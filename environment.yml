@@ -18,6 +18,8 @@ dependencies:
   - notebook
   - pytest
   - pytest-cov
+  - boto3
+  - earthaccess
   - pip
   - pip:
     - mortie

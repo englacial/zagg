@@ -464,7 +464,7 @@ def lambda_handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
     # Log the event for debugging
     logger.info("=" * 70)
     logger.info("Lambda invocation started")
-    logger.info(f"Request ID: {context.request_id}")
+    logger.info(f"Request ID: {context.aws_request_id}")
     logger.info(f"Function: {context.function_name}")
     logger.info(f"Memory: {context.memory_limit_in_mb} MB")
     logger.info(f"Timeout: {context.get_remaining_time_in_millis() / 1000:.0f}s")
@@ -476,7 +476,7 @@ def lambda_handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
         'parent_morton': event.get('parent_morton'),
         'cycle': event.get('cycle'),
         'child_order': event.get('child_order'),
-        'request_id': context.request_id
+        'request_id': context.aws_request_id
     }))
 
     try:
@@ -523,7 +523,7 @@ def lambda_handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
             'total_obs': result['total_obs'],
             'duration_s': result['duration_s'],
             'error': result.get('error'),
-            'request_id': context.request_id
+            'request_id': context.aws_request_id
         }))
 
         logger.info("=" * 70)
@@ -544,6 +544,6 @@ def lambda_handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
             'body': json.dumps({
                 'error': f'Unhandled exception: {str(e)}',
                 'parent_morton': event.get('parent_morton'),
-                'request_id': context.request_id
+                'request_id': context.aws_request_id
             })
         }

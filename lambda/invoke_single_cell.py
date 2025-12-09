@@ -69,7 +69,7 @@ def invoke_lambda(
     if max_granules is not None:
         event["max_granules"] = max_granules
 
-    lambda_client = boto3.client('lambda')
+    lambda_client = boto3.client('lambda', region_name='us-west-2')
     response = lambda_client.invoke(
         FunctionName=function_name,
         InvocationType='RequestResponse',
@@ -83,7 +83,7 @@ def main():
     # =========================================================================
     # CONFIGURATION - Update these values for your environment
     # =========================================================================
-    S3_BUCKET = "your-output-bucket"  # Change this
+    S3_BUCKET = "jupyterhub-englacial-scratch-429435741471"
     S3_PREFIX = "atl06/test"
     PARENT_MORTON = -6134114  # Example Antarctic cell
     CYCLE = 22
