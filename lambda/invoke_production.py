@@ -250,7 +250,7 @@ def main():
     parser.add_argument("--max-workers", type=int, default=1700, help="Max concurrent Lambda invocations")
     parser.add_argument("--max-cells", type=int, default=None, help="Limit number of cells (for testing)")
     parser.add_argument("--cycle", type=int, default=22, help="ICESat-2 cycle number")
-    parser.add_argument("--parent-order", type=int, default=7, help="Parent cell order (default 7)")
+    parser.add_argument("--parent-order", type=int, default=6, help="Parent cell order (default 6)")
     parser.add_argument("--child-order", type=int, default=12, help="Child cell order")
     parser.add_argument("--s3-bucket", default="jupyterhub-englacial-scratch-429435741471")
     parser.add_argument("--s3-prefix", default="atl06/production")

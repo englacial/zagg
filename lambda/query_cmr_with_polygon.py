@@ -21,7 +21,7 @@ from datetime import datetime, timedelta
 import numpy as np
 
 
-def _cmr_request_with_retry(url, params, headers, max_retries=5):
+def _cmr_request_with_retry(url, params, headers, max_retries=15):
     """
     Make CMR request with retry logic for transient errors.
 
