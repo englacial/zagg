@@ -1,0 +1,101 @@
+name: Build Lambda Layers
+
+on:
+  workflow_dispatch:  # Manual trigger
+  push:
+    paths:
+      - 'lambda/build_layer.sh'
+      - '.github/workflows/build-lambda-layers.yml'
+
+jobs:
+  build-layer:
+    strategy:
+      matrix:
+        include:
+          - arch: x86_64
+            runner: ubuntu-latest
+          - arch: arm64
+            runner: ubuntu-24.04-arm
+
+    runs-on: ${{ matrix.runner }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Build Lambda layer
+        run: |
+          cd lambda
+
+          # Create output directory
+          mkdir -p layer_${{ matrix.arch }}/python
+
+          # Install packages
+          pip install numpy pandas pyarrow h5coro pyproj \
+            -t layer_${{ matrix.arch }}/python \
+            --no-cache-dir
+
+          # Clean up to reduce size
+          find layer_${{ matrix.arch }}/python -type d -name '__pycache__' -exec rm -rf {} + 2>/dev/null || true
+          find layer_${{ matrix.arch }}/python -type d -name 'tests' -exec rm -rf {} + 2>/dev/null || true
+          find layer_${{ matrix.arch }}/python -type d -name 'test' -exec rm -rf {} + 2>/dev/null || true
+          find layer_${{ matrix.arch }}/python -name '*.pyc' -delete 2>/dev/null || true
+          find layer_${{ matrix.arch }}/python -name '*.pyo' -delete 2>/dev/null || true
+
+          # Strip binaries
+          find layer_${{ matrix.arch }}/python -name '*.so' -exec strip {} \; 2>/dev/null || true
+
+          # Create zip
+          cd layer_${{ matrix.arch }}
+          zip -r9 ../lambda_layer_${{ matrix.arch }}.zip python
+          cd ..
+
+          # Report size
+          ls -lh lambda_layer_${{ matrix.arch }}.zip
+
+      - name: Upload layer artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: lambda-layer-${{ matrix.arch }}
+          path: lambda/lambda_layer_${{ matrix.arch }}.zip
+          retention-days: 30
+
+  commit-layers:
+    needs: build-layer
+    runs-on: ubuntu-latest
+    if: github.event_name == 'workflow_dispatch'  # Only commit on manual trigger
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Download x86_64 layer
+        uses: actions/download-artifact@v4
+        with:
+          name: lambda-layer-x86_64
+          path: lambda/
+
+      - name: Download arm64 layer
+        uses: actions/download-artifact@v4
+        with:
+          name: lambda-layer-arm64
+          path: lambda/
+
+      - name: Commit layers
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+          git add lambda/lambda_layer_*.zip
+
+          if git diff --cached --quiet; then
+            echo "No changes to commit"
+          else
+            git commit -m "Build Lambda layers for x86_64 and arm64"
+            git push
+          fi
