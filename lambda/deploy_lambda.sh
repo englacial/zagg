@@ -9,7 +9,7 @@ REGION="us-west-2"
 
 echo "Creating deployment package..."
 rm -f lambda_function.zip
-zip lambda_function.zip lambda_handler.py query_cmr_with_polygon.py
+zip lambda_function.zip lambda_handler.py
 
 echo "Deploying to AWS Lambda..."
 aws lambda update-function-code \

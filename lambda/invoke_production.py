@@ -1,10 +1,16 @@
 #!/usr/bin/env python3
 """
-Production Lambda orchestrator for processing ALL Antarctic morton cells.
+Production Lambda orchestrator for processing Antarctic morton cells.
+
+Uses pre-built granule catalog to avoid per-Lambda CMR queries.
 
 Usage:
-    python invoke_production.py
-    python invoke_production.py --dry-run  # Show what would be processed
+    # First, build the catalog:
+    python build_granule_catalog.py --cycle 22 --parent-order 6
+
+    # Then run production:
+    python invoke_production.py --catalog granule_catalog_cycle22_order6.json
+    python invoke_production.py --catalog granule_catalog_cycle22_order6.json --max-cells 200
 """
 
 import argparse
@@ -15,115 +21,21 @@ from datetime import datetime
 
 import boto3
 from botocore.config import Config
-import numpy as np
-import pandas as pd
-from mortie import clip2order, geo2mort, mort2geo
 
 from orchestrator_auth import get_nsidc_s3_credentials
 
 # Lambda pricing (us-west-2, x86)
 # https://aws.amazon.com/lambda/pricing/
 LAMBDA_PRICE_PER_GB_SECOND = 0.0000166667
-LAMBDA_MEMORY_MB = 1024
+LAMBDA_MEMORY_MB = 2048
 LAMBDA_MEMORY_GB = LAMBDA_MEMORY_MB / 1024
 
-# Path to drainage basin polygons
-BASIN_POLYGON_PATH = "/home/espg/software/xagg/Ant_Grounded_DrainageSystem_Polygons.txt"
 
-
-def latlon_to_xyz(lats, lons):
-    """Convert lat/lon arrays to 3D unit vectors."""
-    lat_rad = np.radians(lats)
-    lon_rad = np.radians(lons)
-    x = np.cos(lat_rad) * np.cos(lon_rad)
-    y = np.cos(lat_rad) * np.sin(lon_rad)
-    z = np.sin(lat_rad)
-    return np.column_stack([x, y, z])
-
-
-def angular_distance(vec1, vec2):
-    """Compute angular distance (radians) between two unit vectors."""
-    dot = np.clip(np.dot(vec1, vec2), -1.0, 1.0)
-    return np.arccos(dot)
-
-
-def compute_bounding_disc(lats, lons):
-    """Compute bounding disc (centroid_vec, radius_radians) for lat/lon points."""
-    xyz = latlon_to_xyz(lats, lons)
-    centroid = xyz.mean(axis=0)
-    centroid = centroid / np.linalg.norm(centroid)
-    distances = np.array([angular_distance(centroid, pt) for pt in xyz])
-    return centroid, distances.max()
-
-
-def get_antarctic_morton_cells(order: int = 6) -> list:
-    """
-    Generate order-6 morton cells covering Antarctic drainage basins.
-
-    Uses bounding disc (query_disc) for each of the 27 drainage basins,
-    then combines and deduplicates.
-
-    Parameters
-    ----------
-    order : int
-        Morton order (default 6)
-
-    Returns
-    -------
-    list
-        List of morton cell indices, sorted by latitude (furthest south first)
-    """
-    import healpy as hp
-
-    nside = 2 ** order
-
-    # Read drainage basin polygons
-    df = pd.read_csv(BASIN_POLYGON_PATH, names=["Lat", "Lon", "basin"], sep=r"\s+")
-
-    all_healpix = []
-
-    for basin_id in df['basin'].unique():
-        basin_df = df[df['basin'] == basin_id]
-        lats = basin_df['Lat'].values
-        lons = basin_df['Lon'].values
-
-        if len(lats) < 3:
-            continue
-
-        # Compute bounding disc
-        centroid, radius = compute_bounding_disc(lats, lons)
-
-        # Query HEALPix
-        try:
-            pixels = hp.query_disc(nside, centroid, radius, inclusive=True, nest=True)
-            all_healpix.append(pixels)
-        except Exception:
-            continue
-
-    # Combine and deduplicate
-    all_pixels = np.unique(np.concatenate(all_healpix))
-
-    # Convert to morton indices
-    morton_cells = set()
-    for hpix in all_pixels:
-        theta, phi = hp.pix2ang(nside, hpix, nest=True)
-        lat = 90 - np.degrees(theta)
-        lon = np.degrees(phi)
-        if lon > 180:
-            lon -= 360
-        m = geo2mort([lat], [lon], order=18)[0]
-        m_clipped = clip2order(order, np.array([m]))[0]
-        morton_cells.add(int(m_clipped))
-
-    # Sort by latitude (furthest south first = more data = process first)
-    cells_with_lat = []
-    for m in morton_cells:
-        lat, lon = mort2geo(np.array([m]))
-        lat_val = float(np.asarray(lat).flat[0])
-        cells_with_lat.append((m, lat_val))
-    cells_with_lat.sort(key=lambda x: x[1])  # Ascending (most negative first)
-
-    return [c[0] for c in cells_with_lat]
+def load_catalog(catalog_path: str) -> dict:
+    """Load granule catalog from JSON file."""
+    with open(catalog_path, 'r') as f:
+        data = json.load(f)
+    return data
 
 
 def parse_lambda_report(log_result: str) -> dict:
@@ -153,23 +65,23 @@ def parse_lambda_report(log_result: str) -> dict:
 def invoke_lambda(
     lambda_client,
     parent_morton: int,
-    cycle: int,
     parent_order: int,
     child_order: int,
+    granule_urls: list,
     s3_bucket: str,
     s3_prefix: str,
     s3_credentials: dict,
     function_name: str = "process-morton-cell",
-    max_retries: int = 5
+    max_retries: int = 3
 ) -> dict:
     """Invoke Lambda and return result with timing. Retries on throttling."""
     wall_start = time.time()
 
     event = {
         "parent_morton": parent_morton,
-        "cycle": cycle,
         "parent_order": parent_order,
         "child_order": child_order,
+        "granule_urls": granule_urls,
         "s3_bucket": s3_bucket,
         "s3_prefix": s3_prefix,
         "s3_credentials": {
@@ -224,6 +136,7 @@ def invoke_lambda(
                 "retries": attempt,
                 "timeout": is_timeout,
                 "max_memory_mb": log_info.get("max_memory_mb"),
+                "granule_count": len(granule_urls),
             }
         except Exception as e:
             last_error = str(e)
@@ -241,16 +154,16 @@ def invoke_lambda(
         "wall_time": time.time() - wall_start,
         "lambda_duration": 0,
         "error": last_error,
-        "retries": max_retries
+        "retries": max_retries,
+        "granule_count": len(granule_urls),
     }
 
 
 def main():
     parser = argparse.ArgumentParser(description="Production Lambda orchestrator")
+    parser.add_argument("--catalog", required=True, help="Path to granule catalog JSON")
     parser.add_argument("--max-workers", type=int, default=1700, help="Max concurrent Lambda invocations")
     parser.add_argument("--max-cells", type=int, default=None, help="Limit number of cells (for testing)")
-    parser.add_argument("--cycle", type=int, default=22, help="ICESat-2 cycle number")
-    parser.add_argument("--parent-order", type=int, default=6, help="Parent cell order (default 6)")
     parser.add_argument("--child-order", type=int, default=12, help="Child cell order")
     parser.add_argument("--s3-bucket", default="jupyterhub-englacial-scratch-429435741471")
     parser.add_argument("--s3-prefix", default="atl06/production")
@@ -258,28 +171,38 @@ def main():
     args = parser.parse_args()
 
     print("=" * 70)
-    print("Production Lambda Orchestrator - Full Antarctic Run")
+    print("Production Lambda Orchestrator - Catalog-Based")
     print("=" * 70)
 
-    # Step 1: Get morton cells
-    print(f"\n[1/5] Generating Antarctic morton cells (order {args.parent_order})...")
-    all_cells = get_antarctic_morton_cells(order=args.parent_order)
+    # Step 1: Load catalog
+    print(f"\n[1/5] Loading granule catalog from {args.catalog}...")
+    catalog_data = load_catalog(args.catalog)
+    metadata = catalog_data["metadata"]
+    catalog = catalog_data["catalog"]
+
+    parent_order = metadata["parent_order"]
+    cycle = metadata["cycle"]
+
+    print(f"      Cycle: {cycle}")
+    print(f"      Parent order: {parent_order}")
+    print(f"      Total cells in catalog: {metadata['total_cells']}")
+    print(f"      Total granules: {metadata['total_granules']}")
+
+    # Get cells to process (catalog keys are strings)
+    all_cells = list(catalog.keys())
     if args.max_cells:
         cells = all_cells[:args.max_cells]
         print(f"      Limited to {len(cells)} cells (of {len(all_cells)} total)")
     else:
         cells = all_cells
-        print(f"      Found {len(cells)} cells to process")
+        print(f"      Processing {len(cells)} cells")
 
     if args.dry_run:
         print("\n[DRY RUN] Would process these cells:")
         print(f"      Total: {len(cells)}")
-        print(f"      First 10: {cells[:10]}")
-        print(f"      Last 10: {cells[-10:]}")
-        print(f"\n      Estimated max cost (if all cells run 12s):")
-        max_time = len(cells) * 12  # seconds
-        max_cost = max_time * LAMBDA_MEMORY_GB * LAMBDA_PRICE_PER_GB_SECOND
-        print(f"      {max_time:,}s × {LAMBDA_MEMORY_GB}GB × ${LAMBDA_PRICE_PER_GB_SECOND}/GB-s = ${max_cost:.2f}")
+        print(f"      First 5: {cells[:5]}")
+        granule_counts = [len(catalog[c]) for c in cells]
+        print(f"      Granules per cell: min={min(granule_counts)}, max={max(granule_counts)}, avg={sum(granule_counts)/len(granule_counts):.1f}")
         return
 
     # Step 2: Get credentials
@@ -315,10 +238,10 @@ def main():
             executor.submit(
                 invoke_lambda,
                 lambda_client,
-                cell,
-                args.cycle,
-                args.parent_order,
+                int(cell),  # Convert string key back to int
+                parent_order,
                 args.child_order,
+                catalog[cell],  # Granule URLs for this cell
                 args.s3_bucket,
                 args.s3_prefix,
                 s3_creds
@@ -392,6 +315,7 @@ def main():
     with open(output_file, 'w') as f:
         json.dump({
             "config": vars(args),
+            "catalog_metadata": metadata,
             "summary": {
                 "total_cells": len(cells),
                 "cells_with_data": cells_with_data,

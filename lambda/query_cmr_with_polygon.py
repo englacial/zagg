@@ -21,11 +21,12 @@ from datetime import datetime, timedelta
 import numpy as np
 
 
-def _cmr_request_with_retry(url, params, headers, max_retries=15):
+def _cmr_request_with_retry(url, params, headers, max_retries=15, max_sleep=30):
     """
     Make CMR request with retry logic for transient errors.
 
     Retries on 5xx server errors and connection errors with exponential backoff.
+    Sleep time is capped at max_sleep seconds.
     """
     last_error = None
     for attempt in range(max_retries):
@@ -35,7 +36,7 @@ def _cmr_request_with_retry(url, params, headers, max_retries=15):
             if response.status_code >= 500:
                 last_error = f"{response.status_code} Server Error: {response.text[:100]}"
                 if attempt < max_retries - 1:
-                    sleep_time = (2 ** attempt) + (time.time() % 1)  # Exponential backoff with jitter
+                    sleep_time = min((2 ** attempt) + (time.time() % 1), max_sleep)
                     time.sleep(sleep_time)
                     continue
                 response.raise_for_status()
@@ -45,7 +46,7 @@ def _cmr_request_with_retry(url, params, headers, max_retries=15):
             last_error = str(e)
             # Retry on connection/timeout errors
             if attempt < max_retries - 1:
-                sleep_time = (2 ** attempt) + (time.time() % 1)
+                sleep_time = min((2 ** attempt) + (time.time() % 1), max_sleep)
                 time.sleep(sleep_time)
             else:
                 raise requests.HTTPError(f"CMR request failed after {max_retries} retries: {last_error}")
