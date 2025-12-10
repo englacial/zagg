@@ -1,7 +1,7 @@
 name: Build Lambda Layers
 
 on:
-  workflow_dispatch:  # Manual trigger
+  workflow_dispatch:
   push:
     paths:
       - 'lambda/build_layer_v14.sh'
@@ -12,36 +12,34 @@ permissions:
 
 jobs:
   build-layer:
-    strategy:
-      matrix:
-        include:
-          - arch: x86_64
-            runner: ubuntu-latest
-          - arch: arm64
-            runner: ubuntu-24.04-arm
-
-    runs-on: ${{ matrix.runner }}
+    runs-on: ubuntu-latest
 
     steps:
       - name: Checkout
         uses: actions/checkout@v4
-
-      - name: Set up Python
-        uses: actions/setup-python@v5
         with:
-          python-version: '3.11'
+          lfs: true
 
-      - name: Build Lambda layer
+      - name: Build Lambda layer in AL2023 container
         run: |
-          cd lambda
-          chmod +x build_layer_v14.sh
-          ./build_layer_v14.sh ${{ matrix.arch }}
+          docker run --rm \
+            --platform linux/amd64 \
+            --entrypoint "" \
+            -v ${{ github.workspace }}:/workspace \
+            -w /workspace/lambda \
+            public.ecr.aws/lambda/python:3.11 \
+            bash -c "
+              yum install -y zip &&
+              pip install --upgrade pip &&
+              chmod +x build_layer_v14.sh &&
+              ./build_layer_v14.sh x86_64
+            "
 
       - name: Upload layer artifact
         uses: actions/upload-artifact@v4
         with:
-          name: lambda-layer-${{ matrix.arch }}
-          path: lambda/lambda_layer_${{ matrix.arch }}.zip
+          name: lambda-layer-x86_64
+          path: lambda/lambda_layer_x86_64.zip
           retention-days: 30
 
   commit-layers:
@@ -53,6 +51,7 @@ jobs:
         uses: actions/checkout@v4
         with:
           token: ${{ secrets.GITHUB_TOKEN }}
+          lfs: true
 
       - name: Download x86_64 layer
         uses: actions/download-artifact@v4
@@ -60,22 +59,20 @@ jobs:
           name: lambda-layer-x86_64
           path: lambda/
 
-      - name: Download arm64 layer
-        uses: actions/download-artifact@v4
-        with:
-          name: lambda-layer-arm64
-          path: lambda/
-
-      - name: Commit layers
+      - name: Commit layer
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
+          git lfs install
 
-          git add lambda/lambda_layer_*.zip
+          git add lambda/lambda_layer_x86_64.zip
 
           if git diff --cached --quiet; then
             echo "No changes to commit"
           else
-            git commit -m "Build Lambda layers for x86_64 and arm64"
+            git commit -m "Build Lambda layer for x86_64"
             git push
           fi
+
+# ARM64 build disabled - healpy has ARM compilation issues
+# To re-enable, add arm64 matrix job with ubuntu-24.04-arm runner

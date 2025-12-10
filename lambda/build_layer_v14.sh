@@ -1,7 +1,5 @@
 #!/bin/bash
-# Build Lambda layer matching v14 (xagg-complete-stack:14)
-#
-# Target: ~60MB zipped, ~180MB unzipped (under 250MB Lambda limit)
+# Build Lambda layer for xagg (single layer, under 250MB unzipped)
 #
 # Usage:
 #   ./build_layer_v14.sh [x86_64|arm64]
@@ -13,33 +11,64 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 OUTPUT_DIR="${SCRIPT_DIR}/layer_build"
 ZIP_NAME="lambda_layer_${ARCH}.zip"
 
+# Find Python 3.11
+if command -v python3.11 &> /dev/null; then
+    PYTHON=python3.11
+    PIP="python3.11 -m pip"
+elif python3 -c "import sys; sys.exit(0 if sys.version_info[:2] == (3,11) else 1)" 2>/dev/null; then
+    PYTHON=python3
+    PIP=pip
+else
+    echo "ERROR: Python 3.11 required"
+    exit 1
+fi
+PYTHON_VERSION=$($PYTHON -c "import sys; print(f'{sys.version_info.major}.{sys.version_info.minor}')")
+
+# Check architecture matches
+MACHINE_ARCH=$(uname -m)
+if [[ "$ARCH" == "arm64" && "$MACHINE_ARCH" != "aarch64" ]]; then
+    echo "ERROR: Building arm64 layer on $MACHINE_ARCH machine"
+    exit 1
+fi
+if [[ "$ARCH" == "x86_64" && "$MACHINE_ARCH" != "x86_64" ]]; then
+    echo "ERROR: Building x86_64 layer on $MACHINE_ARCH machine"
+    exit 1
+fi
+
 echo "============================================================"
 echo "Building Lambda layer for ${ARCH}"
+echo "Python: ${PYTHON_VERSION}, Machine: ${MACHINE_ARCH}"
 echo "============================================================"
 
 # Clean previous build
 rm -rf "$OUTPUT_DIR"
 mkdir -p "$OUTPUT_DIR/python"
 
-# Install packages
-echo "Installing earthaccess (brings boto3, s3fs, fsspec, aiohttp, etc.)..."
-pip install earthaccess -t "$OUTPUT_DIR/python" --no-cache-dir
+# Create constraints file to prevent numpy upgrade
+CONSTRAINTS="$OUTPUT_DIR/constraints.txt"
+echo "numpy<2.3" > "$CONSTRAINTS"
 
-echo "Installing scientific stack..."
-pip install numpy pandas -t "$OUTPUT_DIR/python" --no-cache-dir
-
-echo "Installing fastparquet + cramjam (NOT pyarrow)..."
-pip install fastparquet cramjam -t "$OUTPUT_DIR/python" --no-cache-dir
-
-echo "Installing healpy + astropy..."
-pip install healpy astropy -t "$OUTPUT_DIR/python" --no-cache-dir
-
-echo "Installing shapely..."
-pip install shapely -t "$OUTPUT_DIR/python" --no-cache-dir
+# Install all packages with numpy constraint
+echo "Installing packages with numpy<2.3 constraint..."
+$PIP install \
+    "numpy>=2.0,<2.3" \
+    pandas fastparquet cramjam \
+    healpy astropy \
+    earthaccess shapely \
+    -c "$CONSTRAINTS" \
+    -t "$OUTPUT_DIR/python" \
+    --no-cache-dir
 
 echo "Installing h5coro and mortie (--no-deps)..."
-pip install h5coro --no-deps -t "$OUTPUT_DIR/python" --no-cache-dir
-pip install mortie --no-deps -t "$OUTPUT_DIR/python" --no-cache-dir
+$PIP install h5coro mortie --no-deps -t "$OUTPUT_DIR/python" --no-cache-dir
+
+# Verify numpy version
+NUMPY_VERSION=$(ls "$OUTPUT_DIR/python" | grep -E "^numpy-" | head -1)
+echo "Installed: $NUMPY_VERSION"
+if [[ "$NUMPY_VERSION" == *"2.3"* ]]; then
+    echo "ERROR: numpy 2.3.x installed - this breaks Lambda!"
+    exit 1
+fi
 
 # Remove bloat
 echo "Removing bloat..."
@@ -47,9 +76,34 @@ rm -rf "$OUTPUT_DIR/python"/pyarrow* \
        "$OUTPUT_DIR/python"/pyproj* \
        "$OUTPUT_DIR/python"/xarray* \
        "$OUTPUT_DIR/python"/matplotlib* \
-       "$OUTPUT_DIR/python"/lonboard*
+       "$OUTPUT_DIR/python"/lonboard* \
+       "$OUTPUT_DIR/python"/boto3* \
+       "$OUTPUT_DIR/python"/botocore* 2>/dev/null || true
 
-# Clean up caches and tests
+# Patch astropy to remove test runner (requires pytest at import time)
+# This removes the TestRunner import and test() function from astropy/__init__.py
+echo "Patching astropy to remove pytest dependency..."
+ASTROPY_INIT="$OUTPUT_DIR/python/astropy/__init__.py"
+if [ -f "$ASTROPY_INIT" ]; then
+    # Remove "tests" and "test" from __all__ list
+    sed -i 's/"tests",/# "tests",  # removed - requires pytest/' "$ASTROPY_INIT"
+    sed -i 's/"test",/# "test",  # removed - requires pytest/' "$ASTROPY_INIT"
+
+    # Comment out the TestRunner import and test function creation (lines 179-184)
+    sed -i 's/^from \.tests\.runner import TestRunner$/# from .tests.runner import TestRunner  # removed - requires pytest/' "$ASTROPY_INIT"
+    sed -i 's/^with warnings\.catch_warnings():$/# with warnings.catch_warnings():  # removed - requires pytest/' "$ASTROPY_INIT"
+    sed -i 's/^    warnings\.filterwarnings("ignore", category=PendingDeprecationWarning)$/# warnings.filterwarnings("ignore", category=PendingDeprecationWarning)/' "$ASTROPY_INIT"
+    sed -i 's/^    test = TestRunner\.make_test_runner_in(__path__\[0\])$/# test = TestRunner.make_test_runner_in(__path__[0])/' "$ASTROPY_INIT"
+
+    # Add a dummy test attribute to prevent AttributeError
+    echo "" >> "$ASTROPY_INIT"
+    echo "# Dummy test attribute (pytest not available in Lambda)" >> "$ASTROPY_INIT"
+    echo "test = None" >> "$ASTROPY_INIT"
+
+    echo "  - Patched astropy/__init__.py"
+fi
+
+# Clean up caches and tests (now safe to remove astropy/tests since we patched __init__)
 find "$OUTPUT_DIR/python" -type d -name "__pycache__" -exec rm -rf {} + 2>/dev/null || true
 find "$OUTPUT_DIR/python" -type d -name "tests" -exec rm -rf {} + 2>/dev/null || true
 find "$OUTPUT_DIR/python" -type d -name "test" -exec rm -rf {} + 2>/dev/null || true
@@ -61,12 +115,15 @@ echo "Stripping binaries..."
 find "$OUTPUT_DIR/python" -name "*.so" -exec strip {} \; 2>/dev/null || true
 
 # Report unzipped size
-echo ""
-echo "Installed packages:"
-ls -1 "$OUTPUT_DIR/python" | grep -E "^[a-z]" | head -50
-echo ""
 UNZIPPED_SIZE=$(du -sh "$OUTPUT_DIR/python" | cut -f1)
-echo "Unzipped size: ${UNZIPPED_SIZE}"
+UNZIPPED_BYTES=$(du -sb "$OUTPUT_DIR/python" | cut -f1)
+echo ""
+echo "Unzipped size: ${UNZIPPED_SIZE} (${UNZIPPED_BYTES} bytes)"
+
+if [ "$UNZIPPED_BYTES" -gt 262144000 ]; then
+    echo "ERROR: Exceeds 250MB Lambda limit!"
+    exit 1
+fi
 
 # Create zip
 echo ""
