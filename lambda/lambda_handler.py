@@ -1,11 +1,13 @@
 """
 AWS Lambda handler for processing ICESat-2 ATL06 data by morton cell.
 
+Simple version - outputs plain parquet without geometry (smaller layer, no geopandas).
+
 This function:
 1. Queries CMR for granules intersecting a morton cell (anonymous, no auth needed)
 2. Reads HDF5 files directly from S3 using h5coro
 3. Calculates summary statistics for child cells
-4. Writes xdggs-enabled zarr to S3
+4. Writes plain parquet to S3
 
 Event payload:
 {
@@ -34,7 +36,6 @@ from typing import Any, Dict
 import h5coro
 import numpy as np
 import pandas as pd
-import xarray as xr
 from h5coro import s3driver
 
 # Set up structured logging
@@ -109,6 +110,7 @@ def calculate_cell_statistics(df_cell: pd.DataFrame, value_col='h_li', sigma_col
 def process_morton_cell(
     parent_morton: int,
     cycle: int,
+    parent_order: int,
     child_order: int,
     s3_bucket: str,
     s3_prefix: str,
@@ -116,7 +118,7 @@ def process_morton_cell(
     max_granules: int = None
 ) -> Dict[str, Any]:
     """
-    Process one parent morton cell: read from S3, calculate stats, write zarr.
+    Process one parent morton cell: read from S3, calculate stats, write parquet.
 
     Uses h5coro S3Driver for in-place reads (no downloads).
     Handles empty results gracefully.
@@ -124,15 +126,17 @@ def process_morton_cell(
     Parameters
     ----------
     parent_morton : int
-        Morton index of parent cell (order 6)
+        Morton index of parent cell
     cycle : int
         ICESat-2 cycle number
+    parent_order : int
+        Order of parent morton cell (e.g., 6 or 7)
     child_order : int
         Order of child cells for statistics (typically 12)
     s3_bucket : str
-        S3 bucket for output zarr files
+        S3 bucket for output parquet files
     s3_prefix : str
-        S3 prefix for output zarr files
+        S3 prefix for output parquet files
     s3_credentials : dict
         AWS S3 credentials for NSIDC access
     max_granules : int, optional
@@ -141,7 +145,7 @@ def process_morton_cell(
     Returns
     -------
     dict
-        Summary of processing: {parent_morton, cells_with_data, total_obs, zarr_path, error}
+        Summary of processing: {parent_morton, cells_with_data, total_obs, parquet_path, error}
     """
     from mortie import (
         clip2order,
@@ -153,8 +157,6 @@ def process_morton_cell(
 
     # Import query function (must be uploaded with Lambda function)
     from query_cmr_with_polygon import query_atl06_cmr_with_polygon
-
-    import xdggs
 
     logger.info(f"Processing morton cell: {parent_morton}")
     start_time = datetime.now()
@@ -181,7 +183,7 @@ def process_morton_cell(
             'parent_morton': parent_morton,
             'cells_with_data': 0,
             'total_obs': 0,
-            'zarr_path': None,
+            'parquet_path': None,
             'error': f'CMR query failed: {str(e)}',
             'duration_s': (datetime.now() - start_time).total_seconds()
         }
@@ -194,7 +196,7 @@ def process_morton_cell(
             'parent_morton': parent_morton,
             'cells_with_data': 0,
             'total_obs': 0,
-            'zarr_path': None,
+            'parquet_path': None,
             'error': 'No granules found',
             'duration_s': (datetime.now() - start_time).total_seconds()
         }
@@ -261,8 +263,8 @@ def process_morton_cell(
 
                     # MORTON INDEX FILTERING
                     midx18 = geo2mort(lats, lons, order=18)
-                    midx6 = clip2order(6, midx18)
-                    mask_spatial = midx6 == parent_morton
+                    midx_parent = clip2order(parent_order, midx18)
+                    mask_spatial = midx_parent == parent_morton
 
                     if np.sum(mask_spatial) == 0:
                         continue
@@ -313,7 +315,7 @@ def process_morton_cell(
             'parent_morton': parent_morton,
             'cells_with_data': 0,
             'total_obs': 0,
-            'zarr_path': None,
+            'parquet_path': None,
             'error': 'No data after filtering',
             'duration_s': (datetime.now() - start_time).total_seconds()
         }
@@ -355,70 +357,47 @@ def process_morton_cell(
     logger.info(f"  Statistics: {cells_with_data}/{n_cells} cells with data")
 
     # ========================================================================
-    # CREATE XDGGS DATASET
+    # CREATE PARQUET OUTPUT (no geometry)
     # ========================================================================
 
-    logger.info(f"  Creating xdggs dataset...")
+    logger.info(f"  Creating parquet output...")
 
     child_cell_ids, _ = mort2healpix(children)
 
-    ds = xr.Dataset(
-        data_vars={
-            'count': ('cell_ids', stats_arrays['count']),
-            'h_min': ('cell_ids', stats_arrays['min']),
-            'h_max': ('cell_ids', stats_arrays['max']),
-            'h_mean': ('cell_ids', stats_arrays['mean_weighted']),
-            'h_sigma': ('cell_ids', stats_arrays['sigma_mean']),
-            'h_variance': ('cell_ids', stats_arrays['variance']),
-            'h_q25': ('cell_ids', stats_arrays['q25']),
-            'h_q50': ('cell_ids', stats_arrays['q50']),
-            'h_q75': ('cell_ids', stats_arrays['q75']),
-        },
-        coords={
-            'cell_ids': (
-                'cell_ids',
-                child_cell_ids,
-                {'grid_name': 'healpix', 'level': child_order, 'indexing_scheme': 'nested'}
-            ),
-            'morton': ('cell_ids', children)
-        },
-        attrs={
-            'title': f'ATL06 Cycle {cycle} Summary Statistics',
-            'parent_morton': parent_morton,
-            'parent_order': 6,
-            'child_order': child_order,
-            'cycle': cycle,
-            'grid_type': 'healpix',
-            'indexing_scheme': 'nested',
-            'created': datetime.now().isoformat(),
-            'lambda_function': 'process-morton-cell'
-        }
-    )
-
-    # Decode with xdggs
-    ds = xdggs.decode(ds, index_options={"index_kind": "moc"})
-    ds = ds.dggs.assign_latlon_coords()
+    # Build output DataFrame (no geometry)
+    df_out = pd.DataFrame({
+        'child_morton': children,
+        'child_healpix': child_cell_ids,
+        'count': stats_arrays['count'],
+        'h_mean': stats_arrays['mean_weighted'],
+        'h_sigma': stats_arrays['sigma_mean'],
+        'h_min': stats_arrays['min'],
+        'h_max': stats_arrays['max'],
+        'h_variance': stats_arrays['variance'],
+        'h_q25': stats_arrays['q25'],
+        'h_q50': stats_arrays['q50'],
+        'h_q75': stats_arrays['q75'],
+    })
 
     # ========================================================================
-    # WRITE ZARR TO S3
+    # WRITE PARQUET TO S3
     # ========================================================================
 
-    zarr_path = f"s3://{s3_bucket}/{s3_prefix}/{parent_morton}.zarr"
+    parquet_path = f"s3://{s3_bucket}/{s3_prefix}/{parent_morton}.parquet"
 
-    logger.info(f"  Writing zarr to {zarr_path}...")
+    logger.info(f"  Writing parquet to {parquet_path}...")
 
     try:
-        # Write to S3 bucket using Lambda IAM role
-        ds.to_zarr(zarr_path, mode='w')
-        logger.info(f"✓ Wrote zarr: {zarr_path}")
+        df_out.to_parquet(parquet_path, index=False, engine='fastparquet')
+        logger.info(f"✓ Wrote parquet: {parquet_path}")
     except Exception as e:
-        logger.error(f"Failed to write zarr to {zarr_path}: {e}")
+        logger.error(f"Failed to write parquet to {parquet_path}: {e}")
         return {
             'parent_morton': parent_morton,
             'cells_with_data': cells_with_data,
             'total_obs': int(stats_arrays['count'].sum()),
-            'zarr_path': None,
-            'error': f'Failed to write zarr: {str(e)}',
+            'parquet_path': None,
+            'error': f'Failed to write parquet: {str(e)}',
             'duration_s': (datetime.now() - start_time).total_seconds()
         }
 
@@ -430,7 +409,7 @@ def process_morton_cell(
         'parent_morton': parent_morton,
         'cells_with_data': cells_with_data,
         'total_obs': int(stats_arrays['count'].sum()),
-        'zarr_path': zarr_path,
+        'parquet_path': parquet_path,
         'error': None,
         'duration_s': duration,
         'granule_count': len(gdf),
@@ -481,7 +460,7 @@ def lambda_handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
 
     try:
         # Validate required parameters
-        required_params = ['parent_morton', 'cycle', 'child_order', 's3_bucket', 's3_prefix', 's3_credentials']
+        required_params = ['parent_morton', 'cycle', 'parent_order', 'child_order', 's3_bucket', 's3_prefix', 's3_credentials']
         missing_params = [p for p in required_params if p not in event]
 
         if missing_params:
@@ -508,6 +487,7 @@ def lambda_handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
         result = process_morton_cell(
             parent_morton=event['parent_morton'],
             cycle=event['cycle'],
+            parent_order=event['parent_order'],
             child_order=event['child_order'],
             s3_bucket=event['s3_bucket'],
             s3_prefix=event['s3_prefix'],

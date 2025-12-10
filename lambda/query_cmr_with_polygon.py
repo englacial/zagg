@@ -3,15 +3,53 @@
 Modified query_atl06_cmr function that accepts a polygon for server-side CMR filtering.
 NASA's CMR API performs the spatial subsetting on their side.
 """
+from __future__ import annotations
 
+import time
 import requests
 from typing import List, Optional, Dict, Union, Tuple
-import geopandas as gpd
+import pandas as pd
+try:
+    import geopandas as gpd
+    HAS_GEOPANDAS = True
+except ImportError:
+    HAS_GEOPANDAS = False
 from shapely.geometry import box, Polygon, LineString, Point
 from shapely import wkt
 import pandas as pd
 from datetime import datetime, timedelta
 import numpy as np
+
+
+def _cmr_request_with_retry(url, params, headers, max_retries=5):
+    """
+    Make CMR request with retry logic for transient errors.
+
+    Retries on 5xx server errors and connection errors with exponential backoff.
+    """
+    last_error = None
+    for attempt in range(max_retries):
+        try:
+            response = requests.get(url, params=params, headers=headers, timeout=30)
+            # Retry on 5xx server errors
+            if response.status_code >= 500:
+                last_error = f"{response.status_code} Server Error: {response.text[:100]}"
+                if attempt < max_retries - 1:
+                    sleep_time = (2 ** attempt) + (time.time() % 1)  # Exponential backoff with jitter
+                    time.sleep(sleep_time)
+                    continue
+                response.raise_for_status()
+            response.raise_for_status()
+            return response
+        except requests.exceptions.RequestException as e:
+            last_error = str(e)
+            # Retry on connection/timeout errors
+            if attempt < max_retries - 1:
+                sleep_time = (2 ** attempt) + (time.time() % 1)
+                time.sleep(sleep_time)
+            else:
+                raise requests.HTTPError(f"CMR request failed after {max_retries} retries: {last_error}")
+    raise requests.HTTPError(f"CMR request failed after {max_retries} retries: {last_error}")
 
 
 def format_polygon_for_cmr(polygon: Union[Polygon, List[Tuple[float, float]], List[List[float]], str]) -> str:
@@ -234,15 +272,7 @@ def query_atl06_cmr_with_polygon(
 
     # Fetch all pages using offset-based pagination
     while True:
-        response = requests.get(cmr_url, params=params, headers=headers)
-        try:
-            response.raise_for_status()
-        except requests.HTTPError as e:
-            # Print detailed error information
-            print(f"CMR API Error: {e}")
-            print(f"URL: {response.url}")
-            print(f"Response: {response.text[:500]}")
-            raise
+        response = _cmr_request_with_retry(cmr_url, params, headers)
 
         # Get total number of hits from header (only on first request)
         if total_hits is None:
@@ -417,20 +447,25 @@ def query_atl06_cmr_with_polygon(
         }
         records.append(record)
 
-    # Create GeoDataFrame
+    # Create DataFrame (or GeoDataFrame if geopandas available)
     if records:
-        gdf = gpd.GeoDataFrame(records, crs="EPSG:4326")
+        if HAS_GEOPANDAS:
+            gdf = gpd.GeoDataFrame(records, crs="EPSG:4326")
+        else:
+            gdf = pd.DataFrame(records)
     else:
-        gdf = gpd.GeoDataFrame(
-            columns=[
-                "granule_id", "rgt", "cycle", "region",
-                "bbox_west", "bbox_south", "bbox_east", "bbox_north",
-                "geometry", "begin_datetime", "end_datetime",
-                "urls", "n_urls"
-            ]
-        )
-        gdf = gdf.set_geometry("geometry")
-        gdf.set_crs("EPSG:4326", inplace=True, allow_override=True)
+        columns = [
+            "granule_id", "rgt", "cycle", "region",
+            "bbox_west", "bbox_south", "bbox_east", "bbox_north",
+            "geometry", "begin_datetime", "end_datetime",
+            "urls", "n_urls"
+        ]
+        if HAS_GEOPANDAS:
+            gdf = gpd.GeoDataFrame(columns=columns)
+            gdf = gdf.set_geometry("geometry")
+            gdf.set_crs("EPSG:4326", inplace=True, allow_override=True)
+        else:
+            gdf = pd.DataFrame(columns=columns)
 
     return gdf
 
