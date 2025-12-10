@@ -49,10 +49,11 @@ CONSTRAINTS="$OUTPUT_DIR/constraints.txt"
 echo "numpy<2.3" > "$CONSTRAINTS"
 
 # Install all packages with numpy constraint
+# Pin pandas and h5coro to known working versions
 echo "Installing packages with numpy<2.3 constraint..."
 $PIP install \
     "numpy>=2.0,<2.3" \
-    pandas fastparquet cramjam \
+    "pandas==2.3.2" fastparquet cramjam \
     healpy astropy \
     earthaccess shapely \
     -c "$CONSTRAINTS" \
@@ -60,7 +61,7 @@ $PIP install \
     --no-cache-dir
 
 echo "Installing h5coro and mortie (--no-deps)..."
-$PIP install h5coro mortie --no-deps -t "$OUTPUT_DIR/python" --no-cache-dir
+$PIP install "h5coro==0.0.8" mortie --no-deps -t "$OUTPUT_DIR/python" --no-cache-dir
 
 # Verify numpy version
 NUMPY_VERSION=$(ls "$OUTPUT_DIR/python" | grep -E "^numpy-" | head -1)
