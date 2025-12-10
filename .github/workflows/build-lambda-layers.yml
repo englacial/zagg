@@ -7,6 +7,9 @@ on:
       - 'lambda/build_layer.sh'
       - '.github/workflows/build-lambda-layers.yml'
 
+permissions:
+  contents: write
+
 jobs:
   build-layer:
     strategy:
@@ -68,11 +71,12 @@ jobs:
   commit-layers:
     needs: build-layer
     runs-on: ubuntu-latest
-    if: github.event_name == 'workflow_dispatch'  # Only commit on manual trigger
 
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Download x86_64 layer
         uses: actions/download-artifact@v4
