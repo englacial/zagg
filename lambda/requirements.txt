@@ -1,5 +1,0 @@
-# Lambda function requirements
-# NOTE: Heavy dependencies (numpy, pandas, xarray, etc.) are in the Lambda layer
-# Only include lightweight packages needed by the function code here
-
-boto3>=1.40.0  # AWS SDK (usually included in Lambda runtime, but specified for completeness)
