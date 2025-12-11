@@ -24,11 +24,25 @@ from botocore.config import Config
 
 from orchestrator_auth import get_nsidc_s3_credentials
 
-# Lambda pricing (us-west-2, x86)
+# Lambda pricing (us-west-2)
 # https://aws.amazon.com/lambda/pricing/
-LAMBDA_PRICE_PER_GB_SECOND = 0.0000166667
+LAMBDA_PRICE_X86 = 0.0000166667  # per GB-second
+LAMBDA_PRICE_ARM = 0.0000133334  # per GB-second (20% cheaper)
 LAMBDA_MEMORY_MB = 2048
 LAMBDA_MEMORY_GB = LAMBDA_MEMORY_MB / 1024
+LAMBDA_FUNCTION_NAME = "process-morton-cell"
+
+
+def get_lambda_architecture(lambda_client) -> tuple[str, float]:
+    """Detect Lambda architecture and return (arch, price_per_gb_second)."""
+    try:
+        response = lambda_client.get_function(FunctionName=LAMBDA_FUNCTION_NAME)
+        architectures = response.get('Configuration', {}).get('Architectures', ['x86_64'])
+        arch = architectures[0] if architectures else 'x86_64'
+        price = LAMBDA_PRICE_ARM if arch == 'arm64' else LAMBDA_PRICE_X86
+        return arch, price
+    except Exception:
+        return 'x86_64', LAMBDA_PRICE_X86
 
 
 def load_catalog(catalog_path: str) -> dict:
@@ -165,7 +179,7 @@ def main():
     parser.add_argument("--max-workers", type=int, default=1700, help="Max concurrent Lambda invocations")
     parser.add_argument("--max-cells", type=int, default=None, help="Limit number of cells (for testing)")
     parser.add_argument("--child-order", type=int, default=12, help="Child cell order")
-    parser.add_argument("--s3-bucket", default="jupyterhub-englacial-scratch-429435741471")
+    parser.add_argument("--s3-bucket", default="xagg")
     parser.add_argument("--s3-prefix", default="atl06/production")
     parser.add_argument("--dry-run", action="store_true", help="Show what would be processed without running")
     args = parser.parse_args()
@@ -221,6 +235,11 @@ def main():
         retries={'max_attempts': 0}  # We handle retries ourselves
     )
     lambda_client = boto3.client('lambda', region_name='us-west-2', config=boto_config)
+
+    # Detect architecture for accurate cost calculation
+    arch, price_per_gb_sec = get_lambda_architecture(lambda_client)
+    print(f"      Architecture: {arch} (${price_per_gb_sec:.10f}/GB-sec)")
+
     results = []
 
     # Counters
@@ -285,9 +304,10 @@ def main():
     print(f"\n[4/5] Cost Calculation")
     print("-" * 70)
     gb_seconds = total_lambda_time * LAMBDA_MEMORY_GB
-    cost = gb_seconds * LAMBDA_PRICE_PER_GB_SECOND
+    cost = gb_seconds * price_per_gb_sec
     print(f"      Total Lambda execution time: {total_lambda_time:,.1f}s ({total_lambda_time/3600:.2f} hours)")
     print(f"      Memory: {LAMBDA_MEMORY_MB}MB ({LAMBDA_MEMORY_GB}GB)")
+    print(f"      Architecture: {arch}")
     print(f"      GB-seconds: {gb_seconds:,.1f}")
     print(f"      Cost: ${cost:.4f}")
 
@@ -326,6 +346,8 @@ def main():
                 "wall_time_s": total_wall_time,
                 "lambda_time_s": total_lambda_time,
                 "gb_seconds": gb_seconds,
+                "architecture": arch,
+                "price_per_gb_sec": price_per_gb_sec,
                 "estimated_cost_usd": cost
             },
             "results": results
