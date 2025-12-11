@@ -106,6 +106,26 @@ docker run --rm --platform linux/arm64 \
         echo "Stripping binaries..."
         find /out/python -name "*.so" -exec strip {} \; 2>/dev/null || true
 
+        # Remove Python 3.11 files (we use 3.12)
+        echo "Removing Python 3.11 binaries..."
+        find /out/python -name "*cpython-311*" -delete 2>/dev/null || true
+        find /out/python -name "*cpython_311*" -delete 2>/dev/null || true
+
+        # Remove duplicate/stale .so files in .libs directories
+        echo "Removing duplicate .libs entries..."
+        # Keep only the newest openblas in numpy.libs
+        cd /out/python/numpy.libs 2>/dev/null && ls -t libopenblas64*.so 2>/dev/null | tail -n +2 | xargs rm -f 2>/dev/null || true
+        cd /out/python/numpy.libs 2>/dev/null && ls -t libscipy_openblas64*.so 2>/dev/null | tail -n +2 | xargs rm -f 2>/dev/null || true
+        cd /out/python/numpy.libs 2>/dev/null && ls -t libgfortran*.so* 2>/dev/null | tail -n +2 | xargs rm -f 2>/dev/null || true
+        # Keep only the newest healpy libs
+        cd /out/python/healpy.libs 2>/dev/null && ls -t libhealpix*.so* 2>/dev/null | tail -n +2 | xargs rm -f 2>/dev/null || true
+        cd /out/python/healpy.libs 2>/dev/null && ls -t libcfitsio*.so* 2>/dev/null | tail -n +2 | xargs rm -f 2>/dev/null || true
+
+        # Remove astropy IERS data (large, not needed for our use case)
+        echo "Removing astropy IERS data..."
+        rm -rf /out/python/astropy_iers_data/data/*.all 2>/dev/null || true
+        rm -rf /out/python/astropy_iers_data/data/eopc04* 2>/dev/null || true
+
         # Report size
         echo ""
         UNZIPPED=$(du -sh /out/python | cut -f1)
