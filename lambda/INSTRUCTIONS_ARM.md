@@ -10,7 +10,7 @@ This document describes how to build an ARM64 (Graviton2) Lambda layer on an App
 
 | Component | Version | Notes |
 |-----------|---------|-------|
-| Python | 3.11 | Must match Lambda runtime exactly |
+| Python | 3.12 | Must match Lambda runtime exactly |
 | glibc | ≤2.34 | Amazon Linux 2023 uses glibc 2.34 |
 | Architecture | aarch64 | ARM64/Graviton2 |
 
@@ -34,8 +34,8 @@ Use `quay.io/pypa/manylinux_2_28_aarch64`:
 Pin these versions for compatibility:
 
 ```
-numpy>=2.0,<2.3
-pandas==2.3.2
+numpy==2.2.6
+pandas==2.2.3
 fastparquet
 cramjam
 healpy
@@ -46,7 +46,9 @@ h5coro==0.0.8
 mortie
 ```
 
-**Critical**: numpy must be <2.3 (2.3.x has Lambda compatibility issues)
+**Critical**:
+- numpy must be built from source with 64KB page alignment for Lambda ARM64
+- NumPy 2.3.x has Lambda compatibility issues
 
 ## Build Script
 
@@ -80,8 +82,8 @@ docker run --rm --platform linux/arm64 \
     -v "$OUTPUT_DIR:/out" \
     quay.io/pypa/manylinux_2_28_aarch64 \
     bash -c '
-        # Use Python 3.11
-        PYTHON=/opt/python/cp311-cp311/bin/python
+        # Use Python 3.12 (Lambda Python 3.12 uses AL2023 with glibc 2.34)
+        PYTHON=/opt/python/cp312-cp312/bin/python
         PIP="$PYTHON -m pip"
 
         echo "Python: $($PYTHON --version)"
@@ -93,9 +95,17 @@ docker run --rm --platform linux/arm64 \
         # Install packages
         echo ""
         echo "Installing packages..."
+
+        # Build NumPy from source with 64KB page alignment for Lambda ARM64
+        # The pre-built wheels have 4KB alignment which causes ELF load errors
+        export LDFLAGS="-Wl,-z,max-page-size=0x10000"
+        export NPY_BLAS_ORDER=openblas
+        $PIP install "numpy==2.2.6" --no-binary numpy -t /out/python --no-cache-dir
+
+        # Install remaining packages with numpy pinned
+        echo "numpy==2.2.6" > /tmp/constraints.txt
         $PIP install \
-            "numpy>=2.0,<2.3" \
-            "pandas==2.3.2" fastparquet cramjam \
+            "pandas==2.2.3" fastparquet cramjam \
             healpy astropy \
             earthaccess shapely \
             -c /tmp/constraints.txt \
@@ -111,12 +121,12 @@ docker run --rm --platform linux/arm64 \
         NUMPY_VER=$(ls /out/python | grep -E "^numpy-" | head -1)
         echo ""
         echo "Installed: $NUMPY_VER"
-        if [[ "$NUMPY_VER" == *"2.3"* ]]; then
-            echo "ERROR: numpy 2.3.x installed!"
-            exit 1
+        if [[ "$NUMPY_VER" != "numpy-2.2.6.dist-info" ]]; then
+            echo "WARNING: Expected numpy 2.2.6, got $NUMPY_VER"
         fi
 
         # Remove bloat (packages already in Lambda or not needed)
+        # NOTE: Keep botocore - aiobotocore needs 1.41.x but Lambda has 1.40.4
         echo ""
         echo "Removing bloat..."
         rm -rf /out/python/pyarrow* \
@@ -124,8 +134,7 @@ docker run --rm --platform linux/arm64 \
                /out/python/xarray* \
                /out/python/matplotlib* \
                /out/python/lonboard* \
-               /out/python/boto3* \
-               /out/python/botocore* 2>/dev/null || true
+               /out/python/boto3* 2>/dev/null || true
 
         # Patch astropy to remove pytest dependency
         echo "Patching astropy..."
@@ -153,6 +162,21 @@ docker run --rm --platform linux/arm64 \
         echo "Stripping binaries..."
         find /out/python -name "*.so" -exec strip {} \; 2>/dev/null || true
 
+        # Remove duplicate/stale .so files in .libs directories
+        echo "Removing duplicate .libs entries..."
+        # Keep only the newest openblas in numpy.libs
+        cd /out/python/numpy.libs 2>/dev/null && ls -t libopenblas64*.so 2>/dev/null | tail -n +2 | xargs rm -f 2>/dev/null || true
+        cd /out/python/numpy.libs 2>/dev/null && ls -t libscipy_openblas64*.so 2>/dev/null | tail -n +2 | xargs rm -f 2>/dev/null || true
+        cd /out/python/numpy.libs 2>/dev/null && ls -t libgfortran*.so* 2>/dev/null | tail -n +2 | xargs rm -f 2>/dev/null || true
+        # Keep only the newest healpy libs
+        cd /out/python/healpy.libs 2>/dev/null && ls -t libhealpix*.so* 2>/dev/null | tail -n +2 | xargs rm -f 2>/dev/null || true
+        cd /out/python/healpy.libs 2>/dev/null && ls -t libcfitsio*.so* 2>/dev/null | tail -n +2 | xargs rm -f 2>/dev/null || true
+
+        # Remove astropy IERS data (large, not needed for our use case)
+        echo "Removing astropy IERS data..."
+        rm -rf /out/python/astropy_iers_data/data/*.all 2>/dev/null || true
+        rm -rf /out/python/astropy_iers_data/data/eopc04* 2>/dev/null || true
+
         # Report size
         echo ""
         UNZIPPED=$(du -sh /out/python | cut -f1)
@@ -160,7 +184,11 @@ docker run --rm --platform linux/arm64 \
     '
 
 # Verify size limit
-UNZIPPED_BYTES=$(du -sb "$OUTPUT_DIR/python" | cut -f1)
+UNZIPPED_BYTES=$(du -sb "$OUTPUT_DIR/python" 2>/dev/null || stat -f%z "$OUTPUT_DIR/python" 2>/dev/null || echo "0")
+# macOS doesn't have du -sb, use alternative
+if [[ "$OSTYPE" == "darwin"* ]]; then
+    UNZIPPED_BYTES=$(find "$OUTPUT_DIR/python" -type f -exec stat -f%z {} + | awk '{s+=$1} END {print s}')
+fi
 if [ "$UNZIPPED_BYTES" -gt 262144000 ]; then
     echo "ERROR: Exceeds 250MB Lambda limit!"
     exit 1
@@ -224,7 +252,7 @@ aws lambda publish-layer-version \
     --layer-name xagg-layer-arm64 \
     --description "xagg dependencies for ARM64/Graviton2" \
     --content S3Bucket=your-bucket,S3Key=layers/lambda_layer_arm64.zip \
-    --compatible-runtimes python3.11 \
+    --compatible-runtimes python3.12 \
     --compatible-architectures arm64
 ```
 
@@ -235,10 +263,10 @@ Test imports in a Lambda-like environment:
 ```bash
 docker run --rm --platform linux/arm64 \
     -v ./lambda_layer_arm64.zip:/layer.zip \
-    public.ecr.aws/lambda/python:3.11 \
+    public.ecr.aws/lambda/python:3.12 \
     bash -c '
         unzip -q /layer.zip -d /opt
-        python3.11 -c "
+        python3.12 -c "
 import sys
 sys.path.insert(0, \"/opt/python\")
 import numpy; print(f\"numpy {numpy.__version__}\")
@@ -252,6 +280,11 @@ print(\"All imports successful!\")
 ```
 
 ## Troubleshooting
+
+### "ELF load command address/offset not properly aligned" at runtime
+NumPy wasn't built with 64KB page alignment. Lambda ARM64 requires page alignment of 64KB (0x10000), but pre-built wheels use 4KB. The build script handles this with `LDFLAGS="-Wl,-z,max-page-size=0x10000"` and `--no-binary numpy`.
+
+To verify: `readelf -l /path/to/numpy/core/_multiarray_umath.cpython-311-aarch64-linux-gnu.so | grep LOAD` should show alignment of `0x10000`.
 
 ### "healpy build fails"
 Ensure you're using `manylinux_2_28_aarch64` (has GCC ≥9.3). The Lambda container's GCC is too old.
@@ -273,6 +306,7 @@ Ensure Docker Desktop is configured for native ARM execution (not Rosetta emulat
 | Ubuntu has glibc 2.39 | manylinux_2_28 has glibc 2.28 |
 | x86 runners need QEMU for ARM | Mac runs ARM natively |
 | healpy has no ARM wheels | Build from source with proper toolchain |
+| NumPy wheels have 4KB page alignment | Build from source with 64KB alignment |
 
 ## References
 
