@@ -106,11 +106,6 @@ docker run --rm --platform linux/arm64 \
         echo "Stripping binaries..."
         find /out/python -name "*.so" -exec strip {} \; 2>/dev/null || true
 
-        # Remove Python 3.11 files (we use 3.12)
-        echo "Removing Python 3.11 binaries..."
-        find /out/python -name "*cpython-311*" -delete 2>/dev/null || true
-        find /out/python -name "*cpython_311*" -delete 2>/dev/null || true
-
         # Remove duplicate/stale .so files in .libs directories
         echo "Removing duplicate .libs entries..."
         # Keep only the newest openblas in numpy.libs
