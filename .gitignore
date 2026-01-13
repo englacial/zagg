@@ -19,6 +19,7 @@ venv/
 *.egg-info/
 dist/
 build/
+uv.lock
 
 # IDE
 .vscode/
@@ -47,3 +48,5 @@ logs/
 # Environment variables
 .env
 .env.local*.zip
+
+*.json
