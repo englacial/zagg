@@ -13,11 +13,14 @@ This Lambda function processes a single morton cell (order 6) by:
 
 ## Files
 
-- **`lambda_handler.py`**: Main Lambda function handler
-- **`query_cmr_with_polygon.py`**: CMR query module (imported by handler)
-- **`requirements.txt`**: Python package requirements (minimal, dependencies in layer)
-- **`deploy_function.sh`**: Deployment script
+- **`lambda_handler.py`**: Main Lambda function handler (the only file in function.zip)
+- **`orchestrator_auth.py`**: Helper for getting NASA credentials (used by orchestrator, not Lambda)
+- **`build_arm64_layer.sh`**: Script to build the Lambda layer for ARM64
+- **`build_layer_v14.sh`**: Script to build the Lambda layer
+- **`build_granule_catalog.py`**: Script to build granule catalog for orchestrator
+- **`invoke_production.py`**: Orchestration script for invoking Lambda functions
 - **`README.md`**: This file
+- **`INSTRUCTIONS_ARM.md`**: Instructions for building ARM64 layer
 
 ## Architecture
 
@@ -25,7 +28,7 @@ This Lambda function processes a single morton cell (order 6) by:
 ┌─────────────────────────────────────────────────────────────┐
 │  Lambda Function (process-morton-cell)                      │
 │  ──────────────────────────────────────────────────────────  │
-│  Runtime: Python 3.11                                        │
+│  Runtime: Python 3.12                                        │
 │  Memory: 2048 MB (2 GB)                                      │
 │  Timeout: 720s (12 minutes)                                  │
 │  ──────────────────────────────────────────────────────────  │
@@ -156,74 +159,85 @@ aws s3 mb s3://your-output-bucket
 
 ## Deployment
 
-### Option 1: Using the deployment script
+### Step 1: Create the function package
+
+Since all dependencies are in the Lambda layer, the function package only needs the handler:
 
 ```bash
-cd /home/espg/software/xagg/lambda
-./deploy_function.sh
+cd /path/to/magg/lambda
+zip function.zip lambda_handler.py
 ```
 
-This creates `function.zip` with the Lambda function code.
+This creates a small (~17 KB) `function.zip` with just the Lambda handler code.
 
-### Option 2: Manual deployment
+### Step 2: Deploy the Lambda layer and function
 
-1. **Upload the Lambda layer**:
+**Upload the Lambda layer**:
 
 ```bash
-cd /home/espg/software/xagg
+cd /path/to/magg/lambda
 
 aws lambda publish-layer-version \
   --layer-name xagg-complete-stack \
-  --zip-file fileb://lambda_layers/xagg-complete-layer.zip \
-  --compatible-runtimes python3.11 \
+  --zip-file fileb://lambda_layer_arm64.zip \
+  --compatible-runtimes python3.12 \
+  --compatible-architectures arm64 \
   --description "xagg complete stack: numpy, pandas, xarray, xdggs, h5coro, mortie"
 ```
 
 Note the layer ARN from the output (e.g., `arn:aws:lambda:us-east-1:123456789012:layer:xagg-complete-stack:1`)
 
-2. **Create the Lambda function**:
+See `INSTRUCTIONS_ARM.md` for details on building the layer.
+
+**Create the Lambda function**:
 
 ```bash
 aws lambda create-function \
   --function-name process-morton-cell \
-  --runtime python3.11 \
+  --runtime python3.12 \
+  --architectures arm64 \
   --role arn:aws:iam::ACCOUNT_ID:role/lambda-execution-role \
   --handler lambda_handler.lambda_handler \
-  --zip-file fileb://lambda/function.zip \
+  --zip-file fileb://function.zip \
   --timeout 720 \
   --memory-size 2048 \
   --layers arn:aws:lambda:REGION:ACCOUNT_ID:layer:xagg-complete-stack:VERSION
+
 ```
 
 Replace:
 - `ACCOUNT_ID` with your AWS account ID
 - `REGION` with your AWS region (e.g., `us-east-1`)
-- `VERSION` with the layer version from step 1
+- `VERSION` with the layer version from the previous step
 - `lambda-execution-role` with your IAM role name
 
-3. **Update function code** (after initial creation):
+**Update function code** (after making changes to lambda_handler.py):
 
 ```bash
+# Re-create the zip
+zip function.zip lambda_handler.py
+
+# Update the Lambda function
 aws lambda update-function-code \
   --function-name process-morton-cell \
-  --zip-file fileb://lambda/function.zip
+  --zip-file fileb://function.zip
 ```
 
 ## Testing
 
-### Test with a single morton cell
+### Test with the orchestrator
 
-Use the provided `invoke_single_cell.py` script:
+Use the provided `invoke_production.py` script:
 
 ```bash
-cd /home/espg/software/xagg/lambda
+cd /path/to/magg/lambda
 
-# Edit the script to set your S3 bucket
+# Edit the script to configure your S3 bucket and cells to process
 # Then run:
-python invoke_single_cell.py
+uv run python invoke_production.py --dry-run --max-cells 1
 ```
 
-The script handles NASA authentication and passes credentials to the Lambda.
+The script handles NASA authentication and orchestrates Lambda invocations.
 
 ### Check CloudWatch Logs
 
@@ -319,6 +333,16 @@ Task timed out after 720.00 seconds
 - Check CloudWatch Logs to identify which step is slow
 - Profile with `max_granules` parameter to limit data
 - Consider splitting very large cells into smaller ones
+
+
+**5. Too many open files**
+
+```
+ERROR: Could not connect to the endpoint URL: "https://lambda.us-west-2.amazonaws.com/2015-03-31/functions/process-morton-cell/invocations"
+ERROR: SSL validation failed for https://lambda.us-west-2.amazonaws.com/2015-03-31/functions/process-morton-cell/invocations [Errno 24] Too many open files
+```
+
+**Solution**: Decrease max workers (e.g., `uv run python invoke_production.py --max-workers 50`) or increase ulimit (e.g., `ulimit -n 10000`)'
 
 ### Debug Mode
 

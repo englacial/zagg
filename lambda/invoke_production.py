@@ -181,6 +181,7 @@ def main():
     parser.add_argument("--child-order", type=int, default=12, help="Child cell order")
     parser.add_argument("--s3-bucket", default="xagg")
     parser.add_argument("--s3-prefix", default="atl06/production")
+    parser.add_argument("--profile", default=None)
     parser.add_argument("--dry-run", action="store_true", help="Show what would be processed without running")
     args = parser.parse_args()
 
@@ -232,9 +233,16 @@ def main():
     boto_config = Config(
         read_timeout=900,
         connect_timeout=10,
-        retries={'max_attempts': 0}  # We handle retries ourselves
+        retries={'max_attempts': 0},  # We handle retries ourselves
+        max_pool_connections=args.max_workers
     )
-    lambda_client = boto3.client('lambda', region_name='us-west-2', config=boto_config)
+
+    # Create session with optional profile
+    if args.profile:
+        session = boto3.Session(profile_name=args.profile)
+    else:
+        session = boto3.Session()  # Uses default credentials
+    lambda_client = session.client('lambda', region_name='us-west-2', config=boto_config)
 
     # Detect architecture for accurate cost calculation
     arch, price_per_gb_sec = get_lambda_architecture(lambda_client)
@@ -289,7 +297,7 @@ def main():
                 status = "empty (filtered)"
             else:
                 cells_error += 1
-                status = f"ERROR: {str(error)[:40]}"
+                status = f"ERROR: {str(error)}"
 
             # Progress update every 50 cells or on errors
             if i % 50 == 0 or cells_error > 0 and i <= 10:
