@@ -26,15 +26,11 @@ dependencies = [
     "boto3",
     "fastparquet",
     "pyarrow",
+    "pydantic-zarr>=0.9.1",
+    "zarr>=3.1.5",
 ]
 
 [project.optional-dependencies]
-dev = [
-    "pytest",
-    "pytest-cov",
-    "ruff",
-    "notebook",
-]
 lambda = [
     "shapely",
     "cramjam",
@@ -46,6 +42,7 @@ analysis = [
     "geopandas",
     "cartopy>=0.25.0",
     "matplotlib>=3.10.8",
+    "notebook",
 ]
 
 [build-system]
@@ -65,8 +62,16 @@ python_files = ["test_*.py"]
 [tool.ruff]
 line-length = 100
 target-version = "py312"
-select = ["E", "F", "W", "I", "N"]
-ignore = ["E501"]
+lint.select = ["E", "F", "W", "I", "N"]
+lint.ignore = ["E501"]
 
-[tool.ruff.isort]
+[tool.ruff.lint.isort]
 known-first-party = ["magg"]
+
+[dependency-groups]
+dev = [
+    "pre-commit>=4.5.1",
+    "pytest",
+    "pytest-cov",
+    "ruff",
+]

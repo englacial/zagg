@@ -6,12 +6,12 @@ with support for orbital cycle and region filtering via native CMR parameters.
 The CMR API has better native support for ICESat-2 orbital parameters than CMR-STAC.
 """
 
-import requests
-from typing import List, Optional, Dict
-import geopandas as gpd
-from shapely.geometry import box, Polygon, LineString
-import pandas as pd
 from datetime import datetime, timedelta
+from typing import List, Optional
+
+import geopandas as gpd
+import requests
+from shapely.geometry import LineString, Polygon, box
 
 
 def query_atl06_cmr(
@@ -67,7 +67,7 @@ def query_atl06_cmr(
     gpd.GeoDataFrame
         GeoDataFrame with granule metadata and geometries
     """
-    
+
     # CMR granule search endpoint
     cmr_url = "https://cmr.earthdata.nasa.gov/search/granules.umm_json"
 
@@ -106,7 +106,7 @@ def query_atl06_cmr(
     # We'll need to filter by filename pattern after retrieval
     # The cycle is encoded in the granule filename: ATL06_YYYYMMDDhhmmss_ttttccnn_rrr_vv
     # where cc is the cycle number
-    
+
     print(f"Querying CMR for ATL06 v{version}:")
     print(f"  Provider: {provider}")
     if cycle:
@@ -117,7 +117,7 @@ def query_atl06_cmr(
         print(f"  Temporal: {temporal}")
     if rgts:
         print(f"  RGTs: {rgts}")
-    
+
     all_granules = []
     headers = {"Accept": "application/vnd.nasa.cmr.umm_json+json"}
 
@@ -158,28 +158,28 @@ def query_atl06_cmr(
 
         # Update offset for next page
         params["offset"] += len(items)
-    
+
     print(f"Retrieved {len(all_granules)} granules from CMR")
-    
+
     # Filter by region and optionally by RGT from granule names
     filtered_granules = []
     for granule in all_granules:
         umm = granule.get("umm", {})
         granule_ur = umm.get("GranuleUR", "")
-        
+
         # Parse granule filename
         # Format: ATL06_YYYYMMDDhhmmss_ttttccnn_rrr_vv
         try:
             parts = granule_ur.split("_")
             if len(parts) >= 3:
                 rgt_cycle_region = parts[2]
-                
+
                 # Extract RGT (first 4 digits)
                 granule_rgt = int(rgt_cycle_region[0:4])
-                
+
                 # Extract cycle (next 2 digits)
                 granule_cycle = int(rgt_cycle_region[4:6])
-                
+
                 # Extract region (last 2 digits)
                 granule_region = int(rgt_cycle_region[6:8])
 
@@ -194,13 +194,13 @@ def query_atl06_cmr(
                 # Filter by RGT if specified
                 if rgts and granule_rgt not in rgts:
                     continue
-                
+
                 filtered_granules.append(granule)
-                
+
         except (ValueError, IndexError) as e:
             print(f"Warning: Could not parse granule UR {granule_ur}: {e}")
             continue
-    
+
     filter_desc = []
     if cycle is not None:
         filter_desc.append(f"cycle {cycle}")
@@ -213,15 +213,15 @@ def query_atl06_cmr(
         print(f"Filtered to {len(filtered_granules)} granules matching {' and '.join(filter_desc)}")
     else:
         print(f"Found {len(filtered_granules)} granules")
-    
+
     # Convert to GeoDataFrame
     records = []
     for granule in filtered_granules:
         umm = granule.get("umm", {})
-        
+
         # Get granule ID
         granule_id = umm.get("GranuleUR", "")
-        
+
         # Get bounding box from spatial extent
         spatial_extent = umm.get("SpatialExtent", {})
         horiz_spatial = spatial_extent.get("HorizontalSpatialDomain", {})
@@ -236,8 +236,11 @@ def query_atl06_cmr(
                 continue
 
             # Extract coordinates
-            coords = [(p["Longitude"], p["Latitude"]) for p in boundary_points
-                      if "Longitude" in p and "Latitude" in p]
+            coords = [
+                (p["Longitude"], p["Latitude"])
+                for p in boundary_points
+                if "Longitude" in p and "Latitude" in p
+            ]
 
             if len(coords) < 3:
                 continue
@@ -263,15 +266,17 @@ def query_atl06_cmr(
                     for i in range(half):
                         pt1 = coords[i]
                         pt2 = coords[n_points - 1 - i]
-                        mid = ((pt1[0] + pt2[0])/2, (pt1[1] + pt2[1])/2)
+                        mid = ((pt1[0] + pt2[0]) / 2, (pt1[1] + pt2[1]) / 2)
                         centerline_points.append(mid)
                     geom = LineString(centerline_points)
                 else:
                     # Simple polygon - just connect opposite midpoints
-                    geom = LineString([
-                        ((coords[0][0] + coords[2][0])/2, (coords[0][1] + coords[2][1])/2),
-                        ((coords[1][0] + coords[3][0])/2, (coords[1][1] + coords[3][1])/2)
-                    ])
+                    geom = LineString(
+                        [
+                            ((coords[0][0] + coords[2][0]) / 2, (coords[0][1] + coords[2][1]) / 2),
+                            ((coords[1][0] + coords[3][0]) / 2, (coords[1][1] + coords[3][1]) / 2),
+                        ]
+                    )
             else:  # Default to polygon
                 geom = polygon
         else:
@@ -288,13 +293,13 @@ def query_atl06_cmr(
 
             # Create geometry (bbox since no polygon available)
             geom = box(west, south, east, north)
-        
+
         # Get temporal info
         temporal = umm.get("TemporalExtent", {})
         range_date_times = temporal.get("RangeDateTime", {})
         begin_date = range_date_times.get("BeginningDateTime", "")
         end_date = range_date_times.get("EndingDateTime", "")
-        
+
         # Get URLs from related URLs
         related_urls = umm.get("RelatedUrls", [])
         data_urls = []
@@ -302,7 +307,7 @@ def query_atl06_cmr(
             url_type = url_obj.get("Type", "")
             if "GET DATA" in url_type:
                 data_urls.append(url_obj.get("URL", ""))
-        
+
         # Parse granule components from filename
         parts = granule_id.split("_")
         rgt_cycle_region = parts[2] if len(parts) > 2 else ""
@@ -326,7 +331,7 @@ def query_atl06_cmr(
             "n_urls": len(data_urls),
         }
         records.append(record)
-    
+
     # Create GeoDataFrame
     if records:
         gdf = gpd.GeoDataFrame(records, crs="EPSG:4326")
@@ -334,10 +339,19 @@ def query_atl06_cmr(
         # Create an empty GeoDataFrame with the expected schema
         gdf = gpd.GeoDataFrame(
             columns=[
-                "granule_id", "rgt", "cycle", "region",
-                "bbox_west", "bbox_south", "bbox_east", "bbox_north",
-                "geometry", "begin_datetime", "end_datetime",
-                "urls", "n_urls"
+                "granule_id",
+                "rgt",
+                "cycle",
+                "region",
+                "bbox_west",
+                "bbox_south",
+                "bbox_east",
+                "bbox_north",
+                "geometry",
+                "begin_datetime",
+                "end_datetime",
+                "urls",
+                "n_urls",
             ]
         )
         # Set geometry column and CRS
@@ -359,28 +373,28 @@ if __name__ == "__main__":
     # Query for cycle 22, regions 10-12
     cycle = 22
     regions = [10, 11, 12]
-    
+
     gdf = query_atl06_cmr(
         cycle=cycle,
         regions=regions,
         version="006",
         provider="NSIDC_CPRD",
     )
-    
+
     # Display results
     print("\nResults summary:")
     print(f"Total granules: {len(gdf)}")
-    
+
     if len(gdf) > 0:
-        print(f"\nRGT distribution:")
+        print("\nRGT distribution:")
         print(gdf["rgt"].value_counts().sort_index().head(10))
-        
-        print(f"\nRegion distribution:")
+
+        print("\nRegion distribution:")
         print(gdf["region"].value_counts().sort_index())
-        
-        print(f"\nSample granules:")
+
+        print("\nSample granules:")
         print(gdf[["granule_id", "rgt", "region", "bbox_west", "bbox_north"]].head(10))
-        
+
         # Save to GeoParquet
         output_file = f"/mnt/user-data/outputs/atl06_cycle{cycle}_regions_{'_'.join(map(str, regions))}_cmr.parquet"
         save_to_geoparquet(gdf, output_file)

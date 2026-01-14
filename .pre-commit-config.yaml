@@ -1,0 +1,43 @@
+default_language_version:
+  python: python3.12
+
+repos:
+  - repo: https://github.com/astral-sh/ruff-pre-commit
+    rev: v0.14.10
+    hooks:
+      - id: ruff-check
+        args: ["--fix", "--show-fixes"]
+        exclude: ^archive/
+      - id: ruff-format
+        exclude: ^archive/
+  - repo: https://github.com/codespell-project/codespell
+    rev: v2.4.1
+    hooks:
+      - id: codespell
+        args: ["-L", "fo,ihs,kake,te", "-S", "fixture,*.ipynb,archive"]
+  - repo: https://github.com/pre-commit/pre-commit-hooks
+    rev: v6.0.0
+    hooks:
+      - id: check-yaml
+        exclude: mkdocs.yml
+      - id: trailing-whitespace
+  - repo: https://github.com/pre-commit/mirrors-mypy
+    rev: v1.19.1
+    hooks:
+      - id: mypy
+        files: src|tests
+        additional_dependencies:
+          # Package dependencies
+          - packaging
+          - donfig
+          - numpy==2.1 # until https://github.com/numpy/numpy/issues/28034 is resolved
+          - typing_extensions
+          - universal-pathlib
+          - obstore>=0.5.1
+          - types-requests
+          # Tests
+          - pytest
+          - hypothesis
+          - s3fs
+          - zarr
+          - pydantic-zarr
