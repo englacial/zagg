@@ -28,6 +28,7 @@ dependencies = [
     "pyarrow",
     "pydantic-zarr>=0.9.1",
     "zarr>=3.1.5",
+    "obstore>=0.8.2",
 ]
 
 [project.optional-dependencies]
@@ -43,6 +44,11 @@ analysis = [
     "cartopy>=0.25.0",
     "matplotlib>=3.10.8",
     "notebook",
+]
+test = [
+    "pytest>=8.0",
+    "docker>=7.0",
+    "minio>=7.0",
 ]
 
 [build-system]

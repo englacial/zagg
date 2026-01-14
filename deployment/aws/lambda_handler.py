@@ -23,8 +23,12 @@ import json
 import logging
 from typing import Any, Dict
 
+from obstore.auth.boto3 import Boto3CredentialProvider
+from obstore.store import S3Store
+from zarr.storage import ObjectStore
+
 # Import cloud-agnostic processing
-from magg.processing import process_morton_cell
+from magg.processing import process_morton_cell, write_dataframe_to_zarr
 
 # Set up structured logging
 logger = logging.getLogger()
@@ -112,25 +116,29 @@ def lambda_handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
             s3_credentials=s3_creds,
         )
 
-        # Write parquet to S3 (AWS-specific)
+        # Write Zarr to S3 (AWS-specific)
         if not df_out.empty:
             s3_bucket = event["s3_bucket"]
             s3_prefix = event["s3_prefix"]
-            parent_morton = event["parent_morton"]
-            parquet_path = f"s3://{s3_bucket}/{s3_prefix}/{parent_morton}.parquet"
+            zarr_path = f"s3://{s3_bucket}/{s3_prefix}"
+            s3_store = S3Store(
+                s3_bucket,
+                prefix=s3_prefix,
+                region="us-west-2",
+                credential_provider=Boto3CredentialProvider(),
+            )
+            store = ObjectStore(store=s3_store, read_only=False)
 
-            logger.info(f"  Writing parquet to {parquet_path}...")
+            logger.info(f"  Writing data to {zarr_path}...")
 
             try:
-                df_out.to_parquet(parquet_path, index=False, engine="fastparquet")
-                logger.info(f"✓ Wrote parquet: {parquet_path}")
-                metadata["parquet_path"] = parquet_path
+                write_dataframe_to_zarr(df_out, store, event["child_order"], event["parent_order"])
             except Exception as e:
-                logger.error(f"Failed to write parquet to {parquet_path}: {e}")
-                metadata["error"] = f"Failed to write parquet: {str(e)}"
-                metadata["parquet_path"] = None
+                logger.error(f"Failed to write zarr to {zarr_path}: {e}")
+                metadata["error"] = f"Failed to write zarr: {e}"
+                metadata["zarr_path"] = None
         else:
-            metadata["parquet_path"] = None
+            metadata["zarr_path"] = None
 
         # Log structured result
         logger.info(

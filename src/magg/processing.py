@@ -7,13 +7,67 @@ cloud platforms or local processing environments.
 
 import logging
 from datetime import datetime
-from typing import Any, Dict, List, Tuple
+from typing import TYPE_CHECKING, Any, Dict, List, Tuple
 
 import h5coro
 import numpy as np
 import pandas as pd
+from zarr import config, open_array
+from zarr.abc.store import Store
+
+from magg.schema import DATA_VARS
+
+if TYPE_CHECKING:
+    pass
 
 logger = logging.getLogger(__name__)
+
+
+def write_dataframe_to_zarr(
+    df_out: pd.DataFrame,
+    store: Store,
+    child_order: int,
+    parent_order: int,
+) -> Store:
+    """
+    Write a DataFrame to an existing Zarr store.
+
+    Parameters
+    ----------
+    df_out : pd.DataFrame
+        DataFrame with columns matching COORDS + DATA_VARS from schema
+    store : Store
+        Zarr-compatible store (already contains template)
+    child_order : int
+        Order of child cells
+    parent_order : int
+        Order of parent cells
+
+    Returns
+    -------
+    dict
+        Metadata with 'zarr_written': bool, 'error': str or None
+    """
+    if df_out.empty:
+        return store
+    min_index = int(df_out["cell_ids"].min())
+    max_index = int(df_out["cell_ids"].max())
+
+    expected_count = 4 ** (child_order - parent_order)
+    actual_count = max_index - min_index + 1
+    if actual_count != expected_count:
+        raise ValueError(
+            f"Expected index range to match range between min and max cell_ids, got index_range={expected_count}, actual_range={actual_count}"
+        )
+
+    for name, series in df_out.items():
+        with config.set({"async.concurrency": 128}):
+            array = open_array(
+                store, path=f"{str(child_order)}/{name}", zarr_format=3, consolidated=False
+            )
+            array[min_index : max_index + 1] = series.values
+
+    return store
 
 
 def calculate_cell_statistics(df_cell: pd.DataFrame, value_col="h_li", sigma_col="s_li") -> dict:
@@ -289,21 +343,8 @@ def process_morton_cell(
     # Create output DataFrame
     child_cell_ids, _ = mort2healpix(children)
 
-    df_out = pd.DataFrame(
-        {
-            "child_morton": children,
-            "child_healpix": child_cell_ids,
-            "count": stats_arrays["count"],
-            "h_mean": stats_arrays["mean_weighted"],
-            "h_sigma": stats_arrays["sigma_mean"],
-            "h_min": stats_arrays["min"],
-            "h_max": stats_arrays["max"],
-            "h_variance": stats_arrays["variance"],
-            "h_q25": stats_arrays["q25"],
-            "h_q50": stats_arrays["q50"],
-            "h_q75": stats_arrays["q75"],
-        }
-    )
+    df_out = pd.DataFrame({var: stats_arrays[var] for var in DATA_VARS})
+    df_out = df_out.assign(morton=children, cell_ids=child_cell_ids)
 
     duration = (datetime.now() - start_time).total_seconds()
     logger.info(f"✓ Completed morton {parent_morton} in {duration:.1f}s")

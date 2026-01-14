@@ -38,10 +38,14 @@ numpy==2.2.6
 pandas==2.2.3
 fastparquet
 cramjam
+pyarrow
 healpy
 astropy
 earthaccess
 shapely
+pydantic-zarr>=0.9.1
+zarr>=3.1.5
+obstore>=0.8.2
 h5coro==0.0.8
 mortie
 ```
@@ -58,7 +62,7 @@ Key features of the script:
 - Uses `manylinux_2_28_aarch64` container (glibc 2.28, compatible with Lambda's 2.34)
 - Builds NumPy from source with 64KB page alignment (`LDFLAGS="-Wl,-z,max-page-size=0x10000"`)
 - Pins numpy to 2.2.6 (2.3.x has Lambda compatibility issues)
-- Removes bloat packages (pyarrow, matplotlib, boto3, etc.)
+- Removes bloat packages (matplotlib, boto3, etc.)
 - Patches astropy to remove pytest dependency
 - Strips debug symbols and cleans caches
 
@@ -110,6 +114,9 @@ sys.path.insert(0, \"/opt/python\")
 import numpy; print(f\"numpy {numpy.__version__}\")
 import pandas; print(f\"pandas {pandas.__version__}\")
 import healpy; print(f\"healpy {healpy.__version__}\")
+import zarr; print(f\"zarr {zarr.__version__}\")
+import pydantic_zarr; print(\"pydantic_zarr OK\")
+import obstore; print(\"obstore OK\")
 import h5coro; print(\"h5coro OK\")
 import earthaccess; print(\"earthaccess OK\")
 print(\"All imports successful!\")
