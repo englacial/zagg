@@ -67,7 +67,7 @@ gdf_filtered = query_atl06_cmr(
 print(f"\nFound {len(gdf_filtered)} granules for RGTs: {arctic_rgts}")
 if len(gdf_filtered) > 0:
     print("\nRGT distribution:")
-    print(gdf_filtered['rgt'].value_counts().sort_index())
+    print(gdf_filtered["rgt"].value_counts().sort_index())
 
 
 # Example 4: Spatial analysis
@@ -76,21 +76,21 @@ print("EXAMPLE 4: Spatial Analysis")
 print("=" * 80)
 
 if len(gdf_cmr) > 0:
-    print(f"\nSpatial coverage of all granules:")
+    print("\nSpatial coverage of all granules:")
     bounds = gdf_cmr.total_bounds
     print(f"  West:  {bounds[0]:7.2f}°")
     print(f"  South: {bounds[1]:7.2f}°")
     print(f"  East:  {bounds[2]:7.2f}°")
     print(f"  North: {bounds[3]:7.2f}°")
-    
+
     # Filter for high-latitude regions
-    high_lat = gdf_cmr[gdf_cmr['bbox_north'] > 70]
+    high_lat = gdf_cmr[gdf_cmr["bbox_north"] > 70]
     print(f"\nGranules with coverage > 70°N: {len(high_lat)}")
-    
+
     # Group by RGT
     print(f"\nNumber of unique RGTs: {gdf_cmr['rgt'].nunique()}")
-    print(f"Granules per RGT (top 5):")
-    print(gdf_cmr['rgt'].value_counts().head())
+    print("Granules per RGT (top 5):")
+    print(gdf_cmr["rgt"].value_counts().head())
 
 
 print("\n" + "=" * 80)

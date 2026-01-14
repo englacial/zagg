@@ -63,7 +63,7 @@ def densify_polygon(lats: np.ndarray, lons: np.ndarray, max_spacing_km: float = 
         x2, y2 = x_verts[(i + 1) % len(lats)], y_verts[(i + 1) % len(lats)]
 
         # Distance in stereo space (meters)
-        dist_m = np.sqrt((x2 - x1)**2 + (y2 - y1)**2)
+        dist_m = np.sqrt((x2 - x1) ** 2 + (y2 - y1) ** 2)
         dist_km = dist_m / 1000.0
 
         n_points = max(2, int(dist_km / max_spacing_km) + 1)
@@ -117,15 +117,17 @@ def query_cmr_antarctica(
     cycle_duration = 91
     cycle_start = launch_date + timedelta(days=(cycle - 1) * cycle_duration)
     cycle_end = cycle_start + timedelta(days=cycle_duration + 1)
-    temporal = f"{cycle_start.strftime('%Y-%m-%d')}T00:00:00Z,{cycle_end.strftime('%Y-%m-%d')}T23:59:59Z"
+    temporal = (
+        f"{cycle_start.strftime('%Y-%m-%d')}T00:00:00Z,{cycle_end.strftime('%Y-%m-%d')}T23:59:59Z"
+    )
 
     # Bounding box for Antarctica: whole globe longitude, south of -60
     # Format: west,south,east,north
-    bounding_box = f"-180,{-90},-180,{south_of},180,{south_of},180,{-90},-180,{-90}"
+    # bounding_box = f"-180,{-90},-180,{south_of},180,{south_of},180,{-90},-180,{-90}"
     # Actually CMR wants simple bbox: west,south,east,north
     bbox = f"-180,-90,180,{south_of}"
 
-    params = {
+    params: Dict[str, str | int] = {
         "provider": provider,
         "short_name": "ATL06",
         "version": version,
@@ -165,7 +167,7 @@ def query_cmr_antarctica(
         if len(items) < page_size or len(all_granules) >= total_hits:
             break
 
-        params["offset"] += len(items)
+        params["offset"] = int(params["offset"]) + len(items)
         time.sleep(0.1)  # Be nice to CMR
 
     print(f"\nRetrieved {len(all_granules)} granules from CMR")
@@ -307,7 +309,9 @@ def build_morton_catalog(
         granules_processed += 1
 
         if (i + 1) % 500 == 0:
-            print(f"  Processed {i + 1}/{len(granules)} granules, {len(catalog)} cells...", end="\r")
+            print(
+                f"  Processed {i + 1}/{len(granules)} granules, {len(catalog)} cells...", end="\r"
+            )
 
     print(f"\nProcessed {granules_processed} granules with geometry")
     print(f"  Total unique parent cells: {len(catalog)}")
@@ -324,7 +328,9 @@ def main():
     parser.add_argument("--output", default=None, help="Output JSON file path")
     parser.add_argument("--south-of", type=float, default=-60.0, help="Southern latitude bound")
     parser.add_argument("--no-densify", action="store_true", help="Disable polygon densification")
-    parser.add_argument("--densify-spacing", type=float, default=5.0, help="Densification spacing in km (default 5)")
+    parser.add_argument(
+        "--densify-spacing", type=float, default=5.0, help="Densification spacing in km (default 5)"
+    )
     args = parser.parse_args()
 
     start_time = time.time()
@@ -351,9 +357,11 @@ def main():
 
     # Summary stats
     granule_counts = [len(urls) for urls in catalog.values()]
-    print(f"\nCatalog statistics:")
+    print("\nCatalog statistics:")
     print(f"  Parent cells: {len(catalog)}")
-    print(f"  Granules per cell: min={min(granule_counts)}, max={max(granule_counts)}, avg={np.mean(granule_counts):.1f}")
+    print(
+        f"  Granules per cell: min={min(granule_counts)}, max={max(granule_counts)}, avg={np.mean(granule_counts):.1f}"
+    )
 
     # Save catalog
     output_file = args.output or f"granule_catalog_cycle{args.cycle}_order{args.parent_order}.json"

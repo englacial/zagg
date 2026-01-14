@@ -64,86 +64,96 @@ def lambda_handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
     logger.info("=" * 70)
 
     # Log structured event data
-    logger.info(json.dumps({
-        'event_type': 'lambda_invocation',
-        'parent_morton': event.get('parent_morton'),
-        'granule_count': len(event.get('granule_urls', [])),
-        'child_order': event.get('child_order'),
-        'request_id': context.aws_request_id
-    }))
+    logger.info(
+        json.dumps(
+            {
+                "event_type": "lambda_invocation",
+                "parent_morton": event.get("parent_morton"),
+                "granule_count": len(event.get("granule_urls", [])),
+                "child_order": event.get("child_order"),
+                "request_id": context.aws_request_id,
+            }
+        )
+    )
 
     try:
         # Validate required parameters
-        required_params = ['parent_morton', 'parent_order', 'child_order', 'granule_urls', 's3_bucket', 's3_prefix', 's3_credentials']
+        required_params = [
+            "parent_morton",
+            "parent_order",
+            "child_order",
+            "granule_urls",
+            "s3_bucket",
+            "s3_prefix",
+            "s3_credentials",
+        ]
         missing_params = [p for p in required_params if p not in event]
 
         if missing_params:
             error_msg = f"Missing required parameters: {', '.join(missing_params)}"
             logger.error(error_msg)
-            return {
-                'statusCode': 400,
-                'body': json.dumps({'error': error_msg})
-            }
+            return {"statusCode": 400, "body": json.dumps({"error": error_msg})}
 
         # Validate s3_credentials structure
-        s3_creds = event['s3_credentials']
-        required_cred_keys = ['accessKeyId', 'secretAccessKey', 'sessionToken']
+        s3_creds = event["s3_credentials"]
+        required_cred_keys = ["accessKeyId", "secretAccessKey", "sessionToken"]
         missing_cred_keys = [k for k in required_cred_keys if k not in s3_creds]
         if missing_cred_keys:
             error_msg = f"Missing s3_credentials keys: {', '.join(missing_cred_keys)}"
             logger.error(error_msg)
-            return {
-                'statusCode': 400,
-                'body': json.dumps({'error': error_msg})
-            }
+            return {"statusCode": 400, "body": json.dumps({"error": error_msg})}
 
         # Process the morton cell using cloud-agnostic function
         df_out, metadata = process_morton_cell(
-            parent_morton=event['parent_morton'],
-            parent_order=event['parent_order'],
-            child_order=event['child_order'],
-            granule_urls=event['granule_urls'],
+            parent_morton=event["parent_morton"],
+            parent_order=event["parent_order"],
+            child_order=event["child_order"],
+            granule_urls=event["granule_urls"],
             s3_credentials=s3_creds,
         )
 
         # Write parquet to S3 (AWS-specific)
         if not df_out.empty:
-            s3_bucket = event['s3_bucket']
-            s3_prefix = event['s3_prefix']
-            parent_morton = event['parent_morton']
+            s3_bucket = event["s3_bucket"]
+            s3_prefix = event["s3_prefix"]
+            parent_morton = event["parent_morton"]
             parquet_path = f"s3://{s3_bucket}/{s3_prefix}/{parent_morton}.parquet"
 
             logger.info(f"  Writing parquet to {parquet_path}...")
 
             try:
-                df_out.to_parquet(parquet_path, index=False, engine='fastparquet')
+                df_out.to_parquet(parquet_path, index=False, engine="fastparquet")
                 logger.info(f"✓ Wrote parquet: {parquet_path}")
-                metadata['parquet_path'] = parquet_path
+                metadata["parquet_path"] = parquet_path
             except Exception as e:
                 logger.error(f"Failed to write parquet to {parquet_path}: {e}")
-                metadata['error'] = f'Failed to write parquet: {str(e)}'
-                metadata['parquet_path'] = None
+                metadata["error"] = f"Failed to write parquet: {str(e)}"
+                metadata["parquet_path"] = None
         else:
-            metadata['parquet_path'] = None
+            metadata["parquet_path"] = None
 
         # Log structured result
-        logger.info(json.dumps({
-            'event_type': 'processing_complete',
-            'parent_morton': metadata['parent_morton'],
-            'cells_with_data': metadata['cells_with_data'],
-            'total_obs': metadata['total_obs'],
-            'duration_s': metadata['duration_s'],
-            'error': metadata.get('error'),
-            'request_id': context.aws_request_id
-        }))
+        logger.info(
+            json.dumps(
+                {
+                    "event_type": "processing_complete",
+                    "parent_morton": metadata["parent_morton"],
+                    "cells_with_data": metadata["cells_with_data"],
+                    "total_obs": metadata["total_obs"],
+                    "duration_s": metadata["duration_s"],
+                    "error": metadata.get("error"),
+                    "request_id": context.aws_request_id,
+                }
+            )
+        )
 
         logger.info("=" * 70)
         logger.info("Lambda invocation completed successfully")
         logger.info("=" * 70)
 
         return {
-            'statusCode': 200 if not metadata.get('error') else 500,
-            'body': json.dumps(metadata)
+            "statusCode": 200 if not metadata.get("error") else 500,
+            "body": json.dumps(metadata),
         }
 
     except Exception as e:
@@ -151,10 +161,12 @@ def lambda_handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
         logger.exception(e)
 
         return {
-            'statusCode': 500,
-            'body': json.dumps({
-                'error': f'Unhandled exception: {str(e)}',
-                'parent_morton': event.get('parent_morton'),
-                'request_id': context.aws_request_id
-            })
+            "statusCode": 500,
+            "body": json.dumps(
+                {
+                    "error": f"Unhandled exception: {str(e)}",
+                    "parent_morton": event.get("parent_morton"),
+                    "request_id": context.aws_request_id,
+                }
+            ),
         }

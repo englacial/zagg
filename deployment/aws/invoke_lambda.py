@@ -37,17 +37,17 @@ def get_lambda_architecture(lambda_client) -> tuple[str, float]:
     """Detect Lambda architecture and return (arch, price_per_gb_second)."""
     try:
         response = lambda_client.get_function(FunctionName=LAMBDA_FUNCTION_NAME)
-        architectures = response.get('Configuration', {}).get('Architectures', ['x86_64'])
-        arch = architectures[0] if architectures else 'x86_64'
-        price = LAMBDA_PRICE_ARM if arch == 'arm64' else LAMBDA_PRICE_X86
+        architectures = response.get("Configuration", {}).get("Architectures", ["x86_64"])
+        arch = architectures[0] if architectures else "x86_64"
+        price = LAMBDA_PRICE_ARM if arch == "arm64" else LAMBDA_PRICE_X86
         return arch, price
     except Exception:
-        return 'x86_64', LAMBDA_PRICE_X86
+        return "x86_64", LAMBDA_PRICE_X86
 
 
 def load_catalog(catalog_path: str) -> dict:
     """Load granule catalog from JSON file."""
-    with open(catalog_path, 'r') as f:
+    with open(catalog_path, "r") as f:
         data = json.load(f)
     return data
 
@@ -63,14 +63,14 @@ def parse_lambda_report(log_result: str) -> dict:
     import re
 
     try:
-        logs = base64.b64decode(log_result).decode('utf-8')
+        logs = base64.b64decode(log_result).decode("utf-8")
         # Find the REPORT line
-        for line in logs.split('\n'):
-            if 'REPORT' in line and 'Max Memory Used' in line:
+        for line in logs.split("\n"):
+            if "REPORT" in line and "Max Memory Used" in line:
                 # Extract max memory used
-                match = re.search(r'Max Memory Used:\s*(\d+)\s*MB', line)
+                match = re.search(r"Max Memory Used:\s*(\d+)\s*MB", line)
                 if match:
-                    return {'max_memory_mb': int(match.group(1))}
+                    return {"max_memory_mb": int(match.group(1))}
     except Exception:
         pass
     return {}
@@ -86,7 +86,7 @@ def invoke_lambda(
     s3_prefix: str,
     s3_credentials: dict,
     function_name: str = "process-morton-cell",
-    max_retries: int = 3
+    max_retries: int = 3,
 ) -> dict:
     """Invoke Lambda and return result with timing. Retries on throttling."""
     wall_start = time.time()
@@ -101,8 +101,8 @@ def invoke_lambda(
         "s3_credentials": {
             "accessKeyId": s3_credentials["accessKeyId"],
             "secretAccessKey": s3_credentials["secretAccessKey"],
-            "sessionToken": s3_credentials["sessionToken"]
-        }
+            "sessionToken": s3_credentials["sessionToken"],
+        },
     }
 
     last_error = None
@@ -110,17 +110,17 @@ def invoke_lambda(
         try:
             response = lambda_client.invoke(
                 FunctionName=function_name,
-                InvocationType='RequestResponse',
-                LogType='Tail',
-                Payload=json.dumps(event)
+                InvocationType="RequestResponse",
+                LogType="Tail",
+                Payload=json.dumps(event),
             )
 
             # Check for Lambda-level errors (timeout, OOM, crash)
-            function_error = response.get('FunctionError')
+            function_error = response.get("FunctionError")
             is_timeout = False
             if function_error:
-                error_payload = response['Payload'].read().decode('utf-8')
-                if 'Task timed out' in error_payload:
+                error_payload = response["Payload"].read().decode("utf-8")
+                if "Task timed out" in error_payload:
                     is_timeout = True
                     last_error = f"Lambda timeout: {error_payload[:100]}"
                 else:
@@ -128,10 +128,10 @@ def invoke_lambda(
                 if not is_timeout:
                     continue
 
-            result = json.loads(response['Payload'].read()) if not function_error else {}
+            result = json.loads(response["Payload"].read()) if not function_error else {}
             wall_time = time.time() - wall_start
 
-            log_result = response.get('LogResult', '')
+            log_result = response.get("LogResult", "")
             log_info = parse_lambda_report(log_result) if log_result else {}
 
             try:
@@ -156,7 +156,7 @@ def invoke_lambda(
             last_error = str(e)
             retryable = ["TooManyRequestsException", "Rate exceeded", "Read timeout", "timed out"]
             if any(x in last_error for x in retryable):
-                sleep_time = (2 ** attempt) + (time.time() % 1)
+                sleep_time = (2**attempt) + (time.time() % 1)
                 time.sleep(sleep_time)
             else:
                 break
@@ -176,13 +176,19 @@ def invoke_lambda(
 def main():
     parser = argparse.ArgumentParser(description="Production Lambda orchestrator")
     parser.add_argument("--catalog", required=True, help="Path to granule catalog JSON")
-    parser.add_argument("--max-workers", type=int, default=1700, help="Max concurrent Lambda invocations")
-    parser.add_argument("--max-cells", type=int, default=None, help="Limit number of cells (for testing)")
+    parser.add_argument(
+        "--max-workers", type=int, default=1700, help="Max concurrent Lambda invocations"
+    )
+    parser.add_argument(
+        "--max-cells", type=int, default=None, help="Limit number of cells (for testing)"
+    )
     parser.add_argument("--child-order", type=int, default=12, help="Child cell order")
     parser.add_argument("--s3-bucket", default="xagg")
     parser.add_argument("--s3-prefix", default="atl06/production")
     parser.add_argument("--profile", default=None)
-    parser.add_argument("--dry-run", action="store_true", help="Show what would be processed without running")
+    parser.add_argument(
+        "--dry-run", action="store_true", help="Show what would be processed without running"
+    )
     args = parser.parse_args()
 
     print("=" * 70)
@@ -206,7 +212,7 @@ def main():
     # Get cells to process (catalog keys are strings)
     all_cells = list(catalog.keys())
     if args.max_cells:
-        cells = all_cells[:args.max_cells]
+        cells = all_cells[: args.max_cells]
         print(f"      Limited to {len(cells)} cells (of {len(all_cells)} total)")
     else:
         cells = all_cells
@@ -217,7 +223,9 @@ def main():
         print(f"      Total: {len(cells)}")
         print(f"      First 5: {cells[:5]}")
         granule_counts = [len(catalog[c]) for c in cells]
-        print(f"      Granules per cell: min={min(granule_counts)}, max={max(granule_counts)}, avg={sum(granule_counts)/len(granule_counts):.1f}")
+        print(
+            f"      Granules per cell: min={min(granule_counts)}, max={max(granule_counts)}, avg={sum(granule_counts) / len(granule_counts):.1f}"
+        )
         return
 
     # Step 2: Get credentials
@@ -233,8 +241,8 @@ def main():
     boto_config = Config(
         read_timeout=900,
         connect_timeout=10,
-        retries={'max_attempts': 0},  # We handle retries ourselves
-        max_pool_connections=args.max_workers
+        retries={"max_attempts": 0},  # We handle retries ourselves
+        max_pool_connections=args.max_workers,
     )
 
     # Create session with optional profile
@@ -242,7 +250,7 @@ def main():
         session = boto3.Session(profile_name=args.profile)
     else:
         session = boto3.Session()  # Uses default credentials
-    lambda_client = session.client('lambda', region_name='us-west-2', config=boto_config)
+    lambda_client = session.client("lambda", region_name="us-west-2", config=boto_config)
 
     # Detect architecture for accurate cost calculation
     arch, price_per_gb_sec = get_lambda_architecture(lambda_client)
@@ -271,8 +279,9 @@ def main():
                 catalog[cell],  # Granule URLs for this cell
                 args.s3_bucket,
                 args.s3_prefix,
-                s3_creds
-            ): cell for cell in cells
+                s3_creds,
+            ): cell
+            for cell in cells
         }
 
         for i, future in enumerate(as_completed(futures), 1):
@@ -304,23 +313,27 @@ def main():
                 elapsed = time.time() - start_time
                 rate = i / elapsed if elapsed > 0 else 0
                 eta = (len(cells) - i) / rate if rate > 0 else 0
-                print(f"      [{i:4d}/{len(cells)}] {status} | {rate:.1f} cells/s, ETA {eta/60:.1f}m")
+                print(
+                    f"      [{i:4d}/{len(cells)}] {status} | {rate:.1f} cells/s, ETA {eta / 60:.1f}m"
+                )
 
     total_wall_time = time.time() - start_time
 
     # Step 4: Calculate costs
-    print(f"\n[4/5] Cost Calculation")
+    print("\n[4/5] Cost Calculation")
     print("-" * 70)
     gb_seconds = total_lambda_time * LAMBDA_MEMORY_GB
     cost = gb_seconds * price_per_gb_sec
-    print(f"      Total Lambda execution time: {total_lambda_time:,.1f}s ({total_lambda_time/3600:.2f} hours)")
+    print(
+        f"      Total Lambda execution time: {total_lambda_time:,.1f}s ({total_lambda_time / 3600:.2f} hours)"
+    )
     print(f"      Memory: {LAMBDA_MEMORY_MB}MB ({LAMBDA_MEMORY_GB}GB)")
     print(f"      Architecture: {arch}")
     print(f"      GB-seconds: {gb_seconds:,.1f}")
     print(f"      Cost: ${cost:.4f}")
 
     # Step 5: Summary
-    print(f"\n[5/5] Summary")
+    print("\n[5/5] Summary")
     print("=" * 70)
     print(f"      Total cells:          {len(cells)}")
     print(f"      With data:            {cells_with_data}")
@@ -329,37 +342,42 @@ def main():
     print(f"      Errors:               {cells_error}")
     print(f"      Total observations:   {total_obs:,}")
     print("-" * 70)
-    print(f"      Wall clock time:      {total_wall_time:.1f}s ({total_wall_time/60:.1f}m)")
-    print(f"      Lambda compute time:  {total_lambda_time:,.1f}s ({total_lambda_time/60:.1f}m)")
-    print(f"      Throughput:           {len(cells)/total_wall_time:.1f} cells/sec")
+    print(f"      Wall clock time:      {total_wall_time:.1f}s ({total_wall_time / 60:.1f}m)")
+    print(f"      Lambda compute time:  {total_lambda_time:,.1f}s ({total_lambda_time / 60:.1f}m)")
+    print(f"      Throughput:           {len(cells) / total_wall_time:.1f} cells/sec")
     print(f"      Estimated cost:       ${cost:.4f}")
     print("-" * 70)
     print(f"      Output location:      s3://{args.s3_bucket}/{args.s3_prefix}/")
     print("=" * 70)
 
     # Save results to JSON
-    timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     output_file = f"production_results_{timestamp}.json"
-    with open(output_file, 'w') as f:
-        json.dump({
-            "config": vars(args),
-            "catalog_metadata": metadata,
-            "summary": {
-                "total_cells": len(cells),
-                "cells_with_data": cells_with_data,
-                "cells_no_granules": cells_no_granules,
-                "cells_no_data": cells_no_data,
-                "cells_error": cells_error,
-                "total_obs": total_obs,
-                "wall_time_s": total_wall_time,
-                "lambda_time_s": total_lambda_time,
-                "gb_seconds": gb_seconds,
-                "architecture": arch,
-                "price_per_gb_sec": price_per_gb_sec,
-                "estimated_cost_usd": cost
+    with open(output_file, "w") as f:
+        json.dump(
+            {
+                "config": vars(args),
+                "catalog_metadata": metadata,
+                "summary": {
+                    "total_cells": len(cells),
+                    "cells_with_data": cells_with_data,
+                    "cells_no_granules": cells_no_granules,
+                    "cells_no_data": cells_no_data,
+                    "cells_error": cells_error,
+                    "total_obs": total_obs,
+                    "wall_time_s": total_wall_time,
+                    "lambda_time_s": total_lambda_time,
+                    "gb_seconds": gb_seconds,
+                    "architecture": arch,
+                    "price_per_gb_sec": price_per_gb_sec,
+                    "estimated_cost_usd": cost,
+                },
+                "results": results,
             },
-            "results": results
-        }, f, indent=2, default=str)
+            f,
+            indent=2,
+            default=str,
+        )
     print(f"\nResults saved to: {output_file}")
 
 
