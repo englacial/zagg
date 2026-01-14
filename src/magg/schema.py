@@ -82,7 +82,7 @@ def create_zarr_template(
     base_array_spec = ArraySpec(
         attributes={},
         shape=(n_pixels,),
-        dimension_names=("cell_ids",),
+        dimension_names=("cells",),
         data_type="float32",
         chunk_grid=NamedConfig(name="regular", configuration={"chunk_shape": (n_children,)}),
         chunk_key_encoding=NamedConfig(name="default", configuration={"separator": "/"}),
@@ -103,8 +103,33 @@ def create_zarr_template(
         if var != "count":  # count already added above with different dtype/fill
             members[var] = base_array_spec
 
+    dggs_attrs = {
+        "zarr_conventions": [
+            {
+                "schema_url": "https://raw.githubusercontent.com/zarr-conventions/dggs/refs/tags/v1/schema.json",
+                "spec_url": "https://github.com/zarr-conventions/dggs/blob/v1/README.md",
+                "uuid": "7b255807-140c-42ca-97f6-7a1cfecdbc38",
+                "name": "dggs",
+                "description": "Discrete Global Grid Systems convention for zarr",
+            }
+        ],
+        "dggs": {
+            "name": "healpix",
+            "refinement_level": child_order,
+            "indexing_scheme": "nested",
+            "spatial_dimension": "cells",
+            "ellipsoid": {
+                "name": "wgs84",
+                "semimajor_axis": 6378137.0,
+                "inverse_flattening": 298.257223563,
+            },
+            "coordinate": "cell_ids",
+            "compression": "none",
+        },
+    }
+
     # Create and write group specification
-    spec = ATL06AggregationGroup(members=members, attributes={})  # type: ignore[arg-type]
+    spec = ATL06AggregationGroup(members=members, attributes=dggs_attrs)  # type: ignore[arg-type]
     with config.set({"async.concurrency": 128}):
         spec.to_zarr(store, str(child_order), overwrite=overwrite)
 
