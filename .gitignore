@@ -17,6 +17,7 @@ env/
 venv/
 .venv/
 *.egg-info/
+src/magg.egg-info/
 dist/
 build/
 uv.lock
@@ -47,6 +48,12 @@ logs/
 
 # Environment variables
 .env
-.env.local*.zip
+.env.local
 
+# Deployment artifacts
+deployment/data/results/*.json
+deployment/layers/*.zip
+
+# Archives (except examples)
+*.zip
 *.json
