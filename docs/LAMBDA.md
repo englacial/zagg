@@ -36,9 +36,10 @@ This Lambda function processes a single morton cell (order 6) by:
 │    - deployment/aws/lambda_handler.py (AWS wrapper)          │
 │    - src/magg/ package (processing, auth, catalog)           │
 │  ──────────────────────────────────────────────────────────  │
-│  Layer (57 MB compressed, 227 MB uncompressed):              │
+│  Layer (~70 MB compressed, ~240 MB uncompressed):            │
 │    - numpy, pandas, h5coro, mortie, healpy                   │
 │    - fastparquet, cramjam, shapely, astropy, earthaccess     │
+│    - pydantic-zarr, zarr, obstore, pyarrow                   │
 └─────────────────────────────────────────────────────────────┘
 ```
 
@@ -173,7 +174,7 @@ Since all dependencies are in the Lambda layer, the function package needs the h
 cd /path/to/magg
 
 # Create function.zip with handler and magg package
-zip -r function.zip deployment/aws/lambda_handler.py src/magg/
+zip -j deployment/aws/function.zip deployment/aws/lambda_handler.py && cd src &&  zip -ur ../deployment/aws/function.zip magg/ -i "*.py" && cd ..
 ```
 
 This creates a small (~20 KB) `function.zip` with the Lambda handler and core package code.
@@ -191,7 +192,7 @@ aws lambda create-function \
   --architectures arm64 \
   --role arn:aws:iam::ACCOUNT_ID:role/lambda-execution-role \
   --handler deployment.aws.lambda_handler.lambda_handler \
-  --zip-file fileb://function.zip \
+  --zip-file fileb://deployment/aws/function.zip \
   --timeout 720 \
   --memory-size 2048 \
   --layers arn:aws:lambda:REGION:ACCOUNT_ID:layer:xagg-complete-stack:VERSION
@@ -209,12 +210,13 @@ Replace:
 
 ```bash
 # Re-create the zip
-zip -r function.zip deployment/aws/lambda_handler.py src/magg/
+zip -j deployment/aws/function.zip deployment/aws/lambda_handler.py && cd src &&  zip -ur ../deployment/aws/function.zip magg/ -i "*.py" && cd ..
+
 
 # Update the Lambda function
 aws lambda update-function-code \
   --function-name process-morton-cell \
-  --zip-file fileb://function.zip
+  --zip-file fileb://deployment/aws/function.zip
 ```
 
 ## Testing
@@ -225,6 +227,9 @@ Use the provided orchestration script:
 
 ```bash
 cd /path/to/magg
+
+# Set AWS profile if not using default credentials
+export AWS_PROFILE=your-profile-name
 
 # First, build a granule catalog
 uv run python -m magg.catalog --cycle 22 --parent-order 6

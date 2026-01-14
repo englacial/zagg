@@ -21,8 +21,13 @@ from datetime import datetime
 
 import boto3
 from botocore.config import Config
+from obstore.auth.boto3 import Boto3CredentialProvider
+from obstore.store import S3Store
+from zarr import consolidate_metadata
+from zarr.storage import ObjectStore
 
 from magg.auth import get_nsidc_s3_credentials
+from magg.schema import create_zarr_template
 
 # Lambda pricing (us-west-2)
 # https://aws.amazon.com/lambda/pricing/
@@ -184,10 +189,15 @@ def main():
     )
     parser.add_argument("--child-order", type=int, default=12, help="Child cell order")
     parser.add_argument("--s3-bucket", default="xagg")
-    parser.add_argument("--s3-prefix", default="atl06/production")
-    parser.add_argument("--profile", default=None)
+    parser.add_argument("--s3-prefix", default="atl06/production.zarr")
     parser.add_argument(
         "--dry-run", action="store_true", help="Show what would be processed without running"
+    )
+    parser.add_argument(
+        "--overwrite-template",
+        action="store_true",
+        default=False,
+        help="Overwrite existing Zarr template if it exists",
     )
     args = parser.parse_args()
 
@@ -196,12 +206,13 @@ def main():
     print("=" * 70)
 
     # Step 1: Load catalog
-    print(f"\n[1/5] Loading granule catalog from {args.catalog}...")
+    print(f"\n[1/7] Loading granule catalog from {args.catalog}...")
     catalog_data = load_catalog(args.catalog)
     metadata = catalog_data["metadata"]
     catalog = catalog_data["catalog"]
 
     parent_order = metadata["parent_order"]
+    child_order = args.child_order
     cycle = metadata["cycle"]
 
     print(f"      Cycle: {cycle}")
@@ -229,13 +240,26 @@ def main():
         return
 
     # Step 2: Get credentials
-    print("\n[2/5] Authenticating with NASA Earthdata...")
+    print("\n[2/7] Authenticating with NASA Earthdata...")
     s3_creds = get_nsidc_s3_credentials()
     print(f"      Credentials expire: {s3_creds.get('expiration', 'N/A')}")
 
-    # Step 3: Invoke Lambdas in parallel
-    print(f"\n[3/5] Invoking {len(cells)} Lambda functions (max {args.max_workers} concurrent)...")
-    print(f"      Output: s3://{args.s3_bucket}/{args.s3_prefix}/")
+    # Step 3: Create Zarr store
+
+    print("\n[3/7] Creating template Zarr store...")
+    print(f"      Output: s3://{args.s3_bucket}/{args.s3_prefix}")
+    s3_store = S3Store(
+        args.s3_bucket,
+        prefix=args.s3_prefix,
+        region="us-west-2",
+        credential_provider=Boto3CredentialProvider(),
+    )
+    store = ObjectStore(store=s3_store, read_only=False)
+    store = create_zarr_template(
+        store, parent_order, child_order, overwrite=args.overwrite_template
+    )
+    # Step 4: Invoke Lambdas in parallel
+    print(f"\n[4/7] Invoking {len(cells)} Lambda functions (max {args.max_workers} concurrent)...")
 
     # Configure client with longer timeouts
     boto_config = Config(
@@ -245,11 +269,7 @@ def main():
         max_pool_connections=args.max_workers,
     )
 
-    # Create session with optional profile
-    if args.profile:
-        session = boto3.Session(profile_name=args.profile)
-    else:
-        session = boto3.Session()  # Uses default credentials
+    session = boto3.Session()
     lambda_client = session.client("lambda", region_name="us-west-2", config=boto_config)
 
     # Detect architecture for accurate cost calculation
@@ -267,7 +287,6 @@ def main():
     total_lambda_time = 0.0
 
     start_time = time.time()
-
     with ThreadPoolExecutor(max_workers=args.max_workers) as executor:
         futures = {
             executor.submit(
@@ -275,7 +294,7 @@ def main():
                 lambda_client,
                 int(cell),  # Convert string key back to int
                 parent_order,
-                args.child_order,
+                child_order,
                 catalog[cell],  # Granule URLs for this cell
                 args.s3_bucket,
                 args.s3_prefix,
@@ -317,10 +336,14 @@ def main():
                     f"      [{i:4d}/{len(cells)}] {status} | {rate:.1f} cells/s, ETA {eta / 60:.1f}m"
                 )
 
+    # Step 5: Consolidate metadata for quicker opening later
+    print("\n[5/7] Cost Calculation")
+    consolidate_metadata(store, zarr_format=3)
+
     total_wall_time = time.time() - start_time
 
-    # Step 4: Calculate costs
-    print("\n[4/5] Cost Calculation")
+    # Step 6: Calculate costs
+    print("\n[6/7] Cost Calculation")
     print("-" * 70)
     gb_seconds = total_lambda_time * LAMBDA_MEMORY_GB
     cost = gb_seconds * price_per_gb_sec
@@ -332,8 +355,8 @@ def main():
     print(f"      GB-seconds: {gb_seconds:,.1f}")
     print(f"      Cost: ${cost:.4f}")
 
-    # Step 5: Summary
-    print("\n[5/5] Summary")
+    # Step 7: Summary
+    print("\n[7/7] Summary")
     print("=" * 70)
     print(f"      Total cells:          {len(cells)}")
     print(f"      With data:            {cells_with_data}")

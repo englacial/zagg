@@ -52,6 +52,7 @@ docker run --rm --platform linux/arm64 \
             "pandas==2.2.3" fastparquet cramjam \
             healpy astropy \
             earthaccess shapely \
+            "pydantic-zarr>=0.9.1" "zarr>=3.1.5" "obstore>=0.8.2" \
             -c /tmp/constraints.txt \
             -t /out/python \
             --no-cache-dir

@@ -53,7 +53,7 @@ logs/
 # Deployment artifacts
 deployment/data/results/*.json
 deployment/layers/*.zip
-
+deployment/aws/layer_build*
 # Archives (except examples)
 *.zip
 *.json
