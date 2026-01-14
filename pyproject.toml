@@ -38,8 +38,10 @@ lambda = [
     "astropy",
 ]
 analysis = [
+    "cubed>=0.24.0",
+    "cubed-xarray>=0.0.9",
     "xarray",
-    "xdggs",
+    "xdggs @ git+https://github.com/xarray-contrib/xdggs.git@main",
     "geopandas",
     "cartopy>=0.25.0",
     "matplotlib>=3.10.8",

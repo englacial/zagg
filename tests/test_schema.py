@@ -102,7 +102,7 @@ class TestCreateZarrTemplate:
         for name in COORDS + DATA_VARS:
             array = open_array(store, path=f"{child_order}/{name}", mode="r")
             print(array.metadata)
-            assert array.metadata.dimension_names == ("cell_ids",)
+            assert array.metadata.dimension_names == ("cells",)
 
     def test_child_order_less_than_parent_raises(self):
         """Test that child_order < parent_order raises ValueError."""
