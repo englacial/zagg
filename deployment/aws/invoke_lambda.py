@@ -6,11 +6,11 @@ Uses pre-built granule catalog to avoid per-Lambda CMR queries.
 
 Usage:
     # First, build the catalog:
-    python build_granule_catalog.py --cycle 22 --parent-order 6
+    python -m magg.catalog --cycle 22 --parent-order 6
 
     # Then run production:
-    python invoke_production.py --catalog granule_catalog_cycle22_order6.json
-    python invoke_production.py --catalog granule_catalog_cycle22_order6.json --max-cells 200
+    python deployment/aws/invoke_lambda.py --catalog deployment/data/catalogs/granule_catalog_cycle22_order6.json
+    python deployment/aws/invoke_lambda.py --catalog deployment/data/catalogs/granule_catalog_cycle22_order6.json --max-cells 200
 """
 
 import argparse
@@ -22,7 +22,7 @@ from datetime import datetime
 import boto3
 from botocore.config import Config
 
-from orchestrator_auth import get_nsidc_s3_credentials
+from magg.auth import get_nsidc_s3_credentials
 
 # Lambda pricing (us-west-2)
 # https://aws.amazon.com/lambda/pricing/

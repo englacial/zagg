@@ -4,7 +4,7 @@ on:
   workflow_dispatch:
   push:
     paths:
-      - 'lambda/build_layer_v14.sh'
+      - 'deployment/aws/build_layer_v14.sh'
       - '.github/workflows/build-lambda-layers.yml'
 
 permissions:
@@ -26,7 +26,7 @@ jobs:
             --platform linux/amd64 \
             --entrypoint "" \
             -v ${{ github.workspace }}:/workspace \
-            -w /workspace/lambda \
+            -w /workspace/deployment/aws \
             public.ecr.aws/lambda/python:3.11 \
             bash -c "
               yum install -y zip &&
@@ -39,7 +39,7 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: lambda-layer-x86_64
-          path: lambda/lambda_layer_x86_64.zip
+          path: deployment/layers/lambda_layer_x86_64.zip
           retention-days: 30
 
   commit-layers:
@@ -57,7 +57,7 @@ jobs:
         uses: actions/download-artifact@v4
         with:
           name: lambda-layer-x86_64
-          path: lambda/
+          path: deployment/layers/
 
       - name: Commit layer
         run: |
@@ -65,7 +65,7 @@ jobs:
           git config user.email "github-actions[bot]@users.noreply.github.com"
           git lfs install
 
-          git add lambda/lambda_layer_x86_64.zip
+          git add deployment/layers/lambda_layer_x86_64.zip
 
           if git diff --cached --quiet; then
             echo "No changes to commit"

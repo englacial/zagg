@@ -130,12 +130,12 @@ fi
 echo ""
 echo "Creating ${ZIP_NAME}..."
 cd "$OUTPUT_DIR"
-zip -r9q "${SCRIPT_DIR}/${ZIP_NAME}" python
+zip -r9q "${SCRIPT_DIR}/../layers/${ZIP_NAME}" python
 cd "$SCRIPT_DIR"
 
 # Report final sizes
-ZIPPED_SIZE=$(du -h "${ZIP_NAME}" | cut -f1)
-ZIPPED_BYTES=$(stat -c%s "${ZIP_NAME}" 2>/dev/null || stat -f%z "${ZIP_NAME}")
+ZIPPED_SIZE=$(du -h "../layers/${ZIP_NAME}" | cut -f1)
+ZIPPED_BYTES=$(stat -c%s "../layers/${ZIP_NAME}" 2>/dev/null || stat -f%z "../layers/${ZIP_NAME}")
 
 echo ""
 echo "============================================================"
@@ -145,7 +145,7 @@ echo "  Arch:     ${ARCH}"
 echo "  Zipped:   ${ZIPPED_SIZE} (${ZIPPED_BYTES} bytes)"
 echo "  Unzipped: ${UNZIPPED_SIZE}"
 echo ""
-ls -lh "${SCRIPT_DIR}/${ZIP_NAME}"
+ls -lh "${SCRIPT_DIR}/../layers/${ZIP_NAME}"
 
 # Cleanup build dir
 rm -rf "$OUTPUT_DIR"

@@ -1,4 +1,4 @@
-# xagg Lambda Function
+# Lambda Deployment
 
 AWS Lambda function for processing ICESat-2 ATL06 data by morton cell.
 
@@ -13,14 +13,14 @@ This Lambda function processes a single morton cell (order 6) by:
 
 ## Files
 
-- **`lambda_handler.py`**: Main Lambda function handler (the only file in function.zip)
-- **`orchestrator_auth.py`**: Helper for getting NASA credentials (used by orchestrator, not Lambda)
-- **`build_arm64_layer.sh`**: Script to build the Lambda layer for ARM64
-- **`build_layer_v14.sh`**: Script to build the Lambda layer
-- **`build_granule_catalog.py`**: Script to build granule catalog for orchestrator
-- **`invoke_production.py`**: Orchestration script for invoking Lambda functions
-- **`README.md`**: This file
-- **`INSTRUCTIONS_ARM.md`**: Instructions for building ARM64 layer
+- **`deployment/aws/lambda_handler.py`**: AWS Lambda wrapper function (deployed to Lambda)
+- **`src/magg/processing.py`**: Cloud-agnostic core processing logic
+- **`src/magg/auth.py`**: NASA Earthdata authentication helper
+- **`deployment/aws/build_arm64_layer.sh`**: Script to build the Lambda layer for ARM64
+- **`deployment/aws/build_layer_v14.sh`**: Script to build the Lambda layer for x86_64
+- **`src/magg/catalog.py`**: CMR granule catalog builder
+- **`deployment/aws/invoke_lambda.py`**: Orchestration script for invoking Lambda functions
+- **[`LAMBDA_ARM64.md`](LAMBDA_ARM64.md)**: Instructions for building ARM64 layer
 
 ## Architecture
 
@@ -33,13 +33,12 @@ This Lambda function processes a single morton cell (order 6) by:
 │  Timeout: 720s (12 minutes)                                  │
 │  ──────────────────────────────────────────────────────────  │
 │  Code (~5 MB):                                               │
-│    - lambda_handler.py                                       │
-│    - query_cmr_with_polygon.py                               │
+│    - deployment/aws/lambda_handler.py (AWS wrapper)          │
+│    - src/magg/ package (processing, auth, catalog)           │
 │  ──────────────────────────────────────────────────────────  │
-│  Layer (75 MB compressed, 227 MB uncompressed):              │
-│    - numpy, pandas, xarray, botocore                         │
-│    - arro3, shapely, geopandas, earthaccess                  │
-│    - xdggs, h5coro, mortie, healpix                          │
+│  Layer (57 MB compressed, 227 MB uncompressed):              │
+│    - numpy, pandas, h5coro, mortie, healpy                   │
+│    - fastparquet, cramjam, shapely, astropy, earthaccess     │
 └─────────────────────────────────────────────────────────────┘
 ```
 
@@ -47,17 +46,20 @@ This Lambda function processes a single morton cell (order 6) by:
 
 ```json
 {
-  "parent_morton": -6134114,
-  "cycle": 22,
+  "parent_morton": 123456,
+  "parent_order": 6,
   "child_order": 12,
+  "granule_urls": [
+    "s3://nsidc-cumulus-prod-protected/ATLAS/ATL06/007/2023/12/18/...",
+    "s3://nsidc-cumulus-prod-protected/ATLAS/ATL06/007/2023/12/19/..."
+  ],
   "s3_bucket": "your-output-bucket",
-  "s3_prefix": "atl06/cycle_22",
+  "s3_prefix": "atl06/production",
   "s3_credentials": {
     "accessKeyId": "ASIA...",
     "secretAccessKey": "...",
     "sessionToken": "..."
-  },
-  "max_granules": null
+  }
 }
 ```
 
@@ -66,19 +68,19 @@ This Lambda function processes a single morton cell (order 6) by:
 | Parameter | Type | Required | Description |
 |-----------|------|----------|-------------|
 | `parent_morton` | int | Yes | Morton index of parent cell (order 6) |
-| `cycle` | int | Yes | ICESat-2 cycle number (e.g., 22) |
+| `parent_order` | int | Yes | Order of parent cell (typically 6) |
 | `child_order` | int | Yes | Order of child cells for statistics (typically 12) |
-| `s3_bucket` | str | Yes | S3 bucket for output zarr files |
-| `s3_prefix` | str | Yes | S3 prefix for output zarr files |
+| `granule_urls` | list | Yes | Pre-computed list of S3 URLs from catalog |
+| `s3_bucket` | str | Yes | S3 bucket for output parquet files |
+| `s3_prefix` | str | Yes | S3 prefix for output parquet files |
 | `s3_credentials` | dict | Yes | S3 credentials from orchestrator (see below) |
-| `max_granules` | int | No | Maximum number of granules to process (for testing) |
 
 ### S3 Credentials
 
 The `s3_credentials` are obtained by the orchestrator ONCE before invoking Lambda functions:
 
 ```python
-from orchestrator_auth import get_nsidc_s3_credentials
+from magg.auth import get_nsidc_s3_credentials
 
 # Get credentials (valid for ~1 hour)
 s3_creds = get_nsidc_s3_credentials()
@@ -86,8 +88,12 @@ s3_creds = get_nsidc_s3_credentials()
 # Pass to each Lambda invocation
 event = {
     "parent_morton": -6134114,
+    "parent_order": 6,
+    "child_order": 12,
+    "granule_urls": [...],  # From pre-built catalog
+    "s3_bucket": "output-bucket",
+    "s3_prefix": "atl06/production",
     "s3_credentials": s3_creds,
-    # ... other params
 }
 ```
 
@@ -161,35 +167,22 @@ aws s3 mb s3://your-output-bucket
 
 ### Step 1: Create the function package
 
-Since all dependencies are in the Lambda layer, the function package only needs the handler:
+Since all dependencies are in the Lambda layer, the function package needs the handler and the magg package:
 
 ```bash
-cd /path/to/magg/lambda
-zip function.zip lambda_handler.py
+cd /path/to/magg
+
+# Create function.zip with handler and magg package
+zip -r function.zip deployment/aws/lambda_handler.py src/magg/
 ```
 
-This creates a small (~17 KB) `function.zip` with just the Lambda handler code.
+This creates a small (~20 KB) `function.zip` with the Lambda handler and core package code.
 
-### Step 2: Deploy the Lambda layer and function
+### Step 2: Build and deploy the Lambda layer
 
-**Upload the Lambda layer**:
+See [LAMBDA_ARM64.md](LAMBDA_ARM64.md) for building and deploying the Lambda layer. Note the layer ARN from the output.
 
-```bash
-cd /path/to/magg/lambda
-
-aws lambda publish-layer-version \
-  --layer-name xagg-complete-stack \
-  --zip-file fileb://lambda_layer_arm64.zip \
-  --compatible-runtimes python3.12 \
-  --compatible-architectures arm64 \
-  --description "xagg complete stack: numpy, pandas, xarray, xdggs, h5coro, mortie"
-```
-
-Note the layer ARN from the output (e.g., `arn:aws:lambda:us-east-1:123456789012:layer:xagg-complete-stack:1`)
-
-See `INSTRUCTIONS_ARM.md` for details on building the layer.
-
-**Create the Lambda function**:
+### Step 3: Create the Lambda function
 
 ```bash
 aws lambda create-function \
@@ -197,7 +190,7 @@ aws lambda create-function \
   --runtime python3.12 \
   --architectures arm64 \
   --role arn:aws:iam::ACCOUNT_ID:role/lambda-execution-role \
-  --handler lambda_handler.lambda_handler \
+  --handler deployment.aws.lambda_handler.lambda_handler \
   --zip-file fileb://function.zip \
   --timeout 720 \
   --memory-size 2048 \
@@ -209,13 +202,14 @@ Replace:
 - `ACCOUNT_ID` with your AWS account ID
 - `REGION` with your AWS region (e.g., `us-east-1`)
 - `VERSION` with the layer version from the previous step
-- `lambda-execution-role` with your IAM role name
+- `lambda-execution-role` with your IAM role name (needs S3 write permissions)
+- `xagg-complete-stack` with `magg-dependencies`
 
-**Update function code** (after making changes to lambda_handler.py):
+**Update function code** (after making changes to lambda_handler.py or src/magg/):
 
 ```bash
 # Re-create the zip
-zip function.zip lambda_handler.py
+zip -r function.zip deployment/aws/lambda_handler.py src/magg/
 
 # Update the Lambda function
 aws lambda update-function-code \
@@ -227,14 +221,18 @@ aws lambda update-function-code \
 
 ### Test with the orchestrator
 
-Use the provided `invoke_production.py` script:
+Use the provided orchestration script:
 
 ```bash
-cd /path/to/magg/lambda
+cd /path/to/magg
 
-# Edit the script to configure your S3 bucket and cells to process
-# Then run:
-uv run python invoke_production.py --dry-run --max-cells 1
+# First, build a granule catalog
+uv run python -m magg.catalog --cycle 22 --parent-order 6
+
+# Then test with the orchestrator
+uv run python deployment/aws/invoke_lambda.py \
+  --catalog deployment/data/catalogs/granule_catalog_cycle22_order6.json \
+  --dry-run --max-cells 1
 ```
 
 The script handles NASA authentication and orchestrates Lambda invocations.
@@ -342,14 +340,14 @@ ERROR: Could not connect to the endpoint URL: "https://lambda.us-west-2.amazonaw
 ERROR: SSL validation failed for https://lambda.us-west-2.amazonaws.com/2015-03-31/functions/process-morton-cell/invocations [Errno 24] Too many open files
 ```
 
-**Solution**: Decrease max workers (e.g., `uv run python invoke_production.py --max-workers 50`) or increase ulimit (e.g., `ulimit -n 10000`)'
+**Solution**: Decrease max workers (e.g., `uv run python deployment/aws/invoke_lambda.py --max-workers 50`) or increase ulimit (e.g., `ulimit -n 10000`)
 
 ### Debug Mode
 
 To enable more verbose logging, set the log level:
 
 ```python
-# In lambda_handler.py
+# In deployment/aws/lambda_handler.py or src/magg/processing.py
 logger.setLevel(logging.DEBUG)
 ```
 
@@ -386,10 +384,8 @@ Total: 1,872 × $0.006 = ~$11-15
 
 ## Related Documentation
 
-- [../lambda_notes.md](../lambda_notes.md) - Comprehensive refactoring plan
-- [../LAMBDA_BUILD_SUCCESS.md](../LAMBDA_BUILD_SUCCESS.md) - Build results and layer details
-- [../lambda_package_size_analysis.md](../lambda_package_size_analysis.md) - Package size analysis
-- [../demo_s3_xdggs.ipynb](../demo_s3_xdggs.ipynb) - Original Dask implementation
+- [ARCHITECTURE.md](ARCHITECTURE.md) - Design philosophy and spatial indexing approach
+- [LAMBDA_ARM64.md](LAMBDA_ARM64.md) - Building Lambda layers for ARM64
 
 ## Support
 

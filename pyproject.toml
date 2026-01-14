@@ -1,0 +1,72 @@
+[project]
+name = "magg"
+version = "0.1.0"
+description = "Multi-resolution aggregation for ICESat-2 ATL06 data using morton/healpix indexing"
+readme = "README.md"
+requires-python = ">=3.12"
+license = {file = "LICENSE"}
+authors = [
+    {name = "Shane Grisby"}
+]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Science/Research",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Scientific/Engineering :: GIS",
+]
+
+dependencies = [
+    "numpy==2.2.6",
+    "pandas==2.2.3",
+    "h5coro==0.0.8",
+    "mortie",
+    "healpy",
+    "earthaccess",
+    "boto3",
+    "fastparquet",
+    "pyarrow",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest",
+    "pytest-cov",
+    "ruff",
+    "notebook",
+]
+lambda = [
+    "shapely",
+    "cramjam",
+    "astropy",
+]
+analysis = [
+    "xarray",
+    "xdggs",
+    "geopandas",
+    "cartopy>=0.25.0",
+    "matplotlib>=3.10.8",
+]
+
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools]
+packages = ["magg"]
+
+[tool.setuptools.package-dir]
+magg = "src/magg"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+python_files = ["test_*.py"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+select = ["E", "F", "W", "I", "N"]
+ignore = ["E501"]
+
+[tool.ruff.isort]
+known-first-party = ["magg"]

@@ -142,7 +142,7 @@ fi
 echo ""
 echo "Creating ${ZIP_NAME}..."
 cd "$OUTPUT_DIR"
-zip -r9q "${SCRIPT_DIR}/${ZIP_NAME}" python
+zip -r9q "${SCRIPT_DIR}/../layers/${ZIP_NAME}" python
 cd "$SCRIPT_DIR"
 
 # Report
@@ -157,7 +157,7 @@ echo "  Arch:     arm64 (Graviton2)"
 echo "  Zipped:   ${ZIPPED_SIZE}"
 echo "  Unzipped: ${UNZIPPED_SIZE}"
 echo ""
-ls -lh "${SCRIPT_DIR}/${ZIP_NAME}"
+ls -lh "${SCRIPT_DIR}/../layers/${ZIP_NAME}"
 
 # Cleanup
 rm -rf "$OUTPUT_DIR"
