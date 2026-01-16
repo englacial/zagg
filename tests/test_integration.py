@@ -2,21 +2,21 @@ import numpy as np
 import zarr
 
 from magg.processing import write_dataframe_to_zarr
-from magg.schema import COORDS, DATA_VARS, create_zarr_template
+from magg.schema import COORDS, DATA_VARS, xdggs_zarr_template
 
 
 def test_full_integration(s3_store_factory, mock_dataframe_factory):
     """Test complete flow: template creation + data writing.
 
     This tests both functions from the magg package:
-    1. create_zarr_template() - from magg.schema
+    1. xdggs_zarr_template() - from magg.schema
     2. write_dataframe_to_zarr() - from magg.processing
     """
     parent_order = 6
     child_order = 8
 
     store = s3_store_factory()
-    create_zarr_template(store, parent_order, child_order)
+    xdggs_zarr_template(store, parent_order, child_order)
 
     # Antarctic coordinate
     df_out = mock_dataframe_factory(-78.5, -132.0, parent_order, child_order)
@@ -43,7 +43,7 @@ def test_multiple_parent_cells(s3_store_factory, mock_dataframe_factory):
     child_order = 8
 
     store = s3_store_factory()
-    create_zarr_template(store, parent_order, child_order)
+    xdggs_zarr_template(store, parent_order, child_order)
 
     # Different Antarctic locations to get different parent cells
     coordinates = [

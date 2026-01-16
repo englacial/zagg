@@ -4,7 +4,7 @@ import pytest
 from zarr import open_group
 
 from magg.processing import write_dataframe_to_zarr
-from magg.schema import COORDS, DATA_VARS, create_zarr_template
+from magg.schema import COORDS, DATA_VARS, xdggs_zarr_template
 
 
 class TestWriteDataframeToZarr:
@@ -14,7 +14,7 @@ class TestWriteDataframeToZarr:
         child_order = 8
 
         store = s3_store_factory()
-        create_zarr_template(store, parent_order, child_order)
+        xdggs_zarr_template(store, parent_order, child_order)
 
         # Antarctic coordinate
         df_out = mock_dataframe_factory(-78.5, -132.0, parent_order, child_order)
@@ -42,7 +42,7 @@ class TestWriteDataframeToZarr:
         child_order = 8
 
         store = s3_store_factory()
-        create_zarr_template(store, parent_order, child_order)
+        xdggs_zarr_template(store, parent_order, child_order)
 
         # Create DataFrame with only half the children
         df_out = mock_dataframe_factory(-78.5, -132.0, parent_order, child_order)

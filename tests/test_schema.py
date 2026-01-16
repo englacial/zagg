@@ -3,7 +3,7 @@ import pytest
 from zarr import open_array, open_group
 from zarr.storage import MemoryStore
 
-from magg.schema import COORDS, DATA_VARS, HEALPIX_BASE_CELLS, create_zarr_template
+from magg.schema import COORDS, DATA_VARS, HEALPIX_BASE_CELLS, xdggs_zarr_template
 
 
 class TestCreateZarrTemplate:
@@ -13,7 +13,7 @@ class TestCreateZarrTemplate:
         child_order = 8
 
         store = MemoryStore()
-        create_zarr_template(store, parent_order, child_order)
+        xdggs_zarr_template(store, parent_order, child_order)
 
         group = open_group(store, path=str(child_order), mode="r")
         assert set(group.keys()) == set(COORDS + DATA_VARS)
@@ -24,7 +24,7 @@ class TestCreateZarrTemplate:
         child_order = 8
 
         store = MemoryStore()
-        create_zarr_template(store, parent_order, child_order)
+        xdggs_zarr_template(store, parent_order, child_order)
 
         group = open_group(store, path=str(child_order), mode="r")
         expected_shape = (HEALPIX_BASE_CELLS * 4**child_order,)
@@ -38,7 +38,7 @@ class TestCreateZarrTemplate:
         child_order = 8
 
         store = MemoryStore()
-        create_zarr_template(store, parent_order, child_order)
+        xdggs_zarr_template(store, parent_order, child_order)
 
         group = open_group(store, path=str(child_order), mode="r")
         expected_chunks = (4 ** (child_order - parent_order),)
@@ -49,7 +49,7 @@ class TestCreateZarrTemplate:
     def test_coordinate_dtypes(self):
         """Test that cell_ids and morton are uint64."""
         store = MemoryStore()
-        create_zarr_template(store, parent_order=6, child_order=8)
+        xdggs_zarr_template(store, parent_order=6, child_order=8)
 
         group = open_group(store, path="8", mode="r")
         assert group["cell_ids"].dtype == np.uint64
@@ -58,7 +58,7 @@ class TestCreateZarrTemplate:
     def test_count_dtype(self):
         """Test that count is int32."""
         store = MemoryStore()
-        create_zarr_template(store, parent_order=6, child_order=8)
+        xdggs_zarr_template(store, parent_order=6, child_order=8)
 
         group = open_group(store, path="8", mode="r")
         assert group["count"].dtype == np.int32
@@ -66,7 +66,7 @@ class TestCreateZarrTemplate:
     def test_statistical_vars_dtype(self):
         """Test that statistical variables are float32."""
         store = MemoryStore()
-        create_zarr_template(store, parent_order=6, child_order=8)
+        xdggs_zarr_template(store, parent_order=6, child_order=8)
 
         group = open_group(store, path="8", mode="r")
         stat_vars = [v for v in DATA_VARS if v != "count"]
@@ -77,7 +77,7 @@ class TestCreateZarrTemplate:
     def test_fill_values(self):
         """Test that fill values are correct for each type."""
         store = MemoryStore()
-        create_zarr_template(store, parent_order=6, child_order=8)
+        xdggs_zarr_template(store, parent_order=6, child_order=8)
 
         group = open_group(store, path="8", mode="r")
 
@@ -97,7 +97,7 @@ class TestCreateZarrTemplate:
         """Test that dimension_names is set to cell_ids."""
         store = MemoryStore()
         child_order = 8
-        create_zarr_template(store, parent_order=6, child_order=child_order)
+        xdggs_zarr_template(store, parent_order=6, child_order=child_order)
 
         for name in COORDS + DATA_VARS:
             array = open_array(store, path=f"{child_order}/{name}", mode="r")
@@ -109,23 +109,23 @@ class TestCreateZarrTemplate:
         store = MemoryStore()
 
         with pytest.raises(ValueError, match="child_order.*must be >= parent_order"):
-            create_zarr_template(store, parent_order=8, child_order=6)
+            xdggs_zarr_template(store, parent_order=8, child_order=6)
 
     def test_equal_orders(self):
         """Test that child_order == parent_order is valid (chunks of 1)."""
         store = MemoryStore()
-        create_zarr_template(store, parent_order=6, child_order=6)
+        xdggs_zarr_template(store, parent_order=6, child_order=6)
 
         group = open_group(store, path="6", mode="r")
         assert group["count"].chunks == (1,)
 
     def test_template_creation_s3(self, s3_store_factory):
-        """Test create_zarr_template function on S3-compatible storage (MinIO)."""
+        """Test xdggs_zarr_template function on S3-compatible storage (MinIO)."""
         parent_order = 6
         child_order = 8
 
         store = s3_store_factory()
-        create_zarr_template(store, parent_order, child_order)
+        xdggs_zarr_template(store, parent_order, child_order)
 
         group = open_group(store=store, path=str(child_order), mode="r")
         assert set(group.keys()) == set(COORDS + DATA_VARS)

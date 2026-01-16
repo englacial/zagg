@@ -1,6 +1,7 @@
 import numpy as np
 from pydantic_zarr.experimental.v3 import ArraySpec, BaseAttributes, GroupSpec, NamedConfig
 from typing_extensions import TypedDict
+from xarray import Dataset
 from zarr import config
 from zarr.abc.store import Store
 
@@ -39,32 +40,43 @@ class ATL06AggregationGroup(GroupSpec):
     attributes: BaseAttributes
 
 
-def create_zarr_template(
-    store: Store,
-    parent_order: int,
-    child_order: int,
-    overwrite: bool = False,
-) -> Store:
+def spec_to_dataset(spec: GroupSpec) -> Dataset:
     """
-    Create a Zarr template for ATL06 aggregation data using HEALPix/Morton indexing.
+    Produce an xarray dataset from a [pydantic_zarr.experimental.v3.GroupSpec]()
 
-    Overwrites an existing Zarr store if it already exists.
 
     Parameters
     ----------
-    store : Store
-        Zarr-compatible store (from zarr.abc.store)
+    spec : GroupSpec
+        PydanticZarr experimental GroupSpec that aligns with Xarray expectations for datasets
+
+    Returns
+    -------
+    dataset
+        template Xarray dataset
+    """
+    print(spec)
+    return Dataset()
+
+
+def xdggs_spec(
+    parent_order: int,
+    child_order: int,
+) -> ATL06AggregationGroup:
+    """
+    Create a [pydantic_zarr.experimental.v3.GroupSpec]() for ATL06 aggregation data using HEALPix/Morton indexing.
+
+    Parameters
+    ----------
     parent_order : int
         HEALPix order of parent morton cells
     child_order : int
         HEALPix order of child morton cells (must be >= parent_order)
-    overwrite: bool
-        Whether to overwrite an existing array or group at the path. If overwrite is False and an array or group already exists at the path, an exception will be raised. Defaults to False.
 
     Returns
     -------
-    Store
-        The same store, with template written to path '{child_order}/'
+    GroupSpec
+        Xdggs compatible group spec
 
     Raises
     ------
@@ -129,11 +141,41 @@ def create_zarr_template(
     }
 
     # Create and write group specification
-    spec = ATL06AggregationGroup(members=members, attributes=dggs_attrs)  # type: ignore[arg-type]
+    return ATL06AggregationGroup(members=members, attributes=dggs_attrs)  # type: ignore[arg-type]
+
+
+def xdggs_zarr_template(
+    store: Store,
+    parent_order: int,
+    child_order: int,
+    overwrite: bool = False,
+) -> Store:
+    """
+    Create a Zarr template for ATL06 aggregation data using HEALPix/Morton indexing.
+
+    Overwrites an existing Zarr store if it already exists.
+
+    Parameters
+    ----------
+    store : Store
+        Zarr-compatible store (from zarr.abc.store)
+    n_populated: int
+        Number of parent cells containing data
+    child_order : int
+        HEALPix order of child morton cells (must be >= parent_order)
+    overwrite: bool
+        Whether to overwrite an existing array or group at the path. If overwrite is False and an array or group already exists at the path, an exception will be raised. Defaults to False.
+
+    Returns
+    -------
+    Store
+        The same store, with template written to path '{child_order}/'
+    """
+    spec = xdggs_spec(parent_order=parent_order, child_order=child_order)
     with config.set({"async.concurrency": 128}):
         spec.to_zarr(store, str(child_order), overwrite=overwrite)
 
     return store
 
 
-__all__ = ["DATA_VARS", "COORDS", "ATL06AggregationGroup", "create_zarr_template"]
+__all__ = ["DATA_VARS", "COORDS", "ATL06AggregationGroup", "xdggs_zarr_template", "xdggs_spec"]
