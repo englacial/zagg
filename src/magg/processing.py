@@ -26,6 +26,8 @@ logger = logging.getLogger(__name__)
 def write_dataframe_to_zarr(
     df_out: pd.DataFrame,
     store: Store,
+    *,
+    chunk_idx: int,
     child_order: int,
     parent_order: int,
 ) -> Store:
@@ -38,6 +40,8 @@ def write_dataframe_to_zarr(
         DataFrame with columns matching COORDS + DATA_VARS from schema
     store : Store
         Zarr-compatible store (already contains template)
+    chunk_idx : int
+        The chunk index for storing data
     child_order : int
         Order of child cells
     parent_order : int
@@ -65,7 +69,7 @@ def write_dataframe_to_zarr(
             array = open_array(
                 store, path=f"{str(child_order)}/{name}", zarr_format=3, consolidated=False
             )
-            array[min_index : max_index + 1] = series.values
+            array.set_block_selection((chunk_idx,), series.values)
 
     return store
 

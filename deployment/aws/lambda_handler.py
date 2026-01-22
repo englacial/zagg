@@ -5,6 +5,7 @@ This is an AWS-specific wrapper around the cloud-agnostic processing module.
 
 Event payload:
 {
+    "chunk_idx": int,
     "parent_morton": int,
     "parent_order": int,
     "child_order": int,
@@ -43,6 +44,7 @@ def lambda_handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
     ----------
     event : dict
         Lambda event payload with keys:
+        - chunk_idx: int
         - parent_morton: int
         - parent_order: int
         - child_order: int
@@ -76,6 +78,7 @@ def lambda_handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
                 "granule_count": len(event.get("granule_urls", [])),
                 "child_order": event.get("child_order"),
                 "request_id": context.aws_request_id,
+                "chunk_idx": event.get("chunk_idx"),
             }
         )
     )
@@ -132,7 +135,13 @@ def lambda_handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
             logger.info(f"  Writing data to {zarr_path}...")
 
             try:
-                write_dataframe_to_zarr(df_out, store, event["child_order"], event["parent_order"])
+                write_dataframe_to_zarr(
+                    df_out,
+                    store,
+                    chunk_idx=event["chunk_idx"],
+                    child_order=event["child_order"],
+                    parent_order=event["parent_order"],
+                )
             except Exception as e:
                 logger.error(f"Failed to write zarr to {zarr_path}: {e}")
                 metadata["error"] = f"Failed to write zarr: {e}"

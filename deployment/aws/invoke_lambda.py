@@ -27,7 +27,7 @@ from zarr import consolidate_metadata
 from zarr.storage import ObjectStore
 
 from magg.auth import get_nsidc_s3_credentials
-from magg.schema import create_zarr_template
+from magg.schema import xdggs_zarr_template
 
 # Lambda pricing (us-west-2)
 # https://aws.amazon.com/lambda/pricing/
@@ -83,6 +83,7 @@ def parse_lambda_report(log_result: str) -> dict:
 
 def invoke_lambda(
     lambda_client,
+    chunk_idx: int,
     parent_morton: int,
     parent_order: int,
     child_order: int,
@@ -97,6 +98,7 @@ def invoke_lambda(
     wall_start = time.time()
 
     event = {
+        "chunk_idx": chunk_idx,
         "parent_morton": parent_morton,
         "parent_order": parent_order,
         "child_order": child_order,
@@ -255,9 +257,7 @@ def main():
         credential_provider=Boto3CredentialProvider(),
     )
     store = ObjectStore(store=s3_store, read_only=False)
-    store = create_zarr_template(
-        store, parent_order, child_order, overwrite=args.overwrite_template
-    )
+    store = xdggs_zarr_template(store, parent_order, child_order, overwrite=args.overwrite_template)
     # Step 4: Invoke Lambdas in parallel
     print(f"\n[4/7] Invoking {len(cells)} Lambda functions (max {args.max_workers} concurrent)...")
 
@@ -292,6 +292,7 @@ def main():
             executor.submit(
                 invoke_lambda,
                 lambda_client,
+                chunk_idx,
                 int(cell),  # Convert string key back to int
                 parent_order,
                 child_order,
@@ -300,7 +301,7 @@ def main():
                 args.s3_prefix,
                 s3_creds,
             ): cell
-            for cell in cells
+            for chunk_idx, cell in enumerate(cells)
         }
 
         for i, future in enumerate(as_completed(futures), 1):
