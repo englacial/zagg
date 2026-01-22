@@ -3,7 +3,12 @@ import pytest
 from zarr import open_array, open_group
 from zarr.storage import MemoryStore
 
-from magg.schema import COORDS, DATA_VARS, HEALPIX_BASE_CELLS, xdggs_zarr_template
+from magg.schema import (
+    COORDS,
+    DATA_VARS,
+    HEALPIX_BASE_CELLS,
+    xdggs_zarr_template,
+)
 
 
 class TestCreateZarrTemplate:
@@ -28,6 +33,21 @@ class TestCreateZarrTemplate:
 
         group = open_group(store, path=str(child_order), mode="r")
         expected_shape = (HEALPIX_BASE_CELLS * 4**child_order,)
+
+        for name in COORDS + DATA_VARS:
+            assert group[name].shape == expected_shape
+
+    def test_array_shape_n_parent_cells(self):
+        """Test that array shape equals HEALPIX_BASE_CELLS * 4^child_order."""
+        parent_order = 6
+        child_order = 8
+        n_parent_cells = 1
+
+        store = MemoryStore()
+        xdggs_zarr_template(store, parent_order, child_order, n_parent_cells=n_parent_cells)
+
+        group = open_group(store, path=str(child_order), mode="r")
+        expected_shape = (16,)
 
         for name in COORDS + DATA_VARS:
             assert group[name].shape == expected_shape

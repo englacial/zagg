@@ -1,7 +1,5 @@
-import numpy as np
 from pydantic_zarr.experimental.v3 import ArraySpec, BaseAttributes, GroupSpec, NamedConfig
 from typing_extensions import TypedDict
-from xarray import Dataset
 from zarr import config
 from zarr.abc.store import Store
 
@@ -38,25 +36,6 @@ class ATL06AggregationMembers(TypedDict):
 class ATL06AggregationGroup(GroupSpec):
     members: ATL06AggregationMembers  # type: ignore[assignment]
     attributes: BaseAttributes
-
-
-def spec_to_dataset(spec: GroupSpec) -> Dataset:
-    """
-    Produce an xarray dataset from a [pydantic_zarr.experimental.v3.GroupSpec]()
-
-
-    Parameters
-    ----------
-    spec : GroupSpec
-        PydanticZarr experimental GroupSpec that aligns with Xarray expectations for datasets
-
-    Returns
-    -------
-    dataset
-        template Xarray dataset
-    """
-    print(spec)
-    return Dataset()
 
 
 def xdggs_spec(
@@ -100,7 +79,7 @@ def xdggs_spec(
         chunk_key_encoding=NamedConfig(name="default", configuration={"separator": "/"}),
         codecs=(NamedConfig(name="bytes", configuration={"endian": "little"}),),
         storage_transformers=(),
-        fill_value=np.nan,
+        fill_value="NaN",
     )
 
     # Create member specifications
@@ -148,6 +127,7 @@ def xdggs_zarr_template(
     store: Store,
     parent_order: int,
     child_order: int,
+    n_parent_cells: int | None = None,
     overwrite: bool = False,
 ) -> Store:
     """
@@ -159,10 +139,12 @@ def xdggs_zarr_template(
     ----------
     store : Store
         Zarr-compatible store (from zarr.abc.store)
-    n_populated: int
-        Number of parent cells containing data
+    parent_order : int
+        HEALPix order of parent morton cells (must be >= parent_order)
     child_order : int
         HEALPix order of child morton cells (must be >= parent_order)
+    n_parent_cells: int
+        Number of parent cells containing data
     overwrite: bool
         Whether to overwrite an existing array or group at the path. If overwrite is False and an array or group already exists at the path, an exception will be raised. Defaults to False.
 
@@ -172,6 +154,13 @@ def xdggs_zarr_template(
         The same store, with template written to path '{child_order}/'
     """
     spec = xdggs_spec(parent_order=parent_order, child_order=child_order)
+    if n_parent_cells:
+        assert n_parent_cells > 0
+        level_diff = child_order - parent_order
+        n_pixels = 4**level_diff * n_parent_cells
+        members = {var: m.with_shape((n_pixels,)) for var, m in spec.members.items()}  # type: ignore[attr-defined]
+        spec = spec.with_members(members)
+
     with config.set({"async.concurrency": 128}):
         spec.to_zarr(store, str(child_order), overwrite=overwrite)
 
