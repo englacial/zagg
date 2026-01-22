@@ -11,6 +11,9 @@ Usage:
     # Then run production:
     python deployment/aws/invoke_lambda.py --catalog deployment/data/catalogs/granule_catalog_cycle22_order6.json
     python deployment/aws/invoke_lambda.py --catalog deployment/data/catalogs/granule_catalog_cycle22_order6.json --max-cells 200
+
+    # Process a specific morton cell:
+    python deployment/aws/invoke_lambda.py --catalog deployment/data/catalogs/granule_catalog_cycle22_order6.json --morton-cell -4211322
 """
 
 import argparse
@@ -189,6 +192,12 @@ def main():
     parser.add_argument(
         "--max-cells", type=int, default=None, help="Limit number of cells (for testing)"
     )
+    parser.add_argument(
+        "--morton-cell",
+        type=str,
+        default=None,
+        help="Process a specific morton cell (e.g., -4211322)",
+    )
     parser.add_argument("--child-order", type=int, default=12, help="Child cell order")
     parser.add_argument("--s3-bucket", default="xagg")
     parser.add_argument("--s3-prefix", default="atl06/production.zarr")
@@ -224,11 +233,24 @@ def main():
 
     # Get cells to process (catalog keys are strings)
     all_cells = list(catalog.keys())
-    if args.max_cells:
+
+    # Handle specific morton cell selection
+    if parent_morton_cell := args.morton_cell:
+        if parent_morton_cell not in catalog:
+            raise (ValueError, f"Morton cell '{args.morton_cell}' not found in catalog")
+        cells = [args.morton_cell]
+        original_idx = all_cells.index(args.morton_cell)
+        cell_to_idx = {args.morton_cell: original_idx}
+        print(f"      Processing specific cell: {args.morton_cell}")
+        print(f"      Original chunk_idx: {original_idx}")
+        print(f"      Granules for this cell: {len(catalog[args.morton_cell])}")
+    elif args.max_cells:
         cells = all_cells[: args.max_cells]
+        cell_to_idx = {cell: idx for idx, cell in enumerate(cells)}
         print(f"      Limited to {len(cells)} cells (of {len(all_cells)} total)")
     else:
         cells = all_cells
+        cell_to_idx = {cell: idx for idx, cell in enumerate(cells)}
         print(f"      Processing {len(cells)} cells")
 
     if args.dry_run:
@@ -257,7 +279,13 @@ def main():
         credential_provider=Boto3CredentialProvider(),
     )
     store = ObjectStore(store=s3_store, read_only=False)
-    store = xdggs_zarr_template(store, parent_order, child_order, overwrite=args.overwrite_template)
+    store = xdggs_zarr_template(
+        store,
+        parent_order,
+        child_order,
+        overwrite=args.overwrite_template,
+        n_parent_cells=metadata["total_cells"],
+    )
     # Step 4: Invoke Lambdas in parallel
     print(f"\n[4/7] Invoking {len(cells)} Lambda functions (max {args.max_workers} concurrent)...")
 
@@ -292,7 +320,7 @@ def main():
             executor.submit(
                 invoke_lambda,
                 lambda_client,
-                chunk_idx,
+                cell_to_idx[cell],  # Use original index from catalog
                 int(cell),  # Convert string key back to int
                 parent_order,
                 child_order,
@@ -301,7 +329,7 @@ def main():
                 args.s3_prefix,
                 s3_creds,
             ): cell
-            for chunk_idx, cell in enumerate(cells)
+            for cell in cells
         }
 
         for i, future in enumerate(as_completed(futures), 1):
@@ -338,7 +366,7 @@ def main():
                 )
 
     # Step 5: Consolidate metadata for quicker opening later
-    print("\n[5/7] Cost Calculation")
+    print("\n[5/7] Consolidating Zarr metadata...")
     consolidate_metadata(store, zarr_format=3)
 
     total_wall_time = time.time() - start_time
