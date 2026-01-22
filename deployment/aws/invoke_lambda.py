@@ -14,6 +14,9 @@ Usage:
 
     # Process a specific morton cell:
     python deployment/aws/invoke_lambda.py --catalog deployment/data/catalogs/granule_catalog_cycle22_order6.json --morton-cell -4211322
+
+    # Optimize parallel execution by processing cells with the most granules first:
+    python deployment/aws/invoke_lambda.py --catalog deployment/data/catalogs/granule_catalog_cycle22_order6.json --sort-by-granules
 """
 
 import argparse
@@ -183,6 +186,99 @@ def invoke_lambda(
     }
 
 
+def select_cells_to_process(
+    all_cells: list,
+    catalog: dict,
+    morton_cell: str = None,
+    max_cells: int = None,
+    sort_by_granules: bool = False,
+) -> tuple[list, dict]:
+    """
+    Select cells to process and create index mapping.
+
+    Returns:
+        tuple: (cells_to_process, cell_to_idx_mapping)
+    """
+    # Create mapping of all cells to their original indices
+    cell_to_idx = {cell: idx for idx, cell in enumerate(all_cells)}
+
+    # Select subset of cells
+    if morton_cell:
+        if morton_cell not in catalog:
+            raise ValueError(f"Morton cell '{morton_cell}' not found in catalog")
+        cells = [morton_cell]
+        original_idx = cell_to_idx[morton_cell]
+        print(f"      Processing specific cell: {morton_cell}")
+        print(f"      Original chunk_idx: {original_idx}")
+        print(f"      Granules for this cell: {len(catalog[morton_cell])}")
+    elif max_cells:
+        cells = all_cells[:max_cells]
+        print(f"      Limited to {len(cells)} cells (of {len(all_cells)} total)")
+    else:
+        cells = all_cells
+        print(f"      Processing {len(cells)} cells")
+
+    # Sort by granule count if requested
+    if sort_by_granules and not morton_cell:
+        cells_with_counts = [(cell, len(catalog[cell])) for cell in cells]
+        cells_with_counts.sort(key=lambda x: x[1], reverse=True)
+        cells = [cell for cell, count in cells_with_counts]
+        print("      Sorted by granule count (descending)")
+        print(f"      Range: {cells_with_counts[0][1]} → {cells_with_counts[-1][1]} granules")
+    elif sort_by_granules and morton_cell:
+        print("      Note: --sort-by-granules ignored (processing single cell)")
+
+    return cells, cell_to_idx
+
+
+def print_dry_run_stats(cells: list, catalog: dict):
+    """Print statistics for dry-run mode."""
+    print("\n[DRY RUN] Would process these cells:")
+    print(f"      Total: {len(cells)}")
+    print(f"      First 5: {cells[:5]}")
+    granule_counts = [len(catalog[c]) for c in cells]
+    print(
+        f"      Granules per cell: min={min(granule_counts)}, "
+        f"max={max(granule_counts)}, "
+        f"avg={sum(granule_counts) / len(granule_counts):.1f}"
+    )
+
+
+def categorize_result(result: dict) -> tuple[str, dict]:
+    """
+    Categorize Lambda result and return status string and counter updates.
+
+    Returns:
+        tuple: (status_string, counter_dict)
+    """
+    body = result["body"]
+    error = result.get("error")
+    counters = {
+        "cells_with_data": 0,
+        "cells_no_granules": 0,
+        "cells_no_data": 0,
+        "cells_error": 0,
+        "total_obs": 0,
+    }
+
+    if result["status_code"] == 200 and not error:
+        counters["cells_with_data"] = 1
+        obs = body.get("total_obs", 0)
+        counters["total_obs"] = obs
+        status = f"OK ({body.get('cells_with_data', 0)} cells, {obs:,} obs)"
+    elif error == "No granules found":
+        counters["cells_no_granules"] = 1
+        status = "empty (no granules)"
+    elif error == "No data after filtering":
+        counters["cells_no_data"] = 1
+        status = "empty (filtered)"
+    else:
+        counters["cells_error"] = 1
+        status = f"ERROR: {str(error)}"
+
+    return status, counters
+
+
 def main():
     parser = argparse.ArgumentParser(description="Production Lambda orchestrator")
     parser.add_argument("--catalog", required=True, help="Path to granule catalog JSON")
@@ -197,6 +293,11 @@ def main():
         type=str,
         default=None,
         help="Process a specific morton cell (e.g., -4211322)",
+    )
+    parser.add_argument(
+        "--sort-by-granules",
+        action="store_true",
+        help="Sort cells by granule count (descending) to minimize wall-clock time",
     )
     parser.add_argument("--child-order", type=int, default=12, help="Child cell order")
     parser.add_argument("--s3-bucket", default="xagg")
@@ -231,36 +332,14 @@ def main():
     print(f"      Total cells in catalog: {metadata['total_cells']}")
     print(f"      Total granules: {metadata['total_granules']}")
 
-    # Get cells to process (catalog keys are strings)
+    # Select cells to process
     all_cells = list(catalog.keys())
-
-    # Handle specific morton cell selection
-    if parent_morton_cell := args.morton_cell:
-        if parent_morton_cell not in catalog:
-            raise (ValueError, f"Morton cell '{args.morton_cell}' not found in catalog")
-        cells = [args.morton_cell]
-        original_idx = all_cells.index(args.morton_cell)
-        cell_to_idx = {args.morton_cell: original_idx}
-        print(f"      Processing specific cell: {args.morton_cell}")
-        print(f"      Original chunk_idx: {original_idx}")
-        print(f"      Granules for this cell: {len(catalog[args.morton_cell])}")
-    elif args.max_cells:
-        cells = all_cells[: args.max_cells]
-        cell_to_idx = {cell: idx for idx, cell in enumerate(cells)}
-        print(f"      Limited to {len(cells)} cells (of {len(all_cells)} total)")
-    else:
-        cells = all_cells
-        cell_to_idx = {cell: idx for idx, cell in enumerate(cells)}
-        print(f"      Processing {len(cells)} cells")
+    cells, cell_to_idx = select_cells_to_process(
+        all_cells, catalog, args.morton_cell, args.max_cells, args.sort_by_granules
+    )
 
     if args.dry_run:
-        print("\n[DRY RUN] Would process these cells:")
-        print(f"      Total: {len(cells)}")
-        print(f"      First 5: {cells[:5]}")
-        granule_counts = [len(catalog[c]) for c in cells]
-        print(
-            f"      Granules per cell: min={min(granule_counts)}, max={max(granule_counts)}, avg={sum(granule_counts) / len(granule_counts):.1f}"
-        )
+        print_dry_run_stats(cells, catalog)
         return
 
     # Step 2: Get credentials
@@ -269,7 +348,6 @@ def main():
     print(f"      Credentials expire: {s3_creds.get('expiration', 'N/A')}")
 
     # Step 3: Create Zarr store
-
     print("\n[3/7] Creating template Zarr store...")
     print(f"      Output: s3://{args.s3_bucket}/{args.s3_prefix}")
     s3_store = S3Store(
@@ -286,6 +364,7 @@ def main():
         overwrite=args.overwrite_template,
         n_parent_cells=metadata["total_cells"],
     )
+
     # Step 4: Invoke Lambdas in parallel
     print(f"\n[4/7] Invoking {len(cells)} Lambda functions (max {args.max_workers} concurrent)...")
 
@@ -337,27 +416,17 @@ def main():
             results.append(result)
 
             total_lambda_time += result["lambda_duration"]
-            body = result["body"]
-            error = result.get("error")
 
-            # Categorize result
-            if result["status_code"] == 200 and not error:
-                cells_with_data += 1
-                obs = body.get("total_obs", 0)
-                total_obs += obs
-                status = f"OK ({body.get('cells_with_data', 0)} cells, {obs:,} obs)"
-            elif error == "No granules found":
-                cells_no_granules += 1
-                status = "empty (no granules)"
-            elif error == "No data after filtering":
-                cells_no_data += 1
-                status = "empty (filtered)"
-            else:
-                cells_error += 1
-                status = f"ERROR: {str(error)}"
+            # Categorize result and update counters
+            status, counters = categorize_result(result)
+            cells_with_data += counters["cells_with_data"]
+            cells_no_granules += counters["cells_no_granules"]
+            cells_no_data += counters["cells_no_data"]
+            cells_error += counters["cells_error"]
+            total_obs += counters["total_obs"]
 
             # Progress update every 50 cells or on errors
-            if i % 50 == 0 or cells_error > 0 and i <= 10:
+            if i % 50 == 0 or (cells_error > 0 and i <= 10):
                 elapsed = time.time() - start_time
                 rate = i / elapsed if elapsed > 0 else 0
                 eta = (len(cells) - i) / rate if rate > 0 else 0
