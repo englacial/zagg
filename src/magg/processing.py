@@ -92,17 +92,18 @@ def calculate_cell_statistics(df_cell: pd.DataFrame, value_col="h_li", sigma_col
     dict
         Dictionary of statistics
     """
+    print(df_cell)
     if len(df_cell) == 0:
         return {
             "count": 0,
-            "min": np.nan,
-            "max": np.nan,
-            "mean_weighted": np.nan,
-            "sigma_mean": np.nan,
-            "variance": np.nan,
-            "q25": np.nan,
-            "q50": np.nan,
-            "q75": np.nan,
+            "h_min": np.nan,
+            "h_max": np.nan,
+            "h_mean": np.nan,
+            "h_sigma": np.nan,
+            "h_variance": np.nan,
+            "h_q25": np.nan,
+            "h_q50": np.nan,
+            "h_q75": np.nan,
         }
 
     values = df_cell[value_col].values
@@ -115,14 +116,14 @@ def calculate_cell_statistics(df_cell: pd.DataFrame, value_col="h_li", sigma_col
 
     return {
         "count": len(df_cell),
-        "min": float(np.min(values)),
-        "max": float(np.max(values)),
-        "variance": float(np.var(values)),
-        "q25": float(q[0]),
-        "q50": float(q[1]),
-        "q75": float(q[2]),
-        "mean_weighted": float(weighted_mean),
-        "sigma_mean": float(sigma_mean),
+        "h_min": float(np.min(values)),
+        "h_max": float(np.max(values)),
+        "h_variance": float(np.var(values)),
+        "h_q25": float(q[0]),
+        "h_q50": float(q[1]),
+        "h_q75": float(q[2]),
+        "h_mean": float(weighted_mean),
+        "h_sigma": float(sigma_mean),
     }
 
 
@@ -323,14 +324,14 @@ def process_morton_cell(
     n_cells = len(children)
     stats_arrays = {
         "count": np.zeros(n_cells, dtype=np.int32),
-        "min": np.full(n_cells, np.nan, dtype=np.float32),
-        "max": np.full(n_cells, np.nan, dtype=np.float32),
-        "mean_weighted": np.full(n_cells, np.nan, dtype=np.float32),
-        "sigma_mean": np.full(n_cells, np.nan, dtype=np.float32),
-        "variance": np.full(n_cells, np.nan, dtype=np.float32),
-        "q25": np.full(n_cells, np.nan, dtype=np.float32),
-        "q50": np.full(n_cells, np.nan, dtype=np.float32),
-        "q75": np.full(n_cells, np.nan, dtype=np.float32),
+        "h_min": np.full(n_cells, np.nan, dtype=np.float32),
+        "h_max": np.full(n_cells, np.nan, dtype=np.float32),
+        "h_mean": np.full(n_cells, np.nan, dtype=np.float32),
+        "h_sigma": np.full(n_cells, np.nan, dtype=np.float32),
+        "h_variance": np.full(n_cells, np.nan, dtype=np.float32),
+        "h_q25": np.full(n_cells, np.nan, dtype=np.float32),
+        "h_q50": np.full(n_cells, np.nan, dtype=np.float32),
+        "h_q75": np.full(n_cells, np.nan, dtype=np.float32),
     }
 
     cells_with_data = 0

@@ -301,7 +301,7 @@ def main():
     )
     parser.add_argument("--child-order", type=int, default=12, help="Child cell order")
     parser.add_argument("--s3-bucket", default="xagg")
-    parser.add_argument("--s3-prefix", default="atl06/production.zarr")
+    parser.add_argument("--s3-prefix", default="atl06/morton_aggregation.zarr")
     parser.add_argument(
         "--dry-run", action="store_true", help="Show what would be processed without running"
     )

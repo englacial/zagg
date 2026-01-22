@@ -8,14 +8,14 @@ HEALPIX_BASE_CELLS: int = 12  # Number of base cells in HEALPix tessellation
 COORDS: list[str] = ["cell_ids", "morton"]
 DATA_VARS: list[str] = [
     "count",
-    "min",
-    "max",
-    "mean_weighted",
-    "sigma_mean",
-    "variance",
-    "q25",
-    "q50",
-    "q75",
+    "h_min",
+    "h_max",
+    "h_mean",
+    "h_sigma",
+    "h_variance",
+    "h_q25",
+    "h_q50",
+    "h_q75",
 ]
 
 
@@ -23,14 +23,14 @@ class ATL06AggregationMembers(TypedDict):
     cell_ids: ArraySpec
     morton: ArraySpec
     count: ArraySpec
-    min: ArraySpec
-    max: ArraySpec
-    mean_weighted: ArraySpec
-    sigma_mean: ArraySpec
-    variance: ArraySpec
-    q25: ArraySpec
-    q50: ArraySpec
-    q75: ArraySpec
+    h_min: ArraySpec
+    h_max: ArraySpec
+    h_mean: ArraySpec
+    h_sigma: ArraySpec
+    h_variance: ArraySpec
+    h_q25: ArraySpec
+    h_q50: ArraySpec
+    h_q75: ArraySpec
 
 
 class ATL06AggregationGroup(GroupSpec):
@@ -110,7 +110,7 @@ def xdggs_spec(
             "indexing_scheme": "nested",
             "spatial_dimension": "cells",
             "ellipsoid": {
-                "name": "wgs84",
+                "name": "WGS84",
                 "semimajor_axis": 6378137.0,
                 "inverse_flattening": 298.257223563,
             },
