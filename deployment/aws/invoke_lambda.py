@@ -197,7 +197,7 @@ def select_cells_to_process(
     catalog: dict,
     morton_cell: str = None,
     max_cells: int = None,
-    sort_by_granules: bool = False,
+    sort_by_granules: bool = True,
 ) -> tuple[list, dict]:
     """
     Select cells to process and create index mapping.
@@ -304,6 +304,7 @@ def main():
         "--sort-by-granules",
         action="store_true",
         help="Sort cells by granule count (descending) to minimize wall-clock time",
+        default=True,
     )
     parser.add_argument("--child-order", type=int, default=12, help="Child cell order")
     parser.add_argument("--s3-bucket", default="xagg")
