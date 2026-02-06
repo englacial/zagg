@@ -16,12 +16,6 @@ The schema module defines the output structure for aggregated cell statistics. [
 
 ::: magg.schema.ProcessingMetadata
 
-::: magg.schema.ATL06AggregationGroup
-
 ## Constants
-
-::: magg.schema.DATA_VARS
-
-::: magg.schema.COORDS
 
 ::: magg.schema.HEALPIX_BASE_CELLS

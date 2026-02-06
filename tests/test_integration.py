@@ -2,7 +2,7 @@ import numpy as np
 import zarr
 
 from magg.processing import write_dataframe_to_zarr
-from magg.schema import COORDS, DATA_VARS, xdggs_zarr_template
+from magg.schema import _COORDS, _DATA_VARS, xdggs_zarr_template
 
 
 def test_full_integration(s3_store_factory, mock_dataframe_factory):
@@ -32,7 +32,7 @@ def test_full_integration(s3_store_factory, mock_dataframe_factory):
     min_idx = int(df_out["cell_ids"].min())
     max_idx = int(df_out["cell_ids"].max())
 
-    for col in COORDS + DATA_VARS:
+    for col in _COORDS + _DATA_VARS:
         actual = group[col][min_idx : max_idx + 1]
         expected = df_out[col].values
         np.testing.assert_array_almost_equal(actual, expected)
@@ -74,7 +74,7 @@ def test_multiple_parent_cells(s3_store_factory, mock_dataframe_factory):
         min_idx = int(df_out["cell_ids"].min())
         max_idx = int(df_out["cell_ids"].max())
 
-        for col in COORDS + DATA_VARS:
+        for col in _COORDS + _DATA_VARS:
             actual = group[col][min_idx : max_idx + 1]
             expected = df_out[col].values
             np.testing.assert_array_almost_equal(

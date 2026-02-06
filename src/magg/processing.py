@@ -16,7 +16,7 @@ import pandas as pd
 from zarr import config, open_array
 from zarr.abc.store import Store
 
-from magg.schema import DATA_VARS, ProcessingMetadata, _agg_fields, _get_schema_fields
+from magg.schema import _DATA_VARS, ProcessingMetadata, _agg_fields, _get_schema_fields
 
 logger = logging.getLogger(__name__)
 
@@ -67,7 +67,7 @@ def write_dataframe_to_zarr(
     Parameters
     ----------
     df_out : pd.DataFrame
-        DataFrame with columns matching COORDS + DATA_VARS from schema
+        DataFrame with columns matching CellStatsSchema
     store : Store
         Zarr-compatible store (already contains template)
     chunk_idx : int
@@ -120,7 +120,7 @@ def calculate_cell_statistics(df_cell: pd.DataFrame, value_col="h_li", sigma_col
     Returns
     -------
     dict
-        Dictionary of statistics with keys matching DATA_VARS
+        Dictionary of statistics with keys matching _DATA_VARS
     """
     agg_fields = _agg_fields()
 
@@ -349,7 +349,7 @@ def process_morton_cell(
     n_cells = len(children)
     schema_fields = _get_schema_fields()
     stats_arrays = {}
-    for name in DATA_VARS:
+    for name in _DATA_VARS:
         meta = schema_fields[name]
         zarr_dtype = np.dtype(meta.get("zarr_dtype", "float32"))
         fill_value = meta.get("fill_value", "NaN")
@@ -372,7 +372,7 @@ def process_morton_cell(
     # Create output DataFrame
     child_cell_ids, _ = mort2healpix(children)
 
-    df_out = pd.DataFrame({var: stats_arrays[var] for var in DATA_VARS})
+    df_out = pd.DataFrame({var: stats_arrays[var] for var in _DATA_VARS})
     df_out = df_out.assign(morton=children, cell_ids=child_cell_ids)
 
     duration = (datetime.now() - start_time).total_seconds()
