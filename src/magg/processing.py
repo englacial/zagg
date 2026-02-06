@@ -7,7 +7,7 @@ cloud platforms or local processing environments.
 
 import logging
 from datetime import datetime
-from typing import TYPE_CHECKING, Any, Dict, List, Tuple
+from typing import TYPE_CHECKING, List, Tuple
 
 import h5coro
 import numpy as np
@@ -15,7 +15,7 @@ import pandas as pd
 from zarr import config, open_array
 from zarr.abc.store import Store
 
-from magg.schema import DATA_VARS
+from magg.schema import DATA_VARS, ProcessingMetadata
 
 if TYPE_CHECKING:
     pass
@@ -134,7 +134,7 @@ def process_morton_cell(
     granule_urls: List[str],
     s3_credentials: dict,
     h5coro_driver=None,
-) -> Tuple[pd.DataFrame, Dict[str, Any]]:
+) -> Tuple[pd.DataFrame, ProcessingMetadata]:
     """
     Process one parent morton cell: read data, calculate statistics, return DataFrame.
 
@@ -180,7 +180,7 @@ def process_morton_cell(
         h5coro_driver = s3driver.S3Driver
 
     # Prepare metadata
-    metadata: Dict[str, Any] = {
+    metadata: ProcessingMetadata = {
         "parent_morton": parent_morton,
         "cells_with_data": 0,
         "total_obs": 0,

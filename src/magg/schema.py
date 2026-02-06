@@ -19,6 +19,16 @@ DATA_VARS: list[str] = [
 ]
 
 
+class ProcessingMetadata(TypedDict):
+    parent_morton: int
+    cells_with_data: int
+    total_obs: int
+    granule_count: int
+    files_processed: int
+    duration_s: float
+    error: str | None
+
+
 class ATL06AggregationMembers(TypedDict):
     cell_ids: ArraySpec
     morton: ArraySpec
@@ -167,4 +177,4 @@ def xdggs_zarr_template(
     return store
 
 
-__all__ = ["DATA_VARS", "COORDS", "ATL06AggregationGroup", "xdggs_zarr_template", "xdggs_spec"]
+__all__ = ["DATA_VARS", "COORDS", "ATL06AggregationGroup", "ProcessingMetadata", "xdggs_zarr_template", "xdggs_spec"]
