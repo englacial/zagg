@@ -19,7 +19,11 @@ class TestWriteDataframeToZarr:
         # Antarctic coordinate
         df_out = mock_dataframe_factory(-78.5, -132.0, parent_order, child_order)
 
-        assert write_dataframe_to_zarr(df_out, store, child_order, parent_order)
+        n_children = 4 ** (child_order - parent_order)
+        chunk_idx = int(df_out["cell_ids"].min()) // n_children
+        assert write_dataframe_to_zarr(
+            df_out, store, chunk_idx=chunk_idx, child_order=child_order, parent_order=parent_order
+        )
 
         # Verify data was written correctly
         group = open_group(store=store, mode="r", path=str(child_order))
@@ -34,7 +38,9 @@ class TestWriteDataframeToZarr:
     def test_write_empty_dataframe(self, s3_store_factory):
         store = s3_store_factory()
         """Test that writing an empty DataFrame returns False without error."""
-        assert write_dataframe_to_zarr(pd.DataFrame(), store, 8, 6)
+        assert write_dataframe_to_zarr(
+            pd.DataFrame(), store, chunk_idx=0, child_order=8, parent_order=6
+        )
 
     def test_write_index_range_mismatch(self, s3_store_factory, mock_dataframe_factory):
         """Test that index range mismatch returns an error."""
@@ -47,7 +53,15 @@ class TestWriteDataframeToZarr:
         # Create DataFrame with only half the children
         df_out = mock_dataframe_factory(-78.5, -132.0, parent_order, child_order)
         df_out = df_out.iloc[: len(df_out) // 2]
+        n_children = 4 ** (child_order - parent_order)
+        chunk_idx = int(df_out["cell_ids"].min()) // n_children
         with pytest.raises(
             ValueError, match="Expected index range to match range between min and max cell_ids"
         ):
-            write_dataframe_to_zarr(df_out, store, child_order, parent_order)
+            write_dataframe_to_zarr(
+                df_out,
+                store,
+                chunk_idx=chunk_idx,
+                child_order=child_order,
+                parent_order=parent_order,
+            )
