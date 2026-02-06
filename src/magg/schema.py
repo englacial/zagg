@@ -1,7 +1,7 @@
 import numpy as np
 import pandera.pandas as pa
 from pandera.typing import Series
-from pydantic_zarr.experimental.v3 import ArraySpec, BaseAttributes, GroupSpec, NamedConfig
+from pydantic_zarr.experimental.v3 import ArraySpec, GroupSpec, NamedConfig
 from typing_extensions import TypedDict
 from zarr import config
 from zarr.abc.store import Store
@@ -158,9 +158,9 @@ def _agg_fields() -> dict[str, dict]:
     return {name: meta for name, meta in _get_schema_fields().items() if meta.get("agg")}
 
 
-# Derived from CellStatsSchema — same values as the old hardcoded lists
-COORDS: list[str] = _fields_by_role("coord")
-DATA_VARS: list[str] = _fields_by_role("data_var")
+# Derived from CellStatsSchema — internal convenience aliases
+_COORDS: list[str] = _fields_by_role("coord")
+_DATA_VARS: list[str] = _fields_by_role("data_var")
 
 
 class ProcessingMetadata(TypedDict):
@@ -173,29 +173,10 @@ class ProcessingMetadata(TypedDict):
     error: str | None
 
 
-class ATL06AggregationMembers(TypedDict):
-    cell_ids: ArraySpec
-    morton: ArraySpec
-    count: ArraySpec
-    h_min: ArraySpec
-    h_max: ArraySpec
-    h_mean: ArraySpec
-    h_sigma: ArraySpec
-    h_variance: ArraySpec
-    h_q25: ArraySpec
-    h_q50: ArraySpec
-    h_q75: ArraySpec
-
-
-class ATL06AggregationGroup(GroupSpec):
-    members: ATL06AggregationMembers  # type: ignore[assignment]
-    attributes: BaseAttributes
-
-
 def xdggs_spec(
     parent_order: int,
     child_order: int,
-) -> ATL06AggregationGroup:
+) -> GroupSpec:
     """
     Create a [pydantic_zarr.experimental.v3.GroupSpec]() for ATL06 aggregation data using HEALPix/Morton indexing.
 
@@ -270,7 +251,7 @@ def xdggs_spec(
     }
 
     # Create and write group specification
-    return ATL06AggregationGroup(members=members, attributes=dggs_attrs)  # type: ignore[arg-type]
+    return GroupSpec(members=members, attributes=dggs_attrs)
 
 
 def xdggs_zarr_template(
@@ -281,7 +262,7 @@ def xdggs_zarr_template(
     overwrite: bool = False,
 ) -> Store:
     """
-    Create a Zarr template for ATL06 aggregation data using HEALPix/Morton indexing.
+    Create a Zarr template for data aggregation data using HEALPix/Morton indexing.
 
     Overwrites an existing Zarr store if it already exists.
 
@@ -308,7 +289,10 @@ def xdggs_zarr_template(
         assert n_parent_cells > 0
         level_diff = child_order - parent_order
         n_pixels = 4**level_diff * n_parent_cells
-        members = {var: m.with_shape((n_pixels,)) for var, m in spec.members.items()}  # type: ignore[attr-defined]
+        members = {
+            var: m.with_shape((n_pixels,)) if isinstance(m, ArraySpec) else m
+            for var, m in spec.members.items()
+        }
         spec = spec.with_members(members)
 
     with config.set({"async.concurrency": 128}):
@@ -319,9 +303,6 @@ def xdggs_zarr_template(
 
 __all__ = [
     "CellStatsSchema",
-    "DATA_VARS",
-    "COORDS",
-    "ATL06AggregationGroup",
     "ProcessingMetadata",
     "xdggs_zarr_template",
     "xdggs_spec",

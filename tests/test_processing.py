@@ -4,7 +4,7 @@ import pytest
 from zarr import open_group
 
 from magg.processing import AGG_FUNCTIONS, calculate_cell_statistics, write_dataframe_to_zarr
-from magg.schema import COORDS, DATA_VARS, _agg_fields, xdggs_zarr_template
+from magg.schema import _COORDS, _DATA_VARS, _agg_fields, xdggs_zarr_template
 
 
 class TestWriteDataframeToZarr:
@@ -30,7 +30,7 @@ class TestWriteDataframeToZarr:
         min_idx = int(df_out["cell_ids"].min())
         max_idx = int(df_out["cell_ids"].max())
 
-        for col in COORDS + DATA_VARS:
+        for col in _COORDS + _DATA_VARS:
             actual = group[col][min_idx : max_idx + 1]
             expected = df_out[col].values
             np.testing.assert_array_almost_equal(actual, expected, err_msg=f"Mismatch in {col}")
@@ -82,10 +82,10 @@ class TestCalculateCellStatistics:
                 assert np.isnan(result[name]), f"{name} should be NaN for empty input"
 
     def test_result_keys_match_data_vars(self):
-        """calculate_cell_statistics keys should exactly match DATA_VARS."""
+        """calculate_cell_statistics keys should exactly match _DATA_VARS."""
         df = pd.DataFrame({"h_li": [1.0, 2.0, 3.0], "s_li": [0.1, 0.1, 0.1]})
         result = calculate_cell_statistics(df)
-        assert list(result.keys()) == DATA_VARS
+        assert list(result.keys()) == _DATA_VARS
 
     def test_basic_statistics(self):
         """Verify basic statistics for a simple input."""
