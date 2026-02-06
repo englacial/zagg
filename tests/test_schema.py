@@ -7,6 +7,9 @@ from magg.schema import (
     COORDS,
     DATA_VARS,
     HEALPIX_BASE_CELLS,
+    CellStatsSchema,
+    _agg_fields,
+    _fields_by_role,
     xdggs_zarr_template,
 )
 
@@ -151,3 +154,62 @@ class TestCreateZarrTemplate:
         assert set(group.keys()) == set(COORDS + DATA_VARS)
         assert group["count"].shape == (HEALPIX_BASE_CELLS * 4**child_order,)
         assert group["count"].chunks == (4 ** (child_order - parent_order),)
+
+
+class TestCellStatsSchema:
+    def test_data_vars_derived_from_schema(self):
+        """DATA_VARS should match fields with role='data_var'."""
+        assert DATA_VARS == _fields_by_role("data_var")
+
+    def test_coords_derived_from_schema(self):
+        """COORDS should match fields with role='coord'."""
+        assert COORDS == _fields_by_role("coord")
+
+    def test_expected_data_vars(self):
+        """DATA_VARS should contain the expected 9 entries."""
+        assert DATA_VARS == [
+            "count",
+            "h_min",
+            "h_max",
+            "h_mean",
+            "h_sigma",
+            "h_variance",
+            "h_q25",
+            "h_q50",
+            "h_q75",
+        ]
+
+    def test_expected_coords(self):
+        """COORDS should contain cell_ids and morton."""
+        assert COORDS == ["cell_ids", "morton"]
+
+    def test_all_agg_fields_have_required_metadata(self):
+        """Every agg field must have agg, source, fill_value, zarr_dtype."""
+        for name, meta in _agg_fields().items():
+            assert "agg" in meta, f"{name} missing 'agg'"
+            assert "source" in meta, f"{name} missing 'source'"
+            assert "fill_value" in meta, f"{name} missing 'fill_value'"
+            assert "zarr_dtype" in meta, f"{name} missing 'zarr_dtype'"
+
+    def test_schema_validates_conforming_dataframe(self):
+        """A DataFrame matching the schema should validate."""
+        import pandas as pd
+
+        n = 10
+        df = pd.DataFrame(
+            {
+                "cell_ids": np.arange(n, dtype=np.uint64),
+                "morton": np.arange(n, dtype=np.int64),
+                "count": np.ones(n, dtype=np.int32),
+                "h_min": np.zeros(n, dtype=np.float32),
+                "h_max": np.ones(n, dtype=np.float32),
+                "h_mean": np.full(n, 0.5, dtype=np.float32),
+                "h_sigma": np.full(n, 0.1, dtype=np.float32),
+                "h_variance": np.full(n, 0.01, dtype=np.float32),
+                "h_q25": np.full(n, 0.25, dtype=np.float32),
+                "h_q50": np.full(n, 0.50, dtype=np.float32),
+                "h_q75": np.full(n, 0.75, dtype=np.float32),
+            }
+        )
+        validated = CellStatsSchema.validate(df)
+        assert len(validated) == n

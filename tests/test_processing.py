@@ -3,8 +3,8 @@ import pandas as pd
 import pytest
 from zarr import open_group
 
-from magg.processing import write_dataframe_to_zarr
-from magg.schema import COORDS, DATA_VARS, xdggs_zarr_template
+from magg.processing import AGG_FUNCTIONS, calculate_cell_statistics, write_dataframe_to_zarr
+from magg.schema import COORDS, DATA_VARS, _agg_fields, xdggs_zarr_template
 
 
 class TestWriteDataframeToZarr:
@@ -65,3 +65,33 @@ class TestWriteDataframeToZarr:
                 child_order=child_order,
                 parent_order=parent_order,
             )
+
+
+class TestCalculateCellStatistics:
+    def test_all_agg_functions_registered(self):
+        """Every agg name in the schema must exist in AGG_FUNCTIONS."""
+        for name, meta in _agg_fields().items():
+            assert meta["agg"] in AGG_FUNCTIONS, f"Missing AGG_FUNCTIONS entry for '{meta['agg']}'"
+
+    def test_empty_df_returns_zeros_and_nans(self):
+        """Empty DataFrame should return count=0 and NaN for all stats."""
+        result = calculate_cell_statistics(pd.DataFrame(columns=["h_li", "s_li"]))
+        assert result["count"] == 0
+        for name in _agg_fields():
+            if name != "count":
+                assert np.isnan(result[name]), f"{name} should be NaN for empty input"
+
+    def test_result_keys_match_data_vars(self):
+        """calculate_cell_statistics keys should exactly match DATA_VARS."""
+        df = pd.DataFrame({"h_li": [1.0, 2.0, 3.0], "s_li": [0.1, 0.1, 0.1]})
+        result = calculate_cell_statistics(df)
+        assert list(result.keys()) == DATA_VARS
+
+    def test_basic_statistics(self):
+        """Verify basic statistics for a simple input."""
+        df = pd.DataFrame({"h_li": [1.0, 2.0, 3.0], "s_li": [0.1, 0.1, 0.1]})
+        result = calculate_cell_statistics(df)
+        assert result["count"] == 3
+        assert result["h_min"] == 1.0
+        assert result["h_max"] == 3.0
+        np.testing.assert_almost_equal(result["h_q50"], 2.0)

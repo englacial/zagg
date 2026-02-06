@@ -6,8 +6,9 @@ cloud platforms or local processing environments.
 """
 
 import logging
+from collections.abc import Callable
 from datetime import datetime
-from typing import TYPE_CHECKING, List, Tuple
+from typing import List, Tuple
 
 import h5coro
 import numpy as np
@@ -15,12 +16,41 @@ import pandas as pd
 from zarr import config, open_array
 from zarr.abc.store import Store
 
-from magg.schema import DATA_VARS, ProcessingMetadata
-
-if TYPE_CHECKING:
-    pass
+from magg.schema import DATA_VARS, ProcessingMetadata, _agg_fields, _get_schema_fields
 
 logger = logging.getLogger(__name__)
+
+
+# ---------------------------------------------------------------------------
+# Aggregation function registry
+# ---------------------------------------------------------------------------
+
+
+def _weighted_mean(values: np.ndarray, weights: np.ndarray) -> float:
+    """Inverse-variance weighted mean."""
+    w = 1.0 / (weights**2)
+    return float(np.sum(values * w) / np.sum(w))
+
+
+def _weighted_sigma(values: np.ndarray, weights: np.ndarray) -> float:
+    """Uncertainty of inverse-variance weighted mean."""
+    w = 1.0 / (weights**2)
+    return float(1.0 / np.sqrt(np.sum(w)))
+
+
+AGG_FUNCTIONS: dict[str, Callable] = {
+    "count": lambda values, **kw: len(values),
+    "nanmin": lambda values, **kw: float(np.min(values)),
+    "nanmax": lambda values, **kw: float(np.max(values)),
+    "nanvar": lambda values, **kw: float(np.var(values)),
+    "weighted_mean": lambda values, weight_col_values=None, **kw: _weighted_mean(
+        values, weight_col_values
+    ),
+    "weighted_sigma": lambda values, weight_col_values=None, **kw: _weighted_sigma(
+        values, weight_col_values
+    ),
+    "quantile": lambda values, q=0.5, **kw: float(np.quantile(values, q)),
+}
 
 
 def write_dataframe_to_zarr(
@@ -76,7 +106,7 @@ def write_dataframe_to_zarr(
 
 def calculate_cell_statistics(df_cell: pd.DataFrame, value_col="h_li", sigma_col="s_li") -> dict:
     """
-    Calculate summary statistics for a cell.
+    Calculate summary statistics for a cell, driven by CellStatsSchema metadata.
 
     Parameters
     ----------
@@ -90,41 +120,36 @@ def calculate_cell_statistics(df_cell: pd.DataFrame, value_col="h_li", sigma_col
     Returns
     -------
     dict
-        Dictionary of statistics
+        Dictionary of statistics with keys matching DATA_VARS
     """
-    print(df_cell)
+    agg_fields = _agg_fields()
+
     if len(df_cell) == 0:
         return {
-            "count": 0,
-            "h_min": np.nan,
-            "h_max": np.nan,
-            "h_mean": np.nan,
-            "h_sigma": np.nan,
-            "h_variance": np.nan,
-            "h_q25": np.nan,
-            "h_q50": np.nan,
-            "h_q75": np.nan,
+            name: (0 if meta["agg"] == "count" else np.nan) for name, meta in agg_fields.items()
         }
 
-    values = df_cell[value_col].values
-    sigmas = df_cell[sigma_col].values
+    result = {}
+    for name, meta in agg_fields.items():
+        agg_name = meta["agg"]
+        source = meta.get("source") or value_col
+        params = dict(meta.get("params", {}))
 
-    q = np.quantile(values, [0.25, 0.5, 0.75])
-    weights = 1.0 / (sigmas**2)
-    weighted_mean = np.sum(values * weights) / np.sum(weights)
-    sigma_mean = 1.0 / np.sqrt(np.sum(weights))
+        values = df_cell[source].values
 
-    return {
-        "count": len(df_cell),
-        "h_min": float(np.min(values)),
-        "h_max": float(np.max(values)),
-        "h_variance": float(np.var(values)),
-        "h_q25": float(q[0]),
-        "h_q50": float(q[1]),
-        "h_q75": float(q[2]),
-        "h_mean": float(weighted_mean),
-        "h_sigma": float(sigma_mean),
-    }
+        if agg_name == "count":
+            result[name] = len(df_cell)
+            continue
+
+        # Resolve weight column if needed
+        weight_col = params.pop("weight_col", None)
+        if weight_col is not None:
+            params["weight_col_values"] = df_cell[weight_col].values
+
+        func = AGG_FUNCTIONS[agg_name]
+        result[name] = func(values, **params)
+
+    return result
 
 
 def process_morton_cell(
@@ -322,17 +347,16 @@ def process_morton_cell(
     df_all["m12"] = clip2order(child_order, df_all["midx"].values)
 
     n_cells = len(children)
-    stats_arrays = {
-        "count": np.zeros(n_cells, dtype=np.int32),
-        "h_min": np.full(n_cells, np.nan, dtype=np.float32),
-        "h_max": np.full(n_cells, np.nan, dtype=np.float32),
-        "h_mean": np.full(n_cells, np.nan, dtype=np.float32),
-        "h_sigma": np.full(n_cells, np.nan, dtype=np.float32),
-        "h_variance": np.full(n_cells, np.nan, dtype=np.float32),
-        "h_q25": np.full(n_cells, np.nan, dtype=np.float32),
-        "h_q50": np.full(n_cells, np.nan, dtype=np.float32),
-        "h_q75": np.full(n_cells, np.nan, dtype=np.float32),
-    }
+    schema_fields = _get_schema_fields()
+    stats_arrays = {}
+    for name in DATA_VARS:
+        meta = schema_fields[name]
+        zarr_dtype = np.dtype(meta.get("zarr_dtype", "float32"))
+        fill_value = meta.get("fill_value", "NaN")
+        if fill_value == "NaN":
+            stats_arrays[name] = np.full(n_cells, np.nan, dtype=zarr_dtype)
+        else:
+            stats_arrays[name] = np.zeros(n_cells, dtype=zarr_dtype)
 
     cells_with_data = 0
     for i, child_morton in enumerate(children):
