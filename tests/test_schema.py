@@ -4,8 +4,8 @@ from zarr import open_array, open_group
 from zarr.storage import MemoryStore
 
 from magg.schema import (
-    COORDS,
-    DATA_VARS,
+    _COORDS,
+    _DATA_VARS,
     HEALPIX_BASE_CELLS,
     CellStatsSchema,
     _agg_fields,
@@ -16,7 +16,7 @@ from magg.schema import (
 
 class TestCreateZarrTemplate:
     def test_creates_all_arrays(self):
-        """Test that all COORDS and DATA_VARS arrays are created."""
+        """Test that all _COORDS and _DATA_VARS arrays are created."""
         parent_order = 6
         child_order = 8
 
@@ -24,7 +24,7 @@ class TestCreateZarrTemplate:
         xdggs_zarr_template(store, parent_order, child_order)
 
         group = open_group(store, path=str(child_order), mode="r")
-        assert set(group.keys()) == set(COORDS + DATA_VARS)
+        assert set(group.keys()) == set(_COORDS + _DATA_VARS)
 
     def test_array_shape(self):
         """Test that array shape equals HEALPIX_BASE_CELLS * 4^child_order."""
@@ -37,7 +37,7 @@ class TestCreateZarrTemplate:
         group = open_group(store, path=str(child_order), mode="r")
         expected_shape = (HEALPIX_BASE_CELLS * 4**child_order,)
 
-        for name in COORDS + DATA_VARS:
+        for name in _COORDS + _DATA_VARS:
             assert group[name].shape == expected_shape
 
     def test_array_shape_n_parent_cells(self):
@@ -52,7 +52,7 @@ class TestCreateZarrTemplate:
         group = open_group(store, path=str(child_order), mode="r")
         expected_shape = (16,)
 
-        for name in COORDS + DATA_VARS:
+        for name in _COORDS + _DATA_VARS:
             assert group[name].shape == expected_shape
 
     def test_chunk_shape(self):
@@ -66,7 +66,7 @@ class TestCreateZarrTemplate:
         group = open_group(store, path=str(child_order), mode="r")
         expected_chunks = (4 ** (child_order - parent_order),)
 
-        for name in COORDS + DATA_VARS:
+        for name in _COORDS + _DATA_VARS:
             assert group[name].chunks == expected_chunks
 
     def test_coordinate_dtypes(self):
@@ -92,7 +92,7 @@ class TestCreateZarrTemplate:
         xdggs_zarr_template(store, parent_order=6, child_order=8)
 
         group = open_group(store, path="8", mode="r")
-        stat_vars = [v for v in DATA_VARS if v != "count"]
+        stat_vars = [v for v in _DATA_VARS if v != "count"]
 
         for name in stat_vars:
             assert group[name].dtype == np.float32
@@ -112,7 +112,7 @@ class TestCreateZarrTemplate:
         assert group["count"].fill_value == 0
 
         # Statistical vars have fill_value NaN
-        stat_vars = [v for v in DATA_VARS if v != "count"]
+        stat_vars = [v for v in _DATA_VARS if v != "count"]
         for name in stat_vars:
             assert np.isnan(group[name].fill_value)
 
@@ -122,7 +122,7 @@ class TestCreateZarrTemplate:
         child_order = 8
         xdggs_zarr_template(store, parent_order=6, child_order=child_order)
 
-        for name in COORDS + DATA_VARS:
+        for name in _COORDS + _DATA_VARS:
             array = open_array(store, path=f"{child_order}/{name}", mode="r")
             print(array.metadata)
             assert array.metadata.dimension_names == ("cells",)
@@ -151,23 +151,23 @@ class TestCreateZarrTemplate:
         xdggs_zarr_template(store, parent_order, child_order)
 
         group = open_group(store=store, path=str(child_order), mode="r")
-        assert set(group.keys()) == set(COORDS + DATA_VARS)
+        assert set(group.keys()) == set(_COORDS + _DATA_VARS)
         assert group["count"].shape == (HEALPIX_BASE_CELLS * 4**child_order,)
         assert group["count"].chunks == (4 ** (child_order - parent_order),)
 
 
 class TestCellStatsSchema:
     def test_data_vars_derived_from_schema(self):
-        """DATA_VARS should match fields with role='data_var'."""
-        assert DATA_VARS == _fields_by_role("data_var")
+        """_DATA_VARS should match fields with role='data_var'."""
+        assert _DATA_VARS == _fields_by_role("data_var")
 
     def test_coords_derived_from_schema(self):
-        """COORDS should match fields with role='coord'."""
-        assert COORDS == _fields_by_role("coord")
+        """_COORDS should match fields with role='coord'."""
+        assert _COORDS == _fields_by_role("coord")
 
     def test_expected_data_vars(self):
-        """DATA_VARS should contain the expected 9 entries."""
-        assert DATA_VARS == [
+        """_DATA_VARS should contain the expected 9 entries."""
+        assert _DATA_VARS == [
             "count",
             "h_min",
             "h_max",
@@ -180,8 +180,8 @@ class TestCellStatsSchema:
         ]
 
     def test_expected_coords(self):
-        """COORDS should contain cell_ids and morton."""
-        assert COORDS == ["cell_ids", "morton"]
+        """_COORDS should contain cell_ids and morton."""
+        assert _COORDS == ["cell_ids", "morton"]
 
     def test_all_agg_fields_have_required_metadata(self):
         """Every agg field must have agg, source, fill_value, zarr_dtype."""

@@ -8,7 +8,7 @@
 - **Aggregation recipes** --- each data variable's `pa.Field(metadata=...)` encodes the aggregation function, source column, and parameters
 - **Zarr array configuration** --- dtype and fill value per column, used by [`xdggs_spec`][magg.schema.xdggs_spec] to generate the Zarr template
 
-The module-level constants [`COORDS`][magg.schema.COORDS] and [`DATA_VARS`][magg.schema.DATA_VARS] are derived from the schema, not hardcoded.
+Coordinate and data variable column names are derived from the schema via `_fields_by_role()`, not hardcoded.
 
 ## Field Metadata
 
@@ -66,9 +66,7 @@ To add a new output statistic:
     )
     ```
 
-3. Update `ATL06AggregationMembers` TypedDict to include the new field for type checking.
-
-Everything else --- `DATA_VARS`, the Zarr template, `calculate_cell_statistics`, and `process_morton_cell` --- adapts automatically.
+Everything else --- the Zarr template, `calculate_cell_statistics`, and `process_morton_cell` --- adapts automatically.
 
 ## Output Columns
 

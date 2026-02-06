@@ -6,7 +6,7 @@ import numpy as np
 import pandas as pd
 import pytest
 
-from magg.schema import DATA_VARS
+from magg.schema import _DATA_VARS
 
 
 @pytest.fixture(scope="session")
@@ -115,7 +115,7 @@ def mock_dataframe_factory():
         n = len(children)
 
         df = pd.DataFrame({"morton": children, "cell_ids": cell_ids}).assign(
-            **{var: np.random.randn(n).astype(np.float32) for var in DATA_VARS if var != "count"}
+            **{var: np.random.randn(n).astype(np.float32) for var in _DATA_VARS if var != "count"}
         )
         df = df.assign(count=np.random.randn(n).astype(np.int32))
         return df
