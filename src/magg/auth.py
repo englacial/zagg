@@ -29,15 +29,18 @@ def get_nsidc_s3_credentials() -> dict:
 
     Examples
     --------
-    >>> creds = get_nsidc_s3_credentials()
-    >>> print(f"Credentials expire: {creds.get('expiration')}")
 
-    >>> # Pass to Lambda invocation
-    >>> event = {
-    ...     "parent_morton": -6134114,
-    ...     "s3_credentials": creds,
-    ...     # ... other params
-    ... }
+    ```python
+    creds = get_nsidc_s3_credentials()
+    print(f"Credentials expire: {creds.get('expiration')}")
+
+    # Pass to Lambda invocation
+    event = {
+        "parent_morton": -6134114,
+        "s3_credentials": creds,
+        # ... other params
+    }
+    ```
     """
     auth = earthaccess.login()
     return auth.get_s3_credentials(daac="NSIDC")

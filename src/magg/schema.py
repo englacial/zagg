@@ -14,23 +14,18 @@ class CellStatsSchema(pa.DataFrameModel):
 
     Each field's metadata encodes its role (coord vs data_var), Zarr dtype/fill_value,
     and for data variables, the aggregation function and parameters.
-
-    Metadata keys:
-        role: "coord" | "data_var"
-        zarr_dtype: str — Zarr array data type
-        fill_value: int | str — Zarr fill value (0 or "NaN")
-        agg: str — aggregation function name (data_var only)
-        source: str | None — input column name for the aggregation
-        params: dict — extra params (e.g. q for quantiles, weight_col for weighted stats)
     """
 
     # Coordinate columns
     cell_ids: Series[np.uint64] = pa.Field(
         metadata={"role": "coord", "zarr_dtype": "uint64", "fill_value": 0},
     )
+    """Cell identifier"""
+
     morton: Series[np.int64] = pa.Field(
         metadata={"role": "coord", "zarr_dtype": "int64", "fill_value": 0},
     )
+    """Morton code"""
 
     # Aggregation variables
     count: Series[np.int32] = pa.Field(
@@ -43,6 +38,8 @@ class CellStatsSchema(pa.DataFrameModel):
             "params": {},
         },
     )
+    """Number of aggregated values"""
+
     h_min: Series[np.float32] = pa.Field(
         metadata={
             "role": "data_var",
@@ -53,6 +50,8 @@ class CellStatsSchema(pa.DataFrameModel):
             "params": {},
         },
     )
+    """Minimum value"""
+
     h_max: Series[np.float32] = pa.Field(
         metadata={
             "role": "data_var",
@@ -63,6 +62,8 @@ class CellStatsSchema(pa.DataFrameModel):
             "params": {},
         },
     )
+    """Maximum value"""
+
     h_mean: Series[np.float32] = pa.Field(
         metadata={
             "role": "data_var",
@@ -73,6 +74,8 @@ class CellStatsSchema(pa.DataFrameModel):
             "params": {"weight_col": "s_li"},
         },
     )
+    """Mean value"""
+
     h_sigma: Series[np.float32] = pa.Field(
         metadata={
             "role": "data_var",
@@ -83,6 +86,8 @@ class CellStatsSchema(pa.DataFrameModel):
             "params": {"weight_col": "s_li"},
         },
     )
+    """Weighted sigma"""
+
     h_variance: Series[np.float32] = pa.Field(
         metadata={
             "role": "data_var",
@@ -93,6 +98,8 @@ class CellStatsSchema(pa.DataFrameModel):
             "params": {},
         },
     )
+    """Variance"""
+
     h_q25: Series[np.float32] = pa.Field(
         metadata={
             "role": "data_var",
@@ -103,6 +110,8 @@ class CellStatsSchema(pa.DataFrameModel):
             "params": {"q": 0.25},
         },
     )
+    """25th percentile"""
+
     h_q50: Series[np.float32] = pa.Field(
         metadata={
             "role": "data_var",
@@ -113,6 +122,8 @@ class CellStatsSchema(pa.DataFrameModel):
             "params": {"q": 0.50},
         },
     )
+    """50th percentile"""
+
     h_q75: Series[np.float32] = pa.Field(
         metadata={
             "role": "data_var",
@@ -123,6 +134,7 @@ class CellStatsSchema(pa.DataFrameModel):
             "params": {"q": 0.75},
         },
     )
+    """75th percentile"""
 
 
 # ---------------------------------------------------------------------------

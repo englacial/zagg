@@ -57,3 +57,5 @@ deployment/aws/layer_build*
 # Archives (except examples)
 *.zip
 *.json
+
+site/*
