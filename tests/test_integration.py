@@ -21,7 +21,11 @@ def test_full_integration(s3_store_factory, mock_dataframe_factory):
     # Antarctic coordinate
     df_out = mock_dataframe_factory(-78.5, -132.0, parent_order, child_order)
 
-    write_dataframe_to_zarr(df_out, store, child_order, parent_order)
+    n_children = 4 ** (child_order - parent_order)
+    chunk_idx = int(df_out["cell_ids"].min()) // n_children
+    write_dataframe_to_zarr(
+        df_out, store, chunk_idx=chunk_idx, child_order=child_order, parent_order=parent_order
+    )
 
     # Verify data integrity
     group = zarr.open_group(store=store, path=str(child_order), mode="r")
@@ -55,7 +59,11 @@ def test_multiple_parent_cells(s3_store_factory, mock_dataframe_factory):
     for lat, lon in coordinates:
         df_out = mock_dataframe_factory(lat, lon, parent_order, child_order)
 
-        write_dataframe_to_zarr(df_out, store, child_order, parent_order)
+        n_children = 4 ** (child_order - parent_order)
+        chunk_idx = int(df_out["cell_ids"].min()) // n_children
+        write_dataframe_to_zarr(
+            df_out, store, chunk_idx=chunk_idx, child_order=child_order, parent_order=parent_order
+        )
 
         all_data[(lat, lon)] = df_out
 
