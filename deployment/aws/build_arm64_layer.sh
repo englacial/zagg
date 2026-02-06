@@ -51,7 +51,7 @@ docker run --rm --platform linux/arm64 \
         $PIP install \
             "pandas==2.2.3" fastparquet cramjam \
             healpy astropy \
-            earthaccess shapely \
+            earthaccess shapely 'pandera[pandas]' \
             "pydantic-zarr>=0.9.1" "zarr>=3.1.5" "obstore>=0.8.2" \
             -c /tmp/constraints.txt \
             -t /out/python \
