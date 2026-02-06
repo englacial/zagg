@@ -167,7 +167,13 @@ def invoke_lambda(
             }
         except Exception as e:
             last_error = str(e)
-            retryable = ["TooManyRequestsException", "Rate exceeded", "Read timeout", "timed out"]
+            retryable = [
+                "TooManyRequestsException",
+                "Rate exceeded",
+                "Read timeout",
+                "timed out",
+                "UNEXPECTED_EOF",
+            ]
             if any(x in last_error for x in retryable):
                 sleep_time = (2**attempt) + (time.time() % 1)
                 time.sleep(sleep_time)
