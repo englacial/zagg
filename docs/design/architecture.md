@@ -45,23 +45,206 @@ Uses HEALPix nested indexing via morton indices:
 
 Target coverage: 1,872 cells covering Antarctic grounded ice drainage basins.
 
-## Processing Flow
+## End-to-End Flow
 
 ```
-┌─────────────────┐     ┌─────────────────┐     ┌─────────────────┐
-│  1. Pre-process │     │  2. Parallel    │     │  3. Post-process│
-│                 │────▶│     Execution   │────▶│                 │
-│  Build catalog  │     │  1,700+ workers │     │  Visualize      │
-│  Get S3 creds   │     │  Process shards │     │  with xdggs     │
-└─────────────────┘     └─────────────────┘     └─────────────────┘
+                        ┌───────────────────────────────┐
+                        │   ICESat-2 ATL06 on S3        │
+                        │   (NSIDC DAAC, ~2,000 HDF5    │
+                        │    granules per cycle)         │
+                        └───────────────┬───────────────┘
+                                        │
+            ┌───────────────────────────┐│┌───────────────────────────┐
+            │                           │││                           │
+            ▼                           ▼│▼                           │
+┌───────────────────────┐  ┌────────────┴──────────────┐             │
+│ 1. BUILD CATALOG      │  │ 2. AUTHENTICATE           │             │
+│                       │  │                           │             │
+│ catalog.py            │  │ auth.py                   │             │
+│                       │  │                           │             │
+│ Query CMR for cycle   │  │ earthaccess.login()       │             │
+│         │             │  │         │                 │             │
+│         ▼             │  │         ▼                 │             │
+│ Extract S3 URLs +     │  │ Temporary S3 creds        │             │
+│ polygon geometry      │  │ (valid ~1 hour)           │             │
+│         │             │  └─────────────┬─────────────┘             │
+│         ▼             │                │                           │
+│ Densify polygons      │                │                           │
+│ (pyproj EPSG:3031)    │                │                           │
+│         │             │                │                           │
+│         ▼             │                │                           │
+│ geo2mort → clip2order │                │                           │
+│ Map parent cells to   │                │                           │
+│ granule S3 URLs       │                │                           │
+│         │             │                │                           │
+│         ▼             │                │                           │
+│ catalog.json          │                │                           │
+│ {morton: [urls]}      │                │                           │
+└───────────┬───────────┘                │                           │
+            │                            │                           │
+            ▼                            ▼                           │
+┌──────────────────────────────────────────────────────┐             │
+│ 3. CREATE ZARR TEMPLATE                              │             │
+│                                                      │             │
+│ schema.py → xdggs_zarr_template()                    │             │
+│                                                      │             │
+│ CellStatsSchema metadata ──▶ GroupSpec ──▶ Zarr v3   │             │
+│                                                      │             │
+│ Shape:  12 × 4^child_order  (786,432 cells at O12)   │             │
+│ Chunks: 4^(child - parent)  (4,096 cells at O12-O6)  │             │
+│ Arrays: cell_ids, morton, count, h_min, h_max,       │             │
+│         h_mean, h_sigma, h_variance, h_q25-75        │             │
+│                                                      │             │
+│ Written to: s3://bucket/prefix/12/                   │             │
+└──────────────────────────┬───────────────────────────┘             │
+                           │                                         │
+                           ▼                                         │
+┌──────────────────────────────────────────────────────────────────┐ │
+│ 4. PARALLEL EXECUTION                                            │ │
+│                                                                  │ │
+│ invoke_lambda.py (orchestrator)                                  │ │
+│ ThreadPoolExecutor(max_workers=1700)                             │ │
+│                                                                  │ │
+│ For each parent morton cell in catalog:                          │ │
+│ ┌──────────────────────────────────────────────────────────────┐ │ │
+│ │                    AWS Lambda Worker                         │ │ │
+│ │                    (ARM64, 2GB, 15min)                       │ │ │
+│ │                                                              │ │ │
+│ │  lambda_handler.py                                           │ │ │
+│ │       │                                                      │ │ │
+│ │       ▼                                                      │ │ │
+│ │  ┌──────────────────────────────────────────────────────┐   │ │ │
+│ │  │  process_morton_cell()           processing.py       │   │◄┘ │
+│ │  │                                                      │   │   │
+│ │  │  For each granule URL:                               │   │   │
+│ │  │    For each ground track (gt1l..gt3r):               │   │   │
+│ │  │    ┌─────────────────────────────────────────────┐   │   │   │
+│ │  │    │ READ: lat, lon via h5coro (S3 byte-range)  │◄──┼───┘
+│ │  │    │                                             │   │
+│ │  │    │ FILTER: geo2mort(lat,lon,O18)               │   │
+│ │  │    │         clip2order(parent) == parent_morton  │   │
+│ │  │    │                                             │   │
+│ │  │    │ READ: h_li, h_li_sigma, quality_summary     │   │
+│ │  │    │       (hyperslice on bounding indices)      │   │
+│ │  │    │                                             │   │
+│ │  │    │ QUALITY: keep only quality_summary == 0     │   │
+│ │  │    │                                             │   │
+│ │  │    │ OUTPUT: DataFrame(h_li, s_li, midx)         │   │
+│ │  │    └─────────────────────────────────────────────┘   │
+│ │  │                                                      │
+│ │  │  Concatenate all track DataFrames                    │
+│ │  │       │                                              │
+│ │  │       ▼                                              │
+│ │  │  clip2order(child_order=12, midx_18)                 │
+│ │  │  generate_morton_children(parent, child_order)        │
+│ │  │       │                                              │
+│ │  │       ▼                                              │
+│ │  │  For each of 4,096 child cells:                      │
+│ │  │  ┌───────────────────────────────────────────────┐   │
+│ │  │  │ calculate_cell_statistics()                   │   │
+│ │  │  │                                               │   │
+│ │  │  │ Schema-driven dispatch via AGG_FUNCTIONS:     │   │
+│ │  │  │   count      → len(values)                    │   │
+│ │  │  │   nanmin     → np.min(h_li)                   │   │
+│ │  │  │   nanmax     → np.max(h_li)                   │   │
+│ │  │  │   nanvar     → np.var(h_li)                   │   │
+│ │  │  │   weighted   → Σ(h_li/σ²) / Σ(1/σ²)         │   │
+│ │  │  │     _mean      using s_li as weights          │   │
+│ │  │  │   weighted   → 1/√Σ(1/σ²)                    │   │
+│ │  │  │     _sigma                                    │   │
+│ │  │  │   quantile   → np.quantile(h_li, q)          │   │
+│ │  │  │               for q ∈ {0.25, 0.50, 0.75}     │   │
+│ │  │  └───────────────────────────────────────────────┘   │
+│ │  │       │                                              │
+│ │  │       ▼                                              │
+│ │  │  mort2healpix(children) → cell_ids                   │
+│ │  │  Assemble output DataFrame (11 columns × 4,096 rows) │
+│ │  └──────────────────────────┬───────────────────────────┘
+│ │                             │
+│ │                             ▼
+│ │  ┌──────────────────────────────────────────────────────┐
+│ │  │  write_dataframe_to_zarr()         processing.py    │
+│ │  │                                                      │
+│ │  │  For each column:                                    │
+│ │  │    open_array(store, "{child_order}/{col}")           │
+│ │  │    array.set_block_selection(chunk_idx, values)       │
+│ │  │                                                      │
+│ │  │  One chunk per parent cell → concurrent-write-safe   │
+│ │  └──────────────────────────────────────────────────────┘
+│ └──────────────────────────────────────────────────────────┘
+│                                                                  │
+│ Results collected, retried on transient failures                 │
+└──────────────────────────┬───────────────────────────────────────┘
+                           │
+                           ▼
+┌──────────────────────────────────────────────────────┐
+│ 5. CONSOLIDATE + ANALYZE                             │
+│                                                      │
+│ zarr.consolidate_metadata(store)                     │
+│                                                      │
+│ Output Zarr store:                                   │
+│   s3://bucket/prefix/                                │
+│   └── 12/                                            │
+│       ├── cell_ids   (uint64, fill=0)                │
+│       ├── morton     (int64,  fill=0)                │
+│       ├── count      (int32,  fill=0)                │
+│       ├── h_min      (float32, fill=NaN)             │
+│       ├── h_max      (float32, fill=NaN)             │
+│       ├── h_mean     (float32, fill=NaN)             │
+│       ├── h_sigma    (float32, fill=NaN)             │
+│       ├── h_variance (float32, fill=NaN)             │
+│       ├── h_q25      (float32, fill=NaN)             │
+│       ├── h_q50      (float32, fill=NaN)             │
+│       └── h_q75      (float32, fill=NaN)             │
+│                                                      │
+│ Open with xarray + xdggs for visualization           │
+└──────────────────────────────────────────────────────┘
 ```
 
-Each worker:
+## Module Dependency Graph
 
-1. Reads HDF5 files from S3 using h5coro (no downloads)
-2. Filters points by morton cell index
-3. Calculates statistics for child cells (order 12)
-4. Writes results to a Zarr store on S3
+```
+              ┌──────────────┐
+              │  schema.py   │  Single source of truth
+              │              │  CellStatsSchema, xdggs_zarr_template
+              └──────┬───────┘
+                     │
+          ┌──────────┼──────────┐
+          │          │          │
+          ▼          ▼          ▼
+  ┌──────────┐ ┌──────────┐ ┌───────────────────┐
+  │ auth.py  │ │processing│ │ catalog.py        │
+  │          │ │  .py     │ │                   │
+  │ S3 creds │ │ AGG_FUNC │ │ CMR query,        │
+  │          │ │ read/agg │ │ morton mapping     │
+  │          │ │ write    │ │                   │
+  └────┬─────┘ └────┬─────┘ └─────────┬─────────┘
+       │             │                 │
+       └──────┬──────┘                 │
+              │                        │
+              ▼                        │
+  ┌───────────────────────┐            │
+  │ lambda_handler.py     │            │
+  │ (AWS-specific wrapper)│            │
+  └───────────┬───────────┘            │
+              │                        │
+              ▼                        ▼
+  ┌────────────────────────────────────────┐
+  │ invoke_lambda.py                       │
+  │ (orchestrator: catalog + auth +        │
+  │  template + parallel Lambda dispatch)  │
+  └────────────────────────────────────────┘
+```
+
+## Key Design Decisions
+
+**Why one chunk per parent cell?** Each Lambda writes to exactly one chunk of the Zarr store. Since chunks are the atomic unit of Zarr writes, 1,700+ workers can write concurrently without coordination or locking.
+
+**Why h5coro?** Reading HDF5 from S3 normally requires downloading entire files. h5coro reads individual datasets via S3 byte-range requests, fetching only the data needed. A granule may be hundreds of MB, but we only read the few datasets we need for the tracks that intersect our cell.
+
+**Why a pre-built catalog?** Without a catalog, each Lambda would need to query CMR independently to discover which granules intersect its cell. The catalog is built once (~30s) and passed to all workers, avoiding 1,700+ redundant CMR queries.
+
+**Why morton indexing?** Morton (Z-order) curves preserve spatial locality --- nearby cells have nearby indices. This means a contiguous range of child indices maps to exactly one parent cell, enabling efficient `clip2order` operations and chunk-aligned writes.
 
 ## Output Format
 
