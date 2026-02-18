@@ -15,6 +15,7 @@ Usage:
 
 import argparse
 import json
+import logging
 import time
 from datetime import datetime, timedelta
 from typing import Dict, List, Set
@@ -22,6 +23,8 @@ from typing import Dict, List, Set
 import numpy as np
 import requests
 from mortie import clip2order, geo2mort
+
+logger = logging.getLogger(__name__)
 
 
 def densify_polygon(lats: np.ndarray, lons: np.ndarray, max_spacing_km: float = 5.0) -> tuple:
@@ -121,10 +124,7 @@ def query_cmr_antarctica(
         f"{cycle_start.strftime('%Y-%m-%d')}T00:00:00Z,{cycle_end.strftime('%Y-%m-%d')}T23:59:59Z"
     )
 
-    # Bounding box for Antarctica: whole globe longitude, south of -60
-    # Format: west,south,east,north
-    # bounding_box = f"-180,{-90},-180,{south_of},180,{south_of},180,{-90},-180,{-90}"
-    # Actually CMR wants simple bbox: west,south,east,north
+    # Bounding box for Antarctica: whole globe longitude, south of cutoff
     bbox = f"-180,-90,180,{south_of}"
 
     params: Dict[str, str | int] = {
@@ -140,9 +140,9 @@ def query_cmr_antarctica(
 
     headers = {"Accept": "application/vnd.nasa.cmr.umm_json+json"}
 
-    print(f"Querying CMR for ATL06 v{version} cycle {cycle}")
-    print(f"  Temporal: {temporal}")
-    print(f"  Bounding box: {bbox}")
+    logger.info(f"Querying CMR for ATL06 v{version} cycle {cycle}")
+    logger.info(f"  Temporal: {temporal}")
+    logger.info(f"  Bounding box: {bbox}")
 
     all_granules = []
     total_hits = None
@@ -153,7 +153,7 @@ def query_cmr_antarctica(
 
         if total_hits is None:
             total_hits = int(response.headers.get("CMR-Hits", 0))
-            print(f"  Total matching granules: {total_hits}")
+            logger.info(f"  Total matching granules: {total_hits}")
 
         data = response.json()
         items = data.get("items", [])
@@ -162,7 +162,7 @@ def query_cmr_antarctica(
             break
 
         all_granules.extend(items)
-        print(f"  Retrieved {len(all_granules)}/{total_hits}...", end="\r")
+        logger.info(f"  Retrieved {len(all_granules)}/{total_hits}...")
 
         if len(items) < page_size or len(all_granules) >= total_hits:
             break
@@ -170,7 +170,7 @@ def query_cmr_antarctica(
         params["offset"] = int(params["offset"]) + len(items)
         time.sleep(0.1)  # Be nice to CMR
 
-    print(f"\nRetrieved {len(all_granules)} granules from CMR")
+    logger.info(f"Retrieved {len(all_granules)} granules from CMR")
     return all_granules
 
 
@@ -271,7 +271,7 @@ def build_morton_catalog(
     granules_processed = 0
     granules_with_geometry = 0
 
-    print(f"\nBuilding morton catalog at order {parent_order}...")
+    logger.info(f"Building morton catalog at order {parent_order}...")
 
     for i, granule in enumerate(granules):
         info = extract_granule_info(granule)
@@ -309,12 +309,12 @@ def build_morton_catalog(
         granules_processed += 1
 
         if (i + 1) % 500 == 0:
-            print(
-                f"  Processed {i + 1}/{len(granules)} granules, {len(catalog)} cells...", end="\r"
+            logger.info(
+                f"  Processed {i + 1}/{len(granules)} granules, {len(catalog)} cells..."
             )
 
-    print(f"\nProcessed {granules_processed} granules with geometry")
-    print(f"  Total unique parent cells: {len(catalog)}")
+    logger.info(f"Processed {granules_processed} granules with geometry")
+    logger.info(f"  Total unique parent cells: {len(catalog)}")
 
     # Convert sets to lists for JSON serialization
     return {k: list(v) for k, v in catalog.items()}

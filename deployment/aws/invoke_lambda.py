@@ -318,6 +318,16 @@ def main():
         default=False,
         help="Overwrite existing Zarr template if it exists",
     )
+    parser.add_argument(
+        "--region",
+        default="us-west-2",
+        help="AWS region (default: us-west-2)",
+    )
+    parser.add_argument(
+        "--output-dir",
+        default=".",
+        help="Directory for output results JSON (default: current directory)",
+    )
     args = parser.parse_args()
 
     print("=" * 70)
@@ -360,7 +370,7 @@ def main():
     s3_store = S3Store(
         args.s3_bucket,
         prefix=args.s3_prefix,
-        region="us-west-2",
+        region=args.region,
         credential_provider=Boto3CredentialProvider(),
     )
     store = ObjectStore(store=s3_store, read_only=False)
@@ -384,7 +394,7 @@ def main():
     )
 
     session = boto3.Session()
-    lambda_client = session.client("lambda", region_name="us-west-2", config=boto_config)
+    lambda_client = session.client("lambda", region_name=args.region, config=boto_config)
 
     # Detect architecture for accurate cost calculation
     arch, price_per_gb_sec = get_lambda_architecture(lambda_client)
@@ -479,8 +489,10 @@ def main():
     print("=" * 70)
 
     # Save results to JSON
+    import os
+
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    output_file = f"production_results_{timestamp}.json"
+    output_file = os.path.join(args.output_dir, f"production_results_{timestamp}.json")
     with open(output_file, "w") as f:
         json.dump(
             {

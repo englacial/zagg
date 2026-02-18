@@ -79,8 +79,8 @@ def write_dataframe_to_zarr(
 
     Returns
     -------
-    dict
-        Metadata with 'zarr_written': bool, 'error': str or None
+    Store
+        The same store, with data written
     """
     if df_out.empty:
         return store

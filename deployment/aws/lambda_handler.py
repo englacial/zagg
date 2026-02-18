@@ -22,6 +22,7 @@ Event payload:
 
 import json
 import logging
+import os
 from typing import Any, Dict
 
 from obstore.auth.boto3 import Boto3CredentialProvider
@@ -124,13 +125,28 @@ def lambda_handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
             s3_bucket = event["s3_bucket"]
             s3_prefix = event["s3_prefix"]
             zarr_path = f"s3://{s3_bucket}/{s3_prefix}"
+            region = os.environ.get("AWS_REGION", "us-west-2")
             s3_store = S3Store(
                 s3_bucket,
                 prefix=s3_prefix,
-                region="us-west-2",
+                region=region,
                 credential_provider=Boto3CredentialProvider(),
             )
             store = ObjectStore(store=s3_store, read_only=False)
+
+            # Validate that Zarr template exists before writing
+            child_order = event["child_order"]
+            template_key = f"{child_order}/zarr.json"
+            try:
+                store[template_key]
+            except KeyError:
+                error_msg = f"Zarr template not found at {zarr_path}/{template_key}"
+                logger.error(error_msg)
+                metadata["error"] = error_msg
+                return {
+                    "statusCode": 500,
+                    "body": json.dumps(metadata),
+                }
 
             logger.info(f"  Writing data to {zarr_path}...")
 
