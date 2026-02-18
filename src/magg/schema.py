@@ -285,8 +285,9 @@ def xdggs_zarr_template(
         The same store, with template written to path '{child_order}/'
     """
     spec = xdggs_spec(parent_order=parent_order, child_order=child_order)
+    if n_parent_cells is not None and n_parent_cells <= 0:
+        raise ValueError(f"n_parent_cells must be positive, got {n_parent_cells}")
     if n_parent_cells:
-        assert n_parent_cells > 0
         level_diff = child_order - parent_order
         n_pixels = 4**level_diff * n_parent_cells
         members = {

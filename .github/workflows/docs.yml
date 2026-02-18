@@ -1,0 +1,149 @@
+name: Build and Deploy Docs
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+    types: [opened, synchronize, reopened, labeled]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+  pull-requests: write
+
+concurrency:
+  group: "pages"
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v4
+
+    - name: Install uv
+      uses: astral-sh/setup-uv@v4
+
+    - name: Set up Python
+      run: uv python install 3.12
+
+    - name: Install dependencies
+      run: uv sync --group docs
+
+    - name: Build docs
+      run: uv run mkdocs build --strict
+
+    - name: Upload docs artifact
+      uses: actions/upload-artifact@v4
+      with:
+        name: docs-html-${{ github.sha }}
+        path: site
+        retention-days: 7
+
+    - name: Setup Pages
+      uses: actions/configure-pages@v5
+      if: github.ref == 'refs/heads/main'
+
+    - name: Upload pages artifact
+      uses: actions/upload-pages-artifact@v3
+      if: github.ref == 'refs/heads/main'
+      with:
+        path: site
+
+  pr-preview:
+    if: |
+      github.event_name == 'pull_request' &&
+      (contains(github.event.pull_request.labels.*.name, 'preview-docs') ||
+       github.event.action == 'labeled' && github.event.label.name == 'preview-docs')
+    runs-on: ubuntu-latest
+    needs: build
+    permissions:
+      pull-requests: write
+    steps:
+    - name: Download docs artifact
+      uses: actions/download-artifact@v4
+      with:
+        name: docs-html-${{ github.sha }}
+        path: ./docs-html
+
+    - name: Deploy to Surge.sh
+      id: surge_deploy
+      run: |
+        npm install -g surge
+
+        SURGE_DOMAIN="magg-pr-${{ github.event.pull_request.number }}.surge.sh"
+
+        cd docs-html
+        surge . $SURGE_DOMAIN --token ${{ secrets.SURGE_TOKEN }} || {
+          echo "::warning::Surge deployment failed. Check if SURGE_TOKEN is configured."
+          echo "surge_url=" >> $GITHUB_OUTPUT
+          exit 0
+        }
+
+        echo "surge_url=https://$SURGE_DOMAIN/" >> $GITHUB_OUTPUT
+
+    - name: Comment on PR with preview link
+      uses: actions/github-script@v7
+      with:
+        script: |
+          const prNumber = context.issue.number;
+          const sha = context.sha.substring(0, 7);
+          const artifactUrl = `https://github.com/${context.repo.owner}/${context.repo.repo}/actions/runs/${{ github.run_id }}`;
+          const surgeUrl = '${{ steps.surge_deploy.outputs.surge_url }}';
+
+          let body = `## Documentation Preview Ready!\n\n`;
+
+          if (surgeUrl && surgeUrl !== '') {
+            body += `### Live Preview\n`;
+            body += `**URL:** ${surgeUrl}\n\n`;
+            body += `*Preview updates automatically with new commits while the \`preview-docs\` label is present.*\n\n`;
+          } else {
+            body += `### Surge deployment not available\n`;
+            body += `Please check the [workflow logs](${artifactUrl}) or ensure SURGE_TOKEN secret is configured.\n\n`;
+          }
+
+          body += `### Download Artifact\n`;
+          body += `You can also [download the docs](${artifactUrl}) for local viewing.\n\n`;
+          body += `**Commit:** \`${sha}\`\n`;
+
+          const { data: comments } = await github.rest.issues.listComments({
+            owner: context.repo.owner,
+            repo: context.repo.repo,
+            issue_number: prNumber
+          });
+
+          const botComment = comments.find(comment =>
+            comment.user.login === 'github-actions[bot]' &&
+            comment.body.includes('Documentation Preview Ready')
+          );
+
+          if (botComment) {
+            await github.rest.issues.updateComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              comment_id: botComment.id,
+              body: body
+            });
+          } else {
+            await github.rest.issues.createComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: prNumber,
+              body: body
+            });
+          }
+
+  deploy:
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    runs-on: ubuntu-latest
+    needs: build
+    if: github.ref == 'refs/heads/main'
+    steps:
+    - name: Deploy to GitHub Pages
+      id: deployment
+      uses: actions/deploy-pages@v4
