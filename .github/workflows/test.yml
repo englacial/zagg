@@ -13,21 +13,6 @@ jobs:
       matrix:
         python-version: ['3.12', '3.13']
 
-    services:
-      minio:
-        image: minio/minio
-        ports:
-          - 9000:9000
-        env:
-          MINIO_ROOT_USER: minioadmin
-          MINIO_ROOT_PASSWORD: minioadmin
-        options: >-
-          --health-cmd "curl -f http://localhost:9000/minio/health/live || exit 1"
-          --health-interval 10s
-          --health-timeout 5s
-          --health-retries 5
-          --entrypoint "minio server /data"
-
     steps:
     - uses: actions/checkout@v4
 
@@ -42,7 +27,3 @@ jobs:
 
     - name: Run tests with pytest
       run: uv run pytest --cov=magg --cov-report=xml --cov-report=term
-      env:
-        MINIO_ENDPOINT: http://localhost:9000
-        MINIO_ACCESS_KEY: minioadmin
-        MINIO_SECRET_KEY: minioadmin
