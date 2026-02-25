@@ -61,8 +61,23 @@ echo "  Function: ${FUNC_ZIP##*/} ($(du -h "$FUNC_ZIP" | cut -f1))"
 if [ "$FUNCTION_ONLY" = false ]; then
     echo ""
     echo "Publishing layer: $LAYER_NAME"
+    LAYER_SIZE=$(stat -c%s "$LAYER_ZIP" 2>/dev/null || stat -f%z "$LAYER_ZIP")
     if [ "$DRY_RUN" = true ]; then
         echo "  [DRY RUN] aws lambda publish-layer-version --layer-name $LAYER_NAME ..."
+    elif [ "$LAYER_SIZE" -gt 50000000 ]; then
+        # Layer > 50MB: upload to S3 first (direct upload limit is ~50MB)
+        S3_KEY="lambda-deploy/${LAYER_NAME}-$(date +%s).zip"
+        echo "  Layer is $(numfmt --to=iec $LAYER_SIZE), uploading to s3://xagg/$S3_KEY first..."
+        aws s3 cp "$LAYER_ZIP" "s3://xagg/$S3_KEY" --region "$REGION"
+        LAYER_ARN=$(aws lambda publish-layer-version \
+            --layer-name "$LAYER_NAME" \
+            --compatible-runtimes "$RUNTIME" \
+            --compatible-architectures "$ARCH" \
+            --content "S3Bucket=xagg,S3Key=$S3_KEY" \
+            --region "$REGION" \
+            --query 'LayerVersionArn' --output text)
+        echo "  Published: $LAYER_ARN"
+        aws s3 rm "s3://xagg/$S3_KEY" --region "$REGION"
     else
         LAYER_ARN=$(aws lambda publish-layer-version \
             --layer-name "$LAYER_NAME" \
@@ -81,12 +96,26 @@ echo "Deploying function code..."
 if [ "$DRY_RUN" = true ]; then
     echo "  [DRY RUN] aws lambda update-function-code ..."
 else
-    aws lambda update-function-code \
-        --function-name "$FUNCTION_NAME" \
-        --zip-file "fileb://$FUNC_ZIP" \
-        --architectures "$ARCH" \
-        --region "$REGION" \
-        --query '{CodeSize:CodeSize,LastModified:LastModified}' --output table
+    FUNC_SIZE=$(stat -c%s "$FUNC_ZIP" 2>/dev/null || stat -f%z "$FUNC_ZIP")
+    if [ "$FUNC_SIZE" -gt 50000000 ]; then
+        S3_KEY="lambda-deploy/function-$(date +%s).zip"
+        echo "  Function zip is $(numfmt --to=iec $FUNC_SIZE), uploading to s3://xagg/$S3_KEY first..."
+        aws s3 cp "$FUNC_ZIP" "s3://xagg/$S3_KEY" --region "$REGION"
+        aws lambda update-function-code \
+            --function-name "$FUNCTION_NAME" \
+            --s3-bucket xagg --s3-key "$S3_KEY" \
+            --architectures "$ARCH" \
+            --region "$REGION" \
+            --query '{CodeSize:CodeSize,LastModified:LastModified}' --output table
+        aws s3 rm "s3://xagg/$S3_KEY" --region "$REGION"
+    else
+        aws lambda update-function-code \
+            --function-name "$FUNCTION_NAME" \
+            --zip-file "fileb://$FUNC_ZIP" \
+            --architectures "$ARCH" \
+            --region "$REGION" \
+            --query '{CodeSize:CodeSize,LastModified:LastModified}' --output table
+    fi
 
     echo "  Waiting for update..."
     aws lambda wait function-updated --function-name "$FUNCTION_NAME" --region "$REGION"

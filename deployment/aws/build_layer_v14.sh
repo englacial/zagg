@@ -54,7 +54,6 @@ echo "Installing packages with numpy<2.3 constraint..."
 $PIP install \
     "numpy>=2.0,<2.3" \
     "pandas==2.2.3" fastparquet cramjam \
-    healpy astropy \
     earthaccess shapely \
     -c "$CONSTRAINTS" \
     -t "$OUTPUT_DIR/python" \
@@ -81,30 +80,7 @@ rm -rf "$OUTPUT_DIR/python"/pyarrow* \
        "$OUTPUT_DIR/python"/boto3* \
        "$OUTPUT_DIR/python"/botocore* 2>/dev/null || true
 
-# Patch astropy to remove test runner (requires pytest at import time)
-# This removes the TestRunner import and test() function from astropy/__init__.py
-echo "Patching astropy to remove pytest dependency..."
-ASTROPY_INIT="$OUTPUT_DIR/python/astropy/__init__.py"
-if [ -f "$ASTROPY_INIT" ]; then
-    # Remove "tests" and "test" from __all__ list
-    sed -i 's/"tests",/# "tests",  # removed - requires pytest/' "$ASTROPY_INIT"
-    sed -i 's/"test",/# "test",  # removed - requires pytest/' "$ASTROPY_INIT"
-
-    # Comment out the TestRunner import and test function creation (lines 179-184)
-    sed -i 's/^from \.tests\.runner import TestRunner$/# from .tests.runner import TestRunner  # removed - requires pytest/' "$ASTROPY_INIT"
-    sed -i 's/^with warnings\.catch_warnings():$/# with warnings.catch_warnings():  # removed - requires pytest/' "$ASTROPY_INIT"
-    sed -i 's/^    warnings\.filterwarnings("ignore", category=PendingDeprecationWarning)$/# warnings.filterwarnings("ignore", category=PendingDeprecationWarning)/' "$ASTROPY_INIT"
-    sed -i 's/^    test = TestRunner\.make_test_runner_in(__path__\[0\])$/# test = TestRunner.make_test_runner_in(__path__[0])/' "$ASTROPY_INIT"
-
-    # Add a dummy test attribute to prevent AttributeError
-    echo "" >> "$ASTROPY_INIT"
-    echo "# Dummy test attribute (pytest not available in Lambda)" >> "$ASTROPY_INIT"
-    echo "test = None" >> "$ASTROPY_INIT"
-
-    echo "  - Patched astropy/__init__.py"
-fi
-
-# Clean up caches and tests (now safe to remove astropy/tests since we patched __init__)
+# Clean up caches and tests
 find "$OUTPUT_DIR/python" -type d -name "__pycache__" -exec rm -rf {} + 2>/dev/null || true
 find "$OUTPUT_DIR/python" -type d -name "tests" -exec rm -rf {} + 2>/dev/null || true
 find "$OUTPUT_DIR/python" -type d -name "test" -exec rm -rf {} + 2>/dev/null || true

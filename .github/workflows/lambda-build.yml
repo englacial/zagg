@@ -139,7 +139,6 @@ jobs:
               echo 'numpy==2.2.6' > /tmp/constraints.txt
               \$PIP install \
                   'pandas==2.2.3' fastparquet cramjam \
-                  healpy astropy \
                   earthaccess shapely \
                   -c /tmp/constraints.txt \
                   -t \$OUTPUT_DIR/python \
@@ -155,28 +154,12 @@ jobs:
                      \$OUTPUT_DIR/python/lonboard* \
                      \$OUTPUT_DIR/python/boto3* 2>/dev/null || true
 
-              # Patch astropy
-              ASTROPY_INIT=\$OUTPUT_DIR/python/astropy/__init__.py
-              if [ -f \"\$ASTROPY_INIT\" ]; then
-                  sed -i 's/\"tests\",/# \"tests\",/' \"\$ASTROPY_INIT\"
-                  sed -i 's/\"test\",/# \"test\",/' \"\$ASTROPY_INIT\"
-                  sed -i 's/^from \\.tests\\.runner import TestRunner$/# removed/' \"\$ASTROPY_INIT\"
-                  sed -i 's/^with warnings\\.catch_warnings():$/# removed/' \"\$ASTROPY_INIT\"
-                  sed -i 's/^    warnings\\.filterwarnings.*PendingDeprecationWarning.*$/# removed/' \"\$ASTROPY_INIT\"
-                  sed -i 's/^    test = TestRunner\\.make_test_runner_in.*$/# removed/' \"\$ASTROPY_INIT\"
-                  echo 'test = None' >> \"\$ASTROPY_INIT\"
-              fi
-
               # Clean
               find \$OUTPUT_DIR/python -type d -name '__pycache__' -exec rm -rf {} + 2>/dev/null || true
               find \$OUTPUT_DIR/python -type d -name 'tests' -exec rm -rf {} + 2>/dev/null || true
               find \$OUTPUT_DIR/python -type d -name 'test' -exec rm -rf {} + 2>/dev/null || true
               find \$OUTPUT_DIR/python -name '*.pyc' -delete 2>/dev/null || true
               find \$OUTPUT_DIR/python -name '*.so' -exec strip {} \; 2>/dev/null || true
-
-              # Remove astropy IERS data
-              rm -rf \$OUTPUT_DIR/python/astropy_iers_data/data/*.all 2>/dev/null || true
-              rm -rf \$OUTPUT_DIR/python/astropy_iers_data/data/eopc04* 2>/dev/null || true
 
               # Size check
               UNZIPPED_BYTES=\$(du -sb \$OUTPUT_DIR/python | cut -f1)

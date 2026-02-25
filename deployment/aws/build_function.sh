@@ -68,8 +68,7 @@ LAYER_PACKAGES=(
     numpy scipy pandas
     # IO (in layer)
     fastparquet cramjam pyarrow
-    # Astronomy/geo (in layer)
-    healpy astropy astropy_iers_data
+    # Geo (in layer)
     # Data access (in layer)
     earthaccess shapely h5coro mortie
     # AWS (provided by Lambda runtime or layer)
