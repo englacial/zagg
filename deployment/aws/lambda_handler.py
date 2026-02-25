@@ -137,9 +137,7 @@ def lambda_handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
             # Validate that Zarr template exists before writing
             child_order = event["child_order"]
             template_key = f"{child_order}/zarr.json"
-            try:
-                store[template_key]
-            except KeyError:
+            if not store.exists(template_key):
                 error_msg = f"Zarr template not found at {zarr_path}/{template_key}"
                 logger.error(error_msg)
                 metadata["error"] = error_msg
