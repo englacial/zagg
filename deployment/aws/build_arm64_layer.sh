@@ -50,8 +50,7 @@ docker run --rm --platform linux/arm64 \
         echo "numpy==2.2.6" > /tmp/constraints.txt
         $PIP install \
             "pandas==2.2.3" fastparquet cramjam \
-            healpy astropy \
-            earthaccess shapely 'pandera[pandas]' \
+            earthaccess shapely \
             "pydantic-zarr>=0.9.1" "zarr>=3.1.5" "obstore>=0.8.2" \
             -c /tmp/constraints.txt \
             -t /out/python \
@@ -81,20 +80,6 @@ docker run --rm --platform linux/arm64 \
                /out/python/lonboard* \
                /out/python/boto3* 2>/dev/null || true
 
-        # Patch astropy to remove pytest dependency
-        echo "Patching astropy..."
-        ASTROPY_INIT="/out/python/astropy/__init__.py"
-        if [ -f "$ASTROPY_INIT" ]; then
-            sed -i "s/\"tests\",/# \"tests\",  # removed/" "$ASTROPY_INIT"
-            sed -i "s/\"test\",/# \"test\",  # removed/" "$ASTROPY_INIT"
-            sed -i "s/^from \\.tests\\.runner import TestRunner$/# from .tests.runner import TestRunner  # removed/" "$ASTROPY_INIT"
-            sed -i "s/^with warnings\\.catch_warnings():$/# with warnings.catch_warnings():  # removed/" "$ASTROPY_INIT"
-            sed -i "s/^    warnings\\.filterwarnings.*PendingDeprecationWarning.*$/# (removed)/" "$ASTROPY_INIT"
-            sed -i "s/^    test = TestRunner\\.make_test_runner_in.*$/# (removed)/" "$ASTROPY_INIT"
-            echo "" >> "$ASTROPY_INIT"
-            echo "test = None  # pytest not available in Lambda" >> "$ASTROPY_INIT"
-        fi
-
         # Clean caches and tests
         echo "Cleaning caches..."
         find /out/python -type d -name "__pycache__" -exec rm -rf {} + 2>/dev/null || true
@@ -109,18 +94,9 @@ docker run --rm --platform linux/arm64 \
 
         # Remove duplicate/stale .so files in .libs directories
         echo "Removing duplicate .libs entries..."
-        # Keep only the newest openblas in numpy.libs
         cd /out/python/numpy.libs 2>/dev/null && ls -t libopenblas64*.so 2>/dev/null | tail -n +2 | xargs rm -f 2>/dev/null || true
         cd /out/python/numpy.libs 2>/dev/null && ls -t libscipy_openblas64*.so 2>/dev/null | tail -n +2 | xargs rm -f 2>/dev/null || true
         cd /out/python/numpy.libs 2>/dev/null && ls -t libgfortran*.so* 2>/dev/null | tail -n +2 | xargs rm -f 2>/dev/null || true
-        # Keep only the newest healpy libs
-        cd /out/python/healpy.libs 2>/dev/null && ls -t libhealpix*.so* 2>/dev/null | tail -n +2 | xargs rm -f 2>/dev/null || true
-        cd /out/python/healpy.libs 2>/dev/null && ls -t libcfitsio*.so* 2>/dev/null | tail -n +2 | xargs rm -f 2>/dev/null || true
-
-        # Remove astropy IERS data (large, not needed for our use case)
-        echo "Removing astropy IERS data..."
-        rm -rf /out/python/astropy_iers_data/data/*.all 2>/dev/null || true
-        rm -rf /out/python/astropy_iers_data/data/eopc04* 2>/dev/null || true
 
         # Report size
         echo ""
