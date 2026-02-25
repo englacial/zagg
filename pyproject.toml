@@ -68,6 +68,9 @@ magg = "src/magg"
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 python_files = ["test_*.py"]
+markers = [
+    "slow: marks tests as slow (run with pytest -m slow)",
+]
 
 [tool.ruff]
 line-length = 100

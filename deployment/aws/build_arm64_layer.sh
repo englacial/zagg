@@ -140,6 +140,7 @@ if [ "$UNZIPPED_BYTES" -gt 262144000 ]; then
 fi
 
 # Create zip
+mkdir -p "${SCRIPT_DIR}/../layers"
 echo ""
 echo "Creating ${ZIP_NAME}..."
 cd "$OUTPUT_DIR"

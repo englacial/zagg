@@ -1,0 +1,250 @@
+name: Lambda Build
+
+on:
+  push:
+    branches: [lambda, main]
+    paths:
+      - 'src/magg/**'
+      - 'deployment/aws/**'
+      - 'pyproject.toml'
+      - '.github/workflows/lambda-build.yml'
+  pull_request:
+    paths:
+      - 'src/magg/**'
+      - 'deployment/aws/**'
+      - 'pyproject.toml'
+      - '.github/workflows/lambda-build.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  # ---------------------------------------------------------------------------
+  # Build layer + function code for x86_64 (Python 3.11)
+  # ---------------------------------------------------------------------------
+  build-x86_64:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build Lambda layer (x86_64) in AL2023 container
+        run: |
+          docker run --rm \
+            --platform linux/amd64 \
+            --entrypoint "" \
+            -v ${{ github.workspace }}:/workspace \
+            -w /workspace/deployment/aws \
+            public.ecr.aws/lambda/python:3.11 \
+            bash -c "
+              yum install -y zip &&
+              pip install --upgrade pip &&
+              chmod +x build_layer_v14.sh &&
+              ./build_layer_v14.sh x86_64
+            "
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Build function code (x86_64)
+        run: |
+          chmod +x deployment/aws/build_function.sh
+          deployment/aws/build_function.sh
+
+      - name: Check combined size
+        run: |
+          LIMIT=$((250 * 1024 * 1024))
+
+          # Measure layer unzipped size
+          LAYER_ZIP="deployment/layers/lambda_layer_x86_64.zip"
+          LAYER_TMP=$(mktemp -d)
+          unzip -qo "$LAYER_ZIP" -d "$LAYER_TMP"
+          LAYER_BYTES=$(du -sb "$LAYER_TMP" | cut -f1)
+          rm -rf "$LAYER_TMP"
+
+          # Measure function code unzipped size
+          FUNC_ZIP=$(ls deployment/builds/lambda_function_x86_64_*.zip)
+          FUNC_TMP=$(mktemp -d)
+          unzip -qo "$FUNC_ZIP" -d "$FUNC_TMP"
+          FUNC_BYTES=$(du -sb "$FUNC_TMP" | cut -f1)
+          rm -rf "$FUNC_TMP"
+
+          COMBINED=$((LAYER_BYTES + FUNC_BYTES))
+
+          echo "## x86_64 Size Report" >> $GITHUB_STEP_SUMMARY
+          echo "| Component | Size |" >> $GITHUB_STEP_SUMMARY
+          echo "|-----------|------|" >> $GITHUB_STEP_SUMMARY
+          echo "| Layer | $(numfmt --to=iec $LAYER_BYTES) |" >> $GITHUB_STEP_SUMMARY
+          echo "| Function | $(numfmt --to=iec $FUNC_BYTES) |" >> $GITHUB_STEP_SUMMARY
+          echo "| **Combined** | **$(numfmt --to=iec $COMBINED)** |" >> $GITHUB_STEP_SUMMARY
+          echo "| Limit | $(numfmt --to=iec $LIMIT) |" >> $GITHUB_STEP_SUMMARY
+          echo "| Headroom | $(numfmt --to=iec $((LIMIT - COMBINED))) |" >> $GITHUB_STEP_SUMMARY
+
+          echo ""
+          echo "x86_64 combined size: $(numfmt --to=iec $COMBINED) / $(numfmt --to=iec $LIMIT)"
+
+          if [ "$COMBINED" -gt "$LIMIT" ]; then
+            echo "::error::x86_64 combined size ($COMBINED bytes) exceeds 250MB Lambda limit!"
+            exit 1
+          fi
+
+      - name: Upload layer artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: lambda-layer-x86_64
+          path: deployment/layers/lambda_layer_x86_64.zip
+          retention-days: 30
+
+      - name: Upload function artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: lambda-function-x86_64
+          path: deployment/builds/lambda_function_x86_64_*.zip
+          retention-days: 30
+
+  # ---------------------------------------------------------------------------
+  # Build layer + function code for arm64 (Python 3.12)
+  # ---------------------------------------------------------------------------
+  build-arm64:
+    runs-on: ubuntu-24.04-arm
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build Lambda layer (arm64) in manylinux container
+        run: |
+          docker run --rm \
+            -v ${{ github.workspace }}:/workspace \
+            -w /workspace/deployment/aws \
+            quay.io/pypa/manylinux_2_28_aarch64 \
+            bash -c "
+              yum install -y zip &&
+              chmod +x build_arm64_layer.sh &&
+              # Run the inner build logic directly instead of the Docker-wrapping script
+              PYTHON=/opt/python/cp312-cp312/bin/python
+              PIP=\"\$PYTHON -m pip\"
+              OUTPUT_DIR=/workspace/deployment/aws/layer_build_arm64
+
+              rm -rf \$OUTPUT_DIR
+              mkdir -p \$OUTPUT_DIR/python /workspace/deployment/layers
+
+              echo 'numpy<2.3' > /tmp/constraints.txt
+
+              # Build NumPy from source with 64KB page alignment for Lambda ARM64
+              export LDFLAGS='-Wl,-z,max-page-size=0x10000'
+              export NPY_BLAS_ORDER=openblas
+              \$PIP install 'numpy==2.2.6' --no-binary numpy -t \$OUTPUT_DIR/python --no-cache-dir
+
+              echo 'numpy==2.2.6' > /tmp/constraints.txt
+              \$PIP install \
+                  'pandas==2.2.3' fastparquet cramjam \
+                  healpy astropy \
+                  earthaccess shapely \
+                  -c /tmp/constraints.txt \
+                  -t \$OUTPUT_DIR/python \
+                  --no-cache-dir
+
+              \$PIP install 'h5coro==0.0.8' mortie --no-deps -t \$OUTPUT_DIR/python --no-cache-dir
+
+              # Remove bloat
+              rm -rf \$OUTPUT_DIR/python/pyarrow* \
+                     \$OUTPUT_DIR/python/pyproj* \
+                     \$OUTPUT_DIR/python/xarray* \
+                     \$OUTPUT_DIR/python/matplotlib* \
+                     \$OUTPUT_DIR/python/lonboard* \
+                     \$OUTPUT_DIR/python/boto3* 2>/dev/null || true
+
+              # Patch astropy
+              ASTROPY_INIT=\$OUTPUT_DIR/python/astropy/__init__.py
+              if [ -f \"\$ASTROPY_INIT\" ]; then
+                  sed -i 's/\"tests\",/# \"tests\",/' \"\$ASTROPY_INIT\"
+                  sed -i 's/\"test\",/# \"test\",/' \"\$ASTROPY_INIT\"
+                  sed -i 's/^from \\.tests\\.runner import TestRunner$/# removed/' \"\$ASTROPY_INIT\"
+                  sed -i 's/^with warnings\\.catch_warnings():$/# removed/' \"\$ASTROPY_INIT\"
+                  sed -i 's/^    warnings\\.filterwarnings.*PendingDeprecationWarning.*$/# removed/' \"\$ASTROPY_INIT\"
+                  sed -i 's/^    test = TestRunner\\.make_test_runner_in.*$/# removed/' \"\$ASTROPY_INIT\"
+                  echo 'test = None' >> \"\$ASTROPY_INIT\"
+              fi
+
+              # Clean
+              find \$OUTPUT_DIR/python -type d -name '__pycache__' -exec rm -rf {} + 2>/dev/null || true
+              find \$OUTPUT_DIR/python -type d -name 'tests' -exec rm -rf {} + 2>/dev/null || true
+              find \$OUTPUT_DIR/python -type d -name 'test' -exec rm -rf {} + 2>/dev/null || true
+              find \$OUTPUT_DIR/python -name '*.pyc' -delete 2>/dev/null || true
+              find \$OUTPUT_DIR/python -name '*.so' -exec strip {} \; 2>/dev/null || true
+
+              # Remove astropy IERS data
+              rm -rf \$OUTPUT_DIR/python/astropy_iers_data/data/*.all 2>/dev/null || true
+              rm -rf \$OUTPUT_DIR/python/astropy_iers_data/data/eopc04* 2>/dev/null || true
+
+              # Size check
+              UNZIPPED_BYTES=\$(du -sb \$OUTPUT_DIR/python | cut -f1)
+              echo \"Layer unzipped: \$(du -sh \$OUTPUT_DIR/python | cut -f1) (\$UNZIPPED_BYTES bytes)\"
+              if [ \"\$UNZIPPED_BYTES\" -gt 262144000 ]; then
+                  echo 'ERROR: Layer exceeds 250MB!'
+                  exit 1
+              fi
+
+              # Zip
+              cd \$OUTPUT_DIR && zip -r9q /workspace/deployment/layers/lambda_layer_arm64.zip python
+            "
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Build function code (arm64)
+        run: |
+          chmod +x deployment/aws/build_function.sh
+          deployment/aws/build_function.sh
+
+      - name: Check combined size
+        run: |
+          LIMIT=$((250 * 1024 * 1024))
+
+          LAYER_ZIP="deployment/layers/lambda_layer_arm64.zip"
+          LAYER_TMP=$(mktemp -d)
+          unzip -qo "$LAYER_ZIP" -d "$LAYER_TMP"
+          LAYER_BYTES=$(du -sb "$LAYER_TMP" | cut -f1)
+          rm -rf "$LAYER_TMP"
+
+          FUNC_ZIP=$(ls deployment/builds/lambda_function_arm64_*.zip)
+          FUNC_TMP=$(mktemp -d)
+          unzip -qo "$FUNC_ZIP" -d "$FUNC_TMP"
+          FUNC_BYTES=$(du -sb "$FUNC_TMP" | cut -f1)
+          rm -rf "$FUNC_TMP"
+
+          COMBINED=$((LAYER_BYTES + FUNC_BYTES))
+
+          echo "## arm64 Size Report" >> $GITHUB_STEP_SUMMARY
+          echo "| Component | Size |" >> $GITHUB_STEP_SUMMARY
+          echo "|-----------|------|" >> $GITHUB_STEP_SUMMARY
+          echo "| Layer | $(numfmt --to=iec $LAYER_BYTES) |" >> $GITHUB_STEP_SUMMARY
+          echo "| Function | $(numfmt --to=iec $FUNC_BYTES) |" >> $GITHUB_STEP_SUMMARY
+          echo "| **Combined** | **$(numfmt --to=iec $COMBINED)** |" >> $GITHUB_STEP_SUMMARY
+          echo "| Limit | $(numfmt --to=iec $LIMIT) |" >> $GITHUB_STEP_SUMMARY
+          echo "| Headroom | $(numfmt --to=iec $((LIMIT - COMBINED))) |" >> $GITHUB_STEP_SUMMARY
+
+          echo ""
+          echo "arm64 combined size: $(numfmt --to=iec $COMBINED) / $(numfmt --to=iec $LIMIT)"
+
+          if [ "$COMBINED" -gt "$LIMIT" ]; then
+            echo "::error::arm64 combined size ($COMBINED bytes) exceeds 250MB Lambda limit!"
+            exit 1
+          fi
+
+      - name: Upload layer artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: lambda-layer-arm64
+          path: deployment/layers/lambda_layer_arm64.zip
+          retention-days: 30
+
+      - name: Upload function artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: lambda-function-arm64
+          path: deployment/builds/lambda_function_arm64_*.zip
+          retention-days: 30

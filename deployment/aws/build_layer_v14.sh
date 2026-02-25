@@ -53,7 +53,7 @@ echo "numpy<2.3" > "$CONSTRAINTS"
 echo "Installing packages with numpy<2.3 constraint..."
 $PIP install \
     "numpy>=2.0,<2.3" \
-    "pandas==2.3.2" fastparquet cramjam \
+    "pandas==2.2.3" fastparquet cramjam \
     healpy astropy \
     earthaccess shapely \
     -c "$CONSTRAINTS" \
@@ -127,6 +127,7 @@ if [ "$UNZIPPED_BYTES" -gt 262144000 ]; then
 fi
 
 # Create zip
+mkdir -p "${SCRIPT_DIR}/../layers"
 echo ""
 echo "Creating ${ZIP_NAME}..."
 cd "$OUTPUT_DIR"
