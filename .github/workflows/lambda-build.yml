@@ -17,7 +17,7 @@ on:
   workflow_dispatch:
 
 permissions:
-  contents: write
+  contents: read
 
 jobs:
   # ---------------------------------------------------------------------------
@@ -231,56 +231,3 @@ jobs:
           name: lambda-function-arm64
           path: deployment/builds/lambda_function_arm64_*.zip
           retention-days: 30
-
-  # ---------------------------------------------------------------------------
-  # Commit built artifacts back to the repo (push only, not PRs)
-  # ---------------------------------------------------------------------------
-  commit-artifacts:
-    needs: [build-x86_64, build-arm64]
-    runs-on: ubuntu-latest
-    if: github.event_name != 'pull_request'
-
-    steps:
-      - uses: actions/checkout@v4
-        with:
-          token: ${{ secrets.GITHUB_TOKEN }}
-          lfs: true
-
-      - name: Download x86_64 layer
-        uses: actions/download-artifact@v4
-        with:
-          name: lambda-layer-x86_64
-          path: deployment/layers/
-
-      - name: Download arm64 layer
-        uses: actions/download-artifact@v4
-        with:
-          name: lambda-layer-arm64
-          path: deployment/layers/
-
-      - name: Download x86_64 function
-        uses: actions/download-artifact@v4
-        with:
-          name: lambda-function-x86_64
-          path: deployment/builds/
-
-      - name: Download arm64 function
-        uses: actions/download-artifact@v4
-        with:
-          name: lambda-function-arm64
-          path: deployment/builds/
-
-      - name: Commit artifacts
-        run: |
-          git config user.name "github-actions[bot]"
-          git config user.email "github-actions[bot]@users.noreply.github.com"
-          git lfs install
-
-          git add deployment/layers/*.zip deployment/builds/*.zip
-
-          if git diff --cached --quiet; then
-            echo "No changes to commit"
-          else
-            git commit -m "Build Lambda artifacts (x86_64 + arm64)"
-            git push
-          fi
