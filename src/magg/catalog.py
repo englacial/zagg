@@ -350,10 +350,9 @@ def build_morton_catalog_polygon(
         Wall-clock seconds for each pipeline step
     """
     from pyproj import Transformer
-    from mortie import mort2polygon
-    from shapely import make_valid
+    from mortie.tools import mort2polygon
+    from shapely import STRtree, make_valid
     from shapely.geometry import Polygon
-    from shapely import STRtree
 
     timings = {}
     t_total = time.perf_counter()
@@ -406,11 +405,11 @@ def build_morton_catalog_polygon(
     tree = STRtree(granule_polys)
     timings["strtree_construction"] = time.perf_counter() - t0
 
-    # --- mort2polygon + project to EPSG:3031 ---
+    # --- Cell polygons via mort2polygon (step=32 for accurate polar cells) ---
     t0 = time.perf_counter()
     cell_shapely = []
-    for cell in initial_cells:
-        verts = mort2polygon(int(cell))
+    for cell_id in initial_cells:
+        verts = mort2polygon(int(cell_id), step=32)
         lats_c = np.array([v[0] for v in verts])
         lons_c = np.array([v[1] for v in verts])
         x, y = to_stereo.transform(lons_c, lats_c)
