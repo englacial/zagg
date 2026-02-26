@@ -320,6 +320,123 @@ def build_morton_catalog(
     return {k: list(v) for k, v in catalog.items()}
 
 
+def build_morton_catalog_polygon(
+    granules: List[dict],
+    parent_order: int,
+) -> tuple:
+    """
+    Build a granule catalog using exact polygon intersection tests.
+
+    Instead of densifying CMR polygon edges, this function:
+    1. Discovers candidate cells from raw polygon vertices (no densification)
+    2. Gets each cell's polygon boundary via mort2polygon()
+    3. Tests which granule polygons intersect each cell using shapely STRtree
+
+    All geometry operations use EPSG:3031 (Antarctic Polar Stereographic) to
+    avoid antimeridian and pole singularity issues in shapely's Cartesian space.
+
+    Parameters
+    ----------
+    granules : list
+        List of granule metadata from CMR
+    parent_order : int
+        Morton order for parent cells (e.g., 6)
+
+    Returns
+    -------
+    catalog : dict
+        Mapping of parent_morton (int) → list of S3 URLs
+    timings : dict
+        Wall-clock seconds for each pipeline step
+    """
+    from pyproj import Transformer
+    from mortie import mort2polygon
+    from shapely import make_valid
+    from shapely.geometry import Polygon
+    from shapely import STRtree
+
+    timings = {}
+    t_total = time.perf_counter()
+
+    to_stereo = Transformer.from_crs("EPSG:4326", "EPSG:3031", always_xy=True)
+
+    # --- Pass 1: Cell discovery + granule polygon creation ---
+    t0 = time.perf_counter()
+    all_cells: Set[int] = set()
+    granule_polys = []  # (index, s3_url, shapely Polygon in EPSG:3031)
+    granule_urls = []
+
+    for granule in granules:
+        info = extract_granule_info(granule)
+        if not info["s3_url"] or len(info["points"]) < 3:
+            continue
+
+        lats = np.array([p[0] for p in info["points"]])
+        lons = np.array([p[1] for p in info["points"]])
+
+        # Vertex-based cell discovery (no densification)
+        morton_18 = geo2mort(lats, lons, order=18)
+        morton_parent = clip2order(parent_order, morton_18)
+        all_cells.update(int(m) for m in morton_parent)
+
+        # Project granule polygon to EPSG:3031
+        x, y = to_stereo.transform(lons, lats)
+        coords = list(zip(x, y))
+        try:
+            poly = Polygon(coords)
+            if not poly.is_valid:
+                poly = make_valid(poly)
+            if poly.is_empty:
+                continue
+        except Exception:
+            continue
+
+        granule_polys.append(poly)
+        granule_urls.append(info["s3_url"])
+
+    timings["pass1_cell_discovery"] = time.perf_counter() - t0
+
+    initial_cells = np.array(sorted(all_cells))
+    logger.info(
+        f"Pass 1: {len(initial_cells)} cells from {len(granule_urls)} granules"
+    )
+
+    # --- STRtree construction ---
+    t0 = time.perf_counter()
+    tree = STRtree(granule_polys)
+    timings["strtree_construction"] = time.perf_counter() - t0
+
+    # --- mort2polygon + project to EPSG:3031 ---
+    t0 = time.perf_counter()
+    cell_shapely = []
+    for cell in initial_cells:
+        verts = mort2polygon(int(cell))
+        lats_c = np.array([v[0] for v in verts])
+        lons_c = np.array([v[1] for v in verts])
+        x, y = to_stereo.transform(lons_c, lats_c)
+        poly = Polygon(zip(x, y))
+        if not poly.is_valid:
+            poly = make_valid(poly)
+        cell_shapely.append(poly)
+    timings["cell_polygons"] = time.perf_counter() - t0
+
+    # --- STRtree queries ---
+    t0 = time.perf_counter()
+    catalog: Dict[int, List[str]] = {}
+    for i, cell_id in enumerate(initial_cells):
+        hits = tree.query(cell_shapely[i], predicate="intersects")
+        if len(hits) > 0:
+            catalog[int(cell_id)] = [granule_urls[j] for j in hits]
+    timings["strtree_queries"] = time.perf_counter() - t0
+
+    timings["total"] = time.perf_counter() - t_total
+    logger.info(
+        f"Pass 2: {len(catalog)} cells with granule mappings"
+    )
+
+    return catalog, timings
+
+
 def main():
     parser = argparse.ArgumentParser(description="Build granule catalog from CMR")
     parser.add_argument("--cycle", type=int, required=True, help="ICESat-2 cycle number")
@@ -327,7 +444,12 @@ def main():
     parser.add_argument("--version", default="007", help="ATL06 version")
     parser.add_argument("--output", default=None, help="Output JSON file path")
     parser.add_argument("--south-of", type=float, default=-60.0, help="Southern latitude bound")
-    parser.add_argument("--no-densify", action="store_true", help="Disable polygon densification")
+    parser.add_argument(
+        "--method",
+        choices=["densify", "polygon", "raw"],
+        default="densify",
+        help="Cell-to-granule mapping method (default: densify)",
+    )
     parser.add_argument(
         "--densify-spacing", type=float, default=5.0, help="Densification spacing in km (default 5)"
     )
@@ -347,13 +469,19 @@ def main():
         return
 
     # Build morton catalog
-    densify = not args.no_densify
-    catalog = build_morton_catalog(
-        granules,
-        args.parent_order,
-        densify=densify,
-        densify_spacing_km=args.densify_spacing,
-    )
+    if args.method == "polygon":
+        catalog, timings = build_morton_catalog_polygon(granules, args.parent_order)
+        print("\nPolygon intersection timings:")
+        for step, sec in timings.items():
+            print(f"  {step}: {sec:.3f}s")
+    else:
+        densify = args.method == "densify"
+        catalog = build_morton_catalog(
+            granules,
+            args.parent_order,
+            densify=densify,
+            densify_spacing_km=args.densify_spacing,
+        )
 
     # Summary stats
     granule_counts = [len(urls) for urls in catalog.values()]
@@ -372,8 +500,8 @@ def main():
             "parent_order": args.parent_order,
             "version": args.version,
             "south_of": args.south_of,
-            "densify": densify,
-            "densify_spacing_km": args.densify_spacing if densify else None,
+            "method": args.method,
+            "densify_spacing_km": args.densify_spacing if args.method == "densify" else None,
             "total_granules": len(granules),
             "total_cells": len(catalog),
             "created": datetime.now().isoformat(),
