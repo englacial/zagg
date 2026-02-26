@@ -349,8 +349,8 @@ def build_morton_catalog_polygon(
     timings : dict
         Wall-clock seconds for each pipeline step
     """
-    from pyproj import Transformer
     from mortie.tools import mort2polygon
+    from pyproj import Transformer
     from shapely import STRtree, make_valid
     from shapely.geometry import Polygon
 
