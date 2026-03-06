@@ -2,17 +2,42 @@
 
 The catalog module builds a local mapping of parent morton cells to granule S3 URLs by querying NASA's CMR (Common Metadata Repository). This avoids per-worker CMR queries during parallel processing.
 
-## Generating a Catalog
+## Building a Catalog
+
+The catalog CLI accepts date ranges, product names, and spatial polygons:
 
 ```bash
-# Query CMR for cycle 22 granules and build cell-to-granule mapping
-uv run python -m magg.catalog --cycle 22 --parent-order 6
+# ICESat-2 convenience (cycle → date range):
+python -m magg.catalog --cycle 22 --parent-order 6
 
-# Custom output path
-uv run python -m magg.catalog --cycle 22 --parent-order 6 --output deployment/data/catalogs/cycle22.json
+# Explicit date range:
+python -m magg.catalog --start-date 2024-01-06 --end-date 2024-04-07 --parent-order 6
+
+# Custom region via GeoJSON polygon:
+python -m magg.catalog --start-date 2024-01-01 --end-date 2024-06-01 \
+    --polygon my_region.geojson --parent-order 6
+
+# Different product:
+python -m magg.catalog --start-date 2024-01-01 --end-date 2024-06-01 \
+    --short-name ATL08 --polygon my_region.geojson --parent-order 6
 ```
 
-Cell discovery uses `mortie.morton_coverage()` on Antarctic drainage basin polygons to find the exact set of parent cells covering Antarctica. Granule-to-cell assignment uses shapely STRtree intersection in EPSG:3031.
+When `--polygon` is provided, it is used for two things:
+
+1. **Cell discovery** — `morton_coverage` runs on the polygon to find parent cells
+2. **CMR bounding box** — automatically computed from the polygon's extent
+
+When no polygon is given, Antarctic drainage basins are used as the default (suitable for ATL06 ice sheet work).
+
+## Temporal Helpers
+
+::: magg.catalog.cycle_to_dates
+
+## Spatial Helpers
+
+::: magg.catalog.load_polygon
+
+::: magg.catalog.polygon_to_bbox
 
 ## Cell Discovery
 
@@ -20,11 +45,13 @@ Cell discovery uses `mortie.morton_coverage()` on Antarctic drainage basin polyg
 
 ::: magg.catalog.discover_cells
 
+## CMR Query
+
+::: magg.catalog.query_cmr
+
 ## Catalog Builder
 
 ::: magg.catalog.build_catalog
-
-::: magg.catalog.query_cmr_antarctica
 
 ## Granule Parsing
 
