@@ -1,7 +1,6 @@
 """Tests for magg.catalog — CMR query, polygon loading, cell discovery, catalog building."""
 
 import json
-import tempfile
 from datetime import datetime
 from unittest.mock import MagicMock, patch
 
@@ -18,7 +17,6 @@ from magg.catalog import (
     polygon_to_bbox,
     query_cmr,
 )
-
 
 # ---------------------------------------------------------------------------
 # cycle_to_dates
