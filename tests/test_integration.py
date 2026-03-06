@@ -5,7 +5,7 @@ from magg.processing import write_dataframe_to_zarr
 from magg.schema import _COORDS, _DATA_VARS, xdggs_zarr_template
 
 
-def test_full_integration(s3_store_factory, mock_dataframe_factory):
+def test_full_integration(zarr_store, mock_dataframe_factory):
     """Test complete flow: template creation + data writing.
 
     This tests both functions from the magg package:
@@ -15,7 +15,7 @@ def test_full_integration(s3_store_factory, mock_dataframe_factory):
     parent_order = 6
     child_order = 8
 
-    store = s3_store_factory()
+    store = zarr_store
     xdggs_zarr_template(store, parent_order, child_order)
 
     # Antarctic coordinate
@@ -38,7 +38,7 @@ def test_full_integration(s3_store_factory, mock_dataframe_factory):
         np.testing.assert_array_almost_equal(actual, expected)
 
 
-def test_multiple_parent_cells(s3_store_factory, mock_dataframe_factory):
+def test_multiple_parent_cells(zarr_store, mock_dataframe_factory):
     """Test writing data from multiple parent cells to the same store.
 
     This simulates how invoke_lambda.py processes multiple cells in parallel.
@@ -46,7 +46,7 @@ def test_multiple_parent_cells(s3_store_factory, mock_dataframe_factory):
     parent_order = 6
     child_order = 8
 
-    store = s3_store_factory()
+    store = zarr_store
     xdggs_zarr_template(store, parent_order, child_order)
 
     # Different Antarctic locations to get different parent cells
