@@ -43,7 +43,7 @@ Uses HEALPix nested indexing via morton indices:
 | Parent/Shard | 6 | ~100km | Processing unit, defines what granules to read |
 | Child/Base Cell | 12 | ~1.5km | Output resolution, matches ICESat-2 beam pair spacing |
 
-Target coverage: 1,872 cells covering Antarctic grounded ice drainage basins.
+Target coverage: ~1,300 cells covering Antarctic grounded ice drainage basins (exact count determined by `mortie.morton_coverage`).
 
 ## End-to-End Flow
 
@@ -69,11 +69,11 @@ Target coverage: 1,872 cells covering Antarctic grounded ice drainage basins.
 │ polygon geometry      │  │ (valid ~1 hour)           │             │
 │         │             │  └─────────────┬─────────────┘             │
 │         ▼             │                │                           │
-│ Densify polygons      │                │                           │
-│ (pyproj EPSG:3031)    │                │                           │
+│ morton_coverage on    │                │                           │
+│ 27 drainage basins    │                │                           │
 │         │             │                │                           │
 │         ▼             │                │                           │
-│ geo2mort → clip2order │                │                           │
+│ STRtree intersection  │                │                           │
 │ Map parent cells to   │                │                           │
 │ granule S3 URLs       │                │                           │
 │         │             │                │                           │
@@ -238,11 +238,11 @@ Target coverage: 1,872 cells covering Antarctic grounded ice drainage basins.
 
 ## Key Design Decisions
 
-**Why one chunk per parent cell?** Each Lambda writes to exactly one chunk of the Zarr store. Since chunks are the atomic unit of Zarr writes, 1,700+ workers can write concurrently without coordination or locking.
+**Why one chunk per parent cell?** Each Lambda writes to exactly one chunk of the Zarr store. Since chunks are the atomic unit of Zarr writes, all workers can write concurrently without coordination or locking.
 
 **Why h5coro?** Reading HDF5 from S3 normally requires downloading entire files. h5coro reads individual datasets via S3 byte-range requests, fetching only the data needed. A granule may be hundreds of MB, but we only read the few datasets we need for the tracks that intersect our cell.
 
-**Why a pre-built catalog?** Without a catalog, each Lambda would need to query CMR independently to discover which granules intersect its cell. The catalog is built once (~30s) and passed to all workers, avoiding 1,700+ redundant CMR queries.
+**Why a pre-built catalog?** Without a catalog, each Lambda would need to query CMR independently to discover which granules intersect its cell. The catalog is built once (~30s) and passed to all workers, avoiding redundant CMR queries.
 
 **Why morton indexing?** Morton (Z-order) curves preserve spatial locality --- nearby cells have nearby indices. This means a contiguous range of child indices maps to exactly one parent cell, enabling efficient `clip2order` operations and chunk-aligned writes.
 
