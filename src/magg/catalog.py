@@ -3,14 +3,22 @@
 Build a local granule catalog from CMR to avoid per-Lambda CMR queries.
 
 This script:
-1. Queries CMR ONCE for all ATL06 granules in a cycle, south of 60S
-2. Discovers parent morton cells via morton_coverage on Antarctic drainage basins
+1. Queries CMR for granules matching a date range, product, and spatial extent
+2. Discovers parent morton cells via morton_coverage on an input polygon
 3. Intersects cells with granule polygons via shapely STRtree
 4. Builds a mapping: parent_morton -> [granule S3 URLs]
 
 Usage:
+    # General (date range + polygon):
+    python -m magg.catalog --start-date 2024-01-06 --end-date 2024-04-07 \\
+        --polygon antarctica.geojson --parent-order 6
+
+    # ICESat-2 convenience (cycle computes dates automatically):
     python -m magg.catalog --cycle 22 --parent-order 6
-    python -m magg.catalog --cycle 22 --parent-order 6 --output catalog.json
+
+    # Custom product:
+    python -m magg.catalog --start-date 2024-01-01 --end-date 2024-06-01 \\
+        --short-name ATL08 --polygon my_region.geojson --parent-order 6
 """
 
 import argparse
@@ -28,19 +36,94 @@ from mortie.tools import mort2polygon
 
 logger = logging.getLogger(__name__)
 
-# Default path to Antarctic drainage basin polygon file (shipped with mortie tests)
-_BASIN_FILE = None
+# ICESat-2 constants
+_ICESAT2_LAUNCH = datetime(2018, 10, 13)
+_ICESAT2_CYCLE_DAYS = 91
 
 
-def _get_basin_file():
-    global _BASIN_FILE
-    if _BASIN_FILE is None:
-        import mortie.tests
+def cycle_to_dates(cycle: int) -> tuple[datetime, datetime]:
+    """
+    Convert an ICESat-2 repeat cycle number to a date range.
 
-        _BASIN_FILE = str(
-            resources.files(mortie.tests) / "Ant_Grounded_DrainageSystem_Polygons.txt"
-        )
-    return _BASIN_FILE
+    Parameters
+    ----------
+    cycle : int
+        ICESat-2 cycle number (1-based)
+
+    Returns
+    -------
+    tuple of (start_date, end_date)
+        Start and end datetimes for the cycle
+    """
+    start = _ICESAT2_LAUNCH + timedelta(days=(cycle - 1) * _ICESAT2_CYCLE_DAYS)
+    end = start + timedelta(days=_ICESAT2_CYCLE_DAYS)
+    return start, end
+
+
+def load_polygon(geojson_path: str) -> list[tuple]:
+    """
+    Load polygon(s) from a GeoJSON file.
+
+    Supports Feature, FeatureCollection, Polygon, and MultiPolygon geometries.
+
+    Parameters
+    ----------
+    geojson_path : str
+        Path to a GeoJSON file
+
+    Returns
+    -------
+    list of (lats, lons)
+        One (lats, lons) array pair per polygon ring, suitable for
+        morton_coverage multipart input.
+    """
+    from shapely.geometry import shape
+
+    with open(geojson_path) as f:
+        geojson = json.load(f)
+
+    if geojson.get("type") == "FeatureCollection":
+        features = geojson["features"]
+    elif geojson.get("type") == "Feature":
+        features = [geojson]
+    else:
+        features = [{"geometry": geojson}]
+
+    parts = []
+    for feat in features:
+        geom = shape(feat["geometry"])
+        if geom.geom_type == "Polygon":
+            coords = np.array(geom.exterior.coords)
+            parts.append((coords[:, 1], coords[:, 0]))  # GeoJSON is (lon, lat)
+        elif geom.geom_type == "MultiPolygon":
+            for poly in geom.geoms:
+                coords = np.array(poly.exterior.coords)
+                parts.append((coords[:, 1], coords[:, 0]))
+    return parts
+
+
+def polygon_to_bbox(parts: list[tuple]) -> tuple[float, float, float, float]:
+    """
+    Compute a bounding box from polygon parts.
+
+    Parameters
+    ----------
+    parts : list of (lats, lons)
+        Polygon parts as returned by load_polygon
+
+    Returns
+    -------
+    tuple of (lon_min, lat_min, lon_max, lat_max)
+        Bounding box in CMR format
+    """
+    all_lats = np.concatenate([p[0] for p in parts])
+    all_lons = np.concatenate([p[1] for p in parts])
+    return (
+        float(all_lons.min()),
+        float(all_lats.min()),
+        float(all_lons.max()),
+        float(all_lats.max()),
+    )
 
 
 def load_antarctic_basins(filepath=None):
@@ -59,7 +142,13 @@ def load_antarctic_basins(filepath=None):
     """
     import pandas as pd
 
-    filepath = filepath or _get_basin_file()
+    if filepath is None:
+        import mortie.tests
+
+        filepath = str(
+            resources.files(mortie.tests) / "Ant_Grounded_DrainageSystem_Polygons.txt"
+        )
+
     df = pd.read_csv(filepath, names=["Lat", "Lon", "basin"], sep=r"\s+")
     basins = []
     for _, group in df.groupby("basin"):
@@ -67,53 +156,60 @@ def load_antarctic_basins(filepath=None):
     return basins
 
 
-def discover_cells(parent_order, basin_file=None):
+def discover_cells(parent_order, polygon_parts=None):
     """
-    Discover all morton cells at parent_order that cover Antarctica.
-
-    Uses mortie.morton_coverage on each of the 27 Antarctic drainage basins,
-    then unions the results.
+    Discover morton cells at parent_order covering a polygon.
 
     Parameters
     ----------
     parent_order : int
         Morton order for parent cells (e.g., 6)
-    basin_file : str, optional
-        Path to basin polygon file
+    polygon_parts : list of (lats, lons), optional
+        Polygon parts for coverage. Defaults to Antarctic drainage basins.
 
     Returns
     -------
     numpy.ndarray
         Sorted array of unique morton indices at parent_order
     """
-    basins = load_antarctic_basins(basin_file)
-    lats_parts = [b[0] for b in basins]
-    lons_parts = [b[1] for b in basins]
+    if polygon_parts is None:
+        polygon_parts = load_antarctic_basins()
+
+    lats_parts = [p[0] for p in polygon_parts]
+    lons_parts = [p[1] for p in polygon_parts]
     cells = morton_coverage(lats_parts, lons_parts, order=parent_order)
-    logger.info(f"Cell discovery: {len(cells)} cells at order {parent_order} from {len(basins)} basins")
+    logger.info(
+        f"Cell discovery: {len(cells)} cells at order {parent_order} from {len(polygon_parts)} parts"
+    )
     return cells
 
 
-def query_cmr_antarctica(
-    cycle: int,
+def query_cmr(
+    start_date: str,
+    end_date: str,
+    short_name: str = "ATL06",
     version: str = "007",
     provider: str = "NSIDC_CPRD",
-    south_of: float = -60.0,
+    bbox: tuple = None,
     page_size: int = 2000,
 ) -> List[dict]:
     """
-    Query CMR for ALL ATL06 granules in Antarctica for a given cycle.
+    Query CMR for granules matching temporal and spatial filters.
 
     Parameters
     ----------
-    cycle : int
-        ICESat-2 cycle number
+    start_date : str
+        Start date (YYYY-MM-DD)
+    end_date : str
+        End date (YYYY-MM-DD)
+    short_name : str
+        CMR short name (e.g., ATL06, ATL08)
     version : str
-        ATL06 version
+        Product version
     provider : str
         CMR provider
-    south_of : float
-        Southern latitude bound (default -60)
+    bbox : tuple of (lon_min, lat_min, lon_max, lat_max), optional
+        Bounding box filter
     page_size : int
         Results per page
 
@@ -124,32 +220,27 @@ def query_cmr_antarctica(
     """
     cmr_url = "https://cmr.earthdata.nasa.gov/search/granules.umm_json"
 
-    launch_date = datetime(2018, 10, 13)
-    cycle_duration = 91
-    cycle_start = launch_date + timedelta(days=(cycle - 1) * cycle_duration)
-    cycle_end = cycle_start + timedelta(days=cycle_duration + 1)
-    temporal = (
-        f"{cycle_start.strftime('%Y-%m-%d')}T00:00:00Z,{cycle_end.strftime('%Y-%m-%d')}T23:59:59Z"
-    )
-
-    bbox = f"-180,-90,180,{south_of}"
+    temporal = f"{start_date}T00:00:00Z,{end_date}T23:59:59Z"
 
     params: Dict[str, str | int] = {
         "provider": provider,
-        "short_name": "ATL06",
+        "short_name": short_name,
         "version": version,
         "page_size": page_size,
         "sort_key": "start_date",
         "temporal": temporal,
-        "bounding_box": bbox,
         "offset": 0,
     }
 
+    if bbox is not None:
+        params["bounding_box"] = f"{bbox[0]},{bbox[1]},{bbox[2]},{bbox[3]}"
+
     headers = {"Accept": "application/vnd.nasa.cmr.umm_json+json"}
 
-    logger.info(f"Querying CMR for ATL06 v{version} cycle {cycle}")
+    logger.info(f"Querying CMR for {short_name} v{version}")
     logger.info(f"  Temporal: {temporal}")
-    logger.info(f"  Bounding box: {bbox}")
+    if bbox:
+        logger.info(f"  Bounding box: {params['bounding_box']}")
 
     all_granules = []
     total_hits = None
@@ -183,29 +274,20 @@ def query_cmr_antarctica(
 
 def extract_granule_info(granule: dict) -> dict:
     """
-    Extract S3 URL and geometry points from a granule.
+    Extract S3 URL and geometry points from a CMR granule.
+
+    Parameters
+    ----------
+    granule : dict
+        UMM-JSON granule from CMR
 
     Returns
     -------
-    dict with keys:
-        - granule_id: str
-        - s3_url: str or None
-        - points: list of (lat, lon) tuples
-        - rgt: int
-        - cycle: int
-        - region: int
+    dict
+        Keys: granule_id, s3_url, points (list of (lat, lon) tuples)
     """
     umm = granule.get("umm", {})
     granule_id = umm.get("GranuleUR", "")
-
-    parts = granule_id.split("_")
-    rgt, cycle, region = None, None, None
-    if len(parts) >= 3:
-        rgt_cycle_region = parts[2]
-        if len(rgt_cycle_region) >= 8:
-            rgt = int(rgt_cycle_region[0:4])
-            cycle = int(rgt_cycle_region[4:6])
-            region = int(rgt_cycle_region[6:8])
 
     related_urls = umm.get("RelatedUrls", [])
     s3_url = None
@@ -232,26 +314,17 @@ def extract_granule_info(granule: dict) -> dict:
         "granule_id": granule_id,
         "s3_url": s3_url,
         "points": points,
-        "rgt": rgt,
-        "cycle": cycle,
-        "region": region,
     }
 
 
 def build_catalog(
     granules: List[dict],
     parent_order: int,
-    basin_file: str = None,
+    polygon_parts: list = None,
 ) -> tuple:
     """
     Build a granule catalog using morton_coverage for cell discovery
     and shapely STRtree for granule-to-cell intersection.
-
-    Two passes:
-    1. Discover all parent cells covering Antarctica via morton_coverage
-       on the 27 Antarctic drainage basins.
-    2. Build granule polygons in EPSG:3031 and use STRtree to intersect
-       each cell with granule polygons.
 
     Parameters
     ----------
@@ -259,8 +332,8 @@ def build_catalog(
         List of granule metadata from CMR
     parent_order : int
         Morton order for parent cells (e.g., 6)
-    basin_file : str, optional
-        Path to Antarctic drainage basin polygon file
+    polygon_parts : list of (lats, lons), optional
+        Polygon parts for cell discovery. Defaults to Antarctic drainage basins.
 
     Returns
     -------
@@ -280,9 +353,9 @@ def build_catalog(
 
     # --- Pass 1: Cell discovery via morton_coverage ---
     t0 = time.perf_counter()
-    all_cells = discover_cells(parent_order, basin_file)
+    all_cells = discover_cells(parent_order, polygon_parts)
     timings["cell_discovery"] = time.perf_counter() - t0
-    logger.info(f"Pass 1: {len(all_cells)} cells from drainage basins")
+    logger.info(f"Pass 1: {len(all_cells)} cells")
 
     # --- Build granule polygons in EPSG:3031 ---
     t0 = time.perf_counter()
@@ -349,61 +422,139 @@ def build_catalog(
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Build granule catalog from CMR")
-    parser.add_argument("--cycle", type=int, required=True, help="ICESat-2 cycle number")
-    parser.add_argument("--parent-order", type=int, default=6, help="Parent morton order")
-    parser.add_argument("--version", default="007", help="ATL06 version")
-    parser.add_argument("--output", default=None, help="Output JSON file path")
-    parser.add_argument("--south-of", type=float, default=-60.0, help="Southern latitude bound")
-    parser.add_argument(
-        "--basin-file", default=None, help="Path to Antarctic drainage basin polygon file"
-    )
-    args = parser.parse_args()
+    parser = argparse.ArgumentParser(
+        description="Build granule catalog from CMR",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+examples:
+  # ICESat-2 cycle (convenience):
+  python -m magg.catalog --cycle 22 --parent-order 6
 
+  # Explicit date range:
+  python -m magg.catalog --start-date 2024-01-06 --end-date 2024-04-07 --parent-order 6
+
+  # Custom region and product:
+  python -m magg.catalog --start-date 2024-01-01 --end-date 2024-06-01 \\
+      --short-name ATL08 --polygon my_region.geojson --parent-order 6
+""",
+    )
+
+    # Temporal
+    temporal = parser.add_argument_group("temporal (choose one)")
+    temporal.add_argument("--start-date", help="Start date (YYYY-MM-DD)")
+    temporal.add_argument("--end-date", help="End date (YYYY-MM-DD)")
+    temporal.add_argument(
+        "--cycle", type=int, help="ICESat-2 cycle number (computes dates automatically)"
+    )
+
+    # Product
+    parser.add_argument("--short-name", default="ATL06", help="CMR short name (default: ATL06)")
+    parser.add_argument("--version", default="007", help="Product version (default: 007)")
+    parser.add_argument("--provider", default="NSIDC_CPRD", help="CMR provider")
+
+    # Spatial
+    spatial = parser.add_argument_group("spatial")
+    spatial.add_argument(
+        "--polygon",
+        help="GeoJSON file for area of interest (used for cell discovery and CMR bbox)",
+    )
+    spatial.add_argument(
+        "--bbox",
+        help="Bounding box override: lon_min,lat_min,lon_max,lat_max",
+    )
+
+    # Output
+    parser.add_argument("--parent-order", type=int, default=6, help="Parent morton order")
+    parser.add_argument("--output", default=None, help="Output JSON file path")
+
+    args = parser.parse_args()
     logging.basicConfig(level=logging.INFO, format="%(message)s")
 
+    # --- Resolve temporal ---
+    if args.cycle:
+        start_dt, end_dt = cycle_to_dates(args.cycle)
+        start_date = start_dt.strftime("%Y-%m-%d")
+        end_date = end_dt.strftime("%Y-%m-%d")
+    elif args.start_date and args.end_date:
+        start_date = args.start_date
+        end_date = args.end_date
+    else:
+        parser.error("Provide either --cycle or both --start-date and --end-date")
+
+    # --- Resolve spatial ---
+    polygon_parts = None
+    bbox = None
+
+    if args.polygon:
+        polygon_parts = load_polygon(args.polygon)
+        bbox = polygon_to_bbox(polygon_parts)
+        logger.info(f"Loaded polygon from {args.polygon}: {len(polygon_parts)} parts")
+        logger.info(f"  Auto-computed bbox: {bbox}")
+
+    if args.bbox:
+        bbox = tuple(float(x) for x in args.bbox.split(","))
+
+    # --- Query CMR ---
     start_time = time.time()
 
-    # Query CMR
-    granules = query_cmr_antarctica(
-        cycle=args.cycle,
+    granules = query_cmr(
+        start_date=start_date,
+        end_date=end_date,
+        short_name=args.short_name,
         version=args.version,
-        south_of=args.south_of,
+        provider=args.provider,
+        bbox=bbox,
     )
 
     if not granules:
         print("No granules found!")
         return
 
-    # Build catalog
-    catalog, timings = build_catalog(granules, args.parent_order, args.basin_file)
+    # --- Build catalog ---
+    catalog, timings = build_catalog(granules, args.parent_order, polygon_parts)
 
     print("\nTimings:")
     for step, sec in timings.items():
         print(f"  {step}: {sec:.3f}s")
 
-    # Summary stats
     granule_counts = [len(urls) for urls in catalog.values()]
     print("\nCatalog statistics:")
     print(f"  Parent cells: {len(catalog)}")
     print(
-        f"  Granules per cell: min={min(granule_counts)}, max={max(granule_counts)}, avg={np.mean(granule_counts):.1f}"
+        f"  Granules per cell: min={min(granule_counts)}, "
+        f"max={max(granule_counts)}, avg={np.mean(granule_counts):.1f}"
     )
 
-    # Save catalog
-    output_file = args.output or f"granule_catalog_cycle{args.cycle}_order{args.parent_order}.json"
+    # --- Save catalog ---
+    if args.output:
+        output_file = args.output
+    elif args.cycle:
+        output_file = f"catalog_{args.short_name}_cycle{args.cycle}_order{args.parent_order}.json"
+    else:
+        output_file = (
+            f"catalog_{args.short_name}_{start_date}_{end_date}_order{args.parent_order}.json"
+        )
+
+    output_metadata = {
+        "short_name": args.short_name,
+        "version": args.version,
+        "provider": args.provider,
+        "start_date": start_date,
+        "end_date": end_date,
+        "parent_order": args.parent_order,
+        "total_granules": len(granules),
+        "total_cells": len(catalog),
+        "created": datetime.now().isoformat(),
+    }
+    if args.cycle:
+        output_metadata["cycle"] = args.cycle
+    if bbox:
+        output_metadata["bbox"] = list(bbox)
+    if args.polygon:
+        output_metadata["polygon"] = args.polygon
 
     output_data = {
-        "metadata": {
-            "cycle": args.cycle,
-            "parent_order": args.parent_order,
-            "version": args.version,
-            "south_of": args.south_of,
-            "method": "morton_coverage",
-            "total_granules": len(granules),
-            "total_cells": len(catalog),
-            "created": datetime.now().isoformat(),
-        },
+        "metadata": output_metadata,
         "catalog": {str(k): v for k, v in catalog.items()},
     }
 

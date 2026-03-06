@@ -342,9 +342,11 @@ def main():
 
     parent_order = metadata["parent_order"]
     child_order = args.child_order
-    cycle = metadata["cycle"]
 
-    print(f"      Cycle: {cycle}")
+    print(f"      Product: {metadata.get('short_name', 'ATL06')}")
+    print(f"      Temporal: {metadata.get('start_date', '?')} to {metadata.get('end_date', '?')}")
+    if "cycle" in metadata:
+        print(f"      Cycle: {metadata['cycle']}")
     print(f"      Parent order: {parent_order}")
     print(f"      Total cells in catalog: {metadata['total_cells']}")
     print(f"      Total granules: {metadata['total_granules']}")

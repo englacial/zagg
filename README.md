@@ -1,114 +1,140 @@
 # magg - Multi-resolution Aggregation
 
-ICESat-2 ATL06 processing using morton/healpix indexing and AWS Lambda.
+Aggregate point observations to multi-resolution grids using HEALPix spatial indexing and serverless compute.
 
 ## Overview
 
-magg implements a serverless, scalable system for aggregating sparse ICESat-2 ATL06 elevation data to multi-resolution grids using HEALPix spatial indexing. The system processes Antarctic ice sheet data by building spatial trees from leaves (fine resolution) to root (coarse resolution), enabling efficient parallel processing without data duplication.
+magg aggregates sparse point data (e.g., ICESat-2 ATL06 elevation measurements) to gridded products using HEALPix/morton spatial indexing. Processing runs in parallel on AWS Lambda — each worker handles one spatial cell independently, writing to a shared [Zarr v3](https://zarr-specs.readthedocs.io/en/latest/v3/core/v3.0.html) store following the [DGGS convention](https://github.com/zarr-conventions/dggs).
 
 ## Features
 
-- **Serverless AWS Lambda processing** - Python 3.12 on ARM64 for cost efficiency
-- **Pre-computed granule catalogs** - Eliminates CMR query rate limiting
-- **Morton-based spatial indexing** - HEALPix nested scheme for hierarchical grids
-- **Massive parallelism** - Tested with up to 1,700 concurrent workers
-- **Direct S3 access** - h5coro reads HDF5 without local downloads
-- **Cost-effective** - ~$12-15 per full Antarctica run
+- **Pre-computed granule catalogs** — query CMR once, process many times
+- **Morton-based spatial indexing** — HEALPix nested scheme for hierarchical grids
+- **Massive parallelism** — tested with up to 1,700 concurrent Lambda workers
+- **Direct S3 access** — h5coro reads HDF5 via byte-range requests, no downloads
+- **Cost-effective** — ~$0.006/cell (~$2 per full Antarctica run on ARM64)
+
+## End-to-End Workflow
+
+### Step 1: Build a Granule Catalog
+
+Query NASA's CMR to build a mapping of spatial cells to granule S3 URLs.
+
+```bash
+# ICESat-2 convenience — cycle number computes dates automatically:
+uv run python -m magg.catalog --cycle 22 --parent-order 6
+
+# General — explicit date range and spatial polygon:
+uv run python -m magg.catalog \
+    --start-date 2024-01-06 --end-date 2024-04-07 \
+    --short-name ATL06 \
+    --polygon my_region.geojson \
+    --parent-order 6
+```
+
+When `--polygon` is provided, the bounding box for the CMR query is computed automatically from the polygon's extent, and `morton_coverage` uses the polygon for cell discovery. When no polygon is given, Antarctic drainage basins are used as the default.
+
+Output: `catalog_ATL06_2024-01-06_2024-04-07_order6.json`
+
+See [Catalog API](docs/api/catalog.md) for full options.
+
+### Step 2: Deploy the Lambda Function
+
+Build and deploy the Lambda function and its dependency layer.
+
+```bash
+# Build the function package
+bash deployment/aws/build_function.sh
+
+# Build the dependency layer (ARM64)
+bash deployment/aws/build_arm64_layer.sh
+
+# Deploy
+bash deployment/aws/deploy.sh
+```
+
+See [Lambda Deployment](docs/deployment/lambda.md) and [ARM64 Build Guide](docs/deployment/arm64.md).
+
+### Step 3: Run Production Processing
+
+The orchestrator creates a Zarr template, authenticates with NASA Earthdata, and dispatches one Lambda per spatial cell.
+
+```bash
+# Full run:
+uv run python deployment/aws/invoke_lambda.py \
+    --catalog catalog_ATL06_cycle22_order6.json
+
+# Dry run (show what would be processed):
+uv run python deployment/aws/invoke_lambda.py \
+    --catalog catalog_ATL06_cycle22_order6.json \
+    --dry-run
+
+# Test with a few cells:
+uv run python deployment/aws/invoke_lambda.py \
+    --catalog catalog_ATL06_cycle22_order6.json \
+    --max-cells 10
+```
+
+Output: Zarr store at `s3://xagg/atl06/morton_aggregation.zarr/`
+
+### Step 4: Visualize Results
+
+The output Zarr is a public DGGS dataset. The included notebook rasterizes HEALPix cells to a polar stereographic grid for fast rendering with `imshow`.
+
+```bash
+uv run jupyter notebook notebooks/rasterized_zarr.ipynb
+```
+
+Adjust `GRID_SPACING` in the notebook to control output resolution (default 2 km).
 
 ## Project Structure
 
 ```
 magg/
 ├── src/magg/              # Main package (cloud-agnostic)
-│   ├── processing.py      # Core processing functions
-│   ├── catalog.py         # CMR granule catalog building
+│   ├── processing.py      # Core aggregation pipeline
+│   ├── catalog.py         # CMR query + catalog building
+│   ├── schema.py          # Output schema + Zarr template
 │   ├── auth.py            # NASA Earthdata authentication
-├── deployment/            # Cloud-specific deployment code
-│   ├── aws/               # AWS Lambda implementation
-│   │   ├── lambda_handler.py    # AWS Lambda wrapper
-│   │   ├── invoke_lambda.py     # AWS orchestrator
-│   │   └── build_*_layer.sh     # Layer build scripts
-│   ├── layers/            # Pre-built Lambda layers
-│   └── data/              # Granule catalogs and results
-├── notebooks/             # Analysis and visualization
-├── docs/                  # Comprehensive documentation
+├── deployment/            # Cloud-specific deployment
+│   └── aws/               # Lambda handler, orchestrator, build scripts
+├── notebooks/             # Visualization
+├── docs/                  # Documentation
 └── tests/                 # Test suite
-```
-
-## Quick Start
-
-### Installation
-
-```bash
-# Sync dependencies and install package
-uv sync
-
-# Install with optional dependency groups
-uv sync --all-extras
-```
-
-### Build Granule Catalog
-
-```bash
-# Query CMR for cycle 22 granules
-uv run python -m magg.catalog --cycle 22 --parent-order 6
-```
-
-### Run Production Processing (AWS Lambda)
-
-```bash
-# Process all cells
-uv run python deployment/aws/invoke_lambda.py --catalog deployment/data/catalogs/granule_catalog_cycle22_order6.json
-
-# Test with limited cells
-uv run python deployment/aws/invoke_lambda.py --catalog deployment/data/catalogs/granule_catalog_cycle22_order6.json --max-cells 10 --dry-run
-```
-
-### Visualize Results
-
-```bash
-# Launch Jupyter and open visualization notebook
-uv run jupyter notebook notebooks/visualize_production_results.ipynb
 ```
 
 ## Documentation
 
-- **[Architecture Overview](docs/design/architecture.md)** - Design philosophy and approach
-- **[Lambda Deployment](docs/deployment/lambda.md)** - AWS setup and production use
-- **[ARM64 Build Guide](docs/deployment/arm64.md)** - Building Lambda layers for ARM64
+- **[Architecture](docs/design/architecture.md)** — design philosophy, end-to-end flow diagram, key decisions
+- **[Schema](docs/design/schema.md)** — aggregation dispatch, extending with new statistics
+- **[API Reference](docs/api/catalog.md)** — catalog, processing, schema, auth modules
+- **[Lambda Deployment](docs/deployment/lambda.md)** — AWS setup and production use
+- **[ARM64 Build Guide](docs/deployment/arm64.md)** — building Lambda layers for ARM64
 
 ## Development
 
-### Requirements
-
-- Python >= 3.12
-- uv (install from https://docs.astral.sh/uv/)
-- AWS credentials (for Lambda deployment)
-- NASA Earthdata account (for data access)
-
-```
-
-### Building Lambda Layers
-
 ```bash
-# For ARM64 (on Apple Silicon)
-bash deployment/aws/build_arm64_layer.sh
+# Install
+uv sync --all-groups
 
-# For x86_64
-bash deployment/aws/build_layer_v14.sh x86_64
+# Run tests
+uv run pytest
+
+# Lint
+uv run ruff check src/
 ```
+
+Requires Python >= 3.12, [uv](https://docs.astral.sh/uv/), AWS credentials (for Lambda), and a [NASA Earthdata](https://urs.earthdata.nasa.gov/) account (for data access).
 
 ## Performance
 
-- **Execution time**: 2-3 minutes average per cell
-- **Memory**: 2048 MB configured, 1-1.5 GB typical usage
-- **Throughput**: Tested with up to 1,700 concurrent Lambda invocations
-- **Cost**: ~$0.006/cell (~$2 per full Antarctica run with ARM64)
+| Metric | Value |
+|--------|-------|
+| Execution time | 2–3 min average per cell |
+| Memory | 2 GB configured, 1–1.5 GB typical |
+| Throughput | Tested with up to 1,700 concurrent workers |
+| Cost | ~$0.006/cell (~$2 per full Antarctica run on ARM64) |
 
 ## License
 
-MIT License - see LICENSE file
-
-## Acknowledgments
-
-Built for processing ICESat-2 ATL06 Land Ice Height data from NASA's ICESat-2 mission.
+MIT — see LICENSE file.
