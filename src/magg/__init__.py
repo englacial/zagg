@@ -12,11 +12,19 @@ __version__ = "0.1.0"
 
 # Export main processing functions
 from .auth import get_nsidc_s3_credentials
-from .processing import calculate_cell_statistics, process_morton_cell, write_dataframe_to_zarr
+from .processing import (
+    ATL06_CONFIG,
+    DataSourceConfig,
+    calculate_cell_statistics,
+    process_morton_cell,
+    write_dataframe_to_zarr,
+)
 from .schema import CellStatsSchema, xdggs_spec, xdggs_zarr_template
 
 __all__ = [
+    "ATL06_CONFIG",
     "CellStatsSchema",
+    "DataSourceConfig",
     "calculate_cell_statistics",
     "get_nsidc_s3_credentials",
     "process_morton_cell",

@@ -4,7 +4,13 @@ import pytest
 from zarr import open_group
 from zarr.storage import MemoryStore
 
-from magg.processing import AGG_FUNCTIONS, calculate_cell_statistics, write_dataframe_to_zarr
+from magg.processing import (
+    AGG_FUNCTIONS,
+    ATL06_CONFIG,
+    DataSourceConfig,
+    calculate_cell_statistics,
+    write_dataframe_to_zarr,
+)
 from magg.schema import _COORDS, _DATA_VARS, _agg_fields, xdggs_zarr_template
 
 
@@ -86,3 +92,47 @@ class TestCalculateCellStatistics:
         assert result["h_min"] == 1.0
         assert result["h_max"] == 3.0
         np.testing.assert_almost_equal(result["h_q50"], 2.0)
+
+
+class TestDataSourceConfig:
+    def test_atl06_config_has_six_groups(self):
+        assert len(ATL06_CONFIG.groups) == 6
+        assert ATL06_CONFIG.groups[0] == "gt1l"
+
+    def test_atl06_config_has_coordinates(self):
+        assert "latitude" in ATL06_CONFIG.coordinates
+        assert "longitude" in ATL06_CONFIG.coordinates
+        assert "{group}" in ATL06_CONFIG.coordinates["latitude"]
+
+    def test_atl06_config_has_variables(self):
+        assert "h_li" in ATL06_CONFIG.variables
+        assert "s_li" in ATL06_CONFIG.variables
+
+    def test_atl06_config_has_quality_filter(self):
+        assert ATL06_CONFIG.quality_filter is not None
+        assert "dataset" in ATL06_CONFIG.quality_filter
+        assert ATL06_CONFIG.quality_filter["value"] == 0
+
+    def test_roundtrip_serialization(self):
+        d = ATL06_CONFIG.to_dict()
+        restored = DataSourceConfig.from_dict(d)
+        assert restored.groups == ATL06_CONFIG.groups
+        assert restored.coordinates == ATL06_CONFIG.coordinates
+        assert restored.variables == ATL06_CONFIG.variables
+        assert restored.quality_filter == ATL06_CONFIG.quality_filter
+
+    def test_no_quality_filter(self):
+        cfg = DataSourceConfig(
+            groups=["g1"],
+            coordinates={"latitude": "/{group}/lat", "longitude": "/{group}/lon"},
+            variables={"val": "/{group}/value"},
+        )
+        assert cfg.quality_filter is None
+        d = cfg.to_dict()
+        assert d["quality_filter"] is None
+        restored = DataSourceConfig.from_dict(d)
+        assert restored.quality_filter is None
+
+    def test_group_template_substitution(self):
+        path = ATL06_CONFIG.coordinates["latitude"].format(group="gt2r")
+        assert path == "/gt2r/land_ice_segments/latitude"

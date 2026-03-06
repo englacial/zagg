@@ -1,5 +1,5 @@
 """
-Cloud-agnostic processing functions for ICESat-2 ATL06 data.
+Cloud-agnostic processing functions for aggregating HDF5 data.
 
 This module contains the core processing logic that can be used across different
 cloud platforms or local processing environments.
@@ -7,6 +7,7 @@ cloud platforms or local processing environments.
 
 import logging
 from collections.abc import Callable
+from dataclasses import asdict, dataclass
 from datetime import datetime
 from typing import List, Tuple
 
@@ -19,6 +20,62 @@ from zarr.abc.store import Store
 from magg.schema import _DATA_VARS, ProcessingMetadata, _agg_fields, _get_schema_fields
 
 logger = logging.getLogger(__name__)
+
+
+# ---------------------------------------------------------------------------
+# Data source configuration
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class DataSourceConfig:
+    """Configuration for reading data from HDF5 files.
+
+    Parameters
+    ----------
+    groups : list[str]
+        HDF5 group names to iterate over.
+    coordinates : dict[str, str]
+        Mapping of coordinate name to HDF5 path template.
+        Templates use ``{group}`` placeholder.
+    variables : dict[str, str]
+        Mapping of output column name to HDF5 path template.
+        Templates use ``{group}`` placeholder.
+    quality_filter : dict or None
+        Optional quality filter with ``dataset`` (path template) and
+        ``value`` (the "good" value to keep via equality check).
+    """
+
+    groups: list[str]
+    coordinates: dict[str, str]
+    variables: dict[str, str]
+    quality_filter: dict | None = None
+
+    def to_dict(self) -> dict:
+        """Serialize to a JSON-compatible dict (for Lambda payloads)."""
+        return asdict(self)
+
+    @classmethod
+    def from_dict(cls, d: dict) -> "DataSourceConfig":
+        """Deserialize from a dict."""
+        return cls(**d)
+
+
+ATL06_CONFIG = DataSourceConfig(
+    groups=["gt1l", "gt1r", "gt2l", "gt2r", "gt3l", "gt3r"],
+    coordinates={
+        "latitude": "/{group}/land_ice_segments/latitude",
+        "longitude": "/{group}/land_ice_segments/longitude",
+    },
+    variables={
+        "h_li": "/{group}/land_ice_segments/h_li",
+        "s_li": "/{group}/land_ice_segments/h_li_sigma",
+    },
+    quality_filter={
+        "dataset": "/{group}/land_ice_segments/atl06_quality_summary",
+        "value": 0,
+    },
+)
 
 
 # ---------------------------------------------------------------------------
@@ -152,6 +209,78 @@ def calculate_cell_statistics(df_cell: pd.DataFrame, value_col="h_li", sigma_col
     return result
 
 
+def _read_group(h5obj, group: str, data_source: DataSourceConfig, parent_morton: int,
+                parent_order: int, geo2mort, clip2order):
+    """Read and spatially filter one HDF5 group, returning a DataFrame or None."""
+    # Resolve coordinate paths
+    coord_paths = [path.format(group=group) for path in data_source.coordinates.values()]
+    coord_data = h5obj.readDatasets(coord_paths)
+
+    lat_path = data_source.coordinates["latitude"].format(group=group)
+    lon_path = data_source.coordinates["longitude"].format(group=group)
+    lats = coord_data[lat_path]
+    lons = coord_data[lon_path]
+
+    if len(lats) == 0:
+        return None
+
+    # Morton index filtering
+    midx18 = geo2mort(lats, lons, order=18)
+    midx_parent = clip2order(parent_order, midx18)
+    mask_spatial = midx_parent == parent_morton
+
+    if np.sum(mask_spatial) == 0:
+        return None
+
+    # Bounding indices for hyperslice read
+    indices = np.where(mask_spatial)[0]
+    min_idx = int(indices[0])
+    max_idx = int(indices[-1]) + 1
+
+    # Build hyperslice dataset list: variables + optional quality filter
+    datasets = []
+    for path_template in data_source.variables.values():
+        path = path_template.format(group=group)
+        datasets.append({"dataset": path, "hyperslice": [(min_idx, max_idx)]})
+
+    has_quality = data_source.quality_filter is not None
+    if has_quality:
+        qf_path = data_source.quality_filter["dataset"].format(group=group)
+        datasets.append({"dataset": qf_path, "hyperslice": [(min_idx, max_idx)]})
+
+    data = h5obj.readDatasets(datasets)
+
+    # Apply spatial mask to sliced data
+    mask_sliced = mask_spatial[min_idx:max_idx]
+
+    # Apply quality filter if configured
+    if has_quality:
+        qf_path = data_source.quality_filter["dataset"].format(group=group)
+        q_flag = data[qf_path][mask_sliced]
+        quality_mask = q_flag == data_source.quality_filter["value"]
+        if np.sum(quality_mask) == 0:
+            return None
+    else:
+        quality_mask = None
+
+    # Build dataframe
+    midx_sliced = midx18[min_idx:max_idx][mask_sliced]
+    data_dict = {}
+    for col_name, path_template in data_source.variables.items():
+        path = path_template.format(group=group)
+        values = data[path][mask_sliced]
+        if quality_mask is not None:
+            values = values[quality_mask]
+        data_dict[col_name] = values
+
+    if quality_mask is not None:
+        data_dict["midx"] = midx_sliced[quality_mask]
+    else:
+        data_dict["midx"] = midx_sliced
+
+    return pd.DataFrame(data_dict)
+
+
 def process_morton_cell(
     parent_morton: int,
     parent_order: int,
@@ -159,11 +288,12 @@ def process_morton_cell(
     granule_urls: List[str],
     s3_credentials: dict,
     h5coro_driver=None,
+    data_source: DataSourceConfig | None = None,
 ) -> Tuple[pd.DataFrame, ProcessingMetadata]:
     """
     Process one parent morton cell: read data, calculate statistics, return DataFrame.
 
-    This is a cloud-agnostic function that processes ICESat-2 data and returns
+    This is a cloud-agnostic function that processes HDF5 data and returns
     results as a DataFrame. The caller is responsible for writing the output.
 
     Parameters
@@ -180,13 +310,13 @@ def process_morton_cell(
         Credentials for accessing data (format depends on driver)
     h5coro_driver : class, optional
         h5coro driver class to use (e.g., s3driver.S3Driver). If None, auto-detect.
+    data_source : DataSourceConfig, optional
+        Configuration for reading HDF5 data. Defaults to ATL06_CONFIG.
 
     Returns
     -------
     tuple
         (DataFrame, metadata_dict)
-        - DataFrame with columns: child_morton, child_healpix, count, h_mean, h_sigma, h_min, h_max, h_variance, h_q25, h_q50, h_q75
-        - metadata_dict with: parent_morton, cells_with_data, total_obs, granule_count, files_processed, duration_s, error
     """
     from mortie import (
         clip2order,
@@ -194,6 +324,9 @@ def process_morton_cell(
         geo2mort,
         mort2healpix,
     )
+
+    if data_source is None:
+        data_source = ATL06_CONFIG
 
     logger.info(f"Processing morton cell: {parent_morton}")
     start_time = datetime.now()
@@ -240,10 +373,8 @@ def process_morton_cell(
     # Read files and filter spatially
     for s3_url in granule_urls:
         try:
-            # Convert S3 URL to path format for driver
             resource_path = s3_url.replace("s3://", "")
 
-            # Initialize h5coro with driver
             h5obj = h5coro.H5Coro(
                 resource_path,
                 h5coro_driver,
@@ -252,72 +383,14 @@ def process_morton_cell(
                 verbose=False,
             )
 
-            # Process each ground track
-            for g in ["gt1l", "gt1r", "gt2l", "gt2r", "gt3l", "gt3r"]:
+            for g in data_source.groups:
                 try:
-                    # Read coordinates for spatial filtering
-                    coord_data = h5obj.readDatasets(
-                        [f"/{g}/land_ice_segments/latitude", f"/{g}/land_ice_segments/longitude"]
+                    df = _read_group(
+                        h5obj, g, data_source, parent_morton, parent_order,
+                        geo2mort, clip2order,
                     )
-
-                    lats = coord_data[f"/{g}/land_ice_segments/latitude"]
-                    lons = coord_data[f"/{g}/land_ice_segments/longitude"]
-
-                    if len(lats) == 0:
-                        continue
-
-                    # Morton index filtering
-                    midx18 = geo2mort(lats, lons, order=18)
-                    midx_parent = clip2order(parent_order, midx18)
-                    mask_spatial = midx_parent == parent_morton
-
-                    if np.sum(mask_spatial) == 0:
-                        continue
-
-                    # Get bounding indices for hyperslice read
-                    indices = np.where(mask_spatial)[0]
-                    min_idx = int(indices[0])
-                    max_idx = int(indices[-1]) + 1
-
-                    # Read only the bounding range using hyperslice
-                    data = h5obj.readDatasets(
-                        [
-                            {
-                                "dataset": f"/{g}/land_ice_segments/h_li",
-                                "hyperslice": [(min_idx, max_idx)],
-                            },
-                            {
-                                "dataset": f"/{g}/land_ice_segments/h_li_sigma",
-                                "hyperslice": [(min_idx, max_idx)],
-                            },
-                            {
-                                "dataset": f"/{g}/land_ice_segments/atl06_quality_summary",
-                                "hyperslice": [(min_idx, max_idx)],
-                            },
-                        ]
-                    )
-
-                    # Apply mask to the sliced data
-                    mask_sliced = mask_spatial[min_idx:max_idx]
-                    h_li = data[f"/{g}/land_ice_segments/h_li"][mask_sliced]
-                    s_li = data[f"/{g}/land_ice_segments/h_li_sigma"][mask_sliced]
-                    q_flag = data[f"/{g}/land_ice_segments/atl06_quality_summary"][mask_sliced]
-
-                    # Quality filtering
-                    quality_mask = q_flag == 0
-
-                    if np.sum(quality_mask) == 0:
-                        continue
-
-                    # Build dataframe with quality-filtered data
-                    midx_sliced = midx18[min_idx:max_idx][mask_sliced]
-                    data_dict = {
-                        "h_li": h_li[quality_mask],
-                        "s_li": s_li[quality_mask],
-                        "midx": midx_sliced[quality_mask],
-                    }
-                    all_dataframes.append(pd.DataFrame(data_dict))
-
+                    if df is not None:
+                        all_dataframes.append(df)
                 except Exception as e:
                     logger.debug(f"  Error reading track {g}: {e}")
                     continue
@@ -376,7 +449,7 @@ def process_morton_cell(
     df_out = df_out.assign(morton=children, cell_ids=child_cell_ids)
 
     duration = (datetime.now() - start_time).total_seconds()
-    logger.info(f"✓ Completed morton {parent_morton} in {duration:.1f}s")
+    logger.info(f"Completed morton {parent_morton} in {duration:.1f}s")
 
     metadata["cells_with_data"] = cells_with_data
     metadata["total_obs"] = int(stats_arrays["count"].sum())
