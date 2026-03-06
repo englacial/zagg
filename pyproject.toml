@@ -20,7 +20,7 @@ dependencies = [
     "numpy==2.2.6",
     "pandas==2.2.3",
     "h5coro==0.0.8",
-    "mortie",
+    "mortie>=0.6.3",
     "healpy",
     "earthaccess",
     "boto3",
@@ -31,11 +31,11 @@ dependencies = [
     "obstore>=0.8.2",
     "pandera",
     "pyproj",
+    "shapely",
 ]
 
 [project.optional-dependencies]
 lambda = [
-    "shapely",
     "cramjam",
     "astropy",
 ]

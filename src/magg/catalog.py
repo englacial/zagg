@@ -3,14 +3,14 @@
 Build a local granule catalog from CMR to avoid per-Lambda CMR queries.
 
 This script:
-1. Queries CMR ONCE for all ATL06 granules in a cycle, south of 60°S
-2. Extracts track geometry from each granule
-3. Converts geometry points to morton indices at the parent order
-4. Builds a mapping: parent_morton → [granule S3 URLs]
+1. Queries CMR ONCE for all ATL06 granules in a cycle, south of 60S
+2. Discovers parent morton cells via morton_coverage on Antarctic drainage basins
+3. Intersects cells with granule polygons via shapely STRtree
+4. Builds a mapping: parent_morton -> [granule S3 URLs]
 
 Usage:
-    python build_granule_catalog.py --cycle 22 --parent-order 6
-    python build_granule_catalog.py --cycle 22 --parent-order 6 --output catalog.json
+    python -m magg.catalog --cycle 22 --parent-order 6
+    python -m magg.catalog --cycle 22 --parent-order 6 --output catalog.json
 """
 
 import argparse
@@ -18,71 +18,80 @@ import json
 import logging
 import time
 from datetime import datetime, timedelta
-from typing import Dict, List, Set
+from importlib import resources
+from typing import Dict, List
 
 import numpy as np
 import requests
-from mortie import clip2order, geo2mort
+from mortie import morton_coverage
+from mortie.tools import mort2polygon
 
 logger = logging.getLogger(__name__)
 
+# Default path to Antarctic drainage basin polygon file (shipped with mortie tests)
+_BASIN_FILE = None
 
-def densify_polygon(lats: np.ndarray, lons: np.ndarray, max_spacing_km: float = 5.0) -> tuple:
+
+def _get_basin_file():
+    global _BASIN_FILE
+    if _BASIN_FILE is None:
+        import mortie.tests
+
+        _BASIN_FILE = str(
+            resources.files(mortie.tests) / "Ant_Grounded_DrainageSystem_Polygons.txt"
+        )
+    return _BASIN_FILE
+
+
+def load_antarctic_basins(filepath=None):
     """
-    Densify polygon by interpolating points between vertices in polar stereographic space.
-
-    At finer morton orders, sparse CMR polygon vertices miss cells that
-    the actual track passes through. This function projects to Antarctic
-    polar stereographic (EPSG:3031), interpolates linearly in XY, then projects back.
+    Load Antarctic drainage basin polygons.
 
     Parameters
     ----------
-    lats : np.ndarray
-        Latitude values of polygon vertices
-    lons : np.ndarray
-        Longitude values of polygon vertices
-    max_spacing_km : float
-        Maximum spacing between points in kilometers (default 5km)
+    filepath : str, optional
+        Path to basin polygon file. Defaults to the file shipped with mortie.
 
     Returns
     -------
-    tuple
-        (dense_lats, dense_lons) arrays with interpolated points
+    list of (lats, lons)
+        One (lats, lons) pair per basin, suitable for morton_coverage multipart input.
     """
-    from pyproj import Transformer
+    import pandas as pd
 
-    # EPSG:4326 (WGS84) <-> EPSG:3031 (Antarctic Polar Stereographic)
-    to_stereo = Transformer.from_crs("EPSG:4326", "EPSG:3031", always_xy=True)
-    to_latlon = Transformer.from_crs("EPSG:3031", "EPSG:4326", always_xy=True)
+    filepath = filepath or _get_basin_file()
+    df = pd.read_csv(filepath, names=["Lat", "Lon", "basin"], sep=r"\s+")
+    basins = []
+    for _, group in df.groupby("basin"):
+        basins.append((group["Lat"].values, group["Lon"].values))
+    return basins
 
-    # Project all vertices to stereo (lon, lat order for always_xy=True)
-    x_verts, y_verts = to_stereo.transform(lons, lats)
 
-    dense_lats = []
-    dense_lons = []
+def discover_cells(parent_order, basin_file=None):
+    """
+    Discover all morton cells at parent_order that cover Antarctica.
 
-    for i in range(len(lats)):
-        x1, y1 = x_verts[i], y_verts[i]
-        x2, y2 = x_verts[(i + 1) % len(lats)], y_verts[(i + 1) % len(lats)]
+    Uses mortie.morton_coverage on each of the 27 Antarctic drainage basins,
+    then unions the results.
 
-        # Distance in stereo space (meters)
-        dist_m = np.sqrt((x2 - x1) ** 2 + (y2 - y1) ** 2)
-        dist_km = dist_m / 1000.0
+    Parameters
+    ----------
+    parent_order : int
+        Morton order for parent cells (e.g., 6)
+    basin_file : str, optional
+        Path to basin polygon file
 
-        n_points = max(2, int(dist_km / max_spacing_km) + 1)
-
-        # Interpolate in stereo space
-        for j in range(n_points - 1):
-            t = j / (n_points - 1)
-            x_interp = x1 + t * (x2 - x1)
-            y_interp = y1 + t * (y2 - y1)
-
-            # Project back to lat/lon
-            lon_interp, lat_interp = to_latlon.transform(x_interp, y_interp)
-            dense_lats.append(lat_interp)
-            dense_lons.append(lon_interp)
-
-    return np.array(dense_lats), np.array(dense_lons)
+    Returns
+    -------
+    numpy.ndarray
+        Sorted array of unique morton indices at parent_order
+    """
+    basins = load_antarctic_basins(basin_file)
+    lats_parts = [b[0] for b in basins]
+    lons_parts = [b[1] for b in basins]
+    cells = morton_coverage(lats_parts, lons_parts, order=parent_order)
+    logger.info(f"Cell discovery: {len(cells)} cells at order {parent_order} from {len(basins)} basins")
+    return cells
 
 
 def query_cmr_antarctica(
@@ -104,7 +113,7 @@ def query_cmr_antarctica(
     provider : str
         CMR provider
     south_of : float
-        Southern latitude bound (default -60°)
+        Southern latitude bound (default -60)
     page_size : int
         Results per page
 
@@ -115,7 +124,6 @@ def query_cmr_antarctica(
     """
     cmr_url = "https://cmr.earthdata.nasa.gov/search/granules.umm_json"
 
-    # Calculate temporal bounds for cycle
     launch_date = datetime(2018, 10, 13)
     cycle_duration = 91
     cycle_start = launch_date + timedelta(days=(cycle - 1) * cycle_duration)
@@ -124,7 +132,6 @@ def query_cmr_antarctica(
         f"{cycle_start.strftime('%Y-%m-%d')}T00:00:00Z,{cycle_end.strftime('%Y-%m-%d')}T23:59:59Z"
     )
 
-    # Bounding box for Antarctica: whole globe longitude, south of cutoff
     bbox = f"-180,-90,180,{south_of}"
 
     params: Dict[str, str | int] = {
@@ -191,8 +198,6 @@ def extract_granule_info(granule: dict) -> dict:
     umm = granule.get("umm", {})
     granule_id = umm.get("GranuleUR", "")
 
-    # Parse RGT, cycle, region from granule ID
-    # Format: ATL06_20240107023115_02341901_007_01.h5
     parts = granule_id.split("_")
     rgt, cycle, region = None, None, None
     if len(parts) >= 3:
@@ -202,7 +207,6 @@ def extract_granule_info(granule: dict) -> dict:
             cycle = int(rgt_cycle_region[4:6])
             region = int(rgt_cycle_region[6:8])
 
-    # Get S3 URL
     related_urls = umm.get("RelatedUrls", [])
     s3_url = None
     for url_obj in related_urls:
@@ -211,7 +215,6 @@ def extract_granule_info(granule: dict) -> dict:
             s3_url = url
             break
 
-    # Get geometry points from GPolygons
     points = []
     spatial_extent = umm.get("SpatialExtent", {})
     horiz_spatial = spatial_extent.get("HorizontalSpatialDomain", {})
@@ -235,105 +238,20 @@ def extract_granule_info(granule: dict) -> dict:
     }
 
 
-def build_morton_catalog(
+def build_catalog(
     granules: List[dict],
     parent_order: int,
-    densify: bool = True,
-    densify_spacing_km: float = 5.0,
-) -> Dict[int, List[str]]:
-    """
-    Build a catalog mapping parent morton cells to granule S3 URLs.
-
-    For each granule:
-    1. Convert its geometry points to morton indices at order 18
-    2. Clip to parent_order
-    3. Get unique parent cells
-    4. Add granule URL to each parent cell's list
-
-    Parameters
-    ----------
-    granules : list
-        List of granule metadata from CMR
-    parent_order : int
-        Morton order for parent cells (e.g., 6 or 7)
-    densify : bool
-        If True, interpolate points along polygon edges to capture all cells
-        the track passes through (default True)
-    densify_spacing_km : float
-        Maximum spacing between interpolated points in km (default 5.0)
-
-    Returns
-    -------
-    dict
-        Mapping of parent_morton (int) → list of S3 URLs
-    """
-    catalog: Dict[int, Set[str]] = {}
-    granules_processed = 0
-    granules_with_geometry = 0
-
-    logger.info(f"Building morton catalog at order {parent_order}...")
-
-    for i, granule in enumerate(granules):
-        info = extract_granule_info(granule)
-
-        if not info["s3_url"]:
-            continue
-
-        if not info["points"]:
-            continue
-
-        granules_with_geometry += 1
-
-        # Convert points to morton indices
-        lats = np.array([p[0] for p in info["points"]])
-        lons = np.array([p[1] for p in info["points"]])
-
-        # Optionally densify polygon to capture all cells the track passes through
-        # At finer orders, sparse CMR vertices miss intermediate cells
-        if densify:
-            lats, lons = densify_polygon(lats, lons, max_spacing_km=densify_spacing_km)
-
-        # Get morton indices at order 18, then clip to parent order
-        morton_18 = geo2mort(lats, lons, order=18)
-        morton_parent = clip2order(parent_order, morton_18)
-
-        # Get unique parent cells this granule touches
-        unique_cells = set(int(m) for m in morton_parent)
-
-        # Add granule to each cell's list
-        for cell in unique_cells:
-            if cell not in catalog:
-                catalog[cell] = set()
-            catalog[cell].add(info["s3_url"])
-
-        granules_processed += 1
-
-        if (i + 1) % 500 == 0:
-            logger.info(
-                f"  Processed {i + 1}/{len(granules)} granules, {len(catalog)} cells..."
-            )
-
-    logger.info(f"Processed {granules_processed} granules with geometry")
-    logger.info(f"  Total unique parent cells: {len(catalog)}")
-
-    # Convert sets to lists for JSON serialization
-    return {k: list(v) for k, v in catalog.items()}
-
-
-def build_morton_catalog_polygon(
-    granules: List[dict],
-    parent_order: int,
+    basin_file: str = None,
 ) -> tuple:
     """
-    Build a granule catalog using exact polygon intersection tests.
+    Build a granule catalog using morton_coverage for cell discovery
+    and shapely STRtree for granule-to-cell intersection.
 
-    Instead of densifying CMR polygon edges, this function:
-    1. Discovers candidate cells from raw polygon vertices (no densification)
-    2. Gets each cell's polygon boundary via mort2polygon()
-    3. Tests which granule polygons intersect each cell using shapely STRtree
-
-    All geometry operations use EPSG:3031 (Antarctic Polar Stereographic) to
-    avoid antimeridian and pole singularity issues in shapely's Cartesian space.
+    Two passes:
+    1. Discover all parent cells covering Antarctica via morton_coverage
+       on the 27 Antarctic drainage basins.
+    2. Build granule polygons in EPSG:3031 and use STRtree to intersect
+       each cell with granule polygons.
 
     Parameters
     ----------
@@ -341,15 +259,16 @@ def build_morton_catalog_polygon(
         List of granule metadata from CMR
     parent_order : int
         Morton order for parent cells (e.g., 6)
+    basin_file : str, optional
+        Path to Antarctic drainage basin polygon file
 
     Returns
     -------
     catalog : dict
-        Mapping of parent_morton (int) → list of S3 URLs
+        Mapping of parent_morton (int) -> list of S3 URLs
     timings : dict
         Wall-clock seconds for each pipeline step
     """
-    from mortie.tools import mort2polygon
     from pyproj import Transformer
     from shapely import STRtree, make_valid
     from shapely.geometry import Polygon
@@ -359,10 +278,15 @@ def build_morton_catalog_polygon(
 
     to_stereo = Transformer.from_crs("EPSG:4326", "EPSG:3031", always_xy=True)
 
-    # --- Pass 1: Cell discovery + granule polygon creation ---
+    # --- Pass 1: Cell discovery via morton_coverage ---
     t0 = time.perf_counter()
-    all_cells: Set[int] = set()
-    granule_polys = []  # (index, s3_url, shapely Polygon in EPSG:3031)
+    all_cells = discover_cells(parent_order, basin_file)
+    timings["cell_discovery"] = time.perf_counter() - t0
+    logger.info(f"Pass 1: {len(all_cells)} cells from drainage basins")
+
+    # --- Build granule polygons in EPSG:3031 ---
+    t0 = time.perf_counter()
+    granule_polys = []
     granule_urls = []
 
     for granule in granules:
@@ -373,12 +297,6 @@ def build_morton_catalog_polygon(
         lats = np.array([p[0] for p in info["points"]])
         lons = np.array([p[1] for p in info["points"]])
 
-        # Vertex-based cell discovery (no densification)
-        morton_18 = geo2mort(lats, lons, order=18)
-        morton_parent = clip2order(parent_order, morton_18)
-        all_cells.update(int(m) for m in morton_parent)
-
-        # Project granule polygon to EPSG:3031
         x, y = to_stereo.transform(lons, lats)
         coords = list(zip(x, y))
         try:
@@ -393,22 +311,18 @@ def build_morton_catalog_polygon(
         granule_polys.append(poly)
         granule_urls.append(info["s3_url"])
 
-    timings["pass1_cell_discovery"] = time.perf_counter() - t0
-
-    initial_cells = np.array(sorted(all_cells))
-    logger.info(
-        f"Pass 1: {len(initial_cells)} cells from {len(granule_urls)} granules"
-    )
+    timings["granule_polygons"] = time.perf_counter() - t0
+    logger.info(f"Built {len(granule_polys)} granule polygons")
 
     # --- STRtree construction ---
     t0 = time.perf_counter()
     tree = STRtree(granule_polys)
     timings["strtree_construction"] = time.perf_counter() - t0
 
-    # --- Cell polygons via mort2polygon (step=32 for accurate polar cells) ---
+    # --- Cell polygons via mort2polygon ---
     t0 = time.perf_counter()
     cell_shapely = []
-    for cell_id in initial_cells:
+    for cell_id in all_cells:
         verts = mort2polygon(int(cell_id), step=32)
         lats_c = np.array([v[0] for v in verts])
         lons_c = np.array([v[1] for v in verts])
@@ -422,16 +336,14 @@ def build_morton_catalog_polygon(
     # --- STRtree queries ---
     t0 = time.perf_counter()
     catalog: Dict[int, List[str]] = {}
-    for i, cell_id in enumerate(initial_cells):
+    for i, cell_id in enumerate(all_cells):
         hits = tree.query(cell_shapely[i], predicate="intersects")
         if len(hits) > 0:
             catalog[int(cell_id)] = [granule_urls[j] for j in hits]
     timings["strtree_queries"] = time.perf_counter() - t0
 
     timings["total"] = time.perf_counter() - t_total
-    logger.info(
-        f"Pass 2: {len(catalog)} cells with granule mappings"
-    )
+    logger.info(f"Pass 2: {len(catalog)} cells with granule mappings")
 
     return catalog, timings
 
@@ -444,19 +356,15 @@ def main():
     parser.add_argument("--output", default=None, help="Output JSON file path")
     parser.add_argument("--south-of", type=float, default=-60.0, help="Southern latitude bound")
     parser.add_argument(
-        "--method",
-        choices=["densify", "polygon", "raw"],
-        default="densify",
-        help="Cell-to-granule mapping method (default: densify)",
-    )
-    parser.add_argument(
-        "--densify-spacing", type=float, default=5.0, help="Densification spacing in km (default 5)"
+        "--basin-file", default=None, help="Path to Antarctic drainage basin polygon file"
     )
     args = parser.parse_args()
 
+    logging.basicConfig(level=logging.INFO, format="%(message)s")
+
     start_time = time.time()
 
-    # Query CMR once
+    # Query CMR
     granules = query_cmr_antarctica(
         cycle=args.cycle,
         version=args.version,
@@ -467,20 +375,12 @@ def main():
         print("No granules found!")
         return
 
-    # Build morton catalog
-    if args.method == "polygon":
-        catalog, timings = build_morton_catalog_polygon(granules, args.parent_order)
-        print("\nPolygon intersection timings:")
-        for step, sec in timings.items():
-            print(f"  {step}: {sec:.3f}s")
-    else:
-        densify = args.method == "densify"
-        catalog = build_morton_catalog(
-            granules,
-            args.parent_order,
-            densify=densify,
-            densify_spacing_km=args.densify_spacing,
-        )
+    # Build catalog
+    catalog, timings = build_catalog(granules, args.parent_order, args.basin_file)
+
+    print("\nTimings:")
+    for step, sec in timings.items():
+        print(f"  {step}: {sec:.3f}s")
 
     # Summary stats
     granule_counts = [len(urls) for urls in catalog.values()]
@@ -499,13 +399,12 @@ def main():
             "parent_order": args.parent_order,
             "version": args.version,
             "south_of": args.south_of,
-            "method": args.method,
-            "densify_spacing_km": args.densify_spacing if args.method == "densify" else None,
+            "method": "morton_coverage",
             "total_granules": len(granules),
             "total_cells": len(catalog),
             "created": datetime.now().isoformat(),
         },
-        "catalog": {str(k): v for k, v in catalog.items()},  # JSON keys must be strings
+        "catalog": {str(k): v for k, v in catalog.items()},
     }
 
     with open(output_file, "w") as f:
