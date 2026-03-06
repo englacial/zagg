@@ -11,7 +11,7 @@ magg implements a serverless, scalable system for aggregating sparse ICESat-2 AT
 - **Serverless AWS Lambda processing** - Python 3.12 on ARM64 for cost efficiency
 - **Pre-computed granule catalogs** - Eliminates CMR query rate limiting
 - **Morton-based spatial indexing** - HEALPix nested scheme for hierarchical grids
-- **Massive parallelism** - Processes 1,872 Antarctic cells with 1,700+ concurrent workers
+- **Massive parallelism** - Tested with up to 1,700 concurrent workers
 - **Direct S3 access** - h5coro reads HDF5 without local downloads
 - **Cost-effective** - ~$12-15 per full Antarctica run
 
@@ -32,8 +32,7 @@ magg/
 │   └── data/              # Granule catalogs and results
 ├── notebooks/             # Analysis and visualization
 ├── docs/                  # Comprehensive documentation
-├── tests/                 # Test suite
-└── archive/               # Historical Dask prototype
+└── tests/                 # Test suite
 ```
 
 ## Quick Start
@@ -74,9 +73,9 @@ uv run jupyter notebook notebooks/visualize_production_results.ipynb
 
 ## Documentation
 
-- **[Architecture Overview](docs/ARCHITECTURE.md)** - Design philosophy and approach
-- **[Lambda Deployment](docs/LAMBDA.md)** - AWS setup and production use
-- **[ARM64 Build Guide](docs/LAMBDA_ARM64.md)** - Building Lambda layers for ARM64
+- **[Architecture Overview](docs/design/architecture.md)** - Design philosophy and approach
+- **[Lambda Deployment](docs/deployment/lambda.md)** - AWS setup and production use
+- **[ARM64 Build Guide](docs/deployment/arm64.md)** - Building Lambda layers for ARM64
 
 ## Development
 
@@ -103,8 +102,8 @@ bash deployment/aws/build_layer_v14.sh x86_64
 
 - **Execution time**: 2-3 minutes average per cell
 - **Memory**: 2048 MB configured, 1-1.5 GB typical usage
-- **Throughput**: 1,700 concurrent Lambda invocations
-- **Cost**: ~$0.006 per cell with ARM64
+- **Throughput**: Tested with up to 1,700 concurrent Lambda invocations
+- **Cost**: ~$0.006/cell (~$2 per full Antarctica run with ARM64)
 
 ## License
 

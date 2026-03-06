@@ -171,7 +171,7 @@ uv run python deployment/aws/invoke_lambda.py \
 
 **Per invocation** (180s average, 2 GB memory): ~$0.006
 
-**Full run** (1,872 cells): ~$12--15 including S3 and CloudWatch costs.
+**Full run** (~1,300 cells at order 6): ~$2 including S3 and CloudWatch costs.
 
 ## Troubleshooting
 
