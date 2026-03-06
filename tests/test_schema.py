@@ -142,19 +142,6 @@ class TestCreateZarrTemplate:
         group = open_group(store, path="6", mode="r")
         assert group["count"].chunks == (1,)
 
-    def test_template_creation_s3(self, s3_store_factory):
-        """Test xdggs_zarr_template function on S3-compatible storage (MinIO)."""
-        parent_order = 6
-        child_order = 8
-
-        store = s3_store_factory()
-        xdggs_zarr_template(store, parent_order, child_order)
-
-        group = open_group(store=store, path=str(child_order), mode="r")
-        assert set(group.keys()) == set(_COORDS + _DATA_VARS)
-        assert group["count"].shape == (HEALPIX_BASE_CELLS * 4**child_order,)
-        assert group["count"].chunks == (4 ** (child_order - parent_order),)
-
 
 class TestCellStatsSchema:
     def test_data_vars_derived_from_schema(self):

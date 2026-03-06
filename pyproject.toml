@@ -51,8 +51,6 @@ analysis = [
 ]
 test = [
     "pytest>=8.0",
-    "docker>=7.0",
-    "minio>=7.0",
 ]
 
 [build-system]

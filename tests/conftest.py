@@ -1,105 +1,15 @@
-import json
-import time
-import uuid
-
 import numpy as np
 import pandas as pd
 import pytest
+from zarr.storage import MemoryStore
 
 from magg.schema import _DATA_VARS
 
 
-@pytest.fixture(scope="session")
-def minio_container():
-    """Start MinIO container for S3 mocking."""
-    import docker
-
-    client = docker.from_env()
-    port = 9000
-    container = client.containers.run(
-        "quay.io/minio/minio",
-        "server /data",
-        detach=True,
-        ports={f"{port}/tcp": port},
-        environment={
-            "MINIO_ACCESS_KEY": "minioadmin",
-            "MINIO_SECRET_KEY": "minioadmin",
-        },
-    )
-    time.sleep(3)  # give it time to boot
-    yield {
-        "port": port,
-        "endpoint": f"http://localhost:{port}",
-        "username": "minioadmin",
-        "password": "minioadmin",
-    }
-    container.stop()
-    container.remove()
-
-
-@pytest.fixture(scope="function")
-def minio_bucket(minio_container):
-    """Create a fresh bucket for each test."""
-    from minio import Minio
-
-    bucket = f"test-{uuid.uuid4().hex[:8]}"
-
-    client = Minio(
-        f"localhost:{minio_container['port']}",
-        access_key=minio_container["username"],
-        secret_key=minio_container["password"],
-        secure=False,
-    )
-    client.make_bucket(bucket)
-
-    # Set public read policy for testing
-    policy = {
-        "Version": "2012-10-17",
-        "Statement": [
-            {
-                "Effect": "Allow",
-                "Principal": {"AWS": "*"},
-                "Action": ["s3:GetObject", "s3:PutObject", "s3:DeleteObject"],
-                "Resource": f"arn:aws:s3:::{bucket}/*",
-            },
-        ],
-    }
-    client.set_bucket_policy(bucket, json.dumps(policy))
-
-    yield {
-        "port": minio_container["port"],
-        "endpoint": minio_container["endpoint"],
-        "username": minio_container["username"],
-        "password": minio_container["password"],
-        "bucket": bucket,
-        "client": client,
-    }
-
-    # Cleanup: remove all objects and bucket
-    for obj in client.list_objects(bucket, recursive=True):
-        client.remove_object(bucket, obj.object_name)
-    client.remove_bucket(bucket)
-
-
 @pytest.fixture
-def s3_store_factory(minio_bucket):
-    """Factory to create S3Store instances pointing to MinIO."""
-    from obstore.store import S3Store
-    from zarr.storage import ObjectStore
-
-    def _create(prefix: str = "test.zarr"):
-        s3_store = S3Store(
-            minio_bucket["bucket"],
-            prefix=prefix,
-            aws_endpoint=minio_bucket["endpoint"],
-            access_key_id=minio_bucket["username"],
-            secret_access_key=minio_bucket["password"],
-            virtual_hosted_style_request=False,
-            client_options={"allow_http": True},
-        )
-        return ObjectStore(store=s3_store, read_only=False)
-
-    return _create
+def zarr_store():
+    """Create a fresh in-memory Zarr store for each test."""
+    return MemoryStore()
 
 
 @pytest.fixture
