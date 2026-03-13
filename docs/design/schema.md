@@ -2,69 +2,64 @@
 
 ## Single Source of Truth
 
-[`CellStatsSchema`][magg.schema.CellStatsSchema] is a [pandera](https://pandera.readthedocs.io/) `DataFrameModel` that serves as the single source of truth for:
+The YAML pipeline config (`configs/atl06.yaml`) is the single source of truth for:
 
 - **Column definitions and types** --- coordinate columns (`cell_ids`, `morton`) and data variables (`count`, `h_mean`, etc.)
-- **Aggregation recipes** --- each data variable's `pa.Field(metadata=...)` encodes the aggregation function, source column, and parameters
+- **Aggregation recipes** --- each data variable specifies a `function` (resolved via `resolve_function()`) or an `expression` (evaluated at runtime), plus `source` column and `params`
 - **Zarr array configuration** --- dtype and fill value per column, used by [`xdggs_spec`][magg.schema.xdggs_spec] to generate the Zarr template
 
-Coordinate and data variable column names are derived from the schema via `_fields_by_role()`, not hardcoded.
+Coordinate and data variable column names are derived from the config via `get_coords()` and `get_data_vars()`, not hardcoded.
 
-## Field Metadata
+## Aggregation Config
 
-Each field in `CellStatsSchema` carries metadata describing its role and behavior:
+Each variable in `aggregation.variables` carries metadata describing its behavior:
 
 | Key | Values | Description |
 |-----|--------|-------------|
-| `role` | `"coord"` or `"data_var"` | Whether the field is a coordinate or aggregated statistic |
-| `zarr_dtype` | e.g. `"float32"`, `"int32"` | Data type for the Zarr array |
-| `fill_value` | `0` or `"NaN"` | Fill value for unoccupied cells |
-| `agg` | e.g. `"nanmin"`, `"quantile"` | Aggregation function name (data_var only) |
+| `function` | e.g. `"min"`, `"average"`, `"quantile"` | Function resolved via `resolve_function()` (numpy shorthand or dotted path) |
+| `expression` | e.g. `"1.0 / np.sqrt(np.sum(1.0 / s_li**2))"` | Python expression evaluated with column arrays in namespace |
 | `source` | e.g. `"h_li"` | Input column from the raw observations |
-| `params` | e.g. `{"q": 0.25}` | Extra parameters for the aggregation function |
+| `params` | e.g. `{weights: s_li}`, `{q: 0.25}` | Extra parameters; string values referencing data_source variables are resolved to arrays |
+| `dtype` | e.g. `"float32"`, `"int32"` | Data type for the Zarr array |
+| `fill_value` | `0` or `"NaN"` | Fill value for unoccupied cells |
+
+`function` and `expression` are mutually exclusive.
 
 ## Aggregation Dispatch
 
-[`calculate_cell_statistics`][magg.processing.calculate_cell_statistics] is data-driven: it iterates the schema's aggregation metadata and dispatches to [`AGG_FUNCTIONS`][magg.processing.AGG_FUNCTIONS], a registry mapping function names to callables.
+[`calculate_cell_statistics`][magg.processing.calculate_cell_statistics] is config-driven: it iterates the aggregation variable metadata and dispatches via `resolve_function()` (for `function`-based fields) or `evaluate_expression()` (for `expression`-based fields).
 
-Available aggregation functions:
+Available aggregation functions (via numpy or dotted import paths):
 
 | Name | Description | Params |
 |------|-------------|--------|
-| `count` | Number of observations | --- |
-| `nanmin` | Minimum value | --- |
-| `nanmax` | Maximum value | --- |
-| `nanvar` | Variance | --- |
+| `len` / `count` | Number of observations | --- |
+| `min` | Minimum value | --- |
+| `max` | Maximum value | --- |
+| `var` | Variance | --- |
+| `average` | Weighted average | `weights`: weight column |
 | `quantile` | Quantile value | `q`: quantile (0--1) |
-| `weighted_mean` | Inverse-variance weighted mean | `weight_col`: uncertainty column |
-| `weighted_sigma` | Uncertainty of weighted mean | `weight_col`: uncertainty column |
 
 ## Extending the Schema
 
-To add a new output statistic:
+To add a new output statistic, add a variable entry to the YAML config:
 
-1. Add a field to `CellStatsSchema` with appropriate metadata:
+```yaml
+aggregation:
+  variables:
+    h_iqr:
+      expression: "float(np.quantile(h_li, 0.75) - np.quantile(h_li, 0.25))"
+      dtype: float32
+```
 
-    ```python
-    h_iqr: Series[np.float32] = pa.Field(
-        metadata={
-            "role": "data_var",
-            "zarr_dtype": "float32",
-            "fill_value": "NaN",
-            "agg": "iqr",           # new function name
-            "source": "h_li",
-            "params": {},
-        },
-    )
-    ```
+Or using a function:
 
-2. If the aggregation function doesn't exist yet, add it to `AGG_FUNCTIONS`:
-
-    ```python
-    AGG_FUNCTIONS["iqr"] = lambda values, **kw: float(
-        np.quantile(values, 0.75) - np.quantile(values, 0.25)
-    )
-    ```
+```yaml
+    h_median:
+      function: median
+      source: h_li
+      dtype: float32
+```
 
 Everything else --- the Zarr template, `calculate_cell_statistics`, and `process_morton_cell` --- adapts automatically.
 
@@ -75,7 +70,7 @@ Everything else --- the Zarr template, `calculate_cell_statistics`, and `process
 | `cell_ids` | uint64 | HEALPix cell ID at child order |
 | `morton` | int64 | Morton index at child order |
 | `count` | int32 | Number of observations |
-| `h_mean` | float32 | Inverse-variance weighted mean elevation |
+| `h_mean` | float32 | Weighted mean elevation |
 | `h_sigma` | float32 | Uncertainty of weighted mean |
 | `h_min`, `h_max` | float32 | Elevation range |
 | `h_variance` | float32 | Variance |
