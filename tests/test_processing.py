@@ -133,6 +133,41 @@ class TestDataSourceConfig:
         restored = DataSourceConfig.from_dict(d)
         assert restored.quality_filter is None
 
+    def test_validate_schema_passes_for_atl06(self):
+        ATL06_CONFIG.validate_schema()
+
+    def test_validate_schema_catches_missing_source(self):
+        cfg = DataSourceConfig(
+            groups=["g1"],
+            coordinates={"latitude": "/{group}/lat", "longitude": "/{group}/lon"},
+            variables={"h_li": "/{group}/h_li"},  # missing s_li
+        )
+        with pytest.raises(ValueError, match="s_li"):
+            cfg.validate_schema()
+
+    def test_validate_schema_passes_with_custom_fields(self):
+        cfg = DataSourceConfig(
+            groups=["g1"],
+            coordinates={"latitude": "/{group}/lat", "longitude": "/{group}/lon"},
+            variables={"slope": "/{group}/slope"},
+        )
+        custom_fields = {
+            "slope_min": {"agg": "nanmin", "source": "slope", "params": {}},
+        }
+        cfg.validate_schema(custom_fields)
+
+    def test_validate_schema_catches_missing_with_custom_fields(self):
+        cfg = DataSourceConfig(
+            groups=["g1"],
+            coordinates={"latitude": "/{group}/lat", "longitude": "/{group}/lon"},
+            variables={"slope": "/{group}/slope"},
+        )
+        custom_fields = {
+            "x_mean": {"agg": "nanmin", "source": "missing_col", "params": {}},
+        }
+        with pytest.raises(ValueError, match="missing_col"):
+            cfg.validate_schema(custom_fields)
+
     def test_group_template_substitution(self):
         path = ATL06_CONFIG.coordinates["latitude"].format(group="gt2r")
         assert path == "/gt2r/land_ice_segments/latitude"
