@@ -6,7 +6,6 @@ cloud platforms or local processing environments.
 """
 
 import logging
-from collections.abc import Callable
 from dataclasses import asdict, dataclass
 from datetime import datetime
 from typing import List, Tuple
@@ -17,7 +16,7 @@ import pandas as pd
 from zarr import config, open_array
 from zarr.abc.store import Store
 
-from magg.config import default_config, get_agg_fields, get_data_vars
+from magg.config import PipelineConfig, default_config, get_agg_fields, get_data_vars
 from magg.schema import ProcessingMetadata
 
 logger = logging.getLogger(__name__)
@@ -110,38 +109,6 @@ ATL06_CONFIG = DataSourceConfig(
 )
 
 
-# ---------------------------------------------------------------------------
-# Aggregation function registry
-# ---------------------------------------------------------------------------
-
-
-def _weighted_mean(values: np.ndarray, weights: np.ndarray) -> float:
-    """Inverse-variance weighted mean."""
-    w = 1.0 / (weights**2)
-    return float(np.sum(values * w) / np.sum(w))
-
-
-def _weighted_sigma(values: np.ndarray, weights: np.ndarray) -> float:
-    """Uncertainty of inverse-variance weighted mean."""
-    w = 1.0 / (weights**2)
-    return float(1.0 / np.sqrt(np.sum(w)))
-
-
-AGG_FUNCTIONS: dict[str, Callable] = {
-    "count": lambda values, **kw: len(values),
-    "nanmin": lambda values, **kw: float(np.min(values)),
-    "nanmax": lambda values, **kw: float(np.max(values)),
-    "nanvar": lambda values, **kw: float(np.var(values)),
-    "weighted_mean": lambda values, weight_col_values=None, **kw: _weighted_mean(
-        values, weight_col_values
-    ),
-    "weighted_sigma": lambda values, weight_col_values=None, **kw: _weighted_sigma(
-        values, weight_col_values
-    ),
-    "quantile": lambda values, q=0.5, **kw: float(np.quantile(values, q)),
-}
-
-
 def write_dataframe_to_zarr(
     df_out: pd.DataFrame,
     store: Store,
@@ -193,7 +160,12 @@ def write_dataframe_to_zarr(
     return store
 
 
-def calculate_cell_statistics(df_cell: pd.DataFrame, value_col="h_li", sigma_col="s_li") -> dict:
+def calculate_cell_statistics(
+    df_cell: pd.DataFrame,
+    value_col="h_li",
+    sigma_col="s_li",
+    config: PipelineConfig | None = None,
+) -> dict:
     """
     Calculate summary statistics for a cell, driven by pipeline config metadata.
 
@@ -205,6 +177,8 @@ def calculate_cell_statistics(df_cell: pd.DataFrame, value_col="h_li", sigma_col
         Column name for elevation values
     sigma_col : str
         Column name for uncertainty values
+    config : PipelineConfig, optional
+        Pipeline config to use for dispatch. Defaults to ``default_config()``.
 
     Returns
     -------
@@ -213,7 +187,9 @@ def calculate_cell_statistics(df_cell: pd.DataFrame, value_col="h_li", sigma_col
     """
     from magg.config import evaluate_expression, resolve_function
 
-    agg_fields = get_agg_fields(default_config())
+    if config is None:
+        config = default_config()
+    agg_fields = get_agg_fields(config)
 
     if len(df_cell) == 0:
         return {
@@ -335,6 +311,7 @@ def process_morton_cell(
     s3_credentials: dict,
     h5coro_driver=None,
     data_source: DataSourceConfig | None = None,
+    config: PipelineConfig | None = None,
 ) -> Tuple[pd.DataFrame, ProcessingMetadata]:
     """
     Process one parent morton cell: read data, calculate statistics, return DataFrame.
@@ -358,6 +335,8 @@ def process_morton_cell(
         h5coro driver class to use (e.g., s3driver.S3Driver). If None, auto-detect.
     data_source : DataSourceConfig, optional
         Configuration for reading HDF5 data. Defaults to ATL06_CONFIG.
+    config : PipelineConfig, optional
+        Pipeline config for aggregation dispatch. Defaults to ``default_config()``.
 
     Returns
     -------
@@ -371,6 +350,8 @@ def process_morton_cell(
         mort2healpix,
     )
 
+    if config is None:
+        config = default_config()
     if data_source is None:
         data_source = ATL06_CONFIG
     data_source.validate_schema()
@@ -467,9 +448,8 @@ def process_morton_cell(
     df_all["m12"] = clip2order(child_order, df_all["midx"].values)
 
     n_cells = len(children)
-    cfg = default_config()
-    data_vars = get_data_vars(cfg)
-    agg_fields = get_agg_fields(cfg)
+    data_vars = get_data_vars(config)
+    agg_fields = get_agg_fields(config)
     stats_arrays = {}
     for name in data_vars:
         meta = agg_fields[name]
@@ -485,7 +465,7 @@ def process_morton_cell(
         df_cell = df_all[df_all["m12"] == child_morton]
         if len(df_cell) > 0:
             cells_with_data += 1
-        stats = calculate_cell_statistics(df_cell, value_col="h_li", sigma_col="s_li")
+        stats = calculate_cell_statistics(df_cell, value_col="h_li", sigma_col="s_li", config=config)
         for key, value in stats.items():
             stats_arrays[key][i] = value
 

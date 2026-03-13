@@ -13,6 +13,7 @@ extra:
 nav:
   - "index.md"
   - "API":
+      - Config: "api/config.md"
       - Schema: "api/schema.md"
       - Processing: "api/processing.md"
       - Catalog: "api/catalog.md"
