@@ -148,7 +148,7 @@ Target coverage: ~1,300 cells covering Antarctic grounded ice drainage basins (e
 │ │  │  │   h_min      → np.min(h_li)                   │   │
 │ │  │  │   h_max      → np.max(h_li)                   │   │
 │ │  │  │   h_variance → np.var(h_li)                   │   │
-│ │  │  │   h_mean     → np.average(h_li, weights=s_li) │   │
+│ │  │  │   h_mean     → np.average(h_li, w=1/s_li²)   │   │
 │ │  │  │   h_sigma    → expression-based               │   │
 │ │  │  │   quantile   → np.quantile(h_li, q)          │   │
 │ │  │  │               for q ∈ {0.25, 0.50, 0.75}     │   │
@@ -202,31 +202,34 @@ Target coverage: ~1,300 cells covering Antarctic grounded ice drainage basins (e
 ## Module Dependency Graph
 
 ```
-              ┌──────────────┐
-              │  schema.py   │  Single source of truth
-              │              │  CellStatsSchema, xdggs_zarr_template
-              └──────┬───────┘
+              ┌──────────────────┐
+              │  config.py       │  Single source of truth
+              │                  │  PipelineConfig, load_config,
+              │                  │  validate_config
+              └──────┬───────────┘
                      │
           ┌──────────┼──────────┐
           │          │          │
           ▼          ▼          ▼
   ┌──────────┐ ┌──────────┐ ┌───────────────────┐
-  │ auth.py  │ │processing│ │ catalog.py        │
+  │schema.py │ │processing│ │ catalog.py        │
   │          │ │  .py     │ │                   │
-  │ S3 creds │ │ config+  │ │ CMR query,        │
-  │          │ │ read/agg │ │ morton mapping     │
-  │          │ │ write    │ │                   │
-  └────┬─────┘ └────┬─────┘ └─────────┬─────────┘
-       │             │                 │
-       └──────┬──────┘                 │
-              │                        │
-              ▼                        │
-  ┌───────────────────────┐            │
-  │ lambda_handler.py     │            │
-  │ (AWS-specific wrapper)│            │
-  └───────────┬───────────┘            │
-              │                        │
-              ▼                        ▼
+  │ xdggs_   │ │ read/agg │ │ CMR query,        │
+  │ spec,    │ │ write    │ │ morton mapping     │
+  │ xdggs_   │ │          │ │                   │
+  │ zarr_    │ └────┬─────┘ └─────────┬─────────┘
+  │ template │      │                 │
+  └────┬─────┘      │                 │
+       │            │                 │
+       └──────┬─────┘                 │
+              │                       │
+              ▼                       │
+  ┌───────────────────────┐           │
+  │ lambda_handler.py     │           │
+  │ (AWS-specific wrapper)│           │
+  └───────────┬───────────┘           │
+              │                       │
+              ▼                       ▼
   ┌────────────────────────────────────────┐
   │ invoke_lambda.py                       │
   │ (orchestrator: catalog + auth +        │

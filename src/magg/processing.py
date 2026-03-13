@@ -130,7 +130,7 @@ def write_dataframe_to_zarr(
     Parameters
     ----------
     df_out : pd.DataFrame
-        DataFrame with columns matching CellStatsSchema
+        DataFrame with columns matching the pipeline config (coordinates + data variables)
     store : Store
         Zarr-compatible store (already contains template)
     chunk_idx : int

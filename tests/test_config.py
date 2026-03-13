@@ -283,6 +283,20 @@ def _dispatch_config_stat(name, meta, df):
 
 
 class TestEquivalence:
+    def test_expression_in_params(self, synthetic_df):
+        """Param value '1.0 / s_li**2' is evaluated as an expression, not a column name."""
+        meta = {
+            "function": "average",
+            "source": "h_li",
+            "params": {"weights": "1.0 / s_li**2"},
+        }
+        result = _dispatch_config_stat("h_weighted", meta, synthetic_df)
+        expected = np.average(
+            synthetic_df["h_li"].values,
+            weights=1.0 / synthetic_df["s_li"].values ** 2,
+        )
+        assert result == pytest.approx(expected, rel=1e-5)
+
     def test_config_matches_calculate_cell_statistics(self, atl06_config, synthetic_df):
         expected = calculate_cell_statistics(synthetic_df)
         agg_fields = get_agg_fields(atl06_config)
