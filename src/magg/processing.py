@@ -51,6 +51,38 @@ class DataSourceConfig:
     variables: dict[str, str]
     quality_filter: dict | None = None
 
+    def validate_schema(self, agg_fields: dict | None = None) -> None:
+        """Validate that schema aggregation fields reference columns this config provides.
+
+        Parameters
+        ----------
+        agg_fields : dict, optional
+            Schema aggregation fields (from ``_agg_fields()``). If None, reads
+            from the live ``CellStatsSchema``.
+
+        Raises
+        ------
+        ValueError
+            If any ``source`` or ``weight_col`` in the schema is not in
+            ``self.variables``.
+        """
+        if agg_fields is None:
+            agg_fields = _agg_fields()
+        available = set(self.variables.keys())
+        missing = set()
+        for name, meta in agg_fields.items():
+            source = meta.get("source")
+            if source is not None and source not in available:
+                missing.add(source)
+            weight_col = meta.get("params", {}).get("weight_col")
+            if weight_col is not None and weight_col not in available:
+                missing.add(weight_col)
+        if missing:
+            raise ValueError(
+                f"Schema references columns {missing} not provided by "
+                f"DataSourceConfig (available: {available})"
+            )
+
     def to_dict(self) -> dict:
         """Serialize to a JSON-compatible dict (for Lambda payloads)."""
         return asdict(self)
@@ -327,6 +359,7 @@ def process_morton_cell(
 
     if data_source is None:
         data_source = ATL06_CONFIG
+    data_source.validate_schema()
 
     logger.info(f"Processing morton cell: {parent_morton}")
     start_time = datetime.now()
