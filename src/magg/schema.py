@@ -1,166 +1,13 @@
-import numpy as np
-import pandera.pandas as pa
-from pandera.typing import Series
+from __future__ import annotations
+
 from pydantic_zarr.experimental.v3 import ArraySpec, GroupSpec, NamedConfig
 from typing_extensions import TypedDict
-from zarr import config
+from zarr import config as zarr_config
 from zarr.abc.store import Store
 
+from magg.config import PipelineConfig, default_config, get_agg_fields
+
 HEALPIX_BASE_CELLS: int = 12  # Number of base cells in HEALPix tessellation
-
-
-class CellStatsSchema(pa.DataFrameModel):
-    """Pandera schema for cell-level aggregation output.
-
-    Each field's metadata encodes its role (coord vs data_var), Zarr dtype/fill_value,
-    and for data variables, the aggregation function and parameters.
-    """
-
-    # Coordinate columns
-    cell_ids: Series[np.uint64] = pa.Field(
-        metadata={"role": "coord", "zarr_dtype": "uint64", "fill_value": 0},
-    )
-    """Cell identifier"""
-
-    morton: Series[np.int64] = pa.Field(
-        metadata={"role": "coord", "zarr_dtype": "int64", "fill_value": 0},
-    )
-    """Morton code"""
-
-    # Aggregation variables
-    count: Series[np.int32] = pa.Field(
-        metadata={
-            "role": "data_var",
-            "zarr_dtype": "int32",
-            "fill_value": 0,
-            "agg": "count",
-            "source": None,
-            "params": {},
-        },
-    )
-    """Number of aggregated values"""
-
-    h_min: Series[np.float32] = pa.Field(
-        metadata={
-            "role": "data_var",
-            "zarr_dtype": "float32",
-            "fill_value": "NaN",
-            "agg": "nanmin",
-            "source": "h_li",
-            "params": {},
-        },
-    )
-    """Minimum value"""
-
-    h_max: Series[np.float32] = pa.Field(
-        metadata={
-            "role": "data_var",
-            "zarr_dtype": "float32",
-            "fill_value": "NaN",
-            "agg": "nanmax",
-            "source": "h_li",
-            "params": {},
-        },
-    )
-    """Maximum value"""
-
-    h_mean: Series[np.float32] = pa.Field(
-        metadata={
-            "role": "data_var",
-            "zarr_dtype": "float32",
-            "fill_value": "NaN",
-            "agg": "weighted_mean",
-            "source": "h_li",
-            "params": {"weight_col": "s_li"},
-        },
-    )
-    """Mean value"""
-
-    h_sigma: Series[np.float32] = pa.Field(
-        metadata={
-            "role": "data_var",
-            "zarr_dtype": "float32",
-            "fill_value": "NaN",
-            "agg": "weighted_sigma",
-            "source": "h_li",
-            "params": {"weight_col": "s_li"},
-        },
-    )
-    """Weighted sigma"""
-
-    h_variance: Series[np.float32] = pa.Field(
-        metadata={
-            "role": "data_var",
-            "zarr_dtype": "float32",
-            "fill_value": "NaN",
-            "agg": "nanvar",
-            "source": "h_li",
-            "params": {},
-        },
-    )
-    """Variance"""
-
-    h_q25: Series[np.float32] = pa.Field(
-        metadata={
-            "role": "data_var",
-            "zarr_dtype": "float32",
-            "fill_value": "NaN",
-            "agg": "quantile",
-            "source": "h_li",
-            "params": {"q": 0.25},
-        },
-    )
-    """25th percentile"""
-
-    h_q50: Series[np.float32] = pa.Field(
-        metadata={
-            "role": "data_var",
-            "zarr_dtype": "float32",
-            "fill_value": "NaN",
-            "agg": "quantile",
-            "source": "h_li",
-            "params": {"q": 0.50},
-        },
-    )
-    """50th percentile"""
-
-    h_q75: Series[np.float32] = pa.Field(
-        metadata={
-            "role": "data_var",
-            "zarr_dtype": "float32",
-            "fill_value": "NaN",
-            "agg": "quantile",
-            "source": "h_li",
-            "params": {"q": 0.75},
-        },
-    )
-    """75th percentile"""
-
-
-# ---------------------------------------------------------------------------
-# Schema metadata extraction helpers
-# ---------------------------------------------------------------------------
-
-
-def _get_schema_fields() -> dict[str, dict]:
-    """Extract column metadata from CellStatsSchema."""
-    schema = CellStatsSchema.to_schema()
-    return {name: col.metadata or {} for name, col in schema.columns.items()}
-
-
-def _fields_by_role(role: str) -> list[str]:
-    """Return column names with the given role."""
-    return [name for name, meta in _get_schema_fields().items() if meta.get("role") == role]
-
-
-def _agg_fields() -> dict[str, dict]:
-    """Return only fields that have an aggregation function defined."""
-    return {name: meta for name, meta in _get_schema_fields().items() if meta.get("agg")}
-
-
-# Derived from CellStatsSchema — internal convenience aliases
-_COORDS: list[str] = _fields_by_role("coord")
-_DATA_VARS: list[str] = _fields_by_role("data_var")
 
 
 class ProcessingMetadata(TypedDict):
@@ -176,9 +23,10 @@ class ProcessingMetadata(TypedDict):
 def xdggs_spec(
     parent_order: int,
     child_order: int,
+    config: PipelineConfig | None = None,
 ) -> GroupSpec:
     """
-    Create a [pydantic_zarr.experimental.v3.GroupSpec]() for ATL06 aggregation data using HEALPix/Morton indexing.
+    Create a [pydantic_zarr.experimental.v3.GroupSpec]() for aggregation data using HEALPix/Morton indexing.
 
     Parameters
     ----------
@@ -186,6 +34,8 @@ def xdggs_spec(
         HEALPix order of parent morton cells
     child_order : int
         HEALPix order of child morton cells (must be >= parent_order)
+    config : PipelineConfig or None
+        Pipeline configuration. Falls back to ``default_config("atl06")``.
 
     Returns
     -------
@@ -200,11 +50,13 @@ def xdggs_spec(
     if child_order < parent_order:
         raise ValueError(f"child_order ({child_order}) must be >= parent_order ({parent_order})")
 
+    if config is None:
+        config = default_config("atl06")
+
     level_diff = child_order - parent_order
     n_children = 4**level_diff
     n_pixels = HEALPIX_BASE_CELLS * 4**child_order
 
-    # Base configuration for all arrays
     base_array_spec = ArraySpec(
         attributes={},
         shape=(n_pixels,),
@@ -217,13 +69,16 @@ def xdggs_spec(
         fill_value="NaN",
     )
 
-    # Build members from schema metadata
-    schema_fields = _get_schema_fields()
     members = {}
-    for col_name, meta in schema_fields.items():
-        zarr_dtype = meta.get("zarr_dtype", "float32")
-        fill_value = meta.get("fill_value", "NaN")
-        members[col_name] = base_array_spec.with_data_type(zarr_dtype).with_fill_value(fill_value)
+    for coord_name, coord_meta in config.aggregation.get("coordinates", {}).items():
+        zarr_dtype = coord_meta.get("dtype", "float32")
+        fill_value = coord_meta.get("fill_value", "NaN")
+        members[coord_name] = base_array_spec.with_data_type(zarr_dtype).with_fill_value(fill_value)
+
+    for var_name, var_meta in get_agg_fields(config).items():
+        zarr_dtype = var_meta.get("dtype", "float32")
+        fill_value = var_meta.get("fill_value", "NaN")
+        members[var_name] = base_array_spec.with_data_type(zarr_dtype).with_fill_value(fill_value)
 
     dggs_attrs = {
         "zarr_conventions": [
@@ -250,7 +105,6 @@ def xdggs_spec(
         },
     }
 
-    # Create and write group specification
     return GroupSpec(members=members, attributes=dggs_attrs)
 
 
@@ -260,31 +114,33 @@ def xdggs_zarr_template(
     child_order: int,
     n_parent_cells: int | None = None,
     overwrite: bool = False,
+    config: PipelineConfig | None = None,
 ) -> Store:
     """
     Create a Zarr template for data aggregation data using HEALPix/Morton indexing.
-
-    Overwrites an existing Zarr store if it already exists.
 
     Parameters
     ----------
     store : Store
         Zarr-compatible store (from zarr.abc.store)
     parent_order : int
-        HEALPix order of parent morton cells (must be >= parent_order)
+        HEALPix order of parent morton cells
     child_order : int
         HEALPix order of child morton cells (must be >= parent_order)
-    n_parent_cells: int
+    n_parent_cells : int
         Number of parent cells containing data
-    overwrite: bool
-        Whether to overwrite an existing array or group at the path. If overwrite is False and an array or group already exists at the path, an exception will be raised. Defaults to False.
+    overwrite : bool
+        Whether to overwrite an existing array or group at the path.
+        Defaults to False.
+    config : PipelineConfig or None
+        Pipeline configuration. Falls back to ``default_config("atl06")``.
 
     Returns
     -------
     Store
         The same store, with template written to path '{child_order}/'
     """
-    spec = xdggs_spec(parent_order=parent_order, child_order=child_order)
+    spec = xdggs_spec(parent_order=parent_order, child_order=child_order, config=config)
     if n_parent_cells is not None and n_parent_cells <= 0:
         raise ValueError(f"n_parent_cells must be positive, got {n_parent_cells}")
     if n_parent_cells:
@@ -296,14 +152,13 @@ def xdggs_zarr_template(
         }
         spec = spec.with_members(members)
 
-    with config.set({"async.concurrency": 128}):
+    with zarr_config.set({"async.concurrency": 128}):
         spec.to_zarr(store, str(child_order), overwrite=overwrite)
 
     return store
 
 
 __all__ = [
-    "CellStatsSchema",
     "ProcessingMetadata",
     "xdggs_zarr_template",
     "xdggs_spec",

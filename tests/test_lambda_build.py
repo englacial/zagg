@@ -40,7 +40,7 @@ class TestLambdaImports:
 
     def test_magg_schema_imports(self):
         """magg.schema imports used transitively must resolve."""
-        from magg.schema import CellStatsSchema, xdggs_spec, xdggs_zarr_template  # noqa: F401
+        from magg.schema import xdggs_spec, xdggs_zarr_template  # noqa: F401
 
     def test_zarr_codecs_available(self):
         """Zarr codecs (numcodecs/blosc) must be importable for data writing."""
@@ -50,9 +50,9 @@ class TestLambdaImports:
         """pydantic-zarr is needed for Zarr template creation."""
         import pydantic_zarr  # noqa: F401
 
-    def test_pandera_available(self):
-        """pandera is needed for schema validation."""
-        import pandera  # noqa: F401
+    def test_pyyaml_available(self):
+        """pyyaml is needed for config loading."""
+        import yaml  # noqa: F401
 
     def test_h5coro_available(self):
         """h5coro is needed for reading HDF5 from S3."""

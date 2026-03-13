@@ -3,7 +3,7 @@ import pandas as pd
 import pytest
 from zarr.storage import MemoryStore
 
-from magg.schema import _DATA_VARS
+from magg.config import default_config, get_data_vars
 
 
 @pytest.fixture
@@ -17,6 +17,8 @@ def mock_dataframe_factory():
     """Factory to create mock DataFrames matching process_morton_cell output."""
     from mortie import generate_morton_children, geo2mort, mort2healpix
 
+    data_vars = get_data_vars(default_config())
+
     def _create(lat: float, lon: float, parent_order: int, child_order: int) -> pd.DataFrame:
         parent_morton = geo2mort(lat, lon, order=parent_order)
 
@@ -25,7 +27,7 @@ def mock_dataframe_factory():
         n = len(children)
 
         df = pd.DataFrame({"morton": children, "cell_ids": cell_ids}).assign(
-            **{var: np.random.randn(n).astype(np.float32) for var in _DATA_VARS if var != "count"}
+            **{var: np.random.randn(n).astype(np.float32) for var in data_vars if var != "count"}
         )
         df = df.assign(count=np.random.randn(n).astype(np.int32))
         return df

@@ -287,23 +287,6 @@ class TestEquivalence:
             config_val = _dispatch_config_stat(name, meta, synthetic_df)
             exp_val = expected[name]
 
-            if name == "h_mean":
-                # Config uses np.average(h_li, weights=s_li) (sigma-weighted),
-                # while current code uses inverse-variance (1/sigma^2) weighting.
-                # Verify each independently; they are intentionally different
-                # weighting schemes since the YAML config uses standard numpy.
-                w_inv_var = 1.0 / synthetic_df["s_li"].values ** 2
-                expected_inv_var = float(
-                    np.average(synthetic_df["h_li"].values, weights=w_inv_var)
-                )
-                assert exp_val == pytest.approx(expected_inv_var, rel=1e-5)
-                # Config-driven value should be np.average with raw sigma weights
-                expected_sigma_wt = float(
-                    np.average(synthetic_df["h_li"].values, weights=synthetic_df["s_li"].values)
-                )
-                assert config_val == pytest.approx(expected_sigma_wt, rel=1e-5)
-                continue
-
             assert config_val == pytest.approx(exp_val, rel=1e-5), (
                 f"Mismatch for '{name}': config={config_val}, expected={exp_val}"
             )

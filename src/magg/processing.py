@@ -17,7 +17,8 @@ import pandas as pd
 from zarr import config, open_array
 from zarr.abc.store import Store
 
-from magg.schema import _DATA_VARS, ProcessingMetadata, _agg_fields, _get_schema_fields
+from magg.config import default_config, get_agg_fields, get_data_vars
+from magg.schema import ProcessingMetadata
 
 logger = logging.getLogger(__name__)
 
@@ -57,26 +58,25 @@ class DataSourceConfig:
         Parameters
         ----------
         agg_fields : dict, optional
-            Schema aggregation fields (from ``_agg_fields()``). If None, reads
-            from the live ``CellStatsSchema``.
+            Schema aggregation fields. If None, reads from default config.
 
         Raises
         ------
         ValueError
-            If any ``source`` or ``weight_col`` in the schema is not in
+            If any ``source`` or param column reference is not in
             ``self.variables``.
         """
         if agg_fields is None:
-            agg_fields = _agg_fields()
+            agg_fields = get_agg_fields(default_config())
         available = set(self.variables.keys())
         missing = set()
         for name, meta in agg_fields.items():
             source = meta.get("source")
             if source is not None and source not in available:
                 missing.add(source)
-            weight_col = meta.get("params", {}).get("weight_col")
-            if weight_col is not None and weight_col not in available:
-                missing.add(weight_col)
+            for pval in meta.get("params", {}).values():
+                if isinstance(pval, str) and pval not in available:
+                    missing.add(pval)
         if missing:
             raise ValueError(
                 f"Schema references columns {missing} not provided by "
@@ -195,7 +195,7 @@ def write_dataframe_to_zarr(
 
 def calculate_cell_statistics(df_cell: pd.DataFrame, value_col="h_li", sigma_col="s_li") -> dict:
     """
-    Calculate summary statistics for a cell, driven by CellStatsSchema metadata.
+    Calculate summary statistics for a cell, driven by pipeline config metadata.
 
     Parameters
     ----------
@@ -209,34 +209,48 @@ def calculate_cell_statistics(df_cell: pd.DataFrame, value_col="h_li", sigma_col
     Returns
     -------
     dict
-        Dictionary of statistics with keys matching _DATA_VARS
+        Dictionary of statistics keyed by aggregation variable name
     """
-    agg_fields = _agg_fields()
+    from magg.config import evaluate_expression, resolve_function
+
+    agg_fields = get_agg_fields(default_config())
 
     if len(df_cell) == 0:
         return {
-            name: (0 if meta["agg"] == "count" else np.nan) for name, meta in agg_fields.items()
+            name: (0 if meta.get("function") in ("len", "count") else np.nan)
+            for name, meta in agg_fields.items()
         }
 
     result = {}
     for name, meta in agg_fields.items():
-        agg_name = meta["agg"]
+        func_name = meta.get("function")
+        expression = meta.get("expression")
         source = meta.get("source") or value_col
         params = dict(meta.get("params", {}))
 
+        # Expression-based aggregation (e.g. h_sigma)
+        if expression:
+            columns = {col: df_cell[col].values for col in df_cell.columns}
+            result[name] = evaluate_expression(expression, columns)
+            continue
+
         values = df_cell[source].values
 
-        if agg_name == "count":
+        # Count via len
+        if func_name in ("len", "count"):
             result[name] = len(df_cell)
             continue
 
-        # Resolve weight column if needed
-        weight_col = params.pop("weight_col", None)
-        if weight_col is not None:
-            params["weight_col_values"] = df_cell[weight_col].values
+        # Resolve column references in params (e.g. weights: s_li -> array)
+        resolved_params = {}
+        for pkey, pval in params.items():
+            if isinstance(pval, str) and pval in df_cell.columns:
+                resolved_params[pkey] = df_cell[pval].values
+            else:
+                resolved_params[pkey] = pval
 
-        func = AGG_FUNCTIONS[agg_name]
-        result[name] = func(values, **params)
+        func = resolve_function(func_name)
+        result[name] = float(func(values, **resolved_params))
 
     return result
 
@@ -453,11 +467,13 @@ def process_morton_cell(
     df_all["m12"] = clip2order(child_order, df_all["midx"].values)
 
     n_cells = len(children)
-    schema_fields = _get_schema_fields()
+    cfg = default_config()
+    data_vars = get_data_vars(cfg)
+    agg_fields = get_agg_fields(cfg)
     stats_arrays = {}
-    for name in _DATA_VARS:
-        meta = schema_fields[name]
-        zarr_dtype = np.dtype(meta.get("zarr_dtype", "float32"))
+    for name in data_vars:
+        meta = agg_fields[name]
+        zarr_dtype = np.dtype(meta.get("dtype", "float32"))
         fill_value = meta.get("fill_value", "NaN")
         if fill_value == "NaN":
             stats_arrays[name] = np.full(n_cells, np.nan, dtype=zarr_dtype)
@@ -478,7 +494,7 @@ def process_morton_cell(
     # Create output DataFrame
     child_cell_ids, _ = mort2healpix(children)
 
-    df_out = pd.DataFrame({var: stats_arrays[var] for var in _DATA_VARS})
+    df_out = pd.DataFrame({var: stats_arrays[var] for var in data_vars})
     df_out = df_out.assign(morton=children, cell_ids=child_cell_ids)
 
     duration = (datetime.now() - start_time).total_seconds()
