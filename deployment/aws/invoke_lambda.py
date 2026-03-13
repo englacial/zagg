@@ -15,6 +15,9 @@ Usage:
     # Process a specific morton cell:
     python deployment/aws/invoke_lambda.py --catalog deployment/data/catalogs/granule_catalog_cycle22_order6.json --morton-cell -4211322
 
+    # Use a custom pipeline config:
+    python deployment/aws/invoke_lambda.py --catalog deployment/data/catalogs/granule_catalog_cycle22_order6.json --config my_config.yaml
+
     # Optimize parallel execution by processing cells with the most granules first:
     python deployment/aws/invoke_lambda.py --catalog deployment/data/catalogs/granule_catalog_cycle22_order6.json --sort-by-granules
 """
@@ -33,6 +36,7 @@ from zarr import consolidate_metadata
 from zarr.storage import ObjectStore
 
 from magg.auth import get_nsidc_s3_credentials
+from magg.config import default_config, load_config
 from magg.schema import xdggs_zarr_template
 
 # Lambda pricing (us-west-2)
@@ -99,6 +103,7 @@ def invoke_lambda(
     s3_credentials: dict,
     function_name: str = "process-morton-cell",
     max_retries: int = 3,
+    config_dict: dict = None,
 ) -> dict:
     """Invoke Lambda and return result with timing. Retries on throttling."""
     wall_start = time.time()
@@ -117,6 +122,8 @@ def invoke_lambda(
             "sessionToken": s3_credentials["sessionToken"],
         },
     }
+    if config_dict is not None:
+        event["config"] = config_dict
 
     last_error = None
     for attempt in range(max_retries):
@@ -319,6 +326,11 @@ def main():
         help="Overwrite existing Zarr template if it exists",
     )
     parser.add_argument(
+        "--config",
+        default=None,
+        help="Path to pipeline config YAML (default: built-in atl06.yaml)",
+    )
+    parser.add_argument(
         "--region",
         default="us-west-2",
         help="AWS region (default: us-west-2)",
@@ -351,6 +363,13 @@ def main():
     print(f"      Total cells in catalog: {metadata['total_cells']}")
     print(f"      Total granules: {metadata['total_granules']}")
 
+    # Load pipeline config
+    if args.config:
+        print(f"\n      Loading pipeline config from {args.config}...")
+        config = load_config(args.config)
+    else:
+        config = default_config()
+
     # Select cells to process
     all_cells = list(catalog.keys())
     cells, cell_to_idx = select_cells_to_process(
@@ -382,6 +401,7 @@ def main():
         child_order,
         overwrite=args.overwrite_template,
         n_parent_cells=metadata["total_cells"],
+        config=config,
     )
 
     # Step 4: Invoke Lambdas in parallel
@@ -412,6 +432,11 @@ def main():
     total_obs = 0
     total_lambda_time = 0.0
 
+    # Serialize config to dict for Lambda event payload
+    from dataclasses import asdict
+
+    config_dict = asdict(config)
+
     start_time = time.time()
     with ThreadPoolExecutor(max_workers=args.max_workers) as executor:
         futures = {
@@ -426,6 +451,7 @@ def main():
                 args.s3_bucket,
                 args.s3_prefix,
                 s3_creds,
+                config_dict=config_dict,
             ): cell
             for cell in cells
         }

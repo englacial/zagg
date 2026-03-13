@@ -144,16 +144,19 @@ def validate_config(config: PipelineConfig) -> None:
         if has_func:
             resolve_function(meta["function"])  # raises ValueError on failure
 
-        # Validate params column references (e.g. weights: s_li)
+        # Validate params: bare column names, numeric literals, or expressions
         for pval in meta.get("params", {}).values():
-            if isinstance(pval, str) and pval in config.data_source.get("variables", {}):
-                pass  # valid column reference
-            elif isinstance(pval, str) and pval not in config.data_source.get("variables", {}) and not _is_numeric(pval):
-                # Check if it looks like a column reference (not a number)
-                raise ValueError(
-                    f"Variable '{name}': param value '{pval}' references "
-                    f"unknown column (available: {ds_vars})"
-                )
+            if not isinstance(pval, str):
+                continue  # numeric literal
+            if pval in ds_vars or _is_numeric(pval):
+                continue  # column reference or number
+            # Expression containing column names (e.g. "1.0 / s_li**2")
+            if any(v in pval for v in ds_vars):
+                continue
+            raise ValueError(
+                f"Variable '{name}': param value '{pval}' references "
+                f"unknown column (available: {ds_vars})"
+            )
 
         # Validate expression column references
         if has_expr:

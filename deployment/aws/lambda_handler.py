@@ -16,7 +16,8 @@ Event payload:
         "accessKeyId": str,
         "secretAccessKey": str,
         "sessionToken": str
-    }
+    },
+    "config": dict (optional, pipeline config as dict)
 }
 """
 
@@ -30,6 +31,7 @@ from obstore.store import S3Store
 from zarr.storage import ObjectStore
 
 # Import cloud-agnostic processing
+from magg.config import load_config_from_dict
 from magg.processing import process_morton_cell, write_dataframe_to_zarr
 
 # Set up structured logging
@@ -111,6 +113,11 @@ def lambda_handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
             logger.error(error_msg)
             return {"statusCode": 400, "body": json.dumps({"error": error_msg})}
 
+        # Load pipeline config if provided, otherwise use default
+        config = None
+        if "config" in event:
+            config = load_config_from_dict(event["config"])
+
         # Process the morton cell using cloud-agnostic function
         df_out, metadata = process_morton_cell(
             parent_morton=event["parent_morton"],
@@ -118,6 +125,7 @@ def lambda_handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
             child_order=event["child_order"],
             granule_urls=event["granule_urls"],
             s3_credentials=s3_creds,
+            config=config,
         )
 
         # Write Zarr to S3 (AWS-specific)

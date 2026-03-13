@@ -100,7 +100,10 @@ class TestCalculateCellStatistics:
         assert result["count"] == 3
         assert result["h_min"] == 10.0
         assert result["h_max"] == 30.0
-        np.testing.assert_almost_equal(result["h_mean"], np.average([10, 20, 30], weights=[0.1, 0.2, 0.1]))
+        np.testing.assert_almost_equal(
+            result["h_mean"],
+            np.average([10, 20, 30], weights=1.0 / np.array([0.1, 0.2, 0.1]) ** 2),
+        )
 
 
 class TestDataSourceConfig:
