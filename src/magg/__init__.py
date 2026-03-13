@@ -1,7 +1,7 @@
 """
 magg - Multi-resolution Aggregation
 
-ICESat-2 ATL06 processing using morton/healpix indexing.
+Multi-resolution aggregation using morton/healpix indexing.
 
 This package provides cloud-agnostic processing functions that can be deployed
 to various cloud platforms (AWS Lambda, GCP Cloud Functions, Azure Functions, etc.)

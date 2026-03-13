@@ -19,7 +19,7 @@ Each variable in `aggregation.variables` carries metadata describing its behavio
 | `function` | e.g. `"min"`, `"average"`, `"quantile"` | Function resolved via `resolve_function()` (numpy shorthand or dotted path) |
 | `expression` | e.g. `"1.0 / np.sqrt(np.sum(1.0 / s_li**2))"` | Python expression evaluated with column arrays in namespace |
 | `source` | e.g. `"h_li"` | Input column from the raw observations |
-| `params` | e.g. `{weights: s_li}`, `{q: 0.25}` | Extra parameters; string values referencing data_source variables are resolved to arrays |
+| `params` | e.g. `{weights: "1.0 / s_li**2"}`, `{q: 0.25}` | Extra parameters; string values referencing data_source variables are resolved to arrays |
 | `dtype` | e.g. `"float32"`, `"int32"` | Data type for the Zarr array |
 | `fill_value` | `0` or `"NaN"` | Fill value for unoccupied cells |
 
@@ -37,7 +37,7 @@ Available aggregation functions (via numpy or dotted import paths):
 | `min` | Minimum value | --- |
 | `max` | Maximum value | --- |
 | `var` | Variance | --- |
-| `average` | Weighted average | `weights`: weight column |
+| `average` | Weighted average | `weights`: column name or expression |
 | `quantile` | Quantile value | `q`: quantile (0--1) |
 
 ## Extending the Schema
@@ -70,7 +70,7 @@ Everything else --- the Zarr template, `calculate_cell_statistics`, and `process
 | `cell_ids` | uint64 | HEALPix cell ID at child order |
 | `morton` | int64 | Morton index at child order |
 | `count` | int32 | Number of observations |
-| `h_mean` | float32 | Weighted mean elevation |
+| `h_mean` | float32 | Inverse-variance weighted mean elevation |
 | `h_sigma` | float32 | Uncertainty of weighted mean |
 | `h_min`, `h_max` | float32 | Elevation range |
 | `h_variance` | float32 | Variance |

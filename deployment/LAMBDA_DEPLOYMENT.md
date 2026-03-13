@@ -9,7 +9,7 @@ for testing. The target architecture is **arm64 / py3.12** (20% cheaper per GB-s
 - **Runtime**: python3.11
 - **Architecture**: x86_64
 - **Layer**: `xagg-dependencies:1` (x86_64, py3.11, h5coro==0.0.8)
-- **Function code**: `lambda_handler.py` + `magg/` package + obstore/zarr/pydantic/pandera
+- **Function code**: `lambda_handler.py` + `magg/` package + obstore/zarr/pydantic/pyyaml
 - **Role**: `magg-lambda-execution` (scoped to `xagg` bucket)
 
 ### What's in the layer vs function code
@@ -19,7 +19,7 @@ numpy, pandas, h5coro, mortie, healpy, earthaccess, boto3, astropy, shapely, cra
 fastparquet, requests, s3fs, and transitive deps.
 
 **Function code** (20MB unzipped):
-`lambda_handler.py`, `magg/` package, obstore, zarr, pydantic-zarr, pandera, pydantic,
+`lambda_handler.py`, `magg/` package, obstore, zarr, pydantic-zarr, pyyaml, pydantic,
 pydantic-core, typeguard, typing_inspect, annotated-types.
 
 ---
@@ -126,7 +126,7 @@ cp -r src/magg /tmp/lambda_build/magg
 
 # Add deps not in layer (skip native ones if already unpacked)
 pip install --target /tmp/lambda_build --no-deps \
-  zarr pydantic-zarr pandera pydantic typeguard typing_inspect annotated-types
+  zarr pydantic-zarr pyyaml pydantic typeguard typing_inspect annotated-types
 
 # For obstore (native): download correct wheel and unzip
 pip download --python-version <VER> --platform <PLAT> --only-binary :all: \

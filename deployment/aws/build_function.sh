@@ -58,7 +58,7 @@ pip3 install --target "$BUILD_DIR" --no-cache-dir \
     "obstore>=0.8.2" \
     "zarr>=3.1.5" \
     "pydantic-zarr>=0.9.1" \
-    "pandera"
+    "pyyaml"
 
 # --- Remove packages already in the Lambda layer ---
 # The layer provides these (plus their transitive deps). Removing them from
