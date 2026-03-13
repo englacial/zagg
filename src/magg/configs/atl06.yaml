@@ -37,7 +37,7 @@ aggregation:
       function: average
       source: h_li
       params:
-        weights: s_li
+        weights: "1.0 / s_li**2"
       dtype: float32
     h_sigma:
       expression: "1.0 / np.sqrt(np.sum(1.0 / s_li**2))"

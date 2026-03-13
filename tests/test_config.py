@@ -263,11 +263,15 @@ def _dispatch_config_stat(name, meta, df):
 
         func = resolve_function(func_name)
 
-        # Resolve column-reference params (e.g. weights: s_li -> actual array)
+        # Resolve params: bare column name -> array, expression -> eval'd
         resolved = {}
         for k, v in params.items():
             if isinstance(v, str) and v in df.columns:
                 resolved[k] = df[v].values
+            elif isinstance(v, str) and any(c in v for c in df.columns):
+                ns = {"__builtins__": {}, "np": np, "numpy": np,
+                      **{c: df[c].values for c in df.columns}}
+                resolved[k] = eval(v, ns)  # noqa: S307
             else:
                 resolved[k] = v
 

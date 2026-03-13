@@ -74,8 +74,15 @@ class DataSourceConfig:
             if source is not None and source not in available:
                 missing.add(source)
             for pval in meta.get("params", {}).values():
-                if isinstance(pval, str) and pval not in available:
-                    missing.add(pval)
+                if not isinstance(pval, str):
+                    continue
+                # Bare column reference
+                if pval in available:
+                    continue
+                # Expression containing column names
+                if any(v in pval for v in available):
+                    continue
+                missing.add(pval)
         if missing:
             raise ValueError(
                 f"Schema references columns {missing} not provided by "
@@ -217,11 +224,15 @@ def calculate_cell_statistics(
             result[name] = len(df_cell)
             continue
 
-        # Resolve column references in params (e.g. weights: s_li -> array)
+        # Resolve params: bare column name -> array, expression -> eval'd
         resolved_params = {}
         for pkey, pval in params.items():
             if isinstance(pval, str) and pval in df_cell.columns:
                 resolved_params[pkey] = df_cell[pval].values
+            elif isinstance(pval, str) and any(c in pval for c in df_cell.columns):
+                ns = {"__builtins__": {}, "np": np, "numpy": np,
+                      **{c: df_cell[c].values for c in df_cell.columns}}
+                resolved_params[pkey] = eval(pval, ns)  # noqa: S307
             else:
                 resolved_params[pkey] = pval
 
