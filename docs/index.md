@@ -11,9 +11,10 @@ granule query (which granule files to fetch), while a **polygon** controls
 morton cell discovery (which cells to aggregate into). Both are optional —
 omitting them defaults to all Antarctic drainage basins.
 
-The library is organized into five modules:
+The library is organized into six modules:
 
-- **`magg.config`**: YAML-driven pipeline configuration — data source, aggregation, and output grid definitions
+- **`magg.config`**: YAML-driven pipeline configuration — data source, aggregation, output grid, and optional store/catalog/bounds
+- **`magg.store`**: Store factory — opens local or S3 Zarr stores from path strings (`./output.zarr` or `s3://bucket/prefix`)
 - **`magg.catalog`**: CMR granule catalog builder — queries NASA CMR with date ranges, product names, and spatial polygons, then maps parent morton cells to S3 granule URLs
 - **`magg.schema`**: Zarr template creation from pipeline configuration
 - **`magg.processing`**: Core aggregation pipeline — reading HDF5, spatial filtering, statistics calculation, and Zarr writing
@@ -40,14 +41,17 @@ uv run python -m magg.catalog \
 
 See [Catalog API](api/catalog.md) for full options.
 
-### 2. Run production processing
+### 2. Run processing
 
 ```bash
-uv run python deployment/aws/invoke_lambda.py \
-    --catalog catalog_ATL06_cycle22_order6.json
+# Local processing:
+uv run python -m magg --config atl06.yaml --catalog catalog.json --store ./output.zarr
+
+# Lambda dispatch:
+uv run python deployment/aws/invoke_lambda.py --config atl06.yaml --catalog catalog.json
 ```
 
-See [Lambda Deployment](deployment/lambda.md) for setup and configuration.
+See [Lambda Deployment](deployment/lambda.md) for AWS setup.
 
 ### 3. Visualize results
 
@@ -64,20 +68,28 @@ uv run jupyter notebook notebooks/rasterized_zarr.ipynb
 ## Quick example
 
 ```python
-from magg.processing import process_morton_cell
+from magg import default_config, get_child_order, open_store
+from magg.processing import process_morton_cell, write_dataframe_to_zarr
 from magg.auth import get_nsidc_s3_credentials
 
-# Authenticate once
+config = default_config("atl06")
+child_order = get_child_order(config)  # 12
 creds = get_nsidc_s3_credentials()
 
 # Process a single parent cell
 df_out, metadata = process_morton_cell(
     parent_morton=-6134114,
     parent_order=6,
-    child_order=12,
+    child_order=child_order,
     granule_urls=["s3://nsidc-cumulus-prod-protected/ATLAS/ATL06/007/..."],
     s3_credentials=creds,
+    config=config,
 )
+
+# Write results to a local Zarr store
+store = open_store("./output.zarr")
+write_dataframe_to_zarr(df_out, store, chunk_idx=0,
+                        child_order=child_order, parent_order=6)
 ```
 
 ## Contributing

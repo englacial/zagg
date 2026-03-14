@@ -55,27 +55,29 @@ bash deployment/aws/deploy.sh
 
 See [Lambda Deployment](docs/deployment/lambda.md) and [ARM64 Build Guide](docs/deployment/arm64.md).
 
-### Step 3: Run Production Processing
+### Step 3: Run Processing
 
-The orchestrator creates a Zarr template, authenticates with NASA Earthdata, and dispatches one Lambda per spatial cell.
+Processing reads a pipeline config YAML (data source, aggregation, output store) and a granule catalog. Run locally or dispatch to Lambda.
 
 ```bash
-# Full run:
-uv run python deployment/aws/invoke_lambda.py \
-    --catalog catalog_ATL06_cycle22_order6.json
+# Local processing (write to local Zarr):
+uv run python -m magg --config atl06.yaml --catalog catalog.json --store ./output.zarr
 
-# Dry run (show what would be processed):
+# Local processing (write to S3):
+uv run python -m magg --config atl06.yaml --catalog catalog.json --store s3://bucket/output.zarr
+
+# Lambda dispatch (requires deployed Lambda function):
 uv run python deployment/aws/invoke_lambda.py \
-    --catalog catalog_ATL06_cycle22_order6.json \
-    --dry-run
+    --config atl06.yaml --catalog catalog.json
 
 # Test with a few cells:
-uv run python deployment/aws/invoke_lambda.py \
-    --catalog catalog_ATL06_cycle22_order6.json \
-    --max-cells 10
+uv run python -m magg --config atl06.yaml --catalog catalog.json --max-cells 5
+
+# Dry run:
+uv run python -m magg --config atl06.yaml --catalog catalog.json --dry-run
 ```
 
-Output: Zarr store at `s3://xagg/atl06/morton_aggregation.zarr/`
+The store path and output grid parameters are defined in the YAML config (`output.store`, `output.grid.child_order`) and can be overridden via `--store` on the command line.
 
 ### Step 4: Visualize Results
 
@@ -92,10 +94,14 @@ Adjust `GRID_SPACING` in the notebook to control output resolution (default 2 km
 ```
 magg/
 ├── src/magg/              # Main package (cloud-agnostic)
+│   ├── __main__.py        # Local processing runner (python -m magg)
+│   ├── config.py          # YAML pipeline configuration
 │   ├── processing.py      # Core aggregation pipeline
 │   ├── catalog.py         # CMR query + catalog building
 │   ├── schema.py          # Output schema + Zarr template
+│   ├── store.py           # Store factory (local or S3)
 │   ├── auth.py            # NASA Earthdata authentication
+│   └── configs/           # Built-in pipeline configs (atl06.yaml)
 ├── deployment/            # Cloud-specific deployment
 │   └── aws/               # Lambda handler, orchestrator, build scripts
 ├── notebooks/             # Visualization

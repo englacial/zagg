@@ -14,6 +14,7 @@ nav:
   - "index.md"
   - "API":
       - Config: "api/config.md"
+      - Store: "api/store.md"
       - Schema: "api/schema.md"
       - Processing: "api/processing.md"
       - Catalog: "api/catalog.md"

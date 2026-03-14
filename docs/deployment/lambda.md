@@ -54,8 +54,7 @@ The Lambda function processes a single morton cell (order 6) by:
     "s3://nsidc-cumulus-prod-protected/ATLAS/ATL06/007/2023/12/18/...",
     "s3://nsidc-cumulus-prod-protected/ATLAS/ATL06/007/2023/12/19/..."
   ],
-  "s3_bucket": "your-output-bucket",
-  "s3_prefix": "atl06/production",
+  "store_path": "s3://your-output-bucket/atl06/production.zarr",
   "s3_credentials": {
     "accessKeyId": "ASIA...",
     "secretAccessKey": "...",
@@ -72,9 +71,8 @@ The Lambda function processes a single morton cell (order 6) by:
 | `parent_order` | int | Yes | Order of parent cell (typically 6) |
 | `child_order` | int | Yes | Order of child cells for statistics (typically 12) |
 | `granule_urls` | list | Yes | Pre-computed list of S3 URLs from catalog |
-| `s3_bucket` | str | Yes | S3 bucket for output Zarr files |
-| `s3_prefix` | str | Yes | S3 prefix for output Zarr files |
-| `s3_credentials` | dict | Yes | S3 credentials from orchestrator |
+| `store_path` | str | Yes | Output Zarr store path (e.g. `s3://bucket/prefix.zarr`) |
+| `s3_credentials` | dict | Yes | NSIDC S3 credentials for reading source data |
 
 ### S3 Credentials
 
@@ -92,8 +90,7 @@ event = {
     "parent_order": 6,
     "child_order": 12,
     "granule_urls": [...],
-    "s3_bucket": "output-bucket",
-    "s3_prefix": "atl06/production",
+    "store_path": "s3://output-bucket/atl06/production.zarr",
     "s3_credentials": s3_creds,
 }
 ```
@@ -150,10 +147,13 @@ aws lambda update-function-code \
 # Build a granule catalog
 uv run python -m magg.catalog --cycle 22 --parent-order 6
 
-# Dry run with the orchestrator
+# Test locally first (no Lambda required)
+uv run python -m magg --config atl06.yaml --catalog catalog.json \
+  --store ./test.zarr --max-cells 1
+
+# Dry run with the Lambda orchestrator
 uv run python deployment/aws/invoke_lambda.py \
-  --catalog deployment/data/catalogs/granule_catalog_cycle22_order6.json \
-  --dry-run --max-cells 1
+  --config atl06.yaml --catalog catalog.json --dry-run
 ```
 
 ## Performance
