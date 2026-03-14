@@ -3,23 +3,13 @@
 Production Lambda orchestrator for processing Antarctic morton cells.
 
 Uses pre-built granule catalog to avoid per-Lambda CMR queries.
+Reads output store path and child_order from pipeline config YAML.
 
 Usage:
-    # First, build the catalog:
-    python -m magg.catalog --cycle 22 --parent-order 6
-
-    # Then run production:
-    python deployment/aws/invoke_lambda.py --catalog deployment/data/catalogs/granule_catalog_cycle22_order6.json
-    python deployment/aws/invoke_lambda.py --catalog deployment/data/catalogs/granule_catalog_cycle22_order6.json --max-cells 200
-
-    # Process a specific morton cell:
-    python deployment/aws/invoke_lambda.py --catalog deployment/data/catalogs/granule_catalog_cycle22_order6.json --morton-cell -4211322
-
-    # Use a custom pipeline config:
-    python deployment/aws/invoke_lambda.py --catalog deployment/data/catalogs/granule_catalog_cycle22_order6.json --config my_config.yaml
-
-    # Optimize parallel execution by processing cells with the most granules first:
-    python deployment/aws/invoke_lambda.py --catalog deployment/data/catalogs/granule_catalog_cycle22_order6.json --sort-by-granules
+    python deployment/aws/invoke_lambda.py --config atl06.yaml --catalog catalog.json
+    python deployment/aws/invoke_lambda.py --config atl06.yaml --catalog catalog.json --max-cells 10
+    python deployment/aws/invoke_lambda.py --config atl06.yaml --catalog catalog.json --morton-cell -4211322
+    python deployment/aws/invoke_lambda.py --config atl06.yaml --catalog catalog.json --dry-run
 """
 
 import argparse
@@ -30,14 +20,12 @@ from datetime import datetime
 
 import boto3
 from botocore.config import Config
-from obstore.auth.boto3 import Boto3CredentialProvider
-from obstore.store import S3Store
 from zarr import consolidate_metadata
-from zarr.storage import ObjectStore
 
 from magg.auth import get_nsidc_s3_credentials
-from magg.config import default_config, load_config
+from magg.config import default_config, get_child_order, get_store_path, load_config
 from magg.schema import xdggs_zarr_template
+from magg.store import open_store, parse_s3_path
 
 # Lambda pricing (us-west-2)
 # https://aws.amazon.com/lambda/pricing/
@@ -98,8 +86,7 @@ def invoke_lambda(
     parent_order: int,
     child_order: int,
     granule_urls: list,
-    s3_bucket: str,
-    s3_prefix: str,
+    store_path: str,
     s3_credentials: dict,
     function_name: str = "process-morton-cell",
     max_retries: int = 3,
@@ -114,8 +101,7 @@ def invoke_lambda(
         "parent_order": parent_order,
         "child_order": child_order,
         "granule_urls": granule_urls,
-        "s3_bucket": s3_bucket,
-        "s3_prefix": s3_prefix,
+        "store_path": store_path,
         "s3_credentials": {
             "accessKeyId": s3_credentials["accessKeyId"],
             "secretAccessKey": s3_credentials["secretAccessKey"],
@@ -293,75 +279,38 @@ def categorize_result(result: dict) -> tuple[str, dict]:
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Production Lambda orchestrator")
-    parser.add_argument("--catalog", required=True, help="Path to granule catalog JSON")
+    parser = argparse.ArgumentParser(
+        description="Production Lambda orchestrator",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+examples:
+  python deployment/aws/invoke_lambda.py --config atl06.yaml --catalog catalog.json
+  python deployment/aws/invoke_lambda.py --config atl06.yaml --catalog catalog.json --max-cells 10
+  python deployment/aws/invoke_lambda.py --config atl06.yaml --catalog catalog.json --dry-run
+""",
+    )
+    parser.add_argument("--config", default=None, help="Pipeline config YAML (default: built-in atl06)")
+    parser.add_argument("--catalog", default=None, help="Path to granule catalog JSON (overrides config)")
+    parser.add_argument("--store", default=None, help="Output store path (overrides config)")
+    parser.add_argument("--max-workers", type=int, default=1700, help="Max concurrent Lambda invocations")
+    parser.add_argument("--max-cells", type=int, default=None, help="Limit number of cells (for testing)")
     parser.add_argument(
-        "--max-workers", type=int, default=1700, help="Max concurrent Lambda invocations"
+        "--morton-cell", type=str, default=None, help="Process a specific morton cell (e.g., -4211322)"
     )
     parser.add_argument(
-        "--max-cells", type=int, default=None, help="Limit number of cells (for testing)"
-    )
-    parser.add_argument(
-        "--morton-cell",
-        type=str,
-        default=None,
-        help="Process a specific morton cell (e.g., -4211322)",
-    )
-    parser.add_argument(
-        "--sort-by-granules",
-        action="store_true",
+        "--sort-by-granules", action="store_true", default=True,
         help="Sort cells by granule count (descending) to minimize wall-clock time",
-        default=True,
     )
-    parser.add_argument("--child-order", type=int, default=12, help="Child cell order")
-    parser.add_argument("--s3-bucket", default="xagg")
-    parser.add_argument("--s3-prefix", default="atl06/morton_aggregation.zarr")
-    parser.add_argument(
-        "--dry-run", action="store_true", help="Show what would be processed without running"
-    )
-    parser.add_argument(
-        "--overwrite-template",
-        action="store_true",
-        default=False,
-        help="Overwrite existing Zarr template if it exists",
-    )
-    parser.add_argument(
-        "--config",
-        default=None,
-        help="Path to pipeline config YAML (default: built-in atl06.yaml)",
-    )
-    parser.add_argument(
-        "--region",
-        default="us-west-2",
-        help="AWS region (default: us-west-2)",
-    )
-    parser.add_argument(
-        "--output-dir",
-        default=".",
-        help="Directory for output results JSON (default: current directory)",
-    )
+    parser.add_argument("--dry-run", action="store_true", help="Show what would be processed")
+    parser.add_argument("--overwrite-template", action="store_true", default=False,
+                        help="Overwrite existing Zarr template")
+    parser.add_argument("--region", default="us-west-2", help="AWS region (default: us-west-2)")
+    parser.add_argument("--output-dir", default=".", help="Directory for output results JSON")
     args = parser.parse_args()
 
     print("=" * 70)
     print("Production Lambda Orchestrator - Catalog-Based")
     print("=" * 70)
-
-    # Step 1: Load catalog
-    print(f"\n[1/7] Loading granule catalog from {args.catalog}...")
-    catalog_data = load_catalog(args.catalog)
-    metadata = catalog_data["metadata"]
-    catalog = catalog_data["catalog"]
-
-    parent_order = metadata["parent_order"]
-    child_order = args.child_order
-
-    print(f"      Product: {metadata.get('short_name', 'ATL06')}")
-    print(f"      Temporal: {metadata.get('start_date', '?')} to {metadata.get('end_date', '?')}")
-    if "cycle" in metadata:
-        print(f"      Cycle: {metadata['cycle']}")
-    print(f"      Parent order: {parent_order}")
-    print(f"      Total cells in catalog: {metadata['total_cells']}")
-    print(f"      Total granules: {metadata['total_granules']}")
 
     # Load pipeline config
     if args.config:
@@ -369,6 +318,36 @@ def main():
         config = load_config(args.config)
     else:
         config = default_config()
+
+    child_order = get_child_order(config)
+
+    # Resolve store path: CLI > config > error
+    store_path = args.store or get_store_path(config)
+    if not store_path:
+        parser.error("No store path (use --store or set output.store in config)")
+    if not store_path.startswith("s3://"):
+        parser.error(f"Lambda orchestrator requires an S3 store path, got: {store_path}")
+
+    # Resolve catalog: CLI > config > error
+    catalog_path = args.catalog or config.catalog
+    if not catalog_path:
+        parser.error("No catalog specified (use --catalog or set catalog: in config)")
+
+    # Step 1: Load catalog
+    print(f"\n[1/7] Loading granule catalog from {catalog_path}...")
+    catalog_data = load_catalog(catalog_path)
+    metadata = catalog_data["metadata"]
+    catalog = catalog_data["catalog"]
+
+    parent_order = metadata["parent_order"]
+
+    print(f"      Product: {metadata.get('short_name', 'ATL06')}")
+    print(f"      Temporal: {metadata.get('start_date', '?')} to {metadata.get('end_date', '?')}")
+    if "cycle" in metadata:
+        print(f"      Cycle: {metadata['cycle']}")
+    print(f"      Parent order: {parent_order}, Child order: {child_order}")
+    print(f"      Total cells in catalog: {metadata['total_cells']}")
+    print(f"      Total granules: {metadata['total_granules']}")
 
     # Select cells to process
     all_cells = list(catalog.keys())
@@ -387,14 +366,8 @@ def main():
 
     # Step 3: Create Zarr store
     print("\n[3/7] Creating template Zarr store...")
-    print(f"      Output: s3://{args.s3_bucket}/{args.s3_prefix}")
-    s3_store = S3Store(
-        args.s3_bucket,
-        prefix=args.s3_prefix,
-        region=args.region,
-        credential_provider=Boto3CredentialProvider(),
-    )
-    store = ObjectStore(store=s3_store, read_only=False)
+    print(f"      Output: {store_path}")
+    store = open_store(store_path, region=args.region)
     store = xdggs_zarr_template(
         store,
         parent_order,
@@ -448,8 +421,7 @@ def main():
                 parent_order,
                 child_order,
                 catalog[cell],  # Granule URLs for this cell
-                args.s3_bucket,
-                args.s3_prefix,
+                store_path,
                 s3_creds,
                 config_dict=config_dict,
             ): cell
@@ -513,7 +485,7 @@ def main():
     print(f"      Throughput:           {len(cells) / total_wall_time:.1f} cells/sec")
     print(f"      Estimated cost:       ${cost:.4f}")
     print("-" * 70)
-    print(f"      Output location:      s3://{args.s3_bucket}/{args.s3_prefix}/")
+    print(f"      Output location:      {store_path}")
     print("=" * 70)
 
     # Save results to JSON

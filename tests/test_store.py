@@ -2,9 +2,10 @@
 
 from pathlib import Path
 
+import pytest
 from zarr.storage import LocalStore
 
-from magg.store import open_store
+from magg.store import open_store, parse_s3_path
 
 
 class TestOpenStore:
@@ -23,3 +24,15 @@ class TestOpenStore:
         p.mkdir()
         store = open_store(str(p), read_only=True)
         assert isinstance(store, LocalStore)
+
+
+class TestParseS3Path:
+    def test_bucket_and_prefix(self):
+        assert parse_s3_path("s3://mybucket/some/prefix.zarr") == ("mybucket", "some/prefix.zarr")
+
+    def test_bucket_only(self):
+        assert parse_s3_path("s3://mybucket") == ("mybucket", "")
+
+    def test_not_s3_raises(self):
+        with pytest.raises(ValueError, match="Not an S3 path"):
+            parse_s3_path("./local/path.zarr")

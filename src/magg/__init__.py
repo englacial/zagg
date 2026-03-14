@@ -19,7 +19,7 @@ from .processing import (
     write_dataframe_to_zarr,
 )
 from .schema import xdggs_spec, xdggs_zarr_template
-from .store import open_store
+from .store import open_store, parse_s3_path
 
 __all__ = [
     "PipelineConfig",
@@ -30,6 +30,7 @@ __all__ = [
     "get_store_path",
     "load_config",
     "open_store",
+    "parse_s3_path",
     "process_morton_cell",
     "write_dataframe_to_zarr",
     "xdggs_spec",

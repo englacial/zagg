@@ -397,3 +397,38 @@ class TestOutputGridValidation:
         )
         with pytest.raises(ValueError, match="child_order"):
             validate_config(cfg)
+
+
+# ---------------------------------------------------------------------------
+# Bounds validation
+# ---------------------------------------------------------------------------
+
+class TestBoundsValidation:
+    def test_valid_bounds(self, atl06_config):
+        atl06_config.bounds = {
+            "temporal": {"start_date": "2024-01-06", "end_date": "2024-04-07"},
+            "spatial": {"bbox": [-180, -90, 180, -60]},
+        }
+        validate_config(atl06_config)
+
+    def test_temporal_only(self, atl06_config):
+        atl06_config.bounds = {"temporal": {"start_date": "2024-01-01", "end_date": "2024-06-01"}}
+        validate_config(atl06_config)
+
+    def test_spatial_only(self, atl06_config):
+        atl06_config.bounds = {"spatial": {"bbox": [-180, -90, 180, -60]}}
+        validate_config(atl06_config)
+
+    def test_unknown_bounds_key(self, atl06_config):
+        atl06_config.bounds = {"temporal": {"start_date": "2024-01-01", "end_date": "2024-06-01"}, "foo": "bar"}
+        with pytest.raises(ValueError, match="Unknown bounds keys"):
+            validate_config(atl06_config)
+
+    def test_temporal_missing_dates(self, atl06_config):
+        atl06_config.bounds = {"temporal": {"start_date": "2024-01-01"}}
+        with pytest.raises(ValueError, match="start_date and end_date"):
+            validate_config(atl06_config)
+
+    def test_none_bounds_ok(self, atl06_config):
+        atl06_config.bounds = None
+        validate_config(atl06_config)
