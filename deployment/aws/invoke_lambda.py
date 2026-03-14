@@ -25,7 +25,7 @@ from zarr import consolidate_metadata
 from magg.auth import get_nsidc_s3_credentials
 from magg.config import default_config, get_child_order, get_store_path, load_config
 from magg.schema import xdggs_zarr_template
-from magg.store import open_store, parse_s3_path
+from magg.store import open_store
 
 # Lambda pricing (us-west-2)
 # https://aws.amazon.com/lambda/pricing/
