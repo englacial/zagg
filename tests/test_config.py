@@ -92,11 +92,11 @@ class TestResolveFunction:
     def test_min(self):
         assert resolve_function("min") is np.min
 
-    def test_numpy_min(self):
-        assert resolve_function("numpy.min") is np.min
+    def test_np_min(self):
+        assert resolve_function("np.min") is np.min
 
-    def test_numpy_quantile(self):
-        assert resolve_function("numpy.quantile") is np.quantile
+    def test_np_quantile(self):
+        assert resolve_function("np.quantile") is np.quantile
 
     def test_len(self):
         assert resolve_function("len") is len
