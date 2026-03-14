@@ -208,28 +208,27 @@ Target coverage: ~1,300 cells covering Antarctic grounded ice drainage basins (e
               │                  │  validate_config
               └──────┬───────────┘
                      │
-          ┌──────────┼──────────┐
-          │          │          │
-          ▼          ▼          ▼
-  ┌──────────┐ ┌──────────┐ ┌───────────────────┐
-  │schema.py │ │processing│ │ catalog.py        │
-  │          │ │  .py     │ │                   │
-  │ xdggs_   │ │ read/agg │ │ CMR query,        │
-  │ spec,    │ │ write    │ │ morton mapping     │
-  │ xdggs_   │ │          │ │                   │
-  │ zarr_    │ └────┬─────┘ └─────────┬─────────┘
-  │ template │      │                 │
-  └────┬─────┘      │                 │
-       │            │                 │
-       └──────┬─────┘                 │
-              │                       │
-              ▼                       │
-  ┌───────────────────────┐           │
-  │ lambda_handler.py     │           │
-  │ (AWS-specific wrapper)│           │
-  └───────────┬───────────┘           │
-              │                       │
-              ▼                       ▼
+          ┌──────────┼──────────┬──────────┐
+          │          │          │          │
+          ▼          ▼          ▼          ▼
+  ┌──────────┐ ┌──────────┐ ┌─────────┐ ┌───────────────────┐
+  │schema.py │ │processing│ │store.py │ │ catalog.py        │
+  │          │ │  .py     │ │         │ │                   │
+  │ xdggs_   │ │ read/agg │ │open_    │ │ CMR query,        │
+  │ spec,    │ │ write    │ │store()  │ │ morton mapping     │
+  │ zarr_    │ │          │ │local/S3 │ │                   │
+  │ template │ └────┬─────┘ └────┬────┘ └─────────┬─────────┘
+  └────┬─────┘      │            │                 │
+       │            │            │                 │
+       └──────┬─────┼────────────┘                 │
+              │     │                              │
+              ▼     ▼                              │
+  ┌───────────────────────┐  ┌───────────────────┐ │
+  │ lambda_handler.py     │  │ __main__.py       │ │
+  │ (AWS Lambda wrapper)  │  │ (local runner)    │ │
+  └───────────┬───────────┘  └───────────────────┘ │
+              │                                    │
+              ▼                                    ▼
   ┌────────────────────────────────────────┐
   │ invoke_lambda.py                       │
   │ (orchestrator: catalog + auth +        │

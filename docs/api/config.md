@@ -1,6 +1,6 @@
 # Config
 
-The config module loads YAML pipeline configurations that define what data to read, how to aggregate it, and what output grid to use. See [configs/atl06.yaml](https://github.com/englacial/magg/blob/main/src/magg/configs/atl06.yaml) for the default configuration.
+The config module loads YAML pipeline configurations that define what data to read, how to aggregate it, and where to write output. See [configs/atl06.yaml](https://github.com/englacial/magg/blob/main/src/magg/configs/atl06.yaml) for the default configuration.
 
 ## Loading
 
@@ -27,6 +27,10 @@ The config module loads YAML pipeline configurations that define what data to re
 ::: magg.config.get_coords
 
 ::: magg.config.get_data_vars
+
+::: magg.config.get_child_order
+
+::: magg.config.get_store_path
 
 ## Types
 
