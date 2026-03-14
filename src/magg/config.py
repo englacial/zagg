@@ -5,11 +5,22 @@ import re
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from importlib import resources
+from typing import NotRequired, TypedDict
 
 import numpy as np
 import yaml
 
 import magg.configs
+
+
+class DataSourceDict(TypedDict):
+    """Type hints for the ``data_source`` section of a pipeline config."""
+
+    reader: str
+    groups: list[str]
+    coordinates: dict[str, str]
+    variables: dict[str, str]
+    quality_filter: NotRequired[dict]
 
 
 @dataclass
@@ -18,7 +29,7 @@ class PipelineConfig:
 
     Parameters
     ----------
-    data_source : dict
+    data_source : DataSourceDict
         Reader, groups, coordinates, variables, quality filter.
     aggregation : dict
         Coordinate and variable aggregation definitions.
@@ -26,7 +37,7 @@ class PipelineConfig:
         Grid type and indexing scheme.
     """
 
-    data_source: dict = field(default_factory=dict)
+    data_source: DataSourceDict = field(default_factory=dict)
     aggregation: dict = field(default_factory=dict)
     output: dict = field(default_factory=dict)
 

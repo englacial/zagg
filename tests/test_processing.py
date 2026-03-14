@@ -6,8 +6,6 @@ from zarr.storage import MemoryStore
 
 from magg.config import default_config, get_agg_fields, get_coords, get_data_vars
 from magg.processing import (
-    ATL06_CONFIG,
-    DataSourceConfig,
     calculate_cell_statistics,
     write_dataframe_to_zarr,
 )
@@ -106,80 +104,32 @@ class TestCalculateCellStatistics:
         )
 
 
-class TestDataSourceConfig:
-    def test_atl06_config_has_six_groups(self):
-        assert len(ATL06_CONFIG.groups) == 6
-        assert ATL06_CONFIG.groups[0] == "gt1l"
+class TestDataSource:
+    """Test data_source section of default config (replaces old DataSourceConfig tests)."""
 
-    def test_atl06_config_has_coordinates(self):
-        assert "latitude" in ATL06_CONFIG.coordinates
-        assert "longitude" in ATL06_CONFIG.coordinates
-        assert "{group}" in ATL06_CONFIG.coordinates["latitude"]
+    def test_atl06_has_six_groups(self):
+        ds = default_config().data_source
+        assert len(ds["groups"]) == 6
+        assert ds["groups"][0] == "gt1l"
 
-    def test_atl06_config_has_variables(self):
-        assert "h_li" in ATL06_CONFIG.variables
-        assert "s_li" in ATL06_CONFIG.variables
+    def test_atl06_has_coordinates(self):
+        ds = default_config().data_source
+        assert "latitude" in ds["coordinates"]
+        assert "longitude" in ds["coordinates"]
+        assert "{group}" in ds["coordinates"]["latitude"]
 
-    def test_atl06_config_has_quality_filter(self):
-        assert ATL06_CONFIG.quality_filter is not None
-        assert "dataset" in ATL06_CONFIG.quality_filter
-        assert ATL06_CONFIG.quality_filter["value"] == 0
+    def test_atl06_has_variables(self):
+        ds = default_config().data_source
+        assert "h_li" in ds["variables"]
+        assert "s_li" in ds["variables"]
 
-    def test_roundtrip_serialization(self):
-        d = ATL06_CONFIG.to_dict()
-        restored = DataSourceConfig.from_dict(d)
-        assert restored.groups == ATL06_CONFIG.groups
-        assert restored.coordinates == ATL06_CONFIG.coordinates
-        assert restored.variables == ATL06_CONFIG.variables
-        assert restored.quality_filter == ATL06_CONFIG.quality_filter
-
-    def test_no_quality_filter(self):
-        cfg = DataSourceConfig(
-            groups=["g1"],
-            coordinates={"latitude": "/{group}/lat", "longitude": "/{group}/lon"},
-            variables={"val": "/{group}/value"},
-        )
-        assert cfg.quality_filter is None
-        d = cfg.to_dict()
-        assert d["quality_filter"] is None
-        restored = DataSourceConfig.from_dict(d)
-        assert restored.quality_filter is None
-
-    def test_validate_schema_passes_for_atl06(self):
-        ATL06_CONFIG.validate_schema()
-
-    def test_validate_schema_catches_missing_source(self):
-        cfg = DataSourceConfig(
-            groups=["g1"],
-            coordinates={"latitude": "/{group}/lat", "longitude": "/{group}/lon"},
-            variables={"h_li": "/{group}/h_li"},  # missing s_li
-        )
-        with pytest.raises(ValueError, match="s_li"):
-            cfg.validate_schema()
-
-    def test_validate_schema_passes_with_custom_fields(self):
-        cfg = DataSourceConfig(
-            groups=["g1"],
-            coordinates={"latitude": "/{group}/lat", "longitude": "/{group}/lon"},
-            variables={"slope": "/{group}/slope"},
-        )
-        custom_fields = {
-            "slope_min": {"agg": "nanmin", "source": "slope", "params": {}},
-        }
-        cfg.validate_schema(custom_fields)
-
-    def test_validate_schema_catches_missing_with_custom_fields(self):
-        cfg = DataSourceConfig(
-            groups=["g1"],
-            coordinates={"latitude": "/{group}/lat", "longitude": "/{group}/lon"},
-            variables={"slope": "/{group}/slope"},
-        )
-        custom_fields = {
-            "x_mean": {"agg": "nanmin", "source": "missing_col", "params": {}},
-        }
-        with pytest.raises(ValueError, match="missing_col"):
-            cfg.validate_schema(custom_fields)
+    def test_atl06_has_quality_filter(self):
+        ds = default_config().data_source
+        assert ds.get("quality_filter") is not None
+        assert "dataset" in ds["quality_filter"]
+        assert ds["quality_filter"]["value"] == 0
 
     def test_group_template_substitution(self):
-        path = ATL06_CONFIG.coordinates["latitude"].format(group="gt2r")
+        ds = default_config().data_source
+        path = ds["coordinates"]["latitude"].format(group="gt2r")
         assert path == "/gt2r/land_ice_segments/latitude"
