@@ -34,12 +34,18 @@ class PipelineConfig:
     aggregation : dict
         Coordinate and variable aggregation definitions.
     output : dict
-        Grid type and indexing scheme.
+        Grid spec, store path, and indexing details.
+    catalog : str or None
+        Optional path to granule catalog JSON.
+    bounds : dict or None
+        Optional temporal/spatial bounds for filtering.
     """
 
     data_source: DataSourceDict = field(default_factory=dict)
     aggregation: dict = field(default_factory=dict)
     output: dict = field(default_factory=dict)
+    catalog: str | None = None
+    bounds: dict | None = None
 
 
 def load_config(path: str) -> PipelineConfig:
@@ -77,6 +83,8 @@ def load_config_from_dict(d: dict) -> PipelineConfig:
         data_source=d.get("data_source", {}),
         aggregation=d.get("aggregation", {}),
         output=d.get("output", {}),
+        catalog=d.get("catalog"),
+        bounds=d.get("bounds"),
     )
 
 
@@ -124,6 +132,16 @@ def validate_config(config: PipelineConfig) -> None:
         val = getattr(config, section)
         if not val:
             raise ValueError(f"Missing required section: {section}")
+
+    # Validate output.grid structure
+    grid = config.output.get("grid")
+    if grid is not None:
+        if not isinstance(grid, dict):
+            raise ValueError("output.grid must be a mapping (e.g. type: healpix, child_order: 12)")
+        if "type" not in grid:
+            raise ValueError("output.grid.type is required")
+        if grid["type"] == "healpix" and "child_order" not in grid:
+            raise ValueError("output.grid.child_order is required for healpix grid")
 
     ds_vars = set(config.data_source.get("variables", {}).keys())
     agg_vars = config.aggregation.get("variables", {})
@@ -291,6 +309,43 @@ def get_data_vars(config: PipelineConfig) -> list[str]:
     list[str]
     """
     return list(config.aggregation.get("variables", {}).keys())
+
+
+def get_child_order(config: PipelineConfig) -> int:
+    """Return child_order from the output grid config.
+
+    Parameters
+    ----------
+    config : PipelineConfig
+
+    Returns
+    -------
+    int
+
+    Raises
+    ------
+    ValueError
+        If child_order is not set in the config.
+    """
+    grid = config.output.get("grid", {})
+    child_order = grid.get("child_order")
+    if child_order is None:
+        raise ValueError("output.grid.child_order is required")
+    return int(child_order)
+
+
+def get_store_path(config: PipelineConfig) -> str | None:
+    """Return the store path from the output config, or None.
+
+    Parameters
+    ----------
+    config : PipelineConfig
+
+    Returns
+    -------
+    str or None
+    """
+    return config.output.get("store")
 
 
 def evaluate_expression(expression: str, columns: dict[str, np.ndarray]) -> float:
