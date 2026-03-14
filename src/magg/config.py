@@ -143,6 +143,17 @@ def validate_config(config: PipelineConfig) -> None:
         if grid["type"] == "healpix" and "child_order" not in grid:
             raise ValueError("output.grid.child_order is required for healpix grid")
 
+    # Validate bounds structure (optional)
+    if config.bounds is not None:
+        allowed_keys = {"temporal", "spatial"}
+        unknown = set(config.bounds.keys()) - allowed_keys
+        if unknown:
+            raise ValueError(f"Unknown bounds keys: {unknown} (allowed: {allowed_keys})")
+        temporal = config.bounds.get("temporal")
+        if temporal is not None:
+            if "start_date" not in temporal or "end_date" not in temporal:
+                raise ValueError("bounds.temporal requires start_date and end_date")
+
     ds_vars = set(config.data_source.get("variables", {}).keys())
     agg_vars = config.aggregation.get("variables", {})
 

@@ -34,9 +34,7 @@ def _open_s3_store(path: str, read_only: bool = False, **kwargs) -> Store:
     from obstore.store import S3Store
     from zarr.storage import ObjectStore
 
-    parts = path[5:].split("/", 1)
-    bucket = parts[0]
-    prefix = parts[1] if len(parts) > 1 else ""
+    bucket, prefix = parse_s3_path(path)
     region = kwargs.pop("region", "us-west-2")
 
     s3 = S3Store(
@@ -49,4 +47,29 @@ def _open_s3_store(path: str, read_only: bool = False, **kwargs) -> Store:
     return ObjectStore(store=s3, read_only=read_only)
 
 
-__all__ = ["open_store"]
+def parse_s3_path(path: str) -> tuple[str, str]:
+    """Parse an ``s3://bucket/prefix`` path into bucket and prefix.
+
+    Parameters
+    ----------
+    path : str
+        S3 URI (must start with ``s3://``).
+
+    Returns
+    -------
+    tuple of (bucket, prefix)
+
+    Raises
+    ------
+    ValueError
+        If path does not start with ``s3://``.
+    """
+    if not path.startswith("s3://"):
+        raise ValueError(f"Not an S3 path: {path}")
+    parts = path[5:].split("/", 1)
+    bucket = parts[0]
+    prefix = parts[1] if len(parts) > 1 else ""
+    return bucket, prefix
+
+
+__all__ = ["open_store", "parse_s3_path"]

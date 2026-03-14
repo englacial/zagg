@@ -1,5 +1,5 @@
 """
-AWS Lambda handler for processing ICESat-2 ATL06 data by morton cell.
+AWS Lambda handler for processing data by morton cell.
 
 This is an AWS-specific wrapper around the cloud-agnostic processing module.
 
@@ -10,8 +10,7 @@ Event payload:
     "parent_order": int,
     "child_order": int,
     "granule_urls": [str, ...],
-    "s3_bucket": str,
-    "s3_prefix": str,
+    "store_path": str,          # e.g. "s3://bucket/prefix.zarr"
     "s3_credentials": {
         "accessKeyId": str,
         "secretAccessKey": str,
@@ -26,13 +25,10 @@ import logging
 import os
 from typing import Any, Dict
 
-from obstore.auth.boto3 import Boto3CredentialProvider
-from obstore.store import S3Store
-from zarr.storage import ObjectStore
-
 # Import cloud-agnostic processing
 from magg.config import load_config_from_dict
 from magg.processing import process_morton_cell, write_dataframe_to_zarr
+from magg.store import open_store
 
 # Set up structured logging
 logger = logging.getLogger()
@@ -52,8 +48,7 @@ def lambda_handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
         - parent_order: int
         - child_order: int
         - granule_urls: list of S3 URLs
-        - s3_bucket: str
-        - s3_prefix: str
+        - store_path: str (e.g. "s3://bucket/prefix.zarr")
         - s3_credentials: dict with accessKeyId, secretAccessKey, sessionToken
     context : LambdaContext
         Lambda context object
@@ -93,8 +88,7 @@ def lambda_handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
             "parent_order",
             "child_order",
             "granule_urls",
-            "s3_bucket",
-            "s3_prefix",
+            "store_path",
             "s3_credentials",
         ]
         missing_params = [p for p in required_params if p not in event]
@@ -128,25 +122,17 @@ def lambda_handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
             config=config,
         )
 
-        # Write Zarr to S3 (AWS-specific)
+        # Write Zarr to store
         if not df_out.empty:
-            s3_bucket = event["s3_bucket"]
-            s3_prefix = event["s3_prefix"]
-            zarr_path = f"s3://{s3_bucket}/{s3_prefix}"
+            store_path = event["store_path"]
             region = os.environ.get("AWS_REGION", "us-west-2")
-            s3_store = S3Store(
-                s3_bucket,
-                prefix=s3_prefix,
-                region=region,
-                credential_provider=Boto3CredentialProvider(),
-            )
-            store = ObjectStore(store=s3_store, read_only=False)
+            store = open_store(store_path, region=region)
 
             # Validate that Zarr template exists before writing
             child_order = event["child_order"]
             template_key = f"{child_order}/zarr.json"
             if not store.exists(template_key):
-                error_msg = f"Zarr template not found at {zarr_path}/{template_key}"
+                error_msg = f"Zarr template not found at {store_path}/{template_key}"
                 logger.error(error_msg)
                 metadata["error"] = error_msg
                 return {
@@ -154,7 +140,7 @@ def lambda_handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
                     "body": json.dumps(metadata),
                 }
 
-            logger.info(f"  Writing data to {zarr_path}...")
+            logger.info(f"  Writing data to {store_path}...")
 
             try:
                 write_dataframe_to_zarr(
@@ -165,11 +151,8 @@ def lambda_handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
                     parent_order=event["parent_order"],
                 )
             except Exception as e:
-                logger.error(f"Failed to write zarr to {zarr_path}: {e}")
+                logger.error(f"Failed to write zarr to {store_path}: {e}")
                 metadata["error"] = f"Failed to write zarr: {e}"
-                metadata["zarr_path"] = None
-        else:
-            metadata["zarr_path"] = None
 
         # Log structured result
         logger.info(
