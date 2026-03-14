@@ -11,8 +11,10 @@ from magg.config import (
     default_config,
     evaluate_expression,
     get_agg_fields,
+    get_child_order,
     get_coords,
     get_data_vars,
+    get_store_path,
     load_config,
     load_config_from_dict,
     resolve_function,
@@ -67,6 +69,8 @@ class TestLoading:
         assert "variables" in atl06_config.aggregation
         assert "coordinates" in atl06_config.aggregation
         assert "grid" in atl06_config.output
+        assert atl06_config.output["grid"]["type"] == "healpix"
+        assert atl06_config.output["grid"]["child_order"] == 12
 
 
 # ---------------------------------------------------------------------------
@@ -156,7 +160,7 @@ class TestValidation:
             aggregation={"variables": {
                 "bad": {"function": "min", "source": "nonexistent", "dtype": "float32"},
             }},
-            output={"grid": "healpix"},
+            output={"grid": {"type": "healpix", "child_order": 12}},
         )
         with pytest.raises(ValueError, match="source.*nonexistent"):
             validate_config(cfg)
@@ -172,7 +176,7 @@ class TestValidation:
                     "dtype": "float32",
                 },
             }},
-            output={"grid": "healpix"},
+            output={"grid": {"type": "healpix", "child_order": 12}},
         )
         with pytest.raises(ValueError, match="missing_col"):
             validate_config(cfg)
@@ -186,7 +190,7 @@ class TestValidation:
                     "dtype": "float32",
                 },
             }},
-            output={"grid": "healpix"},
+            output={"grid": {"type": "healpix", "child_order": 12}},
         )
         with pytest.raises(ValueError, match="unknown_col"):
             validate_config(cfg)
@@ -202,7 +206,7 @@ class TestValidation:
                     "dtype": "float32",
                 },
             }},
-            output={"grid": "healpix"},
+            output={"grid": {"type": "healpix", "child_order": 12}},
         )
         with pytest.raises(ValueError, match="mutually exclusive"):
             validate_config(cfg)
@@ -213,13 +217,13 @@ class TestValidation:
             aggregation={"variables": {
                 "bad": {"source": "h_li", "dtype": "float32"},
             }},
-            output={"grid": "healpix"},
+            output={"grid": {"type": "healpix", "child_order": 12}},
         )
         with pytest.raises(ValueError, match="must specify"):
             validate_config(cfg)
 
     def test_missing_required_section(self):
-        cfg = PipelineConfig(data_source={}, aggregation={"variables": {}}, output={"grid": "x"})
+        cfg = PipelineConfig(data_source={}, aggregation={"variables": {}}, output={"grid": {"type": "x"}})
         with pytest.raises(ValueError, match="Missing required section"):
             validate_config(cfg)
 
@@ -321,3 +325,75 @@ class TestRoundtrip:
         assert restored.data_source == atl06_config.data_source
         assert restored.aggregation == atl06_config.aggregation
         assert restored.output == atl06_config.output
+
+    def test_catalog_and_bounds_roundtrip(self):
+        d = {
+            "data_source": {"variables": {"h_li": "/path"}, "reader": "h5coro",
+                            "groups": ["gt1l"], "coordinates": {"latitude": "/lat", "longitude": "/lon"}},
+            "aggregation": {"variables": {"count": {"function": "len", "source": "h_li", "dtype": "int32"}},
+                            "coordinates": {"cell_ids": {"dtype": "uint64"}}},
+            "output": {"grid": {"type": "healpix", "child_order": 12}},
+            "catalog": "my_catalog.json",
+            "bounds": {"temporal": {"start_date": "2024-01-01", "end_date": "2024-06-01"}},
+        }
+        cfg = load_config_from_dict(d)
+        assert cfg.catalog == "my_catalog.json"
+        assert cfg.bounds["temporal"]["start_date"] == "2024-01-01"
+
+
+# ---------------------------------------------------------------------------
+# Output config helpers
+# ---------------------------------------------------------------------------
+
+class TestOutputHelpers:
+    def test_get_child_order(self, atl06_config):
+        assert get_child_order(atl06_config) == 12
+
+    def test_get_child_order_missing(self):
+        cfg = PipelineConfig(output={"grid": {"type": "healpix"}})
+        with pytest.raises(ValueError, match="child_order"):
+            get_child_order(cfg)
+
+    def test_get_store_path(self):
+        cfg = PipelineConfig(output={"store": "./test.zarr", "grid": {"type": "healpix", "child_order": 12}})
+        assert get_store_path(cfg) == "./test.zarr"
+
+    def test_get_store_path_none(self, atl06_config):
+        assert get_store_path(atl06_config) is None
+
+    def test_get_store_path_s3(self):
+        cfg = PipelineConfig(output={"store": "s3://bucket/prefix.zarr", "grid": {"type": "healpix", "child_order": 12}})
+        assert get_store_path(cfg) == "s3://bucket/prefix.zarr"
+
+
+# ---------------------------------------------------------------------------
+# Output grid validation
+# ---------------------------------------------------------------------------
+
+class TestOutputGridValidation:
+    def test_grid_must_be_dict(self):
+        cfg = PipelineConfig(
+            data_source={"variables": {"h_li": "/path"}},
+            aggregation={"variables": {"c": {"function": "len", "source": "h_li", "dtype": "int32"}}},
+            output={"grid": "healpix"},
+        )
+        with pytest.raises(ValueError, match="output.grid must be a mapping"):
+            validate_config(cfg)
+
+    def test_grid_missing_type(self):
+        cfg = PipelineConfig(
+            data_source={"variables": {"h_li": "/path"}},
+            aggregation={"variables": {"c": {"function": "len", "source": "h_li", "dtype": "int32"}}},
+            output={"grid": {"child_order": 12}},
+        )
+        with pytest.raises(ValueError, match="output.grid.type"):
+            validate_config(cfg)
+
+    def test_healpix_missing_child_order(self):
+        cfg = PipelineConfig(
+            data_source={"variables": {"h_li": "/path"}},
+            aggregation={"variables": {"c": {"function": "len", "source": "h_li", "dtype": "int32"}}},
+            output={"grid": {"type": "healpix"}},
+        )
+        with pytest.raises(ValueError, match="child_order"):
+            validate_config(cfg)

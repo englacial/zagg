@@ -66,5 +66,7 @@ aggregation:
       dtype: float32
 
 output:
-  grid: healpix
-  indexing_scheme: nested
+  grid:
+    type: healpix
+    indexing_scheme: nested
+    child_order: 12
