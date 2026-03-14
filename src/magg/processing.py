@@ -6,7 +6,6 @@ cloud platforms or local processing environments.
 """
 
 import logging
-from dataclasses import asdict, dataclass
 from datetime import datetime
 from typing import List, Tuple
 
@@ -20,100 +19,6 @@ from magg.config import PipelineConfig, default_config, get_agg_fields, get_data
 from magg.schema import ProcessingMetadata
 
 logger = logging.getLogger(__name__)
-
-
-# ---------------------------------------------------------------------------
-# Data source configuration
-# ---------------------------------------------------------------------------
-
-
-@dataclass
-class DataSourceConfig:
-    """Configuration for reading data from HDF5 files.
-
-    Parameters
-    ----------
-    groups : list[str]
-        HDF5 group names to iterate over.
-    coordinates : dict[str, str]
-        Mapping of coordinate name to HDF5 path template.
-        Templates use ``{group}`` placeholder.
-    variables : dict[str, str]
-        Mapping of output column name to HDF5 path template.
-        Templates use ``{group}`` placeholder.
-    quality_filter : dict or None
-        Optional quality filter with ``dataset`` (path template) and
-        ``value`` (the "good" value to keep via equality check).
-    """
-
-    groups: list[str]
-    coordinates: dict[str, str]
-    variables: dict[str, str]
-    quality_filter: dict | None = None
-
-    def validate_schema(self, agg_fields: dict | None = None) -> None:
-        """Validate that schema aggregation fields reference columns this config provides.
-
-        Parameters
-        ----------
-        agg_fields : dict, optional
-            Schema aggregation fields. If None, reads from default config.
-
-        Raises
-        ------
-        ValueError
-            If any ``source`` or param column reference is not in
-            ``self.variables``.
-        """
-        if agg_fields is None:
-            agg_fields = get_agg_fields(default_config())
-        available = set(self.variables.keys())
-        missing = set()
-        for name, meta in agg_fields.items():
-            source = meta.get("source")
-            if source is not None and source not in available:
-                missing.add(source)
-            for pval in meta.get("params", {}).values():
-                if not isinstance(pval, str):
-                    continue
-                # Bare column reference
-                if pval in available:
-                    continue
-                # Expression containing column names
-                if any(v in pval for v in available):
-                    continue
-                missing.add(pval)
-        if missing:
-            raise ValueError(
-                f"Schema references columns {missing} not provided by "
-                f"DataSourceConfig (available: {available})"
-            )
-
-    def to_dict(self) -> dict:
-        """Serialize to a JSON-compatible dict (for Lambda payloads)."""
-        return asdict(self)
-
-    @classmethod
-    def from_dict(cls, d: dict) -> "DataSourceConfig":
-        """Deserialize from a dict."""
-        return cls(**d)
-
-
-ATL06_CONFIG = DataSourceConfig(
-    groups=["gt1l", "gt1r", "gt2l", "gt2r", "gt3l", "gt3r"],
-    coordinates={
-        "latitude": "/{group}/land_ice_segments/latitude",
-        "longitude": "/{group}/land_ice_segments/longitude",
-    },
-    variables={
-        "h_li": "/{group}/land_ice_segments/h_li",
-        "s_li": "/{group}/land_ice_segments/h_li_sigma",
-    },
-    quality_filter={
-        "dataset": "/{group}/land_ice_segments/atl06_quality_summary",
-        "value": 0,
-    },
-)
 
 
 def write_dataframe_to_zarr(
@@ -242,15 +147,19 @@ def calculate_cell_statistics(
     return result
 
 
-def _read_group(h5obj, group: str, data_source: DataSourceConfig, parent_morton: int,
+def _read_group(h5obj, group: str, data_source: dict, parent_morton: int,
                 parent_order: int, geo2mort, clip2order):
     """Read and spatially filter one HDF5 group, returning a DataFrame or None."""
+    coordinates = data_source["coordinates"]
+    variables = data_source["variables"]
+    quality_filter = data_source.get("quality_filter")
+
     # Resolve coordinate paths
-    coord_paths = [path.format(group=group) for path in data_source.coordinates.values()]
+    coord_paths = [path.format(group=group) for path in coordinates.values()]
     coord_data = h5obj.readDatasets(coord_paths)
 
-    lat_path = data_source.coordinates["latitude"].format(group=group)
-    lon_path = data_source.coordinates["longitude"].format(group=group)
+    lat_path = coordinates["latitude"].format(group=group)
+    lon_path = coordinates["longitude"].format(group=group)
     lats = coord_data[lat_path]
     lons = coord_data[lon_path]
 
@@ -272,13 +181,12 @@ def _read_group(h5obj, group: str, data_source: DataSourceConfig, parent_morton:
 
     # Build hyperslice dataset list: variables + optional quality filter
     datasets = []
-    for path_template in data_source.variables.values():
+    for path_template in variables.values():
         path = path_template.format(group=group)
         datasets.append({"dataset": path, "hyperslice": [(min_idx, max_idx)]})
 
-    has_quality = data_source.quality_filter is not None
-    if has_quality:
-        qf_path = data_source.quality_filter["dataset"].format(group=group)
+    if quality_filter is not None:
+        qf_path = quality_filter["dataset"].format(group=group)
         datasets.append({"dataset": qf_path, "hyperslice": [(min_idx, max_idx)]})
 
     data = h5obj.readDatasets(datasets)
@@ -287,10 +195,10 @@ def _read_group(h5obj, group: str, data_source: DataSourceConfig, parent_morton:
     mask_sliced = mask_spatial[min_idx:max_idx]
 
     # Apply quality filter if configured
-    if has_quality:
-        qf_path = data_source.quality_filter["dataset"].format(group=group)
+    if quality_filter is not None:
+        qf_path = quality_filter["dataset"].format(group=group)
         q_flag = data[qf_path][mask_sliced]
-        quality_mask = q_flag == data_source.quality_filter["value"]
+        quality_mask = q_flag == quality_filter["value"]
         if np.sum(quality_mask) == 0:
             return None
     else:
@@ -299,7 +207,7 @@ def _read_group(h5obj, group: str, data_source: DataSourceConfig, parent_morton:
     # Build dataframe
     midx_sliced = midx18[min_idx:max_idx][mask_sliced]
     data_dict = {}
-    for col_name, path_template in data_source.variables.items():
+    for col_name, path_template in variables.items():
         path = path_template.format(group=group)
         values = data[path][mask_sliced]
         if quality_mask is not None:
@@ -321,7 +229,6 @@ def process_morton_cell(
     granule_urls: List[str],
     s3_credentials: dict,
     h5coro_driver=None,
-    data_source: DataSourceConfig | None = None,
     config: PipelineConfig | None = None,
 ) -> Tuple[pd.DataFrame, ProcessingMetadata]:
     """
@@ -344,10 +251,8 @@ def process_morton_cell(
         Credentials for accessing data (format depends on driver)
     h5coro_driver : class, optional
         h5coro driver class to use (e.g., s3driver.S3Driver). If None, auto-detect.
-    data_source : DataSourceConfig, optional
-        Configuration for reading HDF5 data. Defaults to ATL06_CONFIG.
     config : PipelineConfig, optional
-        Pipeline config for aggregation dispatch. Defaults to ``default_config()``.
+        Pipeline config. Defaults to ``default_config()``.
 
     Returns
     -------
@@ -363,9 +268,7 @@ def process_morton_cell(
 
     if config is None:
         config = default_config()
-    if data_source is None:
-        data_source = ATL06_CONFIG
-    data_source.validate_schema()
+    data_source = config.data_source
 
     logger.info(f"Processing morton cell: {parent_morton}")
     start_time = datetime.now()
@@ -422,7 +325,7 @@ def process_morton_cell(
                 verbose=False,
             )
 
-            for g in data_source.groups:
+            for g in data_source["groups"]:
                 try:
                     df = _read_group(
                         h5obj, g, data_source, parent_morton, parent_order,
