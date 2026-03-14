@@ -206,8 +206,8 @@ def resolve_function(name: str) -> Callable:
 
     Resolution rules:
     - ``"len"`` or ``"count"`` -> builtin ``len``
-    - No dot (e.g. ``"min"``) -> ``numpy.<name>``
-    - Dotted path (e.g. ``"numpy.quantile"``) -> importlib resolution
+    - No dot (e.g. ``"min"``) -> ``np.<name>``
+    - Dotted path (e.g. ``"np.quantile"``) -> importlib resolution
 
     Parameters
     ----------
@@ -226,6 +226,10 @@ def resolve_function(name: str) -> Callable:
     if name in ("len", "count"):
         return len
 
+    # Normalize np. prefix to numpy lookup
+    if name.startswith("np."):
+        name = name[3:]
+
     if "." not in name:
         # numpy shorthand
         func = getattr(np, name, None)
@@ -233,7 +237,7 @@ def resolve_function(name: str) -> Callable:
             return func
         raise ValueError(f"Cannot resolve '{name}' as numpy function")
 
-    # Dotted path
+    # Dotted path (e.g. numpy.quantile)
     parts = name.rsplit(".", 1)
     try:
         mod = importlib.import_module(parts[0])
