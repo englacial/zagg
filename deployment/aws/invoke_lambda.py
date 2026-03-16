@@ -10,10 +10,12 @@ Usage:
     python deployment/aws/invoke_lambda.py --config atl06.yaml --catalog catalog.json --max-cells 10
     python deployment/aws/invoke_lambda.py --config atl06.yaml --catalog catalog.json --morton-cell -4211322
     python deployment/aws/invoke_lambda.py --config atl06.yaml --catalog catalog.json --dry-run
+    python deployment/aws/invoke_lambda.py --config atl06.yaml --catalog catalog.json --function-name my-lambda
 """
 
 import argparse
 import json
+import os
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
@@ -33,13 +35,12 @@ LAMBDA_PRICE_X86 = 0.0000166667  # per GB-second
 LAMBDA_PRICE_ARM = 0.0000133334  # per GB-second (20% cheaper)
 LAMBDA_MEMORY_MB = 2048
 LAMBDA_MEMORY_GB = LAMBDA_MEMORY_MB / 1024
-LAMBDA_FUNCTION_NAME = "process-morton-cell"
 
 
-def get_lambda_architecture(lambda_client) -> tuple[str, float]:
+def get_lambda_architecture(lambda_client, function_name: str) -> tuple[str, float]:
     """Detect Lambda architecture and return (arch, price_per_gb_second)."""
     try:
-        response = lambda_client.get_function(FunctionName=LAMBDA_FUNCTION_NAME)
+        response = lambda_client.get_function(FunctionName=function_name)
         architectures = response.get("Configuration", {}).get("Architectures", ["x86_64"])
         arch = architectures[0] if architectures else "x86_64"
         price = LAMBDA_PRICE_ARM if arch == "arm64" else LAMBDA_PRICE_X86
@@ -306,6 +307,11 @@ examples:
                         help="Overwrite existing Zarr template")
     parser.add_argument("--region", default="us-west-2", help="AWS region (default: us-west-2)")
     parser.add_argument("--output-dir", default=".", help="Directory for output results JSON")
+    parser.add_argument(
+        "--function-name",
+        default=os.environ.get("MAGG_LAMBDA_FUNCTION_NAME", "process-morton-cell"),
+        help="Lambda function name (default: env MAGG_LAMBDA_FUNCTION_NAME or 'process-morton-cell')",
+    )
     args = parser.parse_args()
 
     print("=" * 70)
@@ -392,7 +398,7 @@ examples:
     lambda_client = session.client("lambda", region_name=args.region, config=boto_config)
 
     # Detect architecture for accurate cost calculation
-    arch, price_per_gb_sec = get_lambda_architecture(lambda_client)
+    arch, price_per_gb_sec = get_lambda_architecture(lambda_client, args.function_name)
     print(f"      Architecture: {arch} (${price_per_gb_sec:.10f}/GB-sec)")
 
     results = []
@@ -423,6 +429,7 @@ examples:
                 catalog[cell],  # Granule URLs for this cell
                 store_path,
                 s3_creds,
+                function_name=args.function_name,
                 config_dict=config_dict,
             ): cell
             for cell in cells
@@ -489,8 +496,6 @@ examples:
     print("=" * 70)
 
     # Save results to JSON
-    import os
-
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     output_file = os.path.join(args.output_dir, f"production_results_{timestamp}.json")
     with open(output_file, "w") as f:

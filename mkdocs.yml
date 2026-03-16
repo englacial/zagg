@@ -12,6 +12,7 @@ extra:
 
 nav:
   - "index.md"
+  - "quickstart.md"
   - "API":
       - Config: "api/config.md"
       - Store: "api/store.md"
