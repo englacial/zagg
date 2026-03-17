@@ -18,6 +18,7 @@ from .processing import (
     process_morton_cell,
     write_dataframe_to_zarr,
 )
+from .runner import agg
 from .schema import xdggs_spec, xdggs_zarr_template
 from .store import open_store, parse_s3_path
 
@@ -32,6 +33,7 @@ __all__ = [
     "open_store",
     "parse_s3_path",
     "process_morton_cell",
+    "agg",
     "write_dataframe_to_zarr",
     "xdggs_spec",
     "xdggs_zarr_template",
