@@ -11,8 +11,15 @@ or used for local processing.
 __version__ = "0.1.0"
 
 # Export main processing functions
-from .auth import get_nsidc_s3_credentials
-from .config import PipelineConfig, default_config, get_child_order, get_store_path, load_config
+from .auth import get_edl_token, get_nsidc_s3_credentials
+from .config import (
+    PipelineConfig,
+    default_config,
+    get_child_order,
+    get_driver,
+    get_store_path,
+    load_config,
+)
 from .processing import (
     calculate_cell_statistics,
     process_morton_cell,
@@ -27,6 +34,8 @@ __all__ = [
     "calculate_cell_statistics",
     "default_config",
     "get_child_order",
+    "get_driver",
+    "get_edl_token",
     "get_nsidc_s3_credentials",
     "get_store_path",
     "load_config",

@@ -1,13 +1,33 @@
 """
-Orchestrator authentication helper for NASA Earthdata S3 access.
+Orchestrator authentication helpers for NASA Earthdata access.
 
-Call get_nsidc_s3_credentials() ONCE in your orchestrator before invoking
-Lambda functions. Pass the returned credentials to each Lambda invocation.
+Two credential types:
 
-Credentials are valid for approximately 1 hour.
+- **S3**: ``get_nsidc_s3_credentials()`` returns STS temporary credentials
+  for direct S3 access. Only works from within us-west-2.
+- **HTTPS**: ``get_edl_token()`` returns a bearer token for HTTPS access.
+  Works from anywhere.
+
+Call ONCE in the orchestrator before processing. Credentials are valid
+for approximately 1 hour.
 """
 
 import earthaccess
+
+
+def get_edl_token() -> str:
+    """Return an Earthdata Login bearer token for HTTPS data access.
+
+    Works from any network location (not region-restricted like S3).
+    The token is used by h5coro's HTTPDriver.
+
+    Returns
+    -------
+    str
+        Bearer token string.
+    """
+    auth = earthaccess.login()
+    return auth.token["access_token"]
 
 
 def get_nsidc_s3_credentials() -> dict:

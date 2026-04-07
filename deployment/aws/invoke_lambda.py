@@ -1,33 +1,25 @@
 #!/usr/bin/env python3
 """
-Production Lambda orchestrator for processing Antarctic morton cells.
+Production Lambda orchestrator with cost reporting.
 
-Uses pre-built granule catalog to avoid per-Lambda CMR queries.
-Reads output store path and child_order from pipeline config YAML.
+Thin wrapper around magg.agg(backend="lambda") that adds verbose progress
+output, architecture-based cost calculation, and results JSON export.
 
 Usage:
     python deployment/aws/invoke_lambda.py --config atl06.yaml --catalog catalog.json
     python deployment/aws/invoke_lambda.py --config atl06.yaml --catalog catalog.json --max-cells 10
-    python deployment/aws/invoke_lambda.py --config atl06.yaml --catalog catalog.json --morton-cell -4211322
     python deployment/aws/invoke_lambda.py --config atl06.yaml --catalog catalog.json --dry-run
-    python deployment/aws/invoke_lambda.py --config atl06.yaml --catalog catalog.json --function-name my-lambda
 """
 
 import argparse
 import json
 import os
-import time
-from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
 
 import boto3
-from botocore.config import Config
-from zarr import consolidate_metadata
 
-from magg.auth import get_nsidc_s3_credentials
-from magg.config import default_config, get_child_order, get_store_path, load_config
-from magg.schema import xdggs_zarr_template
-from magg.store import open_store
+from magg.config import default_config, get_store_path, load_config
+from magg.runner import agg
 
 # Lambda pricing (us-west-2)
 # https://aws.amazon.com/lambda/pricing/
@@ -37,10 +29,11 @@ LAMBDA_MEMORY_MB = 2048
 LAMBDA_MEMORY_GB = LAMBDA_MEMORY_MB / 1024
 
 
-def get_lambda_architecture(lambda_client, function_name: str) -> tuple[str, float]:
+def get_lambda_architecture(function_name: str, region: str) -> tuple[str, float]:
     """Detect Lambda architecture and return (arch, price_per_gb_second)."""
     try:
-        response = lambda_client.get_function(FunctionName=function_name)
+        client = boto3.client("lambda", region_name=region)
+        response = client.get_function(FunctionName=function_name)
         architectures = response.get("Configuration", {}).get("Architectures", ["x86_64"])
         arch = architectures[0] if architectures else "x86_64"
         price = LAMBDA_PRICE_ARM if arch == "arm64" else LAMBDA_PRICE_X86
@@ -49,234 +42,60 @@ def get_lambda_architecture(lambda_client, function_name: str) -> tuple[str, flo
         return "x86_64", LAMBDA_PRICE_X86
 
 
-def load_catalog(catalog_path: str) -> dict:
-    """Load granule catalog from JSON file."""
-    with open(catalog_path, "r") as f:
-        data = json.load(f)
-    return data
+def print_cost_summary(summary: dict, arch: str, price_per_gb_sec: float):
+    """Print cost breakdown from agg() results."""
+    lambda_time = summary.get("lambda_time_s", 0)
+    gb_seconds = lambda_time * LAMBDA_MEMORY_GB
+    cost = gb_seconds * price_per_gb_sec
+
+    print("\nCost Calculation")
+    print("-" * 70)
+    print(f"      Lambda execution time: {lambda_time:,.1f}s ({lambda_time / 3600:.2f} hours)")
+    print(f"      Memory: {LAMBDA_MEMORY_MB}MB ({LAMBDA_MEMORY_GB}GB)")
+    print(f"      Architecture: {arch}")
+    print(f"      GB-seconds: {gb_seconds:,.1f}")
+    print(f"      Cost: ${cost:.4f}")
+
+    return {"gb_seconds": gb_seconds, "architecture": arch,
+            "price_per_gb_sec": price_per_gb_sec, "estimated_cost_usd": cost}
 
 
-def parse_lambda_report(log_result: str) -> dict:
-    """
-    Parse Lambda REPORT line from logs to extract memory usage.
+def save_results(summary: dict, cost_info: dict, args, output_dir: str):
+    """Save detailed results to timestamped JSON."""
+    # Categorize results for detailed breakdown
+    cells_no_granules = 0
+    cells_no_data = 0
+    for r in summary.get("results", []):
+        error = r.get("error")
+        if error == "No granules found":
+            cells_no_granules += 1
+        elif error == "No data after filtering":
+            cells_no_data += 1
 
-    Example log line:
-    REPORT RequestId: xxx Duration: 1234.56 ms Billed Duration: 1235 ms Memory Size: 2048 MB Max Memory Used: 512 MB
-    """
-    import base64
-    import re
-
-    try:
-        logs = base64.b64decode(log_result).decode("utf-8")
-        # Find the REPORT line
-        for line in logs.split("\n"):
-            if "REPORT" in line and "Max Memory Used" in line:
-                # Extract max memory used
-                match = re.search(r"Max Memory Used:\s*(\d+)\s*MB", line)
-                if match:
-                    return {"max_memory_mb": int(match.group(1))}
-    except Exception:
-        pass
-    return {}
-
-
-def invoke_lambda(
-    lambda_client,
-    chunk_idx: int,
-    parent_morton: int,
-    parent_order: int,
-    child_order: int,
-    granule_urls: list,
-    store_path: str,
-    s3_credentials: dict,
-    function_name: str = "process-morton-cell",
-    max_retries: int = 3,
-    config_dict: dict = None,
-) -> dict:
-    """Invoke Lambda and return result with timing. Retries on throttling."""
-    wall_start = time.time()
-
-    event = {
-        "chunk_idx": chunk_idx,
-        "parent_morton": parent_morton,
-        "parent_order": parent_order,
-        "child_order": child_order,
-        "granule_urls": granule_urls,
-        "store_path": store_path,
-        "s3_credentials": {
-            "accessKeyId": s3_credentials["accessKeyId"],
-            "secretAccessKey": s3_credentials["secretAccessKey"],
-            "sessionToken": s3_credentials["sessionToken"],
-        },
-    }
-    if config_dict is not None:
-        event["config"] = config_dict
-
-    last_error = None
-    for attempt in range(max_retries):
-        try:
-            response = lambda_client.invoke(
-                FunctionName=function_name,
-                InvocationType="RequestResponse",
-                LogType="Tail",
-                Payload=json.dumps(event),
-            )
-
-            # Check for Lambda-level errors (timeout, OOM, crash)
-            function_error = response.get("FunctionError")
-            is_timeout = False
-            if function_error:
-                error_payload = response["Payload"].read().decode("utf-8")
-                if "Task timed out" in error_payload:
-                    is_timeout = True
-                    last_error = f"Lambda timeout: {error_payload[:100]}"
-                else:
-                    last_error = f"Lambda error ({function_error}): {error_payload[:100]}"
-                if not is_timeout:
-                    continue
-
-            result = json.loads(response["Payload"].read()) if not function_error else {}
-            wall_time = time.time() - wall_start
-
-            log_result = response.get("LogResult", "")
-            log_info = parse_lambda_report(log_result) if log_result else {}
-
-            try:
-                body = json.loads(result.get("body", "{}"))
-            except (json.JSONDecodeError, TypeError):
-                body = {}
-            lambda_duration = body.get("duration_s", 0)
-
-            return {
-                "morton": parent_morton,
-                "status_code": result.get("statusCode"),
-                "body": body,
-                "wall_time": wall_time,
-                "lambda_duration": lambda_duration,
-                "error": last_error if function_error else body.get("error"),
-                "retries": attempt,
-                "timeout": is_timeout,
-                "max_memory_mb": log_info.get("max_memory_mb"),
-                "granule_count": len(granule_urls),
-            }
-        except Exception as e:
-            last_error = str(e)
-            retryable = [
-                "TooManyRequestsException",
-                "Rate exceeded",
-                "Read timeout",
-                "timed out",
-                "UNEXPECTED_EOF",
-            ]
-            if any(x in last_error for x in retryable):
-                sleep_time = (2**attempt) + (time.time() % 1)
-                time.sleep(sleep_time)
-            else:
-                break
-
-    return {
-        "morton": parent_morton,
-        "status_code": None,
-        "body": {},
-        "wall_time": time.time() - wall_start,
-        "lambda_duration": 0,
-        "error": last_error,
-        "retries": max_retries,
-        "granule_count": len(granule_urls),
-    }
-
-
-def select_cells_to_process(
-    all_cells: list,
-    catalog: dict,
-    morton_cell: str = None,
-    max_cells: int = None,
-    sort_by_granules: bool = True,
-) -> tuple[list, dict]:
-    """
-    Select cells to process and create index mapping.
-
-    Returns:
-        tuple: (cells_to_process, cell_to_idx_mapping)
-    """
-    # Create mapping of all cells to their original indices
-    cell_to_idx = {cell: idx for idx, cell in enumerate(all_cells)}
-
-    # Select subset of cells
-    if morton_cell:
-        if morton_cell not in catalog:
-            raise ValueError(f"Morton cell '{morton_cell}' not found in catalog")
-        cells = [morton_cell]
-        original_idx = cell_to_idx[morton_cell]
-        print(f"      Processing specific cell: {morton_cell}")
-        print(f"      Original chunk_idx: {original_idx}")
-        print(f"      Granules for this cell: {len(catalog[morton_cell])}")
-    elif max_cells:
-        cells = all_cells[:max_cells]
-        print(f"      Limited to {len(cells)} cells (of {len(all_cells)} total)")
-    else:
-        cells = all_cells
-        print(f"      Processing {len(cells)} cells")
-
-    # Sort by granule count if requested
-    if sort_by_granules and not morton_cell:
-        cells_with_counts = [(cell, len(catalog[cell])) for cell in cells]
-        cells_with_counts.sort(key=lambda x: x[1], reverse=True)
-        cells = [cell for cell, count in cells_with_counts]
-        print("      Sorted by granule count (descending)")
-        print(f"      Range: {cells_with_counts[0][1]} → {cells_with_counts[-1][1]} granules")
-    elif sort_by_granules and morton_cell:
-        print("      Note: --sort-by-granules ignored (processing single cell)")
-
-    return cells, cell_to_idx
-
-
-def print_dry_run_stats(cells: list, catalog: dict):
-    """Print statistics for dry-run mode."""
-    print("\n[DRY RUN] Would process these cells:")
-    print(f"      Total: {len(cells)}")
-    print(f"      First 5: {cells[:5]}")
-    granule_counts = [len(catalog[c]) for c in cells]
-    print(
-        f"      Granules per cell: min={min(granule_counts)}, "
-        f"max={max(granule_counts)}, "
-        f"avg={sum(granule_counts) / len(granule_counts):.1f}"
-    )
-
-
-def categorize_result(result: dict) -> tuple[str, dict]:
-    """
-    Categorize Lambda result and return status string and counter updates.
-
-    Returns:
-        tuple: (status_string, counter_dict)
-    """
-    body = result["body"]
-    error = result.get("error")
-    counters = {
-        "cells_with_data": 0,
-        "cells_no_granules": 0,
-        "cells_no_data": 0,
-        "cells_error": 0,
-        "total_obs": 0,
-    }
-
-    if result["status_code"] == 200 and not error:
-        counters["cells_with_data"] = 1
-        obs = body.get("total_obs", 0)
-        counters["total_obs"] = obs
-        status = f"OK ({body.get('cells_with_data', 0)} cells, {obs:,} obs)"
-    elif error == "No granules found":
-        counters["cells_no_granules"] = 1
-        status = "empty (no granules)"
-    elif error == "No data after filtering":
-        counters["cells_no_data"] = 1
-        status = "empty (filtered)"
-    else:
-        counters["cells_error"] = 1
-        status = f"ERROR: {str(error)}"
-
-    return status, counters
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    output_file = os.path.join(output_dir, f"production_results_{timestamp}.json")
+    with open(output_file, "w") as f:
+        json.dump(
+            {
+                "config": vars(args),
+                "summary": {
+                    "total_cells": summary["total_cells"],
+                    "cells_with_data": summary["cells_with_data"],
+                    "cells_no_granules": cells_no_granules,
+                    "cells_no_data": cells_no_data,
+                    "cells_error": summary["cells_error"],
+                    "total_obs": summary["total_obs"],
+                    "wall_time_s": summary["wall_time_s"],
+                    "lambda_time_s": summary.get("lambda_time_s", 0),
+                    **cost_info,
+                },
+                "results": summary.get("results", []),
+            },
+            f,
+            indent=2,
+            default=str,
+        )
+    print(f"\nResults saved to: {output_file}")
 
 
 def main():
@@ -295,13 +114,7 @@ examples:
     parser.add_argument("--store", default=None, help="Output store path (overrides config)")
     parser.add_argument("--max-workers", type=int, default=1700, help="Max concurrent Lambda invocations")
     parser.add_argument("--max-cells", type=int, default=None, help="Limit number of cells (for testing)")
-    parser.add_argument(
-        "--morton-cell", type=str, default=None, help="Process a specific morton cell (e.g., -4211322)"
-    )
-    parser.add_argument(
-        "--sort-by-granules", action="store_true", default=True,
-        help="Sort cells by granule count (descending) to minimize wall-clock time",
-    )
+    parser.add_argument("--morton-cell", type=str, default=None, help="Process a specific morton cell")
     parser.add_argument("--dry-run", action="store_true", help="Show what would be processed")
     parser.add_argument("--overwrite-template", action="store_true", default=False,
                         help="Overwrite existing Zarr template")
@@ -314,216 +127,68 @@ examples:
     )
     args = parser.parse_args()
 
-    print("=" * 70)
-    print("Production Lambda Orchestrator - Catalog-Based")
-    print("=" * 70)
-
-    # Load pipeline config
+    # Load config
     if args.config:
-        print(f"\n      Loading pipeline config from {args.config}...")
         config = load_config(args.config)
     else:
         config = default_config()
 
-    child_order = get_child_order(config)
-
-    # Resolve store path: CLI > config > error
+    # Resolve store for validation
     store_path = args.store or get_store_path(config)
-    if not store_path:
-        parser.error("No store path (use --store or set output.store in config)")
-    if not store_path.startswith("s3://"):
+    if store_path and not store_path.startswith("s3://"):
         parser.error(f"Lambda orchestrator requires an S3 store path, got: {store_path}")
 
-    # Resolve catalog: CLI > config > error
-    catalog_path = args.catalog or config.catalog
-    if not catalog_path:
-        parser.error("No catalog specified (use --catalog or set catalog: in config)")
+    print("=" * 70)
+    print("Production Lambda Orchestrator")
+    print(f"  Config: {args.config or 'built-in atl06'}")
+    print(f"  Store: {store_path}")
+    print(f"  Function: {args.function_name}")
+    print("=" * 70)
 
-    # Step 1: Load catalog
-    print(f"\n[1/7] Loading granule catalog from {catalog_path}...")
-    catalog_data = load_catalog(catalog_path)
-    metadata = catalog_data["metadata"]
-    catalog = catalog_data["catalog"]
+    # Detect architecture for cost calculation
+    if not args.dry_run:
+        arch, price_per_gb_sec = get_lambda_architecture(args.function_name, args.region)
+        print(f"  Architecture: {arch} (${price_per_gb_sec:.10f}/GB-sec)")
 
-    parent_order = metadata["parent_order"]
-
-    print(f"      Product: {metadata.get('short_name', 'ATL06')}")
-    print(f"      Temporal: {metadata.get('start_date', '?')} to {metadata.get('end_date', '?')}")
-    if "cycle" in metadata:
-        print(f"      Cycle: {metadata['cycle']}")
-    print(f"      Parent order: {parent_order}, Child order: {child_order}")
-    print(f"      Total cells in catalog: {metadata['total_cells']}")
-    print(f"      Total granules: {metadata['total_granules']}")
-
-    # Select cells to process
-    all_cells = list(catalog.keys())
-    cells, cell_to_idx = select_cells_to_process(
-        all_cells, catalog, args.morton_cell, args.max_cells, args.sort_by_granules
+    # Run via agg()
+    summary = agg(
+        config,
+        catalog=args.catalog,
+        store=args.store,
+        backend="lambda",
+        max_cells=args.max_cells,
+        morton_cell=args.morton_cell,
+        max_workers=args.max_workers,
+        overwrite=args.overwrite_template,
+        dry_run=args.dry_run,
+        function_name=args.function_name,
+        region=args.region,
     )
 
     if args.dry_run:
-        print_dry_run_stats(cells, catalog)
+        print(f"\n[DRY RUN] Would process {summary['total_cells']} cells")
+        print(f"  Granules per cell: min={summary['granules_per_cell_min']}, "
+              f"max={summary['granules_per_cell_max']}, "
+              f"avg={summary['granules_per_cell_avg']:.1f}")
         return
 
-    # Step 2: Get credentials
-    print("\n[2/7] Authenticating with NASA Earthdata...")
-    s3_creds = get_nsidc_s3_credentials()
-    print(f"      Credentials expire: {s3_creds.get('expiration', 'N/A')}")
+    # Cost reporting (CLI-only, not in the library)
+    cost_info = print_cost_summary(summary, arch, price_per_gb_sec)
 
-    # Step 3: Create Zarr store
-    print("\n[3/7] Creating template Zarr store...")
-    print(f"      Output: {store_path}")
-    store = open_store(store_path, region=args.region)
-    store = xdggs_zarr_template(
-        store,
-        parent_order,
-        child_order,
-        overwrite=args.overwrite_template,
-        n_parent_cells=metadata["total_cells"],
-        config=config,
-    )
-
-    # Step 4: Invoke Lambdas in parallel
-    print(f"\n[4/7] Invoking {len(cells)} Lambda functions (max {args.max_workers} concurrent)...")
-
-    # Configure client with longer timeouts
-    boto_config = Config(
-        read_timeout=900,
-        connect_timeout=10,
-        retries={"max_attempts": 0},  # We handle retries ourselves
-        max_pool_connections=args.max_workers,
-    )
-
-    session = boto3.Session()
-    lambda_client = session.client("lambda", region_name=args.region, config=boto_config)
-
-    # Detect architecture for accurate cost calculation
-    arch, price_per_gb_sec = get_lambda_architecture(lambda_client, args.function_name)
-    print(f"      Architecture: {arch} (${price_per_gb_sec:.10f}/GB-sec)")
-
-    results = []
-
-    # Counters
-    cells_with_data = 0
-    cells_no_granules = 0
-    cells_no_data = 0
-    cells_error = 0
-    total_obs = 0
-    total_lambda_time = 0.0
-
-    # Serialize config to dict for Lambda event payload
-    from dataclasses import asdict
-
-    config_dict = asdict(config)
-
-    start_time = time.time()
-    with ThreadPoolExecutor(max_workers=args.max_workers) as executor:
-        futures = {
-            executor.submit(
-                invoke_lambda,
-                lambda_client,
-                cell_to_idx[cell],  # Use original index from catalog
-                int(cell),  # Convert string key back to int
-                parent_order,
-                child_order,
-                catalog[cell],  # Granule URLs for this cell
-                store_path,
-                s3_creds,
-                function_name=args.function_name,
-                config_dict=config_dict,
-            ): cell
-            for cell in cells
-        }
-
-        for i, future in enumerate(as_completed(futures), 1):
-            result = future.result()
-            results.append(result)
-
-            total_lambda_time += result["lambda_duration"]
-
-            # Categorize result and update counters
-            status, counters = categorize_result(result)
-            cells_with_data += counters["cells_with_data"]
-            cells_no_granules += counters["cells_no_granules"]
-            cells_no_data += counters["cells_no_data"]
-            cells_error += counters["cells_error"]
-            total_obs += counters["total_obs"]
-
-            # Progress update every 50 cells or on errors
-            if i % 50 == 0 or (cells_error > 0 and i <= 10):
-                elapsed = time.time() - start_time
-                rate = i / elapsed if elapsed > 0 else 0
-                eta = (len(cells) - i) / rate if rate > 0 else 0
-                print(
-                    f"      [{i:4d}/{len(cells)}] {status} | {rate:.1f} cells/s, ETA {eta / 60:.1f}m"
-                )
-
-    # Step 5: Consolidate metadata for quicker opening later
-    print("\n[5/7] Consolidating Zarr metadata...")
-    consolidate_metadata(store, zarr_format=3)
-
-    total_wall_time = time.time() - start_time
-
-    # Step 6: Calculate costs
-    print("\n[6/7] Cost Calculation")
-    print("-" * 70)
-    gb_seconds = total_lambda_time * LAMBDA_MEMORY_GB
-    cost = gb_seconds * price_per_gb_sec
-    print(
-        f"      Total Lambda execution time: {total_lambda_time:,.1f}s ({total_lambda_time / 3600:.2f} hours)"
-    )
-    print(f"      Memory: {LAMBDA_MEMORY_MB}MB ({LAMBDA_MEMORY_GB}GB)")
-    print(f"      Architecture: {arch}")
-    print(f"      GB-seconds: {gb_seconds:,.1f}")
-    print(f"      Cost: ${cost:.4f}")
-
-    # Step 7: Summary
-    print("\n[7/7] Summary")
+    # Summary
+    print("\nSummary")
     print("=" * 70)
-    print(f"      Total cells:          {len(cells)}")
-    print(f"      With data:            {cells_with_data}")
-    print(f"      Empty (no granules):  {cells_no_granules}")
-    print(f"      Empty (filtered):     {cells_no_data}")
-    print(f"      Errors:               {cells_error}")
-    print(f"      Total observations:   {total_obs:,}")
-    print("-" * 70)
-    print(f"      Wall clock time:      {total_wall_time:.1f}s ({total_wall_time / 60:.1f}m)")
-    print(f"      Lambda compute time:  {total_lambda_time:,.1f}s ({total_lambda_time / 60:.1f}m)")
-    print(f"      Throughput:           {len(cells) / total_wall_time:.1f} cells/sec")
-    print(f"      Estimated cost:       ${cost:.4f}")
-    print("-" * 70)
-    print(f"      Output location:      {store_path}")
+    print(f"      Total cells:         {summary['total_cells']}")
+    print(f"      With data:           {summary['cells_with_data']}")
+    print(f"      Errors:              {summary['cells_error']}")
+    print(f"      Total observations:  {summary['total_obs']:,}")
+    print(f"      Wall clock time:     {summary['wall_time_s']:.1f}s ({summary['wall_time_s'] / 60:.1f}m)")
+    print(f"      Estimated cost:      ${cost_info['estimated_cost_usd']:.4f}")
+    print(f"      Output:              {summary['store_path']}")
     print("=" * 70)
 
-    # Save results to JSON
-    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    output_file = os.path.join(args.output_dir, f"production_results_{timestamp}.json")
-    with open(output_file, "w") as f:
-        json.dump(
-            {
-                "config": vars(args),
-                "catalog_metadata": metadata,
-                "summary": {
-                    "total_cells": len(cells),
-                    "cells_with_data": cells_with_data,
-                    "cells_no_granules": cells_no_granules,
-                    "cells_no_data": cells_no_data,
-                    "cells_error": cells_error,
-                    "total_obs": total_obs,
-                    "wall_time_s": total_wall_time,
-                    "lambda_time_s": total_lambda_time,
-                    "gb_seconds": gb_seconds,
-                    "architecture": arch,
-                    "price_per_gb_sec": price_per_gb_sec,
-                    "estimated_cost_usd": cost,
-                },
-                "results": results,
-            },
-            f,
-            indent=2,
-            default=str,
-        )
-    print(f"\nResults saved to: {output_file}")
+    # Save results JSON
+    save_results(summary, cost_info, args, args.output_dir)
 
 
 if __name__ == "__main__":
