@@ -32,6 +32,8 @@ examples:
     parser.add_argument("--store", default=None, help="Output store path (overrides config)")
     parser.add_argument("--backend", default="local", choices=["local", "lambda"],
                         help="Execution backend (default: local)")
+    parser.add_argument("--driver", default=None, choices=["s3", "https"],
+                        help="Data access driver (default: from config, or s3)")
     parser.add_argument("--max-cells", type=int, default=None, help="Limit number of cells (for testing)")
     parser.add_argument("--morton-cell", type=str, default=None, help="Process a specific morton cell")
     parser.add_argument("--max-workers", type=int, default=None, help="Max concurrent workers")
@@ -54,6 +56,7 @@ examples:
         catalog=args.catalog,
         store=args.store,
         backend=args.backend,
+        driver=args.driver,
         max_cells=args.max_cells,
         morton_cell=args.morton_cell,
         max_workers=args.max_workers,

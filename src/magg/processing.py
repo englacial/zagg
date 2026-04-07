@@ -21,6 +21,25 @@ from magg.schema import ProcessingMetadata
 logger = logging.getLogger(__name__)
 
 
+def _make_url_rewriter(driver: str | None, catalog_metadata: dict | None):
+    """Return a function that converts a granule URL for the active driver."""
+    if driver == "https":
+        s3_base = (catalog_metadata or {}).get("s3_base", "")
+        https_base = (catalog_metadata or {}).get("https_base", "")
+        if s3_base and https_base:
+            def _rewrite(url):
+                return url.replace(s3_base, https_base, 1)
+            return _rewrite
+        raise ValueError(
+            "driver='https' requires catalog metadata with s3_base/https_base. "
+            "Rebuild the catalog with the latest magg to populate these fields."
+        )
+    # S3 driver: strip s3:// prefix (h5coro expects bucket/key)
+    def _rewrite_s3(url):
+        return url.replace("s3://", "", 1)
+    return _rewrite_s3
+
+
 def write_dataframe_to_zarr(
     df_out: pd.DataFrame,
     store: Store,
@@ -230,6 +249,8 @@ def process_morton_cell(
     s3_credentials: dict,
     h5coro_driver=None,
     config: PipelineConfig | None = None,
+    driver: str | None = None,
+    catalog_metadata: dict | None = None,
 ) -> Tuple[pd.DataFrame, ProcessingMetadata]:
     """
     Process one parent morton cell: read data, calculate statistics, return DataFrame.
@@ -248,11 +269,20 @@ def process_morton_cell(
     granule_urls : list
         List of S3 URLs or file paths to process
     s3_credentials : dict
-        Credentials for accessing data (format depends on driver)
+        Credentials for accessing data. For S3 driver: dict with
+        accessKeyId/secretAccessKey/sessionToken. For HTTPS driver:
+        dict with ``edl_token`` key (bearer token string).
     h5coro_driver : class, optional
-        h5coro driver class to use (e.g., s3driver.S3Driver). If None, auto-detect.
+        h5coro driver class. Overrides ``driver`` if provided.
     config : PipelineConfig, optional
         Pipeline config. Defaults to ``default_config()``.
+    driver : str, optional
+        Data access driver: ``"s3"`` or ``"https"``. Used to select
+        h5coro driver and rewrite URLs if needed. Defaults to
+        ``config.data_source.driver`` or ``"s3"``.
+    catalog_metadata : dict, optional
+        Catalog metadata containing ``s3_base`` and ``https_base`` for
+        URL rewriting when using the HTTPS driver.
 
     Returns
     -------
@@ -273,11 +303,16 @@ def process_morton_cell(
     logger.info(f"Processing morton cell: {parent_morton}")
     start_time = datetime.now()
 
-    # Auto-detect driver if not provided
+    # Resolve driver
     if h5coro_driver is None:
-        from h5coro import s3driver
-
-        h5coro_driver = s3driver.S3Driver
+        if driver is None:
+            driver = config.data_source.get("driver", "s3")
+        if driver == "https":
+            from h5coro import webdriver
+            h5coro_driver = webdriver.HTTPDriver
+        else:
+            from h5coro import s3driver
+            h5coro_driver = s3driver.S3Driver
 
     # Prepare metadata
     metadata: ProcessingMetadata = {
@@ -300,14 +335,20 @@ def process_morton_cell(
     logger.info(f"  Processing {len(granule_urls)} granules from catalog")
 
     # Prepare credentials for h5coro
-    credentials = {
-        "aws_access_key_id": s3_credentials.get("accessKeyId")
-        or s3_credentials.get("aws_access_key_id"),
-        "aws_secret_access_key": s3_credentials.get("secretAccessKey")
-        or s3_credentials.get("aws_secret_access_key"),
-        "aws_session_token": s3_credentials.get("sessionToken")
-        or s3_credentials.get("aws_session_token"),
-    }
+    if driver == "https":
+        credentials = s3_credentials.get("edl_token", s3_credentials)
+    else:
+        credentials = {
+            "aws_access_key_id": s3_credentials.get("accessKeyId")
+            or s3_credentials.get("aws_access_key_id"),
+            "aws_secret_access_key": s3_credentials.get("secretAccessKey")
+            or s3_credentials.get("aws_secret_access_key"),
+            "aws_session_token": s3_credentials.get("sessionToken")
+            or s3_credentials.get("aws_session_token"),
+        }
+
+    # Build URL rewriter for HTTPS driver
+    _rewrite_url = _make_url_rewriter(driver, catalog_metadata)
 
     all_dataframes = []
     files_processed = 0
@@ -315,7 +356,7 @@ def process_morton_cell(
     # Read files and filter spatially
     for s3_url in granule_urls:
         try:
-            resource_path = s3_url.replace("s3://", "")
+            resource_path = _rewrite_url(s3_url)
 
             h5obj = h5coro.H5Coro(
                 resource_path,

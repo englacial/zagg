@@ -291,11 +291,13 @@ def extract_granule_info(granule: dict) -> dict:
 
     related_urls = umm.get("RelatedUrls", [])
     s3_url = None
+    https_url = None
     for url_obj in related_urls:
         url = url_obj.get("URL", "")
         if url.startswith("s3://") and url.endswith(".h5"):
             s3_url = url
-            break
+        elif url.startswith("https://") and url.endswith(".h5") and url_obj.get("Type") == "GET DATA":
+            https_url = url
 
     points = []
     spatial_extent = umm.get("SpatialExtent", {})
@@ -313,6 +315,7 @@ def extract_granule_info(granule: dict) -> dict:
     return {
         "granule_id": granule_id,
         "s3_url": s3_url,
+        "https_url": https_url,
         "points": points,
     }
 
@@ -419,6 +422,51 @@ def build_catalog(
     logger.info(f"Pass 2: {len(catalog)} cells with granule mappings")
 
     return catalog, timings
+
+
+def _extract_base_urls(granules: list) -> dict:
+    """Extract S3 and HTTPS base URLs from the first granule with both.
+
+    The base URLs are stored in catalog metadata so the runner can rewrite
+    S3 URLs to HTTPS URLs at runtime without hardcoding provider paths.
+
+    The S3 URL ``s3://bucket/path/file.h5`` maps to the HTTPS URL
+    ``https://host/bucket/path/file.h5``. The file path (everything after
+    the bucket name) is identical in both, so we extract the S3 bucket
+    prefix and the HTTPS host+bucket prefix.
+
+    Parameters
+    ----------
+    granules : list
+        CMR granule list (only the first with both URLs is used).
+
+    Returns
+    -------
+    dict
+        ``{"s3_base": "s3://bucket", "https_base": "https://host/bucket"}``
+        or empty.
+    """
+    for granule in granules:
+        info = extract_granule_info(granule)
+        s3_url = info.get("s3_url")
+        https_url = info.get("https_url")
+        if s3_url and https_url:
+            # S3: s3://bucket/path/file.h5 → bucket
+            s3_after = s3_url.split("//", 1)[1]  # bucket/path/file.h5
+            s3_bucket = s3_after.split("/", 1)[0]  # bucket
+            s3_base = f"s3://{s3_bucket}"
+
+            # HTTPS: https://host/bucket/path/file.h5 → https://host/bucket
+            https_after = https_url.split("//", 1)[1]  # host/bucket/path/file.h5
+            # Find where the bucket name appears in the HTTPS path
+            bucket_idx = https_after.find(f"/{s3_bucket}")
+            if bucket_idx >= 0:
+                https_base = "https://" + https_after[: bucket_idx + 1 + len(s3_bucket)]
+            else:
+                # Bucket name not in HTTPS path — can't derive mapping
+                continue
+            return {"s3_base": s3_base, "https_base": https_base}
+    return {}
 
 
 def main():
@@ -535,6 +583,9 @@ examples:
             f"catalog_{args.short_name}_{start_date}_{end_date}_order{args.parent_order}.json"
         )
 
+    # Derive base URLs from first granule for driver URL rewriting
+    access_urls = _extract_base_urls(granules)
+
     output_metadata = {
         "short_name": args.short_name,
         "version": args.version,
@@ -545,6 +596,7 @@ examples:
         "total_granules": len(granules),
         "total_cells": len(catalog),
         "created": datetime.now().isoformat(),
+        **access_urls,
     }
     if args.cycle:
         output_metadata["cycle"] = args.cycle

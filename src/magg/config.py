@@ -322,6 +322,21 @@ def get_data_vars(config: PipelineConfig) -> list[str]:
     return list(config.aggregation.get("variables", {}).keys())
 
 
+def get_driver(config: PipelineConfig) -> str:
+    """Return the data access driver from the config.
+
+    Parameters
+    ----------
+    config : PipelineConfig
+
+    Returns
+    -------
+    str
+        ``"s3"`` or ``"https"``. Defaults to ``"s3"``.
+    """
+    return config.data_source.get("driver", "s3")
+
+
 def get_child_order(config: PipelineConfig) -> int:
     """Return child_order from the output grid config.
 

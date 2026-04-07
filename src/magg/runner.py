@@ -19,8 +19,8 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 
 from zarr import consolidate_metadata
 
-from magg.auth import get_nsidc_s3_credentials
-from magg.config import PipelineConfig, get_child_order, get_store_path
+from magg.auth import get_edl_token, get_nsidc_s3_credentials
+from magg.config import PipelineConfig, get_child_order, get_driver, get_store_path
 from magg.processing import process_morton_cell, write_dataframe_to_zarr
 from magg.schema import xdggs_zarr_template
 from magg.store import open_store
@@ -34,6 +34,7 @@ def agg(
     catalog: str | None = None,
     store: str | None = None,
     backend: str = "local",
+    driver: str | None = None,
     max_cells: int | None = None,
     morton_cell: str | None = None,
     max_workers: int | None = None,
@@ -55,6 +56,10 @@ def agg(
     backend : str
         Execution backend: ``"local"`` (ThreadPoolExecutor) or
         ``"lambda"`` (AWS Lambda invocation).
+    driver : str, optional
+        Data access driver: ``"s3"`` (direct S3, us-west-2 only) or
+        ``"https"`` (HTTPS, works anywhere). Overrides
+        ``config.data_source.driver``. Default ``"s3"``.
     max_cells : int, optional
         Limit number of cells to process (for testing).
     morton_cell : str, optional
@@ -87,21 +92,29 @@ def agg(
 
     child_order = get_child_order(config)
 
-    # Load catalog
+    # Resolve driver: kwarg > config > default
+    resolved_driver = driver or get_driver(config)
+
+    # Load catalog and determine cell count for worker capping
     catalog_data = _load_catalog(catalog_path)
+    n_cells = len(_select_cells(
+        catalog_data["catalog"], morton_cell=morton_cell, max_cells=max_cells,
+    ))
 
     if backend == "local":
         if max_workers is None:
             max_workers = 4
+        max_workers = min(max_workers, n_cells)
         return _run_local(
             config, catalog_data, store_path, child_order,
             max_cells=max_cells, morton_cell=morton_cell,
             max_workers=max_workers, overwrite=overwrite,
-            dry_run=dry_run, region=region,
+            dry_run=dry_run, region=region, driver=resolved_driver,
         )
     elif backend == "lambda":
         if max_workers is None:
             max_workers = 1700
+        max_workers = min(max_workers, n_cells)
         if not store_path.startswith("s3://"):
             raise ValueError(f"Lambda backend requires s3:// store path, got: {store_path}")
         if function_name is None:
@@ -150,7 +163,7 @@ def _dry_run_summary(cells: list[str], catalog: dict, store_path: str) -> dict:
 
 
 def _process_and_write(cell, chunk_idx, granule_urls, parent_order, child_order,
-                       s3_creds, zarr_store, config):
+                       s3_creds, zarr_store, config, driver=None, catalog_metadata=None):
     """Process a single cell and write results to store."""
     df_out, metadata = process_morton_cell(
         parent_morton=int(cell),
@@ -159,6 +172,8 @@ def _process_and_write(cell, chunk_idx, granule_urls, parent_order, child_order,
         granule_urls=granule_urls,
         s3_credentials=s3_creds,
         config=config,
+        driver=driver,
+        catalog_metadata=catalog_metadata,
     )
     if not df_out.empty:
         write_dataframe_to_zarr(
@@ -171,7 +186,8 @@ def _process_and_write(cell, chunk_idx, granule_urls, parent_order, child_order,
 
 
 def _run_local(config, catalog_data, store_path, child_order, *,
-               max_cells, morton_cell, max_workers, overwrite, dry_run, region):
+               max_cells, morton_cell, max_workers, overwrite, dry_run, region,
+               driver="s3"):
     """Run processing locally with ThreadPoolExecutor."""
     metadata = catalog_data["metadata"]
     catalog = catalog_data["catalog"]
@@ -179,13 +195,16 @@ def _run_local(config, catalog_data, store_path, child_order, *,
     all_cells = list(catalog.keys())
 
     cells = _select_cells(catalog, morton_cell=morton_cell, max_cells=max_cells)
-    logger.info(f"Processing {len(cells)} of {len(all_cells)} cells (local, {max_workers} workers)")
+    logger.info(f"Processing {len(cells)} of {len(all_cells)} cells (local, {max_workers} workers, driver={driver})")
 
     if dry_run:
         return _dry_run_summary(cells, catalog, store_path)
 
-    # Authenticate
-    s3_creds = get_nsidc_s3_credentials()
+    # Authenticate based on driver
+    if driver == "https":
+        s3_creds = {"edl_token": get_edl_token()}
+    else:
+        s3_creds = get_nsidc_s3_credentials()
 
     # Open store and create template
     zarr_store = open_store(store_path, region=region)
@@ -211,6 +230,7 @@ def _run_local(config, catalog_data, store_path, child_order, *,
                 cell, cell_to_idx[cell], catalog[cell],
                 parent_order, child_order,
                 s3_creds, zarr_store, config,
+                driver=driver, catalog_metadata=metadata,
             ): cell
             for cell in cells
         }
@@ -331,6 +351,7 @@ def _run_lambda(config, catalog_data, store_path, child_order, *,
                 cells_with_data += 1
             elif error not in ("No granules found", "No data after filtering"):
                 cells_error += 1
+                logger.warning(f"  [{i}/{len(cells)}] morton {result.get('morton')}: {error}")
 
             if i % 50 == 0:
                 elapsed = time.time() - start_time
