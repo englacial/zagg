@@ -16,30 +16,25 @@ import json
 import os
 from datetime import datetime
 
-import boto3
-
 from magg.config import default_config, get_store_path, load_config
+from magg.orchestrate import detect_architecture
 from magg.runner import agg
 
-# Lambda pricing (us-west-2)
-# https://aws.amazon.com/lambda/pricing/
-LAMBDA_PRICE_X86 = 0.0000166667  # per GB-second
-LAMBDA_PRICE_ARM = 0.0000133334  # per GB-second (20% cheaper)
 LAMBDA_MEMORY_MB = 2048
 LAMBDA_MEMORY_GB = LAMBDA_MEMORY_MB / 1024
+
+# Lambda pricing (us-west-2)
+LAMBDA_PRICE_X86 = 0.0000166667
+LAMBDA_PRICE_ARM = 0.0000133334
 
 
 def get_lambda_architecture(function_name: str, region: str) -> tuple[str, float]:
     """Detect Lambda architecture and return (arch, price_per_gb_second)."""
-    try:
-        client = boto3.client("lambda", region_name=region)
-        response = client.get_function(FunctionName=function_name)
-        architectures = response.get("Configuration", {}).get("Architectures", ["x86_64"])
-        arch = architectures[0] if architectures else "x86_64"
-        price = LAMBDA_PRICE_ARM if arch == "arm64" else LAMBDA_PRICE_X86
-        return arch, price
-    except Exception:
-        return "x86_64", LAMBDA_PRICE_X86
+    import boto3
+
+    client = boto3.client("lambda", region_name=region)
+    arch, price = detect_architecture(client, function_name)
+    return arch, price
 
 
 def print_cost_summary(summary: dict, arch: str, price_per_gb_sec: float):

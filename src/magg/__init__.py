@@ -11,12 +11,13 @@ or used for local processing.
 __version__ = "0.1.0"
 
 # Export main processing functions
-from .auth import get_edl_token, get_nsidc_s3_credentials
+from .auth import get_edl_token, get_nsidc_s3_credentials, get_s3_credentials
 from .config import (
     PipelineConfig,
     default_config,
     get_child_order,
     get_driver,
+    get_pipeline_type,
     get_store_path,
     load_config,
 )
@@ -31,18 +32,20 @@ from .store import open_store, parse_s3_path
 
 __all__ = [
     "PipelineConfig",
+    "agg",
     "calculate_cell_statistics",
     "default_config",
     "get_child_order",
     "get_driver",
     "get_edl_token",
     "get_nsidc_s3_credentials",
+    "get_pipeline_type",
+    "get_s3_credentials",
     "get_store_path",
     "load_config",
     "open_store",
     "parse_s3_path",
     "process_morton_cell",
-    "agg",
     "write_dataframe_to_zarr",
     "xdggs_spec",
     "xdggs_zarr_template",

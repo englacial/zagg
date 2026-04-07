@@ -39,6 +39,11 @@ lambda = [
     "cramjam",
     "astropy",
 ]
+temporal = [
+    "xarray[io]",
+    "h5netcdf",
+    "s3fs",
+]
 analysis = [
     "cubed>=0.24.0",
     "cubed-xarray>=0.0.9",
