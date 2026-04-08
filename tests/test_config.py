@@ -14,6 +14,7 @@ from magg.config import (
     get_child_order,
     get_coords,
     get_data_vars,
+    get_pipeline_type,
     get_store_path,
     load_config,
     load_config_from_dict,
@@ -432,3 +433,136 @@ class TestBoundsValidation:
     def test_none_bounds_ok(self, atl06_config):
         atl06_config.bounds = None
         validate_config(atl06_config)
+
+
+# ---------------------------------------------------------------------------
+# Pipeline type
+# ---------------------------------------------------------------------------
+
+class TestPipelineType:
+    def test_default_is_spatial(self, atl06_config):
+        assert get_pipeline_type(atl06_config) == "spatial"
+
+    def test_explicit_spatial(self):
+        d = {
+            "pipeline": {"type": "spatial"},
+            "data_source": {"variables": {"h_li": "/path"}},
+            "aggregation": {"variables": {"c": {"function": "len", "source": "h_li", "dtype": "int32"}}},
+            "output": {"grid": {"type": "healpix", "child_order": 12}},
+        }
+        cfg = load_config_from_dict(d)
+        assert get_pipeline_type(cfg) == "spatial"
+        validate_config(cfg)
+
+    def test_temporal_type(self):
+        cfg = default_config("merra2_storm")
+        assert get_pipeline_type(cfg) == "temporal"
+        validate_config(cfg)
+
+    def test_unknown_type_raises(self):
+        cfg = PipelineConfig(
+            data_source={"variables": {"h_li": "/path"}},
+            aggregation={"variables": {"c": {"function": "len", "source": "h_li", "dtype": "int32"}}},
+            output={"grid": {"type": "healpix", "child_order": 12}},
+            pipeline={"type": "foobar"},
+        )
+        with pytest.raises(ValueError, match="Unknown pipeline type"):
+            validate_config(cfg)
+
+    def test_missing_pipeline_defaults_spatial(self):
+        d = {
+            "data_source": {"variables": {"h_li": "/path"}},
+            "aggregation": {"variables": {"c": {"function": "len", "source": "h_li", "dtype": "int32"}}},
+            "output": {"grid": {"type": "healpix", "child_order": 12}},
+        }
+        cfg = load_config_from_dict(d)
+        assert get_pipeline_type(cfg) == "spatial"
+
+    def test_roundtrip_with_pipeline(self, atl06_config):
+        d = asdict(atl06_config)
+        restored = load_config_from_dict(d)
+        assert get_pipeline_type(restored) == "spatial"
+        assert restored.pipeline == {"type": "spatial"}
+
+    def test_temporal_no_grid_ok(self):
+        """Temporal pipelines don't need output.grid."""
+        cfg = default_config("merra2_storm")
+        assert "grid" not in cfg.output
+        validate_config(cfg)
+
+
+# ---------------------------------------------------------------------------
+# Temporal config validation
+# ---------------------------------------------------------------------------
+
+class TestTemporalValidation:
+    def test_merra2_storm_validates(self):
+        cfg = default_config("merra2_storm")
+        validate_config(cfg)
+
+    def test_missing_collection_ref(self):
+        cfg = PipelineConfig(
+            data_source={"collections": {"FOO": {"doi": "x"}}},
+            aggregation={"variables": {
+                "bad": {
+                    "variable": "T2M",
+                    "collection": "NONEXISTENT",
+                    "spatial_func": "max",
+                    "temporal_reducer": "max",
+                },
+            }},
+            output={"format": "hdf5"},
+            pipeline={"type": "temporal"},
+        )
+        with pytest.raises(ValueError, match="collection.*NONEXISTENT"):
+            validate_config(cfg)
+
+    def test_missing_required_field(self):
+        cfg = PipelineConfig(
+            data_source={"collections": {"FOO": {"doi": "x"}}},
+            aggregation={"variables": {
+                "bad": {
+                    "variable": "T2M",
+                    "collection": "FOO",
+                    # missing spatial_func and temporal_reducer
+                },
+            }},
+            output={"format": "hdf5"},
+            pipeline={"type": "temporal"},
+        )
+        with pytest.raises(ValueError, match="missing required field"):
+            validate_config(cfg)
+
+    def test_unknown_spatial_func(self):
+        cfg = PipelineConfig(
+            data_source={"collections": {"FOO": {"doi": "x"}}},
+            aggregation={"variables": {
+                "bad": {
+                    "variable": "T2M",
+                    "collection": "FOO",
+                    "spatial_func": "nonexistent",
+                    "temporal_reducer": "max",
+                },
+            }},
+            output={"format": "hdf5"},
+            pipeline={"type": "temporal"},
+        )
+        with pytest.raises(ValueError, match="unknown spatial_func"):
+            validate_config(cfg)
+
+    def test_no_collections_raises(self):
+        cfg = PipelineConfig(
+            data_source={"reader": "xarray"},
+            aggregation={"variables": {
+                "x": {
+                    "variable": "T2M",
+                    "collection": "FOO",
+                    "spatial_func": "max",
+                    "temporal_reducer": "max",
+                },
+            }},
+            output={"format": "hdf5"},
+            pipeline={"type": "temporal"},
+        )
+        with pytest.raises(ValueError, match="requires data_source.collections"):
+            validate_config(cfg)

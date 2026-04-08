@@ -1,0 +1,132 @@
+pipeline:
+  type: temporal
+
+data_source:
+  reader: xarray
+  collections:
+    T2M_TQV_SLP:
+      doi: "10.5067/3Z173KIE2TPD"
+      half_hour: false
+    VFLXQV_PRECIP:
+      doi: "10.5067/Q5GVUVUIVGO7"
+      half_hour: true
+    V850:
+      doi: "10.5067/VJAFPLI1CSIV"
+      half_hour: true
+    OMEGA:
+      doi: "10.5067/QBZ6MG944HW0"
+      half_hour: false
+    climatology:
+      doi: "10.5067/5ESKGQTZG7FO"
+      half_hour: false
+  static_data:
+    ais_mask: "AIS_Full_basins_Zwally_MERRA2grid_new.nc"
+    cell_areas: "MERRA2_gridarea.nc"
+    climatology: "MERRA2_monthly_climatology.nc"
+
+aggregation:
+  variables:
+    # --- T2M_TQV_SLP collection ---
+    max_T2m_ais:
+      variable: T2M
+      collection: T2M_TQV_SLP
+      spatial_func: max
+      temporal_reducer: max
+      mask: ais
+    max_T2M_anomaly_ais:
+      variable: T2M
+      collection: T2M_TQV_SLP
+      spatial_func: max
+      temporal_reducer: max
+      mask: ais
+      anomaly: true
+    max_IWV_ais:
+      variable: TQV
+      collection: T2M_TQV_SLP
+      spatial_func: max
+      temporal_reducer: max
+      mask: ais
+    max_IWV_anomaly_ais:
+      variable: TQV
+      collection: T2M_TQV_SLP
+      spatial_func: max
+      temporal_reducer: max
+      mask: ais
+      anomaly: true
+    min_SLP:
+      variable: SLP
+      collection: T2M_TQV_SLP
+      spatial_func: min
+      temporal_reducer: first_landfall
+      mask: ocean
+    max_SLP_gradient:
+      variable: SLP
+      collection: T2M_TQV_SLP
+      spatial_func: max_gradient
+      temporal_reducer: first_landfall
+      mask: ocean
+
+    # --- VFLXQV_PRECIP collection (non-precip) ---
+    avg_vIVT_ais:
+      variable: VFLXQV
+      collection: VFLXQV_PRECIP
+      spatial_func: weighted_mean
+      temporal_reducer: weighted_mean
+      mask: ais
+      negate: true
+    max_vIVT_ais:
+      variable: VFLXQV
+      collection: VFLXQV_PRECIP
+      spatial_func: max
+      temporal_reducer: max
+      mask: ais
+      negate: true
+    max_vIVT:
+      variable: VFLXQV
+      collection: VFLXQV_PRECIP
+      spatial_func: max
+      temporal_reducer: max
+      mask: full
+
+    # --- VFLXQV_PRECIP collection (precip — augmented mask) ---
+    cumulative_rainfall_ais:
+      variable: _rainfall
+      collection: VFLXQV_PRECIP
+      spatial_func: weighted_sum
+      temporal_reducer: sum
+      mask: ais
+      precip: true
+    cumulative_snowfall_ais:
+      variable: PRECSN
+      collection: VFLXQV_PRECIP
+      spatial_func: weighted_sum
+      temporal_reducer: sum
+      mask: ais
+      precip: true
+
+    # --- V850 collection ---
+    max_landfalling_v850hPa:
+      variable: V850
+      collection: V850
+      spatial_func: max
+      temporal_reducer: first_landfall
+      mask: ocean
+      negate: true
+    avg_landfalling_v850hPa:
+      variable: V850
+      collection: V850
+      spatial_func: weighted_mean
+      temporal_reducer: first_landfall
+      mask: ocean
+      negate: true
+
+    # --- OMEGA collection ---
+    avg_landfalling_minomega:
+      variable: OMEGA
+      collection: OMEGA
+      spatial_func: min_over_levels
+      temporal_reducer: first_landfall
+      mask: ais
+
+output:
+  format: hdf5
