@@ -14,7 +14,6 @@ from magg.temporal import (
     specs_from_config,
 )
 
-
 # ---------------------------------------------------------------------------
 # Accumulator tests
 # ---------------------------------------------------------------------------
@@ -262,6 +261,7 @@ class TestOrchestrate:
 
     def test_parse_billed_duration(self):
         import base64
+
         from magg.orchestrate import parse_billed_duration
         log = "REPORT RequestId: abc Duration: 1234.56 ms Billed Duration: 1235 ms Memory Size: 2048 MB Max Memory Used: 512 MB"
         encoded = base64.b64encode(log.encode()).decode()
@@ -274,6 +274,7 @@ class TestOrchestrate:
 
     def test_parse_max_memory(self):
         import base64
+
         from magg.orchestrate import parse_max_memory
         log = "REPORT RequestId: abc Duration: 100 ms Billed Duration: 100 ms Memory Size: 2048 MB Max Memory Used: 512 MB"
         encoded = base64.b64encode(log.encode()).decode()
