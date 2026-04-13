@@ -97,7 +97,12 @@ done
 # --- Clean build artifacts ---
 echo "Cleaning caches and test directories..."
 find "$BUILD_DIR" -type d -name "__pycache__" -exec rm -rf {} + 2>/dev/null || true
-find "$BUILD_DIR" -type d -name "*.dist-info" -exec rm -rf {} + 2>/dev/null || true
+# Strip dist-info except for packages whose code calls importlib.metadata.version()
+# at runtime. zarr / pydantic_zarr do this for in-package version checks; without
+# their dist-info, calls into ArraySpec.from_zarr fail with PackageNotFoundError.
+find "$BUILD_DIR" -type d -name "*.dist-info" \
+    ! -name "zarr-*" ! -name "pydantic_zarr-*" \
+    -exec rm -rf {} + 2>/dev/null || true
 find "$BUILD_DIR" -type d -name "tests" -exec rm -rf {} + 2>/dev/null || true
 find "$BUILD_DIR" -type d -name "test" -exec rm -rf {} + 2>/dev/null || true
 find "$BUILD_DIR" -name "*.pyc" -delete 2>/dev/null || true
