@@ -293,22 +293,13 @@ def _run_lambda(config, catalog_data, store_path, child_order, *,
     if dry_run:
         return _dry_run_summary(cells, catalog, store_path)
 
-    # Authenticate
+    # Authenticate (for per-cell NSIDC reads inside the Lambda)
     s3_creds = get_nsidc_s3_credentials()
-
-    # Create template
-    zarr_store = open_store(store_path, region=region)
-    zarr_store = xdggs_zarr_template(
-        zarr_store, parent_order, child_order,
-        overwrite=overwrite,
-        n_parent_cells=metadata["total_cells"],
-        config=config,
-    )
 
     cell_to_idx = {cell: idx for idx, cell in enumerate(all_cells)}
     config_dict = asdict(config)
 
-    # Configure boto3 client
+    # Configure boto3 client (created early so we can use it for setup/finalize)
     boto_config = Config(
         read_timeout=900,
         connect_timeout=10,
@@ -317,6 +308,17 @@ def _run_lambda(config, catalog_data, store_path, child_order, *,
     )
     lambda_client = boto3.Session().client(
         "lambda", region_name=region, config=boto_config,
+    )
+
+    # Create template via Lambda. The template write happens inside the
+    # function so the orchestrator only needs lambda:InvokeFunction; no
+    # direct S3 access to the output bucket is required (works cleanly
+    # for cross-account callers like CryoCloud).
+    _invoke_lambda_setup(
+        lambda_client, function_name, store_path,
+        parent_order=parent_order, child_order=child_order,
+        n_parent_cells=metadata["total_cells"],
+        overwrite=overwrite, config_dict=config_dict,
     )
 
     start_time = time.time()
@@ -358,8 +360,16 @@ def _run_lambda(config, catalog_data, store_path, child_order, *,
                 rate = i / elapsed if elapsed > 0 else 0
                 logger.info(f"  [{i:4d}/{len(cells)}] {rate:.1f} cells/s")
 
-    consolidate_metadata(zarr_store, zarr_format=3)
+    # Consolidate metadata via Lambda (same rationale as setup -- avoids
+    # requiring orchestrator-side S3 access).
+    _invoke_lambda_finalize(lambda_client, function_name, store_path)
     wall_time = time.time() - start_time
+
+    # Cost estimate: arm64 pricing = $0.0000133334/GB-second
+    memory_gb = 2.0  # Lambda memory in GB
+    gb_seconds = total_lambda_time * memory_gb
+    price_per_gb_sec = 0.0000133334
+    estimated_cost = gb_seconds * price_per_gb_sec
 
     summary = {
         "total_cells": len(cells),
@@ -368,13 +378,59 @@ def _run_lambda(config, catalog_data, store_path, child_order, *,
         "total_obs": total_obs,
         "wall_time_s": wall_time,
         "lambda_time_s": total_lambda_time,
+        "gb_seconds": gb_seconds,
+        "price_per_gb_sec": price_per_gb_sec,
+        "estimated_cost_usd": estimated_cost,
         "store_path": store_path,
         "backend": "lambda",
         "function_name": function_name,
         "results": results,
     }
     logger.info(f"Done: {cells_with_data} cells, {total_obs:,} obs, {cells_error} errors, {wall_time:.1f}s")
+    logger.info(f"Lambda compute: {total_lambda_time:.0f}s total, {gb_seconds:.0f} GB-s, ~${estimated_cost:.2f}")
     return summary
+
+
+def _invoke_lambda_setup(lambda_client, function_name, store_path, *,
+                         parent_order, child_order, n_parent_cells,
+                         overwrite, config_dict):
+    """Invoke Lambda in setup mode to create the zarr template."""
+    event = {
+        "mode": "setup",
+        "store_path": store_path,
+        "parent_order": parent_order,
+        "child_order": child_order,
+        "n_parent_cells": n_parent_cells,
+        "overwrite": overwrite,
+        "config": config_dict,
+    }
+    response = lambda_client.invoke(
+        FunctionName=function_name,
+        InvocationType="RequestResponse",
+        Payload=json.dumps(event),
+    )
+    payload = response["Payload"].read().decode("utf-8")
+    if response.get("FunctionError"):
+        raise RuntimeError(f"Lambda setup failed: {payload}")
+    result = json.loads(payload)
+    if result.get("statusCode") != 200:
+        raise RuntimeError(f"Lambda setup error: {result.get('body')}")
+
+
+def _invoke_lambda_finalize(lambda_client, function_name, store_path):
+    """Invoke Lambda in finalize mode to consolidate zarr metadata."""
+    event = {"mode": "finalize", "store_path": store_path}
+    response = lambda_client.invoke(
+        FunctionName=function_name,
+        InvocationType="RequestResponse",
+        Payload=json.dumps(event),
+    )
+    payload = response["Payload"].read().decode("utf-8")
+    if response.get("FunctionError"):
+        raise RuntimeError(f"Lambda finalize failed: {payload}")
+    result = json.loads(payload)
+    if result.get("statusCode") != 200:
+        raise RuntimeError(f"Lambda finalize error: {result.get('body')}")
 
 
 def _invoke_lambda_cell(
