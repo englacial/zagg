@@ -460,10 +460,12 @@ def _invoke_lambda_cell(
     last_error = None
     for attempt in range(max_retries):
         try:
+            # Note: LogType="Tail" is omitted because it requires CloudWatch
+            # log access in the function's account, which is not granted to
+            # cross-account callers. The tail data was unused anyway.
             response = lambda_client.invoke(
                 FunctionName=function_name,
                 InvocationType="RequestResponse",
-                LogType="Tail",
                 Payload=json.dumps(event),
             )
 
