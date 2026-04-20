@@ -1,10 +1,10 @@
-# magg
+# zagg
 
 Multi-resolution aggregation for point observations using morton/healpix indexing.
 
 ## Overview
 
-`magg` aggregates sparse point data (e.g., ICESat-2 ATL06 elevation measurements) into gridded products using HEALPix/morton spatial indexing. It is designed for massively parallel execution on commodity cloud workers (e.g., AWS Lambda), producing [Zarr v3](https://zarr-specs.readthedocs.io/en/latest/v3/core/v3.0.html) output following the [DGGS convention](https://github.com/zarr-conventions/dggs).
+`zagg` aggregates sparse point data (e.g., ICESat-2 ATL06 elevation measurements) into gridded products using HEALPix/morton spatial indexing. It is designed for massively parallel execution on commodity cloud workers (e.g., AWS Lambda), producing [Zarr v3](https://zarr-specs.readthedocs.io/en/latest/v3/core/v3.0.html) output following the [DGGS convention](https://github.com/zarr-conventions/dggs).
 
 Spatial filtering happens at two levels: a **bounding box** narrows the CMR
 granule query (which granule files to fetch), while a **polygon** controls
@@ -13,12 +13,12 @@ omitting them defaults to all Antarctic drainage basins.
 
 The library is organized into six modules:
 
-- **`magg.config`**: YAML-driven pipeline configuration — data source, aggregation, output grid, and optional store/catalog/bounds
-- **`magg.store`**: Store factory — opens local or S3 Zarr stores from path strings (`./output.zarr` or `s3://bucket/prefix`)
-- **`magg.catalog`**: CMR granule catalog builder — queries NASA CMR with date ranges, product names, and spatial polygons, then maps parent morton cells to S3 granule URLs
-- **`magg.schema`**: Zarr template creation from pipeline configuration
-- **`magg.processing`**: Core aggregation pipeline — reading HDF5, spatial filtering, statistics calculation, and Zarr writing
-- **`magg.auth`**: NASA Earthdata authentication for S3 access to NSIDC data
+- **`zagg.config`**: YAML-driven pipeline configuration — data source, aggregation, output grid, and optional store/catalog/bounds
+- **`zagg.store`**: Store factory — opens local or S3 Zarr stores from path strings (`./output.zarr` or `s3://bucket/prefix`)
+- **`zagg.catalog`**: CMR granule catalog builder — queries NASA CMR with date ranges, product names, and spatial polygons, then maps parent morton cells to S3 granule URLs
+- **`zagg.schema`**: Zarr template creation from pipeline configuration
+- **`zagg.processing`**: Core aggregation pipeline — reading HDF5, spatial filtering, statistics calculation, and Zarr writing
+- **`zagg.auth`**: NASA Earthdata authentication for S3 access to NSIDC data
 
 ## End-to-End Workflow
 
@@ -26,15 +26,15 @@ The library is organized into six modules:
 
 ```bash
 # ICESat-2 cycle (convenience):
-uv run python -m magg.catalog --cycle 22 --parent-order 6
+uv run python -m zagg.catalog --cycle 22 --parent-order 6
 
 # Date range, bbox-filtered to everything south of 60°S:
-uv run python -m magg.catalog \
+uv run python -m zagg.catalog \
     --start-date 2024-01-06 --end-date 2024-04-07 \
     --bbox -180,-90,180,-60 --parent-order 6
 
 # Custom region via GeoJSON polygon:
-uv run python -m magg.catalog \
+uv run python -m zagg.catalog \
     --start-date 2024-01-01 --end-date 2024-06-01 \
     --polygon my_region.geojson --parent-order 6
 ```
@@ -45,7 +45,7 @@ See [Catalog API](api/catalog.md) for full options.
 
 ```bash
 # Local processing:
-uv run python -m magg --config atl06.yaml --catalog catalog.json --store ./output.zarr
+uv run python -m zagg --config atl06.yaml --catalog catalog.json --store ./output.zarr
 
 # Lambda dispatch:
 uv run python deployment/aws/invoke_lambda.py --config atl06.yaml --catalog catalog.json
@@ -68,9 +68,9 @@ uv run jupyter notebook notebooks/rasterized_zarr.ipynb
 ## Quick example
 
 ```python
-from magg import default_config, get_child_order, open_store
-from magg.processing import process_morton_cell, write_dataframe_to_zarr
-from magg.auth import get_nsidc_s3_credentials
+from zagg import default_config, get_child_order, open_store
+from zagg.processing import process_morton_cell, write_dataframe_to_zarr
+from zagg.auth import get_nsidc_s3_credentials
 
 config = default_config("atl06")
 child_order = get_child_order(config)  # 12
@@ -94,10 +94,10 @@ write_dataframe_to_zarr(df_out, store, chunk_idx=0,
 
 ## Contributing
 
-1. Clone the repository: `git clone https://github.com/englacial/magg.git`
+1. Clone the repository: `git clone https://github.com/englacial/zagg.git`
 2. Install development dependencies: `uv sync --all-groups`
 3. Run the test suite: `uv run pytest`
 
 ## License
 
-`magg` is distributed under the terms of the [MIT](https://spdx.org/licenses/MIT.html) license.
+`zagg` is distributed under the terms of the [MIT](https://spdx.org/licenses/MIT.html) license.

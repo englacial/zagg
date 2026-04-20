@@ -1,25 +1,30 @@
+[build-system]
+requires = ["hatchling", "hatch-vcs"]
+build-backend = "hatchling.build"
+
 [project]
-name = "magg"
-version = "0.1.0"
+name = "zagg"
+dynamic = ["version"]
 description = "Multi-resolution aggregation for ICESat-2 ATL06 data using morton/healpix indexing"
 readme = "README.md"
 requires-python = ">=3.12"
 license = {file = "LICENSE"}
 authors = [
-    {name = "Shane Grisby"}
+    {name = "Shane Grigsby", email = "refuge@rocktalus.com"},
 ]
 classifiers = [
     "Development Status :: 3 - Alpha",
     "Intended Audience :: Science/Research",
     "License :: OSI Approved :: MIT License",
     "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
     "Topic :: Scientific/Engineering :: GIS",
 ]
 
 dependencies = [
-    "numpy==2.2.6",
-    "pandas==2.2.3",
-    "h5coro==0.0.8",
+    "numpy>=2.0",
+    "pandas>=2.2",
+    "h5coro>=0.0.8",
     "mortie>=0.6.3",
     "healpy",
     "earthaccess",
@@ -43,7 +48,7 @@ analysis = [
     "cubed>=0.24.0",
     "cubed-xarray>=0.0.9",
     "xarray[io]",
-    "xdggs @ git+https://github.com/xarray-contrib/xdggs.git@main",
+    "xdggs",
     "geopandas",
     "cartopy>=0.25.0",
     "matplotlib>=3.10.8",
@@ -53,18 +58,31 @@ test = [
     "pytest>=8.0",
 ]
 
-[build-system]
-requires = ["setuptools>=68", "wheel"]
-build-backend = "setuptools.build_meta"
+[project.urls]
+Homepage = "https://github.com/englacial/zagg"
+Repository = "https://github.com/englacial/zagg"
+Issues = "https://github.com/englacial/zagg/issues"
 
-[tool.setuptools]
-packages = ["magg"]
+[project.scripts]
+zagg = "zagg.__main__:main"
 
-[tool.setuptools.package-data]
-magg = ["configs/*.yaml"]
+[tool.hatch.version]
+source = "vcs"
 
-[tool.setuptools.package-dir]
-magg = "src/magg"
+[tool.hatch.build.hooks.vcs]
+version-file = "src/zagg/_version.py"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/zagg"]
+
+[tool.hatch.build.targets.sdist]
+only-include = [
+    "src/zagg",
+    "tests",
+    "README.md",
+    "LICENSE",
+    "pyproject.toml",
+]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
@@ -80,7 +98,7 @@ lint.select = ["E", "F", "W", "I", "N"]
 lint.ignore = ["E501"]
 
 [tool.ruff.lint.isort]
-known-first-party = ["magg"]
+known-first-party = ["zagg"]
 
 [dependency-groups]
 dev = [

@@ -1,5 +1,5 @@
 #!/bin/bash
-# Build Lambda function code zip (handler + magg package + non-layer deps)
+# Build Lambda function code zip (handler + zagg package + non-layer deps)
 #
 # Usage:
 #   ./build_function.sh              # auto-detect arch and python
@@ -45,9 +45,9 @@ echo "============================================================"
 
 # --- Copy our code ---
 echo ""
-echo "Copying handler and magg package..."
+echo "Copying handler and zagg package..."
 cp "$REPO_ROOT/deployment/aws/lambda_handler.py" "$BUILD_DIR/"
-cp -r "$REPO_ROOT/src/magg" "$BUILD_DIR/magg"
+cp -r "$REPO_ROOT/src/zagg" "$BUILD_DIR/zagg"
 
 # --- Install function-level dependencies ---
 # These are packages NOT in the Lambda layer.

@@ -8,17 +8,17 @@ The catalog CLI accepts date ranges, product names, and spatial polygons:
 
 ```bash
 # ICESat-2 convenience (cycle → date range):
-python -m magg.catalog --cycle 22 --parent-order 6
+python -m zagg.catalog --cycle 22 --parent-order 6
 
 # Explicit date range:
-python -m magg.catalog --start-date 2024-01-06 --end-date 2024-04-07 --parent-order 6
+python -m zagg.catalog --start-date 2024-01-06 --end-date 2024-04-07 --parent-order 6
 
 # Custom region via GeoJSON polygon:
-python -m magg.catalog --start-date 2024-01-01 --end-date 2024-06-01 \
+python -m zagg.catalog --start-date 2024-01-01 --end-date 2024-06-01 \
     --polygon my_region.geojson --parent-order 6
 
 # Different product:
-python -m magg.catalog --start-date 2024-01-01 --end-date 2024-06-01 \
+python -m zagg.catalog --start-date 2024-01-01 --end-date 2024-06-01 \
     --short-name ATL08 --polygon my_region.geojson --parent-order 6
 ```
 
@@ -31,28 +31,28 @@ When no polygon is given, Antarctic drainage basins are used as the default (sui
 
 ## Temporal Helpers
 
-::: magg.catalog.cycle_to_dates
+::: zagg.catalog.cycle_to_dates
 
 ## Spatial Helpers
 
-::: magg.catalog.load_polygon
+::: zagg.catalog.load_polygon
 
-::: magg.catalog.polygon_to_bbox
+::: zagg.catalog.polygon_to_bbox
 
 ## Cell Discovery
 
-::: magg.catalog.load_antarctic_basins
+::: zagg.catalog.load_antarctic_basins
 
-::: magg.catalog.discover_cells
+::: zagg.catalog.discover_cells
 
 ## CMR Query
 
-::: magg.catalog.query_cmr
+::: zagg.catalog.query_cmr
 
 ## Catalog Builder
 
-::: magg.catalog.build_catalog
+::: zagg.catalog.build_catalog
 
 ## Granule Parsing
 
-::: magg.catalog.extract_granule_info
+::: zagg.catalog.extract_granule_info

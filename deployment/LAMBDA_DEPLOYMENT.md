@@ -9,8 +9,8 @@ for testing. The target architecture is **arm64 / py3.12** (20% cheaper per GB-s
 - **Runtime**: python3.11
 - **Architecture**: x86_64
 - **Layer**: `xagg-dependencies:1` (x86_64, py3.11, h5coro==0.0.8)
-- **Function code**: `lambda_handler.py` + `magg/` package + obstore/zarr/pydantic/pyyaml
-- **Role**: `magg-lambda-execution` (scoped to `xagg` bucket)
+- **Function code**: `lambda_handler.py` + `zagg/` package + obstore/zarr/pydantic/pyyaml
+- **Role**: `zagg-lambda-execution` (scoped to `xagg` bucket)
 
 ### What's in the layer vs function code
 
@@ -19,7 +19,7 @@ numpy, pandas, h5coro, mortie, healpy, earthaccess, boto3, astropy, shapely, cra
 fastparquet, requests, s3fs, and transitive deps.
 
 **Function code** (20MB unzipped):
-`lambda_handler.py`, `magg/` package, obstore, zarr, pydantic-zarr, pyyaml, pydantic,
+`lambda_handler.py`, `zagg/` package, obstore, zarr, pydantic-zarr, pyyaml, pydantic,
 pydantic-core, typeguard, typing_inspect, annotated-types.
 
 ---
@@ -67,7 +67,7 @@ cd /tmp/layer_build && zip -qr /tmp/lambda_layer_arm64.zip python/
 
 # Publish
 aws lambda publish-layer-version \
-  --layer-name magg-deps-arm64 \
+  --layer-name zagg-deps-arm64 \
   --compatible-runtimes python3.12 \
   --compatible-architectures arm64 \
   --zip-file fileb:///tmp/lambda_layer_arm64.zip \
@@ -77,7 +77,7 @@ aws lambda publish-layer-version \
 aws lambda update-function-configuration \
   --function-name process-morton-cell \
   --runtime python3.12 \
-  --layers "arn:aws:lambda:us-west-2:429435741471:layer:magg-deps-arm64:1" \
+  --layers "arn:aws:lambda:us-west-2:429435741471:layer:zagg-deps-arm64:1" \
   --region us-west-2
 
 # Then update code with arm64 arch
@@ -95,7 +95,7 @@ option because Linux ARM64 runners have had issues building some of our deps.
 
 Key findings:
 - `macos-15` runners use M1 Apple Silicon (ARM64), 3 CPUs, 7GB RAM
-- Free for public repos (englacial/magg is public), $0.062/min for private
+- Free for public repos (englacial/zagg is public), $0.062/min for private
 - Docker is NOT available on macOS ARM64 runners (Apple Virtualization limitation)
 - `pip install --platform manylinux2014_aarch64 --only-binary=:all:` works from macOS
   to cross-compile Lambda layers — no Docker needed
@@ -116,13 +116,13 @@ Then unzip wheels into the build directory. This is what we're doing now for tes
 
 ## Deploying Updated Function Code (no layer change)
 
-When only `lambda_handler.py` or `magg/` package code changes (no new deps):
+When only `lambda_handler.py` or `zagg/` package code changes (no new deps):
 
 ```bash
 # Build zip
 rm -rf /tmp/lambda_build && mkdir -p /tmp/lambda_build
 cp deployment/aws/lambda_handler.py /tmp/lambda_build/
-cp -r src/magg /tmp/lambda_build/magg
+cp -r src/zagg /tmp/lambda_build/zagg
 
 # Add deps not in layer (skip native ones if already unpacked)
 pip install --target /tmp/lambda_build --no-deps \
@@ -186,7 +186,7 @@ deps from the layer into the function code (or vice versa).
 ### Scripts
 - `deployment/aws/build_layer_v14.sh` — x86_64 layer build (runs in AL2023 Docker container)
 - `deployment/aws/build_arm64_layer.sh` — arm64 layer build (runs in manylinux Docker container)
-- `deployment/aws/build_function.sh` — function code build (handler + magg + non-layer deps)
+- `deployment/aws/build_function.sh` — function code build (handler + zagg + non-layer deps)
 
 ### CI/CD
 - `.github/workflows/lambda-build.yml` — builds both layer + function for x86_64 and arm64,

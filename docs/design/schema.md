@@ -6,7 +6,7 @@ The YAML pipeline config (`configs/atl06.yaml`) is the single source of truth fo
 
 - **Column definitions and types** --- coordinate columns (`cell_ids`, `morton`) and data variables (`count`, `h_mean`, etc.)
 - **Aggregation recipes** --- each data variable specifies a `function` (resolved via `resolve_function()`) or an `expression` (evaluated at runtime), plus `source` column and `params`
-- **Zarr array configuration** --- dtype and fill value per column, used by [`xdggs_spec`][magg.schema.xdggs_spec] to generate the Zarr template
+- **Zarr array configuration** --- dtype and fill value per column, used by [`xdggs_spec`][zagg.schema.xdggs_spec] to generate the Zarr template
 
 Coordinate and data variable column names are derived from the config via `get_coords()` and `get_data_vars()`, not hardcoded.
 
@@ -27,7 +27,7 @@ Each variable in `aggregation.variables` carries metadata describing its behavio
 
 ## Aggregation Dispatch
 
-[`calculate_cell_statistics`][magg.processing.calculate_cell_statistics] is config-driven: it iterates the aggregation variable metadata and dispatches via `resolve_function()` (for `function`-based fields) or `evaluate_expression()` (for `expression`-based fields).
+[`calculate_cell_statistics`][zagg.processing.calculate_cell_statistics] is config-driven: it iterates the aggregation variable metadata and dispatches via `resolve_function()` (for `function`-based fields) or `evaluate_expression()` (for `expression`-based fields).
 
 Available aggregation functions (via numpy or dotted import paths):
 

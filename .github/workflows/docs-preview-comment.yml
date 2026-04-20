@@ -85,7 +85,7 @@ jobs:
       run: |
         npm install -g surge
 
-        SURGE_DOMAIN="magg-pr-${{ needs.check-comment.outputs.pr_number }}.surge.sh"
+        SURGE_DOMAIN="zagg-pr-${{ needs.check-comment.outputs.pr_number }}.surge.sh"
 
         cd site
         surge . $SURGE_DOMAIN --token ${{ secrets.SURGE_TOKEN }} || {

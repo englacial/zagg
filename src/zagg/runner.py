@@ -2,7 +2,7 @@
 
 Usage from Python (e.g., Jupyter notebook)::
 
-    from magg import load_config, agg
+    from zagg import load_config, agg
 
     config = load_config("atl06.yaml")
     results = agg(config, catalog="catalog.json", store="./output.zarr", max_cells=5)
@@ -19,11 +19,11 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 
 from zarr import consolidate_metadata
 
-from magg.auth import get_edl_token, get_nsidc_s3_credentials
-from magg.config import PipelineConfig, get_child_order, get_driver, get_store_path
-from magg.processing import process_morton_cell, write_dataframe_to_zarr
-from magg.schema import xdggs_zarr_template
-from magg.store import open_store
+from zagg.auth import get_edl_token, get_nsidc_s3_credentials
+from zagg.config import PipelineConfig, get_child_order, get_driver, get_store_path
+from zagg.processing import process_morton_cell, write_dataframe_to_zarr
+from zagg.schema import xdggs_zarr_template
+from zagg.store import open_store
 
 logger = logging.getLogger(__name__)
 
@@ -71,7 +71,7 @@ def agg(
     dry_run : bool
         Preview what would be processed without running.
     function_name : str, optional
-        Lambda function name. Defaults to env ``MAGG_LAMBDA_FUNCTION_NAME``
+        Lambda function name. Defaults to env ``ZAGG_LAMBDA_FUNCTION_NAME``
         or ``"process-morton-cell"``. Only used with ``backend="lambda"``.
     region : str
         AWS region for S3 and Lambda. Default ``"us-west-2"``.
@@ -118,7 +118,7 @@ def agg(
         if not store_path.startswith("s3://"):
             raise ValueError(f"Lambda backend requires s3:// store path, got: {store_path}")
         if function_name is None:
-            function_name = os.environ.get("MAGG_LAMBDA_FUNCTION_NAME", "process-morton-cell")
+            function_name = os.environ.get("ZAGG_LAMBDA_FUNCTION_NAME", "process-morton-cell")
         return _run_lambda(
             config, catalog_data, store_path, child_order,
             max_cells=max_cells, morton_cell=morton_cell,

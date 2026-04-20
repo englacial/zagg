@@ -60,8 +60,8 @@ aws s3 cp deployment/layers/lambda_layer_arm64.zip s3://your-bucket/layers/
 
 # Create/update layer
 aws lambda publish-layer-version \
-    --layer-name magg-layer-arm64 \
-    --description "magg dependencies for ARM64/Graviton2" \
+    --layer-name zagg-layer-arm64 \
+    --description "zagg dependencies for ARM64/Graviton2" \
     --content S3Bucket=your-bucket,S3Key=layers/lambda_layer_arm64.zip \
     --compatible-runtimes python3.12 \
     --compatible-architectures arm64

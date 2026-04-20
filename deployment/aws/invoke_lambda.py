@@ -2,7 +2,7 @@
 """
 Production Lambda orchestrator with cost reporting.
 
-Thin wrapper around magg.agg(backend="lambda") that adds verbose progress
+Thin wrapper around zagg.agg(backend="lambda") that adds verbose progress
 output, architecture-based cost calculation, and results JSON export.
 
 Usage:
@@ -18,8 +18,8 @@ from datetime import datetime
 
 import boto3
 
-from magg.config import default_config, get_store_path, load_config
-from magg.runner import agg
+from zagg.config import default_config, get_store_path, load_config
+from zagg.runner import agg
 
 # Lambda pricing (us-west-2)
 # https://aws.amazon.com/lambda/pricing/
@@ -122,8 +122,8 @@ examples:
     parser.add_argument("--output-dir", default=".", help="Directory for output results JSON")
     parser.add_argument(
         "--function-name",
-        default=os.environ.get("MAGG_LAMBDA_FUNCTION_NAME", "process-morton-cell"),
-        help="Lambda function name (default: env MAGG_LAMBDA_FUNCTION_NAME or 'process-morton-cell')",
+        default=os.environ.get("ZAGG_LAMBDA_FUNCTION_NAME", "process-morton-cell"),
+        help="Lambda function name (default: env ZAGG_LAMBDA_FUNCTION_NAME or 'process-morton-cell')",
     )
     args = parser.parse_args()
 

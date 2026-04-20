@@ -4,12 +4,12 @@ import pytest
 from zarr import open_group
 from zarr.storage import MemoryStore
 
-from magg.config import default_config, get_agg_fields, get_coords, get_data_vars
-from magg.processing import (
+from zagg.config import default_config, get_agg_fields, get_coords, get_data_vars
+from zagg.processing import (
     calculate_cell_statistics,
     write_dataframe_to_zarr,
 )
-from magg.schema import xdggs_zarr_template
+from zagg.schema import xdggs_zarr_template
 
 
 class TestWriteDataframeToZarr:

@@ -3,7 +3,7 @@ import pandas as pd
 import pytest
 from zarr.storage import MemoryStore
 
-from magg.config import default_config, get_data_vars
+from zagg.config import default_config, get_data_vars
 
 
 @pytest.fixture
