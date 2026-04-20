@@ -11,8 +11,8 @@
 
 set -e
 
-FUNCTION_NAME="${MAGG_LAMBDA_FUNCTION_NAME:-process-morton-cell}"
-S3_BUCKET="${MAGG_S3_BUCKET:-xagg}"
+FUNCTION_NAME="${ZAGG_LAMBDA_FUNCTION_NAME:-process-morton-cell}"
+S3_BUCKET="${ZAGG_S3_BUCKET:-xagg}"
 REGION="us-west-2"
 ARCH="arm64"
 FUNCTION_ONLY=false
@@ -28,8 +28,8 @@ for arg in "$@"; do
 done
 
 case "$ARCH" in
-    arm64)  RUNTIME="python3.12"; LAYER_NAME="magg-deps-arm64" ;;
-    x86_64) RUNTIME="python3.11"; LAYER_NAME="magg-deps-x86_64" ;;
+    arm64)  RUNTIME="python3.12"; LAYER_NAME="zagg-deps-arm64" ;;
+    x86_64) RUNTIME="python3.11"; LAYER_NAME="zagg-deps-x86_64" ;;
 esac
 
 echo "============================================================"

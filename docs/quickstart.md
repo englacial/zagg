@@ -1,6 +1,6 @@
 # Quickstart
 
-Zero-to-working setup for `magg`.
+Zero-to-working setup for `zagg`.
 
 ## Prerequisites
 
@@ -12,14 +12,14 @@ Zero-to-working setup for `magg`.
 ## Installation
 
 ```bash
-git clone https://github.com/englacial/magg.git
-cd magg
+git clone https://github.com/englacial/zagg.git
+cd zagg
 uv sync --all-groups
 ```
 
 ## NASA Earthdata Authentication
 
-`magg` reads ICESat-2 ATL06 data from NSIDC's S3 buckets in AWS `us-west-2`.
+`zagg` reads ICESat-2 ATL06 data from NSIDC's S3 buckets in AWS `us-west-2`.
 This requires NASA Earthdata credentials. Three methods, in order of precedence:
 
 **1. Environment variables**
@@ -53,7 +53,7 @@ The catalog step queries NASA's CMR API (public, no auth needed) and builds a
 morton-cell-to-granule mapping:
 
 ```bash
-uv run python -m magg.catalog --cycle 22 --parent-order 6
+uv run python -m zagg.catalog --cycle 22 --parent-order 6
 ```
 
 This produces a JSON file (e.g., `catalog_ATL06_cycle22_order6.json`) that maps
@@ -66,12 +66,12 @@ The simplest path -- no AWS Lambda needed:
 
 ```bash
 # Process one cell, write to local Zarr:
-uv run python -m magg --config src/magg/configs/atl06.yaml \
+uv run python -m zagg --config src/zagg/configs/atl06.yaml \
     --catalog catalog_ATL06_cycle22_order6.json \
     --store ./output.zarr --max-cells 1
 
 # Dry run (shows what would happen, no processing):
-uv run python -m magg --config src/magg/configs/atl06.yaml \
+uv run python -m zagg --config src/zagg/configs/atl06.yaml \
     --catalog catalog_ATL06_cycle22_order6.json --dry-run
 ```
 
@@ -80,7 +80,7 @@ uv run python -m magg --config src/magg/configs/atl06.yaml \
 To write output to S3, set the store path to an S3 URI:
 
 ```bash
-uv run python -m magg --config src/magg/configs/atl06.yaml \
+uv run python -m zagg --config src/zagg/configs/atl06.yaml \
     --catalog catalog_ATL06_cycle22_order6.json \
     --store s3://my-bucket/output.zarr
 ```
@@ -93,7 +93,7 @@ This requires AWS credentials configured via one of:
 
 ## Lambda Deployment (Optional)
 
-For full-scale processing, `magg` dispatches work to AWS Lambda. See
+For full-scale processing, `zagg` dispatches work to AWS Lambda. See
 [Lambda Deployment](deployment/lambda.md) for details. The short version:
 
 1. **AWS prerequisites**: IAM role with S3 + Lambda permissions, S3 bucket for output
@@ -105,7 +105,7 @@ python deployment/aws/invoke_lambda.py --config atl06.yaml --catalog catalog.jso
 ```
 
 The function name defaults to `process-morton-cell` but is configurable via
-the `MAGG_LAMBDA_FUNCTION_NAME` environment variable.
+the `ZAGG_LAMBDA_FUNCTION_NAME` environment variable.
 
 ## Configuration
 
@@ -144,6 +144,6 @@ catalog: catalog_ATL06_cycle22_order6.json
 store: ./output.zarr
 ```
 
-See `src/magg/configs/atl06.yaml` for a complete example and the
-[custom aggregations notebook](https://github.com/englacial/magg/blob/main/notebooks/custom_aggregations.ipynb)
+See `src/zagg/configs/atl06.yaml` for a complete example and the
+[custom aggregations notebook](https://github.com/englacial/zagg/blob/main/notebooks/custom_aggregations.ipynb)
 for customization examples.

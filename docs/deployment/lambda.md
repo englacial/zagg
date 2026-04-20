@@ -23,7 +23,7 @@ The Lambda function processes a single morton cell (order 6) by:
 │  ──────────────────────────────────────────────────────────  │
 │  Code (~5 MB):                                              │
 │    - deployment/aws/lambda_handler.py (AWS wrapper)         │
-│    - src/magg/ package (processing, auth, catalog)          │
+│    - src/zagg/ package (processing, auth, catalog)          │
 │  ──────────────────────────────────────────────────────────  │
 │  Layer (~70 MB compressed, ~240 MB uncompressed):           │
 │    - numpy, pandas, h5coro, mortie, healpy                  │
@@ -37,9 +37,9 @@ The Lambda function processes a single morton cell (order 6) by:
 | File | Purpose |
 |------|---------|
 | `deployment/aws/lambda_handler.py` | AWS Lambda wrapper function |
-| `src/magg/processing.py` | Cloud-agnostic core processing logic |
-| `src/magg/auth.py` | NASA Earthdata authentication helper |
-| `src/magg/catalog.py` | CMR granule catalog builder |
+| `src/zagg/processing.py` | Cloud-agnostic core processing logic |
+| `src/zagg/auth.py` | NASA Earthdata authentication helper |
+| `src/zagg/catalog.py` | CMR granule catalog builder |
 | `deployment/aws/invoke_lambda.py` | Orchestration script |
 | `deployment/aws/build_arm64_layer.sh` | ARM64 Lambda layer build script |
 
@@ -79,7 +79,7 @@ The Lambda function processes a single morton cell (order 6) by:
 Credentials are obtained by the orchestrator once before invoking Lambda functions:
 
 ```python
-from magg.auth import get_nsidc_s3_credentials
+from zagg.auth import get_nsidc_s3_credentials
 
 # Get credentials (valid for ~1 hour)
 s3_creds = get_nsidc_s3_credentials()
@@ -102,11 +102,11 @@ This approach avoids rate limiting from 1,872 simultaneous NASA logins and elimi
 ### Step 1: Create the function package
 
 ```bash
-cd /path/to/magg
+cd /path/to/zagg
 
-# Create function.zip with handler and magg package
+# Create function.zip with handler and zagg package
 zip -j deployment/aws/function.zip deployment/aws/lambda_handler.py && \
-  cd src && zip -ur ../deployment/aws/function.zip magg/ -i "*.py" && cd ..
+  cd src && zip -ur ../deployment/aws/function.zip zagg/ -i "*.py" && cd ..
 ```
 
 ### Step 2: Build and deploy the Lambda layer
@@ -125,7 +125,7 @@ aws lambda create-function \
   --zip-file fileb://deployment/aws/function.zip \
   --timeout 720 \
   --memory-size 2048 \
-  --layers arn:aws:lambda:REGION:ACCOUNT_ID:layer:magg-layer-arm64:VERSION
+  --layers arn:aws:lambda:REGION:ACCOUNT_ID:layer:zagg-layer-arm64:VERSION
 ```
 
 ### Updating function code
@@ -133,7 +133,7 @@ aws lambda create-function \
 ```bash
 # Re-create the zip
 zip -j deployment/aws/function.zip deployment/aws/lambda_handler.py && \
-  cd src && zip -ur ../deployment/aws/function.zip magg/ -i "*.py" && cd ..
+  cd src && zip -ur ../deployment/aws/function.zip zagg/ -i "*.py" && cd ..
 
 # Update the Lambda function
 aws lambda update-function-code \
@@ -145,10 +145,10 @@ aws lambda update-function-code \
 
 ```bash
 # Build a granule catalog
-uv run python -m magg.catalog --cycle 22 --parent-order 6
+uv run python -m zagg.catalog --cycle 22 --parent-order 6
 
 # Test locally first (no Lambda required)
-uv run python -m magg --config atl06.yaml --catalog catalog.json \
+uv run python -m zagg --config atl06.yaml --catalog catalog.json \
   --store ./test.zarr --max-cells 1
 
 # Dry run with the Lambda orchestrator
@@ -176,7 +176,7 @@ uv run python deployment/aws/invoke_lambda.py \
 ## Troubleshooting
 
 !!! warning "Missing s3_credentials"
-    Ensure your orchestrator script calls [`get_nsidc_s3_credentials`][magg.auth.get_nsidc_s3_credentials] and passes the credentials to each Lambda invocation.
+    Ensure your orchestrator script calls [`get_nsidc_s3_credentials`][zagg.auth.get_nsidc_s3_credentials] and passes the credentials to each Lambda invocation.
 
 !!! info "No granules found"
     This is normal for cells outside the data coverage area. The function returns gracefully with `error: "No granules found"`.

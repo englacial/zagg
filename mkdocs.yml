@@ -1,6 +1,6 @@
-site_name: magg
-repo_name: englacial/magg
-repo_url: https://github.com/englacial/magg
+site_name: zagg
+repo_name: englacial/zagg
+repo_url: https://github.com/englacial/zagg
 site_description: Multi-resolution aggregation for ICESat-2 ATL06 data using morton/healpix indexing.
 site_author: Shane Grisby
 docs_dir: docs
@@ -28,7 +28,7 @@ nav:
       - "ARM64 Layer": "deployment/arm64.md"
 
 watch:
-  - src/magg
+  - src/zagg
   - docs
 
 theme:
@@ -79,7 +79,7 @@ plugins:
       enable_inventory: true
       handlers:
         python:
-          paths: [src/magg]
+          paths: [src/zagg]
           options:
             allow_inspection: true
             docstring_section_style: list

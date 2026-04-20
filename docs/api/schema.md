@@ -4,14 +4,14 @@ The schema module creates Zarr output templates from pipeline configuration. Col
 
 ## Zarr Template
 
-::: magg.schema.xdggs_spec
+::: zagg.schema.xdggs_spec
 
-::: magg.schema.xdggs_zarr_template
+::: zagg.schema.xdggs_zarr_template
 
 ## Types
 
-::: magg.schema.ProcessingMetadata
+::: zagg.schema.ProcessingMetadata
 
 ## Constants
 
-::: magg.schema.HEALPIX_BASE_CELLS
+::: zagg.schema.HEALPIX_BASE_CELLS

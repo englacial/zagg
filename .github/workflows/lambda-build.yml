@@ -4,13 +4,13 @@ on:
   push:
     branches: [lambda, main]
     paths:
-      - 'src/magg/**'
+      - 'src/zagg/**'
       - 'deployment/aws/**'
       - 'pyproject.toml'
       - '.github/workflows/lambda-build.yml'
   pull_request:
     paths:
-      - 'src/magg/**'
+      - 'src/zagg/**'
       - 'deployment/aws/**'
       - 'pyproject.toml'
       - '.github/workflows/lambda-build.yml'

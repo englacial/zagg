@@ -15,8 +15,8 @@ import pandas as pd
 from zarr import config, open_array
 from zarr.abc.store import Store
 
-from magg.config import PipelineConfig, default_config, get_agg_fields, get_data_vars
-from magg.schema import ProcessingMetadata
+from zagg.config import PipelineConfig, default_config, get_agg_fields, get_data_vars
+from zagg.schema import ProcessingMetadata
 
 logger = logging.getLogger(__name__)
 
@@ -32,7 +32,7 @@ def _make_url_rewriter(driver: str | None, catalog_metadata: dict | None):
             return _rewrite
         raise ValueError(
             "driver='https' requires catalog metadata with s3_base/https_base. "
-            "Rebuild the catalog with the latest magg to populate these fields."
+            "Rebuild the catalog with the latest zagg to populate these fields."
         )
     # S3 driver: strip s3:// prefix (h5coro expects bucket/key)
     def _rewrite_s3(url):
@@ -116,7 +116,7 @@ def calculate_cell_statistics(
     dict
         Dictionary of statistics keyed by aggregation variable name
     """
-    from magg.config import evaluate_expression, resolve_function
+    from zagg.config import evaluate_expression, resolve_function
 
     if config is None:
         config = default_config()

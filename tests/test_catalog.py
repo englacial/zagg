@@ -1,4 +1,4 @@
-"""Tests for magg.catalog — CMR query, polygon loading, cell discovery, catalog building."""
+"""Tests for zagg.catalog — CMR query, polygon loading, cell discovery, catalog building."""
 
 import json
 from datetime import datetime
@@ -7,7 +7,7 @@ from unittest.mock import MagicMock, patch
 import numpy as np
 import pytest
 
-from magg.catalog import (
+from zagg.catalog import (
     build_catalog,
     cycle_to_dates,
     discover_cells,
@@ -278,7 +278,7 @@ class TestQueryCmr:
         resp.raise_for_status = MagicMock()
         return resp
 
-    @patch("magg.catalog.requests.get")
+    @patch("zagg.catalog.requests.get")
     def test_basic_query(self, mock_get):
         mock_get.return_value = self._mock_response([{"id": "1"}, {"id": "2"}])
         result = query_cmr("2024-01-01", "2024-04-01")
@@ -290,28 +290,28 @@ class TestQueryCmr:
         assert "2024-01-01" in params["temporal"]
         assert "2024-04-01" in params["temporal"]
 
-    @patch("magg.catalog.requests.get")
+    @patch("zagg.catalog.requests.get")
     def test_custom_short_name(self, mock_get):
         mock_get.return_value = self._mock_response([])
         query_cmr("2024-01-01", "2024-04-01", short_name="ATL08")
         params = mock_get.call_args.kwargs.get("params") or mock_get.call_args[1]["params"]
         assert params["short_name"] == "ATL08"
 
-    @patch("magg.catalog.requests.get")
+    @patch("zagg.catalog.requests.get")
     def test_bbox_passed(self, mock_get):
         mock_get.return_value = self._mock_response([])
         query_cmr("2024-01-01", "2024-04-01", bbox=(-180, -90, 180, -60))
         params = mock_get.call_args.kwargs.get("params") or mock_get.call_args[1]["params"]
         assert params["bounding_box"] == "-180,-90,180,-60"
 
-    @patch("magg.catalog.requests.get")
+    @patch("zagg.catalog.requests.get")
     def test_no_bbox(self, mock_get):
         mock_get.return_value = self._mock_response([])
         query_cmr("2024-01-01", "2024-04-01")
         params = mock_get.call_args.kwargs.get("params") or mock_get.call_args[1]["params"]
         assert "bounding_box" not in params
 
-    @patch("magg.catalog.requests.get")
+    @patch("zagg.catalog.requests.get")
     def test_pagination(self, mock_get):
         page1 = self._mock_response([{"id": str(i)} for i in range(2000)], total_hits=3000)
         page2 = self._mock_response([{"id": str(i)} for i in range(1000)], total_hits=3000)

@@ -1,4 +1,4 @@
-"""YAML-driven pipeline configuration for magg."""
+"""YAML-driven pipeline configuration for zagg."""
 
 import importlib
 import re
@@ -10,7 +10,7 @@ from typing import NotRequired, TypedDict
 import numpy as np
 import yaml
 
-import magg.configs
+import zagg.configs
 
 
 class DataSourceDict(TypedDict):
@@ -105,7 +105,7 @@ def default_config(name: str = "atl06") -> PipelineConfig:
     FileNotFoundError
         If the named config does not exist.
     """
-    ref = resources.files(magg.configs).joinpath(f"{name}.yaml")
+    ref = resources.files(zagg.configs).joinpath(f"{name}.yaml")
     if not ref.is_file():
         raise FileNotFoundError(f"No built-in config named '{name}'")
     text = ref.read_text(encoding="utf-8")

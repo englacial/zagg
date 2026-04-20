@@ -6,7 +6,7 @@ import numpy as np
 import pandas as pd
 import pytest
 
-from magg.config import (
+from zagg.config import (
     PipelineConfig,
     default_config,
     evaluate_expression,
@@ -20,7 +20,7 @@ from magg.config import (
     resolve_function,
     validate_config,
 )
-from magg.processing import calculate_cell_statistics
+from zagg.processing import calculate_cell_statistics
 
 # ---------------------------------------------------------------------------
 # Fixtures
@@ -31,8 +31,8 @@ def atl06_yaml(tmp_path):
     """Path to the built-in atl06.yaml (copied to tmp for load_config tests)."""
     from importlib import resources
 
-    import magg.configs
-    ref = resources.files(magg.configs).joinpath("atl06.yaml")
+    import zagg.configs
+    ref = resources.files(zagg.configs).joinpath("atl06.yaml")
     text = ref.read_text(encoding="utf-8")
     p = tmp_path / "atl06.yaml"
     p.write_text(text)

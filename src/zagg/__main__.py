@@ -1,30 +1,30 @@
-"""CLI entry point for magg processing.
+"""CLI entry point for zagg processing.
 
 Usage:
-    python -m magg --config atl06.yaml --catalog catalog.json
-    python -m magg --config atl06.yaml --catalog catalog.json --store ./test.zarr
-    python -m magg --config atl06.yaml --catalog catalog.json --max-cells 5
-    python -m magg --config atl06.yaml --catalog catalog.json --backend lambda
+    python -m zagg --config atl06.yaml --catalog catalog.json
+    python -m zagg --config atl06.yaml --catalog catalog.json --store ./test.zarr
+    python -m zagg --config atl06.yaml --catalog catalog.json --max-cells 5
+    python -m zagg --config atl06.yaml --catalog catalog.json --backend lambda
 """
 
 import argparse
 import logging
 import os
 
-from magg.config import load_config
-from magg.runner import agg
+from zagg.config import load_config
+from zagg.runner import agg
 
 
 def main():
     parser = argparse.ArgumentParser(
-        description="magg processing runner",
+        description="zagg processing runner",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 examples:
-  python -m magg --config atl06.yaml --catalog catalog.json
-  python -m magg --config atl06.yaml --catalog catalog.json --store ./test.zarr
-  python -m magg --config atl06.yaml --catalog catalog.json --max-cells 5
-  python -m magg --config atl06.yaml --catalog catalog.json --backend lambda
+  python -m zagg --config atl06.yaml --catalog catalog.json
+  python -m zagg --config atl06.yaml --catalog catalog.json --store ./test.zarr
+  python -m zagg --config atl06.yaml --catalog catalog.json --max-cells 5
+  python -m zagg --config atl06.yaml --catalog catalog.json --backend lambda
 """,
     )
     parser.add_argument("--config", required=True, help="Path to pipeline config YAML")
@@ -42,8 +42,8 @@ examples:
     parser.add_argument("--region", default="us-west-2", help="AWS region (default: us-west-2)")
     parser.add_argument(
         "--function-name",
-        default=os.environ.get("MAGG_LAMBDA_FUNCTION_NAME", "process-morton-cell"),
-        help="Lambda function name (default: env MAGG_LAMBDA_FUNCTION_NAME or 'process-morton-cell')",
+        default=os.environ.get("ZAGG_LAMBDA_FUNCTION_NAME", "process-morton-cell"),
+        help="Lambda function name (default: env ZAGG_LAMBDA_FUNCTION_NAME or 'process-morton-cell')",
     )
     args = parser.parse_args()
 

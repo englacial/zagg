@@ -4,12 +4,12 @@ The processing module contains the core aggregation pipeline: reading HDF5 data 
 
 ## Pipeline
 
-::: magg.processing.process_morton_cell
+::: zagg.processing.process_morton_cell
 
 ## Statistics
 
-::: magg.processing.calculate_cell_statistics
+::: zagg.processing.calculate_cell_statistics
 
 ## Zarr I/O
 
-::: magg.processing.write_dataframe_to_zarr
+::: zagg.processing.write_dataframe_to_zarr

@@ -3,7 +3,7 @@
 These tests verify that:
 1. All imports needed by lambda_handler.py are available
 2. The function code build script works and produces output within size budget
-3. The magg package can be imported as Lambda would see it
+3. The zagg package can be imported as Lambda would see it
 """
 
 import subprocess
@@ -34,13 +34,13 @@ class TestLambdaImports:
         from obstore.store import S3Store  # noqa: F401
         from zarr.storage import ObjectStore  # noqa: F401
 
-    def test_handler_magg_imports(self):
-        """magg.processing imports used by lambda_handler must resolve."""
-        from magg.processing import process_morton_cell, write_dataframe_to_zarr  # noqa: F401
+    def test_handler_zagg_imports(self):
+        """zagg.processing imports used by lambda_handler must resolve."""
+        from zagg.processing import process_morton_cell, write_dataframe_to_zarr  # noqa: F401
 
-    def test_magg_schema_imports(self):
-        """magg.schema imports used transitively must resolve."""
-        from magg.schema import xdggs_spec, xdggs_zarr_template  # noqa: F401
+    def test_zagg_schema_imports(self):
+        """zagg.schema imports used transitively must resolve."""
+        from zagg.schema import xdggs_spec, xdggs_zarr_template  # noqa: F401
 
     def test_zarr_codecs_available(self):
         """Zarr codecs (numcodecs/blosc) must be importable for data writing."""

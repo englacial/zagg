@@ -4,8 +4,8 @@ import json
 
 import pytest
 
-from magg.config import default_config
-from magg.runner import _load_catalog, _select_cells, agg
+from zagg.config import default_config
+from zagg.runner import _load_catalog, _select_cells, agg
 
 
 @pytest.fixture

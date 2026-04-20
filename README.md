@@ -1,10 +1,10 @@
-# magg - Multi-resolution Aggregation
+# zagg - Multi-resolution Aggregation
 
 Aggregate point observations to multi-resolution grids using HEALPix spatial indexing and serverless compute.
 
 ## Overview
 
-magg aggregates sparse point data (e.g., ICESat-2 ATL06 elevation measurements) to gridded products using HEALPix/morton spatial indexing. Processing runs in parallel on AWS Lambda — each worker handles one spatial cell independently, writing to a shared [Zarr v3](https://zarr-specs.readthedocs.io/en/latest/v3/core/v3.0.html) store following the [DGGS convention](https://github.com/zarr-conventions/dggs).
+zagg aggregates sparse point data (e.g., ICESat-2 ATL06 elevation measurements) to gridded products using HEALPix/morton spatial indexing. Processing runs in parallel on AWS Lambda — each worker handles one spatial cell independently, writing to a shared [Zarr v3](https://zarr-specs.readthedocs.io/en/latest/v3/core/v3.0.html) store following the [DGGS convention](https://github.com/zarr-conventions/dggs).
 
 ## Features
 
@@ -22,10 +22,10 @@ Query NASA's CMR to build a mapping of spatial cells to granule S3 URLs.
 
 ```bash
 # ICESat-2 convenience — cycle number computes dates automatically:
-uv run python -m magg.catalog --cycle 22 --parent-order 6
+uv run python -m zagg.catalog --cycle 22 --parent-order 6
 
 # General — explicit date range and spatial polygon:
-uv run python -m magg.catalog \
+uv run python -m zagg.catalog \
     --start-date 2024-01-06 --end-date 2024-04-07 \
     --short-name ATL06 \
     --polygon my_region.geojson \
@@ -61,20 +61,20 @@ Processing reads a pipeline config YAML (data source, aggregation, output store)
 
 ```bash
 # Local processing (write to local Zarr):
-uv run python -m magg --config atl06.yaml --catalog catalog.json --store ./output.zarr
+uv run python -m zagg --config atl06.yaml --catalog catalog.json --store ./output.zarr
 
 # Local processing (write to S3):
-uv run python -m magg --config atl06.yaml --catalog catalog.json --store s3://bucket/output.zarr
+uv run python -m zagg --config atl06.yaml --catalog catalog.json --store s3://bucket/output.zarr
 
 # Lambda dispatch (requires deployed Lambda function):
 uv run python deployment/aws/invoke_lambda.py \
     --config atl06.yaml --catalog catalog.json
 
 # Test with a few cells:
-uv run python -m magg --config atl06.yaml --catalog catalog.json --max-cells 5
+uv run python -m zagg --config atl06.yaml --catalog catalog.json --max-cells 5
 
 # Dry run:
-uv run python -m magg --config atl06.yaml --catalog catalog.json --dry-run
+uv run python -m zagg --config atl06.yaml --catalog catalog.json --dry-run
 ```
 
 The store path and output grid parameters are defined in the YAML config (`output.store`, `output.grid.child_order`) and can be overridden via `--store` on the command line.
@@ -92,9 +92,9 @@ Adjust `GRID_SPACING` in the notebook to control output resolution (default 2 km
 ## Project Structure
 
 ```
-magg/
-├── src/magg/              # Main package (cloud-agnostic)
-│   ├── __main__.py        # Local processing runner (python -m magg)
+zagg/
+├── src/zagg/              # Main package (cloud-agnostic)
+│   ├── __main__.py        # Local processing runner (python -m zagg)
 │   ├── config.py          # YAML pipeline configuration
 │   ├── processing.py      # Core aggregation pipeline
 │   ├── catalog.py         # CMR query + catalog building

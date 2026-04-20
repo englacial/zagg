@@ -5,7 +5,7 @@ from typing_extensions import TypedDict
 from zarr import config as zarr_config
 from zarr.abc.store import Store
 
-from magg.config import PipelineConfig, default_config, get_agg_fields
+from zagg.config import PipelineConfig, default_config, get_agg_fields
 
 HEALPIX_BASE_CELLS: int = 12  # Number of base cells in HEALPix tessellation
 

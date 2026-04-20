@@ -1,5 +1,5 @@
 """
-magg - Multi-resolution Aggregation
+zagg - Multi-resolution Aggregation
 
 Multi-resolution aggregation using morton/healpix indexing.
 
@@ -8,9 +8,11 @@ to various cloud platforms (AWS Lambda, GCP Cloud Functions, Azure Functions, et
 or used for local processing.
 """
 
-__version__ = "0.1.0"
+try:
+    from ._version import __version__
+except ImportError:
+    __version__ = "0.0.0+unknown"
 
-# Export main processing functions
 from .auth import get_edl_token, get_nsidc_s3_credentials
 from .config import (
     PipelineConfig,

@@ -4,8 +4,8 @@ The store module provides a factory for opening Zarr stores from path strings. P
 
 ## Factory
 
-::: magg.store.open_store
+::: zagg.store.open_store
 
 ## Helpers
 
-::: magg.store.parse_s3_path
+::: zagg.store.parse_s3_path

@@ -5,7 +5,7 @@ from pathlib import Path
 import pytest
 from zarr.storage import LocalStore
 
-from magg.store import open_store, parse_s3_path
+from zagg.store import open_store, parse_s3_path
 
 
 class TestOpenStore:

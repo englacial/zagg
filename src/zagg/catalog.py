@@ -10,14 +10,14 @@ This script:
 
 Usage:
     # General (date range + polygon):
-    python -m magg.catalog --start-date 2024-01-06 --end-date 2024-04-07 \\
+    python -m zagg.catalog --start-date 2024-01-06 --end-date 2024-04-07 \\
         --polygon antarctica.geojson --parent-order 6
 
     # ICESat-2 convenience (cycle computes dates automatically):
-    python -m magg.catalog --cycle 22 --parent-order 6
+    python -m zagg.catalog --cycle 22 --parent-order 6
 
     # Custom product:
-    python -m magg.catalog --start-date 2024-01-01 --end-date 2024-06-01 \\
+    python -m zagg.catalog --start-date 2024-01-01 --end-date 2024-06-01 \\
         --short-name ATL08 --polygon my_region.geojson --parent-order 6
 """
 
@@ -476,13 +476,13 @@ def main():
         epilog="""
 examples:
   # ICESat-2 cycle (convenience):
-  python -m magg.catalog --cycle 22 --parent-order 6
+  python -m zagg.catalog --cycle 22 --parent-order 6
 
   # Explicit date range:
-  python -m magg.catalog --start-date 2024-01-06 --end-date 2024-04-07 --parent-order 6
+  python -m zagg.catalog --start-date 2024-01-06 --end-date 2024-04-07 --parent-order 6
 
   # Custom region and product:
-  python -m magg.catalog --start-date 2024-01-01 --end-date 2024-06-01 \\
+  python -m zagg.catalog --start-date 2024-01-01 --end-date 2024-06-01 \\
       --short-name ATL08 --polygon my_region.geojson --parent-order 6
 """,
     )

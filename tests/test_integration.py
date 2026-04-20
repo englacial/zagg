@@ -1,9 +1,9 @@
 import numpy as np
 import zarr
 
-from magg.config import default_config, get_coords, get_data_vars
-from magg.processing import write_dataframe_to_zarr
-from magg.schema import xdggs_zarr_template
+from zagg.config import default_config, get_coords, get_data_vars
+from zagg.processing import write_dataframe_to_zarr
+from zagg.schema import xdggs_zarr_template
 
 
 def test_full_integration(zarr_store, mock_dataframe_factory):

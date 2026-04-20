@@ -47,9 +47,9 @@ import os
 from typing import Any, Dict
 
 # Import cloud-agnostic processing
-from magg.config import load_config_from_dict
-from magg.processing import process_morton_cell, write_dataframe_to_zarr
-from magg.store import open_store
+from zagg.config import load_config_from_dict
+from zagg.processing import process_morton_cell, write_dataframe_to_zarr
+from zagg.store import open_store
 
 # Set up structured logging
 logger = logging.getLogger()
@@ -72,7 +72,7 @@ def lambda_handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
 
 def _handle_setup(event: Dict[str, Any]) -> Dict[str, Any]:
     """Create the zarr template at ``event['store_path']``."""
-    from magg.schema import xdggs_zarr_template
+    from zagg.schema import xdggs_zarr_template
 
     logger.info(f"Setup mode: creating template at {event.get('store_path')}")
     try:

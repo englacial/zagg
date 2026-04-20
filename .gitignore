@@ -17,10 +17,13 @@ env/
 venv/
 .venv/
 *.egg-info/
-src/magg.egg-info/
+src/zagg.egg-info/
 dist/
 build/
 uv.lock
+
+# hatch-vcs generated version file
+src/zagg/_version.py
 
 # IDE
 .vscode/

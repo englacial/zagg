@@ -3,8 +3,8 @@ import pytest
 from zarr import open_array, open_group
 from zarr.storage import MemoryStore
 
-from magg.config import default_config, get_agg_fields, get_coords, get_data_vars
-from magg.schema import (
+from zagg.config import default_config, get_agg_fields, get_coords, get_data_vars
+from zagg.schema import (
     HEALPIX_BASE_CELLS,
     xdggs_zarr_template,
 )
