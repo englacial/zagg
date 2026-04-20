@@ -76,6 +76,9 @@ examples:
         print(f"\nDone: {results['cells_with_data']} cells with data, "
               f"{results['total_obs']:,} obs, {results['cells_error']} errors, "
               f"{results['wall_time_s']:.1f}s")
+        if "estimated_cost_usd" in results:
+            print(f"Lambda compute: {results['lambda_time_s']:.0f}s total, "
+                  f"{results['gb_seconds']:.0f} GB-s, ~${results['estimated_cost_usd']:.2f}")
         print(f"Output: {results['store_path']}")
 
 
