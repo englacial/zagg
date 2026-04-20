@@ -159,58 +159,40 @@ class TestLambdaHandlerSyntax:
 class TestPackageConsistency:
     """Verify dependency specifications are consistent across build scripts."""
 
-    def test_numpy_version_consistent(self):
-        """numpy version must match between pyproject.toml and build scripts."""
+    @staticmethod
+    def _lambda_extra_pin(pkg):
         import tomllib
 
-        pyproject = REPO_ROOT / "pyproject.toml"
-        config = tomllib.loads(pyproject.read_text())
-        deps = config["project"]["dependencies"]
-        numpy_dep = [d for d in deps if d.startswith("numpy")][0]
+        config = tomllib.loads((REPO_ROOT / "pyproject.toml").read_text())
+        dep = next(d for d in config["project"]["optional-dependencies"]["lambda"]
+                   if d.startswith(f"{pkg}=="))
+        return dep.split("==", 1)[1]
 
-        # Extract version from pyproject (e.g., "numpy==2.2.6" → "2.2.6")
-        numpy_version = numpy_dep.split("==")[1]
+    @staticmethod
+    def _pinned_in_script(pkg, script_path):
+        import re
 
-        # Check build scripts reference same version
-        layer_script = (REPO_ROOT / "deployment" / "aws" / "build_layer_v14.sh").read_text()
-        arm64_script = (REPO_ROOT / "deployment" / "aws" / "build_arm64_layer.sh").read_text()
+        match = re.search(rf'{re.escape(pkg)}==([0-9][^\s"\']+)', script_path.read_text())
+        return match.group(1) if match else None
 
-        assert f"numpy=={numpy_version}" in arm64_script or "numpy>=" in layer_script, (
-            f"ARM64 build script doesn't pin numpy=={numpy_version}"
+    def _assert_lockstep(self, pkg, script_name):
+        extra_pin = self._lambda_extra_pin(pkg)
+        script_pin = self._pinned_in_script(pkg, REPO_ROOT / "deployment" / "aws" / script_name)
+        assert script_pin, f"{script_name} does not pin {pkg}"
+        assert script_pin == extra_pin, (
+            f"{script_name} pins {pkg}=={script_pin} but [lambda] extra pins {pkg}=={extra_pin}"
         )
+
+    def test_numpy_version_consistent(self):
+        """Lambda [extra] and ARM64 build script must pin the same numpy version."""
+        self._assert_lockstep("numpy", "build_arm64_layer.sh")
 
     def test_pandas_version_consistent(self):
-        """pandas version must match between pyproject.toml and build scripts."""
-        import tomllib
-
-        pyproject = REPO_ROOT / "pyproject.toml"
-        config = tomllib.loads(pyproject.read_text())
-        deps = config["project"]["dependencies"]
-        pandas_dep = [d for d in deps if d.startswith("pandas")][0]
-        pandas_version = pandas_dep.split("==")[1]
-
-        layer_script = (REPO_ROOT / "deployment" / "aws" / "build_layer_v14.sh").read_text()
-        arm64_script = (REPO_ROOT / "deployment" / "aws" / "build_arm64_layer.sh").read_text()
-
-        assert f"pandas=={pandas_version}" in layer_script, (
-            f"x86_64 build script doesn't pin pandas=={pandas_version}"
-        )
-        assert f"pandas=={pandas_version}" in arm64_script, (
-            f"ARM64 build script doesn't pin pandas=={pandas_version}"
-        )
+        """Lambda [extra] and both build scripts must pin the same pandas version."""
+        self._assert_lockstep("pandas", "build_layer_v14.sh")
+        self._assert_lockstep("pandas", "build_arm64_layer.sh")
 
     def test_h5coro_version_consistent(self):
-        """h5coro version must match between pyproject.toml and build scripts."""
-        import tomllib
-
-        pyproject = REPO_ROOT / "pyproject.toml"
-        config = tomllib.loads(pyproject.read_text())
-        deps = config["project"]["dependencies"]
-        h5coro_dep = [d for d in deps if d.startswith("h5coro")][0]
-        h5coro_version = h5coro_dep.split("==")[1]
-
-        layer_script = (REPO_ROOT / "deployment" / "aws" / "build_layer_v14.sh").read_text()
-        arm64_script = (REPO_ROOT / "deployment" / "aws" / "build_arm64_layer.sh").read_text()
-
-        assert f"h5coro=={h5coro_version}" in layer_script
-        assert f"h5coro=={h5coro_version}" in arm64_script
+        """Lambda [extra] and both build scripts must pin the same h5coro version."""
+        self._assert_lockstep("h5coro", "build_layer_v14.sh")
+        self._assert_lockstep("h5coro", "build_arm64_layer.sh")
