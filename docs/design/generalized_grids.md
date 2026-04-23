@@ -1,8 +1,8 @@
 # Broadening input/output grid structures
 
-**Status**: draft · partial (§1–§4). Tracks [#11](https://github.com/englacial/zagg/issues/11).
+**Status**: draft. Tracks [#11](https://github.com/englacial/zagg/issues/11).
 
-> All design decisions (both made and open) are consolidated in §11. Inline references use **D#** for decisions made (rationale in §11.1) and **O#** for open items needing input (§11.2). Revisit before merging.
+> All design decisions (both made and open) are consolidated in the [Decisions registry](#11-decisions-registry). Inline references use **D#** for decisions made (rationale in [Decisions made](#111-decisions-made-rationale-recorded)) and **O#** for open items needing input ([Open for review](#112-open-for-review-input-needed)). Revisit before merging.
 
 ## 1. Motivation
 
@@ -23,8 +23,8 @@ Secondary benefit: the resulting grid abstraction aligns directly with the broad
 - Multiple **output** grid types from the same input pipeline.
 - Config-driven grid selection (same pattern as existing aggregation dispatch in `schema.py`).
 - HEALPix/ATL06 path continues to work without user-visible change.
-- Write-partition strategy per grid type (see §5).
-- Zarr-template generation per grid type (see §6).
+- Write-partition strategy per grid type (see [The write-partition problem](#5-the-write-partition-problem)).
+- Zarr-template generation per grid type (see [Template generalization](#6-template-generalization)).
 
 ### Out of scope (v1)
 - **Arbitrary input grids.** Point-cloud input (HDF5 via h5coro) is the only input data model. Input generalization is deferred to v2 (**D1**).
@@ -54,7 +54,7 @@ Walking the pipeline from `docs/design/architecture.md`, here's what stays gener
 | **4f. Write** | `array.set_block_selection(chunk_idx, values)` | generic, *given* chunk_idx computed by a grid-aware function |
 | **5. Consolidate** | `zarr.consolidate_metadata` | generic |
 
-The schema-driven aggregation dispatch (§4c) and the Zarr block-write (§4f) are already grid-agnostic. The grid-specific pieces cluster cleanly around three operations: **shard enumeration**, **point-to-cell assignment**, and **template emission** — exactly what the protocol in §4 formalizes.
+The schema-driven aggregation dispatch (stage 4c in the table above) and the Zarr block-write (stage 4f) are already grid-agnostic. The grid-specific pieces cluster cleanly around three operations: **shard enumeration**, **point-to-cell assignment**, and **template emission** — exactly what the protocol in [the next section](#4-key-abstraction-the-outputgrid-protocol) formalizes.
 
 ## 4. Key abstraction: the `OutputGrid` protocol
 
@@ -72,7 +72,7 @@ class OutputGrid(Protocol):
 
     def shard_of(self, cell_ids: np.ndarray) -> ShardKey:
         """Which write-partition does a set of cell IDs belong to? (Write stage.)
-        Must return a contention-free key; see §5."""
+        Must return a contention-free key; see the write-partition section."""
 
     def emit_template(self, schema: AggregationSchema) -> ZarrStore:
         """Initialize the output Zarr store with the right shape, chunks,
@@ -92,10 +92,10 @@ Five methods. The first four are load-bearing; `cell_geometry` is a convenience 
 | `H3Grid` | `h3-py` | `zagg[h3]` | Phase 1 — easy, high user value |
 | `RectilinearGrid` | affine transform via `pyproj` | `zagg[rectilinear]` | Phase 1 — climate interop |
 | `S2Grid` | `s2sphere` | `zagg[s2]` | Phase 2 — lower priority |
-| `PolygonZoneGrid` | `grid-indexing` for R-tree point-in-polygon | `zagg[polygons]` | Phase 2 — hardest, see §5 |
+| `PolygonZoneGrid` | `grid-indexing` for R-tree point-in-polygon | `zagg[polygons]` | Phase 2 — hardest, see [write-partition](#5-the-write-partition-problem) |
 | `CurvilinearGrid` / mesh | TBD | — | Out of scope for v1 |
 
-Phase 1 targets HEALPix + H3 + RectilinearGrid (**D2**); polygon zones ship in Phase 2 once the write-partition abstraction (§5.4) is settled. Full schedule in §10.
+Phase 1 targets HEALPix + H3 + RectilinearGrid (**D2**); polygon zones ship in Phase 2 once the [write-partition abstraction for polygon zones](#54-phase-2-polygon-zones-no-natural-hierarchy) is settled. Full schedule in the [Phased roadmap](#10-phased-roadmap).
 
 ### Config surface
 
@@ -143,7 +143,7 @@ A small `OutputGrid.from_config(config_dict)` factory selects the right implemen
 
 - **Stateless interface.** `OutputGrid` instances hold grid parameters (orders, bounds, resolutions, zone geometries) but no per-job state. Safe to pickle across Lambda boundaries.
 - **Opt-in dependencies.** Each backend ships as an extra. Default install stays lean.
-- **Share with the ecosystem.** Where the same operation exists in `grid-indexing` (point-in-polygon, R-tree coverage), `PolygonZoneGrid` delegates rather than reimplements. Where `xdggs` defines conformant metadata, `HealpixGrid.emit_template` and `H3Grid.emit_template` emit exactly that. See §9.
+- **Share with the ecosystem.** Where the same operation exists in `grid-indexing` (point-in-polygon, R-tree coverage), `PolygonZoneGrid` delegates rather than reimplements. Where `xdggs` defines conformant metadata, `HealpixGrid.emit_template` and `H3Grid.emit_template` emit exactly that. See [Ecosystem alignment](#9-ecosystem-alignment).
 - **`RectilinearGrid` accepts (or can convert to) an `odc.geo.GeoBox`.** This is the idiom OpenEO / Pangeo use for grid specs; accepting it directly keeps zagg composable with the rest of the Layer-4 ecosystem.
 - **No xarray coupling in the protocol.** The protocol returns numpy arrays and Zarr stores. Users who want xarray open the Zarr with xarray afterwards. Keeps the core lightweight and matches the "xarray-independent" design goal shared by other emerging indexing/resampling libraries.
 
@@ -301,14 +301,14 @@ The generalization is straightforward: each `OutputGrid` implementation owns its
 A few design notes:
 
 - **`pydantic-zarr` stays the template builder for every grid.** Each grid supplies a `GroupSpec` constructor function; the aggregation variables (from the YAML config) are appended identically across all grids.
-- **The `xdggs_zarr_template` function becomes `HealpixGrid.emit_template` internally.** The public helper stays available (see §8).
+- **The `xdggs_zarr_template` function becomes `HealpixGrid.emit_template` internally.** The public helper stays available (see [Backwards compatibility](#8-backwards-compatibility)).
 - **For `RectilinearGrid`, `emit_template` accepts an `odc.geo.GeoBox` directly.** This is the path to OpenEO/xarray-regrid/odc-stac interop without zagg reinventing grid-spec parsing.
 - **For `PolygonZoneGrid`, there's no community standard**, so `emit_template` emits a minimal spec: a 1D cell axis indexed by `zone_id`, a `zone_geometry_uri` attribute pointing at the source geopackage/parquet (so downstream viewers can rehydrate zone polygons), and a `crs` attribute describing the working CRS used for indexing.
 - **The aggregation variable block is shared code.** Only coord arrays and structural metadata differ per grid.
 
 ## 7. Input-side considerations
 
-v1 is explicitly output-only per §2. Worth briefly acknowledging three input-side directions that may arise in later conversations, and why they don't need resolution now:
+v1 is explicitly output-only per [Scope and non-goals](#2-scope-and-non-goals). Worth briefly acknowledging three input-side directions that may arise in later conversations, and why they don't need resolution now:
 
 - **Gridded point inputs** (e.g., already-binned ATL06 products, HDF5 files with per-cell tables rather than per-shot observations). These could be supported by adding a reader adapter that converts per-cell records to per-shot tuples, but they don't change the output pipeline.
 - **Raster inputs → different grid** (F4 within-cell reduction). This is a different pipeline entirely — downsample one regular grid to another with `σ` over contributing source cells. Close in math to what zagg does but with raster I/O (COGs, Zarr) instead of HDF5 point reads. Arguably a separate tool, or a sibling entry point to `zagg` that reuses the aggregation dispatch and `emit_template` machinery.
@@ -330,7 +330,7 @@ Migration path: none required for existing users. New grids are opt-in via the `
 Testing strategy:
 
 - **Regression**: byte-identical HEALPix output vs. a checked-in golden store.
-- **Protocol conformance**: each grid backend passes the shared `OutputGrid` test suite (including the chunk-alignment invariant from §5.7).
+- **Protocol conformance**: each grid backend passes the shared `OutputGrid` test suite (including the [chunk-alignment invariant](#57-the-chunk-alignment-invariant)).
 - **Integration**: end-to-end tests on a synthetic small dataset for each grid type.
 
 ## 9. Ecosystem alignment
@@ -376,7 +376,7 @@ Regression test confirms byte-identical output. Merge this first — everything 
 
 Each of these is independent and unblocks once Phase 0 lands.
 
-- `H3Grid` via `h3-py` (pentagon padding per §5.3)
+- `H3Grid` via `h3-py` (pentagon padding per [Phase 1 grids](#53-phase-1-grids-hierarchical-sharding-for-free))
 - `RectilinearGrid` via `pyproj` + `odc.geo.GeoBox` acceptance (incl. polar stereographic as the cleanest case)
 
 Ship each behind its own extra (`zagg[h3]`, `zagg[rectilinear]`).
@@ -410,20 +410,20 @@ All design calls made in drafting this document, plus the items still needing in
 
 | ID | Decision | Rationale | Where |
 |---|---|---|---|
-| **D1** | v1 scope is output-side only; input generalization deferred to v2 | Bounded protocol work; real user value concentrated on the output side | §2, §7 |
-| **D2** | Phase 1 grid set = HEALPix + H3 + RectilinearGrid (incl. polar stereographic) | All three share hierarchical sharding — §5 generalizes uniformly | §4, §10 |
-| **D3** | H3 pentagon cells → fill-value padded chunks (not jagged) | ≤0.1% storage waste; vastly simpler than jagged-chunk support | §5.3 |
-| **D4** | RectilinearGrid: shard = chunk (one-level, not two-level like HEALPix) | Chunks are already the right partition size; no shard/chunk distinction to maintain | §5.3 |
-| **D5** | PolygonZoneGrid partition: zone-per-chunk ≤ 10k zones, SFC-centroid above, user-file override | Trivially correct for realistic zone counts; scales with an explicit escape hatch | §5.4 |
-| **D6** | `shard_footprint(key) → Geometry` is a sixth method on the `OutputGrid` protocol | Keeps catalog-stage code grid-agnostic | §5.6 |
-| **D7** | Chunk-alignment invariant enforced via a required shared parametrized test fixture | Only way to catch `emit_template` / `shard_of` drift automatically | §5.7 |
-| **D8** | `PolygonZoneGrid` takes a `grid-indexing` dependency via `zagg[polygons]` extra | Rust-speed R*-tree point-in-polygon; standard in the emerging ecosystem | §9 |
-| **D9** | Protocol mechanism = `typing.Protocol` (interface) + optional `abc.ABC` (shared helpers) | Structural typing for extensibility; ABC only if useful defaults emerge | §4 |
-| **D10** | ShardKey type per grid (tuple / int / bytes / …); contract is "hashable and JSON-serializable" | Each grid's natural shard identifier is different; no value in forcing a common type | §5.5 |
-| **D11** | `cell_geometry()` is optional in the protocol; Phase 1 implementations add it only if cheap | Nice-to-have for viz, not load-bearing | §4 |
-| **D12** | `RectilinearGrid` accepts both `odc.geo.GeoBox` (recommended) and a manual `{crs, resolution, bounds}` dict | GeoBox is the OpenEO/Pangeo idiom; manual dict is bootstrap-friendly | §4, §9 |
-| **D13** | Protocol surface is xarray-independent (numpy arrays + Zarr stores) | Cross-language portability (WASM/TS futures); matches the modular-libraries design goals | §9 |
-| **D14** | §9 cites only public references (warp-resample-profiling ecosystem page, Sean Harkins' public gist); no private-discussion references | Keeps the design doc reviewable by anyone without access to private context | §9, §12 |
+| **D1** | v1 scope is output-side only; input generalization deferred to v2 | Bounded protocol work; real user value concentrated on the output side | [Scope](#2-scope-and-non-goals), [Input-side](#7-input-side-considerations) |
+| **D2** | Phase 1 grid set = HEALPix + H3 + RectilinearGrid (incl. polar stereographic) | All three share hierarchical sharding — the [write-partition problem](#5-the-write-partition-problem) generalizes uniformly | [Protocol](#4-key-abstraction-the-outputgrid-protocol), [Roadmap](#10-phased-roadmap) |
+| **D3** | H3 pentagon cells → fill-value padded chunks (not jagged) | ≤0.1% storage waste; vastly simpler than jagged-chunk support | [Phase 1 grids](#53-phase-1-grids-hierarchical-sharding-for-free) |
+| **D4** | RectilinearGrid: shard = chunk (one-level, not two-level like HEALPix) | Chunks are already the right partition size; no shard/chunk distinction to maintain | [Phase 1 grids](#53-phase-1-grids-hierarchical-sharding-for-free) |
+| **D5** | PolygonZoneGrid partition: zone-per-chunk ≤ 10k zones, SFC-centroid above, user-file override | Trivially correct for realistic zone counts; scales with an explicit escape hatch | [Polygon zones](#54-phase-2-polygon-zones-no-natural-hierarchy) |
+| **D6** | `shard_footprint(key) → Geometry` is a sixth method on the `OutputGrid` protocol | Keeps catalog-stage code grid-agnostic | [Catalog interaction](#56-catalog-stage-interaction) |
+| **D7** | Chunk-alignment invariant enforced via a required shared parametrized test fixture | Only way to catch `emit_template` / `shard_of` drift automatically | [Chunk alignment](#57-the-chunk-alignment-invariant) |
+| **D8** | `PolygonZoneGrid` takes a `grid-indexing` dependency via `zagg[polygons]` extra | Rust-speed R*-tree point-in-polygon; standard in the emerging ecosystem | [Ecosystem alignment](#9-ecosystem-alignment) |
+| **D9** | Protocol mechanism = `typing.Protocol` (interface) + optional `abc.ABC` (shared helpers) | Structural typing for extensibility; ABC only if useful defaults emerge | [Protocol](#4-key-abstraction-the-outputgrid-protocol) |
+| **D10** | ShardKey type per grid (tuple / int / bytes / …); contract is "hashable and JSON-serializable" | Each grid's natural shard identifier is different; no value in forcing a common type | [Shard contract](#55-the-shard_of-contract) |
+| **D11** | `cell_geometry()` is optional in the protocol; Phase 1 implementations add it only if cheap | Nice-to-have for viz, not load-bearing | [Protocol](#4-key-abstraction-the-outputgrid-protocol) |
+| **D12** | `RectilinearGrid` accepts both `odc.geo.GeoBox` (recommended) and a manual `{crs, resolution, bounds}` dict | GeoBox is the OpenEO/Pangeo idiom; manual dict is bootstrap-friendly | [Protocol](#4-key-abstraction-the-outputgrid-protocol), [Ecosystem alignment](#9-ecosystem-alignment) |
+| **D13** | Protocol surface is xarray-independent (numpy arrays + Zarr stores) | Cross-language portability (WASM/TS futures); matches the modular-libraries design goals | [Ecosystem alignment](#9-ecosystem-alignment) |
+| **D14** | [Ecosystem alignment](#9-ecosystem-alignment) cites only public references (warp-resample-profiling ecosystem page, Sean Harkins' public gist); no private-discussion references | Keeps the design doc reviewable by anyone without access to private context | [Ecosystem alignment](#9-ecosystem-alignment), [References](#12-prior-art-and-references) |
 
 ### 11.2 Open for review (input needed)
 
@@ -465,4 +465,4 @@ All design calls made in drafting this document, plus the items still needing in
 
 ---
 
-*Status*: design doc at first-draft complete. Ready for review + comments on open questions in §11. Phase 0 extraction is the natural next concrete step once the shape is agreed.
+*Status*: design doc at first-draft complete. Ready for review + comments on open questions in the [Decisions registry](#11-decisions-registry). Phase 0 extraction is the natural next concrete step once the shape is agreed.
