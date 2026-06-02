@@ -142,6 +142,11 @@ def validate_config(config: PipelineConfig) -> None:
             raise ValueError("output.grid.type is required")
         if grid["type"] == "healpix" and "child_order" not in grid:
             raise ValueError("output.grid.child_order is required for healpix grid")
+        layout = grid.get("layout")
+        if layout is not None and layout not in ("dense", "fullsphere"):
+            raise ValueError(
+                f"output.grid.layout must be 'dense' or 'fullsphere' (got {layout!r})"
+            )
 
     # Validate bounds structure (optional)
     if config.bounds is not None:
@@ -358,6 +363,21 @@ def get_child_order(config: PipelineConfig) -> int:
     if child_order is None:
         raise ValueError("output.grid.child_order is required")
     return int(child_order)
+
+
+def get_layout(config: PipelineConfig) -> str:
+    """Return the HEALPix storage layout from the output grid config.
+
+    Parameters
+    ----------
+    config : PipelineConfig
+
+    Returns
+    -------
+    str
+        ``"dense"`` (default) or ``"fullsphere"``.
+    """
+    return config.output.get("grid", {}).get("layout", "dense")
 
 
 def get_store_path(config: PipelineConfig) -> str | None:

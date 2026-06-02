@@ -19,9 +19,11 @@ from .config import (
     default_config,
     get_child_order,
     get_driver,
+    get_layout,
     get_store_path,
     load_config,
 )
+from .grids import HealpixGrid, OutputGrid
 from .processing import (
     calculate_cell_statistics,
     process_morton_cell,
@@ -32,11 +34,14 @@ from .schema import xdggs_spec, xdggs_zarr_template
 from .store import open_store, parse_s3_path
 
 __all__ = [
+    "HealpixGrid",
+    "OutputGrid",
     "PipelineConfig",
     "calculate_cell_statistics",
     "default_config",
     "get_child_order",
     "get_driver",
+    "get_layout",
     "get_edl_token",
     "get_nsidc_s3_credentials",
     "get_store_path",
