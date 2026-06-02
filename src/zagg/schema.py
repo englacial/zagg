@@ -1,13 +1,17 @@
+"""Compatibility wrappers for HEALPix Zarr template emission.
+
+The actual implementation lives on ``zagg.grids.HealpixGrid``. These functions
+preserve the pre-refactor public API: pass ``n_parent_cells`` for dense pack,
+omit it for full sphere.
+"""
 from __future__ import annotations
 
-from pydantic_zarr.experimental.v3 import ArraySpec, GroupSpec, NamedConfig
+from pydantic_zarr.experimental.v3 import GroupSpec
 from typing_extensions import TypedDict
-from zarr import config as zarr_config
 from zarr.abc.store import Store
 
-from zagg.config import PipelineConfig, default_config, get_agg_fields
-
-HEALPIX_BASE_CELLS: int = 12  # Number of base cells in HEALPix tessellation
+from zagg.config import PipelineConfig
+from zagg.grids.healpix import HEALPIX_BASE_CELLS, HealpixGrid
 
 
 class ProcessingMetadata(TypedDict):
@@ -25,87 +29,13 @@ def xdggs_spec(
     child_order: int,
     config: PipelineConfig | None = None,
 ) -> GroupSpec:
-    """
-    Create a [pydantic_zarr.experimental.v3.GroupSpec]() for aggregation data using HEALPix/Morton indexing.
-
-    Parameters
-    ----------
-    parent_order : int
-        HEALPix order of parent morton cells
-    child_order : int
-        HEALPix order of child morton cells (must be >= parent_order)
-    config : PipelineConfig or None
-        Pipeline configuration. Falls back to ``default_config("atl06")``.
-
-    Returns
-    -------
-    GroupSpec
-        Xdggs compatible group spec
-
-    Raises
-    ------
-    ValueError
-        If child_order < parent_order
-    """
-    if child_order < parent_order:
-        raise ValueError(f"child_order ({child_order}) must be >= parent_order ({parent_order})")
-
-    if config is None:
-        config = default_config("atl06")
-
-    level_diff = child_order - parent_order
-    n_children = 4**level_diff
-    n_pixels = HEALPIX_BASE_CELLS * 4**child_order
-
-    base_array_spec = ArraySpec(
-        attributes={},
-        shape=(n_pixels,),
-        dimension_names=("cells",),
-        data_type="float32",
-        chunk_grid=NamedConfig(name="regular", configuration={"chunk_shape": (n_children,)}),
-        chunk_key_encoding=NamedConfig(name="default", configuration={"separator": "/"}),
-        codecs=(NamedConfig(name="bytes", configuration={"endian": "little"}),),
-        storage_transformers=(),
-        fill_value="NaN",
-    )
-
-    members = {}
-    for coord_name, coord_meta in config.aggregation.get("coordinates", {}).items():
-        zarr_dtype = coord_meta.get("dtype", "float32")
-        fill_value = coord_meta.get("fill_value", "NaN")
-        members[coord_name] = base_array_spec.with_data_type(zarr_dtype).with_fill_value(fill_value)
-
-    for var_name, var_meta in get_agg_fields(config).items():
-        zarr_dtype = var_meta.get("dtype", "float32")
-        fill_value = var_meta.get("fill_value", "NaN")
-        members[var_name] = base_array_spec.with_data_type(zarr_dtype).with_fill_value(fill_value)
-
-    dggs_attrs = {
-        "zarr_conventions": [
-            {
-                "schema_url": "https://raw.githubusercontent.com/zarr-conventions/dggs/refs/tags/v1/schema.json",
-                "spec_url": "https://github.com/zarr-conventions/dggs/blob/v1/README.md",
-                "uuid": "7b255807-140c-42ca-97f6-7a1cfecdbc38",
-                "name": "dggs",
-                "description": "Discrete Global Grid Systems convention for zarr",
-            }
-        ],
-        "dggs": {
-            "name": "healpix",
-            "refinement_level": child_order,
-            "indexing_scheme": "nested",
-            "spatial_dimension": "cells",
-            "ellipsoid": {
-                "name": "WGS84",
-                "semimajor_axis": 6378137.0,
-                "inverse_flattening": 298.257223563,
-            },
-            "coordinate": "cell_ids",
-            "compression": "none",
-        },
-    }
-
-    return GroupSpec(members=members, attributes=dggs_attrs)
+    """Return the full-sphere HEALPix GroupSpec (back-compat wrapper)."""
+    return HealpixGrid(
+        parent_order=parent_order,
+        child_order=child_order,
+        layout="fullsphere",
+        config=config,
+    ).spec()
 
 
 def xdggs_zarr_template(
@@ -116,50 +46,51 @@ def xdggs_zarr_template(
     overwrite: bool = False,
     config: PipelineConfig | None = None,
 ) -> Store:
-    """
-    Create a Zarr template for data aggregation data using HEALPix/Morton indexing.
+    """Write a HEALPix Zarr template to ``store``.
+
+    Layout is selected by ``n_parent_cells``: when ``None`` the store gets a
+    full-sphere array of shape ``(12 · 4^child_order,)``; when set the store
+    gets a dense-pack array of shape ``(4^Δ · n_parent_cells,)``.
 
     Parameters
     ----------
     store : Store
-        Zarr-compatible store (from zarr.abc.store)
+        Zarr-compatible store.
     parent_order : int
-        HEALPix order of parent morton cells
+        Parent (shard) HEALPix order.
     child_order : int
-        HEALPix order of child morton cells (must be >= parent_order)
-    n_parent_cells : int
-        Number of parent cells containing data
-    overwrite : bool
-        Whether to overwrite an existing array or group at the path.
-        Defaults to False.
-    config : PipelineConfig or None
+        Leaf HEALPix order. Must be ``>= parent_order``.
+    n_parent_cells : int, optional
+        Number of populated shards. Selects dense layout when provided.
+    overwrite : bool, optional
+        Overwrite an existing array or group at the path.
+    config : PipelineConfig, optional
         Pipeline configuration. Falls back to ``default_config("atl06")``.
-
-    Returns
-    -------
-    Store
-        The same store, with template written to path '{child_order}/'
     """
-    spec = xdggs_spec(parent_order=parent_order, child_order=child_order, config=config)
     if n_parent_cells is not None and n_parent_cells <= 0:
         raise ValueError(f"n_parent_cells must be positive, got {n_parent_cells}")
-    if n_parent_cells:
-        level_diff = child_order - parent_order
-        n_pixels = 4**level_diff * n_parent_cells
-        members = {
-            var: m.with_shape((n_pixels,)) if isinstance(m, ArraySpec) else m
-            for var, m in spec.members.items()
-        }
-        spec = spec.with_members(members)
-
-    with zarr_config.set({"async.concurrency": 128}):
-        spec.to_zarr(store, str(child_order), overwrite=overwrite)
-
-    return store
+    if n_parent_cells is None:
+        grid = HealpixGrid(
+            parent_order=parent_order,
+            child_order=child_order,
+            layout="fullsphere",
+            config=config,
+        )
+    else:
+        # Synthetic shard identities — emit_template only needs the count.
+        grid = HealpixGrid(
+            parent_order=parent_order,
+            child_order=child_order,
+            layout="dense",
+            config=config,
+            populated_shards=list(range(n_parent_cells)),
+        )
+    return grid.emit_template(store, overwrite=overwrite)
 
 
 __all__ = [
+    "HEALPIX_BASE_CELLS",
     "ProcessingMetadata",
-    "xdggs_zarr_template",
     "xdggs_spec",
+    "xdggs_zarr_template",
 ]

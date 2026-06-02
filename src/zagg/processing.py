@@ -166,8 +166,7 @@ def calculate_cell_statistics(
     return result
 
 
-def _read_group(h5obj, group: str, data_source: dict, parent_morton: int,
-                parent_order: int, geo2mort, clip2order):
+def _read_group(h5obj, group: str, data_source: dict, parent_morton: int, grid):
     """Read and spatially filter one HDF5 group, returning a DataFrame or None."""
     coordinates = data_source["coordinates"]
     variables = data_source["variables"]
@@ -185,10 +184,9 @@ def _read_group(h5obj, group: str, data_source: dict, parent_morton: int,
     if len(lats) == 0:
         return None
 
-    # Morton index filtering
-    midx18 = geo2mort(lats, lons, order=18)
-    midx_parent = clip2order(parent_order, midx18)
-    mask_spatial = midx_parent == parent_morton
+    # Assign points to leaf cells, then filter to the current shard.
+    leaf_ids = grid.assign(lats, lons)
+    mask_spatial = grid.shards_of(leaf_ids) == parent_morton
 
     if np.sum(mask_spatial) == 0:
         return None
@@ -224,7 +222,7 @@ def _read_group(h5obj, group: str, data_source: dict, parent_morton: int,
         quality_mask = None
 
     # Build dataframe
-    midx_sliced = midx18[min_idx:max_idx][mask_sliced]
+    leaf_sliced = leaf_ids[min_idx:max_idx][mask_sliced]
     data_dict = {}
     for col_name, path_template in variables.items():
         path = path_template.format(group=group)
@@ -234,9 +232,9 @@ def _read_group(h5obj, group: str, data_source: dict, parent_morton: int,
         data_dict[col_name] = values
 
     if quality_mask is not None:
-        data_dict["midx"] = midx_sliced[quality_mask]
+        data_dict["leaf_id"] = leaf_sliced[quality_mask]
     else:
-        data_dict["midx"] = midx_sliced
+        data_dict["leaf_id"] = leaf_sliced
 
     return pd.DataFrame(data_dict)
 
@@ -251,6 +249,7 @@ def process_morton_cell(
     config: PipelineConfig | None = None,
     driver: str | None = None,
     catalog_metadata: dict | None = None,
+    grid=None,
 ) -> Tuple[pd.DataFrame, ProcessingMetadata]:
     """
     Process one parent morton cell: read data, calculate statistics, return DataFrame.
@@ -283,22 +282,29 @@ def process_morton_cell(
     catalog_metadata : dict, optional
         Catalog metadata containing ``s3_base`` and ``https_base`` for
         URL rewriting when using the HTTPS driver.
+    grid : OutputGrid, optional
+        Output grid. Defaults to a stateless ``HealpixGrid(layout="dense")``
+        (only ``assign``/``shards_of``/``children``/``encode_cell_ids`` are
+        used here; layout doesn't affect cell-stat computation).
 
     Returns
     -------
     tuple
         (DataFrame, metadata_dict)
     """
-    from mortie import (
-        clip2order,
-        generate_morton_children,
-        geo2mort,
-        mort2healpix,
-    )
-
     if config is None:
         config = default_config()
     data_source = config.data_source
+
+    if grid is None:
+        from zagg.grids import HealpixGrid
+
+        grid = HealpixGrid(
+            parent_order=parent_order,
+            child_order=child_order,
+            layout="dense",
+            config=config,
+        )
 
     logger.info(f"Processing morton cell: {parent_morton}")
     start_time = datetime.now()
@@ -368,10 +374,7 @@ def process_morton_cell(
 
             for g in data_source["groups"]:
                 try:
-                    df = _read_group(
-                        h5obj, g, data_source, parent_morton, parent_order,
-                        geo2mort, clip2order,
-                    )
+                    df = _read_group(h5obj, g, data_source, parent_morton, grid)
                     if df is not None:
                         all_dataframes.append(df)
                 except Exception as e:
@@ -399,8 +402,7 @@ def process_morton_cell(
     # Calculate statistics for child cells
     logger.info(f"  Calculating statistics for order-{child_order} cells...")
 
-    children = generate_morton_children(parent_morton, child_order)
-    df_all["m12"] = clip2order(child_order, df_all["midx"].values)
+    children = grid.children(parent_morton)
 
     n_cells = len(children)
     data_vars = get_data_vars(config)
@@ -416,8 +418,9 @@ def process_morton_cell(
             stats_arrays[name] = np.zeros(n_cells, dtype=zarr_dtype)
 
     cells_with_data = 0
+    bucket_col = grid.bucket_at_child(df_all["leaf_id"].values)
     for i, child_morton in enumerate(children):
-        df_cell = df_all[df_all["m12"] == child_morton]
+        df_cell = df_all[bucket_col == child_morton]
         if len(df_cell) > 0:
             cells_with_data += 1
         stats = calculate_cell_statistics(df_cell, value_col="h_li", sigma_col="s_li", config=config)
@@ -427,7 +430,7 @@ def process_morton_cell(
     logger.info(f"  Statistics: {cells_with_data}/{n_cells} cells with data")
 
     # Create output DataFrame
-    child_cell_ids, _ = mort2healpix(children)
+    child_cell_ids = grid.encode_cell_ids(children)
 
     df_out = pd.DataFrame({var: stats_arrays[var] for var in data_vars})
     df_out = df_out.assign(morton=children, cell_ids=child_cell_ids)

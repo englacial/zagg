@@ -83,7 +83,7 @@ def _handle_setup(event: Dict[str, Any]) -> Dict[str, Any]:
             store,
             parent_order=event["parent_order"],
             child_order=event["child_order"],
-            n_parent_cells=event["n_parent_cells"],
+            n_parent_cells=event.get("n_parent_cells"),
             overwrite=event.get("overwrite", False),
             config=config,
         )

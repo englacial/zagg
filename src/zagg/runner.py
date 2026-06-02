@@ -20,9 +20,9 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from zarr import consolidate_metadata
 
 from zagg.auth import get_edl_token, get_nsidc_s3_credentials
-from zagg.config import PipelineConfig, get_child_order, get_driver, get_store_path
+from zagg.config import PipelineConfig, get_child_order, get_driver, get_layout, get_store_path
+from zagg.grids import HealpixGrid
 from zagg.processing import process_morton_cell, write_dataframe_to_zarr
-from zagg.schema import xdggs_zarr_template
 from zagg.store import open_store
 
 logger = logging.getLogger(__name__)
@@ -162,25 +162,26 @@ def _dry_run_summary(cells: list[str], catalog: dict, store_path: str) -> dict:
     }
 
 
-def _process_and_write(cell, chunk_idx, granule_urls, parent_order, child_order,
+def _process_and_write(cell, chunk_idx, granule_urls, grid,
                        s3_creds, zarr_store, config, driver=None, catalog_metadata=None):
     """Process a single cell and write results to store."""
     df_out, metadata = process_morton_cell(
         parent_morton=int(cell),
-        parent_order=parent_order,
-        child_order=child_order,
+        parent_order=grid.parent_order,
+        child_order=grid.child_order,
         granule_urls=granule_urls,
         s3_credentials=s3_creds,
         config=config,
         driver=driver,
         catalog_metadata=catalog_metadata,
+        grid=grid,
     )
     if not df_out.empty:
         write_dataframe_to_zarr(
             df_out, zarr_store,
             chunk_idx=chunk_idx,
-            child_order=child_order,
-            parent_order=parent_order,
+            child_order=grid.child_order,
+            parent_order=grid.parent_order,
         )
     return metadata
 
@@ -206,16 +207,18 @@ def _run_local(config, catalog_data, store_path, child_order, *,
     else:
         s3_creds = get_nsidc_s3_credentials()
 
-    # Open store and create template
-    zarr_store = open_store(store_path, region=region)
-    zarr_store = xdggs_zarr_template(
-        zarr_store, parent_order, child_order,
-        overwrite=overwrite,
-        n_parent_cells=metadata["total_cells"],
+    # Build grid and template. Populated-shard order matches the catalog's
+    # key order — required for byte-identical writes in dense layout.
+    layout = get_layout(config)
+    grid = HealpixGrid(
+        parent_order=parent_order,
+        child_order=child_order,
+        layout=layout,
         config=config,
+        populated_shards=[int(c) for c in all_cells] if layout == "dense" else None,
     )
-
-    cell_to_idx = {cell: idx for idx, cell in enumerate(all_cells)}
+    zarr_store = open_store(store_path, region=region)
+    zarr_store = grid.emit_template(zarr_store, overwrite=overwrite)
 
     start_time = time.time()
     total_obs = 0
@@ -227,8 +230,8 @@ def _run_local(config, catalog_data, store_path, child_order, *,
         futures = {
             executor.submit(
                 _process_and_write,
-                cell, cell_to_idx[cell], catalog[cell],
-                parent_order, child_order,
+                cell, grid.block_index(int(cell))[0], catalog[cell],
+                grid,
                 s3_creds, zarr_store, config,
                 driver=driver, catalog_metadata=metadata,
             ): cell
@@ -296,7 +299,14 @@ def _run_lambda(config, catalog_data, store_path, child_order, *,
     # Authenticate (for per-cell NSIDC reads inside the Lambda)
     s3_creds = get_nsidc_s3_credentials()
 
-    cell_to_idx = {cell: idx for idx, cell in enumerate(all_cells)}
+    layout = get_layout(config)
+    grid = HealpixGrid(
+        parent_order=parent_order,
+        child_order=child_order,
+        layout=layout,
+        config=config,
+        populated_shards=[int(c) for c in all_cells] if layout == "dense" else None,
+    )
     config_dict = asdict(config)
 
     # Configure boto3 client (created early so we can use it for setup/finalize)
@@ -317,7 +327,7 @@ def _run_lambda(config, catalog_data, store_path, child_order, *,
     _invoke_lambda_setup(
         lambda_client, function_name, store_path,
         parent_order=parent_order, child_order=child_order,
-        n_parent_cells=metadata["total_cells"],
+        n_parent_cells=metadata["total_cells"] if layout == "dense" else None,
         overwrite=overwrite, config_dict=config_dict,
     )
 
@@ -332,7 +342,7 @@ def _run_lambda(config, catalog_data, store_path, child_order, *,
         futures = {
             executor.submit(
                 _invoke_lambda_cell,
-                lambda_client, cell_to_idx[cell], int(cell),
+                lambda_client, grid.block_index(int(cell))[0], int(cell),
                 parent_order, child_order,
                 catalog[cell], store_path, s3_creds,
                 function_name=function_name,
