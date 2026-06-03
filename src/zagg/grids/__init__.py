@@ -1,6 +1,8 @@
 """Output grid implementations."""
 from __future__ import annotations
 
+import warnings
+
 from zagg.config import PipelineConfig, get_child_order
 from zagg.grids.base import InconsistentShardError, OutputGrid, ShardKey
 from zagg.grids.healpix import HEALPIX_BASE_CELLS, HealpixGrid
@@ -26,7 +28,16 @@ def from_config(
     grid_cfg = config.output.get("grid", {})
     grid_type = grid_cfg.get("type", "healpix")
     if grid_type == "healpix":
-        layout = grid_cfg.get("layout", "dense")
+        explicit_layout = grid_cfg.get("layout")
+        if explicit_layout == "dense":
+            warnings.warn(
+                "output.grid.layout: dense is deprecated; switch to fullsphere "
+                "(the new default) or omit the field. Dense will be removed in "
+                "a future release.",
+                DeprecationWarning,
+                stacklevel=2,
+            )
+        layout = explicit_layout or "fullsphere"
         return HealpixGrid(
             parent_order=parent_order,
             child_order=get_child_order(config),

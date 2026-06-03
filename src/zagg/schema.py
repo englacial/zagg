@@ -6,6 +6,8 @@ omit it for full sphere.
 """
 from __future__ import annotations
 
+import warnings
+
 from pydantic_zarr.experimental.v3 import GroupSpec
 from typing_extensions import TypedDict
 from zarr.abc.store import Store
@@ -77,6 +79,13 @@ def xdggs_zarr_template(
             config=config,
         )
     else:
+        warnings.warn(
+            "xdggs_zarr_template(n_parent_cells=...) produces a deprecated "
+            "dense-pack layout; omit n_parent_cells for fullsphere (the new "
+            "default).",
+            DeprecationWarning,
+            stacklevel=2,
+        )
         # Synthetic shard identities — emit_template only needs the count.
         grid = HealpixGrid(
             parent_order=parent_order,

@@ -94,10 +94,16 @@ class TestShardOf:
 
 
 class TestBlockIndex:
-    def test_fullsphere_identity(self):
+    def test_fullsphere_returns_healpix_nested(self):
+        """Fullsphere chunks are indexed by HEALPix nested ID, not morton."""
+        from mortie import mort2healpix
+
         g = HealpixGrid(parent_order=6, child_order=8, layout="fullsphere")
-        assert g.block_index(42) == (42,)
-        assert g.block_index(196607) == (196607,)
+        parent = _valid_parents(1)[0]
+        expected, _ = mort2healpix(np.asarray([parent]))
+        assert g.block_index(parent) == (int(expected[0]),)
+        # Range check: must lie in [0, 12·4^parent_order)
+        assert 0 <= g.block_index(parent)[0] < 12 * 4**6
 
     def test_dense_uses_position_map(self):
         shards = _valid_parents(3)
@@ -194,13 +200,20 @@ class TestRoundTrip:
 
 
 class TestFromConfig:
-    def test_healpix_default_dense(self, cfg):
-        g = from_config(cfg, parent_order=6, populated_shards=_valid_parents(3))
+    def test_healpix_default_fullsphere(self, cfg):
+        # No layout in YAML → fullsphere (default since dense was deprecated).
+        g = from_config(cfg, parent_order=6)
         assert isinstance(g, HealpixGrid)
-        assert g.layout == "dense"
+        assert g.layout == "fullsphere"
         assert g.parent_order == 6
 
-    def test_healpix_fullsphere_via_config(self, cfg):
+    def test_healpix_explicit_dense_warns(self, cfg):
+        cfg.output["grid"]["layout"] = "dense"
+        with pytest.warns(DeprecationWarning, match="dense is deprecated"):
+            g = from_config(cfg, parent_order=6, populated_shards=_valid_parents(3))
+        assert g.layout == "dense"
+
+    def test_healpix_explicit_fullsphere(self, cfg):
         cfg.output["grid"]["layout"] = "fullsphere"
         g = from_config(cfg, parent_order=6)
         assert g.layout == "fullsphere"

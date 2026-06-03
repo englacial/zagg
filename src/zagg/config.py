@@ -375,9 +375,9 @@ def get_layout(config: PipelineConfig) -> str:
     Returns
     -------
     str
-        ``"dense"`` (default) or ``"fullsphere"``.
+        ``"fullsphere"`` (default) or ``"dense"`` (deprecated).
     """
-    return config.output.get("grid", {}).get("layout", "dense")
+    return config.output.get("grid", {}).get("layout", "fullsphere")
 
 
 def get_store_path(config: PipelineConfig) -> str | None:
