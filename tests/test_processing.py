@@ -5,11 +5,11 @@ from zarr import open_group
 from zarr.storage import MemoryStore
 
 from zagg.config import default_config, get_agg_fields, get_coords, get_data_vars
+from zagg.grids import HealpixGrid
 from zagg.processing import (
     calculate_cell_statistics,
     write_dataframe_to_zarr,
 )
-from zagg.schema import xdggs_zarr_template
 
 
 class TestWriteDataframeToZarr:
@@ -21,16 +21,15 @@ class TestWriteDataframeToZarr:
         coords = get_coords(cfg)
         data_vars = get_data_vars(cfg)
 
+        grid = HealpixGrid(parent_order, child_order, layout="fullsphere", config=cfg)
         store = MemoryStore()
-        xdggs_zarr_template(store, parent_order, child_order)
+        grid.emit_template(store)
 
         df_out = mock_dataframe_factory(-78.5, -132.0, parent_order, child_order)
 
         n_children = 4 ** (child_order - parent_order)
-        chunk_idx = int(df_out["cell_ids"].min()) // n_children
-        assert write_dataframe_to_zarr(
-            df_out, store, chunk_idx=chunk_idx, child_order=child_order, parent_order=parent_order
-        )
+        chunk_idx = (int(df_out["cell_ids"].min()) // n_children,)
+        assert write_dataframe_to_zarr(df_out, store, grid=grid, chunk_idx=chunk_idx)
 
         group = open_group(store=store, mode="r", path=str(child_order))
         min_idx = int(df_out["cell_ids"].min())
@@ -42,32 +41,27 @@ class TestWriteDataframeToZarr:
             np.testing.assert_array_almost_equal(actual, expected, err_msg=f"Mismatch in {col}")
 
     def test_write_empty_dataframe(self):
+        grid = HealpixGrid(6, 8, layout="fullsphere")
         store = MemoryStore()
         assert write_dataframe_to_zarr(
-            pd.DataFrame(), store, chunk_idx=0, child_order=8, parent_order=6
+            pd.DataFrame(), store, grid=grid, chunk_idx=(0,)
         )
 
-    def test_write_index_range_mismatch(self, mock_dataframe_factory):
+    def test_write_row_count_mismatch(self, mock_dataframe_factory):
         parent_order = 6
         child_order = 8
 
+        cfg = default_config()
+        grid = HealpixGrid(parent_order, child_order, layout="fullsphere", config=cfg)
         store = MemoryStore()
-        xdggs_zarr_template(store, parent_order, child_order)
+        grid.emit_template(store)
 
         df_out = mock_dataframe_factory(-78.5, -132.0, parent_order, child_order)
         df_out = df_out.iloc[: len(df_out) // 2]
         n_children = 4 ** (child_order - parent_order)
-        chunk_idx = int(df_out["cell_ids"].min()) // n_children
-        with pytest.raises(
-            ValueError, match="Expected index range to match range between min and max cell_ids"
-        ):
-            write_dataframe_to_zarr(
-                df_out,
-                store,
-                chunk_idx=chunk_idx,
-                child_order=child_order,
-                parent_order=parent_order,
-            )
+        chunk_idx = (int(df_out["cell_ids"].min()) // n_children,)
+        with pytest.raises(ValueError, match="Expected.*rows for chunk_shape"):
+            write_dataframe_to_zarr(df_out, store, grid=grid, chunk_idx=chunk_idx)
 
 
 class TestCalculateCellStatistics:

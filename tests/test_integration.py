@@ -5,7 +5,6 @@ from zarr.storage import MemoryStore
 from zagg.config import default_config, get_coords, get_data_vars
 from zagg.grids import HealpixGrid
 from zagg.processing import write_dataframe_to_zarr
-from zagg.schema import xdggs_zarr_template
 
 
 def test_full_integration(zarr_store, mock_dataframe_factory):
@@ -17,16 +16,15 @@ def test_full_integration(zarr_store, mock_dataframe_factory):
     coords = get_coords(cfg)
     data_vars = get_data_vars(cfg)
 
+    grid = HealpixGrid(parent_order, child_order, layout="fullsphere", config=cfg)
     store = zarr_store
-    xdggs_zarr_template(store, parent_order, child_order)
+    grid.emit_template(store)
 
     df_out = mock_dataframe_factory(-78.5, -132.0, parent_order, child_order)
 
     n_children = 4 ** (child_order - parent_order)
-    chunk_idx = int(df_out["cell_ids"].min()) // n_children
-    write_dataframe_to_zarr(
-        df_out, store, chunk_idx=chunk_idx, child_order=child_order, parent_order=parent_order
-    )
+    chunk_idx = (int(df_out["cell_ids"].min()) // n_children,)
+    write_dataframe_to_zarr(df_out, store, grid=grid, chunk_idx=chunk_idx)
 
     group = zarr.open_group(store=store, path=str(child_order), mode="r")
     min_idx = int(df_out["cell_ids"].min())
@@ -70,8 +68,8 @@ def test_dense_fullsphere_equivalence(mock_dataframe_factory):
     for parent, df in zip(parents, frames):
         write_dataframe_to_zarr(
             df, dense_store,
-            chunk_idx=dense_grid.block_index(parent)[0],
-            child_order=child_order, parent_order=parent_order,
+            grid=dense_grid,
+            chunk_idx=dense_grid.block_index(parent),
         )
 
     # Fullsphere store
@@ -83,8 +81,8 @@ def test_dense_fullsphere_equivalence(mock_dataframe_factory):
     for parent, df in zip(parents, frames):
         write_dataframe_to_zarr(
             df, full_store,
-            chunk_idx=full_grid.block_index(parent)[0],
-            child_order=child_order, parent_order=parent_order,
+            grid=full_grid,
+            chunk_idx=full_grid.block_index(parent),
         )
 
     dense_group = zarr.open_group(dense_store, path=str(child_order), mode="r")
@@ -108,6 +106,53 @@ def test_dense_fullsphere_equivalence(mock_dataframe_factory):
             )
 
 
+def test_rectilinear_end_to_end():
+    """Write a synthetic per-cell dataframe to a rectilinear store; read
+    back and verify cell positions."""
+    import pandas as pd
+
+    from zagg.config import default_config
+    from zagg.grids import RectilinearGrid
+
+    cfg = default_config("atl06_polar")
+    # Small grid for test speed: 32 x 32 cells, 8x8 chunks → 4x4 chunk grid.
+    grid = RectilinearGrid(
+        crs="EPSG:3031", resolution=200_000,  # large resolution → small grid
+        bounds=(-3_200_000, -3_200_000, 3_200_000, 3_200_000),
+        chunk_shape=(8, 8), config=cfg,
+    )
+    assert grid.array_shape == (32, 32)
+    assert grid.n_row_blocks == 4 and grid.n_col_blocks == 4
+
+    store = MemoryStore()
+    grid.emit_template(store)
+
+    # Write known values to one chunk.
+    shard = grid._pack(1, 2)
+    n_cells = grid.chunk_h * grid.chunk_w
+    df = pd.DataFrame({
+        "count": np.arange(n_cells, dtype=np.int32),
+        "h_min": np.linspace(-100, 100, n_cells, dtype=np.float32),
+        "h_max": np.linspace(0, 200, n_cells, dtype=np.float32),
+        "h_mean": np.linspace(-50, 150, n_cells, dtype=np.float32),
+        "h_sigma": np.full(n_cells, 0.5, dtype=np.float32),
+        "h_variance": np.full(n_cells, 1.0, dtype=np.float32),
+    })
+    from zagg.processing import write_dataframe_to_zarr
+    write_dataframe_to_zarr(df, store, grid=grid, chunk_idx=grid.block_index(shard))
+
+    # Read back. Block (1, 2) covers rows [8, 16) and cols [16, 24).
+    group = zarr.open_group(store, path=grid.group_path, mode="r")
+    block = group["count"][8:16, 16:24]
+    assert block.shape == (8, 8)
+    np.testing.assert_array_equal(
+        block, np.arange(n_cells, dtype=np.int32).reshape(8, 8)
+    )
+
+    # Confirm other chunks are still fill-value (NaN for float arrays).
+    assert np.all(np.isnan(group["h_mean"][0:8, 0:8]))
+
+
 def test_multiple_parent_cells(zarr_store, mock_dataframe_factory):
     """Test writing data from multiple parent cells to the same store."""
     parent_order = 6
@@ -117,8 +162,9 @@ def test_multiple_parent_cells(zarr_store, mock_dataframe_factory):
     coords = get_coords(cfg)
     data_vars = get_data_vars(cfg)
 
+    grid = HealpixGrid(parent_order, child_order, layout="fullsphere", config=cfg)
     store = zarr_store
-    xdggs_zarr_template(store, parent_order, child_order)
+    grid.emit_template(store)
 
     coordinates = [
         (-78.5, -132.0),
@@ -130,10 +176,8 @@ def test_multiple_parent_cells(zarr_store, mock_dataframe_factory):
         df_out = mock_dataframe_factory(lat, lon, parent_order, child_order)
 
         n_children = 4 ** (child_order - parent_order)
-        chunk_idx = int(df_out["cell_ids"].min()) // n_children
-        write_dataframe_to_zarr(
-            df_out, store, chunk_idx=chunk_idx, child_order=child_order, parent_order=parent_order
-        )
+        chunk_idx = (int(df_out["cell_ids"].min()) // n_children,)
+        write_dataframe_to_zarr(df_out, store, grid=grid, chunk_idx=chunk_idx)
 
         all_data[(lat, lon)] = df_out
 

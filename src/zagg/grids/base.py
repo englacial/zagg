@@ -4,6 +4,16 @@ Each implementation owns the grid-specific operations the pipeline needs:
 shard enumeration, point-to-cell assignment, write-partition identity,
 storage-block mapping, footprint geometry, and Zarr template emission.
 
+Terminology
+-----------
+- **leaf id** — the high-precision spatial identifier returned by ``assign``.
+  Grid-specific (HEALPix: order-18 morton; rectilinear: flat row-major cell
+  index). Pipeline code treats it as an opaque integer.
+- **cell id** — the aggregation-grid identifier returned by ``cells_of`` and
+  ``children``. For some grids (rectilinear) leaf id and cell id coincide.
+- **shard key** — the write-partition identifier returned by ``shard_of``.
+  ``block_index`` maps a shard key to a storage block tuple.
+
 The shard_of / block_index split (see bench/REPORT.md §2) keeps spatial
 identity separate from storage position. For grids where chunks tile space
 algorithmically (rectilinear, fullsphere DGGS) the two collapse; for dense-
@@ -32,8 +42,15 @@ class OutputGrid(Protocol):
     a populated-shard list (dense DGGS) so block_index can resolve.
     """
 
-    parent_order: int
-    child_order: int
+    @property
+    def array_shape(self) -> tuple[int, ...]:
+        """Full output-array shape (1D for DGGS, 2D for rectilinear)."""
+        ...
+
+    @property
+    def chunk_shape(self) -> tuple[int, ...]:
+        """Per-chunk shape (rank matches ``array_shape``)."""
+        ...
 
     def coverage(
         self, polygon_parts: list[tuple[np.ndarray, np.ndarray]]
@@ -42,11 +59,15 @@ class OutputGrid(Protocol):
         ...
 
     def assign(self, lats: np.ndarray, lons: np.ndarray) -> np.ndarray:
-        """Map (lat, lon) points to leaf cell IDs at child_order."""
+        """Map (lat, lon) points to leaf ids."""
+        ...
+
+    def cells_of(self, leaf_ids: np.ndarray) -> np.ndarray:
+        """Coarsen leaf ids to aggregation cell ids."""
         ...
 
     def shards_of(self, leaf_ids: np.ndarray) -> np.ndarray:
-        """Vectorized: shard key for each leaf cell."""
+        """Vectorized: shard key for each leaf id."""
         ...
 
     def shard_of(self, leaf_ids: np.ndarray) -> ShardKey:
@@ -72,11 +93,19 @@ class OutputGrid(Protocol):
         ...
 
     def children(self, shard_key: ShardKey) -> np.ndarray:
-        """Enumerate leaf cell IDs under a shard, in the canonical chunk order."""
+        """Enumerate cell ids under a shard, in canonical chunk order."""
         ...
 
-    def encode_cell_ids(self, leaf_ids: np.ndarray) -> np.ndarray:
-        """Encode leaf IDs to the output coord array (e.g., morton → healpix)."""
+    def encode_cell_ids(self, cell_ids: np.ndarray) -> np.ndarray:
+        """Encode cell ids to the output coord array (e.g., morton → healpix)."""
+        ...
+
+    def chunk_coords(self, shard_key: ShardKey) -> dict:
+        """Per-cell coord column values for a chunk (HEALPix: morton, cell_ids).
+
+        Empty for grids that store coords as 1D dimensional arrays on the
+        template (e.g., rectilinear's ``x``/``y``).
+        """
         ...
 
     def emit_template(self, store: Store, *, overwrite: bool = False) -> Store:

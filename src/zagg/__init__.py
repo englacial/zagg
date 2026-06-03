@@ -27,6 +27,7 @@ from .grids import HealpixGrid, OutputGrid
 from .processing import (
     calculate_cell_statistics,
     process_morton_cell,
+    process_shard,
     write_dataframe_to_zarr,
 )
 from .runner import agg
@@ -49,6 +50,7 @@ __all__ = [
     "open_store",
     "parse_s3_path",
     "process_morton_cell",
+    "process_shard",
     "agg",
     "write_dataframe_to_zarr",
     "xdggs_spec",

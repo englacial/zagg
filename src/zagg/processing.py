@@ -6,6 +6,7 @@ cloud platforms or local processing environments.
 """
 
 import logging
+import warnings
 from datetime import datetime
 from typing import List, Tuple
 
@@ -44,49 +45,52 @@ def write_dataframe_to_zarr(
     df_out: pd.DataFrame,
     store: Store,
     *,
-    chunk_idx: int,
-    child_order: int,
-    parent_order: int,
+    grid,
+    chunk_idx: tuple,
 ) -> Store:
-    """
-    Write a DataFrame to an existing Zarr store.
+    """Write a per-shard DataFrame to an existing Zarr template.
 
     Parameters
     ----------
     df_out : pd.DataFrame
-        DataFrame with columns matching the pipeline config (coordinates + data variables)
+        Coordinate + data-variable columns. Row count must equal
+        ``prod(grid.chunk_shape)``; rows are in the grid's canonical
+        chunk order (``grid.children(shard_key)``).
     store : Store
-        Zarr-compatible store (already contains template)
-    chunk_idx : int
-        The chunk index for storing data
-    child_order : int
-        Order of child cells
-    parent_order : int
-        Order of parent cells
+        Zarr-compatible store with the template already written.
+    grid : OutputGrid
+        Grid the data was aggregated against. Provides ``group_path`` and
+        ``chunk_shape`` for routing the write.
+    chunk_idx : tuple of int
+        Storage block index for this shard, as returned by
+        ``grid.block_index(shard_key)``.
 
     Returns
     -------
     Store
-        The same store, with data written
+        The same store, with data written.
     """
     if df_out.empty:
         return store
-    min_index = int(df_out["cell_ids"].min())
-    max_index = int(df_out["cell_ids"].max())
 
-    expected_count = 4 ** (child_order - parent_order)
-    actual_count = max_index - min_index + 1
-    if actual_count != expected_count:
+    expected_count = int(np.prod(grid.chunk_shape))
+    if len(df_out) != expected_count:
         raise ValueError(
-            f"Expected index range to match range between min and max cell_ids, got index_range={expected_count}, actual_range={actual_count}"
+            f"Expected {expected_count} rows for chunk_shape={grid.chunk_shape}, "
+            f"got {len(df_out)}"
         )
 
+    chunk_idx = tuple(int(i) for i in chunk_idx)
     for name, series in df_out.items():
+        values = series.values
+        if values.shape != grid.chunk_shape:
+            values = values.reshape(grid.chunk_shape)
         with config.set({"async.concurrency": 128}):
             array = open_array(
-                store, path=f"{str(child_order)}/{name}", zarr_format=3, consolidated=False
+                store, path=f"{grid.group_path}/{name}",
+                zarr_format=3, consolidated=False,
             )
-            array.set_block_selection((chunk_idx,), series.values)
+            array.set_block_selection(chunk_idx, values)
 
     return store
 
@@ -239,74 +243,56 @@ def _read_group(h5obj, group: str, data_source: dict, parent_morton: int, grid):
     return pd.DataFrame(data_dict)
 
 
-def process_morton_cell(
-    parent_morton: int,
-    parent_order: int,
-    child_order: int,
+def process_shard(
+    grid,
+    shard_key: int,
     granule_urls: List[str],
+    *,
     s3_credentials: dict,
     h5coro_driver=None,
     config: PipelineConfig | None = None,
     driver: str | None = None,
     catalog_metadata: dict | None = None,
-    grid=None,
 ) -> Tuple[pd.DataFrame, ProcessingMetadata]:
-    """
-    Process one parent morton cell: read data, calculate statistics, return DataFrame.
+    """Process one shard: read granules, filter to this shard, aggregate, return df.
 
-    This is a cloud-agnostic function that processes HDF5 data and returns
-    results as a DataFrame. The caller is responsible for writing the output.
+    Grid-agnostic. For HEALPix, ``shard_key`` is the parent morton ID; for
+    rectilinear, the packed ``rb * n_col_blocks + cb`` chunk index.
 
     Parameters
     ----------
-    parent_morton : int
-        Morton index of parent cell
-    parent_order : int
-        Order of parent morton cell (e.g., 6 or 7)
-    child_order : int
-        Order of child cells for statistics (typically 12)
-    granule_urls : list
-        List of S3 URLs or file paths to process
+    grid : OutputGrid
+        Output grid (provides ``assign``/``shards_of``/``children``/
+        ``encode_cell_ids``/``chunk_coords``).
+    shard_key : int
+        Shard identifier (grid-specific encoding).
+    granule_urls : list of str
+        S3 URLs or file paths to read.
     s3_credentials : dict
-        Credentials for accessing data. For S3 driver: dict with
-        accessKeyId/secretAccessKey/sessionToken. For HTTPS driver:
-        dict with ``edl_token`` key (bearer token string).
+        For S3: ``accessKeyId``/``secretAccessKey``/``sessionToken``.
+        For HTTPS: ``{"edl_token": "..."}``.
     h5coro_driver : class, optional
-        h5coro driver class. Overrides ``driver`` if provided.
+        Overrides ``driver``.
     config : PipelineConfig, optional
-        Pipeline config. Defaults to ``default_config()``.
+        Defaults to ``default_config()``.
     driver : str, optional
-        Data access driver: ``"s3"`` or ``"https"``. Used to select
-        h5coro driver and rewrite URLs if needed. Defaults to
-        ``config.data_source.driver`` or ``"s3"``.
+        ``"s3"`` (default) or ``"https"``.
     catalog_metadata : dict, optional
-        Catalog metadata containing ``s3_base`` and ``https_base`` for
-        URL rewriting when using the HTTPS driver.
-    grid : OutputGrid, optional
-        Output grid. Defaults to a stateless ``HealpixGrid(layout="dense")``
-        (only ``assign``/``shards_of``/``children``/``encode_cell_ids`` are
-        used here; layout doesn't affect cell-stat computation).
+        Carries ``s3_base``/``https_base`` for HTTPS URL rewriting.
 
     Returns
     -------
-    tuple
-        (DataFrame, metadata_dict)
+    (DataFrame, metadata)
+        DataFrame in canonical chunk order; metadata dict with ``shard_key``,
+        ``cells_with_data``, ``total_obs``, ``granule_count``,
+        ``files_processed``, ``duration_s``, ``error``.
     """
     if config is None:
         config = default_config()
     data_source = config.data_source
 
-    if grid is None:
-        from zagg.grids import HealpixGrid
-
-        grid = HealpixGrid(
-            parent_order=parent_order,
-            child_order=child_order,
-            layout="dense",
-            config=config,
-        )
-
-    logger.info(f"Processing morton cell: {parent_morton}")
+    parent_morton = int(shard_key)
+    logger.info(f"Processing shard: {parent_morton}")
     start_time = datetime.now()
 
     # Resolve driver
@@ -400,9 +386,8 @@ def process_morton_cell(
     logger.info(f"  Read {len(df_all):,} observations")
 
     # Calculate statistics for child cells
-    logger.info(f"  Calculating statistics for order-{child_order} cells...")
-
     children = grid.children(parent_morton)
+    logger.info(f"  Calculating statistics for {len(children)} cells...")
 
     n_cells = len(children)
     data_vars = get_data_vars(config)
@@ -418,9 +403,9 @@ def process_morton_cell(
             stats_arrays[name] = np.zeros(n_cells, dtype=zarr_dtype)
 
     cells_with_data = 0
-    bucket_col = grid.bucket_at_child(df_all["leaf_id"].values)
+    cell_col = grid.cells_of(df_all["leaf_id"].values)
     for i, child_morton in enumerate(children):
-        df_cell = df_all[bucket_col == child_morton]
+        df_cell = df_all[cell_col == child_morton]
         if len(df_cell) > 0:
             cells_with_data += 1
         stats = calculate_cell_statistics(df_cell, value_col="h_li", sigma_col="s_li", config=config)
@@ -429,17 +414,59 @@ def process_morton_cell(
 
     logger.info(f"  Statistics: {cells_with_data}/{n_cells} cells with data")
 
-    # Create output DataFrame
-    child_cell_ids = grid.encode_cell_ids(children)
-
+    # Create output DataFrame: data_vars + grid-specific per-cell coord columns
     df_out = pd.DataFrame({var: stats_arrays[var] for var in data_vars})
-    df_out = df_out.assign(morton=children, cell_ids=child_cell_ids)
+    for col_name, vals in grid.chunk_coords(shard_key).items():
+        df_out[col_name] = vals
 
     duration = (datetime.now() - start_time).total_seconds()
-    logger.info(f"Completed morton {parent_morton} in {duration:.1f}s")
+    logger.info(f"Completed shard {parent_morton} in {duration:.1f}s")
 
     metadata["cells_with_data"] = cells_with_data
     metadata["total_obs"] = int(stats_arrays["count"].sum())
     metadata["duration_s"] = duration
 
     return df_out, metadata
+
+
+def process_morton_cell(
+    parent_morton: int,
+    parent_order: int,
+    child_order: int,
+    granule_urls: List[str],
+    s3_credentials: dict,
+    h5coro_driver=None,
+    config: PipelineConfig | None = None,
+    driver: str | None = None,
+    catalog_metadata: dict | None = None,
+    grid=None,
+) -> Tuple[pd.DataFrame, ProcessingMetadata]:
+    """Deprecated HEALPix-flavored alias for :func:`process_shard`.
+
+    Constructs a stateless ``HealpixGrid`` and forwards to ``process_shard``.
+    """
+    warnings.warn(
+        "process_morton_cell is deprecated; use process_shard(grid, shard_key, ...) "
+        "directly.",
+        DeprecationWarning,
+        stacklevel=2,
+    )
+    if grid is None:
+        from zagg.grids import HealpixGrid
+
+        grid = HealpixGrid(
+            parent_order=parent_order,
+            child_order=child_order,
+            layout="fullsphere",
+            config=config or default_config(),
+        )
+    return process_shard(
+        grid,
+        parent_morton,
+        granule_urls,
+        s3_credentials=s3_credentials,
+        h5coro_driver=h5coro_driver,
+        config=config,
+        driver=driver,
+        catalog_metadata=catalog_metadata,
+    )

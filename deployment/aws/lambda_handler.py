@@ -72,21 +72,33 @@ def lambda_handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
 
 def _handle_setup(event: Dict[str, Any]) -> Dict[str, Any]:
     """Create the zarr template at ``event['store_path']``."""
-    from zagg.schema import xdggs_zarr_template
+    from zagg.grids import HealpixGrid, from_config
 
     logger.info(f"Setup mode: creating template at {event.get('store_path')}")
     try:
         config = load_config_from_dict(event["config"])
         region = os.environ.get("AWS_REGION", "us-west-2")
         store = open_store(event["store_path"], region=region)
-        xdggs_zarr_template(
-            store,
-            parent_order=event["parent_order"],
-            child_order=event["child_order"],
-            n_parent_cells=event.get("n_parent_cells"),
-            overwrite=event.get("overwrite", False),
-            config=config,
-        )
+        grid_type = config.output.get("grid", {}).get("type", "healpix")
+        if grid_type == "healpix":
+            # n_parent_cells signals dense layout; populated_shards identities
+            # don't matter for emit_template (only the count does).
+            populated = (
+                list(range(event["n_parent_cells"]))
+                if event.get("n_parent_cells") is not None
+                else None
+            )
+            layout = "dense" if populated is not None else "fullsphere"
+            grid = HealpixGrid(
+                parent_order=event["parent_order"],
+                child_order=event["child_order"],
+                layout=layout,
+                config=config,
+                populated_shards=populated,
+            )
+        else:
+            grid = from_config(config, parent_order=event.get("parent_order"))
+        grid.emit_template(store, overwrite=event.get("overwrite", False))
         return {"statusCode": 200, "body": json.dumps({"ok": True, "mode": "setup"})}
     except Exception as e:
         logger.exception(e)
@@ -166,12 +178,20 @@ def _handle_process(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
         if "config" in event:
             config = load_config_from_dict(event["config"])
 
-        # Process the morton cell using cloud-agnostic function
-        df_out, metadata = process_morton_cell(
-            parent_morton=event["parent_morton"],
-            parent_order=event["parent_order"],
-            child_order=event["child_order"],
-            granule_urls=event["granule_urls"],
+        # Build grid (writer needs group_path + chunk_shape; no populated_shards
+        # required because the orchestrator already computed chunk_idx).
+        from zagg.grids import from_config
+        if config is None:
+            from zagg.config import default_config
+            config = default_config("atl06")
+        grid = from_config(config, parent_order=event["parent_order"])
+
+        # Process the shard using cloud-agnostic function
+        from zagg.processing import process_shard
+        df_out, metadata = process_shard(
+            grid,
+            event["parent_morton"],
+            event["granule_urls"],
             s3_credentials=s3_creds,
             config=config,
         )
@@ -183,8 +203,7 @@ def _handle_process(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
             store = open_store(store_path, region=region)
 
             # Validate that Zarr template exists before writing
-            child_order = event["child_order"]
-            template_key = f"{child_order}/zarr.json"
+            template_key = f"{grid.group_path}/zarr.json"
             if not store.exists(template_key):
                 error_msg = f"Zarr template not found at {store_path}/{template_key}"
                 logger.error(error_msg)
@@ -200,9 +219,8 @@ def _handle_process(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
                 write_dataframe_to_zarr(
                     df_out,
                     store,
-                    chunk_idx=event["chunk_idx"],
-                    child_order=event["child_order"],
-                    parent_order=event["parent_order"],
+                    grid=grid,
+                    chunk_idx=tuple(event["chunk_idx"]),
                 )
             except Exception as e:
                 logger.error(f"Failed to write zarr to {store_path}: {e}")
