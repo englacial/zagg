@@ -142,6 +142,14 @@ def validate_config(config: PipelineConfig) -> None:
             raise ValueError("output.grid.type is required")
         if grid["type"] == "healpix" and "child_order" not in grid:
             raise ValueError("output.grid.child_order is required for healpix grid")
+        if grid["type"] == "rectilinear":
+            for field in ("crs", "resolution", "bounds"):
+                if field not in grid:
+                    raise ValueError(
+                        f"output.grid.{field} is required for rectilinear grid"
+                    )
+            if len(grid["bounds"]) != 4:
+                raise ValueError("output.grid.bounds must be [xmin, ymin, xmax, ymax]")
         layout = grid.get("layout")
         if layout is not None and layout not in ("dense", "fullsphere"):
             raise ValueError(

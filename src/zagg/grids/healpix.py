@@ -86,6 +86,21 @@ class HealpixGrid:
             )
         return len(self._position_map)
 
+    @property
+    def array_shape(self) -> tuple[int, ...]:
+        if self.layout == "fullsphere":
+            return (HEALPIX_BASE_CELLS * (4**self.child_order),)
+        return (self.n_children * self.n_shards,)
+
+    @property
+    def chunk_shape(self) -> tuple[int, ...]:
+        return (self.n_children,)
+
+    @property
+    def group_path(self) -> str:
+        """Zarr group path emitted by ``emit_template`` (e.g. ``'12'``)."""
+        return str(self.child_order)
+
     # ── OutputGrid protocol ──────────────────────────────────────────────
 
     def coverage(self, polygon_parts):
@@ -112,8 +127,8 @@ class HealpixGrid:
 
         return clip2order(self.parent_order, np.asarray(leaf_ids))
 
-    def bucket_at_child(self, leaf_ids) -> np.ndarray:
-        """Coarsen order-18 leaf morton IDs to ``child_order`` buckets."""
+    def cells_of(self, leaf_ids) -> np.ndarray:
+        """Coarsen order-18 leaf morton IDs to ``child_order`` cell IDs."""
         from mortie import clip2order
 
         return clip2order(self.child_order, np.asarray(leaf_ids))
@@ -170,11 +185,16 @@ class HealpixGrid:
         cell_ids, _ = mort2healpix(leaf_ids)
         return cell_ids
 
+    def chunk_coords(self, shard_key) -> dict:
+        """Per-cell coord columns for HEALPix: ``morton`` and ``cell_ids``."""
+        children = self.children(shard_key)
+        return {"morton": children, "cell_ids": self.encode_cell_ids(children)}
+
     def emit_template(self, store: Store, *, overwrite: bool = False) -> Store:
         """Write the Zarr template (group + arrays) to ``store``."""
         spec = self._spec()
         with zarr_config.set({"async.concurrency": 128}):
-            spec.to_zarr(store, str(self.child_order), overwrite=overwrite)
+            spec.to_zarr(store, self.group_path, overwrite=overwrite)
         return store
 
     def spec(self) -> GroupSpec:

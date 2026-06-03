@@ -322,29 +322,47 @@ def extract_granule_info(granule: dict) -> dict:
 
 def build_catalog(
     granules: List[dict],
-    parent_order: int,
+    parent_order: int = None,
     polygon_parts: list = None,
+    grid=None,
 ) -> tuple:
-    """
-    Build a granule catalog using morton_coverage for cell discovery
-    and shapely STRtree for granule-to-cell intersection.
+    """Build a granule catalog mapping shard keys to granule URLs.
+
+    Two code paths:
+
+    - **HEALPix fast path** (``grid is None``): uses ``morton_coverage`` for
+      cell discovery and reprojects everything to EPSG:3031 before the STRtree
+      intersect. Optimal for Antarctic-scale workloads.
+    - **Grid-driven path** (``grid`` supplied): uses ``grid.coverage`` and
+      ``grid.shard_footprint`` directly; STRtree intersect happens in WGS84.
+      Required for non-HEALPix grids.
 
     Parameters
     ----------
     granules : list
-        List of granule metadata from CMR
-    parent_order : int
-        Morton order for parent cells (e.g., 6)
+        Granule metadata from CMR.
+    parent_order : int, optional
+        HEALPix parent order; required when ``grid`` is None.
     polygon_parts : list of (lats, lons), optional
         Polygon parts for cell discovery. Defaults to Antarctic drainage basins.
+    grid : OutputGrid, optional
+        If provided, take the grid-driven path.
 
     Returns
     -------
     catalog : dict
-        Mapping of parent_morton (int) -> list of S3 URLs
+        Mapping of shard_key (int) -> list of S3 URLs.
     timings : dict
-        Wall-clock seconds for each pipeline step
+        Wall-clock seconds per pipeline step.
     """
+    if grid is not None:
+        return _build_catalog_grid_driven(granules, grid, polygon_parts)
+    if parent_order is None:
+        raise ValueError("parent_order is required when grid is None")
+    return _build_catalog_healpix(granules, parent_order, polygon_parts)
+
+
+def _build_catalog_healpix(granules, parent_order, polygon_parts):
     from pyproj import Transformer
     from shapely import STRtree, make_valid
     from shapely.geometry import Polygon
@@ -421,6 +439,65 @@ def build_catalog(
     timings["total"] = time.perf_counter() - t_total
     logger.info(f"Pass 2: {len(catalog)} cells with granule mappings")
 
+    return catalog, timings
+
+
+def _build_catalog_grid_driven(granules, grid, polygon_parts):
+    """Grid-agnostic catalog build. STRtree intersects happen in WGS84."""
+    from shapely import STRtree, make_valid
+    from shapely.geometry import Polygon
+
+    timings = {}
+    t_total = time.perf_counter()
+
+    # --- Pass 1: shard discovery via grid.coverage ---
+    if polygon_parts is None:
+        from zagg.catalog import load_antarctic_basins
+
+        polygon_parts = load_antarctic_basins()
+    t0 = time.perf_counter()
+    all_shards = grid.coverage(polygon_parts)
+    timings["cell_discovery"] = time.perf_counter() - t0
+    logger.info(f"Pass 1: {len(all_shards)} shards")
+
+    # --- Build granule polygons in WGS84 ---
+    t0 = time.perf_counter()
+    granule_polys = []
+    granule_urls = []
+    for granule in granules:
+        info = extract_granule_info(granule)
+        if not info["s3_url"] or len(info["points"]) < 3:
+            continue
+        lats = np.array([p[0] for p in info["points"]])
+        lons = np.array([p[1] for p in info["points"]])
+        try:
+            poly = Polygon(zip(lons, lats))
+            if not poly.is_valid:
+                poly = make_valid(poly)
+            if poly.is_empty:
+                continue
+        except Exception:
+            continue
+        granule_polys.append(poly)
+        granule_urls.append(info["s3_url"])
+    timings["granule_polygons"] = time.perf_counter() - t0
+
+    # --- STRtree + per-shard footprint via grid ---
+    t0 = time.perf_counter()
+    tree = STRtree(granule_polys)
+    timings["strtree_construction"] = time.perf_counter() - t0
+
+    t0 = time.perf_counter()
+    catalog: Dict[int, List[str]] = {}
+    for shard_key in all_shards:
+        footprint = grid.shard_footprint(shard_key)
+        hits = tree.query(footprint, predicate="intersects")
+        if len(hits) > 0:
+            catalog[int(shard_key)] = [granule_urls[j] for j in hits]
+    timings["strtree_queries"] = time.perf_counter() - t0
+
+    timings["total"] = time.perf_counter() - t_total
+    logger.info(f"Pass 2: {len(catalog)} shards with granule mappings")
     return catalog, timings
 
 
@@ -605,9 +682,13 @@ examples:
     if args.polygon:
         output_metadata["polygon"] = args.polygon
 
+    # New catalog format (PR-C): two parallel lists keyed by index.
+    output_metadata["grid_type"] = "healpix"
+    shard_keys = sorted(int(k) for k in catalog.keys())
     output_data = {
         "metadata": output_metadata,
-        "catalog": {str(k): v for k, v in catalog.items()},
+        "shard_keys": shard_keys,
+        "granules": [catalog[k] for k in shard_keys],
     }
 
     with open(output_file, "w") as f:

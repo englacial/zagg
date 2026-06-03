@@ -22,8 +22,7 @@ from zarr import consolidate_metadata
 
 from zagg.auth import get_edl_token, get_nsidc_s3_credentials
 from zagg.config import PipelineConfig, get_child_order, get_driver, get_layout, get_store_path
-from zagg.grids import HealpixGrid
-from zagg.processing import process_morton_cell, write_dataframe_to_zarr
+from zagg.processing import process_shard, write_dataframe_to_zarr
 from zagg.store import open_store
 
 logger = logging.getLogger(__name__)
@@ -111,7 +110,7 @@ def agg(
     # Load catalog and determine cell count for worker capping
     catalog_data = _load_catalog(catalog_path)
     n_cells = len(_select_cells(
-        catalog_data["catalog"], morton_cell=morton_cell, max_cells=max_cells,
+        catalog_data, morton_cell=morton_cell, max_cells=max_cells,
     ))
 
     if backend == "local":
@@ -144,27 +143,69 @@ def agg(
 
 
 def _load_catalog(catalog_path: str) -> dict:
-    """Load granule catalog from JSON file."""
+    """Load granule catalog from JSON file.
+
+    Returns
+    -------
+    dict
+        ``{"metadata": ..., "shard_keys": [...], "granules": [[...], ...]}``.
+        The shard_keys + granules format is required as of PR-C; the
+        legacy ``{"catalog": {str(int): [urls]}}`` format raises with
+        instructions to regenerate.
+    """
     with open(catalog_path) as f:
-        return json.load(f)
+        data = json.load(f)
+    if "shard_keys" in data and "granules" in data:
+        return data
+    if "catalog" in data:
+        raise ValueError(
+            f"Catalog at {catalog_path} uses the pre-PR-C format "
+            f"(dict-keyed). Regenerate with `python -m zagg.catalog` to "
+            f"produce the new shard_keys/granules format."
+        )
+    raise ValueError(
+        f"Catalog at {catalog_path} missing required 'shard_keys' and "
+        f"'granules' top-level keys."
+    )
 
 
-def _select_cells(catalog: dict, *, morton_cell: str | None = None,
-                   max_cells: int | None = None) -> list[str]:
-    """Select cells from catalog, optionally filtering."""
-    all_cells = list(catalog.keys())
+def _select_cells(catalog_data: dict, *, morton_cell: str | None = None,
+                   max_cells: int | None = None) -> list[tuple]:
+    """Select (shard_key, granule_urls) pairs from a loaded catalog.
+
+    Parameters
+    ----------
+    catalog_data : dict
+        Loaded catalog (shard_keys/granules format).
+    morton_cell : str, optional
+        Process a single shard, identified by stringified key.
+    max_cells : int, optional
+        Truncate to the first N shards.
+
+    Returns
+    -------
+    list of (shard_key, granule_urls) tuples.
+    """
+    pairs = list(zip(catalog_data["shard_keys"], catalog_data["granules"]))
     if morton_cell:
-        if morton_cell not in catalog:
-            raise ValueError(f"Morton cell '{morton_cell}' not in catalog")
-        return [morton_cell]
+        target = int(morton_cell)
+        matches = [(k, urls) for k, urls in pairs if k == target]
+        if not matches:
+            raise ValueError(f"shard '{morton_cell}' not in catalog")
+        return matches
     if max_cells:
-        return all_cells[:max_cells]
-    return all_cells
+        return pairs[:max_cells]
+    return pairs
 
 
-def _dry_run_summary(cells: list[str], catalog: dict, store_path: str) -> dict:
-    """Return summary without processing."""
-    granule_counts = [len(catalog[c]) for c in cells]
+def _dry_run_summary(cells: list[tuple], store_path: str) -> dict:
+    """Return summary without processing.
+
+    Parameters
+    ----------
+    cells : list of (shard_key, granule_urls) pairs from ``_select_cells``.
+    """
+    granule_counts = [len(urls) for _, urls in cells]
     return {
         "dry_run": True,
         "total_cells": len(cells),
@@ -175,26 +216,23 @@ def _dry_run_summary(cells: list[str], catalog: dict, store_path: str) -> dict:
     }
 
 
-def _process_and_write(cell, chunk_idx, granule_urls, grid,
+def _process_and_write(shard_key, chunk_idx, granule_urls, grid,
                        s3_creds, zarr_store, config, driver=None, catalog_metadata=None):
-    """Process a single cell and write results to store."""
-    df_out, metadata = process_morton_cell(
-        parent_morton=int(cell),
-        parent_order=grid.parent_order,
-        child_order=grid.child_order,
-        granule_urls=granule_urls,
+    """Process a single shard and write results to store."""
+    df_out, metadata = process_shard(
+        grid,
+        int(shard_key),
+        granule_urls,
         s3_credentials=s3_creds,
         config=config,
         driver=driver,
         catalog_metadata=catalog_metadata,
-        grid=grid,
     )
     if not df_out.empty:
         write_dataframe_to_zarr(
             df_out, zarr_store,
+            grid=grid,
             chunk_idx=chunk_idx,
-            child_order=grid.child_order,
-            parent_order=grid.parent_order,
         )
     return metadata
 
@@ -204,15 +242,13 @@ def _run_local(config, catalog_data, store_path, child_order, *,
                driver="s3"):
     """Run processing locally with ThreadPoolExecutor."""
     metadata = catalog_data["metadata"]
-    catalog = catalog_data["catalog"]
-    parent_order = metadata["parent_order"]
-    all_cells = list(catalog.keys())
+    all_shards = list(catalog_data["shard_keys"])
 
-    cells = _select_cells(catalog, morton_cell=morton_cell, max_cells=max_cells)
-    logger.info(f"Processing {len(cells)} of {len(all_cells)} cells (local, {max_workers} workers, driver={driver})")
+    cells = _select_cells(catalog_data, morton_cell=morton_cell, max_cells=max_cells)
+    logger.info(f"Processing {len(cells)} of {len(all_shards)} cells (local, {max_workers} workers, driver={driver})")
 
     if dry_run:
-        return _dry_run_summary(cells, catalog, store_path)
+        return _dry_run_summary(cells, store_path)
 
     # Authenticate based on driver
     if driver == "https":
@@ -220,16 +256,20 @@ def _run_local(config, catalog_data, store_path, child_order, *,
     else:
         s3_creds = get_nsidc_s3_credentials()
 
-    # Build grid and template. Populated-shard order matches the catalog's
-    # key order — required for byte-identical writes in dense layout.
+    # Build grid and template. For HEALPix-dense, populated_shards order
+    # matches the catalog's shard_keys list (sorted at build time).
+    from zagg.grids import from_config
+    parent_order = metadata.get("parent_order")
     layout = get_layout(config)
-    grid = HealpixGrid(
-        parent_order=parent_order,
-        child_order=child_order,
-        layout=layout,
-        config=config,
-        populated_shards=[int(c) for c in all_cells] if layout == "dense" else None,
-    )
+    grid_type = config.output.get("grid", {}).get("type", "healpix")
+    if grid_type == "healpix":
+        grid = from_config(
+            config,
+            parent_order=parent_order,
+            populated_shards=[int(s) for s in all_shards] if layout == "dense" else None,
+        )
+    else:
+        grid = from_config(config)
     zarr_store = open_store(store_path, region=region)
     zarr_store = grid.emit_template(zarr_store, overwrite=overwrite)
 
@@ -243,30 +283,30 @@ def _run_local(config, catalog_data, store_path, child_order, *,
         futures = {
             executor.submit(
                 _process_and_write,
-                cell, grid.block_index(int(cell))[0], catalog[cell],
+                shard_key, grid.block_index(int(shard_key)), urls,
                 grid,
                 s3_creds, zarr_store, config,
                 driver=driver, catalog_metadata=metadata,
-            ): cell
-            for cell in cells
+            ): shard_key
+            for shard_key, urls in cells
         }
 
         for i, future in enumerate(as_completed(futures), 1):
-            cell = futures[future]
+            shard_key = futures[future]
             try:
                 meta = future.result()
                 results.append(meta)
                 if meta.get("error"):
-                    logger.info(f"  [{i}/{len(cells)}] {cell}: {meta['error']}")
+                    logger.info(f"  [{i}/{len(cells)}] {shard_key}: {meta['error']}")
                 else:
                     obs = meta.get("total_obs", 0)
                     total_obs += obs
                     cells_with_data += 1
                     if i % 10 == 0 or len(cells) <= 20:
-                        logger.info(f"  [{i}/{len(cells)}] {cell}: {obs:,} obs")
+                        logger.info(f"  [{i}/{len(cells)}] {shard_key}: {obs:,} obs")
             except Exception as e:
                 cells_error += 1
-                logger.warning(f"  [{i}/{len(cells)}] {cell}: ERROR {e}")
+                logger.warning(f"  [{i}/{len(cells)}] {shard_key}: ERROR {e}")
 
     consolidate_metadata(zarr_store, zarr_format=3)
     wall_time = time.time() - start_time
@@ -295,31 +335,33 @@ def _run_lambda(config, catalog_data, store_path, child_order, *,
     from botocore.config import Config
 
     metadata = catalog_data["metadata"]
-    catalog = catalog_data["catalog"]
-    parent_order = metadata["parent_order"]
-    all_cells = list(catalog.keys())
+    all_shards = list(catalog_data["shard_keys"])
+    parent_order = metadata.get("parent_order")
 
     # Sort by granule count (descending) for better throughput
-    cells = _select_cells(catalog, morton_cell=morton_cell, max_cells=max_cells)
+    cells = _select_cells(catalog_data, morton_cell=morton_cell, max_cells=max_cells)
     if not morton_cell:
-        cells.sort(key=lambda c: len(catalog[c]), reverse=True)
+        cells.sort(key=lambda kv: len(kv[1]), reverse=True)
 
-    logger.info(f"Processing {len(cells)} of {len(all_cells)} cells (lambda, {max_workers} workers)")
+    logger.info(f"Processing {len(cells)} of {len(all_shards)} cells (lambda, {max_workers} workers)")
 
     if dry_run:
-        return _dry_run_summary(cells, catalog, store_path)
+        return _dry_run_summary(cells, store_path)
 
     # Authenticate (for per-cell NSIDC reads inside the Lambda)
     s3_creds = get_nsidc_s3_credentials()
 
+    from zagg.grids import from_config
     layout = get_layout(config)
-    grid = HealpixGrid(
-        parent_order=parent_order,
-        child_order=child_order,
-        layout=layout,
-        config=config,
-        populated_shards=[int(c) for c in all_cells] if layout == "dense" else None,
-    )
+    grid_type = config.output.get("grid", {}).get("type", "healpix")
+    if grid_type == "healpix":
+        grid = from_config(
+            config,
+            parent_order=parent_order,
+            populated_shards=[int(s) for s in all_shards] if layout == "dense" else None,
+        )
+    else:
+        grid = from_config(config)
     config_dict = asdict(config)
 
     # Configure boto3 client (created early so we can use it for setup/finalize)
@@ -340,7 +382,7 @@ def _run_lambda(config, catalog_data, store_path, child_order, *,
     _invoke_lambda_setup(
         lambda_client, function_name, store_path,
         parent_order=parent_order, child_order=child_order,
-        n_parent_cells=metadata["total_cells"] if layout == "dense" else None,
+        n_parent_cells=len(all_shards) if grid_type == "healpix" and layout == "dense" else None,
         overwrite=overwrite, config_dict=config_dict,
     )
 
@@ -355,13 +397,13 @@ def _run_lambda(config, catalog_data, store_path, child_order, *,
         futures = {
             executor.submit(
                 _invoke_lambda_cell,
-                lambda_client, grid.block_index(int(cell))[0], int(cell),
+                lambda_client, grid.block_index(int(shard_key)), int(shard_key),
                 parent_order, child_order,
-                catalog[cell], store_path, s3_creds,
+                urls, store_path, s3_creds,
                 function_name=function_name,
                 config_dict=config_dict,
-            ): cell
-            for cell in cells
+            ): shard_key
+            for shard_key, urls in cells
         }
 
         for i, future in enumerate(as_completed(futures), 1):

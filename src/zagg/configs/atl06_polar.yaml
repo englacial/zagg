@@ -1,0 +1,50 @@
+data_source:
+  reader: h5coro
+  driver: s3
+  groups: [gt1l, gt1r, gt2l, gt2r, gt3l, gt3r]
+  coordinates:
+    latitude: "/{group}/land_ice_segments/latitude"
+    longitude: "/{group}/land_ice_segments/longitude"
+  variables:
+    h_li: "/{group}/land_ice_segments/h_li"
+    s_li: "/{group}/land_ice_segments/h_li_sigma"
+  quality_filter:
+    dataset: "/{group}/land_ice_segments/atl06_quality_summary"
+    value: 0
+
+aggregation:
+  variables:
+    count:
+      function: len
+      source: h_li
+      dtype: int32
+      fill_value: 0
+    h_min:
+      function: min
+      source: h_li
+      dtype: float32
+    h_max:
+      function: max
+      source: h_li
+      dtype: float32
+    h_mean:
+      function: average
+      source: h_li
+      params:
+        weights: "1.0 / s_li**2"
+      dtype: float32
+    h_sigma:
+      expression: "1.0 / np.sqrt(np.sum(1.0 / s_li**2))"
+      dtype: float32
+    h_variance:
+      function: var
+      source: h_li
+      dtype: float32
+
+output:
+  grid:
+    type: rectilinear
+    crs: EPSG:3031
+    resolution: 5000              # metres
+    bounds: [-3200000, -3200000, 3200000, 3200000]
+    chunk_shape: [256, 256]

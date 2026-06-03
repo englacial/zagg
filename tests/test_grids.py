@@ -82,10 +82,10 @@ class TestShardOf:
         assert np.all(parents[: len(l1)] == p1)
         assert np.all(parents[len(l1) :] == p2)
 
-    def test_bucket_at_child(self, cfg):
+    def test_cells_of(self, cfg):
         g = HealpixGrid(parent_order=6, child_order=12, config=cfg)
         leaves = _leaves_for(-78.5, -132.0)
-        buckets = g.bucket_at_child(leaves)
+        buckets = g.cells_of(leaves)
         # Every leaf bucket must be a valid child of the shard.
         parent = g.shard_of(leaves)
         children = set(int(c) for c in g.children(parent))
