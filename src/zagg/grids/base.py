@@ -12,7 +12,7 @@ shard list to translate.
 """
 from __future__ import annotations
 
-from typing import Any, Iterable, Protocol, runtime_checkable
+from typing import Any, Protocol, runtime_checkable
 
 import numpy as np
 from zarr.abc.store import Store

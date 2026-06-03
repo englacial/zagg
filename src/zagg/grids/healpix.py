@@ -9,7 +9,7 @@ from zarr import config as zarr_config
 from zarr.abc.store import Store
 
 from zagg.config import PipelineConfig, default_config, get_agg_fields
-from zagg.grids.base import InconsistentShardError, ShardKey
+from zagg.grids.base import InconsistentShardError
 
 HEALPIX_BASE_CELLS: int = 12
 HEALPIX_REF_ORDER: int = 18  # mortie's clip2order reference order; do not change
@@ -129,9 +129,18 @@ class HealpixGrid:
         return first
 
     def block_index(self, shard_key) -> tuple[int, ...]:
-        """Storage block index for this parent morton ID."""
+        """Storage block index for this parent morton ID.
+
+        For fullsphere layout, returns the parent's HEALPix nested cell ID
+        (chunks are keyed by parent nested-ID, not by morton — morton is
+        sparse/1-4-digit while nested-ID is contiguous in ``[0, 12·4^p)``).
+        For dense layout, returns the position in ``populated_shards``.
+        """
         if self.layout == "fullsphere":
-            return (int(shard_key),)
+            from mortie import mort2healpix
+
+            healpix, _ = mort2healpix(np.asarray([int(shard_key)]))
+            return (int(healpix[0]),)
         if self._position_map is None:
             raise RuntimeError(
                 "block_index requires set_populated_shards() for dense layout"

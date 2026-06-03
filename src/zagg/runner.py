@@ -15,6 +15,7 @@ import json
 import logging
 import os
 import time
+import warnings
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 from zarr import consolidate_metadata
@@ -26,6 +27,17 @@ from zagg.processing import process_morton_cell, write_dataframe_to_zarr
 from zagg.store import open_store
 
 logger = logging.getLogger(__name__)
+
+_DENSE_DEPRECATION_MSG = (
+    "HEALPix 'dense' layout is deprecated; set output.grid.layout: fullsphere "
+    "(or omit; fullsphere is now the default). Dense will be removed in a "
+    "future release."
+)
+
+
+def _maybe_warn_dense(layout: str) -> None:
+    if layout == "dense":
+        warnings.warn(_DENSE_DEPRECATION_MSG, DeprecationWarning, stacklevel=3)
 
 
 def agg(
@@ -91,6 +103,7 @@ def agg(
         raise ValueError("No store path specified (pass store= or set output.store: in config)")
 
     child_order = get_child_order(config)
+    _maybe_warn_dense(get_layout(config))
 
     # Resolve driver: kwarg > config > default
     resolved_driver = driver or get_driver(config)

@@ -102,6 +102,22 @@ class TestLoadCatalog:
         assert len(data["catalog"]) == 3
 
 
+class TestDenseDeprecation:
+    def test_dense_layout_emits_warning(self, atl06_config, catalog_file):
+        atl06_config.output["grid"]["layout"] = "dense"
+        atl06_config.catalog = catalog_file
+        with pytest.warns(DeprecationWarning, match="dense.*deprecated"):
+            agg(atl06_config, store="./out.zarr", dry_run=True)
+
+    def test_fullsphere_layout_does_not_warn(self, atl06_config, catalog_file):
+        atl06_config.output["grid"]["layout"] = "fullsphere"
+        atl06_config.catalog = catalog_file
+        import warnings as _w
+        with _w.catch_warnings():
+            _w.simplefilter("error", DeprecationWarning)
+            agg(atl06_config, store="./out.zarr", dry_run=True)
+
+
 class TestConfigFallbacks:
     def test_catalog_from_config(self, catalog_file, tmp_path):
         """Config.catalog is used when catalog= is not passed."""
