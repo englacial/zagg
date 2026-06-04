@@ -25,6 +25,7 @@ import argparse
 import json
 import logging
 import time
+import warnings
 from datetime import datetime, timedelta
 from importlib import resources
 from typing import Dict, List
@@ -320,49 +321,123 @@ def extract_granule_info(granule: dict) -> dict:
     }
 
 
+def _resolve_backend(backend: str) -> str:
+    """Resolve ``"auto"`` to a concrete backend by checking what's importable.
+
+    Prefers spherely (exact S2 intersection, fast) when available; falls back
+    to mortie (HEALPix MOC cell-set intersection, no extra deps).
+    """
+    if backend != "auto":
+        return backend
+    try:
+        import spherely  # noqa: F401
+
+        return "spherely"
+    except ImportError:
+        return "mortie"
+
+
 def build_catalog(
     granules: List[dict],
     parent_order: int = None,
     polygon_parts: list = None,
+    *,
     grid=None,
+    geometry_backend: str = "auto",
+    mortie_order: int = 8,
 ) -> tuple:
     """Build a granule catalog mapping shard keys to granule URLs.
 
-    Two code paths:
-
-    - **HEALPix fast path** (``grid is None``): uses ``morton_coverage`` for
-      cell discovery and reprojects everything to EPSG:3031 before the STRtree
-      intersect. Optimal for Antarctic-scale workloads.
-    - **Grid-driven path** (``grid`` supplied): uses ``grid.coverage`` and
-      ``grid.shard_footprint`` directly; STRtree intersect happens in WGS84.
-      Required for non-HEALPix grids.
+    The new (PR-C+) API takes a ``grid`` keyword and an optional
+    ``geometry_backend``. The legacy ``parent_order``-only path stays as a
+    deprecated back-compat shim that uses the EPSG:3031 reprojection trick
+    appropriate for the existing Antarctic ATL06 workload.
 
     Parameters
     ----------
     granules : list
-        Granule metadata from CMR.
+        Granule metadata from CMR (UMM-JSON dicts).
     parent_order : int, optional
-        HEALPix parent order; required when ``grid`` is None.
+        **Deprecated.** HEALPix parent order. If provided without ``grid``,
+        the legacy EPSG:3031 path is used.
     polygon_parts : list of (lats, lons), optional
-        Polygon parts for cell discovery. Defaults to Antarctic drainage basins.
-    grid : OutputGrid, optional
-        If provided, take the grid-driven path.
+        Polygon parts for cell discovery. Defaults to Antarctic drainage
+        basins.
+    grid : OutputGrid, keyword-only
+        Output grid (HealpixGrid, RectilinearGrid, ...). Required for the
+        new path. The grid supplies ``coverage`` and ``shard_footprint``.
+    geometry_backend : {"auto", "spherely", "mortie", "shapely", "shapely-3031"}
+        Sphere-aware geometry backend.
+
+        - ``"auto"`` (default): spherely if importable, else mortie.
+        - ``"spherely"``: exact S2 polygon intersection. Requires
+          ``pip install zagg[catalog]``.
+        - ``"mortie"``: HEALPix MOC cell-set intersection at
+          ``mortie_order``. No extra deps.
+        - ``"shapely"``: shapely STRtree in WGS84. Antimeridian/pole
+          correctness not guaranteed; kept for completeness.
+        - ``"shapely-3031"``: legacy EPSG:3031 path (Antarctic only).
+    mortie_order : int, default 8
+        HEALPix MOC order used by the mortie backend. Orders 6-10 are
+        safe (no false negatives in practice); higher orders trade more
+        precision for occasional false negatives near polygon boundaries.
 
     Returns
     -------
     catalog : dict
-        Mapping of shard_key (int) -> list of S3 URLs.
+        Mapping of shard_key (int) -> list of granule URLs.
     timings : dict
         Wall-clock seconds per pipeline step.
     """
-    if grid is not None:
+    # Legacy back-compat: parent_order without grid → EPSG:3031 path
+    if grid is None and parent_order is not None:
+        warnings.warn(
+            "build_catalog(parent_order=...) is deprecated; pass "
+            "grid=HealpixGrid(...) and geometry_backend='auto' instead.",
+            DeprecationWarning,
+            stacklevel=2,
+        )
+        return _build_catalog_healpix(granules, parent_order, polygon_parts)
+    if grid is None:
+        raise ValueError(
+            "build_catalog requires either grid=... (preferred) or "
+            "parent_order=... (deprecated)"
+        )
+
+    chosen = _resolve_backend(geometry_backend)
+    if chosen == "spherely":
+        return _build_catalog_spherely(granules, grid, polygon_parts)
+    if chosen == "mortie":
+        return _build_catalog_mortie(granules, grid, polygon_parts, order=mortie_order)
+    if chosen == "shapely":
         return _build_catalog_grid_driven(granules, grid, polygon_parts)
-    if parent_order is None:
-        raise ValueError("parent_order is required when grid is None")
-    return _build_catalog_healpix(granules, parent_order, polygon_parts)
+    if chosen == "shapely-3031":
+        if not hasattr(grid, "parent_order"):
+            raise ValueError("'shapely-3031' backend only supports HEALPix grids")
+        return _build_catalog_healpix(granules, grid.parent_order, polygon_parts)
+    raise ValueError(
+        f"unknown geometry_backend: {geometry_backend!r} (resolved to {chosen!r})"
+    )
 
 
 def _build_catalog_healpix(granules, parent_order, polygon_parts):
+    """**DEPRECATED — REMOVE ASAP after new-backend verification.**
+
+    Legacy EPSG:3031 Antarctic-only fast path. Kept ONLY long enough to
+    confirm the new ``_build_catalog_spherely`` path produces equivalent
+    catalogs on a representative Antarctic cycle. Once that's verified,
+    this function and the ``geometry_backend='shapely-3031'`` dispatch
+    entry both go.
+
+    Use ``build_catalog(..., grid=..., geometry_backend='auto')`` instead.
+    """
+    warnings.warn(
+        "_build_catalog_healpix (EPSG:3031 path) is deprecated and will be "
+        "removed in a future release. Use build_catalog(grid=..., "
+        "geometry_backend='auto').",
+        DeprecationWarning,
+        stacklevel=2,
+    )
     from pyproj import Transformer
     from shapely import STRtree, make_valid
     from shapely.geometry import Polygon
@@ -443,7 +518,22 @@ def _build_catalog_healpix(granules, parent_order, polygon_parts):
 
 
 def _build_catalog_grid_driven(granules, grid, polygon_parts):
-    """Grid-agnostic catalog build. STRtree intersects happen in WGS84."""
+    """**DEPRECATED — REMOVE ASAP after new-backend verification.**
+
+    Shapely-WGS84 grid-driven path. STRtree intersects in WGS84 without
+    S2/MOC awareness; correctness near the antimeridian and poles is not
+    guaranteed. Superseded by ``_build_catalog_spherely`` (S2) and
+    ``_build_catalog_mortie`` (HEALPix MOC).
+
+    Use ``build_catalog(..., grid=..., geometry_backend='auto')`` instead.
+    """
+    warnings.warn(
+        "_build_catalog_grid_driven (shapely-WGS84 path) is deprecated and "
+        "will be removed in a future release. Use build_catalog(grid=..., "
+        "geometry_backend='auto').",
+        DeprecationWarning,
+        stacklevel=2,
+    )
     from shapely import STRtree, make_valid
     from shapely.geometry import Polygon
 
@@ -498,6 +588,201 @@ def _build_catalog_grid_driven(granules, grid, polygon_parts):
 
     timings["total"] = time.perf_counter() - t_total
     logger.info(f"Pass 2: {len(catalog)} shards with granule mappings")
+    return catalog, timings
+
+
+def _to_spherely_polygon(lats, lons):
+    """Build a closed sphere-aware polygon. Returns None on validation failure.
+
+    Tries the input vertex order first; if S2 rejects it (e.g., area >
+    half-sphere because of orientation, or self-intersection from
+    non-geodesic interpretation), retries the reverse. Picks whichever
+    orientation has the smaller area (the bounded-region interpretation).
+    """
+    import spherely
+
+    lats = np.asarray(lats, dtype=float)
+    lons = np.asarray(lons, dtype=float)
+    if lats[0] != lats[-1] or lons[0] != lons[-1]:
+        lats = np.concatenate([lats, lats[:1]])
+        lons = np.concatenate([lons, lons[:1]])
+
+    def _try(la, lo):
+        try:
+            return spherely.create_polygon(spherely.points(la, lo))
+        except (ValueError, RuntimeError):
+            return None
+
+    half_earth = 2.55e14
+    fwd = _try(lats, lons)
+    rev = _try(lats[::-1], lons[::-1])
+    if fwd is None and rev is None:
+        return None
+    if fwd is None:
+        return rev
+    if rev is None:
+        return fwd
+    return fwd if spherely.area(fwd) < half_earth else rev
+
+
+def _build_catalog_spherely(granules, grid, polygon_parts):
+    """Catalog build via spherely (S2-backed) exact spherical intersection.
+
+    Sphere-aware everywhere: no projection, no antimeridian / pole
+    workarounds needed. Spherely 0.1.x has no STRtree, so per-shard query
+    is O(N_granules) via vectorized C++ broadcast.
+    """
+    import spherely
+
+    if polygon_parts is None:
+        polygon_parts = load_antarctic_basins()
+
+    timings = {}
+    t_total = time.perf_counter()
+
+    # Shard discovery
+    t0 = time.perf_counter()
+    all_shards = grid.coverage(polygon_parts)
+    timings["cell_discovery"] = time.perf_counter() - t0
+    logger.info(f"Pass 1: {len(all_shards)} shards")
+
+    # Build granule polygons in spherely's S2 space
+    t0 = time.perf_counter()
+    g_polys_raw = []
+    granule_urls = []
+    for granule in granules:
+        info = extract_granule_info(granule)
+        if not info["s3_url"] or len(info["points"]) < 3:
+            continue
+        lats = np.array([p[0] for p in info["points"]])
+        lons = np.array([p[1] for p in info["points"]])
+        poly = _to_spherely_polygon(lats, lons)
+        if poly is None:
+            continue
+        g_polys_raw.append(poly)
+        granule_urls.append(info["s3_url"])
+    g_polys = np.array(g_polys_raw)
+    timings["granule_polygons"] = time.perf_counter() - t0
+    logger.info(f"Built {len(g_polys)} granule polygons")
+
+    # Per-shard vectorized intersect
+    t0 = time.perf_counter()
+    catalog: Dict[int, List[str]] = {}
+    for shard_key in all_shards:
+        footprint = grid.shard_footprint(shard_key)
+        # grid.shard_footprint returns a shapely Polygon in WGS84; we need
+        # the same vertices as a spherely geography.
+        sx, sy = footprint.exterior.coords.xy
+        s_poly = _to_spherely_polygon(np.asarray(sy), np.asarray(sx))
+        if s_poly is None or len(g_polys) == 0:
+            continue
+        mask = spherely.intersects(g_polys, s_poly)
+        hits = np.where(mask)[0]
+        if len(hits) > 0:
+            catalog[int(shard_key)] = [granule_urls[i] for i in hits]
+    timings["strtree_queries"] = time.perf_counter() - t0
+
+    timings["total"] = time.perf_counter() - t_total
+    logger.info(f"Pass 2: {len(catalog)} shards with granule mappings (spherely)")
+    return catalog, timings
+
+
+def _build_catalog_mortie(granules, grid, polygon_parts, *, order=8):
+    """Catalog build via mortie HEALPix MOC cell-set intersection.
+
+    Sphere-aware by construction (HEALPix tiles the sphere; no edges).
+    Requires mortie >= 0.7.0 (earlier versions had a non-determinism bug,
+    espg/mortie#28). Order 6-10 is the safe regime — order >= 12 starts
+    dropping boundary-touching intersections due to mortie's polygon-edge
+    interpretation.
+
+    For HealpixGrid shards, the shard's MOC comes from
+    ``generate_morton_children`` directly (no polygon round-trip). For
+    non-HEALPix grids, the shard footprint is reduced to its WGS84
+    polygon vertices and fed through ``morton_coverage``.
+    """
+    from mortie import generate_morton_children, morton_coverage
+
+    if polygon_parts is None:
+        polygon_parts = load_antarctic_basins()
+
+    timings = {}
+    t_total = time.perf_counter()
+
+    # Shard discovery
+    t0 = time.perf_counter()
+    all_shards = grid.coverage(polygon_parts)
+    timings["cell_discovery"] = time.perf_counter() - t0
+    logger.info(f"Pass 1: {len(all_shards)} shards")
+
+    # Build inverted cell→granule index in a vectorized pass (no per-cell
+    # dict.add Python loop — see issue #28's prototype work).
+    t0 = time.perf_counter()
+    cell_arrays = []
+    granule_urls = []
+    for granule in granules:
+        info = extract_granule_info(granule)
+        if not info["s3_url"] or len(info["points"]) < 3:
+            continue
+        lats = np.array([p[0] for p in info["points"]])
+        lons = np.array([p[1] for p in info["points"]])
+        try:
+            cells = morton_coverage(lats, lons, order=order)
+        except Exception:
+            continue
+        if len(cells) == 0:
+            continue
+        cell_arrays.append(np.asarray(cells, dtype=np.int64))
+        granule_urls.append(info["s3_url"])
+    timings["granule_polygons"] = time.perf_counter() - t0
+
+    if not cell_arrays:
+        timings["total"] = time.perf_counter() - t_total
+        return {}, timings
+
+    all_cells = np.concatenate(cell_arrays)
+    counts = np.fromiter((len(c) for c in cell_arrays), dtype=np.int64,
+                         count=len(cell_arrays))
+    all_idx = np.repeat(np.arange(len(cell_arrays), dtype=np.int64), counts)
+    order_ = np.argsort(all_cells, kind="stable")
+    sorted_cells = all_cells[order_]
+    sorted_idx = all_idx[order_]
+    timings["strtree_construction"] = time.perf_counter() - t0  # reused timing key
+
+    # Per-shard MOC lookup
+    t0 = time.perf_counter()
+    is_healpix = hasattr(grid, "parent_order") and hasattr(grid, "child_order")
+    catalog: Dict[int, List[str]] = {}
+    for shard_key in all_shards:
+        if is_healpix:
+            # Fast path: shard IS a morton cell at parent_order; its MOC
+            # at the target order is just its children.
+            s_cells = generate_morton_children(int(shard_key), order)
+        else:
+            footprint = grid.shard_footprint(shard_key)
+            sx, sy = footprint.exterior.coords.xy
+            try:
+                s_cells = morton_coverage(np.asarray(sy), np.asarray(sx),
+                                          order=order)
+            except Exception:
+                continue
+        if len(s_cells) == 0:
+            continue
+        lo = np.searchsorted(sorted_cells, s_cells, side="left")
+        hi = np.searchsorted(sorted_cells, s_cells, side="right")
+        nonempty = hi > lo
+        if not nonempty.any():
+            continue
+        gathered = np.concatenate(
+            [sorted_idx[lo_i:hi_i] for lo_i, hi_i in zip(lo[nonempty], hi[nonempty])]
+        )
+        hit_indices = np.unique(gathered)
+        if hit_indices.size:
+            catalog[int(shard_key)] = [granule_urls[int(i)] for i in hit_indices]
+    timings["strtree_queries"] = time.perf_counter() - t0
+
+    timings["total"] = time.perf_counter() - t_total
+    logger.info(f"Pass 2: {len(catalog)} shards with granule mappings (mortie order={order})")
     return catalog, timings
 
 
