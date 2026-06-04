@@ -21,6 +21,12 @@ zagg aggregates sparse point data (e.g., ICESat-2 ATL06 elevation measurements) 
 Query NASA's CMR to build a mapping of spatial cells to granule S3 URLs.
 
 ```bash
+# Install with the catalog extra to get the spherely (S2) geometry backend
+# — recommended for global / non-Antarctic catalogs. Without it, the build
+# falls back to mortie (HEALPix MOC) which is slower but ships with the
+# core install.
+pip install 'zagg[catalog]'
+
 # ICESat-2 convenience — cycle number computes dates automatically:
 uv run python -m zagg.catalog --cycle 22 --parent-order 6
 
