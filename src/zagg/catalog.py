@@ -594,10 +594,13 @@ def _build_catalog_grid_driven(granules, grid, polygon_parts):
 def _to_spherely_polygon(lats, lons):
     """Build a closed sphere-aware polygon. Returns None on validation failure.
 
-    Tries the input vertex order first; if S2 rejects it (e.g., area >
-    half-sphere because of orientation, or self-intersection from
-    non-geodesic interpretation), retries the reverse. Picks whichever
-    orientation has the smaller area (the bounded-region interpretation).
+    Uses spherely's ``oriented=False`` mode, which tries both vertex
+    orderings and returns the smaller-area interpretation. This is the
+    correct path for ICESat-2-style polygons whose lat/lon vertices, when
+    reinterpreted as geodesic edges, would otherwise self-intersect near
+    the pole (the points-array overload's strict validator rejects ~32%
+    of cycle-22 polar-orbital granules; this overload accepts all of them
+    — see ``bench/spherely_polar_polygon_issue.ipynb``).
     """
     import spherely
 
@@ -606,23 +609,12 @@ def _to_spherely_polygon(lats, lons):
     if lats[0] != lats[-1] or lons[0] != lons[-1]:
         lats = np.concatenate([lats, lats[:1]])
         lons = np.concatenate([lons, lons[:1]])
-
-    def _try(la, lo):
-        try:
-            return spherely.create_polygon(spherely.points(la, lo))
-        except (ValueError, RuntimeError):
-            return None
-
-    half_earth = 2.55e14
-    fwd = _try(lats, lons)
-    rev = _try(lats[::-1], lons[::-1])
-    if fwd is None and rev is None:
+    try:
+        return spherely.create_polygon(
+            shell=list(zip(lons, lats)), oriented=False
+        )
+    except (ValueError, RuntimeError):
         return None
-    if fwd is None:
-        return rev
-    if rev is None:
-        return fwd
-    return fwd if spherely.area(fwd) < half_earth else rev
 
 
 def _build_catalog_spherely(granules, grid, polygon_parts):
