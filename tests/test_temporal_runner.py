@@ -6,6 +6,8 @@ dispatch -> TemporalStrategy -> LocalExecutor -> process_event -> tabular result
 No network, no AWS.
 """
 
+import json
+
 import numpy as np
 import pytest
 
@@ -61,6 +63,14 @@ class _SyntheticReader:
             coords={"time": TIMES, "lat": LAT, "lon": LON},
         )
         return event_mask, {"C1": xr.Dataset({"T2M": t2m})}
+
+    # --- Lambda-backend hooks ---
+    def build_event(self, event_key, config, *, creds=None):
+        # JSON-serialisable per-event payload (just the key for the synthetic case)
+        return {"event_key": event_key}
+
+    def open_payload(self, event, config, *, creds=None):
+        return self.open_event(event["event_key"], config, creds=creds)
 
 
 def _temporal_config():
@@ -120,10 +130,6 @@ class TestTemporalRun:
         assert summary["dry_run"] is True
         assert summary["total_events"] == 2
 
-    def test_lambda_backend_not_yet(self, synthetic_reader):
-        with pytest.raises(NotImplementedError, match="1d"):
-            agg(_temporal_config(), backend="lambda")
-
     def test_missing_reader_raises(self):
         cfg = _temporal_config()
         cfg.data_source = {"collections": {"C1": {}}}  # no reader
@@ -138,3 +144,66 @@ class TestTemporalRun:
         df = pd.read_parquet(store)
         assert set(df.index) == {"storm_a", "storm_b"}
         assert df.loc["storm_a", "max_T2M"] == 14.0
+
+
+def _load_lambda_handler():
+    """Import the standalone deployment/aws/lambda_handler.py module."""
+    import importlib.util
+    from pathlib import Path
+
+    path = Path(__file__).resolve().parents[1] / "deployment" / "aws" / "lambda_handler.py"
+    spec = importlib.util.spec_from_file_location("zagg_lambda_handler", path)
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
+class TestLambdaHandlerEventMode:
+    def test_process_event_mode(self, synthetic_reader):
+        """Calling the handler in process_event mode reconstructs and aggregates."""
+        handler = _load_lambda_handler()
+        from dataclasses import asdict
+
+        cfg = _temporal_config()
+        event = {
+            "mode": "process_event",
+            "reader": "synthetic",
+            "config": asdict(cfg),
+            "event_key": "storm_b",
+        }
+        resp = handler.lambda_handler(event, None)
+        assert resp["statusCode"] == 200
+        body = json.loads(resp["body"])
+        assert body["results"]["max_T2M"] == 114.0
+
+    def test_process_event_missing_reader(self, synthetic_reader):
+        handler = _load_lambda_handler()
+        resp = handler.lambda_handler({"mode": "process_event"}, None)
+        assert resp["statusCode"] == 400
+
+
+class TestLambdaBackend:
+    def test_lambda_executor_roundtrip(self, synthetic_reader, monkeypatch):
+        """The lambda backend builds events, dispatches, and parses results.
+
+        dispatch_lambda is faked to run each event through the real handler
+        in-process (no AWS), exercising the full build -> handle -> parse path.
+        """
+        handler = _load_lambda_handler()
+
+        def fake_dispatch_lambda(events, function_name, *, region="us-west-2",
+                                 max_workers=1000, **kwargs):
+            results = {}
+            for key, ev in events:
+                resp = handler.lambda_handler(ev, None)
+                results[key] = {"key": key, "payload": resp, "billed_ms": 100,
+                                "error": None}
+            return results, []
+
+        import zagg.dispatch as dispatch
+        monkeypatch.setattr(dispatch, "dispatch_lambda", fake_dispatch_lambda)
+
+        summary = agg(_temporal_config(), backend="lambda", function_name="fn")
+        assert summary["backend"] == "lambda"
+        assert summary["results"]["storm_a"]["max_T2M"] == 14.0
+        assert summary["results"]["storm_b"]["max_T2M"] == 114.0

@@ -284,42 +284,26 @@ def _run_temporal(
             "store_path": store_path,
         }
 
-    if backend == "lambda":
-        raise NotImplementedError(
-            "Temporal/event Lambda backend lands in step 1d; "
-            "use backend='local' for now."
-        )
-    if backend != "local":
-        raise ValueError(f"Unknown backend: {backend!r} (expected 'local' or 'lambda')")
-
-    static_data = (
-        reader.load_static(config, creds=creds)
-        if hasattr(reader, "load_static")
-        else {}
-    )
-    max_rt = config.data_source.get("max_resident_timesteps")
-
-    def worker(event_key):
-        event_mask, collections = reader.open_event(event_key, config, creds=creds)
-        results, meta = process_event(
-            event_key, event_mask, collections, specs, static_data,
-            max_resident_timesteps=max_rt,
-        )
-        return event_key, results, meta
-
     logger.info(
-        f"Processing {len(event_keys)} events (temporal, local, reader={reader_name})"
+        f"Processing {len(event_keys)} events (temporal, {backend}, reader={reader_name})"
     )
     start_time = time.time()
-    executor = LocalExecutor(max_workers=max_workers or 4)
-    outputs = executor.run(event_keys, worker)
+    if backend == "local":
+        rows, errors = _temporal_run_local(
+            reader, event_keys, config, specs, creds, max_workers=max_workers,
+        )
+    elif backend == "lambda":
+        rows, errors = _temporal_run_lambda(
+            reader, reader_name, event_keys, config, specs, creds,
+            function_name=function_name, region=region, max_workers=max_workers,
+        )
+    else:
+        raise ValueError(f"Unknown backend: {backend!r} (expected 'local' or 'lambda')")
     wall_time = time.time() - start_time
 
-    rows = {key: result for (key, result, _meta) in outputs}
-    errors = sum(1 for (_k, _r, meta) in outputs if meta.get("error"))
-
     if store_path:
-        _write_tabular(rows, store_path)
+        from zagg.output import from_output_config
+        from_output_config(config).write(rows, store_path)
 
     summary = {
         "pipeline": "temporal",
@@ -335,19 +319,75 @@ def _run_temporal(
     return summary
 
 
-def _write_tabular(rows: dict, store_path: str) -> None:
-    """Write per-event result rows to a tabular store (HDF5 or Parquet).
+def _temporal_run_local(reader, event_keys, config, specs, creds, *, max_workers):
+    """Run temporal events in-process via :class:`LocalExecutor`."""
+    static_data = (
+        reader.load_static(config, creds=creds)
+        if hasattr(reader, "load_static")
+        else {}
+    )
+    max_rt = config.data_source.get("max_resident_timesteps")
 
-    One row per event keyed by event id; columns are the aggregation outputs.
-    The HDF5 key ``catalog`` matches the antarctic_AR_dataset convention.
+    def worker(event_key):
+        event_mask, collections = reader.open_event(event_key, config, creds=creds)
+        results, meta = process_event(
+            event_key, event_mask, collections, specs, static_data,
+            max_resident_timesteps=max_rt,
+        )
+        return event_key, results, meta
+
+    outputs = LocalExecutor(max_workers=max_workers or 4).run(event_keys, worker)
+    rows = {key: result for (key, result, _meta) in outputs}
+    errors = sum(1 for (_k, _r, meta) in outputs if meta.get("error"))
+    return rows, errors
+
+
+def _temporal_run_lambda(reader, reader_name, event_keys, config, specs, creds, *,
+                         function_name, region, max_workers):
+    """Fan temporal events out to AWS Lambda via :func:`zagg.dispatch.dispatch_lambda`.
+
+    The reader builds the JSON-serialisable per-event payload (e.g. granule
+    URLs); the runner wraps it with the ``process_event`` mode, the config, and
+    credentials. Each worker reconstructs the event from that payload inside the
+    function (see ``lambda_handler`` ``mode='process_event'``).
     """
-    import pandas as pd
+    from dataclasses import asdict
 
-    df = pd.DataFrame.from_dict(rows, orient="index")
-    if store_path.endswith(".parquet"):
-        df.to_parquet(store_path)
-    else:
-        df.to_hdf(store_path, key="catalog")
+    from zagg.dispatch import dispatch_lambda
+
+    if not hasattr(reader, "build_event"):
+        raise NotImplementedError(
+            f"Reader {reader_name!r} does not implement build_event(); the "
+            "Lambda backend needs a JSON-serialisable per-event payload."
+        )
+    function_name = function_name or os.environ.get(
+        "ZAGG_LAMBDA_FUNCTION_NAME", "process-event"
+    )
+    config_dict = asdict(config)
+    events = []
+    for key in event_keys:
+        payload = dict(reader.build_event(key, config, creds=creds))
+        payload.update({"mode": "process_event", "reader": reader_name, "config": config_dict})
+        if creds is not None:
+            payload["s3_credentials"] = creds
+        events.append((key, payload))
+
+    results_map, error_list = dispatch_lambda(
+        events, function_name, region=region, max_workers=max_workers or 1000,
+    )
+    rows = {}
+    for key in event_keys:
+        # dispatch_lambda payload is the Lambda response envelope
+        # {"statusCode", "body": "<json>"}; the results live in body.
+        resp = results_map.get(key, {}).get("payload", {}) or {}
+        body = resp.get("body")
+        if isinstance(body, str):
+            try:
+                body = json.loads(body)
+            except (json.JSONDecodeError, TypeError):
+                body = {}
+        rows[key] = (body or {}).get("results", {}) or {}
+    return rows, len(error_list)
 
 
 def _load_catalog(catalog_path: str) -> dict:

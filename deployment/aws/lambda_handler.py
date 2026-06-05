@@ -36,6 +36,15 @@ Finalize mode (consolidates zarr metadata after all cells complete):
     "store_path": str,
 }
 
+Event mode (temporal/event pipeline — one event per invocation):
+{
+    "mode": "process_event",
+    "reader": str,              # registered reader name (resolves the payload)
+    "config": dict,             # pipeline config as dict
+    "s3_credentials": {...},    # optional, provider-specific
+    ...                         # reader-specific payload (e.g. collection_granules)
+}
+
 Setup and finalize exist so callers without direct S3 write access to the
 output bucket (e.g. cross-account JupyterHub orchestrators) can run the
 full pipeline using only lambda:InvokeFunction.
@@ -47,13 +56,18 @@ import os
 from typing import Any, Dict
 
 # Import cloud-agnostic processing
+from zagg import registry
 from zagg.config import load_config_from_dict
-from zagg.processing import process_morton_cell, write_dataframe_to_zarr
+from zagg.processing import write_dataframe_to_zarr
 from zagg.store import open_store
 
 # Set up structured logging
 logger = logging.getLogger()
 logger.setLevel(logging.INFO)
+
+# Discover plugins (domain readers, spatial funcs, reducers, …) at cold start so
+# config names resolve identically here and on the orchestrator.
+registry.load_plugins()
 
 
 def lambda_handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
@@ -67,7 +81,49 @@ def lambda_handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
         return _handle_setup(event)
     if mode == "finalize":
         return _handle_finalize(event)
+    if mode == "process_event":
+        return _handle_process_event(event)
     return _handle_process(event, context)
+
+
+def _handle_process_event(event: Dict[str, Any]) -> Dict[str, Any]:
+    """Temporal/event handler: reconstruct one event and run ``process_event``.
+
+    The registered reader (``event['reader']``) turns the JSON payload back into
+    an event mask + per-collection datasets; the result is a small dict of
+    scalar attributes returned in the response body (assembled into the tabular
+    output orchestrator-side, so there is no concurrent zarr writer here).
+    """
+    from zagg.temporal import process_event, specs_from_config
+
+    reader_name = event.get("reader")
+    logger.info(f"process_event mode: reader={reader_name}")
+    try:
+        if not reader_name:
+            return {"statusCode": 400,
+                    "body": json.dumps({"error": "missing 'reader'"})}
+        reader = registry.get_reader(reader_name)
+        config = load_config_from_dict(event["config"])
+        creds = event.get("s3_credentials")
+        specs = specs_from_config(config)
+
+        event_mask, collections = reader.open_payload(event, config, creds=creds)
+        static_data = (
+            reader.load_static(config, creds=creds)
+            if hasattr(reader, "load_static") else {}
+        )
+        max_rt = config.data_source.get("max_resident_timesteps")
+
+        results, meta = process_event(
+            event.get("event_key"), event_mask, collections, specs, static_data,
+            max_resident_timesteps=max_rt,
+        )
+        return {"statusCode": 200,
+                "body": json.dumps({"results": results, "metadata": meta})}
+    except Exception as e:
+        logger.exception(e)
+        return {"statusCode": 500,
+                "body": json.dumps({"error": str(e), "mode": "process_event"})}
 
 
 def _handle_setup(event: Dict[str, Any]) -> Dict[str, Any]:

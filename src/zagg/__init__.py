@@ -13,6 +13,7 @@ try:
 except ImportError:
     __version__ = "0.0.0+unknown"
 
+from . import adapters  # noqa: F401  (registers default catalog/credential adapters)
 from .auth import get_edl_token, get_nsidc_s3_credentials
 from .config import (
     PipelineConfig,
