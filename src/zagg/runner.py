@@ -20,10 +20,20 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 
 from zarr import consolidate_metadata
 
+from zagg import registry
 from zagg.auth import get_edl_token, get_nsidc_s3_credentials
-from zagg.config import PipelineConfig, get_child_order, get_driver, get_layout, get_store_path
+from zagg.backends import LocalExecutor
+from zagg.config import (
+    PipelineConfig,
+    get_child_order,
+    get_driver,
+    get_layout,
+    get_pipeline_type,
+    get_store_path,
+)
 from zagg.processing import process_shard, write_dataframe_to_zarr
 from zagg.store import open_store
+from zagg.temporal import process_event, specs_from_config
 
 logger = logging.getLogger(__name__)
 
@@ -56,29 +66,32 @@ def agg(
 ) -> dict:
     """Run the aggregation pipeline.
 
+    Dispatches on the config's pipeline type (``spatial`` by default, or
+    ``temporal``/``event``) to the matching :class:`PipelineStrategy`, which
+    runs the work on the requested ``backend``. The two are orthogonal: the
+    strategy decides *what* each work unit computes; the backend decides
+    *where* it runs (see :mod:`zagg.backends`).
+
     Parameters
     ----------
     config : PipelineConfig
         Pipeline configuration (from ``load_config`` or ``default_config``).
     catalog : str, optional
-        Path to granule catalog JSON. Overrides ``config.catalog``.
+        Path to granule/event catalog. Overrides ``config.catalog``.
     store : str, optional
         Output store path (local or ``s3://``). Overrides ``config.output.store``.
     backend : str
-        Execution backend: ``"local"`` (ThreadPoolExecutor) or
-        ``"lambda"`` (AWS Lambda invocation).
+        Execution backend: ``"local"`` (in-process) or ``"lambda"``.
     driver : str, optional
-        Data access driver: ``"s3"`` (direct S3, us-west-2 only) or
-        ``"https"`` (HTTPS, works anywhere). Overrides
-        ``config.data_source.driver``. Default ``"s3"``.
+        Data access driver: ``"s3"`` or ``"https"`` (spatial pipeline only).
     max_cells : int, optional
-        Limit number of cells to process (for testing).
+        Limit number of work units to process (for testing).
     morton_cell : str, optional
-        Process a single specific morton cell.
+        Process a single specific morton cell (spatial pipeline only).
     max_workers : int, optional
         Max concurrent workers. Defaults to 4 (local) or 1700 (lambda).
     overwrite : bool
-        Overwrite existing Zarr template.
+        Overwrite existing output template.
     dry_run : bool
         Preview what would be processed without running.
     function_name : str, optional
@@ -90,9 +103,41 @@ def agg(
     Returns
     -------
     dict
-        Summary with keys: ``total_cells``, ``cells_with_data``,
-        ``cells_error``, ``total_obs``, ``wall_time_s``, ``store_path``.
+        Run summary (keys vary by pipeline type).
     """
+    strategy = get_strategy(get_pipeline_type(config))
+    return strategy.run(
+        config,
+        catalog=catalog,
+        store=store,
+        backend=backend,
+        driver=driver,
+        max_cells=max_cells,
+        morton_cell=morton_cell,
+        max_workers=max_workers,
+        overwrite=overwrite,
+        dry_run=dry_run,
+        function_name=function_name,
+        region=region,
+    )
+
+
+def _run_spatial(
+    config: PipelineConfig,
+    *,
+    catalog: str | None = None,
+    store: str | None = None,
+    backend: str = "local",
+    driver: str | None = None,
+    max_cells: int | None = None,
+    morton_cell: str | None = None,
+    max_workers: int | None = None,
+    overwrite: bool = False,
+    dry_run: bool = False,
+    function_name: str | None = None,
+    region: str = "us-west-2",
+) -> dict:
+    """Spatial (point-cloud → grid) pipeline: select cells, process shards, write zarr."""
     # Resolve catalog and store
     catalog_path = catalog or config.catalog
     if not catalog_path:
@@ -140,6 +185,169 @@ def agg(
         )
     else:
         raise ValueError(f"Unknown backend: {backend!r} (expected 'local' or 'lambda')")
+
+
+# ---------------------------------------------------------------------------
+# Pipeline strategies (what to compute) — selected by config pipeline type.
+# Each strategy delegates parallelism to a backend executor (where to run).
+# ---------------------------------------------------------------------------
+
+class PipelineStrategy:
+    """Base class: a pipeline type knows how to ``run`` from a config + kwargs."""
+
+    def run(self, config: PipelineConfig, **kwargs) -> dict:  # pragma: no cover
+        raise NotImplementedError
+
+
+class SpatialStrategy(PipelineStrategy):
+    """Point-cloud → grid aggregation (HEALPix/rectilinear, zarr output)."""
+
+    def run(self, config: PipelineConfig, **kwargs) -> dict:
+        return _run_spatial(config, **kwargs)
+
+
+class TemporalStrategy(PipelineStrategy):
+    """Event/temporal aggregation (storm-style streaming → tabular output)."""
+
+    def run(self, config: PipelineConfig, **kwargs) -> dict:
+        return _run_temporal(config, **kwargs)
+
+
+_STRATEGIES: dict[str, PipelineStrategy] = {
+    "spatial": SpatialStrategy(),
+    "temporal": TemporalStrategy(),
+    "event": TemporalStrategy(),
+}
+
+
+def get_strategy(pipeline_type: str) -> PipelineStrategy:
+    """Return the :class:`PipelineStrategy` for a pipeline type."""
+    try:
+        return _STRATEGIES[pipeline_type]
+    except KeyError:
+        raise ValueError(
+            f"Unknown pipeline type {pipeline_type!r} "
+            f"(expected one of {sorted(_STRATEGIES)})"
+        ) from None
+
+
+def _run_temporal(
+    config: PipelineConfig,
+    *,
+    catalog: str | None = None,
+    store: str | None = None,
+    backend: str = "local",
+    driver: str | None = None,
+    max_cells: int | None = None,
+    morton_cell: str | None = None,
+    max_workers: int | None = None,
+    overwrite: bool = False,
+    dry_run: bool = False,
+    function_name: str | None = None,
+    region: str = "us-west-2",
+) -> dict:
+    """Temporal/event pipeline: stream each event through ``process_event``.
+
+    Data access is delegated to a registered *reader* (``data_source.reader``)
+    so the runner stays domain-agnostic. The reader plans the work units
+    (event keys), supplies static data, and opens each event's mask +
+    per-collection datasets; :func:`zagg.temporal.process_event` does the
+    aggregation. Results are collected into one tabular row per event.
+    """
+    # Discover plugins (readers, catalog/credential adapters, domain funcs).
+    registry.load_plugins()
+
+    reader_name = config.data_source.get("reader")
+    if not reader_name:
+        raise ValueError("Temporal pipeline requires data_source.reader")
+    reader = registry.get_reader(reader_name)
+
+    catalog_path = catalog or config.catalog
+    store_path = store or get_store_path(config)
+    specs = specs_from_config(config)
+
+    # Optional credential provider (e.g. GES-DISC temp S3 creds), fetched once.
+    creds = None
+    cred_name = config.data_source.get("credentials")
+    if cred_name:
+        creds = registry.get_credential_provider(cred_name).fetch(region)
+
+    event_keys = list(
+        reader.plan(config, catalog_path, max_cells=max_cells, selection=morton_cell)
+    )
+
+    if dry_run:
+        return {
+            "dry_run": True,
+            "pipeline": "temporal",
+            "total_events": len(event_keys),
+            "store_path": store_path,
+        }
+
+    if backend == "lambda":
+        raise NotImplementedError(
+            "Temporal/event Lambda backend lands in step 1d; "
+            "use backend='local' for now."
+        )
+    if backend != "local":
+        raise ValueError(f"Unknown backend: {backend!r} (expected 'local' or 'lambda')")
+
+    static_data = (
+        reader.load_static(config, creds=creds)
+        if hasattr(reader, "load_static")
+        else {}
+    )
+    max_rt = config.data_source.get("max_resident_timesteps")
+
+    def worker(event_key):
+        event_mask, collections = reader.open_event(event_key, config, creds=creds)
+        results, meta = process_event(
+            event_key, event_mask, collections, specs, static_data,
+            max_resident_timesteps=max_rt,
+        )
+        return event_key, results, meta
+
+    logger.info(
+        f"Processing {len(event_keys)} events (temporal, local, reader={reader_name})"
+    )
+    start_time = time.time()
+    executor = LocalExecutor(max_workers=max_workers or 4)
+    outputs = executor.run(event_keys, worker)
+    wall_time = time.time() - start_time
+
+    rows = {key: result for (key, result, _meta) in outputs}
+    errors = sum(1 for (_k, _r, meta) in outputs if meta.get("error"))
+
+    if store_path:
+        _write_tabular(rows, store_path)
+
+    summary = {
+        "pipeline": "temporal",
+        "total_events": len(event_keys),
+        "events_with_data": sum(1 for r in rows.values() if r),
+        "events_error": errors,
+        "wall_time_s": wall_time,
+        "store_path": store_path,
+        "backend": backend,
+        "results": rows,
+    }
+    logger.info(f"Done: {len(rows)} events, {errors} errors, {wall_time:.1f}s")
+    return summary
+
+
+def _write_tabular(rows: dict, store_path: str) -> None:
+    """Write per-event result rows to a tabular store (HDF5 or Parquet).
+
+    One row per event keyed by event id; columns are the aggregation outputs.
+    The HDF5 key ``catalog`` matches the antarctic_AR_dataset convention.
+    """
+    import pandas as pd
+
+    df = pd.DataFrame.from_dict(rows, orient="index")
+    if store_path.endswith(".parquet"):
+        df.to_parquet(store_path)
+    else:
+        df.to_hdf(store_path, key="catalog")
 
 
 def _load_catalog(catalog_path: str) -> dict:

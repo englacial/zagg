@@ -20,6 +20,7 @@ from .config import (
     get_child_order,
     get_driver,
     get_layout,
+    get_pipeline_type,
     get_store_path,
     load_config,
 )
@@ -33,6 +34,7 @@ from .processing import (
 from .runner import agg
 from .schema import xdggs_spec, xdggs_zarr_template
 from .store import open_store, parse_s3_path
+from .temporal import process_event, specs_from_config
 
 __all__ = [
     "HealpixGrid",
@@ -45,12 +47,15 @@ __all__ = [
     "get_layout",
     "get_edl_token",
     "get_nsidc_s3_credentials",
+    "get_pipeline_type",
     "get_store_path",
     "load_config",
     "open_store",
     "parse_s3_path",
+    "process_event",
     "process_morton_cell",
     "process_shard",
+    "specs_from_config",
     "agg",
     "write_dataframe_to_zarr",
     "xdggs_spec",
