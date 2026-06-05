@@ -39,6 +39,9 @@ class PipelineConfig:
         Optional path to granule catalog JSON.
     bounds : dict or None
         Optional temporal/spatial bounds for filtering.
+    pipeline : dict
+        Pipeline selector, e.g. ``{"type": "spatial"}`` (default) or
+        ``{"type": "temporal"}``. Chooses which processing core runs.
     """
 
     data_source: DataSourceDict = field(default_factory=dict)
@@ -46,6 +49,7 @@ class PipelineConfig:
     output: dict = field(default_factory=dict)
     catalog: str | None = None
     bounds: dict | None = None
+    pipeline: dict = field(default_factory=lambda: {"type": "spatial"})
 
 
 def load_config(path: str) -> PipelineConfig:
@@ -85,6 +89,7 @@ def load_config_from_dict(d: dict) -> PipelineConfig:
         output=d.get("output", {}),
         catalog=d.get("catalog"),
         bounds=d.get("bounds"),
+        pipeline=d.get("pipeline", {"type": "spatial"}),
     )
 
 
@@ -127,34 +132,41 @@ def validate_config(config: PipelineConfig) -> None:
     ValueError
         On any validation failure.
     """
+    # Validate pipeline type
+    pipeline_type = get_pipeline_type(config)
+    valid_types = {"spatial", "temporal", "event"}
+    if pipeline_type not in valid_types:
+        raise ValueError(f"Unknown pipeline type '{pipeline_type}' (valid: {valid_types})")
+
     # Required sections
     for section in ("data_source", "aggregation", "output"):
         val = getattr(config, section)
         if not val:
             raise ValueError(f"Missing required section: {section}")
 
-    # Validate output.grid structure
-    grid = config.output.get("grid")
-    if grid is not None:
-        if not isinstance(grid, dict):
-            raise ValueError("output.grid must be a mapping (e.g. type: healpix, child_order: 12)")
-        if "type" not in grid:
-            raise ValueError("output.grid.type is required")
-        if grid["type"] == "healpix" and "child_order" not in grid:
-            raise ValueError("output.grid.child_order is required for healpix grid")
-        if grid["type"] == "rectilinear":
-            for field in ("crs", "resolution", "bounds"):
-                if field not in grid:
-                    raise ValueError(
-                        f"output.grid.{field} is required for rectilinear grid"
-                    )
-            if len(grid["bounds"]) != 4:
-                raise ValueError("output.grid.bounds must be [xmin, ymin, xmax, ymax]")
-        layout = grid.get("layout")
-        if layout is not None and layout not in ("dense", "fullsphere"):
-            raise ValueError(
-                f"output.grid.layout must be 'dense' or 'fullsphere' (got {layout!r})"
-            )
+    # Validate output.grid structure (spatial pipelines only)
+    if pipeline_type == "spatial":
+        grid = config.output.get("grid")
+        if grid is not None:
+            if not isinstance(grid, dict):
+                raise ValueError("output.grid must be a mapping (e.g. type: healpix, child_order: 12)")
+            if "type" not in grid:
+                raise ValueError("output.grid.type is required")
+            if grid["type"] == "healpix" and "child_order" not in grid:
+                raise ValueError("output.grid.child_order is required for healpix grid")
+            if grid["type"] == "rectilinear":
+                for field in ("crs", "resolution", "bounds"):
+                    if field not in grid:
+                        raise ValueError(
+                            f"output.grid.{field} is required for rectilinear grid"
+                        )
+                if len(grid["bounds"]) != 4:
+                    raise ValueError("output.grid.bounds must be [xmin, ymin, xmax, ymax]")
+            layout = grid.get("layout")
+            if layout is not None and layout not in ("dense", "fullsphere"):
+                raise ValueError(
+                    f"output.grid.layout must be 'dense' or 'fullsphere' (got {layout!r})"
+                )
 
     # Validate bounds structure (optional)
     if config.bounds is not None:
@@ -167,6 +179,20 @@ def validate_config(config: PipelineConfig) -> None:
             if "start_date" not in temporal or "end_date" not in temporal:
                 raise ValueError("bounds.temporal requires start_date and end_date")
 
+    # Aggregation-variable validation depends on the pipeline type
+    if pipeline_type == "temporal":
+        _validate_temporal(config)
+    else:
+        _validate_spatial(config)
+
+
+def get_pipeline_type(config: PipelineConfig) -> str:
+    """Return the pipeline type from config (default ``"spatial"``)."""
+    return config.pipeline.get("type", "spatial")
+
+
+def _validate_spatial(config: PipelineConfig) -> None:
+    """Validate aggregation variables for spatial pipelines."""
     ds_vars = set(config.data_source.get("variables", {}).keys())
     agg_vars = config.aggregation.get("variables", {})
 
@@ -214,6 +240,34 @@ def validate_config(config: PipelineConfig) -> None:
         # Validate expression column references
         if has_expr:
             _validate_expression_columns(name, meta["expression"], ds_vars)
+
+
+def _validate_temporal(config: PipelineConfig) -> None:
+    """Validate aggregation variables for temporal pipelines."""
+    from .temporal import SPATIAL_FUNCTIONS, TEMPORAL_REDUCERS
+
+    collections = config.data_source.get("collections", {})
+    if not collections:
+        raise ValueError("Temporal pipeline requires data_source.collections")
+
+    agg_vars = config.aggregation.get("variables", {})
+    for name, meta in agg_vars.items():
+        for req in ("variable", "collection", "spatial_func", "temporal_reducer"):
+            if req not in meta:
+                raise ValueError(f"Temporal variable '{name}': missing required field '{req}'")
+        if meta["collection"] not in collections:
+            raise ValueError(
+                f"Temporal variable '{name}': collection '{meta['collection']}' "
+                f"not in data_source.collections"
+            )
+        if meta["spatial_func"] not in SPATIAL_FUNCTIONS:
+            raise ValueError(
+                f"Temporal variable '{name}': unknown spatial_func '{meta['spatial_func']}'"
+            )
+        if meta["temporal_reducer"] not in TEMPORAL_REDUCERS:
+            raise ValueError(
+                f"Temporal variable '{name}': unknown temporal_reducer '{meta['temporal_reducer']}'"
+            )
 
 
 def _is_numeric(s: str) -> bool:
