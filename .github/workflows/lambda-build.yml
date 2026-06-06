@@ -14,6 +14,8 @@ on:
       - 'deployment/aws/**'
       - 'pyproject.toml'
       - '.github/workflows/lambda-build.yml'
+  release:
+    types: [published]
   workflow_dispatch:
 
 permissions:
@@ -231,3 +233,30 @@ jobs:
           name: lambda-function-arm64
           path: deployment/builds/lambda_function_arm64_*.zip
           retention-days: 30
+
+  # ---------------------------------------------------------------------------
+  # Attach the built zips to the GitHub Release (durable artifacts for the
+  # CloudFormation standup — see deployment/aws/template.yaml).
+  # ---------------------------------------------------------------------------
+  publish-release-assets:
+    needs: [build-x86_64, build-arm64]
+    if: github.event_name == 'release'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Download built artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: Upload to release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release upload "${{ github.event.release.tag_name }}" \
+            artifacts/lambda-layer-x86_64/lambda_layer_x86_64.zip \
+            artifacts/lambda-layer-arm64/lambda_layer_arm64.zip \
+            artifacts/lambda-function-x86_64/lambda_function_x86_64_*.zip \
+            artifacts/lambda-function-arm64/lambda_function_arm64_*.zip \
+            --repo "${{ github.repository }}" --clobber

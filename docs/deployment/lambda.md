@@ -99,6 +99,35 @@ This approach avoids rate limiting from 1,872 simultaneous NASA logins and elimi
 
 ## Deployment
 
+### Reproducible standup (CloudFormation)
+
+The fastest way to stand up the backend in a fresh AWS account is the committed
+CloudFormation template, which creates the execution role, dependency layer, and
+function in one stack:
+
+```bash
+OUTPUT_BUCKET=my-results-bucket bash deployment/aws/stand_up.sh
+```
+
+`stand_up.sh` downloads the pre-built layer/function zips from the latest GitHub
+Release, stages them in a same-region S3 bucket (CloudFormation requires Lambda
+code to live in a same-region bucket), and deploys `deployment/aws/template.yaml`.
+Useful overrides (environment variables):
+
+| Variable | Default | Purpose |
+|----------|---------|---------|
+| `OUTPUT_BUCKET` | *(required)* | Bucket for results; role is scoped to it |
+| `CREATE_BUCKET` | `false` | `true` makes the stack create `OUTPUT_BUCKET` |
+| `ARCH` | `arm64` | `arm64` (py3.12) or `x86_64` (py3.11) |
+| `REGION` | `us-west-2` | Deployment region |
+| `STACK_NAME` | `zagg-backend` | CloudFormation stack name |
+| `RELEASE_TAG` / `ARTIFACT_BASE_URL` | `latest` | Where to fetch the zips from |
+
+Tear down with `aws cloudformation delete-stack --stack-name zagg-backend`.
+
+The manual steps below are equivalent and useful for understanding what the
+template creates, or for one-off tweaks.
+
 ### Step 1: Create the function package
 
 ```bash
@@ -121,7 +150,7 @@ aws lambda create-function \
   --runtime python3.12 \
   --architectures arm64 \
   --role arn:aws:iam::ACCOUNT_ID:role/lambda-execution-role \
-  --handler deployment.aws.lambda_handler.lambda_handler \
+  --handler lambda_handler.lambda_handler \
   --zip-file fileb://deployment/aws/function.zip \
   --timeout 720 \
   --memory-size 2048 \
