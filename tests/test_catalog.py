@@ -402,3 +402,117 @@ class TestBuildCatalog:
         catalog, _ = build_catalog(granules, parent_order=6)
         # Should work without error; may or may not find matches
         assert isinstance(catalog, dict)
+
+
+class TestBuildCatalogBackends:
+    """Tests for the new geometry_backend dispatching (PR-C+)."""
+
+    def _make_granules(self, n=5):
+        return TestBuildCatalog()._make_granules(n)
+
+    def _grid(self, parent_order=6, child_order=8):
+        from zagg.grids import HealpixGrid
+        return HealpixGrid(parent_order=parent_order, child_order=child_order,
+                           layout="fullsphere")
+
+    def _polys(self):
+        return [(np.array([-70, -85, -75]), np.array([0, 50, 25]))]
+
+    def test_explicit_mortie(self):
+        from zagg.catalog import build_catalog
+        catalog, t = build_catalog(
+            self._make_granules(5),
+            grid=self._grid(),
+            polygon_parts=self._polys(),
+            geometry_backend="mortie",
+            mortie_order=8,
+        )
+        assert isinstance(catalog, dict)
+        assert "total" in t
+
+    def test_explicit_spherely(self):
+        pytest.importorskip("spherely")
+        from zagg.catalog import build_catalog
+        catalog, t = build_catalog(
+            self._make_granules(5),
+            grid=self._grid(),
+            polygon_parts=self._polys(),
+            geometry_backend="spherely",
+        )
+        assert isinstance(catalog, dict)
+        assert "total" in t
+
+    def test_auto_prefers_spherely_when_available(self):
+        import sys
+        if "spherely" not in sys.modules:
+            pytest.importorskip("spherely")
+        from zagg.catalog import _resolve_backend
+        assert _resolve_backend("auto") == "spherely"
+
+    def test_auto_falls_back_to_mortie_without_spherely(self, monkeypatch):
+        """If spherely import fails, auto must resolve to mortie."""
+        import builtins
+
+        from zagg.catalog import _resolve_backend
+        real_import = builtins.__import__
+
+        def fake_import(name, *args, **kwargs):
+            if name == "spherely":
+                raise ImportError("simulated missing spherely")
+            return real_import(name, *args, **kwargs)
+
+        monkeypatch.setattr(builtins, "__import__", fake_import)
+        # Drop a cached module if present so the import attempt re-runs
+        import sys
+        sys.modules.pop("spherely", None)
+        assert _resolve_backend("auto") == "mortie"
+
+    def test_mortie_and_spherely_both_produce_results(self):
+        """Both backends should be wired up correctly and produce non-empty
+        catalogs that mostly overlap. Strict equivalence does NOT hold —
+        mortie's polygon-edge interpretation diverges from S2's geodesic
+        edges near polygon boundaries (see bench/catalog_comparison.ipynb
+        for the detailed correctness analysis). Catalog-build's downstream
+        tolerance for false positives makes both backends fit-for-purpose
+        at low mortie orders."""
+        pytest.importorskip("spherely")
+        from zagg.catalog import build_catalog
+        granules = self._make_granules(5)
+        grid = self._grid()
+        polys = self._polys()
+        m_cat, _ = build_catalog(granules, grid=grid, polygon_parts=polys,
+                                 geometry_backend="mortie", mortie_order=8)
+        s_cat, _ = build_catalog(granules, grid=grid, polygon_parts=polys,
+                                 geometry_backend="spherely")
+        assert len(m_cat) > 0 and len(s_cat) > 0
+        # Most shards should agree on most granules — quantified loosely:
+        # the intersection of (shard, granule) pairs should be at least
+        # half of either side's total.
+        m_pairs = {(s, u) for s, urls in m_cat.items() for u in urls}
+        s_pairs = {(s, u) for s, urls in s_cat.items() for u in urls}
+        common = m_pairs & s_pairs
+        assert len(common) >= 0.5 * min(len(m_pairs), len(s_pairs))
+
+    def test_missing_grid_raises(self):
+        from zagg.catalog import build_catalog
+        with pytest.raises(ValueError, match="grid"):
+            build_catalog(self._make_granules(1))
+
+    def test_unknown_backend_raises(self):
+        from zagg.catalog import build_catalog
+        with pytest.raises(ValueError, match="unknown geometry_backend"):
+            build_catalog(
+                self._make_granules(1),
+                grid=self._grid(),
+                polygon_parts=self._polys(),
+                geometry_backend="not-a-real-backend",
+            )
+
+    def test_legacy_parent_order_warns(self):
+        from zagg.catalog import build_catalog
+        with pytest.warns(DeprecationWarning, match="parent_order"):
+            build_catalog(
+                self._make_granules(2),
+                parent_order=6,
+                polygon_parts=self._polys(),
+            )

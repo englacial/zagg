@@ -6,7 +6,7 @@ from zarr import open_group
 from zarr.storage import MemoryStore
 
 from zagg.config import default_config
-from zagg.grids import InconsistentShardError, OOB_SENTINEL, RectilinearGrid, from_config
+from zagg.grids import OOB_SENTINEL, InconsistentShardError, RectilinearGrid, from_config
 
 
 @pytest.fixture

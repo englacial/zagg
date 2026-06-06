@@ -47,6 +47,13 @@ lambda = [
     "cramjam",
     "astropy",
 ]
+# Sphere-aware geometry backend for catalog construction. Spherely brings
+# Google's S2 via a C++ wheel; we keep it out of the core deps so the
+# Lambda layer build (which doesn't run build_catalog) stays lean and the
+# arm64 wheel gap doesn't break Lambda packaging.
+catalog = [
+    "spherely>=0.1.1",
+]
 analysis = [
     "cubed>=0.24.0",
     "cubed-xarray>=0.0.9",
