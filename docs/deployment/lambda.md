@@ -15,7 +15,7 @@ The Lambda function processes a single morton cell (order 6) by:
 
 ```
 ┌─────────────────────────────────────────────────────────────┐
-│  Lambda Function (process-morton-cell)                      │
+│  Lambda Function (process-shard)                      │
 │  ──────────────────────────────────────────────────────────  │
 │  Runtime: Python 3.12                                       │
 │  Memory: 2048 MB (2 GB)                                     │
@@ -146,7 +146,7 @@ See [ARM64 Layer](arm64.md) for building and deploying the Lambda layer.
 
 ```bash
 aws lambda create-function \
-  --function-name process-morton-cell \
+  --function-name process-shard \
   --runtime python3.12 \
   --architectures arm64 \
   --role arn:aws:iam::ACCOUNT_ID:role/lambda-execution-role \
@@ -166,7 +166,7 @@ zip -j deployment/aws/function.zip deployment/aws/lambda_handler.py && \
 
 # Update the Lambda function
 aws lambda update-function-code \
-  --function-name process-morton-cell \
+  --function-name process-shard \
   --zip-file fileb://deployment/aws/function.zip
 ```
 

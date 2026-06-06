@@ -42,8 +42,8 @@ examples:
     parser.add_argument("--region", default="us-west-2", help="AWS region (default: us-west-2)")
     parser.add_argument(
         "--function-name",
-        default=os.environ.get("ZAGG_LAMBDA_FUNCTION_NAME", "process-morton-cell"),
-        help="Lambda function name (default: env ZAGG_LAMBDA_FUNCTION_NAME or 'process-morton-cell')",
+        default=os.environ.get("ZAGG_LAMBDA_FUNCTION_NAME", "process-shard"),
+        help="Lambda function name (default: env ZAGG_LAMBDA_FUNCTION_NAME or 'process-shard')",
     )
     args = parser.parse_args()
 
