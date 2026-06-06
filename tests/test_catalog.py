@@ -442,30 +442,16 @@ class TestBuildCatalogBackends:
         assert isinstance(catalog, dict)
         assert "total" in t
 
-    def test_auto_prefers_spherely_when_available(self):
-        import sys
-        if "spherely" not in sys.modules:
-            pytest.importorskip("spherely")
+    def test_auto_resolves_to_mortie(self):
+        """auto defaults to mortie MOC (global, fast, no extra dep)."""
         from zagg.catalog import _resolve_backend
-        assert _resolve_backend("auto") == "spherely"
-
-    def test_auto_falls_back_to_mortie_without_spherely(self, monkeypatch):
-        """If spherely import fails, auto must resolve to mortie."""
-        import builtins
-
-        from zagg.catalog import _resolve_backend
-        real_import = builtins.__import__
-
-        def fake_import(name, *args, **kwargs):
-            if name == "spherely":
-                raise ImportError("simulated missing spherely")
-            return real_import(name, *args, **kwargs)
-
-        monkeypatch.setattr(builtins, "__import__", fake_import)
-        # Drop a cached module if present so the import attempt re-runs
-        import sys
-        sys.modules.pop("spherely", None)
         assert _resolve_backend("auto") == "mortie"
+
+    def test_explicit_backend_passthrough(self):
+        """Explicit backends are returned unchanged."""
+        from zagg.catalog import _resolve_backend
+        for b in ("spherely", "mortie", "shapely", "shapely-3031"):
+            assert _resolve_backend(b) == b
 
     def test_mortie_and_spherely_both_produce_results(self):
         """Both backends should be wired up correctly and produce non-empty
