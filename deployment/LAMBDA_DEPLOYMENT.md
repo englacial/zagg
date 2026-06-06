@@ -24,6 +24,27 @@ pydantic-core, typeguard, typing_inspect, annotated-types.
 
 ---
 
+## Standing up the backend (CloudFormation — recommended)
+
+For a reproducible standup in any AWS account, use the committed
+`deployment/aws/template.yaml`, which creates the execution role, dependency
+layer, and function as a single stack from the pre-built release zips:
+
+```bash
+OUTPUT_BUCKET=my-results-bucket bash deployment/aws/stand_up.sh
+```
+
+`stand_up.sh` downloads the layer/function zips from the latest GitHub Release
+(published by the `publish-release-assets` job in `lambda-build.yml`), stages
+them in a same-region S3 bucket, and runs `aws cloudformation deploy`. See
+[docs/deployment/lambda.md](../docs/deployment/lambda.md) for the parameter
+table and overrides.
+
+`deploy.sh` (below) is the maintainer path for *in-place updates* to an
+already-deployed function and does not create the role/function/bucket.
+
+---
+
 ## Rebuilding the ARM64 Layer
 
 ### Why

@@ -40,7 +40,21 @@ See [Catalog API](docs/api/catalog.md) for full options.
 
 ### Step 2: Deploy the Lambda Function
 
-Build and deploy the Lambda function and its dependency layer.
+**Quick standup (CloudFormation).** Stand up the whole backend — IAM role,
+dependency layer, and function — in your own AWS account from the pre-built
+release zips:
+
+```bash
+OUTPUT_BUCKET=my-results-bucket bash deployment/aws/stand_up.sh
+# don't have a bucket yet? add CREATE_BUCKET=true (and REGION=... if not us-west-2)
+```
+
+This pulls the layer/function zips from the latest GitHub Release and deploys
+[`deployment/aws/template.yaml`](deployment/aws/template.yaml). Override
+`ARCH`, `RELEASE_TAG`, or `ARTIFACT_BASE_URL` to use a different architecture or
+your own hosted zips.
+
+**Build from source** (maintainers, or to customize the layer):
 
 ```bash
 # Build the function package
@@ -49,7 +63,7 @@ bash deployment/aws/build_function.sh
 # Build the dependency layer (ARM64)
 bash deployment/aws/build_arm64_layer.sh
 
-# Deploy
+# Deploy (updates an already-deployed function from CI artifacts)
 bash deployment/aws/deploy.sh
 ```
 

@@ -1,0 +1,142 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >-
+  zagg serverless backend — IAM execution role, dependency layer, and the
+  process-morton-cell Lambda function. Layer and function code are pulled from a
+  same-region S3 bucket (ArtifactBucket); use stand_up.sh to populate it from a
+  GitHub Release, or point it at your own copy of the zips.
+
+Parameters:
+  FunctionName:
+    Type: String
+    Default: process-morton-cell
+    Description: Name of the Lambda function to create.
+
+  Architecture:
+    Type: String
+    Default: arm64
+    AllowedValues: [arm64, x86_64]
+    Description: Lambda CPU architecture. Must match the layer/function zips.
+
+  ArtifactBucket:
+    Type: String
+    Description: >-
+      S3 bucket (in THIS stack's region) holding the layer and function zips.
+      CloudFormation requires Lambda code to live in a same-region bucket.
+
+  LayerS3Key:
+    Type: String
+    Default: lambda_layer_arm64.zip
+    Description: S3 key of the dependency layer zip within ArtifactBucket.
+
+  FunctionS3Key:
+    Type: String
+    Default: lambda_function_arm64_py312.zip
+    Description: S3 key of the function code zip within ArtifactBucket.
+
+  OutputBucketName:
+    Type: String
+    Description: >-
+      Bucket where results (parquet/zarr) are written. The execution role is
+      scoped to this bucket. Set CreateOutputBucket=true to have the stack
+      create it; otherwise it must already exist and be writable by you.
+
+  CreateOutputBucket:
+    Type: String
+    Default: "false"
+    AllowedValues: ["true", "false"]
+    Description: Whether to create OutputBucketName as part of this stack.
+
+  MemorySize:
+    Type: Number
+    Default: 2048
+    Description: Function memory in MB.
+
+  Timeout:
+    Type: Number
+    Default: 720
+    Description: Function timeout in seconds.
+
+Conditions:
+  ShouldCreateBucket: !Equals [!Ref CreateOutputBucket, "true"]
+  IsArm: !Equals [!Ref Architecture, arm64]
+
+Resources:
+  OutputBucket:
+    Type: AWS::S3::Bucket
+    Condition: ShouldCreateBucket
+    Properties:
+      BucketName: !Ref OutputBucketName
+
+  ExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: logs-and-output-s3
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: !Sub "arn:aws:logs:${AWS::Region}:${AWS::AccountId}:*"
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:PutObject
+                  - s3:DeleteObject
+                Resource: !Sub "arn:aws:s3:::${OutputBucketName}/*"
+              - Effect: Allow
+                Action: s3:ListBucket
+                Resource: !Sub "arn:aws:s3:::${OutputBucketName}"
+
+  DepsLayer:
+    Type: AWS::Lambda::LayerVersion
+    Properties:
+      LayerName: !Sub "${FunctionName}-deps"
+      Content:
+        S3Bucket: !Ref ArtifactBucket
+        S3Key: !Ref LayerS3Key
+      CompatibleArchitectures: [!Ref Architecture]
+      CompatibleRuntimes:
+        - !If [IsArm, python3.12, python3.11]
+
+  ProcessFn:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Ref FunctionName
+      Handler: lambda_handler.lambda_handler
+      Runtime: !If [IsArm, python3.12, python3.11]
+      Architectures: [!Ref Architecture]
+      MemorySize: !Ref MemorySize
+      Timeout: !Ref Timeout
+      Role: !GetAtt ExecutionRole.Arn
+      Layers: [!Ref DepsLayer]
+      Code:
+        S3Bucket: !Ref ArtifactBucket
+        S3Key: !Ref FunctionS3Key
+
+Outputs:
+  FunctionArn:
+    Description: ARN of the deployed Lambda function.
+    Value: !GetAtt ProcessFn.Arn
+  FunctionName:
+    Description: Name of the deployed Lambda function.
+    Value: !Ref ProcessFn
+  LayerArn:
+    Description: ARN of the published dependency layer version.
+    Value: !Ref DepsLayer
+  RoleArn:
+    Description: ARN of the Lambda execution role.
+    Value: !GetAtt ExecutionRole.Arn
+  OutputBucket:
+    Description: Bucket where results are written.
+    Value: !Ref OutputBucketName
