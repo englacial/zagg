@@ -322,19 +322,16 @@ def extract_granule_info(granule: dict) -> dict:
 
 
 def _resolve_backend(backend: str) -> str:
-    """Resolve ``"auto"`` to a concrete backend by checking what's importable.
+    """Resolve ``"auto"`` to a concrete backend.
 
-    Prefers spherely (exact S2 intersection, fast) when available; falls back
-    to mortie (HEALPix MOC cell-set intersection, no extra deps).
+    Defaults to mortie MOC (``morton_coverage_moc``): global, no projection, no
+    extra dependency, ~3.5x faster than spherely and scales sub-quadratically.
+    It carries a ~0.01% polar omission vs exact S2 (espg/mortie#32); use
+    ``geometry_backend="spherely"`` for an exact reference build.
     """
     if backend != "auto":
         return backend
-    try:
-        import spherely  # noqa: F401
-
-        return "spherely"
-    except ImportError:
-        return "mortie"
+    return "mortie"
 
 
 def build_catalog(
@@ -679,21 +676,25 @@ def _build_catalog_spherely(granules, grid, polygon_parts):
     return catalog, timings
 
 
-def _build_catalog_mortie(granules, grid, polygon_parts, *, order=8):
-    """Catalog build via mortie HEALPix MOC cell-set intersection.
+def _build_catalog_mortie(granules, grid, polygon_parts=None, *, order=8):
+    """Catalog build via mortie Multi-Order Coverage (MOC) intersection.
 
-    Sphere-aware by construction (HEALPix tiles the sphere; no edges).
-    Requires mortie >= 0.7.0 (earlier versions had a non-determinism bug,
-    espg/mortie#28). Order 6-10 is the safe regime — order >= 12 starts
-    dropping boundary-touching intersections due to mortie's polygon-edge
-    interpretation.
+    Requires mortie >= 0.7.0. Each granule footprint is reduced to a compact
+    mixed-order MOC via ``morton_coverage_moc`` (coarse interior, fine boundary
+    down to ``order``); for HEALPix grids the MOC is then mapped to shard keys
+    with ``moc_to_order`` at the grid's ``parent_order``.
 
-    For HealpixGrid shards, the shard's MOC comes from
-    ``generate_morton_children`` directly (no polygon round-trip). For
-    non-HEALPix grids, the shard footprint is reduced to its WGS84
-    polygon vertices and fed through ``morton_coverage``.
+    Sphere-aware by construction (HEALPix tiles the sphere; no projection).
+    Near the pole, mortie's polygon edge interpretation (rhumb-style) misses a
+    tiny fraction of true geodesic overlaps relative to the spherely backend
+    (~0.01% on cycle-22 ATL06; espg/mortie#32). Commission (a few extra
+    granules per shard) is harmless — those files are read then filtered
+    downstream. Order ~8 is the speed/accuracy sweet spot.
+
+    For non-HEALPix grids the shard footprint is reduced to its WGS84 polygon
+    and matched against a flat order-``order`` granule cell index.
     """
-    from mortie import generate_morton_children, morton_coverage
+    from mortie import moc_to_order, morton_coverage, morton_coverage_moc
 
     if polygon_parts is None:
         polygon_parts = load_antarctic_basins()
@@ -701,80 +702,87 @@ def _build_catalog_mortie(granules, grid, polygon_parts, *, order=8):
     timings = {}
     t_total = time.perf_counter()
 
-    # Shard discovery
     t0 = time.perf_counter()
-    all_shards = grid.coverage(polygon_parts)
+    all_shards = set(int(x) for x in grid.coverage(polygon_parts))
     timings["cell_discovery"] = time.perf_counter() - t0
     logger.info(f"Pass 1: {len(all_shards)} shards")
 
-    # Build inverted cell→granule index in a vectorized pass (no per-cell
-    # dict.add Python loop — see issue #28's prototype work).
-    t0 = time.perf_counter()
-    cell_arrays = []
-    granule_urls = []
-    for granule in granules:
-        info = extract_granule_info(granule)
-        if not info["s3_url"] or len(info["points"]) < 3:
-            continue
-        lats = np.array([p[0] for p in info["points"]])
-        lons = np.array([p[1] for p in info["points"]])
-        try:
-            cells = morton_coverage(lats, lons, order=order)
-        except Exception:
-            continue
-        if len(cells) == 0:
-            continue
-        cell_arrays.append(np.asarray(cells, dtype=np.int64))
-        granule_urls.append(info["s3_url"])
-    timings["granule_polygons"] = time.perf_counter() - t0
-
-    if not cell_arrays:
-        timings["total"] = time.perf_counter() - t_total
-        return {}, timings
-
-    all_cells = np.concatenate(cell_arrays)
-    counts = np.fromiter((len(c) for c in cell_arrays), dtype=np.int64,
-                         count=len(cell_arrays))
-    all_idx = np.repeat(np.arange(len(cell_arrays), dtype=np.int64), counts)
-    order_ = np.argsort(all_cells, kind="stable")
-    sorted_cells = all_cells[order_]
-    sorted_idx = all_idx[order_]
-    timings["strtree_construction"] = time.perf_counter() - t0  # reused timing key
-
-    # Per-shard MOC lookup
-    t0 = time.perf_counter()
     is_healpix = hasattr(grid, "parent_order") and hasattr(grid, "child_order")
     catalog: Dict[int, List[str]] = {}
-    for shard_key in all_shards:
-        if is_healpix:
-            # Fast path: shard IS a morton cell at parent_order; its MOC
-            # at the target order is just its children.
-            s_cells = generate_morton_children(int(shard_key), order)
-        else:
-            footprint = grid.shard_footprint(shard_key)
-            sx, sy = footprint.exterior.coords.xy
+
+    t0 = time.perf_counter()
+    if is_healpix:
+        # Granule-centric: map each granule's MOC straight to shard keys.
+        parent_order = grid.parent_order
+        for granule in granules:
+            info = extract_granule_info(granule)
+            if not info["s3_url"] or len(info["points"]) < 3:
+                continue
+            lats = np.array([p[0] for p in info["points"]])
+            lons = np.array([p[1] for p in info["points"]])
             try:
-                s_cells = morton_coverage(np.asarray(sy), np.asarray(sx),
-                                          order=order)
+                moc = np.asarray(morton_coverage_moc(lats, lons, order=order))
             except Exception:
                 continue
-        if len(s_cells) == 0:
-            continue
-        lo = np.searchsorted(sorted_cells, s_cells, side="left")
-        hi = np.searchsorted(sorted_cells, s_cells, side="right")
-        nonempty = hi > lo
-        if not nonempty.any():
-            continue
-        gathered = np.concatenate(
-            [sorted_idx[lo_i:hi_i] for lo_i, hi_i in zip(lo[nonempty], hi[nonempty])]
-        )
-        hit_indices = np.unique(gathered)
-        if hit_indices.size:
-            catalog[int(shard_key)] = [granule_urls[int(i)] for i in hit_indices]
+            if moc.size == 0:
+                continue
+            try:
+                shards = np.unique(moc_to_order(moc, parent_order))
+            except Exception:
+                continue
+            url = info["s3_url"]
+            for s in shards.tolist():
+                s = int(s)
+                if s in all_shards:
+                    catalog.setdefault(s, []).append(url)
+    else:
+        # Non-HEALPix: flat order-`order` granule cell index + per-shard lookup.
+        cell_arrays = []
+        granule_urls = []
+        for granule in granules:
+            info = extract_granule_info(granule)
+            if not info["s3_url"] or len(info["points"]) < 3:
+                continue
+            lats = np.array([p[0] for p in info["points"]])
+            lons = np.array([p[1] for p in info["points"]])
+            try:
+                cells = morton_coverage(lats, lons, order=order)
+            except Exception:
+                continue
+            if len(cells) == 0:
+                continue
+            cell_arrays.append(np.asarray(cells, dtype=np.int64))
+            granule_urls.append(info["s3_url"])
+        if cell_arrays:
+            all_cells = np.concatenate(cell_arrays)
+            counts = np.fromiter((len(c) for c in cell_arrays), dtype=np.int64,
+                                 count=len(cell_arrays))
+            all_idx = np.repeat(np.arange(len(cell_arrays), dtype=np.int64), counts)
+            srt = np.argsort(all_cells, kind="stable")
+            sorted_cells = all_cells[srt]
+            sorted_idx = all_idx[srt]
+            for shard_key in all_shards:
+                footprint = grid.shard_footprint(shard_key)
+                sx, sy = footprint.exterior.coords.xy
+                try:
+                    s_cells = morton_coverage(np.asarray(sy), np.asarray(sx), order=order)
+                except Exception:
+                    continue
+                if len(s_cells) == 0:
+                    continue
+                lo = np.searchsorted(sorted_cells, s_cells, side="left")
+                hi = np.searchsorted(sorted_cells, s_cells, side="right")
+                nz = hi > lo
+                if not nz.any():
+                    continue
+                gathered = np.concatenate(
+                    [sorted_idx[a:b] for a, b in zip(lo[nz], hi[nz])]
+                )
+                catalog[int(shard_key)] = [granule_urls[int(i)] for i in np.unique(gathered)]
     timings["strtree_queries"] = time.perf_counter() - t0
 
     timings["total"] = time.perf_counter() - t_total
-    logger.info(f"Pass 2: {len(catalog)} shards with granule mappings (mortie order={order})")
+    logger.info(f"Pass 2: {len(catalog)} shards with granule mappings (mortie MOC order={order})")
     return catalog, timings
 
 
@@ -869,6 +877,18 @@ examples:
     parser.add_argument("--parent-order", type=int, default=6, help="Parent morton order")
     parser.add_argument("--output", default=None, help="Output JSON file path")
 
+    # Geometry backend
+    geometry = parser.add_argument_group("geometry")
+    geometry.add_argument(
+        "--geometry-backend",
+        default="auto",
+        choices=["auto", "spherely", "mortie", "shapely", "shapely-3031"],
+        help="Sphere-aware geometry backend (default: auto -> spherely if installed, else mortie)",
+    )
+    geometry.add_argument(
+        "--mortie-order", type=int, default=8, help="MOC order for the mortie backend (default: 8)"
+    )
+
     args = parser.parse_args()
     logging.basicConfig(level=logging.INFO, format="%(message)s")
 
@@ -913,7 +933,19 @@ examples:
         return
 
     # --- Build catalog ---
-    catalog, timings = build_catalog(granules, args.parent_order, polygon_parts)
+    # Grid-driven path (spherely/mortie/...). child_order is irrelevant to
+    # catalog coverage/footprint, so mirror parent_order; fullsphere avoids the
+    # deprecated dense layout.
+    from zagg.grids import HealpixGrid
+
+    grid = HealpixGrid(args.parent_order, args.parent_order, layout="fullsphere")
+    catalog, timings = build_catalog(
+        granules,
+        grid=grid,
+        polygon_parts=polygon_parts,
+        geometry_backend=args.geometry_backend,
+        mortie_order=args.mortie_order,
+    )
 
     print("\nTimings:")
     for step, sec in timings.items():
@@ -961,6 +993,7 @@ examples:
 
     # New catalog format (PR-C): two parallel lists keyed by index.
     output_metadata["grid_type"] = "healpix"
+    output_metadata["geometry_backend"] = _resolve_backend(args.geometry_backend)
     shard_keys = sorted(int(k) for k in catalog.keys())
     output_data = {
         "metadata": output_metadata,

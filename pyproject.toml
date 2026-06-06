@@ -25,7 +25,7 @@ dependencies = [
     "numpy>=2.0",
     "pandas>=2.2",
     "h5coro>=0.0.8",
-    "mortie>=0.6.3",
+    "mortie>=0.7.0",
     "healpy",
     "earthaccess",
     "boto3",
