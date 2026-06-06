@@ -2,7 +2,7 @@
 
 ## Current State (2026-02-18)
 
-The Lambda function `process-morton-cell` is temporarily running on **x86_64 / py3.11**
+The Lambda function `process-shard` is temporarily running on **x86_64 / py3.11**
 for testing. The target architecture is **arm64 / py3.12** (20% cheaper per GB-second).
 
 ### Current Config
@@ -96,14 +96,14 @@ aws lambda publish-layer-version \
 
 # Update function
 aws lambda update-function-configuration \
-  --function-name process-morton-cell \
+  --function-name process-shard \
   --runtime python3.12 \
   --layers "arn:aws:lambda:us-west-2:429435741471:layer:zagg-deps-arm64:1" \
   --region us-west-2
 
 # Then update code with arm64 arch
 aws lambda update-function-code \
-  --function-name process-morton-cell \
+  --function-name process-shard \
   --zip-file fileb:///tmp/lambda_function.zip \
   --architectures arm64 \
   --region us-west-2
@@ -161,7 +161,7 @@ cd /tmp/lambda_build && zip -qr /tmp/lambda_function.zip .
 
 # Deploy
 aws lambda update-function-code \
-  --function-name process-morton-cell \
+  --function-name process-shard \
   --zip-file fileb:///tmp/lambda_function.zip \
   --region us-west-2
 ```

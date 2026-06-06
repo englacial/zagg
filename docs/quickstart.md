@@ -104,7 +104,7 @@ For full-scale processing, `zagg` dispatches work to AWS Lambda. See
 python deployment/aws/invoke_lambda.py --config atl06.yaml --catalog catalog.json
 ```
 
-The function name defaults to `process-morton-cell` but is configurable via
+The function name defaults to `process-shard` but is configurable via
 the `ZAGG_LAMBDA_FUNCTION_NAME` environment variable.
 
 ## Configuration

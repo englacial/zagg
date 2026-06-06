@@ -83,7 +83,7 @@ def agg(
         Preview what would be processed without running.
     function_name : str, optional
         Lambda function name. Defaults to env ``ZAGG_LAMBDA_FUNCTION_NAME``
-        or ``"process-morton-cell"``. Only used with ``backend="lambda"``.
+        or ``"process-shard"``. Only used with ``backend="lambda"``.
     region : str
         AWS region for S3 and Lambda. Default ``"us-west-2"``.
 
@@ -130,7 +130,7 @@ def agg(
         if not store_path.startswith("s3://"):
             raise ValueError(f"Lambda backend requires s3:// store path, got: {store_path}")
         if function_name is None:
-            function_name = os.environ.get("ZAGG_LAMBDA_FUNCTION_NAME", "process-morton-cell")
+            function_name = os.environ.get("ZAGG_LAMBDA_FUNCTION_NAME", "process-shard")
         return _run_lambda(
             config, catalog_data, store_path, child_order,
             max_cells=max_cells, morton_cell=morton_cell,

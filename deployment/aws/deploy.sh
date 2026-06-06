@@ -11,7 +11,7 @@
 
 set -e
 
-FUNCTION_NAME="${ZAGG_LAMBDA_FUNCTION_NAME:-process-morton-cell}"
+FUNCTION_NAME="${ZAGG_LAMBDA_FUNCTION_NAME:-process-shard}"
 S3_BUCKET="${ZAGG_S3_BUCKET:-xagg}"
 REGION="us-west-2"
 ARCH="arm64"

@@ -1,14 +1,14 @@
 AWSTemplateFormatVersion: "2010-09-09"
 Description: >-
   zagg serverless backend — IAM execution role, dependency layer, and the
-  process-morton-cell Lambda function. Layer and function code are pulled from a
+  process-shard Lambda function. Layer and function code are pulled from a
   same-region S3 bucket (ArtifactBucket); use stand_up.sh to populate it from a
   GitHub Release, or point it at your own copy of the zips.
 
 Parameters:
   FunctionName:
     Type: String
-    Default: process-morton-cell
+    Default: process-shard
     Description: Name of the Lambda function to create.
 
   Architecture:
