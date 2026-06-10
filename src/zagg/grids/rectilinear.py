@@ -1,9 +1,14 @@
-"""Rectilinear (regular gridded) output grid.
+"""Rectilinear (regular gridded) output grid, backed by ``odc.geo.GeoBox``.
 
 A 2D grid in a user-specified projected CRS. Cells are squares (or rectangles
 when ``resolution`` is a 2-tuple) tiled across ``bounds``. Storage is a 2D
 Zarr array with one chunk per ``chunk_shape`` block; each chunk is one shard
 (``shard_of`` and ``block_index`` collapse to chunk-arithmetic, no remap).
+
+The grid wraps a ``GeoBox`` (shape + affine + CRS) and a ``GeoboxTiles`` chunk
+tiling, which supply coverage, footprint reprojection, and the alignment math
+that ``nests_with`` needs. The integer leaf/shard packing is plain row-major
+arithmetic on the GeoBox affine.
 
 YAML config form::
 
@@ -28,6 +33,8 @@ filter rejects them, so they fall out of the pipeline silently.
 from __future__ import annotations
 
 import numpy as np
+from affine import Affine
+from odc.geo.geobox import GeoBox, GeoboxTiles
 from pydantic_zarr.experimental.v3 import ArraySpec, GroupSpec, NamedConfig
 from zarr import config as zarr_config
 from zarr.abc.store import Store
@@ -46,7 +53,7 @@ def _normalize_resolution(res) -> tuple[float, float]:
 
 
 class RectilinearGrid:
-    """Rectilinear projected grid.
+    """Rectilinear projected grid backed by ``odc.geo.GeoBox``.
 
     Parameters
     ----------
@@ -93,8 +100,7 @@ class RectilinearGrid:
         self.height = int(span_y // self.res_y)
         if self.width == 0 or self.height == 0:
             raise ValueError("resolution larger than bounds span")
-        # Chunk grid dimensions. Edge chunks may not align cleanly; the design
-        # constraint is that chunk_shape divides (width, height). Enforce.
+        # Chunk grid must divide the cell grid evenly (one chunk == one shard).
         if self.height % self.chunk_h != 0 or self.width % self.chunk_w != 0:
             raise ValueError(
                 f"chunk_shape ({self.chunk_h}, {self.chunk_w}) must divide "
@@ -104,7 +110,14 @@ class RectilinearGrid:
         self.n_row_blocks = self.height // self.chunk_h
         self.n_col_blocks = self.width // self.chunk_w
 
-        self._transformer = None  # lazy
+        # GeoBox: north-up affine with origin at (xmin, ymax); y resolution
+        # negative. GeoboxTiles tiles it into one tile per chunk.
+        affine = Affine.translation(self.xmin, self.ymax) * Affine.scale(
+            self.res_x, -self.res_y
+        )
+        self._geobox = GeoBox((self.height, self.width), affine, self.crs)
+        self._tiles = GeoboxTiles(self._geobox, (self.chunk_h, self.chunk_w))
+        self._transformer = None  # lazy WGS84 -> grid CRS, for assign
 
     # ── shape properties ─────────────────────────────────────────────────
 
@@ -120,38 +133,65 @@ class RectilinearGrid:
     def group_path(self) -> str:
         return "rectilinear"
 
+    # ── identity / nesting ───────────────────────────────────────────────
+
+    def signature(self) -> dict:
+        """Canonical fingerprint of the grid's defining parameters.
+
+        Recorded in a ShardMap at build time and re-checked at run time so a
+        shard map can never be silently paired with a different grid.
+        """
+        a = self._geobox.affine
+        return {
+            "type": "rectilinear",
+            "crs": str(self._geobox.crs),
+            "affine": [a.a, a.b, a.c, a.d, a.e, a.f],
+            "shape": [self.height, self.width],
+            "chunk_shape": [self.chunk_h, self.chunk_w],
+        }
+
+    def nests_with(self, other) -> bool:
+        """Whether ``self`` and ``other`` tile compatibly (align + nest).
+
+        True only for another rectilinear grid in the same CRS whose
+        resolutions are whole-number ratios and whose origins align on the
+        finer grid. Cross-family (e.g. HEALPix) never nests.
+        """
+        if not isinstance(other, RectilinearGrid):
+            return False
+        if self._geobox.crs != other._geobox.crs:
+            return False
+        if not (_whole_ratio(self.res_x, other.res_x)
+                and _whole_ratio(self.res_y, other.res_y)):
+            return False
+        fine_x = min(self.res_x, other.res_x)
+        fine_y = min(self.res_y, other.res_y)
+        return (
+            _is_multiple(self.xmin - other.xmin, fine_x)
+            and _is_multiple(self.ymax - other.ymax, fine_y)
+        )
+
     # ── coverage / coords ────────────────────────────────────────────────
 
     def coverage(self, polygon_parts) -> np.ndarray:
-        """Enumerate shard keys whose chunk bbox intersects any polygon part.
+        """Enumerate shard keys whose chunk intersects any polygon part.
 
-        Parts are ``(lats, lons)`` arrays in WGS84.
+        Parts are ``(lats, lons)`` arrays in WGS84. Reprojection to the grid
+        CRS and tile intersection are handled by odc.geo.
         """
-        from shapely import STRtree
-        from shapely.geometry import Polygon
+        from odc.geo.geom import multipolygon, polygon
 
-        tx = self._transformer_to_grid()
-        polys_grid = []
+        rings = []
         for lats, lons in polygon_parts:
-            xs, ys = tx.transform(np.asarray(lons), np.asarray(lats))
-            polys_grid.append(Polygon(zip(xs, ys)))
-        tree = STRtree(polys_grid)
+            rings.append([(float(x), float(y))
+                          for x, y in zip(np.asarray(lons), np.asarray(lats))])
+        if len(rings) == 1:
+            geom = polygon(rings[0], crs="EPSG:4326")
+        else:
+            geom = multipolygon([[r] for r in rings], crs="EPSG:4326")
+        geom = geom.to_crs(self._geobox.crs)
 
-        # Iterate the chunk grid and test intersection.
-        hits = []
-        for rb in range(self.n_row_blocks):
-            for cb in range(self.n_col_blocks):
-                bbox = self._chunk_bbox_grid((rb, cb))
-                box_poly = Polygon(
-                    [
-                        (bbox[0], bbox[1]),
-                        (bbox[2], bbox[1]),
-                        (bbox[2], bbox[3]),
-                        (bbox[0], bbox[3]),
-                    ]
-                )
-                if len(tree.query(box_poly, predicate="intersects")) > 0:
-                    hits.append(self._pack(rb, cb))
+        hits = {self._pack(rb, cb) for rb, cb in self._tiles.tiles(geom)}
         return np.asarray(sorted(hits), dtype=np.int64)
 
     # ── point assignment ─────────────────────────────────────────────────
@@ -202,9 +242,7 @@ class RectilinearGrid:
             raise InconsistentShardError("all leaves are out of bounds")
         first = int(shards[valid].flat[0])
         if not np.all(shards[valid] == first):
-            raise InconsistentShardError(
-                "leaves span multiple shards"
-            )
+            raise InconsistentShardError("leaves span multiple shards")
         return first
 
     # ── storage / footprint ──────────────────────────────────────────────
@@ -214,33 +252,19 @@ class RectilinearGrid:
         return (rb, cb)
 
     def shard_footprint(self, shard_key):
-        """Chunk bbox reprojected to WGS84, densified along edges."""
-        from shapely.geometry import Polygon
+        """Chunk extent reprojected to WGS84, densified along edges.
 
+        Densifying (~32 points per chunk edge) before reprojection keeps
+        curved CRS boundaries — and pole-spanning tiles — from collapsing to
+        a degenerate polygon.
+        """
         rb, cb = self._unpack(int(shard_key))
-        xmin, ymin, xmax, ymax = self._chunk_bbox_grid((rb, cb))
-        # Densify each edge with 32 points before reprojection so curved CRS
-        # boundaries don't get short-circuited.
-        n = 32
-        xs = np.concatenate(
-            [
-                np.linspace(xmin, xmax, n),                  # bottom (y=ymin)
-                np.full(n, xmax),                            # right
-                np.linspace(xmax, xmin, n),                  # top
-                np.full(n, xmin),                            # left
-            ]
+        densify = max(self.chunk_w * self.res_x, self.chunk_h * self.res_y) / 32
+        return (
+            self._tiles[(rb, cb)]
+            .extent.to_crs("EPSG:4326", resolution=densify)
+            .geom
         )
-        ys = np.concatenate(
-            [
-                np.full(n, ymin),
-                np.linspace(ymin, ymax, n),
-                np.full(n, ymax),
-                np.linspace(ymax, ymin, n),
-            ]
-        )
-        tx = self._transformer_from_grid()
-        lons, lats = tx.transform(xs, ys)
-        return Polygon(zip(lons, lats))
 
     # ── leaf enumeration ─────────────────────────────────────────────────
 
@@ -298,8 +322,6 @@ class RectilinearGrid:
         )
 
         # Coordinate arrays — 1D x and y for CF/GeoZarr compliance.
-        # Cell-centre values are populated by emit_template after the template
-        # is written.
         coord_x = ArraySpec(
             attributes={"standard_name": "projection_x_coordinate", "units": "m"},
             shape=(self.width,),
@@ -347,30 +369,29 @@ class RectilinearGrid:
     def _unpack(self, packed: int) -> tuple[int, int]:
         return (packed // self.n_col_blocks, packed % self.n_col_blocks)
 
-    def _chunk_bbox_grid(self, rb_cb) -> tuple[float, float, float, float]:
-        """Chunk bbox in grid CRS: (xmin, ymin, xmax, ymax)."""
-        rb, cb = rb_cb
-        xmin = self.xmin + cb * self.chunk_w * self.res_x
-        xmax = xmin + self.chunk_w * self.res_x
-        ymax = self.ymax - rb * self.chunk_h * self.res_y
-        ymin = ymax - self.chunk_h * self.res_y
-        return (xmin, ymin, xmax, ymax)
-
     def _transformer_to_grid(self):
         """WGS84 → grid CRS transformer (lat/lon → x/y)."""
         if self._transformer is None:
             from pyproj import Transformer
 
-            self._transformer = {
-                "to_grid": Transformer.from_crs("EPSG:4326", self.crs, always_xy=True),
-                "from_grid": Transformer.from_crs(self.crs, "EPSG:4326", always_xy=True),
-            }
-        return self._transformer["to_grid"]
+            self._transformer = Transformer.from_crs(
+                "EPSG:4326", self.crs, always_xy=True
+            )
+        return self._transformer
 
-    def _transformer_from_grid(self):
-        """Grid CRS → WGS84 transformer."""
-        self._transformer_to_grid()  # ensure init
-        return self._transformer["from_grid"]
+
+def _whole_ratio(a: float, b: float, tol: float = 1e-9) -> bool:
+    """True if the larger of a, b is a whole-number multiple of the smaller."""
+    lo, hi = sorted((a, b))
+    if lo <= 0:
+        return False
+    return abs(round(hi / lo) - hi / lo) < tol
+
+
+def _is_multiple(delta: float, step: float, tol: float = 1e-6) -> bool:
+    """True if ``delta`` is an integer multiple of ``step``."""
+    q = delta / step
+    return abs(round(q) - q) < tol
 
 
 __all__ = ["RectilinearGrid", "OOB_SENTINEL"]

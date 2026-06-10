@@ -112,5 +112,22 @@ class OutputGrid(Protocol):
         """Write a Zarr template (group + arrays) for this grid to ``store``."""
         ...
 
+    def signature(self) -> dict:
+        """Canonical fingerprint of the grid's defining parameters.
+
+        Recorded in a ShardMap at build time and compared at run time so a
+        shard map can never be silently paired with a mismatched grid.
+        """
+        ...
+
+    def nests_with(self, other: "OutputGrid") -> bool:
+        """Whether this grid and ``other`` tile compatibly (align + nest).
+
+        The primitive for cross-aggregator compatibility validation: same
+        family, aligned, whole-number resolution ratios. Cross-family
+        (HEALPix vs rectilinear) always returns False.
+        """
+        ...
+
 
 __all__ = ["OutputGrid", "ShardKey", "InconsistentShardError"]

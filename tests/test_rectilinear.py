@@ -191,3 +191,72 @@ class TestFromConfig:
         del cfg.output["grid"]["bounds"]
         with pytest.raises(ValueError, match="missing required"):
             from_config(cfg)
+
+
+class TestCoverage:
+    def test_coverage_contains_point_shard(self, grid):
+        # The shard a point assigns to must appear in the coverage of a small
+        # polygon around that point (coverage and assign agree).
+        lat, lon = -80.0, 10.0
+        shard = int(grid.shards_of(grid.assign(np.array([lat]), np.array([lon])))[0])
+        d = 0.5
+        lats = np.array([lat - d, lat - d, lat + d, lat + d, lat - d])
+        lons = np.array([lon - d, lon + d, lon + d, lon - d, lon - d])
+        shards = grid.coverage([(lats, lons)])
+        assert shards.dtype == np.int64
+        assert shard in shards.tolist()
+
+    def test_coverage_in_range(self, grid):
+        lats = np.array([-82, -82, -78, -78, -82.0])
+        lons = np.array([160, -160, -160, 160, 160.0])
+        shards = grid.coverage([(lats, lons)])
+        n = grid.n_row_blocks * grid.n_col_blocks
+        assert len(shards) > 0
+        assert all(0 <= s < n for s in shards)
+
+
+def _grid(cfg, res, chunk):
+    return RectilinearGrid(
+        crs="EPSG:3031", resolution=res,
+        bounds=(-3_200_000, -3_200_000, 3_200_000, 3_200_000),
+        chunk_shape=chunk, config=cfg,
+    )
+
+
+class TestSignature:
+    def test_fields(self, grid):
+        sig = grid.signature()
+        assert sig["type"] == "rectilinear"
+        assert sig["crs"] == "EPSG:3031"
+        assert sig["shape"] == [1280, 1280]
+        assert sig["chunk_shape"] == [256, 256]
+        assert len(sig["affine"]) == 6
+
+    def test_distinguishes_grids(self, cfg):
+        assert _grid(cfg, 5000, (256, 256)).signature() != \
+            _grid(cfg, 8000, (200, 200)).signature()
+
+
+class TestNesting:
+    def test_self_nests(self, grid):
+        assert grid.nests_with(grid)
+
+    def test_whole_ratio_aligned(self, cfg):
+        assert _grid(cfg, 5000, (256, 256)).nests_with(_grid(cfg, 10000, (320, 320)))
+
+    def test_non_whole_ratio(self, cfg):
+        # 8000 / 5000 = 1.6 -> not a whole-number ratio.
+        assert not _grid(cfg, 5000, (256, 256)).nests_with(_grid(cfg, 8000, (200, 200)))
+
+    def test_cross_crs(self, cfg):
+        utm = RectilinearGrid(
+            crs="EPSG:32618", resolution=10,
+            bounds=[359400, 4300740, 369400, 4310740], chunk_shape=[250, 250],
+            config=cfg,
+        )
+        assert not _grid(cfg, 5000, (256, 256)).nests_with(utm)
+
+    def test_cross_family(self, grid):
+        from zagg.grids import HealpixGrid
+
+        assert not grid.nests_with(HealpixGrid(6, 12, layout="fullsphere"))
