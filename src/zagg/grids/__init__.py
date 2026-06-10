@@ -69,6 +69,38 @@ def from_config(
     raise ValueError(f"Unknown output.grid.type: {grid_type!r}")
 
 
+def validate_compatible(grids: list) -> None:
+    """Validate that output grids can nest into mutually aligned data cubes.
+
+    This is the grid-compatibility core of the future multi-product validator
+    (#24 function 3): every pair of grids must ``nests_with`` the other — same
+    family, aligned origins, whole-number resolution ratios. Cross-family
+    (HEALPix vs rectilinear) is rejected.
+
+    Note
+    ----
+    Spatial-coverage overlap (do the products actually share a region) is not
+    yet checked — that needs the Catalogs/regions and is deferred until the
+    multi-product aggregation API lands.
+
+    Parameters
+    ----------
+    grids : list of OutputGrid
+        Grids that must be mutually compatible.
+
+    Raises
+    ------
+    ValueError
+        If any pair of grids does not nest.
+    """
+    for i, a in enumerate(grids):
+        for b in grids[i + 1:]:
+            if not (a.nests_with(b) and b.nests_with(a)):
+                raise ValueError(
+                    f"incompatible grids (do not nest):\n  {a.signature()}\n  {b.signature()}"
+                )
+
+
 __all__ = [
     "OutputGrid",
     "ShardKey",
@@ -78,4 +110,5 @@ __all__ = [
     "RectilinearGrid",
     "OOB_SENTINEL",
     "from_config",
+    "validate_compatible",
 ]

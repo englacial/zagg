@@ -26,7 +26,7 @@ The Lambda function processes a single morton cell (order 6) by:
 │    - src/zagg/ package (processing, auth, catalog)          │
 │  ──────────────────────────────────────────────────────────  │
 │  Layer (~70 MB compressed, ~240 MB uncompressed):           │
-│    - numpy, pandas, h5coro, mortie, healpy                  │
+│    - numpy, pandas, h5coro, mortie, pyproj, odc-geo         │
 │    - fastparquet, cramjam, shapely, astropy, earthaccess    │
 │    - pydantic-zarr, zarr, obstore, pyarrow                  │
 └─────────────────────────────────────────────────────────────┘
@@ -173,8 +173,9 @@ aws lambda update-function-code \
 ## Testing
 
 ```bash
-# Build a granule catalog
-uv run python -m zagg.catalog --cycle 22 --parent-order 6
+# Build a shard map
+uv run python -m zagg.catalog --config atl06.yaml --short-name ATL06 --cycle 22 \
+    --polygon antarctica.geojson
 
 # Test locally first (no Lambda required)
 uv run python -m zagg --config atl06.yaml --catalog catalog.json \

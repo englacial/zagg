@@ -18,29 +18,32 @@ zagg aggregates sparse point data (e.g., ICESat-2 ATL06 elevation measurements) 
 
 ### Step 1: Build a Granule Catalog
 
-Query NASA's CMR to build a mapping of spatial cells to granule S3 URLs.
+Query NASA's CMR-STAC to build a shard map of grid cells to granules. The grid
+comes from the **same pipeline config** the aggregator uses (`--config`), so the
+shard map can't be built against a different grid than the run.
 
 ```bash
 # Install with the catalog extra to get the spherely (S2) geometry backend
 # — recommended for global / non-Antarctic catalogs. Without it, the build
-# falls back to mortie (HEALPix MOC) which is slower but ships with the
-# core install.
+# falls back to mortie (HEALPix) / shapely (rectilinear).
 pip install 'zagg[catalog]'
 
 # ICESat-2 convenience — cycle number computes dates automatically:
-uv run python -m zagg.catalog --cycle 22 --parent-order 6
+uv run python -m zagg.catalog --config atl06.yaml --short-name ATL06 --cycle 22 \
+    --polygon my_region.geojson
 
-# General — explicit date range and spatial polygon:
+# General — explicit date range and a bbox:
 uv run python -m zagg.catalog \
+    --config atl06.yaml --short-name ATL06 \
     --start-date 2024-01-06 --end-date 2024-04-07 \
-    --short-name ATL06 \
-    --polygon my_region.geojson \
-    --parent-order 6
+    --polygon my_region.geojson
 ```
 
-When `--polygon` is provided, the bounding box for the CMR query is computed automatically from the polygon's extent, and `morton_coverage` uses the polygon for cell discovery. When no polygon is given, Antarctic drainage basins are used as the default.
+`--polygon` drives both the CMR query bbox and the coverage mask; `--bbox` gives
+the query box directly. Each granule record keeps both its S3 and HTTPS hrefs;
+the run picks one via `data_source.driver`.
 
-Output: `catalog_ATL06_2024-01-06_2024-04-07_order6.json`
+Output: `shardmap_ATL06_2024-01-06_2024-04-07.json`
 
 See [Catalog API](docs/api/catalog.md) for full options.
 

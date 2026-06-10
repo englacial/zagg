@@ -27,41 +27,36 @@ yielding a `5×5` chunk grid of `256×256` blocks.
 - Group attrs: `crs`, `resolution`, `bounds` (GeoZarr-style).
 - One chunk per shard; no remap from spatial identity to storage position.
 
-## Building a catalog
+## Building a shard map
 
-`build_catalog()` takes an optional `grid` parameter. Pass a
-`RectilinearGrid` instance to enumerate shards via `grid.coverage` and
-`grid.shard_footprint` rather than the HEALPix-specific defaults:
+The CLI builds the grid from the config, so a rectilinear config gets a
+shard map the same way HEALPix does — no special flag:
+
+```bash
+python -m zagg.catalog --config src/zagg/configs/atl06_polar.yaml \
+    --short-name ATL06 --start-date 2024-01-06 --end-date 2024-04-07 \
+    --polygon antarctica.geojson
+```
+
+Programmatically, `ShardMap.build` takes a `Catalog` and any grid:
 
 ```python
-import json
-from zagg.catalog import query_cmr, build_catalog, load_polygon
+from zagg.catalog import load_polygon, make_shardmap
+from zagg.catalog.sources import Query
 from zagg.config import load_config
 from zagg.grids import from_config
 
 cfg = load_config("src/zagg/configs/atl06_polar.yaml")
 grid = from_config(cfg)
+parts = load_polygon("antarctica.geojson")
 
-granules = query_cmr(start_date="2024-01-06", end_date="2024-04-07",
-                     short_name="ATL06", version="007")
-polygon_parts = load_polygon("antarctica.geojson")
-catalog, _ = build_catalog(granules, polygon_parts=polygon_parts, grid=grid)
-
-shard_keys = sorted(catalog.keys())
-out = {
-    "metadata": {"grid_type": "rectilinear", "total_cells": len(catalog)},
-    "shard_keys": shard_keys,
-    "granules": [catalog[k] for k in shard_keys],
-}
-with open("catalog_atl06_polar.json", "w") as f:
-    json.dump(out, f)
+q = Query("ATL06", "007", "2024-01-06", "2024-04-07", region="antarctica.geojson")
+sm = make_shardmap(q, grid, region=parts)   # auto backend: spherely / mortie / shapely
+sm.to_json("shardmap_atl06_polar.json")
 ```
 
-The catalog format is the shard_keys/granules layout (PR-C). Old
-dict-keyed catalogs are rejected with a clear error — regenerate them.
-
-A `--grid-type rectilinear` flag for the `python -m zagg.catalog` CLI is
-on the roadmap; for now use the programmatic form above.
+The shard map records `grid.signature()`; a run against a mismatched grid is
+refused with a clear error.
 
 ## Running
 
