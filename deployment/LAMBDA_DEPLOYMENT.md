@@ -15,8 +15,8 @@ for testing. The target architecture is **arm64 / py3.12** (20% cheaper per GB-s
 ### What's in the layer vs function code
 
 **Layer** (`xagg-dependencies:1`, 222MB unzipped):
-numpy, pandas, h5coro, mortie, healpy, earthaccess, boto3, astropy, shapely, cramjam,
-fastparquet, requests, s3fs, and transitive deps.
+numpy, pandas, h5coro, mortie, earthaccess, boto3, astropy, shapely, pyproj, odc-geo,
+cramjam, fastparquet, requests, s3fs, and transitive deps.
 
 **Function code** (20MB unzipped):
 `lambda_handler.py`, `zagg/` package, obstore, zarr, pydantic-zarr, pyyaml, pydantic,
@@ -72,8 +72,8 @@ pip install \
   --implementation cp \
   --python-version 3.12 \
   --only-binary=:all: \
-  numpy==2.2.6 pandas==2.2.3 h5coro==0.0.8 mortie healpy earthaccess \
-  boto3 fastparquet pyarrow shapely cramjam astropy requests
+  numpy==2.2.6 pandas==2.2.3 h5coro==0.0.8 mortie earthaccess \
+  boto3 fastparquet pyarrow shapely pyproj odc-geo cramjam astropy requests
 
 # Trim bloat
 find /tmp/layer_build -type d -name '__pycache__' -exec rm -rf {} +

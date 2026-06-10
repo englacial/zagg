@@ -48,9 +48,11 @@ docker run --rm --platform linux/arm64 \
 
         # Install remaining packages with numpy pinned
         echo "numpy==2.2.6" > /tmp/constraints.txt
+        # pyproj + odc-geo are required for arbitrary (rectilinear) grid assign,
+        # which reprojects lat/lon -> grid CRS at processing time.
         $PIP install \
             "pandas==2.2.3" fastparquet cramjam \
-            earthaccess shapely \
+            earthaccess shapely pyproj odc-geo affine cachetools \
             "pydantic-zarr>=0.9.1" "zarr>=3.1.5" "obstore>=0.8.2" \
             -c /tmp/constraints.txt \
             -t /out/python \
@@ -73,8 +75,10 @@ docker run --rm --platform linux/arm64 \
         # NOTE: Keep botocore - aiobotocore needs 1.41.x but Lambda has 1.40.4
         echo ""
         echo "Removing bloat..."
+        # NOTE: pyproj is intentionally NOT stripped -- rectilinear/odc-geo
+        # assign needs it at processing time. pyarrow stays stripped (only
+        # used for catalog fetch/build, never in the processing path).
         rm -rf /out/python/pyarrow* \
-               /out/python/pyproj* \
                /out/python/xarray* \
                /out/python/matplotlib* \
                /out/python/lonboard* \

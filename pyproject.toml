@@ -25,8 +25,7 @@ dependencies = [
     "numpy>=2.0",
     "pandas>=2.2",
     "h5coro>=0.0.8",
-    "mortie>=0.7.0",
-    "healpy",
+    "mortie>=0.7.2",
     "earthaccess",
     "boto3",
     "fastparquet",
@@ -37,6 +36,7 @@ dependencies = [
     "pyyaml",
     "pyproj",
     "shapely",
+    "odc-geo",
 ]
 
 [project.optional-dependencies]
@@ -47,12 +47,15 @@ lambda = [
     "cramjam",
     "astropy",
 ]
-# Sphere-aware geometry backend for catalog construction. Spherely brings
-# Google's S2 via a C++ wheel; we keep it out of the core deps so the
-# Lambda layer build (which doesn't run build_catalog) stays lean and the
-# arm64 wheel gap doesn't break Lambda packaging.
+# Sphere-aware geometry backend + STAC fetch for catalog construction. Kept
+# out of core so the Lambda layer build (which doesn't run fetch/build) stays
+# lean and the arm64 wheel gap doesn't break Lambda packaging.
+#
+# spherely is pinned to the fork carrying the S2 SpatialIndex (exact, ~25x over
+# the brute path) until it is upstreamed (benbovy/spherely#118).
 catalog = [
-    "spherely>=0.1.1",
+    "spherely @ git+https://github.com/espg/spherely@feature/spatial-index",
+    "stac-geoparquet>=0.7.0",
 ]
 analysis = [
     "cubed>=0.24.0",

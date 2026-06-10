@@ -5,7 +5,7 @@
 #   ./build_function.sh              # auto-detect arch and python
 #   ./build_function.sh --check-size # also verify combined size with layer
 #
-# The Lambda layer provides heavy deps (numpy, pandas, healpy, etc).
+# The Lambda layer provides heavy deps (numpy, pandas, pyproj, etc).
 # This script builds the function code with lighter deps (zarr, obstore, etc)
 # that pip resolves transitively — no more manual dep discovery.
 
