@@ -190,6 +190,30 @@ class HealpixGrid:
         children = self.children(shard_key)
         return {"morton": children, "cell_ids": self.encode_cell_ids(children)}
 
+    # ── identity / nesting ───────────────────────────────────────────────
+
+    def signature(self) -> dict:
+        """Canonical fingerprint of the grid's defining parameters.
+
+        Recorded in a ShardMap at build time and re-checked at run time so a
+        shard map can never be silently paired with a different grid.
+        """
+        return {
+            "type": "healpix",
+            "indexing_scheme": "nested",
+            "parent_order": self.parent_order,
+            "child_order": self.child_order,
+            "layout": self.layout,
+        }
+
+    def nests_with(self, other) -> bool:
+        """Whether ``self`` and ``other`` tile compatibly.
+
+        Any two HEALPix grids nest (the nested hierarchy subdivides 4-for-1 at
+        every order). Cross-family (e.g. rectilinear) never nests.
+        """
+        return isinstance(other, HealpixGrid)
+
     def emit_template(self, store: Store, *, overwrite: bool = False) -> Store:
         """Write the Zarr template (group + arrays) to ``store``."""
         spec = self._spec()
