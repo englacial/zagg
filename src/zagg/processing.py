@@ -22,23 +22,16 @@ from zagg.schema import ProcessingMetadata
 logger = logging.getLogger(__name__)
 
 
-def _make_url_rewriter(driver: str | None, catalog_metadata: dict | None):
-    """Return a function that converts a granule URL for the active driver."""
+def _make_url_rewriter(driver: str | None):
+    """Return a function that converts a granule URL for the active h5coro driver.
+
+    The ShardMap carries the driver-appropriate href already (S3 vs HTTPS is
+    chosen at dispatch), so this only strips the ``s3://`` scheme for the S3
+    driver (h5coro's S3Driver expects ``bucket/key``); HTTPS is used as-is.
+    """
     if driver == "https":
-        s3_base = (catalog_metadata or {}).get("s3_base", "")
-        https_base = (catalog_metadata or {}).get("https_base", "")
-        if s3_base and https_base:
-            def _rewrite(url):
-                return url.replace(s3_base, https_base, 1)
-            return _rewrite
-        raise ValueError(
-            "driver='https' requires catalog metadata with s3_base/https_base. "
-            "Rebuild the catalog with the latest zagg to populate these fields."
-        )
-    # S3 driver: strip s3:// prefix (h5coro expects bucket/key)
-    def _rewrite_s3(url):
-        return url.replace("s3://", "", 1)
-    return _rewrite_s3
+        return lambda url: url
+    return lambda url: url.replace("s3://", "", 1)
 
 
 def write_dataframe_to_zarr(
@@ -252,7 +245,6 @@ def process_shard(
     h5coro_driver=None,
     config: PipelineConfig | None = None,
     driver: str | None = None,
-    catalog_metadata: dict | None = None,
 ) -> Tuple[pd.DataFrame, ProcessingMetadata]:
     """Process one shard: read granules, filter to this shard, aggregate, return df.
 
@@ -277,8 +269,6 @@ def process_shard(
         Defaults to ``default_config()``.
     driver : str, optional
         ``"s3"`` (default) or ``"https"``.
-    catalog_metadata : dict, optional
-        Carries ``s3_base``/``https_base`` for HTTPS URL rewriting.
 
     Returns
     -------
@@ -339,8 +329,8 @@ def process_shard(
             or s3_credentials.get("aws_session_token"),
         }
 
-    # Build URL rewriter for HTTPS driver
-    _rewrite_url = _make_url_rewriter(driver, catalog_metadata)
+    # Build URL rewriter for the active driver
+    _rewrite_url = _make_url_rewriter(driver)
 
     all_dataframes = []
     files_processed = 0
@@ -438,7 +428,6 @@ def process_morton_cell(
     h5coro_driver=None,
     config: PipelineConfig | None = None,
     driver: str | None = None,
-    catalog_metadata: dict | None = None,
     grid=None,
 ) -> Tuple[pd.DataFrame, ProcessingMetadata]:
     """Deprecated HEALPix-flavored alias for :func:`process_shard`.
@@ -468,5 +457,4 @@ def process_morton_cell(
         h5coro_driver=h5coro_driver,
         config=config,
         driver=driver,
-        catalog_metadata=catalog_metadata,
     )

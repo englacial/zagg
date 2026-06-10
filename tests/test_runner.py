@@ -13,23 +13,24 @@ def atl06_config():
     return default_config("atl06")
 
 
+def _rec(n):
+    return {"id": f"g{n}", "s3": f"s3://bucket/granule{n}.h5",
+            "https": f"https://h/granule{n}.h5"}
+
+
+# HealpixGrid(parent_order=6, child_order=12, layout="fullsphere").signature()
+_ATL06_SIG = {"type": "healpix", "indexing_scheme": "nested",
+              "parent_order": 6, "child_order": 12, "layout": "fullsphere"}
+
+
 @pytest.fixture
 def catalog_file(tmp_path):
-    """Create a minimal catalog JSON for testing (PR-C shard_keys format)."""
+    """A minimal Phase-5 ShardMap JSON for testing."""
     catalog = {
-        "metadata": {
-            "short_name": "ATL06",
-            "parent_order": 6,
-            "total_cells": 3,
-            "total_granules": 10,
-            "grid_type": "healpix",
-        },
+        "metadata": {"short_name": "ATL06", "total_shards": 3, "total_granules": 6},
+        "grid_signature": _ATL06_SIG,
         "shard_keys": [-4211324, -4211323, -4211322],
-        "granules": [
-            ["s3://bucket/granule4.h5", "s3://bucket/granule5.h5", "s3://bucket/granule6.h5"],
-            ["s3://bucket/granule3.h5"],
-            ["s3://bucket/granule1.h5", "s3://bucket/granule2.h5"],
-        ],
+        "granules": [[_rec(4), _rec(5), _rec(6)], [_rec(3)], [_rec(1), _rec(2)]],
     }
     p = tmp_path / "catalog.json"
     p.write_text(json.dumps(catalog))
@@ -81,8 +82,9 @@ class TestSelectCells:
     def _data(self, n=3):
         return {
             "metadata": {},
+            "grid_signature": {},
             "shard_keys": list(range(n)),
-            "granules": [[f"u{i}"] for i in range(n)],
+            "granules": [[_rec(i)] for i in range(n)],
         }
 
     def test_all_cells(self):
@@ -105,16 +107,17 @@ class TestSelectCells:
 class TestLoadCatalog:
     def test_load(self, catalog_file):
         data = _load_catalog(catalog_file)
-        assert "metadata" in data
+        assert "grid_signature" in data
         assert "shard_keys" in data
         assert "granules" in data
         assert len(data["shard_keys"]) == 3
 
     def test_old_format_rejected(self, tmp_path):
-        old = {"metadata": {}, "catalog": {"0": []}}
+        # Pre-Phase-5: shard_keys/granules but no grid_signature.
+        old = {"metadata": {}, "shard_keys": [0], "granules": [["s3://b/g.h5"]]}
         p = tmp_path / "old.json"
         p.write_text(json.dumps(old))
-        with pytest.raises(ValueError, match="pre-PR-C format"):
+        with pytest.raises(ValueError, match="not a Phase-5 ShardMap"):
             _load_catalog(str(p))
 
 

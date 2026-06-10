@@ -142,6 +142,8 @@ def validate_config(config: PipelineConfig) -> None:
             raise ValueError("output.grid.type is required")
         if grid["type"] == "healpix" and "child_order" not in grid:
             raise ValueError("output.grid.child_order is required for healpix grid")
+        if grid["type"] == "healpix" and "parent_order" not in grid:
+            raise ValueError("output.grid.parent_order is required for healpix grid")
         if grid["type"] == "rectilinear":
             for field in ("crs", "resolution", "bounds"):
                 if field not in grid:
@@ -371,6 +373,29 @@ def get_child_order(config: PipelineConfig) -> int:
     if child_order is None:
         raise ValueError("output.grid.child_order is required")
     return int(child_order)
+
+
+def get_parent_order(config: PipelineConfig) -> int:
+    """Return parent_order (shard order) from the output grid config.
+
+    Parameters
+    ----------
+    config : PipelineConfig
+
+    Returns
+    -------
+    int
+
+    Raises
+    ------
+    ValueError
+        If parent_order is not set in the config.
+    """
+    grid = config.output.get("grid", {})
+    parent_order = grid.get("parent_order")
+    if parent_order is None:
+        raise ValueError("output.grid.parent_order is required")
+    return int(parent_order)
 
 
 def get_layout(config: PipelineConfig) -> str:

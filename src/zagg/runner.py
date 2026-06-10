@@ -21,7 +21,14 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from zarr import consolidate_metadata
 
 from zagg.auth import get_edl_token, get_nsidc_s3_credentials
-from zagg.config import PipelineConfig, get_child_order, get_driver, get_layout, get_store_path
+from zagg.config import (
+    PipelineConfig,
+    get_child_order,
+    get_driver,
+    get_layout,
+    get_parent_order,
+    get_store_path,
+)
 from zagg.processing import process_shard, write_dataframe_to_zarr
 from zagg.store import open_store
 
@@ -143,29 +150,28 @@ def agg(
 
 
 def _load_catalog(catalog_path: str) -> dict:
-    """Load granule catalog from JSON file.
+    """Load a ShardMap manifest from JSON.
 
     Returns
     -------
     dict
-        ``{"metadata": ..., "shard_keys": [...], "granules": [[...], ...]}``.
-        The shard_keys + granules format is required as of PR-C; the
-        legacy ``{"catalog": {str(int): [urls]}}`` format raises with
-        instructions to regenerate.
+        ``{"grid_signature": ..., "shard_keys": [...], "granules": [[...]],
+        "metadata": ...}`` where each granule is ``{"id", "s3", "https"}``.
+
+    Raises
+    ------
+    ValueError
+        If the file is a pre-Phase-5 catalog (URL-list granules, no
+        ``grid_signature``); regenerate it with ``python -m zagg.catalog``.
     """
     with open(catalog_path) as f:
         data = json.load(f)
-    if "shard_keys" in data and "granules" in data:
+    if "shard_keys" in data and "granules" in data and "grid_signature" in data:
         return data
-    if "catalog" in data:
-        raise ValueError(
-            f"Catalog at {catalog_path} uses the pre-PR-C format "
-            f"(dict-keyed). Regenerate with `python -m zagg.catalog` to "
-            f"produce the new shard_keys/granules format."
-        )
     raise ValueError(
-        f"Catalog at {catalog_path} missing required 'shard_keys' and "
-        f"'granules' top-level keys."
+        f"Catalog at {catalog_path} is not a Phase-5 ShardMap (needs "
+        f"'grid_signature' + {{id,s3,https}} granules). Regenerate with "
+        f"`python -m zagg.catalog --config ...`."
     )
 
 
@@ -216,17 +222,38 @@ def _dry_run_summary(cells: list[tuple], store_path: str) -> dict:
     }
 
 
-def _process_and_write(shard_key, chunk_idx, granule_urls, grid,
-                       s3_creds, zarr_store, config, driver=None, catalog_metadata=None):
+def _resolve_urls(records: list, driver: str | None) -> list[str]:
+    """Pick the driver-appropriate href from each granule record.
+
+    ShardMap granules are ``{"id", "s3", "https"}``; the run's
+    ``data_source.driver`` selects which endpoint to read.
+    """
+    key = "https" if driver == "https" else "s3"
+    return [r[key] for r in records if r.get(key)]
+
+
+def _check_signature(grid, catalog_data: dict) -> None:
+    """Refuse a ShardMap built for a different grid than the run config."""
+    expected = catalog_data.get("grid_signature")
+    actual = grid.signature()
+    if expected is not None and expected != actual:
+        raise ValueError(
+            "ShardMap was built for a different grid than this run config.\n"
+            f"  shard map : {expected}\n"
+            f"  run config: {actual}"
+        )
+
+
+def _process_and_write(shard_key, chunk_idx, records, grid,
+                       s3_creds, zarr_store, config, driver=None):
     """Process a single shard and write results to store."""
     df_out, metadata = process_shard(
         grid,
         int(shard_key),
-        granule_urls,
+        _resolve_urls(records, driver),
         s3_credentials=s3_creds,
         config=config,
         driver=driver,
-        catalog_metadata=catalog_metadata,
     )
     if not df_out.empty:
         write_dataframe_to_zarr(
@@ -241,7 +268,6 @@ def _run_local(config, catalog_data, store_path, child_order, *,
                max_cells, morton_cell, max_workers, overwrite, dry_run, region,
                driver="s3"):
     """Run processing locally with ThreadPoolExecutor."""
-    metadata = catalog_data["metadata"]
     all_shards = list(catalog_data["shard_keys"])
 
     cells = _select_cells(catalog_data, morton_cell=morton_cell, max_cells=max_cells)
@@ -256,20 +282,17 @@ def _run_local(config, catalog_data, store_path, child_order, *,
     else:
         s3_creds = get_nsidc_s3_credentials()
 
-    # Build grid and template. For HEALPix-dense, populated_shards order
-    # matches the catalog's shard_keys list (sorted at build time).
+    # Build grid from the run config (single source of truth) and refuse a
+    # shard map built for a different grid. For HEALPix-dense, populated_shards
+    # order matches the catalog's shard_keys list (sorted at build time).
     from zagg.grids import from_config
-    parent_order = metadata.get("parent_order")
     layout = get_layout(config)
     grid_type = config.output.get("grid", {}).get("type", "healpix")
-    if grid_type == "healpix":
-        grid = from_config(
-            config,
-            parent_order=parent_order,
-            populated_shards=[int(s) for s in all_shards] if layout == "dense" else None,
-        )
+    if grid_type == "healpix" and layout == "dense":
+        grid = from_config(config, populated_shards=[int(s) for s in all_shards])
     else:
         grid = from_config(config)
+    _check_signature(grid, catalog_data)
     zarr_store = open_store(store_path, region=region)
     zarr_store = grid.emit_template(zarr_store, overwrite=overwrite)
 
@@ -283,12 +306,12 @@ def _run_local(config, catalog_data, store_path, child_order, *,
         futures = {
             executor.submit(
                 _process_and_write,
-                shard_key, grid.block_index(int(shard_key)), urls,
+                shard_key, grid.block_index(int(shard_key)), records,
                 grid,
                 s3_creds, zarr_store, config,
-                driver=driver, catalog_metadata=metadata,
+                driver=driver,
             ): shard_key
-            for shard_key, urls in cells
+            for shard_key, records in cells
         }
 
         for i, future in enumerate(as_completed(futures), 1):
@@ -334,9 +357,9 @@ def _run_lambda(config, catalog_data, store_path, child_order, *,
     import boto3
     from botocore.config import Config
 
-    metadata = catalog_data["metadata"]
     all_shards = list(catalog_data["shard_keys"])
-    parent_order = metadata.get("parent_order")
+    grid_type = config.output.get("grid", {}).get("type", "healpix")
+    parent_order = get_parent_order(config) if grid_type == "healpix" else None
 
     # Sort by granule count (descending) for better throughput
     cells = _select_cells(catalog_data, morton_cell=morton_cell, max_cells=max_cells)
@@ -351,17 +374,15 @@ def _run_lambda(config, catalog_data, store_path, child_order, *,
     # Authenticate (for per-cell NSIDC reads inside the Lambda)
     s3_creds = get_nsidc_s3_credentials()
 
+    # Build grid from the run config (single source of truth); enforce the
+    # shard map was built for the same grid.
     from zagg.grids import from_config
     layout = get_layout(config)
-    grid_type = config.output.get("grid", {}).get("type", "healpix")
-    if grid_type == "healpix":
-        grid = from_config(
-            config,
-            parent_order=parent_order,
-            populated_shards=[int(s) for s in all_shards] if layout == "dense" else None,
-        )
+    if grid_type == "healpix" and layout == "dense":
+        grid = from_config(config, populated_shards=[int(s) for s in all_shards])
     else:
         grid = from_config(config)
+    _check_signature(grid, catalog_data)
     config_dict = asdict(config)
 
     # Configure boto3 client (created early so we can use it for setup/finalize)
@@ -399,11 +420,11 @@ def _run_lambda(config, catalog_data, store_path, child_order, *,
                 _invoke_lambda_cell,
                 lambda_client, grid.block_index(int(shard_key)), int(shard_key),
                 parent_order, child_order,
-                urls, store_path, s3_creds,
+                _resolve_urls(records, "s3"), store_path, s3_creds,
                 function_name=function_name,
                 config_dict=config_dict,
             ): shard_key
-            for shard_key, urls in cells
+            for shard_key, records in cells
         }
 
         for i, future in enumerate(as_completed(futures), 1):
