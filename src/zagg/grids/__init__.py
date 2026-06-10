@@ -40,10 +40,13 @@ def from_config(
                 stacklevel=2,
             )
         layout = explicit_layout or "fullsphere"
-        if parent_order is None:
-            raise ValueError("parent_order is required for HEALPix grids")
+        # Grid is fully defined by the config (single source of truth); the
+        # parent_order kwarg is only a fallback for legacy callers.
+        resolved_parent = grid_cfg.get("parent_order", parent_order)
+        if resolved_parent is None:
+            raise ValueError("output.grid.parent_order is required for HEALPix grids")
         return HealpixGrid(
-            parent_order=parent_order,
+            parent_order=resolved_parent,
             child_order=get_child_order(config),
             layout=layout,
             config=config,

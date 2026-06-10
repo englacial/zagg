@@ -70,4 +70,5 @@ output:
   grid:
     type: healpix
     indexing_scheme: nested
+    parent_order: 6
     child_order: 12
