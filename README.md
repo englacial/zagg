@@ -23,10 +23,14 @@ comes from the **same pipeline config** the aggregator uses (`--config`), so the
 shard map can't be built against a different grid than the run.
 
 ```bash
-# Install with the catalog extra to get the spherely (S2) geometry backend
-# — recommended for global / non-Antarctic catalogs. Without it, the build
-# falls back to mortie (HEALPix) / shapely (rectilinear).
+# Install the catalog extra (STAC fetch + shard-map build). The geometry
+# backend is mortie (HEALPix) / shapely (rectilinear) by default.
 pip install 'zagg[catalog]'
+
+# Optional: the exact-S2 spherely SpatialIndex backend is a fork not on PyPI
+# (benbovy/spherely#118) — install it separately (pick the wheel for your
+# python/platform from the release assets):
+# pip install "spherely @ https://github.com/espg/spherely/releases/download/v0.1.1-spatialindex/spherely-0.1.1+spatialindex-cp312-cp312-manylinux_2_28_x86_64.whl"
 
 # ICESat-2 convenience — cycle number computes dates automatically:
 uv run python -m zagg.catalog --config atl06.yaml --short-name ATL06 --cycle 22 \

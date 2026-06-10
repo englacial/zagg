@@ -32,7 +32,8 @@ python -m zagg.catalog --config atl06.yaml --short-name ATL06 --cycle 22 \
 `--polygon` drives both the CMR query bbox and the coverage mask; `--bbox`
 gives the query box directly (coverage falls back to that rectangle). The
 geometry backend (`--backend`) defaults to `auto`: exact-S2 spherely if the
-`catalog` extra is installed, else mortie (HEALPix) / shapely (rectilinear).
+spherely fork (with `SpatialIndex`) is installed separately, else mortie
+(HEALPix) / shapely (rectilinear).
 
 Endpoint selection (S3 vs HTTPS) is **not** made here — each granule record
 keeps both hrefs, and the aggregator picks one at run time via
