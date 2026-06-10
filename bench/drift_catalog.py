@@ -25,7 +25,6 @@ import argparse
 import json
 import pickle
 import time
-from datetime import datetime
 from pathlib import Path
 
 # Cached CMR pull produced by bench/verify_spherely_cycle22.py.
@@ -38,6 +37,13 @@ PARENT_ORDER = 6
 def _basename(url: str) -> str:
     """Granule identity, independent of s3://, https://, or bucket prefix."""
     return url.rstrip("/").rsplit("/", 1)[-1]
+
+
+def _gran_basename(g) -> str:
+    """Granule identity from either a URL string or a {id,s3,https} record."""
+    if isinstance(g, dict):
+        return _basename(g.get("s3") or g.get("https") or g.get("id"))
+    return _basename(g)
 
 
 def load_pairs(path: str) -> dict[int, set[str]]:
@@ -60,10 +66,10 @@ def load_pairs(path: str) -> dict[int, set[str]]:
     out: dict[int, set[str]] = {}
     if "shard_keys" in d and "granules" in d:
         for k, urls in zip(d["shard_keys"], d["granules"]):
-            out[int(k)] = {_basename(u) for u in urls}
+            out[int(k)] = {_gran_basename(u) for u in urls}
     elif "catalog" in d:
         for k, urls in d["catalog"].items():
-            out[int(k)] = {_basename(u) for u in urls}
+            out[int(k)] = {_gran_basename(u) for u in urls}
     else:
         raise ValueError(f"{path}: unrecognized catalog format")
     return out
@@ -129,20 +135,53 @@ def _print_compare(summary: dict, label_a: str, label_b: str) -> None:
 
 # ── build ─────────────────────────────────────────────────────────────────────
 
-def build(backend: str, out: str, *, order: int = 8, mortie_order: int = 8) -> None:
-    """Build an order-6 fullsphere cycle-22 catalog from the cached granule pull.
+def _catalog_from_umm(granules):
+    """Build a Catalog from cached raw UMM-JSON granules.
 
-    Parameters
-    ----------
-    backend : str
-        Geometry backend passed to ``build_catalog`` (``mortie``, ``spherely``,
-        ``shapely``, or ``auto``).
-    out : str
-        Output path for the new-format catalog JSON.
-    order, mortie_order : int
-        MOC order for the mortie backend.
+    Lets ``build`` run on the *same* granule set as the pre-refactor baselines
+    (cached from the legacy UMM CMR pull), so new-vs-recent drift reflects the
+    algorithm, not a different granule set.
     """
-    from zagg.catalog import build_catalog, load_antarctic_basins
+    import pyarrow as pa
+    import stac_geoparquet.arrow as sga
+
+    from zagg.catalog.sources import Catalog
+
+    items = []
+    for g in granules:
+        umm = g.get("umm", {})
+        s3 = next((u["URL"] for u in umm.get("RelatedUrls", [])
+                   if u.get("URL", "").startswith("s3://") and u["URL"].endswith(".h5")), None)
+        gpoly = (umm.get("SpatialExtent", {}).get("HorizontalSpatialDomain", {})
+                 .get("Geometry", {}).get("GPolygons", []))
+        if not s3 or not gpoly:
+            continue
+        pts = gpoly[0].get("Boundary", {}).get("Points", [])
+        ring = [[p["Longitude"], p["Latitude"]] for p in pts if "Latitude" in p]
+        if len(ring) < 3:
+            continue
+        if ring[0] != ring[-1]:
+            ring.append(ring[0])
+        lons = [c[0] for c in ring]
+        lats = [c[1] for c in ring]
+        items.append({
+            "type": "Feature", "stac_version": "1.0.0", "id": umm.get("GranuleUR", ""),
+            "geometry": {"type": "Polygon", "coordinates": [ring]},
+            "bbox": [min(lons), min(lats), max(lons), max(lats)],
+            "properties": {"datetime": "2024-01-01T00:00:00Z"},
+            "collection": "ATL06", "stac_extensions": [], "links": [],
+            "assets": {"data_s3": {"href": s3, "roles": ["data"]}},
+        })
+    return Catalog(pa.table(sga.parse_stac_items_to_arrow(items)), {})
+
+
+def build(backend: str, out: str, *, mortie_order: int = 8) -> None:
+    """Build an order-6 fullsphere cycle-22 ShardMap from the cached granule pull."""
+    import logging
+
+    logging.disable(logging.INFO)
+    from zagg.catalog import load_antarctic_basins
+    from zagg.catalog.shardmap import ShardMap
     from zagg.grids import HealpixGrid
 
     if not CACHE.exists():
@@ -151,41 +190,16 @@ def build(backend: str, out: str, *, order: int = 8, mortie_order: int = 8) -> N
             f"bench/verify_spherely_cycle22.py first to populate it."
         )
     granules = pickle.loads(CACHE.read_bytes())
-    basins = load_antarctic_basins()
-    grid = HealpixGrid(PARENT_ORDER, PARENT_ORDER, layout="fullsphere")
-
     print(f"[build] backend={backend} granules={len(granules)} ...")
+    cat = _catalog_from_umm(granules)
+    grid = HealpixGrid(PARENT_ORDER, PARENT_ORDER, layout="fullsphere")
     t0 = time.perf_counter()
-    catalog, timings = build_catalog(
-        granules,
-        grid=grid,
-        polygon_parts=basins,
-        geometry_backend=backend,
-        mortie_order=mortie_order,
-    )
-    wall = time.perf_counter() - t0
-
-    shard_keys = sorted(int(k) for k in catalog)
-    pairs = sum(len(v) for v in catalog.values())
-    payload = {
-        "metadata": {
-            "drift_role": "recent",
-            "backend": backend,
-            "parent_order": PARENT_ORDER,
-            "cycle": 22,
-            "short_name": "ATL06",
-            "total_granules": len(granules),
-            "total_cells": len(catalog),
-            "total_pairs": pairs,
-            "build_wall_s": round(wall, 2),
-            "created": datetime.now().isoformat(),
-        },
-        "shard_keys": shard_keys,
-        "granules": [sorted(catalog[k]) for k in shard_keys],
-    }
+    sm = ShardMap.build(cat, grid, region=load_antarctic_basins(),
+                        backend=backend, mortie_order=mortie_order)
     Path(out).parent.mkdir(parents=True, exist_ok=True)
-    Path(out).write_text(json.dumps(payload, indent=2))
-    print(f"[build] {len(catalog)} shards, {pairs:,} pairs, {wall:.1f}s -> {out}")
+    sm.to_json(out)
+    print(f"[build] {len(sm.shard_keys)} shards, {sm.metadata['total_pairs']:,} pairs, "
+          f"{time.perf_counter() - t0:.1f}s -> {out}")
 
 
 # ── cli ────────────────────────────────────────────────────────────────────────
