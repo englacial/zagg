@@ -48,7 +48,7 @@ from typing import Any, Dict
 
 # Import cloud-agnostic processing
 from zagg.config import load_config_from_dict
-from zagg.processing import process_morton_cell, write_dataframe_to_zarr
+from zagg.processing import write_dataframe_to_zarr
 from zagg.store import open_store
 
 # Set up structured logging

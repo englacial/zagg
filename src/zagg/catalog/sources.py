@@ -185,7 +185,7 @@ class CMRSource:
             doc = resp.json()
             feats = doc.get("features", [])
             items.extend(feats)
-            nxt = next((l for l in doc.get("links", []) if l.get("rel") == "next"), None)
+            nxt = next((ln for ln in doc.get("links", []) if ln.get("rel") == "next"), None)
             if not nxt or not feats:
                 break
             # A next link is either a GET href or a POST href+body+merge.

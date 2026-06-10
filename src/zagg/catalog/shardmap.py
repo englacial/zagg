@@ -29,7 +29,6 @@ from typing import Dict, List
 
 import numpy as np
 
-
 # ── granule footprint helpers ────────────────────────────────────────────────
 
 def _to_spherely_polygon(lats, lons):

@@ -69,6 +69,7 @@ LAYER_PACKAGES=(
     # IO (in layer)
     fastparquet cramjam pyarrow
     # Geo (in layer)
+    pyproj odc affine cachetools
     # Data access (in layer)
     earthaccess shapely h5coro mortie
     # AWS (provided by Lambda runtime or layer)

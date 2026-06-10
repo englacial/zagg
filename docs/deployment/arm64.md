@@ -43,7 +43,7 @@ Use `quay.io/pypa/manylinux_2_28_aarch64`:
 2. **Run the build**:
 
     ```bash
-    bash deployment/aws/build_arm64_layer.sh
+    bash deployment/aws/build_layer.sh arm64
     ```
 
 3. **Transfer the zip** (if building on a different machine):

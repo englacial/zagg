@@ -72,6 +72,7 @@ analysis = [
 ]
 test = [
     "pytest>=8.0",
+    "stac-geoparquet>=0.7.0",
 ]
 
 [project.urls]
@@ -81,6 +82,10 @@ Issues = "https://github.com/englacial/zagg/issues"
 
 [project.scripts]
 zagg = "zagg.__main__:main"
+
+[tool.hatch.metadata]
+# Allow the catalog extra's spherely fork to be pinned by release-asset URL.
+allow-direct-references = true
 
 [tool.hatch.version]
 source = "vcs"

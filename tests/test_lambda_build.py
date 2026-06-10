@@ -77,12 +77,8 @@ class TestFunctionBuild:
         assert build_script.stat().st_mode & 0o111, "build_function.sh is not executable"
 
     def test_layer_build_script_exists(self):
-        script = REPO_ROOT / "deployment" / "aws" / "build_layer_v14.sh"
+        script = REPO_ROOT / "deployment" / "aws" / "build_layer.sh"
         assert script.exists(), f"Layer build script missing: {script}"
-
-    def test_arm64_build_script_exists(self):
-        script = REPO_ROOT / "deployment" / "aws" / "build_arm64_layer.sh"
-        assert script.exists(), f"ARM64 build script missing: {script}"
 
     @pytest.mark.slow
     def test_function_build_succeeds(self, build_script, tmp_path):
@@ -184,15 +180,13 @@ class TestPackageConsistency:
         )
 
     def test_numpy_version_consistent(self):
-        """Lambda [extra] and ARM64 build script must pin the same numpy version."""
-        self._assert_lockstep("numpy", "build_arm64_layer.sh")
+        """Lambda [extra] and the build script must pin the same numpy version."""
+        self._assert_lockstep("numpy", "build_layer.sh")
 
     def test_pandas_version_consistent(self):
-        """Lambda [extra] and both build scripts must pin the same pandas version."""
-        self._assert_lockstep("pandas", "build_layer_v14.sh")
-        self._assert_lockstep("pandas", "build_arm64_layer.sh")
+        """Lambda [extra] and the build script must pin the same pandas version."""
+        self._assert_lockstep("pandas", "build_layer.sh")
 
     def test_h5coro_version_consistent(self):
-        """Lambda [extra] and both build scripts must pin the same h5coro version."""
-        self._assert_lockstep("h5coro", "build_layer_v14.sh")
-        self._assert_lockstep("h5coro", "build_arm64_layer.sh")
+        """Lambda [extra] and the build script must pin the same h5coro version."""
+        self._assert_lockstep("h5coro", "build_layer.sh")

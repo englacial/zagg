@@ -2,13 +2,14 @@
 
 ## Current State (2026-02-18)
 
-The Lambda function `process-shard` is temporarily running on **x86_64 / py3.11**
-for testing. The target architecture is **arm64 / py3.12** (20% cheaper per GB-second).
+Both architectures now build on **py3.12** (manylinux_2_28). The target /
+production architecture is **arm64 / py3.12** (20% cheaper per GB-second);
+x86_64 / py3.12 is available for local/testing parity.
 
 ### Current Config
-- **Runtime**: python3.11
-- **Architecture**: x86_64
-- **Layer**: `xagg-dependencies:1` (x86_64, py3.11, h5coro==0.0.8)
+- **Runtime**: python3.12
+- **Architecture**: arm64 (default; x86_64 also supported)
+- **Layer**: `zagg-deps-{arch}` (py3.12, pyproj/odc-geo for rectilinear grids, h5coro==0.0.8)
 - **Function code**: `lambda_handler.py` + `zagg/` package + obstore/zarr/pydantic/pyyaml
 - **Role**: `zagg-lambda-execution` (scoped to `xagg` bucket)
 
@@ -193,11 +194,11 @@ Lambda limit: **250MB unzipped** (layer + function code combined)
 
 | Component | Current Size | Notes |
 |-----------|-------------|-------|
-| Layer (xagg-dependencies:1) | 222MB | x86_64/py3.11 |
-| Function code | 20MB | Without numcodecs |
-| **Total** | **242MB** | Under 250MB limit |
+| Layer (zagg-deps) | ~125MB | py3.12; pyproj/odc-geo in, earthaccess + redundant zarr/obstore out |
+| Function code | ~20MB | obstore/zarr/pydantic-zarr/pyyaml; without numcodecs |
+| **Total** | **~145MB** | Comfortably under 250MB limit |
 
-If the ARM64/py3.12 layer is larger, we may need to split into two layers or move some
+If a future dep pushes the layer larger, we may need to split into two layers or move some
 deps from the layer into the function code (or vice versa).
 
 ---
@@ -205,8 +206,7 @@ deps from the layer into the function code (or vice versa).
 ## Build Infrastructure
 
 ### Scripts
-- `deployment/aws/build_layer_v14.sh` — x86_64 layer build (runs in AL2023 Docker container)
-- `deployment/aws/build_arm64_layer.sh` — arm64 layer build (runs in manylinux Docker container)
+- `deployment/aws/build_layer.sh [x86_64|arm64]` — Lambda layer build (runs in an arch-matched Docker container)
 - `deployment/aws/build_function.sh` — function code build (handler + zagg + non-layer deps)
 
 ### CI/CD

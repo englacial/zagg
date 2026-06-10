@@ -61,9 +61,10 @@ class TestLoadPolygon:
         assert len(load_polygon(str(path))) == 1
 
     def test_feature_collection(self, tmp_path):
-        feat = lambda x: {"type": "Feature", "properties": {},
-                          "geometry": {"type": "Polygon",
-                                       "coordinates": [[[x, -70], [x + 10, -70], [x + 10, -80], [x, -80], [x, -70]]]}}
+        def feat(x):
+            ring = [[x, -70], [x + 10, -70], [x + 10, -80], [x, -80], [x, -70]]
+            return {"type": "Feature", "properties": {},
+                    "geometry": {"type": "Polygon", "coordinates": [ring]}}
         geojson = {"type": "FeatureCollection", "features": [feat(0), feat(20)]}
         path = tmp_path / "fc.geojson"
         self._write(geojson, path)

@@ -13,7 +13,8 @@ try:
 except ImportError:
     __version__ = "0.0.0+unknown"
 
-from .auth import get_edl_token, get_nsidc_s3_credentials
+import importlib
+
 from .config import (
     PipelineConfig,
     default_config,
@@ -30,9 +31,25 @@ from .processing import (
     process_shard,
     write_dataframe_to_zarr,
 )
-from .runner import agg
 from .schema import xdggs_spec, xdggs_zarr_template
 from .store import open_store, parse_s3_path
+
+# Lazy orchestrator-only re-exports. ``auth`` pulls earthaccess and ``runner``
+# pulls boto3 (and auth); importing them eagerly would force earthaccess into
+# the Lambda layer, which the worker never uses (it receives credentials in the
+# event). Accessing these attributes imports the backing module on demand.
+_LAZY = {
+    "agg": ".runner",
+    "get_edl_token": ".auth",
+    "get_nsidc_s3_credentials": ".auth",
+}
+
+
+def __getattr__(name):
+    if name in _LAZY:
+        mod = importlib.import_module(_LAZY[name], __name__)
+        return getattr(mod, name)
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
 
 __all__ = [
     "HealpixGrid",

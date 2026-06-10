@@ -98,7 +98,7 @@ For full-scale processing, `zagg` dispatches work to AWS Lambda. See
 [Lambda Deployment](deployment/lambda.md) for details. The short version:
 
 1. **AWS prerequisites**: IAM role with S3 + Lambda permissions, S3 bucket for output
-2. **Build**: `deployment/aws/build_function.sh` and `deployment/aws/build_arm64_layer.sh`
+2. **Build**: `deployment/aws/build_function.sh` and `deployment/aws/build_layer.sh`
 3. **Deploy**: `deployment/aws/deploy.sh`
 4. **Run**:
 ```bash

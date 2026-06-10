@@ -70,7 +70,7 @@ your own hosted zips.
 bash deployment/aws/build_function.sh
 
 # Build the dependency layer (ARM64)
-bash deployment/aws/build_arm64_layer.sh
+bash deployment/aws/build_layer.sh arm64
 
 # Deploy (updates an already-deployed function from CI artifacts)
 bash deployment/aws/deploy.sh

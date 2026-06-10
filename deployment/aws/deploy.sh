@@ -29,7 +29,7 @@ done
 
 case "$ARCH" in
     arm64)  RUNTIME="python3.12"; LAYER_NAME="zagg-deps-arm64" ;;
-    x86_64) RUNTIME="python3.11"; LAYER_NAME="zagg-deps-x86_64" ;;
+    x86_64) RUNTIME="python3.12"; LAYER_NAME="zagg-deps-x86_64" ;;
 esac
 
 echo "============================================================"
