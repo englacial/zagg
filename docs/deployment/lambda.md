@@ -41,7 +41,7 @@ The Lambda function processes a single morton cell (order 6) by:
 | `src/zagg/auth.py` | NASA Earthdata authentication helper |
 | `src/zagg/catalog.py` | CMR granule catalog builder |
 | `deployment/aws/invoke_lambda.py` | Orchestration script |
-| `deployment/aws/build_arm64_layer.sh` | ARM64 Lambda layer build script |
+| `deployment/aws/build_layer.sh` | Lambda layer build script (`x86_64`/`arm64`) |
 
 ## Event Payload
 

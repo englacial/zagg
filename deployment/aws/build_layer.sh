@@ -1,8 +1,13 @@
 #!/bin/bash
-# Build Lambda layer for xagg (single layer, under 250MB unzipped)
+# Build the zagg Lambda layer (single layer, under 250MB unzipped).
 #
 # Usage:
-#   ./build_layer_v14.sh [x86_64|arm64]
+#   ./build_layer.sh [x86_64|arm64]
+#
+# Runs inside an arch-matched manylinux_2_28 container (cp312) — see
+# .github/workflows/lambda-build.yml:
+#   x86_64 -> quay.io/pypa/manylinux_2_28_x86_64
+#   arm64  -> quay.io/pypa/manylinux_2_28_aarch64
 
 set -e
 
@@ -11,50 +16,51 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 OUTPUT_DIR="${SCRIPT_DIR}/layer_build"
 ZIP_NAME="lambda_layer_${ARCH}.zip"
 
-# Find Python 3.11
-if command -v python3.11 &> /dev/null; then
-    PYTHON=python3.11
-    PIP="python3.11 -m pip"
-elif python3 -c "import sys; sys.exit(0 if sys.version_info[:2] == (3,11) else 1)" 2>/dev/null; then
-    PYTHON=python3
-    PIP=pip
-else
-    echo "ERROR: Python 3.11 required"
-    exit 1
-fi
-PYTHON_VERSION=$($PYTHON -c "import sys; print(f'{sys.version_info.major}.{sys.version_info.minor}')")
+# Both arches target the Python 3.12 Lambda runtime (AL2023, glibc 2.34), which
+# is compatible with the manylinux_2_28 wheels of geo deps like pyproj. Build in
+# a manylinux_2_28 image (cp312 at /opt/python/cp312-cp312) for both.
+PYTHON=$(command -v python3.12 || echo /opt/python/cp312-cp312/bin/python)
+PIP="$PYTHON -m pip"
+PYVER=$($PYTHON -c "import sys; print(f'{sys.version_info.major}.{sys.version_info.minor}')")
 
-# Check architecture matches
+# Sanity: machine arch must match the requested layer arch.
 MACHINE_ARCH=$(uname -m)
 if [[ "$ARCH" == "arm64" && "$MACHINE_ARCH" != "aarch64" ]]; then
-    echo "ERROR: Building arm64 layer on $MACHINE_ARCH machine"
-    exit 1
+    echo "ERROR: building arm64 layer on $MACHINE_ARCH machine"; exit 1
 fi
 if [[ "$ARCH" == "x86_64" && "$MACHINE_ARCH" != "x86_64" ]]; then
-    echo "ERROR: Building x86_64 layer on $MACHINE_ARCH machine"
-    exit 1
+    echo "ERROR: building x86_64 layer on $MACHINE_ARCH machine"; exit 1
 fi
 
 echo "============================================================"
-echo "Building Lambda layer for ${ARCH}"
-echo "Python: ${PYTHON_VERSION}, Machine: ${MACHINE_ARCH}"
+echo "Building Lambda layer for ${ARCH} (Python ${PYVER}, machine ${MACHINE_ARCH})"
 echo "============================================================"
 
-# Clean previous build
 rm -rf "$OUTPUT_DIR"
 mkdir -p "$OUTPUT_DIR/python"
 
-# Create constraints file to prevent numpy upgrade
 CONSTRAINTS="$OUTPUT_DIR/constraints.txt"
 echo "numpy<2.3" > "$CONSTRAINTS"
 
-# Install all packages with numpy constraint
-# Pin pandas and h5coro to known working versions
-echo "Installing packages with numpy<2.3 constraint..."
+# numpy: arm64 Lambda requires 64KB page alignment, so build from source with
+# the right LDFLAGS; x86_64 uses the prebuilt wheel.
+echo "Installing numpy..."
+if [[ "$ARCH" == "arm64" ]]; then
+    export LDFLAGS="-Wl,-z,max-page-size=0x10000"
+    export NPY_BLAS_ORDER=openblas
+    $PIP install "numpy==2.2.6" --no-binary numpy -t "$OUTPUT_DIR/python" --no-cache-dir
+else
+    $PIP install "numpy>=2.0,<2.3" -t "$OUTPUT_DIR/python" --no-cache-dir
+fi
+
+# Core processing deps. pyproj + odc-geo (and affine/cachetools) are required:
+# zagg.grids imports odc.geo at module load, and rectilinear assign reprojects
+# lat/lon -> grid CRS at processing time. zarr/obstore/pydantic-zarr are NOT
+# here -- they are function-level deps installed by build_function.sh.
+echo "Installing processing deps..."
 $PIP install \
-    "numpy>=2.0,<2.3" \
     "pandas==2.2.3" fastparquet cramjam \
-    earthaccess shapely \
+    shapely pyproj odc-geo affine cachetools \
     -c "$CONSTRAINTS" \
     -t "$OUTPUT_DIR/python" \
     --no-cache-dir
@@ -62,67 +68,57 @@ $PIP install \
 echo "Installing h5coro and mortie (--no-deps)..."
 $PIP install "h5coro==0.0.8" mortie --no-deps -t "$OUTPUT_DIR/python" --no-cache-dir
 
-# Verify numpy version
+# Verify numpy stayed < 2.3
 NUMPY_VERSION=$(ls "$OUTPUT_DIR/python" | grep -E "^numpy-" | head -1)
 echo "Installed: $NUMPY_VERSION"
 if [[ "$NUMPY_VERSION" == *"2.3"* ]]; then
-    echo "ERROR: numpy 2.3.x installed - this breaks Lambda!"
-    exit 1
+    echo "ERROR: numpy 2.3.x installed - this breaks Lambda!"; exit 1
 fi
 
-# Remove bloat
+# Remove bloat. pyproj is intentionally NOT stripped (rectilinear/odc-geo assign
+# needs it); pyarrow stays stripped (catalog fetch/build only, never the
+# processing path).
 echo "Removing bloat..."
 rm -rf "$OUTPUT_DIR/python"/pyarrow* \
-       "$OUTPUT_DIR/python"/pyproj* \
        "$OUTPUT_DIR/python"/xarray* \
        "$OUTPUT_DIR/python"/matplotlib* \
        "$OUTPUT_DIR/python"/lonboard* \
        "$OUTPUT_DIR/python"/boto3* \
        "$OUTPUT_DIR/python"/botocore* 2>/dev/null || true
 
-# Clean up caches and tests
+# Clean caches/tests and strip debug symbols.
 find "$OUTPUT_DIR/python" -type d -name "__pycache__" -exec rm -rf {} + 2>/dev/null || true
 find "$OUTPUT_DIR/python" -type d -name "tests" -exec rm -rf {} + 2>/dev/null || true
 find "$OUTPUT_DIR/python" -type d -name "test" -exec rm -rf {} + 2>/dev/null || true
 find "$OUTPUT_DIR/python" -name "*.pyc" -delete 2>/dev/null || true
 find "$OUTPUT_DIR/python" -name "*.pyo" -delete 2>/dev/null || true
-
-# Strip debug symbols from shared libraries
 echo "Stripping binaries..."
 find "$OUTPUT_DIR/python" -name "*.so" -exec strip {} \; 2>/dev/null || true
 
-# Report unzipped size
+# Report unzipped size and enforce the 250MB Lambda limit.
 UNZIPPED_SIZE=$(du -sh "$OUTPUT_DIR/python" | cut -f1)
 UNZIPPED_BYTES=$(du -sb "$OUTPUT_DIR/python" | cut -f1)
 echo ""
 echo "Unzipped size: ${UNZIPPED_SIZE} (${UNZIPPED_BYTES} bytes)"
-
 if [ "$UNZIPPED_BYTES" -gt 262144000 ]; then
-    echo "ERROR: Exceeds 250MB Lambda limit!"
-    exit 1
+    echo "ERROR: Exceeds 250MB Lambda limit!"; exit 1
 fi
 
 # Create zip
 mkdir -p "${SCRIPT_DIR}/../layers"
-echo ""
 echo "Creating ${ZIP_NAME}..."
 cd "$OUTPUT_DIR"
 zip -r9q "${SCRIPT_DIR}/../layers/${ZIP_NAME}" python
 cd "$SCRIPT_DIR"
 
-# Report final sizes
 ZIPPED_SIZE=$(du -h "../layers/${ZIP_NAME}" | cut -f1)
-ZIPPED_BYTES=$(stat -c%s "../layers/${ZIP_NAME}" 2>/dev/null || stat -f%z "../layers/${ZIP_NAME}")
-
 echo ""
 echo "============================================================"
 echo "Build complete!"
-echo "============================================================"
 echo "  Arch:     ${ARCH}"
-echo "  Zipped:   ${ZIPPED_SIZE} (${ZIPPED_BYTES} bytes)"
+echo "  Zipped:   ${ZIPPED_SIZE}"
 echo "  Unzipped: ${UNZIPPED_SIZE}"
-echo ""
+echo "============================================================"
 ls -lh "${SCRIPT_DIR}/../layers/${ZIP_NAME}"
 
-# Cleanup build dir
 rm -rf "$OUTPUT_DIR"

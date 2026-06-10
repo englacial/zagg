@@ -58,7 +58,6 @@ Parameters:
 
 Conditions:
   ShouldCreateBucket: !Equals [!Ref CreateOutputBucket, "true"]
-  IsArm: !Equals [!Ref Architecture, arm64]
 
 Resources:
   OutputBucket:
@@ -107,14 +106,14 @@ Resources:
         S3Key: !Ref LayerS3Key
       CompatibleArchitectures: [!Ref Architecture]
       CompatibleRuntimes:
-        - !If [IsArm, python3.12, python3.11]
+        - python3.12
 
   ProcessFn:
     Type: AWS::Lambda::Function
     Properties:
       FunctionName: !Ref FunctionName
       Handler: lambda_handler.lambda_handler
-      Runtime: !If [IsArm, python3.12, python3.11]
+      Runtime: python3.12
       Architectures: [!Ref Architecture]
       MemorySize: !Ref MemorySize
       Timeout: !Ref Timeout

@@ -27,7 +27,7 @@ STAGING_BUCKET="${STAGING_BUCKET:-$OUTPUT_BUCKET}"   # where the zips are upload
 
 case "$ARCH" in
     arm64)  LAYER_ZIP="lambda_layer_arm64.zip";  FUNC_ZIP="lambda_function_arm64_py312.zip" ;;
-    x86_64) LAYER_ZIP="lambda_layer_x86_64.zip"; FUNC_ZIP="lambda_function_x86_64_py311.zip" ;;
+    x86_64) LAYER_ZIP="lambda_layer_x86_64.zip"; FUNC_ZIP="lambda_function_x86_64_py312.zip" ;;
     *) echo "ERROR: ARCH must be arm64 or x86_64 (got '$ARCH')"; exit 1 ;;
 esac
 
