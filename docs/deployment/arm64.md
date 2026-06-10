@@ -80,7 +80,7 @@ import sys
 sys.path.insert(0, \"/opt/python\")
 import numpy; print(f\"numpy {numpy.__version__}\")
 import pandas; print(f\"pandas {pandas.__version__}\")
-import healpy; print(f\"healpy {healpy.__version__}\")
+import pyproj; print(f\"pyproj {pyproj.__version__}\")
 import zarr; print(f\"zarr {zarr.__version__}\")
 import pydantic_zarr; print(\"pydantic_zarr OK\")
 import obstore; print(\"obstore OK\")
@@ -96,9 +96,6 @@ print(\"All imports successful!\")
 !!! danger "ELF load command address/offset not properly aligned"
     NumPy wasn't built with 64KB page alignment. Lambda ARM64 requires page alignment of 64KB (0x10000), but pre-built wheels use 4KB. The build script handles this with `LDFLAGS="-Wl,-z,max-page-size=0x10000"` and `--no-binary numpy`.
 
-!!! warning "healpy build fails"
-    Ensure you're using `manylinux_2_28_aarch64` (has GCC ≥9.3). The Lambda container's GCC is too old.
-
 !!! warning "GLIBC_2.XX not found"
     Your build container has a newer glibc than Lambda. Use `manylinux_2_28` (glibc 2.28) which is compatible with Lambda's glibc 2.34.
 
@@ -112,5 +109,4 @@ print(\"All imports successful!\")
 | Lambda container has GCC 7.3 | manylinux_2_28 has GCC ≥9.3 |
 | Ubuntu has glibc 2.39 | manylinux_2_28 has glibc 2.28 |
 | x86 runners need QEMU for ARM | Mac runs ARM natively |
-| healpy has no ARM wheels | Build from source with proper toolchain |
 | NumPy wheels have 4KB page alignment | Build from source with 64KB alignment |

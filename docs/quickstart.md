@@ -49,14 +49,15 @@ of the above is configured.
 
 ## Building a Catalog
 
-The catalog step queries NASA's CMR API (public, no auth needed) and builds a
-morton-cell-to-granule mapping:
+The catalog step queries NASA's CMR-STAC (public, no auth needed) and builds a
+shard-to-granule mapping for the grid in your config:
 
 ```bash
-uv run python -m zagg.catalog --cycle 22 --parent-order 6
+uv run python -m zagg.catalog --config atl06.yaml --short-name ATL06 --cycle 22 \
+    --polygon antarctica.geojson
 ```
 
-This produces a JSON file (e.g., `catalog_ATL06_cycle22_order6.json`) that maps
+This produces a JSON file (e.g., `shardmap_ATL06_2024-01-06_2024-04-07.json`) that maps
 parent morton cells to the S3 URLs of HDF5 granules containing data for those
 cells. The processing step consumes this file.
 

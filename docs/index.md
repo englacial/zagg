@@ -24,19 +24,22 @@ The library is organized into six modules:
 
 ### 1. Build a granule catalog
 
+The grid comes from the pipeline config (`--config`):
+
 ```bash
 # ICESat-2 cycle (convenience):
-uv run python -m zagg.catalog --cycle 22 --parent-order 6
+uv run python -m zagg.catalog --config atl06.yaml --short-name ATL06 --cycle 22 \
+    --polygon my_region.geojson
 
 # Date range, bbox-filtered to everything south of 60°S:
-uv run python -m zagg.catalog \
+uv run python -m zagg.catalog --config atl06.yaml --short-name ATL06 \
     --start-date 2024-01-06 --end-date 2024-04-07 \
-    --bbox -180,-90,180,-60 --parent-order 6
+    --bbox=-180,-90,180,-60
 
 # Custom region via GeoJSON polygon:
-uv run python -m zagg.catalog \
+uv run python -m zagg.catalog --config atl06.yaml --short-name ATL06 \
     --start-date 2024-01-01 --end-date 2024-06-01 \
-    --polygon my_region.geojson --parent-order 6
+    --polygon my_region.geojson
 ```
 
 See [Catalog API](api/catalog.md) for full options.

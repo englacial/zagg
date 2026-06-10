@@ -260,3 +260,22 @@ class TestNesting:
         from zagg.grids import HealpixGrid
 
         assert not grid.nests_with(HealpixGrid(6, 12, layout="fullsphere"))
+
+
+class TestValidateCompatible:
+    def test_compatible_pass(self, cfg):
+        from zagg.grids import validate_compatible
+
+        validate_compatible([_grid(cfg, 5000, (256, 256)), _grid(cfg, 10000, (320, 320))])
+
+    def test_single_grid_ok(self, grid):
+        from zagg.grids import validate_compatible
+
+        validate_compatible([grid])
+
+    def test_cross_family_raises(self, cfg):
+        from zagg.grids import HealpixGrid, validate_compatible
+
+        with pytest.raises(ValueError, match="do not nest"):
+            validate_compatible([_grid(cfg, 5000, (256, 256)),
+                                 HealpixGrid(6, 12, layout="fullsphere")])
