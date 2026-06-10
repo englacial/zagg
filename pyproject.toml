@@ -51,10 +51,13 @@ lambda = [
 # out of core so the Lambda layer build (which doesn't run fetch/build) stays
 # lean and the arm64 wheel gap doesn't break Lambda packaging.
 #
-# spherely is pinned to the fork carrying the S2 SpatialIndex (exact, ~25x over
-# the brute path) until it is upstreamed (benbovy/spherely#118).
+# spherely is the fork build carrying the S2 SpatialIndex (exact, ~25x over the
+# brute path), hosted as a GitHub release asset until upstreamed
+# (benbovy/spherely#118). NOTE: this is a direct-URL pin for cp312/linux-x86_64
+# only (Option A). A find-links index that resolves per platform/pyver is the
+# eventual fix; see englacial/zagg#24.
 catalog = [
-    "spherely @ git+https://github.com/espg/spherely@feature/spatial-index",
+    "spherely @ https://github.com/espg/spherely/releases/download/v0.1.1-spatialindex/spherely-0.1.1%2Bspatialindex-cp312-cp312-manylinux_2_27_x86_64.manylinux_2_28_x86_64.whl",
     "stac-geoparquet>=0.7.0",
 ]
 analysis = [
