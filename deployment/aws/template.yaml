@@ -1,9 +1,14 @@
 AWSTemplateFormatVersion: "2010-09-09"
 Description: >-
-  zagg serverless backend — IAM execution role, dependency layer, and the
-  process-shard Lambda function. Layer and function code are pulled from a
-  same-region S3 bucket (ArtifactBucket); use stand_up.sh to populate it from a
-  GitHub Release, or point it at your own copy of the zips.
+  zagg serverless backend — Lambda execution role, dependency layer, and the
+  process-shard Lambda function. By default the stack creates its own execution
+  role (self-contained, clean teardown — the path for self-hosters who admin
+  their own account). In IAM-constrained accounts (e.g. an SSO power-user that
+  lacks iam:CreateRole), set CreateExecutionRole=false and pass an admin-created
+  role via ExecutionRoleArn — see execution_role.yaml / EXECUTION_ROLE.md.
+  Layer and function code are pulled from a same-region S3 bucket
+  (ArtifactBucket); use stand_up.sh to populate it from a GitHub Release, or
+  point it at your own copy of the zips.
 
 Parameters:
   FunctionName:
@@ -36,15 +41,34 @@ Parameters:
   OutputBucketName:
     Type: String
     Description: >-
-      Bucket where results (parquet/zarr) are written. The execution role is
-      scoped to this bucket. Set CreateOutputBucket=true to have the stack
-      create it; otherwise it must already exist and be writable by you.
+      Bucket where results (parquet/zarr) are written. A stack-created execution
+      role is scoped to this bucket. Set CreateOutputBucket=true to have the
+      stack create it; otherwise it must already exist and be writable by the
+      execution role.
 
   CreateOutputBucket:
     Type: String
     Default: "false"
     AllowedValues: ["true", "false"]
     Description: Whether to create OutputBucketName as part of this stack.
+
+  CreateExecutionRole:
+    Type: String
+    Default: "true"
+    AllowedValues: ["true", "false"]
+    Description: >-
+      Whether the stack creates the Lambda execution role (needs iam:CreateRole).
+      Set to false in IAM-constrained accounts and supply ExecutionRoleArn
+      instead.
+
+  ExecutionRoleArn:
+    Type: String
+    Default: ""
+    Description: >-
+      ARN of a pre-existing Lambda execution role to use when
+      CreateExecutionRole=false. Must trust lambda.amazonaws.com and allow
+      CloudWatch Logs + write to OutputBucketName. Ignored when
+      CreateExecutionRole=true.
 
   MemorySize:
     Type: Number
@@ -58,6 +82,7 @@ Parameters:
 
 Conditions:
   ShouldCreateBucket: !Equals [!Ref CreateOutputBucket, "true"]
+  ShouldCreateRole: !Equals [!Ref CreateExecutionRole, "true"]
 
 Resources:
   OutputBucket:
@@ -68,6 +93,7 @@ Resources:
 
   ExecutionRole:
     Type: AWS::IAM::Role
+    Condition: ShouldCreateRole
     Properties:
       AssumeRolePolicyDocument:
         Version: "2012-10-17"
@@ -117,7 +143,7 @@ Resources:
       Architectures: [!Ref Architecture]
       MemorySize: !Ref MemorySize
       Timeout: !Ref Timeout
-      Role: !GetAtt ExecutionRole.Arn
+      Role: !If [ShouldCreateRole, !GetAtt ExecutionRole.Arn, !Ref ExecutionRoleArn]
       Layers: [!Ref DepsLayer]
       Code:
         S3Bucket: !Ref ArtifactBucket
@@ -134,8 +160,8 @@ Outputs:
     Description: ARN of the published dependency layer version.
     Value: !Ref DepsLayer
   RoleArn:
-    Description: ARN of the Lambda execution role.
-    Value: !GetAtt ExecutionRole.Arn
+    Description: ARN of the Lambda execution role (created or supplied).
+    Value: !If [ShouldCreateRole, !GetAtt ExecutionRole.Arn, !Ref ExecutionRoleArn]
   OutputBucket:
     Description: Bucket where results are written.
     Value: !Ref OutputBucketName
