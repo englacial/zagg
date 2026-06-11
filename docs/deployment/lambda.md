@@ -109,19 +109,27 @@ function in one stack:
 OUTPUT_BUCKET=my-results-bucket bash deployment/aws/stand_up.sh
 ```
 
-`stand_up.sh` downloads the pre-built layer/function zips from the latest GitHub
-Release, stages them in a same-region S3 bucket (CloudFormation requires Lambda
-code to live in a same-region bucket), and deploys `deployment/aws/template.yaml`.
-Useful overrides (environment variables):
+The Lambda code (deps layer + function zips) lives on the public **source.coop
+mirror** (`s3://us-west-2.opendata.source.coop/englacial/zagg/lambda/<minor>/`),
+keyed by zagg minor version (`0.N.x` → `0.N`). CloudFormation reads Lambda code
+from a same-region bucket, so in **us-west-2** `stand_up.sh` points the stack
+straight at the mirror (no staging bucket needed); in **other regions** it copies
+the zips from the mirror into a `STAGING_BUCKET` you own first. It then deploys
+`deployment/aws/template.yaml`. Useful overrides (environment variables):
 
 | Variable | Default | Purpose |
 |----------|---------|---------|
 | `OUTPUT_BUCKET` | *(required)* | Bucket for results; role is scoped to it |
 | `CREATE_BUCKET` | `false` | `true` makes the stack create `OUTPUT_BUCKET` |
-| `ARCH` | `arm64` | `arm64` (py3.12) or `x86_64` (py3.11) |
+| `ARCH` | `arm64` | `arm64` or `x86_64` (both py3.12) |
 | `REGION` | `us-west-2` | Deployment region |
+| `STAGING_BUCKET` | *(none)* | Required outside us-west-2: your same-region bucket the mirror zips are copied into |
+| `LAMBDA_VERSION` | *(derived)* | Lambda minor to deploy (default: the repo's latest git tag, else the installed zagg) |
 | `STACK_NAME` | `zagg-backend` | CloudFormation stack name |
-| `RELEASE_TAG` / `ARTIFACT_BASE_URL` | `latest` | Where to fetch the zips from |
+| `MIRROR_BUCKET` / `MIRROR_PREFIX` | source.coop | Override to self-host the artifact mirror |
+
+Maintainers (re)populate the mirror after a release with
+`deployment/aws/publish_mirror.sh <minor>`.
 
 Tear down with `aws cloudformation delete-stack --stack-name zagg-backend`.
 

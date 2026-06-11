@@ -59,13 +59,17 @@ release zips:
 
 ```bash
 OUTPUT_BUCKET=my-results-bucket bash deployment/aws/stand_up.sh
-# don't have a bucket yet? add CREATE_BUCKET=true (and REGION=... if not us-west-2)
+# don't have the results bucket yet? add CREATE_BUCKET=true
+# deploying outside us-west-2? add REGION=... STAGING_BUCKET=a-bucket-you-own-in-that-region
 ```
 
-This pulls the layer/function zips from the latest GitHub Release and deploys
-[`deployment/aws/template.yaml`](deployment/aws/template.yaml). Override
-`ARCH`, `RELEASE_TAG`, or `ARTIFACT_BASE_URL` to use a different architecture or
-your own hosted zips.
+In **us-west-2** the stack reads the Lambda code straight from the public
+source.coop mirror — no staging bucket of your own needed. Outside us-west-2,
+CloudFormation requires the code in a same-region bucket, so pass a
+`STAGING_BUCKET` you own and the zips are copied there from the mirror first.
+Deploys [`deployment/aws/template.yaml`](deployment/aws/template.yaml); the
+artifacts are keyed by zagg minor version (derive from your install, or pin with
+`LAMBDA_VERSION=0.N`). Override `ARCH` for x86_64.
 
 **Build from source** (maintainers, or to customize the layer):
 

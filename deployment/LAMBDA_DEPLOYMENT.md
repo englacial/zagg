@@ -35,9 +35,20 @@ layer, and function as a single stack from the pre-built release zips:
 OUTPUT_BUCKET=my-results-bucket bash deployment/aws/stand_up.sh
 ```
 
-`stand_up.sh` downloads the layer/function zips from the latest GitHub Release
-(published by the `publish-release-assets` job in `lambda-build.yml`), stages
-them in a same-region S3 bucket, and runs `aws cloudformation deploy`. See
+The Lambda code (deps layer + function zips) lives on the public **source.coop
+mirror** (`s3://us-west-2.opendata.source.coop/englacial/zagg/lambda/<minor>/`),
+keyed by zagg minor version. CloudFormation reads Lambda code from a same-region
+bucket, so:
+
+- **us-west-2** — `stand_up.sh` points the stack straight at the mirror; no
+  staging bucket of your own is needed.
+- **other regions** — pass `STAGING_BUCKET` (a bucket you own in `REGION`); the
+  zips are copied into it from the mirror, then the stack reads them there.
+
+It then runs `aws cloudformation deploy`. The minor is read from the repo's
+latest git tag (so a clone needs no install), or the installed zagg, unless
+`LAMBDA_VERSION` is set. To (re)populate the mirror after a release,
+maintainers run `deployment/aws/publish_mirror.sh <minor>`. See
 [docs/deployment/lambda.md](../docs/deployment/lambda.md) for the parameter
 table and overrides.
 
