@@ -26,6 +26,8 @@ from zagg.config import (
     get_child_order,
     get_driver,
     get_layout,
+    get_output_endpoint_url,
+    get_output_region,
     get_parent_order,
     get_store_path,
 )
@@ -60,6 +62,8 @@ def agg(
     dry_run: bool = False,
     function_name: str | None = None,
     region: str = "us-west-2",
+    output_credentials: dict | None = None,
+    output_endpoint_url: str | None = None,
 ) -> dict:
     """Run the aggregation pipeline.
 
@@ -93,6 +97,16 @@ def agg(
         or ``"process-shard"``. Only used with ``backend="lambda"``.
     region : str
         AWS region for S3 and Lambda. Default ``"us-west-2"``.
+    output_credentials : dict, optional
+        Explicit credentials for writing the output store (camelCase
+        ``accessKeyId``/``secretAccessKey``/``sessionToken``). Omit to use
+        the ambient credential chain / execution role (writes to in-account
+        buckets, unchanged behavior). Supply to write an external or
+        S3-compatible target (e.g. source.coop). Runtime-only -- never read
+        from config.
+    output_endpoint_url : str, optional
+        Custom S3-compatible endpoint for the output store (e.g. R2, MinIO).
+        Overrides ``output.endpoint_url`` in the config.
 
     Returns
     -------
@@ -114,6 +128,12 @@ def agg(
     # Resolve driver: kwarg > config > default
     resolved_driver = driver or get_driver(config)
 
+    # Output endpoint/region are non-secret: runtime kwarg > config.
+    resolved_endpoint = output_endpoint_url or get_output_endpoint_url(config)
+    config_region = get_output_region(config)
+    if config_region and region == "us-west-2":
+        region = config_region
+
     # Load catalog and determine cell count for worker capping
     catalog_data = _load_catalog(catalog_path)
     n_cells = len(_select_cells(
@@ -129,6 +149,8 @@ def agg(
             max_cells=max_cells, morton_cell=morton_cell,
             max_workers=max_workers, overwrite=overwrite,
             dry_run=dry_run, region=region, driver=resolved_driver,
+            output_credentials=output_credentials,
+            output_endpoint_url=resolved_endpoint,
         )
     elif backend == "lambda":
         if max_workers is None:
@@ -144,6 +166,8 @@ def agg(
             max_workers=max_workers, overwrite=overwrite,
             dry_run=dry_run, region=region,
             function_name=function_name,
+            output_credentials=output_credentials,
+            output_endpoint_url=resolved_endpoint,
         )
     else:
         raise ValueError(f"Unknown backend: {backend!r} (expected 'local' or 'lambda')")
@@ -266,7 +290,7 @@ def _process_and_write(shard_key, chunk_idx, records, grid,
 
 def _run_local(config, catalog_data, store_path, child_order, *,
                max_cells, morton_cell, max_workers, overwrite, dry_run, region,
-               driver="s3"):
+               driver="s3", output_credentials=None, output_endpoint_url=None):
     """Run processing locally with ThreadPoolExecutor."""
     all_shards = list(catalog_data["shard_keys"])
 
@@ -293,7 +317,10 @@ def _run_local(config, catalog_data, store_path, child_order, *,
     else:
         grid = from_config(config)
     _check_signature(grid, catalog_data)
-    zarr_store = open_store(store_path, region=region)
+    zarr_store = open_store(
+        store_path, region=region,
+        credentials=output_credentials, endpoint_url=output_endpoint_url,
+    )
     zarr_store = grid.emit_template(zarr_store, overwrite=overwrite)
 
     start_time = time.time()
@@ -350,7 +377,8 @@ def _run_local(config, catalog_data, store_path, child_order, *,
 
 def _run_lambda(config, catalog_data, store_path, child_order, *,
                 max_cells, morton_cell, max_workers, overwrite, dry_run,
-                region, function_name):
+                region, function_name,
+                output_credentials=None, output_endpoint_url=None):
     """Run processing via AWS Lambda invocation."""
     from dataclasses import asdict
 
@@ -385,6 +413,12 @@ def _run_lambda(config, catalog_data, store_path, child_order, *,
     _check_signature(grid, catalog_data)
     config_dict = asdict(config)
 
+    # Build the optional output_credentials event block (write side, symmetric
+    # to s3_credentials on the read side). None -> execution-role writes.
+    output_creds_event = _build_output_creds_event(
+        output_credentials, output_endpoint_url, region,
+    )
+
     # Configure boto3 client (created early so we can use it for setup/finalize)
     boto_config = Config(
         read_timeout=900,
@@ -405,6 +439,7 @@ def _run_lambda(config, catalog_data, store_path, child_order, *,
         parent_order=parent_order, child_order=child_order,
         n_parent_cells=len(all_shards) if grid_type == "healpix" and layout == "dense" else None,
         overwrite=overwrite, config_dict=config_dict,
+        output_creds_event=output_creds_event,
     )
 
     start_time = time.time()
@@ -423,6 +458,7 @@ def _run_lambda(config, catalog_data, store_path, child_order, *,
                 _resolve_urls(records, "s3"), store_path, s3_creds,
                 function_name=function_name,
                 config_dict=config_dict,
+                output_creds_event=output_creds_event,
             ): shard_key
             for shard_key, records in cells
         }
@@ -448,7 +484,8 @@ def _run_lambda(config, catalog_data, store_path, child_order, *,
 
     # Consolidate metadata via Lambda (same rationale as setup -- avoids
     # requiring orchestrator-side S3 access).
-    _invoke_lambda_finalize(lambda_client, function_name, store_path)
+    _invoke_lambda_finalize(lambda_client, function_name, store_path,
+                            output_creds_event=output_creds_event)
     wall_time = time.time() - start_time
 
     # Cost estimate: arm64 pricing = $0.0000133334/GB-second
@@ -477,9 +514,30 @@ def _run_lambda(config, catalog_data, store_path, child_order, *,
     return summary
 
 
+def _build_output_creds_event(credentials, endpoint_url, region):
+    """Build the optional ``output_credentials`` event block, or None.
+
+    Normalizes runtime credentials + non-secret endpoint/region into the
+    camelCase event shape the handler expects. Returns ``None`` when no
+    explicit credentials are supplied (execution-role writes, unchanged).
+    """
+    if not credentials:
+        return None
+    block = {
+        "accessKeyId": credentials["accessKeyId"],
+        "secretAccessKey": credentials["secretAccessKey"],
+        "region": credentials.get("region", region),
+    }
+    if credentials.get("sessionToken"):
+        block["sessionToken"] = credentials["sessionToken"]
+    if endpoint_url:
+        block["endpointUrl"] = endpoint_url
+    return block
+
+
 def _invoke_lambda_setup(lambda_client, function_name, store_path, *,
                          parent_order, child_order, n_parent_cells,
-                         overwrite, config_dict):
+                         overwrite, config_dict, output_creds_event=None):
     """Invoke Lambda in setup mode to create the zarr template."""
     event = {
         "mode": "setup",
@@ -490,6 +548,8 @@ def _invoke_lambda_setup(lambda_client, function_name, store_path, *,
         "overwrite": overwrite,
         "config": config_dict,
     }
+    if output_creds_event is not None:
+        event["output_credentials"] = output_creds_event
     response = lambda_client.invoke(
         FunctionName=function_name,
         InvocationType="RequestResponse",
@@ -503,9 +563,12 @@ def _invoke_lambda_setup(lambda_client, function_name, store_path, *,
         raise RuntimeError(f"Lambda setup error: {result.get('body')}")
 
 
-def _invoke_lambda_finalize(lambda_client, function_name, store_path):
+def _invoke_lambda_finalize(lambda_client, function_name, store_path,
+                            output_creds_event=None):
     """Invoke Lambda in finalize mode to consolidate zarr metadata."""
     event = {"mode": "finalize", "store_path": store_path}
+    if output_creds_event is not None:
+        event["output_credentials"] = output_creds_event
     response = lambda_client.invoke(
         FunctionName=function_name,
         InvocationType="RequestResponse",
@@ -522,7 +585,7 @@ def _invoke_lambda_finalize(lambda_client, function_name, store_path):
 def _invoke_lambda_cell(
     lambda_client, chunk_idx, parent_morton, parent_order, child_order,
     granule_urls, store_path, s3_credentials, *,
-    function_name, config_dict, max_retries=3,
+    function_name, config_dict, output_creds_event=None, max_retries=3,
 ):
     """Invoke Lambda for a single cell with retry logic."""
     wall_start = time.time()
@@ -542,6 +605,8 @@ def _invoke_lambda_cell(
     }
     if config_dict is not None:
         event["config"] = config_dict
+    if output_creds_event is not None:
+        event["output_credentials"] = output_creds_event
 
     last_error = None
     for attempt in range(max_retries):

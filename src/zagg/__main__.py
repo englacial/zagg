@@ -8,6 +8,7 @@ Usage:
 """
 
 import argparse
+import json
 import logging
 import os
 
@@ -41,6 +42,12 @@ examples:
     parser.add_argument("--dry-run", action="store_true", help="Show what would be processed")
     parser.add_argument("--region", default="us-west-2", help="AWS region (default: us-west-2)")
     parser.add_argument(
+        "--output-creds", default=None, metavar="PATH",
+        help="Path to a JSON file with credentials for writing the output store "
+             "(keys: accessKeyId, secretAccessKey, optional sessionToken/"
+             "endpointUrl/region). Omit to use the ambient/execution-role creds.",
+    )
+    parser.add_argument(
         "--function-name",
         default=os.environ.get("ZAGG_LAMBDA_FUNCTION_NAME", "process-shard"),
         help="Lambda function name (default: env ZAGG_LAMBDA_FUNCTION_NAME or 'process-shard')",
@@ -50,6 +57,14 @@ examples:
     logging.basicConfig(level=logging.INFO, format="%(message)s")
 
     config = load_config(args.config)
+
+    # Load output credentials from a JSON file (kept out of shell history).
+    output_credentials = None
+    output_endpoint_url = None
+    if args.output_creds:
+        with open(args.output_creds) as f:
+            output_credentials = json.load(f)
+        output_endpoint_url = output_credentials.get("endpointUrl")
 
     results = agg(
         config,
@@ -64,6 +79,8 @@ examples:
         dry_run=args.dry_run,
         function_name=args.function_name,
         region=args.region,
+        output_credentials=output_credentials,
+        output_endpoint_url=output_endpoint_url,
     )
 
     if args.dry_run:
