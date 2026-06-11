@@ -11,10 +11,17 @@ Event payload (default / process mode):
     "child_order": int,
     "granule_urls": [str, ...],
     "store_path": str,          # e.g. "s3://bucket/prefix.zarr"
-    "s3_credentials": {
+    "s3_credentials": {         # creds for reading NSIDC source data
         "accessKeyId": str,
         "secretAccessKey": str,
         "sessionToken": str
+    },
+    "output_credentials": {     # OPTIONAL -- creds for writing the output store;
+        "accessKeyId": str,     #   omit to use the execution role (in-account).
+        "secretAccessKey": str, #   Supply to write an external/S3-compatible
+        "sessionToken": str,    #   target (e.g. source.coop). sessionToken,
+        "endpointUrl": str,     #   endpointUrl, and region are optional.
+        "region": str
     },
     "config": dict (optional, pipeline config as dict)
 }
@@ -28,12 +35,14 @@ Setup mode (creates the zarr template once before per-cell fan-out):
     "n_parent_cells": int,
     "overwrite": bool,
     "config": dict,
+    "output_credentials": dict (optional, same shape as process mode),
 }
 
 Finalize mode (consolidates zarr metadata after all cells complete):
 {
     "mode": "finalize",
     "store_path": str,
+    "output_credentials": dict (optional, same shape as process mode),
 }
 
 Setup and finalize exist so callers without direct S3 write access to the
@@ -54,6 +63,43 @@ from zagg.store import open_store
 # Set up structured logging
 logger = logging.getLogger()
 logger.setLevel(logging.INFO)
+
+
+def _output_store_kwargs(event: Dict[str, Any]) -> Dict[str, Any]:
+    """Resolve open_store kwargs for the output store from an event.
+
+    Symmetric to the read side: an optional ``output_credentials`` block
+    (camelCase ``accessKeyId``/``secretAccessKey``/``sessionToken``, plus
+    optional ``endpointUrl``/``region``) injects explicit write credentials.
+    When absent, falls back to the execution role and the AWS region env var.
+
+    Returns
+    -------
+    dict
+        Keyword arguments for ``open_store`` (always includes ``region``;
+        ``credentials`` and ``endpoint_url`` only when supplied).
+
+    Raises
+    ------
+    ValueError
+        If ``output_credentials`` is present but missing required keys.
+    """
+    region = os.environ.get("AWS_REGION", "us-west-2")
+    creds = event.get("output_credentials")
+    if not creds:
+        return {"region": region}
+    missing = [k for k in ("accessKeyId", "secretAccessKey") if k not in creds]
+    if missing:
+        raise ValueError(
+            f"output_credentials missing keys: {', '.join(missing)}"
+        )
+    kwargs: Dict[str, Any] = {
+        "region": creds.get("region", region),
+        "credentials": creds,
+    }
+    if creds.get("endpointUrl"):
+        kwargs["endpoint_url"] = creds["endpointUrl"]
+    return kwargs
 
 
 def lambda_handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
@@ -77,8 +123,7 @@ def _handle_setup(event: Dict[str, Any]) -> Dict[str, Any]:
     logger.info(f"Setup mode: creating template at {event.get('store_path')}")
     try:
         config = load_config_from_dict(event["config"])
-        region = os.environ.get("AWS_REGION", "us-west-2")
-        store = open_store(event["store_path"], region=region)
+        store = open_store(event["store_path"], **_output_store_kwargs(event))
         grid_type = config.output.get("grid", {}).get("type", "healpix")
         if grid_type == "healpix":
             # n_parent_cells signals dense layout; populated_shards identities
@@ -112,8 +157,7 @@ def _handle_finalize(event: Dict[str, Any]) -> Dict[str, Any]:
 
     logger.info(f"Finalize mode: consolidating metadata at {event.get('store_path')}")
     try:
-        region = os.environ.get("AWS_REGION", "us-west-2")
-        store = open_store(event["store_path"], region=region)
+        store = open_store(event["store_path"], **_output_store_kwargs(event))
         consolidate_metadata(store, zarr_format=3)
         return {"statusCode": 200, "body": json.dumps({"ok": True, "mode": "finalize"})}
     except Exception as e:
@@ -199,8 +243,7 @@ def _handle_process(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
         # Write Zarr to store
         if not df_out.empty:
             store_path = event["store_path"]
-            region = os.environ.get("AWS_REGION", "us-west-2")
-            store = open_store(store_path, region=region)
+            store = open_store(store_path, **_output_store_kwargs(event))
 
             # Validate that Zarr template exists before writing
             template_key = f"{grid.group_path}/zarr.json"

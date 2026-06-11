@@ -151,3 +151,26 @@ class TestConfigFallbacks:
         cfg.output["store"] = "./configured.zarr"
         result = agg(cfg, catalog=catalog_file, dry_run=True)
         assert result["store_path"] == "./configured.zarr"
+
+
+class TestOutputCredsEvent:
+    """Normalization of the Lambda ``output_credentials`` event block."""
+
+    def test_none_when_no_creds(self):
+        from zagg.runner import _build_output_creds_event
+        assert _build_output_creds_event(None, None, "us-west-2") is None
+
+    def test_camelcase_passthrough(self):
+        from zagg.runner import _build_output_creds_event
+        creds = {"accessKeyId": "AKIA", "secretAccessKey": "s", "sessionToken": "t"}
+        block = _build_output_creds_event(creds, None, "us-west-2")
+        assert block == {"accessKeyId": "AKIA", "secretAccessKey": "s",
+                         "region": "us-west-2", "sessionToken": "t"}
+
+    def test_endpoint_and_region_override(self):
+        from zagg.runner import _build_output_creds_event
+        creds = {"accessKeyId": "AKIA", "secretAccessKey": "s", "region": "eu-west-1"}
+        block = _build_output_creds_event(creds, "https://r2.example", "us-west-2")
+        assert block["endpointUrl"] == "https://r2.example"
+        assert block["region"] == "eu-west-1"
+        assert "sessionToken" not in block

@@ -59,6 +59,13 @@ The Lambda function processes a single morton cell (order 6) by:
     "accessKeyId": "ASIA...",
     "secretAccessKey": "...",
     "sessionToken": "..."
+  },
+  "output_credentials": {
+    "accessKeyId": "ASIA...",
+    "secretAccessKey": "...",
+    "sessionToken": "...",
+    "endpointUrl": "https://...",
+    "region": "us-west-2"
   }
 }
 ```
@@ -73,6 +80,7 @@ The Lambda function processes a single morton cell (order 6) by:
 | `granule_urls` | list | Yes | Pre-computed list of S3 URLs from catalog |
 | `store_path` | str | Yes | Output Zarr store path (e.g. `s3://bucket/prefix.zarr`) |
 | `s3_credentials` | dict | Yes | NSIDC S3 credentials for reading source data |
+| `output_credentials` | dict | No | Explicit credentials for *writing* the output store. Omit to use the execution role (in-account writes). Supply to write an external / S3-compatible target. Keys: `accessKeyId`, `secretAccessKey`, optional `sessionToken`/`endpointUrl`/`region`. |
 
 ### S3 Credentials
 
@@ -96,6 +104,47 @@ event = {
 ```
 
 This approach avoids rate limiting from 1,872 simultaneous NASA logins and eliminates an AWS Secrets Manager dependency.
+
+### Output Credentials (external write targets)
+
+By default the function writes the output store with its **execution role**
+against the in-account bucket; omit `output_credentials` entirely to keep this
+behavior. To write an **external or S3-compatible target** (another account, or
+e.g. source.coop) without changing the execution role, supply
+`output_credentials` in the event — symmetric to how `s3_credentials` injects
+read credentials:
+
+```python
+from zagg import load_config, agg
+
+results = agg(
+    config, catalog="catalog.json", backend="lambda",
+    store="s3://us-west-2.opendata.source.coop/org/dataset.zarr",
+    output_credentials={  # runtime-only; never store in config/YAML
+        "accessKeyId": "ASIA...",
+        "secretAccessKey": "...",
+        "sessionToken": "...",        # optional
+        # "endpointUrl": "https://...",  # optional: R2/MinIO etc.
+        # "region": "us-west-2",         # optional
+    },
+)
+```
+
+From the CLI, point `--output-creds` at a JSON file holding that dict (keeps
+secrets out of shell history):
+
+```bash
+python -m zagg --config atl06.yaml --catalog catalog.json --backend lambda \
+  --store s3://us-west-2.opendata.source.coop/org/dataset.zarr \
+  --output-creds /path/to/output-creds.json
+```
+
+The non-secret `endpoint_url` / `region` may also be set in the config's
+`output:` section (overridable at runtime); **credentials are runtime-only**.
+source.coop uses the standard AWS S3 endpoint with injected STS credentials —
+`endpointUrl` is only needed for non-AWS S3-compatible stores. Dotted bucket
+names (e.g. `us-west-2.opendata.source.coop`) and custom endpoints use
+path-style addressing automatically.
 
 ## Deployment
 

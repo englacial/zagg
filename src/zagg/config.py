@@ -427,6 +427,37 @@ def get_store_path(config: PipelineConfig) -> str | None:
     return config.output.get("store")
 
 
+def get_output_endpoint_url(config: PipelineConfig) -> str | None:
+    """Return the output S3 endpoint URL from the output config, or None.
+
+    Non-secret S3-compatible endpoint (e.g. R2, MinIO). Credentials are never
+    stored in config; they are supplied at runtime.
+
+    Parameters
+    ----------
+    config : PipelineConfig
+
+    Returns
+    -------
+    str or None
+    """
+    return config.output.get("endpoint_url")
+
+
+def get_output_region(config: PipelineConfig) -> str | None:
+    """Return the output S3 region from the output config, or None.
+
+    Parameters
+    ----------
+    config : PipelineConfig
+
+    Returns
+    -------
+    str or None
+    """
+    return config.output.get("region")
+
+
 def evaluate_expression(expression: str, columns: dict[str, np.ndarray]) -> float:
     """Evaluate an expression string in a restricted namespace.
 
