@@ -21,6 +21,10 @@
 
 set -euo pipefail
 
+# Verbose by default: echo each AWS command (copy-pasteable) before running it.
+# The command runs in the foreground, so its stdout/stderr stream straight to you.
+run() { echo "+ $(printf '%q ' "$@")"; "$@"; }
+
 ARCH="${ARCH:-arm64}"                                # arm64 | x86_64
 STACK_NAME="${STACK_NAME:-zagg-backend}"
 REGION="${REGION:-us-west-2}"
@@ -84,17 +88,17 @@ else
     fi
     TMPDIR="$(mktemp -d)"; trap 'rm -rf "$TMPDIR"' EXIT
     echo "Copying zips from the mirror into s3://$STAGING_BUCKET/ ..."
-    aws s3 cp "s3://$MIRROR_BUCKET/$LAYER_KEY" "$TMPDIR/$LAYER_ZIP" --region "$MIRROR_REGION" --no-sign-request
-    aws s3 cp "s3://$MIRROR_BUCKET/$FUNC_KEY"  "$TMPDIR/$FUNC_ZIP"  --region "$MIRROR_REGION" --no-sign-request
-    aws s3 cp "$TMPDIR/$LAYER_ZIP" "s3://$STAGING_BUCKET/$LAYER_ZIP" --region "$REGION"
-    aws s3 cp "$TMPDIR/$FUNC_ZIP"  "s3://$STAGING_BUCKET/$FUNC_ZIP"  --region "$REGION"
+    run aws s3 cp "s3://$MIRROR_BUCKET/$LAYER_KEY" "$TMPDIR/$LAYER_ZIP" --region "$MIRROR_REGION" --no-sign-request
+    run aws s3 cp "s3://$MIRROR_BUCKET/$FUNC_KEY"  "$TMPDIR/$FUNC_ZIP"  --region "$MIRROR_REGION" --no-sign-request
+    run aws s3 cp "$TMPDIR/$LAYER_ZIP" "s3://$STAGING_BUCKET/$LAYER_ZIP" --region "$REGION"
+    run aws s3 cp "$TMPDIR/$FUNC_ZIP"  "s3://$STAGING_BUCKET/$FUNC_ZIP"  --region "$REGION"
     ARTIFACT_BUCKET="$STAGING_BUCKET"
     LAYER_S3KEY="$LAYER_ZIP"
     FUNC_S3KEY="$FUNC_ZIP"
 fi
 
 echo "Deploying stack $STACK_NAME..."
-aws cloudformation deploy \
+run aws cloudformation deploy \
     --template-file "$SCRIPT_DIR/template.yaml" \
     --stack-name "$STACK_NAME" \
     --region "$REGION" \
@@ -108,7 +112,7 @@ aws cloudformation deploy \
         CreateOutputBucket="$CREATE_BUCKET"
 
 echo ""
-aws cloudformation describe-stacks --stack-name "$STACK_NAME" --region "$REGION" \
+run aws cloudformation describe-stacks --stack-name "$STACK_NAME" --region "$REGION" \
     --query 'Stacks[0].Outputs' --output table
 
 echo ""
