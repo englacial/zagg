@@ -13,9 +13,15 @@
 # clone and the minor is read from the latest tag (no install needed); otherwise
 # set LAMBDA_VERSION (e.g. LAMBDA_VERSION=0.2).
 #
+# By default the stack creates its own Lambda execution role (needs
+# iam:CreateRole — fine if you admin your own account). In IAM-constrained
+# accounts (e.g. an SSO power-user), set CREATE_ROLE=false and pass ROLE_ARN, an
+# execution role an admin made once (see execution_role.yaml / EXECUTION_ROLE.md).
+#
 # Usage:
-#   OUTPUT_BUCKET=my-results ./stand_up.sh                              # us-west-2
+#   OUTPUT_BUCKET=my-results ./stand_up.sh                              # us-west-2, stack makes the role
 #   REGION=us-east-1 OUTPUT_BUCKET=my-results STAGING_BUCKET=my-stage ./stand_up.sh
+#   CREATE_ROLE=false ROLE_ARN=arn:aws:iam::123:role/zagg-exec OUTPUT_BUCKET=my-results ./stand_up.sh
 #
 # Requires: aws CLI (configured).
 
@@ -30,7 +36,19 @@ STACK_NAME="${STACK_NAME:-zagg-backend}"
 REGION="${REGION:-us-west-2}"
 OUTPUT_BUCKET="${OUTPUT_BUCKET:?Set OUTPUT_BUCKET to the bucket where results go}"
 CREATE_BUCKET="${CREATE_BUCKET:-false}"              # true => the stack creates OUTPUT_BUCKET
+CREATE_ROLE="${CREATE_ROLE:-true}"                   # true => the stack creates the exec role
+ROLE_ARN="${ROLE_ARN:-}"                             # required only when CREATE_ROLE=false
 STAGING_BUCKET="${STAGING_BUCKET:-}"                 # required only outside the mirror region
+
+# When the stack can't create IAM roles (e.g. an SSO power-user without
+# iam:CreateRole), set CREATE_ROLE=false and pass ROLE_ARN — an execution role
+# an account admin created once (see execution_role.yaml / EXECUTION_ROLE.md).
+if [ "$CREATE_ROLE" != "true" ] && [ -z "$ROLE_ARN" ]; then
+    echo "ERROR: CREATE_ROLE=$CREATE_ROLE but ROLE_ARN is empty."
+    echo "       Set ROLE_ARN to a pre-existing Lambda execution role ARN, or set"
+    echo "       CREATE_ROLE=true to have the stack create one (needs iam:CreateRole)."
+    exit 1
+fi
 
 # Public mirror (override to self-host a copy).
 MIRROR_BUCKET="${MIRROR_BUCKET:-us-west-2.opendata.source.coop}"
@@ -109,7 +127,9 @@ run aws cloudformation deploy \
         LayerS3Key="$LAYER_S3KEY" \
         FunctionS3Key="$FUNC_S3KEY" \
         OutputBucketName="$OUTPUT_BUCKET" \
-        CreateOutputBucket="$CREATE_BUCKET"
+        CreateOutputBucket="$CREATE_BUCKET" \
+        CreateExecutionRole="$CREATE_ROLE" \
+        ExecutionRoleArn="$ROLE_ARN"
 
 echo ""
 run aws cloudformation describe-stacks --stack-name "$STACK_NAME" --region "$REGION" \

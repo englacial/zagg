@@ -1,0 +1,73 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >-
+  zagg Lambda execution role — a least-privilege role for the process-shard
+  function, kept in its OWN stack so an account admin (someone with iam:CreateRole)
+  applies it once, then hands the RoleArn to whoever stands up the backend.
+  Used when template.yaml is deployed with CreateExecutionRole=false. The role
+  only needs CloudWatch Logs + write to the output bucket: source granules are
+  read with credentials passed in the invocation event, not by this role.
+
+Parameters:
+  RoleName:
+    Type: String
+    Default: zagg-process-shard-exec
+    Description: Name of the execution role to create.
+
+  FunctionName:
+    Type: String
+    Default: process-shard
+    Description: >-
+      Lambda function name — used only to scope the CloudWatch Logs permissions
+      to that function's log group. Must match FunctionName in template.yaml.
+
+  OutputBucketName:
+    Type: String
+    Description: >-
+      Bucket the function writes results (parquet/zarr) into. The role is scoped
+      to write here and nowhere else. (For SlideRule this is sliderule-public.)
+
+Resources:
+  ExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Ref RoleName
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: logs-and-output-s3
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Sid: WriteFunctionLogs
+                Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource:
+                  - !Sub "arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/lambda/${FunctionName}:*"
+              - Sid: WriteOutputObjects
+                Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:PutObject
+                  - s3:DeleteObject
+                Resource: !Sub "arn:aws:s3:::${OutputBucketName}/*"
+              - Sid: ListOutputBucket
+                Effect: Allow
+                Action: s3:ListBucket
+                Resource: !Sub "arn:aws:s3:::${OutputBucketName}"
+
+Outputs:
+  RoleArn:
+    Description: >-
+      Pass this to stand_up.sh as ROLE_ARN (with CREATE_ROLE=false), or to
+      template.yaml as ExecutionRoleArn (with CreateExecutionRole=false).
+    Value: !GetAtt ExecutionRole.Arn
+    Export:
+      Name: !Sub "${AWS::StackName}-RoleArn"
