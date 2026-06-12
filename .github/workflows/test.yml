@@ -12,6 +12,9 @@ jobs:
     runs-on: ubuntu-latest
     strategy:
       matrix:
+        # 3.14+ intentionally excluded: numpy 2.2.6 (pinned for the arm64 Lambda
+        # layer) has no cp314 wheels -> ABI mismatch / silent wrong results (#31).
+        # Lambda runtime is 3.12; keep the dev/CI matrix on supported pairings.
         python-version: ['3.12', '3.13']
 
     steps:
