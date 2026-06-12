@@ -114,7 +114,7 @@ class TestBuildGroups:
             start, end = cell_to_slice[cell_id]
             new_vals = col_arrays["h_li"][start:end]
             old_vals = h_vals[cells == cell_id]
-            np.testing.assert_array_equal(np.sort(new_vals), np.sort(old_vals))
+            np.testing.assert_array_equal(new_vals, old_vals)
 
     def test_boundary_positions(self):
         cells = np.array([1, 1, 2, 3, 3, 3], dtype=np.int64)
