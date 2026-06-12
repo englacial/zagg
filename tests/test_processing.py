@@ -7,6 +7,7 @@ from zarr.storage import MemoryStore
 from zagg.config import default_config, get_agg_fields, get_coords, get_data_vars
 from zagg.grids import HealpixGrid
 from zagg.processing import (
+    _build_groups,
     calculate_cell_statistics,
     write_dataframe_to_zarr,
 )
@@ -65,21 +66,21 @@ class TestWriteDataframeToZarr:
 
 
 class TestCalculateCellStatistics:
-    def test_empty_df_returns_zeros_and_nans(self):
-        result = calculate_cell_statistics(pd.DataFrame(columns=["h_li", "s_li"]))
+    def test_empty_data_returns_zeros_and_nans(self):
+        result = calculate_cell_statistics({"h_li": np.array([]), "s_li": np.array([])})
         assert result["count"] == 0
         for name in get_agg_fields(default_config()):
             if name != "count":
                 assert np.isnan(result[name]), f"{name} should be NaN for empty input"
 
     def test_result_keys_match_data_vars(self):
-        df = pd.DataFrame({"h_li": [1.0, 2.0, 3.0], "s_li": [0.1, 0.1, 0.1]})
-        result = calculate_cell_statistics(df)
+        data = {"h_li": np.array([1.0, 2.0, 3.0]), "s_li": np.array([0.1, 0.1, 0.1])}
+        result = calculate_cell_statistics(data)
         assert list(result.keys()) == get_data_vars(default_config())
 
     def test_basic_statistics(self):
-        df = pd.DataFrame({"h_li": [1.0, 2.0, 3.0], "s_li": [0.1, 0.1, 0.1]})
-        result = calculate_cell_statistics(df)
+        data = {"h_li": np.array([1.0, 2.0, 3.0]), "s_li": np.array([0.1, 0.1, 0.1])}
+        result = calculate_cell_statistics(data)
         assert result["count"] == 3
         assert result["h_min"] == 1.0
         assert result["h_max"] == 3.0
@@ -87,8 +88,8 @@ class TestCalculateCellStatistics:
 
     def test_with_explicit_config(self):
         cfg = default_config()
-        df = pd.DataFrame({"h_li": [10.0, 20.0, 30.0], "s_li": [0.1, 0.2, 0.1]})
-        result = calculate_cell_statistics(df, config=cfg)
+        data = {"h_li": np.array([10.0, 20.0, 30.0]), "s_li": np.array([0.1, 0.2, 0.1])}
+        result = calculate_cell_statistics(data, config=cfg)
         assert result["count"] == 3
         assert result["h_min"] == 10.0
         assert result["h_max"] == 30.0
@@ -96,6 +97,76 @@ class TestCalculateCellStatistics:
             result["h_mean"],
             np.average([10, 20, 30], weights=1.0 / np.array([0.1, 0.2, 0.1]) ** 2),
         )
+
+
+class TestBuildGroups:
+    def test_slice_counts_match_per_cell_mask(self):
+        """_build_groups produces identical cell populations as the old boolean-mask loop."""
+        rng = np.random.default_rng(42)
+        cells = np.array([10, 10, 20, 10, 30, 20, 30], dtype=np.int64)
+        h_vals = rng.standard_normal(len(cells))
+        s_vals = np.abs(rng.standard_normal(len(cells))) + 0.01
+        df = pd.DataFrame({"h_li": h_vals, "s_li": s_vals, "leaf_id": cells})
+
+        col_arrays, cell_to_slice = _build_groups(df, cells)
+
+        for cell_id in [10, 20, 30]:
+            start, end = cell_to_slice[cell_id]
+            new_vals = col_arrays["h_li"][start:end]
+            old_vals = h_vals[cells == cell_id]
+            np.testing.assert_array_equal(np.sort(new_vals), np.sort(old_vals))
+
+    def test_boundary_positions(self):
+        cells = np.array([1, 1, 2, 3, 3, 3], dtype=np.int64)
+        df = pd.DataFrame({"h_li": np.zeros(6), "s_li": np.ones(6), "leaf_id": cells})
+        col_arrays, cell_to_slice = _build_groups(df, cells)
+        start_1, end_1 = cell_to_slice[1]
+        start_2, end_2 = cell_to_slice[2]
+        start_3, end_3 = cell_to_slice[3]
+        assert end_1 - start_1 == 2
+        assert end_2 - start_2 == 1
+        assert end_3 - start_3 == 3
+
+    def test_absent_cell_not_in_map(self):
+        cells = np.array([1, 2], dtype=np.int64)
+        df = pd.DataFrame({"h_li": np.zeros(2), "s_li": np.ones(2), "leaf_id": cells})
+        _, cell_to_slice = _build_groups(df, cells)
+        assert 99 not in cell_to_slice
+
+    def test_statistics_match_old_approach(self):
+        """Sort-group statistics are identical to boolean-mask statistics."""
+        rng = np.random.default_rng(7)
+        n = 200
+        child_ids = np.array([100, 200, 300, 400], dtype=np.int64)
+        cells = rng.choice(child_ids, size=n)
+        h_vals = rng.standard_normal(n).astype(np.float32)
+        s_vals = np.abs(rng.standard_normal(n)).astype(np.float32) + 0.01
+        df = pd.DataFrame({"h_li": h_vals, "s_li": s_vals, "leaf_id": cells})
+
+        cfg = default_config()
+        col_arrays, cell_to_slice = _build_groups(df, cells)
+        _empty = {col: arr[:0] for col, arr in col_arrays.items()}
+
+        for child_id in child_ids:
+            # New sort/hash approach
+            if child_id in cell_to_slice:
+                s, e = cell_to_slice[child_id]
+                new_data = {col: arr[s:e] for col, arr in col_arrays.items()}
+            else:
+                new_data = _empty
+            new_stats = calculate_cell_statistics(new_data, config=cfg)
+
+            # Reference: boolean-mask approach
+            mask = cells == child_id
+            old_data = {"h_li": h_vals[mask], "s_li": s_vals[mask], "leaf_id": cells[mask]}
+            old_stats = calculate_cell_statistics(old_data, config=cfg)
+
+            for key in new_stats:
+                if np.isnan(new_stats[key]) and np.isnan(old_stats[key]):
+                    continue
+                np.testing.assert_array_equal(
+                    new_stats[key], old_stats[key], err_msg=f"{key} mismatch for cell {child_id}"
+                )
 
 
 class TestDataSource:

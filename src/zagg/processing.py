@@ -34,6 +34,42 @@ def _make_url_rewriter(driver: str | None):
     return lambda url: url.replace("s3://", "", 1)
 
 
+def _build_groups(
+    df_all: pd.DataFrame,
+    cell_col: np.ndarray,
+) -> tuple[dict[str, np.ndarray], dict[int, tuple[int, int]]]:
+    """Sort observations by cell id; return reordered column arrays and per-cell slice map.
+
+    O(n log n) replacement for the O(n_children x n_obs) boolean-mask loop. The
+    returned arrays are sorted by ascending cell id; each cell's observations form
+    a contiguous slice, so ``col_arrays[col][start:end]`` is a zero-copy view.
+
+    Parameters
+    ----------
+    df_all : pd.DataFrame
+        Combined observation DataFrame (all beams / granules for this shard).
+    cell_col : np.ndarray
+        Cell id for each row in df_all (from ``grid.cells_of``).
+
+    Returns
+    -------
+    col_arrays : dict[str, np.ndarray]
+        Column arrays from df_all, sorted in ascending cell-id order.
+    cell_to_slice : dict[int, tuple[int, int]]
+        Maps each observed cell id to ``(start, end)`` indices into col_arrays.
+    """
+    sort_idx = np.argsort(cell_col, kind="stable")
+    sorted_cells = cell_col[sort_idx]
+    col_arrays = {col: df_all[col].values[sort_idx] for col in df_all.columns}
+    boundaries = np.flatnonzero(np.diff(sorted_cells)) + 1
+    starts = np.concatenate([[0], boundaries])
+    ends = np.concatenate([boundaries, [len(sorted_cells)]])
+    cell_to_slice = {
+        int(sorted_cells[s]): (int(s), int(e)) for s, e in zip(starts, ends)
+    }
+    return col_arrays, cell_to_slice
+
+
 def write_dataframe_to_zarr(
     df_out: pd.DataFrame,
     store: Store,
@@ -89,9 +125,9 @@ def write_dataframe_to_zarr(
 
 
 def calculate_cell_statistics(
-    df_cell: pd.DataFrame,
-    value_col="h_li",
-    sigma_col="s_li",
+    cell_data: dict[str, np.ndarray],
+    value_col: str = "h_li",
+    sigma_col: str = "s_li",
     config: PipelineConfig | None = None,
 ) -> dict:
     """
@@ -99,19 +135,20 @@ def calculate_cell_statistics(
 
     Parameters
     ----------
-    df_cell : pd.DataFrame
-        Dataframe containing observations for a single cell
+    cell_data : dict[str, np.ndarray]
+        Column arrays for a single cell. Keys are column names; values are
+        numpy arrays of equal length.
     value_col : str
-        Column name for elevation values
+        Column name for elevation values.
     sigma_col : str
-        Column name for uncertainty values
+        Column name for uncertainty values.
     config : PipelineConfig, optional
         Pipeline config to use for dispatch. Defaults to ``default_config()``.
 
     Returns
     -------
     dict
-        Dictionary of statistics keyed by aggregation variable name
+        Dictionary of statistics keyed by aggregation variable name.
     """
     from zagg.config import evaluate_expression, resolve_function
 
@@ -119,7 +156,8 @@ def calculate_cell_statistics(
         config = default_config()
     agg_fields = get_agg_fields(config)
 
-    if len(df_cell) == 0:
+    n_obs = len(next(iter(cell_data.values()))) if cell_data else 0
+    if n_obs == 0:
         return {
             name: (0 if meta.get("function") in ("len", "count") else np.nan)
             for name, meta in agg_fields.items()
@@ -134,25 +172,26 @@ def calculate_cell_statistics(
 
         # Expression-based aggregation (e.g. h_sigma)
         if expression:
-            columns = {col: df_cell[col].values for col in df_cell.columns}
-            result[name] = evaluate_expression(expression, columns)
+            result[name] = evaluate_expression(expression, cell_data)
             continue
 
-        values = df_cell[source].values
+        values = cell_data[source]
 
         # Count via len
         if func_name in ("len", "count"):
-            result[name] = len(df_cell)
+            result[name] = n_obs
             continue
 
         # Resolve params: bare column name -> array, expression -> eval'd
         resolved_params = {}
         for pkey, pval in params.items():
-            if isinstance(pval, str) and pval in df_cell.columns:
-                resolved_params[pkey] = df_cell[pval].values
-            elif isinstance(pval, str) and any(c in pval for c in df_cell.columns):
-                ns = {"__builtins__": {}, "np": np, "numpy": np,
-                      **{c: df_cell[c].values for c in df_cell.columns}}
+            if isinstance(pval, str) and pval in cell_data:
+                resolved_params[pkey] = cell_data[pval]
+            elif isinstance(pval, str) and any(c in pval for c in cell_data):
+                ns = {
+                    "__builtins__": {}, "np": np, "numpy": np,
+                    **cell_data,
+                }
                 resolved_params[pkey] = eval(pval, ns)  # noqa: S307
             else:
                 resolved_params[pkey] = pval
@@ -392,13 +431,24 @@ def process_shard(
         else:
             stats_arrays[name] = np.zeros(n_cells, dtype=zarr_dtype)
 
-    cells_with_data = 0
+    # Sort/hash grouping: O(n_obs log n_obs) vs O(n_children x n_obs)
     cell_col = grid.cells_of(df_all["leaf_id"].values)
+    col_arrays, cell_to_slice = _build_groups(df_all, cell_col)
+    _empty: dict[str, np.ndarray] = {col: arr[:0] for col, arr in col_arrays.items()}
+
+    cells_with_data = 0
     for i, child_morton in enumerate(children):
-        df_cell = df_all[cell_col == child_morton]
-        if len(df_cell) > 0:
+        if child_morton in cell_to_slice:
+            start, end = cell_to_slice[child_morton]
+            cell_data: dict[str, np.ndarray] = {
+                col: arr[start:end] for col, arr in col_arrays.items()
+            }
             cells_with_data += 1
-        stats = calculate_cell_statistics(df_cell, value_col="h_li", sigma_col="s_li", config=config)
+        else:
+            cell_data = _empty
+        stats = calculate_cell_statistics(
+            cell_data, value_col="h_li", sigma_col="s_li", config=config
+        )
         for key, value in stats.items():
             stats_arrays[key][i] = value
 
