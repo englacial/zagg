@@ -61,6 +61,8 @@ def _build_groups(
     sort_idx = np.argsort(cell_col, kind="stable")
     sorted_cells = cell_col[sort_idx]
     col_arrays = {col: df_all[col].values[sort_idx] for col in df_all.columns}
+    if len(sorted_cells) == 0:
+        return col_arrays, {}
     boundaries = np.flatnonzero(np.diff(sorted_cells)) + 1
     starts = np.concatenate([[0], boundaries])
     ends = np.concatenate([boundaries, [len(sorted_cells)]])
