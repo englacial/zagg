@@ -1,5 +1,17 @@
 # zagg Lambda execution role
 
+> ⚠️ **Status: out of date / unverified — see [#34](https://github.com/englacial/zagg/issues/34).**
+> This document covers **only** the IAM-constrained path: accounts whose deploy
+> identity *cannot* create IAM roles (e.g. an AWS SSO "power user" permission
+> set), where an admin creates the execution role out of band and you deploy with
+> `CreateExecutionRole=false`. The **supported, verified** path is the default —
+> run `stand_up.sh` (→ `template.yaml` with `CreateExecutionRole=true`) from an
+> identity that has IAM access, and the backend stack creates the role for you,
+> with no out-of-band step. The from-scratch AWS deploy validated in
+> [#32](https://github.com/englacial/zagg/pull/32) exercised that default path;
+> the SSO no-`iam:CreateRole` flow described below has **not** been re-validated
+> and may be stale. Treat it as legacy until it is re-tested.
+
 The `process-shard` Lambda needs an IAM **execution role** — the identity it runs
 as, which lets it write CloudWatch logs and write results to the in-account
 output bucket (e.g. `sliderule-public`).
