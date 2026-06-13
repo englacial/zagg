@@ -8,6 +8,7 @@ from zagg.config import default_config, get_agg_fields, get_coords, get_data_var
 from zagg.grids import HealpixGrid
 from zagg.processing import (
     _build_groups,
+    _group_columns,
     calculate_cell_statistics,
     write_dataframe_to_zarr,
 )
@@ -44,9 +45,7 @@ class TestWriteDataframeToZarr:
     def test_write_empty_dataframe(self):
         grid = HealpixGrid(6, 8, layout="fullsphere")
         store = MemoryStore()
-        assert write_dataframe_to_zarr(
-            pd.DataFrame(), store, grid=grid, chunk_idx=(0,)
-        )
+        assert write_dataframe_to_zarr(pd.DataFrame(), store, grid=grid, chunk_idx=(0,))
 
     def test_write_row_count_mismatch(self, mock_dataframe_factory):
         parent_order = 6
@@ -166,6 +165,67 @@ class TestBuildGroups:
                     continue
                 np.testing.assert_array_equal(
                     new_stats[key], old_stats[key], err_msg=f"{key} mismatch for cell {child_id}"
+                )
+
+
+class TestArrowHandoff:
+    """Phase 2 of #30: the Arrow carrier must match the pandas carrier exactly."""
+
+    def test_group_columns_matches_build_groups(self):
+        """_group_columns (carrier-agnostic core) == _build_groups (pandas wrapper)."""
+        cells = np.array([5, 1, 5, 1, 9], dtype=np.int64)
+        col_dict = {
+            "h_li": np.arange(5.0, dtype=np.float32),
+            "s_li": np.ones(5, dtype=np.float32),
+            "leaf_id": cells,
+        }
+        df = pd.DataFrame(col_dict)
+        arrays_a, slices_a = _build_groups(df, cells)
+        arrays_b, slices_b = _group_columns(col_dict, cells)
+        assert slices_a == slices_b
+        for key in arrays_a:
+            np.testing.assert_array_equal(arrays_a[key], arrays_b[key])
+
+    def test_arrow_grouping_matches_pandas(self):
+        """Arrow-carrier grouping yields byte-for-byte identical stats to pandas."""
+        pa = pytest.importorskip("pyarrow")
+        rng = np.random.default_rng(11)
+        n = 500
+        child_ids = np.array([100, 200, 300, 400, 500], dtype=np.int64)
+        cells = rng.choice(child_ids, size=n)
+        h_vals = (rng.standard_normal(n) * 30.0).astype(np.float32)
+        s_vals = (np.abs(rng.standard_normal(n)) + 0.01).astype(np.float32)
+        col_dict = {"h_li": h_vals, "s_li": s_vals, "leaf_id": cells}
+        cfg = default_config()
+
+        # pandas carrier
+        df = pd.DataFrame(col_dict)
+        p_arrays, p_slices = _build_groups(df, cells)
+
+        # arrow carrier: read the columns back as numpy and group identically
+        table = pa.table(col_dict).combine_chunks()
+        a_carrier = {
+            name: table.column(name).to_numpy(zero_copy_only=False) for name in table.column_names
+        }
+        a_leaf = table.column("leaf_id").to_numpy(zero_copy_only=False)
+        a_arrays, a_slices = _group_columns(a_carrier, a_leaf)
+
+        assert p_slices == a_slices
+        for child in child_ids:
+            child = int(child)
+            ps, pe = p_slices[child]
+            as_, ae = a_slices[child]
+            p_stats = calculate_cell_statistics(
+                {k: v[ps:pe] for k, v in p_arrays.items()}, config=cfg
+            )
+            a_stats = calculate_cell_statistics(
+                {k: v[as_:ae] for k, v in a_arrays.items()}, config=cfg
+            )
+            for key in p_stats:
+                if np.isnan(p_stats[key]) and np.isnan(a_stats[key]):
+                    continue
+                np.testing.assert_array_equal(
+                    p_stats[key], a_stats[key], err_msg=f"{key} mismatch for cell {child}"
                 )
 
 
