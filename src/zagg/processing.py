@@ -34,15 +34,41 @@ def _make_url_rewriter(driver: str | None):
     return lambda url: url.replace("s3://", "", 1)
 
 
+def _group_columns(
+    col_dict: dict[str, np.ndarray],
+    cell_col: np.ndarray,
+) -> tuple[dict[str, np.ndarray], dict[int, tuple[int, int]]]:
+    """Sort column arrays by cell id; return reordered arrays and per-cell slice map.
+
+    Carrier-agnostic core shared by the pandas and Arrow handoff paths. ``col_dict``
+    is a plain ``name -> ndarray`` mapping (extracted from a DataFrame or an Arrow
+    table); the math below is identical regardless of carrier, so both paths produce
+    byte-for-byte identical groupings and aggregations.
+
+    O(n log n) replacement for the O(n_children x n_obs) boolean-mask loop. The
+    returned arrays are sorted (stably) by ascending cell id; each cell's
+    observations form a contiguous slice, so ``col_arrays[col][start:end]`` is a
+    view.
+    """
+    sort_idx = np.argsort(cell_col, kind="stable")
+    sorted_cells = cell_col[sort_idx]
+    col_arrays = {col: arr[sort_idx] for col, arr in col_dict.items()}
+    if len(sorted_cells) == 0:
+        return col_arrays, {}
+    boundaries = np.flatnonzero(np.diff(sorted_cells)) + 1
+    starts = np.concatenate([[0], boundaries])
+    ends = np.concatenate([boundaries, [len(sorted_cells)]])
+    cell_to_slice = {int(sorted_cells[s]): (int(s), int(e)) for s, e in zip(starts, ends)}
+    return col_arrays, cell_to_slice
+
+
 def _build_groups(
     df_all: pd.DataFrame,
     cell_col: np.ndarray,
 ) -> tuple[dict[str, np.ndarray], dict[int, tuple[int, int]]]:
     """Sort observations by cell id; return reordered column arrays and per-cell slice map.
 
-    O(n log n) replacement for the O(n_children x n_obs) boolean-mask loop. The
-    returned arrays are sorted by ascending cell id; each cell's observations form
-    a contiguous slice, so ``col_arrays[col][start:end]`` is a zero-copy view.
+    Pandas carrier wrapper over :func:`_group_columns` (extracts ``.values`` once).
 
     Parameters
     ----------
@@ -58,18 +84,8 @@ def _build_groups(
     cell_to_slice : dict[int, tuple[int, int]]
         Maps each observed cell id to ``(start, end)`` indices into col_arrays.
     """
-    sort_idx = np.argsort(cell_col, kind="stable")
-    sorted_cells = cell_col[sort_idx]
-    col_arrays = {col: df_all[col].values[sort_idx] for col in df_all.columns}
-    if len(sorted_cells) == 0:
-        return col_arrays, {}
-    boundaries = np.flatnonzero(np.diff(sorted_cells)) + 1
-    starts = np.concatenate([[0], boundaries])
-    ends = np.concatenate([boundaries, [len(sorted_cells)]])
-    cell_to_slice = {
-        int(sorted_cells[s]): (int(s), int(e)) for s, e in zip(starts, ends)
-    }
-    return col_arrays, cell_to_slice
+    col_dict = {col: df_all[col].values for col in df_all.columns}
+    return _group_columns(col_dict, cell_col)
 
 
 def write_dataframe_to_zarr(
@@ -107,8 +123,7 @@ def write_dataframe_to_zarr(
     expected_count = int(np.prod(grid.chunk_shape))
     if len(df_out) != expected_count:
         raise ValueError(
-            f"Expected {expected_count} rows for chunk_shape={grid.chunk_shape}, "
-            f"got {len(df_out)}"
+            f"Expected {expected_count} rows for chunk_shape={grid.chunk_shape}, got {len(df_out)}"
         )
 
     chunk_idx = tuple(int(i) for i in chunk_idx)
@@ -118,8 +133,10 @@ def write_dataframe_to_zarr(
             values = values.reshape(grid.chunk_shape)
         with config.set({"async.concurrency": 128}):
             array = open_array(
-                store, path=f"{grid.group_path}/{name}",
-                zarr_format=3, consolidated=False,
+                store,
+                path=f"{grid.group_path}/{name}",
+                zarr_format=3,
+                consolidated=False,
             )
             array.set_block_selection(chunk_idx, values)
 
@@ -191,7 +208,9 @@ def calculate_cell_statistics(
                 resolved_params[pkey] = cell_data[pval]
             elif isinstance(pval, str) and any(c in pval for c in cell_data):
                 ns = {
-                    "__builtins__": {}, "np": np, "numpy": np,
+                    "__builtins__": {},
+                    "np": np,
+                    "numpy": np,
                     **cell_data,
                 }
                 resolved_params[pkey] = eval(pval, ns)  # noqa: S307
@@ -204,8 +223,15 @@ def calculate_cell_statistics(
     return result
 
 
-def _read_group(h5obj, group: str, data_source: dict, parent_morton: int, grid):
-    """Read and spatially filter one HDF5 group, returning a DataFrame or None."""
+def _read_group(
+    h5obj, group: str, data_source: dict, parent_morton: int, grid, arrow: bool = False
+):
+    """Read and spatially filter one HDF5 group.
+
+    Returns a ``pandas.DataFrame`` (default) or, when ``arrow=True``, a
+    ``pyarrow.Table`` carrying the identical columns. Returns ``None`` when the
+    group has no observations in this shard.
+    """
     coordinates = data_source["coordinates"]
     variables = data_source["variables"]
     quality_filter = data_source.get("quality_filter")
@@ -274,6 +300,10 @@ def _read_group(h5obj, group: str, data_source: dict, parent_morton: int, grid):
     else:
         data_dict["leaf_id"] = leaf_sliced
 
+    if arrow:
+        import pyarrow as pa
+
+        return pa.table(data_dict)
     return pd.DataFrame(data_dict)
 
 
@@ -286,6 +316,7 @@ def process_shard(
     h5coro_driver=None,
     config: PipelineConfig | None = None,
     driver: str | None = None,
+    handoff: str = "pandas",
 ) -> Tuple[pd.DataFrame, ProcessingMetadata]:
     """Process one shard: read granules, filter to this shard, aggregate, return df.
 
@@ -310,6 +341,11 @@ def process_shard(
         Defaults to ``default_config()``.
     driver : str, optional
         ``"s3"`` (default) or ``"https"``.
+    handoff : str, optional
+        Per-cell aggregation carrier: ``"pandas"`` (default) or ``"arrow"``.
+        Both paths share :func:`_group_columns` and the same numpy reductions, so
+        scalar outputs are byte-for-byte identical; only the read→concat→extract
+        representation differs. Opt-in while the two are benchmarked (issue #30).
 
     Returns
     -------
@@ -320,6 +356,8 @@ def process_shard(
     """
     if config is None:
         config = default_config()
+    if handoff not in ("pandas", "arrow"):
+        raise ValueError(f"handoff must be 'pandas' or 'arrow', got {handoff!r}")
     data_source = config.data_source
 
     parent_morton = int(shard_key)
@@ -332,9 +370,11 @@ def process_shard(
             driver = config.data_source.get("driver", "s3")
         if driver == "https":
             from h5coro import webdriver
+
             h5coro_driver = webdriver.HTTPDriver
         else:
             from h5coro import s3driver
+
             h5coro_driver = s3driver.S3Driver
 
     # Prepare metadata
@@ -373,7 +413,8 @@ def process_shard(
     # Build URL rewriter for the active driver
     _rewrite_url = _make_url_rewriter(driver)
 
-    all_dataframes = []
+    use_arrow = handoff == "arrow"
+    all_reads = []
     files_processed = 0
 
     # Read files and filter spatially
@@ -391,9 +432,9 @@ def process_shard(
 
             for g in data_source["groups"]:
                 try:
-                    df = _read_group(h5obj, g, data_source, parent_morton, grid)
-                    if df is not None:
-                        all_dataframes.append(df)
+                    chunk = _read_group(h5obj, g, data_source, parent_morton, grid, arrow=use_arrow)
+                    if chunk is not None:
+                        all_reads.append(chunk)
                 except Exception as e:
                     logger.debug(f"  Error reading track {g}: {e}")
                     continue
@@ -407,14 +448,31 @@ def process_shard(
     logger.info(f"  Processed {files_processed}/{len(granule_urls)} files")
     metadata["files_processed"] = files_processed
 
-    if not all_dataframes:
+    if not all_reads:
         logger.info(f"  No data after filtering for morton {parent_morton} - skipping")
         metadata["error"] = "No data after filtering"
         metadata["duration_s"] = (datetime.now() - start_time).total_seconds()
         return pd.DataFrame(), metadata
 
-    df_all = pd.concat(all_dataframes, ignore_index=True)
-    logger.info(f"  Read {len(df_all):,} observations")
+    # Concat the per-group reads and split observations by cell. Both carriers
+    # feed identical numpy arrays into _group_columns, so outputs match exactly.
+    if use_arrow:
+        import pyarrow as pa
+
+        table = pa.concat_tables(all_reads).combine_chunks()
+        n_obs_total = table.num_rows
+        leaf_ids = table.column("leaf_id").to_numpy(zero_copy_only=False)
+        cell_col = grid.cells_of(leaf_ids)
+        col_dict = {
+            name: table.column(name).to_numpy(zero_copy_only=False) for name in table.column_names
+        }
+        col_arrays, cell_to_slice = _group_columns(col_dict, cell_col)
+    else:
+        df_all = pd.concat(all_reads, ignore_index=True)
+        n_obs_total = len(df_all)
+        cell_col = grid.cells_of(df_all["leaf_id"].values)
+        col_arrays, cell_to_slice = _build_groups(df_all, cell_col)
+    logger.info(f"  Read {n_obs_total:,} observations")
 
     # Calculate statistics for child cells
     children = grid.children(parent_morton)
@@ -433,9 +491,7 @@ def process_shard(
         else:
             stats_arrays[name] = np.zeros(n_cells, dtype=zarr_dtype)
 
-    # Sort/hash grouping: O(n_obs log n_obs) vs O(n_children x n_obs)
-    cell_col = grid.cells_of(df_all["leaf_id"].values)
-    col_arrays, cell_to_slice = _build_groups(df_all, cell_col)
+    # Per-cell observation slices (grouped above, carrier-agnostic).
     _empty: dict[str, np.ndarray] = {col: arr[:0] for col, arr in col_arrays.items()}
 
     cells_with_data = 0
@@ -487,8 +543,7 @@ def process_morton_cell(
     Constructs a stateless ``HealpixGrid`` and forwards to ``process_shard``.
     """
     warnings.warn(
-        "process_morton_cell is deprecated; use process_shard(grid, shard_key, ...) "
-        "directly.",
+        "process_morton_cell is deprecated; use process_shard(grid, shard_key, ...) directly.",
         DeprecationWarning,
         stacklevel=2,
     )
