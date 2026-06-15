@@ -275,6 +275,148 @@ def calculate_cell_statistics(
     return result
 
 
+# EXPERIMENTAL (phase 2b of #30) -----------------------------------------------
+# Optional pyarrow.compute hash-aggregate ("kernel") reduction path. Unlike the
+# pandas/arrow *carriers* — which feed identical numpy arrays into
+# ``calculate_cell_statistics`` and are therefore byte-for-byte identical — the
+# kernel path computes the kernel-able reductions in a single vectorised C++
+# pass (Acero ``TableGroupBy.aggregate``). pyarrow's float summation differs from
+# numpy's, so its ``mean``/``variance`` outputs are NOT byte-identical to the
+# numpy path; they agree only within ``KERNEL_RTOL`` (validated in tests and in
+# ``benchmarks/handoff_bench.py``). This lever is opt-in via
+# ``handoff="arrow-kernel"`` and exists purely so phase 3 can benchmark it on
+# real ATL03 data; it is kept gated and clearly experimental, and should be
+# dropped if that benchmark shows no material speedup (see PR #33 discussion).
+
+# Documented tolerance for kernel-vs-numpy float agreement. float32 means/variance
+# over millions of obs diverge by ~1 ULP (~1e-6 relative); 1e-5 leaves headroom.
+KERNEL_RTOL = 1e-5
+
+# numpy/config ``function`` name -> pyarrow hash-aggregate function name. Only
+# reductions that are mathematically a pure (unweighted) group reduction appear
+# here; weighted ``average``, ``quantile`` (only approximate via tdigest) and any
+# ``expression`` field fall back to the per-cell numpy path.
+_KERNEL_FUNCS = {
+    "len": "count",
+    "count": "count",
+    "min": "min",
+    "max": "max",
+    "var": "variance",
+    "average": "mean",
+}
+
+
+def _kernel_able(meta: dict) -> bool:
+    """Whether an agg field can be computed by a pyarrow hash-aggregate kernel.
+
+    EXPERIMENTAL. Excludes expression fields, weighted ``average`` (no weighted
+    hash kernel), quantiles (only approximate tdigest), and anything whose
+    function has no pure-reduction kernel equivalent.
+    """
+    if meta.get("expression"):
+        return False
+    func = meta.get("function")
+    if func not in _KERNEL_FUNCS:
+        return False
+    # Weighted average is not a pure hash reduction.
+    if func == "average" and "weights" in (meta.get("params") or {}):
+        return False
+    return True
+
+
+def _kernel_aggregate(
+    table, cell_col: np.ndarray, children, value_col: str, config: PipelineConfig
+) -> dict:
+    """EXPERIMENTAL pyarrow hash-aggregate reducer (phase 2b of #30).
+
+    Computes the kernel-able stats (count/min/max/variance/unweighted-mean) for
+    every child cell in one vectorised ``TableGroupBy.aggregate`` pass, then fills
+    the remaining (weighted mean, expression, quantile) fields via the per-cell
+    numpy path so output columns match the default reducer exactly in shape.
+
+    Kernel-computed float stats are NOT byte-identical to numpy — they agree
+    within :data:`KERNEL_RTOL`. Returns ``stats_arrays`` (``name -> ndarray`` over
+    ``children``) plus ``cells_with_data``.
+
+    Parameters
+    ----------
+    table : pyarrow.Table
+        Concatenated, null-free observations (one row per observation).
+    cell_col : np.ndarray
+        Child cell id for each row of ``table`` (already ``grid.cells_of`` mapped,
+        so the group key is the destination cell, not the leaf id).
+    children : sequence of int
+        Child cell ids, in canonical chunk order.
+    value_col : str
+        Default value column for fields without an explicit ``source``.
+    config : PipelineConfig
+        Drives the agg-field metadata.
+    """
+    import pyarrow as pa
+
+    agg_fields = get_agg_fields(config)
+    data_vars = get_data_vars(config)
+    n_cells = len(children)
+    child_index = {int(c): i for i, c in enumerate(children)}
+
+    stats_arrays: dict[str, np.ndarray] = {}
+    for name in data_vars:
+        meta = agg_fields[name]
+        zarr_dtype = np.dtype(meta.get("dtype", "float32"))
+        fill_value = meta.get("fill_value", "NaN")
+        if fill_value == "NaN":
+            stats_arrays[name] = np.full(n_cells, np.nan, dtype=zarr_dtype)
+        else:
+            stats_arrays[name] = np.zeros(n_cells, dtype=zarr_dtype)
+
+    kernel_names = [n for n in data_vars if _kernel_able(agg_fields[n])]
+    fallback_names = [n for n in data_vars if n not in kernel_names]
+
+    # Group by the destination cell id (not the raw leaf id): append cell_col and
+    # run one vectorised group-by + reduction pass for all kernel-able fields.
+    keyed = table.append_column("_cell", pa.array(np.asarray(cell_col)))
+    aggregations = [
+        (agg_fields[n].get("source") or value_col, _KERNEL_FUNCS[agg_fields[n]["function"]])
+        for n in kernel_names
+    ]
+    gd = keyed.group_by("_cell").aggregate(aggregations).to_pydict()
+    group_cells = gd["_cell"]
+    # Map each grouped row back to its position in ``children``.
+    row_to_idx = [child_index.get(int(c)) for c in group_cells]
+    for n, (src, kfunc) in zip(kernel_names, aggregations):
+        col = gd[f"{src}_{kfunc}"]
+        out = stats_arrays[n]
+        for row, idx in enumerate(row_to_idx):
+            if idx is not None:
+                out[idx] = col[row]
+
+    cells_with_data = sum(1 for idx in row_to_idx if idx is not None)
+
+    # Fallback fields (and only those) via the per-cell numpy reducer. Reuse the
+    # carrier-agnostic grouping so the slices match the default path exactly.
+    if fallback_names:
+        col_dict = {
+            name: table.column(name).to_numpy(zero_copy_only=False) for name in table.column_names
+        }
+        col_arrays, cell_to_slice = _group_columns(col_dict, np.asarray(cell_col))
+        _empty = {col: arr[:0] for col, arr in col_arrays.items()}
+        for i, child in enumerate(children):
+            child = int(child)
+            if child in cell_to_slice:
+                s, e = cell_to_slice[child]
+                cell_data = {col: arr[s:e] for col, arr in col_arrays.items()}
+            else:
+                cell_data = _empty
+            stats = calculate_cell_statistics(cell_data, value_col=value_col, config=config)
+            for name in fallback_names:
+                stats_arrays[name][i] = stats[name]
+
+    return {"stats_arrays": stats_arrays, "cells_with_data": cells_with_data}
+
+
+# -- end EXPERIMENTAL kernel path ---------------------------------------------
+
+
 def _read_group(
     h5obj, group: str, data_source: dict, parent_morton: int, grid, arrow: bool = False
 ):
@@ -394,10 +536,14 @@ def process_shard(
     driver : str, optional
         ``"s3"`` (default) or ``"https"``.
     handoff : str, optional
-        Per-cell aggregation carrier: ``"pandas"`` (default) or ``"arrow"``.
-        Both paths share :func:`_group_columns` and the same numpy reductions, so
-        scalar outputs are byte-for-byte identical; only the read→concat→extract
-        representation differs. Opt-in while the two are benchmarked (issue #30).
+        Per-cell aggregation carrier: ``"pandas"`` (default), ``"arrow"``, or the
+        EXPERIMENTAL ``"arrow-kernel"``. ``"pandas"`` and ``"arrow"`` share
+        :func:`_group_columns` and the same numpy reductions, so scalar outputs
+        are byte-for-byte identical; only the read→concat→extract representation
+        differs. ``"arrow-kernel"`` (phase 2b of #30) instead reduces via
+        ``pyarrow.compute`` hash-aggregate kernels: its float ``mean``/``variance``
+        differ from numpy by ~1 ULP (agree within :data:`KERNEL_RTOL`, not byte
+        identical). All three are opt-in while benchmarked (issue #30).
 
     Returns
     -------
@@ -408,8 +554,8 @@ def process_shard(
     """
     if config is None:
         config = default_config()
-    if handoff not in ("pandas", "arrow"):
-        raise ValueError(f"handoff must be 'pandas' or 'arrow', got {handoff!r}")
+    if handoff not in ("pandas", "arrow", "arrow-kernel"):
+        raise ValueError(f"handoff must be 'pandas', 'arrow', or 'arrow-kernel', got {handoff!r}")
     data_source = config.data_source
 
     parent_morton = int(shard_key)
@@ -465,7 +611,7 @@ def process_shard(
     # Build URL rewriter for the active driver
     _rewrite_url = _make_url_rewriter(driver)
 
-    use_arrow = handoff == "arrow"
+    use_arrow = handoff in ("arrow", "arrow-kernel")
     all_reads = []
     files_processed = 0
 
@@ -506,46 +652,64 @@ def process_shard(
         metadata["duration_s"] = (datetime.now() - start_time).total_seconds()
         return pd.DataFrame(), metadata
 
-    # Concat the per-group reads and split observations by cell (carrier-agnostic;
-    # both carriers feed identical numpy arrays into _group_columns).
-    col_arrays, cell_to_slice, n_obs_total = _concat_and_group(all_reads, grid, handoff)
-    logger.info(f"  Read {n_obs_total:,} observations")
-
-    # Calculate statistics for child cells
     children = grid.children(parent_morton)
-    logger.info(f"  Calculating statistics for {len(children)} cells...")
-
-    n_cells = len(children)
     data_vars = get_data_vars(config)
-    agg_fields = get_agg_fields(config)
-    stats_arrays = {}
-    for name in data_vars:
-        meta = agg_fields[name]
-        zarr_dtype = np.dtype(meta.get("dtype", "float32"))
-        fill_value = meta.get("fill_value", "NaN")
-        if fill_value == "NaN":
-            stats_arrays[name] = np.full(n_cells, np.nan, dtype=zarr_dtype)
-        else:
-            stats_arrays[name] = np.zeros(n_cells, dtype=zarr_dtype)
 
-    # Per-cell observation slices (grouped above, carrier-agnostic).
-    _empty: dict[str, np.ndarray] = {col: arr[:0] for col, arr in col_arrays.items()}
+    if handoff == "arrow-kernel":
+        # EXPERIMENTAL (phase 2b of #30): reduce via pyarrow hash-aggregate kernels
+        # instead of the per-cell numpy loop. Not byte-identical to the default
+        # path (float mean/variance diverge by ~1 ULP — see KERNEL_RTOL).
+        import pyarrow as pa
 
-    cells_with_data = 0
-    for i, child_morton in enumerate(children):
-        if child_morton in cell_to_slice:
-            start, end = cell_to_slice[child_morton]
-            cell_data: dict[str, np.ndarray] = {
-                col: arr[start:end] for col, arr in col_arrays.items()
-            }
-            cells_with_data += 1
-        else:
-            cell_data = _empty
-        stats = calculate_cell_statistics(
-            cell_data, value_col="h_li", sigma_col="s_li", config=config
-        )
-        for key, value in stats.items():
-            stats_arrays[key][i] = value
+        table = pa.concat_tables(all_reads).combine_chunks()
+        null_cols = [n for n in table.column_names if table.column(n).null_count]
+        if null_cols:
+            raise ValueError(f"arrow handoff requires null-free columns; got nulls in {null_cols}")
+        n_obs_total = table.num_rows
+        cell_col = grid.cells_of(table.column("leaf_id").to_numpy(zero_copy_only=False))
+        logger.info(f"  Read {n_obs_total:,} observations")
+        logger.info(f"  Calculating statistics for {len(children)} cells (kernel)...")
+        kernel = _kernel_aggregate(table, cell_col, children, "h_li", config)
+        stats_arrays = kernel["stats_arrays"]
+        cells_with_data = kernel["cells_with_data"]
+        n_cells = len(children)
+    else:
+        # Concat the per-group reads and split observations by cell (carrier-
+        # agnostic; both carriers feed identical numpy arrays into _group_columns).
+        col_arrays, cell_to_slice, n_obs_total = _concat_and_group(all_reads, grid, handoff)
+        logger.info(f"  Read {n_obs_total:,} observations")
+        logger.info(f"  Calculating statistics for {len(children)} cells...")
+
+        n_cells = len(children)
+        agg_fields = get_agg_fields(config)
+        stats_arrays = {}
+        for name in data_vars:
+            meta = agg_fields[name]
+            zarr_dtype = np.dtype(meta.get("dtype", "float32"))
+            fill_value = meta.get("fill_value", "NaN")
+            if fill_value == "NaN":
+                stats_arrays[name] = np.full(n_cells, np.nan, dtype=zarr_dtype)
+            else:
+                stats_arrays[name] = np.zeros(n_cells, dtype=zarr_dtype)
+
+        # Per-cell observation slices (grouped above, carrier-agnostic).
+        _empty: dict[str, np.ndarray] = {col: arr[:0] for col, arr in col_arrays.items()}
+
+        cells_with_data = 0
+        for i, child_morton in enumerate(children):
+            if child_morton in cell_to_slice:
+                start, end = cell_to_slice[child_morton]
+                cell_data: dict[str, np.ndarray] = {
+                    col: arr[start:end] for col, arr in col_arrays.items()
+                }
+                cells_with_data += 1
+            else:
+                cell_data = _empty
+            stats = calculate_cell_statistics(
+                cell_data, value_col="h_li", sigma_col="s_li", config=config
+            )
+            for key, value in stats.items():
+                stats_arrays[key][i] = value
 
     logger.info(f"  Statistics: {cells_with_data}/{n_cells} cells with data")
 
