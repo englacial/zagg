@@ -578,6 +578,25 @@ class TestOutputKind:
         with pytest.raises(ValueError, match="int or a sequence of ints"):
             validate_config(cfg)
 
+    def test_trailing_shape_list_bad_element_type(self):
+        cfg = _vector_config(
+            {"function": "histogram", "kind": "vector", "trailing_shape": [16, "x"]}
+        )
+        with pytest.raises(ValueError, match="positive"):
+            validate_config(cfg)
+
+    def test_trailing_shape_list_zero_element(self):
+        cfg = _vector_config({"function": "histogram", "kind": "vector", "trailing_shape": [16, 0]})
+        with pytest.raises(ValueError, match="positive"):
+            validate_config(cfg)
+
+    def test_trailing_shape_list_bool_element(self):
+        cfg = _vector_config(
+            {"function": "histogram", "kind": "vector", "trailing_shape": [16, True]}
+        )
+        with pytest.raises(ValueError, match="positive"):
+            validate_config(cfg)
+
     def test_invalid_dtype_rejected(self):
         cfg = _vector_config({"function": "min", "dtype": "not_a_dtype"})
         with pytest.raises(ValueError, match="not a valid"):

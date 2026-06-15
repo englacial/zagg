@@ -221,9 +221,10 @@ OUTPUT_KINDS = ("scalar", "vector")
 def _validate_output_kind(name: str, meta: dict) -> None:
     """Validate a variable's non-scalar output declaration.
 
-    A field may declare ``kind`` (``scalar`` default, or ``vector``),
-    ``trailing_shape`` (required for ``vector``), and a ``fill``/``pad_weight``
-    sentinel. ``scalar`` fields need none of these and stay the default path.
+    A field may declare ``kind`` (``scalar`` default, or ``vector``) and
+    ``trailing_shape`` (required for ``vector``). ``scalar`` fields need
+    neither and stay the default path. (A per-cell padding sentinel for
+    vectors is a later phase; see issue #29.)
 
     Parameters
     ----------
@@ -239,16 +240,17 @@ def _validate_output_kind(name: str, meta: dict) -> None:
     """
     kind = meta.get("kind", "scalar")
     if kind not in OUTPUT_KINDS:
+        allowed = ", ".join(OUTPUT_KINDS)
         raise ValueError(
             f"Variable '{name}': output kind '{kind}' is not supported "
-            f"(allowed: {OUTPUT_KINDS}; 'ragged' is planned but not yet implemented)"
+            f"(allowed: {allowed}; 'ragged' is planned but not yet implemented)"
         )
 
     # dtype, when declared, must name a real numpy dtype (applies to all kinds).
     if "dtype" in meta:
         try:
             np.dtype(meta["dtype"])
-        except TypeError as e:
+        except (TypeError, ValueError) as e:
             raise ValueError(
                 f"Variable '{name}': dtype {meta['dtype']!r} is not a valid numpy dtype ({e})"
             ) from e
