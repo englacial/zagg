@@ -88,6 +88,58 @@ def _build_groups(
     return _group_columns(col_dict, cell_col)
 
 
+def _concat_and_group(all_reads, grid, handoff: str):
+    """Concat the per-group reads and split observations by cell.
+
+    Carrier-agnostic seam shared by :func:`process_shard` and its tests, so the
+    Arrow path is exercised end-to-end (including multi-table ``concat_tables``
+    ordering) rather than re-assembled inline. Both carriers feed identical numpy
+    arrays into :func:`_group_columns`, so the groupings — and the aggregations
+    computed from them — are byte-for-byte identical.
+
+    Parameters
+    ----------
+    all_reads : list
+        Per-group reads from ``_read_group``: ``pandas.DataFrame`` for the pandas
+        carrier, ``pyarrow.Table`` for the arrow carrier.
+    grid : OutputGrid
+        Provides ``cells_of`` to map leaf ids to child cell ids.
+    handoff : {"pandas", "arrow"}
+        Which carrier ``all_reads`` holds.
+
+    Returns
+    -------
+    col_arrays : dict[str, np.ndarray]
+        Column arrays sorted in ascending cell-id order.
+    cell_to_slice : dict[int, tuple[int, int]]
+        Maps each observed cell id to ``(start, end)`` into ``col_arrays``.
+    n_obs_total : int
+        Total observation count across all reads.
+    """
+    if handoff == "arrow":
+        import pyarrow as pa
+
+        table = pa.concat_tables(all_reads).combine_chunks()
+        # The arrow handoff requires dense, null-free columns: ``_read_group``
+        # builds tables from raw h5coro reads (no null mask), so
+        # ``to_numpy(zero_copy_only=False)`` is dtype-exact and matches ``.values``
+        # on the pandas side. Guard the precondition so a future nullable source
+        # can't silently diverge the two carriers instead of failing loudly.
+        null_cols = [n for n in table.column_names if table.column(n).null_count]
+        if null_cols:
+            raise ValueError(f"arrow handoff requires null-free columns; got nulls in {null_cols}")
+        n_obs_total = table.num_rows
+        cell_col = grid.cells_of(table.column("leaf_id").to_numpy(zero_copy_only=False))
+        col_dict = {n: table.column(n).to_numpy(zero_copy_only=False) for n in table.column_names}
+        col_arrays, cell_to_slice = _group_columns(col_dict, cell_col)
+    else:
+        df_all = pd.concat(all_reads, ignore_index=True)
+        n_obs_total = len(df_all)
+        cell_col = grid.cells_of(df_all["leaf_id"].values)
+        col_arrays, cell_to_slice = _build_groups(df_all, cell_col)
+    return col_arrays, cell_to_slice, n_obs_total
+
+
 def write_dataframe_to_zarr(
     df_out: pd.DataFrame,
     store: Store,
@@ -454,24 +506,9 @@ def process_shard(
         metadata["duration_s"] = (datetime.now() - start_time).total_seconds()
         return pd.DataFrame(), metadata
 
-    # Concat the per-group reads and split observations by cell. Both carriers
-    # feed identical numpy arrays into _group_columns, so outputs match exactly.
-    if use_arrow:
-        import pyarrow as pa
-
-        table = pa.concat_tables(all_reads).combine_chunks()
-        n_obs_total = table.num_rows
-        leaf_ids = table.column("leaf_id").to_numpy(zero_copy_only=False)
-        cell_col = grid.cells_of(leaf_ids)
-        col_dict = {
-            name: table.column(name).to_numpy(zero_copy_only=False) for name in table.column_names
-        }
-        col_arrays, cell_to_slice = _group_columns(col_dict, cell_col)
-    else:
-        df_all = pd.concat(all_reads, ignore_index=True)
-        n_obs_total = len(df_all)
-        cell_col = grid.cells_of(df_all["leaf_id"].values)
-        col_arrays, cell_to_slice = _build_groups(df_all, cell_col)
+    # Concat the per-group reads and split observations by cell (carrier-agnostic;
+    # both carriers feed identical numpy arrays into _group_columns).
+    col_arrays, cell_to_slice, n_obs_total = _concat_and_group(all_reads, grid, handoff)
     logger.info(f"  Read {n_obs_total:,} observations")
 
     # Calculate statistics for child cells

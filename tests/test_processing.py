@@ -8,6 +8,7 @@ from zagg.config import default_config, get_agg_fields, get_coords, get_data_var
 from zagg.grids import HealpixGrid
 from zagg.processing import (
     _build_groups,
+    _concat_and_group,
     _group_columns,
     calculate_cell_statistics,
     write_dataframe_to_zarr,
@@ -227,6 +228,79 @@ class TestArrowHandoff:
                 np.testing.assert_array_equal(
                     p_stats[key], a_stats[key], err_msg=f"{key} mismatch for cell {child}"
                 )
+
+    def test_concat_and_group_arrow_matches_pandas(self):
+        """_concat_and_group drives the real carrier path (incl. multi-table concat)."""
+        pa = pytest.importorskip("pyarrow")
+
+        class _IdentityGrid:
+            # leaf_id already is the cell id for this test; isolate the carrier
+            # path from grid semantics.
+            @staticmethod
+            def cells_of(leaf_ids):
+                return np.asarray(leaf_ids)
+
+        grid = _IdentityGrid()
+        cfg = default_config()
+        rng = np.random.default_rng(7)
+        child_ids = np.array([100, 200, 300, 400, 500], dtype=np.int64)
+
+        # Three reads of differing length -> exercises concat ordering / offsets.
+        reads = []
+        for n in (40, 7, 53):
+            cells = rng.choice(child_ids, size=n)
+            reads.append(
+                {
+                    "h_li": (rng.standard_normal(n) * 30.0).astype(np.float32),
+                    "s_li": (np.abs(rng.standard_normal(n)) + 0.01).astype(np.float32),
+                    "leaf_id": cells,
+                }
+            )
+        pandas_reads = [pd.DataFrame(r) for r in reads]
+        arrow_reads = [pa.table(r) for r in reads]
+
+        p_arrays, p_slices, p_n = _concat_and_group(pandas_reads, grid, "pandas")
+        a_arrays, a_slices, a_n = _concat_and_group(arrow_reads, grid, "arrow")
+
+        assert p_n == a_n == sum(len(r["leaf_id"]) for r in reads)
+        assert p_slices == a_slices
+        for child in child_ids:
+            child = int(child)
+            if child not in p_slices:
+                continue
+            ps, pe = p_slices[child]
+            as_, ae = a_slices[child]
+            p_stats = calculate_cell_statistics(
+                {k: v[ps:pe] for k, v in p_arrays.items()}, config=cfg
+            )
+            a_stats = calculate_cell_statistics(
+                {k: v[as_:ae] for k, v in a_arrays.items()}, config=cfg
+            )
+            for key in p_stats:
+                if np.isnan(p_stats[key]) and np.isnan(a_stats[key]):
+                    continue
+                np.testing.assert_array_equal(
+                    p_stats[key], a_stats[key], err_msg=f"{key} mismatch for cell {child}"
+                )
+
+    def test_concat_and_group_arrow_rejects_nulls(self):
+        """The arrow carrier must fail loudly on null columns, not silently diverge."""
+        pa = pytest.importorskip("pyarrow")
+
+        class _IdentityGrid:
+            @staticmethod
+            def cells_of(leaf_ids):
+                return np.asarray(leaf_ids)
+
+        table = pa.table(
+            {
+                "h_li": pa.array([1.0, None, 3.0], type=pa.float32()),
+                "s_li": pa.array([0.1, 0.2, 0.3], type=pa.float32()),
+                "leaf_id": pa.array([100, 200, 100], type=pa.int64()),
+            }
+        )
+        with pytest.raises(ValueError, match="null-free"):
+            _concat_and_group([table], _IdentityGrid(), "arrow")
 
 
 class TestDataSource:
