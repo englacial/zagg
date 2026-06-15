@@ -15,6 +15,15 @@ from zagg.processing import (
 )
 
 
+class _IdentityGrid:
+    """Grid stub whose cell id is the leaf id, isolating the carrier path in
+    ``_concat_and_group`` tests from real grid semantics."""
+
+    @staticmethod
+    def cells_of(leaf_ids):
+        return np.asarray(leaf_ids)
+
+
 class TestWriteDataframeToZarr:
     def test_write_dataframe_to_zarr(self, mock_dataframe_factory):
         parent_order = 6
@@ -233,13 +242,6 @@ class TestArrowHandoff:
         """_concat_and_group drives the real carrier path (incl. multi-table concat)."""
         pa = pytest.importorskip("pyarrow")
 
-        class _IdentityGrid:
-            # leaf_id already is the cell id for this test; isolate the carrier
-            # path from grid semantics.
-            @staticmethod
-            def cells_of(leaf_ids):
-                return np.asarray(leaf_ids)
-
         grid = _IdentityGrid()
         cfg = default_config()
         rng = np.random.default_rng(7)
@@ -284,19 +286,19 @@ class TestArrowHandoff:
                 )
 
     def test_concat_and_group_arrow_rejects_nulls(self):
-        """The arrow carrier must fail loudly on null columns, not silently diverge."""
-        pa = pytest.importorskip("pyarrow")
+        """The arrow carrier must fail loudly on null columns, not silently diverge.
 
-        class _IdentityGrid:
-            @staticmethod
-            def cells_of(leaf_ids):
-                return np.asarray(leaf_ids)
+        The null is in ``leaf_id`` — the grouping key — which is the case the guard
+        exists to catch: a null there would corrupt the cell assignment under
+        ``to_numpy``, not just a single stat.
+        """
+        pa = pytest.importorskip("pyarrow")
 
         table = pa.table(
             {
-                "h_li": pa.array([1.0, None, 3.0], type=pa.float32()),
+                "h_li": pa.array([1.0, 2.0, 3.0], type=pa.float32()),
                 "s_li": pa.array([0.1, 0.2, 0.3], type=pa.float32()),
-                "leaf_id": pa.array([100, 200, 100], type=pa.int64()),
+                "leaf_id": pa.array([100, None, 100], type=pa.int64()),
             }
         )
         with pytest.raises(ValueError, match="null-free"):
