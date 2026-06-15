@@ -158,6 +158,12 @@ function in one stack:
 OUTPUT_BUCKET=my-results-bucket bash deployment/aws/stand_up.sh
 ```
 
+By default (`CreateExecutionRole=true`) the stack creates the function's IAM
+execution role for you, so there is no out-of-band step. The only exception is an
+account whose deploy identity *cannot* create IAM roles (e.g. an AWS SSO "power
+user" set) — see [Execution Role](execution-role.md) for that IAM-constrained
+path, which is legacy/unverified.
+
 The Lambda code (deps layer + function zips) lives on the public **source.coop
 mirror** (`s3://us-west-2.opendata.source.coop/englacial/zagg/lambda/<minor>/`),
 keyed by zagg minor version (`0.N.x` → `0.N`). CloudFormation reads Lambda code
