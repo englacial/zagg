@@ -399,7 +399,9 @@ def _run_lambda(config, catalog_data, store_path, child_order, *,
     if not morton_cell:
         cells.sort(key=lambda kv: len(kv[1]), reverse=True)
 
-    logger.info(f"Processing {len(cells)} of {len(all_shards)} cells (lambda, {max_workers} workers)")
+    # Worker count is logged after the pre-flight clamp (see
+    # _log_concurrency_report); here max_workers is still the requested value.
+    logger.info(f"Processing {len(cells)} of {len(all_shards)} cells (lambda)")
 
     if dry_run:
         return _dry_run_summary(cells, store_path)
@@ -479,6 +481,7 @@ def _run_lambda(config, catalog_data, store_path, child_order, *,
                 function_name=function_name,
                 config_dict=config_dict,
                 output_creds_event=output_creds_event,
+                max_workers=max_workers,
             ): shard_key
             for shard_key, records in cells
         }
@@ -486,9 +489,11 @@ def _run_lambda(config, catalog_data, store_path, child_order, *,
         for i, future in enumerate(as_completed(futures), 1):
             try:
                 result = future.result()
-            except OSError as e:
-                # Surface client-side FD exhaustion loudly instead of letting
-                # invocations fail like an AWS/network fault and drop cells.
+            except Exception as e:
+                # _invoke_lambda_cell already re-raises FD exhaustion with
+                # ulimit guidance; this is a backstop for exhaustion that
+                # surfaces outside the cell body (e.g. at submit time). Other
+                # exceptions propagate unchanged.
                 raise_for_fd_exhaustion(e, max_workers)
                 raise
             results.append(result)
@@ -629,8 +634,13 @@ def _invoke_lambda_cell(
     lambda_client, chunk_idx, parent_morton, parent_order, child_order,
     granule_urls, store_path, s3_credentials, *,
     function_name, config_dict, output_creds_event=None, max_retries=3,
+    max_workers=None,
 ):
-    """Invoke Lambda for a single cell with retry logic."""
+    """Invoke Lambda for a single cell with retry logic.
+
+    ``max_workers`` is used only for the file-descriptor-exhaustion message
+    (#28); it does not affect dispatch.
+    """
     wall_start = time.time()
 
     event = {
@@ -693,6 +703,11 @@ def _invoke_lambda_cell(
                 "granule_count": len(granule_urls),
             }
         except Exception as e:
+            # Client-side FD exhaustion is run-fatal (every subsequent cell
+            # will hit it too) and was previously swallowed into a
+            # status_code=None result -- a silent dropped cell. Surface it
+            # loudly with ulimit guidance instead (#28).
+            raise_for_fd_exhaustion(e, max_workers)
             last_error = str(e)
             retryable = ["TooManyRequestsException", "Rate exceeded",
                          "Read timeout", "timed out", "UNEXPECTED_EOF"]

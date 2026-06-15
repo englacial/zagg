@@ -110,6 +110,47 @@ class TestFdExhaustionSurfaces:
         assert "--max-workers" in str(exc_info.value)
 
 
+class TestInvokeLambdaCellFdExhaustion:
+    """The cell must re-raise FD exhaustion, not swallow it into a result dict."""
+
+    def _call(self, client):
+        return runner._invoke_lambda_cell(
+            client, (0,), 10, 6, 12, ["s3://b/g.h5"], "s3://out/x.zarr",
+            {"accessKeyId": "a", "secretAccessKey": "s", "sessionToken": "t"},
+            function_name="process-shard", config_dict=None, max_workers=900,
+        )
+
+    def test_emfile_reraised_not_swallowed(self):
+        import errno
+
+        client = MagicMock()
+        client.invoke.side_effect = OSError(errno.EMFILE, "Too many open files")
+        with pytest.raises(OSError) as exc_info:
+            self._call(client)
+        assert exc_info.value.errno == errno.EMFILE
+        assert "ulimit -n" in str(exc_info.value)
+
+    def test_botocore_wrapped_emfile_reraised(self):
+        import errno
+
+        inner = OSError(errno.EMFILE, "Too many open files")
+        wrapped = ConnectionError("Could not connect to the endpoint URL")
+        wrapped.__cause__ = inner
+        client = MagicMock()
+        client.invoke.side_effect = wrapped
+        with pytest.raises(OSError) as exc_info:
+            self._call(client)
+        assert exc_info.value.errno == errno.EMFILE
+
+    def test_unrelated_error_still_returns_result(self):
+        # Non-FD errors keep the existing swallow-into-result behavior.
+        client = MagicMock()
+        client.invoke.side_effect = RuntimeError("some other boto failure")
+        result = self._call(client)
+        assert result["status_code"] is None
+        assert "some other boto failure" in result["error"]
+
+
 class TestLogConcurrencyReport:
     def test_logs_account_view(self, caplog):
         with caplog.at_level("INFO", logger="zagg.runner"):

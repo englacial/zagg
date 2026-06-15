@@ -27,6 +27,7 @@ IAM-dependent calls degrade gracefully: if the dispatch identity lacks
 ``lambda:GetFunctionConcurrency``, the probe falls back rather than failing.
 """
 
+import errno
 import logging
 import resource
 from dataclasses import dataclass
@@ -51,7 +52,7 @@ _CW_PERIOD_S = 60
 _CW_LOOKBACK_S = 300
 
 
-def fd_safe_max_workers(headroom: int = _FD_HEADROOM) -> int:
+def fd_safe_max_workers(headroom: int = _FD_HEADROOM, soft: int | None = None) -> int:
     """Largest worker count the open-file soft limit can safely sustain.
 
     Each Lambda worker holds one open socket, so the number of concurrent
@@ -63,47 +64,75 @@ def fd_safe_max_workers(headroom: int = _FD_HEADROOM) -> int:
     headroom : int
         File descriptors to reserve for non-worker use (stdio, catalog,
         boto3 metadata sockets). Default 32.
+    soft : int, optional
+        The soft limit to use. Defaults to reading ``RLIMIT_NOFILE``; pass it
+        to avoid a redundant read when the caller already has it.
 
     Returns
     -------
     int
         ``soft_limit - headroom``, floored at 1.
     """
-    soft, _hard = resource.getrlimit(resource.RLIMIT_NOFILE)
+    if soft is None:
+        soft, _hard = resource.getrlimit(resource.RLIMIT_NOFILE)
     return max(1, soft - headroom)
 
 
-def raise_for_fd_exhaustion(exc: OSError, max_workers: int) -> None:
-    """Re-raise an errno-24 ``OSError`` with actionable guidance.
+def is_fd_exhaustion(exc: BaseException) -> bool:
+    """Return True if ``exc`` (or its cause chain) is file-descriptor exhaustion.
 
-    The raw error -- ``[Errno 24] Too many open files`` / "Could not connect
-    to the endpoint URL" -- reads like an AWS or network fault, not a local
-    file-descriptor limit. Catch it at dispatch and call this so the operator
-    knows to raise ``ulimit -n`` or lower ``--max-workers``. Non-errno-24
-    ``OSError`` is left untouched (returns without raising).
+    A client-side ``[Errno 24] Too many open files`` is what surfaces when
+    concurrent workers exceed the open-file limit. botocore wraps it in a
+    ``ConnectionError`` ("Could not connect to the endpoint URL"), so the raw
+    ``OSError`` is usually buried in ``__cause__``/``__context__`` rather than
+    the top-level exception. This walks the chain for either an ``OSError``
+    with ``errno == EMFILE`` or the "too many open files" message text.
+    """
+    seen: set[int] = set()
+    cur: BaseException | None = exc
+    while cur is not None and id(cur) not in seen:
+        seen.add(id(cur))
+        if isinstance(cur, OSError) and cur.errno == errno.EMFILE:
+            return True
+        if "too many open files" in str(cur).lower():
+            return True
+        cur = cur.__cause__ or cur.__context__
+    return False
+
+
+def raise_for_fd_exhaustion(exc: BaseException, max_workers: int) -> None:
+    """Re-raise file-descriptor exhaustion with actionable guidance.
+
+    The raw error -- ``[Errno 24] Too many open files``, often wrapped by
+    botocore as "Could not connect to the endpoint URL" -- reads like an AWS
+    or network fault, not a local file-descriptor limit. Catch it at dispatch
+    and call this so the operator knows to raise ``ulimit -n`` or lower
+    ``--max-workers``. Anything that is not FD exhaustion
+    (:func:`is_fd_exhaustion`) is left untouched (returns without raising).
 
     Parameters
     ----------
-    exc : OSError
-        The caught error.
+    exc : BaseException
+        The caught error (the botocore/OSError, possibly wrapping the real
+        ``OSError`` in its cause chain).
     max_workers : int
         The worker count in effect, for the message.
 
     Raises
     ------
     OSError
-        A new errno-24 ``OSError`` chained to ``exc`` with guidance, when
-        ``exc`` is errno 24.
+        A new ``EMFILE`` ``OSError`` chained to ``exc`` with guidance, when
+        ``exc`` is FD exhaustion.
     """
-    if exc.errno != 24:
+    if not is_fd_exhaustion(exc):
         return
     soft, hard = resource.getrlimit(resource.RLIMIT_NOFILE)
     raise OSError(
-        24,
+        errno.EMFILE,
         f"Too many open files: {max_workers} Lambda workers exceeded the "
         f"open-file soft limit (ulimit -n = {soft}, hard = {hard}). Cells "
         f"would be silently dropped. Raise the limit (e.g. `ulimit -n 8192`) "
-        f"or lower --max-workers to <= {fd_safe_max_workers()}.",
+        f"or lower --max-workers to <= {fd_safe_max_workers(soft=soft)}.",
     ) from exc
 
 
