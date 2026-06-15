@@ -147,16 +147,12 @@ def validate_config(config: PipelineConfig) -> None:
         if grid["type"] == "rectilinear":
             for field in ("crs", "resolution", "bounds"):
                 if field not in grid:
-                    raise ValueError(
-                        f"output.grid.{field} is required for rectilinear grid"
-                    )
+                    raise ValueError(f"output.grid.{field} is required for rectilinear grid")
             if len(grid["bounds"]) != 4:
                 raise ValueError("output.grid.bounds must be [xmin, ymin, xmax, ymax]")
         layout = grid.get("layout")
         if layout is not None and layout not in ("dense", "fullsphere"):
-            raise ValueError(
-                f"output.grid.layout must be 'dense' or 'fullsphere' (got {layout!r})"
-            )
+            raise ValueError(f"output.grid.layout must be 'dense' or 'fullsphere' (got {layout!r})")
 
     # Validate bounds structure (optional)
     if config.bounds is not None:
@@ -184,16 +180,12 @@ def validate_config(config: PipelineConfig) -> None:
 
         # Must have one (count via function:len is allowed)
         if not has_func and not has_expr:
-            raise ValueError(
-                f"Variable '{name}': must specify 'function' or 'expression'"
-            )
+            raise ValueError(f"Variable '{name}': must specify 'function' or 'expression'")
 
         # Validate source references
         source = meta.get("source")
         if source is not None and source not in ds_vars:
-            raise ValueError(
-                f"Variable '{name}': source '{source}' not in data_source.variables"
-            )
+            raise ValueError(f"Variable '{name}': source '{source}' not in data_source.variables")
 
         # Validate function resolves
         if has_func:
@@ -216,6 +208,85 @@ def validate_config(config: PipelineConfig) -> None:
         # Validate expression column references
         if has_expr:
             _validate_expression_columns(name, meta["expression"], ds_vars)
+
+        # Validate the output-kind declaration (kind + trailing_shape + dtype)
+        _validate_output_kind(name, meta)
+
+
+# Recognized per-field output kinds. ``ragged`` (CSR) is Tier 2 and not yet
+# accepted; see issue #29.
+OUTPUT_KINDS = ("scalar", "vector")
+
+
+def _validate_output_kind(name: str, meta: dict) -> None:
+    """Validate a variable's non-scalar output declaration.
+
+    A field may declare ``kind`` (``scalar`` default, or ``vector``),
+    ``trailing_shape`` (required for ``vector``), and a ``fill``/``pad_weight``
+    sentinel. ``scalar`` fields need none of these and stay the default path.
+
+    Parameters
+    ----------
+    name : str
+        Variable name (for error messages).
+    meta : dict
+        The variable's aggregation metadata.
+
+    Raises
+    ------
+    ValueError
+        On any invalid output-kind declaration.
+    """
+    kind = meta.get("kind", "scalar")
+    if kind not in OUTPUT_KINDS:
+        raise ValueError(
+            f"Variable '{name}': output kind '{kind}' is not supported "
+            f"(allowed: {OUTPUT_KINDS}; 'ragged' is planned but not yet implemented)"
+        )
+
+    # dtype, when declared, must name a real numpy dtype (applies to all kinds).
+    if "dtype" in meta:
+        try:
+            np.dtype(meta["dtype"])
+        except TypeError as e:
+            raise ValueError(
+                f"Variable '{name}': dtype {meta['dtype']!r} is not a valid numpy dtype ({e})"
+            ) from e
+
+    has_trailing = "trailing_shape" in meta
+
+    if kind == "scalar":
+        if has_trailing:
+            raise ValueError(
+                f"Variable '{name}': 'trailing_shape' is only valid for kind 'vector', not 'scalar'"
+            )
+        return
+
+    # kind == "vector": trailing_shape is required and must be positive ints.
+    if not has_trailing:
+        raise ValueError(f"Variable '{name}': kind 'vector' requires 'trailing_shape'")
+    _validate_trailing_shape(name, meta["trailing_shape"])
+
+
+def _validate_trailing_shape(name: str, trailing_shape) -> None:
+    """Check a vector field's trailing_shape is a tuple of positive ints."""
+    if isinstance(trailing_shape, int):
+        dims: tuple = (trailing_shape,)
+    elif isinstance(trailing_shape, (list, tuple)):
+        dims = tuple(trailing_shape)
+    else:
+        raise ValueError(
+            f"Variable '{name}': 'trailing_shape' must be an int or a "
+            f"sequence of ints (got {trailing_shape!r})"
+        )
+    if not dims:
+        raise ValueError(f"Variable '{name}': 'trailing_shape' must have at least one dimension")
+    for dim in dims:
+        if not isinstance(dim, int) or isinstance(dim, bool) or dim < 1:
+            raise ValueError(
+                f"Variable '{name}': 'trailing_shape' entries must be positive "
+                f"integers (got {dim!r})"
+            )
 
 
 def _is_numeric(s: str) -> bool:
@@ -304,9 +375,46 @@ def get_agg_fields(config: PipelineConfig) -> dict:
     Returns
     -------
     dict
-        ``{name: {function/expression, source, params, dtype, fill_value, ...}}``
+        ``{name: {function/expression, source, params, dtype, fill_value, ...}}``.
+        A field may also declare a non-scalar output (issue #29) via ``kind``
+        (``scalar`` default, or ``vector``) and ``trailing_shape``; use
+        :func:`get_output_signature` to read the normalized declaration.
     """
     return dict(config.aggregation.get("variables", {}))
+
+
+def get_output_signature(meta: dict) -> dict:
+    """Return the normalized non-scalar output signature for one agg field.
+
+    This is the single read point for a field's Option B declaration (issue
+    #29): its output ``kind``, the per-cell ``trailing_shape``, and ``dtype``.
+    Later phases (statistic eval, the per-shard container, and the grid
+    ``signature()``) consume this rather than re-parsing the raw metadata.
+
+    Parameters
+    ----------
+    meta : dict
+        A single variable's aggregation metadata (a value of
+        :func:`get_agg_fields`).
+
+    Returns
+    -------
+    dict
+        ``{"kind": str, "trailing_shape": tuple[int, ...], "dtype": str}``.
+        ``trailing_shape`` is ``()`` for scalar fields. ``dtype`` is the
+        declared dtype string, or ``None`` if unset.
+    """
+    kind = meta.get("kind", "scalar")
+    if kind == "vector":
+        ts = meta["trailing_shape"]
+        trailing_shape = (ts,) if isinstance(ts, int) else tuple(ts)
+    else:
+        trailing_shape = ()
+    return {
+        "kind": kind,
+        "trailing_shape": trailing_shape,
+        "dtype": meta.get("dtype"),
+    }
 
 
 def get_coords(config: PipelineConfig) -> list[str]:
