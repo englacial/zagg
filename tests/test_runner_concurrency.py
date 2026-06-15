@@ -17,15 +17,22 @@ from zagg.config import default_config
 @pytest.fixture
 def lambda_env(monkeypatch):
     """Stub the AWS-touching seams of ``_run_lambda`` and capture the pool size."""
-    monkeypatch.setattr(runner, "get_nsidc_s3_credentials", lambda: {
-        "accessKeyId": "AKIA", "secretAccessKey": "s", "sessionToken": "t",
-    })
+    monkeypatch.setattr(
+        runner,
+        "get_nsidc_s3_credentials",
+        lambda: {
+            "accessKeyId": "AKIA",
+            "secretAccessKey": "s",
+            "sessionToken": "t",
+        },
+    )
 
     # Stub grid construction (signature must match the catalog).
     grid = MagicMock()
     grid.signature.return_value = {}
     grid.block_index.side_effect = lambda k: (k,)
     import zagg.grids as grids_mod
+
     monkeypatch.setattr(grids_mod, "from_config", lambda *a, **k: grid)
 
     # Stub setup/finalize invokes (no real Lambda).
@@ -44,6 +51,7 @@ def lambda_env(monkeypatch):
 
     # Stub boto3.Session so no real clients are created.
     import boto3
+
     monkeypatch.setattr(boto3, "Session", lambda *a, **k: MagicMock())
 
     return {"grid": grid, "captured": captured}
@@ -60,8 +68,11 @@ def _catalog():
 
 def _report(available):
     return ConcurrencyReport(
-        account_limit=1000, current_concurrent=100, padding=100,
-        available=available, function_reserved=None,
+        account_limit=1000,
+        current_concurrent=100,
+        padding=100,
+        available=available,
+        function_reserved=None,
     )
 
 
@@ -69,18 +80,33 @@ class TestProbeClampsWorkers:
     def test_pool_sized_to_clamped_workers(self, lambda_env, monkeypatch):
         # Probe clamps requested 1700 down to 64.
         monkeypatch.setattr(
-            runner, "compute_available_workers",
+            runner,
+            "compute_available_workers",
             lambda requested, *a, **k: (64, _report(64)),
         )
         monkeypatch.setattr(
-            runner, "_invoke_lambda_cell",
-            lambda *a, **k: {"status_code": 200, "body": {"total_obs": 5},
-                             "error": None, "lambda_duration": 1.0, "morton": 0},
+            runner,
+            "_invoke_lambda_cell",
+            lambda *a, **k: {
+                "status_code": 200,
+                "body": {"total_obs": 5},
+                "error": None,
+                "lambda_duration": 1.0,
+                "morton": 0,
+            },
         )
         summary = runner._run_lambda(
-            default_config("atl06"), _catalog(), "s3://out/x.zarr", 12,
-            max_cells=None, morton_cell=None, max_workers=1700, overwrite=False,
-            dry_run=False, region="us-west-2", function_name="process-shard",
+            default_config("atl06"),
+            _catalog(),
+            "s3://out/x.zarr",
+            12,
+            max_cells=None,
+            morton_cell=None,
+            max_workers=1700,
+            overwrite=False,
+            dry_run=False,
+            region="us-west-2",
+            function_name="process-shard",
         )
         assert lambda_env["captured"]["max_workers"] == 64
         assert summary["cells_with_data"] == 4
@@ -89,7 +115,8 @@ class TestProbeClampsWorkers:
 class TestFdExhaustionSurfaces:
     def test_errno_24_in_future_reraised_with_guidance(self, lambda_env, monkeypatch):
         monkeypatch.setattr(
-            runner, "compute_available_workers",
+            runner,
+            "compute_available_workers",
             lambda requested, *a, **k: (100, _report(100)),
         )
 
@@ -100,9 +127,16 @@ class TestFdExhaustionSurfaces:
 
         with pytest.raises(OSError) as exc_info:
             runner._run_lambda(
-                default_config("atl06"), _catalog(), "s3://out/x.zarr", 12,
-                max_cells=None, morton_cell=None, max_workers=100,
-                overwrite=False, dry_run=False, region="us-west-2",
+                default_config("atl06"),
+                _catalog(),
+                "s3://out/x.zarr",
+                12,
+                max_cells=None,
+                morton_cell=None,
+                max_workers=100,
+                overwrite=False,
+                dry_run=False,
+                region="us-west-2",
                 function_name="process-shard",
             )
         assert exc_info.value.errno == 24
@@ -115,9 +149,17 @@ class TestInvokeLambdaCellFdExhaustion:
 
     def _call(self, client):
         return runner._invoke_lambda_cell(
-            client, (0,), 10, 6, 12, ["s3://b/g.h5"], "s3://out/x.zarr",
+            client,
+            (0,),
+            10,
+            6,
+            12,
+            ["s3://b/g.h5"],
+            "s3://out/x.zarr",
             {"accessKeyId": "a", "secretAccessKey": "s", "sessionToken": "t"},
-            function_name="process-shard", config_dict=None, max_workers=900,
+            function_name="process-shard",
+            config_dict=None,
+            max_workers=900,
         )
 
     def test_emfile_reraised_not_swallowed(self):
@@ -162,8 +204,11 @@ class TestLogConcurrencyReport:
 
     def test_warns_when_account_unreadable(self, caplog):
         report = ConcurrencyReport(
-            account_limit=None, current_concurrent=0, padding=100,
-            available=None, function_reserved=None,
+            account_limit=None,
+            current_concurrent=0,
+            padding=100,
+            available=None,
+            function_reserved=None,
         )
         with caplog.at_level("WARNING", logger="zagg.runner"):
             runner._log_concurrency_report(report, 224)
@@ -172,8 +217,11 @@ class TestLogConcurrencyReport:
 
     def test_reports_function_reserved(self, caplog):
         report = ConcurrencyReport(
-            account_limit=1000, current_concurrent=0, padding=100,
-            available=900, function_reserved=50,
+            account_limit=1000,
+            current_concurrent=0,
+            padding=100,
+            available=900,
+            function_reserved=50,
         )
         with caplog.at_level("INFO", logger="zagg.runner"):
             runner._log_concurrency_report(report, 900)
