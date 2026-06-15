@@ -23,18 +23,15 @@ comes from the **same pipeline config** the aggregator uses (`--config`), so the
 shard map can't be built against a different grid than the run.
 
 ```bash
-# Install the catalog extra (STAC fetch + shard-map build). The default
-# geometry backend is mortie (HEALPix MOC); non-HEALPix grids use spherely.
+# Install the catalog extra (STAC fetch + shard-map build). The geometry
+# backend defaults to `auto`: exact-S2 spherely if its fork is installed (used
+# for all grids), else mortie (HEALPix MOC); rectilinear grids require spherely.
 pip install 'zagg[catalog]'
 
-# spherely (exact-S2 intersection): the SpatialIndex build is a fork not on
-# PyPI (benbovy/spherely#118) — install it separately for the fast tree path
-# (pick the wheel for your python/platform from the release assets):
+# Optional: the exact-S2 spherely SpatialIndex backend is a fork not on PyPI
+# (benbovy/spherely#118) — install it separately (pick the wheel for your
+# python/platform from the release assets):
 # pip install "spherely @ https://github.com/espg/spherely/releases/download/v0.1.1-spatialindex/spherely-0.1.1+spatialindex-cp312-cp312-manylinux_2_28_x86_64.whl"
-# Without the fork, stock spherely still works via a slower brute-force path
-# (O(granules x shards), no tree prefilter) until SpatialIndex lands upstream.
-# shapely is no longer an intersection backend (it had antimeridian/near-pole
-# bugs, #36) — it is still used for WKB decode and footprint geometry.
 
 # ICESat-2 convenience — cycle number computes dates automatically:
 uv run python -m zagg.catalog --config atl06.yaml --short-name ATL06 --cycle 22 \

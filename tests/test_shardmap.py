@@ -144,6 +144,11 @@ class TestBuildSpherelyBrute:
         assert sm.metadata["total_pairs"] == sum(len(g) for g in sm.granules)
         assert sm.metadata["total_granules"] == 3
 
+    def test_brute_empty_records_early_out(self, grid, fake_spherely):
+        # No records -> no polygons -> {} early-out, no intersect call (#36 brute path).
+        from zagg.catalog.shardmap import _intersect_spherely
+        assert _intersect_spherely([], grid, {}) == {}
+
 
 class TestSpherelyAbsent:
     """When spherely is genuinely absent, the backend raises with a pointer."""
@@ -210,6 +215,17 @@ class TestResolveBackend:
     def test_unknown_backend_raises(self, catalog, grid):
         with pytest.raises(ValueError, match="unknown backend"):
             ShardMap.build(catalog, grid, backend="nope")
+
+    def test_cli_rejects_shapely_backend(self, monkeypatch):
+        # shapely was dropped as a backend (#36); the CLI must not accept it.
+        from zagg.catalog import main
+        monkeypatch.setattr(
+            sys, "argv",
+            ["zagg-catalog", "--config", "x.yaml", "--short-name", "ATL03",
+             "--backend", "shapely"],
+        )
+        with pytest.raises(SystemExit):
+            main()
 
 
 class TestIO:
