@@ -23,10 +23,11 @@ x86_64 / py3.12 is available for local/testing parity.
 - **Architecture**: arm64 (default; x86_64 also supported)
 - **Layer**: `zagg-deps-{arch}` (py3.12, pyproj/odc-geo for rectilinear grids, h5coro==0.0.8)
 - **Function code**: `lambda_handler.py` + `zagg/` package + obstore/zarr/pydantic-zarr/pyyaml
-- **Role**: created by `template.yaml` (`<FunctionName>-deps` layer; default
-  function `process-shard`), scoped least-privilege to the `OutputBucketName`
-  bucket you pass to `stand_up.sh` — *not* a fixed `zagg-lambda-execution`/`xagg`.
-  (The legacy `deploy.sh` in-place updater still defaults `ZAGG_S3_BUCKET=xagg`
+- **Role**: created by `template.yaml` (CloudFormation-auto-named; the template
+  sets no `RoleName`), scoped least-privilege to the `OutputBucketName` bucket
+  you pass to `stand_up.sh` — *not* a fixed `zagg-lambda-execution`/`xagg`. (The
+  dependency layer is named `<FunctionName>-deps`, default `process-shard-deps`.
+  The legacy `deploy.sh` in-place updater still defaults `ZAGG_S3_BUCKET=xagg`
   for its >50MB staging copies; that is the updater's staging bucket, not the
   output bucket.)
 
