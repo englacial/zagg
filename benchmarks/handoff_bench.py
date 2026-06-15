@@ -11,7 +11,10 @@ in-memory observations:
 The first three feed identical numpy arrays into the reducer, so their stats are
 asserted byte-for-byte identical. ``arrow-kernel`` reduces via pyarrow's C++ hash
 kernels, whose float mean/variance differ from numpy by ~1 ULP; it is asserted
-*close* (``np.allclose`` at ``KERNEL_RTOL``), not identical.
+*close* (``np.allclose`` at ``KERNEL_RTOL``), not identical. Its count/min/max are
+asserted *exact*; this synthetic data is NaN-free, so the kernel's NaN-propagation
+fix (pyarrow min/max skip NaN, numpy propagate) is covered in the unit tests, not
+here.
 
 This is the CI-runnable half of #30's benchmark: it isolates the grouping
 algorithm, the carrier representation cost, and the kernel reducer with no I/O,
