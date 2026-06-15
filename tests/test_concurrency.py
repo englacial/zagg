@@ -63,21 +63,67 @@ class TestFdSafeMaxWorkers:
         assert concurrency.fd_safe_max_workers() == 1
 
 
+class TestIsFdExhaustion:
+    def test_bare_emfile_oserror(self):
+        import errno
+
+        assert concurrency.is_fd_exhaustion(OSError(errno.EMFILE, "Too many open files"))
+
+    def test_wrapped_in_cause_chain(self):
+        # Mimics botocore wrapping the OSError in a ConnectionError.
+        import errno
+
+        inner = OSError(errno.EMFILE, "Too many open files")
+        outer = ConnectionError("Could not connect to the endpoint URL")
+        outer.__cause__ = inner
+        assert concurrency.is_fd_exhaustion(outer)
+
+    def test_message_only_match(self):
+        # No errno set, just the telltale message (some wrappers stringify).
+        assert concurrency.is_fd_exhaustion(RuntimeError("[Errno 24] Too many open files"))
+
+    def test_unrelated_error_is_false(self):
+        assert not concurrency.is_fd_exhaustion(OSError(13, "Permission denied"))
+        assert not concurrency.is_fd_exhaustion(ValueError("nope"))
+
+    def test_self_referential_chain_terminates(self):
+        # A cycle in __context__ must not loop forever.
+        e = ValueError("loop")
+        e.__context__ = e
+        assert not concurrency.is_fd_exhaustion(e)
+
+
 class TestRaiseForFdExhaustion:
-    def test_errno_24_raises_with_guidance(self, fake_rlimit):
+    def test_emfile_raises_with_guidance(self, fake_rlimit):
+        import errno
+
         fake_rlimit(256, 1024)
-        original = OSError(24, "Too many open files")
+        original = OSError(errno.EMFILE, "Too many open files")
         with pytest.raises(OSError) as exc_info:
             concurrency.raise_for_fd_exhaustion(original, max_workers=900)
         msg = str(exc_info.value)
-        assert exc_info.value.errno == 24
+        assert exc_info.value.errno == errno.EMFILE
         assert "ulimit -n" in msg
         assert "--max-workers" in msg
         assert "900" in msg  # the offending worker count
         assert "256" in msg  # the soft limit
         assert exc_info.value.__cause__ is original
 
-    def test_non_errno_24_is_noop(self):
+    def test_botocore_wrapped_raises(self, fake_rlimit):
+        # The realistic path: a ConnectionError whose cause is the OSError.
+        import errno
+
+        fake_rlimit(256, 1024)
+        inner = OSError(errno.EMFILE, "Too many open files")
+        outer = ConnectionError("Could not connect to the endpoint URL")
+        outer.__cause__ = inner
+        with pytest.raises(OSError) as exc_info:
+            concurrency.raise_for_fd_exhaustion(outer, max_workers=500)
+        assert exc_info.value.errno == errno.EMFILE
+        assert "ulimit -n" in str(exc_info.value)
+        assert exc_info.value.__cause__ is outer
+
+    def test_non_fd_error_is_noop(self):
         # A different OSError must pass through untouched (no raise).
         concurrency.raise_for_fd_exhaustion(OSError(13, "Permission denied"), 100)
 
