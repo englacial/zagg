@@ -114,7 +114,7 @@ Target coverage: ~1,300 cells covering Antarctic grounded ice drainage basins (e
 │ │       │                                                      │ │ │
 │ │       ▼                                                      │ │ │
 │ │  ┌──────────────────────────────────────────────────────┐   │ │ │
-│ │  │  process_morton_cell()           processing.py       │   │◄┘ │
+│ │  │  process_shard()                 processing.py       │   │◄┘ │
 │ │  │                                                      │   │   │
 │ │  │  For each granule URL:                               │   │   │
 │ │  │    For each ground track (gt1l..gt3r):               │   │   │
