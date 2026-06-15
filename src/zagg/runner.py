@@ -448,7 +448,7 @@ def _run_lambda(config, catalog_data, store_path, child_order, *,
         retries={"max_attempts": 0},
         max_pool_connections=max_workers,
     )
-    lambda_client = boto3.Session().client(
+    lambda_client = session.client(
         "lambda", region_name=region, config=boto_config,
     )
 
