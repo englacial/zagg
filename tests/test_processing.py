@@ -7,9 +7,12 @@ from zarr.storage import MemoryStore
 from zagg.config import default_config, get_agg_fields, get_coords, get_data_vars
 from zagg.grids import HealpixGrid
 from zagg.processing import (
+    KERNEL_RTOL,
     _build_groups,
     _concat_and_group,
     _group_columns,
+    _kernel_able,
+    _kernel_aggregate,
     calculate_cell_statistics,
     write_dataframe_to_zarr,
 )
@@ -303,6 +306,104 @@ class TestArrowHandoff:
         )
         with pytest.raises(ValueError, match="null-free"):
             _concat_and_group([table], _IdentityGrid(), "arrow")
+
+
+class TestKernelHandoff:
+    """Phase 2b of #30 (EXPERIMENTAL): the pyarrow hash-aggregate kernel reducer.
+
+    Unlike the pandas<->arrow *carrier* equivalence (byte-for-byte identical), the
+    kernel path's float mean/variance diverge from numpy by ~1 ULP, so it is
+    validated within :data:`KERNEL_RTOL`, not by exact equality.
+    """
+
+    def _numpy_reference(self, col_dict, cell_col, children, cfg):
+        """Default per-cell numpy stats, as ``name -> ndarray`` over ``children``."""
+        col_arrays, cell_to_slice = _group_columns(col_dict, cell_col)
+        empty = {c: a[:0] for c, a in col_arrays.items()}
+        out = {v: np.full(len(children), np.nan, dtype=np.float64) for v in get_data_vars(cfg)}
+        for i, child in enumerate(children):
+            child = int(child)
+            if child in cell_to_slice:
+                s, e = cell_to_slice[child]
+                cell_data = {c: a[s:e] for c, a in col_arrays.items()}
+            else:
+                cell_data = empty
+            stats = calculate_cell_statistics(cell_data, config=cfg)
+            for k, v in stats.items():
+                out[k][i] = v
+        return out
+
+    def test_kernel_able_classification(self):
+        """count/min/max/var and unweighted average are kernel-able; the rest fall back."""
+        cfg = default_config()
+        fields = get_agg_fields(cfg)
+        # Default atl06 config: count/h_min/h_max/h_variance are pure reductions;
+        # h_mean is weighted, h_sigma is an expression, the quantiles are tdigest.
+        assert _kernel_able(fields["count"])
+        assert _kernel_able(fields["h_min"])
+        assert _kernel_able(fields["h_max"])
+        assert _kernel_able(fields["h_variance"])
+        assert not _kernel_able(fields["h_mean"])  # weighted average
+        assert not _kernel_able(fields["h_sigma"])  # expression
+        assert not _kernel_able(fields["h_q50"])  # quantile
+        # Unweighted average would be kernel-able.
+        assert _kernel_able({"function": "average", "source": "h_li"})
+
+    def test_kernel_matches_numpy_within_tolerance(self):
+        """Kernel stats match the numpy reducer within KERNEL_RTOL (exact where integral)."""
+        pa = pytest.importorskip("pyarrow")
+        cfg = default_config()
+        rng = np.random.default_rng(3)
+        children = np.array([100, 200, 300, 400, 500], dtype=np.int64)
+        n = 2000
+        cells = rng.choice(children, size=n)
+        h = (rng.standard_normal(n) * 30.0).astype(np.float32)
+        s = (np.abs(rng.standard_normal(n)) + 0.01).astype(np.float32)
+        col_dict = {"h_li": h, "s_li": s, "leaf_id": cells}
+
+        ref = self._numpy_reference(col_dict, cells, children, cfg)
+        table = pa.table(col_dict)
+        kernel = _kernel_aggregate(table, cells, children, "h_li", cfg)
+        ks = kernel["stats_arrays"]
+
+        assert kernel["cells_with_data"] == len(children)
+        # count/min/max are integral or order-independent extrema: exact.
+        for name in ("count", "h_min", "h_max"):
+            np.testing.assert_array_equal(
+                np.asarray(ks[name], dtype=np.float64), ref[name], err_msg=name
+            )
+        # variance is the kernel-reduced float stat: close, not identical.
+        np.testing.assert_allclose(
+            np.asarray(ks["h_variance"], dtype=np.float64),
+            ref["h_variance"],
+            rtol=KERNEL_RTOL,
+            equal_nan=True,
+        )
+        # Fallback fields (weighted mean, expression, quantiles) stay byte-identical
+        # to numpy because the kernel path routes them through the same reducer.
+        for name in ("h_mean", "h_sigma", "h_q25", "h_q50", "h_q75"):
+            np.testing.assert_array_equal(
+                np.asarray(ks[name], dtype=np.float64), ref[name], err_msg=name
+            )
+
+    def test_kernel_empty_cells_get_fill_values(self):
+        """Cells with no observations get count=0 and NaN floats, like the default path."""
+        pa = pytest.importorskip("pyarrow")
+        cfg = default_config()
+        children = np.array([1, 2, 3], dtype=np.int64)
+        # Only cell 2 has data.
+        cells = np.array([2, 2, 2], dtype=np.int64)
+        col_dict = {
+            "h_li": np.array([1.0, 2.0, 3.0], dtype=np.float32),
+            "s_li": np.array([0.1, 0.1, 0.1], dtype=np.float32),
+            "leaf_id": cells,
+        }
+        kernel = _kernel_aggregate(pa.table(col_dict), cells, children, "h_li", cfg)
+        ks = kernel["stats_arrays"]
+        assert kernel["cells_with_data"] == 1
+        assert list(ks["count"]) == [0, 3, 0]
+        assert np.isnan(ks["h_min"][0]) and np.isnan(ks["h_min"][2])
+        assert ks["h_min"][1] == 1.0
 
 
 class TestDataSource:
