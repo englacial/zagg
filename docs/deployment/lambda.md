@@ -39,7 +39,7 @@ The Lambda function processes a single morton cell (order 6) by:
 | `deployment/aws/lambda_handler.py` | AWS Lambda wrapper function |
 | `src/zagg/processing.py` | Cloud-agnostic core processing logic |
 | `src/zagg/auth.py` | NASA Earthdata authentication helper |
-| `src/zagg/catalog.py` | CMR granule catalog builder |
+| `src/zagg/catalog/` | CMR/STAC shard-map (granule catalog) builder (`python -m zagg.catalog`) |
 | `deployment/aws/invoke_lambda.py` | Orchestration script |
 | `deployment/aws/build_layer.sh` | Lambda layer build script (`x86_64`/`arm64`) |
 
@@ -81,6 +81,17 @@ The Lambda function processes a single morton cell (order 6) by:
 | `store_path` | str | Yes | Output Zarr store path (e.g. `s3://bucket/prefix.zarr`) |
 | `s3_credentials` | dict | Yes | NSIDC S3 credentials for reading source data |
 | `output_credentials` | dict | No | Explicit credentials for *writing* the output store. Omit to use the execution role (in-account writes). Supply to write an external / S3-compatible target. Keys: `accessKeyId`, `secretAccessKey`, optional `sessionToken`/`endpointUrl`/`region`. |
+
+!!! note "Shard vs. `parent_order` naming"
+    The unit of work is a **shard** — one parent (order-6) HEALPix cell. The
+    orchestrator and the catalog use that vocabulary (`python -m zagg.catalog`
+    emits a shard map with `shard_keys` + a `grid_signature`). The Lambda
+    **event** schema, however, still carries the HEALPix-shaped field names
+    `parent_morton` / `parent_order` / `child_order` shown above (the handler
+    requires them — see `deployment/aws/lambda_handler.py`). A grid-neutral
+    rename of those event fields is tracked in
+    [#24](https://github.com/englacial/zagg/issues/24), not done here, so the
+    field names above are the current, accurate ones.
 
 ### S3 Credentials
 
@@ -148,50 +159,38 @@ path-style addressing automatically.
 
 ## Deployment
 
-### Reproducible standup (CloudFormation)
+### Recommended: CloudFormation standup
 
-The fastest way to stand up the backend in a fresh AWS account is the committed
-CloudFormation template, which creates the execution role, dependency layer, and
-function in one stack:
+The recommended way to stand up the backend in a fresh AWS account is the
+committed CloudFormation template, driven by `stand_up.sh`, which creates the
+execution role, dependency layer, and function in one stack:
 
 ```bash
 OUTPUT_BUCKET=my-results-bucket bash deployment/aws/stand_up.sh
 ```
 
-By default (`CreateExecutionRole=true`) the stack creates the function's IAM
-execution role for you, so there is no out-of-band step. The only exception is an
-account whose deploy identity *cannot* create IAM roles (e.g. an AWS SSO "power
-user" set) — see [Execution Role](execution-role.md) for that IAM-constrained
-path, which is legacy/unverified.
+See **[Standing Up the Backend](standup.md)** for the full walkthrough: what the
+script does, the parameter/environment-variable reference, cross-region staging,
+and teardown. By default (`CreateExecutionRole=true`) the stack creates the IAM
+execution role for you; the only exception is an account whose deploy identity
+*cannot* create IAM roles (e.g. an AWS SSO "power user" set) — see
+[Execution Role](execution-role.md) for that IAM-constrained, legacy/unverified
+path.
 
-The Lambda code (deps layer + function zips) lives on the public **source.coop
-mirror** (`s3://us-west-2.opendata.source.coop/englacial/zagg/lambda/<minor>/`),
-keyed by zagg minor version (`0.N.x` → `0.N`). CloudFormation reads Lambda code
-from a same-region bucket, so in **us-west-2** `stand_up.sh` points the stack
-straight at the mirror (no staging bucket needed); in **other regions** it copies
-the zips from the mirror into a `STAGING_BUCKET` you own first. It then deploys
-`deployment/aws/template.yaml`. Useful overrides (environment variables):
+### Legacy / manual deploy {#legacy-manual-deploy}
 
-| Variable | Default | Purpose |
-|----------|---------|---------|
-| `OUTPUT_BUCKET` | *(required)* | Bucket for results; role is scoped to it |
-| `CREATE_BUCKET` | `false` | `true` makes the stack create `OUTPUT_BUCKET` |
-| `ARCH` | `arm64` | `arm64` or `x86_64` (both py3.12) |
-| `REGION` | `us-west-2` | Deployment region |
-| `STAGING_BUCKET` | *(none)* | Required outside us-west-2: your same-region bucket the mirror zips are copied into |
-| `LAMBDA_VERSION` | *(derived)* | Lambda minor to deploy (default: the repo's latest git tag, else the installed zagg) |
-| `STACK_NAME` | `zagg-backend` | CloudFormation stack name |
-| `MIRROR_BUCKET` / `MIRROR_PREFIX` | source.coop | Override to self-host the artifact mirror |
+!!! warning "Not the recommended path"
+    The steps below hand-assemble the function zip and create/update the Lambda
+    with raw `aws lambda` calls. They are kept for understanding what the
+    template builds and for one-off tweaks, but the
+    **[CloudFormation standup](standup.md)** above is the preferred, reproducible
+    way to deploy. The maintainer in-place code updater
+    `deployment/aws/deploy.sh` (pulls the latest CI artifacts and runs
+    `aws lambda update-function-code`) is a convenience over the manual
+    `update-function-code` step; it updates an already-deployed function and does
+    not create the role/function/bucket.
 
-Maintainers (re)populate the mirror after a release with
-`deployment/aws/publish_mirror.sh <minor>`.
-
-Tear down with `aws cloudformation delete-stack --stack-name zagg-backend`.
-
-The manual steps below are equivalent and useful for understanding what the
-template creates, or for one-off tweaks.
-
-### Step 1: Create the function package
+#### Step 1: Create the function package
 
 ```bash
 cd /path/to/zagg
@@ -201,11 +200,11 @@ zip -j deployment/aws/function.zip deployment/aws/lambda_handler.py && \
   cd src && zip -ur ../deployment/aws/function.zip zagg/ -i "*.py" && cd ..
 ```
 
-### Step 2: Build and deploy the Lambda layer
+#### Step 2: Build and deploy the Lambda layer
 
 See [ARM64 Layer](arm64.md) for building and deploying the Lambda layer.
 
-### Step 3: Create the Lambda function
+#### Step 3: Create the Lambda function
 
 ```bash
 aws lambda create-function \
@@ -220,7 +219,7 @@ aws lambda create-function \
   --layers arn:aws:lambda:REGION:ACCOUNT_ID:layer:zagg-layer-arm64:VERSION
 ```
 
-### Updating function code
+#### Updating function code
 
 ```bash
 # Re-create the zip
