@@ -21,6 +21,11 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from zarr import consolidate_metadata
 
 from zagg.auth import get_edl_token, get_nsidc_s3_credentials
+from zagg.concurrency import (
+    ConcurrencyReport,
+    compute_available_workers,
+    raise_for_fd_exhaustion,
+)
 from zagg.config import (
     PipelineConfig,
     get_child_order,
@@ -419,7 +424,22 @@ def _run_lambda(config, catalog_data, store_path, child_order, *,
         output_credentials, output_endpoint_url, region,
     )
 
-    # Configure boto3 client (created early so we can use it for setup/finalize)
+    # Pre-flight concurrency probe: clamp workers to what local file
+    # descriptors and account-wide Lambda concurrency can sustain, so we don't
+    # silently drop cells (FD exhaustion) or saturate the account pool (#28).
+    # Probe with a lightweight session; the dispatch client is sized to the
+    # clamped count below.
+    session = boto3.Session()
+    probe_lambda = session.client("lambda", region_name=region)
+    cloudwatch_client = session.client("cloudwatch", region_name=region)
+    max_workers, concurrency_report = compute_available_workers(
+        max_workers, probe_lambda, cloudwatch_client, function_name,
+    )
+    _log_concurrency_report(concurrency_report, max_workers)
+
+    # Configure boto3 client (created early so we can use it for setup/finalize).
+    # max_pool_connections is sized to the clamped worker count so connections
+    # cannot outrun the file-descriptor budget.
     boto_config = Config(
         read_timeout=900,
         connect_timeout=10,
@@ -464,7 +484,13 @@ def _run_lambda(config, catalog_data, store_path, child_order, *,
         }
 
         for i, future in enumerate(as_completed(futures), 1):
-            result = future.result()
+            try:
+                result = future.result()
+            except OSError as e:
+                # Surface client-side FD exhaustion loudly instead of letting
+                # invocations fail like an AWS/network fault and drop cells.
+                raise_for_fd_exhaustion(e, max_workers)
+                raise
             results.append(result)
             total_lambda_time += result.get("lambda_duration", 0)
 
@@ -533,6 +559,23 @@ def _build_output_creds_event(credentials, endpoint_url, region):
     if endpoint_url:
         block["endpointUrl"] = endpoint_url
     return block
+
+
+def _log_concurrency_report(report: ConcurrencyReport, max_workers: int) -> None:
+    """Log the pre-flight concurrency probe outcome and the clamped workers."""
+    if report.function_reserved is not None:
+        logger.info(f"Function reserved concurrency: {report.function_reserved}")
+    if report.account_limit is None:
+        logger.warning(
+            "Account concurrency unreadable (missing IAM?); bounding workers by "
+            f"file-descriptor limit only -> {max_workers}"
+        )
+    else:
+        logger.info(
+            f"Account concurrency: limit={report.account_limit}, "
+            f"current={report.current_concurrent}, padding={report.padding}, "
+            f"available={report.available} -> using {max_workers} workers"
+        )
 
 
 def _invoke_lambda_setup(lambda_client, function_name, store_path, *,
