@@ -230,6 +230,12 @@ aws lambda update-function-code \
 ## Testing
 
 ```bash
+# Raise the open-file limit before fanning out: each concurrent worker holds
+# one socket to the Lambda endpoint, and the default soft limit (often 256)
+# would otherwise cap concurrency. See "Concurrency, workers, and file
+# descriptors" below.
+ulimit -n 8192
+
 # Build a shard map
 uv run python -m zagg.catalog --config atl06.yaml --short-name ATL06 --cycle 22 \
     --polygon antarctica.geojson
@@ -242,6 +248,31 @@ uv run python -m zagg --config atl06.yaml --catalog catalog.json \
 uv run python deployment/aws/invoke_lambda.py \
   --config atl06.yaml --catalog catalog.json --dry-run
 ```
+
+## Concurrency, workers, and file descriptors
+
+The Lambda backend fans out one synchronous `invoke` per cell across a thread
+pool, and each in-flight worker holds an open socket to the Lambda endpoint.
+Two limits bound how many can run at once, and the orchestrator checks both
+**before** dispatch so cells are never silently dropped:
+
+- **Open file descriptors (`ulimit -n`).** If concurrent workers exceed the
+  process's open-file soft limit (256 on stock macOS / many Linux shells),
+  invokes fail with `OSError: [Errno 24] Too many open files` — a client-side
+  failure AWS never sees. The runner derives a safe ceiling from the soft limit
+  and surfaces errno-24 with actionable guidance instead of a raw connection
+  error. Raise the limit before a large run: `ulimit -n 8192`.
+- **Account Lambda concurrency.** The runner reads the account
+  `ConcurrentExecutions` ceiling and current usage (CloudWatch) and clamps
+  workers to the available headroom (5% padding, floored at 100 free slots), so
+  a run can't saturate the account pool and throttle itself or other Lambda
+  activity. This degrades gracefully if the dispatch role lacks
+  `lambda:GetAccountSettings` / `cloudwatch:GetMetricStatistics` — it then
+  bounds workers by the FD limit alone.
+
+Keep `--max-workers ≤ min(ulimit -n − headroom, account concurrency)`. The
+orchestrator enforces this automatically; setting `ulimit -n` higher simply
+raises the FD ceiling it can use.
 
 ## Performance
 
@@ -272,4 +303,8 @@ uv run python deployment/aws/invoke_lambda.py \
     Check that the Lambda execution role has `s3:PutObject` permission for the output bucket.
 
 !!! warning "Too many open files"
-    Decrease max workers (e.g., `--max-workers 50`) or increase ulimit (`ulimit -n 10000`).
+    `[Errno 24] Too many open files` means concurrent workers exceeded the
+    open-file soft limit and cells would be dropped. Raise it (`ulimit -n 8192`)
+    or lower `--max-workers`. See "Concurrency, workers, and file descriptors"
+    above — the orchestrator now clamps workers to the FD and account-concurrency
+    limits automatically.
