@@ -26,7 +26,7 @@ WKB decode (``sources.py``) and footprint geometry (``grids/``).
 """
 from __future__ import annotations
 
-import importlib.util
+import importlib
 import json
 import time
 from dataclasses import dataclass, field
@@ -69,10 +69,19 @@ def _resolve_backend(backend: str, grid) -> str:
     """
     if backend != "auto":
         return backend
-    if importlib.util.find_spec("spherely") is not None:
+    if _spherely_available():
         return "spherely"
     is_healpix = hasattr(grid, "parent_order") and hasattr(grid, "child_order")
     return "mortie" if is_healpix else "spherely"
+
+
+def _spherely_available() -> bool:
+    """True if ``import spherely`` succeeds (any build, fork or stock)."""
+    try:
+        importlib.import_module("spherely")
+    except ImportError:
+        return False
+    return True
 
 
 def _region_parts(region, metadata) -> list:
@@ -122,9 +131,9 @@ def _intersect_spherely(records, grid, all_shards) -> Dict[int, List[int]]:
             idx.append(i)
     if not polys:
         return {}
-    polys = np.asarray(polys)
+    poly_arr = np.asarray(polys)
     has_index = hasattr(spherely, "SpatialIndex")
-    tree = spherely.SpatialIndex(polys) if has_index else None
+    tree = spherely.SpatialIndex(poly_arr) if has_index else None
 
     out: Dict[int, List[int]] = {}
     for shard in all_shards:
@@ -136,7 +145,7 @@ def _intersect_spherely(records, grid, all_shards) -> Dict[int, List[int]]:
         if tree is not None:
             hits = tree.query(s_poly, predicate="intersects")
         else:
-            hits = np.flatnonzero(spherely.intersects(polys, s_poly))
+            hits = np.flatnonzero(spherely.intersects(poly_arr, s_poly))
         if len(hits) > 0:
             out[int(shard)] = [idx[int(h)] for h in hits]
     return out
