@@ -283,9 +283,13 @@ def calculate_cell_statistics(
 # pass (Acero ``TableGroupBy.aggregate``). pyarrow's float summation differs from
 # numpy's, so its ``mean``/``variance`` outputs are NOT byte-identical to the
 # numpy path; they agree only within ``KERNEL_RTOL`` (validated in tests and in
-# ``benchmarks/handoff_bench.py``). This lever is opt-in via
-# ``handoff="arrow-kernel"`` and exists purely so phase 3 can benchmark it on
-# real ATL03 data; it is kept gated and clearly experimental, and should be
+# ``benchmarks/handoff_bench.py``). ``count``/``min``/``max`` ARE exact vs numpy,
+# including on NaN input: pyarrow's ``min``/``max`` kernels skip NaN by default
+# (numpy propagates it), so :func:`_kernel_aggregate` detects NaN per group and
+# overwrites those groups' min/max with NaN to restore numpy parity (NaN is a
+# value, not an Arrow null, so ``skip_nulls`` does not cover it). This lever is
+# opt-in via ``handoff="arrow-kernel"`` and exists purely so phase 3 can benchmark
+# it on real ATL03 data; it is kept gated and clearly experimental, and should be
 # dropped if that benchmark shows no material speedup (see PR #33 discussion).
 
 # Documented tolerance for kernel-vs-numpy float agreement. float32 means/variance
@@ -296,6 +300,10 @@ KERNEL_RTOL = 1e-5
 # reductions that are mathematically a pure (unweighted) group reduction appear
 # here; weighted ``average``, ``quantile`` (only approximate via tdigest) and any
 # ``expression`` field fall back to the per-cell numpy path.
+# NOTE: ``"average" -> "mean"`` is currently dead for the shipped atl06 config
+# (its ``h_mean`` is a *weighted* average, which ``_kernel_able`` excludes). It is
+# kept only so an unweighted ``average`` field — if a future config defines one —
+# is kernel-able rather than silently falling back; remove it if that never lands.
 _KERNEL_FUNCS = {
     "len": "count",
     "count": "count",
@@ -334,14 +342,21 @@ def _kernel_aggregate(
     the remaining (weighted mean, expression, quantile) fields via the per-cell
     numpy path so output columns match the default reducer exactly in shape.
 
-    Kernel-computed float stats are NOT byte-identical to numpy — they agree
-    within :data:`KERNEL_RTOL`. Returns ``stats_arrays`` (``name -> ndarray`` over
-    ``children``) plus ``cells_with_data``.
+    ``count``/``min``/``max`` are EXACT vs the numpy reducer, including on NaN
+    input — pyarrow's min/max kernels skip NaN, so this function detects NaN per
+    group and propagates it (numpy semantics). The kernel-reduced float stats
+    (``mean``/``variance``) are NOT byte-identical to numpy; they agree within
+    :data:`KERNEL_RTOL` (and both yield NaN on a NaN-bearing group). Returns
+    ``stats_arrays`` (``name -> ndarray`` over ``children``) plus
+    ``cells_with_data``.
 
     Parameters
     ----------
     table : pyarrow.Table
-        Concatenated, null-free observations (one row per observation).
+        Concatenated, null-free observations (one row per observation). "Null-free"
+        is the Arrow-null sense; float NaN values ARE allowed and are handled with
+        numpy semantics (see above). Callers must enforce the null-free contract
+        (``process_shard`` does); this function does not re-check it.
     cell_col : np.ndarray
         Child cell id for each row of ``table`` (already ``grid.cells_of`` mapped,
         so the group key is the destination cell, not the leaf id).
@@ -379,21 +394,43 @@ def _kernel_aggregate(
         (agg_fields[n].get("source") or value_col, _KERNEL_FUNCS[agg_fields[n]["function"]])
         for n in kernel_names
     ]
-    gd = keyed.group_by("_cell").aggregate(aggregations).to_pydict()
+    # NaN semantics: pyarrow's ``min``/``max`` hash kernels SKIP NaN, whereas
+    # ``np.min``/``np.max`` PROPAGATE it. To keep count/min/max bit-identical to the
+    # numpy path on NaN-bearing input (ATL06 ``h_li`` can carry fill/invalid values
+    # and ``quality_filter`` is a flag check, not a NaN filter), detect NaN per
+    # group on each min/max source column and overwrite those groups' min/max with
+    # NaN below. (``count`` already matches: NaN is a value, not a null, so it is
+    # counted; ``mean``/``variance`` already propagate NaN like numpy.)
+    extrema_srcs = {
+        src for n, (src, kfunc) in zip(kernel_names, aggregations) if kfunc in ("min", "max")
+    }
+    for src in extrema_srcs:
+        is_nan = np.isnan(table.column(src).to_numpy(zero_copy_only=False))
+        keyed = keyed.append_column(f"_isnan_{src}", pa.array(is_nan))
+    aggregations_nan = [(f"_isnan_{src}", "max") for src in extrema_srcs]
+    gd = keyed.group_by("_cell").aggregate(aggregations + aggregations_nan).to_pydict()
     group_cells = gd["_cell"]
+    group_has_nan = {src: gd[f"_isnan_{src}_max"] for src in extrema_srcs}
     # Map each grouped row back to its position in ``children``.
     row_to_idx = [child_index.get(int(c)) for c in group_cells]
     for n, (src, kfunc) in zip(kernel_names, aggregations):
         col = gd[f"{src}_{kfunc}"]
+        nan_flags = group_has_nan.get(src) if kfunc in ("min", "max") else None
         out = stats_arrays[n]
         for row, idx in enumerate(row_to_idx):
             if idx is not None:
-                out[idx] = col[row]
+                # Propagate NaN for min/max to match numpy (pyarrow skips NaN).
+                out[idx] = np.nan if (nan_flags is not None and nan_flags[row]) else col[row]
 
     cells_with_data = sum(1 for idx in row_to_idx if idx is not None)
 
     # Fallback fields (and only those) via the per-cell numpy reducer. Reuse the
     # carrier-agnostic grouping so the slices match the default path exactly.
+    # NOTE: ``calculate_cell_statistics`` recomputes the *full* stats dict per cell,
+    # so the kernel-able stats are computed a second time here and discarded — we
+    # only read ``fallback_names`` out of it. Acceptable while experimental (the
+    # fallback set is small: weighted mean, expression, quantiles); revisit if a
+    # config makes the fallback set dominate.
     if fallback_names:
         col_dict = {
             name: table.column(name).to_numpy(zero_copy_only=False) for name in table.column_names
@@ -541,9 +578,11 @@ def process_shard(
         :func:`_group_columns` and the same numpy reductions, so scalar outputs
         are byte-for-byte identical; only the read→concat→extract representation
         differs. ``"arrow-kernel"`` (phase 2b of #30) instead reduces via
-        ``pyarrow.compute`` hash-aggregate kernels: its float ``mean``/``variance``
-        differ from numpy by ~1 ULP (agree within :data:`KERNEL_RTOL`, not byte
-        identical). All three are opt-in while benchmarked (issue #30).
+        ``pyarrow.compute`` hash-aggregate kernels: ``count``/``min``/``max`` stay
+        exact vs numpy (NaN included — see :func:`_kernel_aggregate`), while its
+        float ``mean``/``variance`` differ by ~1 ULP (agree within
+        :data:`KERNEL_RTOL`, not byte identical). All three are opt-in while
+        benchmarked (issue #30).
 
     Returns
     -------

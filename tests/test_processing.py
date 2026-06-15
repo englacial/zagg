@@ -14,6 +14,7 @@ from zagg.processing import (
     _kernel_able,
     _kernel_aggregate,
     calculate_cell_statistics,
+    process_shard,
     write_dataframe_to_zarr,
 )
 
@@ -404,6 +405,182 @@ class TestKernelHandoff:
         assert list(ks["count"]) == [0, 3, 0]
         assert np.isnan(ks["h_min"][0]) and np.isnan(ks["h_min"][2])
         assert ks["h_min"][1] == 1.0
+
+    def test_kernel_nan_matches_numpy_semantics(self):
+        """NaN-bearing cells: count/min/max stay EXACT vs numpy (NaN-propagating).
+
+        pyarrow's min/max kernels skip NaN; numpy's propagate it. _kernel_aggregate
+        must restore numpy semantics so the "count/min/max exact" contract holds on
+        the NaN-bearing ``h_li`` values ATL06 can carry (the quality_filter is a
+        flag check, not a NaN/fill filter). count is unaffected (NaN is a value, not
+        a null) and mean/variance already propagate NaN like numpy.
+        """
+        pa = pytest.importorskip("pyarrow")
+        cfg = default_config()
+        children = np.array([10, 20, 30], dtype=np.int64)
+        # cell 10: clean; cell 20: one NaN; cell 30: all NaN.
+        cells = np.array([10, 10, 10, 20, 20, 20, 30, 30], dtype=np.int64)
+        h = np.array([1.0, 2.0, 4.0, 1.0, np.nan, 3.0, np.nan, np.nan], dtype=np.float32)
+        s = np.full(len(cells), 0.1, dtype=np.float32)
+        col_dict = {"h_li": h, "s_li": s, "leaf_id": cells}
+
+        ref = self._numpy_reference(col_dict, cells, children, cfg)
+        ks = _kernel_aggregate(pa.table(col_dict), cells, children, "h_li", cfg)["stats_arrays"]
+
+        # count: exact everywhere (NaN counts as a value).
+        np.testing.assert_array_equal(np.asarray(ks["count"], dtype=np.float64), ref["count"])
+        # min/max: bit-identical to numpy, including the NaN cells (10 clean, 20/30
+        # propagate NaN). assert_array_equal treats NaN==NaN here.
+        for name in ("h_min", "h_max"):
+            np.testing.assert_array_equal(
+                np.asarray(ks[name], dtype=np.float64), ref[name], err_msg=name
+            )
+        # Clean cell 10 is finite; NaN cells 20/30 propagate to NaN.
+        assert ks["h_min"][0] == 1.0 and ks["h_max"][0] == 4.0
+        assert np.isnan(ks["h_min"][1]) and np.isnan(ks["h_max"][1])
+        assert np.isnan(ks["h_min"][2]) and np.isnan(ks["h_max"][2])
+        # mean/variance already propagate NaN in both paths -> NaN on cells 20/30.
+        for name in ("h_variance",):
+            assert np.isnan(ks[name][1]) and np.isnan(ref[name][1])
+            assert np.isnan(ks[name][2]) and np.isnan(ref[name][2])
+
+
+class _KernelShardGrid:
+    """Minimal grid stub driving the ``process_shard`` kernel branch.
+
+    Exposes only what the ``handoff="arrow-kernel"`` path post-read needs:
+    ``children``/``cells_of``/``chunk_coords`` (and ``chunk_shape`` is unused by
+    process_shard itself). Spatial read methods are bypassed because the test
+    monkeypatches ``_read_group`` to return canned tables.
+    """
+
+    def __init__(self, children, leaf_to_cell):
+        self._children = np.asarray(children, dtype=np.int64)
+        self._leaf_to_cell = leaf_to_cell
+
+    def children(self, shard_key):
+        return self._children
+
+    def cells_of(self, leaf_ids):
+        return np.array([self._leaf_to_cell[int(x)] for x in leaf_ids], dtype=np.int64)
+
+    def chunk_coords(self, shard_key):
+        return {
+            "cell_lat": np.zeros(len(self._children)),
+            "cell_lon": np.zeros(len(self._children)),
+        }
+
+
+class TestProcessShardKernelBranch:
+    """HIGH-2 of PR #33 review: exercise the production ``process_shard`` kernel
+    branch (null guard, ``cells_of``, ``concat_tables().combine_chunks()``, and the
+    ``handoff`` validation), including NaN-bearing input so the NaN-semantics fix is
+    covered end-to-end, not only in ``_kernel_aggregate``."""
+
+    def _patch_reads(self, monkeypatch, tables):
+        """Make ``_read_group`` yield the canned tables once, then None.
+
+        Also stubs ``h5coro.H5Coro`` so the read loop never touches the network;
+        the canned tables stand in for the spatially filtered group reads.
+        """
+        it = iter(tables)
+
+        def fake_read_group(*args, **kwargs):
+            return next(it, None)
+
+        monkeypatch.setattr("zagg.processing._read_group", fake_read_group)
+        monkeypatch.setattr("zagg.processing.h5coro.H5Coro", lambda *a, **k: object())
+        # Avoid resolving a real h5coro driver (s3driver import / creds plumbing).
+        monkeypatch.setattr("zagg.processing._make_url_rewriter", lambda driver: (lambda u: u))
+
+    def test_kernel_branch_matches_default_path(self, monkeypatch):
+        """process_shard(handoff="arrow-kernel") agrees with the default path on the
+        kernel-able stats (count/min/max exact, variance within KERNEL_RTOL),
+        running the real concat + null guard + cells_of."""
+        pa = pytest.importorskip("pyarrow")
+
+        cfg = default_config()
+        leaf_to_cell = {1: 10, 2: 10, 3: 20, 4: 30}
+        children = [10, 20, 30]
+        grid = _KernelShardGrid(children, leaf_to_cell)
+
+        rng = np.random.default_rng(5)
+
+        def make_table(n):
+            leaf = rng.choice([1, 2, 3, 4], size=n).astype(np.int64)
+            h = (rng.standard_normal(n) * 10.0).astype(np.float32)
+            s = (np.abs(rng.standard_normal(n)) + 0.01).astype(np.float32)
+            return pa.table({"h_li": h, "s_li": s, "leaf_id": leaf})
+
+        # Two reads -> exercises pa.concat_tables(...).combine_chunks().
+        tables = [make_table(60), make_table(25)]
+        # Reuse the same data for the default path via a copy of the iterator.
+        kernel_tables = [t for t in tables]
+        default_tables = [t for t in tables]
+
+        self._patch_reads(monkeypatch, kernel_tables)
+        df_k, meta_k = process_shard(
+            grid, 0, ["s3://x"], s3_credentials={}, config=cfg, handoff="arrow-kernel"
+        )
+
+        self._patch_reads(monkeypatch, default_tables)
+        df_d, meta_d = process_shard(
+            grid, 0, ["s3://x"], s3_credentials={}, config=cfg, handoff="arrow"
+        )
+
+        assert meta_k["cells_with_data"] == meta_d["cells_with_data"]
+        assert meta_k["total_obs"] == meta_d["total_obs"] == 85
+        for name in ("count", "h_min", "h_max"):
+            np.testing.assert_array_equal(
+                df_k[name].to_numpy(), df_d[name].to_numpy(), err_msg=name
+            )
+        np.testing.assert_allclose(
+            df_k["h_variance"].to_numpy(),
+            df_d["h_variance"].to_numpy(),
+            rtol=KERNEL_RTOL,
+            equal_nan=True,
+        )
+
+    def test_kernel_branch_nan_input(self, monkeypatch):
+        """End-to-end NaN handling through process_shard's kernel branch: a NaN in
+        ``h_li`` propagates to that cell's min/max (numpy semantics), count is
+        unaffected, and the null guard does NOT trip (NaN is not an Arrow null)."""
+        pa = pytest.importorskip("pyarrow")
+
+        cfg = default_config()
+        leaf_to_cell = {1: 10, 2: 20}
+        children = [10, 20]
+        grid = _KernelShardGrid(children, leaf_to_cell)
+
+        # cell 10 clean, cell 20 has a NaN.
+        table = pa.table(
+            {
+                "h_li": pa.array([1.0, 2.0, 4.0, 5.0, np.nan], type=pa.float32()),
+                "s_li": pa.array([0.1, 0.1, 0.1, 0.1, 0.1], type=pa.float32()),
+                "leaf_id": pa.array([1, 1, 1, 2, 2], type=pa.int64()),
+            }
+        )
+        self._patch_reads(monkeypatch, [table])
+        df, meta = process_shard(
+            grid, 0, ["s3://x"], s3_credentials={}, config=cfg, handoff="arrow-kernel"
+        )
+
+        idx = {c: i for i, c in enumerate(children)}
+        # Clean cell 10: finite extrema.
+        assert df["h_min"].to_numpy()[idx[10]] == 1.0
+        assert df["h_max"].to_numpy()[idx[10]] == 4.0
+        # NaN cell 20: min/max propagate NaN (numpy semantics), count still 2.
+        assert np.isnan(df["h_min"].to_numpy()[idx[20]])
+        assert np.isnan(df["h_max"].to_numpy()[idx[20]])
+        assert df["count"].to_numpy()[idx[20]] == 2
+        assert meta["total_obs"] == 5
+
+    def test_invalid_handoff_rejected(self):
+        """The ``handoff`` validation rejects unknown carriers before any read."""
+
+        grid = _KernelShardGrid([10], {1: 10})
+        with pytest.raises(ValueError, match="handoff must be"):
+            process_shard(grid, 0, ["s3://x"], s3_credentials={}, handoff="bogus")
 
 
 class TestDataSource:
