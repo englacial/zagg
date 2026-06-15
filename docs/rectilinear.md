@@ -51,7 +51,7 @@ grid = from_config(cfg)
 parts = load_polygon("antarctica.geojson")
 
 q = Query("ATL06", "007", "2024-01-06", "2024-04-07", region="antarctica.geojson")
-sm = make_shardmap(q, grid, region=parts)   # auto backend: spherely (rect grids need it; #36)
+sm = make_shardmap(q, grid, region=parts)   # auto backend: spherely / mortie / shapely
 sm.to_json("shardmap_atl06_polar.json")
 ```
 
