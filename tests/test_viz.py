@@ -251,3 +251,41 @@ class TestRenderShardmap:
         catalog.to_geoparquet(str(cat_path))
         out = render_shardmap(shardmap, str(cat_path))
         assert len(out["granules"]["features"]) == 2
+
+
+# ── phase 2: ipyleaflet wrapper (skips when the viz extra isn't installed) ────
+
+class TestShowShardmap:
+    def test_import_core_without_ipyleaflet(self):
+        # The headless core and zagg.viz import must not require ipyleaflet.
+        import zagg.viz  # noqa: F401
+
+        assert hasattr(zagg.viz, "shard_outlines")
+
+    def test_build_map(self, shardmap, tmp_path):
+        pytest.importorskip("ipyleaflet")
+        from ipyleaflet import Map
+
+        from zagg.viz import show_shardmap
+
+        path = tmp_path / "sm.json"
+        shardmap.to_json(str(path))
+        m = show_shardmap(str(path))
+        assert isinstance(m, Map)
+        # shard layer + grid layer (+ basemap) present.
+        assert len(m.layers) >= 2
+
+    def test_build_map_with_catalog(self, shardmap, catalog, tmp_path):
+        pytest.importorskip("ipyleaflet")
+        from ipyleaflet import Map
+
+        from zagg.viz import show_shardmap
+
+        sm_path = tmp_path / "sm.json"
+        cat_path = tmp_path / "cat.parquet"
+        shardmap.to_json(str(sm_path))
+        catalog.to_geoparquet(str(cat_path))
+        m = show_shardmap(str(sm_path), catalog=str(cat_path))
+        assert isinstance(m, Map)
+        names = {getattr(layer, "name", None) for layer in m.layers}
+        assert "granule footprints" in names

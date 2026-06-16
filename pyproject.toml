@@ -61,6 +61,13 @@ lambda = [
 catalog = [
     "stac-geoparquet>=0.7.0",
 ]
+# Interactive shard-map viewer (issue #38). Optional — kept out of core and out
+# of `lambda` so the deployment layer stays lean. `pip install zagg[viz]`.
+# ipyleaflet is a Jupyter widget; @espg approved adding it for the viewer
+# (https://github.com/englacial/zagg/issues/38#issuecomment-4713639466).
+viz = [
+    "ipyleaflet>=0.19",
+]
 analysis = [
     "cubed>=0.24.0",
     "cubed-xarray>=0.0.9",
