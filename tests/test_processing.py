@@ -8,9 +8,13 @@ from zagg.config import default_config, get_agg_fields, get_coords, get_data_var
 from zagg.grids import HealpixGrid
 from zagg.processing import (
     KERNEL_RTOL,
+    _arrow_column,
     _build_groups,
+    _build_output,
     _concat_and_group,
     _group_columns,
+    _has_vector_fields,
+    _iter_carrier_columns,
     _kernel_able,
     _kernel_aggregate,
     calculate_cell_statistics,
@@ -735,6 +739,130 @@ class TestProcessShardKernelBranch:
         grid = _KernelShardGrid([10], {1: 10})
         with pytest.raises(ValueError, match="handoff must be"):
             process_shard(grid, 0, ["s3://x"], s3_credentials={}, handoff="bogus")
+
+
+class TestVectorCarrier:
+    """Issue #29 phase 3: a config with any ``vector`` field routes the
+    cell->table handoff through Arrow (FixedSizeList vector columns), while a
+    pure-scalar config keeps the unchanged pandas carrier with byte-identical
+    scalar outputs."""
+
+    @staticmethod
+    def _scalar_cfg():
+        from zagg.config import PipelineConfig
+
+        return PipelineConfig(
+            data_source={"groups": ["g"]},
+            aggregation={
+                "variables": {
+                    "count": {"function": "len"},
+                    "h_min": {"function": "min", "source": "h_li", "dtype": "float32"},
+                }
+            },
+        )
+
+    @staticmethod
+    def _vector_cfg():
+        """``_scalar_cfg`` plus a vector ``hist`` field (FixedSizeList<3>)."""
+        from zagg.config import PipelineConfig
+
+        return PipelineConfig(
+            data_source={"groups": ["g"]},
+            aggregation={
+                "variables": {
+                    "count": {"function": "len"},
+                    "h_min": {"function": "min", "source": "h_li", "dtype": "float32"},
+                    "hist": {
+                        "function": "np.bincount",
+                        "source": "b",
+                        "kind": "vector",
+                        "trailing_shape": 3,
+                        "dtype": "int64",
+                        "fill_value": 0,
+                        "params": {"minlength": 3},
+                    },
+                }
+            }
+        )
+
+    def test_has_vector_fields(self):
+        assert not _has_vector_fields(self._scalar_cfg())
+        assert _has_vector_fields(self._vector_cfg())
+
+    def _run(self, monkeypatch, cfg):
+        """Drive process_shard on a canned read via the default (pandas) handoff;
+        the output carrier (pandas vs Arrow) is chosen by the config's field kinds,
+        independent of the input handoff."""
+        pytest.importorskip("pyarrow")
+        leaf_to_cell = {1: 10, 2: 10, 3: 20}
+        children = [10, 20]
+        grid = _KernelShardGrid(children, leaf_to_cell)
+        df = pd.DataFrame(
+            {
+                "h_li": np.array([1.0, 2.0, 5.0], dtype=np.float32),
+                "b": np.array([0, 2, 1], dtype=np.int64),
+                "leaf_id": np.array([1, 1, 3], dtype=np.int64),
+            }
+        )
+        TestProcessShardKernelBranch()._patch_reads(monkeypatch, [df])
+        return process_shard(grid, 0, ["s3://x"], s3_credentials={}, config=cfg), children
+
+    def test_scalar_config_returns_dataframe(self, monkeypatch):
+        (df, _meta), _children = self._run(monkeypatch, self._scalar_cfg())
+        assert isinstance(df, pd.DataFrame)
+
+    def test_vector_config_returns_arrow_table(self, monkeypatch):
+        pa = pytest.importorskip("pyarrow")
+        (tbl, _meta), _children = self._run(monkeypatch, self._vector_cfg())
+        assert isinstance(tbl, pa.Table)
+        assert pa.types.is_fixed_size_list(tbl.column("hist").type)
+        assert tbl.column("hist").type.list_size == 3
+
+    def test_scalar_columns_byte_identical_with_and_without_vector(self, monkeypatch):
+        """The hard #29/#30 criterion: adding a vector field must not perturb the
+        scalar columns. Run the same canned input through both configs and assert
+        the shared scalar columns match exactly."""
+        (df, _m1), _c = self._run(monkeypatch, self._scalar_cfg())
+        (tbl, _m2), _c = self._run(monkeypatch, self._vector_cfg())
+        for name in ("count", "h_min"):
+            np.testing.assert_array_equal(
+                df[name].to_numpy(),
+                tbl.column(name).to_numpy(zero_copy_only=False),
+                err_msg=name,
+            )
+
+    def test_vector_column_values(self, monkeypatch):
+        """The FixedSizeList payload holds each cell's per-cell vector. cell 10 has
+        b=[0,2] -> bincount(minlength=3)=[1,0,1]; cell 20 has b=[1] -> [0,1,0]."""
+        (tbl, _meta), children = self._run(monkeypatch, self._vector_cfg())
+        hist = tbl.column("hist").combine_chunks()
+        block = hist.values.to_numpy(zero_copy_only=False).reshape(len(children), 3)
+        idx = {c: i for i, c in enumerate(children)}
+        np.testing.assert_array_equal(block[idx[10]], [1, 0, 1])
+        np.testing.assert_array_equal(block[idx[20]], [0, 1, 0])
+
+    def test_arrow_column_roundtrips_through_iter(self):
+        """_arrow_column -> _iter_carrier_columns recovers the (n_cells, C) block,
+        the seam the dense vector writer consumes (phase 5)."""
+        pa = pytest.importorskip("pyarrow")
+        sig = {"kind": "vector", "trailing_shape": (3,), "dtype": "int64"}
+        block = np.array([[1, 0, 1], [0, 1, 0]], dtype=np.int64)
+        col = _arrow_column(block, sig)
+        assert pa.types.is_fixed_size_list(col.type)
+        tbl = pa.table({"hist": col})
+        recovered = dict(_iter_carrier_columns(tbl))["hist"]
+        np.testing.assert_array_equal(recovered, block)
+
+    def test_build_output_scalar_is_plain_dataframe(self):
+        """_build_output(use_arrow=False) is the unchanged pandas assembly."""
+        grid = _KernelShardGrid([10, 20], {1: 10})
+        stats = {"count": np.array([2, 1]), "h_min": np.array([1.0, 5.0], dtype=np.float32)}
+        cfg = self._scalar_cfg()
+        out = _build_output(
+            stats, ["count", "h_min"], get_agg_fields(cfg), grid, 0, use_arrow=False
+        )
+        assert isinstance(out, pd.DataFrame)
+        np.testing.assert_array_equal(out["count"].to_numpy(), [2, 1])
 
 
 class TestDataSource:
