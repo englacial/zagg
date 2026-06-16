@@ -202,6 +202,20 @@ class TestValidation:
         with pytest.raises(ValueError, match="source.*nonexistent"):
             validate_config(cfg)
 
+    def test_bad_quality_filter_op(self):
+        cfg = PipelineConfig(
+            data_source={
+                "variables": {"h_li": "/path"},
+                "quality_filter": {"dataset": "/q", "value": 0, "op": "gt"},
+            },
+            aggregation={"variables": {
+                "c": {"function": "len", "source": "h_li", "dtype": "int32"},
+            }},
+            output={"grid": {"type": "healpix", "parent_order": 6, "child_order": 12}},
+        )
+        with pytest.raises(ValueError, match="quality_filter.op must be"):
+            validate_config(cfg)
+
     def test_missing_weights_column(self):
         cfg = PipelineConfig(
             data_source={"variables": {"h_li": "/path"}},

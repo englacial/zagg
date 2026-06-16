@@ -169,6 +169,13 @@ def validate_config(config: PipelineConfig) -> None:
             if "start_date" not in temporal or "end_date" not in temporal:
                 raise ValueError("bounds.temporal requires start_date and end_date")
 
+    # Validate quality_filter op (default eq; eq/ne supported by _quality_mask)
+    qf = config.data_source.get("quality_filter")
+    if qf is not None and qf.get("op", "eq") not in ("eq", "ne"):
+        raise ValueError(
+            f"data_source.quality_filter.op must be 'eq' or 'ne' (got {qf['op']!r})"
+        )
+
     ds_vars = set(config.data_source.get("variables", {}).keys())
     agg_vars = config.aggregation.get("variables", {})
 
