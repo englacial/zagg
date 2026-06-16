@@ -32,6 +32,8 @@ filter rejects them, so they fall out of the pipeline silently.
 """
 from __future__ import annotations
 
+import math
+
 import numpy as np
 from affine import Affine
 from odc.geo.geobox import GeoBox, GeoboxTiles
@@ -95,18 +97,20 @@ class RectilinearGrid:
         span_y = self.ymax - self.ymin
         if span_x <= 0 or span_y <= 0:
             raise ValueError("bounds must have xmax > xmin and ymax > ymin")
-        # Width / height in cells, rounded down to whole cells.
-        self.width = int(span_x // self.res_x)
-        self.height = int(span_y // self.res_y)
-        if self.width == 0 or self.height == 0:
+        # Cells needed to cover the requested extent (round up; the 1e-9 guards
+        # an exactly-divisible span from rounding up on float fuzz).
+        raw_w = int(math.ceil(span_x / self.res_x - 1e-9))
+        raw_h = int(math.ceil(span_y / self.res_y - 1e-9))
+        if raw_w == 0 or raw_h == 0:
             raise ValueError("resolution larger than bounds span")
-        # Chunk grid must divide the cell grid evenly (one chunk == one shard).
-        if self.height % self.chunk_h != 0 or self.width % self.chunk_w != 0:
-            raise ValueError(
-                f"chunk_shape ({self.chunk_h}, {self.chunk_w}) must divide "
-                f"grid shape ({self.height}, {self.width}). Adjust bounds, "
-                f"resolution, or chunk_shape."
-            )
+        # Zero-pad the far edges up to a whole number of chunks so one chunk ==
+        # one shard. The origin (xmin, ymax) is preserved, so cell/chunk
+        # alignment and `nests_with` stay valid; the extra cells are empty.
+        self.width = -(-raw_w // self.chunk_w) * self.chunk_w
+        self.height = -(-raw_h // self.chunk_h) * self.chunk_h
+        # Extend the far bounds (xmax, ymin) to match the padded grid.
+        self.xmax = self.xmin + self.width * self.res_x
+        self.ymin = self.ymax - self.height * self.res_y
         self.n_row_blocks = self.height // self.chunk_h
         self.n_col_blocks = self.width // self.chunk_w
 
@@ -224,12 +228,16 @@ class RectilinearGrid:
         valid = leaf_ids != OOB_SENTINEL
         if not np.any(valid):
             return out
-        v = leaf_ids[valid]
+        # Work around a signed-int64 miscompute that corrupts the chained index
+        # math on arrays >= 2**15 elements (see issue #31; observed on an
+        # unsupported numpy/CPython-3.14 pairing). Valid leaf ids are
+        # non-negative, so uint64 is exact and uses the unaffected kernel.
+        v = leaf_ids[valid].astype(np.uint64)
         rows = v // self.width
         cols = v % self.width
         rb = rows // self.chunk_h
         cb = cols // self.chunk_w
-        out[valid] = rb * self.n_col_blocks + cb
+        out[valid] = (rb * self.n_col_blocks + cb).astype(np.int64)
         return out
 
     def shard_of(self, leaf_ids) -> int:

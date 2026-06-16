@@ -330,7 +330,8 @@ class TestEquivalence:
         assert result == pytest.approx(expected, rel=1e-5)
 
     def test_config_matches_calculate_cell_statistics(self, atl06_config, synthetic_df):
-        expected = calculate_cell_statistics(synthetic_df)
+        cell_data = {col: synthetic_df[col].values for col in synthetic_df.columns}
+        expected = calculate_cell_statistics(cell_data)
         agg_fields = get_agg_fields(atl06_config)
 
         for name, meta in agg_fields.items():

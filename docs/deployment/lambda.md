@@ -39,7 +39,7 @@ The Lambda function processes a single morton cell (order 6) by:
 | `deployment/aws/lambda_handler.py` | AWS Lambda wrapper function |
 | `src/zagg/processing.py` | Cloud-agnostic core processing logic |
 | `src/zagg/auth.py` | NASA Earthdata authentication helper |
-| `src/zagg/catalog.py` | CMR granule catalog builder |
+| `src/zagg/catalog/` | CMR/STAC shard-map (granule catalog) builder (`python -m zagg.catalog`) |
 | `deployment/aws/invoke_lambda.py` | Orchestration script |
 | `deployment/aws/build_layer.sh` | Lambda layer build script (`x86_64`/`arm64`) |
 
@@ -81,6 +81,17 @@ The Lambda function processes a single morton cell (order 6) by:
 | `store_path` | str | Yes | Output Zarr store path (e.g. `s3://bucket/prefix.zarr`) |
 | `s3_credentials` | dict | Yes | NSIDC S3 credentials for reading source data |
 | `output_credentials` | dict | No | Explicit credentials for *writing* the output store. Omit to use the execution role (in-account writes). Supply to write an external / S3-compatible target. Keys: `accessKeyId`, `secretAccessKey`, optional `sessionToken`/`endpointUrl`/`region`. |
+
+!!! note "Shard vs. `parent_order` naming"
+    The unit of work is a **shard** — one parent (order-6) HEALPix cell. The
+    orchestrator and the catalog use that vocabulary (`python -m zagg.catalog`
+    emits a shard map with `shard_keys` + a `grid_signature`). The Lambda
+    **event** schema, however, still carries the HEALPix-shaped field names
+    `parent_morton` / `parent_order` / `child_order` shown above (the handler
+    requires them — see `deployment/aws/lambda_handler.py`). A grid-neutral
+    rename of those event fields is tracked in
+    [#24](https://github.com/englacial/zagg/issues/24), not done here, so the
+    field names above are the current, accurate ones.
 
 ### S3 Credentials
 
@@ -148,44 +159,38 @@ path-style addressing automatically.
 
 ## Deployment
 
-### Reproducible standup (CloudFormation)
+### Recommended: CloudFormation standup
 
-The fastest way to stand up the backend in a fresh AWS account is the committed
-CloudFormation template, which creates the execution role, dependency layer, and
-function in one stack:
+The recommended way to stand up the backend in a fresh AWS account is the
+committed CloudFormation template, driven by `stand_up.sh`, which creates the
+execution role, dependency layer, and function in one stack:
 
 ```bash
 OUTPUT_BUCKET=my-results-bucket bash deployment/aws/stand_up.sh
 ```
 
-The Lambda code (deps layer + function zips) lives on the public **source.coop
-mirror** (`s3://us-west-2.opendata.source.coop/englacial/zagg/lambda/<minor>/`),
-keyed by zagg minor version (`0.N.x` → `0.N`). CloudFormation reads Lambda code
-from a same-region bucket, so in **us-west-2** `stand_up.sh` points the stack
-straight at the mirror (no staging bucket needed); in **other regions** it copies
-the zips from the mirror into a `STAGING_BUCKET` you own first. It then deploys
-`deployment/aws/template.yaml`. Useful overrides (environment variables):
+See **[Standing Up the Backend](standup.md)** for the full walkthrough: what the
+script does, the parameter/environment-variable reference, cross-region staging,
+and teardown. By default (`CreateExecutionRole=true`) the stack creates the IAM
+execution role for you; the only exception is an account whose deploy identity
+*cannot* create IAM roles (e.g. an AWS SSO "power user" set) — see
+[Execution Role](execution-role.md) for that IAM-constrained, legacy/unverified
+path.
 
-| Variable | Default | Purpose |
-|----------|---------|---------|
-| `OUTPUT_BUCKET` | *(required)* | Bucket for results; role is scoped to it |
-| `CREATE_BUCKET` | `false` | `true` makes the stack create `OUTPUT_BUCKET` |
-| `ARCH` | `arm64` | `arm64` or `x86_64` (both py3.12) |
-| `REGION` | `us-west-2` | Deployment region |
-| `STAGING_BUCKET` | *(none)* | Required outside us-west-2: your same-region bucket the mirror zips are copied into |
-| `LAMBDA_VERSION` | *(derived)* | Lambda minor to deploy (default: the repo's latest git tag, else the installed zagg) |
-| `STACK_NAME` | `zagg-backend` | CloudFormation stack name |
-| `MIRROR_BUCKET` / `MIRROR_PREFIX` | source.coop | Override to self-host the artifact mirror |
+### Legacy / manual deploy {#legacy-manual-deploy}
 
-Maintainers (re)populate the mirror after a release with
-`deployment/aws/publish_mirror.sh <minor>`.
+!!! warning "Not the recommended path"
+    The steps below hand-assemble the function zip and create/update the Lambda
+    with raw `aws lambda` calls. They are kept for understanding what the
+    template builds and for one-off tweaks, but the
+    **[CloudFormation standup](standup.md)** above is the preferred, reproducible
+    way to deploy. The maintainer in-place code updater
+    `deployment/aws/deploy.sh` (pulls the latest CI artifacts and runs
+    `aws lambda update-function-code`) is a convenience over the manual
+    `update-function-code` step; it updates an already-deployed function and does
+    not create the role/function/bucket.
 
-Tear down with `aws cloudformation delete-stack --stack-name zagg-backend`.
-
-The manual steps below are equivalent and useful for understanding what the
-template creates, or for one-off tweaks.
-
-### Step 1: Create the function package
+#### Step 1: Create the function package
 
 ```bash
 cd /path/to/zagg
@@ -195,11 +200,11 @@ zip -j deployment/aws/function.zip deployment/aws/lambda_handler.py && \
   cd src && zip -ur ../deployment/aws/function.zip zagg/ -i "*.py" && cd ..
 ```
 
-### Step 2: Build and deploy the Lambda layer
+#### Step 2: Build and deploy the Lambda layer
 
 See [ARM64 Layer](arm64.md) for building and deploying the Lambda layer.
 
-### Step 3: Create the Lambda function
+#### Step 3: Create the Lambda function
 
 ```bash
 aws lambda create-function \
@@ -214,7 +219,7 @@ aws lambda create-function \
   --layers arn:aws:lambda:REGION:ACCOUNT_ID:layer:zagg-layer-arm64:VERSION
 ```
 
-### Updating function code
+#### Updating function code
 
 ```bash
 # Re-create the zip
@@ -230,6 +235,12 @@ aws lambda update-function-code \
 ## Testing
 
 ```bash
+# Raise the open-file limit before fanning out: each concurrent worker holds
+# one socket to the Lambda endpoint, and the default soft limit (often 256)
+# would otherwise cap concurrency. See "Concurrency, workers, and file
+# descriptors" below.
+ulimit -n 8192
+
 # Build a shard map
 uv run python -m zagg.catalog --config atl06.yaml --short-name ATL06 --cycle 22 \
     --polygon antarctica.geojson
@@ -242,6 +253,31 @@ uv run python -m zagg --config atl06.yaml --catalog catalog.json \
 uv run python deployment/aws/invoke_lambda.py \
   --config atl06.yaml --catalog catalog.json --dry-run
 ```
+
+## Concurrency, workers, and file descriptors
+
+The Lambda backend fans out one synchronous `invoke` per cell across a thread
+pool, and each in-flight worker holds an open socket to the Lambda endpoint.
+Two limits bound how many can run at once, and the orchestrator checks both
+**before** dispatch so cells are never silently dropped:
+
+- **Open file descriptors (`ulimit -n`).** If concurrent workers exceed the
+  process's open-file soft limit (256 on stock macOS / many Linux shells),
+  invokes fail with `OSError: [Errno 24] Too many open files` — a client-side
+  failure AWS never sees. The runner derives a safe ceiling from the soft limit
+  and surfaces errno-24 with actionable guidance instead of a raw connection
+  error. Raise the limit before a large run: `ulimit -n 8192`.
+- **Account Lambda concurrency.** The runner reads the account
+  `ConcurrentExecutions` ceiling and current usage (CloudWatch) and clamps
+  workers to the available headroom (5% padding, floored at 100 free slots), so
+  a run can't saturate the account pool and throttle itself or other Lambda
+  activity. This degrades gracefully if the dispatch role lacks
+  `lambda:GetAccountSettings` / `cloudwatch:GetMetricStatistics` — it then
+  bounds workers by the FD limit alone.
+
+Keep `--max-workers ≤ min(ulimit -n − headroom, account concurrency)`. The
+orchestrator enforces this automatically; setting `ulimit -n` higher simply
+raises the FD ceiling it can use.
 
 ## Performance
 
@@ -272,4 +308,8 @@ uv run python deployment/aws/invoke_lambda.py \
     Check that the Lambda execution role has `s3:PutObject` permission for the output bucket.
 
 !!! warning "Too many open files"
-    Decrease max workers (e.g., `--max-workers 50`) or increase ulimit (`ulimit -n 10000`).
+    `[Errno 24] Too many open files` means concurrent workers exceeded the
+    open-file soft limit and cells would be dropped. Raise it (`ulimit -n 8192`)
+    or lower `--max-workers`. See "Concurrency, workers, and file descriptors"
+    above — the orchestrator now clamps workers to the FD and account-concurrency
+    limits automatically.

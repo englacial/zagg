@@ -1,5 +1,17 @@
 # Lambda Deployment Guide
 
+> **Status: maintainer notes — partially out of date (audited against the code
+> 2026-06-15, see [#34](https://github.com/englacial/zagg/issues/34)).** The
+> canonical, rendered deploy docs live in the docs site:
+> [Standing Up the Backend](../docs/deployment/standup.md) (preferred path),
+> [AWS Lambda](../docs/deployment/lambda.md), and
+> [Execution Role](../docs/deployment/execution-role.md). This file keeps the
+> build/layer internals and the size/cost rationale; several figures below
+> (layer/function sizes, the role/bucket names, the layer contents) are
+> historical and were not all re-measured — trust the scripts
+> (`build_layer.sh` / `build_function.sh`) and `template.yaml` over the numbers
+> here. Specific corrections are inline below.
+
 ## Current State (2026-02-18)
 
 Both architectures now build on **py3.12** (manylinux_2_28). The target /
@@ -10,18 +22,28 @@ x86_64 / py3.12 is available for local/testing parity.
 - **Runtime**: python3.12
 - **Architecture**: arm64 (default; x86_64 also supported)
 - **Layer**: `zagg-deps-{arch}` (py3.12, pyproj/odc-geo for rectilinear grids, h5coro==0.0.8)
-- **Function code**: `lambda_handler.py` + `zagg/` package + obstore/zarr/pydantic/pyyaml
-- **Role**: `zagg-lambda-execution` (scoped to `xagg` bucket)
+- **Function code**: `lambda_handler.py` + `zagg/` package + obstore/zarr/pydantic-zarr/pyyaml
+- **Role**: created by `template.yaml` (CloudFormation-auto-named; the template
+  sets no `RoleName`), scoped least-privilege to the `OutputBucketName` bucket
+  you pass to `stand_up.sh` — *not* a fixed `zagg-lambda-execution`/`xagg`. (The
+  dependency layer is named `<FunctionName>-deps`, default `process-shard-deps`.
+  The legacy `deploy.sh` in-place updater still defaults `ZAGG_S3_BUCKET=xagg`
+  for its >50MB staging copies; that is the updater's staging bucket, not the
+  output bucket.)
 
 ### What's in the layer vs function code
 
-**Layer** (`xagg-dependencies:1`, 222MB unzipped):
-numpy, pandas, h5coro, mortie, earthaccess, boto3, astropy, shapely, pyproj, odc-geo,
-cramjam, fastparquet, requests, s3fs, and transitive deps.
+**Layer** (built by `build_layer.sh`):
+numpy, pandas, fastparquet, cramjam, shapely, pyproj, odc-geo, affine, cachetools,
+h5coro, mortie, and their transitive deps. (Corrected: `earthaccess` is
+orchestrator-only and **not** in the layer; `boto3` is provided by the Lambda
+runtime; `astropy`/`s3fs`/`pyarrow` are not installed by `build_layer.sh`. The old
+`xagg-dependencies:1`/222MB figure is historical.)
 
-**Function code** (20MB unzipped):
-`lambda_handler.py`, `zagg/` package, obstore, zarr, pydantic-zarr, pyyaml, pydantic,
-pydantic-core, typeguard, typing_inspect, annotated-types.
+**Function code** (built by `build_function.sh`):
+`lambda_handler.py`, `zagg/` package, plus `obstore`, `zarr`, `pydantic-zarr`,
+`pyyaml` and their transitive deps; packages already in the layer are stripped
+back out to avoid duplication.
 
 ---
 
@@ -134,7 +156,7 @@ Key findings:
   to cross-compile Lambda layers — no Docker needed
 - All our deps have pre-built `manylinux2014_aarch64` wheels on PyPI
 
-See `.github/workflows/deploy-lambda.yml` for the workflow (to be created).
+The layer + function are now built in CI by `.github/workflows/lambda-build.yml` (both arches, with the combined 250MB size gate); the originally-planned `deploy-lambda.yml` was never added. The manual/CI options below are historical design notes.
 
 ### Option C: Cross-compile from x86_64 (current approach for testing)
 
@@ -180,7 +202,12 @@ aws lambda update-function-code \
 
 ---
 
-## CI/CD Workflow Design
+## CI/CD Workflow Design (historical design note)
+
+> The build half of this is implemented in `.github/workflows/lambda-build.yml`
+> (build + size gate + artifact upload). Automated *deploy*-on-push was never
+> wired up; the source.coop mirror + `stand_up.sh` is the deploy path instead.
+> Kept below as the original design rationale.
 
 A GitHub Actions workflow for automated Lambda deployment should:
 

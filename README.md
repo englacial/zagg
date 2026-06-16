@@ -24,7 +24,8 @@ shard map can't be built against a different grid than the run.
 
 ```bash
 # Install the catalog extra (STAC fetch + shard-map build). The geometry
-# backend is mortie (HEALPix) / shapely (rectilinear) by default.
+# backend defaults to `auto`: exact-S2 spherely if its fork is installed (used
+# for all grids), else mortie (HEALPix MOC); rectilinear grids require spherely.
 pip install 'zagg[catalog]'
 
 # Optional: the exact-S2 spherely SpatialIndex backend is a fork not on PyPI
