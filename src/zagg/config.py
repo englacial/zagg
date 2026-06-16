@@ -5,7 +5,7 @@ import re
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from importlib import resources
-from typing import NotRequired, TypedDict
+from typing import Any, NotRequired, TypedDict
 
 import numpy as np
 import yaml
@@ -578,7 +578,7 @@ def get_output_region(config: PipelineConfig) -> str | None:
     return config.output.get("region")
 
 
-def eval_expression_raw(expression: str, columns: dict[str, np.ndarray]):
+def _eval_expression_raw(expression: str, columns: dict[str, np.ndarray]) -> Any:
     """Evaluate an expression string in a restricted namespace, uncoerced.
 
     Returns the expression's native value (a scalar, an ndarray, ...). Used by
@@ -625,4 +625,4 @@ def evaluate_expression(expression: str, columns: dict[str, np.ndarray]) -> floa
     -------
     float
     """
-    return float(eval_expression_raw(expression, columns))
+    return float(_eval_expression_raw(expression, columns))

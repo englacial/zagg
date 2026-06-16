@@ -220,7 +220,10 @@ class TestVectorOutputs:
         np.testing.assert_array_equal(edges, [1.0, 5.0])
 
     def test_vector_expression_empty_cell_gets_sentinel(self):
-        """An empty cell emits the same shape filled with the fill_value sentinel."""
+        """An empty cell short-circuits to the fill_value sentinel WITHOUT
+        evaluating the expression. ``_edges_config``'s expression is
+        ``np.array([np.min(h), np.max(h)])`` and ``np.min([])`` raises, so this
+        passing proves the empty-cell path never reaches the eval (issue #29)."""
         cfg = self._edges_config()
         result = calculate_cell_statistics({"h": np.array([])}, config=cfg)
         edges = result["edges"]
@@ -228,6 +231,7 @@ class TestVectorOutputs:
         assert np.all(np.isnan(edges))  # default fill_value "NaN"
 
     def test_vector_expression_empty_cell_numeric_sentinel(self):
+        """Empty cell short-circuits to a numeric sentinel (no expression eval)."""
         cfg = self._edges_config(fill_value=0)
         result = calculate_cell_statistics({"h": np.array([])}, config=cfg)
         np.testing.assert_array_equal(result["edges"], [0, 0])
