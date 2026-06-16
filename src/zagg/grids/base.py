@@ -124,8 +124,10 @@ class OutputGrid(Protocol):
         """Whether this grid and ``other`` tile compatibly (align + nest).
 
         The primitive for cross-aggregator compatibility validation: same
-        family, aligned, whole-number resolution ratios. Cross-family
-        (HEALPix vs rectilinear) always returns False.
+        family, aligned, whole-number resolution ratios, and the same Option-B
+        output-field set (issue #29 — same scalar/vector kinds, trailing
+        shapes, dtypes). Cross-family (HEALPix vs rectilinear) always returns
+        False.
         """
         ...
 

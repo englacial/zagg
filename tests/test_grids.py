@@ -245,3 +245,93 @@ class TestBackcompatWrapper:
         )
         group = open_group(store, path="8", mode="r")
         assert group["count"].shape == (4 ** (8 - 6) * 3,)
+
+
+def _vector_config(bins=4, dtype="int64"):
+    """A config with one scalar (``count``) and one ``kind: vector`` field
+    (issue #29), reusing the atl06 coordinates so grids build normally."""
+    from zagg.config import PipelineConfig
+
+    base = default_config("atl06")
+    agg = {
+        "coordinates": base.aggregation.get("coordinates", {}),
+        "variables": {
+            "count": {"function": "len", "source": "h_li"},
+            "hist": {
+                "function": "np.bincount",
+                "source": "b",
+                "kind": "vector",
+                "trailing_shape": bins,
+                "dtype": dtype,
+            },
+        },
+    }
+    return PipelineConfig(
+        data_source=base.data_source, aggregation=agg, output=base.output
+    )
+
+
+class TestOutputFieldSignature:
+    """Issue #29 phase 4: ``signature()`` carries the Option-B output-field set
+    and ``nests_with()`` requires a matching set."""
+
+    def test_signature_includes_output_fields(self, cfg):
+        g = HealpixGrid(parent_order=6, child_order=8, layout="fullsphere", config=cfg)
+        sig = g.signature()
+        assert "output_fields" in sig
+        names = {f["name"] for f in sig["output_fields"]}
+        assert "count" in names
+        # Each entry carries the Option-B keys.
+        for f in sig["output_fields"]:
+            assert set(f) == {"name", "kind", "trailing_shape", "dtype"}
+
+    def test_signature_marks_vector_field(self):
+        g = HealpixGrid(
+            parent_order=6, child_order=8, layout="fullsphere", config=_vector_config()
+        )
+        by_name = {f["name"]: f for f in g.signature()["output_fields"]}
+        assert by_name["hist"]["kind"] == "vector"
+        assert by_name["hist"]["trailing_shape"] == [4]
+        assert by_name["count"]["kind"] == "scalar"
+        assert by_name["count"]["trailing_shape"] == []
+
+    def test_signature_is_json_serializable(self):
+        import json
+
+        g = HealpixGrid(
+            parent_order=6, child_order=8, layout="fullsphere", config=_vector_config()
+        )
+        # Round-trips unchanged (recorded in a ShardMap as JSON).
+        assert json.loads(json.dumps(g.signature())) == json.loads(
+            json.dumps(g.signature())
+        )
+
+    def test_nests_with_same_field_set(self, cfg):
+        a = HealpixGrid(parent_order=6, child_order=8, layout="fullsphere", config=cfg)
+        b = HealpixGrid(parent_order=4, child_order=8, layout="fullsphere", config=cfg)
+        assert a.nests_with(b) and b.nests_with(a)
+
+    def test_nests_with_differing_field_kind_rejected(self, cfg):
+        scalar = HealpixGrid(
+            parent_order=6, child_order=8, layout="fullsphere", config=cfg
+        )
+        vector = HealpixGrid(
+            parent_order=6, child_order=8, layout="fullsphere", config=_vector_config()
+        )
+        assert not scalar.nests_with(vector)
+        assert not vector.nests_with(scalar)
+
+    def test_nests_with_differing_trailing_shape_rejected(self):
+        a = HealpixGrid(
+            parent_order=6,
+            child_order=8,
+            layout="fullsphere",
+            config=_vector_config(bins=4),
+        )
+        b = HealpixGrid(
+            parent_order=6,
+            child_order=8,
+            layout="fullsphere",
+            config=_vector_config(bins=8),
+        )
+        assert not a.nests_with(b)
