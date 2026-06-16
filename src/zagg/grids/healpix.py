@@ -12,9 +12,10 @@ from zagg.config import (
     PipelineConfig,
     default_config,
     get_agg_fields,
+    get_output_signature,
     output_field_signature,
 )
-from zagg.grids.base import InconsistentShardError
+from zagg.grids.base import InconsistentShardError, vector_array_spec
 
 HEALPIX_BASE_CELLS: int = 12
 HEALPIX_REF_ORDER: int = 18  # mortie's clip2order reference order; do not change
@@ -269,7 +270,15 @@ class HealpixGrid:
         for name, meta in get_agg_fields(self.config).items():
             dtype = meta.get("dtype", "float32")
             fill = meta.get("fill_value", "NaN")
-            members[name] = base.with_data_type(dtype).with_fill_value(fill)
+            spec = base.with_data_type(dtype).with_fill_value(fill)
+            # A vector field (issue #29) gets a trailing payload dim chunked
+            # whole; scalars are returned unchanged.
+            members[name] = vector_array_spec(
+                spec,
+                get_output_signature(meta),
+                base_dims=("cells",),
+                base_chunk_shape=(self.n_children,),
+            )
 
         return GroupSpec(members=members, attributes=self._dggs_attrs())
 

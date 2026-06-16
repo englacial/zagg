@@ -45,8 +45,10 @@ from zagg.config import (
     PipelineConfig,
     default_config,
     get_agg_fields,
+    get_output_signature,
     output_field_signature,
 )
+from zagg.grids.base import vector_array_spec
 
 OOB_SENTINEL: int = -1
 
@@ -368,7 +370,15 @@ class RectilinearGrid:
         for name, meta in get_agg_fields(self.config).items():
             dtype = meta.get("dtype", "float32")
             fill = meta.get("fill_value", "NaN")
-            members[name] = base.with_data_type(dtype).with_fill_value(fill)
+            spec = base.with_data_type(dtype).with_fill_value(fill)
+            # A vector field (issue #29) gets a trailing payload dim chunked
+            # whole; scalars are returned unchanged.
+            members[name] = vector_array_spec(
+                spec,
+                get_output_signature(meta),
+                base_dims=("y", "x"),
+                base_chunk_shape=self.chunk_shape,
+            )
 
         return GroupSpec(members=members, attributes=self._geozarr_attrs())
 

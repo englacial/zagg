@@ -30,6 +30,61 @@ from zarr.abc.store import Store
 ShardKey = Any  # int for HEALPix, tuple[int,int] for rectilinear, etc.
 
 
+def vector_array_spec(base, sig, *, base_dims, base_chunk_shape):
+    """Extend a scalar data-var ``ArraySpec`` with a trailing payload dim.
+
+    Issue #29 phase 5: a ``kind: vector`` field is stored as a dense array of
+    shape ``(*spatial_shape, *trailing_shape)`` — the per-cell vector rides on
+    one or more trailing dimensions appended to the grid's spatial axes.
+
+    **Single-trailing-chunk invariant.** The trailing payload dimension(s) are
+    chunked *whole* (one chunk spans the full ``trailing_shape``). This is what
+    lets :func:`zagg.processing.write_dataframe_to_zarr` address a shard's
+    payload with ``block_idx = chunk_idx + (0,) * len(trailing_shape)`` — the
+    trailing block index is always ``0``. Do not chunk the trailing dim; the
+    writer assumes block 0.
+
+    Parameters
+    ----------
+    base : ArraySpec
+        The scalar data-var spec for this grid (already carries the field's
+        ``dtype``/``fill_value``); its ``shape`` is the spatial shape and its
+        chunk grid the spatial chunk shape.
+    sig : dict
+        Output signature from :func:`zagg.config.get_output_signature`
+        (``kind``/``trailing_shape``/``dtype``). For a scalar field (empty
+        ``trailing_shape``) ``base`` is returned unchanged.
+    base_dims : tuple of str
+        Spatial dimension names (e.g. ``("cells",)`` or ``("y", "x")``).
+    base_chunk_shape : tuple of int
+        Spatial chunk shape (the grid's ``chunk_shape``).
+
+    Returns
+    -------
+    ArraySpec
+    """
+    from pydantic_zarr.experimental.v3 import NamedConfig
+
+    trailing = tuple(int(t) for t in sig["trailing_shape"])
+    if not trailing:
+        return base
+    shape = (*base.shape, *trailing)
+    dim_names = (*base_dims, *(f"{base_dims[-1]}_v{i}" for i in range(len(trailing))))
+    chunk_shape = (*base_chunk_shape, *trailing)
+    chunk_grid = NamedConfig(name="regular", configuration={"chunk_shape": list(chunk_shape)})
+    # Set shape + dimension_names together: ArraySpec validates their ranks
+    # match on construction, so a chained ``with_shape`` then
+    # ``with_dimension_names`` would transiently mismatch and raise.
+    return type(base)(
+        **{
+            **base.model_dump(),
+            "shape": shape,
+            "dimension_names": dim_names,
+            "chunk_grid": chunk_grid,
+        }
+    )
+
+
 class InconsistentShardError(ValueError):
     """Raised by shard_of when input cells don't all share a shard."""
 
@@ -132,4 +187,9 @@ class OutputGrid(Protocol):
         ...
 
 
-__all__ = ["OutputGrid", "ShardKey", "InconsistentShardError"]
+__all__ = [
+    "OutputGrid",
+    "ShardKey",
+    "InconsistentShardError",
+    "vector_array_spec",
+]

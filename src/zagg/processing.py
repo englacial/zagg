@@ -269,6 +269,11 @@ def write_dataframe_to_zarr(
         # Scalar columns reshape to the grid's chunk_shape; a vector column keeps
         # its trailing payload dim(s), so the block (and target array) is
         # (*chunk_shape, *trailing_shape). The cell count invariant is unchanged.
+        #
+        # Single-trailing-chunk invariant (issue #29): the template
+        # (``grids.base.vector_array_spec``) chunks the trailing payload dim
+        # *whole*, so the trailing block index is always 0 and a shard's payload
+        # lands in one Zarr block via ``chunk_idx + (0,) * len(trailing)``.
         trailing = values.shape[1:]
         values = values.reshape((*grid.chunk_shape, *trailing))
         block_idx = chunk_idx + (0,) * len(trailing)
