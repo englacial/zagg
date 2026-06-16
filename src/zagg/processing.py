@@ -487,7 +487,7 @@ def _kernel_aggregate(
 
 
 def _read_group(
-    h5obj, group: str, data_source: dict, parent_morton: int, grid, arrow: bool = False
+    h5obj, group: str, data_source: dict, shard_key: int, grid, arrow: bool = False
 ):
     """Read and spatially filter one HDF5 group.
 
@@ -513,7 +513,7 @@ def _read_group(
 
     # Assign points to leaf cells, then filter to the current shard.
     leaf_ids = grid.assign(lats, lons)
-    mask_spatial = grid.shards_of(leaf_ids) == parent_morton
+    mask_spatial = grid.shards_of(leaf_ids) == shard_key
 
     if np.sum(mask_spatial) == 0:
         return None
@@ -629,8 +629,8 @@ def process_shard(
         raise ValueError(f"handoff must be 'pandas', 'arrow', or 'arrow-kernel', got {handoff!r}")
     data_source = config.data_source
 
-    parent_morton = int(shard_key)
-    logger.info(f"Processing shard: {parent_morton}")
+    shard_key = int(shard_key)
+    logger.info(f"Processing shard: {shard_key}")
     start_time = datetime.now()
 
     # Resolve driver
@@ -648,7 +648,7 @@ def process_shard(
 
     # Prepare metadata
     metadata: ProcessingMetadata = {
-        "parent_morton": parent_morton,
+        "shard_key": shard_key,
         "cells_with_data": 0,
         "total_obs": 0,
         "granule_count": len(granule_urls),
@@ -659,7 +659,7 @@ def process_shard(
 
     # Check for granules
     if not granule_urls:
-        logger.info(f"  No granules provided for morton {parent_morton} - skipping")
+        logger.info(f"  No granules provided for shard {shard_key} - skipping")
         metadata["error"] = "No granules found"
         metadata["duration_s"] = (datetime.now() - start_time).total_seconds()
         return pd.DataFrame(), metadata
@@ -701,7 +701,7 @@ def process_shard(
 
             for g in data_source["groups"]:
                 try:
-                    chunk = _read_group(h5obj, g, data_source, parent_morton, grid, arrow=use_arrow)
+                    chunk = _read_group(h5obj, g, data_source, shard_key, grid, arrow=use_arrow)
                     if chunk is not None:
                         all_reads.append(chunk)
                 except Exception as e:
@@ -718,12 +718,12 @@ def process_shard(
     metadata["files_processed"] = files_processed
 
     if not all_reads:
-        logger.info(f"  No data after filtering for morton {parent_morton} - skipping")
+        logger.info(f"  No data after filtering for shard {shard_key} - skipping")
         metadata["error"] = "No data after filtering"
         metadata["duration_s"] = (datetime.now() - start_time).total_seconds()
         return pd.DataFrame(), metadata
 
-    children = grid.children(parent_morton)
+    children = grid.children(shard_key)
     data_vars = get_data_vars(config)
 
     if handoff == "arrow-kernel":
@@ -790,7 +790,7 @@ def process_shard(
         df_out[col_name] = vals
 
     duration = (datetime.now() - start_time).total_seconds()
-    logger.info(f"Completed shard {parent_morton} in {duration:.1f}s")
+    logger.info(f"Completed shard {shard_key} in {duration:.1f}s")
 
     metadata["cells_with_data"] = cells_with_data
     metadata["total_obs"] = int(stats_arrays["count"].sum())

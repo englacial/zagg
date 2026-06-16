@@ -174,3 +174,42 @@ class TestOutputCredsEvent:
         assert block["endpointUrl"] == "https://r2.example"
         assert block["region"] == "eu-west-1"
         assert "sessionToken" not in block
+
+
+class TestInvokeLambdaCellEvent:
+    """The per-cell Lambda event uses the grid-neutral ``shard_key`` field, and
+    only forwards the HEALPix-specific ``child_order`` when it is set (#24)."""
+
+    _CREDS = {"accessKeyId": "a", "secretAccessKey": "s", "sessionToken": "t"}
+
+    def _captured_event(self, *, child_order):
+        from unittest.mock import MagicMock
+
+        from zagg.runner import _invoke_lambda_cell
+
+        client = MagicMock()
+        payload = MagicMock()
+        payload.read.return_value = json.dumps(
+            {"statusCode": 200, "body": json.dumps({"total_obs": 0, "duration_s": 0.0})}
+        ).encode()
+        client.invoke.return_value = {"Payload": payload, "FunctionError": None}
+        _invoke_lambda_cell(
+            client, (0,), 12345, 6, child_order,
+            ["s3://b/g.h5"], "s3://out/x.zarr", self._CREDS,
+            function_name="process-shard", config_dict=None, max_workers=4,
+        )
+        return json.loads(client.invoke.call_args.kwargs["Payload"])
+
+    def test_healpix_event_uses_shard_key_and_keeps_child_order(self):
+        event = self._captured_event(child_order=12)
+        assert event["shard_key"] == 12345
+        assert "parent_morton" not in event
+        assert event["parent_order"] == 6
+        assert event["child_order"] == 12
+
+    def test_non_healpix_event_omits_child_order(self):
+        # Rectilinear runs pass child_order=None; the field is dropped.
+        event = self._captured_event(child_order=None)
+        assert event["shard_key"] == 12345
+        assert "child_order" not in event
+        assert "parent_morton" not in event
