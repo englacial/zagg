@@ -938,6 +938,9 @@ class TestVectorRoundTrip:
         n = len(children)  # 4 ** (child_order - parent_order)
         assert n == 4 ** (child_order - parent_order)
 
+        # This test isolates the carrier->writer->Zarr->reader half of #29, so it
+        # fabricates the per-cell stats blocks directly rather than running the
+        # ``edges`` expression (the stat-eval path is covered by TestVectorOutputs).
         # Two populated cells; the rest stay NaN-padded (the empty-cell sentinel).
         stats = {
             "count": np.zeros(n, dtype="float32"),
