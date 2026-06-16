@@ -16,7 +16,13 @@ import pandas as pd
 from zarr import config, open_array
 from zarr.abc.store import Store
 
-from zagg.config import PipelineConfig, default_config, get_agg_fields, get_data_vars
+from zagg.config import (
+    PipelineConfig,
+    default_config,
+    get_agg_fields,
+    get_data_vars,
+    get_output_signature,
+)
 from zagg.schema import ProcessingMetadata
 
 logger = logging.getLogger(__name__)
@@ -32,6 +38,18 @@ def _make_url_rewriter(driver: str | None):
     if driver == "https":
         return lambda url: url
     return lambda url: url.replace("s3://", "", 1)
+
+
+def _field_sentinel(meta: dict) -> float:
+    """Per-cell fill value for an agg field's empty/unused slots.
+
+    Mirrors how ``process_shard`` / :func:`_kernel_aggregate` seed their output
+    arrays: the schema-declared ``fill_value`` (default ``"NaN"`` -> ``np.nan``,
+    else the literal numeric fill). Used both for scalar empty cells and for the
+    padding of ``vector`` fields (issue #29 Option B).
+    """
+    fill_value = meta.get("fill_value", "NaN")
+    return np.nan if fill_value == "NaN" else fill_value
 
 
 def _group_columns(
@@ -244,10 +262,7 @@ def calculate_cell_statistics(
 
     n_obs = len(next(iter(cell_data.values()))) if cell_data else 0
     if n_obs == 0:
-        return {
-            name: (0 if meta.get("function") in ("len", "count") else np.nan)
-            for name, meta in agg_fields.items()
-        }
+        return {name: _empty_cell_value(meta) for name, meta in agg_fields.items()}
 
     result = {}
     for name, meta in agg_fields.items():
@@ -255,9 +270,18 @@ def calculate_cell_statistics(
         expression = meta.get("expression")
         source = meta.get("source") or value_col
         params = dict(meta.get("params", {}))
+        sig = get_output_signature(meta)
 
-        # Expression-based aggregation (e.g. h_sigma)
+        # Expression-based aggregation (e.g. h_sigma). Expressions are scalar-only
+        # in Tier 1: ``evaluate_expression`` returns a Python float. A vector
+        # expression field would need a non-scalar eval contract; that's deferred
+        # (issue #29) — declaring ``kind: vector`` with ``expression`` is rejected.
         if expression:
+            if sig["kind"] == "vector":
+                raise ValueError(
+                    f"Variable '{name}': vector output from an expression is not yet "
+                    f"supported; use 'function' (issue #29 Tier 1)"
+                )
             result[name] = evaluate_expression(expression, cell_data)
             continue
 
@@ -285,9 +309,45 @@ def calculate_cell_statistics(
                 resolved_params[pkey] = pval
 
         func = resolve_function(func_name)
-        result[name] = float(func(values, **resolved_params))
+        out = func(values, **resolved_params)
+        # Scalar fields stay byte-for-byte identical to the pre-#29 path; only a
+        # declared ``vector`` field is allowed to return an ndarray (issue #29).
+        result[name] = _coerce_field_value(out, sig) if sig["kind"] == "vector" else float(out)
 
     return result
+
+
+def _empty_cell_value(meta: dict):
+    """Value emitted for a single agg field when its cell has no observations.
+
+    Scalar fields keep the pre-#29 contract: ``0`` for ``len``/``count``,
+    ``np.nan`` otherwise. A ``vector`` field (issue #29) instead gets a full
+    ``trailing_shape`` array filled with its schema-declared sentinel
+    (:func:`_field_sentinel`), so empty and populated cells emit the same shape.
+    """
+    sig = get_output_signature(meta)
+    if sig["kind"] == "vector":
+        dtype = np.dtype(sig["dtype"]) if sig["dtype"] is not None else np.dtype("float32")
+        return np.full(sig["trailing_shape"], _field_sentinel(meta), dtype=dtype)
+    return 0 if meta.get("function") in ("len", "count") else np.nan
+
+
+def _coerce_field_value(value, sig: dict) -> np.ndarray:
+    """Coerce a ``vector`` field's aggregation output to its declared signature.
+
+    The field's ``function`` must yield exactly ``trailing_shape`` values (issue
+    #29 Tier-1 fixed-width vectors; ragged/CSR is Tier 2; vector ``expression``
+    fields are deferred and rejected upstream). Returns
+    a contiguous array of the declared dtype (default ``float32``), so every cell
+    emits an identically-shaped slab the dense writer (phase 5) can stack.
+    """
+    dtype = np.dtype(sig["dtype"]) if sig["dtype"] is not None else np.dtype("float32")
+    arr = np.asarray(value, dtype=dtype)
+    if arr.shape != sig["trailing_shape"]:
+        raise ValueError(
+            f"vector field produced shape {arr.shape}, expected {sig['trailing_shape']}"
+        )
+    return arr
 
 
 # EXPERIMENTAL (phase 2b of #30) -----------------------------------------------

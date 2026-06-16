@@ -145,6 +145,83 @@ class TestCalculateCellStatistics:
         assert result["h_nanmin"] == 1.0
 
 
+class TestVectorOutputs:
+    """Issue #29 phase 2: a ``kind: vector`` field yields a per-cell ndarray of
+    its declared ``trailing_shape``/``dtype``; scalar fields are unchanged."""
+
+    @staticmethod
+    def _hist_config(bins=4, dtype="int64", fill_value=None):
+        from zagg.config import PipelineConfig
+
+        meta = {
+            "function": "np.bincount",
+            "source": "b",
+            "kind": "vector",
+            "trailing_shape": bins,
+            "dtype": dtype,
+            "params": {"minlength": bins},
+        }
+        if fill_value is not None:
+            meta["fill_value"] = fill_value
+        return PipelineConfig(aggregation={"variables": {"hist": meta}})
+
+    def test_vector_field_returns_declared_shape(self):
+        cfg = self._hist_config(bins=4)
+        data = {"b": np.array([0, 1, 1, 3])}
+        result = calculate_cell_statistics(data, config=cfg)
+        hist = result["hist"]
+        assert isinstance(hist, np.ndarray)
+        assert hist.shape == (4,)
+        assert hist.dtype == np.dtype("int64")
+        np.testing.assert_array_equal(hist, [1, 2, 0, 1])
+
+    def test_vector_empty_cell_gets_sentinel(self):
+        cfg = self._hist_config(bins=4, dtype="float32")
+        result = calculate_cell_statistics({"b": np.array([])}, config=cfg)
+        hist = result["hist"]
+        assert hist.shape == (4,)
+        assert np.all(np.isnan(hist))  # default fill_value "NaN"
+
+    def test_vector_empty_cell_numeric_sentinel(self):
+        cfg = self._hist_config(bins=3, dtype="int64", fill_value=0)
+        result = calculate_cell_statistics({"b": np.array([])}, config=cfg)
+        np.testing.assert_array_equal(result["hist"], [0, 0, 0])
+
+    def test_vector_wrong_width_raises(self):
+        cfg = self._hist_config(bins=2)  # but bincount yields width 4 below
+        with pytest.raises(ValueError, match="expected"):
+            calculate_cell_statistics({"b": np.array([0, 3])}, config=cfg)
+
+    def test_vector_expression_rejected(self):
+        """Tier 1 vectors come from ``function``; a vector ``expression`` field is
+        deferred (issue #29) and must fail loudly rather than silently scalarize."""
+        from zagg.config import PipelineConfig
+
+        cfg = PipelineConfig(
+            aggregation={
+                "variables": {
+                    "edges": {
+                        "expression": "np.array([np.min(h), np.max(h)])",
+                        "kind": "vector",
+                        "trailing_shape": 2,
+                        "dtype": "float32",
+                    }
+                }
+            }
+        )
+        with pytest.raises(ValueError, match="vector output from an expression"):
+            calculate_cell_statistics({"h": np.array([1.0, 5.0, 3.0])}, config=cfg)
+
+    def test_scalar_fields_unchanged_alongside_vector(self):
+        """Adding a vector field must not perturb scalar outputs in the same dict."""
+        scalar = calculate_cell_statistics(
+            {"h_li": np.array([1.0, 2.0, 3.0]), "s_li": np.array([0.1, 0.1, 0.1])}
+        )
+        assert isinstance(scalar["h_min"], float)
+        assert scalar["h_min"] == 1.0
+        assert scalar["count"] == 3
+
+
 class TestBuildGroups:
     def test_slice_counts_match_per_cell_mask(self):
         """_build_groups produces identical cell populations as the old boolean-mask loop."""
