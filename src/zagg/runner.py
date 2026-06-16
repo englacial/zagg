@@ -127,7 +127,9 @@ def agg(
     if not store_path:
         raise ValueError("No store path specified (pass store= or set output.store: in config)")
 
-    child_order = get_child_order(config)
+    # child_order is HEALPix-specific (leaf order); other grids don't define it.
+    grid_type = config.output.get("grid", {}).get("type", "healpix")
+    child_order = get_child_order(config) if grid_type == "healpix" else None
     _maybe_warn_dense(get_layout(config))
 
     # Resolve driver: kwarg > config > default
@@ -506,7 +508,7 @@ def _run_lambda(config, catalog_data, store_path, child_order, *,
                 cells_with_data += 1
             elif error not in ("No granules found", "No data after filtering"):
                 cells_error += 1
-                logger.warning(f"  [{i}/{len(cells)}] morton {result.get('morton')}: {error}")
+                logger.warning(f"  [{i}/{len(cells)}] shard {result.get('shard_key')}: {error}")
 
             if i % 50 == 0:
                 elapsed = time.time() - start_time
@@ -631,7 +633,7 @@ def _invoke_lambda_finalize(lambda_client, function_name, store_path,
 
 
 def _invoke_lambda_cell(
-    lambda_client, chunk_idx, parent_morton, parent_order, child_order,
+    lambda_client, chunk_idx, shard_key, parent_order, child_order,
     granule_urls, store_path, s3_credentials, *,
     function_name, config_dict, output_creds_event=None, max_retries=3,
     max_workers=None,
@@ -645,9 +647,8 @@ def _invoke_lambda_cell(
 
     event = {
         "chunk_idx": chunk_idx,
-        "parent_morton": parent_morton,
+        "shard_key": shard_key,
         "parent_order": parent_order,
-        "child_order": child_order,
         "granule_urls": granule_urls,
         "store_path": store_path,
         "s3_credentials": {
@@ -656,6 +657,10 @@ def _invoke_lambda_cell(
             "sessionToken": s3_credentials["sessionToken"],
         },
     }
+    # child_order is HEALPix-specific; only forward it when set (non-HEALPix
+    # grids leave it None and the handler doesn't require it).
+    if child_order is not None:
+        event["child_order"] = child_order
     if config_dict is not None:
         event["config"] = config_dict
     if output_creds_event is not None:
@@ -692,7 +697,7 @@ def _invoke_lambda_cell(
                 body = {}
 
             return {
-                "morton": parent_morton,
+                "shard_key": shard_key,
                 "status_code": result.get("statusCode"),
                 "body": body,
                 "wall_time": time.time() - wall_start,
@@ -717,7 +722,7 @@ def _invoke_lambda_cell(
                 break
 
     return {
-        "morton": parent_morton,
+        "shard_key": shard_key,
         "status_code": None,
         "body": {},
         "wall_time": time.time() - wall_start,

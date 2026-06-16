@@ -6,9 +6,9 @@ This is an AWS-specific wrapper around the cloud-agnostic processing module.
 Event payload (default / process mode):
 {
     "chunk_idx": int,
-    "parent_morton": int,
-    "parent_order": int,
-    "child_order": int,
+    "shard_key": int,           # grid-agnostic shard identifier
+    "parent_order": int,        # HEALPix only (omit for other grids)
+    "child_order": int,         # HEALPix only (omit for other grids)
     "granule_urls": [str, ...],
     "store_path": str,          # e.g. "s3://bucket/prefix.zarr"
     "s3_credentials": {         # creds for reading NSIDC source data
@@ -182,7 +182,7 @@ def _handle_process(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
         json.dumps(
             {
                 "event_type": "lambda_invocation",
-                "parent_morton": event.get("parent_morton"),
+                "shard_key": event.get("shard_key"),
                 "granule_count": len(event.get("granule_urls", [])),
                 "child_order": event.get("child_order"),
                 "request_id": context.aws_request_id,
@@ -192,11 +192,13 @@ def _handle_process(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
     )
 
     try:
-        # Validate required parameters
+        # Validate required parameters. ``child_order`` is HEALPix-specific and
+        # only required once the grid is known to be HEALPix (checked below);
+        # ``parent_order`` is forwarded by the orchestrator for every grid (None
+        # for non-HEALPix), so its key is always present.
         required_params = [
-            "parent_morton",
+            "shard_key",
             "parent_order",
-            "child_order",
             "granule_urls",
             "store_path",
             "s3_credentials",
@@ -228,13 +230,22 @@ def _handle_process(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
         if config is None:
             from zagg.config import default_config
             config = default_config("atl06")
-        grid = from_config(config, parent_order=event["parent_order"])
+
+        # child_order is required for HEALPix runs (drives the leaf order); it is
+        # absent/unused for non-HEALPix grids.
+        grid_type = config.output.get("grid", {}).get("type", "healpix")
+        if grid_type == "healpix" and "child_order" not in event:
+            error_msg = "Missing required parameters: child_order"
+            logger.error(error_msg)
+            return {"statusCode": 400, "body": json.dumps({"error": error_msg})}
+
+        grid = from_config(config, parent_order=event.get("parent_order"))
 
         # Process the shard using cloud-agnostic function
         from zagg.processing import process_shard
         df_out, metadata = process_shard(
             grid,
-            event["parent_morton"],
+            event["shard_key"],
             event["granule_urls"],
             s3_credentials=s3_creds,
             config=config,
@@ -274,7 +285,7 @@ def _handle_process(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
             json.dumps(
                 {
                     "event_type": "processing_complete",
-                    "parent_morton": metadata["parent_morton"],
+                    "shard_key": metadata["shard_key"],
                     "cells_with_data": metadata["cells_with_data"],
                     "total_obs": metadata["total_obs"],
                     "duration_s": metadata["duration_s"],
@@ -302,7 +313,7 @@ def _handle_process(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
             "body": json.dumps(
                 {
                     "error": f"Unhandled exception: {str(e)}",
-                    "parent_morton": event.get("parent_morton"),
+                    "shard_key": event.get("shard_key"),
                     "request_id": context.aws_request_id,
                 }
             ),

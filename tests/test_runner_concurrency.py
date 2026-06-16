@@ -92,7 +92,7 @@ class TestProbeClampsWorkers:
                 "body": {"total_obs": 5},
                 "error": None,
                 "lambda_duration": 1.0,
-                "morton": 0,
+                "shard_key": 0,
             },
         )
         summary = runner._run_lambda(

@@ -17,7 +17,7 @@ from zagg.grids.healpix import HEALPIX_BASE_CELLS, HealpixGrid
 
 
 class ProcessingMetadata(TypedDict):
-    parent_morton: int
+    shard_key: int
     cells_with_data: int
     total_obs: int
     granule_count: int
