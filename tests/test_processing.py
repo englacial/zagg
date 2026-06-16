@@ -5,7 +5,7 @@ from zarr import open_group
 from zarr.storage import MemoryStore
 
 from zagg.config import default_config, get_agg_fields, get_coords, get_data_vars
-from zagg.grids import HealpixGrid
+from zagg.grids import HEALPIX_BASE_CELLS, HealpixGrid
 from zagg.processing import (
     KERNEL_RTOL,
     _arrow_column,
@@ -894,3 +894,82 @@ class TestDataSource:
         ds = default_config().data_source
         path = ds["coordinates"]["latitude"].format(group="gt2r")
         assert path == "/gt2r/land_ice_segments/latitude"
+
+
+class TestVectorRoundTrip:
+    """Issue #29 phase 6: a vector field written to a real Zarr template reads
+    back through the trailing-dim block, and NaN-padded empty cells are skipped
+    by a NaN-aware reducer."""
+
+    @staticmethod
+    def _vector_cfg():
+        cfg = default_config("atl06")
+        agg = {
+            "coordinates": cfg.aggregation.get("coordinates", {}),
+            "variables": {
+                "count": {"function": "len", "source": "h_li"},
+                "edges": {
+                    "expression": "np.array([np.min(h), np.max(h)])",
+                    "source": "h",
+                    "kind": "vector",
+                    "trailing_shape": 2,
+                    "dtype": "float32",
+                },
+            },
+        }
+        from zagg.config import PipelineConfig
+
+        return PipelineConfig(
+            data_source=cfg.data_source, aggregation=agg, output=cfg.output
+        )
+
+    def test_vector_leaf_to_zarr_to_read(self):
+        pytest.importorskip("pyarrow")
+        from mortie import geo2mort
+
+        cfg = self._vector_cfg()
+        parent_order, child_order = 2, 4
+        grid = HealpixGrid(parent_order, child_order, layout="fullsphere", config=cfg)
+        store = MemoryStore()
+        grid.emit_template(store)
+
+        parent = int(geo2mort(-78.5, -132.0, order=parent_order)[0])
+        children = grid.children(parent)
+        n = len(children)  # 4 ** (child_order - parent_order)
+        assert n == 4 ** (child_order - parent_order)
+
+        # Two populated cells; the rest stay NaN-padded (the empty-cell sentinel).
+        stats = {
+            "count": np.zeros(n, dtype="float32"),
+            "edges": np.full((n, 2), np.nan, dtype="float32"),
+        }
+        stats["count"][0] = 5
+        stats["edges"][0] = [1.0, 9.0]
+        stats["count"][3] = 2
+        stats["edges"][3] = [-2.0, 4.0]
+
+        carrier = _build_output(
+            stats, get_data_vars(cfg), get_agg_fields(cfg), grid, parent, use_arrow=True
+        )
+        # The vector column is carried as a FixedSizeList (issue #29 B').
+        assert carrier.column_names[:2] == ["count", "edges"]
+
+        chunk_idx = grid.block_index(parent)
+        write_dataframe_to_zarr(carrier, store, grid=grid, chunk_idx=chunk_idx)
+
+        group = open_group(store=store, mode="r", path=str(child_order))
+        assert group["edges"].shape == (HEALPIX_BASE_CELLS * 4**child_order, 2)
+        block_start = chunk_idx[0] * n
+        got = group["edges"][block_start : block_start + n]
+
+        # Populated cells round-trip exactly through the trailing-dim selection.
+        np.testing.assert_array_equal(got[0], [1.0, 9.0])
+        np.testing.assert_array_equal(got[3], [-2.0, 4.0])
+        # Empty cells carry the NaN padding sentinel.
+        assert np.all(np.isnan(got[1]))
+        assert np.all(np.isnan(got[2]))
+
+        # A NaN-aware reducer skips the padding: the per-edge mean over cells is
+        # taken only over the two populated rows.
+        reduced = np.nanmean(got, axis=0)
+        np.testing.assert_allclose(reduced, [(1.0 - 2.0) / 2, (9.0 + 4.0) / 2])
