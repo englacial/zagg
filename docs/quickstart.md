@@ -61,6 +61,13 @@ This produces a JSON file (e.g., `shardmap_ATL06_2024-01-06_2024-04-07.json`) th
 parent morton cells to the S3 URLs of HDF5 granules containing data for those
 cells. The processing step consumes this file.
 
+To inspect the chunking interactively -- shard outlines, granule footprints,
+and a grid that appears on zoom -- use the shard-map viewer
+(`pip install zagg[viz]`). See the
+[shard-map viewer notebook](https://github.com/englacial/zagg/blob/main/notebooks/shardmap_viewer.ipynb),
+which runs on a synthetic example (no network needed) and includes manual
+in-browser verification instructions.
+
 ## Local Processing
 
 The simplest path -- no AWS Lambda needed:
