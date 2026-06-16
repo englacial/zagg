@@ -13,6 +13,7 @@ from zagg.processing import (
     _group_columns,
     _kernel_able,
     _kernel_aggregate,
+    _quality_mask,
     calculate_cell_statistics,
     process_shard,
     write_dataframe_to_zarr,
@@ -645,3 +646,23 @@ class TestDataSource:
         ds = default_config().data_source
         path = ds["coordinates"]["latitude"].format(group="gt2r")
         assert path == "/gt2r/land_ice_segments/latitude"
+
+
+class TestQualityMask:
+    """``_quality_mask`` builds the keep-mask for the configured comparison op."""
+
+    def test_eq_default_keeps_equal(self):
+        # ATL06 semantics: keep atl06_quality_summary == 0 (op defaults to eq).
+        q_flag = np.array([0, 1, 0, 2], dtype=np.int8)
+        mask = _quality_mask(q_flag, {"value": 0})
+        np.testing.assert_array_equal(mask, [True, False, True, False])
+
+    def test_ne_keeps_nonmatching(self):
+        # ATL03 semantics: keep signal_conf_ph != 0 (drop only the noise flag).
+        q_flag = np.array([0, 1, 4, 0], dtype=np.int8)
+        mask = _quality_mask(q_flag, {"value": 0, "op": "ne"})
+        np.testing.assert_array_equal(mask, [False, True, True, False])
+
+    def test_unknown_op_raises(self):
+        with pytest.raises(ValueError, match="Unknown quality_filter op"):
+            _quality_mask(np.array([0]), {"value": 0, "op": "gt"})

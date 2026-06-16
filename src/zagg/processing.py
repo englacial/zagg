@@ -486,6 +486,42 @@ def _kernel_aggregate(
 # -- end EXPERIMENTAL kernel path ---------------------------------------------
 
 
+def _quality_mask(q_flag: np.ndarray, quality_filter: dict) -> np.ndarray:
+    """Build a keep-mask from a quality-flag array and a ``quality_filter`` spec.
+
+    The comparison is controlled by ``quality_filter["op"]`` (default ``"eq"``):
+
+    - ``"eq"`` keeps rows where the flag equals ``value`` (ATL06: keep
+      ``atl06_quality_summary == 0``).
+    - ``"ne"`` keeps rows where the flag differs from ``value`` (ATL03: keep
+      ``signal_conf_ph != 0``, dropping only the noise flag).
+
+    Parameters
+    ----------
+    q_flag : np.ndarray
+        Quality-flag values for the candidate rows.
+    quality_filter : dict
+        Filter spec with ``value`` and optional ``op``.
+
+    Returns
+    -------
+    np.ndarray
+        Boolean keep-mask, same length as ``q_flag``.
+
+    Raises
+    ------
+    ValueError
+        If ``op`` is not ``"eq"`` or ``"ne"``.
+    """
+    value = quality_filter["value"]
+    op = quality_filter.get("op", "eq")
+    if op == "eq":
+        return q_flag == value
+    if op == "ne":
+        return q_flag != value
+    raise ValueError(f"Unknown quality_filter op '{op}' (expected 'eq' or 'ne')")
+
+
 def _read_group(
     h5obj, group: str, data_source: dict, shard_key: int, grid, arrow: bool = False
 ):
@@ -542,7 +578,7 @@ def _read_group(
     if quality_filter is not None:
         qf_path = quality_filter["dataset"].format(group=group)
         q_flag = data[qf_path][mask_sliced]
-        quality_mask = q_flag == quality_filter["value"]
+        quality_mask = _quality_mask(q_flag, quality_filter)
         if np.sum(quality_mask) == 0:
             return None
     else:

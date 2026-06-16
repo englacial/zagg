@@ -1,0 +1,61 @@
+# ATL03 photon-height aggregation template.
+#
+# Scalar-only stats (non-scalar outputs are deferred to #29): per-cell density
+# (photon count), min/max elevation, mean and median height, and variance.
+#
+# Confidence filter keeps everything except the noise flag: signal_conf_ph != 0
+# (retains flags 1-4), per the ATL03 v3 data dictionary
+# (https://nsidc.org/sites/default/files/icesat2_atl03_data_dict_v003_0.pdf).
+#
+# signal_conf_ph is per-surface-type in ATL03; this template reads the land
+# surface_type column (index 0). Grid is rectilinear (HEALPix order-19, the
+# ~10 m match, waits on mortie #35).
+data_source:
+  reader: h5coro
+  driver: s3
+  groups: [gt1l, gt1r, gt2l, gt2r, gt3l, gt3r]
+  coordinates:
+    latitude: "/{group}/heights/lat_ph"
+    longitude: "/{group}/heights/lon_ph"
+  variables:
+    h_ph: "/{group}/heights/h_ph"
+  quality_filter:
+    dataset: "/{group}/heights/signal_conf_ph"
+    value: 0
+    op: ne
+
+aggregation:
+  variables:
+    count:
+      function: len
+      source: h_ph
+      dtype: int32
+      fill_value: 0
+    h_min:
+      function: min
+      source: h_ph
+      dtype: float32
+    h_max:
+      function: max
+      source: h_ph
+      dtype: float32
+    h_mean:
+      function: mean
+      source: h_ph
+      dtype: float32
+    h_median:
+      function: median
+      source: h_ph
+      dtype: float32
+    h_variance:
+      function: var
+      source: h_ph
+      dtype: float32
+
+output:
+  grid:
+    type: rectilinear
+    crs: EPSG:4326
+    resolution: 0.0001            # degrees (~10 m at the equator)
+    bounds: [-180, -90, 180, 90]
+    chunk_shape: [256, 256]

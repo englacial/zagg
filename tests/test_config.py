@@ -89,6 +89,42 @@ class TestDefaultConfig:
 
 
 # ---------------------------------------------------------------------------
+# ATL03 template
+# ---------------------------------------------------------------------------
+
+class TestATL03Template:
+    @pytest.fixture
+    def atl03_config(self):
+        return default_config("atl03")
+
+    def test_loads_and_validates(self, atl03_config):
+        # default_config already runs validate_config; assert it round-trips.
+        validate_config(atl03_config)
+        assert atl03_config.data_source["reader"] == "h5coro"
+        assert len(atl03_config.data_source["groups"]) == 6
+
+    def test_scalar_variables(self, atl03_config):
+        dvars = set(get_data_vars(atl03_config))
+        assert dvars == {"count", "h_min", "h_max", "h_mean", "h_median", "h_variance"}
+
+    def test_functions_resolve(self, atl03_config):
+        for meta in get_agg_fields(atl03_config).values():
+            assert "expression" not in meta  # scalar-only; non-scalar is #29
+            resolve_function(meta["function"])  # raises on failure
+
+    def test_confidence_filter_drops_noise(self, atl03_config):
+        qf = atl03_config.data_source["quality_filter"]
+        assert qf["value"] == 0
+        assert qf["op"] == "ne"  # keep signal_conf_ph != 0 (flags 1-4)
+        assert qf["dataset"].endswith("signal_conf_ph")
+
+    def test_rectilinear_grid(self, atl03_config):
+        grid = atl03_config.output["grid"]
+        assert grid["type"] == "rectilinear"
+        assert len(grid["bounds"]) == 4
+
+
+# ---------------------------------------------------------------------------
 # Function resolution
 # ---------------------------------------------------------------------------
 
