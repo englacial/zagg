@@ -208,13 +208,40 @@ class TestOutputCredsEvent:
         with pytest.raises(ValueError, match="accessKeyId"):
             _build_output_creds_event(creds, None, "us-west-2")
 
-    def test_endpoint_url_snake_case_normalizes(self):
-        """``endpoint_url`` in the creds dict normalizes to ``endpointUrl`` (#45)."""
-        from zagg.runner import normalize_output_credentials
+    def test_missing_both_required_fields_names_both(self):
+        """Both missing fields are named in the error (#45)."""
+        from zagg.runner import _build_output_creds_event
+        with pytest.raises(ValueError, match="accessKeyId.*secretAccessKey"):
+            _build_output_creds_event({"region": "us-west-2"}, None, "us-west-2")
+
+    def test_empty_creds_returns_none(self):
+        """An empty dict is treated as "no explicit creds", like None (#45)."""
+        from zagg.runner import _build_output_creds_event
+        assert _build_output_creds_event({}, None, "us-west-2") is None
+
+    def test_endpoint_url_from_creds_flows_into_event(self):
+        """``endpoint_url`` in the creds dict reaches the event block (#45)."""
+        from zagg.runner import _build_output_creds_event
         creds = {"aws_access_key_id": "AKIA", "aws_secret_access_key": "s",
                  "endpoint_url": "https://r2.example"}
+        block = _build_output_creds_event(creds, None, "us-west-2")
+        assert block["endpointUrl"] == "https://r2.example"
+
+    def test_endpoint_param_takes_precedence_over_creds(self):
+        """The explicit endpoint_url parameter wins over the creds dict (#45)."""
+        from zagg.runner import _build_output_creds_event
+        creds = {"accessKeyId": "AKIA", "secretAccessKey": "s",
+                 "endpointUrl": "https://from-creds"}
+        block = _build_output_creds_event(creds, "https://from-param", "us-west-2")
+        assert block["endpointUrl"] == "https://from-param"
+
+    def test_first_truthy_spelling_wins(self):
+        """A falsy spelling falls through to the next, mirroring the read path (#45)."""
+        from zagg.runner import normalize_output_credentials
+        creds = {"accessKeyId": "", "aws_access_key_id": "AKIA",
+                 "secretAccessKey": "s"}
         normalized = normalize_output_credentials(creds)
-        assert normalized["endpointUrl"] == "https://r2.example"
+        assert normalized["accessKeyId"] == "AKIA"
 
 
 class TestInvokeLambdaCellEvent:
