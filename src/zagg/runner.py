@@ -565,15 +565,17 @@ def normalize_output_credentials(credentials):
     Accepts camelCase (``accessKeyId``), boto snake_case
     (``aws_access_key_id``), and STS PascalCase (``AccessKeyId``) spellings,
     returning a dict keyed only by the canonical camelCase names. Keys that are
-    absent under every spelling are simply omitted. ``None``/empty passes
-    through unchanged so callers can keep using execution-role writes.
+    absent (or falsy under every spelling) are simply omitted -- the first
+    truthy spelling wins, mirroring the ``or``-chain read-path leniency in
+    ``processing.process_shard``. ``None``/empty passes through unchanged so
+    callers can keep using execution-role writes.
     """
     if not credentials:
         return credentials
     normalized = {}
     for canonical, aliases in _OUTPUT_CRED_ALIASES.items():
         for alias in aliases:
-            if alias in credentials:
+            if credentials.get(alias):
                 normalized[canonical] = credentials[alias]
                 break
     return normalized
@@ -605,8 +607,9 @@ def _build_output_creds_event(credentials, endpoint_url, region):
     }
     if credentials.get("sessionToken"):
         block["sessionToken"] = credentials["sessionToken"]
-    if endpoint_url:
-        block["endpointUrl"] = endpoint_url
+    endpoint = endpoint_url or credentials.get("endpointUrl")
+    if endpoint:
+        block["endpointUrl"] = endpoint
     return block
 
 
