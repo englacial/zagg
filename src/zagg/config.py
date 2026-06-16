@@ -429,6 +429,40 @@ def get_output_signature(meta: dict) -> dict:
     }
 
 
+def output_field_signature(config: PipelineConfig) -> list[dict]:
+    """Return the Option-B output-field signature for a config (issue #29).
+
+    A canonical, JSON-serializable list of ``{"name", "kind", "trailing_shape",
+    "dtype"}`` for every aggregation variable, sorted by ``name``. Recorded in a
+    grid's :meth:`signature` so a shard map can never be silently paired with a
+    grid whose output schema (scalar vs vector, trailing shape, dtype) differs,
+    and compared in ``nests_with`` so co-aggregated grids must share a field set.
+
+    ``trailing_shape`` is rendered as a ``list`` (``()``  for scalar fields) so
+    the structure round-trips through JSON unchanged.
+
+    Parameters
+    ----------
+    config : PipelineConfig
+
+    Returns
+    -------
+    list of dict
+    """
+    fields = []
+    for name, meta in get_agg_fields(config).items():
+        sig = get_output_signature(meta)
+        fields.append(
+            {
+                "name": name,
+                "kind": sig["kind"],
+                "trailing_shape": list(sig["trailing_shape"]),
+                "dtype": sig["dtype"],
+            }
+        )
+    return sorted(fields, key=lambda f: f["name"])
+
+
 def get_coords(config: PipelineConfig) -> list[str]:
     """Return coordinate column names from the aggregation config.
 

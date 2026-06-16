@@ -41,7 +41,12 @@ from pydantic_zarr.experimental.v3 import ArraySpec, GroupSpec, NamedConfig
 from zarr import config as zarr_config
 from zarr.abc.store import Store
 
-from zagg.config import PipelineConfig, default_config, get_agg_fields
+from zagg.config import (
+    PipelineConfig,
+    default_config,
+    get_agg_fields,
+    output_field_signature,
+)
 
 OOB_SENTINEL: int = -1
 
@@ -152,6 +157,7 @@ class RectilinearGrid:
             "affine": [a.a, a.b, a.c, a.d, a.e, a.f],
             "shape": [self.height, self.width],
             "chunk_shape": [self.chunk_h, self.chunk_w],
+            "output_fields": output_field_signature(self.config),
         }
 
     def nests_with(self, other) -> bool:
@@ -164,6 +170,10 @@ class RectilinearGrid:
         if not isinstance(other, RectilinearGrid):
             return False
         if self._geobox.crs != other._geobox.crs:
+            return False
+        if output_field_signature(self.config) != output_field_signature(other.config):
+            # Co-aggregated grids must declare the same Option-B output-field
+            # set (issue #29): same scalar/vector kinds, trailing shapes, dtypes.
             return False
         if not (_whole_ratio(self.res_x, other.res_x)
                 and _whole_ratio(self.res_y, other.res_y)):
