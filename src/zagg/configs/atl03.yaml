@@ -7,9 +7,9 @@
 # (retains flags 1-4), per the ATL03 v3 data dictionary
 # (https://nsidc.org/sites/default/files/icesat2_atl03_data_dict_v003_0.pdf).
 #
-# signal_conf_ph is per-surface-type in ATL03; this template reads the land
-# surface_type column (index 0). Grid is rectilinear (HEALPix order-19, the
-# ~10 m match, waits on mortie #35).
+# signal_conf_ph is 2-D in ATL03 (n_photons x 5 surface types); this template
+# selects the land column (index 0) via quality_filter.column. Grid is
+# rectilinear (HEALPix order-19, the ~10 m match, waits on mortie #35).
 data_source:
   reader: h5coro
   driver: s3
@@ -23,6 +23,7 @@ data_source:
     dataset: "/{group}/heights/signal_conf_ph"
     value: 0
     op: ne
+    column: 0                      # land surface_type (signal_conf_ph is 2-D)
 
 aggregation:
   variables:

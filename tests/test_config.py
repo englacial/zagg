@@ -116,6 +116,7 @@ class TestATL03Template:
         qf = atl03_config.data_source["quality_filter"]
         assert qf["value"] == 0
         assert qf["op"] == "ne"  # keep signal_conf_ph != 0 (flags 1-4)
+        assert qf["column"] == 0  # signal_conf_ph is 2-D; select land column
         assert qf["dataset"].endswith("signal_conf_ph")
 
     def test_rectilinear_grid(self, atl03_config):

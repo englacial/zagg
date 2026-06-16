@@ -487,7 +487,7 @@ def _kernel_aggregate(
 
 
 def _quality_mask(q_flag: np.ndarray, quality_filter: dict) -> np.ndarray:
-    """Build a keep-mask from a quality-flag array and a ``quality_filter`` spec.
+    """Build a 1-D keep-mask from a quality-flag array and a ``quality_filter`` spec.
 
     The comparison is controlled by ``quality_filter["op"]`` (default ``"eq"``):
 
@@ -496,23 +496,41 @@ def _quality_mask(q_flag: np.ndarray, quality_filter: dict) -> np.ndarray:
     - ``"ne"`` keeps rows where the flag differs from ``value`` (ATL03: keep
       ``signal_conf_ph != 0``, dropping only the noise flag).
 
+    When ``q_flag`` is 2-D (e.g. ATL03 ``signal_conf_ph`` is ``(n_photons,
+    n_surface_types)``), ``quality_filter["column"]`` selects the surface-type
+    column to compare (e.g. ``0`` for land); it is required in that case and
+    must not be set for a 1-D flag.
+
     Parameters
     ----------
     q_flag : np.ndarray
-        Quality-flag values for the candidate rows.
+        Quality-flag values for the candidate rows (1-D, or 2-D with a
+        ``column`` selector).
     quality_filter : dict
-        Filter spec with ``value`` and optional ``op``.
+        Filter spec with ``value``, optional ``op``, and optional ``column``.
 
     Returns
     -------
     np.ndarray
-        Boolean keep-mask, same length as ``q_flag``.
+        Boolean keep-mask, length ``q_flag.shape[0]``.
 
     Raises
     ------
     ValueError
-        If ``op`` is not ``"eq"`` or ``"ne"``.
+        If ``op`` is not ``"eq"``/``"ne"``, or if the flag dimensionality and
+        the ``column`` selector disagree.
     """
+    column = quality_filter.get("column")
+    if q_flag.ndim == 2:
+        if column is None:
+            raise ValueError(
+                "quality_filter on a 2-D flag requires a 'column' index "
+                f"(got shape {q_flag.shape})"
+            )
+        q_flag = q_flag[:, column]
+    elif column is not None:
+        raise ValueError("quality_filter 'column' is only valid for a 2-D flag")
+
     value = quality_filter["value"]
     op = quality_filter.get("op", "eq")
     if op == "eq":

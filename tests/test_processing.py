@@ -666,3 +666,27 @@ class TestQualityMask:
     def test_unknown_op_raises(self):
         with pytest.raises(ValueError, match="Unknown quality_filter op"):
             _quality_mask(np.array([0]), {"value": 0, "op": "gt"})
+
+    def test_2d_column_selects_surface_type(self):
+        # ATL03 signal_conf_ph is (n_photons, n_surface_types); column picks one.
+        q_flag = np.array([[0, 2], [3, 0], [0, 4]], dtype=np.int8)
+        mask = _quality_mask(q_flag, {"value": 0, "op": "ne", "column": 0})
+        np.testing.assert_array_equal(mask, [False, True, False])
+        mask_col1 = _quality_mask(q_flag, {"value": 0, "op": "ne", "column": 1})
+        np.testing.assert_array_equal(mask_col1, [True, False, True])
+
+    def test_2d_without_column_raises(self):
+        q_flag = np.zeros((3, 5), dtype=np.int8)
+        with pytest.raises(ValueError, match="requires a 'column'"):
+            _quality_mask(q_flag, {"value": 0, "op": "ne"})
+
+    def test_column_on_1d_raises(self):
+        with pytest.raises(ValueError, match="only valid for a 2-D flag"):
+            _quality_mask(np.array([0, 1]), {"value": 0, "column": 0})
+
+    def test_atl03_template_filter_runs(self):
+        # The shipped template's quality_filter must apply cleanly to a 2-D flag.
+        qf = default_config("atl03").data_source["quality_filter"]
+        q_flag = np.array([[0, 1], [1, 0], [4, 0]], dtype=np.int8)
+        mask = _quality_mask(q_flag, qf)
+        np.testing.assert_array_equal(mask, [False, True, True])
