@@ -254,7 +254,7 @@ def calculate_cell_statistics(
     dict
         Dictionary of statistics keyed by aggregation variable name.
     """
-    from zagg.config import eval_expression_raw, evaluate_expression, resolve_function
+    from zagg.config import _eval_expression_raw, evaluate_expression, resolve_function
 
     if config is None:
         config = default_config()
@@ -278,7 +278,7 @@ def calculate_cell_statistics(
         # ``function`` field (issue #29).
         if expression:
             if sig["kind"] == "vector":
-                out = eval_expression_raw(expression, cell_data)
+                out = _eval_expression_raw(expression, cell_data)
                 result[name] = _coerce_field_value(out, sig)
             else:
                 result[name] = evaluate_expression(expression, cell_data)
