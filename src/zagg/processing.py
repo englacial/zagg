@@ -204,6 +204,21 @@ def calculate_cell_statistics(
     """
     Calculate summary statistics for a cell, driven by pipeline config metadata.
 
+    User contract
+    -------------
+    The supported aggregation surface is *anything expressible in numpy*. Each
+    agg field names a ``function`` that :func:`zagg.config.resolve_function`
+    turns into a callable: a bare name (``"min"``, ``"nanmean"``) resolves to
+    ``np.<name>`` via ``getattr(np, ...)``, an ``"np."``-prefixed name the same
+    way, and a dotted path (``"numpy.quantile"``) via import. This means the full
+    numpy **NaN-aware family** — ``np.nanmean``, ``np.nanvar``, ``np.nanmax``,
+    ``np.nanmin``, ``np.nansum``, ``np.nanstd``, ``np.nanmedian``, … — is
+    usable directly from the config template with no special-casing, and is
+    reduced with numpy's own NaN semantics (see ``test_numpy_nan_aware_functions``).
+    The experimental ``handoff="arrow-kernel"`` path is an *opt-in* acceleration
+    for the kernel-able subset only; it does not change or narrow this contract
+    (see the EXPERIMENTAL block below).
+
     Parameters
     ----------
     cell_data : dict[str, np.ndarray]
@@ -276,6 +291,23 @@ def calculate_cell_statistics(
 
 
 # EXPERIMENTAL (phase 2b of #30) -----------------------------------------------
+# Dual aggregation contract
+# -------------------------
+# The DEFAULT, fully-supported contract is "any aggregation expressible in numpy",
+# including the NaN-aware family (``np.nanmean``/``np.nanvar``/``np.nanmax``/…);
+# the user picks the function in the agg template and it runs through
+# ``calculate_cell_statistics`` with numpy's own semantics (see that docstring and
+# ``test_numpy_nan_aware_functions``). Arrow kernels do NOT replace or narrow that
+# contract — they are an OPT-IN acceleration for the kernel-able subset, and the
+# user chooses numpy vs arrow per run via the ``handoff`` flag.
+#
+# Why arrow kernels aren't drop-in nan-operators: pyarrow compute has
+# ``mean``/``min_max``/``variance`` with ``skip_nulls``, but an Arrow NULL is a
+# distinct missing-value bit, NOT a float NaN — ``skip_nulls`` does not skip NaN.
+# So there is no arrow "nanmean" kernel equivalent; the kernel path instead
+# replicates numpy's NaN behaviour by hand (NaN-propagating min/max, see below)
+# rather than pretending arrow nulls and float NaN are the same thing.
+#
 # Optional pyarrow.compute hash-aggregate ("kernel") reduction path. Unlike the
 # pandas/arrow *carriers* — which feed identical numpy arrays into
 # ``calculate_cell_statistics`` and are therefore byte-for-byte identical — the

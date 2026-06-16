@@ -111,6 +111,39 @@ class TestCalculateCellStatistics:
             np.average([10, 20, 30], weights=1.0 / np.array([0.1, 0.2, 0.1]) ** 2),
         )
 
+    def test_numpy_nan_aware_functions(self):
+        """The user contract — any aggregation expressible in numpy, including the
+        ``nan*`` family — resolves and runs end-to-end through the default numpy
+        path (``resolve_function`` does ``getattr(np, name)``). NaN-bearing input
+        must be reduced NaN-skipping, matching the bare ``np.nan*`` operators."""
+        from zagg.config import PipelineConfig
+
+        cfg = PipelineConfig(
+            aggregation={
+                "variables": {
+                    "h_nanmean": {"function": "np.nanmean", "source": "h_li", "dtype": "float32"},
+                    "h_nanmax": {"function": "nanmax", "source": "h_li", "dtype": "float32"},
+                    "h_nanmin": {"function": "np.nanmin", "source": "h_li", "dtype": "float32"},
+                    "h_nanvar": {"function": "nanvar", "source": "h_li", "dtype": "float32"},
+                    "h_nansum": {"function": "np.nansum", "source": "h_li", "dtype": "float32"},
+                    "h_nanstd": {"function": "np.nanstd", "source": "h_li", "dtype": "float32"},
+                }
+            }
+        )
+        vals = np.array([1.0, np.nan, 3.0, 5.0], dtype=np.float32)
+        result = calculate_cell_statistics({"h_li": vals}, config=cfg)
+
+        np.testing.assert_allclose(result["h_nanmean"], np.nanmean(vals))
+        np.testing.assert_allclose(result["h_nanmax"], np.nanmax(vals))
+        np.testing.assert_allclose(result["h_nanmin"], np.nanmin(vals))
+        np.testing.assert_allclose(result["h_nanvar"], np.nanvar(vals))
+        np.testing.assert_allclose(result["h_nansum"], np.nansum(vals))
+        np.testing.assert_allclose(result["h_nanstd"], np.nanstd(vals))
+        # NaN-skipping really happened: a plain np.mean/np.max would propagate NaN.
+        assert not np.isnan(result["h_nanmean"])
+        assert result["h_nanmax"] == 5.0
+        assert result["h_nanmin"] == 1.0
+
 
 class TestBuildGroups:
     def test_slice_counts_match_per_cell_mask(self):
