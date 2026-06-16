@@ -547,15 +547,57 @@ def _run_lambda(config, catalog_data, store_path, child_order, *,
     return summary
 
 
+# Maps each canonical camelCase key to the alternate spellings we accept on
+# input: boto/``~/.aws/credentials`` snake_case and STS PascalCase. Mirrors the
+# read-path leniency in ``processing.process_shard``.
+_OUTPUT_CRED_ALIASES = {
+    "accessKeyId": ("accessKeyId", "aws_access_key_id", "AccessKeyId"),
+    "secretAccessKey": ("secretAccessKey", "aws_secret_access_key", "SecretAccessKey"),
+    "sessionToken": ("sessionToken", "aws_session_token", "SessionToken"),
+    "region": ("region", "region_name", "Region"),
+    "endpointUrl": ("endpointUrl", "endpoint_url"),
+}
+
+
+def normalize_output_credentials(credentials):
+    """Normalize an output-credentials dict to the canonical camelCase shape.
+
+    Accepts camelCase (``accessKeyId``), boto snake_case
+    (``aws_access_key_id``), and STS PascalCase (``AccessKeyId``) spellings,
+    returning a dict keyed only by the canonical camelCase names. Keys that are
+    absent under every spelling are simply omitted. ``None``/empty passes
+    through unchanged so callers can keep using execution-role writes.
+    """
+    if not credentials:
+        return credentials
+    normalized = {}
+    for canonical, aliases in _OUTPUT_CRED_ALIASES.items():
+        for alias in aliases:
+            if alias in credentials:
+                normalized[canonical] = credentials[alias]
+                break
+    return normalized
+
+
 def _build_output_creds_event(credentials, endpoint_url, region):
     """Build the optional ``output_credentials`` event block, or None.
 
     Normalizes runtime credentials + non-secret endpoint/region into the
-    camelCase event shape the handler expects. Returns ``None`` when no
-    explicit credentials are supplied (execution-role writes, unchanged).
+    camelCase event shape the handler expects. Accepts camelCase, snake_case,
+    and STS PascalCase key conventions (see ``normalize_output_credentials``).
+    Returns ``None`` when no explicit credentials are supplied (execution-role
+    writes, unchanged).
     """
     if not credentials:
         return None
+    credentials = normalize_output_credentials(credentials)
+    missing = [k for k in ("accessKeyId", "secretAccessKey") if k not in credentials]
+    if missing:
+        raise ValueError(
+            "output_credentials is missing required field(s): "
+            f"{', '.join(missing)} (accepts camelCase, snake_case, or STS "
+            "PascalCase spellings)"
+        )
     block = {
         "accessKeyId": credentials["accessKeyId"],
         "secretAccessKey": credentials["secretAccessKey"],

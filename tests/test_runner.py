@@ -175,6 +175,47 @@ class TestOutputCredsEvent:
         assert block["region"] == "eu-west-1"
         assert "sessionToken" not in block
 
+    def test_snake_case_input(self):
+        """boto / ``~/.aws/credentials`` spellings normalize to camelCase (#45)."""
+        from zagg.runner import _build_output_creds_event
+        creds = {
+            "aws_access_key_id": "AKIA",
+            "aws_secret_access_key": "s",
+            "aws_session_token": "t",
+            "region_name": "eu-west-1",
+        }
+        block = _build_output_creds_event(creds, None, "us-west-2")
+        assert block == {"accessKeyId": "AKIA", "secretAccessKey": "s",
+                         "region": "eu-west-1", "sessionToken": "t"}
+
+    def test_sts_pascalcase_input(self):
+        """STS ``Credentials`` spellings normalize to camelCase (#45)."""
+        from zagg.runner import _build_output_creds_event
+        creds = {
+            "AccessKeyId": "AKIA",
+            "SecretAccessKey": "s",
+            "SessionToken": "t",
+            "Region": "eu-west-1",
+        }
+        block = _build_output_creds_event(creds, None, "us-west-2")
+        assert block == {"accessKeyId": "AKIA", "secretAccessKey": "s",
+                         "region": "eu-west-1", "sessionToken": "t"}
+
+    def test_missing_required_field_raises_clear_error(self):
+        """A missing access key gives an actionable message, not a raw KeyError (#45)."""
+        from zagg.runner import _build_output_creds_event
+        creds = {"secretAccessKey": "s"}
+        with pytest.raises(ValueError, match="accessKeyId"):
+            _build_output_creds_event(creds, None, "us-west-2")
+
+    def test_endpoint_url_snake_case_normalizes(self):
+        """``endpoint_url`` in the creds dict normalizes to ``endpointUrl`` (#45)."""
+        from zagg.runner import normalize_output_credentials
+        creds = {"aws_access_key_id": "AKIA", "aws_secret_access_key": "s",
+                 "endpoint_url": "https://r2.example"}
+        normalized = normalize_output_credentials(creds)
+        assert normalized["endpointUrl"] == "https://r2.example"
+
 
 class TestInvokeLambdaCellEvent:
     """The per-cell Lambda event uses the grid-neutral ``shard_key`` field, and
