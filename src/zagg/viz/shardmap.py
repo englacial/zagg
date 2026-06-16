@@ -88,32 +88,51 @@ def grid_from_signature(signature: dict):
 
 # ── GeoJSON geometry helpers ─────────────────────────────────────────────────
 
+def _ring_list(ring) -> list[list[float]]:
+    """A shapely ring's ``[[lon, lat], ...]`` as plain floats."""
+    x, y = ring.coords.xy
+    return [[float(lon), float(lat)] for lon, lat in zip(x, y)]
+
+
 def _ring_coords(geom) -> list[list[float]]:
     """Exterior-ring ``[[lon, lat], ...]`` for a shapely Polygon."""
-    x, y = geom.exterior.coords.xy
-    return [[float(lon), float(lat)] for lon, lat in zip(x, y)]
+    return _ring_list(geom.exterior)
+
+
+def _crosses_antimeridian(geom) -> bool:
+    """True if the polygon's exterior ring jumps the +-180 seam.
+
+    A *jump* -- two consecutive vertices &gt; 180 deg apart in longitude -- means
+    the ring crosses the antimeridian. This is distinct from a merely wide
+    polygon (e.g. a swath from lon -170 to +170 across 0 deg), whose vertices
+    step continuously and never jump, so it is left intact (review of #38
+    phase 1).
+    """
+    lons = np.array([pt[0] for pt in _ring_coords(geom)])
+    return bool(np.any(np.abs(np.diff(lons)) > _ANTIMERIDIAN_SPAN))
 
 
 def _split_antimeridian(geom):
     """Split a Polygon that crosses +-180 deg into hemisphere-local parts.
 
-    Returns a GeoJSON ``geometry`` dict -- a ``Polygon`` when the ring stays
-    within a hemisphere, or a ``MultiPolygon`` cut at the antimeridian when it
-    crosses. The cut unwraps the ring (western vertices shifted +360), clips
-    against ``[-180, 180]`` and ``[180, 540]`` half-planes, then rewraps the
-    eastern part back into ``[-180, 180]`` -- shapely-only, no extra deps.
+    Returns a GeoJSON ``geometry`` dict -- a ``Polygon`` (interior rings kept)
+    when the ring does not cross the seam, or a ``MultiPolygon`` cut at the
+    antimeridian when it does. The cut unwraps the polygon (western vertices
+    shifted +360), clips against the ``[-180, 180]`` and ``[180, 540]``
+    half-planes, then rewraps the eastern part back into ``[-180, 180]`` --
+    shapely-only, no extra deps. Holes are carried through the unwrap/clip.
     """
     from shapely.geometry import Polygon, box
 
-    ring = _ring_coords(geom)
-    lons = np.array([pt[0] for pt in ring])
-    if lons.max() - lons.min() <= _ANTIMERIDIAN_SPAN:
-        return {"type": "Polygon", "coordinates": [ring]}
+    if not _crosses_antimeridian(geom):
+        return {"type": "Polygon", "coordinates": _polygon_rings(geom)}
 
     # Unwrap: lift western-hemisphere vertices by +360 so the ring is monotone
-    # across the seam (e.g. 180, -178 -> 180, 182).
-    unwrapped = [[lon + 360.0 if lon < 0 else lon, lat] for lon, lat in ring]
-    poly = Polygon(unwrapped)
+    # across the seam (e.g. 180, -178 -> 180, 182). Interiors come along.
+    def _unwrap(ring):
+        return [[lon + 360.0 if lon < 0 else lon, lat] for lon, lat in _ring_list(ring)]
+
+    poly = Polygon(_unwrap(geom.exterior), [_unwrap(r) for r in geom.interiors])
     if not poly.is_valid:
         poly = poly.buffer(0)
 
@@ -125,12 +144,17 @@ def _split_antimeridian(geom):
         for sub in getattr(part, "geoms", [part]):
             if sub.is_empty or sub.geom_type != "Polygon":
                 continue
-            x, y = sub.exterior.coords.xy
-            parts.append([[float(lon + shift), float(lat)] for lon, lat in zip(x, y)])
+            parts.append(_polygon_rings(sub, shift=shift))
 
     if not parts:
-        return {"type": "Polygon", "coordinates": [ring]}
-    return {"type": "MultiPolygon", "coordinates": [[p] for p in parts]}
+        return {"type": "Polygon", "coordinates": _polygon_rings(geom)}
+    return {"type": "MultiPolygon", "coordinates": parts}
+
+
+def _polygon_rings(geom, *, shift: float = 0.0) -> list[list[list[float]]]:
+    """GeoJSON ring list ``[exterior, *interiors]`` for a Polygon, lon-shifted."""
+    rings = [geom.exterior, *geom.interiors]
+    return [[[lon + shift, lat] for lon, lat in _ring_list(r)] for r in rings]
 
 
 def _polygon_geometry(geom) -> dict:
@@ -273,18 +297,18 @@ def viewport_cells(shardmap, bbox, *, max_shards: int = 4) -> dict:
     grid = grid_from_signature(shardmap.grid_signature)
     view = box(bbox[0], bbox[1], bbox[2], bbox[3])
 
+    # Build each footprint once (reproject + densify is not free), then gate.
     visible = [
-        key
-        for key in shardmap.shard_keys
-        if grid.shard_footprint(key).intersects(view)
+        (key, fp)
+        for key, fp in ((k, grid.shard_footprint(k)) for k in shardmap.shard_keys)
+        if fp.intersects(view)
     ]
     if not visible or len(visible) > max_shards:
         return _collection([])
 
     features = []
-    for key in visible:
-        geom = grid.shard_footprint(key)
-        clipped = _polygonal(geom.intersection(view))
+    for key, fp in visible:
+        clipped = _polygonal(fp.intersection(view))
         if clipped is None:
             continue
         features.append(
