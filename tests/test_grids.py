@@ -301,10 +301,9 @@ class TestOutputFieldSignature:
         g = HealpixGrid(
             parent_order=6, child_order=8, layout="fullsphere", config=_vector_config()
         )
-        # Round-trips unchanged (recorded in a ShardMap as JSON).
-        assert json.loads(json.dumps(g.signature())) == json.loads(
-            json.dumps(g.signature())
-        )
+        fields = g.signature()["output_fields"]
+        # Round-trips through JSON unchanged (recorded in a ShardMap as JSON).
+        assert json.loads(json.dumps(fields)) == fields
 
     def test_nests_with_same_field_set(self, cfg):
         a = HealpixGrid(parent_order=6, child_order=8, layout="fullsphere", config=cfg)
@@ -335,3 +334,51 @@ class TestOutputFieldSignature:
             config=_vector_config(bins=8),
         )
         assert not a.nests_with(b)
+
+
+class TestVectorTemplate:
+    """Issue #29 phase 5: a ``kind: vector`` field's template array gets a
+    trailing payload dim chunked whole (single-trailing-chunk invariant)."""
+
+    def test_healpix_vector_array_has_trailing_dim(self):
+        cfg = _vector_config(bins=4, dtype="int64")
+        # int vector field needs an int fill_value (NaN is invalid on int dtype).
+        cfg.aggregation["variables"]["hist"]["fill_value"] = 0
+        g = HealpixGrid(parent_order=6, child_order=8, layout="fullsphere", config=cfg)
+        store = MemoryStore()
+        g.emit_template(store)
+        grp = open_group(store, path="8", mode="r")
+        n_pix = HEALPIX_BASE_CELLS * 4**8
+        assert grp["count"].shape == (n_pix,)  # scalar unchanged
+        assert grp["hist"].shape == (n_pix, 4)  # trailing payload dim
+        # Trailing dim is ONE chunk (block_idx invariant): chunk == full width.
+        assert grp["hist"].chunks == (4 ** (8 - 6), 4)
+        assert grp["hist"].dtype == np.dtype("int64")
+
+    def test_healpix_dimension_names_extend(self):
+        cfg = _vector_config(bins=3, dtype="int64")
+        cfg.aggregation["variables"]["hist"]["fill_value"] = 0
+        g = HealpixGrid(parent_order=6, child_order=8, layout="fullsphere", config=cfg)
+        spec = g.spec()
+        names = spec.members["hist"].dimension_names
+        assert names[0] == "cells"
+        assert len(names) == 2  # spatial + one trailing dim
+
+    def test_rectilinear_vector_array_has_trailing_dim(self):
+        from zagg.grids import RectilinearGrid
+
+        cfg = _vector_config(bins=4, dtype="int64")
+        cfg.aggregation["variables"]["hist"]["fill_value"] = 0
+        g = RectilinearGrid(
+            "EPSG:3031",
+            1000.0,
+            (-1e6, -1e6, 1e6, 1e6),
+            chunk_shape=(64, 64),
+            config=cfg,
+        )
+        store = MemoryStore()
+        g.emit_template(store)
+        grp = open_group(store, path="rectilinear", mode="r")
+        assert grp["count"].shape == (g.height, g.width)
+        assert grp["hist"].shape == (g.height, g.width, 4)
+        assert grp["hist"].chunks == (64, 64, 4)  # trailing dim whole

@@ -438,7 +438,7 @@ def output_field_signature(config: PipelineConfig) -> list[dict]:
     grid whose output schema (scalar vs vector, trailing shape, dtype) differs,
     and compared in ``nests_with`` so co-aggregated grids must share a field set.
 
-    ``trailing_shape`` is rendered as a ``list`` (``()``  for scalar fields) so
+    ``trailing_shape`` is rendered as a ``list`` (``()`` for scalar fields) so
     the structure round-trips through JSON unchanged.
 
     Parameters

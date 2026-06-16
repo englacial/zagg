@@ -295,6 +295,33 @@ class TestNesting:
 
         assert not grid.nests_with(HealpixGrid(6, 12, layout="fullsphere"))
 
+    def test_differing_output_field_set_rejected(self, cfg):
+        """Otherwise-nesting grids with a different Option-B output-field set
+        (issue #29 phase 4) must not nest, symmetrically."""
+        from zagg.config import PipelineConfig
+
+        agg = {
+            "coordinates": cfg.aggregation.get("coordinates", {}),
+            "variables": {
+                "count": {"function": "len", "source": "h_li"},
+                "hist": {
+                    "function": "np.bincount",
+                    "source": "b",
+                    "kind": "vector",
+                    "trailing_shape": 4,
+                    "dtype": "int64",
+                },
+            },
+        }
+        vcfg = PipelineConfig(
+            data_source=cfg.data_source, aggregation=agg, output=cfg.output
+        )
+        scalar = _grid(cfg, 5000, (256, 256))
+        vector = _grid(vcfg, 5000, (256, 256))
+        # Same CRS / whole-ratio / aligned — only the field set differs.
+        assert not scalar.nests_with(vector)
+        assert not vector.nests_with(scalar)
+
 
 class TestValidateCompatible:
     def test_compatible_pass(self, cfg):
