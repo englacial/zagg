@@ -13,7 +13,7 @@ import logging
 import os
 
 from zagg.config import load_config
-from zagg.runner import agg
+from zagg.runner import agg, normalize_output_credentials
 
 
 def main():
@@ -45,7 +45,8 @@ examples:
         "--output-creds", default=None, metavar="PATH",
         help="Path to a JSON file with credentials for writing the output store "
              "(keys: accessKeyId, secretAccessKey, optional sessionToken/"
-             "endpointUrl/region). Omit to use the ambient/execution-role creds.",
+             "endpointUrl/region; camelCase, snake_case, or STS PascalCase "
+             "spellings accepted). Omit to use the ambient/execution-role creds.",
     )
     parser.add_argument(
         "--function-name",
@@ -64,6 +65,8 @@ examples:
     if args.output_creds:
         with open(args.output_creds) as f:
             output_credentials = json.load(f)
+        # Accept camelCase, snake_case, or STS PascalCase key spellings.
+        output_credentials = normalize_output_credentials(output_credentials)
         output_endpoint_url = output_credentials.get("endpointUrl")
 
     results = agg(
