@@ -361,8 +361,7 @@ class TestVectorTemplate:
         g = HealpixGrid(parent_order=6, child_order=8, layout="fullsphere", config=cfg)
         spec = g.spec()
         names = spec.members["hist"].dimension_names
-        assert names[0] == "cells"
-        assert len(names) == 2  # spatial + one trailing dim
+        assert names == ("cells", "vector")  # spatial + the trailing payload axis
 
     def test_rectilinear_vector_array_has_trailing_dim(self):
         from zagg.grids import RectilinearGrid

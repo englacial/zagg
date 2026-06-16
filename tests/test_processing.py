@@ -973,3 +973,33 @@ class TestVectorRoundTrip:
         # taken only over the two populated rows.
         reduced = np.nanmean(got, axis=0)
         np.testing.assert_allclose(reduced, [(1.0 - 2.0) / 2, (9.0 + 4.0) / 2])
+
+    def test_split_trailing_chunk_rejected(self):
+        """The writer enforces the single-trailing-chunk invariant: if the target
+        array chunks the trailing payload dim, ``set_block_selection`` at block 0
+        would drop the rest, so the write must raise instead (issue #29)."""
+        pa = pytest.importorskip("pyarrow")
+        from zarr import create_array
+
+        class _OneChunkGrid:
+            group_path = "g"
+            chunk_shape = (2,)
+
+        store = MemoryStore()
+        # Trailing dim of width 4 deliberately split into two chunks of 2.
+        create_array(
+            store,
+            name="g/edges",
+            shape=(2, 4),
+            chunks=(2, 2),
+            dtype="float32",
+            fill_value=np.float32("nan"),
+        )
+        edges = pa.FixedSizeListArray.from_arrays(
+            pa.array(np.arange(8.0, dtype="float32")), 4
+        )
+        table = pa.table({"edges": edges})
+        with pytest.raises(ValueError, match="one whole chunk"):
+            write_dataframe_to_zarr(
+                table, store, grid=_OneChunkGrid(), chunk_idx=(0,)
+            )
