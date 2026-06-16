@@ -24,7 +24,9 @@ nav:
       - "Architecture": "design/architecture.md"
       - "Schema": "design/schema.md"
   - "Deployment":
+      - "Standing Up the Backend": "deployment/standup.md"
       - "AWS Lambda": "deployment/lambda.md"
+      - "Execution Role": "deployment/execution-role.md"
       - "ARM64 Layer": "deployment/arm64.md"
 
 watch:
@@ -116,7 +118,11 @@ markdown_extensions:
       hide_protocol: true
       repo_url_shortener: true
   - pymdownx.smartsymbols
-  - pymdownx.snippets
+  - pymdownx.snippets:
+      base_path:
+        - .
+        - docs
+      check_paths: true
   - pymdownx.superfences
   - pymdownx.tabbed:
       alternate_style: true

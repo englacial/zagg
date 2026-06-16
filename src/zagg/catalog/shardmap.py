@@ -11,17 +11,22 @@ endpoint at dispatch time via ``data_source.driver`` -- the map itself stays
 endpoint-neutral and never needs the Catalog at run time. It also records the
 grid ``signature()`` so a run can refuse a map built for a different grid.
 
-Geometry backends (all sphere-aware where it matters):
+Geometry backends (all sphere-correct):
 
-- ``spherely`` -- exact S2 intersection via ``SpatialIndex`` (build once, query
-  per shard). Requires the spatial-index build of spherely.
+- ``spherely`` -- exact S2 intersection. Uses ``SpatialIndex`` (build once,
+  query per shard) when the spatial-index build of spherely is present, else
+  falls back to elementwise ``spherely.intersects`` -- a brute
+  O(granules x shards) path that is still sphere-correct (no fork needed).
 - ``mortie``   -- HEALPix MOC intersection (``morton_coverage_moc``); a tiny
   ~0.01% polar omission vs S2 (espg/mortie#32), no extra deps.
-- ``shapely``  -- WGS84 STRtree fallback; antimeridian/pole correctness not
-  guaranteed.
+
+shapely is no longer an intersection backend -- its WGS84 STRtree path had
+antimeridian/near-pole correctness bugs (#36). shapely remains a dependency for
+WKB decode (``sources.py``) and footprint geometry (``grids/``).
 """
 from __future__ import annotations
 
+import importlib
 import json
 import time
 from dataclasses import dataclass, field
@@ -55,23 +60,28 @@ def _to_spherely_polygon(lats, lons):
 def _resolve_backend(backend: str, grid) -> str:
     """Resolve ``"auto"`` to a concrete, grid-appropriate backend.
 
-    Prefers exact S2 (``spherely.SpatialIndex``) when available. Without it,
-    falls back per grid family: **mortie** for HEALPix (its native MOC order
-    matches the grid), **shapely** for rectilinear (a global MOC order is far
-    too coarse for fine projected tiles and over-commissions every granule to
-    every shard).
+    Prefers exact S2 via ``spherely`` whenever it imports -- using its
+    ``SpatialIndex`` when present and elementwise ``spherely.intersects``
+    (a brute path) otherwise, both sphere-correct. When spherely is absent,
+    HEALPix grids use the native **mortie** MOC path (its order matches the
+    grid); non-HEALPix grids have no spherely-free path, so ``build`` raises
+    with an install pointer (#36).
     """
     if backend != "auto":
         return backend
-    try:
-        import spherely
-
-        if hasattr(spherely, "SpatialIndex"):
-            return "spherely"
-    except ImportError:
-        pass
+    if _spherely_available():
+        return "spherely"
     is_healpix = hasattr(grid, "parent_order") and hasattr(grid, "child_order")
-    return "mortie" if is_healpix else "shapely"
+    return "mortie" if is_healpix else "spherely"
+
+
+def _spherely_available() -> bool:
+    """True if ``import spherely`` succeeds (any build, fork or stock)."""
+    try:
+        importlib.import_module("spherely")
+    except ImportError:
+        return False
+    return True
 
 
 def _region_parts(region, metadata) -> list:
@@ -91,13 +101,27 @@ def _region_parts(region, metadata) -> list:
 
 # ── backends (operate on granule records) ────────────────────────────────────
 
-def _intersect_spherely(records, grid, all_shards) -> Dict[int, List[int]]:
-    """Exact S2 intersection via spherely ``SpatialIndex``.
+_SPHERELY_INSTALL_HINT = (
+    "spherely is required for the 'spherely' intersection backend. Install it "
+    "(see the zagg README -- the exact-S2 SpatialIndex build is a fork not on "
+    "PyPI; the stock build also works via a slower brute path), or use a "
+    "HEALPix grid with backend='mortie'."
+)
 
-    Builds the index once over granule footprints, then issues one
-    ``query(..., predicate="intersects")`` per shard footprint.
+
+def _intersect_spherely(records, grid, all_shards) -> Dict[int, List[int]]:
+    """Exact S2 intersection via spherely.
+
+    Builds sphere-aware polygons for each granule footprint, then maps each
+    shard to the granules it intersects. Uses ``spherely.SpatialIndex`` (build
+    once, query per shard) when present; otherwise falls back to elementwise
+    ``spherely.intersects`` -- still sphere-correct, but a brute
+    O(granules x shards) scan with no tree prefilter (#36).
     """
-    import spherely
+    try:
+        import spherely
+    except ImportError as exc:
+        raise ImportError(_SPHERELY_INSTALL_HINT) from exc
 
     polys, idx = [], []
     for i, rec in enumerate(records):
@@ -107,7 +131,9 @@ def _intersect_spherely(records, grid, all_shards) -> Dict[int, List[int]]:
             idx.append(i)
     if not polys:
         return {}
-    tree = spherely.SpatialIndex(np.asarray(polys))
+    poly_arr = np.asarray(polys)
+    has_index = hasattr(spherely, "SpatialIndex")
+    tree = spherely.SpatialIndex(poly_arr) if has_index else None
 
     out: Dict[int, List[int]] = {}
     for shard in all_shards:
@@ -116,7 +142,10 @@ def _intersect_spherely(records, grid, all_shards) -> Dict[int, List[int]]:
         s_poly = _to_spherely_polygon(np.asarray(sy), np.asarray(sx))
         if s_poly is None:
             continue
-        hits = tree.query(s_poly, predicate="intersects")
+        if tree is not None:
+            hits = tree.query(s_poly, predicate="intersects")
+        else:
+            hits = np.flatnonzero(spherely.intersects(poly_arr, s_poly))
         if len(hits) > 0:
             out[int(shard)] = [idx[int(h)] for h in hits]
     return out
@@ -185,39 +214,9 @@ def _intersect_mortie(records, grid, all_shards, order=8) -> Dict[int, List[int]
     return out
 
 
-def _intersect_shapely(records, grid, all_shards) -> Dict[int, List[int]]:
-    """WGS84 STRtree fallback (antimeridian/pole correctness not guaranteed)."""
-    from shapely import STRtree, make_valid
-    from shapely.geometry import Polygon
-
-    polys, idx = [], []
-    for i, rec in enumerate(records):
-        try:
-            poly = Polygon(zip(rec["lons"], rec["lats"]))
-            if not poly.is_valid:
-                poly = make_valid(poly)
-            if poly.is_empty:
-                continue
-        except Exception:
-            continue
-        polys.append(poly)
-        idx.append(i)
-    if not polys:
-        return {}
-    tree = STRtree(polys)
-    out: Dict[int, List[int]] = {}
-    for shard in all_shards:
-        fp = grid.shard_footprint(shard)
-        hits = tree.query(fp, predicate="intersects")
-        if len(hits) > 0:
-            out[int(shard)] = [idx[int(h)] for h in hits]
-    return out
-
-
 _BACKENDS = {
     "spherely": _intersect_spherely,
     "mortie": _intersect_mortie,
-    "shapely": _intersect_shapely,
 }
 
 
@@ -267,8 +266,10 @@ class ShardMap:
             ``signature``).
         region : list of (lats, lons), optional
             Coverage mask in WGS84. Defaults to the catalog bbox rectangle.
-        backend : {"auto", "spherely", "mortie", "shapely"}
-            Geometry backend. ``"auto"`` -> spherely if available, else mortie.
+        backend : {"auto", "spherely", "mortie"}
+            Geometry backend. ``"auto"`` -> spherely when importable, else
+            mortie for HEALPix grids (non-HEALPix grids require spherely and
+            raise an ``ImportError`` with an install pointer when it is absent).
         mortie_order : int
             MOC order for the mortie backend.
 

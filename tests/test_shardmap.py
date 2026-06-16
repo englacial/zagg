@@ -1,16 +1,23 @@
-"""Tests for ShardMap building (shapely + mortie backends; IO; resolution).
+"""Tests for ShardMap building (spherely + mortie backends; IO; resolution).
 
-The spherely (SpatialIndex) backend is exercised separately in the conda
-sidecar env since its build isn't in the default venv.
+The real spherely (SpatialIndex) backend is exercised separately in the conda
+sidecar env since its build isn't in the default venv. Here the spherely
+*brute* path (elementwise ``spherely.intersects``, no SpatialIndex) and the
+absent-spherely error are exercised with a lightweight fake spherely module so
+they run in the default venv (#36).
 """
 
 import json
+import sys
 import tempfile
+import types
 
+import numpy as np
 import pyarrow as pa
 import pytest
 import stac_geoparquet.arrow as sga
 
+from zagg.catalog import shardmap
 from zagg.catalog.shardmap import ShardMap, _resolve_backend
 from zagg.catalog.sources import Catalog
 from zagg.config import default_config
@@ -66,31 +73,100 @@ def _granule_shards(sm):
     return out
 
 
-class TestBuildShapely:
-    def test_spatial_split(self, catalog, grid):
-        sm = ShardMap.build(catalog, grid, backend="shapely")
+# ── fake spherely (brute path) ───────────────────────────────────────────────
+#
+# A minimal stand-in for the *stock* (no-SpatialIndex) spherely build: polygons
+# are reduced to their planar lon/lat bounding box and ``intersects`` is an AABB
+# overlap test. On this local, non-polar grid that matches exact S2, so it lets
+# the real ``_intersect_spherely`` brute branch run end-to-end. It deliberately
+# omits ``SpatialIndex`` to force ``hasattr(spherely, "SpatialIndex")`` False.
+
+class _FakePoly:
+    def __init__(self, lons, lats):
+        self.x0, self.x1 = float(min(lons)), float(max(lons))
+        self.y0, self.y1 = float(min(lats)), float(max(lats))
+
+    def _overlaps(self, other):
+        return (self.x0 <= other.x1 and other.x0 <= self.x1
+                and self.y0 <= other.y1 and other.y0 <= self.y1)
+
+
+def _fake_create_polygon(*, shell, oriented):  # noqa: ARG001 (mirror real sig)
+    lons = [pt[0] for pt in shell]
+    lats = [pt[1] for pt in shell]
+    return _FakePoly(lons, lats)
+
+
+def _fake_intersects(a, b):
+    arr = np.atleast_1d(np.asarray(a, dtype=object))
+    return np.array([p._overlaps(b) for p in arr], dtype=bool)
+
+
+@pytest.fixture
+def fake_spherely(monkeypatch):
+    """Install a brute-only fake spherely module (no SpatialIndex)."""
+    mod = types.ModuleType("spherely")
+    mod.create_polygon = _fake_create_polygon
+    mod.intersects = _fake_intersects
+    monkeypatch.setitem(sys.modules, "spherely", mod)
+    return mod
+
+
+class TestBuildSpherelyBrute:
+    """The brute (no-SpatialIndex) spherely path via a fake spherely module."""
+
+    def test_no_spatial_index(self, fake_spherely):
+        # Sanity: the fake forces the brute branch.
+        assert not hasattr(fake_spherely, "SpatialIndex")
+
+    def test_spatial_split(self, catalog, grid, fake_spherely):
+        sm = ShardMap.build(catalog, grid, backend="spherely")
         gs = _granule_shards(sm)
         # 4x4 chunk grid: col block = shard % 4. West granule only in col 0-1.
         assert gs["Gwest"], "west granule should hit some shards"
         assert all(k % 4 in (0, 1) for k in gs["Gwest"])
         assert all(k % 4 in (2, 3) for k in gs["Geast"])
 
-    def test_option_c_self_contained(self, catalog, grid):
-        sm = ShardMap.build(catalog, grid, backend="shapely")
+    def test_option_c_self_contained(self, catalog, grid, fake_spherely):
+        sm = ShardMap.build(catalog, grid, backend="spherely")
         for g in sm.granules:
             for rec in g:
                 assert rec["s3"] and rec["https"]
                 assert set(rec) == {"id", "s3", "https"}
 
-    def test_signature_recorded(self, catalog, grid):
-        sm = ShardMap.build(catalog, grid, backend="shapely")
+    def test_signature_recorded(self, catalog, grid, fake_spherely):
+        sm = ShardMap.build(catalog, grid, backend="spherely")
         assert sm.grid_signature == grid.signature()
 
-    def test_metadata(self, catalog, grid):
-        sm = ShardMap.build(catalog, grid, backend="shapely")
-        assert sm.metadata["backend"] == "shapely"
+    def test_metadata(self, catalog, grid, fake_spherely):
+        sm = ShardMap.build(catalog, grid, backend="spherely")
+        assert sm.metadata["backend"] == "spherely"
         assert sm.metadata["total_pairs"] == sum(len(g) for g in sm.granules)
         assert sm.metadata["total_granules"] == 3
+
+    def test_brute_empty_records_early_out(self, grid, fake_spherely):
+        # No records -> no polygons -> {} early-out, no intersect call (#36 brute path).
+        from zagg.catalog.shardmap import _intersect_spherely
+        assert _intersect_spherely([], grid, {}) == {}
+
+
+class TestSpherelyAbsent:
+    """When spherely is genuinely absent, the backend raises with a pointer."""
+
+    @pytest.fixture
+    def no_spherely(self, monkeypatch):
+        monkeypatch.setitem(sys.modules, "spherely", None)
+
+    def test_explicit_spherely_raises(self, catalog, grid, no_spherely):
+        with pytest.raises(ImportError, match="spherely is required"):
+            ShardMap.build(catalog, grid, backend="spherely")
+
+    def test_auto_rectilinear_raises(self, catalog, grid, no_spherely):
+        # Non-HEALPix auto resolves to spherely, which then raises loudly --
+        # there is no shapely fallback anymore (#36).
+        assert _resolve_backend("auto", grid) == "spherely"
+        with pytest.raises(ImportError, match="README"):
+            ShardMap.build(catalog, grid, backend="auto")
 
 
 def _has_spatial_index():
@@ -105,34 +181,56 @@ def _has_spatial_index():
 @pytest.mark.skipif(not _has_spatial_index(),
                     reason="spherely SpatialIndex (fork build) not installed")
 class TestBuildSpherely:
-    def test_matches_shapely(self, catalog, grid):
-        # Exact S2 and WGS84 STRtree agree on a local non-polar grid.
-        sph = ShardMap.build(catalog, grid, backend="spherely")
-        shp = ShardMap.build(catalog, grid, backend="shapely")
-        assert _granule_shards(sph) == _granule_shards(shp)
-        assert sph.metadata["backend"] == "spherely"
+    def test_spatial_split(self, catalog, grid):
+        # Exact S2 with SpatialIndex gives the expected local split.
+        sm = ShardMap.build(catalog, grid, backend="spherely")
+        gs = _granule_shards(sm)
+        assert gs["Gwest"]
+        assert all(k % 4 in (0, 1) for k in gs["Gwest"])
+        assert all(k % 4 in (2, 3) for k in gs["Geast"])
+        assert sm.metadata["backend"] == "spherely"
 
 
 class TestResolveBackend:
-    def test_auto_rectilinear_without_spherely(self, grid):
-        # No SpatialIndex spherely in the venv -> rectilinear falls to shapely.
-        assert _resolve_backend("auto", grid) in ("spherely", "shapely")
+    def test_auto_rectilinear_uses_spherely(self, grid, fake_spherely):
+        assert _resolve_backend("auto", grid) == "spherely"
 
-    def test_auto_healpix_without_spherely(self):
+    def test_auto_healpix_without_spherely(self, monkeypatch):
+        # No spherely -> HEALPix auto falls to its native mortie MOC path.
+        monkeypatch.setitem(sys.modules, "spherely", None)
         hp = HealpixGrid(6, 12, layout="fullsphere")
-        assert _resolve_backend("auto", hp) in ("spherely", "mortie")
+        assert _resolve_backend("auto", hp) == "mortie"
+
+    def test_auto_healpix_prefers_spherely(self, fake_spherely):
+        hp = HealpixGrid(6, 12, layout="fullsphere")
+        assert _resolve_backend("auto", hp) == "spherely"
 
     def test_explicit_passthrough(self, grid):
-        assert _resolve_backend("shapely", grid) == "shapely"
+        assert _resolve_backend("mortie", grid) == "mortie"
+
+    def test_shapely_no_longer_a_backend(self):
+        # shapely was removed as an intersection backend (#36).
+        assert "shapely" not in shardmap._BACKENDS
 
     def test_unknown_backend_raises(self, catalog, grid):
         with pytest.raises(ValueError, match="unknown backend"):
             ShardMap.build(catalog, grid, backend="nope")
 
+    def test_cli_rejects_shapely_backend(self, monkeypatch):
+        # shapely was dropped as a backend (#36); the CLI must not accept it.
+        from zagg.catalog import main
+        monkeypatch.setattr(
+            sys, "argv",
+            ["zagg-catalog", "--config", "x.yaml", "--short-name", "ATL03",
+             "--backend", "shapely"],
+        )
+        with pytest.raises(SystemExit):
+            main()
+
 
 class TestIO:
-    def test_round_trip(self, catalog, grid):
-        sm = ShardMap.build(catalog, grid, backend="shapely")
+    def test_round_trip(self, catalog, grid, fake_spherely):
+        sm = ShardMap.build(catalog, grid, backend="spherely")
         with tempfile.NamedTemporaryFile(suffix=".json", delete=False) as f:
             sm.to_json(f.name)
             sm2 = ShardMap.from_json(f.name)

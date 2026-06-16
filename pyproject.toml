@@ -7,7 +7,10 @@ name = "zagg"
 dynamic = ["version"]
 description = "Multi-resolution aggregation for ICESat-2 ATL06 data using morton/healpix indexing"
 readme = "README.md"
-requires-python = ">=3.12"
+# Upper bound excludes 3.14+: numpy is pinned to 2.2.6 for the arm64 Lambda layer
+# (see deployment/aws/build_layer.sh), and 2.2.6 has no CPython 3.14 support — the
+# ABI mismatch silently corrupts results (issue #31). Lambda runtime is 3.12.
+requires-python = ">=3.12,<3.14"
 license = {file = "LICENSE"}
 authors = [
     {name = "Shane Grigsby", email = "refuge@rocktalus.com"},

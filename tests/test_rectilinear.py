@@ -34,15 +34,49 @@ class TestConstruction:
         assert grid.array_shape == (1280, 1280)
         assert grid.chunk_shape == (256, 256)
 
-    def test_uneven_chunk_rejected(self, cfg):
-        with pytest.raises(ValueError, match="chunk_shape.*must divide"):
-            RectilinearGrid(
-                crs="EPSG:3031",
-                resolution=5000,
-                bounds=(-3_200_000, -3_200_000, 3_200_000, 3_200_000),
-                chunk_shape=(300, 300),
-                config=cfg,
-            )
+    def test_clean_config_not_padded(self, grid):
+        # 1280 == 5*256 already, so auto-pad is a no-op and bounds are unchanged.
+        assert grid.array_shape == (1280, 1280)
+        assert (grid.xmin, grid.ymax, grid.xmax, grid.ymin) == (
+            -3_200_000, 3_200_000, 3_200_000, -3_200_000
+        )
+
+    def test_uneven_chunk_padded(self, cfg):
+        # 1280x1280 cells, chunk 300 doesn't divide -> zero-pad up to 1500 (5*300).
+        g = RectilinearGrid(
+            crs="EPSG:3031",
+            resolution=5000,
+            bounds=(-3_200_000, -3_200_000, 3_200_000, 3_200_000),
+            chunk_shape=(300, 300),
+            config=cfg,
+        )
+        assert g.array_shape == (1500, 1500)
+        assert g.height % g.chunk_h == 0 and g.width % g.chunk_w == 0
+        assert g.n_row_blocks == 5 and g.n_col_blocks == 5
+        # origin (xmin, ymax) preserved; far edges (xmax, ymin) extended to fit.
+        assert (g.xmin, g.ymax) == (-3_200_000, 3_200_000)
+        assert g.xmax == -3_200_000 + 1500 * 5000
+        assert g.ymin == 3_200_000 - 1500 * 5000
+
+    def test_partial_extent_rounds_up_to_cover(self, cfg):
+        # span not a whole multiple of resolution -> round cells UP to cover it
+        # (chunk_shape (1,1) isolates the cover-rounding from chunk-padding).
+        g = RectilinearGrid(
+            crs="EPSG:3031", resolution=5000,
+            bounds=(0, 0, 5000 * 130 + 100, 5000 * 130 + 100),
+            chunk_shape=(1, 1), config=cfg,
+        )
+        assert g.array_shape == (131, 131)  # ceil(130.02) -> 131
+
+    def test_signature_reflects_padding(self, cfg):
+        g = RectilinearGrid(
+            crs="EPSG:3031", resolution=5000,
+            bounds=(-3_200_000, -3_200_000, 3_200_000, 3_200_000),
+            chunk_shape=(300, 300), config=cfg,
+        )
+        sig = g.signature()
+        assert sig["shape"] == [1500, 1500]
+        assert sig["chunk_shape"] == [300, 300]
 
     def test_invalid_bounds(self, cfg):
         with pytest.raises(ValueError, match="bounds"):

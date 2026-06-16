@@ -197,7 +197,7 @@ examples:
     spatial.add_argument("--bbox", help="lon_min,lat_min,lon_max,lat_max")
 
     parser.add_argument("--backend", default="auto",
-                        choices=["auto", "spherely", "mortie", "shapely"])
+                        choices=["auto", "spherely", "mortie"])
     parser.add_argument("--preserve-thumbnails", action="store_true",
                         help="Keep browse/thumbnail assets in the Catalog")
     parser.add_argument("--output", default=None, help="Output ShardMap JSON path")

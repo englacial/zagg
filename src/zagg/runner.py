@@ -21,6 +21,11 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from zarr import consolidate_metadata
 
 from zagg.auth import get_edl_token, get_nsidc_s3_credentials
+from zagg.concurrency import (
+    ConcurrencyReport,
+    compute_available_workers,
+    raise_for_fd_exhaustion,
+)
 from zagg.config import (
     PipelineConfig,
     get_child_order,
@@ -394,7 +399,9 @@ def _run_lambda(config, catalog_data, store_path, child_order, *,
     if not morton_cell:
         cells.sort(key=lambda kv: len(kv[1]), reverse=True)
 
-    logger.info(f"Processing {len(cells)} of {len(all_shards)} cells (lambda, {max_workers} workers)")
+    # Worker count is logged after the pre-flight clamp (see
+    # _log_concurrency_report); here max_workers is still the requested value.
+    logger.info(f"Processing {len(cells)} of {len(all_shards)} cells (lambda)")
 
     if dry_run:
         return _dry_run_summary(cells, store_path)
@@ -419,14 +426,29 @@ def _run_lambda(config, catalog_data, store_path, child_order, *,
         output_credentials, output_endpoint_url, region,
     )
 
-    # Configure boto3 client (created early so we can use it for setup/finalize)
+    # Pre-flight concurrency probe: clamp workers to what local file
+    # descriptors and account-wide Lambda concurrency can sustain, so we don't
+    # silently drop cells (FD exhaustion) or saturate the account pool (#28).
+    # Probe with a lightweight session; the dispatch client is sized to the
+    # clamped count below.
+    session = boto3.Session()
+    probe_lambda = session.client("lambda", region_name=region)
+    cloudwatch_client = session.client("cloudwatch", region_name=region)
+    max_workers, concurrency_report = compute_available_workers(
+        max_workers, probe_lambda, cloudwatch_client, function_name,
+    )
+    _log_concurrency_report(concurrency_report, max_workers)
+
+    # Configure boto3 client (created early so we can use it for setup/finalize).
+    # max_pool_connections is sized to the clamped worker count so connections
+    # cannot outrun the file-descriptor budget.
     boto_config = Config(
         read_timeout=900,
         connect_timeout=10,
         retries={"max_attempts": 0},
         max_pool_connections=max_workers,
     )
-    lambda_client = boto3.Session().client(
+    lambda_client = session.client(
         "lambda", region_name=region, config=boto_config,
     )
 
@@ -459,12 +481,21 @@ def _run_lambda(config, catalog_data, store_path, child_order, *,
                 function_name=function_name,
                 config_dict=config_dict,
                 output_creds_event=output_creds_event,
+                max_workers=max_workers,
             ): shard_key
             for shard_key, records in cells
         }
 
         for i, future in enumerate(as_completed(futures), 1):
-            result = future.result()
+            try:
+                result = future.result()
+            except Exception as e:
+                # _invoke_lambda_cell already re-raises FD exhaustion with
+                # ulimit guidance; this is a backstop for exhaustion that
+                # surfaces outside the cell body (e.g. at submit time). Other
+                # exceptions propagate unchanged.
+                raise_for_fd_exhaustion(e, max_workers)
+                raise
             results.append(result)
             total_lambda_time += result.get("lambda_duration", 0)
 
@@ -535,6 +566,23 @@ def _build_output_creds_event(credentials, endpoint_url, region):
     return block
 
 
+def _log_concurrency_report(report: ConcurrencyReport, max_workers: int) -> None:
+    """Log the pre-flight concurrency probe outcome and the clamped workers."""
+    if report.function_reserved is not None:
+        logger.info(f"Function reserved concurrency: {report.function_reserved}")
+    if report.account_limit is None:
+        logger.warning(
+            "Account concurrency unreadable (missing IAM?); bounding workers by "
+            f"file-descriptor limit only -> {max_workers}"
+        )
+    else:
+        logger.info(
+            f"Account concurrency: limit={report.account_limit}, "
+            f"current={report.current_concurrent}, padding={report.padding}, "
+            f"available={report.available} -> using {max_workers} workers"
+        )
+
+
 def _invoke_lambda_setup(lambda_client, function_name, store_path, *,
                          parent_order, child_order, n_parent_cells,
                          overwrite, config_dict, output_creds_event=None):
@@ -586,8 +634,13 @@ def _invoke_lambda_cell(
     lambda_client, chunk_idx, parent_morton, parent_order, child_order,
     granule_urls, store_path, s3_credentials, *,
     function_name, config_dict, output_creds_event=None, max_retries=3,
+    max_workers=None,
 ):
-    """Invoke Lambda for a single cell with retry logic."""
+    """Invoke Lambda for a single cell with retry logic.
+
+    ``max_workers`` is used only for the file-descriptor-exhaustion message
+    (#28); it does not affect dispatch.
+    """
     wall_start = time.time()
 
     event = {
@@ -650,6 +703,11 @@ def _invoke_lambda_cell(
                 "granule_count": len(granule_urls),
             }
         except Exception as e:
+            # Client-side FD exhaustion is run-fatal (every subsequent cell
+            # will hit it too) and was previously swallowed into a
+            # status_code=None result -- a silent dropped cell. Surface it
+            # loudly with ulimit guidance instead (#28).
+            raise_for_fd_exhaustion(e, max_workers)
             last_error = str(e)
             retryable = ["TooManyRequestsException", "Rate exceeded",
                          "Read timeout", "timed out", "UNEXPECTED_EOF"]

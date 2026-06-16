@@ -1,11 +1,22 @@
 AWSTemplateFormatVersion: "2010-09-09"
+# LEGACY / OPTIONAL — only for the IAM-constrained deploy path (no iam:CreateRole).
+# The supported, verified path is the DEFAULT: stand_up.sh -> template.yaml with
+# CreateExecutionRole=true creates this role in-stack and needs no out-of-band
+# step. Use this standalone template ONLY when the deploy identity cannot create
+# IAM roles (e.g. an AWS SSO "power user" permission set), so an account admin
+# applies it once out of band. Kept as the escape hatch for that case rather than
+# removed; see deployment/aws/EXECUTION_ROLE.md and issue #34. Not re-validated
+# since the SSO flow was last exercised — treat as legacy until re-tested.
 Description: >-
-  zagg Lambda execution role — a least-privilege role for the process-shard
-  function, kept in its OWN stack so an account admin (someone with iam:CreateRole)
-  applies it once, then hands the RoleArn to whoever stands up the backend.
-  Used when template.yaml is deployed with CreateExecutionRole=false. The role
-  only needs CloudWatch Logs + write to the output bucket: source granules are
-  read with credentials passed in the invocation event, not by this role.
+  LEGACY/OPTIONAL (IAM-constrained path only — see EXECUTION_ROLE.md / #34): zagg
+  Lambda execution role — a least-privilege role for the process-shard function,
+  kept in its OWN stack so an account admin (someone with iam:CreateRole) applies
+  it once, then hands the RoleArn to whoever stands up the backend. Used when
+  template.yaml is deployed with CreateExecutionRole=false; the default deploy
+  (CreateExecutionRole=true) creates the role in-stack and does not need this.
+  The role only needs CloudWatch Logs + write to the output bucket: source
+  granules are read with credentials passed in the invocation event, not by this
+  role.
 
 Parameters:
   RoleName:
