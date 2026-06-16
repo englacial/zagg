@@ -597,6 +597,28 @@ class TestOutputKind:
         with pytest.raises(ValueError, match="positive"):
             validate_config(cfg)
 
+    def test_vector_expression_allowed(self):
+        """A vector field may be driven by an expression (issue #29)."""
+        cfg = _vector_config(
+            {
+                "expression": "np.array([np.min(h_li), np.max(h_li)])",
+                "kind": "vector",
+                "trailing_shape": 2,
+            }
+        )
+        validate_config(cfg)
+
+    def test_vector_len_rejected(self):
+        """``len`` short-circuits to a scalar count; kind 'vector' is nonsensical."""
+        cfg = _vector_config({"function": "len", "kind": "vector", "trailing_shape": 4})
+        with pytest.raises(ValueError, match="cannot be combined with kind 'vector'"):
+            validate_config(cfg)
+
+    def test_vector_count_rejected(self):
+        cfg = _vector_config({"function": "count", "kind": "vector", "trailing_shape": 4})
+        with pytest.raises(ValueError, match="cannot be combined with kind 'vector'"):
+            validate_config(cfg)
+
     def test_invalid_dtype_rejected(self):
         cfg = _vector_config({"function": "min", "dtype": "not_a_dtype"})
         with pytest.raises(ValueError, match="not a valid"):

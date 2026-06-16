@@ -223,8 +223,9 @@ def _validate_output_kind(name: str, meta: dict) -> None:
 
     A field may declare ``kind`` (``scalar`` default, or ``vector``) and
     ``trailing_shape`` (required for ``vector``). ``scalar`` fields need
-    neither and stay the default path. (A per-cell padding sentinel for
-    vectors is a later phase; see issue #29.)
+    neither and stay the default path. A ``vector`` field may be driven by
+    either ``function`` or ``expression``; ``len``/``count`` are rejected for
+    ``vector`` (they short-circuit to a scalar count). See issue #29.
 
     Parameters
     ----------
@@ -268,6 +269,15 @@ def _validate_output_kind(name: str, meta: dict) -> None:
     if not has_trailing:
         raise ValueError(f"Variable '{name}': kind 'vector' requires 'trailing_shape'")
     _validate_trailing_shape(name, meta["trailing_shape"])
+
+    # ``len``/``count`` short-circuit to a scalar obs count in
+    # ``calculate_cell_statistics``; pairing them with kind 'vector' would
+    # silently emit a scalar, so reject the nonsensical combination.
+    if meta.get("function") in ("len", "count"):
+        raise ValueError(
+            f"Variable '{name}': function {meta['function']!r} produces a scalar "
+            f"count and cannot be combined with kind 'vector'"
+        )
 
 
 def _validate_trailing_shape(name: str, trailing_shape) -> None:
@@ -568,6 +578,39 @@ def get_output_region(config: PipelineConfig) -> str | None:
     return config.output.get("region")
 
 
+def eval_expression_raw(expression: str, columns: dict[str, np.ndarray]):
+    """Evaluate an expression string in a restricted namespace, uncoerced.
+
+    Returns the expression's native value (a scalar, an ndarray, ...). Used by
+    vector ``expression`` fields (issue #29), which coerce the result through
+    ``_coerce_field_value`` rather than casting to ``float``.
+
+    Parameters
+    ----------
+    expression : str
+        Python expression using numpy and column variables.
+    columns : dict[str, np.ndarray]
+        Mapping of column names to arrays.
+
+    Returns
+    -------
+    Any
+        Whatever the expression evaluates to.
+    """
+    ns = {
+        "__builtins__": {},
+        "np": np,
+        "numpy": np,
+        "len": len,
+        "float": float,
+        "int": int,
+        "abs": abs,
+        "sum": sum,
+        **columns,
+    }
+    return eval(expression, ns)  # noqa: S307
+
+
 def evaluate_expression(expression: str, columns: dict[str, np.ndarray]) -> float:
     """Evaluate an expression string in a restricted namespace.
 
@@ -582,15 +625,4 @@ def evaluate_expression(expression: str, columns: dict[str, np.ndarray]) -> floa
     -------
     float
     """
-    ns = {
-        "__builtins__": {},
-        "np": np,
-        "numpy": np,
-        "len": len,
-        "float": float,
-        "int": int,
-        "abs": abs,
-        "sum": sum,
-        **columns,
-    }
-    return float(eval(expression, ns))  # noqa: S307
+    return float(eval_expression_raw(expression, columns))

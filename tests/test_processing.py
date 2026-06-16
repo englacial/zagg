@@ -192,16 +192,56 @@ class TestVectorOutputs:
         with pytest.raises(ValueError, match="expected"):
             calculate_cell_statistics({"b": np.array([0, 3])}, config=cfg)
 
-    def test_vector_expression_rejected(self):
-        """Tier 1 vectors come from ``function``; a vector ``expression`` field is
-        deferred (issue #29) and must fail loudly rather than silently scalarize."""
+    @staticmethod
+    def _edges_config(fill_value=None):
+        """A ``kind: vector`` field driven by an ``expression`` (issue #29)."""
+        from zagg.config import PipelineConfig
+
+        meta = {
+            "expression": "np.array([np.min(h), np.max(h)])",
+            "source": "h",
+            "kind": "vector",
+            "trailing_shape": 2,
+            "dtype": "float32",
+        }
+        if fill_value is not None:
+            meta["fill_value"] = fill_value
+        return PipelineConfig(aggregation={"variables": {"edges": meta}})
+
+    def test_vector_expression_returns_declared_shape(self):
+        """A vector ``expression`` field coerces to its declared shape/dtype, the
+        same path a vector ``function`` field uses (issue #29)."""
+        cfg = self._edges_config()
+        result = calculate_cell_statistics({"h": np.array([1.0, 5.0, 3.0])}, config=cfg)
+        edges = result["edges"]
+        assert isinstance(edges, np.ndarray)
+        assert edges.shape == (2,)
+        assert edges.dtype == np.dtype("float32")
+        np.testing.assert_array_equal(edges, [1.0, 5.0])
+
+    def test_vector_expression_empty_cell_gets_sentinel(self):
+        """An empty cell emits the same shape filled with the fill_value sentinel."""
+        cfg = self._edges_config()
+        result = calculate_cell_statistics({"h": np.array([])}, config=cfg)
+        edges = result["edges"]
+        assert edges.shape == (2,)
+        assert np.all(np.isnan(edges))  # default fill_value "NaN"
+
+    def test_vector_expression_empty_cell_numeric_sentinel(self):
+        cfg = self._edges_config(fill_value=0)
+        result = calculate_cell_statistics({"h": np.array([])}, config=cfg)
+        np.testing.assert_array_equal(result["edges"], [0, 0])
+
+    def test_vector_expression_wrong_width_raises(self):
+        """An expression yielding the wrong width fails loudly, like the function case."""
         from zagg.config import PipelineConfig
 
         cfg = PipelineConfig(
             aggregation={
                 "variables": {
                     "edges": {
-                        "expression": "np.array([np.min(h), np.max(h)])",
+                        "expression": "np.array([np.min(h), np.max(h), np.mean(h)])",
+                        "source": "h",
                         "kind": "vector",
                         "trailing_shape": 2,
                         "dtype": "float32",
@@ -209,7 +249,7 @@ class TestVectorOutputs:
                 }
             }
         )
-        with pytest.raises(ValueError, match="vector output from an expression"):
+        with pytest.raises(ValueError, match="expected"):
             calculate_cell_statistics({"h": np.array([1.0, 5.0, 3.0])}, config=cfg)
 
     def test_scalar_fields_unchanged_alongside_vector(self):
