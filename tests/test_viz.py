@@ -198,6 +198,32 @@ class TestAntimeridian:
         geom = _split_antimeridian(poly)
         assert geom["type"] == "Polygon"
 
+    def test_wide_non_crossing_polygon_kept_intact(self):
+        # A swath that steps continuously from -170 across 0 to +170 spans >180
+        # in total but never jumps the seam between consecutive vertices; it
+        # must stay a single Polygon, not get split into ±180 slivers (review of
+        # #38 phase 1 -- the old total-span gate over-split this).
+        from shapely.geometry import Polygon
+
+        ring = [
+            (-170, -10), (-85, -10), (0, -10), (85, -10), (170, -10),
+            (170, 10), (85, 10), (0, 10), (-85, 10), (-170, 10), (-170, -10),
+        ]
+        geom = _split_antimeridian(Polygon(ring))
+        assert geom["type"] == "Polygon"
+        lons = [pt[0] for pt in geom["coordinates"][0]]
+        assert min(lons) == -170 and max(lons) == 170
+
+    def test_holes_preserved(self):
+        # An exterior ring with an interior hole keeps the hole through GeoJSON.
+        from shapely.geometry import Polygon
+
+        shell = [(0, 0), (10, 0), (10, 10), (0, 10), (0, 0)]
+        hole = [(3, 3), (7, 3), (7, 7), (3, 7), (3, 3)]
+        geom = _split_antimeridian(Polygon(shell, [hole]))
+        assert geom["type"] == "Polygon"
+        assert len(geom["coordinates"]) == 2  # exterior + one interior ring
+
 
 # ── render_shardmap assembly ─────────────────────────────────────────────────
 
