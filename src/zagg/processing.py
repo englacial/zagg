@@ -254,7 +254,7 @@ def calculate_cell_statistics(
     dict
         Dictionary of statistics keyed by aggregation variable name.
     """
-    from zagg.config import evaluate_expression, resolve_function
+    from zagg.config import eval_expression_raw, evaluate_expression, resolve_function
 
     if config is None:
         config = default_config()
@@ -272,17 +272,16 @@ def calculate_cell_statistics(
         params = dict(meta.get("params", {}))
         sig = get_output_signature(meta)
 
-        # Expression-based aggregation (e.g. h_sigma). Expressions are scalar-only
-        # in Tier 1: ``evaluate_expression`` returns a Python float. A vector
-        # expression field would need a non-scalar eval contract; that's deferred
-        # (issue #29) — declaring ``kind: vector`` with ``expression`` is rejected.
+        # Expression-based aggregation (e.g. h_sigma). A scalar expression casts
+        # to a Python float; a ``kind: vector`` expression is coerced through the
+        # same ``_coerce_field_value``/``trailing_shape``/dtype path as a vector
+        # ``function`` field (issue #29).
         if expression:
             if sig["kind"] == "vector":
-                raise ValueError(
-                    f"Variable '{name}': vector output from an expression is not yet "
-                    f"supported; use 'function' (issue #29 Tier 1)"
-                )
-            result[name] = evaluate_expression(expression, cell_data)
+                out = eval_expression_raw(expression, cell_data)
+                result[name] = _coerce_field_value(out, sig)
+            else:
+                result[name] = evaluate_expression(expression, cell_data)
             continue
 
         values = cell_data[source]
@@ -335,11 +334,11 @@ def _empty_cell_value(meta: dict):
 def _coerce_field_value(value, sig: dict) -> np.ndarray:
     """Coerce a ``vector`` field's aggregation output to its declared signature.
 
-    The field's ``function`` must yield exactly ``trailing_shape`` values (issue
-    #29 Tier-1 fixed-width vectors; ragged/CSR is Tier 2; vector ``expression``
-    fields are deferred and rejected upstream). Returns
-    a contiguous array of the declared dtype (default ``float32``), so every cell
-    emits an identically-shaped slab the dense writer (phase 5) can stack.
+    The field's ``function`` or ``expression`` must yield exactly
+    ``trailing_shape`` values (issue #29 Tier-1 fixed-width vectors; ragged/CSR
+    is Tier 2). Returns a contiguous array of the declared dtype (default
+    ``float32``), so every cell emits an identically-shaped slab the dense
+    writer (phase 5) can stack.
     """
     dtype = np.dtype(sig["dtype"]) if sig["dtype"] is not None else np.dtype("float32")
     arr = np.asarray(value, dtype=dtype)
