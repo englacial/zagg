@@ -69,7 +69,13 @@ def vector_array_spec(base, sig, *, base_dims, base_chunk_shape):
     if not trailing:
         return base
     shape = (*base.shape, *trailing)
-    dim_names = (*base_dims, *(f"{base_dims[-1]}_v{i}" for i in range(len(trailing))))
+    # Name trailing payload axes ``vector`` (one dim) or ``vector_0``/``vector_1``
+    # (multi-dim, e.g. a t-digest ``(k, 2)``) — distinct from the spatial axes.
+    if len(trailing) == 1:
+        trailing_names: tuple[str, ...] = ("vector",)
+    else:
+        trailing_names = tuple(f"vector_{i}" for i in range(len(trailing)))
+    dim_names = (*base_dims, *trailing_names)
     chunk_shape = (*base_chunk_shape, *trailing)
     chunk_grid = NamedConfig(name="regular", configuration={"chunk_shape": list(chunk_shape)})
     # Set shape + dimension_names together: ArraySpec validates their ranks
