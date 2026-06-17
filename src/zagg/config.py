@@ -21,6 +21,16 @@ class DataSourceDict(TypedDict):
     coordinates: dict[str, str]
     variables: dict[str, str]
     quality_filter: NotRequired[dict]
+    filters: NotRequired[list[dict]]
+
+
+# Structured-predicate comparison operators (issue #43). ``in``/``not_in`` take a
+# ``values`` list; the rest take a scalar ``value``. These are the only
+# pushdown-eligible filter language; an ``expression`` filter is a base-level-only,
+# aggregation-time escape hatch that forfeits pushdown.
+_SCALAR_OPS = frozenset({"eq", "ne", "ge", "le", "lt", "gt"})
+_SET_OPS = frozenset({"in", "not_in"})
+FILTER_OPS = _SCALAR_OPS | _SET_OPS
 
 
 @dataclass
@@ -169,6 +179,9 @@ def validate_config(config: PipelineConfig) -> None:
             if "start_date" not in temporal or "end_date" not in temporal:
                 raise ValueError("bounds.temporal requires start_date and end_date")
 
+    # Validate the structured filter list (issue #43, Phase A)
+    _validate_filters(config.data_source)
+
     ds_vars = set(config.data_source.get("variables", {}).keys())
     agg_vars = config.aggregation.get("variables", {})
 
@@ -216,6 +229,142 @@ def validate_config(config: PipelineConfig) -> None:
         # Validate expression column references
         if has_expr:
             _validate_expression_columns(name, meta["expression"], ds_vars)
+
+
+def get_filters(config: PipelineConfig) -> list[dict]:
+    """Return the ordered list of normalized data-source filters (issue #43).
+
+    Two filter languages coexist:
+
+    - **Structured predicates** ``{level?, dataset, column?, op, value|values,
+      keep?}`` are machine-inspectable and are the only kind eligible for read
+      pushdown (Phase C). ``op`` is one of :data:`FILTER_OPS`; ``in``/``not_in``
+      take ``values`` (a list), the rest take a scalar ``value``. ``column`` is an
+      integer selector into an N-D flag array (e.g. ATL03 ``signal_conf_ph``).
+      ``keep`` (default ``True``) keeps matching rows; ``keep: false`` drops them.
+    - **Expression** filters ``{expression: "<py expr>"}`` are a base-level-only,
+      aggregation-time escape hatch that forfeits pushdown (opaque to the planner).
+
+    The flat ``quality_filter: {dataset, value}`` is sugar synthesizing one
+    base-level ``op: eq`` structured filter, so the ATL06 path is unchanged. An
+    explicit ``filters:`` list, when present, is used as-is (the flat
+    ``quality_filter`` is then ignored).
+
+    Each returned filter carries a normalized ``level`` (``None`` means the base
+    level) and, for structured predicates, an explicit ``keep`` bool.
+
+    Parameters
+    ----------
+    config : PipelineConfig
+
+    Returns
+    -------
+    list[dict]
+    """
+    return filters_from_data_source(config.data_source)
+
+
+def filters_from_data_source(data_source: dict) -> list[dict]:
+    """Normalize the filter list from a raw ``data_source`` dict.
+
+    Shared by :func:`get_filters` and the read path (which only holds the
+    ``data_source`` mapping). See :func:`get_filters` for the schema.
+    """
+    explicit = data_source.get("filters")
+    if explicit is not None:
+        return [_normalize_filter(f) for f in explicit]
+    qf = data_source.get("quality_filter")
+    if qf is not None:
+        return [
+            {
+                "level": None,
+                "dataset": qf["dataset"],
+                "column": None,
+                "op": "eq",
+                "value": qf["value"],
+                "keep": True,
+            }
+        ]
+    return []
+
+
+def _normalize_filter(f: dict) -> dict:
+    """Normalize one raw filter dict into canonical form (see :func:`get_filters`)."""
+    if "expression" in f:
+        return {"level": f.get("level"), "expression": f["expression"]}
+    op = f["op"]
+    out = {
+        "level": f.get("level"),
+        "dataset": f["dataset"],
+        "column": f.get("column"),
+        "op": op,
+        "keep": bool(f.get("keep", True)),
+    }
+    if op in _SET_OPS:
+        out["values"] = list(f["values"])
+    else:
+        out["value"] = f["value"]
+    return out
+
+
+def _validate_filters(data_source: dict) -> None:
+    """Validate the ``filters`` list (and that a flat ``quality_filter`` is sane).
+
+    Raises ``ValueError`` on: unknown op, missing ``dataset``, ``in``/``not_in``
+    without a list ``values``, scalar ops without ``value``, non-int ``column``,
+    a non-base-level ``expression`` filter, or wrong ``value`` type. ``column`` is
+    required for the N-D flag case but cannot be checked against array rank here
+    (no data); rank checks happen at read time.
+    """
+    filters = data_source.get("filters")
+    if filters is None:
+        return
+    if not isinstance(filters, list):
+        raise ValueError("data_source.filters must be a list")
+    for i, f in enumerate(filters):
+        if not isinstance(f, dict):
+            raise ValueError(f"filter[{i}] must be a mapping")
+        if "expression" in f:
+            if "op" in f or "dataset" in f:
+                raise ValueError(
+                    f"filter[{i}]: 'expression' filters take no 'op'/'dataset' "
+                    "(base-level aggregation-time escape hatch, no pushdown)"
+                )
+            if f.get("level") is not None:
+                raise ValueError(
+                    f"filter[{i}]: 'expression' filters are base-level only "
+                    "(level must be omitted)"
+                )
+            if not isinstance(f["expression"], str):
+                raise ValueError(f"filter[{i}]: 'expression' must be a string")
+            continue
+        if "dataset" not in f:
+            raise ValueError(f"filter[{i}]: structured filter requires 'dataset'")
+        op = f.get("op")
+        if op not in FILTER_OPS:
+            raise ValueError(
+                f"filter[{i}]: unknown op {op!r} (allowed: {sorted(FILTER_OPS)})"
+            )
+        col = f.get("column")
+        if col is not None and not isinstance(col, int):
+            raise ValueError(
+                f"filter[{i}]: 'column' must be an integer index (got {col!r})"
+            )
+        if op in _SET_OPS:
+            if not isinstance(f.get("values"), list):
+                raise ValueError(f"filter[{i}]: op {op!r} requires a 'values' list")
+            for v in f["values"]:
+                if not isinstance(v, (int, float)):
+                    raise ValueError(
+                        f"filter[{i}]: 'values' must be numeric (got {v!r})"
+                    )
+        else:
+            if "value" not in f:
+                raise ValueError(f"filter[{i}]: op {op!r} requires a scalar 'value'")
+            if not isinstance(f["value"], (int, float)):
+                raise ValueError(
+                    f"filter[{i}]: 'value' must be numeric (got {f['value']!r})"
+                )
 
 
 def _is_numeric(s: str) -> bool:
@@ -484,3 +633,38 @@ def evaluate_expression(expression: str, columns: dict[str, np.ndarray]) -> floa
         **columns,
     }
     return float(eval(expression, ns))  # noqa: S307
+
+
+def evaluate_filter_expression(
+    expression: str, columns: dict[str, np.ndarray]
+) -> np.ndarray:
+    """Evaluate a boolean filter expression to a per-row mask (issue #43).
+
+    Like :func:`evaluate_expression` but returns the raw boolean array rather than
+    a scalar float — the base-level ``expression`` filter escape hatch (e.g.
+    ``"(h_li > 0) & (s_li < 1)"``). Uses the same restricted namespace.
+
+    Parameters
+    ----------
+    expression : str
+        Python boolean expression over numpy and column variables.
+    columns : dict[str, np.ndarray]
+        Mapping of column names to arrays.
+
+    Returns
+    -------
+    numpy.ndarray
+        Boolean mask.
+    """
+    ns = {
+        "__builtins__": {},
+        "np": np,
+        "numpy": np,
+        "len": len,
+        "float": float,
+        "int": int,
+        "abs": abs,
+        "sum": sum,
+        **columns,
+    }
+    return np.asarray(eval(expression, ns), dtype=bool)  # noqa: S307

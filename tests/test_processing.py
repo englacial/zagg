@@ -13,6 +13,8 @@ from zagg.processing import (
     _group_columns,
     _kernel_able,
     _kernel_aggregate,
+    _predicate_mask,
+    _read_group,
     calculate_cell_statistics,
     process_shard,
     write_dataframe_to_zarr,
@@ -645,3 +647,187 @@ class TestDataSource:
         ds = default_config().data_source
         path = ds["coordinates"]["latitude"].format(group="gt2r")
         assert path == "/gt2r/land_ice_segments/latitude"
+
+
+# ---------------------------------------------------------------------------
+# Structured filters in the read path (issue #43, Phase A)
+# ---------------------------------------------------------------------------
+
+class _FakeH5:
+    """Stub h5coro object: ``readDatasets`` returns canned arrays by path.
+
+    Honors the ``hyperslice`` bound so sliced reads mirror the real driver.
+    """
+
+    def __init__(self, arrays):
+        self._arrays = arrays
+
+    def readDatasets(self, datasets):  # noqa: N802 (mirror real h5coro API)
+        out = {}
+        for d in datasets:
+            if isinstance(d, str):
+                out[d] = self._arrays[d]
+                continue
+            path = d["dataset"]
+            arr = self._arrays[path]
+            hs = d.get("hyperslice")
+            if hs is not None:
+                lo, hi = hs[0]
+                arr = arr[lo:hi]
+            out[path] = arr
+        return out
+
+
+class _ShardGrid:
+    """Grid stub: leaf id == row index; every row maps to ``shard_key`` 0,
+    so the spatial filter keeps all rows and the structured filters are
+    exercised in isolation."""
+
+    @staticmethod
+    def assign(lats, lons):
+        return np.arange(len(lats))
+
+    @staticmethod
+    def shards_of(leaf_ids):
+        return np.zeros(len(leaf_ids), dtype=int)
+
+
+class TestPredicateMask:
+    def test_scalar_ops_1d(self):
+        arr = np.array([0, 1, 2, 3, 0])
+        assert _predicate_mask(
+            arr, {"dataset": "/d", "op": "eq", "value": 0, "column": None}
+        ).tolist() == [True, False, False, False, True]
+        assert _predicate_mask(
+            arr, {"dataset": "/d", "op": "ge", "value": 2, "column": None}
+        ).tolist() == [False, False, True, True, False]
+
+    def test_set_ops(self):
+        arr = np.array([2, 3, 4, 5])
+        assert _predicate_mask(
+            arr, {"dataset": "/d", "op": "in", "values": [2, 4]}
+        ).tolist() == [True, False, True, False]
+        assert _predicate_mask(
+            arr, {"dataset": "/d", "op": "not_in", "values": [2, 4]}
+        ).tolist() == [False, True, False, True]
+
+    def test_keep_false_inverts(self):
+        arr = np.array([0, 1, 0])
+        assert _predicate_mask(
+            arr, {"dataset": "/d", "op": "eq", "value": 0, "keep": False}
+        ).tolist() == [False, True, False]
+
+    def test_nd_column_slicing(self):
+        # 2-D flag array (5 rows x 3 surface-type columns)
+        arr = np.array([[0, 9, 9], [-2, 9, 9], [1, 9, 9], [-2, 9, 9], [3, 9, 9]])
+        # signal_conf_ph-style: column 0, != -2
+        mask = _predicate_mask(arr, {"dataset": "/d", "column": 0, "op": "ne", "value": -2})
+        assert mask.tolist() == [True, False, True, False, True]
+
+    def test_nd_requires_column(self):
+        arr = np.zeros((3, 2))
+        with pytest.raises(ValueError, match="requires an integer 'column'"):
+            _predicate_mask(arr, {"dataset": "/d", "op": "eq", "value": 0})
+
+    def test_column_on_1d_rejected(self):
+        arr = np.zeros(3)
+        with pytest.raises(ValueError, match="array is 1-D"):
+            _predicate_mask(arr, {"dataset": "/d", "column": 0, "op": "eq", "value": 0})
+
+
+class TestReadGroupFilters:
+    def _data_source(self, **extra):
+        ds = {
+            "coordinates": {"latitude": "/lat", "longitude": "/lon"},
+            "variables": {"h": "/h"},
+        }
+        ds.update(extra)
+        return ds
+
+    def test_quality_filter_eq_path(self):
+        h5 = _FakeH5({
+            "/lat": np.array([1.0, 2.0, 3.0, 4.0]),
+            "/lon": np.array([1.0, 2.0, 3.0, 4.0]),
+            "/h": np.array([10.0, 20.0, 30.0, 40.0], dtype=np.float32),
+            "/qs": np.array([0, 1, 0, 1]),
+        })
+        ds = self._data_source(quality_filter={"dataset": "/qs", "value": 0})
+        df = _read_group(h5, "gt1l", ds, 0, _ShardGrid())
+        assert df["h"].tolist() == [10.0, 30.0]
+
+    def test_quality_filter_byte_identical_to_manual_eq(self):
+        # The synthesized base eq filter must reproduce the legacy mask exactly.
+        h = np.array([10.0, 20.0, 30.0, 40.0, 50.0], dtype=np.float32)
+        qs = np.array([0, 1, 0, 0, 1])
+        h5 = _FakeH5({
+            "/lat": np.arange(5.0), "/lon": np.arange(5.0), "/h": h, "/qs": qs,
+        })
+        ds = self._data_source(quality_filter={"dataset": "/qs", "value": 0})
+        df = _read_group(h5, "gt1l", ds, 0, _ShardGrid())
+        expected = h[qs == 0]
+        assert df["h"].to_numpy().tobytes() == expected.tobytes()
+
+    def test_2d_signal_conf_filter(self):
+        conf = np.array([[0], [-2], [4], [-2], [3]])  # column 0, surface type
+        h5 = _FakeH5({
+            "/lat": np.arange(5.0), "/lon": np.arange(5.0),
+            "/h": np.arange(5.0, dtype=np.float32), "/conf": conf,
+        })
+        ds = self._data_source(
+            filters=[{"dataset": "/conf", "column": 0, "op": "ne", "value": -2}]
+        )
+        df = _read_group(h5, "gt1l", ds, 0, _ShardGrid())
+        assert df["h"].tolist() == [0.0, 2.0, 4.0]
+
+    def test_multiple_anded_filters(self):
+        h5 = _FakeH5({
+            "/lat": np.arange(5.0), "/lon": np.arange(5.0),
+            "/h": np.arange(5.0, dtype=np.float32),
+            "/conf": np.array([[5], [5], [0], [5], [5]]),
+            "/pod": np.array([0, 0, 0, 1, 0]),
+        })
+        ds = self._data_source(filters=[
+            {"dataset": "/conf", "column": 0, "op": "ne", "value": 0},
+            {"dataset": "/pod", "op": "eq", "value": 0},
+        ])
+        df = _read_group(h5, "gt1l", ds, 0, _ShardGrid())
+        # row2 dropped by conf==0, row3 dropped by pod==1
+        assert df["h"].tolist() == [0.0, 1.0, 4.0]
+
+    def test_in_op_integer_column(self):
+        h5 = _FakeH5({
+            "/lat": np.arange(5.0), "/lon": np.arange(5.0),
+            "/h": np.arange(5.0, dtype=np.float32),
+            "/conf": np.array([[2], [0], [3], [1], [4]]),
+        })
+        ds = self._data_source(
+            filters=[{"dataset": "/conf", "column": 0, "op": "in", "values": [2, 3, 4]}]
+        )
+        df = _read_group(h5, "gt1l", ds, 0, _ShardGrid())
+        assert df["h"].tolist() == [0.0, 2.0, 4.0]
+
+    def test_expression_filter_base_level(self):
+        h5 = _FakeH5({
+            "/lat": np.arange(5.0), "/lon": np.arange(5.0),
+            "/h": np.array([-1.0, 2.0, -3.0, 4.0, 5.0], dtype=np.float32),
+        })
+        ds = self._data_source(filters=[{"expression": "h > 0"}])
+        df = _read_group(h5, "gt1l", ds, 0, _ShardGrid())
+        assert df["h"].tolist() == [2.0, 4.0, 5.0]
+
+    def test_no_filter_keeps_all(self):
+        h5 = _FakeH5({
+            "/lat": np.arange(3.0), "/lon": np.arange(3.0),
+            "/h": np.arange(3.0, dtype=np.float32),
+        })
+        df = _read_group(h5, "gt1l", self._data_source(), 0, _ShardGrid())
+        assert df["h"].tolist() == [0.0, 1.0, 2.0]
+
+    def test_all_filtered_returns_none(self):
+        h5 = _FakeH5({
+            "/lat": np.arange(3.0), "/lon": np.arange(3.0),
+            "/h": np.arange(3.0, dtype=np.float32),
+            "/qs": np.array([1, 1, 1]),
+        })
+        ds = self._data_source(quality_filter={"dataset": "/qs", "value": 0})
+        assert _read_group(h5, "gt1l", ds, 0, _ShardGrid()) is None
