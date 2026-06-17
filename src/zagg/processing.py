@@ -168,8 +168,7 @@ def _has_vector_fields(config: PipelineConfig) -> bool:
     :func:`_arrow_column`).
     """
     return any(
-        get_output_signature(meta)["kind"] == "vector"
-        for meta in get_agg_fields(config).values()
+        get_output_signature(meta)["kind"] == "vector" for meta in get_agg_fields(config).values()
     )
 
 
@@ -680,14 +679,10 @@ def _predicate_mask(arr: np.ndarray, f: dict) -> np.ndarray:
     column = f.get("column")
     if arr.ndim > 1:
         if column is None:
-            raise ValueError(
-                f"filter on '{f['dataset']}': N-D array requires an integer 'column'"
-            )
+            raise ValueError(f"filter on '{f['dataset']}': N-D array requires an integer 'column'")
         arr = arr[:, column]
     elif column is not None:
-        raise ValueError(
-            f"filter on '{f['dataset']}': 'column' set but array is 1-D"
-        )
+        raise ValueError(f"filter on '{f['dataset']}': 'column' set but array is 1-D")
 
     op = f["op"]
     if op == "in":
@@ -701,9 +696,7 @@ def _predicate_mask(arr: np.ndarray, f: dict) -> np.ndarray:
     return mask
 
 
-def _read_group(
-    h5obj, group: str, data_source: dict, shard_key: int, grid, arrow: bool = False
-):
+def _read_group(h5obj, group: str, data_source: dict, shard_key: int, grid, arrow: bool = False):
     """Read and spatially filter one HDF5 group.
 
     Returns a ``pandas.DataFrame`` (default) or, when ``arrow=True``, a
@@ -789,7 +782,12 @@ def _read_group(
     # over the already-read variable columns (forfeits pushdown, issue #43).
     for f in expressions:
         cols = {c: data_dict[c] for c in variables if c in data_dict}
-        emask = evaluate_filter_expression(f["expression"], cols)
+        try:
+            emask = evaluate_filter_expression(f["expression"], cols)
+        except NameError as e:
+            raise NameError(
+                f"expression filter {f['expression']!r} references an undefined name: {e}"
+            ) from e
         if emask.shape != data_dict["leaf_id"].shape:
             raise ValueError(
                 f"expression filter {f['expression']!r} must yield a per-row "
