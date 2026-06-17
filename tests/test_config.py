@@ -112,11 +112,12 @@ class TestATL03Template:
             assert "expression" not in meta  # scalar-only; non-scalar is #29
             resolve_function(meta["function"])  # raises on failure
 
-    def test_confidence_filter_drops_noise(self, atl03_config):
+    def test_confidence_filter_drops_tep(self, atl03_config):
         qf = atl03_config.data_source["quality_filter"]
-        assert qf["value"] == 0
-        assert qf["op"] == "ne"  # keep signal_conf_ph != 0 (flags 1-4)
-        assert qf["column"] == 0  # signal_conf_ph is 2-D; select land column
+        assert qf["value"] == -2
+        assert qf["op"] == "ne"  # keep signal_conf_ph != -2 (drop only TEP)
+        # no column selector: TEP filter is reduced across all surface types
+        assert "column" not in qf
         assert qf["dataset"].endswith("signal_conf_ph")
 
     def test_rectilinear_grid(self, atl03_config):

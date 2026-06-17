@@ -3,13 +3,15 @@
 # Scalar-only stats (non-scalar outputs are deferred to #29): per-cell density
 # (photon count), min/max elevation, mean and median height, and variance.
 #
-# Confidence filter keeps everything except the noise flag: signal_conf_ph != 0
-# (retains flags 1-4), per the ATL03 v3 data dictionary
+# Confidence filter drops only TEP (transmit-echo path) photons and keeps
+# everything else: signal_conf_ph != -2, per the ATL03 v3 data dictionary
 # (https://nsidc.org/sites/default/files/icesat2_atl03_data_dict_v003_0.pdf).
 #
-# signal_conf_ph is 2-D in ATL03 (n_photons x 5 surface types); this template
-# selects the land column (index 0) via quality_filter.column. Grid is
-# rectilinear (HEALPix order-19, the ~10 m match, waits on mortie #35).
+# signal_conf_ph is 2-D in ATL03 (n_photons x 5 surface types). TEP photons are
+# flagged -2 across every surface type, so with no column selector the != -2
+# filter is reduced across all columns (a photon is dropped only when it is TEP
+# for all surface types). Grid is rectilinear (HEALPix order-19, the ~10 m
+# match, waits on mortie #35).
 data_source:
   reader: h5coro
   driver: s3
@@ -21,9 +23,8 @@ data_source:
     h_ph: "/{group}/heights/h_ph"
   quality_filter:
     dataset: "/{group}/heights/signal_conf_ph"
-    value: 0
+    value: -2                      # TEP flag; reduced across all surface types
     op: ne
-    column: 0                      # land surface_type (signal_conf_ph is 2-D)
 
 aggregation:
   variables:

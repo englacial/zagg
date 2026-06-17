@@ -675,18 +675,30 @@ class TestQualityMask:
         mask_col1 = _quality_mask(q_flag, {"value": 0, "op": "ne", "column": 1})
         np.testing.assert_array_equal(mask_col1, [True, False, True])
 
-    def test_2d_without_column_raises(self):
-        q_flag = np.zeros((3, 5), dtype=np.int8)
-        with pytest.raises(ValueError, match="requires a 'column'"):
-            _quality_mask(q_flag, {"value": 0, "op": "ne"})
+    def test_2d_ne_reduces_across_surface_types(self):
+        # ATL03 TEP filter: signal_conf_ph == -2 across every surface type marks a
+        # TEP photon. With no column selector, != -2 keeps a photon if ANY surface
+        # type is non-TEP, dropping only all-column (true TEP) photons.
+        q_flag = np.array(
+            [[-2, -2, -2], [4, 4, 4], [-2, 3, -2]],  # TEP / signal / mixed
+            dtype=np.int8,
+        )
+        mask = _quality_mask(q_flag, {"value": -2, "op": "ne"})
+        np.testing.assert_array_equal(mask, [False, True, True])
+
+    def test_2d_eq_reduces_across_surface_types(self):
+        # eq with no column keeps a photon if ANY surface type matches value.
+        q_flag = np.array([[0, 1], [2, 3], [1, 0]], dtype=np.int8)
+        mask = _quality_mask(q_flag, {"value": 0, "op": "eq"})
+        np.testing.assert_array_equal(mask, [True, False, True])
 
     def test_column_on_1d_raises(self):
         with pytest.raises(ValueError, match="only valid for a 2-D flag"):
             _quality_mask(np.array([0, 1]), {"value": 0, "column": 0})
 
     def test_atl03_template_filter_runs(self):
-        # The shipped template's quality_filter must apply cleanly to a 2-D flag.
+        # The shipped template drops only TEP (-2) across all surface types.
         qf = default_config("atl03").data_source["quality_filter"]
-        q_flag = np.array([[0, 1], [1, 0], [4, 0]], dtype=np.int8)
+        q_flag = np.array([[-2, -2], [1, 4], [-2, 0]], dtype=np.int8)
         mask = _quality_mask(q_flag, qf)
         np.testing.assert_array_equal(mask, [False, True, True])

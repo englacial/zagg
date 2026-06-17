@@ -497,15 +497,19 @@ def _quality_mask(q_flag: np.ndarray, quality_filter: dict) -> np.ndarray:
       ``signal_conf_ph != 0``, dropping only the noise flag).
 
     When ``q_flag`` is 2-D (e.g. ATL03 ``signal_conf_ph`` is ``(n_photons,
-    n_surface_types)``), ``quality_filter["column"]`` selects the surface-type
-    column to compare (e.g. ``0`` for land); it is required in that case and
-    must not be set for a 1-D flag.
+    n_surface_types)``), the comparison is reduced **across all surface-type
+    columns** rather than keying on one column: a photon's flag matches a given
+    surface type if any column matches. This is what the ATL03 template needs to
+    drop TEP photons (``signal_conf_ph == -2``, set across every surface type)
+    while keeping everything else. Optionally ``quality_filter["column"]``
+    restricts the comparison to a single surface-type column (e.g. ``0`` for
+    land); it must not be set for a 1-D flag.
 
     Parameters
     ----------
     q_flag : np.ndarray
-        Quality-flag values for the candidate rows (1-D, or 2-D with a
-        ``column`` selector).
+        Quality-flag values for the candidate rows (1-D, or 2-D reduced across
+        surface-type columns).
     quality_filter : dict
         Filter spec with ``value``, optional ``op``, and optional ``column``.
 
@@ -517,27 +521,30 @@ def _quality_mask(q_flag: np.ndarray, quality_filter: dict) -> np.ndarray:
     Raises
     ------
     ValueError
-        If ``op`` is not ``"eq"``/``"ne"``, or if the flag dimensionality and
-        the ``column`` selector disagree.
+        If ``op`` is not ``"eq"``/``"ne"``, or if ``column`` is set on a 1-D flag.
     """
     column = quality_filter.get("column")
-    if q_flag.ndim == 2:
-        if column is None:
-            raise ValueError(
-                "quality_filter on a 2-D flag requires a 'column' index "
-                f"(got shape {q_flag.shape})"
-            )
+    if q_flag.ndim == 2 and column is not None:
         q_flag = q_flag[:, column]
-    elif column is not None:
+    elif q_flag.ndim != 2 and column is not None:
         raise ValueError("quality_filter 'column' is only valid for a 2-D flag")
 
     value = quality_filter["value"]
     op = quality_filter.get("op", "eq")
     if op == "eq":
-        return q_flag == value
-    if op == "ne":
-        return q_flag != value
-    raise ValueError(f"Unknown quality_filter op '{op}' (expected 'eq' or 'ne')")
+        match = q_flag == value
+    elif op == "ne":
+        match = q_flag != value
+    else:
+        raise ValueError(f"Unknown quality_filter op '{op}' (expected 'eq' or 'ne')")
+
+    # 2-D flag with no column selector: reduce across surface-type columns. ``ne``
+    # keeps a photon if any surface type is non-matching (drops only all-column
+    # matches, e.g. TEP photons flagged -2 across every surface type); ``eq``
+    # keeps a photon if any surface type matches.
+    if match.ndim == 2:
+        return match.any(axis=1)
+    return match
 
 
 def _read_group(
