@@ -12,6 +12,7 @@ from zagg.processing import (
     _build_groups,
     _build_output,
     _concat_and_group,
+    _expand_mask_to_base,
     _group_columns,
     _has_vector_fields,
     _iter_carrier_columns,
@@ -1281,3 +1282,170 @@ class TestReadGroupFilters:
         ds = self._data_source(filters=[{"expression": "undefined_col > 0"}])
         with pytest.raises(NameError, match="undefined name"):
             _read_group(h5, "gt1l", ds, 0, _ShardGrid())
+
+
+# ---------------------------------------------------------------------------
+# _expand_mask_to_base and cross-level filter path (issue #43, Phase B)
+# ---------------------------------------------------------------------------
+
+
+class TestExpandMaskToBase:
+    def test_single_parent_kept(self):
+        # 1 parent keeps base rows 0-2 (3 photons).
+        coarse = np.array([True])
+        ibeg = np.array([0])
+        cnt = np.array([3])
+        out = _expand_mask_to_base(coarse, ibeg, cnt, index_base=0, total_base_size=3)
+        np.testing.assert_array_equal(out, [True, True, True])
+
+    def test_single_parent_dropped(self):
+        coarse = np.array([False])
+        ibeg = np.array([0])
+        cnt = np.array([3])
+        out = _expand_mask_to_base(coarse, ibeg, cnt, index_base=0, total_base_size=3)
+        np.testing.assert_array_equal(out, [False, False, False])
+
+    def test_two_parents_alternating(self):
+        # parent 0 -> base rows 0-1 (kept); parent 1 -> base rows 2-4 (dropped).
+        coarse = np.array([True, False])
+        ibeg = np.array([0, 2])
+        cnt = np.array([2, 3])
+        out = _expand_mask_to_base(coarse, ibeg, cnt, index_base=0, total_base_size=5)
+        np.testing.assert_array_equal(out, [True, True, False, False, False])
+
+    def test_index_base_shift(self):
+        # HDF5 1-based indexing: index_beg values start at 1.
+        coarse = np.array([False, True])
+        ibeg = np.array([1, 4])  # 1-based
+        cnt = np.array([3, 2])
+        out = _expand_mask_to_base(coarse, ibeg, cnt, index_base=1, total_base_size=5)
+        # parent1 covers base rows 3 and 4 (ibeg=4-1=3, cnt=2).
+        np.testing.assert_array_equal(out, [False, False, False, True, True])
+
+    def test_empty_coarse_mask(self):
+        coarse = np.array([False, False, False])
+        ibeg = np.array([0, 2, 5])
+        cnt = np.array([2, 3, 1])
+        out = _expand_mask_to_base(coarse, ibeg, cnt, index_base=0, total_base_size=6)
+        assert not np.any(out)
+
+    def test_full_coarse_mask(self):
+        coarse = np.array([True, True])
+        ibeg = np.array([0, 3])
+        cnt = np.array([3, 2])
+        out = _expand_mask_to_base(coarse, ibeg, cnt, index_base=0, total_base_size=5)
+        assert np.all(out)
+
+
+class TestReadGroupCrossLevel:
+    """Phase B: cross-level filters expand coarse verdicts to base-rate rows."""
+
+    def _data_source_with_levels(self, coarse_filter_value=None):
+        """Two-level data source: 'segments' -> 'photons' via link arrays."""
+        ds = {
+            "coordinates": {"latitude": "/lat", "longitude": "/lon"},
+            "variables": {"h": "/h"},
+            "base_level": "photons",
+            "levels": {
+                "photons": {
+                    "path": "/heights",
+                    "coordinates": ["lat", "lon"],
+                    "variables": ["h"],
+                    "link": None,
+                },
+                "segments": {
+                    "path": "/geolocation",
+                    "coordinates": [],
+                    "variables": ["signal_conf_ph"],
+                    "link": {
+                        "to": "photons",
+                        "index_beg": "/ph_index_beg",
+                        "count": "/segment_ph_cnt",
+                    },
+                },
+            },
+        }
+        if coarse_filter_value is not None:
+            ds["filters"] = [
+                {
+                    "dataset": "/conf",
+                    "op": "ne",
+                    "value": coarse_filter_value,
+                    "level": "segments",
+                }
+            ]
+        return ds
+
+    def test_coarse_filter_expands_to_base(self):
+        # 3 segments, each covering 2 photons (6 total).
+        # segment1 (conf=-2) -> drop; segment0 and segment2 -> keep.
+        h5 = _FakeH5(
+            {
+                "/lat": np.arange(6.0),
+                "/lon": np.arange(6.0),
+                "/h": np.arange(6.0, dtype=np.float32),
+                # link arrays: segment0->ph[0:2], segment1->ph[2:4], segment2->ph[4:6]
+                "/ph_index_beg": np.array([0, 2, 4]),
+                "/segment_ph_cnt": np.array([2, 2, 2]),
+                # coarse flag: segment1 has conf=-2, others conf=4
+                "/conf": np.array([4, -2, 4]),
+            }
+        )
+        ds = self._data_source_with_levels(coarse_filter_value=-2)
+        df = _read_group(h5, "gt1l", ds, 0, _ShardGrid())
+        # Segments 0 and 2 survive; their photons are h[0:2] and h[4:6].
+        assert df["h"].tolist() == [0.0, 1.0, 4.0, 5.0]
+
+    def test_all_segments_filtered_returns_none(self):
+        h5 = _FakeH5(
+            {
+                "/lat": np.arange(4.0),
+                "/lon": np.arange(4.0),
+                "/h": np.arange(4.0, dtype=np.float32),
+                "/ph_index_beg": np.array([0, 2]),
+                "/segment_ph_cnt": np.array([2, 2]),
+                "/conf": np.array([-2, -2]),  # both segments dropped
+            }
+        )
+        ds = self._data_source_with_levels(coarse_filter_value=-2)
+        assert _read_group(h5, "gt1l", ds, 0, _ShardGrid()) is None
+
+    def test_cross_level_and_base_level_filters_anded(self):
+        # Cross-level keeps segments 0 and 2 (photons 0-1 and 4-5);
+        # base-level h>1 further drops photon 0 and photon 4.
+        h5 = _FakeH5(
+            {
+                "/lat": np.arange(6.0),
+                "/lon": np.arange(6.0),
+                "/h": np.array([0.0, 1.5, 2.0, 2.5, 3.0, 4.0], dtype=np.float32),
+                "/ph_index_beg": np.array([0, 2, 4]),
+                "/segment_ph_cnt": np.array([2, 2, 2]),
+                "/conf": np.array([4, -2, 4]),
+                "/qs": np.array([0, 0, 1, 0, 0, 0]),  # base-level flag
+            }
+        )
+        ds = self._data_source_with_levels(coarse_filter_value=-2)
+        # Add a base-level structured filter alongside the coarse one.
+        ds["filters"].append({"dataset": "/qs", "op": "eq", "value": 0})
+        df = _read_group(h5, "gt1l", ds, 0, _ShardGrid())
+        # Cross-level: keep ph0,1,4,5; base-level drops ph2 (qs==1 after reindex).
+        # Expected survivors among ph0,1,4,5: qs[0]=0,qs[1]=0,qs[4]=0,qs[5]=0 -> all 4
+        assert df["h"].tolist() == [0.0, 1.5, 3.0, 4.0]
+
+    def test_flat_form_unchanged(self):
+        # No levels/base_level -> flat path still works.
+        h5 = _FakeH5(
+            {
+                "/lat": np.arange(3.0),
+                "/lon": np.arange(3.0),
+                "/h": np.array([1.0, 2.0, 3.0], dtype=np.float32),
+                "/qs": np.array([0, 1, 0]),
+            }
+        )
+        ds = {
+            "coordinates": {"latitude": "/lat", "longitude": "/lon"},
+            "variables": {"h": "/h"},
+            "quality_filter": {"dataset": "/qs", "value": 0},
+        }
+        df = _read_group(h5, "gt1l", ds, 0, _ShardGrid())
+        assert df["h"].tolist() == [1.0, 3.0]

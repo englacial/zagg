@@ -668,6 +668,47 @@ _COMPARE = {
 }
 
 
+def _expand_mask_to_base(
+    coarse_mask: np.ndarray,
+    index_beg_arr: np.ndarray,
+    count_arr: np.ndarray,
+    index_base: int,
+    total_base_size: int,
+) -> np.ndarray:
+    """Expand a coarse-rate boolean mask to a base-rate boolean mask (issue #43, Phase B).
+
+    Each coarse parent ``p`` covers base-rate rows
+    ``index_beg_arr[p] - index_base, ..., index_beg_arr[p] - index_base + count_arr[p] - 1``.
+    The contiguity assumption: ranges do not overlap and together tile the full base array.
+
+    Parameters
+    ----------
+    coarse_mask : np.ndarray
+        1-D boolean array of length ``n_parents``.
+    index_beg_arr : np.ndarray
+        Per-parent start index into the base array (before ``index_base`` shift).
+    count_arr : np.ndarray
+        Per-parent child count (number of base-rate rows this parent covers).
+    index_base : int
+        Subtracted from ``index_beg_arr`` to get 0-based base indices.
+    total_base_size : int
+        Length of the output base-rate array.
+
+    Returns
+    -------
+    np.ndarray
+        1-D boolean array of length ``total_base_size``.
+    """
+    out = np.zeros(total_base_size, dtype=bool)
+    for p, keep in enumerate(coarse_mask):
+        if not keep:
+            continue
+        beg = int(index_beg_arr[p]) - index_base
+        cnt = int(count_arr[p])
+        out[beg : beg + cnt] = True
+    return out
+
+
 def _predicate_mask(arr: np.ndarray, f: dict) -> np.ndarray:
     """Build a 1-D boolean keep-mask for one structured predicate (issue #43).
 
@@ -702,11 +743,33 @@ def _read_group(h5obj, group: str, data_source: dict, shard_key: int, grid, arro
     Returns a ``pandas.DataFrame`` (default) or, when ``arrow=True``, a
     ``pyarrow.Table`` carrying the identical columns. Returns ``None`` when the
     group has no observations in this shard.
+
+    Supports two modes (issue #43, Phase B):
+
+    *Flat* (no ``levels``/``base_level`` in ``data_source``): unchanged from Phase A —
+    all structured filters are applied directly to base-rate data.
+
+    *Hierarchical* (``levels`` + ``base_level`` present): structured filters whose
+    normalized ``level`` key names a non-base level are applied at coarse rate, then
+    expanded to base-rate via the level's ``link`` arrays (``_expand_mask_to_base``).
+    Base-level structured filters and expression filters are unchanged.
     """
     coordinates = data_source["coordinates"]
     variables = data_source["variables"]
     filters = filters_from_data_source(data_source)
-    structured = [f for f in filters if "expression" not in f]
+    base_level_key = data_source.get("base_level")
+    levels = data_source.get("levels")
+    # Partition filters: base-level structured, coarse-level structured, expressions.
+    base_structured = [
+        f
+        for f in filters
+        if "expression" not in f and (f.get("level") is None or f.get("level") == base_level_key)
+    ]
+    coarse_structured = [
+        f
+        for f in filters
+        if "expression" not in f and f.get("level") is not None and f.get("level") != base_level_key
+    ]
     expressions = [f for f in filters if "expression" in f]
 
     # Resolve coordinate paths
@@ -733,7 +796,40 @@ def _read_group(h5obj, group: str, data_source: dict, shard_key: int, grid, arro
     min_idx = int(indices[0])
     max_idx = int(indices[-1]) + 1
 
-    # Build hyperslice dataset list: variables + any structured-filter flag arrays.
+    # --- Coarse-level filter expansion (Phase B) ---
+    # For each filter whose level is not the base level, read the coarse-rate
+    # flag array from the declared level path, build a coarse mask, then expand
+    # to base-rate via the level link arrays.  AND the results into ``cross_mask``.
+    cross_mask: np.ndarray | None = None
+    if coarse_structured and levels is not None:
+        for f in coarse_structured:
+            level_key = f["level"]
+            lvl = levels[level_key]
+            flag_path = f["dataset"].format(group=group)
+            # Read the coarse flag array (full level, no hyperslice — we need all parents
+            # to align with link arrays which are also full-length).
+            coarse_data = h5obj.readDatasets([{"dataset": flag_path}])
+            coarse_arr = coarse_data[flag_path]
+            coarse_fmask = _predicate_mask(coarse_arr, f)
+            # Read the link arrays from this level.
+            link = lvl["link"]
+            index_base = int(link.get("index_base", 0))
+            ibeg_path = link["index_beg"].format(group=group)
+            cnt_path = link["count"].format(group=group)
+            link_data = h5obj.readDatasets(
+                [
+                    {"dataset": ibeg_path},
+                    {"dataset": cnt_path},
+                ]
+            )
+            ibeg_arr = link_data[ibeg_path]
+            cnt_arr = link_data[cnt_path]
+            expanded = _expand_mask_to_base(coarse_fmask, ibeg_arr, cnt_arr, index_base, len(lats))
+            cross_mask = expanded if cross_mask is None else (cross_mask & expanded)
+        if cross_mask is not None and np.sum(cross_mask[min_idx:max_idx]) == 0:
+            return None
+
+    # Build hyperslice dataset list: variables + any base-level structured-filter arrays.
     # Read each distinct path once; flag datasets may coincide with a variable.
     datasets = []
     paths_seen = set()
@@ -742,7 +838,7 @@ def _read_group(h5obj, group: str, data_source: dict, shard_key: int, grid, arro
         if path not in paths_seen:
             datasets.append({"dataset": path, "hyperslice": [(min_idx, max_idx)]})
             paths_seen.add(path)
-    filter_paths = {id(f): f["dataset"].format(group=group) for f in structured}
+    filter_paths = {id(f): f["dataset"].format(group=group) for f in base_structured}
     for path in filter_paths.values():
         if path not in paths_seen:
             datasets.append({"dataset": path, "hyperslice": [(min_idx, max_idx)]})
@@ -753,14 +849,18 @@ def _read_group(h5obj, group: str, data_source: dict, shard_key: int, grid, arro
     # Apply spatial mask to sliced data
     mask_sliced = mask_spatial[min_idx:max_idx]
 
-    # Combine structured predicates as ANDed keep-masks (issue #43). A single
-    # base-level ``op: eq`` filter (the ATL06 quality_filter sugar) reproduces the
-    # former path byte-for-byte.
+    # Combine base-level structured predicates as ANDed keep-masks (issue #43).
     keep_mask = None
-    for f in structured:
+    for f in base_structured:
         flag = data[filter_paths[id(f)]][mask_sliced]
         fmask = _predicate_mask(flag, f)
         keep_mask = fmask if keep_mask is None else (keep_mask & fmask)
+
+    # AND in the cross-level expanded mask, aligned to the sliced window.
+    if cross_mask is not None:
+        cross_sliced = cross_mask[min_idx:max_idx][mask_sliced]
+        keep_mask = cross_sliced if keep_mask is None else (keep_mask & cross_sliced)
+
     if keep_mask is not None and np.sum(keep_mask) == 0:
         return None
 
