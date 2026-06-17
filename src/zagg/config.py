@@ -347,7 +347,7 @@ def _validate_output_kind(name: str, meta: dict) -> None:
         )
     if "inner_shape" not in meta:
         raise ValueError(f"Variable '{name}': kind 'ragged' requires 'inner_shape'")
-    _validate_trailing_shape(name, meta["inner_shape"])
+    _validate_trailing_shape(name, meta["inner_shape"], key_name="inner_shape")
 
     # Same restriction as vector: ``len``/``count`` produce a scalar count.
     if meta.get("function") in ("len", "count"):
@@ -357,23 +357,23 @@ def _validate_output_kind(name: str, meta: dict) -> None:
         )
 
 
-def _validate_trailing_shape(name: str, trailing_shape) -> None:
-    """Check a vector field's trailing_shape is a tuple of positive ints."""
+def _validate_trailing_shape(name: str, trailing_shape, key_name: str = "trailing_shape") -> None:
+    """Check a shape field (trailing_shape or inner_shape) is a tuple of positive ints."""
     if isinstance(trailing_shape, int):
         dims: tuple = (trailing_shape,)
     elif isinstance(trailing_shape, (list, tuple)):
         dims = tuple(trailing_shape)
     else:
         raise ValueError(
-            f"Variable '{name}': 'trailing_shape' must be an int or a "
+            f"Variable '{name}': '{key_name}' must be an int or a "
             f"sequence of ints (got {trailing_shape!r})"
         )
     if not dims:
-        raise ValueError(f"Variable '{name}': 'trailing_shape' must have at least one dimension")
+        raise ValueError(f"Variable '{name}': '{key_name}' must have at least one dimension")
     for dim in dims:
         if not isinstance(dim, int) or isinstance(dim, bool) or dim < 1:
             raise ValueError(
-                f"Variable '{name}': 'trailing_shape' entries must be positive "
+                f"Variable '{name}': '{key_name}' entries must be positive "
                 f"integers (got {dim!r})"
             )
 
