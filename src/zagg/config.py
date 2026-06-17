@@ -271,19 +271,20 @@ def validate_config(config: PipelineConfig) -> None:
         _validate_output_kind(name, meta)
 
 
-# Recognized per-field output kinds. ``ragged`` (CSR) is Tier 2 and not yet
-# accepted; see issue #29.
-OUTPUT_KINDS = ("scalar", "vector")
+# Recognized per-field output kinds. ``ragged`` (CSR) is the Tier-2 carrier
+# for variable-length per-cell outputs; see issue #48.
+OUTPUT_KINDS = ("scalar", "vector", "ragged")
 
 
 def _validate_output_kind(name: str, meta: dict) -> None:
     """Validate a variable's non-scalar output declaration.
 
-    A field may declare ``kind`` (``scalar`` default, or ``vector``) and
-    ``trailing_shape`` (required for ``vector``). ``scalar`` fields need
-    neither and stay the default path. A ``vector`` field may be driven by
-    either ``function`` or ``expression``; ``len``/``count`` are rejected for
-    ``vector`` (they short-circuit to a scalar count). See issue #29.
+    A field may declare ``kind`` (``scalar`` default, ``vector``, or ``ragged``)
+    and a shape key (``trailing_shape`` for ``vector``, ``inner_shape`` for
+    ``ragged``). ``scalar`` fields need neither and stay the default path.
+    ``vector`` and ``ragged`` fields may be driven by either ``function`` or
+    ``expression``; ``len``/``count`` are rejected for both (they short-circuit
+    to a scalar count). See issue #29 (vector) and issue #48 (ragged/CSR).
 
     Parameters
     ----------
@@ -302,7 +303,7 @@ def _validate_output_kind(name: str, meta: dict) -> None:
         allowed = ", ".join(OUTPUT_KINDS)
         raise ValueError(
             f"Variable '{name}': output kind '{kind}' is not supported "
-            f"(allowed: {allowed}; 'ragged' is planned but not yet implemented)"
+            f"(allowed: {allowed})"
         )
 
     # dtype, when declared, must name a real numpy dtype (applies to all kinds).
@@ -323,18 +324,36 @@ def _validate_output_kind(name: str, meta: dict) -> None:
             )
         return
 
-    # kind == "vector": trailing_shape is required and must be positive ints.
-    if not has_trailing:
-        raise ValueError(f"Variable '{name}': kind 'vector' requires 'trailing_shape'")
-    _validate_trailing_shape(name, meta["trailing_shape"])
+    if kind == "vector":
+        # trailing_shape is required and must be positive ints.
+        if not has_trailing:
+            raise ValueError(f"Variable '{name}': kind 'vector' requires 'trailing_shape'")
+        _validate_trailing_shape(name, meta["trailing_shape"])
 
-    # ``len``/``count`` short-circuit to a scalar obs count in
-    # ``calculate_cell_statistics``; pairing them with kind 'vector' would
-    # silently emit a scalar, so reject the nonsensical combination.
+        # ``len``/``count`` short-circuit to a scalar obs count in
+        # ``calculate_cell_statistics``; pairing them with kind 'vector' would
+        # silently emit a scalar, so reject the nonsensical combination.
+        if meta.get("function") in ("len", "count"):
+            raise ValueError(
+                f"Variable '{name}': function {meta['function']!r} produces a scalar "
+                f"count and cannot be combined with kind 'vector'"
+            )
+        return
+
+    # kind == "ragged": inner_shape is required; trailing_shape is rejected.
+    if has_trailing:
+        raise ValueError(
+            f"Variable '{name}': 'trailing_shape' is only valid for 'vector', not 'ragged'"
+        )
+    if "inner_shape" not in meta:
+        raise ValueError(f"Variable '{name}': kind 'ragged' requires 'inner_shape'")
+    _validate_trailing_shape(name, meta["inner_shape"])
+
+    # Same restriction as vector: ``len``/``count`` produce a scalar count.
     if meta.get("function") in ("len", "count"):
         raise ValueError(
             f"Variable '{name}': function {meta['function']!r} produces a scalar "
-            f"count and cannot be combined with kind 'vector'"
+            f"count and cannot be combined with kind 'ragged'"
         )
 
 
@@ -701,10 +720,11 @@ def get_agg_fields(config: PipelineConfig) -> dict:
 def get_output_signature(meta: dict) -> dict:
     """Return the normalized non-scalar output signature for one agg field.
 
-    This is the single read point for a field's Option B declaration (issue
-    #29): its output ``kind``, the per-cell ``trailing_shape``, and ``dtype``.
-    Later phases (statistic eval, the per-shard container, and the grid
-    ``signature()``) consume this rather than re-parsing the raw metadata.
+    This is the single read point for a field's output declaration (issues
+    #29 and #48): its output ``kind``, the per-cell ``trailing_shape``,
+    ``inner_shape``, and ``dtype``. Later phases (statistic eval, the
+    per-shard container, and the grid ``signature()``) consume this rather
+    than re-parsing the raw metadata.
 
     Parameters
     ----------
@@ -715,19 +735,28 @@ def get_output_signature(meta: dict) -> dict:
     Returns
     -------
     dict
-        ``{"kind": str, "trailing_shape": tuple[int, ...], "dtype": str}``.
-        ``trailing_shape`` is ``()`` for scalar fields. ``dtype`` is the
-        declared dtype string, or ``None`` if unset.
+        ``{"kind": str, "trailing_shape": tuple, "inner_shape": tuple, "dtype": str}``.
+        ``trailing_shape`` is ``()`` for scalar and ragged fields.
+        ``inner_shape`` is ``()`` for scalar and vector fields; for ragged it
+        holds the per-element shape (e.g. ``(2,)`` for a centroid pair).
+        ``dtype`` is the declared dtype string, or ``None`` if unset.
     """
     kind = meta.get("kind", "scalar")
     if kind == "vector":
         ts = meta["trailing_shape"]
         trailing_shape = (ts,) if isinstance(ts, int) else tuple(ts)
+        inner_shape: tuple = ()
+    elif kind == "ragged":
+        trailing_shape = ()
+        rs = meta["inner_shape"]
+        inner_shape = (rs,) if isinstance(rs, int) else tuple(rs)
     else:
         trailing_shape = ()
+        inner_shape = ()
     return {
         "kind": kind,
         "trailing_shape": trailing_shape,
+        "inner_shape": inner_shape,
         "dtype": meta.get("dtype"),
     }
 
@@ -760,6 +789,7 @@ def output_field_signature(config: PipelineConfig) -> list[dict]:
                 "name": name,
                 "kind": sig["kind"],
                 "trailing_shape": list(sig["trailing_shape"]),
+                "inner_shape": list(sig["inner_shape"]),
                 "dtype": sig["dtype"],
             }
         )
