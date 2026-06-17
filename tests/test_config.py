@@ -21,6 +21,7 @@ from zagg.config import (
     get_store_path,
     load_config,
     load_config_from_dict,
+    output_field_signature,
     resolve_function,
     validate_config,
 )
@@ -859,9 +860,9 @@ class TestOutputKind:
         with pytest.raises(ValueError, match="output kind 'matrix' is not supported"):
             validate_config(cfg)
 
-    def test_ragged_not_yet_supported(self):
+    def test_ragged_requires_inner_shape(self):
         cfg = _vector_config({"function": "min", "kind": "ragged"})
-        with pytest.raises(ValueError, match="ragged.*not yet implemented"):
+        with pytest.raises(ValueError, match="requires 'inner_shape'"):
             validate_config(cfg)
 
     def test_vector_requires_trailing_shape(self):
@@ -949,17 +950,144 @@ class TestOutputKind:
 class TestGetOutputSignature:
     def test_scalar_signature(self):
         sig = get_output_signature({"function": "min", "dtype": "float32"})
-        assert sig == {"kind": "scalar", "trailing_shape": (), "dtype": "float32"}
+        assert sig == {"kind": "scalar", "trailing_shape": (), "inner_shape": (), "dtype": "float32"}
 
     def test_scalar_default_dtype_none(self):
         sig = get_output_signature({"function": "min"})
-        assert sig == {"kind": "scalar", "trailing_shape": (), "dtype": None}
+        assert sig == {"kind": "scalar", "trailing_shape": (), "inner_shape": (), "dtype": None}
 
     def test_vector_int_signature(self):
         sig = get_output_signature({"kind": "vector", "trailing_shape": 64, "dtype": "float32"})
-        assert sig == {"kind": "vector", "trailing_shape": (64,), "dtype": "float32"}
+        assert sig == {
+            "kind": "vector",
+            "trailing_shape": (64,),
+            "inner_shape": (),
+            "dtype": "float32",
+        }
 
     def test_vector_list_signature(self):
         sig = get_output_signature({"kind": "vector", "trailing_shape": [16, 2]})
         assert sig["kind"] == "vector"
         assert sig["trailing_shape"] == (16, 2)
+        assert sig["inner_shape"] == ()
+
+
+# ---------------------------------------------------------------------------
+# Ragged output kind (issue #48, phase 1)
+# ---------------------------------------------------------------------------
+
+
+def _ragged_cfg(inner_shape=None, **overrides):
+    """Build a minimal config with a single ragged agg variable."""
+    meta = {
+        "function": "mean",
+        "source": "h_ph",
+        "kind": "ragged",
+        **({"inner_shape": inner_shape} if inner_shape is not None else {}),
+        **overrides,
+    }
+    return PipelineConfig(
+        data_source={
+            "reader": "h5coro",
+            "groups": ["gt1l/heights"],
+            "coordinates": {
+                "latitude": "{group}/lat_ph",
+                "longitude": "{group}/lon_ph",
+            },
+            "variables": {"h_ph": "{group}/h_ph"},
+        },
+        aggregation={"coordinates": {}, "variables": {"h_ph_tdigest": meta}},
+        output={
+            "grid": {
+                "type": "healpix",
+                "child_order": 12,
+                "parent_order": 6,
+            }
+        },
+    )
+
+
+class TestRaggedKind:
+    def test_valid_ragged_validates(self):
+        """A ragged field with inner_shape declared validates without error."""
+        cfg = _ragged_cfg(inner_shape=[2])
+        validate_config(cfg)
+
+    def test_get_output_signature_ragged(self):
+        sig = get_output_signature({"kind": "ragged", "inner_shape": [2], "dtype": "float32"})
+        assert sig == {
+            "kind": "ragged",
+            "trailing_shape": (),
+            "inner_shape": (2,),
+            "dtype": "float32",
+        }
+
+    def test_ragged_inner_shape_int_normalized(self):
+        sig = get_output_signature({"kind": "ragged", "inner_shape": 3})
+        assert sig["inner_shape"] == (3,)
+
+    def test_inner_shape_required(self):
+        cfg = _ragged_cfg()  # no inner_shape
+        with pytest.raises(ValueError, match="requires 'inner_shape'"):
+            validate_config(cfg)
+
+    def test_inner_shape_must_be_positive(self):
+        cfg = _ragged_cfg(inner_shape=0)
+        with pytest.raises(ValueError, match="positive"):
+            validate_config(cfg)
+
+    def test_inner_shape_rejects_empty(self):
+        cfg = _ragged_cfg(inner_shape=[])
+        with pytest.raises(ValueError, match="at least one dimension"):
+            validate_config(cfg)
+
+    def test_inner_shape_rejects_non_int(self):
+        cfg = _ragged_cfg(inner_shape="2")
+        with pytest.raises(ValueError, match="int or a sequence of ints"):
+            validate_config(cfg)
+
+    def test_inner_shape_list_rejects_non_int_element(self):
+        cfg = _ragged_cfg(inner_shape=[2, "x"])
+        with pytest.raises(ValueError, match="positive"):
+            validate_config(cfg)
+
+    def test_trailing_shape_rejected_for_ragged(self):
+        cfg = _ragged_cfg(inner_shape=[2], trailing_shape=4)
+        with pytest.raises(ValueError, match="'trailing_shape' is only valid for 'vector', not 'ragged'"):
+            validate_config(cfg)
+
+    def test_len_rejected_for_ragged(self):
+        cfg = _ragged_cfg(inner_shape=[2], function="len")
+        with pytest.raises(ValueError, match="cannot be combined with kind 'ragged'"):
+            validate_config(cfg)
+
+    def test_count_rejected_for_ragged(self):
+        cfg = _ragged_cfg(inner_shape=[2], function="count")
+        with pytest.raises(ValueError, match="cannot be combined with kind 'ragged'"):
+            validate_config(cfg)
+
+    def test_scalar_inner_shape_empty(self):
+        """Scalar fields still return inner_shape=() from get_output_signature."""
+        sig = get_output_signature({"function": "min", "dtype": "float32"})
+        assert sig["inner_shape"] == ()
+
+    def test_vector_inner_shape_empty(self):
+        """Vector fields still return inner_shape=() from get_output_signature."""
+        sig = get_output_signature({"kind": "vector", "trailing_shape": 4, "dtype": "float32"})
+        assert sig["inner_shape"] == ()
+
+    def test_output_field_signature_ragged_includes_inner_shape(self):
+        cfg = _ragged_cfg(inner_shape=[2], function="mean")
+        entries = output_field_signature(cfg)
+        assert len(entries) == 1
+        entry = entries[0]
+        assert entry["name"] == "h_ph_tdigest"
+        assert entry["kind"] == "ragged"
+        assert entry["inner_shape"] == [2]
+        assert entry["trailing_shape"] == []
+
+    def test_output_field_signature_scalar_inner_shape_empty(self, atl06_config):
+        """Scalar fields get inner_shape: [] in output_field_signature (backward compat)."""
+        entries = output_field_signature(atl06_config)
+        for e in entries:
+            assert e["inner_shape"] == [], f"{e['name']!r} has non-empty inner_shape"

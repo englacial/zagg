@@ -281,9 +281,9 @@ class TestOutputFieldSignature:
         assert "output_fields" in sig
         names = {f["name"] for f in sig["output_fields"]}
         assert "count" in names
-        # Each entry carries the Option-B keys.
+        # Each entry carries the Option-B keys (inner_shape added in issue #48).
         for f in sig["output_fields"]:
-            assert set(f) == {"name", "kind", "trailing_shape", "dtype"}
+            assert set(f) == {"name", "kind", "trailing_shape", "inner_shape", "dtype"}
 
     def test_signature_marks_vector_field(self):
         g = HealpixGrid(
