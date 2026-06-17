@@ -19,6 +19,8 @@ from zarr.abc.store import Store
 from zagg.config import (
     PipelineConfig,
     default_config,
+    evaluate_filter_expression,
+    filters_from_data_source,
     get_agg_fields,
     get_data_vars,
     get_output_signature,
@@ -657,6 +659,48 @@ def _kernel_aggregate(
 # -- end EXPERIMENTAL kernel path ---------------------------------------------
 
 
+_COMPARE = {
+    "eq": np.equal,
+    "ne": np.not_equal,
+    "ge": np.greater_equal,
+    "le": np.less_equal,
+    "lt": np.less,
+    "gt": np.greater,
+}
+
+
+def _predicate_mask(arr: np.ndarray, f: dict) -> np.ndarray:
+    """Build a 1-D boolean keep-mask for one structured predicate (issue #43).
+
+    ``f`` is a normalized structured filter (see :func:`zagg.config.get_filters`):
+    ``{op, column, value|values, keep}``. An integer ``column`` selects a column
+    from a 2-D flag array before comparing; it is required for N-D arrays and
+    rejected for 1-D arrays. ``keep: false`` inverts the result (drop matches).
+    """
+    column = f.get("column")
+    if arr.ndim > 1:
+        if column is None:
+            raise ValueError(
+                f"filter on '{f['dataset']}': N-D array requires an integer 'column'"
+            )
+        arr = arr[:, column]
+    elif column is not None:
+        raise ValueError(
+            f"filter on '{f['dataset']}': 'column' set but array is 1-D"
+        )
+
+    op = f["op"]
+    if op == "in":
+        mask = np.isin(arr, f["values"])
+    elif op == "not_in":
+        mask = ~np.isin(arr, f["values"])
+    else:
+        mask = _COMPARE[op](arr, f["value"])
+    if not f.get("keep", True):
+        mask = ~mask
+    return mask
+
+
 def _read_group(
     h5obj, group: str, data_source: dict, shard_key: int, grid, arrow: bool = False
 ):
@@ -668,7 +712,9 @@ def _read_group(
     """
     coordinates = data_source["coordinates"]
     variables = data_source["variables"]
-    quality_filter = data_source.get("quality_filter")
+    filters = filters_from_data_source(data_source)
+    structured = [f for f in filters if "expression" not in f]
+    expressions = [f for f in filters if "expression" in f]
 
     # Resolve coordinate paths
     coord_paths = [path.format(group=group) for path in coordinates.values()]
@@ -694,45 +740,64 @@ def _read_group(
     min_idx = int(indices[0])
     max_idx = int(indices[-1]) + 1
 
-    # Build hyperslice dataset list: variables + optional quality filter
+    # Build hyperslice dataset list: variables + any structured-filter flag arrays.
+    # Read each distinct path once; flag datasets may coincide with a variable.
     datasets = []
-    for path_template in variables.values():
-        path = path_template.format(group=group)
-        datasets.append({"dataset": path, "hyperslice": [(min_idx, max_idx)]})
-
-    if quality_filter is not None:
-        qf_path = quality_filter["dataset"].format(group=group)
-        datasets.append({"dataset": qf_path, "hyperslice": [(min_idx, max_idx)]})
+    paths_seen = set()
+    var_paths = {col: tmpl.format(group=group) for col, tmpl in variables.items()}
+    for path in var_paths.values():
+        if path not in paths_seen:
+            datasets.append({"dataset": path, "hyperslice": [(min_idx, max_idx)]})
+            paths_seen.add(path)
+    filter_paths = {id(f): f["dataset"].format(group=group) for f in structured}
+    for path in filter_paths.values():
+        if path not in paths_seen:
+            datasets.append({"dataset": path, "hyperslice": [(min_idx, max_idx)]})
+            paths_seen.add(path)
 
     data = h5obj.readDatasets(datasets)
 
     # Apply spatial mask to sliced data
     mask_sliced = mask_spatial[min_idx:max_idx]
 
-    # Apply quality filter if configured
-    if quality_filter is not None:
-        qf_path = quality_filter["dataset"].format(group=group)
-        q_flag = data[qf_path][mask_sliced]
-        quality_mask = q_flag == quality_filter["value"]
-        if np.sum(quality_mask) == 0:
-            return None
-    else:
-        quality_mask = None
+    # Combine structured predicates as ANDed keep-masks (issue #43). A single
+    # base-level ``op: eq`` filter (the ATL06 quality_filter sugar) reproduces the
+    # former path byte-for-byte.
+    keep_mask = None
+    for f in structured:
+        flag = data[filter_paths[id(f)]][mask_sliced]
+        fmask = _predicate_mask(flag, f)
+        keep_mask = fmask if keep_mask is None else (keep_mask & fmask)
+    if keep_mask is not None and np.sum(keep_mask) == 0:
+        return None
 
-    # Build dataframe
+    # Build dataframe (variables sliced to spatial mask, then to the keep-mask)
     leaf_sliced = leaf_ids[min_idx:max_idx][mask_sliced]
     data_dict = {}
-    for col_name, path_template in variables.items():
-        path = path_template.format(group=group)
+    for col_name, path in var_paths.items():
         values = data[path][mask_sliced]
-        if quality_mask is not None:
-            values = values[quality_mask]
+        if keep_mask is not None:
+            values = values[keep_mask]
         data_dict[col_name] = values
 
-    if quality_mask is not None:
-        data_dict["leaf_id"] = leaf_sliced[quality_mask]
+    if keep_mask is not None:
+        data_dict["leaf_id"] = leaf_sliced[keep_mask]
     else:
         data_dict["leaf_id"] = leaf_sliced
+
+    # Base-level ``expression`` filters: aggregation-time escape hatch, evaluated
+    # over the already-read variable columns (forfeits pushdown, issue #43).
+    for f in expressions:
+        cols = {c: data_dict[c] for c in variables if c in data_dict}
+        emask = evaluate_filter_expression(f["expression"], cols)
+        if emask.shape != data_dict["leaf_id"].shape:
+            raise ValueError(
+                f"expression filter {f['expression']!r} must yield a per-row "
+                f"boolean mask (got shape {emask.shape})"
+            )
+        if np.sum(emask) == 0:
+            return None
+        data_dict = {k: v[emask] for k, v in data_dict.items()}
 
     if arrow:
         import pyarrow as pa

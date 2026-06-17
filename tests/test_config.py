@@ -14,6 +14,7 @@ from zagg.config import (
     get_child_order,
     get_coords,
     get_data_vars,
+    get_filters,
     get_output_signature,
     get_store_path,
     load_config,
@@ -247,6 +248,117 @@ class TestValidation:
             data_source={}, aggregation={"variables": {}}, output={"grid": {"type": "x"}}
         )
         with pytest.raises(ValueError, match="Missing required section"):
+            validate_config(cfg)
+
+
+# ---------------------------------------------------------------------------
+# Structured filters (issue #43, Phase A)
+# ---------------------------------------------------------------------------
+
+def _cfg_with_filters(filters=None, quality_filter=None):
+    """Minimal valid config with a custom data_source filter spec."""
+    ds = {"variables": {"h_li": "/{group}/h_li"}}
+    if filters is not None:
+        ds["filters"] = filters
+    if quality_filter is not None:
+        ds["quality_filter"] = quality_filter
+    return PipelineConfig(
+        data_source=ds,
+        aggregation={"variables": {
+            "h_min": {"function": "min", "source": "h_li", "dtype": "float32"},
+        }},
+        output={"grid": {"type": "healpix", "parent_order": 6, "child_order": 12}},
+    )
+
+
+class TestFilters:
+    def test_quality_filter_synthesizes_base_eq(self, atl06_config):
+        filters = get_filters(atl06_config)
+        assert len(filters) == 1
+        f = filters[0]
+        assert f["op"] == "eq"
+        assert f["level"] is None
+        assert f["column"] is None
+        assert f["keep"] is True
+        assert f["value"] == 0
+        assert f["dataset"].endswith("atl06_quality_summary")
+
+    def test_no_filters_returns_empty(self):
+        cfg = _cfg_with_filters()
+        assert get_filters(cfg) == []
+
+    def test_explicit_filters_override_quality_filter(self):
+        cfg = _cfg_with_filters(
+            filters=[{"dataset": "/{group}/conf", "column": 0, "op": "ne", "value": 0}],
+            quality_filter={"dataset": "/{group}/qs", "value": 0},
+        )
+        filters = get_filters(cfg)
+        assert len(filters) == 1
+        assert filters[0]["column"] == 0
+        assert filters[0]["op"] == "ne"
+
+    def test_normalize_set_op_keeps_values_list(self):
+        cfg = _cfg_with_filters(
+            filters=[{"dataset": "/d", "op": "in", "values": [2, 3, 4]}]
+        )
+        f = get_filters(cfg)[0]
+        assert f["values"] == [2, 3, 4]
+        assert "value" not in f
+
+    def test_normalize_keep_drop(self):
+        cfg = _cfg_with_filters(
+            filters=[{"dataset": "/d", "op": "eq", "value": 1, "keep": False}]
+        )
+        assert get_filters(cfg)[0]["keep"] is False
+
+    def test_expression_filter_normalized(self):
+        cfg = _cfg_with_filters(filters=[{"expression": "h_li > 0"}])
+        f = get_filters(cfg)[0]
+        assert f["expression"] == "h_li > 0"
+        assert f["level"] is None
+
+    def test_unknown_op_rejected(self):
+        cfg = _cfg_with_filters(filters=[{"dataset": "/d", "op": "between", "value": 1}])
+        with pytest.raises(ValueError, match="unknown op"):
+            validate_config(cfg)
+
+    def test_column_must_be_int(self):
+        cfg = _cfg_with_filters(
+            filters=[{"dataset": "/d", "column": "land", "op": "ne", "value": 0}]
+        )
+        with pytest.raises(ValueError, match="must be an integer"):
+            validate_config(cfg)
+
+    def test_set_op_requires_values_list(self):
+        cfg = _cfg_with_filters(filters=[{"dataset": "/d", "op": "in", "value": 3}])
+        with pytest.raises(ValueError, match="requires a 'values' list"):
+            validate_config(cfg)
+
+    def test_scalar_op_requires_value(self):
+        cfg = _cfg_with_filters(filters=[{"dataset": "/d", "op": "eq"}])
+        with pytest.raises(ValueError, match="requires a scalar 'value'"):
+            validate_config(cfg)
+
+    def test_bad_value_type_rejected(self):
+        cfg = _cfg_with_filters(filters=[{"dataset": "/d", "op": "eq", "value": "x"}])
+        with pytest.raises(ValueError, match="must be numeric"):
+            validate_config(cfg)
+
+    def test_missing_dataset_rejected(self):
+        cfg = _cfg_with_filters(filters=[{"op": "eq", "value": 0}])
+        with pytest.raises(ValueError, match="requires 'dataset'"):
+            validate_config(cfg)
+
+    def test_expression_with_level_rejected(self):
+        cfg = _cfg_with_filters(filters=[{"expression": "h_li > 0", "level": "segment"}])
+        with pytest.raises(ValueError, match="base-level only"):
+            validate_config(cfg)
+
+    def test_expression_with_op_rejected(self):
+        cfg = _cfg_with_filters(
+            filters=[{"expression": "h_li > 0", "op": "eq", "dataset": "/d"}]
+        )
+        with pytest.raises(ValueError, match="take no 'op'"):
             validate_config(cfg)
 
 
