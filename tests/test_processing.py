@@ -12,11 +12,14 @@ from zagg.processing import (
     _build_groups,
     _build_output,
     _concat_and_group,
+    _expand_mask_to_base,
     _group_columns,
     _has_vector_fields,
     _iter_carrier_columns,
     _kernel_able,
     _kernel_aggregate,
+    _predicate_mask,
+    _read_group,
     calculate_cell_statistics,
     process_shard,
     write_dataframe_to_zarr,
@@ -649,7 +652,7 @@ class TestProcessShardKernelBranch:
         monkeypatch.setattr("zagg.processing._read_group", fake_read_group)
         monkeypatch.setattr("zagg.processing.h5coro.H5Coro", lambda *a, **k: object())
         # Avoid resolving a real h5coro driver (s3driver import / creds plumbing).
-        monkeypatch.setattr("zagg.processing._make_url_rewriter", lambda driver: (lambda u: u))
+        monkeypatch.setattr("zagg.processing._make_url_rewriter", lambda driver: lambda u: u)
 
     def test_kernel_branch_matches_default_path(self, monkeypatch):
         """process_shard(handoff="arrow-kernel") agrees with the default path on the
@@ -782,7 +785,7 @@ class TestVectorCarrier:
                         "params": {"minlength": 3},
                     },
                 }
-            }
+            },
         )
 
     def test_has_vector_fields(self):
@@ -919,9 +922,7 @@ class TestVectorRoundTrip:
         }
         from zagg.config import PipelineConfig
 
-        return PipelineConfig(
-            data_source=cfg.data_source, aggregation=agg, output=cfg.output
-        )
+        return PipelineConfig(data_source=cfg.data_source, aggregation=agg, output=cfg.output)
 
     def test_vector_leaf_to_zarr_to_read(self):
         pytest.importorskip("pyarrow")
@@ -998,11 +999,461 @@ class TestVectorRoundTrip:
             dtype="float32",
             fill_value=np.float32("nan"),
         )
-        edges = pa.FixedSizeListArray.from_arrays(
-            pa.array(np.arange(8.0, dtype="float32")), 4
-        )
+        edges = pa.FixedSizeListArray.from_arrays(pa.array(np.arange(8.0, dtype="float32")), 4)
         table = pa.table({"edges": edges})
         with pytest.raises(ValueError, match="one whole chunk"):
-            write_dataframe_to_zarr(
-                table, store, grid=_OneChunkGrid(), chunk_idx=(0,)
-            )
+            write_dataframe_to_zarr(table, store, grid=_OneChunkGrid(), chunk_idx=(0,))
+
+
+# ---------------------------------------------------------------------------
+# Structured filters in the read path (issue #43, Phase A)
+# ---------------------------------------------------------------------------
+
+
+class _FakeH5:
+    """Stub h5coro object: ``readDatasets`` returns canned arrays by path.
+
+    Honors the ``hyperslice`` bound so sliced reads mirror the real driver.
+    """
+
+    def __init__(self, arrays):
+        self._arrays = arrays
+
+    def readDatasets(self, datasets):  # noqa: N802 (mirror real h5coro API)
+        out = {}
+        for d in datasets:
+            if isinstance(d, str):
+                out[d] = self._arrays[d]
+                continue
+            path = d["dataset"]
+            arr = self._arrays[path]
+            hs = d.get("hyperslice")
+            if hs is not None:
+                lo, hi = hs[0]
+                arr = arr[lo:hi]
+            out[path] = arr
+        return out
+
+
+class _ShardGrid:
+    """Grid stub: leaf id == row index; every row maps to ``shard_key`` 0,
+    so the spatial filter keeps all rows and the structured filters are
+    exercised in isolation."""
+
+    @staticmethod
+    def assign(lats, lons):
+        return np.arange(len(lats))
+
+    @staticmethod
+    def shards_of(leaf_ids):
+        return np.zeros(len(leaf_ids), dtype=int)
+
+
+class TestPredicateMask:
+    def test_scalar_ops_1d(self):
+        arr = np.array([0, 1, 2, 3, 0])
+        assert _predicate_mask(
+            arr, {"dataset": "/d", "op": "eq", "value": 0, "column": None}
+        ).tolist() == [True, False, False, False, True]
+        assert _predicate_mask(
+            arr, {"dataset": "/d", "op": "ge", "value": 2, "column": None}
+        ).tolist() == [False, False, True, True, False]
+
+    def test_set_ops(self):
+        arr = np.array([2, 3, 4, 5])
+        assert _predicate_mask(arr, {"dataset": "/d", "op": "in", "values": [2, 4]}).tolist() == [
+            True,
+            False,
+            True,
+            False,
+        ]
+        assert _predicate_mask(
+            arr, {"dataset": "/d", "op": "not_in", "values": [2, 4]}
+        ).tolist() == [False, True, False, True]
+
+    def test_keep_false_inverts(self):
+        arr = np.array([0, 1, 0])
+        assert _predicate_mask(
+            arr, {"dataset": "/d", "op": "eq", "value": 0, "keep": False}
+        ).tolist() == [False, True, False]
+
+    def test_nd_column_slicing(self):
+        # 2-D flag array (5 rows x 3 surface-type columns)
+        arr = np.array([[0, 9, 9], [-2, 9, 9], [1, 9, 9], [-2, 9, 9], [3, 9, 9]])
+        # signal_conf_ph-style: column 0, != -2
+        mask = _predicate_mask(arr, {"dataset": "/d", "column": 0, "op": "ne", "value": -2})
+        assert mask.tolist() == [True, False, True, False, True]
+
+    def test_nd_requires_column(self):
+        arr = np.zeros((3, 2))
+        with pytest.raises(ValueError, match="requires an integer 'column'"):
+            _predicate_mask(arr, {"dataset": "/d", "op": "eq", "value": 0})
+
+    def test_column_on_1d_rejected(self):
+        arr = np.zeros(3)
+        with pytest.raises(ValueError, match="array is 1-D"):
+            _predicate_mask(arr, {"dataset": "/d", "column": 0, "op": "eq", "value": 0})
+
+
+class TestReadGroupFilters:
+    def _data_source(self, **extra):
+        ds = {
+            "coordinates": {"latitude": "/lat", "longitude": "/lon"},
+            "variables": {"h": "/h"},
+        }
+        ds.update(extra)
+        return ds
+
+    def test_quality_filter_eq_path(self):
+        h5 = _FakeH5(
+            {
+                "/lat": np.array([1.0, 2.0, 3.0, 4.0]),
+                "/lon": np.array([1.0, 2.0, 3.0, 4.0]),
+                "/h": np.array([10.0, 20.0, 30.0, 40.0], dtype=np.float32),
+                "/qs": np.array([0, 1, 0, 1]),
+            }
+        )
+        ds = self._data_source(quality_filter={"dataset": "/qs", "value": 0})
+        df = _read_group(h5, "gt1l", ds, 0, _ShardGrid())
+        assert df["h"].tolist() == [10.0, 30.0]
+
+    def test_quality_filter_byte_identical_to_manual_eq(self):
+        # The synthesized base eq filter must reproduce the legacy mask exactly.
+        h = np.array([10.0, 20.0, 30.0, 40.0, 50.0], dtype=np.float32)
+        qs = np.array([0, 1, 0, 0, 1])
+        h5 = _FakeH5(
+            {
+                "/lat": np.arange(5.0),
+                "/lon": np.arange(5.0),
+                "/h": h,
+                "/qs": qs,
+            }
+        )
+        ds = self._data_source(quality_filter={"dataset": "/qs", "value": 0})
+        df = _read_group(h5, "gt1l", ds, 0, _ShardGrid())
+        expected = h[qs == 0]
+        assert df["h"].to_numpy().tobytes() == expected.tobytes()
+
+    def test_2d_signal_conf_filter(self):
+        conf = np.array([[0], [-2], [4], [-2], [3]])  # column 0, surface type
+        h5 = _FakeH5(
+            {
+                "/lat": np.arange(5.0),
+                "/lon": np.arange(5.0),
+                "/h": np.arange(5.0, dtype=np.float32),
+                "/conf": conf,
+            }
+        )
+        ds = self._data_source(filters=[{"dataset": "/conf", "column": 0, "op": "ne", "value": -2}])
+        df = _read_group(h5, "gt1l", ds, 0, _ShardGrid())
+        assert df["h"].tolist() == [0.0, 2.0, 4.0]
+
+    def test_multiple_anded_filters(self):
+        h5 = _FakeH5(
+            {
+                "/lat": np.arange(5.0),
+                "/lon": np.arange(5.0),
+                "/h": np.arange(5.0, dtype=np.float32),
+                "/conf": np.array([[5], [5], [0], [5], [5]]),
+                "/pod": np.array([0, 0, 0, 1, 0]),
+            }
+        )
+        ds = self._data_source(
+            filters=[
+                {"dataset": "/conf", "column": 0, "op": "ne", "value": 0},
+                {"dataset": "/pod", "op": "eq", "value": 0},
+            ]
+        )
+        df = _read_group(h5, "gt1l", ds, 0, _ShardGrid())
+        # row2 dropped by conf==0, row3 dropped by pod==1
+        assert df["h"].tolist() == [0.0, 1.0, 4.0]
+
+    def test_in_op_integer_column(self):
+        h5 = _FakeH5(
+            {
+                "/lat": np.arange(5.0),
+                "/lon": np.arange(5.0),
+                "/h": np.arange(5.0, dtype=np.float32),
+                "/conf": np.array([[2], [0], [3], [1], [4]]),
+            }
+        )
+        ds = self._data_source(
+            filters=[{"dataset": "/conf", "column": 0, "op": "in", "values": [2, 3, 4]}]
+        )
+        df = _read_group(h5, "gt1l", ds, 0, _ShardGrid())
+        assert df["h"].tolist() == [0.0, 2.0, 4.0]
+
+    def test_expression_filter_base_level(self):
+        h5 = _FakeH5(
+            {
+                "/lat": np.arange(5.0),
+                "/lon": np.arange(5.0),
+                "/h": np.array([-1.0, 2.0, -3.0, 4.0, 5.0], dtype=np.float32),
+            }
+        )
+        ds = self._data_source(filters=[{"expression": "h > 0"}])
+        df = _read_group(h5, "gt1l", ds, 0, _ShardGrid())
+        assert df["h"].tolist() == [2.0, 4.0, 5.0]
+
+    def test_no_filter_keeps_all(self):
+        h5 = _FakeH5(
+            {
+                "/lat": np.arange(3.0),
+                "/lon": np.arange(3.0),
+                "/h": np.arange(3.0, dtype=np.float32),
+            }
+        )
+        df = _read_group(h5, "gt1l", self._data_source(), 0, _ShardGrid())
+        assert df["h"].tolist() == [0.0, 1.0, 2.0]
+
+    def test_all_filtered_returns_none(self):
+        h5 = _FakeH5(
+            {
+                "/lat": np.arange(3.0),
+                "/lon": np.arange(3.0),
+                "/h": np.arange(3.0, dtype=np.float32),
+                "/qs": np.array([1, 1, 1]),
+            }
+        )
+        ds = self._data_source(quality_filter={"dataset": "/qs", "value": 0})
+        assert _read_group(h5, "gt1l", ds, 0, _ShardGrid()) is None
+
+    def test_filter_dataset_coincides_with_variable_path(self):
+        # Filter dataset path == variable path exercises the dedup branch
+        # (path must appear exactly once in the h5coro read list).
+        h5 = _FakeH5(
+            {
+                "/lat": np.arange(5.0),
+                "/lon": np.arange(5.0),
+                "/h": np.array([0.0, 1.0, 2.0, 3.0, 4.0], dtype=np.float32),
+            }
+        )
+        ds = self._data_source(filters=[{"dataset": "/h", "op": "ge", "value": 2.0}])
+        df = _read_group(h5, "gt1l", ds, 0, _ShardGrid())
+        assert df["h"].tolist() == [2.0, 3.0, 4.0]
+
+    def test_expression_filter_after_structured(self):
+        # Expression filter ANDed after a structured predicate.
+        h5 = _FakeH5(
+            {
+                "/lat": np.arange(5.0),
+                "/lon": np.arange(5.0),
+                "/h": np.array([1.0, 2.0, 3.0, 4.0, 5.0], dtype=np.float32),
+                "/qs": np.array([0, 0, 1, 0, 0]),
+            }
+        )
+        ds = self._data_source(
+            filters=[
+                {"dataset": "/qs", "op": "eq", "value": 0},
+                {"expression": "h > 2"},
+            ]
+        )
+        df = _read_group(h5, "gt1l", ds, 0, _ShardGrid())
+        # structured drops row2 (qs==1); expression keeps h>2 from remainder
+        assert df["h"].tolist() == [4.0, 5.0]
+
+    def test_two_sequential_expression_filters(self):
+        # Two sequential expression filters both applied.
+        h5 = _FakeH5(
+            {
+                "/lat": np.arange(6.0),
+                "/lon": np.arange(6.0),
+                "/h": np.array([1.0, 2.0, 3.0, 4.0, 5.0, 6.0], dtype=np.float32),
+            }
+        )
+        ds = self._data_source(
+            filters=[
+                {"expression": "h > 2"},
+                {"expression": "h < 6"},
+            ]
+        )
+        df = _read_group(h5, "gt1l", ds, 0, _ShardGrid())
+        assert df["h"].tolist() == [3.0, 4.0, 5.0]
+
+    def test_expression_filter_undefined_name_raises(self):
+        # Expression referencing an undefined name re-raises as NameError.
+        h5 = _FakeH5(
+            {
+                "/lat": np.arange(3.0),
+                "/lon": np.arange(3.0),
+                "/h": np.arange(3.0, dtype=np.float32),
+            }
+        )
+        ds = self._data_source(filters=[{"expression": "undefined_col > 0"}])
+        with pytest.raises(NameError, match="undefined name"):
+            _read_group(h5, "gt1l", ds, 0, _ShardGrid())
+
+
+# ---------------------------------------------------------------------------
+# _expand_mask_to_base and cross-level filter path (issue #43, Phase B)
+# ---------------------------------------------------------------------------
+
+
+class TestExpandMaskToBase:
+    def test_single_parent_kept(self):
+        # 1 parent keeps base rows 0-2 (3 photons).
+        coarse = np.array([True])
+        ibeg = np.array([0])
+        cnt = np.array([3])
+        out = _expand_mask_to_base(coarse, ibeg, cnt, index_base=0, total_base_size=3)
+        np.testing.assert_array_equal(out, [True, True, True])
+
+    def test_single_parent_dropped(self):
+        coarse = np.array([False])
+        ibeg = np.array([0])
+        cnt = np.array([3])
+        out = _expand_mask_to_base(coarse, ibeg, cnt, index_base=0, total_base_size=3)
+        np.testing.assert_array_equal(out, [False, False, False])
+
+    def test_two_parents_alternating(self):
+        # parent 0 -> base rows 0-1 (kept); parent 1 -> base rows 2-4 (dropped).
+        coarse = np.array([True, False])
+        ibeg = np.array([0, 2])
+        cnt = np.array([2, 3])
+        out = _expand_mask_to_base(coarse, ibeg, cnt, index_base=0, total_base_size=5)
+        np.testing.assert_array_equal(out, [True, True, False, False, False])
+
+    def test_index_base_shift(self):
+        # HDF5 1-based indexing: index_beg values start at 1.
+        coarse = np.array([False, True])
+        ibeg = np.array([1, 4])  # 1-based
+        cnt = np.array([3, 2])
+        out = _expand_mask_to_base(coarse, ibeg, cnt, index_base=1, total_base_size=5)
+        # parent1 covers base rows 3 and 4 (ibeg=4-1=3, cnt=2).
+        np.testing.assert_array_equal(out, [False, False, False, True, True])
+
+    def test_empty_coarse_mask(self):
+        coarse = np.array([False, False, False])
+        ibeg = np.array([0, 2, 5])
+        cnt = np.array([2, 3, 1])
+        out = _expand_mask_to_base(coarse, ibeg, cnt, index_base=0, total_base_size=6)
+        assert not np.any(out)
+
+    def test_full_coarse_mask(self):
+        coarse = np.array([True, True])
+        ibeg = np.array([0, 3])
+        cnt = np.array([3, 2])
+        out = _expand_mask_to_base(coarse, ibeg, cnt, index_base=0, total_base_size=5)
+        assert np.all(out)
+
+    def test_negative_beg_raises(self):
+        # index_beg_arr[0]=0 < index_base=1 -> beg=-1 -> must raise ValueError
+        coarse = np.array([True])
+        ibeg = np.array([0])
+        cnt = np.array([3])
+        with pytest.raises(ValueError, match="less than index_base"):
+            _expand_mask_to_base(coarse, ibeg, cnt, index_base=1, total_base_size=3)
+
+
+class TestReadGroupCrossLevel:
+    """Phase B: cross-level filters expand coarse verdicts to base-rate rows."""
+
+    def _data_source_with_levels(self, coarse_filter_value=None):
+        """Two-level data source: 'segments' -> 'photons' via link arrays."""
+        ds = {
+            "coordinates": {"latitude": "/lat", "longitude": "/lon"},
+            "variables": {"h": "/h"},
+            "base_level": "photons",
+            "levels": {
+                "photons": {
+                    "path": "/heights",
+                    "coordinates": ["lat", "lon"],
+                    "variables": ["h"],
+                    "link": None,
+                },
+                "segments": {
+                    "path": "/geolocation",
+                    "coordinates": [],
+                    "variables": ["signal_conf_ph"],
+                    "link": {
+                        "to": "photons",
+                        "index_beg": "/ph_index_beg",
+                        "count": "/segment_ph_cnt",
+                    },
+                },
+            },
+        }
+        if coarse_filter_value is not None:
+            ds["filters"] = [
+                {
+                    "dataset": "/conf",
+                    "op": "ne",
+                    "value": coarse_filter_value,
+                    "level": "segments",
+                }
+            ]
+        return ds
+
+    def test_coarse_filter_expands_to_base(self):
+        # 3 segments, each covering 2 photons (6 total).
+        # segment1 (conf=-2) -> drop; segment0 and segment2 -> keep.
+        h5 = _FakeH5(
+            {
+                "/lat": np.arange(6.0),
+                "/lon": np.arange(6.0),
+                "/h": np.arange(6.0, dtype=np.float32),
+                # link arrays: segment0->ph[0:2], segment1->ph[2:4], segment2->ph[4:6]
+                "/ph_index_beg": np.array([0, 2, 4]),
+                "/segment_ph_cnt": np.array([2, 2, 2]),
+                # coarse flag: segment1 has conf=-2, others conf=4
+                "/conf": np.array([4, -2, 4]),
+            }
+        )
+        ds = self._data_source_with_levels(coarse_filter_value=-2)
+        df = _read_group(h5, "gt1l", ds, 0, _ShardGrid())
+        # Segments 0 and 2 survive; their photons are h[0:2] and h[4:6].
+        assert df["h"].tolist() == [0.0, 1.0, 4.0, 5.0]
+
+    def test_all_segments_filtered_returns_none(self):
+        h5 = _FakeH5(
+            {
+                "/lat": np.arange(4.0),
+                "/lon": np.arange(4.0),
+                "/h": np.arange(4.0, dtype=np.float32),
+                "/ph_index_beg": np.array([0, 2]),
+                "/segment_ph_cnt": np.array([2, 2]),
+                "/conf": np.array([-2, -2]),  # both segments dropped
+            }
+        )
+        ds = self._data_source_with_levels(coarse_filter_value=-2)
+        assert _read_group(h5, "gt1l", ds, 0, _ShardGrid()) is None
+
+    def test_cross_level_and_base_level_filters_anded(self):
+        # Cross-level keeps segments 0 and 2 (photons 0-1 and 4-5);
+        # base-level h>1 further drops photon 0 and photon 4.
+        h5 = _FakeH5(
+            {
+                "/lat": np.arange(6.0),
+                "/lon": np.arange(6.0),
+                "/h": np.array([0.0, 1.5, 2.0, 2.5, 3.0, 4.0], dtype=np.float32),
+                "/ph_index_beg": np.array([0, 2, 4]),
+                "/segment_ph_cnt": np.array([2, 2, 2]),
+                "/conf": np.array([4, -2, 4]),
+                "/qs": np.array([0, 0, 1, 0, 0, 0]),  # base-level flag
+            }
+        )
+        ds = self._data_source_with_levels(coarse_filter_value=-2)
+        # Add a base-level structured filter alongside the coarse one.
+        ds["filters"].append({"dataset": "/qs", "op": "eq", "value": 0})
+        df = _read_group(h5, "gt1l", ds, 0, _ShardGrid())
+        # Cross-level: keep ph0,1,4,5; base-level drops ph2 (qs==1 after reindex).
+        # Expected survivors among ph0,1,4,5: qs[0]=0,qs[1]=0,qs[4]=0,qs[5]=0 -> all 4
+        assert df["h"].tolist() == [0.0, 1.5, 3.0, 4.0]
+
+    def test_flat_form_unchanged(self):
+        # No levels/base_level -> flat path still works.
+        h5 = _FakeH5(
+            {
+                "/lat": np.arange(3.0),
+                "/lon": np.arange(3.0),
+                "/h": np.array([1.0, 2.0, 3.0], dtype=np.float32),
+                "/qs": np.array([0, 1, 0]),
+            }
+        )
+        ds = {
+            "coordinates": {"latitude": "/lat", "longitude": "/lon"},
+            "variables": {"h": "/h"},
+            "quality_filter": {"dataset": "/qs", "value": 0},
+        }
+        df = _read_group(h5, "gt1l", ds, 0, _ShardGrid())
+        assert df["h"].tolist() == [1.0, 3.0]
