@@ -2,10 +2,11 @@
 
 This is the real-data (phase-3) counterpart to the synthetic ``handoff_bench.py``:
 it drives the actual catalog -> shard-map -> ``runner.agg()`` path against
-ICESat-2 ATL03 granules over three 10 km x 10 km AOIs, swept across a set of
-time windows, and records wall-time, peak RSS, observation/cell counts, and
-output bytes for the ``pandas`` and ``arrow`` handoff carriers -- asserting their
-scalar outputs are byte-for-byte identical (#30's parity criterion on real data).
+ICESat-2 ATL03 granules over three 10 km x 10 km AOIs, swept across two date
+ranges (calendar 2025 and the full 2018 -> Jan 2026 mission), and records
+wall-time, peak RSS, observation/cell counts, and output bytes for the
+``pandas`` and ``arrow`` handoff carriers -- asserting their scalar outputs are
+byte-for-byte identical (#30's parity criterion on real data).
 
 Three regions span the density regimes the synthetic harness can't reproduce:
 
@@ -19,10 +20,10 @@ is deferred / behind the flag by default (per @espg) because it is far more
 expensive than the other three.
 
 Confidence filter and grid come straight from the shipped ``atl03`` template:
-``signal_conf_ph != 0`` (keep flags 1-4, drop only noise), rectilinear grid. The
-``output.grid.bounds`` are overridden per region to the AOI's 10 km box so the
-grid covers just the patch. (HEALPix order-19 -- the ~10 m match -- waits on
-mortie #35, so this first pass is rectilinear only.)
+``signal_conf_ph != -2`` (drop only TEP photons, across all surface types),
+rectilinear grid. The ``output.grid.bounds`` are overridden per region to the
+AOI's 10 km box so the grid covers just the patch. (HEALPix order-19 -- the
+~10 m match -- waits on mortie #35, so this first pass is rectilinear only.)
 
 **This script is NOT run in CI**: it needs ``earthaccess``/NSIDC-S3 credentials
 (CMR-STAC query + byte-range HDF5 reads) and is slow. It lives under
@@ -31,7 +32,7 @@ import and construct cleanly and stay ruff-clean regardless.
 
 Run (in a credentialed session)::
 
-    uv run python benchmarks/region_timing.py --windows 1d,5d --max-cells 4
+    uv run python benchmarks/region_timing.py --windows 1y --max-cells 4
     uv run python benchmarks/region_timing.py --hard --out results.txt
 """
 
@@ -42,22 +43,24 @@ import sys
 import tempfile
 import time
 from dataclasses import dataclass
-from datetime import date, timedelta
 
 import numpy as np
 
 from zagg.config import default_config, get_data_vars
 from zagg.runner import agg
 
-# Time windows (per @espg). Each is the span ending at ``--end-date`` that drives
-# the catalog query; longer windows pull more granules -> more overlap.
+# Time windows (per @espg). Each is an explicit ``(start, end)`` date range
+# (inclusive start, exclusive end) driving the catalog query. The AOI only has
+# ~10 granules for a whole year, so the earlier {1d,5d,15d,30d,91d} sweep was too
+# sparse to be meaningful; we benchmark two ranges instead:
+#
+#   * ``1y``  -- calendar 2025 (2025-01-01 .. 2026-01-01).
+#   * ``all`` -- the full mission, 2018-01-01 .. 2026-01-01. The upper bound is
+#     CLIPPED at 2026-01-01 so future runs stay stable and don't drift as new
+#     granules land (otherwise benchmark numbers would creep every run).
 WINDOWS = {
-    "1d": 1,
-    "5d": 5,
-    "15d": 15,
-    "30d": 30,
-    "91d": 91,
-    "1y": 365,
+    "1y": ("2025-01-01", "2026-01-01"),
+    "all": ("2018-01-01", "2026-01-01"),
 }
 
 # Carriers compared head-to-head. Both must produce identical scalar outputs.
@@ -168,9 +171,8 @@ def _output_bytes(store_path: str) -> int:
 def run_one(
     region: Region,
     window: str,
-    days: int,
+    date_range: tuple[str, str],
     *,
-    end_date: date,
     version: str,
     max_cells: int | None,
     max_workers: int | None,
@@ -181,8 +183,8 @@ def run_one(
     from zagg.grids import from_config
 
     cfg = _region_config(region)
-    start = (end_date - timedelta(days=days)).isoformat()
-    query = Query("ATL03", version, start, end_date.isoformat(), region=region.bbox)
+    start, end = date_range
+    query = Query("ATL03", version, start, end, region=region.bbox)
 
     with tempfile.TemporaryDirectory() as tmp:
         catalog_path = f"{tmp}/shardmap.json"
@@ -249,12 +251,7 @@ def parse_args(argv=None):
     ap.add_argument(
         "--windows",
         default=",".join(WINDOWS),
-        help="Comma-separated time windows (default: all). Choices: " + ", ".join(WINDOWS),
-    )
-    ap.add_argument(
-        "--end-date",
-        default=date.today().isoformat(),
-        help="End of each time window, YYYY-MM-DD (default: today).",
+        help="Comma-separated time windows (default: both). Choices: " + ", ".join(WINDOWS),
     )
     ap.add_argument(
         "--hard",
@@ -287,7 +284,6 @@ def main(argv=None):
             raise SystemExit(f"unknown window {w!r}; choices: {', '.join(WINDOWS)}")
         windows.append(w)
 
-    end_date = date.fromisoformat(args.end_date)
     regions = list(REGIONS) + ([HARD_REGION] if args.hard else [])
 
     records: list[Record] = []
@@ -298,7 +294,6 @@ def main(argv=None):
                     region,
                     window,
                     WINDOWS[window],
-                    end_date=end_date,
                     version=args.version,
                     max_cells=args.max_cells,
                     max_workers=args.max_workers,
