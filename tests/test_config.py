@@ -1033,23 +1033,49 @@ class TestRaggedKind:
 
     def test_inner_shape_must_be_positive(self):
         cfg = _ragged_cfg(inner_shape=0)
-        with pytest.raises(ValueError, match="positive"):
+        with pytest.raises(ValueError, match="'inner_shape' entries must be positive"):
             validate_config(cfg)
 
     def test_inner_shape_rejects_empty(self):
         cfg = _ragged_cfg(inner_shape=[])
-        with pytest.raises(ValueError, match="at least one dimension"):
+        with pytest.raises(ValueError, match="'inner_shape' must have at least one dimension"):
             validate_config(cfg)
 
     def test_inner_shape_rejects_non_int(self):
         cfg = _ragged_cfg(inner_shape="2")
-        with pytest.raises(ValueError, match="int or a sequence of ints"):
+        with pytest.raises(ValueError, match="'inner_shape' must be an int or a sequence of ints"):
             validate_config(cfg)
 
     def test_inner_shape_list_rejects_non_int_element(self):
         cfg = _ragged_cfg(inner_shape=[2, "x"])
-        with pytest.raises(ValueError, match="positive"):
+        with pytest.raises(ValueError, match="'inner_shape' entries must be positive"):
             validate_config(cfg)
+
+    def test_ragged_with_expression_validates(self):
+        """A ragged field driven by an expression (not function) validates."""
+        cfg = PipelineConfig(
+            data_source={
+                "reader": "h5coro",
+                "groups": ["gt1l/heights"],
+                "coordinates": {
+                    "latitude": "{group}/lat_ph",
+                    "longitude": "{group}/lon_ph",
+                },
+                "variables": {"h_ph": "{group}/h_ph"},
+            },
+            aggregation={
+                "coordinates": {},
+                "variables": {
+                    "h_ph_tdigest": {
+                        "expression": "np.array([np.mean(h_ph), np.var(h_ph)])",
+                        "kind": "ragged",
+                        "inner_shape": [2],
+                    }
+                },
+            },
+            output={"grid": {"type": "healpix", "child_order": 12, "parent_order": 6}},
+        )
+        validate_config(cfg)
 
     def test_trailing_shape_rejected_for_ragged(self):
         cfg = _ragged_cfg(inner_shape=[2], trailing_shape=4)
