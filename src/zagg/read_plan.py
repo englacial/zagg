@@ -108,7 +108,7 @@ def plan_read(
         if bbox[0] <= lon <= bbox[2] and bbox[1] <= lat <= bbox[3]:
             in_aoi[j] = True
             continue
-        # Linestring crossing check with the next segment.
+        # Last segment: no next-segment linestring to check; rep-point only.
         if j + 1 < n_coarse:
             lat2, lon2 = float(lat_arr[j + 1]), float(lon_arr[j + 1])
             seg_line = LineString([(lon, lat), (lon2, lat2)])
@@ -141,6 +141,7 @@ def plan_read(
     # Merge overlapping/adjacent padded runs.
     merged: list[tuple[int, int]] = []
     for s, e in padded_runs:
+        # +1 merges immediately adjacent runs (closed intervals: [a,b] and [b+1,c] -> [a,c]).
         if merged and s <= merged[-1][1] + 1:
             merged[-1] = (merged[-1][0], max(merged[-1][1], e))
         else:
@@ -198,10 +199,10 @@ def execute_read_plan(plan: ReadPlan, read_fn, dataset_path: str, dtype) -> np.n
         Concatenated data for all runs in the plan, or an empty array if the
         plan matched nothing. If ``plan.full_read``, returns the full dataset.
     """
-    if not plan.parent_runs:
-        return np.empty(0, dtype=dtype)
     if plan.full_read:
         return np.asarray(read_fn(dataset_path, hyperslice=None), dtype=dtype)
+    if not plan.parent_runs:
+        return np.empty(0, dtype=dtype)
     parts = [
         np.asarray(read_fn(dataset_path, hyperslice=chunk), dtype=dtype)
         for chunk in plan.chunk_lists

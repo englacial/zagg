@@ -539,6 +539,33 @@ class TestLevelsValidation:
             validate_config(cfg)
 
 
+    def test_self_link_rejected(self):
+        # link.to == level name (self-reference) must raise ValueError
+        ds = _minimal_two_level_ds()
+        ds["levels"]["segments"]["link"]["to"] = "segments"
+        cfg = PipelineConfig(
+            data_source=ds,
+            aggregation={"variables": {"c": {"function": "len", "dtype": "int32"}}},
+            output={"grid": {"type": "healpix", "parent_order": 6, "child_order": 12}},
+        )
+        with pytest.raises(ValueError, match="cannot reference the level itself"):
+            validate_config(cfg)
+
+    def test_filter_level_not_in_levels_rejected(self):
+        # A filter whose level names a nonexistent key must fail at validate time.
+        ds = _minimal_two_level_ds()
+        ds["filters"] = [
+            {"level": "nonexistent", "dataset": "/{group}/flag", "op": "eq", "value": 0}
+        ]
+        cfg = PipelineConfig(
+            data_source=ds,
+            aggregation={"variables": {"c": {"function": "len", "dtype": "int32"}}},
+            output={"grid": {"type": "healpix", "parent_order": 6, "child_order": 12}},
+        )
+        with pytest.raises(ValueError, match="not a key in levels"):
+            validate_config(cfg)
+
+
 # ---------------------------------------------------------------------------
 # Helper accessors
 # ---------------------------------------------------------------------------

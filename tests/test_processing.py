@@ -1336,6 +1336,14 @@ class TestExpandMaskToBase:
         out = _expand_mask_to_base(coarse, ibeg, cnt, index_base=0, total_base_size=5)
         assert np.all(out)
 
+    def test_negative_beg_raises(self):
+        # index_beg_arr[0]=0 < index_base=1 -> beg=-1 -> must raise ValueError
+        coarse = np.array([True])
+        ibeg = np.array([0])
+        cnt = np.array([3])
+        with pytest.raises(ValueError, match="less than index_base"):
+            _expand_mask_to_base(coarse, ibeg, cnt, index_base=1, total_base_size=3)
+
 
 class TestReadGroupCrossLevel:
     """Phase B: cross-level filters expand coarse verdicts to base-rate rows."""

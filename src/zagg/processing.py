@@ -704,6 +704,10 @@ def _expand_mask_to_base(
         if not keep:
             continue
         beg = int(index_beg_arr[p]) - index_base
+        if beg < 0:
+            raise ValueError(
+                f"index_beg_arr[{p}]={index_beg_arr[p]} is less than index_base={index_base}"
+            )
         cnt = int(count_arr[p])
         out[beg : beg + cnt] = True
     return out

@@ -220,6 +220,9 @@ def validate_config(config: PipelineConfig) -> None:
     # Validate hierarchical multi-level form (issue #43, Phase B)
     _validate_levels(config.data_source)
 
+    # Cross-check: each filter's level field must name a key in levels (issue #43)
+    _validate_filter_levels(config.data_source)
+
     ds_vars = set(config.data_source.get("variables", {}).keys())
     agg_vars = config.aggregation.get("variables", {})
 
@@ -532,6 +535,8 @@ def _validate_levels(data_source: dict) -> None:
                 f"levels.{name}.link: unknown fields {sorted(unknown)} "
                 f"(allowed: to, index_beg, count, index_base, reference_index)"
             )
+        if link.get("to") == name:
+            raise ValueError(f"level '{name}': link.to cannot reference the level itself")
         if link["to"] not in level_keys:
             raise ValueError(
                 f"levels.{name}.link.to {link['to']!r} is not a key in levels "
@@ -547,6 +552,27 @@ def _validate_levels(data_source: dict) -> None:
             raise ValueError(
                 f"levels.{name}.link.reference_index is reserved and must be null/omitted "
                 f"(explicit index-array variant not yet implemented)"
+            )
+
+
+def _validate_filter_levels(data_source: dict) -> None:
+    """Cross-check each filter's level field against the levels keys (issue #43).
+
+    A filter with ``level: "nonexistent"`` would otherwise only fail at read time
+    with an opaque ``KeyError``. Raises ``ValueError`` with a clear message when a
+    filter's ``level`` names a key not present in ``levels``.
+    """
+    levels = data_source.get("levels")
+    if levels is None:
+        return
+    level_keys = set(levels)
+    filters = data_source.get("filters") or []
+    for i, f in enumerate(filters):
+        lvl = f.get("level")
+        if lvl is not None and lvl not in level_keys:
+            raise ValueError(
+                f"filter[{i}]: level {lvl!r} is not a key in levels "
+                f"(available: {sorted(level_keys)})"
             )
 
 

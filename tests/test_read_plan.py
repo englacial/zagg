@@ -207,3 +207,18 @@ class TestExecuteReadPlan:
 
         out = execute_read_plan(plan, read_fn, "/h", np.float64)
         assert out.dtype == np.float64
+
+    def test_full_read_true_with_empty_parent_runs(self):
+        # full_read=True must take precedence over empty parent_runs; the full
+        # dataset should be returned rather than an empty array.
+        data = np.arange(20.0, dtype=np.float32)
+        plan = ReadPlan(parent_runs=[], base_slices=[], chunk_lists=[], full_read=True)
+        calls = []
+
+        def read_fn(path, hyperslice=None):
+            calls.append(hyperslice)
+            return data
+
+        out = execute_read_plan(plan, read_fn, "/h", np.float32)
+        assert calls == [None]  # full-read call, no hyperslice
+        np.testing.assert_array_equal(out, data)
