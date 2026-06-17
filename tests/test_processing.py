@@ -5,12 +5,16 @@ from zarr import open_group
 from zarr.storage import MemoryStore
 
 from zagg.config import default_config, get_agg_fields, get_coords, get_data_vars
-from zagg.grids import HealpixGrid
+from zagg.grids import HEALPIX_BASE_CELLS, HealpixGrid
 from zagg.processing import (
     KERNEL_RTOL,
+    _arrow_column,
     _build_groups,
+    _build_output,
     _concat_and_group,
     _group_columns,
+    _has_vector_fields,
+    _iter_carrier_columns,
     _kernel_able,
     _kernel_aggregate,
     _predicate_mask,
@@ -145,6 +149,127 @@ class TestCalculateCellStatistics:
         assert not np.isnan(result["h_nanmean"])
         assert result["h_nanmax"] == 5.0
         assert result["h_nanmin"] == 1.0
+
+
+class TestVectorOutputs:
+    """Issue #29 phase 2: a ``kind: vector`` field yields a per-cell ndarray of
+    its declared ``trailing_shape``/``dtype``; scalar fields are unchanged."""
+
+    @staticmethod
+    def _hist_config(bins=4, dtype="int64", fill_value=None):
+        from zagg.config import PipelineConfig
+
+        meta = {
+            "function": "np.bincount",
+            "source": "b",
+            "kind": "vector",
+            "trailing_shape": bins,
+            "dtype": dtype,
+            "params": {"minlength": bins},
+        }
+        if fill_value is not None:
+            meta["fill_value"] = fill_value
+        return PipelineConfig(aggregation={"variables": {"hist": meta}})
+
+    def test_vector_field_returns_declared_shape(self):
+        cfg = self._hist_config(bins=4)
+        data = {"b": np.array([0, 1, 1, 3])}
+        result = calculate_cell_statistics(data, config=cfg)
+        hist = result["hist"]
+        assert isinstance(hist, np.ndarray)
+        assert hist.shape == (4,)
+        assert hist.dtype == np.dtype("int64")
+        np.testing.assert_array_equal(hist, [1, 2, 0, 1])
+
+    def test_vector_empty_cell_gets_sentinel(self):
+        cfg = self._hist_config(bins=4, dtype="float32")
+        result = calculate_cell_statistics({"b": np.array([])}, config=cfg)
+        hist = result["hist"]
+        assert hist.shape == (4,)
+        assert np.all(np.isnan(hist))  # default fill_value "NaN"
+
+    def test_vector_empty_cell_numeric_sentinel(self):
+        cfg = self._hist_config(bins=3, dtype="int64", fill_value=0)
+        result = calculate_cell_statistics({"b": np.array([])}, config=cfg)
+        np.testing.assert_array_equal(result["hist"], [0, 0, 0])
+
+    def test_vector_wrong_width_raises(self):
+        cfg = self._hist_config(bins=2)  # but bincount yields width 4 below
+        with pytest.raises(ValueError, match="expected"):
+            calculate_cell_statistics({"b": np.array([0, 3])}, config=cfg)
+
+    @staticmethod
+    def _edges_config(fill_value=None):
+        """A ``kind: vector`` field driven by an ``expression`` (issue #29)."""
+        from zagg.config import PipelineConfig
+
+        meta = {
+            "expression": "np.array([np.min(h), np.max(h)])",
+            "source": "h",
+            "kind": "vector",
+            "trailing_shape": 2,
+            "dtype": "float32",
+        }
+        if fill_value is not None:
+            meta["fill_value"] = fill_value
+        return PipelineConfig(aggregation={"variables": {"edges": meta}})
+
+    def test_vector_expression_returns_declared_shape(self):
+        """A vector ``expression`` field coerces to its declared shape/dtype, the
+        same path a vector ``function`` field uses (issue #29)."""
+        cfg = self._edges_config()
+        result = calculate_cell_statistics({"h": np.array([1.0, 5.0, 3.0])}, config=cfg)
+        edges = result["edges"]
+        assert isinstance(edges, np.ndarray)
+        assert edges.shape == (2,)
+        assert edges.dtype == np.dtype("float32")
+        np.testing.assert_array_equal(edges, [1.0, 5.0])
+
+    def test_vector_expression_empty_cell_gets_sentinel(self):
+        """An empty cell short-circuits to the fill_value sentinel WITHOUT
+        evaluating the expression. ``_edges_config``'s expression is
+        ``np.array([np.min(h), np.max(h)])`` and ``np.min([])`` raises, so this
+        passing proves the empty-cell path never reaches the eval (issue #29)."""
+        cfg = self._edges_config()
+        result = calculate_cell_statistics({"h": np.array([])}, config=cfg)
+        edges = result["edges"]
+        assert edges.shape == (2,)
+        assert np.all(np.isnan(edges))  # default fill_value "NaN"
+
+    def test_vector_expression_empty_cell_numeric_sentinel(self):
+        """Empty cell short-circuits to a numeric sentinel (no expression eval)."""
+        cfg = self._edges_config(fill_value=0)
+        result = calculate_cell_statistics({"h": np.array([])}, config=cfg)
+        np.testing.assert_array_equal(result["edges"], [0, 0])
+
+    def test_vector_expression_wrong_width_raises(self):
+        """An expression yielding the wrong width fails loudly, like the function case."""
+        from zagg.config import PipelineConfig
+
+        cfg = PipelineConfig(
+            aggregation={
+                "variables": {
+                    "edges": {
+                        "expression": "np.array([np.min(h), np.max(h), np.mean(h)])",
+                        "source": "h",
+                        "kind": "vector",
+                        "trailing_shape": 2,
+                        "dtype": "float32",
+                    }
+                }
+            }
+        )
+        with pytest.raises(ValueError, match="expected"):
+            calculate_cell_statistics({"h": np.array([1.0, 5.0, 3.0])}, config=cfg)
+
+    def test_scalar_fields_unchanged_alongside_vector(self):
+        """Adding a vector field must not perturb scalar outputs in the same dict."""
+        scalar = calculate_cell_statistics(
+            {"h_li": np.array([1.0, 2.0, 3.0]), "s_li": np.array([0.1, 0.1, 0.1])}
+        )
+        assert isinstance(scalar["h_min"], float)
+        assert scalar["h_min"] == 1.0
+        assert scalar["count"] == 3
 
 
 class TestBuildGroups:
@@ -618,6 +743,130 @@ class TestProcessShardKernelBranch:
             process_shard(grid, 0, ["s3://x"], s3_credentials={}, handoff="bogus")
 
 
+class TestVectorCarrier:
+    """Issue #29 phase 3: a config with any ``vector`` field routes the
+    cell->table handoff through Arrow (FixedSizeList vector columns), while a
+    pure-scalar config keeps the unchanged pandas carrier with byte-identical
+    scalar outputs."""
+
+    @staticmethod
+    def _scalar_cfg():
+        from zagg.config import PipelineConfig
+
+        return PipelineConfig(
+            data_source={"groups": ["g"]},
+            aggregation={
+                "variables": {
+                    "count": {"function": "len"},
+                    "h_min": {"function": "min", "source": "h_li", "dtype": "float32"},
+                }
+            },
+        )
+
+    @staticmethod
+    def _vector_cfg():
+        """``_scalar_cfg`` plus a vector ``hist`` field (FixedSizeList<3>)."""
+        from zagg.config import PipelineConfig
+
+        return PipelineConfig(
+            data_source={"groups": ["g"]},
+            aggregation={
+                "variables": {
+                    "count": {"function": "len"},
+                    "h_min": {"function": "min", "source": "h_li", "dtype": "float32"},
+                    "hist": {
+                        "function": "np.bincount",
+                        "source": "b",
+                        "kind": "vector",
+                        "trailing_shape": 3,
+                        "dtype": "int64",
+                        "fill_value": 0,
+                        "params": {"minlength": 3},
+                    },
+                }
+            }
+        )
+
+    def test_has_vector_fields(self):
+        assert not _has_vector_fields(self._scalar_cfg())
+        assert _has_vector_fields(self._vector_cfg())
+
+    def _run(self, monkeypatch, cfg):
+        """Drive process_shard on a canned read via the default (pandas) handoff;
+        the output carrier (pandas vs Arrow) is chosen by the config's field kinds,
+        independent of the input handoff."""
+        pytest.importorskip("pyarrow")
+        leaf_to_cell = {1: 10, 2: 10, 3: 20}
+        children = [10, 20]
+        grid = _KernelShardGrid(children, leaf_to_cell)
+        df = pd.DataFrame(
+            {
+                "h_li": np.array([1.0, 2.0, 5.0], dtype=np.float32),
+                "b": np.array([0, 2, 1], dtype=np.int64),
+                "leaf_id": np.array([1, 1, 3], dtype=np.int64),
+            }
+        )
+        TestProcessShardKernelBranch()._patch_reads(monkeypatch, [df])
+        return process_shard(grid, 0, ["s3://x"], s3_credentials={}, config=cfg), children
+
+    def test_scalar_config_returns_dataframe(self, monkeypatch):
+        (df, _meta), _children = self._run(monkeypatch, self._scalar_cfg())
+        assert isinstance(df, pd.DataFrame)
+
+    def test_vector_config_returns_arrow_table(self, monkeypatch):
+        pa = pytest.importorskip("pyarrow")
+        (tbl, _meta), _children = self._run(monkeypatch, self._vector_cfg())
+        assert isinstance(tbl, pa.Table)
+        assert pa.types.is_fixed_size_list(tbl.column("hist").type)
+        assert tbl.column("hist").type.list_size == 3
+
+    def test_scalar_columns_byte_identical_with_and_without_vector(self, monkeypatch):
+        """The hard #29/#30 criterion: adding a vector field must not perturb the
+        scalar columns. Run the same canned input through both configs and assert
+        the shared scalar columns match exactly."""
+        (df, _m1), _c = self._run(monkeypatch, self._scalar_cfg())
+        (tbl, _m2), _c = self._run(monkeypatch, self._vector_cfg())
+        for name in ("count", "h_min"):
+            np.testing.assert_array_equal(
+                df[name].to_numpy(),
+                tbl.column(name).to_numpy(zero_copy_only=False),
+                err_msg=name,
+            )
+
+    def test_vector_column_values(self, monkeypatch):
+        """The FixedSizeList payload holds each cell's per-cell vector. cell 10 has
+        b=[0,2] -> bincount(minlength=3)=[1,0,1]; cell 20 has b=[1] -> [0,1,0]."""
+        (tbl, _meta), children = self._run(monkeypatch, self._vector_cfg())
+        hist = tbl.column("hist").combine_chunks()
+        block = hist.values.to_numpy(zero_copy_only=False).reshape(len(children), 3)
+        idx = {c: i for i, c in enumerate(children)}
+        np.testing.assert_array_equal(block[idx[10]], [1, 0, 1])
+        np.testing.assert_array_equal(block[idx[20]], [0, 1, 0])
+
+    def test_arrow_column_roundtrips_through_iter(self):
+        """_arrow_column -> _iter_carrier_columns recovers the (n_cells, C) block,
+        the seam the dense vector writer consumes (phase 5)."""
+        pa = pytest.importorskip("pyarrow")
+        sig = {"kind": "vector", "trailing_shape": (3,), "dtype": "int64"}
+        block = np.array([[1, 0, 1], [0, 1, 0]], dtype=np.int64)
+        col = _arrow_column(block, sig)
+        assert pa.types.is_fixed_size_list(col.type)
+        tbl = pa.table({"hist": col})
+        recovered = dict(_iter_carrier_columns(tbl))["hist"]
+        np.testing.assert_array_equal(recovered, block)
+
+    def test_build_output_scalar_is_plain_dataframe(self):
+        """_build_output(use_arrow=False) is the unchanged pandas assembly."""
+        grid = _KernelShardGrid([10, 20], {1: 10})
+        stats = {"count": np.array([2, 1]), "h_min": np.array([1.0, 5.0], dtype=np.float32)}
+        cfg = self._scalar_cfg()
+        out = _build_output(
+            stats, ["count", "h_min"], get_agg_fields(cfg), grid, 0, use_arrow=False
+        )
+        assert isinstance(out, pd.DataFrame)
+        np.testing.assert_array_equal(out["count"].to_numpy(), [2, 1])
+
+
 class TestDataSource:
     """Test data_source section of default config (replaces old DataSourceConfig tests)."""
 
@@ -649,6 +898,116 @@ class TestDataSource:
         assert path == "/gt2r/land_ice_segments/latitude"
 
 
+class TestVectorRoundTrip:
+    """Issue #29 phase 6: a vector field written to a real Zarr template reads
+    back through the trailing-dim block, and NaN-padded empty cells are skipped
+    by a NaN-aware reducer."""
+
+    @staticmethod
+    def _vector_cfg():
+        cfg = default_config("atl06")
+        agg = {
+            "coordinates": cfg.aggregation.get("coordinates", {}),
+            "variables": {
+                "count": {"function": "len", "source": "h_li"},
+                "edges": {
+                    "expression": "np.array([np.min(h), np.max(h)])",
+                    "source": "h",
+                    "kind": "vector",
+                    "trailing_shape": 2,
+                    "dtype": "float32",
+                },
+            },
+        }
+        from zagg.config import PipelineConfig
+
+        return PipelineConfig(
+            data_source=cfg.data_source, aggregation=agg, output=cfg.output
+        )
+
+    def test_vector_leaf_to_zarr_to_read(self):
+        pytest.importorskip("pyarrow")
+        from mortie import geo2mort
+
+        cfg = self._vector_cfg()
+        parent_order, child_order = 2, 4
+        grid = HealpixGrid(parent_order, child_order, layout="fullsphere", config=cfg)
+        store = MemoryStore()
+        grid.emit_template(store)
+
+        parent = int(geo2mort(-78.5, -132.0, order=parent_order)[0])
+        children = grid.children(parent)
+        n = len(children)  # 4 ** (child_order - parent_order)
+        assert n == 4 ** (child_order - parent_order)
+
+        # This test isolates the carrier->writer->Zarr->reader half of #29, so it
+        # fabricates the per-cell stats blocks directly rather than running the
+        # ``edges`` expression (the stat-eval path is covered by TestVectorOutputs).
+        # Two populated cells; the rest stay NaN-padded (the empty-cell sentinel).
+        stats = {
+            "count": np.zeros(n, dtype="float32"),
+            "edges": np.full((n, 2), np.nan, dtype="float32"),
+        }
+        stats["count"][0] = 5
+        stats["edges"][0] = [1.0, 9.0]
+        stats["count"][3] = 2
+        stats["edges"][3] = [-2.0, 4.0]
+
+        carrier = _build_output(
+            stats, get_data_vars(cfg), get_agg_fields(cfg), grid, parent, use_arrow=True
+        )
+        # The vector column is carried as a FixedSizeList (issue #29 B').
+        assert carrier.column_names[:2] == ["count", "edges"]
+
+        chunk_idx = grid.block_index(parent)
+        write_dataframe_to_zarr(carrier, store, grid=grid, chunk_idx=chunk_idx)
+
+        group = open_group(store=store, mode="r", path=str(child_order))
+        assert group["edges"].shape == (HEALPIX_BASE_CELLS * 4**child_order, 2)
+        block_start = chunk_idx[0] * n
+        got = group["edges"][block_start : block_start + n]
+
+        # Populated cells round-trip exactly through the trailing-dim selection.
+        np.testing.assert_array_equal(got[0], [1.0, 9.0])
+        np.testing.assert_array_equal(got[3], [-2.0, 4.0])
+        # Empty cells carry the NaN padding sentinel.
+        assert np.all(np.isnan(got[1]))
+        assert np.all(np.isnan(got[2]))
+
+        # A NaN-aware reducer skips the padding: the per-edge mean over cells is
+        # taken only over the two populated rows.
+        reduced = np.nanmean(got, axis=0)
+        np.testing.assert_allclose(reduced, [(1.0 - 2.0) / 2, (9.0 + 4.0) / 2])
+
+    def test_split_trailing_chunk_rejected(self):
+        """The writer enforces the single-trailing-chunk invariant: if the target
+        array chunks the trailing payload dim, ``set_block_selection`` at block 0
+        would drop the rest, so the write must raise instead (issue #29)."""
+        pa = pytest.importorskip("pyarrow")
+        from zarr import create_array
+
+        class _OneChunkGrid:
+            group_path = "g"
+            chunk_shape = (2,)
+
+        store = MemoryStore()
+        # Trailing dim of width 4 deliberately split into two chunks of 2.
+        create_array(
+            store,
+            name="g/edges",
+            shape=(2, 4),
+            chunks=(2, 2),
+            dtype="float32",
+            fill_value=np.float32("nan"),
+        )
+        edges = pa.FixedSizeListArray.from_arrays(
+            pa.array(np.arange(8.0, dtype="float32")), 4
+        )
+        table = pa.table({"edges": edges})
+        with pytest.raises(ValueError, match="one whole chunk"):
+            write_dataframe_to_zarr(
+                table, store, grid=_OneChunkGrid(), chunk_idx=(0,)
+            )
 # ---------------------------------------------------------------------------
 # Structured filters in the read path (issue #43, Phase A)
 # ---------------------------------------------------------------------------

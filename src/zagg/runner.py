@@ -286,12 +286,13 @@ def _process_and_write(shard_key, chunk_idx, records, grid,
         config=config,
         driver=driver,
     )
-    if not df_out.empty:
-        write_dataframe_to_zarr(
-            df_out, zarr_store,
-            grid=grid,
-            chunk_idx=chunk_idx,
-        )
+    # write_dataframe_to_zarr no-ops on an empty carrier (DataFrame or Arrow
+    # table), so no carrier-specific emptiness check is needed here.
+    write_dataframe_to_zarr(
+        df_out, zarr_store,
+        grid=grid,
+        chunk_idx=chunk_idx,
+    )
     return metadata
 
 

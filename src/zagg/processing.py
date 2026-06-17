@@ -23,6 +23,7 @@ from zagg.config import (
     filters_from_data_source,
     get_agg_fields,
     get_data_vars,
+    get_output_signature,
 )
 from zagg.schema import ProcessingMetadata
 
@@ -39,6 +40,18 @@ def _make_url_rewriter(driver: str | None):
     if driver == "https":
         return lambda url: url
     return lambda url: url.replace("s3://", "", 1)
+
+
+def _field_sentinel(meta: dict) -> float:
+    """Per-cell fill value for an agg field's empty/unused slots.
+
+    Mirrors how ``process_shard`` / :func:`_kernel_aggregate` seed their output
+    arrays: the schema-declared ``fill_value`` (default ``"NaN"`` -> ``np.nan``,
+    else the literal numeric fill). Used both for scalar empty cells and for the
+    padding of ``vector`` fields (issue #29 Option B).
+    """
+    fill_value = meta.get("fill_value", "NaN")
+    return np.nan if fill_value == "NaN" else fill_value
 
 
 def _group_columns(
@@ -147,21 +160,88 @@ def _concat_and_group(all_reads, grid, handoff: str):
     return col_arrays, cell_to_slice, n_obs_total
 
 
+def _has_vector_fields(config: PipelineConfig) -> bool:
+    """Whether any aggregation field declares a non-scalar (``vector``) output.
+
+    A pure-scalar config keeps the unchanged pandas carrier; any ``vector`` field
+    (issue #29) routes the whole cell->table handoff through Arrow (see
+    :func:`_arrow_column`).
+    """
+    return any(
+        get_output_signature(meta)["kind"] == "vector"
+        for meta in get_agg_fields(config).values()
+    )
+
+
+def _arrow_column(block: np.ndarray, sig: dict):
+    """Build the Arrow column for one agg field from its per-cell stats block.
+
+    A scalar field's ``(n_cells,)`` block becomes a plain Arrow array (values
+    byte-for-byte identical to the pandas carrier). A ``vector`` field's
+    ``(n_cells, *trailing_shape)`` block becomes a ``FixedSizeList<C>`` column
+    (``C = prod(trailing_shape)``), so every cell carries an identically-sized
+    list. Keeping the vector path a list-carrier (rather than a bespoke 2-D
+    column) is what lets the future ragged t-digest slot in as a variable-length
+    ``List<FixedSizeList<2>>`` through the same seam (issue #29 Tier 2).
+    """
+    import pyarrow as pa
+
+    if sig["kind"] != "vector":
+        return pa.array(block)
+    width = int(np.prod(sig["trailing_shape"]))
+    flat = np.ascontiguousarray(block).reshape(-1)
+    return pa.FixedSizeListArray.from_arrays(pa.array(flat), width)
+
+
+def _build_output(stats_arrays, data_vars, agg_fields, grid, shard_key, use_arrow: bool):
+    """Assemble the per-shard output carrier from the per-cell stats blocks.
+
+    Returns a ``pandas.DataFrame`` for a pure-scalar config (unchanged) or a
+    ``pyarrow.Table`` when any ``vector`` field is present, in both cases with the
+    data-variable columns followed by the grid's per-cell coord columns.
+    """
+    if not use_arrow:
+        df_out = pd.DataFrame({var: stats_arrays[var] for var in data_vars})
+        for col_name, vals in grid.chunk_coords(shard_key).items():
+            df_out[col_name] = vals
+        return df_out
+
+    import pyarrow as pa
+
+    columns = {
+        var: _arrow_column(stats_arrays[var], get_output_signature(agg_fields[var]))
+        for var in data_vars
+    }
+    for col_name, vals in grid.chunk_coords(shard_key).items():
+        columns[col_name] = pa.array(np.asarray(vals))
+    return pa.table(columns)
+
+
+def _carrier_empty(carrier) -> bool:
+    """Whether a process_shard output carrier (DataFrame or Arrow table) is empty."""
+    if isinstance(carrier, pd.DataFrame):
+        return carrier.empty
+    return carrier.num_rows == 0
+
+
 def write_dataframe_to_zarr(
-    df_out: pd.DataFrame,
+    df_out,
     store: Store,
     *,
     grid,
     chunk_idx: tuple,
 ) -> Store:
-    """Write a per-shard DataFrame to an existing Zarr template.
+    """Write a per-shard output carrier to an existing Zarr template.
 
     Parameters
     ----------
-    df_out : pd.DataFrame
-        Coordinate + data-variable columns. Row count must equal
-        ``prod(grid.chunk_shape)``; rows are in the grid's canonical
-        chunk order (``grid.children(shard_key)``).
+    df_out : pandas.DataFrame or pyarrow.Table
+        Coordinate + data-variable columns. A ``pyarrow.Table`` is used when the
+        config declares any ``vector`` field (issue #29): its ``FixedSizeList``
+        columns carry the per-cell ``trailing_shape`` payload, written to a
+        Zarr array with a trailing dimension. Cell count must equal
+        ``prod(grid.chunk_shape)``; cells are in the grid's canonical chunk order
+        (``grid.children(shard_key)``).
     store : Store
         Zarr-compatible store with the template already written.
     grid : OutputGrid
@@ -176,20 +256,29 @@ def write_dataframe_to_zarr(
     Store
         The same store, with data written.
     """
-    if df_out.empty:
+    if _carrier_empty(df_out):
         return store
 
     expected_count = int(np.prod(grid.chunk_shape))
-    if len(df_out) != expected_count:
+    n_cells = len(df_out) if isinstance(df_out, pd.DataFrame) else df_out.num_rows
+    if n_cells != expected_count:
         raise ValueError(
-            f"Expected {expected_count} rows for chunk_shape={grid.chunk_shape}, got {len(df_out)}"
+            f"Expected {expected_count} rows for chunk_shape={grid.chunk_shape}, got {n_cells}"
         )
 
     chunk_idx = tuple(int(i) for i in chunk_idx)
-    for name, series in df_out.items():
-        values = series.values
-        if values.shape != grid.chunk_shape:
-            values = values.reshape(grid.chunk_shape)
+    for name, values in _iter_carrier_columns(df_out):
+        # Scalar columns reshape to the grid's chunk_shape; a vector column keeps
+        # its trailing payload dim(s), so the block (and target array) is
+        # (*chunk_shape, *trailing_shape). The cell count invariant is unchanged.
+        #
+        # Single-trailing-chunk invariant (issue #29): the template
+        # (``grids.base.vector_array_spec``) chunks the trailing payload dim
+        # *whole*, so the trailing block index is always 0 and a shard's payload
+        # lands in one Zarr block via ``chunk_idx + (0,) * len(trailing)``.
+        trailing = values.shape[1:]
+        values = values.reshape((*grid.chunk_shape, *trailing))
+        block_idx = chunk_idx + (0,) * len(trailing)
         with config.set({"async.concurrency": 128}):
             array = open_array(
                 store,
@@ -197,9 +286,45 @@ def write_dataframe_to_zarr(
                 zarr_format=3,
                 consolidated=False,
             )
-            array.set_block_selection(chunk_idx, values)
+            if trailing:
+                # Enforce the single-trailing-chunk invariant: the target array's
+                # trailing chunk must span the whole payload, or set_block_selection
+                # at block 0 would silently write only part of it (issue #29).
+                target_trailing_chunks = array.chunks[len(grid.chunk_shape) :]
+                if target_trailing_chunks != trailing:
+                    raise ValueError(
+                        f"vector field {name!r}: trailing chunk "
+                        f"{target_trailing_chunks} must equal trailing shape "
+                        f"{trailing} (the payload dim must be one whole chunk)"
+                    )
+            array.set_block_selection(block_idx, values)
 
     return store
+
+
+def _iter_carrier_columns(carrier):
+    """Yield ``(name, ndarray)`` for each column of a DataFrame or Arrow table.
+
+    Scalar columns yield a 1-D array; a ``FixedSizeList<C>`` Arrow column yields a
+    2-D ``(n_cells, C)`` array (the per-cell vector block), so the writer can map
+    it onto the Zarr trailing payload dimension (issue #29).
+    """
+    if isinstance(carrier, pd.DataFrame):
+        for name, series in carrier.items():
+            yield name, series.values
+        return
+
+    import pyarrow as pa
+
+    n_rows = carrier.num_rows
+    for name in carrier.column_names:
+        col = carrier.column(name).combine_chunks()
+        if pa.types.is_fixed_size_list(col.type):
+            width = col.type.list_size
+            flat = col.values.to_numpy(zero_copy_only=False)
+            yield name, flat.reshape(n_rows, width)
+        else:
+            yield name, col.to_numpy(zero_copy_only=False)
 
 
 def calculate_cell_statistics(
@@ -243,7 +368,7 @@ def calculate_cell_statistics(
     dict
         Dictionary of statistics keyed by aggregation variable name.
     """
-    from zagg.config import evaluate_expression, resolve_function
+    from zagg.config import _eval_expression_raw, evaluate_expression, resolve_function
 
     if config is None:
         config = default_config()
@@ -251,10 +376,7 @@ def calculate_cell_statistics(
 
     n_obs = len(next(iter(cell_data.values()))) if cell_data else 0
     if n_obs == 0:
-        return {
-            name: (0 if meta.get("function") in ("len", "count") else np.nan)
-            for name, meta in agg_fields.items()
-        }
+        return {name: _empty_cell_value(meta) for name, meta in agg_fields.items()}
 
     result = {}
     for name, meta in agg_fields.items():
@@ -262,10 +384,18 @@ def calculate_cell_statistics(
         expression = meta.get("expression")
         source = meta.get("source") or value_col
         params = dict(meta.get("params", {}))
+        sig = get_output_signature(meta)
 
-        # Expression-based aggregation (e.g. h_sigma)
+        # Expression-based aggregation (e.g. h_sigma). A scalar expression casts
+        # to a Python float; a ``kind: vector`` expression is coerced through the
+        # same ``_coerce_field_value``/``trailing_shape``/dtype path as a vector
+        # ``function`` field (issue #29).
         if expression:
-            result[name] = evaluate_expression(expression, cell_data)
+            if sig["kind"] == "vector":
+                out = _eval_expression_raw(expression, cell_data)
+                result[name] = _coerce_field_value(out, sig)
+            else:
+                result[name] = evaluate_expression(expression, cell_data)
             continue
 
         values = cell_data[source]
@@ -292,9 +422,45 @@ def calculate_cell_statistics(
                 resolved_params[pkey] = pval
 
         func = resolve_function(func_name)
-        result[name] = float(func(values, **resolved_params))
+        out = func(values, **resolved_params)
+        # Scalar fields stay byte-for-byte identical to the pre-#29 path; only a
+        # declared ``vector`` field is allowed to return an ndarray (issue #29).
+        result[name] = _coerce_field_value(out, sig) if sig["kind"] == "vector" else float(out)
 
     return result
+
+
+def _empty_cell_value(meta: dict):
+    """Value emitted for a single agg field when its cell has no observations.
+
+    Scalar fields keep the pre-#29 contract: ``0`` for ``len``/``count``,
+    ``np.nan`` otherwise. A ``vector`` field (issue #29) instead gets a full
+    ``trailing_shape`` array filled with its schema-declared sentinel
+    (:func:`_field_sentinel`), so empty and populated cells emit the same shape.
+    """
+    sig = get_output_signature(meta)
+    if sig["kind"] == "vector":
+        dtype = np.dtype(sig["dtype"]) if sig["dtype"] is not None else np.dtype("float32")
+        return np.full(sig["trailing_shape"], _field_sentinel(meta), dtype=dtype)
+    return 0 if meta.get("function") in ("len", "count") else np.nan
+
+
+def _coerce_field_value(value, sig: dict) -> np.ndarray:
+    """Coerce a ``vector`` field's aggregation output to its declared signature.
+
+    The field's ``function`` or ``expression`` must yield exactly
+    ``trailing_shape`` values (issue #29 Tier-1 fixed-width vectors; ragged/CSR
+    is Tier 2). Returns a contiguous array of the declared dtype (default
+    ``float32``), so every cell emits an identically-shaped slab the dense
+    writer (phase 5) can stack.
+    """
+    dtype = np.dtype(sig["dtype"]) if sig["dtype"] is not None else np.dtype("float32")
+    arr = np.asarray(value, dtype=dtype)
+    if arr.shape != sig["trailing_shape"]:
+        raise ValueError(
+            f"vector field produced shape {arr.shape}, expected {sig['trailing_shape']}"
+        )
+    return arr
 
 
 # EXPERIMENTAL (phase 2b of #30) -----------------------------------------------
@@ -826,12 +992,16 @@ def process_shard(
         stats_arrays = {}
         for name in data_vars:
             meta = agg_fields[name]
+            # Vector fields (issue #29) get a per-cell (n_cells, *trailing_shape)
+            # block; scalars keep the 1-D (n_cells,) layout, unchanged. Either way
+            # ``stats_arrays[name][i] = value`` assigns the cell's result row.
+            shape = (n_cells, *get_output_signature(meta)["trailing_shape"])
             zarr_dtype = np.dtype(meta.get("dtype", "float32"))
             fill_value = meta.get("fill_value", "NaN")
             if fill_value == "NaN":
-                stats_arrays[name] = np.full(n_cells, np.nan, dtype=zarr_dtype)
+                stats_arrays[name] = np.full(shape, np.nan, dtype=zarr_dtype)
             else:
-                stats_arrays[name] = np.zeros(n_cells, dtype=zarr_dtype)
+                stats_arrays[name] = np.zeros(shape, dtype=zarr_dtype)
 
         # Per-cell observation slices (grouped above, carrier-agnostic).
         _empty: dict[str, np.ndarray] = {col: arr[:0] for col, arr in col_arrays.items()}
@@ -854,10 +1024,17 @@ def process_shard(
 
     logger.info(f"  Statistics: {cells_with_data}/{n_cells} cells with data")
 
-    # Create output DataFrame: data_vars + grid-specific per-cell coord columns
-    df_out = pd.DataFrame({var: stats_arrays[var] for var in data_vars})
-    for col_name, vals in grid.chunk_coords(shard_key).items():
-        df_out[col_name] = vals
+    # Assemble the output carrier: a plain DataFrame for a pure-scalar config
+    # (unchanged), or a pyarrow.Table with FixedSizeList vector columns when any
+    # field declares a non-scalar output (issue #29). Scalars stay byte-identical.
+    df_out = _build_output(
+        stats_arrays,
+        data_vars,
+        get_agg_fields(config),
+        grid,
+        shard_key,
+        use_arrow=_has_vector_fields(config),
+    )
 
     duration = (datetime.now() - start_time).total_seconds()
     logger.info(f"Completed shard {shard_key} in {duration:.1f}s")
