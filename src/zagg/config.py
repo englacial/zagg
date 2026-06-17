@@ -415,8 +415,7 @@ def _validate_filters(data_source: dict) -> None:
                 )
             if f.get("level") is not None:
                 raise ValueError(
-                    f"filter[{i}]: 'expression' filters are base-level only "
-                    "(level must be omitted)"
+                    f"filter[{i}]: 'expression' filters are base-level only (level must be omitted)"
                 )
             if not isinstance(f["expression"], str):
                 raise ValueError(f"filter[{i}]: 'expression' must be a string")
@@ -425,29 +424,21 @@ def _validate_filters(data_source: dict) -> None:
             raise ValueError(f"filter[{i}]: structured filter requires 'dataset'")
         op = f.get("op")
         if op not in FILTER_OPS:
-            raise ValueError(
-                f"filter[{i}]: unknown op {op!r} (allowed: {sorted(FILTER_OPS)})"
-            )
+            raise ValueError(f"filter[{i}]: unknown op {op!r} (allowed: {sorted(FILTER_OPS)})")
         col = f.get("column")
-        if col is not None and not isinstance(col, int):
-            raise ValueError(
-                f"filter[{i}]: 'column' must be an integer index (got {col!r})"
-            )
+        if col is not None and (not isinstance(col, int) or isinstance(col, bool)):
+            raise ValueError(f"filter[{i}]: 'column' must be an integer index (got {col!r})")
         if op in _SET_OPS:
             if not isinstance(f.get("values"), list):
                 raise ValueError(f"filter[{i}]: op {op!r} requires a 'values' list")
             for v in f["values"]:
-                if not isinstance(v, (int, float)):
-                    raise ValueError(
-                        f"filter[{i}]: 'values' must be numeric (got {v!r})"
-                    )
+                if not isinstance(v, (int, float)) or isinstance(v, bool):
+                    raise ValueError(f"filter[{i}]: 'values' must be numeric (got {v!r})")
         else:
             if "value" not in f:
                 raise ValueError(f"filter[{i}]: op {op!r} requires a scalar 'value'")
-            if not isinstance(f["value"], (int, float)):
-                raise ValueError(
-                    f"filter[{i}]: 'value' must be numeric (got {f['value']!r})"
-                )
+            if not isinstance(f["value"], (int, float)) or isinstance(f["value"], bool):
+                raise ValueError(f"filter[{i}]: 'value' must be numeric (got {f['value']!r})")
 
 
 def _is_numeric(s: str) -> bool:
@@ -811,9 +802,7 @@ def evaluate_expression(expression: str, columns: dict[str, np.ndarray]) -> floa
     return float(_eval_expression_raw(expression, columns))
 
 
-def evaluate_filter_expression(
-    expression: str, columns: dict[str, np.ndarray]
-) -> np.ndarray:
+def evaluate_filter_expression(expression: str, columns: dict[str, np.ndarray]) -> np.ndarray:
     """Evaluate a boolean filter expression to a per-row mask (issue #43).
 
     Like :func:`evaluate_expression` but returns the raw boolean array rather than

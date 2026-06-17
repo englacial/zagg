@@ -255,6 +255,7 @@ class TestValidation:
 # Structured filters (issue #43, Phase A)
 # ---------------------------------------------------------------------------
 
+
 def _cfg_with_filters(filters=None, quality_filter=None):
     """Minimal valid config with a custom data_source filter spec."""
     ds = {"variables": {"h_li": "/{group}/h_li"}}
@@ -264,9 +265,11 @@ def _cfg_with_filters(filters=None, quality_filter=None):
         ds["quality_filter"] = quality_filter
     return PipelineConfig(
         data_source=ds,
-        aggregation={"variables": {
-            "h_min": {"function": "min", "source": "h_li", "dtype": "float32"},
-        }},
+        aggregation={
+            "variables": {
+                "h_min": {"function": "min", "source": "h_li", "dtype": "float32"},
+            }
+        },
         output={"grid": {"type": "healpix", "parent_order": 6, "child_order": 12}},
     )
 
@@ -298,17 +301,13 @@ class TestFilters:
         assert filters[0]["op"] == "ne"
 
     def test_normalize_set_op_keeps_values_list(self):
-        cfg = _cfg_with_filters(
-            filters=[{"dataset": "/d", "op": "in", "values": [2, 3, 4]}]
-        )
+        cfg = _cfg_with_filters(filters=[{"dataset": "/d", "op": "in", "values": [2, 3, 4]}])
         f = get_filters(cfg)[0]
         assert f["values"] == [2, 3, 4]
         assert "value" not in f
 
     def test_normalize_keep_drop(self):
-        cfg = _cfg_with_filters(
-            filters=[{"dataset": "/d", "op": "eq", "value": 1, "keep": False}]
-        )
+        cfg = _cfg_with_filters(filters=[{"dataset": "/d", "op": "eq", "value": 1, "keep": False}])
         assert get_filters(cfg)[0]["keep"] is False
 
     def test_expression_filter_normalized(self):
@@ -355,10 +354,26 @@ class TestFilters:
             validate_config(cfg)
 
     def test_expression_with_op_rejected(self):
-        cfg = _cfg_with_filters(
-            filters=[{"expression": "h_li > 0", "op": "eq", "dataset": "/d"}]
-        )
+        cfg = _cfg_with_filters(filters=[{"expression": "h_li > 0", "op": "eq", "dataset": "/d"}])
         with pytest.raises(ValueError, match="take no 'op'"):
+            validate_config(cfg)
+
+    def test_bool_column_rejected(self):
+        # bool is a subclass of int; filter column: true must be rejected.
+        cfg = _cfg_with_filters(filters=[{"dataset": "/d", "column": True, "op": "eq", "value": 0}])
+        with pytest.raises(ValueError, match="must be an integer"):
+            validate_config(cfg)
+
+    def test_bool_value_rejected(self):
+        # bool is a subclass of int; filter value: true must be rejected.
+        cfg = _cfg_with_filters(filters=[{"dataset": "/d", "op": "eq", "value": True}])
+        with pytest.raises(ValueError, match="must be numeric"):
+            validate_config(cfg)
+
+    def test_bool_in_values_rejected(self):
+        # bool elements in a 'values' list must be rejected.
+        cfg = _cfg_with_filters(filters=[{"dataset": "/d", "op": "in", "values": [0, True]}])
+        with pytest.raises(ValueError, match="must be numeric"):
             validate_config(cfg)
 
 

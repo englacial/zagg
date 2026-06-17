@@ -651,7 +651,7 @@ class TestProcessShardKernelBranch:
         monkeypatch.setattr("zagg.processing._read_group", fake_read_group)
         monkeypatch.setattr("zagg.processing.h5coro.H5Coro", lambda *a, **k: object())
         # Avoid resolving a real h5coro driver (s3driver import / creds plumbing).
-        monkeypatch.setattr("zagg.processing._make_url_rewriter", lambda driver: (lambda u: u))
+        monkeypatch.setattr("zagg.processing._make_url_rewriter", lambda driver: lambda u: u)
 
     def test_kernel_branch_matches_default_path(self, monkeypatch):
         """process_shard(handoff="arrow-kernel") agrees with the default path on the
@@ -784,7 +784,7 @@ class TestVectorCarrier:
                         "params": {"minlength": 3},
                     },
                 }
-            }
+            },
         )
 
     def test_has_vector_fields(self):
@@ -921,9 +921,7 @@ class TestVectorRoundTrip:
         }
         from zagg.config import PipelineConfig
 
-        return PipelineConfig(
-            data_source=cfg.data_source, aggregation=agg, output=cfg.output
-        )
+        return PipelineConfig(data_source=cfg.data_source, aggregation=agg, output=cfg.output)
 
     def test_vector_leaf_to_zarr_to_read(self):
         pytest.importorskip("pyarrow")
@@ -1000,17 +998,16 @@ class TestVectorRoundTrip:
             dtype="float32",
             fill_value=np.float32("nan"),
         )
-        edges = pa.FixedSizeListArray.from_arrays(
-            pa.array(np.arange(8.0, dtype="float32")), 4
-        )
+        edges = pa.FixedSizeListArray.from_arrays(pa.array(np.arange(8.0, dtype="float32")), 4)
         table = pa.table({"edges": edges})
         with pytest.raises(ValueError, match="one whole chunk"):
-            write_dataframe_to_zarr(
-                table, store, grid=_OneChunkGrid(), chunk_idx=(0,)
-            )
+            write_dataframe_to_zarr(table, store, grid=_OneChunkGrid(), chunk_idx=(0,))
+
+
 # ---------------------------------------------------------------------------
 # Structured filters in the read path (issue #43, Phase A)
 # ---------------------------------------------------------------------------
+
 
 class _FakeH5:
     """Stub h5coro object: ``readDatasets`` returns canned arrays by path.
@@ -1063,9 +1060,12 @@ class TestPredicateMask:
 
     def test_set_ops(self):
         arr = np.array([2, 3, 4, 5])
-        assert _predicate_mask(
-            arr, {"dataset": "/d", "op": "in", "values": [2, 4]}
-        ).tolist() == [True, False, True, False]
+        assert _predicate_mask(arr, {"dataset": "/d", "op": "in", "values": [2, 4]}).tolist() == [
+            True,
+            False,
+            True,
+            False,
+        ]
         assert _predicate_mask(
             arr, {"dataset": "/d", "op": "not_in", "values": [2, 4]}
         ).tolist() == [False, True, False, True]
@@ -1104,12 +1104,14 @@ class TestReadGroupFilters:
         return ds
 
     def test_quality_filter_eq_path(self):
-        h5 = _FakeH5({
-            "/lat": np.array([1.0, 2.0, 3.0, 4.0]),
-            "/lon": np.array([1.0, 2.0, 3.0, 4.0]),
-            "/h": np.array([10.0, 20.0, 30.0, 40.0], dtype=np.float32),
-            "/qs": np.array([0, 1, 0, 1]),
-        })
+        h5 = _FakeH5(
+            {
+                "/lat": np.array([1.0, 2.0, 3.0, 4.0]),
+                "/lon": np.array([1.0, 2.0, 3.0, 4.0]),
+                "/h": np.array([10.0, 20.0, 30.0, 40.0], dtype=np.float32),
+                "/qs": np.array([0, 1, 0, 1]),
+            }
+        )
         ds = self._data_source(quality_filter={"dataset": "/qs", "value": 0})
         df = _read_group(h5, "gt1l", ds, 0, _ShardGrid())
         assert df["h"].tolist() == [10.0, 30.0]
@@ -1118,9 +1120,14 @@ class TestReadGroupFilters:
         # The synthesized base eq filter must reproduce the legacy mask exactly.
         h = np.array([10.0, 20.0, 30.0, 40.0, 50.0], dtype=np.float32)
         qs = np.array([0, 1, 0, 0, 1])
-        h5 = _FakeH5({
-            "/lat": np.arange(5.0), "/lon": np.arange(5.0), "/h": h, "/qs": qs,
-        })
+        h5 = _FakeH5(
+            {
+                "/lat": np.arange(5.0),
+                "/lon": np.arange(5.0),
+                "/h": h,
+                "/qs": qs,
+            }
+        )
         ds = self._data_source(quality_filter={"dataset": "/qs", "value": 0})
         df = _read_group(h5, "gt1l", ds, 0, _ShardGrid())
         expected = h[qs == 0]
@@ -1128,37 +1135,47 @@ class TestReadGroupFilters:
 
     def test_2d_signal_conf_filter(self):
         conf = np.array([[0], [-2], [4], [-2], [3]])  # column 0, surface type
-        h5 = _FakeH5({
-            "/lat": np.arange(5.0), "/lon": np.arange(5.0),
-            "/h": np.arange(5.0, dtype=np.float32), "/conf": conf,
-        })
-        ds = self._data_source(
-            filters=[{"dataset": "/conf", "column": 0, "op": "ne", "value": -2}]
+        h5 = _FakeH5(
+            {
+                "/lat": np.arange(5.0),
+                "/lon": np.arange(5.0),
+                "/h": np.arange(5.0, dtype=np.float32),
+                "/conf": conf,
+            }
         )
+        ds = self._data_source(filters=[{"dataset": "/conf", "column": 0, "op": "ne", "value": -2}])
         df = _read_group(h5, "gt1l", ds, 0, _ShardGrid())
         assert df["h"].tolist() == [0.0, 2.0, 4.0]
 
     def test_multiple_anded_filters(self):
-        h5 = _FakeH5({
-            "/lat": np.arange(5.0), "/lon": np.arange(5.0),
-            "/h": np.arange(5.0, dtype=np.float32),
-            "/conf": np.array([[5], [5], [0], [5], [5]]),
-            "/pod": np.array([0, 0, 0, 1, 0]),
-        })
-        ds = self._data_source(filters=[
-            {"dataset": "/conf", "column": 0, "op": "ne", "value": 0},
-            {"dataset": "/pod", "op": "eq", "value": 0},
-        ])
+        h5 = _FakeH5(
+            {
+                "/lat": np.arange(5.0),
+                "/lon": np.arange(5.0),
+                "/h": np.arange(5.0, dtype=np.float32),
+                "/conf": np.array([[5], [5], [0], [5], [5]]),
+                "/pod": np.array([0, 0, 0, 1, 0]),
+            }
+        )
+        ds = self._data_source(
+            filters=[
+                {"dataset": "/conf", "column": 0, "op": "ne", "value": 0},
+                {"dataset": "/pod", "op": "eq", "value": 0},
+            ]
+        )
         df = _read_group(h5, "gt1l", ds, 0, _ShardGrid())
         # row2 dropped by conf==0, row3 dropped by pod==1
         assert df["h"].tolist() == [0.0, 1.0, 4.0]
 
     def test_in_op_integer_column(self):
-        h5 = _FakeH5({
-            "/lat": np.arange(5.0), "/lon": np.arange(5.0),
-            "/h": np.arange(5.0, dtype=np.float32),
-            "/conf": np.array([[2], [0], [3], [1], [4]]),
-        })
+        h5 = _FakeH5(
+            {
+                "/lat": np.arange(5.0),
+                "/lon": np.arange(5.0),
+                "/h": np.arange(5.0, dtype=np.float32),
+                "/conf": np.array([[2], [0], [3], [1], [4]]),
+            }
+        )
         ds = self._data_source(
             filters=[{"dataset": "/conf", "column": 0, "op": "in", "values": [2, 3, 4]}]
         )
@@ -1166,27 +1183,101 @@ class TestReadGroupFilters:
         assert df["h"].tolist() == [0.0, 2.0, 4.0]
 
     def test_expression_filter_base_level(self):
-        h5 = _FakeH5({
-            "/lat": np.arange(5.0), "/lon": np.arange(5.0),
-            "/h": np.array([-1.0, 2.0, -3.0, 4.0, 5.0], dtype=np.float32),
-        })
+        h5 = _FakeH5(
+            {
+                "/lat": np.arange(5.0),
+                "/lon": np.arange(5.0),
+                "/h": np.array([-1.0, 2.0, -3.0, 4.0, 5.0], dtype=np.float32),
+            }
+        )
         ds = self._data_source(filters=[{"expression": "h > 0"}])
         df = _read_group(h5, "gt1l", ds, 0, _ShardGrid())
         assert df["h"].tolist() == [2.0, 4.0, 5.0]
 
     def test_no_filter_keeps_all(self):
-        h5 = _FakeH5({
-            "/lat": np.arange(3.0), "/lon": np.arange(3.0),
-            "/h": np.arange(3.0, dtype=np.float32),
-        })
+        h5 = _FakeH5(
+            {
+                "/lat": np.arange(3.0),
+                "/lon": np.arange(3.0),
+                "/h": np.arange(3.0, dtype=np.float32),
+            }
+        )
         df = _read_group(h5, "gt1l", self._data_source(), 0, _ShardGrid())
         assert df["h"].tolist() == [0.0, 1.0, 2.0]
 
     def test_all_filtered_returns_none(self):
-        h5 = _FakeH5({
-            "/lat": np.arange(3.0), "/lon": np.arange(3.0),
-            "/h": np.arange(3.0, dtype=np.float32),
-            "/qs": np.array([1, 1, 1]),
-        })
+        h5 = _FakeH5(
+            {
+                "/lat": np.arange(3.0),
+                "/lon": np.arange(3.0),
+                "/h": np.arange(3.0, dtype=np.float32),
+                "/qs": np.array([1, 1, 1]),
+            }
+        )
         ds = self._data_source(quality_filter={"dataset": "/qs", "value": 0})
         assert _read_group(h5, "gt1l", ds, 0, _ShardGrid()) is None
+
+    def test_filter_dataset_coincides_with_variable_path(self):
+        # Filter dataset path == variable path exercises the dedup branch
+        # (path must appear exactly once in the h5coro read list).
+        h5 = _FakeH5(
+            {
+                "/lat": np.arange(5.0),
+                "/lon": np.arange(5.0),
+                "/h": np.array([0.0, 1.0, 2.0, 3.0, 4.0], dtype=np.float32),
+            }
+        )
+        ds = self._data_source(filters=[{"dataset": "/h", "op": "ge", "value": 2.0}])
+        df = _read_group(h5, "gt1l", ds, 0, _ShardGrid())
+        assert df["h"].tolist() == [2.0, 3.0, 4.0]
+
+    def test_expression_filter_after_structured(self):
+        # Expression filter ANDed after a structured predicate.
+        h5 = _FakeH5(
+            {
+                "/lat": np.arange(5.0),
+                "/lon": np.arange(5.0),
+                "/h": np.array([1.0, 2.0, 3.0, 4.0, 5.0], dtype=np.float32),
+                "/qs": np.array([0, 0, 1, 0, 0]),
+            }
+        )
+        ds = self._data_source(
+            filters=[
+                {"dataset": "/qs", "op": "eq", "value": 0},
+                {"expression": "h > 2"},
+            ]
+        )
+        df = _read_group(h5, "gt1l", ds, 0, _ShardGrid())
+        # structured drops row2 (qs==1); expression keeps h>2 from remainder
+        assert df["h"].tolist() == [4.0, 5.0]
+
+    def test_two_sequential_expression_filters(self):
+        # Two sequential expression filters both applied.
+        h5 = _FakeH5(
+            {
+                "/lat": np.arange(6.0),
+                "/lon": np.arange(6.0),
+                "/h": np.array([1.0, 2.0, 3.0, 4.0, 5.0, 6.0], dtype=np.float32),
+            }
+        )
+        ds = self._data_source(
+            filters=[
+                {"expression": "h > 2"},
+                {"expression": "h < 6"},
+            ]
+        )
+        df = _read_group(h5, "gt1l", ds, 0, _ShardGrid())
+        assert df["h"].tolist() == [3.0, 4.0, 5.0]
+
+    def test_expression_filter_undefined_name_raises(self):
+        # Expression referencing an undefined name re-raises as NameError.
+        h5 = _FakeH5(
+            {
+                "/lat": np.arange(3.0),
+                "/lon": np.arange(3.0),
+                "/h": np.arange(3.0, dtype=np.float32),
+            }
+        )
+        ds = self._data_source(filters=[{"expression": "undefined_col > 0"}])
+        with pytest.raises(NameError, match="undefined name"):
+            _read_group(h5, "gt1l", ds, 0, _ShardGrid())
