@@ -494,7 +494,7 @@ def _quality_mask(q_flag: np.ndarray, quality_filter: dict) -> np.ndarray:
     - ``"eq"`` keeps rows where the flag equals ``value`` (ATL06: keep
       ``atl06_quality_summary == 0``).
     - ``"ne"`` keeps rows where the flag differs from ``value`` (ATL03: keep
-      ``signal_conf_ph != 0``, dropping only the noise flag).
+      ``signal_conf_ph != -2``, dropping only TEP photons).
 
     When ``q_flag`` is 2-D (e.g. ATL03 ``signal_conf_ph`` is ``(n_photons,
     n_surface_types)``), the comparison is reduced **across all surface-type
