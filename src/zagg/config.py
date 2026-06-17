@@ -13,6 +13,40 @@ import yaml
 import zagg.configs
 
 
+class LinkDict(TypedDict):
+    """Per-level link to the next coarser level (issue #43, Phase B).
+
+    A *link* describes a contiguous-range parent->child tiling: each parent segment
+    ``p`` covers base-rate indices ``[index_beg[p] - index_base, ...`` for
+    ``count[p]`` children.  ``index_base`` shifts the raw ``index_beg`` values so
+    that Python 0-based indexing into the base array is straightforward.
+
+    ``reference_index`` is a reserved slot for a future explicit-index-array variant
+    (non-contiguous children per parent); leave it ``None`` for the contiguous case.
+    """
+
+    to: str  # key of the coarser level in ``levels``
+    index_beg: str  # HDF5 path for the per-parent start index array
+    count: str  # HDF5 path for the per-parent child count array
+    index_base: NotRequired[int]  # subtracted from index_beg values (default 0)
+    reference_index: NotRequired[str | None]  # reserved; must be None
+
+
+class LevelDict(TypedDict):
+    """One hierarchical level in a multi-rate HDF5 source (issue #43, Phase B).
+
+    A source may have several rates (e.g. ATL03 ``photons`` and ``segments``).
+    Each level declares its own ``path``, ``coordinates``, and ``variables``,
+    plus an optional ``link`` to a coarser parent level.  The flat single-level
+    form (no ``levels``/``base_level`` keys in ``data_source``) stays first-class.
+    """
+
+    path: str  # HDF5 group path template (may contain ``{group}``)
+    coordinates: list[str]  # coordinate dataset names within ``path``
+    variables: list[str]  # variable dataset names within ``path``
+    link: NotRequired[LinkDict | None]
+
+
 class DataSourceDict(TypedDict):
     """Type hints for the ``data_source`` section of a pipeline config."""
 
@@ -22,6 +56,11 @@ class DataSourceDict(TypedDict):
     variables: dict[str, str]
     quality_filter: NotRequired[dict]
     filters: NotRequired[list[dict]]
+    # Hierarchical multi-level form (issue #43, Phase B). When present, the flat
+    # ``coordinates``/``variables`` keys are still accepted for the base level but
+    # ``levels`` + ``base_level`` take precedence for the read path.
+    levels: NotRequired[dict[str, LevelDict]]
+    base_level: NotRequired[str]
 
 
 # Structured-predicate comparison operators (issue #43). ``in``/``not_in`` take a
@@ -177,6 +216,9 @@ def validate_config(config: PipelineConfig) -> None:
 
     # Validate the structured filter list (issue #43, Phase A)
     _validate_filters(config.data_source)
+
+    # Validate hierarchical multi-level form (issue #43, Phase B)
+    _validate_levels(config.data_source)
 
     ds_vars = set(config.data_source.get("variables", {}).keys())
     agg_vars = config.aggregation.get("variables", {})
@@ -439,6 +481,101 @@ def _validate_filters(data_source: dict) -> None:
                 raise ValueError(f"filter[{i}]: op {op!r} requires a scalar 'value'")
             if not isinstance(f["value"], (int, float)) or isinstance(f["value"], bool):
                 raise ValueError(f"filter[{i}]: 'value' must be numeric (got {f['value']!r})")
+
+
+def _validate_levels(data_source: dict) -> None:
+    """Validate the hierarchical ``levels``/``base_level`` form (issue #43, Phase B).
+
+    Rules:
+    - ``base_level`` must name a key in ``levels``.
+    - ``link.to`` in each level must name another key in ``levels``.
+    - ``link.index_base`` must be a non-negative int when present.
+    - ``link.reference_index`` must be ``None`` when present (reserved slot).
+    - Only ``base_level`` may omit ``link`` (it has no coarser parent).
+    - Flat single-level form (no ``levels`` key) is always valid.
+    """
+    levels = data_source.get("levels")
+    if levels is None:
+        return
+    if not isinstance(levels, dict) or not levels:
+        raise ValueError("data_source.levels must be a non-empty mapping")
+    base_level = data_source.get("base_level")
+    if base_level is None:
+        raise ValueError("data_source.base_level is required when levels is present")
+    if base_level not in levels:
+        raise ValueError(
+            f"data_source.base_level {base_level!r} is not a key in levels "
+            f"(available: {sorted(levels)})"
+        )
+    level_keys = set(levels)
+    for name, lvl in levels.items():
+        if not isinstance(lvl, dict):
+            raise ValueError(f"levels.{name} must be a mapping")
+        if "path" not in lvl:
+            raise ValueError(f"levels.{name}: 'path' is required")
+        link = lvl.get("link")
+        if link is None:
+            if name != base_level:
+                raise ValueError(
+                    f"levels.{name}: non-base levels must have a 'link' "
+                    f"(only {base_level!r} may omit it)"
+                )
+            continue
+        if not isinstance(link, dict):
+            raise ValueError(f"levels.{name}.link must be a mapping")
+        for field_name in ("to", "index_beg", "count"):
+            if field_name not in link:
+                raise ValueError(f"levels.{name}.link: '{field_name}' is required")
+        unknown = set(link) - {"to", "index_beg", "count", "index_base", "reference_index"}
+        if unknown:
+            raise ValueError(
+                f"levels.{name}.link: unknown fields {sorted(unknown)} "
+                f"(allowed: to, index_beg, count, index_base, reference_index)"
+            )
+        if link["to"] not in level_keys:
+            raise ValueError(
+                f"levels.{name}.link.to {link['to']!r} is not a key in levels "
+                f"(available: {sorted(level_keys)})"
+            )
+        index_base = link.get("index_base", 0)
+        if not isinstance(index_base, int) or isinstance(index_base, bool) or index_base < 0:
+            raise ValueError(
+                f"levels.{name}.link.index_base must be a non-negative int (got {index_base!r})"
+            )
+        ref = link.get("reference_index")
+        if ref is not None:
+            raise ValueError(
+                f"levels.{name}.link.reference_index is reserved and must be null/omitted "
+                f"(explicit index-array variant not yet implemented)"
+            )
+
+
+def get_levels(config: "PipelineConfig") -> dict | None:
+    """Return the ``levels`` mapping from the data source, or ``None`` if flat.
+
+    Parameters
+    ----------
+    config : PipelineConfig
+
+    Returns
+    -------
+    dict or None
+    """
+    return config.data_source.get("levels")
+
+
+def get_base_level(config: "PipelineConfig") -> str | None:
+    """Return the ``base_level`` key from the data source, or ``None`` if flat.
+
+    Parameters
+    ----------
+    config : PipelineConfig
+
+    Returns
+    -------
+    str or None
+    """
+    return config.data_source.get("base_level")
 
 
 def _is_numeric(s: str) -> bool:
