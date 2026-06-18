@@ -1987,3 +1987,55 @@ class TestPlannedReadGroup:
         # Same row -- leaf_id == lat under _LatBboxGrid.assign.
         assert df_planned["leaf_id"].tolist() == df_full["leaf_id"].tolist()
         assert df_planned["h"].tolist() == df_full["h"].tolist()
+
+    def test_shipped_atl03_template_through_planned_read(self):
+        # End-to-end coverage of the shipped ``atl03`` template against an
+        # ATL03-shaped ``_FakeH5`` stub: real ``{group}`` path templates,
+        # ``index_base: 1`` arithmetic, ``pad: 1``, and the 2-D
+        # ``signal_conf_ph`` TEP filter all run through ``_planned_read_group``
+        # together. This is the integration test the phase 6 review flagged
+        # was missing -- without it a future YAML edit dropping ``index_base``
+        # (defaulting to 0) lands green on the synthetic ``_planned_read_h5``
+        # fixture even though it'd be wrong on real ATL03.
+        from zagg.config import default_config
+
+        cfg = default_config("atl03")
+        ds = cfg.data_source
+        # 4 segments × 2 photons = 8 photons, 1-based ph_index_beg.
+        seg_lats = np.array([0.0, 100.0, 200.0, 300.0])
+        seg_lons = np.zeros(4)
+        ibeg = np.array([1, 3, 5, 7], dtype=np.int64)  # 1-based per ATL03 v3 dict
+        cnt = np.array([2, 2, 2, 2], dtype=np.int64)
+        ph_lats = np.array([0.0, 50.0, 100.0, 150.0, 200.0, 250.0, 300.0, 350.0])
+        ph_lons = np.zeros(8)
+        h_ph = np.arange(8.0, dtype=np.float32) * 10.0
+        # 2-D signal_conf_ph (n_photons × 5 surface types). One TEP photon
+        # (uniform -2) at index 4 -- filter must drop it.
+        signal_conf = np.full((8, 5), 4, dtype=np.int8)
+        signal_conf[4, :] = -2
+        h5 = _FakeH5(
+            {
+                "/gt1l/heights/lat_ph": ph_lats,
+                "/gt1l/heights/lon_ph": ph_lons,
+                "/gt1l/heights/h_ph": h_ph,
+                "/gt1l/heights/signal_conf_ph": signal_conf,
+                "/gt1l/geolocation/reference_photon_lat": seg_lats,
+                "/gt1l/geolocation/reference_photon_lon": seg_lons,
+                "/gt1l/geolocation/ph_index_beg": ibeg,
+                "/gt1l/geolocation/segment_ph_cnt": cnt,
+            }
+        )
+        # Bbox around segment 2 (lat=200); pad=1 (the shipped default) widens
+        # the matched parent run by one on each side. The permissive grid
+        # accepts every photon read so the planned path's output is the
+        # post-filter photon set.
+        grid = _BboxGrid((-0.1, 175.0, 0.1, 225.0))
+        df = _read_group(h5, "gt1l", ds, 0, grid)
+        assert df is not None
+        # Without pad the bbox (lat 175..225) matches seg 2 (lat=200) directly
+        # and seg 1 via the lstr 1->2 sweep (lat 100->200 crosses y=175); seg
+        # 2's own lstr 2->3 (200->300) pulls in seg 2 again. With pad=1 the
+        # run [1, 2] widens to [0, 3]. Plan covers photons 0..7. The 2-D
+        # signal_conf_ph filter drops photon 4 (uniform TEP -2 across all 5
+        # surface types). Survivors: 0, 1, 2, 3, 5, 6, 7.
+        assert df["h_ph"].tolist() == [0.0, 10.0, 20.0, 30.0, 50.0, 60.0, 70.0]

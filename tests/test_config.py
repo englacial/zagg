@@ -1139,10 +1139,14 @@ class TestATL03WaveformCountsTemplate:
         rp = ds["read_plan"]
         assert rp["spatial_index"] == "segments"
         assert rp["pad"] == 1
-        # Cross-check the link is identical to atl03's so the two templates
-        # share the same plan_read inputs on the same granule.
+        # Cross-check only the fields that drive ``plan_read`` parity: the
+        # link's source/target arrays + index_base. Other level fields
+        # (documentation-only ``variables``, coord names, formatting) can
+        # legitimately diverge across templates without affecting the plan.
         atl03_link = default_config("atl03").data_source["levels"]["segments"]["link"]
-        assert ds["levels"]["segments"]["link"] == atl03_link
+        wf_link = ds["levels"]["segments"]["link"]
+        for key in ("to", "index_beg", "count", "index_base"):
+            assert wf_link[key] == atl03_link[key], f"link.{key} diverges from atl03.yaml"
 
 
 # ---------------------------------------------------------------------------

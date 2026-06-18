@@ -41,16 +41,16 @@ data_source:
       op: ne
       value: -2
   base_level: photons
+  # See atl03.yaml for the rationale behind the bare-name coordinates +
+  # absolute link path templates + documentation-only level ``variables``.
   levels:
     photons:
       path: "/{group}/heights"
       coordinates: {latitude: lat_ph, longitude: lon_ph}
-      variables: {h_ph: h_ph, signal_conf_ph: signal_conf_ph}
       link: null
     segments:
       path: "/{group}/geolocation"
       coordinates: {latitude: reference_photon_lat, longitude: reference_photon_lon}
-      variables: {ph_index_beg: ph_index_beg, segment_ph_cnt: segment_ph_cnt}
       link:
         to: photons
         index_beg: "/{group}/geolocation/ph_index_beg"
