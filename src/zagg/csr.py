@@ -113,7 +113,11 @@ def _write_array(store: Store, path: str, data: np.ndarray, *, zarr_format: int 
         path=path,
         mode="w",
         shape=data.shape,
-        chunks=data.shape if data.size > 0 else (1,) * data.ndim,
+        chunks=data.shape
+        if data.size > 0
+        else tuple(max(1, d) for d in data.shape)
+        if data.ndim > 1
+        else (1,),
         dtype=data.dtype,
         zarr_format=zarr_format,
     )
@@ -124,6 +128,8 @@ def _write_array(store: Store, path: str, data: np.ndarray, *, zarr_format: int 
 def read_csr(
     store: Store,
     field_name: str,
+    *,
+    zarr_format: int = 3,
 ) -> dict[str, np.ndarray]:
     """Read CSR arrays written by :func:`write_csr`.
 
@@ -133,6 +139,9 @@ def read_csr(
         Zarr-compatible store.
     field_name : str
         Prefix used when writing (``{field_name}/values`` etc.).
+    zarr_format : int, optional
+        Zarr format version.  Must match the version used when writing.
+        Default 3.
 
     Returns
     -------
@@ -142,9 +151,15 @@ def read_csr(
           is the payload for cell ``cell_ids[k]``.
         - ``cell_ids`` : which cells (by chunk position) have data.
     """
-    values = zarr.open_array(store, path=f"{field_name}/values", mode="r", zarr_format=3)[...]
-    offsets = zarr.open_array(store, path=f"{field_name}/offsets", mode="r", zarr_format=3)[...]
-    cell_ids = zarr.open_array(store, path=f"{field_name}/cell_ids", mode="r", zarr_format=3)[...]
+    values = zarr.open_array(store, path=f"{field_name}/values", mode="r", zarr_format=zarr_format)[
+        ...
+    ]
+    offsets = zarr.open_array(
+        store, path=f"{field_name}/offsets", mode="r", zarr_format=zarr_format
+    )[...]
+    cell_ids = zarr.open_array(
+        store, path=f"{field_name}/cell_ids", mode="r", zarr_format=zarr_format
+    )[...]
     return {"values": values, "offsets": offsets, "cell_ids": cell_ids}
 
 

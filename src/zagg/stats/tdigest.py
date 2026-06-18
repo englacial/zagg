@@ -130,11 +130,17 @@ def build_tdigest(
     cur_mean = sorted_vals[0]
     cur_weight = 1.0
     # cum_w tracks total weight processed so far (finalized + current centroid).
+    # Loop invariant: at the start of each iteration, cum_w == i (total weight
+    # seen up to but not including sorted_vals[i]).  The fractional rank
+    # q = (cum_w - cur_weight/2) / n_total is evaluated *before* attempting to
+    # merge sorted_vals[i], so the budget is assessed one observation behind the
+    # true midpoint — a standard approximation in the sequential sort-and-merge
+    # variant that avoids a second pass.
     cum_w = 1.0
 
     for i in range(1, n):
         v = sorted_vals[i]
-        # Fractional rank of the current centroid's midpoint.
+        # Fractional rank of the current centroid's midpoint (one obs behind).
         q = (cum_w - cur_weight / 2.0) / n_total
         bud = _budget(q, delta_f)
         if cur_weight + 1.0 <= bud:
