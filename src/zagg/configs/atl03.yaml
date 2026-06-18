@@ -14,6 +14,12 @@
 # replaces the older flat ``quality_filter`` form to access the ``column`` and
 # ``op: ne`` knobs (issue #43, Phase A). Grid is rectilinear (HEALPix order-19,
 # the ~10 m match, waits on mortie #35).
+#
+# Multi-level form (issue #43 Phase B + C) is declared so the read path can
+# bound base-rate IO via the coarse ``segments`` rep-point coords + the
+# ``ph_index_beg``/``segment_ph_cnt`` link. Without this, ``lat_ph``/``lon_ph``
+# would be full-read (~245 MB per beam) before any spatial filter, which is the
+# dominant driver of the Lambda OOMs on ATL03 region runs (#43 motivation).
 data_source:
   reader: h5coro
   driver: s3
@@ -28,6 +34,25 @@ data_source:
       column: 0                  # land surface type; TEP is uniform across columns
       op: ne
       value: -2
+  base_level: photons
+  levels:
+    photons:
+      path: "/{group}/heights"
+      coordinates: {latitude: lat_ph, longitude: lon_ph}
+      variables: {h_ph: h_ph, signal_conf_ph: signal_conf_ph}
+      link: null
+    segments:
+      path: "/{group}/geolocation"
+      coordinates: {latitude: reference_photon_lat, longitude: reference_photon_lon}
+      variables: {ph_index_beg: ph_index_beg, segment_ph_cnt: segment_ph_cnt}
+      link:
+        to: photons
+        index_beg: "/{group}/geolocation/ph_index_beg"
+        count: "/{group}/geolocation/segment_ph_cnt"
+        index_base: 1            # ATL03 ph_index_beg is 1-based per the v3 dict
+  read_plan:
+    spatial_index: segments
+    pad: 1                       # one segment of padding on each side per #43
 
 aggregation:
   variables:

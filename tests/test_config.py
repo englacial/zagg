@@ -142,6 +142,27 @@ class TestATL03Template:
         assert grid["type"] == "rectilinear"
         assert len(grid["bounds"]) == 4
 
+    def test_multi_level_form_for_planned_reads(self, atl03_config):
+        # Phase 6: the template declares the ``photons`` (base) + ``segments``
+        # (coarse) levels and the link arrays so the #43 Phase C read_plan can
+        # bound base-rate IO. Without this the ATL03 region runs OOM on Lambda
+        # (245 MB-per-beam coord-read floor; see #43).
+        ds = atl03_config.data_source
+        assert ds["base_level"] == "photons"
+        levels = ds["levels"]
+        assert set(levels) == {"photons", "segments"}
+        assert levels["photons"]["link"] is None
+        seg_link = levels["segments"]["link"]
+        assert seg_link["to"] == "photons"
+        assert seg_link["index_beg"].endswith("ph_index_beg")
+        assert seg_link["count"].endswith("segment_ph_cnt")
+        assert seg_link["index_base"] == 1  # ATL03 ph_index_beg is 1-based
+
+    def test_read_plan_targets_segments_level(self, atl03_config):
+        rp = atl03_config.data_source["read_plan"]
+        assert rp["spatial_index"] == "segments"
+        assert rp["pad"] == 1
+
 
 # ---------------------------------------------------------------------------
 # Function resolution
@@ -1108,6 +1129,20 @@ class TestATL03WaveformCountsTemplate:
         grid = cfg.output["grid"]
         assert grid["type"] == "rectilinear"
         assert len(grid["bounds"]) == 4
+
+    def test_multi_level_form_matches_atl03(self, cfg):
+        # Phase 6: waveform template carries the same multi-level form +
+        # read_plan as atl03.yaml so the planned-IO benefits apply equally.
+        ds = cfg.data_source
+        assert ds["base_level"] == "photons"
+        assert set(ds["levels"]) == {"photons", "segments"}
+        rp = ds["read_plan"]
+        assert rp["spatial_index"] == "segments"
+        assert rp["pad"] == 1
+        # Cross-check the link is identical to atl03's so the two templates
+        # share the same plan_read inputs on the same granule.
+        atl03_link = default_config("atl03").data_source["levels"]["segments"]["link"]
+        assert ds["levels"]["segments"]["link"] == atl03_link
 
 
 # ---------------------------------------------------------------------------

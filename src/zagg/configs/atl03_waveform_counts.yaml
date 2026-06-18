@@ -23,7 +23,9 @@
 #
 # Confidence filter is the same as atl03.yaml: drop only TEP photons by the
 # structured ``filters:`` list (signal_conf_ph[:, 0] != -2; TEP is uniform
-# across surface types). Grid is rectilinear, matching atl03.yaml.
+# across surface types). Multi-level form + ``read_plan`` also identical to
+# atl03.yaml so the planned-IO benefits (#43 Phase C) apply to the waveform
+# template equally. Grid is rectilinear, matching atl03.yaml.
 data_source:
   reader: h5coro
   driver: s3
@@ -38,6 +40,25 @@ data_source:
       column: 0                  # land surface type; TEP is uniform across columns
       op: ne
       value: -2
+  base_level: photons
+  levels:
+    photons:
+      path: "/{group}/heights"
+      coordinates: {latitude: lat_ph, longitude: lon_ph}
+      variables: {h_ph: h_ph, signal_conf_ph: signal_conf_ph}
+      link: null
+    segments:
+      path: "/{group}/geolocation"
+      coordinates: {latitude: reference_photon_lat, longitude: reference_photon_lon}
+      variables: {ph_index_beg: ph_index_beg, segment_ph_cnt: segment_ph_cnt}
+      link:
+        to: photons
+        index_beg: "/{group}/geolocation/ph_index_beg"
+        count: "/{group}/geolocation/segment_ph_cnt"
+        index_base: 1            # ATL03 ph_index_beg is 1-based per the v3 dict
+  read_plan:
+    spatial_index: segments
+    pad: 1                       # one segment of padding on each side per #43
 
 aggregation:
   variables:
