@@ -1036,7 +1036,7 @@ def process_shard(
     logger.info(f"Completed shard {shard_key} in {duration:.1f}s")
 
     metadata["cells_with_data"] = cells_with_data
-    metadata["total_obs"] = int(stats_arrays["count"].sum())
+    metadata["total_obs"] = n_obs_total
     metadata["duration_s"] = duration
 
     return df_out, metadata

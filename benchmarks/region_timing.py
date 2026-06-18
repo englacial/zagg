@@ -307,7 +307,7 @@ def run_one_waveform(
         )
         # Shape check: waveform_counts must carry the 128-element trailing dim.
         wf = arrays["pandas"]["waveform_counts"]
-        if wf.ndim != 2 or wf.shape[1] != 128:
+        if wf.shape[-1] != 128:
             raise AssertionError(
                 f"{region.name}/{window}: waveform_counts shape {wf.shape} expected (..., 128)"
             )
