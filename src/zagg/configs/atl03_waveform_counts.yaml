@@ -1,16 +1,21 @@
 # ATL03 per-cell waveform-counts template.
 #
 # Aggregates photon heights (h_ph) into a 128-bin fixed-width histogram at 2 m
-# vertical spacing, centred on the per-cell median of the ICESat-2 reference
-# DEM height (dem_h). Each bin spans 2 m, giving a 256 m window
-# [median(dem_h) - 128 m, median(dem_h) + 128 m). Out-of-range photons are
-# dropped (not counted). The companion scalar bin_start records median(dem_h)
-# so the absolute elevation of bin 0 can be recovered downstream.
+# vertical spacing, centred on the per-cell median of h_ph itself. Each bin
+# spans 2 m, giving a 256 m window [median(h_ph) - 128 m, median(h_ph) + 128 m).
+# Out-of-range photons are dropped (not counted). The companion scalar
+# bin_start records median(h_ph) so the absolute elevation of bin 0 can be
+# recovered downstream.
 #
-# Both h_ph and dem_h live in the ATL03 heights group (NSIDC ATL03 v3 data
-# dictionary). Confidence filter is the same as atl03.yaml: drop only TEP
-# photons (signal_conf_ph == -2 across all surface types). Grid is rectilinear,
-# matching atl03.yaml.
+# Note (issue #30 thread): an earlier draft of this template tried to centre
+# on np.median(dem_h), but dem_h lives in /{group}/geophys_corr/dem_h at the
+# segment level (one value per ~100 photons), not the heights group; centring
+# on the cell's own median(h_ph) is more natural for a photon-height density
+# template and avoids the cross-group / resolution-mismatch read.
+#
+# Confidence filter is the same as atl03.yaml: drop only TEP photons by the
+# structured ``filters:`` list (signal_conf_ph[:, 0] != -2; TEP is uniform
+# across surface types). Grid is rectilinear, matching atl03.yaml.
 data_source:
   reader: h5coro
   driver: s3
@@ -20,24 +25,24 @@ data_source:
     longitude: "/{group}/heights/lon_ph"
   variables:
     h_ph: "/{group}/heights/h_ph"
-    dem_h: "/{group}/heights/dem_h"
-  quality_filter:
-    dataset: "/{group}/heights/signal_conf_ph"
-    value: -2                      # TEP flag; reduced across all surface types
-    op: ne
+  filters:
+    - dataset: "/{group}/heights/signal_conf_ph"
+      column: 0                  # land surface type; TEP is uniform across columns
+      op: ne
+      value: -2
 
 aggregation:
   variables:
     waveform_counts:
       kind: vector
       trailing_shape: 128
-      expression: "np.histogram(h_ph - np.median(dem_h), 128, (-128.0, 128.0))[0].astype('uint32')"
+      expression: "np.histogram(h_ph - np.median(h_ph), 128, (-128.0, 128.0))[0].astype('uint32')"
       source: h_ph
       dtype: uint32
       fill_value: 0
     bin_start:
       function: median
-      source: dem_h
+      source: h_ph
       dtype: float32
 
 output:

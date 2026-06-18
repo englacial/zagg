@@ -19,6 +19,8 @@ from zarr.abc.store import Store
 from zagg.config import (
     PipelineConfig,
     default_config,
+    evaluate_filter_expression,
+    filters_from_data_source,
     get_agg_fields,
     get_data_vars,
     get_output_signature,
@@ -166,8 +168,19 @@ def _has_vector_fields(config: PipelineConfig) -> bool:
     :func:`_arrow_column`).
     """
     return any(
-        get_output_signature(meta)["kind"] == "vector"
-        for meta in get_agg_fields(config).values()
+        get_output_signature(meta)["kind"] == "vector" for meta in get_agg_fields(config).values()
+    )
+
+
+def _has_ragged_fields(config: PipelineConfig) -> bool:
+    """Whether any aggregation field declares a ``ragged`` (CSR) output.
+
+    Ragged fields (issue #48) carry variable-length per-cell payloads and are
+    collected separately from scalar/vector fields; they are written via the CSR
+    writer rather than the dense Zarr path.
+    """
+    return any(
+        get_output_signature(meta)["kind"] == "ragged" for meta in get_agg_fields(config).values()
     )
 
 
@@ -387,11 +400,16 @@ def calculate_cell_statistics(
         # Expression-based aggregation (e.g. h_sigma). A scalar expression casts
         # to a Python float; a ``kind: vector`` expression is coerced through the
         # same ``_coerce_field_value``/``trailing_shape``/dtype path as a vector
-        # ``function`` field (issue #29).
+        # ``function`` field (issue #29). A ``kind: ragged`` expression (issue #48)
+        # returns the raw result as a numpy array — the CSR writer receives it as
+        # a variable-length per-cell payload.
         if expression:
             if sig["kind"] == "vector":
                 out = _eval_expression_raw(expression, cell_data)
                 result[name] = _coerce_field_value(out, sig)
+            elif sig["kind"] == "ragged":
+                out = _eval_expression_raw(expression, cell_data)
+                result[name] = _coerce_ragged_value(out, sig)
             else:
                 result[name] = evaluate_expression(expression, cell_data)
             continue
@@ -421,9 +439,16 @@ def calculate_cell_statistics(
 
         func = resolve_function(func_name)
         out = func(values, **resolved_params)
-        # Scalar fields stay byte-for-byte identical to the pre-#29 path; only a
-        # declared ``vector`` field is allowed to return an ndarray (issue #29).
-        result[name] = _coerce_field_value(out, sig) if sig["kind"] == "vector" else float(out)
+        # Scalar fields stay byte-for-byte identical to the pre-#29 path; a
+        # declared ``vector`` field coerces to its trailing_shape (issue #29); a
+        # ``ragged`` field (issue #48) returns a variable-length numpy array that
+        # the CSR writer later packs into flat + offsets + cell_ids arrays.
+        if sig["kind"] == "vector":
+            result[name] = _coerce_field_value(out, sig)
+        elif sig["kind"] == "ragged":
+            result[name] = _coerce_ragged_value(out, sig)
+        else:
+            result[name] = float(out)
 
     return result
 
@@ -435,8 +460,12 @@ def _empty_cell_value(meta: dict):
     ``np.nan`` otherwise. A ``vector`` field (issue #29) instead gets a full
     ``trailing_shape`` array filled with its schema-declared sentinel
     (:func:`_field_sentinel`), so empty and populated cells emit the same shape.
+    A ``ragged`` field (issue #48) returns an empty list ``[]`` — the CSR writer
+    handles absent cells by leaving them out of ``cell_ids``.
     """
     sig = get_output_signature(meta)
+    if sig["kind"] == "ragged":
+        return []
     if sig["kind"] == "vector":
         dtype = np.dtype(sig["dtype"]) if sig["dtype"] is not None else np.dtype("float32")
         return np.full(sig["trailing_shape"], _field_sentinel(meta), dtype=dtype)
@@ -459,6 +488,40 @@ def _coerce_field_value(value, sig: dict) -> np.ndarray:
             f"vector field produced shape {arr.shape}, expected {sig['trailing_shape']}"
         )
     return arr
+
+
+def _coerce_ragged_value(value, sig: dict) -> np.ndarray:
+    """Coerce a ``ragged`` field's aggregation output to a 2-D numpy array.
+
+    A ragged field (issue #48) emits a variable-length array of shape
+    ``(n_elements, *inner_shape)`` per cell. This function verifies the inner
+    dimensions match the declared ``inner_shape`` and returns a contiguous
+    array of the declared dtype (default ``float32``), ready for the CSR writer.
+
+    Parameters
+    ----------
+    value : array-like
+        The raw result from the field's function or expression.
+    sig : dict
+        Output signature from :func:`zagg.config.get_output_signature`.
+
+    Returns
+    -------
+    np.ndarray
+        Shape ``(n_elements, *inner_shape)``, or ``(0, *inner_shape)`` when
+        ``value`` is empty.
+    """
+    dtype = np.dtype(sig["dtype"]) if sig["dtype"] is not None else np.dtype("float32")
+    inner = sig["inner_shape"]
+    arr = np.asarray(value, dtype=dtype)
+    if arr.size == 0:
+        return np.empty((0, *inner), dtype=dtype)
+    # Accept a 1-D array when inner_shape has one dimension: reshape to (n, d).
+    if arr.ndim == 1 and len(inner) == 1:
+        arr = arr.reshape(-1, *inner)
+    if arr.ndim != len(inner) + 1 or arr.shape[1:] != inner:
+        raise ValueError(f"ragged field produced inner shape {arr.shape[1:]}, expected {inner}")
+    return np.ascontiguousarray(arr)
 
 
 # EXPERIMENTAL (phase 2b of #30) -----------------------------------------------
@@ -580,6 +643,15 @@ def _kernel_aggregate(
     stats_arrays: dict[str, np.ndarray] = {}
     for name in data_vars:
         meta = agg_fields[name]
+        # Ragged fields (issue #48) cannot be dense-preallocated; skip them here.
+        # The kernel path does not support ragged — they have no hash-aggregate
+        # kernel equivalent — so a config mixing ragged + arrow-kernel uses the
+        # fallback for ragged fields. But the dense fallback array assignment
+        # (``stats_arrays[name][i] = value``) would crash for a list payload.
+        # Exclude ragged from both the kernel and fallback lists; the caller is
+        # responsible for collecting ragged payloads via process_shard's own loop.
+        if get_output_signature(meta)["kind"] == "ragged":
+            continue
         zarr_dtype = np.dtype(meta.get("dtype", "float32"))
         fill_value = meta.get("fill_value", "NaN")
         if fill_value == "NaN":
@@ -587,8 +659,10 @@ def _kernel_aggregate(
         else:
             stats_arrays[name] = np.zeros(n_cells, dtype=zarr_dtype)
 
-    kernel_names = [n for n in data_vars if _kernel_able(agg_fields[n])]
-    fallback_names = [n for n in data_vars if n not in kernel_names]
+    # Ragged fields are excluded from kernel and fallback (see above).
+    dense_names = [n for n in data_vars if get_output_signature(agg_fields[n])["kind"] != "ragged"]
+    kernel_names = [n for n in dense_names if _kernel_able(agg_fields[n])]
+    fallback_names = [n for n in dense_names if n not in kernel_names]
 
     # Group by the destination cell id (not the raw leaf id): append cell_col and
     # run one vectorised group-by + reduction pass for all kernel-able fields.
@@ -657,79 +731,123 @@ def _kernel_aggregate(
 # -- end EXPERIMENTAL kernel path ---------------------------------------------
 
 
-def _quality_mask(q_flag: np.ndarray, quality_filter: dict) -> np.ndarray:
-    """Build a 1-D keep-mask from a quality-flag array and a ``quality_filter`` spec.
+_COMPARE = {
+    "eq": np.equal,
+    "ne": np.not_equal,
+    "ge": np.greater_equal,
+    "le": np.less_equal,
+    "lt": np.less,
+    "gt": np.greater,
+}
 
-    The comparison is controlled by ``quality_filter["op"]`` (default ``"eq"``):
 
-    - ``"eq"`` keeps rows where the flag equals ``value`` (ATL06: keep
-      ``atl06_quality_summary == 0``).
-    - ``"ne"`` keeps rows where the flag differs from ``value`` (ATL03: keep
-      ``signal_conf_ph != -2``, dropping only TEP photons).
+def _expand_mask_to_base(
+    coarse_mask: np.ndarray,
+    index_beg_arr: np.ndarray,
+    count_arr: np.ndarray,
+    index_base: int,
+    total_base_size: int,
+) -> np.ndarray:
+    """Expand a coarse-rate boolean mask to a base-rate boolean mask (issue #43, Phase B).
 
-    When ``q_flag`` is 2-D (e.g. ATL03 ``signal_conf_ph`` is ``(n_photons,
-    n_surface_types)``), the comparison is reduced **across all surface-type
-    columns** rather than keying on one column: a photon's flag matches a given
-    surface type if any column matches. This is what the ATL03 template needs to
-    drop TEP photons (``signal_conf_ph == -2``, set across every surface type)
-    while keeping everything else. Optionally ``quality_filter["column"]``
-    restricts the comparison to a single surface-type column (e.g. ``0`` for
-    land); it must not be set for a 1-D flag.
+    Each coarse parent ``p`` covers base-rate rows
+    ``index_beg_arr[p] - index_base, ..., index_beg_arr[p] - index_base + count_arr[p] - 1``.
+    The contiguity assumption: ranges do not overlap and together tile the full base array.
 
     Parameters
     ----------
-    q_flag : np.ndarray
-        Quality-flag values for the candidate rows (1-D, or 2-D reduced across
-        surface-type columns).
-    quality_filter : dict
-        Filter spec with ``value``, optional ``op``, and optional ``column``.
+    coarse_mask : np.ndarray
+        1-D boolean array of length ``n_parents``.
+    index_beg_arr : np.ndarray
+        Per-parent start index into the base array (before ``index_base`` shift).
+    count_arr : np.ndarray
+        Per-parent child count (number of base-rate rows this parent covers).
+    index_base : int
+        Subtracted from ``index_beg_arr`` to get 0-based base indices.
+    total_base_size : int
+        Length of the output base-rate array.
 
     Returns
     -------
     np.ndarray
-        Boolean keep-mask, length ``q_flag.shape[0]``.
-
-    Raises
-    ------
-    ValueError
-        If ``op`` is not ``"eq"``/``"ne"``, or if ``column`` is set on a 1-D flag.
+        1-D boolean array of length ``total_base_size``.
     """
-    column = quality_filter.get("column")
-    if q_flag.ndim == 2 and column is not None:
-        q_flag = q_flag[:, column]
-    elif q_flag.ndim != 2 and column is not None:
-        raise ValueError("quality_filter 'column' is only valid for a 2-D flag")
+    out = np.zeros(total_base_size, dtype=bool)
+    for p, keep in enumerate(coarse_mask):
+        if not keep:
+            continue
+        beg = int(index_beg_arr[p]) - index_base
+        if beg < 0:
+            raise ValueError(
+                f"index_beg_arr[{p}]={index_beg_arr[p]} is less than index_base={index_base}"
+            )
+        cnt = int(count_arr[p])
+        out[beg : beg + cnt] = True
+    return out
 
-    value = quality_filter["value"]
-    op = quality_filter.get("op", "eq")
-    if op == "eq":
-        match = q_flag == value
-    elif op == "ne":
-        match = q_flag != value
+
+def _predicate_mask(arr: np.ndarray, f: dict) -> np.ndarray:
+    """Build a 1-D boolean keep-mask for one structured predicate (issue #43).
+
+    ``f`` is a normalized structured filter (see :func:`zagg.config.get_filters`):
+    ``{op, column, value|values, keep}``. An integer ``column`` selects a column
+    from a 2-D flag array before comparing; it is required for N-D arrays and
+    rejected for 1-D arrays. ``keep: false`` inverts the result (drop matches).
+    """
+    column = f.get("column")
+    if arr.ndim > 1:
+        if column is None:
+            raise ValueError(f"filter on '{f['dataset']}': N-D array requires an integer 'column'")
+        arr = arr[:, column]
+    elif column is not None:
+        raise ValueError(f"filter on '{f['dataset']}': 'column' set but array is 1-D")
+
+    op = f["op"]
+    if op == "in":
+        mask = np.isin(arr, f["values"])
+    elif op == "not_in":
+        mask = ~np.isin(arr, f["values"])
     else:
-        raise ValueError(f"Unknown quality_filter op '{op}' (expected 'eq' or 'ne')")
-
-    # 2-D flag with no column selector: reduce across surface-type columns. ``ne``
-    # keeps a photon if any surface type is non-matching (drops only all-column
-    # matches, e.g. TEP photons flagged -2 across every surface type); ``eq``
-    # keeps a photon if any surface type matches.
-    if match.ndim == 2:
-        return match.any(axis=1)
-    return match
+        mask = _COMPARE[op](arr, f["value"])
+    if not f.get("keep", True):
+        mask = ~mask
+    return mask
 
 
-def _read_group(
-    h5obj, group: str, data_source: dict, shard_key: int, grid, arrow: bool = False
-):
+def _read_group(h5obj, group: str, data_source: dict, shard_key: int, grid, arrow: bool = False):
     """Read and spatially filter one HDF5 group.
 
     Returns a ``pandas.DataFrame`` (default) or, when ``arrow=True``, a
     ``pyarrow.Table`` carrying the identical columns. Returns ``None`` when the
     group has no observations in this shard.
+
+    Supports two modes (issue #43, Phase B):
+
+    *Flat* (no ``levels``/``base_level`` in ``data_source``): unchanged from Phase A —
+    all structured filters are applied directly to base-rate data.
+
+    *Hierarchical* (``levels`` + ``base_level`` present): structured filters whose
+    normalized ``level`` key names a non-base level are applied at coarse rate, then
+    expanded to base-rate via the level's ``link`` arrays (``_expand_mask_to_base``).
+    Base-level structured filters and expression filters are unchanged.
     """
     coordinates = data_source["coordinates"]
     variables = data_source["variables"]
-    quality_filter = data_source.get("quality_filter")
+    filters = filters_from_data_source(data_source)
+    base_level_key = data_source.get("base_level")
+    levels = data_source.get("levels")
+    # Partition filters: base-level structured, coarse-level structured, expressions.
+    base_structured = [
+        f
+        for f in filters
+        if "expression" not in f and (f.get("level") is None or f.get("level") == base_level_key)
+    ]
+    coarse_structured = [
+        f
+        for f in filters
+        if "expression" not in f and f.get("level") is not None and f.get("level") != base_level_key
+    ]
+    expressions = [f for f in filters if "expression" in f]
 
     # Resolve coordinate paths
     coord_paths = [path.format(group=group) for path in coordinates.values()]
@@ -755,45 +873,106 @@ def _read_group(
     min_idx = int(indices[0])
     max_idx = int(indices[-1]) + 1
 
-    # Build hyperslice dataset list: variables + optional quality filter
-    datasets = []
-    for path_template in variables.values():
-        path = path_template.format(group=group)
-        datasets.append({"dataset": path, "hyperslice": [(min_idx, max_idx)]})
+    # --- Coarse-level filter expansion (Phase B) ---
+    # For each filter whose level is not the base level, read the coarse-rate
+    # flag array from the declared level path, build a coarse mask, then expand
+    # to base-rate via the level link arrays.  AND the results into ``cross_mask``.
+    cross_mask: np.ndarray | None = None
+    if coarse_structured and levels is not None:
+        for f in coarse_structured:
+            level_key = f["level"]
+            lvl = levels[level_key]
+            flag_path = f["dataset"].format(group=group)
+            # Read the coarse flag array (full level, no hyperslice — we need all parents
+            # to align with link arrays which are also full-length).
+            coarse_data = h5obj.readDatasets([{"dataset": flag_path}])
+            coarse_arr = coarse_data[flag_path]
+            coarse_fmask = _predicate_mask(coarse_arr, f)
+            # Read the link arrays from this level.
+            link = lvl["link"]
+            index_base = int(link.get("index_base", 0))
+            ibeg_path = link["index_beg"].format(group=group)
+            cnt_path = link["count"].format(group=group)
+            link_data = h5obj.readDatasets(
+                [
+                    {"dataset": ibeg_path},
+                    {"dataset": cnt_path},
+                ]
+            )
+            ibeg_arr = link_data[ibeg_path]
+            cnt_arr = link_data[cnt_path]
+            expanded = _expand_mask_to_base(coarse_fmask, ibeg_arr, cnt_arr, index_base, len(lats))
+            cross_mask = expanded if cross_mask is None else (cross_mask & expanded)
+        if cross_mask is not None and np.sum(cross_mask[min_idx:max_idx]) == 0:
+            return None
 
-    if quality_filter is not None:
-        qf_path = quality_filter["dataset"].format(group=group)
-        datasets.append({"dataset": qf_path, "hyperslice": [(min_idx, max_idx)]})
+    # Build hyperslice dataset list: variables + any base-level structured-filter arrays.
+    # Read each distinct path once; flag datasets may coincide with a variable.
+    datasets = []
+    paths_seen = set()
+    var_paths = {col: tmpl.format(group=group) for col, tmpl in variables.items()}
+    for path in var_paths.values():
+        if path not in paths_seen:
+            datasets.append({"dataset": path, "hyperslice": [(min_idx, max_idx)]})
+            paths_seen.add(path)
+    filter_paths = {id(f): f["dataset"].format(group=group) for f in base_structured}
+    for path in filter_paths.values():
+        if path not in paths_seen:
+            datasets.append({"dataset": path, "hyperslice": [(min_idx, max_idx)]})
+            paths_seen.add(path)
 
     data = h5obj.readDatasets(datasets)
 
     # Apply spatial mask to sliced data
     mask_sliced = mask_spatial[min_idx:max_idx]
 
-    # Apply quality filter if configured
-    if quality_filter is not None:
-        qf_path = quality_filter["dataset"].format(group=group)
-        q_flag = data[qf_path][mask_sliced]
-        quality_mask = _quality_mask(q_flag, quality_filter)
-        if np.sum(quality_mask) == 0:
-            return None
-    else:
-        quality_mask = None
+    # Combine base-level structured predicates as ANDed keep-masks (issue #43).
+    keep_mask = None
+    for f in base_structured:
+        flag = data[filter_paths[id(f)]][mask_sliced]
+        fmask = _predicate_mask(flag, f)
+        keep_mask = fmask if keep_mask is None else (keep_mask & fmask)
 
-    # Build dataframe
+    # AND in the cross-level expanded mask, aligned to the sliced window.
+    if cross_mask is not None:
+        cross_sliced = cross_mask[min_idx:max_idx][mask_sliced]
+        keep_mask = cross_sliced if keep_mask is None else (keep_mask & cross_sliced)
+
+    if keep_mask is not None and np.sum(keep_mask) == 0:
+        return None
+
+    # Build dataframe (variables sliced to spatial mask, then to the keep-mask)
     leaf_sliced = leaf_ids[min_idx:max_idx][mask_sliced]
     data_dict = {}
-    for col_name, path_template in variables.items():
-        path = path_template.format(group=group)
+    for col_name, path in var_paths.items():
         values = data[path][mask_sliced]
-        if quality_mask is not None:
-            values = values[quality_mask]
+        if keep_mask is not None:
+            values = values[keep_mask]
         data_dict[col_name] = values
 
-    if quality_mask is not None:
-        data_dict["leaf_id"] = leaf_sliced[quality_mask]
+    if keep_mask is not None:
+        data_dict["leaf_id"] = leaf_sliced[keep_mask]
     else:
         data_dict["leaf_id"] = leaf_sliced
+
+    # Base-level ``expression`` filters: aggregation-time escape hatch, evaluated
+    # over the already-read variable columns (forfeits pushdown, issue #43).
+    for f in expressions:
+        cols = {c: data_dict[c] for c in variables if c in data_dict}
+        try:
+            emask = evaluate_filter_expression(f["expression"], cols)
+        except NameError as e:
+            raise NameError(
+                f"expression filter {f['expression']!r} references an undefined name: {e}"
+            ) from e
+        if emask.shape != data_dict["leaf_id"].shape:
+            raise ValueError(
+                f"expression filter {f['expression']!r} must yield a per-row "
+                f"boolean mask (got shape {emask.shape})"
+            )
+        if np.sum(emask) == 0:
+            return None
+        data_dict = {k: v[emask] for k, v in data_dict.items()}
 
     if arrow:
         import pyarrow as pa
@@ -958,10 +1137,21 @@ def process_shard(
     children = grid.children(shard_key)
     data_vars = get_data_vars(config)
 
+    # Ragged-field collectors (issue #48): populated only in the non-kernel path;
+    # initialized here so the post-if/else _build_output call can reference them
+    # regardless of which branch ran.
+    ragged_payloads: dict[str, list] = {}
+    ragged_cell_indices: dict[str, list[int]] = {}
+
     if handoff == "arrow-kernel":
         # EXPERIMENTAL (phase 2b of #30): reduce via pyarrow hash-aggregate kernels
         # instead of the per-cell numpy loop. Not byte-identical to the default
         # path (float mean/variance diverge by ~1 ULP — see KERNEL_RTOL).
+        if _has_ragged_fields(config):
+            raise NotImplementedError(
+                "handoff='arrow-kernel' does not support ragged fields (issue #48); "
+                "use handoff='pandas' or 'arrow' instead"
+            )
         import pyarrow as pa
 
         table = pa.concat_tables(all_reads).combine_chunks()
@@ -985,13 +1175,21 @@ def process_shard(
 
         n_cells = len(children)
         agg_fields = get_agg_fields(config)
-        stats_arrays = {}
+        stats_arrays: dict = {}
+        # Ragged fields (issue #48) are variable-length per-cell; they cannot be
+        # preallocated as a dense block. ``ragged_payloads``/``ragged_cell_indices``
+        # are pre-initialized before this branch (see above); fill them in the loop.
         for name in data_vars:
             meta = agg_fields[name]
+            sig = get_output_signature(meta)
+            if sig["kind"] == "ragged":
+                ragged_payloads[name] = []
+                ragged_cell_indices[name] = []
+                continue
             # Vector fields (issue #29) get a per-cell (n_cells, *trailing_shape)
             # block; scalars keep the 1-D (n_cells,) layout, unchanged. Either way
             # ``stats_arrays[name][i] = value`` assigns the cell's result row.
-            shape = (n_cells, *get_output_signature(meta)["trailing_shape"])
+            shape = (n_cells, *sig["trailing_shape"])
             zarr_dtype = np.dtype(meta.get("dtype", "float32"))
             fill_value = meta.get("fill_value", "NaN")
             if fill_value == "NaN":
@@ -1016,17 +1214,30 @@ def process_shard(
                 cell_data, value_col="h_li", sigma_col="s_li", config=config
             )
             for key, value in stats.items():
-                stats_arrays[key][i] = value
+                if key in ragged_payloads:
+                    # Ragged field: collect non-empty payloads with their cell index.
+                    # Empty cells (from _empty_cell_value -> []) are skipped; the
+                    # CSR writer represents absent cells via ``cell_ids``.
+                    arr_val = np.asarray(value)
+                    if arr_val.size > 0:
+                        ragged_payloads[key].append(arr_val)
+                        ragged_cell_indices[key].append(i)
+                else:
+                    stats_arrays[key][i] = value
 
     logger.info(f"  Statistics: {cells_with_data}/{n_cells} cells with data")
 
     # Assemble the output carrier: a plain DataFrame for a pure-scalar config
     # (unchanged), or a pyarrow.Table with FixedSizeList vector columns when any
     # field declares a non-scalar output (issue #29). Scalars stay byte-identical.
+    # Ragged fields (issue #48) are excluded from the dense carrier — they are
+    # returned separately as (payloads, cell_indices) for the CSR writer.
+    _agg_fields = get_agg_fields(config)
+    dense_vars = [v for v in data_vars if get_output_signature(_agg_fields[v])["kind"] != "ragged"]
     df_out = _build_output(
         stats_arrays,
-        data_vars,
-        get_agg_fields(config),
+        dense_vars,
+        _agg_fields,
         grid,
         shard_key,
         use_arrow=_has_vector_fields(config),

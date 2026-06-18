@@ -13,6 +13,40 @@ import yaml
 import zagg.configs
 
 
+class LinkDict(TypedDict):
+    """Per-level link to the next coarser level (issue #43, Phase B).
+
+    A *link* describes a contiguous-range parent->child tiling: each parent segment
+    ``p`` covers base-rate indices ``[index_beg[p] - index_base, ...`` for
+    ``count[p]`` children.  ``index_base`` shifts the raw ``index_beg`` values so
+    that Python 0-based indexing into the base array is straightforward.
+
+    ``reference_index`` is a reserved slot for a future explicit-index-array variant
+    (non-contiguous children per parent); leave it ``None`` for the contiguous case.
+    """
+
+    to: str  # key of the coarser level in ``levels``
+    index_beg: str  # HDF5 path for the per-parent start index array
+    count: str  # HDF5 path for the per-parent child count array
+    index_base: NotRequired[int]  # subtracted from index_beg values (default 0)
+    reference_index: NotRequired[str | None]  # reserved; must be None
+
+
+class LevelDict(TypedDict):
+    """One hierarchical level in a multi-rate HDF5 source (issue #43, Phase B).
+
+    A source may have several rates (e.g. ATL03 ``photons`` and ``segments``).
+    Each level declares its own ``path``, ``coordinates``, and ``variables``,
+    plus an optional ``link`` to a coarser parent level.  The flat single-level
+    form (no ``levels``/``base_level`` keys in ``data_source``) stays first-class.
+    """
+
+    path: str  # HDF5 group path template (may contain ``{group}``)
+    coordinates: list[str]  # coordinate dataset names within ``path``
+    variables: list[str]  # variable dataset names within ``path``
+    link: NotRequired[LinkDict | None]
+
+
 class DataSourceDict(TypedDict):
     """Type hints for the ``data_source`` section of a pipeline config."""
 
@@ -21,6 +55,21 @@ class DataSourceDict(TypedDict):
     coordinates: dict[str, str]
     variables: dict[str, str]
     quality_filter: NotRequired[dict]
+    filters: NotRequired[list[dict]]
+    # Hierarchical multi-level form (issue #43, Phase B). When present, the flat
+    # ``coordinates``/``variables`` keys are still accepted for the base level but
+    # ``levels`` + ``base_level`` take precedence for the read path.
+    levels: NotRequired[dict[str, LevelDict]]
+    base_level: NotRequired[str]
+
+
+# Structured-predicate comparison operators (issue #43). ``in``/``not_in`` take a
+# ``values`` list; the rest take a scalar ``value``. These are the only
+# pushdown-eligible filter language; an ``expression`` filter is a base-level-only,
+# aggregation-time escape hatch that forfeits pushdown.
+_SCALAR_OPS = frozenset({"eq", "ne", "ge", "le", "lt", "gt"})
+_SET_OPS = frozenset({"in", "not_in"})
+FILTER_OPS = _SCALAR_OPS | _SET_OPS
 
 
 @dataclass
@@ -165,12 +214,14 @@ def validate_config(config: PipelineConfig) -> None:
             if "start_date" not in temporal or "end_date" not in temporal:
                 raise ValueError("bounds.temporal requires start_date and end_date")
 
-    # Validate quality_filter op (default eq; eq/ne supported by _quality_mask)
-    qf = config.data_source.get("quality_filter")
-    if qf is not None and qf.get("op", "eq") not in ("eq", "ne"):
-        raise ValueError(
-            f"data_source.quality_filter.op must be 'eq' or 'ne' (got {qf['op']!r})"
-        )
+    # Validate the structured filter list (issue #43, Phase A)
+    _validate_filters(config.data_source)
+
+    # Validate hierarchical multi-level form (issue #43, Phase B)
+    _validate_levels(config.data_source)
+
+    # Cross-check: each filter's level field must name a key in levels (issue #43)
+    _validate_filter_levels(config.data_source)
 
     ds_vars = set(config.data_source.get("variables", {}).keys())
     agg_vars = config.aggregation.get("variables", {})
@@ -220,19 +271,20 @@ def validate_config(config: PipelineConfig) -> None:
         _validate_output_kind(name, meta)
 
 
-# Recognized per-field output kinds. ``ragged`` (CSR) is Tier 2 and not yet
-# accepted; see issue #29.
-OUTPUT_KINDS = ("scalar", "vector")
+# Recognized per-field output kinds. ``ragged`` (CSR) is the Tier-2 carrier
+# for variable-length per-cell outputs; see issue #48.
+OUTPUT_KINDS = ("scalar", "vector", "ragged")
 
 
 def _validate_output_kind(name: str, meta: dict) -> None:
     """Validate a variable's non-scalar output declaration.
 
-    A field may declare ``kind`` (``scalar`` default, or ``vector``) and
-    ``trailing_shape`` (required for ``vector``). ``scalar`` fields need
-    neither and stay the default path. A ``vector`` field may be driven by
-    either ``function`` or ``expression``; ``len``/``count`` are rejected for
-    ``vector`` (they short-circuit to a scalar count). See issue #29.
+    A field may declare ``kind`` (``scalar`` default, ``vector``, or ``ragged``)
+    and a shape key (``trailing_shape`` for ``vector``, ``inner_shape`` for
+    ``ragged``). ``scalar`` fields need neither and stay the default path.
+    ``vector`` and ``ragged`` fields may be driven by either ``function`` or
+    ``expression``; ``len``/``count`` are rejected for both (they short-circuit
+    to a scalar count). See issue #29 (vector) and issue #48 (ragged/CSR).
 
     Parameters
     ----------
@@ -251,7 +303,7 @@ def _validate_output_kind(name: str, meta: dict) -> None:
         allowed = ", ".join(OUTPUT_KINDS)
         raise ValueError(
             f"Variable '{name}': output kind '{kind}' is not supported "
-            f"(allowed: {allowed}; 'ragged' is planned but not yet implemented)"
+            f"(allowed: {allowed})"
         )
 
     # dtype, when declared, must name a real numpy dtype (applies to all kinds).
@@ -272,40 +324,303 @@ def _validate_output_kind(name: str, meta: dict) -> None:
             )
         return
 
-    # kind == "vector": trailing_shape is required and must be positive ints.
-    if not has_trailing:
-        raise ValueError(f"Variable '{name}': kind 'vector' requires 'trailing_shape'")
-    _validate_trailing_shape(name, meta["trailing_shape"])
+    if kind == "vector":
+        # trailing_shape is required and must be positive ints.
+        if not has_trailing:
+            raise ValueError(f"Variable '{name}': kind 'vector' requires 'trailing_shape'")
+        _validate_trailing_shape(name, meta["trailing_shape"])
 
-    # ``len``/``count`` short-circuit to a scalar obs count in
-    # ``calculate_cell_statistics``; pairing them with kind 'vector' would
-    # silently emit a scalar, so reject the nonsensical combination.
+        # ``len``/``count`` short-circuit to a scalar obs count in
+        # ``calculate_cell_statistics``; pairing them with kind 'vector' would
+        # silently emit a scalar, so reject the nonsensical combination.
+        if meta.get("function") in ("len", "count"):
+            raise ValueError(
+                f"Variable '{name}': function {meta['function']!r} produces a scalar "
+                f"count and cannot be combined with kind 'vector'"
+            )
+        return
+
+    # kind == "ragged": inner_shape is required; trailing_shape is rejected.
+    if has_trailing:
+        raise ValueError(
+            f"Variable '{name}': 'trailing_shape' is only valid for 'vector', not 'ragged'"
+        )
+    if "inner_shape" not in meta:
+        raise ValueError(f"Variable '{name}': kind 'ragged' requires 'inner_shape'")
+    _validate_trailing_shape(name, meta["inner_shape"], key_name="inner_shape")
+
+    # Same restriction as vector: ``len``/``count`` produce a scalar count.
     if meta.get("function") in ("len", "count"):
         raise ValueError(
             f"Variable '{name}': function {meta['function']!r} produces a scalar "
-            f"count and cannot be combined with kind 'vector'"
+            f"count and cannot be combined with kind 'ragged'"
         )
 
 
-def _validate_trailing_shape(name: str, trailing_shape) -> None:
-    """Check a vector field's trailing_shape is a tuple of positive ints."""
+def _validate_trailing_shape(name: str, trailing_shape, key_name: str = "trailing_shape") -> None:
+    """Check a shape field (trailing_shape or inner_shape) is a tuple of positive ints."""
     if isinstance(trailing_shape, int):
         dims: tuple = (trailing_shape,)
     elif isinstance(trailing_shape, (list, tuple)):
         dims = tuple(trailing_shape)
     else:
         raise ValueError(
-            f"Variable '{name}': 'trailing_shape' must be an int or a "
+            f"Variable '{name}': '{key_name}' must be an int or a "
             f"sequence of ints (got {trailing_shape!r})"
         )
     if not dims:
-        raise ValueError(f"Variable '{name}': 'trailing_shape' must have at least one dimension")
+        raise ValueError(f"Variable '{name}': '{key_name}' must have at least one dimension")
     for dim in dims:
         if not isinstance(dim, int) or isinstance(dim, bool) or dim < 1:
             raise ValueError(
-                f"Variable '{name}': 'trailing_shape' entries must be positive "
+                f"Variable '{name}': '{key_name}' entries must be positive "
                 f"integers (got {dim!r})"
             )
+
+
+def get_filters(config: PipelineConfig) -> list[dict]:
+    """Return the ordered list of normalized data-source filters (issue #43).
+
+    Two filter languages coexist:
+
+    - **Structured predicates** ``{level?, dataset, column?, op, value|values,
+      keep?}`` are machine-inspectable and are the only kind eligible for read
+      pushdown (Phase C). ``op`` is one of :data:`FILTER_OPS`; ``in``/``not_in``
+      take ``values`` (a list), the rest take a scalar ``value``. ``column`` is an
+      integer selector into an N-D flag array (e.g. ATL03 ``signal_conf_ph``).
+      ``keep`` (default ``True``) keeps matching rows; ``keep: false`` drops them.
+    - **Expression** filters ``{expression: "<py expr>"}`` are a base-level-only,
+      aggregation-time escape hatch that forfeits pushdown (opaque to the planner).
+
+    The flat ``quality_filter: {dataset, value}`` is sugar synthesizing one
+    base-level ``op: eq`` structured filter, so the ATL06 path is unchanged. An
+    explicit ``filters:`` list, when present, is used as-is (the flat
+    ``quality_filter`` is then ignored).
+
+    Each returned filter carries a normalized ``level`` (``None`` means the base
+    level) and, for structured predicates, an explicit ``keep`` bool.
+
+    Parameters
+    ----------
+    config : PipelineConfig
+
+    Returns
+    -------
+    list[dict]
+    """
+    return filters_from_data_source(config.data_source)
+
+
+def filters_from_data_source(data_source: dict) -> list[dict]:
+    """Normalize the filter list from a raw ``data_source`` dict.
+
+    Shared by :func:`get_filters` and the read path (which only holds the
+    ``data_source`` mapping). See :func:`get_filters` for the schema.
+    """
+    explicit = data_source.get("filters")
+    if explicit is not None:
+        return [_normalize_filter(f) for f in explicit]
+    qf = data_source.get("quality_filter")
+    if qf is not None:
+        return [
+            {
+                "level": None,
+                "dataset": qf["dataset"],
+                "column": None,
+                "op": "eq",
+                "value": qf["value"],
+                "keep": True,
+            }
+        ]
+    return []
+
+
+def _normalize_filter(f: dict) -> dict:
+    """Normalize one raw filter dict into canonical form (see :func:`get_filters`)."""
+    if "expression" in f:
+        return {"level": f.get("level"), "expression": f["expression"]}
+    op = f["op"]
+    out = {
+        "level": f.get("level"),
+        "dataset": f["dataset"],
+        "column": f.get("column"),
+        "op": op,
+        "keep": bool(f.get("keep", True)),
+    }
+    if op in _SET_OPS:
+        out["values"] = list(f["values"])
+    else:
+        out["value"] = f["value"]
+    return out
+
+
+def _validate_filters(data_source: dict) -> None:
+    """Validate the ``filters`` list (and that a flat ``quality_filter`` is sane).
+
+    Raises ``ValueError`` on: unknown op, missing ``dataset``, ``in``/``not_in``
+    without a list ``values``, scalar ops without ``value``, non-int ``column``,
+    a non-base-level ``expression`` filter, or wrong ``value`` type. ``column`` is
+    required for the N-D flag case but cannot be checked against array rank here
+    (no data); rank checks happen at read time.
+    """
+    filters = data_source.get("filters")
+    if filters is None:
+        return
+    if not isinstance(filters, list):
+        raise ValueError("data_source.filters must be a list")
+    for i, f in enumerate(filters):
+        if not isinstance(f, dict):
+            raise ValueError(f"filter[{i}] must be a mapping")
+        if "expression" in f:
+            if "op" in f or "dataset" in f:
+                raise ValueError(
+                    f"filter[{i}]: 'expression' filters take no 'op'/'dataset' "
+                    "(base-level aggregation-time escape hatch, no pushdown)"
+                )
+            if f.get("level") is not None:
+                raise ValueError(
+                    f"filter[{i}]: 'expression' filters are base-level only (level must be omitted)"
+                )
+            if not isinstance(f["expression"], str):
+                raise ValueError(f"filter[{i}]: 'expression' must be a string")
+            continue
+        if "dataset" not in f:
+            raise ValueError(f"filter[{i}]: structured filter requires 'dataset'")
+        op = f.get("op")
+        if op not in FILTER_OPS:
+            raise ValueError(f"filter[{i}]: unknown op {op!r} (allowed: {sorted(FILTER_OPS)})")
+        col = f.get("column")
+        if col is not None and (not isinstance(col, int) or isinstance(col, bool)):
+            raise ValueError(f"filter[{i}]: 'column' must be an integer index (got {col!r})")
+        if op in _SET_OPS:
+            if not isinstance(f.get("values"), list):
+                raise ValueError(f"filter[{i}]: op {op!r} requires a 'values' list")
+            for v in f["values"]:
+                if not isinstance(v, (int, float)) or isinstance(v, bool):
+                    raise ValueError(f"filter[{i}]: 'values' must be numeric (got {v!r})")
+        else:
+            if "value" not in f:
+                raise ValueError(f"filter[{i}]: op {op!r} requires a scalar 'value'")
+            if not isinstance(f["value"], (int, float)) or isinstance(f["value"], bool):
+                raise ValueError(f"filter[{i}]: 'value' must be numeric (got {f['value']!r})")
+
+
+def _validate_levels(data_source: dict) -> None:
+    """Validate the hierarchical ``levels``/``base_level`` form (issue #43, Phase B).
+
+    Rules:
+    - ``base_level`` must name a key in ``levels``.
+    - ``link.to`` in each level must name another key in ``levels``.
+    - ``link.index_base`` must be a non-negative int when present.
+    - ``link.reference_index`` must be ``None`` when present (reserved slot).
+    - Only ``base_level`` may omit ``link`` (it has no coarser parent).
+    - Flat single-level form (no ``levels`` key) is always valid.
+    """
+    levels = data_source.get("levels")
+    if levels is None:
+        return
+    if not isinstance(levels, dict) or not levels:
+        raise ValueError("data_source.levels must be a non-empty mapping")
+    base_level = data_source.get("base_level")
+    if base_level is None:
+        raise ValueError("data_source.base_level is required when levels is present")
+    if base_level not in levels:
+        raise ValueError(
+            f"data_source.base_level {base_level!r} is not a key in levels "
+            f"(available: {sorted(levels)})"
+        )
+    level_keys = set(levels)
+    for name, lvl in levels.items():
+        if not isinstance(lvl, dict):
+            raise ValueError(f"levels.{name} must be a mapping")
+        if "path" not in lvl:
+            raise ValueError(f"levels.{name}: 'path' is required")
+        link = lvl.get("link")
+        if link is None:
+            if name != base_level:
+                raise ValueError(
+                    f"levels.{name}: non-base levels must have a 'link' "
+                    f"(only {base_level!r} may omit it)"
+                )
+            continue
+        if not isinstance(link, dict):
+            raise ValueError(f"levels.{name}.link must be a mapping")
+        for field_name in ("to", "index_beg", "count"):
+            if field_name not in link:
+                raise ValueError(f"levels.{name}.link: '{field_name}' is required")
+        unknown = set(link) - {"to", "index_beg", "count", "index_base", "reference_index"}
+        if unknown:
+            raise ValueError(
+                f"levels.{name}.link: unknown fields {sorted(unknown)} "
+                f"(allowed: to, index_beg, count, index_base, reference_index)"
+            )
+        if link.get("to") == name:
+            raise ValueError(f"level '{name}': link.to cannot reference the level itself")
+        if link["to"] not in level_keys:
+            raise ValueError(
+                f"levels.{name}.link.to {link['to']!r} is not a key in levels "
+                f"(available: {sorted(level_keys)})"
+            )
+        index_base = link.get("index_base", 0)
+        if not isinstance(index_base, int) or isinstance(index_base, bool) or index_base < 0:
+            raise ValueError(
+                f"levels.{name}.link.index_base must be a non-negative int (got {index_base!r})"
+            )
+        ref = link.get("reference_index")
+        if ref is not None:
+            raise ValueError(
+                f"levels.{name}.link.reference_index is reserved and must be null/omitted "
+                f"(explicit index-array variant not yet implemented)"
+            )
+
+
+def _validate_filter_levels(data_source: dict) -> None:
+    """Cross-check each filter's level field against the levels keys (issue #43).
+
+    A filter with ``level: "nonexistent"`` would otherwise only fail at read time
+    with an opaque ``KeyError``. Raises ``ValueError`` with a clear message when a
+    filter's ``level`` names a key not present in ``levels``.
+    """
+    levels = data_source.get("levels")
+    if levels is None:
+        return
+    level_keys = set(levels)
+    filters = data_source.get("filters") or []
+    for i, f in enumerate(filters):
+        lvl = f.get("level")
+        if lvl is not None and lvl not in level_keys:
+            raise ValueError(
+                f"filter[{i}]: level {lvl!r} is not a key in levels "
+                f"(available: {sorted(level_keys)})"
+            )
+
+
+def get_levels(config: "PipelineConfig") -> dict | None:
+    """Return the ``levels`` mapping from the data source, or ``None`` if flat.
+
+    Parameters
+    ----------
+    config : PipelineConfig
+
+    Returns
+    -------
+    dict or None
+    """
+    return config.data_source.get("levels")
+
+
+def get_base_level(config: "PipelineConfig") -> str | None:
+    """Return the ``base_level`` key from the data source, or ``None`` if flat.
+
+    Parameters
+    ----------
+    config : PipelineConfig
+
+    Returns
+    -------
+    str or None
+    """
+    return config.data_source.get("base_level")
 
 
 def _is_numeric(s: str) -> bool:
@@ -405,10 +720,11 @@ def get_agg_fields(config: PipelineConfig) -> dict:
 def get_output_signature(meta: dict) -> dict:
     """Return the normalized non-scalar output signature for one agg field.
 
-    This is the single read point for a field's Option B declaration (issue
-    #29): its output ``kind``, the per-cell ``trailing_shape``, and ``dtype``.
-    Later phases (statistic eval, the per-shard container, and the grid
-    ``signature()``) consume this rather than re-parsing the raw metadata.
+    This is the single read point for a field's output declaration (issues
+    #29 and #48): its output ``kind``, the per-cell ``trailing_shape``,
+    ``inner_shape``, and ``dtype``. Later phases (statistic eval, the
+    per-shard container, and the grid ``signature()``) consume this rather
+    than re-parsing the raw metadata.
 
     Parameters
     ----------
@@ -419,19 +735,28 @@ def get_output_signature(meta: dict) -> dict:
     Returns
     -------
     dict
-        ``{"kind": str, "trailing_shape": tuple[int, ...], "dtype": str}``.
-        ``trailing_shape`` is ``()`` for scalar fields. ``dtype`` is the
-        declared dtype string, or ``None`` if unset.
+        ``{"kind": str, "trailing_shape": tuple, "inner_shape": tuple, "dtype": str}``.
+        ``trailing_shape`` is ``()`` for scalar and ragged fields.
+        ``inner_shape`` is ``()`` for scalar and vector fields; for ragged it
+        holds the per-element shape (e.g. ``(2,)`` for a centroid pair).
+        ``dtype`` is the declared dtype string, or ``None`` if unset.
     """
     kind = meta.get("kind", "scalar")
     if kind == "vector":
         ts = meta["trailing_shape"]
         trailing_shape = (ts,) if isinstance(ts, int) else tuple(ts)
+        inner_shape: tuple = ()
+    elif kind == "ragged":
+        trailing_shape = ()
+        rs = meta["inner_shape"]
+        inner_shape = (rs,) if isinstance(rs, int) else tuple(rs)
     else:
         trailing_shape = ()
+        inner_shape = ()
     return {
         "kind": kind,
         "trailing_shape": trailing_shape,
+        "inner_shape": inner_shape,
         "dtype": meta.get("dtype"),
     }
 
@@ -464,6 +789,7 @@ def output_field_signature(config: PipelineConfig) -> list[dict]:
                 "name": name,
                 "kind": sig["kind"],
                 "trailing_shape": list(sig["trailing_shape"]),
+                "inner_shape": list(sig["inner_shape"]),
                 "dtype": sig["dtype"],
             }
         )
@@ -667,3 +993,36 @@ def evaluate_expression(expression: str, columns: dict[str, np.ndarray]) -> floa
     float
     """
     return float(_eval_expression_raw(expression, columns))
+
+
+def evaluate_filter_expression(expression: str, columns: dict[str, np.ndarray]) -> np.ndarray:
+    """Evaluate a boolean filter expression to a per-row mask (issue #43).
+
+    Like :func:`evaluate_expression` but returns the raw boolean array rather than
+    a scalar float — the base-level ``expression`` filter escape hatch (e.g.
+    ``"(h_li > 0) & (s_li < 1)"``). Uses the same restricted namespace.
+
+    Parameters
+    ----------
+    expression : str
+        Python boolean expression over numpy and column variables.
+    columns : dict[str, np.ndarray]
+        Mapping of column names to arrays.
+
+    Returns
+    -------
+    numpy.ndarray
+        Boolean mask.
+    """
+    ns = {
+        "__builtins__": {},
+        "np": np,
+        "numpy": np,
+        "len": len,
+        "float": float,
+        "int": int,
+        "abs": abs,
+        "sum": sum,
+        **columns,
+    }
+    return np.asarray(eval(expression, ns), dtype=bool)  # noqa: S307
