@@ -11,9 +11,12 @@ from zagg.processing import (
     _arrow_column,
     _build_groups,
     _build_output,
+    _coerce_ragged_value,
     _concat_and_group,
+    _empty_cell_value,
     _expand_mask_to_base,
     _group_columns,
+    _has_ragged_fields,
     _has_vector_fields,
     _iter_carrier_columns,
     _kernel_able,
@@ -271,6 +274,169 @@ class TestVectorOutputs:
         assert isinstance(scalar["h_min"], float)
         assert scalar["h_min"] == 1.0
         assert scalar["count"] == 3
+
+
+class TestRaggedPayloads:
+    """Issue #48 phase 2: ragged per-cell payloads collect correctly through the
+    Arrow seam (``calculate_cell_statistics`` + ``_empty_cell_value``).
+    """
+
+    @staticmethod
+    def _ragged_config(inner_shape=(2,), function="mean", source="h_li"):
+        """Minimal config with one ragged field and one scalar field."""
+        from zagg.config import PipelineConfig
+
+        return PipelineConfig(
+            aggregation={
+                "variables": {
+                    "h_ragged": {
+                        "function": function,
+                        "source": source,
+                        "kind": "ragged",
+                        "inner_shape": list(inner_shape),
+                        "dtype": "float32",
+                    },
+                    "h_count": {
+                        "function": "len",
+                        "source": "h_li",
+                    },
+                }
+            }
+        )
+
+    def test_has_ragged_fields_detects_ragged(self):
+        cfg = self._ragged_config()
+        assert _has_ragged_fields(cfg)
+
+    def test_has_ragged_fields_false_for_scalar_only(self):
+        from zagg.config import default_config
+
+        assert not _has_ragged_fields(default_config())
+
+    def test_empty_cell_value_ragged_returns_empty_list(self):
+        meta = {"function": "mean", "source": "h", "kind": "ragged", "inner_shape": [2]}
+        val = _empty_cell_value(meta)
+        assert val == []
+
+    def test_empty_cell_value_scalar_unchanged(self):
+        meta = {"function": "len", "source": "h"}
+        assert _empty_cell_value(meta) == 0
+
+    def test_coerce_ragged_value_2d(self):
+        sig = {"kind": "ragged", "inner_shape": (2,), "dtype": "float32", "trailing_shape": ()}
+        arr = np.array([[1.0, 2.0], [3.0, 4.0]])
+        out = _coerce_ragged_value(arr, sig)
+        assert out.shape == (2, 2)
+        assert out.dtype == np.dtype("float32")
+
+    def test_coerce_ragged_value_empty(self):
+        sig = {"kind": "ragged", "inner_shape": (2,), "dtype": "float32", "trailing_shape": ()}
+        out = _coerce_ragged_value(np.array([]), sig)
+        assert out.shape == (0, 2)
+
+    def test_coerce_ragged_value_wrong_inner_raises(self):
+        sig = {"kind": "ragged", "inner_shape": (3,), "dtype": "float32", "trailing_shape": ()}
+        arr = np.array([[1.0, 2.0], [3.0, 4.0]])  # inner_shape (2,) != declared (3,)
+        with pytest.raises(ValueError, match="inner shape"):
+            _coerce_ragged_value(arr, sig)
+
+    def test_calculate_cell_statistics_ragged_function(self):
+        """A ragged field driven by a function returns a per-cell numpy array."""
+        from zagg.config import PipelineConfig
+
+        cfg = PipelineConfig(
+            aggregation={
+                "variables": {
+                    "h_raw": {
+                        "function": "np.sort",
+                        "source": "h_li",
+                        "kind": "ragged",
+                        "inner_shape": [1],
+                        "dtype": "float32",
+                    }
+                }
+            }
+        )
+        vals = np.array([3.0, 1.0, 2.0], dtype=np.float32)
+        result = calculate_cell_statistics({"h_li": vals}, config=cfg)
+        assert "h_raw" in result
+        assert isinstance(result["h_raw"], np.ndarray)
+        # np.sort returns a 1-D array; _coerce_ragged_value wraps to (n, 1).
+        assert result["h_raw"].shape == (3, 1)
+        np.testing.assert_array_equal(result["h_raw"].flatten(), [1.0, 2.0, 3.0])
+
+    def test_calculate_cell_statistics_ragged_expression(self):
+        """A ragged field driven by an expression returns a per-cell numpy array."""
+        from zagg.config import PipelineConfig
+
+        cfg = PipelineConfig(
+            aggregation={
+                "variables": {
+                    "h_pairs": {
+                        "expression": "np.column_stack([h_li, h_li * 2])",
+                        "kind": "ragged",
+                        "inner_shape": [2],
+                        "dtype": "float32",
+                    }
+                }
+            }
+        )
+        vals = np.array([1.0, 2.0], dtype=np.float32)
+        result = calculate_cell_statistics({"h_li": vals}, config=cfg)
+        out = result["h_pairs"]
+        assert out.shape == (2, 2)
+        np.testing.assert_array_almost_equal(out[:, 0], [1.0, 2.0])
+        np.testing.assert_array_almost_equal(out[:, 1], [2.0, 4.0])
+
+    def test_empty_cell_ragged_returns_empty_list(self):
+        """An empty cell for a ragged field returns [] (no observations)."""
+        from zagg.config import PipelineConfig
+
+        cfg = PipelineConfig(
+            aggregation={
+                "variables": {
+                    "h_raw": {
+                        "function": "np.sort",
+                        "source": "h_li",
+                        "kind": "ragged",
+                        "inner_shape": [1],
+                        "dtype": "float32",
+                    }
+                }
+            }
+        )
+        result = calculate_cell_statistics({"h_li": np.array([])}, config=cfg)
+        assert result["h_raw"] == []
+
+    def test_ragged_scalar_vector_coexist(self):
+        """Ragged, scalar, and vector fields can coexist in one config."""
+        from zagg.config import PipelineConfig
+
+        cfg = PipelineConfig(
+            aggregation={
+                "variables": {
+                    "h_min": {"function": "min", "source": "h_li"},
+                    "h_edges": {
+                        "expression": "np.array([np.min(h_li), np.max(h_li)])",
+                        "kind": "vector",
+                        "trailing_shape": 2,
+                        "dtype": "float32",
+                    },
+                    "h_raw": {
+                        "function": "np.sort",
+                        "source": "h_li",
+                        "kind": "ragged",
+                        "inner_shape": [1],
+                        "dtype": "float32",
+                    },
+                }
+            }
+        )
+        vals = np.array([3.0, 1.0, 2.0], dtype=np.float32)
+        result = calculate_cell_statistics({"h_li": vals}, config=cfg)
+        assert result["h_min"] == 1.0
+        assert result["h_edges"].shape == (2,)
+        assert result["h_raw"].shape == (3, 1)
 
 
 class TestBuildGroups:
