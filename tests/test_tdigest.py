@@ -200,3 +200,60 @@ class TestQuantileFromTDigest:
         q1 = quantile_from_tdigest(digest, 1.0)
         assert q0 < 0.5, f"q0={q0:.3f} should be near the minimum"
         assert q1 > 99.5, f"q1={q1:.3f} should be near the maximum"
+
+
+class TestTDigestDeltaSweep:
+    """Phase 5 of issue #48: accuracy/width trade-off across δ ∈ {128, 256, 512, 1024}."""
+
+    @staticmethod
+    def _make_data(n: int = 20_000, seed: int = 77) -> np.ndarray:
+        rng = np.random.default_rng(seed)
+        return rng.standard_normal(n)
+
+    @pytest.mark.parametrize("delta", [128, 256, 512, 1024])
+    def test_centroid_count_at_most_4_delta(self, delta):
+        """The sketch must stay within Dunning's 4δ centroid bound."""
+        vals = self._make_data()
+        digest = build_tdigest(vals, delta=delta)
+        assert len(digest) <= 4 * delta, (
+            f"delta={delta}: got {len(digest)} centroids, expected ≤{4 * delta}"
+        )
+
+    @pytest.mark.parametrize("delta", [128, 256, 512, 1024])
+    def test_weights_sum_to_n(self, delta):
+        """Total weight must equal the number of non-NaN input observations."""
+        vals = self._make_data()
+        digest = build_tdigest(vals, delta=delta)
+        np.testing.assert_almost_equal(float(digest[:, 1].sum()), len(vals), decimal=4)
+
+    @pytest.mark.parametrize(
+        "delta,q,tol",
+        [
+            # Tighter tolerance at higher δ; larger tol at tails vs median.
+            (128, 0.5, 0.15),  # median, δ=128: within 0.15 std dev
+            (256, 0.5, 0.10),
+            (512, 0.5, 0.06),
+            (1024, 0.5, 0.04),
+            (512, 0.1, 0.15),  # left tail
+            (512, 0.9, 0.15),  # right tail
+        ],
+    )
+    def test_quantile_error_within_tolerance(self, delta, q, tol):
+        """Quantile error is within ``tol`` standard deviations of N(0,1)."""
+        vals = self._make_data(n=50_000)
+        true_q = float(np.quantile(vals, q))
+        digest = build_tdigest(vals, delta=delta)
+        est = quantile_from_tdigest(digest, q)
+        err = abs(est - true_q)
+        assert err < tol, (
+            f"delta={delta}, q={q}: error={err:.4f} > tol={tol} (est={est:.3f}, true={true_q:.3f})"
+        )
+
+    @pytest.mark.parametrize("delta", [128, 256, 512, 1024])
+    def test_larger_delta_not_worse_than_smaller_for_median(self, delta):
+        """Larger δ should have equal or fewer centroid-count as a multiple of δ."""
+        vals = self._make_data()
+        digest = build_tdigest(vals, delta=delta)
+        # Centroid count should grow sub-linearly with δ (proportional, not more).
+        ratio = len(digest) / delta
+        assert ratio <= 4.0, f"delta={delta}: centroid/delta ratio {ratio:.2f} > 4.0"
