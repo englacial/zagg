@@ -25,6 +25,7 @@ from zagg.config import (
     get_data_vars,
     get_output_signature,
 )
+from zagg.read_plan import execute_read_plan, plan_read
 from zagg.schema import ProcessingMetadata
 
 logger = logging.getLogger(__name__)
@@ -814,6 +815,247 @@ def _predicate_mask(arr: np.ndarray, f: dict) -> np.ndarray:
     return mask
 
 
+def _level_coord_paths(level: dict, group: str) -> tuple[str, str]:
+    """Resolve ``(latitude, longitude)`` HDF5 paths for a coarse-level spatial index.
+
+    The level's ``coordinates`` field is a ``{latitude, longitude}`` dict of names
+    relative to the level's ``path`` template (matching the schema in #43's issue
+    body). Both halves are required for the ``read_plan`` to compute an AOI box.
+    """
+    coords = level.get("coordinates")
+    if not isinstance(coords, dict) or "latitude" not in coords or "longitude" not in coords:
+        raise ValueError(
+            "read_plan.spatial_index level requires "
+            "'coordinates: {latitude: <name>, longitude: <name>}'"
+        )
+    base = level["path"].format(group=group).rstrip("/")
+    lat_name = coords["latitude"]
+    lon_name = coords["longitude"]
+    # Allow either a relative name (joined to the level path) or an absolute path
+    # template (already group-substituted on .format above? no -- coords names
+    # don't carry templates; keep them simple). Absolute paths win as-is.
+    lat_path = lat_name if lat_name.startswith("/") else f"{base}/{lat_name}"
+    lon_path = lon_name if lon_name.startswith("/") else f"{base}/{lon_name}"
+    return lat_path, lon_path
+
+
+def _planned_read_group(
+    h5obj, group: str, data_source: dict, shard_key: int, grid, arrow: bool = False
+):
+    """Planned (AOI-bounded) read of one HDF5 group via the coarse spatial index.
+
+    Issue #43 Phase C: when ``data_source.read_plan.spatial_index`` names a coarse
+    level whose ``link`` points at the base level, we read the coarse coordinates
+    + link arrays once (small), call :func:`zagg.read_plan.plan_read` to compute
+    which base-rate slices the AOI bbox actually touches, and read base-rate
+    coords + variables + filter datasets only over those slices via
+    :func:`zagg.read_plan.execute_read_plan`. This avoids the
+    ``lat_ph`` + ``lon_ph`` full-coord read (up to ~245 MB per ATL03 beam) that
+    drives Lambda OOMs (issue #43 motivation).
+
+    Falls back transparently to :func:`_read_group` when:
+    - the empty-AOI short-circuit fires (no parents match) → return ``None``;
+    - ``plan_read`` flags ``full_read=True`` (selectivity above threshold);
+    - the cell ``signal_conf_ph``-style 2-D structured filter would be re-read
+      via the planned slices either way (the helper handles that uniformly).
+
+    Returns the same ``pandas.DataFrame`` / ``pyarrow.Table`` / ``None`` contract
+    as :func:`_read_group`. Output rows are in plan-slice / spatial-mask /
+    filter order — which matches the full-read path's row ordering because the
+    plan's runs are emitted in increasing parent index.
+    """
+    coordinates = data_source["coordinates"]
+    variables = data_source["variables"]
+    levels = data_source["levels"]
+    base_level_key = data_source["base_level"]
+    rp = data_source["read_plan"]
+    spatial_index_level = rp["spatial_index"]
+    pad = int(rp.get("pad", 1))
+    full_read_threshold = float(rp.get("full_read_threshold", 0.9))
+
+    si_lvl = levels[spatial_index_level]
+    link = si_lvl.get("link")
+    if not isinstance(link, dict):
+        raise ValueError(
+            f"read_plan.spatial_index level {spatial_index_level!r} requires a 'link'"
+        )
+    if link["to"] != base_level_key:
+        raise ValueError(
+            f"read_plan.spatial_index level {spatial_index_level!r} must link "
+            f"directly to base level {base_level_key!r} (got link.to={link['to']!r})"
+        )
+    index_base = int(link.get("index_base", 0))
+
+    # Read coarse-level coordinates + link arrays in one go (small — geolocation
+    # rate is ~30x lighter than photon rate on ATL03).
+    si_lat_path, si_lon_path = _level_coord_paths(si_lvl, group)
+    ibeg_path = link["index_beg"].format(group=group)
+    cnt_path = link["count"].format(group=group)
+    coarse_data = h5obj.readDatasets([si_lat_path, si_lon_path, ibeg_path, cnt_path])
+    coarse_lats = coarse_data[si_lat_path]
+    coarse_lons = coarse_data[si_lon_path]
+    ibeg_arr = coarse_data[ibeg_path]
+    cnt_arr = coarse_data[cnt_path]
+
+    if len(coarse_lats) == 0:
+        return None
+
+    # Under the contiguity assumption (#43): ``sum(count) == n_base``, so the
+    # last parent's tail gives the total length without an extra header read.
+    n_base = int(ibeg_arr[-1]) - index_base + int(cnt_arr[-1])
+    if n_base <= 0:
+        return None
+
+    # Compute the shard's WGS84 bbox from the grid (every grid's shard_footprint
+    # returns a shapely Polygon).
+    poly = grid.shard_footprint(shard_key)
+    min_lon, min_lat, max_lon, max_lat = poly.bounds
+    bbox = (float(min_lon), float(min_lat), float(max_lon), float(max_lat))
+
+    plan = plan_read(
+        np.asarray(coarse_lats),
+        np.asarray(coarse_lons),
+        np.asarray(ibeg_arr),
+        np.asarray(cnt_arr),
+        n_base,
+        bbox,
+        index_base=index_base,
+        pad=pad,
+        full_read_threshold=full_read_threshold,
+    )
+
+    if not plan.parent_runs:
+        return None  # empty AOI -- no parent intersects, skip the group entirely
+
+    if plan.full_read:
+        # Selectivity above threshold: many small reads would still sum to most
+        # of the file. Defer to the full-coord-read path; semantics identical.
+        return _read_group_full(h5obj, group, data_source, shard_key, grid, arrow=arrow)
+
+    # h5coro-compatible reader callback for execute_read_plan.
+    def _read_fn(path, hyperslice=None):
+        if hyperslice is None:
+            return h5obj.readDatasets([path])[path]
+        return h5obj.readDatasets([{"dataset": path, "hyperslice": hyperslice}])[path]
+
+    # ---- Read base coords + variables + filter datasets over the planned slices.
+    filters = filters_from_data_source(data_source)
+    base_structured = [
+        f
+        for f in filters
+        if "expression" not in f and (f.get("level") is None or f.get("level") == base_level_key)
+    ]
+    coarse_structured = [
+        f
+        for f in filters
+        if "expression" not in f
+        and f.get("level") is not None
+        and f.get("level") != base_level_key
+    ]
+    expressions = [f for f in filters if "expression" in f]
+
+    lat_path = coordinates["latitude"].format(group=group)
+    lon_path = coordinates["longitude"].format(group=group)
+    lats = execute_read_plan(plan, _read_fn, lat_path, np.float64)
+    lons = execute_read_plan(plan, _read_fn, lon_path, np.float64)
+
+    if len(lats) == 0:
+        return None
+
+    # Apply spatial / shard mask over the concatenated planned reads.
+    leaf_ids = grid.assign(lats, lons)
+    mask_spatial = grid.shards_of(leaf_ids) == shard_key
+    if np.sum(mask_spatial) == 0:
+        return None
+
+    # Read the variables and base-level filter datasets via the same plan. Read
+    # each distinct path once (the variable and filter dataset paths can coincide).
+    var_paths = {col: tmpl.format(group=group) for col, tmpl in variables.items()}
+    filter_paths = {id(f): f["dataset"].format(group=group) for f in base_structured}
+    paths_seen: set[str] = set()
+    arrays_by_path: dict[str, np.ndarray] = {}
+    for path in list(var_paths.values()) + list(filter_paths.values()):
+        if path in paths_seen:
+            continue
+        paths_seen.add(path)
+        # dtype hint isn't load-bearing -- execute_read_plan dtype-casts via
+        # np.asarray, which is a no-op when the source dtype already matches.
+        arrays_by_path[path] = execute_read_plan(plan, _read_fn, path, None)
+
+    # Base-level structured filters: ANDed keep-masks over the concatenated reads.
+    keep_mask: np.ndarray | None = None
+    for f in base_structured:
+        flag = arrays_by_path[filter_paths[id(f)]][mask_spatial]
+        fmask = _predicate_mask(flag, f)
+        keep_mask = fmask if keep_mask is None else (keep_mask & fmask)
+
+    # Cross-level (Phase B) filters: read coarse flags fully, expand to base
+    # rate (length n_base), then subset to the planned indices.
+    if coarse_structured:
+        # Build the global base-index array once: which original-base positions
+        # are present in the concatenated planned read.
+        global_idx = np.concatenate(
+            [np.arange(s, e, dtype=np.int64) for s, e in plan.base_slices]
+        )
+        cross_full: np.ndarray | None = None
+        for f in coarse_structured:
+            level_key = f["level"]
+            cf_lvl = levels[level_key]
+            cf_link = cf_lvl["link"]
+            cf_index_base = int(cf_link.get("index_base", 0))
+            cf_flag_path = f["dataset"].format(group=group)
+            cf_ibeg_path = cf_link["index_beg"].format(group=group)
+            cf_cnt_path = cf_link["count"].format(group=group)
+            cf_data = h5obj.readDatasets([cf_flag_path, cf_ibeg_path, cf_cnt_path])
+            cf_flag = cf_data[cf_flag_path]
+            cf_ibeg = cf_data[cf_ibeg_path]
+            cf_cnt = cf_data[cf_cnt_path]
+            coarse_fmask = _predicate_mask(cf_flag, f)
+            expanded = _expand_mask_to_base(coarse_fmask, cf_ibeg, cf_cnt, cf_index_base, n_base)
+            cross_full = expanded if cross_full is None else (cross_full & expanded)
+        # Subset the full-length mask to the concatenated planned indices, then
+        # to the spatial keep window so it lines up with keep_mask above.
+        cross_planned = cross_full[global_idx][mask_spatial]
+        keep_mask = cross_planned if keep_mask is None else (keep_mask & cross_planned)
+
+    if keep_mask is not None and np.sum(keep_mask) == 0:
+        return None
+
+    # Build the data dict (variables sliced to mask_spatial, then to keep_mask).
+    leaf_after_spatial = leaf_ids[mask_spatial]
+    data_dict: dict[str, np.ndarray] = {}
+    for col_name, path in var_paths.items():
+        values = arrays_by_path[path][mask_spatial]
+        if keep_mask is not None:
+            values = values[keep_mask]
+        data_dict[col_name] = values
+    data_dict["leaf_id"] = leaf_after_spatial[keep_mask] if keep_mask is not None else leaf_after_spatial
+
+    # Base-level expression filters (aggregation-time escape hatch, no pushdown).
+    for f in expressions:
+        cols = {c: data_dict[c] for c in variables if c in data_dict}
+        try:
+            emask = evaluate_filter_expression(f["expression"], cols)
+        except NameError as e:
+            raise NameError(
+                f"expression filter {f['expression']!r} references an undefined name: {e}"
+            ) from e
+        if emask.shape != data_dict["leaf_id"].shape:
+            raise ValueError(
+                f"expression filter {f['expression']!r} must yield a per-row "
+                f"boolean mask (got shape {emask.shape})"
+            )
+        if np.sum(emask) == 0:
+            return None
+        data_dict = {k: v[emask] for k, v in data_dict.items()}
+
+    if arrow:
+        import pyarrow as pa
+
+        return pa.table(data_dict)
+    return pd.DataFrame(data_dict)
+
+
 def _read_group(h5obj, group: str, data_source: dict, shard_key: int, grid, arrow: bool = False):
     """Read and spatially filter one HDF5 group.
 
@@ -821,15 +1063,50 @@ def _read_group(h5obj, group: str, data_source: dict, shard_key: int, grid, arro
     ``pyarrow.Table`` carrying the identical columns. Returns ``None`` when the
     group has no observations in this shard.
 
-    Supports two modes (issue #43, Phase B):
+    Supports three modes (issues #43 Phase A/B/C):
 
     *Flat* (no ``levels``/``base_level`` in ``data_source``): unchanged from Phase A —
     all structured filters are applied directly to base-rate data.
 
-    *Hierarchical* (``levels`` + ``base_level`` present): structured filters whose
-    normalized ``level`` key names a non-base level are applied at coarse rate, then
-    expanded to base-rate via the level's ``link`` arrays (``_expand_mask_to_base``).
-    Base-level structured filters and expression filters are unchanged.
+    *Hierarchical filtering* (``levels`` + ``base_level`` present): structured
+    filters whose normalized ``level`` key names a non-base level are applied at
+    coarse rate, then expanded to base-rate via the level's ``link`` arrays
+    (``_expand_mask_to_base``). Base-level structured filters and expression
+    filters are unchanged.
+
+    *Hierarchical (planned) read* (``read_plan.spatial_index`` set, in addition
+    to ``levels``/``base_level``): the AOI bbox is computed from the grid's
+    shard footprint, the coarse-level spatial-index coordinates are read fully
+    (cheap), and base-rate coords + variables + filter datasets are read only
+    over the planned hyperslices via :func:`zagg.read_plan.execute_read_plan`.
+    Empty-AOI groups short-circuit to ``None``. Selectivity above the configured
+    threshold falls back to the full-read path; the planned and full paths
+    produce row-for-row identical output (#43 Phase C parity).
+    """
+    if (
+        isinstance(data_source.get("read_plan"), dict)
+        and data_source["read_plan"].get("spatial_index")
+        and data_source.get("levels")
+        and data_source.get("base_level")
+    ):
+        return _planned_read_group(h5obj, group, data_source, shard_key, grid, arrow=arrow)
+    return _read_group_full(h5obj, group, data_source, shard_key, grid, arrow=arrow)
+
+
+def _read_group_full(
+    h5obj, group: str, data_source: dict, shard_key: int, grid, arrow: bool = False
+):
+    """Full-coord-read variant of :func:`_read_group` (the pre-#49-Phase-C path).
+
+    Reads the base-rate coordinate arrays in full, computes the spatial mask,
+    then hyperslices variables + base-level filter datasets to the matched
+    ``[min_idx, max_idx]`` range. Cross-level structured filters are read fully
+    at coarse rate and expanded to base-rate via ``_expand_mask_to_base``.
+    Expression filters apply over already-read variable columns.
+
+    Kept as the explicit fallback for: groups whose ``data_source`` declares no
+    ``read_plan.spatial_index``; ``plan_read``'s selectivity fallback
+    (``full_read=True``); and the legacy flat (no-levels) form.
     """
     coordinates = data_source["coordinates"]
     variables = data_source["variables"]

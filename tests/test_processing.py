@@ -1661,3 +1661,232 @@ class TestReadGroupCrossLevel:
         }
         df = _read_group(h5, "gt1l", ds, 0, _ShardGrid())
         assert df["h"].tolist() == [1.0, 3.0]
+
+
+# ---------------------------------------------------------------------------
+# Planned-read path (issue #43, Phase C — read_plan wiring into _read_group)
+# ---------------------------------------------------------------------------
+
+
+class _BboxGrid:
+    """Permissive grid stub: ``shard_footprint`` returns the bbox polygon,
+    every photon read is in shard 0. Keeps tests focused on what the planned
+    read returns (the IO-bounded slice + filters), not on a spatial-mask
+    re-filter we'd need to model separately.
+    """
+
+    def __init__(self, bbox, shard_key=0):
+        from shapely.geometry import box as _box
+
+        self.bbox = tuple(float(v) for v in bbox)
+        self._poly = _box(*self.bbox)
+        self._shard_key = shard_key
+
+    def shard_footprint(self, shard_key):
+        return self._poly
+
+    def assign(self, lats, lons):
+        return np.arange(len(lats))
+
+    def shards_of(self, leaf_ids):
+        return np.full(len(leaf_ids), self._shard_key, dtype=int)
+
+
+class _LatBboxGrid(_BboxGrid):
+    """Strict variant: ``shards_of`` keeps a photon only when its lat (carried
+    via ``assign``'s returned leaf id) falls inside the bbox lat range. Used
+    for the planned-vs-full parity test, where the spatial mask must agree
+    between paths."""
+
+    def assign(self, lats, lons):
+        # Stash lat as the leaf id; `shards_of` decodes it. Works because the
+        # test fixture has distinct lats. Real grids use cell ids.
+        return np.asarray(lats, dtype=np.float64)
+
+    def shards_of(self, leaf_ids):
+        min_lon, min_lat, max_lon, max_lat = self.bbox
+        in_shard = (leaf_ids >= min_lat) & (leaf_ids <= max_lat)
+        out = np.full(len(leaf_ids), -1, dtype=int)
+        out[in_shard] = self._shard_key
+        return out
+
+
+def _planned_read_data_source(*, with_base_filter=False, with_coarse_filter=False):
+    """Multi-level data source for the planned-read tests.
+
+    Six segments × 2 photons/segment = 12 photons. The segment-level
+    rep-point coordinates live at /seg/lat,/seg/lon; the base-level photon
+    coords at /heights/lat_ph,/heights/lon_ph; the link arrays at
+    /seg/ph_index_beg + /seg/segment_ph_cnt (0-based contiguous).
+    """
+    ds = {
+        "coordinates": {
+            "latitude": "/heights/lat_ph",
+            "longitude": "/heights/lon_ph",
+        },
+        "variables": {"h": "/heights/h"},
+        "base_level": "photons",
+        "levels": {
+            "photons": {
+                "path": "/heights",
+                "coordinates": {"latitude": "lat_ph", "longitude": "lon_ph"},
+                "variables": {"h": "h"},
+                "link": None,
+            },
+            "segments": {
+                "path": "/seg",
+                "coordinates": {"latitude": "lat", "longitude": "lon"},
+                "variables": {},
+                "link": {
+                    "to": "photons",
+                    "index_beg": "/seg/ph_index_beg",
+                    "count": "/seg/segment_ph_cnt",
+                    "index_base": 0,
+                },
+            },
+        },
+        "read_plan": {"spatial_index": "segments", "pad": 0},
+    }
+    filters = []
+    if with_base_filter:
+        filters.append({"dataset": "/heights/qs", "op": "eq", "value": 0})
+    if with_coarse_filter:
+        filters.append(
+            {"dataset": "/seg/podppd", "op": "eq", "value": 0, "level": "segments"}
+        )
+    if filters:
+        ds["filters"] = filters
+    return ds
+
+
+def _planned_read_h5(*, qs=None, podppd=None):
+    """Six-segment / 12-photon HDF5 stub with optional base/coarse flag arrays.
+
+    Segments live at lats 0,100,200,300,400,500 (lon 0); photons at lats
+    0,50,100,150,200,250,...,550 (lon 0). The wide segment spacing keeps the
+    ``plan_read`` linestring-crossing check from sweeping unrelated segments
+    into the matched range -- a narrow bbox between two rep-points stays
+    bounded by the immediate neighbours.
+    """
+    seg_lats = np.array([0.0, 100.0, 200.0, 300.0, 400.0, 500.0])
+    seg_lons = np.zeros(6)
+    ibeg = np.arange(0, 12, 2, dtype=np.int64)
+    cnt = np.full(6, 2, dtype=np.int64)
+    ph_lats = np.array(
+        [0.0, 50.0, 100.0, 150.0, 200.0, 250.0, 300.0, 350.0, 400.0, 450.0, 500.0, 550.0]
+    )
+    ph_lons = np.zeros(12)
+    h = np.arange(12.0, dtype=np.float32) * 10.0
+    arrays = {
+        "/seg/lat": seg_lats,
+        "/seg/lon": seg_lons,
+        "/seg/ph_index_beg": ibeg,
+        "/seg/segment_ph_cnt": cnt,
+        "/heights/lat_ph": ph_lats,
+        "/heights/lon_ph": ph_lons,
+        "/heights/h": h,
+    }
+    if qs is not None:
+        arrays["/heights/qs"] = np.asarray(qs)
+    if podppd is not None:
+        arrays["/seg/podppd"] = np.asarray(podppd)
+    return _FakeH5(arrays)
+
+
+class TestPlannedReadGroup:
+    """Phase C: ``_read_group`` dispatches to ``_planned_read_group`` when
+    ``data_source.read_plan.spatial_index`` is set, bounding the base-rate IO
+    via the coarse-level rep-point coords + link arrays.
+
+    The shared fixture lays out 6 segments at lats ``[0, 100, 200, 300, 400,
+    500]`` covering 12 photons (2 each). The wide spacing keeps ``plan_read``'s
+    linestring-crossing sweep bounded: a bbox between two adjacent rep-points
+    pulls in exactly its two neighbours."""
+
+    def test_planned_path_bounds_io_to_matched_segments(self):
+        # Bbox (-0.1, 175, 0.1, 225) directly contains segment 2 (lat=200);
+        # segment 1's (lat 100 -> 200) linestring crosses the lower edge so
+        # plan_read sweeps segment 1 in too. Two adjacent segments -> one
+        # contiguous run -> photons 2..5 in the base array.
+        ds = _planned_read_data_source()
+        h5 = _planned_read_h5()
+        grid = _BboxGrid((-0.1, 175.0, 0.1, 225.0))
+        df = _read_group(h5, "gt1l", ds, 0, grid)
+        assert df["h"].tolist() == [20.0, 30.0, 40.0, 50.0]
+
+    def test_empty_aoi_returns_none(self):
+        # Bbox far from any segment rep-point or linestring -> no parents
+        # match -> short-circuit return None before any base-rate read.
+        ds = _planned_read_data_source()
+        h5 = _planned_read_h5()
+        grid = _BboxGrid((10000.0, 10000.0, 10001.0, 10001.0))
+        assert _read_group(h5, "gt1l", ds, 0, grid) is None
+
+    def test_full_read_fallback_on_high_selectivity(self):
+        # full_read_threshold lowered so any plan covering >=10% of n_base
+        # (>=2/12 photons) triggers the fallback. Same bbox as the basic test
+        # selects 4/12 = 33% -> falls through to _read_group_full and reads
+        # everything; the permissive grid keeps all 12.
+        ds = _planned_read_data_source()
+        ds["read_plan"]["full_read_threshold"] = 0.1
+        h5 = _planned_read_h5()
+        grid = _BboxGrid((-0.1, 175.0, 0.1, 225.0))
+        df = _read_group(h5, "gt1l", ds, 0, grid)
+        assert df["h"].tolist() == [float(i * 10) for i in range(12)]
+
+    def test_parity_with_full_read(self):
+        # Both paths produce the same row set when the spatial mask is keyed
+        # on lat: the planned read narrows IO to photons 2..5 (via plan_read);
+        # _LatBboxGrid.shards_of further restricts to photons with lat in
+        # bbox range (photon 4, lat=200). qs drops nothing in-shard.
+        qs = np.array([0] * 12, dtype=np.int8)
+        h5 = _planned_read_h5(qs=qs)
+        grid = _LatBboxGrid((-0.1, 175.0, 0.1, 225.0))
+
+        ds_planned = _planned_read_data_source(with_base_filter=True)
+        ds_full = {
+            "coordinates": {
+                "latitude": "/heights/lat_ph",
+                "longitude": "/heights/lon_ph",
+            },
+            "variables": {"h": "/heights/h"},
+            "filters": [{"dataset": "/heights/qs", "op": "eq", "value": 0}],
+        }
+
+        df_planned = _read_group(h5, "gt1l", ds_planned, 0, grid)
+        df_full = _read_group(h5, "gt1l", ds_full, 0, grid)
+        # Photon 4 (lat=200, h=40) is the only one in the bbox lat range.
+        assert df_planned["h"].tolist() == [40.0]
+        assert df_full["h"].tolist() == [40.0]
+
+    def test_coarse_filter_via_planned_path(self):
+        # Cross-level (Phase B) filter ANDs with the planned path: drop
+        # segment 1 via podppd; segment 2 (also pulled in by the linestring
+        # sweep) survives. Photons 2,3 dropped; 4,5 kept.
+        ds = _planned_read_data_source(with_coarse_filter=True)
+        podppd = np.array([0, 1, 0, 0, 0, 0], dtype=np.int8)
+        h5 = _planned_read_h5(podppd=podppd)
+        grid = _BboxGrid((-0.1, 175.0, 0.1, 225.0))
+        df = _read_group(h5, "gt1l", ds, 0, grid)
+        assert df["h"].tolist() == [40.0, 50.0]
+
+    def test_pad_extends_selection(self):
+        # bbox (490..510) covers segment 5 (last, lat=500) directly; segment
+        # 4's linestring (400 -> 500) crosses the lower edge. With pad=0:
+        # segments 4,5 -> photons 8..11. With pad=1: segments 3,4,5,6(clamped
+        # back to 5) -> photons 6..11.
+        ds = _planned_read_data_source()
+        ds["read_plan"]["pad"] = 1
+        h5 = _planned_read_h5()
+        grid = _BboxGrid((-0.1, 490.0, 0.1, 510.0))
+        df = _read_group(h5, "gt1l", ds, 0, grid)
+        assert df["h"].tolist() == [60.0, 70.0, 80.0, 90.0, 100.0, 110.0]
+
+    def test_invalid_link_target_raises(self):
+        # The spatial_index level's link must point at the base level.
+        ds = _planned_read_data_source()
+        ds["levels"]["segments"]["link"]["to"] = "not_a_level"
+        h5 = _planned_read_h5()
+        grid = _BboxGrid((-0.1, 175.0, 0.1, 225.0))
+        with pytest.raises(ValueError, match="must link directly to base level"):
+            _read_group(h5, "gt1l", ds, 0, grid)

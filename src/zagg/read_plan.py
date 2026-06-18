@@ -28,8 +28,10 @@ class ReadPlan:
     base_slices : list of (int, int)
         Corresponding base-level ``[start, end)`` half-open slices.
     chunk_lists : list of list of (int, int)
-        h5coro-style ``[(start, end)]`` hyperslice lists (inclusive end, 0-based)
-        for each run.
+        h5coro-style ``[(start, end)]`` hyperslice lists (half-open
+        ``[start, end)``, 0-based — matches h5coro's ``h5dataset.py`` "must
+        provide as list of ranges [x,y)" contract). Mirrors ``base_slices``
+        one-to-one.
     coarse_flag_ranges : list of (int, int)
         Reserved for future use (coarse-level flag read ranges).
     full_read : bool
@@ -159,7 +161,7 @@ def plan_read(
         if base_end <= base_start:
             continue
         base_slices.append((base_start, base_end))
-        chunk_lists.append([(base_start, base_end - 1)])  # h5coro inclusive end
+        chunk_lists.append([(base_start, base_end)])  # h5coro half-open [start, end)
         total_base += base_end - base_start
 
     # -- Selectivity fallback --
@@ -167,7 +169,7 @@ def plan_read(
         return ReadPlan(
             parent_runs=[(0, n_coarse - 1)],
             base_slices=[(0, n_base)],
-            chunk_lists=[[(0, n_base - 1)]],
+            chunk_lists=[[(0, n_base)]],
             full_read=True,
         )
 

@@ -136,7 +136,10 @@ class TestPlanReadIndexBase:
 class TestExecuteReadPlan:
     def _make_plan(self, slices, full_read=False):
         runs = [(s, e - 1) for s, e in slices]
-        chunks = [[(s, e - 1)] for s, e in slices]
+        # chunk_lists use h5coro's half-open ``[start, end)`` convention --
+        # mirrors base_slices exactly. The runs are inclusive index pairs in
+        # the coarse array (different domain than chunks).
+        chunks = [[slc] for slc in slices]
         return ReadPlan(
             parent_runs=runs,
             base_slices=list(slices),
@@ -161,9 +164,11 @@ class TestExecuteReadPlan:
         plan = self._make_plan([(10, 20)])
 
         def read_fn(path, hyperslice=None):
+            # h5coro hyperslice is half-open ``[lo, hi)`` per h5dataset.py
+            # ("must provide as list of ranges [x,y)") -- Python slicing matches.
             assert hyperslice is not None
             lo, hi = hyperslice[0]
-            return data[lo : hi + 1]  # h5coro inclusive end
+            return data[lo:hi]
 
         out = execute_read_plan(plan, read_fn, "/h", np.float32)
         np.testing.assert_array_equal(out, data[10:20])
@@ -174,7 +179,7 @@ class TestExecuteReadPlan:
 
         def read_fn(path, hyperslice=None):
             lo, hi = hyperslice[0]
-            return data[lo : hi + 1]
+            return data[lo:hi]
 
         out = execute_read_plan(plan, read_fn, "/h", np.float32)
         expected = np.concatenate([data[5:10], data[20:25]])
@@ -185,7 +190,7 @@ class TestExecuteReadPlan:
         plan = ReadPlan(
             parent_runs=[(0, 4)],
             base_slices=[(0, 50)],
-            chunk_lists=[[(0, 49)]],
+            chunk_lists=[[(0, 50)]],
             full_read=True,
         )
         called_with_none = []
