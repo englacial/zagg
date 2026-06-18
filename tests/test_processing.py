@@ -1349,6 +1349,44 @@ class TestReadGroupFilters:
         df = _read_group(h5, "gt1l", ds, 0, _ShardGrid())
         assert df["h"].tolist() == [0.0, 2.0, 4.0]
 
+    def test_atl03_shipped_template_2d_signal_conf(self):
+        # Drives the shipped atl03.yaml structured filter through the read path
+        # against a realistic (n_photons, 5) signal_conf_ph: one TEP photon
+        # (-2 across every surface type) plus four non-TEP photons of varying
+        # confidence. Only the TEP row is dropped (column 0, op: ne, value: -2).
+        from zagg.config import default_config
+
+        atl03_filters = default_config("atl03").data_source["filters"]
+        conf = np.array(
+            [
+                [4, 4, 4, 4, 4],     # all-high-confidence (kept)
+                [-2, -2, -2, -2, -2],  # TEP across all surface types (dropped)
+                [0, 0, 0, 0, 0],     # noise across all (kept; -2 is the TEP flag)
+                [3, 2, 1, 0, 4],     # mixed confidence (kept)
+                [-2, 4, 4, 4, 4],    # column 0 is TEP but others aren't -- with
+                                     # column: 0 this row is dropped, even though
+                                     # the photon is a valid land-ice return on
+                                     # surface type 3. See PR #47 review thread:
+                                     # this is the operational tradeoff of moving
+                                     # from .any(axis=1) to a single-column key.
+            ]
+        )
+        h5 = _FakeH5(
+            {
+                "/lat": np.arange(5.0),
+                "/lon": np.arange(5.0),
+                "/h": np.arange(5.0, dtype=np.float32),
+                "/conf": conf,
+            }
+        )
+        # Rewrite the shipped template's filter dataset path to match the fake h5.
+        f = dict(atl03_filters[0])
+        f["dataset"] = "/conf"
+        ds = self._data_source(filters=[f])
+        df = _read_group(h5, "gt1l", ds, 0, _ShardGrid())
+        # Rows 1 (true TEP) and 4 (column-0 TEP only) are dropped.
+        assert df["h"].tolist() == [0.0, 2.0, 3.0]
+
     def test_expression_filter_base_level(self):
         h5 = _FakeH5(
             {

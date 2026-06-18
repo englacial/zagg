@@ -13,6 +13,14 @@
 # on the cell's own median(h_ph) is more natural for a photon-height density
 # template and avoids the cross-group / resolution-mismatch read.
 #
+# Caveat: median(h_ph) is a *per-cell* anchor, not a stable absolute reference.
+# In a bimodal cell (e.g. ground + canopy returns) the median can land between
+# the two clusters, splitting both into wings of the histogram; that is a real
+# tradeoff of centring on the photon distribution itself. bin_start records the
+# centring value so the bin-0 absolute elevation = (bin_start - 128 m) is still
+# recoverable, but comparing waveforms across cells in the same absolute frame
+# requires shifting each cell's bins by its own bin_start.
+#
 # Confidence filter is the same as atl03.yaml: drop only TEP photons by the
 # structured ``filters:`` list (signal_conf_ph[:, 0] != -2; TEP is uniform
 # across surface types). Grid is rectilinear, matching atl03.yaml.
