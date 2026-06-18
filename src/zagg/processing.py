@@ -900,16 +900,30 @@ def _planned_read_group(
     if len(coarse_lats) == 0:
         return None
 
-    # Under the contiguity assumption (#43): ``sum(count) == n_base``, so the
-    # last parent's tail gives the total length without an extra header read.
-    n_base = int(ibeg_arr[-1]) - index_base + int(cnt_arr[-1])
+    # ``n_base`` under #43's contiguity assumption ("ranges do not overlap and
+    # together tile the full base array" -- :func:`_expand_mask_to_base`).
+    # ``int(cnt_arr.sum())`` makes the assumption explicit and is identical to
+    # ``ibeg_arr[-1] - index_base + cnt_arr[-1]`` when contiguity holds. If a
+    # future granule format drops trailing photons or gaps between parents,
+    # either form under- or over-estimates -- track via a follow-up to #43.
+    n_base = int(np.asarray(cnt_arr).sum())
     if n_base <= 0:
         return None
 
-    # Compute the shard's WGS84 bbox from the grid (every grid's shard_footprint
-    # returns a shapely Polygon).
+    # Compute the shard's WGS84 bbox from the grid (every grid's
+    # ``shard_footprint`` returns a shapely ``Polygon`` or ``MultiPolygon``).
+    # An antimeridian-crossing HEALPix shard's footprint can come back as a
+    # split ``MultiPolygon`` (see ``zagg.viz.shardmap._split_antimeridian``),
+    # in which case ``.bounds`` spans ~360 deg in lon and would neutralize
+    # the IO bound (the AOI would intersect every segment). Same for
+    # globe-spanning polar caps. Detect the wide-bbox case up front and fall
+    # back to ``_read_group_full`` so we don't pretend to optimize.
     poly = grid.shard_footprint(shard_key)
     min_lon, min_lat, max_lon, max_lat = poly.bounds
+    if (max_lon - min_lon) >= 180.0:
+        # Hand off to the full-read path; the planned-IO benefit is gone for
+        # this shard and trying to plan would waste the coarse-coord read.
+        return _read_group_full(h5obj, group, data_source, shard_key, grid, arrow=arrow)
     bbox = (float(min_lon), float(min_lat), float(max_lon), float(max_lat))
 
     plan = plan_read(
@@ -1083,12 +1097,24 @@ def _read_group(h5obj, group: str, data_source: dict, shard_key: int, grid, arro
     threshold falls back to the full-read path; the planned and full paths
     produce row-for-row identical output (#43 Phase C parity).
     """
-    if (
-        isinstance(data_source.get("read_plan"), dict)
-        and data_source["read_plan"].get("spatial_index")
-        and data_source.get("levels")
-        and data_source.get("base_level")
-    ):
+    rp = data_source.get("read_plan")
+    levels = data_source.get("levels")
+    base_level = data_source.get("base_level")
+    # Truthy-checking ``levels``/``base_level`` would route an empty ``{}`` (a
+    # config typo, easy to do) back to the full-read path silently. Reject
+    # incomplete configurations explicitly instead -- the planned path is
+    # gated only when ``spatial_index`` is set, and *then* requires a real
+    # multi-level structure to operate on.
+    if isinstance(rp, dict) and rp.get("spatial_index"):
+        if not isinstance(levels, dict) or not levels:
+            raise ValueError(
+                "data_source.read_plan.spatial_index requires a non-empty "
+                "'levels' mapping"
+            )
+        if not base_level:
+            raise ValueError(
+                "data_source.read_plan.spatial_index requires 'base_level'"
+            )
         return _planned_read_group(h5obj, group, data_source, shard_key, grid, arrow=arrow)
     return _read_group_full(h5obj, group, data_source, shard_key, grid, arrow=arrow)
 

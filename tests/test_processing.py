@@ -1890,3 +1890,100 @@ class TestPlannedReadGroup:
         grid = _BboxGrid((-0.1, 175.0, 0.1, 225.0))
         with pytest.raises(ValueError, match="must link directly to base level"):
             _read_group(h5, "gt1l", ds, 0, grid)
+
+    def test_multi_slice_plan_global_idx_alignment(self):
+        # Force a plan with two disjoint base-slices (one ATL03 track that
+        # crosses the AOI lat band twice). Fixture: 10 segments × 1 photon
+        # each, lats wave from 0 -> 100 -> 0 -> 100 -> 0 so plan_read's
+        # linestring + containment check picks up segments {2,3,4} and
+        # {6,7,8} but not {0,1,5,9}. The plan therefore has two runs and
+        # ``global_idx = [2,3,4,6,7,8]``. A cross-level podppd filter that
+        # drops segment 3 must align correctly through that global_idx
+        # (otherwise photon 3's drop hits the wrong row).
+        seg_lats = np.array([0.0, 0.0, 50.0, 100.0, 100.0, 0.0, 0.0, 100.0, 100.0, 0.0])
+        seg_lons = np.zeros(10)
+        ibeg = np.arange(10, dtype=np.int64)
+        cnt = np.ones(10, dtype=np.int64)
+        ph_lats = seg_lats.copy()
+        ph_lons = np.zeros(10)
+        h = np.arange(10.0, dtype=np.float32) * 10.0
+        podppd = np.array([0, 0, 0, 1, 0, 0, 0, 0, 0, 0], dtype=np.int8)
+        h5 = _FakeH5(
+            {
+                "/seg/lat": seg_lats,
+                "/seg/lon": seg_lons,
+                "/seg/ph_index_beg": ibeg,
+                "/seg/segment_ph_cnt": cnt,
+                "/seg/podppd": podppd,
+                "/heights/lat_ph": ph_lats,
+                "/heights/lon_ph": ph_lons,
+                "/heights/h": h,
+            }
+        )
+        ds = _planned_read_data_source(with_coarse_filter=True)
+        grid = _BboxGrid((-0.1, 95.0, 0.1, 105.0))
+        df = _read_group(h5, "gt1l", ds, 0, grid)
+        # plan covers segments {2,3,4} and {6,7,8} -> base_slices [(2,5),(6,9)]
+        # -> global_idx [2,3,4,6,7,8] -> base photons h = [20,30,40,60,70,80]
+        # cross-level drops segment 3 -> drop photon 3 (h=30) only.
+        assert df["h"].tolist() == [20.0, 40.0, 60.0, 70.0, 80.0]
+
+    def test_full_read_fallback_carries_filters(self):
+        # The selectivity-fallback path must produce the same row set as the
+        # planned path would, including base-level structured filters: drop
+        # photons 5,6 via qs=1 below. Bbox + low threshold -> fallback to
+        # _read_group_full, which still applies the qs filter.
+        ds = _planned_read_data_source(with_base_filter=True)
+        ds["read_plan"]["full_read_threshold"] = 0.1
+        qs = np.array([0, 0, 0, 0, 0, 1, 1, 0, 0, 0, 0, 0], dtype=np.int8)
+        h5 = _planned_read_h5(qs=qs)
+        grid = _BboxGrid((-0.1, 175.0, 0.1, 225.0))
+        df = _read_group(h5, "gt1l", ds, 0, grid)
+        # Full-coord path keeps all 12 photons (permissive grid); qs drops 5,6.
+        assert df["h"].tolist() == [0.0, 10.0, 20.0, 30.0, 40.0, 70.0, 80.0, 90.0, 100.0, 110.0]
+
+    def test_antimeridian_grid_falls_back_to_full_read(self):
+        # A grid whose shard_footprint spans ~360 deg in lon (HEALPix
+        # antimeridian / polar cap) gives plan_read a useless bbox. The
+        # planned path detects this and falls back so the full-read path is
+        # used instead -- otherwise the AOI would intersect every segment.
+        ds = _planned_read_data_source()
+        h5 = _planned_read_h5()
+        grid = _BboxGrid((-180.0, -10.0, 180.0, 10.0))  # 360 deg lon span
+        df = _read_group(h5, "gt1l", ds, 0, grid)
+        # Full-coord path with permissive grid keeps all 12 photons.
+        assert df["h"].tolist() == [float(i * 10) for i in range(12)]
+
+    def test_dispatch_rejects_empty_levels(self):
+        # An incomplete config -- ``read_plan.spatial_index`` set but
+        # ``levels`` empty -- raises rather than silently routing to the
+        # full-read path (which would pretend nothing was wrong).
+        ds = _planned_read_data_source()
+        ds["levels"] = {}
+        h5 = _planned_read_h5()
+        grid = _BboxGrid((-0.1, 175.0, 0.1, 225.0))
+        with pytest.raises(ValueError, match="non-empty 'levels' mapping"):
+            _read_group(h5, "gt1l", ds, 0, grid)
+
+    def test_parity_with_full_read_includes_leaf_id(self):
+        # Strengthen the parity check: row ORDER (via leaf_id) must agree
+        # between paths, not just the value column.
+        qs = np.array([0] * 12, dtype=np.int8)
+        h5 = _planned_read_h5(qs=qs)
+        grid = _LatBboxGrid((-0.1, 175.0, 0.1, 225.0))
+
+        ds_planned = _planned_read_data_source(with_base_filter=True)
+        ds_full = {
+            "coordinates": {
+                "latitude": "/heights/lat_ph",
+                "longitude": "/heights/lon_ph",
+            },
+            "variables": {"h": "/heights/h"},
+            "filters": [{"dataset": "/heights/qs", "op": "eq", "value": 0}],
+        }
+
+        df_planned = _read_group(h5, "gt1l", ds_planned, 0, grid)
+        df_full = _read_group(h5, "gt1l", ds_full, 0, grid)
+        # Same row -- leaf_id == lat under _LatBboxGrid.assign.
+        assert df_planned["leaf_id"].tolist() == df_full["leaf_id"].tolist()
+        assert df_planned["h"].tolist() == df_full["h"].tolist()
