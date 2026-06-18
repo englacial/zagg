@@ -41,7 +41,14 @@ from pydantic_zarr.experimental.v3 import ArraySpec, GroupSpec, NamedConfig
 from zarr import config as zarr_config
 from zarr.abc.store import Store
 
-from zagg.config import PipelineConfig, default_config, get_agg_fields
+from zagg.config import (
+    PipelineConfig,
+    default_config,
+    get_agg_fields,
+    get_output_signature,
+    output_field_signature,
+)
+from zagg.grids.base import vector_array_spec
 
 OOB_SENTINEL: int = -1
 
@@ -152,6 +159,7 @@ class RectilinearGrid:
             "affine": [a.a, a.b, a.c, a.d, a.e, a.f],
             "shape": [self.height, self.width],
             "chunk_shape": [self.chunk_h, self.chunk_w],
+            "output_fields": output_field_signature(self.config),
         }
 
     def nests_with(self, other) -> bool:
@@ -164,6 +172,10 @@ class RectilinearGrid:
         if not isinstance(other, RectilinearGrid):
             return False
         if self._geobox.crs != other._geobox.crs:
+            return False
+        if output_field_signature(self.config) != output_field_signature(other.config):
+            # Co-aggregated grids must declare the same Option-B output-field
+            # set (issue #29): same scalar/vector kinds, trailing shapes, dtypes.
             return False
         if not (_whole_ratio(self.res_x, other.res_x)
                 and _whole_ratio(self.res_y, other.res_y)):
@@ -358,7 +370,15 @@ class RectilinearGrid:
         for name, meta in get_agg_fields(self.config).items():
             dtype = meta.get("dtype", "float32")
             fill = meta.get("fill_value", "NaN")
-            members[name] = base.with_data_type(dtype).with_fill_value(fill)
+            spec = base.with_data_type(dtype).with_fill_value(fill)
+            # A vector field (issue #29) gets a trailing payload dim chunked
+            # whole; scalars are returned unchanged.
+            members[name] = vector_array_spec(
+                spec,
+                get_output_signature(meta),
+                base_dims=("y", "x"),
+                base_chunk_shape=self.chunk_shape,
+            )
 
         return GroupSpec(members=members, attributes=self._geozarr_attrs())
 

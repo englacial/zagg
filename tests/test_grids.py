@@ -245,3 +245,139 @@ class TestBackcompatWrapper:
         )
         group = open_group(store, path="8", mode="r")
         assert group["count"].shape == (4 ** (8 - 6) * 3,)
+
+
+def _vector_config(bins=4, dtype="int64"):
+    """A config with one scalar (``count``) and one ``kind: vector`` field
+    (issue #29), reusing the atl06 coordinates so grids build normally."""
+    from zagg.config import PipelineConfig
+
+    base = default_config("atl06")
+    agg = {
+        "coordinates": base.aggregation.get("coordinates", {}),
+        "variables": {
+            "count": {"function": "len", "source": "h_li"},
+            "hist": {
+                "function": "np.bincount",
+                "source": "b",
+                "kind": "vector",
+                "trailing_shape": bins,
+                "dtype": dtype,
+            },
+        },
+    }
+    return PipelineConfig(
+        data_source=base.data_source, aggregation=agg, output=base.output
+    )
+
+
+class TestOutputFieldSignature:
+    """Issue #29 phase 4: ``signature()`` carries the Option-B output-field set
+    and ``nests_with()`` requires a matching set."""
+
+    def test_signature_includes_output_fields(self, cfg):
+        g = HealpixGrid(parent_order=6, child_order=8, layout="fullsphere", config=cfg)
+        sig = g.signature()
+        assert "output_fields" in sig
+        names = {f["name"] for f in sig["output_fields"]}
+        assert "count" in names
+        # Each entry carries the Option-B keys.
+        for f in sig["output_fields"]:
+            assert set(f) == {"name", "kind", "trailing_shape", "dtype"}
+
+    def test_signature_marks_vector_field(self):
+        g = HealpixGrid(
+            parent_order=6, child_order=8, layout="fullsphere", config=_vector_config()
+        )
+        by_name = {f["name"]: f for f in g.signature()["output_fields"]}
+        assert by_name["hist"]["kind"] == "vector"
+        assert by_name["hist"]["trailing_shape"] == [4]
+        assert by_name["count"]["kind"] == "scalar"
+        assert by_name["count"]["trailing_shape"] == []
+
+    def test_signature_is_json_serializable(self):
+        import json
+
+        g = HealpixGrid(
+            parent_order=6, child_order=8, layout="fullsphere", config=_vector_config()
+        )
+        fields = g.signature()["output_fields"]
+        # Round-trips through JSON unchanged (recorded in a ShardMap as JSON).
+        assert json.loads(json.dumps(fields)) == fields
+
+    def test_nests_with_same_field_set(self, cfg):
+        a = HealpixGrid(parent_order=6, child_order=8, layout="fullsphere", config=cfg)
+        b = HealpixGrid(parent_order=4, child_order=8, layout="fullsphere", config=cfg)
+        assert a.nests_with(b) and b.nests_with(a)
+
+    def test_nests_with_differing_field_kind_rejected(self, cfg):
+        scalar = HealpixGrid(
+            parent_order=6, child_order=8, layout="fullsphere", config=cfg
+        )
+        vector = HealpixGrid(
+            parent_order=6, child_order=8, layout="fullsphere", config=_vector_config()
+        )
+        assert not scalar.nests_with(vector)
+        assert not vector.nests_with(scalar)
+
+    def test_nests_with_differing_trailing_shape_rejected(self):
+        a = HealpixGrid(
+            parent_order=6,
+            child_order=8,
+            layout="fullsphere",
+            config=_vector_config(bins=4),
+        )
+        b = HealpixGrid(
+            parent_order=6,
+            child_order=8,
+            layout="fullsphere",
+            config=_vector_config(bins=8),
+        )
+        assert not a.nests_with(b)
+
+
+class TestVectorTemplate:
+    """Issue #29 phase 5: a ``kind: vector`` field's template array gets a
+    trailing payload dim chunked whole (single-trailing-chunk invariant)."""
+
+    def test_healpix_vector_array_has_trailing_dim(self):
+        cfg = _vector_config(bins=4, dtype="int64")
+        # int vector field needs an int fill_value (NaN is invalid on int dtype).
+        cfg.aggregation["variables"]["hist"]["fill_value"] = 0
+        g = HealpixGrid(parent_order=6, child_order=8, layout="fullsphere", config=cfg)
+        store = MemoryStore()
+        g.emit_template(store)
+        grp = open_group(store, path="8", mode="r")
+        n_pix = HEALPIX_BASE_CELLS * 4**8
+        assert grp["count"].shape == (n_pix,)  # scalar unchanged
+        assert grp["hist"].shape == (n_pix, 4)  # trailing payload dim
+        # Trailing dim is ONE chunk (block_idx invariant): chunk == full width.
+        assert grp["hist"].chunks == (4 ** (8 - 6), 4)
+        assert grp["hist"].dtype == np.dtype("int64")
+
+    def test_healpix_dimension_names_extend(self):
+        cfg = _vector_config(bins=3, dtype="int64")
+        cfg.aggregation["variables"]["hist"]["fill_value"] = 0
+        g = HealpixGrid(parent_order=6, child_order=8, layout="fullsphere", config=cfg)
+        spec = g.spec()
+        names = spec.members["hist"].dimension_names
+        assert names == ("cells", "vector")  # spatial + the trailing payload axis
+
+    def test_rectilinear_vector_array_has_trailing_dim(self):
+        from zagg.grids import RectilinearGrid
+
+        cfg = _vector_config(bins=4, dtype="int64")
+        cfg.aggregation["variables"]["hist"]["fill_value"] = 0
+        g = RectilinearGrid(
+            "EPSG:3031",
+            1000.0,
+            (-1e6, -1e6, 1e6, 1e6),
+            chunk_shape=(64, 64),
+            config=cfg,
+        )
+        store = MemoryStore()
+        g.emit_template(store)
+        grp = open_group(store, path="rectilinear", mode="r")
+        assert grp["count"].shape == (g.height, g.width)
+        assert grp["hist"].shape == (g.height, g.width, 4)
+        assert grp["hist"].chunks == (64, 64, 4)  # trailing dim whole

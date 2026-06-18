@@ -8,8 +8,14 @@ from pydantic_zarr.experimental.v3 import ArraySpec, GroupSpec, NamedConfig
 from zarr import config as zarr_config
 from zarr.abc.store import Store
 
-from zagg.config import PipelineConfig, default_config, get_agg_fields
-from zagg.grids.base import InconsistentShardError
+from zagg.config import (
+    PipelineConfig,
+    default_config,
+    get_agg_fields,
+    get_output_signature,
+    output_field_signature,
+)
+from zagg.grids.base import InconsistentShardError, vector_array_spec
 
 HEALPIX_BASE_CELLS: int = 12
 HEALPIX_REF_ORDER: int = 18  # mortie's clip2order reference order; do not change
@@ -204,15 +210,22 @@ class HealpixGrid:
             "parent_order": self.parent_order,
             "child_order": self.child_order,
             "layout": self.layout,
+            "output_fields": output_field_signature(self.config),
         }
 
     def nests_with(self, other) -> bool:
         """Whether ``self`` and ``other`` tile compatibly.
 
         Any two HEALPix grids nest (the nested hierarchy subdivides 4-for-1 at
-        every order). Cross-family (e.g. rectilinear) never nests.
+        every order), provided they declare the same Option-B output-field set
+        (issue #29) — co-aggregated grids must produce the same scalar/vector
+        schema. Cross-family (e.g. rectilinear) never nests.
         """
-        return isinstance(other, HealpixGrid)
+        if not isinstance(other, HealpixGrid):
+            return False
+        return output_field_signature(self.config) == output_field_signature(
+            other.config
+        )
 
     def emit_template(self, store: Store, *, overwrite: bool = False) -> Store:
         """Write the Zarr template (group + arrays) to ``store``."""
@@ -257,7 +270,15 @@ class HealpixGrid:
         for name, meta in get_agg_fields(self.config).items():
             dtype = meta.get("dtype", "float32")
             fill = meta.get("fill_value", "NaN")
-            members[name] = base.with_data_type(dtype).with_fill_value(fill)
+            spec = base.with_data_type(dtype).with_fill_value(fill)
+            # A vector field (issue #29) gets a trailing payload dim chunked
+            # whole; scalars are returned unchanged.
+            members[name] = vector_array_spec(
+                spec,
+                get_output_signature(meta),
+                base_dims=("cells",),
+                base_chunk_shape=(self.n_children,),
+            )
 
         return GroupSpec(members=members, attributes=self._dggs_attrs())
 

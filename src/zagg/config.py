@@ -5,7 +5,7 @@ import re
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from importlib import resources
-from typing import NotRequired, TypedDict
+from typing import Any, NotRequired, TypedDict
 
 import numpy as np
 import yaml
@@ -147,16 +147,12 @@ def validate_config(config: PipelineConfig) -> None:
         if grid["type"] == "rectilinear":
             for field in ("crs", "resolution", "bounds"):
                 if field not in grid:
-                    raise ValueError(
-                        f"output.grid.{field} is required for rectilinear grid"
-                    )
+                    raise ValueError(f"output.grid.{field} is required for rectilinear grid")
             if len(grid["bounds"]) != 4:
                 raise ValueError("output.grid.bounds must be [xmin, ymin, xmax, ymax]")
         layout = grid.get("layout")
         if layout is not None and layout not in ("dense", "fullsphere"):
-            raise ValueError(
-                f"output.grid.layout must be 'dense' or 'fullsphere' (got {layout!r})"
-            )
+            raise ValueError(f"output.grid.layout must be 'dense' or 'fullsphere' (got {layout!r})")
 
     # Validate bounds structure (optional)
     if config.bounds is not None:
@@ -191,16 +187,12 @@ def validate_config(config: PipelineConfig) -> None:
 
         # Must have one (count via function:len is allowed)
         if not has_func and not has_expr:
-            raise ValueError(
-                f"Variable '{name}': must specify 'function' or 'expression'"
-            )
+            raise ValueError(f"Variable '{name}': must specify 'function' or 'expression'")
 
         # Validate source references
         source = meta.get("source")
         if source is not None and source not in ds_vars:
-            raise ValueError(
-                f"Variable '{name}': source '{source}' not in data_source.variables"
-            )
+            raise ValueError(f"Variable '{name}': source '{source}' not in data_source.variables")
 
         # Validate function resolves
         if has_func:
@@ -223,6 +215,97 @@ def validate_config(config: PipelineConfig) -> None:
         # Validate expression column references
         if has_expr:
             _validate_expression_columns(name, meta["expression"], ds_vars)
+
+        # Validate the output-kind declaration (kind + trailing_shape + dtype)
+        _validate_output_kind(name, meta)
+
+
+# Recognized per-field output kinds. ``ragged`` (CSR) is Tier 2 and not yet
+# accepted; see issue #29.
+OUTPUT_KINDS = ("scalar", "vector")
+
+
+def _validate_output_kind(name: str, meta: dict) -> None:
+    """Validate a variable's non-scalar output declaration.
+
+    A field may declare ``kind`` (``scalar`` default, or ``vector``) and
+    ``trailing_shape`` (required for ``vector``). ``scalar`` fields need
+    neither and stay the default path. A ``vector`` field may be driven by
+    either ``function`` or ``expression``; ``len``/``count`` are rejected for
+    ``vector`` (they short-circuit to a scalar count). See issue #29.
+
+    Parameters
+    ----------
+    name : str
+        Variable name (for error messages).
+    meta : dict
+        The variable's aggregation metadata.
+
+    Raises
+    ------
+    ValueError
+        On any invalid output-kind declaration.
+    """
+    kind = meta.get("kind", "scalar")
+    if kind not in OUTPUT_KINDS:
+        allowed = ", ".join(OUTPUT_KINDS)
+        raise ValueError(
+            f"Variable '{name}': output kind '{kind}' is not supported "
+            f"(allowed: {allowed}; 'ragged' is planned but not yet implemented)"
+        )
+
+    # dtype, when declared, must name a real numpy dtype (applies to all kinds).
+    if "dtype" in meta:
+        try:
+            np.dtype(meta["dtype"])
+        except (TypeError, ValueError) as e:
+            raise ValueError(
+                f"Variable '{name}': dtype {meta['dtype']!r} is not a valid numpy dtype ({e})"
+            ) from e
+
+    has_trailing = "trailing_shape" in meta
+
+    if kind == "scalar":
+        if has_trailing:
+            raise ValueError(
+                f"Variable '{name}': 'trailing_shape' is only valid for kind 'vector', not 'scalar'"
+            )
+        return
+
+    # kind == "vector": trailing_shape is required and must be positive ints.
+    if not has_trailing:
+        raise ValueError(f"Variable '{name}': kind 'vector' requires 'trailing_shape'")
+    _validate_trailing_shape(name, meta["trailing_shape"])
+
+    # ``len``/``count`` short-circuit to a scalar obs count in
+    # ``calculate_cell_statistics``; pairing them with kind 'vector' would
+    # silently emit a scalar, so reject the nonsensical combination.
+    if meta.get("function") in ("len", "count"):
+        raise ValueError(
+            f"Variable '{name}': function {meta['function']!r} produces a scalar "
+            f"count and cannot be combined with kind 'vector'"
+        )
+
+
+def _validate_trailing_shape(name: str, trailing_shape) -> None:
+    """Check a vector field's trailing_shape is a tuple of positive ints."""
+    if isinstance(trailing_shape, int):
+        dims: tuple = (trailing_shape,)
+    elif isinstance(trailing_shape, (list, tuple)):
+        dims = tuple(trailing_shape)
+    else:
+        raise ValueError(
+            f"Variable '{name}': 'trailing_shape' must be an int or a "
+            f"sequence of ints (got {trailing_shape!r})"
+        )
+    if not dims:
+        raise ValueError(f"Variable '{name}': 'trailing_shape' must have at least one dimension")
+    for dim in dims:
+        if not isinstance(dim, int) or isinstance(dim, bool) or dim < 1:
+            raise ValueError(
+                f"Variable '{name}': 'trailing_shape' entries must be positive "
+                f"integers (got {dim!r})"
+            )
 
 
 def _is_numeric(s: str) -> bool:
@@ -311,9 +394,80 @@ def get_agg_fields(config: PipelineConfig) -> dict:
     Returns
     -------
     dict
-        ``{name: {function/expression, source, params, dtype, fill_value, ...}}``
+        ``{name: {function/expression, source, params, dtype, fill_value, ...}}``.
+        A field may also declare a non-scalar output (issue #29) via ``kind``
+        (``scalar`` default, or ``vector``) and ``trailing_shape``; use
+        :func:`get_output_signature` to read the normalized declaration.
     """
     return dict(config.aggregation.get("variables", {}))
+
+
+def get_output_signature(meta: dict) -> dict:
+    """Return the normalized non-scalar output signature for one agg field.
+
+    This is the single read point for a field's Option B declaration (issue
+    #29): its output ``kind``, the per-cell ``trailing_shape``, and ``dtype``.
+    Later phases (statistic eval, the per-shard container, and the grid
+    ``signature()``) consume this rather than re-parsing the raw metadata.
+
+    Parameters
+    ----------
+    meta : dict
+        A single variable's aggregation metadata (a value of
+        :func:`get_agg_fields`).
+
+    Returns
+    -------
+    dict
+        ``{"kind": str, "trailing_shape": tuple[int, ...], "dtype": str}``.
+        ``trailing_shape`` is ``()`` for scalar fields. ``dtype`` is the
+        declared dtype string, or ``None`` if unset.
+    """
+    kind = meta.get("kind", "scalar")
+    if kind == "vector":
+        ts = meta["trailing_shape"]
+        trailing_shape = (ts,) if isinstance(ts, int) else tuple(ts)
+    else:
+        trailing_shape = ()
+    return {
+        "kind": kind,
+        "trailing_shape": trailing_shape,
+        "dtype": meta.get("dtype"),
+    }
+
+
+def output_field_signature(config: PipelineConfig) -> list[dict]:
+    """Return the Option-B output-field signature for a config (issue #29).
+
+    A canonical, JSON-serializable list of ``{"name", "kind", "trailing_shape",
+    "dtype"}`` for every aggregation variable, sorted by ``name``. Recorded in a
+    grid's :meth:`signature` so a shard map can never be silently paired with a
+    grid whose output schema (scalar vs vector, trailing shape, dtype) differs,
+    and compared in ``nests_with`` so co-aggregated grids must share a field set.
+
+    ``trailing_shape`` is rendered as a ``list`` (``()`` for scalar fields) so
+    the structure round-trips through JSON unchanged.
+
+    Parameters
+    ----------
+    config : PipelineConfig
+
+    Returns
+    -------
+    list of dict
+    """
+    fields = []
+    for name, meta in get_agg_fields(config).items():
+        sig = get_output_signature(meta)
+        fields.append(
+            {
+                "name": name,
+                "kind": sig["kind"],
+                "trailing_shape": list(sig["trailing_shape"]),
+                "dtype": sig["dtype"],
+            }
+        )
+    return sorted(fields, key=lambda f: f["name"])
 
 
 def get_coords(config: PipelineConfig) -> list[str]:
@@ -465,6 +619,39 @@ def get_output_region(config: PipelineConfig) -> str | None:
     return config.output.get("region")
 
 
+def _eval_expression_raw(expression: str, columns: dict[str, np.ndarray]) -> Any:
+    """Evaluate an expression string in a restricted namespace, uncoerced.
+
+    Returns the expression's native value (a scalar, an ndarray, ...). Used by
+    vector ``expression`` fields (issue #29), which coerce the result through
+    ``_coerce_field_value`` rather than casting to ``float``.
+
+    Parameters
+    ----------
+    expression : str
+        Python expression using numpy and column variables.
+    columns : dict[str, np.ndarray]
+        Mapping of column names to arrays.
+
+    Returns
+    -------
+    Any
+        Whatever the expression evaluates to.
+    """
+    ns = {
+        "__builtins__": {},
+        "np": np,
+        "numpy": np,
+        "len": len,
+        "float": float,
+        "int": int,
+        "abs": abs,
+        "sum": sum,
+        **columns,
+    }
+    return eval(expression, ns)  # noqa: S307
+
+
 def evaluate_expression(expression: str, columns: dict[str, np.ndarray]) -> float:
     """Evaluate an expression string in a restricted namespace.
 
@@ -479,15 +666,4 @@ def evaluate_expression(expression: str, columns: dict[str, np.ndarray]) -> floa
     -------
     float
     """
-    ns = {
-        "__builtins__": {},
-        "np": np,
-        "numpy": np,
-        "len": len,
-        "float": float,
-        "int": int,
-        "abs": abs,
-        "sum": sum,
-        **columns,
-    }
-    return float(eval(expression, ns))  # noqa: S307
+    return float(_eval_expression_raw(expression, columns))
