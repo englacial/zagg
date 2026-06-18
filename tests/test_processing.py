@@ -650,7 +650,7 @@ class TestProcessShardKernelBranch:
         monkeypatch.setattr("zagg.processing._read_group", fake_read_group)
         monkeypatch.setattr("zagg.processing.h5coro.H5Coro", lambda *a, **k: object())
         # Avoid resolving a real h5coro driver (s3driver import / creds plumbing).
-        monkeypatch.setattr("zagg.processing._make_url_rewriter", lambda driver: (lambda u: u))
+        monkeypatch.setattr("zagg.processing._make_url_rewriter", lambda driver: lambda u: u)
 
     def test_kernel_branch_matches_default_path(self, monkeypatch):
         """process_shard(handoff="arrow-kernel") agrees with the default path on the
@@ -783,7 +783,7 @@ class TestVectorCarrier:
                         "params": {"minlength": 3},
                     },
                 }
-            }
+            },
         )
 
     def test_has_vector_fields(self):
@@ -952,6 +952,7 @@ class TestQualityMask:
         mask = _quality_mask(q_flag, qf)
         np.testing.assert_array_equal(mask, [False, True, True])
 
+
 class TestVectorRoundTrip:
     """Issue #29 phase 6: a vector field written to a real Zarr template reads
     back through the trailing-dim block, and NaN-padded empty cells are skipped
@@ -975,9 +976,7 @@ class TestVectorRoundTrip:
         }
         from zagg.config import PipelineConfig
 
-        return PipelineConfig(
-            data_source=cfg.data_source, aggregation=agg, output=cfg.output
-        )
+        return PipelineConfig(data_source=cfg.data_source, aggregation=agg, output=cfg.output)
 
     def test_vector_leaf_to_zarr_to_read(self):
         pytest.importorskip("pyarrow")
@@ -1054,11 +1053,7 @@ class TestVectorRoundTrip:
             dtype="float32",
             fill_value=np.float32("nan"),
         )
-        edges = pa.FixedSizeListArray.from_arrays(
-            pa.array(np.arange(8.0, dtype="float32")), 4
-        )
+        edges = pa.FixedSizeListArray.from_arrays(pa.array(np.arange(8.0, dtype="float32")), 4)
         table = pa.table({"edges": edges})
         with pytest.raises(ValueError, match="one whole chunk"):
-            write_dataframe_to_zarr(
-                table, store, grid=_OneChunkGrid(), chunk_idx=(0,)
-            )
+            write_dataframe_to_zarr(table, store, grid=_OneChunkGrid(), chunk_idx=(0,))

@@ -1,0 +1,49 @@
+# ATL03 per-cell waveform-counts template.
+#
+# Aggregates photon heights (h_ph) into a 128-bin fixed-width histogram at 2 m
+# vertical spacing, centred on the per-cell median of the ICESat-2 reference
+# DEM height (dem_h). Each bin spans 2 m, giving a 256 m window
+# [median(dem_h) - 128 m, median(dem_h) + 128 m). Out-of-range photons are
+# dropped (not counted). The companion scalar bin_start records median(dem_h)
+# so the absolute elevation of bin 0 can be recovered downstream.
+#
+# Both h_ph and dem_h live in the ATL03 heights group (NSIDC ATL03 v3 data
+# dictionary). Confidence filter is the same as atl03.yaml: drop only TEP
+# photons (signal_conf_ph == -2 across all surface types). Grid is rectilinear,
+# matching atl03.yaml.
+data_source:
+  reader: h5coro
+  driver: s3
+  groups: [gt1l, gt1r, gt2l, gt2r, gt3l, gt3r]
+  coordinates:
+    latitude: "/{group}/heights/lat_ph"
+    longitude: "/{group}/heights/lon_ph"
+  variables:
+    h_ph: "/{group}/heights/h_ph"
+    dem_h: "/{group}/heights/dem_h"
+  quality_filter:
+    dataset: "/{group}/heights/signal_conf_ph"
+    value: -2                      # TEP flag; reduced across all surface types
+    op: ne
+
+aggregation:
+  variables:
+    waveform_counts:
+      kind: vector
+      trailing_shape: 128
+      expression: "np.histogram(h_ph - np.median(dem_h), 128, (-128.0, 128.0))[0].astype('uint32')"
+      source: h_ph
+      dtype: uint32
+      fill_value: 0
+    bin_start:
+      function: median
+      source: dem_h
+      dtype: float32
+
+output:
+  grid:
+    type: rectilinear
+    crs: EPSG:4326
+    resolution: 0.0001            # degrees (~10 m at the equator)
+    bounds: [-180, -90, 180, 90]
+    chunk_shape: [256, 256]

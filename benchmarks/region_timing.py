@@ -25,6 +25,12 @@ rectilinear grid. The ``output.grid.bounds`` are overridden per region to the
 AOI's 10 km box so the grid covers just the patch. (HEALPix order-19 -- the
 ~10 m match -- waits on mortie #35, so this first pass is rectilinear only.)
 
+Phase 3 adds a second template sweep -- ``atl03_waveform_counts`` -- alongside
+the scalar ``atl03`` run: wall-times for both templates are printed side-by-side
+so the overhead of the 128-bin vector histogram over plain scalars is visible.
+The waveform store is also checked to confirm the ``waveform_counts`` array has
+the expected trailing shape of 128.
+
 **This script is NOT run in CI**: it needs ``earthaccess``/NSIDC-S3 credentials
 (CMR-STAC query + byte-range HDF5 reads) and is slow. It lives under
 ``benchmarks/`` (not ``tests/``) and is meant for a credentialed session. It must
@@ -107,10 +113,11 @@ HARD_REGION = _box("antarctica_88s", lon=0.0, lat=-88.0)
 
 @dataclass
 class Record:
-    """One (region x window x handoff) measurement."""
+    """One (region x window x template x handoff) measurement."""
 
     region: str
     window: str
+    template: str
     handoff: str
     wall_s: float
     peak_rss_mb: float
@@ -133,11 +140,19 @@ def _region_config(region: Region):
     return cfg
 
 
-def _store_scalars(store_path: str, cfg) -> dict[str, np.ndarray]:
+def _region_waveform_config(region: Region):
+    """An ``atl03_waveform_counts`` config clipped to the region bbox."""
+    cfg = default_config("atl03_waveform_counts")
+    cfg = copy.deepcopy(cfg)
+    cfg.output["grid"]["bounds"] = list(region.bbox)
+    return cfg
+
+
+def _store_arrays(store_path: str, cfg) -> dict[str, np.ndarray]:
     """Read each aggregated data variable out of a written store as a dense array.
 
-    Data is written under the grid's ``group_path`` (see
-    ``write_dataframe_to_zarr``), so resolve it from the config's grid.
+    Works for both scalar (1-D) and vector (N-D) variables; the trailing
+    dimension(s) are preserved so callers can check shapes.
     """
     import zarr
 
@@ -149,7 +164,7 @@ def _store_scalars(store_path: str, cfg) -> dict[str, np.ndarray]:
 
 
 def _assert_parity(a: dict[str, np.ndarray], b: dict[str, np.ndarray], ctx: str) -> None:
-    """Assert two stores' scalar outputs are byte-for-byte identical (NaN-aware)."""
+    """Assert two stores' outputs are byte-for-byte identical (NaN-aware for floats)."""
     assert a.keys() == b.keys(), f"{ctx}: variable mismatch {a.keys()} vs {b.keys()}"
     for name in a:
         x, y = a[name], b[name]
@@ -192,7 +207,7 @@ def run_one(
         make_shardmap(query, grid).to_json(catalog_path)
 
         records: list[Record] = []
-        scalars: dict[str, dict] = {}
+        arrays: dict[str, dict] = {}
         for handoff in HANDOFFS:
             store_path = f"{tmp}/out_{handoff}.zarr"
             t0 = time.perf_counter()
@@ -206,11 +221,12 @@ def run_one(
                 overwrite=True,
             )
             wall = time.perf_counter() - t0
-            scalars[handoff] = _store_scalars(store_path, cfg)
+            arrays[handoff] = _store_arrays(store_path, cfg)
             records.append(
                 Record(
                     region=region.name,
                     window=window,
+                    template="atl03",
                     handoff=handoff,
                     wall_s=wall,
                     peak_rss_mb=_peak_rss_mb(),
@@ -220,23 +236,94 @@ def run_one(
                 )
             )
         _assert_parity(
-            scalars["pandas"],
-            scalars["arrow"],
-            ctx=f"{region.name}/{window}",
+            arrays["pandas"],
+            arrays["arrow"],
+            ctx=f"{region.name}/{window}/atl03",
         )
+    return records
+
+
+def run_one_waveform(
+    region: Region,
+    window: str,
+    date_range: tuple[str, str],
+    *,
+    version: str,
+    max_cells: int | None,
+    max_workers: int | None,
+) -> list[Record]:
+    """Run the ``atl03_waveform_counts`` template for (region, window).
+
+    Runs both carriers and asserts parity (both produce identical vector output).
+    Also confirms the ``waveform_counts`` array carries the expected 128-element
+    trailing dimension so the shape contract is exercised on real data.
+    """
+    from zagg.catalog import make_shardmap
+    from zagg.catalog.sources import Query
+    from zagg.grids import from_config
+
+    cfg = _region_waveform_config(region)
+    start, end = date_range
+    query = Query("ATL03", version, start, end, region=region.bbox)
+
+    with tempfile.TemporaryDirectory() as tmp:
+        catalog_path = f"{tmp}/shardmap.json"
+        grid = from_config(cfg)
+        make_shardmap(query, grid).to_json(catalog_path)
+
+        records: list[Record] = []
+        arrays: dict[str, dict] = {}
+        for handoff in HANDOFFS:
+            store_path = f"{tmp}/wf_{handoff}.zarr"
+            t0 = time.perf_counter()
+            summary = agg(
+                cfg,
+                catalog=catalog_path,
+                store=store_path,
+                handoff=handoff,
+                max_cells=max_cells,
+                max_workers=max_workers,
+                overwrite=True,
+            )
+            wall = time.perf_counter() - t0
+            arrays[handoff] = _store_arrays(store_path, cfg)
+            records.append(
+                Record(
+                    region=region.name,
+                    window=window,
+                    template="atl03_waveform",
+                    handoff=handoff,
+                    wall_s=wall,
+                    peak_rss_mb=_peak_rss_mb(),
+                    total_obs=int(summary.get("total_obs", 0)),
+                    cells_with_data=int(summary.get("cells_with_data", 0)),
+                    output_bytes=_output_bytes(store_path),
+                )
+            )
+        _assert_parity(
+            arrays["pandas"],
+            arrays["arrow"],
+            ctx=f"{region.name}/{window}/atl03_waveform_counts",
+        )
+        # Shape check: waveform_counts must carry the 128-element trailing dim.
+        wf = arrays["pandas"]["waveform_counts"]
+        if wf.ndim != 2 or wf.shape[1] != 128:
+            raise AssertionError(
+                f"{region.name}/{window}: waveform_counts shape {wf.shape} expected (..., 128)"
+            )
     return records
 
 
 def format_table(records: list[Record]) -> str:
     """Render the collected records as a fixed-width text table."""
     header = (
-        f"{'region':<18}{'window':>8}{'handoff':>10}{'wall_s':>10}"
+        f"{'region':<18}{'window':>8}{'template':>16}{'handoff':>10}{'wall_s':>10}"
         f"{'rss_MB':>10}{'obs':>12}{'cells':>10}{'out_MB':>10}"
     )
     lines = [header, "-" * len(header)]
     for r in records:
         lines.append(
-            f"{r.region:<18}{r.window:>8}{r.handoff:>10}{r.wall_s:>10.3f}"
+            f"{r.region:<18}{r.window:>8}{r.template:>16}{r.handoff:>10}{r.wall_s:>10.3f}"
             f"{r.peak_rss_mb:>10.1f}{r.total_obs:>12,}{r.cells_with_data:>10,}"
             f"{r.output_bytes / 1e6:>10.2f}"
         )
@@ -291,6 +378,16 @@ def main(argv=None):
         for window in windows:
             records.extend(
                 run_one(
+                    region,
+                    window,
+                    WINDOWS[window],
+                    version=args.version,
+                    max_cells=args.max_cells,
+                    max_workers=args.max_workers,
+                )
+            )
+            records.extend(
+                run_one_waveform(
                     region,
                     window,
                     WINDOWS[window],

@@ -99,6 +99,7 @@ class TestDefaultConfig:
 # ATL03 template
 # ---------------------------------------------------------------------------
 
+
 class TestATL03Template:
     @pytest.fixture
     def atl03_config(self):
@@ -221,9 +222,11 @@ class TestValidation:
                 "variables": {"h_li": "/path"},
                 "quality_filter": {"dataset": "/q", "value": 0, "op": "gt"},
             },
-            aggregation={"variables": {
-                "c": {"function": "len", "source": "h_li", "dtype": "int32"},
-            }},
+            aggregation={
+                "variables": {
+                    "c": {"function": "len", "source": "h_li", "dtype": "int32"},
+                }
+            },
             output={"grid": {"type": "healpix", "parent_order": 6, "child_order": 12}},
         )
         with pytest.raises(ValueError, match="quality_filter.op must be"):
@@ -699,3 +702,91 @@ class TestGetOutputSignature:
         sig = get_output_signature({"kind": "vector", "trailing_shape": [16, 2]})
         assert sig["kind"] == "vector"
         assert sig["trailing_shape"] == (16, 2)
+
+
+# ---------------------------------------------------------------------------
+# atl03_waveform_counts template (issue #30, phase 3)
+# ---------------------------------------------------------------------------
+
+
+class TestATL03WaveformCountsTemplate:
+    @pytest.fixture
+    def cfg(self):
+        return default_config("atl03_waveform_counts")
+
+    def test_loads_and_validates(self, cfg):
+        # default_config already calls validate_config; just confirm round-trip.
+        validate_config(cfg)
+        assert cfg.data_source["reader"] == "h5coro"
+        assert len(cfg.data_source["groups"]) == 6
+
+    def test_variables_include_h_ph_and_dem_h(self, cfg):
+        ds_vars = cfg.data_source["variables"]
+        assert "h_ph" in ds_vars
+        assert "dem_h" in ds_vars
+        assert ds_vars["h_ph"].endswith("h_ph")
+        assert ds_vars["dem_h"].endswith("dem_h")
+
+    def test_waveform_counts_field_is_vector(self, cfg):
+        fields = get_agg_fields(cfg)
+        meta = fields["waveform_counts"]
+        sig = get_output_signature(meta)
+        assert sig["kind"] == "vector"
+        assert sig["trailing_shape"] == (128,)
+        assert sig["dtype"] == "uint32"
+
+    def test_bin_start_field_is_scalar(self, cfg):
+        fields = get_agg_fields(cfg)
+        meta = fields["bin_start"]
+        sig = get_output_signature(meta)
+        assert sig["kind"] == "scalar"
+        assert sig["trailing_shape"] == ()
+
+    def test_waveform_counts_expression_with_synthetic_data(self, cfg):
+        # Photons all within range; all should be counted.
+        from zagg.processing import calculate_cell_statistics
+
+        np.random.seed(0)
+        dem_h = np.full(50, 0.0, dtype="float32")
+        h_ph = np.random.uniform(-100.0, 100.0, 50).astype("float32")
+        result = calculate_cell_statistics(
+            {"h_ph": h_ph, "dem_h": dem_h, "leaf_id": np.arange(50)}, config=cfg
+        )
+        wc = result["waveform_counts"]
+        assert wc.shape == (128,)
+        assert wc.dtype == np.dtype("uint32")
+        assert int(wc.sum()) == 50, "all in-range photons must be counted"
+
+    def test_out_of_range_photons_dropped(self, cfg):
+        from zagg.processing import calculate_cell_statistics
+
+        # One photon within range, one beyond ±128 m of dem_h median.
+        dem_h = np.array([0.0, 0.0], dtype="float32")
+        h_ph = np.array([10.0, 500.0], dtype="float32")
+        result = calculate_cell_statistics(
+            {"h_ph": h_ph, "dem_h": dem_h, "leaf_id": np.arange(2)}, config=cfg
+        )
+        wc = result["waveform_counts"]
+        assert int(wc.sum()) == 1, "out-of-range photon must not appear in any bin"
+
+    def test_empty_cell_returns_zero_filled_vector(self, cfg):
+        from zagg.processing import calculate_cell_statistics
+
+        result = calculate_cell_statistics(
+            {"h_ph": np.array([]), "dem_h": np.array([]), "leaf_id": np.array([])}, config=cfg
+        )
+        wc = result["waveform_counts"]
+        assert wc.shape == (128,)
+        assert np.all(wc == 0), "empty cell sentinel must be all-zero for uint32/fill_value:0"
+
+    def test_confidence_filter_same_as_atl03(self, cfg):
+        qf = cfg.data_source["quality_filter"]
+        assert qf["value"] == -2
+        assert qf["op"] == "ne"
+        assert "column" not in qf
+        assert qf["dataset"].endswith("signal_conf_ph")
+
+    def test_rectilinear_grid(self, cfg):
+        grid = cfg.output["grid"]
+        assert grid["type"] == "rectilinear"
+        assert len(grid["bounds"]) == 4
