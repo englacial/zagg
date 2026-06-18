@@ -172,6 +172,18 @@ def _has_vector_fields(config: PipelineConfig) -> bool:
     )
 
 
+def _has_ragged_fields(config: PipelineConfig) -> bool:
+    """Whether any aggregation field declares a ``ragged`` (CSR) output.
+
+    Ragged fields (issue #48) carry variable-length per-cell payloads and are
+    collected separately from scalar/vector fields; they are written via the CSR
+    writer rather than the dense Zarr path.
+    """
+    return any(
+        get_output_signature(meta)["kind"] == "ragged" for meta in get_agg_fields(config).values()
+    )
+
+
 def _arrow_column(block: np.ndarray, sig: dict):
     """Build the Arrow column for one agg field from its per-cell stats block.
 
@@ -388,11 +400,16 @@ def calculate_cell_statistics(
         # Expression-based aggregation (e.g. h_sigma). A scalar expression casts
         # to a Python float; a ``kind: vector`` expression is coerced through the
         # same ``_coerce_field_value``/``trailing_shape``/dtype path as a vector
-        # ``function`` field (issue #29).
+        # ``function`` field (issue #29). A ``kind: ragged`` expression (issue #48)
+        # returns the raw result as a numpy array — the CSR writer receives it as
+        # a variable-length per-cell payload.
         if expression:
             if sig["kind"] == "vector":
                 out = _eval_expression_raw(expression, cell_data)
                 result[name] = _coerce_field_value(out, sig)
+            elif sig["kind"] == "ragged":
+                out = _eval_expression_raw(expression, cell_data)
+                result[name] = _coerce_ragged_value(out, sig)
             else:
                 result[name] = evaluate_expression(expression, cell_data)
             continue
@@ -422,9 +439,16 @@ def calculate_cell_statistics(
 
         func = resolve_function(func_name)
         out = func(values, **resolved_params)
-        # Scalar fields stay byte-for-byte identical to the pre-#29 path; only a
-        # declared ``vector`` field is allowed to return an ndarray (issue #29).
-        result[name] = _coerce_field_value(out, sig) if sig["kind"] == "vector" else float(out)
+        # Scalar fields stay byte-for-byte identical to the pre-#29 path; a
+        # declared ``vector`` field coerces to its trailing_shape (issue #29); a
+        # ``ragged`` field (issue #48) returns a variable-length numpy array that
+        # the CSR writer later packs into flat + offsets + cell_ids arrays.
+        if sig["kind"] == "vector":
+            result[name] = _coerce_field_value(out, sig)
+        elif sig["kind"] == "ragged":
+            result[name] = _coerce_ragged_value(out, sig)
+        else:
+            result[name] = float(out)
 
     return result
 
@@ -436,8 +460,12 @@ def _empty_cell_value(meta: dict):
     ``np.nan`` otherwise. A ``vector`` field (issue #29) instead gets a full
     ``trailing_shape`` array filled with its schema-declared sentinel
     (:func:`_field_sentinel`), so empty and populated cells emit the same shape.
+    A ``ragged`` field (issue #48) returns an empty list ``[]`` — the CSR writer
+    handles absent cells by leaving them out of ``cell_ids``.
     """
     sig = get_output_signature(meta)
+    if sig["kind"] == "ragged":
+        return []
     if sig["kind"] == "vector":
         dtype = np.dtype(sig["dtype"]) if sig["dtype"] is not None else np.dtype("float32")
         return np.full(sig["trailing_shape"], _field_sentinel(meta), dtype=dtype)
@@ -460,6 +488,42 @@ def _coerce_field_value(value, sig: dict) -> np.ndarray:
             f"vector field produced shape {arr.shape}, expected {sig['trailing_shape']}"
         )
     return arr
+
+
+def _coerce_ragged_value(value, sig: dict) -> np.ndarray:
+    """Coerce a ``ragged`` field's aggregation output to a 2-D numpy array.
+
+    A ragged field (issue #48) emits a variable-length array of shape
+    ``(n_elements, *inner_shape)`` per cell. This function verifies the inner
+    dimensions match the declared ``inner_shape`` and returns a contiguous
+    array of the declared dtype (default ``float32``), ready for the CSR writer.
+
+    Parameters
+    ----------
+    value : array-like
+        The raw result from the field's function or expression.
+    sig : dict
+        Output signature from :func:`zagg.config.get_output_signature`.
+
+    Returns
+    -------
+    np.ndarray
+        Shape ``(n_elements, *inner_shape)``, or ``(0, *inner_shape)`` when
+        ``value`` is empty.
+    """
+    dtype = np.dtype(sig["dtype"]) if sig["dtype"] is not None else np.dtype("float32")
+    inner = sig["inner_shape"]
+    arr = np.asarray(value, dtype=dtype)
+    if arr.size == 0:
+        return np.empty((0, *inner), dtype=dtype)
+    # Accept a 1-D array when inner_shape == (1,): reshape to (n, 1).
+    if arr.ndim == 1 and inner == (1,):
+        arr = arr.reshape(-1, 1)
+    if arr.ndim == 1 and len(inner) == 1:
+        arr = arr.reshape(-1, *inner)
+    if arr.ndim != len(inner) + 1 or arr.shape[1:] != inner:
+        raise ValueError(f"ragged field produced inner shape {arr.shape[1:]}, expected {inner}")
+    return np.ascontiguousarray(arr)
 
 
 # EXPERIMENTAL (phase 2b of #30) -----------------------------------------------
@@ -581,6 +645,15 @@ def _kernel_aggregate(
     stats_arrays: dict[str, np.ndarray] = {}
     for name in data_vars:
         meta = agg_fields[name]
+        # Ragged fields (issue #48) cannot be dense-preallocated; skip them here.
+        # The kernel path does not support ragged — they have no hash-aggregate
+        # kernel equivalent — so a config mixing ragged + arrow-kernel uses the
+        # fallback for ragged fields. But the dense fallback array assignment
+        # (``stats_arrays[name][i] = value``) would crash for a list payload.
+        # Exclude ragged from both the kernel and fallback lists; the caller is
+        # responsible for collecting ragged payloads via process_shard's own loop.
+        if get_output_signature(meta)["kind"] == "ragged":
+            continue
         zarr_dtype = np.dtype(meta.get("dtype", "float32"))
         fill_value = meta.get("fill_value", "NaN")
         if fill_value == "NaN":
@@ -588,8 +661,10 @@ def _kernel_aggregate(
         else:
             stats_arrays[name] = np.zeros(n_cells, dtype=zarr_dtype)
 
-    kernel_names = [n for n in data_vars if _kernel_able(agg_fields[n])]
-    fallback_names = [n for n in data_vars if n not in kernel_names]
+    # Ragged fields are excluded from kernel and fallback (see above).
+    dense_names = [n for n in data_vars if get_output_signature(agg_fields[n])["kind"] != "ragged"]
+    kernel_names = [n for n in dense_names if _kernel_able(agg_fields[n])]
+    fallback_names = [n for n in dense_names if n not in kernel_names]
 
     # Group by the destination cell id (not the raw leaf id): append cell_col and
     # run one vectorised group-by + reduction pass for all kernel-able fields.
@@ -1064,6 +1139,12 @@ def process_shard(
     children = grid.children(shard_key)
     data_vars = get_data_vars(config)
 
+    # Ragged-field collectors (issue #48): populated only in the non-kernel path;
+    # initialized here so the post-if/else _build_output call can reference them
+    # regardless of which branch ran.
+    ragged_payloads: dict[str, list] = {}
+    ragged_cell_indices: dict[str, list[int]] = {}
+
     if handoff == "arrow-kernel":
         # EXPERIMENTAL (phase 2b of #30): reduce via pyarrow hash-aggregate kernels
         # instead of the per-cell numpy loop. Not byte-identical to the default
@@ -1091,13 +1172,21 @@ def process_shard(
 
         n_cells = len(children)
         agg_fields = get_agg_fields(config)
-        stats_arrays = {}
+        stats_arrays: dict = {}
+        # Ragged fields (issue #48) are variable-length per-cell; they cannot be
+        # preallocated as a dense block. ``ragged_payloads``/``ragged_cell_indices``
+        # are pre-initialized before this branch (see above); fill them in the loop.
         for name in data_vars:
             meta = agg_fields[name]
+            sig = get_output_signature(meta)
+            if sig["kind"] == "ragged":
+                ragged_payloads[name] = []
+                ragged_cell_indices[name] = []
+                continue
             # Vector fields (issue #29) get a per-cell (n_cells, *trailing_shape)
             # block; scalars keep the 1-D (n_cells,) layout, unchanged. Either way
             # ``stats_arrays[name][i] = value`` assigns the cell's result row.
-            shape = (n_cells, *get_output_signature(meta)["trailing_shape"])
+            shape = (n_cells, *sig["trailing_shape"])
             zarr_dtype = np.dtype(meta.get("dtype", "float32"))
             fill_value = meta.get("fill_value", "NaN")
             if fill_value == "NaN":
@@ -1122,17 +1211,30 @@ def process_shard(
                 cell_data, value_col="h_li", sigma_col="s_li", config=config
             )
             for key, value in stats.items():
-                stats_arrays[key][i] = value
+                if key in ragged_payloads:
+                    # Ragged field: collect non-empty payloads with their cell index.
+                    # Empty cells (from _empty_cell_value -> []) are skipped; the
+                    # CSR writer represents absent cells via ``cell_ids``.
+                    arr_val = np.asarray(value)
+                    if arr_val.size > 0:
+                        ragged_payloads[key].append(arr_val)
+                        ragged_cell_indices[key].append(i)
+                else:
+                    stats_arrays[key][i] = value
 
     logger.info(f"  Statistics: {cells_with_data}/{n_cells} cells with data")
 
     # Assemble the output carrier: a plain DataFrame for a pure-scalar config
     # (unchanged), or a pyarrow.Table with FixedSizeList vector columns when any
     # field declares a non-scalar output (issue #29). Scalars stay byte-identical.
+    # Ragged fields (issue #48) are excluded from the dense carrier — they are
+    # returned separately as (payloads, cell_indices) for the CSR writer.
+    _agg_fields = get_agg_fields(config)
+    dense_vars = [v for v in data_vars if get_output_signature(_agg_fields[v])["kind"] != "ragged"]
     df_out = _build_output(
         stats_arrays,
-        data_vars,
-        get_agg_fields(config),
+        dense_vars,
+        _agg_fields,
         grid,
         shard_key,
         use_arrow=_has_vector_fields(config),
