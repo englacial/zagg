@@ -1,0 +1,83 @@
+# ATL03 per-cell waveform-counts template.
+#
+# Aggregates photon heights (h_ph) into a 128-bin fixed-width histogram at 2 m
+# vertical spacing, centred on the per-cell median of h_ph itself. Each bin
+# spans 2 m, giving a 256 m window [median(h_ph) - 128 m, median(h_ph) + 128 m).
+# Out-of-range photons are dropped (not counted). The companion scalar
+# bin_start records median(h_ph) so the absolute elevation of bin 0 can be
+# recovered downstream.
+#
+# Note (issue #30 thread): an earlier draft of this template tried to centre
+# on np.median(dem_h), but dem_h lives in /{group}/geophys_corr/dem_h at the
+# segment level (one value per ~100 photons), not the heights group; centring
+# on the cell's own median(h_ph) is more natural for a photon-height density
+# template and avoids the cross-group / resolution-mismatch read.
+#
+# Caveat: median(h_ph) is a *per-cell* anchor, not a stable absolute reference.
+# In a bimodal cell (e.g. ground + canopy returns) the median can land between
+# the two clusters, splitting both into wings of the histogram; that is a real
+# tradeoff of centring on the photon distribution itself. bin_start records the
+# centring value so the bin-0 absolute elevation = (bin_start - 128 m) is still
+# recoverable, but comparing waveforms across cells in the same absolute frame
+# requires shifting each cell's bins by its own bin_start.
+#
+# Confidence filter is the same as atl03.yaml: drop only TEP photons by the
+# structured ``filters:`` list (signal_conf_ph[:, 0] != -2; TEP is uniform
+# across surface types). Multi-level form + ``read_plan`` also identical to
+# atl03.yaml so the planned-IO benefits (#43 Phase C) apply to the waveform
+# template equally. Grid is rectilinear, matching atl03.yaml.
+data_source:
+  reader: h5coro
+  driver: s3
+  groups: [gt1l, gt1r, gt2l, gt2r, gt3l, gt3r]
+  coordinates:
+    latitude: "/{group}/heights/lat_ph"
+    longitude: "/{group}/heights/lon_ph"
+  variables:
+    h_ph: "/{group}/heights/h_ph"
+  filters:
+    - dataset: "/{group}/heights/signal_conf_ph"
+      column: 0                  # land surface type; TEP is uniform across columns
+      op: ne
+      value: -2
+  base_level: photons
+  # See atl03.yaml for the rationale behind the bare-name coordinates +
+  # absolute link path templates + documentation-only level ``variables``.
+  levels:
+    photons:
+      path: "/{group}/heights"
+      coordinates: {latitude: lat_ph, longitude: lon_ph}
+      link: null
+    segments:
+      path: "/{group}/geolocation"
+      coordinates: {latitude: reference_photon_lat, longitude: reference_photon_lon}
+      link:
+        to: photons
+        index_beg: "/{group}/geolocation/ph_index_beg"
+        count: "/{group}/geolocation/segment_ph_cnt"
+        index_base: 1            # ATL03 ph_index_beg is 1-based per the v3 dict
+  read_plan:
+    spatial_index: segments
+    pad: 1                       # one segment of padding on each side per #43
+
+aggregation:
+  variables:
+    waveform_counts:
+      kind: vector
+      trailing_shape: 128
+      expression: "np.histogram(h_ph - np.median(h_ph), 128, (-128.0, 128.0))[0].astype('uint32')"
+      source: h_ph
+      dtype: uint32
+      fill_value: 0
+    bin_start:
+      function: median
+      source: h_ph
+      dtype: float32
+
+output:
+  grid:
+    type: rectilinear
+    crs: EPSG:4326
+    resolution: 0.0001            # degrees (~10 m at the equator)
+    bounds: [-180, -90, 180, 90]
+    chunk_shape: [256, 256]

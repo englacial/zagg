@@ -281,3 +281,41 @@ class TestInvokeLambdaCellEvent:
         assert event["shard_key"] == 12345
         assert "child_order" not in event
         assert "parent_morton" not in event
+
+
+class TestHandoffPassthrough:
+    """`agg(handoff=...)` threads the carrier choice down to process_shard."""
+
+    def test_process_and_write_forwards_handoff(self, monkeypatch, atl06_config):
+        from zagg import runner
+
+        captured = {}
+
+        def fake_process_shard(grid, shard_key, urls, **kwargs):
+            import pandas as pd
+            captured["handoff"] = kwargs.get("handoff")
+            return pd.DataFrame(), {"shard_key": shard_key, "error": None}
+
+        monkeypatch.setattr(runner, "process_shard", fake_process_shard)
+        runner._process_and_write(
+            0, (0,), [_rec(1)], grid=None, s3_creds={}, zarr_store=None,
+            config=atl06_config, driver="s3", handoff="arrow",
+        )
+        assert captured["handoff"] == "arrow"
+
+    def test_default_handoff_is_pandas(self, monkeypatch, atl06_config):
+        from zagg import runner
+
+        captured = {}
+
+        def fake_process_shard(grid, shard_key, urls, **kwargs):
+            import pandas as pd
+            captured["handoff"] = kwargs.get("handoff")
+            return pd.DataFrame(), {"shard_key": shard_key, "error": None}
+
+        monkeypatch.setattr(runner, "process_shard", fake_process_shard)
+        runner._process_and_write(
+            0, (0,), [_rec(1)], grid=None, s3_creds={}, zarr_store=None,
+            config=atl06_config, driver="s3",
+        )
+        assert captured["handoff"] == "pandas"

@@ -100,6 +100,71 @@ class TestDefaultConfig:
 
 
 # ---------------------------------------------------------------------------
+# ATL03 template
+# ---------------------------------------------------------------------------
+
+
+class TestATL03Template:
+    @pytest.fixture
+    def atl03_config(self):
+        return default_config("atl03")
+
+    def test_loads_and_validates(self, atl03_config):
+        # default_config already runs validate_config; assert it round-trips.
+        validate_config(atl03_config)
+        assert atl03_config.data_source["reader"] == "h5coro"
+        assert len(atl03_config.data_source["groups"]) == 6
+
+    def test_scalar_variables(self, atl03_config):
+        dvars = set(get_data_vars(atl03_config))
+        assert dvars == {"count", "h_min", "h_max", "h_mean", "h_median", "h_variance"}
+
+    def test_functions_resolve(self, atl03_config):
+        for meta in get_agg_fields(atl03_config).values():
+            assert "expression" not in meta  # scalar-only; non-scalar is #29
+            resolve_function(meta["function"])  # raises on failure
+
+    def test_confidence_filter_drops_tep(self, atl03_config):
+        # The ATL03 template carries one structured TEP filter: keep photons where
+        # signal_conf_ph[:, 0] (land surface type) != -2. TEP is uniform across
+        # surface types per the ATL03 v3 data dictionary, so column 0 is
+        # operationally equivalent to any other column for the TEP drop.
+        filters = atl03_config.data_source["filters"]
+        assert len(filters) == 1
+        f = filters[0]
+        assert f["value"] == -2
+        assert f["op"] == "ne"  # keep signal_conf_ph != -2 (drop only TEP)
+        assert f["column"] == 0
+        assert f["dataset"].endswith("signal_conf_ph")
+
+    def test_rectilinear_grid(self, atl03_config):
+        grid = atl03_config.output["grid"]
+        assert grid["type"] == "rectilinear"
+        assert len(grid["bounds"]) == 4
+
+    def test_multi_level_form_for_planned_reads(self, atl03_config):
+        # Phase 6: the template declares the ``photons`` (base) + ``segments``
+        # (coarse) levels and the link arrays so the #43 Phase C read_plan can
+        # bound base-rate IO. Without this the ATL03 region runs OOM on Lambda
+        # (245 MB-per-beam coord-read floor; see #43).
+        ds = atl03_config.data_source
+        assert ds["base_level"] == "photons"
+        levels = ds["levels"]
+        assert set(levels) == {"photons", "segments"}
+        assert levels["photons"]["link"] is None
+        seg_link = levels["segments"]["link"]
+        assert seg_link["to"] == "photons"
+        assert seg_link["index_beg"].endswith("ph_index_beg")
+        assert seg_link["count"].endswith("segment_ph_cnt")
+        assert seg_link["index_base"] == 1  # ATL03 ph_index_beg is 1-based
+
+    def test_read_plan_targets_segments_level(self, atl03_config):
+        rp = atl03_config.data_source["read_plan"]
+        assert rp["spatial_index"] == "segments"
+        assert rp["pad"] == 1
+
+
+# ---------------------------------------------------------------------------
 # Function resolution
 # ---------------------------------------------------------------------------
 
@@ -970,6 +1035,118 @@ class TestGetOutputSignature:
         assert sig["kind"] == "vector"
         assert sig["trailing_shape"] == (16, 2)
         assert sig["inner_shape"] == ()
+
+
+# ---------------------------------------------------------------------------
+# atl03_waveform_counts template (issue #30, phase 3)
+# ---------------------------------------------------------------------------
+
+
+class TestATL03WaveformCountsTemplate:
+    @pytest.fixture
+    def cfg(self):
+        return default_config("atl03_waveform_counts")
+
+    def test_loads_and_validates(self, cfg):
+        # default_config already calls validate_config; just confirm round-trip.
+        validate_config(cfg)
+        assert cfg.data_source["reader"] == "h5coro"
+        assert len(cfg.data_source["groups"]) == 6
+
+    def test_variables_include_h_ph_only(self, cfg):
+        # Option A: the histogram is centered on np.median(h_ph), so dem_h is
+        # not needed (and the segment-level ``geophys_corr/dem_h`` path was the
+        # wrong group anyway -- see #30 thread).
+        ds_vars = cfg.data_source["variables"]
+        assert "h_ph" in ds_vars
+        assert "dem_h" not in ds_vars
+        assert ds_vars["h_ph"].endswith("h_ph")
+
+    def test_waveform_counts_field_is_vector(self, cfg):
+        fields = get_agg_fields(cfg)
+        meta = fields["waveform_counts"]
+        sig = get_output_signature(meta)
+        assert sig["kind"] == "vector"
+        assert sig["trailing_shape"] == (128,)
+        assert sig["dtype"] == "uint32"
+
+    def test_bin_start_field_is_scalar(self, cfg):
+        fields = get_agg_fields(cfg)
+        meta = fields["bin_start"]
+        sig = get_output_signature(meta)
+        assert sig["kind"] == "scalar"
+        assert sig["trailing_shape"] == ()
+
+    def test_waveform_counts_expression_with_synthetic_data(self, cfg):
+        # Photons all within ±128 m of their own median; all should be counted.
+        from zagg.processing import calculate_cell_statistics
+
+        np.random.seed(0)
+        h_ph = np.random.uniform(-100.0, 100.0, 50).astype("float32")
+        result = calculate_cell_statistics(
+            {"h_ph": h_ph, "leaf_id": np.arange(50)}, config=cfg
+        )
+        wc = result["waveform_counts"]
+        assert wc.shape == (128,)
+        assert wc.dtype == np.dtype("uint32")
+        assert int(wc.sum()) == 50, "all in-range photons must be counted"
+
+    def test_out_of_range_photons_dropped(self, cfg):
+        from zagg.processing import calculate_cell_statistics
+
+        # Two photons clustered near 0, one far outlier at 500 m. The cell median
+        # is ~5 m, so the outlier sits beyond ±128 m and falls outside the hist.
+        h_ph = np.array([0.0, 10.0, 500.0], dtype="float32")
+        result = calculate_cell_statistics(
+            {"h_ph": h_ph, "leaf_id": np.arange(3)}, config=cfg
+        )
+        wc = result["waveform_counts"]
+        assert int(wc.sum()) == 2, "out-of-range photon must not appear in any bin"
+
+    def test_empty_cell_returns_zero_filled_vector(self, cfg):
+        from zagg.processing import calculate_cell_statistics
+
+        result = calculate_cell_statistics(
+            {"h_ph": np.array([]), "leaf_id": np.array([])}, config=cfg
+        )
+        wc = result["waveform_counts"]
+        assert wc.shape == (128,)
+        assert np.all(wc == 0), "empty cell sentinel must be all-zero for uint32/fill_value:0"
+
+    def test_confidence_filter_same_as_atl03(self, cfg):
+        # Both templates carry the same TEP filter expressed in the structured
+        # ``filters:`` list form (op: ne, value: -2, column: 0 -- land surface
+        # type; TEP is uniform across columns per the v3 data dictionary).
+        filters = cfg.data_source["filters"]
+        assert len(filters) == 1
+        f = filters[0]
+        assert f["op"] == "ne"
+        assert f["value"] == -2
+        assert f["column"] == 0
+        assert f["dataset"].endswith("signal_conf_ph")
+
+    def test_rectilinear_grid(self, cfg):
+        grid = cfg.output["grid"]
+        assert grid["type"] == "rectilinear"
+        assert len(grid["bounds"]) == 4
+
+    def test_multi_level_form_matches_atl03(self, cfg):
+        # Phase 6: waveform template carries the same multi-level form +
+        # read_plan as atl03.yaml so the planned-IO benefits apply equally.
+        ds = cfg.data_source
+        assert ds["base_level"] == "photons"
+        assert set(ds["levels"]) == {"photons", "segments"}
+        rp = ds["read_plan"]
+        assert rp["spatial_index"] == "segments"
+        assert rp["pad"] == 1
+        # Cross-check only the fields that drive ``plan_read`` parity: the
+        # link's source/target arrays + index_base. Other level fields
+        # (documentation-only ``variables``, coord names, formatting) can
+        # legitimately diverge across templates without affecting the plan.
+        atl03_link = default_config("atl03").data_source["levels"]["segments"]["link"]
+        wf_link = ds["levels"]["segments"]["link"]
+        for key in ("to", "index_beg", "count", "index_base"):
+            assert wf_link[key] == atl03_link[key], f"link.{key} diverges from atl03.yaml"
 
 
 # ---------------------------------------------------------------------------

@@ -69,6 +69,7 @@ def agg(
     region: str = "us-west-2",
     output_credentials: dict | None = None,
     output_endpoint_url: str | None = None,
+    handoff: str = "pandas",
 ) -> dict:
     """Run the aggregation pipeline.
 
@@ -112,6 +113,10 @@ def agg(
     output_endpoint_url : str, optional
         Custom S3-compatible endpoint for the output store (e.g. R2, MinIO).
         Overrides ``output.endpoint_url`` in the config.
+    handoff : str
+        Per-cell aggregation carrier: ``"pandas"`` (default) or ``"arrow"``.
+        Both produce byte-for-byte identical scalar outputs (#30); ``"arrow"``
+        is opt-in for benchmarking. Only honored by the ``"local"`` backend.
 
     Returns
     -------
@@ -158,6 +163,7 @@ def agg(
             dry_run=dry_run, region=region, driver=resolved_driver,
             output_credentials=output_credentials,
             output_endpoint_url=resolved_endpoint,
+            handoff=handoff,
         )
     elif backend == "lambda":
         if max_workers is None:
@@ -276,7 +282,8 @@ def _check_signature(grid, catalog_data: dict) -> None:
 
 
 def _process_and_write(shard_key, chunk_idx, records, grid,
-                       s3_creds, zarr_store, config, driver=None):
+                       s3_creds, zarr_store, config, driver=None,
+                       handoff="pandas"):
     """Process a single shard and write results to store."""
     df_out, metadata = process_shard(
         grid,
@@ -285,6 +292,7 @@ def _process_and_write(shard_key, chunk_idx, records, grid,
         s3_credentials=s3_creds,
         config=config,
         driver=driver,
+        handoff=handoff,
     )
     # write_dataframe_to_zarr no-ops on an empty carrier (DataFrame or Arrow
     # table), so no carrier-specific emptiness check is needed here.
@@ -298,7 +306,8 @@ def _process_and_write(shard_key, chunk_idx, records, grid,
 
 def _run_local(config, catalog_data, store_path, child_order, *,
                max_cells, morton_cell, max_workers, overwrite, dry_run, region,
-               driver="s3", output_credentials=None, output_endpoint_url=None):
+               driver="s3", output_credentials=None, output_endpoint_url=None,
+               handoff="pandas"):
     """Run processing locally with ThreadPoolExecutor."""
     all_shards = list(catalog_data["shard_keys"])
 
@@ -344,7 +353,7 @@ def _run_local(config, catalog_data, store_path, child_order, *,
                 shard_key, grid.block_index(int(shard_key)), records,
                 grid,
                 s3_creds, zarr_store, config,
-                driver=driver,
+                driver=driver, handoff=handoff,
             ): shard_key
             for shard_key, records in cells
         }

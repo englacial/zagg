@@ -455,14 +455,31 @@ def _normalize_filter(f: dict) -> dict:
 
 
 def _validate_filters(data_source: dict) -> None:
-    """Validate the ``filters`` list (and that a flat ``quality_filter`` is sane).
+    """Validate the ``filters`` list and the flat ``quality_filter`` sugar.
 
-    Raises ``ValueError`` on: unknown op, missing ``dataset``, ``in``/``not_in``
-    without a list ``values``, scalar ops without ``value``, non-int ``column``,
-    a non-base-level ``expression`` filter, or wrong ``value`` type. ``column`` is
-    required for the N-D flag case but cannot be checked against array rank here
-    (no data); rank checks happen at read time.
+    For the structured ``filters:`` list, raises ``ValueError`` on: unknown op,
+    missing ``dataset``, ``in``/``not_in`` without a list ``values``, scalar ops
+    without ``value``, non-int ``column``, a non-base-level ``expression`` filter,
+    or wrong ``value`` type. ``column`` is required for the N-D flag case but
+    cannot be checked against array rank here (no data); rank checks happen at
+    read time.
+
+    For the flat ``quality_filter`` sugar, only ``dataset`` and ``value`` are
+    honored (``filters_from_data_source`` synthesizes ``op: eq, column: null``).
+    Reject any extra keys at load time so a user-typoed ``op: gt`` or stray
+    ``column:`` is not silently dropped on the floor — the structured ``filters:``
+    list is the right form when those knobs are wanted.
     """
+    qf = data_source.get("quality_filter")
+    if qf is not None:
+        allowed = {"dataset", "value"}
+        unknown = set(qf) - allowed
+        if unknown:
+            raise ValueError(
+                f"data_source.quality_filter only honors {sorted(allowed)} "
+                f"(got extra keys {sorted(unknown)}); use the structured "
+                "'filters:' list to set 'op', 'column', 'keep', etc."
+            )
     filters = data_source.get("filters")
     if filters is None:
         return
