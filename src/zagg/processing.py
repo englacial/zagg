@@ -516,9 +516,7 @@ def _coerce_ragged_value(value, sig: dict) -> np.ndarray:
     arr = np.asarray(value, dtype=dtype)
     if arr.size == 0:
         return np.empty((0, *inner), dtype=dtype)
-    # Accept a 1-D array when inner_shape == (1,): reshape to (n, 1).
-    if arr.ndim == 1 and inner == (1,):
-        arr = arr.reshape(-1, 1)
+    # Accept a 1-D array when inner_shape has one dimension: reshape to (n, d).
     if arr.ndim == 1 and len(inner) == 1:
         arr = arr.reshape(-1, *inner)
     if arr.ndim != len(inner) + 1 or arr.shape[1:] != inner:
@@ -1149,6 +1147,11 @@ def process_shard(
         # EXPERIMENTAL (phase 2b of #30): reduce via pyarrow hash-aggregate kernels
         # instead of the per-cell numpy loop. Not byte-identical to the default
         # path (float mean/variance diverge by ~1 ULP — see KERNEL_RTOL).
+        if _has_ragged_fields(config):
+            raise NotImplementedError(
+                "handoff='arrow-kernel' does not support ragged fields (issue #48); "
+                "use handoff='pandas' or 'arrow' instead"
+            )
         import pyarrow as pa
 
         table = pa.concat_tables(all_reads).combine_chunks()
