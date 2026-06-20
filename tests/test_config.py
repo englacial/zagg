@@ -18,6 +18,7 @@ from zagg.config import (
     get_filters,
     get_levels,
     get_output_signature,
+    get_pipeline_type,
     get_store_path,
     load_config,
     load_config_from_dict,
@@ -97,6 +98,60 @@ class TestDefaultConfig:
     def test_nonexistent_raises(self):
         with pytest.raises(FileNotFoundError):
             default_config("nonexistent")
+
+
+# ---------------------------------------------------------------------------
+# Pipeline type (issue #12 Phase 0)
+# ---------------------------------------------------------------------------
+
+
+class TestPipelineType:
+    def test_default_is_spatial_no_key(self, atl06_config):
+        # Existing configs (no ``pipeline`` key) keep defaulting to spatial,
+        # preserving the back-compat contract for every shipped YAML.
+        assert get_pipeline_type(atl06_config) == "spatial"
+
+    def test_explicit_spatial(self):
+        cfg = load_config_from_dict(
+            {
+                "pipeline": {"type": "spatial"},
+                "data_source": {"reader": "h5coro"},
+                "aggregation": {"variables": {"x": {"source": "h", "function": "np.mean"}}},
+                "output": {"store": "."},
+            }
+        )
+        assert get_pipeline_type(cfg) == "spatial"
+
+    def test_unknown_type_raises(self):
+        cfg = load_config_from_dict(
+            {
+                "pipeline": {"type": "bogus"},
+                "data_source": {"reader": "h5coro"},
+                "aggregation": {},
+                "output": {},
+            }
+        )
+        with pytest.raises(ValueError, match="pipeline.type must be one of"):
+            get_pipeline_type(cfg)
+
+    def test_validate_rejects_temporal_until_engine_lands(self):
+        # Until the temporal engine lands, validate_config refuses the
+        # temporal/event types so silently-broken configs can't ship.
+        cfg = load_config_from_dict(
+            {
+                "pipeline": {"type": "temporal"},
+                "data_source": {"reader": "xarray_s3"},
+                "aggregation": {"variables": {"x": {"source": "h", "function": "np.mean"}}},
+                "output": {"store": "."},
+            }
+        )
+        with pytest.raises(NotImplementedError, match="pipeline.type='temporal'"):
+            validate_config(cfg)
+
+    def test_pipeline_must_be_mapping(self):
+        cfg = PipelineConfig(pipeline="spatial")  # type: ignore[arg-type]
+        with pytest.raises(ValueError, match="pipeline must be a mapping"):
+            get_pipeline_type(cfg)
 
 
 # ---------------------------------------------------------------------------

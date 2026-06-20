@@ -72,6 +72,9 @@ _SET_OPS = frozenset({"in", "not_in"})
 FILTER_OPS = _SCALAR_OPS | _SET_OPS
 
 
+_PIPELINE_TYPES = frozenset({"spatial", "temporal", "event"})
+
+
 @dataclass
 class PipelineConfig:
     """Full pipeline configuration.
@@ -88,6 +91,12 @@ class PipelineConfig:
         Optional path to granule catalog JSON.
     bounds : dict or None
         Optional temporal/spatial bounds for filtering.
+    pipeline : dict
+        Pipeline kind selector (issue #12). ``{"type": "spatial"}`` (default)
+        runs the point-cloud->grid aggregation path; ``"temporal"`` /
+        ``"event"`` route to the event-streaming engines added in later
+        phases. Absent ``pipeline`` key in YAML defaults to ``spatial`` for
+        backward compatibility with every existing config.
     """
 
     data_source: DataSourceDict = field(default_factory=dict)
@@ -95,6 +104,22 @@ class PipelineConfig:
     output: dict = field(default_factory=dict)
     catalog: str | None = None
     bounds: dict | None = None
+    pipeline: dict = field(default_factory=lambda: {"type": "spatial"})
+
+
+def get_pipeline_type(config: PipelineConfig) -> str:
+    """Return the pipeline kind, defaulting to ``"spatial"``.
+
+    Centralised so dispatch / strategy selection has a single source of truth.
+    """
+    if not isinstance(config.pipeline, dict):
+        raise ValueError("pipeline must be a mapping with a 'type' key")
+    t = config.pipeline.get("type", "spatial")
+    if t not in _PIPELINE_TYPES:
+        raise ValueError(
+            f"pipeline.type must be one of {sorted(_PIPELINE_TYPES)} (got {t!r})"
+        )
+    return t
 
 
 def load_config(path: str) -> PipelineConfig:
@@ -134,6 +159,7 @@ def load_config_from_dict(d: dict) -> PipelineConfig:
         output=d.get("output", {}),
         catalog=d.get("catalog"),
         bounds=d.get("bounds"),
+        pipeline=d.get("pipeline", {"type": "spatial"}),
     )
 
 
@@ -176,6 +202,16 @@ def validate_config(config: PipelineConfig) -> None:
     ValueError
         On any validation failure.
     """
+    # Pipeline kind drives which validation branch runs; spatial keeps the
+    # full grid + aggregation cross-checks below. Temporal/event pipelines
+    # land in a follow-up phase once the engine + process_event are in.
+    ptype = get_pipeline_type(config)
+    if ptype != "spatial":
+        raise NotImplementedError(
+            f"pipeline.type={ptype!r} is reserved for issue #12 follow-up phases; "
+            "only 'spatial' is validated today"
+        )
+
     # Required sections
     for section in ("data_source", "aggregation", "output"):
         val = getattr(config, section)
