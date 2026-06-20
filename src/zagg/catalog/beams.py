@@ -39,6 +39,20 @@ _BEAM_PRODUCTS: frozenset[str] = frozenset({"ATL03", "ATL06"})
 # cannot reliably separate the two swath edges, so we fall back to the swath.
 _MIN_VERTS: int = 6
 
+# Expected ATL03/06 swath envelope half-width (the CMR polygon for a quarter
+# orbit is ~12.6 km across, so ~6.3 km on either side of the centerline). When
+# the recovered envelope is asymmetric or anomalously padded, the centerline of
+# the envelope drifts from the true data center; we widen the corridor by half
+# the excess so the beams remain covered (option (b) of the review on issue #65).
+_EXPECTED_SWATH_HALF_WIDTH_M: float = 6300.0
+
+
+def is_beam_product(product: str | None) -> bool:
+    """True for ICESat-2 products whose CMR swath decomposes into beam corridors."""
+    if not product:
+        return False
+    return product.upper() in _BEAM_PRODUCTS
+
 
 def _wgs84_geod():
     from pyproj import Geod
@@ -97,12 +111,20 @@ def _split_swath_edges(lats: np.ndarray, lons: np.ndarray):
     return edge(a_idx), edge(b_idx)
 
 
-def _centerline(lats: np.ndarray, lons: np.ndarray, n_samples: int = 200):
-    """Recover the swath centerline as ``(clat, clon)``, ordered south->north.
+def _centerline(lats: np.ndarray, lons: np.ndarray, geod, n_samples: int = 200):
+    """Recover the swath centerline + measured envelope half-width.
 
-    Resamples both edges onto a shared along-track grid and averages them, which
-    cancels the over-wide swath width and is robust to the sparse (~20-35)
-    vertices of a CMR polygon. Returns ``None`` on a degenerate split.
+    Returns ``(clat, clon, half_width_m)`` ordered south->north, or ``None`` on
+    a degenerate split. ``half_width_m`` is the larger of the median geodesic
+    distances from the centerline to each envelope edge -- the asymmetric side
+    is the one the corridor must widen toward downstream.
+
+    The width threshold drops samples in the converging end caps where the two
+    edges meet at a shared corner. Short interior gaps left by a mid-track
+    pinch are bridged implicitly by the geod azimuth between adjacent kept
+    samples -- a known limitation for severely-pinched CMR envelopes, which
+    would yield an angled chord across the pinch rather than a faithful
+    centerline.
     """
     split = _split_swath_edges(lats, lons)
     if split is None:
@@ -124,11 +146,21 @@ def _centerline(lats: np.ndarray, lons: np.ndarray, n_samples: int = 200):
     if keep.sum() < 2:
         return None
     clat, clon = clat[keep], clon[keep]
-    # Order south -> north so the signed cross-track offsets place gt1 west /
-    # gt3 east consistently for both ascending and descending granules.
+    lon_a, lat_a, lon_b, lat_b = lon_a[keep], lat_a[keep], lon_b[keep], lat_b[keep]
+    # Median geodesic distance from the centerline to each edge. Take the max
+    # of the two so an asymmetric envelope (one edge padded farther than the
+    # other) reports its true outer reach -- the side the centerline drifted
+    # away from is the side we need to widen the corridor toward.
+    _, _, d_a = geod.inv(clon, clat, lon_a, lat_a)
+    _, _, d_b = geod.inv(clon, clat, lon_b, lat_b)
+    half_width_m = float(max(np.median(d_a), np.median(d_b)))
+    # Order south -> north so the three corridors land on the three true beam
+    # positions as a *set* for both ascending and descending granules (the
+    # backends union all per-granule rings, so per-pair west/east labelling is
+    # not preserved across heading sign).
     if clat[0] > clat[-1]:
         clat, clon = clat[::-1], clon[::-1]
-    return clat, clon
+    return clat, clon, half_width_m
 
 
 def _offset_point(geod, lon: float, lat: float, az_track: float, cross_m: float):
@@ -173,29 +205,41 @@ def beam_tracks_from_cmr_polygon(
     if product not in _BEAM_PRODUCTS or len(lats) < _MIN_VERTS:
         return _swath_fallback(lats, lons)
 
-    # Antimeridian-crossing swaths (>= 180 deg lon span) can't be represented as
-    # a simple [-180, 180] corridor ring; decomposing them is rare (polar/seam
-    # granules) so fall back to the swath rather than mis-handle the wrap.
-    if np.ptp(lons) >= 180.0:
+    # Antimeridian-crossing swaths can't be represented as a simple [-180, 180]
+    # corridor ring; decomposing them is rare (polar/seam granules) so fall back
+    # to the swath rather than mis-handle the wrap. The detection keys on an
+    # actual consecutive-vertex seam jump (>~180 deg between neighbours), not on
+    # the raw lon span -- a near-polar quarter-orbit can sweep >180 deg of lon
+    # without any antimeridian crossing, and would otherwise no-op silently.
+    if len(lons) >= 2 and float(np.max(np.abs(np.diff(lons)))) >= 180.0:
         return _swath_fallback(lats, lons)
 
     # Drop the closing duplicate vertex, if any.
     if lats[0] == lats[-1] and lons[0] == lons[-1]:
         lats, lons = lats[:-1], lons[:-1]
 
-    center = _centerline(lats, lons)
+    geod = _wgs84_geod()
+    center = _centerline(lats, lons, geod)
     if center is None:
         return _swath_fallback(lats, lons)
-    clat, clon = center
+    clat, clon, measured_half_width_m = center
 
-    geod = _wgs84_geod()
     # Forward azimuth along the centerline; repeat the last for the final point.
     az12, _, _ = geod.inv(clon[:-1], clat[:-1], clon[1:], clat[1:])
     az = np.concatenate([az12, az12[-1:]])
 
+    # Adaptive half-width. The CMR envelope of a quarter-orbit ATL03/06 swath
+    # is ~12.6 km wide (half-width ~6.3 km); a wider envelope means asymmetric
+    # or one-sided CMR padding can drift the recovered centerline from the true
+    # data center by up to half the excess width. Widen the corridor by exactly
+    # that excess so the beams remain covered even when the envelope is
+    # irregular.
+    extra = max(0.0, measured_half_width_m - _EXPECTED_SWATH_HALF_WIDTH_M)
+    half_width_eff = half_width_m + extra
+
     rings: list[tuple[np.ndarray, np.ndarray]] = []
     for off in pair_offsets_m:
-        lo, hi = off - half_width_m, off + half_width_m
+        lo, hi = off - half_width_eff, off + half_width_eff
         lo_lat, lo_lon, hi_lat, hi_lon = [], [], [], []
         for la, lo_, a in zip(clat, clon, az):
             p_lat, p_lon = _offset_point(geod, lo_, la, a, lo)

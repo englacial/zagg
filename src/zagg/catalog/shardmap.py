@@ -321,6 +321,17 @@ class ShardMap:
         records = catalog.granule_records()
         # Product short-name drives beam decomposition (collection like "ATL03_007").
         product = ((catalog.metadata or {}).get("collection") or "").split("_")[0].upper()
+        if footprint == "beams":
+            from zagg.catalog.beams import is_beam_product
+            if not is_beam_product(product):
+                # ``beams`` is opt-in; silently degrading to swath here would
+                # leave the metadata recording ``footprint="beams"`` while the
+                # tightening did nothing. Make the mismatch loud.
+                raise ValueError(
+                    f"footprint='beams' requires an ICESat-2 beam product "
+                    f"(ATL03/ATL06); catalog collection {(catalog.metadata or {}).get('collection')!r} "
+                    f"resolves to product {product!r}"
+                )
         parts = _region_parts(region, catalog.metadata)
         all_shards = set(int(s) for s in grid.coverage(parts))
 

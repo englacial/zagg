@@ -357,6 +357,76 @@ class TestBeamHelper:
         out = beam_tracks_from_cmr_polygon(lats, lons, product="ATL03")
         assert len(out) == 1
 
+    def test_wide_lon_polar_does_not_fall_back(self):
+        # Near-polar quarter-orbit polygons can sweep > 180 deg of longitude
+        # with no antimeridian crossing -- consecutive vertices stay close.
+        # The decomposition must run on these, not silently degrade to swath.
+        lats = np.array([85.5, 85.7, 85.9, 86.0, 86.1, 86.3, 86.1, 86.0, 85.9, 85.7, 85.5, 85.5])
+        lons = np.array([
+            -150.0, -100.0, -50.0, 0.0, 50.0, 100.0,
+            105.0, 55.0, 5.0, -45.0, -95.0, -150.0,
+        ])
+        assert float(np.ptp(lons)) > 180.0  # spans >180 deg but no seam
+        assert float(np.max(np.abs(np.diff(lons)))) < 180.0  # no neighbour jump
+        out = beam_tracks_from_cmr_polygon(lats, lons, product="ATL03")
+        assert len(out) == 3, "wide-lon polar swath must decompose, not no-op to swath"
+
+    def test_wider_envelope_widens_corridor(self):
+        # The CMR envelope's symmetric centerline (mean of the two edges) is
+        # only a faithful proxy for the true data axis when the envelope is the
+        # expected ~12.6 km width; a wider envelope means extra CMR padding has
+        # moved the envelope center away from the true data axis. The adaptive
+        # half-width must widen the corridor by the excess so the beams remain
+        # covered when the envelope is over-padded.
+        from shapely.geometry import Point, Polygon
+
+        center_lon, center_lat = -76.50, 38.89
+        deg_per_m = 1.0 / (np.cos(np.radians(center_lat)) * 111320.0)
+        # 20 km wide envelope (~10 km half-width vs the ~6.3 km expected).
+        col = np.linspace(38.74, 39.04, 12)
+        wide = 10_000.0 * deg_per_m
+        lats = np.concatenate([col, col[::-1], [col[0]]])
+        lons = np.concatenate(
+            [np.full(12, center_lon - wide), np.full(12, center_lon + wide), [center_lon - wide]],
+        )
+        rings = beam_tracks_from_cmr_polygon(lats, lons, product="ATL03")
+        assert len(rings) == 3
+        # Outer corridor must extend ~3.3 km + (10 - 6.3) km of widening = ~7 km
+        # from the centerline. Probe the extremes of the corridor at mid-lat.
+        outer_offset_m = 3300.0 + (10_000.0 - 6300.0)  # ~7000 m
+        eps = 0.001  # ~110 m
+        outer_lon_pos = Point(center_lon + outer_offset_m * deg_per_m - eps, center_lat)
+        outer_lon_neg = Point(center_lon - outer_offset_m * deg_per_m + eps, center_lat)
+        corridors = [Polygon(zip(rlon, rlat)) for rlat, rlon in rings]
+        assert any(c.contains(outer_lon_pos) for c in corridors), (
+            "adaptive widening must extend corridor outward when envelope is over-padded"
+        )
+        assert any(c.contains(outer_lon_neg) for c in corridors)
+
+    def test_descending_track_corridor_union(self):
+        # Same beam-set coverage holds for descending granules (heading south).
+        # The S->N reorder makes per-pair west/east labels arbitrary, but the
+        # union of corridors must still cover all three true beam positions.
+        from shapely.geometry import Point, Polygon
+
+        # Tilted descending track at lat 38.89: heading ~170 deg (mostly south,
+        # slight eastward drift). Build a symmetric envelope around it.
+        center_lat = np.linspace(39.04, 38.74, 12)
+        center_lon = -76.50 + 0.05 * np.linspace(-1, 1, 12)  # mild eastward drift
+        deg_per_m = 1.0 / (np.cos(np.radians(38.89)) * 111320.0)
+        half_w = 0.073  # ~6.3 km
+        # Cross-track perpendicular per sample (rough, sufficient for synthetic).
+        west_lon = center_lon - half_w
+        east_lon = center_lon + half_w
+        lats = np.concatenate([center_lat, center_lat[::-1], [center_lat[0]]])
+        lons = np.concatenate([west_lon, east_lon[::-1], [west_lon[0]]])
+        rings = beam_tracks_from_cmr_polygon(lats, lons, product="ATL03")
+        assert len(rings) == 3
+        beams_true = [Point(-76.50 + d * 3300 * deg_per_m, 38.89) for d in (-1, 0, 1)]
+        corridors = [Polygon(zip(rlon, rlat)) for rlat, rlon in rings]
+        for beam in beams_true:
+            assert any(c.contains(beam) for c in corridors)
+
 
 class TestBeamFootprintBehavior:
     """Beam mode assigns fewer shards than swath -- proven in both backends."""
@@ -412,6 +482,36 @@ class TestBeamFootprintBehavior:
     def test_invalid_footprint_raises(self, catalog, grid, fake_spherely):
         with pytest.raises(ValueError, match="footprint must be"):
             ShardMap.build(catalog, grid, backend="spherely", footprint="nope")
+
+    def test_beams_on_non_beam_catalog_raises(self, catalog, grid, fake_spherely):
+        # ``catalog`` fixture has collection "TEST", not ATL03/06. Requesting
+        # beams must fail loudly rather than silently degrade to swath -- the
+        # opt-in flag would otherwise record ``footprint="beams"`` while no
+        # tightening occurred.
+        with pytest.raises(ValueError, match="requires an ICESat-2 beam product"):
+            ShardMap.build(catalog, grid, backend="spherely", footprint="beams")
+
+    def test_beams_on_missing_collection_metadata_raises(self, grid, fake_spherely):
+        # Catalog without ``collection`` metadata at all -> product resolves to
+        # the empty string; beams must refuse rather than no-op.
+        cat = _catalog([_item("G", -76.55, -76.52)])
+        cat.metadata.pop("collection", None)
+        with pytest.raises(ValueError, match="requires an ICESat-2 beam product"):
+            ShardMap.build(cat, grid, backend="spherely", footprint="beams")
+
+
+class TestIsBeamProduct:
+    def test_known_beam_products(self):
+        from zagg.catalog.beams import is_beam_product
+        assert is_beam_product("ATL03")
+        assert is_beam_product("ATL06")
+        assert is_beam_product("atl03")  # case-insensitive
+
+    def test_non_beam_or_missing(self):
+        from zagg.catalog.beams import is_beam_product
+        assert not is_beam_product("ATL08")
+        assert not is_beam_product("")
+        assert not is_beam_product(None)
 
 
 class TestIO:
