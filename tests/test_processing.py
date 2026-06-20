@@ -1859,6 +1859,38 @@ class TestPlannedReadGroup:
         assert df_planned["h"].tolist() == [40.0]
         assert df_full["h"].tolist() == [40.0]
 
+    def test_parity_with_empty_segment(self):
+        # ATL03 empty-segment sentinel (#68): seg 1 is empty (ph_index_beg==0,
+        # count==0) and is pulled into the matched run as the pad boundary. Pre-fix
+        # the run collapsed (base_end = 0-1+0 <= base_start) and the planned path
+        # dropped seg 0's real photons -> planned (None) != full. The guard bounds
+        # the run by its non-empty segment, restoring planned == full parity.
+        h5 = _FakeH5({
+            "/seg/lat": np.array([200.0, 300.0, 1000.0, 2000.0]),
+            "/seg/lon": np.zeros(4),
+            "/seg/ph_index_beg": np.array([1, 0, 3, 5], dtype=np.int64),  # seg 1 empty
+            "/seg/segment_ph_cnt": np.array([2, 0, 2, 2], dtype=np.int64),
+            "/heights/lat_ph": np.array([200.0, 210.0, 1000.0, 1010.0, 2000.0, 2010.0]),
+            "/heights/lon_ph": np.zeros(6),
+            "/heights/h": np.arange(6.0, dtype=np.float32) * 10.0,
+            "/heights/qs": np.zeros(6, dtype=np.int8),
+        })
+        grid = _LatBboxGrid((-0.1, 195.0, 0.1, 215.0))  # keeps photons 0,1 (lat 200,210)
+
+        ds_planned = _planned_read_data_source(with_base_filter=True)
+        ds_planned["levels"]["segments"]["link"]["index_base"] = 1  # ATL03 1-based
+        ds_planned["read_plan"]["pad"] = 1  # pull the empty seg 1 into the run
+        ds_full = {
+            "coordinates": {"latitude": "/heights/lat_ph", "longitude": "/heights/lon_ph"},
+            "variables": {"h": "/heights/h"},
+            "filters": [{"dataset": "/heights/qs", "op": "eq", "value": 0}],
+        }
+
+        df_planned = _read_group(h5, "gt1l", ds_planned, 0, grid)
+        df_full = _read_group(h5, "gt1l", ds_full, 0, grid)
+        assert df_planned["h"].tolist() == [0.0, 10.0]
+        assert df_full["h"].tolist() == [0.0, 10.0]
+
     def test_coarse_filter_via_planned_path(self):
         # Cross-level (Phase B) filter ANDs with the planned path: drop
         # segment 1 via podppd; segment 2 (also pulled in by the linestring
