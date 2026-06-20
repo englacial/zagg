@@ -150,6 +150,11 @@ def plan_read(
             merged.append((s, e))
 
     # -- Translate to base slices --
+    # ``kept_runs`` stays one-to-one with ``base_slices``/``chunk_lists``: a run
+    # that yields no slice (all-empty, or collapsed) is dropped from all three,
+    # so the returned plan never has phantom ``parent_runs`` without matching
+    # reads (which would crash ``execute_read_plan`` on an empty concatenate).
+    kept_runs: list[tuple[int, int]] = []
     base_slices: list[tuple[int, int]] = []
     chunk_lists: list[list[tuple[int, int]]] = []
     total_base = 0
@@ -162,7 +167,9 @@ def plan_read(
         # spans from photon 0 to the AOI (~half the granule). That balloons
         # total_base past the selectivity threshold -> full-granule read -> OOM
         # (and ruinous compute). Bound each run by its NON-EMPTY segments only;
-        # empty ones carry no photons, so a run with none is skipped.
+        # empty ones carry no photons, so a run with none is skipped. (The single
+        # contiguous [first, last] slice relies on the #43 contiguity assumption:
+        # non-empty segments are monotonic in ph_index_beg and tile the photons.)
         local = np.flatnonzero(cnt[s : e + 1] > 0)
         if local.size == 0:
             continue
@@ -173,6 +180,7 @@ def plan_read(
         base_end = min(n_base, base_end)
         if base_end <= base_start:
             continue
+        kept_runs.append((s, e))
         base_slices.append((base_start, base_end))
         chunk_lists.append([(base_start, base_end)])  # h5coro half-open [start, end)
         total_base += base_end - base_start
@@ -187,7 +195,7 @@ def plan_read(
         )
 
     return ReadPlan(
-        parent_runs=merged,
+        parent_runs=kept_runs,
         base_slices=base_slices,
         chunk_lists=chunk_lists,
     )
