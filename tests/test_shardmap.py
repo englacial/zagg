@@ -382,6 +382,20 @@ class TestBeamFootprintBehavior:
         assert bm
         assert bm < sw
 
+    def test_beam_mode_fewer_shards_healpix(self):
+        # HEALPix grid -> the is_healpix mortie MOC sub-path + per-granule dedup.
+        hp = HealpixGrid(12, 14, layout="fullsphere")
+        cat = _atl03_catalog([_swath_item("G", -76.50, 38.89)])
+        region = [(np.array([38.74, 38.74, 39.04, 39.04, 38.74]),
+                   np.array([-76.62, -76.42, -76.42, -76.62, -76.62]))]
+        swath = ShardMap.build(cat, hp, region=region, backend="mortie",
+                               mortie_order=14, footprint="swath")
+        beams = ShardMap.build(cat, hp, region=region, backend="mortie",
+                               mortie_order=14, footprint="beams")
+        sw, bm = self._granule_shard_set(swath, "G"), self._granule_shard_set(beams, "G")
+        assert bm
+        assert bm < sw
+
     def test_beam_metadata(self, fake_spherely):
         grid = _fine_grid()
         cat = _atl03_catalog([_swath_item("G", -76.50, 38.89)])
