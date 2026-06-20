@@ -227,6 +227,178 @@ class TestResolveBackend:
         with pytest.raises(SystemExit):
             main()
 
+    def test_cli_rejects_bad_footprint(self, monkeypatch):
+        from zagg.catalog import main
+        monkeypatch.setattr(
+            sys, "argv",
+            ["zagg-catalog", "--config", "x.yaml", "--short-name", "ATL03",
+             "--footprint", "garbage"],
+        )
+        with pytest.raises(SystemExit):
+            main()
+
+
+# ── beam-corridor footprints (issue #65) ─────────────────────────────────────
+
+from zagg.catalog.beams import beam_tracks_from_cmr_polygon  # noqa: E402
+
+# Real RGT0568 cycle-29 CMR footprint polygon (lon, lat), captured from CMR.
+# The granule's measured beam ground-tracks at lat 38.89 are gt1l -76.5475,
+# gt2l -76.5106, gt3l -76.4737 -- the decomposition must place a corridor over
+# each (issue #65 validation target).
+_C29_POLY = [
+    (-79.4552, 59.5458), (-79.6776, 59.5342), (-79.5274, 58.7894), (-79.1270, 56.6847),
+    (-79.0193, 55.9820), (-78.9553, 55.3096), (-78.5002, 52.5857), (-78.1682, 50.4866),
+    (-77.4919, 45.8442), (-76.9446, 41.7520), (-76.4355, 37.6827), (-75.9327, 33.4550),
+    (-75.3154, 28.0089), (-75.1996, 26.9469), (-75.0726, 26.9579), (-75.1873, 28.0199),
+    (-75.7972, 33.4664), (-76.2927, 37.6939), (-76.7931, 41.7632), (-77.3297, 45.8554),
+    (-77.9907, 50.4980), (-78.3143, 52.5970), (-78.7568, 55.3209), (-78.8168, 55.9880),
+    (-78.9211, 56.6943), (-79.3096, 58.8011), (-79.4552, 59.5458),
+]
+_C29_MEASURED = {0: -76.5475, 1: -76.5106, 2: -76.4737}  # pair index -> beam lon @ 38.89
+
+
+def _swath_latlon(center_lon, center_lat, half_width_deg=0.073, half_height_deg=0.15, n=12):
+    """Densified N-S swath polygon ring as (lats, lons) -- down west edge, up east.
+
+    Tall (along-track) >> wide (cross-track), as real quarter-orbit swaths are,
+    so the principal axis is the N-S track direction.
+    """
+    lats_col = np.linspace(center_lat - half_height_deg, center_lat + half_height_deg, n)
+    w = center_lon - half_width_deg
+    e = center_lon + half_width_deg
+    lons = np.concatenate([np.full(n, w), np.full(n, e)[::-1], [w]])
+    lats = np.concatenate([lats_col, lats_col[::-1], [lats_col[0]]])
+    return lats, lons
+
+
+def _swath_item(gid, center_lon, center_lat, half_width_deg=0.073, n=12):
+    lats, lons = _swath_latlon(center_lon, center_lat, half_width_deg=half_width_deg, n=n)
+    ring = [[float(lo), float(la)] for lo, la in zip(lons, lats)]
+    return {
+        "type": "Feature", "stac_version": "1.0.0", "id": gid,
+        "geometry": {"type": "Polygon", "coordinates": [ring]},
+        "bbox": [float(lons.min()), float(lats.min()), float(lons.max()), float(lats.max())],
+        "properties": {"datetime": "2025-06-01T00:00:00Z"},
+        "collection": "ATL03_007", "stac_extensions": [], "links": [],
+        "assets": {
+            "data": {"href": f"https://h/{gid}.h5", "roles": ["data"]},
+            "data_s3": {"href": f"s3://b/{gid}.h5", "roles": ["data"]},
+        },
+    }
+
+
+def _atl03_catalog(items):
+    return Catalog(
+        pa.table(sga.parse_stac_items_to_arrow(items)),
+        {"collection": "ATL03_007", "bbox": [-76.62107, 38.84504, -76.50583, 38.93512]},
+    )
+
+
+def _fine_grid():
+    # 10 km AOI at 10 m, 50-cell (500 m) shards -> 20x20, fine enough that the
+    # ~3 km inter-pair gaps contain whole shards.
+    return RectilinearGrid(
+        "EPSG:32618", 10, [359400, 4300740, 369400, 4310740], [50, 50],
+        config=default_config("atl06_polar"),
+    )
+
+
+class TestBeamHelper:
+    """Pure-geometry decomposition (pyproj + numpy only)."""
+
+    def test_c29_corridors_contain_measured_beams(self):
+        from shapely.geometry import Point, Polygon
+
+        lons = np.array([v[0] for v in _C29_POLY])
+        lats = np.array([v[1] for v in _C29_POLY])
+        rings = beam_tracks_from_cmr_polygon(lats, lons, product="ATL03")
+        assert len(rings) == 3
+        for k, (rlat, rlon) in enumerate(rings):
+            corridor = Polygon(zip(rlon, rlat))
+            beam = Point(_C29_MEASURED[k], 38.89)
+            assert corridor.contains(beam), f"pair {k} corridor missed its measured beam"
+
+    def test_synthetic_straight_swath_offsets(self):
+        from shapely.geometry import LineString, Polygon
+
+        lats, lons = _swath_latlon(-76.50, 38.89, n=12)
+        rings = beam_tracks_from_cmr_polygon(lats, lons, product="ATL03")
+        assert len(rings) == 3
+        # corridor centers at lat 38.89 should sit at -3.3 / 0 / +3.3 km cross-track
+        deg_per_m = 1.0 / (np.cos(np.radians(38.89)) * 111320.0)
+        expected = [-76.50 + d * 3300 * deg_per_m for d in (-1, 0, 1)]
+        for k, (rlat, rlon) in enumerate(rings):
+            sl = Polygon(zip(rlon, rlat)).intersection(LineString([(-78, 38.89), (-75, 38.89)]))
+            xs = [c[0] for g in (sl.geoms if hasattr(sl, "geoms") else [sl]) for c in g.coords]
+            center = 0.5 * (min(xs) + max(xs))
+            assert abs(center - expected[k]) < 0.003  # ~260 m
+
+    def test_non_beam_product_passthrough(self):
+        lats = np.array([v[1] for v in _C29_POLY])
+        lons = np.array([v[0] for v in _C29_POLY])
+        out = beam_tracks_from_cmr_polygon(lats, lons, product="ATL08")
+        assert len(out) == 1
+        np.testing.assert_array_equal(out[0][0], lats)
+        np.testing.assert_array_equal(out[0][1], lons)
+
+    def test_degenerate_few_vertices_falls_back(self):
+        lats = np.array([38.85, 38.85, 38.93, 38.85])
+        lons = np.array([-76.6, -76.5, -76.55, -76.6])
+        out = beam_tracks_from_cmr_polygon(lats, lons, product="ATL03")
+        assert len(out) == 1  # too few vertices -> swath fallback, granule kept
+
+    def test_antimeridian_falls_back(self):
+        # Swath straddling +/-180 (wrapped lons, ptp ~360) can't be a simple
+        # corridor ring -> swath fallback (granule kept, just not tightened).
+        col = np.linspace(64.85, 65.15, 10)
+        lons = np.concatenate([np.full(10, 179.9), np.full(10, -179.9), [179.9]])
+        lats = np.concatenate([col, col[::-1], [col[0]]])
+        out = beam_tracks_from_cmr_polygon(lats, lons, product="ATL03")
+        assert len(out) == 1
+
+
+class TestBeamFootprintBehavior:
+    """Beam mode assigns fewer shards than swath -- proven in both backends."""
+
+    def _granule_shard_set(self, sm, gid):
+        return _granule_shards(sm).get(gid, set())
+
+    def test_beam_mode_fewer_shards_spherely(self, fake_spherely):
+        grid = _fine_grid()
+        cat = _atl03_catalog([_swath_item("G", -76.50, 38.89)])
+        swath = ShardMap.build(cat, grid, backend="spherely", footprint="swath")
+        beams = ShardMap.build(cat, grid, backend="spherely", footprint="beams")
+        sw, bm = self._granule_shard_set(swath, "G"), self._granule_shard_set(beams, "G")
+        assert bm, "granule must still be assigned in beam mode"
+        assert bm < sw, "beam corridors must hit strictly fewer shards than the swath"
+
+    def test_beam_mode_fewer_shards_mortie(self):
+        grid = _fine_grid()
+        cat = _atl03_catalog([_swath_item("G", -76.50, 38.89)])
+        swath = ShardMap.build(cat, grid, backend="mortie", mortie_order=14, footprint="swath")
+        beams = ShardMap.build(cat, grid, backend="mortie", mortie_order=14, footprint="beams")
+        sw, bm = self._granule_shard_set(swath, "G"), self._granule_shard_set(beams, "G")
+        assert bm
+        assert bm < sw
+
+    def test_beam_metadata(self, fake_spherely):
+        grid = _fine_grid()
+        cat = _atl03_catalog([_swath_item("G", -76.50, 38.89)])
+        sm = ShardMap.build(cat, grid, backend="spherely", footprint="beams")
+        assert sm.metadata["footprint"] == "beams"
+
+    def test_swath_is_the_default(self, catalog, grid, fake_spherely):
+        # Default build == explicit swath build (non-breaking).
+        default = ShardMap.build(catalog, grid, backend="spherely")
+        swath = ShardMap.build(catalog, grid, backend="spherely", footprint="swath")
+        assert default.metadata["footprint"] == "swath"
+        assert _granule_shards(default) == _granule_shards(swath)
+
+    def test_invalid_footprint_raises(self, catalog, grid, fake_spherely):
+        with pytest.raises(ValueError, match="footprint must be"):
+            ShardMap.build(catalog, grid, backend="spherely", footprint="nope")
+
 
 class TestIO:
     def test_round_trip(self, catalog, grid, fake_spherely):

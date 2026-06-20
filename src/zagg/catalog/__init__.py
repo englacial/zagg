@@ -19,6 +19,8 @@ from importlib import resources
 
 import numpy as np
 
+from zagg.catalog.beams import beam_tracks_from_cmr_polygon
+
 # ICESat-2 constants
 _ICESAT2_LAUNCH = datetime(2018, 10, 13)
 _ICESAT2_CYCLE_DAYS = 91
@@ -127,7 +129,7 @@ def load_antarctic_basins(filepath=None) -> list[tuple]:
     return [(g["Lat"].values, g["Lon"].values) for _, g in df.groupby("basin")]
 
 
-def make_shardmap(query, grid, *, region=None, backend="auto", catalog_out=None):
+def make_shardmap(query, grid, *, region=None, backend="auto", catalog_out=None, footprint="swath"):
     """Fetch a Catalog and build a ShardMap in one call (concerns 1+2 chained).
 
     Parameters
@@ -142,6 +144,9 @@ def make_shardmap(query, grid, *, region=None, backend="auto", catalog_out=None)
         Geometry backend for the shard map.
     catalog_out : str, optional
         If given, persist the fetched Catalog to this geoparquet path.
+    footprint : {"swath", "beams"}
+        Granule footprint for intersection; ``"beams"`` tightens ICESat-2
+        ATL03/06 assignment to per-beam-pair corridors (issue #65).
 
     Returns
     -------
@@ -153,7 +158,7 @@ def make_shardmap(query, grid, *, region=None, backend="auto", catalog_out=None)
     cat = CMRSource().fetch(query)
     if catalog_out:
         cat.to_geoparquet(catalog_out)
-    return ShardMap.build(cat, grid, region=region, backend=backend)
+    return ShardMap.build(cat, grid, region=region, backend=backend, footprint=footprint)
 
 
 def main():
@@ -198,6 +203,10 @@ examples:
 
     parser.add_argument("--backend", default="auto",
                         choices=["auto", "spherely", "mortie"])
+    parser.add_argument("--footprint", default="swath",
+                        choices=["swath", "beams"],
+                        help="ATL03/06: 'beams' decomposes the CMR swath into "
+                             "per-beam-pair corridors to tighten shard assignment (#65)")
     parser.add_argument("--preserve-thumbnails", action="store_true",
                         help="Keep browse/thumbnail assets in the Catalog")
     parser.add_argument("--output", default=None, help="Output ShardMap JSON path")
@@ -237,7 +246,7 @@ examples:
         cat.to_geoparquet(args.catalog_out)
         print(f"Catalog -> {args.catalog_out}")
 
-    sm = ShardMap.build(cat, grid, region=parts, backend=args.backend)
+    sm = ShardMap.build(cat, grid, region=parts, backend=args.backend, footprint=args.footprint)
     out = args.output or f"shardmap_{args.short_name}_{start}_{end}.json"
     sm.to_json(out)
     print(f"ShardMap: {len(sm.shard_keys)} shards, {sm.metadata['total_pairs']} pairs "
@@ -254,5 +263,6 @@ __all__ = [
     "polygon_to_bbox",
     "load_antarctic_basins",
     "make_shardmap",
+    "beam_tracks_from_cmr_polygon",
     "main",
 ]
