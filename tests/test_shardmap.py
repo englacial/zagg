@@ -403,19 +403,41 @@ class TestBeamHelper:
         )
         assert any(c.contains(outer_lon_neg) for c in corridors)
 
-    def test_descending_track_corridor_union(self):
-        # Same beam-set coverage holds for descending granules (heading south).
-        # The S->N reorder makes per-pair west/east labels arbitrary, but the
-        # union of corridors must still cover all three true beam positions.
+    def test_normal_envelope_keeps_base_corridor_width(self):
+        # Converse of the "widen-when-wide" test: a normal ~12.6 km envelope
+        # must NOT trigger the adaptive widening, so the inter-pair ~3 km gaps
+        # stay unassigned (the original tightening goal of #65). Asserted on
+        # corridor extent: gt2 (offset 0) must not extend past ~500 m + the
+        # ~260 m centerline-recovery error.
+        from shapely.geometry import LineString, Polygon
+
+        lats, lons = _swath_latlon(-76.50, 38.89, n=12)
+        rings = beam_tracks_from_cmr_polygon(lats, lons, product="ATL03")
+        gt2_lat, gt2_lon = rings[1]
+        poly = Polygon(zip(gt2_lon, gt2_lat))
+        sl = poly.intersection(LineString([(-78, 38.89), (-75, 38.89)]))
+        xs = [c[0] for g in (sl.geoms if hasattr(sl, "geoms") else [sl]) for c in g.coords]
+        deg_per_m = 1.0 / (np.cos(np.radians(38.89)) * 111320.0)
+        half_extent_m = abs(max(xs) - min(xs)) / 2 / deg_per_m
+        # Base ~500 m + ~260 m centerline-recovery error budget; > ~1 km would
+        # indicate the adaptive widening over-fired on a normal envelope.
+        assert half_extent_m < 1000.0, (
+            f"normal envelope should keep corridor narrow; got half-extent {half_extent_m:.0f} m"
+        )
+
+    def test_input_order_reversed_yields_same_corridor_union(self):
+        # The S->N reorder in ``_centerline`` makes the corridor union order-
+        # invariant: input vertices ordered N->S (e.g. a descending track read
+        # in scan order) must produce the same coverage as an S->N input. A
+        # genuine descending-heading test (azimuth ~170 deg) would require a
+        # non-pure-meridional polygon; this test asserts the easier and more
+        # important invariant for shard assignment, which is union coverage.
         from shapely.geometry import Point, Polygon
 
-        # Tilted descending track at lat 38.89: heading ~170 deg (mostly south,
-        # slight eastward drift). Build a symmetric envelope around it.
-        center_lat = np.linspace(39.04, 38.74, 12)
+        center_lat = np.linspace(39.04, 38.74, 12)  # N -> S input order
         center_lon = -76.50 + 0.05 * np.linspace(-1, 1, 12)  # mild eastward drift
         deg_per_m = 1.0 / (np.cos(np.radians(38.89)) * 111320.0)
         half_w = 0.073  # ~6.3 km
-        # Cross-track perpendicular per sample (rough, sufficient for synthetic).
         west_lon = center_lon - half_w
         east_lon = center_lon + half_w
         lats = np.concatenate([center_lat, center_lat[::-1], [center_lat[0]]])

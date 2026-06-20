@@ -202,15 +202,16 @@ def beam_tracks_from_cmr_polygon(
     """
     lats = np.asarray(lats, dtype=float)
     lons = np.asarray(lons, dtype=float)
-    if product not in _BEAM_PRODUCTS or len(lats) < _MIN_VERTS:
+    if not is_beam_product(product) or len(lats) < _MIN_VERTS:
         return _swath_fallback(lats, lons)
 
-    # Antimeridian-crossing swaths can't be represented as a simple [-180, 180]
-    # corridor ring; decomposing them is rare (polar/seam granules) so fall back
-    # to the swath rather than mis-handle the wrap. The detection keys on an
-    # actual consecutive-vertex seam jump (>~180 deg between neighbours), not on
-    # the raw lon span -- a near-polar quarter-orbit can sweep >180 deg of lon
-    # without any antimeridian crossing, and would otherwise no-op silently.
+    # Fall back on swaths whose ring has a >=180 deg consecutive-vertex
+    # longitude jump. This catches the common antimeridian wrap (e.g.
+    # 179.9 -> -179.9 = ~360 deg jump) and the rarer true polar-cap polygon
+    # whose vertices straddle the pole at opposite longitudes (a near-180 deg
+    # leap, no actual seam crossing). The plain raw-lon-span (np.ptp) form
+    # used previously falsely tripped on wide-lon polar quarter-orbits with no
+    # seam at all -- the consecutive-vertex form keeps those passing through.
     if len(lons) >= 2 and float(np.max(np.abs(np.diff(lons)))) >= 180.0:
         return _swath_fallback(lats, lons)
 
@@ -229,11 +230,16 @@ def beam_tracks_from_cmr_polygon(
     az = np.concatenate([az12, az12[-1:]])
 
     # Adaptive half-width. The CMR envelope of a quarter-orbit ATL03/06 swath
-    # is ~12.6 km wide (half-width ~6.3 km); a wider envelope means asymmetric
-    # or one-sided CMR padding can drift the recovered centerline from the true
-    # data center by up to half the excess width. Widen the corridor by exactly
-    # that excess so the beams remain covered even when the envelope is
-    # irregular.
+    # is ~12.6 km wide (half-width ~6.3 km); a wider-than-expected envelope
+    # means CMR has padded one or both sides, and the recovered centerline
+    # can drift by up to half the excess. Widen the corridor by exactly that
+    # excess so the beams remain covered. Note this does NOT handle a
+    # *placement-shifted* envelope of normal width (e.g. CMR padding shifted 4
+    # km west / 8 km east while keeping the total ~12 km wide): from the
+    # polygon shape alone the centerline-of-envelope is indistinguishable
+    # from a symmetric centred envelope, so no widening fires and the beams
+    # can fall outside their corridors. That case is documented in
+    # ``_centerline``'s docstring and the PR description.
     extra = max(0.0, measured_half_width_m - _EXPECTED_SWATH_HALF_WIDTH_M)
     half_width_eff = half_width_m + extra
 

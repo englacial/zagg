@@ -327,10 +327,20 @@ class ShardMap:
                 # ``beams`` is opt-in; silently degrading to swath here would
                 # leave the metadata recording ``footprint="beams"`` while the
                 # tightening did nothing. Make the mismatch loud.
+                collection = (catalog.metadata or {}).get("collection")
+                if collection is None:
+                    detail = (
+                        "catalog has no 'collection' metadata so the product "
+                        "can't be identified"
+                    )
+                else:
+                    detail = (
+                        f"catalog collection {collection!r} resolves to "
+                        f"product {product!r}"
+                    )
                 raise ValueError(
                     f"footprint='beams' requires an ICESat-2 beam product "
-                    f"(ATL03/ATL06); catalog collection {(catalog.metadata or {}).get('collection')!r} "
-                    f"resolves to product {product!r}"
+                    f"(ATL03/ATL06); {detail}"
                 )
         parts = _region_parts(region, catalog.metadata)
         all_shards = set(int(s) for s in grid.coverage(parts))
