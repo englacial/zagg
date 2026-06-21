@@ -75,8 +75,15 @@ _ENTRY_POINT_GROUP = "zagg.plugins"
 
 # Discovery is idempotent across processes within a single interpreter; we
 # track it so repeated ``get_*`` / ``list_*`` calls don't re-iterate
-# ``importlib.metadata.entry_points`` every time.
+# ``importlib.metadata.entry_points`` every time. ``_DISCOVERING`` is a
+# separate re-entrancy guard: if a plugin's ``register()`` itself reaches a
+# ``get_*`` helper during loading, we return early without re-running the
+# entry-point loop. Both flags are written from a single thread (import-time
+# registration) — concurrent ``get_*`` from multiple worker threads is safe
+# only because each registry is a plain ``dict`` whose entries don't change
+# after ``register_*`` completes; see ``discover_plugins`` for the contract.
 _DISCOVERED = False
+_DISCOVERING = False
 
 
 # ---------------------------------------------------------------------------
@@ -128,44 +135,62 @@ def _ensure_discovered() -> None:
 
     Each entry point must resolve to a callable that, when invoked with no
     arguments, registers its capabilities through the helpers below. A
-    failure in any one plugin is logged at WARNING but does not crash the
-    discovery pass — the rest still load.
+    failure in any one plugin's ``ep.load()`` or ``register()`` is logged at
+    ERROR (via ``logger.exception``) and skipped — the rest still load.
+
+    If ``importlib.metadata.entry_points()`` itself fails, ``_DISCOVERED``
+    stays ``False`` so the next ``get_*`` / ``list_*`` call retries. This
+    catches transient failures from broken third-party ``importlib_metadata``
+    backports without permanently degrading the seam.
     """
-    global _DISCOVERED
-    if _DISCOVERED:
+    global _DISCOVERED, _DISCOVERING
+    if _DISCOVERED or _DISCOVERING:
         return
-    # Mark discovered *before* loading so a plugin that calls back into a
-    # ``get_*`` helper during its ``register()`` doesn't recurse.
-    _DISCOVERED = True
+    _DISCOVERING = True
     try:
-        eps: Iterable[metadata.EntryPoint] = metadata.entry_points(group=_ENTRY_POINT_GROUP)
-    except Exception:  # pragma: no cover - importlib.metadata API surface is narrow
-        logger.exception("zagg.plugins entry-point lookup failed; no plugins loaded")
-        return
-    for ep in eps:
         try:
-            register_fn = ep.load()
+            eps: Iterable[metadata.EntryPoint] = metadata.entry_points(group=_ENTRY_POINT_GROUP)
         except Exception:
-            logger.exception("Failed to load zagg.plugins entry point %r", ep.name)
-            continue
-        try:
-            register_fn()
-        except Exception:
-            logger.exception("zagg.plugins entry point %r raised on register()", ep.name)
+            logger.exception(
+                "zagg.plugins entry-point lookup failed; will retry on next get_* call"
+            )
+            return  # Leave _DISCOVERED=False so subsequent calls retry.
+        # Got a valid list — flip the persistent flag now so a plugin's
+        # ``register()`` calling back through ``get_*`` short-circuits via
+        # ``_DISCOVERED`` (not just ``_DISCOVERING``) and never re-enters
+        # the entry-point loop even after this function returns.
+        _DISCOVERED = True
+        for ep in eps:
+            try:
+                register_fn = ep.load()
+            except Exception:
+                logger.exception("Failed to load zagg.plugins entry point %r", ep.name)
+                continue
+            try:
+                register_fn()
+            except Exception:
+                logger.exception("zagg.plugins entry point %r raised on register()", ep.name)
+    finally:
+        _DISCOVERING = False
 
 
 def discover_plugins(*, force: bool = False) -> None:
     """Trigger entry-point discovery explicitly.
 
     Discovery is normally lazy (deferred until the first ``get_*`` / ``list_*``
-    call). Tests and the Lambda handler call this at a deterministic point so
-    failures surface early.
+    call). The Lambda handler calls this at module import so plugin-loading
+    failures surface during cold-start logs rather than mid-invocation.
 
     Parameters
     ----------
     force : bool
-        Re-run discovery even if it has already happened. Useful in tests
-        that install a plugin after import.
+        Re-run discovery even if it has already happened. Intended for tests
+        that patch ``importlib.metadata.entry_points`` *before* the first
+        discovery; after a real plugin has registered, re-running discovery
+        against the same entry points trips the duplicate-name guard in
+        ``_register`` (which is itself logged and skipped). Callers that need
+        to install a plugin into already-populated registries should call
+        ``register_*(..., replace=True)`` directly instead.
     """
     global _DISCOVERED
     if force:

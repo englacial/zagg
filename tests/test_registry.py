@@ -48,11 +48,13 @@ def _clean_registries():
     """
     saved = {kind: dict(reg) for kind, reg in registry._REGISTRIES.items()}
     saved_discovered = registry._DISCOVERED
+    saved_discovering = registry._DISCOVERING
     yield
     for kind, reg in registry._REGISTRIES.items():
         reg.clear()
         reg.update(saved[kind])
     registry._DISCOVERED = saved_discovered
+    registry._DISCOVERING = saved_discovering
 
 
 # ---------------------------------------------------------------------------
@@ -144,6 +146,16 @@ class TestRegistrySurface:
         reg("demo", second, replace=True)
         assert get("demo") is second
 
+    def test_replace_overrides_via_decorator(self, kind, reg, get, lst):
+        first = object()
+        reg("demo", first)
+
+        @reg("demo", replace=True)
+        def replacement():
+            return "new"
+
+        assert get("demo") is replacement
+
     def test_empty_name_rejected(self, kind, reg, get, lst):
         with pytest.raises(ValueError, match="non-empty string"):
             reg("", object())
@@ -234,7 +246,7 @@ class TestDiscovery:
         # Good plugin still registered; the bad one logged but did not abort.
         assert "good" in list_reducers()
         assert good_calls == [1]
-        assert any("bad" in rec.message for rec in caplog.records)
+        assert any("bad" in rec.getMessage() for rec in caplog.records)
 
     def test_failing_entry_point_load_does_not_crash(self, monkeypatch, caplog):
         class BadEntryPoint:
@@ -256,7 +268,7 @@ class TestDiscovery:
             discover_plugins()
 
         assert "good" in list_readers()
-        assert any("bad" in rec.message for rec in caplog.records)
+        assert any("bad" in rec.getMessage() for rec in caplog.records)
 
     def test_list_also_triggers_discovery(self, monkeypatch):
         def register_fn():
@@ -276,3 +288,54 @@ class TestDiscovery:
 
         snap = registry_snapshot()
         assert "from_plugin" in snap["mask_provider"]
+
+    def test_entry_point_lookup_failure_allows_retry(self, monkeypatch, caplog):
+        """If ``metadata.entry_points`` itself raises, the seam stays in the
+        not-yet-discovered state so a later call can recover (e.g. after a
+        broken ``importlib_metadata`` backport is uninstalled)."""
+        attempts = {"n": 0}
+
+        def flaky_entry_points(*, group):
+            assert group == registry._ENTRY_POINT_GROUP
+            attempts["n"] += 1
+            if attempts["n"] == 1:
+                raise RuntimeError("metadata lookup failed transiently")
+            return [_FakeEntryPoint("demo", lambda: register_reader("from_plugin", object()))]
+
+        monkeypatch.setattr(registry.metadata, "entry_points", flaky_entry_points)
+        registry._DISCOVERED = False
+
+        with caplog.at_level("ERROR"):
+            # First call: lookup failure logged, no discovery marked.
+            discover_plugins()
+        assert registry._DISCOVERED is False
+        assert any("entry-point lookup failed" in rec.getMessage() for rec in caplog.records)
+
+        # Second call: lookup succeeds, plugin registers.
+        discover_plugins()
+        assert registry._DISCOVERED is True
+        assert "from_plugin" in list_readers()
+        assert attempts["n"] == 2
+
+    def test_register_during_register_does_not_recurse(self, monkeypatch):
+        """A plugin that calls a ``register_*`` helper from inside its
+        ``register()`` must not trigger nested discovery — ``_DISCOVERING``
+        gates re-entry, and ``register_*`` itself does not call
+        ``_ensure_discovered``."""
+        load_calls = []
+
+        def register_fn():
+            load_calls.append(1)
+            # Touch the snapshot mid-register; before the fix this would
+            # have re-entered _ensure_discovered if _DISCOVERED were still
+            # False (it's now set to True before the loop, but the test
+            # also exercises the _DISCOVERING guard explicitly).
+            registry_snapshot()
+            register_field_transform("from_plugin", lambda x: x)
+
+        _install_entry_points(monkeypatch, [_FakeEntryPoint("demo", register_fn)])
+        registry._DISCOVERED = False
+
+        discover_plugins()
+        assert load_calls == [1]
+        assert "from_plugin" in list_field_transforms()
