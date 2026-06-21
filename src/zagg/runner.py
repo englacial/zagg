@@ -683,6 +683,10 @@ def _invoke_lambda_cell(
     is generic and lives in ``dispatch``. ``max_workers`` is forwarded only
     so the FD-exhaustion message can recommend a usable ulimit cap (#28).
     """
+    # ``wall_start`` is taken before event construction so the per-cell
+    # wall_time includes the spatial event-build cost — matching the
+    # pre-extraction _invoke_lambda_cell behavior byte-for-byte.
+    wall_start = time.time()
     event = {
         "chunk_idx": chunk_idx,
         "shard_key": shard_key,
@@ -707,6 +711,7 @@ def _invoke_lambda_cell(
     result = invoke_with_retry(
         lambda_client, function_name, event,
         max_retries=max_retries, max_workers=max_workers,
+        wall_start=wall_start,
     )
     # Layer the spatial-specific fields on top of the generic dispatch result.
     return {

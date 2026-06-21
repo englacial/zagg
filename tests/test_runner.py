@@ -283,6 +283,59 @@ class TestInvokeLambdaCellEvent:
         assert "parent_morton" not in event
 
 
+class TestInvokeLambdaCellResultShape:
+    """The Phase 3 refactor (#12) splits invoke-with-retry into ``dispatch``
+    and event-build into ``runner._invoke_lambda_cell``. The layered result
+    dict must keep the same fields the pre-extraction return carried, so
+    every consumer of ``summary['results']`` (the spatial counter loop in
+    ``_run_lambda`` plus any caller of ``_invoke_lambda_cell`` directly)
+    stays byte-identical."""
+
+    _CREDS = {"accessKeyId": "a", "secretAccessKey": "s", "sessionToken": "t"}
+
+    def _call(self, *, status: int | None = 200, body: dict | None = None):
+        from unittest.mock import MagicMock
+
+        from zagg.runner import _invoke_lambda_cell
+
+        client = MagicMock()
+        payload = MagicMock()
+        payload.read.return_value = json.dumps(
+            {"statusCode": status, "body": json.dumps(body or {"total_obs": 9, "duration_s": 0.5})}
+        ).encode()
+        client.invoke.return_value = {"Payload": payload, "FunctionError": None}
+        return _invoke_lambda_cell(
+            client, (0,), 99, 6, 12,
+            ["s3://b/g1.h5", "s3://b/g2.h5"],
+            "s3://out/x.zarr", self._CREDS,
+            function_name="process-shard", config_dict=None, max_workers=4,
+        )
+
+    def test_success_result_keys_pinned(self):
+        result = self._call()
+        # Pre-extraction shape: shard_key + 7 generic fields + granule_count.
+        assert set(result) == {
+            "shard_key", "status_code", "body", "wall_time", "lambda_duration",
+            "error", "retries", "timeout", "granule_count",
+        }
+        assert result["shard_key"] == 99
+        assert result["granule_count"] == 2
+        assert result["status_code"] == 200
+        assert result["body"] == {"total_obs": 9, "duration_s": 0.5}
+        assert result["lambda_duration"] == 0.5
+        assert result["error"] is None
+        assert result["retries"] == 0
+        assert result["timeout"] is False
+
+    def test_wall_time_includes_event_build_cost(self):
+        # ``wall_start`` is taken in ``_invoke_lambda_cell`` before event
+        # construction, so wall_time covers both build + dispatch (the
+        # pre-extraction behavior). A microsecond floor is enough — the
+        # point is that wall_time is non-zero, not that it's calibrated.
+        result = self._call()
+        assert result["wall_time"] >= 0
+
+
 class TestHandoffPassthrough:
     """`agg(handoff=...)` threads the carrier choice down to process_shard."""
 

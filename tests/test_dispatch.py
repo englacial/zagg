@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import errno
 import json
+import time
 from unittest.mock import MagicMock
 
 import pytest
@@ -106,10 +107,37 @@ class TestInvokeWithRetry:
         )
         result = invoke_with_retry(client, "fn", self._event(), max_retries=2)
         assert client.invoke.call_count == 2
+        # Failure schema pinned end-to-end: every field the pre-extraction
+        # ``_invoke_lambda_cell`` failure return carried (minus the
+        # spatial-only ``shard_key`` / ``granule_count``). ``timeout`` is
+        # deliberately absent — see the byte-compat note in dispatch.py.
+        assert set(result) == {
+            "status_code",
+            "body",
+            "wall_time",
+            "lambda_duration",
+            "error",
+            "retries",
+        }
         assert result["status_code"] is None
         assert result["body"] == {}
         assert result["retries"] == 2
+        assert result["lambda_duration"] == 0
         assert "never works" in result["error"]
+        assert isinstance(result["wall_time"], float)
+
+    def test_wall_start_passthrough_includes_pre_call_cost(self):
+        # When the caller times event construction, ``wall_start`` is taken
+        # before the call and reaches the result unchanged. The
+        # pre-extraction _invoke_lambda_cell relied on this.
+        client = MagicMock()
+        client.invoke.return_value = _ok_response()
+        # Anchor wall_start in the distant past; the returned wall_time
+        # should reflect that.
+        result = invoke_with_retry(
+            client, "fn", self._event(), wall_start=time.time() - 100.0
+        )
+        assert result["wall_time"] >= 100.0
 
     def test_emfile_is_reraised_with_ulimit_guidance(self):
         client = MagicMock()

@@ -71,6 +71,7 @@ def invoke_with_retry(
     *,
     max_retries: int = _DEFAULT_MAX_RETRIES,
     max_workers: int | None = None,
+    wall_start: float | None = None,
 ) -> dict:
     """Synchronously invoke ``function_name`` with ``event`` and retry on failure.
 
@@ -84,7 +85,9 @@ def invoke_with_retry(
             "error": str | None,
             "retries": int,          # 0-based attempt count of the *successful* try,
                                      # or ``max_retries`` if every attempt failed
-            "timeout": bool,         # last-attempt timeout flag
+            "timeout": bool,         # last-attempt timeout flag (success path only;
+                                     # the all-attempts-exhausted path omits it for
+                                     # byte-compat with the pre-extraction result)
         }
 
     The caller layers on any domain-specific fields (e.g. ``shard_key``,
@@ -108,8 +111,15 @@ def invoke_with_retry(
     max_workers
         Forwarded to ``raise_for_fd_exhaustion`` so the ulimit guidance can
         recommend a usable cap. Not otherwise consulted.
+    wall_start
+        Wall-clock start (``time.time()``-style) used to compute
+        ``wall_time``. Passed by callers that want event-build cost included
+        in the per-cell wall-time (the pre-extraction ``_invoke_lambda_cell``
+        started the clock before building the event); defaults to *now* when
+        the caller doesn't supply it.
     """
-    wall_start = time.time()
+    if wall_start is None:
+        wall_start = time.time()
     last_error: str | None = None
     is_timeout = False
 
@@ -124,6 +134,11 @@ def invoke_with_retry(
             function_error = response.get("FunctionError")
             is_timeout = False
             if function_error:
+                # ``response["Payload"]`` is a single-read stream; the
+                # FunctionError branch consumes it here, and the success
+                # branch below reads it instead. Mutually exclusive — the
+                # ``if not function_error`` guard on the success read
+                # enforces that.
                 error_payload = response["Payload"].read().decode("utf-8")
                 if "Task timed out" in error_payload:
                     is_timeout = True
@@ -159,6 +174,11 @@ def invoke_with_retry(
             else:
                 break
 
+    # All attempts exhausted. The pre-extraction failure return did NOT
+    # include ``timeout`` (only the success-path return did), so omitting it
+    # here keeps ``summary["results"]`` byte-identical against the previous
+    # spatial path. Callers that need the flag in every result should
+    # ``result.get("timeout", False)``.
     return {
         "status_code": None,
         "body": {},
@@ -166,7 +186,6 @@ def invoke_with_retry(
         "lambda_duration": 0,
         "error": last_error,
         "retries": max_retries,
-        "timeout": is_timeout,
     }
 
 
