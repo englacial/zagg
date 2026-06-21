@@ -23,7 +23,6 @@ from zarr import consolidate_metadata
 from zagg.auth import get_edl_token, get_nsidc_s3_credentials
 from zagg.concurrency import (
     ConcurrencyReport,
-    compute_available_workers,
     raise_for_fd_exhaustion,
 )
 from zagg.config import (
@@ -35,6 +34,11 @@ from zagg.config import (
     get_output_region,
     get_parent_order,
     get_store_path,
+)
+from zagg.dispatch import (
+    estimate_cost,
+    invoke_with_retry,
+    preflight_concurrency_probe,
 )
 from zagg.processing import process_shard, write_dataframe_to_zarr
 from zagg.store import open_store
@@ -400,7 +404,6 @@ def _run_lambda(config, catalog_data, store_path, child_order, *,
     from dataclasses import asdict
 
     import boto3
-    from botocore.config import Config
 
     all_shards = list(catalog_data["shard_keys"])
     grid_type = config.output.get("grid", {}).get("type", "healpix")
@@ -438,31 +441,13 @@ def _run_lambda(config, catalog_data, store_path, child_order, *,
         output_credentials, output_endpoint_url, region,
     )
 
-    # Pre-flight concurrency probe: clamp workers to what local file
-    # descriptors and account-wide Lambda concurrency can sustain, so we don't
-    # silently drop cells (FD exhaustion) or saturate the account pool (#28).
-    # Probe with a lightweight session; the dispatch client is sized to the
-    # clamped count below.
+    # Pre-flight concurrency probe + dispatch-client setup (dispatch.py owns
+    # the probe + sized client construction so future backends reuse it).
     session = boto3.Session()
-    probe_lambda = session.client("lambda", region_name=region)
-    cloudwatch_client = session.client("cloudwatch", region_name=region)
-    max_workers, concurrency_report = compute_available_workers(
-        max_workers, probe_lambda, cloudwatch_client, function_name,
+    lambda_client, max_workers, concurrency_report = preflight_concurrency_probe(
+        session, function_name, region=region, max_workers=max_workers,
     )
     _log_concurrency_report(concurrency_report, max_workers)
-
-    # Configure boto3 client (created early so we can use it for setup/finalize).
-    # max_pool_connections is sized to the clamped worker count so connections
-    # cannot outrun the file-descriptor budget.
-    boto_config = Config(
-        read_timeout=900,
-        connect_timeout=10,
-        retries={"max_attempts": 0},
-        max_pool_connections=max_workers,
-    )
-    lambda_client = session.client(
-        "lambda", region_name=region, config=boto_config,
-    )
 
     # Create template via Lambda. The template write happens inside the
     # function so the orchestrator only needs lambda:InvokeFunction; no
@@ -531,11 +516,7 @@ def _run_lambda(config, catalog_data, store_path, child_order, *,
                             output_creds_event=output_creds_event)
     wall_time = time.time() - start_time
 
-    # Cost estimate: arm64 pricing = $0.0000133334/GB-second
-    memory_gb = 2.0  # Lambda memory in GB
-    gb_seconds = total_lambda_time * memory_gb
-    price_per_gb_sec = 0.0000133334
-    estimated_cost = gb_seconds * price_per_gb_sec
+    cost = estimate_cost(total_lambda_time, memory_gb=2.0, arch="arm64")
 
     summary = {
         "total_cells": len(cells),
@@ -544,16 +525,17 @@ def _run_lambda(config, catalog_data, store_path, child_order, *,
         "total_obs": total_obs,
         "wall_time_s": wall_time,
         "lambda_time_s": total_lambda_time,
-        "gb_seconds": gb_seconds,
-        "price_per_gb_sec": price_per_gb_sec,
-        "estimated_cost_usd": estimated_cost,
+        **cost,
         "store_path": store_path,
         "backend": "lambda",
         "function_name": function_name,
         "results": results,
     }
     logger.info(f"Done: {cells_with_data} cells, {total_obs:,} obs, {cells_error} errors, {wall_time:.1f}s")
-    logger.info(f"Lambda compute: {total_lambda_time:.0f}s total, {gb_seconds:.0f} GB-s, ~${estimated_cost:.2f}")
+    logger.info(
+        f"Lambda compute: {total_lambda_time:.0f}s total, "
+        f"{cost['gb_seconds']:.0f} GB-s, ~${cost['estimated_cost_usd']:.2f}"
+    )
     return summary
 
 
@@ -693,13 +675,14 @@ def _invoke_lambda_cell(
     function_name, config_dict, output_creds_event=None, max_retries=3,
     max_workers=None,
 ):
-    """Invoke Lambda for a single cell with retry logic.
+    """Build a per-cell Lambda event and dispatch it through
+    :func:`zagg.dispatch.invoke_with_retry`.
 
-    ``max_workers`` is used only for the file-descriptor-exhaustion message
-    (#28); it does not affect dispatch.
+    The event payload is spatial-specific (chunk_idx, shard_key,
+    granule_urls, S3 read creds); the retry / timeout / FD-exhaustion logic
+    is generic and lives in ``dispatch``. ``max_workers`` is forwarded only
+    so the FD-exhaustion message can recommend a usable ulimit cap (#28).
     """
-    wall_start = time.time()
-
     event = {
         "chunk_idx": chunk_idx,
         "shard_key": shard_key,
@@ -721,68 +704,13 @@ def _invoke_lambda_cell(
     if output_creds_event is not None:
         event["output_credentials"] = output_creds_event
 
-    last_error = None
-    for attempt in range(max_retries):
-        try:
-            # Note: LogType="Tail" is omitted because it requires CloudWatch
-            # log access in the function's account, which is not granted to
-            # cross-account callers. The tail data was unused anyway.
-            response = lambda_client.invoke(
-                FunctionName=function_name,
-                InvocationType="RequestResponse",
-                Payload=json.dumps(event),
-            )
-
-            function_error = response.get("FunctionError")
-            is_timeout = False
-            if function_error:
-                error_payload = response["Payload"].read().decode("utf-8")
-                if "Task timed out" in error_payload:
-                    is_timeout = True
-                    last_error = f"Lambda timeout: {error_payload[:100]}"
-                else:
-                    last_error = f"Lambda error ({function_error}): {error_payload[:100]}"
-                if not is_timeout:
-                    continue
-
-            result = json.loads(response["Payload"].read()) if not function_error else {}
-            try:
-                body = json.loads(result.get("body", "{}"))
-            except (json.JSONDecodeError, TypeError):
-                body = {}
-
-            return {
-                "shard_key": shard_key,
-                "status_code": result.get("statusCode"),
-                "body": body,
-                "wall_time": time.time() - wall_start,
-                "lambda_duration": body.get("duration_s", 0),
-                "error": last_error if function_error else body.get("error"),
-                "retries": attempt,
-                "timeout": is_timeout,
-                "granule_count": len(granule_urls),
-            }
-        except Exception as e:
-            # Client-side FD exhaustion is run-fatal (every subsequent cell
-            # will hit it too) and was previously swallowed into a
-            # status_code=None result -- a silent dropped cell. Surface it
-            # loudly with ulimit guidance instead (#28).
-            raise_for_fd_exhaustion(e, max_workers)
-            last_error = str(e)
-            retryable = ["TooManyRequestsException", "Rate exceeded",
-                         "Read timeout", "timed out", "UNEXPECTED_EOF"]
-            if any(x in last_error for x in retryable):
-                time.sleep((2 ** attempt) + (time.time() % 1))
-            else:
-                break
-
+    result = invoke_with_retry(
+        lambda_client, function_name, event,
+        max_retries=max_retries, max_workers=max_workers,
+    )
+    # Layer the spatial-specific fields on top of the generic dispatch result.
     return {
         "shard_key": shard_key,
-        "status_code": None,
-        "body": {},
-        "wall_time": time.time() - wall_start,
-        "lambda_duration": 0,
-        "error": last_error,
-        "retries": max_retries,
+        **result,
         "granule_count": len(granule_urls),
     }

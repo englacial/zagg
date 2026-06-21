@@ -78,11 +78,17 @@ def _report(available):
 
 class TestProbeClampsWorkers:
     def test_pool_sized_to_clamped_workers(self, lambda_env, monkeypatch):
-        # Probe clamps requested 1700 down to 64.
+        # Probe clamps requested 1700 down to 64. After Phase 3 the probe
+        # runs inside ``dispatch.preflight_concurrency_probe``; the runner
+        # imports it as a bound name, so we patch the runner-side alias.
         monkeypatch.setattr(
             runner,
-            "compute_available_workers",
-            lambda requested, *a, **k: (64, _report(64)),
+            "preflight_concurrency_probe",
+            lambda session, function_name, *, region, max_workers: (
+                MagicMock(),
+                64,
+                _report(64),
+            ),
         )
         monkeypatch.setattr(
             runner,
@@ -116,8 +122,12 @@ class TestFdExhaustionSurfaces:
     def test_errno_24_in_future_reraised_with_guidance(self, lambda_env, monkeypatch):
         monkeypatch.setattr(
             runner,
-            "compute_available_workers",
-            lambda requested, *a, **k: (100, _report(100)),
+            "preflight_concurrency_probe",
+            lambda session, function_name, *, region, max_workers: (
+                MagicMock(),
+                100,
+                _report(100),
+            ),
         )
 
         def _boom(*a, **k):
