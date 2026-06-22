@@ -27,11 +27,15 @@ from zagg.grids import HealpixGrid, RectilinearGrid
 def _item(gid, lon0, lon1, lat0=38.85, lat1=38.93):
     ring = [[lon0, lat0], [lon1, lat0], [lon1, lat1], [lon0, lat1], [lon0, lat0]]
     return {
-        "type": "Feature", "stac_version": "1.0.0", "id": gid,
+        "type": "Feature",
+        "stac_version": "1.0.0",
+        "id": gid,
         "geometry": {"type": "Polygon", "coordinates": [ring]},
         "bbox": [lon0, lat0, lon1, lat1],
         "properties": {"datetime": "2025-06-01T00:00:00Z"},
-        "collection": "TEST", "stac_extensions": [], "links": [],
+        "collection": "TEST",
+        "stac_extensions": [],
+        "links": [],
         "assets": {
             "data": {"href": f"https://h/{gid}.h5", "roles": ["data"]},
             "data_s3": {"href": f"s3://b/{gid}.h5", "roles": ["data"]},
@@ -49,7 +53,10 @@ def _catalog(items):
 @pytest.fixture
 def grid():
     return RectilinearGrid(
-        "EPSG:32618", 10, [359400, 4300740, 369400, 4310740], [250, 250],
+        "EPSG:32618",
+        10,
+        [359400, 4300740, 369400, 4310740],
+        [250, 250],
         config=default_config("atl06_polar"),
     )
 
@@ -57,11 +64,13 @@ def grid():
 @pytest.fixture
 def catalog():
     # West-half, east-half, and a small NE granule over SERC.
-    return _catalog([
-        _item("Gwest", -76.62, -76.57),
-        _item("Geast", -76.55, -76.50),
-        _item("GneSmall", -76.55, -76.52, 38.91, 38.93),
-    ])
+    return _catalog(
+        [
+            _item("Gwest", -76.62, -76.57),
+            _item("Geast", -76.55, -76.50),
+            _item("GneSmall", -76.55, -76.52, 38.91, 38.93),
+        ]
+    )
 
 
 def _granule_shards(sm):
@@ -81,14 +90,19 @@ def _granule_shards(sm):
 # the real ``_intersect_spherely`` brute branch run end-to-end. It deliberately
 # omits ``SpatialIndex`` to force ``hasattr(spherely, "SpatialIndex")`` False.
 
+
 class _FakePoly:
     def __init__(self, lons, lats):
         self.x0, self.x1 = float(min(lons)), float(max(lons))
         self.y0, self.y1 = float(min(lats)), float(max(lats))
 
     def _overlaps(self, other):
-        return (self.x0 <= other.x1 and other.x0 <= self.x1
-                and self.y0 <= other.y1 and other.y0 <= self.y1)
+        return (
+            self.x0 <= other.x1
+            and other.x0 <= self.x1
+            and self.y0 <= other.y1
+            and other.y0 <= self.y1
+        )
 
 
 def _fake_create_polygon(*, shell, oriented):  # noqa: ARG001 (mirror real sig)
@@ -147,6 +161,7 @@ class TestBuildSpherelyBrute:
     def test_brute_empty_records_early_out(self, grid, fake_spherely):
         # No records -> no polygons -> {} early-out, no intersect call (#36 brute path).
         from zagg.catalog.shardmap import _intersect_spherely
+
         assert _intersect_spherely([], grid, {}) == {}
 
 
@@ -178,8 +193,9 @@ def _has_spatial_index():
         return False
 
 
-@pytest.mark.skipif(not _has_spatial_index(),
-                    reason="spherely SpatialIndex (fork build) not installed")
+@pytest.mark.skipif(
+    not _has_spatial_index(), reason="spherely SpatialIndex (fork build) not installed"
+)
 class TestBuildSpherely:
     def test_spatial_split(self, catalog, grid):
         # Exact S2 with SpatialIndex gives the expected local split.
@@ -219,10 +235,11 @@ class TestResolveBackend:
     def test_cli_rejects_shapely_backend(self, monkeypatch):
         # shapely was dropped as a backend (#36); the CLI must not accept it.
         from zagg.catalog import main
+
         monkeypatch.setattr(
-            sys, "argv",
-            ["zagg-catalog", "--config", "x.yaml", "--short-name", "ATL03",
-             "--backend", "shapely"],
+            sys,
+            "argv",
+            ["zagg-catalog", "--config", "x.yaml", "--short-name", "ATL03", "--backend", "shapely"],
         )
         with pytest.raises(SystemExit):
             main()
@@ -244,3 +261,25 @@ class TestIO:
             path = f.name
         with pytest.raises(ValueError, match="missing required key"):
             ShardMap.from_json(path)
+
+    def test_high_base_cell_morton_keys_roundtrip(self):
+        """Parent-morton shard keys from southern (base 7-11) cells are large
+        unsigned words; JSON (de)serialization preserves them exactly (#71).
+
+        These are the keys that, as a signed int64, would read back negative —
+        here we assert the manifest carries the unsigned value byte-for-byte.
+        """
+        from mortie import clip2order, geo2mort
+
+        # Southern points → high base cells whose packed parent word sets bit 63.
+        pts = [(-78.5, -132.0), (-72.1, 25.4), (-65.0, -45.0)]
+        keys = sorted(
+            int(clip2order(6, geo2mort(np.array([lat]), np.array([lon]), order=18))[0])
+            for lat, lon in pts
+        )
+        assert any(k > 2**63 for k in keys)  # at least one bit-63-set key
+        sm = ShardMap({"type": "healpix"}, keys, [[] for _ in keys], {})
+        with tempfile.NamedTemporaryFile(suffix=".json", delete=False) as f:
+            sm.to_json(f.name)
+            sm2 = ShardMap.from_json(f.name)
+        assert sm2.shard_keys == keys

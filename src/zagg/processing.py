@@ -25,6 +25,7 @@ from zagg.config import (
     get_data_vars,
     get_output_signature,
 )
+from zagg.grids.morton import is_morton_array, morton_words
 from zagg.read_plan import execute_read_plan, plan_read
 from zagg.schema import ProcessingMetadata
 
@@ -323,7 +324,13 @@ def _iter_carrier_columns(carrier):
     """
     if isinstance(carrier, pd.DataFrame):
         for name, series in carrier.items():
-            yield name, series.values
+            values = series.values
+            # The ``morton`` coordinate is carried as a mortie ``MortonIndexArray``
+            # (#71); Zarr stores numpy dtypes, so extract its packed ``uint64``
+            # words for the on-disk write (no .reshape on the extension array).
+            if is_morton_array(values):
+                values = morton_words(values)
+            yield name, values
         return
 
     import pyarrow as pa
@@ -876,9 +883,7 @@ def _planned_read_group(
     si_lvl = levels[spatial_index_level]
     link = si_lvl.get("link")
     if not isinstance(link, dict):
-        raise ValueError(
-            f"read_plan.spatial_index level {spatial_index_level!r} requires a 'link'"
-        )
+        raise ValueError(f"read_plan.spatial_index level {spatial_index_level!r} requires a 'link'")
     if link["to"] != base_level_key:
         raise ValueError(
             f"read_plan.spatial_index level {spatial_index_level!r} must link "
@@ -962,9 +967,7 @@ def _planned_read_group(
     coarse_structured = [
         f
         for f in filters
-        if "expression" not in f
-        and f.get("level") is not None
-        and f.get("level") != base_level_key
+        if "expression" not in f and f.get("level") is not None and f.get("level") != base_level_key
     ]
     expressions = [f for f in filters if "expression" in f]
 
@@ -1008,9 +1011,7 @@ def _planned_read_group(
     if coarse_structured:
         # Build the global base-index array once: which original-base positions
         # are present in the concatenated planned read.
-        global_idx = np.concatenate(
-            [np.arange(s, e, dtype=np.int64) for s, e in plan.base_slices]
-        )
+        global_idx = np.concatenate([np.arange(s, e, dtype=np.int64) for s, e in plan.base_slices])
         cross_full: np.ndarray | None = None
         for f in coarse_structured:
             level_key = f["level"]
@@ -1043,7 +1044,9 @@ def _planned_read_group(
         if keep_mask is not None:
             values = values[keep_mask]
         data_dict[col_name] = values
-    data_dict["leaf_id"] = leaf_after_spatial[keep_mask] if keep_mask is not None else leaf_after_spatial
+    data_dict["leaf_id"] = (
+        leaf_after_spatial[keep_mask] if keep_mask is not None else leaf_after_spatial
+    )
 
     # Base-level expression filters (aggregation-time escape hatch, no pushdown).
     for f in expressions:
@@ -1108,13 +1111,10 @@ def _read_group(h5obj, group: str, data_source: dict, shard_key: int, grid, arro
     if isinstance(rp, dict) and rp.get("spatial_index"):
         if not isinstance(levels, dict) or not levels:
             raise ValueError(
-                "data_source.read_plan.spatial_index requires a non-empty "
-                "'levels' mapping"
+                "data_source.read_plan.spatial_index requires a non-empty 'levels' mapping"
             )
         if not base_level:
-            raise ValueError(
-                "data_source.read_plan.spatial_index requires 'base_level'"
-            )
+            raise ValueError("data_source.read_plan.spatial_index requires 'base_level'")
         return _planned_read_group(h5obj, group, data_source, shard_key, grid, arrow=arrow)
     return _read_group_full(h5obj, group, data_source, shard_key, grid, arrow=arrow)
 

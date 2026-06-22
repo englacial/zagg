@@ -5,7 +5,7 @@ import pytest
 from zarr import open_group
 from zarr.storage import MemoryStore
 
-from zagg.config import default_config
+from zagg.config import default_config, get_data_vars
 from zagg.grids import HEALPIX_BASE_CELLS, HealpixGrid, InconsistentShardError, from_config
 
 
@@ -107,9 +107,7 @@ class TestBlockIndex:
 
     def test_dense_uses_position_map(self):
         shards = _valid_parents(3)
-        g = HealpixGrid(
-            parent_order=6, child_order=8, layout="dense", populated_shards=shards
-        )
+        g = HealpixGrid(parent_order=6, child_order=8, layout="dense", populated_shards=shards)
         for i, s in enumerate(shards):
             assert g.block_index(s) == (i,)
 
@@ -123,7 +121,9 @@ class TestBlockIndex:
         shards = _valid_parents(3)
         shards_reordered = [shards[2], shards[0], shards[1]]
         g = HealpixGrid(
-            parent_order=6, child_order=8, layout="dense",
+            parent_order=6,
+            child_order=8,
+            layout="dense",
             populated_shards=shards_reordered,
         )
         assert g.block_index(shards_reordered[0]) == (0,)
@@ -136,8 +136,11 @@ class TestEmitTemplate:
         n_shards = 3
         shards = list(range(n_shards))
         g = HealpixGrid(
-            parent_order=6, child_order=8, layout="dense",
-            config=cfg, populated_shards=shards,
+            parent_order=6,
+            child_order=8,
+            layout="dense",
+            config=cfg,
+            populated_shards=shards,
         )
         store = MemoryStore()
         g.emit_template(store)
@@ -147,9 +150,7 @@ class TestEmitTemplate:
             assert group[name].shape == expected
 
     def test_fullsphere_shape(self, cfg):
-        g = HealpixGrid(
-            parent_order=6, child_order=8, layout="fullsphere", config=cfg
-        )
+        g = HealpixGrid(parent_order=6, child_order=8, layout="fullsphere", config=cfg)
         store = MemoryStore()
         g.emit_template(store)
         group = open_group(store, path="8", mode="r")
@@ -161,7 +162,10 @@ class TestEmitTemplate:
         """Chunk-alignment invariant: chunks == 4^(child - parent)."""
         for layout in ("dense", "fullsphere"):
             g = HealpixGrid(
-                parent_order=6, child_order=8, layout=layout, config=cfg,
+                parent_order=6,
+                child_order=8,
+                layout=layout,
+                config=cfg,
                 populated_shards=[1, 2, 3] if layout == "dense" else None,
             )
             store = MemoryStore()
@@ -169,9 +173,7 @@ class TestEmitTemplate:
             group = open_group(store, path="8", mode="r")
             expected_chunks = (4 ** (8 - 6),)
             for name in group:
-                assert group[name].chunks == expected_chunks, (
-                    f"layout={layout} var={name}"
-                )
+                assert group[name].chunks == expected_chunks, f"layout={layout} var={name}"
 
 
 class TestRoundTrip:
@@ -181,7 +183,9 @@ class TestRoundTrip:
 
         g = HealpixGrid(parent_order=6, child_order=12, config=cfg)
         lat, lon = -78.5, -132.0
-        expected_parent = int(clip2order(6, geo2mort(np.array([lat]), np.array([lon]), order=18))[0])
+        expected_parent = int(
+            clip2order(6, geo2mort(np.array([lat]), np.array([lon]), order=18))[0]
+        )
         leaves = g.assign(np.array([lat]), np.array([lon]))
         assert g.shard_of(leaves) == expected_parent
 
@@ -240,9 +244,7 @@ class TestBackcompatWrapper:
         from zagg.schema import xdggs_zarr_template
 
         store = MemoryStore()
-        xdggs_zarr_template(
-            store, parent_order=6, child_order=8, n_parent_cells=3, config=cfg
-        )
+        xdggs_zarr_template(store, parent_order=6, child_order=8, n_parent_cells=3, config=cfg)
         group = open_group(store, path="8", mode="r")
         assert group["count"].shape == (4 ** (8 - 6) * 3,)
 
@@ -266,9 +268,7 @@ def _vector_config(bins=4, dtype="int64"):
             },
         },
     }
-    return PipelineConfig(
-        data_source=base.data_source, aggregation=agg, output=base.output
-    )
+    return PipelineConfig(data_source=base.data_source, aggregation=agg, output=base.output)
 
 
 class TestOutputFieldSignature:
@@ -286,9 +286,7 @@ class TestOutputFieldSignature:
             assert set(f) == {"name", "kind", "trailing_shape", "inner_shape", "dtype"}
 
     def test_signature_marks_vector_field(self):
-        g = HealpixGrid(
-            parent_order=6, child_order=8, layout="fullsphere", config=_vector_config()
-        )
+        g = HealpixGrid(parent_order=6, child_order=8, layout="fullsphere", config=_vector_config())
         by_name = {f["name"]: f for f in g.signature()["output_fields"]}
         assert by_name["hist"]["kind"] == "vector"
         assert by_name["hist"]["trailing_shape"] == [4]
@@ -298,9 +296,7 @@ class TestOutputFieldSignature:
     def test_signature_is_json_serializable(self):
         import json
 
-        g = HealpixGrid(
-            parent_order=6, child_order=8, layout="fullsphere", config=_vector_config()
-        )
+        g = HealpixGrid(parent_order=6, child_order=8, layout="fullsphere", config=_vector_config())
         fields = g.signature()["output_fields"]
         # Round-trips through JSON unchanged (recorded in a ShardMap as JSON).
         assert json.loads(json.dumps(fields)) == fields
@@ -311,9 +307,7 @@ class TestOutputFieldSignature:
         assert a.nests_with(b) and b.nests_with(a)
 
     def test_nests_with_differing_field_kind_rejected(self, cfg):
-        scalar = HealpixGrid(
-            parent_order=6, child_order=8, layout="fullsphere", config=cfg
-        )
+        scalar = HealpixGrid(parent_order=6, child_order=8, layout="fullsphere", config=cfg)
         vector = HealpixGrid(
             parent_order=6, child_order=8, layout="fullsphere", config=_vector_config()
         )
@@ -381,3 +375,82 @@ class TestVectorTemplate:
         assert grp["count"].shape == (g.height, g.width)
         assert grp["hist"].shape == (g.height, g.width, 4)
         assert grp["hist"].chunks == (64, 64, 4)  # trailing dim whole
+
+
+class TestMortonCoordinate:
+    """The ``morton`` coordinate is a mortie ``MortonIndexArray`` stored as
+    ``uint64`` on disk (#71); ``cell_ids`` stays NESTED ``uint64`` (DGGS)."""
+
+    def test_chunk_coords_morton_is_extension_array(self, cfg):
+        from mortie import MortonIndexArray
+
+        g = HealpixGrid(parent_order=6, child_order=8, layout="fullsphere", config=cfg)
+        parent = _valid_parents(1)[0]
+        coords = g.chunk_coords(parent)
+        assert isinstance(coords["morton"], MortonIndexArray)
+        # cell_ids stays a plain NESTED integer array, unchanged.
+        assert not isinstance(coords["cell_ids"], MortonIndexArray)
+
+    def test_morton_words_match_generate_children(self, cfg):
+        """The typed coordinate carries the same packed words generate_morton_children
+        returns — the type is a skin, not a re-encoding."""
+        from mortie import generate_morton_children
+
+        from zagg.grids.morton import morton_words
+
+        g = HealpixGrid(parent_order=6, child_order=8, layout="fullsphere", config=cfg)
+        parent = _valid_parents(1)[0]
+        children = generate_morton_children(int(parent), 8)
+        coords = g.chunk_coords(parent)
+        np.testing.assert_array_equal(morton_words(coords["morton"]), children)
+
+    def test_geo2mort_clip2order_coord_roundtrip(self, cfg):
+        """geo2mort → clip2order → coord → reload reconstructs the same words and
+        is non-negative for southern (base 7-11) cells where int64 went negative."""
+        from mortie import clip2order, geo2mort
+
+        from zagg.grids.morton import morton_words, to_morton_array
+
+        # A southern point lands in a high base cell whose packed word sets bit 63.
+        leaf = geo2mort(np.array([-78.5]), np.array([-132.0]), order=18)
+        cells = clip2order(8, leaf)
+        coord = to_morton_array(cells)
+        words = morton_words(coord)
+        np.testing.assert_array_equal(words, np.asarray(cells, dtype=np.uint64))
+        assert words.dtype == np.uint64
+        # Round-trips losslessly back through the uint64 storage form.
+        np.testing.assert_array_equal(morton_words(to_morton_array(words)), words)
+
+    def test_morton_stored_uint64_roundtrips_through_zarr(self, cfg):
+        """Write a fullsphere chunk and read morton back as the same non-negative
+        uint64 words — the int64 sign hazard is gone (#71)."""
+        import pandas as pd
+
+        from zagg.grids.morton import morton_words, to_morton_array
+        from zagg.processing import write_dataframe_to_zarr
+
+        parent_order, child_order = 6, 8
+        g = HealpixGrid(parent_order, child_order, layout="fullsphere", config=cfg)
+        store = MemoryStore()
+        g.emit_template(store)
+
+        parent = _valid_parents(1)[0]
+        coords = g.chunk_coords(parent)
+        n = len(coords["cell_ids"])
+        df = pd.DataFrame({"cell_ids": coords["cell_ids"]})
+        df["morton"] = coords["morton"]
+        for var in get_data_vars(cfg):
+            df[var] = np.zeros(n, dtype=np.int32 if var == "count" else np.float32)
+
+        write_dataframe_to_zarr(df, store, grid=g, chunk_idx=g.block_index(parent))
+
+        grp = open_group(store, path=str(child_order), mode="r")
+        assert grp["morton"].dtype == np.uint64
+        lo = int(np.asarray(coords["cell_ids"]).min())
+        hi = int(np.asarray(coords["cell_ids"]).max())
+        stored = grp["morton"][lo : hi + 1]
+        expected = morton_words(coords["morton"])
+        np.testing.assert_array_equal(stored, expected)
+        assert (stored >= 0).all()
+        # Reconstructs to the same MortonIndexArray on read.
+        np.testing.assert_array_equal(morton_words(to_morton_array(stored)), expected)
