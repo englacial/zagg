@@ -58,10 +58,10 @@ def _walk_coords(coords, lons, lats):
 def _leaflet_crs(projection: dict):
     """A proj4leaflet ``ipyleaflet.projections`` CRS dict from a projection def.
 
-    ipyleaflet's ``Map.crs`` accepts a dict matching proj4leaflet's
-    ``L.Proj.CRS`` signature (``name`` + ``proj4def`` + an ``options`` block with
-    ``origin``/``bounds``/``resolutions``). :mod:`zagg.viz.crs` carries those
-    values per polar EPSG so they line up with the GIBS tile matrix set.
+    ipyleaflet's ``Map.crs`` accepts a flat dict (``name``, ``custom``,
+    ``proj4def``, ``origin``, ``bounds``, ``resolutions``) -- the same shape as
+    its bundled ``projections.EPSG3413["NASAGIBS"]``. :mod:`zagg.viz.crs` carries
+    those values per polar EPSG so they line up with the GIBS tile matrix set.
     """
     return {
         "name": projection["name"],
