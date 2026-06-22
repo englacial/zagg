@@ -438,3 +438,50 @@ class TestSummaryKeysByteIdentical:
         assert summary["gb_seconds"] == 16.0
         assert summary["price_per_gb_sec"] == 0.0000133334
         assert summary["estimated_cost_usd"] == 16.0 * 0.0000133334
+
+    def test_lambda_cost_byte_identical_with_mixed_durations(self, monkeypatch, atl06_config):
+        """estimated_cost_usd must equal the pre-refactor arithmetic order:
+        ``(sum(durations) * 2.0) * price`` computed once -- not a sum of
+        per-cell ``cost_usd`` (which would diverge in the last FP ULP). Uses
+        heterogeneous per-cell durations so the two orders actually differ.
+        """
+        import boto3
+
+        import zagg.grids as grids_mod
+        from zagg import runner
+        from zagg.concurrency import ConcurrencyReport
+
+        durations = iter([0.1, 0.2, 0.3, 12.7])
+
+        monkeypatch.setattr(runner, "get_nsidc_s3_credentials",
+                            lambda: {"accessKeyId": "a", "secretAccessKey": "s",
+                                     "sessionToken": "t"})
+        monkeypatch.setattr(grids_mod, "from_config", lambda *a, **k: _stub_grid())
+        monkeypatch.setattr(runner, "_invoke_lambda_setup", lambda *a, **k: None)
+        monkeypatch.setattr(runner, "_invoke_lambda_finalize", lambda *a, **k: None)
+        from unittest.mock import MagicMock
+        monkeypatch.setattr(boto3, "Session", lambda *a, **k: MagicMock())
+        monkeypatch.setattr(
+            runner, "compute_available_workers",
+            lambda requested, *a, **k: (
+                1,  # 1 worker -> deterministic completion order for the iter()
+                ConcurrencyReport(account_limit=1000, current_concurrent=0,
+                                  padding=100, available=900, function_reserved=None),
+            ),
+        )
+        monkeypatch.setattr(
+            runner, "_invoke_lambda_cell",
+            lambda *a, **k: {"status_code": 200, "body": {"total_obs": 1},
+                             "error": None, "lambda_duration": next(durations),
+                             "shard_key": 0},
+        )
+
+        summary = runner._run_lambda(
+            atl06_config, _run_catalog(), "s3://out/x.zarr", 12,
+            max_cells=None, morton_cell=None, max_workers=1700, overwrite=False,
+            dry_run=False, region="us-west-2", function_name="process-shard",
+        )
+        total = 0.1 + 0.2 + 0.3 + 12.7
+        # The exact pre-refactor order: one multiply over the summed time.
+        assert summary["gb_seconds"] == total * 2.0
+        assert summary["estimated_cost_usd"] == (total * 2.0) * 0.0000133334

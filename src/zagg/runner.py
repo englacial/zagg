@@ -37,6 +37,7 @@ from zagg.config import (
     get_store_path,
 )
 from zagg.dispatch import (
+    LAMBDA_MEMORY_GB,
     LAMBDA_PRICE_PER_GB_SEC,
     LAMBDA_RETRY,
     LOCAL_RETRY,
@@ -594,12 +595,17 @@ def _run_lambda(config, catalog_data, store_path, child_order, *,
     executor.finalize()
     wall_time = time.time() - start_time
 
-    # Cost estimate: arm64 pricing = $0.0000133334/GB-second. The structured
-    # numbers come off the report; runner owns presentation (#63).
+    # Cost estimate: arm64 pricing = $0.0000133334/GB-second. Compute gb_seconds
+    # and cost *once* over the summed Lambda time (the report carries only the
+    # accumulated compute_time_s) so the arithmetic order -- and thus the last
+    # ULP of estimated_cost_usd -- stays byte-identical to the pre-refactor path
+    # (summing per-cell cost_usd would diverge in FP). Runner owns presentation;
+    # the per-cell CellCost.cost_usd is for the report's structured breakdown.
     total_lambda_time = report.cost.compute_time_s
-    gb_seconds = report.cost.gb_seconds
+    memory_gb = LAMBDA_MEMORY_GB
+    gb_seconds = total_lambda_time * memory_gb
     price_per_gb_sec = LAMBDA_PRICE_PER_GB_SEC
-    estimated_cost = report.cost.cost_usd
+    estimated_cost = gb_seconds * price_per_gb_sec
 
     summary = {
         "total_cells": len(cells),
