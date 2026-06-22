@@ -386,6 +386,11 @@ def _validate_chunk_precompute(aggregation: dict, ds_vars: set[str]) -> None:
 # for variable-length per-cell outputs; see issue #48.
 OUTPUT_KINDS = ("scalar", "vector", "ragged")
 
+# Recognized per-field output resolutions (issue #30 item 2). ``cell`` (default)
+# stores one value per aggregation cell; ``chunk`` stores one value per chunk in a
+# companion array shaped at the chunk grid, indexed by ``grid.block_index``.
+OUTPUT_RESOLUTIONS = ("cell", "chunk")
+
 
 def _validate_output_kind(name: str, meta: dict) -> None:
     """Validate a variable's non-scalar output declaration.
@@ -396,6 +401,14 @@ def _validate_output_kind(name: str, meta: dict) -> None:
     ``vector`` and ``ragged`` fields may be driven by either ``function`` or
     ``expression``; ``len``/``count`` are rejected for both (they short-circuit
     to a scalar count). See issue #29 (vector) and issue #48 (ragged/CSR).
+
+    A field may also declare ``resolution`` (``cell`` default, or ``chunk``).
+    A ``resolution: chunk`` field (issue #30 item 2) is written ONCE per chunk
+    into a companion array shaped at the chunk grid (``main.shape //
+    chunk_shape``), indexed by ``grid.block_index(shard_key)`` — the compact
+    storage for a chunk-uniform value (e.g. a ``chunk_precompute`` anchor). A
+    ``kind: scalar`` field may be ``resolution: chunk``; ``vector``/``ragged``
+    chunk companions are not supported here (deferred — see the error message).
 
     Parameters
     ----------
@@ -414,6 +427,21 @@ def _validate_output_kind(name: str, meta: dict) -> None:
         allowed = ", ".join(OUTPUT_KINDS)
         raise ValueError(
             f"Variable '{name}': output kind '{kind}' is not supported (allowed: {allowed})"
+        )
+
+    # resolution (cell default, or chunk). A chunk-resolution field stores one
+    # value per chunk in a companion array (issue #30 item 2). Only kind: scalar
+    # chunk companions are supported in this PR.
+    resolution = meta.get("resolution", "cell")
+    if resolution not in OUTPUT_RESOLUTIONS:
+        allowed = ", ".join(OUTPUT_RESOLUTIONS)
+        raise ValueError(
+            f"Variable '{name}': resolution '{resolution}' is not supported (allowed: {allowed})"
+        )
+    if resolution == "chunk" and kind != "scalar":
+        raise ValueError(
+            f"Variable '{name}': resolution 'chunk' is only supported for kind 'scalar' "
+            f"(got kind '{kind}'); a chunk-resolution vector/ragged companion is deferred"
         )
 
     # dtype, when declared, must name a real numpy dtype (applies to all kinds).
@@ -881,11 +909,15 @@ def get_output_signature(meta: dict) -> dict:
     Returns
     -------
     dict
-        ``{"kind": str, "trailing_shape": tuple, "inner_shape": tuple, "dtype": str}``.
+        ``{"kind": str, "trailing_shape": tuple, "inner_shape": tuple, "dtype":
+        str, "resolution": str}``.
         ``trailing_shape`` is ``()`` for scalar and ragged fields.
         ``inner_shape`` is ``()`` for scalar and vector fields; for ragged it
         holds the per-element shape (e.g. ``(2,)`` for a centroid pair).
         ``dtype`` is the declared dtype string, or ``None`` if unset.
+        ``resolution`` is ``"cell"`` (default — one value per aggregation cell) or
+        ``"chunk"`` (issue #30 item 2 — one value per chunk, stored in a companion
+        array shaped at the chunk grid and indexed by ``grid.block_index``).
     """
     kind = meta.get("kind", "scalar")
     if kind == "vector":
@@ -904,6 +936,7 @@ def get_output_signature(meta: dict) -> dict:
         "trailing_shape": trailing_shape,
         "inner_shape": inner_shape,
         "dtype": meta.get("dtype"),
+        "resolution": meta.get("resolution", "cell"),
     }
 
 
