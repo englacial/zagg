@@ -3,7 +3,12 @@
 import numpy as np
 import pytest
 
-from zagg.stats.tdigest import build_tdigest, merge_tdigests, quantile_from_tdigest
+from zagg.stats.tdigest import (
+    build_tdigest,
+    cdf_from_tdigest,
+    merge_tdigests,
+    quantile_from_tdigest,
+)
 
 
 class TestBuildTDigest:
@@ -357,3 +362,75 @@ class TestScaleFunctionRegression:
         merged = merge_tdigests(d1, d2, delta=delta)
         assert merged.shape[0] <= 2 * delta
         np.testing.assert_almost_equal(float(merged[:, 1].sum()), 100_000, decimal=3)
+
+
+class TestCdfFromTDigest:
+    def test_empty_returns_nan_scalar(self):
+        out = cdf_from_tdigest(np.empty((0, 2), dtype=np.float32), 3.0)
+        assert isinstance(out, float)
+        assert np.isnan(out)
+
+    def test_empty_returns_nan_array(self):
+        out = cdf_from_tdigest(np.empty((0, 2), dtype=np.float32), np.array([1.0, 2.0]))
+        assert isinstance(out, np.ndarray)
+        assert out.shape == (2,)
+        assert np.all(np.isnan(out))
+
+    def test_single_centroid_step(self):
+        digest = build_tdigest(np.array([5.0]))
+        assert cdf_from_tdigest(digest, 4.0) == pytest.approx(0.0)
+        assert cdf_from_tdigest(digest, 5.0) == pytest.approx(1.0)
+        assert cdf_from_tdigest(digest, 9.0) == pytest.approx(1.0)
+
+    def test_endpoints_zero_and_total(self):
+        rng = np.random.default_rng(1)
+        vals = rng.standard_normal(5_000)
+        digest = build_tdigest(vals, delta=256)
+        total = float(digest[:, 1].sum())
+        # Far below the minimum mean → 0; far above the maximum mean → total.
+        lo = float(digest[:, 0].min()) - 100.0
+        hi = float(digest[:, 0].max()) + 100.0
+        assert cdf_from_tdigest(digest, lo) == pytest.approx(0.0)
+        assert cdf_from_tdigest(digest, hi) == pytest.approx(total)
+
+    def test_monotonic_non_decreasing(self):
+        rng = np.random.default_rng(2)
+        vals = rng.standard_normal(8_000)
+        digest = build_tdigest(vals, delta=256)
+        xs = np.linspace(vals.min() - 1.0, vals.max() + 1.0, 500)
+        cdf = cdf_from_tdigest(digest, xs)
+        assert np.all(np.diff(cdf) >= -1e-9)
+
+    def test_scalar_in_scalar_out(self):
+        digest = build_tdigest(np.arange(100.0))
+        out = cdf_from_tdigest(digest, 50.0)
+        assert isinstance(out, float)
+
+    def test_array_in_array_out(self):
+        digest = build_tdigest(np.arange(100.0))
+        out = cdf_from_tdigest(digest, np.array([10.0, 50.0, 90.0]))
+        assert isinstance(out, np.ndarray)
+        assert out.shape == (3,)
+
+    def test_matches_empirical_cdf_within_tolerance(self):
+        """cdf_from_tdigest tracks the empirical CDF of the samples (as a fraction)."""
+        rng = np.random.default_rng(3)
+        vals = rng.standard_normal(20_000)
+        digest = build_tdigest(vals, delta=512)
+        total = float(digest[:, 1].sum())
+        xs = np.linspace(np.quantile(vals, 0.02), np.quantile(vals, 0.98), 50)
+        est_frac = np.asarray(cdf_from_tdigest(digest, xs)) / total
+        emp_frac = np.searchsorted(np.sort(vals), xs, side="right") / len(vals)
+        # t-digest CDF tracks the empirical CDF within a few percent.
+        assert np.max(np.abs(est_frac - emp_frac)) < 0.03
+
+    def test_inverse_consistency_with_quantile(self):
+        """cdf(quantile(q)) ≈ q*total over the interior (round-trip within tolerance)."""
+        rng = np.random.default_rng(7)
+        vals = rng.standard_normal(20_000)
+        digest = build_tdigest(vals, delta=512)
+        total = float(digest[:, 1].sum())
+        for q in (0.1, 0.25, 0.5, 0.75, 0.9):
+            x = quantile_from_tdigest(digest, q)
+            frac = cdf_from_tdigest(digest, x) / total
+            assert abs(frac - q) < 0.03, f"q={q}: round-trip frac={frac:.4f}"

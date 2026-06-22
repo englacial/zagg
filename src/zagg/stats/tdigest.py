@@ -68,7 +68,12 @@ from __future__ import annotations
 
 import numpy as np
 
-__all__ = ["build_tdigest", "merge_tdigests", "quantile_from_tdigest"]
+__all__ = [
+    "build_tdigest",
+    "cdf_from_tdigest",
+    "merge_tdigests",
+    "quantile_from_tdigest",
+]
 
 _DEFAULT_DELTA = 512
 
@@ -284,3 +289,64 @@ def quantile_from_tdigest(digest: np.ndarray, q: float) -> float:
                 hi_val = means[k] if k == len(means) - 1 else (means[k] + means[k + 1]) / 2.0
             return float(lo_val + frac * (hi_val - lo_val))
     return float(means[-1])
+
+
+def cdf_from_tdigest(digest: np.ndarray, x: float | np.ndarray) -> float | np.ndarray:
+    """Estimate cumulative weight at value ``x`` from a t-digest.
+
+    The value→cumulative-weight inverse of :func:`quantile_from_tdigest`: where
+    that maps a rank fraction to a value, this maps a value to the cumulative
+    *weight* (number of observations) at or below ``x``.  It is the primitive
+    needed to fill evenly-spaced *value* bins from a digest (issue #79).
+
+    Each centroid ``k`` (mean ``m_k``, weight ``w_k``) is placed at the centre
+    of its cumulative-weight span, i.e. at cumulative weight
+    ``cum_before + w_k / 2``.  The CDF interpolates cumulative weight linearly
+    in value-space between adjacent centroid means and is clamped flat outside
+    ``[m_0, m_{k-1}]``, so it is monotonic non-decreasing in ``x`` with
+    endpoints ``0`` (below the first mean) and the total weight (above the
+    last).
+
+    Parameters
+    ----------
+    digest : ndarray, shape (k, 2)
+        Centroid array (mean, weight) as returned by :func:`build_tdigest`.
+    x : float or ndarray
+        Value(s) at which to evaluate the cumulative weight.
+
+    Returns
+    -------
+    float or ndarray
+        Cumulative weight at ``x``, in ``[0, total_weight]``.  Returns NaN
+        (matching the shape of ``x``) for an empty digest.
+
+    Notes
+    -----
+    Returns a scalar ``float`` for scalar ``x`` and an ``ndarray`` (float64)
+    for array ``x``.
+    """
+    x_arr = np.asarray(x, dtype=np.float64)
+    scalar = x_arr.ndim == 0
+
+    if len(digest) == 0:
+        out = np.full(x_arr.shape, np.nan, dtype=np.float64)
+        return float(out) if scalar else out
+
+    means = np.asarray(digest[:, 0], dtype=np.float64)
+    weights = np.asarray(digest[:, 1], dtype=np.float64)
+    total = float(weights.sum())
+
+    # Cumulative weight at each centroid's centre: cum_before + w/2.
+    cum_upper = np.cumsum(weights)
+    cum_center = cum_upper - weights / 2.0
+
+    # Single centroid (or all-equal means): step from 0 to total at the mean.
+    if len(means) == 1:
+        out = np.where(x_arr >= means[0], total, 0.0)
+        return float(out) if scalar else out.astype(np.float64)
+
+    # Piecewise-linear interpolation of cumulative weight over centroid means.
+    # np.interp clamps to the endpoint values outside [means[0], means[-1]],
+    # giving the flat 0 / total tails.
+    out = np.interp(x_arr, means, cum_center, left=0.0, right=total)
+    return float(out) if scalar else out
