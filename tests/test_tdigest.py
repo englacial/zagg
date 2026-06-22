@@ -429,3 +429,67 @@ class TestVectorizedSegmentation:
         merged = merge_tdigests(d1, d2, delta=512)
         np.testing.assert_almost_equal(float(merged[:, 1].sum()), 20_000.0, decimal=3)
         assert np.all(merged[1:, 0] >= merged[:-1, 0])
+
+
+class TestSearchsortedJumpPath:
+    """``method="jump"`` is a faster boundary search that must be bit-identical
+    to the default ``method="loop"`` (issue #48).
+
+    The jump path skips a whole centroid's k1 budget at once with
+    ``np.searchsorted`` instead of scanning each observation; it only changes
+    *how* the centroid start indices are found, so the resulting centroids
+    (means and weights) must match the loop path exactly.
+    """
+
+    @pytest.mark.parametrize("n", [1, 2, 7, 250, 1000, 10_000, 50_000])
+    @pytest.mark.parametrize("delta", [128, 512])
+    def test_build_jump_identical_to_loop(self, n, delta):
+        rng = np.random.default_rng(n + delta)
+        vals = rng.standard_normal(n)
+        loop = build_tdigest(vals, delta=delta, method="loop")
+        jump = build_tdigest(vals, delta=delta, method="jump")
+        # Same boundaries → same reduceat segments → bit-identical means/weights.
+        np.testing.assert_array_equal(loop, jump)
+
+    def test_build_default_is_loop(self):
+        rng = np.random.default_rng(123)
+        vals = rng.standard_normal(5000)
+        default = build_tdigest(vals, delta=512)
+        loop = build_tdigest(vals, delta=512, method="loop")
+        np.testing.assert_array_equal(default, loop)
+
+    @pytest.mark.parametrize("n", [1, 7, 250, 10_000])
+    def test_merge_jump_identical_to_loop(self, n):
+        rng = np.random.default_rng(n)
+        d1 = build_tdigest(rng.standard_normal(n), delta=512)
+        d2 = build_tdigest(rng.standard_normal(n), delta=512)
+        loop = merge_tdigests(d1, d2, delta=512, method="loop")
+        jump = merge_tdigests(d1, d2, delta=512, method="jump")
+        np.testing.assert_array_equal(loop, jump)
+
+    def test_merge_default_is_loop(self):
+        rng = np.random.default_rng(9)
+        d1 = build_tdigest(rng.standard_normal(3000), delta=256)
+        d2 = build_tdigest(rng.standard_normal(4000), delta=256)
+        default = merge_tdigests(d1, d2, delta=256)
+        loop = merge_tdigests(d1, d2, delta=256, method="loop")
+        np.testing.assert_array_equal(default, loop)
+
+    def test_invalid_method_raises(self):
+        with pytest.raises(ValueError, match="method must be"):
+            build_tdigest(np.arange(10.0), method="bogus")
+        with pytest.raises(ValueError, match="method must be"):
+            d = build_tdigest(np.arange(10.0))
+            merge_tdigests(d, d, method="bogus")
+
+    @pytest.mark.slow
+    def test_jump_faster_than_loop_at_large_n(self):
+        """Sanity check (not a hard perf gate — CI timing is flaky): at n ≫ k
+        the jump path runs fewer Python iterations and should be faster."""
+        import timeit
+
+        rng = np.random.default_rng(0)
+        vals = rng.standard_normal(100_000)
+        loop_t = timeit.timeit(lambda: build_tdigest(vals, method="loop"), number=5)
+        jump_t = timeit.timeit(lambda: build_tdigest(vals, method="jump"), number=5)
+        assert jump_t < loop_t, f"jump {jump_t:.4f}s not faster than loop {loop_t:.4f}s"
