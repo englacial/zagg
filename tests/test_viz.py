@@ -22,6 +22,7 @@ from zagg.viz import (
     shard_outlines,
     viewport_cells,
 )
+from zagg.viz.crs import crs_info, is_polar, pick_crs, shardmap_bbox
 from zagg.viz.shardmap import _is_geojson, _split_antimeridian
 
 # ── fixtures ─────────────────────────────────────────────────────────────────
@@ -70,6 +71,20 @@ def catalog():
         pa.table(sga.parse_stac_items_to_arrow(items)),
         {"collection": "TEST"},
     )
+
+
+@pytest.fixture
+def antarctic_shardmap():
+    """ShardMap on an EPSG:3031 grid -> footprints entirely south of -60 deg."""
+    g = RectilinearGrid("EPSG:3031", 100000, [-1000000, -1000000, 0, 0], [5, 5])
+    return ShardMap(g.signature(), [0, 1], [[], []], {"backend": "test"})
+
+
+@pytest.fixture
+def arctic_shardmap():
+    """ShardMap on an EPSG:3413 grid -> footprints entirely north of +60 deg."""
+    g = RectilinearGrid("EPSG:3413", 100000, [-1000000, -1000000, 0, 0], [5, 5])
+    return ShardMap(g.signature(), [0, 1], [[], []], {"backend": "test"})
 
 
 # ── grid_from_signature ──────────────────────────────────────────────────────
@@ -253,6 +268,88 @@ class TestRenderShardmap:
         assert len(out["granules"]["features"]) == 2
 
 
+# ── phase C: CRS selection (headless, no browser) ────────────────────────────
+
+class TestCrsSelection:
+    def test_midlatitude_is_web_mercator(self, shardmap):
+        # UTM 18N grid near 38.9N -> mid-latitude -> Web Mercator default.
+        assert pick_crs(shardmap) == "EPSG:3857"
+
+    def test_antarctic_is_3031(self, antarctic_shardmap):
+        assert pick_crs(antarctic_shardmap) == "EPSG:3031"
+
+    def test_arctic_is_3413(self, arctic_shardmap):
+        assert pick_crs(arctic_shardmap) == "EPSG:3413"
+
+    def test_explicit_override_wins(self, shardmap):
+        # A mid-latitude map forced onto a polar CRS returns the override.
+        assert pick_crs(shardmap, override="EPSG:3031") == "EPSG:3031"
+
+    def test_bad_override_raises(self, shardmap):
+        with pytest.raises(ValueError, match="unsupported crs override"):
+            pick_crs(shardmap, override="EPSG:9999")
+
+    def test_bbox_from_footprints(self, antarctic_shardmap):
+        lon_min, lat_min, lon_max, lat_max = shardmap_bbox(antarctic_shardmap)
+        assert lat_max <= -60.0
+        assert lon_min >= -180.0 and lon_max <= 180.0
+
+    def test_empty_map_bbox_raises(self, shardmap):
+        empty = ShardMap(shardmap.grid_signature, [], [], {})
+        with pytest.raises(ValueError, match="no shards"):
+            shardmap_bbox(empty)
+
+
+class TestCrsInfo:
+    def test_web_mercator_has_no_projection_or_basemap(self):
+        info = crs_info("EPSG:3857")
+        assert info["projection"] is None
+        assert info["basemap"] is None
+        assert not is_polar("EPSG:3857")
+
+    @pytest.mark.parametrize("crs", ["EPSG:3031", "EPSG:3413"])
+    def test_polar_has_projection_and_gibs_basemap(self, crs):
+        info = crs_info(crs)
+        assert is_polar(crs)
+        proj = info["projection"]
+        assert proj["name"] == crs
+        assert proj["proj4def"].startswith("+proj=stere")
+        assert proj["origin"] and proj["bounds"] and proj["resolutions"]
+        assert "gibs.earthdata.nasa.gov" in info["basemap"]["url"]
+        assert f"epsg{crs.split(':')[1]}" in info["basemap"]["url"]
+
+    def test_bad_crs_raises(self):
+        with pytest.raises(ValueError, match="unsupported crs"):
+            crs_info("EPSG:9999")
+
+
+# ── phase C: CRS-aware antimeridian seam ─────────────────────────────────────
+
+class TestSeamAwareLayers:
+    def test_polar_skips_antimeridian_split(self):
+        # A HEALPix cell straddling +-180 is a MultiPolygon under the Mercator
+        # split, but stays a single Polygon when split_seam=False (polar CRS).
+        grid = HealpixGrid(2, 6, layout="fullsphere")
+        key = int(
+            grid.coverage(
+                [(np.array([0.0, 1, 1, 0, 0]), np.array([179.0, 179, 180, 180, 179]))]
+            )[0]
+        )
+        sm = ShardMap(
+            grid.signature(), [key],
+            [[{"id": "G", "s3": "s", "https": "h"}]], {},
+        )
+        split = shard_outlines(sm)["features"][0]["geometry"]
+        unsplit = shard_outlines(sm, split_seam=False)["features"][0]["geometry"]
+        assert split["type"] == "MultiPolygon"
+        assert unsplit["type"] == "Polygon"
+
+    def test_granule_footprints_seam_flag(self, catalog):
+        fc = granule_footprints(catalog, split_seam=False)
+        assert _is_geojson(fc)
+        assert all(f["geometry"]["type"] == "Polygon" for f in fc["features"])
+
+
 # ── phase 2: ipyleaflet wrapper (skips when the viz extra isn't installed) ────
 
 class TestShowShardmap:
@@ -289,3 +386,36 @@ class TestShowShardmap:
         assert isinstance(m, Map)
         names = {getattr(layer, "name", None) for layer in m.layers}
         assert "granule footprints" in names
+
+    def test_polar_map_uses_3031_crs_and_gibs(self, antarctic_shardmap, tmp_path):
+        pytest.importorskip("ipyleaflet")
+        from zagg.viz import show_shardmap
+
+        path = tmp_path / "sm.json"
+        antarctic_shardmap.to_json(str(path))
+        m = show_shardmap(str(path))
+        # proj4leaflet CRS for EPSG:3031 is wired onto the Map.
+        assert m.crs["name"] == "EPSG:3031"
+        # GIBS Antarctic tile basemap is present.
+        urls = [getattr(layer, "url", "") for layer in m.layers]
+        assert any("epsg3031" in u for u in urls)
+
+    def test_midlatitude_map_stays_web_mercator(self, shardmap, tmp_path):
+        pytest.importorskip("ipyleaflet")
+        from zagg.viz import show_shardmap
+
+        path = tmp_path / "sm.json"
+        shardmap.to_json(str(path))
+        m = show_shardmap(str(path))
+        # No custom proj4leaflet CRS -> ipyleaflet's default Web Mercator.
+        assert m.crs["name"] == "EPSG3857"
+        assert not m.crs.get("custom", False)
+
+    def test_crs_override(self, shardmap, tmp_path):
+        pytest.importorskip("ipyleaflet")
+        from zagg.viz import show_shardmap
+
+        path = tmp_path / "sm.json"
+        shardmap.to_json(str(path))
+        m = show_shardmap(str(path), crs="EPSG:3413")
+        assert m.crs["name"] == "EPSG:3413"

@@ -157,12 +157,33 @@ def _polygon_rings(geom, *, shift: float = 0.0) -> list[list[list[float]]]:
     return [[[lon + shift, lat] for lon, lat in _ring_list(r)] for r in rings]
 
 
-def _polygon_geometry(geom) -> dict:
-    """GeoJSON geometry for a shapely Polygon/MultiPolygon, antimeridian-safe.
+def _plain_geometry(geom) -> dict:
+    """GeoJSON geometry for a Polygon/MultiPolygon with no antimeridian split.
 
-    Coordinates are plain ``list`` (not shapely's tuples) so the result is
+    Used under a polar-stereographic CRS, where the +-180 seam is a Mercator/
+    WGS84 artifact that does not exist in the projected plane (the singularity is
+    the opposite pole instead). Coordinates are plain ``list`` so the result is
     canonical, ``json``-stable GeoJSON.
     """
+    if geom.geom_type == "MultiPolygon":
+        return {
+            "type": "MultiPolygon",
+            "coordinates": [_polygon_rings(sub) for sub in geom.geoms],
+        }
+    if geom.geom_type == "Polygon":
+        return {"type": "Polygon", "coordinates": _polygon_rings(geom)}
+    raise ValueError(f"unsupported geometry type for GeoJSON: {geom.geom_type}")
+
+
+def _polygon_geometry(geom, *, split_seam: bool = True) -> dict:
+    """GeoJSON geometry for a shapely Polygon/MultiPolygon, antimeridian-safe.
+
+    When ``split_seam`` is False (polar CRS), the +-180 split is skipped -- see
+    :func:`_plain_geometry`. Coordinates are plain ``list`` (not shapely's
+    tuples) so the result is canonical, ``json``-stable GeoJSON.
+    """
+    if not split_seam:
+        return _plain_geometry(geom)
     if geom.geom_type == "MultiPolygon":
         coords: list = []
         for sub in geom.geoms:
@@ -210,7 +231,7 @@ def _collection(features: list[dict]) -> dict:
 
 # ── layers ───────────────────────────────────────────────────────────────────
 
-def shard_outlines(shardmap) -> dict:
+def shard_outlines(shardmap, *, split_seam: bool = True) -> dict:
     """Shard/chunk outlines as a GeoJSON ``FeatureCollection``.
 
     One feature per shard key in the map, with the shard's footprint polygon and
@@ -221,6 +242,9 @@ def shard_outlines(shardmap) -> dict:
     ----------
     shardmap : ShardMap
         A built or loaded shard map.
+    split_seam : bool
+        Split polygons crossing +-180 into a ``MultiPolygon``. Set False under a
+        polar-stereographic CRS, where there is no antimeridian seam.
 
     Returns
     -------
@@ -233,14 +257,14 @@ def shard_outlines(shardmap) -> dict:
         geom = grid.shard_footprint(key)
         features.append(
             _feature(
-                _polygon_geometry(geom),
+                _polygon_geometry(geom, split_seam=split_seam),
                 {"shard_key": _jsonable(key), "n_granules": len(granules)},
             )
         )
     return _collection(features)
 
 
-def granule_footprints(catalog) -> dict:
+def granule_footprints(catalog, *, split_seam: bool = True) -> dict:
     """Granule footprints as a GeoJSON ``FeatureCollection``.
 
     One polygon feature per granule in the catalog (its footprint
@@ -250,6 +274,9 @@ def granule_footprints(catalog) -> dict:
     ----------
     catalog : Catalog
         A loaded catalog (provides ``granule_records``).
+    split_seam : bool
+        Split polygons crossing +-180 into a ``MultiPolygon``. Set False under a
+        polar-stereographic CRS, where there is no antimeridian seam.
 
     Returns
     -------
@@ -264,12 +291,15 @@ def granule_footprints(catalog) -> dict:
         if len(ring) < 4:
             continue
         features.append(
-            _feature(_polygon_geometry(Polygon(ring)), {"id": rec["id"]})
+            _feature(
+                _polygon_geometry(Polygon(ring), split_seam=split_seam),
+                {"id": rec["id"]},
+            )
         )
     return _collection(features)
 
 
-def viewport_cells(shardmap, bbox, *, max_shards: int = 4) -> dict:
+def viewport_cells(shardmap, bbox, *, max_shards: int = 4, split_seam: bool = True) -> dict:
     """Shard-order cell outlines clipped to a viewport, gated on visible shards.
 
     Implements the "grid-on-zoom" behavior (issue #38): cell outlines **at the
@@ -285,6 +315,9 @@ def viewport_cells(shardmap, bbox, *, max_shards: int = 4) -> dict:
         Viewport ``(lon_min, lat_min, lon_max, lat_max)`` in WGS84.
     max_shards : int
         Maximum number of intersecting shards for the grid to render.
+    split_seam : bool
+        Split polygons crossing +-180 into a ``MultiPolygon``. Set False under a
+        polar-stereographic CRS, where there is no antimeridian seam.
 
     Returns
     -------
@@ -312,7 +345,10 @@ def viewport_cells(shardmap, bbox, *, max_shards: int = 4) -> dict:
         if clipped is None:
             continue
         features.append(
-            _feature(_polygon_geometry(clipped), {"shard_key": _jsonable(key)})
+            _feature(
+                _polygon_geometry(clipped, split_seam=split_seam),
+                {"shard_key": _jsonable(key)},
+            )
         )
     return _collection(features)
 
