@@ -234,8 +234,9 @@ def show_shardmap(
         )
 
     # Debounce so a burst of intermediate pan/zoom ticks coalesces into one
-    # refresh after movement settles. Keep a handle so the pending timer can be
-    # cancelled (exposed as ``m.cancel_grid_refresh``) for clean teardown.
+    # refresh after movement settles, scheduled on the kernel's event loop (main
+    # thread) -- never a background thread mutating the widget comm. Keep a handle
+    # so the pending callback can be cancelled (``m.cancel_grid_refresh``).
     debounced_refresh = _debounce(_GRID_DEBOUNCE_S, _refresh_grid)
     m.observe(debounced_refresh, names="bounds")
     m.cancel_grid_refresh = debounced_refresh.cancel

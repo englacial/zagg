@@ -400,6 +400,57 @@ class TestViewportCellsHealpix:
         fc = viewport_cells(healpix_shardmap, view, max_shards=4, max_cells=200)
         assert fc["features"] == []
 
+    def test_child_cells_respect_antimeridian_seam(self):
+        # Child cells straddling +-180 split into hemisphere-local parts (no
+        # globe-spanning band) when split_seam=True, and stay single Polygons
+        # under a polar CRS (split_seam=False) -- same seam handling as shards.
+        from zagg.viz import shardmap as sm_mod
+
+        sm_mod._INDEX_CACHE.clear()
+        g = HealpixGrid(parent_order=4, child_order=8, layout="fullsphere")
+        key = int(
+            g.coverage([(np.array([0.0, 1, 1, 0, 0]), np.array([179.0, 179, 180, 180, 179]))])[0]
+        )
+        sm = ShardMap(g.signature(), [key], [[]], {})
+        view = g.shard_footprint(key).bounds
+        split = viewport_cells(sm, view, max_shards=8, max_cells=5000, split_seam=True)
+        assert any(f["geometry"]["type"] == "MultiPolygon" for f in split["features"])
+        for feat in split["features"]:
+            geom = feat["geometry"]
+            polys = geom["coordinates"] if geom["type"] == "MultiPolygon" else [geom["coordinates"]]
+            for poly in polys:
+                lons = [pt[0] for pt in poly[0]]
+                assert max(lons) - min(lons) <= 180.0  # no globe-spanning band
+        unsplit = viewport_cells(sm, view, max_shards=8, max_cells=5000, split_seam=False)
+        assert all(f["geometry"]["type"] == "Polygon" for f in unsplit["features"])
+
+    def test_seam_cell_clipped_to_true_sliver_not_global_band(self):
+        # Regression (PR #44 review): a child cell straddling +-180 must be split
+        # at the seam *before* clipping. The unsplit cell's flat ring spans
+        # ~360 deg; clipping that band to a seam-hugging viewport yields a wrong,
+        # oversized geometry (or drops the cell). After the fix, every emitted
+        # part is a small hemisphere-local sliver -- never a near-global band.
+        from shapely.geometry import shape
+
+        from zagg.viz import shardmap as sm_mod
+
+        sm_mod._INDEX_CACHE.clear()
+        g = HealpixGrid(parent_order=4, child_order=9, layout="fullsphere")
+        key = int(
+            g.coverage([(np.array([0.0, 1, 1, 0, 0]), np.array([179.0, 179, 180, 180, 179]))])[0]
+        )
+        sm = ShardMap(g.signature(), [key], [[]], {})
+        # A narrow viewport hugging the seam at the shard's latitude band.
+        lon0, lat0, lon1, lat1 = g.shard_footprint(key).bounds
+        view = (179.0, lat0, 180.0, (lat0 + lat1) / 2)
+        fc = viewport_cells(sm, view, max_shards=8, max_cells=20000, split_seam=True)
+        assert fc["features"]  # the seam region is not silently emptied
+        # An order-9 cell footprint is ~0.009 deg^2. Clipping the unsplit flat
+        # band to the view instead fills the whole view strip (~0.19 deg^2, 20x
+        # bigger) -- so a small per-cell area bound pins the seam-first fix.
+        for feat in fc["features"]:
+            assert shape(feat["geometry"]).area < 0.05  # true cell, not a band
+
 
 # ── antimeridian splitting ───────────────────────────────────────────────────
 
