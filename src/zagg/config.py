@@ -226,6 +226,13 @@ def validate_config(config: PipelineConfig) -> None:
     ds_vars = set(config.data_source.get("variables", {}).keys())
     agg_vars = config.aggregation.get("variables", {})
 
+    # Validate the per-chunk precompute hook (issue #30, item 1). Each entry is
+    # evaluated ONCE per chunk over the shard's pooled column data, before the
+    # per-cell loop; its name becomes available in the per-cell expression
+    # namespace. Validation mirrors ``aggregation.variables`` (exactly one of
+    # function/expression, sources exist) but the entries are chunk-level scalars.
+    _validate_chunk_precompute(config.aggregation, ds_vars)
+
     for name, meta in agg_vars.items():
         has_func = "function" in meta
         has_expr = "expression" in meta
@@ -271,6 +278,84 @@ def validate_config(config: PipelineConfig) -> None:
         _validate_output_kind(name, meta)
 
 
+def _validate_chunk_precompute(aggregation: dict, ds_vars: set[str]) -> None:
+    """Validate the ``aggregation.chunk_precompute`` block (issue #30, item 1).
+
+    Each named entry is a chunk-level scalar computed ONCE per chunk (shard) over
+    the shard's pooled column data, before the per-cell loop; its name then enters
+    the per-cell expression namespace. Validation mirrors ``aggregation.variables``:
+    each entry must declare exactly one of ``function``/``expression``, and any
+    ``source`` / expression / param column references must exist in
+    ``data_source.variables``. ``dtype`` (optional) must be a valid numpy dtype.
+
+    The block is optional; a config without it is unchanged.
+
+    Parameters
+    ----------
+    aggregation : dict
+        The config's ``aggregation`` mapping.
+    ds_vars : set[str]
+        Available ``data_source.variables`` column names.
+
+    Raises
+    ------
+    ValueError
+        On any invalid ``chunk_precompute`` declaration.
+    """
+    precompute = aggregation.get("chunk_precompute")
+    if precompute is None:
+        return
+    if not isinstance(precompute, dict):
+        raise ValueError("aggregation.chunk_precompute must be a mapping of name -> entry")
+    for name, meta in precompute.items():
+        if not isinstance(name, str) or not name.strip():
+            raise ValueError("chunk_precompute entry names must be non-empty strings")
+        if not isinstance(meta, dict):
+            raise ValueError(f"chunk_precompute '{name}': entry must be a mapping")
+
+        has_func = "function" in meta
+        has_expr = "expression" in meta
+        if has_func and has_expr:
+            raise ValueError(
+                f"chunk_precompute '{name}': 'function' and 'expression' are mutually exclusive"
+            )
+        if not has_func and not has_expr:
+            raise ValueError(f"chunk_precompute '{name}': must specify 'function' or 'expression'")
+
+        source = meta.get("source")
+        if source is not None and source not in ds_vars:
+            raise ValueError(
+                f"chunk_precompute '{name}': source '{source}' not in data_source.variables"
+            )
+
+        if has_func:
+            resolve_function(meta["function"])  # raises ValueError on failure
+
+        for pval in meta.get("params", {}).values():
+            if not isinstance(pval, str):
+                continue  # numeric literal
+            if pval in ds_vars or _is_numeric(pval):
+                continue
+            if any(v in pval for v in ds_vars):
+                continue
+            raise ValueError(
+                f"chunk_precompute '{name}': param value '{pval}' references "
+                f"unknown column (available: {ds_vars})"
+            )
+
+        if has_expr:
+            _validate_expression_columns(name, meta["expression"], ds_vars)
+
+        if "dtype" in meta:
+            try:
+                np.dtype(meta["dtype"])
+            except (TypeError, ValueError) as e:
+                raise ValueError(
+                    f"chunk_precompute '{name}': dtype {meta['dtype']!r} is not a valid "
+                    f"numpy dtype ({e})"
+                ) from e
+
+
 # Recognized per-field output kinds. ``ragged`` (CSR) is the Tier-2 carrier
 # for variable-length per-cell outputs; see issue #48.
 OUTPUT_KINDS = ("scalar", "vector", "ragged")
@@ -302,8 +387,7 @@ def _validate_output_kind(name: str, meta: dict) -> None:
     if kind not in OUTPUT_KINDS:
         allowed = ", ".join(OUTPUT_KINDS)
         raise ValueError(
-            f"Variable '{name}': output kind '{kind}' is not supported "
-            f"(allowed: {allowed})"
+            f"Variable '{name}': output kind '{kind}' is not supported (allowed: {allowed})"
         )
 
     # dtype, when declared, must name a real numpy dtype (applies to all kinds).
@@ -373,8 +457,7 @@ def _validate_trailing_shape(name: str, trailing_shape, key_name: str = "trailin
     for dim in dims:
         if not isinstance(dim, int) or isinstance(dim, bool) or dim < 1:
             raise ValueError(
-                f"Variable '{name}': '{key_name}' entries must be positive "
-                f"integers (got {dim!r})"
+                f"Variable '{name}': '{key_name}' entries must be positive integers (got {dim!r})"
             )
 
 
@@ -732,6 +815,26 @@ def get_agg_fields(config: PipelineConfig) -> dict:
         :func:`get_output_signature` to read the normalized declaration.
     """
     return dict(config.aggregation.get("variables", {}))
+
+
+def get_chunk_precompute(config: PipelineConfig) -> dict:
+    """Return the ``aggregation.chunk_precompute`` entries keyed by name (issue #30).
+
+    Each entry is a chunk-level scalar evaluated ONCE per chunk (shard) over the
+    shard's pooled column data, before the per-cell loop; the resulting scalar is
+    injected into the per-cell expression namespace. Returns an empty dict when no
+    ``chunk_precompute`` block is present, so the existing per-cell path is a no-op.
+
+    Parameters
+    ----------
+    config : PipelineConfig
+
+    Returns
+    -------
+    dict
+        ``{name: {function/expression, source, params, dtype}}``.
+    """
+    return dict(config.aggregation.get("chunk_precompute", {}))
 
 
 def get_output_signature(meta: dict) -> dict:
