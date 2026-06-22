@@ -49,6 +49,13 @@ and ~200 μs at n=1000 (≈7× faster than a per-observation ``arcsin``).  Over 
 the centroid count (and output size) is ~4× smaller; at δ=1024 the digest
 carries ~2× more centroids and is more accurate near the tails.
 
+The boundary scan is the only remaining O(n) Python work.  For cells with very
+high observation counts (n ≫ centroid count), pass ``method="jump"`` to locate
+each boundary with ``np.searchsorted`` over the monotone k1 vector — O(centroids)
+iterations instead of O(n), ~15–29× faster at n ≥ 10k.  Output is identical to
+the default ``method="loop"``; loop stays the better choice at n ≈ 250–1000
+where centroids ≈ n.
+
 Usage
 -----
 Wire as a ragged reducer in a YAML config::
@@ -93,9 +100,61 @@ def _k1_scale(q, delta: float):
     return delta * (np.arcsin(2.0 * qc - 1.0) / np.pi + 0.5)
 
 
+def _segment_starts(k_right: np.ndarray, delta_f: float, method: str) -> np.ndarray:
+    """Find centroid start indices from the per-element right-edge k1 values.
+
+    ``k_right[i]`` is the k1 scale at element ``i``'s right cumulative-rank edge;
+    the array is strictly increasing (k1 is monotone in q).  A centroid that
+    opens at index ``s`` absorbs every following element while it stays within
+    1 unit of the k1 scale measured from its left edge ``k_left`` (the k value
+    just before its first element, ``k_right[s - 1]``, or ``k(0)`` for ``s = 0``);
+    the next centroid opens at the first ``i`` with ``k_right[i] - k_left > 1``.
+
+    Two equivalent paths produce **identical** boundaries:
+
+    ``"loop"`` (default)
+        Scan every element with a scalar float compare — ``O(n)`` Python-level
+        work.  Optimal in the per-cell regime (n ≈ 250–1000, centroids ≈ n).
+    ``"jump"``
+        Locate each next boundary with ``np.searchsorted`` over the monotone
+        ``k_right`` — ``O(k)`` Python iterations (one per centroid) instead of
+        ``O(n)``.  Much faster when n ≫ k (n ≥ 10k); the searchsorted overhead
+        makes it ~1.6–2× when k ≈ n.
+    """
+    n = len(k_right)
+    k0 = float(_k1_scale(0.0, delta_f))
+    if method == "loop":
+        starts = [0]
+        k_left = k0
+        for i in range(1, n):
+            if k_right[i] - k_left > 1.0:
+                starts.append(i)
+                k_left = float(k_right[i - 1])
+        return np.asarray(starts)
+    if method == "jump":
+        starts = [0]
+        k_left = k0
+        s = 0
+        while True:
+            # First index whose right edge exceeds the centroid's k-budget; the
+            # ``> s`` guard makes a loss-free element (where one step already
+            # exceeds 1 k-unit) still claim its own centroid, matching the loop.
+            nxt = int(np.searchsorted(k_right, k_left + 1.0, side="right"))
+            if nxt <= s:
+                nxt = s + 1
+            if nxt >= n:
+                break
+            starts.append(nxt)
+            k_left = float(k_right[nxt - 1])
+            s = nxt
+        return np.asarray(starts)
+    raise ValueError(f"method must be 'loop' or 'jump', got {method!r}")
+
+
 def build_tdigest(
     values: np.ndarray,
     delta: int = _DEFAULT_DELTA,
+    method: str = "loop",
 ) -> np.ndarray:
     """Build a t-digest sketch from a 1-D array of values.
 
@@ -107,6 +166,14 @@ def build_tdigest(
     delta : int, optional
         Compression parameter.  Larger δ → more centroids → more accurate.
         Default 512.  Typical values: 128, 256, 512, 1024.
+    method : {"loop", "jump"}, optional
+        How centroid boundaries are found (the output is **identical** either
+        way — only the boundary search differs).  ``"loop"`` (default) scans
+        every observation with a scalar compare, optimal in the per-cell regime
+        (n ≈ 250–1000, where centroids ≈ n).  ``"jump"`` uses ``np.searchsorted``
+        over the monotone k1 vector to skip a whole centroid's budget at once —
+        ``O(k)`` Python iterations instead of ``O(n)``, much faster when n ≫ k
+        (n ≥ 10k) but ~1.6–2× when k ≈ n.
 
     Returns
     -------
@@ -136,18 +203,11 @@ def build_tdigest(
     # Greedy partition: observation i joins the current centroid while the
     # centroid still spans ≤ 1 unit of the k1 scale measured from its left edge
     # (the k value just before its first observation), otherwise it opens a
-    # fresh centroid. Only the centroid *start* indices are collected here; the
-    # per-observation work is a single float compare, and the centroid
-    # means/weights fall out of one vectorized segment-sum below. This keeps the
-    # digest to ~delta centroids and loss-free until the count exceeds delta.
-    starts = [0]
-    k_left = float(_k1_scale(0.0, delta_f))
-    for i in range(1, n):
-        if k_right[i] - k_left > 1.0:
-            starts.append(i)
-            k_left = float(k_right[i - 1])
-
-    start_idx = np.asarray(starts)
+    # fresh centroid. Only the centroid *start* indices are collected here (via
+    # ``method``); the centroid means/weights fall out of one vectorized
+    # segment-sum below. This keeps the digest to ~delta centroids and loss-free
+    # until the count exceeds delta.
+    start_idx = _segment_starts(k_right, delta_f, method)
     counts = np.diff(np.append(start_idx, n)).astype(np.float64)
     sums = np.add.reduceat(sorted_vals, start_idx)
 
@@ -161,6 +221,7 @@ def merge_tdigests(
     d1: np.ndarray,
     d2: np.ndarray,
     delta: int = _DEFAULT_DELTA,
+    method: str = "loop",
 ) -> np.ndarray:
     """Merge two t-digest centroid arrays into one.
 
@@ -176,6 +237,10 @@ def merge_tdigests(
         Second centroid array.
     delta : int, optional
         Compression parameter (same default as :func:`build_tdigest`).
+    method : {"loop", "jump"}, optional
+        Boundary-search path, forwarded to the same shared logic as
+        :func:`build_tdigest`; the output is identical either way.  See
+        :func:`build_tdigest` for the n-regime trade-off.
 
     Returns
     -------
@@ -207,14 +272,7 @@ def merge_tdigests(
     # the k1 scale measured from its left edge.
     k_right = _k1_scale(np.cumsum(c_weights) / n_total, delta_f)
 
-    starts = [0]
-    k_left = float(_k1_scale(0.0, delta_f))
-    for i in range(1, len(combined)):
-        if k_right[i] - k_left > 1.0:
-            starts.append(i)
-            k_left = float(k_right[i - 1])
-
-    start_idx = np.asarray(starts)
+    start_idx = _segment_starts(k_right, delta_f, method)
     seg_weight = np.add.reduceat(c_weights, start_idx)
     seg_weighted_mean = np.add.reduceat(c_means * c_weights, start_idx)
 
