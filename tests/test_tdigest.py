@@ -357,3 +357,58 @@ class TestScaleFunctionRegression:
         merged = merge_tdigests(d1, d2, delta=delta)
         assert merged.shape[0] <= 2 * delta
         np.testing.assert_almost_equal(float(merged[:, 1].sum()), 100_000, decimal=3)
+
+
+class TestVectorizedSegmentation:
+    """The vectorized build/merge must agree with a direct reference (issue #48).
+
+    build_tdigest computes centroid means/weights with a single segment-sum
+    (np.add.reduceat) over the sorted values instead of a per-observation
+    Welford loop. These tests pin that the segmentation and the weighted-mean
+    arithmetic are exactly what an explicit per-centroid reconstruction yields.
+    """
+
+    @staticmethod
+    def _reference_from_digest(sorted_vals, digest):
+        """Rebuild expected (mean, weight) by slicing sorted_vals by the weights.
+
+        Centroid k owns the next ``weight[k]`` sorted observations, so its mean
+        must equal that slice's mean — a check independent of how build_tdigest
+        partitions internally.
+        """
+        weights = digest[:, 1].astype(int)
+        assert weights.sum() == len(sorted_vals)
+        out = np.empty_like(digest)
+        start = 0
+        for k, w in enumerate(weights):
+            sl = sorted_vals[start : start + w]
+            out[k, 0] = sl.mean()
+            out[k, 1] = w
+            start += w
+        return out
+
+    @pytest.mark.parametrize("n", [1, 2, 7, 1000, 50_000])
+    def test_build_means_match_slice_means(self, n):
+        rng = np.random.default_rng(n)
+        vals = rng.standard_normal(n)
+        digest = build_tdigest(vals, delta=512)
+        expected = self._reference_from_digest(np.sort(vals), digest)
+        # weights are exact integers; means within float32 rounding of the slice mean
+        np.testing.assert_array_equal(digest[:, 1], expected[:, 1])
+        np.testing.assert_allclose(digest[:, 0], expected[:, 0], rtol=0, atol=1e-4)
+
+    def test_build_weights_are_integral_and_sum_to_n(self):
+        rng = np.random.default_rng(0)
+        vals = rng.standard_normal(12_345)
+        digest = build_tdigest(vals, delta=256)
+        w = digest[:, 1]
+        np.testing.assert_array_equal(w, np.round(w))  # integral weights
+        assert float(w.sum()) == 12_345.0
+
+    def test_merge_conserves_weight_and_sorts_means(self):
+        rng = np.random.default_rng(3)
+        d1 = build_tdigest(rng.standard_normal(8000), delta=512)
+        d2 = build_tdigest(rng.standard_normal(12_000), delta=512)
+        merged = merge_tdigests(d1, d2, delta=512)
+        np.testing.assert_almost_equal(float(merged[:, 1].sum()), 20_000.0, decimal=3)
+        assert np.all(merged[1:, 0] >= merged[:-1, 0])
