@@ -29,29 +29,36 @@ from zagg.viz.shardmap import grid_from_signature
 _POLAR_LAT = 60.0
 
 # proj4leaflet projection definitions for the two NASA polar-stereographic
-# grids. ``resolutions`` and ``bounds`` follow the GIBS tile matrix sets so the
-# WMTS basemaps below line up (the published EPSG:3413 / EPSG:3031 GIBS tile
-# pyramids, 8192 m down to 256 m per pixel over a +-4194304 m extent).
+# grids. These mirror ipyleaflet's own bundled ``projections.EPSG3413/3031
+# ["NASAGIBS"]`` (proj4 string, origin, bounds, and the full 7-level GIBS 500m
+# tile-matrix-set resolution pyramid, 16384 m down to 256 m per pixel over a
+# +-4194304 m extent) so the WMTS basemaps below line up zoom-for-zoom. Kept
+# here as plain dicts so this module stays ipyleaflet-free and headlessly
+# testable.
+_GIBS_RESOLUTIONS = [16384.0, 8192.0, 4096.0, 2048.0, 1024.0, 512.0, 256.0]
+_GIBS_ORIGIN = [-4194304, 4194304]
+_GIBS_BOUNDS = [[-4194304, -4194304], [4194304, 4194304]]
+
 _PROJ_3413 = {
     "name": "EPSG:3413",
     "proj4def": (
         "+proj=stere +lat_0=90 +lat_ts=70 +lon_0=-45 +k=1 +x_0=0 +y_0=0 "
-        "+a=6378137 +b=6356752.3142 +units=m +no_defs"
+        "+ellps=WGS84 +datum=WGS84 +units=m +no_defs"
     ),
-    "origin": [-4194304, 4194304],
-    "bounds": [[-4194304, -4194304], [4194304, 4194304]],
-    "resolutions": [8192.0, 4096.0, 2048.0, 1024.0, 512.0, 256.0],
+    "origin": _GIBS_ORIGIN,
+    "bounds": _GIBS_BOUNDS,
+    "resolutions": _GIBS_RESOLUTIONS,
 }
 
 _PROJ_3031 = {
     "name": "EPSG:3031",
     "proj4def": (
         "+proj=stere +lat_0=-90 +lat_ts=-71 +lon_0=0 +k=1 +x_0=0 +y_0=0 "
-        "+a=6378137 +b=6356752.3142 +units=m +no_defs"
+        "+datum=WGS84 +units=m +no_defs"
     ),
-    "origin": [-4194304, 4194304],
-    "bounds": [[-4194304, -4194304], [4194304, 4194304]],
-    "resolutions": [8192.0, 4096.0, 2048.0, 1024.0, 512.0, 256.0],
+    "origin": _GIBS_ORIGIN,
+    "bounds": _GIBS_BOUNDS,
+    "resolutions": _GIBS_RESOLUTIONS,
 }
 
 # NASA GIBS WMTS basemap (BlueMarble shaded relief, a static all-time layer) per
@@ -87,6 +94,11 @@ def shardmap_bbox(shardmap) -> tuple[float, float, float, float]:
 
     Computed from the union of the shard footprints (rebuilt from the map's own
     ``grid_signature``), so it reflects exactly the area the viewer will draw.
+
+    Note: for a footprint that encloses a pole the longitude extent degenerates
+    to roughly the full ``[-180, 180]`` (the cell wraps the pole), so callers
+    should rely on the latitude extent for a pole-enclosing map. :func:`pick_crs`
+    keys on latitude only for exactly this reason.
 
     Raises
     ------

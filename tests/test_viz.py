@@ -344,10 +344,26 @@ class TestSeamAwareLayers:
         assert split["type"] == "MultiPolygon"
         assert unsplit["type"] == "Polygon"
 
-    def test_granule_footprints_seam_flag(self, catalog):
-        fc = granule_footprints(catalog, split_seam=False)
-        assert _is_geojson(fc)
-        assert all(f["geometry"]["type"] == "Polygon" for f in fc["features"])
+    def test_granule_footprints_seam_flag(self):
+        # A footprint straddling +-180 (ring jumps 178 -> -178): split_seam=True
+        # cuts it into a MultiPolygon, but split_seam=False (polar CRS) keeps the
+        # single ring -- so the flag, not the data, decides the geometry type.
+        ring = [[178.0, 70.0], [-178.0, 70.0], [-178.0, 72.0], [178.0, 72.0], [178.0, 70.0]]
+        item = {
+            "type": "Feature", "stac_version": "1.0.0", "id": "Gx",
+            "geometry": {"type": "Polygon", "coordinates": [ring]},
+            "bbox": [-180.0, 70.0, 180.0, 72.0],
+            "properties": {"datetime": "2025-06-01T00:00:00Z"},
+            "collection": "TEST", "stac_extensions": [], "links": [],
+            "assets": {"data": {"href": "https://h/Gx.h5", "roles": ["data"]}},
+        }
+        cat = Catalog(
+            pa.table(sga.parse_stac_items_to_arrow([item])), {"collection": "TEST"}
+        )
+        split = granule_footprints(cat)["features"][0]["geometry"]
+        unsplit = granule_footprints(cat, split_seam=False)["features"][0]["geometry"]
+        assert split["type"] == "MultiPolygon"
+        assert unsplit["type"] == "Polygon"
 
 
 # ── phase 2: ipyleaflet wrapper (skips when the viz extra isn't installed) ────
