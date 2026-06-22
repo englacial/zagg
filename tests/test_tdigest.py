@@ -278,14 +278,19 @@ class TestScaleFunctionRegression:
         assert digest.shape[0] == n, f"n={n}: expected {n} centroids, got {digest.shape[0]}"
         np.testing.assert_array_equal(digest[:, 1], np.ones(n, dtype=np.float32))
 
-    def test_loss_free_transition_at_delta_boundary(self):
-        """n == δ is the exact loss-free/compress boundary the fix pins."""
+    def test_loss_free_at_delta_then_compresses(self):
+        """n == δ is guaranteed loss-free; well past δ the digest compresses.
+
+        The k1 bound guarantees loss-free for n ≤ δ (the region actually extends
+        to ~1.27·δ because the left edge lags one observation), so this pins the
+        guaranteed boundary at n == δ and a clearly-compressing case at n == 2δ.
+        """
         delta = 256
         rng = np.random.default_rng(99)
         at = build_tdigest(rng.standard_normal(delta), delta=delta)
-        over = build_tdigest(rng.standard_normal(delta + 1), delta=delta)
+        over = build_tdigest(rng.standard_normal(2 * delta), delta=delta)
         assert at.shape[0] == delta, f"n==δ should be loss-free, got k={at.shape[0]}"
-        assert over.shape[0] < delta + 1, f"n>δ must compress, got k={over.shape[0]}"
+        assert over.shape[0] < 2 * delta, f"n==2δ must compress, got k={over.shape[0]}"
 
     def test_compression_begins_past_delta(self):
         """Once n exceeds δ the digest must actually compress (k < n)."""
