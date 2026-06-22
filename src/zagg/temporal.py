@@ -1,0 +1,461 @@
+"""Temporal aggregation primitives for zagg.
+
+Streaming accumulators for cross-timestep reduction, per-timestep spatial
+functions for masked gridded data, and a domain-agnostic :func:`process_event`
+worker. These are the building blocks for temporal and event-based aggregation
+pipelines (e.g. computing storm summary statistics from reanalysis data).
+
+The built-ins seed the canonical registries in :mod:`zagg.registry` (#73) by
+*name*; external plugins add more through the same ``register_*`` helpers, and
+:func:`process_event` resolves every capability by name so the loop carries no
+domain knowledge. xarray is used only through methods on the arrays passed in,
+so importing this module stays cheap for spatial-only installs.
+
+Ported from antarctic_AR_dataset/artools/cloud/.
+"""
+
+import numpy as np
+
+from . import registry
+
+# ---------------------------------------------------------------------------
+# Temporal accumulators (streaming reducers)
+# ---------------------------------------------------------------------------
+
+
+class MaxAccumulator:
+    """Running maximum across timesteps."""
+
+    def __init__(self):
+        self.value = -np.inf
+
+    def update(self, val):
+        if val is not None and not np.isnan(val):
+            self.value = max(self.value, val)
+
+    def finalize(self):
+        return float(self.value) if self.value != -np.inf else np.nan
+
+
+class MinAccumulator:
+    """Running minimum across timesteps."""
+
+    def __init__(self):
+        self.value = np.inf
+
+    def update(self, val):
+        if val is not None and not np.isnan(val):
+            self.value = min(self.value, val)
+
+    def finalize(self):
+        return float(self.value) if self.value != np.inf else np.nan
+
+
+class SumAccumulator:
+    """Running sum across timesteps."""
+
+    def __init__(self):
+        self.value = 0.0
+        self.has_data = False
+
+    def update(self, val):
+        if val is not None and not np.isnan(val):
+            self.value += val
+            self.has_data = True
+
+    def finalize(self):
+        return float(self.value) if self.has_data else np.nan
+
+
+class WeightedMeanAccumulator:
+    """Running weighted mean across timesteps.
+
+    Spatial functions paired with this return ``(weighted_sum, weight_sum)``
+    tuples. The final result is the ratio.
+    """
+
+    def __init__(self):
+        self.weighted_sum = 0.0
+        self.weight_sum = 0.0
+
+    def update(self, val):
+        if val is None:
+            return
+        weighted_sum, weight_sum = val
+        if not np.isnan(weighted_sum) and not np.isnan(weight_sum):
+            self.weighted_sum += weighted_sum
+            self.weight_sum += weight_sum
+
+    def finalize(self):
+        if self.weight_sum > 0:
+            return float(self.weighted_sum / self.weight_sum)
+        return np.nan
+
+
+class FirstLandfallCapture:
+    """Captures a value only at the first triggered (e.g. landfall) timestep."""
+
+    def __init__(self):
+        self.value = None
+
+    def update(self, val):
+        if self.value is None and val is not None:
+            self.value = val
+
+    def finalize(self):
+        if self.value is None:
+            return np.nan
+        if isinstance(self.value, tuple):
+            weighted_sum, weight_sum = self.value
+            if weight_sum > 0:
+                return float(weighted_sum / weight_sum)
+            return np.nan
+        return float(self.value)
+
+
+registry.register_reducer("max", MaxAccumulator)
+registry.register_reducer("min", MinAccumulator)
+registry.register_reducer("sum", SumAccumulator)
+registry.register_reducer("weighted_mean", WeightedMeanAccumulator)
+registry.register_reducer("first_landfall", FirstLandfallCapture)
+
+#: The reducer registry (``zagg.registry.REDUCERS``); plugins may add more via
+#: ``registry.register_reducer``.
+REDUCERS = registry.REDUCERS
+
+
+# ---------------------------------------------------------------------------
+# Per-timestep spatial functions (operate on gridded fields with masks)
+# ---------------------------------------------------------------------------
+
+
+def _apply_mask(storm_mask_t, ais_mask_subset, mask_type):
+    """Combine an event mask with a spatial mask for one timestep.
+
+    Parameters
+    ----------
+    storm_mask_t : xr.DataArray
+        Binary event mask for one timestep (lat, lon).
+    ais_mask_subset : xr.DataArray
+        Spatial (e.g. ice-sheet) mask subsetted to the event extent.
+    mask_type : str
+        ``"ais"`` = event AND mask, ``"ocean"`` = event AND NOT mask,
+        ``"full"`` = event only.
+
+    Returns
+    -------
+    xr.DataArray
+    """
+    if mask_type == "ais":
+        return storm_mask_t.where(ais_mask_subset, 0)
+    elif mask_type == "ocean":
+        return storm_mask_t.where(~ais_mask_subset, 0)
+    else:
+        return storm_mask_t
+
+
+def spatial_max(var_t, combined_mask, cell_areas):
+    """Max value under the masked footprint for one timestep."""
+    vals = (var_t * combined_mask).values[combined_mask.values > 0]
+    if len(vals) == 0:
+        return np.nan
+    return float(np.nanmax(vals))
+
+
+def spatial_min(var_t, combined_mask, cell_areas):
+    """Min value under the masked footprint for one timestep."""
+    masked = var_t.where(combined_mask > 0)
+    vals = masked.values[~np.isnan(masked.values)]
+    if len(vals) == 0:
+        return np.nan
+    return float(np.nanmin(vals))
+
+
+def spatial_weighted_sum(var_t, combined_mask, cell_areas):
+    """Area-weighted sum under the masked footprint for one timestep."""
+    return float((var_t * combined_mask * cell_areas).sum().values)
+
+
+def spatial_weighted_mean_parts(var_t, combined_mask, cell_areas):
+    """Return ``(weighted_sum, weight_sum)`` for a streaming mean."""
+    weights = cell_areas * combined_mask
+    weighted_sum = float((var_t * combined_mask * cell_areas).sum().values)
+    weight_sum = float(weights.sum().values)
+    return (weighted_sum, weight_sum)
+
+
+def spatial_max_gradient(var_t, combined_mask, cell_areas):
+    """Max gradient magnitude under the masked footprint for one timestep."""
+    if (combined_mask == 0).all().values:
+        return np.nan
+
+    rads = var_t.assign_coords(
+        lon=np.radians(var_t.lon),
+        lat=np.radians(var_t.lat),
+    )
+    r = 6378  # Earth radius in km
+    lat_partials = rads.differentiate("lat") / r
+    lon_partials = rads.differentiate("lon") / (np.sin(rads.lat) * r)
+
+    magnitude = np.sqrt(lon_partials**2 + lat_partials**2)
+    grad_vals = magnitude.values * combined_mask.values
+    nonzero = grad_vals[combined_mask.values > 0]
+    if len(nonzero) == 0:
+        return np.nan
+    return float(np.nanmax(nonzero))
+
+
+def spatial_min_level_then_weighted_mean(var_t, combined_mask, cell_areas):
+    """For 3-D vars: min over levels, then area-weighted mean.
+
+    Returns a ``(weighted_sum, weight_sum)`` tuple.
+    """
+    var_2d = var_t.min("lev") if "lev" in var_t.dims else var_t
+
+    weights = cell_areas * combined_mask
+    weight_sum = float(weights.sum().values)
+    if weight_sum == 0:
+        return (np.nan, np.nan)
+
+    weighted_sum = float((var_2d * combined_mask * cell_areas).sum().values)
+    return (weighted_sum, weight_sum)
+
+
+registry.register_spatial_func("max", spatial_max)
+registry.register_spatial_func("min", spatial_min)
+registry.register_spatial_func("weighted_sum", spatial_weighted_sum)
+registry.register_spatial_func("weighted_mean", spatial_weighted_mean_parts)
+registry.register_spatial_func("max_gradient", spatial_max_gradient)
+registry.register_spatial_func("min_over_levels", spatial_min_level_then_weighted_mean)
+
+#: The spatial-function registry (``zagg.registry.SPATIAL_FUNCS``); plugins may
+#: add more via ``registry.register_spatial_func``.
+SPATIAL_FUNCS = registry.SPATIAL_FUNCS
+
+
+# ---------------------------------------------------------------------------
+# Built-in mask providers and field transforms
+#
+# A mask provider has signature ``fn(event_mask_t, static_data, spec) -> mask``;
+# a field transform has signature ``fn(var_t, static_data, spec) -> var_t``.
+# These built-ins are domain-neutral (the *combine* op and a generic monthly
+# anomaly). The *meaning* of "ais" — i.e. which static array is the ice sheet —
+# is config (``data_source.static_data.ais_mask``); domain-specific providers
+# such as precip masking are contributed by plugins.
+# ---------------------------------------------------------------------------
+
+
+def mask_full(event_mask_t, static_data, spec):
+    """Event footprint only (no spatial mask)."""
+    return event_mask_t
+
+
+def mask_ais(event_mask_t, static_data, spec):
+    """Event AND the ``ais_mask`` static field."""
+    return _apply_mask(event_mask_t, static_data["ais_mask"].astype(bool), "ais")
+
+
+def mask_ocean(event_mask_t, static_data, spec):
+    """Event AND NOT the ``ais_mask`` static field."""
+    return _apply_mask(event_mask_t, static_data["ais_mask"].astype(bool), "ocean")
+
+
+registry.register_mask_provider("full", mask_full)
+registry.register_mask_provider("ais", mask_ais)
+registry.register_mask_provider("ocean", mask_ocean)
+
+#: The mask-provider registry (``zagg.registry.MASK_PROVIDERS``).
+MASK_PROVIDERS = registry.MASK_PROVIDERS
+
+
+def monthly_anomaly(var_t, static_data, spec):
+    """Subtract the monthly climatology for ``spec['variable']`` from ``var_t``.
+
+    Expects ``static_data['climatology']`` to be an ``xr.Dataset`` with the
+    aggregated variable indexed by a ``month`` dimension. The current month is
+    read from ``var_t``'s ``time`` coordinate.
+    """
+    clim = static_data["climatology"][spec["variable"]]
+    month = int(np.asarray(var_t["time"].dt.month))
+    clim_m = clim.sel(month=month)
+    # Align climatology to the timestep's spatial extent before subtracting.
+    clim_m = clim_m.sel(lat=var_t["lat"].values, lon=var_t["lon"].values)
+    return var_t - clim_m
+
+
+registry.register_field_transform("monthly_anomaly", monthly_anomaly)
+
+#: The field-transform registry (``zagg.registry.FIELD_TRANSFORMS``).
+FIELD_TRANSFORMS = registry.FIELD_TRANSFORMS
+
+
+# ---------------------------------------------------------------------------
+# Event worker core
+# ---------------------------------------------------------------------------
+
+
+def process_event(
+    event_key,
+    event_mask,
+    collections,
+    specs,
+    static_data,
+    *,
+    plugins=registry,
+    max_resident_timesteps=None,
+):
+    """Aggregate one spatiotemporal event into a row of scalar attributes.
+
+    The temporal counterpart of :func:`zagg.processing.process_shard`: it
+    streams over an event's timesteps, applies a per-timestep spatial function
+    under a mask, and reduces the results across time. All domain-specific
+    behaviour (mask semantics, anomaly/derivation transforms, event triggers,
+    spatial functions, reducers) is resolved *by name* through the plugin
+    registry, so the loop itself carries no storm/AR knowledge.
+
+    Parameters
+    ----------
+    event_key : hashable
+        Identifier for this event (e.g. ``storm_id``); echoed in the output.
+    event_mask : xr.DataArray
+        Binary mask with dims ``(time, lat, lon)`` describing where/when the
+        event is present.
+    collections : dict[str, xr.Dataset]
+        Source datasets keyed by collection name. May be lazy; this function
+        subsets to the event extent and the current time batch, then
+        ``.compute()``s, to bound memory.
+    specs : list[dict]
+        Aggregation specs (see :func:`specs_from_config`). Each must provide
+        ``output_name``, ``variable``, ``collection``, ``spatial_func``,
+        ``temporal_reducer``, ``mask``; optional keys: ``is_anomaly``,
+        ``negate``, ``transform`` (field-transform name), ``trigger``
+        (event-trigger name).
+    static_data : dict[str, xr.DataArray | xr.Dataset]
+        Static fields keyed by name, e.g. ``ais_mask``, ``cell_areas``,
+        ``climatology``. Spatial fields are subset to the event extent.
+    plugins : module or object, optional
+        Resolver exposing ``get_reducer`` / ``get_spatial_func`` /
+        ``get_mask_provider`` / ``get_field_transform`` / ``get_event_trigger``.
+        Defaults to :mod:`zagg.registry`.
+    max_resident_timesteps : int, optional
+        Number of timesteps to hold in memory per batch. ``None`` loads all.
+
+    Returns
+    -------
+    results : dict[str, float]
+        ``{output_name: scalar}`` for every spec.
+    metadata : dict
+        ``event_key``, ``timesteps_processed``, ``n_specs``, ``collections``.
+    """
+    lats = event_mask["lat"].values
+    lons = event_mask["lon"].values
+
+    # Subset spatial static fields to the event extent once (climatology keeps
+    # its month dimension; fields without lat/lon are passed through).
+    static_sub = {}
+    for name, arr in static_data.items():
+        try:
+            static_sub[name] = arr.sel(lat=lats, lon=lons)
+        except (KeyError, ValueError):
+            static_sub[name] = arr
+    cell_areas = static_sub.get("cell_areas")
+
+    # One accumulator per spec, plus resolved trigger timesteps (if any).
+    accumulators = {}
+    spec_triggers = {}
+    for spec in specs:
+        out = spec["output_name"]
+        accumulators[out] = plugins.get_reducer(spec["temporal_reducer"])()
+        trigger_name = spec.get("trigger")
+        if trigger_name:
+            trig = plugins.get_event_trigger(trigger_name)(event_mask, static_sub, spec)
+            # Keep native dtype (e.g. datetime64) so membership matches `t`.
+            spec_triggers[out] = set(np.atleast_1d(trig))
+        else:
+            spec_triggers[out] = None
+
+    times = list(np.asarray(event_mask["time"].values))
+    batch_size = max_resident_timesteps or len(times) or 1
+    n_processed = 0
+
+    for start in range(0, len(times), batch_size):
+        batch_times = times[start : start + batch_size]
+
+        # Load each needed collection for this batch, bounded to extent/time.
+        loaded = {}
+        for spec in specs:
+            cname = spec["collection"]
+            if cname in loaded:
+                continue
+            sub = collections[cname].sel(lat=lats, lon=lons).sel(time=batch_times)
+            loaded[cname] = sub.compute() if hasattr(sub, "compute") else sub
+
+        for t in batch_times:
+            storm_t = event_mask.sel(time=t)
+            for spec in specs:
+                out = spec["output_name"]
+                trig = spec_triggers[out]
+                if trig is not None and t not in trig:
+                    continue
+
+                var_t = loaded[spec["collection"]][spec["variable"]].sel(time=t)
+                if spec.get("is_anomaly"):
+                    var_t = plugins.get_field_transform("monthly_anomaly")(var_t, static_sub, spec)
+                if spec.get("transform"):
+                    var_t = plugins.get_field_transform(spec["transform"])(var_t, static_sub, spec)
+                if spec.get("negate"):
+                    var_t = -var_t
+
+                mask_t = plugins.get_mask_provider(spec["mask"])(storm_t, static_sub, spec)
+                value = plugins.get_spatial_func(spec["spatial_func"])(var_t, mask_t, cell_areas)
+                accumulators[out].update(value)
+            n_processed += 1
+
+    results = {out: acc.finalize() for out, acc in accumulators.items()}
+    metadata = {
+        "event_key": event_key,
+        "timesteps_processed": n_processed,
+        "n_specs": len(specs),
+        "collections": sorted({s["collection"] for s in specs}),
+    }
+    return results, metadata
+
+
+# ---------------------------------------------------------------------------
+# Config bridge
+# ---------------------------------------------------------------------------
+
+
+def specs_from_config(config):
+    """Convert temporal aggregation config to internal spec dicts.
+
+    Parameters
+    ----------
+    config : PipelineConfig
+
+    Returns
+    -------
+    list[dict]
+        Each dict has keys: ``output_name``, ``variable``, ``collection``,
+        ``spatial_func``, ``temporal_reducer``, ``mask``, ``is_anomaly``,
+        ``negate``, ``precip``, and the optional generic hooks ``transform``
+        (field-transform name) and ``trigger`` (event-trigger name).
+    """
+    specs = []
+    for name, meta in config.aggregation.get("variables", {}).items():
+        specs.append(
+            {
+                "output_name": name,
+                "variable": meta["variable"],
+                "collection": meta["collection"],
+                "spatial_func": meta["spatial_func"],
+                "temporal_reducer": meta["temporal_reducer"],
+                "mask": meta.get("mask", "ais"),
+                "is_anomaly": meta.get("anomaly", False),
+                "negate": meta.get("negate", False),
+                "precip": meta.get("precip", False),
+                "transform": meta.get("transform"),
+                "trigger": meta.get("trigger"),
+            }
+        )
+    return specs

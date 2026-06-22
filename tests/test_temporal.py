@@ -1,0 +1,401 @@
+"""Tests for the temporal aggregation primitives (issue #12 Phase 4)."""
+
+import numpy as np
+import pytest
+
+from zagg import registry
+from zagg.temporal import (
+    FirstLandfallCapture,
+    MaxAccumulator,
+    MinAccumulator,
+    SumAccumulator,
+    WeightedMeanAccumulator,
+    process_event,
+    specs_from_config,
+)
+
+# ---------------------------------------------------------------------------
+# Accumulator tests
+# ---------------------------------------------------------------------------
+
+
+class TestMaxAccumulator:
+    def test_basic(self):
+        acc = MaxAccumulator()
+        for v in [1.0, 3.0, 2.0]:
+            acc.update(v)
+        assert acc.finalize() == 3.0
+
+    def test_nan_ignored(self):
+        acc = MaxAccumulator()
+        acc.update(5.0)
+        acc.update(np.nan)
+        acc.update(2.0)
+        assert acc.finalize() == 5.0
+
+    def test_none_ignored(self):
+        acc = MaxAccumulator()
+        acc.update(None)
+        acc.update(4.0)
+        assert acc.finalize() == 4.0
+
+    def test_empty(self):
+        acc = MaxAccumulator()
+        assert np.isnan(acc.finalize())
+
+
+class TestMinAccumulator:
+    def test_basic(self):
+        acc = MinAccumulator()
+        for v in [3.0, 1.0, 2.0]:
+            acc.update(v)
+        assert acc.finalize() == 1.0
+
+    def test_empty(self):
+        acc = MinAccumulator()
+        assert np.isnan(acc.finalize())
+
+
+class TestSumAccumulator:
+    def test_basic(self):
+        acc = SumAccumulator()
+        for v in [1.0, 2.0, 3.0]:
+            acc.update(v)
+        assert acc.finalize() == pytest.approx(6.0)
+
+    def test_nan_ignored(self):
+        acc = SumAccumulator()
+        acc.update(1.0)
+        acc.update(np.nan)
+        acc.update(2.0)
+        assert acc.finalize() == pytest.approx(3.0)
+
+    def test_empty(self):
+        acc = SumAccumulator()
+        assert np.isnan(acc.finalize())
+
+
+class TestWeightedMeanAccumulator:
+    def test_basic(self):
+        acc = WeightedMeanAccumulator()
+        # weighted_sum=10, weight_sum=2 -> mean=5
+        acc.update((10.0, 2.0))
+        # weighted_sum=30, weight_sum=3 -> mean=6
+        acc.update((30.0, 3.0))
+        # total: 40/5 = 8
+        assert acc.finalize() == pytest.approx(8.0)
+
+    def test_none_ignored(self):
+        acc = WeightedMeanAccumulator()
+        acc.update(None)
+        acc.update((10.0, 2.0))
+        assert acc.finalize() == pytest.approx(5.0)
+
+    def test_empty(self):
+        acc = WeightedMeanAccumulator()
+        assert np.isnan(acc.finalize())
+
+
+class TestFirstLandfallCapture:
+    def test_captures_first(self):
+        acc = FirstLandfallCapture()
+        acc.update(None)
+        acc.update(42.0)
+        acc.update(99.0)
+        assert acc.finalize() == 42.0
+
+    def test_tuple_value(self):
+        acc = FirstLandfallCapture()
+        acc.update((10.0, 2.0))
+        assert acc.finalize() == pytest.approx(5.0)
+
+    def test_empty(self):
+        acc = FirstLandfallCapture()
+        assert np.isnan(acc.finalize())
+
+
+# ---------------------------------------------------------------------------
+# Registry seeding — built-ins land in the canonical zagg.registry (#73)
+# ---------------------------------------------------------------------------
+
+
+class TestRegistrySeeding:
+    def test_reducers_registered(self):
+        # The registry is extensible (plugins add more); built-ins are a subset.
+        assert {
+            "max",
+            "min",
+            "sum",
+            "weighted_mean",
+            "first_landfall",
+        } <= set(registry.list_reducers())
+
+    def test_spatial_funcs_registered(self):
+        assert {
+            "max",
+            "min",
+            "weighted_sum",
+            "weighted_mean",
+            "max_gradient",
+            "min_over_levels",
+        } <= set(registry.list_spatial_funcs())
+
+    def test_mask_providers_registered(self):
+        assert {"full", "ais", "ocean"} <= set(registry.list_mask_providers())
+
+    def test_field_transforms_registered(self):
+        assert "monthly_anomaly" in set(registry.list_field_transforms())
+
+    def test_reducers_satisfy_protocol(self):
+        for name in ("max", "min", "sum", "weighted_mean", "first_landfall"):
+            acc = registry.get_reducer(name)()
+            assert hasattr(acc, "update"), f"{name} missing update()"
+            assert hasattr(acc, "finalize"), f"{name} missing finalize()"
+
+    def test_spatial_funcs_callable(self):
+        for name in registry.list_spatial_funcs():
+            assert callable(registry.get_spatial_func(name)), f"{name} not callable"
+
+
+# ---------------------------------------------------------------------------
+# Config bridge
+# ---------------------------------------------------------------------------
+
+
+def _temporal_config():
+    from zagg.config import load_config_from_dict
+
+    return load_config_from_dict(
+        {
+            "pipeline": {"type": "temporal"},
+            "data_source": {"reader": "xarray_s3", "collections": ["merra2"]},
+            "aggregation": {
+                "variables": {
+                    "max_t2m_ais": {
+                        "variable": "T2M",
+                        "collection": "merra2",
+                        "spatial_func": "max",
+                        "temporal_reducer": "max",
+                        "mask": "ais",
+                    },
+                    "anom_iwv_full": {
+                        "variable": "TQV",
+                        "collection": "merra2",
+                        "spatial_func": "weighted_mean",
+                        "temporal_reducer": "weighted_mean",
+                        "mask": "full",
+                        "anomaly": True,
+                    },
+                    "rainfall_ocean": {
+                        "variable": "PRECTOT",
+                        "collection": "merra2",
+                        "spatial_func": "weighted_sum",
+                        "temporal_reducer": "sum",
+                        "mask": "ocean",
+                        "precip": True,
+                    },
+                }
+            },
+            "output": {"format": "tabular", "store": "."},
+        }
+    )
+
+
+class TestSpecsFromConfig:
+    def test_one_spec_per_variable(self):
+        specs = specs_from_config(_temporal_config())
+        names = {s["output_name"] for s in specs}
+        assert names == {"max_t2m_ais", "anom_iwv_full", "rainfall_ocean"}
+
+    def test_keys_present(self):
+        specs = specs_from_config(_temporal_config())
+        required = {
+            "output_name",
+            "variable",
+            "collection",
+            "spatial_func",
+            "temporal_reducer",
+            "mask",
+            "is_anomaly",
+            "negate",
+            "precip",
+            "transform",
+            "trigger",
+        }
+        for spec in specs:
+            assert set(spec) == required, f"bad keys for {spec['output_name']}"
+
+    def test_flag_defaults_and_overrides(self):
+        specs = {s["output_name"]: s for s in specs_from_config(_temporal_config())}
+        assert specs["anom_iwv_full"]["is_anomaly"] is True
+        assert specs["max_t2m_ais"]["is_anomaly"] is False
+        assert specs["rainfall_ocean"]["precip"] is True
+        # default mask is "ais" when omitted; here every spec sets it explicitly
+        assert specs["rainfall_ocean"]["mask"] == "ocean"
+
+
+# ---------------------------------------------------------------------------
+# Spatial functions with synthetic xarray data
+# ---------------------------------------------------------------------------
+
+
+class TestSpatialFunctions:
+    @pytest.fixture
+    def grid_3x3(self):
+        xr = pytest.importorskip("xarray")
+        lat = np.array([-70.0, -69.5, -69.0])
+        lon = np.array([0.0, 0.5, 1.0])
+        values = np.array(
+            [
+                [1.0, 2.0, 3.0],
+                [4.0, 5.0, 6.0],
+                [7.0, 8.0, 9.0],
+            ]
+        )
+        var = xr.DataArray(values, dims=["lat", "lon"], coords={"lat": lat, "lon": lon})
+        mask = xr.DataArray(
+            np.array([[1, 1, 0], [1, 1, 0], [0, 0, 0]], dtype=float),
+            dims=["lat", "lon"],
+            coords={"lat": lat, "lon": lon},
+        )
+        areas = xr.DataArray(np.ones((3, 3)), dims=["lat", "lon"], coords={"lat": lat, "lon": lon})
+        return var, mask, areas
+
+    def test_spatial_max(self, grid_3x3):
+        from zagg.temporal import spatial_max
+
+        var, mask, areas = grid_3x3
+        assert spatial_max(var, mask, areas) == 5.0
+
+    def test_spatial_min(self, grid_3x3):
+        from zagg.temporal import spatial_min
+
+        var, mask, areas = grid_3x3
+        assert spatial_min(var, mask, areas) == 1.0
+
+    def test_spatial_weighted_sum(self, grid_3x3):
+        from zagg.temporal import spatial_weighted_sum
+
+        var, mask, areas = grid_3x3
+        # masked values: 1+2+4+5 = 12, areas=1
+        assert spatial_weighted_sum(var, mask, areas) == pytest.approx(12.0)
+
+    def test_spatial_weighted_mean_parts(self, grid_3x3):
+        from zagg.temporal import spatial_weighted_mean_parts
+
+        var, mask, areas = grid_3x3
+        ws, wt = spatial_weighted_mean_parts(var, mask, areas)
+        assert ws == pytest.approx(12.0)  # sum of masked values * areas
+        assert wt == pytest.approx(4.0)  # sum of mask * areas
+
+    def test_spatial_max_empty_mask(self, grid_3x3):
+        from zagg.temporal import spatial_max
+
+        xr = pytest.importorskip("xarray")
+        var, _, areas = grid_3x3
+        empty = xr.zeros_like(var)
+        assert np.isnan(spatial_max(var, empty, areas))
+
+
+# ---------------------------------------------------------------------------
+# Mask providers
+# ---------------------------------------------------------------------------
+
+
+class TestMaskProviders:
+    @pytest.fixture
+    def masks(self):
+        xr = pytest.importorskip("xarray")
+        lat = np.array([-70.0, -69.5])
+        lon = np.array([0.0, 0.5])
+        coords = {"lat": lat, "lon": lon}
+        event = xr.DataArray(np.ones((2, 2)), dims=["lat", "lon"], coords=coords)
+        ais = xr.DataArray(
+            np.array([[1, 0], [0, 1]], dtype=float), dims=["lat", "lon"], coords=coords
+        )
+        return event, {"ais_mask": ais}
+
+    def test_full_passes_through(self, masks):
+        event, static = masks
+        out = registry.get_mask_provider("full")(event, static, {})
+        assert float(out.sum()) == 4.0
+
+    def test_ais_keeps_ice(self, masks):
+        event, static = masks
+        out = registry.get_mask_provider("ais")(event, static, {})
+        # AIS mask has two True cells -> two retained
+        assert float(out.sum()) == 2.0
+
+    def test_ocean_is_complement(self, masks):
+        event, static = masks
+        out = registry.get_mask_provider("ocean")(event, static, {})
+        assert float(out.sum()) == 2.0
+
+
+# ---------------------------------------------------------------------------
+# process_event end-to-end on synthetic data
+# ---------------------------------------------------------------------------
+
+
+def _event_inputs():
+    xr = pytest.importorskip("xarray")
+    lat = np.array([-70.0, -69.5])
+    lon = np.array([0.0, 0.5])
+    time = np.array(["2020-01-01T00", "2020-01-01T03", "2020-01-01T06"], dtype="datetime64[ns]")
+    coords = {"time": time, "lat": lat, "lon": lon}
+    event_mask = xr.DataArray(np.ones((3, 2, 2)), dims=["time", "lat", "lon"], coords=coords)
+    # T rises each timestep; cell-level max over the footprint then max-over-time.
+    temp = xr.DataArray(
+        np.stack(
+            [
+                np.full((2, 2), 1.0),
+                np.full((2, 2), 5.0),
+                np.full((2, 2), 3.0),
+            ]
+        ),
+        dims=["time", "lat", "lon"],
+        coords=coords,
+    )
+    collections = {"merra2": xr.Dataset({"T2M": temp})}
+    areas = xr.DataArray(np.ones((2, 2)), dims=["lat", "lon"], coords={"lat": lat, "lon": lon})
+    static = {"cell_areas": areas}
+    specs = [
+        {
+            "output_name": "max_t2m",
+            "variable": "T2M",
+            "collection": "merra2",
+            "spatial_func": "max",
+            "temporal_reducer": "max",
+            "mask": "full",
+        }
+    ]
+    return event_mask, collections, specs, static
+
+
+class TestProcessEvent:
+    def test_max_over_time(self):
+        event_mask, collections, specs, static = _event_inputs()
+        results, meta = process_event("storm1", event_mask, collections, specs, static)
+        assert results["max_t2m"] == pytest.approx(5.0)
+        assert meta["event_key"] == "storm1"
+        assert meta["timesteps_processed"] == 3
+        assert meta["n_specs"] == 1
+        assert meta["collections"] == ["merra2"]
+
+    def test_batching_is_invariant(self):
+        # Streaming in batches of 1 must yield the same reduction as one batch.
+        event_mask, collections, specs, static = _event_inputs()
+        full, _ = process_event("storm1", event_mask, collections, specs, static)
+        batched, meta = process_event(
+            "storm1", event_mask, collections, specs, static, max_resident_timesteps=1
+        )
+        assert batched["max_t2m"] == pytest.approx(full["max_t2m"])
+        assert meta["timesteps_processed"] == 3
+
+    def test_negate_flips_extremum(self):
+        event_mask, collections, specs, static = _event_inputs()
+        specs[0]["negate"] = True
+        specs[0]["temporal_reducer"] = "max"
+        results, _ = process_event("storm1", event_mask, collections, specs, static)
+        # negated max over {-1,-5,-3} is -1
+        assert results["max_t2m"] == pytest.approx(-1.0)

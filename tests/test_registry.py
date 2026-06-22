@@ -37,10 +37,21 @@ _EXPECTED_REGISTRIES = {
 
 @pytest.fixture(autouse=True)
 def _clean_registries():
-    """Snapshot every registry + the discovery flags; restore on teardown."""
+    """Snapshot every registry + the discovery flags, run each test against an
+    empty slate, and restore the real state on teardown.
+
+    Clearing at setup keeps these tests independent of import order: once
+    ``zagg.temporal`` is imported (#12 Phase 4) its built-ins seed the global
+    registries, which would otherwise leak into the exact-contents assertions
+    here. Teardown restores whatever was registered before the test.
+    """
     saved = {kind: dict(reg._entries) for kind, reg in registry._REGISTRIES.items()}
     saved_discovered = registry._DISCOVERED
     saved_discovering = registry._DISCOVERING
+    for reg in registry._REGISTRIES.values():
+        reg._entries.clear()
+    registry._DISCOVERED = False
+    registry._DISCOVERING = False
     yield
     for kind, reg in registry._REGISTRIES.items():
         reg._entries.clear()
