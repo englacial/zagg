@@ -294,6 +294,18 @@ def _validate_chunk_precompute(aggregation: dict, ds_vars: set[str]) -> None:
     ``source`` / expression / param column references must exist in
     ``data_source.variables``. ``dtype`` (optional) must be a valid numpy dtype.
 
+    A precompute name must not collide with a ``data_source.variables`` column or
+    a reserved namespace name (``leaf_id``): the per-cell namespace is built as
+    ``{**cell_data, **chunk_scalars}`` in :func:`zagg.processing.process_shard`, so
+    a colliding name would shadow the real column *array* with a 0-d *scalar* and
+    corrupt every cell. Such names are rejected here.
+
+    Inter-precompute references are NOT supported: an entry's expression is
+    evaluated only over the pooled columns (:func:`zagg.processing._eval_chunk_precompute`
+    iterates the entries independently, with no defined order), so one entry cannot
+    reference another (e.g. ``chunk_gain`` cannot read ``chunk_offset``). A name
+    that references another precompute entry is rejected as an unknown column.
+
     The block is optional; a config without it is unchanged.
 
     Parameters
@@ -313,9 +325,17 @@ def _validate_chunk_precompute(aggregation: dict, ds_vars: set[str]) -> None:
         return
     if not isinstance(precompute, dict):
         raise ValueError("aggregation.chunk_precompute must be a mapping of name -> entry")
+    reserved = ds_vars | {"leaf_id"}
     for name, meta in precompute.items():
         if not isinstance(name, str) or not name.strip():
             raise ValueError("chunk_precompute entry names must be non-empty strings")
+        if name in reserved:
+            raise ValueError(
+                f"chunk_precompute '{name}': name collides with a "
+                f"data_source.variables column or the reserved 'leaf_id'; the "
+                f"per-cell namespace merge would shadow the real column with a "
+                f"chunk scalar. Rename the precompute entry."
+            )
         if not isinstance(meta, dict):
             raise ValueError(f"chunk_precompute '{name}': entry must be a mapping")
 
