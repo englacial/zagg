@@ -1,0 +1,111 @@
+# ATL03 per-chunk-anchored waveform-counts template (issue #30, item 1).
+#
+# Worked example of the per-chunk precompute hook: the "compute once per chunk,
+# use per cell" primitive. The ``aggregation.chunk_precompute`` block is
+# evaluated ONCE per chunk (shard) over the shard's POOLED photon heights, before
+# the per-cell loop, and the resulting chunk-level scalars are injected into every
+# cell's expression namespace. So every cell in a chunk shares one bin window,
+# unlike atl03_waveform_counts.yaml which anchors on each cell's own median.
+#
+# The anchor and gain (see issue #30 comment 4773320226):
+#   chunk_offset = floor(median(h_ph))   over the whole shard (pooled, not per-cell)
+#   chunk_gain   = smallest power-of-two (>= 0.5 m) whose 128 bins span the shard's
+#                  photon-height range  ->  2^ceil(log2((max - min) / 128)), floored at 0.5 m
+# The 128-bin window is [chunk_offset - 27*chunk_gain, chunk_offset + 101*chunk_gain),
+# so the floor(median) anchor lands in bin 28 (27 bins reserved below it, 100
+# above) -- the asymmetric layout @espg specified for a mostly-above-ground
+# return. Out-of-range photons are dropped (not counted), matching #30's spec.
+#
+# Note (issue #30 thread): the design target for the chunk anchor is the ATL03
+# reference DEM (``dem_h``), which gives a stable absolute frame. dem_h lives in
+# the segment-level geolocation group (one value per ~100 photons), a cross-group
+# / resolution-mismatch read that @espg deferred (the segment-level variable
+# schema change is a follow-up). This template therefore anchors on the pooled
+# ``median(h_ph)`` as the worked example of the hook; swapping in a ``dem_h``
+# source is a one-line change once that read lands.
+#
+# offset_h / gain_h are recorded as per-cell scalar fields: every cell in a chunk
+# carries the chunk's offset/gain identically (duplicated for now -- the compact
+# per-chunk companion-array storage is the #30 item-2 follow-on). A reader
+# reconstructs each chunk's altitude axis as ``offset_h + gain_h * arange(128)``.
+#
+# Confidence filter, multi-level form, read_plan and grid are identical to
+# atl03_waveform_counts.yaml so the planned-IO benefits (#43 Phase C) apply here
+# too; only the aggregation block differs.
+data_source:
+  reader: h5coro
+  driver: s3
+  groups: [gt1l, gt1r, gt2l, gt2r, gt3l, gt3r]
+  coordinates:
+    latitude: "/{group}/heights/lat_ph"
+    longitude: "/{group}/heights/lon_ph"
+  variables:
+    h_ph: "/{group}/heights/h_ph"
+  filters:
+    - dataset: "/{group}/heights/signal_conf_ph"
+      column: 0                  # land surface type; TEP is uniform across columns
+      op: ne
+      value: -2
+  base_level: photons
+  levels:
+    photons:
+      path: "/{group}/heights"
+      coordinates: {latitude: lat_ph, longitude: lon_ph}
+      link: null
+    segments:
+      path: "/{group}/geolocation"
+      coordinates: {latitude: reference_photon_lat, longitude: reference_photon_lon}
+      link:
+        to: photons
+        index_beg: "/{group}/geolocation/ph_index_beg"
+        count: "/{group}/geolocation/segment_ph_cnt"
+        index_base: 1            # ATL03 ph_index_beg is 1-based per the v3 dict
+  read_plan:
+    spatial_index: segments
+    pad: 1                       # one segment of padding on each side per #43
+
+aggregation:
+  # Evaluated ONCE per chunk over the shard's pooled h_ph, before the per-cell
+  # loop; the names below enter the per-cell expression namespace.
+  chunk_precompute:
+    # ``np.maximum`` (not the ``max`` builtin) floors the gain at 0.5 m, and the
+    # range uses ``np.max``/``np.min`` (not the ``ndarray.max()`` method): the
+    # expression sandbox runs with an empty ``__builtins__``, where an ndarray
+    # method call raises ``KeyError('__import__')`` but the functional numpy form
+    # is fine.
+    chunk_gain:
+      expression: "np.float32(np.maximum(0.5, 2.0 ** np.ceil(np.log2((np.max(h_ph) - np.min(h_ph)) / 128.0))))"
+      source: h_ph
+      dtype: float32
+    chunk_offset:
+      expression: "np.float32(np.floor(np.median(h_ph)))"
+      source: h_ph
+      dtype: float32
+  variables:
+    waveform_counts:
+      kind: vector
+      trailing_shape: 128
+      # references the chunk-level anchor/gain instead of a per-cell median, so
+      # every cell in the chunk shares one bin window (bin 28 anchored).
+      expression: "np.histogram(h_ph, 128, (chunk_offset - 27.0 * chunk_gain, chunk_offset + 101.0 * chunk_gain))[0].astype('uint32')"
+      source: h_ph
+      dtype: uint32
+      fill_value: 0
+    offset_h:
+      # records the chunk offset per cell (chunk-uniform; duplicated until the
+      # per-chunk companion-array storage of #30 item 2 lands).
+      expression: "chunk_offset"
+      source: h_ph
+      dtype: float32
+    gain_h:
+      expression: "chunk_gain"
+      source: h_ph
+      dtype: float32
+
+output:
+  grid:
+    type: rectilinear
+    crs: EPSG:4326
+    resolution: 0.0001            # degrees (~10 m at the equator)
+    bounds: [-180, -90, 180, 90]
+    chunk_shape: [256, 256]

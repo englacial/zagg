@@ -233,6 +233,12 @@ def validate_config(config: PipelineConfig) -> None:
     # function/expression, sources exist) but the entries are chunk-level scalars.
     _validate_chunk_precompute(config.aggregation, ds_vars)
 
+    # Chunk-precompute names are injected into the per-cell expression namespace
+    # (issue #30), so a per-cell ``expression`` (or its params) may reference them
+    # like a column. Treat them as valid identifiers in the per-cell validation.
+    precompute_names = set(config.aggregation.get("chunk_precompute", {}).keys())
+    expr_vars = ds_vars | precompute_names
+
     for name, meta in agg_vars.items():
         has_func = "function" in meta
         has_expr = "expression" in meta
@@ -260,19 +266,19 @@ def validate_config(config: PipelineConfig) -> None:
         for pval in meta.get("params", {}).values():
             if not isinstance(pval, str):
                 continue  # numeric literal
-            if pval in ds_vars or _is_numeric(pval):
-                continue  # column reference or number
+            if pval in expr_vars or _is_numeric(pval):
+                continue  # column / chunk-precompute reference or number
             # Expression containing column names (e.g. "1.0 / s_li**2")
-            if any(v in pval for v in ds_vars):
+            if any(v in pval for v in expr_vars):
                 continue
             raise ValueError(
                 f"Variable '{name}': param value '{pval}' references "
-                f"unknown column (available: {ds_vars})"
+                f"unknown column (available: {expr_vars})"
             )
 
-        # Validate expression column references
+        # Validate expression column references (chunk-precompute names included)
         if has_expr:
-            _validate_expression_columns(name, meta["expression"], ds_vars)
+            _validate_expression_columns(name, meta["expression"], expr_vars)
 
         # Validate the output-kind declaration (kind + trailing_shape + dtype)
         _validate_output_kind(name, meta)

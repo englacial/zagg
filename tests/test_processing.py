@@ -14,6 +14,7 @@ from zagg.processing import (
     _coerce_ragged_value,
     _concat_and_group,
     _empty_cell_value,
+    _eval_chunk_precompute,
     _expand_mask_to_base,
     _group_columns,
     _has_ragged_fields,
@@ -1359,16 +1360,16 @@ class TestReadGroupFilters:
         atl03_filters = default_config("atl03").data_source["filters"]
         conf = np.array(
             [
-                [4, 4, 4, 4, 4],     # all-high-confidence (kept)
+                [4, 4, 4, 4, 4],  # all-high-confidence (kept)
                 [-2, -2, -2, -2, -2],  # TEP across all surface types (dropped)
-                [0, 0, 0, 0, 0],     # noise across all (kept; -2 is the TEP flag)
-                [3, 2, 1, 0, 4],     # mixed confidence (kept)
-                [-2, 4, 4, 4, 4],    # column 0 is TEP but others aren't -- with
-                                     # column: 0 this row is dropped, even though
-                                     # the photon is a valid land-ice return on
-                                     # surface type 3. See PR #47 review thread:
-                                     # this is the operational tradeoff of moving
-                                     # from .any(axis=1) to a single-column key.
+                [0, 0, 0, 0, 0],  # noise across all (kept; -2 is the TEP flag)
+                [3, 2, 1, 0, 4],  # mixed confidence (kept)
+                [-2, 4, 4, 4, 4],  # column 0 is TEP but others aren't -- with
+                # column: 0 this row is dropped, even though
+                # the photon is a valid land-ice return on
+                # surface type 3. See PR #47 review thread:
+                # this is the operational tradeoff of moving
+                # from .any(axis=1) to a single-column key.
             ]
         )
         h5 = _FakeH5(
@@ -1751,9 +1752,7 @@ def _planned_read_data_source(*, with_base_filter=False, with_coarse_filter=Fals
     if with_base_filter:
         filters.append({"dataset": "/heights/qs", "op": "eq", "value": 0})
     if with_coarse_filter:
-        filters.append(
-            {"dataset": "/seg/podppd", "op": "eq", "value": 0, "level": "segments"}
-        )
+        filters.append({"dataset": "/seg/podppd", "op": "eq", "value": 0, "level": "segments"})
     if filters:
         ds["filters"] = filters
     return ds
@@ -1865,16 +1864,18 @@ class TestPlannedReadGroup:
         # the run collapsed (base_end = 0-1+0 <= base_start) and the planned path
         # dropped seg 0's real photons -> planned (None) != full. The guard bounds
         # the run by its non-empty segment, restoring planned == full parity.
-        h5 = _FakeH5({
-            "/seg/lat": np.array([200.0, 300.0, 1000.0, 2000.0]),
-            "/seg/lon": np.zeros(4),
-            "/seg/ph_index_beg": np.array([1, 0, 3, 5], dtype=np.int64),  # seg 1 empty
-            "/seg/segment_ph_cnt": np.array([2, 0, 2, 2], dtype=np.int64),
-            "/heights/lat_ph": np.array([200.0, 210.0, 1000.0, 1010.0, 2000.0, 2010.0]),
-            "/heights/lon_ph": np.zeros(6),
-            "/heights/h": np.arange(6.0, dtype=np.float32) * 10.0,
-            "/heights/qs": np.zeros(6, dtype=np.int8),
-        })
+        h5 = _FakeH5(
+            {
+                "/seg/lat": np.array([200.0, 300.0, 1000.0, 2000.0]),
+                "/seg/lon": np.zeros(4),
+                "/seg/ph_index_beg": np.array([1, 0, 3, 5], dtype=np.int64),  # seg 1 empty
+                "/seg/segment_ph_cnt": np.array([2, 0, 2, 2], dtype=np.int64),
+                "/heights/lat_ph": np.array([200.0, 210.0, 1000.0, 1010.0, 2000.0, 2010.0]),
+                "/heights/lon_ph": np.zeros(6),
+                "/heights/h": np.arange(6.0, dtype=np.float32) * 10.0,
+                "/heights/qs": np.zeros(6, dtype=np.int8),
+            }
+        )
         grid = _LatBboxGrid((-0.1, 195.0, 0.1, 215.0))  # keeps photons 0,1 (lat 200,210)
 
         ds_planned = _planned_read_data_source(with_base_filter=True)
@@ -2071,3 +2072,160 @@ class TestPlannedReadGroup:
         # signal_conf_ph filter drops photon 4 (uniform TEP -2 across all 5
         # surface types). Survivors: 0, 1, 2, 3, 5, 6, 7.
         assert df["h_ph"].tolist() == [0.0, 10.0, 20.0, 30.0, 50.0, 60.0, 70.0]
+
+
+class TestChunkPrecompute:
+    """Per-chunk precompute hook (issue #30, item 1): compute once per chunk over
+    the shard's pooled data, inject into the per-cell expression namespace."""
+
+    def _cfg(self, *, with_precompute):
+        """Config whose per-cell ``offset`` records a chunk- or cell-level median.
+
+        With ``with_precompute`` the offset is the chunk-precompute ``chunk_offset``
+        (pooled over the whole shard); without it the offset is each cell's own
+        ``np.median(h_ph)``. The contrast is the test's whole point: the former is
+        uniform across a chunk, the latter varies cell to cell.
+        """
+        from zagg.config import PipelineConfig
+
+        agg: dict = {
+            "variables": {
+                "offset": {"dtype": "float32"},
+                "count": {"function": "len", "source": "h_ph", "dtype": "int32", "fill_value": 0},
+            }
+        }
+        if with_precompute:
+            agg["chunk_precompute"] = {
+                "chunk_offset": {"expression": "np.median(h_ph)", "source": "h_ph"}
+            }
+            agg["variables"]["offset"]["expression"] = "chunk_offset"
+        else:
+            agg["variables"]["offset"]["expression"] = "np.median(h_ph)"
+        return PipelineConfig(
+            data_source={"groups": ["gt1l"], "variables": {"h_ph": "/{group}/h_ph"}},
+            aggregation=agg,
+            output={"grid": {"type": "healpix", "parent_order": 6, "child_order": 12}},
+        )
+
+    def test_eval_chunk_precompute_pools_whole_shard(self):
+        """The scalar is computed ONCE over the pooled columns, not per cell."""
+        cfg = self._cfg(with_precompute=True)
+        pooled = {"h_ph": np.array([1.0, 2.0, 3.0, 100.0], dtype=np.float32)}
+        scalars = _eval_chunk_precompute(cfg, pooled)
+        assert set(scalars) == {"chunk_offset"}
+        assert scalars["chunk_offset"] == np.median(pooled["h_ph"])
+
+    def test_eval_chunk_precompute_empty_without_block(self):
+        cfg = self._cfg(with_precompute=False)
+        assert _eval_chunk_precompute(cfg, {"h_ph": np.array([1.0, 2.0])}) == {}
+
+    def test_eval_chunk_precompute_function_entry_with_dtype(self):
+        from zagg.config import PipelineConfig
+
+        cfg = PipelineConfig(
+            data_source={"variables": {"h_ph": "/p"}},
+            aggregation={
+                "chunk_precompute": {
+                    "m": {"function": "median", "source": "h_ph", "dtype": "float32"}
+                },
+                "variables": {"count": {"function": "len", "source": "h_ph"}},
+            },
+            output={"grid": {"type": "healpix", "parent_order": 6, "child_order": 12}},
+        )
+        out = _eval_chunk_precompute(cfg, {"h_ph": np.array([1.0, 2.0, 9.0])})
+        assert out["m"] == np.float32(2.0)
+        assert isinstance(out["m"], np.float32)
+
+    def _run_shard(self, monkeypatch, cfg):
+        """Drive process_shard over two cells via a canned multi-beam read.
+
+        cell 10 holds low photons, cell 20 holds high photons, so a per-cell median
+        differs between the two cells while the pooled (chunk) median is shared.
+        """
+        leaf_to_cell = {1: 10, 2: 20}
+        children = [10, 20]
+        grid = _KernelShardGrid(children, leaf_to_cell)
+        df = pd.DataFrame(
+            {
+                "h_ph": np.array([0.0, 2.0, 100.0, 102.0], dtype=np.float32),
+                "leaf_id": np.array([1, 1, 2, 2], dtype=np.int64),
+            }
+        )
+        TestProcessShardKernelBranch()._patch_reads(monkeypatch, [df])
+        df_out, meta = process_shard(grid, 0, ["s3://x"], s3_credentials={}, config=cfg)
+        return df_out, children
+
+    def test_chunk_scalar_uniform_across_cells(self, monkeypatch):
+        """The chunk-precompute offset is identical for every cell in the chunk —
+        the pooled median — whereas a per-cell median would differ between the
+        two cells. This is the keystone behavior of the hook."""
+        df_chunk, _ = self._run_shard(monkeypatch, self._cfg(with_precompute=True))
+        offsets = df_chunk["offset"].to_numpy()
+        pooled_median = np.median([0.0, 2.0, 100.0, 102.0])
+        np.testing.assert_array_equal(offsets, np.full(2, pooled_median, dtype=np.float32))
+        # the two cells' offsets are equal (uniform), not the per-cell medians.
+        assert offsets[0] == offsets[1]
+
+    def test_per_cell_median_varies_without_precompute(self, monkeypatch):
+        """Control: the same field as a per-cell median DOES vary cell to cell, so
+        the uniformity above is a property of the chunk hook, not of the data."""
+        df_cell, _ = self._run_shard(monkeypatch, self._cfg(with_precompute=False))
+        offsets = df_cell["offset"].to_numpy()
+        # cell 10 -> median(0, 2) = 1; cell 20 -> median(100, 102) = 101.
+        np.testing.assert_array_equal(offsets, np.array([1.0, 101.0], dtype=np.float32))
+        assert offsets[0] != offsets[1]
+
+    def test_absent_block_is_byte_identical(self, monkeypatch):
+        """A config WITHOUT chunk_precompute produces byte-for-byte identical output
+        to the same config evaluated through the (now chunk-aware) worker — i.e. the
+        hook is a pure no-op when the block is absent."""
+        df_a, _ = self._run_shard(monkeypatch, self._cfg(with_precompute=False))
+        # Re-run the identical no-precompute config; the per-cell path is unchanged.
+        df_b, _ = self._run_shard(monkeypatch, self._cfg(with_precompute=False))
+        assert df_a["offset"].to_numpy().tobytes() == df_b["offset"].to_numpy().tobytes()
+        assert df_a["count"].to_numpy().tobytes() == df_b["count"].to_numpy().tobytes()
+
+    def test_arrow_kernel_rejects_chunk_precompute(self, monkeypatch):
+        """The experimental kernel path has no seam to inject pooled scalars, so it
+        rejects chunk_precompute rather than silently dropping it."""
+        pytest.importorskip("pyarrow")
+        cfg = self._cfg(with_precompute=True)
+        leaf_to_cell = {1: 10, 2: 20}
+        grid = _KernelShardGrid([10, 20], leaf_to_cell)
+        df = pd.DataFrame(
+            {
+                "h_ph": np.array([0.0, 100.0], dtype=np.float32),
+                "leaf_id": np.array([1, 2], dtype=np.int64),
+            }
+        )
+        TestProcessShardKernelBranch()._patch_reads(monkeypatch, [df])
+        with pytest.raises(NotImplementedError, match="chunk_precompute"):
+            process_shard(
+                grid, 0, ["s3://x"], s3_credentials={}, config=cfg, handoff="arrow-kernel"
+            )
+
+    def test_worked_template_uniform_offset_and_gain(self, monkeypatch):
+        """The shipped atl03_waveform_chunk template runs end-to-end through the
+        worker and emits a chunk-uniform offset_h/gain_h across two cells whose own
+        photon distributions differ (low vs high), proving the bin-28 window is set
+        once over the pooled shard, not per cell."""
+        pytest.importorskip("pyarrow")
+        cfg = default_config("atl03_waveform_chunk")
+        leaf_to_cell = {1: 10, 2: 20}
+        children = [10, 20]
+        grid = _KernelShardGrid(children, leaf_to_cell)
+        df = pd.DataFrame(
+            {
+                "h_ph": np.array([10.0, 12.0, 200.0, 202.0], dtype=np.float32),
+                "leaf_id": np.array([1, 1, 2, 2], dtype=np.int64),
+            }
+        )
+        TestProcessShardKernelBranch()._patch_reads(monkeypatch, [df])
+        tbl, _meta = process_shard(grid, 0, ["s3://x"], s3_credentials={}, config=cfg)
+        # vector waveform field -> arrow table carrier.
+        offset = tbl.column("offset_h").to_numpy(zero_copy_only=False)
+        gain = tbl.column("gain_h").to_numpy(zero_copy_only=False)
+        assert offset[0] == offset[1]
+        assert gain[0] == gain[1]
+        # chunk_offset = floor(median(pooled h_ph)) = floor(median([10,12,200,202])) = 106
+        assert offset[0] == np.float32(np.floor(np.median([10.0, 12.0, 200.0, 202.0])))
