@@ -226,7 +226,11 @@ def _build_output(stats_arrays, data_vars, agg_fields, grid, shard_key, use_arro
         for var in data_vars
     }
     for col_name, vals in grid.chunk_coords(shard_key).items():
-        columns[col_name] = pa.array(np.asarray(vals))
+        # Route the morton coordinate through the same uint64 boundary as the
+        # pandas carrier (#71), so both carriers share one on-disk dtype guarantee
+        # rather than relying on MortonIndexArray.__array__ returning uint64.
+        arr = morton_words(vals) if is_morton_array(vals) else np.asarray(vals)
+        columns[col_name] = pa.array(arr)
     return pa.table(columns)
 
 
