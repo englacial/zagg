@@ -369,31 +369,48 @@ class TestVectorizedSegmentation:
     """
 
     @staticmethod
-    def _reference_from_digest(sorted_vals, digest):
-        """Rebuild expected (mean, weight) by slicing sorted_vals by the weights.
+    def _sequential_reference(vals, delta=512):
+        """Independent per-observation reference for centroid boundaries.
 
-        Centroid k owns the next ``weight[k]`` sorted observations, so its mean
-        must equal that slice's mean — a check independent of how build_tdigest
-        partitions internally.
+        Recomputes the k1 boundary rule from scratch with a scalar scale
+        function and a Welford mean — it never looks at ``build_tdigest``'s
+        output, so a misplaced boundary in the vectorized version shows up as a
+        weight mismatch (not a self-fulfilling slice).
         """
-        weights = digest[:, 1].astype(int)
-        assert weights.sum() == len(sorted_vals)
-        out = np.empty_like(digest)
-        start = 0
-        for k, w in enumerate(weights):
-            sl = sorted_vals[start : start + w]
-            out[k, 0] = sl.mean()
-            out[k, 1] = w
-            start += w
+        v = np.sort(np.asarray(vals, dtype=np.float64))
+        v = v[np.isfinite(v)]
+        n = len(v)
+        if n == 0:
+            return np.empty((0, 2), dtype=np.float32)
+
+        def k(q):
+            qc = min(1.0, max(0.0, q))
+            return delta * (float(np.arcsin(2.0 * qc - 1.0)) / np.pi + 0.5)
+
+        means, weights = [], []
+        cur_mean, cur_weight, k_left = v[0], 1.0, k(0.0)
+        for i in range(1, n):
+            if k((i + 1) / n) - k_left <= 1.0:
+                cur_mean += (v[i] - cur_mean) / (cur_weight + 1.0)
+                cur_weight += 1.0
+            else:
+                means.append(cur_mean)
+                weights.append(cur_weight)
+                cur_mean, cur_weight, k_left = v[i], 1.0, k(i / n)
+        means.append(cur_mean)
+        weights.append(cur_weight)
+        out = np.empty((len(means), 2), dtype=np.float32)
+        out[:, 0] = means
+        out[:, 1] = weights
         return out
 
     @pytest.mark.parametrize("n", [1, 2, 7, 1000, 50_000])
-    def test_build_means_match_slice_means(self, n):
+    def test_build_matches_sequential_reference(self, n):
         rng = np.random.default_rng(n)
         vals = rng.standard_normal(n)
         digest = build_tdigest(vals, delta=512)
-        expected = self._reference_from_digest(np.sort(vals), digest)
-        # weights are exact integers; means within float32 rounding of the slice mean
+        expected = self._sequential_reference(vals, delta=512)
+        # Weights encode the segmentation — exact match pins the boundaries.
         np.testing.assert_array_equal(digest[:, 1], expected[:, 1])
         np.testing.assert_allclose(digest[:, 0], expected[:, 0], rtol=0, atol=1e-4)
 
