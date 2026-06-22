@@ -27,14 +27,19 @@ from zagg.viz.shardmap import _is_geojson, _split_antimeridian
 
 # ── fixtures ─────────────────────────────────────────────────────────────────
 
+
 def _item(gid, lon0, lon1, lat0=38.85, lat1=38.93):
     ring = [[lon0, lat0], [lon1, lat0], [lon1, lat1], [lon0, lat1], [lon0, lat0]]
     return {
-        "type": "Feature", "stac_version": "1.0.0", "id": gid,
+        "type": "Feature",
+        "stac_version": "1.0.0",
+        "id": gid,
         "geometry": {"type": "Polygon", "coordinates": [ring]},
         "bbox": [lon0, lat0, lon1, lat1],
         "properties": {"datetime": "2025-06-01T00:00:00Z"},
-        "collection": "TEST", "stac_extensions": [], "links": [],
+        "collection": "TEST",
+        "stac_extensions": [],
+        "links": [],
         "assets": {
             "data": {"href": f"https://h/{gid}.h5", "roles": ["data"]},
             "data_s3": {"href": f"s3://b/{gid}.h5", "roles": ["data"]},
@@ -44,9 +49,7 @@ def _item(gid, lon0, lon1, lat0=38.85, lat1=38.93):
 
 @pytest.fixture
 def rect_grid():
-    return RectilinearGrid(
-        "EPSG:32618", 10, [359400, 4300740, 369400, 4310740], [250, 250]
-    )
+    return RectilinearGrid("EPSG:32618", 10, [359400, 4300740, 369400, 4310740], [250, 250])
 
 
 @pytest.fixture
@@ -74,6 +77,22 @@ def catalog():
 
 
 @pytest.fixture
+def healpix_shardmap():
+    """A HEALPix shardmap (parent_order=6, child_order=12) over a tight AOI.
+
+    Child cells subdivide each order-6 shard 4-for-1 per order step
+    (``4^(12-6)`` per shard), so the grid-on-zoom must show those nested child
+    cells -- not the shard outline redrawn.
+    """
+    g = HealpixGrid(parent_order=6, child_order=12, layout="fullsphere")
+    lats = np.array([10.0, 10.5, 10.5, 10.0, 10.0])
+    lons = np.array([20.0, 20.0, 20.5, 20.5, 20.0])
+    keys = [int(k) for k in g.coverage([(lats, lons)])]
+    granules = [[{"id": "G", "s3": "s", "https": "h"}] for _ in keys]
+    return ShardMap(g.signature(), keys, granules, {"backend": "test"})
+
+
+@pytest.fixture
 def antarctic_shardmap():
     """ShardMap on an EPSG:3031 grid -> footprints entirely south of -60 deg."""
     g = RectilinearGrid("EPSG:3031", 100000, [-1000000, -1000000, 0, 0], [5, 5])
@@ -88,6 +107,7 @@ def arctic_shardmap():
 
 
 # ── grid_from_signature ──────────────────────────────────────────────────────
+
 
 class TestGridFromSignature:
     def test_rectilinear_round_trip(self, rect_grid):
@@ -106,6 +126,7 @@ class TestGridFromSignature:
 
 
 # ── shard_outlines ───────────────────────────────────────────────────────────
+
 
 class TestShardOutlines:
     def test_one_feature_per_shard(self, shardmap):
@@ -136,6 +157,7 @@ class TestShardOutlines:
 
 # ── granule_footprints ───────────────────────────────────────────────────────
 
+
 class TestGranuleFootprints:
     def test_one_feature_per_granule(self, catalog):
         fc = granule_footprints(catalog)
@@ -150,6 +172,7 @@ class TestGranuleFootprints:
 
 
 # ── viewport_cells (grid-on-zoom gate) ───────────────────────────────────────
+
 
 class TestViewportCells:
     def test_gate_open_few_shards(self, shardmap):
@@ -238,7 +261,148 @@ class TestViewportCells:
             assert indexed == exhaustive
 
 
+# ── viewport_cells: HEALPix child-cell nesting + viewport bound ──────────────
+
+
+class TestViewportCellsHealpix:
+    def _tight_view(self, grid, key, frac=0.3):
+        """A viewport centered in shard ``key``, ``frac`` of its bbox each side."""
+        lon0, lat0, lon1, lat1 = grid.shard_footprint(key).bounds
+        cx, cy = (lon0 + lon1) / 2, (lat0 + lat1) / 2
+        w, h = (lon1 - lon0) * frac / 2, (lat1 - lat0) * frac / 2
+        return (cx - w, cy - h, cx + w, cy + h)
+
+    def test_emits_child_order_cells_not_shard_outline(self, healpix_shardmap):
+        # The grid-on-zoom for HEALPix is the finer child-cell grid, so a single
+        # visible shard must yield *many* child cells -- not one shard-clip
+        # feature (the bug @espg reported: grid == shards, no nesting).
+        from zagg.viz import shardmap as sm_mod
+
+        sm_mod._INDEX_CACHE.clear()
+        grid = grid_from_signature(healpix_shardmap.grid_signature)
+        key = healpix_shardmap.shard_keys[0]
+        view = self._tight_view(grid, key, frac=0.3)
+        fc = viewport_cells(healpix_shardmap, view, max_shards=4, max_cells=5000)
+        assert _is_geojson(fc)
+        assert len(fc["features"]) > 1  # not a lone shard-outline clip
+
+    def test_cells_nest_within_parent_shard(self, healpix_shardmap):
+        # Every emitted cell's parent (clip2order at parent_order) is one of the
+        # visible shards, and the cell IDs are genuine order-child_order cells.
+        from mortie import clip2order, infer_order_from_morton
+
+        from zagg.viz import shardmap as sm_mod
+
+        sm_mod._INDEX_CACHE.clear()
+        grid = grid_from_signature(healpix_shardmap.grid_signature)
+        key = int(healpix_shardmap.shard_keys[0])
+        view = self._tight_view(grid, key, frac=0.2)
+        fc = viewport_cells(healpix_shardmap, view, max_shards=4, max_cells=5000)
+        shard_keys = {int(k) for k in healpix_shardmap.shard_keys}
+        assert fc["features"]
+        for feat in fc["features"]:
+            cell = feat["properties"]["cell"]
+            parent = feat["properties"]["shard_key"]
+            assert int(infer_order_from_morton(cell)) == grid.child_order
+            assert int(clip2order(grid.parent_order, np.asarray([cell]))[0]) == parent
+            assert parent in shard_keys
+
+    def test_cell_union_tiles_visible_shard(self, healpix_shardmap):
+        # A viewport covering exactly one whole shard: the union of the emitted
+        # child cells must reconstruct that shard footprint (4-for-1 nesting),
+        # confirming the grid lines up inside the shard outline.
+        from shapely.ops import unary_union
+
+        from zagg.viz import shardmap as sm_mod
+
+        sm_mod._INDEX_CACHE.clear()
+        # Use a smaller level diff so a whole-shard view stays cheap.
+        g = HealpixGrid(parent_order=6, child_order=8, layout="fullsphere")
+        lats = np.array([10.0, 10.5, 10.5, 10.0, 10.0])
+        lons = np.array([20.0, 20.0, 20.5, 20.5, 20.0])
+        keys = [int(k) for k in g.coverage([(lats, lons)])]
+        sm = ShardMap(g.signature(), keys, [[] for _ in keys], {})
+        key = keys[0]
+        shard_fp = g.shard_footprint(key)
+        # The shard's bbox overlaps its 4 neighbors (a HEALPix diamond's bbox is
+        # larger than the diamond), so allow them through the gate; cells are
+        # then filtered to this shard via the parent check below.
+        view = shard_fp.bounds
+        fc = viewport_cells(sm, view, max_shards=8, max_cells=5000)
+        cell_polys = [
+            g.shard_footprint(f["properties"]["cell"])
+            for f in fc["features"]
+            if f["properties"]["shard_key"] == key
+        ]
+        union = unary_union(cell_polys)
+        # Union of the shard's child cells reconstructs the shard footprint.
+        assert union.intersection(shard_fp).area / shard_fp.area > 0.98
+
+    def test_cell_count_scales_with_viewport_not_fan_out(self, healpix_shardmap):
+        # Zooming in (smaller viewport) must emit *fewer* cells. A naive
+        # 4^(child-parent) per-shard enumeration would emit a constant 4096/shard
+        # regardless of zoom; viewport-bounded coverage shrinks with the view.
+        from zagg.viz import shardmap as sm_mod
+
+        sm_mod._INDEX_CACHE.clear()
+        grid = grid_from_signature(healpix_shardmap.grid_signature)
+        key = healpix_shardmap.shard_keys[0]
+        wide = viewport_cells(
+            healpix_shardmap,
+            self._tight_view(grid, key, 0.4),
+            max_shards=4,
+            max_cells=100000,
+        )
+        tight = viewport_cells(
+            healpix_shardmap,
+            self._tight_view(grid, key, 0.05),
+            max_shards=4,
+            max_cells=100000,
+        )
+        assert len(tight["features"]) < len(wide["features"])
+        # And both are far below the full 4^(12-6)=4096 per-shard enumeration.
+        assert len(wide["features"]) < grid.n_children
+
+    def test_no_full_enumeration_on_zoom(self, healpix_shardmap, monkeypatch):
+        # A zoomed-in query must not enumerate every child of a shard. Guard
+        # generate_morton_children: the viewport path uses morton_coverage, so a
+        # full child enumeration would be a regression.
+        import mortie
+
+        from zagg.viz import shardmap as sm_mod
+
+        sm_mod._INDEX_CACHE.clear()
+
+        def boom(*a, **k):  # pragma: no cover - must not be called
+            raise AssertionError("full child enumeration on a zoomed-in query")
+
+        monkeypatch.setattr(mortie, "generate_morton_children", boom)
+        grid = grid_from_signature(healpix_shardmap.grid_signature)
+        key = healpix_shardmap.shard_keys[0]
+        fc = viewport_cells(
+            healpix_shardmap,
+            self._tight_view(grid, key, 0.1),
+            max_shards=4,
+            max_cells=5000,
+        )
+        assert _is_geojson(fc)
+
+    def test_max_cells_gate_returns_empty(self, healpix_shardmap):
+        # A whole-shard view at child_order 12 is tens of thousands of cells;
+        # the max_cells gate keeps a refresh bounded by returning empty rather
+        # than emitting them all (the dense-viewport bound).
+        from zagg.viz import shardmap as sm_mod
+
+        sm_mod._INDEX_CACHE.clear()
+        grid = grid_from_signature(healpix_shardmap.grid_signature)
+        key = healpix_shardmap.shard_keys[0]
+        view = grid.shard_footprint(key).bounds
+        fc = viewport_cells(healpix_shardmap, view, max_shards=4, max_cells=200)
+        assert fc["features"] == []
+
+
 # ── antimeridian splitting ───────────────────────────────────────────────────
+
 
 class TestAntimeridian:
     def test_healpix_shard_near_antimeridian_splits(self):
@@ -246,13 +410,13 @@ class TestAntimeridian:
         # one hemisphere (no globe-spanning band).
         grid = HealpixGrid(2, 6, layout="fullsphere")
         key = int(
-            grid.coverage(
-                [(np.array([0.0, 1, 1, 0, 0]), np.array([179.0, 179, 180, 180, 179]))]
-            )[0]
+            grid.coverage([(np.array([0.0, 1, 1, 0, 0]), np.array([179.0, 179, 180, 180, 179]))])[0]
         )
         sm = ShardMap(
-            grid.signature(), [key],
-            [[{"id": "G", "s3": "s", "https": "h"}]], {},
+            grid.signature(),
+            [key],
+            [[{"id": "G", "s3": "s", "https": "h"}]],
+            {},
         )
         fc = shard_outlines(sm)
         geom = fc["features"][0]["geometry"]
@@ -276,8 +440,17 @@ class TestAntimeridian:
         from shapely.geometry import Polygon
 
         ring = [
-            (-170, -10), (-85, -10), (0, -10), (85, -10), (170, -10),
-            (170, 10), (85, 10), (0, 10), (-85, 10), (-170, 10), (-170, -10),
+            (-170, -10),
+            (-85, -10),
+            (0, -10),
+            (85, -10),
+            (170, -10),
+            (170, 10),
+            (85, 10),
+            (0, 10),
+            (-85, 10),
+            (-170, 10),
+            (-170, -10),
         ]
         geom = _split_antimeridian(Polygon(ring))
         assert geom["type"] == "Polygon"
@@ -296,6 +469,7 @@ class TestAntimeridian:
 
 
 # ── render_shardmap assembly ─────────────────────────────────────────────────
+
 
 class TestRenderShardmap:
     def test_shards_only(self, shardmap):
@@ -324,6 +498,7 @@ class TestRenderShardmap:
 
 
 # ── phase C: CRS selection (headless, no browser) ────────────────────────────
+
 
 class TestCrsSelection:
     def test_midlatitude_is_web_mercator(self, shardmap):
@@ -380,19 +555,20 @@ class TestCrsInfo:
 
 # ── phase C: CRS-aware antimeridian seam ─────────────────────────────────────
 
+
 class TestSeamAwareLayers:
     def test_polar_skips_antimeridian_split(self):
         # A HEALPix cell straddling +-180 is a MultiPolygon under the Mercator
         # split, but stays a single Polygon when split_seam=False (polar CRS).
         grid = HealpixGrid(2, 6, layout="fullsphere")
         key = int(
-            grid.coverage(
-                [(np.array([0.0, 1, 1, 0, 0]), np.array([179.0, 179, 180, 180, 179]))]
-            )[0]
+            grid.coverage([(np.array([0.0, 1, 1, 0, 0]), np.array([179.0, 179, 180, 180, 179]))])[0]
         )
         sm = ShardMap(
-            grid.signature(), [key],
-            [[{"id": "G", "s3": "s", "https": "h"}]], {},
+            grid.signature(),
+            [key],
+            [[{"id": "G", "s3": "s", "https": "h"}]],
+            {},
         )
         split = shard_outlines(sm)["features"][0]["geometry"]
         unsplit = shard_outlines(sm, split_seam=False)["features"][0]["geometry"]
@@ -405,16 +581,18 @@ class TestSeamAwareLayers:
         # single ring -- so the flag, not the data, decides the geometry type.
         ring = [[178.0, 70.0], [-178.0, 70.0], [-178.0, 72.0], [178.0, 72.0], [178.0, 70.0]]
         item = {
-            "type": "Feature", "stac_version": "1.0.0", "id": "Gx",
+            "type": "Feature",
+            "stac_version": "1.0.0",
+            "id": "Gx",
             "geometry": {"type": "Polygon", "coordinates": [ring]},
             "bbox": [-180.0, 70.0, 180.0, 72.0],
             "properties": {"datetime": "2025-06-01T00:00:00Z"},
-            "collection": "TEST", "stac_extensions": [], "links": [],
+            "collection": "TEST",
+            "stac_extensions": [],
+            "links": [],
             "assets": {"data": {"href": "https://h/Gx.h5", "roles": ["data"]}},
         }
-        cat = Catalog(
-            pa.table(sga.parse_stac_items_to_arrow([item])), {"collection": "TEST"}
-        )
+        cat = Catalog(pa.table(sga.parse_stac_items_to_arrow([item])), {"collection": "TEST"})
         split = granule_footprints(cat)["features"][0]["geometry"]
         unsplit = granule_footprints(cat, split_seam=False)["features"][0]["geometry"]
         assert split["type"] == "MultiPolygon"
@@ -423,25 +601,52 @@ class TestSeamAwareLayers:
 
 # ── debounce wrapper (pure stdlib; no widget stack) ──────────────────────────
 
+
 class TestDebounce:
-    def test_rapid_calls_coalesce_to_one(self):
+    def test_rapid_calls_coalesce_to_one_on_loop(self):
         # Importing leaflet pulls only stdlib + zagg.viz at module level (the
         # ipyleaflet imports are local to the functions), so this is headless.
-        import time
+        # The debounce now schedules on the *running* event loop (the kernel's
+        # main thread) rather than a background threading.Timer -- that is the
+        # fix for the comm-thread crash (PR #44). Drive it on a loop and assert
+        # the burst coalesces to one call, fired on the loop thread.
+        import asyncio
+        import threading
 
+        from zagg.viz.leaflet import _debounce
+
+        async def scenario():
+            calls = {"n": 0, "tid": None}
+
+            def hit():
+                calls["n"] += 1
+                calls["tid"] = threading.get_ident()
+
+            deb = _debounce(0.05, hit)
+            for _ in range(20):
+                deb()  # each cancels and reschedules the pending loop callback
+            assert calls["n"] == 0  # nothing fired yet (still within the window)
+            await asyncio.sleep(0.2)
+            return calls
+
+        result = asyncio.run(scenario())
+        assert result["n"] == 1  # the burst coalesced into a single refresh
+        assert result["tid"] == threading.get_ident()  # ran on the loop's thread
+
+    def test_no_loop_runs_synchronously(self):
+        # With no running event loop (plain script / headless), there is no comm
+        # to protect and no loop to schedule on, so the call runs inline.
         from zagg.viz.leaflet import _debounce
 
         calls = {"n": 0}
         deb = _debounce(0.05, lambda: calls.__setitem__("n", calls["n"] + 1))
-        for _ in range(20):
-            deb()  # each cancels and reschedules the prior timer
-        assert calls["n"] == 0  # nothing fired yet (still within the window)
-        time.sleep(0.2)
-        assert calls["n"] == 1  # the burst coalesced into a single refresh
+        deb()
+        assert calls["n"] == 1
         deb.cancel()
 
 
 # ── phase 2: ipyleaflet wrapper (skips when the viz extra isn't installed) ────
+
 
 class TestShowShardmap:
     def test_import_core_without_ipyleaflet(self):
