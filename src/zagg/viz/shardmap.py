@@ -299,13 +299,81 @@ def granule_footprints(catalog, *, split_seam: bool = True) -> dict:
     return _collection(features)
 
 
-def viewport_cells(shardmap, bbox, *, max_shards: int = 4, split_seam: bool = True) -> dict:
+class ShardIndex:
+    """One-time shard-footprint index for fast viewport queries (issue #38).
+
+    Building a shard footprint is not free -- on HEALPix it is
+    ``mortie.tools.mort2polygon`` per key. The interactive viewer re-queries on
+    every pan/zoom, so regenerating all footprints per event freezes the kernel.
+    This builds the ``(key, footprint)`` list **once** and indexes the
+    footprints in a shapely ``STRtree``; :meth:`query` then answers a viewport
+    in ``O(log N + k)`` instead of ``O(N)`` footprint rebuilds.
+    """
+
+    def __init__(self, shardmap):
+        from shapely import STRtree
+
+        grid = grid_from_signature(shardmap.grid_signature)
+        self.keys = list(shardmap.shard_keys)
+        self.footprints = [grid.shard_footprint(k) for k in self.keys]
+        self._tree = STRtree(self.footprints)
+
+    def query(self, view):
+        """``[(key, footprint)]`` whose footprint truly intersects ``view``.
+
+        The ``STRtree`` returns bbox-overlap candidates; each is refined with a
+        precise ``footprint.intersects(view)`` so the result matches the old
+        exhaustive scan exactly.
+        """
+        out = []
+        for i in self._tree.query(view):
+            fp = self.footprints[i]
+            if fp.intersects(view):
+                out.append((self.keys[i], fp))
+        return out
+
+
+# Cache one ShardIndex per shardmap object so repeated viewport queries (and the
+# back-compat viewport_cells path) never rebuild footprints. Keyed by id() and
+# guarded by a weak ref so a collected shardmap drops its entry.
+_INDEX_CACHE: dict = {}
+
+
+def shard_index(shardmap) -> ShardIndex:
+    """Return a cached :class:`ShardIndex` for ``shardmap`` (built once)."""
+    import weakref
+
+    key = id(shardmap)
+    entry = _INDEX_CACHE.get(key)
+    if entry is not None:
+        return entry[0]
+
+    index = ShardIndex(shardmap)
+
+    def _drop(_ref, key=key):
+        _INDEX_CACHE.pop(key, None)
+
+    try:
+        ref = weakref.ref(shardmap, _drop)
+    except TypeError:
+        ref = None  # not weak-referenceable; entry simply lingers
+    _INDEX_CACHE[key] = (index, ref)
+    return index
+
+
+def viewport_cells(
+    shardmap, bbox, *, max_shards: int = 4, split_seam: bool = True, index=None
+) -> dict:
     """Shard-order cell outlines clipped to a viewport, gated on visible shards.
 
     Implements the "grid-on-zoom" behavior (issue #38): cell outlines **at the
     shard order** are drawn only when ``<= max_shards`` shards intersect
     ``bbox``. When more shards are visible the viewport is too zoomed-out for a
     useful grid and an empty collection is returned -- never a global graticule.
+
+    Footprints are taken from a one-time :class:`ShardIndex` (built and cached
+    per shardmap, or passed in via ``index=``), so repeated calls -- e.g. the
+    interactive viewer's per-pan refresh -- never rebuild them.
 
     Parameters
     ----------
@@ -318,6 +386,9 @@ def viewport_cells(shardmap, bbox, *, max_shards: int = 4, split_seam: bool = Tr
     split_seam : bool
         Split polygons crossing +-180 into a ``MultiPolygon``. Set False under a
         polar-stereographic CRS, where there is no antimeridian seam.
+    index : ShardIndex, optional
+        A prebuilt index to query. When omitted, the cached index for
+        ``shardmap`` is used (:func:`shard_index`).
 
     Returns
     -------
@@ -327,15 +398,11 @@ def viewport_cells(shardmap, bbox, *, max_shards: int = 4, split_seam: bool = Tr
     """
     from shapely.geometry import box
 
-    grid = grid_from_signature(shardmap.grid_signature)
+    if index is None:
+        index = shard_index(shardmap)
     view = box(bbox[0], bbox[1], bbox[2], bbox[3])
 
-    # Build each footprint once (reproject + densify is not free), then gate.
-    visible = [
-        (key, fp)
-        for key, fp in ((k, grid.shard_footprint(k)) for k in shardmap.shard_keys)
-        if fp.intersects(view)
-    ]
+    visible = index.query(view)
     if not visible or len(visible) > max_shards:
         return _collection([])
 
@@ -431,5 +498,7 @@ __all__ = [
     "shard_outlines",
     "granule_footprints",
     "viewport_cells",
+    "ShardIndex",
+    "shard_index",
     "render_shardmap",
 ]

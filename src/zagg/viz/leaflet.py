@@ -19,11 +19,14 @@ widget stack. Install it with ``pip install zagg[viz]``.
 """
 from __future__ import annotations
 
+import threading
+
 from zagg.viz.crs import crs_info, is_polar, pick_crs
 from zagg.viz.shardmap import (
     _load_catalog,
     _load_shardmap,
     granule_footprints,
+    shard_index,
     shard_outlines,
     viewport_cells,
 )
@@ -32,6 +35,35 @@ from zagg.viz.shardmap import (
 _SHARD_STYLE = {"color": "#1f78b4", "weight": 1, "fillOpacity": 0.05}
 _FOOTPRINT_STYLE = {"color": "#e31a1c", "weight": 1, "fillOpacity": 0.10}
 _GRID_STYLE = {"color": "#333333", "weight": 1, "fillOpacity": 0.0}
+
+# Coalesce a burst of pan/zoom ``bounds`` ticks into one grid refresh after the
+# viewport settles (seconds). Without this the grid recomputes on every
+# intermediate frame of a drag.
+_GRID_DEBOUNCE_S = 0.2
+
+
+def _debounce(wait, func):
+    """Wrap ``func`` so rapid calls coalesce to one call ``wait`` s after the last.
+
+    Each call cancels the pending :class:`threading.Timer` and reschedules, so a
+    burst of events fires ``func`` once when they stop. Returns the wrapper with a
+    ``cancel()`` to tear the timer down.
+    """
+    timer: list = [None]
+
+    def wrapper(*args, **kwargs):
+        if timer[0] is not None:
+            timer[0].cancel()
+        timer[0] = threading.Timer(wait, lambda: func(*args, **kwargs))
+        timer[0].daemon = True
+        timer[0].start()
+
+    def cancel():
+        if timer[0] is not None:
+            timer[0].cancel()
+
+    wrapper.cancel = cancel
+    return wrapper
 
 
 def _center_zoom(fc: dict):
@@ -151,8 +183,9 @@ def show_shardmap(
         )
         m.add(footprint_layer)
 
-    # Grid-on-zoom: an empty layer kept in sync with the viewport. Recomputed on
-    # every bounds change; the headless core's gate returns nothing when too
+    # Grid-on-zoom: an empty layer kept in sync with the viewport. The shard
+    # footprints are indexed once (STRtree) so each refresh is a cheap query, not
+    # a full footprint rebuild; the headless core's gate returns nothing when too
     # many shards are visible, so this never becomes a global graticule.
     grid_layer = GeoJSON(
         data={"type": "FeatureCollection", "features": []},
@@ -160,6 +193,8 @@ def show_shardmap(
         name="grid (shard cells)",
     )
     m.add(grid_layer)
+
+    index = shard_index(shardmap)
 
     def _refresh_grid(event=None):  # noqa: ARG001 (traitlets observe signature)
         bounds = m.bounds
@@ -171,9 +206,12 @@ def show_shardmap(
             (west, south, east, north),
             max_shards=max_shards,
             split_seam=split_seam,
+            index=index,
         )
 
-    m.observe(_refresh_grid, names="bounds")
+    # Debounce so a burst of intermediate pan/zoom ticks coalesces into one
+    # refresh after movement settles.
+    m.observe(_debounce(_GRID_DEBOUNCE_S, _refresh_grid), names="bounds")
     _refresh_grid()
 
     m.add(LayersControl(position="topright"))
