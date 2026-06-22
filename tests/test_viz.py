@@ -462,6 +462,9 @@ class TestShowShardmap:
         assert isinstance(m, Map)
         # shard layer + grid layer (+ basemap) present.
         assert len(m.layers) >= 2
+        # Debounced bounds observer is wired with a reachable cancel hook.
+        assert callable(getattr(m, "cancel_grid_refresh", None))
+        m.cancel_grid_refresh()
 
     def test_build_map_with_catalog(self, shardmap, catalog, tmp_path):
         pytest.importorskip("ipyleaflet")
