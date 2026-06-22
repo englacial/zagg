@@ -399,3 +399,78 @@ class TestProcessEvent:
         results, _ = process_event("storm1", event_mask, collections, specs, static)
         # negated max over {-1,-5,-3} is -1
         assert results["max_t2m"] == pytest.approx(-1.0)
+
+    @pytest.mark.parametrize("batch", [None, 1, 2, 3])
+    def test_sum_batching_invariant(self, batch):
+        # A non-idempotent reducer (sum) must give the same total no matter how
+        # the timesteps are sliced into resident batches — this catches a
+        # batching bug that ``max`` alone would mask.
+        event_mask, collections, specs, static = _event_inputs()
+        specs[0].update(
+            output_name="sum_t2m",
+            spatial_func="weighted_sum",
+            temporal_reducer="sum",
+        )
+        results, _ = process_event(
+            "storm1", event_mask, collections, specs, static, max_resident_timesteps=batch
+        )
+        # per timestep: weighted_sum over 4 unit cells = value*4; sum over
+        # {1,5,3} -> (1+5+3)*4 = 36
+        assert results["sum_t2m"] == pytest.approx(36.0)
+
+    def test_missing_cell_areas_raises(self):
+        event_mask, collections, specs, _ = _event_inputs()
+        specs[0]["spatial_func"] = "weighted_sum"
+        specs[0]["temporal_reducer"] = "sum"
+        with pytest.raises(ValueError, match="cell_areas"):
+            process_event("storm1", event_mask, collections, specs, {})
+
+
+class TestSpatialFunctionEdges:
+    def test_max_gradient_finite_across_equator(self):
+        # The 1/sin(lat) longitude metric blows up at lat=0; the guard must
+        # keep the result finite (the equator row drops out of the gradient).
+        xr = pytest.importorskip("xarray")
+        from zagg.temporal import spatial_max_gradient
+
+        lat = np.array([-1.0, 0.0, 1.0])
+        lon = np.array([0.0, 1.0, 2.0])
+        coords = {"lat": lat, "lon": lon}
+        var = xr.DataArray(np.arange(9.0).reshape(3, 3), dims=["lat", "lon"], coords=coords)
+        mask = xr.DataArray(np.ones((3, 3)), dims=["lat", "lon"], coords=coords)
+        result = spatial_max_gradient(var, mask, None)
+        assert np.isfinite(result)
+
+    def test_min_over_levels_then_weighted_mean(self):
+        xr = pytest.importorskip("xarray")
+        from zagg.temporal import spatial_min_level_then_weighted_mean
+
+        lat = np.array([-70.0, -69.5])
+        lon = np.array([0.0, 0.5])
+        coords = {"lev": [1, 2], "lat": lat, "lon": lon}
+        # min over the two levels is the level-1 plane (all smaller); then the
+        # area-weighted mean over a uniform mask/area is just its mean.
+        data = np.stack([np.full((2, 2), 2.0), np.full((2, 2), 5.0)])
+        var = xr.DataArray(data, dims=["lev", "lat", "lon"], coords=coords)
+        mask = xr.DataArray(np.ones((2, 2)), dims=["lat", "lon"], coords={"lat": lat, "lon": lon})
+        areas = xr.DataArray(np.ones((2, 2)), dims=["lat", "lon"], coords={"lat": lat, "lon": lon})
+        ws, wt = spatial_min_level_then_weighted_mean(var, mask, areas)
+        assert ws == pytest.approx(8.0)  # 4 cells * min-level value 2.0
+        assert wt == pytest.approx(4.0)
+        assert ws / wt == pytest.approx(2.0)
+
+    def test_max_min_consistent_on_fractional_mask(self):
+        # max and min select the same (unscaled) cells under a non-binary mask.
+        xr = pytest.importorskip("xarray")
+        from zagg.temporal import spatial_max, spatial_min
+
+        lat = np.array([-70.0, -69.5])
+        lon = np.array([0.0, 0.5])
+        coords = {"lat": lat, "lon": lon}
+        var = xr.DataArray(
+            np.array([[10.0, 20.0], [30.0, 40.0]]), dims=["lat", "lon"], coords=coords
+        )
+        mask = xr.DataArray(np.array([[0.5, 0.0], [0.0, 0.5]]), dims=["lat", "lon"], coords=coords)
+        # Only the two 0.5 cells (10, 40) are selected; unscaled values used.
+        assert spatial_max(var, mask, None) == pytest.approx(40.0)
+        assert spatial_min(var, mask, None) == pytest.approx(10.0)

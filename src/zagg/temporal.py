@@ -155,8 +155,13 @@ def _apply_mask(storm_mask_t, ais_mask_subset, mask_type):
 
 
 def spatial_max(var_t, combined_mask, cell_areas):
-    """Max value under the masked footprint for one timestep."""
-    vals = (var_t * combined_mask).values[combined_mask.values > 0]
+    """Max value under the masked footprint for one timestep.
+
+    Selects the unscaled values under ``combined_mask > 0`` (matching
+    :func:`spatial_min`) so the two agree for non-binary masks too.
+    """
+    masked = var_t.where(combined_mask > 0)
+    vals = masked.values[~np.isnan(masked.values)]
     if len(vals) == 0:
         return np.nan
     return float(np.nanmax(vals))
@@ -195,7 +200,12 @@ def spatial_max_gradient(var_t, combined_mask, cell_areas):
     )
     r = 6378  # Earth radius in km
     lat_partials = rads.differentiate("lat") / r
-    lon_partials = rads.differentiate("lon") / (np.sin(rads.lat) * r)
+    # The longitude metric term carries 1/sin(lat), which blows up to inf at the
+    # equator (sin(lat) == 0). Mask those rows out of the gradient rather than
+    # letting inf propagate through nanmax.
+    sin_lat = np.sin(rads.lat)
+    lon_metric = sin_lat.where(sin_lat != 0) * r
+    lon_partials = rads.differentiate("lon") / lon_metric
 
     magnitude = np.sqrt(lon_partials**2 + lat_partials**2)
     grad_vals = magnitude.values * combined_mask.values
@@ -231,6 +241,10 @@ registry.register_spatial_func("min_over_levels", spatial_min_level_then_weighte
 #: The spatial-function registry (``zagg.registry.SPATIAL_FUNCS``); plugins may
 #: add more via ``registry.register_spatial_func``.
 SPATIAL_FUNCS = registry.SPATIAL_FUNCS
+
+#: Built-in spatial funcs that multiply by ``cell_areas``; ``process_event``
+#: refuses a spec using one of these when no ``cell_areas`` static field exists.
+_AREA_WEIGHTED_FUNCS = frozenset({"weighted_sum", "weighted_mean", "min_over_levels"})
 
 
 # ---------------------------------------------------------------------------
@@ -359,6 +373,14 @@ def process_event(
         except (KeyError, ValueError):
             static_sub[name] = arr
     cell_areas = static_sub.get("cell_areas")
+    if cell_areas is None and any(spec["spatial_func"] in _AREA_WEIGHTED_FUNCS for spec in specs):
+        offenders = sorted(
+            {spec["spatial_func"] for spec in specs if spec["spatial_func"] in _AREA_WEIGHTED_FUNCS}
+        )
+        raise ValueError(
+            f"area-weighted spatial funcs {offenders} require a 'cell_areas' static field, "
+            "but static_data has none"
+        )
 
     # One accumulator per spec, plus resolved trigger timesteps (if any).
     accumulators = {}
