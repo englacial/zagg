@@ -9,6 +9,7 @@ from zarr.storage import MemoryStore
 
 from zagg.csr import write_csr
 from zagg.readers.tdigest_tensor import (
+    _resolve_chunk_morton,
     chunk_z_range,
     rasterize_cell,
     read_raw_values,
@@ -129,6 +130,20 @@ class TestChunkZRange:
         # And halving once more would no longer cover it (smallest that fits).
         assert (n_bins // 2) * res < span
 
+    def test_collapse_bins_pow2_for_non_pow2_n_bins(self):
+        # Non-power-of-two n_bins must still collapse to a power of two.
+        digests = [self._digest(100.0, 110.0, seed=8)]
+        _, n_bins, res = chunk_z_range(
+            digests,
+            n_bins=100,
+            resolution=0.5,
+            bottom=0.0,
+            top=1.0,
+            fit="collapse_bins",
+        )
+        assert n_bins in (1, 2, 4, 8, 16, 32, 64)  # ≤ largest pow2 ≤ 100 (=64)
+        assert res == 0.5
+
     def test_collapse_bins_cannot_grow_raises(self):
         digests = [self._digest(0.0, 200.0, seed=66)]
         with pytest.raises(ValueError, match="cannot grow"):
@@ -224,6 +239,22 @@ class TestReadTensors:
         arr[...] = np.array([900, 901], dtype=np.uint64)
         mortons = sorted(m for _, m in read_tensors(store, "f"))
         assert mortons == [900, 901]
+
+    def test_morton_coord_array_mixed_digit_keys(self):
+        # Regression: subgroup names of differing digit counts must align with
+        # the coord array in numeric (not lexicographic) order — a lexicographic
+        # zip would pair "1000" before "99" and mis-assign mortons.
+        store = MemoryStore()
+        rng = np.random.default_rng(33)
+        for key in (99, 100, 1000):
+            _write_chunk(store, "f", key, {0: rng.uniform(0.0, 30.0, 1_000)})
+        arr = zarr.open_array(
+            store, path="f/morton", mode="w", shape=(3,), chunks=(3,), dtype="uint64"
+        )
+        # Coord in ascending-morton chunk order (99, 100, 1000).
+        arr[...] = np.array([900, 901, 902], dtype=np.uint64)
+        mapping = _resolve_chunk_morton(store, "f", ["99", "100", "1000"], 3)
+        assert mapping == {"99": 900, "100": 901, "1000": 902}
 
     def test_raise_when_chunk_too_wide(self):
         store = MemoryStore()

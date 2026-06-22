@@ -171,15 +171,17 @@ def chunk_z_range(
     window = n_bins * resolution
 
     if fit == "collapse_bins":
-        # Shrink n_bins to the smallest power of two whose window still covers
-        # the trimmed range. Only ever reduces the bin count, so it cannot help
-        # a range that already exceeds the full n_bins window.
+        # Shrink to the smallest power-of-two bin count (≤ the largest power of
+        # two that fits within n_bins) whose window still covers the trimmed
+        # range. Only ever reduces the bin count, so it cannot help a range that
+        # already exceeds the full n_bins window.
         if needed > window:
             raise ValueError(
                 f'fit="collapse_bins" cannot grow the window: trimmed span {needed} '
                 f"exceeds {n_bins} bins × {resolution} = {window}"
             )
-        n = n_bins
+        # Largest power of two ≤ n_bins (the collapsed count is always pow2).
+        n = 1 << (int(n_bins).bit_length() - 1)
         while n // 2 >= 1 and (n // 2) * resolution >= needed:
             n //= 2
         return float(z_lo), n, resolution
@@ -209,6 +211,11 @@ def _resolve_chunk_morton(
     Prefers a sibling ``{field}/morton`` ``uint64`` coordinate array (chunk
     order → morton id); falls back to parsing the subgroup name as the parent
     morton id (the shard key is the parent morton — see :func:`process_shard`).
+
+    The coordinate array is aligned against the subgroup names sorted
+    **numerically** (the canonical ascending-morton chunk order), not
+    lexicographically — string sorting would mis-align names of differing digit
+    counts (e.g. ``"1000"`` before ``"99"``).
     """
     try:
         arr = zarr.open_array(store, path=f"{field}/morton", mode="r", zarr_format=zarr_format)
@@ -218,7 +225,7 @@ def _resolve_chunk_morton(
     if len(morton) != len(shard_keys):
         # Coordinate present but not 1:1 with subgroups — fall back to the names.
         return {k: int(k) for k in shard_keys}
-    return {k: int(m) for k, m in zip(sorted(shard_keys), morton)}
+    return {k: int(m) for k, m in zip(sorted(shard_keys, key=int), morton)}
 
 
 def read_tensors(
@@ -259,7 +266,9 @@ def read_tensors(
         (default ``"raise"``).
     dtype : {"uint16", "uint32", "float32"}, optional
         Output tensor dtype (default ``"uint32"``).  ``uint16``/``uint32`` round
-        counts to the nearest integer; ``float32`` keeps fractional counts.
+        counts to the nearest integer; ``float32`` keeps fractional counts.  A
+        per-bin count exceeding the dtype's max (65535 for ``uint16``) wraps on
+        cast — keep ``uint32`` for dense cells with many observations per bin.
     zarr_format : int, optional
         Zarr format version (default 3).
 
