@@ -182,6 +182,61 @@ class TestViewportCells:
                 for lon, lat in ring:
                     assert view[0] - 1e-6 <= lon <= view[2] + 1e-6
 
+    def test_footprints_built_once_across_queries(self, shardmap, monkeypatch):
+        # Regression for the grid-on-zoom hang (PR #44): footprints must be
+        # generated once for the STRtree index and never again per query. Wrap
+        # the grid's shard_footprint with a call counter and run many viewports.
+        from zagg.grids.rectilinear import RectilinearGrid
+        from zagg.viz import shardmap as sm_mod
+
+        sm_mod._INDEX_CACHE.clear()  # fresh index for this shardmap
+        calls = {"n": 0}
+        orig = RectilinearGrid.shard_footprint
+
+        def counting(self, key):
+            calls["n"] += 1
+            return orig(self, key)
+
+        monkeypatch.setattr(RectilinearGrid, "shard_footprint", counting)
+
+        full = (-180, -90, 180, 90)
+        for _ in range(10):
+            viewport_cells(shardmap, full, max_shards=10)
+        # Exactly one footprint build per shard for index construction; the ten
+        # queries add nothing.
+        assert calls["n"] == len(shardmap.shard_keys)
+
+    def test_prebuilt_index_reused(self, shardmap, monkeypatch):
+        # Passing an explicit index never touches shard_footprint at query time.
+        from zagg.grids.rectilinear import RectilinearGrid
+        from zagg.viz.shardmap import ShardIndex
+
+        index = ShardIndex(shardmap)
+
+        def boom(self, key):  # pragma: no cover - must not be called
+            raise AssertionError("shard_footprint rebuilt during query")
+
+        monkeypatch.setattr(RectilinearGrid, "shard_footprint", boom)
+        fc = viewport_cells(shardmap, (-180, -90, 180, 90), max_shards=10, index=index)
+        assert _is_geojson(fc)
+
+    def test_index_query_matches_exhaustive_scan(self, shardmap):
+        # The STRtree-backed visible set equals the old exhaustive intersects
+        # scan, for both a tight and a wide bbox.
+        from shapely.geometry import box
+
+        from zagg.viz.shardmap import grid_from_signature, shard_index
+
+        grid = grid_from_signature(shardmap.grid_signature)
+        idx = shard_index(shardmap)
+        for bbox in ((-180, -90, 180, 90), grid.shard_footprint(0).bounds):
+            view = box(*bbox)
+            indexed = {k for k, _ in idx.query(view)}
+            exhaustive = {
+                k for k in shardmap.shard_keys if grid.shard_footprint(k).intersects(view)
+            }
+            assert indexed == exhaustive
+
 
 # ── antimeridian splitting ───────────────────────────────────────────────────
 
@@ -364,6 +419,26 @@ class TestSeamAwareLayers:
         unsplit = granule_footprints(cat, split_seam=False)["features"][0]["geometry"]
         assert split["type"] == "MultiPolygon"
         assert unsplit["type"] == "Polygon"
+
+
+# ── debounce wrapper (pure stdlib; no widget stack) ──────────────────────────
+
+class TestDebounce:
+    def test_rapid_calls_coalesce_to_one(self):
+        # Importing leaflet pulls only stdlib + zagg.viz at module level (the
+        # ipyleaflet imports are local to the functions), so this is headless.
+        import time
+
+        from zagg.viz.leaflet import _debounce
+
+        calls = {"n": 0}
+        deb = _debounce(0.05, lambda: calls.__setitem__("n", calls["n"] + 1))
+        for _ in range(20):
+            deb()  # each cancels and reschedules the prior timer
+        assert calls["n"] == 0  # nothing fired yet (still within the window)
+        time.sleep(0.2)
+        assert calls["n"] == 1  # the burst coalesced into a single refresh
+        deb.cancel()
 
 
 # ── phase 2: ipyleaflet wrapper (skips when the viz extra isn't installed) ────
