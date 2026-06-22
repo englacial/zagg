@@ -479,43 +479,42 @@ def _run_lambda(config, catalog_data, store_path, child_order, *,
         output_credentials, output_endpoint_url, region,
     )
 
-    # Pre-flight concurrency probe: clamp workers to what local file
-    # descriptors and account-wide Lambda concurrency can sustain, so we don't
-    # silently drop cells (FD exhaustion) or saturate the account pool (#28).
-    # Probe with a lightweight session; the dispatch client is sized to the
-    # clamped count below.
+    # The dispatch lambda_client is built inside preflight() (once the probe
+    # has clamped the worker count, which sizes its connection pool), so the
+    # per-cell / finalize closures read it from this holder rather than closing
+    # over a not-yet-built name.
     session = boto3.Session()
-    probe_lambda = session.client("lambda", region_name=region)
-    cloudwatch_client = session.client("cloudwatch", region_name=region)
-    max_workers, concurrency_report = compute_available_workers(
-        max_workers, probe_lambda, cloudwatch_client, function_name,
-    )
-    _log_concurrency_report(concurrency_report, max_workers)
+    state: dict = {}
 
-    # Configure boto3 client (created early so we can use it for setup/finalize).
-    # max_pool_connections is sized to the clamped worker count so connections
-    # cannot outrun the file-descriptor budget.
-    boto_config = Config(
-        read_timeout=900,
-        connect_timeout=10,
-        retries={"max_attempts": 0},
-        max_pool_connections=max_workers,
-    )
-    lambda_client = session.client(
-        "lambda", region_name=region, config=boto_config,
-    )
+    def _preflight(n):
+        # Pre-flight concurrency probe: clamp workers to what local file
+        # descriptors and account-wide Lambda concurrency can sustain, so we
+        # don't silently drop cells (FD exhaustion) or saturate the account
+        # pool (#28). Probe with a lightweight session; the dispatch client is
+        # sized to the clamped count. Kept behind the Executor.preflight() seam
+        # (#63) -- concurrency.py stays a helper module called from here.
+        probe_lambda = session.client("lambda", region_name=region)
+        cloudwatch_client = session.client("cloudwatch", region_name=region)
+        clamped, concurrency_report = compute_available_workers(
+            max_workers, probe_lambda, cloudwatch_client, function_name,
+        )
+        _log_concurrency_report(concurrency_report, clamped)
 
-    # Create template via Lambda. The template write happens inside the
-    # function so the orchestrator only needs lambda:InvokeFunction; no
-    # direct S3 access to the output bucket is required (works cleanly
-    # for cross-account callers like CryoCloud).
-    _invoke_lambda_setup(
-        lambda_client, function_name, store_path,
-        parent_order=parent_order, child_order=child_order,
-        n_parent_cells=len(all_shards) if grid_type == "healpix" and layout == "dense" else None,
-        overwrite=overwrite, config_dict=config_dict,
-        output_creds_event=output_creds_event,
-    )
+        # Configure the dispatch boto3 client. max_pool_connections is sized to
+        # the clamped worker count so connections cannot outrun the
+        # file-descriptor budget. Built here (not before) so the pool tracks
+        # the probe's clamp.
+        boto_config = Config(
+            read_timeout=900,
+            connect_timeout=10,
+            retries={"max_attempts": 0},
+            max_pool_connections=clamped,
+        )
+        state["workers"] = clamped
+        state["lambda_client"] = session.client(
+            "lambda", region_name=region, config=boto_config,
+        )
+        return PreflightReport(workers=clamped, detail=concurrency_report)
 
     # Per-cell invoke, bound to everything but the (shard_key, records) pair so
     # the executor submits one payload per cell. Mirrors the kwargs the old
@@ -523,31 +522,39 @@ def _run_lambda(config, catalog_data, store_path, child_order, *,
     def _cell_work(payload):
         shard_key, records = payload
         return _invoke_lambda_cell(
-            lambda_client, grid.block_index(int(shard_key)), int(shard_key),
+            state["lambda_client"], grid.block_index(int(shard_key)), int(shard_key),
             parent_order, child_order,
             _resolve_urls(records, "s3"), store_path, s3_creds,
             function_name=function_name,
             config_dict=config_dict,
             output_creds_event=output_creds_event,
-            max_workers=max_workers,
+            max_workers=state["workers"],
         )
 
     executor = LambdaExecutor(
         _cell_work,
-        # The probe already ran above (it also sizes the boto client pool); the
-        # preflight hook here just hands the clamped count to the executor's
-        # ThreadPoolExecutor, sourced via this module so the concurrency tests'
-        # ``runner.ThreadPoolExecutor`` spy still binds it.
-        preflight_fn=lambda n: PreflightReport(
-            workers=max_workers, detail=concurrency_report,
-        ),
+        preflight_fn=_preflight,
         pool_factory=ThreadPoolExecutor,
         finalize_fn=lambda: _invoke_lambda_finalize(
-            lambda_client, function_name, store_path,
+            state["lambda_client"], function_name, store_path,
             output_creds_event=output_creds_event,
         ),
     )
+    # preflight() runs the probe, builds the sized client, and sizes the pool.
     executor.preflight(len(cells))
+    max_workers = state["workers"]
+
+    # Create template via Lambda. The template write happens inside the
+    # function so the orchestrator only needs lambda:InvokeFunction; no
+    # direct S3 access to the output bucket is required (works cleanly
+    # for cross-account callers like CryoCloud).
+    _invoke_lambda_setup(
+        state["lambda_client"], function_name, store_path,
+        parent_order=parent_order, child_order=child_order,
+        n_parent_cells=len(all_shards) if grid_type == "healpix" and layout == "dense" else None,
+        overwrite=overwrite, config_dict=config_dict,
+        output_creds_event=output_creds_event,
+    )
 
     start_time = time.time()
     n = len(cells)
