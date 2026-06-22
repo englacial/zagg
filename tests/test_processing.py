@@ -2175,24 +2175,28 @@ class TestChunkPrecompute:
         np.testing.assert_array_equal(offsets, np.array([1.0, 101.0], dtype=np.float32))
         assert offsets[0] != offsets[1]
 
-    def test_arrow_kernel_rejects_chunk_precompute(self, monkeypatch):
-        """The experimental kernel path has no seam to inject pooled scalars, so it
-        rejects chunk_precompute rather than silently dropping it."""
-        pytest.importorskip("pyarrow")
+    def test_arrow_kernel_runs_chunk_precompute(self, monkeypatch):
+        """The kernel path now evaluates chunk_precompute over the pooled arrow
+        table and threads the scalar through the fallback per-cell loop (issue #30,
+        item ii): the per-cell ``offset`` resolves to the pooled chunk anchor,
+        uniform across cells — same result the pandas/arrow carriers produce."""
+        pa = pytest.importorskip("pyarrow")
         cfg = self._cfg(with_precompute=True)
-        leaf_to_cell = {1: 10, 2: 20}
-        grid = _KernelShardGrid([10, 20], leaf_to_cell)
-        df = pd.DataFrame(
+        grid = _KernelShardGrid([10, 20], {1: 10, 2: 20})
+        table = pa.table(
             {
-                "h_ph": np.array([0.0, 100.0], dtype=np.float32),
-                "leaf_id": np.array([1, 2], dtype=np.int64),
+                "h_ph": np.array([0.0, 2.0, 100.0, 102.0], dtype=np.float32),
+                "leaf_id": np.array([1, 1, 2, 2], dtype=np.int64),
             }
         )
-        TestProcessShardKernelBranch()._patch_reads(monkeypatch, [df])
-        with pytest.raises(NotImplementedError, match="chunk_precompute"):
-            process_shard(
-                grid, 0, ["s3://x"], s3_credentials={}, config=cfg, handoff="arrow-kernel"
-            )
+        TestProcessShardKernelBranch()._patch_reads(monkeypatch, [table])
+        df_out, _ = process_shard(
+            grid, 0, ["s3://x"], s3_credentials={}, config=cfg, handoff="arrow-kernel"
+        )
+        offsets = df_out["offset"].to_numpy()
+        pooled_median = np.median([0.0, 2.0, 100.0, 102.0])
+        np.testing.assert_array_equal(offsets, np.full(2, pooled_median, dtype=np.float32))
+        assert offsets[0] == offsets[1]
 
     def test_worked_template_uniform_offset_and_gain(self, monkeypatch):
         """The shipped atl03_waveform_chunk template runs end-to-end through the
@@ -2247,30 +2251,123 @@ class TestChunkPrecompute:
         # The empty cell still reports a zero obs count (the anchor is not data).
         assert df_out["count"].to_numpy()[2] == 0
 
-    def test_non_scalar_precompute_rejected(self, monkeypatch):
-        """A chunk_precompute expression that does not reduce to a scalar is
-        rejected with a clear error rather than silently coerced/broadcast."""
+    def test_non_scalar_chunk_value_allowed_in_namespace(self):
+        """A non-scalar chunk_precompute result (e.g. a matrix) is now ALLOWED into
+        the namespace (issue #30 / @espg 4773649308) — only a kind: scalar *write*
+        requires scalar-ness. The dtype cast applies element-wise to the array."""
+        from zagg.config import PipelineConfig
+
+        cfg = PipelineConfig(
+            data_source={"variables": {"h_ph": "/p"}},
+            aggregation={
+                # A covariance matrix: shape (2, 2), non-scalar.
+                "chunk_precompute": {
+                    "chunk_cov": {
+                        "expression": "np.cov(np.vstack([h_ph, h_ph * 2.0]))",
+                        "source": "h_ph",
+                        "dtype": "float64",
+                    }
+                },
+                "variables": {"count": {"function": "len", "source": "h_ph"}},
+            },
+            output={"grid": {"type": "healpix", "parent_order": 6, "child_order": 12}},
+        )
+        pooled = {"h_ph": np.array([1.0, 2.0, 3.0, 4.0], dtype=np.float64)}
+        out = _eval_chunk_precompute(cfg, pooled)
+        assert out["chunk_cov"].shape == (2, 2)
+        assert out["chunk_cov"].dtype == np.float64
+
+    def test_non_scalar_chunk_value_usable_in_per_cell_expression(self, monkeypatch):
+        """A non-scalar chunk value feeds a per-cell ``expression``: a per-cell
+        vector field references a chunk-level array (here a 3-vector), proving the
+        namespace injection is shape-agnostic end-to-end (issue #30)."""
         from zagg.config import PipelineConfig
 
         cfg = PipelineConfig(
             data_source={"groups": ["gt1l"], "variables": {"h_ph": "/{group}/h_ph"}},
             aggregation={
-                # np.floor(h_ph) is an ARRAY, not a chunk scalar.
-                "chunk_precompute": {"bad": {"expression": "np.floor(h_ph)", "source": "h_ph"}},
+                # chunk_vec is a length-3 array (pooled per-quantile anchor).
+                "chunk_precompute": {
+                    "chunk_vec": {
+                        "expression": "np.percentile(h_ph, [25, 50, 75])",
+                        "source": "h_ph",
+                        "dtype": "float32",
+                    }
+                },
                 "variables": {
+                    # references the chunk array in a per-cell vector expression.
+                    "anchored": {
+                        "kind": "vector",
+                        "trailing_shape": 3,
+                        "expression": "chunk_vec + np.float32(np.mean(h_ph))",
+                        "source": "h_ph",
+                        "dtype": "float32",
+                    },
                     "count": {
                         "function": "len",
                         "source": "h_ph",
                         "dtype": "int32",
                         "fill_value": 0,
-                    }
+                    },
                 },
             },
             output={"grid": {"type": "healpix", "parent_order": 6, "child_order": 12}},
         )
-        pooled = {"h_ph": np.array([1.0, 2.0, 3.0], dtype=np.float32)}
-        with pytest.raises(ValueError, match="must reduce to a scalar"):
-            _eval_chunk_precompute(cfg, pooled)
+        grid = _KernelShardGrid([10, 20], {1: 10, 2: 20})
+        df = pd.DataFrame(
+            {
+                "h_ph": np.array([0.0, 2.0, 100.0, 102.0], dtype=np.float32),
+                "leaf_id": np.array([1, 1, 2, 2], dtype=np.int64),
+            }
+        )
+        TestProcessShardKernelBranch()._patch_reads(monkeypatch, [df])
+        # vector field -> arrow table carrier.
+        tbl, _ = process_shard(grid, 0, ["s3://x"], s3_credentials={}, config=cfg)
+        anchored = tbl.column("anchored").combine_chunks()
+        block = anchored.values.to_numpy(zero_copy_only=False).reshape(2, 3)
+        chunk_vec = np.percentile([0.0, 2.0, 100.0, 102.0], [25, 50, 75]).astype(np.float32)
+        # cell 10 mean = 1.0, cell 20 mean = 101.0.
+        np.testing.assert_allclose(block[0], chunk_vec + np.float32(1.0), rtol=1e-5)
+        np.testing.assert_allclose(block[1], chunk_vec + np.float32(101.0), rtol=1e-5)
+
+    def test_non_scalar_chunk_value_into_scalar_field_clear_error(self, monkeypatch):
+        """Writing a non-scalar chunk value to a kind: scalar field raises a clear
+        error (the scalar-ness guard now lives at the WRITE point, not the
+        precompute reduction — issue #30)."""
+        from zagg.config import PipelineConfig
+
+        cfg = PipelineConfig(
+            data_source={"groups": ["gt1l"], "variables": {"h_ph": "/{group}/h_ph"}},
+            aggregation={
+                "chunk_precompute": {
+                    "chunk_vec": {
+                        "expression": "np.percentile(h_ph, [25, 50, 75])",
+                        "source": "h_ph",
+                    }
+                },
+                "variables": {
+                    # scalar field assigned a length-3 chunk array -> clear error.
+                    "bad": {"expression": "chunk_vec", "dtype": "float32"},
+                    "count": {
+                        "function": "len",
+                        "source": "h_ph",
+                        "dtype": "int32",
+                        "fill_value": 0,
+                    },
+                },
+            },
+            output={"grid": {"type": "healpix", "parent_order": 6, "child_order": 12}},
+        )
+        grid = _KernelShardGrid([10, 20], {1: 10, 2: 20})
+        df = pd.DataFrame(
+            {
+                "h_ph": np.array([0.0, 2.0, 100.0, 102.0], dtype=np.float32),
+                "leaf_id": np.array([1, 1, 2, 2], dtype=np.int64),
+            }
+        )
+        TestProcessShardKernelBranch()._patch_reads(monkeypatch, [df])
+        with pytest.raises(ValueError, match="scalar field 'bad'.*non-scalar"):
+            process_shard(grid, 0, ["s3://x"], s3_credentials={}, config=cfg)
 
     def test_missing_source_column_clear_error(self):
         """A function precompute whose source is absent from the pooled dict raises
@@ -2289,19 +2386,61 @@ class TestChunkPrecompute:
         with pytest.raises(ValueError, match="source column 'other' is not present"):
             _eval_chunk_precompute(cfg, {"h_ph": np.array([1.0, 2.0])})
 
-    def test_arrow_kernel_rejects_chunk_precompute_even_on_empty_reads(self, monkeypatch):
-        """The arrow-kernel + chunk_precompute incompatibility is a config property,
-        enforced before any read — so it still raises when every read comes back
-        empty (no rows), not only when there happens to be data (issue #30)."""
-        pytest.importorskip("pyarrow")
-        cfg = self._cfg(with_precompute=True)
+    def test_arrow_kernel_runs_non_scalar_chunk_precompute(self, monkeypatch):
+        """A NON-scalar chunk_precompute result also works on the kernel path: the
+        pooled arrow table is reduced once to a 3-vector, injected into the kernel
+        fallback namespace, and a per-cell scalar expression reduces over it (issue
+        #30, item ii). (A kind: vector OUTPUT is a separate kernel-path gap — the
+        experimental kernel reducer dense-preallocates scalars only — so the
+        per-cell field reduces the chunk array rather than emitting it whole.)"""
+        pa = pytest.importorskip("pyarrow")
+        from zagg.config import PipelineConfig
+
+        cfg = PipelineConfig(
+            data_source={"groups": ["gt1l"], "variables": {"h_ph": "/{group}/h_ph"}},
+            aggregation={
+                "chunk_precompute": {
+                    "chunk_vec": {
+                        "expression": "np.percentile(h_ph, [25, 50, 75])",
+                        "source": "h_ph",
+                        "dtype": "float32",
+                    }
+                },
+                "variables": {
+                    # per-cell scalar reduces over the injected chunk 3-vector.
+                    "anchored": {
+                        "expression": "float(np.sum(chunk_vec)) + float(np.mean(h_ph))",
+                        "source": "h_ph",
+                        "dtype": "float32",
+                    },
+                    "count": {
+                        "function": "len",
+                        "source": "h_ph",
+                        "dtype": "int32",
+                        "fill_value": 0,
+                    },
+                },
+            },
+            output={"grid": {"type": "healpix", "parent_order": 6, "child_order": 12}},
+        )
         grid = _KernelShardGrid([10, 20], {1: 10, 2: 20})
-        # No canned tables: every _read_group returns None, so all_reads is empty.
-        TestProcessShardKernelBranch()._patch_reads(monkeypatch, [])
-        with pytest.raises(NotImplementedError, match="chunk_precompute"):
-            process_shard(
-                grid, 0, ["s3://x"], s3_credentials={}, config=cfg, handoff="arrow-kernel"
-            )
+        table = pa.table(
+            {
+                "h_ph": np.array([0.0, 2.0, 100.0, 102.0], dtype=np.float32),
+                "leaf_id": np.array([1, 1, 2, 2], dtype=np.int64),
+            }
+        )
+        TestProcessShardKernelBranch()._patch_reads(monkeypatch, [table])
+        df_out, _ = process_shard(
+            grid, 0, ["s3://x"], s3_credentials={}, config=cfg, handoff="arrow-kernel"
+        )
+        anchored = df_out["anchored"].to_numpy()
+        chunk_sum = float(
+            np.sum(np.percentile([0.0, 2.0, 100.0, 102.0], [25, 50, 75]).astype(np.float32))
+        )
+        # cell 10 mean = 1.0, cell 20 mean = 101.0.
+        np.testing.assert_allclose(anchored[0], chunk_sum + 1.0, rtol=1e-5)
+        np.testing.assert_allclose(anchored[1], chunk_sum + 101.0, rtol=1e-5)
 
     def test_degenerate_single_photon_chunk_gain_floor(self, monkeypatch):
         """The worked template's chunk_gain floors to 0.5 on a degenerate pooled
