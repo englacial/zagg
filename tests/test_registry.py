@@ -1,4 +1,4 @@
-"""Tests for the capability registries (issue #12, Phase 2)."""
+"""Tests for the capability registry (issue #64)."""
 
 from __future__ import annotations
 
@@ -6,22 +6,10 @@ import pytest
 
 import zagg.registry as registry
 from zagg.registry import (
+    UnknownCapability,
+    describe_all,
     discover_plugins,
-    get_catalog_source,
-    get_credential_provider,
-    get_event_trigger,
-    get_field_transform,
-    get_mask_provider,
-    get_reader,
-    get_reducer,
     get_spatial_func,
-    list_catalog_sources,
-    list_credential_providers,
-    list_event_triggers,
-    list_field_transforms,
-    list_mask_providers,
-    list_readers,
-    list_reducers,
     list_spatial_funcs,
     register_catalog_source,
     register_credential_provider,
@@ -34,36 +22,7 @@ from zagg.registry import (
     registry_snapshot,
 )
 
-# ---------------------------------------------------------------------------
-# Fixtures
-# ---------------------------------------------------------------------------
-
-
-@pytest.fixture(autouse=True)
-def _clean_registries():
-    """Snapshot every registry + the discovered flag, restore on teardown.
-
-    Phase 2 ships empty registries, but later phases add built-ins; this
-    keeps the test suite future-proof and isolates each test from the rest.
-    """
-    saved = {kind: dict(reg) for kind, reg in registry._REGISTRIES.items()}
-    saved_discovered = registry._DISCOVERED
-    saved_discovering = registry._DISCOVERING
-    yield
-    for kind, reg in registry._REGISTRIES.items():
-        reg.clear()
-        reg.update(saved[kind])
-    registry._DISCOVERED = saved_discovered
-    registry._DISCOVERING = saved_discovering
-
-
-# ---------------------------------------------------------------------------
-# All eight registries are present
-# ---------------------------------------------------------------------------
-
-
-# The June plan (https://github.com/englacial/zagg/issues/12#issuecomment-4635480666)
-# names exactly these eight registries. The set is treated as an invariant.
+# The June plan names exactly these eight registries; treated as an invariant.
 _EXPECTED_REGISTRIES = {
     "spatial_func",
     "reducer",
@@ -76,93 +35,151 @@ _EXPECTED_REGISTRIES = {
 }
 
 
+@pytest.fixture(autouse=True)
+def _clean_registries():
+    """Snapshot every registry + the discovery flags; restore on teardown."""
+    saved = {kind: dict(reg._entries) for kind, reg in registry._REGISTRIES.items()}
+    saved_discovered = registry._DISCOVERED
+    saved_discovering = registry._DISCOVERING
+    yield
+    for kind, reg in registry._REGISTRIES.items():
+        reg._entries.clear()
+        reg._entries.update(saved[kind])
+    registry._DISCOVERED = saved_discovered
+    registry._DISCOVERING = saved_discovering
+
+
+# ---------------------------------------------------------------------------
+# Registry set
+# ---------------------------------------------------------------------------
+
+
 class TestRegistrySet:
     def test_exactly_eight_registries(self):
         assert set(registry._REGISTRIES) == _EXPECTED_REGISTRIES
 
-    def test_snapshot_lists_every_registry(self):
+    def test_each_registry_knows_its_kind(self):
+        for kind, reg in registry._REGISTRIES.items():
+            assert reg.kind == kind
+
+    def test_snapshot_lists_every_registry_name_sorted(self):
         snap = registry_snapshot()
         assert set(snap) == _EXPECTED_REGISTRIES
-        # Each entry is a sorted name list
-        for kind, names in snap.items():
+        for names in snap.values():
             assert isinstance(names, list)
             assert names == sorted(names)
 
 
 # ---------------------------------------------------------------------------
-# Direct register / get / list round-trip for each registry. Parametrising
-# keeps the eight surfaces in lockstep — a future registry that grows a typo
-# in one of its three helpers fails here loudly.
+# Register / get / list round-trip across all eight, both call forms
 # ---------------------------------------------------------------------------
 
-
-_REGISTRATIONS = [
-    ("spatial_func", register_spatial_func, get_spatial_func, list_spatial_funcs),
-    ("reducer", register_reducer, get_reducer, list_reducers),
-    ("mask_provider", register_mask_provider, get_mask_provider, list_mask_providers),
-    ("field_transform", register_field_transform, get_field_transform, list_field_transforms),
-    ("event_trigger", register_event_trigger, get_event_trigger, list_event_triggers),
-    ("reader", register_reader, get_reader, list_readers),
-    ("catalog_source", register_catalog_source, get_catalog_source, list_catalog_sources),
-    (
-        "credential_provider",
-        register_credential_provider,
-        get_credential_provider,
-        list_credential_providers,
-    ),
+_REGISTER = [
+    ("spatial_func", register_spatial_func),
+    ("reducer", register_reducer),
+    ("mask_provider", register_mask_provider),
+    ("field_transform", register_field_transform),
+    ("event_trigger", register_event_trigger),
+    ("reader", register_reader),
+    ("catalog_source", register_catalog_source),
+    ("credential_provider", register_credential_provider),
 ]
 
 
-@pytest.mark.parametrize("kind,reg,get,lst", _REGISTRATIONS)
-class TestRegistrySurface:
-    def test_register_then_get_direct(self, kind, reg, get, lst):
+@pytest.mark.parametrize("kind,register_fn", _REGISTER)
+class TestSurface:
+    def test_register_direct_then_get(self, kind, register_fn):
         sentinel = object()
-        reg("demo", sentinel)
-        assert get("demo") is sentinel
-        assert "demo" in lst()
+        ret = register_fn("demo", sentinel)
+        assert ret is sentinel  # direct call returns the object
+        reg = registry._REGISTRIES[kind]
+        assert reg.get("demo") is sentinel
+        assert "demo" in reg.names()
+        assert "demo" in reg
 
-    def test_register_then_get_decorator(self, kind, reg, get, lst):
-        @reg("demo")
-        def f():
-            return 42
+    def test_register_decorator_form(self, kind, register_fn):
+        @register_fn("decorated")
+        def capability():  # pragma: no cover - never called
+            return 1
 
-        assert get("demo") is f
-        assert f() == 42
-        assert "demo" in lst()
+        assert registry._REGISTRIES[kind].get("decorated") is capability
 
-    def test_unknown_raises_keyerror_naming_kind(self, kind, reg, get, lst):
-        with pytest.raises(KeyError, match=kind):
-            get("nope")
-
-    def test_duplicate_registration_raises(self, kind, reg, get, lst):
-        reg("demo", object())
+    def test_duplicate_raises_unless_replace(self, kind, register_fn):
+        register_fn("dup", object())
         with pytest.raises(ValueError, match="already registered"):
-            reg("demo", object())
+            register_fn("dup", object())
+        replacement = object()
+        register_fn("dup", replacement, replace=True)
+        assert registry._REGISTRIES[kind].get("dup") is replacement
 
-    def test_replace_overrides_existing(self, kind, reg, get, lst):
-        first = object()
-        second = object()
-        reg("demo", first)
-        reg("demo", second, replace=True)
-        assert get("demo") is second
-
-    def test_replace_overrides_via_decorator(self, kind, reg, get, lst):
-        first = object()
-        reg("demo", first)
-
-        @reg("demo", replace=True)
-        def replacement():
-            return "new"
-
-        assert get("demo") is replacement
-
-    def test_empty_name_rejected(self, kind, reg, get, lst):
+    def test_empty_or_nonstring_name_raises(self, kind, register_fn):
         with pytest.raises(ValueError, match="non-empty string"):
-            reg("", object())
-
-    def test_non_string_name_rejected(self, kind, reg, get, lst):
+            register_fn("", object())
         with pytest.raises(ValueError, match="non-empty string"):
-            reg(123, object())
+            register_fn(None, object())  # type: ignore[arg-type]
+
+
+# ---------------------------------------------------------------------------
+# Unknown-name error
+# ---------------------------------------------------------------------------
+
+
+class TestUnknownCapability:
+    def test_get_unknown_raises_with_kind_and_available(self):
+        register_spatial_func("alpha", object())
+        register_spatial_func("beta", object())
+        with pytest.raises(UnknownCapability) as exc:
+            get_spatial_func("gamma")
+        err = exc.value
+        assert err.kind == "spatial_func"
+        assert err.name == "gamma"
+        assert err.available == ["alpha", "beta"]
+        assert "spatial_func" in str(err)
+        assert "alpha" in str(err)
+
+    def test_is_a_keyerror_subclass(self):
+        # Existing ``except KeyError`` paths keep catching it.
+        with pytest.raises(KeyError):
+            get_spatial_func("missing")
+
+    def test_describe_unknown_raises(self):
+        with pytest.raises(UnknownCapability):
+            registry.SPATIAL_FUNCS.describe("nope")
+
+
+# ---------------------------------------------------------------------------
+# Optional description + schema
+# ---------------------------------------------------------------------------
+
+
+class TestDescribeAndSchema:
+    def test_describe_without_schema_omits_key(self):
+        register_spatial_func("plain", object(), description="a plain one")
+        d = registry.SPATIAL_FUNCS.describe("plain")
+        assert d == {"name": "plain", "kind": "spatial_func", "description": "a plain one"}
+        assert "schema" not in d
+
+    def test_describe_with_schema_includes_it(self):
+        schema = {"type": "object", "properties": {"window": {"type": "integer"}}}
+        register_spatial_func("with_schema", object(), description="d", schema=schema)
+        d = registry.SPATIAL_FUNCS.describe("with_schema")
+        assert d["schema"] is schema
+        assert d["description"] == "d"
+
+    def test_describe_all_is_structured_and_sorted(self):
+        register_reducer("zeta", object())
+        register_reducer("alpha", object(), description="first")
+        out = describe_all()
+        assert set(out) == _EXPECTED_REGISTRIES
+        reducers = out["reducer"]
+        assert [e["name"] for e in reducers] == ["alpha", "zeta"]
+        assert reducers[0] == {"name": "alpha", "kind": "reducer", "description": "first"}
+
+    def test_schema_default_none_pays_nothing(self):
+        register_mask_provider("m", object())
+        entry = registry.MASK_PROVIDERS._entries["m"]
+        assert entry.schema is None
+        assert entry.description == ""
 
 
 # ---------------------------------------------------------------------------
@@ -171,171 +188,113 @@ class TestRegistrySurface:
 
 
 class _FakeEntryPoint:
-    """Lightweight stand-in for importlib.metadata.EntryPoint."""
-
-    def __init__(self, name: str, register_fn):
+    def __init__(self, name, register_fn, *, load_error=None):
         self.name = name
-        self._register = register_fn
+        self._register_fn = register_fn
+        self._load_error = load_error
 
     def load(self):
-        return self._register
+        if self._load_error is not None:
+            raise self._load_error
+        return self._register_fn
 
 
-def _install_entry_points(monkeypatch, eps):
-    """Patch importlib.metadata.entry_points to return ``eps`` for our group."""
-
-    def fake_entry_points(*, group):
-        assert group == registry._ENTRY_POINT_GROUP
-        return eps
-
-    monkeypatch.setattr(registry.metadata, "entry_points", fake_entry_points)
+def _patch_entry_points(monkeypatch, eps):
+    monkeypatch.setattr(registry.metadata, "entry_points", lambda group: list(eps))
+    registry._DISCOVERED = False
+    registry._DISCOVERING = False
 
 
 class TestDiscovery:
-    def test_discovery_runs_once_on_get(self, monkeypatch):
-        calls = []
+    def test_entry_point_register_runs_on_first_get(self, monkeypatch):
+        def plugin_register():
+            register_spatial_func("from_plugin", object())
 
-        def register_fn():
-            calls.append(1)
-            register_spatial_func("from_plugin", lambda: None)
+        _patch_entry_points(monkeypatch, [_FakeEntryPoint("p", plugin_register)])
+        # Not discovered yet until a get/list touches the registry.
+        assert "from_plugin" not in registry.SPATIAL_FUNCS._entries
+        assert "from_plugin" in list_spatial_funcs()
 
-        _install_entry_points(monkeypatch, [_FakeEntryPoint("demo", register_fn)])
-        registry._DISCOVERED = False
-
-        # First lookup triggers discovery and finds the plugin.
-        assert get_spatial_func("from_plugin") is not None
-        # Subsequent lookups do NOT re-discover.
-        assert get_spatial_func("from_plugin") is not None
-        assert calls == [1]
-
-    def test_discover_plugins_force_reruns(self, monkeypatch):
-        calls = []
-
-        def register_fn():
-            calls.append(1)
-
-        _install_entry_points(monkeypatch, [_FakeEntryPoint("demo", register_fn)])
-        registry._DISCOVERED = False
-        discover_plugins()
-        discover_plugins()  # idempotent
-        discover_plugins(force=True)
-        assert calls == [1, 1]
-
-    def test_failing_plugin_does_not_crash_discovery(self, monkeypatch, caplog):
-        good_calls = []
-
-        def good():
-            good_calls.append(1)
+    def test_broken_load_is_skipped(self, monkeypatch):
+        def good_register():
             register_reducer("good", object())
 
-        def bad():
-            raise RuntimeError("plugin exploded")
+        eps = [
+            _FakeEntryPoint("broken", None, load_error=ImportError("boom")),
+            _FakeEntryPoint("good", good_register),
+        ]
+        _patch_entry_points(monkeypatch, eps)
+        assert "good" in registry.REDUCERS.names()  # the broken one didn't abort discovery
 
-        _install_entry_points(
-            monkeypatch,
-            [
-                _FakeEntryPoint("bad", bad),
-                _FakeEntryPoint("good", good),
-            ],
-        )
+    def test_broken_register_is_skipped(self, monkeypatch):
+        def bad_register():
+            raise RuntimeError("plugin blew up")
+
+        def good_register():
+            register_reader("ok", object())
+
+        eps = [_FakeEntryPoint("bad", bad_register), _FakeEntryPoint("ok", good_register)]
+        _patch_entry_points(monkeypatch, eps)
+        assert "ok" in registry.READERS.names()
+
+    def test_entry_points_lookup_failure_retries(self, monkeypatch):
+        calls = {"n": 0}
+
+        def flaky(group):
+            calls["n"] += 1
+            if calls["n"] == 1:
+                raise RuntimeError("transient metadata failure")
+            return []
+
+        monkeypatch.setattr(registry.metadata, "entry_points", flaky)
         registry._DISCOVERED = False
-
-        with caplog.at_level("ERROR"):
-            discover_plugins()
-
-        # Good plugin still registered; the bad one logged but did not abort.
-        assert "good" in list_reducers()
-        assert good_calls == [1]
-        assert any("bad" in rec.getMessage() for rec in caplog.records)
-
-    def test_failing_entry_point_load_does_not_crash(self, monkeypatch, caplog):
-        class BadEntryPoint:
-            name = "bad"
-
-            def load(self):
-                raise ImportError("module not found")
-
-        def good():
-            register_reader("good", object())
-
-        _install_entry_points(
-            monkeypatch,
-            [BadEntryPoint(), _FakeEntryPoint("good", good)],
-        )
-        registry._DISCOVERED = False
-
-        with caplog.at_level("ERROR"):
-            discover_plugins()
-
-        assert "good" in list_readers()
-        assert any("bad" in rec.getMessage() for rec in caplog.records)
-
-    def test_list_also_triggers_discovery(self, monkeypatch):
-        def register_fn():
-            register_event_trigger("from_plugin", lambda: True)
-
-        _install_entry_points(monkeypatch, [_FakeEntryPoint("demo", register_fn)])
-        registry._DISCOVERED = False
-
-        assert "from_plugin" in list_event_triggers()
-
-    def test_snapshot_triggers_discovery(self, monkeypatch):
-        def register_fn():
-            register_mask_provider("from_plugin", object())
-
-        _install_entry_points(monkeypatch, [_FakeEntryPoint("demo", register_fn)])
-        registry._DISCOVERED = False
-
-        snap = registry_snapshot()
-        assert "from_plugin" in snap["mask_provider"]
-
-    def test_entry_point_lookup_failure_allows_retry(self, monkeypatch, caplog):
-        """If ``metadata.entry_points`` itself raises, the seam stays in the
-        not-yet-discovered state so a later call can recover (e.g. after a
-        broken ``importlib_metadata`` backport is uninstalled)."""
-        attempts = {"n": 0}
-
-        def flaky_entry_points(*, group):
-            assert group == registry._ENTRY_POINT_GROUP
-            attempts["n"] += 1
-            if attempts["n"] == 1:
-                raise RuntimeError("metadata lookup failed transiently")
-            return [_FakeEntryPoint("demo", lambda: register_reader("from_plugin", object()))]
-
-        monkeypatch.setattr(registry.metadata, "entry_points", flaky_entry_points)
-        registry._DISCOVERED = False
-
-        with caplog.at_level("ERROR"):
-            # First call: lookup failure logged, no discovery marked.
-            discover_plugins()
+        registry._DISCOVERING = False
+        # First call swallows the failure and leaves the seam retryable.
+        assert list_spatial_funcs() == []
         assert registry._DISCOVERED is False
-        assert any("entry-point lookup failed" in rec.getMessage() for rec in caplog.records)
-
-        # Second call: lookup succeeds, plugin registers.
-        discover_plugins()
+        # Second call succeeds and flips the flag.
+        assert list_spatial_funcs() == []
         assert registry._DISCOVERED is True
-        assert "from_plugin" in list_readers()
-        assert attempts["n"] == 2
+        assert calls["n"] == 2
 
-    def test_register_during_register_does_not_recurse(self, monkeypatch):
-        """A plugin that calls a ``register_*`` helper from inside its
-        ``register()`` must not trigger nested discovery — ``_DISCOVERING``
-        gates re-entry, and ``register_*`` itself does not call
-        ``_ensure_discovered``."""
-        load_calls = []
+    def test_register_reentrancy_during_discovery(self, monkeypatch):
+        # A plugin whose register() itself calls get_* must not re-enter the sweep.
+        def plugin_register():
+            register_field_transform("a", object())
+            # Touch get/list during discovery — must short-circuit via the
+            # re-entrancy guard, not recurse into another sweep. These calls go
+            # through _ensure_discovered(); they hang/recurse if the guard breaks.
+            assert "a" in registry.FIELD_TRANSFORMS  # __contains__ -> _ensure_discovered
+            assert registry.FIELD_TRANSFORMS.names() == ["a"]
 
-        def register_fn():
-            load_calls.append(1)
-            # Touch the snapshot mid-register; before the fix this would
-            # have re-entered _ensure_discovered if _DISCOVERED were still
-            # False (it's now set to True before the loop, but the test
-            # also exercises the _DISCOVERING guard explicitly).
-            registry_snapshot()
-            register_field_transform("from_plugin", lambda x: x)
-
-        _install_entry_points(monkeypatch, [_FakeEntryPoint("demo", register_fn)])
-        registry._DISCOVERED = False
-
+        _patch_entry_points(monkeypatch, [_FakeEntryPoint("p", plugin_register)])
         discover_plugins()
-        assert load_calls == [1]
-        assert "from_plugin" in list_field_transforms()
+        assert "a" in registry.FIELD_TRANSFORMS.names()
+
+    def test_discover_plugins_force_reruns(self, monkeypatch):
+        seen = {"n": 0}
+
+        def plugin_register():
+            seen["n"] += 1
+            # replace=True so the second (forced) sweep doesn't trip the dup guard.
+            register_credential_provider("edl", object(), replace=True)
+
+        _patch_entry_points(monkeypatch, [_FakeEntryPoint("p", plugin_register)])
+        discover_plugins()
+        assert seen["n"] == 1
+        discover_plugins(force=True)
+        assert seen["n"] == 2
+
+
+# ---------------------------------------------------------------------------
+# Strings-not-callables invariant
+# ---------------------------------------------------------------------------
+
+
+def test_name_resolves_back_to_same_object():
+    def my_max(arr):  # pragma: no cover - never called
+        return arr
+
+    register_spatial_func("max", my_max)
+    # A config would carry the string "max"; resolution returns the callable.
+    assert get_spatial_func("max") is my_max

@@ -1,4 +1,5 @@
 """HEALPix DGGS output grid via mortie."""
+
 from __future__ import annotations
 
 from typing import Literal
@@ -16,6 +17,7 @@ from zagg.config import (
     output_field_signature,
 )
 from zagg.grids.base import InconsistentShardError, vector_array_spec
+from zagg.grids.morton import to_morton_array
 
 HEALPIX_BASE_CELLS: int = 12
 HEALPIX_REF_ORDER: int = 18  # mortie's clip2order reference order; do not change
@@ -163,9 +165,7 @@ class HealpixGrid:
             healpix, _ = mort2healpix(np.asarray([int(shard_key)]))
             return (int(healpix[0]),)
         if self._position_map is None:
-            raise RuntimeError(
-                "block_index requires set_populated_shards() for dense layout"
-            )
+            raise RuntimeError("block_index requires set_populated_shards() for dense layout")
         return (self._position_map[int(shard_key)],)
 
     def shard_footprint(self, shard_key):
@@ -192,9 +192,17 @@ class HealpixGrid:
         return cell_ids
 
     def chunk_coords(self, shard_key) -> dict:
-        """Per-cell coord columns for HEALPix: ``morton`` and ``cell_ids``."""
+        """Per-cell coord columns for HEALPix: ``morton`` and ``cell_ids``.
+
+        ``morton`` is a mortie ``MortonIndexArray`` (the typed coordinate; #71);
+        it is stored as ``uint64`` on disk via :mod:`zagg.grids.morton`. ``cell_ids``
+        stays NESTED ``uint64`` (the DGGS coordinate, unchanged).
+        """
         children = self.children(shard_key)
-        return {"morton": children, "cell_ids": self.encode_cell_ids(children)}
+        return {
+            "morton": to_morton_array(children),
+            "cell_ids": self.encode_cell_ids(children),
+        }
 
     # ── identity / nesting ───────────────────────────────────────────────
 
@@ -223,9 +231,7 @@ class HealpixGrid:
         """
         if not isinstance(other, HealpixGrid):
             return False
-        return output_field_signature(self.config) == output_field_signature(
-            other.config
-        )
+        return output_field_signature(self.config) == output_field_signature(other.config)
 
     def emit_template(self, store: Store, *, overwrite: bool = False) -> Store:
         """Write the Zarr template (group + arrays) to ``store``."""
@@ -254,9 +260,7 @@ class HealpixGrid:
             chunk_grid=NamedConfig(
                 name="regular", configuration={"chunk_shape": (self.n_children,)}
             ),
-            chunk_key_encoding=NamedConfig(
-                name="default", configuration={"separator": "/"}
-            ),
+            chunk_key_encoding=NamedConfig(name="default", configuration={"separator": "/"}),
             codecs=(NamedConfig(name="bytes", configuration={"endian": "little"}),),
             storage_transformers=(),
             fill_value="NaN",

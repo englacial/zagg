@@ -16,13 +16,14 @@ import logging
 import os
 import time
 import warnings
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import ThreadPoolExecutor
 
 from zarr import consolidate_metadata
 
 from zagg.auth import get_edl_token, get_nsidc_s3_credentials
 from zagg.concurrency import (
     ConcurrencyReport,
+    compute_available_workers,
     raise_for_fd_exhaustion,
 )
 from zagg.config import (
@@ -36,9 +37,14 @@ from zagg.config import (
     get_store_path,
 )
 from zagg.dispatch import (
-    estimate_cost,
-    invoke_with_retry,
-    preflight_concurrency_probe,
+    LAMBDA_MEMORY_GB,
+    LAMBDA_PRICE_PER_GB_SEC,
+    LAMBDA_RETRY,
+    LOCAL_RETRY,
+    LambdaExecutor,
+    LocalExecutor,
+    PreflightReport,
+    dispatch,
 )
 from zagg.processing import process_shard, write_dataframe_to_zarr
 from zagg.store import open_store
@@ -312,7 +318,15 @@ def _run_local(config, catalog_data, store_path, child_order, *,
                max_cells, morton_cell, max_workers, overwrite, dry_run, region,
                driver="s3", output_credentials=None, output_endpoint_url=None,
                handoff="pandas"):
-    """Run processing locally with ThreadPoolExecutor."""
+    """Run processing locally via the generic dispatch loop on a thread pool.
+
+    This is the trivial backend: a :class:`~zagg.dispatch.LocalExecutor` over a
+    ``ThreadPoolExecutor`` with no metered cost. Per-cell exception handling
+    differs from Lambda -- a raised cell exception is *counted* as an error and
+    the run continues (Lambda instead only surfaces its run-fatal errno-24) --
+    so the work callable catches and tags exceptions and ``_accumulate``
+    reproduces the original counting exactly, keeping the summary byte-identical.
+    """
     all_shards = list(catalog_data["shard_keys"])
 
     cells = _select_cells(catalog_data, morton_cell=morton_cell, max_cells=max_cells)
@@ -344,55 +358,69 @@ def _run_local(config, catalog_data, store_path, child_order, *,
     )
     zarr_store = grid.emit_template(zarr_store, overwrite=overwrite)
 
-    start_time = time.time()
-    total_obs = 0
-    cells_with_data = 0
-    cells_error = 0
-    results = []
-
-    with ThreadPoolExecutor(max_workers=max_workers) as executor:
-        futures = {
-            executor.submit(
-                _process_and_write,
+    # Per-cell work, catching its own exceptions so one bad cell counts as an
+    # error and the run continues (the old loop's ``except`` branch). The
+    # outcome is tagged in a private envelope the accumulator unpacks; on the
+    # error path nothing is appended to ``results``, matching the old behavior.
+    def _cell_work(payload):
+        shard_key, records = payload
+        try:
+            meta = _process_and_write(
                 shard_key, grid.block_index(int(shard_key)), records,
                 grid,
                 s3_creds, zarr_store, config,
                 driver=driver, handoff=handoff,
-            ): shard_key
-            for shard_key, records in cells
-        }
+            )
+            return {"shard_key": shard_key, "ok": True, "meta": meta}
+        except Exception as e:
+            return {"shard_key": shard_key, "ok": False, "error": e}
 
-        for i, future in enumerate(as_completed(futures), 1):
-            shard_key = futures[future]
-            try:
-                meta = future.result()
-                results.append(meta)
-                if meta.get("error"):
-                    logger.info(f"  [{i}/{len(cells)}] {shard_key}: {meta['error']}")
-                else:
-                    obs = meta.get("total_obs", 0)
-                    total_obs += obs
-                    cells_with_data += 1
-                    if i % 10 == 0 or len(cells) <= 20:
-                        logger.info(f"  [{i}/{len(cells)}] {shard_key}: {obs:,} obs")
-            except Exception as e:
-                cells_error += 1
-                logger.warning(f"  [{i}/{len(cells)}] {shard_key}: ERROR {e}")
+    executor = LocalExecutor(
+        _cell_work, max_workers=max_workers, pool_factory=ThreadPoolExecutor,
+    )
+    executor.preflight(len(cells))
+
+    n = len(cells)
+
+    def _accumulate(report, i, outcome):
+        shard_key = outcome["shard_key"]
+        if not outcome["ok"]:
+            report.cells_error += 1
+            logger.warning(f"  [{i}/{n}] {shard_key}: ERROR {outcome['error']}")
+            return
+        meta = outcome["meta"]
+        report.results.append(meta)
+        if meta.get("error"):
+            logger.info(f"  [{i}/{n}] {shard_key}: {meta['error']}")
+        else:
+            obs = meta.get("total_obs", 0)
+            report.total_obs += obs
+            report.cells_with_data += 1
+            if i % 10 == 0 or n <= 20:
+                logger.info(f"  [{i}/{n}] {shard_key}: {obs:,} obs")
+
+    start_time = time.time()
+    try:
+        report = dispatch(
+            executor, cells, retry=LOCAL_RETRY, accumulate=_accumulate,
+        )
+    finally:
+        executor.shutdown()
 
     consolidate_metadata(zarr_store, zarr_format=3)
     wall_time = time.time() - start_time
 
     summary = {
         "total_cells": len(cells),
-        "cells_with_data": cells_with_data,
-        "cells_error": cells_error,
-        "total_obs": total_obs,
+        "cells_with_data": report.cells_with_data,
+        "cells_error": report.cells_error,
+        "total_obs": report.total_obs,
         "wall_time_s": wall_time,
         "store_path": store_path,
         "backend": "local",
-        "results": results,
+        "results": report.results,
     }
-    logger.info(f"Done: {cells_with_data} cells, {total_obs:,} obs, {cells_error} errors, {wall_time:.1f}s")
+    logger.info(f"Done: {report.cells_with_data} cells, {report.total_obs:,} obs, {report.cells_error} errors, {wall_time:.1f}s")
     return summary
 
 
@@ -400,10 +428,21 @@ def _run_lambda(config, catalog_data, store_path, child_order, *,
                 max_cells, morton_cell, max_workers, overwrite, dry_run,
                 region, function_name,
                 output_credentials=None, output_endpoint_url=None):
-    """Run processing via AWS Lambda invocation."""
+    """Run processing via AWS Lambda invocation.
+
+    The fan-out -> retry -> measured-cost loop is the generic
+    :func:`zagg.dispatch.dispatch`; this function owns the Lambda-specific
+    setup (grid, auth, concurrency probe, template/finalize invokes) and cost
+    *presentation*. The boto3 seams (``_invoke_lambda_cell`` /
+    ``_invoke_lambda_setup`` / ``_invoke_lambda_finalize`` /
+    ``compute_available_workers`` / ``ThreadPoolExecutor``) are referenced off
+    this module so the spatial path stays byte-identical and existing tests
+    that monkeypatch them continue to bind the exact objects in use.
+    """
     from dataclasses import asdict
 
     import boto3
+    from botocore.config import Config
 
     all_shards = list(catalog_data["shard_keys"])
     grid_type = config.output.get("grid", {}).get("type", "healpix")
@@ -441,20 +480,77 @@ def _run_lambda(config, catalog_data, store_path, child_order, *,
         output_credentials, output_endpoint_url, region,
     )
 
-    # Pre-flight concurrency probe + dispatch-client setup (dispatch.py owns
-    # the probe + sized client construction so future backends reuse it).
+    # The dispatch lambda_client is built inside preflight() (once the probe
+    # has clamped the worker count, which sizes its connection pool), so the
+    # per-cell / finalize closures read it from this holder rather than closing
+    # over a not-yet-built name.
     session = boto3.Session()
-    lambda_client, max_workers, concurrency_report = preflight_concurrency_probe(
-        session, function_name, region=region, max_workers=max_workers,
+    state: dict = {}
+
+    def _preflight(n):
+        # Pre-flight concurrency probe: clamp workers to what local file
+        # descriptors and account-wide Lambda concurrency can sustain, so we
+        # don't silently drop cells (FD exhaustion) or saturate the account
+        # pool (#28). Probe with a lightweight session; the dispatch client is
+        # sized to the clamped count. Kept behind the Executor.preflight() seam
+        # (#63) -- concurrency.py stays a helper module called from here.
+        probe_lambda = session.client("lambda", region_name=region)
+        cloudwatch_client = session.client("cloudwatch", region_name=region)
+        clamped, concurrency_report = compute_available_workers(
+            max_workers, probe_lambda, cloudwatch_client, function_name,
+        )
+        _log_concurrency_report(concurrency_report, clamped)
+
+        # Configure the dispatch boto3 client. max_pool_connections is sized to
+        # the clamped worker count so connections cannot outrun the
+        # file-descriptor budget. Built here (not before) so the pool tracks
+        # the probe's clamp.
+        boto_config = Config(
+            read_timeout=900,
+            connect_timeout=10,
+            retries={"max_attempts": 0},
+            max_pool_connections=clamped,
+        )
+        state["workers"] = clamped
+        state["lambda_client"] = session.client(
+            "lambda", region_name=region, config=boto_config,
+        )
+        return PreflightReport(workers=clamped, detail=concurrency_report)
+
+    # Per-cell invoke, bound to everything but the (shard_key, records) pair so
+    # the executor submits one payload per cell. Mirrors the kwargs the old
+    # inline ``executor.submit(_invoke_lambda_cell, ...)`` passed.
+    def _cell_work(payload):
+        shard_key, records = payload
+        return _invoke_lambda_cell(
+            state["lambda_client"], grid.block_index(int(shard_key)), int(shard_key),
+            parent_order, child_order,
+            _resolve_urls(records, "s3"), store_path, s3_creds,
+            function_name=function_name,
+            config_dict=config_dict,
+            output_creds_event=output_creds_event,
+            max_workers=state["workers"],
+        )
+
+    executor = LambdaExecutor(
+        _cell_work,
+        preflight_fn=_preflight,
+        pool_factory=ThreadPoolExecutor,
+        finalize_fn=lambda: _invoke_lambda_finalize(
+            state["lambda_client"], function_name, store_path,
+            output_creds_event=output_creds_event,
+        ),
     )
-    _log_concurrency_report(concurrency_report, max_workers)
+    # preflight() runs the probe, builds the sized client, and sizes the pool.
+    executor.preflight(len(cells))
+    max_workers = state["workers"]
 
     # Create template via Lambda. The template write happens inside the
     # function so the orchestrator only needs lambda:InvokeFunction; no
     # direct S3 access to the output bucket is required (works cleanly
     # for cross-account callers like CryoCloud).
     _invoke_lambda_setup(
-        lambda_client, function_name, store_path,
+        state["lambda_client"], function_name, store_path,
         parent_order=parent_order, child_order=child_order,
         n_parent_cells=len(all_shards) if grid_type == "healpix" and layout == "dense" else None,
         overwrite=overwrite, config_dict=config_dict,
@@ -462,80 +558,72 @@ def _run_lambda(config, catalog_data, store_path, child_order, *,
     )
 
     start_time = time.time()
-    total_obs = 0
-    cells_with_data = 0
-    cells_error = 0
-    total_lambda_time = 0.0
-    results = []
+    n = len(cells)
 
-    with ThreadPoolExecutor(max_workers=max_workers) as executor:
-        futures = {
-            executor.submit(
-                _invoke_lambda_cell,
-                lambda_client, grid.block_index(int(shard_key)), int(shard_key),
-                parent_order, child_order,
-                _resolve_urls(records, "s3"), store_path, s3_creds,
-                function_name=function_name,
-                config_dict=config_dict,
-                output_creds_event=output_creds_event,
-                max_workers=max_workers,
-            ): shard_key
-            for shard_key, records in cells
-        }
+    def _accumulate(report, i, result):
+        error = result.get("error")
+        if result.get("status_code") == 200 and not error:
+            obs = result.get("body", {}).get("total_obs", 0)
+            report.total_obs += obs
+            report.cells_with_data += 1
+        elif error not in ("No granules found", "No data after filtering"):
+            report.cells_error += 1
+            logger.warning(f"  [{i}/{n}] shard {result.get('shard_key')}: {error}")
+        report.results.append(result)
 
-        for i, future in enumerate(as_completed(futures), 1):
-            try:
-                result = future.result()
-            except Exception as e:
-                # _invoke_lambda_cell already re-raises FD exhaustion with
-                # ulimit guidance; this is a backstop for exhaustion that
-                # surfaces outside the cell body (e.g. at submit time). Other
-                # exceptions propagate unchanged.
-                raise_for_fd_exhaustion(e, max_workers)
-                raise
-            results.append(result)
-            total_lambda_time += result.get("lambda_duration", 0)
+        if i % 50 == 0:
+            elapsed = time.time() - start_time
+            rate = i / elapsed if elapsed > 0 else 0
+            logger.info(f"  [{i:4d}/{n}] {rate:.1f} cells/s")
 
-            error = result.get("error")
-            if result.get("status_code") == 200 and not error:
-                obs = result.get("body", {}).get("total_obs", 0)
-                total_obs += obs
-                cells_with_data += 1
-            elif error not in ("No granules found", "No data after filtering"):
-                cells_error += 1
-                logger.warning(f"  [{i}/{len(cells)}] shard {result.get('shard_key')}: {error}")
-
-            if i % 50 == 0:
-                elapsed = time.time() - start_time
-                rate = i / elapsed if elapsed > 0 else 0
-                logger.info(f"  [{i:4d}/{len(cells)}] {rate:.1f} cells/s")
+    try:
+        report = dispatch(
+            executor,
+            cells,
+            retry=LAMBDA_RETRY,
+            accumulate=_accumulate,
+            # _invoke_lambda_cell already re-raises FD exhaustion with ulimit
+            # guidance; this is a backstop for exhaustion that surfaces outside
+            # the cell body (e.g. at submit time). Other exceptions propagate.
+            on_submit_error=lambda e: raise_for_fd_exhaustion(e, max_workers),
+        )
+    finally:
+        executor.shutdown()
 
     # Consolidate metadata via Lambda (same rationale as setup -- avoids
     # requiring orchestrator-side S3 access).
-    _invoke_lambda_finalize(lambda_client, function_name, store_path,
-                            output_creds_event=output_creds_event)
+    executor.finalize()
     wall_time = time.time() - start_time
 
-    cost = estimate_cost(total_lambda_time, memory_gb=2.0, arch="arm64")
+    # Cost estimate: arm64 pricing = $0.0000133334/GB-second. Compute gb_seconds
+    # and cost *once* over the summed Lambda time (the report carries only the
+    # accumulated compute_time_s) so the arithmetic order -- and thus the last
+    # ULP of estimated_cost_usd -- stays byte-identical to the pre-refactor path
+    # (summing per-cell cost_usd would diverge in FP). Runner owns presentation;
+    # the per-cell CellCost.cost_usd is for the report's structured breakdown.
+    total_lambda_time = report.cost.compute_time_s
+    memory_gb = LAMBDA_MEMORY_GB
+    gb_seconds = total_lambda_time * memory_gb
+    price_per_gb_sec = LAMBDA_PRICE_PER_GB_SEC
+    estimated_cost = gb_seconds * price_per_gb_sec
 
     summary = {
         "total_cells": len(cells),
-        "cells_with_data": cells_with_data,
-        "cells_error": cells_error,
-        "total_obs": total_obs,
+        "cells_with_data": report.cells_with_data,
+        "cells_error": report.cells_error,
+        "total_obs": report.total_obs,
         "wall_time_s": wall_time,
         "lambda_time_s": total_lambda_time,
-        **cost,
+        "gb_seconds": gb_seconds,
+        "price_per_gb_sec": price_per_gb_sec,
+        "estimated_cost_usd": estimated_cost,
         "store_path": store_path,
         "backend": "lambda",
         "function_name": function_name,
-        "results": results,
+        "results": report.results,
     }
-    logger.info(f"Done: {cells_with_data} cells, {total_obs:,} obs, {cells_error} errors, {wall_time:.1f}s")
-    logger.info(
-        f"Lambda compute: {total_lambda_time:.0f}s total, "
-        f"{cost['gb_seconds']:.0f} GB-s, ~${cost['estimated_cost_usd']:.2f}"
-    )
+    logger.info(f"Done: {report.cells_with_data} cells, {report.total_obs:,} obs, {report.cells_error} errors, {wall_time:.1f}s")
+    logger.info(f"Lambda compute: {total_lambda_time:.0f}s total, {gb_seconds:.0f} GB-s, ~${estimated_cost:.2f}")
     return summary
 
 
@@ -675,18 +763,13 @@ def _invoke_lambda_cell(
     function_name, config_dict, output_creds_event=None, max_retries=3,
     max_workers=None,
 ):
-    """Build a per-cell Lambda event and dispatch it through
-    :func:`zagg.dispatch.invoke_with_retry`.
+    """Invoke Lambda for a single cell with retry logic.
 
-    The event payload is spatial-specific (chunk_idx, shard_key,
-    granule_urls, S3 read creds); the retry / timeout / FD-exhaustion logic
-    is generic and lives in ``dispatch``. ``max_workers`` is forwarded only
-    so the FD-exhaustion message can recommend a usable ulimit cap (#28).
+    ``max_workers`` is used only for the file-descriptor-exhaustion message
+    (#28); it does not affect dispatch.
     """
-    # ``wall_start`` is taken before event construction so the per-cell
-    # wall_time includes the spatial event-build cost — matching the
-    # pre-extraction _invoke_lambda_cell behavior byte-for-byte.
     wall_start = time.time()
+
     event = {
         "chunk_idx": chunk_idx,
         "shard_key": shard_key,
@@ -708,14 +791,68 @@ def _invoke_lambda_cell(
     if output_creds_event is not None:
         event["output_credentials"] = output_creds_event
 
-    result = invoke_with_retry(
-        lambda_client, function_name, event,
-        max_retries=max_retries, max_workers=max_workers,
-        wall_start=wall_start,
-    )
-    # Layer the spatial-specific fields on top of the generic dispatch result.
+    last_error = None
+    for attempt in range(max_retries):
+        try:
+            # Note: LogType="Tail" is omitted because it requires CloudWatch
+            # log access in the function's account, which is not granted to
+            # cross-account callers. The tail data was unused anyway.
+            response = lambda_client.invoke(
+                FunctionName=function_name,
+                InvocationType="RequestResponse",
+                Payload=json.dumps(event),
+            )
+
+            function_error = response.get("FunctionError")
+            is_timeout = False
+            if function_error:
+                error_payload = response["Payload"].read().decode("utf-8")
+                if "Task timed out" in error_payload:
+                    is_timeout = True
+                    last_error = f"Lambda timeout: {error_payload[:100]}"
+                else:
+                    last_error = f"Lambda error ({function_error}): {error_payload[:100]}"
+                if not is_timeout:
+                    continue
+
+            result = json.loads(response["Payload"].read()) if not function_error else {}
+            try:
+                body = json.loads(result.get("body", "{}"))
+            except (json.JSONDecodeError, TypeError):
+                body = {}
+
+            return {
+                "shard_key": shard_key,
+                "status_code": result.get("statusCode"),
+                "body": body,
+                "wall_time": time.time() - wall_start,
+                "lambda_duration": body.get("duration_s", 0),
+                "error": last_error if function_error else body.get("error"),
+                "retries": attempt,
+                "timeout": is_timeout,
+                "granule_count": len(granule_urls),
+            }
+        except Exception as e:
+            # Client-side FD exhaustion is run-fatal (every subsequent cell
+            # will hit it too) and was previously swallowed into a
+            # status_code=None result -- a silent dropped cell. Surface it
+            # loudly with ulimit guidance instead (#28).
+            raise_for_fd_exhaustion(e, max_workers)
+            last_error = str(e)
+            retryable = ["TooManyRequestsException", "Rate exceeded",
+                         "Read timeout", "timed out", "UNEXPECTED_EOF"]
+            if any(x in last_error for x in retryable):
+                time.sleep((2 ** attempt) + (time.time() % 1))
+            else:
+                break
+
     return {
         "shard_key": shard_key,
-        **result,
+        "status_code": None,
+        "body": {},
+        "wall_time": time.time() - wall_start,
+        "lambda_duration": 0,
+        "error": last_error,
+        "retries": max_retries,
         "granule_count": len(granule_urls),
     }

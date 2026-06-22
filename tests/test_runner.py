@@ -283,59 +283,6 @@ class TestInvokeLambdaCellEvent:
         assert "parent_morton" not in event
 
 
-class TestInvokeLambdaCellResultShape:
-    """The Phase 3 refactor (#12) splits invoke-with-retry into ``dispatch``
-    and event-build into ``runner._invoke_lambda_cell``. The layered result
-    dict must keep the same fields the pre-extraction return carried, so
-    every consumer of ``summary['results']`` (the spatial counter loop in
-    ``_run_lambda`` plus any caller of ``_invoke_lambda_cell`` directly)
-    stays byte-identical."""
-
-    _CREDS = {"accessKeyId": "a", "secretAccessKey": "s", "sessionToken": "t"}
-
-    def _call(self, *, status: int | None = 200, body: dict | None = None):
-        from unittest.mock import MagicMock
-
-        from zagg.runner import _invoke_lambda_cell
-
-        client = MagicMock()
-        payload = MagicMock()
-        payload.read.return_value = json.dumps(
-            {"statusCode": status, "body": json.dumps(body or {"total_obs": 9, "duration_s": 0.5})}
-        ).encode()
-        client.invoke.return_value = {"Payload": payload, "FunctionError": None}
-        return _invoke_lambda_cell(
-            client, (0,), 99, 6, 12,
-            ["s3://b/g1.h5", "s3://b/g2.h5"],
-            "s3://out/x.zarr", self._CREDS,
-            function_name="process-shard", config_dict=None, max_workers=4,
-        )
-
-    def test_success_result_keys_pinned(self):
-        result = self._call()
-        # Pre-extraction shape: shard_key + 7 generic fields + granule_count.
-        assert set(result) == {
-            "shard_key", "status_code", "body", "wall_time", "lambda_duration",
-            "error", "retries", "timeout", "granule_count",
-        }
-        assert result["shard_key"] == 99
-        assert result["granule_count"] == 2
-        assert result["status_code"] == 200
-        assert result["body"] == {"total_obs": 9, "duration_s": 0.5}
-        assert result["lambda_duration"] == 0.5
-        assert result["error"] is None
-        assert result["retries"] == 0
-        assert result["timeout"] is False
-
-    def test_wall_time_includes_event_build_cost(self):
-        # ``wall_start`` is taken in ``_invoke_lambda_cell`` before event
-        # construction, so wall_time covers both build + dispatch (the
-        # pre-extraction behavior). A microsecond floor is enough — the
-        # point is that wall_time is non-zero, not that it's calibrated.
-        result = self._call()
-        assert result["wall_time"] >= 0
-
-
 class TestHandoffPassthrough:
     """`agg(handoff=...)` threads the carrier choice down to process_shard."""
 
@@ -372,3 +319,169 @@ class TestHandoffPassthrough:
             config=atl06_config, driver="s3",
         )
         assert captured["handoff"] == "pandas"
+
+
+def _stub_grid():
+    from unittest.mock import MagicMock
+
+    grid = MagicMock()
+    grid.signature.return_value = {}
+    grid.block_index.side_effect = lambda k: (k,)
+    grid.emit_template.side_effect = lambda store, overwrite=False: store
+    return grid
+
+
+def _run_catalog():
+    return {
+        "metadata": {}, "grid_signature": {},
+        "shard_keys": [10, 11, 12, 13],
+        "granules": [[{"s3": f"s3://b/g{i}.h5"}] for i in range(4)],
+    }
+
+
+class TestSummaryKeysByteIdentical:
+    """The dispatch refactor (#63) must leave the run-summary dict keys -- and
+    the data/error counting -- byte-identical for both backends.
+
+    These pin the *structure* (key set) and the counters the dispatch loop now
+    rolls up, against mocked per-cell work. Per-cell Lambda event payload bytes
+    are pinned separately in ``TestInvokeLambdaCellEvent``.
+    """
+
+    _LOCAL_KEYS = {
+        "total_cells", "cells_with_data", "cells_error", "total_obs",
+        "wall_time_s", "store_path", "backend", "results",
+    }
+    _LAMBDA_KEYS = {
+        "total_cells", "cells_with_data", "cells_error", "total_obs",
+        "wall_time_s", "lambda_time_s", "gb_seconds", "price_per_gb_sec",
+        "estimated_cost_usd", "store_path", "backend", "function_name",
+        "results",
+    }
+
+    def test_local_summary_keys_and_counts(self, monkeypatch, atl06_config):
+        import zagg.grids as grids_mod
+        from zagg import runner
+
+        monkeypatch.setattr(runner, "get_nsidc_s3_credentials",
+                            lambda: {"accessKeyId": "a", "secretAccessKey": "s",
+                                     "sessionToken": "t"})
+        monkeypatch.setattr(grids_mod, "from_config", lambda *a, **k: _stub_grid())
+        monkeypatch.setattr(runner, "open_store", lambda *a, **k: object())
+        monkeypatch.setattr(runner, "consolidate_metadata", lambda *a, **k: None)
+
+        # 10,13 -> data; 11 -> raised (error, dropped from results); 12 ->
+        # benign no-data meta (in results, not counted).
+        def fake_paw(shard_key, chunk_idx, records, grid, s3_creds, zarr_store,
+                     config, driver=None, handoff="pandas"):
+            if shard_key == 11:
+                raise RuntimeError("boom")
+            if shard_key == 12:
+                return {"shard_key": shard_key, "error": "No data after filtering"}
+            return {"shard_key": shard_key, "total_obs": 7, "error": None}
+
+        monkeypatch.setattr(runner, "_process_and_write", fake_paw)
+
+        summary = runner._run_local(
+            atl06_config, _run_catalog(), "./out.zarr", 12,
+            max_cells=None, morton_cell=None, max_workers=2, overwrite=False,
+            dry_run=False, region="us-west-2",
+        )
+        assert set(summary.keys()) == self._LOCAL_KEYS
+        assert summary["backend"] == "local"
+        assert summary["total_cells"] == 4
+        assert summary["cells_with_data"] == 2
+        assert summary["cells_error"] == 1
+        assert summary["total_obs"] == 14
+        assert len(summary["results"]) == 3  # raised cell excluded
+
+    def test_lambda_summary_keys_and_cost(self, monkeypatch, atl06_config):
+        import boto3
+
+        import zagg.grids as grids_mod
+        from zagg import runner
+        from zagg.concurrency import ConcurrencyReport
+
+        monkeypatch.setattr(runner, "get_nsidc_s3_credentials",
+                            lambda: {"accessKeyId": "a", "secretAccessKey": "s",
+                                     "sessionToken": "t"})
+        monkeypatch.setattr(grids_mod, "from_config", lambda *a, **k: _stub_grid())
+        monkeypatch.setattr(runner, "_invoke_lambda_setup", lambda *a, **k: None)
+        monkeypatch.setattr(runner, "_invoke_lambda_finalize", lambda *a, **k: None)
+        from unittest.mock import MagicMock
+        monkeypatch.setattr(boto3, "Session", lambda *a, **k: MagicMock())
+        monkeypatch.setattr(
+            runner, "compute_available_workers",
+            lambda requested, *a, **k: (
+                4,
+                ConcurrencyReport(account_limit=1000, current_concurrent=0,
+                                  padding=100, available=900, function_reserved=None),
+            ),
+        )
+        monkeypatch.setattr(
+            runner, "_invoke_lambda_cell",
+            lambda *a, **k: {"status_code": 200, "body": {"total_obs": 3},
+                             "error": None, "lambda_duration": 2.0, "shard_key": 0},
+        )
+
+        summary = runner._run_lambda(
+            atl06_config, _run_catalog(), "s3://out/x.zarr", 12,
+            max_cells=None, morton_cell=None, max_workers=1700, overwrite=False,
+            dry_run=False, region="us-west-2", function_name="process-shard",
+        )
+        assert set(summary.keys()) == self._LAMBDA_KEYS
+        assert summary["backend"] == "lambda"
+        assert summary["cells_with_data"] == 4
+        assert summary["total_obs"] == 12
+        # 4 cells x 2 s x 2 GB = 16 GB-s; cost = 16 * arm64 price.
+        assert summary["lambda_time_s"] == 8.0
+        assert summary["gb_seconds"] == 16.0
+        assert summary["price_per_gb_sec"] == 0.0000133334
+        assert summary["estimated_cost_usd"] == 16.0 * 0.0000133334
+
+    def test_lambda_cost_byte_identical_with_mixed_durations(self, monkeypatch, atl06_config):
+        """estimated_cost_usd must equal the pre-refactor arithmetic order:
+        ``(sum(durations) * 2.0) * price`` computed once -- not a sum of
+        per-cell ``cost_usd`` (which would diverge in the last FP ULP). Uses
+        heterogeneous per-cell durations so the two orders actually differ.
+        """
+        import boto3
+
+        import zagg.grids as grids_mod
+        from zagg import runner
+        from zagg.concurrency import ConcurrencyReport
+
+        durations = iter([0.1, 0.2, 0.3, 12.7])
+
+        monkeypatch.setattr(runner, "get_nsidc_s3_credentials",
+                            lambda: {"accessKeyId": "a", "secretAccessKey": "s",
+                                     "sessionToken": "t"})
+        monkeypatch.setattr(grids_mod, "from_config", lambda *a, **k: _stub_grid())
+        monkeypatch.setattr(runner, "_invoke_lambda_setup", lambda *a, **k: None)
+        monkeypatch.setattr(runner, "_invoke_lambda_finalize", lambda *a, **k: None)
+        from unittest.mock import MagicMock
+        monkeypatch.setattr(boto3, "Session", lambda *a, **k: MagicMock())
+        monkeypatch.setattr(
+            runner, "compute_available_workers",
+            lambda requested, *a, **k: (
+                1,  # 1 worker -> deterministic completion order for the iter()
+                ConcurrencyReport(account_limit=1000, current_concurrent=0,
+                                  padding=100, available=900, function_reserved=None),
+            ),
+        )
+        monkeypatch.setattr(
+            runner, "_invoke_lambda_cell",
+            lambda *a, **k: {"status_code": 200, "body": {"total_obs": 1},
+                             "error": None, "lambda_duration": next(durations),
+                             "shard_key": 0},
+        )
+
+        summary = runner._run_lambda(
+            atl06_config, _run_catalog(), "s3://out/x.zarr", 12,
+            max_cells=None, morton_cell=None, max_workers=1700, overwrite=False,
+            dry_run=False, region="us-west-2", function_name="process-shard",
+        )
+        total = 0.1 + 0.2 + 0.3 + 12.7
+        # The exact pre-refactor order: one multiply over the summed time.
+        assert summary["gb_seconds"] == total * 2.0
+        assert summary["estimated_cost_usd"] == (total * 2.0) * 0.0000133334

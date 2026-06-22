@@ -116,9 +116,7 @@ def get_pipeline_type(config: PipelineConfig) -> str:
         raise ValueError("pipeline must be a mapping with a 'type' key")
     t = config.pipeline.get("type", "spatial")
     if t not in _PIPELINE_TYPES:
-        raise ValueError(
-            f"pipeline.type must be one of {sorted(_PIPELINE_TYPES)} (got {t!r})"
-        )
+        raise ValueError(f"pipeline.type must be one of {sorted(_PIPELINE_TYPES)} (got {t!r})")
     return t
 
 
