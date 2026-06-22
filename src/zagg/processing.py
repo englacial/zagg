@@ -391,13 +391,12 @@ def write_dataframe_to_zarr(
     chunk_idx = tuple(int(i) for i in chunk_idx)
     for name, values in _iter_carrier_columns(df_out):
         if name in chunk_res_fields:
-            # resolution: chunk — the column is chunk-uniform (every cell carries
-            # the same chunk value), so collapse to the single value and write it to
-            # the companion array's one-block-per-chunk grid at ``chunk_idx`` (which
-            # IS ``grid.block_index(shard_key)``). One value per chunk, no per-cell
-            # duplication on disk (issue #30 item 2).
-            flat = values.reshape(-1)
-            chunk_value = flat[0]
+            # resolution: chunk — the column must be chunk-uniform (every populated
+            # cell carries the same chunk value), so collapse to the single value and
+            # write it to the companion array's one-block-per-chunk grid at
+            # ``chunk_idx`` (which IS ``grid.block_index(shard_key)``). One value per
+            # chunk, no per-cell duplication on disk (issue #30 item 2).
+            chunk_value = _chunk_uniform_value(name, values)
             block = np.asarray(chunk_value).reshape((1,) * len(chunk_idx))
             with config.set({"async.concurrency": 128}):
                 array = open_array(
@@ -456,6 +455,43 @@ def _chunk_resolution_fields(config: PipelineConfig | None) -> set[str]:
         for name, meta in get_agg_fields(config).items()
         if get_output_signature(meta)["resolution"] == "chunk"
     }
+
+
+def _chunk_uniform_value(name: str, values: np.ndarray):
+    """Collapse a ``resolution: chunk`` field's per-cell column to its single value.
+
+    A chunk-resolution field stores ONE value per chunk (issue #30 item 2), so its
+    per-cell column must be chunk-uniform: every *populated* cell carries the same
+    chunk value. Empty cells (which carry the field's fill sentinel — ``NaN`` for a
+    float field, or the bare-chunk-anchor when the expression is a bare precompute
+    name) are ignored when selecting the representative value, so an empty cell 0 no
+    longer poisons the companion write with ``NaN``.
+
+    Raises a clear error if the populated cells are NOT uniform — that means the
+    field's ``expression`` genuinely varies per cell and ``resolution: chunk`` is a
+    misconfiguration (the per-cell values would be silently dropped otherwise).
+    """
+    flat = np.asarray(values).reshape(-1)
+    # Treat NaN as the empty/fill sentinel for float columns; integer columns have
+    # no NaN, so every cell is "populated" and the uniformity check covers them all.
+    if np.issubdtype(flat.dtype, np.floating):
+        populated = flat[~np.isnan(flat)]
+    else:
+        populated = flat
+    if populated.size == 0:
+        # Whole chunk is fill (e.g. a vector-carrier shard with no chunk anchor):
+        # nothing meaningful to record; fall back to the first cell's sentinel.
+        return flat[0]
+    first = populated[0]
+    if not np.all(populated == first):
+        uniq = np.unique(populated)
+        raise ValueError(
+            f"resolution: chunk field {name!r} is not chunk-uniform: the populated "
+            f"cells carry {uniq.size} distinct values ({uniq[:4]}...); a chunk-"
+            f"resolution field must reduce to one value per chunk (use resolution: "
+            f"cell for a per-cell field)"
+        )
+    return first
 
 
 def _iter_carrier_columns(carrier):

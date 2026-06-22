@@ -1380,6 +1380,116 @@ class TestChunkResolutionCompanion:
         assert np.count_nonzero(~np.isnan(rgroup["offset_h"][:])) == 1
         assert np.count_nonzero(~np.isnan(rgroup["gain_h"][:])) == 1
 
+    def test_dense_healpix_companion_at_populated_shard_position(self):
+        """Dense HEALPix layout: the companion is shaped (n_shards,) and a shard's
+        value lands at its position in populated_shards (block_index), not at the
+        parent nested id (issue #30 item 2; fold of review finding)."""
+        from mortie import geo2mort
+
+        cfg = self._chunk_cfg("atl06")
+        shards = [
+            int(geo2mort(la, lo, order=6)[0])
+            for la, lo in [(-78.5, -132.0), (-72.1, 25.4), (-65.0, -45.0)]
+        ]
+        grid = HealpixGrid(6, 8, layout="dense", config=cfg, populated_shards=shards)
+        store = MemoryStore()
+        grid.emit_template(store)
+        group = open_group(store=store, mode="r", path="8")
+        assert grid.chunk_grid_shape == (len(shards),)
+        assert group["anchor_h"].shape == (len(shards),)
+
+        parent = shards[1]
+        n = len(grid.children(parent))
+        stats = {
+            "count": np.zeros(n, dtype="float32"),
+            "anchor_h": np.full(n, 99.0, dtype="float32"),
+        }
+        carrier = _build_output(
+            stats, get_data_vars(cfg), get_agg_fields(cfg), grid, parent, use_arrow=False
+        )
+        chunk_idx = grid.block_index(parent)
+        assert chunk_idx == (1,)  # position in populated_shards, not nested id
+        write_dataframe_to_zarr(carrier, store, grid=grid, chunk_idx=chunk_idx)
+        companion = open_group(store=store, mode="r", path="8")["anchor_h"][:]
+        assert companion[1] == np.float32(99.0)
+        assert np.count_nonzero(~np.isnan(companion)) == 1
+
+    def test_empty_cell0_compound_expr_writes_chunk_value_not_nan(self):
+        """Fold of review [MED]: with a COMPOUND resolution: chunk expression (not a
+        bare precompute name), an empty cell 0 used to poison the companion with NaN
+        because the writer took flat[0]. The writer now selects a populated cell's
+        value, so the companion records the real chunk value."""
+        from mortie import geo2mort
+
+        from zagg.config import PipelineConfig
+
+        base = default_config("atl06")
+        agg = {
+            "coordinates": base.aggregation.get("coordinates", {}),
+            "chunk_precompute": {
+                "chunk_anchor": {"expression": "np.float32(np.median(h_li))", "source": "h_li"}
+            },
+            "variables": {
+                "count": {"function": "len", "source": "h_li"},
+                # compound expression (NOT a bare identifier) -> empty cells get NaN,
+                # not the anchor, so the writer must skip them.
+                "anchor_h": {
+                    "expression": "chunk_anchor + np.float32(1.0)",
+                    "source": "h_li",
+                    "resolution": "chunk",
+                },
+            },
+        }
+        cfg = PipelineConfig(data_source=base.data_source, aggregation=agg, output=base.output)
+        parent_order, child_order = 2, 4
+        grid = HealpixGrid(parent_order, child_order, layout="fullsphere", config=cfg)
+        store = MemoryStore()
+        grid.emit_template(store)
+
+        parent = int(geo2mort(-78.5, -132.0, order=parent_order)[0])
+        n = len(grid.children(parent))
+        # cell 0 empty (NaN), only cell 3 populated with the chunk value 50.0.
+        stats = {
+            "count": np.zeros(n, dtype="float32"),
+            "anchor_h": np.full(n, np.nan, dtype="float32"),
+        }
+        stats["count"][3] = 5
+        stats["anchor_h"][3] = 50.0
+        carrier = _build_output(
+            stats, get_data_vars(cfg), get_agg_fields(cfg), grid, parent, use_arrow=False
+        )
+        chunk_idx = grid.block_index(parent)
+        write_dataframe_to_zarr(carrier, store, grid=grid, chunk_idx=chunk_idx)
+        companion = open_group(store=store, mode="r", path=str(child_order))["anchor_h"][:]
+        assert companion[chunk_idx[0]] == np.float32(50.0)  # the populated value, not NaN
+        assert not np.isnan(companion[chunk_idx[0]])
+
+    def test_non_uniform_chunk_resolution_column_raises(self):
+        """Fold of review [MED]: a resolution: chunk field whose per-cell values are
+        NOT uniform (a misconfiguration) is rejected with a clear error instead of
+        silently dropping every cell but the first."""
+        from mortie import geo2mort
+
+        cfg = self._chunk_cfg("atl06")
+        grid = HealpixGrid(2, 4, layout="fullsphere", config=cfg)
+        store = MemoryStore()
+        grid.emit_template(store)
+        parent = int(geo2mort(-78.5, -132.0, order=2)[0])
+        n = len(grid.children(parent))
+        # Two populated cells with DIFFERENT values -> not chunk-uniform.
+        stats = {
+            "count": np.zeros(n, dtype="float32"),
+            "anchor_h": np.full(n, np.nan, dtype="float32"),
+        }
+        stats["anchor_h"][0] = 1.0
+        stats["anchor_h"][1] = 2.0
+        carrier = _build_output(
+            stats, get_data_vars(cfg), get_agg_fields(cfg), grid, parent, use_arrow=False
+        )
+        chunk_idx = grid.block_index(parent)
+        with pytest.raises(ValueError, match="not chunk-uniform"):
+            write_dataframe_to_zarr(carrier, store, grid=grid, chunk_idx=chunk_idx)
+
 
 # ---------------------------------------------------------------------------
 # Structured filters in the read path (issue #43, Phase A)
