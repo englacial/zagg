@@ -156,6 +156,51 @@ def _split_antimeridian(geom):
     return {"type": "MultiPolygon", "coordinates": parts}
 
 
+def _seam_safe_polygon(geom):
+    """Cut a seam-crossing Polygon into hemisphere-local parts (shapely).
+
+    Returns a shapely Polygon/MultiPolygon already in ``[-180, 180]`` -- the
+    same unwrap (+360) / clip / rewrap as :func:`_split_antimeridian`, but
+    returning geometry instead of a GeoJSON dict so callers can keep clipping or
+    measuring it. A polygon that doesn't cross the seam is returned unchanged.
+
+    This must run **before** any ``box`` clip on a HEALPix child cell: a cell
+    straddling +-180 comes back from ``mort2polygon`` as a flat ring spanning
+    ~360 deg (e.g. ``-179.98 ... 180``), so intersecting that band with a
+    viewport box is meaningless -- the cell would vanish or mis-clip (PR #44).
+    """
+    from shapely.geometry import MultiPolygon, Polygon, box
+
+    if not _crosses_antimeridian(geom):
+        return geom
+
+    def _unwrap(ring):
+        return [[lon + 360.0 if lon < 0 else lon, lat] for lon, lat in _ring_list(ring)]
+
+    poly = Polygon(_unwrap(geom.exterior), [_unwrap(r) for r in geom.interiors])
+    if not poly.is_valid:
+        poly = poly.buffer(0)
+
+    parts: list = []
+    for clip, shift in (
+        (box(-180.0, -90.0, 180.0, 90.0), 0.0),
+        (box(180.0, -90.0, 540.0, 90.0), -360.0),
+    ):
+        piece = poly.intersection(clip)
+        for sub in getattr(piece, "geoms", [piece]):
+            if sub.is_empty or sub.geom_type != "Polygon":
+                continue
+            rings = [
+                [[lon + shift, lat] for lon, lat in _ring_list(r)]
+                for r in (sub.exterior, *sub.interiors)
+            ]
+            parts.append(Polygon(rings[0], rings[1:]))
+
+    if not parts:
+        return geom
+    return parts[0] if len(parts) == 1 else MultiPolygon(parts)
+
+
 def _polygon_rings(geom, *, shift: float = 0.0) -> list[list[list[float]]]:
     """GeoJSON ring list ``[exterior, *interiors]`` for a Polygon, lon-shifted."""
     rings = [geom.exterior, *geom.interiors]
@@ -383,7 +428,7 @@ def _child_cell_polygon(cell):
     return Polygon(zip(lons, lats))
 
 
-def _healpix_child_cells(grid, visible_keys, view, bbox, max_cells):
+def _healpix_child_cells(grid, visible_keys, bbox, max_cells):
     """Child cells at ``child_order`` nesting inside the visible HEALPix shards.
 
     The grid-on-zoom for HEALPix is the **finer child grid that subdivides each
@@ -486,13 +531,19 @@ def viewport_cells(
 
     if isinstance(grid, HealpixGrid):
         visible_keys = {int(key) for key, _ in visible}
-        result = _healpix_child_cells(grid, visible_keys, view, bbox, max_cells)
+        result = _healpix_child_cells(grid, visible_keys, bbox, max_cells)
         if result is None:
             return _collection([])
         cells, parents = result
         features = []
         for cell, parent in zip(cells, parents):
-            clipped = _polygonal(_child_cell_polygon(cell).intersection(view))
+            poly = _child_cell_polygon(cell)
+            # Cut a seam-crossing cell at +-180 *before* clipping: its flat ring
+            # spans ~360 deg, so a box clip on the unsplit band drops/mis-clips
+            # it (PR #44). Skipped under a polar CRS (no seam there).
+            if split_seam:
+                poly = _seam_safe_polygon(poly)
+            clipped = _polygonal(poly.intersection(view))
             if clipped is None:
                 continue
             features.append(
