@@ -16,7 +16,7 @@ from zagg.config import (
     get_output_signature,
     output_field_signature,
 )
-from zagg.grids.base import InconsistentShardError, vector_array_spec
+from zagg.grids.base import InconsistentShardError, chunk_array_spec, vector_array_spec
 from zagg.grids.morton import to_morton_array
 
 HEALPIX_BASE_CELLS: int = 12
@@ -103,6 +103,18 @@ class HealpixGrid:
     @property
     def chunk_shape(self) -> tuple[int, ...]:
         return (self.n_children,)
+
+    @property
+    def chunk_grid_shape(self) -> tuple[int, ...]:
+        """Number of chunks (``array_shape // chunk_shape``) for companion arrays.
+
+        A ``resolution: chunk`` field (issue #30 item 2) stores one value per
+        chunk here, indexed by :meth:`block_index` (the parent nested cell id for
+        fullsphere, the populated-shard position for dense). Equals
+        ``12·4^parent_order`` for fullsphere and ``n_shards`` for dense — the
+        block-index range, so every ``block_index`` lands in bounds.
+        """
+        return (self.array_shape[0] // self.n_children,)
 
     @property
     def group_path(self) -> str:
@@ -275,11 +287,22 @@ class HealpixGrid:
             dtype = meta.get("dtype", "float32")
             fill = meta.get("fill_value", "NaN")
             spec = base.with_data_type(dtype).with_fill_value(fill)
+            sig = get_output_signature(meta)
+            if sig["resolution"] == "chunk":
+                # A resolution: chunk field (issue #30 item 2) is stored once per
+                # chunk in a companion array shaped at the chunk grid, indexed by
+                # block_index (the parent nested cell id).
+                members[name] = chunk_array_spec(
+                    spec,
+                    chunk_grid_shape=self.chunk_grid_shape,
+                    chunk_dims=("chunks",),
+                )
+                continue
             # A vector field (issue #29) gets a trailing payload dim chunked
             # whole; scalars are returned unchanged.
             members[name] = vector_array_spec(
                 spec,
-                get_output_signature(meta),
+                sig,
                 base_dims=("cells",),
                 base_chunk_shape=(self.n_children,),
             )

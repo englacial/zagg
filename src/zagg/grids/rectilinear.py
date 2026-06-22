@@ -30,6 +30,7 @@ Internal representations
 Out-of-bounds points get leaf id ``-1`` (signed). The corresponding shard
 filter rejects them, so they fall out of the pipeline silently.
 """
+
 from __future__ import annotations
 
 import math
@@ -48,7 +49,7 @@ from zagg.config import (
     get_output_signature,
     output_field_signature,
 )
-from zagg.grids.base import vector_array_spec
+from zagg.grids.base import chunk_array_spec, vector_array_spec
 
 OOB_SENTINEL: int = -1
 
@@ -123,9 +124,7 @@ class RectilinearGrid:
 
         # GeoBox: north-up affine with origin at (xmin, ymax); y resolution
         # negative. GeoboxTiles tiles it into one tile per chunk.
-        affine = Affine.translation(self.xmin, self.ymax) * Affine.scale(
-            self.res_x, -self.res_y
-        )
+        affine = Affine.translation(self.xmin, self.ymax) * Affine.scale(self.res_x, -self.res_y)
         self._geobox = GeoBox((self.height, self.width), affine, self.crs)
         self._tiles = GeoboxTiles(self._geobox, (self.chunk_h, self.chunk_w))
         self._transformer = None  # lazy WGS84 -> grid CRS, for assign
@@ -139,6 +138,16 @@ class RectilinearGrid:
     @property
     def chunk_shape(self) -> tuple[int, int]:
         return (self.chunk_h, self.chunk_w)
+
+    @property
+    def chunk_grid_shape(self) -> tuple[int, int]:
+        """Number of chunks per axis (``array_shape // chunk_shape``).
+
+        A ``resolution: chunk`` field (issue #30 item 2) stores one value per
+        chunk in a companion array of this shape, indexed by :meth:`block_index`
+        (the ``(rb, cb)`` chunk index). Equals ``(n_row_blocks, n_col_blocks)``.
+        """
+        return (self.n_row_blocks, self.n_col_blocks)
 
     @property
     def group_path(self) -> str:
@@ -177,14 +186,12 @@ class RectilinearGrid:
             # Co-aggregated grids must declare the same Option-B output-field
             # set (issue #29): same scalar/vector kinds, trailing shapes, dtypes.
             return False
-        if not (_whole_ratio(self.res_x, other.res_x)
-                and _whole_ratio(self.res_y, other.res_y)):
+        if not (_whole_ratio(self.res_x, other.res_x) and _whole_ratio(self.res_y, other.res_y)):
             return False
         fine_x = min(self.res_x, other.res_x)
         fine_y = min(self.res_y, other.res_y)
-        return (
-            _is_multiple(self.xmin - other.xmin, fine_x)
-            and _is_multiple(self.ymax - other.ymax, fine_y)
+        return _is_multiple(self.xmin - other.xmin, fine_x) and _is_multiple(
+            self.ymax - other.ymax, fine_y
         )
 
     # ── coverage / coords ────────────────────────────────────────────────
@@ -199,8 +206,7 @@ class RectilinearGrid:
 
         rings = []
         for lats, lons in polygon_parts:
-            rings.append([(float(x), float(y))
-                          for x, y in zip(np.asarray(lons), np.asarray(lats))])
+            rings.append([(float(x), float(y)) for x, y in zip(np.asarray(lons), np.asarray(lats))])
         if len(rings) == 1:
             geom = polygon(rings[0], crs="EPSG:4326")
         else:
@@ -223,9 +229,7 @@ class RectilinearGrid:
         xs, ys = tx.transform(lons, lats)
         cols = ((xs - self.xmin) // self.res_x).astype(np.int64)
         rows = ((self.ymax - ys) // self.res_y).astype(np.int64)
-        in_bounds = (
-            (rows >= 0) & (rows < self.height) & (cols >= 0) & (cols < self.width)
-        )
+        in_bounds = (rows >= 0) & (rows < self.height) & (cols >= 0) & (cols < self.width)
         ids = rows * self.width + cols
         return np.where(in_bounds, ids, OOB_SENTINEL).astype(np.int64)
 
@@ -280,11 +284,7 @@ class RectilinearGrid:
         """
         rb, cb = self._unpack(int(shard_key))
         densify = max(self.chunk_w * self.res_x, self.chunk_h * self.res_y) / 32
-        return (
-            self._tiles[(rb, cb)]
-            .extent.to_crs("EPSG:4326", resolution=densify)
-            .geom
-        )
+        return self._tiles[(rb, cb)].extent.to_crs("EPSG:4326", resolution=densify).geom
 
     # ── leaf enumeration ─────────────────────────────────────────────────
 
@@ -333,9 +333,7 @@ class RectilinearGrid:
                 name="regular",
                 configuration={"chunk_shape": list(self.chunk_shape)},
             ),
-            chunk_key_encoding=NamedConfig(
-                name="default", configuration={"separator": "/"}
-            ),
+            chunk_key_encoding=NamedConfig(name="default", configuration={"separator": "/"}),
             codecs=(NamedConfig(name="bytes", configuration={"endian": "little"}),),
             storage_transformers=(),
             fill_value="NaN",
@@ -353,10 +351,10 @@ class RectilinearGrid:
             storage_transformers=(),
             fill_value=0.0,
         )
-        coord_y = coord_x.with_shape((self.height,)).with_dimension_names(
-            ("y",)
-        ).with_attributes(
-            {"standard_name": "projection_y_coordinate", "units": "m"}
+        coord_y = (
+            coord_x.with_shape((self.height,))
+            .with_dimension_names(("y",))
+            .with_attributes({"standard_name": "projection_y_coordinate", "units": "m"})
         )
 
         members = {"x": coord_x, "y": coord_y}
@@ -371,11 +369,22 @@ class RectilinearGrid:
             dtype = meta.get("dtype", "float32")
             fill = meta.get("fill_value", "NaN")
             spec = base.with_data_type(dtype).with_fill_value(fill)
+            sig = get_output_signature(meta)
+            if sig["resolution"] == "chunk":
+                # A resolution: chunk field (issue #30 item 2) is stored once per
+                # chunk in a companion array shaped at the chunk grid (row-major
+                # chunk index), indexed by block_index = (rb, cb).
+                members[name] = chunk_array_spec(
+                    spec,
+                    chunk_grid_shape=self.chunk_grid_shape,
+                    chunk_dims=("chunk_y", "chunk_x"),
+                )
+                continue
             # A vector field (issue #29) gets a trailing payload dim chunked
             # whole; scalars are returned unchanged.
             members[name] = vector_array_spec(
                 spec,
-                get_output_signature(meta),
+                sig,
                 base_dims=("y", "x"),
                 base_chunk_shape=self.chunk_shape,
             )
@@ -402,9 +411,7 @@ class RectilinearGrid:
         if self._transformer is None:
             from pyproj import Transformer
 
-            self._transformer = Transformer.from_crs(
-                "EPSG:4326", self.crs, always_xy=True
-            )
+            self._transformer = Transformer.from_crs("EPSG:4326", self.crs, always_xy=True)
         return self._transformer
 
 

@@ -1163,11 +1163,18 @@ class TestGetOutputSignature:
             "trailing_shape": (),
             "inner_shape": (),
             "dtype": "float32",
+            "resolution": "cell",
         }
 
     def test_scalar_default_dtype_none(self):
         sig = get_output_signature({"function": "min"})
-        assert sig == {"kind": "scalar", "trailing_shape": (), "inner_shape": (), "dtype": None}
+        assert sig == {
+            "kind": "scalar",
+            "trailing_shape": (),
+            "inner_shape": (),
+            "dtype": None,
+            "resolution": "cell",
+        }
 
     def test_vector_int_signature(self):
         sig = get_output_signature({"kind": "vector", "trailing_shape": 64, "dtype": "float32"})
@@ -1176,6 +1183,7 @@ class TestGetOutputSignature:
             "trailing_shape": (64,),
             "inner_shape": (),
             "dtype": "float32",
+            "resolution": "cell",
         }
 
     def test_vector_list_signature(self):
@@ -1183,6 +1191,67 @@ class TestGetOutputSignature:
         assert sig["kind"] == "vector"
         assert sig["trailing_shape"] == (16, 2)
         assert sig["inner_shape"] == ()
+
+
+# ---------------------------------------------------------------------------
+# resolution attribute (issue #30 item 2)
+# ---------------------------------------------------------------------------
+
+
+def _cfg_with_field(meta):
+    """Minimal valid config carrying a single agg field ``f`` with ``meta``."""
+    return PipelineConfig(
+        data_source={"variables": {"h_ph": "/{group}/h_ph"}},
+        aggregation={"variables": {"f": {"source": "h_ph", **meta}}},
+        output={"grid": {"type": "healpix", "parent_order": 6, "child_order": 12}},
+    )
+
+
+class TestResolutionAttribute:
+    def test_resolution_defaults_to_cell(self):
+        sig = get_output_signature({"function": "min"})
+        assert sig["resolution"] == "cell"
+
+    def test_resolution_cell_explicit_validates(self):
+        cfg = _cfg_with_field({"function": "min", "resolution": "cell"})
+        validate_config(cfg)  # should not raise
+        assert get_output_signature(get_agg_fields(cfg)["f"])["resolution"] == "cell"
+
+    def test_scalar_field_may_be_resolution_chunk(self):
+        cfg = _cfg_with_field({"expression": "chunk_anchor", "resolution": "chunk"})
+        # add the referenced chunk_precompute so the per-cell expression validates.
+        cfg.aggregation["chunk_precompute"] = {
+            "chunk_anchor": {"expression": "np.median(h_ph)", "source": "h_ph"}
+        }
+        validate_config(cfg)
+        assert get_output_signature(get_agg_fields(cfg)["f"])["resolution"] == "chunk"
+
+    def test_bad_resolution_rejected(self):
+        cfg = _cfg_with_field({"function": "min", "resolution": "block"})
+        with pytest.raises(ValueError, match="resolution 'block' is not supported"):
+            validate_config(cfg)
+
+    def test_resolution_chunk_vector_rejected(self):
+        cfg = _cfg_with_field(
+            {
+                "kind": "vector",
+                "trailing_shape": 4,
+                "expression": "np.zeros(4)",
+                "resolution": "chunk",
+            }
+        )
+        with pytest.raises(
+            ValueError, match="resolution 'chunk' is only supported for kind 'scalar'"
+        ):
+            validate_config(cfg)
+
+    def test_worked_template_offset_gain_are_chunk_resolution(self):
+        cfg = default_config("atl03_waveform_chunk")
+        fields = get_agg_fields(cfg)
+        assert get_output_signature(fields["offset_h"])["resolution"] == "chunk"
+        assert get_output_signature(fields["gain_h"])["resolution"] == "chunk"
+        # waveform_counts stays cell-resolution (per-cell vector).
+        assert get_output_signature(fields["waveform_counts"])["resolution"] == "cell"
 
 
 # ---------------------------------------------------------------------------
@@ -1341,6 +1410,7 @@ class TestRaggedKind:
             "trailing_shape": (),
             "inner_shape": (2,),
             "dtype": "float32",
+            "resolution": "cell",
         }
 
     def test_ragged_inner_shape_int_normalized(self):

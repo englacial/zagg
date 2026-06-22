@@ -383,8 +383,32 @@ def write_dataframe_to_zarr(
             f"Expected {expected_count} rows for chunk_shape={grid.chunk_shape}, got {n_cells}"
         )
 
+    # Fields declared ``resolution: chunk`` (issue #30 item 2) are written ONCE per
+    # chunk into a companion array shaped at the chunk grid, not the per-cell array.
+    # Read the set from the grid's config (every concrete grid carries ``config``).
+    chunk_res_fields = _chunk_resolution_fields(getattr(grid, "config", None))
+
     chunk_idx = tuple(int(i) for i in chunk_idx)
     for name, values in _iter_carrier_columns(df_out):
+        if name in chunk_res_fields:
+            # resolution: chunk — the column is chunk-uniform (every cell carries
+            # the same chunk value), so collapse to the single value and write it to
+            # the companion array's one-block-per-chunk grid at ``chunk_idx`` (which
+            # IS ``grid.block_index(shard_key)``). One value per chunk, no per-cell
+            # duplication on disk (issue #30 item 2).
+            flat = values.reshape(-1)
+            chunk_value = flat[0]
+            block = np.asarray(chunk_value).reshape((1,) * len(chunk_idx))
+            with config.set({"async.concurrency": 128}):
+                array = open_array(
+                    store,
+                    path=f"{grid.group_path}/{name}",
+                    zarr_format=3,
+                    consolidated=False,
+                )
+                array.set_block_selection(chunk_idx, block)
+            continue
+
         # Scalar columns reshape to the grid's chunk_shape; a vector column keeps
         # its trailing payload dim(s), so the block (and target array) is
         # (*chunk_shape, *trailing_shape). The cell count invariant is unchanged.
@@ -417,6 +441,21 @@ def write_dataframe_to_zarr(
             array.set_block_selection(block_idx, values)
 
     return store
+
+
+def _chunk_resolution_fields(config: PipelineConfig | None) -> set[str]:
+    """Names of agg fields declared ``resolution: chunk`` (issue #30 item 2).
+
+    Empty for a config without any such field, so the writer's per-cell path is
+    byte-for-byte unchanged for existing (cell-resolution-only) configs.
+    """
+    if config is None:
+        return set()
+    return {
+        name
+        for name, meta in get_agg_fields(config).items()
+        if get_output_signature(meta)["resolution"] == "chunk"
+    }
 
 
 def _iter_carrier_columns(carrier):

@@ -24,10 +24,11 @@
 # ``median(h_ph)`` as the worked example of the hook; swapping in a ``dem_h``
 # source is a one-line change once that read lands.
 #
-# offset_h / gain_h are recorded as per-cell scalar fields: every cell in a chunk
-# carries the chunk's offset/gain identically (duplicated for now -- the compact
-# per-chunk companion-array storage is the #30 item-2 follow-on). A reader
-# reconstructs each chunk's altitude axis as ``offset_h + gain_h * arange(128)``.
+# offset_h / gain_h are recorded as resolution: chunk companion fields (issue #30
+# item 2): the chunk offset/gain is stored ONCE per chunk in an array shaped at the
+# chunk grid (main.shape // chunk_shape), indexed by block_index -- no per-cell
+# duplication. A reader reconstructs each chunk's altitude axis as
+# ``offset_h + gain_h * arange(128)``.
 #
 # Confidence filter, multi-level form, read_plan and grid are identical to
 # atl03_waveform_counts.yaml so the planned-IO benefits (#43 Phase C) apply here
@@ -95,15 +96,19 @@ aggregation:
       dtype: uint32
       fill_value: 0
     offset_h:
-      # records the chunk offset per cell (chunk-uniform; duplicated until the
-      # per-chunk companion-array storage of #30 item 2 lands).
+      # records the chunk offset ONCE per chunk (issue #30 item 2): a companion
+      # array shaped at the chunk grid (main.shape // chunk_shape), indexed by
+      # block_index — no per-cell duplication. A reader reconstructs each chunk's
+      # altitude axis as ``offset_h + gain_h * arange(128)``.
       expression: "chunk_offset"
       source: h_ph
       dtype: float32
+      resolution: chunk
     gain_h:
       expression: "chunk_gain"
       source: h_ph
       dtype: float32
+      resolution: chunk
 
 output:
   grid:

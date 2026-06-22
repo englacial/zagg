@@ -1172,6 +1172,215 @@ class TestVectorRoundTrip:
             write_dataframe_to_zarr(table, store, grid=_OneChunkGrid(), chunk_idx=(0,))
 
 
+class TestChunkResolutionCompanion:
+    """Issue #30 item 2: a ``resolution: chunk`` field is written ONCE per chunk to
+    a companion array shaped at the chunk grid (main.shape // chunk_shape), indexed
+    by ``grid.block_index``. Works identically on HEALPix and rectilinear."""
+
+    @staticmethod
+    def _chunk_cfg(base_name):
+        """atl06-derived config with one cell-resolution count and one chunk field."""
+        from zagg.config import PipelineConfig
+
+        cfg = default_config(base_name)
+        agg = {
+            "coordinates": cfg.aggregation.get("coordinates", {}),
+            "chunk_precompute": {
+                "chunk_anchor": {"expression": "np.float32(np.median(h_li))", "source": "h_li"}
+            },
+            "variables": {
+                "count": {"function": "len", "source": "h_li"},
+                "anchor_h": {"expression": "chunk_anchor", "source": "h_li", "resolution": "chunk"},
+            },
+        }
+        return PipelineConfig(data_source=cfg.data_source, aggregation=agg, output=cfg.output)
+
+    def test_healpix_companion_shape_and_index(self):
+        """The HEALPix companion array is shaped at the chunk grid (12·4^parent),
+        and a shard's single value lands at block_index = the parent nested id."""
+        from mortie import geo2mort
+
+        cfg = self._chunk_cfg("atl06")
+        parent_order, child_order = 2, 4
+        grid = HealpixGrid(parent_order, child_order, layout="fullsphere", config=cfg)
+        store = MemoryStore()
+        grid.emit_template(store)
+
+        # Companion shape == number of chunks (12·4^parent_order), NOT the cell grid.
+        group = open_group(store=store, mode="r", path=str(child_order))
+        n_chunks = HEALPIX_BASE_CELLS * 4**parent_order
+        assert grid.chunk_grid_shape == (n_chunks,)
+        assert group["anchor_h"].shape == (n_chunks,)
+        # The cell-resolution count keeps the full cell-grid shape.
+        assert group["count"].shape == (HEALPIX_BASE_CELLS * 4**child_order,)
+
+        parent = int(geo2mort(-78.5, -132.0, order=parent_order)[0])
+        children = grid.children(parent)
+        n = len(children)
+        # Every cell carries the chunk-uniform anchor (chunk-uniform column).
+        stats = {
+            "count": np.zeros(n, dtype="float32"),
+            "anchor_h": np.full(n, 42.5, dtype="float32"),
+        }
+        carrier = _build_output(
+            stats, get_data_vars(cfg), get_agg_fields(cfg), grid, parent, use_arrow=False
+        )
+        chunk_idx = grid.block_index(parent)
+        write_dataframe_to_zarr(carrier, store, grid=grid, chunk_idx=chunk_idx)
+
+        # Exactly ONE value per chunk, at block_index; the rest stay at fill (NaN).
+        rgroup = open_group(store=store, mode="r", path=str(child_order))
+        companion = rgroup["anchor_h"][:]
+        assert companion[chunk_idx[0]] == np.float32(42.5)
+        # All other chunks untouched (NaN fill).
+        other = np.delete(companion, chunk_idx[0])
+        assert np.all(np.isnan(other))
+        # A reader reconstructs the chunk value without any per-cell array.
+        assert rgroup["anchor_h"][chunk_idx[0]] == np.float32(42.5)
+
+    def test_rectilinear_companion_shape_and_index(self):
+        """The rectilinear companion array is shaped at the chunk grid
+        (n_row_blocks, n_col_blocks) and indexed by block_index = (rb, cb)."""
+        from zagg.grids import RectilinearGrid
+
+        cfg = self._chunk_cfg("atl06")
+        grid = RectilinearGrid(
+            crs="EPSG:3031",
+            resolution=100000.0,
+            bounds=[-400000, -400000, 400000, 400000],
+            chunk_shape=(4, 4),
+            config=cfg,
+        )
+        store = MemoryStore()
+        grid.emit_template(store)
+
+        group = open_group(store=store, mode="r", path="rectilinear")
+        assert group["anchor_h"].shape == grid.chunk_grid_shape
+        assert grid.chunk_grid_shape == (grid.n_row_blocks, grid.n_col_blocks)
+        # Cell-resolution count keeps the full 2-D cell grid.
+        assert group["count"].shape == grid.array_shape
+
+        # Pick an interior chunk and write its uniform value.
+        shard_key = grid._pack(1, 1)
+        children = grid.children(shard_key)
+        n = len(children)
+        stats = {
+            "count": np.zeros(n, dtype="float32"),
+            "anchor_h": np.full(n, 7.0, dtype="float32"),
+        }
+        carrier = _build_output(
+            stats, get_data_vars(cfg), get_agg_fields(cfg), grid, shard_key, use_arrow=False
+        )
+        chunk_idx = grid.block_index(shard_key)
+        assert chunk_idx == (1, 1)
+        write_dataframe_to_zarr(carrier, store, grid=grid, chunk_idx=chunk_idx)
+
+        rgroup = open_group(store=store, mode="r", path="rectilinear")
+        companion = rgroup["anchor_h"][:]
+        assert companion[1, 1] == np.float32(7.0)
+        # Exactly one written cell; the rest are NaN fill.
+        assert np.count_nonzero(~np.isnan(companion)) == 1
+
+    def test_empty_cell_in_populated_chunk_needs_no_per_cell_value(self):
+        """With resolution: chunk, an empty cell in a populated chunk needs NO
+        per-cell value — the chunk anchor is stored once and read back regardless of
+        which cells are empty (issue #30 item 2 retires the per-cell band-aid)."""
+        from mortie import geo2mort
+
+        cfg = self._chunk_cfg("atl06")
+        parent_order, child_order = 2, 4
+        grid = HealpixGrid(parent_order, child_order, layout="fullsphere", config=cfg)
+        store = MemoryStore()
+        grid.emit_template(store)
+
+        parent = int(geo2mort(-78.5, -132.0, order=parent_order)[0])
+        children = grid.children(parent)
+        n = len(children)
+        # Only cell 0 has photons; every other cell is empty. The anchor column is
+        # still chunk-uniform (empty cells carry the anchor too — phase-4 behavior).
+        stats = {
+            "count": np.zeros(n, dtype="float32"),
+            "anchor_h": np.full(n, 13.0, dtype="float32"),
+        }
+        stats["count"][0] = 4
+        carrier = _build_output(
+            stats, get_data_vars(cfg), get_agg_fields(cfg), grid, parent, use_arrow=False
+        )
+        chunk_idx = grid.block_index(parent)
+        write_dataframe_to_zarr(carrier, store, grid=grid, chunk_idx=chunk_idx)
+
+        rgroup = open_group(store=store, mode="r", path=str(child_order))
+        # One companion value for the whole chunk; reading it does not depend on any
+        # per-cell anchor array — there is no cell-resolution anchor_h array at all.
+        assert rgroup["anchor_h"].shape == (HEALPIX_BASE_CELLS * 4**parent_order,)
+        assert rgroup["anchor_h"][chunk_idx[0]] == np.float32(13.0)
+
+    def test_worked_template_emits_chunk_companions(self, monkeypatch):
+        """The shipped atl03_waveform_chunk template, run end-to-end through the
+        worker and written to a real Zarr store, stores offset_h/gain_h as
+        chunk-resolution companions (one value per chunk), while waveform_counts
+        stays a per-cell vector array (issue #30 items 1+2)."""
+        pytest.importorskip("pyarrow")
+        from zagg.grids import RectilinearGrid
+
+        cfg = default_config("atl03_waveform_chunk")
+        # Small rect grid so a real template fits in memory; one 2x2 chunk holds the
+        # two populated cells (the worker fabricates the per-cell loop via canned
+        # reads as in TestChunkPrecompute).
+        grid = RectilinearGrid(
+            crs="EPSG:4326",
+            resolution=1.0,
+            bounds=[0, 0, 2, 2],
+            chunk_shape=(2, 2),
+            config=cfg,
+        )
+        store = MemoryStore()
+        grid.emit_template(store)
+
+        # Companion arrays are at the chunk grid; waveform_counts keeps cell+trailing.
+        group = open_group(store=store, mode="r", path="rectilinear")
+        assert group["offset_h"].shape == grid.chunk_grid_shape
+        assert group["gain_h"].shape == grid.chunk_grid_shape
+        assert group["waveform_counts"].shape == (*grid.array_shape, 128)
+
+        # Drive process_shard over chunk (0,0): children are the 4 cells of the
+        # top-left 2x2 block; place photons in two of them.
+        shard_key = grid._pack(0, 0)
+        children = grid.children(shard_key)
+        # vector field present -> default pandas carrier path; feed a DataFrame read.
+        df = pd.DataFrame(
+            {
+                "h_ph": np.array([10.0, 12.0, 200.0, 202.0], dtype=np.float32),
+                "leaf_id": np.array(
+                    [children[0], children[0], children[1], children[1]], dtype=np.int64
+                ),
+            }
+        )
+
+        calls = {"n": 0}
+
+        def one_shot(*args, **kwargs):
+            calls["n"] += 1
+            return df if calls["n"] == 1 else None
+
+        monkeypatch.setattr("zagg.processing._read_group", one_shot)
+        monkeypatch.setattr("zagg.processing.h5coro.H5Coro", lambda *a, **k: object())
+        monkeypatch.setattr("zagg.processing._make_url_rewriter", lambda driver: lambda u: u)
+
+        carrier, _meta = process_shard(grid, shard_key, ["s3://x"], s3_credentials={}, config=cfg)
+        chunk_idx = grid.block_index(shard_key)
+        write_dataframe_to_zarr(carrier, store, grid=grid, chunk_idx=chunk_idx)
+
+        rgroup = open_group(store=store, mode="r", path="rectilinear")
+        # offset_h companion: one value at this chunk = floor(median(pooled h_ph)).
+        expected_offset = np.float32(np.floor(np.median([10.0, 12.0, 200.0, 202.0])))
+        assert rgroup["offset_h"][chunk_idx] == expected_offset
+        assert not np.isnan(rgroup["gain_h"][chunk_idx])
+        # Only one chunk written for each companion.
+        assert np.count_nonzero(~np.isnan(rgroup["offset_h"][:])) == 1
+        assert np.count_nonzero(~np.isnan(rgroup["gain_h"][:])) == 1
+
+
 # ---------------------------------------------------------------------------
 # Structured filters in the read path (issue #43, Phase A)
 # ---------------------------------------------------------------------------

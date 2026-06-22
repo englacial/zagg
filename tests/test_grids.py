@@ -377,6 +377,91 @@ class TestVectorTemplate:
         assert grp["hist"].chunks == (64, 64, 4)  # trailing dim whole
 
 
+def _chunk_resolution_config():
+    """Config with one cell-resolution scalar and one ``resolution: chunk`` field."""
+    from zagg.config import PipelineConfig
+
+    base = default_config("atl06")
+    agg = {
+        "coordinates": base.aggregation.get("coordinates", {}),
+        "chunk_precompute": {
+            "chunk_anchor": {"expression": "np.float32(np.median(h_li))", "source": "h_li"}
+        },
+        "variables": {
+            "count": {"function": "len", "source": "h_li"},
+            "anchor_h": {"expression": "chunk_anchor", "source": "h_li", "resolution": "chunk"},
+        },
+    }
+    return PipelineConfig(data_source=base.data_source, aggregation=agg, output=base.output)
+
+
+class TestChunkResolutionTemplate:
+    """Issue #30 item 2: a ``resolution: chunk`` field emits a companion array
+    shaped at the chunk grid (main.shape // chunk_shape), not the cell grid."""
+
+    def test_healpix_companion_at_chunk_grid(self):
+        cfg = _chunk_resolution_config()
+        g = HealpixGrid(parent_order=6, child_order=8, layout="fullsphere", config=cfg)
+        store = MemoryStore()
+        g.emit_template(store)
+        grp = open_group(store, path="8", mode="r")
+        # companion is the chunk grid (12·4^parent), one block per chunk.
+        n_chunks = HEALPIX_BASE_CELLS * 4**6
+        assert grp["anchor_h"].shape == (n_chunks,)
+        assert grp["anchor_h"].chunks == (1,)
+        # cell-resolution count keeps the full cell grid.
+        assert grp["count"].shape == (HEALPIX_BASE_CELLS * 4**8,)
+        assert g.spec().members["anchor_h"].dimension_names == ("chunks",)
+
+    def test_rectilinear_companion_at_chunk_grid(self):
+        from zagg.grids import RectilinearGrid
+
+        cfg = _chunk_resolution_config()
+        g = RectilinearGrid(
+            "EPSG:3031", 1000.0, (-1e6, -1e6, 1e6, 1e6), chunk_shape=(64, 64), config=cfg
+        )
+        store = MemoryStore()
+        g.emit_template(store)
+        grp = open_group(store, path="rectilinear", mode="r")
+        assert grp["anchor_h"].shape == (g.n_row_blocks, g.n_col_blocks)
+        assert grp["anchor_h"].chunks == (1, 1)
+        assert grp["count"].shape == (g.height, g.width)
+        assert g._spec().members["anchor_h"].dimension_names == ("chunk_y", "chunk_x")
+
+
+class TestPlainConfigByteIdentical:
+    """A config with NO chunk_precompute and NO resolution: chunk field must emit a
+    template byte-for-byte identical to the pre-item-2 schema (issue #30 byte-
+    identical guarantee): the new attributes are purely additive (default cell)."""
+
+    def test_atl06_template_unchanged_by_resolution_machinery(self):
+        # The atl06 config declares no resolution: chunk field, so no agg-field
+        # array routes through the chunk companion path: every field keeps the cell
+        # grid shape, and the serialized member specs are identical to a re-emit.
+        from zagg.processing import _chunk_resolution_fields
+
+        cfg = default_config("atl06")
+        assert _chunk_resolution_fields(cfg) == set()
+        g = HealpixGrid(parent_order=6, child_order=8, layout="fullsphere", config=cfg)
+        spec = g.spec()
+        # Every agg field is at the cell grid (no companion), so the serialized
+        # GroupSpec equals a re-derived one and no dimension name is a chunk axis.
+        n_pix = HEALPIX_BASE_CELLS * 4**8
+        for name in get_data_vars(cfg):
+            member = spec.members[name]
+            assert member.shape == (n_pix,)
+            assert member.dimension_names == ("cells",)
+        # Full-spec round-trip equality (the additive resolution key is inert).
+        assert (
+            g.spec().model_dump()
+            == HealpixGrid(
+                parent_order=6, child_order=8, layout="fullsphere", config=default_config("atl06")
+            )
+            .spec()
+            .model_dump()
+        )
+
+
 class TestMortonCoordinate:
     """The ``morton`` coordinate is a mortie ``MortonIndexArray`` stored as
     ``uint64`` on disk (#71); ``cell_ids`` stays NESTED ``uint64`` (DGGS)."""
