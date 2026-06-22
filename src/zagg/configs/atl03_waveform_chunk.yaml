@@ -8,7 +8,7 @@
 # unlike atl03_waveform_counts.yaml which anchors on each cell's own median.
 #
 # The anchor and gain (see issue #30 comment 4773320226):
-#   chunk_offset = floor(median(h_ph))   over the whole shard (pooled, not per-cell)
+#   chunk_offset = floor(median(dem_h)) over the whole shard (pooled, not per-cell)
 #   chunk_gain   = smallest power-of-two (>= 0.5 m) whose 128 bins span the shard's
 #                  photon-height range  ->  2^ceil(log2((max - min) / 128)), floored at 0.5 m
 # The 128-bin window is [chunk_offset - 27*chunk_gain, chunk_offset + 101*chunk_gain),
@@ -16,13 +16,14 @@
 # above) -- the asymmetric layout @espg specified for a mostly-above-ground
 # return. Out-of-range photons are dropped (not counted), matching #30's spec.
 #
-# Note (issue #30 thread): the design target for the chunk anchor is the ATL03
-# reference DEM (``dem_h``), which gives a stable absolute frame. dem_h lives in
-# the segment-level geolocation group (one value per ~100 photons), a cross-group
-# / resolution-mismatch read that @espg deferred (the segment-level variable
-# schema change is a follow-up). This template therefore anchors on the pooled
-# ``median(h_ph)`` as the worked example of the hook; swapping in a ``dem_h``
-# source is a one-line change once that read lands.
+# The chunk anchor is the ATL03 reference DEM (``dem_h``), which gives a stable
+# absolute frame independent of the photon cloud's own median. dem_h lives in the
+# segment-level geolocation group (one value per ~100 photons); it is declared as a
+# segment-level ``variables`` entry below and broadcast to the photon rows at read
+# time via the existing geolocation->heights link (the same link the read plan
+# already rides), landing as a per-photon ``dem_h`` column the chunk_precompute
+# reduces. The gain is still a spread over ``h_ph`` (the photon-height range), not
+# an anchor, so it stays on h_ph.
 #
 # offset_h / gain_h are recorded as resolution: chunk companion fields (issue #30
 # item 2): the chunk offset/gain is stored ONCE per chunk in an array shaped at the
@@ -56,6 +57,11 @@ data_source:
     segments:
       path: "/{group}/geolocation"
       coordinates: {latitude: reference_photon_lat, longitude: reference_photon_lon}
+      # Segment-level readable variable (issue #30): dem_h is one value per ~100
+      # photons; it is broadcast to the photon rows via the link below and lands as
+      # a per-photon ``dem_h`` column the chunk_precompute reduces.
+      variables:
+        dem_h: "/{group}/geophys_corr/dem_h"
       link:
         to: photons
         index_beg: "/{group}/geolocation/ph_index_beg"
@@ -82,8 +88,10 @@ aggregation:
       source: h_ph
       dtype: float32
     chunk_offset:
-      expression: "np.float32(np.floor(np.median(h_ph)))"
-      source: h_ph
+      # DEM-anchored: the chunk's absolute frame is the reference DEM, not the
+      # photon cloud's own median. dem_h rides the segment->photon broadcast above.
+      expression: "np.float32(np.floor(np.median(dem_h)))"
+      source: dem_h
       dtype: float32
   variables:
     waveform_counts:

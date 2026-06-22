@@ -179,10 +179,12 @@ class TestWaveformChunkTemplate:
     def test_declares_chunk_precompute(self, cfg):
         pc = get_chunk_precompute(cfg)
         assert set(pc) == {"chunk_offset", "chunk_gain"}
-        # both are expression entries over the pooled h_ph
         for meta in pc.values():
             assert "expression" in meta
-            assert meta["source"] == "h_ph"
+        # chunk_offset is the DEM anchor (dem_h, a segment-level variable);
+        # chunk_gain is a spread over the photon heights (h_ph).
+        assert pc["chunk_offset"]["source"] == "dem_h"
+        assert pc["chunk_gain"]["source"] == "h_ph"
 
     def test_waveform_references_chunk_names(self, cfg):
         expr = cfg.aggregation["variables"]["waveform_counts"]["expression"]
@@ -773,6 +775,89 @@ class TestLevelsValidation:
         )
         with pytest.raises(ValueError, match="not a key in levels"):
             validate_config(cfg)
+
+
+class TestSegmentLevelVariables:
+    """Issue #30: a non-base level may declare ``variables`` as a ``{name: path}``
+    mapping (a readable segment-level variable, e.g. ``dem_h``). It is validated
+    like ``data_source.variables`` (string names -> non-empty path templates) and
+    its names become valid column references for the aggregation."""
+
+    def _cfg(self, seg_variables, **agg_overrides):
+        ds = _minimal_two_level_ds()
+        ds["levels"]["segments"]["variables"] = seg_variables
+        agg = {"variables": {"c": {"function": "len", "dtype": "int32"}}}
+        agg.update(agg_overrides)
+        return PipelineConfig(
+            data_source=ds,
+            aggregation=agg,
+            output={"grid": {"type": "healpix", "parent_order": 6, "child_order": 12}},
+        )
+
+    def test_mapping_form_valid(self):
+        validate_config(self._cfg({"dem_h": "/{group}/geophys_corr/dem_h"}))
+
+    def test_list_form_still_valid(self):
+        # The documentation-only ``list[str]`` form is unchanged.
+        validate_config(self._cfg(["signal_conf_ph"]))
+
+    def test_segment_variable_usable_as_agg_source(self):
+        # dem_h becomes a per-photon column, so an agg field may source it.
+        validate_config(
+            self._cfg(
+                {"dem_h": "/{group}/geophys_corr/dem_h"},
+                variables={"dem_mean": {"function": "mean", "source": "dem_h", "dtype": "float32"}},
+            )
+        )
+
+    def test_segment_variable_usable_in_chunk_precompute(self):
+        ds = _minimal_two_level_ds()
+        ds["levels"]["segments"]["variables"] = {"dem_h": "/{group}/geophys_corr/dem_h"}
+        cfg = PipelineConfig(
+            data_source=ds,
+            aggregation={
+                "chunk_precompute": {
+                    "chunk_offset": {
+                        "expression": "np.float32(np.median(dem_h))",
+                        "source": "dem_h",
+                    }
+                },
+                "variables": {"c": {"function": "len", "dtype": "int32"}},
+            },
+            output={"grid": {"type": "healpix", "parent_order": 6, "child_order": 12}},
+        )
+        validate_config(cfg)
+
+    def test_empty_path_template_rejected(self):
+        with pytest.raises(ValueError, match="path template must be a"):
+            validate_config(self._cfg({"dem_h": ""}))
+
+    def test_mapping_on_base_level_rejected(self):
+        ds = _minimal_two_level_ds()
+        ds["levels"]["photons"]["variables"] = {"h_ph": "/{group}/heights/h_ph"}
+        cfg = PipelineConfig(
+            data_source=ds,
+            aggregation={"variables": {"c": {"function": "len", "dtype": "int32"}}},
+            output={"grid": {"type": "healpix", "parent_order": 6, "child_order": 12}},
+        )
+        with pytest.raises(ValueError, match="base level uses data_source.variables"):
+            validate_config(cfg)
+
+    def test_name_collision_with_base_variable_rejected(self):
+        # ``h`` is already a data_source.variables column.
+        with pytest.raises(ValueError, match="collides with a data_source.variables column"):
+            validate_config(self._cfg({"h": "/{group}/geophys_corr/dem_h"}))
+
+    def test_worked_template_declares_dem_h_segment_variable(self):
+        cfg = load_config("src/zagg/configs/atl03_waveform_chunk.yaml")
+        validate_config(cfg)
+        seg = cfg.data_source["levels"]["segments"]["variables"]
+        assert isinstance(seg, dict)
+        assert seg["dem_h"] == "/{group}/geophys_corr/dem_h"
+        # chunk_offset is DEM-anchored.
+        offset = cfg.aggregation["chunk_precompute"]["chunk_offset"]
+        assert offset["source"] == "dem_h"
+        assert "dem_h" in offset["expression"]
 
 
 # ---------------------------------------------------------------------------

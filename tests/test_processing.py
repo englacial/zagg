@@ -9,6 +9,7 @@ from zagg.grids import HEALPIX_BASE_CELLS, HealpixGrid
 from zagg.processing import (
     KERNEL_RTOL,
     _arrow_column,
+    _broadcast_segment_to_base,
     _build_groups,
     _build_output,
     _coerce_ragged_value,
@@ -24,6 +25,8 @@ from zagg.processing import (
     _kernel_aggregate,
     _predicate_mask,
     _read_group,
+    _read_segment_broadcasts,
+    _segment_level_variables,
     calculate_cell_statistics,
     process_shard,
     write_dataframe_to_zarr,
@@ -1348,9 +1351,12 @@ class TestChunkResolutionCompanion:
         shard_key = grid._pack(0, 0)
         children = grid.children(shard_key)
         # vector field present -> default pandas carrier path; feed a DataFrame read.
+        # dem_h (the DEM anchor) rides alongside h_ph as a pooled column (issue #30).
+        dem = np.array([50.0, 50.0, 60.0, 60.0], dtype=np.float32)
         df = pd.DataFrame(
             {
                 "h_ph": np.array([10.0, 12.0, 200.0, 202.0], dtype=np.float32),
+                "dem_h": dem,
                 "leaf_id": np.array(
                     [children[0], children[0], children[1], children[1]], dtype=np.int64
                 ),
@@ -1372,8 +1378,8 @@ class TestChunkResolutionCompanion:
         write_dataframe_to_zarr(carrier, store, grid=grid, chunk_idx=chunk_idx)
 
         rgroup = open_group(store=store, mode="r", path="rectilinear")
-        # offset_h companion: one value at this chunk = floor(median(pooled h_ph)).
-        expected_offset = np.float32(np.floor(np.median([10.0, 12.0, 200.0, 202.0])))
+        # offset_h companion: one value at this chunk = floor(median(pooled dem_h)).
+        expected_offset = np.float32(np.floor(np.median(dem)))
         assert rgroup["offset_h"][chunk_idx] == expected_offset
         assert not np.isnan(rgroup["gain_h"][chunk_idx])
         # Only one chunk written for each companion.
@@ -2393,6 +2399,150 @@ class TestPlannedReadGroup:
         assert df["h_ph"].tolist() == [0.0, 10.0, 20.0, 30.0, 50.0, 60.0, 70.0]
 
 
+class TestSegmentLevelVariables:
+    """Issue #30: a non-base level declaring ``variables: {name: path}`` is read at
+    coarse rate and broadcast to the base (photon) rows via the level's link, so a
+    per-segment field (e.g. ``dem_h``, one value per ~100 photons) lands as a
+    per-photon column the aggregation / chunk_precompute reduces."""
+
+    def test_broadcast_segment_to_base_repeats_by_count(self):
+        # 3 segments covering 2 photons each; each photon carries its segment value.
+        seg = np.array([100.0, 200.0, 300.0], dtype=np.float32)
+        ibeg = np.array([0, 2, 4])
+        cnt = np.array([2, 2, 2])
+        out = _broadcast_segment_to_base(seg, ibeg, cnt, index_base=0, total_base_size=6)
+        assert out.tolist() == [100.0, 100.0, 200.0, 200.0, 300.0, 300.0]
+        # Equals np.repeat under contiguity.
+        assert out.tolist() == np.repeat(seg, cnt).tolist()
+        assert out.dtype == seg.dtype
+
+    def test_broadcast_honors_index_base(self):
+        seg = np.array([10.0, 20.0])
+        ibeg = np.array([1, 3])  # 1-based (ATL03-style)
+        cnt = np.array([2, 2])
+        out = _broadcast_segment_to_base(seg, ibeg, cnt, index_base=1, total_base_size=4)
+        assert out.tolist() == [10.0, 10.0, 20.0, 20.0]
+
+    def _data_source(self):
+        return {
+            "coordinates": {"latitude": "/lat", "longitude": "/lon"},
+            "variables": {"h": "/h"},
+            "base_level": "photons",
+            "levels": {
+                "photons": {
+                    "path": "/heights",
+                    "coordinates": ["lat", "lon"],
+                    "variables": ["h"],
+                    "link": None,
+                },
+                "segments": {
+                    "path": "/geolocation",
+                    "coordinates": [],
+                    "variables": {"dem_h": "/dem_h"},
+                    "link": {
+                        "to": "photons",
+                        "index_beg": "/ph_index_beg",
+                        "count": "/segment_ph_cnt",
+                    },
+                },
+            },
+        }
+
+    def test_full_path_broadcasts_dem_h_to_photons(self):
+        # 3 segments x 2 photons; each photon carries its segment's dem_h.
+        h5 = _FakeH5(
+            {
+                "/lat": np.arange(6.0),
+                "/lon": np.arange(6.0),
+                "/h": np.arange(6.0, dtype=np.float32),
+                "/ph_index_beg": np.array([0, 2, 4]),
+                "/segment_ph_cnt": np.array([2, 2, 2]),
+                "/dem_h": np.array([100.0, 200.0, 300.0], dtype=np.float32),
+            }
+        )
+        df = _read_group(h5, "gt1l", self._data_source(), 0, _ShardGrid())
+        assert df["h"].tolist() == [0.0, 1.0, 2.0, 3.0, 4.0, 5.0]
+        assert df["dem_h"].tolist() == [100.0, 100.0, 200.0, 200.0, 300.0, 300.0]
+
+    def test_full_path_alignment_under_base_filter(self):
+        # A base-level filter drops some photons; the broadcast dem_h must follow
+        # the SAME mask so each surviving photon keeps its own segment's value.
+        ds = self._data_source()
+        ds["filters"] = [{"dataset": "/qs", "op": "eq", "value": 0}]
+        h5 = _FakeH5(
+            {
+                "/lat": np.arange(6.0),
+                "/lon": np.arange(6.0),
+                "/h": np.arange(6.0, dtype=np.float32),
+                "/ph_index_beg": np.array([0, 2, 4]),
+                "/segment_ph_cnt": np.array([2, 2, 2]),
+                "/dem_h": np.array([100.0, 200.0, 300.0], dtype=np.float32),
+                "/qs": np.array([0, 1, 0, 0, 1, 0]),  # drop photons 1 and 4
+            }
+        )
+        df = _read_group(h5, "gt1l", ds, 0, _ShardGrid())
+        # Survivors: photons 0,2,3,5 -> dem_h 100,200,200,300.
+        assert df["h"].tolist() == [0.0, 2.0, 3.0, 5.0]
+        assert df["dem_h"].tolist() == [100.0, 200.0, 200.0, 300.0]
+
+    def test_planned_partial_read_aligns_dem_h(self):
+        # Partial read plan (NOT a full read): the bbox selects only segments
+        # 1-2 (photons 2..5). Each selected photon must carry its own segment's
+        # dem_h, broadcast over the read-plan-selected photons only.
+        ds = _planned_read_data_source()
+        ds["levels"]["segments"]["variables"] = {"dem_h": "/seg/dem_h"}
+        h5 = _planned_read_h5()
+        # 6 segments; dem_h one value per segment.
+        h5._arrays["/seg/dem_h"] = np.array([10.0, 20.0, 30.0, 40.0, 50.0, 60.0], dtype=np.float32)
+        grid = _BboxGrid((-0.1, 175.0, 0.1, 225.0))
+        df = _read_group(h5, "gt1l", ds, 0, grid)
+        # Planned path selects photons 2,3 (seg 1) and 4,5 (seg 2).
+        assert df["h"].tolist() == [20.0, 30.0, 40.0, 50.0]
+        assert df["dem_h"].tolist() == [20.0, 20.0, 30.0, 30.0]
+
+    def test_no_segment_variables_is_inert(self):
+        # A hierarchical config whose non-base level uses the documentation-only
+        # ``list[str]`` variables form (NOT the mapping) triggers no broadcast: the
+        # helpers return empty and the read path produces the same columns as before.
+        ds = self._data_source()
+        ds["levels"]["segments"]["variables"] = ["signal_conf_ph"]  # list form
+        assert _segment_level_variables(ds) == {}
+
+        class _NoH5:
+            def readDatasets(self, datasets):  # noqa: N802
+                raise AssertionError("no segment-variable read should occur")
+
+        # No segment-variable read is attempted (the link arrays are never read).
+        assert _read_segment_broadcasts(_NoH5(), "gt1l", ds, ds["levels"], 6) == {}
+
+        h5 = _FakeH5(
+            {
+                "/lat": np.arange(6.0),
+                "/lon": np.arange(6.0),
+                "/h": np.arange(6.0, dtype=np.float32),
+                "/ph_index_beg": np.array([0, 2, 4]),
+                "/segment_ph_cnt": np.array([2, 2, 2]),
+            }
+        )
+        df = _read_group(h5, "gt1l", ds, 0, _ShardGrid())
+        assert list(df.columns) == ["h", "leaf_id"]  # no dem_h column injected
+
+    def test_worked_template_chunk_offset_is_floor_median_dem_h(self):
+        # End-to-end through process_shard: dem_h broadcast feeds chunk_offset,
+        # whose value is floor(median(pooled dem_h)) and is uniform across cells.
+        from zagg.config import load_config
+
+        cfg = load_config("src/zagg/configs/atl03_waveform_chunk.yaml")
+        # Two cells' worth of photons pooled in one shard; dem_h per photon
+        # (already broadcast) with a known median.
+        dem = np.array([100.0, 100.0, 102.0, 108.0, 110.0], dtype=np.float32)
+        chunk_scalars = _eval_chunk_precompute(
+            cfg, {"h_ph": np.arange(5.0, dtype=np.float32), "dem_h": dem}
+        )
+        assert chunk_scalars["chunk_offset"] == np.float32(np.floor(np.median(dem)))
+        assert chunk_scalars["chunk_offset"] == np.float32(102.0)
+
+
 class TestChunkPrecompute:
     """Per-chunk precompute hook (issue #30, item 1): compute once per chunk over
     the shard's pooled data, inject into the per-cell expression namespace."""
@@ -2527,9 +2677,13 @@ class TestChunkPrecompute:
         leaf_to_cell = {1: 10, 2: 20}
         children = [10, 20]
         grid = _KernelShardGrid(children, leaf_to_cell)
+        # dem_h (the DEM anchor) is the per-photon broadcast of each segment's
+        # reference DEM; it rides alongside h_ph as a pooled column (issue #30).
+        dem = np.array([50.0, 50.0, 60.0, 60.0], dtype=np.float32)
         df = pd.DataFrame(
             {
                 "h_ph": np.array([10.0, 12.0, 200.0, 202.0], dtype=np.float32),
+                "dem_h": dem,
                 "leaf_id": np.array([1, 1, 2, 2], dtype=np.int64),
             }
         )
@@ -2540,8 +2694,8 @@ class TestChunkPrecompute:
         gain = tbl.column("gain_h").to_numpy(zero_copy_only=False)
         assert offset[0] == offset[1]
         assert gain[0] == gain[1]
-        # chunk_offset = floor(median(pooled h_ph)) = floor(median([10,12,200,202])) = 106
-        assert offset[0] == np.float32(np.floor(np.median([10.0, 12.0, 200.0, 202.0])))
+        # chunk_offset is now the DEM anchor: floor(median(pooled dem_h)).
+        assert offset[0] == np.float32(np.floor(np.median(dem)))
 
     def test_empty_cell_gets_chunk_anchor_not_nan(self, monkeypatch):
         """An empty cell in a POPULATED chunk records the chunk-uniform anchor, not
@@ -2769,10 +2923,12 @@ class TestChunkPrecompute:
         cfg = default_config("atl03_waveform_chunk")
         children = [10, 20]
         grid = _KernelShardGrid(children, {1: 10, 2: 20})
-        # All photons share one height -> pooled range == 0 (degenerate).
+        # All photons share one height -> pooled range == 0 (degenerate). dem_h
+        # (the DEM anchor) rides alongside; chunk_gain is the spread over h_ph.
         df = pd.DataFrame(
             {
                 "h_ph": np.array([42.0, 42.0], dtype=np.float32),
+                "dem_h": np.array([42.0, 42.0], dtype=np.float32),
                 "leaf_id": np.array([1, 2], dtype=np.int64),
             }
         )

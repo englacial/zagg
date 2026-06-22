@@ -43,7 +43,12 @@ class LevelDict(TypedDict):
 
     path: str  # HDF5 group path template (may contain ``{group}``)
     coordinates: list[str]  # coordinate dataset names within ``path``
-    variables: list[str]  # variable dataset names within ``path``
+    # ``variables`` has two forms: a documentation-only ``list[str]`` of names, or
+    # (non-base levels, issue #30) a ``{name: path-template}`` mapping declaring a
+    # *readable* segment-level variable. The mapping form is read at coarse rate and
+    # broadcast to the base (photon) rows via ``link`` so e.g. ``dem_h`` (one value
+    # per ~100 photons) becomes a per-photon column the aggregation can reduce.
+    variables: list[str] | dict[str, str]
     link: NotRequired[LinkDict | None]
 
 
@@ -223,7 +228,13 @@ def validate_config(config: PipelineConfig) -> None:
     # Cross-check: each filter's level field must name a key in levels (issue #43)
     _validate_filter_levels(config.data_source)
 
-    ds_vars = set(config.data_source.get("variables", {}).keys())
+    # Segment-level (non-base) ``variables`` mappings (issue #30) become real
+    # per-photon columns in the pooled shard data once broadcast, so they are valid
+    # column references everywhere a ``data_source.variables`` column is (agg
+    # sources/expressions, chunk_precompute sources). Fold their names into ds_vars.
+    ds_vars = set(config.data_source.get("variables", {}).keys()) | _segment_variable_names(
+        config.data_source
+    )
     agg_vars = config.aggregation.get("variables", {})
 
     # Validate the per-chunk precompute hook (issue #30, item 1). Each entry is
@@ -659,6 +670,29 @@ def _validate_filters(data_source: dict) -> None:
                 raise ValueError(f"filter[{i}]: 'value' must be numeric (got {f['value']!r})")
 
 
+def _segment_variable_names(data_source: dict) -> set[str]:
+    """Names of readable segment-level (non-base) variables (issue #30).
+
+    A non-base level may declare ``variables`` as a ``{name: path-template}``
+    mapping; each name becomes a per-photon column once broadcast at read time
+    (:func:`zagg.processing._read_segment_broadcasts`). The documentation-only
+    ``list[str]`` form contributes nothing. Empty when no level declares the
+    mapping form, so plain configs are unaffected.
+    """
+    levels = data_source.get("levels")
+    base_level = data_source.get("base_level")
+    if not isinstance(levels, dict) or base_level is None:
+        return set()
+    names: set[str] = set()
+    for name, lvl in levels.items():
+        if name == base_level or not isinstance(lvl, dict):
+            continue
+        lvl_vars = lvl.get("variables")
+        if isinstance(lvl_vars, dict):
+            names |= set(lvl_vars)
+    return names
+
+
 def _validate_levels(data_source: dict) -> None:
     """Validate the hierarchical ``levels``/``base_level`` form (issue #43, Phase B).
 
@@ -683,12 +717,41 @@ def _validate_levels(data_source: dict) -> None:
             f"data_source.base_level {base_level!r} is not a key in levels "
             f"(available: {sorted(levels)})"
         )
+    base_vars = set(data_source.get("variables", {}))
     level_keys = set(levels)
     for name, lvl in levels.items():
         if not isinstance(lvl, dict):
             raise ValueError(f"levels.{name} must be a mapping")
         if "path" not in lvl:
             raise ValueError(f"levels.{name}: 'path' is required")
+        # A non-base level may declare ``variables`` as a ``{name: path-template}``
+        # mapping (issue #30): a readable segment-level variable broadcast to the
+        # base rows at read time. Validate it like ``data_source.variables`` (string
+        # names -> non-empty string path templates) and forbid the mapping form on
+        # the base level (the base level uses ``data_source.variables``). The
+        # documentation-only ``list[str]`` form stays valid on any level.
+        lvl_vars = lvl.get("variables")
+        if isinstance(lvl_vars, dict):
+            if name == base_level:
+                raise ValueError(
+                    f"levels.{base_level}: the base level uses data_source.variables; "
+                    f"a non-base level uses the 'variables' mapping for segment-level reads"
+                )
+            for var_name, tmpl in lvl_vars.items():
+                if not isinstance(var_name, str) or not var_name:
+                    raise ValueError(
+                        f"levels.{name}.variables: variable names must be non-empty strings"
+                    )
+                if not isinstance(tmpl, str) or not tmpl:
+                    raise ValueError(
+                        f"levels.{name}.variables.{var_name}: path template must be a "
+                        f"non-empty string (got {tmpl!r})"
+                    )
+                if var_name in base_vars:
+                    raise ValueError(
+                        f"levels.{name}.variables.{var_name}: collides with a "
+                        f"data_source.variables column"
+                    )
         link = lvl.get("link")
         if link is None:
             if name != base_level:

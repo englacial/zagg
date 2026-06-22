@@ -1024,6 +1024,114 @@ def _expand_mask_to_base(
     return out
 
 
+def _broadcast_segment_to_base(
+    seg_values: np.ndarray,
+    index_beg_arr: np.ndarray,
+    count_arr: np.ndarray,
+    index_base: int,
+    total_base_size: int,
+) -> np.ndarray:
+    """Broadcast a per-segment variable to a base-rate (per-photon) array (issue #30).
+
+    Each coarse parent ``p`` covers base-rate rows ``index_beg_arr[p] - index_base``
+    through ``... + count_arr[p] - 1`` (the same contiguous parent->child tiling
+    :func:`_expand_mask_to_base` expands a mask over). Where that tiling is
+    contiguous and ordered this equals ``np.repeat(seg_values, count_arr)``; placing
+    by ``index_beg`` keeps it robust to the same gap/order cases the mask path
+    handles. The returned array carries each photon's segment value (e.g. ``dem_h``,
+    one value per ~100 photons) so it can ride alongside the base-rate variables
+    through the read plan's spatial/keep masks.
+
+    Parameters
+    ----------
+    seg_values : np.ndarray
+        1-D per-parent values of length ``n_parents``.
+    index_beg_arr, count_arr, index_base, total_base_size
+        As in :func:`_expand_mask_to_base`.
+
+    Returns
+    -------
+    np.ndarray
+        1-D array of length ``total_base_size`` and ``seg_values``' dtype.
+    """
+    out = np.empty(total_base_size, dtype=seg_values.dtype)
+    for p in range(len(seg_values)):
+        beg = int(index_beg_arr[p]) - index_base
+        if beg < 0:
+            raise ValueError(
+                f"index_beg_arr[{p}]={index_beg_arr[p]} is less than index_base={index_base}"
+            )
+        cnt = int(count_arr[p])
+        out[beg : beg + cnt] = seg_values[p]
+    return out
+
+
+def _segment_level_variables(data_source: dict) -> dict[str, dict[str, str]]:
+    """Collect declared segment-level (non-base) readable variables (issue #30).
+
+    A non-base level may declare ``variables`` as a ``{name: path-template}``
+    mapping (the readable form, distinct from the documentation-only ``list[str]``
+    form). Each such variable is read at coarse rate and broadcast to the base
+    (photon) rows via the level's ``link`` (``_broadcast_segment_to_base``), so a
+    per-segment field like ``dem_h`` becomes a per-photon column the aggregation /
+    ``chunk_precompute`` can reduce. Returns ``{level_key: {name: template}}`` for
+    every non-base level carrying a dict ``variables``; empty when none do, so the
+    read path is unchanged for configs without it.
+    """
+    levels = data_source.get("levels")
+    base_level = data_source.get("base_level")
+    if not isinstance(levels, dict) or base_level is None:
+        return {}
+    out: dict[str, dict[str, str]] = {}
+    for name, lvl in levels.items():
+        if name == base_level or not isinstance(lvl, dict):
+            continue
+        lvl_vars = lvl.get("variables")
+        if isinstance(lvl_vars, dict) and lvl_vars:
+            out[name] = dict(lvl_vars)
+    return out
+
+
+def _read_segment_broadcasts(
+    h5obj, group: str, data_source: dict, levels: dict, n_base: int
+) -> dict[str, np.ndarray]:
+    """Read each segment-level variable and broadcast it to a base-rate column (issue #30).
+
+    For every non-base level carrying a ``{name: path}`` ``variables`` mapping, read
+    the variable and the level's link arrays at coarse rate, then broadcast to the
+    base (photon) rows via :func:`_broadcast_segment_to_base`. Returns
+    ``{name: base_rate_array}`` (length ``n_base``), ready to be sliced through the
+    same spatial / keep masks the base-rate variables are. A variable name colliding
+    with a ``data_source.variables`` column is rejected (it would shadow the read).
+    """
+    seg_vars = _segment_level_variables(data_source)
+    if not seg_vars:
+        return {}
+    base_cols = set(data_source.get("variables", {}))
+    out: dict[str, np.ndarray] = {}
+    for level_key, mapping in seg_vars.items():
+        lvl = levels[level_key]
+        link = lvl["link"]
+        index_base = int(link.get("index_base", 0))
+        ibeg_path = link["index_beg"].format(group=group)
+        cnt_path = link["count"].format(group=group)
+        link_data = h5obj.readDatasets([ibeg_path, cnt_path])
+        ibeg_arr = link_data[ibeg_path]
+        cnt_arr = link_data[cnt_path]
+        for col_name, tmpl in mapping.items():
+            if col_name in base_cols:
+                raise ValueError(
+                    f"segment-level variable '{col_name}' on level '{level_key}' "
+                    f"collides with a data_source.variables column"
+                )
+            seg_path = tmpl.format(group=group)
+            seg_values = np.asarray(h5obj.readDatasets([seg_path])[seg_path])
+            out[col_name] = _broadcast_segment_to_base(
+                seg_values, ibeg_arr, cnt_arr, index_base, n_base
+            )
+    return out
+
+
 def _predicate_mask(arr: np.ndarray, f: dict) -> np.ndarray:
     """Build a 1-D boolean keep-mask for one structured predicate (issue #43).
 
@@ -1266,11 +1374,26 @@ def _planned_read_group(
     if keep_mask is not None and np.sum(keep_mask) == 0:
         return None
 
+    # Segment-level variables (issue #30): read each declared non-base-level
+    # variable and broadcast it to a base-rate per-photon column (length n_base),
+    # then subset to the concatenated planned indices so it lines up with the
+    # base-rate variables before the spatial / keep masks below.
+    seg_broadcasts = _read_segment_broadcasts(h5obj, group, data_source, levels, n_base)
+    if seg_broadcasts:
+        seg_global_idx = np.concatenate(
+            [np.arange(s, e, dtype=np.int64) for s, e in plan.base_slices]
+        )
+
     # Build the data dict (variables sliced to mask_spatial, then to keep_mask).
     leaf_after_spatial = leaf_ids[mask_spatial]
     data_dict: dict[str, np.ndarray] = {}
     for col_name, path in var_paths.items():
         values = arrays_by_path[path][mask_spatial]
+        if keep_mask is not None:
+            values = values[keep_mask]
+        data_dict[col_name] = values
+    for col_name, base_values in seg_broadcasts.items():
+        values = base_values[seg_global_idx][mask_spatial]
         if keep_mask is not None:
             values = values[keep_mask]
         data_dict[col_name] = values
@@ -1474,11 +1597,21 @@ def _read_group_full(
     if keep_mask is not None and np.sum(keep_mask) == 0:
         return None
 
+    # Segment-level variables (issue #30): read each declared non-base-level
+    # variable and broadcast it to a base-rate per-photon column (length len(lats))
+    # so it can be sliced through the same masks as the base-rate variables below.
+    seg_broadcasts = _read_segment_broadcasts(h5obj, group, data_source, levels or {}, len(lats))
+
     # Build dataframe (variables sliced to spatial mask, then to the keep-mask)
     leaf_sliced = leaf_ids[min_idx:max_idx][mask_sliced]
     data_dict = {}
     for col_name, path in var_paths.items():
         values = data[path][mask_sliced]
+        if keep_mask is not None:
+            values = values[keep_mask]
+        data_dict[col_name] = values
+    for col_name, base_values in seg_broadcasts.items():
+        values = base_values[min_idx:max_idx][mask_sliced]
         if keep_mask is not None:
             values = values[keep_mask]
         data_dict[col_name] = values
