@@ -257,3 +257,89 @@ class TestTDigestDeltaSweep:
         # Centroid count should grow sub-linearly with δ (proportional, not more).
         ratio = len(digest) / delta
         assert ratio <= 4.0, f"delta={delta}: centroid/delta ratio {ratio:.2f} > 4.0"
+
+
+class TestScaleFunctionRegression:
+    """Guards against the k1-budget regression where δ was inverted.
+
+    Before the scale-function fix the per-centroid weight cap was proportional
+    to δ (and independent of n), so larger δ produced *fewer*, coarser centroids
+    and even a handful of points collapsed to a single centroid. These tests pin
+    the correct behavior: δ is a resolution knob, the digest saturates at ~δ
+    centroids, and it is loss-free until the count exceeds δ.
+    """
+
+    @pytest.mark.parametrize("n", [10, 100, 500])
+    def test_loss_free_when_count_at_most_delta(self, n):
+        """With n ≤ δ every observation is kept as its own weight-1 centroid."""
+        rng = np.random.default_rng(n)
+        vals = rng.standard_normal(n)  # distinct values w.p. 1
+        digest = build_tdigest(vals, delta=512)
+        assert digest.shape[0] == n, f"n={n}: expected {n} centroids, got {digest.shape[0]}"
+        np.testing.assert_array_equal(digest[:, 1], np.ones(n, dtype=np.float32))
+
+    def test_compression_begins_past_delta(self):
+        """Once n exceeds δ the digest must actually compress (k < n)."""
+        rng = np.random.default_rng(1)
+        delta = 256
+        vals = rng.standard_normal(4 * delta)
+        digest = build_tdigest(vals, delta=delta)
+        assert digest.shape[0] < len(vals)
+        np.testing.assert_almost_equal(float(digest[:, 1].sum()), len(vals), decimal=4)
+
+    def test_delta_controls_resolution_not_inverted(self):
+        """More δ ⇒ more centroids. The old budget did the opposite."""
+        rng = np.random.default_rng(2)
+        vals = rng.standard_normal(50_000)
+        counts = [build_tdigest(vals, delta=d).shape[0] for d in (128, 256, 512, 1024)]
+        assert counts == sorted(counts), f"centroid count not monotonic in δ: {counts}"
+        assert counts[-1] > 2 * counts[0], f"δ=1024 barely finer than δ=128: {counts}"
+
+    @pytest.mark.parametrize("n", [50_000, 200_000])
+    def test_centroid_count_saturates_near_delta(self, n):
+        """Count stays ~δ regardless of n (≤ 2δ), instead of growing with n."""
+        rng = np.random.default_rng(n)
+        vals = rng.standard_normal(n)
+        k = build_tdigest(vals, delta=256).shape[0]
+        assert k <= 2 * 256, f"n={n}: {k} centroids exceeds 2·δ"
+
+    def test_accuracy_not_degraded_at_high_delta_on_structured_data(self):
+        """On a bimodal mixture, large δ must stay accurate.
+
+        This is the user-visible symptom of the inversion bug: interior-quantile
+        error blew up as δ grew (≈0.33 here at δ=1024 — ~60× the δ=128 error).
+        A correct digest keeps high-δ error small and comparable to low-δ.
+        """
+        rng = np.random.default_rng(3)
+        vals = np.concatenate([rng.normal(-3, 0.3, 5000), rng.normal(3, 0.3, 5000)])
+        qs = [0.1, 0.25, 0.5, 0.75, 0.9]
+        exact = np.quantile(vals, qs)
+
+        def mean_err(delta):
+            d = build_tdigest(vals, delta=delta)
+            est = np.array([quantile_from_tdigest(d, q) for q in qs])
+            return float(np.abs(est - exact).mean())
+
+        err_lo, err_hi = mean_err(128), mean_err(1024)
+        assert err_hi < 0.05, f"δ=1024 interior error {err_hi:.4f} too large"
+        assert err_hi < 5 * err_lo, f"δ=1024 error {err_hi:.4f} >> δ=128 error {err_lo:.4f}"
+
+    @pytest.mark.parametrize("q", [0.02, 0.25, 0.5, 0.75, 0.98])
+    def test_quantiles_track_exact_within_tolerance(self, q):
+        """Estimated quantiles track exact numpy quantiles (independent ground truth)."""
+        rng = np.random.default_rng(4)
+        vals = rng.standard_normal(20_000)
+        digest = build_tdigest(vals, delta=512)
+        est = quantile_from_tdigest(digest, q)
+        exact = float(np.quantile(vals, q))
+        assert abs(est - exact) < 0.05, f"q={q}: est={est:.4f} exact={exact:.4f}"
+
+    def test_merge_saturates_near_delta(self):
+        """Merging two saturated digests stays ~δ, not 2δ-and-growing."""
+        rng = np.random.default_rng(5)
+        delta = 512
+        d1 = build_tdigest(rng.standard_normal(50_000), delta=delta)
+        d2 = build_tdigest(rng.standard_normal(50_000), delta=delta)
+        merged = merge_tdigests(d1, d2, delta=delta)
+        assert merged.shape[0] <= 2 * delta
+        np.testing.assert_almost_equal(float(merged[:, 1].sum()), 100_000, decimal=3)
