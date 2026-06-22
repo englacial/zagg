@@ -278,6 +278,15 @@ class TestScaleFunctionRegression:
         assert digest.shape[0] == n, f"n={n}: expected {n} centroids, got {digest.shape[0]}"
         np.testing.assert_array_equal(digest[:, 1], np.ones(n, dtype=np.float32))
 
+    def test_loss_free_transition_at_delta_boundary(self):
+        """n == δ is the exact loss-free/compress boundary the fix pins."""
+        delta = 256
+        rng = np.random.default_rng(99)
+        at = build_tdigest(rng.standard_normal(delta), delta=delta)
+        over = build_tdigest(rng.standard_normal(delta + 1), delta=delta)
+        assert at.shape[0] == delta, f"n==δ should be loss-free, got k={at.shape[0]}"
+        assert over.shape[0] < delta + 1, f"n>δ must compress, got k={over.shape[0]}"
+
     def test_compression_begins_past_delta(self):
         """Once n exceeds δ the digest must actually compress (k < n)."""
         rng = np.random.default_rng(1)
