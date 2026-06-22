@@ -16,7 +16,7 @@ import logging
 import os
 import time
 import warnings
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import ThreadPoolExecutor
 
 from zarr import consolidate_metadata
 
@@ -39,7 +39,9 @@ from zagg.config import (
 from zagg.dispatch import (
     LAMBDA_PRICE_PER_GB_SEC,
     LAMBDA_RETRY,
+    LOCAL_RETRY,
     LambdaExecutor,
+    LocalExecutor,
     PreflightReport,
     dispatch,
 )
@@ -315,7 +317,15 @@ def _run_local(config, catalog_data, store_path, child_order, *,
                max_cells, morton_cell, max_workers, overwrite, dry_run, region,
                driver="s3", output_credentials=None, output_endpoint_url=None,
                handoff="pandas"):
-    """Run processing locally with ThreadPoolExecutor."""
+    """Run processing locally via the generic dispatch loop on a thread pool.
+
+    This is the trivial backend: a :class:`~zagg.dispatch.LocalExecutor` over a
+    ``ThreadPoolExecutor`` with no metered cost. Per-cell exception handling
+    differs from Lambda -- a raised cell exception is *counted* as an error and
+    the run continues (Lambda instead only surfaces its run-fatal errno-24) --
+    so the work callable catches and tags exceptions and ``_accumulate``
+    reproduces the original counting exactly, keeping the summary byte-identical.
+    """
     all_shards = list(catalog_data["shard_keys"])
 
     cells = _select_cells(catalog_data, morton_cell=morton_cell, max_cells=max_cells)
@@ -347,55 +357,69 @@ def _run_local(config, catalog_data, store_path, child_order, *,
     )
     zarr_store = grid.emit_template(zarr_store, overwrite=overwrite)
 
-    start_time = time.time()
-    total_obs = 0
-    cells_with_data = 0
-    cells_error = 0
-    results = []
-
-    with ThreadPoolExecutor(max_workers=max_workers) as executor:
-        futures = {
-            executor.submit(
-                _process_and_write,
+    # Per-cell work, catching its own exceptions so one bad cell counts as an
+    # error and the run continues (the old loop's ``except`` branch). The
+    # outcome is tagged in a private envelope the accumulator unpacks; on the
+    # error path nothing is appended to ``results``, matching the old behavior.
+    def _cell_work(payload):
+        shard_key, records = payload
+        try:
+            meta = _process_and_write(
                 shard_key, grid.block_index(int(shard_key)), records,
                 grid,
                 s3_creds, zarr_store, config,
                 driver=driver, handoff=handoff,
-            ): shard_key
-            for shard_key, records in cells
-        }
+            )
+            return {"shard_key": shard_key, "ok": True, "meta": meta}
+        except Exception as e:
+            return {"shard_key": shard_key, "ok": False, "error": e}
 
-        for i, future in enumerate(as_completed(futures), 1):
-            shard_key = futures[future]
-            try:
-                meta = future.result()
-                results.append(meta)
-                if meta.get("error"):
-                    logger.info(f"  [{i}/{len(cells)}] {shard_key}: {meta['error']}")
-                else:
-                    obs = meta.get("total_obs", 0)
-                    total_obs += obs
-                    cells_with_data += 1
-                    if i % 10 == 0 or len(cells) <= 20:
-                        logger.info(f"  [{i}/{len(cells)}] {shard_key}: {obs:,} obs")
-            except Exception as e:
-                cells_error += 1
-                logger.warning(f"  [{i}/{len(cells)}] {shard_key}: ERROR {e}")
+    executor = LocalExecutor(
+        _cell_work, max_workers=max_workers, pool_factory=ThreadPoolExecutor,
+    )
+    executor.preflight(len(cells))
+
+    n = len(cells)
+
+    def _accumulate(report, i, outcome):
+        shard_key = outcome["shard_key"]
+        if not outcome["ok"]:
+            report.cells_error += 1
+            logger.warning(f"  [{i}/{n}] {shard_key}: ERROR {outcome['error']}")
+            return
+        meta = outcome["meta"]
+        report.results.append(meta)
+        if meta.get("error"):
+            logger.info(f"  [{i}/{n}] {shard_key}: {meta['error']}")
+        else:
+            obs = meta.get("total_obs", 0)
+            report.total_obs += obs
+            report.cells_with_data += 1
+            if i % 10 == 0 or n <= 20:
+                logger.info(f"  [{i}/{n}] {shard_key}: {obs:,} obs")
+
+    start_time = time.time()
+    try:
+        report = dispatch(
+            executor, cells, retry=LOCAL_RETRY, accumulate=_accumulate,
+        )
+    finally:
+        executor.shutdown()
 
     consolidate_metadata(zarr_store, zarr_format=3)
     wall_time = time.time() - start_time
 
     summary = {
         "total_cells": len(cells),
-        "cells_with_data": cells_with_data,
-        "cells_error": cells_error,
-        "total_obs": total_obs,
+        "cells_with_data": report.cells_with_data,
+        "cells_error": report.cells_error,
+        "total_obs": report.total_obs,
         "wall_time_s": wall_time,
         "store_path": store_path,
         "backend": "local",
-        "results": results,
+        "results": report.results,
     }
-    logger.info(f"Done: {cells_with_data} cells, {total_obs:,} obs, {cells_error} errors, {wall_time:.1f}s")
+    logger.info(f"Done: {report.cells_with_data} cells, {report.total_obs:,} obs, {report.cells_error} errors, {wall_time:.1f}s")
     return summary
 
 
