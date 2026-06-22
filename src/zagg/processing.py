@@ -8,7 +8,7 @@ cloud platforms or local processing environments.
 import logging
 import warnings
 from datetime import datetime
-from typing import List, Tuple
+from typing import Any, List, Tuple
 
 import h5coro
 import numpy as np
@@ -22,6 +22,7 @@ from zagg.config import (
     evaluate_filter_expression,
     filters_from_data_source,
     get_agg_fields,
+    get_chunk_precompute,
     get_data_vars,
     get_output_signature,
 )
@@ -160,6 +161,72 @@ def _concat_and_group(all_reads, grid, handoff: str):
         cell_col = grid.cells_of(df_all["leaf_id"].values)
         col_arrays, cell_to_slice = _build_groups(df_all, cell_col)
     return col_arrays, cell_to_slice, n_obs_total
+
+
+def _eval_chunk_precompute(config: PipelineConfig, pooled: dict[str, np.ndarray]) -> dict[str, Any]:
+    """Evaluate the ``chunk_precompute`` entries ONCE over a shard's pooled columns.
+
+    The per-chunk precompute hook (issue #30, item 1) is the "compute once per
+    chunk, use per cell" primitive: each named entry is evaluated a single time
+    over the shard's *pooled* column arrays (all beams/granules concatenated,
+    before the per-cell split), yielding a chunk-level scalar. Those scalars are
+    then injected into the per-cell expression namespace by :func:`process_shard`
+    so a per-cell ``expression`` (e.g. a 128-bin waveform window) can reference a
+    chunk-uniform anchor instead of recomputing a per-cell one.
+
+    Evaluation mirrors :func:`calculate_cell_statistics`: an ``expression`` entry
+    runs through ``_eval_expression_raw`` over the pooled columns; a ``function``
+    entry resolves via ``resolve_function`` and is applied to the entry's
+    ``source`` column (with ``params`` resolved the same way as agg fields). The
+    optional ``dtype`` casts the scalar.
+
+    Returns an empty dict when no ``chunk_precompute`` block is present, so the
+    per-cell path is byte-for-byte unchanged for configs that do not use the hook.
+
+    Parameters
+    ----------
+    config : PipelineConfig
+        Drives the ``chunk_precompute`` entries.
+    pooled : dict[str, np.ndarray]
+        Pooled column arrays for the whole shard (e.g. ``col_arrays`` from
+        :func:`_concat_and_group`). Order does not matter — these are chunk-level
+        reductions over the full shard.
+
+    Returns
+    -------
+    dict[str, object]
+        ``{name: scalar}`` for each ``chunk_precompute`` entry.
+    """
+    from zagg.config import _eval_expression_raw, resolve_function
+
+    entries = get_chunk_precompute(config)
+    if not entries:
+        return {}
+
+    out: dict[str, Any] = {}
+    for name, meta in entries.items():
+        expression = meta.get("expression")
+        if expression is not None:
+            value = _eval_expression_raw(expression, pooled)
+        else:
+            source = meta["source"]
+            values = pooled[source]
+            params = dict(meta.get("params", {}))
+            resolved_params = {}
+            for pkey, pval in params.items():
+                if isinstance(pval, str) and pval in pooled:
+                    resolved_params[pkey] = pooled[pval]
+                elif isinstance(pval, str) and any(c in pval for c in pooled):
+                    ns = {"__builtins__": {}, "np": np, "numpy": np, **pooled}
+                    resolved_params[pkey] = eval(pval, ns)  # noqa: S307
+                else:
+                    resolved_params[pkey] = pval
+            value = resolve_function(meta["function"])(values, **resolved_params)
+        dtype = meta.get("dtype")
+        if dtype is not None:
+            value = np.dtype(dtype).type(value)
+        out[name] = value
+    return out
 
 
 def _has_vector_fields(config: PipelineConfig) -> bool:
@@ -351,7 +418,7 @@ def _iter_carrier_columns(carrier):
 
 
 def calculate_cell_statistics(
-    cell_data: dict[str, np.ndarray],
+    cell_data: dict[str, Any],
     value_col: str = "h_li",
     sigma_col: str = "s_li",
     config: PipelineConfig | None = None,
@@ -376,9 +443,11 @@ def calculate_cell_statistics(
 
     Parameters
     ----------
-    cell_data : dict[str, np.ndarray]
-        Column arrays for a single cell. Keys are column names; values are
-        numpy arrays of equal length.
+    cell_data : dict[str, Any]
+        Eval namespace for a single cell. Keys are column names; values are
+        numpy arrays of equal length. May also carry chunk-level scalars injected
+        by the per-chunk precompute hook (issue #30), which a per-cell expression
+        can reference by name.
     value_col : str
         Column name for elevation values.
     sigma_col : str
@@ -1459,6 +1528,15 @@ def process_shard(
                 "handoff='arrow-kernel' does not support ragged fields (issue #48); "
                 "use handoff='pandas' or 'arrow' instead"
             )
+        if get_chunk_precompute(config):
+            # The kernel path's fallback loop reduces each cell independently and
+            # has no seam to inject the shard-pooled chunk scalars; rather than
+            # silently drop them, reject the combination (the experimental kernel
+            # path is opt-in — pandas/arrow carry chunk_precompute fully).
+            raise NotImplementedError(
+                "handoff='arrow-kernel' does not support aggregation.chunk_precompute "
+                "(issue #30); use handoff='pandas' or 'arrow' instead"
+            )
         import pyarrow as pa
 
         table = pa.concat_tables(all_reads).combine_chunks()
@@ -1478,6 +1556,14 @@ def process_shard(
         # agnostic; both carriers feed identical numpy arrays into _group_columns).
         col_arrays, cell_to_slice, n_obs_total = _concat_and_group(all_reads, grid, handoff)
         logger.info(f"  Read {n_obs_total:,} observations")
+
+        # Per-chunk precompute hook (issue #30, item 1): evaluate each
+        # ``chunk_precompute`` entry ONCE over the shard's pooled columns, then
+        # inject the resulting chunk-level scalars into every cell's namespace so a
+        # per-cell expression can reference a chunk-uniform anchor (e.g. the 128-bin
+        # waveform window). Empty when the block is absent, so the per-cell path is
+        # byte-for-byte unchanged for configs that do not use the hook.
+        chunk_scalars = _eval_chunk_precompute(config, col_arrays)
         logger.info(f"  Calculating statistics for {len(children)} cells...")
 
         n_cells = len(children)
@@ -1517,8 +1603,13 @@ def process_shard(
                 cells_with_data += 1
             else:
                 cell_data = _empty
+            # Inject the chunk-level scalars into this cell's namespace (no-op when
+            # ``chunk_scalars`` is empty, so non-precompute configs are unchanged).
+            cell_namespace: dict[str, Any] = (
+                {**cell_data, **chunk_scalars} if chunk_scalars else cell_data
+            )
             stats = calculate_cell_statistics(
-                cell_data, value_col="h_li", sigma_col="s_li", config=config
+                cell_namespace, value_col="h_li", sigma_col="s_li", config=config
             )
             for key, value in stats.items():
                 if key in ragged_payloads:
