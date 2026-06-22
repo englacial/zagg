@@ -418,6 +418,9 @@ class TestMortonCoordinate:
         words = morton_words(coord)
         np.testing.assert_array_equal(words, np.asarray(cells, dtype=np.uint64))
         assert words.dtype == np.uint64
+        # The southern children set bit 63: non-negative as uint64, but at least
+        # one would have read back negative under the old int64 coordinate.
+        assert (words.view(np.int64) < 0).any()
         # Round-trips losslessly back through the uint64 storage form.
         np.testing.assert_array_equal(morton_words(to_morton_array(words)), words)
 
@@ -451,6 +454,9 @@ class TestMortonCoordinate:
         stored = grp["morton"][lo : hi + 1]
         expected = morton_words(coords["morton"])
         np.testing.assert_array_equal(stored, expected)
-        assert (stored >= 0).all()
+        # The southern parent's order-8 children set bit 63: under the old int64
+        # coordinate at least one word would have read back negative. As uint64
+        # they are stored intact (this is the sign hazard #71 removes).
+        assert stored.view(np.int64).min() < 0
         # Reconstructs to the same MortonIndexArray on read.
         np.testing.assert_array_equal(morton_words(to_morton_array(stored)), expected)

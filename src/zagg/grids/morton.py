@@ -22,6 +22,15 @@ from __future__ import annotations
 import numpy as np
 
 
+def is_morton_array(values) -> bool:
+    """True if ``values`` is a mortie ``MortonIndexArray``."""
+    try:
+        from mortie import MortonIndexArray
+    except ImportError:  # pragma: no cover - mortie is a hard dependency
+        return False
+    return isinstance(values, MortonIndexArray)
+
+
 def morton_words(values) -> np.ndarray:
     """Return the packed ``uint64`` Morton words for ``values``.
 
@@ -30,9 +39,8 @@ def morton_words(values) -> np.ndarray:
     ``uint64`` ndarray). This is the on-disk / wire form of the ``morton``
     coordinate.
     """
-    data = getattr(values, "_data", None)
-    if data is not None:
-        return np.asarray(data, dtype=np.uint64)
+    if is_morton_array(values):
+        return np.asarray(values._data, dtype=np.uint64)
     return np.asarray(values, dtype=np.uint64)
 
 
@@ -47,13 +55,4 @@ def to_morton_array(words):
     return MortonIndexArray.from_words(np.asarray(words, dtype=np.uint64))
 
 
-def is_morton_array(values) -> bool:
-    """True if ``values`` is a mortie ``MortonIndexArray``."""
-    try:
-        from mortie import MortonIndexArray
-    except ImportError:  # pragma: no cover - mortie is a hard dependency
-        return False
-    return isinstance(values, MortonIndexArray)
-
-
-__all__ = ["morton_words", "to_morton_array", "is_morton_array"]
+__all__ = ["is_morton_array", "morton_words", "to_morton_array"]
