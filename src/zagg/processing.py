@@ -1035,12 +1035,16 @@ def _broadcast_segment_to_base(
 
     Each coarse parent ``p`` covers base-rate rows ``index_beg_arr[p] - index_base``
     through ``... + count_arr[p] - 1`` (the same contiguous parent->child tiling
-    :func:`_expand_mask_to_base` expands a mask over). Where that tiling is
-    contiguous and ordered this equals ``np.repeat(seg_values, count_arr)``; placing
-    by ``index_beg`` keeps it robust to the same gap/order cases the mask path
-    handles. The returned array carries each photon's segment value (e.g. ``dem_h``,
-    one value per ~100 photons) so it can ride alongside the base-rate variables
-    through the read plan's spatial/keep masks.
+    :func:`_expand_mask_to_base` expands a mask over). Under #43's contiguity
+    assumption (ranges do not overlap and together tile the full base array) this
+    equals ``np.repeat(seg_values, count_arr)``; placing by ``index_beg`` keeps the
+    per-parent value correctly positioned even when ``index_beg`` is shifted
+    (``index_base``). Any base row left untiled (a gap, if the contiguity assumption
+    is violated) is filled with ``NaN`` for float dtypes so it surfaces as a missing
+    value rather than uninitialized garbage; non-float dtypes are zero-filled. The
+    returned array carries each photon's segment value (e.g. ``dem_h``, one value per
+    ~100 photons) so it can ride alongside the base-rate variables through the read
+    plan's spatial/keep masks.
 
     Parameters
     ----------
@@ -1053,8 +1057,20 @@ def _broadcast_segment_to_base(
     -------
     np.ndarray
         1-D array of length ``total_base_size`` and ``seg_values``' dtype.
+
+    Raises
+    ------
+    ValueError
+        If a parent's range starts before 0 or extends past ``total_base_size``
+        (a tiling that does not fit the declared base size — e.g. a segment-level
+        variable on a level whose link does not match the read's base extent).
     """
-    out = np.empty(total_base_size, dtype=seg_values.dtype)
+    # NaN-fill floats so an untiled gap reads as missing, not garbage (the mask path
+    # is safe-by-construction with np.zeros; a value array has no such safe default).
+    if np.issubdtype(seg_values.dtype, np.floating):
+        out = np.full(total_base_size, np.nan, dtype=seg_values.dtype)
+    else:
+        out = np.zeros(total_base_size, dtype=seg_values.dtype)
     for p in range(len(seg_values)):
         beg = int(index_beg_arr[p]) - index_base
         if beg < 0:
@@ -1062,6 +1078,11 @@ def _broadcast_segment_to_base(
                 f"index_beg_arr[{p}]={index_beg_arr[p]} is less than index_base={index_base}"
             )
         cnt = int(count_arr[p])
+        if beg + cnt > total_base_size:
+            raise ValueError(
+                f"segment {p} range [{beg}:{beg + cnt}] exceeds base size {total_base_size}; "
+                f"the segment-level variable's link does not tile the read's base extent"
+            )
         out[beg : beg + cnt] = seg_values[p]
     return out
 

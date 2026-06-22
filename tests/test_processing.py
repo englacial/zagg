@@ -2500,6 +2500,43 @@ class TestSegmentLevelVariables:
         assert df["h"].tolist() == [20.0, 30.0, 40.0, 50.0]
         assert df["dem_h"].tolist() == [20.0, 20.0, 30.0, 30.0]
 
+    def test_planned_partial_read_aligns_dem_h_under_base_filter(self):
+        # Planned (partial) read with a base-level filter stacked on top of the
+        # seg-variable broadcast: each surviving photon must still carry its own
+        # segment's dem_h after the keep mask.
+        ds = _planned_read_data_source(with_base_filter=True)
+        ds["levels"]["segments"]["variables"] = {"dem_h": "/seg/dem_h"}
+        # qs drops photon 3 (within the selected seg 1) so the keep mask is exercised.
+        qs = np.zeros(12, dtype=np.int8)
+        qs[3] = 1
+        h5 = _planned_read_h5(qs=qs)
+        h5._arrays["/seg/dem_h"] = np.array([10.0, 20.0, 30.0, 40.0, 50.0, 60.0], dtype=np.float32)
+        grid = _BboxGrid((-0.1, 175.0, 0.1, 225.0))
+        df = _read_group(h5, "gt1l", ds, 0, grid)
+        # Selected photons 2,3 (seg 1) + 4,5 (seg 2); qs drops photon 3.
+        assert df["h"].tolist() == [20.0, 40.0, 50.0]
+        assert df["dem_h"].tolist() == [20.0, 30.0, 30.0]
+
+    def test_broadcast_out_of_bounds_raises(self):
+        # A segment range extending past the base size (e.g. a seg-variable level
+        # whose link does not tile the read's base extent) is rejected, not silently
+        # written out of bounds.
+        seg = np.array([1.0, 2.0])
+        ibeg = np.array([0, 2])
+        cnt = np.array([2, 5])  # second range [2:7] exceeds base size 4
+        with pytest.raises(ValueError, match="exceeds base size"):
+            _broadcast_segment_to_base(seg, ibeg, cnt, index_base=0, total_base_size=4)
+
+    def test_broadcast_gap_fills_nan_for_float(self):
+        # An untiled gap (contiguity violated) surfaces as NaN for float dtypes,
+        # not uninitialized garbage.
+        seg = np.array([1.0, 2.0], dtype=np.float32)
+        ibeg = np.array([0, 3])  # base index 2 left untiled
+        cnt = np.array([2, 1])
+        out = _broadcast_segment_to_base(seg, ibeg, cnt, index_base=0, total_base_size=4)
+        assert out[0] == 1.0 and out[1] == 1.0 and out[3] == 2.0
+        assert np.isnan(out[2])
+
     def test_no_segment_variables_is_inert(self):
         # A hierarchical config whose non-base level uses the documentation-only
         # ``list[str]`` variables form (NOT the mapping) triggers no broadcast: the

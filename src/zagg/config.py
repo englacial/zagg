@@ -718,6 +718,7 @@ def _validate_levels(data_source: dict) -> None:
             f"(available: {sorted(levels)})"
         )
     base_vars = set(data_source.get("variables", {}))
+    seg_var_names: set[str] = set()  # segment-variable names seen across non-base levels
     level_keys = set(levels)
     for name, lvl in levels.items():
         if not isinstance(lvl, dict):
@@ -752,6 +753,15 @@ def _validate_levels(data_source: dict) -> None:
                         f"levels.{name}.variables.{var_name}: collides with a "
                         f"data_source.variables column"
                     )
+                # Two non-base levels declaring the same name would silently
+                # overwrite each other when broadcast into one per-photon column
+                # (the read keys by name); reject the ambiguity.
+                if var_name in seg_var_names:
+                    raise ValueError(
+                        f"levels.{name}.variables.{var_name}: a segment-level "
+                        f"variable named {var_name!r} is already declared on another level"
+                    )
+                seg_var_names.add(var_name)
         link = lvl.get("link")
         if link is None:
             if name != base_level:

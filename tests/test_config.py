@@ -848,6 +848,29 @@ class TestSegmentLevelVariables:
         with pytest.raises(ValueError, match="collides with a data_source.variables column"):
             validate_config(self._cfg({"h": "/{group}/geophys_corr/dem_h"}))
 
+    def test_duplicate_segment_variable_across_levels_rejected(self):
+        # Two non-base levels declaring the same name would silently overwrite each
+        # other when broadcast into one per-photon column; reject the ambiguity.
+        ds = _minimal_two_level_ds()
+        ds["levels"]["segments"]["variables"] = {"dem_h": "/{group}/geophys_corr/dem_h"}
+        ds["levels"]["coarse"] = {
+            "path": "/{group}/other",
+            "coordinates": [],
+            "variables": {"dem_h": "/{group}/other/dem_h"},
+            "link": {
+                "to": "photons",
+                "index_beg": "/{group}/other/ph_index_beg",
+                "count": "/{group}/other/ph_cnt",
+            },
+        }
+        cfg = PipelineConfig(
+            data_source=ds,
+            aggregation={"variables": {"c": {"function": "len", "dtype": "int32"}}},
+            output={"grid": {"type": "healpix", "parent_order": 6, "child_order": 12}},
+        )
+        with pytest.raises(ValueError, match="already declared on another level"):
+            validate_config(cfg)
+
     def test_worked_template_declares_dem_h_segment_variable(self):
         cfg = load_config("src/zagg/configs/atl03_waveform_chunk.yaml")
         validate_config(cfg)
