@@ -52,7 +52,7 @@ carries ~2× more centroids and is more accurate near the tails.
 The boundary scan is the only remaining O(n) Python work.  For cells with very
 high observation counts (n ≫ centroid count), pass ``method="jump"`` to locate
 each boundary with ``np.searchsorted`` over the monotone k1 vector — O(centroids)
-iterations instead of O(n), ~15–29× faster at n ≥ 10k.  Output is identical to
+iterations instead of O(n), ~2× at n≈10k and ~4× at n≈100k.  Output is identical to
 the default ``method="loop"``; loop stays the better choice at n ≈ 250–1000
 where centroids ≈ n.
 
