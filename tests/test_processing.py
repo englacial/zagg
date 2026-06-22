@@ -2175,16 +2175,6 @@ class TestChunkPrecompute:
         np.testing.assert_array_equal(offsets, np.array([1.0, 101.0], dtype=np.float32))
         assert offsets[0] != offsets[1]
 
-    def test_absent_block_is_byte_identical(self, monkeypatch):
-        """A config WITHOUT chunk_precompute produces byte-for-byte identical output
-        to the same config evaluated through the (now chunk-aware) worker — i.e. the
-        hook is a pure no-op when the block is absent."""
-        df_a, _ = self._run_shard(monkeypatch, self._cfg(with_precompute=False))
-        # Re-run the identical no-precompute config; the per-cell path is unchanged.
-        df_b, _ = self._run_shard(monkeypatch, self._cfg(with_precompute=False))
-        assert df_a["offset"].to_numpy().tobytes() == df_b["offset"].to_numpy().tobytes()
-        assert df_a["count"].to_numpy().tobytes() == df_b["count"].to_numpy().tobytes()
-
     def test_arrow_kernel_rejects_chunk_precompute(self, monkeypatch):
         """The experimental kernel path has no seam to inject pooled scalars, so it
         rejects chunk_precompute rather than silently dropping it."""
@@ -2229,3 +2219,128 @@ class TestChunkPrecompute:
         assert gain[0] == gain[1]
         # chunk_offset = floor(median(pooled h_ph)) = floor(median([10,12,200,202])) = 106
         assert offset[0] == np.float32(np.floor(np.median([10.0, 12.0, 200.0, 202.0])))
+
+    def test_empty_cell_gets_chunk_anchor_not_nan(self, monkeypatch):
+        """An empty cell in a POPULATED chunk records the chunk-uniform anchor, not
+        NaN. The dense writer still emits a row for the empty cell; the field whose
+        expression is a bare chunk-precompute name must resolve to the shared scalar
+        so readers see a uniform anchor across the whole chunk (issue #30)."""
+        # Three children, but only cells 10 and 20 carry photons; cell 30 is empty.
+        leaf_to_cell = {1: 10, 2: 20}
+        children = [10, 20, 30]
+        grid = _KernelShardGrid(children, leaf_to_cell)
+        df = pd.DataFrame(
+            {
+                "h_ph": np.array([0.0, 2.0, 100.0, 102.0], dtype=np.float32),
+                "leaf_id": np.array([1, 1, 2, 2], dtype=np.int64),
+            }
+        )
+        TestProcessShardKernelBranch()._patch_reads(monkeypatch, [df])
+        df_out, _meta = process_shard(
+            grid, 0, ["s3://x"], s3_credentials={}, config=self._cfg(with_precompute=True)
+        )
+        offsets = df_out["offset"].to_numpy()
+        pooled_median = np.float32(np.median([0.0, 2.0, 100.0, 102.0]))
+        # Every cell — including the empty third one — carries the chunk anchor.
+        np.testing.assert_array_equal(offsets, np.full(3, pooled_median, dtype=np.float32))
+        assert not np.isnan(offsets[2])
+        # The empty cell still reports a zero obs count (the anchor is not data).
+        assert df_out["count"].to_numpy()[2] == 0
+
+    def test_non_scalar_precompute_rejected(self, monkeypatch):
+        """A chunk_precompute expression that does not reduce to a scalar is
+        rejected with a clear error rather than silently coerced/broadcast."""
+        from zagg.config import PipelineConfig
+
+        cfg = PipelineConfig(
+            data_source={"groups": ["gt1l"], "variables": {"h_ph": "/{group}/h_ph"}},
+            aggregation={
+                # np.floor(h_ph) is an ARRAY, not a chunk scalar.
+                "chunk_precompute": {"bad": {"expression": "np.floor(h_ph)", "source": "h_ph"}},
+                "variables": {
+                    "count": {
+                        "function": "len",
+                        "source": "h_ph",
+                        "dtype": "int32",
+                        "fill_value": 0,
+                    }
+                },
+            },
+            output={"grid": {"type": "healpix", "parent_order": 6, "child_order": 12}},
+        )
+        pooled = {"h_ph": np.array([1.0, 2.0, 3.0], dtype=np.float32)}
+        with pytest.raises(ValueError, match="must reduce to a scalar"):
+            _eval_chunk_precompute(cfg, pooled)
+
+    def test_missing_source_column_clear_error(self):
+        """A function precompute whose source is absent from the pooled dict raises
+        a clear config/data error, not a bare KeyError."""
+        from zagg.config import PipelineConfig
+
+        cfg = PipelineConfig(
+            data_source={"variables": {"h_ph": "/p", "other": "/o"}},
+            aggregation={
+                "chunk_precompute": {"m": {"function": "median", "source": "other"}},
+                "variables": {"count": {"function": "len", "source": "h_ph"}},
+            },
+            output={"grid": {"type": "healpix", "parent_order": 6, "child_order": 12}},
+        )
+        # Pooled dict only carries h_ph (e.g. 'other' was not read).
+        with pytest.raises(ValueError, match="source column 'other' is not present"):
+            _eval_chunk_precompute(cfg, {"h_ph": np.array([1.0, 2.0])})
+
+    def test_arrow_kernel_rejects_chunk_precompute_even_on_empty_reads(self, monkeypatch):
+        """The arrow-kernel + chunk_precompute incompatibility is a config property,
+        enforced before any read — so it still raises when every read comes back
+        empty (no rows), not only when there happens to be data (issue #30)."""
+        pytest.importorskip("pyarrow")
+        cfg = self._cfg(with_precompute=True)
+        grid = _KernelShardGrid([10, 20], {1: 10, 2: 20})
+        # No canned tables: every _read_group returns None, so all_reads is empty.
+        TestProcessShardKernelBranch()._patch_reads(monkeypatch, [])
+        with pytest.raises(NotImplementedError, match="chunk_precompute"):
+            process_shard(
+                grid, 0, ["s3://x"], s3_credentials={}, config=cfg, handoff="arrow-kernel"
+            )
+
+    def test_degenerate_single_photon_chunk_gain_floor(self, monkeypatch):
+        """The worked template's chunk_gain floors to 0.5 on a degenerate pooled
+        range (single photon / all-equal heights) WITHOUT a log2(0) divide-by-zero
+        warning — the range is clamped before log2 and the 0.5 m floor applies."""
+        pytest.importorskip("pyarrow")
+        cfg = default_config("atl03_waveform_chunk")
+        children = [10, 20]
+        grid = _KernelShardGrid(children, {1: 10, 2: 20})
+        # All photons share one height -> pooled range == 0 (degenerate).
+        df = pd.DataFrame(
+            {
+                "h_ph": np.array([42.0, 42.0], dtype=np.float32),
+                "leaf_id": np.array([1, 2], dtype=np.int64),
+            }
+        )
+        TestProcessShardKernelBranch()._patch_reads(monkeypatch, [df])
+        import warnings
+
+        with warnings.catch_warnings():
+            warnings.simplefilter("error")  # any RuntimeWarning would fail the test
+            tbl, _meta = process_shard(grid, 0, ["s3://x"], s3_credentials={}, config=cfg)
+        gain = tbl.column("gain_h").to_numpy(zero_copy_only=False)
+        np.testing.assert_array_equal(gain, np.full(2, np.float32(0.5)))
+
+    def test_absent_block_matches_plain_path_values(self, monkeypatch):
+        """A config WITHOUT chunk_precompute produces the SAME per-cell values the
+        plain (pre-hook) path would — proving the hook is a true no-op when absent,
+        not merely deterministic across two runs of the same new code. The expected
+        per-cell medians/counts are known independently (cell 10 -> median(0,2)=1,
+        cell 20 -> median(100,102)=101; two obs each)."""
+        df_out, _ = self._run_shard(monkeypatch, self._cfg(with_precompute=False))
+        np.testing.assert_array_equal(
+            df_out["offset"].to_numpy(), np.array([1.0, 101.0], dtype=np.float32)
+        )
+        np.testing.assert_array_equal(df_out["count"].to_numpy(), np.array([2, 2], dtype=np.int32))
+        # And the chunk-precompute config does NOT reproduce these per-cell values
+        # (it injects the pooled anchor instead), so the no-op claim is non-vacuous.
+        df_chunk, _ = self._run_shard(monkeypatch, self._cfg(with_precompute=True))
+        assert not np.array_equal(
+            df_chunk["offset"].to_numpy(), np.array([1.0, 101.0], dtype=np.float32)
+        )

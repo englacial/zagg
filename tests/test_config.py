@@ -438,6 +438,30 @@ class TestChunkPrecompute:
         with pytest.raises(ValueError, match="must be a mapping"):
             validate_config(cfg)
 
+    def test_name_colliding_with_column_rejected(self):
+        # A precompute name equal to a data_source.variables column would shadow the
+        # real column array with a 0-d scalar in the per-cell namespace merge.
+        cfg = _cfg_with_precompute({"h_ph": {"expression": "np.median(h_ph)", "source": "h_ph"}})
+        with pytest.raises(ValueError, match="chunk_precompute 'h_ph'.*collides"):
+            validate_config(cfg)
+
+    def test_name_colliding_with_leaf_id_rejected(self):
+        cfg = _cfg_with_precompute({"leaf_id": {"expression": "np.median(h_ph)", "source": "h_ph"}})
+        with pytest.raises(ValueError, match="chunk_precompute 'leaf_id'.*collides"):
+            validate_config(cfg)
+
+    def test_inter_precompute_reference_rejected_as_unknown_column(self):
+        # Inter-precompute references are unsupported: chunk_gain referencing
+        # chunk_offset is rejected as an unknown column (no chaining, single pass).
+        cfg = _cfg_with_precompute(
+            {
+                "chunk_offset": {"expression": "np.median(h_ph)", "source": "h_ph"},
+                "chunk_gain": {"expression": "chunk_offset + 1.0", "source": "h_ph"},
+            }
+        )
+        with pytest.raises(ValueError, match="chunk_offset"):
+            validate_config(cfg)
+
 
 # ---------------------------------------------------------------------------
 # Structured filters (issue #43, Phase A)

@@ -72,9 +72,12 @@ aggregation:
     # range uses ``np.max``/``np.min`` (not the ``ndarray.max()`` method): the
     # expression sandbox runs with an empty ``__builtins__``, where an ndarray
     # method call raises ``KeyError('__import__')`` but the functional numpy form
-    # is fine.
+    # is fine. The pooled range is floored at 1e-6 m BEFORE ``log2`` so a
+    # single-photon / all-equal-height shard (range == 0) does not hit
+    # ``log2(0) == -inf`` (a numpy divide-by-zero RuntimeWarning); the 0.5 m gain
+    # floor then still applies. Such degenerate shards are plausible at grid edges.
     chunk_gain:
-      expression: "np.float32(np.maximum(0.5, 2.0 ** np.ceil(np.log2((np.max(h_ph) - np.min(h_ph)) / 128.0))))"
+      expression: "np.float32(np.maximum(0.5, 2.0 ** np.ceil(np.log2(np.maximum(1e-6, np.max(h_ph) - np.min(h_ph)) / 128.0))))"
       source: h_ph
       dtype: float32
     chunk_offset:

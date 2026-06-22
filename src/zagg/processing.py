@@ -174,11 +174,20 @@ def _eval_chunk_precompute(config: PipelineConfig, pooled: dict[str, np.ndarray]
     so a per-cell ``expression`` (e.g. a 128-bin waveform window) can reference a
     chunk-uniform anchor instead of recomputing a per-cell one.
 
-    Evaluation mirrors :func:`calculate_cell_statistics`: an ``expression`` entry
-    runs through ``_eval_expression_raw`` over the pooled columns; a ``function``
-    entry resolves via ``resolve_function`` and is applied to the entry's
-    ``source`` column (with ``params`` resolved the same way as agg fields). The
-    optional ``dtype`` casts the scalar.
+    Evaluation follows :func:`calculate_cell_statistics`'s expression/function
+    dispatch: an ``expression`` entry runs through ``_eval_expression_raw`` over
+    the pooled columns; a ``function`` entry resolves via ``resolve_function`` and
+    is applied to the entry's ``source`` column (with ``params`` resolved the same
+    way as agg fields). The optional ``dtype`` casts the scalar. The result must
+    reduce to a scalar (``np.ndim(value) == 0``); a non-scalar is rejected.
+
+    It deliberately diverges from the per-cell path in two ways: (1) there is no
+    ``n_obs == 0`` short-circuit (these are shard-level reductions, evaluated once
+    over the pooled columns), and no ``len``/``count`` short-circuit (a
+    ``function: len`` precompute returns the pooled column length, not a cell
+    ``n_obs``); (2) entries are evaluated independently over ``pooled`` only, with
+    no defined order, so one entry cannot reference another's scalar (validation
+    rejects inter-precompute references — see ``_validate_chunk_precompute``).
 
     Returns an empty dict when no ``chunk_precompute`` block is present, so the
     per-cell path is byte-for-byte unchanged for configs that do not use the hook.
@@ -210,6 +219,14 @@ def _eval_chunk_precompute(config: PipelineConfig, pooled: dict[str, np.ndarray]
             value = _eval_expression_raw(expression, pooled)
         else:
             source = meta["source"]
+            if source not in pooled:
+                # The pooled dict only carries columns that were actually read for
+                # this shard; a validated config can still hit this if a read path
+                # omits the source. Raise a clear error rather than a bare KeyError.
+                raise ValueError(
+                    f"chunk_precompute '{name}': source column {source!r} is not "
+                    f"present in the shard's pooled data (available: {sorted(pooled)})"
+                )
             values = pooled[source]
             params = dict(meta.get("params", {}))
             resolved_params = {}
@@ -222,6 +239,13 @@ def _eval_chunk_precompute(config: PipelineConfig, pooled: dict[str, np.ndarray]
                 else:
                     resolved_params[pkey] = pval
             value = resolve_function(meta["function"])(values, **resolved_params)
+        # The hook's whole contract is a chunk-level *scalar*; an expression like
+        # ``np.floor(h_ph)`` (no reduction) returns an array that would be silently
+        # broadcast or mangled by the dtype cast and the per-cell namespace merge.
+        if np.ndim(value) != 0:
+            raise ValueError(
+                f"chunk_precompute '{name}' must reduce to a scalar, got shape {np.shape(value)}"
+            )
         dtype = meta.get("dtype")
         if dtype is not None:
             value = np.dtype(dtype).type(value)
@@ -466,9 +490,32 @@ def calculate_cell_statistics(
         config = default_config()
     agg_fields = get_agg_fields(config)
 
-    n_obs = len(next(iter(cell_data.values()))) if cell_data else 0
+    # ``n_obs`` must count a real (length-bearing) observation column, not a 0-d
+    # chunk-precompute scalar injected into the namespace (issue #30). Scalars have
+    # no ``len``; skip them so an empty cell whose namespace carries only scalars
+    # still reports n_obs == 0 rather than crashing on ``len`` of a 0-d value.
+    n_obs = next(
+        (len(v) for v in cell_data.values() if np.ndim(v) != 0),
+        0,
+    )
     if n_obs == 0:
-        return {name: _empty_cell_value(meta) for name, meta in agg_fields.items()}
+        # Empty cell: every agg field gets its sentinel EXCEPT a field whose
+        # ``expression`` is a bare chunk-precompute name. Those resolve to the
+        # chunk-uniform scalar (well-defined for an empty cell), so the dense
+        # writer's empty rows still carry the shared chunk anchor instead of NaN
+        # (issue #30 — every cell in a chunk shares one anchor).
+        empty = {}
+        for name, meta in agg_fields.items():
+            expr = meta.get("expression")
+            if expr is not None:
+                key = expr.strip()
+                if key.isidentifier() and key in cell_data and np.ndim(cell_data[key]) == 0:
+                    sig = get_output_signature(meta)
+                    if sig["kind"] == "scalar":
+                        empty[name] = float(cell_data[key])
+                        continue
+            empty[name] = _empty_cell_value(meta)
+        return empty
 
     result = {}
     for name, meta in agg_fields.items():
@@ -1414,6 +1461,16 @@ def process_shard(
         config = default_config()
     if handoff not in ("pandas", "arrow", "arrow-kernel"):
         raise ValueError(f"handoff must be 'pandas', 'arrow', or 'arrow-kernel', got {handoff!r}")
+    # Reject the unsupported arrow-kernel + chunk_precompute combination up front,
+    # before any read (issue #30). The kernel fallback loop reduces each cell
+    # independently and has no seam to inject the shard-pooled chunk scalars; this
+    # is a property of the *config*, not the data, so enforce it deterministically
+    # rather than only when some rows happen to be read.
+    if handoff == "arrow-kernel" and get_chunk_precompute(config):
+        raise NotImplementedError(
+            "handoff='arrow-kernel' does not support aggregation.chunk_precompute "
+            "(issue #30); use handoff='pandas' or 'arrow' instead"
+        )
     data_source = config.data_source
 
     shard_key = int(shard_key)
@@ -1528,15 +1585,8 @@ def process_shard(
                 "handoff='arrow-kernel' does not support ragged fields (issue #48); "
                 "use handoff='pandas' or 'arrow' instead"
             )
-        if get_chunk_precompute(config):
-            # The kernel path's fallback loop reduces each cell independently and
-            # has no seam to inject the shard-pooled chunk scalars; rather than
-            # silently drop them, reject the combination (the experimental kernel
-            # path is opt-in — pandas/arrow carry chunk_precompute fully).
-            raise NotImplementedError(
-                "handoff='arrow-kernel' does not support aggregation.chunk_precompute "
-                "(issue #30); use handoff='pandas' or 'arrow' instead"
-            )
+        # (arrow-kernel + chunk_precompute is rejected at the top of process_shard,
+        # before any read, so the combination never reaches this branch.)
         import pyarrow as pa
 
         table = pa.concat_tables(all_reads).combine_chunks()
