@@ -94,7 +94,7 @@ class TestSurface:
         assert ret is sentinel  # direct call returns the object
         reg = registry._REGISTRIES[kind]
         assert reg.get("demo") is sentinel
-        assert "demo" in reg.list()
+        assert "demo" in reg.names()
         assert "demo" in reg
 
     def test_register_decorator_form(self, kind, register_fn):
@@ -224,7 +224,7 @@ class TestDiscovery:
             _FakeEntryPoint("good", good_register),
         ]
         _patch_entry_points(monkeypatch, eps)
-        assert "good" in registry.REDUCERS.list()  # the broken one didn't abort discovery
+        assert "good" in registry.REDUCERS.names()  # the broken one didn't abort discovery
 
     def test_broken_register_is_skipped(self, monkeypatch):
         def bad_register():
@@ -235,7 +235,7 @@ class TestDiscovery:
 
         eps = [_FakeEntryPoint("bad", bad_register), _FakeEntryPoint("ok", good_register)]
         _patch_entry_points(monkeypatch, eps)
-        assert "ok" in registry.READERS.list()
+        assert "ok" in registry.READERS.names()
 
     def test_entry_points_lookup_failure_retries(self, monkeypatch):
         calls = {"n": 0}
@@ -261,12 +261,15 @@ class TestDiscovery:
         # A plugin whose register() itself calls get_* must not re-enter the sweep.
         def plugin_register():
             register_field_transform("a", object())
-            # Touch a get during discovery — should short-circuit, not recurse.
-            assert "a" in registry.FIELD_TRANSFORMS._entries
+            # Touch get/list during discovery — must short-circuit via the
+            # re-entrancy guard, not recurse into another sweep. These calls go
+            # through _ensure_discovered(); they hang/recurse if the guard breaks.
+            assert "a" in registry.FIELD_TRANSFORMS  # __contains__ -> _ensure_discovered
+            assert registry.FIELD_TRANSFORMS.names() == ["a"]
 
         _patch_entry_points(monkeypatch, [_FakeEntryPoint("p", plugin_register)])
         discover_plugins()
-        assert "a" in registry.FIELD_TRANSFORMS.list()
+        assert "a" in registry.FIELD_TRANSFORMS.names()
 
     def test_discover_plugins_force_reruns(self, monkeypatch):
         seen = {"n": 0}

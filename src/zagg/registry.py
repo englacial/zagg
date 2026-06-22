@@ -44,6 +44,7 @@ this module ships the seam alone — every registry starts empty.
 from __future__ import annotations
 
 import logging
+import threading
 from collections.abc import Callable, Iterable
 from dataclasses import dataclass
 from importlib import metadata
@@ -109,8 +110,13 @@ class Registry(Generic[T]):
         schema: Any | None = None,
         replace: bool = False,
     ):
-        """Register ``obj`` under ``name`` (or return a decorator if omitted)."""
+        """Register ``obj`` under ``name`` (or return a decorator if omitted).
+
+        ``schema`` is stored by reference and surfaced as-is by ``describe`` —
+        pass an immutable / owned object; the registry does not copy it.
+        """
         if obj is None:
+
             def _decorate(target: T) -> T:
                 self._set(name, target, description, schema, replace)
                 return target
@@ -135,7 +141,7 @@ class Registry(Generic[T]):
         except KeyError:
             raise UnknownCapability(name, self.kind, sorted(self._entries)) from None
 
-    def list(self) -> list[str]:
+    def names(self) -> list[str]:
         _ensure_discovered()
         return sorted(self._entries)
 
@@ -203,6 +209,12 @@ _REGISTRIES: dict[str, Registry] = {
 # a ``get`` during loading, we return early without re-running the sweep.
 _DISCOVERED = False
 _DISCOVERING = False
+# Guards the first-time sweep so concurrent ``get`` / ``names`` from worker
+# threads (the Lambda ThreadPoolExecutor) can't double-run discovery. Reentrant
+# so a plugin's ``register()`` calling back through ``get`` on the same thread
+# doesn't deadlock — though it short-circuits on ``_DISCOVERED`` before the lock
+# anyway, since that flag flips before the plugin loop runs.
+_DISCOVERY_LOCK = threading.RLock()
 
 
 def _ensure_discovered() -> None:
@@ -216,33 +228,36 @@ def _ensure_discovered() -> None:
     seam permanently).
     """
     global _DISCOVERED, _DISCOVERING
-    if _DISCOVERED or _DISCOVERING:
+    if _DISCOVERED:
         return
-    _DISCOVERING = True
-    try:
+    with _DISCOVERY_LOCK:
+        if _DISCOVERED or _DISCOVERING:
+            return
+        _DISCOVERING = True
         try:
-            eps: Iterable[metadata.EntryPoint] = metadata.entry_points(group=_ENTRY_POINT_GROUP)
-        except Exception:
-            logger.exception(
-                "zagg.plugins entry-point lookup failed; will retry on next get/list"
-            )
-            return  # Leave _DISCOVERED=False so subsequent calls retry.
-        # Flip the persistent flag before invoking plugins so a plugin's
-        # ``register()`` calling back through ``get`` short-circuits on
-        # ``_DISCOVERED`` and never re-enters the sweep.
-        _DISCOVERED = True
-        for ep in eps:
             try:
-                register_fn = ep.load()
+                eps: Iterable[metadata.EntryPoint] = metadata.entry_points(group=_ENTRY_POINT_GROUP)
             except Exception:
-                logger.exception("Failed to load zagg.plugins entry point %r", ep.name)
-                continue
-            try:
-                register_fn()
-            except Exception:
-                logger.exception("zagg.plugins entry point %r raised on register()", ep.name)
-    finally:
-        _DISCOVERING = False
+                logger.exception(
+                    "zagg.plugins entry-point lookup failed; will retry on next get/names"
+                )
+                return  # Leave _DISCOVERED=False so subsequent calls retry.
+            # Flip the persistent flag before invoking plugins so a plugin's
+            # ``register()`` calling back through ``get`` short-circuits on
+            # ``_DISCOVERED`` and never re-enters the sweep.
+            _DISCOVERED = True
+            for ep in eps:
+                try:
+                    register_fn = ep.load()
+                except Exception:
+                    logger.exception("Failed to load zagg.plugins entry point %r", ep.name)
+                    continue
+                try:
+                    register_fn()
+                except Exception:
+                    logger.exception("zagg.plugins entry point %r raised on register()", ep.name)
+        finally:
+            _DISCOVERING = False
 
 
 def discover_plugins(*, force: bool = False) -> None:
@@ -269,7 +284,7 @@ def discover_plugins(*, force: bool = False) -> None:
 def registry_snapshot() -> dict[str, list[str]]:
     """Name-only snapshot of every registry (diagnostics; coarse MCP view)."""
     _ensure_discovered()
-    return {kind: reg.list() for kind, reg in _REGISTRIES.items()}
+    return {kind: reg.names() for kind, reg in _REGISTRIES.items()}
 
 
 def describe_all() -> dict[str, list[dict[str, Any]]]:
@@ -304,7 +319,7 @@ def get_spatial_func(name: str) -> Callable:
 
 
 def list_spatial_funcs() -> list[str]:
-    return SPATIAL_FUNCS.list()
+    return SPATIAL_FUNCS.names()
 
 
 def register_reducer(name, factory=None, *, description="", schema=None, replace=False):
@@ -317,7 +332,7 @@ def get_reducer(name: str) -> Any:
 
 
 def list_reducers() -> list[str]:
-    return REDUCERS.list()
+    return REDUCERS.names()
 
 
 def register_mask_provider(name, provider=None, *, description="", schema=None, replace=False):
@@ -332,7 +347,7 @@ def get_mask_provider(name: str) -> Any:
 
 
 def list_mask_providers() -> list[str]:
-    return MASK_PROVIDERS.list()
+    return MASK_PROVIDERS.names()
 
 
 def register_field_transform(name, transform=None, *, description="", schema=None, replace=False):
@@ -347,7 +362,7 @@ def get_field_transform(name: str) -> Callable:
 
 
 def list_field_transforms() -> list[str]:
-    return FIELD_TRANSFORMS.list()
+    return FIELD_TRANSFORMS.names()
 
 
 def register_event_trigger(name, predicate=None, *, description="", schema=None, replace=False):
@@ -362,7 +377,7 @@ def get_event_trigger(name: str) -> Callable:
 
 
 def list_event_triggers() -> list[str]:
-    return EVENT_TRIGGERS.list()
+    return EVENT_TRIGGERS.names()
 
 
 def register_reader(name, reader=None, *, description="", schema=None, replace=False):
@@ -375,7 +390,7 @@ def get_reader(name: str) -> Any:
 
 
 def list_readers() -> list[str]:
-    return READERS.list()
+    return READERS.names()
 
 
 def register_catalog_source(name, source=None, *, description="", schema=None, replace=False):
@@ -390,10 +405,12 @@ def get_catalog_source(name: str) -> Any:
 
 
 def list_catalog_sources() -> list[str]:
-    return CATALOG_SOURCES.list()
+    return CATALOG_SOURCES.names()
 
 
-def register_credential_provider(name, provider=None, *, description="", schema=None, replace=False):
+def register_credential_provider(
+    name, provider=None, *, description="", schema=None, replace=False
+):
     """Register a credential provider (``nsidc``, ``gesdisc``, ``edl``)."""
     return CREDENTIAL_PROVIDERS.register(
         name, provider, description=description, schema=schema, replace=replace
@@ -405,7 +422,7 @@ def get_credential_provider(name: str) -> Any:
 
 
 def list_credential_providers() -> list[str]:
-    return CREDENTIAL_PROVIDERS.list()
+    return CREDENTIAL_PROVIDERS.names()
 
 
 __all__ = [
