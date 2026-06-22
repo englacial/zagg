@@ -17,9 +17,10 @@ All ``ipyleaflet`` imports are local to the functions here so importing
 :mod:`zagg.viz` (and the phase-1 render core / test suite) never requires the
 widget stack. Install it with ``pip install zagg[viz]``.
 """
+
 from __future__ import annotations
 
-import threading
+import asyncio
 
 from zagg.viz.crs import crs_info, is_polar, pick_crs
 from zagg.viz.shardmap import (
@@ -45,22 +46,45 @@ _GRID_DEBOUNCE_S = 0.2
 def _debounce(wait, func):
     """Wrap ``func`` so rapid calls coalesce to one call ``wait`` s after the last.
 
-    Each call cancels the pending :class:`threading.Timer` and reschedules, so a
-    burst of events fires ``func`` once when they stop. Returns the wrapper with a
-    ``cancel()`` to tear the timer down.
+    The coalesced call is scheduled on the **kernel's own asyncio event loop**
+    (``loop.call_later``) -- the same main thread that owns the ipywidgets comm
+    -- not on a background ``threading.Timer``. That distinction is the fix for
+    the kernel-crash report (PR #44): the Jupyter widget comm channel is not
+    thread-safe, so mutating a widget traitlet (here ``grid_layer.data``) from a
+    timer thread can hang or corrupt the comm and crash the kernel. Scheduling on
+    the running loop keeps every refresh on the main thread.
+
+    Each call cancels the pending :class:`asyncio.TimerHandle` and reschedules,
+    so a burst of events fires ``func`` once when they stop. Returns the wrapper
+    with a ``cancel()`` to tear the pending call down.
+
+    When no event loop is running (e.g. a plain script / headless test) the call
+    is run synchronously -- there is no comm to protect and no loop to schedule
+    on, so coalescing is moot.
     """
-    timer: list = [None]
+    handle: list = [None]
+
+    def _fire(args, kwargs):
+        handle[0] = None
+        func(*args, **kwargs)
 
     def wrapper(*args, **kwargs):
-        if timer[0] is not None:
-            timer[0].cancel()
-        timer[0] = threading.Timer(wait, lambda: func(*args, **kwargs))
-        timer[0].daemon = True
-        timer[0].start()
+        if handle[0] is not None:
+            handle[0].cancel()
+            handle[0] = None
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            loop = None
+        if loop is None:
+            func(*args, **kwargs)
+            return
+        handle[0] = loop.call_later(wait, _fire, args, kwargs)
 
     def cancel():
-        if timer[0] is not None:
-            timer[0].cancel()
+        if handle[0] is not None:
+            handle[0].cancel()
+            handle[0] = None
 
     wrapper.cancel = cancel
     return wrapper

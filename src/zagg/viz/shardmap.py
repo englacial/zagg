@@ -13,9 +13,12 @@ Three layers are produced:
   needed.
 - :func:`granule_footprints` -- one polygon feature per granule footprint,
   decoded from a ``Catalog`` (``granule_records``).
-- :func:`viewport_cells` -- shard-order cell outlines clipped to a viewport
-  bbox, emitted **only** when ``<= max_shards`` shards intersect the viewport
-  (the "grid-on-zoom" gate -- never a global graticule, issue #38).
+- :func:`viewport_cells` -- the grid-on-zoom layer clipped to a viewport bbox,
+  emitted **only** when ``<= max_shards`` shards intersect the viewport (the
+  gate -- never a global graticule, issue #38). For HEALPix this is the finer
+  **child cells at ``child_order``** nesting inside the visible shards (generated
+  viewport-bounded via ``mortie.morton_coverage``, not by per-shard fan-out);
+  for other grids it is the shard footprint clipped to the viewport.
 
 Antimeridian handling
 ---------------------
@@ -26,6 +29,7 @@ path already normalizes vertices that merely *touch* the antimeridian; for the
 ones that genuinely *cross* it, :func:`_split_antimeridian` cuts the ring at
 +-180 into a ``MultiPolygon`` so GeoJSON consumers draw it correctly.
 """
+
 from __future__ import annotations
 
 import json
@@ -87,6 +91,7 @@ def grid_from_signature(signature: dict):
 
 
 # ── GeoJSON geometry helpers ─────────────────────────────────────────────────
+
 
 def _ring_list(ring) -> list[list[float]]:
     """A shapely ring's ``[[lon, lat], ...]`` as plain floats."""
@@ -214,9 +219,7 @@ def _polygonal(geom):
         polys = [g for g in geom.geoms if g.geom_type in ("Polygon", "MultiPolygon")]
         if not polys:
             return None
-        merged = MultiPolygon(
-            [p for g in polys for p in getattr(g, "geoms", [g])]
-        )
+        merged = MultiPolygon([p for g in polys for p in getattr(g, "geoms", [g])])
         return merged
     return None
 
@@ -230,6 +233,7 @@ def _collection(features: list[dict]) -> dict:
 
 
 # ── layers ───────────────────────────────────────────────────────────────────
+
 
 def shard_outlines(shardmap, *, split_seam: bool = True) -> dict:
     """Shard/chunk outlines as a GeoJSON ``FeatureCollection``.
@@ -361,15 +365,81 @@ def shard_index(shardmap) -> ShardIndex:
     return index
 
 
-def viewport_cells(
-    shardmap, bbox, *, max_shards: int = 4, split_seam: bool = True, index=None
-) -> dict:
-    """Shard-order cell outlines clipped to a viewport, gated on visible shards.
+# Edge samples per side for a child-cell polygon. Child cells are small
+# near-squares, so a low step traces them faithfully while keeping each ring --
+# and the GeoJSON shipped over the widget comm -- light. (HealpixGrid.shard_
+# footprint uses step=32 for the much larger parent diamonds.)
+_CHILD_CELL_STEP = 8
 
-    Implements the "grid-on-zoom" behavior (issue #38): cell outlines **at the
-    shard order** are drawn only when ``<= max_shards`` shards intersect
-    ``bbox``. When more shards are visible the viewport is too zoomed-out for a
-    useful grid and an empty collection is returned -- never a global graticule.
+
+def _child_cell_polygon(cell):
+    """Polygon (WGS84 lon/lat) for a single HEALPix child cell morton id."""
+    from mortie.tools import mort2polygon
+    from shapely.geometry import Polygon
+
+    verts = mort2polygon(int(cell), step=_CHILD_CELL_STEP)
+    lats = np.array([v[0] for v in verts])
+    lons = np.array([v[1] for v in verts])
+    return Polygon(zip(lons, lats))
+
+
+def _healpix_child_cells(grid, visible_keys, view, bbox, max_cells):
+    """Child cells at ``child_order`` nesting inside the visible HEALPix shards.
+
+    The grid-on-zoom for HEALPix is the **finer child grid that subdivides each
+    shard** (issue #38) -- not the shard outline redrawn. Children are generated
+    in a **viewport-bounded** way: a single ``mortie.morton_coverage`` query over
+    the viewport bbox at ``child_order`` returns only the child cells overlapping
+    the view, so the count scales with the viewport, not with the
+    ``4^(child_order - parent_order)`` per-shard fan-out. The returned cells are
+    filtered to those whose parent (``clip2order(parent_order, ...)``) is one of
+    the visible shards, so the rendered grid lines up *inside* the shard outlines.
+
+    Returns ``(cells, parents)`` morton-id arrays, or ``None`` when the in-view
+    child count exceeds ``max_cells`` (the analogous gate to ``max_shards`` --
+    keeps a single dense-viewport refresh bounded rather than emitting tens of
+    thousands of polygons).
+    """
+    from mortie import clip2order, morton_coverage
+
+    lon_min, lat_min, lon_max, lat_max = bbox
+    view_lats = np.array([lat_min, lat_min, lat_max, lat_max, lat_min])
+    view_lons = np.array([lon_min, lon_max, lon_max, lon_min, lon_min])
+    cov = np.asarray(morton_coverage([view_lats], [view_lons], order=grid.child_order))
+    if cov.size == 0:
+        return np.empty(0, dtype=np.int64), np.empty(0, dtype=np.int64)
+    parents = clip2order(grid.parent_order, cov)
+    keep = np.isin(parents, np.asarray(list(visible_keys)))
+    cells = cov[keep]
+    if cells.size > max_cells:
+        return None
+    return cells, parents[keep]
+
+
+def viewport_cells(
+    shardmap,
+    bbox,
+    *,
+    max_shards: int = 4,
+    max_cells: int = 2000,
+    split_seam: bool = True,
+    index=None,
+) -> dict:
+    """Grid-on-zoom cell outlines clipped to a viewport, gated on visible shards.
+
+    Implements the "grid-on-zoom" behavior (issue #38): the finer grid is drawn
+    only when ``<= max_shards`` shards intersect ``bbox``. When more shards are
+    visible the viewport is too zoomed-out for a useful grid and an empty
+    collection is returned -- never a global graticule.
+
+    For a **HEALPix** grid the emitted features are the **child cells at
+    ``child_order`` that nest inside the visible shards** -- the grid that
+    subdivides each shard 4-for-1 per order step -- not the shard outline
+    redrawn. They are generated viewport-bounded via a single
+    :func:`mortie.morton_coverage` query at ``child_order`` (so the cell count
+    scales with the viewport, not with the ``4^(child_order - parent_order)``
+    per-shard fan-out), filtered to the visible shards, and clipped to ``bbox``.
+    For any other grid the shard footprint clipped to the viewport is emitted.
 
     Footprints are taken from a one-time :class:`ShardIndex` (built and cached
     per shardmap, or passed in via ``index=``), so repeated calls -- e.g. the
@@ -383,6 +453,10 @@ def viewport_cells(
         Viewport ``(lon_min, lat_min, lon_max, lat_max)`` in WGS84.
     max_shards : int
         Maximum number of intersecting shards for the grid to render.
+    max_cells : int
+        Maximum number of in-view HEALPix child cells to render. Above this the
+        viewport is too dense (zoomed out relative to ``child_order``) and an
+        empty collection is returned, keeping a single refresh bounded.
     split_seam : bool
         Split polygons crossing +-180 into a ``MultiPolygon``. Set False under a
         polar-stereographic CRS, where there is no antimeridian seam.
@@ -393,8 +467,8 @@ def viewport_cells(
     Returns
     -------
     dict
-        GeoJSON ``FeatureCollection`` of shard-cell outlines clipped to the
-        viewport, or an empty collection when the gate is not met.
+        GeoJSON ``FeatureCollection`` of grid outlines clipped to the viewport,
+        or an empty collection when a gate is not met.
     """
     from shapely.geometry import box
 
@@ -405,6 +479,29 @@ def viewport_cells(
     visible = index.query(view)
     if not visible or len(visible) > max_shards:
         return _collection([])
+
+    grid = grid_from_signature(shardmap.grid_signature)
+
+    from zagg.grids import HealpixGrid
+
+    if isinstance(grid, HealpixGrid):
+        visible_keys = {int(key) for key, _ in visible}
+        result = _healpix_child_cells(grid, visible_keys, view, bbox, max_cells)
+        if result is None:
+            return _collection([])
+        cells, parents = result
+        features = []
+        for cell, parent in zip(cells, parents):
+            clipped = _polygonal(_child_cell_polygon(cell).intersection(view))
+            if clipped is None:
+                continue
+            features.append(
+                _feature(
+                    _polygon_geometry(clipped, split_seam=split_seam),
+                    {"cell": int(cell), "shard_key": int(parent)},
+                )
+            )
+        return _collection(features)
 
     features = []
     for key, fp in visible:
@@ -421,6 +518,7 @@ def viewport_cells(
 
 
 # ── top-level assembly ───────────────────────────────────────────────────────
+
 
 def render_shardmap(shardmap, catalog=None, *, bbox=None, max_shards: int = 4) -> dict:
     """Assemble all viewer layers for a shard map into one dict of collections.
@@ -455,6 +553,7 @@ def render_shardmap(shardmap, catalog=None, *, bbox=None, max_shards: int = 4) -
 
 
 # ── small loaders / utils ────────────────────────────────────────────────────
+
 
 def _load_shardmap(shardmap):
     """Accept a ShardMap or a JSON path; return a ShardMap."""
