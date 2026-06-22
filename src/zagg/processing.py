@@ -166,10 +166,10 @@ def _concat_and_group(all_reads, grid, handoff: str):
 def _eval_chunk_precompute(config: PipelineConfig, pooled: dict[str, np.ndarray]) -> dict[str, Any]:
     """Evaluate the ``chunk_precompute`` entries ONCE over a shard's pooled columns.
 
-    The per-chunk precompute hook (issue #30, item 1) is the "compute once per
+    The per-chunk precompute hook (issue #30, items 1+2) is the "compute once per
     chunk, use per cell" primitive: each named entry is evaluated a single time
     over the shard's *pooled* column arrays (all beams/granules concatenated,
-    before the per-cell split), yielding a chunk-level scalar. Those scalars are
+    before the per-cell split), yielding a chunk-level value. Those values are
     then injected into the per-cell expression namespace by :func:`process_shard`
     so a per-cell ``expression`` (e.g. a 128-bin waveform window) can reference a
     chunk-uniform anchor instead of recomputing a per-cell one.
@@ -178,8 +178,15 @@ def _eval_chunk_precompute(config: PipelineConfig, pooled: dict[str, np.ndarray]
     dispatch: an ``expression`` entry runs through ``_eval_expression_raw`` over
     the pooled columns; a ``function`` entry resolves via ``resolve_function`` and
     is applied to the entry's ``source`` column (with ``params`` resolved the same
-    way as agg fields). The optional ``dtype`` casts the scalar. The result must
-    reduce to a scalar (``np.ndim(value) == 0``); a non-scalar is rejected.
+    way as agg fields). The optional ``dtype`` casts the result.
+
+    The result is **shape-agnostic**: a chunk value may be a scalar OR a
+    non-scalar array (e.g. a covariance matrix), since the namespace-injection
+    mechanism is shape-blind — a per-cell ``expression`` can reference a chunk
+    array just like a chunk scalar (issue #30, @espg's 4773649308). Scalar-ness is
+    only required when a chunk value is *written* to a ``kind: scalar`` output
+    field; that is enforced in :func:`calculate_cell_statistics` (a non-scalar into
+    a scalar field raises a clear error), not here.
 
     It deliberately diverges from the per-cell path in two ways: (1) there is no
     ``n_obs == 0`` short-circuit (these are shard-level reductions, evaluated once
@@ -204,7 +211,7 @@ def _eval_chunk_precompute(config: PipelineConfig, pooled: dict[str, np.ndarray]
     Returns
     -------
     dict[str, object]
-        ``{name: scalar}`` for each ``chunk_precompute`` entry.
+        ``{name: value}`` for each ``chunk_precompute`` entry (scalar or array).
     """
     from zagg.config import _eval_expression_raw, resolve_function
 
@@ -239,16 +246,18 @@ def _eval_chunk_precompute(config: PipelineConfig, pooled: dict[str, np.ndarray]
                 else:
                     resolved_params[pkey] = pval
             value = resolve_function(meta["function"])(values, **resolved_params)
-        # The hook's whole contract is a chunk-level *scalar*; an expression like
-        # ``np.floor(h_ph)`` (no reduction) returns an array that would be silently
-        # broadcast or mangled by the dtype cast and the per-cell namespace merge.
-        if np.ndim(value) != 0:
-            raise ValueError(
-                f"chunk_precompute '{name}' must reduce to a scalar, got shape {np.shape(value)}"
-            )
+        # Shape-agnostic: a chunk value may be a scalar or a non-scalar array (e.g.
+        # a covariance matrix) — both inject cleanly into the per-cell namespace and
+        # can feed any per-cell ``expression`` (issue #30). Scalar-ness is required
+        # only when a chunk value is written to a ``kind: scalar`` field, which is
+        # enforced at that write point in ``calculate_cell_statistics``. The dtype
+        # cast applies element-wise to either a scalar or an array.
         dtype = meta.get("dtype")
         if dtype is not None:
-            value = np.dtype(dtype).type(value)
+            np_dtype = np.dtype(dtype)
+            value = (
+                np_dtype.type(value) if np.ndim(value) == 0 else np.asarray(value, dtype=np_dtype)
+            )
         out[name] = value
     return out
 
@@ -484,7 +493,7 @@ def calculate_cell_statistics(
     dict
         Dictionary of statistics keyed by aggregation variable name.
     """
-    from zagg.config import _eval_expression_raw, evaluate_expression, resolve_function
+    from zagg.config import _eval_expression_raw, resolve_function
 
     if config is None:
         config = default_config()
@@ -539,7 +548,19 @@ def calculate_cell_statistics(
                 out = _eval_expression_raw(expression, cell_data)
                 result[name] = _coerce_ragged_value(out, sig)
             else:
-                result[name] = evaluate_expression(expression, cell_data)
+                # kind: scalar — the expression must reduce to a single value. A
+                # non-scalar chunk_precompute value (issue #30 allows arrays in the
+                # namespace) written to a scalar field is a config error; raise a
+                # clear message rather than letting ``float()`` emit a cryptic one.
+                out = _eval_expression_raw(expression, cell_data)
+                if np.ndim(out) != 0:
+                    raise ValueError(
+                        f"scalar field {name!r}: expression {expression!r} produced a "
+                        f"non-scalar of shape {np.shape(out)}; a kind: scalar field "
+                        f"requires a scalar result (declare 'kind: vector' to store an "
+                        f"array per cell)"
+                    )
+                result[name] = float(out)
             continue
 
         values = cell_data[source]
@@ -727,7 +748,12 @@ def _kernel_able(meta: dict) -> bool:
 
 
 def _kernel_aggregate(
-    table, cell_col: np.ndarray, children, value_col: str, config: PipelineConfig
+    table,
+    cell_col: np.ndarray,
+    children,
+    value_col: str,
+    config: PipelineConfig,
+    chunk_scalars: dict[str, Any] | None = None,
 ) -> dict:
     """EXPERIMENTAL pyarrow hash-aggregate reducer (phase 2b of #30).
 
@@ -735,6 +761,12 @@ def _kernel_aggregate(
     every child cell in one vectorised ``TableGroupBy.aggregate`` pass, then fills
     the remaining (weighted mean, expression, quantile) fields via the per-cell
     numpy path so output columns match the default reducer exactly in shape.
+
+    ``chunk_scalars`` (issue #30) are the per-chunk precompute values, injected
+    into each cell's namespace in the fallback per-cell loop exactly as the default
+    handoff does, so an ``expression`` field referencing a chunk anchor resolves on
+    the arrow path too. A precompute field is never kernel-able (it is an
+    ``expression``), so it always lands in ``fallback_names`` and sees the scalars.
 
     ``count``/``min``/``max`` are EXACT vs the numpy reducer, including on NaN
     input — pyarrow's min/max kernels skip NaN, so this function detects NaN per
@@ -849,7 +881,10 @@ def _kernel_aggregate(
                 cell_data = {col: arr[s:e] for col, arr in col_arrays.items()}
             else:
                 cell_data = _empty
-            stats = calculate_cell_statistics(cell_data, value_col=value_col, config=config)
+            # Inject the chunk-level precompute values (no-op when empty), so an
+            # expression fallback field can reference a chunk anchor (issue #30).
+            cell_namespace = {**cell_data, **chunk_scalars} if chunk_scalars else cell_data
+            stats = calculate_cell_statistics(cell_namespace, value_col=value_col, config=config)
             for name in fallback_names:
                 stats_arrays[name][i] = stats[name]
 
@@ -1461,16 +1496,6 @@ def process_shard(
         config = default_config()
     if handoff not in ("pandas", "arrow", "arrow-kernel"):
         raise ValueError(f"handoff must be 'pandas', 'arrow', or 'arrow-kernel', got {handoff!r}")
-    # Reject the unsupported arrow-kernel + chunk_precompute combination up front,
-    # before any read (issue #30). The kernel fallback loop reduces each cell
-    # independently and has no seam to inject the shard-pooled chunk scalars; this
-    # is a property of the *config*, not the data, so enforce it deterministically
-    # rather than only when some rows happen to be read.
-    if handoff == "arrow-kernel" and get_chunk_precompute(config):
-        raise NotImplementedError(
-            "handoff='arrow-kernel' does not support aggregation.chunk_precompute "
-            "(issue #30); use handoff='pandas' or 'arrow' instead"
-        )
     data_source = config.data_source
 
     shard_key = int(shard_key)
@@ -1585,8 +1610,6 @@ def process_shard(
                 "handoff='arrow-kernel' does not support ragged fields (issue #48); "
                 "use handoff='pandas' or 'arrow' instead"
             )
-        # (arrow-kernel + chunk_precompute is rejected at the top of process_shard,
-        # before any read, so the combination never reaches this branch.)
         import pyarrow as pa
 
         table = pa.concat_tables(all_reads).combine_chunks()
@@ -1596,8 +1619,18 @@ def process_shard(
         n_obs_total = table.num_rows
         cell_col = grid.cells_of(table.column("leaf_id").to_numpy(zero_copy_only=False))
         logger.info(f"  Read {n_obs_total:,} observations")
+        # Per-chunk precompute hook (issue #30): reduce each entry ONCE over the
+        # pooled arrow table. Columns are dense + null-free (guarded above), so the
+        # ``to_numpy`` extraction is zero-copy where the buffer layout allows and
+        # dtype-exact otherwise — the same numpy arrays the pandas/arrow carriers
+        # feed in. The resulting scalars/arrays are threaded into the kernel
+        # fallback per-cell loop (where expression fields resolve).
+        pooled = {n: table.column(n).to_numpy(zero_copy_only=False) for n in table.column_names}
+        chunk_scalars = _eval_chunk_precompute(config, pooled)
         logger.info(f"  Calculating statistics for {len(children)} cells (kernel)...")
-        kernel = _kernel_aggregate(table, cell_col, children, "h_li", config)
+        kernel = _kernel_aggregate(
+            table, cell_col, children, "h_li", config, chunk_scalars=chunk_scalars
+        )
         stats_arrays = kernel["stats_arrays"]
         cells_with_data = kernel["cells_with_data"]
         n_cells = len(children)
