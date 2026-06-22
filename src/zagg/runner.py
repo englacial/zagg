@@ -36,6 +36,13 @@ from zagg.config import (
     get_parent_order,
     get_store_path,
 )
+from zagg.dispatch import (
+    LAMBDA_PRICE_PER_GB_SEC,
+    LAMBDA_RETRY,
+    LambdaExecutor,
+    PreflightReport,
+    dispatch,
+)
 from zagg.processing import process_shard, write_dataframe_to_zarr
 from zagg.store import open_store
 
@@ -396,7 +403,17 @@ def _run_lambda(config, catalog_data, store_path, child_order, *,
                 max_cells, morton_cell, max_workers, overwrite, dry_run,
                 region, function_name,
                 output_credentials=None, output_endpoint_url=None):
-    """Run processing via AWS Lambda invocation."""
+    """Run processing via AWS Lambda invocation.
+
+    The fan-out -> retry -> measured-cost loop is the generic
+    :func:`zagg.dispatch.dispatch`; this function owns the Lambda-specific
+    setup (grid, auth, concurrency probe, template/finalize invokes) and cost
+    *presentation*. The boto3 seams (``_invoke_lambda_cell`` /
+    ``_invoke_lambda_setup`` / ``_invoke_lambda_finalize`` /
+    ``compute_available_workers`` / ``ThreadPoolExecutor``) are referenced off
+    this module so the spatial path stays byte-identical and existing tests
+    that monkeypatch them continue to bind the exact objects in use.
+    """
     from dataclasses import asdict
 
     import boto3
@@ -476,72 +493,88 @@ def _run_lambda(config, catalog_data, store_path, child_order, *,
         output_creds_event=output_creds_event,
     )
 
+    # Per-cell invoke, bound to everything but the (shard_key, records) pair so
+    # the executor submits one payload per cell. Mirrors the kwargs the old
+    # inline ``executor.submit(_invoke_lambda_cell, ...)`` passed.
+    def _cell_work(payload):
+        shard_key, records = payload
+        return _invoke_lambda_cell(
+            lambda_client, grid.block_index(int(shard_key)), int(shard_key),
+            parent_order, child_order,
+            _resolve_urls(records, "s3"), store_path, s3_creds,
+            function_name=function_name,
+            config_dict=config_dict,
+            output_creds_event=output_creds_event,
+            max_workers=max_workers,
+        )
+
+    executor = LambdaExecutor(
+        _cell_work,
+        # The probe already ran above (it also sizes the boto client pool); the
+        # preflight hook here just hands the clamped count to the executor's
+        # ThreadPoolExecutor, sourced via this module so the concurrency tests'
+        # ``runner.ThreadPoolExecutor`` spy still binds it.
+        preflight_fn=lambda n: PreflightReport(
+            workers=max_workers, detail=concurrency_report,
+        ),
+        pool_factory=ThreadPoolExecutor,
+        finalize_fn=lambda: _invoke_lambda_finalize(
+            lambda_client, function_name, store_path,
+            output_creds_event=output_creds_event,
+        ),
+    )
+    executor.preflight(len(cells))
+
     start_time = time.time()
-    total_obs = 0
-    cells_with_data = 0
-    cells_error = 0
-    total_lambda_time = 0.0
-    results = []
+    n = len(cells)
 
-    with ThreadPoolExecutor(max_workers=max_workers) as executor:
-        futures = {
-            executor.submit(
-                _invoke_lambda_cell,
-                lambda_client, grid.block_index(int(shard_key)), int(shard_key),
-                parent_order, child_order,
-                _resolve_urls(records, "s3"), store_path, s3_creds,
-                function_name=function_name,
-                config_dict=config_dict,
-                output_creds_event=output_creds_event,
-                max_workers=max_workers,
-            ): shard_key
-            for shard_key, records in cells
-        }
+    def _accumulate(report, i, result):
+        error = result.get("error")
+        if result.get("status_code") == 200 and not error:
+            obs = result.get("body", {}).get("total_obs", 0)
+            report.total_obs += obs
+            report.cells_with_data += 1
+        elif error not in ("No granules found", "No data after filtering"):
+            report.cells_error += 1
+            logger.warning(f"  [{i}/{n}] shard {result.get('shard_key')}: {error}")
+        report.results.append(result)
 
-        for i, future in enumerate(as_completed(futures), 1):
-            try:
-                result = future.result()
-            except Exception as e:
-                # _invoke_lambda_cell already re-raises FD exhaustion with
-                # ulimit guidance; this is a backstop for exhaustion that
-                # surfaces outside the cell body (e.g. at submit time). Other
-                # exceptions propagate unchanged.
-                raise_for_fd_exhaustion(e, max_workers)
-                raise
-            results.append(result)
-            total_lambda_time += result.get("lambda_duration", 0)
+        if i % 50 == 0:
+            elapsed = time.time() - start_time
+            rate = i / elapsed if elapsed > 0 else 0
+            logger.info(f"  [{i:4d}/{n}] {rate:.1f} cells/s")
 
-            error = result.get("error")
-            if result.get("status_code") == 200 and not error:
-                obs = result.get("body", {}).get("total_obs", 0)
-                total_obs += obs
-                cells_with_data += 1
-            elif error not in ("No granules found", "No data after filtering"):
-                cells_error += 1
-                logger.warning(f"  [{i}/{len(cells)}] shard {result.get('shard_key')}: {error}")
-
-            if i % 50 == 0:
-                elapsed = time.time() - start_time
-                rate = i / elapsed if elapsed > 0 else 0
-                logger.info(f"  [{i:4d}/{len(cells)}] {rate:.1f} cells/s")
+    try:
+        report = dispatch(
+            executor,
+            cells,
+            retry=LAMBDA_RETRY,
+            accumulate=_accumulate,
+            # _invoke_lambda_cell already re-raises FD exhaustion with ulimit
+            # guidance; this is a backstop for exhaustion that surfaces outside
+            # the cell body (e.g. at submit time). Other exceptions propagate.
+            on_submit_error=lambda e: raise_for_fd_exhaustion(e, max_workers),
+        )
+    finally:
+        executor.shutdown()
 
     # Consolidate metadata via Lambda (same rationale as setup -- avoids
     # requiring orchestrator-side S3 access).
-    _invoke_lambda_finalize(lambda_client, function_name, store_path,
-                            output_creds_event=output_creds_event)
+    executor.finalize()
     wall_time = time.time() - start_time
 
-    # Cost estimate: arm64 pricing = $0.0000133334/GB-second
-    memory_gb = 2.0  # Lambda memory in GB
-    gb_seconds = total_lambda_time * memory_gb
-    price_per_gb_sec = 0.0000133334
-    estimated_cost = gb_seconds * price_per_gb_sec
+    # Cost estimate: arm64 pricing = $0.0000133334/GB-second. The structured
+    # numbers come off the report; runner owns presentation (#63).
+    total_lambda_time = report.cost.compute_time_s
+    gb_seconds = report.cost.gb_seconds
+    price_per_gb_sec = LAMBDA_PRICE_PER_GB_SEC
+    estimated_cost = report.cost.cost_usd
 
     summary = {
         "total_cells": len(cells),
-        "cells_with_data": cells_with_data,
-        "cells_error": cells_error,
-        "total_obs": total_obs,
+        "cells_with_data": report.cells_with_data,
+        "cells_error": report.cells_error,
+        "total_obs": report.total_obs,
         "wall_time_s": wall_time,
         "lambda_time_s": total_lambda_time,
         "gb_seconds": gb_seconds,
@@ -550,9 +583,9 @@ def _run_lambda(config, catalog_data, store_path, child_order, *,
         "store_path": store_path,
         "backend": "lambda",
         "function_name": function_name,
-        "results": results,
+        "results": report.results,
     }
-    logger.info(f"Done: {cells_with_data} cells, {total_obs:,} obs, {cells_error} errors, {wall_time:.1f}s")
+    logger.info(f"Done: {report.cells_with_data} cells, {report.total_obs:,} obs, {report.cells_error} errors, {wall_time:.1f}s")
     logger.info(f"Lambda compute: {total_lambda_time:.0f}s total, {gb_seconds:.0f} GB-s, ~${estimated_cost:.2f}")
     return summary
 
