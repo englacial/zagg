@@ -426,12 +426,13 @@ def _validate_output_kind(name: str, meta: dict) -> None:
     A ``resolution: chunk`` field (issue #30 item 2) is written ONCE per chunk
     into a companion array shaped at the chunk grid (``main.shape //
     chunk_shape``), indexed by ``grid.block_index(shard_key)`` — the compact
-    storage for a chunk-uniform value (e.g. a ``chunk_precompute`` anchor). Any
-    ``kind`` may be ``resolution: chunk`` (issue #82): a ``scalar`` companion is a
-    plain chunk-grid array, a ``vector`` companion appends the field's
-    ``trailing_shape`` to the chunk grid (chunked whole), and a ``ragged``
-    companion is CSR at chunk resolution. The shape keys are validated below
-    exactly as for cell resolution — the chunk axis just replaces the cell axis.
+    storage for a chunk-uniform value (e.g. a ``chunk_precompute`` anchor).
+    ``scalar`` and ``vector`` kinds may be ``resolution: chunk`` (issue #82): a
+    ``scalar`` companion is a plain chunk-grid array, a ``vector`` companion
+    appends the field's ``trailing_shape`` to the chunk grid (chunked whole). The
+    shape keys are validated below exactly as for cell resolution — the chunk axis
+    just replaces the cell axis. A ``ragged`` chunk companion (CSR at chunk
+    resolution) is deferred and rejected here (see the error message).
 
     Parameters
     ----------
@@ -453,15 +454,29 @@ def _validate_output_kind(name: str, meta: dict) -> None:
         )
 
     # resolution (cell default, or chunk). A chunk-resolution field stores one
-    # value per chunk in a companion array (issue #30 item 2). Any kind may be
-    # chunk-resolution (issue #82): scalar, vector (trailing on the chunk grid),
-    # or ragged (CSR at chunk resolution). The kind-specific shape keys are
-    # validated by the per-kind branches below regardless of resolution.
+    # value per chunk in a companion array (issue #30 item 2). ``scalar`` and
+    # ``vector`` chunk companions are wired (issue #82): a scalar companion is a
+    # plain chunk-grid array, a vector companion appends the field's
+    # ``trailing_shape`` to the chunk grid (chunked whole). The kind-specific shape
+    # keys are validated by the per-kind branches below regardless of resolution.
     resolution = meta.get("resolution", "cell")
     if resolution not in OUTPUT_RESOLUTIONS:
         allowed = ", ".join(OUTPUT_RESOLUTIONS)
         raise ValueError(
             f"Variable '{name}': resolution '{resolution}' is not supported (allowed: {allowed})"
+        )
+    # ``ragged`` at chunk resolution would be CSR at chunk granularity. The
+    # cell-resolution CSR write path is not yet wired into the worker/runner
+    # (``write_csr`` exists and is unit-tested standalone, but ``process_shard``
+    # collects ragged payloads without writing them), so a ragged chunk companion
+    # is deferred rather than accepted-then-silently-misbehaving (issue #82). The
+    # scalar/vector chunk companions above are unaffected.
+    if resolution == "chunk" and kind == "ragged":
+        raise ValueError(
+            f"Variable '{name}': resolution 'chunk' is not yet supported for kind "
+            f"'ragged' (CSR at chunk resolution is deferred; the cell-resolution CSR "
+            f"write path is not yet wired into the worker). Use kind 'scalar' or "
+            f"'vector' for a chunk companion."
         )
 
     # dtype, when declared, must name a real numpy dtype (applies to all kinds).

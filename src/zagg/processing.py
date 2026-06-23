@@ -513,7 +513,13 @@ def _chunk_uniform_value(name: str, values: np.ndarray):
         else np.array_equal(populated, broadcast_first)
     )
     if not uniform:
-        n_distinct = len({tuple(np.ravel(row)) for row in populated})
+        # Count distinct populated rows for the message. Map NaN to a sentinel
+        # first so a uniform-but-NaN-bearing layout is not over-counted (NaN != NaN
+        # would otherwise make every such row look distinct).
+        keys = populated.reshape(populated.shape[0], -1)
+        if np.issubdtype(arr.dtype, np.floating):
+            keys = np.where(np.isnan(keys), np.float64(np.inf), keys.astype(np.float64))
+        n_distinct = len({tuple(row) for row in keys})
         raise ValueError(
             f"resolution: chunk field {name!r} is not chunk-uniform: the populated "
             f"cells carry {n_distinct} distinct values; a chunk-resolution field must "

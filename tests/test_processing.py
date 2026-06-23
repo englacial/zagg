@@ -1629,6 +1629,30 @@ class TestVectorChunkResolutionCompanion:
         with pytest.raises(ValueError, match="not chunk-uniform"):
             write_dataframe_to_zarr(carrier, store, grid=grid, chunk_idx=chunk_idx)
 
+    def test_partially_nan_but_uniform_vector_accepted(self):
+        """A vector whose populated cells all carry the SAME partially-NaN vector is
+        chunk-uniform (the NaN positions match) — the reason _chunk_uniform_value
+        compares with equal_nan=True. Returns that vector, NaNs preserved."""
+        from zagg.processing import _chunk_uniform_value
+
+        vec = np.array([1.0, np.nan, 3.0, np.nan], dtype="float32")
+        # 5 cells: cells 0,2 populated with the same partially-NaN vec; rest all-NaN.
+        col = np.full((5, 4), np.nan, dtype="float32")
+        col[0] = vec
+        col[2] = vec
+        out = _chunk_uniform_value("profile_h", col)
+        np.testing.assert_array_equal(out, vec)  # array_equal treats NaN==NaN
+
+    def test_all_nan_vector_chunk_falls_back_to_first(self):
+        """When every cell's vector is all-NaN (empty chunk), _chunk_uniform_value
+        returns the first cell's (all-NaN) sentinel rather than raising."""
+        from zagg.processing import _chunk_uniform_value
+
+        col = np.full((3, 4), np.nan, dtype="float32")
+        out = np.asarray(_chunk_uniform_value("profile_h", col))
+        assert out.shape == (4,)
+        assert np.all(np.isnan(out))
+
 
 # ---------------------------------------------------------------------------
 # Structured filters in the read path (issue #43, Phase A)
