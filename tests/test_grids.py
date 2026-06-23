@@ -203,6 +203,52 @@ class TestRoundTrip:
         assert cell_ids.shape == children.shape
 
 
+class TestReferenceOrder:
+    """Regression: the HEALPix assign reference order must reach mortie 0.8.1's
+    max (29), not the old hardcoded 18 -- otherwise a fine ``child_order`` is
+    silently collapsed onto order 18 (no added resolution)."""
+
+    def test_ref_order_supports_fine_child_orders(self):
+        from zagg.grids.healpix import HEALPIX_REF_ORDER
+
+        assert HEALPIX_REF_ORDER >= 19  # mortie 0.8.1 resolves up to 29
+
+    def test_child_order_19_refines_order_18(self):
+        # The bug: ``assign`` pinned points at order 18, so ``child_order=19``
+        # produced the SAME cells as ``child_order=18``. They must now differ.
+        rng = np.random.default_rng(0)
+        lats = rng.uniform(-89, 89, 2000)
+        lons = rng.uniform(-179, 179, 2000)
+        g18 = HealpixGrid(parent_order=10, child_order=18, layout="fullsphere")
+        g19 = HealpixGrid(parent_order=11, child_order=19, layout="fullsphere")
+        c18 = g18.cells_of(g18.assign(lats, lons))
+        c19 = g19.cells_of(g19.assign(lats, lons))
+        assert not np.array_equal(c19, c18)
+
+    def test_existing_order_assignment_unchanged(self):
+        # Raising the reference order must NOT move existing (<= 18) assignments:
+        # coarsening order-12 cells from a deeper reference is byte-identical to
+        # the pre-fix order-18 reference, so shipped configs' outputs don't drift.
+        from mortie import clip2order, geo2mort
+
+        rng = np.random.default_rng(3)
+        lats = rng.uniform(-89, 89, 2000)
+        lons = rng.uniform(-179, 179, 2000)
+        g = HealpixGrid(parent_order=6, child_order=12, layout="fullsphere")
+        cells = g.cells_of(g.assign(lats, lons))
+        cells_via18 = clip2order(12, geo2mort(lats, lons, order=18))
+        assert np.array_equal(cells, cells_via18)
+
+    def test_order_19_nesting_holds(self):
+        # An order-19 child cell coarsens back to its order-11 parent shard.
+        g = HealpixGrid(parent_order=11, chunk_inner=13, child_order=19, layout="fullsphere")
+        leaves = g.assign(np.array([38.89, -45.0]), np.array([-76.5, 30.0]))
+        for shard in np.unique(g.shards_of(leaves)):
+            children = g.children(int(shard))
+            assert len(children) == 4 ** (19 - 11)
+            assert np.all(g.shards_of(children) == int(shard))
+
+
 class TestFromConfig:
     def test_healpix_default_fullsphere(self, cfg):
         # No layout in YAML → fullsphere (default since dense was deprecated).

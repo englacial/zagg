@@ -20,7 +20,14 @@ from zagg.grids.base import InconsistentShardError, chunk_array_spec, vector_arr
 from zagg.grids.morton import to_morton_array
 
 HEALPIX_BASE_CELLS: int = 12
-HEALPIX_REF_ORDER: int = 18  # mortie's clip2order reference order; do not change
+# Reference order at which ``assign`` resolves points before ``cells_of`` /
+# ``shards_of`` coarsen down to ``child_order`` / ``parent_order``. It must be
+# >= the finest ``child_order`` any grid uses, or that resolution is silently
+# lost (``clip2order`` cannot refine past its input order). mortie 0.8.1 supports
+# orders up to 29, so this is the cap. Coarsening from a deeper reference is
+# byte-identical for any order <= the old value, so raising it leaves existing
+# grids' cell/shard assignments unchanged (verified for the shipped configs).
+HEALPIX_REF_ORDER: int = 29
 
 
 class HealpixGrid:
@@ -207,15 +214,17 @@ class HealpixGrid:
     def assign(self, lats, lons) -> np.ndarray:
         """Map (lat, lon) points to morton IDs at the HEALPix reference order.
 
-        Returns morton at order 18 — mortie's ``clip2order`` requires its
-        input at that fixed reference order to clip correctly.
+        Returns morton at :data:`HEALPIX_REF_ORDER` — the finest order zagg
+        resolves to. ``cells_of`` / ``shards_of`` then coarsen this down to
+        ``child_order`` / ``parent_order`` via ``clip2order``, so the reference
+        must be at least as fine as the grid's ``child_order``.
         """
         from mortie import geo2mort
 
         return geo2mort(lats, lons, order=HEALPIX_REF_ORDER)
 
     def shards_of(self, leaf_ids) -> np.ndarray:
-        """Vectorized parent-morton lookup. ``leaf_ids`` must be at order 18."""
+        """Vectorized parent-morton lookup. ``leaf_ids`` at :data:`HEALPIX_REF_ORDER`."""
         from mortie import clip2order
 
         return clip2order(self.parent_order, np.asarray(leaf_ids))
