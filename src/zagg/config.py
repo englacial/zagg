@@ -427,12 +427,13 @@ def _validate_output_kind(name: str, meta: dict) -> None:
     into a companion array shaped at the chunk grid (``main.shape //
     chunk_shape``), indexed by ``grid.block_index(shard_key)`` — the compact
     storage for a chunk-uniform value (e.g. a ``chunk_precompute`` anchor).
-    ``scalar`` and ``vector`` kinds may be ``resolution: chunk`` (issue #82): a
-    ``scalar`` companion is a plain chunk-grid array, a ``vector`` companion
-    appends the field's ``trailing_shape`` to the chunk grid (chunked whole). The
-    shape keys are validated below exactly as for cell resolution — the chunk axis
-    just replaces the cell axis. A ``ragged`` chunk companion (CSR at chunk
-    resolution) is deferred and rejected here (see the error message).
+    ``scalar``, ``vector``, and ``ragged`` kinds may all be ``resolution: chunk``
+    (issue #82): a ``scalar`` companion is a plain chunk-grid array, a ``vector``
+    companion appends the field's ``trailing_shape`` to the chunk grid (chunked
+    whole), and a ``ragged`` companion is CSR at chunk granularity — one
+    variable-length payload per chunk, written by ``write_ragged_to_zarr`` (phase
+    4c). The shape keys are validated below exactly as for cell resolution — the
+    chunk axis just replaces the cell axis.
 
     Parameters
     ----------

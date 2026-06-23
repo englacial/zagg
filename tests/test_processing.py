@@ -772,8 +772,15 @@ class TestRaggedChunkCompanion:
         )
         self._patch_reads(monkeypatch, df)
 
+        import zarr
+
         store = MemoryStore()
         grid.emit_template(store)
+        # Rect: the chunk-ragged field gets NO dense array either (CSR group prefix).
+        product = zarr.open_group(store, path=grid.group_path, mode="r")
+        assert "h_min" in product.array_keys()
+        assert "h_chunk_edges" not in product.array_keys()
+
         ragged: dict = {}
         process_shard(grid, shard_key, ["s3://x"], s3_credentials={}, config=cfg, ragged_out=ragged)
         write_ragged_to_zarr(ragged, store, grid=grid, shard_key=shard_key)
