@@ -449,10 +449,16 @@ class RectilinearGrid:
             fill = meta.get("fill_value", "NaN")
             members[name] = base.with_data_type(dtype).with_fill_value(fill)
         for name, meta in get_agg_fields(self.config).items():
+            sig = get_output_signature(meta)
+            # Ragged fields (issue #48) are CSR subgroups written fresh by
+            # ``write_ragged_to_zarr`` (``{name}/{shard_key}/...``), not a dense
+            # array — skip them so ``{name}`` stays a group prefix and the CSR
+            # child nodes don't collide with a dense array at the same path.
+            if sig["kind"] == "ragged":
+                continue
             dtype = meta.get("dtype", "float32")
             fill = meta.get("fill_value", "NaN")
             spec = base.with_data_type(dtype).with_fill_value(fill)
-            sig = get_output_signature(meta)
             if sig["resolution"] == "chunk":
                 # A resolution: chunk field (issues #30 item 2, #82) is stored once
                 # per chunk in a companion array shaped at the chunk grid (row-major

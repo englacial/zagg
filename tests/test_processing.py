@@ -559,7 +559,18 @@ class TestRaggedCsrWrite:
         )
         self._patch_reads(monkeypatch, df)
 
+        # Emit the real product template first: a ragged field must NOT get a
+        # dense array at ``{group_path}/h_raw`` (which would make the CSR per-shard
+        # child groups collide with an array node). The dense scalar h_min still
+        # gets its array.
         store = MemoryStore()
+        grid.emit_template(store)
+        import zarr
+
+        product = zarr.open_group(store, path=grid.group_path, mode="r")
+        assert "h_min" in product.array_keys()
+        assert "h_raw" not in product.array_keys()
+
         ragged: dict = {}
         process_shard(grid, shard_key, ["s3://x"], s3_credentials={}, config=cfg, ragged_out=ragged)
         write_ragged_to_zarr(ragged, store, grid=grid, shard_key=shard_key)
