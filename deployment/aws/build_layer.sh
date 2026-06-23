@@ -66,7 +66,7 @@ $PIP install \
     --no-cache-dir
 
 echo "Installing h5coro and mortie (--no-deps)..."
-$PIP install "h5coro==1.0.3" mortie --no-deps -t "$OUTPUT_DIR/python" --no-cache-dir
+$PIP install "h5coro==1.0.4" mortie --no-deps -t "$OUTPUT_DIR/python" --no-cache-dir
 
 # Verify numpy stayed < 2.3
 NUMPY_VERSION=$(ls "$OUTPUT_DIR/python" | grep -E "^numpy-" | head -1)
