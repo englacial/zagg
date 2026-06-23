@@ -56,6 +56,7 @@ class HealpixGrid:
         layout: Literal["dense", "fullsphere"] = "dense",
         config: PipelineConfig | None = None,
         populated_shards: list[int] | None = None,
+        chunk_inner: int | None = None,
     ):
         if child_order < parent_order:
             raise ValueError(
@@ -63,10 +64,37 @@ class HealpixGrid:
             )
         if layout not in ("dense", "fullsphere"):
             raise ValueError(f"Unknown layout: {layout!r} (expected 'dense' or 'fullsphere')")
+        # chunk_inner (issue #30 item 3): an optional finer ZARR-chunk order between
+        # the shard order (parent_order) and the cell order (child_order). One shard
+        # (the dispatch unit) then owns K = 4^(chunk_order - parent_order) chunks.
+        # HEALPix specs this in its native unit — an order — so orders nest
+        # automatically (no extra check beyond the bounds below). Default
+        # ``chunk_inner is None`` means chunk_order == parent_order (K == 1), i.e.
+        # shard == chunk, byte-identical to the pre-item-3 grid.
+        chunk_order = parent_order if chunk_inner is None else int(chunk_inner)
+        if not (parent_order <= chunk_order <= child_order):
+            raise ValueError(
+                f"chunk_inner order ({chunk_order}) must satisfy parent_order "
+                f"({parent_order}) <= chunk_inner <= child_order ({child_order})"
+            )
+        if chunk_inner is not None and chunk_order != parent_order and layout != "fullsphere":
+            # Dense layout keys companion/main blocks by populated-shard POSITION;
+            # resolving K finer chunk positions per shard there is a separate concern
+            # (issue #30 item 3 lands fullsphere first). Reject rather than mis-index.
+            raise ValueError(
+                "chunk_inner finer than parent_order requires layout='fullsphere' "
+                "(dense multi-chunk-per-shard block indexing is not yet supported)"
+            )
         self.parent_order = parent_order
         self.child_order = child_order
+        self.chunk_order = chunk_order
+        self.chunk_inner = chunk_inner
         self.level_diff = child_order - parent_order
         self.n_children = 4**self.level_diff
+        # Cells per ZARR chunk (== n_children when chunk_inner is unset) and the
+        # number of chunks one shard owns (K, == 1 when unset).
+        self.cells_per_chunk = 4 ** (child_order - chunk_order)
+        self.chunks_per_shard = 4 ** (chunk_order - parent_order)
         self.layout = layout
         self.config = config or default_config("atl06")
         self._position_map: dict[int, int] | None = None
@@ -102,19 +130,53 @@ class HealpixGrid:
 
     @property
     def chunk_shape(self) -> tuple[int, ...]:
-        return (self.n_children,)
+        """ZARR chunk shape — cells per chunk.
+
+        Equals ``n_children`` (one chunk == one shard) unless ``chunk_inner`` set a
+        finer chunk order (issue #30 item 3), in which case it is the smaller
+        ``cells_per_chunk = 4^(child_order - chunk_order)``.
+        """
+        return (self.cells_per_chunk,)
 
     @property
     def chunk_grid_shape(self) -> tuple[int, ...]:
         """Number of chunks (``array_shape // chunk_shape``) for companion arrays.
 
         A ``resolution: chunk`` field (issue #30 item 2) stores one value per
-        chunk here, indexed by :meth:`block_index` (the parent nested cell id for
-        fullsphere, the populated-shard position for dense). Equals
-        ``12·4^parent_order`` for fullsphere and ``n_shards`` for dense — the
-        block-index range, so every ``block_index`` lands in bounds.
+        chunk here, indexed by :meth:`block_index`. Equals ``12·4^chunk_order`` for
+        fullsphere (``== 12·4^parent_order`` when ``chunk_inner`` is unset) and
+        ``n_shards`` for dense — the block-index range, so every ``block_index``
+        lands in bounds.
         """
-        return (self.array_shape[0] // self.n_children,)
+        return (self.array_shape[0] // self.cells_per_chunk,)
+
+    def iter_chunks(self, shard_key):
+        """Yield ``(chunk_block_index, chunk_children)`` for each chunk in a shard.
+
+        Item 3 (issue #30): one shard (the dispatch unit) owns
+        ``K = chunks_per_shard`` finer ZARR chunks. The worker reads the shard's
+        granules once, then emits one chunk region + one companion slice per chunk.
+        Each yielded ``chunk_block_index`` is the storage block tuple for that chunk
+        (as :meth:`block_index` returns for a shard when ``K == 1``) and
+        ``chunk_children`` are its cell ids in canonical order.
+
+        When ``chunk_inner`` is unset (``K == 1``) this yields exactly one entry —
+        ``(block_index(shard_key), children(shard_key))`` — so the single-chunk
+        worker path is byte-identical.
+        """
+        if self.chunks_per_shard == 1:
+            yield (self.block_index(shard_key), self.children(shard_key))
+            return
+        from mortie import generate_morton_children, mort2healpix
+
+        # The shard's K sub-chunks are its morton children at chunk_order; each
+        # sub-chunk's block index is its own nested-cell id (fullsphere only).
+        sub_chunks = generate_morton_children(int(shard_key), self.chunk_order)
+        for sub in np.asarray(sub_chunks):
+            healpix, _ = mort2healpix(np.asarray([int(sub)]))
+            block = (int(healpix[0]),)
+            children = generate_morton_children(int(sub), self.child_order)
+            yield (block, children)
 
     @property
     def group_path(self) -> str:
@@ -270,7 +332,7 @@ class HealpixGrid:
             dimension_names=("cells",),
             data_type="float32",
             chunk_grid=NamedConfig(
-                name="regular", configuration={"chunk_shape": (self.n_children,)}
+                name="regular", configuration={"chunk_shape": (self.cells_per_chunk,)}
             ),
             chunk_key_encoding=NamedConfig(name="default", configuration={"separator": "/"}),
             codecs=(NamedConfig(name="bytes", configuration={"endian": "little"}),),
@@ -313,7 +375,7 @@ class HealpixGrid:
                 spec,
                 sig,
                 base_dims=("cells",),
-                base_chunk_shape=(self.n_children,),
+                base_chunk_shape=(self.cells_per_chunk,),
             )
 
         return GroupSpec(members=members, attributes=self._dggs_attrs())
