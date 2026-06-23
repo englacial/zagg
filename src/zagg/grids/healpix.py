@@ -143,10 +143,15 @@ class HealpixGrid:
         """Number of chunks (``array_shape // chunk_shape``) for companion arrays.
 
         A ``resolution: chunk`` field (issue #30 item 2) stores one value per
-        chunk here, indexed by :meth:`block_index`. Equals ``12·4^chunk_order`` for
-        fullsphere (``== 12·4^parent_order`` when ``chunk_inner`` is unset) and
-        ``n_shards`` for dense — the block-index range, so every ``block_index``
-        lands in bounds.
+        chunk here. Equals ``12·4^chunk_order`` for fullsphere (``== 12·4^parent_order``
+        when ``chunk_inner`` is unset) and ``n_shards`` for dense.
+
+        Indexing: at K==1 (``chunk_inner`` unset) the per-chunk index IS
+        :meth:`block_index` (one chunk per shard). At K>1 (issue #30 item 3) the
+        companion is sized at the finer ``chunk_order`` grid, so the correct
+        per-chunk index is the block yielded by :meth:`iter_chunks` — NOT
+        ``block_index(shard_key)``, which is the coarser parent-order index of the
+        whole shard. The K>1 writer must index by ``iter_chunks``.
         """
         return (self.array_shape[0] // self.cells_per_chunk,)
 
@@ -163,6 +168,12 @@ class HealpixGrid:
         When ``chunk_inner`` is unset (``K == 1``) this yields exactly one entry —
         ``(block_index(shard_key), children(shard_key))`` — so the single-chunk
         worker path is byte-identical.
+
+        Order note: at K>1 the union of the per-chunk ``chunk_children`` equals the
+        shard's :meth:`children` as a SET, but the concatenation order does NOT match
+        ``children(shard_key)`` (each chunk is enumerated in its own canonical order).
+        The writer must place each chunk's cells against its own ``block`` region, not
+        assume a shard-wide ordering.
         """
         if self.chunks_per_shard == 1:
             yield (self.block_index(shard_key), self.children(shard_key))

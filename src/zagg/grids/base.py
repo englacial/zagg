@@ -97,14 +97,18 @@ def chunk_array_spec(base, *, chunk_grid_shape, chunk_dims):
 
     Issue #30 item 2: a ``resolution: chunk`` field stores ONE value per chunk
     rather than one per aggregation cell. Its array is shaped at the *chunk grid*
-    (``main.shape // chunk_shape`` = number of chunks along each axis), with one
-    Zarr block per chunk so :func:`zagg.processing.write_dataframe_to_zarr` writes
-    the shard's single value at ``grid.block_index(shard_key)``.
+    (``grid.chunk_grid_shape`` = number of chunks along each axis), with one Zarr
+    block per chunk so :func:`zagg.processing.write_dataframe_to_zarr` writes a
+    chunk's single value at its chunk block index.
+
+    At K==1 (``chunk_inner`` unset, one chunk per shard) that index is
+    ``grid.block_index(shard_key)``. At K>1 (issue #30 item 3) the chunk grid is
+    finer than the shard grid, so the per-chunk index is the block yielded by
+    ``grid.iter_chunks(shard_key)``, not ``block_index``.
 
     The companion carries the field's ``dtype``/``fill_value`` (inherited from
     ``base``); only its shape, dimension names and chunk grid are re-set to the
-    chunk grid. Each axis is chunked ``1`` (one chunk == one block) so the block
-    index equals ``block_index`` directly.
+    chunk grid. Each axis is chunked ``1`` (one chunk == one block).
 
     Parameters
     ----------

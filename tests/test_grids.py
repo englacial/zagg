@@ -672,7 +672,19 @@ class TestChunkInnerMultiChunk:
         chunks = list(g.iter_chunks(shard))
         assert len(chunks) == 4
         all_children = np.concatenate([c for _, c in chunks])
+        # SET equality holds (partition is complete + disjoint)...
         np.testing.assert_array_equal(np.sort(all_children), np.sort(g.children(shard)))
+        # ...but the concatenation ORDER does NOT match the shard's row-major order
+        # (documented caveat: per-chunk children are row-major within each inner
+        # sub-tile, so the writer must place each chunk against its own block).
+        assert not np.array_equal(all_children, g.children(shard))
+        # Each chunk's own children are row-major within its inner tile.
+        first_block, first_children = chunks[0]
+        assert first_block == (0, 0)
+        expected_first = np.array(
+            [r * g.width + c for r in range(4) for c in range(4)], dtype=np.int64
+        )
+        np.testing.assert_array_equal(first_children, expected_first)
         blocks = [b for b, _ in chunks]
         assert len(set(blocks)) == 4
         # block (0,0) shard -> inner chunks (0,0),(0,1),(1,0),(1,1).
