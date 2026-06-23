@@ -41,16 +41,25 @@ def _arrow_column(block: np.ndarray, sig: dict):
     return pa.FixedSizeListArray.from_arrays(pa.array(flat), width)
 
 
-def _build_output(stats_arrays, data_vars, agg_fields, grid, shard_key, use_arrow: bool):
+def _build_output(
+    stats_arrays, data_vars, agg_fields, grid, shard_key, use_arrow: bool, *, children=None
+):
     """Assemble the per-shard output carrier from the per-cell stats blocks.
 
     Returns a ``pandas.DataFrame`` for a pure-scalar config (unchanged) or a
     ``pyarrow.Table`` when any ``vector`` field is present, in both cases with the
     data-variable columns followed by the grid's per-cell coord columns.
+
+    ``children`` (issue #30 item 3): when given, the coord columns are computed
+    for that explicit chunk's cells via ``grid.coords_of(children)`` instead of the
+    whole shard's ``grid.chunk_coords(shard_key)``. This is what lets the K>1 worker
+    build one carrier per finer chunk. ``None`` (default) is the K==1 path — the
+    coords are the shard's, byte-for-byte unchanged.
     """
+    coords = grid.coords_of(children) if children is not None else grid.chunk_coords(shard_key)
     if not use_arrow:
         df_out = pd.DataFrame({var: stats_arrays[var] for var in data_vars})
-        for col_name, vals in grid.chunk_coords(shard_key).items():
+        for col_name, vals in coords.items():
             df_out[col_name] = vals
         return df_out
 
@@ -60,7 +69,7 @@ def _build_output(stats_arrays, data_vars, agg_fields, grid, shard_key, use_arro
         var: _arrow_column(stats_arrays[var], get_output_signature(agg_fields[var]))
         for var in data_vars
     }
-    for col_name, vals in grid.chunk_coords(shard_key).items():
+    for col_name, vals in coords.items():
         # Route the morton coordinate through the same uint64 boundary as the
         # pandas carrier (#71), so both carriers share one on-disk dtype guarantee
         # rather than relying on MortonIndexArray.__array__ returning uint64.

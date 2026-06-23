@@ -486,6 +486,87 @@ def _coerce_ragged_value(value, sig: dict) -> np.ndarray:
     return np.ascontiguousarray(arr)
 
 
+def _aggregate_chunk_cells(
+    children,
+    col_arrays: dict,
+    cell_to_slice: dict,
+    chunk_scalars: dict,
+    config: PipelineConfig,
+    data_vars,
+    agg_fields: dict,
+):
+    """Compute per-cell stats for one chunk's ``children`` (default numpy path).
+
+    The per-cell aggregation loop, lifted out of ``process_shard`` so the
+    multi-chunk-per-worker path (issue #30 item 3) can call it once per finer
+    chunk. ``children`` are the chunk's cell ids in canonical order; the pooled
+    ``col_arrays``/``cell_to_slice`` (grouped once over the whole shard) and the
+    shard-level ``chunk_scalars`` are shared across chunks. At K==1 ``children`` is
+    the whole shard's, so this is byte-for-byte the old single-chunk loop.
+
+    Returns ``(stats_arrays, ragged_payloads, ragged_cell_indices,
+    cells_with_data)``: dense fields preallocated to ``(n_cells, *trailing_shape)``
+    and filled per cell; ragged fields collected as ``(payloads, cell_indices)``
+    keyed by the cell's position in ``children`` (the chunk-local index the CSR
+    writer expects).
+    """
+    children = np.asarray(children)
+    n_cells = len(children)
+    stats_arrays: dict = {}
+    ragged_payloads: dict[str, list] = {}
+    ragged_cell_indices: dict[str, list[int]] = {}
+    for name in data_vars:
+        meta = agg_fields[name]
+        sig = get_output_signature(meta)
+        if sig["kind"] == "ragged":
+            ragged_payloads[name] = []
+            ragged_cell_indices[name] = []
+            continue
+        # Vector fields (issue #29) get a per-cell (n_cells, *trailing_shape) block;
+        # scalars keep the 1-D (n_cells,) layout, unchanged.
+        shape = (n_cells, *sig["trailing_shape"])
+        zarr_dtype = np.dtype(meta.get("dtype", "float32"))
+        fill_value = meta.get("fill_value", "NaN")
+        if fill_value == "NaN":
+            stats_arrays[name] = np.full(shape, np.nan, dtype=zarr_dtype)
+        else:
+            stats_arrays[name] = np.zeros(shape, dtype=zarr_dtype)
+
+    _empty: dict[str, np.ndarray] = {col: arr[:0] for col, arr in col_arrays.items()}
+
+    cells_with_data = 0
+    for i, child_morton in enumerate(children):
+        child_key = int(child_morton)
+        if child_key in cell_to_slice:
+            start, end = cell_to_slice[child_key]
+            cell_data: dict[str, np.ndarray] = {
+                col: arr[start:end] for col, arr in col_arrays.items()
+            }
+            cells_with_data += 1
+        else:
+            cell_data = _empty
+        # Inject the chunk-level scalars into this cell's namespace (no-op when
+        # empty, so non-precompute configs are unchanged).
+        cell_namespace: dict[str, Any] = (
+            {**cell_data, **chunk_scalars} if chunk_scalars else cell_data
+        )
+        stats = calculate_cell_statistics(
+            cell_namespace, value_col="h_li", sigma_col="s_li", config=config
+        )
+        for key, value in stats.items():
+            if key in ragged_payloads:
+                # Ragged field: collect non-empty payloads with their chunk-local
+                # cell index. Empty cells (``_empty_cell_value`` -> []) are skipped.
+                arr_val = np.asarray(value)
+                if arr_val.size > 0:
+                    ragged_payloads[key].append(arr_val)
+                    ragged_cell_indices[key].append(i)
+            else:
+                stats_arrays[key][i] = value
+
+    return stats_arrays, ragged_payloads, ragged_cell_indices, cells_with_data
+
+
 # EXPERIMENTAL (phase 2b of #30) -----------------------------------------------
 # Dual aggregation contract
 # -------------------------

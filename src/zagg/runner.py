@@ -294,13 +294,19 @@ def _check_signature(grid, catalog_data: dict) -> None:
 def _process_and_write(shard_key, chunk_idx, records, grid,
                        s3_creds, zarr_store, config, driver=None,
                        handoff="pandas"):
-    """Process a single shard and write results to store."""
-    # ``ragged_out`` is the out-of-band sink for ``kind: ragged`` (CSR) fields
-    # (issue #48): process_shard fills it with ``{field: (payloads, cell_ids)}``
-    # while still returning the dense ``(df_out, metadata)`` 2-tuple. Empty for a
-    # config with no ragged field, so the CSR write below no-ops.
-    ragged_out: dict = {}
-    df_out, metadata = process_shard(
+    """Process a single shard and write its K finer chunks to the store.
+
+    Multi-chunk-per-worker (issue #30 item 3): one shard owns
+    ``K = grid.chunks_per_shard`` finer Zarr chunks. ``process_shard`` reads the
+    granules once and returns one ``(block_index, carrier, ragged)`` per chunk via
+    ``chunk_results``; this writes each chunk's dense region (at its own
+    ``block_index``) plus its ragged (CSR) companion. At K==1 ``chunk_results`` has
+    exactly one entry whose ``block_index`` equals ``chunk_idx``, so the write is
+    byte-for-byte the single-chunk path. ``chunk_idx`` is retained for the K==1
+    callers/signature but the per-chunk block index from ``iter_chunks`` is used.
+    """
+    chunk_results: list = []
+    _df_out, metadata = process_shard(
         grid,
         int(shard_key),
         _resolve_urls(records, driver),
@@ -308,23 +314,45 @@ def _process_and_write(shard_key, chunk_idx, records, grid,
         config=config,
         driver=driver,
         handoff=handoff,
-        ragged_out=ragged_out,
+        chunk_results=chunk_results,
     )
-    # write_dataframe_to_zarr no-ops on an empty carrier (DataFrame or Arrow
-    # table), so no carrier-specific emptiness check is needed here.
-    write_dataframe_to_zarr(
-        df_out, zarr_store,
-        grid=grid,
-        chunk_idx=chunk_idx,
-    )
-    # Persist any ragged (CSR) fields at cell resolution — one CSR group per field
-    # per shard (issue #48). No-ops cleanly when ``ragged_out`` is empty.
-    write_ragged_to_zarr(
-        ragged_out, zarr_store,
-        grid=grid,
-        shard_key=int(shard_key),
-    )
+    single_chunk = len(chunk_results) == 1
+    for block_index, carrier, ragged in chunk_results:
+        # write_dataframe_to_zarr no-ops on an empty carrier (DataFrame or Arrow
+        # table), so no carrier-specific emptiness check is needed here.
+        write_dataframe_to_zarr(
+            carrier, zarr_store,
+            grid=grid,
+            chunk_idx=block_index,
+        )
+        # Persist this chunk's ragged (CSR) fields — one CSR group per field per
+        # chunk (issue #48). At K==1 the chunk IS the shard, so the CSR subgroup is
+        # keyed by ``shard_key`` (the phase-4b cell-resolution contract); at K>1
+        # each finer chunk is keyed by its own block index so the K groups stay
+        # distinct. No-ops when ``ragged`` is empty.
+        ragged_key = int(shard_key) if single_chunk else _block_index_key(block_index)
+        write_ragged_to_zarr(
+            ragged, zarr_store,
+            grid=grid,
+            shard_key=ragged_key,
+        )
     return metadata
+
+
+def _block_index_key(block_index) -> int:
+    """Flatten a chunk's block-index tuple to the CSR subgroup key (issue #48, K>1).
+
+    1-D grids (the HEALPix companion grid, the typical case) yield a single-element
+    block index used directly; a multi-axis (rectilinear) block index is packed
+    row-major so each chunk still maps to a distinct CSR subgroup name.
+    """
+    block = tuple(int(b) for b in block_index)
+    if len(block) == 1:
+        return block[0]
+    key = 0
+    for b in block:
+        key = key * (1 << 21) + b
+    return key
 
 
 def _run_local(config, catalog_data, store_path, child_order, *,

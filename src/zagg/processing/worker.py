@@ -15,7 +15,7 @@ existing tests that ``monkeypatch.setattr("zagg.processing._read_group", ...)``
 import logging
 import warnings
 from datetime import datetime
-from typing import Any, List, Tuple
+from typing import List, Tuple
 
 import numpy as np
 import pandas as pd
@@ -29,12 +29,12 @@ from zagg.config import (
     get_output_signature,
 )
 from zagg.processing.aggregate import (
+    _aggregate_chunk_cells,
     _concat_and_group,
     _eval_chunk_precompute,
     _has_ragged_fields,
     _has_vector_fields,
     _kernel_aggregate,
-    calculate_cell_statistics,
 )
 from zagg.processing.write import _build_output
 from zagg.schema import ProcessingMetadata
@@ -53,6 +53,7 @@ def process_shard(
     driver: str | None = None,
     handoff: str = "pandas",
     ragged_out: dict | None = None,
+    chunk_results: list | None = None,
 ) -> Tuple[pd.DataFrame, ProcessingMetadata]:
     """Process one shard: read granules, filter to this shard, aggregate, return df.
 
@@ -96,7 +97,23 @@ def process_shard(
         caller to hand to :func:`zagg.processing.write.write_ragged_to_zarr`. The
         return value stays the 2-tuple ``(df_out, metadata)`` so existing 2-tuple
         callers are unaffected; ``None`` (default) collects-then-discards the
-        ragged payloads exactly as before (byte-for-byte unchanged).
+        ragged payloads exactly as before (byte-for-byte unchanged). At K>1 (see
+        ``chunk_results``) the ragged payloads are delivered per chunk via that
+        sink instead, and ``ragged_out`` is left untouched.
+    chunk_results : list, optional
+        Out-param sink for the multi-chunk-per-worker path (issue #30 item 3).
+        When the grid sets a finer ``chunk_inner`` (``K = grid.chunks_per_shard >
+        1``), one worker (one shard) owns K finer Zarr chunks: this fills the list
+        with one ``(block_index, carrier, ragged)`` tuple per chunk —
+        ``block_index`` the chunk's storage block (from ``grid.iter_chunks``),
+        ``carrier`` its dense DataFrame/Table, ``ragged`` its
+        ``{field: (values_list, cell_ids)}`` CSR map — for the caller to write K
+        regions + K companion slices. The returned 2-tuple's ``df_out`` is an empty
+        carrier in that case (the real carriers live in ``chunk_results``).
+        ``None`` (default) is the K==1 path: the single chunk's carrier is the
+        returned ``df_out`` and ragged goes to ``ragged_out`` — byte-for-byte
+        unchanged. A caller that passes ``None`` while the grid has K>1 cannot place
+        the K carriers, so that combination raises.
 
     Returns
     -------
@@ -104,7 +121,8 @@ def process_shard(
         DataFrame in canonical chunk order; metadata dict with ``shard_key``,
         ``cells_with_data``, ``total_obs``, ``granule_count``,
         ``files_processed``, ``duration_s``, ``error``. Ragged (CSR) fields are
-        delivered out-of-band via ``ragged_out`` (above), not in this tuple.
+        delivered out-of-band via ``ragged_out`` (above), not in this tuple. At
+        K>1 the per-chunk carriers + ragged are delivered via ``chunk_results``.
     """
     if config is None:
         config = default_config()
@@ -208,19 +226,28 @@ def process_shard(
         metadata["duration_s"] = (datetime.now() - start_time).total_seconds()
         return pd.DataFrame(), metadata
 
-    children = grid.children(shard_key)
     data_vars = get_data_vars(config)
+    agg_fields = get_agg_fields(config)
+    dense_vars = [v for v in data_vars if get_output_signature(agg_fields[v])["kind"] != "ragged"]
+    use_arrow = _has_vector_fields(config)
 
-    # Ragged-field collectors (issue #48): populated only in the non-kernel path;
-    # initialized here so the post-if/else _build_output call can reference them
-    # regardless of which branch ran.
-    ragged_payloads: dict[str, list] = {}
-    ragged_cell_indices: dict[str, list[int]] = {}
+    # K = number of finer Zarr chunks this shard owns (issue #30 item 3). K==1 is
+    # the unchanged single-chunk path; K>1 fans the shard into ``grid.iter_chunks``.
+    chunks_per_shard = int(getattr(grid, "chunks_per_shard", 1))
+    if chunks_per_shard > 1 and chunk_results is None:
+        raise ValueError(
+            f"grid has chunks_per_shard={chunks_per_shard} (chunk_inner set, issue #30 "
+            f"item 3) but process_shard was called without a chunk_results sink; the K "
+            f"per-chunk carriers cannot be returned through the single df_out. Pass "
+            f"chunk_results=[] (the runner does)."
+        )
 
+    # ---- Pool the shard's reads ONCE (shared across all K chunks) -------------
+    # ``chunk_scalars`` (chunk_precompute, issue #30 item 1) are reduced once over
+    # the whole shard and reused for every chunk — a chunk-resolution companion is
+    # chunk-uniform, so the same shard-level anchor feeds each chunk's cells.
     if handoff == "arrow-kernel":
-        # EXPERIMENTAL (phase 2b of #30): reduce via pyarrow hash-aggregate kernels
-        # instead of the per-cell numpy loop. Not byte-identical to the default
-        # path (float mean/variance diverge by ~1 ULP — see KERNEL_RTOL).
+        # EXPERIMENTAL (phase 2b of #30): reduce via pyarrow hash-aggregate kernels.
         if _has_ragged_fields(config):
             raise NotImplementedError(
                 "handoff='arrow-kernel' does not support ragged fields (issue #48); "
@@ -235,110 +262,74 @@ def process_shard(
         n_obs_total = table.num_rows
         cell_col = grid.cells_of(table.column("leaf_id").to_numpy(zero_copy_only=False))
         logger.info(f"  Read {n_obs_total:,} observations")
-        # Per-chunk precompute hook (issue #30): reduce each entry ONCE over the
-        # pooled arrow table. Columns are dense + null-free (guarded above), so the
-        # ``to_numpy`` extraction is zero-copy where the buffer layout allows and
-        # dtype-exact otherwise — the same numpy arrays the pandas/arrow carriers
-        # feed in. The resulting scalars/arrays are threaded into the kernel
-        # fallback per-cell loop (where expression fields resolve).
         pooled = {n: table.column(n).to_numpy(zero_copy_only=False) for n in table.column_names}
         chunk_scalars = _eval_chunk_precompute(config, pooled)
-        logger.info(f"  Calculating statistics for {len(children)} cells (kernel)...")
-        kernel = _kernel_aggregate(
-            table, cell_col, children, "h_li", config, chunk_scalars=chunk_scalars
-        )
-        stats_arrays = kernel["stats_arrays"]
-        cells_with_data = kernel["cells_with_data"]
-        n_cells = len(children)
     else:
         # Concat the per-group reads and split observations by cell (carrier-
         # agnostic; both carriers feed identical numpy arrays into _group_columns).
         col_arrays, cell_to_slice, n_obs_total = _concat_and_group(all_reads, grid, handoff)
         logger.info(f"  Read {n_obs_total:,} observations")
-
-        # Per-chunk precompute hook (issue #30, item 1): evaluate each
-        # ``chunk_precompute`` entry ONCE over the shard's pooled columns, then
-        # inject the resulting chunk-level scalars into every cell's namespace so a
-        # per-cell expression can reference a chunk-uniform anchor (e.g. the 128-bin
-        # waveform window). Empty when the block is absent, so the per-cell path is
-        # byte-for-byte unchanged for configs that do not use the hook.
         chunk_scalars = _eval_chunk_precompute(config, col_arrays)
-        logger.info(f"  Calculating statistics for {len(children)} cells...")
 
-        n_cells = len(children)
-        agg_fields = get_agg_fields(config)
-        stats_arrays: dict = {}
-        # Ragged fields (issue #48) are variable-length per-cell; they cannot be
-        # preallocated as a dense block. ``ragged_payloads``/``ragged_cell_indices``
-        # are pre-initialized before this branch (see above); fill them in the loop.
-        for name in data_vars:
-            meta = agg_fields[name]
-            sig = get_output_signature(meta)
-            if sig["kind"] == "ragged":
-                ragged_payloads[name] = []
-                ragged_cell_indices[name] = []
-                continue
-            # Vector fields (issue #29) get a per-cell (n_cells, *trailing_shape)
-            # block; scalars keep the 1-D (n_cells,) layout, unchanged. Either way
-            # ``stats_arrays[name][i] = value`` assigns the cell's result row.
-            shape = (n_cells, *sig["trailing_shape"])
-            zarr_dtype = np.dtype(meta.get("dtype", "float32"))
-            fill_value = meta.get("fill_value", "NaN")
-            if fill_value == "NaN":
-                stats_arrays[name] = np.full(shape, np.nan, dtype=zarr_dtype)
-            else:
-                stats_arrays[name] = np.zeros(shape, dtype=zarr_dtype)
+    # ---- Aggregate + build one carrier per finer chunk -----------------------
+    # ``iter_chunks`` is the K-chunk seam (issue #30 item 3); a minimal grid (e.g.
+    # a test stub) without it is implicitly K==1 — fall back to the single chunk
+    # ``(block_index(shard_key), children(shard_key))``, the byte-identical path.
+    if hasattr(grid, "iter_chunks"):
+        chunk_iter = grid.iter_chunks(shard_key)
+    else:
+        # Minimal stub: derive the lone chunk's children and (only when a sink
+        # needs it) its block index. ``block_index`` may be absent on a stub that
+        # never returns through ``chunk_results``; default to () in that case.
+        fallback_block = grid.block_index(shard_key) if hasattr(grid, "block_index") else ()
+        chunk_iter = iter([(fallback_block, grid.children(shard_key))])
 
-        # Per-cell observation slices (grouped above, carrier-agnostic).
-        _empty: dict[str, np.ndarray] = {col: arr[:0] for col, arr in col_arrays.items()}
-
-        cells_with_data = 0
-        for i, child_morton in enumerate(children):
-            if child_morton in cell_to_slice:
-                start, end = cell_to_slice[child_morton]
-                cell_data: dict[str, np.ndarray] = {
-                    col: arr[start:end] for col, arr in col_arrays.items()
-                }
-                cells_with_data += 1
-            else:
-                cell_data = _empty
-            # Inject the chunk-level scalars into this cell's namespace (no-op when
-            # ``chunk_scalars`` is empty, so non-precompute configs are unchanged).
-            cell_namespace: dict[str, Any] = (
-                {**cell_data, **chunk_scalars} if chunk_scalars else cell_data
+    cells_with_data = 0
+    single_carrier = None
+    single_ragged: dict = {}
+    for block_index, chunk_children in chunk_iter:
+        chunk_children = np.asarray(chunk_children)
+        if handoff == "arrow-kernel":
+            kernel = _kernel_aggregate(
+                table, cell_col, chunk_children, "h_li", config, chunk_scalars=chunk_scalars
             )
-            stats = calculate_cell_statistics(
-                cell_namespace, value_col="h_li", sigma_col="s_li", config=config
+            stats_arrays = kernel["stats_arrays"]
+            cells_with_data += kernel["cells_with_data"]
+            ragged_payloads: dict[str, list] = {}
+        else:
+            stats_arrays, ragged_payloads, ragged_idx, cwd = _aggregate_chunk_cells(
+                chunk_children,
+                col_arrays,
+                cell_to_slice,
+                chunk_scalars,
+                config,
+                data_vars,
+                agg_fields,
             )
-            for key, value in stats.items():
-                if key in ragged_payloads:
-                    # Ragged field: collect non-empty payloads with their cell index.
-                    # Empty cells (from _empty_cell_value -> []) are skipped; the
-                    # CSR writer represents absent cells via ``cell_ids``.
-                    arr_val = np.asarray(value)
-                    if arr_val.size > 0:
-                        ragged_payloads[key].append(arr_val)
-                        ragged_cell_indices[key].append(i)
-                else:
-                    stats_arrays[key][i] = value
+            cells_with_data += cwd
+        carrier = _build_output(
+            stats_arrays,
+            dense_vars,
+            agg_fields,
+            grid,
+            shard_key,
+            use_arrow=use_arrow,
+            children=(chunk_children if chunks_per_shard > 1 else None),
+        )
+        ragged = (
+            {name: (ragged_payloads[name], ragged_idx[name]) for name in ragged_payloads}
+            if handoff != "arrow-kernel"
+            else {}
+        )
+        if chunk_results is not None:
+            chunk_results.append((block_index, carrier, ragged))
+        else:
+            # K==1 path: stash the lone chunk's carrier + ragged for the 2-tuple
+            # return / ``ragged_out`` sink below (byte-for-byte the old behavior).
+            single_carrier = carrier
+            single_ragged = ragged
 
-    logger.info(f"  Statistics: {cells_with_data}/{n_cells} cells with data")
-
-    # Assemble the output carrier: a plain DataFrame for a pure-scalar config
-    # (unchanged), or a pyarrow.Table with FixedSizeList vector columns when any
-    # field declares a non-scalar output (issue #29). Scalars stay byte-identical.
-    # Ragged fields (issue #48) are excluded from the dense carrier — they are
-    # returned separately as (payloads, cell_indices) for the CSR writer.
-    _agg_fields = get_agg_fields(config)
-    dense_vars = [v for v in data_vars if get_output_signature(_agg_fields[v])["kind"] != "ragged"]
-    df_out = _build_output(
-        stats_arrays,
-        dense_vars,
-        _agg_fields,
-        grid,
-        shard_key,
-        use_arrow=_has_vector_fields(config),
-    )
+    logger.info(f"  Statistics: {cells_with_data} cells with data")
 
     duration = (datetime.now() - start_time).total_seconds()
     logger.info(f"Completed shard {shard_key} in {duration:.1f}s")
@@ -347,15 +338,16 @@ def process_shard(
     metadata["total_obs"] = n_obs_total
     metadata["duration_s"] = duration
 
-    # Hand the collected ragged (CSR) payloads back out-of-band (issue #48). The
-    # per-cell loop above already gathered ``(payloads, cell_indices)`` per ragged
-    # field; thread them to the caller for the CSR write. A field with no
-    # populated cell still gets an empty entry so the caller can no-op cleanly.
-    # ``handoff="arrow-kernel"`` rejects ragged fields up front, so the collectors
-    # are empty there and this is a no-op (the entries are simply absent).
-    if ragged_out is not None:
-        for name in ragged_payloads:
-            ragged_out[name] = (ragged_payloads[name], ragged_cell_indices[name])
+    # K==1: deliver the lone chunk's carrier as the 2-tuple ``df_out`` and its
+    # ragged via ``ragged_out`` (unchanged contract). K>1: the carriers + ragged
+    # were appended to ``chunk_results``; return an empty carrier here.
+    if chunk_results is not None:
+        df_out = pd.DataFrame()
+    else:
+        df_out = single_carrier if single_carrier is not None else pd.DataFrame()
+        if ragged_out is not None:
+            for name, payload in single_ragged.items():
+                ragged_out[name] = payload
 
     return df_out, metadata
 
