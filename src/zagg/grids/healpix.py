@@ -357,10 +357,18 @@ class HealpixGrid:
             fill = meta.get("fill_value", "NaN")
             members[name] = base.with_data_type(dtype).with_fill_value(fill)
         for name, meta in get_agg_fields(self.config).items():
+            sig = get_output_signature(meta)
+            # Ragged fields (issue #48) are stored as CSR subgroups
+            # (``{name}/{shard_key}/values|offsets|cell_ids``) written fresh by
+            # ``write_ragged_to_zarr`` — NOT a dense array. Emitting a dense
+            # ``{name}`` array here would make ``{name}`` an array, and CSR's
+            # per-shard child groups under it would then collide ("only groups may
+            # have child nodes"). Skip them so ``{name}`` stays a group prefix.
+            if sig["kind"] == "ragged":
+                continue
             dtype = meta.get("dtype", "float32")
             fill = meta.get("fill_value", "NaN")
             spec = base.with_data_type(dtype).with_fill_value(fill)
-            sig = get_output_signature(meta)
             if sig["resolution"] == "chunk":
                 # A resolution: chunk field (issues #30 item 2, #82) is stored once
                 # per chunk in a companion array shaped at the chunk grid, indexed by
