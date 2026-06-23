@@ -52,6 +52,7 @@ def process_shard(
     config: PipelineConfig | None = None,
     driver: str | None = None,
     handoff: str = "pandas",
+    ragged_out: dict | None = None,
 ) -> Tuple[pd.DataFrame, ProcessingMetadata]:
     """Process one shard: read granules, filter to this shard, aggregate, return df.
 
@@ -87,13 +88,23 @@ def process_shard(
         float ``mean``/``variance`` differ by ~1 ULP (agree within
         :data:`KERNEL_RTOL`, not byte identical). All three are opt-in while
         benchmarked (issue #30).
+    ragged_out : dict, optional
+        Out-param sink for ``kind: ragged`` (CSR) fields (issue #48). When a dict
+        is passed, it is filled in place with ``{field_name: (values_list,
+        cell_ids)}`` — ``values_list`` the per-populated-cell payload arrays and
+        ``cell_ids`` their position in the chunk's ``children`` block — for the
+        caller to hand to :func:`zagg.processing.write.write_ragged_to_zarr`. The
+        return value stays the 2-tuple ``(df_out, metadata)`` so existing 2-tuple
+        callers are unaffected; ``None`` (default) collects-then-discards the
+        ragged payloads exactly as before (byte-for-byte unchanged).
 
     Returns
     -------
     (DataFrame, metadata)
         DataFrame in canonical chunk order; metadata dict with ``shard_key``,
         ``cells_with_data``, ``total_obs``, ``granule_count``,
-        ``files_processed``, ``duration_s``, ``error``.
+        ``files_processed``, ``duration_s``, ``error``. Ragged (CSR) fields are
+        delivered out-of-band via ``ragged_out`` (above), not in this tuple.
     """
     if config is None:
         config = default_config()
@@ -335,6 +346,16 @@ def process_shard(
     metadata["cells_with_data"] = cells_with_data
     metadata["total_obs"] = n_obs_total
     metadata["duration_s"] = duration
+
+    # Hand the collected ragged (CSR) payloads back out-of-band (issue #48). The
+    # per-cell loop above already gathered ``(payloads, cell_indices)`` per ragged
+    # field; thread them to the caller for the CSR write. A field with no
+    # populated cell still gets an empty entry so the caller can no-op cleanly.
+    # ``handoff="arrow-kernel"`` rejects ragged fields up front, so the collectors
+    # are empty there and this is a no-op (the entries are simply absent).
+    if ragged_out is not None:
+        for name in ragged_payloads:
+            ragged_out[name] = (ragged_payloads[name], ragged_cell_indices[name])
 
     return df_out, metadata
 
