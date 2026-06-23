@@ -15,7 +15,18 @@ corridors at fixed offsets, and intersect those instead.
 same exterior-ring form the swath polygon already uses, so both shard-map
 backends (spherely S2 polygons and mortie ``morton_coverage``) consume it
 unchanged.
+
+.. deprecated::
+    This whole module is a stopgap geometric approximation of per-beam coverage.
+    Remove it once a better fix lands -- native per-beam CMR geometry, the
+    memory-handling robustness in #66 (so reading the full swath is affordable),
+    or data virtualization tracked in #97. The ``footprint="beams"`` surface in
+    :mod:`zagg.catalog.shardmap` carries the same marker.
 """
+
+# DEPRECATED -- remove this module when a better fix lands: native per-beam CMR
+# geometry, OR the memory-handling robustness in #66, OR data virtualization
+# tracked in #97. Marked per the deprecation direction on PR #67.
 
 from __future__ import annotations
 
@@ -48,7 +59,12 @@ _EXPECTED_SWATH_HALF_WIDTH_M: float = 6300.0
 
 
 def is_beam_product(product: str | None) -> bool:
-    """True for ICESat-2 products whose CMR swath decomposes into beam corridors."""
+    """True for ICESat-2 products whose CMR swath decomposes into beam corridors.
+
+    .. deprecated::
+        Part of the stopgap beam-corridor mechanism; remove with the rest of
+        this module once native per-beam CMR geometry, #66, or #97 lands.
+    """
     if not product:
         return False
     return product.upper() in _BEAM_PRODUCTS
@@ -179,6 +195,11 @@ def beam_tracks_from_cmr_polygon(
     half_width_m: float = _BEAM_CORRIDOR_HALF_WIDTH_M,
 ) -> list[tuple[np.ndarray, np.ndarray]]:
     """Decompose a CMR swath polygon into per-beam-pair corridor rings.
+
+    .. deprecated::
+        This is a stopgap geometric approximation (see the module docstring).
+        Remove it once a better fix lands -- native per-beam CMR geometry, the
+        memory-handling robustness in #66, or data virtualization tracked in #97.
 
     Parameters
     ----------

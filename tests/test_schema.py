@@ -87,7 +87,10 @@ class TestCreateZarrTemplate:
 
         group = open_group(store, path="8", mode="r")
         assert group["cell_ids"].dtype == np.uint64
-        assert group["morton"].dtype == np.int64
+        # morton is stored as uint64 (#71): the mortie MortonIndexArray's packed
+        # words are unsigned, so base cells 7-11 (bit 63 set) no longer read back
+        # negative as they did under the old int64 coordinate.
+        assert group["morton"].dtype == np.uint64
 
     def test_count_dtype(self):
         store = MemoryStore()

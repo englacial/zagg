@@ -7,8 +7,8 @@ storage-block mapping, footprint geometry, and Zarr template emission.
 Terminology
 -----------
 - **leaf id** — the high-precision spatial identifier returned by ``assign``.
-  Grid-specific (HEALPix: order-18 morton; rectilinear: flat row-major cell
-  index). Pipeline code treats it as an opaque integer.
+  Grid-specific (HEALPix: morton at the grid's reference order; rectilinear:
+  flat row-major cell index). Pipeline code treats it as an opaque integer.
 - **cell id** — the aggregation-grid identifier returned by ``cells_of`` and
   ``children``. For some grids (rectilinear) leaf id and cell id coincide.
 - **shard key** — the write-partition identifier returned by ``shard_of``.
@@ -20,6 +20,7 @@ algorithmically (rectilinear, fullsphere DGGS) the two collapse; for dense-
 packed sparse DGGS arrays they differ and block_index needs the populated-
 shard list to translate.
 """
+
 from __future__ import annotations
 
 from typing import Any, Protocol, runtime_checkable
@@ -91,6 +92,54 @@ def vector_array_spec(base, sig, *, base_dims, base_chunk_shape):
     )
 
 
+def chunk_array_spec(base, *, chunk_grid_shape, chunk_dims):
+    """Build a chunk-resolution companion ``ArraySpec`` from a scalar data-var spec.
+
+    Issue #30 item 2: a ``resolution: chunk`` field stores ONE value per chunk
+    rather than one per aggregation cell. Its array is shaped at the *chunk grid*
+    (``grid.chunk_grid_shape`` = number of chunks along each axis), with one Zarr
+    block per chunk so :func:`zagg.processing.write_dataframe_to_zarr` writes a
+    chunk's single value at its chunk block index.
+
+    At K==1 (``chunk_inner`` unset, one chunk per shard) that index is
+    ``grid.block_index(shard_key)``. At K>1 (issue #30 item 3) the chunk grid is
+    finer than the shard grid, so the per-chunk index is the block yielded by
+    ``grid.iter_chunks(shard_key)``, not ``block_index``.
+
+    The companion carries the field's ``dtype``/``fill_value`` (inherited from
+    ``base``); only its shape, dimension names and chunk grid are re-set to the
+    chunk grid. Each axis is chunked ``1`` (one chunk == one block).
+
+    Parameters
+    ----------
+    base : ArraySpec
+        The scalar data-var spec for this field (already carries
+        ``dtype``/``fill_value``).
+    chunk_grid_shape : tuple of int
+        Number of chunks along each spatial axis (the companion array shape).
+    chunk_dims : tuple of str
+        Dimension names for the chunk-grid axes (e.g. ``("chunks",)`` for HEALPix,
+        ``("chunk_y", "chunk_x")`` for rectilinear).
+
+    Returns
+    -------
+    ArraySpec
+    """
+    from pydantic_zarr.experimental.v3 import NamedConfig
+
+    shape = tuple(int(s) for s in chunk_grid_shape)
+    chunk_shape = tuple(1 for _ in shape)
+    chunk_grid = NamedConfig(name="regular", configuration={"chunk_shape": list(chunk_shape)})
+    return type(base)(
+        **{
+            **base.model_dump(),
+            "shape": shape,
+            "dimension_names": tuple(chunk_dims),
+            "chunk_grid": chunk_grid,
+        }
+    )
+
+
 class InconsistentShardError(ValueError):
     """Raised by shard_of when input cells don't all share a shard."""
 
@@ -113,9 +162,7 @@ class OutputGrid(Protocol):
         """Per-chunk shape (rank matches ``array_shape``)."""
         ...
 
-    def coverage(
-        self, polygon_parts: list[tuple[np.ndarray, np.ndarray]]
-    ) -> np.ndarray:
+    def coverage(self, polygon_parts: list[tuple[np.ndarray, np.ndarray]]) -> np.ndarray:
         """Enumerate shard keys covering multipart polygons."""
         ...
 
@@ -198,4 +245,5 @@ __all__ = [
     "ShardKey",
     "InconsistentShardError",
     "vector_array_spec",
+    "chunk_array_spec",
 ]

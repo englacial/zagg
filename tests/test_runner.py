@@ -5,7 +5,8 @@ import json
 import pytest
 
 from zagg.config import default_config
-from zagg.runner import _load_catalog, _select_cells, agg
+from zagg.grids import HealpixGrid, RectilinearGrid, from_config
+from zagg.runner import _check_signature, _load_catalog, _select_cells, agg
 
 
 @pytest.fixture
@@ -119,6 +120,82 @@ class TestLoadCatalog:
         p.write_text(json.dumps(old))
         with pytest.raises(ValueError, match="not a Phase-5 ShardMap"):
             _load_catalog(str(p))
+
+
+class TestCheckSignature:
+    """The shard-map reuse guard compares the *spatial* signature only (#89).
+
+    A ShardMap is a spatial artifact, so it must validate any config that shares
+    the spatial grid while declaring different aggregation fields, and still
+    reject a genuinely different spatial grid. Old (full-signature) maps keep
+    validating via a spatial-subset projection.
+    """
+
+    @staticmethod
+    def _grid(name):
+        return from_config(default_config(name))
+
+    @staticmethod
+    def _catalog(grid_signature):
+        return {"metadata": {}, "grid_signature": grid_signature,
+                "shard_keys": [0], "granules": [[_rec(1)]]}
+
+    def test_cross_aggregator_reuse_healpix(self):
+        # Headline: a map built for tdigest validates a gain_bias run (same
+        # parent11/chunk_inner13/child19 spatial grid, different agg fields).
+        tdigest = self._grid("atl03_tdigest_healpix")
+        gain_bias = self._grid("atl03_gain_bias_healpix")
+        assert tdigest.signature() != gain_bias.signature()  # full sigs differ
+        built = self._catalog(tdigest.spatial_signature())
+        _check_signature(gain_bias, built)  # no raise
+        # ... and the reverse.
+        _check_signature(tdigest, self._catalog(gain_bias.spatial_signature()))
+
+    def test_different_spatial_grid_raises_healpix(self):
+        a = HealpixGrid(6, 12, layout="fullsphere")
+        built = self._catalog(a.spatial_signature())
+        # Different parent_order/child_order -> spatial mismatch -> raise.
+        b = HealpixGrid(7, 13, layout="fullsphere")
+        with pytest.raises(ValueError, match="different grid"):
+            _check_signature(b, built)
+
+    def test_old_full_signature_validates_and_reuses(self):
+        # Back-compat: an OLD-style stored signature carrying output_fields (the
+        # full signature) validates against a matching spatial grid AND is
+        # reusable across differing agg fields (the projection drops output_fields).
+        tdigest = self._grid("atl03_tdigest_healpix")
+        gain_bias = self._grid("atl03_gain_bias_healpix")
+        old = self._catalog(tdigest.signature())  # full sig (incl. output_fields)
+        assert "output_fields" in old["grid_signature"]
+        _check_signature(tdigest, old)  # same config: validates
+        _check_signature(gain_bias, old)  # different agg fields: still reusable
+
+    def test_none_signature_early_return(self):
+        grid = self._grid("atl03_tdigest_healpix")
+        _check_signature(grid, {"metadata": {}})  # no grid_signature key -> no raise
+
+    def test_rectilinear_cross_aggregator_reuse(self):
+        bounds = [359400, 4300740, 369400, 4310740]
+        a = RectilinearGrid("EPSG:32618", 10, bounds, [250, 250],
+                            config=default_config("atl06"))
+        b = RectilinearGrid("EPSG:32618", 10, bounds, [250, 250],
+                            config=default_config("atl06_polar"))
+        assert a.signature() != b.signature()
+        _check_signature(b, self._catalog(a.spatial_signature()))  # no raise
+        _check_signature(b, self._catalog(a.signature()))  # old full sig: also ok
+
+    def test_rectilinear_different_spatial_grid_raises(self):
+        bounds = [359400, 4300740, 369400, 4310740]
+        a = RectilinearGrid("EPSG:32618", 10, bounds, [250, 250])
+        built = self._catalog(a.spatial_signature())
+        # Different resolution/shape -> spatial mismatch.
+        b = RectilinearGrid("EPSG:32618", 20, bounds, [250, 250])
+        with pytest.raises(ValueError, match="different grid"):
+            _check_signature(b, built)
+        # Different CRS -> spatial mismatch.
+        c = RectilinearGrid("EPSG:3031", 10, bounds, [250, 250])
+        with pytest.raises(ValueError, match="different grid"):
+            _check_signature(c, built)
 
 
 class TestDenseDeprecation:
@@ -319,3 +396,170 @@ class TestHandoffPassthrough:
             config=atl06_config, driver="s3",
         )
         assert captured["handoff"] == "pandas"
+
+
+def _stub_grid():
+    from unittest.mock import MagicMock
+
+    grid = MagicMock()
+    grid.signature.return_value = {}
+    grid.spatial_signature.return_value = {}
+    grid.block_index.side_effect = lambda k: (k,)
+    grid.emit_template.side_effect = lambda store, overwrite=False: store
+    return grid
+
+
+def _run_catalog():
+    return {
+        "metadata": {}, "grid_signature": {},
+        "shard_keys": [10, 11, 12, 13],
+        "granules": [[{"s3": f"s3://b/g{i}.h5"}] for i in range(4)],
+    }
+
+
+class TestSummaryKeysByteIdentical:
+    """The dispatch refactor (#63) must leave the run-summary dict keys -- and
+    the data/error counting -- byte-identical for both backends.
+
+    These pin the *structure* (key set) and the counters the dispatch loop now
+    rolls up, against mocked per-cell work. Per-cell Lambda event payload bytes
+    are pinned separately in ``TestInvokeLambdaCellEvent``.
+    """
+
+    _LOCAL_KEYS = {
+        "total_cells", "cells_with_data", "cells_error", "total_obs",
+        "wall_time_s", "store_path", "backend", "results",
+    }
+    _LAMBDA_KEYS = {
+        "total_cells", "cells_with_data", "cells_error", "total_obs",
+        "wall_time_s", "lambda_time_s", "gb_seconds", "price_per_gb_sec",
+        "estimated_cost_usd", "store_path", "backend", "function_name",
+        "results",
+    }
+
+    def test_local_summary_keys_and_counts(self, monkeypatch, atl06_config):
+        import zagg.grids as grids_mod
+        from zagg import runner
+
+        monkeypatch.setattr(runner, "get_nsidc_s3_credentials",
+                            lambda: {"accessKeyId": "a", "secretAccessKey": "s",
+                                     "sessionToken": "t"})
+        monkeypatch.setattr(grids_mod, "from_config", lambda *a, **k: _stub_grid())
+        monkeypatch.setattr(runner, "open_store", lambda *a, **k: object())
+        monkeypatch.setattr(runner, "consolidate_metadata", lambda *a, **k: None)
+
+        # 10,13 -> data; 11 -> raised (error, dropped from results); 12 ->
+        # benign no-data meta (in results, not counted).
+        def fake_paw(shard_key, chunk_idx, records, grid, s3_creds, zarr_store,
+                     config, driver=None, handoff="pandas"):
+            if shard_key == 11:
+                raise RuntimeError("boom")
+            if shard_key == 12:
+                return {"shard_key": shard_key, "error": "No data after filtering"}
+            return {"shard_key": shard_key, "total_obs": 7, "error": None}
+
+        monkeypatch.setattr(runner, "_process_and_write", fake_paw)
+
+        summary = runner._run_local(
+            atl06_config, _run_catalog(), "./out.zarr", 12,
+            max_cells=None, morton_cell=None, max_workers=2, overwrite=False,
+            dry_run=False, region="us-west-2",
+        )
+        assert set(summary.keys()) == self._LOCAL_KEYS
+        assert summary["backend"] == "local"
+        assert summary["total_cells"] == 4
+        assert summary["cells_with_data"] == 2
+        assert summary["cells_error"] == 1
+        assert summary["total_obs"] == 14
+        assert len(summary["results"]) == 3  # raised cell excluded
+
+    def test_lambda_summary_keys_and_cost(self, monkeypatch, atl06_config):
+        import boto3
+
+        import zagg.grids as grids_mod
+        from zagg import runner
+        from zagg.concurrency import ConcurrencyReport
+
+        monkeypatch.setattr(runner, "get_nsidc_s3_credentials",
+                            lambda: {"accessKeyId": "a", "secretAccessKey": "s",
+                                     "sessionToken": "t"})
+        monkeypatch.setattr(grids_mod, "from_config", lambda *a, **k: _stub_grid())
+        monkeypatch.setattr(runner, "_invoke_lambda_setup", lambda *a, **k: None)
+        monkeypatch.setattr(runner, "_invoke_lambda_finalize", lambda *a, **k: None)
+        from unittest.mock import MagicMock
+        monkeypatch.setattr(boto3, "Session", lambda *a, **k: MagicMock())
+        monkeypatch.setattr(
+            runner, "compute_available_workers",
+            lambda requested, *a, **k: (
+                4,
+                ConcurrencyReport(account_limit=1000, current_concurrent=0,
+                                  padding=100, available=900, function_reserved=None),
+            ),
+        )
+        monkeypatch.setattr(
+            runner, "_invoke_lambda_cell",
+            lambda *a, **k: {"status_code": 200, "body": {"total_obs": 3},
+                             "error": None, "lambda_duration": 2.0, "shard_key": 0},
+        )
+
+        summary = runner._run_lambda(
+            atl06_config, _run_catalog(), "s3://out/x.zarr", 12,
+            max_cells=None, morton_cell=None, max_workers=1700, overwrite=False,
+            dry_run=False, region="us-west-2", function_name="process-shard",
+        )
+        assert set(summary.keys()) == self._LAMBDA_KEYS
+        assert summary["backend"] == "lambda"
+        assert summary["cells_with_data"] == 4
+        assert summary["total_obs"] == 12
+        # 4 cells x 2 s x 2 GB = 16 GB-s; cost = 16 * arm64 price.
+        assert summary["lambda_time_s"] == 8.0
+        assert summary["gb_seconds"] == 16.0
+        assert summary["price_per_gb_sec"] == 0.0000133334
+        assert summary["estimated_cost_usd"] == 16.0 * 0.0000133334
+
+    def test_lambda_cost_byte_identical_with_mixed_durations(self, monkeypatch, atl06_config):
+        """estimated_cost_usd must equal the pre-refactor arithmetic order:
+        ``(sum(durations) * 2.0) * price`` computed once -- not a sum of
+        per-cell ``cost_usd`` (which would diverge in the last FP ULP). Uses
+        heterogeneous per-cell durations so the two orders actually differ.
+        """
+        import boto3
+
+        import zagg.grids as grids_mod
+        from zagg import runner
+        from zagg.concurrency import ConcurrencyReport
+
+        durations = iter([0.1, 0.2, 0.3, 12.7])
+
+        monkeypatch.setattr(runner, "get_nsidc_s3_credentials",
+                            lambda: {"accessKeyId": "a", "secretAccessKey": "s",
+                                     "sessionToken": "t"})
+        monkeypatch.setattr(grids_mod, "from_config", lambda *a, **k: _stub_grid())
+        monkeypatch.setattr(runner, "_invoke_lambda_setup", lambda *a, **k: None)
+        monkeypatch.setattr(runner, "_invoke_lambda_finalize", lambda *a, **k: None)
+        from unittest.mock import MagicMock
+        monkeypatch.setattr(boto3, "Session", lambda *a, **k: MagicMock())
+        monkeypatch.setattr(
+            runner, "compute_available_workers",
+            lambda requested, *a, **k: (
+                1,  # 1 worker -> deterministic completion order for the iter()
+                ConcurrencyReport(account_limit=1000, current_concurrent=0,
+                                  padding=100, available=900, function_reserved=None),
+            ),
+        )
+        monkeypatch.setattr(
+            runner, "_invoke_lambda_cell",
+            lambda *a, **k: {"status_code": 200, "body": {"total_obs": 1},
+                             "error": None, "lambda_duration": next(durations),
+                             "shard_key": 0},
+        )
+
+        summary = runner._run_lambda(
+            atl06_config, _run_catalog(), "s3://out/x.zarr", 12,
+            max_cells=None, morton_cell=None, max_workers=1700, overwrite=False,
+            dry_run=False, region="us-west-2", function_name="process-shard",
+        )
+        total = 0.1 + 0.2 + 0.3 + 12.7
+        # The exact pre-refactor order: one multiply over the summed time.
+        assert summary["gb_seconds"] == total * 2.0
+        assert summary["estimated_cost_usd"] == (total * 2.0) * 0.0000133334

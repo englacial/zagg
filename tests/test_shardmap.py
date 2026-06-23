@@ -27,11 +27,15 @@ from zagg.grids import HealpixGrid, RectilinearGrid
 def _item(gid, lon0, lon1, lat0=38.85, lat1=38.93):
     ring = [[lon0, lat0], [lon1, lat0], [lon1, lat1], [lon0, lat1], [lon0, lat0]]
     return {
-        "type": "Feature", "stac_version": "1.0.0", "id": gid,
+        "type": "Feature",
+        "stac_version": "1.0.0",
+        "id": gid,
         "geometry": {"type": "Polygon", "coordinates": [ring]},
         "bbox": [lon0, lat0, lon1, lat1],
         "properties": {"datetime": "2025-06-01T00:00:00Z"},
-        "collection": "TEST", "stac_extensions": [], "links": [],
+        "collection": "TEST",
+        "stac_extensions": [],
+        "links": [],
         "assets": {
             "data": {"href": f"https://h/{gid}.h5", "roles": ["data"]},
             "data_s3": {"href": f"s3://b/{gid}.h5", "roles": ["data"]},
@@ -49,7 +53,10 @@ def _catalog(items):
 @pytest.fixture
 def grid():
     return RectilinearGrid(
-        "EPSG:32618", 10, [359400, 4300740, 369400, 4310740], [250, 250],
+        "EPSG:32618",
+        10,
+        [359400, 4300740, 369400, 4310740],
+        [250, 250],
         config=default_config("atl06_polar"),
     )
 
@@ -57,11 +64,13 @@ def grid():
 @pytest.fixture
 def catalog():
     # West-half, east-half, and a small NE granule over SERC.
-    return _catalog([
-        _item("Gwest", -76.62, -76.57),
-        _item("Geast", -76.55, -76.50),
-        _item("GneSmall", -76.55, -76.52, 38.91, 38.93),
-    ])
+    return _catalog(
+        [
+            _item("Gwest", -76.62, -76.57),
+            _item("Geast", -76.55, -76.50),
+            _item("GneSmall", -76.55, -76.52, 38.91, 38.93),
+        ]
+    )
 
 
 def _granule_shards(sm):
@@ -81,14 +90,19 @@ def _granule_shards(sm):
 # the real ``_intersect_spherely`` brute branch run end-to-end. It deliberately
 # omits ``SpatialIndex`` to force ``hasattr(spherely, "SpatialIndex")`` False.
 
+
 class _FakePoly:
     def __init__(self, lons, lats):
         self.x0, self.x1 = float(min(lons)), float(max(lons))
         self.y0, self.y1 = float(min(lats)), float(max(lats))
 
     def _overlaps(self, other):
-        return (self.x0 <= other.x1 and other.x0 <= self.x1
-                and self.y0 <= other.y1 and other.y0 <= self.y1)
+        return (
+            self.x0 <= other.x1
+            and other.x0 <= self.x1
+            and self.y0 <= other.y1
+            and other.y0 <= self.y1
+        )
 
 
 def _fake_create_polygon(*, shell, oriented):  # noqa: ARG001 (mirror real sig)
@@ -135,8 +149,11 @@ class TestBuildSpherelyBrute:
                 assert set(rec) == {"id", "s3", "https"}
 
     def test_signature_recorded(self, catalog, grid, fake_spherely):
+        # The ShardMap stores the spatial signature only (#89) -- no
+        # output_fields, so the map is reusable across aggregation configs.
         sm = ShardMap.build(catalog, grid, backend="spherely")
-        assert sm.grid_signature == grid.signature()
+        assert sm.grid_signature == grid.spatial_signature()
+        assert "output_fields" not in sm.grid_signature
 
     def test_metadata(self, catalog, grid, fake_spherely):
         sm = ShardMap.build(catalog, grid, backend="spherely")
@@ -147,6 +164,7 @@ class TestBuildSpherelyBrute:
     def test_brute_empty_records_early_out(self, grid, fake_spherely):
         # No records -> no polygons -> {} early-out, no intersect call (#36 brute path).
         from zagg.catalog.shardmap import _intersect_spherely
+
         assert _intersect_spherely([], grid, {}) == {}
 
 
@@ -178,8 +196,9 @@ def _has_spatial_index():
         return False
 
 
-@pytest.mark.skipif(not _has_spatial_index(),
-                    reason="spherely SpatialIndex (fork build) not installed")
+@pytest.mark.skipif(
+    not _has_spatial_index(), reason="spherely SpatialIndex (fork build) not installed"
+)
 class TestBuildSpherely:
     def test_spatial_split(self, catalog, grid):
         # Exact S2 with SpatialIndex gives the expected local split.
@@ -219,23 +238,189 @@ class TestResolveBackend:
     def test_cli_rejects_shapely_backend(self, monkeypatch):
         # shapely was dropped as a backend (#36); the CLI must not accept it.
         from zagg.catalog import main
+
         monkeypatch.setattr(
-            sys, "argv",
-            ["zagg-catalog", "--config", "x.yaml", "--short-name", "ATL03",
-             "--backend", "shapely"],
+            sys,
+            "argv",
+            ["zagg-catalog", "--config", "x.yaml", "--short-name", "ATL03", "--backend", "shapely"],
         )
         with pytest.raises(SystemExit):
             main()
 
     def test_cli_rejects_bad_footprint(self, monkeypatch):
         from zagg.catalog import main
+
         monkeypatch.setattr(
-            sys, "argv",
-            ["zagg-catalog", "--config", "x.yaml", "--short-name", "ATL03",
-             "--footprint", "garbage"],
+            sys,
+            "argv",
+            [
+                "zagg-catalog",
+                "--config",
+                "x.yaml",
+                "--short-name",
+                "ATL03",
+                "--footprint",
+                "garbage",
+            ],
         )
         with pytest.raises(SystemExit):
             main()
+
+
+class TestMortieOrder:
+    """The mortie MOC order must track the grid, not a fixed coarse default (#92).
+
+    A MOC order below ``parent_order`` upsamples in ``moc_to_order``, fattening
+    every granule footprint onto all shards under each coarse cell -- the
+    order-8-vs-order-13 degeneracy that put ~every granule in ~every shard.
+    """
+
+    @pytest.fixture
+    def hp_grid(self):
+        # parent_order 11 shards (~0.03 deg), child_order 17 leaves over the AOI.
+        # chunk_inner unset -> chunk_order == parent_order == 11.
+        return HealpixGrid(11, 17, layout="fullsphere")
+
+    def test_default_keys_to_chunk_order(self, catalog):
+        # chunk_inner=13 (the shipped ATL03 config) -> MOC order 13, the inner
+        # chunk the worker dispatches at.
+        g = HealpixGrid(11, 19, layout="fullsphere", chunk_inner=13)
+        assert g.chunk_order == 13
+        sm = ShardMap.build(catalog, g, backend="mortie")
+        assert sm.metadata["mortie_order"] == 13
+
+    def test_default_falls_back_to_parent_order(self, catalog, hp_grid):
+        # chunk_inner unset -> chunk_order == parent_order, so the MOC order is the
+        # bare shard order (the "else the shard order" branch of the directive).
+        assert hp_grid.chunk_order == hp_grid.parent_order == 11
+        sm = ShardMap.build(catalog, hp_grid, backend="mortie")
+        assert sm.metadata["mortie_order"] == 11
+
+    def test_default_under_mortie_cap_at_leaf_order_19(self, catalog):
+        # The shipped production grid (chunk_inner 13) -> 13, under the order-18 cap.
+        g = HealpixGrid(11, 19, layout="fullsphere", chunk_inner=13)
+        sm = ShardMap.build(catalog, g, backend="mortie")
+        assert sm.metadata["mortie_order"] == 13
+
+    def test_coarse_order_rejected(self, catalog, hp_grid):
+        # An explicit order coarser than parent_order would fatten -> raise.
+        with pytest.raises(ValueError, match="coarser than the grid's parent_order"):
+            ShardMap.build(catalog, hp_grid, backend="mortie", mortie_order=8)
+
+    def test_derived_order_clamped_below_parent_rejected(self):
+        # The derived path can still trip the guard: when parent_order exceeds the
+        # order-18 cap, the clamp drives the order to 18 < parent_order, so the
+        # guard fires (#92). chunk_order 19 -> clamped 18 < parent_order 19.
+        from zagg.catalog.shardmap import _resolve_mortie_order
+
+        g = HealpixGrid(19, 20, layout="fullsphere")  # chunk_order == parent_order == 19
+        with pytest.raises(ValueError, match="coarser than the grid's parent_order"):
+            _resolve_mortie_order(None, g)
+
+    def test_derived_order_clamped_to_cap(self):
+        # A chunk_order above mortie's order-18 cap is clamped to 18, never an
+        # illegal order that mortie would reject (#92). chunk_inner=19 > cap, with
+        # parent_order 15 so the clamped 18 still clears the parent_order guard.
+        from zagg.catalog.shardmap import MORTIE_MOC_ORDER_CAP, _resolve_mortie_order
+
+        g = HealpixGrid(15, 22, layout="fullsphere", chunk_inner=19)
+        assert g.chunk_order == 19
+        assert _resolve_mortie_order(None, g) == MORTIE_MOC_ORDER_CAP == 18
+
+    def test_no_fattening_west_east_disjoint(self, hp_grid):
+        # A west granule and an east granule must occupy disjoint shard sets --
+        # under the old order-8 default both spread onto every AOI shard.
+        cat = _catalog([_item("Gwest", -76.62, -76.59), _item("Geast", -76.53, -76.50)])
+        sm = ShardMap.build(cat, hp_grid, backend="mortie")
+        gs = _granule_shards(sm)
+        assert gs["Gwest"] and gs["Geast"]
+        assert gs["Gwest"].isdisjoint(gs["Geast"])
+
+    def test_non_healpix_keeps_legacy_default(self, grid):
+        # Non-HEALPix grids have no parent/child order -> legacy default of 8.
+        from zagg.catalog.shardmap import _resolve_mortie_order
+
+        assert _resolve_mortie_order(None, grid) == 8
+
+
+class TestIO:
+    def test_round_trip(self, catalog, grid, fake_spherely):
+        sm = ShardMap.build(catalog, grid, backend="spherely")
+        with tempfile.NamedTemporaryFile(suffix=".json", delete=False) as f:
+            sm.to_json(f.name)
+            sm2 = ShardMap.from_json(f.name)
+        assert sm2.shard_keys == sm.shard_keys
+        assert sm2.granules == sm.granules
+        assert sm2.grid_signature == sm.grid_signature
+
+    def test_from_json_missing_key(self):
+        with tempfile.NamedTemporaryFile("w", suffix=".json", delete=False) as f:
+            json.dump({"shard_keys": [], "granules": []}, f)
+            path = f.name
+        with pytest.raises(ValueError, match="missing required key"):
+            ShardMap.from_json(path)
+
+    def test_round_trip_preserves_spatial_signature(self, catalog, grid, fake_spherely):
+        # The stored signature is spatial-only and survives JSON round-trip (#89).
+        sm = ShardMap.build(catalog, grid, backend="spherely")
+        with tempfile.NamedTemporaryFile(suffix=".json", delete=False) as f:
+            sm.to_json(f.name)
+            sm2 = ShardMap.from_json(f.name)
+        assert sm2.grid_signature == grid.spatial_signature()
+        assert "output_fields" not in sm2.grid_signature
+
+
+class TestSpatialSignature:
+    """``spatial_signature()`` is the full signature minus ``output_fields`` (#89)."""
+
+    def test_healpix_excludes_output_fields(self):
+        g = HealpixGrid(6, 12, layout="fullsphere")
+        spatial = g.spatial_signature()
+        assert "output_fields" not in spatial
+        assert g.signature() == {**spatial, "output_fields": g.signature()["output_fields"]}
+
+    def test_rectilinear_excludes_output_fields(self, grid):
+        spatial = grid.spatial_signature()
+        assert "output_fields" not in spatial
+        full = grid.signature()
+        assert full == {**spatial, "output_fields": full["output_fields"]}
+
+    def test_healpix_spatial_signature_invariant_to_agg_fields(self):
+        # Same spatial grid, different aggregation configs -> identical spatial sig.
+        a = HealpixGrid(6, 12, layout="fullsphere", config=default_config("atl06"))
+        b = HealpixGrid(6, 12, layout="fullsphere", config=default_config("atl06_polar"))
+        assert a.signature() != b.signature()  # full sigs differ (output_fields)
+        assert a.spatial_signature() == b.spatial_signature()  # spatial sigs match
+
+    def test_rectilinear_spatial_signature_invariant_to_agg_fields(self):
+        bounds = [359400, 4300740, 369400, 4310740]
+        a = RectilinearGrid("EPSG:32618", 10, bounds, [250, 250], config=default_config("atl06"))
+        b = RectilinearGrid(
+            "EPSG:32618", 10, bounds, [250, 250], config=default_config("atl06_polar")
+        )
+        assert a.spatial_signature() == b.spatial_signature()
+
+    def test_high_base_cell_morton_keys_roundtrip(self):
+        """Parent-morton shard keys from southern (base 7-11) cells are large
+        unsigned words; JSON (de)serialization preserves them exactly (#71).
+
+        These are the keys that, as a signed int64, would read back negative —
+        here we assert the manifest carries the unsigned value byte-for-byte.
+        """
+        from mortie import clip2order, geo2mort
+
+        # Southern points → high base cells whose packed parent word sets bit 63.
+        pts = [(-78.5, -132.0), (-72.1, 25.4), (-65.0, -45.0)]
+        keys = sorted(
+            int(clip2order(6, geo2mort(np.array([lat]), np.array([lon]), order=18))[0])
+            for lat, lon in pts
+        )
+        assert any(k > 2**63 for k in keys)  # at least one bit-63-set key
+        sm = ShardMap({"type": "healpix"}, keys, [[] for _ in keys], {})
+        with tempfile.NamedTemporaryFile(suffix=".json", delete=False) as f:
+            sm.to_json(f.name)
+            sm2 = ShardMap.from_json(f.name)
+        assert sm2.shard_keys == keys
 
 
 # ── beam-corridor footprints (issue #65) ─────────────────────────────────────
@@ -247,13 +432,33 @@ from zagg.catalog.beams import beam_tracks_from_cmr_polygon  # noqa: E402
 # gt2l -76.5106, gt3l -76.4737 -- the decomposition must place a corridor over
 # each (issue #65 validation target).
 _C29_POLY = [
-    (-79.4552, 59.5458), (-79.6776, 59.5342), (-79.5274, 58.7894), (-79.1270, 56.6847),
-    (-79.0193, 55.9820), (-78.9553, 55.3096), (-78.5002, 52.5857), (-78.1682, 50.4866),
-    (-77.4919, 45.8442), (-76.9446, 41.7520), (-76.4355, 37.6827), (-75.9327, 33.4550),
-    (-75.3154, 28.0089), (-75.1996, 26.9469), (-75.0726, 26.9579), (-75.1873, 28.0199),
-    (-75.7972, 33.4664), (-76.2927, 37.6939), (-76.7931, 41.7632), (-77.3297, 45.8554),
-    (-77.9907, 50.4980), (-78.3143, 52.5970), (-78.7568, 55.3209), (-78.8168, 55.9880),
-    (-78.9211, 56.6943), (-79.3096, 58.8011), (-79.4552, 59.5458),
+    (-79.4552, 59.5458),
+    (-79.6776, 59.5342),
+    (-79.5274, 58.7894),
+    (-79.1270, 56.6847),
+    (-79.0193, 55.9820),
+    (-78.9553, 55.3096),
+    (-78.5002, 52.5857),
+    (-78.1682, 50.4866),
+    (-77.4919, 45.8442),
+    (-76.9446, 41.7520),
+    (-76.4355, 37.6827),
+    (-75.9327, 33.4550),
+    (-75.3154, 28.0089),
+    (-75.1996, 26.9469),
+    (-75.0726, 26.9579),
+    (-75.1873, 28.0199),
+    (-75.7972, 33.4664),
+    (-76.2927, 37.6939),
+    (-76.7931, 41.7632),
+    (-77.3297, 45.8554),
+    (-77.9907, 50.4980),
+    (-78.3143, 52.5970),
+    (-78.7568, 55.3209),
+    (-78.8168, 55.9880),
+    (-78.9211, 56.6943),
+    (-79.3096, 58.8011),
+    (-79.4552, 59.5458),
 ]
 _C29_MEASURED = {0: -76.5475, 1: -76.5106, 2: -76.4737}  # pair index -> beam lon @ 38.89
 
@@ -276,11 +481,15 @@ def _swath_item(gid, center_lon, center_lat, half_width_deg=0.073, n=12):
     lats, lons = _swath_latlon(center_lon, center_lat, half_width_deg=half_width_deg, n=n)
     ring = [[float(lo), float(la)] for lo, la in zip(lons, lats)]
     return {
-        "type": "Feature", "stac_version": "1.0.0", "id": gid,
+        "type": "Feature",
+        "stac_version": "1.0.0",
+        "id": gid,
         "geometry": {"type": "Polygon", "coordinates": [ring]},
         "bbox": [float(lons.min()), float(lats.min()), float(lons.max()), float(lats.max())],
         "properties": {"datetime": "2025-06-01T00:00:00Z"},
-        "collection": "ATL03_007", "stac_extensions": [], "links": [],
+        "collection": "ATL03_007",
+        "stac_extensions": [],
+        "links": [],
         "assets": {
             "data": {"href": f"https://h/{gid}.h5", "roles": ["data"]},
             "data_s3": {"href": f"s3://b/{gid}.h5", "roles": ["data"]},
@@ -299,7 +508,10 @@ def _fine_grid():
     # 10 km AOI at 10 m, 50-cell (500 m) shards -> 20x20, fine enough that the
     # ~3 km inter-pair gaps contain whole shards.
     return RectilinearGrid(
-        "EPSG:32618", 10, [359400, 4300740, 369400, 4310740], [50, 50],
+        "EPSG:32618",
+        10,
+        [359400, 4300740, 369400, 4310740],
+        [50, 50],
         config=default_config("atl06_polar"),
     )
 
@@ -362,10 +574,22 @@ class TestBeamHelper:
         # with no antimeridian crossing -- consecutive vertices stay close.
         # The decomposition must run on these, not silently degrade to swath.
         lats = np.array([85.5, 85.7, 85.9, 86.0, 86.1, 86.3, 86.1, 86.0, 85.9, 85.7, 85.5, 85.5])
-        lons = np.array([
-            -150.0, -100.0, -50.0, 0.0, 50.0, 100.0,
-            105.0, 55.0, 5.0, -45.0, -95.0, -150.0,
-        ])
+        lons = np.array(
+            [
+                -150.0,
+                -100.0,
+                -50.0,
+                0.0,
+                50.0,
+                100.0,
+                105.0,
+                55.0,
+                5.0,
+                -45.0,
+                -95.0,
+                -150.0,
+            ]
+        )
         assert float(np.ptp(lons)) > 180.0  # spans >180 deg but no seam
         assert float(np.max(np.abs(np.diff(lons)))) < 180.0  # no neighbour jump
         out = beam_tracks_from_cmr_polygon(lats, lons, product="ATL03")
@@ -478,12 +702,18 @@ class TestBeamFootprintBehavior:
         # HEALPix grid -> the is_healpix mortie MOC sub-path + per-granule dedup.
         hp = HealpixGrid(12, 14, layout="fullsphere")
         cat = _atl03_catalog([_swath_item("G", -76.50, 38.89)])
-        region = [(np.array([38.74, 38.74, 39.04, 39.04, 38.74]),
-                   np.array([-76.62, -76.42, -76.42, -76.62, -76.62]))]
-        swath = ShardMap.build(cat, hp, region=region, backend="mortie",
-                               mortie_order=14, footprint="swath")
-        beams = ShardMap.build(cat, hp, region=region, backend="mortie",
-                               mortie_order=14, footprint="beams")
+        region = [
+            (
+                np.array([38.74, 38.74, 39.04, 39.04, 38.74]),
+                np.array([-76.62, -76.42, -76.42, -76.62, -76.62]),
+            )
+        ]
+        swath = ShardMap.build(
+            cat, hp, region=region, backend="mortie", mortie_order=14, footprint="swath"
+        )
+        beams = ShardMap.build(
+            cat, hp, region=region, backend="mortie", mortie_order=14, footprint="beams"
+        )
         sw, bm = self._granule_shard_set(swath, "G"), self._granule_shard_set(beams, "G")
         assert bm
         assert bm < sw
@@ -525,30 +755,14 @@ class TestBeamFootprintBehavior:
 class TestIsBeamProduct:
     def test_known_beam_products(self):
         from zagg.catalog.beams import is_beam_product
+
         assert is_beam_product("ATL03")
         assert is_beam_product("ATL06")
         assert is_beam_product("atl03")  # case-insensitive
 
     def test_non_beam_or_missing(self):
         from zagg.catalog.beams import is_beam_product
+
         assert not is_beam_product("ATL08")
         assert not is_beam_product("")
         assert not is_beam_product(None)
-
-
-class TestIO:
-    def test_round_trip(self, catalog, grid, fake_spherely):
-        sm = ShardMap.build(catalog, grid, backend="spherely")
-        with tempfile.NamedTemporaryFile(suffix=".json", delete=False) as f:
-            sm.to_json(f.name)
-            sm2 = ShardMap.from_json(f.name)
-        assert sm2.shard_keys == sm.shard_keys
-        assert sm2.granules == sm.granules
-        assert sm2.grid_signature == sm.grid_signature
-
-    def test_from_json_missing_key(self):
-        with tempfile.NamedTemporaryFile("w", suffix=".json", delete=False) as f:
-            json.dump({"shard_keys": [], "granules": []}, f)
-            path = f.name
-        with pytest.raises(ValueError, match="missing required key"):
-            ShardMap.from_json(path)

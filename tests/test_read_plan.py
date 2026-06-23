@@ -133,6 +133,70 @@ class TestPlanReadIndexBase:
         assert plan.base_slices[0] == (0, 5)  # 1-1=0, 0+5=5
 
 
+class TestPlanReadEmptySegments:
+    """ATL03 marks empty segments with ph_index_beg == 0 / count == 0. Using one
+    as a run boundary translated to a bogus slice -- balloon to photon 0 (->
+    full-read OOM) or collapse to nothing (-> silent data loss). The run must be
+    bounded by its non-empty segments only.
+    """
+
+    def test_empty_at_run_start_does_not_balloon(self):
+        # Three close rep-points all land in the bbox; the first is empty. The
+        # slice must start at the first NON-EMPTY segment's photons, not at 0.
+        lats = np.array([0.00, 0.10, 0.20, 40.0, 80.0])
+        lons = np.full(5, 0.5)
+        ibeg = np.array([0, 5001, 5101, 5201, 5301])  # seg 0 empty (sentinel 0)
+        cnt = np.array([0, 100, 100, 100, 100])
+        n_base = 5400
+        bbox = (0.0, -0.5, 1.0, 0.5)  # matches segs 0,1,2
+        plan = plan_read(lats, lons, ibeg, cnt, n_base, bbox, index_base=1, pad=0)
+        assert not plan.full_read  # pre-fix this ballooned to [0, 5200] -> selectivity full read
+        assert plan.base_slices == [(5000, 5200)]  # non-empty segs 1..2 only
+        assert plan.parent_runs == [(0, 2)]  # parent_runs stays in lockstep
+
+    def test_empty_at_run_end_not_dropped(self):
+        # Empty segment at the run end must not collapse the slice to nothing.
+        lats = np.array([0.00, 0.10, 0.20, 40.0])
+        lons = np.full(4, 0.5)
+        ibeg = np.array([5001, 5101, 0, 5301])  # seg 2 empty
+        cnt = np.array([100, 100, 0, 100])
+        n_base = 5400
+        bbox = (0.0, -0.5, 1.0, 0.5)  # matches segs 0,1,2
+        plan = plan_read(lats, lons, ibeg, cnt, n_base, bbox, index_base=1, pad=0)
+        assert plan.base_slices == [(5000, 5200)]  # bounded by non-empty seg 1
+        assert plan.parent_runs == [(0, 2)]
+
+    def test_empty_in_run_middle_stays_contiguous(self):
+        # An empty interior segment consumes no photon indices, so the two
+        # non-empty neighbours are adjacent -- one contiguous slice covers both.
+        lats = np.array([0.00, 0.10, 0.20, 40.0])
+        lons = np.full(4, 0.5)
+        ibeg = np.array([5001, 0, 5101, 5301])  # seg 1 empty (middle)
+        cnt = np.array([100, 0, 100, 100])
+        n_base = 5400
+        bbox = (0.0, -0.5, 1.0, 0.5)  # matches segs 0,1,2
+        plan = plan_read(lats, lons, ibeg, cnt, n_base, bbox, index_base=1, pad=0)
+        assert plan.base_slices == [(5000, 5200)]  # seg0 [5000,5100) + seg2 [5100,5200)
+        assert plan.parent_runs == [(0, 2)]
+
+    def test_all_empty_run_skipped_no_crash(self):
+        # A run with only empty segments contributes no photons. parent_runs MUST
+        # stay empty in lockstep, else execute_read_plan hits np.concatenate([]).
+        lats = np.array([0.00, 0.10, 40.0])
+        lons = np.full(3, 0.5)
+        ibeg = np.array([0, 0, 5301])
+        cnt = np.array([0, 0, 100])
+        n_base = 5400
+        bbox = (0.0, -0.5, 1.0, 0.5)  # matches segs 0,1 (both empty)
+        plan = plan_read(lats, lons, ibeg, cnt, n_base, bbox, index_base=1, pad=0)
+        assert plan.base_slices == []
+        assert plan.parent_runs == []  # lockstep -> consumer short-circuits, no phantom run
+        assert not plan.full_read
+        # consumer contract: must return empty, not raise on an empty concatenate.
+        out = execute_read_plan(plan, lambda *a, **k: np.array([]), "any/path", float)
+        assert out.size == 0
+
+
 class TestExecuteReadPlan:
     def _make_plan(self, slices, full_read=False):
         runs = [(s, e - 1) for s, e in slices]

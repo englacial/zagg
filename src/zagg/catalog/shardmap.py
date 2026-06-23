@@ -9,7 +9,9 @@ The ``ShardMap`` is a small, self-contained JSON plan (option C): each granule
 is recorded with **both** its S3 and HTTPS hrefs so the runner can pick the
 endpoint at dispatch time via ``data_source.driver`` -- the map itself stays
 endpoint-neutral and never needs the Catalog at run time. It also records the
-grid ``signature()`` so a run can refuse a map built for a different grid.
+grid ``spatial_signature()`` (the spatial layout only, no aggregation fields;
+#89) so a run can refuse a map built for a different *spatial* grid while still
+reusing one map across configs that differ only in what they aggregate.
 
 Geometry backends (all sphere-correct):
 
@@ -24,6 +26,7 @@ shapely is no longer an intersection backend -- its WGS84 STRtree path had
 antimeridian/near-pole correctness bugs (#36). shapely remains a dependency for
 WKB decode (``sources.py``) and footprint geometry (``grids/``).
 """
+
 from __future__ import annotations
 
 import importlib
@@ -34,7 +37,14 @@ from typing import Dict, List
 
 import numpy as np
 
+# Upper bound on the MOC order mortie's ``morton_coverage`` /
+# ``morton_coverage_moc`` accept; a higher order raises inside mortie. The
+# derived order is clamped to this so an exotic ``chunk_order`` can't push the MOC
+# order past the cap and silently lose coverage (#92).
+MORTIE_MOC_ORDER_CAP = 18
+
 # ── granule footprint helpers ────────────────────────────────────────────────
+
 
 def _to_spherely_polygon(lats, lons):
     """Build a closed sphere-aware polygon, or None on validation failure.
@@ -66,12 +76,69 @@ def _granule_footprints(rec, footprint, product):
     backends consume the rings identically -- spherely as polygons, mortie as
     ``morton_coverage`` point sequences -- so the per-beam path needs no
     backend-specific geometry.
+
+    .. deprecated::
+        The ``"beams"`` corridor path is a stopgap (see ``beams.py``); remove it
+        once native per-beam CMR geometry, the memory-handling robustness in #66,
+        or data virtualization (#97) lands.
     """
     if footprint == "beams":
         from zagg.catalog.beams import beam_tracks_from_cmr_polygon
 
         return beam_tracks_from_cmr_polygon(rec["lats"], rec["lons"], product=product)
     return [(rec["lats"], rec["lons"])]
+
+
+def _resolve_mortie_order(mortie_order, grid) -> int:
+    """Choose the MOC order for the mortie backend.
+
+    The MOC order must be **>= the shard order** (``parent_order``). A coarser
+    MOC upsamples in ``moc_to_order(moc, parent_order)``: every coarse cell
+    becomes all ``4^(parent_order - order)`` order-``parent_order`` descendants,
+    fattening a thin granule track to fill every shard under that cell. The old
+    fixed default of 8 against ``parent_order=13`` expanded each cell to 1024
+    shards, putting ~every granule in ~every shard and OOMing the workers (#92).
+
+    ``None`` (the default) pins the order to the grid's **inner-chunk order**
+    (``grid.chunk_order``) -- the Zarr-chunk order between the shard order
+    (``parent_order``) and the leaf (``child_order``), set by ``chunk_inner`` and
+    defaulting to ``parent_order`` when unset (so chunk == shard). The shipped
+    ATL03 HEALPix configs use ``chunk_inner=13`` (parent 11, child 19), so the
+    order resolves to 13. Keying the MOC to the chunk order matches the unit work
+    is dispatched at: footprints resolve no finer than the chunk the worker reads,
+    which is enough to keep ``moc_to_order`` from upsampling onto neighbor shards
+    (#92) at near-minimal compute -- the order-sweep benchmark
+    (``benchmarks/mortie_order_sweep.py``) shows granules/shard flat for every
+    order >= ``parent_order`` while wall-time grows with order, so a finer MOC
+    buys precision the order-``parent_order`` shard cells can't see.
+    The order is still clamped to ``MORTIE_MOC_ORDER_CAP`` (mortie's order-18
+    coverage cap) before the ``parent_order`` guard, so an exotic ``chunk_order``
+    past the cap can't make mortie raise into the swallowing ``except`` (silent
+    coverage loss). The clamp comes *before* the guard, so a ``parent_order``
+    itself above the cap (the clamp then lands at 18 < ``parent_order``) still
+    trips the raise rather than passing an order coarser than the shards. An
+    explicit ``mortie_order`` is honored but still validated against
+    ``parent_order``. Non-HEALPix grids (no ``parent_order`` / ``child_order``)
+    keep the legacy default of 8.
+    """
+    is_healpix = hasattr(grid, "parent_order") and hasattr(grid, "child_order")
+    if mortie_order is not None:
+        order = int(mortie_order)
+    elif is_healpix:
+        # ``chunk_order`` is the inner-chunk order on HealpixGrid (always set;
+        # == parent_order when chunk_inner is unset). The getattr default only
+        # covers a duck-typed grid that exposes parent/child but not chunk_order.
+        chunk_order = getattr(grid, "chunk_order", grid.parent_order)
+        order = min(int(chunk_order), MORTIE_MOC_ORDER_CAP)
+    else:
+        order = 8
+    if is_healpix and order < grid.parent_order:
+        raise ValueError(
+            f"mortie MOC order {order} is coarser than the grid's parent_order "
+            f"{grid.parent_order}; this upsamples every granule footprint onto all "
+            f"shards under each MOC cell (#92). Use order >= {grid.parent_order}."
+        )
+    return order
 
 
 def _resolve_backend(backend: str, grid) -> str:
@@ -126,7 +193,9 @@ _SPHERELY_INSTALL_HINT = (
 )
 
 
-def _intersect_spherely(records, grid, all_shards, footprint="swath", product="ATL03") -> Dict[int, List[int]]:
+def _intersect_spherely(
+    records, grid, all_shards, footprint="swath", product="ATL03"
+) -> Dict[int, List[int]]:
     """Exact S2 intersection via spherely.
 
     Builds sphere-aware polygons for each granule footprint, then maps each
@@ -175,7 +244,9 @@ def _intersect_spherely(records, grid, all_shards, footprint="swath", product="A
     return out
 
 
-def _intersect_mortie(records, grid, all_shards, order=8, footprint="swath", product="ATL03") -> Dict[int, List[int]]:
+def _intersect_mortie(
+    records, grid, all_shards, order=8, footprint="swath", product="ATL03"
+) -> Dict[int, List[int]]:
     """HEALPix MOC intersection via mortie ``morton_coverage_moc``.
 
     ``footprint="beams"`` decomposes each granule into per-beam-pair corridor
@@ -254,6 +325,7 @@ _BACKENDS = {
 
 # ── ShardMap ─────────────────────────────────────────────────────────────────
 
+
 @dataclass
 class ShardMap:
     """Work-distribution manifest: shard key -> granules, tied to one grid.
@@ -261,8 +333,12 @@ class ShardMap:
     Parameters
     ----------
     grid_signature : dict
-        ``grid.signature()`` at build time. The runner checks it against the
-        run grid so a map can't be silently paired with a mismatched grid.
+        ``grid.spatial_signature()`` at build time -- the spatial layout only
+        (#89). The runner checks it against the run grid's spatial signature so
+        a map can't be paired with a mismatched *spatial* grid, while staying
+        reusable across configs that differ only in aggregation fields. (Kept as
+        ``grid_signature`` for back-compat; old maps carry the full signature
+        and still validate via a spatial-subset projection.)
     shard_keys : list of int
         Sorted shard keys with at least one granule.
     granules : list of list of dict
@@ -285,7 +361,7 @@ class ShardMap:
         *,
         region=None,
         backend: str = "auto",
-        mortie_order: int = 8,
+        mortie_order: int | None = None,
         footprint: str = "swath",
     ) -> "ShardMap":
         """Build a ShardMap from a ``Catalog`` and an output grid.
@@ -296,21 +372,33 @@ class ShardMap:
             Fetched granule metadata (provides ``granule_records()``).
         grid : OutputGrid
             Output grid (provides ``coverage``, ``shard_footprint``,
-            ``signature``).
+            ``spatial_signature``).
         region : list of (lats, lons), optional
             Coverage mask in WGS84. Defaults to the catalog bbox rectangle.
         backend : {"auto", "spherely", "mortie"}
             Geometry backend. ``"auto"`` -> spherely when importable, else
             mortie for HEALPix grids (non-HEALPix grids require spherely and
             raise an ``ImportError`` with an install pointer when it is absent).
-        mortie_order : int
-            MOC order for the mortie backend.
+        mortie_order : int, optional
+            MOC order for the mortie backend. ``None`` (default) pins it to the
+            grid's inner-chunk order ``grid.chunk_order`` (the ``chunk_inner``
+            order, defaulting to ``parent_order`` when unset), clamped to mortie's
+            order-18 coverage cap -- the dispatch chunk's own resolution, enough
+            to keep ``moc_to_order`` from upsampling a footprint onto neighbor
+            shards (#92) at near-minimal compute. Raises if the resolved order is
+            coarser than ``parent_order``.
         footprint : {"swath", "beams"}
             Granule footprint used for intersection. ``"swath"`` (default) uses
             the raw CMR polygon. ``"beams"`` decomposes ICESat-2 ATL03/06 swaths
             into per-beam-pair corridors so granules stop being assigned to
             shards their beams never cross (issue #65); non-beam products fall
             back to the swath ring.
+
+            .. deprecated::
+                The ``"beams"`` corridor mechanism is a stopgap (see
+                ``beams.py``); remove it once native per-beam CMR geometry, the
+                memory-handling robustness in #66, or data virtualization (#97)
+                lands.
 
         Returns
         -------
@@ -323,6 +411,7 @@ class ShardMap:
         product = ((catalog.metadata or {}).get("collection") or "").split("_")[0].upper()
         if footprint == "beams":
             from zagg.catalog.beams import is_beam_product
+
             if not is_beam_product(product):
                 # ``beams`` is opt-in; silently degrading to swath here would
                 # leave the metadata recording ``footprint="beams"`` while the
@@ -330,17 +419,12 @@ class ShardMap:
                 collection = (catalog.metadata or {}).get("collection")
                 if collection is None:
                     detail = (
-                        "catalog has no 'collection' metadata so the product "
-                        "can't be identified"
+                        "catalog has no 'collection' metadata so the product can't be identified"
                     )
                 else:
-                    detail = (
-                        f"catalog collection {collection!r} resolves to "
-                        f"product {product!r}"
-                    )
+                    detail = f"catalog collection {collection!r} resolves to product {product!r}"
                 raise ValueError(
-                    f"footprint='beams' requires an ICESat-2 beam product "
-                    f"(ATL03/ATL06); {detail}"
+                    f"footprint='beams' requires an ICESat-2 beam product (ATL03/ATL06); {detail}"
                 )
         parts = _region_parts(region, catalog.metadata)
         all_shards = set(int(s) for s in grid.coverage(parts))
@@ -351,13 +435,22 @@ class ShardMap:
 
         t0 = time.perf_counter()
         if chosen == "mortie":
+            mortie_order = _resolve_mortie_order(mortie_order, grid)
             shard_to_idx = _intersect_mortie(
-                records, grid, all_shards, order=mortie_order,
-                footprint=footprint, product=product,
+                records,
+                grid,
+                all_shards,
+                order=mortie_order,
+                footprint=footprint,
+                product=product,
             )
         else:
             shard_to_idx = _BACKENDS[chosen](
-                records, grid, all_shards, footprint=footprint, product=product,
+                records,
+                grid,
+                all_shards,
+                footprint=footprint,
+                product=product,
             )
         wall = time.perf_counter() - t0
 
@@ -380,18 +473,23 @@ class ShardMap:
         }
         if chosen == "mortie":
             meta["mortie_order"] = mortie_order
-        return cls(grid.signature(), shard_keys, granules, meta)
+        return cls(grid.spatial_signature(), shard_keys, granules, meta)
 
     def to_json(self, path: str) -> None:
         """Write the manifest as JSON."""
         from pathlib import Path
 
-        Path(path).write_text(json.dumps({
-            "metadata": self.metadata,
-            "grid_signature": self.grid_signature,
-            "shard_keys": self.shard_keys,
-            "granules": self.granules,
-        }, indent=2))
+        Path(path).write_text(
+            json.dumps(
+                {
+                    "metadata": self.metadata,
+                    "grid_signature": self.grid_signature,
+                    "shard_keys": self.shard_keys,
+                    "granules": self.granules,
+                },
+                indent=2,
+            )
+        )
 
     @classmethod
     def from_json(cls, path: str) -> "ShardMap":
@@ -402,8 +500,7 @@ class ShardMap:
         for key in ("grid_signature", "shard_keys", "granules"):
             if key not in d:
                 raise ValueError(f"{path}: missing required key {key!r}")
-        return cls(d["grid_signature"], d["shard_keys"], d["granules"],
-                   d.get("metadata", {}))
+        return cls(d["grid_signature"], d["shard_keys"], d["granules"], d.get("metadata", {}))
 
 
 __all__ = ["ShardMap"]
