@@ -1423,8 +1423,12 @@ def _planned_read_group(
     )
 
     # Base-level expression filters (aggregation-time escape hatch, no pushdown).
+    # The namespace carries both base-rate ``variables`` and any segment-level
+    # broadcast columns (issue #30), which are already materialized into
+    # ``data_dict`` above, so an expression filter may reference e.g. ``dem_h``.
+    expr_names = list(variables) + list(seg_broadcasts)
     for f in expressions:
-        cols = {c: data_dict[c] for c in variables if c in data_dict}
+        cols = {c: data_dict[c] for c in expr_names if c in data_dict}
         try:
             emask = evaluate_filter_expression(f["expression"], cols)
         except NameError as e:
@@ -1643,9 +1647,13 @@ def _read_group_full(
         data_dict["leaf_id"] = leaf_sliced
 
     # Base-level ``expression`` filters: aggregation-time escape hatch, evaluated
-    # over the already-read variable columns (forfeits pushdown, issue #43).
+    # over the already-read variable columns (forfeits pushdown, issue #43). The
+    # namespace also carries any segment-level broadcast columns (issue #30),
+    # materialized into ``data_dict`` above, so a filter may reference e.g.
+    # ``dem_h``.
+    expr_names = list(variables) + list(seg_broadcasts)
     for f in expressions:
-        cols = {c: data_dict[c] for c in variables if c in data_dict}
+        cols = {c: data_dict[c] for c in expr_names if c in data_dict}
         try:
             emask = evaluate_filter_expression(f["expression"], cols)
         except NameError as e:

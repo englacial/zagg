@@ -244,6 +244,15 @@ def validate_config(config: PipelineConfig) -> None:
     # function/expression, sources exist) but the entries are chunk-level scalars.
     _validate_chunk_precompute(config.aggregation, ds_vars)
 
+    # Base-level ``expression`` filters evaluate over the read columns at read time
+    # (before chunk_precompute), so their valid names are exactly ``ds_vars`` —
+    # ``data_source.variables`` plus any broadcast segment-level variable (issue
+    # #30). Validate their column references the same way agg/precompute
+    # expressions are, so e.g. an ``{expression: "dem_h > ..."}`` filter is accepted.
+    for f in filters_from_data_source(config.data_source):
+        if "expression" in f:
+            _validate_expression_columns(f"filter {f['expression']!r}", f["expression"], ds_vars)
+
     # Chunk-precompute names are injected into the per-cell expression namespace
     # (issue #30), so a per-cell ``expression`` (or its params) may reference them
     # like a column. Treat them as valid identifiers in the per-cell validation.

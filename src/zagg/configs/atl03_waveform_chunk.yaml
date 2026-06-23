@@ -8,13 +8,14 @@
 # unlike atl03_waveform_counts.yaml which anchors on each cell's own median.
 #
 # The anchor and gain (see issue #30 comment 4773320226):
-#   chunk_offset = floor(median(dem_h)) over the whole shard (pooled, not per-cell)
+#   chunk_offset = floor(min(dem_h)) over the whole shard (pooled, not per-cell)
 #   chunk_gain   = smallest power-of-two (>= 0.5 m) whose 128 bins span the shard's
 #                  photon-height range  ->  2^ceil(log2((max - min) / 128)), floored at 0.5 m
 # The 128-bin window is [chunk_offset - 27*chunk_gain, chunk_offset + 101*chunk_gain),
-# so the floor(median) anchor lands in bin 28 (27 bins reserved below it, 100
+# so the floor(min) anchor lands in bin 28 (27 bins reserved below it, 100
 # above) -- the asymmetric layout @espg specified for a mostly-above-ground
-# return. Out-of-range photons are dropped (not counted), matching #30's spec.
+# return. dem_h is less noisy than the photon cloud, so the min (not median) is a
+# stable floor. Out-of-range photons are dropped (not counted), matching #30's spec.
 #
 # The chunk anchor is the ATL03 reference DEM (``dem_h``), which gives a stable
 # absolute frame independent of the photon cloud's own median. dem_h lives in the
@@ -90,7 +91,7 @@ aggregation:
     chunk_offset:
       # DEM-anchored: the chunk's absolute frame is the reference DEM, not the
       # photon cloud's own median. dem_h rides the segment->photon broadcast above.
-      expression: "np.float32(np.floor(np.median(dem_h)))"
+      expression: "np.float32(np.floor(np.min(dem_h)))"
       source: dem_h
       dtype: float32
   variables:

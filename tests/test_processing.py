@@ -1378,8 +1378,8 @@ class TestChunkResolutionCompanion:
         write_dataframe_to_zarr(carrier, store, grid=grid, chunk_idx=chunk_idx)
 
         rgroup = open_group(store=store, mode="r", path="rectilinear")
-        # offset_h companion: one value at this chunk = floor(median(pooled dem_h)).
-        expected_offset = np.float32(np.floor(np.median(dem)))
+        # offset_h companion: one value at this chunk = floor(min(pooled dem_h)).
+        expected_offset = np.float32(np.floor(np.min(dem)))
         assert rgroup["offset_h"][chunk_idx] == expected_offset
         assert not np.isnan(rgroup["gain_h"][chunk_idx])
         # Only one chunk written for each companion.
@@ -2485,6 +2485,28 @@ class TestSegmentLevelVariables:
         assert df["h"].tolist() == [0.0, 2.0, 3.0, 5.0]
         assert df["dem_h"].tolist() == [100.0, 200.0, 200.0, 300.0]
 
+    def test_expression_filter_references_broadcast_dem_h(self):
+        # An ``{expression: "dem_h > ..."}`` filter references the broadcast
+        # segment variable, which is materialized before the filter runs (issue
+        # #30): photons are kept/dropped by their own segment's dem_h, even though
+        # ``dem_h`` is not a ``data_source.variables`` column.
+        ds = self._data_source()
+        ds["filters"] = [{"expression": "dem_h > 150.0"}]
+        h5 = _FakeH5(
+            {
+                "/lat": np.arange(6.0),
+                "/lon": np.arange(6.0),
+                "/h": np.arange(6.0, dtype=np.float32),
+                "/ph_index_beg": np.array([0, 2, 4]),
+                "/segment_ph_cnt": np.array([2, 2, 2]),
+                "/dem_h": np.array([100.0, 200.0, 300.0], dtype=np.float32),
+            }
+        )
+        df = _read_group(h5, "gt1l", ds, 0, _ShardGrid())
+        # Seg 0 (dem_h 100) is dropped; segs 1,2 (dem_h 200,300) are kept.
+        assert df["h"].tolist() == [2.0, 3.0, 4.0, 5.0]
+        assert df["dem_h"].tolist() == [200.0, 200.0, 300.0, 300.0]
+
     def test_planned_partial_read_aligns_dem_h(self):
         # Partial read plan (NOT a full read): the bbox selects only segments
         # 1-2 (photons 2..5). Each selected photon must carry its own segment's
@@ -2516,6 +2538,22 @@ class TestSegmentLevelVariables:
         # Selected photons 2,3 (seg 1) + 4,5 (seg 2); qs drops photon 3.
         assert df["h"].tolist() == [20.0, 40.0, 50.0]
         assert df["dem_h"].tolist() == [20.0, 30.0, 30.0]
+
+    def test_planned_path_expression_filter_references_broadcast_dem_h(self):
+        # Planned (partial) read: an ``{expression: "dem_h > ..."}`` filter
+        # references the broadcast segment variable, mirroring the full-path test.
+        # Locks in parity of the namespace fix across both read paths (issue #30).
+        ds = _planned_read_data_source()
+        ds["levels"]["segments"]["variables"] = {"dem_h": "/seg/dem_h"}
+        ds["filters"] = [{"expression": "dem_h > 25.0"}]
+        h5 = _planned_read_h5()
+        h5._arrays["/seg/dem_h"] = np.array([10.0, 20.0, 30.0, 40.0, 50.0, 60.0], dtype=np.float32)
+        grid = _BboxGrid((-0.1, 175.0, 0.1, 225.0))
+        df = _read_group(h5, "gt1l", ds, 0, grid)
+        # Selected photons 2,3 (seg 1, dem_h 20) + 4,5 (seg 2, dem_h 30); the
+        # filter drops seg 1 (20 <= 25) and keeps seg 2 (30 > 25).
+        assert df["h"].tolist() == [40.0, 50.0]
+        assert df["dem_h"].tolist() == [30.0, 30.0]
 
     def test_broadcast_out_of_bounds_raises(self):
         # A segment range extending past the base size (e.g. a seg-variable level
@@ -2564,20 +2602,20 @@ class TestSegmentLevelVariables:
         df = _read_group(h5, "gt1l", ds, 0, _ShardGrid())
         assert list(df.columns) == ["h", "leaf_id"]  # no dem_h column injected
 
-    def test_worked_template_chunk_offset_is_floor_median_dem_h(self):
+    def test_worked_template_chunk_offset_is_floor_min_dem_h(self):
         # End-to-end through process_shard: dem_h broadcast feeds chunk_offset,
-        # whose value is floor(median(pooled dem_h)) and is uniform across cells.
+        # whose value is floor(min(pooled dem_h)) and is uniform across cells.
         from zagg.config import load_config
 
         cfg = load_config("src/zagg/configs/atl03_waveform_chunk.yaml")
         # Two cells' worth of photons pooled in one shard; dem_h per photon
-        # (already broadcast) with a known median.
+        # (already broadcast) with a known min.
         dem = np.array([100.0, 100.0, 102.0, 108.0, 110.0], dtype=np.float32)
         chunk_scalars = _eval_chunk_precompute(
             cfg, {"h_ph": np.arange(5.0, dtype=np.float32), "dem_h": dem}
         )
-        assert chunk_scalars["chunk_offset"] == np.float32(np.floor(np.median(dem)))
-        assert chunk_scalars["chunk_offset"] == np.float32(102.0)
+        assert chunk_scalars["chunk_offset"] == np.float32(np.floor(np.min(dem)))
+        assert chunk_scalars["chunk_offset"] == np.float32(100.0)
 
 
 class TestChunkPrecompute:
@@ -2731,8 +2769,8 @@ class TestChunkPrecompute:
         gain = tbl.column("gain_h").to_numpy(zero_copy_only=False)
         assert offset[0] == offset[1]
         assert gain[0] == gain[1]
-        # chunk_offset is now the DEM anchor: floor(median(pooled dem_h)).
-        assert offset[0] == np.float32(np.floor(np.median(dem)))
+        # chunk_offset is now the DEM anchor: floor(min(pooled dem_h)).
+        assert offset[0] == np.float32(np.floor(np.min(dem)))
 
     def test_empty_cell_gets_chunk_anchor_not_nan(self, monkeypatch):
         """An empty cell in a POPULATED chunk records the chunk-uniform anchor, not
