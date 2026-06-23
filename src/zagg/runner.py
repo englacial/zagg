@@ -34,6 +34,7 @@ from zagg.config import (
     get_output_endpoint_url,
     get_output_region,
     get_parent_order,
+    get_pipeline_type,
     get_store_path,
 )
 from zagg.dispatch import (
@@ -80,6 +81,7 @@ def agg(
     output_credentials: dict | None = None,
     output_endpoint_url: str | None = None,
     handoff: str = "pandas",
+    events=None,
 ) -> dict:
     """Run the aggregation pipeline.
 
@@ -127,6 +129,13 @@ def agg(
         Per-cell aggregation carrier: ``"pandas"`` (default) or ``"arrow"``.
         Both produce byte-for-byte identical scalar outputs (#30); ``"arrow"``
         is opt-in for benchmarking. Only honored by the ``"local"`` backend.
+    events : iterable, optional
+        Temporal pipeline only (``pipeline.type: temporal``/``event``): an
+        iterable of ``(event_key, event_mask, collections, static_data)`` tuples
+        fed one-per-worker to :func:`zagg.temporal.process_event`. Ignored by
+        the spatial path. Until the Phase-6/7 event reader + catalog land, the
+        caller supplies events directly (e.g. from a notebook), which is enough
+        to run a temporal config end-to-end on the local backend.
 
     Returns
     -------
@@ -134,66 +143,232 @@ def agg(
         Summary with keys: ``total_cells``, ``cells_with_data``,
         ``cells_error``, ``total_obs``, ``wall_time_s``, ``store_path``.
     """
-    # Resolve catalog and store
-    catalog_path = catalog or config.catalog
-    if not catalog_path:
-        raise ValueError("No catalog specified (pass catalog= or set catalog: in config)")
-    store_path = store or get_store_path(config)
-    if not store_path:
-        raise ValueError("No store path specified (pass store= or set output.store: in config)")
+    # Pipeline kind picks the strategy (issue #12, Phase 5). The strategy seam
+    # is dispatch-level: the spatial path is the existing code, moved verbatim
+    # into SpatialStrategy so its behavior/output stays byte-identical; the
+    # temporal path drives process_event over the same dispatch.py Executor.
+    strategy = _get_strategy(get_pipeline_type(config))
+    return strategy.run(
+        config,
+        catalog=catalog,
+        store=store,
+        backend=backend,
+        driver=driver,
+        max_cells=max_cells,
+        morton_cell=morton_cell,
+        max_workers=max_workers,
+        overwrite=overwrite,
+        dry_run=dry_run,
+        function_name=function_name,
+        region=region,
+        output_credentials=output_credentials,
+        output_endpoint_url=output_endpoint_url,
+        handoff=handoff,
+        events=events,
+    )
 
-    # child_order is HEALPix-specific (leaf order); other grids don't define it.
-    grid_type = config.output.get("grid", {}).get("type", "healpix")
-    child_order = get_child_order(config) if grid_type == "healpix" else None
-    _maybe_warn_dense(get_layout(config))
 
-    # Resolve driver: kwarg > config > default
-    resolved_driver = driver or get_driver(config)
+class SpatialStrategy:
+    """The point-cloud -> grid aggregation path (``pipeline.type: spatial``).
 
-    # Output endpoint/region are non-secret: runtime kwarg > config.
-    resolved_endpoint = output_endpoint_url or get_output_endpoint_url(config)
-    config_region = get_output_region(config)
-    if config_region and region == "us-west-2":
-        region = config_region
+    This is the original ``agg`` body, unchanged: resolve catalog/store, build
+    the grid, and fan cells out across the local or Lambda backend. Wrapping it
+    in a strategy keeps the spatial output byte-identical -- the dispatch seam
+    is the only new thing; the work below is verbatim.
+    """
 
-    # Load catalog and determine cell count for worker capping
-    catalog_data = _load_catalog(catalog_path)
-    n_cells = len(_select_cells(
-        catalog_data, morton_cell=morton_cell, max_cells=max_cells,
-    ))
+    def run(self, config, *, catalog, store, backend, driver, max_cells,
+            morton_cell, max_workers, overwrite, dry_run, function_name,
+            region, output_credentials, output_endpoint_url, handoff,
+            events=None):
+        # Resolve catalog and store
+        catalog_path = catalog or config.catalog
+        if not catalog_path:
+            raise ValueError("No catalog specified (pass catalog= or set catalog: in config)")
+        store_path = store or get_store_path(config)
+        if not store_path:
+            raise ValueError(
+                "No store path specified (pass store= or set output.store: in config)"
+            )
 
-    if backend == "local":
+        # child_order is HEALPix-specific (leaf order); other grids don't define it.
+        grid_type = config.output.get("grid", {}).get("type", "healpix")
+        child_order = get_child_order(config) if grid_type == "healpix" else None
+        _maybe_warn_dense(get_layout(config))
+
+        # Resolve driver: kwarg > config > default
+        resolved_driver = driver or get_driver(config)
+
+        # Output endpoint/region are non-secret: runtime kwarg > config.
+        resolved_endpoint = output_endpoint_url or get_output_endpoint_url(config)
+        config_region = get_output_region(config)
+        if config_region and region == "us-west-2":
+            region = config_region
+
+        # Load catalog and determine cell count for worker capping
+        catalog_data = _load_catalog(catalog_path)
+        n_cells = len(_select_cells(
+            catalog_data, morton_cell=morton_cell, max_cells=max_cells,
+        ))
+
+        if backend == "local":
+            if max_workers is None:
+                max_workers = 4
+            max_workers = min(max_workers, n_cells)
+            return _run_local(
+                config, catalog_data, store_path, child_order,
+                max_cells=max_cells, morton_cell=morton_cell,
+                max_workers=max_workers, overwrite=overwrite,
+                dry_run=dry_run, region=region, driver=resolved_driver,
+                output_credentials=output_credentials,
+                output_endpoint_url=resolved_endpoint,
+                handoff=handoff,
+            )
+        elif backend == "lambda":
+            if max_workers is None:
+                max_workers = 1700
+            max_workers = min(max_workers, n_cells)
+            if not store_path.startswith("s3://"):
+                raise ValueError(f"Lambda backend requires s3:// store path, got: {store_path}")
+            if function_name is None:
+                function_name = os.environ.get("ZAGG_LAMBDA_FUNCTION_NAME", "process-shard")
+            return _run_lambda(
+                config, catalog_data, store_path, child_order,
+                max_cells=max_cells, morton_cell=morton_cell,
+                max_workers=max_workers, overwrite=overwrite,
+                dry_run=dry_run, region=region,
+                function_name=function_name,
+                output_credentials=output_credentials,
+                output_endpoint_url=resolved_endpoint,
+            )
+        else:
+            raise ValueError(f"Unknown backend: {backend!r} (expected 'local' or 'lambda')")
+
+
+class TemporalStrategy:
+    """The event-streaming aggregation path (``pipeline.type: temporal``/``event``).
+
+    Drives :func:`zagg.temporal.process_event` over the merged ``dispatch.py``
+    primitives: one work unit per event, fanned out on a
+    :class:`~zagg.dispatch.LocalExecutor` (the Lambda backend lands with the
+    Phase-7 handler). ``specs_from_config(config)`` is resolved once and shared
+    across every event. Each event is an
+    ``(event_key, event_mask, collections, static_data)`` tuple supplied via the
+    ``events`` argument until the Phase-6/7 reader + catalog land.
+    """
+
+    def run(self, config, *, catalog, store, backend, driver, max_cells,
+            morton_cell, max_workers, overwrite, dry_run, function_name,
+            region, output_credentials, output_endpoint_url, handoff,
+            events=None):
+        from zagg.temporal import process_event, specs_from_config
+
+        if backend != "local":
+            raise ValueError(
+                f"temporal pipeline supports only the 'local' backend today "
+                f"(got {backend!r}); the Lambda handler lands in Phase 7"
+            )
+        if events is None:
+            raise ValueError(
+                "temporal pipeline requires events= (an iterable of "
+                "(event_key, event_mask, collections, static_data) tuples); the "
+                "event reader/catalog lands in a later phase"
+            )
+
+        store_path = store or get_store_path(config)
+        specs = specs_from_config(config)
+        event_list = list(events)
+        if max_cells is not None:
+            event_list = event_list[:max_cells]
+
+        if dry_run:
+            return {
+                "dry_run": True,
+                "total_events": len(event_list),
+                "n_specs": len(specs),
+                "store_path": store_path,
+                "backend": "local",
+            }
+
         if max_workers is None:
             max_workers = 4
-        max_workers = min(max_workers, n_cells)
-        return _run_local(
-            config, catalog_data, store_path, child_order,
-            max_cells=max_cells, morton_cell=morton_cell,
-            max_workers=max_workers, overwrite=overwrite,
-            dry_run=dry_run, region=region, driver=resolved_driver,
-            output_credentials=output_credentials,
-            output_endpoint_url=resolved_endpoint,
-            handoff=handoff,
+        max_workers = min(max_workers, len(event_list)) if event_list else 1
+
+        # One work unit per event, catching its own exceptions so one bad event
+        # counts as an error and the run continues -- mirrors the spatial local
+        # path's tagged-envelope contract so ``_accumulate`` stays simple.
+        def _event_work(payload):
+            event_key, event_mask, collections, static_data = payload
+            try:
+                results, meta = process_event(
+                    event_key, event_mask, collections, specs, static_data,
+                )
+                return {"event_key": event_key, "ok": True, "results": results, "meta": meta}
+            except Exception as e:
+                return {"event_key": event_key, "ok": False, "error": e}
+
+        executor = LocalExecutor(
+            _event_work, max_workers=max_workers, pool_factory=ThreadPoolExecutor,
         )
-    elif backend == "lambda":
-        if max_workers is None:
-            max_workers = 1700
-        max_workers = min(max_workers, n_cells)
-        if not store_path.startswith("s3://"):
-            raise ValueError(f"Lambda backend requires s3:// store path, got: {store_path}")
-        if function_name is None:
-            function_name = os.environ.get("ZAGG_LAMBDA_FUNCTION_NAME", "process-shard")
-        return _run_lambda(
-            config, catalog_data, store_path, child_order,
-            max_cells=max_cells, morton_cell=morton_cell,
-            max_workers=max_workers, overwrite=overwrite,
-            dry_run=dry_run, region=region,
-            function_name=function_name,
-            output_credentials=output_credentials,
-            output_endpoint_url=resolved_endpoint,
+        executor.preflight(len(event_list))
+
+        n = len(event_list)
+
+        def _accumulate(report, i, outcome):
+            event_key = outcome["event_key"]
+            if not outcome["ok"]:
+                report.cells_error += 1
+                logger.warning(f"  [{i}/{n}] event {event_key}: ERROR {outcome['error']}")
+                return
+            report.cells_with_data += 1
+            report.total_obs += outcome["meta"].get("timesteps_processed", 0)
+            report.results.append(
+                {"event_key": event_key, "results": outcome["results"], "meta": outcome["meta"]}
+            )
+
+        start_time = time.time()
+        try:
+            report = dispatch(
+                executor, event_list, retry=LOCAL_RETRY, accumulate=_accumulate,
+            )
+        finally:
+            executor.shutdown()
+        wall_time = time.time() - start_time
+
+        summary = {
+            "total_events": len(event_list),
+            "events_with_data": report.cells_with_data,
+            "events_error": report.cells_error,
+            "timesteps_processed": report.total_obs,
+            "wall_time_s": wall_time,
+            "store_path": store_path,
+            "backend": "local",
+            "results": report.results,
+        }
+        logger.info(
+            f"Done: {report.cells_with_data} events, {report.total_obs} timesteps, "
+            f"{report.cells_error} errors, {wall_time:.1f}s"
         )
-    else:
-        raise ValueError(f"Unknown backend: {backend!r} (expected 'local' or 'lambda')")
+        return summary
+
+
+# Strategy registry, keyed by pipeline.type (issue #12, Phase 5). ``event`` and
+# ``temporal`` share the event-streaming engine; ``spatial`` is the point-cloud
+# path. New pipeline kinds register here rather than adding another branch to
+# ``agg``.
+_STRATEGIES = {
+    "spatial": SpatialStrategy,
+    "temporal": TemporalStrategy,
+    "event": TemporalStrategy,
+}
+
+
+def _get_strategy(pipeline_type: str):
+    """Return the strategy instance for a pipeline kind (see :data:`_STRATEGIES`)."""
+    try:
+        return _STRATEGIES[pipeline_type]()
+    except KeyError:  # pragma: no cover - get_pipeline_type already gates the set
+        raise ValueError(f"No strategy for pipeline.type={pipeline_type!r}") from None
 
 
 def _load_catalog(catalog_path: str) -> dict:

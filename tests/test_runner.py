@@ -485,3 +485,158 @@ class TestSummaryKeysByteIdentical:
         # The exact pre-refactor order: one multiply over the summed time.
         assert summary["gb_seconds"] == total * 2.0
         assert summary["estimated_cost_usd"] == (total * 2.0) * 0.0000133334
+
+
+# ---------------------------------------------------------------------------
+# Pipeline strategy dispatch (issue #12, Phase 5)
+# ---------------------------------------------------------------------------
+
+
+def _temporal_config():
+    from zagg.config import load_config_from_dict
+
+    return load_config_from_dict(
+        {
+            "pipeline": {"type": "temporal"},
+            "data_source": {"reader": "xarray_s3", "collections": ["merra2"]},
+            "aggregation": {
+                "variables": {
+                    "max_t2m": {
+                        "variable": "T2M",
+                        "collection": "merra2",
+                        "spatial_func": "max",
+                        "temporal_reducer": "max",
+                        "mask": "full",
+                    }
+                }
+            },
+            "output": {"format": "tabular", "store": "."},
+        }
+    )
+
+
+def _synthetic_events():
+    """Two synthetic events feeding ``process_event`` (max-T2M over time)."""
+    xr = pytest.importorskip("xarray")
+    import numpy as np
+
+    lat = np.array([-70.0, -69.5])
+    lon = np.array([0.0, 0.5])
+    time = np.array(["2020-01-01T00", "2020-01-01T03"], dtype="datetime64[ns]")
+    coords = {"time": time, "lat": lat, "lon": lon}
+    events = []
+    for key, peak in (("storm1", 5.0), ("storm2", 9.0)):
+        event_mask = xr.DataArray(
+            np.ones((2, 2, 2)), dims=["time", "lat", "lon"], coords=coords
+        )
+        temp = xr.DataArray(
+            np.stack([np.full((2, 2), 1.0), np.full((2, 2), peak)]),
+            dims=["time", "lat", "lon"],
+            coords=coords,
+        )
+        collections = {"merra2": xr.Dataset({"T2M": temp})}
+        areas = xr.DataArray(
+            np.ones((2, 2)), dims=["lat", "lon"], coords={"lat": lat, "lon": lon}
+        )
+        events.append((key, event_mask, collections, {"cell_areas": areas}))
+    return events
+
+
+class TestStrategyDispatch:
+    def test_spatial_uses_spatial_strategy(self, atl06_config):
+        from zagg.runner import SpatialStrategy, _get_strategy
+
+        assert isinstance(_get_strategy("spatial"), SpatialStrategy)
+
+    def test_temporal_and_event_share_temporal_strategy(self):
+        from zagg.runner import TemporalStrategy, _get_strategy
+
+        assert isinstance(_get_strategy("temporal"), TemporalStrategy)
+        assert isinstance(_get_strategy("event"), TemporalStrategy)
+
+    def test_agg_spatial_still_routes_through_spatial_path(self, monkeypatch, atl06_config):
+        # Byte-identical guard at the seam: a spatial config dispatches into the
+        # unchanged spatial path. We assert agg() delegates to SpatialStrategy
+        # (the summary itself is pinned by TestSummaryKeysByteIdentical).
+        from zagg import runner
+
+        called = {}
+
+        def fake_run(self, config, **kwargs):
+            called["cls"] = type(self).__name__
+            return {"ok": True}
+
+        monkeypatch.setattr(runner.SpatialStrategy, "run", fake_run)
+        out = runner.agg(atl06_config, catalog="c.json", store="./out.zarr")
+        assert called["cls"] == "SpatialStrategy"
+        assert out == {"ok": True}
+
+
+class TestTemporalStrategy:
+    def test_runs_events_via_local_executor(self):
+        from zagg.runner import agg
+
+        events = _synthetic_events()
+        summary = agg(_temporal_config(), events=events)
+        assert summary["backend"] == "local"
+        assert summary["total_events"] == 2
+        assert summary["events_with_data"] == 2
+        assert summary["events_error"] == 0
+        by_key = {r["event_key"]: r for r in summary["results"]}
+        assert by_key["storm1"]["results"]["max_t2m"] == pytest.approx(5.0)
+        assert by_key["storm2"]["results"]["max_t2m"] == pytest.approx(9.0)
+
+    def test_max_cells_truncates_events(self):
+        from zagg.runner import agg
+
+        summary = agg(_temporal_config(), events=_synthetic_events(), max_cells=1)
+        assert summary["total_events"] == 1
+
+    def test_dry_run_summary(self):
+        from zagg.runner import agg
+
+        summary = agg(_temporal_config(), events=_synthetic_events(), dry_run=True)
+        assert summary["dry_run"] is True
+        assert summary["total_events"] == 2
+        assert summary["n_specs"] == 1
+
+    def test_missing_events_raises(self):
+        from zagg.runner import agg
+
+        with pytest.raises(ValueError, match="requires events="):
+            agg(_temporal_config())
+
+    def test_lambda_backend_rejected(self):
+        from zagg.runner import agg
+
+        with pytest.raises(ValueError, match="only the 'local' backend"):
+            agg(_temporal_config(), events=_synthetic_events(), backend="lambda")
+
+    def test_failing_event_counted_as_error(self):
+        # A spec referencing a missing variable makes process_event raise; the
+        # event is counted as an error and the run continues (tagged-envelope
+        # contract, mirroring the spatial local path).
+        from zagg.config import load_config_from_dict
+        from zagg.runner import agg
+
+        cfg = load_config_from_dict(
+            {
+                "pipeline": {"type": "temporal"},
+                "data_source": {"reader": "xarray_s3", "collections": ["merra2"]},
+                "aggregation": {
+                    "variables": {
+                        "bad": {
+                            "variable": "NOPE",
+                            "collection": "merra2",
+                            "spatial_func": "max",
+                            "temporal_reducer": "max",
+                            "mask": "full",
+                        }
+                    }
+                },
+                "output": {"format": "tabular", "store": "."},
+            }
+        )
+        summary = agg(cfg, events=_synthetic_events())
+        assert summary["events_error"] == 2
+        assert summary["events_with_data"] == 0

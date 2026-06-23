@@ -202,13 +202,13 @@ def validate_config(config: PipelineConfig) -> None:
     """
     # Pipeline kind drives which validation branch runs; spatial keeps the
     # full grid + aggregation cross-checks below. Temporal/event pipelines
-    # land in a follow-up phase once the engine + process_event are in.
+    # validate their own (much smaller) spec shape and return early -- they
+    # carry no output grid and run through the event-streaming engine
+    # (``zagg.temporal.process_event``) rather than the point-cloud path.
     ptype = get_pipeline_type(config)
     if ptype != "spatial":
-        raise NotImplementedError(
-            f"pipeline.type={ptype!r} is reserved for issue #12 follow-up phases; "
-            "only 'spatial' is validated today"
-        )
+        _validate_temporal_config(config)
+        return
 
     # Required sections
     for section in ("data_source", "aggregation", "output"):
@@ -303,6 +303,38 @@ def validate_config(config: PipelineConfig) -> None:
 
         # Validate the output-kind declaration (kind + trailing_shape + dtype)
         _validate_output_kind(name, meta)
+
+
+# Required per-variable keys for a temporal/event aggregation spec. ``mask``
+# is optional (``specs_from_config`` defaults it to ``"ais"``); capability
+# *names* (spatial_func / temporal_reducer / mask) are resolved by the registry
+# at run time, not here -- a typo surfaces as a clean ``UnknownCapability`` from
+# ``process_event`` rather than a load-time guess about which plugins are
+# installed.
+_TEMPORAL_SPEC_KEYS = ("variable", "collection", "spatial_func", "temporal_reducer")
+
+
+def _validate_temporal_config(config: PipelineConfig) -> None:
+    """Validate a temporal/event pipeline config (issue #12, Phase 5).
+
+    Temporal pipelines carry no output grid; the only cross-check is that the
+    ``aggregation.variables`` block names, per variable, the four keys
+    :data:`_TEMPORAL_SPEC_KEYS` that :func:`zagg.temporal.specs_from_config`
+    requires (the rest are optional flags with defaults). Raises ``ValueError``
+    on a missing section or key.
+    """
+    if not config.aggregation:
+        raise ValueError("Missing required section: aggregation")
+    variables = config.aggregation.get("variables")
+    if not variables:
+        raise ValueError("temporal pipeline requires aggregation.variables")
+    for name, meta in variables.items():
+        missing = [k for k in _TEMPORAL_SPEC_KEYS if k not in meta]
+        if missing:
+            raise ValueError(
+                f"temporal variable '{name}' is missing required key(s): "
+                f"{', '.join(missing)} (need {', '.join(_TEMPORAL_SPEC_KEYS)})"
+            )
 
 
 # Recognized per-field output kinds. ``ragged`` (CSR) is the Tier-2 carrier

@@ -134,18 +134,53 @@ class TestPipelineType:
         with pytest.raises(ValueError, match="pipeline.type must be one of"):
             get_pipeline_type(cfg)
 
-    def test_validate_rejects_temporal_until_engine_lands(self):
-        # Until the temporal engine lands, validate_config refuses the
-        # temporal/event types so silently-broken configs can't ship.
+    def test_validate_accepts_well_formed_temporal(self):
+        # Phase 5: a temporal config with the four required per-variable spec
+        # keys validates (the spatial grid cross-checks are skipped entirely).
+        cfg = load_config_from_dict(
+            {
+                "pipeline": {"type": "temporal"},
+                "data_source": {"reader": "xarray_s3", "collections": ["merra2"]},
+                "aggregation": {
+                    "variables": {
+                        "max_t2m": {
+                            "variable": "T2M",
+                            "collection": "merra2",
+                            "spatial_func": "max",
+                            "temporal_reducer": "max",
+                            "mask": "ais",
+                        }
+                    }
+                },
+                "output": {"format": "tabular", "store": "."},
+            }
+        )
+        validate_config(cfg)  # no raise
+
+    def test_validate_temporal_missing_spec_key_raises(self):
+        # A temporal variable lacking a required spec key fails at load time
+        # rather than silently shipping.
         cfg = load_config_from_dict(
             {
                 "pipeline": {"type": "temporal"},
                 "data_source": {"reader": "xarray_s3"},
-                "aggregation": {"variables": {"x": {"source": "h", "function": "np.mean"}}},
+                "aggregation": {"variables": {"x": {"variable": "T2M"}}},
                 "output": {"store": "."},
             }
         )
-        with pytest.raises(NotImplementedError, match="pipeline.type='temporal'"):
+        with pytest.raises(ValueError, match="missing required key"):
+            validate_config(cfg)
+
+    def test_validate_temporal_requires_variables(self):
+        cfg = load_config_from_dict(
+            {
+                "pipeline": {"type": "event"},
+                "data_source": {"reader": "xarray_s3"},
+                "aggregation": {"coordinates": {}},
+                "output": {"store": "."},
+            }
+        )
+        with pytest.raises(ValueError, match="aggregation.variables"):
             validate_config(cfg)
 
     def test_pipeline_must_be_mapping(self):
