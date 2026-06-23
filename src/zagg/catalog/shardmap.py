@@ -35,14 +35,21 @@ from typing import Dict, List
 
 import numpy as np
 
-# Resolve the granule-footprint MOC this many HEALPix levels ABOVE the leaf
-# (``child_order``). A few levels coarser than the leaf keeps footprint edges
-# reasonably tight while staying well above the shard order (``parent_order``) --
-# so ``moc_to_order`` never upsamples a footprint onto every shard (#92) -- and
+# Resolve the granule-footprint MOC this many HEALPix levels *coarser than* the
+# leaf (``child_order``) -- i.e. subtracting N gives an order N levels above the
+# leaf. A few levels coarser than the leaf keeps footprint edges reasonably tight
+# while staying well above the shard order (``parent_order``) -- so
+# ``moc_to_order`` never upsamples a footprint onto every shard (#92) -- and
 # comfortably under mortie's order-18 coverage cap (child_order 19 -> order 16).
 # Once mortie lifts that cap (espg/mortie#60) this offset can shrink for tighter
 # edges.
 MOC_LEVELS_BELOW_LEAF = 3
+
+# Upper bound on the MOC order mortie's ``morton_coverage`` /
+# ``morton_coverage_moc`` accept; a higher order raises inside mortie. The
+# derived order is clamped to this so a large ``child_order`` can't push the MOC
+# order past the cap and silently lose coverage (#92).
+MORTIE_MOC_ORDER_CAP = 18
 
 # ── granule footprint helpers ────────────────────────────────────────────────
 
@@ -78,18 +85,22 @@ def _resolve_mortie_order(mortie_order, grid) -> int:
     fixed default of 8 against ``parent_order=13`` expanded each cell to 1024
     shards, putting ~every granule in ~every shard and OOMing the workers (#92).
 
-    ``None`` (the default) pins the order to ``child_order -
-    MOC_LEVELS_BELOW_LEAF`` so footprints resolve a few levels above the leaf --
-    tight enough to track the granule yet under mortie's order-18 coverage cap.
-    An explicit ``mortie_order`` is honored but still validated against
-    ``parent_order``. Non-HEALPix grids (no ``parent_order``/``child_order``)
-    keep the legacy default of 8.
+    ``None`` (the default) pins the order to ``min(child_order -
+    MOC_LEVELS_BELOW_LEAF, MORTIE_MOC_ORDER_CAP)`` so footprints resolve a few
+    levels above the leaf -- tight enough to track the granule yet never past
+    mortie's order-18 coverage cap (a large ``child_order`` would otherwise push
+    the order past the cap and make mortie raise, silently losing coverage).
+    The clamp is applied first, then the order is still validated against
+    ``parent_order`` -- so if the clamp ever lands at or below ``parent_order``
+    the raise still fires. An explicit ``mortie_order`` is honored but still
+    validated against ``parent_order``. Non-HEALPix grids (no
+    ``parent_order``/``child_order``) keep the legacy default of 8.
     """
     is_healpix = hasattr(grid, "parent_order") and hasattr(grid, "child_order")
     if mortie_order is not None:
         order = int(mortie_order)
     elif is_healpix:
-        order = int(grid.child_order) - MOC_LEVELS_BELOW_LEAF
+        order = min(int(grid.child_order) - MOC_LEVELS_BELOW_LEAF, MORTIE_MOC_ORDER_CAP)
     else:
         order = 8
     if is_healpix and order < grid.parent_order:
@@ -316,10 +327,12 @@ class ShardMap:
             mortie for HEALPix grids (non-HEALPix grids require spherely and
             raise an ``ImportError`` with an install pointer when it is absent).
         mortie_order : int, optional
-            MOC order for the mortie backend. ``None`` (default) pins it to the
-            grid's ``child_order`` (clamped to mortie's order-18 cap) so granule
-            footprints resolve at leaf resolution; a coarser order upsamples
-            every footprint onto all shards (#92). Must be >= ``parent_order``.
+            MOC order for the mortie backend. ``None`` (default) pins it to
+            ``min(child_order - MOC_LEVELS_BELOW_LEAF, 18)`` -- a few levels above
+            the leaf, never past mortie's order-18 coverage cap -- so footprints
+            resolve tight to the granule; a coarser order upsamples every
+            footprint onto all shards (#92). Raises if the resolved order is
+            coarser than ``parent_order``.
 
         Returns
         -------

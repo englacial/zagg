@@ -274,6 +274,21 @@ class TestMortieOrder:
         with pytest.raises(ValueError, match="coarser than the grid's parent_order"):
             ShardMap.build(catalog, hp_grid, backend="mortie", mortie_order=8)
 
+    def test_derived_coarse_order_rejected(self, catalog):
+        # The None (derived) path also trips the guard: child_order 14 - 3 = 11
+        # is coarser than parent_order 13 -> raise (#92).
+        g = HealpixGrid(13, 14, layout="fullsphere")
+        with pytest.raises(ValueError, match="coarser than the grid's parent_order"):
+            ShardMap.build(catalog, g, backend="mortie")
+
+    def test_derived_order_clamped_to_cap(self):
+        # A child_order whose derived order would exceed mortie's order-18 cap is
+        # clamped to 18, never an illegal order that mortie would reject (#92).
+        from zagg.catalog.shardmap import MORTIE_MOC_ORDER_CAP, _resolve_mortie_order
+
+        g = HealpixGrid(15, 22, layout="fullsphere")  # 22 - 3 = 19 > cap
+        assert _resolve_mortie_order(None, g) == MORTIE_MOC_ORDER_CAP == 18
+
     def test_no_fattening_west_east_disjoint(self, hp_grid):
         # A west granule and an east granule must occupy disjoint shard sets --
         # under the old order-8 default both spread onto every AOI shard.
