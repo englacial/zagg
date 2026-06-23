@@ -994,6 +994,74 @@ class TestMultiChunkWorker:
         # Each chunk had one populated cell -> one CSR group per chunk.
         assert n_csr_groups == 4
 
+    def test_chunk_precompute_is_per_chunk_not_shard_pooled(self, monkeypatch):
+        """Issue #82 phase 6: a ``chunk_precompute`` anchor is reduced over EACH
+        finer Zarr chunk's own observations, not the whole pooled shard. Build a
+        shard whose K=4 inner chunks hold disjoint value ranges and assert the
+        stored per-chunk gain/offset companions DIFFER (each == its chunk's own
+        min), where a shard-pooled anchor would have stored one shared value."""
+        import zarr
+        from mortie import geo2mort
+        from zarr.storage import MemoryStore
+
+        from zagg.config import default_config
+        from zagg.grids import from_config
+        from zagg.processing import write_dataframe_to_zarr
+
+        cfg = default_config("atl06")
+        cfg.output["grid"] = {
+            "type": "healpix",
+            "parent_order": 6,
+            "chunk_inner": 7,
+            "child_order": 8,
+        }
+        # gain/offset basis case: the anchor is min(h_li) over the chunk.
+        cfg.aggregation["chunk_precompute"] = {
+            "anchor": {"expression": "np.float32(np.min(h_li))", "source": "h_li"}
+        }
+        cfg.aggregation["variables"] = {
+            "h_min": {"function": "min", "source": "h_li", "dtype": "float32"},
+            "offset_h": {"expression": "anchor", "resolution": "chunk", "dtype": "float32"},
+        }
+        grid = from_config(cfg)
+        assert grid.chunks_per_shard == 4
+        shard_key = int(geo2mort(-78.5, -132.0, order=6)[0])
+        chunks = list(grid.iter_chunks(shard_key))
+        # Two photons in the first cell of each chunk; each chunk's range is offset
+        # by +100, so per-chunk mins are 100, 200, 300, 400 (shard min would be 100).
+        leaf, h = [], []
+        per_chunk_min = []
+        for k, (_b, cc) in enumerate(chunks):
+            base = 100.0 * (k + 1)
+            leaf += [int(cc[0]), int(cc[0])]
+            h += [base + 5.0, base]  # min is ``base``
+            per_chunk_min.append(base)
+        df = pd.DataFrame(
+            {
+                "h_li": np.array(h, dtype=np.float32),
+                "leaf_id": np.array(leaf, dtype=np.uint64),
+            }
+        )
+        self._patch_reads(monkeypatch, df)
+
+        store = MemoryStore()
+        grid.emit_template(store)
+        results: list = []
+        process_shard(
+            grid, shard_key, ["s3://x"], s3_credentials={}, config=cfg, chunk_results=results
+        )
+        assert len(results) == 4
+        for block_index, carrier, _ragged in results:
+            write_dataframe_to_zarr(carrier, store, grid=grid, chunk_idx=block_index)
+        # offset_h is a resolution: chunk companion: one value per chunk, indexed by
+        # the chunk's block index. Read each chunk's stored anchor.
+        offset = zarr.open_array(store, path="8/offset_h", mode="r")
+        got = [float(offset[block_index]) for block_index, _c, _r in results]
+        # Per-chunk anchors DIFFER and equal each chunk's own min — not the single
+        # shard-pooled min (100.0) that the old shard-level reduction would store.
+        assert got == per_chunk_min
+        assert len(set(got)) == 4
+
 
 class TestChunkCompanionWorkedExample:
     """Issue #82 phase 5: a worked example exercising a chunk_precompute value
