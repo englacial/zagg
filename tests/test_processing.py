@@ -792,6 +792,308 @@ class TestRaggedChunkCompanion:
         np.testing.assert_array_equal(cells[0].reshape(-1), [1.0, 2.0])
 
 
+class TestMultiChunkWorker:
+    """Issue #30 item 3: one worker (one shard) owns K = grid.chunks_per_shard finer
+    Zarr chunks. process_shard reads granules once and returns one carrier + ragged
+    per chunk via ``chunk_results``; the runner writes K regions + K companions.
+    K==1 (chunk_inner unset) is byte-identical to the single-chunk path."""
+
+    @staticmethod
+    def _scalar_cfg(chunk_inner=None):
+        """atl06-style coords + a scalar config, optionally with a finer chunk_inner."""
+        from zagg.config import default_config
+
+        cfg = default_config("atl06")
+        grid = {"type": "healpix", "parent_order": 6, "child_order": 8}
+        if chunk_inner is not None:
+            grid["chunk_inner"] = chunk_inner
+        cfg.output["grid"] = grid
+        cfg.aggregation["variables"] = {
+            "h_min": {"function": "min", "source": "h_li", "dtype": "float32"},
+            "count": {"function": "len", "source": "h_li"},
+        }
+        return cfg
+
+    def _patch_reads(self, monkeypatch, df):
+        calls = {"n": 0}
+
+        def one_shot(*args, **kwargs):
+            calls["n"] += 1
+            return df if calls["n"] == 1 else None
+
+        monkeypatch.setattr("zagg.processing._read_group", one_shot)
+        monkeypatch.setattr("zagg.processing.h5coro.H5Coro", lambda *a, **k: object())
+        monkeypatch.setattr("zagg.processing._make_url_rewriter", lambda driver: lambda u: u)
+
+    def test_k_gt_1_yields_one_carrier_per_chunk(self, monkeypatch):
+        """K=4: process_shard returns 4 chunk_results, each a carrier at its own
+        block index; one photon per chunk lands in the right chunk region."""
+        import zarr
+        from mortie import geo2mort
+        from zarr.storage import MemoryStore
+
+        from zagg.grids import from_config
+
+        cfg = self._scalar_cfg(chunk_inner=7)  # parent 6, chunk 7, child 8 -> K=4
+        grid = from_config(cfg)
+        assert grid.chunks_per_shard == 4
+        shard_key = int(geo2mort(-78.5, -132.0, order=6)[0])
+        chunks = list(grid.iter_chunks(shard_key))
+        # One photon in the first cell of each finer chunk, distinct heights.
+        leaf = [int(cc[0]) for _b, cc in chunks]
+        df = pd.DataFrame(
+            {
+                "h_li": np.array([10.0, 11.0, 12.0, 13.0], dtype=np.float32),
+                "leaf_id": np.array(leaf, dtype=np.uint64),
+            }
+        )
+        self._patch_reads(monkeypatch, df)
+
+        store = MemoryStore()
+        grid.emit_template(store)
+        results: list = []
+        _df, meta = process_shard(
+            grid, shard_key, ["s3://x"], s3_credentials={}, config=cfg, chunk_results=results
+        )
+        assert len(results) == 4
+        from zagg.processing import write_dataframe_to_zarr
+
+        for block_index, carrier, _ragged in results:
+            assert len(carrier) == grid.cells_per_chunk
+            write_dataframe_to_zarr(carrier, store, grid=grid, chunk_idx=block_index)
+
+        h_min = zarr.open_array(store, path="8/h_min", mode="r")[:]
+        populated = sorted(h_min[~np.isnan(h_min)].tolist())
+        assert populated == [10.0, 11.0, 12.0, 13.0]
+        assert meta["cells_with_data"] == 4
+
+    def test_k_gt_1_without_chunk_results_raises(self, monkeypatch):
+        """A K>1 grid called without a chunk_results sink raises (the K carriers
+        cannot be returned through the single df_out)."""
+        from mortie import geo2mort
+
+        from zagg.grids import from_config
+
+        cfg = self._scalar_cfg(chunk_inner=7)
+        grid = from_config(cfg)
+        shard_key = int(geo2mort(-78.5, -132.0, order=6)[0])
+        df = pd.DataFrame(
+            {
+                "h_li": np.array([1.0], dtype=np.float32),
+                "leaf_id": np.array([int(grid.children(shard_key)[0])], dtype=np.uint64),
+            }
+        )
+        self._patch_reads(monkeypatch, df)
+        with pytest.raises(ValueError, match="chunks_per_shard"):
+            process_shard(grid, shard_key, ["s3://x"], s3_credentials={}, config=cfg)
+
+    def test_k1_byte_identical_to_chunk_results_path(self, monkeypatch):
+        """K==1: the carrier from the default 2-tuple return equals the lone
+        chunk_results carrier — the chunk_results plumbing changes nothing at K==1."""
+        from mortie import geo2mort
+
+        from zagg.grids import from_config
+
+        cfg = self._scalar_cfg(chunk_inner=None)  # K == 1
+        grid = from_config(cfg)
+        assert grid.chunks_per_shard == 1
+        shard_key = int(geo2mort(-78.5, -132.0, order=6)[0])
+        children = grid.children(shard_key)
+        df = pd.DataFrame(
+            {
+                "h_li": np.array([5.0, 6.0], dtype=np.float32),
+                "leaf_id": np.array([int(children[0]), int(children[1])], dtype=np.uint64),
+            }
+        )
+        self._patch_reads(monkeypatch, df)
+        df_default, _ = process_shard(grid, shard_key, ["s3://x"], s3_credentials={}, config=cfg)
+
+        self._patch_reads(monkeypatch, df.copy())
+        results: list = []
+        process_shard(
+            grid, shard_key, ["s3://x"], s3_credentials={}, config=cfg, chunk_results=results
+        )
+        assert len(results) == 1
+        _block, carrier, _ragged = results[0]
+        pd.testing.assert_frame_equal(
+            df_default.reset_index(drop=True), carrier.reset_index(drop=True)
+        )
+
+    def test_k_gt_1_with_chunk_companion_and_ragged(self, monkeypatch):
+        """K>1 with a resolution: chunk scalar companion AND a cell-resolution ragged
+        field: each chunk writes its own companion slice + CSR group."""
+        import zarr
+        from mortie import geo2mort
+        from zarr.storage import MemoryStore
+
+        from zagg.config import default_config
+        from zagg.csr import read_csr
+        from zagg.grids import from_config
+        from zagg.processing import write_dataframe_to_zarr, write_ragged_to_zarr
+
+        cfg = default_config("atl06")
+        cfg.output["grid"] = {
+            "type": "healpix",
+            "parent_order": 6,
+            "chunk_inner": 7,
+            "child_order": 8,
+        }
+        cfg.aggregation["chunk_precompute"] = {
+            "anchor": {"expression": "np.float32(np.min(h_li))", "source": "h_li"}
+        }
+        cfg.aggregation["variables"] = {
+            "h_min": {"function": "min", "source": "h_li", "dtype": "float32"},
+            # chunk-resolution scalar companion (bare anchor name).
+            "offset_h": {
+                "expression": "anchor",
+                "resolution": "chunk",
+                "dtype": "float32",
+            },
+            # cell-resolution ragged.
+            "h_raw": {
+                "function": "np.sort",
+                "source": "h_li",
+                "kind": "ragged",
+                "inner_shape": [1],
+                "dtype": "float32",
+            },
+        }
+        grid = from_config(cfg)
+        assert grid.chunks_per_shard == 4
+        shard_key = int(geo2mort(-78.5, -132.0, order=6)[0])
+        chunks = list(grid.iter_chunks(shard_key))
+        leaf = [int(cc[0]) for _b, cc in chunks]
+        df = pd.DataFrame(
+            {
+                "h_li": np.array([20.0, 21.0, 22.0, 23.0], dtype=np.float32),
+                "leaf_id": np.array(leaf, dtype=np.uint64),
+            }
+        )
+        self._patch_reads(monkeypatch, df)
+
+        store = MemoryStore()
+        grid.emit_template(store)
+        results: list = []
+        process_shard(
+            grid, shard_key, ["s3://x"], s3_credentials={}, config=cfg, chunk_results=results
+        )
+        assert len(results) == 4
+        n_csr_groups = 0
+        for block_index, carrier, ragged in results:
+            write_dataframe_to_zarr(carrier, store, grid=grid, chunk_idx=block_index)
+            # Each chunk's ragged keyed by its own block index (K>1).
+            key = int(block_index[0])
+            write_ragged_to_zarr(ragged, store, grid=grid, shard_key=key)
+            if ragged.get("h_raw") and ragged["h_raw"][0]:
+                csr = read_csr(store, f"{grid.group_path}/h_raw/{key}")
+                assert csr["values"].size > 0
+                n_csr_groups += 1
+        # offset_h companion: 4 distinct chunk slices populated.
+        offset = zarr.open_array(store, path="8/offset_h", mode="r")[:]
+        assert int(np.count_nonzero(~np.isnan(offset))) == 4
+        # Each chunk had one populated cell -> one CSR group per chunk.
+        assert n_csr_groups == 4
+
+
+class TestChunkCompanionWorkedExample:
+    """Issue #82 phase 5: a worked example exercising a chunk_precompute value
+    stored as all three chunk-companion kinds — scalar, vector, AND ragged — and
+    read back. This is the end-to-end shape the issue asked for: one
+    ``chunk_precompute`` anchor surfaced into a per-chunk scalar companion, a
+    per-chunk vector companion, and a per-chunk ragged (CSR) companion."""
+
+    def _patch_reads(self, monkeypatch, df):
+        calls = {"n": 0}
+
+        def one_shot(*args, **kwargs):
+            calls["n"] += 1
+            return df if calls["n"] == 1 else None
+
+        monkeypatch.setattr("zagg.processing._read_group", one_shot)
+        monkeypatch.setattr("zagg.processing.h5coro.H5Coro", lambda *a, **k: object())
+        monkeypatch.setattr("zagg.processing._make_url_rewriter", lambda driver: lambda u: u)
+
+    def test_scalar_vector_ragged_chunk_companions_roundtrip(self, monkeypatch):
+        import zarr
+        from mortie import geo2mort
+        from zarr.storage import MemoryStore
+
+        from zagg.config import default_config
+        from zagg.csr import iter_csr_cells, read_csr
+        from zagg.grids import from_config
+        from zagg.processing import write_dataframe_to_zarr, write_ragged_to_zarr
+
+        cfg = default_config("atl06")
+        cfg.output["grid"] = {"type": "healpix", "parent_order": 6, "child_order": 8}
+        # One chunk anchor (a fixed 3-vector + a scalar derived from it), surfaced
+        # into a scalar, a vector, and a ragged chunk companion.
+        cfg.aggregation["chunk_precompute"] = {
+            "edges": {
+                "expression": "np.array([0.0, 5.0, 10.0], dtype=np.float32)",
+                "source": "h_li",
+            },
+            "anchor": {"expression": "np.float32(np.min(h_li))", "source": "h_li"},
+        }
+        cfg.aggregation["variables"] = {
+            "h_min": {"function": "min", "source": "h_li", "dtype": "float32"},
+            # scalar chunk companion (one value per chunk).
+            "offset_h": {"expression": "anchor", "resolution": "chunk", "dtype": "float32"},
+            # vector chunk companion (one 3-vector per chunk). Default NaN fill so
+            # empty cells are NaN-ignored by the chunk-uniform collapse (a 0-fill
+            # would make empty cells [0,0,0], spuriously non-uniform vs [0,5,10]).
+            "edges_h": {
+                "expression": "edges",
+                "kind": "vector",
+                "trailing_shape": 3,
+                "resolution": "chunk",
+                "dtype": "float32",
+            },
+            # ragged chunk companion (one variable-length payload per chunk).
+            "edges_ragged": {
+                "expression": "edges",
+                "kind": "ragged",
+                "inner_shape": [1],
+                "resolution": "chunk",
+                "dtype": "float32",
+            },
+        }
+        grid = from_config(cfg)
+        shard_key = int(geo2mort(-78.5, -132.0, order=6)[0])
+        children = grid.children(shard_key)
+        df = pd.DataFrame(
+            {
+                "h_li": np.array([3.0, 7.0, 4.0], dtype=np.float32),
+                "leaf_id": np.array(
+                    [int(children[0]), int(children[0]), int(children[1])], dtype=np.uint64
+                ),
+            }
+        )
+        self._patch_reads(monkeypatch, df)
+
+        store = MemoryStore()
+        grid.emit_template(store)
+        results: list = []
+        process_shard(
+            grid, shard_key, ["s3://x"], s3_credentials={}, config=cfg, chunk_results=results
+        )
+        assert len(results) == 1  # K == 1 (no chunk_inner)
+        block_index, carrier, ragged = results[0]
+        write_dataframe_to_zarr(carrier, store, grid=grid, chunk_idx=block_index)
+        write_ragged_to_zarr(ragged, store, grid=grid, shard_key=shard_key)
+
+        chunk_idx = grid.block_index(shard_key)
+        # scalar companion: one value at this chunk == min(h_li) == 3.0.
+        offset = zarr.open_array(store, path="8/offset_h", mode="r")
+        assert offset[chunk_idx] == np.float32(3.0)
+        # vector companion: the 3-vector edges at this chunk.
+        edges = zarr.open_array(store, path="8/edges_h", mode="r")
+        np.testing.assert_array_equal(edges[chunk_idx], [0.0, 5.0, 10.0])
+        # ragged companion: one CSR payload per chunk == edges.
+        cells = dict(iter_csr_cells(read_csr(store, f"8/edges_ragged/{shard_key}")))
+        assert list(cells) == [0]
+        np.testing.assert_array_equal(cells[0].reshape(-1), [0.0, 5.0, 10.0])
+
+
 class TestBuildGroups:
     def test_slice_counts_match_per_cell_mask(self):
         """_build_groups produces identical cell populations as the old boolean-mask loop."""

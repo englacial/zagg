@@ -388,6 +388,15 @@ class RectilinearGrid:
         """No per-cell coord columns; x/y are 1D dimensional coords on the template."""
         return {}
 
+    def coords_of(self, children) -> dict:
+        """No per-cell coord columns (matches :meth:`chunk_coords`).
+
+        The chunk-resolution variant used by the K>1 worker (issue #30 item 3);
+        rectilinear carries x/y as 1-D dimensional coords on the template, so a
+        per-chunk carrier needs no coord columns either.
+        """
+        return {}
+
     # ── template ─────────────────────────────────────────────────────────
 
     def emit_template(self, store: Store, *, overwrite: bool = False) -> Store:

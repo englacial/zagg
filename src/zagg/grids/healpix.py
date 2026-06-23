@@ -283,7 +283,17 @@ class HealpixGrid:
         it is stored as ``uint64`` on disk via :mod:`zagg.grids.morton`. ``cell_ids``
         stays NESTED ``uint64`` (the DGGS coordinate, unchanged).
         """
-        children = self.children(shard_key)
+        return self.coords_of(self.children(shard_key))
+
+    def coords_of(self, children) -> dict:
+        """Per-cell coord columns for an explicit ``children`` array.
+
+        The chunk-resolution variant of :meth:`chunk_coords`: at K>1 (issue #30
+        item 3) a worker writes one carrier per finer chunk, whose cells are the
+        chunk's own ``children`` (from :meth:`iter_chunks`), not the whole shard's.
+        ``chunk_coords`` is just ``coords_of(children(shard_key))``.
+        """
+        children = np.asarray(children)
         return {
             "morton": to_morton_array(children),
             "cell_ids": self.encode_cell_ids(children),
