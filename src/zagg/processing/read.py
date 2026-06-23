@@ -271,8 +271,10 @@ def _planned_read_group(
 
     Issue #43 Phase C: when ``data_source.read_plan.spatial_index`` names a coarse
     level whose ``link`` points at the base level, we read the coarse coordinates
-    + link arrays once (small), call :func:`zagg.read_plan.plan_read` to compute
-    which base-rate slices the AOI bbox actually touches, and read base-rate
+    + link arrays once (small), call :func:`zagg.read_plan.plan_read` with the
+    mortie segment->shard mask (``grid.shards_of(grid.assign(...)) == shard_key``,
+    the same exact test the photon path applies) to compute which base-rate
+    slices the shard actually touches, and read base-rate
     coords + variables + filter datasets only over those slices via
     :func:`zagg.read_plan.execute_read_plan`. This avoids the
     ``lat_ph`` + ``lon_ph`` full-coord read (up to ~245 MB per ATL03 beam) that
@@ -344,7 +346,7 @@ def _planned_read_group(
     # shard edge is recovered by ``pad`` (and the photon-level filter below never
     # over-includes); residual omission is bounded to a few edge photons (#95).
     coarse_leaf = grid.assign(np.asarray(coarse_lats), np.asarray(coarse_lons))
-    coarse_mask = grid.shards_of(coarse_leaf) == int(shard_key)
+    coarse_mask = grid.shards_of(coarse_leaf) == shard_key
 
     plan = plan_read(
         np.asarray(coarse_lats),
@@ -526,9 +528,10 @@ def _read_group(h5obj, group: str, data_source: dict, shard_key: int, grid, arro
     filters are unchanged.
 
     *Hierarchical (planned) read* (``read_plan.spatial_index`` set, in addition
-    to ``levels``/``base_level``): the AOI bbox is computed from the grid's
-    shard footprint, the coarse-level spatial-index coordinates are read fully
-    (cheap), and base-rate coords + variables + filter datasets are read only
+    to ``levels``/``base_level``): the coarse-level spatial-index coordinates
+    are read fully (cheap), matched to the shard with the mortie segment->shard
+    mask (``grid.shards_of(grid.assign(...)) == shard_key``), and base-rate
+    coords + variables + filter datasets are read only
     over the planned hyperslices via :func:`zagg.read_plan.execute_read_plan`.
     Empty-AOI groups short-circuit to ``None``. Selectivity above the configured
     threshold falls back to the full-read path; the planned and full paths
