@@ -18,7 +18,7 @@ import pytest
 import stac_geoparquet.arrow as sga
 
 from zagg.catalog import shardmap
-from zagg.catalog.shardmap import ShardMap, _resolve_backend
+from zagg.catalog.shardmap import MOC_LEVELS_BELOW_LEAF, ShardMap, _resolve_backend
 from zagg.catalog.sources import Catalog
 from zagg.config import default_config
 from zagg.grids import HealpixGrid, RectilinearGrid
@@ -243,6 +243,51 @@ class TestResolveBackend:
         )
         with pytest.raises(SystemExit):
             main()
+
+
+class TestMortieOrder:
+    """The mortie MOC order must track the grid, not a fixed coarse default (#92).
+
+    A MOC order below ``parent_order`` upsamples in ``moc_to_order``, fattening
+    every granule footprint onto all shards under each coarse cell -- the
+    order-8-vs-order-13 degeneracy that put ~every granule in ~every shard.
+    """
+
+    @pytest.fixture
+    def hp_grid(self):
+        # parent_order 11 shards (~0.03 deg), child_order 17 leaves over the AOI.
+        return HealpixGrid(11, 17, layout="fullsphere")
+
+    def test_default_offsets_below_child_order(self, catalog, hp_grid):
+        # child_order 17 - MOC_LEVELS_BELOW_LEAF (3) = 14.
+        sm = ShardMap.build(catalog, hp_grid, backend="mortie")
+        assert sm.metadata["mortie_order"] == 17 - MOC_LEVELS_BELOW_LEAF == 14
+
+    def test_default_under_mortie_cap_at_leaf_order_19(self, catalog):
+        # child_order 19 (the ~10 m leaf) -> order 16, under mortie's order-18 cap.
+        g = HealpixGrid(13, 19, layout="fullsphere")
+        sm = ShardMap.build(catalog, g, backend="mortie")
+        assert sm.metadata["mortie_order"] == 16
+
+    def test_coarse_order_rejected(self, catalog, hp_grid):
+        # An explicit order coarser than parent_order would fatten -> raise.
+        with pytest.raises(ValueError, match="coarser than the grid's parent_order"):
+            ShardMap.build(catalog, hp_grid, backend="mortie", mortie_order=8)
+
+    def test_no_fattening_west_east_disjoint(self, hp_grid):
+        # A west granule and an east granule must occupy disjoint shard sets --
+        # under the old order-8 default both spread onto every AOI shard.
+        cat = _catalog([_item("Gwest", -76.62, -76.59), _item("Geast", -76.53, -76.50)])
+        sm = ShardMap.build(cat, hp_grid, backend="mortie")
+        gs = _granule_shards(sm)
+        assert gs["Gwest"] and gs["Geast"]
+        assert gs["Gwest"].isdisjoint(gs["Geast"])
+
+    def test_non_healpix_keeps_legacy_default(self, grid):
+        # Non-HEALPix grids have no parent/child order -> legacy default of 8.
+        from zagg.catalog.shardmap import _resolve_mortie_order
+
+        assert _resolve_mortie_order(None, grid) == 8
 
 
 class TestIO:
