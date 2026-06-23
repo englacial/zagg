@@ -230,7 +230,7 @@ class HealpixGrid:
         return clip2order(self.parent_order, np.asarray(leaf_ids))
 
     def cells_of(self, leaf_ids) -> np.ndarray:
-        """Coarsen order-18 leaf morton IDs to ``child_order`` cell IDs."""
+        """Coarsen reference-order leaf morton IDs to ``child_order`` cell IDs."""
         from mortie import clip2order
 
         return clip2order(self.child_order, np.asarray(leaf_ids))

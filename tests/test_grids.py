@@ -248,6 +248,29 @@ class TestReferenceOrder:
             assert len(children) == 4 ** (19 - 11)
             assert np.all(g.shards_of(children) == int(shard))
 
+    def test_assign_morton_exceeds_int64(self):
+        # Order-29 ``assign`` produces morton values past int64's max (bit 63
+        # set) -- they must be carried unsigned, never silently truncated/signed.
+        g = HealpixGrid(parent_order=11, child_order=19, layout="fullsphere")
+        rng = np.random.default_rng(11)
+        leaves = np.asarray(g.assign(rng.uniform(-89, 89, 50000), rng.uniform(-179, 179, 50000)))
+        mx = int(leaves.max())
+        assert mx > np.iinfo(np.int64).max  # would be negative if stored signed
+        assert mx <= np.iinfo(np.uint64).max
+
+    def test_order_19_template_emits(self):
+        # The order-19 + chunk_inner template emits sanely: cell-resolution arrays
+        # at the full 12*4^19 grid, ``resolution: chunk`` companions at the chunk
+        # grid (12*4^13). The nominal 3.3e12 cell array is metadata-only.
+        cfg = default_config("atl03_gain_bias_healpix")
+        g = from_config(cfg)
+        store = MemoryStore()
+        g.emit_template(store)
+        group = open_group(store, path=str(g.child_order), mode="r")
+        assert group["waveform_counts"].shape == (HEALPIX_BASE_CELLS * 4**19, 128)
+        assert group["offset_h"].shape == (HEALPIX_BASE_CELLS * 4**13,)
+        assert group["gain_h"].shape == (HEALPIX_BASE_CELLS * 4**13,)
+
 
 class TestFromConfig:
     def test_healpix_default_fullsphere(self, cfg):
