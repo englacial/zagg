@@ -184,9 +184,14 @@ class RectilinearGrid:
         """Number of chunks per axis (``array_shape // chunk_shape``).
 
         A ``resolution: chunk`` field (issue #30 item 2) stores one value per
-        chunk in a companion array of this shape, indexed by :meth:`block_index`
-        (the ``(rb, cb)`` chunk index). Equals ``(n_inner_row_blocks,
+        chunk in a companion array of this shape. Equals ``(n_inner_row_blocks,
         n_inner_col_blocks)`` (== the shard grid when ``chunk_inner`` is unset).
+
+        Indexing: at K==1 the per-chunk index IS :meth:`block_index` (the shard's
+        ``(rb, cb)``). At K>1 the companion is the finer inner grid, so the correct
+        per-chunk index is the ``(rb, cb)`` yielded by :meth:`iter_chunks` — NOT
+        ``block_index(shard_key)``, which is the coarser shard-tile index. The K>1
+        writer must index by ``iter_chunks``.
         """
         return (self.n_inner_row_blocks, self.n_inner_col_blocks)
 
@@ -201,6 +206,12 @@ class RectilinearGrid:
         When ``chunk_inner`` is unset (``K == 1``) this yields exactly one entry —
         ``(block_index(shard_key), children(shard_key))`` — byte-identical to the
         single-chunk path.
+
+        Order note: at K>1 the union of the per-chunk ``chunk_children`` equals the
+        shard's :meth:`children` as a SET, but the concatenation order does NOT match
+        ``children(shard_key)`` (the shard is row-major over the whole tile; the
+        chunks are row-major within each inner sub-tile). The writer must place each
+        chunk's cells against its own ``block`` region.
         """
         if self.inner_h == self.chunk_h and self.inner_w == self.chunk_w:
             yield (self.block_index(shard_key), self.children(shard_key))
