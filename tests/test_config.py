@@ -1393,11 +1393,11 @@ class TestResolutionAttribute:
         with pytest.raises(ValueError, match="kind 'vector' requires 'trailing_shape'"):
             validate_config(cfg)
 
-    def test_ragged_chunk_deferred_rejected(self):
-        # issue #82: ragged chunk companions (CSR at chunk resolution) are deferred
-        # — the cell-resolution CSR write path is not yet wired into the worker, so
-        # accepting it would validate-then-silently-misbehave. Rejected with a clear
-        # "deferred" message (vector/scalar chunk companions are unaffected).
+    def test_ragged_chunk_companion_accepted(self):
+        # issue #82 phase 4c: ragged chunk companions (CSR at chunk resolution) are
+        # now wired — a chunk-resolution ragged field stores one payload per chunk
+        # via write_ragged_to_zarr. Validation accepts it like any other ragged
+        # field (inner_shape required; trailing_shape rejected).
         cfg = _cfg_with_field(
             {
                 "kind": "ragged",
@@ -1409,8 +1409,8 @@ class TestResolutionAttribute:
         cfg.aggregation["chunk_precompute"] = {
             "chunk_pairs": {"expression": "np.zeros((3, 2))", "source": "h_ph"}
         }
-        with pytest.raises(ValueError, match="not yet supported for kind 'ragged'"):
-            validate_config(cfg)
+        validate_config(cfg)  # no raise
+        assert get_output_signature(get_agg_fields(cfg)["f"])["resolution"] == "chunk"
 
     def test_worked_template_offset_gain_are_chunk_resolution(self):
         cfg = default_config("atl03_waveform_chunk")
