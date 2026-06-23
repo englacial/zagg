@@ -1062,6 +1062,149 @@ class TestMultiChunkWorker:
         assert got == per_chunk_min
         assert len(set(got)) == 4
 
+    def test_chunk_precompute_empty_inner_chunk_gets_nan_anchor(self, monkeypatch):
+        """Issue #82 phase 6 (review fold): an EMPTY inner chunk must not raise.
+        ``iter_chunks`` yields all K chunks including those with zero observations,
+        and the canonical ``np.float32(np.min(h_li))`` anchor raises ``ValueError``
+        over an empty array. Populate only some chunks, leaving ≥1 empty, and assert
+        the empty chunk's stored anchor is NaN (and the run does NOT raise)."""
+        import zarr
+        from mortie import geo2mort
+        from zarr.storage import MemoryStore
+
+        from zagg.config import default_config
+        from zagg.grids import from_config
+        from zagg.processing import write_dataframe_to_zarr
+
+        cfg = default_config("atl06")
+        cfg.output["grid"] = {
+            "type": "healpix",
+            "parent_order": 6,
+            "chunk_inner": 7,
+            "child_order": 8,
+        }
+        cfg.aggregation["chunk_precompute"] = {
+            "anchor": {"expression": "np.float32(np.min(h_li))", "source": "h_li"}
+        }
+        cfg.aggregation["variables"] = {
+            "h_min": {"function": "min", "source": "h_li", "dtype": "float32"},
+            "offset_h": {"expression": "anchor", "resolution": "chunk", "dtype": "float32"},
+        }
+        grid = from_config(cfg)
+        assert grid.chunks_per_shard == 4
+        shard_key = int(geo2mort(-78.5, -132.0, order=6)[0])
+        chunks = list(grid.iter_chunks(shard_key))
+        # Populate ONLY the first two chunks; the last two stay empty (zero obs).
+        populated = {0, 1}
+        leaf, h = [], []
+        for k, (_b, cc) in enumerate(chunks):
+            if k not in populated:
+                continue
+            base = 100.0 * (k + 1)
+            leaf += [int(cc[0]), int(cc[0])]
+            h += [base + 5.0, base]
+        df = pd.DataFrame(
+            {
+                "h_li": np.array(h, dtype=np.float32),
+                "leaf_id": np.array(leaf, dtype=np.uint64),
+            }
+        )
+        self._patch_reads(monkeypatch, df)
+
+        store = MemoryStore()
+        grid.emit_template(store)
+        results: list = []
+        # The empty-chunk anchor would raise ValueError without the n_obs==0 guard.
+        process_shard(
+            grid, shard_key, ["s3://x"], s3_credentials={}, config=cfg, chunk_results=results
+        )
+        assert len(results) == 4
+        for block_index, carrier, _ragged in results:
+            write_dataframe_to_zarr(carrier, store, grid=grid, chunk_idx=block_index)
+        offset = zarr.open_array(store, path="8/offset_h", mode="r")
+        for k, (block_index, _c, _r) in enumerate(results):
+            anchor = float(offset[block_index])
+            if k in populated:
+                assert anchor == 100.0 * (k + 1)
+            else:
+                # Empty chunk -> NaN anchor (the n_obs==0 short-circuit), not a raise.
+                assert np.isnan(anchor)
+
+    def test_chunk_precompute_empty_inner_chunk_arrow_kernel(self, monkeypatch):
+        """Issue #82 phase 6 (review fold): the arrow-kernel path also short-circuits
+        an empty inner chunk to a NaN anchor instead of raising on ``np.min`` of an
+        empty subset. Mirrors the default-path empty-chunk test on
+        ``handoff='arrow-kernel'`` (the once-grouped O(N) per-chunk subset path)."""
+        pa = pytest.importorskip("pyarrow")
+        import zarr
+        from mortie import geo2mort
+        from zarr.storage import MemoryStore
+
+        from zagg.config import default_config
+        from zagg.grids import from_config
+        from zagg.processing import write_dataframe_to_zarr
+
+        cfg = default_config("atl06")
+        cfg.output["grid"] = {
+            "type": "healpix",
+            "parent_order": 6,
+            "chunk_inner": 7,
+            "child_order": 8,
+        }
+        cfg.aggregation["chunk_precompute"] = {
+            "anchor": {"expression": "np.float32(np.min(h_li))", "source": "h_li"}
+        }
+        cfg.aggregation["variables"] = {
+            "h_min": {"function": "min", "source": "h_li", "dtype": "float32"},
+            "offset_h": {"expression": "anchor", "resolution": "chunk", "dtype": "float32"},
+        }
+        grid = from_config(cfg)
+        assert grid.chunks_per_shard == 4
+        shard_key = int(geo2mort(-78.5, -132.0, order=6)[0])
+        chunks = list(grid.iter_chunks(shard_key))
+        populated = {0, 1}
+        leaf, h = [], []
+        for k, (_b, cc) in enumerate(chunks):
+            if k not in populated:
+                continue
+            base = 100.0 * (k + 1)
+            leaf += [int(cc[0]), int(cc[0])]
+            h += [base + 5.0, base]
+        table = pa.table(
+            {
+                "h_li": pa.array(np.array(h, dtype=np.float32)),
+                "s_li": pa.array(np.full(len(h), 0.1, dtype=np.float32)),
+                "leaf_id": pa.array(np.array(leaf, dtype=np.uint64)),
+            }
+        )
+        it = iter([table])
+        monkeypatch.setattr("zagg.processing._read_group", lambda *a, **k: next(it, None))
+        monkeypatch.setattr("zagg.processing.h5coro.H5Coro", lambda *a, **k: object())
+        monkeypatch.setattr("zagg.processing._make_url_rewriter", lambda driver: lambda u: u)
+
+        store = MemoryStore()
+        grid.emit_template(store)
+        results: list = []
+        process_shard(
+            grid,
+            shard_key,
+            ["s3://x"],
+            s3_credentials={},
+            config=cfg,
+            chunk_results=results,
+            handoff="arrow-kernel",
+        )
+        assert len(results) == 4
+        for block_index, carrier, _ragged in results:
+            write_dataframe_to_zarr(carrier, store, grid=grid, chunk_idx=block_index)
+        offset = zarr.open_array(store, path="8/offset_h", mode="r")
+        for k, (block_index, _c, _r) in enumerate(results):
+            anchor = float(offset[block_index])
+            if k in populated:
+                assert anchor == 100.0 * (k + 1)
+            else:
+                assert np.isnan(anchor)
+
 
 class TestChunkCompanionWorkedExample:
     """Issue #82 phase 5: a worked example exercising a chunk_precompute value

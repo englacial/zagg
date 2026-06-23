@@ -32,6 +32,7 @@ from zagg.processing.aggregate import (
     _aggregate_chunk_cells,
     _concat_and_group,
     _eval_chunk_precompute,
+    _group_columns,
     _has_ragged_fields,
     _has_vector_fields,
     _kernel_aggregate,
@@ -267,6 +268,11 @@ def process_shard(
         cell_col = grid.cells_of(table.column("leaf_id").to_numpy(zero_copy_only=False))
         logger.info(f"  Read {n_obs_total:,} observations")
         pooled = {n: table.column(n).to_numpy(zero_copy_only=False) for n in table.column_names}
+        # Group the pooled columns by cell ONCE (issue #82 phase 6), exactly as the
+        # default path's ``cell_to_slice`` does, so the per-chunk precompute subset is
+        # a contiguous gather (O(N) total) rather than a shard-wide ``np.isin`` rescan
+        # on every one of the K iterations (O(K·N)).
+        pooled_sorted, pooled_to_slice = _group_columns(pooled, cell_col)
     else:
         # Concat the per-group reads and split observations by cell (carrier-
         # agnostic; both carriers feed identical numpy arrays into _group_columns).
@@ -293,11 +299,11 @@ def process_shard(
         chunk_children = np.asarray(chunk_children)
         if handoff == "arrow-kernel":
             # Per-chunk precompute (issue #82 phase 6): reduce the anchor over only
-            # this chunk's observations. Subset the pooled columns to the rows whose
-            # destination cell falls in ``chunk_children``; an empty chunk leaves
-            # length-0 arrays, so nan-aware reducers yield NaN anchors (not a raise).
-            chunk_mask = np.isin(cell_col, chunk_children)
-            chunk_pooled = {n: arr[chunk_mask] for n, arr in pooled.items()}
+            # this chunk's observations, gathered from the once-grouped pooled columns
+            # (contiguous slices, not a shard-wide rescan). An empty chunk yields
+            # length-0 columns, which ``_eval_chunk_precompute`` short-circuits to NaN
+            # anchors rather than raising on ``np.min`` of an empty array.
+            chunk_pooled = _pool_chunk_columns(pooled_sorted, pooled_to_slice, chunk_children)
             chunk_scalars = _eval_chunk_precompute(config, chunk_pooled)
             kernel = _kernel_aggregate(
                 table, cell_col, chunk_children, "h_li", config, chunk_scalars=chunk_scalars

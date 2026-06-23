@@ -165,13 +165,21 @@ def _eval_chunk_precompute(config: PipelineConfig, pooled: dict[str, np.ndarray]
     field; that is enforced in :func:`calculate_cell_statistics` (a non-scalar into
     a scalar field raises a clear error), not here.
 
-    It deliberately diverges from the per-cell path in two ways: (1) there is no
-    ``n_obs == 0`` short-circuit (these are shard-level reductions, evaluated once
-    over the pooled columns), and no ``len``/``count`` short-circuit (a
-    ``function: len`` precompute returns the pooled column length, not a cell
-    ``n_obs``); (2) entries are evaluated independently over ``pooled`` only, with
-    no defined order, so one entry cannot reference another's scalar (validation
-    rejects inter-precompute references — see ``_validate_chunk_precompute``).
+    It deliberately diverges from the per-cell path in one way: entries are
+    evaluated independently over ``pooled`` only, with no defined order, so one
+    entry cannot reference another's scalar (validation rejects inter-precompute
+    references — see ``_validate_chunk_precompute``).
+
+    Empty input (``n_obs == 0``) is short-circuited: when ``pooled`` carries no
+    observations — which happens for an empty inner chunk once the reduction moved
+    into the per-chunk loop (issue #82 phase 6), since ``iter_chunks`` yields every
+    chunk including the empty ones — each entry returns a NaN anchor (cast to the
+    entry's ``dtype`` if declared) instead of evaluating its expression/function.
+    Without this guard the canonical gain/offset anchor ``np.float32(np.min(h_li))``
+    would raise ``ValueError: zero-size array to reduction`` on the first empty
+    chunk (``np.min``/``np.nanmin`` over empty both raise). This mirrors the
+    per-cell path's ``n_obs == 0`` short-circuit in
+    :func:`calculate_cell_statistics`.
 
     Returns an empty dict when no ``chunk_precompute`` block is present, so the
     per-cell path is byte-for-byte unchanged for configs that do not use the hook.
@@ -195,6 +203,22 @@ def _eval_chunk_precompute(config: PipelineConfig, pooled: dict[str, np.ndarray]
     entries = get_chunk_precompute(config)
     if not entries:
         return {}
+
+    # Empty-chunk short-circuit (issue #82 phase 6): an empty inner chunk leaves
+    # length-0 pooled columns, and the canonical ``np.min``/``np.nanmin`` anchor
+    # raises ``ValueError`` over a zero-size array. Mirror the per-cell ``n_obs ==
+    # 0`` guard: count a real length-bearing column (skip any 0-d value) and, when
+    # there are no observations, return a NaN anchor (cast to the entry's declared
+    # ``dtype``) for every entry rather than evaluating its expression/function.
+    n_obs = next((len(v) for v in pooled.values() if np.ndim(v) != 0), 0)
+    if n_obs == 0:
+        empty_out: dict[str, Any] = {}
+        for name, meta in entries.items():
+            dtype = meta.get("dtype")
+            empty_out[name] = (
+                np.dtype(dtype).type(np.nan) if dtype is not None else np.float64(np.nan)
+            )
+        return empty_out
 
     out: dict[str, Any] = {}
     for name, meta in entries.items():
@@ -502,9 +526,9 @@ def _pool_chunk_columns(
     Cells of ``chunk_children`` absent from ``cell_to_slice`` are empty and
     contribute no rows. The gather index is built once and reused across every
     column, so the cost is one fancy-index per column over the chunk's rows. An
-    empty chunk (no populated cells) yields length-0 arrays of each column's dtype
-    — :func:`_eval_chunk_precompute` then reduces over empty input, which numpy's
-    nan-aware reducers turn into NaN anchors (not a raise).
+    empty chunk (no populated cells) yields length-0 arrays of each column's dtype;
+    :func:`_eval_chunk_precompute` short-circuits that ``n_obs == 0`` case to NaN
+    anchors (``np.min``/``np.nanmin`` over an empty array would otherwise raise).
 
     Parameters
     ----------
@@ -529,8 +553,9 @@ def _pool_chunk_columns(
         if sl is not None:
             slices.append(sl)
     if not slices:
-        # Empty chunk: length-0 view per column (dtype-preserving) so a per-chunk
-        # reduction over it yields NaN anchors rather than raising.
+        # Empty chunk: length-0 view per column (dtype-preserving). The per-chunk
+        # reduction (``_eval_chunk_precompute``) detects this n_obs==0 case and
+        # returns NaN anchors rather than raising on ``np.min`` of an empty array.
         return {col: arr[:0] for col, arr in col_arrays.items()}
     if len(slices) == 1:
         start, end = slices[0]
