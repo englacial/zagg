@@ -4272,3 +4272,64 @@ class TestProcessShardCacheRelease:
         assert meta["total_obs"] == 2
         assert df_out["count"].to_numpy()[0] == 2
         assert df_out["h_min"].to_numpy()[0] == np.float32(100.0)
+
+    def test_constructor_failure_releases_nothing_and_others_proceed(self, monkeypatch):
+        """If ``H5Coro(...)`` raises for one granule, the loop-top ``h5obj = None``
+        guard means the ``finally`` has nothing to release (no spurious ``close()`` on
+        the failed granule), the granule is skipped (caught by the outer ``except`` →
+        ``continue``), and the remaining granules still process and release normally."""
+        log: list = []
+        calls = {"n": 0}
+
+        def factory(*a, **k):
+            calls["n"] += 1
+            if calls["n"] == 2:  # second granule's constructor blows up
+                raise RuntimeError("h5coro open failed")
+            return _CloseRecordingH5(_canned_arrays(), log)
+
+        self._patch_h5(monkeypatch, factory)
+        df_out, meta = process_shard(
+            _ReleaseGrid(),
+            0,
+            ["s3://a", "s3://b", "s3://c"],
+            s3_credentials={},
+            config=_release_cfg(),
+        )
+        closes = [e for e in log if e[0] == "close"]
+        # Only the two granules whose constructor SUCCEEDED are closed; the failed one
+        # left ``h5obj is None`` so the ``finally`` released nothing for it.
+        assert len(closes) == 2
+        # The two good granules were still read end-to-end.
+        assert meta["files_processed"] == 2
+        assert meta["total_obs"] == 4  # 2 photons × 2 surviving granules
+
+    def test_read_exception_still_releases_in_finally(self, monkeypatch):
+        """The whole point of ``try/finally`` (vs. a post-read ``close()``): if a read
+        raises AFTER the H5Coro is constructed, the ``finally`` still releases that
+        granule's cache exactly once."""
+        log: list = []
+
+        class _RaisingReadH5:
+            """Constructs fine, records ``close()``, but its read raises."""
+
+            def __init__(self, log):
+                self._log = log
+
+            def readDatasets(self, datasets):  # noqa: N802 (mirror real h5coro API)
+                raise RuntimeError("byte-range read failed")
+
+            def close(self):
+                self._log.append(("close", id(self)))
+
+        def factory(*a, **k):
+            return _RaisingReadH5(log)
+
+        self._patch_h5(monkeypatch, factory)
+        df_out, meta = process_shard(
+            _ReleaseGrid(), 0, ["s3://a"], s3_credentials={}, config=_release_cfg()
+        )
+        closes = [e for e in log if e[0] == "close"]
+        # close() fired exactly once despite the read raising — the finally ran.
+        assert len(closes) == 1
+        # No data survived the failed read, so the shard reports the empty path.
+        assert meta["error"] == "No data after filtering"

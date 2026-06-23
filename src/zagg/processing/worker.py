@@ -220,21 +220,11 @@ def process_shard(
             logger.warning(f"  Error processing file {s3_url}: {e}")
             continue
         finally:
-            # Release this granule's h5coro cache before moving on (issue #66).
-            # h5coro caches reads in 4 MB lines with no eviction and leaves a
-            # ThreadPoolExecutor pinning ``self``, so without an explicit release
-            # each granule's ~tens-of-MB HDF5-navigation cache stays resident for
-            # the whole loop (~40 granules × ~67 MB ≈ 2.7 GB → Lambda OOM, even for
-            # trivial data volumes). Nothing retained in ``all_reads`` aliases the
-            # cache lines: ``_read_group`` builds every column by boolean indexing
-            # (a numpy copy) and returns ``pd.DataFrame(data_dict)`` (which copies
-            # its numpy inputs into managed blocks), so freeing the cache here
-            # cannot corrupt already-read data. The pinned h5coro 1.0.4 has
-            # ``close()`` (it does ``cache.clear()`` + ``cache_locks.clear()`` +
-            # ``driver.close()``), so that is the live path; the ``cache.clear()``
-            # branch is a defensive fallback for any build lacking ``close()``. The
-            # ``hasattr`` guard keeps this forward-compatible without bumping the
-            # h5coro pin.
+            # Release this granule's h5coro cache before the next one (issue #66):
+            # without it each granule's unevicted cache stays resident for the whole
+            # loop → Lambda OOM. ``close()`` is the live path; ``cache.clear()`` is a
+            # fallback for builds lacking it. Retained ``all_reads`` data is already
+            # copied off the cache lines (see PR #94), so releasing here is safe.
             if h5obj is not None:
                 try:
                     if hasattr(h5obj, "close"):
@@ -243,7 +233,6 @@ def process_shard(
                         h5obj.cache.clear()
                 except Exception:
                     logger.debug("h5coro cache release failed", exc_info=True)
-            h5obj = None
 
     logger.info(f"  Processed {files_processed}/{len(granule_urls)} files")
     metadata["files_processed"] = files_processed
