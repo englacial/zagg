@@ -30,6 +30,7 @@ def lambda_env(monkeypatch):
     # Stub grid construction (signature must match the catalog).
     grid = MagicMock()
     grid.signature.return_value = {}
+    grid.spatial_signature.return_value = {}
     grid.block_index.side_effect = lambda k: (k,)
     import zagg.grids as grids_mod
 

@@ -285,13 +285,24 @@ def _resolve_urls(records: list, driver: str | None) -> list[str]:
 
 
 def _check_signature(grid, catalog_data: dict) -> None:
-    """Refuse a ShardMap built for a different grid than the run config."""
+    """Refuse a ShardMap built for a different *spatial* grid than the run config.
+
+    A ShardMap is a spatial artifact (shard keys + granule→shard assignment), so
+    the guard compares only the spatial signature (#89) — one map is reusable
+    across configs that share the spatial grid but declare different aggregation
+    fields. The stored ``grid_signature`` is projected onto the spatial keys, so
+    both new spatial-only maps and old full-signature maps (which also carry
+    ``output_fields``) validate.
+    """
     expected = catalog_data.get("grid_signature")
-    actual = grid.signature()
-    if expected is not None and expected != actual:
+    if expected is None:
+        return
+    actual = grid.spatial_signature()
+    stored_spatial = {k: expected.get(k) for k in actual}
+    if stored_spatial != actual:
         raise ValueError(
             "ShardMap was built for a different grid than this run config.\n"
-            f"  shard map : {expected}\n"
+            f"  shard map : {stored_spatial}\n"
             f"  run config: {actual}"
         )
 

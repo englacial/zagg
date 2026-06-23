@@ -9,7 +9,9 @@ The ``ShardMap`` is a small, self-contained JSON plan (option C): each granule
 is recorded with **both** its S3 and HTTPS hrefs so the runner can pick the
 endpoint at dispatch time via ``data_source.driver`` -- the map itself stays
 endpoint-neutral and never needs the Catalog at run time. It also records the
-grid ``signature()`` so a run can refuse a map built for a different grid.
+grid ``spatial_signature()`` (the spatial layout only, no aggregation fields;
+#89) so a run can refuse a map built for a different *spatial* grid while still
+reusing one map across configs that differ only in what they aggregate.
 
 Geometry backends (all sphere-correct):
 
@@ -229,8 +231,12 @@ class ShardMap:
     Parameters
     ----------
     grid_signature : dict
-        ``grid.signature()`` at build time. The runner checks it against the
-        run grid so a map can't be silently paired with a mismatched grid.
+        ``grid.spatial_signature()`` at build time -- the spatial layout only
+        (#89). The runner checks it against the run grid's spatial signature so
+        a map can't be paired with a mismatched *spatial* grid, while staying
+        reusable across configs that differ only in aggregation fields. (Kept as
+        ``grid_signature`` for back-compat; old maps carry the full signature
+        and still validate via a spatial-subset projection.)
     shard_keys : list of int
         Sorted shard keys with at least one granule.
     granules : list of list of dict
@@ -263,7 +269,7 @@ class ShardMap:
             Fetched granule metadata (provides ``granule_records()``).
         grid : OutputGrid
             Output grid (provides ``coverage``, ``shard_footprint``,
-            ``signature``).
+            ``spatial_signature``).
         region : list of (lats, lons), optional
             Coverage mask in WGS84. Defaults to the catalog bbox rectangle.
         backend : {"auto", "spherely", "mortie"}
@@ -310,7 +316,7 @@ class ShardMap:
         }
         if chosen == "mortie":
             meta["mortie_order"] = mortie_order
-        return cls(grid.signature(), shard_keys, granules, meta)
+        return cls(grid.spatial_signature(), shard_keys, granules, meta)
 
     def to_json(self, path: str) -> None:
         """Write the manifest as JSON."""

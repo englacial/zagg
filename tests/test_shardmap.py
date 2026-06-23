@@ -149,8 +149,11 @@ class TestBuildSpherelyBrute:
                 assert set(rec) == {"id", "s3", "https"}
 
     def test_signature_recorded(self, catalog, grid, fake_spherely):
+        # The ShardMap stores the spatial signature only (#89) -- no
+        # output_fields, so the map is reusable across aggregation configs.
         sm = ShardMap.build(catalog, grid, backend="spherely")
-        assert sm.grid_signature == grid.signature()
+        assert sm.grid_signature == grid.spatial_signature()
+        assert "output_fields" not in sm.grid_signature
 
     def test_metadata(self, catalog, grid, fake_spherely):
         sm = ShardMap.build(catalog, grid, backend="spherely")
@@ -261,6 +264,46 @@ class TestIO:
             path = f.name
         with pytest.raises(ValueError, match="missing required key"):
             ShardMap.from_json(path)
+
+    def test_round_trip_preserves_spatial_signature(self, catalog, grid, fake_spherely):
+        # The stored signature is spatial-only and survives JSON round-trip (#89).
+        sm = ShardMap.build(catalog, grid, backend="spherely")
+        with tempfile.NamedTemporaryFile(suffix=".json", delete=False) as f:
+            sm.to_json(f.name)
+            sm2 = ShardMap.from_json(f.name)
+        assert sm2.grid_signature == grid.spatial_signature()
+        assert "output_fields" not in sm2.grid_signature
+
+
+class TestSpatialSignature:
+    """``spatial_signature()`` is the full signature minus ``output_fields`` (#89)."""
+
+    def test_healpix_excludes_output_fields(self):
+        g = HealpixGrid(6, 12, layout="fullsphere")
+        spatial = g.spatial_signature()
+        assert "output_fields" not in spatial
+        assert g.signature() == {**spatial, "output_fields": g.signature()["output_fields"]}
+
+    def test_rectilinear_excludes_output_fields(self, grid):
+        spatial = grid.spatial_signature()
+        assert "output_fields" not in spatial
+        full = grid.signature()
+        assert full == {**spatial, "output_fields": full["output_fields"]}
+
+    def test_healpix_spatial_signature_invariant_to_agg_fields(self):
+        # Same spatial grid, different aggregation configs -> identical spatial sig.
+        a = HealpixGrid(6, 12, layout="fullsphere", config=default_config("atl06"))
+        b = HealpixGrid(6, 12, layout="fullsphere", config=default_config("atl06_polar"))
+        assert a.signature() != b.signature()  # full sigs differ (output_fields)
+        assert a.spatial_signature() == b.spatial_signature()  # spatial sigs match
+
+    def test_rectilinear_spatial_signature_invariant_to_agg_fields(self):
+        bounds = [359400, 4300740, 369400, 4310740]
+        a = RectilinearGrid("EPSG:32618", 10, bounds, [250, 250],
+                            config=default_config("atl06"))
+        b = RectilinearGrid("EPSG:32618", 10, bounds, [250, 250],
+                            config=default_config("atl06_polar"))
+        assert a.spatial_signature() == b.spatial_signature()
 
     def test_high_base_cell_morton_keys_roundtrip(self):
         """Parent-morton shard keys from southern (base 7-11) cells are large
