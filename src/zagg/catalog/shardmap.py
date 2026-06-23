@@ -35,19 +35,9 @@ from typing import Dict, List
 
 import numpy as np
 
-# Resolve the granule-footprint MOC this many HEALPix levels *coarser than* the
-# leaf (``child_order``) -- i.e. subtracting N gives an order N levels above the
-# leaf. A few levels coarser than the leaf keeps footprint edges reasonably tight
-# while staying well above the shard order (``parent_order``) -- so
-# ``moc_to_order`` never upsamples a footprint onto every shard (#92) -- and
-# comfortably under mortie's order-18 coverage cap (child_order 19 -> order 16).
-# Once mortie lifts that cap (espg/mortie#60) this offset can shrink for tighter
-# edges.
-MOC_LEVELS_BELOW_LEAF = 3
-
 # Upper bound on the MOC order mortie's ``morton_coverage`` /
 # ``morton_coverage_moc`` accept; a higher order raises inside mortie. The
-# derived order is clamped to this so a large ``child_order`` can't push the MOC
+# derived order is clamped to this so an exotic ``chunk_order`` can't push the MOC
 # order past the cap and silently lose coverage (#92).
 MORTIE_MOC_ORDER_CAP = 18
 
@@ -85,22 +75,30 @@ def _resolve_mortie_order(mortie_order, grid) -> int:
     fixed default of 8 against ``parent_order=13`` expanded each cell to 1024
     shards, putting ~every granule in ~every shard and OOMing the workers (#92).
 
-    ``None`` (the default) pins the order to ``min(child_order -
-    MOC_LEVELS_BELOW_LEAF, MORTIE_MOC_ORDER_CAP)`` so footprints resolve a few
-    levels above the leaf -- tight enough to track the granule yet never past
-    mortie's order-18 coverage cap (a large ``child_order`` would otherwise push
-    the order past the cap and make mortie raise, silently losing coverage).
-    The clamp is applied first, then the order is still validated against
-    ``parent_order`` -- so if the clamp ever lands at or below ``parent_order``
-    the raise still fires. An explicit ``mortie_order`` is honored but still
-    validated against ``parent_order``. Non-HEALPix grids (no
-    ``parent_order``/``child_order``) keep the legacy default of 8.
+    ``None`` (the default) pins the order to the grid's **inner-chunk order**
+    (``grid.chunk_order``) -- the Zarr-chunk order between the shard order
+    (``parent_order``) and the leaf (``child_order``), set by ``chunk_inner`` and
+    defaulting to ``parent_order`` when unset (so chunk == shard). The shipped
+    ATL03 HEALPix configs use ``chunk_inner=13`` (parent 11, child 19), so the
+    order resolves to 13. Keying the MOC to the chunk order matches the unit work
+    is dispatched at: footprints resolve no finer than the chunk the worker reads,
+    which is enough to keep ``moc_to_order`` from upsampling onto neighbor shards
+    (#92) at near-minimal compute -- a benchmark sweep showed granules/shard is
+    flat for every order >= ``parent_order`` while wall-time grows with order, so
+    a finer MOC buys precision the order-``parent_order`` shard cells can't see.
+    The order is still clamped to ``MORTIE_MOC_ORDER_CAP`` (mortie's order-18
+    coverage cap) before the ``parent_order`` guard, so an exotic ``chunk_order``
+    past the cap can't make mortie raise into the swallowing ``except`` (silent
+    coverage loss). An explicit ``mortie_order`` is honored but still validated
+    against ``parent_order``. Non-HEALPix grids (no ``parent_order`` /
+    ``child_order``) keep the legacy default of 8.
     """
     is_healpix = hasattr(grid, "parent_order") and hasattr(grid, "child_order")
     if mortie_order is not None:
         order = int(mortie_order)
     elif is_healpix:
-        order = min(int(grid.child_order) - MOC_LEVELS_BELOW_LEAF, MORTIE_MOC_ORDER_CAP)
+        chunk_order = getattr(grid, "chunk_order", grid.parent_order)
+        order = min(int(chunk_order), MORTIE_MOC_ORDER_CAP)
     else:
         order = 8
     if is_healpix and order < grid.parent_order:
@@ -327,11 +325,12 @@ class ShardMap:
             mortie for HEALPix grids (non-HEALPix grids require spherely and
             raise an ``ImportError`` with an install pointer when it is absent).
         mortie_order : int, optional
-            MOC order for the mortie backend. ``None`` (default) pins it to
-            ``min(child_order - MOC_LEVELS_BELOW_LEAF, 18)`` -- a few levels above
-            the leaf, never past mortie's order-18 coverage cap -- so footprints
-            resolve tight to the granule; a coarser order upsamples every
-            footprint onto all shards (#92). Raises if the resolved order is
+            MOC order for the mortie backend. ``None`` (default) pins it to the
+            grid's inner-chunk order ``grid.chunk_order`` (the ``chunk_inner``
+            order, defaulting to ``parent_order`` when unset), clamped to mortie's
+            order-18 coverage cap -- the dispatch chunk's own resolution, enough
+            to keep ``moc_to_order`` from upsampling a footprint onto neighbor
+            shards (#92) at near-minimal compute. Raises if the resolved order is
             coarser than ``parent_order``.
 
         Returns

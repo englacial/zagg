@@ -18,7 +18,7 @@ import pytest
 import stac_geoparquet.arrow as sga
 
 from zagg.catalog import shardmap
-from zagg.catalog.shardmap import MOC_LEVELS_BELOW_LEAF, ShardMap, _resolve_backend
+from zagg.catalog.shardmap import ShardMap, _resolve_backend
 from zagg.catalog.sources import Catalog
 from zagg.config import default_config
 from zagg.grids import HealpixGrid, RectilinearGrid
@@ -256,37 +256,43 @@ class TestMortieOrder:
     @pytest.fixture
     def hp_grid(self):
         # parent_order 11 shards (~0.03 deg), child_order 17 leaves over the AOI.
+        # chunk_inner unset -> chunk_order == parent_order == 11.
         return HealpixGrid(11, 17, layout="fullsphere")
 
-    def test_default_offsets_below_child_order(self, catalog, hp_grid):
-        # child_order 17 - MOC_LEVELS_BELOW_LEAF (3) = 14.
+    def test_default_keys_to_chunk_order(self, catalog):
+        # chunk_inner=13 (the shipped ATL03 config) -> MOC order 13, the inner
+        # chunk the worker dispatches at.
+        g = HealpixGrid(11, 19, layout="fullsphere", chunk_inner=13)
+        assert g.chunk_order == 13
+        sm = ShardMap.build(catalog, g, backend="mortie")
+        assert sm.metadata["mortie_order"] == 13
+
+    def test_default_falls_back_to_parent_order(self, catalog, hp_grid):
+        # chunk_inner unset -> chunk_order == parent_order, so the MOC order is the
+        # bare shard order (the "else the shard order" branch of the directive).
+        assert hp_grid.chunk_order == hp_grid.parent_order == 11
         sm = ShardMap.build(catalog, hp_grid, backend="mortie")
-        assert sm.metadata["mortie_order"] == 17 - MOC_LEVELS_BELOW_LEAF == 14
+        assert sm.metadata["mortie_order"] == 11
 
     def test_default_under_mortie_cap_at_leaf_order_19(self, catalog):
-        # child_order 19 (the ~10 m leaf) -> order 16, under mortie's order-18 cap.
-        g = HealpixGrid(13, 19, layout="fullsphere")
+        # The shipped production grid (chunk_inner 13) -> 13, under the order-18 cap.
+        g = HealpixGrid(11, 19, layout="fullsphere", chunk_inner=13)
         sm = ShardMap.build(catalog, g, backend="mortie")
-        assert sm.metadata["mortie_order"] == 16
+        assert sm.metadata["mortie_order"] == 13
 
     def test_coarse_order_rejected(self, catalog, hp_grid):
         # An explicit order coarser than parent_order would fatten -> raise.
         with pytest.raises(ValueError, match="coarser than the grid's parent_order"):
             ShardMap.build(catalog, hp_grid, backend="mortie", mortie_order=8)
 
-    def test_derived_coarse_order_rejected(self, catalog):
-        # The None (derived) path also trips the guard: child_order 14 - 3 = 11
-        # is coarser than parent_order 13 -> raise (#92).
-        g = HealpixGrid(13, 14, layout="fullsphere")
-        with pytest.raises(ValueError, match="coarser than the grid's parent_order"):
-            ShardMap.build(catalog, g, backend="mortie")
-
     def test_derived_order_clamped_to_cap(self):
-        # A child_order whose derived order would exceed mortie's order-18 cap is
-        # clamped to 18, never an illegal order that mortie would reject (#92).
+        # A chunk_order above mortie's order-18 cap is clamped to 18, never an
+        # illegal order that mortie would reject (#92). chunk_inner=19 > cap, with
+        # parent_order 15 so the clamped 18 still clears the parent_order guard.
         from zagg.catalog.shardmap import MORTIE_MOC_ORDER_CAP, _resolve_mortie_order
 
-        g = HealpixGrid(15, 22, layout="fullsphere")  # 22 - 3 = 19 > cap
+        g = HealpixGrid(15, 22, layout="fullsphere", chunk_inner=19)
+        assert g.chunk_order == 19
         assert _resolve_mortie_order(None, g) == MORTIE_MOC_ORDER_CAP == 18
 
     def test_no_fattening_west_east_disjoint(self, hp_grid):
