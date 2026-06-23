@@ -60,6 +60,7 @@ from zagg.processing.read import (
 from zagg.processing.worker import process_morton_cell, process_shard
 from zagg.processing.write import (
     _arrow_column,
+    _block_index_key,
     _build_output,
     _carrier_empty,
     _chunk_resolution_fields,
@@ -112,6 +113,7 @@ __all__ = [
     "_segment_level_variables",
     # write-stage helpers
     "_arrow_column",
+    "_block_index_key",
     "_build_output",
     "_carrier_empty",
     "_chunk_resolution_fields",

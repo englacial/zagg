@@ -128,3 +128,87 @@ class TestProcessEventDispatch:
         resp, captured = self._run(handler_mod, monkeypatch, event)
         assert resp["statusCode"] == 200
         assert captured["shard_key"] == 12345
+
+
+class TestProcessEventWriteLoop:
+    """Issue #82 phase 7: the handler drives ``process_shard`` with a
+    ``chunk_results`` sink and writes each chunk's dense region (at its own
+    block_index) plus its ragged (CSR) companion — the same K>1 write loop the
+    local runner runs. These mock the writers/store to assert the loop's wiring
+    (sink passed, per-chunk block index used, ragged persisted) without a real
+    Zarr store."""
+
+    def _patch(self, handler_mod, monkeypatch, chunks):
+        """Patch process_shard to fill ``chunk_results`` with ``chunks`` and capture
+        every dense/ragged write. Returns the capture dict."""
+        import zagg.grids as grids
+        import zagg.processing as processing
+
+        cap = {"dense": [], "ragged": []}
+
+        def fake_process_shard(grid, shard_key, granule_urls, **kwargs):
+            sink = kwargs["chunk_results"]
+            sink.extend(chunks)
+            meta = {
+                "shard_key": shard_key,
+                "cells_with_data": 1,
+                "total_obs": 1,
+                "duration_s": 0.0,
+                "error": None,
+            }
+            return pd.DataFrame(), meta
+
+        # A store whose template always exists; record nothing on it.
+        store = MagicMock()
+        store.exists.return_value = True
+
+        def fake_write_dense(carrier, st, *, grid, chunk_idx):
+            cap["dense"].append(chunk_idx)
+
+        def fake_write_ragged(ragged, st, *, grid, shard_key):
+            cap["ragged"].append((shard_key, ragged))
+
+        # grid stub: a 1-D companion (single-element block index), exposes
+        # chunk_grid_shape so _block_index_key is exercised on its real path.
+        grid_stub = MagicMock()
+        grid_stub.group_path = "8"
+        grid_stub.chunk_grid_shape = (4,)
+
+        monkeypatch.setattr(processing, "process_shard", fake_process_shard)
+        monkeypatch.setattr(grids, "from_config", lambda *a, **k: grid_stub)
+        monkeypatch.setattr(handler_mod, "open_store", lambda *a, **k: store)
+        monkeypatch.setattr(handler_mod, "write_dataframe_to_zarr", fake_write_dense)
+        monkeypatch.setattr(handler_mod, "write_ragged_to_zarr", fake_write_ragged)
+        return cap
+
+    def test_k_gt_1_writes_each_chunk_region(self, handler_mod, monkeypatch):
+        """K=3: the sink loop writes 3 dense regions at distinct block indices, and
+        each chunk's ragged is keyed by its own _block_index_key (not shard_key)."""
+        chunks = [
+            ((0,), pd.DataFrame(), {}),
+            ((1,), pd.DataFrame(), {"h_tdigest": ([], [])}),
+            ((2,), pd.DataFrame(), {}),
+        ]
+        cap = self._patch(handler_mod, monkeypatch, chunks)
+        event = _base_event(_healpix_config_dict())
+        event["child_order"] = 12
+        resp = handler_mod._handle_process(event, _context())
+        assert resp["statusCode"] == 200
+        # One dense write per chunk, at each chunk's own block_index.
+        assert cap["dense"] == [(0,), (1,), (2,)]
+        # K>1 -> ragged keyed by _block_index_key(block_index) == 0/1/2, NOT shard_key.
+        assert [k for k, _r in cap["ragged"]] == [0, 1, 2]
+
+    def test_k_eq_1_ragged_keyed_by_shard_key(self, handler_mod, monkeypatch):
+        """K=1: the lone chunk's ragged CSR is persisted (the gap this phase closes:
+        the old handler never called write_ragged_to_zarr), keyed by shard_key."""
+        chunks = [((0,), pd.DataFrame(), {"h_tdigest": ([], [])})]
+        cap = self._patch(handler_mod, monkeypatch, chunks)
+        event = _base_event(_healpix_config_dict())
+        event["child_order"] = 12
+        resp = handler_mod._handle_process(event, _context())
+        assert resp["statusCode"] == 200
+        assert cap["dense"] == [(0,)]
+        # Single chunk -> ragged keyed by shard_key (cell-resolution contract).
+        assert len(cap["ragged"]) == 1
+        assert cap["ragged"][0][0] == event["shard_key"]
