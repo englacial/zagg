@@ -1,9 +1,11 @@
 """Offline-computable read plan for AOI-based hyperslice selection (issue #43, Phase C).
 
-``plan_read`` computes which coarse-level segments (e.g. ATL03 ``land_ice_segments``)
-overlap a bounding-box AOI, merges adjacent runs, translates them to base-level
-(photon) slices, and packages them as h5coro-compatible hyperslice lists.
-``execute_read_plan`` then drives a caller-supplied read function with those slices.
+``plan_read`` takes which coarse-level segments (e.g. ATL03 ``land_ice_segments``)
+match the AOI -- preferably a precomputed mortie segment->shard ``coarse_mask``
+(issue #95), or a bbox fallback -- merges adjacent runs, translates them to
+base-level (photon) slices, and packages them as h5coro-compatible hyperslice
+lists. ``execute_read_plan`` then drives a caller-supplied read function with
+those slices.
 
 Both functions are pure and offline-testable — no h5coro, S3, or credentials needed.
 """
@@ -51,17 +53,30 @@ def plan_read(
     index_beg_arr: np.ndarray,
     count_arr: np.ndarray,
     n_base: int,
-    bbox: tuple[float, float, float, float],
+    bbox: tuple[float, float, float, float] | None = None,
     index_base: int = 0,
     pad: int = 1,
     full_read_threshold: float = 0.9,
+    coarse_mask: np.ndarray | None = None,
 ) -> ReadPlan:
-    """Compute a hyperslice-based read plan for an AOI bounding box (issue #43, Phase C).
+    """Compute a hyperslice-based read plan for an AOI (issue #43, Phase C).
 
-    For each coarse-level parent (segment), checks whether:
-    (a) the rep-point ``(lat_arr[j], lon_arr[j])`` falls within ``bbox``, OR
-    (b) the linestring from ``(lat_arr[j], lon_arr[j])`` to the next parent
-        crosses ``bbox`` (euclidean approximation, fine for 20 m segments).
+    Which coarse-level parents (segments) match the AOI is decided one of two
+    ways:
+
+    * ``coarse_mask`` given (preferred) -- a boolean array, one entry per parent,
+      already computed by the caller. The production path passes the **mortie**
+      segment->shard mask (``grid.shards_of(grid.assign(seg_lat, seg_lon)) ==
+      shard_key``), the same exact test the photon path applies later -- so the
+      coarse filter matches the leaf cell, not a loose bbox, and skips the
+      per-segment shapely scan entirely (issue #95). Because the mask is
+      rep-point based, a boundary segment whose photons straddle the shard edge
+      is recovered by ``pad`` (and the exact photon-level filter never
+      *over*-includes), so the only residual is a bounded edge omission.
+    * ``bbox`` given (no ``coarse_mask``) -- the grid-free fallback: a parent
+      matches when its rep-point ``(lat, lon)`` is in ``bbox`` OR the linestring
+      to the next parent crosses ``bbox`` (euclidean, fine for 20 m segments).
+      Kept for offline/grid-free callers and tests.
 
     Adjacent matched parents are merged into contiguous runs, padded by ``pad``
     elements on each side, then translated to base-level ``[start, end)`` slices.
@@ -72,10 +87,10 @@ def plan_read(
 
     Parameters
     ----------
-    lat_arr : np.ndarray
-        Float array, shape ``(n_coarse,)``. Rep-point latitudes of each parent.
-    lon_arr : np.ndarray
-        Float array, shape ``(n_coarse,)``. Rep-point longitudes of each parent.
+    lat_arr, lon_arr : np.ndarray
+        Float arrays, shape ``(n_coarse,)``. Rep-point coords of each parent.
+        Used only by the ``bbox`` fallback; ignored when ``coarse_mask`` is given
+        (then only their length sets ``n_coarse``).
     index_beg_arr : np.ndarray
         Integer array, shape ``(n_coarse,)``. Base-level start for each parent
         (before ``index_base`` adjustment).
@@ -83,55 +98,58 @@ def plan_read(
         Integer array, shape ``(n_coarse,)``. Number of base-level children per parent.
     n_base : int
         Total size of the base array.
-    bbox : (min_lon, min_lat, max_lon, max_lat)
-        Bounding box for the AOI.
+    bbox : (min_lon, min_lat, max_lon, max_lat), optional
+        AOI bounding box for the fallback matcher. Required when ``coarse_mask``
+        is not given.
     index_base : int
         0 (default) or 1 (ATL03 1-based ``ph_index_beg``).
     pad : int
         Number of extra parents to include on each side of each run (clamped
-        to array bounds). Helps capture partial edge segments.
+        to array bounds). Recovers partial edge segments (the omission knob).
     full_read_threshold : float
         Fraction of ``n_base`` above which the plan falls back to a full read.
+    coarse_mask : np.ndarray, optional
+        Boolean per-parent match mask. Takes precedence over ``bbox``.
 
     Returns
     -------
     ReadPlan
     """
-    n_coarse = len(lat_arr)
+    n_coarse = len(index_beg_arr)  # one entry per coarse parent (segment)
     if n_coarse == 0 or n_base == 0:
         return ReadPlan(parent_runs=[], base_slices=[], chunk_lists=[])
 
-    aoi_box = box(bbox[0], bbox[1], bbox[2], bbox[3])
-
     # -- AOI matching --
-    in_aoi = np.zeros(n_coarse, dtype=bool)
-    for j in range(n_coarse):
-        lat, lon = float(lat_arr[j]), float(lon_arr[j])
-        if bbox[0] <= lon <= bbox[2] and bbox[1] <= lat <= bbox[3]:
-            in_aoi[j] = True
-            continue
-        # Last segment: no next-segment linestring to check; rep-point only.
-        if j + 1 < n_coarse:
-            lat2, lon2 = float(lat_arr[j + 1]), float(lon_arr[j + 1])
-            seg_line = LineString([(lon, lat), (lon2, lat2)])
-            if seg_line.intersects(aoi_box):
+    if coarse_mask is not None:
+        in_aoi = np.asarray(coarse_mask, dtype=bool)
+        if in_aoi.shape != (n_coarse,):
+            raise ValueError(f"coarse_mask shape {in_aoi.shape} != ({n_coarse},) parents")
+    elif bbox is not None:
+        # Grid-free fallback: per-segment rep-point / linestring test against bbox.
+        aoi_box = box(bbox[0], bbox[1], bbox[2], bbox[3])
+        in_aoi = np.zeros(n_coarse, dtype=bool)
+        for j in range(n_coarse):
+            lat, lon = float(lat_arr[j]), float(lon_arr[j])
+            if bbox[0] <= lon <= bbox[2] and bbox[1] <= lat <= bbox[3]:
                 in_aoi[j] = True
+                continue
+            # Last segment: no next-segment linestring to check; rep-point only.
+            if j + 1 < n_coarse:
+                lat2, lon2 = float(lat_arr[j + 1]), float(lon_arr[j + 1])
+                seg_line = LineString([(lon, lat), (lon2, lat2)])
+                if seg_line.intersects(aoi_box):
+                    in_aoi[j] = True
+    else:
+        raise ValueError("plan_read requires either coarse_mask or bbox")
 
     if not in_aoi.any():
         return ReadPlan(parent_runs=[], base_slices=[], chunk_lists=[])
 
     # -- Run merging --
-    # Find contiguous blocks of True in in_aoi.
-    raw_runs: list[tuple[int, int]] = []
-    start_run = None
-    for j in range(n_coarse):
-        if in_aoi[j] and start_run is None:
-            start_run = j
-        elif not in_aoi[j] and start_run is not None:
-            raw_runs.append((start_run, j - 1))
-            start_run = None
-    if start_run is not None:
-        raw_runs.append((start_run, n_coarse - 1))
+    # Contiguous blocks of True in in_aoi, found vectorized via the rising/falling
+    # edges of the mask (sentinel-padded so runs touching either end are closed).
+    edges = np.flatnonzero(np.diff(np.concatenate(([False], in_aoi, [False])).astype(np.int8)))
+    raw_runs: list[tuple[int, int]] = list(zip(edges[::2].tolist(), (edges[1::2] - 1).tolist()))
 
     # -- Padding --
     padded_runs: list[tuple[int, int]] = []

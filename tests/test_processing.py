@@ -3147,22 +3147,21 @@ class TestPlannedReadGroup:
     pulls in exactly its two neighbours."""
 
     def test_planned_path_bounds_io_to_matched_segments(self):
-        # Bbox (-0.1, 175, 0.1, 225) directly contains segment 2 (lat=200);
-        # segment 1's (lat 100 -> 200) linestring crosses the lower edge so
-        # plan_read sweeps segment 1 in too. Two adjacent segments -> one
-        # contiguous run -> photons 2..5 in the base array.
+        # Mortie segment->shard mask (issue #95): lat band [100, 250] selects
+        # segments 1 (lat 100) and 2 (lat 200) by rep-point -> one contiguous run
+        # -> photons 2..5; the photon-level mask keeps all four (lat 100..250).
         ds = _planned_read_data_source()
         h5 = _planned_read_h5()
-        grid = _BboxGrid((-0.1, 175.0, 0.1, 225.0))
+        grid = _LatBboxGrid((-0.1, 100.0, 0.1, 250.0))
         df = _read_group(h5, "gt1l", ds, 0, grid)
         assert df["h"].tolist() == [20.0, 30.0, 40.0, 50.0]
 
     def test_empty_aoi_returns_none(self):
-        # Bbox far from any segment rep-point or linestring -> no parents
-        # match -> short-circuit return None before any base-rate read.
+        # No segment rep-point maps to this shard -> empty coarse mask ->
+        # short-circuit return None before any base-rate read.
         ds = _planned_read_data_source()
         h5 = _planned_read_h5()
-        grid = _BboxGrid((10000.0, 10000.0, 10001.0, 10001.0))
+        grid = _LatBboxGrid((-0.1, 10000.0, 0.1, 10001.0))
         assert _read_group(h5, "gt1l", ds, 0, grid) is None
 
     def test_full_read_fallback_on_high_selectivity(self):
@@ -3237,27 +3236,41 @@ class TestPlannedReadGroup:
         assert df_full["h"].tolist() == [0.0, 10.0]
 
     def test_coarse_filter_via_planned_path(self):
-        # Cross-level (Phase B) filter ANDs with the planned path: drop
-        # segment 1 via podppd; segment 2 (also pulled in by the linestring
-        # sweep) survives. Photons 2,3 dropped; 4,5 kept.
+        # Cross-level (Phase B) filter ANDs with the planned path: lat band
+        # [100, 250] selects segments 1,2 (mortie mask); podppd drops segment 1.
+        # Photons 2,3 dropped; 4,5 kept.
         ds = _planned_read_data_source(with_coarse_filter=True)
         podppd = np.array([0, 1, 0, 0, 0, 0], dtype=np.int8)
         h5 = _planned_read_h5(podppd=podppd)
-        grid = _BboxGrid((-0.1, 175.0, 0.1, 225.0))
+        grid = _LatBboxGrid((-0.1, 100.0, 0.1, 250.0))
         df = _read_group(h5, "gt1l", ds, 0, grid)
         assert df["h"].tolist() == [40.0, 50.0]
 
-    def test_pad_extends_selection(self):
-        # bbox (490..510) covers segment 5 (last, lat=500) directly; segment
-        # 4's linestring (400 -> 500) crosses the lower edge. With pad=0:
-        # segments 4,5 -> photons 8..11. With pad=1: segments 3,4,5,6(clamped
-        # back to 5) -> photons 6..11.
-        ds = _planned_read_data_source()
-        ds["read_plan"]["pad"] = 1
+    def test_pad_recovers_boundary_segment_and_matches_full(self):
+        # Omission guard for the rep-point mask (issue #95): lat band [150, 310].
+        # The mortie mask selects segments 2 (lat 200) and 3 (lat 300) by
+        # rep-point, but photon 3 (lat 150) belongs to segment 1, whose rep-point
+        # (100) is OUTSIDE the band. With pad=0 it would be omitted; pad=1 pulls
+        # segment 1 into the run, recovering photon 3 -- so the planned read then
+        # matches the full read exactly (no omission at the tested pad).
         h5 = _planned_read_h5()
-        grid = _BboxGrid((-0.1, 490.0, 0.1, 510.0))
-        df = _read_group(h5, "gt1l", ds, 0, grid)
-        assert df["h"].tolist() == [60.0, 70.0, 80.0, 90.0, 100.0, 110.0]
+        grid = _LatBboxGrid((-0.1, 150.0, 0.1, 310.0))
+
+        ds_pad0 = _planned_read_data_source()  # pad=0 default
+        df_pad0 = _read_group(h5, "gt1l", ds_pad0, 0, grid)
+        assert df_pad0["h"].tolist() == [40.0, 50.0, 60.0]  # photon 3 (h=30) omitted
+
+        ds_pad1 = _planned_read_data_source()
+        ds_pad1["read_plan"]["pad"] = 1
+        df_pad1 = _read_group(h5, "gt1l", ds_pad1, 0, grid)
+        # Ground truth: a full read keeps every photon whose lat is in band.
+        ds_full = {
+            "coordinates": {"latitude": "/heights/lat_ph", "longitude": "/heights/lon_ph"},
+            "variables": {"h": "/heights/h"},
+        }
+        df_full = _read_group(h5, "gt1l", ds_full, 0, grid)
+        assert df_pad1["h"].tolist() == [30.0, 40.0, 50.0, 60.0]
+        assert df_pad1["h"].tolist() == df_full["h"].tolist()
 
     def test_invalid_link_target_raises(self):
         # The spatial_index level's link must point at the base level.
@@ -3270,13 +3283,12 @@ class TestPlannedReadGroup:
 
     def test_multi_slice_plan_global_idx_alignment(self):
         # Force a plan with two disjoint base-slices (one ATL03 track that
-        # crosses the AOI lat band twice). Fixture: 10 segments × 1 photon
-        # each, lats wave from 0 -> 100 -> 0 -> 100 -> 0 so plan_read's
-        # linestring + containment check picks up segments {2,3,4} and
-        # {6,7,8} but not {0,1,5,9}. The plan therefore has two runs and
-        # ``global_idx = [2,3,4,6,7,8]``. A cross-level podppd filter that
-        # drops segment 3 must align correctly through that global_idx
-        # (otherwise photon 3's drop hits the wrong row).
+        # crosses the shard lat band twice). Fixture: 10 segments × 1 photon
+        # each, lats wave from 0 -> 100 -> 0 -> 100 -> 0. The mortie mask (lat
+        # band [45, 105]) picks up segments {2,3,4} and {7,8} -> two runs ->
+        # ``global_idx = [2,3,4,7,8]``. A cross-level podppd filter that drops
+        # segment 3 must align correctly through that global_idx (otherwise
+        # photon 3's drop hits the wrong row).
         seg_lats = np.array([0.0, 0.0, 50.0, 100.0, 100.0, 0.0, 0.0, 100.0, 100.0, 0.0])
         seg_lons = np.zeros(10)
         ibeg = np.arange(10, dtype=np.int64)
@@ -3298,12 +3310,12 @@ class TestPlannedReadGroup:
             }
         )
         ds = _planned_read_data_source(with_coarse_filter=True)
-        grid = _BboxGrid((-0.1, 95.0, 0.1, 105.0))
+        grid = _LatBboxGrid((-0.1, 45.0, 0.1, 105.0))
         df = _read_group(h5, "gt1l", ds, 0, grid)
-        # plan covers segments {2,3,4} and {6,7,8} -> base_slices [(2,5),(6,9)]
-        # -> global_idx [2,3,4,6,7,8] -> base photons h = [20,30,40,60,70,80]
+        # mask selects segments {2,3,4} and {7,8} -> base_slices [(2,5),(7,9)]
+        # -> global_idx [2,3,4,7,8] -> in-band photons h = [20,30,40,70,80];
         # cross-level drops segment 3 -> drop photon 3 (h=30) only.
-        assert df["h"].tolist() == [20.0, 40.0, 60.0, 70.0, 80.0]
+        assert df["h"].tolist() == [20.0, 40.0, 70.0, 80.0]
 
     def test_full_read_fallback_carries_filters(self):
         # The selectivity-fallback path must produce the same row set as the
@@ -3319,16 +3331,17 @@ class TestPlannedReadGroup:
         # Full-coord path keeps all 12 photons (permissive grid); qs drops 5,6.
         assert df["h"].tolist() == [0.0, 10.0, 20.0, 30.0, 40.0, 70.0, 80.0, 90.0, 100.0, 110.0]
 
-    def test_antimeridian_grid_falls_back_to_full_read(self):
-        # A grid whose shard_footprint spans ~360 deg in lon (HEALPix
-        # antimeridian / polar cap) gives plan_read a useless bbox. The
-        # planned path detects this and falls back so the full-read path is
-        # used instead -- otherwise the AOI would intersect every segment.
+    def test_low_selectivity_falls_back_to_full_read(self):
+        # The mortie mask needs no antimeridian/polar special-case (issue #95):
+        # ``grid.assign`` is globally correct, so the old wide-bbox bail is gone.
+        # A shard that genuinely owns (nearly) every segment -- here the
+        # permissive grid maps all of them in -- still falls back to the full
+        # read via the selectivity threshold rather than issuing many slices that
+        # sum to the whole file.
         ds = _planned_read_data_source()
         h5 = _planned_read_h5()
-        grid = _BboxGrid((-180.0, -10.0, 180.0, 10.0))  # 360 deg lon span
+        grid = _BboxGrid((-180.0, -10.0, 180.0, 10.0))  # permissive: all segments in shard
         df = _read_group(h5, "gt1l", ds, 0, grid)
-        # Full-coord path with permissive grid keeps all 12 photons.
         assert df["h"].tolist() == [float(i * 10) for i in range(12)]
 
     def test_dispatch_rejects_empty_levels(self):
@@ -3402,19 +3415,14 @@ class TestPlannedReadGroup:
                 "/gt1l/geolocation/segment_ph_cnt": cnt,
             }
         )
-        # Bbox around segment 2 (lat=200); pad=1 (the shipped default) widens
-        # the matched parent run by one on each side. The permissive grid
-        # accepts every photon read so the planned path's output is the
-        # post-filter photon set.
+        # Permissive grid: every segment maps to the shard, so with pad=1 the
+        # run spans all 4 segments and the planned read falls back to the full
+        # read via the selectivity threshold (still index_base=1 arithmetic).
+        # Plan covers photons 0..7; the 2-D signal_conf_ph filter drops photon 4
+        # (uniform TEP -2 across all 5 surface types). Survivors: 0,1,2,3,5,6,7.
         grid = _BboxGrid((-0.1, 175.0, 0.1, 225.0))
         df = _read_group(h5, "gt1l", ds, 0, grid)
         assert df is not None
-        # Without pad the bbox (lat 175..225) matches seg 2 (lat=200) directly
-        # and seg 1 via the lstr 1->2 sweep (lat 100->200 crosses y=175); seg
-        # 2's own lstr 2->3 (200->300) pulls in seg 2 again. With pad=1 the
-        # run [1, 2] widens to [0, 3]. Plan covers photons 0..7. The 2-D
-        # signal_conf_ph filter drops photon 4 (uniform TEP -2 across all 5
-        # surface types). Survivors: 0, 1, 2, 3, 5, 6, 7.
         assert df["h_ph"].tolist() == [0.0, 10.0, 20.0, 30.0, 50.0, 60.0, 70.0]
 
 
@@ -3535,7 +3543,7 @@ class TestSegmentLevelVariables:
         h5 = _planned_read_h5()
         # 6 segments; dem_h one value per segment.
         h5._arrays["/seg/dem_h"] = np.array([10.0, 20.0, 30.0, 40.0, 50.0, 60.0], dtype=np.float32)
-        grid = _BboxGrid((-0.1, 175.0, 0.1, 225.0))
+        grid = _LatBboxGrid((-0.1, 100.0, 0.1, 250.0))
         df = _read_group(h5, "gt1l", ds, 0, grid)
         # Planned path selects photons 2,3 (seg 1) and 4,5 (seg 2).
         assert df["h"].tolist() == [20.0, 30.0, 40.0, 50.0]
@@ -3552,7 +3560,7 @@ class TestSegmentLevelVariables:
         qs[3] = 1
         h5 = _planned_read_h5(qs=qs)
         h5._arrays["/seg/dem_h"] = np.array([10.0, 20.0, 30.0, 40.0, 50.0, 60.0], dtype=np.float32)
-        grid = _BboxGrid((-0.1, 175.0, 0.1, 225.0))
+        grid = _LatBboxGrid((-0.1, 100.0, 0.1, 250.0))
         df = _read_group(h5, "gt1l", ds, 0, grid)
         # Selected photons 2,3 (seg 1) + 4,5 (seg 2); qs drops photon 3.
         assert df["h"].tolist() == [20.0, 40.0, 50.0]
@@ -3567,7 +3575,7 @@ class TestSegmentLevelVariables:
         ds["filters"] = [{"expression": "dem_h > 25.0"}]
         h5 = _planned_read_h5()
         h5._arrays["/seg/dem_h"] = np.array([10.0, 20.0, 30.0, 40.0, 50.0, 60.0], dtype=np.float32)
-        grid = _BboxGrid((-0.1, 175.0, 0.1, 225.0))
+        grid = _LatBboxGrid((-0.1, 100.0, 0.1, 250.0))
         df = _read_group(h5, "gt1l", ds, 0, grid)
         # Selected photons 2,3 (seg 1, dem_h 20) + 4,5 (seg 2, dem_h 30); the
         # filter drops seg 1 (20 <= 25) and keeps seg 2 (30 > 25).
