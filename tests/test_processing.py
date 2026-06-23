@@ -4052,3 +4052,215 @@ class TestChunkPrecompute:
         assert not np.array_equal(
             df_chunk["offset"].to_numpy(), np.array([1.0, 101.0], dtype=np.float32)
         )
+
+
+# ---------------------------------------------------------------------------
+# Per-granule h5coro cache release in process_shard (issue #66)
+# ---------------------------------------------------------------------------
+
+
+class _ReleaseGrid:
+    """Grid stub for the #66 release tests: leaf id == row index, every row maps
+    to ``shard_key`` 0 (so the flat read keeps all rows), and the post-read
+    methods (``cells_of``/``children``/``chunk_coords``) collapse every row onto a
+    single cell. Drives the real ``_read_group`` → aggregate → ``_build_output``
+    path so the per-granule ``close()`` in the loop actually runs."""
+
+    @staticmethod
+    def assign(lats, lons):
+        return np.arange(len(lats), dtype=np.int64)
+
+    @staticmethod
+    def shards_of(leaf_ids):
+        return np.zeros(len(leaf_ids), dtype=np.int64)
+
+    def children(self, shard_key):
+        return np.array([0], dtype=np.int64)
+
+    def cells_of(self, leaf_ids):
+        return np.zeros(len(leaf_ids), dtype=np.int64)
+
+    def chunk_coords(self, shard_key):
+        return {"cell_lat": np.zeros(1), "cell_lon": np.zeros(1)}
+
+
+def _release_cfg():
+    """Minimal flat config: one group, lat/lon coords + one variable ``h_li``,
+    aggregated to count/min so ``process_shard`` runs end-to-end on canned reads."""
+    from zagg.config import PipelineConfig
+
+    return PipelineConfig(
+        data_source={
+            "groups": ["gt1l"],
+            "coordinates": {"latitude": "/{group}/lat", "longitude": "/{group}/lon"},
+            "variables": {"h_li": "/{group}/h_li"},
+        },
+        aggregation={
+            "variables": {
+                "count": {"function": "len", "dtype": "int32", "fill_value": 0},
+                "h_min": {"function": "min", "source": "h_li", "dtype": "float32"},
+            }
+        },
+    )
+
+
+def _serve_datasets(arrays, datasets):
+    """Shared ``readDatasets`` body: honor the same path/hyperslice contract as
+    :class:`_FakeH5` (mirrors the real h5coro driver)."""
+    out = {}
+    for d in datasets:
+        if isinstance(d, str):
+            out[d] = arrays[d]
+            continue
+        path = d["dataset"]
+        arr = arrays[path]
+        hs = d.get("hyperslice")
+        if hs is not None:
+            lo, hi = hs[0]
+            arr = arr[lo:hi]
+        out[path] = arr
+    return out
+
+
+class _CloseRecordingH5:
+    """h5coro-1.0.5-shaped stub: serves canned arrays and records ``close()`` calls
+    on a shared ``log`` (``("close", id)``), one entry per release."""
+
+    def __init__(self, arrays, log):
+        self._arrays = arrays
+        self._log = log
+
+    def readDatasets(self, datasets):  # noqa: N802 (mirror real h5coro API)
+        return _serve_datasets(self._arrays, datasets)
+
+    def close(self):
+        self._log.append(("close", id(self)))
+
+
+class _RecordingCache(dict):
+    """A cache whose ``clear()`` records the release (so the 1.0.4 fallback —
+    ``h5obj.cache.clear()`` — is observable)."""
+
+    def __init__(self, log):
+        super().__init__()
+        self._log = log
+        self["line0"] = b"x"  # non-empty so clear() actually frees something.
+
+    def clear(self):
+        self._log.append(("clear", id(self)))
+        super().clear()
+
+
+class _ClearOnlyH5:
+    """h5coro-1.0.4-shaped stub: NO ``close()`` (so ``hasattr(h5obj, "close")`` is
+    False), only a ``cache`` whose ``clear()`` records the release."""
+
+    def __init__(self, arrays, log):
+        self._arrays = arrays
+        self.cache = _RecordingCache(log)
+
+    def readDatasets(self, datasets):  # noqa: N802 (mirror real h5coro API)
+        return _serve_datasets(self._arrays, datasets)
+
+
+def _canned_arrays():
+    """Two photons in shard 0; lat/lon keep both rows under ``_ReleaseGrid``."""
+    return {
+        "/gt1l/lat": np.array([10.0, 11.0]),
+        "/gt1l/lon": np.array([20.0, 21.0]),
+        "/gt1l/h_li": np.array([100.0, 200.0], dtype=np.float32),
+    }
+
+
+class TestProcessShardCacheRelease:
+    """Issue #66: ``process_shard`` must release each granule's h5coro cache once
+    per granule (not zero, not once at the end), and the release must not corrupt
+    the data already extracted into ``all_reads`` (copy-before-clear)."""
+
+    def _patch_h5(self, monkeypatch, factory):
+        monkeypatch.setattr("zagg.processing.h5coro.H5Coro", factory)
+        monkeypatch.setattr("zagg.processing._make_url_rewriter", lambda driver: lambda u: u)
+
+    def test_close_called_once_per_granule(self, monkeypatch):
+        """A close-bearing stub (h5coro 1.0.5 shape) is closed exactly once for each
+        of three granules — the per-granule release fires inside the loop."""
+        log: list = []
+
+        def factory(*a, **k):
+            return _CloseRecordingH5(_canned_arrays(), log)
+
+        self._patch_h5(monkeypatch, factory)
+        df_out, meta = process_shard(
+            _ReleaseGrid(),
+            0,
+            ["s3://a", "s3://b", "s3://c"],
+            s3_credentials={},
+            config=_release_cfg(),
+        )
+        closes = [e for e in log if e[0] == "close"]
+        # One release per granule, inside the loop — not zero, not once at the end.
+        assert len(closes) == 3
+        assert meta["files_processed"] == 3
+
+    def test_cache_clear_fallback_on_1_0_4(self, monkeypatch):
+        """When the object has no ``close()`` (h5coro 1.0.4), the loop falls back to
+        ``cache.clear()`` — also once per granule."""
+        log: list = []
+
+        def factory(*a, **k):
+            return _ClearOnlyH5(_canned_arrays(), log)
+
+        self._patch_h5(monkeypatch, factory)
+        process_shard(
+            _ReleaseGrid(), 0, ["s3://a", "s3://b"], s3_credentials={}, config=_release_cfg()
+        )
+        clears = [e for e in log if e[0] == "clear"]
+        assert len(clears) == 2
+
+    def test_retained_data_survives_cache_clear(self, monkeypatch):
+        """Copy-before-clear correctness: the stub backs its returned arrays with
+        memoryviews into a buffer it ZEROES on ``close()``. If anything retained in
+        ``all_reads`` were a view into that buffer (rather than a numpy boolean-mask
+        copy), the aggregation output would be corrupted after the release. Assert
+        the output reflects the ORIGINAL bytes, proving the retained columns are
+        copies."""
+
+        class _ViewBackedH5:
+            """Returns memoryview-backed arrays into a private buffer per dataset;
+            ``close()`` zeroes every buffer (simulating cache-line eviction)."""
+
+            def __init__(self, arrays):
+                # keep a writable bytearray-backed copy per path; hand out views.
+                self._buffers = {k: bytearray(v.tobytes()) for k, v in arrays.items()}
+                self._dtypes = {k: v.dtype for k, v in arrays.items()}
+
+            def readDatasets(self, datasets):  # noqa: N802
+                out = {}
+                for d in datasets:
+                    path = d if isinstance(d, str) else d["dataset"]
+                    buf = self._buffers[path]
+                    arr = np.frombuffer(buf, dtype=self._dtypes[path])  # view into buffer
+                    if not isinstance(d, str) and d.get("hyperslice") is not None:
+                        lo, hi = d["hyperslice"][0]
+                        arr = arr[lo:hi]
+                    out[path] = arr
+                return out
+
+            def close(self):
+                for buf in self._buffers.values():
+                    for i in range(len(buf)):
+                        buf[i] = 0  # corrupt any surviving view
+
+        def factory(*a, **k):
+            return _ViewBackedH5(_canned_arrays())
+
+        self._patch_h5(monkeypatch, factory)
+        df_out, meta = process_shard(
+            _ReleaseGrid(), 0, ["s3://a"], s3_credentials={}, config=_release_cfg()
+        )
+        # The single cell pooled both photons (h_li = 100, 200) BEFORE the buffer
+        # was zeroed; h_min must be the original 100.0, not 0.0 (corrupted) and the
+        # count must be 2. A retained view would read back 0.0 here.
+        assert meta["total_obs"] == 2
+        assert df_out["count"].to_numpy()[0] == 2
+        assert df_out["h_min"].to_numpy()[0] == np.float32(100.0)
