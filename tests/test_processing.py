@@ -595,6 +595,196 @@ class TestRaggedCsrWrite:
         assert out is store
 
 
+class TestRaggedChunkCompanion:
+    """Issue #82 phase 4c: a ``kind: ragged`` + ``resolution: chunk`` field stores
+    ONE variable-length payload per chunk (collapsed from the populated cells under
+    the same chunk-uniform contract as scalar/vector companions), written as a
+    single-entry CSR."""
+
+    @staticmethod
+    def _chunk_ragged_cfg():
+        """A chunk-resolution ragged field anchored on a chunk_precompute value, so
+        every populated cell carries the identical (chunk-uniform) payload."""
+        from zagg.config import PipelineConfig
+
+        return PipelineConfig(
+            data_source={"groups": ["g"]},
+            aggregation={
+                # The chunk anchor is a fixed 3-vector reduced once over the shard.
+                "chunk_precompute": {
+                    "chunk_edges": {
+                        "expression": "np.array([0.0, 5.0, 10.0], dtype=np.float32)",
+                        "source": "h_li",
+                    }
+                },
+                "variables": {
+                    "h_min": {"function": "min", "source": "h_li", "dtype": "float32"},
+                    # bare chunk-anchor name -> every cell gets the same payload.
+                    "h_chunk_edges": {
+                        "expression": "chunk_edges",
+                        "kind": "ragged",
+                        "inner_shape": [1],
+                        "resolution": "chunk",
+                        "dtype": "float32",
+                    },
+                },
+            },
+        )
+
+    def _patch_reads(self, monkeypatch, df):
+        calls = {"n": 0}
+
+        def one_shot(*args, **kwargs):
+            calls["n"] += 1
+            return df if calls["n"] == 1 else None
+
+        monkeypatch.setattr("zagg.processing._read_group", one_shot)
+        monkeypatch.setattr("zagg.processing.h5coro.H5Coro", lambda *a, **k: object())
+        monkeypatch.setattr("zagg.processing._make_url_rewriter", lambda driver: lambda u: u)
+
+    def test_healpix_chunk_ragged_collapses_to_one_payload(self, monkeypatch):
+        """HEALPix: a chunk-resolution ragged field writes ONE chunk payload, even
+        with several populated cells, as a single-entry CSR (cell_ids == [0])."""
+        from mortie import geo2mort
+        from zarr.storage import MemoryStore
+
+        from zagg.csr import iter_csr_cells, read_csr
+
+        cfg = self._chunk_ragged_cfg()
+        grid = HealpixGrid(6, 8, layout="fullsphere", config=cfg)
+        shard_key = int(geo2mort(-78.5, -132.0, order=6)[0])
+        children = grid.children(shard_key)
+        # Three populated cells; the chunk anchor is shared across all of them.
+        c0, c1, c2 = int(children[0]), int(children[2]), int(children[7])
+        df = pd.DataFrame(
+            {
+                "h_li": np.array([1.0, 2.0, 3.0], dtype=np.float32),
+                "leaf_id": np.array([c0, c1, c2], dtype=np.uint64),
+            }
+        )
+        self._patch_reads(monkeypatch, df)
+
+        store = MemoryStore()
+        grid.emit_template(store)
+        ragged: dict = {}
+        process_shard(grid, shard_key, ["s3://x"], s3_credentials={}, config=cfg, ragged_out=ragged)
+        write_ragged_to_zarr(ragged, store, grid=grid, shard_key=shard_key)
+
+        cells = dict(
+            iter_csr_cells(read_csr(store, f"{grid.group_path}/h_chunk_edges/{shard_key}"))
+        )
+        # Exactly one chunk payload, keyed at the lone chunk position 0.
+        assert list(cells) == [0]
+        np.testing.assert_array_equal(cells[0].reshape(-1), [0.0, 5.0, 10.0])
+
+    def test_chunk_ragged_non_uniform_raises(self):
+        """A chunk-resolution ragged field whose populated cells disagree raises —
+        it genuinely varies per cell, so resolution: chunk is a misconfiguration."""
+        from zarr.storage import MemoryStore
+
+        from zagg.config import PipelineConfig
+
+        cfg = PipelineConfig(
+            data_source={"groups": ["g"]},
+            aggregation={
+                "variables": {
+                    "h_raw": {
+                        "function": "np.sort",
+                        "source": "h_li",
+                        "kind": "ragged",
+                        "inner_shape": [1],
+                        "resolution": "chunk",
+                        "dtype": "float32",
+                    }
+                }
+            },
+        )
+        grid = HealpixGrid(6, 8, layout="fullsphere", config=cfg)
+        # Two populated cells carry DIFFERENT sorted payloads -> not chunk-uniform.
+        ragged = {"h_raw": ([np.array([[1.0]]), np.array([[2.0], [3.0]])], [0, 1])}
+        store = MemoryStore()
+        with pytest.raises(ValueError, match="not chunk-uniform"):
+            write_ragged_to_zarr(ragged, store, grid=grid, shard_key=1)
+
+    def test_chunk_ragged_template_has_no_dense_array(self):
+        """The chunk-resolution ragged field gets NO dense companion array in the
+        template (it is CSR), so its name stays a free group prefix."""
+        import zarr
+        from zarr.storage import MemoryStore
+
+        cfg = self._chunk_ragged_cfg()
+        grid = HealpixGrid(6, 8, layout="fullsphere", config=cfg)
+        store = MemoryStore()
+        grid.emit_template(store)
+        product = zarr.open_group(store, path=grid.group_path, mode="r")
+        assert "h_min" in product.array_keys()
+        assert "h_chunk_edges" not in product.array_keys()
+
+    def test_rectilinear_chunk_ragged_roundtrip(self, monkeypatch):
+        """Rectilinear: a chunk-resolution ragged field collapses + round-trips the
+        same as HEALPix (grid-agnostic CSR seam)."""
+        from zarr.storage import MemoryStore
+
+        from zagg.config import PipelineConfig
+        from zagg.csr import iter_csr_cells, read_csr
+        from zagg.grids import from_config
+
+        cfg = PipelineConfig(
+            data_source={"groups": ["g"]},
+            aggregation={
+                "chunk_precompute": {
+                    "chunk_edges": {
+                        "expression": "np.array([1.0, 2.0], dtype=np.float32)",
+                        "source": "h_li",
+                    }
+                },
+                "variables": {
+                    "h_min": {"function": "min", "source": "h_li", "dtype": "float32"},
+                    "h_chunk_edges": {
+                        "expression": "chunk_edges",
+                        "kind": "ragged",
+                        "inner_shape": [1],
+                        "resolution": "chunk",
+                        "dtype": "float32",
+                    },
+                },
+            },
+            output={
+                "grid": {
+                    "type": "rectilinear",
+                    "crs": "EPSG:4326",
+                    "resolution": [1.0, 1.0],
+                    "bounds": [-4.0, -4.0, 4.0, 4.0],
+                    "chunk_shape": [4, 4],
+                }
+            },
+        )
+        grid = from_config(cfg)
+        # Pick a shard and two child cells within it.
+        shard_key = 0
+        children = grid.children(shard_key)
+        c0, c1 = int(children[0]), int(children[3])
+        df = pd.DataFrame(
+            {
+                "h_li": np.array([1.0, 2.0], dtype=np.float32),
+                "leaf_id": np.array([c0, c1], dtype=np.int64),
+            }
+        )
+        self._patch_reads(monkeypatch, df)
+
+        store = MemoryStore()
+        grid.emit_template(store)
+        ragged: dict = {}
+        process_shard(grid, shard_key, ["s3://x"], s3_credentials={}, config=cfg, ragged_out=ragged)
+        write_ragged_to_zarr(ragged, store, grid=grid, shard_key=shard_key)
+
+        cells = dict(
+            iter_csr_cells(read_csr(store, f"{grid.group_path}/h_chunk_edges/{shard_key}"))
+        )
+        assert list(cells) == [0]
+        np.testing.assert_array_equal(cells[0].reshape(-1), [1.0, 2.0])
+
+
 class TestBuildGroups:
     def test_slice_counts_match_per_cell_mask(self):
         """_build_groups produces identical cell populations as the old boolean-mask loop."""

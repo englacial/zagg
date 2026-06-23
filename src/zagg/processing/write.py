@@ -203,10 +203,19 @@ def write_ragged_to_zarr(
         {group_path}/{field}/{shard_key}/offsets
         {group_path}/{field}/{shard_key}/cell_ids
 
-    ``cell_ids[k]`` is each populated cell's position in the chunk's ``children``
-    block (the index collected by ``process_shard``); the per-shard subgroup name
-    is the ``shard_key`` (the coverage cell's morton id for HEALPix), recovered by
-    the reader directly from the store.
+    At **cell resolution** (default) ``cell_ids[k]`` is each populated cell's
+    position in the chunk's ``children`` block (the index collected by
+    ``process_shard``); the per-shard subgroup name is the ``shard_key`` (the
+    coverage cell's morton id for HEALPix), recovered by the reader directly from
+    the store.
+
+    At **chunk resolution** (``resolution: chunk``, issue #82) a ragged field
+    stores ONE variable-length payload per chunk, not per cell. The populated
+    cells are collapsed to that single chunk payload under the same chunk-uniform
+    contract as scalar/vector chunk companions (every populated cell must carry an
+    identical payload, else raise); it is written as a single-entry CSR with
+    ``cell_ids == [0]`` (the lone chunk), so the on-disk layout is the same three
+    arrays — a consumer reads the chunk payload as the only populated "cell".
 
     Parameters
     ----------
@@ -219,7 +228,7 @@ def write_ragged_to_zarr(
         Zarr-compatible store.
     grid : OutputGrid
         Provides ``group_path`` for routing the write (and ``config`` for the
-        per-field dtype).
+        per-field dtype + resolution).
     shard_key : int
         Shard identifier; the CSR subgroup name (one chunk per shard at cell
         resolution).
@@ -232,10 +241,26 @@ def write_ragged_to_zarr(
     if not ragged:
         return store
     agg_fields = get_agg_fields(grid.config) if getattr(grid, "config", None) else {}
+    chunk_res_fields = _chunk_resolution_fields(getattr(grid, "config", None))
     shard_key = int(shard_key)
     for name, (values_list, cell_ids) in ragged.items():
         sig = get_output_signature(agg_fields[name]) if name in agg_fields else {}
         dtype = sig.get("dtype") or "float32"
+        if name in chunk_res_fields:
+            # resolution: chunk — collapse the populated cells to the single chunk
+            # payload (chunk-uniform, like scalar/vector companions) and store it as
+            # a one-entry CSR (the lone chunk at cell_ids == [0]).
+            chunk_payload = _chunk_uniform_ragged(name, values_list)
+            if chunk_payload is None:
+                continue  # whole chunk is fill — nothing to record
+            write_csr(
+                store,
+                f"{grid.group_path}/{name}/{shard_key}",
+                [chunk_payload],
+                [0],
+                dtype=dtype,
+            )
+            continue
         write_csr(
             store,
             f"{grid.group_path}/{name}/{shard_key}",
@@ -244,6 +269,46 @@ def write_ragged_to_zarr(
             dtype=dtype,
         )
     return store
+
+
+def _chunk_uniform_ragged(name: str, values_list: list):
+    """Collapse a ``resolution: chunk`` ragged field's per-cell payloads to one.
+
+    A chunk-resolution ragged field stores ONE variable-length payload per chunk
+    (issue #82), so every *populated* cell's payload must be identical — the same
+    "raise if populated cells disagree" contract the scalar/vector chunk companions
+    enforce (:func:`_chunk_uniform_value`), here over whole variable-length arrays.
+
+    Returns the single chunk payload (a numpy array), or ``None`` when no cell is
+    populated (the whole chunk is fill — nothing to record).
+
+    Raises a clear error if the populated cells carry differing payloads — that
+    means the field genuinely varies per cell and ``resolution: chunk`` is a
+    misconfiguration (the per-cell values would otherwise be silently dropped).
+    """
+    populated = [np.asarray(v) for v in values_list if np.asarray(v).size > 0]
+    if not populated:
+        return None
+    first = populated[0]
+    # NaN-aware compare for floats (a NaN-bearing-but-uniform payload is accepted);
+    # ``equal_nan`` is only valid for float dtypes, so gate on the dtype.
+    use_equal_nan = np.issubdtype(first.dtype, np.floating)
+    for other in populated[1:]:
+        same_shape = other.shape == first.shape
+        equal = same_shape and (
+            np.array_equal(other, first, equal_nan=True)
+            if use_equal_nan
+            else np.array_equal(other, first)
+        )
+        if not equal:
+            n_distinct = len({arr.tobytes() for arr in populated})
+            raise ValueError(
+                f"resolution: chunk ragged field {name!r} is not chunk-uniform: the "
+                f"populated cells carry {n_distinct} distinct payloads; a "
+                f"chunk-resolution field must reduce to one payload per chunk (use "
+                f"resolution: cell for a per-cell ragged field)"
+            )
+    return first
 
 
 def _chunk_resolution_fields(config: PipelineConfig | None) -> set[str]:

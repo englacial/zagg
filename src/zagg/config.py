@@ -465,19 +465,12 @@ def _validate_output_kind(name: str, meta: dict) -> None:
         raise ValueError(
             f"Variable '{name}': resolution '{resolution}' is not supported (allowed: {allowed})"
         )
-    # ``ragged`` at chunk resolution would be CSR at chunk granularity. The
-    # cell-resolution CSR write path is not yet wired into the worker/runner
-    # (``write_csr`` exists and is unit-tested standalone, but ``process_shard``
-    # collects ragged payloads without writing them), so a ragged chunk companion
-    # is deferred rather than accepted-then-silently-misbehaving (issue #82). The
-    # scalar/vector chunk companions above are unaffected.
-    if resolution == "chunk" and kind == "ragged":
-        raise ValueError(
-            f"Variable '{name}': resolution 'chunk' is not yet supported for kind "
-            f"'ragged' (CSR at chunk resolution is deferred; the cell-resolution CSR "
-            f"write path is not yet wired into the worker). Use kind 'scalar' or "
-            f"'vector' for a chunk companion."
-        )
+    # ``ragged`` at chunk resolution (issue #82) is CSR at chunk granularity: one
+    # variable-length payload per chunk instead of per cell. It rides the same CSR
+    # writer as cell-resolution ragged (``write_ragged_to_zarr``), which collapses
+    # the populated cells to the single chunk payload under the same chunk-uniform
+    # contract as scalar/vector chunk companions (raise if populated cells
+    # disagree). No special shape key is needed beyond ``inner_shape``.
 
     # dtype, when declared, must name a real numpy dtype (applies to all kinds).
     if "dtype" in meta:
