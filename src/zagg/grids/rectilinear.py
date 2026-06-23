@@ -90,6 +90,7 @@ class RectilinearGrid:
         bounds,
         chunk_shape=(256, 256),
         config: PipelineConfig | None = None,
+        chunk_inner=None,
     ):
         if len(bounds) != 4:
             raise ValueError("bounds must be (xmin, ymin, xmax, ymax)")
@@ -98,7 +99,25 @@ class RectilinearGrid:
         self.crs = str(crs)
         self.res_x, self.res_y = _normalize_resolution(resolution)
         self.xmin, self.ymin, self.xmax, self.ymax = (float(b) for b in bounds)
+        # The SHARD tile (the dispatch unit): chunk_h/chunk_w. The ZARR chunk is
+        # the (optionally finer) inner chunk (issue #30 item 3). chunk_inner is the
+        # native rectilinear unit — a [h, w] SHAPE. Default chunk_inner == shard tile
+        # (K == 1, shard == chunk), byte-identical to the pre-item-3 grid.
         self.chunk_h, self.chunk_w = (int(c) for c in chunk_shape)
+        self.chunk_inner = chunk_inner
+        if chunk_inner is None:
+            self.inner_h, self.inner_w = self.chunk_h, self.chunk_w
+        else:
+            if len(chunk_inner) != 2:
+                raise ValueError("chunk_inner must be (inner_h, inner_w)")
+            self.inner_h, self.inner_w = (int(c) for c in chunk_inner)
+            # Native-units nesting check: each shard dim divisible by the matching
+            # chunk_inner dim (per-grid validation; rect uses shapes).
+            if self.chunk_h % self.inner_h or self.chunk_w % self.inner_w:
+                raise ValueError(
+                    f"chunk_inner ({self.inner_h}, {self.inner_w}) must evenly divide the "
+                    f"shard tile ({self.chunk_h}, {self.chunk_w})"
+                )
         self.config = config or default_config("atl06")
 
         span_x = self.xmax - self.xmin
@@ -121,6 +140,12 @@ class RectilinearGrid:
         self.ymin = self.ymax - self.height * self.res_y
         self.n_row_blocks = self.height // self.chunk_h
         self.n_col_blocks = self.width // self.chunk_w
+        # The (optionally finer) ZARR-chunk grid. Equals the shard grid when
+        # chunk_inner is unset (K == 1). The far edges are already padded to a whole
+        # number of shard tiles, and inner divides the shard tile, so they divide the
+        # padded extent too.
+        self.n_inner_row_blocks = self.height // self.inner_h
+        self.n_inner_col_blocks = self.width // self.inner_w
 
         # GeoBox: north-up affine with origin at (xmin, ymax); y resolution
         # negative. GeoboxTiles tiles it into one tile per chunk.
@@ -137,7 +162,13 @@ class RectilinearGrid:
 
     @property
     def chunk_shape(self) -> tuple[int, int]:
-        return (self.chunk_h, self.chunk_w)
+        """ZARR chunk shape — the inner chunk ``(inner_h, inner_w)``.
+
+        Equals the shard tile ``(chunk_h, chunk_w)`` unless ``chunk_inner`` set a
+        finer chunk (issue #30 item 3). This is the per-chunk cell extent the
+        worker/writer size a chunk region against.
+        """
+        return (self.inner_h, self.inner_w)
 
     @property
     def chunk_grid_shape(self) -> tuple[int, int]:
@@ -145,9 +176,41 @@ class RectilinearGrid:
 
         A ``resolution: chunk`` field (issue #30 item 2) stores one value per
         chunk in a companion array of this shape, indexed by :meth:`block_index`
-        (the ``(rb, cb)`` chunk index). Equals ``(n_row_blocks, n_col_blocks)``.
+        (the ``(rb, cb)`` chunk index). Equals ``(n_inner_row_blocks,
+        n_inner_col_blocks)`` (== the shard grid when ``chunk_inner`` is unset).
         """
-        return (self.n_row_blocks, self.n_col_blocks)
+        return (self.n_inner_row_blocks, self.n_inner_col_blocks)
+
+    def iter_chunks(self, shard_key):
+        """Yield ``(chunk_block_index, chunk_children)`` for each chunk in a shard.
+
+        Item 3 (issue #30): one shard tile owns ``K`` finer ZARR chunks (the
+        ``inner_h × inner_w`` sub-tiles of the ``chunk_h × chunk_w`` shard). Each
+        yielded ``chunk_block_index`` is the ``(rb, cb)`` of that inner chunk in the
+        inner chunk grid; ``chunk_children`` are its cell ids in row-major order.
+
+        When ``chunk_inner`` is unset (``K == 1``) this yields exactly one entry —
+        ``(block_index(shard_key), children(shard_key))`` — byte-identical to the
+        single-chunk path.
+        """
+        if self.inner_h == self.chunk_h and self.inner_w == self.chunk_w:
+            yield (self.block_index(shard_key), self.children(shard_key))
+            return
+        rb, cb = self._unpack(int(shard_key))
+        # Top-left cell of the shard tile, and how many inner chunks fit per axis.
+        shard_r0 = rb * self.chunk_h
+        shard_c0 = cb * self.chunk_w
+        n_ir = self.chunk_h // self.inner_h
+        n_ic = self.chunk_w // self.inner_w
+        for ir in range(n_ir):
+            for ic in range(n_ic):
+                r0 = shard_r0 + ir * self.inner_h
+                c0 = shard_c0 + ic * self.inner_w
+                rows = np.arange(self.inner_h)[:, None] + r0
+                cols = np.arange(self.inner_w)[None, :] + c0
+                children = (rows * self.width + cols).reshape(-1).astype(np.int64)
+                block = (r0 // self.inner_h, c0 // self.inner_w)
+                yield (block, children)
 
     @property
     def group_path(self) -> str:

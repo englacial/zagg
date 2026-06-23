@@ -545,3 +545,159 @@ class TestMortonCoordinate:
         assert stored.view(np.int64).min() < 0
         # Reconstructs to the same MortonIndexArray on read.
         np.testing.assert_array_equal(morton_words(to_morton_array(stored)), expected)
+
+
+class TestChunkInnerMultiChunk:
+    """Issue #30 item 3: an optional finer ``chunk_inner`` level between shard and
+    cell, native units per grid (HEALPix order, rectilinear shape). One shard owns
+    K chunks; ``iter_chunks`` enumerates them. Default (unset) == today (K == 1)."""
+
+    def test_healpix_default_is_single_chunk_byte_identical(self):
+        # Unset chunk_inner: chunk_order == parent_order, K == 1, and the template
+        # member specs equal a grid built without the kwarg.
+        cfg = default_config("atl06")
+        g0 = HealpixGrid(parent_order=6, child_order=8, layout="fullsphere", config=cfg)
+        g1 = HealpixGrid(
+            parent_order=6, child_order=8, layout="fullsphere", config=cfg, chunk_inner=None
+        )
+        assert g0.chunk_order == g1.chunk_order == 6
+        assert g1.chunks_per_shard == 1
+        assert g1.chunk_shape == g0.chunk_shape == (4 ** (8 - 6),)
+        assert g0.spec().model_dump() == g1.spec().model_dump()
+
+    def test_healpix_iter_chunks_k1_matches_block_index_children(self):
+        from mortie import geo2mort
+
+        cfg = default_config("atl06")
+        g = HealpixGrid(parent_order=4, child_order=8, layout="fullsphere", config=cfg)
+        parent = int(geo2mort(-78.5, -132.0, order=4)[0])
+        chunks = list(g.iter_chunks(parent))
+        assert len(chunks) == 1
+        (block, children) = chunks[0]
+        assert block == g.block_index(parent)
+        np.testing.assert_array_equal(children, g.children(parent))
+
+    def test_healpix_chunk_inner_partitions_shard(self):
+        from mortie import geo2mort
+
+        cfg = default_config("atl06")
+        # parent 4, chunk_inner order 6 -> K = 4^(6-4) = 16 chunks per shard, each
+        # holding 4^(8-6) = 16 cells.
+        g = HealpixGrid(
+            parent_order=4, child_order=8, layout="fullsphere", config=cfg, chunk_inner=6
+        )
+        assert g.chunks_per_shard == 16
+        assert g.cells_per_chunk == 16
+        assert g.chunk_shape == (16,)
+        # companion chunk grid is the finer 12·4^6, not 12·4^4.
+        assert g.chunk_grid_shape == (HEALPIX_BASE_CELLS * 4**6,)
+
+        parent = int(geo2mort(-78.5, -132.0, order=4)[0])
+        chunks = list(g.iter_chunks(parent))
+        assert len(chunks) == 16
+        # Each chunk has cells_per_chunk children; the union equals the shard's cells.
+        all_children = np.concatenate([c for _, c in chunks])
+        assert len(all_children) == 16 * 16
+        np.testing.assert_array_equal(np.sort(all_children), np.sort(g.children(parent)))
+        # Block indices are distinct and in-bounds of the finer chunk grid.
+        blocks = [b[0] for b, _ in chunks]
+        assert len(set(blocks)) == 16
+        assert all(0 <= b < g.chunk_grid_shape[0] for b in blocks)
+
+    def test_healpix_chunk_inner_bounds_validated(self):
+        cfg = default_config("atl06")
+        with pytest.raises(ValueError, match="chunk_inner"):
+            HealpixGrid(4, 8, layout="fullsphere", config=cfg, chunk_inner=3)  # < parent
+        with pytest.raises(ValueError, match="chunk_inner"):
+            HealpixGrid(4, 8, layout="fullsphere", config=cfg, chunk_inner=9)  # > child
+
+    def test_healpix_chunk_inner_rejected_for_dense(self):
+        cfg = default_config("atl06")
+        with pytest.raises(ValueError, match="fullsphere"):
+            HealpixGrid(4, 8, layout="dense", config=cfg, chunk_inner=6, populated_shards=[0])
+
+    def test_healpix_chunk_inner_not_in_signature(self):
+        # The shard-map fingerprint must be unchanged by chunk_inner (byte-identical
+        # guarantee): a K=16 grid signs identically to a K=1 grid.
+        cfg = default_config("atl06")
+        g0 = HealpixGrid(4, 8, layout="fullsphere", config=cfg)
+        g1 = HealpixGrid(4, 8, layout="fullsphere", config=cfg, chunk_inner=6)
+        assert g0.signature() == g1.signature()
+
+    def test_rectilinear_default_is_single_chunk_byte_identical(self):
+        from zagg.grids import RectilinearGrid
+
+        cfg = default_config("atl06")
+        bounds = (-1e6, -1e6, 1e6, 1e6)
+        g0 = RectilinearGrid("EPSG:3031", 1000.0, bounds, chunk_shape=(64, 64), config=cfg)
+        g1 = RectilinearGrid(
+            "EPSG:3031", 1000.0, bounds, chunk_shape=(64, 64), config=cfg, chunk_inner=None
+        )
+        assert g1.chunk_shape == g0.chunk_shape == (64, 64)
+        assert g0._spec().model_dump() == g1._spec().model_dump()
+
+    def test_rectilinear_iter_chunks_k1_matches(self):
+        from zagg.grids import RectilinearGrid
+
+        cfg = default_config("atl06")
+        g = RectilinearGrid(
+            "EPSG:3031", 100000.0, (-4e5, -4e5, 4e5, 4e5), chunk_shape=(4, 4), config=cfg
+        )
+        shard = g._pack(1, 1)
+        chunks = list(g.iter_chunks(shard))
+        assert len(chunks) == 1
+        (block, children) = chunks[0]
+        assert block == g.block_index(shard)
+        np.testing.assert_array_equal(children, g.children(shard))
+
+    def test_rectilinear_chunk_inner_partitions_shard(self):
+        from zagg.grids import RectilinearGrid
+
+        cfg = default_config("atl06")
+        # shard tile 8x8, inner 4x4 -> K = 4 chunks per shard, each 16 cells.
+        g = RectilinearGrid(
+            "EPSG:3031",
+            100000.0,
+            (-4e5, -4e5, 4e5, 4e5),
+            chunk_shape=(8, 8),
+            config=cfg,
+            chunk_inner=(4, 4),
+        )
+        assert g.chunk_shape == (4, 4)
+        assert g.chunk_grid_shape == (g.n_inner_row_blocks, g.n_inner_col_blocks)
+        assert g.chunk_grid_shape == (g.height // 4, g.width // 4)
+
+        shard = g._pack(0, 0)
+        chunks = list(g.iter_chunks(shard))
+        assert len(chunks) == 4
+        all_children = np.concatenate([c for _, c in chunks])
+        np.testing.assert_array_equal(np.sort(all_children), np.sort(g.children(shard)))
+        blocks = [b for b, _ in chunks]
+        assert len(set(blocks)) == 4
+        # block (0,0) shard -> inner chunks (0,0),(0,1),(1,0),(1,1).
+        assert set(blocks) == {(0, 0), (0, 1), (1, 0), (1, 1)}
+
+    def test_rectilinear_chunk_inner_must_divide_shard(self):
+        from zagg.grids import RectilinearGrid
+
+        cfg = default_config("atl06")
+        with pytest.raises(ValueError, match="evenly divide"):
+            RectilinearGrid(
+                "EPSG:3031",
+                100000.0,
+                (-4e5, -4e5, 4e5, 4e5),
+                chunk_shape=(8, 8),
+                config=cfg,
+                chunk_inner=(3, 4),
+            )
+
+    def test_rectilinear_chunk_inner_not_in_signature(self):
+        from zagg.grids import RectilinearGrid
+
+        cfg = default_config("atl06")
+        bounds = (-4e5, -4e5, 4e5, 4e5)
+        g0 = RectilinearGrid("EPSG:3031", 100000.0, bounds, chunk_shape=(8, 8), config=cfg)
+        g1 = RectilinearGrid(
+            "EPSG:3031", 100000.0, bounds, chunk_shape=(8, 8), config=cfg, chunk_inner=(4, 4)
+        )
+        assert g0.signature() == g1.signature()
