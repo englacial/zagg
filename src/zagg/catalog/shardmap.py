@@ -67,6 +67,28 @@ def _to_spherely_polygon(lats, lons):
         return None
 
 
+def _granule_footprints(rec, footprint, product):
+    """Return ``[(lats, lons), ...]`` rings for one granule under ``footprint``.
+
+    ``"swath"`` yields the single CMR footprint ring (current behavior).
+    ``"beams"`` yields one thin corridor ring per beam pair via
+    :func:`zagg.catalog.beams.beam_tracks_from_cmr_polygon` (issue #65). Both
+    backends consume the rings identically -- spherely as polygons, mortie as
+    ``morton_coverage`` point sequences -- so the per-beam path needs no
+    backend-specific geometry.
+
+    .. deprecated::
+        The ``"beams"`` corridor path is a stopgap (see ``beams.py``); remove it
+        once native per-beam CMR geometry, the memory-handling robustness in #66,
+        or data virtualization (#97) lands.
+    """
+    if footprint == "beams":
+        from zagg.catalog.beams import beam_tracks_from_cmr_polygon
+
+        return beam_tracks_from_cmr_polygon(rec["lats"], rec["lons"], product=product)
+    return [(rec["lats"], rec["lons"])]
+
+
 def _resolve_mortie_order(mortie_order, grid) -> int:
     """Choose the MOC order for the mortie backend.
 
@@ -171,7 +193,9 @@ _SPHERELY_INSTALL_HINT = (
 )
 
 
-def _intersect_spherely(records, grid, all_shards) -> Dict[int, List[int]]:
+def _intersect_spherely(
+    records, grid, all_shards, footprint="swath", product="ATL03"
+) -> Dict[int, List[int]]:
     """Exact S2 intersection via spherely.
 
     Builds sphere-aware polygons for each granule footprint, then maps each
@@ -179,6 +203,10 @@ def _intersect_spherely(records, grid, all_shards) -> Dict[int, List[int]]:
     once, query per shard) when present; otherwise falls back to elementwise
     ``spherely.intersects`` -- still sphere-correct, but a brute
     O(granules x shards) scan with no tree prefilter (#36).
+
+    ``footprint="beams"`` decomposes each granule into per-beam-pair corridor
+    rings (issue #65); a granule is assigned to a shard if any of its rings
+    intersect it (deduped, order preserved).
     """
     try:
         import spherely
@@ -187,10 +215,11 @@ def _intersect_spherely(records, grid, all_shards) -> Dict[int, List[int]]:
 
     polys, idx = [], []
     for i, rec in enumerate(records):
-        poly = _to_spherely_polygon(rec["lats"], rec["lons"])
-        if poly is not None:
-            polys.append(poly)
-            idx.append(i)
+        for rlats, rlons in _granule_footprints(rec, footprint, product):
+            poly = _to_spherely_polygon(rlats, rlons)
+            if poly is not None:
+                polys.append(poly)
+                idx.append(i)
     if not polys:
         return {}
     poly_arr = np.asarray(polys)
@@ -209,12 +238,21 @@ def _intersect_spherely(records, grid, all_shards) -> Dict[int, List[int]]:
         else:
             hits = np.flatnonzero(spherely.intersects(poly_arr, s_poly))
         if len(hits) > 0:
-            out[int(shard)] = [idx[int(h)] for h in hits]
+            # dict.fromkeys dedups multiple beam-ring hits per granule while
+            # preserving order (a no-op for single-ring swath mode).
+            out[int(shard)] = list(dict.fromkeys(idx[int(h)] for h in hits))
     return out
 
 
-def _intersect_mortie(records, grid, all_shards, order=8) -> Dict[int, List[int]]:
-    """HEALPix MOC intersection via mortie ``morton_coverage_moc``."""
+def _intersect_mortie(
+    records, grid, all_shards, order=8, footprint="swath", product="ATL03"
+) -> Dict[int, List[int]]:
+    """HEALPix MOC intersection via mortie ``morton_coverage_moc``.
+
+    ``footprint="beams"`` decomposes each granule into per-beam-pair corridor
+    rings (issue #65); a granule maps to a shard if any of its rings cover it
+    (deduped). Consumes the same ``(lats, lons)`` rings as the spherely path.
+    """
     from mortie import moc_to_order, morton_coverage, morton_coverage_moc
 
     is_healpix = hasattr(grid, "parent_order") and hasattr(grid, "child_order")
@@ -223,33 +261,36 @@ def _intersect_mortie(records, grid, all_shards, order=8) -> Dict[int, List[int]
     if is_healpix:
         parent_order = grid.parent_order
         for i, rec in enumerate(records):
-            try:
-                moc = np.asarray(morton_coverage_moc(rec["lats"], rec["lons"], order=order))
-            except Exception:
-                continue
-            if moc.size == 0:
-                continue
-            try:
-                shards = np.unique(moc_to_order(moc, parent_order))
-            except Exception:
-                continue
-            for s in shards.tolist():
-                s = int(s)
-                if s in all_shards:
-                    out.setdefault(s, []).append(i)
-        return out
+            for rlats, rlons in _granule_footprints(rec, footprint, product):
+                try:
+                    moc = np.asarray(morton_coverage_moc(rlats, rlons, order=order))
+                except Exception:
+                    continue
+                if moc.size == 0:
+                    continue
+                try:
+                    shards = np.unique(moc_to_order(moc, parent_order))
+                except Exception:
+                    continue
+                for s in shards.tolist():
+                    s = int(s)
+                    if s in all_shards:
+                        out.setdefault(s, []).append(i)
+        # Dedup a granule reached via multiple beam rings (no-op for swath).
+        return {k: list(dict.fromkeys(v)) for k, v in out.items()}
 
     # Non-HEALPix: flat order-`order` granule cell index + per-shard lookup.
     cell_arrays, rec_idx = [], []
     for i, rec in enumerate(records):
-        try:
-            cells = morton_coverage(rec["lats"], rec["lons"], order=order)
-        except Exception:
-            continue
-        if len(cells) == 0:
-            continue
-        cell_arrays.append(np.asarray(cells, dtype=np.int64))
-        rec_idx.append(i)
+        for rlats, rlons in _granule_footprints(rec, footprint, product):
+            try:
+                cells = morton_coverage(rlats, rlons, order=order)
+            except Exception:
+                continue
+            if len(cells) == 0:
+                continue
+            cell_arrays.append(np.asarray(cells, dtype=np.int64))
+            rec_idx.append(i)
     if not cell_arrays:
         return {}
     all_cells = np.concatenate(cell_arrays)
@@ -321,6 +362,7 @@ class ShardMap:
         region=None,
         backend: str = "auto",
         mortie_order: int | None = None,
+        footprint: str = "swath",
     ) -> "ShardMap":
         """Build a ShardMap from a ``Catalog`` and an output grid.
 
@@ -345,12 +387,45 @@ class ShardMap:
             to keep ``moc_to_order`` from upsampling a footprint onto neighbor
             shards (#92) at near-minimal compute. Raises if the resolved order is
             coarser than ``parent_order``.
+        footprint : {"swath", "beams"}
+            Granule footprint used for intersection. ``"swath"`` (default) uses
+            the raw CMR polygon. ``"beams"`` decomposes ICESat-2 ATL03/06 swaths
+            into per-beam-pair corridors so granules stop being assigned to
+            shards their beams never cross (issue #65); non-beam products fall
+            back to the swath ring.
+
+            .. deprecated::
+                The ``"beams"`` corridor mechanism is a stopgap (see
+                ``beams.py``); remove it once native per-beam CMR geometry, the
+                memory-handling robustness in #66, or data virtualization (#97)
+                lands.
 
         Returns
         -------
         ShardMap
         """
+        if footprint not in ("swath", "beams"):
+            raise ValueError(f"footprint must be 'swath' or 'beams' (got {footprint!r})")
         records = catalog.granule_records()
+        # Product short-name drives beam decomposition (collection like "ATL03_007").
+        product = ((catalog.metadata or {}).get("collection") or "").split("_")[0].upper()
+        if footprint == "beams":
+            from zagg.catalog.beams import is_beam_product
+
+            if not is_beam_product(product):
+                # ``beams`` is opt-in; silently degrading to swath here would
+                # leave the metadata recording ``footprint="beams"`` while the
+                # tightening did nothing. Make the mismatch loud.
+                collection = (catalog.metadata or {}).get("collection")
+                if collection is None:
+                    detail = (
+                        "catalog has no 'collection' metadata so the product can't be identified"
+                    )
+                else:
+                    detail = f"catalog collection {collection!r} resolves to product {product!r}"
+                raise ValueError(
+                    f"footprint='beams' requires an ICESat-2 beam product (ATL03/ATL06); {detail}"
+                )
         parts = _region_parts(region, catalog.metadata)
         all_shards = set(int(s) for s in grid.coverage(parts))
 
@@ -361,9 +436,22 @@ class ShardMap:
         t0 = time.perf_counter()
         if chosen == "mortie":
             mortie_order = _resolve_mortie_order(mortie_order, grid)
-            shard_to_idx = _intersect_mortie(records, grid, all_shards, order=mortie_order)
+            shard_to_idx = _intersect_mortie(
+                records,
+                grid,
+                all_shards,
+                order=mortie_order,
+                footprint=footprint,
+                product=product,
+            )
         else:
-            shard_to_idx = _BACKENDS[chosen](records, grid, all_shards)
+            shard_to_idx = _BACKENDS[chosen](
+                records,
+                grid,
+                all_shards,
+                footprint=footprint,
+                product=product,
+            )
         wall = time.perf_counter() - t0
 
         shard_keys = sorted(shard_to_idx)
@@ -377,6 +465,7 @@ class ShardMap:
         meta = {
             **(catalog.metadata or {}),
             "backend": chosen,
+            "footprint": footprint,
             "total_granules": len(records),
             "total_shards": len(shard_keys),
             "total_pairs": sum(len(g) for g in granules),
