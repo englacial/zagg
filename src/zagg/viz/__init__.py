@@ -2,22 +2,23 @@
 
 Two layers:
 
-- :mod:`zagg.viz.shardmap` -- the **headless render core** (phase 1). Pure
-  Python, no browser or ipyleaflet import: it turns a :class:`ShardMap` (and an
-  optional :class:`~zagg.catalog.sources.Catalog`) into GeoJSON
-  ``FeatureCollection`` dicts -- shard/chunk outlines, granule footprints, and
-  viewport-clipped cell outlines at the shard order. Fully unit-testable with
+- :mod:`zagg.viz.shardmap` -- the **headless render core**. Pure Python, no
+  browser or ipyleaflet import: it turns a :class:`ShardMap` (and an optional
+  :class:`~zagg.catalog.sources.Catalog`) into GeoJSON ``FeatureCollection``
+  dicts -- shard/chunk outlines and granule footprints. Fully unit-testable with
   no widget stack installed.
-- :func:`show_shardmap` -- the **ipyleaflet wrapper** (phase 2). Builds an
-  interactive map from a saved ShardMap (basemap + shard layer + a toggleable
-  footprint layer + a zoom-thresholded grid layer). ``ipyleaflet`` is imported
-  lazily inside the widget functions so phase-1 core and the test suite never
-  require it; it lives in the optional ``viz`` extra (``pip install zagg[viz]``).
+- :func:`show_shardmap` -- the **ipyleaflet wrapper**. Builds an interactive map
+  from a saved ShardMap (context basemap with auto polar-projection switching +
+  shard layer + a toggleable granule-footprint layer). ``ipyleaflet`` is
+  imported lazily inside the widget functions so the render core and the test
+  suite never require it; it lives in the optional ``viz`` extra
+  (``pip install zagg[viz]``).
 
 Both inputs are reused directly off the existing surface -- ``ShardMap`` /
 ``Catalog`` round-trips and per-grid ``shard_footprint`` / ``signature`` -- so
 there is no viewer-specific file type or second tessellation (issue #38).
 """
+
 from __future__ import annotations
 
 from zagg.viz.shardmap import (
@@ -25,12 +26,11 @@ from zagg.viz.shardmap import (
     grid_from_signature,
     render_shardmap,
     shard_outlines,
-    viewport_cells,
 )
 
 
 def show_shardmap(shardmap_path, catalog=None, **kwargs):
-    """Build an interactive ipyleaflet map for a saved ShardMap (phase 2).
+    """Build an interactive ipyleaflet map for a saved ShardMap.
 
     Thin lazy passthrough to :func:`zagg.viz.leaflet.show_shardmap` so importing
     :mod:`zagg.viz` never pulls in ``ipyleaflet`` -- only calling this does.
@@ -59,7 +59,6 @@ __all__ = [
     "render_shardmap",
     "shard_outlines",
     "granule_footprints",
-    "viewport_cells",
     "grid_from_signature",
     "show_shardmap",
 ]
