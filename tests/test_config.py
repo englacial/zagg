@@ -810,6 +810,32 @@ class TestSegmentLevelVariables:
             )
         )
 
+    def test_segment_variable_usable_in_expression_filter(self):
+        # A broadcast segment variable is a valid name in an ``expression`` filter,
+        # consistent with agg/precompute expressions (issue #30).
+        ds = _minimal_two_level_ds()
+        ds["levels"]["segments"]["variables"] = {"dem_h": "/{group}/geophys_corr/dem_h"}
+        ds["filters"] = [{"expression": "dem_h > 100.0"}]
+        cfg = PipelineConfig(
+            data_source=ds,
+            aggregation={"variables": {"c": {"function": "len", "dtype": "int32"}}},
+            output={"grid": {"type": "healpix", "parent_order": 6, "child_order": 12}},
+        )
+        validate_config(cfg)
+
+    def test_unknown_name_in_expression_filter_rejected(self):
+        # A truly-undefined name in an expression filter is rejected at validate
+        # time, like agg/precompute expressions.
+        ds = _minimal_two_level_ds()
+        ds["filters"] = [{"expression": "nope_col > 0"}]
+        cfg = PipelineConfig(
+            data_source=ds,
+            aggregation={"variables": {"c": {"function": "len", "dtype": "int32"}}},
+            output={"grid": {"type": "healpix", "parent_order": 6, "child_order": 12}},
+        )
+        with pytest.raises(ValueError, match="nope_col"):
+            validate_config(cfg)
+
     def test_segment_variable_usable_in_chunk_precompute(self):
         ds = _minimal_two_level_ds()
         ds["levels"]["segments"]["variables"] = {"dem_h": "/{group}/geophys_corr/dem_h"}
