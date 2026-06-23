@@ -333,21 +333,18 @@ def _planned_read_group(
     if n_base <= 0:
         return None
 
-    # Compute the shard's WGS84 bbox from the grid (every grid's
-    # ``shard_footprint`` returns a shapely ``Polygon`` or ``MultiPolygon``).
-    # An antimeridian-crossing HEALPix shard's footprint can come back as a
-    # split ``MultiPolygon`` (see ``zagg.viz.shardmap._split_antimeridian``),
-    # in which case ``.bounds`` spans ~360 deg in lon and would neutralize
-    # the IO bound (the AOI would intersect every segment). Same for
-    # globe-spanning polar caps. Detect the wide-bbox case up front and fall
-    # back to ``_read_group_full`` so we don't pretend to optimize.
-    poly = grid.shard_footprint(shard_key)
-    min_lon, min_lat, max_lon, max_lat = poly.bounds
-    if (max_lon - min_lon) >= 180.0:
-        # Hand off to the full-read path; the planned-IO benefit is gone for
-        # this shard and trying to plan would waste the coarse-coord read.
-        return _read_group_full(h5obj, group, data_source, shard_key, grid, arrow=arrow)
-    bbox = (float(min_lon), float(min_lat), float(max_lon), float(max_lat))
+    # Match segments to this shard with the SAME mortie test the photon path
+    # applies below (``grid.shards_of(grid.assign(...)) == shard_key``), not a
+    # loose bbox + per-segment shapely scan (issue #95). It is exact to the leaf
+    # cell, vectorized (~280x faster than the shapely loop on a 181k-segment
+    # ATL03 beam), and antimeridian/polar-correct -- so the wide-bbox bail the
+    # old bbox path needed is gone; a shard that genuinely spans most segments is
+    # still caught by ``plan_read``'s selectivity ``full_read`` fallback. The
+    # mask is rep-point based, so a boundary segment whose photons straddle the
+    # shard edge is recovered by ``pad`` (and the photon-level filter below never
+    # over-includes); residual omission is bounded to a few edge photons (#95).
+    coarse_leaf = grid.assign(np.asarray(coarse_lats), np.asarray(coarse_lons))
+    coarse_mask = grid.shards_of(coarse_leaf) == int(shard_key)
 
     plan = plan_read(
         np.asarray(coarse_lats),
@@ -355,10 +352,10 @@ def _planned_read_group(
         np.asarray(ibeg_arr),
         np.asarray(cnt_arr),
         n_base,
-        bbox,
         index_base=index_base,
         pad=pad,
         full_read_threshold=full_read_threshold,
+        coarse_mask=coarse_mask,
     )
 
     if not plan.parent_runs:
