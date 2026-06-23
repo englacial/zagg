@@ -30,6 +30,7 @@ Internal representations
 Out-of-bounds points get leaf id ``-1`` (signed). The corresponding shard
 filter rejects them, so they fall out of the pipeline silently.
 """
+
 from __future__ import annotations
 
 import math
@@ -48,7 +49,7 @@ from zagg.config import (
     get_output_signature,
     output_field_signature,
 )
-from zagg.grids.base import vector_array_spec
+from zagg.grids.base import chunk_array_spec, vector_array_spec
 
 OOB_SENTINEL: int = -1
 
@@ -89,6 +90,7 @@ class RectilinearGrid:
         bounds,
         chunk_shape=(256, 256),
         config: PipelineConfig | None = None,
+        chunk_inner=None,
     ):
         if len(bounds) != 4:
             raise ValueError("bounds must be (xmin, ymin, xmax, ymax)")
@@ -97,7 +99,25 @@ class RectilinearGrid:
         self.crs = str(crs)
         self.res_x, self.res_y = _normalize_resolution(resolution)
         self.xmin, self.ymin, self.xmax, self.ymax = (float(b) for b in bounds)
+        # The SHARD tile (the dispatch unit): chunk_h/chunk_w. The ZARR chunk is
+        # the (optionally finer) inner chunk (issue #30 item 3). chunk_inner is the
+        # native rectilinear unit — a [h, w] SHAPE. Default chunk_inner == shard tile
+        # (K == 1, shard == chunk), byte-identical to the pre-item-3 grid.
         self.chunk_h, self.chunk_w = (int(c) for c in chunk_shape)
+        self.chunk_inner = chunk_inner
+        if chunk_inner is None:
+            self.inner_h, self.inner_w = self.chunk_h, self.chunk_w
+        else:
+            if len(chunk_inner) != 2:
+                raise ValueError("chunk_inner must be (inner_h, inner_w)")
+            self.inner_h, self.inner_w = (int(c) for c in chunk_inner)
+            # Native-units nesting check: each shard dim divisible by the matching
+            # chunk_inner dim (per-grid validation; rect uses shapes).
+            if self.chunk_h % self.inner_h or self.chunk_w % self.inner_w:
+                raise ValueError(
+                    f"chunk_inner ({self.inner_h}, {self.inner_w}) must evenly divide the "
+                    f"shard tile ({self.chunk_h}, {self.chunk_w})"
+                )
         self.config = config or default_config("atl06")
 
         span_x = self.xmax - self.xmin
@@ -120,12 +140,16 @@ class RectilinearGrid:
         self.ymin = self.ymax - self.height * self.res_y
         self.n_row_blocks = self.height // self.chunk_h
         self.n_col_blocks = self.width // self.chunk_w
+        # The (optionally finer) ZARR-chunk grid. Equals the shard grid when
+        # chunk_inner is unset (K == 1). The far edges are already padded to a whole
+        # number of shard tiles, and inner divides the shard tile, so they divide the
+        # padded extent too.
+        self.n_inner_row_blocks = self.height // self.inner_h
+        self.n_inner_col_blocks = self.width // self.inner_w
 
         # GeoBox: north-up affine with origin at (xmin, ymax); y resolution
         # negative. GeoboxTiles tiles it into one tile per chunk.
-        affine = Affine.translation(self.xmin, self.ymax) * Affine.scale(
-            self.res_x, -self.res_y
-        )
+        affine = Affine.translation(self.xmin, self.ymax) * Affine.scale(self.res_x, -self.res_y)
         self._geobox = GeoBox((self.height, self.width), affine, self.crs)
         self._tiles = GeoboxTiles(self._geobox, (self.chunk_h, self.chunk_w))
         self._transformer = None  # lazy WGS84 -> grid CRS, for assign
@@ -133,12 +157,80 @@ class RectilinearGrid:
     # ── shape properties ─────────────────────────────────────────────────
 
     @property
+    def chunks_per_shard(self) -> int:
+        """Number of ZARR chunks one shard tile owns (K; issue #30 item 3).
+
+        ``1`` unless ``chunk_inner`` subdivided the shard tile into finer chunks,
+        in which case ``(chunk_h // inner_h) * (chunk_w // inner_w)``.
+        """
+        return (self.chunk_h // self.inner_h) * (self.chunk_w // self.inner_w)
+
+    @property
     def array_shape(self) -> tuple[int, int]:
         return (self.height, self.width)
 
     @property
     def chunk_shape(self) -> tuple[int, int]:
-        return (self.chunk_h, self.chunk_w)
+        """ZARR chunk shape — the inner chunk ``(inner_h, inner_w)``.
+
+        Equals the shard tile ``(chunk_h, chunk_w)`` unless ``chunk_inner`` set a
+        finer chunk (issue #30 item 3). This is the per-chunk cell extent the
+        worker/writer size a chunk region against.
+        """
+        return (self.inner_h, self.inner_w)
+
+    @property
+    def chunk_grid_shape(self) -> tuple[int, int]:
+        """Number of chunks per axis (``array_shape // chunk_shape``).
+
+        A ``resolution: chunk`` field (issue #30 item 2) stores one value per
+        chunk in a companion array of this shape. Equals ``(n_inner_row_blocks,
+        n_inner_col_blocks)`` (== the shard grid when ``chunk_inner`` is unset).
+
+        Indexing: at K==1 the per-chunk index IS :meth:`block_index` (the shard's
+        ``(rb, cb)``). At K>1 the companion is the finer inner grid, so the correct
+        per-chunk index is the ``(rb, cb)`` yielded by :meth:`iter_chunks` — NOT
+        ``block_index(shard_key)``, which is the coarser shard-tile index. The K>1
+        writer must index by ``iter_chunks``.
+        """
+        return (self.n_inner_row_blocks, self.n_inner_col_blocks)
+
+    def iter_chunks(self, shard_key):
+        """Yield ``(chunk_block_index, chunk_children)`` for each chunk in a shard.
+
+        Item 3 (issue #30): one shard tile owns ``K`` finer ZARR chunks (the
+        ``inner_h × inner_w`` sub-tiles of the ``chunk_h × chunk_w`` shard). Each
+        yielded ``chunk_block_index`` is the ``(rb, cb)`` of that inner chunk in the
+        inner chunk grid; ``chunk_children`` are its cell ids in row-major order.
+
+        When ``chunk_inner`` is unset (``K == 1``) this yields exactly one entry —
+        ``(block_index(shard_key), children(shard_key))`` — byte-identical to the
+        single-chunk path.
+
+        Order note: at K>1 the union of the per-chunk ``chunk_children`` equals the
+        shard's :meth:`children` as a SET, but the concatenation order does NOT match
+        ``children(shard_key)`` (the shard is row-major over the whole tile; the
+        chunks are row-major within each inner sub-tile). The writer must place each
+        chunk's cells against its own ``block`` region.
+        """
+        if self.inner_h == self.chunk_h and self.inner_w == self.chunk_w:
+            yield (self.block_index(shard_key), self.children(shard_key))
+            return
+        rb, cb = self._unpack(int(shard_key))
+        # Top-left cell of the shard tile, and how many inner chunks fit per axis.
+        shard_r0 = rb * self.chunk_h
+        shard_c0 = cb * self.chunk_w
+        n_ir = self.chunk_h // self.inner_h
+        n_ic = self.chunk_w // self.inner_w
+        for ir in range(n_ir):
+            for ic in range(n_ic):
+                r0 = shard_r0 + ir * self.inner_h
+                c0 = shard_c0 + ic * self.inner_w
+                rows = np.arange(self.inner_h)[:, None] + r0
+                cols = np.arange(self.inner_w)[None, :] + c0
+                children = (rows * self.width + cols).reshape(-1).astype(np.int64)
+                block = (r0 // self.inner_h, c0 // self.inner_w)
+                yield (block, children)
 
     @property
     def group_path(self) -> str:
@@ -177,14 +269,12 @@ class RectilinearGrid:
             # Co-aggregated grids must declare the same Option-B output-field
             # set (issue #29): same scalar/vector kinds, trailing shapes, dtypes.
             return False
-        if not (_whole_ratio(self.res_x, other.res_x)
-                and _whole_ratio(self.res_y, other.res_y)):
+        if not (_whole_ratio(self.res_x, other.res_x) and _whole_ratio(self.res_y, other.res_y)):
             return False
         fine_x = min(self.res_x, other.res_x)
         fine_y = min(self.res_y, other.res_y)
-        return (
-            _is_multiple(self.xmin - other.xmin, fine_x)
-            and _is_multiple(self.ymax - other.ymax, fine_y)
+        return _is_multiple(self.xmin - other.xmin, fine_x) and _is_multiple(
+            self.ymax - other.ymax, fine_y
         )
 
     # ── coverage / coords ────────────────────────────────────────────────
@@ -199,8 +289,7 @@ class RectilinearGrid:
 
         rings = []
         for lats, lons in polygon_parts:
-            rings.append([(float(x), float(y))
-                          for x, y in zip(np.asarray(lons), np.asarray(lats))])
+            rings.append([(float(x), float(y)) for x, y in zip(np.asarray(lons), np.asarray(lats))])
         if len(rings) == 1:
             geom = polygon(rings[0], crs="EPSG:4326")
         else:
@@ -223,9 +312,7 @@ class RectilinearGrid:
         xs, ys = tx.transform(lons, lats)
         cols = ((xs - self.xmin) // self.res_x).astype(np.int64)
         rows = ((self.ymax - ys) // self.res_y).astype(np.int64)
-        in_bounds = (
-            (rows >= 0) & (rows < self.height) & (cols >= 0) & (cols < self.width)
-        )
+        in_bounds = (rows >= 0) & (rows < self.height) & (cols >= 0) & (cols < self.width)
         ids = rows * self.width + cols
         return np.where(in_bounds, ids, OOB_SENTINEL).astype(np.int64)
 
@@ -280,11 +367,7 @@ class RectilinearGrid:
         """
         rb, cb = self._unpack(int(shard_key))
         densify = max(self.chunk_w * self.res_x, self.chunk_h * self.res_y) / 32
-        return (
-            self._tiles[(rb, cb)]
-            .extent.to_crs("EPSG:4326", resolution=densify)
-            .geom
-        )
+        return self._tiles[(rb, cb)].extent.to_crs("EPSG:4326", resolution=densify).geom
 
     # ── leaf enumeration ─────────────────────────────────────────────────
 
@@ -303,6 +386,15 @@ class RectilinearGrid:
 
     def chunk_coords(self, shard_key) -> dict:
         """No per-cell coord columns; x/y are 1D dimensional coords on the template."""
+        return {}
+
+    def coords_of(self, children) -> dict:
+        """No per-cell coord columns (matches :meth:`chunk_coords`).
+
+        The chunk-resolution variant used by the K>1 worker (issue #30 item 3);
+        rectilinear carries x/y as 1-D dimensional coords on the template, so a
+        per-chunk carrier needs no coord columns either.
+        """
         return {}
 
     # ── template ─────────────────────────────────────────────────────────
@@ -333,9 +425,7 @@ class RectilinearGrid:
                 name="regular",
                 configuration={"chunk_shape": list(self.chunk_shape)},
             ),
-            chunk_key_encoding=NamedConfig(
-                name="default", configuration={"separator": "/"}
-            ),
+            chunk_key_encoding=NamedConfig(name="default", configuration={"separator": "/"}),
             codecs=(NamedConfig(name="bytes", configuration={"endian": "little"}),),
             storage_transformers=(),
             fill_value="NaN",
@@ -353,10 +443,10 @@ class RectilinearGrid:
             storage_transformers=(),
             fill_value=0.0,
         )
-        coord_y = coord_x.with_shape((self.height,)).with_dimension_names(
-            ("y",)
-        ).with_attributes(
-            {"standard_name": "projection_y_coordinate", "units": "m"}
+        coord_y = (
+            coord_x.with_shape((self.height,))
+            .with_dimension_names(("y",))
+            .with_attributes({"standard_name": "projection_y_coordinate", "units": "m"})
         )
 
         members = {"x": coord_x, "y": coord_y}
@@ -368,14 +458,40 @@ class RectilinearGrid:
             fill = meta.get("fill_value", "NaN")
             members[name] = base.with_data_type(dtype).with_fill_value(fill)
         for name, meta in get_agg_fields(self.config).items():
+            sig = get_output_signature(meta)
+            # Ragged fields (issue #48) are CSR subgroups written fresh by
+            # ``write_ragged_to_zarr`` (``{name}/{shard_key}/...``), not a dense
+            # array — skip them so ``{name}`` stays a group prefix and the CSR
+            # child nodes don't collide with a dense array at the same path.
+            if sig["kind"] == "ragged":
+                continue
             dtype = meta.get("dtype", "float32")
             fill = meta.get("fill_value", "NaN")
             spec = base.with_data_type(dtype).with_fill_value(fill)
+            if sig["resolution"] == "chunk":
+                # A resolution: chunk field (issues #30 item 2, #82) is stored once
+                # per chunk in a companion array shaped at the chunk grid (row-major
+                # chunk index), indexed by block_index = (rb, cb). Compose the two
+                # helpers: chunk_array_spec sets the chunk-grid base, then
+                # vector_array_spec appends the field's trailing_shape (chunked whole)
+                # for a vector companion. A scalar/ragged field has an empty
+                # trailing_shape, so vector_array_spec returns the chunk base.
+                members[name] = vector_array_spec(
+                    chunk_array_spec(
+                        spec,
+                        chunk_grid_shape=self.chunk_grid_shape,
+                        chunk_dims=("chunk_y", "chunk_x"),
+                    ),
+                    sig,
+                    base_dims=("chunk_y", "chunk_x"),
+                    base_chunk_shape=(1, 1),
+                )
+                continue
             # A vector field (issue #29) gets a trailing payload dim chunked
             # whole; scalars are returned unchanged.
             members[name] = vector_array_spec(
                 spec,
-                get_output_signature(meta),
+                sig,
                 base_dims=("y", "x"),
                 base_chunk_shape=self.chunk_shape,
             )
@@ -402,9 +518,7 @@ class RectilinearGrid:
         if self._transformer is None:
             from pyproj import Transformer
 
-            self._transformer = Transformer.from_crs(
-                "EPSG:4326", self.crs, always_xy=True
-            )
+            self._transformer = Transformer.from_crs("EPSG:4326", self.crs, always_xy=True)
         return self._transformer
 
 

@@ -57,7 +57,8 @@ from typing import Any, Dict
 
 # Import cloud-agnostic processing
 from zagg.config import load_config_from_dict
-from zagg.processing import write_dataframe_to_zarr
+from zagg.processing import write_dataframe_to_zarr, write_ragged_to_zarr
+from zagg.processing.write import _block_index_key
 from zagg.store import open_store
 
 # Set up structured logging
@@ -241,18 +242,25 @@ def _handle_process(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
 
         grid = from_config(config, parent_order=event.get("parent_order"))
 
-        # Process the shard using cloud-agnostic function
+        # Process the shard using cloud-agnostic function. A ``chunk_results`` sink
+        # is required for K>1 grids (issue #82 phase 7): ``process_shard`` reads the
+        # granules once and returns one ``(block_index, carrier, ragged)`` per finer
+        # Zarr chunk through the sink. At K==1 the sink holds exactly one entry whose
+        # ``block_index`` equals ``event["chunk_idx"]``, so the write is unchanged.
         from zagg.processing import process_shard
-        df_out, metadata = process_shard(
+        chunk_results: list = []
+        _df_out, metadata = process_shard(
             grid,
             event["shard_key"],
             event["granule_urls"],
             s3_credentials=s3_creds,
             config=config,
+            chunk_results=chunk_results,
         )
 
-        # Write Zarr to store
-        if not df_out.empty:
+        # Write Zarr to store: one dense region per chunk plus its ragged (CSR)
+        # companion. Mirrors the local runner's K>1 write loop (``_process_and_write``).
+        if chunk_results:
             store_path = event["store_path"]
             store = open_store(store_path, **_output_store_kwargs(event))
 
@@ -269,13 +277,32 @@ def _handle_process(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
 
             logger.info(f"  Writing data to {store_path}...")
 
+            single_chunk = len(chunk_results) == 1
+            shard_key = event["shard_key"]
             try:
-                write_dataframe_to_zarr(
-                    df_out,
-                    store,
-                    grid=grid,
-                    chunk_idx=tuple(event["chunk_idx"]),
-                )
+                for block_index, carrier, ragged in chunk_results:
+                    # write_dataframe_to_zarr no-ops on an empty carrier, so no
+                    # per-chunk emptiness check is needed. Use each chunk's own
+                    # block_index (from iter_chunks), not event["chunk_idx"].
+                    write_dataframe_to_zarr(
+                        carrier,
+                        store,
+                        grid=grid,
+                        chunk_idx=block_index,
+                    )
+                    # Persist this chunk's ragged (CSR) fields (issue #48). At K==1 the
+                    # chunk IS the shard, so the CSR subgroup is keyed by ``shard_key``
+                    # (cell-resolution contract); at K>1 each finer chunk is keyed by
+                    # its own block index. No-ops when ``ragged`` is empty.
+                    ragged_key = (
+                        int(shard_key) if single_chunk else _block_index_key(block_index, grid)
+                    )
+                    write_ragged_to_zarr(
+                        ragged,
+                        store,
+                        grid=grid,
+                        shard_key=ragged_key,
+                    )
             except Exception as e:
                 logger.error(f"Failed to write zarr to {store_path}: {e}")
                 metadata["error"] = f"Failed to write zarr: {e}"

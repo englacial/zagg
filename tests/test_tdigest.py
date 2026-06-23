@@ -3,7 +3,12 @@
 import numpy as np
 import pytest
 
-from zagg.stats.tdigest import build_tdigest, merge_tdigests, quantile_from_tdigest
+from zagg.stats.tdigest import (
+    build_tdigest,
+    cdf_from_tdigest,
+    merge_tdigests,
+    quantile_from_tdigest,
+)
 
 
 class TestBuildTDigest:
@@ -257,3 +262,175 @@ class TestTDigestDeltaSweep:
         # Centroid count should grow sub-linearly with δ (proportional, not more).
         ratio = len(digest) / delta
         assert ratio <= 4.0, f"delta={delta}: centroid/delta ratio {ratio:.2f} > 4.0"
+
+
+class TestScaleFunctionRegression:
+    """Guards against the k1-budget regression where δ was inverted.
+
+    Before the scale-function fix the per-centroid weight cap was proportional
+    to δ (and independent of n), so larger δ produced *fewer*, coarser centroids
+    and even a handful of points collapsed to a single centroid. These tests pin
+    the correct behavior: δ is a resolution knob, the digest saturates at ~δ
+    centroids, and it is loss-free until the count exceeds δ.
+    """
+
+    @pytest.mark.parametrize("n", [10, 100, 500])
+    def test_loss_free_when_count_at_most_delta(self, n):
+        """With n ≤ δ every observation is kept as its own weight-1 centroid."""
+        rng = np.random.default_rng(n)
+        vals = rng.standard_normal(n)  # distinct values w.p. 1
+        digest = build_tdigest(vals, delta=512)
+        assert digest.shape[0] == n, f"n={n}: expected {n} centroids, got {digest.shape[0]}"
+        np.testing.assert_array_equal(digest[:, 1], np.ones(n, dtype=np.float32))
+
+    def test_loss_free_at_delta_then_compresses(self):
+        """n == δ is guaranteed loss-free; well past δ the digest compresses.
+
+        The k1 bound guarantees loss-free for n ≤ δ (the region actually extends
+        to ~1.27·δ because the left edge lags one observation), so this pins the
+        guaranteed boundary at n == δ and a clearly-compressing case at n == 2δ.
+        """
+        delta = 256
+        rng = np.random.default_rng(99)
+        at = build_tdigest(rng.standard_normal(delta), delta=delta)
+        over = build_tdigest(rng.standard_normal(2 * delta), delta=delta)
+        assert at.shape[0] == delta, f"n==δ should be loss-free, got k={at.shape[0]}"
+        assert over.shape[0] < 2 * delta, f"n==2δ must compress, got k={over.shape[0]}"
+
+    def test_compression_begins_past_delta(self):
+        """Once n exceeds δ the digest must actually compress (k < n)."""
+        rng = np.random.default_rng(1)
+        delta = 256
+        vals = rng.standard_normal(4 * delta)
+        digest = build_tdigest(vals, delta=delta)
+        assert digest.shape[0] < len(vals)
+        np.testing.assert_almost_equal(float(digest[:, 1].sum()), len(vals), decimal=4)
+
+    def test_delta_controls_resolution_not_inverted(self):
+        """More δ ⇒ more centroids. The old budget did the opposite."""
+        rng = np.random.default_rng(2)
+        vals = rng.standard_normal(50_000)
+        counts = [build_tdigest(vals, delta=d).shape[0] for d in (128, 256, 512, 1024)]
+        assert counts == sorted(counts), f"centroid count not monotonic in δ: {counts}"
+        assert counts[-1] > 2 * counts[0], f"δ=1024 barely finer than δ=128: {counts}"
+
+    @pytest.mark.parametrize("n", [50_000, 200_000])
+    def test_centroid_count_saturates_near_delta(self, n):
+        """Count stays ~δ regardless of n (≤ 2δ), instead of growing with n."""
+        rng = np.random.default_rng(n)
+        vals = rng.standard_normal(n)
+        k = build_tdigest(vals, delta=256).shape[0]
+        assert k <= 2 * 256, f"n={n}: {k} centroids exceeds 2·δ"
+
+    def test_accuracy_not_degraded_at_high_delta_on_structured_data(self):
+        """On a bimodal mixture, large δ must stay accurate.
+
+        This is the user-visible symptom of the inversion bug: interior-quantile
+        error blew up as δ grew (≈0.33 here at δ=1024 — ~60× the δ=128 error).
+        A correct digest keeps high-δ error small and comparable to low-δ.
+        """
+        rng = np.random.default_rng(3)
+        vals = np.concatenate([rng.normal(-3, 0.3, 5000), rng.normal(3, 0.3, 5000)])
+        qs = [0.1, 0.25, 0.5, 0.75, 0.9]
+        exact = np.quantile(vals, qs)
+
+        def mean_err(delta):
+            d = build_tdigest(vals, delta=delta)
+            est = np.array([quantile_from_tdigest(d, q) for q in qs])
+            return float(np.abs(est - exact).mean())
+
+        err_lo, err_hi = mean_err(128), mean_err(1024)
+        assert err_hi < 0.05, f"δ=1024 interior error {err_hi:.4f} too large"
+        assert err_hi < 5 * err_lo, f"δ=1024 error {err_hi:.4f} >> δ=128 error {err_lo:.4f}"
+
+    @pytest.mark.parametrize("q", [0.02, 0.25, 0.5, 0.75, 0.98])
+    def test_quantiles_track_exact_within_tolerance(self, q):
+        """Estimated quantiles track exact numpy quantiles (independent ground truth)."""
+        rng = np.random.default_rng(4)
+        vals = rng.standard_normal(20_000)
+        digest = build_tdigest(vals, delta=512)
+        est = quantile_from_tdigest(digest, q)
+        exact = float(np.quantile(vals, q))
+        assert abs(est - exact) < 0.05, f"q={q}: est={est:.4f} exact={exact:.4f}"
+
+    def test_merge_saturates_near_delta(self):
+        """Merging two saturated digests stays ~δ, not 2δ-and-growing."""
+        rng = np.random.default_rng(5)
+        delta = 512
+        d1 = build_tdigest(rng.standard_normal(50_000), delta=delta)
+        d2 = build_tdigest(rng.standard_normal(50_000), delta=delta)
+        merged = merge_tdigests(d1, d2, delta=delta)
+        assert merged.shape[0] <= 2 * delta
+        np.testing.assert_almost_equal(float(merged[:, 1].sum()), 100_000, decimal=3)
+
+
+class TestCdfFromTDigest:
+    def test_empty_returns_nan_scalar(self):
+        out = cdf_from_tdigest(np.empty((0, 2), dtype=np.float32), 3.0)
+        assert isinstance(out, float)
+        assert np.isnan(out)
+
+    def test_empty_returns_nan_array(self):
+        out = cdf_from_tdigest(np.empty((0, 2), dtype=np.float32), np.array([1.0, 2.0]))
+        assert isinstance(out, np.ndarray)
+        assert out.shape == (2,)
+        assert np.all(np.isnan(out))
+
+    def test_single_centroid_step(self):
+        digest = build_tdigest(np.array([5.0]))
+        assert cdf_from_tdigest(digest, 4.0) == pytest.approx(0.0)
+        assert cdf_from_tdigest(digest, 5.0) == pytest.approx(1.0)
+        assert cdf_from_tdigest(digest, 9.0) == pytest.approx(1.0)
+
+    def test_endpoints_zero_and_total(self):
+        rng = np.random.default_rng(1)
+        vals = rng.standard_normal(5_000)
+        digest = build_tdigest(vals, delta=256)
+        total = float(digest[:, 1].sum())
+        # Far below the minimum mean → 0; far above the maximum mean → total.
+        lo = float(digest[:, 0].min()) - 100.0
+        hi = float(digest[:, 0].max()) + 100.0
+        assert cdf_from_tdigest(digest, lo) == pytest.approx(0.0)
+        assert cdf_from_tdigest(digest, hi) == pytest.approx(total)
+
+    def test_monotonic_non_decreasing(self):
+        rng = np.random.default_rng(2)
+        vals = rng.standard_normal(8_000)
+        digest = build_tdigest(vals, delta=256)
+        xs = np.linspace(vals.min() - 1.0, vals.max() + 1.0, 500)
+        cdf = cdf_from_tdigest(digest, xs)
+        assert np.all(np.diff(cdf) >= -1e-9)
+
+    def test_scalar_in_scalar_out(self):
+        digest = build_tdigest(np.arange(100.0))
+        out = cdf_from_tdigest(digest, 50.0)
+        assert isinstance(out, float)
+
+    def test_array_in_array_out(self):
+        digest = build_tdigest(np.arange(100.0))
+        out = cdf_from_tdigest(digest, np.array([10.0, 50.0, 90.0]))
+        assert isinstance(out, np.ndarray)
+        assert out.shape == (3,)
+
+    def test_matches_empirical_cdf_within_tolerance(self):
+        """cdf_from_tdigest tracks the empirical CDF of the samples (as a fraction)."""
+        rng = np.random.default_rng(3)
+        vals = rng.standard_normal(20_000)
+        digest = build_tdigest(vals, delta=512)
+        total = float(digest[:, 1].sum())
+        xs = np.linspace(np.quantile(vals, 0.02), np.quantile(vals, 0.98), 50)
+        est_frac = np.asarray(cdf_from_tdigest(digest, xs)) / total
+        emp_frac = np.searchsorted(np.sort(vals), xs, side="right") / len(vals)
+        # t-digest CDF tracks the empirical CDF within a few percent.
+        assert np.max(np.abs(est_frac - emp_frac)) < 0.03
+
+    def test_inverse_consistency_with_quantile(self):
+        """cdf(quantile(q)) ≈ q*total over the interior (round-trip within tolerance)."""
+        rng = np.random.default_rng(7)
+        vals = rng.standard_normal(20_000)
+        digest = build_tdigest(vals, delta=512)
+        total = float(digest[:, 1].sum())
+        for q in (0.1, 0.25, 0.5, 0.75, 0.9):
+            x = quantile_from_tdigest(digest, q)
+            frac = cdf_from_tdigest(digest, x) / total
+            assert abs(frac - q) < 0.03, f"q={q}: round-trip frac={frac:.4f}"

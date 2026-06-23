@@ -10,34 +10,41 @@ This module is **pure numpy** — no scipy, no numba, no JAX.  It is the Tier-2
 ragged consumer for issue #48 and the first ``kind: ragged`` reducer wired into
 :func:`zagg.config.resolve_function`.
 
-Algorithm (sequential sort-and-merge variant)
-----------------------------------------------
+Algorithm (scale-function sort-and-merge variant)
+--------------------------------------------------
 ``build_tdigest`` sorts the input, then greedily merges adjacent observations
-into centroids:
+into centroids bounded by Dunning's k1 scale function:
 
 1. Sort all input values.
-2. Walk sorted values; for each value try to merge it into the current centroid.
-3. The merge succeeds if the resulting centroid weight ≤ the local budget
-   ``w_max = δ * (k(q + 1/n) - k(q))``, where k(q) = δ/2 * (1 + sin(π*(q-0.5)))
-   is Dunning's scale function.  A simpler closed-form bound is used here:
-   the budget for a centroid at rank fraction q is proportional to
-   sin(π*q)*(1-sin(π*q)), which peaks at δ/4 at q=0.5 and is 0 at the tails.
-4. When the budget is exhausted, finalize the current centroid and start fresh.
+2. Walk sorted values, accumulating each into the current centroid.
+3. A point joins the current centroid while the centroid still spans ≤ 1 unit
+   of the k1 scale ``k(q) = δ * (arcsin(2q − 1)/π + 1/2)``, which maps the
+   cumulative rank fraction q ∈ [0, 1] onto [0, δ].  ``dk/dq`` is largest at the
+   tails (q → 0 or 1) and smallest at the median, so centroids are narrow and
+   high-resolution in the tails and wide in the middle — the defining t-digest
+   property.
+4. When adding the next point would make the centroid span more than 1 k-unit,
+   finalize it and start a fresh centroid.
+
+Because k maps onto a fixed ``[0, δ]`` range, a digest holds ~δ centroids
+regardless of the observation count (it saturates instead of growing with n),
+and is **loss-free** — one centroid per observation, every weight 1 — while the
+count stays ≤ δ.  Larger δ therefore means more centroids and higher accuracy.
 
 ``merge_tdigests`` concatenates two centroid arrays sorted by mean, then
-re-compresses with the same scale-limited merge so the result respects the
-δ-budget.  The merged sketch matches the one-shot sketch within typical t-digest
-accuracy guarantees.
+re-compresses with the same k1-bounded merge so the result respects the same
+~δ centroid budget.  The merged sketch matches the one-shot sketch within
+typical t-digest accuracy guarantees.
 
 Profiling note (IO vs compute)
 -------------------------------
-At δ=512, ``build_tdigest`` on 10 000 points typically produces ≤200
-centroids; the output is a ``(k, 2)`` float32 array of ≲2 kB, much smaller
+At δ=512, ``build_tdigest`` saturates near ~512 centroids once the observation
+count exceeds δ; the output is a ``(k, 2)`` float32 array of ≲4 kB, much smaller
 than the raw observation array.  Over a 4096-cell shard with ~500 obs per cell,
 the per-cell sort (O(n log n)) and merge loop (O(n)) are the dominant cost at
-~10 μs/cell, giving ~40 ms/shard — well below network IO.  At δ=128 the cost
-is similar but centroid count is 4× smaller; at δ=1024 the loop runs
-4× longer but accuracy improves near the tails.
+~10 μs/cell, giving ~40 ms/shard — well below network IO.  At δ=128 the centroid
+count (and output size) is ~4× smaller; at δ=1024 the digest carries ~2× more
+centroids and is more accurate near the tails.
 
 Usage
 -----
@@ -61,31 +68,28 @@ from __future__ import annotations
 
 import numpy as np
 
-__all__ = ["build_tdigest", "merge_tdigests", "quantile_from_tdigest"]
+__all__ = [
+    "build_tdigest",
+    "cdf_from_tdigest",
+    "merge_tdigests",
+    "quantile_from_tdigest",
+]
 
 _DEFAULT_DELTA = 512
 
 
-def _k_scale(q: float, delta: float) -> float:
-    """Dunning's k1 scale function: k(q) = delta/2 * (1 + sin(pi*(q - 0.5))).
+def _k1_scale(q: float, delta: float) -> float:
+    """Dunning's k1 scale function: k(q) = delta * (arcsin(2q - 1)/pi + 1/2).
 
-    Maps quantile q ∈ [0,1] to a scale value; the budget for a centroid at
-    cumulative quantile q is proportional to k(q+ε) - k(q).
+    Maps the cumulative rank fraction q ∈ [0, 1] onto [0, delta].  Its
+    derivative is largest at the tails (q → 0 or 1) and smallest at the median,
+    so bounding each centroid to span ≤ 1 unit of k yields narrow, high-
+    resolution centroids in the tails and wide centroids in the middle — the
+    defining t-digest property.  A digest holds ~delta centroids regardless of
+    the observation count, and is loss-free while the count stays ≤ delta.
     """
-    return delta / 2.0 * (1.0 + np.sin(np.pi * (q - 0.5)))
-
-
-def _budget(q: float, delta: float) -> float:
-    """Maximum weight a centroid at fractional rank q can absorb.
-
-    Derived from the derivative of the k1 scale function k(q):
-    the per-centroid budget is proportional to the width Δk at quantile q.
-    For k1: dk/dq = delta * pi/2 * cos(pi*(q-0.5)).
-    Peaks at delta*pi/2 at q=0.5 and approaches 0 at the tails.
-    Bounded below at 1.0 so every value can always form its own centroid.
-    """
-    bud = delta * np.pi / 2.0 * np.cos(np.pi * (q - 0.5))
-    return max(1.0, bud)
+    qc = min(1.0, max(0.0, q))
+    return delta * (float(np.arcsin(2.0 * qc - 1.0)) / np.pi + 0.5)
 
 
 def build_tdigest(
@@ -129,21 +133,18 @@ def build_tdigest(
 
     cur_mean = sorted_vals[0]
     cur_weight = 1.0
-    # cum_w tracks total weight processed so far (finalized + current centroid).
-    # Loop invariant: at the start of each iteration, cum_w == i (total weight
-    # seen up to but not including sorted_vals[i]).  The fractional rank
-    # q = (cum_w - cur_weight/2) / n_total is evaluated *before* attempting to
-    # merge sorted_vals[i], so the budget is assessed one observation behind the
-    # true midpoint — a standard approximation in the sequential sort-and-merge
-    # variant that avoids a second pass.
-    cum_w = 1.0
+    # k1 scale value at the current centroid's left edge — the cumulative rank
+    # fraction *before* its first observation. Observation i extends the
+    # centroid's right edge to rank (i + 1); it joins the centroid while the
+    # centroid still spans ≤ 1 unit of the k1 scale, otherwise it opens a fresh
+    # centroid. This keeps the digest to ~delta centroids and loss-free until
+    # the count exceeds delta.
+    k_left = _k1_scale(0.0, delta_f)
 
     for i in range(1, n):
         v = sorted_vals[i]
-        # Fractional rank of the current centroid's midpoint (one obs behind).
-        q = (cum_w - cur_weight / 2.0) / n_total
-        bud = _budget(q, delta_f)
-        if cur_weight + 1.0 <= bud:
+        k_right = _k1_scale((i + 1) / n_total, delta_f)
+        if k_right - k_left <= 1.0:
             # Merge: update running mean via Welford one-pass update.
             cur_mean += (v - cur_mean) / (cur_weight + 1.0)
             cur_weight += 1.0
@@ -152,7 +153,7 @@ def build_tdigest(
             weights.append(cur_weight)
             cur_mean = v
             cur_weight = 1.0
-        cum_w += 1.0
+            k_left = _k1_scale(i / n_total, delta_f)
 
     means.append(cur_mean)
     weights.append(cur_weight)
@@ -210,14 +211,17 @@ def merge_tdigests(
 
     cur_mean = float(combined[0, 0])
     cur_weight = float(combined[0, 1])
-    cum_w = cur_weight
+    # Cumulative weight before the current centroid's first sub-centroid, and
+    # the k1 scale value at that left edge. A sub-centroid merges in while the
+    # combined centroid still spans ≤ 1 unit of the k1 scale.
+    cum_left = 0.0
+    k_left = _k1_scale(0.0, delta_f)
 
     for i in range(1, len(combined)):
         v_mean = float(combined[i, 0])
         v_weight = float(combined[i, 1])
-        q = (cum_w - cur_weight / 2.0) / n_total
-        bud = _budget(q, delta_f)
-        if cur_weight + v_weight <= bud:
+        k_right = _k1_scale((cum_left + cur_weight + v_weight) / n_total, delta_f)
+        if k_right - k_left <= 1.0:
             # Weighted mean update.
             total = cur_weight + v_weight
             cur_mean = (cur_mean * cur_weight + v_mean * v_weight) / total
@@ -225,9 +229,10 @@ def merge_tdigests(
         else:
             means.append(cur_mean)
             weights.append(cur_weight)
+            cum_left += cur_weight
+            k_left = _k1_scale(cum_left / n_total, delta_f)
             cur_mean = v_mean
             cur_weight = v_weight
-        cum_w += v_weight
 
     means.append(cur_mean)
     weights.append(cur_weight)
@@ -284,3 +289,64 @@ def quantile_from_tdigest(digest: np.ndarray, q: float) -> float:
                 hi_val = means[k] if k == len(means) - 1 else (means[k] + means[k + 1]) / 2.0
             return float(lo_val + frac * (hi_val - lo_val))
     return float(means[-1])
+
+
+def cdf_from_tdigest(digest: np.ndarray, x: float | np.ndarray) -> float | np.ndarray:
+    """Estimate cumulative weight at value ``x`` from a t-digest.
+
+    The value→cumulative-weight inverse of :func:`quantile_from_tdigest`: where
+    that maps a rank fraction to a value, this maps a value to the cumulative
+    *weight* (number of observations) at or below ``x``.  It is the primitive
+    needed to fill evenly-spaced *value* bins from a digest (issue #79).
+
+    Each centroid ``k`` (mean ``m_k``, weight ``w_k``) is placed at the centre
+    of its cumulative-weight span, i.e. at cumulative weight
+    ``cum_before + w_k / 2``.  The CDF interpolates cumulative weight linearly
+    in value-space between adjacent centroid means and is clamped flat outside
+    ``[m_0, m_{k-1}]``, so it is monotonic non-decreasing in ``x`` with
+    endpoints ``0`` (below the first mean) and the total weight (above the
+    last).
+
+    Parameters
+    ----------
+    digest : ndarray, shape (k, 2)
+        Centroid array (mean, weight) as returned by :func:`build_tdigest`.
+    x : float or ndarray
+        Value(s) at which to evaluate the cumulative weight.
+
+    Returns
+    -------
+    float or ndarray
+        Cumulative weight at ``x``, in ``[0, total_weight]``.  Returns NaN
+        (matching the shape of ``x``) for an empty digest.
+
+    Notes
+    -----
+    Returns a scalar ``float`` for scalar ``x`` and an ``ndarray`` (float64)
+    for array ``x``.
+    """
+    x_arr = np.asarray(x, dtype=np.float64)
+    scalar = x_arr.ndim == 0
+
+    if len(digest) == 0:
+        out = np.full(x_arr.shape, np.nan, dtype=np.float64)
+        return float(out) if scalar else out
+
+    means = np.asarray(digest[:, 0], dtype=np.float64)
+    weights = np.asarray(digest[:, 1], dtype=np.float64)
+    total = float(weights.sum())
+
+    # Cumulative weight at each centroid's centre: cum_before + w/2.
+    cum_upper = np.cumsum(weights)
+    cum_center = cum_upper - weights / 2.0
+
+    # Single centroid (or all-equal means): step from 0 to total at the mean.
+    if len(means) == 1:
+        out = np.where(x_arr >= means[0], total, 0.0)
+        return float(out) if scalar else out.astype(np.float64)
+
+    # Piecewise-linear interpolation of cumulative weight over centroid means.
+    # np.interp clamps to the endpoint values outside [means[0], means[-1]],
+    # giving the flat 0 / total tails.
+    out = np.interp(x_arr, means, cum_center, left=0.0, right=total)
+    return float(out) if scalar else out
