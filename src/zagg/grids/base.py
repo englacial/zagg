@@ -7,8 +7,8 @@ storage-block mapping, footprint geometry, and Zarr template emission.
 Terminology
 -----------
 - **leaf id** — the high-precision spatial identifier returned by ``assign``.
-  Grid-specific (HEALPix: order-18 morton; rectilinear: flat row-major cell
-  index). Pipeline code treats it as an opaque integer.
+  Grid-specific (HEALPix: morton at the grid's reference order; rectilinear:
+  flat row-major cell index). Pipeline code treats it as an opaque integer.
 - **cell id** — the aggregation-grid identifier returned by ``cells_of`` and
   ``children``. For some grids (rectilinear) leaf id and cell id coincide.
 - **shard key** — the write-partition identifier returned by ``shard_of``.
