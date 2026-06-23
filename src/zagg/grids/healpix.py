@@ -289,13 +289,22 @@ class HealpixGrid:
             spec = base.with_data_type(dtype).with_fill_value(fill)
             sig = get_output_signature(meta)
             if sig["resolution"] == "chunk":
-                # A resolution: chunk field (issue #30 item 2) is stored once per
-                # chunk in a companion array shaped at the chunk grid, indexed by
-                # block_index (the parent nested cell id).
-                members[name] = chunk_array_spec(
-                    spec,
-                    chunk_grid_shape=self.chunk_grid_shape,
-                    chunk_dims=("chunks",),
+                # A resolution: chunk field (issues #30 item 2, #82) is stored once
+                # per chunk in a companion array shaped at the chunk grid, indexed by
+                # block_index (the parent nested cell id). Compose the two helpers:
+                # chunk_array_spec sets the chunk-grid base, then vector_array_spec
+                # appends the field's trailing_shape (chunked whole) for a vector
+                # companion. A scalar/ragged field has an empty trailing_shape, so
+                # vector_array_spec returns the chunk base unchanged.
+                members[name] = vector_array_spec(
+                    chunk_array_spec(
+                        spec,
+                        chunk_grid_shape=self.chunk_grid_shape,
+                        chunk_dims=("chunks",),
+                    ),
+                    sig,
+                    base_dims=("chunks",),
+                    base_chunk_shape=(1,),
                 )
                 continue
             # A vector field (issue #29) gets a trailing payload dim chunked

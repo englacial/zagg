@@ -1497,6 +1497,139 @@ class TestChunkResolutionCompanion:
             write_dataframe_to_zarr(carrier, store, grid=grid, chunk_idx=chunk_idx)
 
 
+class TestVectorChunkResolutionCompanion:
+    """Issue #82: a ``kind: vector`` ``resolution: chunk`` field stores ONE
+    trailing-shaped vector per chunk (companion shape = chunk grid + trailing,
+    chunked whole on trailing), indexed by ``grid.block_index``."""
+
+    @staticmethod
+    def _vec_chunk_cfg(base_name, width=8):
+        from zagg.config import PipelineConfig
+
+        cfg = default_config(base_name)
+        agg = {
+            "coordinates": cfg.aggregation.get("coordinates", {}),
+            "chunk_precompute": {
+                "chunk_profile": {
+                    "expression": f"np.arange({width}).astype('float32')",
+                    "source": "h_li",
+                }
+            },
+            "variables": {
+                "count": {"function": "len", "source": "h_li"},
+                "profile_h": {
+                    "kind": "vector",
+                    "trailing_shape": width,
+                    "expression": "chunk_profile",
+                    "source": "h_li",
+                    "resolution": "chunk",
+                },
+            },
+        }
+        return PipelineConfig(data_source=cfg.data_source, aggregation=agg, output=cfg.output)
+
+    def test_healpix_vector_companion_shape_and_index(self):
+        from mortie import geo2mort
+
+        width = 8
+        cfg = self._vec_chunk_cfg("atl06", width=width)
+        parent_order, child_order = 2, 4
+        grid = HealpixGrid(parent_order, child_order, layout="fullsphere", config=cfg)
+        store = MemoryStore()
+        grid.emit_template(store)
+
+        group = open_group(store=store, mode="r", path=str(child_order))
+        n_chunks = HEALPIX_BASE_CELLS * 4**parent_order
+        # Companion shape = (n_chunks, width); trailing chunked whole.
+        assert group["profile_h"].shape == (n_chunks, width)
+        assert group["profile_h"].chunks == (1, width)
+        assert grid.spec().members["profile_h"].dimension_names == ("chunks", "vector")
+
+        parent = int(geo2mort(-78.5, -132.0, order=parent_order)[0])
+        n = len(grid.children(parent))
+        profile = np.arange(width, dtype="float32")
+        # Every populated cell carries the same chunk vector (chunk-uniform).
+        stats = {
+            "count": np.zeros(n, dtype="float32"),
+            "profile_h": np.tile(profile, (n, 1)).astype("float32"),
+        }
+        carrier = _build_output(
+            stats, get_data_vars(cfg), get_agg_fields(cfg), grid, parent, use_arrow=True
+        )
+        chunk_idx = grid.block_index(parent)
+        write_dataframe_to_zarr(carrier, store, grid=grid, chunk_idx=chunk_idx)
+
+        rgroup = open_group(store=store, mode="r", path=str(child_order))
+        companion = rgroup["profile_h"][:]
+        # Exactly one chunk row written with the profile; the rest NaN.
+        np.testing.assert_array_equal(companion[chunk_idx[0]], profile)
+        other = np.delete(companion, chunk_idx[0], axis=0)
+        assert np.all(np.isnan(other))
+
+    def test_rectilinear_vector_companion_shape_and_index(self):
+        from zagg.grids import RectilinearGrid
+
+        width = 5
+        cfg = self._vec_chunk_cfg("atl06", width=width)
+        grid = RectilinearGrid(
+            crs="EPSG:3031",
+            resolution=100000.0,
+            bounds=[-400000, -400000, 400000, 400000],
+            chunk_shape=(4, 4),
+            config=cfg,
+        )
+        store = MemoryStore()
+        grid.emit_template(store)
+        group = open_group(store=store, mode="r", path="rectilinear")
+        assert group["profile_h"].shape == (grid.n_row_blocks, grid.n_col_blocks, width)
+        assert group["profile_h"].chunks == (1, 1, width)
+
+        shard_key = grid._pack(1, 1)
+        n = len(grid.children(shard_key))
+        profile = (np.arange(width) + 0.5).astype("float32")
+        stats = {
+            "count": np.zeros(n, dtype="float32"),
+            "profile_h": np.tile(profile, (n, 1)).astype("float32"),
+        }
+        carrier = _build_output(
+            stats, get_data_vars(cfg), get_agg_fields(cfg), grid, shard_key, use_arrow=True
+        )
+        chunk_idx = grid.block_index(shard_key)
+        write_dataframe_to_zarr(carrier, store, grid=grid, chunk_idx=chunk_idx)
+
+        rgroup = open_group(store=store, mode="r", path="rectilinear")
+        companion = rgroup["profile_h"][:]
+        np.testing.assert_array_equal(companion[1, 1], profile)
+        # Only one (rb, cb) row written.
+        written = ~np.all(np.isnan(companion), axis=2)
+        assert np.count_nonzero(written) == 1
+
+    def test_per_cell_varying_vector_raises(self):
+        """A vector chunk field whose populated cells carry DIFFERENT vectors is a
+        misconfiguration -> clear non-uniform error (per-element over trailing)."""
+        from mortie import geo2mort
+
+        width = 4
+        cfg = self._vec_chunk_cfg("atl06", width=width)
+        grid = HealpixGrid(2, 4, layout="fullsphere", config=cfg)
+        store = MemoryStore()
+        grid.emit_template(store)
+        parent = int(geo2mort(-78.5, -132.0, order=2)[0])
+        n = len(grid.children(parent))
+        stats = {
+            "count": np.zeros(n, dtype="float32"),
+            "profile_h": np.full((n, width), np.nan, dtype="float32"),
+        }
+        stats["profile_h"][0] = np.arange(width)
+        stats["profile_h"][1] = np.arange(width) + 1.0  # differs in the trailing axis
+        carrier = _build_output(
+            stats, get_data_vars(cfg), get_agg_fields(cfg), grid, parent, use_arrow=True
+        )
+        chunk_idx = grid.block_index(parent)
+        with pytest.raises(ValueError, match="not chunk-uniform"):
+            write_dataframe_to_zarr(carrier, store, grid=grid, chunk_idx=chunk_idx)
+
+
 # ---------------------------------------------------------------------------
 # Structured filters in the read path (issue #43, Phase A)
 # ---------------------------------------------------------------------------

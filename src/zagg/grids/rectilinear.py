@@ -371,13 +371,22 @@ class RectilinearGrid:
             spec = base.with_data_type(dtype).with_fill_value(fill)
             sig = get_output_signature(meta)
             if sig["resolution"] == "chunk":
-                # A resolution: chunk field (issue #30 item 2) is stored once per
-                # chunk in a companion array shaped at the chunk grid (row-major
-                # chunk index), indexed by block_index = (rb, cb).
-                members[name] = chunk_array_spec(
-                    spec,
-                    chunk_grid_shape=self.chunk_grid_shape,
-                    chunk_dims=("chunk_y", "chunk_x"),
+                # A resolution: chunk field (issues #30 item 2, #82) is stored once
+                # per chunk in a companion array shaped at the chunk grid (row-major
+                # chunk index), indexed by block_index = (rb, cb). Compose the two
+                # helpers: chunk_array_spec sets the chunk-grid base, then
+                # vector_array_spec appends the field's trailing_shape (chunked whole)
+                # for a vector companion. A scalar/ragged field has an empty
+                # trailing_shape, so vector_array_spec returns the chunk base.
+                members[name] = vector_array_spec(
+                    chunk_array_spec(
+                        spec,
+                        chunk_grid_shape=self.chunk_grid_shape,
+                        chunk_dims=("chunk_y", "chunk_x"),
+                    ),
+                    sig,
+                    base_dims=("chunk_y", "chunk_x"),
+                    base_chunk_shape=(1, 1),
                 )
                 continue
             # A vector field (issue #29) gets a trailing payload dim chunked
