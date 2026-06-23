@@ -17,6 +17,7 @@ from zagg.config import (
     get_agg_fields,
     get_output_signature,
 )
+from zagg.csr import write_csr
 from zagg.grids.morton import is_morton_array, morton_words
 
 
@@ -178,6 +179,70 @@ def write_dataframe_to_zarr(
                     )
             array.set_block_selection(block_idx, values)
 
+    return store
+
+
+def write_ragged_to_zarr(
+    ragged: dict,
+    store: Store,
+    *,
+    grid,
+    shard_key: int,
+) -> Store:
+    """Write a shard's ``kind: ragged`` (CSR) fields to the Zarr store (issue #48).
+
+    Mirrors the :func:`write_dataframe_to_zarr` seam for the dense path: the
+    worker collects the per-cell variable-length payloads (a ``kind: ragged``
+    field has no fixed per-cell width, so it cannot ride the dense block writer),
+    and this function persists them via :func:`zagg.csr.write_csr` — one CSR group
+    (``values`` / ``offsets`` / ``cell_ids``) per field per shard.
+
+    Store layout (the contract the ``readers/tdigest_tensor.py`` reader consumes)::
+
+        {group_path}/{field}/{shard_key}/values
+        {group_path}/{field}/{shard_key}/offsets
+        {group_path}/{field}/{shard_key}/cell_ids
+
+    ``cell_ids[k]`` is each populated cell's position in the chunk's ``children``
+    block (the index collected by ``process_shard``); the per-shard subgroup name
+    is the ``shard_key`` (the coverage cell's morton id for HEALPix), recovered by
+    the reader directly from the store.
+
+    Parameters
+    ----------
+    ragged : dict
+        ``{field_name: (values_list, cell_ids)}`` as filled by ``process_shard``'s
+        ``ragged_out`` sink. Empty (or all-empty payloads) writes empty CSR arrays
+        (``write_csr`` skips empties), so a shard with no ragged data is a clean
+        no-op rather than a special case.
+    store : Store
+        Zarr-compatible store.
+    grid : OutputGrid
+        Provides ``group_path`` for routing the write (and ``config`` for the
+        per-field dtype).
+    shard_key : int
+        Shard identifier; the CSR subgroup name (one chunk per shard at cell
+        resolution).
+
+    Returns
+    -------
+    Store
+        The same store, with the ragged CSR arrays written.
+    """
+    if not ragged:
+        return store
+    agg_fields = get_agg_fields(grid.config) if getattr(grid, "config", None) else {}
+    shard_key = int(shard_key)
+    for name, (values_list, cell_ids) in ragged.items():
+        sig = get_output_signature(agg_fields[name]) if name in agg_fields else {}
+        dtype = sig.get("dtype") or "float32"
+        write_csr(
+            store,
+            f"{grid.group_path}/{name}/{shard_key}",
+            values_list,
+            cell_ids,
+            dtype=dtype,
+        )
     return store
 
 

@@ -30,6 +30,7 @@ from zagg.processing import (
     calculate_cell_statistics,
     process_shard,
     write_dataframe_to_zarr,
+    write_ragged_to_zarr,
 )
 
 
@@ -441,6 +442,146 @@ class TestRaggedPayloads:
         assert result["h_min"] == 1.0
         assert result["h_edges"].shape == (2,)
         assert result["h_raw"].shape == (3, 1)
+
+
+class TestRaggedCsrWrite:
+    """Issue #48 phase 4b: cell-resolution ragged (CSR) fields are threaded out of
+    ``process_shard`` via ``ragged_out`` and persisted by ``write_ragged_to_zarr``,
+    then read back through the standard ``read_csr`` layout the tensor reader
+    consumes (``{group_path}/{field}/{shard_key}/values|offsets|cell_ids``)."""
+
+    @staticmethod
+    def _ragged_cfg():
+        """One ragged field (sorted per-cell h_li) plus a scalar, on a 'g' group."""
+        from zagg.config import PipelineConfig
+
+        return PipelineConfig(
+            data_source={"groups": ["g"]},
+            aggregation={
+                "variables": {
+                    "h_min": {"function": "min", "source": "h_li", "dtype": "float32"},
+                    "h_raw": {
+                        "function": "np.sort",
+                        "source": "h_li",
+                        "kind": "ragged",
+                        "inner_shape": [1],
+                        "dtype": "float32",
+                    },
+                }
+            },
+        )
+
+    def _patch_reads(self, monkeypatch, df):
+        """Return ``df`` for the first group read, then ``None`` (one granule)."""
+        calls = {"n": 0}
+
+        def one_shot(*args, **kwargs):
+            calls["n"] += 1
+            return df if calls["n"] == 1 else None
+
+        monkeypatch.setattr("zagg.processing._read_group", one_shot)
+        monkeypatch.setattr("zagg.processing.h5coro.H5Coro", lambda *a, **k: object())
+        monkeypatch.setattr("zagg.processing._make_url_rewriter", lambda driver: lambda u: u)
+
+    @staticmethod
+    def _shard_grid(cfg):
+        """A fullsphere HEALPix grid + a valid (nonzero-morton) shard key."""
+        from mortie import geo2mort
+
+        grid = HealpixGrid(6, 8, layout="fullsphere", config=cfg)
+        shard_key = int(geo2mort(-78.5, -132.0, order=6)[0])
+        return grid, shard_key
+
+    def test_ragged_out_collects_payloads_and_indices(self, monkeypatch):
+        """``ragged_out`` is filled with ``(values_list, cell_ids)`` for each ragged
+        field — one entry per *populated* cell, at the cell's chunk position."""
+        cfg = self._ragged_cfg()
+        grid, shard_key = self._shard_grid(cfg)
+        # Build a read whose photons fall into two distinct child cells of the shard.
+        children = grid.children(shard_key)
+        c0, c1 = int(children[0]), int(children[5])
+        df = pd.DataFrame(
+            {
+                "h_li": np.array([3.0, 1.0, 2.0, 9.0], dtype=np.float32),
+                "leaf_id": np.array([c0, c0, c1, c1], dtype=np.uint64),
+            }
+        )
+        self._patch_reads(monkeypatch, df)
+
+        ragged: dict = {}
+        df_out, meta = process_shard(
+            grid, shard_key, ["s3://x"], s3_credentials={}, config=cfg, ragged_out=ragged
+        )
+        # 2-tuple return preserved; ragged delivered out-of-band.
+        assert isinstance(df_out, pd.DataFrame)
+        assert "h_raw" in ragged
+        values_list, cell_ids = ragged["h_raw"]
+        # Two populated cells; their payloads are the per-cell sorted h_li.
+        assert len(values_list) == 2 and len(cell_ids) == 2
+        assert cell_ids == [0, 5]
+        np.testing.assert_array_equal(values_list[0].reshape(-1), [1.0, 3.0])
+        np.testing.assert_array_equal(values_list[1].reshape(-1), [2.0, 9.0])
+
+    def test_ragged_out_none_is_byte_identical(self, monkeypatch):
+        """Passing no ``ragged_out`` (the default) is byte-for-byte the old path:
+        the dense return is unchanged and no CSR collection escapes."""
+        cfg = self._ragged_cfg()
+        grid, shard_key = self._shard_grid(cfg)
+        children = grid.children(shard_key)
+        df = pd.DataFrame(
+            {
+                "h_li": np.array([3.0, 1.0], dtype=np.float32),
+                "leaf_id": np.array([int(children[0])] * 2, dtype=np.uint64),
+            }
+        )
+        self._patch_reads(monkeypatch, df)
+        result = process_shard(grid, shard_key, ["s3://x"], s3_credentials={}, config=cfg)
+        # Still a 2-tuple; the dense carrier is a DataFrame (ragged excluded).
+        assert len(result) == 2
+        assert isinstance(result[0], pd.DataFrame)
+
+    def test_end_to_end_write_then_read_csr(self, monkeypatch):
+        """Full path: process_shard → write_ragged_to_zarr → read_csr returns the
+        per-cell payloads at the ``{group_path}/{field}/{shard_key}`` CSR layout."""
+        from zarr.storage import MemoryStore
+
+        from zagg.csr import iter_csr_cells, read_csr
+
+        cfg = self._ragged_cfg()
+        grid, shard_key = self._shard_grid(cfg)
+        children = grid.children(shard_key)
+        c0, c1 = int(children[1]), int(children[3])
+        df = pd.DataFrame(
+            {
+                "h_li": np.array([5.0, 4.0, 7.0], dtype=np.float32),
+                "leaf_id": np.array([c0, c0, c1], dtype=np.uint64),
+            }
+        )
+        self._patch_reads(monkeypatch, df)
+
+        store = MemoryStore()
+        ragged: dict = {}
+        process_shard(grid, shard_key, ["s3://x"], s3_credentials={}, config=cfg, ragged_out=ragged)
+        write_ragged_to_zarr(ragged, store, grid=grid, shard_key=shard_key)
+
+        csr = read_csr(store, f"{grid.group_path}/h_raw/{shard_key}")
+        cells = dict(iter_csr_cells(csr))
+        # Cell positions 1 and 3 are populated; their payloads are the sorted h_li.
+        assert sorted(cells) == [1, 3]
+        np.testing.assert_array_equal(cells[1].reshape(-1), [4.0, 5.0])
+        np.testing.assert_array_equal(cells[3].reshape(-1), [7.0])
+        # The values array carries the declared dtype.
+        assert csr["values"].dtype == np.dtype("float32")
+
+    def test_write_ragged_empty_is_noop(self):
+        """An empty ``ragged`` dict writes nothing and returns the store."""
+        from zarr.storage import MemoryStore
+
+        cfg = self._ragged_cfg()
+        grid, _shard_key = self._shard_grid(cfg)
+        store = MemoryStore()
+        out = write_ragged_to_zarr({}, store, grid=grid, shard_key=0)
+        assert out is store
 
 
 class TestBuildGroups:

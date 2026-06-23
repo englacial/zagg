@@ -46,7 +46,7 @@ from zagg.dispatch import (
     PreflightReport,
     dispatch,
 )
-from zagg.processing import process_shard, write_dataframe_to_zarr
+from zagg.processing import process_shard, write_dataframe_to_zarr, write_ragged_to_zarr
 from zagg.store import open_store
 
 logger = logging.getLogger(__name__)
@@ -295,6 +295,11 @@ def _process_and_write(shard_key, chunk_idx, records, grid,
                        s3_creds, zarr_store, config, driver=None,
                        handoff="pandas"):
     """Process a single shard and write results to store."""
+    # ``ragged_out`` is the out-of-band sink for ``kind: ragged`` (CSR) fields
+    # (issue #48): process_shard fills it with ``{field: (payloads, cell_ids)}``
+    # while still returning the dense ``(df_out, metadata)`` 2-tuple. Empty for a
+    # config with no ragged field, so the CSR write below no-ops.
+    ragged_out: dict = {}
     df_out, metadata = process_shard(
         grid,
         int(shard_key),
@@ -303,6 +308,7 @@ def _process_and_write(shard_key, chunk_idx, records, grid,
         config=config,
         driver=driver,
         handoff=handoff,
+        ragged_out=ragged_out,
     )
     # write_dataframe_to_zarr no-ops on an empty carrier (DataFrame or Arrow
     # table), so no carrier-specific emptiness check is needed here.
@@ -310,6 +316,13 @@ def _process_and_write(shard_key, chunk_idx, records, grid,
         df_out, zarr_store,
         grid=grid,
         chunk_idx=chunk_idx,
+    )
+    # Persist any ragged (CSR) fields at cell resolution — one CSR group per field
+    # per shard (issue #48). No-ops cleanly when ``ragged_out`` is empty.
+    write_ragged_to_zarr(
+        ragged_out, zarr_store,
+        grid=grid,
+        shard_key=int(shard_key),
     )
     return metadata
 

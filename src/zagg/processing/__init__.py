@@ -66,6 +66,7 @@ from zagg.processing.write import (
     _chunk_uniform_value,
     _iter_carrier_columns,
     write_dataframe_to_zarr,
+    write_ragged_to_zarr,
 )
 
 # The four public entry points the package commits to, plus every previously
@@ -82,6 +83,7 @@ __all__ = [
     "process_morton_cell",
     "process_shard",
     "write_dataframe_to_zarr",
+    "write_ragged_to_zarr",
     # aggregate-stage helpers
     "_KERNEL_FUNCS",
     "_build_groups",
