@@ -160,9 +160,20 @@ class TestPackageConsistency:
         import tomllib
 
         config = tomllib.loads((REPO_ROOT / "pyproject.toml").read_text())
-        dep = next(d for d in config["project"]["optional-dependencies"]["lambda"]
-                   if d.startswith(f"{pkg}=="))
+        dep = next(
+            d
+            for d in config["project"]["optional-dependencies"]["lambda"]
+            if d.startswith(f"{pkg}==")
+        )
         return dep.split("==", 1)[1]
+
+    @staticmethod
+    def _core_floor(pkg):
+        import tomllib
+
+        config = tomllib.loads((REPO_ROOT / "pyproject.toml").read_text())
+        dep = next(d for d in config["project"]["dependencies"] if d.startswith(f"{pkg}>="))
+        return dep.split(">=", 1)[1]
 
     @staticmethod
     def _pinned_in_script(pkg, script_path):
@@ -190,3 +201,13 @@ class TestPackageConsistency:
     def test_h5coro_version_consistent(self):
         """Lambda [extra] and the build script must pin the same h5coro version."""
         self._assert_lockstep("h5coro", "build_layer.sh")
+
+    def test_h5coro_lambda_pin_satisfies_core_floor(self):
+        """The [lambda] exact pin must not fall below the core h5coro floor."""
+        from packaging.version import Version
+
+        lambda_pin = Version(self._lambda_extra_pin("h5coro"))
+        core_floor = Version(self._core_floor("h5coro"))
+        assert lambda_pin >= core_floor, (
+            f"[lambda] pins h5coro=={lambda_pin} but core requires h5coro>={core_floor}"
+        )
