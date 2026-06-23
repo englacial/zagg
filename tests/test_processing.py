@@ -4218,12 +4218,20 @@ class TestProcessShardCacheRelease:
         assert len(clears) == 2
 
     def test_retained_data_survives_cache_clear(self, monkeypatch):
-        """Copy-before-clear correctness: the stub backs its returned arrays with
-        memoryviews into a buffer it ZEROES on ``close()``. If anything retained in
-        ``all_reads`` were a view into that buffer (rather than a numpy boolean-mask
-        copy), the aggregation output would be corrupted after the release. Assert
-        the output reflects the ORIGINAL bytes, proving the retained columns are
-        copies."""
+        """End-to-end copy-before-clear: drive the full ``process_shard`` loop with a
+        stub that hands out buffer-backed views (as real h5coro does — memoryviews
+        into 4 MB cache lines) and ZEROES every buffer on ``close()`` (the
+        per-granule release simulating cache-line eviction). Assert the aggregation
+        output reflects the ORIGINAL bytes — the worker's retained data is detached
+        from the cache before the release fires, so per-granule release is safe.
+
+        Note this guards the SYSTEM-LEVEL invariant (the worker's output survives the
+        release), which is what the fix relies on. It is a two-layer guarantee:
+        ``_read_group`` builds columns by boolean-mask indexing (a numpy copy) AND
+        ``pd.DataFrame``/``pa.table`` copy their numpy inputs at construction. A test
+        on a DataFrame-returning helper cannot isolate the read-site layer (pandas
+        copies regardless), so this asserts the property that actually matters: no
+        retained array references the evicted cache."""
 
         class _ViewBackedH5:
             """Returns memoryview-backed arrays into a private buffer per dataset;
@@ -4260,7 +4268,7 @@ class TestProcessShardCacheRelease:
         )
         # The single cell pooled both photons (h_li = 100, 200) BEFORE the buffer
         # was zeroed; h_min must be the original 100.0, not 0.0 (corrupted) and the
-        # count must be 2. A retained view would read back 0.0 here.
+        # count must be 2.
         assert meta["total_obs"] == 2
         assert df_out["count"].to_numpy()[0] == 2
         assert df_out["h_min"].to_numpy()[0] == np.float32(100.0)

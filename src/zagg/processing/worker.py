@@ -225,13 +225,16 @@ def process_shard(
             # ThreadPoolExecutor pinning ``self``, so without an explicit release
             # each granule's ~tens-of-MB HDF5-navigation cache stays resident for
             # the whole loop (~40 granules × ~67 MB ≈ 2.7 GB → Lambda OOM, even for
-            # trivial data volumes). Every array retained in ``all_reads`` is a
-            # boolean-mask copy made in ``_read_group`` (numpy boolean indexing
-            # always copies — never a memoryview into the cache lines), so freeing
-            # the cache here cannot corrupt already-read data. Prefer the upstream
-            # ``close()`` (h5coro 1.0.5's fix/resource-leak branch) and fall back to
-            # ``cache.clear()`` on 1.0.4; the ``hasattr`` guard keeps this
-            # forward-compatible without bumping the h5coro pin.
+            # trivial data volumes). Nothing retained in ``all_reads`` aliases the
+            # cache lines: ``_read_group`` builds every column by boolean indexing
+            # (a numpy copy) and returns ``pd.DataFrame(data_dict)`` (which copies
+            # its numpy inputs into managed blocks), so freeing the cache here
+            # cannot corrupt already-read data. The pinned h5coro 1.0.4 has
+            # ``close()`` (it does ``cache.clear()`` + ``cache_locks.clear()`` +
+            # ``driver.close()``), so that is the live path; the ``cache.clear()``
+            # branch is a defensive fallback for any build lacking ``close()``. The
+            # ``hasattr`` guard keeps this forward-compatible without bumping the
+            # h5coro pin.
             if h5obj is not None:
                 try:
                     if hasattr(h5obj, "close"):
