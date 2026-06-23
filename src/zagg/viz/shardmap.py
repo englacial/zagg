@@ -1,11 +1,11 @@
-"""Headless render core for the shard-map viewer (issue #38, phase 1).
+"""Headless render core for the shard-map viewer (issue #38).
 
 Pure Python: turns a :class:`~zagg.catalog.shardmap.ShardMap` (and an optional
 :class:`~zagg.catalog.sources.Catalog`) into GeoJSON ``FeatureCollection`` dicts
 in WGS84. No browser, no ipyleaflet -- everything here is unit-testable with
 just the core deps (``shapely`` + the grid backends).
 
-Three layers are produced:
+Two layers are produced:
 
 - :func:`shard_outlines` -- one polygon feature per shard, straight off
   ``grid.shard_footprint(key)``. The grid is reconstructed from the map's own
@@ -13,12 +13,6 @@ Three layers are produced:
   needed.
 - :func:`granule_footprints` -- one polygon feature per granule footprint,
   decoded from a ``Catalog`` (``granule_records``).
-- :func:`viewport_cells` -- the grid-on-zoom layer clipped to a viewport bbox,
-  emitted **only** when ``<= max_shards`` shards intersect the viewport (the
-  gate -- never a global graticule, issue #38). For HEALPix this is the finer
-  **child cells at ``child_order``** nesting inside the visible shards (generated
-  viewport-bounded via ``mortie.morton_coverage``, not by per-shard fan-out);
-  for other grids it is the shard footprint clipped to the viewport.
 
 Antimeridian handling
 ---------------------
@@ -44,9 +38,9 @@ _ANTIMERIDIAN_SPAN = 180.0
 def grid_from_signature(signature: dict):
     """Reconstruct an output grid from a ``ShardMap.grid_signature``.
 
-    The viewer only needs ``shard_footprint`` / ``children`` off the grid, both
-    of which are fully determined by the signature -- so the map is
-    self-describing and no separate config is required.
+    The viewer only needs ``shard_footprint`` off the grid, which is fully
+    determined by the signature -- so the map is self-describing and no separate
+    config is required.
 
     Parameters
     ----------
@@ -156,51 +150,6 @@ def _split_antimeridian(geom):
     return {"type": "MultiPolygon", "coordinates": parts}
 
 
-def _seam_safe_polygon(geom):
-    """Cut a seam-crossing Polygon into hemisphere-local parts (shapely).
-
-    Returns a shapely Polygon/MultiPolygon already in ``[-180, 180]`` -- the
-    same unwrap (+360) / clip / rewrap as :func:`_split_antimeridian`, but
-    returning geometry instead of a GeoJSON dict so callers can keep clipping or
-    measuring it. A polygon that doesn't cross the seam is returned unchanged.
-
-    This must run **before** any ``box`` clip on a HEALPix child cell: a cell
-    straddling +-180 comes back from ``mort2polygon`` as a flat ring spanning
-    ~360 deg (e.g. ``-179.98 ... 180``), so intersecting that band with a
-    viewport box is meaningless -- the cell would vanish or mis-clip (PR #44).
-    """
-    from shapely.geometry import MultiPolygon, Polygon, box
-
-    if not _crosses_antimeridian(geom):
-        return geom
-
-    def _unwrap(ring):
-        return [[lon + 360.0 if lon < 0 else lon, lat] for lon, lat in _ring_list(ring)]
-
-    poly = Polygon(_unwrap(geom.exterior), [_unwrap(r) for r in geom.interiors])
-    if not poly.is_valid:
-        poly = poly.buffer(0)
-
-    parts: list = []
-    for clip, shift in (
-        (box(-180.0, -90.0, 180.0, 90.0), 0.0),
-        (box(180.0, -90.0, 540.0, 90.0), -360.0),
-    ):
-        piece = poly.intersection(clip)
-        for sub in getattr(piece, "geoms", [piece]):
-            if sub.is_empty or sub.geom_type != "Polygon":
-                continue
-            rings = [
-                [[lon + shift, lat] for lon, lat in _ring_list(r)]
-                for r in (sub.exterior, *sub.interiors)
-            ]
-            parts.append(Polygon(rings[0], rings[1:]))
-
-    if not parts:
-        return geom
-    return parts[0] if len(parts) == 1 else MultiPolygon(parts)
-
-
 def _polygon_rings(geom, *, shift: float = 0.0) -> list[list[list[float]]]:
     """GeoJSON ring list ``[exterior, *interiors]`` for a Polygon, lon-shifted."""
     rings = [geom.exterior, *geom.interiors]
@@ -246,27 +195,6 @@ def _polygon_geometry(geom, *, split_seam: bool = True) -> dict:
     if geom.geom_type == "Polygon":
         return _split_antimeridian(geom)
     raise ValueError(f"unsupported geometry type for GeoJSON: {geom.geom_type}")
-
-
-def _polygonal(geom):
-    """Reduce an intersection result to Polygon/MultiPolygon, or None.
-
-    A clip can degenerate to a point/line on a shared edge or yield a
-    ``GeometryCollection`` mixing dimensions; keep only the polygonal part.
-    """
-    if geom.is_empty:
-        return None
-    if geom.geom_type in ("Polygon", "MultiPolygon"):
-        return geom
-    if geom.geom_type == "GeometryCollection":
-        from shapely.geometry import MultiPolygon
-
-        polys = [g for g in geom.geoms if g.geom_type in ("Polygon", "MultiPolygon")]
-        if not polys:
-            return None
-        merged = MultiPolygon([p for g in polys for p in getattr(g, "geoms", [g])])
-        return merged
-    return None
 
 
 def _feature(geometry: dict, properties: dict) -> dict:
@@ -348,231 +276,11 @@ def granule_footprints(catalog, *, split_seam: bool = True) -> dict:
     return _collection(features)
 
 
-class ShardIndex:
-    """One-time shard-footprint index for fast viewport queries (issue #38).
-
-    Building a shard footprint is not free -- on HEALPix it is
-    ``mortie.tools.mort2polygon`` per key. The interactive viewer re-queries on
-    every pan/zoom, so regenerating all footprints per event freezes the kernel.
-    This builds the ``(key, footprint)`` list **once** and indexes the
-    footprints in a shapely ``STRtree``; :meth:`query` then answers a viewport
-    in ``O(log N + k)`` instead of ``O(N)`` footprint rebuilds.
-    """
-
-    def __init__(self, shardmap):
-        from shapely import STRtree
-
-        grid = grid_from_signature(shardmap.grid_signature)
-        self.keys = list(shardmap.shard_keys)
-        self.footprints = [grid.shard_footprint(k) for k in self.keys]
-        self._tree = STRtree(self.footprints)
-
-    def query(self, view):
-        """``[(key, footprint)]`` whose footprint truly intersects ``view``.
-
-        The ``STRtree`` returns bbox-overlap candidates; each is refined with a
-        precise ``footprint.intersects(view)`` so the result matches the old
-        exhaustive scan exactly.
-        """
-        out = []
-        for i in self._tree.query(view):
-            fp = self.footprints[i]
-            if fp.intersects(view):
-                out.append((self.keys[i], fp))
-        return out
-
-
-# Cache one ShardIndex per shardmap object so repeated viewport queries (and the
-# back-compat viewport_cells path) never rebuild footprints. Keyed by id() and
-# guarded by a weak ref so a collected shardmap drops its entry.
-_INDEX_CACHE: dict = {}
-
-
-def shard_index(shardmap) -> ShardIndex:
-    """Return a cached :class:`ShardIndex` for ``shardmap`` (built once)."""
-    import weakref
-
-    key = id(shardmap)
-    entry = _INDEX_CACHE.get(key)
-    if entry is not None:
-        return entry[0]
-
-    index = ShardIndex(shardmap)
-
-    def _drop(_ref, key=key):
-        _INDEX_CACHE.pop(key, None)
-
-    try:
-        ref = weakref.ref(shardmap, _drop)
-    except TypeError:
-        ref = None  # not weak-referenceable; entry simply lingers
-    _INDEX_CACHE[key] = (index, ref)
-    return index
-
-
-# Edge samples per side for a child-cell polygon. Child cells are small
-# near-squares, so a low step traces them faithfully while keeping each ring --
-# and the GeoJSON shipped over the widget comm -- light. (HealpixGrid.shard_
-# footprint uses step=32 for the much larger parent diamonds.)
-_CHILD_CELL_STEP = 8
-
-
-def _child_cell_polygon(cell):
-    """Polygon (WGS84 lon/lat) for a single HEALPix child cell morton id."""
-    from mortie.tools import mort2polygon
-    from shapely.geometry import Polygon
-
-    verts = mort2polygon(int(cell), step=_CHILD_CELL_STEP)
-    lats = np.array([v[0] for v in verts])
-    lons = np.array([v[1] for v in verts])
-    return Polygon(zip(lons, lats))
-
-
-def _healpix_child_cells(grid, visible_keys, bbox, max_cells):
-    """Child cells at ``child_order`` nesting inside the visible HEALPix shards.
-
-    The grid-on-zoom for HEALPix is the **finer child grid that subdivides each
-    shard** (issue #38) -- not the shard outline redrawn. Children are generated
-    in a **viewport-bounded** way: a single ``mortie.morton_coverage`` query over
-    the viewport bbox at ``child_order`` returns only the child cells overlapping
-    the view, so the count scales with the viewport, not with the
-    ``4^(child_order - parent_order)`` per-shard fan-out. The returned cells are
-    filtered to those whose parent (``clip2order(parent_order, ...)``) is one of
-    the visible shards, so the rendered grid lines up *inside* the shard outlines.
-
-    Returns ``(cells, parents)`` morton-id arrays, or ``None`` when the in-view
-    child count exceeds ``max_cells`` (the analogous gate to ``max_shards`` --
-    keeps a single dense-viewport refresh bounded rather than emitting tens of
-    thousands of polygons).
-    """
-    from mortie import clip2order, morton_coverage
-
-    lon_min, lat_min, lon_max, lat_max = bbox
-    view_lats = np.array([lat_min, lat_min, lat_max, lat_max, lat_min])
-    view_lons = np.array([lon_min, lon_max, lon_max, lon_min, lon_min])
-    cov = np.asarray(morton_coverage([view_lats], [view_lons], order=grid.child_order))
-    if cov.size == 0:
-        return np.empty(0, dtype=np.int64), np.empty(0, dtype=np.int64)
-    parents = clip2order(grid.parent_order, cov)
-    keep = np.isin(parents, np.asarray(list(visible_keys)))
-    cells = cov[keep]
-    if cells.size > max_cells:
-        return None
-    return cells, parents[keep]
-
-
-def viewport_cells(
-    shardmap,
-    bbox,
-    *,
-    max_shards: int = 4,
-    max_cells: int = 2000,
-    split_seam: bool = True,
-    index=None,
-) -> dict:
-    """Grid-on-zoom cell outlines clipped to a viewport, gated on visible shards.
-
-    Implements the "grid-on-zoom" behavior (issue #38): the finer grid is drawn
-    only when ``<= max_shards`` shards intersect ``bbox``. When more shards are
-    visible the viewport is too zoomed-out for a useful grid and an empty
-    collection is returned -- never a global graticule.
-
-    For a **HEALPix** grid the emitted features are the **child cells at
-    ``child_order`` that nest inside the visible shards** -- the grid that
-    subdivides each shard 4-for-1 per order step -- not the shard outline
-    redrawn. They are generated viewport-bounded via a single
-    :func:`mortie.morton_coverage` query at ``child_order`` (so the cell count
-    scales with the viewport, not with the ``4^(child_order - parent_order)``
-    per-shard fan-out), filtered to the visible shards, and clipped to ``bbox``.
-    For any other grid the shard footprint clipped to the viewport is emitted.
-
-    Footprints are taken from a one-time :class:`ShardIndex` (built and cached
-    per shardmap, or passed in via ``index=``), so repeated calls -- e.g. the
-    interactive viewer's per-pan refresh -- never rebuild them.
-
-    Parameters
-    ----------
-    shardmap : ShardMap
-        A built or loaded shard map.
-    bbox : tuple of float
-        Viewport ``(lon_min, lat_min, lon_max, lat_max)`` in WGS84.
-    max_shards : int
-        Maximum number of intersecting shards for the grid to render.
-    max_cells : int
-        Maximum number of in-view HEALPix child cells to render. Above this the
-        viewport is too dense (zoomed out relative to ``child_order``) and an
-        empty collection is returned, keeping a single refresh bounded.
-    split_seam : bool
-        Split polygons crossing +-180 into a ``MultiPolygon``. Set False under a
-        polar-stereographic CRS, where there is no antimeridian seam.
-    index : ShardIndex, optional
-        A prebuilt index to query. When omitted, the cached index for
-        ``shardmap`` is used (:func:`shard_index`).
-
-    Returns
-    -------
-    dict
-        GeoJSON ``FeatureCollection`` of grid outlines clipped to the viewport,
-        or an empty collection when a gate is not met.
-    """
-    from shapely.geometry import box
-
-    if index is None:
-        index = shard_index(shardmap)
-    view = box(bbox[0], bbox[1], bbox[2], bbox[3])
-
-    visible = index.query(view)
-    if not visible or len(visible) > max_shards:
-        return _collection([])
-
-    grid = grid_from_signature(shardmap.grid_signature)
-
-    from zagg.grids import HealpixGrid
-
-    if isinstance(grid, HealpixGrid):
-        visible_keys = {int(key) for key, _ in visible}
-        result = _healpix_child_cells(grid, visible_keys, bbox, max_cells)
-        if result is None:
-            return _collection([])
-        cells, parents = result
-        features = []
-        for cell, parent in zip(cells, parents):
-            poly = _child_cell_polygon(cell)
-            # Cut a seam-crossing cell at +-180 *before* clipping: its flat ring
-            # spans ~360 deg, so a box clip on the unsplit band drops/mis-clips
-            # it (PR #44). Skipped under a polar CRS (no seam there).
-            if split_seam:
-                poly = _seam_safe_polygon(poly)
-            clipped = _polygonal(poly.intersection(view))
-            if clipped is None:
-                continue
-            features.append(
-                _feature(
-                    _polygon_geometry(clipped, split_seam=split_seam),
-                    {"cell": int(cell), "shard_key": int(parent)},
-                )
-            )
-        return _collection(features)
-
-    features = []
-    for key, fp in visible:
-        clipped = _polygonal(fp.intersection(view))
-        if clipped is None:
-            continue
-        features.append(
-            _feature(
-                _polygon_geometry(clipped, split_seam=split_seam),
-                {"shard_key": _jsonable(key)},
-            )
-        )
-    return _collection(features)
-
-
 # ── top-level assembly ───────────────────────────────────────────────────────
 
 
-def render_shardmap(shardmap, catalog=None, *, bbox=None, max_shards: int = 4) -> dict:
-    """Assemble all viewer layers for a shard map into one dict of collections.
+def render_shardmap(shardmap, catalog=None) -> dict:
+    """Assemble the viewer layers for a shard map into one dict of collections.
 
     Parameters
     ----------
@@ -581,25 +289,17 @@ def render_shardmap(shardmap, catalog=None, *, bbox=None, max_shards: int = 4) -
     catalog : Catalog or str, optional
         A ``Catalog`` or a geoparquet path. When given, the granule-footprint
         layer is included.
-    bbox : tuple of float, optional
-        Viewport ``(lon_min, lat_min, lon_max, lat_max)``. When given, the
-        viewport-clipped cell-outline layer is included.
-    max_shards : int
-        Visible-shard gate for the viewport cell layer.
 
     Returns
     -------
     dict
-        ``{"shards": FC, "granules": FC | None, "cells": FC | None}`` where each
-        value is a GeoJSON ``FeatureCollection`` (or ``None`` when its input was
-        not provided).
+        ``{"shards": FC, "granules": FC | None}`` where each value is a GeoJSON
+        ``FeatureCollection`` (or ``None`` when its input was not provided).
     """
     shardmap = _load_shardmap(shardmap)
-    out = {"shards": shard_outlines(shardmap), "granules": None, "cells": None}
+    out = {"shards": shard_outlines(shardmap), "granules": None}
     if catalog is not None:
         out["granules"] = granule_footprints(_load_catalog(catalog))
-    if bbox is not None:
-        out["cells"] = viewport_cells(shardmap, bbox, max_shards=max_shards)
     return out
 
 
@@ -647,8 +347,5 @@ __all__ = [
     "grid_from_signature",
     "shard_outlines",
     "granule_footprints",
-    "viewport_cells",
-    "ShardIndex",
-    "shard_index",
     "render_shardmap",
 ]
