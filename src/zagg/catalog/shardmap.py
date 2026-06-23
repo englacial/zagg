@@ -26,6 +26,7 @@ shapely is no longer an intersection backend -- its WGS84 STRtree path had
 antimeridian/near-pole correctness bugs (#36). shapely remains a dependency for
 WKB decode (``sources.py``) and footprint geometry (``grids/``).
 """
+
 from __future__ import annotations
 
 import importlib
@@ -36,7 +37,17 @@ from typing import Dict, List
 
 import numpy as np
 
+# Resolve the granule-footprint MOC this many HEALPix levels ABOVE the leaf
+# (``child_order``). A few levels coarser than the leaf keeps footprint edges
+# reasonably tight while staying well above the shard order (``parent_order``) --
+# so ``moc_to_order`` never upsamples a footprint onto every shard (#92) -- and
+# comfortably under mortie's order-18 coverage cap (child_order 19 -> order 16).
+# Once mortie lifts that cap (espg/mortie#60) this offset can shrink for tighter
+# edges.
+MOC_LEVELS_BELOW_LEAF = 3
+
 # ── granule footprint helpers ────────────────────────────────────────────────
+
 
 def _to_spherely_polygon(lats, lons):
     """Build a closed sphere-aware polygon, or None on validation failure.
@@ -57,6 +68,39 @@ def _to_spherely_polygon(lats, lons):
         return spherely.create_polygon(shell=list(zip(lons, lats)), oriented=False)
     except (ValueError, RuntimeError):
         return None
+
+
+def _resolve_mortie_order(mortie_order, grid) -> int:
+    """Choose the MOC order for the mortie backend.
+
+    The MOC order must be **>= the shard order** (``parent_order``). A coarser
+    MOC upsamples in ``moc_to_order(moc, parent_order)``: every coarse cell
+    becomes all ``4^(parent_order - order)`` order-``parent_order`` descendants,
+    fattening a thin granule track to fill every shard under that cell. The old
+    fixed default of 8 against ``parent_order=13`` expanded each cell to 1024
+    shards, putting ~every granule in ~every shard and OOMing the workers (#92).
+
+    ``None`` (the default) pins the order to ``child_order -
+    MOC_LEVELS_BELOW_LEAF`` so footprints resolve a few levels above the leaf --
+    tight enough to track the granule yet under mortie's order-18 coverage cap.
+    An explicit ``mortie_order`` is honored but still validated against
+    ``parent_order``. Non-HEALPix grids (no ``parent_order``/``child_order``)
+    keep the legacy default of 8.
+    """
+    is_healpix = hasattr(grid, "parent_order") and hasattr(grid, "child_order")
+    if mortie_order is not None:
+        order = int(mortie_order)
+    elif is_healpix:
+        order = int(grid.child_order) - MOC_LEVELS_BELOW_LEAF
+    else:
+        order = 8
+    if is_healpix and order < grid.parent_order:
+        raise ValueError(
+            f"mortie MOC order {order} is coarser than the grid's parent_order "
+            f"{grid.parent_order}; this upsamples every granule footprint onto all "
+            f"shards under each MOC cell (#92). Use order >= {grid.parent_order}."
+        )
+    return order
 
 
 def _resolve_backend(backend: str, grid) -> str:
@@ -224,6 +268,7 @@ _BACKENDS = {
 
 # ── ShardMap ─────────────────────────────────────────────────────────────────
 
+
 @dataclass
 class ShardMap:
     """Work-distribution manifest: shard key -> granules, tied to one grid.
@@ -259,7 +304,7 @@ class ShardMap:
         *,
         region=None,
         backend: str = "auto",
-        mortie_order: int = 8,
+        mortie_order: int | None = None,
     ) -> "ShardMap":
         """Build a ShardMap from a ``Catalog`` and an output grid.
 
@@ -276,8 +321,11 @@ class ShardMap:
             Geometry backend. ``"auto"`` -> spherely when importable, else
             mortie for HEALPix grids (non-HEALPix grids require spherely and
             raise an ``ImportError`` with an install pointer when it is absent).
-        mortie_order : int
-            MOC order for the mortie backend.
+        mortie_order : int, optional
+            MOC order for the mortie backend. ``None`` (default) pins it to the
+            grid's ``child_order`` (clamped to mortie's order-18 cap) so granule
+            footprints resolve at leaf resolution; a coarser order upsamples
+            every footprint onto all shards (#92). Must be >= ``parent_order``.
 
         Returns
         -------
@@ -293,6 +341,7 @@ class ShardMap:
 
         t0 = time.perf_counter()
         if chosen == "mortie":
+            mortie_order = _resolve_mortie_order(mortie_order, grid)
             shard_to_idx = _intersect_mortie(records, grid, all_shards, order=mortie_order)
         else:
             shard_to_idx = _BACKENDS[chosen](records, grid, all_shards)
@@ -322,12 +371,17 @@ class ShardMap:
         """Write the manifest as JSON."""
         from pathlib import Path
 
-        Path(path).write_text(json.dumps({
-            "metadata": self.metadata,
-            "grid_signature": self.grid_signature,
-            "shard_keys": self.shard_keys,
-            "granules": self.granules,
-        }, indent=2))
+        Path(path).write_text(
+            json.dumps(
+                {
+                    "metadata": self.metadata,
+                    "grid_signature": self.grid_signature,
+                    "shard_keys": self.shard_keys,
+                    "granules": self.granules,
+                },
+                indent=2,
+            )
+        )
 
     @classmethod
     def from_json(cls, path: str) -> "ShardMap":
@@ -338,8 +392,7 @@ class ShardMap:
         for key in ("grid_signature", "shard_keys", "granules"):
             if key not in d:
                 raise ValueError(f"{path}: missing required key {key!r}")
-        return cls(d["grid_signature"], d["shard_keys"], d["granules"],
-                   d.get("metadata", {}))
+        return cls(d["grid_signature"], d["shard_keys"], d["granules"], d.get("metadata", {}))
 
 
 __all__ = ["ShardMap"]
