@@ -486,6 +486,61 @@ def _coerce_ragged_value(value, sig: dict) -> np.ndarray:
     return np.ascontiguousarray(arr)
 
 
+def _pool_chunk_columns(
+    col_arrays: dict[str, np.ndarray],
+    cell_to_slice: dict[int, tuple[int, int]],
+    chunk_children,
+) -> dict[str, np.ndarray]:
+    """Pool a single chunk's observations from the shard's sorted column arrays.
+
+    The shard is read+grouped ONCE (``col_arrays`` sorted by cell id,
+    ``cell_to_slice`` mapping each populated cell to its ``(start, end)`` slice);
+    this gathers only the rows belonging to ``chunk_children`` so a per-chunk
+    reduction (e.g. :func:`_eval_chunk_precompute`, issue #82 phase 6) sees just
+    that Zarr chunk's observations rather than the whole shard's.
+
+    Cells of ``chunk_children`` absent from ``cell_to_slice`` are empty and
+    contribute no rows. The gather index is built once and reused across every
+    column, so the cost is one fancy-index per column over the chunk's rows. An
+    empty chunk (no populated cells) yields length-0 arrays of each column's dtype
+    — :func:`_eval_chunk_precompute` then reduces over empty input, which numpy's
+    nan-aware reducers turn into NaN anchors (not a raise).
+
+    Parameters
+    ----------
+    col_arrays : dict[str, np.ndarray]
+        Shard column arrays, sorted in ascending cell-id order (from
+        :func:`_concat_and_group` / :func:`_group_columns`).
+    cell_to_slice : dict[int, tuple[int, int]]
+        Maps each populated cell id to its ``(start, end)`` slice into
+        ``col_arrays``.
+    chunk_children : sequence of int
+        The chunk's cell ids (canonical order).
+
+    Returns
+    -------
+    dict[str, np.ndarray]
+        ``{name: ndarray}`` holding only this chunk's rows, in the shard's sorted
+        order (concatenated child-slice by child-slice).
+    """
+    slices = []
+    for child in np.asarray(chunk_children):
+        sl = cell_to_slice.get(int(child))
+        if sl is not None:
+            slices.append(sl)
+    if not slices:
+        # Empty chunk: length-0 view per column (dtype-preserving) so a per-chunk
+        # reduction over it yields NaN anchors rather than raising.
+        return {col: arr[:0] for col, arr in col_arrays.items()}
+    if len(slices) == 1:
+        start, end = slices[0]
+        return {col: arr[start:end] for col, arr in col_arrays.items()}
+    # Build the gather index once (the slices are disjoint and already in sorted
+    # order) and reuse it across every column.
+    idx = np.concatenate([np.arange(start, end) for start, end in slices])
+    return {col: arr[idx] for col, arr in col_arrays.items()}
+
+
 def _aggregate_chunk_cells(
     children,
     col_arrays: dict,

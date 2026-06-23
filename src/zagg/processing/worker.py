@@ -35,6 +35,7 @@ from zagg.processing.aggregate import (
     _has_ragged_fields,
     _has_vector_fields,
     _kernel_aggregate,
+    _pool_chunk_columns,
 )
 from zagg.processing.write import _build_output
 from zagg.schema import ProcessingMetadata
@@ -243,9 +244,12 @@ def process_shard(
         )
 
     # ---- Pool the shard's reads ONCE (shared across all K chunks) -------------
-    # ``chunk_scalars`` (chunk_precompute, issue #30 item 1) are reduced once over
-    # the whole shard and reused for every chunk — a chunk-resolution companion is
-    # chunk-uniform, so the same shard-level anchor feeds each chunk's cells.
+    # The shard is read+grouped a single time; only the ``chunk_precompute``
+    # reduction (``chunk_scalars``, issue #30 item 1) moves INTO the per-chunk loop
+    # below (issue #82 phase 6). A ``resolution: chunk`` companion is per Zarr chunk,
+    # so the gain/offset anchor must be reduced over each chunk's own observations,
+    # not the whole pooled shard. At K==1 the lone chunk == the whole shard, so the
+    # anchor is identical to the old shard-level reduction (byte-for-byte unchanged).
     if handoff == "arrow-kernel":
         # EXPERIMENTAL (phase 2b of #30): reduce via pyarrow hash-aggregate kernels.
         if _has_ragged_fields(config):
@@ -263,13 +267,11 @@ def process_shard(
         cell_col = grid.cells_of(table.column("leaf_id").to_numpy(zero_copy_only=False))
         logger.info(f"  Read {n_obs_total:,} observations")
         pooled = {n: table.column(n).to_numpy(zero_copy_only=False) for n in table.column_names}
-        chunk_scalars = _eval_chunk_precompute(config, pooled)
     else:
         # Concat the per-group reads and split observations by cell (carrier-
         # agnostic; both carriers feed identical numpy arrays into _group_columns).
         col_arrays, cell_to_slice, n_obs_total = _concat_and_group(all_reads, grid, handoff)
         logger.info(f"  Read {n_obs_total:,} observations")
-        chunk_scalars = _eval_chunk_precompute(config, col_arrays)
 
     # ---- Aggregate + build one carrier per finer chunk -----------------------
     # ``iter_chunks`` is the K-chunk seam (issue #30 item 3); a minimal grid (e.g.
@@ -290,6 +292,13 @@ def process_shard(
     for block_index, chunk_children in chunk_iter:
         chunk_children = np.asarray(chunk_children)
         if handoff == "arrow-kernel":
+            # Per-chunk precompute (issue #82 phase 6): reduce the anchor over only
+            # this chunk's observations. Subset the pooled columns to the rows whose
+            # destination cell falls in ``chunk_children``; an empty chunk leaves
+            # length-0 arrays, so nan-aware reducers yield NaN anchors (not a raise).
+            chunk_mask = np.isin(cell_col, chunk_children)
+            chunk_pooled = {n: arr[chunk_mask] for n, arr in pooled.items()}
+            chunk_scalars = _eval_chunk_precompute(config, chunk_pooled)
             kernel = _kernel_aggregate(
                 table, cell_col, chunk_children, "h_li", config, chunk_scalars=chunk_scalars
             )
@@ -297,6 +306,10 @@ def process_shard(
             cells_with_data += kernel["cells_with_data"]
             ragged_payloads: dict[str, list] = {}
         else:
+            # Per-chunk precompute (issue #82 phase 6): pool only this chunk's rows
+            # from the shard's sorted column arrays, then reduce the anchor over them.
+            chunk_pooled = _pool_chunk_columns(col_arrays, cell_to_slice, chunk_children)
+            chunk_scalars = _eval_chunk_precompute(config, chunk_pooled)
             stats_arrays, ragged_payloads, ragged_idx, cwd = _aggregate_chunk_cells(
                 chunk_children,
                 col_arrays,
