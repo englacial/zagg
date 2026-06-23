@@ -191,6 +191,7 @@ def process_shard(
 
     # Read files and filter spatially
     for s3_url in granule_urls:
+        h5obj = None
         try:
             resource_path = _rewrite_url(s3_url)
 
@@ -218,6 +219,28 @@ def process_shard(
         except Exception as e:
             logger.warning(f"  Error processing file {s3_url}: {e}")
             continue
+        finally:
+            # Release this granule's h5coro cache before moving on (issue #66).
+            # h5coro caches reads in 4 MB lines with no eviction and leaves a
+            # ThreadPoolExecutor pinning ``self``, so without an explicit release
+            # each granule's ~tens-of-MB HDF5-navigation cache stays resident for
+            # the whole loop (~40 granules × ~67 MB ≈ 2.7 GB → Lambda OOM, even for
+            # trivial data volumes). Every array retained in ``all_reads`` is a
+            # boolean-mask copy made in ``_read_group`` (numpy boolean indexing
+            # always copies — never a memoryview into the cache lines), so freeing
+            # the cache here cannot corrupt already-read data. Prefer the upstream
+            # ``close()`` (h5coro 1.0.5's fix/resource-leak branch) and fall back to
+            # ``cache.clear()`` on 1.0.4; the ``hasattr`` guard keeps this
+            # forward-compatible without bumping the h5coro pin.
+            if h5obj is not None:
+                try:
+                    if hasattr(h5obj, "close"):
+                        h5obj.close()
+                    elif getattr(h5obj, "cache", None) is not None:
+                        h5obj.cache.clear()
+                except Exception:
+                    logger.debug("h5coro cache release failed", exc_info=True)
+            h5obj = None
 
     logger.info(f"  Processed {files_processed}/{len(granule_urls)} files")
     metadata["files_processed"] = files_processed
