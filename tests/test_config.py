@@ -1365,19 +1365,53 @@ class TestResolutionAttribute:
         with pytest.raises(ValueError, match="resolution 'block' is not supported"):
             validate_config(cfg)
 
-    def test_resolution_chunk_vector_rejected(self):
+    def test_vector_field_may_be_resolution_chunk(self):
+        # issue #82: a kind: vector resolution: chunk companion is now accepted;
+        # trailing_shape is validated exactly as for a cell-resolution vector.
         cfg = _cfg_with_field(
             {
                 "kind": "vector",
                 "trailing_shape": 4,
-                "expression": "np.zeros(4)",
+                "expression": "chunk_profile",
                 "resolution": "chunk",
             }
         )
-        with pytest.raises(
-            ValueError, match="resolution 'chunk' is only supported for kind 'scalar'"
-        ):
+        cfg.aggregation["chunk_precompute"] = {
+            "chunk_profile": {"expression": "np.zeros(4)", "source": "h_ph"}
+        }
+        validate_config(cfg)
+        sig = get_output_signature(get_agg_fields(cfg)["f"])
+        assert sig["resolution"] == "chunk"
+        assert sig["kind"] == "vector"
+        assert sig["trailing_shape"] == (4,)
+
+    def test_vector_chunk_still_requires_trailing_shape(self):
+        # The kind-specific validation still applies at chunk resolution.
+        cfg = _cfg_with_field(
+            {"kind": "vector", "expression": "np.zeros(4)", "resolution": "chunk"}
+        )
+        with pytest.raises(ValueError, match="kind 'vector' requires 'trailing_shape'"):
             validate_config(cfg)
+
+    def test_ragged_field_may_be_resolution_chunk(self):
+        # issue #82: a kind: ragged resolution: chunk companion (CSR at chunk
+        # resolution) is accepted; inner_shape is validated as for cell ragged.
+        cfg = _cfg_with_field(
+            {
+                "kind": "ragged",
+                "inner_shape": 2,
+                "expression": "chunk_pairs",
+                "resolution": "chunk",
+            }
+        )
+        cfg.aggregation["chunk_precompute"] = {
+            "chunk_pairs": {"expression": "np.zeros((3, 2))", "source": "h_ph"}
+        }
+        validate_config(cfg)
+        sig = get_output_signature(get_agg_fields(cfg)["f"])
+        assert sig["resolution"] == "chunk"
+        assert sig["kind"] == "ragged"
+        assert sig["inner_shape"] == (2,)
 
     def test_worked_template_offset_gain_are_chunk_resolution(self):
         cfg = default_config("atl03_waveform_chunk")

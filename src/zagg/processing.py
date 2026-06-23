@@ -392,12 +392,17 @@ def write_dataframe_to_zarr(
     for name, values in _iter_carrier_columns(df_out):
         if name in chunk_res_fields:
             # resolution: chunk — the column must be chunk-uniform (every populated
-            # cell carries the same chunk value), so collapse to the single value and
-            # write it to the companion array's one-block-per-chunk grid at
-            # ``chunk_idx`` (which IS ``grid.block_index(shard_key)``). One value per
-            # chunk, no per-cell duplication on disk (issue #30 item 2).
-            chunk_value = _chunk_uniform_value(name, values)
-            block = np.asarray(chunk_value).reshape((1,) * len(chunk_idx))
+            # cell carries the same chunk value), so collapse the CELL axis to the
+            # single value and write it to the companion array's one-block-per-chunk
+            # grid at ``chunk_idx`` (which IS ``grid.block_index(shard_key)``). One
+            # value per chunk, no per-cell duplication on disk (issues #30 item 2, #82).
+            # A vector companion keeps its ``trailing`` shape: the block is
+            # (1, ..., 1, *trailing) and the trailing axis is one whole chunk, so the
+            # block index appends ``0`` per trailing dim (issue #29's invariant).
+            chunk_value = np.asarray(_chunk_uniform_value(name, values))
+            trailing = chunk_value.shape
+            block = chunk_value.reshape((1,) * len(chunk_idx) + trailing)
+            block_idx = chunk_idx + (0,) * len(trailing)
             with config.set({"async.concurrency": 128}):
                 array = open_array(
                     store,
@@ -405,7 +410,7 @@ def write_dataframe_to_zarr(
                     zarr_format=3,
                     consolidated=False,
                 )
-                array.set_block_selection(chunk_idx, block)
+                array.set_block_selection(block_idx, block)
             continue
 
         # Scalar columns reshape to the grid's chunk_shape; a vector column keeps
@@ -467,31 +472,54 @@ def _chunk_uniform_value(name: str, values: np.ndarray):
     name) are ignored when selecting the representative value, so an empty cell 0 no
     longer poisons the companion write with ``NaN``.
 
+    The column may be a scalar ``(n_cells,)`` array or a vector
+    ``(n_cells, *trailing)`` block (issue #82): the CELL axis (axis 0) is collapsed,
+    keeping the per-element ``trailing`` shape. Uniformity is checked per-element over
+    the trailing axis — a populated cell is one whose vector is not all-NaN — and the
+    returned value is a 0-d scalar (scalar field) or a ``trailing``-shaped array.
+
     Raises a clear error if the populated cells are NOT uniform — that means the
     field's ``expression`` genuinely varies per cell and ``resolution: chunk`` is a
     misconfiguration (the per-cell values would be silently dropped otherwise).
     """
-    flat = np.asarray(values).reshape(-1)
+    arr = np.asarray(values)
+    # Reshape to (n_cells, *trailing): a scalar column is (n_cells,) -> trailing ().
+    cells = arr.reshape(arr.shape[0], -1) if arr.ndim > 1 else arr.reshape(-1)
+    trailing = arr.shape[1:]
     # Treat NaN as the empty/fill sentinel for float columns; integer columns have
     # no NaN, so every cell is "populated" and the uniformity check covers them all.
-    if np.issubdtype(flat.dtype, np.floating):
-        populated = flat[~np.isnan(flat)]
+    # A vector cell is "empty" only when its whole vector is NaN (a partially-NaN
+    # vector is a real chunk value, kept as-is).
+    if np.issubdtype(arr.dtype, np.floating):
+        if arr.ndim > 1:
+            populated_mask = ~np.all(np.isnan(cells), axis=1)
+        else:
+            populated_mask = ~np.isnan(cells)
+        populated = cells[populated_mask]
     else:
-        populated = flat
-    if populated.size == 0:
+        populated = cells
+    if populated.shape[0] == 0:
         # Whole chunk is fill (e.g. a vector-carrier shard with no chunk anchor):
         # nothing meaningful to record; fall back to the first cell's sentinel.
-        return flat[0]
+        return arr[0]
     first = populated[0]
-    if not np.all(populated == first):
-        uniq = np.unique(populated)
+    # Compare per-element over the trailing axis; for float columns NaN positions
+    # must match too (so a NaN-bearing-but-uniform vector is accepted), which only
+    # ``array_equal(equal_nan=True)`` allows — integer columns have no NaN.
+    broadcast_first = np.broadcast_to(first, populated.shape)
+    uniform = (
+        np.array_equal(populated, broadcast_first, equal_nan=True)
+        if np.issubdtype(arr.dtype, np.floating)
+        else np.array_equal(populated, broadcast_first)
+    )
+    if not uniform:
+        n_distinct = len({tuple(np.ravel(row)) for row in populated})
         raise ValueError(
             f"resolution: chunk field {name!r} is not chunk-uniform: the populated "
-            f"cells carry {uniq.size} distinct values ({uniq[:4]}...); a chunk-"
-            f"resolution field must reduce to one value per chunk (use resolution: "
-            f"cell for a per-cell field)"
+            f"cells carry {n_distinct} distinct values; a chunk-resolution field must "
+            f"reduce to one value per chunk (use resolution: cell for a per-cell field)"
         )
-    return first
+    return first.reshape(trailing) if trailing else first
 
 
 def _iter_carrier_columns(carrier):
