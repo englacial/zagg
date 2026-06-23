@@ -157,6 +157,15 @@ class RectilinearGrid:
     # ── shape properties ─────────────────────────────────────────────────
 
     @property
+    def chunks_per_shard(self) -> int:
+        """Number of ZARR chunks one shard tile owns (K; issue #30 item 3).
+
+        ``1`` unless ``chunk_inner`` subdivided the shard tile into finer chunks,
+        in which case ``(chunk_h // inner_h) * (chunk_w // inner_w)``.
+        """
+        return (self.chunk_h // self.inner_h) * (self.chunk_w // self.inner_w)
+
+    @property
     def array_shape(self) -> tuple[int, int]:
         return (self.height, self.width)
 

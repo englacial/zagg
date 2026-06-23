@@ -664,6 +664,7 @@ class TestChunkInnerMultiChunk:
             chunk_inner=(4, 4),
         )
         assert g.chunk_shape == (4, 4)
+        assert g.chunks_per_shard == 4
         assert g.chunk_grid_shape == (g.n_inner_row_blocks, g.n_inner_col_blocks)
         assert g.chunk_grid_shape == (g.height // 4, g.width // 4)
 
