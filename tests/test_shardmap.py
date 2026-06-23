@@ -285,6 +285,16 @@ class TestMortieOrder:
         with pytest.raises(ValueError, match="coarser than the grid's parent_order"):
             ShardMap.build(catalog, hp_grid, backend="mortie", mortie_order=8)
 
+    def test_derived_order_clamped_below_parent_rejected(self):
+        # The derived path can still trip the guard: when parent_order exceeds the
+        # order-18 cap, the clamp drives the order to 18 < parent_order, so the
+        # guard fires (#92). chunk_order 19 -> clamped 18 < parent_order 19.
+        from zagg.catalog.shardmap import _resolve_mortie_order
+
+        g = HealpixGrid(19, 20, layout="fullsphere")  # chunk_order == parent_order == 19
+        with pytest.raises(ValueError, match="coarser than the grid's parent_order"):
+            _resolve_mortie_order(None, g)
+
     def test_derived_order_clamped_to_cap(self):
         # A chunk_order above mortie's order-18 cap is clamped to 18, never an
         # illegal order that mortie would reject (#92). chunk_inner=19 > cap, with

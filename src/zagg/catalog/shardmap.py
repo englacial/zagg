@@ -83,20 +83,27 @@ def _resolve_mortie_order(mortie_order, grid) -> int:
     order resolves to 13. Keying the MOC to the chunk order matches the unit work
     is dispatched at: footprints resolve no finer than the chunk the worker reads,
     which is enough to keep ``moc_to_order`` from upsampling onto neighbor shards
-    (#92) at near-minimal compute -- a benchmark sweep showed granules/shard is
-    flat for every order >= ``parent_order`` while wall-time grows with order, so
-    a finer MOC buys precision the order-``parent_order`` shard cells can't see.
+    (#92) at near-minimal compute -- the order-sweep benchmark
+    (``benchmarks/mortie_order_sweep.py``) shows granules/shard flat for every
+    order >= ``parent_order`` while wall-time grows with order, so a finer MOC
+    buys precision the order-``parent_order`` shard cells can't see.
     The order is still clamped to ``MORTIE_MOC_ORDER_CAP`` (mortie's order-18
     coverage cap) before the ``parent_order`` guard, so an exotic ``chunk_order``
     past the cap can't make mortie raise into the swallowing ``except`` (silent
-    coverage loss). An explicit ``mortie_order`` is honored but still validated
-    against ``parent_order``. Non-HEALPix grids (no ``parent_order`` /
-    ``child_order``) keep the legacy default of 8.
+    coverage loss). The clamp comes *before* the guard, so a ``parent_order``
+    itself above the cap (the clamp then lands at 18 < ``parent_order``) still
+    trips the raise rather than passing an order coarser than the shards. An
+    explicit ``mortie_order`` is honored but still validated against
+    ``parent_order``. Non-HEALPix grids (no ``parent_order`` / ``child_order``)
+    keep the legacy default of 8.
     """
     is_healpix = hasattr(grid, "parent_order") and hasattr(grid, "child_order")
     if mortie_order is not None:
         order = int(mortie_order)
     elif is_healpix:
+        # ``chunk_order`` is the inner-chunk order on HealpixGrid (always set;
+        # == parent_order when chunk_inner is unset). The getattr default only
+        # covers a duck-typed grid that exposes parent/child but not chunk_order.
         chunk_order = getattr(grid, "chunk_order", grid.parent_order)
         order = min(int(chunk_order), MORTIE_MOC_ORDER_CAP)
     else:
