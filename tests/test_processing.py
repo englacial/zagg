@@ -3272,6 +3272,53 @@ class TestPlannedReadGroup:
         assert df_pad1["h"].tolist() == [30.0, 40.0, 50.0, 60.0]
         assert df_pad1["h"].tolist() == df_full["h"].tolist()
 
+    def test_pad_does_not_recover_segment_two_runs_away(self):
+        # Pins the omission bound from the PR's rep-point argument (issue #95):
+        # pad recovers an in-band photon only when its OWNING segment is within
+        # ``pad`` of a matched rep-point segment. Here segment 0 has a stray
+        # photon (lat 255) inside the band [190, 260], but seg 0's rep-point (0)
+        # is two segments away from the only matched segment (seg 2, rep 200),
+        # so pad=1 does NOT pull seg 0's run in and the stray photon stays
+        # omitted. The full read keeps it -> the planned read intentionally
+        # diverges, confirming the bound is exactly ``pad`` segments, not "a few
+        # edge photons" unconditionally.
+        seg_lats = np.array([0.0, 100.0, 200.0, 300.0, 400.0])
+        seg_lons = np.zeros(5)
+        # seg 0 owns photons {0,1}, seg 1 {2}, seg 2 {3}, seg 3 {4}, seg 4 {5}.
+        ibeg = np.array([0, 2, 3, 4, 5], dtype=np.int64)
+        cnt = np.array([2, 1, 1, 1, 1], dtype=np.int64)
+        # photon 1 is seg 0's stray, parked inside the band at lat 255.
+        ph_lats = np.array([0.0, 255.0, 100.0, 200.0, 300.0, 400.0])
+        ph_lons = np.zeros(6)
+        h = np.arange(6.0, dtype=np.float32) * 10.0
+        h5 = _FakeH5(
+            {
+                "/seg/lat": seg_lats,
+                "/seg/lon": seg_lons,
+                "/seg/ph_index_beg": ibeg,
+                "/seg/segment_ph_cnt": cnt,
+                "/heights/lat_ph": ph_lats,
+                "/heights/lon_ph": ph_lons,
+                "/heights/h": h,
+            }
+        )
+        grid = _LatBboxGrid((-0.1, 190.0, 0.1, 260.0))  # rep-point band: seg 2 only
+
+        ds_pad1 = _planned_read_data_source()
+        ds_pad1["read_plan"]["pad"] = 1
+        df_pad1 = _read_group(h5, "gt1l", ds_pad1, 0, grid)
+        # Run [2,2] padded to [1,3] -> photons 2..4 -> only seg 2's photon (lat
+        # 200, h=30) is in band; seg 0's stray (h=10) is two runs away, omitted.
+        assert df_pad1["h"].tolist() == [30.0]
+
+        ds_full = {
+            "coordinates": {"latitude": "/heights/lat_ph", "longitude": "/heights/lon_ph"},
+            "variables": {"h": "/heights/h"},
+        }
+        df_full = _read_group(h5, "gt1l", ds_full, 0, grid)
+        # The full read recovers the stray (h=10) the planned read omits at pad=1.
+        assert df_full["h"].tolist() == [10.0, 30.0]
+
     def test_invalid_link_target_raises(self):
         # The spatial_index level's link must point at the base level.
         ds = _planned_read_data_source()
