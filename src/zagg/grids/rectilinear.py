@@ -238,11 +238,13 @@ class RectilinearGrid:
 
     # ── identity / nesting ───────────────────────────────────────────────
 
-    def signature(self) -> dict:
-        """Canonical fingerprint of the grid's defining parameters.
+    def spatial_signature(self) -> dict:
+        """Structural (spatial-only) fingerprint of the grid.
 
-        Recorded in a ShardMap at build time and re-checked at run time so a
-        shard map can never be silently paired with a different grid.
+        The shard-map reuse guard (``runner._check_signature``, #89) compares
+        this — it is purely the spatial layout (no ``output_fields``), so one
+        ShardMap is reusable across configs that share the spatial grid but
+        declare different aggregation fields.
         """
         a = self._geobox.affine
         return {
@@ -251,6 +253,17 @@ class RectilinearGrid:
             "affine": [a.a, a.b, a.c, a.d, a.e, a.f],
             "shape": [self.height, self.width],
             "chunk_shape": [self.chunk_h, self.chunk_w],
+        }
+
+    def signature(self) -> dict:
+        """Canonical fingerprint of the grid's defining parameters.
+
+        The full fingerprint: the spatial layout (:meth:`spatial_signature`)
+        plus the Option-B output-field set. ``nests_with`` (#29) keys on the
+        latter; the shard-map reuse guard keys on the former (#89).
+        """
+        return {
+            **self.spatial_signature(),
             "output_fields": output_field_signature(self.config),
         }
 

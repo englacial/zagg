@@ -5,7 +5,8 @@ import json
 import pytest
 
 from zagg.config import default_config
-from zagg.runner import _load_catalog, _select_cells, agg
+from zagg.grids import HealpixGrid, RectilinearGrid, from_config
+from zagg.runner import _check_signature, _load_catalog, _select_cells, agg
 
 
 @pytest.fixture
@@ -119,6 +120,82 @@ class TestLoadCatalog:
         p.write_text(json.dumps(old))
         with pytest.raises(ValueError, match="not a Phase-5 ShardMap"):
             _load_catalog(str(p))
+
+
+class TestCheckSignature:
+    """The shard-map reuse guard compares the *spatial* signature only (#89).
+
+    A ShardMap is a spatial artifact, so it must validate any config that shares
+    the spatial grid while declaring different aggregation fields, and still
+    reject a genuinely different spatial grid. Old (full-signature) maps keep
+    validating via a spatial-subset projection.
+    """
+
+    @staticmethod
+    def _grid(name):
+        return from_config(default_config(name))
+
+    @staticmethod
+    def _catalog(grid_signature):
+        return {"metadata": {}, "grid_signature": grid_signature,
+                "shard_keys": [0], "granules": [[_rec(1)]]}
+
+    def test_cross_aggregator_reuse_healpix(self):
+        # Headline: a map built for tdigest validates a gain_bias run (same
+        # parent11/chunk_inner13/child19 spatial grid, different agg fields).
+        tdigest = self._grid("atl03_tdigest_healpix")
+        gain_bias = self._grid("atl03_gain_bias_healpix")
+        assert tdigest.signature() != gain_bias.signature()  # full sigs differ
+        built = self._catalog(tdigest.spatial_signature())
+        _check_signature(gain_bias, built)  # no raise
+        # ... and the reverse.
+        _check_signature(tdigest, self._catalog(gain_bias.spatial_signature()))
+
+    def test_different_spatial_grid_raises_healpix(self):
+        a = HealpixGrid(6, 12, layout="fullsphere")
+        built = self._catalog(a.spatial_signature())
+        # Different parent_order/child_order -> spatial mismatch -> raise.
+        b = HealpixGrid(7, 13, layout="fullsphere")
+        with pytest.raises(ValueError, match="different grid"):
+            _check_signature(b, built)
+
+    def test_old_full_signature_validates_and_reuses(self):
+        # Back-compat: an OLD-style stored signature carrying output_fields (the
+        # full signature) validates against a matching spatial grid AND is
+        # reusable across differing agg fields (the projection drops output_fields).
+        tdigest = self._grid("atl03_tdigest_healpix")
+        gain_bias = self._grid("atl03_gain_bias_healpix")
+        old = self._catalog(tdigest.signature())  # full sig (incl. output_fields)
+        assert "output_fields" in old["grid_signature"]
+        _check_signature(tdigest, old)  # same config: validates
+        _check_signature(gain_bias, old)  # different agg fields: still reusable
+
+    def test_none_signature_early_return(self):
+        grid = self._grid("atl03_tdigest_healpix")
+        _check_signature(grid, {"metadata": {}})  # no grid_signature key -> no raise
+
+    def test_rectilinear_cross_aggregator_reuse(self):
+        bounds = [359400, 4300740, 369400, 4310740]
+        a = RectilinearGrid("EPSG:32618", 10, bounds, [250, 250],
+                            config=default_config("atl06"))
+        b = RectilinearGrid("EPSG:32618", 10, bounds, [250, 250],
+                            config=default_config("atl06_polar"))
+        assert a.signature() != b.signature()
+        _check_signature(b, self._catalog(a.spatial_signature()))  # no raise
+        _check_signature(b, self._catalog(a.signature()))  # old full sig: also ok
+
+    def test_rectilinear_different_spatial_grid_raises(self):
+        bounds = [359400, 4300740, 369400, 4310740]
+        a = RectilinearGrid("EPSG:32618", 10, bounds, [250, 250])
+        built = self._catalog(a.spatial_signature())
+        # Different resolution/shape -> spatial mismatch.
+        b = RectilinearGrid("EPSG:32618", 20, bounds, [250, 250])
+        with pytest.raises(ValueError, match="different grid"):
+            _check_signature(b, built)
+        # Different CRS -> spatial mismatch.
+        c = RectilinearGrid("EPSG:3031", 10, bounds, [250, 250])
+        with pytest.raises(ValueError, match="different grid"):
+            _check_signature(c, built)
 
 
 class TestDenseDeprecation:
@@ -326,6 +403,7 @@ def _stub_grid():
 
     grid = MagicMock()
     grid.signature.return_value = {}
+    grid.spatial_signature.return_value = {}
     grid.block_index.side_effect = lambda k: (k,)
     grid.emit_template.side_effect = lambda store, overwrite=False: store
     return grid
