@@ -280,6 +280,36 @@ def write_ragged_to_zarr(
     return store
 
 
+def _block_index_key(block_index, grid) -> int:
+    """Flatten a chunk's block-index tuple to the CSR subgroup key (issue #48, K>1).
+
+    1-D grids (the HEALPix companion grid, the typical case) yield a single-element
+    block index used directly; a multi-axis (rectilinear) block index is packed
+    row-major against the grid's ``chunk_grid_shape`` so each chunk maps to a
+    distinct CSR subgroup name. Deriving the per-axis strides from the chunk grid
+    (rather than a fixed shift) keeps the pack injective for any grid size.
+
+    Shared by both the local runner and the Lambda handler (issue #82 phase 7) so
+    the K>1 ragged-write key is computed identically off-Lambda and on-Lambda.
+    """
+    block = tuple(int(b) for b in block_index)
+    if len(block) == 1:
+        return block[0]
+    # Row-major flatten with each axis's true extent as the stride.
+    shape = tuple(int(s) for s in getattr(grid, "chunk_grid_shape", ()))
+    if len(shape) != len(block):
+        # Fall back to a generous fixed stride if the grid does not expose a
+        # matching chunk_grid_shape (keeps a unique-enough key without crashing).
+        key = 0
+        for b in block:
+            key = key * (1 << 32) + b
+        return key
+    key = 0
+    for b, extent in zip(block, shape):
+        key = key * extent + b
+    return key
+
+
 def _chunk_uniform_ragged(name: str, values_list: list):
     """Collapse a ``resolution: chunk`` ragged field's per-cell payloads to one.
 
