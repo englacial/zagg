@@ -15,8 +15,11 @@ from unittest.mock import MagicMock
 
 import pandas as pd
 import pytest
+from zarr import open_group
+from zarr.storage import MemoryStore
 
 from zagg.config import default_config
+from zagg.grids import HEALPIX_BASE_CELLS, from_config
 
 REPO_ROOT = Path(__file__).parent.parent
 HANDLER_PATH = REPO_ROOT / "deployment" / "aws" / "lambda_handler.py"
@@ -212,3 +215,52 @@ class TestProcessEventWriteLoop:
         # Single chunk -> ragged keyed by shard_key (cell-resolution contract).
         assert len(cap["ragged"]) == 1
         assert cap["ragged"][0][0] == event["shard_key"]
+
+
+class TestSetupTemplate:
+    """Issue #99: the setup handler used to hand-build the HEALPix grid and drop
+    ``chunk_inner``, so the template was chunked at ``parent_order`` while workers
+    (built via ``from_config``) wrote finer ``chunk_inner`` block indices -> Zarr
+    "block index out of bounds". Setup now builds the grid via ``from_config`` too,
+    so the two paths share one construction path and can't drift."""
+
+    def _setup(self, handler_mod, monkeypatch, config_dict, **event_extra):
+        store = MemoryStore()
+        monkeypatch.setattr(handler_mod, "open_store", lambda *a, **k: store)
+        event = {
+            "mode": "setup",
+            "store_path": "s3://out/x.zarr",
+            "parent_order": 11,
+            "config": config_dict,
+            **event_extra,
+        }
+        resp = handler_mod._handle_setup(event)
+        return resp, store
+
+    def test_setup_template_chunked_at_chunk_inner(self, handler_mod, monkeypatch):
+        # The config sets parent_order 11, chunk_inner 13, child_order 19, so the
+        # template must be chunked at order 13 (12*4^13 chunks), matching what the
+        # worker grid writes -- NOT the order-11 (12*4^11) grid the old code emitted.
+        cfg = default_config("atl03_tdigest_healpix")
+        resp, store = self._setup(handler_mod, monkeypatch, asdict(cfg))
+        assert resp["statusCode"] == 200, json.loads(resp["body"])
+
+        worker_grid = from_config(cfg)
+        group = open_group(store, path=str(worker_grid.child_order), mode="r")
+        # The cell-resolution array's chunk count equals the worker grid's
+        # chunk_grid_shape -- the invariant the bug violated.
+        cell_arr = group["cell_ids"]
+        n_chunks = cell_arr.shape[0] // cell_arr.chunks[0]
+        assert (n_chunks,) == worker_grid.chunk_grid_shape
+        assert n_chunks == HEALPIX_BASE_CELLS * 4**13
+
+    def test_setup_template_matches_worker_grid_chunk_count(self, handler_mod, monkeypatch):
+        # Same invariant via the gain/bias config (different schema, same grid).
+        cfg = default_config("atl03_gain_bias_healpix")
+        resp, store = self._setup(handler_mod, monkeypatch, asdict(cfg))
+        assert resp["statusCode"] == 200, json.loads(resp["body"])
+
+        worker_grid = from_config(cfg)
+        group = open_group(store, path=str(worker_grid.child_order), mode="r")
+        offset_arr = group["offset_h"]  # a resolution: chunk companion array
+        assert offset_arr.shape == worker_grid.chunk_grid_shape

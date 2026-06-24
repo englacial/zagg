@@ -30,11 +30,11 @@ Setup mode (creates the zarr template once before per-cell fan-out):
 {
     "mode": "setup",
     "store_path": str,
-    "parent_order": int,
-    "child_order": int,
-    "n_parent_cells": int,
+    "parent_order": int,        # HEALPix fallback; config.output.grid wins
+    "n_parent_cells": int,      # OPTIONAL -- dense layout only (populated count)
     "overwrite": bool,
-    "config": dict,
+    "config": dict,             # single source of truth: child_order, chunk_inner,
+                                #   layout, and grid type all come from here
     "output_credentials": dict (optional, same shape as process mode),
 }
 
@@ -119,31 +119,30 @@ def lambda_handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
 
 def _handle_setup(event: Dict[str, Any]) -> Dict[str, Any]:
     """Create the zarr template at ``event['store_path']``."""
-    from zagg.grids import HealpixGrid, from_config
+    from zagg.grids import from_config
 
     logger.info(f"Setup mode: creating template at {event.get('store_path')}")
     try:
         config = load_config_from_dict(event["config"])
         store = open_store(event["store_path"], **_output_store_kwargs(event))
-        grid_type = config.output.get("grid", {}).get("type", "healpix")
-        if grid_type == "healpix":
-            # n_parent_cells signals dense layout; populated_shards identities
-            # don't matter for emit_template (only the count does).
-            populated = (
-                list(range(event["n_parent_cells"]))
-                if event.get("n_parent_cells") is not None
-                else None
-            )
-            layout = "dense" if populated is not None else "fullsphere"
-            grid = HealpixGrid(
-                parent_order=event["parent_order"],
-                child_order=event["child_order"],
-                layout=layout,
-                config=config,
-                populated_shards=populated,
-            )
-        else:
-            grid = from_config(config, parent_order=event.get("parent_order"))
+        # Build the grid exactly as the worker does (from_config), so the
+        # template's chunk structure can't drift from what workers write. The
+        # old hand-built HEALPix branch dropped chunk_inner, under-chunking the
+        # template at parent_order while workers wrote finer chunk_inner block
+        # indices -> "block index out of bounds" (issue #99). from_config reads
+        # chunk_inner + layout from the config; n_parent_cells (dense layout)
+        # still threads through as populated_shards (only its count matters for
+        # emit_template).
+        populated = (
+            list(range(event["n_parent_cells"]))
+            if event.get("n_parent_cells") is not None
+            else None
+        )
+        grid = from_config(
+            config,
+            parent_order=event.get("parent_order"),
+            populated_shards=populated,
+        )
         grid.emit_template(store, overwrite=event.get("overwrite", False))
         return {"statusCode": 200, "body": json.dumps({"ok": True, "mode": "setup"})}
     except Exception as e:
