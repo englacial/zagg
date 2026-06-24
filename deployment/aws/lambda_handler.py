@@ -130,9 +130,9 @@ def _handle_setup(event: Dict[str, Any]) -> Dict[str, Any]:
         # old hand-built HEALPix branch dropped chunk_inner, under-chunking the
         # template at parent_order while workers wrote finer chunk_inner block
         # indices -> "block index out of bounds" (issue #99). from_config reads
-        # chunk_inner + layout from the config; n_parent_cells (dense layout)
-        # still threads through as populated_shards (only its count matters for
-        # emit_template).
+        # chunk_inner + layout from the config. n_parent_cells is inert unless
+        # the config selects layout: dense, where it threads through as
+        # populated_shards (only its count matters for emit_template).
         populated = (
             list(range(event["n_parent_cells"]))
             if event.get("n_parent_cells") is not None

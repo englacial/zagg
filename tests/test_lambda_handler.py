@@ -237,30 +237,56 @@ class TestSetupTemplate:
         resp = handler_mod._handle_setup(event)
         return resp, store
 
+    @staticmethod
+    def _template_chunk_count(store, worker_grid):
+        """Number of chunks in the emitted cell-resolution array."""
+        group = open_group(store, path=str(worker_grid.child_order), mode="r")
+        cell_arr = group["cell_ids"]
+        return cell_arr.shape[0] // cell_arr.chunks[0]
+
     def test_setup_template_chunked_at_chunk_inner(self, handler_mod, monkeypatch):
         # The config sets parent_order 11, chunk_inner 13, child_order 19, so the
         # template must be chunked at order 13 (12*4^13 chunks), matching what the
         # worker grid writes -- NOT the order-11 (12*4^11) grid the old code emitted.
+        # This is the exact #99 regression: setup dropping chunk_inner.
         cfg = default_config("atl03_tdigest_healpix")
         resp, store = self._setup(handler_mod, monkeypatch, asdict(cfg))
         assert resp["statusCode"] == 200, json.loads(resp["body"])
 
         worker_grid = from_config(cfg)
-        group = open_group(store, path=str(worker_grid.child_order), mode="r")
-        # The cell-resolution array's chunk count equals the worker grid's
-        # chunk_grid_shape -- the invariant the bug violated.
-        cell_arr = group["cell_ids"]
-        n_chunks = cell_arr.shape[0] // cell_arr.chunks[0]
+        n_chunks = self._template_chunk_count(store, worker_grid)
         assert (n_chunks,) == worker_grid.chunk_grid_shape
         assert n_chunks == HEALPIX_BASE_CELLS * 4**13
 
-    def test_setup_template_matches_worker_grid_chunk_count(self, handler_mod, monkeypatch):
-        # Same invariant via the gain/bias config (different schema, same grid).
-        cfg = default_config("atl03_gain_bias_healpix")
-        resp, store = self._setup(handler_mod, monkeypatch, asdict(cfg))
+    def test_setup_template_k1_chunked_at_parent_order(self, handler_mod, monkeypatch):
+        # K==1 (chunk_inner unset): chunk_order == parent_order, so the template is
+        # chunked at parent_order (12*4^6) -- still matching the worker grid. Guards
+        # the unset-chunk_inner path the fix must leave byte-identical.
+        cfg = default_config("atl06")  # parent_order 6, child_order 12, no chunk_inner
+        resp, store = self._setup(handler_mod, monkeypatch, asdict(cfg), parent_order=6)
         assert resp["statusCode"] == 200, json.loads(resp["body"])
 
-        worker_grid = from_config(cfg)
-        group = open_group(store, path=str(worker_grid.child_order), mode="r")
-        offset_arr = group["offset_h"]  # a resolution: chunk companion array
-        assert offset_arr.shape == worker_grid.chunk_grid_shape
+        worker_grid = from_config(cfg, parent_order=6)
+        n_chunks = self._template_chunk_count(store, worker_grid)
+        assert (n_chunks,) == worker_grid.chunk_grid_shape
+        assert n_chunks == HEALPIX_BASE_CELLS * 4**6
+
+    def test_setup_dense_layout_threads_populated_shards(self, handler_mod, monkeypatch):
+        # n_parent_cells signals the (deprecated) dense layout; the count must thread
+        # through as populated_shards so the template is sized to the populated shards
+        # (chunk count == n_parent_cells), not the full sphere. Covers the
+        # populated_shards branch the fix routes through from_config.
+        cfg = default_config("atl06")
+        cfg.output["grid"]["layout"] = "dense"
+        cfg_dict = asdict(cfg)
+        with pytest.warns(DeprecationWarning, match="dense is deprecated"):
+            resp, store = self._setup(
+                handler_mod, monkeypatch, cfg_dict, parent_order=6, n_parent_cells=5
+            )
+        assert resp["statusCode"] == 200, json.loads(resp["body"])
+
+        with pytest.warns(DeprecationWarning, match="dense is deprecated"):
+            worker_grid = from_config(cfg, parent_order=6, populated_shards=list(range(5)))
+        n_chunks = self._template_chunk_count(store, worker_grid)
+        assert (n_chunks,) == worker_grid.chunk_grid_shape
+        assert n_chunks == 5
