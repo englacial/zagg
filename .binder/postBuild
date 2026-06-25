@@ -1,0 +1,16 @@
+#!/bin/bash
+# repo2docker runs this after building the conda environment.
+#
+# Install zagg from the checked-out repo together with its ``analysis`` extra
+# (the notebook runtime: jupyter/notebook, xarray, cartopy, matplotlib, ...).
+# Keeping the dependency set in pyproject.toml's ``[analysis]`` extra means the
+# Binder image and a local ``pip install zagg[analysis]`` resolve the same way.
+#
+# We deliberately do NOT install:
+#   * the spherely exact-S2 fork (not on PyPI; not needed to *read* a prebuilt
+#     public store -- only catalog/SpatialIndex builds use it), or
+#   * icechunk / hvplot (only the non-Binder cryocloud_example notebook uses
+#     those, and it is excluded from Binder because it dispatches to AWS Lambda).
+set -euo pipefail
+
+python -m pip install --no-cache-dir ".[analysis]"
