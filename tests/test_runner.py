@@ -434,7 +434,8 @@ class TestSummaryKeysByteIdentical:
         "total_cells", "cells_with_data", "cells_error", "total_obs",
         "wall_time_s", "lambda_time_s", "gb_seconds", "price_per_gb_sec",
         "estimated_cost_usd", "store_path", "backend", "function_name",
-        "results",
+        "results", "setup_s", "fanout_s", "finalize_s", "function_timeout_s",
+        "worker_max_s", "worker_median_s", "worker_pstdev_s", "worker_pct_timeout",
     }
 
     def test_local_summary_keys_and_counts(self, monkeypatch, atl06_config):
@@ -563,3 +564,134 @@ class TestSummaryKeysByteIdentical:
         # The exact pre-refactor order: one multiply over the summed time.
         assert summary["gb_seconds"] == total * 2.0
         assert summary["estimated_cost_usd"] == (total * 2.0) * 0.0000133334
+
+
+def _run_lambda_with_durations(monkeypatch, atl06_config, durations, *, timeout=720):
+    """Drive ``_run_lambda`` over synthetic per-cell durations.
+
+    Returns the summary dict. ``durations`` is consumed one per cell (the
+    _run_catalog() has 4 cells); ``timeout`` stubs the function Timeout read.
+    """
+    import boto3
+
+    import zagg.grids as grids_mod
+    from zagg import runner
+    from zagg.concurrency import ConcurrencyReport
+
+    monkeypatch.setattr(runner, "get_nsidc_s3_credentials",
+                        lambda: {"accessKeyId": "a", "secretAccessKey": "s",
+                                 "sessionToken": "t"})
+    monkeypatch.setattr(grids_mod, "from_config", lambda *a, **k: _stub_grid())
+    monkeypatch.setattr(runner, "_invoke_lambda_setup", lambda *a, **k: None)
+    monkeypatch.setattr(runner, "_invoke_lambda_finalize", lambda *a, **k: None)
+    monkeypatch.setattr(runner, "_get_function_timeout_s", lambda *a, **k: timeout)
+    from unittest.mock import MagicMock
+    monkeypatch.setattr(boto3, "Session", lambda *a, **k: MagicMock())
+    monkeypatch.setattr(
+        runner, "compute_available_workers",
+        lambda requested, *a, **k: (
+            1,  # 1 worker -> deterministic completion order for the iter()
+            ConcurrencyReport(account_limit=1000, current_concurrent=0,
+                              padding=100, available=900, function_reserved=None),
+        ),
+    )
+    it = iter(durations)
+    monkeypatch.setattr(
+        runner, "_invoke_lambda_cell",
+        lambda *a, **k: {"status_code": 200, "body": {"total_obs": 1},
+                         "error": None, "lambda_duration": next(it),
+                         "shard_key": 0},
+    )
+    return runner._run_lambda(
+        atl06_config, _run_catalog(), "s3://out/x.zarr", 12,
+        max_cells=None, morton_cell=None, max_workers=1700, overwrite=False,
+        dry_run=False, region="us-west-2", function_name="process-shard",
+    )
+
+
+class TestWorkerRuntimeStats:
+    """Phase 1 of issue #100: always-on worker-runtime distribution stats and
+    orchestrator phase brackets in the lambda summary."""
+
+    def test_worker_stats_pinned_against_synthetic_durations(self, monkeypatch, atl06_config):
+        import statistics
+
+        durations = [10.0, 20.0, 30.0, 100.0]
+        summary = _run_lambda_with_durations(
+            monkeypatch, atl06_config, durations, timeout=720
+        )
+        assert summary["function_timeout_s"] == 720
+        assert summary["worker_max_s"] == 100.0
+        assert summary["worker_median_s"] == statistics.median(durations)
+        assert summary["worker_pstdev_s"] == statistics.pstdev(durations)
+        assert summary["worker_pct_timeout"] == 100.0 / 720
+
+    def test_worker_pct_timeout_tracks_function_timeout(self, monkeypatch, atl06_config):
+        summary = _run_lambda_with_durations(
+            monkeypatch, atl06_config, [180.0, 60.0, 60.0, 60.0], timeout=900
+        )
+        assert summary["function_timeout_s"] == 900
+        assert summary["worker_pct_timeout"] == 180.0 / 900
+
+    def test_empty_durations_degrade_to_none(self, monkeypatch, atl06_config):
+        # All cells report zero/falsy lambda_duration -> no distribution.
+        summary = _run_lambda_with_durations(
+            monkeypatch, atl06_config, [0, 0, 0, 0], timeout=720
+        )
+        assert summary["worker_max_s"] is None
+        assert summary["worker_median_s"] is None
+        assert summary["worker_pstdev_s"] is None
+        assert summary["worker_pct_timeout"] is None
+        # function_timeout_s is still populated even with no durations.
+        assert summary["function_timeout_s"] == 720
+
+    def test_orchestrator_brackets_present_and_nonnegative(self, monkeypatch, atl06_config):
+        summary = _run_lambda_with_durations(
+            monkeypatch, atl06_config, [1.0, 2.0, 3.0, 4.0]
+        )
+        for key in ("setup_s", "fanout_s", "finalize_s"):
+            assert key in summary
+            assert summary[key] >= 0.0
+
+
+class TestGetFunctionTimeout:
+    """``_get_function_timeout_s`` reads the configured Timeout, or falls back
+    to the template default on any failure (issue #100)."""
+
+    def test_reads_timeout_from_client(self):
+        from unittest.mock import MagicMock
+
+        from zagg.runner import _get_function_timeout_s
+
+        client = MagicMock()
+        client.get_function_configuration.return_value = {"Timeout": 720}
+        assert _get_function_timeout_s(client, "process-shard") == 720
+        client.get_function_configuration.assert_called_once_with(FunctionName="process-shard")
+
+    def test_falls_back_on_error(self):
+        from unittest.mock import MagicMock
+
+        from zagg.runner import _DEFAULT_FUNCTION_TIMEOUT_S, _get_function_timeout_s
+
+        client = MagicMock()
+        client.get_function_configuration.side_effect = RuntimeError("AccessDenied")
+        assert _get_function_timeout_s(client, "process-shard") == _DEFAULT_FUNCTION_TIMEOUT_S
+
+    def test_falls_back_on_missing_key(self):
+        from unittest.mock import MagicMock
+
+        from zagg.runner import _DEFAULT_FUNCTION_TIMEOUT_S, _get_function_timeout_s
+
+        # Response without a "Timeout" key -> KeyError -> fallback.
+        client = MagicMock()
+        client.get_function_configuration.return_value = {}
+        assert _get_function_timeout_s(client, "process-shard") == _DEFAULT_FUNCTION_TIMEOUT_S
+
+    def test_falls_back_on_non_integer(self):
+        from zagg.runner import _DEFAULT_FUNCTION_TIMEOUT_S, _get_function_timeout_s
+
+        class _Client:
+            def get_function_configuration(self, FunctionName):
+                return {"Timeout": "not-a-number"}
+
+        assert _get_function_timeout_s(_Client(), "process-shard") == _DEFAULT_FUNCTION_TIMEOUT_S

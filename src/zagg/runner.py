@@ -14,6 +14,7 @@ Usage from Python (e.g., Jupyter notebook)::
 import json
 import logging
 import os
+import statistics
 import time
 import warnings
 from concurrent.futures import ThreadPoolExecutor
@@ -668,6 +669,11 @@ def _run_lambda(
     # function so the orchestrator only needs lambda:InvokeFunction; no
     # direct S3 access to the output bucket is required (works cleanly
     # for cross-account callers like CryoCloud).
+    # Orchestrator phase brackets (always-on; just time.time() deltas around
+    # calls that already happen, so no worker probe tax -- issue #100). They
+    # decompose wall time into setup invoke / fan-out / finalize invoke so
+    # "where did wall time go" is answerable from the summary.
+    setup_start = time.time()
     _invoke_lambda_setup(
         state["lambda_client"],
         function_name,
@@ -679,6 +685,7 @@ def _run_lambda(
         config_dict=config_dict,
         output_creds_event=output_creds_event,
     )
+    setup_s = time.time() - setup_start
 
     start_time = time.time()
     n = len(cells)
@@ -712,10 +719,13 @@ def _run_lambda(
         )
     finally:
         executor.shutdown()
+    fanout_s = time.time() - start_time
 
     # Consolidate metadata via Lambda (same rationale as setup -- avoids
     # requiring orchestrator-side S3 access).
+    finalize_start = time.time()
     executor.finalize()
+    finalize_s = time.time() - finalize_start
     wall_time = time.time() - start_time
 
     # Cost estimate: arm64 pricing = $0.0000133334/GB-second. Compute gb_seconds
@@ -730,6 +740,21 @@ def _run_lambda(
     price_per_gb_sec = LAMBDA_PRICE_PER_GB_SEC
     estimated_cost = gb_seconds * price_per_gb_sec
 
+    # Worker-runtime distribution (issue #100). Wall time on a parallel fan-out
+    # tracks the *straggler*, not the mean, so surface max / median / pstdev of
+    # the billed per-cell durations plus the max's share of the function
+    # Timeout -- the safety margin that flags a skewed shardmap (one fat cell
+    # dominating wall time). Raw material already lives in report.results.
+    function_timeout_s = _get_function_timeout_s(state.get("lambda_client"), function_name)
+    durations = [r["lambda_duration"] for r in report.results if r.get("lambda_duration")]
+    if durations:
+        worker_max_s = max(durations)
+        worker_median_s = statistics.median(durations)
+        worker_pstdev_s = statistics.pstdev(durations)
+        worker_pct_timeout = worker_max_s / function_timeout_s if function_timeout_s else None
+    else:
+        worker_max_s = worker_median_s = worker_pstdev_s = worker_pct_timeout = None
+
     summary = {
         "total_cells": len(cells),
         "cells_with_data": report.cells_with_data,
@@ -740,6 +765,14 @@ def _run_lambda(
         "gb_seconds": gb_seconds,
         "price_per_gb_sec": price_per_gb_sec,
         "estimated_cost_usd": estimated_cost,
+        "setup_s": setup_s,
+        "fanout_s": fanout_s,
+        "finalize_s": finalize_s,
+        "function_timeout_s": function_timeout_s,
+        "worker_max_s": worker_max_s,
+        "worker_median_s": worker_median_s,
+        "worker_pstdev_s": worker_pstdev_s,
+        "worker_pct_timeout": worker_pct_timeout,
         "store_path": store_path,
         "backend": "lambda",
         "function_name": function_name,
@@ -751,6 +784,12 @@ def _run_lambda(
     logger.info(
         f"Lambda compute: {total_lambda_time:.0f}s total, {gb_seconds:.0f} GB-s, ~${estimated_cost:.2f}"
     )
+    if worker_max_s is not None:
+        pct = f"{worker_pct_timeout:.0%}" if worker_pct_timeout is not None else "n/a"
+        logger.info(
+            f"Workers: max {worker_max_s:.0f}s ({pct} of {function_timeout_s:.0f}s timeout), "
+            f"median {worker_median_s:.0f}s, pstdev {worker_pstdev_s:.0f}s"
+        )
     return summary
 
 
@@ -835,6 +874,27 @@ def _log_concurrency_report(report: ConcurrencyReport, max_workers: int) -> None
             f"current={report.current_concurrent}, padding={report.padding}, "
             f"available={report.available} -> using {max_workers} workers"
         )
+
+
+# Function Timeout fallback when get_function_configuration can't be read
+# (permission denied, etc.). Mirrors the CloudFormation default in
+# deployment/aws/template.yaml (Timeout Default: 720).
+_DEFAULT_FUNCTION_TIMEOUT_S = 720
+
+
+def _get_function_timeout_s(lambda_client, function_name):
+    """Read the function's configured Timeout (seconds), once.
+
+    Used for ``worker_pct_timeout`` (issue #100). Falls back to
+    ``_DEFAULT_FUNCTION_TIMEOUT_S`` (the template default) on any failure --
+    permission error, missing client, or a non-integer response -- so the
+    percent is exact when available and still populated otherwise.
+    """
+    try:
+        timeout = lambda_client.get_function_configuration(FunctionName=function_name)["Timeout"]
+        return int(timeout)
+    except Exception:
+        return _DEFAULT_FUNCTION_TIMEOUT_S
 
 
 def _invoke_lambda_setup(
