@@ -15,8 +15,11 @@ from unittest.mock import MagicMock
 
 import pandas as pd
 import pytest
+from zarr import open_group
+from zarr.storage import MemoryStore
 
 from zagg.config import default_config
+from zagg.grids import HEALPIX_BASE_CELLS, from_config
 
 REPO_ROOT = Path(__file__).parent.parent
 HANDLER_PATH = REPO_ROOT / "deployment" / "aws" / "lambda_handler.py"
@@ -212,3 +215,78 @@ class TestProcessEventWriteLoop:
         # Single chunk -> ragged keyed by shard_key (cell-resolution contract).
         assert len(cap["ragged"]) == 1
         assert cap["ragged"][0][0] == event["shard_key"]
+
+
+class TestSetupTemplate:
+    """Issue #99: the setup handler used to hand-build the HEALPix grid and drop
+    ``chunk_inner``, so the template was chunked at ``parent_order`` while workers
+    (built via ``from_config``) wrote finer ``chunk_inner`` block indices -> Zarr
+    "block index out of bounds". Setup now builds the grid via ``from_config`` too,
+    so the two paths share one construction path and can't drift."""
+
+    def _setup(self, handler_mod, monkeypatch, config_dict, **event_extra):
+        store = MemoryStore()
+        monkeypatch.setattr(handler_mod, "open_store", lambda *a, **k: store)
+        event = {
+            "mode": "setup",
+            "store_path": "s3://out/x.zarr",
+            "parent_order": 11,
+            "config": config_dict,
+            **event_extra,
+        }
+        resp = handler_mod._handle_setup(event)
+        return resp, store
+
+    @staticmethod
+    def _template_chunk_count(store, worker_grid):
+        """Number of chunks in the emitted cell-resolution array."""
+        group = open_group(store, path=str(worker_grid.child_order), mode="r")
+        cell_arr = group["cell_ids"]
+        return cell_arr.shape[0] // cell_arr.chunks[0]
+
+    def test_setup_template_chunked_at_chunk_inner(self, handler_mod, monkeypatch):
+        # The config sets parent_order 11, chunk_inner 13, child_order 19, so the
+        # template must be chunked at order 13 (12*4^13 chunks), matching what the
+        # worker grid writes -- NOT the order-11 (12*4^11) grid the old code emitted.
+        # This is the exact #99 regression: setup dropping chunk_inner.
+        cfg = default_config("atl03_tdigest_healpix")
+        resp, store = self._setup(handler_mod, monkeypatch, asdict(cfg))
+        assert resp["statusCode"] == 200, json.loads(resp["body"])
+
+        worker_grid = from_config(cfg)
+        n_chunks = self._template_chunk_count(store, worker_grid)
+        assert (n_chunks,) == worker_grid.chunk_grid_shape
+        assert n_chunks == HEALPIX_BASE_CELLS * 4**13
+
+    def test_setup_template_k1_chunked_at_parent_order(self, handler_mod, monkeypatch):
+        # K==1 (chunk_inner unset): chunk_order == parent_order, so the template is
+        # chunked at parent_order (12*4^6) -- still matching the worker grid. Guards
+        # the unset-chunk_inner path the fix must leave byte-identical.
+        cfg = default_config("atl06")  # parent_order 6, child_order 12, no chunk_inner
+        resp, store = self._setup(handler_mod, monkeypatch, asdict(cfg), parent_order=6)
+        assert resp["statusCode"] == 200, json.loads(resp["body"])
+
+        worker_grid = from_config(cfg, parent_order=6)
+        n_chunks = self._template_chunk_count(store, worker_grid)
+        assert (n_chunks,) == worker_grid.chunk_grid_shape
+        assert n_chunks == HEALPIX_BASE_CELLS * 4**6
+
+    def test_setup_dense_layout_threads_populated_shards(self, handler_mod, monkeypatch):
+        # n_parent_cells signals the (deprecated) dense layout; the count must thread
+        # through as populated_shards so the template is sized to the populated shards
+        # (chunk count == n_parent_cells), not the full sphere. Covers the
+        # populated_shards branch the fix routes through from_config.
+        cfg = default_config("atl06")
+        cfg.output["grid"]["layout"] = "dense"
+        cfg_dict = asdict(cfg)
+        with pytest.warns(DeprecationWarning, match="dense is deprecated"):
+            resp, store = self._setup(
+                handler_mod, monkeypatch, cfg_dict, parent_order=6, n_parent_cells=5
+            )
+        assert resp["statusCode"] == 200, json.loads(resp["body"])
+
+        with pytest.warns(DeprecationWarning, match="dense is deprecated"):
+            worker_grid = from_config(cfg, parent_order=6, populated_shards=list(range(5)))
+        n_chunks = self._template_chunk_count(store, worker_grid)
+        assert (n_chunks,) == worker_grid.chunk_grid_shape
+        assert n_chunks == 5

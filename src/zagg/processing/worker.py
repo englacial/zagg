@@ -191,6 +191,7 @@ def process_shard(
 
     # Read files and filter spatially
     for s3_url in granule_urls:
+        h5obj = None
         try:
             resource_path = _rewrite_url(s3_url)
 
@@ -218,6 +219,20 @@ def process_shard(
         except Exception as e:
             logger.warning(f"  Error processing file {s3_url}: {e}")
             continue
+        finally:
+            # Release this granule's h5coro cache before the next one (issue #66):
+            # without it each granule's unevicted cache stays resident for the whole
+            # loop → Lambda OOM. ``close()`` is the live path; ``cache.clear()`` is a
+            # fallback for builds lacking it. Retained ``all_reads`` data is already
+            # copied off the cache lines (see PR #94), so releasing here is safe.
+            if h5obj is not None:
+                try:
+                    if hasattr(h5obj, "close"):
+                        h5obj.close()
+                    elif getattr(h5obj, "cache", None) is not None:
+                        h5obj.cache.clear()
+                except Exception:
+                    logger.debug("h5coro cache release failed", exc_info=True)
 
     logger.info(f"  Processed {files_processed}/{len(granule_urls)} files")
     metadata["files_processed"] = files_processed

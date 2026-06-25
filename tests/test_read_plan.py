@@ -4,6 +4,7 @@ All tests use synthetic numpy arrays — no h5coro, S3, or credentials needed.
 """
 
 import numpy as np
+import pytest
 
 from zagg.read_plan import ReadPlan, execute_read_plan, plan_read
 
@@ -291,3 +292,59 @@ class TestExecuteReadPlan:
         out = execute_read_plan(plan, read_fn, "/h", np.float32)
         assert calls == [None]  # full-read call, no hyperslice
         np.testing.assert_array_equal(out, data)
+
+
+class TestPlanReadCoarseMask:
+    """The mortie-mask path (issue #95): a precomputed boolean ``coarse_mask``
+    replaces the shapely/bbox per-segment scan, and the contiguous-run detection
+    is vectorized off that mask."""
+
+    def test_mask_matches_equivalent_bbox(self):
+        # The mask path must produce the same plan as the bbox path picking the
+        # same segments. Segs 0 and 1 in AOI -> one run [0, 1] -> photons 0..19.
+        lats, lons, idx, cnt, n_base = _isolated_setup(5)
+        bbox = (0.0, -0.5, 1.0, 40.5)  # covers segs 0 and 1
+        by_bbox = plan_read(lats, lons, idx, cnt, n_base, bbox, pad=0)
+        mask = np.array([True, True, False, False, False])
+        by_mask = plan_read(lats, lons, idx, cnt, n_base, pad=0, coarse_mask=mask)
+        assert by_mask.parent_runs == by_bbox.parent_runs == [(0, 1)]
+        assert by_mask.base_slices == by_bbox.base_slices == [(0, 20)]
+
+    def test_mask_multiple_disjoint_runs(self):
+        # Vectorized run detection must split non-contiguous True blocks, including
+        # runs that touch the first and last element.
+        lats, lons, idx, cnt, n_base = _isolated_setup(6)
+        mask = np.array([True, False, True, True, False, True])
+        plan = plan_read(lats, lons, idx, cnt, n_base, pad=0, coarse_mask=mask)
+        assert plan.parent_runs == [(0, 0), (2, 3), (5, 5)]
+        assert plan.base_slices == [(0, 10), (20, 40), (50, 60)]
+
+    def test_mask_pad_extends_run(self):
+        lats, lons, idx, cnt, n_base = _isolated_setup(5)
+        mask = np.array([False, False, True, False, False])
+        plan = plan_read(lats, lons, idx, cnt, n_base, pad=1, coarse_mask=mask)
+        assert plan.parent_runs == [(1, 3)]  # seg 2 padded by one on each side
+
+    def test_empty_mask_returns_empty_plan(self):
+        lats, lons, idx, cnt, n_base = _isolated_setup(5)
+        mask = np.zeros(5, dtype=bool)
+        plan = plan_read(lats, lons, idx, cnt, n_base, pad=0, coarse_mask=mask)
+        assert plan.parent_runs == [] and not plan.full_read
+
+    def test_mask_takes_precedence_over_bbox(self):
+        # When both are passed, the mask wins (the bbox is ignored).
+        lats, lons, idx, cnt, n_base = _isolated_setup(5)
+        far_bbox = (100.0, 100.0, 110.0, 110.0)  # would match nothing
+        mask = np.array([True, False, False, False, False])
+        plan = plan_read(lats, lons, idx, cnt, n_base, far_bbox, pad=0, coarse_mask=mask)
+        assert plan.parent_runs == [(0, 0)]
+
+    def test_mask_shape_mismatch_raises(self):
+        lats, lons, idx, cnt, n_base = _isolated_setup(5)
+        with pytest.raises(ValueError, match="coarse_mask shape"):
+            plan_read(lats, lons, idx, cnt, n_base, pad=0, coarse_mask=np.ones(3, dtype=bool))
+
+    def test_neither_mask_nor_bbox_raises(self):
+        lats, lons, idx, cnt, n_base = _isolated_setup(5)
+        with pytest.raises(ValueError, match="requires either coarse_mask or bbox"):
+            plan_read(lats, lons, idx, cnt, n_base)

@@ -3147,22 +3147,21 @@ class TestPlannedReadGroup:
     pulls in exactly its two neighbours."""
 
     def test_planned_path_bounds_io_to_matched_segments(self):
-        # Bbox (-0.1, 175, 0.1, 225) directly contains segment 2 (lat=200);
-        # segment 1's (lat 100 -> 200) linestring crosses the lower edge so
-        # plan_read sweeps segment 1 in too. Two adjacent segments -> one
-        # contiguous run -> photons 2..5 in the base array.
+        # Mortie segment->shard mask (issue #95): lat band [100, 250] selects
+        # segments 1 (lat 100) and 2 (lat 200) by rep-point -> one contiguous run
+        # -> photons 2..5; the photon-level mask keeps all four (lat 100..250).
         ds = _planned_read_data_source()
         h5 = _planned_read_h5()
-        grid = _BboxGrid((-0.1, 175.0, 0.1, 225.0))
+        grid = _LatBboxGrid((-0.1, 100.0, 0.1, 250.0))
         df = _read_group(h5, "gt1l", ds, 0, grid)
         assert df["h"].tolist() == [20.0, 30.0, 40.0, 50.0]
 
     def test_empty_aoi_returns_none(self):
-        # Bbox far from any segment rep-point or linestring -> no parents
-        # match -> short-circuit return None before any base-rate read.
+        # No segment rep-point maps to this shard -> empty coarse mask ->
+        # short-circuit return None before any base-rate read.
         ds = _planned_read_data_source()
         h5 = _planned_read_h5()
-        grid = _BboxGrid((10000.0, 10000.0, 10001.0, 10001.0))
+        grid = _LatBboxGrid((-0.1, 10000.0, 0.1, 10001.0))
         assert _read_group(h5, "gt1l", ds, 0, grid) is None
 
     def test_full_read_fallback_on_high_selectivity(self):
@@ -3237,27 +3236,88 @@ class TestPlannedReadGroup:
         assert df_full["h"].tolist() == [0.0, 10.0]
 
     def test_coarse_filter_via_planned_path(self):
-        # Cross-level (Phase B) filter ANDs with the planned path: drop
-        # segment 1 via podppd; segment 2 (also pulled in by the linestring
-        # sweep) survives. Photons 2,3 dropped; 4,5 kept.
+        # Cross-level (Phase B) filter ANDs with the planned path: lat band
+        # [100, 250] selects segments 1,2 (mortie mask); podppd drops segment 1.
+        # Photons 2,3 dropped; 4,5 kept.
         ds = _planned_read_data_source(with_coarse_filter=True)
         podppd = np.array([0, 1, 0, 0, 0, 0], dtype=np.int8)
         h5 = _planned_read_h5(podppd=podppd)
-        grid = _BboxGrid((-0.1, 175.0, 0.1, 225.0))
+        grid = _LatBboxGrid((-0.1, 100.0, 0.1, 250.0))
         df = _read_group(h5, "gt1l", ds, 0, grid)
         assert df["h"].tolist() == [40.0, 50.0]
 
-    def test_pad_extends_selection(self):
-        # bbox (490..510) covers segment 5 (last, lat=500) directly; segment
-        # 4's linestring (400 -> 500) crosses the lower edge. With pad=0:
-        # segments 4,5 -> photons 8..11. With pad=1: segments 3,4,5,6(clamped
-        # back to 5) -> photons 6..11.
-        ds = _planned_read_data_source()
-        ds["read_plan"]["pad"] = 1
+    def test_pad_recovers_boundary_segment_and_matches_full(self):
+        # Omission guard for the rep-point mask (issue #95): lat band [150, 310].
+        # The mortie mask selects segments 2 (lat 200) and 3 (lat 300) by
+        # rep-point, but photon 3 (lat 150) belongs to segment 1, whose rep-point
+        # (100) is OUTSIDE the band. With pad=0 it would be omitted; pad=1 pulls
+        # segment 1 into the run, recovering photon 3 -- so the planned read then
+        # matches the full read exactly (no omission at the tested pad).
         h5 = _planned_read_h5()
-        grid = _BboxGrid((-0.1, 490.0, 0.1, 510.0))
-        df = _read_group(h5, "gt1l", ds, 0, grid)
-        assert df["h"].tolist() == [60.0, 70.0, 80.0, 90.0, 100.0, 110.0]
+        grid = _LatBboxGrid((-0.1, 150.0, 0.1, 310.0))
+
+        ds_pad0 = _planned_read_data_source()  # pad=0 default
+        df_pad0 = _read_group(h5, "gt1l", ds_pad0, 0, grid)
+        assert df_pad0["h"].tolist() == [40.0, 50.0, 60.0]  # photon 3 (h=30) omitted
+
+        ds_pad1 = _planned_read_data_source()
+        ds_pad1["read_plan"]["pad"] = 1
+        df_pad1 = _read_group(h5, "gt1l", ds_pad1, 0, grid)
+        # Ground truth: a full read keeps every photon whose lat is in band.
+        ds_full = {
+            "coordinates": {"latitude": "/heights/lat_ph", "longitude": "/heights/lon_ph"},
+            "variables": {"h": "/heights/h"},
+        }
+        df_full = _read_group(h5, "gt1l", ds_full, 0, grid)
+        assert df_pad1["h"].tolist() == [30.0, 40.0, 50.0, 60.0]
+        assert df_pad1["h"].tolist() == df_full["h"].tolist()
+
+    def test_pad_does_not_recover_segment_two_runs_away(self):
+        # Pins the omission bound from the PR's rep-point argument (issue #95):
+        # pad recovers an in-band photon only when its OWNING segment is within
+        # ``pad`` of a matched rep-point segment. Here segment 0 has a stray
+        # photon (lat 255) inside the band [190, 260], but seg 0's rep-point (0)
+        # is two segments away from the only matched segment (seg 2, rep 200),
+        # so pad=1 does NOT pull seg 0's run in and the stray photon stays
+        # omitted. The full read keeps it -> the planned read intentionally
+        # diverges, confirming the bound is exactly ``pad`` segments, not "a few
+        # edge photons" unconditionally.
+        seg_lats = np.array([0.0, 100.0, 200.0, 300.0, 400.0])
+        seg_lons = np.zeros(5)
+        # seg 0 owns photons {0,1}, seg 1 {2}, seg 2 {3}, seg 3 {4}, seg 4 {5}.
+        ibeg = np.array([0, 2, 3, 4, 5], dtype=np.int64)
+        cnt = np.array([2, 1, 1, 1, 1], dtype=np.int64)
+        # photon 1 is seg 0's stray, parked inside the band at lat 255.
+        ph_lats = np.array([0.0, 255.0, 100.0, 200.0, 300.0, 400.0])
+        ph_lons = np.zeros(6)
+        h = np.arange(6.0, dtype=np.float32) * 10.0
+        h5 = _FakeH5(
+            {
+                "/seg/lat": seg_lats,
+                "/seg/lon": seg_lons,
+                "/seg/ph_index_beg": ibeg,
+                "/seg/segment_ph_cnt": cnt,
+                "/heights/lat_ph": ph_lats,
+                "/heights/lon_ph": ph_lons,
+                "/heights/h": h,
+            }
+        )
+        grid = _LatBboxGrid((-0.1, 190.0, 0.1, 260.0))  # rep-point band: seg 2 only
+
+        ds_pad1 = _planned_read_data_source()
+        ds_pad1["read_plan"]["pad"] = 1
+        df_pad1 = _read_group(h5, "gt1l", ds_pad1, 0, grid)
+        # Run [2,2] padded to [1,3] -> photons 2..4 -> only seg 2's photon (lat
+        # 200, h=30) is in band; seg 0's stray (h=10) is two runs away, omitted.
+        assert df_pad1["h"].tolist() == [30.0]
+
+        ds_full = {
+            "coordinates": {"latitude": "/heights/lat_ph", "longitude": "/heights/lon_ph"},
+            "variables": {"h": "/heights/h"},
+        }
+        df_full = _read_group(h5, "gt1l", ds_full, 0, grid)
+        # The full read recovers the stray (h=10) the planned read omits at pad=1.
+        assert df_full["h"].tolist() == [10.0, 30.0]
 
     def test_invalid_link_target_raises(self):
         # The spatial_index level's link must point at the base level.
@@ -3270,13 +3330,12 @@ class TestPlannedReadGroup:
 
     def test_multi_slice_plan_global_idx_alignment(self):
         # Force a plan with two disjoint base-slices (one ATL03 track that
-        # crosses the AOI lat band twice). Fixture: 10 segments × 1 photon
-        # each, lats wave from 0 -> 100 -> 0 -> 100 -> 0 so plan_read's
-        # linestring + containment check picks up segments {2,3,4} and
-        # {6,7,8} but not {0,1,5,9}. The plan therefore has two runs and
-        # ``global_idx = [2,3,4,6,7,8]``. A cross-level podppd filter that
-        # drops segment 3 must align correctly through that global_idx
-        # (otherwise photon 3's drop hits the wrong row).
+        # crosses the shard lat band twice). Fixture: 10 segments × 1 photon
+        # each, lats wave from 0 -> 100 -> 0 -> 100 -> 0. The mortie mask (lat
+        # band [45, 105]) picks up segments {2,3,4} and {7,8} -> two runs ->
+        # ``global_idx = [2,3,4,7,8]``. A cross-level podppd filter that drops
+        # segment 3 must align correctly through that global_idx (otherwise
+        # photon 3's drop hits the wrong row).
         seg_lats = np.array([0.0, 0.0, 50.0, 100.0, 100.0, 0.0, 0.0, 100.0, 100.0, 0.0])
         seg_lons = np.zeros(10)
         ibeg = np.arange(10, dtype=np.int64)
@@ -3298,12 +3357,12 @@ class TestPlannedReadGroup:
             }
         )
         ds = _planned_read_data_source(with_coarse_filter=True)
-        grid = _BboxGrid((-0.1, 95.0, 0.1, 105.0))
+        grid = _LatBboxGrid((-0.1, 45.0, 0.1, 105.0))
         df = _read_group(h5, "gt1l", ds, 0, grid)
-        # plan covers segments {2,3,4} and {6,7,8} -> base_slices [(2,5),(6,9)]
-        # -> global_idx [2,3,4,6,7,8] -> base photons h = [20,30,40,60,70,80]
+        # mask selects segments {2,3,4} and {7,8} -> base_slices [(2,5),(7,9)]
+        # -> global_idx [2,3,4,7,8] -> in-band photons h = [20,30,40,70,80];
         # cross-level drops segment 3 -> drop photon 3 (h=30) only.
-        assert df["h"].tolist() == [20.0, 40.0, 60.0, 70.0, 80.0]
+        assert df["h"].tolist() == [20.0, 40.0, 70.0, 80.0]
 
     def test_full_read_fallback_carries_filters(self):
         # The selectivity-fallback path must produce the same row set as the
@@ -3319,16 +3378,17 @@ class TestPlannedReadGroup:
         # Full-coord path keeps all 12 photons (permissive grid); qs drops 5,6.
         assert df["h"].tolist() == [0.0, 10.0, 20.0, 30.0, 40.0, 70.0, 80.0, 90.0, 100.0, 110.0]
 
-    def test_antimeridian_grid_falls_back_to_full_read(self):
-        # A grid whose shard_footprint spans ~360 deg in lon (HEALPix
-        # antimeridian / polar cap) gives plan_read a useless bbox. The
-        # planned path detects this and falls back so the full-read path is
-        # used instead -- otherwise the AOI would intersect every segment.
+    def test_low_selectivity_falls_back_to_full_read(self):
+        # The mortie mask needs no antimeridian/polar special-case (issue #95):
+        # ``grid.assign`` is globally correct, so the old wide-bbox bail is gone.
+        # A shard that genuinely owns (nearly) every segment -- here the
+        # permissive grid maps all of them in -- still falls back to the full
+        # read via the selectivity threshold rather than issuing many slices that
+        # sum to the whole file.
         ds = _planned_read_data_source()
         h5 = _planned_read_h5()
-        grid = _BboxGrid((-180.0, -10.0, 180.0, 10.0))  # 360 deg lon span
+        grid = _BboxGrid((-180.0, -10.0, 180.0, 10.0))  # permissive: all segments in shard
         df = _read_group(h5, "gt1l", ds, 0, grid)
-        # Full-coord path with permissive grid keeps all 12 photons.
         assert df["h"].tolist() == [float(i * 10) for i in range(12)]
 
     def test_dispatch_rejects_empty_levels(self):
@@ -3402,19 +3462,14 @@ class TestPlannedReadGroup:
                 "/gt1l/geolocation/segment_ph_cnt": cnt,
             }
         )
-        # Bbox around segment 2 (lat=200); pad=1 (the shipped default) widens
-        # the matched parent run by one on each side. The permissive grid
-        # accepts every photon read so the planned path's output is the
-        # post-filter photon set.
+        # Permissive grid: every segment maps to the shard, so with pad=1 the
+        # run spans all 4 segments and the planned read falls back to the full
+        # read via the selectivity threshold (still index_base=1 arithmetic).
+        # Plan covers photons 0..7; the 2-D signal_conf_ph filter drops photon 4
+        # (uniform TEP -2 across all 5 surface types). Survivors: 0,1,2,3,5,6,7.
         grid = _BboxGrid((-0.1, 175.0, 0.1, 225.0))
         df = _read_group(h5, "gt1l", ds, 0, grid)
         assert df is not None
-        # Without pad the bbox (lat 175..225) matches seg 2 (lat=200) directly
-        # and seg 1 via the lstr 1->2 sweep (lat 100->200 crosses y=175); seg
-        # 2's own lstr 2->3 (200->300) pulls in seg 2 again. With pad=1 the
-        # run [1, 2] widens to [0, 3]. Plan covers photons 0..7. The 2-D
-        # signal_conf_ph filter drops photon 4 (uniform TEP -2 across all 5
-        # surface types). Survivors: 0, 1, 2, 3, 5, 6, 7.
         assert df["h_ph"].tolist() == [0.0, 10.0, 20.0, 30.0, 50.0, 60.0, 70.0]
 
 
@@ -3535,7 +3590,7 @@ class TestSegmentLevelVariables:
         h5 = _planned_read_h5()
         # 6 segments; dem_h one value per segment.
         h5._arrays["/seg/dem_h"] = np.array([10.0, 20.0, 30.0, 40.0, 50.0, 60.0], dtype=np.float32)
-        grid = _BboxGrid((-0.1, 175.0, 0.1, 225.0))
+        grid = _LatBboxGrid((-0.1, 100.0, 0.1, 250.0))
         df = _read_group(h5, "gt1l", ds, 0, grid)
         # Planned path selects photons 2,3 (seg 1) and 4,5 (seg 2).
         assert df["h"].tolist() == [20.0, 30.0, 40.0, 50.0]
@@ -3552,7 +3607,7 @@ class TestSegmentLevelVariables:
         qs[3] = 1
         h5 = _planned_read_h5(qs=qs)
         h5._arrays["/seg/dem_h"] = np.array([10.0, 20.0, 30.0, 40.0, 50.0, 60.0], dtype=np.float32)
-        grid = _BboxGrid((-0.1, 175.0, 0.1, 225.0))
+        grid = _LatBboxGrid((-0.1, 100.0, 0.1, 250.0))
         df = _read_group(h5, "gt1l", ds, 0, grid)
         # Selected photons 2,3 (seg 1) + 4,5 (seg 2); qs drops photon 3.
         assert df["h"].tolist() == [20.0, 40.0, 50.0]
@@ -3567,7 +3622,7 @@ class TestSegmentLevelVariables:
         ds["filters"] = [{"expression": "dem_h > 25.0"}]
         h5 = _planned_read_h5()
         h5._arrays["/seg/dem_h"] = np.array([10.0, 20.0, 30.0, 40.0, 50.0, 60.0], dtype=np.float32)
-        grid = _BboxGrid((-0.1, 175.0, 0.1, 225.0))
+        grid = _LatBboxGrid((-0.1, 100.0, 0.1, 250.0))
         df = _read_group(h5, "gt1l", ds, 0, grid)
         # Selected photons 2,3 (seg 1, dem_h 20) + 4,5 (seg 2, dem_h 30); the
         # filter drops seg 1 (20 <= 25) and keeps seg 2 (30 > 25).
@@ -4052,3 +4107,284 @@ class TestChunkPrecompute:
         assert not np.array_equal(
             df_chunk["offset"].to_numpy(), np.array([1.0, 101.0], dtype=np.float32)
         )
+
+
+# ---------------------------------------------------------------------------
+# Per-granule h5coro cache release in process_shard (issue #66)
+# ---------------------------------------------------------------------------
+
+
+class _ReleaseGrid:
+    """Grid stub for the #66 release tests: leaf id == row index, every row maps
+    to ``shard_key`` 0 (so the flat read keeps all rows), and the post-read
+    methods (``cells_of``/``children``/``chunk_coords``) collapse every row onto a
+    single cell. Drives the real ``_read_group`` → aggregate → ``_build_output``
+    path so the per-granule ``close()`` in the loop actually runs."""
+
+    @staticmethod
+    def assign(lats, lons):
+        return np.arange(len(lats), dtype=np.int64)
+
+    @staticmethod
+    def shards_of(leaf_ids):
+        return np.zeros(len(leaf_ids), dtype=np.int64)
+
+    def children(self, shard_key):
+        return np.array([0], dtype=np.int64)
+
+    def cells_of(self, leaf_ids):
+        return np.zeros(len(leaf_ids), dtype=np.int64)
+
+    def chunk_coords(self, shard_key):
+        return {"cell_lat": np.zeros(1), "cell_lon": np.zeros(1)}
+
+
+def _release_cfg():
+    """Minimal flat config: one group, lat/lon coords + one variable ``h_li``,
+    aggregated to count/min so ``process_shard`` runs end-to-end on canned reads."""
+    from zagg.config import PipelineConfig
+
+    return PipelineConfig(
+        data_source={
+            "groups": ["gt1l"],
+            "coordinates": {"latitude": "/{group}/lat", "longitude": "/{group}/lon"},
+            "variables": {"h_li": "/{group}/h_li"},
+        },
+        aggregation={
+            "variables": {
+                "count": {"function": "len", "dtype": "int32", "fill_value": 0},
+                "h_min": {"function": "min", "source": "h_li", "dtype": "float32"},
+            }
+        },
+    )
+
+
+def _serve_datasets(arrays, datasets):
+    """Shared ``readDatasets`` body: honor the same path/hyperslice contract as
+    :class:`_FakeH5` (mirrors the real h5coro driver)."""
+    out = {}
+    for d in datasets:
+        if isinstance(d, str):
+            out[d] = arrays[d]
+            continue
+        path = d["dataset"]
+        arr = arrays[path]
+        hs = d.get("hyperslice")
+        if hs is not None:
+            lo, hi = hs[0]
+            arr = arr[lo:hi]
+        out[path] = arr
+    return out
+
+
+class _CloseRecordingH5:
+    """h5coro-1.0.5-shaped stub: serves canned arrays and records ``close()`` calls
+    on a shared ``log`` (``("close", id)``), one entry per release."""
+
+    def __init__(self, arrays, log):
+        self._arrays = arrays
+        self._log = log
+
+    def readDatasets(self, datasets):  # noqa: N802 (mirror real h5coro API)
+        return _serve_datasets(self._arrays, datasets)
+
+    def close(self):
+        self._log.append(("close", id(self)))
+
+
+class _RecordingCache(dict):
+    """A cache whose ``clear()`` records the release (so the 1.0.4 fallback —
+    ``h5obj.cache.clear()`` — is observable)."""
+
+    def __init__(self, log):
+        super().__init__()
+        self._log = log
+        self["line0"] = b"x"  # non-empty so clear() actually frees something.
+
+    def clear(self):
+        self._log.append(("clear", id(self)))
+        super().clear()
+
+
+class _ClearOnlyH5:
+    """h5coro-1.0.4-shaped stub: NO ``close()`` (so ``hasattr(h5obj, "close")`` is
+    False), only a ``cache`` whose ``clear()`` records the release."""
+
+    def __init__(self, arrays, log):
+        self._arrays = arrays
+        self.cache = _RecordingCache(log)
+
+    def readDatasets(self, datasets):  # noqa: N802 (mirror real h5coro API)
+        return _serve_datasets(self._arrays, datasets)
+
+
+def _canned_arrays():
+    """Two photons in shard 0; lat/lon keep both rows under ``_ReleaseGrid``."""
+    return {
+        "/gt1l/lat": np.array([10.0, 11.0]),
+        "/gt1l/lon": np.array([20.0, 21.0]),
+        "/gt1l/h_li": np.array([100.0, 200.0], dtype=np.float32),
+    }
+
+
+class TestProcessShardCacheRelease:
+    """Issue #66: ``process_shard`` must release each granule's h5coro cache once
+    per granule (not zero, not once at the end), and the release must not corrupt
+    the data already extracted into ``all_reads`` (copy-before-clear)."""
+
+    def _patch_h5(self, monkeypatch, factory):
+        monkeypatch.setattr("zagg.processing.h5coro.H5Coro", factory)
+        monkeypatch.setattr("zagg.processing._make_url_rewriter", lambda driver: lambda u: u)
+
+    def test_close_called_once_per_granule(self, monkeypatch):
+        """A close-bearing stub (h5coro 1.0.5 shape) is closed exactly once for each
+        of three granules — the per-granule release fires inside the loop."""
+        log: list = []
+
+        def factory(*a, **k):
+            return _CloseRecordingH5(_canned_arrays(), log)
+
+        self._patch_h5(monkeypatch, factory)
+        df_out, meta = process_shard(
+            _ReleaseGrid(),
+            0,
+            ["s3://a", "s3://b", "s3://c"],
+            s3_credentials={},
+            config=_release_cfg(),
+        )
+        closes = [e for e in log if e[0] == "close"]
+        # One release per granule, inside the loop — not zero, not once at the end.
+        assert len(closes) == 3
+        assert meta["files_processed"] == 3
+
+    def test_cache_clear_fallback_on_1_0_4(self, monkeypatch):
+        """When the object has no ``close()`` (h5coro 1.0.4), the loop falls back to
+        ``cache.clear()`` — also once per granule."""
+        log: list = []
+
+        def factory(*a, **k):
+            return _ClearOnlyH5(_canned_arrays(), log)
+
+        self._patch_h5(monkeypatch, factory)
+        process_shard(
+            _ReleaseGrid(), 0, ["s3://a", "s3://b"], s3_credentials={}, config=_release_cfg()
+        )
+        clears = [e for e in log if e[0] == "clear"]
+        assert len(clears) == 2
+
+    def test_retained_data_survives_cache_clear(self, monkeypatch):
+        """End-to-end copy-before-clear: drive the full ``process_shard`` loop with a
+        stub that hands out buffer-backed views (as real h5coro does — memoryviews
+        into 4 MB cache lines) and ZEROES every buffer on ``close()`` (the
+        per-granule release simulating cache-line eviction). Assert the aggregation
+        output reflects the ORIGINAL bytes — the worker's retained data is detached
+        from the cache before the release fires, so per-granule release is safe.
+
+        Note this guards the SYSTEM-LEVEL invariant (the worker's output survives the
+        release), which is what the fix relies on. It is a two-layer guarantee:
+        ``_read_group`` builds columns by boolean-mask indexing (a numpy copy) AND
+        ``pd.DataFrame``/``pa.table`` copy their numpy inputs at construction. A test
+        on a DataFrame-returning helper cannot isolate the read-site layer (pandas
+        copies regardless), so this asserts the property that actually matters: no
+        retained array references the evicted cache."""
+
+        class _ViewBackedH5:
+            """Returns memoryview-backed arrays into a private buffer per dataset;
+            ``close()`` zeroes every buffer (simulating cache-line eviction)."""
+
+            def __init__(self, arrays):
+                # keep a writable bytearray-backed copy per path; hand out views.
+                self._buffers = {k: bytearray(v.tobytes()) for k, v in arrays.items()}
+                self._dtypes = {k: v.dtype for k, v in arrays.items()}
+
+            def readDatasets(self, datasets):  # noqa: N802
+                out = {}
+                for d in datasets:
+                    path = d if isinstance(d, str) else d["dataset"]
+                    buf = self._buffers[path]
+                    arr = np.frombuffer(buf, dtype=self._dtypes[path])  # view into buffer
+                    if not isinstance(d, str) and d.get("hyperslice") is not None:
+                        lo, hi = d["hyperslice"][0]
+                        arr = arr[lo:hi]
+                    out[path] = arr
+                return out
+
+            def close(self):
+                for buf in self._buffers.values():
+                    for i in range(len(buf)):
+                        buf[i] = 0  # corrupt any surviving view
+
+        def factory(*a, **k):
+            return _ViewBackedH5(_canned_arrays())
+
+        self._patch_h5(monkeypatch, factory)
+        df_out, meta = process_shard(
+            _ReleaseGrid(), 0, ["s3://a"], s3_credentials={}, config=_release_cfg()
+        )
+        # The single cell pooled both photons (h_li = 100, 200) BEFORE the buffer
+        # was zeroed; h_min must be the original 100.0, not 0.0 (corrupted) and the
+        # count must be 2.
+        assert meta["total_obs"] == 2
+        assert df_out["count"].to_numpy()[0] == 2
+        assert df_out["h_min"].to_numpy()[0] == np.float32(100.0)
+
+    def test_constructor_failure_releases_nothing_and_others_proceed(self, monkeypatch):
+        """If ``H5Coro(...)`` raises for one granule, the loop-top ``h5obj = None``
+        guard means the ``finally`` has nothing to release (no spurious ``close()`` on
+        the failed granule), the granule is skipped (caught by the outer ``except`` →
+        ``continue``), and the remaining granules still process and release normally."""
+        log: list = []
+        calls = {"n": 0}
+
+        def factory(*a, **k):
+            calls["n"] += 1
+            if calls["n"] == 2:  # second granule's constructor blows up
+                raise RuntimeError("h5coro open failed")
+            return _CloseRecordingH5(_canned_arrays(), log)
+
+        self._patch_h5(monkeypatch, factory)
+        df_out, meta = process_shard(
+            _ReleaseGrid(),
+            0,
+            ["s3://a", "s3://b", "s3://c"],
+            s3_credentials={},
+            config=_release_cfg(),
+        )
+        closes = [e for e in log if e[0] == "close"]
+        # Only the two granules whose constructor SUCCEEDED are closed; the failed one
+        # left ``h5obj is None`` so the ``finally`` released nothing for it.
+        assert len(closes) == 2
+        # The two good granules were still read end-to-end.
+        assert meta["files_processed"] == 2
+        assert meta["total_obs"] == 4  # 2 photons × 2 surviving granules
+
+    def test_read_exception_still_releases_in_finally(self, monkeypatch):
+        """The whole point of ``try/finally`` (vs. a post-read ``close()``): if a read
+        raises AFTER the H5Coro is constructed, the ``finally`` still releases that
+        granule's cache exactly once."""
+        log: list = []
+
+        class _RaisingReadH5:
+            """Constructs fine, records ``close()``, but its read raises."""
+
+            def __init__(self, log):
+                self._log = log
+
+            def readDatasets(self, datasets):  # noqa: N802 (mirror real h5coro API)
+                raise RuntimeError("byte-range read failed")
+
+            def close(self):
+                self._log.append(("close", id(self)))
+
+        def factory(*a, **k):
+            return _RaisingReadH5(log)
+
+        self._patch_h5(monkeypatch, factory)
+        df_out, meta = process_shard(
+            _ReleaseGrid(), 0, ["s3://a"], s3_credentials={}, config=_release_cfg()
+        )
+        closes = [e for e in log if e[0] == "close"]
+        # close() fired exactly once despite the read raising — the finally ran.
+        assert len(closes) == 1
+        # No data survived the failed read, so the shard reports the empty path.
+        assert meta["error"] == "No data after filtering"
