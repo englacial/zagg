@@ -86,6 +86,7 @@ def agg(
     output_credentials: dict | None = None,
     output_endpoint_url: str | None = None,
     handoff: str = "pandas",
+    profile: bool = False,
 ) -> dict:
     """Run the aggregation pipeline.
 
@@ -133,6 +134,12 @@ def agg(
         Per-cell aggregation carrier: ``"pandas"`` (default) or ``"arrow"``.
         Both produce byte-for-byte identical scalar outputs (#30); ``"arrow"``
         is opt-in for benchmarking. Only honored by the ``"local"`` backend.
+    profile : bool
+        Opt-in per-phase timing (issue #100). When ``True`` (lambda backend),
+        forwards ``profile`` into each cell event so the worker emits a
+        ``phase_timings`` (read/index/aggregate) sub-dict, and the run prints a
+        per-phase worker breakdown. Default ``False`` leaves the worker path and
+        per-cell event payload byte-identical -- no probe tax.
 
     Returns
     -------
@@ -214,6 +221,7 @@ def agg(
             function_name=function_name,
             output_credentials=output_credentials,
             output_endpoint_url=resolved_endpoint,
+            profile=profile,
         )
     else:
         raise ValueError(f"Unknown backend: {backend!r} (expected 'local' or 'lambda')")
@@ -532,6 +540,7 @@ def _run_lambda(
     function_name,
     output_credentials=None,
     output_endpoint_url=None,
+    profile=False,
 ):
     """Run processing via AWS Lambda invocation.
 
@@ -648,6 +657,7 @@ def _run_lambda(
             config_dict=config_dict,
             output_creds_event=output_creds_event,
             max_workers=state["workers"],
+            profile=profile,
         )
 
     executor = LambdaExecutor(
@@ -755,6 +765,17 @@ def _run_lambda(
     else:
         worker_max_s = worker_median_s = worker_pstdev_s = worker_pct_timeout = None
 
+    # Per-phase worker breakdown (issue #100 phase 2), only when --profile fed
+    # the workers a "profile" event so they emitted body["phase_timings"]. Roll
+    # the straggler (max) per phase across cells, matching the wall-time framing.
+    # Off by default -> no extra summary key, so the default key set is unchanged.
+    worker_phase_max = None
+    if profile:
+        worker_phase_max = {}
+        for r in report.results:
+            for phase, secs in (r.get("body", {}).get("phase_timings") or {}).items():
+                worker_phase_max[phase] = max(worker_phase_max.get(phase, 0.0), secs)
+
     summary = {
         "total_cells": len(cells),
         "cells_with_data": report.cells_with_data,
@@ -778,6 +799,8 @@ def _run_lambda(
         "function_name": function_name,
         "results": report.results,
     }
+    if profile:
+        summary["worker_phase_max"] = worker_phase_max
     logger.info(
         f"Done: {report.cells_with_data} cells, {report.total_obs:,} obs, {report.cells_error} errors, {wall_time:.1f}s"
     )
@@ -790,6 +813,9 @@ def _run_lambda(
             f"Workers: max {worker_max_s:.0f}s ({pct} of {function_timeout_s:.0f}s timeout), "
             f"median {worker_median_s:.0f}s, pstdev {worker_pstdev_s:.0f}s"
         )
+    if profile and worker_phase_max:
+        breakdown = ", ".join(f"{phase} {secs:.0f}s" for phase, secs in worker_phase_max.items())
+        logger.info(f"Worker phases (max across cells): {breakdown}")
     return summary
 
 
@@ -967,11 +993,14 @@ def _invoke_lambda_cell(
     output_creds_event=None,
     max_retries=3,
     max_workers=None,
+    profile=False,
 ):
     """Invoke Lambda for a single cell with retry logic.
 
     ``max_workers`` is used only for the file-descriptor-exhaustion message
-    (#28); it does not affect dispatch.
+    (#28); it does not affect dispatch. ``profile`` (issue #100) forwards a
+    ``"profile": true`` event key so the worker emits ``phase_timings``; when
+    False the event payload is byte-identical to the pre-profile path (no key).
     """
     wall_start = time.time()
 
@@ -995,6 +1024,9 @@ def _invoke_lambda_cell(
         event["config"] = config_dict
     if output_creds_event is not None:
         event["output_credentials"] = output_creds_event
+    # Only add the key when profiling, so default runs stay byte-identical (#100).
+    if profile:
+        event["profile"] = True
 
     last_error = None
     for attempt in range(max_retries):

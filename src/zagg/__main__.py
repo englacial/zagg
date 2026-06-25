@@ -40,6 +40,11 @@ examples:
     parser.add_argument("--max-workers", type=int, default=None, help="Max concurrent workers")
     parser.add_argument("--overwrite", action="store_true", help="Overwrite existing Zarr template")
     parser.add_argument("--dry-run", action="store_true", help="Show what would be processed")
+    parser.add_argument(
+        "--profile", action="store_true",
+        help="Emit per-phase worker timings (read/index/aggregate) on the lambda "
+             "backend. Off by default to avoid the per-worker probe tax (issue #100).",
+    )
     parser.add_argument("--region", default="us-west-2", help="AWS region (default: us-west-2)")
     parser.add_argument(
         "--output-creds", default=None, metavar="PATH",
@@ -84,6 +89,7 @@ examples:
         region=args.region,
         output_credentials=output_credentials,
         output_endpoint_url=output_endpoint_url,
+        profile=args.profile,
     )
 
     if args.dry_run:
@@ -99,6 +105,11 @@ examples:
         if "estimated_cost_usd" in results:
             print(f"Lambda compute: {results['lambda_time_s']:.0f}s total, "
                   f"{results['gb_seconds']:.0f} GB-s, ~${results['estimated_cost_usd']:.2f}")
+        if results.get("worker_phase_max"):
+            breakdown = ", ".join(
+                f"{phase} {secs:.0f}s" for phase, secs in results["worker_phase_max"].items()
+            )
+            print(f"Worker phases (max across cells): {breakdown}")
         print(f"Output: {results['store_path']}")
 
 
