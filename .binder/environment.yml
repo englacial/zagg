@@ -15,16 +15,17 @@
 name: zagg-binder
 channels:
   - conda-forge
+  - nodefaults
 dependencies:
   # zagg requires Python >=3.12,<3.14; the AWS Lambda runtime is 3.12.
   - python=3.12
-  # System libraries for the geospatial stack. Installing these from
+  # System geospatial libraries. Bundling the non-Python GEOS/PROJ deps from
   # conda-forge is the reason we use a conda env on Binder (espg, issue #104):
-  # it bundles the non-Python GEOS/PROJ/GEOTIFF deps that cartopy and pyproj
-  # need without a from-source build.
+  # it gives cartopy a system GEOS/PROJ to link against without a from-source
+  # build. (pyproj/shapely ship vendored copies in their manylinux wheels, so
+  # these are mainly for cartopy.)
   - geos
   - proj
-  - libgdal-core
   - pip
   # The Python packages (zagg + the ``analysis`` extra) are installed via pip
   # in postBuild against the checked-out repo, so the notebook dependency set
