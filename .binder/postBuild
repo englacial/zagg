@@ -13,4 +13,15 @@
 #     those, and it is excluded from Binder because it dispatches to AWS Lambda).
 set -euo pipefail
 
-python -m pip install --no-cache-dir ".[analysis]"
+# zagg's version is derived from git tags by hatch-vcs. repo2docker's checkout
+# can be shallow / tag-less, which would make the build fail to detect a
+# version. Try to make a tag reachable first; if none is, fall back to a
+# pretend version so the Binder image still builds (the version string is
+# irrelevant for running the example notebooks).
+git fetch --tags --unshallow 2>/dev/null || git fetch --tags 2>/dev/null || true
+if git describe --tags --abbrev=0 >/dev/null 2>&1; then
+    python -m pip install --no-cache-dir ".[analysis]"
+else
+    HATCH_VCS_PRETEND_VERSION="0.0.0+binder" \
+        python -m pip install --no-cache-dir ".[analysis]"
+fi
