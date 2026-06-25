@@ -860,3 +860,46 @@ class TestTemporalStrategy:
         summary = agg(cfg, events=_synthetic_events())
         assert summary["events_error"] == 2
         assert summary["events_with_data"] == 0
+
+    def test_tabular_store_writes_parquet_and_reports_path(self, tmp_path):
+        # Phase 6: a temporal run whose store path names a tabular file persists
+        # the event rows through TabularWriter and reports output_path.
+        import pandas as pd
+
+        from zagg.config import load_config_from_dict
+        from zagg.runner import agg
+
+        path = tmp_path / "events.parquet"
+        cfg = load_config_from_dict(
+            {
+                "pipeline": {"type": "temporal"},
+                "data_source": {"reader": "xarray_s3", "collections": ["merra2"]},
+                "aggregation": {
+                    "variables": {
+                        "max_t2m": {
+                            "variable": "T2M",
+                            "collection": "merra2",
+                            "spatial_func": "max",
+                            "temporal_reducer": "max",
+                            "mask": "full",
+                        }
+                    }
+                },
+                "output": {"format": "parquet", "store": str(path)},
+            }
+        )
+        summary = agg(cfg, events=_synthetic_events())
+        assert summary["output_path"] == str(path)
+        assert path.exists()
+        back = pd.read_parquet(path).set_index("event_key")
+        assert back.loc["storm1", "max_t2m"] == pytest.approx(5.0)
+        assert back.loc["storm2", "max_t2m"] == pytest.approx(9.0)
+
+    def test_directory_store_leaves_rows_in_memory_only(self):
+        # A bare-directory store (the default) writes no file; output_path is None
+        # and the in-memory results are unchanged (back-compat with Phase 5).
+        from zagg.runner import agg
+
+        summary = agg(_temporal_config(), events=_synthetic_events())
+        assert summary["output_path"] is None
+        assert len(summary["results"]) == 2

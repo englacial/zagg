@@ -396,6 +396,16 @@ class TemporalStrategy:
             executor.shutdown()
         wall_time = time.time() - start_time
 
+        # Persist the event rows through the tabular output writer (issue #12,
+        # Phase 6) when the store path names a tabular file (``.parquet``/``.csv``/
+        # ``.h5``); a bare directory store (the default) keeps the rows in-memory
+        # only, as before. The writer chooses the serialisation from the suffix.
+        output_path = None
+        if store_path and _is_tabular_path(store_path):
+            from zagg.output import TabularWriter
+
+            output_path = str(TabularWriter().write(report.results, store_path))
+
         summary = {
             "total_events": len(event_list),
             "events_with_data": report.cells_with_data,
@@ -403,6 +413,7 @@ class TemporalStrategy:
             "timesteps_processed": report.total_obs,
             "wall_time_s": wall_time,
             "store_path": store_path,
+            "output_path": output_path,
             "backend": "local",
             "results": report.results,
         }
@@ -430,6 +441,18 @@ def _get_strategy(pipeline_type: str):
         return _STRATEGIES[pipeline_type]()
     except KeyError:  # pragma: no cover - get_pipeline_type already gates the set
         raise ValueError(f"No strategy for pipeline.type={pipeline_type!r}") from None
+
+
+#: Output-store suffixes that select the tabular writer (issue #12, Phase 6).
+#: A temporal run whose ``output.store`` ends in one of these writes its event
+#: rows to that file; any other store path (e.g. a bare directory) leaves the
+#: rows in-memory only.
+_TABULAR_SUFFIXES = (".parquet", ".pq", ".csv", ".h5", ".hdf5", ".he5")
+
+
+def _is_tabular_path(store_path: str) -> bool:
+    """Whether ``store_path`` names a tabular output file (see :data:`_TABULAR_SUFFIXES`)."""
+    return store_path.lower().endswith(_TABULAR_SUFFIXES)
 
 
 def _load_catalog(catalog_path: str) -> dict:
