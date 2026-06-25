@@ -13,6 +13,7 @@ existing tests that ``monkeypatch.setattr("zagg.processing._read_group", ...)``
 """
 
 import logging
+import time
 import warnings
 from datetime import datetime
 from typing import List, Tuple
@@ -56,6 +57,7 @@ def process_shard(
     handoff: str = "pandas",
     ragged_out: dict | None = None,
     chunk_results: list | None = None,
+    profile: bool = False,
 ) -> Tuple[pd.DataFrame, ProcessingMetadata]:
     """Process one shard: read granules, filter to this shard, aggregate, return df.
 
@@ -116,6 +118,14 @@ def process_shard(
         returned ``df_out`` and ragged goes to ``ragged_out`` — byte-for-byte
         unchanged. A caller that passes ``None`` while the grid has K>1 cannot place
         the K carriers, so that combination raises.
+    profile : bool, optional
+        Opt-in per-phase timing (issue #100 phase 2). When ``True``, fills
+        ``metadata["phase_timings"]`` with ``read`` / ``index`` / ``aggregate``
+        wall-clock seconds (``time.time()`` deltas) for the in-worker stages.
+        Default ``False`` takes the current path unchanged — no added timing
+        calls, no ``phase_timings`` key — so the worker pays no probe tax on
+        ordinary runs. (The ``write`` phase runs in the lambda handler, outside
+        this function.)
 
     Returns
     -------
@@ -189,6 +199,11 @@ def process_shard(
     all_reads = []
     files_processed = 0
 
+    # Opt-in per-phase timing (issue #100). Only allocated when profiling so the
+    # default path stays byte-identical (no dict, no time.time() calls).
+    phase_timings: dict | None = {} if profile else None
+    _read_t0 = time.time() if profile else None
+
     # Read files and filter spatially
     for s3_url in granule_urls:
         h5obj = None
@@ -236,11 +251,15 @@ def process_shard(
 
     logger.info(f"  Processed {files_processed}/{len(granule_urls)} files")
     metadata["files_processed"] = files_processed
+    if profile:
+        phase_timings["read"] = time.time() - _read_t0
 
     if not all_reads:
         logger.info(f"  No data after filtering for shard {shard_key} - skipping")
         metadata["error"] = "No data after filtering"
         metadata["duration_s"] = (datetime.now() - start_time).total_seconds()
+        if profile:
+            metadata["phase_timings"] = phase_timings
         return pd.DataFrame(), metadata
 
     data_vars = get_data_vars(config)
@@ -258,6 +277,8 @@ def process_shard(
             f"per-chunk carriers cannot be returned through the single df_out. Pass "
             f"chunk_results=[] (the runner does)."
         )
+
+    _index_t0 = time.time() if profile else None
 
     # ---- Pool the shard's reads ONCE (shared across all K chunks) -------------
     # The shard is read+grouped a single time; only the ``chunk_precompute``
@@ -293,6 +314,10 @@ def process_shard(
         # agnostic; both carriers feed identical numpy arrays into _group_columns).
         col_arrays, cell_to_slice, n_obs_total = _concat_and_group(all_reads, grid, handoff)
         logger.info(f"  Read {n_obs_total:,} observations")
+
+    if profile:
+        phase_timings["index"] = time.time() - _index_t0
+        _aggregate_t0 = time.time()
 
     # ---- Aggregate + build one carrier per finer chunk -----------------------
     # ``iter_chunks`` is the K-chunk seam (issue #30 item 3); a minimal grid (e.g.
@@ -364,6 +389,10 @@ def process_shard(
             single_ragged = ragged
 
     logger.info(f"  Statistics: {cells_with_data} cells with data")
+
+    if profile:
+        phase_timings["aggregate"] = time.time() - _aggregate_t0
+        metadata["phase_timings"] = phase_timings
 
     duration = (datetime.now() - start_time).total_seconds()
     logger.info(f"Completed shard {shard_key} in {duration:.1f}s")
