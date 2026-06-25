@@ -903,3 +903,60 @@ class TestTemporalStrategy:
         summary = agg(_temporal_config(), events=_synthetic_events())
         assert summary["output_path"] is None
         assert len(summary["results"]) == 2
+
+    def test_s3_tabular_store_rejected_until_phase7(self):
+        # Remote tabular output lands with the Phase-7 Lambda handler; a local
+        # write would mangle the s3:// URI, so it is rejected with a clear error.
+        from zagg.config import load_config_from_dict
+        from zagg.runner import agg
+
+        cfg = load_config_from_dict(
+            {
+                "pipeline": {"type": "temporal"},
+                "data_source": {"reader": "xarray_s3", "collections": ["merra2"]},
+                "aggregation": {
+                    "variables": {
+                        "max_t2m": {
+                            "variable": "T2M",
+                            "collection": "merra2",
+                            "spatial_func": "max",
+                            "temporal_reducer": "max",
+                            "mask": "full",
+                        }
+                    }
+                },
+                "output": {"format": "parquet", "store": "s3://bucket/events.parquet"},
+            }
+        )
+        with pytest.raises(ValueError, match="s3:// store is not supported"):
+            agg(cfg, events=_synthetic_events())
+
+    def test_all_error_run_writes_no_file(self, tmp_path):
+        # When no event produces a row, the (column-less) tabular write is skipped
+        # and output_path is None -- the run still reports its error counts.
+        from zagg.config import load_config_from_dict
+        from zagg.runner import agg
+
+        path = tmp_path / "events.parquet"
+        cfg = load_config_from_dict(
+            {
+                "pipeline": {"type": "temporal"},
+                "data_source": {"reader": "xarray_s3", "collections": ["merra2"]},
+                "aggregation": {
+                    "variables": {
+                        "bad": {
+                            "variable": "NOPE",
+                            "collection": "merra2",
+                            "spatial_func": "max",
+                            "temporal_reducer": "max",
+                            "mask": "full",
+                        }
+                    }
+                },
+                "output": {"format": "parquet", "store": str(path)},
+            }
+        )
+        summary = agg(cfg, events=_synthetic_events())
+        assert summary["events_error"] == 2
+        assert summary["output_path"] is None
+        assert not path.exists()

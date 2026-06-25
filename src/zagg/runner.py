@@ -396,15 +396,14 @@ class TemporalStrategy:
             executor.shutdown()
         wall_time = time.time() - start_time
 
-        # Persist the event rows through the tabular output writer (issue #12,
-        # Phase 6) when the store path names a tabular file (``.parquet``/``.csv``/
-        # ``.h5``); a bare directory store (the default) keeps the rows in-memory
-        # only, as before. The writer chooses the serialisation from the suffix.
-        output_path = None
-        if store_path and _is_tabular_path(store_path):
-            from zagg.output import TabularWriter
-
-            output_path = str(TabularWriter().write(report.results, store_path))
+        # Persist the event rows through the output writer the config selects
+        # (issue #12, Phase 6). ``output.format`` resolves a writer from the
+        # registry; the tabular writer serialises the rows to ``store_path``. A
+        # store that is a bare directory (the default) or has no rows leaves the
+        # results in-memory only -- the writer is not invoked. ``s3://`` targets
+        # land with the Phase-7 Lambda handler, so they are rejected here rather
+        # than silently mangled by a local-filesystem write.
+        output_path = _write_tabular_output(config, store_path, report.results)
 
         summary = {
             "total_events": len(event_list),
@@ -443,16 +442,48 @@ def _get_strategy(pipeline_type: str):
         raise ValueError(f"No strategy for pipeline.type={pipeline_type!r}") from None
 
 
-#: Output-store suffixes that select the tabular writer (issue #12, Phase 6).
-#: A temporal run whose ``output.store`` ends in one of these writes its event
-#: rows to that file; any other store path (e.g. a bare directory) leaves the
-#: rows in-memory only.
+#: ``output.store`` suffixes that name a concrete tabular output *file* (vs a
+#: bare directory). A temporal run whose store ends in one of these writes its
+#: event rows there; any other local store path leaves the rows in-memory only.
 _TABULAR_SUFFIXES = (".parquet", ".pq", ".csv", ".h5", ".hdf5", ".he5")
 
 
-def _is_tabular_path(store_path: str) -> bool:
-    """Whether ``store_path`` names a tabular output file (see :data:`_TABULAR_SUFFIXES`)."""
-    return store_path.lower().endswith(_TABULAR_SUFFIXES)
+def _write_tabular_output(config, store_path, rows):
+    """Persist temporal event rows via the config-selected output writer.
+
+    Resolves the writer from ``output.format`` through
+    :func:`zagg.output.get_writer` (so the registry seam is the real dispatch
+    path, not just a path-suffix sniff). Returns the written path, or ``None``
+    when nothing is written -- a directory/empty store, a ``zarr`` format (which
+    is gridded, not tabular), or an empty result set.
+
+    Raises
+    ------
+    ValueError
+        For an ``s3://`` store: remote tabular output lands with the Phase-7
+        Lambda handler; writing it locally would mangle the URI.
+    """
+    from zagg.output import get_writer, output_format
+
+    fmt = output_format(config)
+    if fmt == "zarr":
+        # The gridded writer is for the spatial path; a temporal config left at
+        # the default format has no tabular target, so keep the rows in-memory.
+        return None
+    if not store_path or not store_path.lower().endswith(_TABULAR_SUFFIXES):
+        return None  # a bare directory (or unset) store -- nothing to serialise to
+    if store_path.startswith("s3://"):
+        raise ValueError(
+            f"tabular output to an s3:// store is not supported yet (got {store_path!r}); "
+            "the Lambda handler that writes remote tabular output lands in Phase 7"
+        )
+    if not rows:
+        return None  # no events produced data -- skip the (column-less) write
+    writer = get_writer(fmt)
+    # ``tabular`` is the generic alias -- let the file suffix pick parquet/csv/hdf5;
+    # a concrete format name is passed through as the explicit serialisation.
+    serialisation = None if fmt == "tabular" else fmt
+    return str(writer.write(rows, store_path, output_format=serialisation))
 
 
 def _load_catalog(catalog_path: str) -> dict:
