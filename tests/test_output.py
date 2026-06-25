@@ -1,7 +1,5 @@
 """Tests for the output writer abstraction (issue #12 Phase 6)."""
 
-import importlib
-
 import numpy as np
 import pandas as pd
 import pytest
@@ -47,13 +45,13 @@ class TestWriterRegistry:
 
     def test_register_writer_replace_overrides(self):
         sentinel = type("Sentinel", (), {})
+        original = output_base._WRITERS["zarr"]
         try:
             register_writer("zarr", sentinel, replace=True)
             assert isinstance(get_writer("zarr"), sentinel)
         finally:
             # Restore the canonical mapping so other tests see the real writer.
-            importlib.reload(output_base)
-            register_writer("zarr", ZarrGridWriter, replace=True)
+            register_writer("zarr", original, replace=True)
 
     def test_register_writer_decorator_form(self):
         @register_writer("decotest")
