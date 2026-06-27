@@ -279,6 +279,18 @@ def write_shard_to_zarr(
                 zarr_format=3,
                 consolidated=False,
             )
+            if trailing:
+                # Mirror write_dataframe_to_zarr's single-trailing-chunk invariant
+                # (issue #29): a vector field's trailing payload dim must be one whole
+                # (inner) chunk, or set_block_selection at trailing block 0 would
+                # silently write only part of it.
+                target_trailing_chunks = array.chunks[len(slab_shape) :]
+                if target_trailing_chunks != trailing:
+                    raise ValueError(
+                        f"vector field {name!r}: trailing chunk "
+                        f"{target_trailing_chunks} must equal trailing shape "
+                        f"{trailing} (the payload dim must be one whole chunk)"
+                    )
             array.set_block_selection(block_idx, slab)
     return store
 
