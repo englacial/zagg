@@ -146,7 +146,10 @@ jobs:
   distribute:
     name: Distribute zips to public bucket
     needs: github-release
-    if: vars.LAMBDA_RELEASE_ROLE_ARN != '' && vars.LAMBDA_DIST_BUCKET != ''
+    if: >-
+      vars.LAMBDA_RELEASE_ROLE_ARN != '' &&
+      vars.LAMBDA_DIST_BUCKET != '' &&
+      vars.LAMBDA_AWS_REGION != ''
     runs-on: ubuntu-latest
     permissions:
       id-token: write
@@ -182,7 +185,14 @@ jobs:
   deploy-prod:
     name: Deploy production Lambda
     needs: [github-release, distribute]
-    if: vars.LAMBDA_RELEASE_ROLE_ARN != ''
+    # Gate on EVERY var this job consumes (not just the role): the "no
+    # unstaged-layer deploy" safety currently rests on distribute's skip
+    # propagating here, and a partial config must skip, never half-deploy prod.
+    if: >-
+      vars.LAMBDA_RELEASE_ROLE_ARN != '' &&
+      vars.LAMBDA_DIST_BUCKET != '' &&
+      vars.LAMBDA_AWS_REGION != '' &&
+      vars.LAMBDA_PROD_FUNCTION_NAME != ''
     runs-on: ubuntu-latest
     environment: production
     permissions:
@@ -207,7 +217,7 @@ jobs:
         REGION: ${{ vars.LAMBDA_AWS_REGION }}
       run: |
         set -euo pipefail
-        FN="${FUNCTION_NAME:-process-shard}"
+        FN="$FUNCTION_NAME"  # guaranteed non-empty by the job `if:`
         # Publish a new layer version from the just-distributed S3 object, then
         # point the function at it (config update must settle before the code update).
         LAYER_ARN=$(aws lambda publish-layer-version \
