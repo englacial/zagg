@@ -132,3 +132,78 @@ def test_mortie_version_asserted(monkeypatch):
         aoi._assert_mortie_version()
     monkeypatch.setattr(mortie, "__version__", "0.8.2", raising=False)
     aoi._assert_mortie_version()  # no raise
+
+
+class TestRectilinearMask:
+    def _grid(self):
+        from zagg.grids import RectilinearGrid
+
+        # A 20x20 m grid in a metres CRS; cell centers fall on (5,15,...)+10k offsets.
+        return RectilinearGrid(
+            crs="EPSG:3413",
+            resolution=1000.0,
+            bounds=[0.0, 0.0, 20000.0, 20000.0],
+            chunk_shape=(4, 4),
+        )
+
+    def test_mask_matches_center_contains(self):
+        from shapely.geometry import Point
+
+        grid = self._grid()
+        # AOI: a WGS84 box; reproject via the grid path and test each child center.
+        parts = _box(60.0, -40.0, 75.0, -20.0)
+        aoi_geom = grid.aoi_polygon(parts)
+        shard = 0
+        children = grid.children(shard)
+        mask = grid.aoi_mask_for_children(aoi_geom, children)
+        xs, ys = grid.cell_centers(children)
+        expected = np.fromiter(
+            (aoi_geom.contains(Point(x, y)) for x, y in zip(xs, ys)),
+            dtype=bool,
+            count=len(children),
+        )
+        assert mask.dtype == bool
+        assert mask.shape == np.asarray(children).shape
+        np.testing.assert_array_equal(mask, expected)
+
+    def test_fully_inside_aoi_all_true(self):
+        # An AOI polygon directly in grid CRS covering the whole grid -> all True.
+        grid = self._grid()
+        # Build a generous WGS84 polygon by reprojecting the grid bounds back out:
+        # instead, reproject a grid-CRS box. Use cell-center membership against an
+        # explicit grid-CRS rectangle that contains every center.
+        from shapely.geometry import box as shapely_box
+
+        aoi_geom = shapely_box(-1000.0, -1000.0, 21000.0, 21000.0)
+        for shard in (0, 1, grid.n_col_blocks):
+            children = grid.children(shard)
+            mask = grid.aoi_mask_for_children(aoi_geom, children)
+            assert mask.all()
+
+    def test_outside_aoi_all_false(self):
+        from shapely.geometry import box as shapely_box
+
+        grid = self._grid()
+        # A grid-CRS rectangle far from any cell center -> no cell inside.
+        aoi_geom = shapely_box(-50000.0, -50000.0, -40000.0, -40000.0)
+        children = grid.children(0)
+        mask = grid.aoi_mask_for_children(aoi_geom, children)
+        assert not mask.any()
+
+    def test_partial_aoi_is_mixed(self):
+        from shapely.geometry import box as shapely_box
+
+        grid = self._grid()
+        # A grid-CRS rectangle covering only the left half of the 0,0 shard tile.
+        aoi_geom = shapely_box(-1000.0, -1000.0, 2000.0, 21000.0)
+        children = grid.children(0)  # 4x4 tile, cols 0..3 at x-centers 500..3500
+        mask = grid.aoi_mask_for_children(aoi_geom, children)
+        assert mask.any() and not mask.all()
+
+    def test_cell_centers_roundtrip(self):
+        grid = self._grid()
+        children = grid.children(0)
+        xs, ys = grid.cell_centers(children)
+        # First child is leaf 0 -> row 0, col 0 -> center (xmin+0.5*res, ymax-0.5*res).
+        assert xs[0] == grid.xmin + 0.5 * grid.res_x
+        assert ys[0] == grid.ymax - 0.5 * grid.res_y

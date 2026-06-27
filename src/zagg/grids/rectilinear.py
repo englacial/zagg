@@ -397,6 +397,40 @@ class RectilinearGrid:
         """Identity for rectilinear (output coord is the flat cell id)."""
         return np.asarray(cell_ids, dtype=np.int64)
 
+    def cell_centers(self, leaf_ids):
+        """Cell-center ``(xs, ys)`` in grid CRS for row-major flat ``leaf_ids``."""
+        v = np.asarray(leaf_ids, dtype=np.int64)
+        rows = v // self.width
+        cols = v % self.width
+        xs = self.xmin + (cols + 0.5) * self.res_x
+        ys = self.ymax - (rows + 0.5) * self.res_y
+        return xs, ys
+
+    # ── strict-AOI cell mask (issue #101, optional) ─────────────────────────
+
+    def aoi_polygon(self, polygon_parts):
+        """Reproject the AOI ``[(lats, lons), ...]`` parts to the grid CRS.
+
+        Built once at the shard-map stage (same ``to_crs`` reprojection
+        :meth:`coverage` uses); the per-shard boolean (:meth:`aoi_mask_for_children`)
+        is precomputed against it and carried in the manifest.
+        """
+        from zagg.grids.aoi import rectilinear_aoi_polygon
+
+        return rectilinear_aoi_polygon(polygon_parts, self._geobox.crs)
+
+    def aoi_mask_for_children(self, aoi_geom, children) -> np.ndarray:
+        """Boolean over ``children`` — ``True`` where the cell center is in the AOI.
+
+        ``aoi_geom`` is the reprojected polygon (:meth:`aoi_polygon`); ``children``
+        the chunk's row-major flat cell ids (``children``). Cell centers are tested
+        with a prepared-geometry ``contains``.
+        """
+        from zagg.grids.aoi import rectilinear_mask_for_centers
+
+        xs, ys = self.cell_centers(children)
+        return rectilinear_mask_for_centers(aoi_geom, xs, ys)
+
     def chunk_coords(self, shard_key) -> dict:
         """No per-cell coord columns; x/y are 1D dimensional coords on the template."""
         return {}
