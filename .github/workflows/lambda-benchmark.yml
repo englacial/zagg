@@ -1,0 +1,126 @@
+name: Lambda Benchmark
+
+# Cost/runtime regression tracking on real Lambda (issue #110).
+#   * non-fork PR to main, non-draft -> run + post an (ephemeral) PR comment
+#   * push to main (a merge)        -> run + retain to the `benchmarks` data
+#                                      branch and re-render the Pages charts
+# Fork PRs are handled on demand (label / slash-command) in
+# lambda-benchmark-command.yml so untrusted code never auto-runs with creds.
+
+on:
+  pull_request:
+    branches: [main]
+    types: [opened, synchronize, reopened, ready_for_review]
+  push:
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      targets:
+        description: Space-separated target keys (empty = all)
+        required: false
+        default: ""
+
+permissions:
+  contents: read
+  id-token: write
+  pull-requests: write
+
+jobs:
+  pr-comment:
+    # Same-repo PRs only (forks can't be trusted with the role); skip drafts.
+    if: >-
+      github.event_name == 'pull_request' &&
+      github.event.pull_request.head.repo.full_name == github.repository &&
+      github.event.pull_request.draft == false
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout PR head
+        uses: actions/checkout@v5
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+
+      - name: Run benchmark
+        uses: ./.github/actions/run-benchmark
+        with:
+          role-arn: ${{ vars.BENCHMARK_ROLE_ARN }}
+          aws-region: ${{ vars.BENCHMARK_AWS_REGION }}
+          function-name: ${{ vars.BENCHMARK_FUNCTION_NAME }}
+          store-prefix: ${{ vars.BENCHMARK_STORE_PREFIX }}
+          event: pr
+          commit: ${{ github.event.pull_request.head.sha }}
+          ref-label: ${{ github.head_ref }}
+          pr-number: ${{ github.event.pull_request.number }}
+
+      - name: Upsert PR comment
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs');
+            const body = fs.readFileSync('comment.md', 'utf8');
+            const marker = '<!-- zagg-benchmark -->';
+            const { owner, repo } = context.repo;
+            const issue_number = context.payload.pull_request.number;
+            const { data: comments } = await github.rest.issues.listComments({ owner, repo, issue_number });
+            const existing = comments.find(c => c.body && c.body.includes(marker));
+            if (existing) {
+              await github.rest.issues.updateComment({ owner, repo, comment_id: existing.id, body });
+            } else {
+              await github.rest.issues.createComment({ owner, repo, issue_number, body });
+            }
+
+  merge-publish:
+    if: github.event_name == 'push' || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    # contents: write to push the series + charts to the benchmarks branch.
+    permissions:
+      contents: write
+      id-token: write
+    # Serialize so concurrent merges don't race on the benchmarks branch.
+    concurrency:
+      group: lambda-benchmark-publish
+      cancel-in-progress: false
+    steps:
+      - name: Checkout merge commit
+        uses: actions/checkout@v5
+
+      - name: Run benchmark
+        uses: ./.github/actions/run-benchmark
+        with:
+          targets: ${{ github.event.inputs.targets }}
+          role-arn: ${{ vars.BENCHMARK_ROLE_ARN }}
+          aws-region: ${{ vars.BENCHMARK_AWS_REGION }}
+          function-name: ${{ vars.BENCHMARK_FUNCTION_NAME }}
+          store-prefix: ${{ vars.BENCHMARK_STORE_PREFIX }}
+          event: merge
+          commit: ${{ github.sha }}
+          ref-label: ${{ github.ref_name }}
+
+      - name: Check out benchmarks data branch
+        uses: actions/checkout@v5
+        with:
+          ref: benchmarks
+          path: _series
+          fetch-depth: 0
+
+      - name: Append series + render charts
+        run: |
+          set -euo pipefail
+          uv sync --extra benchmark
+          uv run python .github/scripts/update_series.py \
+            --series _series/series.parquet --records metrics.json
+          uv run python .github/scripts/plot_series.py \
+            --series _series/series.parquet --out _series/site
+
+      - name: Commit + push to benchmarks branch
+        working-directory: _series
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add series.parquet site
+          if git diff --cached --quiet; then
+            echo "no benchmark changes to commit"
+          else
+            git commit -m "benchmark: ${{ github.sha }}"
+            git push origin benchmarks
+          fi
