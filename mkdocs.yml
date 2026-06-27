@@ -23,6 +23,7 @@ nav:
   - "Design":
       - "Architecture": "design/architecture.md"
       - "Schema": "design/schema.md"
+      - "Sharded output": "sharding.md"
   - "Deployment":
       - "Standing Up the Backend": "deployment/standup.md"
       - "AWS Lambda": "deployment/lambda.md"
