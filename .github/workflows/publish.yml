@@ -199,6 +199,7 @@ jobs:
       id-token: write
       contents: read
     steps:
+    - uses: actions/checkout@v5
     - name: Download arm64 function zip
       uses: actions/download-artifact@v4
       with:
@@ -217,19 +218,10 @@ jobs:
         REGION: ${{ vars.LAMBDA_AWS_REGION }}
       run: |
         set -euo pipefail
-        FN="$FUNCTION_NAME"  # guaranteed non-empty by the job `if:`
-        # Publish a new layer version from the just-distributed S3 object, then
-        # point the function at it (config update must settle before the code update).
-        LAYER_ARN=$(aws lambda publish-layer-version \
-          --layer-name "${FN}-deps" \
-          --content "S3Bucket=${DIST_BUCKET},S3Key=${MINOR}/lambda_layer_arm64.zip" \
-          --compatible-architectures arm64 \
-          --compatible-runtimes python3.12 \
-          --region "$REGION" \
-          --query LayerVersionArn --output text)
-        aws lambda update-function-configuration \
-          --function-name "$FN" --layers "$LAYER_ARN" --region "$REGION"
-        aws lambda wait function-updated --function-name "$FN" --region "$REGION"
-        ZIP=$(ls fn/lambda_function_arm64_*.zip)
-        aws lambda update-function-code \
-          --function-name "$FN" --zip-file "fileb://$ZIP" --publish --region "$REGION"
+        # Layer was staged to the dist bucket by `distribute` (this job needs it).
+        .github/scripts/deploy_lambda.sh \
+          --function "$FUNCTION_NAME" \
+          --layer-bucket "$DIST_BUCKET" \
+          --layer-key "${MINOR}/lambda_layer_arm64.zip" \
+          --function-zip "$(ls fn/lambda_function_arm64_*.zip)" \
+          --region "$REGION"
