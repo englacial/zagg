@@ -303,3 +303,24 @@ def test_plot_series_empty_writes_placeholder(tmp_path):
     # No data -> index exists with placeholder, no PNGs.
     assert (outdir / "index.html").exists()
     assert not (outdir / "cost_per_shard.png").exists()
+
+
+def test_update_series_main_retains_merge_only(tmp_path):
+    path = tmp_path / "series.parquet"
+    recs = [
+        _rec_row("m1", "t1", event="merge"),
+        _rec_row("p1", "t1", event="pr"),  # ephemeral PR run -> must not be retained
+    ]
+    update_series.main(["--series", str(path), "--records", str(_write_json(tmp_path, recs))])
+    out = update_series.load_series(path)
+    assert set(out["commit"]) == {"m1"}
+
+
+def test_make_figure_returns_false_when_no_targets(tmp_path):
+    pytest.importorskip("matplotlib")
+    import plot_series
+
+    # Rows that are merges but carry no target label -> nothing to panel, no crash.
+    rows = [_rec_row("c1", None, event="merge")]
+    df = update_series.records_to_frame(rows)
+    assert plot_series.make_figure(df, "cost_per_shard_usd", "cost", tmp_path / "x.png") is False

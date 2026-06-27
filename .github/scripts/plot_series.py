@@ -48,6 +48,8 @@ def make_figure(df: pd.DataFrame, cost_col: str, cost_label: str, out_png: Path)
 
     targets = sorted(hist["target"].dropna().unique())
     n = len(targets)
+    if n == 0:  # rows present but no usable target labels -> nothing to panel
+        return False
     ncols = min(2, n)
     nrows = math.ceil(n / ncols)
     fig, axes = plt.subplots(nrows, ncols, figsize=(7 * ncols, 3.2 * nrows), squeeze=False)
