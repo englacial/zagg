@@ -1,0 +1,60 @@
+{
+  "description": "Pinned Lambda-benchmark targets (issue #110). Each target dispatches ONE shard -- the densest cell over the NEON SERC AOP box -- so cost/runtime deltas track code changes, not data drift. Shard maps are shared per (grid, order): the densest shard does not depend on the aggregator. Rebuild + drift check: tests/test_benchmark_shardmap.py.",
+  "aoi": {
+    "file": "AOP_NEON.geojson",
+    "name": "NEON SERC AOP box"
+  },
+  "temporal": {
+    "start": "2018-10-13",
+    "end": "2025-06-01"
+  },
+  "cmr": {
+    "short_name": "ATL03",
+    "version": "007",
+    "provider": "NSIDC_CPRD",
+    "backend": "mortie",
+    "footprint": "swath"
+  },
+  "shardmaps": {
+    "healpix_o11": {
+      "path": "shardmaps/sm_healpix_o11.json",
+      "shard_key": 5347394812217655307,
+      "n_granules": 44
+    },
+    "healpix_o10": {
+      "path": "shardmaps/sm_healpix_o10.json",
+      "shard_key": 5347405532456026122,
+      "n_granules": 50
+    }
+  },
+  "targets": {
+    "gain_bias_healpix_o11": {
+      "config": "configs/atl03_gain_bias_healpix_o11.yaml",
+      "shardmap": "healpix_o11",
+      "aggregator": "gain_bias",
+      "grid_type": "healpix",
+      "grid_size": "o11"
+    },
+    "tdigest_healpix_o11": {
+      "config": "configs/atl03_tdigest_healpix_o11.yaml",
+      "shardmap": "healpix_o11",
+      "aggregator": "tdigest",
+      "grid_type": "healpix",
+      "grid_size": "o11"
+    },
+    "gain_bias_healpix_o10": {
+      "config": "configs/atl03_gain_bias_healpix_o10.yaml",
+      "shardmap": "healpix_o10",
+      "aggregator": "gain_bias",
+      "grid_type": "healpix",
+      "grid_size": "o10"
+    },
+    "tdigest_healpix_o10": {
+      "config": "configs/atl03_tdigest_healpix_o10.yaml",
+      "shardmap": "healpix_o10",
+      "aggregator": "tdigest",
+      "grid_type": "healpix",
+      "grid_size": "o10"
+    }
+  }
+}
