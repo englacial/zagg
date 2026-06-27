@@ -140,6 +140,68 @@ def chunk_array_spec(base, *, chunk_grid_shape, chunk_dims):
     )
 
 
+def sharded_array_spec(base, *, shard_shape, inner_chunk_shape):
+    """Wrap a dense data-var ``ArraySpec`` in a zarr ``ShardingCodec`` (issue #108).
+
+    Decouples the **write/dispatch** granularity (one shard object per dispatch
+    shard) from the **read** granularity (the inner 64×64 chunk). The K inner
+    chunks of one shard become ONE shard object (empties omitted from the shard
+    index, so sub-shard sparsity is preserved *inside* the object) instead of K
+    independent regular chunk objects.
+
+    The transform: the array's outer chunk grid is re-set to ``shard_shape`` (the
+    whole dispatch shard) and a ``sharding_indexed`` codec replaces the array's
+    top-level codecs, carrying the inner ``chunk_shape`` (the 64×64 read chunk)
+    plus the array's existing (bytes-only) codecs as its INNER codecs. Building
+    the codec config by hand — rather than ``ArraySpec.from_array`` (which drops
+    the sharding codec in pydantic-zarr 0.10.0) or ``zarr.create_array`` (which
+    silently injects a zstd level-0 compressor) — is what preserves zagg's
+    bytes-only/uncompressed on-disk policy (the two prototype caveats on
+    issue #108).
+
+    Parameters
+    ----------
+    base : ArraySpec
+        The dense data-var spec whose ``chunk_grid`` currently chunks at the
+        inner chunk shape; its ``codecs`` are the bytes-only inner codecs.
+    shard_shape : tuple of int
+        Outer chunk (== shard) shape: the whole dispatch shard's cell extent.
+    inner_chunk_shape : tuple of int
+        Inner chunk shape (the 64×64 read chunk); ``prod(shard_shape) //
+        prod(inner_chunk_shape) == K`` inner chunks per shard.
+
+    Returns
+    -------
+    ArraySpec
+    """
+    from pydantic_zarr.experimental.v3 import NamedConfig
+
+    inner_codecs = [c.model_dump() if hasattr(c, "model_dump") else dict(c) for c in base.codecs]
+    # crc32c on the shard index matches zarr's create_array default; the index
+    # payload is bytes-only (no compression), keeping the policy bytes-only.
+    index_codecs = [
+        {"name": "bytes", "configuration": {"endian": "little"}},
+        {"name": "crc32c"},
+    ]
+    sharding = NamedConfig(
+        name="sharding_indexed",
+        configuration={
+            "chunk_shape": list(inner_chunk_shape),
+            "codecs": inner_codecs,
+            "index_codecs": index_codecs,
+            "index_location": "end",
+        },
+    )
+    chunk_grid = NamedConfig(name="regular", configuration={"chunk_shape": list(shard_shape)})
+    return type(base)(
+        **{
+            **base.model_dump(),
+            "chunk_grid": chunk_grid,
+            "codecs": (sharding,),
+        }
+    )
+
+
 class InconsistentShardError(ValueError):
     """Raised by shard_of when input cells don't all share a shard."""
 
@@ -246,4 +308,5 @@ __all__ = [
     "InconsistentShardError",
     "vector_array_spec",
     "chunk_array_spec",
+    "sharded_array_spec",
 ]
