@@ -94,6 +94,8 @@ jobs:
           aws-region: ${{ vars.BENCHMARK_AWS_REGION }}
           function-name: ${{ vars.BENCHMARK_FUNCTION_NAME }}
           store-prefix: ${{ vars.BENCHMARK_STORE_PREFIX }}
+          edl-username: ${{ secrets.EARTHDATA_USERNAME }}
+          edl-password: ${{ secrets.EARTHDATA_PASSWORD }}
           event: pr
           commit: ${{ needs.check.outputs.pr_sha }}
           ref-label: ${{ needs.check.outputs.head_ref }}
