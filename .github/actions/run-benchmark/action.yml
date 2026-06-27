@@ -42,6 +42,11 @@ inputs:
     description: PR number, when this is a PR run
     required: false
     default: ""
+  worker-note:
+    description: One-line PR-comment banner when the benchmarked worker is the stable
+      deploy, not this ref's code (issue #25)
+    required: false
+    default: ""
 
 runs:
   using: composite
@@ -77,6 +82,7 @@ runs:
         COMMIT: ${{ inputs.commit }}
         REF_LABEL: ${{ inputs.ref-label }}
         PR_NUMBER: ${{ inputs.pr-number }}
+        WORKER_NOTE: ${{ inputs.worker-note }}
         # earthaccess.login() reads these to mint the NSIDC S3 read creds the
         # orchestrator forwards to Lambda. Masked: they arrive from secrets.
         EARTHDATA_USERNAME: ${{ inputs.edl-username }}
@@ -97,6 +103,7 @@ runs:
           --store-prefix "$STORE_PREFIX" \
           --region "$AWS_REGION" \
           --function-name "$FUNCTION_NAME" \
+          --worker-note "$WORKER_NOTE" \
           --event "$EVENT" \
           --commit "$COMMIT" \
           --ref "$REF_LABEL" \

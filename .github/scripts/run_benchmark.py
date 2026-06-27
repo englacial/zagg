@@ -148,6 +148,12 @@ def main(argv: list[str] | None = None) -> int:
         action="store_true",
         help="Skip Lambda dispatch; emit empty-metric records (wiring check).",
     )
+    parser.add_argument(
+        "--worker-note",
+        default="",
+        help="One-line banner for the PR comment when the benchmarked worker is "
+        "the stable deploy, not this PR's code (issue #25).",
+    )
     args = parser.parse_args(argv)
 
     manifest, base = load_targets(args.targets)
@@ -188,7 +194,9 @@ def main(argv: list[str] | None = None) -> int:
 
     Path(args.out_json).write_text(json.dumps(records, indent=2))
     if args.out_comment:
-        Path(args.out_comment).write_text(bench_metrics.comment_markdown(records))
+        Path(args.out_comment).write_text(
+            bench_metrics.comment_markdown(records, worker_note=args.worker_note)
+        )
     return 0
 
 

@@ -147,6 +147,17 @@ def test_comment_markdown_empty():
     assert "<!-- zagg-benchmark -->" in bench_metrics.comment_markdown([])
 
 
+def test_comment_markdown_worker_note_banner():
+    g = HealpixGrid(parent_order=11, child_order=19)
+    rec = bench_metrics.build_record(_summary(), grid=g, context={"target": "t", "commit": "abc"})
+    note = "Worker = stable main, not this PR's code."
+    md = bench_metrics.comment_markdown([rec], worker_note=note)
+    assert f"> ⚠️ {note}" in md  # banner rendered above the table
+    assert md.index(note) < md.index("| target |")  # ...and before the table
+    # Default (no note) has no banner.
+    assert "⚠️" not in bench_metrics.comment_markdown([rec])
+
+
 # --- run_benchmark wiring (dry-run, no AWS) -------------------------------
 
 

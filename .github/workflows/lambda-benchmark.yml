@@ -45,6 +45,7 @@ jobs:
     outputs:
       affecting: ${{ steps.d.outputs.affecting }}
       function_name: ${{ steps.d.outputs.function_name }}
+      worker_note: ${{ steps.d.outputs.worker_note }}
     steps:
       - uses: actions/checkout@v5
         with:
@@ -83,13 +84,20 @@ jobs:
             if echo "$CHANGED" | grep -qE '^(src/zagg/|deployment/aws/|pyproject\.toml)'; then touched=true; fi
           fi
 
+          note=""
           if [ "$deployable" = "true" ] && [ "$touched" = "true" ]; then
             echo "affecting=true" >> "$GITHUB_OUTPUT"
             echo "function_name=$TEST_FN" >> "$GITHUB_OUTPUT"
           else
             echo "affecting=false" >> "$GITHUB_OUTPUT"
             echo "function_name=$STABLE_FN" >> "$GITHUB_OUTPUT"
+            # Benchmarking stable, but the change touches deployed code -> the
+            # numbers don't reflect this PR's worker. Flag it in the comment.
+            if [ "$touched" = "true" ]; then
+              note="Worker = stable \`main\`, not this PR's code — it changes lambda-deployed code but wasn't redeployed, so cost/runtime here don't reflect it. Real numbers land on merge."
+            fi
           fi
+          echo "worker_note=$note" >> "$GITHUB_OUTPUT"
 
   # Build the arm64 zips and update process-shard-test in place (only when the
   # change is lambda-affecting). Serialized with the benchmark via the workflow
@@ -174,6 +182,7 @@ jobs:
           commit: ${{ github.event.pull_request.head.sha }}
           ref-label: ${{ github.head_ref }}
           pr-number: ${{ github.event.pull_request.number }}
+          worker-note: ${{ needs.detect.outputs.worker_note }}
 
       - name: Upsert PR comment
         uses: actions/github-script@v7

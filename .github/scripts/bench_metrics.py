@@ -140,21 +140,27 @@ def _fmt(value, spec: str = "") -> str:
     return format(value, spec) if spec else str(value)
 
 
-def comment_markdown(records: list[dict]) -> str:
+def comment_markdown(records: list[dict], worker_note: str = "") -> str:
     """Render a PR comment table from one run's benchmark records.
 
     Ephemeral (posted on PRs, not retained -- issue #110): one row per target so a
     reviewer sees cost/runtime regressions in the PR thread without the noise of
     keeping every pre-merge point in the series.
+
+    ``worker_note`` (issue #25): a one-line banner shown above the table when the
+    benchmark ran against the *stable* deployed worker but the PR touches
+    lambda-deployed code -- so the numbers don't reflect this PR. Keeps a
+    plausible-but-wrong figure from reading as real.
     """
+    marker = "<!-- zagg-benchmark -->"
     if not records:
-        return "<!-- zagg-benchmark -->\nNo benchmark records were produced."
+        return f"{marker}\nNo benchmark records were produced."
 
     head = records[0]
-    lines = [
-        "<!-- zagg-benchmark -->",
-        f"### Lambda benchmark — `{_fmt(head.get('commit'))[:7]}`",
-        "",
+    lines = [marker, f"### Lambda benchmark — `{_fmt(head.get('commit'))[:7]}`", ""]
+    if worker_note:
+        lines += [f"> ⚠️ {worker_note}", ""]
+    lines += [
         "| target | obs | runtime (s) | cost/shard | cost/100 km² | % timeout |",
         "| --- | ---: | ---: | ---: | ---: | ---: |",
     ]
