@@ -207,9 +207,12 @@ class TestRectilinearMask:
         xs, ys = grid.cell_centers(children)
         clon, clat = to_wgs.transform(xs, ys)
         oracle = (clon >= lon0) & (clon <= lon1) & (clat >= lat0) & (clat <= lat1)
-        # Straight-chord vs geodesic edge: allow boundary-cell slop, exact interior.
+        # Straight-chord vs geodesic edge is sub-cell at 1 km / mid-latitude UTM,
+        # so the two oracles agree exactly here. Assert exact agreement so a real
+        # containment regression (tile shift, boundary-handling change) can't hide
+        # under a loose threshold.
         agree = mask == oracle
-        assert agree.mean() > 0.9
+        assert agree.all()
         # Non-degenerate: the AOI genuinely cuts this shard (independent of contains).
         assert mask.any() and not mask.all()
 

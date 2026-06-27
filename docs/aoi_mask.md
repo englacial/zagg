@@ -92,6 +92,9 @@ strict = ds.where(ds["aoi_mask"])
   (espg/mortie#71).
 
 See the runnable, data-free example in
-[`notebooks/aoi_mask.ipynb`](https://github.com/englacial/zagg/blob/main/notebooks/aoi_mask.ipynb)
-(launchable on Binder), which builds a small HEALPix grid + AOI box and shows the
-mask is `True` exactly for the in-AOI cells.
+[`notebooks/aoi_mask.ipynb`](https://github.com/englacial/zagg/blob/main/notebooks/aoi_mask.ipynb),
+which builds a small HEALPix grid + AOI box and shows the mask is `True` exactly
+for the in-AOI cells. The notebook is self-contained (no remote data) and runs
+anywhere `zagg` (with `mortie>=0.8.2`) is installed. Binder launch additionally
+needs the repo-wide `.binder/` environment, which lands separately via #105; until
+then the Binder badge won't resolve `zagg` + `mortie` on a default build.

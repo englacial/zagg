@@ -193,12 +193,14 @@ def _compute_aoi_mask(grid, parts, shard_keys) -> list:
 
     Computed once here (the shard-map stage) so the local worker expands it with
     no region plumbing — the mask depends only on (grid, AOI), never on
-    observations. Dispatches on the grid's AOI API: ``aoi_moc`` (HEALPix native
-    morton) vs ``aoi_polygon`` (rectilinear shapely centers). A grid exposing
-    neither with the flag on is a misconfiguration, raised here rather than left to
-    a cryptic ``AttributeError`` downstream.
+    observations. Dispatches on the same HEALPix predicate the rest of this module
+    uses (``parent_order`` + ``child_order``), then branches to the native morton
+    ``aoi_moc`` path vs the rectilinear shapely-center ``aoi_polygon`` path. A grid
+    that is neither (no AOI API) with the flag on is a misconfiguration, raised here
+    rather than left to a cryptic ``AttributeError`` downstream.
     """
-    if hasattr(grid, "aoi_moc"):
+    is_healpix = hasattr(grid, "parent_order") and hasattr(grid, "child_order")
+    if is_healpix:
         aoi_moc = grid.aoi_moc(parts)
         return [[int(w) for w in grid.aoi_shard_moc(aoi_moc, int(k))] for k in shard_keys]
     if hasattr(grid, "aoi_polygon"):
