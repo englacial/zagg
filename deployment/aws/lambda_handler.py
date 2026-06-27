@@ -310,16 +310,18 @@ def _handle_process(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
                         grid=grid,
                         shard_key=ragged_key,
                     )
+                # Record the write-phase timing (issue #100) only on a clean write:
+                # read/index/aggregate come from ``process_shard``; ``write`` is owned
+                # here and joins the same sub-dict. Recording inside the ``try`` (and
+                # after the early-return template-missing 500) keeps ``write`` absent
+                # on every failure path, so the runner's per-phase max rollup never
+                # folds in a time-to-failure as a real write duration. The no-data
+                # path returns earlier without writing, so ``write`` stays absent too.
+                if profile and "phase_timings" in metadata:
+                    metadata["phase_timings"]["write"] = time.time() - _write_t0
             except Exception as e:
                 logger.error(f"Failed to write zarr to {store_path}: {e}")
                 metadata["error"] = f"Failed to write zarr: {e}"
-
-        # Record the write-phase timing (issue #100). read/index/aggregate come
-        # from ``process_shard``; ``write`` is owned here, so it joins the same
-        # sub-dict only when profiling and a write actually ran (non-empty
-        # ``chunk_results``). The no-data path leaves ``write`` absent.
-        if profile and chunk_results and "phase_timings" in metadata:
-            metadata["phase_timings"]["write"] = time.time() - _write_t0
 
         # Log structured result
         logger.info(
