@@ -208,6 +208,11 @@ def validate_config(config: PipelineConfig) -> None:
         if layout is not None and layout not in ("dense", "fullsphere"):
             raise ValueError(f"output.grid.layout must be 'dense' or 'fullsphere' (got {layout!r})")
 
+    # Optional strict-AOI cell mask (issue #101), default off. Must be a bool.
+    aoi_mask = config.output.get("aoi_mask")
+    if aoi_mask is not None and not isinstance(aoi_mask, bool):
+        raise ValueError(f"output.aoi_mask must be a boolean (got {aoi_mask!r})")
+
     # Validate bounds structure (optional)
     if config.bounds is not None:
         allowed_keys = {"temporal", "spatial"}
@@ -1182,6 +1187,25 @@ def get_store_path(config: PipelineConfig) -> str | None:
     str or None
     """
     return config.output.get("store")
+
+
+def get_aoi_mask(config: PipelineConfig) -> bool:
+    """Whether the optional strict-AOI cell mask is enabled (issue #101).
+
+    ``output.aoi_mask: true`` packages a per-cell boolean ``aoi_mask`` array
+    aligned to the output cell grid, ``True`` where the cell is inside the AOI.
+    Defaults to ``False`` — when off, no array is emitted and outputs are
+    byte-identical to a run without the feature.
+
+    Parameters
+    ----------
+    config : PipelineConfig
+
+    Returns
+    -------
+    bool
+    """
+    return bool(config.output.get("aoi_mask", False))
 
 
 def get_output_endpoint_url(config: PipelineConfig) -> str | None:

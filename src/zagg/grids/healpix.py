@@ -13,6 +13,7 @@ from zagg.config import (
     PipelineConfig,
     default_config,
     get_agg_fields,
+    get_aoi_mask,
     get_output_signature,
     output_field_signature,
 )
@@ -241,6 +242,17 @@ class HealpixGrid:
 
         return healpix_mask_for_children(shard_moc, children, self.child_order)
 
+    def aoi_mask_from_payload(self, payload, children) -> np.ndarray:
+        """Expand a manifest per-shard payload to a per-cell bool over ``children``.
+
+        For HEALPix the payload is the compact sub-MOC (uint64 words as ints), so
+        this is :meth:`aoi_mask_for_children` over the chunk's cells. Used by the
+        worker, which has only the JSON payload (no recompute) — see
+        ``catalog.shardmap._compute_aoi_mask``.
+        """
+        shard_moc = np.asarray(payload, dtype=np.uint64)
+        return self.aoi_mask_for_children(shard_moc, children)
+
     def assign(self, lats, lons) -> np.ndarray:
         """Map (lat, lon) points to morton IDs at the HEALPix reference order.
 
@@ -418,6 +430,12 @@ class HealpixGrid:
             dtype = meta.get("dtype", "float32")
             fill = meta.get("fill_value", "NaN")
             members[name] = base.with_data_type(dtype).with_fill_value(fill)
+        # Optional strict-AOI cell mask (issue #101): a bool array aligned to the
+        # cell grid, emitted only when ``output.aoi_mask`` is on so off-runs stay
+        # byte-identical. fill_value False — cells never written (out-of-AOI shards,
+        # or cells the worker leaves untouched) read as not-in-AOI.
+        if get_aoi_mask(self.config):
+            members["aoi_mask"] = base.with_data_type("bool").with_fill_value(False)
         for name, meta in get_agg_fields(self.config).items():
             sig = get_output_signature(meta)
             # Ragged fields (issue #48) are stored as CSR subgroups

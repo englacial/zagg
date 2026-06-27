@@ -56,6 +56,7 @@ def process_shard(
     handoff: str = "pandas",
     ragged_out: dict | None = None,
     chunk_results: list | None = None,
+    aoi_payload=None,
 ) -> Tuple[pd.DataFrame, ProcessingMetadata]:
     """Process one shard: read granules, filter to this shard, aggregate, return df.
 
@@ -102,6 +103,13 @@ def process_shard(
         ragged payloads exactly as before (byte-for-byte unchanged). At K>1 (see
         ``chunk_results``) the ragged payloads are delivered per chunk via that
         sink instead, and ``ragged_out`` is left untouched.
+    aoi_payload : optional
+        The shard's strict-AOI mask payload (issue #101) from the manifest's
+        ``aoi_mask`` list — a compact MOC (HEALPix) or in-AOI cell ids
+        (rectilinear). When given, each chunk's carrier gains a per-cell ``bool``
+        ``aoi_mask`` column (``True`` where the cell is inside the AOI), expanded via
+        ``grid.aoi_mask_from_payload`` over the chunk's cells. ``None`` (default,
+        flag off) appends nothing — byte-for-byte unchanged.
     chunk_results : list, optional
         Out-param sink for the multi-chunk-per-worker path (issue #30 item 3).
         When the grid sets a finer ``chunk_inner`` (``K = grid.chunks_per_shard >
@@ -341,6 +349,14 @@ def process_shard(
                 agg_fields,
             )
             cells_with_data += cwd
+        # Strict-AOI per-cell mask (issue #101): expand the shard's manifest payload
+        # over THIS chunk's cells (order-aligned with the carrier). None when the
+        # flag is off, so the carrier is byte-for-byte unchanged.
+        chunk_aoi_mask = (
+            grid.aoi_mask_from_payload(aoi_payload, chunk_children)
+            if aoi_payload is not None and hasattr(grid, "aoi_mask_from_payload")
+            else None
+        )
         carrier = _build_output(
             stats_arrays,
             dense_vars,
@@ -349,6 +365,7 @@ def process_shard(
             shard_key,
             use_arrow=use_arrow,
             children=(chunk_children if chunks_per_shard > 1 else None),
+            aoi_mask=chunk_aoi_mask,
         )
         ragged = (
             {name: (ragged_payloads[name], ragged_idx[name]) for name in ragged_payloads}

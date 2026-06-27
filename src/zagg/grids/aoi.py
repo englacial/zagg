@@ -32,7 +32,7 @@ import numpy as np
 # The AOI MOC is built at ``child_order`` (the cell resolution), which can exceed
 # the legacy order-18 cap, so we assert the resolved mortie ships the lifted cap
 # rather than silently mis-sizing the mask against an 18-capped build.
-MIN_MORTIE_VERSION = (0, 8, 2)
+MIN_MORTIE_VERSION = "0.8.2"
 
 
 def _assert_mortie_version() -> None:
@@ -42,26 +42,29 @@ def _assert_mortie_version() -> None:
     raises for any ``child_order > 18``, so the AOI mask would silently come back
     empty (the swallowing ``except`` paths elsewhere) or wrongly sized. Assert here
     so a stale environment is a clear error at use, not a quiet bad mask.
+
+    Uses PEP 440 ordering (via ``packaging``) so a pre-release like ``0.8.2.devN``
+    — which is *before* the 0.8.2 tag that shipped the cap lift, hence still
+    18-capped — is correctly rejected, not waved through by a digits-only parse.
     """
     import mortie
+    from packaging.version import InvalidVersion, Version
 
-    raw = getattr(mortie, "__version__", "0")
-    parts: list[int] = []
-    for token in str(raw).split(".")[:3]:
-        digits = ""
-        for ch in token:
-            if ch.isdigit():
-                digits += ch
-            else:
-                break
-        parts.append(int(digits) if digits else 0)
-    while len(parts) < 3:
-        parts.append(0)
-    if tuple(parts) < MIN_MORTIE_VERSION:
+    raw = str(getattr(mortie, "__version__", "0"))
+    try:
+        resolved = Version(raw)
+    except InvalidVersion:
+        # An unparseable version string can't be proven new enough — refuse rather
+        # than silently run the MOC path against a possibly-capped build.
         raise RuntimeError(
-            f"aoi_mask requires mortie >= {'.'.join(map(str, MIN_MORTIE_VERSION))} "
-            f"(the order-29 MOC coverage cap, espg/mortie#59 + #70); resolved {raw}. "
-            "Upgrade mortie or disable output.aoi_mask."
+            f"aoi_mask requires mortie >= {MIN_MORTIE_VERSION}; could not parse the "
+            f"resolved mortie version {raw!r}. Upgrade mortie or disable output.aoi_mask."
+        ) from None
+    if resolved < Version(MIN_MORTIE_VERSION):
+        raise RuntimeError(
+            f"aoi_mask requires mortie >= {MIN_MORTIE_VERSION} (the order-29 MOC "
+            f"coverage cap, espg/mortie#59 + #70); resolved {raw}. Upgrade mortie "
+            "or disable output.aoi_mask."
         )
 
 

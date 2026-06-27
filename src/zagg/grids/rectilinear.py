@@ -46,6 +46,7 @@ from zagg.config import (
     PipelineConfig,
     default_config,
     get_agg_fields,
+    get_aoi_mask,
     get_output_signature,
     output_field_signature,
 )
@@ -431,6 +432,21 @@ class RectilinearGrid:
         xs, ys = self.cell_centers(children)
         return rectilinear_mask_for_centers(aoi_geom, xs, ys)
 
+    def aoi_mask_from_payload(self, payload, children) -> np.ndarray:
+        """Expand a manifest per-shard payload to a per-cell bool over ``children``.
+
+        For rectilinear the payload is the in-AOI cell ids (not positional indices),
+        so membership of ``children`` against them is the mask — order-independent,
+        so a K>1 chunk that enumerates a sub-tile still maps correctly. Used by the
+        worker, which has only the JSON payload (no shapely recompute) — see
+        ``catalog.shardmap._compute_aoi_mask``.
+        """
+        true_ids = np.asarray(payload, dtype=np.int64)
+        children = np.asarray(children, dtype=np.int64)
+        if true_ids.size == 0:
+            return np.zeros(children.shape, dtype=bool)
+        return np.isin(children, true_ids)
+
     def chunk_coords(self, shard_key) -> dict:
         """No per-cell coord columns; x/y are 1D dimensional coords on the template."""
         return {}
@@ -504,6 +520,11 @@ class RectilinearGrid:
             dtype = meta.get("dtype", "float32")
             fill = meta.get("fill_value", "NaN")
             members[name] = base.with_data_type(dtype).with_fill_value(fill)
+        # Optional strict-AOI cell mask (issue #101): a bool array aligned to the
+        # (y, x) cell grid, emitted only when ``output.aoi_mask`` is on so off-runs
+        # stay byte-identical. fill_value False — unwritten cells read as out-of-AOI.
+        if get_aoi_mask(self.config):
+            members["aoi_mask"] = base.with_data_type("bool").with_fill_value(False)
         for name, meta in get_agg_fields(self.config).items():
             sig = get_output_signature(meta)
             # Ragged fields (issue #48) are CSR subgroups written fresh by

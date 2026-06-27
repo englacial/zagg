@@ -274,6 +274,19 @@ def _select_cells(
     return pairs
 
 
+def _aoi_payload_map(catalog_data: dict) -> dict:
+    """Map ``shard_key -> AOI mask payload`` from a loaded manifest (issue #101).
+
+    Returns ``{}`` when the manifest has no ``aoi_mask`` list (the flag was off at
+    build), so the worker appends no mask column and outputs are byte-identical.
+    The ``aoi_mask`` list is parallel to ``shard_keys``.
+    """
+    aoi = catalog_data.get("aoi_mask")
+    if not aoi:
+        return {}
+    return {int(k): payload for k, payload in zip(catalog_data["shard_keys"], aoi)}
+
+
 def _dry_run_summary(cells: list[tuple], store_path: str) -> dict:
     """Return summary without processing.
 
@@ -327,7 +340,16 @@ def _check_signature(grid, catalog_data: dict) -> None:
 
 
 def _process_and_write(
-    shard_key, chunk_idx, records, grid, s3_creds, zarr_store, config, driver=None, handoff="pandas"
+    shard_key,
+    chunk_idx,
+    records,
+    grid,
+    s3_creds,
+    zarr_store,
+    config,
+    driver=None,
+    handoff="pandas",
+    aoi_payload=None,
 ):
     """Process a single shard and write its K finer chunks to the store.
 
@@ -350,6 +372,7 @@ def _process_and_write(
         driver=driver,
         handoff=handoff,
         chunk_results=chunk_results,
+        aoi_payload=aoi_payload,
     )
     single_chunk = len(chunk_results) == 1
     for block_index, carrier, ragged in chunk_results:
@@ -405,6 +428,10 @@ def _run_local(
     all_shards = list(catalog_data["shard_keys"])
 
     cells = _select_cells(catalog_data, morton_cell=morton_cell, max_cells=max_cells)
+    # Strict-AOI per-shard mask payload (issue #101), keyed by shard for the
+    # per-cell lookup. Empty dict when the manifest carries no ``aoi_mask`` (flag
+    # off) — the worker then appends no column and outputs stay byte-identical.
+    aoi_by_shard = _aoi_payload_map(catalog_data)
     logger.info(
         f"Processing {len(cells)} of {len(all_shards)} cells (local, {max_workers} workers, driver={driver})"
     )
@@ -444,6 +471,12 @@ def _run_local(
     # error path nothing is appended to ``results``, matching the old behavior.
     def _cell_work(payload):
         shard_key, records = payload
+        # Only thread aoi_payload when the manifest actually carries a mask (flag
+        # on); otherwise omit the kwarg entirely so the flag-off call is identical
+        # to the pre-feature signature.
+        extra = {}
+        if aoi_by_shard:
+            extra["aoi_payload"] = aoi_by_shard.get(int(shard_key))
         try:
             meta = _process_and_write(
                 shard_key,
@@ -455,6 +488,7 @@ def _run_local(
                 config,
                 driver=driver,
                 handoff=handoff,
+                **extra,
             )
             return {"shard_key": shard_key, "ok": True, "meta": meta}
         except Exception as e:

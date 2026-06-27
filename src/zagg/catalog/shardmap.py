@@ -183,6 +183,33 @@ def _region_parts(region, metadata) -> list:
     return [(np.array([y0, y0, y1, y1, y0]), np.array([x0, x1, x1, x0, x0]))]
 
 
+def _compute_aoi_mask(grid, parts, shard_keys) -> list:
+    """Per-shard strict-AOI mask payload (issue #101), parallel to ``shard_keys``.
+
+    HEALPix: each entry is the shard's compact sub-MOC of the AOI (``uint64`` words
+    as ints). Rectilinear: each entry is the True-cell indices into the shard's
+    ``children`` order (cell centers inside the reprojected AOI). The worker expands
+    the entry to a per-cell bool over ``children(shard_key)`` at write time.
+
+    Computed once here (the shard-map stage) so the worker/Lambda path needs no
+    region plumbing — the mask depends only on (grid, AOI), never on observations.
+    """
+    is_healpix = hasattr(grid, "aoi_moc")
+    if is_healpix:
+        aoi_moc = grid.aoi_moc(parts)
+        return [[int(w) for w in grid.aoi_shard_moc(aoi_moc, int(k))] for k in shard_keys]
+    # Rectilinear (or any center-test grid): the in-AOI cell ids per shard. Storing
+    # cell IDS (not positional indices) keeps the worker expansion order-independent,
+    # so a K>1 chunk that enumerates a sub-tile still maps correctly via membership.
+    aoi_geom = grid.aoi_polygon(parts)
+    out = []
+    for k in shard_keys:
+        children = np.asarray(grid.children(int(k)))
+        mask = grid.aoi_mask_for_children(aoi_geom, children)
+        out.append([int(c) for c in children[mask]])
+    return out
+
+
 # ── backends (operate on granule records) ────────────────────────────────────
 
 _SPHERELY_INSTALL_HINT = (
@@ -352,6 +379,13 @@ class ShardMap:
     shard_keys: List[int]
     granules: List[List[dict]]
     metadata: dict = field(default_factory=dict)
+    aoi_mask: List[List[int]] | None = None
+    """Optional strict-AOI per-shard mask payload (issue #101), parallel to
+    ``shard_keys``. ``None`` when ``output.aoi_mask`` is off (the default) — the
+    manifest then carries no extra key and is byte-identical to a pre-feature map.
+    Each entry is a JSON int list the grid expands to a per-cell bool over the
+    shard's ``children()``: a compact MOC (HEALPix) or the True-cell indices into
+    ``children`` order (rectilinear)."""
 
     @classmethod
     def build(
@@ -473,23 +507,38 @@ class ShardMap:
         }
         if chosen == "mortie":
             meta["mortie_order"] = mortie_order
-        return cls(grid.spatial_signature(), shard_keys, granules, meta)
+
+        # Strict-AOI mask (issue #101), default off: precompute a per-shard payload
+        # so the worker can package the per-cell bool with no region plumbing. Only
+        # when ``output.aoi_mask`` is on — otherwise the manifest is unchanged.
+        from zagg.config import get_aoi_mask
+
+        grid_config = getattr(grid, "config", None)
+        aoi_mask = (
+            _compute_aoi_mask(grid, parts, shard_keys)
+            if grid_config is not None and get_aoi_mask(grid_config)
+            else None
+        )
+        if aoi_mask is not None:
+            meta["aoi_mask"] = True
+        return cls(grid.spatial_signature(), shard_keys, granules, meta, aoi_mask)
 
     def to_json(self, path: str) -> None:
         """Write the manifest as JSON."""
         from pathlib import Path
 
-        Path(path).write_text(
-            json.dumps(
-                {
-                    "metadata": self.metadata,
-                    "grid_signature": self.grid_signature,
-                    "shard_keys": self.shard_keys,
-                    "granules": self.granules,
-                },
-                indent=2,
-            )
-        )
+        payload = {
+            "metadata": self.metadata,
+            "grid_signature": self.grid_signature,
+            "shard_keys": self.shard_keys,
+            "granules": self.granules,
+        }
+        # Carry the strict-AOI per-shard mask only when present (issue #101): a map
+        # built with the flag off writes no ``aoi_mask`` key, byte-identical to a
+        # pre-feature manifest.
+        if self.aoi_mask is not None:
+            payload["aoi_mask"] = self.aoi_mask
+        Path(path).write_text(json.dumps(payload, indent=2))
 
     @classmethod
     def from_json(cls, path: str) -> "ShardMap":
@@ -500,7 +549,13 @@ class ShardMap:
         for key in ("grid_signature", "shard_keys", "granules"):
             if key not in d:
                 raise ValueError(f"{path}: missing required key {key!r}")
-        return cls(d["grid_signature"], d["shard_keys"], d["granules"], d.get("metadata", {}))
+        return cls(
+            d["grid_signature"],
+            d["shard_keys"],
+            d["granules"],
+            d.get("metadata", {}),
+            d.get("aoi_mask"),
+        )
 
 
 __all__ = ["ShardMap"]
