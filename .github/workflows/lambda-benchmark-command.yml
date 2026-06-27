@@ -12,9 +12,10 @@ on:
   pull_request_target:
     types: [labeled]
 
+# Least privilege: the gate job only needs to read + react/comment. OIDC
+# (id-token) is granted ONLY to the run job that assumes the role.
 permissions:
   contents: read
-  id-token: write
   pull-requests: write
 
 jobs:
@@ -32,25 +33,34 @@ jobs:
         with:
           script: |
             const { owner, repo } = context.repo;
-            const maintainers = ['OWNER', 'MEMBER', 'COLLABORATOR'];
             let prNumber;
 
+            // First, does the textual trigger match (and is it a PR)?
             if (context.eventName === 'issue_comment') {
-              // PR comments only; body must contain /benchmark; commenter must be a maintainer.
               if (!context.payload.issue.pull_request) return core.setOutput('should_run', 'false');
               if (!context.payload.comment.body.includes('/benchmark')) return core.setOutput('should_run', 'false');
-              if (!maintainers.includes(context.payload.comment.author_association)) {
-                return core.setOutput('should_run', 'false');
-              }
               prNumber = context.payload.issue.number;
+            } else {
+              if (context.payload.label.name !== 'benchmark') return core.setOutput('should_run', 'false');
+              prNumber = context.payload.pull_request.number;
+            }
+
+            // The trust boundary: the ACTOR must have write/admin on this repo.
+            // author_association (MEMBER/COLLABORATOR) is a relationship, not a
+            // permission, and labels are addable at triage level -- neither is
+            // sufficient to hand fork code the AWS role.
+            const { data: perm } = await github.rest.repos.getCollaboratorPermissionLevel({
+              owner, repo, username: context.actor,
+            });
+            if (!['admin', 'write'].includes(perm.permission)) {
+              core.notice(`actor ${context.actor} lacks write access (${perm.permission}); not running`);
+              return core.setOutput('should_run', 'false');
+            }
+
+            if (context.eventName === 'issue_comment') {
               await github.rest.reactions.createForIssueComment({
                 owner, repo, comment_id: context.payload.comment.id, content: 'rocket',
               });
-            } else {
-              // pull_request_target labeled: applying a label already requires triage/write,
-              // so the actor is inherently a maintainer; just gate on the label name.
-              if (context.payload.label.name !== 'benchmark') return core.setOutput('should_run', 'false');
-              prNumber = context.payload.pull_request.number;
             }
 
             const { data: pr } = await github.rest.pulls.get({ owner, repo, pull_number: prNumber });
@@ -63,6 +73,14 @@ jobs:
     needs: check
     if: needs.check.outputs.should_run == 'true'
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
+      pull-requests: write
+    # One run per PR; a newer trigger supersedes an in-flight one.
+    concurrency:
+      group: lambda-benchmark-cmd-${{ needs.check.outputs.pr_number }}
+      cancel-in-progress: true
     steps:
       - name: Checkout PR head
         uses: actions/checkout@v5

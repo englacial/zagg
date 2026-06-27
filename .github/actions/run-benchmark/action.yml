@@ -59,8 +59,18 @@ runs:
 
     - name: Dispatch benchmark shard(s)
       shell: bash
+      # All inputs flow through env, never interpolated into the script body, so
+      # an attacker-controlled value (e.g. REF_LABEL <- a fork branch name) can't
+      # break out of the argument and inject shell.
       env:
         TARGETS: ${{ inputs.targets }}
+        STORE_PREFIX: ${{ inputs.store-prefix }}
+        AWS_REGION: ${{ inputs.aws-region }}
+        FUNCTION_NAME: ${{ inputs.function-name }}
+        EVENT: ${{ inputs.event }}
+        COMMIT: ${{ inputs.commit }}
+        REF_LABEL: ${{ inputs.ref-label }}
+        PR_NUMBER: ${{ inputs.pr-number }}
       run: |
         set -euo pipefail
         target_flags=()
@@ -68,18 +78,18 @@ runs:
           target_flags+=(--target "$t")
         done
         pr_flag=()
-        if [ -n "${{ inputs.pr-number }}" ]; then
-          pr_flag=(--pr-number "${{ inputs.pr-number }}")
+        if [ -n "$PR_NUMBER" ]; then
+          pr_flag=(--pr-number "$PR_NUMBER")
         fi
         uv run python .github/scripts/run_benchmark.py \
           --targets tests/data/benchmark/targets.json \
           "${target_flags[@]}" \
-          --store-prefix "${{ inputs.store-prefix }}" \
-          --region "${{ inputs.aws-region }}" \
-          --function-name "${{ inputs.function-name }}" \
-          --event "${{ inputs.event }}" \
-          --commit "${{ inputs.commit }}" \
-          --ref "${{ inputs.ref-label }}" \
+          --store-prefix "$STORE_PREFIX" \
+          --region "$AWS_REGION" \
+          --function-name "$FUNCTION_NAME" \
+          --event "$EVENT" \
+          --commit "$COMMIT" \
+          --ref "$REF_LABEL" \
           "${pr_flag[@]}" \
           --out-json metrics.json \
           --out-comment comment.md
