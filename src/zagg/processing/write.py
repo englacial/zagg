@@ -191,6 +191,141 @@ def write_dataframe_to_zarr(
     return store
 
 
+def write_shard_to_zarr(
+    chunk_results: list,
+    store: Store,
+    *,
+    grid,
+    shard_key: int,
+) -> Store:
+    """Write a whole sharded shard in ONE block selection per dense array (issue #108).
+
+    On a ``ShardingCodec`` array (``grid.sharded``) the K inner chunks of one
+    dispatch shard live inside a single shard object, and ``set_block_selection``
+    is **shard-granular** (one block == one shard). Writing the K inner chunks as K
+    separate block selections would each trigger a read-modify-write on the *same*
+    shard object — racy and slow. The worker already holds all K chunk carriers
+    (it reads the shard's granules once), so this assembles them into one
+    shard-wide slab per dense per-cell array and writes it at the shard block in a
+    single call. Empty inner chunks are left as fill, so the ShardingCodec omits
+    them from the shard index (sub-shard sparsity preserved inside the object).
+
+    ``chunk_results`` is the worker's ``[(block_index, carrier, ragged), ...]`` —
+    one entry per inner chunk (from ``grid.iter_chunks``). Dense per-cell columns
+    (data vars + coords) are placed by their ``cell_ids`` into the shard slab
+    (cell id ``c`` lands at shard-relative offset ``c - shard_lo``). The
+    ``resolution: chunk`` companions and ragged (CSR) fields are NOT sharded —
+    they are delegated to :func:`write_dataframe_to_zarr` / :func:`write_ragged_to_zarr`
+    per inner chunk, exactly as on the regular path.
+
+    Parameters
+    ----------
+    chunk_results : list of (block_index, carrier, ragged)
+        The worker's per-inner-chunk results for one dispatch shard.
+    store : Store
+        Zarr store with the (sharded) template already written.
+    grid : OutputGrid
+        Must be ``sharded`` with a ``cells_per_shard`` and ``block_index``.
+    shard_key : int
+        The dispatch shard's key (HEALPix parent morton id).
+
+    Returns
+    -------
+    Store
+    """
+    chunk_res_fields = _chunk_resolution_fields(getattr(grid, "config", None))
+    (shard_block,) = tuple(int(i) for i in grid.block_index(shard_key))
+    cells_per_shard = int(grid.cells_per_shard)
+    shard_lo = shard_block * cells_per_shard
+
+    # Accumulate each dense per-cell column into one shard-wide slab; companions
+    # and ragged are written per inner chunk via the existing seams.
+    slabs: dict = {}
+    fills: dict = {}
+    for block_index, carrier, ragged in chunk_results:
+        if _carrier_empty(carrier):
+            # Still flush this chunk's companion/ragged below (they may be empty
+            # no-ops); an empty dense carrier contributes nothing to the slab.
+            write_dataframe_to_zarr(carrier, store, grid=grid, chunk_idx=block_index)
+            write_ragged_to_zarr(
+                ragged, store, grid=grid, shard_key=_block_index_key(block_index, grid)
+            )
+            continue
+        cell_ids = None
+        for name, values in _iter_carrier_columns(carrier):
+            if name == "cell_ids":
+                cell_ids = np.asarray(values).astype(np.int64)
+        if cell_ids is None:
+            raise ValueError(
+                "sharded write requires a 'cell_ids' coord column to place cells "
+                f"within the shard, but carrier for shard {shard_key} has none"
+            )
+        offsets = cell_ids - shard_lo
+        for name, values in _iter_carrier_columns(carrier):
+            if name in chunk_res_fields:
+                continue  # companion (resolution: chunk) — handled below, unsharded
+            values = np.asarray(values)
+            trailing = values.shape[1:]
+            if name not in slabs:
+                array = open_array(
+                    store,
+                    path=f"{grid.group_path}/{name}",
+                    zarr_format=3,
+                    consolidated=False,
+                )
+                fill = array.metadata.fill_value
+                fills[name] = fill
+                slabs[name] = np.full((cells_per_shard, *trailing), fill, dtype=values.dtype)
+            slabs[name][offsets] = values
+        # Companions + ragged for this inner chunk are not sharded: write them
+        # straight through (companion array is one block per chunk; ragged is CSR).
+        if chunk_res_fields:
+            _write_companion_columns(carrier, store, grid, block_index, chunk_res_fields)
+        write_ragged_to_zarr(
+            ragged, store, grid=grid, shard_key=_block_index_key(block_index, grid)
+        )
+
+    # One block selection per dense array == one shard object write.
+    for name, slab in slabs.items():
+        trailing = slab.shape[1:]
+        block_idx = (shard_block, *((0,) * len(trailing)))
+        with config.set({"async.concurrency": 128}):
+            array = open_array(
+                store,
+                path=f"{grid.group_path}/{name}",
+                zarr_format=3,
+                consolidated=False,
+            )
+            array.set_block_selection(block_idx, slab)
+    return store
+
+
+def _write_companion_columns(carrier, store, grid, block_index, chunk_res_fields):
+    """Write a chunk's ``resolution: chunk`` companion columns (unsharded path).
+
+    A ``resolution: chunk`` companion array is shaped at the coarse chunk grid
+    (one block per chunk), never sharded, so it keeps the per-chunk write even on
+    the sharded path. Reuses the same chunk-uniform collapse + block placement as
+    :func:`write_dataframe_to_zarr`'s companion branch.
+    """
+    block_idx = tuple(int(i) for i in block_index)
+    for name, values in _iter_carrier_columns(carrier):
+        if name not in chunk_res_fields:
+            continue
+        chunk_value = np.asarray(_chunk_uniform_value(name, values))
+        trailing = chunk_value.shape
+        block = chunk_value.reshape((1,) * len(block_idx) + trailing)
+        target = block_idx + (0,) * len(trailing)
+        with config.set({"async.concurrency": 128}):
+            array = open_array(
+                store,
+                path=f"{grid.group_path}/{name}",
+                zarr_format=3,
+                consolidated=False,
+            )
+            array.set_block_selection(target, block)
+
+
 def write_ragged_to_zarr(
     ragged: dict,
     store: Store,

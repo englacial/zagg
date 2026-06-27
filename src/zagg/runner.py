@@ -51,6 +51,7 @@ from zagg.processing import (
     process_shard,
     write_dataframe_to_zarr,
     write_ragged_to_zarr,
+    write_shard_to_zarr,
 )
 from zagg.processing.write import _block_index_key
 from zagg.store import open_store
@@ -360,6 +361,12 @@ def _process_and_write(
         handoff=handoff,
         chunk_results=chunk_results,
     )
+    # Sharded output (issue #108): the shard's K inner chunks bundle into one
+    # ShardingCodec shard object — write the whole shard in one block selection per
+    # dense array (a per-inner-chunk loop would read-modify-write the shard object).
+    if getattr(grid, "sharded", False):
+        write_shard_to_zarr(chunk_results, zarr_store, grid=grid, shard_key=int(shard_key))
+        return metadata
     single_chunk = len(chunk_results) == 1
     for block_index, carrier, ragged in chunk_results:
         # write_dataframe_to_zarr no-ops on an empty carrier (DataFrame or Arrow
