@@ -19,6 +19,7 @@ sys.path.insert(0, str(SCRIPTS))
 
 import bench_metrics  # noqa: E402
 import run_benchmark  # noqa: E402
+import update_series  # noqa: E402
 
 from zagg.grids import HealpixGrid, RectilinearGrid  # noqa: E402
 
@@ -207,3 +208,98 @@ def test_targets_manifest_consistent():
         key, n = bench_metrics.select_densest_shard(sm)
         assert key == sm_meta["shard_key"], f"{t['shardmap']}: stale pinned shard_key"
         assert n == sm_meta["n_granules"], f"{t['shardmap']}: stale n_granules"
+
+
+# --- update_series (parquet store) ----------------------------------------
+
+
+def _rec_row(commit, target, event="merge", cost=0.005, rt=200.0):
+    return {
+        "timestamp": f"2026-01-01T00:00:0{len(commit) % 10}Z",
+        "commit": commit,
+        "ref": "main",
+        "event": event,
+        "pr_number": None,
+        "target": target,
+        "aggregator": "gain_bias",
+        "grid_type": "healpix",
+        "grid_size": "o11",
+        "shard_key": 1,
+        "n_granules": 44,
+        "total_obs": 5_000_000,
+        "runtime_s": rt,
+        "gb_seconds": 400.0,
+        "cost_per_shard_usd": cost,
+        "shard_area_km2": 10.13,
+        "cost_per_100km2_usd": cost * 100 / 10.13,
+        "function_timeout_s": 720,
+        "worker_pct_timeout": 0.28,
+        "memory_gb": 2.0,
+        "price_per_gb_sec": 1.33334e-05,
+        "zagg_version": "9.9.9",
+    }
+
+
+def test_records_to_frame_column_stable():
+    df = update_series.records_to_frame([_rec_row("a", "t1")])
+    assert list(df.columns) == bench_metrics.RECORD_COLUMNS
+
+
+def test_append_records_grows_and_dedups():
+    df = update_series.load_series("does-not-exist.parquet")
+    assert df.empty and list(df.columns) == bench_metrics.RECORD_COLUMNS
+    df = update_series.append_records(df, [_rec_row("c1", "t1"), _rec_row("c1", "t2")])
+    assert len(df) == 2
+    # Re-running the same commit replaces, not duplicates; keep=last wins.
+    df = update_series.append_records(df, [_rec_row("c1", "t1", cost=0.009)])
+    assert len(df) == 2
+    row = df[(df.commit == "c1") & (df.target == "t1")].iloc[0]
+    assert row["cost_per_shard_usd"] == 0.009
+
+
+def test_series_roundtrip(tmp_path):
+    path = tmp_path / "series.parquet"
+    update_series.save_series(update_series.records_to_frame([_rec_row("c1", "t1")]), path)
+    update_series.main(
+        ["--series", str(path), "--records", str(_write_json(tmp_path, [_rec_row("c2", "t1")]))]
+    )
+    out = update_series.load_series(path)
+    assert set(out["commit"]) == {"c1", "c2"}
+
+
+def _write_json(tmp_path, obj):
+    p = tmp_path / "records.json"
+    p.write_text(json.dumps(obj))
+    return p
+
+
+# --- plot_series (smoke; needs matplotlib) --------------------------------
+
+
+def test_plot_series_smoke(tmp_path):
+    pytest.importorskip("matplotlib")
+    import plot_series
+
+    rows = [
+        _rec_row(f"c{i}", t, cost=0.004 + i * 0.001, rt=180 + i * 10)
+        for i in range(3)
+        for t in ("t1", "t2")
+    ]
+    series = tmp_path / "series.parquet"
+    update_series.save_series(update_series.records_to_frame(rows), series)
+    outdir = tmp_path / "site"
+    plot_series.main(["--series", str(series), "--out", str(outdir)])
+    assert (outdir / "index.html").exists()
+    assert (outdir / "cost_per_shard.png").exists()
+    assert (outdir / "cost_per_100km2.png").exists()
+
+
+def test_plot_series_empty_writes_placeholder(tmp_path):
+    pytest.importorskip("matplotlib")
+    import plot_series
+
+    outdir = tmp_path / "site"
+    plot_series.main(["--series", str(tmp_path / "missing.parquet"), "--out", str(outdir)])
+    # No data -> index exists with placeholder, no PNGs.
+    assert (outdir / "index.html").exists()
+    assert not (outdir / "cost_per_shard.png").exists()

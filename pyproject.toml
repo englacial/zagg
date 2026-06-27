@@ -71,6 +71,12 @@ analysis = [
     "matplotlib>=3.10.8",
     "notebook",
 ]
+# Lean extra for the Lambda-benchmark CI plotting step (issue #110). pyarrow is
+# already a core dep; this just pulls in matplotlib (same pin as analysis) so the
+# benchmark workflow doesn't install the heavy analysis stack.
+benchmark = [
+    "matplotlib>=3.10.8",
+]
 test = [
     "pytest>=8.0",
     "stac-geoparquet>=0.7.0",
