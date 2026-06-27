@@ -68,6 +68,7 @@ def from_config(
             chunk_shape=tuple(grid_cfg.get("chunk_shape", (256, 256))),
             config=config,
             chunk_inner=tuple(chunk_inner) if chunk_inner is not None else None,
+            sharded=get_sharded(config),
         )
     raise ValueError(f"Unknown output.grid.type: {grid_type!r}")
 

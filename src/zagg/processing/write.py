@@ -211,12 +211,13 @@ def write_shard_to_zarr(
     them from the shard index (sub-shard sparsity preserved inside the object).
 
     ``chunk_results`` is the worker's ``[(block_index, carrier, ragged), ...]`` —
-    one entry per inner chunk (from ``grid.iter_chunks``). Dense per-cell columns
-    (data vars + coords) are placed by their ``cell_ids`` into the shard slab
-    (cell id ``c`` lands at shard-relative offset ``c - shard_lo``). The
-    ``resolution: chunk`` companions and ragged (CSR) fields are NOT sharded —
-    they are delegated to :func:`write_dataframe_to_zarr` / :func:`write_ragged_to_zarr`
-    per inner chunk, exactly as on the regular path.
+    one entry per inner chunk (from ``grid.iter_chunks``). Each dense per-cell
+    column (data vars + coords) is placed into the shard slab by the chunk's own
+    region (``grid.shard_local_region(block_index, shard_key)``), reshaped to the
+    inner chunk's cell shape (``grid.chunk_shape``) — grid-agnostic, so HEALPix
+    (1-D) and rectilinear (2-D) share one path. The ``resolution: chunk``
+    companions and ragged (CSR) fields are NOT sharded — they are written per inner
+    chunk via the existing seams, exactly as on the regular path.
 
     Parameters
     ----------
@@ -225,58 +226,40 @@ def write_shard_to_zarr(
     store : Store
         Zarr store with the (sharded) template already written.
     grid : OutputGrid
-        Must be ``sharded`` with a ``cells_per_shard`` and ``block_index``.
+        Must be ``sharded`` with ``shard_slab_shape`` / ``shard_local_region``.
     shard_key : int
-        The dispatch shard's key (HEALPix parent morton id).
+        The dispatch shard's key (HEALPix parent morton id / rect packed tile).
 
     Returns
     -------
     Store
     """
     chunk_res_fields = _chunk_resolution_fields(getattr(grid, "config", None))
-    (shard_block,) = tuple(int(i) for i in grid.block_index(shard_key))
-    cells_per_shard = int(grid.cells_per_shard)
-    shard_lo = shard_block * cells_per_shard
+    shard_block = tuple(int(i) for i in grid.block_index(shard_key))
+    slab_shape = tuple(int(s) for s in grid.shard_slab_shape())
+    inner_shape = tuple(int(s) for s in grid.chunk_shape)
 
     # Accumulate each dense per-cell column into one shard-wide slab; companions
     # and ragged are written per inner chunk via the existing seams.
     slabs: dict = {}
-    fills: dict = {}
     for block_index, carrier, ragged in chunk_results:
-        if _carrier_empty(carrier):
-            # Still flush this chunk's companion/ragged below (they may be empty
-            # no-ops); an empty dense carrier contributes nothing to the slab.
-            write_dataframe_to_zarr(carrier, store, grid=grid, chunk_idx=block_index)
-            write_ragged_to_zarr(
-                ragged, store, grid=grid, shard_key=_block_index_key(block_index, grid)
-            )
-            continue
-        cell_ids = None
-        for name, values in _iter_carrier_columns(carrier):
-            if name == "cell_ids":
-                cell_ids = np.asarray(values).astype(np.int64)
-        if cell_ids is None:
-            raise ValueError(
-                "sharded write requires a 'cell_ids' coord column to place cells "
-                f"within the shard, but carrier for shard {shard_key} has none"
-            )
-        offsets = cell_ids - shard_lo
-        for name, values in _iter_carrier_columns(carrier):
-            if name in chunk_res_fields:
-                continue  # companion (resolution: chunk) — handled below, unsharded
-            values = np.asarray(values)
-            trailing = values.shape[1:]
-            if name not in slabs:
-                array = open_array(
-                    store,
-                    path=f"{grid.group_path}/{name}",
-                    zarr_format=3,
-                    consolidated=False,
-                )
-                fill = array.metadata.fill_value
-                fills[name] = fill
-                slabs[name] = np.full((cells_per_shard, *trailing), fill, dtype=values.dtype)
-            slabs[name][offsets] = values
+        if not _carrier_empty(carrier):
+            region = grid.shard_local_region(block_index, shard_key)
+            for name, values in _iter_carrier_columns(carrier):
+                if name in chunk_res_fields:
+                    continue  # companion (resolution: chunk) — handled below, unsharded
+                values = np.asarray(values)
+                trailing = values.shape[1:]
+                if name not in slabs:
+                    array = open_array(
+                        store,
+                        path=f"{grid.group_path}/{name}",
+                        zarr_format=3,
+                        consolidated=False,
+                    )
+                    fill = array.metadata.fill_value
+                    slabs[name] = np.full((*slab_shape, *trailing), fill, dtype=values.dtype)
+                slabs[name][region] = values.reshape((*inner_shape, *trailing))
         # Companions + ragged for this inner chunk are not sharded: write them
         # straight through (companion array is one block per chunk; ragged is CSR).
         if chunk_res_fields:
@@ -287,8 +270,8 @@ def write_shard_to_zarr(
 
     # One block selection per dense array == one shard object write.
     for name, slab in slabs.items():
-        trailing = slab.shape[1:]
-        block_idx = (shard_block, *((0,) * len(trailing)))
+        trailing = slab.shape[len(slab_shape) :]
+        block_idx = (*shard_block, *((0,) * len(trailing)))
         with config.set({"async.concurrency": 128}):
             array = open_array(
                 store,

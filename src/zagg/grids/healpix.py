@@ -221,6 +221,31 @@ class HealpixGrid:
             children = generate_morton_children(int(sub), self.child_order)
             yield (block, children)
 
+    def shard_slab_shape(self) -> tuple[int, ...]:
+        """Cell extent of one whole sharded shard (issue #108).
+
+        The shape the sharded worker assembles per dense array before the single
+        whole-shard ``set_block_selection`` — ``(cells_per_shard,)`` for HEALPix
+        (the K inner chunks laid out contiguously, matching the ShardingCodec's
+        inner-chunk tiling of the outer shard).
+        """
+        return (self.cells_per_shard,)
+
+    def shard_local_region(self, block_index, shard_key) -> tuple:
+        """Slice(s) an inner chunk occupies within its shard slab (issue #108).
+
+        ``block_index`` is the inner chunk's global block (from :meth:`iter_chunks`);
+        its position inside the shard is ``local = block - block_index(shard)·K``,
+        and it occupies the contiguous ``[local·cells_per_chunk, +cells_per_chunk)``
+        run of the ``cells_per_shard`` slab (HEALPix nested ids tile the shard in
+        ascending order, so this matches the carrier's canonical chunk order).
+        """
+        (shard_block,) = self.block_index(shard_key)
+        (inner_block,) = tuple(int(b) for b in block_index)
+        local = inner_block - shard_block * self.chunks_per_shard
+        start = local * self.cells_per_chunk
+        return (slice(start, start + self.cells_per_chunk),)
+
     @property
     def group_path(self) -> str:
         """Zarr group path emitted by ``emit_template`` (e.g. ``'12'``)."""
