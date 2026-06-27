@@ -217,6 +217,83 @@ class TestProcessEventWriteLoop:
         assert cap["ragged"][0][0] == event["shard_key"]
 
 
+class TestProcessEventProfile:
+    """Issue #100 phase 3: the handler bridges the opt-in ``profile`` event key
+    into ``process_shard`` (read/index/aggregate timing) and brackets the
+    write phase it owns, merging ``phase_timings`` into the response body. When
+    ``profile`` is absent the worker call and body are unchanged."""
+
+    def _patch(self, handler_mod, monkeypatch, *, worker_phase_timings, chunks):
+        """Patch process_shard to record the ``profile`` kwarg and (when given)
+        seed ``metadata['phase_timings']``; fill the sink with ``chunks``."""
+        import zagg.grids as grids
+        import zagg.processing as processing
+
+        cap = {}
+
+        def fake_process_shard(grid, shard_key, granule_urls, **kwargs):
+            cap["profile"] = kwargs.get("profile")
+            kwargs["chunk_results"].extend(chunks)
+            meta = {
+                "shard_key": shard_key,
+                "cells_with_data": 1,
+                "total_obs": 1,
+                "duration_s": 0.0,
+                "error": None,
+            }
+            if worker_phase_timings is not None:
+                meta["phase_timings"] = dict(worker_phase_timings)
+            return pd.DataFrame(), meta
+
+        store = MagicMock()
+        store.exists.return_value = True
+        grid_stub = MagicMock()
+        grid_stub.group_path = "8"
+        grid_stub.chunk_grid_shape = (4,)
+
+        monkeypatch.setattr(processing, "process_shard", fake_process_shard)
+        monkeypatch.setattr(grids, "from_config", lambda *a, **k: grid_stub)
+        monkeypatch.setattr(handler_mod, "open_store", lambda *a, **k: store)
+        monkeypatch.setattr(handler_mod, "write_dataframe_to_zarr", lambda *a, **k: None)
+        monkeypatch.setattr(handler_mod, "write_ragged_to_zarr", lambda *a, **k: None)
+        return cap
+
+    def test_profile_forwarded_and_write_bracketed(self, handler_mod, monkeypatch):
+        # profile=True flows into process_shard, and the handler-owned write phase
+        # is appended to the worker's read/index/aggregate timings in the body.
+        cap = self._patch(
+            handler_mod,
+            monkeypatch,
+            worker_phase_timings={"read": 1.0, "index": 0.5, "aggregate": 0.25},
+            chunks=[((0,), pd.DataFrame(), {})],
+        )
+        event = _base_event(_healpix_config_dict())
+        event["child_order"] = 12
+        event["profile"] = True
+        resp = handler_mod._handle_process(event, _context())
+        assert resp["statusCode"] == 200
+        assert cap["profile"] is True
+        timings = json.loads(resp["body"])["phase_timings"]
+        assert set(timings) == {"read", "index", "aggregate", "write"}
+        assert timings["write"] >= 0.0
+
+    def test_default_off_no_profile_no_timings(self, handler_mod, monkeypatch):
+        # No profile key -> process_shard gets profile=False and the body carries
+        # no phase_timings (worker path unchanged).
+        cap = self._patch(
+            handler_mod,
+            monkeypatch,
+            worker_phase_timings=None,
+            chunks=[((0,), pd.DataFrame(), {})],
+        )
+        event = _base_event(_healpix_config_dict())
+        event["child_order"] = 12
+        resp = handler_mod._handle_process(event, _context())
+        assert resp["statusCode"] == 200
+        assert cap["profile"] is False
+        assert "phase_timings" not in json.loads(resp["body"])
+
+
 class TestSetupTemplate:
     """Issue #99: the setup handler used to hand-build the HEALPix grid and drop
     ``chunk_inner``, so the template was chunked at ``parent_order`` while workers
