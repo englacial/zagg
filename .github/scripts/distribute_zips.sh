@@ -28,7 +28,9 @@ done
 : "${MINOR:?--minor required}" "${BUCKET:?--bucket required}" "${DIR:?--dir required}"
 
 shopt -s nullglob
-zips=("$DIR"/lambda_layer_arm64.zip "$DIR"/lambda_layer_x86_64.zip \
+# All four are globs (note the trailing * on the layer names) so nullglob drops
+# any that's missing -- the count check then catches it here, not at `aws s3 cp`.
+zips=("$DIR"/lambda_layer_arm64*.zip "$DIR"/lambda_layer_x86_64*.zip \
       "$DIR"/lambda_function_arm64_*.zip "$DIR"/lambda_function_x86_64_*.zip)
 if [ "${#zips[@]}" -ne 4 ]; then
   echo "expected 4 zips in $DIR, found ${#zips[@]}: ${zips[*]:-none}" >&2
