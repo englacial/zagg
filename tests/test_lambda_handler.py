@@ -223,9 +223,21 @@ class TestProcessEventProfile:
     write phase it owns, merging ``phase_timings`` into the response body. When
     ``profile`` is absent the worker call and body are unchanged."""
 
-    def _patch(self, handler_mod, monkeypatch, *, worker_phase_timings, chunks):
+    def _patch(
+        self,
+        handler_mod,
+        monkeypatch,
+        *,
+        worker_phase_timings,
+        chunks,
+        template_exists=True,
+        write_raises=False,
+    ):
         """Patch process_shard to record the ``profile`` kwarg and (when given)
-        seed ``metadata['phase_timings']``; fill the sink with ``chunks``."""
+        seed ``metadata['phase_timings']``; fill the sink with ``chunks``.
+        ``template_exists`` toggles the store's existence check (template-missing
+        500 path); ``write_raises`` makes the dense write blow up (failed-write
+        500 path)."""
         import zagg.grids as grids
         import zagg.processing as processing
 
@@ -246,36 +258,46 @@ class TestProcessEventProfile:
             return pd.DataFrame(), meta
 
         store = MagicMock()
-        store.exists.return_value = True
+        store.exists.return_value = template_exists
         grid_stub = MagicMock()
         grid_stub.group_path = "8"
         grid_stub.chunk_grid_shape = (4,)
 
+        def fake_write_dense(*a, **k):
+            if write_raises:
+                raise RuntimeError("boom")
+
         monkeypatch.setattr(processing, "process_shard", fake_process_shard)
         monkeypatch.setattr(grids, "from_config", lambda *a, **k: grid_stub)
         monkeypatch.setattr(handler_mod, "open_store", lambda *a, **k: store)
-        monkeypatch.setattr(handler_mod, "write_dataframe_to_zarr", lambda *a, **k: None)
+        monkeypatch.setattr(handler_mod, "write_dataframe_to_zarr", fake_write_dense)
         monkeypatch.setattr(handler_mod, "write_ragged_to_zarr", lambda *a, **k: None)
         return cap
 
-    def test_profile_forwarded_and_write_bracketed(self, handler_mod, monkeypatch):
-        # profile=True flows into process_shard, and the handler-owned write phase
-        # is appended to the worker's read/index/aggregate timings in the body.
-        cap = self._patch(
-            handler_mod,
-            monkeypatch,
-            worker_phase_timings={"read": 1.0, "index": 0.5, "aggregate": 0.25},
-            chunks=[((0,), pd.DataFrame(), {})],
-        )
+    def _profile_event(self):
         event = _base_event(_healpix_config_dict())
         event["child_order"] = 12
         event["profile"] = True
-        resp = handler_mod._handle_process(event, _context())
+        return event
+
+    def test_profile_forwarded_and_write_bracketed(self, handler_mod, monkeypatch):
+        # profile=True flows into process_shard, the worker's read/index/aggregate
+        # timings pass through unchanged, and the handler-owned write phase is added.
+        worker = {"read": 1.0, "index": 0.5, "aggregate": 0.25}
+        cap = self._patch(
+            handler_mod,
+            monkeypatch,
+            worker_phase_timings=worker,
+            chunks=[((0,), pd.DataFrame(), {})],
+        )
+        resp = handler_mod._handle_process(self._profile_event(), _context())
         assert resp["statusCode"] == 200
         assert cap["profile"] is True
         timings = json.loads(resp["body"])["phase_timings"]
         assert set(timings) == {"read", "index", "aggregate", "write"}
-        assert timings["write"] >= 0.0
+        # worker-seeded phases pass through untouched; write is a non-negative delta.
+        assert {k: timings[k] for k in worker} == worker
+        assert isinstance(timings["write"], float) and timings["write"] >= 0.0
 
     def test_default_off_no_profile_no_timings(self, handler_mod, monkeypatch):
         # No profile key -> process_shard gets profile=False and the body carries
@@ -292,6 +314,50 @@ class TestProcessEventProfile:
         assert resp["statusCode"] == 200
         assert cap["profile"] is False
         assert "phase_timings" not in json.loads(resp["body"])
+
+    def test_profile_no_data_omits_write(self, handler_mod, monkeypatch):
+        # Empty chunk_results (no-data shard): the worker still seeds read but no
+        # write runs, so the body carries phase_timings WITHOUT a write key.
+        self._patch(
+            handler_mod,
+            monkeypatch,
+            worker_phase_timings={"read": 1.0},
+            chunks=[],
+        )
+        resp = handler_mod._handle_process(self._profile_event(), _context())
+        assert resp["statusCode"] == 200
+        timings = json.loads(resp["body"])["phase_timings"]
+        assert "write" not in timings
+
+    def test_profile_failed_write_omits_write(self, handler_mod, monkeypatch):
+        # A raising write loop (500): write timing is recorded only on a clean
+        # write, so a time-to-failure never leaks in as a real write duration.
+        self._patch(
+            handler_mod,
+            monkeypatch,
+            worker_phase_timings={"read": 1.0, "index": 0.5, "aggregate": 0.25},
+            chunks=[((0,), pd.DataFrame(), {})],
+            write_raises=True,
+        )
+        resp = handler_mod._handle_process(self._profile_event(), _context())
+        assert resp["statusCode"] == 500
+        timings = json.loads(resp["body"])["phase_timings"]
+        assert "write" not in timings
+
+    def test_profile_missing_template_omits_write(self, handler_mod, monkeypatch):
+        # Template-missing early return (500) bypasses the write loop, so write
+        # stays absent (the worker-seeded phases still ride along in the body).
+        self._patch(
+            handler_mod,
+            monkeypatch,
+            worker_phase_timings={"read": 1.0, "index": 0.5, "aggregate": 0.25},
+            chunks=[((0,), pd.DataFrame(), {})],
+            template_exists=False,
+        )
+        resp = handler_mod._handle_process(self._profile_event(), _context())
+        assert resp["statusCode"] == 500
+        timings = json.loads(resp["body"])["phase_timings"]
+        assert "write" not in timings
 
 
 class TestSetupTemplate:
