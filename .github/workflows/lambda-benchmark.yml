@@ -77,7 +77,9 @@ jobs:
           else
             if [ "$EVENT" = "pull_request" ]; then BASE="$PR_BASE"; HEAD="$PR_HEAD"; else BASE="$PUSH_BEFORE"; HEAD="$PUSH_AFTER"; fi
             if ! git cat-file -e "${BASE}^{commit}" 2>/dev/null; then BASE="${HEAD}~1"; fi
-            CHANGED=$(git diff --name-only "$BASE" "$HEAD" 2>/dev/null || echo "")
+            # No error-masking: a git diff failure aborts the run (set -e) rather
+            # than silently reading as "not affecting" -> benchmarking stale code.
+            CHANGED=$(git diff --name-only "$BASE" "$HEAD")
             if echo "$CHANGED" | grep -qE '^(src/zagg/|deployment/aws/|pyproject\.toml)'; then touched=true; fi
           fi
 
@@ -148,7 +150,7 @@ jobs:
     if: >-
       !cancelled() &&
       needs.detect.result == 'success' &&
-      needs.deploy-test.result != 'failure' &&
+      (needs.deploy-test.result == 'success' || needs.deploy-test.result == 'skipped') &&
       github.event_name == 'pull_request' &&
       github.event.pull_request.head.repo.full_name == github.repository &&
       github.event.pull_request.draft == false
@@ -195,7 +197,7 @@ jobs:
     if: >-
       !cancelled() &&
       needs.detect.result == 'success' &&
-      needs.deploy-test.result != 'failure' &&
+      (needs.deploy-test.result == 'success' || needs.deploy-test.result == 'skipped') &&
       (github.event_name == 'push' || github.event_name == 'workflow_dispatch')
     runs-on: ubuntu-latest
     # contents: write to push the series + charts to the benchmarks branch.
