@@ -1,0 +1,85 @@
+name: Run zagg Lambda benchmark
+description: >-
+  Assume the benchmark AWS role via OIDC and dispatch the pinned benchmark
+  shard(s) to Lambda, emitting metrics.json + comment.md. The caller must have
+  already checked out the ref to benchmark and must set
+  `permissions: id-token: write` so OIDC can mint creds.
+
+inputs:
+  targets:
+    description: Space-separated target keys (empty = every target in the manifest)
+    required: false
+    default: ""
+  role-arn:
+    description: AWS IAM role ARN to assume via OIDC
+    required: true
+  aws-region:
+    description: AWS region the Lambda + bucket live in
+    required: true
+  function-name:
+    description: Lambda function name to invoke
+    required: true
+  store-prefix:
+    description: S3 prefix for benchmark output stores (s3://bucket/prefix)
+    required: true
+  event:
+    description: Trigger kind recorded in the metrics (pr|merge|manual)
+    required: true
+  commit:
+    description: Commit SHA under test (recorded in the metrics)
+    required: true
+  ref-label:
+    description: Human ref label recorded in the metrics (branch / PR ref)
+    required: false
+    default: ""
+  pr-number:
+    description: PR number, when this is a PR run
+    required: false
+    default: ""
+
+runs:
+  using: composite
+  steps:
+    - name: Install uv
+      uses: astral-sh/setup-uv@v6
+
+    - name: Set up Python
+      shell: bash
+      run: uv python install 3.12
+
+    - name: Install zagg
+      shell: bash
+      run: uv sync
+
+    - name: Assume AWS role (OIDC)
+      uses: aws-actions/configure-aws-credentials@v4
+      with:
+        role-to-assume: ${{ inputs.role-arn }}
+        aws-region: ${{ inputs.aws-region }}
+
+    - name: Dispatch benchmark shard(s)
+      shell: bash
+      env:
+        TARGETS: ${{ inputs.targets }}
+      run: |
+        set -euo pipefail
+        target_flags=()
+        for t in $TARGETS; do
+          target_flags+=(--target "$t")
+        done
+        pr_flag=()
+        if [ -n "${{ inputs.pr-number }}" ]; then
+          pr_flag=(--pr-number "${{ inputs.pr-number }}")
+        fi
+        uv run python .github/scripts/run_benchmark.py \
+          --targets tests/data/benchmark/targets.json \
+          "${target_flags[@]}" \
+          --store-prefix "${{ inputs.store-prefix }}" \
+          --region "${{ inputs.aws-region }}" \
+          --function-name "${{ inputs.function-name }}" \
+          --event "${{ inputs.event }}" \
+          --commit "${{ inputs.commit }}" \
+          --ref "${{ inputs.ref-label }}" \
+          "${pr_flag[@]}" \
+          --out-json metrics.json \
+          --out-comment comment.md
