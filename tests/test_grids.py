@@ -327,7 +327,7 @@ def _vector_config(bins=4, dtype="int64"):
     agg = {
         "coordinates": base.aggregation.get("coordinates", {}),
         "variables": {
-            "count": {"function": "len", "source": "h_mean"},
+            "count": {"function": "len", "source": "h_li"},
             "hist": {
                 "function": "np.bincount",
                 "source": "b",
@@ -454,11 +454,11 @@ def _chunk_resolution_config():
     agg = {
         "coordinates": base.aggregation.get("coordinates", {}),
         "chunk_precompute": {
-            "chunk_anchor": {"expression": "np.float32(np.median(h_mean))", "source": "h_mean"}
+            "chunk_anchor": {"expression": "np.float32(np.median(h_li))", "source": "h_li"}
         },
         "variables": {
-            "count": {"function": "len", "source": "h_mean"},
-            "anchor_h": {"expression": "chunk_anchor", "source": "h_mean", "resolution": "chunk"},
+            "count": {"function": "len", "source": "h_li"},
+            "anchor_h": {"expression": "chunk_anchor", "source": "h_li", "resolution": "chunk"},
         },
     }
     return PipelineConfig(data_source=base.data_source, aggregation=agg, output=base.output)

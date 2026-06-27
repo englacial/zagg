@@ -176,6 +176,9 @@ class TestProcessEventWriteLoop:
         grid_stub = MagicMock()
         grid_stub.group_path = "8"
         grid_stub.chunk_grid_shape = (4,)
+        # Regular (non-sharded) write path — a MagicMock attr is truthy by default,
+        # so pin it off explicitly (issue #108 routes sharded grids elsewhere).
+        grid_stub.sharded = False
 
         monkeypatch.setattr(processing, "process_shard", fake_process_shard)
         monkeypatch.setattr(grids, "from_config", lambda *a, **k: grid_stub)
@@ -262,6 +265,9 @@ class TestProcessEventProfile:
         grid_stub = MagicMock()
         grid_stub.group_path = "8"
         grid_stub.chunk_grid_shape = (4,)
+        # Regular (non-sharded) write path — a MagicMock attr is truthy by default,
+        # so pin it off explicitly (issue #108 routes sharded grids elsewhere).
+        grid_stub.sharded = False
 
         def fake_write_dense(*a, **k):
             if write_raises:

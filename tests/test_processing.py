@@ -93,6 +93,113 @@ class TestWriteDataframeToZarr:
             write_dataframe_to_zarr(df_out, store, grid=grid, chunk_idx=chunk_idx)
 
 
+class TestWriteShardToZarr:
+    """Issue #108 phase 2: the sharded worker writes a whole shard in ONE block
+    selection per dense array, byte-identical to the per-inner-chunk regular path."""
+
+    # parent 6, child 8, chunk_inner 7 -> K = 4 inner chunks/shard, cells_per_chunk
+    # 4, cells_per_shard 16. Small enough to enumerate, K>1 so sharding is valid.
+    @staticmethod
+    def _grids(cfg):
+        from mortie import geo2mort
+
+        kw = dict(layout="fullsphere", config=cfg, chunk_inner=7)
+        sharded = HealpixGrid(6, 8, sharded=True, **kw)
+        regular = HealpixGrid(6, 8, **kw)
+        shard_key = int(geo2mort(-78.5, -132.0, order=6)[0])
+        return sharded, regular, shard_key
+
+    @staticmethod
+    def _patch_reads(monkeypatch, df):
+        calls = {"n": 0}
+
+        def one_shot(*args, **kwargs):
+            calls["n"] += 1
+            return df if calls["n"] == 1 else None
+
+        monkeypatch.setattr("zagg.processing._read_group", one_shot)
+        monkeypatch.setattr("zagg.processing.h5coro.H5Coro", lambda *a, **k: object())
+        monkeypatch.setattr("zagg.processing._make_url_rewriter", lambda driver: lambda u: u)
+
+    def _read_df(self, grid, shard_key):
+        # Two distinct cells in two distinct inner chunks of the shard, so the
+        # written shard spans more than one inner read-chunk.
+        children = grid.children(shard_key)
+        c_first = int(children[0])  # inner chunk 0
+        c_last = int(children[-1])  # inner chunk K-1
+        return pd.DataFrame(
+            {
+                "h_li": np.array([3.0, 1.0, 7.0], dtype=np.float32),
+                "s_li": np.array([0.1, 0.1, 0.1], dtype=np.float32),
+                "leaf_id": np.array([c_first, c_first, c_last], dtype=np.uint64),
+            }
+        )
+
+    def _run(self, grid, shard_key, df, monkeypatch):
+        from zagg.processing import write_shard_to_zarr
+
+        store = MemoryStore()
+        grid.emit_template(store)
+        self._patch_reads(monkeypatch, df)
+        chunk_results: list = []
+        process_shard(
+            grid,
+            shard_key,
+            ["s3://x"],
+            s3_credentials={},
+            config=grid.config,
+            chunk_results=chunk_results,
+        )
+        if getattr(grid, "sharded", False):
+            write_shard_to_zarr(chunk_results, store, grid=grid, shard_key=shard_key)
+        else:
+            for block_index, carrier, _ragged in chunk_results:
+                write_dataframe_to_zarr(carrier, store, grid=grid, chunk_idx=block_index)
+        return store
+
+    def test_sharded_matches_regular_byte_for_byte(self, monkeypatch):
+        cfg = default_config()
+        sharded, regular, shard_key = self._grids(cfg)
+        df = self._read_df(regular, shard_key)
+
+        s_store = self._run(sharded, shard_key, df, monkeypatch)
+        r_store = self._run(regular, shard_key, df.copy(), monkeypatch)
+
+        s_grp = open_group(store=s_store, mode="r", path="8")
+        r_grp = open_group(store=r_store, mode="r", path="8")
+        # The whole-shard slab contents must equal the per-inner-chunk writes.
+        for name in r_grp.array_keys():
+            np.testing.assert_array_equal(
+                s_grp[name][:], r_grp[name][:], err_msg=f"sharded vs regular differ in {name}"
+            )
+
+    def test_one_shard_object_per_dispatch_shard(self, monkeypatch):
+        cfg = default_config()
+        sharded, _regular, shard_key = self._grids(cfg)
+        df = self._read_df(sharded, shard_key)
+        store = self._run(sharded, shard_key, df, monkeypatch)
+
+        # Exactly one shard object per populated dense array (h_mean), not K.
+        (shard_block,) = sharded.block_index(shard_key)
+        h_keys = [k for k in store._store_dict if k.startswith("8/h_mean/c/")]
+        assert h_keys == [f"8/h_mean/c/{shard_block}"]
+
+    def test_readback_places_cells_at_correct_positions(self, monkeypatch):
+        cfg = default_config()
+        sharded, _regular, shard_key = self._grids(cfg)
+        df = self._read_df(sharded, shard_key)
+        store = self._run(sharded, shard_key, df, monkeypatch)
+
+        grp = open_group(store=store, mode="r", path="8")
+        children = sharded.children(shard_key)
+        cell_ids = sharded.encode_cell_ids(children)
+        first, last = int(cell_ids[0]), int(cell_ids[-1])
+        # Populated cells carry data; an interior empty cell stays NaN fill.
+        assert grp["count"][first] == 2  # two photons in the first cell
+        assert grp["count"][last] == 1
+        assert np.isnan(grp["h_mean"][int(cell_ids[1])])
+
+
 class TestCalculateCellStatistics:
     def test_empty_data_returns_zeros_and_nans(self):
         result = calculate_cell_statistics({"h_li": np.array([]), "s_li": np.array([])})
