@@ -1,0 +1,38 @@
+name: Benchmark Shardmap Drift
+
+# Rebuilds the pinned benchmark shard maps from CMR and fails if the densest
+# shard drifted (issue #110). Decoupled from the per-PR test suite because it
+# needs the network + the exact-S2 spherely backend; runs weekly and on demand.
+# No AWS / no Earthdata creds -- CMR shard-map builds are anonymous.
+
+on:
+  schedule:
+    - cron: "0 6 * * 1" # Mondays 06:00 UTC
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  drift:
+    runs-on: ubuntu-latest # native x86_64 -> the spherely fork wheel installs cleanly
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v6
+
+      - name: Set up Python
+        run: uv python install 3.12
+
+      - name: Install zagg + spherely (exact-S2 fork)
+        run: |
+          set -euo pipefail
+          uv sync --extra catalog --extra test
+          # Exact-S2 SpatialIndex backend: a non-PyPI fork (see README / CLAUDE.md).
+          uv pip install "spherely @ https://github.com/espg/spherely/releases/download/v0.1.1-spatialindex/spherely-0.1.1+spatialindex-cp312-cp312-manylinux_2_27_x86_64.manylinux_2_28_x86_64.whl"
+
+      - name: Check shard-map drift
+        env:
+          ZAGG_BENCHMARK_DRIFT: "1"
+        run: uv run pytest tests/test_benchmark_shardmap.py -v
