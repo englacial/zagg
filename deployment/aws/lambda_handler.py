@@ -53,6 +53,7 @@ full pipeline using only lambda:InvokeFunction.
 import json
 import logging
 import os
+import time
 from typing import Any, Dict
 
 # Import cloud-agnostic processing
@@ -247,6 +248,11 @@ def _handle_process(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
         # Zarr chunk through the sink. At K==1 the sink holds exactly one entry whose
         # ``block_index`` equals ``event["chunk_idx"]``, so the write is unchanged.
         from zagg.processing import process_shard
+        # Opt-in per-phase timing (issue #100). When the orchestrator forwards
+        # ``profile``, ``process_shard`` fills ``metadata["phase_timings"]`` with
+        # read/index/aggregate deltas; the write phase runs here, so we bracket it
+        # below and merge it in. Default (no key) leaves the worker path unchanged.
+        profile = event.get("profile", False)
         chunk_results: list = []
         _df_out, metadata = process_shard(
             grid,
@@ -255,10 +261,12 @@ def _handle_process(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
             s3_credentials=s3_creds,
             config=config,
             chunk_results=chunk_results,
+            profile=profile,
         )
 
         # Write Zarr to store: one dense region per chunk plus its ragged (CSR)
         # companion. Mirrors the local runner's K>1 write loop (``_process_and_write``).
+        _write_t0 = time.time() if profile else None
         if chunk_results:
             store_path = event["store_path"]
             store = open_store(store_path, **_output_store_kwargs(event))
@@ -305,6 +313,13 @@ def _handle_process(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
             except Exception as e:
                 logger.error(f"Failed to write zarr to {store_path}: {e}")
                 metadata["error"] = f"Failed to write zarr: {e}"
+
+        # Record the write-phase timing (issue #100). read/index/aggregate come
+        # from ``process_shard``; ``write`` is owned here, so it joins the same
+        # sub-dict only when profiling and a write actually ran (non-empty
+        # ``chunk_results``). The no-data path leaves ``write`` absent.
+        if profile and chunk_results and "phase_timings" in metadata:
+            metadata["phase_timings"]["write"] = time.time() - _write_t0
 
         # Log structured result
         logger.info(
