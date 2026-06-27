@@ -928,3 +928,43 @@ class TestSharded:
         dense_bytes = len(store._store_dict[f"8/h_mean/c/{shard_block}"])
 
         assert sparse_bytes < dense_bytes
+
+    def test_vector_field_shards_and_roundtrips(self):
+        # A kind: vector field's trailing payload dim stays whole inside the shard:
+        # outer shard (cells_per_shard, T), inner chunk (cells_per_chunk, T). A whole-
+        # shard slab round-trips, and one shard object holds the K inner chunks.
+        from mortie import geo2mort
+        from zarr import open_array
+
+        g = HealpixGrid(
+            parent_order=4,
+            child_order=8,
+            layout="fullsphere",
+            config=_vector_config(bins=4, dtype="float32"),
+            chunk_inner=6,
+            sharded=True,
+        )
+        store = MemoryStore()
+        g.emit_template(store)
+        arr = open_array(store, path="8/hist", zarr_format=3, consolidated=False)
+        assert arr.chunks == (g.cells_per_chunk, 4)
+        assert arr.shards == (g.cells_per_shard, 4)
+
+        parent = int(geo2mort(-78.5, -132.0, order=4)[0])
+        (shard_block,) = g.block_index(parent)
+        slab = np.zeros((g.cells_per_shard, 4), dtype="float32")
+        slab[: g.cells_per_chunk] = np.arange(g.cells_per_chunk * 4).reshape(g.cells_per_chunk, 4)
+        arr.set_block_selection((shard_block, 0), slab)
+
+        shard_keys = [k for k in store._store_dict if k.startswith("8/hist/c/")]
+        assert shard_keys == [f"8/hist/c/{shard_block}/0"]
+        lo = shard_block * g.cells_per_shard
+        np.testing.assert_array_equal(arr[lo : lo + g.cells_per_shard], slab)
+
+    def test_sharded_not_in_signature(self):
+        # sharded is a storage form, not a spatial-layout change, so it must not
+        # alter the shard-map fingerprint (parallels chunk_inner's exclusion).
+        cfg = default_config("atl06")
+        g0 = HealpixGrid(4, 8, layout="fullsphere", config=cfg, chunk_inner=6)
+        g1 = HealpixGrid(4, 8, layout="fullsphere", config=cfg, chunk_inner=6, sharded=True)
+        assert g0.signature() == g1.signature()
