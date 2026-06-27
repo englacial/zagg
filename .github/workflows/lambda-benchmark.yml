@@ -33,6 +33,10 @@ jobs:
       github.event.pull_request.head.repo.full_name == github.repository &&
       github.event.pull_request.draft == false
     runs-on: ubuntu-latest
+    # One run per PR; a new push supersedes the in-flight (and unbilled) run.
+    concurrency:
+      group: lambda-benchmark-pr-${{ github.event.pull_request.number }}
+      cancel-in-progress: true
     steps:
       - name: Checkout PR head
         uses: actions/checkout@v5
