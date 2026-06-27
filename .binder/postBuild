@@ -2,11 +2,13 @@
 # repo2docker runs this after building the conda environment.
 #
 # Install zagg from the checked-out repo together with its ``analysis`` extra
-# (the notebook runtime: jupyter/notebook, xarray, cartopy, matplotlib, ...) and
+# (the notebook runtime: jupyter/notebook, xarray, cartopy, matplotlib, ...),
 # the ``catalog`` extra (stac-geoparquet), which the anonymous CMR-STAC
-# catalog-build cell in jupyterhub_example needs. Keeping the dependency set in
+# catalog-build cells in jupyterhub_example / shardmap_viewer need, and the
+# ``viz`` extra (ipyleaflet -- a pure-Python Jupyter widget) for the
+# shardmap_viewer notebook's interactive map. Keeping the dependency set in
 # pyproject.toml's extras means the Binder image and a local
-# ``pip install "zagg[analysis,catalog]"`` resolve the same way.
+# ``pip install "zagg[analysis,catalog,viz]"`` resolve the same way.
 #
 # We deliberately do NOT install:
 #   * the spherely exact-S2 fork (not on PyPI; not needed -- catalog building
@@ -23,8 +25,8 @@ set -euo pipefail
 # irrelevant for running the example notebooks).
 git fetch --tags --unshallow 2>/dev/null || git fetch --tags 2>/dev/null || true
 if git describe --tags --abbrev=0 >/dev/null 2>&1; then
-    python -m pip install --no-cache-dir ".[analysis,catalog]"
+    python -m pip install --no-cache-dir ".[analysis,catalog,viz]"
 else
     HATCH_VCS_PRETEND_VERSION="0.0.0+binder" \
-        python -m pip install --no-cache-dir ".[analysis,catalog]"
+        python -m pip install --no-cache-dir ".[analysis,catalog,viz]"
 fi
