@@ -1,11 +1,19 @@
 name: Lambda Benchmark
 
-# Cost/runtime regression tracking on real Lambda (issue #110).
+# Cost/runtime regression tracking on real Lambda (issues #110, #25).
 #   * non-fork PR to main, non-draft -> run + post an (ephemeral) PR comment
 #   * push to main (a merge)        -> run + retain to the `benchmarks` data
 #                                      branch and re-render the Pages charts
-# Fork PRs are handled on demand (label / slash-command) in
-# lambda-benchmark-command.yml so untrusted code never auto-runs with creds.
+# Tier 2 (issue #25): a benchmark only reflects the PR if the DEPLOYED worker is
+# the PR's code. When the change is "lambda-affecting" (touches src/zagg,
+# deployment/aws, or pyproject) and the deploy is configured, we build the arm64
+# zips and update the `process-shard-test` function, then benchmark against it.
+# Otherwise we benchmark the stable function (correct for orchestrator/doc-only
+# changes, and the path before the AWS-side deploy is set up). Fork PRs never
+# deploy (handled in lambda-benchmark-command.yml).
+#
+# The whole workflow is serialized (a single shared `test` function), so two
+# runs can't deploy/benchmark over each other.
 
 on:
   pull_request:
@@ -25,18 +33,126 @@ permissions:
   id-token: write
   pull-requests: write
 
+concurrency:
+  group: lambda-benchmark
+  cancel-in-progress: false
+
 jobs:
+  # Decide whether to deploy + benchmark the `test` function (lambda-affecting,
+  # configured, non-fork) or just benchmark the stable function.
+  detect:
+    runs-on: ubuntu-latest
+    outputs:
+      affecting: ${{ steps.d.outputs.affecting }}
+      function_name: ${{ steps.d.outputs.function_name }}
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+          ref: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.sha || github.sha }}
+      - id: d
+        env:
+          DEPLOY_ROLE: ${{ vars.BENCHMARK_DEPLOY_ROLE_ARN }}
+          TEST_FN: ${{ vars.BENCHMARK_TEST_FUNCTION_NAME }}
+          STAGE_BUCKET: ${{ vars.BENCHMARK_TEST_STAGE_BUCKET }}
+          STABLE_FN: ${{ vars.BENCHMARK_FUNCTION_NAME }}
+          IS_FORK: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name != github.repository }}
+          EVENT: ${{ github.event_name }}
+          PR_BASE: ${{ github.event.pull_request.base.sha }}
+          PR_HEAD: ${{ github.event.pull_request.head.sha }}
+          PUSH_BEFORE: ${{ github.event.before }}
+          PUSH_AFTER: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          # Tier-2 deploy is possible only when fully configured and not a fork.
+          deployable=true
+          { [ -n "$DEPLOY_ROLE" ] && [ -n "$TEST_FN" ] && [ -n "$STAGE_BUCKET" ]; } || deployable=false
+          [ "$IS_FORK" = "true" ] && deployable=false
+
+          # Does the change touch the deployed Lambda closure? (Over-detection is
+          # safe -- it just redeploys; under-detection would benchmark stale code.)
+          touched=false
+          if [ "$EVENT" = "workflow_dispatch" ]; then
+            touched=true
+          else
+            if [ "$EVENT" = "pull_request" ]; then BASE="$PR_BASE"; HEAD="$PR_HEAD"; else BASE="$PUSH_BEFORE"; HEAD="$PUSH_AFTER"; fi
+            if ! git cat-file -e "${BASE}^{commit}" 2>/dev/null; then BASE="${HEAD}~1"; fi
+            CHANGED=$(git diff --name-only "$BASE" "$HEAD" 2>/dev/null || echo "")
+            if echo "$CHANGED" | grep -qE '^(src/zagg/|deployment/aws/|pyproject\.toml)'; then touched=true; fi
+          fi
+
+          if [ "$deployable" = "true" ] && [ "$touched" = "true" ]; then
+            echo "affecting=true" >> "$GITHUB_OUTPUT"
+            echo "function_name=$TEST_FN" >> "$GITHUB_OUTPUT"
+          else
+            echo "affecting=false" >> "$GITHUB_OUTPUT"
+            echo "function_name=$STABLE_FN" >> "$GITHUB_OUTPUT"
+          fi
+
+  # Build the arm64 zips and update process-shard-test in place (only when the
+  # change is lambda-affecting). Serialized with the benchmark via the workflow
+  # concurrency group above.
+  deploy-test:
+    needs: detect
+    if: needs.detect.outputs.affecting == 'true'
+    runs-on: ubuntu-24.04-arm
+    permissions:
+      id-token: write
+      contents: read
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          ref: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.sha || github.sha }}
+      - name: Build arm64 layer
+        run: |
+          docker run --rm \
+            -v ${{ github.workspace }}:/workspace \
+            -w /workspace/deployment/aws \
+            quay.io/pypa/manylinux_2_28_aarch64 \
+            bash -c "yum install -y zip && chmod +x build_layer.sh && ./build_layer.sh arm64"
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v6
+        with:
+          python-version: '3.12'
+      - name: Build arm64 function
+        run: |
+          chmod +x deployment/aws/build_function.sh
+          deployment/aws/build_function.sh
+      - name: Assume deploy role (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.BENCHMARK_DEPLOY_ROLE_ARN }}
+          aws-region: ${{ vars.BENCHMARK_AWS_REGION }}
+      - name: Stage layer + deploy test function
+        env:
+          STAGE_BUCKET: ${{ vars.BENCHMARK_TEST_STAGE_BUCKET }}
+          FUNCTION_NAME: ${{ vars.BENCHMARK_TEST_FUNCTION_NAME }}
+          REGION: ${{ vars.BENCHMARK_AWS_REGION }}
+          SHA: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.sha || github.sha }}
+        run: |
+          set -euo pipefail
+          KEY="lambda-test/${SHA}/lambda_layer_arm64.zip"
+          aws s3 cp deployment/layers/lambda_layer_arm64.zip "s3://${STAGE_BUCKET}/${KEY}" --region "$REGION"
+          .github/scripts/deploy_lambda.sh \
+            --function "$FUNCTION_NAME" \
+            --layer-bucket "$STAGE_BUCKET" \
+            --layer-key "$KEY" \
+            --function-zip "$(ls deployment/builds/lambda_function_arm64_*.zip)" \
+            --region "$REGION"
+
   pr-comment:
+    needs: [detect, deploy-test]
     # Same-repo PRs only (forks can't be trusted with the role); skip drafts.
+    # !cancelled() lets this run when deploy-test was skipped (non-affecting);
+    # a deploy *failure* skips the benchmark (don't measure a broken deploy).
     if: >-
+      !cancelled() &&
+      needs.detect.result == 'success' &&
+      needs.deploy-test.result != 'failure' &&
       github.event_name == 'pull_request' &&
       github.event.pull_request.head.repo.full_name == github.repository &&
       github.event.pull_request.draft == false
     runs-on: ubuntu-latest
-    # One run per PR; a new push supersedes the in-flight (and unbilled) run.
-    concurrency:
-      group: lambda-benchmark-pr-${{ github.event.pull_request.number }}
-      cancel-in-progress: true
     steps:
       - name: Checkout PR head
         uses: actions/checkout@v5
@@ -48,7 +164,7 @@ jobs:
         with:
           role-arn: ${{ vars.BENCHMARK_ROLE_ARN }}
           aws-region: ${{ vars.BENCHMARK_AWS_REGION }}
-          function-name: ${{ vars.BENCHMARK_FUNCTION_NAME }}
+          function-name: ${{ needs.detect.outputs.function_name }}
           store-prefix: ${{ vars.BENCHMARK_STORE_PREFIX }}
           edl-username: ${{ secrets.EARTHDATA_USERNAME }}
           edl-password: ${{ secrets.EARTHDATA_PASSWORD }}
@@ -75,16 +191,17 @@ jobs:
             }
 
   merge-publish:
-    if: github.event_name == 'push' || github.event_name == 'workflow_dispatch'
+    needs: [detect, deploy-test]
+    if: >-
+      !cancelled() &&
+      needs.detect.result == 'success' &&
+      needs.deploy-test.result != 'failure' &&
+      (github.event_name == 'push' || github.event_name == 'workflow_dispatch')
     runs-on: ubuntu-latest
     # contents: write to push the series + charts to the benchmarks branch.
     permissions:
       contents: write
       id-token: write
-    # Serialize so concurrent merges don't race on the benchmarks branch.
-    concurrency:
-      group: lambda-benchmark-publish
-      cancel-in-progress: false
     steps:
       - name: Checkout merge commit
         uses: actions/checkout@v5
@@ -95,7 +212,7 @@ jobs:
           targets: ${{ github.event.inputs.targets }}
           role-arn: ${{ vars.BENCHMARK_ROLE_ARN }}
           aws-region: ${{ vars.BENCHMARK_AWS_REGION }}
-          function-name: ${{ vars.BENCHMARK_FUNCTION_NAME }}
+          function-name: ${{ needs.detect.outputs.function_name }}
           store-prefix: ${{ vars.BENCHMARK_STORE_PREFIX }}
           edl-username: ${{ secrets.EARTHDATA_USERNAME }}
           edl-password: ${{ secrets.EARTHDATA_PASSWORD }}
