@@ -70,11 +70,19 @@ def main(argv: list[str] | None = None) -> int:
     if not isinstance(records, list):
         raise SystemExit("records JSON must be a list of record objects")
 
+    # Only merge runs are retained (the locked design). Enforce it at the boundary
+    # so a stray non-merge record can never evict a retained merge point via the
+    # (commit, target) dedup. Report drops -- a silent skip would read as "stored".
+    retained = [r for r in records if r.get("event") == "merge"]
+    dropped = len(records) - len(retained)
+    if dropped:
+        print(f"skipping {dropped} non-merge record(s); only merge runs are retained")
+
     existing = load_series(args.series)
-    updated = append_records(existing, records)
+    updated = append_records(existing, retained)
     save_series(updated, args.series)
     print(
-        f"series: {len(existing)} -> {len(updated)} rows ({len(records)} records) -> {args.series}"
+        f"series: {len(existing)} -> {len(updated)} rows ({len(retained)} records) -> {args.series}"
     )
     return 0
 
