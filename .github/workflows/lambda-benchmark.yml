@@ -50,6 +50,8 @@ jobs:
           aws-region: ${{ vars.BENCHMARK_AWS_REGION }}
           function-name: ${{ vars.BENCHMARK_FUNCTION_NAME }}
           store-prefix: ${{ vars.BENCHMARK_STORE_PREFIX }}
+          edl-username: ${{ secrets.EARTHDATA_USERNAME }}
+          edl-password: ${{ secrets.EARTHDATA_PASSWORD }}
           event: pr
           commit: ${{ github.event.pull_request.head.sha }}
           ref-label: ${{ github.head_ref }}
@@ -95,6 +97,8 @@ jobs:
           aws-region: ${{ vars.BENCHMARK_AWS_REGION }}
           function-name: ${{ vars.BENCHMARK_FUNCTION_NAME }}
           store-prefix: ${{ vars.BENCHMARK_STORE_PREFIX }}
+          edl-username: ${{ secrets.EARTHDATA_USERNAME }}
+          edl-password: ${{ secrets.EARTHDATA_PASSWORD }}
           event: merge
           commit: ${{ github.sha }}
           ref-label: ${{ github.ref_name }}

@@ -28,6 +28,8 @@ nav:
       - "AWS Lambda": "deployment/lambda.md"
       - "Execution Role": "deployment/execution-role.md"
       - "ARM64 Layer": "deployment/arm64.md"
+      - "Benchmark CI/CD Setup": "deployment/benchmark-cicd.md"
+      - "Benchmark Results": "deployment/benchmark.md"
 
 watch:
   - src/zagg

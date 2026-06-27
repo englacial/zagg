@@ -22,6 +22,12 @@ inputs:
   store-prefix:
     description: S3 prefix for benchmark output stores (s3://bucket/prefix)
     required: true
+  edl-username:
+    description: Earthdata Login username (the orchestrator mints NSIDC S3 read creds)
+    required: true
+  edl-password:
+    description: Earthdata Login password
+    required: true
   event:
     description: Trigger kind recorded in the metrics (pr|merge|manual)
     required: true
@@ -71,6 +77,10 @@ runs:
         COMMIT: ${{ inputs.commit }}
         REF_LABEL: ${{ inputs.ref-label }}
         PR_NUMBER: ${{ inputs.pr-number }}
+        # earthaccess.login() reads these to mint the NSIDC S3 read creds the
+        # orchestrator forwards to Lambda. Masked: they arrive from secrets.
+        EARTHDATA_USERNAME: ${{ inputs.edl-username }}
+        EARTHDATA_PASSWORD: ${{ inputs.edl-password }}
       run: |
         set -euo pipefail
         target_flags=()
