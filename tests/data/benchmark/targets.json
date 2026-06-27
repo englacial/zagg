@@ -19,7 +19,8 @@
     "healpix_o11": {
       "path": "shardmaps/sm_healpix_o11.json",
       "shard_key": 5347394812217655307,
-      "n_granules": 44
+      "n_granules": 44,
+      "note": "4-way tie at 44 granules; the lowest-key tiebreak makes the pin deterministic. The benchmark always dispatches this static shard_key, so the series is stable regardless of CMR drift. The phase-5 drift test must tolerate tie reselection (compare granule count within +/-1, not exact shard_key)."
     },
     "healpix_o10": {
       "path": "shardmaps/sm_healpix_o10.json",
