@@ -1,4 +1,5 @@
 """Output grid implementations."""
+
 from __future__ import annotations
 
 import warnings
@@ -51,20 +52,21 @@ def from_config(
             layout=layout,
             config=config,
             populated_shards=populated_shards,
+            chunk_inner=grid_cfg.get("chunk_inner"),
         )
     if grid_type == "rectilinear":
         required = ("crs", "resolution", "bounds")
         missing = [k for k in required if k not in grid_cfg]
         if missing:
-            raise ValueError(
-                f"output.grid type 'rectilinear' missing required fields: {missing}"
-            )
+            raise ValueError(f"output.grid type 'rectilinear' missing required fields: {missing}")
+        chunk_inner = grid_cfg.get("chunk_inner")
         return RectilinearGrid(
             crs=grid_cfg["crs"],
             resolution=grid_cfg["resolution"],
             bounds=grid_cfg["bounds"],
             chunk_shape=tuple(grid_cfg.get("chunk_shape", (256, 256))),
             config=config,
+            chunk_inner=tuple(chunk_inner) if chunk_inner is not None else None,
         )
     raise ValueError(f"Unknown output.grid.type: {grid_type!r}")
 
@@ -94,7 +96,7 @@ def validate_compatible(grids: list) -> None:
         If any pair of grids does not nest.
     """
     for i, a in enumerate(grids):
-        for b in grids[i + 1:]:
+        for b in grids[i + 1 :]:
             if not (a.nests_with(b) and b.nests_with(a)):
                 raise ValueError(
                     f"incompatible grids (do not nest):\n  {a.signature()}\n  {b.signature()}"

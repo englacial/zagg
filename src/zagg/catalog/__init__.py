@@ -11,6 +11,7 @@ This package root keeps the small region/temporal helpers shared by both, the
 *same* pipeline config the aggregator uses -- so the shard map can never be
 built against a different grid than the run (enforced via ``grid.signature()``).
 """
+
 from __future__ import annotations
 
 import json
@@ -18,6 +19,8 @@ from datetime import datetime, timedelta
 from importlib import resources
 
 import numpy as np
+
+from zagg.catalog.beams import beam_tracks_from_cmr_polygon
 
 # ICESat-2 constants
 _ICESAT2_LAUNCH = datetime(2018, 10, 13)
@@ -119,15 +122,13 @@ def load_antarctic_basins(filepath=None) -> list[tuple]:
     if filepath is None:
         import mortie.tests
 
-        filepath = str(
-            resources.files(mortie.tests) / "Ant_Grounded_DrainageSystem_Polygons.txt"
-        )
+        filepath = str(resources.files(mortie.tests) / "Ant_Grounded_DrainageSystem_Polygons.txt")
 
     df = pd.read_csv(filepath, names=["Lat", "Lon", "basin"], sep=r"\s+")
     return [(g["Lat"].values, g["Lon"].values) for _, g in df.groupby("basin")]
 
 
-def make_shardmap(query, grid, *, region=None, backend="auto", catalog_out=None):
+def make_shardmap(query, grid, *, region=None, backend="auto", catalog_out=None, footprint="swath"):
     """Fetch a Catalog and build a ShardMap in one call (concerns 1+2 chained).
 
     Parameters
@@ -142,6 +143,14 @@ def make_shardmap(query, grid, *, region=None, backend="auto", catalog_out=None)
         Geometry backend for the shard map.
     catalog_out : str, optional
         If given, persist the fetched Catalog to this geoparquet path.
+    footprint : {"swath", "beams"}
+        Granule footprint for intersection; ``"beams"`` tightens ICESat-2
+        ATL03/06 assignment to per-beam-pair corridors (issue #65).
+
+        .. deprecated::
+            The ``"beams"`` corridor mechanism is a stopgap. Remove it once a
+            better fix lands -- native per-beam CMR geometry, the memory-handling
+            robustness in #66, or data virtualization tracked in #97.
 
     Returns
     -------
@@ -153,7 +162,7 @@ def make_shardmap(query, grid, *, region=None, backend="auto", catalog_out=None)
     cat = CMRSource().fetch(query)
     if catalog_out:
         cat.to_geoparquet(catalog_out)
-    return ShardMap.build(cat, grid, region=region, backend=backend)
+    return ShardMap.build(cat, grid, region=region, backend=backend, footprint=footprint)
 
 
 def main():
@@ -181,8 +190,9 @@ examples:
       --bbox -76.62107,38.84504,-76.50583,38.93512
 """,
     )
-    parser.add_argument("--config", required=True,
-                        help="Pipeline config YAML (defines the output grid)")
+    parser.add_argument(
+        "--config", required=True, help="Pipeline config YAML (defines the output grid)"
+    )
     parser.add_argument("--short-name", required=True, help="CMR short name (e.g. ATL03)")
     parser.add_argument("--version", default="007", help="Product version (default: 007)")
     parser.add_argument("--provider", default="NSIDC_CPRD", help="CMR/STAC provider")
@@ -196,13 +206,25 @@ examples:
     spatial.add_argument("--polygon", help="GeoJSON area of interest")
     spatial.add_argument("--bbox", help="lon_min,lat_min,lon_max,lat_max")
 
-    parser.add_argument("--backend", default="auto",
-                        choices=["auto", "spherely", "mortie"])
-    parser.add_argument("--preserve-thumbnails", action="store_true",
-                        help="Keep browse/thumbnail assets in the Catalog")
+    parser.add_argument("--backend", default="auto", choices=["auto", "spherely", "mortie"])
+    parser.add_argument(
+        "--footprint",
+        default="swath",
+        choices=["swath", "beams"],
+        help="ATL03/06: 'beams' decomposes the CMR swath into "
+        "per-beam-pair corridors to tighten shard assignment (#65). "
+        "DEPRECATED -- remove once native per-beam CMR geometry, "
+        "#66, or #97 lands",
+    )
+    parser.add_argument(
+        "--preserve-thumbnails",
+        action="store_true",
+        help="Keep browse/thumbnail assets in the Catalog",
+    )
     parser.add_argument("--output", default=None, help="Output ShardMap JSON path")
-    parser.add_argument("--catalog-out", default=None,
-                        help="Optional: persist the fetched Catalog as geoparquet")
+    parser.add_argument(
+        "--catalog-out", default=None, help="Optional: persist the fetched Catalog as geoparquet"
+    )
 
     args = parser.parse_args()
     logging.basicConfig(level=logging.INFO, format="%(message)s")
@@ -229,19 +251,20 @@ examples:
     else:
         parser.error("provide --polygon or --bbox")
 
-    query = Query(args.short_name, args.version, start, end, region=bbox,
-                  provider=args.provider)
+    query = Query(args.short_name, args.version, start, end, region=bbox, provider=args.provider)
     cat = CMRSource().fetch(query, preserve_thumbnails=args.preserve_thumbnails)
     print(f"Fetched {len(cat)} granules ({query.collection})")
     if args.catalog_out:
         cat.to_geoparquet(args.catalog_out)
         print(f"Catalog -> {args.catalog_out}")
 
-    sm = ShardMap.build(cat, grid, region=parts, backend=args.backend)
+    sm = ShardMap.build(cat, grid, region=parts, backend=args.backend, footprint=args.footprint)
     out = args.output or f"shardmap_{args.short_name}_{start}_{end}.json"
     sm.to_json(out)
-    print(f"ShardMap: {len(sm.shard_keys)} shards, {sm.metadata['total_pairs']} pairs "
-          f"(backend={sm.metadata['backend']}) -> {out}")
+    print(
+        f"ShardMap: {len(sm.shard_keys)} shards, {sm.metadata['total_pairs']} pairs "
+        f"(backend={sm.metadata['backend']}) -> {out}"
+    )
 
 
 if __name__ == "__main__":
@@ -254,5 +277,6 @@ __all__ = [
     "polygon_to_bbox",
     "load_antarctic_basins",
     "make_shardmap",
+    "beam_tracks_from_cmr_polygon",
     "main",
 ]

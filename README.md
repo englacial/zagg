@@ -1,5 +1,7 @@
 # zagg - Multi-resolution Aggregation
 
+[![Binder](https://mybinder.org/badge_logo.svg)](https://mybinder.org/v2/gh/englacial/zagg/main?urlpath=lab/tree/notebooks)
+
 Aggregate point observations to multi-resolution grids using HEALPix spatial indexing and serverless compute.
 
 ## Overview
@@ -119,7 +121,20 @@ The output Zarr is a public DGGS dataset. The included notebook rasterizes HEALP
 uv run jupyter notebook notebooks/rasterized_zarr.ipynb
 ```
 
-Adjust `GRID_SPACING` in the notebook to control output resolution (default 2 km).
+Adjust `GRID_SPACING` in the notebook to control output resolution.
+
+## Example Notebooks
+
+The notebooks under `notebooks/` run on [Binder](https://mybinder.org/v2/gh/englacial/zagg/main?urlpath=lab/tree/notebooks) — no install, no credentials. They install `zagg[analysis]` via the `.binder/` conda config and read only synthetic in-notebook data or the **anonymous, public** [source.coop](https://source.coop/englacial/zagg/benchmarks) benchmark store.
+
+| Notebook | What it shows | Binder |
+|----------|---------------|--------|
+| `custom_aggregations.ipynb` | Config-driven aggregation API on synthetic data | [![Binder](https://mybinder.org/badge_logo.svg)](https://mybinder.org/v2/gh/englacial/zagg/main?urlpath=lab/tree/notebooks/custom_aggregations.ipynb) |
+| `rasterized_zarr.ipynb` | Rasterize the published HEALPix store to an 8 km polar-stereo grid | [![Binder](https://mybinder.org/badge_logo.svg)](https://mybinder.org/v2/gh/englacial/zagg/main?urlpath=lab/tree/notebooks/rasterized_zarr.ipynb) |
+| `jupyterhub_example.ipynb` | Drive the API from a science hub; read & visualize a published result | [![Binder](https://mybinder.org/badge_logo.svg)](https://mybinder.org/v2/gh/englacial/zagg/main?urlpath=lab/tree/notebooks/jupyterhub_example.ipynb) |
+| `cryocloud_example.ipynb` | End-to-end ISMIP6 read + **AWS Lambda fan-out** on CryoCloud | **not Binder-runnable** (needs live AWS + Earthdata credentials) |
+
+`cryocloud_example.ipynb` is the only Lambda demo; it dispatches to a deployed AWS Lambda and reads private-account S3 via the CryoCloud IRSA role, so it cannot run on Binder.
 
 ## Project Structure
 

@@ -47,7 +47,7 @@ The Lambda function processes a single morton cell (order 6) by:
 
 ```json
 {
-  "parent_morton": 123456,
+  "shard_key": 123456,
   "parent_order": 6,
   "child_order": 12,
   "granule_urls": [
@@ -74,24 +74,24 @@ The Lambda function processes a single morton cell (order 6) by:
 
 | Parameter | Type | Required | Description |
 |-----------|------|----------|-------------|
-| `parent_morton` | int | Yes | Morton index of parent cell (order 6) |
-| `parent_order` | int | Yes | Order of parent cell (typically 6) |
-| `child_order` | int | Yes | Order of child cells for statistics (typically 12) |
+| `shard_key` | int | Yes | Grid-agnostic shard identifier (HEALPix: the parent-cell morton index) |
+| `parent_order` | int | Yes | Order of parent cell (typically 6); HEALPix-only (`null` for other grids) |
+| `child_order` | int | HEALPix only | Order of child cells for statistics (typically 12); omitted for non-HEALPix grids |
 | `granule_urls` | list | Yes | Pre-computed list of S3 URLs from catalog |
 | `store_path` | str | Yes | Output Zarr store path (e.g. `s3://bucket/prefix.zarr`) |
 | `s3_credentials` | dict | Yes | NSIDC S3 credentials for reading source data |
 | `output_credentials` | dict | No | Explicit credentials for *writing* the output store. Omit to use the execution role (in-account writes). Supply to write an external / S3-compatible target. Keys: `accessKeyId`, `secretAccessKey`, optional `sessionToken`/`endpointUrl`/`region`. |
 
-!!! note "Shard vs. `parent_order` naming"
-    The unit of work is a **shard** — one parent (order-6) HEALPix cell. The
+!!! note "Grid-neutral event fields"
+    The unit of work is a **shard** — for HEALPix, one parent (order-6) cell. The
     orchestrator and the catalog use that vocabulary (`python -m zagg.catalog`
     emits a shard map with `shard_keys` + a `grid_signature`). The Lambda
-    **event** schema, however, still carries the HEALPix-shaped field names
-    `parent_morton` / `parent_order` / `child_order` shown above (the handler
-    requires them — see `deployment/aws/lambda_handler.py`). A grid-neutral
-    rename of those event fields is tracked in
-    [#24](https://github.com/englacial/zagg/issues/24), not done here, so the
-    field names above are the current, accurate ones.
+    **event** schema uses the grid-neutral field name `shard_key` (the shard
+    identifier for any grid; for HEALPix it is the parent-cell morton index).
+    `parent_order`/`child_order` are HEALPix-specific: `parent_order` is
+    forwarded for every grid (`null` for non-HEALPix), while `child_order` is
+    only required/sent for HEALPix runs. See `deployment/aws/lambda_handler.py`.
+    This rename landed via [#24](https://github.com/englacial/zagg/issues/24).
 
 ### S3 Credentials
 
@@ -105,7 +105,7 @@ s3_creds = get_nsidc_s3_credentials()
 
 # Pass to each Lambda invocation
 event = {
-    "parent_morton": -6134114,
+    "shard_key": -6134114,
     "parent_order": 6,
     "child_order": 12,
     "granule_urls": [...],

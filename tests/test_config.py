@@ -11,12 +11,18 @@ from zagg.config import (
     default_config,
     evaluate_expression,
     get_agg_fields,
+    get_base_level,
     get_child_order,
+    get_chunk_precompute,
     get_coords,
     get_data_vars,
+    get_filters,
+    get_levels,
+    get_output_signature,
     get_store_path,
     load_config,
     load_config_from_dict,
+    output_field_signature,
     resolve_function,
     validate_config,
 )
@@ -26,12 +32,14 @@ from zagg.processing import calculate_cell_statistics
 # Fixtures
 # ---------------------------------------------------------------------------
 
+
 @pytest.fixture
 def atl06_yaml(tmp_path):
     """Path to the built-in atl06.yaml (copied to tmp for load_config tests)."""
     from importlib import resources
 
     import zagg.configs
+
     ref = resources.files(zagg.configs).joinpath("atl06.yaml")
     text = ref.read_text(encoding="utf-8")
     p = tmp_path / "atl06.yaml"
@@ -46,15 +54,18 @@ def atl06_config():
 
 @pytest.fixture
 def synthetic_df():
-    return pd.DataFrame({
-        "h_li": np.array([120.5, 118.3, 122.1, 119.7, 121.0], dtype=np.float32),
-        "s_li": np.array([0.05, 0.10, 0.03, 0.08, 0.06], dtype=np.float32),
-    })
+    return pd.DataFrame(
+        {
+            "h_li": np.array([120.5, 118.3, 122.1, 119.7, 121.0], dtype=np.float32),
+            "s_li": np.array([0.05, 0.10, 0.03, 0.08, 0.06], dtype=np.float32),
+        }
+    )
 
 
 # ---------------------------------------------------------------------------
 # Loading
 # ---------------------------------------------------------------------------
+
 
 class TestLoading:
     def test_load_yaml(self, atl06_yaml):
@@ -77,6 +88,7 @@ class TestLoading:
 # Default config
 # ---------------------------------------------------------------------------
 
+
 class TestDefaultConfig:
     def test_default_atl06(self):
         cfg = default_config("atl06")
@@ -89,8 +101,106 @@ class TestDefaultConfig:
 
 
 # ---------------------------------------------------------------------------
+# ATL03 template
+# ---------------------------------------------------------------------------
+
+
+class TestATL03Template:
+    @pytest.fixture
+    def atl03_config(self):
+        return default_config("atl03")
+
+    def test_loads_and_validates(self, atl03_config):
+        # default_config already runs validate_config; assert it round-trips.
+        validate_config(atl03_config)
+        assert atl03_config.data_source["reader"] == "h5coro"
+        assert len(atl03_config.data_source["groups"]) == 6
+
+    def test_scalar_variables(self, atl03_config):
+        dvars = set(get_data_vars(atl03_config))
+        assert dvars == {"count", "h_min", "h_max", "h_mean", "h_median", "h_variance"}
+
+    def test_functions_resolve(self, atl03_config):
+        for meta in get_agg_fields(atl03_config).values():
+            assert "expression" not in meta  # scalar-only; non-scalar is #29
+            resolve_function(meta["function"])  # raises on failure
+
+    def test_confidence_filter_drops_tep(self, atl03_config):
+        # The ATL03 template carries one structured TEP filter: keep photons where
+        # signal_conf_ph[:, 0] (land surface type) != -2. TEP is uniform across
+        # surface types per the ATL03 v3 data dictionary, so column 0 is
+        # operationally equivalent to any other column for the TEP drop.
+        filters = atl03_config.data_source["filters"]
+        assert len(filters) == 1
+        f = filters[0]
+        assert f["value"] == -2
+        assert f["op"] == "ne"  # keep signal_conf_ph != -2 (drop only TEP)
+        assert f["column"] == 0
+        assert f["dataset"].endswith("signal_conf_ph")
+
+    def test_rectilinear_grid(self, atl03_config):
+        grid = atl03_config.output["grid"]
+        assert grid["type"] == "rectilinear"
+        assert len(grid["bounds"]) == 4
+
+    def test_multi_level_form_for_planned_reads(self, atl03_config):
+        # Phase 6: the template declares the ``photons`` (base) + ``segments``
+        # (coarse) levels and the link arrays so the #43 Phase C read_plan can
+        # bound base-rate IO. Without this the ATL03 region runs OOM on Lambda
+        # (245 MB-per-beam coord-read floor; see #43).
+        ds = atl03_config.data_source
+        assert ds["base_level"] == "photons"
+        levels = ds["levels"]
+        assert set(levels) == {"photons", "segments"}
+        assert levels["photons"]["link"] is None
+        seg_link = levels["segments"]["link"]
+        assert seg_link["to"] == "photons"
+        assert seg_link["index_beg"].endswith("ph_index_beg")
+        assert seg_link["count"].endswith("segment_ph_cnt")
+        assert seg_link["index_base"] == 1  # ATL03 ph_index_beg is 1-based
+
+    def test_read_plan_targets_segments_level(self, atl03_config):
+        rp = atl03_config.data_source["read_plan"]
+        assert rp["spatial_index"] == "segments"
+        assert rp["pad"] == 1
+
+
+class TestWaveformChunkTemplate:
+    """The worked chunk-precompute example (issue #30, item 1)."""
+
+    @pytest.fixture
+    def cfg(self):
+        return default_config("atl03_waveform_chunk")
+
+    def test_loads_and_validates(self, cfg):
+        validate_config(cfg)
+        assert cfg.data_source["reader"] == "h5coro"
+
+    def test_declares_chunk_precompute(self, cfg):
+        pc = get_chunk_precompute(cfg)
+        assert set(pc) == {"chunk_offset", "chunk_gain"}
+        for meta in pc.values():
+            assert "expression" in meta
+        # chunk_offset is the DEM anchor (dem_h, a segment-level variable);
+        # chunk_gain is a spread over the photon heights (h_ph).
+        assert pc["chunk_offset"]["source"] == "dem_h"
+        assert pc["chunk_gain"]["source"] == "h_ph"
+
+    def test_waveform_references_chunk_names(self, cfg):
+        expr = cfg.aggregation["variables"]["waveform_counts"]["expression"]
+        assert "chunk_offset" in expr
+        assert "chunk_gain" in expr
+
+    def test_records_offset_and_gain_scalar_fields(self, cfg):
+        vars_ = cfg.aggregation["variables"]
+        assert vars_["offset_h"]["expression"] == "chunk_offset"
+        assert vars_["gain_h"]["expression"] == "chunk_gain"
+
+
+# ---------------------------------------------------------------------------
 # Function resolution
 # ---------------------------------------------------------------------------
+
 
 class TestResolveFunction:
     def test_min(self):
@@ -116,6 +226,7 @@ class TestResolveFunction:
 # ---------------------------------------------------------------------------
 # Expression evaluation
 # ---------------------------------------------------------------------------
+
 
 class TestEvaluateExpression:
     def test_simple_expression(self):
@@ -149,6 +260,7 @@ class TestEvaluateExpression:
 # Validation
 # ---------------------------------------------------------------------------
 
+
 class TestValidation:
     def test_atl06_validates(self, atl06_config):
         # Should not raise
@@ -157,9 +269,11 @@ class TestValidation:
     def test_missing_source(self):
         cfg = PipelineConfig(
             data_source={"variables": {"h_li": "/path"}},
-            aggregation={"variables": {
-                "bad": {"function": "min", "source": "nonexistent", "dtype": "float32"},
-            }},
+            aggregation={
+                "variables": {
+                    "bad": {"function": "min", "source": "nonexistent", "dtype": "float32"},
+                }
+            },
             output={"grid": {"type": "healpix", "parent_order": 6, "child_order": 12}},
         )
         with pytest.raises(ValueError, match="source.*nonexistent"):
@@ -168,14 +282,16 @@ class TestValidation:
     def test_missing_weights_column(self):
         cfg = PipelineConfig(
             data_source={"variables": {"h_li": "/path"}},
-            aggregation={"variables": {
-                "bad": {
-                    "function": "average",
-                    "source": "h_li",
-                    "params": {"weights": "missing_col"},
-                    "dtype": "float32",
-                },
-            }},
+            aggregation={
+                "variables": {
+                    "bad": {
+                        "function": "average",
+                        "source": "h_li",
+                        "params": {"weights": "missing_col"},
+                        "dtype": "float32",
+                    },
+                }
+            },
             output={"grid": {"type": "healpix", "parent_order": 6, "child_order": 12}},
         )
         with pytest.raises(ValueError, match="missing_col"):
@@ -184,12 +300,14 @@ class TestValidation:
     def test_expression_unknown_column(self):
         cfg = PipelineConfig(
             data_source={"variables": {"h_li": "/path"}},
-            aggregation={"variables": {
-                "bad": {
-                    "expression": "unknown_col + 1",
-                    "dtype": "float32",
-                },
-            }},
+            aggregation={
+                "variables": {
+                    "bad": {
+                        "expression": "unknown_col + 1",
+                        "dtype": "float32",
+                    },
+                }
+            },
             output={"grid": {"type": "healpix", "parent_order": 6, "child_order": 12}},
         )
         with pytest.raises(ValueError, match="unknown_col"):
@@ -198,14 +316,16 @@ class TestValidation:
     def test_function_and_expression_mutual_exclusion(self):
         cfg = PipelineConfig(
             data_source={"variables": {"h_li": "/path"}},
-            aggregation={"variables": {
-                "bad": {
-                    "function": "min",
-                    "expression": "np.min(h_li)",
-                    "source": "h_li",
-                    "dtype": "float32",
-                },
-            }},
+            aggregation={
+                "variables": {
+                    "bad": {
+                        "function": "min",
+                        "expression": "np.min(h_li)",
+                        "source": "h_li",
+                        "dtype": "float32",
+                    },
+                }
+            },
             output={"grid": {"type": "healpix", "parent_order": 6, "child_order": 12}},
         )
         with pytest.raises(ValueError, match="mutually exclusive"):
@@ -214,23 +334,585 @@ class TestValidation:
     def test_neither_function_nor_expression(self):
         cfg = PipelineConfig(
             data_source={"variables": {"h_li": "/path"}},
-            aggregation={"variables": {
-                "bad": {"source": "h_li", "dtype": "float32"},
-            }},
+            aggregation={
+                "variables": {
+                    "bad": {"source": "h_li", "dtype": "float32"},
+                }
+            },
             output={"grid": {"type": "healpix", "parent_order": 6, "child_order": 12}},
         )
         with pytest.raises(ValueError, match="must specify"):
             validate_config(cfg)
 
     def test_missing_required_section(self):
-        cfg = PipelineConfig(data_source={}, aggregation={"variables": {}}, output={"grid": {"type": "x"}})
+        cfg = PipelineConfig(
+            data_source={}, aggregation={"variables": {}}, output={"grid": {"type": "x"}}
+        )
         with pytest.raises(ValueError, match="Missing required section"):
             validate_config(cfg)
 
 
 # ---------------------------------------------------------------------------
+# Per-chunk precompute hook (issue #30, item 1)
+# ---------------------------------------------------------------------------
+
+
+def _cfg_with_precompute(precompute, variables=None):
+    """Minimal valid config carrying an aggregation.chunk_precompute block."""
+    return PipelineConfig(
+        data_source={"variables": {"h_ph": "/{group}/h_ph"}},
+        aggregation={
+            "chunk_precompute": precompute,
+            "variables": variables
+            or {"h_min": {"function": "min", "source": "h_ph", "dtype": "float32"}},
+        },
+        output={"grid": {"type": "healpix", "parent_order": 6, "child_order": 12}},
+    )
+
+
+class TestChunkPrecompute:
+    def test_expression_entry_validates(self):
+        cfg = _cfg_with_precompute(
+            {"chunk_offset": {"expression": "np.floor(np.median(h_ph))", "source": "h_ph"}}
+        )
+        validate_config(cfg)  # should not raise
+        assert list(get_chunk_precompute(cfg)) == ["chunk_offset"]
+
+    def test_function_entry_validates(self):
+        cfg = _cfg_with_precompute(
+            {"chunk_median": {"function": "median", "source": "h_ph", "dtype": "float32"}}
+        )
+        validate_config(cfg)
+
+    def test_get_chunk_precompute_empty_without_block(self, atl06_config):
+        assert get_chunk_precompute(atl06_config) == {}
+
+    def test_per_cell_expression_may_reference_precompute_name(self):
+        # offset_h's expression is just the chunk_precompute name; it must validate.
+        cfg = _cfg_with_precompute(
+            {"chunk_offset": {"expression": "np.floor(np.median(h_ph))", "source": "h_ph"}},
+            variables={"offset_h": {"expression": "chunk_offset", "dtype": "float32"}},
+        )
+        validate_config(cfg)
+
+    def test_unknown_source_rejected(self):
+        cfg = _cfg_with_precompute({"bad": {"function": "median", "source": "nonexistent"}})
+        with pytest.raises(ValueError, match="chunk_precompute 'bad'.*nonexistent"):
+            validate_config(cfg)
+
+    def test_both_function_and_expression_rejected(self):
+        cfg = _cfg_with_precompute(
+            {
+                "bad": {
+                    "function": "median",
+                    "expression": "np.median(h_ph)",
+                    "source": "h_ph",
+                }
+            }
+        )
+        with pytest.raises(ValueError, match="mutually exclusive"):
+            validate_config(cfg)
+
+    def test_neither_function_nor_expression_rejected(self):
+        cfg = _cfg_with_precompute({"bad": {"source": "h_ph"}})
+        with pytest.raises(ValueError, match="must specify"):
+            validate_config(cfg)
+
+    def test_empty_name_rejected(self):
+        cfg = _cfg_with_precompute({"   ": {"function": "median", "source": "h_ph"}})
+        with pytest.raises(ValueError, match="non-empty strings"):
+            validate_config(cfg)
+
+    def test_expression_unknown_column_rejected(self):
+        cfg = _cfg_with_precompute({"bad": {"expression": "np.median(missing_col)"}})
+        with pytest.raises(ValueError, match="missing_col"):
+            validate_config(cfg)
+
+    def test_bad_dtype_rejected(self):
+        cfg = _cfg_with_precompute(
+            {"bad": {"function": "median", "source": "h_ph", "dtype": "not_a_dtype"}}
+        )
+        with pytest.raises(ValueError, match="not a valid.*numpy dtype"):
+            validate_config(cfg)
+
+    def test_non_mapping_block_rejected(self):
+        cfg = _cfg_with_precompute(["not", "a", "mapping"])
+        with pytest.raises(ValueError, match="must be a mapping"):
+            validate_config(cfg)
+
+    def test_name_colliding_with_column_rejected(self):
+        # A precompute name equal to a data_source.variables column would shadow the
+        # real column array with a 0-d scalar in the per-cell namespace merge.
+        cfg = _cfg_with_precompute({"h_ph": {"expression": "np.median(h_ph)", "source": "h_ph"}})
+        with pytest.raises(ValueError, match="chunk_precompute 'h_ph'.*collides"):
+            validate_config(cfg)
+
+    def test_name_colliding_with_leaf_id_rejected(self):
+        cfg = _cfg_with_precompute({"leaf_id": {"expression": "np.median(h_ph)", "source": "h_ph"}})
+        with pytest.raises(ValueError, match="chunk_precompute 'leaf_id'.*collides"):
+            validate_config(cfg)
+
+    def test_inter_precompute_reference_rejected_as_unknown_column(self):
+        # Inter-precompute references are unsupported: chunk_gain referencing
+        # chunk_offset is rejected as an unknown column (no chaining, single pass).
+        cfg = _cfg_with_precompute(
+            {
+                "chunk_offset": {"expression": "np.median(h_ph)", "source": "h_ph"},
+                "chunk_gain": {"expression": "chunk_offset + 1.0", "source": "h_ph"},
+            }
+        )
+        with pytest.raises(ValueError, match="chunk_offset"):
+            validate_config(cfg)
+
+
+# ---------------------------------------------------------------------------
+# Structured filters (issue #43, Phase A)
+# ---------------------------------------------------------------------------
+
+
+def _cfg_with_filters(filters=None, quality_filter=None):
+    """Minimal valid config with a custom data_source filter spec."""
+    ds = {"variables": {"h_li": "/{group}/h_li"}}
+    if filters is not None:
+        ds["filters"] = filters
+    if quality_filter is not None:
+        ds["quality_filter"] = quality_filter
+    return PipelineConfig(
+        data_source=ds,
+        aggregation={
+            "variables": {
+                "h_min": {"function": "min", "source": "h_li", "dtype": "float32"},
+            }
+        },
+        output={"grid": {"type": "healpix", "parent_order": 6, "child_order": 12}},
+    )
+
+
+class TestFilters:
+    def test_quality_filter_synthesizes_base_eq(self, atl06_config):
+        filters = get_filters(atl06_config)
+        assert len(filters) == 1
+        f = filters[0]
+        assert f["op"] == "eq"
+        assert f["level"] is None
+        assert f["column"] is None
+        assert f["keep"] is True
+        assert f["value"] == 0
+        assert f["dataset"].endswith("atl06_quality_summary")
+
+    def test_no_filters_returns_empty(self):
+        cfg = _cfg_with_filters()
+        assert get_filters(cfg) == []
+
+    def test_explicit_filters_override_quality_filter(self):
+        cfg = _cfg_with_filters(
+            filters=[{"dataset": "/{group}/conf", "column": 0, "op": "ne", "value": 0}],
+            quality_filter={"dataset": "/{group}/qs", "value": 0},
+        )
+        filters = get_filters(cfg)
+        assert len(filters) == 1
+        assert filters[0]["column"] == 0
+        assert filters[0]["op"] == "ne"
+
+    def test_normalize_set_op_keeps_values_list(self):
+        cfg = _cfg_with_filters(filters=[{"dataset": "/d", "op": "in", "values": [2, 3, 4]}])
+        f = get_filters(cfg)[0]
+        assert f["values"] == [2, 3, 4]
+        assert "value" not in f
+
+    def test_normalize_keep_drop(self):
+        cfg = _cfg_with_filters(filters=[{"dataset": "/d", "op": "eq", "value": 1, "keep": False}])
+        assert get_filters(cfg)[0]["keep"] is False
+
+    def test_expression_filter_normalized(self):
+        cfg = _cfg_with_filters(filters=[{"expression": "h_li > 0"}])
+        f = get_filters(cfg)[0]
+        assert f["expression"] == "h_li > 0"
+        assert f["level"] is None
+
+    def test_unknown_op_rejected(self):
+        cfg = _cfg_with_filters(filters=[{"dataset": "/d", "op": "between", "value": 1}])
+        with pytest.raises(ValueError, match="unknown op"):
+            validate_config(cfg)
+
+    def test_column_must_be_int(self):
+        cfg = _cfg_with_filters(
+            filters=[{"dataset": "/d", "column": "land", "op": "ne", "value": 0}]
+        )
+        with pytest.raises(ValueError, match="must be an integer"):
+            validate_config(cfg)
+
+    def test_set_op_requires_values_list(self):
+        cfg = _cfg_with_filters(filters=[{"dataset": "/d", "op": "in", "value": 3}])
+        with pytest.raises(ValueError, match="requires a 'values' list"):
+            validate_config(cfg)
+
+    def test_scalar_op_requires_value(self):
+        cfg = _cfg_with_filters(filters=[{"dataset": "/d", "op": "eq"}])
+        with pytest.raises(ValueError, match="requires a scalar 'value'"):
+            validate_config(cfg)
+
+    def test_bad_value_type_rejected(self):
+        cfg = _cfg_with_filters(filters=[{"dataset": "/d", "op": "eq", "value": "x"}])
+        with pytest.raises(ValueError, match="must be numeric"):
+            validate_config(cfg)
+
+    def test_missing_dataset_rejected(self):
+        cfg = _cfg_with_filters(filters=[{"op": "eq", "value": 0}])
+        with pytest.raises(ValueError, match="requires 'dataset'"):
+            validate_config(cfg)
+
+    def test_expression_with_level_rejected(self):
+        cfg = _cfg_with_filters(filters=[{"expression": "h_li > 0", "level": "segment"}])
+        with pytest.raises(ValueError, match="base-level only"):
+            validate_config(cfg)
+
+    def test_expression_with_op_rejected(self):
+        cfg = _cfg_with_filters(filters=[{"expression": "h_li > 0", "op": "eq", "dataset": "/d"}])
+        with pytest.raises(ValueError, match="take no 'op'"):
+            validate_config(cfg)
+
+    def test_bool_column_rejected(self):
+        # bool is a subclass of int; filter column: true must be rejected.
+        cfg = _cfg_with_filters(filters=[{"dataset": "/d", "column": True, "op": "eq", "value": 0}])
+        with pytest.raises(ValueError, match="must be an integer"):
+            validate_config(cfg)
+
+    def test_bool_value_rejected(self):
+        # bool is a subclass of int; filter value: true must be rejected.
+        cfg = _cfg_with_filters(filters=[{"dataset": "/d", "op": "eq", "value": True}])
+        with pytest.raises(ValueError, match="must be numeric"):
+            validate_config(cfg)
+
+    def test_bool_in_values_rejected(self):
+        # bool elements in a 'values' list must be rejected.
+        cfg = _cfg_with_filters(filters=[{"dataset": "/d", "op": "in", "values": [0, True]}])
+        with pytest.raises(ValueError, match="must be numeric"):
+            validate_config(cfg)
+
+
+# ---------------------------------------------------------------------------
+# Hierarchical levels and link validation (issue #43, Phase B)
+# ---------------------------------------------------------------------------
+
+
+def _minimal_two_level_ds(**overrides):
+    """Return a minimal two-level data_source dict with one segment->photon link."""
+    ds = {
+        "reader": "h5coro",
+        "groups": ["gt1l"],
+        "coordinates": {"latitude": "/gt1l/ph_lat", "longitude": "/gt1l/ph_lon"},
+        "variables": {"h": "/gt1l/h_ph"},
+        "base_level": "photons",
+        "levels": {
+            "photons": {
+                "path": "/{group}/heights",
+                "coordinates": ["lat_ph", "lon_ph"],
+                "variables": ["h_ph"],
+                "link": None,
+            },
+            "segments": {
+                "path": "/{group}/geolocation",
+                "coordinates": ["reference_photon_lat", "reference_photon_lon"],
+                "variables": ["signal_conf_ph"],
+                "link": {
+                    "to": "photons",
+                    "index_beg": "/{group}/geolocation/ph_index_beg",
+                    "count": "/{group}/geolocation/segment_ph_cnt",
+                },
+            },
+        },
+    }
+    ds.update(overrides)
+    return ds
+
+
+def _cfg_with_levels(**overrides):
+    ds = _minimal_two_level_ds(**overrides)
+    return PipelineConfig(
+        data_source=ds,
+        aggregation={"variables": {"count": {"function": "len", "source": "h", "dtype": "int32"}}},
+        output={"grid": {"type": "healpix", "parent_order": 6, "child_order": 12}},
+    )
+
+
+class TestLevelsValidation:
+    def test_valid_two_level_config(self):
+        validate_config(_cfg_with_levels())
+
+    def test_flat_form_still_valid(self, atl06_config):
+        # Flat form (no levels/base_level) must still pass.
+        assert get_levels(atl06_config) is None
+        assert get_base_level(atl06_config) is None
+        validate_config(atl06_config)
+
+    def test_get_levels_and_base_level(self):
+        cfg = _cfg_with_levels()
+        levels = get_levels(cfg)
+        assert levels is not None
+        assert "photons" in levels
+        assert "segments" in levels
+        assert get_base_level(cfg) == "photons"
+
+    def test_base_level_must_name_a_key(self):
+        cfg = _cfg_with_levels(base_level="nonexistent")
+        with pytest.raises(ValueError, match="not a key in levels"):
+            validate_config(cfg)
+
+    def test_link_to_must_name_a_key(self):
+        ds = _minimal_two_level_ds()
+        ds["levels"]["segments"]["link"]["to"] = "nonexistent"
+        cfg = _cfg_with_levels(**ds)
+        with pytest.raises(ValueError, match="not a key in levels"):
+            validate_config(cfg)
+
+    def test_link_to_must_name_a_key2(self):
+        # Build config directly to avoid _cfg_with_levels merging issues
+        ds = _minimal_two_level_ds()
+        ds["levels"]["segments"]["link"]["to"] = "nonexistent"
+        cfg = PipelineConfig(
+            data_source=ds,
+            aggregation={"variables": {"c": {"function": "len", "dtype": "int32"}}},
+            output={"grid": {"type": "healpix", "parent_order": 6, "child_order": 12}},
+        )
+        with pytest.raises(ValueError, match="not a key in levels"):
+            validate_config(cfg)
+
+    def test_link_missing_required_field(self):
+        ds = _minimal_two_level_ds()
+        del ds["levels"]["segments"]["link"]["count"]
+        cfg = PipelineConfig(
+            data_source=ds,
+            aggregation={"variables": {"c": {"function": "len", "dtype": "int32"}}},
+            output={"grid": {"type": "healpix", "parent_order": 6, "child_order": 12}},
+        )
+        with pytest.raises(ValueError, match="'count' is required"):
+            validate_config(cfg)
+
+    def test_link_unknown_field_rejected(self):
+        ds = _minimal_two_level_ds()
+        ds["levels"]["segments"]["link"]["bogus"] = "x"
+        cfg = PipelineConfig(
+            data_source=ds,
+            aggregation={"variables": {"c": {"function": "len", "dtype": "int32"}}},
+            output={"grid": {"type": "healpix", "parent_order": 6, "child_order": 12}},
+        )
+        with pytest.raises(ValueError, match="unknown fields"):
+            validate_config(cfg)
+
+    def test_base_level_without_link_ok(self):
+        # base_level is the only level allowed to have link: None.
+        cfg = _cfg_with_levels()
+        validate_config(cfg)
+        assert cfg.data_source["levels"]["photons"]["link"] is None
+
+    def test_non_base_level_without_link_rejected(self):
+        ds = _minimal_two_level_ds()
+        ds["levels"]["segments"]["link"] = None
+        cfg = PipelineConfig(
+            data_source=ds,
+            aggregation={"variables": {"c": {"function": "len", "dtype": "int32"}}},
+            output={"grid": {"type": "healpix", "parent_order": 6, "child_order": 12}},
+        )
+        with pytest.raises(ValueError, match="must have a 'link'"):
+            validate_config(cfg)
+
+    def test_levels_missing_base_level_key_rejected(self):
+        ds = _minimal_two_level_ds()
+        del ds["base_level"]
+        cfg = PipelineConfig(
+            data_source=ds,
+            aggregation={"variables": {"c": {"function": "len", "dtype": "int32"}}},
+            output={"grid": {"type": "healpix", "parent_order": 6, "child_order": 12}},
+        )
+        with pytest.raises(ValueError, match="base_level is required"):
+            validate_config(cfg)
+
+    def test_index_base_must_be_nonneg_int(self):
+        ds = _minimal_two_level_ds()
+        ds["levels"]["segments"]["link"]["index_base"] = -1
+        cfg = PipelineConfig(
+            data_source=ds,
+            aggregation={"variables": {"c": {"function": "len", "dtype": "int32"}}},
+            output={"grid": {"type": "healpix", "parent_order": 6, "child_order": 12}},
+        )
+        with pytest.raises(ValueError, match="non-negative int"):
+            validate_config(cfg)
+
+    def test_reference_index_must_be_none(self):
+        ds = _minimal_two_level_ds()
+        ds["levels"]["segments"]["link"]["reference_index"] = "/some/path"
+        cfg = PipelineConfig(
+            data_source=ds,
+            aggregation={"variables": {"c": {"function": "len", "dtype": "int32"}}},
+            output={"grid": {"type": "healpix", "parent_order": 6, "child_order": 12}},
+        )
+        with pytest.raises(ValueError, match="reserved"):
+            validate_config(cfg)
+
+    def test_self_link_rejected(self):
+        # link.to == level name (self-reference) must raise ValueError
+        ds = _minimal_two_level_ds()
+        ds["levels"]["segments"]["link"]["to"] = "segments"
+        cfg = PipelineConfig(
+            data_source=ds,
+            aggregation={"variables": {"c": {"function": "len", "dtype": "int32"}}},
+            output={"grid": {"type": "healpix", "parent_order": 6, "child_order": 12}},
+        )
+        with pytest.raises(ValueError, match="cannot reference the level itself"):
+            validate_config(cfg)
+
+    def test_filter_level_not_in_levels_rejected(self):
+        # A filter whose level names a nonexistent key must fail at validate time.
+        ds = _minimal_two_level_ds()
+        ds["filters"] = [
+            {"level": "nonexistent", "dataset": "/{group}/flag", "op": "eq", "value": 0}
+        ]
+        cfg = PipelineConfig(
+            data_source=ds,
+            aggregation={"variables": {"c": {"function": "len", "dtype": "int32"}}},
+            output={"grid": {"type": "healpix", "parent_order": 6, "child_order": 12}},
+        )
+        with pytest.raises(ValueError, match="not a key in levels"):
+            validate_config(cfg)
+
+
+class TestSegmentLevelVariables:
+    """Issue #30: a non-base level may declare ``variables`` as a ``{name: path}``
+    mapping (a readable segment-level variable, e.g. ``dem_h``). It is validated
+    like ``data_source.variables`` (string names -> non-empty path templates) and
+    its names become valid column references for the aggregation."""
+
+    def _cfg(self, seg_variables, **agg_overrides):
+        ds = _minimal_two_level_ds()
+        ds["levels"]["segments"]["variables"] = seg_variables
+        agg = {"variables": {"c": {"function": "len", "dtype": "int32"}}}
+        agg.update(agg_overrides)
+        return PipelineConfig(
+            data_source=ds,
+            aggregation=agg,
+            output={"grid": {"type": "healpix", "parent_order": 6, "child_order": 12}},
+        )
+
+    def test_mapping_form_valid(self):
+        validate_config(self._cfg({"dem_h": "/{group}/geophys_corr/dem_h"}))
+
+    def test_list_form_still_valid(self):
+        # The documentation-only ``list[str]`` form is unchanged.
+        validate_config(self._cfg(["signal_conf_ph"]))
+
+    def test_segment_variable_usable_as_agg_source(self):
+        # dem_h becomes a per-photon column, so an agg field may source it.
+        validate_config(
+            self._cfg(
+                {"dem_h": "/{group}/geophys_corr/dem_h"},
+                variables={"dem_mean": {"function": "mean", "source": "dem_h", "dtype": "float32"}},
+            )
+        )
+
+    def test_segment_variable_usable_in_expression_filter(self):
+        # A broadcast segment variable is a valid name in an ``expression`` filter,
+        # consistent with agg/precompute expressions (issue #30).
+        ds = _minimal_two_level_ds()
+        ds["levels"]["segments"]["variables"] = {"dem_h": "/{group}/geophys_corr/dem_h"}
+        ds["filters"] = [{"expression": "dem_h > 100.0"}]
+        cfg = PipelineConfig(
+            data_source=ds,
+            aggregation={"variables": {"c": {"function": "len", "dtype": "int32"}}},
+            output={"grid": {"type": "healpix", "parent_order": 6, "child_order": 12}},
+        )
+        validate_config(cfg)
+
+    def test_unknown_name_in_expression_filter_rejected(self):
+        # A truly-undefined name in an expression filter is rejected at validate
+        # time, like agg/precompute expressions.
+        ds = _minimal_two_level_ds()
+        ds["filters"] = [{"expression": "nope_col > 0"}]
+        cfg = PipelineConfig(
+            data_source=ds,
+            aggregation={"variables": {"c": {"function": "len", "dtype": "int32"}}},
+            output={"grid": {"type": "healpix", "parent_order": 6, "child_order": 12}},
+        )
+        with pytest.raises(ValueError, match="nope_col"):
+            validate_config(cfg)
+
+    def test_segment_variable_usable_in_chunk_precompute(self):
+        ds = _minimal_two_level_ds()
+        ds["levels"]["segments"]["variables"] = {"dem_h": "/{group}/geophys_corr/dem_h"}
+        cfg = PipelineConfig(
+            data_source=ds,
+            aggregation={
+                "chunk_precompute": {
+                    "chunk_offset": {
+                        "expression": "np.float32(np.median(dem_h))",
+                        "source": "dem_h",
+                    }
+                },
+                "variables": {"c": {"function": "len", "dtype": "int32"}},
+            },
+            output={"grid": {"type": "healpix", "parent_order": 6, "child_order": 12}},
+        )
+        validate_config(cfg)
+
+    def test_empty_path_template_rejected(self):
+        with pytest.raises(ValueError, match="path template must be a"):
+            validate_config(self._cfg({"dem_h": ""}))
+
+    def test_mapping_on_base_level_rejected(self):
+        ds = _minimal_two_level_ds()
+        ds["levels"]["photons"]["variables"] = {"h_ph": "/{group}/heights/h_ph"}
+        cfg = PipelineConfig(
+            data_source=ds,
+            aggregation={"variables": {"c": {"function": "len", "dtype": "int32"}}},
+            output={"grid": {"type": "healpix", "parent_order": 6, "child_order": 12}},
+        )
+        with pytest.raises(ValueError, match="base level uses data_source.variables"):
+            validate_config(cfg)
+
+    def test_name_collision_with_base_variable_rejected(self):
+        # ``h`` is already a data_source.variables column.
+        with pytest.raises(ValueError, match="collides with a data_source.variables column"):
+            validate_config(self._cfg({"h": "/{group}/geophys_corr/dem_h"}))
+
+    def test_duplicate_segment_variable_across_levels_rejected(self):
+        # Two non-base levels declaring the same name would silently overwrite each
+        # other when broadcast into one per-photon column; reject the ambiguity.
+        ds = _minimal_two_level_ds()
+        ds["levels"]["segments"]["variables"] = {"dem_h": "/{group}/geophys_corr/dem_h"}
+        ds["levels"]["coarse"] = {
+            "path": "/{group}/other",
+            "coordinates": [],
+            "variables": {"dem_h": "/{group}/other/dem_h"},
+            "link": {
+                "to": "photons",
+                "index_beg": "/{group}/other/ph_index_beg",
+                "count": "/{group}/other/ph_cnt",
+            },
+        }
+        cfg = PipelineConfig(
+            data_source=ds,
+            aggregation={"variables": {"c": {"function": "len", "dtype": "int32"}}},
+            output={"grid": {"type": "healpix", "parent_order": 6, "child_order": 12}},
+        )
+        with pytest.raises(ValueError, match="already declared on another level"):
+            validate_config(cfg)
+
+    def test_worked_template_declares_dem_h_segment_variable(self):
+        cfg = load_config("src/zagg/configs/atl03_waveform_chunk.yaml")
+        validate_config(cfg)
+        seg = cfg.data_source["levels"]["segments"]["variables"]
+        assert isinstance(seg, dict)
+        assert seg["dem_h"] == "/{group}/geophys_corr/dem_h"
+        # chunk_offset is DEM-anchored.
+        offset = cfg.aggregation["chunk_precompute"]["chunk_offset"]
+        assert offset["source"] == "dem_h"
+        assert "dem_h" in offset["expression"]
+
+
+# ---------------------------------------------------------------------------
 # Helper accessors
 # ---------------------------------------------------------------------------
+
 
 class TestAccessors:
     def test_get_agg_fields(self, atl06_config):
@@ -254,6 +936,7 @@ class TestAccessors:
 # Equivalence with calculate_cell_statistics
 # ---------------------------------------------------------------------------
 
+
 def _dispatch_config_stat(name, meta, df):
     """Compute a single statistic using config metadata, mirroring calculate_cell_statistics."""
     if "function" in meta:
@@ -273,8 +956,12 @@ def _dispatch_config_stat(name, meta, df):
             if isinstance(v, str) and v in df.columns:
                 resolved[k] = df[v].values
             elif isinstance(v, str) and any(c in v for c in df.columns):
-                ns = {"__builtins__": {}, "np": np, "numpy": np,
-                      **{c: df[c].values for c in df.columns}}
+                ns = {
+                    "__builtins__": {},
+                    "np": np,
+                    "numpy": np,
+                    **{c: df[c].values for c in df.columns},
+                }
                 resolved[k] = eval(v, ns)  # noqa: S307
             else:
                 resolved[k] = v
@@ -319,6 +1006,7 @@ class TestEquivalence:
 # Roundtrip: YAML -> PipelineConfig -> dict -> PipelineConfig
 # ---------------------------------------------------------------------------
 
+
 class TestRoundtrip:
     def test_dict_roundtrip(self, atl06_config):
         d = asdict(atl06_config)
@@ -329,10 +1017,16 @@ class TestRoundtrip:
 
     def test_catalog_and_bounds_roundtrip(self):
         d = {
-            "data_source": {"variables": {"h_li": "/path"}, "reader": "h5coro",
-                            "groups": ["gt1l"], "coordinates": {"latitude": "/lat", "longitude": "/lon"}},
-            "aggregation": {"variables": {"count": {"function": "len", "source": "h_li", "dtype": "int32"}},
-                            "coordinates": {"cell_ids": {"dtype": "uint64"}}},
+            "data_source": {
+                "variables": {"h_li": "/path"},
+                "reader": "h5coro",
+                "groups": ["gt1l"],
+                "coordinates": {"latitude": "/lat", "longitude": "/lon"},
+            },
+            "aggregation": {
+                "variables": {"count": {"function": "len", "source": "h_li", "dtype": "int32"}},
+                "coordinates": {"cell_ids": {"dtype": "uint64"}},
+            },
             "output": {"grid": {"type": "healpix", "parent_order": 6, "child_order": 12}},
             "catalog": "my_catalog.json",
             "bounds": {"temporal": {"start_date": "2024-01-01", "end_date": "2024-06-01"}},
@@ -346,6 +1040,7 @@ class TestRoundtrip:
 # Output config helpers
 # ---------------------------------------------------------------------------
 
+
 class TestOutputHelpers:
     def test_get_child_order(self, atl06_config):
         assert get_child_order(atl06_config) == 12
@@ -356,14 +1051,24 @@ class TestOutputHelpers:
             get_child_order(cfg)
 
     def test_get_store_path(self):
-        cfg = PipelineConfig(output={"store": "./test.zarr", "grid": {"type": "healpix", "parent_order": 6, "child_order": 12}})
+        cfg = PipelineConfig(
+            output={
+                "store": "./test.zarr",
+                "grid": {"type": "healpix", "parent_order": 6, "child_order": 12},
+            }
+        )
         assert get_store_path(cfg) == "./test.zarr"
 
     def test_get_store_path_none(self, atl06_config):
         assert get_store_path(atl06_config) is None
 
     def test_get_store_path_s3(self):
-        cfg = PipelineConfig(output={"store": "s3://bucket/prefix.zarr", "grid": {"type": "healpix", "parent_order": 6, "child_order": 12}})
+        cfg = PipelineConfig(
+            output={
+                "store": "s3://bucket/prefix.zarr",
+                "grid": {"type": "healpix", "parent_order": 6, "child_order": 12},
+            }
+        )
         assert get_store_path(cfg) == "s3://bucket/prefix.zarr"
 
 
@@ -371,11 +1076,14 @@ class TestOutputHelpers:
 # Output grid validation
 # ---------------------------------------------------------------------------
 
+
 class TestOutputGridValidation:
     def test_grid_must_be_dict(self):
         cfg = PipelineConfig(
             data_source={"variables": {"h_li": "/path"}},
-            aggregation={"variables": {"c": {"function": "len", "source": "h_li", "dtype": "int32"}}},
+            aggregation={
+                "variables": {"c": {"function": "len", "source": "h_li", "dtype": "int32"}}
+            },
             output={"grid": "healpix"},
         )
         with pytest.raises(ValueError, match="output.grid must be a mapping"):
@@ -384,7 +1092,9 @@ class TestOutputGridValidation:
     def test_grid_missing_type(self):
         cfg = PipelineConfig(
             data_source={"variables": {"h_li": "/path"}},
-            aggregation={"variables": {"c": {"function": "len", "source": "h_li", "dtype": "int32"}}},
+            aggregation={
+                "variables": {"c": {"function": "len", "source": "h_li", "dtype": "int32"}}
+            },
             output={"grid": {"child_order": 12}},
         )
         with pytest.raises(ValueError, match="output.grid.type"):
@@ -393,7 +1103,9 @@ class TestOutputGridValidation:
     def test_healpix_missing_child_order(self):
         cfg = PipelineConfig(
             data_source={"variables": {"h_li": "/path"}},
-            aggregation={"variables": {"c": {"function": "len", "source": "h_li", "dtype": "int32"}}},
+            aggregation={
+                "variables": {"c": {"function": "len", "source": "h_li", "dtype": "int32"}}
+            },
             output={"grid": {"type": "healpix"}},
         )
         with pytest.raises(ValueError, match="child_order"):
@@ -402,7 +1114,9 @@ class TestOutputGridValidation:
     def test_healpix_missing_parent_order(self):
         cfg = PipelineConfig(
             data_source={"variables": {"h_li": "/path"}},
-            aggregation={"variables": {"c": {"function": "len", "source": "h_li", "dtype": "int32"}}},
+            aggregation={
+                "variables": {"c": {"function": "len", "source": "h_li", "dtype": "int32"}}
+            },
             output={"grid": {"type": "healpix", "child_order": 12}},
         )
         with pytest.raises(ValueError, match="parent_order"):
@@ -412,6 +1126,7 @@ class TestOutputGridValidation:
 # ---------------------------------------------------------------------------
 # Bounds validation
 # ---------------------------------------------------------------------------
+
 
 class TestBoundsValidation:
     def test_valid_bounds(self, atl06_config):
@@ -430,7 +1145,10 @@ class TestBoundsValidation:
         validate_config(atl06_config)
 
     def test_unknown_bounds_key(self, atl06_config):
-        atl06_config.bounds = {"temporal": {"start_date": "2024-01-01", "end_date": "2024-06-01"}, "foo": "bar"}
+        atl06_config.bounds = {
+            "temporal": {"start_date": "2024-01-01", "end_date": "2024-06-01"},
+            "foo": "bar",
+        }
         with pytest.raises(ValueError, match="Unknown bounds keys"):
             validate_config(atl06_config)
 
@@ -442,3 +1160,520 @@ class TestBoundsValidation:
     def test_none_bounds_ok(self, atl06_config):
         atl06_config.bounds = None
         validate_config(atl06_config)
+
+
+# ---------------------------------------------------------------------------
+# Non-scalar output kind declaration (issue #29, phase 1)
+# ---------------------------------------------------------------------------
+
+
+def _vector_config(var_meta: dict) -> PipelineConfig:
+    """Build a minimal config whose single agg variable carries ``var_meta``."""
+    cfg = PipelineConfig(
+        data_source={
+            "reader": "h5coro",
+            "groups": ["gt1l"],
+            "coordinates": {"latitude": "/lat", "longitude": "/lon"},
+            "variables": {"h_li": "/path"},
+        },
+        aggregation={"variables": {"hist": {"source": "h_li", **var_meta}}},
+        output={"grid": {"type": "healpix", "parent_order": 6, "child_order": 12}},
+    )
+    return cfg
+
+
+class TestOutputKind:
+    def test_scalar_default_backward_compatible(self, atl06_config):
+        """Existing scalar configs declare no kind and still validate."""
+        validate_config(atl06_config)
+        for meta in get_agg_fields(atl06_config).values():
+            assert "kind" not in meta
+
+    def test_vector_int_trailing_shape(self):
+        cfg = _vector_config({"function": "histogram", "kind": "vector", "trailing_shape": 64})
+        validate_config(cfg)
+
+    def test_vector_list_trailing_shape(self):
+        cfg = _vector_config({"function": "histogram", "kind": "vector", "trailing_shape": [16, 2]})
+        validate_config(cfg)
+
+    def test_unknown_kind_rejected(self):
+        cfg = _vector_config({"function": "min", "kind": "matrix"})
+        with pytest.raises(ValueError, match="output kind 'matrix' is not supported"):
+            validate_config(cfg)
+
+    def test_ragged_requires_inner_shape(self):
+        cfg = _vector_config({"function": "min", "kind": "ragged"})
+        with pytest.raises(ValueError, match="requires 'inner_shape'"):
+            validate_config(cfg)
+
+    def test_vector_requires_trailing_shape(self):
+        cfg = _vector_config({"function": "histogram", "kind": "vector"})
+        with pytest.raises(ValueError, match="requires 'trailing_shape'"):
+            validate_config(cfg)
+
+    def test_scalar_rejects_trailing_shape(self):
+        cfg = _vector_config({"function": "min", "trailing_shape": 8})
+        with pytest.raises(ValueError, match="only valid for kind 'vector'"):
+            validate_config(cfg)
+
+    def test_trailing_shape_must_be_positive(self):
+        cfg = _vector_config({"function": "histogram", "kind": "vector", "trailing_shape": 0})
+        with pytest.raises(ValueError, match="positive"):
+            validate_config(cfg)
+
+    def test_trailing_shape_rejects_bool(self):
+        cfg = _vector_config({"function": "histogram", "kind": "vector", "trailing_shape": True})
+        with pytest.raises(ValueError, match="positive"):
+            validate_config(cfg)
+
+    def test_trailing_shape_rejects_empty(self):
+        cfg = _vector_config({"function": "histogram", "kind": "vector", "trailing_shape": []})
+        with pytest.raises(ValueError, match="at least one dimension"):
+            validate_config(cfg)
+
+    def test_trailing_shape_bad_type(self):
+        cfg = _vector_config({"function": "histogram", "kind": "vector", "trailing_shape": "64"})
+        with pytest.raises(ValueError, match="int or a sequence of ints"):
+            validate_config(cfg)
+
+    def test_trailing_shape_list_bad_element_type(self):
+        cfg = _vector_config(
+            {"function": "histogram", "kind": "vector", "trailing_shape": [16, "x"]}
+        )
+        with pytest.raises(ValueError, match="positive"):
+            validate_config(cfg)
+
+    def test_trailing_shape_list_zero_element(self):
+        cfg = _vector_config({"function": "histogram", "kind": "vector", "trailing_shape": [16, 0]})
+        with pytest.raises(ValueError, match="positive"):
+            validate_config(cfg)
+
+    def test_trailing_shape_list_bool_element(self):
+        cfg = _vector_config(
+            {"function": "histogram", "kind": "vector", "trailing_shape": [16, True]}
+        )
+        with pytest.raises(ValueError, match="positive"):
+            validate_config(cfg)
+
+    def test_vector_expression_allowed(self):
+        """A vector field may be driven by an expression (issue #29)."""
+        cfg = _vector_config(
+            {
+                "expression": "np.array([np.min(h_li), np.max(h_li)])",
+                "kind": "vector",
+                "trailing_shape": 2,
+            }
+        )
+        validate_config(cfg)
+
+    def test_vector_len_rejected(self):
+        """``len`` short-circuits to a scalar count; kind 'vector' is nonsensical."""
+        cfg = _vector_config({"function": "len", "kind": "vector", "trailing_shape": 4})
+        with pytest.raises(ValueError, match="cannot be combined with kind 'vector'"):
+            validate_config(cfg)
+
+    def test_vector_count_rejected(self):
+        cfg = _vector_config({"function": "count", "kind": "vector", "trailing_shape": 4})
+        with pytest.raises(ValueError, match="cannot be combined with kind 'vector'"):
+            validate_config(cfg)
+
+    def test_invalid_dtype_rejected(self):
+        cfg = _vector_config({"function": "min", "dtype": "not_a_dtype"})
+        with pytest.raises(ValueError, match="not a valid"):
+            validate_config(cfg)
+
+    def test_valid_dtypes_accepted(self):
+        for dt in ("float32", "int32", "uint64", "float64"):
+            cfg = _vector_config({"function": "min", "dtype": dt})
+            validate_config(cfg)
+
+
+class TestGetOutputSignature:
+    def test_scalar_signature(self):
+        sig = get_output_signature({"function": "min", "dtype": "float32"})
+        assert sig == {
+            "kind": "scalar",
+            "trailing_shape": (),
+            "inner_shape": (),
+            "dtype": "float32",
+            "resolution": "cell",
+        }
+
+    def test_scalar_default_dtype_none(self):
+        sig = get_output_signature({"function": "min"})
+        assert sig == {
+            "kind": "scalar",
+            "trailing_shape": (),
+            "inner_shape": (),
+            "dtype": None,
+            "resolution": "cell",
+        }
+
+    def test_vector_int_signature(self):
+        sig = get_output_signature({"kind": "vector", "trailing_shape": 64, "dtype": "float32"})
+        assert sig == {
+            "kind": "vector",
+            "trailing_shape": (64,),
+            "inner_shape": (),
+            "dtype": "float32",
+            "resolution": "cell",
+        }
+
+    def test_vector_list_signature(self):
+        sig = get_output_signature({"kind": "vector", "trailing_shape": [16, 2]})
+        assert sig["kind"] == "vector"
+        assert sig["trailing_shape"] == (16, 2)
+        assert sig["inner_shape"] == ()
+
+
+# ---------------------------------------------------------------------------
+# resolution attribute (issue #30 item 2)
+# ---------------------------------------------------------------------------
+
+
+def _cfg_with_field(meta):
+    """Minimal valid config carrying a single agg field ``f`` with ``meta``."""
+    return PipelineConfig(
+        data_source={"variables": {"h_ph": "/{group}/h_ph"}},
+        aggregation={"variables": {"f": {"source": "h_ph", **meta}}},
+        output={"grid": {"type": "healpix", "parent_order": 6, "child_order": 12}},
+    )
+
+
+class TestResolutionAttribute:
+    def test_resolution_defaults_to_cell(self):
+        sig = get_output_signature({"function": "min"})
+        assert sig["resolution"] == "cell"
+
+    def test_resolution_cell_explicit_validates(self):
+        cfg = _cfg_with_field({"function": "min", "resolution": "cell"})
+        validate_config(cfg)  # should not raise
+        assert get_output_signature(get_agg_fields(cfg)["f"])["resolution"] == "cell"
+
+    def test_scalar_field_may_be_resolution_chunk(self):
+        cfg = _cfg_with_field({"expression": "chunk_anchor", "resolution": "chunk"})
+        # add the referenced chunk_precompute so the per-cell expression validates.
+        cfg.aggregation["chunk_precompute"] = {
+            "chunk_anchor": {"expression": "np.median(h_ph)", "source": "h_ph"}
+        }
+        validate_config(cfg)
+        assert get_output_signature(get_agg_fields(cfg)["f"])["resolution"] == "chunk"
+
+    def test_bad_resolution_rejected(self):
+        cfg = _cfg_with_field({"function": "min", "resolution": "block"})
+        with pytest.raises(ValueError, match="resolution 'block' is not supported"):
+            validate_config(cfg)
+
+    def test_vector_field_may_be_resolution_chunk(self):
+        # issue #82: a kind: vector resolution: chunk companion is now accepted;
+        # trailing_shape is validated exactly as for a cell-resolution vector.
+        cfg = _cfg_with_field(
+            {
+                "kind": "vector",
+                "trailing_shape": 4,
+                "expression": "chunk_profile",
+                "resolution": "chunk",
+            }
+        )
+        cfg.aggregation["chunk_precompute"] = {
+            "chunk_profile": {"expression": "np.zeros(4)", "source": "h_ph"}
+        }
+        validate_config(cfg)
+        sig = get_output_signature(get_agg_fields(cfg)["f"])
+        assert sig["resolution"] == "chunk"
+        assert sig["kind"] == "vector"
+        assert sig["trailing_shape"] == (4,)
+
+    def test_vector_chunk_still_requires_trailing_shape(self):
+        # The kind-specific validation still applies at chunk resolution.
+        cfg = _cfg_with_field(
+            {"kind": "vector", "expression": "np.zeros(4)", "resolution": "chunk"}
+        )
+        with pytest.raises(ValueError, match="kind 'vector' requires 'trailing_shape'"):
+            validate_config(cfg)
+
+    def test_ragged_chunk_companion_accepted(self):
+        # issue #82 phase 4c: ragged chunk companions (CSR at chunk resolution) are
+        # now wired — a chunk-resolution ragged field stores one payload per chunk
+        # via write_ragged_to_zarr. Validation accepts it like any other ragged
+        # field (inner_shape required; trailing_shape rejected).
+        cfg = _cfg_with_field(
+            {
+                "kind": "ragged",
+                "inner_shape": 2,
+                "expression": "chunk_pairs",
+                "resolution": "chunk",
+            }
+        )
+        cfg.aggregation["chunk_precompute"] = {
+            "chunk_pairs": {"expression": "np.zeros((3, 2))", "source": "h_ph"}
+        }
+        validate_config(cfg)  # no raise
+        assert get_output_signature(get_agg_fields(cfg)["f"])["resolution"] == "chunk"
+
+    def test_worked_template_offset_gain_are_chunk_resolution(self):
+        cfg = default_config("atl03_waveform_chunk")
+        fields = get_agg_fields(cfg)
+        assert get_output_signature(fields["offset_h"])["resolution"] == "chunk"
+        assert get_output_signature(fields["gain_h"])["resolution"] == "chunk"
+        # waveform_counts stays cell-resolution (per-cell vector).
+        assert get_output_signature(fields["waveform_counts"])["resolution"] == "cell"
+
+
+# ---------------------------------------------------------------------------
+# atl03_waveform_counts template (issue #30, phase 3)
+# ---------------------------------------------------------------------------
+
+
+class TestATL03WaveformCountsTemplate:
+    @pytest.fixture
+    def cfg(self):
+        return default_config("atl03_waveform_counts")
+
+    def test_loads_and_validates(self, cfg):
+        # default_config already calls validate_config; just confirm round-trip.
+        validate_config(cfg)
+        assert cfg.data_source["reader"] == "h5coro"
+        assert len(cfg.data_source["groups"]) == 6
+
+    def test_variables_include_h_ph_only(self, cfg):
+        # Option A: the histogram is centered on np.median(h_ph), so dem_h is
+        # not needed (and the segment-level ``geophys_corr/dem_h`` path was the
+        # wrong group anyway -- see #30 thread).
+        ds_vars = cfg.data_source["variables"]
+        assert "h_ph" in ds_vars
+        assert "dem_h" not in ds_vars
+        assert ds_vars["h_ph"].endswith("h_ph")
+
+    def test_waveform_counts_field_is_vector(self, cfg):
+        fields = get_agg_fields(cfg)
+        meta = fields["waveform_counts"]
+        sig = get_output_signature(meta)
+        assert sig["kind"] == "vector"
+        assert sig["trailing_shape"] == (128,)
+        assert sig["dtype"] == "uint32"
+
+    def test_bin_start_field_is_scalar(self, cfg):
+        fields = get_agg_fields(cfg)
+        meta = fields["bin_start"]
+        sig = get_output_signature(meta)
+        assert sig["kind"] == "scalar"
+        assert sig["trailing_shape"] == ()
+
+    def test_waveform_counts_expression_with_synthetic_data(self, cfg):
+        # Photons all within ±128 m of their own median; all should be counted.
+        from zagg.processing import calculate_cell_statistics
+
+        np.random.seed(0)
+        h_ph = np.random.uniform(-100.0, 100.0, 50).astype("float32")
+        result = calculate_cell_statistics({"h_ph": h_ph, "leaf_id": np.arange(50)}, config=cfg)
+        wc = result["waveform_counts"]
+        assert wc.shape == (128,)
+        assert wc.dtype == np.dtype("uint32")
+        assert int(wc.sum()) == 50, "all in-range photons must be counted"
+
+    def test_out_of_range_photons_dropped(self, cfg):
+        from zagg.processing import calculate_cell_statistics
+
+        # Two photons clustered near 0, one far outlier at 500 m. The cell median
+        # is ~5 m, so the outlier sits beyond ±128 m and falls outside the hist.
+        h_ph = np.array([0.0, 10.0, 500.0], dtype="float32")
+        result = calculate_cell_statistics({"h_ph": h_ph, "leaf_id": np.arange(3)}, config=cfg)
+        wc = result["waveform_counts"]
+        assert int(wc.sum()) == 2, "out-of-range photon must not appear in any bin"
+
+    def test_empty_cell_returns_zero_filled_vector(self, cfg):
+        from zagg.processing import calculate_cell_statistics
+
+        result = calculate_cell_statistics(
+            {"h_ph": np.array([]), "leaf_id": np.array([])}, config=cfg
+        )
+        wc = result["waveform_counts"]
+        assert wc.shape == (128,)
+        assert np.all(wc == 0), "empty cell sentinel must be all-zero for uint32/fill_value:0"
+
+    def test_confidence_filter_same_as_atl03(self, cfg):
+        # Both templates carry the same TEP filter expressed in the structured
+        # ``filters:`` list form (op: ne, value: -2, column: 0 -- land surface
+        # type; TEP is uniform across columns per the v3 data dictionary).
+        filters = cfg.data_source["filters"]
+        assert len(filters) == 1
+        f = filters[0]
+        assert f["op"] == "ne"
+        assert f["value"] == -2
+        assert f["column"] == 0
+        assert f["dataset"].endswith("signal_conf_ph")
+
+    def test_rectilinear_grid(self, cfg):
+        grid = cfg.output["grid"]
+        assert grid["type"] == "rectilinear"
+        assert len(grid["bounds"]) == 4
+
+    def test_multi_level_form_matches_atl03(self, cfg):
+        # Phase 6: waveform template carries the same multi-level form +
+        # read_plan as atl03.yaml so the planned-IO benefits apply equally.
+        ds = cfg.data_source
+        assert ds["base_level"] == "photons"
+        assert set(ds["levels"]) == {"photons", "segments"}
+        rp = ds["read_plan"]
+        assert rp["spatial_index"] == "segments"
+        assert rp["pad"] == 1
+        # Cross-check only the fields that drive ``plan_read`` parity: the
+        # link's source/target arrays + index_base. Other level fields
+        # (documentation-only ``variables``, coord names, formatting) can
+        # legitimately diverge across templates without affecting the plan.
+        atl03_link = default_config("atl03").data_source["levels"]["segments"]["link"]
+        wf_link = ds["levels"]["segments"]["link"]
+        for key in ("to", "index_beg", "count", "index_base"):
+            assert wf_link[key] == atl03_link[key], f"link.{key} diverges from atl03.yaml"
+
+
+# ---------------------------------------------------------------------------
+# Ragged output kind (issue #48, phase 1)
+# ---------------------------------------------------------------------------
+
+
+def _ragged_cfg(inner_shape=None, **overrides):
+    """Build a minimal config with a single ragged agg variable."""
+    meta = {
+        "function": "mean",
+        "source": "h_ph",
+        "kind": "ragged",
+        **({"inner_shape": inner_shape} if inner_shape is not None else {}),
+        **overrides,
+    }
+    return PipelineConfig(
+        data_source={
+            "reader": "h5coro",
+            "groups": ["gt1l/heights"],
+            "coordinates": {
+                "latitude": "{group}/lat_ph",
+                "longitude": "{group}/lon_ph",
+            },
+            "variables": {"h_ph": "{group}/h_ph"},
+        },
+        aggregation={"coordinates": {}, "variables": {"h_ph_tdigest": meta}},
+        output={
+            "grid": {
+                "type": "healpix",
+                "child_order": 12,
+                "parent_order": 6,
+            }
+        },
+    )
+
+
+class TestRaggedKind:
+    def test_valid_ragged_validates(self):
+        """A ragged field with inner_shape declared validates without error."""
+        cfg = _ragged_cfg(inner_shape=[2])
+        validate_config(cfg)
+
+    def test_get_output_signature_ragged(self):
+        sig = get_output_signature({"kind": "ragged", "inner_shape": [2], "dtype": "float32"})
+        assert sig == {
+            "kind": "ragged",
+            "trailing_shape": (),
+            "inner_shape": (2,),
+            "dtype": "float32",
+            "resolution": "cell",
+        }
+
+    def test_ragged_inner_shape_int_normalized(self):
+        sig = get_output_signature({"kind": "ragged", "inner_shape": 3})
+        assert sig["inner_shape"] == (3,)
+
+    def test_inner_shape_required(self):
+        cfg = _ragged_cfg()  # no inner_shape
+        with pytest.raises(ValueError, match="requires 'inner_shape'"):
+            validate_config(cfg)
+
+    def test_inner_shape_must_be_positive(self):
+        cfg = _ragged_cfg(inner_shape=0)
+        with pytest.raises(ValueError, match="'inner_shape' entries must be positive"):
+            validate_config(cfg)
+
+    def test_inner_shape_rejects_empty(self):
+        cfg = _ragged_cfg(inner_shape=[])
+        with pytest.raises(ValueError, match="'inner_shape' must have at least one dimension"):
+            validate_config(cfg)
+
+    def test_inner_shape_rejects_non_int(self):
+        cfg = _ragged_cfg(inner_shape="2")
+        with pytest.raises(ValueError, match="'inner_shape' must be an int or a sequence of ints"):
+            validate_config(cfg)
+
+    def test_inner_shape_list_rejects_non_int_element(self):
+        cfg = _ragged_cfg(inner_shape=[2, "x"])
+        with pytest.raises(ValueError, match="'inner_shape' entries must be positive"):
+            validate_config(cfg)
+
+    def test_ragged_with_expression_validates(self):
+        """A ragged field driven by an expression (not function) validates."""
+        cfg = PipelineConfig(
+            data_source={
+                "reader": "h5coro",
+                "groups": ["gt1l/heights"],
+                "coordinates": {
+                    "latitude": "{group}/lat_ph",
+                    "longitude": "{group}/lon_ph",
+                },
+                "variables": {"h_ph": "{group}/h_ph"},
+            },
+            aggregation={
+                "coordinates": {},
+                "variables": {
+                    "h_ph_tdigest": {
+                        "expression": "np.array([np.mean(h_ph), np.var(h_ph)])",
+                        "kind": "ragged",
+                        "inner_shape": [2],
+                    }
+                },
+            },
+            output={"grid": {"type": "healpix", "child_order": 12, "parent_order": 6}},
+        )
+        validate_config(cfg)
+
+    def test_trailing_shape_rejected_for_ragged(self):
+        cfg = _ragged_cfg(inner_shape=[2], trailing_shape=4)
+        with pytest.raises(
+            ValueError, match="'trailing_shape' is only valid for 'vector', not 'ragged'"
+        ):
+            validate_config(cfg)
+
+    def test_len_rejected_for_ragged(self):
+        cfg = _ragged_cfg(inner_shape=[2], function="len")
+        with pytest.raises(ValueError, match="cannot be combined with kind 'ragged'"):
+            validate_config(cfg)
+
+    def test_count_rejected_for_ragged(self):
+        cfg = _ragged_cfg(inner_shape=[2], function="count")
+        with pytest.raises(ValueError, match="cannot be combined with kind 'ragged'"):
+            validate_config(cfg)
+
+    def test_scalar_inner_shape_empty(self):
+        """Scalar fields still return inner_shape=() from get_output_signature."""
+        sig = get_output_signature({"function": "min", "dtype": "float32"})
+        assert sig["inner_shape"] == ()
+
+    def test_vector_inner_shape_empty(self):
+        """Vector fields still return inner_shape=() from get_output_signature."""
+        sig = get_output_signature({"kind": "vector", "trailing_shape": 4, "dtype": "float32"})
+        assert sig["inner_shape"] == ()
+
+    def test_output_field_signature_ragged_includes_inner_shape(self):
+        cfg = _ragged_cfg(inner_shape=[2], function="mean")
+        entries = output_field_signature(cfg)
+        assert len(entries) == 1
+        entry = entries[0]
+        assert entry["name"] == "h_ph_tdigest"
+        assert entry["kind"] == "ragged"
+        assert entry["inner_shape"] == [2]
+        assert entry["trailing_shape"] == []
+
+    def test_output_field_signature_scalar_inner_shape_empty(self, atl06_config):
+        """Scalar fields get inner_shape: [] in output_field_signature (backward compat)."""
+        entries = output_field_signature(atl06_config)
+        for e in entries:
+            assert e["inner_shape"] == [], f"{e['name']!r} has non-empty inner_shape"

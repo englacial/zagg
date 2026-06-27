@@ -1,4 +1,5 @@
 """HEALPix DGGS output grid via mortie."""
+
 from __future__ import annotations
 
 from typing import Literal
@@ -8,11 +9,25 @@ from pydantic_zarr.experimental.v3 import ArraySpec, GroupSpec, NamedConfig
 from zarr import config as zarr_config
 from zarr.abc.store import Store
 
-from zagg.config import PipelineConfig, default_config, get_agg_fields
-from zagg.grids.base import InconsistentShardError
+from zagg.config import (
+    PipelineConfig,
+    default_config,
+    get_agg_fields,
+    get_output_signature,
+    output_field_signature,
+)
+from zagg.grids.base import InconsistentShardError, chunk_array_spec, vector_array_spec
+from zagg.grids.morton import to_morton_array
 
 HEALPIX_BASE_CELLS: int = 12
-HEALPIX_REF_ORDER: int = 18  # mortie's clip2order reference order; do not change
+# Reference order at which ``assign`` resolves points before ``cells_of`` /
+# ``shards_of`` coarsen down to ``child_order`` / ``parent_order``. It must be
+# >= the finest ``child_order`` any grid uses, or that resolution is silently
+# lost (``clip2order`` cannot refine past its input order). mortie 0.8.1 supports
+# orders up to 29, so this is the cap. Coarsening from a deeper reference is
+# byte-identical for any order <= the old value, so raising it leaves existing
+# grids' cell/shard assignments unchanged (verified for the shipped configs).
+HEALPIX_REF_ORDER: int = 29
 
 
 class HealpixGrid:
@@ -48,6 +63,7 @@ class HealpixGrid:
         layout: Literal["dense", "fullsphere"] = "dense",
         config: PipelineConfig | None = None,
         populated_shards: list[int] | None = None,
+        chunk_inner: int | None = None,
     ):
         if child_order < parent_order:
             raise ValueError(
@@ -55,10 +71,37 @@ class HealpixGrid:
             )
         if layout not in ("dense", "fullsphere"):
             raise ValueError(f"Unknown layout: {layout!r} (expected 'dense' or 'fullsphere')")
+        # chunk_inner (issue #30 item 3): an optional finer ZARR-chunk order between
+        # the shard order (parent_order) and the cell order (child_order). One shard
+        # (the dispatch unit) then owns K = 4^(chunk_order - parent_order) chunks.
+        # HEALPix specs this in its native unit — an order — so orders nest
+        # automatically (no extra check beyond the bounds below). Default
+        # ``chunk_inner is None`` means chunk_order == parent_order (K == 1), i.e.
+        # shard == chunk, byte-identical to the pre-item-3 grid.
+        chunk_order = parent_order if chunk_inner is None else int(chunk_inner)
+        if not (parent_order <= chunk_order <= child_order):
+            raise ValueError(
+                f"chunk_inner order ({chunk_order}) must satisfy parent_order "
+                f"({parent_order}) <= chunk_inner <= child_order ({child_order})"
+            )
+        if chunk_inner is not None and chunk_order != parent_order and layout != "fullsphere":
+            # Dense layout keys companion/main blocks by populated-shard POSITION;
+            # resolving K finer chunk positions per shard there is a separate concern
+            # (issue #30 item 3 lands fullsphere first). Reject rather than mis-index.
+            raise ValueError(
+                "chunk_inner finer than parent_order requires layout='fullsphere' "
+                "(dense multi-chunk-per-shard block indexing is not yet supported)"
+            )
         self.parent_order = parent_order
         self.child_order = child_order
+        self.chunk_order = chunk_order
+        self.chunk_inner = chunk_inner
         self.level_diff = child_order - parent_order
         self.n_children = 4**self.level_diff
+        # Cells per ZARR chunk (== n_children when chunk_inner is unset) and the
+        # number of chunks one shard owns (K, == 1 when unset).
+        self.cells_per_chunk = 4 ** (child_order - chunk_order)
+        self.chunks_per_shard = 4 ** (chunk_order - parent_order)
         self.layout = layout
         self.config = config or default_config("atl06")
         self._position_map: dict[int, int] | None = None
@@ -94,7 +137,64 @@ class HealpixGrid:
 
     @property
     def chunk_shape(self) -> tuple[int, ...]:
-        return (self.n_children,)
+        """ZARR chunk shape — cells per chunk.
+
+        Equals ``n_children`` (one chunk == one shard) unless ``chunk_inner`` set a
+        finer chunk order (issue #30 item 3), in which case it is the smaller
+        ``cells_per_chunk = 4^(child_order - chunk_order)``.
+        """
+        return (self.cells_per_chunk,)
+
+    @property
+    def chunk_grid_shape(self) -> tuple[int, ...]:
+        """Number of chunks (``array_shape // chunk_shape``) for companion arrays.
+
+        A ``resolution: chunk`` field (issue #30 item 2) stores one value per
+        chunk here. Equals ``12·4^chunk_order`` for fullsphere (``== 12·4^parent_order``
+        when ``chunk_inner`` is unset) and ``n_shards`` for dense.
+
+        Indexing: at K==1 (``chunk_inner`` unset) the per-chunk index IS
+        :meth:`block_index` (one chunk per shard). At K>1 (issue #30 item 3) the
+        companion is sized at the finer ``chunk_order`` grid, so the correct
+        per-chunk index is the block yielded by :meth:`iter_chunks` — NOT
+        ``block_index(shard_key)``, which is the coarser parent-order index of the
+        whole shard. The K>1 writer must index by ``iter_chunks``.
+        """
+        return (self.array_shape[0] // self.cells_per_chunk,)
+
+    def iter_chunks(self, shard_key):
+        """Yield ``(chunk_block_index, chunk_children)`` for each chunk in a shard.
+
+        Item 3 (issue #30): one shard (the dispatch unit) owns
+        ``K = chunks_per_shard`` finer ZARR chunks. The worker reads the shard's
+        granules once, then emits one chunk region + one companion slice per chunk.
+        Each yielded ``chunk_block_index`` is the storage block tuple for that chunk
+        (as :meth:`block_index` returns for a shard when ``K == 1``) and
+        ``chunk_children`` are its cell ids in canonical order.
+
+        When ``chunk_inner`` is unset (``K == 1``) this yields exactly one entry —
+        ``(block_index(shard_key), children(shard_key))`` — so the single-chunk
+        worker path is byte-identical.
+
+        Order note: at K>1 the union of the per-chunk ``chunk_children`` equals the
+        shard's :meth:`children` as a SET, but the concatenation order does NOT match
+        ``children(shard_key)`` (each chunk is enumerated in its own canonical order).
+        The writer must place each chunk's cells against its own ``block`` region, not
+        assume a shard-wide ordering.
+        """
+        if self.chunks_per_shard == 1:
+            yield (self.block_index(shard_key), self.children(shard_key))
+            return
+        from mortie import generate_morton_children, mort2healpix
+
+        # The shard's K sub-chunks are its morton children at chunk_order; each
+        # sub-chunk's block index is its own nested-cell id (fullsphere only).
+        sub_chunks = generate_morton_children(int(shard_key), self.chunk_order)
+        for sub in np.asarray(sub_chunks):
+            healpix, _ = mort2healpix(np.asarray([int(sub)]))
+            block = (int(healpix[0]),)
+            children = generate_morton_children(int(sub), self.child_order)
+            yield (block, children)
 
     @property
     def group_path(self) -> str:
@@ -114,21 +214,23 @@ class HealpixGrid:
     def assign(self, lats, lons) -> np.ndarray:
         """Map (lat, lon) points to morton IDs at the HEALPix reference order.
 
-        Returns morton at order 18 — mortie's ``clip2order`` requires its
-        input at that fixed reference order to clip correctly.
+        Returns morton at :data:`HEALPIX_REF_ORDER` — the finest order zagg
+        resolves to. ``cells_of`` / ``shards_of`` then coarsen this down to
+        ``child_order`` / ``parent_order`` via ``clip2order``, so the reference
+        must be at least as fine as the grid's ``child_order``.
         """
         from mortie import geo2mort
 
         return geo2mort(lats, lons, order=HEALPIX_REF_ORDER)
 
     def shards_of(self, leaf_ids) -> np.ndarray:
-        """Vectorized parent-morton lookup. ``leaf_ids`` must be at order 18."""
+        """Vectorized parent-morton lookup. ``leaf_ids`` at :data:`HEALPIX_REF_ORDER`."""
         from mortie import clip2order
 
         return clip2order(self.parent_order, np.asarray(leaf_ids))
 
     def cells_of(self, leaf_ids) -> np.ndarray:
-        """Coarsen order-18 leaf morton IDs to ``child_order`` cell IDs."""
+        """Coarsen reference-order leaf morton IDs to ``child_order`` cell IDs."""
         from mortie import clip2order
 
         return clip2order(self.child_order, np.asarray(leaf_ids))
@@ -157,9 +259,7 @@ class HealpixGrid:
             healpix, _ = mort2healpix(np.asarray([int(shard_key)]))
             return (int(healpix[0]),)
         if self._position_map is None:
-            raise RuntimeError(
-                "block_index requires set_populated_shards() for dense layout"
-            )
+            raise RuntimeError("block_index requires set_populated_shards() for dense layout")
         return (self._position_map[int(shard_key)],)
 
     def shard_footprint(self, shard_key):
@@ -186,17 +286,37 @@ class HealpixGrid:
         return cell_ids
 
     def chunk_coords(self, shard_key) -> dict:
-        """Per-cell coord columns for HEALPix: ``morton`` and ``cell_ids``."""
-        children = self.children(shard_key)
-        return {"morton": children, "cell_ids": self.encode_cell_ids(children)}
+        """Per-cell coord columns for HEALPix: ``morton`` and ``cell_ids``.
+
+        ``morton`` is a mortie ``MortonIndexArray`` (the typed coordinate; #71);
+        it is stored as ``uint64`` on disk via :mod:`zagg.grids.morton`. ``cell_ids``
+        stays NESTED ``uint64`` (the DGGS coordinate, unchanged).
+        """
+        return self.coords_of(self.children(shard_key))
+
+    def coords_of(self, children) -> dict:
+        """Per-cell coord columns for an explicit ``children`` array.
+
+        The chunk-resolution variant of :meth:`chunk_coords`: at K>1 (issue #30
+        item 3) a worker writes one carrier per finer chunk, whose cells are the
+        chunk's own ``children`` (from :meth:`iter_chunks`), not the whole shard's.
+        ``chunk_coords`` is just ``coords_of(children(shard_key))``.
+        """
+        children = np.asarray(children)
+        return {
+            "morton": to_morton_array(children),
+            "cell_ids": self.encode_cell_ids(children),
+        }
 
     # ── identity / nesting ───────────────────────────────────────────────
 
-    def signature(self) -> dict:
-        """Canonical fingerprint of the grid's defining parameters.
+    def spatial_signature(self) -> dict:
+        """Structural (spatial-only) fingerprint of the grid.
 
-        Recorded in a ShardMap at build time and re-checked at run time so a
-        shard map can never be silently paired with a different grid.
+        The shard-map reuse guard (``runner._check_signature``, #89) compares
+        this — it is purely the spatial layout (no ``output_fields``), so one
+        ShardMap is reusable across configs that share the spatial grid but
+        declare different aggregation fields.
         """
         return {
             "type": "healpix",
@@ -206,13 +326,29 @@ class HealpixGrid:
             "layout": self.layout,
         }
 
+    def signature(self) -> dict:
+        """Canonical fingerprint of the grid's defining parameters.
+
+        The full fingerprint: the spatial layout (:meth:`spatial_signature`)
+        plus the Option-B output-field set. ``nests_with`` (#29) keys on the
+        latter; the shard-map reuse guard keys on the former (#89).
+        """
+        return {
+            **self.spatial_signature(),
+            "output_fields": output_field_signature(self.config),
+        }
+
     def nests_with(self, other) -> bool:
         """Whether ``self`` and ``other`` tile compatibly.
 
         Any two HEALPix grids nest (the nested hierarchy subdivides 4-for-1 at
-        every order). Cross-family (e.g. rectilinear) never nests.
+        every order), provided they declare the same Option-B output-field set
+        (issue #29) — co-aggregated grids must produce the same scalar/vector
+        schema. Cross-family (e.g. rectilinear) never nests.
         """
-        return isinstance(other, HealpixGrid)
+        if not isinstance(other, HealpixGrid):
+            return False
+        return output_field_signature(self.config) == output_field_signature(other.config)
 
     def emit_template(self, store: Store, *, overwrite: bool = False) -> Store:
         """Write the Zarr template (group + arrays) to ``store``."""
@@ -239,11 +375,9 @@ class HealpixGrid:
             dimension_names=("cells",),
             data_type="float32",
             chunk_grid=NamedConfig(
-                name="regular", configuration={"chunk_shape": (self.n_children,)}
+                name="regular", configuration={"chunk_shape": (self.cells_per_chunk,)}
             ),
-            chunk_key_encoding=NamedConfig(
-                name="default", configuration={"separator": "/"}
-            ),
+            chunk_key_encoding=NamedConfig(name="default", configuration={"separator": "/"}),
             codecs=(NamedConfig(name="bytes", configuration={"endian": "little"}),),
             storage_transformers=(),
             fill_value="NaN",
@@ -255,9 +389,45 @@ class HealpixGrid:
             fill = meta.get("fill_value", "NaN")
             members[name] = base.with_data_type(dtype).with_fill_value(fill)
         for name, meta in get_agg_fields(self.config).items():
+            sig = get_output_signature(meta)
+            # Ragged fields (issue #48) are stored as CSR subgroups
+            # (``{name}/{shard_key}/values|offsets|cell_ids``) written fresh by
+            # ``write_ragged_to_zarr`` — NOT a dense array. Emitting a dense
+            # ``{name}`` array here would make ``{name}`` an array, and CSR's
+            # per-shard child groups under it would then collide ("only groups may
+            # have child nodes"). Skip them so ``{name}`` stays a group prefix.
+            if sig["kind"] == "ragged":
+                continue
             dtype = meta.get("dtype", "float32")
             fill = meta.get("fill_value", "NaN")
-            members[name] = base.with_data_type(dtype).with_fill_value(fill)
+            spec = base.with_data_type(dtype).with_fill_value(fill)
+            if sig["resolution"] == "chunk":
+                # A resolution: chunk field (issues #30 item 2, #82) is stored once
+                # per chunk in a companion array shaped at the chunk grid, indexed by
+                # block_index (the parent nested cell id). Compose the two helpers:
+                # chunk_array_spec sets the chunk-grid base, then vector_array_spec
+                # appends the field's trailing_shape (chunked whole) for a vector
+                # companion. A scalar/ragged field has an empty trailing_shape, so
+                # vector_array_spec returns the chunk base unchanged.
+                members[name] = vector_array_spec(
+                    chunk_array_spec(
+                        spec,
+                        chunk_grid_shape=self.chunk_grid_shape,
+                        chunk_dims=("chunks",),
+                    ),
+                    sig,
+                    base_dims=("chunks",),
+                    base_chunk_shape=(1,),
+                )
+                continue
+            # A vector field (issue #29) gets a trailing payload dim chunked
+            # whole; scalars are returned unchanged.
+            members[name] = vector_array_spec(
+                spec,
+                sig,
+                base_dims=("cells",),
+                base_chunk_shape=(self.cells_per_chunk,),
+            )
 
         return GroupSpec(members=members, attributes=self._dggs_attrs())
 

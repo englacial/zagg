@@ -1,0 +1,95 @@
+# ATL03 photon-height aggregation template.
+#
+# Scalar-only stats (non-scalar outputs are deferred to #29): per-cell density
+# (photon count), min/max elevation, mean and median height, and variance.
+#
+# Confidence filter drops only TEP (transmit-echo path) photons and keeps
+# everything else: signal_conf_ph != -2 (column 0, the land surface type), per
+# the ATL03 v3 data dictionary
+# (https://nsidc.org/sites/default/files/icesat2_atl03_data_dict_v003_0.pdf).
+#
+# signal_conf_ph is 2-D (n_photons x 5 surface types) and TEP is flagged -2
+# uniformly across every surface type, so the land column (0) is operationally
+# equivalent to any other column for the TEP drop. The structured filter list
+# replaces the older flat ``quality_filter`` form to access the ``column`` and
+# ``op: ne`` knobs (issue #43, Phase A). Grid is rectilinear (HEALPix order-19,
+# the ~10 m match, waits on mortie #35).
+#
+# Multi-level form (issue #43 Phase B + C) is declared so the read path can
+# bound base-rate IO via the coarse ``segments`` rep-point coords + the
+# ``ph_index_beg``/``segment_ph_cnt`` link. Without this, ``lat_ph``/``lon_ph``
+# would be full-read (~245 MB per beam) before any spatial filter, which is the
+# dominant driver of the Lambda OOMs on ATL03 region runs (#43 motivation).
+data_source:
+  reader: h5coro
+  driver: s3
+  groups: [gt1l, gt1r, gt2l, gt2r, gt3l, gt3r]
+  coordinates:
+    latitude: "/{group}/heights/lat_ph"
+    longitude: "/{group}/heights/lon_ph"
+  variables:
+    h_ph: "/{group}/heights/h_ph"
+  filters:
+    - dataset: "/{group}/heights/signal_conf_ph"
+      column: 0                  # land surface type; TEP is uniform across columns
+      op: ne
+      value: -2
+  base_level: photons
+  # ``coordinates`` uses bare names joined to the level's ``path``; link
+  # ``index_beg`` / ``count`` use absolute path templates so they remain
+  # readable when the link arrays live outside the level's path (the read
+  # path resolves both forms -- see ``_level_coord_paths`` in processing.py).
+  # ``variables`` at the level scope is documentation only; the read path
+  # consults the top-level ``data_source.variables`` + filter datasets.
+  levels:
+    photons:
+      path: "/{group}/heights"
+      coordinates: {latitude: lat_ph, longitude: lon_ph}
+      link: null
+    segments:
+      path: "/{group}/geolocation"
+      coordinates: {latitude: reference_photon_lat, longitude: reference_photon_lon}
+      link:
+        to: photons
+        index_beg: "/{group}/geolocation/ph_index_beg"
+        count: "/{group}/geolocation/segment_ph_cnt"
+        index_base: 1            # ATL03 ph_index_beg is 1-based per the v3 dict
+  read_plan:
+    spatial_index: segments
+    pad: 1                       # one segment of padding on each side per #43
+
+aggregation:
+  variables:
+    count:
+      function: len
+      source: h_ph
+      dtype: int32
+      fill_value: 0
+    h_min:
+      function: min
+      source: h_ph
+      dtype: float32
+    h_max:
+      function: max
+      source: h_ph
+      dtype: float32
+    h_mean:
+      function: mean
+      source: h_ph
+      dtype: float32
+    h_median:
+      function: median
+      source: h_ph
+      dtype: float32
+    h_variance:
+      function: var
+      source: h_ph
+      dtype: float32
+
+output:
+  grid:
+    type: rectilinear
+    crs: EPSG:4326
+    resolution: 0.0001            # degrees (~10 m at the equator)
+    bounds: [-180, -90, 180, 90]
+    chunk_shape: [256, 256]

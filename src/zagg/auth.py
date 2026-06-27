@@ -56,7 +56,7 @@ def get_nsidc_s3_credentials() -> dict:
 
     # Pass to Lambda invocation
     event = {
-        "parent_morton": -6134114,
+        "shard_key": -6134114,
         "s3_credentials": creds,
         # ... other params
     }

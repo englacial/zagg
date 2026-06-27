@@ -13,7 +13,7 @@ import logging
 import os
 
 from zagg.config import load_config
-from zagg.runner import agg
+from zagg.runner import agg, normalize_output_credentials
 
 
 def main():
@@ -40,12 +40,18 @@ examples:
     parser.add_argument("--max-workers", type=int, default=None, help="Max concurrent workers")
     parser.add_argument("--overwrite", action="store_true", help="Overwrite existing Zarr template")
     parser.add_argument("--dry-run", action="store_true", help="Show what would be processed")
+    parser.add_argument(
+        "--profile", action="store_true",
+        help="Emit per-phase worker timings (read/index/aggregate) on the lambda "
+             "backend. Off by default to avoid the per-worker probe tax (issue #100).",
+    )
     parser.add_argument("--region", default="us-west-2", help="AWS region (default: us-west-2)")
     parser.add_argument(
         "--output-creds", default=None, metavar="PATH",
         help="Path to a JSON file with credentials for writing the output store "
              "(keys: accessKeyId, secretAccessKey, optional sessionToken/"
-             "endpointUrl/region). Omit to use the ambient/execution-role creds.",
+             "endpointUrl/region; camelCase, snake_case, or STS PascalCase "
+             "spellings accepted). Omit to use the ambient/execution-role creds.",
     )
     parser.add_argument(
         "--function-name",
@@ -64,6 +70,8 @@ examples:
     if args.output_creds:
         with open(args.output_creds) as f:
             output_credentials = json.load(f)
+        # Accept camelCase, snake_case, or STS PascalCase key spellings.
+        output_credentials = normalize_output_credentials(output_credentials)
         output_endpoint_url = output_credentials.get("endpointUrl")
 
     results = agg(
@@ -81,6 +89,7 @@ examples:
         region=args.region,
         output_credentials=output_credentials,
         output_endpoint_url=output_endpoint_url,
+        profile=args.profile,
     )
 
     if args.dry_run:
@@ -96,6 +105,11 @@ examples:
         if "estimated_cost_usd" in results:
             print(f"Lambda compute: {results['lambda_time_s']:.0f}s total, "
                   f"{results['gb_seconds']:.0f} GB-s, ~${results['estimated_cost_usd']:.2f}")
+        if results.get("worker_phase_max"):
+            breakdown = ", ".join(
+                f"{phase} {secs:.0f}s" for phase, secs in results["worker_phase_max"].items()
+            )
+            print(f"Worker phases (max across cells): {breakdown}")
         print(f"Output: {results['store_path']}")
 
 

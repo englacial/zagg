@@ -30,6 +30,7 @@ def lambda_env(monkeypatch):
     # Stub grid construction (signature must match the catalog).
     grid = MagicMock()
     grid.signature.return_value = {}
+    grid.spatial_signature.return_value = {}
     grid.block_index.side_effect = lambda k: (k,)
     import zagg.grids as grids_mod
 
@@ -92,7 +93,7 @@ class TestProbeClampsWorkers:
                 "body": {"total_obs": 5},
                 "error": None,
                 "lambda_duration": 1.0,
-                "morton": 0,
+                "shard_key": 0,
             },
         )
         summary = runner._run_lambda(

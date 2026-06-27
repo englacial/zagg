@@ -7,6 +7,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+- rename parent_morton event field to shard_key (#24) ([#42](https://github.com/englacial/zagg/pull/42)) by @espg
+- Concurrency-aware Lambda orchestrator: pre-flight probe + FD-exhaustion guard ([#41](https://github.com/englacial/zagg/pull/41)) by @espg
+- drop shapely as an intersection backend (#36) ([#39](https://github.com/englacial/zagg/pull/39)) by @espg
+- CLAUDE.md: per-issue claude/ branches, multi-PR, and PR label states ([#37](https://github.com/englacial/zagg/pull/37)) by @espg
+- docs: mark SSO execution-role path out of date ([#35](https://github.com/englacial/zagg/pull/35)) by @espg
+- sort/hash grouping refactor (#30) ([#33](https://github.com/englacial/zagg/pull/33)) by @espg
+- Rectilinear grid: chunk-driven auto-padding + run enablement ([#32](https://github.com/englacial/zagg/pull/32)) by @espg
+
+## [0.3.0] - 2026-06-11
+
+- Add bring-your-own-role path for IAM-constrained deploys; creds handling for external s3 bucket writes ([#27](https://github.com/englacial/zagg/pull/27)) by @espg
+
+## [0.2.2] - 2026-06-10
+
+- spherely install / distribution packaging fixes
+
+## [0.2.1] - 2026-06-10
+
 ### Catalog API reconcile ([#24](https://github.com/englacial/zagg/issues/24))
 
 - Split catalog construction into **fetch** (`zagg.catalog.sources`: `Query`,

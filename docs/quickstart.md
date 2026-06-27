@@ -155,3 +155,12 @@ store: ./output.zarr
 See `src/zagg/configs/atl06.yaml` for a complete example and the
 [custom aggregations notebook](https://github.com/englacial/zagg/blob/main/notebooks/custom_aggregations.ipynb)
 for customization examples.
+
+## Reading the output
+
+For products with per-cell t-digest fields, the `zagg.readers` package
+reconstructs dense `(64, 64, n_bins)` tensors (or lossless raw value vectors)
+from the stored digests. The
+[t-digest reader notebook](https://github.com/englacial/zagg/blob/main/notebooks/tdigest_reader_example.ipynb)
+walks through `read_tensors` and `read_raw_values` end to end on a self-contained
+synthetic store.
