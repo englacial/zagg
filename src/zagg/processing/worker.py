@@ -351,12 +351,17 @@ def process_shard(
             cells_with_data += cwd
         # Strict-AOI per-cell mask (issue #101): expand the shard's manifest payload
         # over THIS chunk's cells (order-aligned with the carrier). None when the
-        # flag is off, so the carrier is byte-for-byte unchanged.
-        chunk_aoi_mask = (
-            grid.aoi_mask_from_payload(aoi_payload, chunk_children)
-            if aoi_payload is not None and hasattr(grid, "aoi_mask_from_payload")
-            else None
-        )
+        # flag is off, so the carrier is byte-for-byte unchanged. A non-None payload
+        # against a grid that can't expand it is a manifest/grid mismatch — raise
+        # rather than silently drop the column (which would leave an all-False mask).
+        chunk_aoi_mask = None
+        if aoi_payload is not None:
+            if not hasattr(grid, "aoi_mask_from_payload"):
+                raise ValueError(
+                    f"manifest carries an aoi_mask payload but grid "
+                    f"{type(grid).__name__} cannot expand it (no aoi_mask_from_payload)"
+                )
+            chunk_aoi_mask = grid.aoi_mask_from_payload(aoi_payload, chunk_children)
         carrier = _build_output(
             stats_arrays,
             dense_vars,

@@ -174,6 +174,45 @@ class TestRectilinearMask:
         assert mask.shape == np.asarray(children).shape
         np.testing.assert_array_equal(mask, expected)
 
+    def test_reproject_independent_oracle(self):
+        # Cross-check the WGS84->grid reprojection path against an INDEPENDENT
+        # oracle: reproject each grid-CRS cell center back to WGS84 with pyproj and
+        # test membership in the original WGS84 box directly (no shapely contains on
+        # the grid-CRS geometry). The two must agree, so this checks the containment
+        # result, not just prep-vs-unprep or ordering (review).
+        from pyproj import Transformer
+
+        from zagg.grids import RectilinearGrid
+
+        # A mid-latitude UTM grid (not polar) so a WGS84 lat/lon box is a clean
+        # oracle. EPSG:32618 over a 20-km tile near the SERC bbox (#100).
+        grid = RectilinearGrid(
+            "EPSG:32618",
+            1000.0,
+            [359400, 4300740, 379400, 4320740],
+            chunk_shape=(20, 20),
+            config=None,
+        )
+        # AOI: a WGS84 box that cuts diagonally across the tile's footprint.
+        to_wgs = Transformer.from_crs(grid.crs, "EPSG:4326", always_xy=True)
+        cx, cy = grid.cell_centers(grid.children(0))
+        clon0, clat0 = to_wgs.transform(cx, cy)
+        # Box covering the lower-left ~half of the cell-center cloud.
+        lon0, lat0 = float(clon0.min()) - 0.01, float(clat0.min()) - 0.01
+        lon1, lat1 = float(np.median(clon0)), float(np.median(clat0))
+        aoi_geom = grid.aoi_polygon(_box(lat0, lon0, lat1, lon1))
+        children = grid.children(0)
+        mask = grid.aoi_mask_for_children(aoi_geom, children)
+
+        xs, ys = grid.cell_centers(children)
+        clon, clat = to_wgs.transform(xs, ys)
+        oracle = (clon >= lon0) & (clon <= lon1) & (clat >= lat0) & (clat <= lat1)
+        # Straight-chord vs geodesic edge: allow boundary-cell slop, exact interior.
+        agree = mask == oracle
+        assert agree.mean() > 0.9
+        # Non-degenerate: the AOI genuinely cuts this shard (independent of contains).
+        assert mask.any() and not mask.all()
+
     def test_fully_inside_aoi_all_true(self):
         # An AOI polygon directly in grid CRS covering the whole grid -> all True.
         grid = self._grid()
