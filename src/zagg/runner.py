@@ -28,6 +28,7 @@ from zagg.concurrency import (
 )
 from zagg.config import (
     PipelineConfig,
+    get_aoi_mask,
     get_child_order,
     get_driver,
     get_layout,
@@ -581,6 +582,18 @@ def _run_lambda(
 
     import boto3
     from botocore.config import Config
+
+    # The Lambda worker path (deployment/aws/lambda_handler.py) does not yet thread
+    # the per-shard AOI payload to process_shard, so a Lambda run with the flag on
+    # would emit_template the bool aoi_mask array but never fill it — an all-False
+    # (entirely out-of-AOI) mask, silently the inverse of the feature (issue #101).
+    # Refuse rather than write a wrong mask; the local backend supports aoi_mask.
+    if get_aoi_mask(config):
+        raise NotImplementedError(
+            "output.aoi_mask is not yet supported on the Lambda backend (the Lambda "
+            "handler does not thread the per-shard AOI payload to the worker); use "
+            "backend='local', or disable output.aoi_mask for Lambda runs."
+        )
 
     all_shards = list(catalog_data["shard_keys"])
     grid_type = config.output.get("grid", {}).get("type", "healpix")

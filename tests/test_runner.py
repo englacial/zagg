@@ -631,6 +631,27 @@ class TestSummaryKeysByteIdentical:
         )
         assert all(v == "OMITTED" for v in seen.values())
 
+    def test_lambda_refuses_aoi_mask(self, atl06_config):
+        # The Lambda worker path can't fill the mask yet, so a flag-on Lambda run
+        # must refuse loudly rather than emit an all-False (out-of-AOI) mask (#101).
+        from zagg import runner
+
+        atl06_config.output = {**atl06_config.output, "aoi_mask": True}
+        with pytest.raises(NotImplementedError, match="not yet supported on the Lambda"):
+            runner._run_lambda(
+                atl06_config,
+                _run_catalog(),
+                "s3://out/x.zarr",
+                12,
+                max_cells=None,
+                morton_cell=None,
+                max_workers=1,
+                overwrite=False,
+                dry_run=False,
+                region="us-west-2",
+                function_name="fn",
+            )
+
     def test_lambda_summary_keys_and_cost(self, monkeypatch, atl06_config):
         import boto3
 
