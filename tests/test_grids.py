@@ -296,6 +296,35 @@ class TestFromConfig:
         with pytest.raises(ValueError, match="Unknown output.grid.type"):
             from_config(cfg, parent_order=6)
 
+    def test_sharded_default_off(self, cfg):
+        # The knob is absent by default -> regular (non-sharded) storage (issue #108).
+        g = from_config(cfg, parent_order=6)
+        assert g.sharded is False
+
+    def test_sharded_flag_threads_through(self, cfg):
+        # sharded on the grid block, with chunk_inner giving K>1, yields a sharded grid.
+        cfg.output["grid"]["chunk_inner"] = 8
+        cfg.output["grid"]["sharded"] = True
+        g = from_config(cfg, parent_order=6)
+        assert g.sharded is True
+        assert g.chunks_per_shard > 1
+
+    def test_sharded_k1_validated_pre_deployment(self, cfg):
+        # sharded without chunk_inner (K==1) is meaningless -> error at construction
+        # (validated before lambda deployment, matching the grid-mismatch errors).
+        cfg.output["grid"]["sharded"] = True
+        with pytest.raises(ValueError, match="K>1"):
+            from_config(cfg, parent_order=6)
+
+    def test_sharded_off_byte_identical_template(self, cfg):
+        # Flag off must reproduce the regular template byte-for-byte even when
+        # chunk_inner is set (sharding is purely opt-in storage form).
+        cfg.output["grid"]["chunk_inner"] = 8
+        g_off = from_config(cfg, parent_order=6)
+        cfg.output["grid"]["sharded"] = False
+        g_explicit_off = from_config(cfg, parent_order=6)
+        assert g_off._spec().model_dump() == g_explicit_off._spec().model_dump()
+
 
 class TestBackcompatWrapper:
     """xdggs_zarr_template (the public API) must keep producing the same
