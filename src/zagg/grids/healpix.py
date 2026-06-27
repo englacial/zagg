@@ -211,6 +211,36 @@ class HealpixGrid:
         lons_parts = [p[1] for p in polygon_parts]
         return morton_coverage(lats_parts, lons_parts, order=self.parent_order)
 
+    # ── strict-AOI cell mask (issue #101, optional) ─────────────────────────
+
+    def aoi_moc(self, polygon_parts) -> np.ndarray:
+        """Compact MOC of the AOI at ``child_order`` (native morton; issue #101).
+
+        Built once at the shard-map stage next to :meth:`coverage`. The per-shard
+        slices (:meth:`aoi_shard_moc`) ride the manifest; each worker expands its
+        slice to a cell-order boolean via :meth:`aoi_mask_for_children`.
+        """
+        from zagg.grids.aoi import healpix_aoi_moc
+
+        return healpix_aoi_moc(polygon_parts, self.child_order)
+
+    def aoi_shard_moc(self, aoi_moc, shard_key) -> np.ndarray:
+        """Restrict the AOI MOC to one shard (compact per-shard sub-MOC)."""
+        from zagg.grids.aoi import healpix_shard_moc
+
+        return healpix_shard_moc(aoi_moc, int(shard_key))
+
+    def aoi_mask_for_children(self, shard_moc, children) -> np.ndarray:
+        """Boolean over ``children`` — ``True`` where the cell is inside the AOI.
+
+        ``shard_moc`` is the per-shard sub-MOC (from :meth:`aoi_shard_moc`),
+        ``children`` the chunk's cell morton ids in canonical order; the result is
+        already in cell/storage order, ready to ride as the ``aoi_mask`` column.
+        """
+        from zagg.grids.aoi import healpix_mask_for_children
+
+        return healpix_mask_for_children(shard_moc, children, self.child_order)
+
     def assign(self, lats, lons) -> np.ndarray:
         """Map (lat, lon) points to morton IDs at the HEALPix reference order.
 
