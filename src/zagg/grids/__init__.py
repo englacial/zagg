@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import warnings
 
-from zagg.config import PipelineConfig, get_child_order
+from zagg.config import PipelineConfig, get_child_order, get_sharded
 from zagg.grids.base import InconsistentShardError, OutputGrid, ShardKey
 from zagg.grids.healpix import HEALPIX_BASE_CELLS, HealpixGrid
 from zagg.grids.rectilinear import OOB_SENTINEL, RectilinearGrid
@@ -53,6 +53,7 @@ def from_config(
             config=config,
             populated_shards=populated_shards,
             chunk_inner=grid_cfg.get("chunk_inner"),
+            sharded=get_sharded(config),
         )
     if grid_type == "rectilinear":
         required = ("crs", "resolution", "bounds")

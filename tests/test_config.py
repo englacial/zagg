@@ -19,6 +19,7 @@ from zagg.config import (
     get_filters,
     get_levels,
     get_output_signature,
+    get_sharded,
     get_store_path,
     load_config,
     load_config_from_dict,
@@ -1049,6 +1050,23 @@ class TestOutputHelpers:
         cfg = PipelineConfig(output={"grid": {"type": "healpix"}})
         with pytest.raises(ValueError, match="child_order"):
             get_child_order(cfg)
+
+    def test_get_sharded_default_false(self, atl06_config):
+        assert get_sharded(atl06_config) is False
+
+    def test_get_sharded_true(self):
+        cfg = PipelineConfig(
+            output={
+                "grid": {
+                    "type": "healpix",
+                    "parent_order": 6,
+                    "child_order": 12,
+                    "chunk_inner": 8,
+                    "sharded": True,
+                }
+            }
+        )
+        assert get_sharded(cfg) is True
 
     def test_get_store_path(self):
         cfg = PipelineConfig(
