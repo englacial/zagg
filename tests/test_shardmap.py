@@ -412,6 +412,15 @@ class TestBuildAOIMask:
         assert sm.aoi_mask is not None
         assert len(sm.aoi_mask) == len(sm.shard_keys)
 
+    def test_unsupported_grid_raises(self):
+        from zagg.catalog.shardmap import _compute_aoi_mask
+
+        class _NoAOIGrid:
+            pass
+
+        with pytest.raises(ValueError, match="provides no AOI mask API"):
+            _compute_aoi_mask(_NoAOIGrid(), [(np.array([0.0]), np.array([0.0]))], [1])
+
     def test_round_trip_carries_payload(self, catalog, fake_spherely):
         grid = RectilinearGrid(
             "EPSG:32618",

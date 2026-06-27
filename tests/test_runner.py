@@ -15,13 +15,17 @@ def atl06_config():
 
 
 def _rec(n):
-    return {"id": f"g{n}", "s3": f"s3://bucket/granule{n}.h5",
-            "https": f"https://h/granule{n}.h5"}
+    return {"id": f"g{n}", "s3": f"s3://bucket/granule{n}.h5", "https": f"https://h/granule{n}.h5"}
 
 
 # HealpixGrid(parent_order=6, child_order=12, layout="fullsphere").signature()
-_ATL06_SIG = {"type": "healpix", "indexing_scheme": "nested",
-              "parent_order": 6, "child_order": 12, "layout": "fullsphere"}
+_ATL06_SIG = {
+    "type": "healpix",
+    "indexing_scheme": "nested",
+    "parent_order": 6,
+    "child_order": 12,
+    "layout": "fullsphere",
+}
 
 
 @pytest.fixture
@@ -64,19 +68,30 @@ class TestDryRun:
         assert result["store_path"] == "./out.zarr"
 
     def test_dry_run_max_cells(self, atl06_config, catalog_file):
-        result = agg(atl06_config, catalog=catalog_file, store="./out.zarr",
-                     dry_run=True, max_cells=2)
+        result = agg(
+            atl06_config, catalog=catalog_file, store="./out.zarr", dry_run=True, max_cells=2
+        )
         assert result["total_cells"] == 2
 
     def test_dry_run_morton_cell(self, atl06_config, catalog_file):
-        result = agg(atl06_config, catalog=catalog_file, store="./out.zarr",
-                     dry_run=True, morton_cell="-4211322")
+        result = agg(
+            atl06_config,
+            catalog=catalog_file,
+            store="./out.zarr",
+            dry_run=True,
+            morton_cell="-4211322",
+        )
         assert result["total_cells"] == 1
 
     def test_dry_run_invalid_morton_cell(self, atl06_config, catalog_file):
         with pytest.raises(ValueError, match="not in catalog"):
-            agg(atl06_config, catalog=catalog_file, store="./out.zarr",
-                dry_run=True, morton_cell="99999999")
+            agg(
+                atl06_config,
+                catalog=catalog_file,
+                store="./out.zarr",
+                dry_run=True,
+                morton_cell="99999999",
+            )
 
 
 class TestSelectCells:
@@ -137,8 +152,12 @@ class TestCheckSignature:
 
     @staticmethod
     def _catalog(grid_signature):
-        return {"metadata": {}, "grid_signature": grid_signature,
-                "shard_keys": [0], "granules": [[_rec(1)]]}
+        return {
+            "metadata": {},
+            "grid_signature": grid_signature,
+            "shard_keys": [0],
+            "granules": [[_rec(1)]],
+        }
 
     def test_cross_aggregator_reuse_healpix(self):
         # Headline: a map built for tdigest validates a gain_bias run (same
@@ -176,10 +195,10 @@ class TestCheckSignature:
 
     def test_rectilinear_cross_aggregator_reuse(self):
         bounds = [359400, 4300740, 369400, 4310740]
-        a = RectilinearGrid("EPSG:32618", 10, bounds, [250, 250],
-                            config=default_config("atl06"))
-        b = RectilinearGrid("EPSG:32618", 10, bounds, [250, 250],
-                            config=default_config("atl06_polar"))
+        a = RectilinearGrid("EPSG:32618", 10, bounds, [250, 250], config=default_config("atl06"))
+        b = RectilinearGrid(
+            "EPSG:32618", 10, bounds, [250, 250], config=default_config("atl06_polar")
+        )
         assert a.signature() != b.signature()
         _check_signature(b, self._catalog(a.spatial_signature()))  # no raise
         _check_signature(b, self._catalog(a.signature()))  # old full sig: also ok
@@ -209,6 +228,7 @@ class TestDenseDeprecation:
         atl06_config.output["grid"]["layout"] = "fullsphere"
         atl06_config.catalog = catalog_file
         import warnings as _w
+
         with _w.catch_warnings():
             _w.simplefilter("error", DeprecationWarning)
             agg(atl06_config, store="./out.zarr", dry_run=True)
@@ -235,17 +255,24 @@ class TestOutputCredsEvent:
 
     def test_none_when_no_creds(self):
         from zagg.runner import _build_output_creds_event
+
         assert _build_output_creds_event(None, None, "us-west-2") is None
 
     def test_camelcase_passthrough(self):
         from zagg.runner import _build_output_creds_event
+
         creds = {"accessKeyId": "AKIA", "secretAccessKey": "s", "sessionToken": "t"}
         block = _build_output_creds_event(creds, None, "us-west-2")
-        assert block == {"accessKeyId": "AKIA", "secretAccessKey": "s",
-                         "region": "us-west-2", "sessionToken": "t"}
+        assert block == {
+            "accessKeyId": "AKIA",
+            "secretAccessKey": "s",
+            "region": "us-west-2",
+            "sessionToken": "t",
+        }
 
     def test_endpoint_and_region_override(self):
         from zagg.runner import _build_output_creds_event
+
         creds = {"accessKeyId": "AKIA", "secretAccessKey": "s", "region": "eu-west-1"}
         block = _build_output_creds_event(creds, "https://r2.example", "us-west-2")
         assert block["endpointUrl"] == "https://r2.example"
@@ -255,6 +282,7 @@ class TestOutputCredsEvent:
     def test_snake_case_input(self):
         """boto / ``~/.aws/credentials`` spellings normalize to camelCase (#45)."""
         from zagg.runner import _build_output_creds_event
+
         creds = {
             "aws_access_key_id": "AKIA",
             "aws_secret_access_key": "s",
@@ -262,12 +290,17 @@ class TestOutputCredsEvent:
             "region_name": "eu-west-1",
         }
         block = _build_output_creds_event(creds, None, "us-west-2")
-        assert block == {"accessKeyId": "AKIA", "secretAccessKey": "s",
-                         "region": "eu-west-1", "sessionToken": "t"}
+        assert block == {
+            "accessKeyId": "AKIA",
+            "secretAccessKey": "s",
+            "region": "eu-west-1",
+            "sessionToken": "t",
+        }
 
     def test_sts_pascalcase_input(self):
         """STS ``Credentials`` spellings normalize to camelCase (#45)."""
         from zagg.runner import _build_output_creds_event
+
         creds = {
             "AccessKeyId": "AKIA",
             "SecretAccessKey": "s",
@@ -275,12 +308,17 @@ class TestOutputCredsEvent:
             "Region": "eu-west-1",
         }
         block = _build_output_creds_event(creds, None, "us-west-2")
-        assert block == {"accessKeyId": "AKIA", "secretAccessKey": "s",
-                         "region": "eu-west-1", "sessionToken": "t"}
+        assert block == {
+            "accessKeyId": "AKIA",
+            "secretAccessKey": "s",
+            "region": "eu-west-1",
+            "sessionToken": "t",
+        }
 
     def test_missing_required_field_raises_clear_error(self):
         """A missing access key gives an actionable message, not a raw KeyError (#45)."""
         from zagg.runner import _build_output_creds_event
+
         creds = {"secretAccessKey": "s"}
         with pytest.raises(ValueError, match="accessKeyId"):
             _build_output_creds_event(creds, None, "us-west-2")
@@ -288,35 +326,41 @@ class TestOutputCredsEvent:
     def test_missing_both_required_fields_names_both(self):
         """Both missing fields are named in the error (#45)."""
         from zagg.runner import _build_output_creds_event
+
         with pytest.raises(ValueError, match="accessKeyId.*secretAccessKey"):
             _build_output_creds_event({"region": "us-west-2"}, None, "us-west-2")
 
     def test_empty_creds_returns_none(self):
         """An empty dict is treated as "no explicit creds", like None (#45)."""
         from zagg.runner import _build_output_creds_event
+
         assert _build_output_creds_event({}, None, "us-west-2") is None
 
     def test_endpoint_url_from_creds_flows_into_event(self):
         """``endpoint_url`` in the creds dict reaches the event block (#45)."""
         from zagg.runner import _build_output_creds_event
-        creds = {"aws_access_key_id": "AKIA", "aws_secret_access_key": "s",
-                 "endpoint_url": "https://r2.example"}
+
+        creds = {
+            "aws_access_key_id": "AKIA",
+            "aws_secret_access_key": "s",
+            "endpoint_url": "https://r2.example",
+        }
         block = _build_output_creds_event(creds, None, "us-west-2")
         assert block["endpointUrl"] == "https://r2.example"
 
     def test_endpoint_param_takes_precedence_over_creds(self):
         """The explicit endpoint_url parameter wins over the creds dict (#45)."""
         from zagg.runner import _build_output_creds_event
-        creds = {"accessKeyId": "AKIA", "secretAccessKey": "s",
-                 "endpointUrl": "https://from-creds"}
+
+        creds = {"accessKeyId": "AKIA", "secretAccessKey": "s", "endpointUrl": "https://from-creds"}
         block = _build_output_creds_event(creds, "https://from-param", "us-west-2")
         assert block["endpointUrl"] == "https://from-param"
 
     def test_first_truthy_spelling_wins(self):
         """A falsy spelling falls through to the next, mirroring the read path (#45)."""
         from zagg.runner import normalize_output_credentials
-        creds = {"accessKeyId": "", "aws_access_key_id": "AKIA",
-                 "secretAccessKey": "s"}
+
+        creds = {"accessKeyId": "", "aws_access_key_id": "AKIA", "secretAccessKey": "s"}
         normalized = normalize_output_credentials(creds)
         assert normalized["accessKeyId"] == "AKIA"
 
@@ -339,9 +383,17 @@ class TestInvokeLambdaCellEvent:
         ).encode()
         client.invoke.return_value = {"Payload": payload, "FunctionError": None}
         _invoke_lambda_cell(
-            client, (0,), 12345, 6, child_order,
-            ["s3://b/g.h5"], "s3://out/x.zarr", self._CREDS,
-            function_name="process-shard", config_dict=None, max_workers=4,
+            client,
+            (0,),
+            12345,
+            6,
+            child_order,
+            ["s3://b/g.h5"],
+            "s3://out/x.zarr",
+            self._CREDS,
+            function_name="process-shard",
+            config_dict=None,
+            max_workers=4,
         )
         return json.loads(client.invoke.call_args.kwargs["Payload"])
 
@@ -370,13 +422,21 @@ class TestHandoffPassthrough:
 
         def fake_process_shard(grid, shard_key, urls, **kwargs):
             import pandas as pd
+
             captured["handoff"] = kwargs.get("handoff")
             return pd.DataFrame(), {"shard_key": shard_key, "error": None}
 
         monkeypatch.setattr(runner, "process_shard", fake_process_shard)
         runner._process_and_write(
-            0, (0,), [_rec(1)], grid=None, s3_creds={}, zarr_store=None,
-            config=atl06_config, driver="s3", handoff="arrow",
+            0,
+            (0,),
+            [_rec(1)],
+            grid=None,
+            s3_creds={},
+            zarr_store=None,
+            config=atl06_config,
+            driver="s3",
+            handoff="arrow",
         )
         assert captured["handoff"] == "arrow"
 
@@ -387,13 +447,20 @@ class TestHandoffPassthrough:
 
         def fake_process_shard(grid, shard_key, urls, **kwargs):
             import pandas as pd
+
             captured["handoff"] = kwargs.get("handoff")
             return pd.DataFrame(), {"shard_key": shard_key, "error": None}
 
         monkeypatch.setattr(runner, "process_shard", fake_process_shard)
         runner._process_and_write(
-            0, (0,), [_rec(1)], grid=None, s3_creds={}, zarr_store=None,
-            config=atl06_config, driver="s3",
+            0,
+            (0,),
+            [_rec(1)],
+            grid=None,
+            s3_creds={},
+            zarr_store=None,
+            config=atl06_config,
+            driver="s3",
         )
         assert captured["handoff"] == "pandas"
 
@@ -411,7 +478,8 @@ def _stub_grid():
 
 def _run_catalog():
     return {
-        "metadata": {}, "grid_signature": {},
+        "metadata": {},
+        "grid_signature": {},
         "shard_keys": [10, 11, 12, 13],
         "granules": [[{"s3": f"s3://b/g{i}.h5"}] for i in range(4)],
     }
@@ -427,13 +495,28 @@ class TestSummaryKeysByteIdentical:
     """
 
     _LOCAL_KEYS = {
-        "total_cells", "cells_with_data", "cells_error", "total_obs",
-        "wall_time_s", "store_path", "backend", "results",
+        "total_cells",
+        "cells_with_data",
+        "cells_error",
+        "total_obs",
+        "wall_time_s",
+        "store_path",
+        "backend",
+        "results",
     }
     _LAMBDA_KEYS = {
-        "total_cells", "cells_with_data", "cells_error", "total_obs",
-        "wall_time_s", "lambda_time_s", "gb_seconds", "price_per_gb_sec",
-        "estimated_cost_usd", "store_path", "backend", "function_name",
+        "total_cells",
+        "cells_with_data",
+        "cells_error",
+        "total_obs",
+        "wall_time_s",
+        "lambda_time_s",
+        "gb_seconds",
+        "price_per_gb_sec",
+        "estimated_cost_usd",
+        "store_path",
+        "backend",
+        "function_name",
         "results",
     }
 
@@ -441,17 +524,28 @@ class TestSummaryKeysByteIdentical:
         import zagg.grids as grids_mod
         from zagg import runner
 
-        monkeypatch.setattr(runner, "get_nsidc_s3_credentials",
-                            lambda: {"accessKeyId": "a", "secretAccessKey": "s",
-                                     "sessionToken": "t"})
+        monkeypatch.setattr(
+            runner,
+            "get_nsidc_s3_credentials",
+            lambda: {"accessKeyId": "a", "secretAccessKey": "s", "sessionToken": "t"},
+        )
         monkeypatch.setattr(grids_mod, "from_config", lambda *a, **k: _stub_grid())
         monkeypatch.setattr(runner, "open_store", lambda *a, **k: object())
         monkeypatch.setattr(runner, "consolidate_metadata", lambda *a, **k: None)
 
         # 10,13 -> data; 11 -> raised (error, dropped from results); 12 ->
         # benign no-data meta (in results, not counted).
-        def fake_paw(shard_key, chunk_idx, records, grid, s3_creds, zarr_store,
-                     config, driver=None, handoff="pandas"):
+        def fake_paw(
+            shard_key,
+            chunk_idx,
+            records,
+            grid,
+            s3_creds,
+            zarr_store,
+            config,
+            driver=None,
+            handoff="pandas",
+        ):
             if shard_key == 11:
                 raise RuntimeError("boom")
             if shard_key == 12:
@@ -461,9 +555,16 @@ class TestSummaryKeysByteIdentical:
         monkeypatch.setattr(runner, "_process_and_write", fake_paw)
 
         summary = runner._run_local(
-            atl06_config, _run_catalog(), "./out.zarr", 12,
-            max_cells=None, morton_cell=None, max_workers=2, overwrite=False,
-            dry_run=False, region="us-west-2",
+            atl06_config,
+            _run_catalog(),
+            "./out.zarr",
+            12,
+            max_cells=None,
+            morton_cell=None,
+            max_workers=2,
+            overwrite=False,
+            dry_run=False,
+            region="us-west-2",
         )
         assert set(summary.keys()) == self._LOCAL_KEYS
         assert summary["backend"] == "local"
@@ -473,6 +574,63 @@ class TestSummaryKeysByteIdentical:
         assert summary["total_obs"] == 14
         assert len(summary["results"]) == 3  # raised cell excluded
 
+    def test_local_threads_aoi_payload(self, monkeypatch, atl06_config):
+        # When the manifest carries an aoi_mask list, _run_local threads each
+        # shard's payload into _process_and_write; when it doesn't, the kwarg is
+        # omitted entirely so the flag-off call is unchanged (issue #101).
+        import zagg.grids as grids_mod
+        from zagg import runner
+
+        monkeypatch.setattr(
+            runner,
+            "get_nsidc_s3_credentials",
+            lambda: {"accessKeyId": "a", "secretAccessKey": "s", "sessionToken": "t"},
+        )
+        monkeypatch.setattr(grids_mod, "from_config", lambda *a, **k: _stub_grid())
+        monkeypatch.setattr(runner, "open_store", lambda *a, **k: object())
+        monkeypatch.setattr(runner, "consolidate_metadata", lambda *a, **k: None)
+
+        seen = {}
+
+        def fake_paw(shard_key, chunk_idx, records, grid, s3_creds, zarr_store, config, **kw):
+            seen[int(shard_key)] = kw.get("aoi_payload", "OMITTED")
+            return {"shard_key": shard_key, "total_obs": 1, "error": None}
+
+        monkeypatch.setattr(runner, "_process_and_write", fake_paw)
+
+        cat = _run_catalog()
+        cat["aoi_mask"] = [[1, 2], [3], [], [4, 5]]  # parallel to shard_keys
+        runner._run_local(
+            atl06_config,
+            cat,
+            "./out.zarr",
+            12,
+            max_cells=None,
+            morton_cell=None,
+            max_workers=1,
+            overwrite=False,
+            dry_run=False,
+            region="us-west-2",
+        )
+        assert seen[10] == [1, 2]
+        assert seen[13] == [4, 5]
+
+        # No aoi_mask key -> kwarg omitted (legacy signature preserved).
+        seen.clear()
+        runner._run_local(
+            atl06_config,
+            _run_catalog(),
+            "./out.zarr",
+            12,
+            max_cells=None,
+            morton_cell=None,
+            max_workers=1,
+            overwrite=False,
+            dry_run=False,
+            region="us-west-2",
+        )
+        assert all(v == "OMITTED" for v in seen.values())
+
     def test_lambda_summary_keys_and_cost(self, monkeypatch, atl06_config):
         import boto3
 
@@ -480,32 +638,55 @@ class TestSummaryKeysByteIdentical:
         from zagg import runner
         from zagg.concurrency import ConcurrencyReport
 
-        monkeypatch.setattr(runner, "get_nsidc_s3_credentials",
-                            lambda: {"accessKeyId": "a", "secretAccessKey": "s",
-                                     "sessionToken": "t"})
+        monkeypatch.setattr(
+            runner,
+            "get_nsidc_s3_credentials",
+            lambda: {"accessKeyId": "a", "secretAccessKey": "s", "sessionToken": "t"},
+        )
         monkeypatch.setattr(grids_mod, "from_config", lambda *a, **k: _stub_grid())
         monkeypatch.setattr(runner, "_invoke_lambda_setup", lambda *a, **k: None)
         monkeypatch.setattr(runner, "_invoke_lambda_finalize", lambda *a, **k: None)
         from unittest.mock import MagicMock
+
         monkeypatch.setattr(boto3, "Session", lambda *a, **k: MagicMock())
         monkeypatch.setattr(
-            runner, "compute_available_workers",
+            runner,
+            "compute_available_workers",
             lambda requested, *a, **k: (
                 4,
-                ConcurrencyReport(account_limit=1000, current_concurrent=0,
-                                  padding=100, available=900, function_reserved=None),
+                ConcurrencyReport(
+                    account_limit=1000,
+                    current_concurrent=0,
+                    padding=100,
+                    available=900,
+                    function_reserved=None,
+                ),
             ),
         )
         monkeypatch.setattr(
-            runner, "_invoke_lambda_cell",
-            lambda *a, **k: {"status_code": 200, "body": {"total_obs": 3},
-                             "error": None, "lambda_duration": 2.0, "shard_key": 0},
+            runner,
+            "_invoke_lambda_cell",
+            lambda *a, **k: {
+                "status_code": 200,
+                "body": {"total_obs": 3},
+                "error": None,
+                "lambda_duration": 2.0,
+                "shard_key": 0,
+            },
         )
 
         summary = runner._run_lambda(
-            atl06_config, _run_catalog(), "s3://out/x.zarr", 12,
-            max_cells=None, morton_cell=None, max_workers=1700, overwrite=False,
-            dry_run=False, region="us-west-2", function_name="process-shard",
+            atl06_config,
+            _run_catalog(),
+            "s3://out/x.zarr",
+            12,
+            max_cells=None,
+            morton_cell=None,
+            max_workers=1700,
+            overwrite=False,
+            dry_run=False,
+            region="us-west-2",
+            function_name="process-shard",
         )
         assert set(summary.keys()) == self._LAMBDA_KEYS
         assert summary["backend"] == "lambda"
@@ -531,33 +712,55 @@ class TestSummaryKeysByteIdentical:
 
         durations = iter([0.1, 0.2, 0.3, 12.7])
 
-        monkeypatch.setattr(runner, "get_nsidc_s3_credentials",
-                            lambda: {"accessKeyId": "a", "secretAccessKey": "s",
-                                     "sessionToken": "t"})
+        monkeypatch.setattr(
+            runner,
+            "get_nsidc_s3_credentials",
+            lambda: {"accessKeyId": "a", "secretAccessKey": "s", "sessionToken": "t"},
+        )
         monkeypatch.setattr(grids_mod, "from_config", lambda *a, **k: _stub_grid())
         monkeypatch.setattr(runner, "_invoke_lambda_setup", lambda *a, **k: None)
         monkeypatch.setattr(runner, "_invoke_lambda_finalize", lambda *a, **k: None)
         from unittest.mock import MagicMock
+
         monkeypatch.setattr(boto3, "Session", lambda *a, **k: MagicMock())
         monkeypatch.setattr(
-            runner, "compute_available_workers",
+            runner,
+            "compute_available_workers",
             lambda requested, *a, **k: (
                 1,  # 1 worker -> deterministic completion order for the iter()
-                ConcurrencyReport(account_limit=1000, current_concurrent=0,
-                                  padding=100, available=900, function_reserved=None),
+                ConcurrencyReport(
+                    account_limit=1000,
+                    current_concurrent=0,
+                    padding=100,
+                    available=900,
+                    function_reserved=None,
+                ),
             ),
         )
         monkeypatch.setattr(
-            runner, "_invoke_lambda_cell",
-            lambda *a, **k: {"status_code": 200, "body": {"total_obs": 1},
-                             "error": None, "lambda_duration": next(durations),
-                             "shard_key": 0},
+            runner,
+            "_invoke_lambda_cell",
+            lambda *a, **k: {
+                "status_code": 200,
+                "body": {"total_obs": 1},
+                "error": None,
+                "lambda_duration": next(durations),
+                "shard_key": 0,
+            },
         )
 
         summary = runner._run_lambda(
-            atl06_config, _run_catalog(), "s3://out/x.zarr", 12,
-            max_cells=None, morton_cell=None, max_workers=1700, overwrite=False,
-            dry_run=False, region="us-west-2", function_name="process-shard",
+            atl06_config,
+            _run_catalog(),
+            "s3://out/x.zarr",
+            12,
+            max_cells=None,
+            morton_cell=None,
+            max_workers=1700,
+            overwrite=False,
+            dry_run=False,
+            region="us-west-2",
+            function_name="process-shard",
         )
         total = 0.1 + 0.2 + 0.3 + 12.7
         # The exact pre-refactor order: one multiply over the summed time.

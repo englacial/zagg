@@ -191,23 +191,32 @@ def _compute_aoi_mask(grid, parts, shard_keys) -> list:
     ``children`` order (cell centers inside the reprojected AOI). The worker expands
     the entry to a per-cell bool over ``children(shard_key)`` at write time.
 
-    Computed once here (the shard-map stage) so the worker/Lambda path needs no
-    region plumbing — the mask depends only on (grid, AOI), never on observations.
+    Computed once here (the shard-map stage) so the local worker expands it with
+    no region plumbing — the mask depends only on (grid, AOI), never on
+    observations. Dispatches on the grid's AOI API: ``aoi_moc`` (HEALPix native
+    morton) vs ``aoi_polygon`` (rectilinear shapely centers). A grid exposing
+    neither with the flag on is a misconfiguration, raised here rather than left to
+    a cryptic ``AttributeError`` downstream.
     """
-    is_healpix = hasattr(grid, "aoi_moc")
-    if is_healpix:
+    if hasattr(grid, "aoi_moc"):
         aoi_moc = grid.aoi_moc(parts)
         return [[int(w) for w in grid.aoi_shard_moc(aoi_moc, int(k))] for k in shard_keys]
-    # Rectilinear (or any center-test grid): the in-AOI cell ids per shard. Storing
-    # cell IDS (not positional indices) keeps the worker expansion order-independent,
-    # so a K>1 chunk that enumerates a sub-tile still maps correctly via membership.
-    aoi_geom = grid.aoi_polygon(parts)
-    out = []
-    for k in shard_keys:
-        children = np.asarray(grid.children(int(k)))
-        mask = grid.aoi_mask_for_children(aoi_geom, children)
-        out.append([int(c) for c in children[mask]])
-    return out
+    if hasattr(grid, "aoi_polygon"):
+        # Rectilinear (or any center-test grid): the in-AOI cell ids per shard.
+        # Storing cell IDS (not positional indices) keeps the worker expansion
+        # order-independent, so a K>1 chunk that enumerates a sub-tile still maps
+        # correctly via membership.
+        aoi_geom = grid.aoi_polygon(parts)
+        out = []
+        for k in shard_keys:
+            children = np.asarray(grid.children(int(k)))
+            mask = grid.aoi_mask_for_children(aoi_geom, children)
+            out.append([int(c) for c in children[mask]])
+        return out
+    raise ValueError(
+        f"output.aoi_mask is on but grid {type(grid).__name__} provides no AOI mask "
+        "API (aoi_moc / aoi_polygon); disable output.aoi_mask for this grid."
+    )
 
 
 # ── backends (operate on granule records) ────────────────────────────────────
