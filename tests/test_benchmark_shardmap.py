@@ -62,7 +62,8 @@ def test_pinned_shardmap_no_drift(sm_key):
     cfg = load_config(str(_config_for_shardmap(sm_key)))
     grid = from_config(cfg)
     cmr, temporal, aoi = MANIFEST["cmr"], MANIFEST["temporal"], MANIFEST["aoi"]
-    parts = load_polygon(str(REPO / aoi["file"]))
+    # aoi.file is relative to the manifest dir, like the config/shardmap paths.
+    parts = load_polygon(str(BENCH / aoi["file"]))
     bbox = polygon_to_bbox(parts)
 
     query = Query(
