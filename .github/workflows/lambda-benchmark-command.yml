@@ -26,6 +26,7 @@ jobs:
       pr_number: ${{ steps.gate.outputs.pr_number }}
       pr_sha: ${{ steps.gate.outputs.pr_sha }}
       head_ref: ${{ steps.gate.outputs.head_ref }}
+      head_repo: ${{ steps.gate.outputs.head_repo }}
     steps:
       - name: Gate on maintainer trigger
         id: gate
@@ -68,6 +69,7 @@ jobs:
             core.setOutput('pr_number', String(prNumber));
             core.setOutput('pr_sha', pr.head.sha);
             core.setOutput('head_ref', pr.head.ref);
+            core.setOutput('head_repo', pr.head.repo.full_name);
 
   run:
     needs: check
@@ -82,12 +84,37 @@ jobs:
       group: lambda-benchmark-cmd-${{ needs.check.outputs.pr_number }}
       cancel-in-progress: true
     steps:
-      - name: Checkout PR head
+      # Base-pin: the benchmark HARNESS (run_benchmark.py, bench_metrics.py,
+      # targets.json, the pinned shard maps + configs) comes from base `main`, so
+      # an untrusted fork can't rewrite what the benchmark does (target, cost
+      # math, shard selection). Only the fork's `src/zagg` -- the code we actually
+      # want to measure -- is overlaid on top. (The fork's package still executes
+      # with the role, so the role stays minimally scoped + the maintainer gate
+      # stands; this removes the harness/target-tampering vector, not that.)
+      - name: Checkout base harness
         uses: actions/checkout@v5
         with:
-          ref: ${{ needs.check.outputs.pr_sha }}
+          ref: main
 
-      - name: Run benchmark on PR head
+      - name: Checkout fork src/zagg
+        uses: actions/checkout@v5
+        with:
+          repository: ${{ needs.check.outputs.head_repo }}
+          ref: ${{ needs.check.outputs.pr_sha }}
+          path: _fork
+          sparse-checkout: src/zagg
+
+      - name: Overlay fork package under test
+        run: |
+          set -euo pipefail
+          if [ ! -d _fork/src/zagg ]; then
+            echo "fork has no src/zagg; nothing to benchmark" >&2
+            exit 1
+          fi
+          rm -rf src/zagg
+          cp -r _fork/src/zagg src/zagg
+
+      - name: Run benchmark (base harness, fork package)
         uses: ./.github/actions/run-benchmark
         with:
           role-arn: ${{ vars.BENCHMARK_ROLE_ARN }}

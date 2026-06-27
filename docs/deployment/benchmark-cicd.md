@@ -67,8 +67,15 @@ permission policy (what it can do).
 
 ### 2a. Trust policy — pin to the repo
 
-`trust.json` (restrict `sub` to your repo; the `main` and `pull_request`
-conditions keep it to the branch/PR contexts the workflows actually run in):
+`trust.json` — the `sub` wildcard `repo:englacial/zagg:*` restricts assumption to
+**this** repo's Actions (a fork's OIDC `sub` is `repo:<fork>/zagg:*` and can't
+match), which is the standard scope. Branch/PR/fork-context gating is enforced in
+the workflows themselves (same-repo guard for the auto path, write/admin actor
+check for the on-demand path). If you want to tighten the trust at the IAM layer
+too, replace the wildcard with explicit subs (e.g.
+`repo:englacial/zagg:ref:refs/heads/main` and `repo:englacial/zagg:pull_request`)
+— but note the on-demand fork path runs under `pull_request_target`, whose `sub`
+is the **base** ref, so don't over-restrict or you'll lock it out:
 
 ```json
 {
