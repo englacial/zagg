@@ -59,23 +59,65 @@ aws iam list-open-id-connect-providers
 
 ---
 
-## 2. Create the scoped IAM role
+## 2. Create the CI/CD roles + distribution bucket (one CloudFormation stack)
 
-The role is assumable **only** by this repo's Actions, and can do **only** what
-the benchmark needs. Two policy documents: a trust policy (who can assume) and a
-permission policy (what it can do).
+All three GitHub-OIDC roles — **benchmark-invoke** (this section), **test-deploy**
+and **release** (section 9) — plus the public **`sliderule-public-cors`** bucket
+(section 10) are provisioned by one template, `deployment/aws/benchmark_cicd.yaml`,
+kept in its own stack so it rolls back / tears down cleanly (the SlideRule
+CFN-first convention; mirrors `execution_role.yaml`). It references the existing
+OIDC provider from section 1 by account ID, so nothing here recreates it.
 
-### 2a. Trust policy — pin to the repo
+```bash
+aws cloudformation deploy \
+  --template-file deployment/aws/benchmark_cicd.yaml \
+  --stack-name zagg-benchmark-cicd \
+  --region us-west-2 \
+  --capabilities CAPABILITY_NAMED_IAM \
+  --parameter-overrides \
+      GitHubRepo=englacial/zagg \
+      BenchmarkFunctionName=process-shard \
+      TestFunctionName=process-shard-test \
+      BenchmarkStoreBucket=sliderule-public \
+      DistBucketName=sliderule-public-cors
+```
 
-`trust.json` — the `sub` wildcard `repo:englacial/zagg:*` restricts assumption to
-**this** repo's Actions (a fork's OIDC `sub` is `repo:<fork>/zagg:*` and can't
-match), which is the standard scope. Branch/PR/fork-context gating is enforced in
-the workflows themselves (same-repo guard for the auto path, write/admin actor
-check for the on-demand path). If you want to tighten the trust at the IAM layer
-too, replace the wildcard with explicit subs (e.g.
-`repo:englacial/zagg:ref:refs/heads/main` and `repo:englacial/zagg:pull_request`)
-— but note the on-demand fork path runs under `pull_request_target`, whose `sub`
-is the **base** ref, so don't over-restrict or you'll lock it out:
+Parameters (all default to the values in this guide):
+
+| Parameter | Default | Scopes |
+| --- | --- | --- |
+| `GitHubRepo` | `englacial/zagg` | the OIDC trust `sub` (`repo:<repo>:*`) on all three roles |
+| `BenchmarkFunctionName` | `process-shard` | the stable function the invoke role calls + the release role deploys |
+| `TestFunctionName` | `process-shard-test` | the function the deploy role updates + the invoke role calls |
+| `BenchmarkStoreBucket` | `sliderule-public` | the benchmark output store + the staged test layer (`lambda-test/*`) |
+| `DistBucketName` | `sliderule-public-cors` | the public distribution bucket (`CreateDistBucket=false` to reuse an existing one) |
+
+The **benchmark-invoke** role (`zagg-benchmark`) gets `lambda:InvokeFunction` +
+`lambda:GetFunctionConfiguration` (the latter for the `worker_pct_timeout` metric)
+on the stable + test functions, and read/write on the benchmark store bucket.
+
+> The Lambda reads the ATL03 source granules itself, using the NSIDC S3
+> credentials the orchestrator forwards — that's the **Lambda execution role**'s
+> concern, not this role's. This role only invokes + writes output.
+
+**Verify** — the stack Outputs hand you the exact ARNs/names for section 4:
+
+```bash
+aws cloudformation describe-stacks --stack-name zagg-benchmark-cicd \
+  --region us-west-2 --query 'Stacks[0].Outputs' --output table
+```
+
+The trust `sub` is the repo wildcard `repo:englacial/zagg:*` (a fork's `sub` can't
+match); branch/PR/fork-context gating lives in the workflows + the `production`
+Environment (section 11). To tighten at the IAM layer, override the roles'
+conditions — but the on-demand fork path runs under `pull_request_target` (base
+`sub`) and the release job under `environment:production`, so don't over-restrict
+or you'll lock them out.
+
+<details><summary>Manual (raw-CLI) alternative for the invoke role</summary>
+
+If you can't use CloudFormation, create just the invoke role with this trust
+(`trust.json`) and permission (`permissions.json`) policy:
 
 ```json
 {
@@ -87,21 +129,12 @@ is the **base** ref, so don't over-restrict or you'll lock it out:
     },
     "Action": "sts:AssumeRoleWithWebIdentity",
     "Condition": {
-      "StringEquals": {
-        "token.actions.githubusercontent.com:aud": "sts.amazonaws.com"
-      },
-      "StringLike": {
-        "token.actions.githubusercontent.com:sub": "repo:englacial/zagg:*"
-      }
+      "StringEquals": { "token.actions.githubusercontent.com:aud": "sts.amazonaws.com" },
+      "StringLike": { "token.actions.githubusercontent.com:sub": "repo:englacial/zagg:*" }
     }
   }]
 }
 ```
-
-### 2b. Permission policy — least privilege
-
-`permissions.json` — invoke the one function, read its config (for the
-`worker_pct_timeout` metric), and read/write the benchmark bucket prefix:
 
 ```json
 {
@@ -117,36 +150,22 @@ is the **base** ref, so don't over-restrict or you'll lock it out:
       "Sid": "BenchmarkBucket",
       "Effect": "Allow",
       "Action": ["s3:PutObject", "s3:GetObject", "s3:DeleteObject", "s3:ListBucket"],
-      "Resource": [
-        "arn:aws:s3:::BUCKET",
-        "arn:aws:s3:::BUCKET/PREFIX/*"
-      ]
+      "Resource": ["arn:aws:s3:::BUCKET", "arn:aws:s3:::BUCKET/PREFIX/*"]
     }
   ]
 }
 ```
 
-> The Lambda reads the ATL03 source granules itself, using the NSIDC S3
-> credentials the orchestrator forwards — that's the **Lambda execution role**'s
-> concern, not this role's. This role only invokes + writes output.
-
-### 2c. Create the role and attach the policy
-
 ```bash
 aws iam create-role --role-name zagg-benchmark \
   --assume-role-policy-document file://trust.json
-
 aws iam put-role-policy --role-name zagg-benchmark \
-  --policy-name zagg-benchmark-access \
-  --policy-document file://permissions.json
+  --policy-name zagg-benchmark-access --policy-document file://permissions.json
 ```
 
-**Verify** — note the ARN (you need it in step 4):
-
-```bash
-aws iam get-role --role-name zagg-benchmark --query 'Role.Arn' --output text
-# -> arn:aws:iam::ACCOUNT_ID:role/zagg-benchmark
-```
+(Section 9's deploy/release roles + section 10's bucket then also need their own
+`create-role`/`s3api` commands — the CloudFormation path does all of it at once.)
+</details>
 
 ---
 
@@ -333,8 +352,8 @@ the function.
 
 ## 9. Deploy + release IAM roles (OIDC)
 
-Two more roles, both trusting this repo via the OIDC provider from section 1
-(reuse the same `trust.json`):
+The **`zagg-benchmark-deploy`** and **`zagg-lambda-release`** roles are created by
+the section-2 stack (`benchmark_cicd.yaml`). Their grants, for reference:
 
 - **`zagg-benchmark-deploy`** (test tier) — update the test function + stage the
   layer:
@@ -363,13 +382,17 @@ A **real public** bucket (readable + **listable** from anywhere — unlike
 directly. Listing lets a user resolve `LAMBDA_VERSION=latest` from
 `versions.json` instead of being pinned to their clone's version.
 
+The section-2 stack creates this bucket (with the public read/list policy + CORS
+rule below) when `CreateDistBucket=true` (the default). One **account-level**
+caveat the stack can't handle: if your account has Block Public Access enabled
+(`aws s3control get-public-access-block --account-id ACCOUNT_ID`), the
+bucket-level setting can't override it — relax it at the account level too, or the
+public policy is silently ineffective.
+
+<details><summary>Manual (raw-CLI) alternative</summary>
+
 ```bash
 aws s3 mb s3://sliderule-public-cors --region us-west-2
-# Relax the BUCKET-level block-public-access, then attach the policy below. NOTE:
-# if your ACCOUNT has Block Public Access enabled (aws s3control
-# get-public-access-block --account-id ACCOUNT_ID), the bucket setting can't
-# override it -- you must relax it at the account level too, or the public policy
-# is silently ineffective.
 aws s3api put-public-access-block --bucket sliderule-public-cors \
   --public-access-block-configuration BlockPublicPolicy=false,RestrictPublicBuckets=false
 aws s3api put-bucket-policy --bucket sliderule-public-cors --policy '{
@@ -391,6 +414,7 @@ aws s3api put-bucket-cors --bucket sliderule-public-cors --cors-configuration '{
   }]
 }'
 ```
+</details>
 
 **Verify** (anonymous read + list both work):
 
@@ -405,7 +429,9 @@ aws s3 cp s3://sliderule-public-cors/versions.json - --no-sign-request   # after
 ## 11. GitHub Environments, variables, and tag protection
 
 The deploy/release jobs read these **variables** (and reuse the section-4
-`EARTHDATA_*` secrets):
+`EARTHDATA_*` secrets). The role ARNs are the section-2 stack's Outputs
+(`DeployRoleArn` / `ReleaseRoleArn`) — paste those rather than hand-building the
+ARNs below:
 
 ```bash
 # Benchmark test-deploy (tier 2)
