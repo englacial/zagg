@@ -1,0 +1,232 @@
+AWSTemplateFormatVersion: "2010-09-09"
+# CI/CD IAM roles + public distribution bucket for the Lambda benchmark + deploy
+# pipeline (issues #110, #25). Kept in its OWN stack (separate from the runtime
+# backend template.yaml) so it rolls back / tears down cleanly and an account
+# admin applies it once. Companion to docs/deployment/benchmark-cicd.md, which
+# also documents the equivalent raw-CLI path.
+#
+# Provisions the THREE GitHub-OIDC roles the workflows assume, plus the public,
+# listable distribution bucket. It does NOT create: the GitHub OIDC provider
+# (already account-global -- referenced by ARN below), the runtime Lambda(s) /
+# their execution roles (template.yaml), the benchmark OUTPUT bucket (the backend
+# stack's OutputBucketName), or any GitHub-side resource (repo vars/secrets, the
+# `benchmarks` branch, the `benchmark` label, the `production` Environment, tag
+# protection) -- those aren't AWS resources. Copy the Outputs into the
+# `gh variable set BENCHMARK_*/LAMBDA_*` step.
+Description: >-
+  zagg CI/CD: GitHub-OIDC roles (benchmark-invoke, test-deploy, release) and the
+  public sliderule-public-cors distribution bucket. See benchmark-cicd.md.
+
+Parameters:
+  GitHubRepo:
+    Type: String
+    Default: englacial/zagg
+    Description: owner/repo whose Actions may assume these roles (the OIDC `sub`).
+
+  BenchmarkFunctionName:
+    Type: String
+    Default: process-shard
+    Description: Stable function the benchmark invokes (and prod deploy target).
+
+  TestFunctionName:
+    Type: String
+    Default: process-shard-test
+    Description: Test function the tier-2 deploy updates + the benchmark invokes.
+
+  BenchmarkStoreBucket:
+    Type: String
+    Default: sliderule-public
+    Description: >-
+      Bucket the orchestrator writes the benchmark output store + the staged test
+      layer (lambda-test/*) into. The invoke + deploy roles are scoped to it.
+
+  DistBucketName:
+    Type: String
+    Default: sliderule-public-cors
+    Description: Public, listable bucket the release distributes the zips to.
+
+  CreateDistBucket:
+    Type: String
+    Default: "true"
+    AllowedValues: ["true", "false"]
+    Description: Create DistBucketName here, or set false to use an existing one.
+
+  BenchmarkInvokeRoleName:
+    Type: String
+    Default: zagg-benchmark
+  DeployRoleName:
+    Type: String
+    Default: zagg-benchmark-deploy
+  ReleaseRoleName:
+    Type: String
+    Default: zagg-lambda-release
+
+Conditions:
+  ShouldCreateDistBucket: !Equals [!Ref CreateDistBucket, "true"]
+
+Resources:
+  # --- public distribution bucket (issue #25 §10) ----------------------------
+  DistBucket:
+    Type: AWS::S3::Bucket
+    Condition: ShouldCreateDistBucket
+    Properties:
+      BucketName: !Ref DistBucketName
+      # Public read is granted by the bucket POLICY below (not ACLs), so the ACL
+      # blocks stay on; only the policy/restrict blocks are relaxed. NOTE: this
+      # can't override ACCOUNT-level Block Public Access -- relax that separately
+      # (see benchmark-cicd.md §10) if enabled.
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        IgnorePublicAcls: true
+        BlockPublicPolicy: false
+        RestrictPublicBuckets: false
+      CorsConfiguration:
+        CorsRules:
+          - AllowedOrigins: ["*"]
+            AllowedMethods: [GET, HEAD]
+            AllowedHeaders: ["*"]
+
+  DistBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Condition: ShouldCreateDistBucket
+    Properties:
+      Bucket: !Ref DistBucket
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: PublicReadList
+            Effect: Allow
+            Principal: "*"
+            Action: [s3:GetObject, s3:ListBucket]
+            Resource:
+              - !Sub "arn:aws:s3:::${DistBucketName}"
+              - !Sub "arn:aws:s3:::${DistBucketName}/*"
+
+  # --- benchmark invoke role (issue #110 §2) ---------------------------------
+  BenchmarkInvokeRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Ref BenchmarkInvokeRoleName
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Federated: !Sub "arn:aws:iam::${AWS::AccountId}:oidc-provider/token.actions.githubusercontent.com"
+            Action: sts:AssumeRoleWithWebIdentity
+            Condition:
+              StringEquals:
+                "token.actions.githubusercontent.com:aud": "sts.amazonaws.com"
+              StringLike:
+                "token.actions.githubusercontent.com:sub": !Sub "repo:${GitHubRepo}:*"
+      Policies:
+        - PolicyName: invoke-and-store
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Sid: InvokeBenchmarkFunctions
+                Effect: Allow
+                Action: [lambda:InvokeFunction, lambda:GetFunctionConfiguration]
+                Resource:
+                  - !Sub "arn:aws:lambda:${AWS::Region}:${AWS::AccountId}:function:${BenchmarkFunctionName}"
+                  - !Sub "arn:aws:lambda:${AWS::Region}:${AWS::AccountId}:function:${TestFunctionName}"
+              - Sid: WriteBenchmarkStore
+                Effect: Allow
+                Action: [s3:PutObject, s3:GetObject, s3:DeleteObject]
+                Resource: !Sub "arn:aws:s3:::${BenchmarkStoreBucket}/*"
+              - Sid: ListBenchmarkStore
+                Effect: Allow
+                Action: s3:ListBucket
+                Resource: !Sub "arn:aws:s3:::${BenchmarkStoreBucket}"
+
+  # --- tier-2 test-deploy role (issue #25 §9) --------------------------------
+  DeployRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Ref DeployRoleName
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Federated: !Sub "arn:aws:iam::${AWS::AccountId}:oidc-provider/token.actions.githubusercontent.com"
+            Action: sts:AssumeRoleWithWebIdentity
+            Condition:
+              StringEquals:
+                "token.actions.githubusercontent.com:aud": "sts.amazonaws.com"
+              StringLike:
+                "token.actions.githubusercontent.com:sub": !Sub "repo:${GitHubRepo}:*"
+      Policies:
+        - PolicyName: deploy-test-function
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Sid: UpdateTestFunction
+                Effect: Allow
+                Action:
+                  - lambda:UpdateFunctionCode
+                  - lambda:UpdateFunctionConfiguration
+                  - lambda:GetFunction
+                  - lambda:GetFunctionConfiguration
+                Resource: !Sub "arn:aws:lambda:${AWS::Region}:${AWS::AccountId}:function:${TestFunctionName}"
+              - Sid: PublishTestLayer
+                Effect: Allow
+                Action: lambda:PublishLayerVersion
+                Resource: !Sub "arn:aws:lambda:${AWS::Region}:${AWS::AccountId}:layer:${TestFunctionName}-deps"
+              - Sid: StageTestLayer
+                Effect: Allow
+                Action: [s3:PutObject, s3:GetObject]
+                Resource: !Sub "arn:aws:s3:::${BenchmarkStoreBucket}/lambda-test/*"
+
+  # --- tier-3 release role (issue #25 §9) ------------------------------------
+  ReleaseRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Ref ReleaseRoleName
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Federated: !Sub "arn:aws:iam::${AWS::AccountId}:oidc-provider/token.actions.githubusercontent.com"
+            Action: sts:AssumeRoleWithWebIdentity
+            Condition:
+              StringEquals:
+                "token.actions.githubusercontent.com:aud": "sts.amazonaws.com"
+              StringLike:
+                "token.actions.githubusercontent.com:sub": !Sub "repo:${GitHubRepo}:*"
+      Policies:
+        - PolicyName: deploy-prod-and-distribute
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Sid: UpdateProdFunction
+                Effect: Allow
+                Action:
+                  - lambda:UpdateFunctionCode
+                  - lambda:UpdateFunctionConfiguration
+                  - lambda:GetFunction
+                  - lambda:GetFunctionConfiguration
+                Resource: !Sub "arn:aws:lambda:${AWS::Region}:${AWS::AccountId}:function:${BenchmarkFunctionName}"
+              - Sid: PublishProdLayer
+                Effect: Allow
+                Action: lambda:PublishLayerVersion
+                Resource: !Sub "arn:aws:lambda:${AWS::Region}:${AWS::AccountId}:layer:${BenchmarkFunctionName}-deps"
+              - Sid: DistributeZips
+                Effect: Allow
+                Action: [s3:PutObject, s3:GetObject]
+                Resource: !Sub "arn:aws:s3:::${DistBucketName}/*"
+
+Outputs:
+  BenchmarkInvokeRoleArn:
+    Description: gh variable set BENCHMARK_ROLE_ARN
+    Value: !GetAtt BenchmarkInvokeRole.Arn
+  DeployRoleArn:
+    Description: gh variable set BENCHMARK_DEPLOY_ROLE_ARN
+    Value: !GetAtt DeployRole.Arn
+  ReleaseRoleArn:
+    Description: gh variable set LAMBDA_RELEASE_ROLE_ARN
+    Value: !GetAtt ReleaseRole.Arn
+  DistBucket:
+    Description: gh variable set LAMBDA_DIST_BUCKET
+    Value: !Ref DistBucketName
