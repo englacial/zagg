@@ -288,3 +288,159 @@ you want the raw artifacts.
   the one bucket prefix.
 - **Rotating creds.** OIDC mints fresh AWS creds per run (nothing to rotate).
   Rotate the `EARTHDATA_*` secrets per your normal policy.
+
+---
+
+# Deploy automation (issue #25)
+
+The benchmark above measures the **deployed** Lambda worker. For a PR's worker
+changes to actually be measured, the PR's code has to be deployed first. This
+second pipeline does that across three tiers:
+
+- **Internal PRs / merges that touch the deployed closure** (`src/zagg/**`,
+  `deployment/aws/**`, `pyproject.toml`) → build arm64 + redeploy a separate
+  `process-shard-test` function, then benchmark against it. Non-affecting changes
+  benchmark the stable function.
+- **Fork PRs** → never redeploy; the benchmark comment is annotated that the
+  numbers reflect the stable worker, not the PR.
+- **Releases (tags)** → update the **production** function in place and publish
+  the zips to a public, listable bucket (`sliderule-public-cors`), replacing the
+  source.coop mirror over a transition window.
+
+This is the **"AWS update for this PR"** step in the rollout order
+(`#112` → benchmark setup → the deploy PR → this). Until these resources +
+variables exist, the deploy/distribute/prod jobs **skip cleanly** — the benchmark
+keeps running against the stable function and releases still attach zips.
+
+## 8. The `process-shard-test` stack
+
+A second copy of the backend stack, named `process-shard-test`, so PR benchmarks
+never touch production. Stand it up **once** (the template already parameterizes
+the function name); subsequent PR deploys only `update-function-code`, no stack
+churn.
+
+```bash
+OUTPUT_BUCKET=sliderule-public \
+STACK_NAME=zagg-backend-test \
+FUNCTION_NAME=process-shard-test \
+  ./deployment/aws/stand_up.sh
+```
+
+(`stand_up.sh` passes `FUNCTION_NAME` to the template's `FunctionName` parameter.)
+Subsequent PR deploys only `update-function-code`, so the stack is stood up once.
+**Verify:** `aws lambda get-function --function-name process-shard-test` returns
+the function.
+
+## 9. Deploy + release IAM roles (OIDC)
+
+Two more roles, both trusting this repo via the OIDC provider from section 1
+(reuse the same `trust.json`):
+
+- **`zagg-benchmark-deploy`** (test tier) — update the test function + stage the
+  layer:
+  - `lambda:UpdateFunctionCode`, `lambda:UpdateFunctionConfiguration`,
+    `lambda:PublishLayerVersion`, `lambda:GetFunction` on `process-shard-test`
+    (+ its `-deps` layer).
+  - `s3:PutObject` on `s3://sliderule-public/lambda-test/*` (the staged layer).
+- **`zagg-lambda-release`** (release tier) — update **production** + publish:
+  - the same `lambda:*` actions on `process-shard` (+ `process-shard-deps`).
+  - `s3:PutObject`/`s3:GetObject` on `s3://sliderule-public-cors/*` (distribute).
+
+**Verify:** `aws iam get-role --role-name zagg-benchmark-deploy` /
+`zagg-lambda-release`.
+
+> The release role can mutate production, so gate it (section 11) — don't rely on
+> the trust policy alone.
+
+## 10. The `sliderule-public-cors` distribution bucket
+
+A **real public** bucket (readable + **listable** from anywhere — unlike
+`s3://sliderule-public`, which is cryocloud-only and no-list), in **us-west-2**
+(CloudFormation reads Lambda code same-region) so `stand_up.sh` can fetch it
+directly. Listing lets a user resolve `LAMBDA_VERSION=latest` from
+`versions.json` instead of being pinned to their clone's version.
+
+```bash
+aws s3 mb s3://sliderule-public-cors --region us-west-2
+# Disable the account block-public-access for this bucket, then:
+aws s3api put-public-access-block --bucket sliderule-public-cors \
+  --public-access-block-configuration BlockPublicPolicy=false,RestrictPublicBuckets=false
+aws s3api put-bucket-policy --bucket sliderule-public-cors --policy '{
+  "Version": "2012-10-17",
+  "Statement": [{
+    "Sid": "PublicReadList",
+    "Effect": "Allow",
+    "Principal": "*",
+    "Action": ["s3:GetObject", "s3:ListBucket"],
+    "Resource": ["arn:aws:s3:::sliderule-public-cors",
+                 "arn:aws:s3:::sliderule-public-cors/*"]
+  }]
+}'
+aws s3api put-bucket-cors --bucket sliderule-public-cors --cors-configuration '{
+  "CORSRules": [{
+    "AllowedOrigins": ["*"],
+    "AllowedMethods": ["GET", "HEAD"],
+    "AllowedHeaders": ["*"]
+  }]
+}'
+```
+
+**Verify** (anonymous read + list both work):
+
+```bash
+aws s3 ls s3://sliderule-public-cors/ --no-sign-request
+aws s3 cp s3://sliderule-public-cors/versions.json - --no-sign-request   # after the first release
+```
+
+> The bucket must be in the same region as the **production** Lambda — the
+> release job's `publish-layer-version` reads the layer zip from it in-region.
+
+## 11. GitHub Environments, variables, and tag protection
+
+The deploy/release jobs read these **variables** (and reuse the section-4
+`EARTHDATA_*` secrets):
+
+```bash
+# Benchmark test-deploy (tier 2)
+gh variable set BENCHMARK_DEPLOY_ROLE_ARN    --body "arn:aws:iam::ACCOUNT_ID:role/zagg-benchmark-deploy"
+gh variable set BENCHMARK_TEST_FUNCTION_NAME --body "process-shard-test"
+gh variable set BENCHMARK_TEST_STAGE_BUCKET  --body "sliderule-public"
+# Release (tier 3)
+gh variable set LAMBDA_RELEASE_ROLE_ARN   --body "arn:aws:iam::ACCOUNT_ID:role/zagg-lambda-release"
+gh variable set LAMBDA_PROD_FUNCTION_NAME --body "process-shard"
+gh variable set LAMBDA_DIST_BUCKET        --body "sliderule-public-cors"
+gh variable set LAMBDA_AWS_REGION         --body "us-west-2"
+```
+
+Protect the production deploy:
+
+- **`production` Environment** (Settings → Environments → New → `production`) with
+  a **required reviewer** — the release workflow's `deploy-prod` job waits for an
+  approval before it mutates the live function.
+- **Tag protection** for `*.*.*` so only maintainers can cut a release (a tag is
+  what triggers the prod deploy + PyPI publish).
+
+**Verify:** `gh variable list` shows the seven new vars; the Environments page
+shows `production` with a reviewer.
+
+## 12. Verify the deploy tiers
+
+1. **Tier 2.** Open an internal PR that edits `src/zagg/processing/` — the
+   benchmark run should include a `deploy-test` job and the comment should have no
+   stale-worker banner. A docs-only PR should skip the deploy and (correctly) show
+   no banner either.
+2. **Tier 1.** On a fork PR that touches `src/zagg/`, a maintainer `/benchmark` →
+   the comment carries the **"worker = stable `main`"** banner.
+3. **Tier 3.** Cut a pre-release tag → the GitHub release gets the four zips
+   attached, `s3://sliderule-public-cors/<minor>/` is populated with a
+   `versions.json`, and (after the `production` approval) `process-shard` is
+   updated. `LAMBDA_VERSION=latest ./stand_up.sh` then resolves the new minor.
+
+## Distribution transition (source.coop → CORS bucket)
+
+`stand_up.sh` now prefers `sliderule-public-cors` and **falls back to the
+source.coop mirror** for any minor not yet on the new bucket — so older standups
+keep working while new releases populate the new bucket. Once enough releases have
+published to the CORS bucket, retire the source.coop mirror (and its
+`publish_mirror.sh` step) in a follow-up. Set `LAMBDA_VERSION=latest` to always
+pull the newest published minor.
