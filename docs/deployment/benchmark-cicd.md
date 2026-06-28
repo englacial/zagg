@@ -339,11 +339,14 @@ Two more roles, both trusting this repo via the OIDC provider from section 1
 - **`zagg-benchmark-deploy`** (test tier) — update the test function + stage the
   layer:
   - `lambda:UpdateFunctionCode`, `lambda:UpdateFunctionConfiguration`,
-    `lambda:PublishLayerVersion`, `lambda:GetFunction` on `process-shard-test`
-    (+ its `-deps` layer).
+    `lambda:PublishLayerVersion`, `lambda:GetFunction`,
+    `lambda:GetFunctionConfiguration` on `process-shard-test` (+ its `-deps`
+    layer). `GetFunctionConfiguration` is required: `deploy_lambda.sh` calls
+    `aws lambda wait function-updated`, whose waiter polls it.
   - `s3:PutObject` on `s3://sliderule-public/lambda-test/*` (the staged layer).
 - **`zagg-lambda-release`** (release tier) — update **production** + publish:
-  - the same `lambda:*` actions on `process-shard` (+ `process-shard-deps`).
+  - the same five `lambda:*` actions (incl. `lambda:GetFunctionConfiguration`)
+    on `process-shard` (+ `process-shard-deps`).
   - `s3:PutObject`/`s3:GetObject` on `s3://sliderule-public-cors/*` (distribute).
 
 **Verify:** `aws iam get-role --role-name zagg-benchmark-deploy` /
@@ -362,7 +365,11 @@ directly. Listing lets a user resolve `LAMBDA_VERSION=latest` from
 
 ```bash
 aws s3 mb s3://sliderule-public-cors --region us-west-2
-# Disable the account block-public-access for this bucket, then:
+# Relax the BUCKET-level block-public-access, then attach the policy below. NOTE:
+# if your ACCOUNT has Block Public Access enabled (aws s3control
+# get-public-access-block --account-id ACCOUNT_ID), the bucket setting can't
+# override it -- you must relax it at the account level too, or the public policy
+# is silently ineffective.
 aws s3api put-public-access-block --bucket sliderule-public-cors \
   --public-access-block-configuration BlockPublicPolicy=false,RestrictPublicBuckets=false
 aws s3api put-bucket-policy --bucket sliderule-public-cors --policy '{
