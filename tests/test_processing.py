@@ -3000,6 +3000,17 @@ class TestExpandMaskToBase:
         with pytest.raises(ValueError, match="less than index_base"):
             _expand_mask_to_base(coarse, ibeg, cnt, index_base=1, total_base_size=3)
 
+    def test_empty_parent_skipped_index_base_1(self):
+        # Issue #116 twin: an empty parent (``ph_index_beg == 0, cnt == 0``)
+        # under ``index_base=1`` must be skipped, not raise on ``beg = -1`` --
+        # the same fix applied to ``_broadcast_segment_to_base``. A non-empty
+        # parent with ``beg < 0`` still raises (covered by ``test_negative_beg``).
+        coarse = np.array([True, True, True])
+        ibeg = np.array([1, 0, 3])  # middle parent is an empty (ph_index_beg == 0)
+        cnt = np.array([2, 0, 2])
+        out = _expand_mask_to_base(coarse, ibeg, cnt, index_base=1, total_base_size=4)
+        np.testing.assert_array_equal(out, [True, True, True, True])
+
 
 class TestReadGroupCrossLevel:
     """Phase B: cross-level filters expand coarse verdicts to base-rate rows."""
@@ -3604,6 +3615,21 @@ class TestSegmentLevelVariables:
         out = _broadcast_segment_to_base(seg, ibeg, cnt, index_base=1, total_base_size=4)
         assert out.tolist() == [10.0, 10.0, 20.0, 20.0]
 
+    def test_broadcast_skips_empty_segments_index_base_1(self):
+        # Issue #116: real ATL03 marks empty segments with ``ph_index_beg == 0,
+        # cnt == 0``. Under ``index_base=1`` that gave ``beg = 0 - 1 = -1`` and
+        # raised, dropping every photon in the gain_bias dem_h broadcast. The
+        # empties must now be skipped (cover no photons) and the non-empty
+        # segments still land their value on the right photons.
+        seg = np.array([10.0, 0.0, 20.0, 0.0, 30.0], dtype=np.float32)
+        ibeg = np.array([1, 0, 3, 0, 5])  # 1-based; empties carry ph_index_beg == 0
+        cnt = np.array([2, 0, 2, 0, 2])
+        out = _broadcast_segment_to_base(seg, ibeg, cnt, index_base=1, total_base_size=6)
+        assert out.tolist() == [10.0, 10.0, 20.0, 20.0, 30.0, 30.0]
+        # Equals np.repeat over the non-empty segments only.
+        nonempty = cnt > 0
+        assert out.tolist() == np.repeat(seg[nonempty], cnt[nonempty]).tolist()
+
     def _data_source(self):
         return {
             "coordinates": {"latitude": "/lat", "longitude": "/lon"},
@@ -3688,6 +3714,83 @@ class TestSegmentLevelVariables:
         assert df["h"].tolist() == [2.0, 3.0, 4.0, 5.0]
         assert df["dem_h"].tolist() == [200.0, 200.0, 300.0, 300.0]
 
+    def _atl03_like_data_source(self, *, with_dem_h):
+        # A realistic ATL03-style segment table (index_base=1) used for the
+        # gain_bias-vs-tdigest parity regression (issue #116). When
+        # ``with_dem_h`` is set, the segments level declares the dem_h broadcast
+        # (the gain_bias config); otherwise the level carries no readable
+        # variables (the tdigest config). Everything else is identical.
+        ds = {
+            "coordinates": {"latitude": "/lat", "longitude": "/lon"},
+            "variables": {"h": "/h"},
+            "base_level": "photons",
+            "levels": {
+                "photons": {
+                    "path": "/heights",
+                    "coordinates": ["lat", "lon"],
+                    "variables": ["h"],
+                    "link": None,
+                },
+                "segments": {
+                    "path": "/geolocation",
+                    "coordinates": [],
+                    "variables": ({"dem_h": "/dem_h"} if with_dem_h else {}),
+                    "link": {
+                        "to": "photons",
+                        "index_beg": "/ph_index_beg",
+                        "count": "/segment_ph_cnt",
+                        "index_base": 1,  # ATL03 ph_index_beg is 1-based
+                    },
+                },
+            },
+        }
+        return ds
+
+    def _atl03_like_h5(self):
+        # 4 segments x 2 photons = 8 photons, but with two EMPTY segments
+        # interspersed (ph_index_beg == 0, cnt == 0) -- exactly how real ATL03
+        # marks segments with no photons (issue #116). Non-empty segments are
+        # 1-based contiguous: seg0 -> photons 1-2, seg2 -> 3-4, seg4 -> 5-6,
+        # seg5 -> 7-8. The first non-empty run does NOT need to start at file
+        # index 0 in spirit; empties are scattered so the broadcast must skip
+        # them rather than place at beg = 0 - 1 = -1.
+        return _FakeH5(
+            {
+                "/lat": np.arange(8.0),
+                "/lon": np.arange(8.0),
+                "/h": np.arange(8.0, dtype=np.float32),
+                # 6 segments: indices 1 and 3 are empties.
+                "/ph_index_beg": np.array([1, 0, 3, 0, 5, 7]),
+                "/segment_ph_cnt": np.array([2, 0, 2, 0, 2, 2]),
+                "/dem_h": np.array([10.0, 0.0, 20.0, 0.0, 30.0, 40.0], dtype=np.float32),
+            }
+        )
+
+    def test_gain_bias_reads_same_obs_as_tdigest_with_empty_segments(self):
+        # Issue #116 regression: on the same shard/photons and an ATL03-style
+        # segment table with empty segments (index_base=1), the gain_bias-style
+        # data source (segment dem_h broadcast) must read the SAME observation
+        # count as the tdigest-style one (no broadcast) -- the unit analogue of
+        # the observed "gain_bias 0 vs tdigest 20,710" drop. Before the fix the
+        # broadcast raised on the first empty segment, returning 0 rows.
+        tdigest = _read_group(
+            self._atl03_like_h5(),
+            "gt1l",
+            self._atl03_like_data_source(with_dem_h=False),
+            0,
+            _ShardGrid(),
+        )
+        gain_bias = _read_group(
+            self._atl03_like_h5(),
+            "gt1l",
+            self._atl03_like_data_source(with_dem_h=True),
+            0,
+            _ShardGrid(),
+        )
+        assert len(gain_bias) == len(tdigest) == 8
+        # Each photon carries its own (non-empty) segment's dem_h.
+        assert gain_bias["dem_h"].tolist() == [10.0, 10.0, 20.0, 20.0, 30.0, 30.0, 40.0, 40.0]
+
     def test_planned_partial_read_aligns_dem_h(self):
         # Partial read plan (NOT a full read): the bbox selects only segments
         # 1-2 (photons 2..5). Each selected photon must carry its own segment's
@@ -3700,6 +3803,42 @@ class TestSegmentLevelVariables:
         grid = _LatBboxGrid((-0.1, 100.0, 0.1, 250.0))
         df = _read_group(h5, "gt1l", ds, 0, grid)
         # Planned path selects photons 2,3 (seg 1) and 4,5 (seg 2).
+        assert df["h"].tolist() == [20.0, 30.0, 40.0, 50.0]
+        assert df["dem_h"].tolist() == [20.0, 20.0, 30.0, 30.0]
+
+    def test_planned_read_skips_empty_segments_index_base_1(self):
+        # Issue #116 regression on the PLANNED path: an ATL03-style table with
+        # an empty segment (ph_index_beg == 0, cnt == 0) under index_base=1 must
+        # not raise in the dem_h broadcast. The planned broadcast iterates the
+        # FULL segment table (then subsets by seg_global_idx), so the empty must
+        # be skipped just like the full path. The bbox selects a run that does
+        # not start at file index 0.
+        ds = _planned_read_data_source()
+        ds["levels"]["segments"]["link"]["index_base"] = 1
+        ds["levels"]["segments"]["variables"] = {"dem_h": "/seg/dem_h"}
+        # Six segments, one EMPTY (index 2). Non-empty segments tile the 10
+        # photons 1-based contiguously: seg0 -> ph 1-2, seg1 -> 3-4, seg3 -> 5-6,
+        # seg4 -> 7-8, seg5 -> 9-10. dem_h carries a marker for the empty.
+        seg_lats = np.array([0.0, 100.0, 200.0, 300.0, 400.0, 500.0])
+        ph_lats = np.array([0.0, 50.0, 100.0, 150.0, 200.0, 250.0, 300.0, 350.0, 400.0, 450.0])
+        h5 = _FakeH5(
+            {
+                "/seg/lat": seg_lats,
+                "/seg/lon": np.zeros(6),
+                "/seg/ph_index_beg": np.array([1, 3, 0, 5, 7, 9], dtype=np.int64),
+                "/seg/segment_ph_cnt": np.array([2, 2, 0, 2, 2, 2], dtype=np.int64),
+                "/seg/dem_h": np.array([10.0, 20.0, -1.0, 30.0, 40.0, 50.0], dtype=np.float32),
+                "/heights/lat_ph": ph_lats,
+                "/heights/lon_ph": np.zeros(10),
+                "/heights/h": np.arange(10.0, dtype=np.float32) * 10.0,
+            }
+        )
+        # Select segments 1 and 3 (photons 3-4 and 5-6) -- a run starting past
+        # file index 0, straddling the empty segment 2.
+        grid = _LatBboxGrid((-0.1, 100.0, 0.1, 300.0))
+        df = _read_group(h5, "gt1l", ds, 0, grid)
+        # seg1 (lat 100) -> photons 2,3 (h 20,30); seg3 (lat 300) -> photons 4,5
+        # (h 40,50). Each photon carries its own segment's dem_h (20 then 30).
         assert df["h"].tolist() == [20.0, 30.0, 40.0, 50.0]
         assert df["dem_h"].tolist() == [20.0, 20.0, 30.0, 30.0]
 
@@ -4493,5 +4632,8 @@ class TestProcessShardCacheRelease:
         closes = [e for e in log if e[0] == "close"]
         # close() fired exactly once despite the read raising — the finally ran.
         assert len(closes) == 1
-        # No data survived the failed read, so the shard reports the empty path.
-        assert meta["error"] == "No data after filtering"
+        # A raised read is a real error, NOT a legitimately-empty read (issue
+        # #116): the shard reports the read-error path and counts the failure,
+        # rather than the misleading "No data after filtering".
+        assert meta["error"] == "All group reads raised (1 read errors)"
+        assert meta["read_errors"] == 1
