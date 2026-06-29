@@ -1,0 +1,81 @@
+# ATL03 photon-height scalar template (HEALPix, multi-chunk-per-worker).
+#
+# Purely SCALAR per-cell stats over photon heights (h_ph): count, min, max, and
+# variance -- no vector and no ragged field. Every field is a pure (unweighted)
+# group reduction in ``_KERNEL_FUNCS`` (len/min/max/var), so this config is the
+# one that the experimental ``handoff="arrow-kernel"`` Acero hash-aggregate
+# reducer can run end-to-end. It exists purely to benchmark the per-cell handoff
+# (issue #130): the SAME config + SAME shard is dispatched three times --
+# pandas / arrow / arrow-kernel -- to isolate the Arrow carrier cost and the
+# kernel reducer's speedup + accuracy (pandas==arrow byte-identical; arrow-kernel
+# within KERNEL_RTOL). See the ``provisional_targets`` block in targets.json.
+#
+# data_source / read_plan / grid match atl03_tdigest_healpix_o11.yaml exactly
+# (the segment->photon planned IO of issue #43 applies here too); only the
+# aggregation differs -- scalar-only so arrow-kernel is applicable.
+data_source:
+  reader: h5coro
+  driver: s3
+  groups: [gt1l, gt1r, gt2l, gt2r, gt3l, gt3r]
+  coordinates:
+    latitude: "/{group}/heights/lat_ph"
+    longitude: "/{group}/heights/lon_ph"
+  variables:
+    h_ph: "/{group}/heights/h_ph"
+  filters:
+    - dataset: "/{group}/heights/signal_conf_ph"
+      column: 0                  # land surface type; TEP is uniform across columns
+      op: ne
+      value: -2
+  base_level: photons
+  levels:
+    photons:
+      path: "/{group}/heights"
+      coordinates: {latitude: lat_ph, longitude: lon_ph}
+      link: null
+    segments:
+      path: "/{group}/geolocation"
+      coordinates: {latitude: reference_photon_lat, longitude: reference_photon_lon}
+      link:
+        to: photons
+        index_beg: "/{group}/geolocation/ph_index_beg"
+        count: "/{group}/geolocation/segment_ph_cnt"
+        index_base: 1            # ATL03 ph_index_beg is 1-based per the v3 dict
+  read_plan:
+    spatial_index: segments
+    pad: 1                       # one segment of padding on each side per #43
+
+aggregation:
+  coordinates:
+    cell_ids:
+      dtype: uint64
+      fill_value: 0
+    morton:
+      dtype: uint64
+      fill_value: 0
+  variables:
+    count:
+      function: len
+      source: h_ph
+      dtype: int32
+      fill_value: 0
+    h_min:
+      function: min
+      source: h_ph
+      dtype: float32
+    h_max:
+      function: max
+      source: h_ph
+      dtype: float32
+    h_variance:
+      function: var
+      source: h_ph
+      dtype: float32
+
+output:
+  grid:
+    type: healpix
+    indexing_scheme: nested
+    parent_order: 11             # shard / dispatch unit: 4^(19-11) = 256x256 cells
+    chunk_inner: 13              # inner Zarr chunk: 4^(19-13) = 64x64 cells (K=16 per shard)
+    child_order: 19              # leaf cell resolution (~10 m)
