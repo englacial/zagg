@@ -78,7 +78,10 @@ def _expand_mask_to_base(
         # ``count == 0`` AND ``ph_index_beg == 0`` (issue #116), so under
         # ``index_base=1`` they would otherwise give ``beg = 0 - 1 = -1`` and
         # raise below; skip them, mirroring the non-empty-only contract
-        # ``read_plan.plan_read`` already uses (its ``cnt > 0`` skip).
+        # ``read_plan.plan_read`` already uses (its ``cnt > 0`` skip). Skipping
+        # intentionally bypasses the ``beg < 0`` validation for these parents --
+        # correct, since they map to zero base rows (a non-empty parent with
+        # ``beg < 0`` still raises).
         if cnt == 0:
             continue
         beg = int(index_beg_arr[p]) - index_base
@@ -143,7 +146,10 @@ def _broadcast_segment_to_base(
         # ``count == 0`` AND ``ph_index_beg == 0`` (issue #116, see
         # ``read_plan.plan_read``'s ``cnt > 0`` skip); under ``index_base=1``
         # that gives ``beg = 0 - 1 = -1`` and would raise below, which is what
-        # made the gain_bias dem_h broadcast drop every photon. Skip them.
+        # made the gain_bias dem_h broadcast drop every photon. Skip them; this
+        # intentionally bypasses the ``beg < 0`` / ``beg + cnt > base`` checks
+        # for empties (they map to zero base rows). A non-empty segment with
+        # ``beg < 0`` or an over-extending range still raises below.
         if cnt == 0:
             continue
         beg = int(index_beg_arr[p]) - index_base

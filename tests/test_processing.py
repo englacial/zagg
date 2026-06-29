@@ -4635,5 +4635,5 @@ class TestProcessShardCacheRelease:
         # A raised read is a real error, NOT a legitimately-empty read (issue
         # #116): the shard reports the read-error path and counts the failure,
         # rather than the misleading "No data after filtering".
-        assert meta["error"] == "All group reads raised (1 read errors)"
+        assert meta["error"] == "No data after filtering (1 group reads raised)"
         assert meta["read_errors"] == 1
