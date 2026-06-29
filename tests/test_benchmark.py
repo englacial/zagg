@@ -642,3 +642,5 @@ def test_make_figure_cost_scatter_drawn_above_runtime_line(tmp_path, monkeypatch
     (twin,) = [ax for ax in fig.axes if ax is not panel and ax.bbox.bounds == panel.bbox.bounds]
     assert panel.get_zorder() > twin.get_zorder()  # cost circles render over the runtime line
     assert panel.patch.get_visible() is False  # so the runtime line shows through gaps
+    scatter = next(c for c in panel.collections if isinstance(c, PathCollection))
+    assert list(scatter.get_sizes()) == [90]  # marker bumped one size up
