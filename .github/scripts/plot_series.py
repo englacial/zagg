@@ -15,15 +15,41 @@ from __future__ import annotations
 
 import argparse
 import math
+import sys
 from pathlib import Path
 
 import pandas as pd
+
+# Allow ``import bench_metrics`` whether run as a script or imported by tests.
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import bench_metrics  # noqa: E402
 
 # Cost metric -> (column, human label) for the two retained-series figures.
 FIGURES = {
     "cost_per_shard": ("cost_per_shard_usd", "cost / shard (USD)"),
     "cost_per_100km2": ("cost_per_100km2_usd", "cost / 100 km² (USD)"),
 }
+
+# green->red colormap for memory headroom (issue #120): 0% of the cap reads
+# green, the OOM wall reads red. ``_r`` flips the stock green->red ramp.
+MEMORY_CMAP = "RdYlGn_r"
+
+
+def memory_fractions(sub: pd.DataFrame) -> list[float | None]:
+    """Per-row memory headroom as a fraction of the Lambda cap (issue #120).
+
+    ``max_memory_mb / (memory_gb * 1024)`` via the shared ``bench_metrics``
+    helper, so a row missing either column degrades to ``None`` (plotted as an
+    uncoloured marker) instead of crashing the render.
+    """
+    cols = sub.columns
+    return [
+        bench_metrics.memory_pct_of_cap(
+            row["max_memory_mb"] if "max_memory_mb" in cols else None,
+            row["memory_gb"] if "memory_gb" in cols else None,
+        )
+        for _, row in sub.iterrows()
+    ]
 
 
 def _merge_history(df: pd.DataFrame) -> pd.DataFrame:
@@ -41,6 +67,8 @@ def make_figure(df: pd.DataFrame, cost_col: str, cost_label: str, out_png: Path)
 
     matplotlib.use("Agg")  # headless CI
     import matplotlib.pyplot as plt
+    from matplotlib.cm import ScalarMappable
+    from matplotlib.colors import Normalize
 
     hist = _merge_history(df)
     if hist.empty:
@@ -54,17 +82,36 @@ def make_figure(df: pd.DataFrame, cost_col: str, cost_label: str, out_png: Path)
     nrows = math.ceil(n / ncols)
     fig, axes = plt.subplots(nrows, ncols, figsize=(7 * ncols, 3.2 * nrows), squeeze=False)
 
+    # Fixed [0, 1] normalisation so colour means the same fraction-of-cap in
+    # every panel and across both figures -- 1.0 (red) is the OOM wall.
+    norm = Normalize(vmin=0.0, vmax=1.0)
+
     for i, target in enumerate(targets):
         ax = axes[i // ncols][i % ncols]
         sub = hist[hist["target"] == target]
-        x = range(len(sub))
+        x = list(range(len(sub)))
         labels = [str(c)[:7] for c in sub["commit"]]
 
-        ax.plot(x, sub[cost_col], "o-", color="C0", label=cost_label)
+        # Connecting line stays cost-blue; the markers carry the memory signal
+        # (colour = % of the Lambda memory cap, green->red). Rows missing memory
+        # plot uncoloured (grey) rather than dropping out.
+        fracs = memory_fractions(sub)
+        ax.plot(x, sub[cost_col], "-", color="C0", zorder=1, label=cost_label)
+        ax.scatter(
+            x,
+            sub[cost_col],
+            c=[f if f is not None else float("nan") for f in fracs],
+            cmap=MEMORY_CMAP,
+            norm=norm,
+            edgecolors="C0",
+            linewidths=0.6,
+            zorder=2,
+            plotnonfinite=True,
+        )
         ax.set_ylabel(cost_label, color="C0")
         ax.tick_params(axis="y", labelcolor="C0")
         ax.set_title(target, fontsize=10)
-        ax.set_xticks(list(x))
+        ax.set_xticks(x)
         ax.set_xticklabels(labels, rotation=45, ha="right", fontsize=7)
 
         rt = ax.twinx()
@@ -76,10 +123,14 @@ def make_figure(df: pd.DataFrame, cost_col: str, cost_label: str, out_png: Path)
     for j in range(n, nrows * ncols):
         axes[j // ncols][j % ncols].axis("off")
 
+    # One shared colorbar for the memory scale (issue #120).
+    sm = ScalarMappable(norm=norm, cmap=MEMORY_CMAP)
+    cbar = fig.colorbar(sm, ax=axes.ravel().tolist(), fraction=0.025, pad=0.02)
+    cbar.set_label("peak memory (% of cap)")
+
     fig.suptitle(f"zagg Lambda benchmark — {cost_label} vs merge history")
-    fig.tight_layout(rect=(0, 0, 1, 0.97))
     out_png.parent.mkdir(parents=True, exist_ok=True)
-    fig.savefig(out_png, dpi=120)
+    fig.savefig(out_png, dpi=120, bbox_inches="tight")
     plt.close(fig)
     return True
 

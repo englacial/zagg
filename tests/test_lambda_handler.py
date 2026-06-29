@@ -132,6 +132,17 @@ class TestProcessEventDispatch:
         assert resp["statusCode"] == 200
         assert captured["shard_key"] == 12345
 
+    def test_body_reports_max_memory_mb(self, handler_mod, monkeypatch):
+        """Issue #120: every successful invocation stamps a positive
+        ``max_memory_mb`` (the worker's peak RSS) into the result body so the
+        orchestrator can roll up OOM-proximity without CloudWatch access."""
+        event = _base_event(_healpix_config_dict())
+        event["child_order"] = 12
+        resp, _ = self._run(handler_mod, monkeypatch, event)
+        body = json.loads(resp["body"])
+        assert isinstance(body["max_memory_mb"], float)
+        assert body["max_memory_mb"] > 0.0
+
 
 class TestProcessEventWriteLoop:
     """Issue #82 phase 7: the handler drives ``process_shard`` with a
