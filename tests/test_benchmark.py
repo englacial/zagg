@@ -500,10 +500,11 @@ def test_make_figure_null_memory_renders_uncoloured(tmp_path):
     assert out.exists()
 
 
-def test_make_figure_shared_x_and_circle_runtime(tmp_path, monkeypatch):
+def test_make_figure_circle_runtime_and_bottom_row_labels(tmp_path, monkeypatch):
     # The benchmark-plot polish (PR #123 fold of #125's chart): runtime markers
     # are circles (not squares) so the memory-coloured cost marker shows through,
-    # and the x-axis is shared so only the bottom-row panels carry commit labels.
+    # and only the bottom-row panels carry commit labels -- the upper rows are
+    # blanked by hand (``tick_params(labelbottom=False)``), not a shared x-axis.
     pytest.importorskip("matplotlib")
     import matplotlib
 
@@ -528,8 +529,8 @@ def test_make_figure_shared_x_and_circle_runtime(tmp_path, monkeypatch):
     markers = [ln.get_marker() for ax in fig.axes for ln in ax.get_lines()]
     assert "o" in markers and "s" not in markers
 
-    # Shared x-axis: only the bottom-row panels show tick labels; the top row's
-    # are empty (the panels carry the same merge points beneath them).
+    # Only the bottom-row panels show tick labels; the top row's are hidden so the
+    # commit labels aren't repeated up the grid.
     base = [ax for ax in fig.axes if ax.get_title()]  # the 4 panels (twins/cbar have no title)
     base.sort(key=lambda ax: ax.get_subplotspec().rowspan.start)
     top, bottom = base[:2], base[2:]
@@ -538,10 +539,11 @@ def test_make_figure_shared_x_and_circle_runtime(tmp_path, monkeypatch):
 
 
 def test_make_figure_uneven_commit_sets_label_per_panel(tmp_path, monkeypatch):
-    # Regression for the per-target x-label misalignment class (fixed in c7d7080):
-    # when targets share x but have *different* commit sets (one missing an early
-    # merge), each bottom panel must carry ITS OWN commits in order -- not another
-    # panel's labels. A uniform-commit fixture can't catch this; an uneven one can.
+    # Regression for the per-target x-label misalignment class: when targets have
+    # *different* commit sets (some missing an early merge), each bottom panel must
+    # carry ITS OWN commits in order -- not another panel's labels. A uniform-commit
+    # fixture can't catch this. Four targets -> a 2x2 grid, so this also exercises
+    # the row-hiding pass (top row blanked, bottom row labelled).
     pytest.importorskip("matplotlib")
     import matplotlib
 
@@ -552,13 +554,18 @@ def test_make_figure_uneven_commit_sets_label_per_panel(tmp_path, monkeypatch):
     captured = {}
     monkeypatch.setattr(plt, "close", lambda fig: captured.setdefault("fig", fig))
 
-    # Two targets in one column-pair. ``_rec_row`` derives the timestamp from the
-    # commit-name length, so name lengths set the merge order. ``early`` has 3
-    # points; ``late`` skipped the first merge and has only 2.
-    early = [_rec_row(c, "t_early") for c in ("a", "bb", "ccc")]
-    late = [_rec_row(c, "t_late") for c in ("dd", "eee")]  # missing the len-1 merge
+    # ``_rec_row`` derives the timestamp from the commit-name length, so name
+    # lengths set the merge order. The four targets carry deliberately uneven
+    # commit sets; sorted alphabetically they fill the grid as
+    # t1 t2 / t3 t4, so t3/t4 are the labelled bottom row.
+    rows = (
+        [_rec_row(c, "t1") for c in ("a", "bb", "ccc")]
+        + [_rec_row(c, "t2") for c in ("dd", "eee")]  # missing the earliest merge
+        + [_rec_row(c, "t3") for c in ("f", "gg")]
+        + [_rec_row(c, "t4") for c in ("h", "ii", "jjj", "kkkk")]
+    )
     series = tmp_path / "series.parquet"
-    update_series.save_series(update_series.records_to_frame(early + late), series)
+    update_series.save_series(update_series.records_to_frame(rows), series)
     out = tmp_path / "fig.png"
     assert plot_series.make_figure(
         update_series.load_series(series), "cost_per_shard_usd", "c", out
@@ -566,6 +573,40 @@ def test_make_figure_uneven_commit_sets_label_per_panel(tmp_path, monkeypatch):
     fig = captured["fig"]
 
     panels = {ax.get_title(): ax for ax in fig.axes if ax.get_title()}
-    # n=2 -> single row, so both panels are "bottom" and carry their own labels.
-    assert [t.get_text() for t in panels["t_early"].get_xticklabels()] == ["a", "bb", "ccc"]
-    assert [t.get_text() for t in panels["t_late"].get_xticklabels()] == ["dd", "eee"]
+    # Top row (t1, t2) is hidden; the bottom row carries each panel's own commits.
+    assert not any(t.get_text() for t in panels["t1"].get_xticklabels())
+    assert not any(t.get_text() for t in panels["t2"].get_xticklabels())
+    assert [t.get_text() for t in panels["t3"].get_xticklabels()] == ["f", "gg"]
+    assert [t.get_text() for t in panels["t4"].get_xticklabels()] == ["h", "ii", "jjj", "kkkk"]
+
+
+def test_make_figure_colorbar_has_mb_twin_axis(tmp_path, monkeypatch):
+    # The colorbar carries a second axis reading the same scale in absolute MB
+    # (issue #120 polish): MB = fraction-of-cap * cap_mb. cap_mb = 2 GB here, so a
+    # marker at 1536/2048 = 0.75 of cap must read 1536 MB on the twin axis.
+    pytest.importorskip("matplotlib")
+    import matplotlib
+
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+    import plot_series
+
+    captured = {}
+    monkeypatch.setattr(plt, "close", lambda fig: captured.setdefault("fig", fig))
+
+    rows = [_rec_row("c0", "t1", mem=1024.0), _rec_row("c1", "t1", mem=1536.0)]
+    series = tmp_path / "series.parquet"
+    update_series.save_series(update_series.records_to_frame(rows), series)
+    out = tmp_path / "fig.png"
+    assert plot_series.make_figure(
+        update_series.load_series(series), "cost_per_shard_usd", "c", out
+    )
+    fig = captured["fig"]
+
+    # The colorbar axes own one secondary (child) axis; its forward transform maps
+    # a fraction-of-cap to MB.
+    cbar_ax = next(ax for ax in fig.axes if ax.get_xlabel() == "peak memory (% of cap)")
+    (mb_ax,) = cbar_ax.child_axes
+    assert mb_ax.get_xlabel() == "peak memory (MB)"
+    fwd = mb_ax._functions[0]
+    assert fwd(0.75) == pytest.approx(1536.0)  # 0.75 * 2 GB cap
