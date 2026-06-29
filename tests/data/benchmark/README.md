@@ -14,7 +14,8 @@ the matrix from here.
 | `targets.json` | the matrix: the list of targets + the shared shard maps and their pinned densest shard |
 | `configs/*.yaml` | one pipeline config per target (data_source + aggregation + `output.grid`) |
 | `shardmaps/*.json` | one shard map per `(grid, order)` — **shared** by both aggregators on that grid |
-| `AOP_NEON.geojson` | the AOI (NEON SERC AOP box) every shard map is built over |
+| `AOP_NEON.geojson` | the **default** AOI (NEON SERC AOP box) shard maps are built over |
+| `antarctic_88s.geojson` | a non-default AOI near the ±88° turning latitude, for an override 88°S stress target (issue #121) |
 
 The workflow calls `run_benchmark.py --targets tests/data/benchmark/targets.json`,
 which loads `targets.json` and dispatches **one shard per target** (the pinned
@@ -92,6 +93,58 @@ aggregator).
 
    `test_targets_manifest_consistent` re-derives the densest shard from the
    committed map and fails if the pinned `shard_key`/`n_granules` is stale.
+
+## Add a target over a different AOI (latitude sweep / polar stress)
+
+The default AOI is NEON SERC. To benchmark a **different** AOI — runtime vs.
+latitude, or the `antarctic_88s.geojson` 88°S stress target — give that shard map
+its own `aoi`/`temporal`/`cmr` *override*; absent keys fall back to the
+top-level default (issue #121).
+
+1. **AOI geojson** — drop the polygon under this directory (e.g.
+   `antarctic_88s.geojson`, already shipped). HEALPix is CRS-agnostic, so it is
+   the simplest grid for a clean latitude sweep; a rectilinear analog at high
+   latitude needs a polar CRS (e.g. `EPSG:3031`) in its config.
+
+2. **Build the shard map over that AOI** — point `--polygon` at the new geojson
+   (and `--start-date`/`--end-date` if the override narrows the window):
+
+   ```bash
+   python -m zagg.catalog \
+     --config tests/data/benchmark/configs/<your_config>.yaml \
+     --short-name ATL03 --version 007 \
+     --start-date 2018-10-13 --end-date 2025-06-01 \
+     --polygon tests/data/benchmark/antarctic_88s.geojson \
+     --backend mortie \
+     --output tests/data/benchmark/shardmaps/sm_healpix_o11_88s.json
+   ```
+
+   Pin the densest shard with `bench_metrics.select_densest_shard` as above.
+
+3. **`targets.json`** — add the shard map **with its override** and a target:
+
+   ```json
+   "shardmaps": {
+     "healpix_o11_88s": { "path": "shardmaps/sm_healpix_o11_88s.json",
+                          "shard_key": <key>, "n_granules": <n>,
+                          "aoi": { "file": "antarctic_88s.geojson", "name": "88S dense" } }
+   },
+   "targets": {
+     "gain_bias_healpix_o11_88s": { "config": "configs/atl03_gain_bias_healpix_o11.yaml",
+                                    "shardmap": "healpix_o11_88s",
+                                    "aggregator": "gain_bias",
+                                    "grid_type": "healpix",
+                                    "grid_size": "o11_88s" }
+   }
+   ```
+
+   Omit `temporal`/`cmr` to inherit the defaults, or set them to narrow the
+   window. The drift test then rebuilds *this* map over its resolved 88°S AOI.
+
+   **High-latitude density → failure is the expected result.** Near ±88° the
+   densest shard is far heavier than NEON's 44–50 granules, so the target will
+   likely OOM or hit the 720 s / 2 GB timeout — that is the point of a stress
+   target. Label it as such (it compounds the OOM issues #117 / #119).
 
 ## Remove a target
 

@@ -262,6 +262,18 @@ def test_override_resolution_partial_override():
     assert cmr is drift.MANIFEST["cmr"]
 
 
+def test_antarctic_88s_aoi_fixture_loads_near_turning_latitude():
+    # The 88S stress-target AOI ships as a usable fixture even before its built
+    # shard map / live target lands (that step needs CMR + a re-pin). It must
+    # load and sit near the +/-88 deg ICESat-2 turning latitude (issue #121).
+    from zagg.catalog import load_polygon, polygon_to_bbox
+
+    parts = load_polygon(str(BENCH / "antarctic_88s.geojson"))
+    minx, miny, maxx, maxy = polygon_to_bbox(parts)
+    assert miny <= -87.5 and maxy <= -87.0  # well into the high-density polar band
+    assert -90.0 <= miny < maxy <= -80.0
+
+
 # --- update_series (parquet store) ----------------------------------------
 
 
