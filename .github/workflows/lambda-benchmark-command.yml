@@ -40,7 +40,18 @@ jobs:
             // First, does the textual trigger match (and is it a PR)?
             if (context.eventName === 'issue_comment') {
               if (!context.payload.issue.pull_request) return core.setOutput('should_run', 'false');
-              if (!context.payload.comment.body.includes('/benchmark')) return core.setOutput('should_run', 'false');
+              // Require `/benchmark` to LEAD a line, not appear anywhere in the
+              // body (issue #126): a body that merely *mentions* the string --
+              // inside a path like `tests/data/benchmark/...`, a URL like
+              // `.../zagg/benchmarks/site/...`, or mid-prose ("don't run
+              // `/benchmark` yet") -- must NOT trigger a billed run. The command
+              // must start a line (optional leading whitespace) and be bounded by
+              // whitespace/EOL, so `/benchmark.md` and `/benchmarks/` (glued to
+              // more characters) are rejected while a leading `/benchmark` or
+              // `/benchmark <targets>` still fires.
+              if (!/^\s*\/benchmark(\s|$)/m.test(context.payload.comment.body)) {
+                return core.setOutput('should_run', 'false');
+              }
               prNumber = context.payload.issue.number;
             } else {
               if (context.payload.label.name !== 'benchmark') return core.setOutput('should_run', 'false');
