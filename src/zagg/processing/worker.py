@@ -265,15 +265,17 @@ def process_shard(
         phase_timings["read"] = time.time() - _read_t0
 
     if not all_reads:
-        # Distinguish a genuinely-empty read from one where every group raised
-        # (issue #116): the latter is a real read error masquerading as
-        # "no data", so report it as such instead of the misleading text.
+        # Distinguish a genuinely-empty read from one where a group read raised
+        # (issue #116): a raised read is a real error masquerading as "no data",
+        # so report it as such instead of the misleading text. Some groups may
+        # have returned ``None`` (legitimately empty) rather than raised, so the
+        # message is "no data AND N raised", not "all groups raised".
         if read_errors:
             logger.warning(
-                f"  Read raised on all groups for shard {shard_key} "
-                f"({read_errors} read error(s)) - skipping"
+                f"  No data after filtering for shard {shard_key} and "
+                f"{read_errors} group read(s) raised - skipping"
             )
-            metadata["error"] = f"All group reads raised ({read_errors} read errors)"
+            metadata["error"] = f"No data after filtering ({read_errors} group reads raised)"
         else:
             logger.info(f"  No data after filtering for shard {shard_key} - skipping")
             metadata["error"] = "No data after filtering"
