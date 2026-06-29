@@ -498,3 +498,40 @@ def test_make_figure_null_memory_renders_uncoloured(tmp_path):
         is True
     )
     assert out.exists()
+
+
+def test_make_figure_shared_x_and_circle_runtime(tmp_path, monkeypatch):
+    # The benchmark-plot polish (PR #123 fold of #125's chart): runtime markers
+    # are circles (not squares) so the memory-coloured cost marker shows through,
+    # and the x-axis is shared so only the bottom-row panels carry commit labels.
+    pytest.importorskip("matplotlib")
+    import matplotlib
+
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+    import plot_series
+
+    captured = {}
+    monkeypatch.setattr(plt, "close", lambda fig: captured.setdefault("fig", fig))
+
+    # 4 targets -> a 2x2 grid; two merge points each.
+    rows = [_rec_row(f"c{i}", t) for i in range(2) for t in ("t1", "t2", "t3", "t4")]
+    series = tmp_path / "series.parquet"
+    update_series.save_series(update_series.records_to_frame(rows), series)
+    out = tmp_path / "fig.png"
+    assert plot_series.make_figure(
+        update_series.load_series(series), "cost_per_shard_usd", "c", out
+    )
+    fig = captured["fig"]
+
+    # Right-axis runtime lines use round ('o') markers, never squares ('s').
+    markers = [ln.get_marker() for ax in fig.axes for ln in ax.get_lines()]
+    assert "o" in markers and "s" not in markers
+
+    # Shared x-axis: only the bottom-row panels show tick labels; the top row's
+    # are empty (the panels carry the same merge points beneath them).
+    base = [ax for ax in fig.axes if ax.get_title()]  # the 4 panels (twins/cbar have no title)
+    base.sort(key=lambda ax: ax.get_subplotspec().rowspan.start)
+    top, bottom = base[:2], base[2:]
+    assert all(not any(t.get_text() for t in ax.get_xticklabels()) for ax in top)
+    assert all(any(t.get_text() for t in ax.get_xticklabels()) for ax in bottom)
