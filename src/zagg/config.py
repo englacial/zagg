@@ -1236,6 +1236,18 @@ def get_layout(config: PipelineConfig) -> str:
     return config.output.get("grid", {}).get("layout", "fullsphere")
 
 
+def get_sharded(config: PipelineConfig) -> bool:
+    """Return whether the output grid uses ShardingCodec storage (issue #108).
+
+    The ``sharded`` knob lives on the grid/chunk block next to ``chunk_inner``
+    (mirroring its accessor), default ``False``. When ``True`` the grid bundles a
+    dispatch shard's K inner chunks into one zarr shard object instead of K
+    independent regular chunk objects; it is only valid when ``chunk_inner`` gives
+    K>1 (the grid raises otherwise, validated before deployment).
+    """
+    return bool(config.output.get("grid", {}).get("sharded", False))
+
+
 def get_store_path(config: PipelineConfig) -> str | None:
     """Return the store path from the output config, or None.
 

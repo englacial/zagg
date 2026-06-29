@@ -38,7 +38,10 @@ class TestConstruction:
         # 1280 == 5*256 already, so auto-pad is a no-op and bounds are unchanged.
         assert grid.array_shape == (1280, 1280)
         assert (grid.xmin, grid.ymax, grid.xmax, grid.ymin) == (
-            -3_200_000, 3_200_000, 3_200_000, -3_200_000
+            -3_200_000,
+            3_200_000,
+            3_200_000,
+            -3_200_000,
         )
 
     def test_uneven_chunk_padded(self, cfg):
@@ -62,17 +65,21 @@ class TestConstruction:
         # span not a whole multiple of resolution -> round cells UP to cover it
         # (chunk_shape (1,1) isolates the cover-rounding from chunk-padding).
         g = RectilinearGrid(
-            crs="EPSG:3031", resolution=5000,
+            crs="EPSG:3031",
+            resolution=5000,
             bounds=(0, 0, 5000 * 130 + 100, 5000 * 130 + 100),
-            chunk_shape=(1, 1), config=cfg,
+            chunk_shape=(1, 1),
+            config=cfg,
         )
         assert g.array_shape == (131, 131)  # ceil(130.02) -> 131
 
     def test_signature_reflects_padding(self, cfg):
         g = RectilinearGrid(
-            crs="EPSG:3031", resolution=5000,
+            crs="EPSG:3031",
+            resolution=5000,
             bounds=(-3_200_000, -3_200_000, 3_200_000, 3_200_000),
-            chunk_shape=(300, 300), config=cfg,
+            chunk_shape=(300, 300),
+            config=cfg,
         )
         sig = g.signature()
         assert sig["shape"] == [1500, 1500]
@@ -81,18 +88,27 @@ class TestConstruction:
     def test_invalid_bounds(self, cfg):
         with pytest.raises(ValueError, match="bounds"):
             RectilinearGrid(
-                crs="EPSG:3031", resolution=5000,
-                bounds=(0, 0, -100, -100), chunk_shape=(2, 2), config=cfg,
+                crs="EPSG:3031",
+                resolution=5000,
+                bounds=(0, 0, -100, -100),
+                chunk_shape=(2, 2),
+                config=cfg,
             )
 
     def test_scalar_vs_tuple_resolution(self, cfg):
         g1 = RectilinearGrid(
-            crs="EPSG:3031", resolution=5000,
-            bounds=(0, 0, 10000, 10000), chunk_shape=(2, 2), config=cfg,
+            crs="EPSG:3031",
+            resolution=5000,
+            bounds=(0, 0, 10000, 10000),
+            chunk_shape=(2, 2),
+            config=cfg,
         )
         g2 = RectilinearGrid(
-            crs="EPSG:3031", resolution=[5000, 5000],
-            bounds=(0, 0, 10000, 10000), chunk_shape=(2, 2), config=cfg,
+            crs="EPSG:3031",
+            resolution=[5000, 5000],
+            bounds=(0, 0, 10000, 10000),
+            chunk_shape=(2, 2),
+            config=cfg,
         )
         assert g1.array_shape == g2.array_shape
 
@@ -226,6 +242,21 @@ class TestFromConfig:
         with pytest.raises(ValueError, match="missing required"):
             from_config(cfg)
 
+    def test_sharded_default_off(self, cfg):
+        assert from_config(cfg).sharded is False
+
+    def test_sharded_threads_through(self, cfg):
+        cfg.output["grid"]["chunk_inner"] = [128, 128]
+        cfg.output["grid"]["sharded"] = True
+        g = from_config(cfg)
+        assert g.sharded is True
+        assert g.chunks_per_shard > 1
+
+    def test_sharded_k1_validated(self, cfg):
+        cfg.output["grid"]["sharded"] = True  # no chunk_inner -> K == 1
+        with pytest.raises(ValueError, match="K>1"):
+            from_config(cfg)
+
 
 class TestCoverage:
     def test_coverage_contains_point_shard(self, grid):
@@ -251,9 +282,11 @@ class TestCoverage:
 
 def _grid(cfg, res, chunk):
     return RectilinearGrid(
-        crs="EPSG:3031", resolution=res,
+        crs="EPSG:3031",
+        resolution=res,
         bounds=(-3_200_000, -3_200_000, 3_200_000, 3_200_000),
-        chunk_shape=chunk, config=cfg,
+        chunk_shape=chunk,
+        config=cfg,
     )
 
 
@@ -267,8 +300,7 @@ class TestSignature:
         assert len(sig["affine"]) == 6
 
     def test_distinguishes_grids(self, cfg):
-        assert _grid(cfg, 5000, (256, 256)).signature() != \
-            _grid(cfg, 8000, (200, 200)).signature()
+        assert _grid(cfg, 5000, (256, 256)).signature() != _grid(cfg, 8000, (200, 200)).signature()
 
 
 class TestNesting:
@@ -284,8 +316,10 @@ class TestNesting:
 
     def test_cross_crs(self, cfg):
         utm = RectilinearGrid(
-            crs="EPSG:32618", resolution=10,
-            bounds=[359400, 4300740, 369400, 4310740], chunk_shape=[250, 250],
+            crs="EPSG:32618",
+            resolution=10,
+            bounds=[359400, 4300740, 369400, 4310740],
+            chunk_shape=[250, 250],
             config=cfg,
         )
         assert not _grid(cfg, 5000, (256, 256)).nests_with(utm)
@@ -313,9 +347,7 @@ class TestNesting:
                 },
             },
         }
-        vcfg = PipelineConfig(
-            data_source=cfg.data_source, aggregation=agg, output=cfg.output
-        )
+        vcfg = PipelineConfig(data_source=cfg.data_source, aggregation=agg, output=cfg.output)
         scalar = _grid(cfg, 5000, (256, 256))
         vector = _grid(vcfg, 5000, (256, 256))
         # Same CRS / whole-ratio / aligned — only the field set differs.
@@ -338,5 +370,90 @@ class TestValidateCompatible:
         from zagg.grids import HealpixGrid, validate_compatible
 
         with pytest.raises(ValueError, match="do not nest"):
-            validate_compatible([_grid(cfg, 5000, (256, 256)),
-                                 HealpixGrid(6, 12, layout="fullsphere")])
+            validate_compatible(
+                [_grid(cfg, 5000, (256, 256)), HealpixGrid(6, 12, layout="fullsphere")]
+            )
+
+
+class TestSharded:
+    """Issue #108 phase 4: rectilinear ShardingCodec — one shard object per shard
+    tile, K inner chunks bundled inside, byte-identical to the regular path."""
+
+    # shard tile 8x8, inner 4x4 -> K = 4 inner chunks/shard.
+    def _grids(self, cfg):
+        kw = dict(
+            crs="EPSG:3031",
+            resolution=100000.0,
+            bounds=(-4e5, -4e5, 4e5, 4e5),
+            chunk_shape=(8, 8),
+            config=cfg,
+            chunk_inner=(4, 4),
+        )
+        return RectilinearGrid(sharded=True, **kw), RectilinearGrid(**kw)
+
+    def test_k1_sharded_rejected(self, cfg):
+        with pytest.raises(ValueError, match="K>1"):
+            RectilinearGrid(
+                "EPSG:3031",
+                100000.0,
+                (-4e5, -4e5, 4e5, 4e5),
+                chunk_shape=(8, 8),
+                config=cfg,
+                sharded=True,  # no chunk_inner -> K == 1
+            )
+
+    def test_template_emits_sharding_codec(self, cfg):
+        sharded, _regular = self._grids(cfg)
+        store = MemoryStore()
+        sharded.emit_template(store)
+        group = open_group(store, path="rectilinear", mode="r")
+        for name in ("h_mean", "count"):
+            arr = group[name]
+            assert arr.chunks == (4, 4), name  # inner read chunk
+            assert arr.shards == (8, 8), name  # dispatch shard tile
+            assert any("sharding" in type(c).__name__.lower() for c in arr.metadata.codecs)
+        # 1-D x/y coords are never sharded.
+        assert group["x"].shards is None
+        assert group["y"].shards is None
+
+    def test_flag_off_byte_identical(self, cfg):
+        sharded_off = RectilinearGrid(
+            "EPSG:3031",
+            100000.0,
+            (-4e5, -4e5, 4e5, 4e5),
+            chunk_shape=(8, 8),
+            config=cfg,
+            chunk_inner=(4, 4),
+        )
+        _sharded, regular = self._grids(cfg)
+        assert sharded_off._spec().model_dump() == regular._spec().model_dump()
+
+    def test_whole_shard_write_roundtrip(self, cfg):
+        import pandas as pd
+
+        from zagg.processing import write_shard_to_zarr
+
+        sharded, _regular = self._grids(cfg)
+        store = MemoryStore()
+        sharded.emit_template(store)
+
+        # Build one carrier per inner chunk: each cell carries its own global cell
+        # id as the h_mean value, in the chunk's row-major order (as the worker does).
+        shard_key = sharded._pack(0, 0)
+        chunk_results = []
+        for block_index, children in sharded.iter_chunks(shard_key):
+            df = pd.DataFrame({"h_mean": np.asarray(children, dtype=np.float32)})
+            chunk_results.append((block_index, df, {}))
+        write_shard_to_zarr(chunk_results, store, grid=sharded, shard_key=shard_key)
+
+        # Exactly one shard object for the populated dense array.
+        h_keys = [k for k in store._store_dict if k.startswith("rectilinear/h_mean/c/")]
+        assert h_keys == ["rectilinear/h_mean/c/0/0"]
+
+        # Read-back: every cell in the shard tile holds its own global id.
+        group = open_group(store, path="rectilinear", mode="r")
+        arr = group["h_mean"][:8, :8]
+        expected = (np.arange(8)[:, None] * sharded.width + np.arange(8)[None, :]).astype(
+            np.float32
+        )
+        np.testing.assert_array_equal(arr, expected)

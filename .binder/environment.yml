@@ -1,0 +1,32 @@
+# Conda environment for Binder / repo2docker.
+#
+# repo2docker (which Binder runs) builds this with mamba, so the env solves
+# fast. We keep the conda layer thin: just Python plus the system geospatial
+# stack (GEOS / PROJ / GEOTIFF) that cartopy, pyproj and shapely link against.
+# Everything Python-side -- zagg itself and its notebook runtime -- is installed
+# from the repo's ``[analysis]`` optional-dependency extra in ``postBuild`` so
+# there is a single source of truth for the notebook dependencies (pyproject.toml).
+#
+# Only PyPI/conda-forge resolvable packages appear here: no ``git+`` URLs and no
+# spherely fork. The three Binder-runnable notebooks
+# (custom_aggregations, rasterized_zarr, jupyterhub_example) read the public,
+# anonymous source.coop store or synthetic data, so the exact-S2 spherely
+# SpatialIndex backend is never on their import path.
+name: zagg-binder
+channels:
+  - conda-forge
+  - nodefaults
+dependencies:
+  # zagg requires Python >=3.12,<3.14; the AWS Lambda runtime is 3.12.
+  - python=3.12
+  # System geospatial libraries. Bundling the non-Python GEOS/PROJ deps from
+  # conda-forge is the reason we use a conda env on Binder (espg, issue #104):
+  # it gives cartopy a system GEOS/PROJ to link against without a from-source
+  # build. (pyproj/shapely ship vendored copies in their manylinux wheels, so
+  # these are mainly for cartopy.)
+  - geos
+  - proj
+  - pip
+  # The Python packages (zagg + the ``analysis`` extra) are installed via pip
+  # in postBuild against the checked-out repo, so the notebook dependency set
+  # stays defined once in pyproject.toml.

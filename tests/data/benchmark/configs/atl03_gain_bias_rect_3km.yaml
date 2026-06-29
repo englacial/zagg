@@ -1,0 +1,126 @@
+# ATL03 per-chunk gain/bias waveform template (HEALPix, multi-chunk-per-worker).
+#
+# Per-CHUNK-anchored waveform counts with a stored gain + bias (offset) per Zarr
+# chunk -- the remote-sensing scale+offset paradigm. The ``chunk_precompute``
+# hook (issue #30 item 1) is evaluated ONCE per inner chunk over that chunk's
+# pooled photons, BEFORE the per-cell loop, and the resulting chunk-level scalars
+# are injected into every cell's expression namespace, so every cell in a chunk
+# shares one 128-bin altitude window:
+#
+#   chunk_offset = floor(min(dem_h))        # absolute DEM-anchored bin-0 floor
+#   chunk_gain   = smallest power-of-two (>= 0.5 m) whose 128 bins span the
+#                  chunk's photon-height range: 2^ceil(log2((max-min)/128)) >= 0.5
+#
+# The 128-bin window is [chunk_offset - 27*chunk_gain, chunk_offset + 101*chunk_gain),
+# so the floor(min) DEM anchor lands in bin 28 (27 bins below, 100 above) -- the
+# asymmetric layout for a mostly-above-ground return. dem_h (the segment-level
+# reference DEM, less noisy than the photon cloud) gives a stable absolute frame;
+# it is declared as a segment-level readable variable and broadcast to the photon
+# rows via the geolocation->heights link, landing as a per-photon ``dem_h`` column
+# the chunk_precompute reduces. Out-of-range photons are dropped.
+#
+# offset_h / gain_h are ``resolution: chunk`` companion fields (issue #30 item 2):
+# stored ONCE per Zarr chunk in an array shaped at the chunk grid, indexed by
+# block_index -- no per-cell duplication. A reader reconstructs each chunk's
+# altitude axis as ``offset_h + gain_h * arange(128)``.
+#
+# Because chunk_precompute is reduced PER inner chunk (not pooled over the whole
+# shard), every one of the K finer chunks gets its own gain/offset -- the
+# multi-chunk-per-worker path (issue #30 item 3). Grid is HEALPix nested at
+# child_order 19: parent_order 11 shards (256x256 cells) each own K = 16 inner
+# chunks (chunk_inner 13 = 64x64 cells). The worker reads the shard once and
+# writes 16 chunk regions + 16 offset_h/gain_h companion slices.
+data_source:
+  reader: h5coro
+  driver: s3
+  groups: [gt1l, gt1r, gt2l, gt2r, gt3l, gt3r]
+  coordinates:
+    latitude: "/{group}/heights/lat_ph"
+    longitude: "/{group}/heights/lon_ph"
+  variables:
+    h_ph: "/{group}/heights/h_ph"
+  filters:
+    - dataset: "/{group}/heights/signal_conf_ph"
+      column: 0                  # land surface type; TEP is uniform across columns
+      op: ne
+      value: -2
+  base_level: photons
+  levels:
+    photons:
+      path: "/{group}/heights"
+      coordinates: {latitude: lat_ph, longitude: lon_ph}
+      link: null
+    segments:
+      path: "/{group}/geolocation"
+      coordinates: {latitude: reference_photon_lat, longitude: reference_photon_lon}
+      # Segment-level readable variable (issue #30): dem_h is one value per ~100
+      # photons; broadcast to the photon rows via the link below as a per-photon
+      # ``dem_h`` column the chunk_precompute reduces.
+      variables:
+        dem_h: "/{group}/geophys_corr/dem_h"
+      link:
+        to: photons
+        index_beg: "/{group}/geolocation/ph_index_beg"
+        count: "/{group}/geolocation/segment_ph_cnt"
+        index_base: 1            # ATL03 ph_index_beg is 1-based per the v3 dict
+  read_plan:
+    spatial_index: segments
+    pad: 1                       # one segment of padding on each side per #43
+
+aggregation:
+  coordinates:
+    cell_ids:
+      dtype: uint64
+      fill_value: 0
+    morton:
+      dtype: uint64
+      fill_value: 0
+  # Evaluated ONCE per inner chunk over that chunk's pooled photons, before the
+  # per-cell loop; the names below enter the per-cell expression namespace.
+  chunk_precompute:
+    # ``np.maximum`` (not the ``max`` builtin) floors the gain at 0.5 m, and the
+    # range uses ``np.max``/``np.min`` (not ndarray methods): the expression
+    # sandbox runs with an empty ``__builtins__`` where an ndarray method call
+    # raises but the functional numpy form is fine. The range is floored at 1e-6 m
+    # BEFORE log2 so an all-equal-height chunk (range == 0) does not hit log2(0).
+    chunk_gain:
+      expression: "np.float32(np.maximum(0.5, 2.0 ** np.ceil(np.log2(np.maximum(1e-6, np.max(h_ph) - np.min(h_ph)) / 128.0))))"
+      source: h_ph
+      dtype: float32
+    chunk_offset:
+      # DEM-anchored: the chunk's absolute frame is the reference DEM, not the
+      # photon cloud's own median. dem_h rides the segment->photon broadcast above.
+      expression: "np.float32(np.floor(np.min(dem_h)))"
+      source: dem_h
+      dtype: float32
+  variables:
+    waveform_counts:
+      kind: vector
+      trailing_shape: 128
+      # references the chunk-level anchor/gain, so every cell in the chunk shares
+      # one bin window (the floor(min(dem_h)) anchor at bin 28).
+      expression: "np.histogram(h_ph, 128, (chunk_offset - 27.0 * chunk_gain, chunk_offset + 101.0 * chunk_gain))[0].astype('uint32')"
+      source: h_ph
+      dtype: uint32
+      fill_value: 0
+    offset_h:
+      # the chunk bin-0 absolute elevation, recorded ONCE per chunk.
+      expression: "chunk_offset"
+      source: h_ph
+      dtype: float32
+      resolution: chunk
+    gain_h:
+      # the chunk vertical bin width (m), recorded ONCE per chunk.
+      expression: "chunk_gain"
+      source: h_ph
+      dtype: float32
+      resolution: chunk
+
+output:
+  grid:
+    type: rectilinear
+    crs: EPSG:32618                              # UTM zone 18N
+    resolution: 10                               # metres (~ HEALPix order-19 leaf)
+    bounds: [358300, 4299600, 370300, 4311600]   # NEON SERC box -> 12 km UTM tile (1200x1200)
+    chunk_shape: [300, 300]                       # shard: 3 km tile, 9 km2 (~ order-11's 10.1 km2)
+    chunk_inner: [75, 75]                         # inner Zarr chunk: 0.75 km (K=16 per shard)

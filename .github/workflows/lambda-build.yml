@@ -1,5 +1,11 @@
 name: Lambda Build
 
+# Build + size-gate the dual-arch Lambda zips on every push/PR that touches the
+# deployed closure. The actual build lives in the reusable workflow so the
+# release path (publish.yml) builds identically without a cross-workflow event
+# cascade (issue #25). Release-asset attachment + prod deploy + distribution all
+# moved to publish.yml.
+
 on:
   push:
     branches: [lambda, main]
@@ -8,203 +14,19 @@ on:
       - 'deployment/aws/**'
       - 'pyproject.toml'
       - '.github/workflows/lambda-build.yml'
+      - '.github/workflows/lambda-build-reusable.yml'
   pull_request:
     paths:
       - 'src/zagg/**'
       - 'deployment/aws/**'
       - 'pyproject.toml'
       - '.github/workflows/lambda-build.yml'
-  release:
-    types: [published]
+      - '.github/workflows/lambda-build-reusable.yml'
   workflow_dispatch:
 
 permissions:
   contents: read
 
 jobs:
-  # ---------------------------------------------------------------------------
-  # Build layer + function code for x86_64 (Python 3.12)
-  # ---------------------------------------------------------------------------
-  build-x86_64:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v5
-
-      - name: Build Lambda layer (x86_64) in manylinux container
-        run: |
-          docker run --rm \
-            -v ${{ github.workspace }}:/workspace \
-            -w /workspace/deployment/aws \
-            quay.io/pypa/manylinux_2_28_x86_64 \
-            bash -c "
-              yum install -y zip &&
-              chmod +x build_layer.sh &&
-              ./build_layer.sh x86_64
-            "
-
-      - name: Set up Python 3.12
-        uses: actions/setup-python@v6
-        with:
-          python-version: '3.12'
-
-      - name: Build function code (x86_64)
-        run: |
-          chmod +x deployment/aws/build_function.sh
-          deployment/aws/build_function.sh
-
-      - name: Check combined size
-        run: |
-          LIMIT=$((250 * 1024 * 1024))
-
-          # Measure layer unzipped size
-          LAYER_ZIP="deployment/layers/lambda_layer_x86_64.zip"
-          LAYER_TMP=$(mktemp -d)
-          unzip -qo "$LAYER_ZIP" -d "$LAYER_TMP"
-          LAYER_BYTES=$(du -sb "$LAYER_TMP" | cut -f1)
-          rm -rf "$LAYER_TMP"
-
-          # Measure function code unzipped size
-          FUNC_ZIP=$(ls deployment/builds/lambda_function_x86_64_*.zip)
-          FUNC_TMP=$(mktemp -d)
-          unzip -qo "$FUNC_ZIP" -d "$FUNC_TMP"
-          FUNC_BYTES=$(du -sb "$FUNC_TMP" | cut -f1)
-          rm -rf "$FUNC_TMP"
-
-          COMBINED=$((LAYER_BYTES + FUNC_BYTES))
-
-          echo "## x86_64 Size Report" >> $GITHUB_STEP_SUMMARY
-          echo "| Component | Size |" >> $GITHUB_STEP_SUMMARY
-          echo "|-----------|------|" >> $GITHUB_STEP_SUMMARY
-          echo "| Layer | $(numfmt --to=iec $LAYER_BYTES) |" >> $GITHUB_STEP_SUMMARY
-          echo "| Function | $(numfmt --to=iec $FUNC_BYTES) |" >> $GITHUB_STEP_SUMMARY
-          echo "| **Combined** | **$(numfmt --to=iec $COMBINED)** |" >> $GITHUB_STEP_SUMMARY
-          echo "| Limit | $(numfmt --to=iec $LIMIT) |" >> $GITHUB_STEP_SUMMARY
-          echo "| Headroom | $(numfmt --to=iec $((LIMIT - COMBINED))) |" >> $GITHUB_STEP_SUMMARY
-
-          echo ""
-          echo "x86_64 combined size: $(numfmt --to=iec $COMBINED) / $(numfmt --to=iec $LIMIT)"
-
-          if [ "$COMBINED" -gt "$LIMIT" ]; then
-            echo "::error::x86_64 combined size ($COMBINED bytes) exceeds 250MB Lambda limit!"
-            exit 1
-          fi
-
-      - name: Upload layer artifact
-        uses: actions/upload-artifact@v4
-        with:
-          name: lambda-layer-x86_64
-          path: deployment/layers/lambda_layer_x86_64.zip
-          retention-days: 30
-
-      - name: Upload function artifact
-        uses: actions/upload-artifact@v4
-        with:
-          name: lambda-function-x86_64
-          path: deployment/builds/lambda_function_x86_64_*.zip
-          retention-days: 30
-
-  # ---------------------------------------------------------------------------
-  # Build layer + function code for arm64 (Python 3.12)
-  # ---------------------------------------------------------------------------
-  build-arm64:
-    runs-on: ubuntu-24.04-arm
-    steps:
-      - uses: actions/checkout@v5
-
-      - name: Build Lambda layer (arm64) in manylinux container
-        run: |
-          docker run --rm \
-            -v ${{ github.workspace }}:/workspace \
-            -w /workspace/deployment/aws \
-            quay.io/pypa/manylinux_2_28_aarch64 \
-            bash -c "
-              yum install -y zip &&
-              chmod +x build_layer.sh &&
-              ./build_layer.sh arm64
-            "
-
-      - name: Set up Python 3.12
-        uses: actions/setup-python@v6
-        with:
-          python-version: '3.12'
-
-      - name: Build function code (arm64)
-        run: |
-          chmod +x deployment/aws/build_function.sh
-          deployment/aws/build_function.sh
-
-      - name: Check combined size
-        run: |
-          LIMIT=$((250 * 1024 * 1024))
-
-          LAYER_ZIP="deployment/layers/lambda_layer_arm64.zip"
-          LAYER_TMP=$(mktemp -d)
-          unzip -qo "$LAYER_ZIP" -d "$LAYER_TMP"
-          LAYER_BYTES=$(du -sb "$LAYER_TMP" | cut -f1)
-          rm -rf "$LAYER_TMP"
-
-          FUNC_ZIP=$(ls deployment/builds/lambda_function_arm64_*.zip)
-          FUNC_TMP=$(mktemp -d)
-          unzip -qo "$FUNC_ZIP" -d "$FUNC_TMP"
-          FUNC_BYTES=$(du -sb "$FUNC_TMP" | cut -f1)
-          rm -rf "$FUNC_TMP"
-
-          COMBINED=$((LAYER_BYTES + FUNC_BYTES))
-
-          echo "## arm64 Size Report" >> $GITHUB_STEP_SUMMARY
-          echo "| Component | Size |" >> $GITHUB_STEP_SUMMARY
-          echo "|-----------|------|" >> $GITHUB_STEP_SUMMARY
-          echo "| Layer | $(numfmt --to=iec $LAYER_BYTES) |" >> $GITHUB_STEP_SUMMARY
-          echo "| Function | $(numfmt --to=iec $FUNC_BYTES) |" >> $GITHUB_STEP_SUMMARY
-          echo "| **Combined** | **$(numfmt --to=iec $COMBINED)** |" >> $GITHUB_STEP_SUMMARY
-          echo "| Limit | $(numfmt --to=iec $LIMIT) |" >> $GITHUB_STEP_SUMMARY
-          echo "| Headroom | $(numfmt --to=iec $((LIMIT - COMBINED))) |" >> $GITHUB_STEP_SUMMARY
-
-          echo ""
-          echo "arm64 combined size: $(numfmt --to=iec $COMBINED) / $(numfmt --to=iec $LIMIT)"
-
-          if [ "$COMBINED" -gt "$LIMIT" ]; then
-            echo "::error::arm64 combined size ($COMBINED bytes) exceeds 250MB Lambda limit!"
-            exit 1
-          fi
-
-      - name: Upload layer artifact
-        uses: actions/upload-artifact@v4
-        with:
-          name: lambda-layer-arm64
-          path: deployment/layers/lambda_layer_arm64.zip
-          retention-days: 30
-
-      - name: Upload function artifact
-        uses: actions/upload-artifact@v4
-        with:
-          name: lambda-function-arm64
-          path: deployment/builds/lambda_function_arm64_*.zip
-          retention-days: 30
-
-  # ---------------------------------------------------------------------------
-  # Attach the built zips to the GitHub Release (durable artifacts for the
-  # CloudFormation standup — see deployment/aws/template.yaml).
-  # ---------------------------------------------------------------------------
-  publish-release-assets:
-    needs: [build-x86_64, build-arm64]
-    if: github.event_name == 'release'
-    runs-on: ubuntu-latest
-    permissions:
-      contents: write
-    steps:
-      - name: Download built artifacts
-        uses: actions/download-artifact@v4
-        with:
-          path: artifacts
-
-      - name: Upload to release
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          gh release upload "${{ github.event.release.tag_name }}" \
-            artifacts/lambda-layer-x86_64/lambda_layer_x86_64.zip \
-            artifacts/lambda-layer-arm64/lambda_layer_arm64.zip \
-            artifacts/lambda-function-x86_64/lambda_function_x86_64_*.zip \
-            artifacts/lambda-function-arm64/lambda_function_arm64_*.zip \
-            --repo "${{ github.repository }}" --clobber
+  build:
+    uses: ./.github/workflows/lambda-build-reusable.yml

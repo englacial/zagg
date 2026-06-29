@@ -14,6 +14,7 @@ Usage from Python (e.g., Jupyter notebook)::
 import json
 import logging
 import os
+import statistics
 import time
 import warnings
 from concurrent.futures import ThreadPoolExecutor
@@ -51,6 +52,7 @@ from zagg.processing import (
     process_shard,
     write_dataframe_to_zarr,
     write_ragged_to_zarr,
+    write_shard_to_zarr,
 )
 from zagg.processing.write import _block_index_key
 from zagg.store import open_store
@@ -86,6 +88,7 @@ def agg(
     output_credentials: dict | None = None,
     output_endpoint_url: str | None = None,
     handoff: str = "pandas",
+    profile: bool = False,
     events=None,
 ) -> dict:
     """Run the aggregation pipeline.
@@ -134,6 +137,12 @@ def agg(
         Per-cell aggregation carrier: ``"pandas"`` (default) or ``"arrow"``.
         Both produce byte-for-byte identical scalar outputs (#30); ``"arrow"``
         is opt-in for benchmarking. Only honored by the ``"local"`` backend.
+    profile : bool
+        Opt-in per-phase timing (issue #100). When ``True`` (lambda backend),
+        forwards ``profile`` into each cell event so the worker emits a
+        ``phase_timings`` (read/index/aggregate) sub-dict, and the run prints a
+        per-phase worker breakdown. Default ``False`` leaves the worker path and
+        per-cell event payload byte-identical -- no probe tax.
     events : iterable, optional
         Temporal pipeline only (``pipeline.type: temporal``/``event``): an
         iterable of ``(event_key, event_mask, collections, static_data)`` tuples
@@ -169,6 +178,7 @@ def agg(
         output_credentials=output_credentials,
         output_endpoint_url=output_endpoint_url,
         handoff=handoff,
+        profile=profile,
         events=events,
     )
 
@@ -200,6 +210,7 @@ class SpatialStrategy:
         output_credentials,
         output_endpoint_url,
         handoff,
+        profile=False,
         events=None,
     ):
         # Resolve catalog and store
@@ -276,6 +287,7 @@ class SpatialStrategy:
                 function_name=function_name,
                 output_credentials=output_credentials,
                 output_endpoint_url=resolved_endpoint,
+                profile=profile,
             )
         else:
             raise ValueError(f"Unknown backend: {backend!r} (expected 'local' or 'lambda')")
@@ -311,6 +323,7 @@ class TemporalStrategy:
         output_credentials,
         output_endpoint_url,
         handoff,
+        profile=False,
         events=None,
     ):
         from zagg.temporal import process_event, specs_from_config
@@ -619,6 +632,12 @@ def _process_and_write(
         handoff=handoff,
         chunk_results=chunk_results,
     )
+    # Sharded output (issue #108): the shard's K inner chunks bundle into one
+    # ShardingCodec shard object — write the whole shard in one block selection per
+    # dense array (a per-inner-chunk loop would read-modify-write the shard object).
+    if getattr(grid, "sharded", False):
+        write_shard_to_zarr(chunk_results, zarr_store, grid=grid, shard_key=int(shard_key))
+        return metadata
     single_chunk = len(chunk_results) == 1
     for block_index, carrier, ragged in chunk_results:
         # write_dataframe_to_zarr no-ops on an empty carrier (DataFrame or Arrow
@@ -799,6 +818,7 @@ def _run_lambda(
     function_name,
     output_credentials=None,
     output_endpoint_url=None,
+    profile=False,
 ):
     """Run processing via AWS Lambda invocation.
 
@@ -915,6 +935,7 @@ def _run_lambda(
             config_dict=config_dict,
             output_creds_event=output_creds_event,
             max_workers=state["workers"],
+            profile=profile,
         )
 
     executor = LambdaExecutor(
@@ -936,6 +957,11 @@ def _run_lambda(
     # function so the orchestrator only needs lambda:InvokeFunction; no
     # direct S3 access to the output bucket is required (works cleanly
     # for cross-account callers like CryoCloud).
+    # Orchestrator phase brackets (always-on; just time.time() deltas around
+    # calls that already happen, so no worker probe tax -- issue #100). They
+    # decompose wall time into setup invoke / fan-out / finalize invoke so
+    # "where did wall time go" is answerable from the summary.
+    setup_start = time.time()
     _invoke_lambda_setup(
         state["lambda_client"],
         function_name,
@@ -947,6 +973,7 @@ def _run_lambda(
         config_dict=config_dict,
         output_creds_event=output_creds_event,
     )
+    setup_s = time.time() - setup_start
 
     start_time = time.time()
     n = len(cells)
@@ -980,10 +1007,13 @@ def _run_lambda(
         )
     finally:
         executor.shutdown()
+    fanout_s = time.time() - start_time
 
     # Consolidate metadata via Lambda (same rationale as setup -- avoids
     # requiring orchestrator-side S3 access).
+    finalize_start = time.time()
     executor.finalize()
+    finalize_s = time.time() - finalize_start
     wall_time = time.time() - start_time
 
     # Cost estimate: arm64 pricing = $0.0000133334/GB-second. Compute gb_seconds
@@ -998,6 +1028,32 @@ def _run_lambda(
     price_per_gb_sec = LAMBDA_PRICE_PER_GB_SEC
     estimated_cost = gb_seconds * price_per_gb_sec
 
+    # Worker-runtime distribution (issue #100). Wall time on a parallel fan-out
+    # tracks the *straggler*, not the mean, so surface max / median / pstdev of
+    # the billed per-cell durations plus the max's share of the function
+    # Timeout -- the safety margin that flags a skewed shardmap (one fat cell
+    # dominating wall time). Raw material already lives in report.results.
+    function_timeout_s = _get_function_timeout_s(state.get("lambda_client"), function_name)
+    durations = [r["lambda_duration"] for r in report.results if r.get("lambda_duration")]
+    if durations:
+        worker_max_s = max(durations)
+        worker_median_s = statistics.median(durations)
+        worker_pstdev_s = statistics.pstdev(durations)
+        worker_pct_timeout = worker_max_s / function_timeout_s if function_timeout_s else None
+    else:
+        worker_max_s = worker_median_s = worker_pstdev_s = worker_pct_timeout = None
+
+    # Per-phase worker breakdown (issue #100 phase 2), only when --profile fed
+    # the workers a "profile" event so they emitted body["phase_timings"]. Roll
+    # the straggler (max) per phase across cells, matching the wall-time framing.
+    # Off by default -> no extra summary key, so the default key set is unchanged.
+    worker_phase_max = None
+    if profile:
+        worker_phase_max = {}
+        for r in report.results:
+            for phase, secs in (r.get("body", {}).get("phase_timings") or {}).items():
+                worker_phase_max[phase] = max(worker_phase_max.get(phase, 0.0), secs)
+
     summary = {
         "total_cells": len(cells),
         "cells_with_data": report.cells_with_data,
@@ -1008,17 +1064,36 @@ def _run_lambda(
         "gb_seconds": gb_seconds,
         "price_per_gb_sec": price_per_gb_sec,
         "estimated_cost_usd": estimated_cost,
+        "setup_s": setup_s,
+        "fanout_s": fanout_s,
+        "finalize_s": finalize_s,
+        "function_timeout_s": function_timeout_s,
+        "worker_max_s": worker_max_s,
+        "worker_median_s": worker_median_s,
+        "worker_pstdev_s": worker_pstdev_s,
+        "worker_pct_timeout": worker_pct_timeout,
         "store_path": store_path,
         "backend": "lambda",
         "function_name": function_name,
         "results": report.results,
     }
+    if profile:
+        summary["worker_phase_max"] = worker_phase_max
     logger.info(
         f"Done: {report.cells_with_data} cells, {report.total_obs:,} obs, {report.cells_error} errors, {wall_time:.1f}s"
     )
     logger.info(
         f"Lambda compute: {total_lambda_time:.0f}s total, {gb_seconds:.0f} GB-s, ~${estimated_cost:.2f}"
     )
+    if worker_max_s is not None:
+        pct = f"{worker_pct_timeout:.0%}" if worker_pct_timeout is not None else "n/a"
+        logger.info(
+            f"Workers: max {worker_max_s:.0f}s ({pct} of {function_timeout_s:.0f}s timeout), "
+            f"median {worker_median_s:.0f}s, pstdev {worker_pstdev_s:.0f}s"
+        )
+    if profile and worker_phase_max:
+        breakdown = ", ".join(f"{phase} {secs:.0f}s" for phase, secs in worker_phase_max.items())
+        logger.info(f"Worker phases (max across cells): {breakdown}")
     return summary
 
 
@@ -1105,6 +1180,27 @@ def _log_concurrency_report(report: ConcurrencyReport, max_workers: int) -> None
         )
 
 
+# Function Timeout fallback when get_function_configuration can't be read
+# (permission denied, etc.). Mirrors the CloudFormation default in
+# deployment/aws/template.yaml (Timeout Default: 720).
+_DEFAULT_FUNCTION_TIMEOUT_S = 720
+
+
+def _get_function_timeout_s(lambda_client, function_name):
+    """Read the function's configured Timeout (seconds), once.
+
+    Used for ``worker_pct_timeout`` (issue #100). Falls back to
+    ``_DEFAULT_FUNCTION_TIMEOUT_S`` (the template default) on any failure --
+    permission error, missing client, or a non-integer response -- so the
+    percent is exact when available and still populated otherwise.
+    """
+    try:
+        timeout = lambda_client.get_function_configuration(FunctionName=function_name)["Timeout"]
+        return int(timeout)
+    except Exception:
+        return _DEFAULT_FUNCTION_TIMEOUT_S
+
+
 def _invoke_lambda_setup(
     lambda_client,
     function_name,
@@ -1175,11 +1271,14 @@ def _invoke_lambda_cell(
     output_creds_event=None,
     max_retries=3,
     max_workers=None,
+    profile=False,
 ):
     """Invoke Lambda for a single cell with retry logic.
 
     ``max_workers`` is used only for the file-descriptor-exhaustion message
-    (#28); it does not affect dispatch.
+    (#28); it does not affect dispatch. ``profile`` (issue #100) forwards a
+    ``"profile": true`` event key so the worker emits ``phase_timings``; when
+    False the event payload is byte-identical to the pre-profile path (no key).
     """
     wall_start = time.time()
 
@@ -1203,6 +1302,9 @@ def _invoke_lambda_cell(
         event["config"] = config_dict
     if output_creds_event is not None:
         event["output_credentials"] = output_creds_event
+    # Only add the key when profiling, so default runs stay byte-identical (#100).
+    if profile:
+        event["profile"] = True
 
     last_error = None
     for attempt in range(max_retries):

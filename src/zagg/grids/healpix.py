@@ -16,7 +16,12 @@ from zagg.config import (
     get_output_signature,
     output_field_signature,
 )
-from zagg.grids.base import InconsistentShardError, chunk_array_spec, vector_array_spec
+from zagg.grids.base import (
+    InconsistentShardError,
+    chunk_array_spec,
+    sharded_array_spec,
+    vector_array_spec,
+)
 from zagg.grids.morton import to_morton_array
 
 HEALPIX_BASE_CELLS: int = 12
@@ -64,6 +69,7 @@ class HealpixGrid:
         config: PipelineConfig | None = None,
         populated_shards: list[int] | None = None,
         chunk_inner: int | None = None,
+        sharded: bool = False,
     ):
         if child_order < parent_order:
             raise ValueError(
@@ -102,6 +108,25 @@ class HealpixGrid:
         # number of chunks one shard owns (K, == 1 when unset).
         self.cells_per_chunk = 4 ** (child_order - chunk_order)
         self.chunks_per_shard = 4 ** (chunk_order - parent_order)
+        # Cells per dispatch shard == the whole shard's leaf extent (n_children).
+        # When sharded (issue #108), this is the zarr SHARD shape: the K inner
+        # chunks (each ``cells_per_chunk``) bundle into one shard object.
+        self.cells_per_shard = self.n_children
+        # Sharded storage (issue #108): bundle the shard's K inner chunks into one
+        # zarr ShardingCodec shard object instead of K independent regular chunk
+        # objects. Only meaningful when K > 1 (a finer ``chunk_inner`` gives the
+        # shard multiple inner chunks); sharding a K==1 shard is a no-op shard of
+        # one chunk, so reject it with a clear message (validated pre-deployment,
+        # matching the grid-mismatch errors). HEALPix lands first (issue #108).
+        if sharded and self.chunks_per_shard <= 1:
+            raise ValueError(
+                "sharded output requires chunk_inner to give more than one inner "
+                f"chunk per shard (K>1), but chunk_order ({chunk_order}) == "
+                f"parent_order ({parent_order}) gives K=1; set chunk_inner finer "
+                "than parent_order (e.g. chunk_inner=13 for the 64x64 read chunk) "
+                "or disable sharded"
+            )
+        self.sharded = bool(sharded)
         self.layout = layout
         self.config = config or default_config("atl06")
         self._position_map: dict[int, int] | None = None
@@ -195,6 +220,31 @@ class HealpixGrid:
             block = (int(healpix[0]),)
             children = generate_morton_children(int(sub), self.child_order)
             yield (block, children)
+
+    def shard_slab_shape(self) -> tuple[int, ...]:
+        """Cell extent of one whole sharded shard (issue #108).
+
+        The shape the sharded worker assembles per dense array before the single
+        whole-shard ``set_block_selection`` — ``(cells_per_shard,)`` for HEALPix
+        (the K inner chunks laid out contiguously, matching the ShardingCodec's
+        inner-chunk tiling of the outer shard).
+        """
+        return (self.cells_per_shard,)
+
+    def shard_local_region(self, block_index, shard_key) -> tuple:
+        """Slice(s) an inner chunk occupies within its shard slab (issue #108).
+
+        ``block_index`` is the inner chunk's global block (from :meth:`iter_chunks`);
+        its position inside the shard is ``local = block - block_index(shard)·K``,
+        and it occupies the contiguous ``[local·cells_per_chunk, +cells_per_chunk)``
+        run of the ``cells_per_shard`` slab (HEALPix nested ids tile the shard in
+        ascending order, so this matches the carrier's canonical chunk order).
+        """
+        (shard_block,) = self.block_index(shard_key)
+        (inner_block,) = tuple(int(b) for b in block_index)
+        local = inner_block - shard_block * self.chunks_per_shard
+        start = local * self.cells_per_chunk
+        return (slice(start, start + self.cells_per_chunk),)
 
     @property
     def group_path(self) -> str:
@@ -383,11 +433,29 @@ class HealpixGrid:
             fill_value="NaN",
         )
 
+        # Sharded storage (issue #108): wrap each dense per-cell array in a
+        # ShardingCodec — outer (shard) chunk == ``cells_per_shard``, inner chunk ==
+        # ``cells_per_chunk`` (the 64x64 read chunk). Applied to the per-cell
+        # coord/data-var arrays only; the ``resolution: chunk`` companions stay
+        # regular (they are already one block per chunk on the coarse chunk grid).
+        def _shard(arr):
+            if not self.sharded:
+                return arr
+            # The inner chunk is the array's current chunk shape (``cells_per_chunk``
+            # on the cells axis; a vector field's trailing payload dim is chunked
+            # whole and stays whole). The outer shard widens only the cells axis to
+            # ``cells_per_shard`` (== K inner chunks); trailing dims are unchanged.
+            cg = arr.chunk_grid
+            cfg = cg["configuration"] if isinstance(cg, dict) else cg.configuration
+            inner = tuple(int(c) for c in cfg["chunk_shape"])
+            shard = (self.cells_per_shard, *inner[1:])
+            return sharded_array_spec(arr, shard_shape=shard, inner_chunk_shape=inner)
+
         members = {}
         for name, meta in self.config.aggregation.get("coordinates", {}).items():
             dtype = meta.get("dtype", "float32")
             fill = meta.get("fill_value", "NaN")
-            members[name] = base.with_data_type(dtype).with_fill_value(fill)
+            members[name] = _shard(base.with_data_type(dtype).with_fill_value(fill))
         for name, meta in get_agg_fields(self.config).items():
             sig = get_output_signature(meta)
             # Ragged fields (issue #48) are stored as CSR subgroups
@@ -422,11 +490,13 @@ class HealpixGrid:
                 continue
             # A vector field (issue #29) gets a trailing payload dim chunked
             # whole; scalars are returned unchanged.
-            members[name] = vector_array_spec(
-                spec,
-                sig,
-                base_dims=("cells",),
-                base_chunk_shape=(self.cells_per_chunk,),
+            members[name] = _shard(
+                vector_array_spec(
+                    spec,
+                    sig,
+                    base_dims=("cells",),
+                    base_chunk_shape=(self.cells_per_chunk,),
+                )
             )
 
         return GroupSpec(members=members, attributes=self._dggs_attrs())

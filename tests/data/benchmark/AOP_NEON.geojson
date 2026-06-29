@@ -1,0 +1,25 @@
+{
+  "type": "FeatureCollection",
+  "features": [
+    {
+      "type": "Feature",
+      "properties": {
+        "name": "NEON SERC AOP box",
+        "source_crs": "EPSG:32618",
+        "utm_bounds": [359300, 4300600, 369300, 4310600]
+      },
+      "geometry": {
+        "type": "Polygon",
+        "coordinates": [
+          [
+            [-76.621242, 38.842973],
+            [-76.506054, 38.844515],
+            [-76.507957, 38.934599],
+            [-76.623291, 38.933052],
+            [-76.621242, 38.842973]
+          ]
+        ]
+      }
+    }
+  ]
+}

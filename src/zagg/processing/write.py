@@ -191,6 +191,136 @@ def write_dataframe_to_zarr(
     return store
 
 
+def write_shard_to_zarr(
+    chunk_results: list,
+    store: Store,
+    *,
+    grid,
+    shard_key: int,
+) -> Store:
+    """Write a whole sharded shard in ONE block selection per dense array (issue #108).
+
+    On a ``ShardingCodec`` array (``grid.sharded``) the K inner chunks of one
+    dispatch shard live inside a single shard object, and ``set_block_selection``
+    is **shard-granular** (one block == one shard). Writing the K inner chunks as K
+    separate block selections would each trigger a read-modify-write on the *same*
+    shard object — racy and slow. The worker already holds all K chunk carriers
+    (it reads the shard's granules once), so this assembles them into one
+    shard-wide slab per dense per-cell array and writes it at the shard block in a
+    single call. Empty inner chunks are left as fill, so the ShardingCodec omits
+    them from the shard index (sub-shard sparsity preserved inside the object).
+
+    ``chunk_results`` is the worker's ``[(block_index, carrier, ragged), ...]`` —
+    one entry per inner chunk (from ``grid.iter_chunks``). Each dense per-cell
+    column (data vars + coords) is placed into the shard slab by the chunk's own
+    region (``grid.shard_local_region(block_index, shard_key)``), reshaped to the
+    inner chunk's cell shape (``grid.chunk_shape``) — grid-agnostic, so HEALPix
+    (1-D) and rectilinear (2-D) share one path. The ``resolution: chunk``
+    companions and ragged (CSR) fields are NOT sharded — they are written per inner
+    chunk via the existing seams, exactly as on the regular path.
+
+    Parameters
+    ----------
+    chunk_results : list of (block_index, carrier, ragged)
+        The worker's per-inner-chunk results for one dispatch shard.
+    store : Store
+        Zarr store with the (sharded) template already written.
+    grid : OutputGrid
+        Must be ``sharded`` with ``shard_slab_shape`` / ``shard_local_region``.
+    shard_key : int
+        The dispatch shard's key (HEALPix parent morton id / rect packed tile).
+
+    Returns
+    -------
+    Store
+    """
+    chunk_res_fields = _chunk_resolution_fields(getattr(grid, "config", None))
+    shard_block = tuple(int(i) for i in grid.block_index(shard_key))
+    slab_shape = tuple(int(s) for s in grid.shard_slab_shape())
+    inner_shape = tuple(int(s) for s in grid.chunk_shape)
+
+    # Accumulate each dense per-cell column into one shard-wide slab; companions
+    # and ragged are written per inner chunk via the existing seams.
+    slabs: dict = {}
+    for block_index, carrier, ragged in chunk_results:
+        if not _carrier_empty(carrier):
+            region = grid.shard_local_region(block_index, shard_key)
+            for name, values in _iter_carrier_columns(carrier):
+                if name in chunk_res_fields:
+                    continue  # companion (resolution: chunk) — handled below, unsharded
+                values = np.asarray(values)
+                trailing = values.shape[1:]
+                if name not in slabs:
+                    array = open_array(
+                        store,
+                        path=f"{grid.group_path}/{name}",
+                        zarr_format=3,
+                        consolidated=False,
+                    )
+                    fill = array.metadata.fill_value
+                    slabs[name] = np.full((*slab_shape, *trailing), fill, dtype=values.dtype)
+                slabs[name][region] = values.reshape((*inner_shape, *trailing))
+        # Companions + ragged for this inner chunk are not sharded: write them
+        # straight through (companion array is one block per chunk; ragged is CSR).
+        if chunk_res_fields:
+            _write_companion_columns(carrier, store, grid, block_index, chunk_res_fields)
+        write_ragged_to_zarr(
+            ragged, store, grid=grid, shard_key=_block_index_key(block_index, grid)
+        )
+
+    # One block selection per dense array == one shard object write.
+    for name, slab in slabs.items():
+        trailing = slab.shape[len(slab_shape) :]
+        block_idx = (*shard_block, *((0,) * len(trailing)))
+        with config.set({"async.concurrency": 128}):
+            array = open_array(
+                store,
+                path=f"{grid.group_path}/{name}",
+                zarr_format=3,
+                consolidated=False,
+            )
+            if trailing:
+                # Mirror write_dataframe_to_zarr's single-trailing-chunk invariant
+                # (issue #29): a vector field's trailing payload dim must be one whole
+                # (inner) chunk, or set_block_selection at trailing block 0 would
+                # silently write only part of it.
+                target_trailing_chunks = array.chunks[len(slab_shape) :]
+                if target_trailing_chunks != trailing:
+                    raise ValueError(
+                        f"vector field {name!r}: trailing chunk "
+                        f"{target_trailing_chunks} must equal trailing shape "
+                        f"{trailing} (the payload dim must be one whole chunk)"
+                    )
+            array.set_block_selection(block_idx, slab)
+    return store
+
+
+def _write_companion_columns(carrier, store, grid, block_index, chunk_res_fields):
+    """Write a chunk's ``resolution: chunk`` companion columns (unsharded path).
+
+    A ``resolution: chunk`` companion array is shaped at the coarse chunk grid
+    (one block per chunk), never sharded, so it keeps the per-chunk write even on
+    the sharded path. Reuses the same chunk-uniform collapse + block placement as
+    :func:`write_dataframe_to_zarr`'s companion branch.
+    """
+    block_idx = tuple(int(i) for i in block_index)
+    for name, values in _iter_carrier_columns(carrier):
+        if name not in chunk_res_fields:
+            continue
+        chunk_value = np.asarray(_chunk_uniform_value(name, values))
+        trailing = chunk_value.shape
+        block = chunk_value.reshape((1,) * len(block_idx) + trailing)
+        target = block_idx + (0,) * len(trailing)
+        with config.set({"async.concurrency": 128}):
+            array = open_array(
+                store,
+                path=f"{grid.group_path}/{name}",
+                zarr_format=3,
+                consolidated=False,
+            )
+            array.set_block_selection(target, block)
+
+
 def write_ragged_to_zarr(
     ragged: dict,
     store: Store,
