@@ -131,7 +131,7 @@ def make_figure(df: pd.DataFrame, cost_col: str, cost_label: str, out_png: Path)
         ax.scatter(
             xs,
             sub[cost_col],
-            s=60,
+            s=90,
             c=[f if f is not None else float("nan") for f in fracs],
             cmap=MEMORY_CMAP,
             norm=norm,
@@ -151,7 +151,9 @@ def make_figure(df: pd.DataFrame, cost_col: str, cost_label: str, out_png: Path)
         ax.set_xticklabels(labels, rotation=45, ha="right", fontsize=7)
 
         # Runtime on the right axis: hollow circles (not filled squares) so the
-        # memory-coloured cost marker underneath stays visible (issue #125).
+        # memory-coloured cost marker stays visible (issue #125). The twin axis is
+        # drawn after ``ax``, so raise ``ax`` above it and drop ``ax``'s opaque
+        # patch -- otherwise the runtime glyph sits on top of the cost circles.
         rt = ax.twinx()
         rt.plot(
             xs,
@@ -160,10 +162,13 @@ def make_figure(df: pd.DataFrame, cost_col: str, cost_label: str, out_png: Path)
             marker="o",
             markerfacecolor="none",
             color="C1",
+            zorder=1,
             label="runtime (s)",
         )
         rt.set_ylabel("runtime (s)", color="C1")
         rt.tick_params(axis="y", labelcolor="C1")
+        ax.set_zorder(rt.get_zorder() + 1)
+        ax.patch.set_visible(False)
 
     # Keep commit labels only on the bottom-most populated panel of each column;
     # hide the rows above so the labels aren't repeated up the grid.
