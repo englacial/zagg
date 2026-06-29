@@ -16,11 +16,28 @@ name: Lambda Benchmark
 # runs can't deploy/benchmark over each other.
 
 on:
+  # Only run when something benchmark-relevant changed: the deployed closure
+  # (src/zagg, deployment/aws, pyproject) or the matrix itself
+  # (tests/data/benchmark) -- but never for docs (*.md, incl. the matrix README).
+  # Doc/CI-only merges shouldn't pay for a run or add a redundant series point.
+  # Use workflow_dispatch to benchmark on demand (e.g. after a workflow/runner edit).
   pull_request:
     branches: [main]
     types: [opened, synchronize, reopened, ready_for_review]
+    paths:
+      - 'src/zagg/**'
+      - 'deployment/aws/**'
+      - 'pyproject.toml'
+      - 'tests/data/benchmark/**'
+      - '!**/*.md'
   push:
     branches: [main]
+    paths:
+      - 'src/zagg/**'
+      - 'deployment/aws/**'
+      - 'pyproject.toml'
+      - 'tests/data/benchmark/**'
+      - '!**/*.md'
   workflow_dispatch:
     inputs:
       targets:
