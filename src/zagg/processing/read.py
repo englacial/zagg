@@ -73,12 +73,19 @@ def _expand_mask_to_base(
     for p, keep in enumerate(coarse_mask):
         if not keep:
             continue
+        cnt = int(count_arr[p])
+        # Empty parents cover no base rows. Real ATL03 marks them with
+        # ``count == 0`` AND ``ph_index_beg == 0`` (issue #116), so under
+        # ``index_base=1`` they would otherwise give ``beg = 0 - 1 = -1`` and
+        # raise below; skip them, mirroring the non-empty-only contract
+        # ``read_plan.plan_read`` already uses (its ``cnt > 0`` skip).
+        if cnt == 0:
+            continue
         beg = int(index_beg_arr[p]) - index_base
         if beg < 0:
             raise ValueError(
                 f"index_beg_arr[{p}]={index_beg_arr[p]} is less than index_base={index_base}"
             )
-        cnt = int(count_arr[p])
         out[beg : beg + cnt] = True
     return out
 
@@ -131,12 +138,19 @@ def _broadcast_segment_to_base(
     else:
         out = np.zeros(total_base_size, dtype=seg_values.dtype)
     for p in range(len(seg_values)):
+        cnt = int(count_arr[p])
+        # Empty segments cover no photons. Real ATL03 marks them with
+        # ``count == 0`` AND ``ph_index_beg == 0`` (issue #116, see
+        # ``read_plan.plan_read``'s ``cnt > 0`` skip); under ``index_base=1``
+        # that gives ``beg = 0 - 1 = -1`` and would raise below, which is what
+        # made the gain_bias dem_h broadcast drop every photon. Skip them.
+        if cnt == 0:
+            continue
         beg = int(index_beg_arr[p]) - index_base
         if beg < 0:
             raise ValueError(
                 f"index_beg_arr[{p}]={index_beg_arr[p]} is less than index_base={index_base}"
             )
-        cnt = int(count_arr[p])
         if beg + cnt > total_base_size:
             raise ValueError(
                 f"segment {p} range [{beg}:{beg + cnt}] exceeds base size {total_base_size}; "
