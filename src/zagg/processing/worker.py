@@ -198,6 +198,7 @@ def process_shard(
     use_arrow = handoff in ("arrow", "arrow-kernel")
     all_reads = []
     files_processed = 0
+    read_errors = 0
 
     # Opt-in per-phase timing (issue #100). Only allocated when profiling so the
     # default path stays byte-identical (no dict, no time.time() calls).
@@ -226,7 +227,14 @@ def process_shard(
                     if chunk is not None:
                         all_reads.append(chunk)
                 except Exception as e:
-                    logger.debug(f"  Error reading track {g}: {e}")
+                    # A raised read error is always a real failure: a
+                    # legitimately-empty group returns ``None`` (no exception),
+                    # so promoting this to WARNING does not get noisy on shards
+                    # where many granules simply contribute 0 photons (issue
+                    # #116). Logging it at DEBUG hid the dem_h broadcast failure
+                    # behind the misleading "No data after filtering" below.
+                    read_errors += 1
+                    logger.warning(f"  Error reading track {g}: {e}")
                     continue
 
             files_processed += 1
@@ -251,12 +259,24 @@ def process_shard(
 
     logger.info(f"  Processed {files_processed}/{len(granule_urls)} files")
     metadata["files_processed"] = files_processed
+    if read_errors:
+        metadata["read_errors"] = read_errors
     if profile:
         phase_timings["read"] = time.time() - _read_t0
 
     if not all_reads:
-        logger.info(f"  No data after filtering for shard {shard_key} - skipping")
-        metadata["error"] = "No data after filtering"
+        # Distinguish a genuinely-empty read from one where every group raised
+        # (issue #116): the latter is a real read error masquerading as
+        # "no data", so report it as such instead of the misleading text.
+        if read_errors:
+            logger.warning(
+                f"  Read raised on all groups for shard {shard_key} "
+                f"({read_errors} read error(s)) - skipping"
+            )
+            metadata["error"] = f"All group reads raised ({read_errors} read errors)"
+        else:
+            logger.info(f"  No data after filtering for shard {shard_key} - skipping")
+            metadata["error"] = "No data after filtering"
         metadata["duration_s"] = (datetime.now() - start_time).total_seconds()
         if profile:
             metadata["phase_timings"] = phase_timings
