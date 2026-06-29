@@ -271,6 +271,10 @@ def _handle_process(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
         # read/index/aggregate deltas; the write phase runs here, so we bracket it
         # below and merge it in. Default (no key) leaves the worker path unchanged.
         profile = event.get("profile", False)
+        # Per-cell carrier/reducer (issue #130). Absent key -> "pandas", the
+        # byte-identical default worker path; "arrow"/"arrow-kernel" opt into the
+        # Arrow read carrier / experimental pyarrow.compute reducer for benchmarks.
+        handoff = event.get("handoff", "pandas")
         chunk_results: list = []
         _df_out, metadata = process_shard(
             grid,
@@ -279,6 +283,7 @@ def _handle_process(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
             s3_credentials=s3_creds,
             config=config,
             chunk_results=chunk_results,
+            handoff=handoff,
             profile=profile,
         )
 

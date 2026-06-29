@@ -133,9 +133,13 @@ def agg(
         Custom S3-compatible endpoint for the output store (e.g. R2, MinIO).
         Overrides ``output.endpoint_url`` in the config.
     handoff : str
-        Per-cell aggregation carrier: ``"pandas"`` (default) or ``"arrow"``.
-        Both produce byte-for-byte identical scalar outputs (#30); ``"arrow"``
-        is opt-in for benchmarking. Only honored by the ``"local"`` backend.
+        Per-cell aggregation carrier/reducer: ``"pandas"`` (default), ``"arrow"``,
+        or ``"arrow-kernel"`` (experimental pyarrow.compute reducer). ``"pandas"``
+        and ``"arrow"`` produce byte-for-byte identical scalar outputs (#30);
+        ``"arrow-kernel"`` agrees within ``KERNEL_RTOL`` (#33). Opt-in for
+        benchmarking. Honored by both the ``"local"`` and ``"lambda"`` backends
+        (issue #130): the lambda backend forwards it into each cell event, and the
+        default ``"pandas"`` keeps the event payload byte-identical (no key).
     profile : bool
         Opt-in per-phase timing (issue #100). When ``True`` (lambda backend),
         forwards ``profile`` into each cell event so the worker emits a
@@ -230,6 +234,7 @@ def agg(
             function_name=function_name,
             output_credentials=output_credentials,
             output_endpoint_url=resolved_endpoint,
+            handoff=handoff,
             profile=profile,
             max_retries=max_retries,
         )
@@ -556,6 +561,7 @@ def _run_lambda(
     function_name,
     output_credentials=None,
     output_endpoint_url=None,
+    handoff="pandas",
     profile=False,
     max_retries=3,
 ):
@@ -675,6 +681,7 @@ def _run_lambda(
             output_creds_event=output_creds_event,
             max_retries=max_retries,
             max_workers=state["workers"],
+            handoff=handoff,
             profile=profile,
         )
 
@@ -1029,6 +1036,7 @@ def _invoke_lambda_cell(
     output_creds_event=None,
     max_retries=3,
     max_workers=None,
+    handoff="pandas",
     profile=False,
 ):
     """Invoke Lambda for a single cell with retry logic.
@@ -1037,6 +1045,9 @@ def _invoke_lambda_cell(
     (#28); it does not affect dispatch. ``profile`` (issue #100) forwards a
     ``"profile": true`` event key so the worker emits ``phase_timings``; when
     False the event payload is byte-identical to the pre-profile path (no key).
+    ``handoff`` (issue #130) forwards a ``"handoff"`` event key selecting the
+    worker's carrier/reducer; the default ``"pandas"`` omits the key, keeping the
+    event byte-identical to the pre-handoff path.
     """
     wall_start = time.time()
 
@@ -1063,6 +1074,10 @@ def _invoke_lambda_cell(
     # Only add the key when profiling, so default runs stay byte-identical (#100).
     if profile:
         event["profile"] = True
+    # Only add the key for a non-default carrier, so default (pandas) runs stay
+    # byte-identical to the pre-handoff path (#130).
+    if handoff and handoff != "pandas":
+        event["handoff"] = handoff
 
     last_error = None
     for attempt in range(max_retries):
