@@ -297,9 +297,11 @@ def _handle_process(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
 
         def _write_chunk(block_index, carrier, ragged):
             nonlocal _write_elapsed
+            if write_error:
+                return  # a prior chunk failed (or template missing) — skip the rest
             store = _get_store()
             if store is None:
-                return  # template missing or a prior chunk failed — skip the rest
+                return  # template missing — recorded in write_error, skip the rest
             _t0 = time.time() if profile else None
             try:
                 # write_dataframe_to_zarr no-ops on an empty carrier, so no per-chunk

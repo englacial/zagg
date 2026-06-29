@@ -1433,6 +1433,34 @@ class TestStreamAndFreeChunkWrites:
                 write_chunk=lambda *a: None,
             )
 
+    def test_streaming_and_ragged_out_together_raises(self, monkeypatch):
+        """``write_chunk`` + ``ragged_out`` is rejected: the chunk's ragged is handed
+        to the callback, so ragged_out would be silently empty (review fold)."""
+        from mortie import geo2mort
+
+        from zagg.grids import from_config
+
+        cfg = self._scalar_cfg(chunk_inner=7)
+        grid = from_config(cfg)
+        shard_key = int(geo2mort(-78.5, -132.0, order=6)[0])
+        df = pd.DataFrame(
+            {
+                "h_li": np.array([1.0], dtype=np.float32),
+                "leaf_id": np.array([int(grid.children(shard_key)[0])], dtype=np.uint64),
+            }
+        )
+        self._patch_reads(monkeypatch, df)
+        with pytest.raises(ValueError, match="ignores ragged_out"):
+            process_shard(
+                grid,
+                shard_key,
+                ["s3://x"],
+                s3_credentials={},
+                config=cfg,
+                write_chunk=lambda *a: None,
+                ragged_out={},
+            )
+
     def test_k1_streaming_is_noop_byte_identical(self, monkeypatch):
         """K==1: the lone carrier streamed through ``write_chunk`` equals the carrier
         the default 2-tuple return produces — streaming changes nothing at K==1."""

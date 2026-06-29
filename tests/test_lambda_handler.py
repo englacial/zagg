@@ -277,6 +277,60 @@ class TestProcessEventWriteLoop:
         assert len(cap["ragged"]) == 1
         assert cap["ragged"][0][0] == event["shard_key"]
 
+    def test_streaming_later_chunk_write_failure_partial_writes_and_500(
+        self, handler_mod, monkeypatch
+    ):
+        """Issue #91: when a LATER streamed chunk's write raises after an earlier one
+        already wrote, the failure is recorded → 500, the earlier write stands, and
+        remaining chunks are skipped (the write_error short-circuit)."""
+        import zagg.grids as grids
+        import zagg.processing as processing
+
+        def fake_process_shard(grid, shard_key, granule_urls, **kwargs):
+            chunks = [
+                ((0,), pd.DataFrame(), {}),
+                ((1,), pd.DataFrame(), {}),
+                ((2,), pd.DataFrame(), {}),
+            ]
+            for block_index, carrier, ragged in chunks:
+                kwargs["write_chunk"](block_index, carrier, ragged)
+            return pd.DataFrame(), {
+                "shard_key": shard_key,
+                "cells_with_data": 1,
+                "total_obs": 1,
+                "duration_s": 0.0,
+                "error": None,
+            }
+
+        store = MagicMock()
+        store.exists.return_value = True
+        grid_stub = MagicMock()
+        grid_stub.group_path = "8"
+        grid_stub.chunk_grid_shape = (4,)
+        grid_stub.chunks_per_shard = 3
+        grid_stub.sharded = False
+
+        written = []
+
+        def fake_write_dense(c, st, *, grid, chunk_idx):
+            if chunk_idx == (1,):  # the SECOND chunk's write blows up
+                raise RuntimeError("boom")
+            written.append(chunk_idx)
+
+        monkeypatch.setattr(processing, "process_shard", fake_process_shard)
+        monkeypatch.setattr(grids, "from_config", lambda *a, **k: grid_stub)
+        monkeypatch.setattr(handler_mod, "open_store", lambda *a, **k: store)
+        monkeypatch.setattr(handler_mod, "write_dataframe_to_zarr", fake_write_dense)
+        monkeypatch.setattr(handler_mod, "write_ragged_to_zarr", lambda *a, **k: None)
+
+        event = _base_event(_healpix_config_dict())
+        event["child_order"] = 12
+        resp = handler_mod._handle_process(event, _context())
+        assert resp["statusCode"] == 500
+        assert "Failed to write zarr" in json.loads(resp["body"])["error"]
+        # Chunk 0 wrote; chunk 1 raised; chunk 2 was skipped (short-circuit).
+        assert written == [(0,)]
+
 
 class TestProcessEventProfile:
     """Issue #100 phase 3: the handler bridges the opt-in ``profile`` event key

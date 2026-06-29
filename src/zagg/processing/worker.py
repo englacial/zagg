@@ -290,6 +290,14 @@ def process_shard(
             "process_shard takes either chunk_results (accumulate) or write_chunk "
             "(stream-and-free, issue #91), not both."
         )
+    if write_chunk is not None and ragged_out is not None:
+        # When streaming, each chunk's ragged goes straight to write_chunk, so a
+        # ragged_out sink would be left silently empty — reject the ambiguity (as the
+        # chunk_results+write_chunk guard above does) rather than mislead the caller.
+        raise ValueError(
+            "process_shard ignores ragged_out when write_chunk is given (the chunk's "
+            "ragged is delivered to the callback); pass one or the other, not both."
+        )
     # A K>1 grid needs one of the two multi-chunk sinks: ``chunk_results`` to
     # accumulate the K carriers or ``write_chunk`` to stream-and-free them (#91).
     streaming = write_chunk is not None
@@ -408,7 +416,6 @@ def process_shard(
             # Stream-and-free (issue #91): write this chunk now and drop its refs so
             # peak output-side memory holds ~1 chunk, not all K. Nothing is stashed.
             write_chunk(block_index, carrier, ragged)
-            carrier = ragged = None
             del carrier, ragged
         elif chunk_results is not None:
             chunk_results.append((block_index, carrier, ragged))
