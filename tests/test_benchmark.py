@@ -358,3 +358,39 @@ def test_make_figure_returns_false_when_no_targets(tmp_path):
     rows = [_rec_row("c1", None, event="merge")]
     df = update_series.records_to_frame(rows)
     assert plot_series.make_figure(df, "cost_per_shard_usd", "cost", tmp_path / "x.png") is False
+
+
+# --- marker memory colouring (issue #120) ---------------------------------
+
+
+def test_memory_fractions_maps_each_row():
+    import plot_series
+
+    # 1024 MB / 2048 -> 0.5; 1963 MB / 2048 -> ~0.96 (the OOM-adjacent figure).
+    sub = update_series.records_to_frame(
+        [_rec_row("c1", "t1", mem=1024.0), _rec_row("c2", "t1", mem=1963.0)]
+    )
+    fracs = plot_series.memory_fractions(sub)
+    assert fracs[0] == pytest.approx(0.5)
+    assert fracs[1] == pytest.approx(0.9585, abs=1e-3)  # near the red end of the scale
+
+
+def test_memory_fractions_none_when_memory_missing():
+    import plot_series
+
+    sub = update_series.records_to_frame([_rec_row("c1", "t1")])
+    sub = sub.assign(max_memory_mb=None)  # legacy row: no memory recorded
+    assert plot_series.memory_fractions(sub) == [None]
+
+
+def test_make_figure_colours_markers_by_memory(tmp_path):
+    pytest.importorskip("matplotlib")
+    import plot_series
+
+    # Two points with distinct memory -> the scatter carries the fraction array,
+    # and a memory colorbar is attached to the figure.
+    rows = [_rec_row("c0", "t1", mem=512.0), _rec_row("c1", "t1", mem=1963.0)]
+    df = update_series.records_to_frame(rows)
+    out = tmp_path / "fig.png"
+    assert plot_series.make_figure(df, "cost_per_shard_usd", "cost", out) is True
+    assert out.exists()
