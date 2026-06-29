@@ -467,6 +467,56 @@ class TestInvokeLambdaCellRetry:
         assert result["error"] == "AccessDeniedException"
 
 
+class TestMaxRetriesPassthrough:
+    """`agg(max_retries=...)` threads the per-cell retry budget down to
+    ``_invoke_lambda_cell`` on the lambda backend (#119), default 3."""
+
+    def _drive(self, monkeypatch, atl06_config, catalog_file, **agg_kwargs):
+        import boto3
+
+        import zagg.grids as grids_mod
+        from zagg import runner
+        from zagg.concurrency import ConcurrencyReport
+
+        captured = {}
+
+        monkeypatch.setattr(runner, "get_nsidc_s3_credentials",
+                            lambda: {"accessKeyId": "a", "secretAccessKey": "s",
+                                     "sessionToken": "t"})
+        monkeypatch.setattr(grids_mod, "from_config", lambda *a, **k: _stub_grid())
+        monkeypatch.setattr(runner, "_invoke_lambda_setup", lambda *a, **k: None)
+        monkeypatch.setattr(runner, "_invoke_lambda_finalize", lambda *a, **k: None)
+        monkeypatch.setattr(runner, "_get_function_timeout_s", lambda *a, **k: 720)
+        from unittest.mock import MagicMock
+        monkeypatch.setattr(boto3, "Session", lambda *a, **k: MagicMock())
+        monkeypatch.setattr(
+            runner, "compute_available_workers",
+            lambda requested, *a, **k: (
+                1,
+                ConcurrencyReport(account_limit=1000, current_concurrent=0,
+                                  padding=100, available=900, function_reserved=None),
+            ),
+        )
+
+        def _fake_cell(*a, **k):
+            captured["max_retries"] = k.get("max_retries")
+            return {"status_code": 200, "body": {"total_obs": 1}, "error": None,
+                    "lambda_duration": 1.0, "shard_key": 0}
+
+        monkeypatch.setattr(runner, "_invoke_lambda_cell", _fake_cell)
+        agg(atl06_config, catalog=catalog_file, store="s3://out/x.zarr",
+            backend="lambda", **agg_kwargs)
+        return captured
+
+    def test_max_retries_threaded_end_to_end(self, monkeypatch, atl06_config, catalog_file):
+        captured = self._drive(monkeypatch, atl06_config, catalog_file, max_retries=1)
+        assert captured["max_retries"] == 1
+
+    def test_default_max_retries_is_three(self, monkeypatch, atl06_config, catalog_file):
+        captured = self._drive(monkeypatch, atl06_config, catalog_file)
+        assert captured["max_retries"] == 3
+
+
 class TestHandoffPassthrough:
     """`agg(handoff=...)` threads the carrier choice down to process_shard."""
 

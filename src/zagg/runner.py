@@ -88,6 +88,7 @@ def agg(
     output_endpoint_url: str | None = None,
     handoff: str = "pandas",
     profile: bool = False,
+    max_retries: int = 3,
 ) -> dict:
     """Run the aggregation pipeline.
 
@@ -141,6 +142,13 @@ def agg(
         ``phase_timings`` (read/index/aggregate) sub-dict, and the run prints a
         per-phase worker breakdown. Default ``False`` leaves the worker path and
         per-cell event payload byte-identical -- no probe tax.
+    max_retries : int
+        Lambda-only (issue #119). Per-cell retry budget for *transient*
+        client-side faults (throttle/network) in ``_invoke_lambda_cell``;
+        deterministic Lambda ``FunctionError``s (timeout, OOM, unhandled
+        exception) are never retried regardless. Default ``3``. Ignored by the
+        ``"local"`` backend. Set to ``1`` (e.g. the CI benchmark) to measure one
+        clean invocation and record a failure as a failure.
 
     Returns
     -------
@@ -223,6 +231,7 @@ def agg(
             output_credentials=output_credentials,
             output_endpoint_url=resolved_endpoint,
             profile=profile,
+            max_retries=max_retries,
         )
     else:
         raise ValueError(f"Unknown backend: {backend!r} (expected 'local' or 'lambda')")
@@ -548,6 +557,7 @@ def _run_lambda(
     output_credentials=None,
     output_endpoint_url=None,
     profile=False,
+    max_retries=3,
 ):
     """Run processing via AWS Lambda invocation.
 
@@ -663,6 +673,7 @@ def _run_lambda(
             function_name=function_name,
             config_dict=config_dict,
             output_creds_event=output_creds_event,
+            max_retries=max_retries,
             max_workers=state["workers"],
             profile=profile,
         )
