@@ -80,26 +80,35 @@ def make_figure(df: pd.DataFrame, cost_col: str, cost_label: str, out_png: Path)
         return False
     ncols = min(2, n)
     nrows = math.ceil(n / ncols)
-    fig, axes = plt.subplots(nrows, ncols, figsize=(7 * ncols, 3.2 * nrows), squeeze=False)
+    # Share the x-axis across panels so only the bottom row carries the commit
+    # labels (the rows above don't repeat them) -- cuts visual clutter.
+    fig, axes = plt.subplots(
+        nrows, ncols, figsize=(7 * ncols, 3.2 * nrows), squeeze=False, sharex=True
+    )
 
     # Fixed [0, 1] normalisation so colour means the same fraction-of-cap in
     # every panel and across both figures -- 1.0 (red) is the OOM wall.
     norm = Normalize(vmin=0.0, vmax=1.0)
 
+    # x positions/labels share across panels (same merge points per target).
+    nx = max(len(hist[hist["target"] == t]) for t in targets)
+    x = list(range(nx))
+    labels = [str(c)[:7] for c in hist.drop_duplicates("commit").sort_values("timestamp")["commit"]]
+
     for i, target in enumerate(targets):
         ax = axes[i // ncols][i % ncols]
         sub = hist[hist["target"] == target]
-        x = list(range(len(sub)))
-        labels = [str(c)[:7] for c in sub["commit"]]
+        xs = list(range(len(sub)))
 
         # Connecting line stays cost-blue; the markers carry the memory signal
         # (colour = % of the Lambda memory cap, green->red). Rows missing memory
         # plot uncoloured (grey) rather than dropping out.
         fracs = memory_fractions(sub)
-        ax.plot(x, sub[cost_col], "-", color="C0", zorder=1, label=cost_label)
+        ax.plot(xs, sub[cost_col], "-", color="C0", zorder=1, label=cost_label)
         ax.scatter(
-            x,
+            xs,
             sub[cost_col],
+            s=60,
             c=[f if f is not None else float("nan") for f in fracs],
             cmap=MEMORY_CMAP,
             norm=norm,
@@ -112,23 +121,49 @@ def make_figure(df: pd.DataFrame, cost_col: str, cost_label: str, out_png: Path)
         ax.tick_params(axis="y", labelcolor="C0")
         ax.set_title(target, fontsize=10)
         ax.set_xticks(x)
-        ax.set_xticklabels(labels, rotation=45, ha="right", fontsize=7)
 
+        # Runtime on the right axis: hollow circles (not filled squares) so the
+        # memory-coloured cost marker underneath stays visible (issue #125).
         rt = ax.twinx()
-        rt.plot(x, sub["runtime_s"], "s--", color="C1", label="runtime (s)")
+        rt.plot(
+            xs,
+            sub["runtime_s"],
+            linestyle="--",
+            marker="o",
+            markerfacecolor="none",
+            color="C1",
+            label="runtime (s)",
+        )
         rt.set_ylabel("runtime (s)", color="C1")
         rt.tick_params(axis="y", labelcolor="C1")
+
+    # Only label the bottom-most populated panel in each column (shared x-axis).
+    for col in range(ncols):
+        last = max((i for i in range(n) if i % ncols == col), default=None)
+        if last is None:
+            continue
+        bottom = axes[last // ncols][last % ncols]
+        bottom.set_xticklabels(labels, rotation=45, ha="right", fontsize=7)
 
     # Blank any unused panels in the grid.
     for j in range(n, nrows * ncols):
         axes[j // ncols][j % ncols].axis("off")
 
-    # One shared colorbar for the memory scale (issue #120).
+    fig.suptitle(f"zagg Lambda benchmark — {cost_label} vs merge history")
+    # One shared colorbar for the memory scale (issue #120) -- horizontal and
+    # tucked just below the title so it doesn't crowd the right-axis labels.
     sm = ScalarMappable(norm=norm, cmap=MEMORY_CMAP)
-    cbar = fig.colorbar(sm, ax=axes.ravel().tolist(), fraction=0.025, pad=0.02)
+    cbar = fig.colorbar(
+        sm,
+        ax=axes.ravel().tolist(),
+        orientation="horizontal",
+        location="top",
+        fraction=0.04,
+        pad=0.06,
+        aspect=40,
+    )
     cbar.set_label("peak memory (% of cap)")
 
-    fig.suptitle(f"zagg Lambda benchmark — {cost_label} vs merge history")
     out_png.parent.mkdir(parents=True, exist_ok=True)
     fig.savefig(out_png, dpi=120, bbox_inches="tight")
     plt.close(fig)
