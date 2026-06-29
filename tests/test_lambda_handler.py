@@ -9,6 +9,7 @@ other grids.
 
 import importlib.util
 import json
+import warnings
 from dataclasses import asdict
 from pathlib import Path
 from unittest.mock import MagicMock
@@ -16,6 +17,7 @@ from unittest.mock import MagicMock
 import pandas as pd
 import pytest
 from zarr import open_group
+from zarr.errors import GroupNotFoundError
 from zarr.storage import MemoryStore
 
 from zagg.config import default_config
@@ -172,9 +174,9 @@ class TestProcessEventWriteLoop:
             }
             return pd.DataFrame(), meta
 
-        # A store whose template always exists; record nothing on it.
+        # A store whose template always exists; record nothing on it. The handler
+        # checks existence via ``open_group`` (issue #118), so stub that to succeed.
         store = MagicMock()
-        store.exists.return_value = True
 
         def fake_write_dense(carrier, st, *, grid, chunk_idx):
             cap["dense"].append(chunk_idx)
@@ -194,6 +196,7 @@ class TestProcessEventWriteLoop:
         monkeypatch.setattr(processing, "process_shard", fake_process_shard)
         monkeypatch.setattr(grids, "from_config", lambda *a, **k: grid_stub)
         monkeypatch.setattr(handler_mod, "open_store", lambda *a, **k: store)
+        monkeypatch.setattr(handler_mod, "open_group", lambda *a, **k: MagicMock())
         monkeypatch.setattr(handler_mod, "write_dataframe_to_zarr", fake_write_dense)
         monkeypatch.setattr(handler_mod, "write_ragged_to_zarr", fake_write_ragged)
         return cap
@@ -249,9 +252,9 @@ class TestProcessEventProfile:
     ):
         """Patch process_shard to record the ``profile`` kwarg and (when given)
         seed ``metadata['phase_timings']``; fill the sink with ``chunks``.
-        ``template_exists`` toggles the store's existence check (template-missing
-        500 path); ``write_raises`` makes the dense write blow up (failed-write
-        500 path)."""
+        ``template_exists`` toggles the ``open_group`` existence check
+        (template-missing 500 path, via ``GroupNotFoundError``); ``write_raises``
+        makes the dense write blow up (failed-write 500 path)."""
         import zagg.grids as grids
         import zagg.processing as processing
 
@@ -272,13 +275,19 @@ class TestProcessEventProfile:
             return pd.DataFrame(), meta
 
         store = MagicMock()
-        store.exists.return_value = template_exists
         grid_stub = MagicMock()
         grid_stub.group_path = "8"
         grid_stub.chunk_grid_shape = (4,)
         # Regular (non-sharded) write path — a MagicMock attr is truthy by default,
         # so pin it off explicitly (issue #108 routes sharded grids elsewhere).
         grid_stub.sharded = False
+
+        # Existence check goes through ``open_group`` (issue #118): present ->
+        # returns a group; missing -> raises ``GroupNotFoundError``.
+        def fake_open_group(*a, **k):
+            if not template_exists:
+                raise GroupNotFoundError(grid_stub.group_path)
+            return MagicMock()
 
         def fake_write_dense(*a, **k):
             if write_raises:
@@ -287,6 +296,7 @@ class TestProcessEventProfile:
         monkeypatch.setattr(processing, "process_shard", fake_process_shard)
         monkeypatch.setattr(grids, "from_config", lambda *a, **k: grid_stub)
         monkeypatch.setattr(handler_mod, "open_store", lambda *a, **k: store)
+        monkeypatch.setattr(handler_mod, "open_group", fake_open_group)
         monkeypatch.setattr(handler_mod, "write_dataframe_to_zarr", fake_write_dense)
         monkeypatch.setattr(handler_mod, "write_ragged_to_zarr", lambda *a, **k: None)
         return cap
@@ -375,6 +385,68 @@ class TestProcessEventProfile:
         assert resp["statusCode"] == 500
         timings = json.loads(resp["body"])["phase_timings"]
         assert "write" not in timings
+
+
+class TestTemplateExistenceGuard:
+    """Issue #118: the pre-write template check used ``store.exists()``, whose
+    zarr v3 implementation is async — the un-awaited coroutine is always truthy,
+    so ``if not store.exists(...)`` never fired (dead code) and emitted
+    ``RuntimeWarning: coroutine ... was never awaited``. The fix checks via
+    ``open_group(..., mode="r")`` and catches ``GroupNotFoundError``."""
+
+    def _patch(self, handler_mod, monkeypatch, *, raises_missing):
+        import zagg.grids as grids
+        import zagg.processing as processing
+
+        def fake_process_shard(grid, shard_key, granule_urls, **kwargs):
+            kwargs["chunk_results"].append(((0,), pd.DataFrame(), {}))
+            meta = {
+                "shard_key": shard_key,
+                "cells_with_data": 1,
+                "total_obs": 1,
+                "duration_s": 0.0,
+                "error": None,
+            }
+            return pd.DataFrame(), meta
+
+        grid_stub = MagicMock()
+        grid_stub.group_path = "8"
+        grid_stub.chunk_grid_shape = (4,)
+        grid_stub.sharded = False
+
+        def fake_open_group(*a, **k):
+            if raises_missing:
+                raise GroupNotFoundError(grid_stub.group_path)
+            return MagicMock()
+
+        monkeypatch.setattr(processing, "process_shard", fake_process_shard)
+        monkeypatch.setattr(grids, "from_config", lambda *a, **k: grid_stub)
+        monkeypatch.setattr(handler_mod, "open_store", lambda *a, **k: MagicMock())
+        monkeypatch.setattr(handler_mod, "open_group", fake_open_group)
+        monkeypatch.setattr(handler_mod, "write_dataframe_to_zarr", lambda *a, **k: None)
+        monkeypatch.setattr(handler_mod, "write_ragged_to_zarr", lambda *a, **k: None)
+
+    def _event(self):
+        event = _base_event(_healpix_config_dict())
+        event["child_order"] = 12
+        return event
+
+    def test_missing_template_returns_500(self, handler_mod, monkeypatch):
+        # The guard must FIRE when the template group is absent. Against the
+        # pre-fix un-awaited ``store.exists`` this returned 200 (dead guard).
+        self._patch(handler_mod, monkeypatch, raises_missing=True)
+        resp = handler_mod._handle_process(self._event(), _context())
+        assert resp["statusCode"] == 500
+        assert "Zarr template not found" in json.loads(resp["body"])["error"]
+
+    def test_present_template_proceeds_without_runtimewarning(self, handler_mod, monkeypatch):
+        # Present template -> guard passes (200), and no ``coroutine ... was never
+        # awaited`` warning leaks (the foot-gun the fix removes).
+        self._patch(handler_mod, monkeypatch, raises_missing=False)
+        with warnings.catch_warnings():
+            warnings.simplefilter("error", RuntimeWarning)
+            resp = handler_mod._handle_process(self._event(), _context())
+        assert resp["statusCode"] == 200
 
 
 class TestSetupTemplate:
