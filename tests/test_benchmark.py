@@ -535,3 +535,37 @@ def test_make_figure_shared_x_and_circle_runtime(tmp_path, monkeypatch):
     top, bottom = base[:2], base[2:]
     assert all(not any(t.get_text() for t in ax.get_xticklabels()) for ax in top)
     assert all(any(t.get_text() for t in ax.get_xticklabels()) for ax in bottom)
+
+
+def test_make_figure_uneven_commit_sets_label_per_panel(tmp_path, monkeypatch):
+    # Regression for the per-target x-label misalignment class (fixed in c7d7080):
+    # when targets share x but have *different* commit sets (one missing an early
+    # merge), each bottom panel must carry ITS OWN commits in order -- not another
+    # panel's labels. A uniform-commit fixture can't catch this; an uneven one can.
+    pytest.importorskip("matplotlib")
+    import matplotlib
+
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+    import plot_series
+
+    captured = {}
+    monkeypatch.setattr(plt, "close", lambda fig: captured.setdefault("fig", fig))
+
+    # Two targets in one column-pair. ``_rec_row`` derives the timestamp from the
+    # commit-name length, so name lengths set the merge order. ``early`` has 3
+    # points; ``late`` skipped the first merge and has only 2.
+    early = [_rec_row(c, "t_early") for c in ("a", "bb", "ccc")]
+    late = [_rec_row(c, "t_late") for c in ("dd", "eee")]  # missing the len-1 merge
+    series = tmp_path / "series.parquet"
+    update_series.save_series(update_series.records_to_frame(early + late), series)
+    out = tmp_path / "fig.png"
+    assert plot_series.make_figure(
+        update_series.load_series(series), "cost_per_shard_usd", "c", out
+    )
+    fig = captured["fig"]
+
+    panels = {ax.get_title(): ax for ax in fig.axes if ax.get_title()}
+    # n=2 -> single row, so both panels are "bottom" and carry their own labels.
+    assert [t.get_text() for t in panels["t_early"].get_xticklabels()] == ["a", "bb", "ccc"]
+    assert [t.get_text() for t in panels["t_late"].get_xticklabels()] == ["dd", "eee"]

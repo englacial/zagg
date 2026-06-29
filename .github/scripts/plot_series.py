@@ -52,6 +52,19 @@ def memory_fractions(sub: pd.DataFrame) -> list[float | None]:
     ]
 
 
+def _memory_cap_mb(sub: pd.DataFrame) -> float:
+    """Lambda memory cap in MB, for the colorbar's fraction<->MB twin axis.
+
+    Reads ``memory_gb`` (uniform across the series -- the benchmark pins 2 GB) and
+    falls back to 2048 MB when the column is absent or empty.
+    """
+    if "memory_gb" in sub.columns:
+        caps = sub["memory_gb"].dropna()
+        if not caps.empty:
+            return float(caps.iloc[0]) * 1024.0
+    return 2.0 * 1024.0
+
+
 def _merge_history(df: pd.DataFrame) -> pd.DataFrame:
     """Retained points only (merge runs), ordered by time."""
     hist = df[df["event"] == "merge"].copy()
@@ -80,15 +93,30 @@ def make_figure(df: pd.DataFrame, cost_col: str, cost_label: str, out_png: Path)
         return False
     ncols = min(2, n)
     nrows = math.ceil(n / ncols)
-    # Share the x-axis across panels so only the bottom row carries the commit
-    # labels (the rows above don't repeat them) -- cuts visual clutter.
+    # Each panel keeps its OWN x-axis: targets can have different commit sets (one
+    # may have skipped an early merge), so a single shared axis would stamp one
+    # target's labels onto all panels. We instead hide the upper rows' commit
+    # labels by hand below, keeping the "only the bottom row is labelled" look
+    # without the misalignment. ``wspace`` opens a gap between the 2-wide columns
+    # so a panel's right-axis (runtime) labels don't collide with the next
+    # column's left-axis (cost) labels.
     fig, axes = plt.subplots(
-        nrows, ncols, figsize=(7 * ncols, 3.2 * nrows), squeeze=False, sharex=True
+        nrows,
+        ncols,
+        figsize=(7 * ncols, 3.2 * nrows),
+        squeeze=False,
+        gridspec_kw={"wspace": 0.45},
     )
 
-    # Fixed [0, 1] normalisation so colour means the same fraction-of-cap in
-    # every panel and across both figures -- 1.0 (red) is the OOM wall.
-    norm = Normalize(vmin=0.0, vmax=1.0)
+    # Clip the colour scale to the observed memory range (don't anchor at 0) so
+    # the green->red gradient spans only real data; fall back to [0, 1] when no
+    # row carries memory. ``cap_mb`` drives the colorbar's MB twin axis below.
+    fracs_all = [f for f in memory_fractions(hist) if f is not None]
+    vmin, vmax = (min(fracs_all), max(fracs_all)) if fracs_all else (0.0, 1.0)
+    if vmin == vmax:  # single observed value -> give the bar a hair of width
+        vmin, vmax = vmin - 0.01, vmax + 0.01
+    norm = Normalize(vmin=vmin, vmax=vmax)
+    cap_mb = _memory_cap_mb(hist)
 
     for i, target in enumerate(targets):
         ax = axes[i // ncols][i % ncols]
@@ -117,6 +145,11 @@ def make_figure(df: pd.DataFrame, cost_col: str, cost_label: str, out_png: Path)
         ax.set_title(target, fontsize=10)
         ax.set_xticks(xs)
 
+        # Label every panel with its own commits; the upper rows have the labels
+        # hidden afterwards, so only the bottom row of each column shows them.
+        labels = [str(c)[:7] for c in sub["commit"]]
+        ax.set_xticklabels(labels, rotation=45, ha="right", fontsize=7)
+
         # Runtime on the right axis: hollow circles (not filled squares) so the
         # memory-coloured cost marker underneath stays visible (issue #125).
         rt = ax.twinx()
@@ -132,17 +165,13 @@ def make_figure(df: pd.DataFrame, cost_col: str, cost_label: str, out_png: Path)
         rt.set_ylabel("runtime (s)", color="C1")
         rt.tick_params(axis="y", labelcolor="C1")
 
-    # Only label the bottom-most populated panel in each column (shared x-axis);
-    # labels come from that panel's own target so ticks/labels stay length-matched.
+    # Keep commit labels only on the bottom-most populated panel of each column;
+    # hide the rows above so the labels aren't repeated up the grid.
     for col in range(ncols):
         last = max((i for i in range(n) if i % ncols == col), default=None)
-        if last is None:
-            continue
-        bottom = axes[last // ncols][last % ncols]
-        sub = hist[hist["target"] == targets[last]]
-        labels = [str(c)[:7] for c in sub["commit"]]
-        bottom.set_xticks(list(range(len(sub))))
-        bottom.set_xticklabels(labels, rotation=45, ha="right", fontsize=7)
+        for i in range(n):
+            if i % ncols == col and i != last:
+                axes[i // ncols][i % ncols].tick_params(labelbottom=False)
 
     # Blank any unused panels in the grid.
     for j in range(n, nrows * ncols):
@@ -155,13 +184,17 @@ def make_figure(df: pd.DataFrame, cost_col: str, cost_label: str, out_png: Path)
     cbar = fig.colorbar(
         sm,
         ax=axes.ravel().tolist(),
-        orientation="horizontal",
         location="top",
         fraction=0.04,
-        pad=0.06,
+        pad=0.12,
         aspect=40,
     )
     cbar.set_label("peak memory (% of cap)")
+    cbar.ax.xaxis.set_major_formatter(lambda v, _pos: f"{v:.0%}")
+    # Twin axis (below the bar) reading the same scale in absolute MB: the bar's
+    # data coords are fraction-of-cap, so MB = fraction * cap_mb (and back).
+    mb_ax = cbar.ax.secondary_xaxis(-1.0, functions=(lambda f: f * cap_mb, lambda mb: mb / cap_mb))
+    mb_ax.set_xlabel("peak memory (MB)")
 
     out_png.parent.mkdir(parents=True, exist_ok=True)
     fig.savefig(out_png, dpi=120, bbox_inches="tight")
