@@ -57,6 +57,9 @@ import resource
 import time
 from typing import Any, Dict
 
+from zarr import open_group
+from zarr.errors import GroupNotFoundError
+
 # Import cloud-agnostic processing
 from zagg.config import load_config_from_dict
 from zagg.processing import (
@@ -286,10 +289,16 @@ def _handle_process(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
             store_path = event["store_path"]
             store = open_store(store_path, **_output_store_kwargs(event))
 
-            # Validate that Zarr template exists before writing
-            template_key = f"{grid.group_path}/zarr.json"
-            if not store.exists(template_key):
-                error_msg = f"Zarr template not found at {store_path}/{template_key}"
+            # Validate that the Zarr template exists before writing. ``store`` is a
+            # zarr v3 ``Store`` whose ``exists()`` is async, so open the group via
+            # the high-level sync API and catch the missing-node error instead
+            # (issue #118). Mirrors the open-and-catch pattern in
+            # ``readers/tdigest_tensor.py``. ``GroupNotFoundError`` is raised
+            # identically on the LocalStore and obstore-backed (S3) paths.
+            try:
+                open_group(store, path=grid.group_path, mode="r", zarr_format=3)
+            except GroupNotFoundError:
+                error_msg = f"Zarr template not found at {store_path}/{grid.group_path}"
                 logger.error(error_msg)
                 metadata["error"] = error_msg
                 return {
