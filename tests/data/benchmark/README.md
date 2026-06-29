@@ -140,6 +140,10 @@ top-level default (issue #121).
 
    Omit `temporal`/`cmr` to inherit the defaults, or set them to narrow the
    window. The drift test then rebuilds *this* map over its resolved 88°S AOI.
+   A `cmr` override carries `short_name`/`version`/`provider`/`footprint` (like
+   the top-level default) but **not** `backend`: the drift test reads the
+   build backend from the committed shard map's `metadata.backend`, not from
+   `cmr`.
 
    **High-latitude density → failure is the expected result.** Near ±88° the
    densest shard is far heavier than NEON's 44–50 granules, so the target will
