@@ -46,6 +46,7 @@ dependencies = [
 lambda = [
     "numpy==2.2.6",
     "pandas==2.2.3",
+    "pyarrow==24.0.0",
     "h5coro==1.0.4",
     "cramjam",
     "astropy",
