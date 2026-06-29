@@ -84,6 +84,7 @@ def _summary():
         "estimated_cost_usd": 0.00547,
         "function_timeout_s": 720,
         "worker_pct_timeout": 0.285,
+        "max_memory_mb": 1963.0,
     }
 
 
@@ -109,7 +110,30 @@ def test_build_record_cost_per_100km2():
     assert rec["runtime_s"] == 205.0  # worker_max_s preferred
     assert rec["n_granules"] == 44
     assert rec["zagg_version"] == "9.9.9"
+    assert rec["max_memory_mb"] == 1963.0  # threaded from the summary (issue #120)
     assert set(rec) == set(bench_metrics.RECORD_COLUMNS)
+
+
+def test_build_record_max_memory_null_safe():
+    # An empty/legacy summary leaves max_memory_mb null so old rows degrade.
+    g = HealpixGrid(parent_order=11, child_order=19)
+    rec = bench_metrics.build_record({}, grid=g, context={"target": "t"})
+    assert rec["max_memory_mb"] is None
+    assert "max_memory_mb" in bench_metrics.RECORD_COLUMNS
+
+
+def test_memory_pct_of_cap_maps_near_red():
+    # 1963 MB on a 2 GB cap -> ~0.96 (the OOM-adjacent run #1 figure, issue #120).
+    pct = bench_metrics.memory_pct_of_cap(1963.0, 2.0)
+    assert pct == pytest.approx(0.9585, abs=1e-3)
+
+
+def test_memory_pct_of_cap_null_safe():
+    assert bench_metrics.memory_pct_of_cap(None, 2.0) is None
+    assert bench_metrics.memory_pct_of_cap(1000.0, None) is None
+    assert bench_metrics.memory_pct_of_cap(1000.0, 0.0) is None
+    # A legacy parquet row degrades to NaN (not None) -> still treated as missing.
+    assert bench_metrics.memory_pct_of_cap(float("nan"), 2.0) is None
 
 
 def test_build_record_runtime_fallback():
@@ -277,7 +301,7 @@ def test_antarctic_88s_aoi_fixture_loads_near_turning_latitude():
 # --- update_series (parquet store) ----------------------------------------
 
 
-def _rec_row(commit, target, event="merge", cost=0.005, rt=200.0):
+def _rec_row(commit, target, event="merge", cost=0.005, rt=200.0, mem=1200.0):
     return {
         "timestamp": f"2026-01-01T00:00:0{len(commit) % 10}Z",
         "commit": commit,
@@ -301,6 +325,7 @@ def _rec_row(commit, target, event="merge", cost=0.005, rt=200.0):
         "memory_gb": 2.0,
         "price_per_gb_sec": 1.33334e-05,
         "zagg_version": "9.9.9",
+        "max_memory_mb": mem,
     }
 
 
@@ -388,3 +413,88 @@ def test_make_figure_returns_false_when_no_targets(tmp_path):
     rows = [_rec_row("c1", None, event="merge")]
     df = update_series.records_to_frame(rows)
     assert plot_series.make_figure(df, "cost_per_shard_usd", "cost", tmp_path / "x.png") is False
+
+
+# --- marker memory colouring (issue #120) ---------------------------------
+
+
+def test_memory_fractions_maps_each_row():
+    import plot_series
+
+    # 1024 MB / 2048 -> 0.5; 1963 MB / 2048 -> ~0.96 (the OOM-adjacent figure).
+    sub = update_series.records_to_frame(
+        [_rec_row("c1", "t1", mem=1024.0), _rec_row("c2", "t1", mem=1963.0)]
+    )
+    fracs = plot_series.memory_fractions(sub)
+    assert fracs[0] == pytest.approx(0.5)
+    assert fracs[1] == pytest.approx(0.9585, abs=1e-3)  # near the red end of the scale
+
+
+def test_memory_fractions_none_when_memory_missing():
+    import plot_series
+
+    sub = update_series.records_to_frame([_rec_row("c1", "t1")])
+    sub = sub.assign(max_memory_mb=None)  # legacy row: no memory recorded
+    assert plot_series.memory_fractions(sub) == [None]
+
+
+def test_make_figure_colours_markers_by_memory(tmp_path, monkeypatch):
+    pytest.importorskip("matplotlib")
+    import matplotlib
+
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+    import plot_series
+    from matplotlib.collections import PathCollection
+
+    # Stop make_figure from closing the figure so we can introspect the artists.
+    captured = {}
+    real_close = plt.close
+
+    def _capture_close(fig):
+        captured["fig"] = fig  # grab the figure on its way out
+
+    monkeypatch.setattr(plt, "close", _capture_close)
+
+    # Round-trip through parquet so the (commit, target) points land in order and
+    # carry real memory; 512/2048 -> 0.25, 1963/2048 -> ~0.96 (near the red end).
+    rows = [_rec_row("c0", "t1", mem=512.0), _rec_row("c1", "t1", mem=1963.0)]
+    series = tmp_path / "series.parquet"
+    update_series.save_series(update_series.records_to_frame(rows), series)
+    df = update_series.load_series(series)
+
+    out = tmp_path / "fig.png"
+    assert plot_series.make_figure(df, "cost_per_shard_usd", "cost", out) is True
+    assert out.exists()
+    fig = captured["fig"]
+
+    # The cost markers are a scatter whose colour array IS the memory fraction.
+    scatters = [c for ax in fig.axes for c in ax.collections if isinstance(c, PathCollection)]
+    arrays = [s.get_array() for s in scatters if s.get_array() is not None]
+    assert any(
+        len(a) == 2 and a[0] == pytest.approx(0.25) and a[1] == pytest.approx(0.9585, abs=1e-3)
+        for a in arrays
+    )
+    # A colorbar (its own axes) is attached for the memory scale.
+    assert len(fig.axes) > 1
+    real_close(fig)
+
+
+def test_make_figure_null_memory_renders_uncoloured(tmp_path):
+    pytest.importorskip("matplotlib")
+    import plot_series
+
+    # A legacy row reads back as NaN memory -> uncoloured marker, no crash.
+    rows = [_rec_row("c0", "t1", mem=900.0), _rec_row("c1", "t1")]
+    series = tmp_path / "series.parquet"
+    df = update_series.records_to_frame(rows)
+    df = df.assign(max_memory_mb=[900.0, None])
+    update_series.save_series(df, series)
+    out = tmp_path / "fig.png"
+    assert (
+        plot_series.make_figure(
+            update_series.load_series(series), "cost_per_shard_usd", "cost", out
+        )
+        is True
+    )
+    assert out.exists()

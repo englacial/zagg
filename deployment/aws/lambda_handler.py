@@ -53,6 +53,7 @@ full pipeline using only lambda:InvokeFunction.
 import json
 import logging
 import os
+import resource
 import time
 from typing import Any, Dict
 
@@ -69,6 +70,17 @@ from zagg.store import open_store
 # Set up structured logging
 logger = logging.getLogger()
 logger.setLevel(logging.INFO)
+
+
+def _max_memory_mb() -> float:
+    """Peak resident set size of this worker in MB (issue #120).
+
+    ``ru_maxrss`` is a high-water mark over the whole process, so reading it at
+    the end of the invocation captures read+index+aggregate+write. On Linux
+    (the Lambda runtime) the field is in kibibytes; tracks CloudWatch's "Max
+    Memory Used" closely.
+    """
+    return resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / 1024.0
 
 
 def _output_store_kwargs(event: Dict[str, Any]) -> Dict[str, Any]:
@@ -333,6 +345,11 @@ def _handle_process(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
                 logger.error(f"Failed to write zarr to {store_path}: {e}")
                 metadata["error"] = f"Failed to write zarr: {e}"
 
+        # Peak worker RSS (issue #120): captured here, after the write phase, so
+        # it covers the full invocation. Threaded back via the result body so the
+        # orchestrator can surface OOM-proximity without CloudWatch access.
+        metadata["max_memory_mb"] = _max_memory_mb()
+
         # Log structured result
         logger.info(
             json.dumps(
@@ -342,6 +359,7 @@ def _handle_process(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
                     "cells_with_data": metadata["cells_with_data"],
                     "total_obs": metadata["total_obs"],
                     "duration_s": metadata["duration_s"],
+                    "max_memory_mb": metadata["max_memory_mb"],
                     "error": metadata.get("error"),
                     "request_id": context.aws_request_id,
                 }
