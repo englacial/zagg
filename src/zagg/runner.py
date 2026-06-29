@@ -1068,14 +1068,22 @@ def _invoke_lambda_cell(
             function_error = response.get("FunctionError")
             is_timeout = False
             if function_error:
+                # Every ``FunctionError`` on a synchronous invoke is deterministic
+                # for a given shard -- a timeout, ``Runtime.OutOfMemory``, or an
+                # exception that escaped the handler -- so none are retried: they
+                # all return immediately, exactly as timeouts already did (#119).
+                # (Transient throttle/network faults are a separate channel,
+                # retried with backoff in the ``except`` block below.) The error
+                # is tagged with its real mode so a benchmark records an OOM as an
+                # OOM rather than masking it behind a later retry's outcome.
                 error_payload = response["Payload"].read().decode("utf-8")
                 if "Task timed out" in error_payload:
                     is_timeout = True
                     last_error = f"Lambda timeout: {error_payload[:100]}"
+                elif "Runtime.OutOfMemory" in error_payload:
+                    last_error = f"Lambda OOM: {error_payload[:100]}"
                 else:
                     last_error = f"Lambda error ({function_error}): {error_payload[:100]}"
-                if not is_timeout:
-                    continue
 
             result = json.loads(response["Payload"].read()) if not function_error else {}
             try:

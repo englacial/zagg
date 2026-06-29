@@ -372,6 +372,101 @@ class TestInvokeLambdaCellEvent:
         assert "profile" not in event
 
 
+class TestInvokeLambdaCellRetry:
+    """Retry policy (#119): deterministic ``FunctionError``s (OOM / runtime
+    crash) return immediately -- they are never re-invoked -- while transient
+    client-side faults (throttle/network) still retry with backoff.
+    """
+
+    _CREDS = {"accessKeyId": "a", "secretAccessKey": "s", "sessionToken": "t"}
+
+    def _invoke(self, client, *, max_retries=3):
+        from zagg.runner import _invoke_lambda_cell
+
+        return _invoke_lambda_cell(
+            client, (0,), 12345, 6, 12,
+            ["s3://b/g.h5"], "s3://out/x.zarr", self._CREDS,
+            function_name="process-shard", config_dict=None, max_workers=4,
+            max_retries=max_retries,
+        )
+
+    def _function_error_response(self, error_payload):
+        from unittest.mock import MagicMock
+
+        payload = MagicMock()
+        payload.read.return_value = error_payload.encode()
+        return {"Payload": payload, "FunctionError": "Unhandled"}
+
+    def test_oom_function_error_not_retried(self):
+        from unittest.mock import MagicMock
+
+        client = MagicMock()
+        client.invoke.return_value = self._function_error_response(
+            '{"errorType": "Runtime.OutOfMemory"}'
+        )
+        result = self._invoke(client)
+        # A deterministic FunctionError is invoked exactly once, regardless of
+        # max_retries, and the recorded error reflects the OOM (not masked).
+        assert client.invoke.call_count == 1
+        assert result["retries"] == 0
+        assert result["error"].startswith("Lambda OOM:")
+        assert result["status_code"] is None
+
+    def test_generic_function_error_not_retried(self):
+        from unittest.mock import MagicMock
+
+        client = MagicMock()
+        client.invoke.return_value = self._function_error_response(
+            '{"errorType": "RuntimeError", "errorMessage": "boom"}'
+        )
+        result = self._invoke(client)
+        assert client.invoke.call_count == 1
+        assert result["retries"] == 0
+        assert result["error"].startswith("Lambda error (Unhandled):")
+
+    def test_transient_client_error_retried_with_backoff(self, monkeypatch):
+        from unittest.mock import MagicMock
+
+        import zagg.runner as runner
+
+        sleeps = []
+        monkeypatch.setattr(runner.time, "sleep", lambda s: sleeps.append(s))
+
+        ok_payload = MagicMock()
+        ok_payload.read.return_value = json.dumps(
+            {"statusCode": 200, "body": json.dumps({"total_obs": 7, "duration_s": 1.0})}
+        ).encode()
+        ok = {"Payload": ok_payload, "FunctionError": None}
+
+        client = MagicMock()
+        client.invoke.side_effect = [
+            Exception("TooManyRequestsException: Rate exceeded"),
+            ok,
+        ]
+        result = self._invoke(client)
+        # Transient fault retried: invoked twice, slept once with backoff.
+        assert client.invoke.call_count == 2
+        assert len(sleeps) == 1
+        assert result["status_code"] == 200
+        assert result["retries"] == 1
+
+    def test_non_retryable_client_error_breaks(self, monkeypatch):
+        from unittest.mock import MagicMock
+
+        import zagg.runner as runner
+
+        sleeps = []
+        monkeypatch.setattr(runner.time, "sleep", lambda s: sleeps.append(s))
+
+        client = MagicMock()
+        client.invoke.side_effect = Exception("AccessDeniedException")
+        result = self._invoke(client)
+        # A non-transient client error is not retried (break), no backoff sleep.
+        assert client.invoke.call_count == 1
+        assert sleeps == []
+        assert result["error"] == "AccessDeniedException"
+
+
 class TestHandoffPassthrough:
     """`agg(handoff=...)` threads the carrier choice down to process_shard."""
 
