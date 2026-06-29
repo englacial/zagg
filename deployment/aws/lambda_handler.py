@@ -53,11 +53,16 @@ full pipeline using only lambda:InvokeFunction.
 import json
 import logging
 import os
+import time
 from typing import Any, Dict
 
 # Import cloud-agnostic processing
 from zagg.config import load_config_from_dict
-from zagg.processing import write_dataframe_to_zarr, write_ragged_to_zarr
+from zagg.processing import (
+    write_dataframe_to_zarr,
+    write_ragged_to_zarr,
+    write_shard_to_zarr,
+)
 from zagg.processing.write import _block_index_key
 from zagg.store import open_store
 
@@ -91,9 +96,7 @@ def _output_store_kwargs(event: Dict[str, Any]) -> Dict[str, Any]:
         return {"region": region}
     missing = [k for k in ("accessKeyId", "secretAccessKey") if k not in creds]
     if missing:
-        raise ValueError(
-            f"output_credentials missing keys: {', '.join(missing)}"
-        )
+        raise ValueError(f"output_credentials missing keys: {', '.join(missing)}")
     kwargs: Dict[str, Any] = {
         "region": creds.get("region", region),
         "credentials": creds,
@@ -147,8 +150,7 @@ def _handle_setup(event: Dict[str, Any]) -> Dict[str, Any]:
         return {"statusCode": 200, "body": json.dumps({"ok": True, "mode": "setup"})}
     except Exception as e:
         logger.exception(e)
-        return {"statusCode": 500,
-                "body": json.dumps({"error": str(e), "mode": "setup"})}
+        return {"statusCode": 500, "body": json.dumps({"error": str(e), "mode": "setup"})}
 
 
 def _handle_finalize(event: Dict[str, Any]) -> Dict[str, Any]:
@@ -162,8 +164,7 @@ def _handle_finalize(event: Dict[str, Any]) -> Dict[str, Any]:
         return {"statusCode": 200, "body": json.dumps({"ok": True, "mode": "finalize"})}
     except Exception as e:
         logger.exception(e)
-        return {"statusCode": 500,
-                "body": json.dumps({"error": str(e), "mode": "finalize"})}
+        return {"statusCode": 500, "body": json.dumps({"error": str(e), "mode": "finalize"})}
 
 
 def _handle_process(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
@@ -227,8 +228,10 @@ def _handle_process(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
         # Build grid (writer needs group_path + chunk_shape; no populated_shards
         # required because the orchestrator already computed chunk_idx).
         from zagg.grids import from_config
+
         if config is None:
             from zagg.config import default_config
+
             config = default_config("atl06")
 
         # child_order is required for HEALPix runs (drives the leaf order); it is
@@ -247,6 +250,12 @@ def _handle_process(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
         # Zarr chunk through the sink. At K==1 the sink holds exactly one entry whose
         # ``block_index`` equals ``event["chunk_idx"]``, so the write is unchanged.
         from zagg.processing import process_shard
+
+        # Opt-in per-phase timing (issue #100). When the orchestrator forwards
+        # ``profile``, ``process_shard`` fills ``metadata["phase_timings"]`` with
+        # read/index/aggregate deltas; the write phase runs here, so we bracket it
+        # below and merge it in. Default (no key) leaves the worker path unchanged.
+        profile = event.get("profile", False)
         chunk_results: list = []
         _df_out, metadata = process_shard(
             grid,
@@ -255,10 +264,12 @@ def _handle_process(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
             s3_credentials=s3_creds,
             config=config,
             chunk_results=chunk_results,
+            profile=profile,
         )
 
         # Write Zarr to store: one dense region per chunk plus its ragged (CSR)
         # companion. Mirrors the local runner's K>1 write loop (``_process_and_write``).
+        _write_t0 = time.time() if profile else None
         if chunk_results:
             store_path = event["store_path"]
             store = open_store(store_path, **_output_store_kwargs(event))
@@ -279,29 +290,45 @@ def _handle_process(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
             single_chunk = len(chunk_results) == 1
             shard_key = event["shard_key"]
             try:
-                for block_index, carrier, ragged in chunk_results:
-                    # write_dataframe_to_zarr no-ops on an empty carrier, so no
-                    # per-chunk emptiness check is needed. Use each chunk's own
-                    # block_index (from iter_chunks), not event["chunk_idx"].
-                    write_dataframe_to_zarr(
-                        carrier,
-                        store,
-                        grid=grid,
-                        chunk_idx=block_index,
-                    )
-                    # Persist this chunk's ragged (CSR) fields (issue #48). At K==1 the
-                    # chunk IS the shard, so the CSR subgroup is keyed by ``shard_key``
-                    # (cell-resolution contract); at K>1 each finer chunk is keyed by
-                    # its own block index. No-ops when ``ragged`` is empty.
-                    ragged_key = (
-                        int(shard_key) if single_chunk else _block_index_key(block_index, grid)
-                    )
-                    write_ragged_to_zarr(
-                        ragged,
-                        store,
-                        grid=grid,
-                        shard_key=ragged_key,
-                    )
+                # Sharded output (issue #108): bundle the shard's K inner chunks into
+                # one ShardingCodec shard object — write the whole shard in one block
+                # selection per dense array (mirrors the local runner). A per-inner-
+                # chunk loop would read-modify-write the same shard object.
+                if getattr(grid, "sharded", False):
+                    write_shard_to_zarr(chunk_results, store, grid=grid, shard_key=int(shard_key))
+                else:
+                    for block_index, carrier, ragged in chunk_results:
+                        # write_dataframe_to_zarr no-ops on an empty carrier, so no
+                        # per-chunk emptiness check is needed. Use each chunk's own
+                        # block_index (from iter_chunks), not event["chunk_idx"].
+                        write_dataframe_to_zarr(
+                            carrier,
+                            store,
+                            grid=grid,
+                            chunk_idx=block_index,
+                        )
+                        # Persist this chunk's ragged (CSR) fields (issue #48). At K==1
+                        # the chunk IS the shard, so the CSR subgroup is keyed by
+                        # ``shard_key`` (cell-resolution contract); at K>1 each finer
+                        # chunk is keyed by its own block index. No-ops when empty.
+                        ragged_key = (
+                            int(shard_key) if single_chunk else _block_index_key(block_index, grid)
+                        )
+                        write_ragged_to_zarr(
+                            ragged,
+                            store,
+                            grid=grid,
+                            shard_key=ragged_key,
+                        )
+                # Record the write-phase timing (issue #100) only on a clean write:
+                # read/index/aggregate come from ``process_shard``; ``write`` is owned
+                # here and joins the same sub-dict. Recording inside the ``try`` (and
+                # after the early-return template-missing 500) keeps ``write`` absent
+                # on every failure path, so the runner's per-phase max rollup never
+                # folds in a time-to-failure as a real write duration. The no-data
+                # path returns earlier without writing, so ``write`` stays absent too.
+                if profile and "phase_timings" in metadata:
+                    metadata["phase_timings"]["write"] = time.time() - _write_t0
             except Exception as e:
                 logger.error(f"Failed to write zarr to {store_path}: {e}")
                 metadata["error"] = f"Failed to write zarr: {e}"

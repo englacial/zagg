@@ -296,6 +296,35 @@ class TestFromConfig:
         with pytest.raises(ValueError, match="Unknown output.grid.type"):
             from_config(cfg, parent_order=6)
 
+    def test_sharded_default_off(self, cfg):
+        # The knob is absent by default -> regular (non-sharded) storage (issue #108).
+        g = from_config(cfg, parent_order=6)
+        assert g.sharded is False
+
+    def test_sharded_flag_threads_through(self, cfg):
+        # sharded on the grid block, with chunk_inner giving K>1, yields a sharded grid.
+        cfg.output["grid"]["chunk_inner"] = 8
+        cfg.output["grid"]["sharded"] = True
+        g = from_config(cfg, parent_order=6)
+        assert g.sharded is True
+        assert g.chunks_per_shard > 1
+
+    def test_sharded_k1_validated_pre_deployment(self, cfg):
+        # sharded without chunk_inner (K==1) is meaningless -> error at construction
+        # (validated before lambda deployment, matching the grid-mismatch errors).
+        cfg.output["grid"]["sharded"] = True
+        with pytest.raises(ValueError, match="K>1"):
+            from_config(cfg, parent_order=6)
+
+    def test_sharded_off_byte_identical_template(self, cfg):
+        # Flag off must reproduce the regular template byte-for-byte even when
+        # chunk_inner is set (sharding is purely opt-in storage form).
+        cfg.output["grid"]["chunk_inner"] = 8
+        g_off = from_config(cfg, parent_order=6)
+        cfg.output["grid"]["sharded"] = False
+        g_explicit_off = from_config(cfg, parent_order=6)
+        assert g_off._spec().model_dump() == g_explicit_off._spec().model_dump()
+
 
 class TestBackcompatWrapper:
     """xdggs_zarr_template (the public API) must keep producing the same
@@ -782,4 +811,160 @@ class TestChunkInnerMultiChunk:
         g1 = RectilinearGrid(
             "EPSG:3031", 100000.0, bounds, chunk_shape=(8, 8), config=cfg, chunk_inner=(4, 4)
         )
+        assert g0.signature() == g1.signature()
+
+
+class TestSharded:
+    """Issue #108: HEALPix ShardingCodec output — one shard object per dispatch
+    shard, K inner read-chunks bundled inside (empties omitted)."""
+
+    # parent 4, child 8, chunk_inner 6 -> K = 4^(6-4) = 16 inner chunks/shard,
+    # each cells_per_chunk = 4^(8-6) = 16 cells; cells_per_shard = 256.
+    def _grid(self, sharded=True):
+        cfg = default_config("atl06")
+        return HealpixGrid(
+            parent_order=4,
+            child_order=8,
+            layout="fullsphere",
+            config=cfg,
+            chunk_inner=6,
+            sharded=sharded,
+        )
+
+    def test_k1_sharded_rejected(self):
+        cfg = default_config("atl06")
+        # No chunk_inner -> K == 1 -> sharding is a no-op shard of one chunk.
+        with pytest.raises(ValueError, match="K>1"):
+            HealpixGrid(4, 8, layout="fullsphere", config=cfg, sharded=True)
+
+    def test_template_emits_sharding_codec(self):
+        g = self._grid()
+        assert g.cells_per_shard == 256
+        assert g.cells_per_chunk == 16
+        store = MemoryStore()
+        g.emit_template(store)
+        group = open_group(store, path="8", mode="r")
+        for name in group:
+            arr = group[name]
+            # Sharded: zarr chunks == inner read chunk; shards == dispatch shard.
+            assert arr.chunks == (16,), name
+            assert arr.shards == (256,), name
+            assert any("sharding" in type(c).__name__.lower() for c in arr.metadata.codecs), name
+
+    def test_flag_off_byte_identical_to_regular(self):
+        # Sharded OFF must reproduce the existing regular template exactly.
+        g_off = self._grid(sharded=False)
+        g_reg = HealpixGrid(
+            4, 8, layout="fullsphere", config=default_config("atl06"), chunk_inner=6
+        )
+        assert g_off._spec().model_dump() == g_reg._spec().model_dump()
+
+    def test_inner_codecs_are_bytes_only(self):
+        # The bytes-only/uncompressed policy must survive the sharding wrap: the
+        # inner codecs carry no compressor (caveat: zarr.create_array injects zstd).
+        g = self._grid()
+        spec = g._spec()
+        h_mean = spec.members["h_mean"].model_dump()
+        (codec,) = h_mean["codecs"]
+        assert codec["name"] == "sharding_indexed"
+        inner = codec["configuration"]["codecs"]
+        assert [c["name"] for c in inner] == ["bytes"]
+        assert codec["configuration"]["chunk_shape"] == [16]
+
+    def test_one_shard_object_empties_omitted_and_roundtrip(self):
+        from mortie import geo2mort
+        from zarr import open_array
+
+        g = self._grid()
+        store = MemoryStore()
+        g.emit_template(store)
+        arr = open_array(store, path="8/h_mean", zarr_format=3, consolidated=False)
+
+        # Populate ONE dispatch shard, only its first inner chunk (sub-shard
+        # sparsity): a whole-shard slab that is mostly fill.
+        parent = int(geo2mort(-78.5, -132.0, order=4)[0])
+        (shard_block,) = g.block_index(parent)
+        slab = np.full(g.cells_per_shard, np.nan, dtype="float32")
+        slab[: g.cells_per_chunk] = np.arange(g.cells_per_chunk, dtype="float32")
+        # Block selection is shard-granular on a sharded array (issue #108): one
+        # block == one shard, so this writes the whole shard in a single call.
+        arr.set_block_selection((shard_block,), slab)
+
+        # Exactly one shard object on disk for the one populated shard.
+        shard_keys = [k for k in store._store_dict if k.startswith("8/h_mean/c/")]
+        assert shard_keys == [f"8/h_mean/c/{shard_block}"]
+
+        # Byte-exact read-back of the whole shard.
+        lo = shard_block * g.cells_per_shard
+        read = arr[lo : lo + g.cells_per_shard]
+        np.testing.assert_array_equal(read[: g.cells_per_chunk], np.arange(g.cells_per_chunk))
+        assert np.all(np.isnan(read[g.cells_per_chunk :]))
+
+        # Partial decode: read just the populated inner (read) chunk via a slice
+        # narrower than the shard — the sharding index serves it without the rest.
+        chunk = arr[lo : lo + g.cells_per_chunk]
+        np.testing.assert_array_equal(chunk, np.arange(g.cells_per_chunk))
+
+    def test_sparse_shard_omits_empty_inner_chunks(self):
+        # A shard object holding one populated 16-cell inner chunk must be far
+        # smaller than a fully-dense shard (empty inner chunks absent from index).
+        from mortie import geo2mort
+        from zarr import open_array
+
+        g = self._grid()
+        store = MemoryStore()
+        g.emit_template(store)
+        arr = open_array(store, path="8/h_mean", zarr_format=3, consolidated=False)
+        parent = int(geo2mort(-78.5, -132.0, order=4)[0])
+        (shard_block,) = g.block_index(parent)
+
+        sparse = np.full(g.cells_per_shard, np.nan, dtype="float32")
+        sparse[: g.cells_per_chunk] = 1.0
+        arr.set_block_selection((shard_block,), sparse)
+        sparse_bytes = len(store._store_dict[f"8/h_mean/c/{shard_block}"])
+
+        dense = np.ones(g.cells_per_shard, dtype="float32")
+        arr.set_block_selection((shard_block,), dense)
+        dense_bytes = len(store._store_dict[f"8/h_mean/c/{shard_block}"])
+
+        assert sparse_bytes < dense_bytes
+
+    def test_vector_field_shards_and_roundtrips(self):
+        # A kind: vector field's trailing payload dim stays whole inside the shard:
+        # outer shard (cells_per_shard, T), inner chunk (cells_per_chunk, T). A whole-
+        # shard slab round-trips, and one shard object holds the K inner chunks.
+        from mortie import geo2mort
+        from zarr import open_array
+
+        g = HealpixGrid(
+            parent_order=4,
+            child_order=8,
+            layout="fullsphere",
+            config=_vector_config(bins=4, dtype="float32"),
+            chunk_inner=6,
+            sharded=True,
+        )
+        store = MemoryStore()
+        g.emit_template(store)
+        arr = open_array(store, path="8/hist", zarr_format=3, consolidated=False)
+        assert arr.chunks == (g.cells_per_chunk, 4)
+        assert arr.shards == (g.cells_per_shard, 4)
+
+        parent = int(geo2mort(-78.5, -132.0, order=4)[0])
+        (shard_block,) = g.block_index(parent)
+        slab = np.zeros((g.cells_per_shard, 4), dtype="float32")
+        slab[: g.cells_per_chunk] = np.arange(g.cells_per_chunk * 4).reshape(g.cells_per_chunk, 4)
+        arr.set_block_selection((shard_block, 0), slab)
+
+        shard_keys = [k for k in store._store_dict if k.startswith("8/hist/c/")]
+        assert shard_keys == [f"8/hist/c/{shard_block}/0"]
+        lo = shard_block * g.cells_per_shard
+        np.testing.assert_array_equal(arr[lo : lo + g.cells_per_shard], slab)
+
+    def test_sharded_not_in_signature(self):
+        # sharded is a storage form, not a spatial-layout change, so it must not
+        # alter the shard-map fingerprint (parallels chunk_inner's exclusion).
+        cfg = default_config("atl06")
+        g0 = HealpixGrid(4, 8, layout="fullsphere", config=cfg, chunk_inner=6)
+        g1 = HealpixGrid(4, 8, layout="fullsphere", config=cfg, chunk_inner=6, sharded=True)
         assert g0.signature() == g1.signature()

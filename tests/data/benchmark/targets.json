@@ -1,0 +1,101 @@
+{
+  "description": "Pinned Lambda-benchmark targets (issue #110). Each target dispatches ONE shard -- the densest cell over the NEON SERC AOP box -- so cost/runtime deltas track code changes, not data drift. Shard maps are shared per (grid, order): the densest shard does not depend on the aggregator. Rebuild + drift check: tests/test_benchmark_shardmap.py.",
+  "aoi": {
+    "file": "AOP_NEON.geojson",
+    "name": "NEON SERC AOP box"
+  },
+  "temporal": {
+    "start": "2018-10-13",
+    "end": "2025-06-01"
+  },
+  "cmr": {
+    "short_name": "ATL03",
+    "version": "007",
+    "provider": "NSIDC_CPRD",
+    "backend": "mortie",
+    "footprint": "swath"
+  },
+  "shardmaps": {
+    "healpix_o11": {
+      "path": "shardmaps/sm_healpix_o11.json",
+      "shard_key": 5347394812217655307,
+      "n_granules": 44,
+      "note": "4-way tie at 44 granules; the lowest-key tiebreak makes the pin deterministic. The benchmark always dispatches this static shard_key, so the series is stable regardless of CMR drift. The phase-5 drift test must tolerate tie reselection (compare granule count within +/-1, not exact shard_key)."
+    },
+    "healpix_o10": {
+      "path": "shardmaps/sm_healpix_o10.json",
+      "shard_key": 5347405532456026122,
+      "n_granules": 50
+    },
+    "rect_3km": {
+      "path": "shardmaps/sm_rect_3km.json",
+      "shard_key": 0,
+      "n_granules": 44,
+      "note": "Rectilinear (UTM 18N) ~order-11 analog: 3 km shard, 9 km2. Built with the exact-S2 spherely backend. 4-way tie at 44 granules; lowest-key tiebreak -> shard 0. Drift test is tie-tolerant (granule count, not exact key)."
+    },
+    "rect_6km": {
+      "path": "shardmaps/sm_rect_6km.json",
+      "shard_key": 0,
+      "n_granules": 47,
+      "note": "Rectilinear (UTM 18N) ~order-10 analog: 6 km shard, 36 km2. 2-way tie at 47 granules; lowest-key tiebreak -> shard 0."
+    }
+  },
+  "targets": {
+    "gain_bias_healpix_o11": {
+      "config": "configs/atl03_gain_bias_healpix_o11.yaml",
+      "shardmap": "healpix_o11",
+      "aggregator": "gain_bias",
+      "grid_type": "healpix",
+      "grid_size": "o11"
+    },
+    "tdigest_healpix_o11": {
+      "config": "configs/atl03_tdigest_healpix_o11.yaml",
+      "shardmap": "healpix_o11",
+      "aggregator": "tdigest",
+      "grid_type": "healpix",
+      "grid_size": "o11"
+    },
+    "gain_bias_healpix_o10": {
+      "config": "configs/atl03_gain_bias_healpix_o10.yaml",
+      "shardmap": "healpix_o10",
+      "aggregator": "gain_bias",
+      "grid_type": "healpix",
+      "grid_size": "o10"
+    },
+    "tdigest_healpix_o10": {
+      "config": "configs/atl03_tdigest_healpix_o10.yaml",
+      "shardmap": "healpix_o10",
+      "aggregator": "tdigest",
+      "grid_type": "healpix",
+      "grid_size": "o10"
+    },
+    "gain_bias_rect_3km": {
+      "config": "configs/atl03_gain_bias_rect_3km.yaml",
+      "shardmap": "rect_3km",
+      "aggregator": "gain_bias",
+      "grid_type": "rectilinear",
+      "grid_size": "3km"
+    },
+    "tdigest_rect_3km": {
+      "config": "configs/atl03_tdigest_rect_3km.yaml",
+      "shardmap": "rect_3km",
+      "aggregator": "tdigest",
+      "grid_type": "rectilinear",
+      "grid_size": "3km"
+    },
+    "gain_bias_rect_6km": {
+      "config": "configs/atl03_gain_bias_rect_6km.yaml",
+      "shardmap": "rect_6km",
+      "aggregator": "gain_bias",
+      "grid_type": "rectilinear",
+      "grid_size": "6km"
+    },
+    "tdigest_rect_6km": {
+      "config": "configs/atl03_tdigest_rect_6km.yaml",
+      "shardmap": "rect_6km",
+      "aggregator": "tdigest",
+      "grid_type": "rectilinear",
+      "grid_size": "6km"
+    }
+  }
+}

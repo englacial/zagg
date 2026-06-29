@@ -371,7 +371,7 @@ class TestInvokeLambdaCellEvent:
 
     _CREDS = {"accessKeyId": "a", "secretAccessKey": "s", "sessionToken": "t"}
 
-    def _captured_event(self, *, child_order):
+    def _captured_event(self, *, child_order, profile=False):
         from unittest.mock import MagicMock
 
         from zagg.runner import _invoke_lambda_cell
@@ -394,6 +394,7 @@ class TestInvokeLambdaCellEvent:
             function_name="process-shard",
             config_dict=None,
             max_workers=4,
+            profile=profile,
         )
         return json.loads(client.invoke.call_args.kwargs["Payload"])
 
@@ -410,6 +411,17 @@ class TestInvokeLambdaCellEvent:
         assert event["shard_key"] == 12345
         assert "child_order" not in event
         assert "parent_morton" not in event
+
+    def test_profile_flag_adds_event_key(self):
+        # issue #100 phase 2: --profile forwards "profile": true into the event.
+        event = self._captured_event(child_order=12, profile=True)
+        assert event["profile"] is True
+
+    def test_default_event_has_no_profile_key(self):
+        # Default (profile off): event payload is byte-identical to pre-profile;
+        # no "profile" key is added.
+        event = self._captured_event(child_order=12, profile=False)
+        assert "profile" not in event
 
 
 class TestHandoffPassthrough:
@@ -518,6 +530,14 @@ class TestSummaryKeysByteIdentical:
         "backend",
         "function_name",
         "results",
+        "setup_s",
+        "fanout_s",
+        "finalize_s",
+        "function_timeout_s",
+        "worker_max_s",
+        "worker_median_s",
+        "worker_pstdev_s",
+        "worker_pct_timeout",
     }
 
     def test_local_summary_keys_and_counts(self, monkeypatch, atl06_config):
@@ -667,6 +687,7 @@ class TestSummaryKeysByteIdentical:
         monkeypatch.setattr(grids_mod, "from_config", lambda *a, **k: _stub_grid())
         monkeypatch.setattr(runner, "_invoke_lambda_setup", lambda *a, **k: None)
         monkeypatch.setattr(runner, "_invoke_lambda_finalize", lambda *a, **k: None)
+        monkeypatch.setattr(runner, "_get_function_timeout_s", lambda *a, **k: 720)
         from unittest.mock import MagicMock
 
         monkeypatch.setattr(boto3, "Session", lambda *a, **k: MagicMock())
@@ -741,6 +762,7 @@ class TestSummaryKeysByteIdentical:
         monkeypatch.setattr(grids_mod, "from_config", lambda *a, **k: _stub_grid())
         monkeypatch.setattr(runner, "_invoke_lambda_setup", lambda *a, **k: None)
         monkeypatch.setattr(runner, "_invoke_lambda_finalize", lambda *a, **k: None)
+        monkeypatch.setattr(runner, "_get_function_timeout_s", lambda *a, **k: 720)
         from unittest.mock import MagicMock
 
         monkeypatch.setattr(boto3, "Session", lambda *a, **k: MagicMock())
@@ -787,3 +809,270 @@ class TestSummaryKeysByteIdentical:
         # The exact pre-refactor order: one multiply over the summed time.
         assert summary["gb_seconds"] == total * 2.0
         assert summary["estimated_cost_usd"] == (total * 2.0) * 0.0000133334
+
+
+def _run_lambda_with_durations(
+    monkeypatch, atl06_config, durations, *, timeout=720, profile=False, phase_timings=None
+):
+    """Drive ``_run_lambda`` over synthetic per-cell durations.
+
+    Returns the summary dict. ``durations`` is consumed one per cell (the
+    _run_catalog() has 4 cells); ``timeout`` stubs the function Timeout read.
+    ``profile``/``phase_timings`` exercise the phase-2 opt-in path: when
+    ``phase_timings`` is set it is attached to each cell result body.
+    """
+    import boto3
+
+    import zagg.grids as grids_mod
+    from zagg import runner
+    from zagg.concurrency import ConcurrencyReport
+
+    monkeypatch.setattr(runner, "get_nsidc_s3_credentials",
+                        lambda: {"accessKeyId": "a", "secretAccessKey": "s",
+                                 "sessionToken": "t"})
+    monkeypatch.setattr(grids_mod, "from_config", lambda *a, **k: _stub_grid())
+    monkeypatch.setattr(runner, "_invoke_lambda_setup", lambda *a, **k: None)
+    monkeypatch.setattr(runner, "_invoke_lambda_finalize", lambda *a, **k: None)
+    monkeypatch.setattr(runner, "_get_function_timeout_s", lambda *a, **k: timeout)
+    from unittest.mock import MagicMock
+    monkeypatch.setattr(boto3, "Session", lambda *a, **k: MagicMock())
+    monkeypatch.setattr(
+        runner, "compute_available_workers",
+        lambda requested, *a, **k: (
+            1,  # 1 worker -> deterministic completion order for the iter()
+            ConcurrencyReport(account_limit=1000, current_concurrent=0,
+                              padding=100, available=900, function_reserved=None),
+        ),
+    )
+    it = iter(durations)
+
+    def _fake_cell(*a, **k):
+        body = {"total_obs": 1}
+        if phase_timings is not None:
+            body["phase_timings"] = phase_timings
+        return {"status_code": 200, "body": body, "error": None,
+                "lambda_duration": next(it), "shard_key": 0}
+
+    monkeypatch.setattr(runner, "_invoke_lambda_cell", _fake_cell)
+    return runner._run_lambda(
+        atl06_config, _run_catalog(), "s3://out/x.zarr", 12,
+        max_cells=None, morton_cell=None, max_workers=1700, overwrite=False,
+        dry_run=False, region="us-west-2", function_name="process-shard",
+        profile=profile,
+    )
+
+
+class TestWorkerRuntimeStats:
+    """Phase 1 of issue #100: always-on worker-runtime distribution stats and
+    orchestrator phase brackets in the lambda summary."""
+
+    def test_worker_stats_pinned_against_synthetic_durations(self, monkeypatch, atl06_config):
+        import statistics
+
+        durations = [10.0, 20.0, 30.0, 100.0]
+        summary = _run_lambda_with_durations(
+            monkeypatch, atl06_config, durations, timeout=720
+        )
+        assert summary["function_timeout_s"] == 720
+        assert summary["worker_max_s"] == 100.0
+        assert summary["worker_median_s"] == statistics.median(durations)
+        assert summary["worker_pstdev_s"] == statistics.pstdev(durations)
+        assert summary["worker_pct_timeout"] == 100.0 / 720
+
+    def test_worker_pct_timeout_tracks_function_timeout(self, monkeypatch, atl06_config):
+        summary = _run_lambda_with_durations(
+            monkeypatch, atl06_config, [180.0, 60.0, 60.0, 60.0], timeout=900
+        )
+        assert summary["function_timeout_s"] == 900
+        assert summary["worker_pct_timeout"] == 180.0 / 900
+
+    def test_empty_durations_degrade_to_none(self, monkeypatch, atl06_config):
+        # All cells report zero/falsy lambda_duration -> no distribution.
+        summary = _run_lambda_with_durations(
+            monkeypatch, atl06_config, [0, 0, 0, 0], timeout=720
+        )
+        assert summary["worker_max_s"] is None
+        assert summary["worker_median_s"] is None
+        assert summary["worker_pstdev_s"] is None
+        assert summary["worker_pct_timeout"] is None
+        # function_timeout_s is still populated even with no durations.
+        assert summary["function_timeout_s"] == 720
+
+    def test_orchestrator_brackets_present_and_nonnegative(self, monkeypatch, atl06_config):
+        summary = _run_lambda_with_durations(
+            monkeypatch, atl06_config, [1.0, 2.0, 3.0, 4.0]
+        )
+        for key in ("setup_s", "fanout_s", "finalize_s"):
+            assert key in summary
+            assert summary[key] >= 0.0
+
+
+class TestGetFunctionTimeout:
+    """``_get_function_timeout_s`` reads the configured Timeout, or falls back
+    to the template default on any failure (issue #100)."""
+
+    def test_reads_timeout_from_client(self):
+        from unittest.mock import MagicMock
+
+        from zagg.runner import _get_function_timeout_s
+
+        client = MagicMock()
+        client.get_function_configuration.return_value = {"Timeout": 720}
+        assert _get_function_timeout_s(client, "process-shard") == 720
+        client.get_function_configuration.assert_called_once_with(FunctionName="process-shard")
+
+    def test_falls_back_on_error(self):
+        from unittest.mock import MagicMock
+
+        from zagg.runner import _DEFAULT_FUNCTION_TIMEOUT_S, _get_function_timeout_s
+
+        client = MagicMock()
+        client.get_function_configuration.side_effect = RuntimeError("AccessDenied")
+        assert _get_function_timeout_s(client, "process-shard") == _DEFAULT_FUNCTION_TIMEOUT_S
+
+    def test_falls_back_on_missing_key(self):
+        from unittest.mock import MagicMock
+
+        from zagg.runner import _DEFAULT_FUNCTION_TIMEOUT_S, _get_function_timeout_s
+
+        # Response without a "Timeout" key -> KeyError -> fallback.
+        client = MagicMock()
+        client.get_function_configuration.return_value = {}
+        assert _get_function_timeout_s(client, "process-shard") == _DEFAULT_FUNCTION_TIMEOUT_S
+
+    def test_falls_back_on_non_integer(self):
+        from zagg.runner import _DEFAULT_FUNCTION_TIMEOUT_S, _get_function_timeout_s
+
+        class _Client:
+            def get_function_configuration(self, **kwargs):
+                return {"Timeout": "not-a-number"}
+
+        assert _get_function_timeout_s(_Client(), "process-shard") == _DEFAULT_FUNCTION_TIMEOUT_S
+
+
+class TestProfilePlumbing:
+    """Phase 2 of issue #100: the opt-in --profile path. Default runs stay
+    byte-identical (no profile event key, no worker_phase_max summary key); when
+    set, the per-cell ``phase_timings`` roll up into ``worker_phase_max``."""
+
+    def test_default_run_omits_worker_phase_max(self, monkeypatch, atl06_config):
+        summary = _run_lambda_with_durations(
+            monkeypatch, atl06_config, [1.0, 2.0, 3.0, 4.0]
+        )
+        assert "worker_phase_max" not in summary
+
+    def test_profile_run_rolls_up_phase_max(self, monkeypatch, atl06_config):
+        # Every cell reports the same phase_timings; the rollup is the per-phase
+        # max across cells.
+        summary = _run_lambda_with_durations(
+            monkeypatch, atl06_config, [1.0, 2.0, 3.0, 4.0],
+            profile=True, phase_timings={"read": 5.0, "index": 1.0, "aggregate": 2.0},
+        )
+        assert summary["worker_phase_max"] == {"read": 5.0, "index": 1.0, "aggregate": 2.0}
+
+    def test_profile_run_with_no_phase_timings_is_empty(self, monkeypatch, atl06_config):
+        # profile=True but workers emitted no phase_timings (e.g. handler bridge
+        # not yet wired): the key is present but empty, never raising.
+        summary = _run_lambda_with_durations(
+            monkeypatch, atl06_config, [1.0, 2.0, 3.0, 4.0], profile=True
+        )
+        assert summary["worker_phase_max"] == {}
+
+    def test_agg_threads_profile_into_run_lambda(self, monkeypatch, atl06_config):
+        from zagg import runner
+
+        captured = {}
+
+        def fake_run_lambda(*a, **k):
+            captured["profile"] = k.get("profile")
+            return {}
+
+        monkeypatch.setattr(runner, "_load_catalog", lambda p: _run_catalog())
+        monkeypatch.setattr(runner, "_run_lambda", fake_run_lambda)
+        runner.agg(
+            atl06_config, catalog="ignored", store="s3://out/x.zarr",
+            backend="lambda", profile=True,
+        )
+        assert captured["profile"] is True
+
+    def test_agg_default_profile_is_false(self, monkeypatch, atl06_config):
+        from zagg import runner
+
+        captured = {}
+        monkeypatch.setattr(runner, "_load_catalog", lambda p: _run_catalog())
+        monkeypatch.setattr(
+            runner, "_run_lambda",
+            lambda *a, **k: captured.update(profile=k.get("profile")) or {},
+        )
+        runner.agg(atl06_config, catalog="ignored", store="s3://out/x.zarr", backend="lambda")
+        assert captured["profile"] is False
+
+
+class TestWorkerPhaseTimings:
+    """``process_shard(profile=...)`` emits ``phase_timings`` only when set, and
+    leaves the default metadata unchanged otherwise (issue #100 phase 2)."""
+
+    def _run(self, monkeypatch, *, profile, with_data=True):
+        import numpy as np
+
+        from zagg.processing import worker
+
+        # Stub the read/group/aggregate seams so process_shard runs without I/O.
+        monkeypatch.setattr(worker._processing, "_make_url_rewriter", lambda d: (lambda u: u))
+
+        class _H5:
+            def __init__(self, *a, **k):
+                pass
+
+            def close(self):
+                pass
+
+        monkeypatch.setattr(worker._processing, "h5coro", type("M", (), {"H5Coro": _H5}))
+        monkeypatch.setattr(
+            worker._processing, "_read_group",
+            lambda *a, **k: (object() if with_data else None),
+        )
+        monkeypatch.setattr(
+            worker, "_concat_and_group",
+            lambda reads, grid, handoff: ({"leaf_id": np.array([0])}, {0: slice(0, 1)}, 1),
+        )
+        monkeypatch.setattr(worker, "_has_vector_fields", lambda config: False)
+        monkeypatch.setattr(worker, "_eval_chunk_precompute", lambda config, pooled: {})
+        monkeypatch.setattr(worker, "_pool_chunk_columns", lambda *a, **k: {})
+        monkeypatch.setattr(
+            worker, "_aggregate_chunk_cells",
+            lambda *a, **k: ({}, {}, {}, 1),
+        )
+        monkeypatch.setattr(worker, "_build_output", lambda *a, **k: __import__("pandas").DataFrame())
+
+        from unittest.mock import MagicMock
+        grid = MagicMock()
+        grid.chunks_per_shard = 1
+        grid.block_index.return_value = (0,)
+        grid.children.return_value = np.array([0])
+        del grid.iter_chunks  # force the K==1 fallback path
+
+        from zagg.config import default_config
+        _df, meta = worker.process_shard(
+            grid, 0, ["s3://b/g.h5"], s3_credentials={"accessKeyId": "a"},
+            config=default_config("atl06"), driver="s3",
+            h5coro_driver=object(), profile=profile,
+        )
+        return meta
+
+    def test_no_phase_timings_by_default(self, monkeypatch):
+        meta = self._run(monkeypatch, profile=False)
+        assert "phase_timings" not in meta
+
+    def test_phase_timings_present_when_profiled(self, monkeypatch):
+        meta = self._run(monkeypatch, profile=True)
+        assert set(meta["phase_timings"]) == {"read", "index", "aggregate"}
+        for v in meta["phase_timings"].values():
+            assert v >= 0.0
+
+    def test_phase_timings_on_no_data_path(self, monkeypatch):
+        # Even the "No data after filtering" early return carries read timing
+        # when profiling (index/aggregate never ran).
+        meta = self._run(monkeypatch, profile=True, with_data=False)
+        assert meta["error"] == "No data after filtering"
+        assert set(meta["phase_timings"]) == {"read"}

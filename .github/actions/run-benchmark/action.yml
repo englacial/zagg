@@ -1,0 +1,109 @@
+name: Run zagg Lambda benchmark
+description: >-
+  Assume the benchmark AWS role via OIDC and dispatch the pinned benchmark
+  shard(s) to Lambda, emitting metrics.json + comment.md. The caller must have
+  already checked out the ref to benchmark and must set
+  `permissions: id-token: write` so OIDC can mint creds.
+
+inputs:
+  targets:
+    description: Space-separated target keys (empty = every target in the manifest)
+    required: false
+    default: ""
+  role-arn:
+    description: AWS IAM role ARN to assume via OIDC
+    required: true
+  aws-region:
+    description: AWS region the Lambda + bucket live in
+    required: true
+  function-name:
+    description: Lambda function name to invoke
+    required: true
+  store-prefix:
+    description: S3 prefix for benchmark output stores (s3://bucket/prefix)
+    required: true
+  edl-token:
+    description: Earthdata Login bearer token (the orchestrator mints NSIDC S3 read creds)
+    required: true
+  event:
+    description: Trigger kind recorded in the metrics (pr|merge|manual)
+    required: true
+  commit:
+    description: Commit SHA under test (recorded in the metrics)
+    required: true
+  ref-label:
+    description: Human ref label recorded in the metrics (branch / PR ref)
+    required: false
+    default: ""
+  pr-number:
+    description: PR number, when this is a PR run
+    required: false
+    default: ""
+  worker-note:
+    description: One-line PR-comment banner when the benchmarked worker is the stable
+      deploy, not this ref's code (issue #25)
+    required: false
+    default: ""
+
+runs:
+  using: composite
+  steps:
+    - name: Install uv
+      uses: astral-sh/setup-uv@v6
+
+    - name: Set up Python
+      shell: bash
+      run: uv python install 3.12
+
+    - name: Install zagg
+      shell: bash
+      run: uv sync
+
+    - name: Assume AWS role (OIDC)
+      uses: aws-actions/configure-aws-credentials@v4
+      with:
+        role-to-assume: ${{ inputs.role-arn }}
+        aws-region: ${{ inputs.aws-region }}
+
+    - name: Dispatch benchmark shard(s)
+      shell: bash
+      # All inputs flow through env, never interpolated into the script body, so
+      # an attacker-controlled value (e.g. REF_LABEL <- a fork branch name) can't
+      # break out of the argument and inject shell.
+      env:
+        TARGETS: ${{ inputs.targets }}
+        STORE_PREFIX: ${{ inputs.store-prefix }}
+        AWS_REGION: ${{ inputs.aws-region }}
+        FUNCTION_NAME: ${{ inputs.function-name }}
+        EVENT: ${{ inputs.event }}
+        COMMIT: ${{ inputs.commit }}
+        REF_LABEL: ${{ inputs.ref-label }}
+        PR_NUMBER: ${{ inputs.pr-number }}
+        WORKER_NOTE: ${{ inputs.worker-note }}
+        # earthaccess.login() reads this to mint the NSIDC S3 read creds the
+        # orchestrator forwards to Lambda (a user bearer token -- urs.earthdata
+        # .nasa.gov/documentation/for_users/user_token). Masked: from a secret.
+        EARTHDATA_TOKEN: ${{ inputs.edl-token }}
+      run: |
+        set -euo pipefail
+        target_flags=()
+        for t in $TARGETS; do
+          target_flags+=(--target "$t")
+        done
+        pr_flag=()
+        if [ -n "$PR_NUMBER" ]; then
+          pr_flag=(--pr-number "$PR_NUMBER")
+        fi
+        uv run python .github/scripts/run_benchmark.py \
+          --targets tests/data/benchmark/targets.json \
+          "${target_flags[@]}" \
+          --store-prefix "$STORE_PREFIX" \
+          --region "$AWS_REGION" \
+          --function-name "$FUNCTION_NAME" \
+          --worker-note "$WORKER_NOTE" \
+          --event "$EVENT" \
+          --commit "$COMMIT" \
+          --ref "$REF_LABEL" \
+          "${pr_flag[@]}" \
+          --out-json metrics.json \
+          --out-comment comment.md

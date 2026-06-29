@@ -1,17 +1,21 @@
 #!/bin/bash
 # Stand up the zagg Lambda backend in your own AWS account, end to end.
 #
-# Lambda code (the deps layer + function zips) is read from the public source.coop
-# mirror. CloudFormation requires that code to live in a SAME-REGION S3 bucket:
+# Lambda code (the deps layer + function zips) is read from the public CORS bucket
+# (s3://sliderule-public-cors), with the legacy source.coop mirror as a fallback
+# for older minors. CloudFormation requires that code to live in a SAME-REGION
+# bucket:
 #
-#   * In us-west-2 (where the mirror lives) the stack reads it straight from the
-#     mirror — no staging bucket of your own needed.
+#   * In us-west-2 (where the sources live) the stack reads it straight from the
+#     source — no staging bucket of your own needed.
 #   * In any other region, provide STAGING_BUCKET (a bucket you own in that
-#     region); the zips are copied from the mirror into it first.
+#     region); the zips are copied from the source into it first.
 #
-# The mirror is keyed by zagg MINOR version (0.N.x -> 0.N). Run from a zagg git
+# Sources are keyed by zagg MINOR version (0.N.x -> 0.N). Run from a zagg git
 # clone and the minor is read from the latest tag (no install needed); otherwise
-# set LAMBDA_VERSION (e.g. LAMBDA_VERSION=0.2).
+# set LAMBDA_VERSION (e.g. LAMBDA_VERSION=0.2). Set LAMBDA_VERSION=latest to read
+# the newest published minor from the CORS bucket's versions.json (so a clone/
+# pip-install isn't hard-pinned to its build-time version).
 #
 # By default the stack creates its own Lambda execution role (needs
 # iam:CreateRole — fine if you admin your own account). In IAM-constrained
@@ -33,6 +37,7 @@ run() { echo "+ $(printf '%q ' "$@")"; "$@"; }
 
 ARCH="${ARCH:-arm64}"                                # arm64 | x86_64
 STACK_NAME="${STACK_NAME:-zagg-backend}"
+FUNCTION_NAME="${FUNCTION_NAME:-process-shard}"      # e.g. process-shard-test for a test stack
 REGION="${REGION:-us-west-2}"
 OUTPUT_BUCKET="${OUTPUT_BUCKET:?Set OUTPUT_BUCKET to the bucket where results go}"
 CREATE_BUCKET="${CREATE_BUCKET:-false}"              # true => the stack creates OUTPUT_BUCKET
@@ -50,10 +55,20 @@ if [ "$CREATE_ROLE" != "true" ] && [ -z "$ROLE_ARN" ]; then
     exit 1
 fi
 
-# Public mirror (override to self-host a copy).
+# Distribution sources (issue #25). The public CORS bucket is primary: listable
+# (a versions.json index), keyed by minor as <minor>/<zip>. The legacy source.coop
+# mirror is the fallback for older minors that predate the new bucket (transition
+# window). Override any of these to self-host a copy.
+DIST_BUCKET="${DIST_BUCKET:-sliderule-public-cors}"
+DIST_PREFIX="${DIST_PREFIX:-}"                       # keys: [<prefix>/]<minor>/<zip>
+DIST_REGION="${DIST_REGION:-us-west-2}"
 MIRROR_BUCKET="${MIRROR_BUCKET:-us-west-2.opendata.source.coop}"
-MIRROR_PREFIX="${MIRROR_PREFIX:-englacial/zagg/lambda}"
+MIRROR_PREFIX="${MIRROR_PREFIX:-englacial/zagg/lambda}"   # keys: <prefix>/<minor>/<zip>
 MIRROR_REGION="${MIRROR_REGION:-us-west-2}"
+
+dist_key()   { local p="$DIST_PREFIX"; [ -n "$p" ] && p="$p/"; echo "${p}${1}/${2}"; }  # minor, zip
+mirror_key() { echo "${MIRROR_PREFIX}/${1}/${2}"; }
+dist_root()  { local p="$DIST_PREFIX"; [ -n "$p" ] && p="$p/"; echo "${p}${1}"; }       # versions.json path
 
 case "$ARCH" in
     arm64)  LAYER_ZIP="lambda_layer_arm64.zip";  FUNC_ZIP="lambda_function_arm64_py312.zip" ;;
@@ -63,9 +78,15 @@ esac
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
-# Resolve the lambda minor version (0.N). Order: explicit override -> the repo's
-# git tag (works from a fresh clone, no install needed) -> the installed zagg.
-if [ -n "${LAMBDA_VERSION:-}" ]; then
+# Resolve the lambda minor version (0.N). Order: LAMBDA_VERSION=latest (read the
+# CORS bucket's versions.json) -> explicit LAMBDA_VERSION -> the repo's git tag
+# (works from a fresh clone) -> the installed zagg.
+if [ "${LAMBDA_VERSION:-}" = "latest" ]; then
+    MINOR="$(aws s3 cp "s3://$DIST_BUCKET/$(dist_root versions.json)" - --region "$DIST_REGION" --no-sign-request 2>/dev/null \
+        | python3 -c 'import json,sys; print(json.load(sys.stdin)["latest"])' 2>/dev/null || true)"
+    [ -z "$MINOR" ] && { echo "ERROR: could not read 'latest' from s3://$DIST_BUCKET/$(dist_root versions.json)"; exit 1; }
+    echo "Resolved LAMBDA_VERSION=latest -> $MINOR"
+elif [ -n "${LAMBDA_VERSION:-}" ]; then
     MINOR="$LAMBDA_VERSION"
 else
     MINOR="$(git -C "$SCRIPT_DIR" describe --tags --abbrev=0 2>/dev/null | sed 's/^v//' | cut -d. -f1,2)"
@@ -73,29 +94,36 @@ else
     if [ -z "$MINOR" ]; then
         echo "ERROR: could not determine the lambda minor version. Run from a zagg git"
         echo "       clone (uses the latest tag), or install zagg, or set LAMBDA_VERSION"
-        echo "       (e.g. LAMBDA_VERSION=0.2)."
+        echo "       (e.g. LAMBDA_VERSION=0.2, or LAMBDA_VERSION=latest)."
         exit 1
     fi
 fi
-
-LAYER_KEY="$MIRROR_PREFIX/$MINOR/$LAYER_ZIP"
-FUNC_KEY="$MIRROR_PREFIX/$MINOR/$FUNC_ZIP"
 echo "zagg lambda artifacts: $MINOR ($ARCH), region $REGION"
 
-if [ "$REGION" = "$MIRROR_REGION" ]; then
-    # Same region as the mirror — deploy straight from it, no staging bucket.
-    echo "Region matches the mirror: deploying directly from s3://$MIRROR_BUCKET/$MIRROR_PREFIX/$MINOR/"
-    ARTIFACT_BUCKET="$MIRROR_BUCKET"
-    LAYER_S3KEY="$LAYER_KEY"
-    FUNC_S3KEY="$FUNC_KEY"
+# Pick the source that actually holds this minor: prefer the CORS bucket; if the
+# layer isn't there (an older minor), fall back to the source.coop mirror.
+SRC_BUCKET="$DIST_BUCKET"; SRC_REGION="$DIST_REGION"
+SRC_LAYER_KEY="$(dist_key "$MINOR" "$LAYER_ZIP")"; SRC_FUNC_KEY="$(dist_key "$MINOR" "$FUNC_ZIP")"
+if ! aws s3api head-object --bucket "$DIST_BUCKET" --key "$SRC_LAYER_KEY" --region "$DIST_REGION" --no-sign-request >/dev/null 2>&1; then
+    echo "note: $MINOR not on s3://$DIST_BUCKET — falling back to the source.coop mirror"
+    SRC_BUCKET="$MIRROR_BUCKET"; SRC_REGION="$MIRROR_REGION"
+    SRC_LAYER_KEY="$(mirror_key "$MINOR" "$LAYER_ZIP")"; SRC_FUNC_KEY="$(mirror_key "$MINOR" "$FUNC_ZIP")"
+fi
+
+if [ "$REGION" = "$SRC_REGION" ]; then
+    # Same region as the source — deploy straight from it, no staging bucket.
+    echo "Deploying directly from s3://$SRC_BUCKET/$SRC_LAYER_KEY"
+    ARTIFACT_BUCKET="$SRC_BUCKET"
+    LAYER_S3KEY="$SRC_LAYER_KEY"
+    FUNC_S3KEY="$SRC_FUNC_KEY"
 else
     # Different region — CloudFormation needs a same-region bucket, so copy the
-    # zips from the mirror into the user's STAGING_BUCKET first.
+    # zips from the source into the user's STAGING_BUCKET first.
     if [ -z "$STAGING_BUCKET" ]; then
-        echo "ERROR: REGION=$REGION is not the mirror region ($MIRROR_REGION)."
+        echo "ERROR: REGION=$REGION is not the source region ($SRC_REGION)."
         echo "       CloudFormation reads Lambda code from a SAME-REGION bucket, so the public"
-        echo "       mirror can't be used directly here. Provide STAGING_BUCKET (a bucket you"
-        echo "       own in $REGION); the zips will be copied into it from the mirror."
+        echo "       source can't be used directly here. Provide STAGING_BUCKET (a bucket you"
+        echo "       own in $REGION); the zips will be copied into it from the source."
         echo "       (Or deploy in us-west-2 to skip staging entirely.)"
         exit 1
     fi
@@ -105,9 +133,9 @@ else
         exit 1
     fi
     TMPDIR="$(mktemp -d)"; trap 'rm -rf "$TMPDIR"' EXIT
-    echo "Copying zips from the mirror into s3://$STAGING_BUCKET/ ..."
-    run aws s3 cp "s3://$MIRROR_BUCKET/$LAYER_KEY" "$TMPDIR/$LAYER_ZIP" --region "$MIRROR_REGION" --no-sign-request
-    run aws s3 cp "s3://$MIRROR_BUCKET/$FUNC_KEY"  "$TMPDIR/$FUNC_ZIP"  --region "$MIRROR_REGION" --no-sign-request
+    echo "Copying zips from s3://$SRC_BUCKET into s3://$STAGING_BUCKET/ ..."
+    run aws s3 cp "s3://$SRC_BUCKET/$SRC_LAYER_KEY" "$TMPDIR/$LAYER_ZIP" --region "$SRC_REGION" --no-sign-request
+    run aws s3 cp "s3://$SRC_BUCKET/$SRC_FUNC_KEY"  "$TMPDIR/$FUNC_ZIP"  --region "$SRC_REGION" --no-sign-request
     run aws s3 cp "$TMPDIR/$LAYER_ZIP" "s3://$STAGING_BUCKET/$LAYER_ZIP" --region "$REGION"
     run aws s3 cp "$TMPDIR/$FUNC_ZIP"  "s3://$STAGING_BUCKET/$FUNC_ZIP"  --region "$REGION"
     ARTIFACT_BUCKET="$STAGING_BUCKET"
@@ -123,6 +151,7 @@ run aws cloudformation deploy \
     --capabilities CAPABILITY_NAMED_IAM \
     --parameter-overrides \
         Architecture="$ARCH" \
+        FunctionName="$FUNCTION_NAME" \
         ArtifactBucket="$ARTIFACT_BUCKET" \
         LayerS3Key="$LAYER_S3KEY" \
         FunctionS3Key="$FUNC_S3KEY" \

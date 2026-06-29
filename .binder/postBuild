@@ -1,0 +1,30 @@
+#!/bin/bash
+# repo2docker runs this after building the conda environment.
+#
+# Install zagg from the checked-out repo together with its ``analysis`` extra
+# (the notebook runtime: jupyter/notebook, xarray, cartopy, matplotlib, ...) and
+# the ``catalog`` extra (stac-geoparquet), which the anonymous CMR-STAC
+# catalog-build cell in jupyterhub_example needs. Keeping the dependency set in
+# pyproject.toml's extras means the Binder image and a local
+# ``pip install "zagg[analysis,catalog]"`` resolve the same way.
+#
+# We deliberately do NOT install:
+#   * the spherely exact-S2 fork (not on PyPI; not needed -- catalog building
+#     uses the default HEALPix ``mortie`` backend, and reading a prebuilt public
+#     store needs no intersection backend at all), or
+#   * icechunk / hvplot (only the non-Binder cryocloud_example notebook uses
+#     those, and it is excluded from Binder because it dispatches to AWS Lambda).
+set -euo pipefail
+
+# zagg's version is derived from git tags by hatch-vcs. repo2docker's checkout
+# can be shallow / tag-less, which would make the build fail to detect a
+# version. Try to make a tag reachable first; if none is, fall back to a
+# pretend version so the Binder image still builds (the version string is
+# irrelevant for running the example notebooks).
+git fetch --tags --unshallow 2>/dev/null || git fetch --tags 2>/dev/null || true
+if git describe --tags --abbrev=0 >/dev/null 2>&1; then
+    python -m pip install --no-cache-dir ".[analysis,catalog]"
+else
+    HATCH_VCS_PRETEND_VERSION="0.0.0+binder" \
+        python -m pip install --no-cache-dir ".[analysis,catalog]"
+fi

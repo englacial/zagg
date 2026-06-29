@@ -80,12 +80,22 @@ jobs:
     - name: Publish to PyPI
       uses: pypa/gh-action-pypi-publish@release/v1
 
+  # Build the dual-arch Lambda zips in-line (issue #25): self-contained so the
+  # release no longer depends on GITHUB_TOKEN cascade-triggering lambda-build.
+  lambda-build:
+    name: Build Lambda zips
+    needs: publish-to-pypi
+    uses: ./.github/workflows/lambda-build-reusable.yml
+
   github-release:
     name: Create GitHub Release
-    needs: publish-to-pypi
+    needs: lambda-build
     runs-on: ubuntu-latest
     permissions:
       contents: write
+    outputs:
+      tag: ${{ steps.get_tag.outputs.tag }}
+      minor: ${{ steps.get_tag.outputs.minor }}
 
     steps:
     - uses: actions/checkout@v5
@@ -96,11 +106,17 @@ jobs:
       id: get_tag
       run: |
         if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
-          echo "tag=${{ inputs.tag }}" >> $GITHUB_OUTPUT
+          TAG="${{ inputs.tag }}"
         else
-          echo "tag=${GITHUB_REF#refs/tags/}" >> $GITHUB_OUTPUT
+          TAG="${GITHUB_REF#refs/tags/}"
         fi
-    - name: Create GitHub Release
+        echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+        echo "minor=$(echo "$TAG" | cut -d. -f1,2)" >> "$GITHUB_OUTPUT"
+    - name: Download Lambda zips
+      uses: actions/download-artifact@v4
+      with:
+        path: artifacts
+    - name: Create GitHub Release + attach Lambda zips
       env:
         GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
       run: |
@@ -116,3 +132,96 @@ jobs:
           --repo '${{ github.repository }}' \
           --title "Release $TAG_NAME" \
           --notes-file release_notes.md || echo "Release already exists"
+        # Attach the four zips (the durable CloudFormation/standup artifacts).
+        gh release upload "$TAG_NAME" \
+          artifacts/lambda-layer-x86_64/lambda_layer_x86_64.zip \
+          artifacts/lambda-layer-arm64/lambda_layer_arm64.zip \
+          artifacts/lambda-function-x86_64/lambda_function_x86_64_*.zip \
+          artifacts/lambda-function-arm64/lambda_function_arm64_*.zip \
+          --repo "${{ github.repository }}" --clobber
+
+  # Publish the zips to the public distribution bucket (replaces source.coop;
+  # keyed by minor + a versions.json index). Skips until the bucket/role vars
+  # exist, so a release before the AWS-side setup still attaches zips (above).
+  distribute:
+    name: Distribute zips to public bucket
+    needs: github-release
+    if: >-
+      vars.LAMBDA_RELEASE_ROLE_ARN != '' &&
+      vars.LAMBDA_DIST_BUCKET != '' &&
+      vars.LAMBDA_AWS_REGION != ''
+    runs-on: ubuntu-latest
+    permissions:
+      id-token: write
+      contents: read
+    steps:
+    - uses: actions/checkout@v5
+    - name: Download Lambda zips
+      uses: actions/download-artifact@v4
+      with:
+        path: artifacts
+    - name: Assume release role (OIDC)
+      uses: aws-actions/configure-aws-credentials@v4
+      with:
+        role-to-assume: ${{ vars.LAMBDA_RELEASE_ROLE_ARN }}
+        aws-region: ${{ vars.LAMBDA_AWS_REGION }}
+    - name: Distribute
+      run: |
+        set -euo pipefail
+        mkdir -p zips
+        find artifacts -name '*.zip' -exec cp {} zips/ \;
+        .github/scripts/distribute_zips.sh \
+          --minor "${{ needs.github-release.outputs.minor }}" \
+          --tag "${{ needs.github-release.outputs.tag }}" \
+          --bucket "${{ vars.LAMBDA_DIST_BUCKET }}" \
+          --region "${{ vars.LAMBDA_AWS_REGION }}" \
+          --dir zips
+
+  # Update the PRODUCTION Lambda in place (tags only). Behind the `production`
+  # GitHub Environment (add a required-reviewer rule). publish-layer-version +
+  # update-function-configuration handles a deps change that the function-code
+  # update alone would miss. Needs `distribute` so the layer is staged in S3 for
+  # publish-layer-version (the layer zip can exceed the 50 MB direct-upload cap).
+  deploy-prod:
+    name: Deploy production Lambda
+    needs: [github-release, distribute]
+    # Gate on EVERY var this job consumes (not just the role): the "no
+    # unstaged-layer deploy" safety currently rests on distribute's skip
+    # propagating here, and a partial config must skip, never half-deploy prod.
+    if: >-
+      vars.LAMBDA_RELEASE_ROLE_ARN != '' &&
+      vars.LAMBDA_DIST_BUCKET != '' &&
+      vars.LAMBDA_AWS_REGION != '' &&
+      vars.LAMBDA_PROD_FUNCTION_NAME != ''
+    runs-on: ubuntu-latest
+    environment: production
+    permissions:
+      id-token: write
+      contents: read
+    steps:
+    - uses: actions/checkout@v5
+    - name: Download arm64 function zip
+      uses: actions/download-artifact@v4
+      with:
+        name: lambda-function-arm64
+        path: fn
+    - name: Assume release role (OIDC)
+      uses: aws-actions/configure-aws-credentials@v4
+      with:
+        role-to-assume: ${{ vars.LAMBDA_RELEASE_ROLE_ARN }}
+        aws-region: ${{ vars.LAMBDA_AWS_REGION }}
+    - name: Update function (layer + code, in place)
+      env:
+        FUNCTION_NAME: ${{ vars.LAMBDA_PROD_FUNCTION_NAME }}
+        DIST_BUCKET: ${{ vars.LAMBDA_DIST_BUCKET }}
+        MINOR: ${{ needs.github-release.outputs.minor }}
+        REGION: ${{ vars.LAMBDA_AWS_REGION }}
+      run: |
+        set -euo pipefail
+        # Layer was staged to the dist bucket by `distribute` (this job needs it).
+        .github/scripts/deploy_lambda.sh \
+          --function "$FUNCTION_NAME" \
+          --layer-bucket "$DIST_BUCKET" \
+          --layer-key "${MINOR}/lambda_layer_arm64.zip" \
+          --function-zip "$(ls fn/lambda_function_arm64_*.zip)" \
+          --region "$REGION"

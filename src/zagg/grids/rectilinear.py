@@ -50,7 +50,7 @@ from zagg.config import (
     get_output_signature,
     output_field_signature,
 )
-from zagg.grids.base import chunk_array_spec, vector_array_spec
+from zagg.grids.base import chunk_array_spec, sharded_array_spec, vector_array_spec
 
 OOB_SENTINEL: int = -1
 
@@ -92,6 +92,7 @@ class RectilinearGrid:
         chunk_shape=(256, 256),
         config: PipelineConfig | None = None,
         chunk_inner=None,
+        sharded: bool = False,
     ):
         if len(bounds) != 4:
             raise ValueError("bounds must be (xmin, ymin, xmax, ymax)")
@@ -119,6 +120,20 @@ class RectilinearGrid:
                     f"chunk_inner ({self.inner_h}, {self.inner_w}) must evenly divide the "
                     f"shard tile ({self.chunk_h}, {self.chunk_w})"
                 )
+        # Sharded storage (issue #108): bundle the shard tile's K inner chunks into
+        # one zarr ShardingCodec shard object. Only meaningful when chunk_inner gives
+        # K>1 (a finer inner chunk subdivides the shard tile); sharding a K==1 tile is
+        # a no-op shard of one chunk, so reject it with a clear message (validated
+        # pre-deployment, matching the grid-mismatch errors).
+        n_inner = (self.chunk_h // self.inner_h) * (self.chunk_w // self.inner_w)
+        if sharded and n_inner <= 1:
+            raise ValueError(
+                "sharded output requires chunk_inner to give more than one inner "
+                f"chunk per shard (K>1), but chunk_inner ({self.inner_h}, {self.inner_w}) "
+                f"== shard tile ({self.chunk_h}, {self.chunk_w}) gives K=1; set a finer "
+                "chunk_inner or disable sharded"
+            )
+        self.sharded = bool(sharded)
         self.config = config or default_config("atl06")
 
         span_x = self.xmax - self.xmin
@@ -232,6 +247,32 @@ class RectilinearGrid:
                 children = (rows * self.width + cols).reshape(-1).astype(np.int64)
                 block = (r0 // self.inner_h, c0 // self.inner_w)
                 yield (block, children)
+
+    def shard_slab_shape(self) -> tuple[int, int]:
+        """Cell extent of one whole sharded shard tile (issue #108).
+
+        The ``(chunk_h, chunk_w)`` slab the sharded worker assembles per dense array
+        before the single whole-shard ``set_block_selection`` — the K inner chunks
+        tiled across the shard tile (matching the ShardingCodec's inner tiling).
+        """
+        return (self.chunk_h, self.chunk_w)
+
+    def shard_local_region(self, block_index, shard_key) -> tuple:
+        """Slices an inner chunk occupies within its shard slab (issue #108).
+
+        ``block_index`` is the inner chunk's global ``(rb, cb)`` (from
+        :meth:`iter_chunks`); its position inside the shard tile is the global block
+        minus the shard tile's top-left inner block, and it occupies the
+        ``inner_h × inner_w`` sub-tile there.
+        """
+        rb, cb = self._unpack(int(shard_key))
+        gir, gic = (int(b) for b in block_index)
+        lir = gir - rb * (self.chunk_h // self.inner_h)
+        lic = gic - cb * (self.chunk_w // self.inner_w)
+        return (
+            slice(lir * self.inner_h, (lir + 1) * self.inner_h),
+            slice(lic * self.inner_w, (lic + 1) * self.inner_w),
+        )
 
     @property
     def group_path(self) -> str:
@@ -512,6 +553,21 @@ class RectilinearGrid:
             .with_attributes({"standard_name": "projection_y_coordinate", "units": "m"})
         )
 
+        # Sharded storage (issue #108): wrap each dense per-cell array in a
+        # ShardingCodec — outer (shard) chunk == the shard tile (chunk_h, chunk_w),
+        # inner chunk == (inner_h, inner_w). Applied to the per-cell data-var arrays
+        # only; the 1-D x/y coords and ``resolution: chunk`` companions stay regular.
+        def _shard(arr):
+            if not self.sharded:
+                return arr
+            cg = arr.chunk_grid
+            cfg = cg["configuration"] if isinstance(cg, dict) else cg.configuration
+            inner = tuple(int(c) for c in cfg["chunk_shape"])
+            # Widen only the spatial (y, x) axes to the shard tile; trailing payload
+            # dims (vector fields) are chunked whole and stay whole.
+            shard = (self.chunk_h, self.chunk_w, *inner[2:])
+            return sharded_array_spec(arr, shard_shape=shard, inner_chunk_shape=inner)
+
         members = {"x": coord_x, "y": coord_y}
         for name, meta in self.config.aggregation.get("coordinates", {}).items():
             # DGGS-specific coord names (cell_ids, morton) don't apply here.
@@ -519,12 +575,12 @@ class RectilinearGrid:
                 continue
             dtype = meta.get("dtype", "float32")
             fill = meta.get("fill_value", "NaN")
-            members[name] = base.with_data_type(dtype).with_fill_value(fill)
+            members[name] = _shard(base.with_data_type(dtype).with_fill_value(fill))
         # Optional strict-AOI cell mask (issue #101): a bool array aligned to the
         # (y, x) cell grid, emitted only when ``output.aoi_mask`` is on so off-runs
         # stay byte-identical. fill_value False — unwritten cells read as out-of-AOI.
         if get_aoi_mask(self.config):
-            members["aoi_mask"] = base.with_data_type("bool").with_fill_value(False)
+            members["aoi_mask"] = _shard(base.with_data_type("bool").with_fill_value(False))
         for name, meta in get_agg_fields(self.config).items():
             sig = get_output_signature(meta)
             # Ragged fields (issue #48) are CSR subgroups written fresh by
@@ -557,11 +613,13 @@ class RectilinearGrid:
                 continue
             # A vector field (issue #29) gets a trailing payload dim chunked
             # whole; scalars are returned unchanged.
-            members[name] = vector_array_spec(
-                spec,
-                sig,
-                base_dims=("y", "x"),
-                base_chunk_shape=self.chunk_shape,
+            members[name] = _shard(
+                vector_array_spec(
+                    spec,
+                    sig,
+                    base_dims=("y", "x"),
+                    base_chunk_shape=self.chunk_shape,
+                )
             )
 
         return GroupSpec(members=members, attributes=self._geozarr_attrs())
