@@ -221,6 +221,47 @@ def test_targets_manifest_consistent():
         assert n == sm_meta["n_granules"], f"{t['shardmap']}: stale n_granules"
 
 
+# --- per-target AOI override resolution (issue #121) -----------------------
+
+
+def test_override_resolution_falls_back_to_defaults():
+    # A shard map with no override inherits the top-level aoi/temporal/cmr
+    # *by identity* -- existing NEON entries resolve byte-identically to today.
+    import test_benchmark_shardmap as drift
+
+    aoi, temporal, cmr = drift.resolve_aoi_temporal_cmr({"path": "x", "shard_key": 0})
+    assert aoi is drift.MANIFEST["aoi"]
+    assert temporal is drift.MANIFEST["temporal"]
+    assert cmr is drift.MANIFEST["cmr"]
+
+
+def test_override_resolution_uses_overrides():
+    import test_benchmark_shardmap as drift
+
+    sm_meta = {
+        "path": "x",
+        "shard_key": 0,
+        "aoi": {"file": "antarctic_88s.geojson", "name": "88S dense"},
+        "temporal": {"start": "2019-01-01", "end": "2020-01-01"},
+        "cmr": {"short_name": "ATL03", "version": "007", "provider": "P", "footprint": "swath"},
+    }
+    aoi, temporal, cmr = drift.resolve_aoi_temporal_cmr(sm_meta)
+    assert aoi == sm_meta["aoi"]
+    assert temporal == sm_meta["temporal"]
+    assert cmr == sm_meta["cmr"]
+
+
+def test_override_resolution_partial_override():
+    # aoi overridden, temporal/cmr omitted -> override wins, rest falls back.
+    import test_benchmark_shardmap as drift
+
+    sm_meta = {"path": "x", "shard_key": 0, "aoi": {"file": "f.geojson", "name": "n"}}
+    aoi, temporal, cmr = drift.resolve_aoi_temporal_cmr(sm_meta)
+    assert aoi == sm_meta["aoi"]
+    assert temporal is drift.MANIFEST["temporal"]
+    assert cmr is drift.MANIFEST["cmr"]
+
+
 # --- update_series (parquet store) ----------------------------------------
 
 
