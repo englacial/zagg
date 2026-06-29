@@ -84,6 +84,7 @@ def _summary():
         "estimated_cost_usd": 0.00547,
         "function_timeout_s": 720,
         "worker_pct_timeout": 0.285,
+        "max_memory_mb": 1963.0,
     }
 
 
@@ -109,7 +110,28 @@ def test_build_record_cost_per_100km2():
     assert rec["runtime_s"] == 205.0  # worker_max_s preferred
     assert rec["n_granules"] == 44
     assert rec["zagg_version"] == "9.9.9"
+    assert rec["max_memory_mb"] == 1963.0  # threaded from the summary (issue #120)
     assert set(rec) == set(bench_metrics.RECORD_COLUMNS)
+
+
+def test_build_record_max_memory_null_safe():
+    # An empty/legacy summary leaves max_memory_mb null so old rows degrade.
+    g = HealpixGrid(parent_order=11, child_order=19)
+    rec = bench_metrics.build_record({}, grid=g, context={"target": "t"})
+    assert rec["max_memory_mb"] is None
+    assert "max_memory_mb" in bench_metrics.RECORD_COLUMNS
+
+
+def test_memory_pct_of_cap_maps_near_red():
+    # 1963 MB on a 2 GB cap -> ~0.96 (the OOM-adjacent run #1 figure, issue #120).
+    pct = bench_metrics.memory_pct_of_cap(1963.0, 2.0)
+    assert pct == pytest.approx(0.9585, abs=1e-3)
+
+
+def test_memory_pct_of_cap_null_safe():
+    assert bench_metrics.memory_pct_of_cap(None, 2.0) is None
+    assert bench_metrics.memory_pct_of_cap(1000.0, None) is None
+    assert bench_metrics.memory_pct_of_cap(1000.0, 0.0) is None
 
 
 def test_build_record_runtime_fallback():
@@ -224,7 +246,7 @@ def test_targets_manifest_consistent():
 # --- update_series (parquet store) ----------------------------------------
 
 
-def _rec_row(commit, target, event="merge", cost=0.005, rt=200.0):
+def _rec_row(commit, target, event="merge", cost=0.005, rt=200.0, mem=1200.0):
     return {
         "timestamp": f"2026-01-01T00:00:0{len(commit) % 10}Z",
         "commit": commit,
@@ -248,6 +270,7 @@ def _rec_row(commit, target, event="merge", cost=0.005, rt=200.0):
         "memory_gb": 2.0,
         "price_per_gb_sec": 1.33334e-05,
         "zagg_version": "9.9.9",
+        "max_memory_mb": mem,
     }
 
 
