@@ -420,7 +420,8 @@ aws s3api put-bucket-cors --bucket sliderule-public-cors --cors-configuration '{
   "CORSRules": [{
     "AllowedOrigins": ["*"],
     "AllowedMethods": ["GET", "HEAD"],
-    "AllowedHeaders": ["*"]
+    "AllowedHeaders": ["*"],
+    "ExposeHeaders": ["Content-Length", "Content-Range", "Content-Type", "ETag", "Accept-Ranges"]
   }]
 }'
 ```

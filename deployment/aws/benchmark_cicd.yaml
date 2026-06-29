@@ -86,6 +86,10 @@ Resources:
           - AllowedOrigins: ["*"]
             AllowedMethods: [GET, HEAD]
             AllowedHeaders: ["*"]
+            # Let browser clients read these off a cross-origin response -- needed
+            # for HTTP byte-range reads (Content-Range/Accept-Ranges/ETag aren't
+            # CORS-safelisted, so JS can't see them unless exposed).
+            ExposedHeaders: [Content-Length, Content-Range, Content-Type, ETag, Accept-Ranges]
 
   DistBucketPolicy:
     Type: AWS::S3::BucketPolicy
