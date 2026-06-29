@@ -27,7 +27,7 @@ Throughout, substitute your values for `ACCOUNT_ID`, `REGION` (e.g.
 | Piece | Why |
 | --- | --- |
 | GitHub OIDC provider in AWS | Lets Actions mint short-lived AWS creds with **no stored secret** |
-| Scoped IAM role (`zagg-benchmark`) | What those creds can do: invoke the one Lambda, read/write the one bucket prefix |
+| Scoped IAM role (`zagg-benchmark`) | What those creds can do: invoke the Lambda + probe account concurrency (no direct S3 — the Lambda writes the store) |
 | S3 bucket / prefix | Where the benchmark Zarr stores are written |
 | Repo **variables** `BENCHMARK_*` | Non-secret config (role ARN, region, function, store prefix) |
 | Repo **secret** `EARTHDATA_TOKEN` | Earthdata Login bearer token for the orchestrator to mint NSIDC read creds |
@@ -93,12 +93,14 @@ Parameters (all default to the values in this guide):
 | `DistBucketName` | `sliderule-public-cors` | the public distribution bucket (`CreateDistBucket=false` to reuse an existing one) |
 
 The **benchmark-invoke** role (`zagg-benchmark`) gets `lambda:InvokeFunction` +
-`lambda:GetFunctionConfiguration` (the latter for the `worker_pct_timeout` metric)
-on the stable + test functions, and read/write on the benchmark store bucket.
+`lambda:GetFunctionConfiguration` + `lambda:GetFunctionConcurrency` on the stable +
+test functions, plus the worker-sizing probe (`lambda:GetAccountSettings` +
+`cloudwatch:GetMetricStatistics`, issue #28/#63). **No S3** — the Zarr template
+write happens inside the Lambda, so the orchestrator never touches the bucket.
 
 > The Lambda reads the ATL03 source granules itself, using the NSIDC S3
 > credentials the orchestrator forwards — that's the **Lambda execution role**'s
-> concern, not this role's. This role only invokes + writes output.
+> concern, not this role's. This role only invokes + probes concurrency.
 
 **Verify** — the stack Outputs hand you the exact ARNs/names for section 4:
 
@@ -143,14 +145,14 @@ If you can't use CloudFormation, create just the invoke role with this trust
     {
       "Sid": "InvokeBenchmarkLambda",
       "Effect": "Allow",
-      "Action": ["lambda:InvokeFunction", "lambda:GetFunctionConfiguration"],
+      "Action": ["lambda:InvokeFunction", "lambda:GetFunctionConfiguration", "lambda:GetFunctionConcurrency"],
       "Resource": "arn:aws:lambda:REGION:ACCOUNT_ID:function:FUNCTION_NAME"
     },
     {
-      "Sid": "BenchmarkBucket",
+      "Sid": "ConcurrencyProbe",
       "Effect": "Allow",
-      "Action": ["s3:PutObject", "s3:GetObject", "s3:DeleteObject", "s3:ListBucket"],
-      "Resource": ["arn:aws:s3:::BUCKET", "arn:aws:s3:::BUCKET/PREFIX/*"]
+      "Action": ["lambda:GetAccountSettings", "cloudwatch:GetMetricStatistics"],
+      "Resource": "*"
     }
   ]
 }

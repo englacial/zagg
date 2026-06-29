@@ -37,8 +37,9 @@ Parameters:
     Type: String
     Default: sliderule-public
     Description: >-
-      Bucket the orchestrator writes the benchmark output store + the staged test
-      layer (lambda-test/*) into. The invoke + deploy roles are scoped to it.
+      Bucket the staged test layer (lambda-test/*) is uploaded to; the deploy role
+      is scoped to it. (The benchmark output store is written by the Lambda's
+      execution role, not these roles.)
 
   DistBucketName:
     Type: String
@@ -119,25 +120,30 @@ Resources:
                 "token.actions.githubusercontent.com:aud": "sts.amazonaws.com"
               StringLike:
                 "token.actions.githubusercontent.com:sub": !Sub "repo:${GitHubRepo}:*"
+      # No S3: the Zarr template write happens INSIDE the Lambda (runner.py
+      # "the orchestrator only needs lambda:InvokeFunction; no direct S3 access"),
+      # so the orchestrator never touches the output bucket directly.
       Policies:
-        - PolicyName: invoke-and-store
+        - PolicyName: invoke-and-probe
           PolicyDocument:
             Version: "2012-10-17"
             Statement:
               - Sid: InvokeBenchmarkFunctions
                 Effect: Allow
-                Action: [lambda:InvokeFunction, lambda:GetFunctionConfiguration]
+                Action:
+                  - lambda:InvokeFunction
+                  - lambda:GetFunctionConfiguration
+                  - lambda:GetFunctionConcurrency
                 Resource:
                   - !Sub "arn:aws:lambda:${AWS::Region}:${AWS::AccountId}:function:${BenchmarkFunctionName}"
                   - !Sub "arn:aws:lambda:${AWS::Region}:${AWS::AccountId}:function:${TestFunctionName}"
-              - Sid: WriteBenchmarkStore
+              # Pre-flight worker-sizing probe (issue #28/#63 via concurrency.py);
+              # these degrade gracefully but are needed for the guard to work.
+              # Neither action supports resource-level scoping -> "*".
+              - Sid: ConcurrencyProbe
                 Effect: Allow
-                Action: [s3:PutObject, s3:GetObject, s3:DeleteObject]
-                Resource: !Sub "arn:aws:s3:::${BenchmarkStoreBucket}/*"
-              - Sid: ListBenchmarkStore
-                Effect: Allow
-                Action: s3:ListBucket
-                Resource: !Sub "arn:aws:s3:::${BenchmarkStoreBucket}"
+                Action: [lambda:GetAccountSettings, cloudwatch:GetMetricStatistics]
+                Resource: "*"
 
   # --- tier-2 test-deploy role (issue #25 §9) --------------------------------
   DeployRole:
