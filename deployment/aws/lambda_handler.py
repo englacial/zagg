@@ -244,94 +244,121 @@ def _handle_process(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
 
         grid = from_config(config, parent_order=event.get("parent_order"))
 
-        # Process the shard using cloud-agnostic function. A ``chunk_results`` sink
-        # is required for K>1 grids (issue #82 phase 7): ``process_shard`` reads the
-        # granules once and returns one ``(block_index, carrier, ragged)`` per finer
-        # Zarr chunk through the sink. At K==1 the sink holds exactly one entry whose
-        # ``block_index`` equals ``event["chunk_idx"]``, so the write is unchanged.
+        # Process the shard using cloud-agnostic function. A K>1 grid needs a
+        # multi-chunk sink (issue #82 phase 7): ``process_shard`` reads the granules
+        # once and yields one ``(block_index, carrier, ragged)`` per finer Zarr chunk.
+        # The non-sharded path streams each chunk write-then-free via a ``write_chunk``
+        # callback (issue #91) so peak output memory holds ~1 chunk instead of all K;
+        # the sharded path (#108) must bundle all K, so it still accumulates via
+        # ``chunk_results``. At K==1 the lone chunk's ``block_index`` equals
+        # ``event["chunk_idx"]`` and the write is byte-identical either way.
         from zagg.processing import process_shard
 
         # Opt-in per-phase timing (issue #100). When the orchestrator forwards
         # ``profile``, ``process_shard`` fills ``metadata["phase_timings"]`` with
-        # read/index/aggregate deltas; the write phase runs here, so we bracket it
-        # below and merge it in. Default (no key) leaves the worker path unchanged.
+        # read/index/aggregate deltas; the write phase runs in the callback below and
+        # is accumulated into the same sub-dict. Default (no key) leaves it unchanged.
         profile = event.get("profile", False)
-        chunk_results: list = []
+        sharded = getattr(grid, "sharded", False)
+        store_path = event["store_path"]
+        shard_key = event["shard_key"]
+        # K==1 vs K>1 is fixed by the grid, not the chunk count (issue #91), so the
+        # streaming callback can pick the ragged key without a materialized list: at
+        # K==1 the chunk IS the shard (keyed by ``shard_key``); at K>1 each finer
+        # chunk is keyed by its own block index.
+        single_chunk = int(getattr(grid, "chunks_per_shard", 1)) == 1
+
+        # Lazy store + one-time template check, opened on the FIRST chunk write so a
+        # no-data shard (zero chunks) never touches the store, exactly as before. A
+        # missing template or a failed write is RECORDED (not raised) so ``metadata``
+        # from ``process_shard`` survives — the buffered path returned its 500 with
+        # that metadata; folding the error in after the stream preserves that body.
+        store_box: dict = {}
+        write_error: dict = {}
+        _write_elapsed = 0.0
+
+        def _get_store():
+            """Open + template-check once; returns the store, or None if the template
+            is missing (recording the error so the write is skipped)."""
+            if "store" in store_box:
+                return store_box["store"]
+            if write_error:
+                return None
+            store = open_store(store_path, **_output_store_kwargs(event))
+            template_key = f"{grid.group_path}/zarr.json"
+            if not store.exists(template_key):
+                msg = f"Zarr template not found at {store_path}/{template_key}"
+                logger.error(msg)
+                write_error["msg"] = msg
+                return None
+            logger.info(f"  Writing data to {store_path}...")
+            store_box["store"] = store
+            return store
+
+        def _write_chunk(block_index, carrier, ragged):
+            nonlocal _write_elapsed
+            store = _get_store()
+            if store is None:
+                return  # template missing or a prior chunk failed — skip the rest
+            _t0 = time.time() if profile else None
+            try:
+                # write_dataframe_to_zarr no-ops on an empty carrier, so no per-chunk
+                # emptiness check is needed. Use each chunk's own block_index.
+                write_dataframe_to_zarr(carrier, store, grid=grid, chunk_idx=block_index)
+                ragged_key = int(shard_key) if single_chunk else _block_index_key(block_index, grid)
+                write_ragged_to_zarr(ragged, store, grid=grid, shard_key=ragged_key)
+            except Exception as e:
+                # Mirror the buffered path's ``except``: record the failure, stop
+                # writing, and let the run surface a 500 after process_shard returns.
+                logger.error(f"Failed to write zarr to {store_path}: {e}")
+                write_error["msg"] = f"Failed to write zarr: {e}"
+                return
+            if profile:
+                _write_elapsed += time.time() - _t0
+
+        chunk_results: list | None = [] if sharded else None
         _df_out, metadata = process_shard(
             grid,
-            event["shard_key"],
+            shard_key,
             event["granule_urls"],
             s3_credentials=s3_creds,
             config=config,
             chunk_results=chunk_results,
+            write_chunk=None if sharded else _write_chunk,
             profile=profile,
         )
 
-        # Write Zarr to store: one dense region per chunk plus its ragged (CSR)
-        # companion. Mirrors the local runner's K>1 write loop (``_process_and_write``).
-        _write_t0 = time.time() if profile else None
-        if chunk_results:
-            store_path = event["store_path"]
-            store = open_store(store_path, **_output_store_kwargs(event))
-
-            # Validate that Zarr template exists before writing
-            template_key = f"{grid.group_path}/zarr.json"
-            if not store.exists(template_key):
-                error_msg = f"Zarr template not found at {store_path}/{template_key}"
-                logger.error(error_msg)
-                metadata["error"] = error_msg
-                return {
-                    "statusCode": 500,
-                    "body": json.dumps(metadata),
-                }
-
-            logger.info(f"  Writing data to {store_path}...")
-
-            single_chunk = len(chunk_results) == 1
-            shard_key = event["shard_key"]
-            try:
-                # Sharded output (issue #108): bundle the shard's K inner chunks into
-                # one ShardingCodec shard object — write the whole shard in one block
-                # selection per dense array (mirrors the local runner). A per-inner-
-                # chunk loop would read-modify-write the same shard object.
-                if getattr(grid, "sharded", False):
+        # Sharded output (issue #108): bundle the shard's K inner chunks into one
+        # ShardingCodec shard object — one block selection per dense array (a per-
+        # inner-chunk loop would read-modify-write the same shard object). This path
+        # accumulated all K, so it opens + validates + writes here (same recording).
+        if sharded and chunk_results:
+            store = _get_store()
+            if store is not None:
+                _write_t0 = time.time() if profile else None
+                try:
                     write_shard_to_zarr(chunk_results, store, grid=grid, shard_key=int(shard_key))
-                else:
-                    for block_index, carrier, ragged in chunk_results:
-                        # write_dataframe_to_zarr no-ops on an empty carrier, so no
-                        # per-chunk emptiness check is needed. Use each chunk's own
-                        # block_index (from iter_chunks), not event["chunk_idx"].
-                        write_dataframe_to_zarr(
-                            carrier,
-                            store,
-                            grid=grid,
-                            chunk_idx=block_index,
-                        )
-                        # Persist this chunk's ragged (CSR) fields (issue #48). At K==1
-                        # the chunk IS the shard, so the CSR subgroup is keyed by
-                        # ``shard_key`` (cell-resolution contract); at K>1 each finer
-                        # chunk is keyed by its own block index. No-ops when empty.
-                        ragged_key = (
-                            int(shard_key) if single_chunk else _block_index_key(block_index, grid)
-                        )
-                        write_ragged_to_zarr(
-                            ragged,
-                            store,
-                            grid=grid,
-                            shard_key=ragged_key,
-                        )
-                # Record the write-phase timing (issue #100) only on a clean write:
-                # read/index/aggregate come from ``process_shard``; ``write`` is owned
-                # here and joins the same sub-dict. Recording inside the ``try`` (and
-                # after the early-return template-missing 500) keeps ``write`` absent
-                # on every failure path, so the runner's per-phase max rollup never
-                # folds in a time-to-failure as a real write duration. The no-data
-                # path returns earlier without writing, so ``write`` stays absent too.
-                if profile and "phase_timings" in metadata:
-                    metadata["phase_timings"]["write"] = time.time() - _write_t0
-            except Exception as e:
-                logger.error(f"Failed to write zarr to {store_path}: {e}")
-                metadata["error"] = f"Failed to write zarr: {e}"
+                    if profile:
+                        _write_elapsed += time.time() - _write_t0
+                except Exception as e:
+                    logger.error(f"Failed to write zarr to {store_path}: {e}")
+                    write_error["msg"] = f"Failed to write zarr: {e}"
+
+        # A recorded template-missing / write failure folds into ``metadata`` so the
+        # response surfaces a 500 with the structured log, exactly as the buffered
+        # ``except`` / early-return branches did (now carrying the worker metadata).
+        if write_error:
+            metadata["error"] = write_error["msg"]
+
+        # Record the write-phase timing (issue #100): read/index/aggregate come from
+        # ``process_shard``; ``write`` is the time spent in the streaming callback /
+        # sharded write. Only attach it on a clean write (no ``error``) so a time-to-
+        # failure is never folded in as a real write duration; the no-data path wrote
+        # nothing (``_write_elapsed`` stays 0) but also has no chunks, so writing 0 is
+        # harmless — gate on a populated ``phase_timings`` and no error to match the
+        # old "write absent on failure / no-data" contract.
+        if profile and not metadata.get("error") and "phase_timings" in metadata and store_box:
+            metadata["phase_timings"]["write"] = _write_elapsed
 
         # Log structured result
         logger.info(
