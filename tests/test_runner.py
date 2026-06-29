@@ -371,7 +371,7 @@ class TestInvokeLambdaCellEvent:
 
     _CREDS = {"accessKeyId": "a", "secretAccessKey": "s", "sessionToken": "t"}
 
-    def _captured_event(self, *, child_order, profile=False):
+    def _captured_event(self, *, child_order, profile=False, aoi_payload=None):
         from unittest.mock import MagicMock
 
         from zagg.runner import _invoke_lambda_cell
@@ -395,6 +395,7 @@ class TestInvokeLambdaCellEvent:
             config_dict=None,
             max_workers=4,
             profile=profile,
+            aoi_payload=aoi_payload,
         )
         return json.loads(client.invoke.call_args.kwargs["Payload"])
 
@@ -422,6 +423,18 @@ class TestInvokeLambdaCellEvent:
         # no "profile" key is added.
         event = self._captured_event(child_order=12, profile=False)
         assert "profile" not in event
+
+    def test_aoi_payload_adds_event_key(self):
+        # issue #101: a flag-on Lambda run forwards the per-shard mask payload
+        # under the "aoi_payload" event key for the worker to expand.
+        event = self._captured_event(child_order=12, aoi_payload=[1, 2, 3])
+        assert event["aoi_payload"] == [1, 2, 3]
+
+    def test_default_event_has_no_aoi_payload_key(self):
+        # Default (flag off): no "aoi_payload" key, so the event stays
+        # byte-identical to the pre-feature path (issue #101).
+        event = self._captured_event(child_order=12)
+        assert "aoi_payload" not in event
 
 
 class TestHandoffPassthrough:
@@ -652,26 +665,93 @@ class TestSummaryKeysByteIdentical:
         )
         assert all(v == "OMITTED" for v in seen.values())
 
-    def test_lambda_refuses_aoi_mask(self, atl06_config):
-        # The Lambda worker path can't fill the mask yet, so a flag-on Lambda run
-        # must refuse loudly rather than emit an all-False (out-of-AOI) mask (#101).
+    def test_lambda_threads_aoi_payload(self, monkeypatch, atl06_config):
+        # When the manifest carries an aoi_mask list, _run_lambda threads each
+        # shard's payload into _invoke_lambda_cell; when it doesn't, the kwarg is
+        # omitted so the per-cell invoke is byte-identical to the flag-off path
+        # (issue #101).
+        import boto3
+
+        import zagg.grids as grids_mod
         from zagg import runner
+        from zagg.concurrency import ConcurrencyReport
+
+        monkeypatch.setattr(
+            runner,
+            "get_nsidc_s3_credentials",
+            lambda: {"accessKeyId": "a", "secretAccessKey": "s", "sessionToken": "t"},
+        )
+        monkeypatch.setattr(grids_mod, "from_config", lambda *a, **k: _stub_grid())
+        monkeypatch.setattr(runner, "_invoke_lambda_setup", lambda *a, **k: None)
+        monkeypatch.setattr(runner, "_invoke_lambda_finalize", lambda *a, **k: None)
+        monkeypatch.setattr(runner, "_get_function_timeout_s", lambda *a, **k: 720)
+        from unittest.mock import MagicMock
+
+        monkeypatch.setattr(boto3, "Session", lambda *a, **k: MagicMock())
+        monkeypatch.setattr(
+            runner,
+            "compute_available_workers",
+            lambda requested, *a, **k: (
+                4,
+                ConcurrencyReport(
+                    account_limit=1000,
+                    current_concurrent=0,
+                    padding=100,
+                    available=900,
+                    function_reserved=None,
+                ),
+            ),
+        )
+
+        seen = {}
+
+        def fake_cell(client, chunk_idx, shard_key, *a, **kw):
+            seen[int(shard_key)] = kw.get("aoi_payload", "OMITTED")
+            return {
+                "shard_key": shard_key,
+                "status_code": 200,
+                "body": {"total_obs": 1},
+                "error": None,
+                "timeout": False,
+            }
+
+        monkeypatch.setattr(runner, "_invoke_lambda_cell", fake_cell)
 
         atl06_config.output = {**atl06_config.output, "aoi_mask": True}
-        with pytest.raises(NotImplementedError, match="not yet supported on the Lambda"):
-            runner._run_lambda(
-                atl06_config,
-                _run_catalog(),
-                "s3://out/x.zarr",
-                12,
-                max_cells=None,
-                morton_cell=None,
-                max_workers=1,
-                overwrite=False,
-                dry_run=False,
-                region="us-west-2",
-                function_name="fn",
-            )
+        cat = _run_catalog()
+        cat["aoi_mask"] = [[1, 2], [3], [], [4, 5]]  # parallel to shard_keys
+        runner._run_lambda(
+            atl06_config,
+            cat,
+            "s3://out/x.zarr",
+            12,
+            max_cells=None,
+            morton_cell=None,
+            max_workers=1,
+            overwrite=False,
+            dry_run=False,
+            region="us-west-2",
+            function_name="fn",
+        )
+        assert seen[10] == [1, 2]
+        assert seen[13] == [4, 5]
+
+        # No aoi_mask key -> kwarg omitted (legacy event preserved).
+        seen.clear()
+        runner._run_lambda(
+            atl06_config,
+            _run_catalog(),
+            "s3://out/x.zarr",
+            12,
+            max_cells=None,
+            morton_cell=None,
+            max_workers=1,
+            overwrite=False,
+            dry_run=False,
+            region="us-west-2",
+            function_name="fn",
+        )
+        assert all(v == "OMITTED" for v in seen.values())
 
     def test_lambda_summary_keys_and_cost(self, monkeypatch, atl06_config):
         import boto3
@@ -837,21 +917,30 @@ def _run_lambda_with_durations(
     from zagg import runner
     from zagg.concurrency import ConcurrencyReport
 
-    monkeypatch.setattr(runner, "get_nsidc_s3_credentials",
-                        lambda: {"accessKeyId": "a", "secretAccessKey": "s",
-                                 "sessionToken": "t"})
+    monkeypatch.setattr(
+        runner,
+        "get_nsidc_s3_credentials",
+        lambda: {"accessKeyId": "a", "secretAccessKey": "s", "sessionToken": "t"},
+    )
     monkeypatch.setattr(grids_mod, "from_config", lambda *a, **k: _stub_grid())
     monkeypatch.setattr(runner, "_invoke_lambda_setup", lambda *a, **k: None)
     monkeypatch.setattr(runner, "_invoke_lambda_finalize", lambda *a, **k: None)
     monkeypatch.setattr(runner, "_get_function_timeout_s", lambda *a, **k: timeout)
     from unittest.mock import MagicMock
+
     monkeypatch.setattr(boto3, "Session", lambda *a, **k: MagicMock())
     monkeypatch.setattr(
-        runner, "compute_available_workers",
+        runner,
+        "compute_available_workers",
         lambda requested, *a, **k: (
             1,  # 1 worker -> deterministic completion order for the iter()
-            ConcurrencyReport(account_limit=1000, current_concurrent=0,
-                              padding=100, available=900, function_reserved=None),
+            ConcurrencyReport(
+                account_limit=1000,
+                current_concurrent=0,
+                padding=100,
+                available=900,
+                function_reserved=None,
+            ),
         ),
     )
     it = iter(durations)
@@ -863,14 +952,27 @@ def _run_lambda_with_durations(
             body["phase_timings"] = phase_timings
         if mem_it is not None:
             body["max_memory_mb"] = next(mem_it)
-        return {"status_code": 200, "body": body, "error": None,
-                "lambda_duration": next(it), "shard_key": 0}
+        return {
+            "status_code": 200,
+            "body": body,
+            "error": None,
+            "lambda_duration": next(it),
+            "shard_key": 0,
+        }
 
     monkeypatch.setattr(runner, "_invoke_lambda_cell", _fake_cell)
     return runner._run_lambda(
-        atl06_config, _run_catalog(), "s3://out/x.zarr", 12,
-        max_cells=None, morton_cell=None, max_workers=1700, overwrite=False,
-        dry_run=False, region="us-west-2", function_name="process-shard",
+        atl06_config,
+        _run_catalog(),
+        "s3://out/x.zarr",
+        12,
+        max_cells=None,
+        morton_cell=None,
+        max_workers=1700,
+        overwrite=False,
+        dry_run=False,
+        region="us-west-2",
+        function_name="process-shard",
         profile=profile,
     )
 
@@ -883,9 +985,7 @@ class TestWorkerRuntimeStats:
         import statistics
 
         durations = [10.0, 20.0, 30.0, 100.0]
-        summary = _run_lambda_with_durations(
-            monkeypatch, atl06_config, durations, timeout=720
-        )
+        summary = _run_lambda_with_durations(monkeypatch, atl06_config, durations, timeout=720)
         assert summary["function_timeout_s"] == 720
         assert summary["worker_max_s"] == 100.0
         assert summary["worker_median_s"] == statistics.median(durations)
@@ -901,9 +1001,7 @@ class TestWorkerRuntimeStats:
 
     def test_empty_durations_degrade_to_none(self, monkeypatch, atl06_config):
         # All cells report zero/falsy lambda_duration -> no distribution.
-        summary = _run_lambda_with_durations(
-            monkeypatch, atl06_config, [0, 0, 0, 0], timeout=720
-        )
+        summary = _run_lambda_with_durations(monkeypatch, atl06_config, [0, 0, 0, 0], timeout=720)
         assert summary["worker_max_s"] is None
         assert summary["worker_median_s"] is None
         assert summary["worker_pstdev_s"] is None
@@ -912,9 +1010,7 @@ class TestWorkerRuntimeStats:
         assert summary["function_timeout_s"] == 720
 
     def test_orchestrator_brackets_present_and_nonnegative(self, monkeypatch, atl06_config):
-        summary = _run_lambda_with_durations(
-            monkeypatch, atl06_config, [1.0, 2.0, 3.0, 4.0]
-        )
+        summary = _run_lambda_with_durations(monkeypatch, atl06_config, [1.0, 2.0, 3.0, 4.0])
         for key in ("setup_s", "fanout_s", "finalize_s"):
             assert key in summary
             assert summary[key] >= 0.0
@@ -935,9 +1031,7 @@ class TestWorkerMemory:
 
     def test_max_memory_none_when_unreported(self, monkeypatch, atl06_config):
         # No worker stamped memory (e.g. an older deployed layer) -> null, not 0.
-        summary = _run_lambda_with_durations(
-            monkeypatch, atl06_config, [1.0, 2.0, 3.0, 4.0]
-        )
+        summary = _run_lambda_with_durations(monkeypatch, atl06_config, [1.0, 2.0, 3.0, 4.0])
         assert summary["max_memory_mb"] is None
 
 
@@ -990,17 +1084,18 @@ class TestProfilePlumbing:
     set, the per-cell ``phase_timings`` roll up into ``worker_phase_max``."""
 
     def test_default_run_omits_worker_phase_max(self, monkeypatch, atl06_config):
-        summary = _run_lambda_with_durations(
-            monkeypatch, atl06_config, [1.0, 2.0, 3.0, 4.0]
-        )
+        summary = _run_lambda_with_durations(monkeypatch, atl06_config, [1.0, 2.0, 3.0, 4.0])
         assert "worker_phase_max" not in summary
 
     def test_profile_run_rolls_up_phase_max(self, monkeypatch, atl06_config):
         # Every cell reports the same phase_timings; the rollup is the per-phase
         # max across cells.
         summary = _run_lambda_with_durations(
-            monkeypatch, atl06_config, [1.0, 2.0, 3.0, 4.0],
-            profile=True, phase_timings={"read": 5.0, "index": 1.0, "aggregate": 2.0},
+            monkeypatch,
+            atl06_config,
+            [1.0, 2.0, 3.0, 4.0],
+            profile=True,
+            phase_timings={"read": 5.0, "index": 1.0, "aggregate": 2.0},
         )
         assert summary["worker_phase_max"] == {"read": 5.0, "index": 1.0, "aggregate": 2.0}
 
@@ -1024,8 +1119,11 @@ class TestProfilePlumbing:
         monkeypatch.setattr(runner, "_load_catalog", lambda p: _run_catalog())
         monkeypatch.setattr(runner, "_run_lambda", fake_run_lambda)
         runner.agg(
-            atl06_config, catalog="ignored", store="s3://out/x.zarr",
-            backend="lambda", profile=True,
+            atl06_config,
+            catalog="ignored",
+            store="s3://out/x.zarr",
+            backend="lambda",
+            profile=True,
         )
         assert captured["profile"] is True
 
@@ -1035,7 +1133,8 @@ class TestProfilePlumbing:
         captured = {}
         monkeypatch.setattr(runner, "_load_catalog", lambda p: _run_catalog())
         monkeypatch.setattr(
-            runner, "_run_lambda",
+            runner,
+            "_run_lambda",
             lambda *a, **k: captured.update(profile=k.get("profile")) or {},
         )
         runner.agg(atl06_config, catalog="ignored", store="s3://out/x.zarr", backend="lambda")
@@ -1052,7 +1151,7 @@ class TestWorkerPhaseTimings:
         from zagg.processing import worker
 
         # Stub the read/group/aggregate seams so process_shard runs without I/O.
-        monkeypatch.setattr(worker._processing, "_make_url_rewriter", lambda d: (lambda u: u))
+        monkeypatch.setattr(worker._processing, "_make_url_rewriter", lambda d: lambda u: u)
 
         class _H5:
             def __init__(self, *a, **k):
@@ -1063,23 +1162,29 @@ class TestWorkerPhaseTimings:
 
         monkeypatch.setattr(worker._processing, "h5coro", type("M", (), {"H5Coro": _H5}))
         monkeypatch.setattr(
-            worker._processing, "_read_group",
-            lambda *a, **k: (object() if with_data else None),
+            worker._processing,
+            "_read_group",
+            lambda *a, **k: object() if with_data else None,
         )
         monkeypatch.setattr(
-            worker, "_concat_and_group",
+            worker,
+            "_concat_and_group",
             lambda reads, grid, handoff: ({"leaf_id": np.array([0])}, {0: slice(0, 1)}, 1),
         )
         monkeypatch.setattr(worker, "_has_vector_fields", lambda config: False)
         monkeypatch.setattr(worker, "_eval_chunk_precompute", lambda config, pooled: {})
         monkeypatch.setattr(worker, "_pool_chunk_columns", lambda *a, **k: {})
         monkeypatch.setattr(
-            worker, "_aggregate_chunk_cells",
+            worker,
+            "_aggregate_chunk_cells",
             lambda *a, **k: ({}, {}, {}, 1),
         )
-        monkeypatch.setattr(worker, "_build_output", lambda *a, **k: __import__("pandas").DataFrame())
+        monkeypatch.setattr(
+            worker, "_build_output", lambda *a, **k: __import__("pandas").DataFrame()
+        )
 
         from unittest.mock import MagicMock
+
         grid = MagicMock()
         grid.chunks_per_shard = 1
         grid.block_index.return_value = (0,)
@@ -1087,10 +1192,16 @@ class TestWorkerPhaseTimings:
         del grid.iter_chunks  # force the K==1 fallback path
 
         from zagg.config import default_config
+
         _df, meta = worker.process_shard(
-            grid, 0, ["s3://b/g.h5"], s3_credentials={"accessKeyId": "a"},
-            config=default_config("atl06"), driver="s3",
-            h5coro_driver=object(), profile=profile,
+            grid,
+            0,
+            ["s3://b/g.h5"],
+            s3_credentials={"accessKeyId": "a"},
+            config=default_config("atl06"),
+            driver="s3",
+            h5coro_driver=object(),
+            profile=profile,
         )
         return meta
 

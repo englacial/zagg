@@ -101,6 +101,7 @@ class TestProcessEventDispatch:
 
         def fake_process_shard(grid, shard_key, granule_urls, **kwargs):
             captured["shard_key"] = shard_key
+            captured["aoi_payload"] = kwargs.get("aoi_payload", "OMITTED")
             meta = {
                 "shard_key": shard_key,
                 "cells_with_data": 0,
@@ -131,6 +132,27 @@ class TestProcessEventDispatch:
         resp, captured = self._run(handler_mod, monkeypatch, event)
         assert resp["statusCode"] == 200
         assert captured["shard_key"] == 12345
+
+    def test_aoi_payload_threaded_to_process_shard(self, handler_mod, monkeypatch):
+        # issue #101: a flag-on Lambda event carries an "aoi_payload"; the handler
+        # threads it into process_shard so the worker fills the aoi_mask column.
+        event = _base_event(_healpix_config_dict())
+        event["child_order"] = 12
+        event["aoi_payload"] = [1, 2, 3]
+        resp, captured = self._run(handler_mod, monkeypatch, event)
+        assert resp["statusCode"] == 200
+        assert captured["aoi_payload"] == [1, 2, 3]
+
+    def test_no_aoi_payload_passes_none(self, handler_mod, monkeypatch):
+        # Flag off (no "aoi_payload" key): the handler passes aoi_payload=None,
+        # which equals process_shard's default, so the worker call is unchanged
+        # and the aoi_mask column is not allocated (issue #101).
+        event = _base_event(_healpix_config_dict())
+        event["child_order"] = 12
+        assert "aoi_payload" not in event
+        resp, captured = self._run(handler_mod, monkeypatch, event)
+        assert resp["statusCode"] == 200
+        assert captured["aoi_payload"] is None
 
     def test_body_reports_max_memory_mb(self, handler_mod, monkeypatch):
         """Issue #120: every successful invocation stamps a positive

@@ -23,7 +23,12 @@ Event payload (default / process mode):
         "endpointUrl": str,     #   endpointUrl, and region are optional.
         "region": str
     },
-    "config": dict (optional, pipeline config as dict)
+    "config": dict (optional, pipeline config as dict),
+    "aoi_payload": list (optional, issue #101) -- this shard's strict-AOI mask
+        payload (a compact MOC for HEALPix / in-AOI cell ids for rectilinear).
+        Forwarded to ``process_shard`` so the worker fills the ``aoi_mask``
+        column; absent when ``output.aoi_mask`` is off (the column is not
+        allocated), keeping the flag-off event and outputs byte-identical.
 }
 
 Setup mode (creates the zarr template once before per-cell fan-out):
@@ -268,6 +273,11 @@ def _handle_process(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
         # read/index/aggregate deltas; the write phase runs here, so we bracket it
         # below and merge it in. Default (no key) leaves the worker path unchanged.
         profile = event.get("profile", False)
+        # Strict-AOI mask payload (issue #101): when present, process_shard
+        # expands it into the per-cell ``aoi_mask`` column. Absent (flag off) ->
+        # not passed, so the worker call and outputs are byte-identical. Mirrors
+        # the local runner threading aoi_payload through _process_and_write.
+        aoi_payload = event.get("aoi_payload")
         chunk_results: list = []
         _df_out, metadata = process_shard(
             grid,
@@ -277,6 +287,7 @@ def _handle_process(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
             config=config,
             chunk_results=chunk_results,
             profile=profile,
+            aoi_payload=aoi_payload,
         )
 
         # Write Zarr to store: one dense region per chunk plus its ragged (CSR)

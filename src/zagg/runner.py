@@ -29,7 +29,6 @@ from zagg.concurrency import (
 )
 from zagg.config import (
     PipelineConfig,
-    get_aoi_mask,
     get_child_order,
     get_driver,
     get_layout,
@@ -600,19 +599,12 @@ def _run_lambda(
     import boto3
     from botocore.config import Config
 
-    # The Lambda worker path (deployment/aws/lambda_handler.py) does not yet thread
-    # the per-shard AOI payload to process_shard, so a Lambda run with the flag on
-    # would emit_template the bool aoi_mask array but never fill it — an all-False
-    # (entirely out-of-AOI) mask, silently the inverse of the feature (issue #101).
-    # Refuse rather than write a wrong mask; the local backend supports aoi_mask.
-    if get_aoi_mask(config):
-        raise NotImplementedError(
-            "output.aoi_mask is not yet supported on the Lambda backend (the Lambda "
-            "handler does not thread the per-shard AOI payload to the worker); use "
-            "backend='local', or disable output.aoi_mask for Lambda runs."
-        )
-
     all_shards = list(catalog_data["shard_keys"])
+    # Strict-AOI per-shard mask payload (issue #101), keyed by shard for the
+    # per-cell event. Empty dict when the manifest carries no ``aoi_mask`` (flag
+    # off) — the per-cell invoke then omits the ``aoi_payload`` event key, so the
+    # event payload and the worker's outputs stay byte-identical.
+    aoi_by_shard = _aoi_payload_map(catalog_data)
     grid_type = config.output.get("grid", {}).get("type", "healpix")
     parent_order = get_parent_order(config) if grid_type == "healpix" else None
 
@@ -698,6 +690,12 @@ def _run_lambda(
     # inline ``executor.submit(_invoke_lambda_cell, ...)`` passed.
     def _cell_work(payload):
         shard_key, records = payload
+        # Only thread aoi_payload when the manifest carries a mask (flag on);
+        # otherwise omit the kwarg so the event payload is byte-identical to the
+        # pre-feature path (issue #101). Mirrors the local runner's _cell_work.
+        extra = {}
+        if aoi_by_shard:
+            extra["aoi_payload"] = aoi_by_shard.get(int(shard_key))
         return _invoke_lambda_cell(
             state["lambda_client"],
             grid.block_index(int(shard_key)),
@@ -712,6 +710,7 @@ def _run_lambda(
             output_creds_event=output_creds_event,
             max_workers=state["workers"],
             profile=profile,
+            **extra,
         )
 
     executor = LambdaExecutor(
@@ -1066,6 +1065,7 @@ def _invoke_lambda_cell(
     max_retries=3,
     max_workers=None,
     profile=False,
+    aoi_payload=None,
 ):
     """Invoke Lambda for a single cell with retry logic.
 
@@ -1073,6 +1073,10 @@ def _invoke_lambda_cell(
     (#28); it does not affect dispatch. ``profile`` (issue #100) forwards a
     ``"profile": true`` event key so the worker emits ``phase_timings``; when
     False the event payload is byte-identical to the pre-profile path (no key).
+    ``aoi_payload`` (issue #101) forwards the per-shard strict-AOI mask payload
+    (a compact MOC for HEALPix / in-AOI cell ids for rect) under the
+    ``"aoi_payload"`` event key so the worker expands the ``aoi_mask`` column;
+    when ``None`` (flag off) the key is omitted and the payload stays identical.
     """
     wall_start = time.time()
 
@@ -1099,6 +1103,10 @@ def _invoke_lambda_cell(
     # Only add the key when profiling, so default runs stay byte-identical (#100).
     if profile:
         event["profile"] = True
+    # Only add the AOI key when the flag is on; flag-off runs stay byte-identical
+    # to the pre-feature event (issue #101).
+    if aoi_payload is not None:
+        event["aoi_payload"] = aoi_payload
 
     last_error = None
     for attempt in range(max_retries):
