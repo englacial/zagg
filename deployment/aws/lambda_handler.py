@@ -292,9 +292,10 @@ def _handle_process(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
             # Validate that the Zarr template exists before writing. ``store`` is a
             # zarr v3 ``Store`` whose ``exists()`` is async, so open the group via
             # the high-level sync API and catch the missing-node error instead
-            # (issue #118). Mirrors the open-and-catch pattern in
+            # (issue #118), in the same open-and-catch spirit as
             # ``readers/tdigest_tensor.py``. ``GroupNotFoundError`` is raised
-            # identically on the LocalStore and obstore-backed (S3) paths.
+            # identically on the LocalStore and obstore-backed (S3) paths; a
+            # present-but-wrong-type node surfaces as a real error, not "missing".
             try:
                 open_group(store, path=grid.group_path, mode="r", zarr_format=3)
             except GroupNotFoundError:
