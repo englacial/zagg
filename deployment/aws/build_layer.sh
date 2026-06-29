@@ -86,21 +86,28 @@ rm -rf "$OUTPUT_DIR/python"/xarray* \
        "$OUTPUT_DIR/python"/boto3* \
        "$OUTPUT_DIR/python"/botocore* 2>/dev/null || true
 
-# pyarrow component strip (issue #130): drop the C++ engines zagg never calls --
-# Flight (RPC), Substrait, Gandiva (LLVM expr JIT), and Dataset -- plus their
-# cython modules. KEEP libarrow.so* (core), libarrow_python* (numpy<->arrow),
-# libparquet* (catalog), libarrow_acero*/_acero*.so + _compute*.so (the
-# arrow-kernel hash-aggregate reducer, kept per issue #130). The generic *.so
-# strip below then strips debug symbols from what remains.
+# pyarrow component strip (issue #130): drop the C++ engines the Lambda worker
+# never calls -- Flight (RPC), Substrait, Gandiva (LLVM expr JIT), Dataset, and
+# Parquet -- plus their cython modules. KEEP libarrow.so* (core), libarrow_python*
+# (numpy<->arrow), and libarrow_acero*/_acero*.so + _compute*.so (the arrow-kernel
+# hash-aggregate reducer, kept per issue #130). Parquet is stripped because
+# pyarrow.parquet is used ONLY by zagg.catalog (STAC/geoparquet fetch+build), which
+# runs OFF-Lambda with the ``catalog`` extra and never on the worker -- the layer
+# exists only for the worker, so libparquet is pure dead weight here (and recovers
+# the ~12 MB that put the combined layer+function over the 250 MB gate). The worker
+# parquet path, if any, is fastparquet+cramjam, which stay. The generic *.so strip
+# below then strips debug symbols from what remains.
 echo "Component-stripping pyarrow..."
 rm -f "$OUTPUT_DIR/python/pyarrow"/libarrow_flight* \
       "$OUTPUT_DIR/python/pyarrow"/libarrow_substrait* \
       "$OUTPUT_DIR/python/pyarrow"/libgandiva* \
       "$OUTPUT_DIR/python/pyarrow"/libarrow_dataset* \
+      "$OUTPUT_DIR/python/pyarrow"/libparquet* \
       "$OUTPUT_DIR/python/pyarrow"/_flight*.so \
       "$OUTPUT_DIR/python/pyarrow"/_substrait*.so \
       "$OUTPUT_DIR/python/pyarrow"/_gandiva*.so \
-      "$OUTPUT_DIR/python/pyarrow"/_dataset*.so 2>/dev/null || true
+      "$OUTPUT_DIR/python/pyarrow"/_dataset*.so \
+      "$OUTPUT_DIR/python/pyarrow"/_parquet*.so 2>/dev/null || true
 
 # Clean caches/tests and strip debug symbols.
 find "$OUTPUT_DIR/python" -type d -name "__pycache__" -exec rm -rf {} + 2>/dev/null || true
