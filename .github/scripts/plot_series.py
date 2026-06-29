@@ -14,7 +14,6 @@ suite never needs a plotting backend.
 from __future__ import annotations
 
 import argparse
-import math
 import sys
 from pathlib import Path
 
@@ -73,6 +72,49 @@ def _merge_history(df: pd.DataFrame) -> pd.DataFrame:
     return hist.sort_values("timestamp").reset_index(drop=True)
 
 
+def _panel_layout(hist: pd.DataFrame) -> tuple[list[list[str | None]], int, int]:
+    """Place each target in a ``(row, col)`` grid, data-driven (issue #121 review).
+
+    Convention: the LEFT column is the rectilinear grids, the RIGHT column is the
+    HEALPix grids. A row pairs the two families at the same aggregator and the same
+    *shard-size rank* within their family (so e.g. ``rect_6km`` lines up with the
+    largest HEALPix shard). Rows are ordered largest-shard-first, top to bottom;
+    same-size rows break ties on the aggregator name. New targets slot in by the
+    same rule -- nothing is hardcoded to today's eight.
+    """
+    meta = hist.dropna(subset=["target"]).drop_duplicates("target")
+    rows = []
+    for _, r in meta.iterrows():
+        grid = str(r.get("grid_type", ""))
+        col = 0 if grid.startswith("rect") else 1
+        rows.append(
+            {
+                "target": r["target"],
+                "col": col,
+                "grid": grid,
+                "agg": str(r.get("aggregator", "")),
+                "area": float(r.get("shard_area_km2") or 0.0),
+            }
+        )
+    # Shard-size rank within each grid family (0 = largest), so the two families
+    # align row-for-row even though their absolute areas differ.
+    for col in (0, 1):
+        areas = sorted({d["area"] for d in rows if d["col"] == col}, reverse=True)
+        rank = {a: i for i, a in enumerate(areas)}
+        for d in rows:
+            if d["col"] == col:
+                d["rank"] = rank[d["area"]]
+    # One row per (size-rank, aggregator); largest shard at the top.
+    row_keys = sorted({(d["rank"], d["agg"]) for d in rows})
+    row_of = {k: i for i, k in enumerate(row_keys)}
+    nrows = len(row_keys)
+    ncols = 1 + int(any(d["col"] == 1 for d in rows)) if rows else 1
+    grid: list[list[str | None]] = [[None] * ncols for _ in range(nrows)]
+    for d in rows:
+        grid[row_of[(d["rank"], d["agg"])]][d["col"]] = d["target"]
+    return grid, nrows, ncols
+
+
 def make_figure(df: pd.DataFrame, cost_col: str, cost_label: str, out_png: Path) -> bool:
     """Render one figure (a per-target grid of cost+runtime panels). Returns
     False (writing nothing) when there's no retained data to plot."""
@@ -87,12 +129,11 @@ def make_figure(df: pd.DataFrame, cost_col: str, cost_label: str, out_png: Path)
     if hist.empty:
         return False
 
-    targets = sorted(hist["target"].dropna().unique())
-    n = len(targets)
-    if n == 0:  # rows present but no usable target labels -> nothing to panel
+    if hist["target"].dropna().empty:  # rows present but no labels -> nothing to panel
         return False
-    ncols = min(2, n)
-    nrows = math.ceil(n / ncols)
+    # Meaningful layout: rect grids on the left, HEALPix on the right; rows pair
+    # the families at matching aggregator + shard-size rank, largest shard on top.
+    layout, nrows, ncols = _panel_layout(hist)
     # Each panel keeps its OWN x-axis: targets can have different commit sets (one
     # may have skipped an early merge), so a single shared axis would stamp one
     # target's labels onto all panels. We instead hide the upper rows' commit
@@ -118,68 +159,86 @@ def make_figure(df: pd.DataFrame, cost_col: str, cost_label: str, out_png: Path)
     norm = Normalize(vmin=vmin, vmax=vmax)
     cap_mb = _memory_cap_mb(hist)
 
-    for i, target in enumerate(targets):
-        ax = axes[i // ncols][i % ncols]
-        sub = hist[hist["target"] == target]
-        xs = list(range(len(sub)))
+    for r in range(nrows):
+        for c in range(ncols):
+            target = layout[r][c]
+            ax = axes[r][c]
+            if target is None:  # no target at this slot -> blank panel
+                ax.axis("off")
+                continue
+            sub = hist[hist["target"] == target]
+            xs = list(range(len(sub)))
 
-        # Connecting line stays cost-blue; the markers carry the memory signal
-        # (colour = % of the Lambda memory cap, green->red). Rows missing memory
-        # plot uncoloured (grey) rather than dropping out.
-        fracs = memory_fractions(sub)
-        ax.plot(xs, sub[cost_col], "-", color="C0", zorder=1, label=cost_label)
-        ax.scatter(
-            xs,
-            sub[cost_col],
-            s=90,
-            c=[f if f is not None else float("nan") for f in fracs],
-            cmap=MEMORY_CMAP,
-            norm=norm,
-            edgecolors="C0",
-            linewidths=0.6,
-            zorder=2,
-            plotnonfinite=True,
-        )
-        ax.set_ylabel(cost_label, color="C0")
-        ax.tick_params(axis="y", labelcolor="C0")
-        ax.set_title(target, fontsize=10)
-        ax.set_xticks(xs)
+            # Drop failed runs: a zero cost/runtime is a crashed shard, not a
+            # measurement. ``line`` breaks the connecting segment at those x
+            # (NaN), so the line never dips to 0; ``fail`` marks them with a
+            # non-connected 'X' so the x-axis/commit alignment is kept and the
+            # failure reads as a failure, not a real 0.
+            cost = sub[cost_col].to_numpy(dtype=float)
+            line = [v if v != 0 else float("nan") for v in cost]
+            fail = [x for x, v in zip(xs, cost) if v == 0]
 
-        # Label every panel with its own commits; the upper rows have the labels
-        # hidden afterwards, so only the bottom row of each column shows them.
-        labels = [str(c)[:7] for c in sub["commit"]]
-        ax.set_xticklabels(labels, rotation=45, ha="right", fontsize=7)
+            # Connecting line stays cost-blue; the markers carry the memory signal
+            # (colour = % of the Lambda memory cap, green->red). Rows missing
+            # memory plot uncoloured (grey) rather than dropping out.
+            fracs = memory_fractions(sub)
+            colors = [
+                f if (f is not None and v != 0) else float("nan") for f, v in zip(fracs, cost)
+            ]
+            ax.plot(xs, line, "-", color="C0", zorder=1, label=cost_label)
+            ax.scatter(
+                xs,
+                line,
+                s=90,
+                c=colors,
+                cmap=MEMORY_CMAP,
+                norm=norm,
+                edgecolors="C0",
+                linewidths=0.6,
+                zorder=2,
+                plotnonfinite=True,
+            )
+            if fail:  # failed-run markers, not joined to the line
+                ax.scatter(fail, [0] * len(fail), marker="x", color="0.5", s=60, zorder=3)
+            ax.set_ylabel(cost_label, color="C0")
+            ax.tick_params(axis="y", labelcolor="C0")
+            ax.set_title(target, fontsize=10)
+            ax.set_xticks(xs)
 
-        # Runtime on the right axis: hollow circles (not filled squares) so the
-        # memory-coloured cost marker stays visible (issue #125). The twin axis is
-        # drawn after ``ax``, so raise ``ax`` above it and drop ``ax``'s opaque
-        # patch -- otherwise the runtime glyph sits on top of the cost circles.
-        rt = ax.twinx()
-        rt.plot(
-            xs,
-            sub["runtime_s"],
-            linestyle="--",
-            marker="o",
-            markerfacecolor="none",
-            color="C1",
-            label="runtime (s)",
-        )
-        rt.set_ylabel("runtime (s)", color="C1")
-        rt.tick_params(axis="y", labelcolor="C1")
-        ax.set_zorder(rt.get_zorder() + 1)
-        ax.patch.set_visible(False)
+            # Label every panel with its own commits; the upper rows have the
+            # labels hidden afterwards, so only the bottom row shows them.
+            labels = [str(cm)[:7] for cm in sub["commit"]]
+            ax.set_xticklabels(labels, rotation=45, ha="right", fontsize=7)
+
+            # Runtime on the right axis: hollow circles (not filled squares) so
+            # the memory-coloured cost marker stays visible (issue #125). The twin
+            # axis is drawn after ``ax``, so raise ``ax`` above it and drop
+            # ``ax``'s opaque patch -- otherwise the runtime glyph sits on top of
+            # the cost circles. Zero runtimes break the line the same way.
+            runtime = sub["runtime_s"].to_numpy(dtype=float)
+            rt_line = [v if v != 0 else float("nan") for v in runtime]
+            rt = ax.twinx()
+            rt.plot(
+                xs,
+                rt_line,
+                linestyle="--",
+                marker="o",
+                markerfacecolor="none",
+                color="C1",
+                label="runtime (s)",
+            )
+            rt.set_ylabel("runtime (s)", color="C1")
+            rt.tick_params(axis="y", labelcolor="C1")
+            ax.set_zorder(rt.get_zorder() + 1)
+            ax.patch.set_visible(False)
 
     # Keep commit labels only on the bottom-most populated panel of each column;
     # hide the rows above so the labels aren't repeated up the grid.
-    for col in range(ncols):
-        last = max((i for i in range(n) if i % ncols == col), default=None)
-        for i in range(n):
-            if i % ncols == col and i != last:
-                axes[i // ncols][i % ncols].tick_params(labelbottom=False)
-
-    # Blank any unused panels in the grid.
-    for j in range(n, nrows * ncols):
-        axes[j // ncols][j % ncols].axis("off")
+    for c in range(ncols):
+        last = max((r for r in range(nrows) if layout[r][c] is not None), default=None)
+        for r in range(nrows):
+            if layout[r][c] is not None and r != last:
+                axes[r][c].tick_params(labelbottom=False)
 
     fig.suptitle(f"zagg Lambda benchmark — {cost_label} vs merge history")
     # One shared colorbar for the memory scale (issue #120) -- horizontal and

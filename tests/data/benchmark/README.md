@@ -40,6 +40,33 @@ aggregator).
   NEON shard maps resolve exactly as before. The drift test
   (`test_benchmark_shardmap.py`) rebuilds each map over its *resolved* AOI.
 
+## Plot layout (`plot_series.py`)
+
+The two GitHub-Pages charts (`cost_per_shard.png`, `cost_per_100km2.png`) lay
+their per-target panels out by a **data-driven** rule (issue #121 review), so new
+or rearranged targets follow the same convention automatically — nothing is keyed
+to today's eight targets:
+
+- **Columns = grid family.** The **left** column is the rectilinear (`rect_*`)
+  targets; the **right** column is the HEALPix targets.
+- **Rows = aggregator + resolution, aligned across families.** A row pairs the two
+  families at the **same aggregator** and the **same shard-size rank within their
+  family**, so e.g. `rect_6km` lines up with the largest HEALPix shard
+  (`healpix_o10`) and `rect_3km` with `healpix_o11`. `tdigest` rows and
+  `gain_bias` rows stay aligned.
+- **Rows ordered largest-shard-first.** The largest shards sit at the **top** and
+  shard size **descends** down the rows (size is ranked from `shard_area_km2`);
+  same-size rows break ties on the aggregator name.
+- **Zeros are failed runs, not data.** A zero cost/runtime means the shard run
+  failed, so it is **not** plotted as a real datapoint: the connecting line
+  **breaks** at that merge (it never dips to 0), and the failure is shown as a
+  non-line-connected **`x`** marker (distinct from the normal cost circle / runtime
+  open-circle) to keep the x-axis/commit alignment.
+
+When adding or rearranging targets, keep these conventions — the layout is derived
+from `grid_type` / `aggregator` / `shard_area_km2`, so getting that metadata right
+in `targets.json` is what places the panel.
+
 ## Add a target
 
 1. **Config** — copy the closest `configs/*.yaml` and edit only what differs
