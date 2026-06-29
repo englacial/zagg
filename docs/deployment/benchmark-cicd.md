@@ -30,7 +30,7 @@ Throughout, substitute your values for `ACCOUNT_ID`, `REGION` (e.g.
 | Scoped IAM role (`zagg-benchmark`) | What those creds can do: invoke the one Lambda, read/write the one bucket prefix |
 | S3 bucket / prefix | Where the benchmark Zarr stores are written |
 | Repo **variables** `BENCHMARK_*` | Non-secret config (role ARN, region, function, store prefix) |
-| Repo **secrets** `EARTHDATA_*` | Earthdata Login for the orchestrator to mint NSIDC read creds |
+| Repo **secret** `EARTHDATA_TOKEN` | Earthdata Login bearer token for the orchestrator to mint NSIDC read creds |
 | `benchmarks` branch | Holds the retained parquet series + rendered charts |
 | `benchmark` label | One of the two fork-PR on-demand triggers |
 
@@ -198,16 +198,24 @@ gh variable set BENCHMARK_AWS_REGION    --body "REGION"
 gh variable set BENCHMARK_FUNCTION_NAME --body "FUNCTION_NAME"
 gh variable set BENCHMARK_STORE_PREFIX  --body "s3://BUCKET/PREFIX"
 
-# Secrets (Earthdata Login for the orchestrator)
-gh secret set EARTHDATA_USERNAME --body "your-edl-username"
-gh secret set EARTHDATA_PASSWORD --body "your-edl-password"
+# Secret: an Earthdata Login BEARER TOKEN for the orchestrator (the NSIDC S3
+# credentials endpoint accepts a user token). Generate one at
+# https://urs.earthdata.nasa.gov/documentation/for_users/user_token (Profile ->
+# Generate Token). earthaccess reads it from EARTHDATA_TOKEN.
+gh secret set EARTHDATA_TOKEN --body "<edl-bearer-token>"
 ```
+
+A token is preferred over username/password: it's scoped, expiring (EDL allows up
+to 2 active tokens, ~60-day lifetime), and rotates without touching the EDL
+account password. Set a calendar reminder to regenerate + re-`gh secret set`
+before expiry — an expired token fails the benchmark at the NSIDC-credentials
+step.
 
 **Verify**:
 
 ```bash
 gh variable list   # 4 BENCHMARK_* entries
-gh secret list     # EARTHDATA_USERNAME, EARTHDATA_PASSWORD
+gh secret list     # EARTHDATA_TOKEN
 ```
 
 ---
@@ -277,7 +285,7 @@ gh label create benchmark \
 
 If a run fails at *Assume AWS role*, re-check the trust policy `sub` matches the
 repo and the OIDC provider exists (steps 1–2). If it fails minting NSIDC creds,
-re-check the `EARTHDATA_*` secrets (step 4).
+re-check the `EARTHDATA_TOKEN` secret (step 4) — an expired token fails here.
 
 ---
 
@@ -306,7 +314,7 @@ you want the raw artifacts.
   cost of benchmarking a fork; the role can only invoke the one Lambda and write
   the one bucket prefix.
 - **Rotating creds.** OIDC mints fresh AWS creds per run (nothing to rotate).
-  Rotate the `EARTHDATA_*` secrets per your normal policy.
+  Regenerate the `EARTHDATA_TOKEN` before it expires (EDL tokens are short-lived).
 
 ---
 
@@ -429,7 +437,7 @@ aws s3 cp s3://sliderule-public-cors/versions.json - --no-sign-request   # after
 ## 11. GitHub Environments, variables, and tag protection
 
 The deploy/release jobs read these **variables** (and reuse the section-4
-`EARTHDATA_*` secrets). The role ARNs are the section-2 stack's Outputs
+`EARTHDATA_TOKEN` secret). The role ARNs are the section-2 stack's Outputs
 (`DeployRoleArn` / `ReleaseRoleArn`) — paste those rather than hand-building the
 ARNs below:
 
