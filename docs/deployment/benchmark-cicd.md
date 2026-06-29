@@ -438,8 +438,8 @@ aws s3 cp s3://sliderule-public-cors/versions.json - --no-sign-request   # after
 
 ## 11. GitHub Environments, variables, and tag protection
 
-The deploy/release jobs read these **variables** (and reuse the section-4
-`EARTHDATA_TOKEN` secret). The role ARNs are the section-2 stack's Outputs
+The deploy/release jobs read these **variables** (no extra secrets — only the
+benchmark jobs use `EARTHDATA_TOKEN`). The role ARNs are the section-2 stack's Outputs
 (`DeployRoleArn` / `ReleaseRoleArn`) — paste those rather than hand-building the
 ARNs below:
 
