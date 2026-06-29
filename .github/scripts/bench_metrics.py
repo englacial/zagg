@@ -51,6 +51,9 @@ RECORD_COLUMNS = [
     "memory_gb",
     "price_per_gb_sec",
     "zagg_version",
+    # Appended for issue #120 (stable schema -> new columns go last). Peak worker
+    # RSS in MB; null on rows recorded before the worker reported it.
+    "max_memory_mb",
 ]
 
 
@@ -86,6 +89,22 @@ def _runtime_s(summary: dict) -> float | None:
         if val is not None:
             return float(val)
     return None
+
+
+def memory_pct_of_cap(max_memory_mb, memory_gb) -> float | None:
+    """Fraction of the Lambda memory cap a shard peaked at (issue #120).
+
+    ``max_memory_mb / (memory_gb * 1024)`` -- 0.0 at idle, ~1.0 at the OOM wall.
+    None when either input is missing or the cap is non-positive, so callers
+    (chart colouring, comment table) degrade gracefully on legacy rows. Not
+    clamped: a value slightly over 1.0 is a real OOM signal worth surfacing.
+    """
+    if max_memory_mb is None or memory_gb is None:
+        return None
+    cap_mb = memory_gb * 1024.0
+    if cap_mb <= 0:
+        return None
+    return max_memory_mb / cap_mb
 
 
 def build_record(
@@ -130,6 +149,8 @@ def build_record(
         "memory_gb": LAMBDA_MEMORY_GB,
         "price_per_gb_sec": LAMBDA_PRICE_PER_GB_SEC,
         "zagg_version": zagg_version,
+        # Null-safe: absent on an empty/legacy summary -> None -> null parquet cell.
+        "max_memory_mb": summary.get("max_memory_mb"),
     }
     return record
 
@@ -161,18 +182,21 @@ def comment_markdown(records: list[dict], worker_note: str = "") -> str:
     if worker_note:
         lines += [f"> ⚠️ {worker_note}", ""]
     lines += [
-        "| target | obs | runtime (s) | cost/shard | cost/100 km² | % timeout |",
-        "| --- | ---: | ---: | ---: | ---: | ---: |",
+        "| target | obs | runtime (s) | cost/shard | cost/100 km² | % timeout | mem (MB) | % cap |",
+        "| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |",
     ]
     for r in records:
+        mem_pct = memory_pct_of_cap(r.get("max_memory_mb"), r.get("memory_gb"))
         lines.append(
-            "| {target} | {obs} | {rt} | ${cost} | ${c100} | {pct} |".format(
+            "| {target} | {obs} | {rt} | ${cost} | ${c100} | {pct} | {mem} | {mempct} |".format(
                 target=_fmt(r.get("target")),
                 obs=_fmt(r.get("total_obs"), ",d") if r.get("total_obs") is not None else "n/a",
                 rt=_fmt(r.get("runtime_s"), ".1f"),
                 cost=_fmt(r.get("cost_per_shard_usd"), ".5f"),
                 c100=_fmt(r.get("cost_per_100km2_usd"), ".5f"),
                 pct=_fmt(r.get("worker_pct_timeout"), ".0%"),
+                mem=_fmt(r.get("max_memory_mb"), ".0f"),
+                mempct=_fmt(mem_pct, ".0%"),
             )
         )
     lines += [
