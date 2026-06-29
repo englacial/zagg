@@ -610,3 +610,35 @@ def test_make_figure_colorbar_has_mb_twin_axis(tmp_path, monkeypatch):
     assert mb_ax.get_xlabel() == "peak memory (MB)"
     fwd = mb_ax._functions[0]
     assert fwd(0.75) == pytest.approx(1536.0)  # 0.75 * 2 GB cap
+
+
+def test_make_figure_cost_scatter_drawn_above_runtime_line(tmp_path, monkeypatch):
+    # The memory-coloured cost circles must sit ON TOP of the runtime twin's
+    # open-circle/dashed-line glyph. The twin axis is drawn after the host, so the
+    # fix raises the host axes' z-order above the twin (and hides the host patch).
+    pytest.importorskip("matplotlib")
+    import matplotlib
+
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+    import plot_series
+    from matplotlib.collections import PathCollection
+
+    captured = {}
+    monkeypatch.setattr(plt, "close", lambda fig: captured.setdefault("fig", fig))
+
+    rows = [_rec_row("c0", "t1", mem=1024.0), _rec_row("c1", "t1", mem=1536.0)]
+    series = tmp_path / "series.parquet"
+    update_series.save_series(update_series.records_to_frame(rows), series)
+    out = tmp_path / "fig.png"
+    assert plot_series.make_figure(
+        update_series.load_series(series), "cost_per_shard_usd", "c", out
+    )
+    fig = captured["fig"]
+
+    panel = next(
+        ax for ax in fig.axes if any(isinstance(c, PathCollection) for c in ax.collections)
+    )
+    (twin,) = [ax for ax in fig.axes if ax is not panel and ax.bbox.bounds == panel.bbox.bounds]
+    assert panel.get_zorder() > twin.get_zorder()  # cost circles render over the runtime line
+    assert panel.patch.get_visible() is False  # so the runtime line shows through gaps
