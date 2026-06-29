@@ -458,7 +458,7 @@ def _get_strategy(pipeline_type: str):
 #: ``output.store`` suffixes that name a concrete tabular output *file* (vs a
 #: bare directory). A temporal run whose store ends in one of these writes its
 #: event rows there; any other local store path leaves the rows in-memory only.
-_TABULAR_SUFFIXES = (".parquet", ".pq", ".csv", ".h5", ".hdf5", ".he5")
+_TABULAR_SUFFIXES = (".parquet", ".pq", ".csv")
 
 
 def _write_tabular_output(config, store_path, rows):
@@ -493,7 +493,7 @@ def _write_tabular_output(config, store_path, rows):
     if not rows:
         return None  # no events produced data -- skip the (column-less) write
     writer = get_writer(fmt)
-    # ``tabular`` is the generic alias -- let the file suffix pick parquet/csv/hdf5;
+    # ``tabular`` is the generic alias -- let the file suffix pick parquet/csv;
     # a concrete format name is passed through as the explicit serialisation.
     serialisation = None if fmt == "tabular" else fmt
     return str(writer.write(rows, store_path, output_format=serialisation))

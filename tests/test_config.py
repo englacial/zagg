@@ -1785,3 +1785,40 @@ class TestRaggedKind:
         entries = output_field_signature(atl06_config)
         for e in entries:
             assert e["inner_shape"] == [], f"{e['name']!r} has non-empty inner_shape"
+
+
+class TestMerra2StormTemplate:
+    """The packaged temporal-pipeline example (issue #12, Phase 7)."""
+
+    @pytest.fixture
+    def merra2_config(self):
+        from importlib import resources
+
+        import zagg.configs
+
+        ref = resources.files(zagg.configs).joinpath("merra2_storm.yaml")
+        with resources.as_file(ref) as p:
+            return load_config(str(p))
+
+    def test_is_temporal_pipeline(self, merra2_config):
+        assert get_pipeline_type(merra2_config) == "temporal"
+
+    def test_validates(self, merra2_config):
+        validate_config(merra2_config)  # no raise
+
+    def test_output_is_parquet(self, merra2_config):
+        from zagg.output import output_format
+
+        assert output_format(merra2_config) == "parquet"
+        assert merra2_config.output["store"].endswith(".parquet")
+
+    def test_specs_resolve_registered_capabilities(self, merra2_config):
+        from zagg import registry
+        from zagg.temporal import specs_from_config
+
+        specs = {s["output_name"]: s for s in specs_from_config(merra2_config)}
+        assert set(specs) == {"max_t2m_ais", "anom_tqv_full", "total_precip_ocean"}
+        assert specs["anom_tqv_full"]["is_anomaly"] is True
+        for spec in specs.values():
+            assert spec["spatial_func"] in registry.list_spatial_funcs()
+            assert spec["mask"] in registry.list_mask_providers()

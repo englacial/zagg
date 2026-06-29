@@ -11,9 +11,8 @@ writer by output format rather than branching inline.
   :func:`zagg.processing.write.write_ragged_to_zarr` + metadata consolidation)
   **byte-for-byte** -- it is a thin adapter over functions the spatial runner
   already calls, so routing through it changes nothing on disk.
-- :class:`TabularWriter` serialises temporal/event result rows to Parquet or CSV
-  (no new dependency -- ``pyarrow``/``pandas`` are already core) and to HDF5 when
-  the optional ``h5py`` extra is installed.
+- :class:`TabularWriter` serialises temporal/event result rows to Parquet
+  (default) or CSV -- no new dependency, ``pyarrow``/``pandas`` are already core.
 
 ``get_writer(output_format(config))`` resolves the writer for a config's
 ``output.format`` so the dispatch stays declarative.

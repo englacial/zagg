@@ -23,7 +23,7 @@ class TestWriterRegistry:
     def test_zarr_resolves_to_grid_writer(self):
         assert isinstance(get_writer("zarr"), ZarrGridWriter)
 
-    @pytest.mark.parametrize("fmt", ["tabular", "parquet", "csv", "hdf5"])
+    @pytest.mark.parametrize("fmt", ["tabular", "parquet", "csv"])
     def test_tabular_aliases_resolve_to_tabular_writer(self, fmt):
         assert isinstance(get_writer(fmt), TabularWriter)
 
@@ -226,29 +226,3 @@ class TestTabularWriterSerialise:
     def test_bad_format_raises(self, tmp_path):
         with pytest.raises(ValueError, match="unknown tabular output format"):
             TabularWriter().write(_result_rows(), tmp_path / "x", output_format="xml")
-
-    def test_hdf5_round_trip_or_clear_error(self, tmp_path):
-        path = tmp_path / "events.h5"
-        h5py = pytest.importorskip(
-            "h5py", reason="HDF5 tabular output needs the optional h5py extra"
-        )
-        TabularWriter().write(_result_rows(), path, key="events")
-        with h5py.File(path, "r") as f:
-            assert "events" in f
-            assert list(f["events/event_key"].asstr()[:]) == ["storm1", "storm2"]
-            assert f["events/max_t2m"][:].tolist() == pytest.approx([5.0, 9.0])
-
-    def test_hdf5_without_h5py_raises_actionable_error(self, monkeypatch, tmp_path):
-        # Force the optional-import to fail and assert the message points at h5py.
-        import builtins
-
-        real_import = builtins.__import__
-
-        def fake_import(name, *args, **kwargs):
-            if name == "h5py":
-                raise ModuleNotFoundError("No module named 'h5py'")
-            return real_import(name, *args, **kwargs)
-
-        monkeypatch.setattr(builtins, "__import__", fake_import)
-        with pytest.raises(ModuleNotFoundError, match="requires the optional 'h5py'"):
-            TabularWriter().write(_result_rows(), tmp_path / "e.h5")

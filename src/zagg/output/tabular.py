@@ -1,15 +1,17 @@
 """The tabular output writer for the temporal/event pipeline (issue #12, Phase 6).
 
 The temporal/event core produces one row per event with scalar attribute columns
-(challenge #5 / "Output: HDF5/DataFrame" in issue #12). :class:`TabularWriter`
-flattens :func:`zagg.temporal.process_event` result rows into a table and writes
-it to Parquet or CSV -- both using ``pyarrow``/``pandas``, which are already core
-dependencies, so the temporal output path needs **no new dependency**.
+(challenge #5 / the issue #12 "Output: HDF5/DataFrame (tabular)" row).
+:class:`TabularWriter` flattens :func:`zagg.temporal.process_event` result rows
+into a table and writes it to Parquet (default) or CSV -- both using
+``pyarrow``/``pandas``, which are already core dependencies, so the temporal
+output path needs **no new dependency**.
 
-HDF5 output is supported when the optional ``h5py`` extra is installed; without
-it, requesting HDF5 raises a clear, actionable error rather than silently
-swapping formats. (``h5coro`` -- zagg's HDF5 dependency -- is a byte-range
-*reader* only, so it cannot write.)
+The issue's comparison table names HDF5 as the AR repo's tabular output; zagg
+standardises on Parquet instead (see PR #70 discussion) -- the temporal output is
+flat tabular, not gridded, so it does not map onto the Zarr/xarray model, and
+Parquet already ships in core. (``h5coro`` -- zagg's HDF5 dependency -- is a
+byte-range *reader* only, so it cannot write regardless.)
 """
 
 from __future__ import annotations
@@ -25,16 +27,12 @@ _EXT_FORMAT = {
     ".parquet": "parquet",
     ".pq": "parquet",
     ".csv": "csv",
-    ".h5": "hdf5",
-    ".hdf5": "hdf5",
-    ".he5": "hdf5",
 }
 
 
 @register_writer("tabular")
 @register_writer("parquet")
 @register_writer("csv")
-@register_writer("hdf5")
 class TabularWriter:
     """Writer for tabular temporal/event output (``output.format: tabular``).
 
@@ -61,8 +59,8 @@ class TabularWriter:
             records.append(record)
         return pd.DataFrame.from_records(records)
 
-    def write(self, rows, path, *, output_format: str | None = None, key: str = "events"):
-        """Serialise result rows to ``path`` as Parquet, CSV, or HDF5.
+    def write(self, rows, path, *, output_format: str | None = None):
+        """Serialise result rows to ``path`` as Parquet or CSV.
 
         Parameters
         ----------
@@ -72,10 +70,8 @@ class TabularWriter:
             Output file. The format is inferred from the extension unless
             ``output_format`` is given.
         output_format : str, optional
-            ``"parquet"`` (default when the extension is unknown), ``"csv"``, or
-            ``"hdf5"``. Overrides the extension.
-        key : str
-            HDF5 dataset key (ignored for parquet/csv). Default ``"events"``.
+            ``"parquet"`` (default when the extension is unknown) or ``"csv"``.
+            Overrides the extension.
 
         Returns
         -------
@@ -86,8 +82,6 @@ class TabularWriter:
         ------
         ValueError
             For an unknown ``output_format``.
-        ModuleNotFoundError
-            For ``hdf5`` when the optional ``h5py`` extra is not installed.
         """
         path = Path(path)
         fmt = output_format or _EXT_FORMAT.get(path.suffix.lower(), "parquet")
@@ -97,42 +91,6 @@ class TabularWriter:
             frame.to_parquet(path, index=False)
         elif fmt == "csv":
             frame.to_csv(path, index=False)
-        elif fmt == "hdf5":
-            self._write_hdf5(frame, path, key)
         else:
-            raise ValueError(
-                f"unknown tabular output format {fmt!r} (expected 'parquet', 'csv', or 'hdf5')"
-            )
+            raise ValueError(f"unknown tabular output format {fmt!r} (expected 'parquet' or 'csv')")
         return path
-
-    def _write_hdf5(self, frame: pd.DataFrame, path: Path, key: str) -> None:
-        """Write ``frame`` to HDF5 via the optional ``h5py`` extra.
-
-        Each column becomes a dataset under ``key`` (string columns stored as a
-        variable-length UTF-8 dtype). Raises an actionable error when ``h5py`` is
-        not installed -- the dependency is intentionally optional (see module
-        docstring) so the core temporal path stays Parquet/CSV-only.
-        """
-        try:
-            import h5py
-        except ModuleNotFoundError as exc:  # pragma: no cover - exercised via skip
-            raise ModuleNotFoundError(
-                "HDF5 tabular output requires the optional 'h5py' package, which is not "
-                "installed. Install it (e.g. `pip install h5py`) or write Parquet/CSV "
-                "instead (output.format: parquet)."
-            ) from exc
-
-        import numpy as np
-
-        with h5py.File(path, "w") as f:
-            group = f.create_group(key)
-            for column in frame.columns:
-                values = frame[column].to_numpy()
-                if values.dtype == object or values.dtype.kind in ("U", "S"):
-                    group.create_dataset(
-                        column,
-                        data=values.astype(str),
-                        dtype=h5py.string_dtype(encoding="utf-8"),
-                    )
-                else:
-                    group.create_dataset(column, data=np.asarray(values))

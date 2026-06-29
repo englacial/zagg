@@ -32,9 +32,9 @@ class Writer(Protocol):
 
 
 #: Built-in ``output.format`` -> writer-factory registry. ``"zarr"`` is the
-#: spatial default; ``"tabular"``/``"parquet"``/``"csv"``/``"hdf5"`` all resolve
-#: to the tabular writer (the concrete serialisation is chosen from the path /
-#: an explicit ``format=`` at write time).
+#: spatial default; ``"tabular"``/``"parquet"``/``"csv"`` all resolve to the
+#: tabular writer (the concrete serialisation is chosen from the path / an
+#: explicit ``format=`` at write time).
 _WRITERS: dict[str, type] = {}
 
 
