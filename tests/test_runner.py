@@ -448,6 +448,7 @@ class TestSummaryKeysByteIdentical:
         "estimated_cost_usd", "store_path", "backend", "function_name",
         "results", "setup_s", "fanout_s", "finalize_s", "function_timeout_s",
         "worker_max_s", "worker_median_s", "worker_pstdev_s", "worker_pct_timeout",
+        "max_memory_mb",
     }
 
     def test_local_summary_keys_and_counts(self, monkeypatch, atl06_config):
@@ -581,7 +582,14 @@ class TestSummaryKeysByteIdentical:
 
 
 def _run_lambda_with_durations(
-    monkeypatch, atl06_config, durations, *, timeout=720, profile=False, phase_timings=None
+    monkeypatch,
+    atl06_config,
+    durations,
+    *,
+    timeout=720,
+    profile=False,
+    phase_timings=None,
+    memories=None,
 ):
     """Drive ``_run_lambda`` over synthetic per-cell durations.
 
@@ -589,6 +597,8 @@ def _run_lambda_with_durations(
     _run_catalog() has 4 cells); ``timeout`` stubs the function Timeout read.
     ``profile``/``phase_timings`` exercise the phase-2 opt-in path: when
     ``phase_timings`` is set it is attached to each cell result body.
+    ``memories`` (issue #120), when given, is consumed one per cell and attached
+    as ``body["max_memory_mb"]`` so the peak-memory rollup can be pinned.
     """
     import boto3
 
@@ -614,11 +624,14 @@ def _run_lambda_with_durations(
         ),
     )
     it = iter(durations)
+    mem_it = iter(memories) if memories is not None else None
 
     def _fake_cell(*a, **k):
         body = {"total_obs": 1}
         if phase_timings is not None:
             body["phase_timings"] = phase_timings
+        if mem_it is not None:
+            body["max_memory_mb"] = next(mem_it)
         return {"status_code": 200, "body": body, "error": None,
                 "lambda_duration": next(it), "shard_key": 0}
 
@@ -674,6 +687,27 @@ class TestWorkerRuntimeStats:
         for key in ("setup_s", "fanout_s", "finalize_s"):
             assert key in summary
             assert summary[key] >= 0.0
+
+
+class TestWorkerMemory:
+    """Issue #120: the lambda summary rolls up the straggler's peak RSS from the
+    per-cell ``body['max_memory_mb']`` the worker stamps."""
+
+    def test_max_memory_is_straggler_across_cells(self, monkeypatch, atl06_config):
+        summary = _run_lambda_with_durations(
+            monkeypatch,
+            atl06_config,
+            [1.0, 2.0, 3.0, 4.0],
+            memories=[800.0, 1963.0, 1200.0, 900.0],
+        )
+        assert summary["max_memory_mb"] == 1963.0  # max, mirroring the wall-time framing
+
+    def test_max_memory_none_when_unreported(self, monkeypatch, atl06_config):
+        # No worker stamped memory (e.g. an older deployed layer) -> null, not 0.
+        summary = _run_lambda_with_durations(
+            monkeypatch, atl06_config, [1.0, 2.0, 3.0, 4.0]
+        )
+        assert summary["max_memory_mb"] is None
 
 
 class TestGetFunctionTimeout:
