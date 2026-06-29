@@ -28,6 +28,21 @@ import bench_metrics  # noqa: E402
 
 MANIFEST = json.loads((BENCH / "targets.json").read_text())
 
+
+def resolve_aoi_temporal_cmr(sm_meta: dict) -> tuple[dict, dict, dict]:
+    """Resolve a shard map's ``aoi``/``temporal``/``cmr`` (issue #121).
+
+    A per-entry override wins; an absent key falls back to the top-level manifest
+    default. Existing single-AOI (NEON) shard maps carry no override, so they
+    resolve byte-identically to the top-level ``aoi``/``temporal``/``cmr``.
+    """
+    return (
+        sm_meta.get("aoi", MANIFEST["aoi"]),
+        sm_meta.get("temporal", MANIFEST["temporal"]),
+        sm_meta.get("cmr", MANIFEST["cmr"]),
+    )
+
+
 pytestmark = [
     pytest.mark.slow,
     pytest.mark.skipif(
@@ -61,7 +76,9 @@ def test_pinned_shardmap_no_drift(sm_key):
 
     cfg = load_config(str(_config_for_shardmap(sm_key)))
     grid = from_config(cfg)
-    cmr, temporal, aoi = MANIFEST["cmr"], MANIFEST["temporal"], MANIFEST["aoi"]
+    # Resolve this shard map's AOI/temporal/CMR: a per-entry override (issue #121)
+    # falls back to the top-level manifest default. NEON entries have no override.
+    aoi, temporal, cmr = resolve_aoi_temporal_cmr(sm_meta)
     # aoi.file is relative to the manifest dir, like the config/shardmap paths.
     parts = load_polygon(str(BENCH / aoi["file"]))
     bbox = polygon_to_bbox(parts)

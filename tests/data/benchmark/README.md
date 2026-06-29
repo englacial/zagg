@@ -32,6 +32,12 @@ aggregator).
   in `targets.json` under `temporal`. AOI = `AOP_NEON.geojson`.
 - **Cost model:** arm64, 2 GB, capped at the 720 s deploy timeout (see
   `zagg.dispatch`).
+- **AOI is per shard map (issue #121).** The top-level `aoi`/`temporal`/`cmr` in
+  `targets.json` are **defaults**; a shard-map entry may override any of them.
+  A shard map built over a non-NEON box carries its own `aoi` (and usually
+  `temporal`/`cmr`); entries that omit a key inherit the default, so existing
+  NEON shard maps resolve exactly as before. The drift test
+  (`test_benchmark_shardmap.py`) rebuilds each map over its *resolved* AOI.
 
 ## Add a target
 
