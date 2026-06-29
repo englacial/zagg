@@ -59,7 +59,7 @@ fi
 # here -- they are function-level deps installed by build_function.sh.
 echo "Installing processing deps..."
 $PIP install \
-    "pandas==2.2.3" fastparquet cramjam \
+    "pandas==2.2.3" "pyarrow==24.0.0" fastparquet cramjam \
     shapely pyproj odc-geo affine cachetools \
     -c "$CONSTRAINTS" \
     -t "$OUTPUT_DIR/python" \
@@ -76,15 +76,31 @@ if [[ "$NUMPY_VERSION" == *"2.3"* ]]; then
 fi
 
 # Remove bloat. pyproj is intentionally NOT stripped (rectilinear/odc-geo assign
-# needs it); pyarrow stays stripped (catalog fetch/build only, never the
-# processing path).
+# needs it); pyarrow IS kept now -- it is on the vector-write hot path and the
+# experimental arrow-kernel reducer (issue #130), but its unused C++ engines are
+# component-stripped below to stay under the combined size gate.
 echo "Removing bloat..."
-rm -rf "$OUTPUT_DIR/python"/pyarrow* \
-       "$OUTPUT_DIR/python"/xarray* \
+rm -rf "$OUTPUT_DIR/python"/xarray* \
        "$OUTPUT_DIR/python"/matplotlib* \
        "$OUTPUT_DIR/python"/lonboard* \
        "$OUTPUT_DIR/python"/boto3* \
        "$OUTPUT_DIR/python"/botocore* 2>/dev/null || true
+
+# pyarrow component strip (issue #130): drop the C++ engines zagg never calls --
+# Flight (RPC), Substrait, Gandiva (LLVM expr JIT), and Dataset -- plus their
+# cython modules. KEEP libarrow.so* (core), libarrow_python* (numpy<->arrow),
+# libparquet* (catalog), libarrow_acero*/_acero*.so + _compute*.so (the
+# arrow-kernel hash-aggregate reducer, kept per issue #130). The generic *.so
+# strip below then strips debug symbols from what remains.
+echo "Component-stripping pyarrow..."
+rm -f "$OUTPUT_DIR/python/pyarrow"/libarrow_flight* \
+      "$OUTPUT_DIR/python/pyarrow"/libarrow_substrait* \
+      "$OUTPUT_DIR/python/pyarrow"/libgandiva* \
+      "$OUTPUT_DIR/python/pyarrow"/libarrow_dataset* \
+      "$OUTPUT_DIR/python/pyarrow"/_flight*.so \
+      "$OUTPUT_DIR/python/pyarrow"/_substrait*.so \
+      "$OUTPUT_DIR/python/pyarrow"/_gandiva*.so \
+      "$OUTPUT_DIR/python/pyarrow"/_dataset*.so 2>/dev/null || true
 
 # Clean caches/tests and strip debug symbols.
 find "$OUTPUT_DIR/python" -type d -name "__pycache__" -exec rm -rf {} + 2>/dev/null || true
