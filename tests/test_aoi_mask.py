@@ -216,6 +216,35 @@ class TestRectilinearMask:
         # Non-degenerate: the AOI genuinely cuts this shard (independent of contains).
         assert mask.any() and not mask.all()
 
+    def test_aoi_ring_is_densified_before_reproject(self):
+        # issue #101: rectilinear_aoi_polygon densifies the WGS84 ring before
+        # to_crs (resolution="auto") so AOI edges follow the geodesic instead of
+        # collapsing to straight chords in a polar CRS. A 4-corner box reprojected
+        # WITHOUT densification keeps ~5 ring vertices; the densified path inserts
+        # many. In a curving CRS (EPSG:3413) the two polygons genuinely differ.
+        from odc.geo.geom import polygon as odc_polygon
+
+        from zagg.grids.aoi import rectilinear_aoi_polygon
+
+        grid = self._grid()
+        parts = _box(60.0, -40.0, 75.0, -20.0)
+        densified = rectilinear_aoi_polygon(parts, grid.crs)
+
+        # Same parts, reprojected as straight chords (no densification) -- the old
+        # behavior, built here directly as the baseline.
+        lats, lons = parts[0]
+        ring = [(float(x), float(y)) for x, y in zip(lons, lats)]
+        chord = odc_polygon(ring, crs="EPSG:4326").to_crs(grid.crs).geom
+
+        n_dense = len(densified.exterior.coords)
+        n_chord = len(chord.exterior.coords)
+        assert n_dense > n_chord  # densification inserted edge vertices
+        assert n_chord <= 5  # the raw box is just its corners
+        # The geodesic-following polygon is not the chord polygon: in a polar CRS
+        # the curved edges enclose a measurably different area.
+        assert not densified.equals(chord)
+        assert abs(densified.area - chord.area) / chord.area > 1e-4
+
     def test_fully_inside_aoi_all_true(self):
         # An AOI polygon directly in grid CRS covering the whole grid -> all True.
         grid = self._grid()

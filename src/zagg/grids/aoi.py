@@ -140,6 +140,14 @@ def rectilinear_aoi_polygon(polygon_parts, crs):
     Reuses the WGS84 -> grid-CRS reprojection ``RectilinearGrid.coverage`` does
     (via odc.geo), returning a prepared-friendly shapely geometry in grid CRS for
     the per-cell ``contains`` test.
+
+    The ring is **densified** before reprojection (odc.geo ``to_crs(resolution=
+    "auto")``, the same primitive ``RectilinearGrid.shard_footprint`` uses), so the
+    AOI edges follow the geodesic instead of collapsing to straight chords in a
+    polar / large-extent CRS. Since the mask is the *strict* deliverable, this
+    keeps edge-cell membership from drifting by the chord-vs-arc deviation. This is
+    a rect-only concern: the HEALPix path tessellates the native ``(lats, lons)``
+    ring on the sphere (``morton_coverage_moc``) and never reprojects a polygon.
     """
     from odc.geo.geom import multipolygon, polygon
 
@@ -150,7 +158,7 @@ def rectilinear_aoi_polygon(polygon_parts, crs):
         geom = polygon(rings[0], crs="EPSG:4326")
     else:
         geom = multipolygon([[r] for r in rings], crs="EPSG:4326")
-    return geom.to_crs(crs).geom
+    return geom.to_crs(crs, resolution="auto").geom
 
 
 def rectilinear_mask_for_centers(aoi_geom, xs, ys) -> np.ndarray:
