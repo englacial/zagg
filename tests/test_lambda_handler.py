@@ -103,6 +103,7 @@ class TestProcessEventDispatch:
 
         def fake_process_shard(grid, shard_key, granule_urls, **kwargs):
             captured["shard_key"] = shard_key
+            captured["handoff"] = kwargs.get("handoff")
             meta = {
                 "shard_key": shard_key,
                 "cells_with_data": 0,
@@ -125,6 +126,25 @@ class TestProcessEventDispatch:
         resp, captured = self._run(handler_mod, monkeypatch, event)
         assert resp["statusCode"] == 200
         assert captured["shard_key"] == 12345
+
+    def test_handoff_event_key_forwarded_to_worker(self, handler_mod, monkeypatch):
+        # issue #130: an explicit handoff event key reaches process_shard so the
+        # deployed worker selects the arrow/arrow-kernel carrier/reducer.
+        event = _base_event(_healpix_config_dict())
+        event["child_order"] = 12
+        event["handoff"] = "arrow-kernel"
+        resp, captured = self._run(handler_mod, monkeypatch, event)
+        assert resp["statusCode"] == 200
+        assert captured["handoff"] == "arrow-kernel"
+
+    def test_default_handoff_is_pandas(self, handler_mod, monkeypatch):
+        # No handoff key -> the worker runs the byte-identical default ("pandas").
+        event = _base_event(_healpix_config_dict())
+        event["child_order"] = 12
+        assert "handoff" not in event
+        resp, captured = self._run(handler_mod, monkeypatch, event)
+        assert resp["statusCode"] == 200
+        assert captured["handoff"] == "pandas"
 
     def test_rectilinear_dispatch_without_child_order(self, handler_mod, monkeypatch):
         event = _base_event(_rectilinear_config_dict())

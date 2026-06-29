@@ -327,7 +327,7 @@ class TestInvokeLambdaCellEvent:
 
     _CREDS = {"accessKeyId": "a", "secretAccessKey": "s", "sessionToken": "t"}
 
-    def _captured_event(self, *, child_order, profile=False):
+    def _captured_event(self, *, child_order, profile=False, handoff="pandas"):
         from unittest.mock import MagicMock
 
         from zagg.runner import _invoke_lambda_cell
@@ -342,7 +342,7 @@ class TestInvokeLambdaCellEvent:
             client, (0,), 12345, 6, child_order,
             ["s3://b/g.h5"], "s3://out/x.zarr", self._CREDS,
             function_name="process-shard", config_dict=None, max_workers=4,
-            profile=profile,
+            handoff=handoff, profile=profile,
         )
         return json.loads(client.invoke.call_args.kwargs["Payload"])
 
@@ -370,6 +370,19 @@ class TestInvokeLambdaCellEvent:
         # no "profile" key is added.
         event = self._captured_event(child_order=12, profile=False)
         assert "profile" not in event
+
+    def test_handoff_adds_event_key(self):
+        # issue #130: a non-default handoff forwards "handoff" into the event so
+        # the deployed worker selects the arrow/arrow-kernel carrier/reducer.
+        for h in ("arrow", "arrow-kernel"):
+            event = self._captured_event(child_order=12, handoff=h)
+            assert event["handoff"] == h
+
+    def test_default_handoff_event_has_no_handoff_key(self):
+        # Default (pandas): event payload is byte-identical to the pre-handoff
+        # path; no "handoff" key is added (#130).
+        event = self._captured_event(child_order=12, handoff="pandas")
+        assert "handoff" not in event
 
 
 class TestInvokeLambdaCellRetry:
@@ -971,6 +984,34 @@ class TestProfilePlumbing:
         )
         runner.agg(atl06_config, catalog="ignored", store="s3://out/x.zarr", backend="lambda")
         assert captured["profile"] is False
+
+    def test_agg_threads_handoff_into_run_lambda(self, monkeypatch, atl06_config):
+        # issue #130: agg(handoff=...) reaches the lambda backend (it was local-only).
+        from zagg import runner
+
+        captured = {}
+        monkeypatch.setattr(runner, "_load_catalog", lambda p: _run_catalog())
+        monkeypatch.setattr(
+            runner, "_run_lambda",
+            lambda *a, **k: captured.update(handoff=k.get("handoff")) or {},
+        )
+        runner.agg(
+            atl06_config, catalog="ignored", store="s3://out/x.zarr",
+            backend="lambda", handoff="arrow-kernel",
+        )
+        assert captured["handoff"] == "arrow-kernel"
+
+    def test_agg_default_handoff_is_pandas_on_lambda(self, monkeypatch, atl06_config):
+        from zagg import runner
+
+        captured = {}
+        monkeypatch.setattr(runner, "_load_catalog", lambda p: _run_catalog())
+        monkeypatch.setattr(
+            runner, "_run_lambda",
+            lambda *a, **k: captured.update(handoff=k.get("handoff")) or {},
+        )
+        runner.agg(atl06_config, catalog="ignored", store="s3://out/x.zarr", backend="lambda")
+        assert captured["handoff"] == "pandas"
 
 
 class TestWorkerPhaseTimings:
