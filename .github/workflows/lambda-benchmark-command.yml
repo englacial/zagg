@@ -86,7 +86,8 @@ jobs:
 
   run:
     needs: check
-    if: needs.check.outputs.should_run == 'true'
+    # Skip cleanly until the benchmark is configured (no role -> nothing to assume).
+    if: needs.check.outputs.should_run == 'true' && vars.BENCHMARK_ROLE_ARN != ''
     runs-on: ubuntu-latest
     permissions:
       contents: read

@@ -157,6 +157,7 @@ jobs:
     # a deploy *failure* skips the benchmark (don't measure a broken deploy).
     if: >-
       !cancelled() &&
+      vars.BENCHMARK_ROLE_ARN != '' &&
       needs.detect.result == 'success' &&
       (needs.deploy-test.result == 'success' || needs.deploy-test.result == 'skipped') &&
       github.event_name == 'pull_request' &&
@@ -204,6 +205,7 @@ jobs:
     needs: [detect, deploy-test]
     if: >-
       !cancelled() &&
+      vars.BENCHMARK_ROLE_ARN != '' &&
       needs.detect.result == 'success' &&
       (needs.deploy-test.result == 'success' || needs.deploy-test.result == 'skipped') &&
       (github.event_name == 'push' || github.event_name == 'workflow_dispatch')
