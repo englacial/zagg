@@ -439,14 +439,75 @@ class TestTemplateExistenceGuard:
         assert resp["statusCode"] == 500
         assert "Zarr template not found" in json.loads(resp["body"])["error"]
 
-    def test_present_template_proceeds_without_runtimewarning(self, handler_mod, monkeypatch):
-        # Present template -> guard passes (200), and no ``coroutine ... was never
-        # awaited`` warning leaks (the foot-gun the fix removes).
+    def test_present_template_proceeds(self, handler_mod, monkeypatch):
+        # Present template (open_group succeeds) -> guard passes through to 200.
+        # The meaningful no-RuntimeWarning check rides on the real-store test
+        # below; here open_group is mocked, so a coroutine is never created.
         self._patch(handler_mod, monkeypatch, raises_missing=False)
+        resp = handler_mod._handle_process(self._event(), _context())
+        assert resp["statusCode"] == 200
+
+    def _patch_real_store(self, handler_mod, monkeypatch, store):
+        """Wire the handler to a real zarr ``store`` so the existence check runs the
+        actual ``open_group`` (not a mock) — the un-awaited-coroutine regression
+        would reappear here if the fix were reverted."""
+        import zagg.grids as grids
+        import zagg.processing as processing
+
+        def fake_process_shard(grid, shard_key, granule_urls, **kwargs):
+            kwargs["chunk_results"].append(((0,), pd.DataFrame(), {}))
+            meta = {
+                "shard_key": shard_key,
+                "cells_with_data": 1,
+                "total_obs": 1,
+                "duration_s": 0.0,
+                "error": None,
+            }
+            return pd.DataFrame(), meta
+
+        grid_stub = MagicMock()
+        grid_stub.group_path = "8"
+        grid_stub.chunk_grid_shape = (4,)
+        grid_stub.sharded = False
+
+        monkeypatch.setattr(processing, "process_shard", fake_process_shard)
+        monkeypatch.setattr(grids, "from_config", lambda *a, **k: grid_stub)
+        monkeypatch.setattr(handler_mod, "open_store", lambda *a, **k: store)
+        monkeypatch.setattr(handler_mod, "write_dataframe_to_zarr", lambda *a, **k: None)
+        monkeypatch.setattr(handler_mod, "write_ragged_to_zarr", lambda *a, **k: None)
+
+    def test_real_store_missing_group_returns_500(self, handler_mod, monkeypatch):
+        # End-to-end through the real ``open_group`` on an empty store: the missing
+        # group raises GroupNotFoundError, so the guard returns the 500.
+        store = MemoryStore()
+        self._patch_real_store(handler_mod, monkeypatch, store)
+        resp = handler_mod._handle_process(self._event(), _context())
+        assert resp["statusCode"] == 500
+        assert "Zarr template not found" in json.loads(resp["body"])["error"]
+
+    def test_real_store_present_group_proceeds(self, handler_mod, monkeypatch):
+        # The group exists -> the real ``open_group`` succeeds, the guard passes
+        # (200), and no un-awaited-coroutine RuntimeWarning leaks.
+        store = MemoryStore()
+        open_group(store, path="8", mode="w", zarr_format=3)
+        self._patch_real_store(handler_mod, monkeypatch, store)
         with warnings.catch_warnings():
             warnings.simplefilter("error", RuntimeWarning)
             resp = handler_mod._handle_process(self._event(), _context())
         assert resp["statusCode"] == 200
+
+    def test_present_but_not_a_group_is_not_masked_as_missing(self, handler_mod, monkeypatch):
+        # A node present at the template path but of the wrong kind (an array) must
+        # NOT be swallowed as "template not found" — open_group raises a non-
+        # GroupNotFoundError that escapes the guard and surfaces as a real error,
+        # so the response is not the clean template-missing 500.
+        from zarr import create_array
+
+        store = MemoryStore()
+        create_array(store, name="8", shape=(1,), chunks=(1,), dtype="int64", zarr_format=3)
+        self._patch_real_store(handler_mod, monkeypatch, store)
+        resp = handler_mod._handle_process(self._event(), _context())
+        assert "Zarr template not found" not in resp["body"]
 
 
 class TestSetupTemplate:
