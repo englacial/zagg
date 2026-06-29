@@ -162,7 +162,6 @@ def make_figure(df: pd.DataFrame, cost_col: str, cost_label: str, out_png: Path)
             marker="o",
             markerfacecolor="none",
             color="C1",
-            zorder=1,
             label="runtime (s)",
         )
         rt.set_ylabel("runtime (s)", color="C1")
