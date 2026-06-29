@@ -4,12 +4,13 @@ The actual implementation lives on ``zagg.grids.HealpixGrid``. These functions
 preserve the pre-refactor public API: pass ``n_parent_cells`` for dense pack,
 omit it for full sphere.
 """
+
 from __future__ import annotations
 
 import warnings
 
 from pydantic_zarr.experimental.v3 import GroupSpec
-from typing_extensions import TypedDict
+from typing_extensions import NotRequired, TypedDict
 from zarr.abc.store import Store
 
 from zagg.config import PipelineConfig
@@ -24,6 +25,13 @@ class ProcessingMetadata(TypedDict):
     files_processed: int
     duration_s: float
     error: str | None
+    # Peak resident memory (RSS) of the worker process in MB. Stamped by the
+    # Lambda handler from ``resource.getrusage`` after the write phase (issue
+    # #120); absent on the local runner path, hence ``NotRequired``.
+    max_memory_mb: NotRequired[float]
+    # Per-phase wall timings (read/index/aggregate/write), present only when the
+    # worker is dispatched with ``profile=True`` (issue #100).
+    phase_timings: NotRequired[dict[str, float]]
 
 
 def xdggs_spec(

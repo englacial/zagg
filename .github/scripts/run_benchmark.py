@@ -189,7 +189,8 @@ def main(argv: list[str] | None = None) -> int:
         print(
             f"[{name}] obs={record['total_obs']} runtime_s={record['runtime_s']} "
             f"cost/shard=${record['cost_per_shard_usd']} "
-            f"cost/100km2=${record['cost_per_100km2_usd']}"
+            f"cost/100km2=${record['cost_per_100km2_usd']} "
+            f"max_memory_mb={record['max_memory_mb']}"
         )
 
     Path(args.out_json).write_text(json.dumps(records, indent=2))

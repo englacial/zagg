@@ -819,6 +819,17 @@ def _run_lambda(
     else:
         worker_max_s = worker_median_s = worker_pstdev_s = worker_pct_timeout = None
 
+    # Peak worker memory (issue #120). The Lambda handler stamps body[
+    # "max_memory_mb"] (RSS high-water mark, KB->MB) on every successful
+    # invocation; roll the straggler (max) across cells, matching the wall-time
+    # framing. None when no worker reported it (e.g. local backend).
+    worker_memory = [
+        r["body"]["max_memory_mb"]
+        for r in report.results
+        if (r.get("body") or {}).get("max_memory_mb") is not None
+    ]
+    max_memory_mb = max(worker_memory) if worker_memory else None
+
     # Per-phase worker breakdown (issue #100 phase 2), only when --profile fed
     # the workers a "profile" event so they emitted body["phase_timings"]. Roll
     # the straggler (max) per phase across cells, matching the wall-time framing.
@@ -848,6 +859,7 @@ def _run_lambda(
         "worker_median_s": worker_median_s,
         "worker_pstdev_s": worker_pstdev_s,
         "worker_pct_timeout": worker_pct_timeout,
+        "max_memory_mb": max_memory_mb,
         "store_path": store_path,
         "backend": "lambda",
         "function_name": function_name,
@@ -866,6 +878,12 @@ def _run_lambda(
         logger.info(
             f"Workers: max {worker_max_s:.0f}s ({pct} of {function_timeout_s:.0f}s timeout), "
             f"median {worker_median_s:.0f}s, pstdev {worker_pstdev_s:.0f}s"
+        )
+    if max_memory_mb is not None:
+        cap_mb = memory_gb * 1024.0
+        logger.info(
+            f"Worker peak memory: {max_memory_mb:.0f} MB ({max_memory_mb / cap_mb:.0%} of "
+            f"{cap_mb:.0f} MB cap)"
         )
     if profile and worker_phase_max:
         breakdown = ", ".join(f"{phase} {secs:.0f}s" for phase, secs in worker_phase_max.items())
