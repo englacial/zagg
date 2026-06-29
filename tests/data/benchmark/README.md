@@ -59,9 +59,12 @@ to today's eight targets:
   same-size rows break ties on the aggregator name.
 - **Zeros are failed runs, not data.** A zero cost/runtime means the shard run
   failed, so it is **not** plotted as a real datapoint: the connecting line
-  **breaks** at that merge (it never dips to 0), and the failure is shown as a
-  non-line-connected **`x`** marker (distinct from the normal cost circle / runtime
-  open-circle) to keep the x-axis/commit alignment.
+  **breaks** at that merge (it never dips to 0) on **both** the cost and runtime
+  series. The failure is shown as a single non-line-connected **`x`** marker on the
+  cost axis (distinct from the normal cost circle / runtime open-circle), pinned
+  near the axis floor so it keeps the x-axis/commit alignment without dragging the
+  cost axis back down to 0. A failed shard zeros both series at the same merge, so
+  the one cost `x` flags the failure for both.
 
 When adding or rearranging targets, keep these conventions — the layout is derived
 from `grid_type` / `aggregator` / `shard_area_km2`, so getting that metadata right

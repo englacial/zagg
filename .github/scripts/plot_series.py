@@ -92,18 +92,24 @@ def _panel_layout(hist: pd.DataFrame) -> tuple[list[list[str | None]], int, int]
                 "target": r["target"],
                 "col": col,
                 "grid": grid,
+                "size": str(r.get("grid_size", "")),
                 "agg": str(r.get("aggregator", "")),
                 "area": float(r.get("shard_area_km2") or 0.0),
             }
         )
     # Shard-size rank within each grid family (0 = largest), so the two families
-    # align row-for-row even though their absolute areas differ.
+    # align row-for-row even though their absolute areas differ. Rank on
+    # ``(area, grid_size)`` so two resolutions that happen to share an exact area
+    # still get distinct rows instead of colliding into one cell.
     for col in (0, 1):
-        areas = sorted({d["area"] for d in rows if d["col"] == col}, reverse=True)
-        rank = {a: i for i, a in enumerate(areas)}
+        keys = sorted(
+            {(d["area"], d["size"]) for d in rows if d["col"] == col},
+            key=lambda k: (-k[0], k[1]),
+        )
+        rank = {k: i for i, k in enumerate(keys)}
         for d in rows:
             if d["col"] == col:
-                d["rank"] = rank[d["area"]]
+                d["rank"] = rank[(d["area"], d["size"])]
     # One row per (size-rank, aggregator); largest shard at the top.
     row_keys = sorted({(d["rank"], d["agg"]) for d in rows})
     row_of = {k: i for i, k in enumerate(row_keys)}
@@ -172,8 +178,9 @@ def make_figure(df: pd.DataFrame, cost_col: str, cost_label: str, out_png: Path)
             # Drop failed runs: a zero cost/runtime is a crashed shard, not a
             # measurement. ``line`` breaks the connecting segment at those x
             # (NaN), so the line never dips to 0; ``fail`` marks them with a
-            # non-connected 'X' so the x-axis/commit alignment is kept and the
-            # failure reads as a failure, not a real 0.
+            # non-connected 'x' (drawn in axes-fraction y near the bottom, so it
+            # doesn't drag the cost axis floor back down to 0) so the x-axis/commit
+            # alignment is kept and the failure reads as a failure, not a real 0.
             cost = sub[cost_col].to_numpy(dtype=float)
             line = [v if v != 0 else float("nan") for v in cost]
             fail = [x for x, v in zip(xs, cost) if v == 0]
@@ -198,12 +205,22 @@ def make_figure(df: pd.DataFrame, cost_col: str, cost_label: str, out_png: Path)
                 zorder=2,
                 plotnonfinite=True,
             )
-            if fail:  # failed-run markers, not joined to the line
-                ax.scatter(fail, [0] * len(fail), marker="x", color="0.5", s=60, zorder=3)
+            if fail:  # failed-run markers, pinned near the axis floor, not joined
+                ax.scatter(
+                    fail,
+                    [0.02] * len(fail),
+                    transform=ax.get_xaxis_transform(),
+                    marker="x",
+                    color="0.5",
+                    s=60,
+                    zorder=3,
+                )
             ax.set_ylabel(cost_label, color="C0")
             ax.tick_params(axis="y", labelcolor="C0")
             ax.set_title(target, fontsize=10)
             ax.set_xticks(xs)
+            if xs:  # pin the x-range to every merge so a failed last/first run
+                ax.set_xlim(xs[0] - 0.5, xs[-1] + 0.5)  # (drawn in axes-y) stays visible
 
             # Label every panel with its own commits; the upper rows have the
             # labels hidden afterwards, so only the bottom row shows them.
