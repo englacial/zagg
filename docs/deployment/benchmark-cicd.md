@@ -368,13 +368,15 @@ the section-2 stack (`benchmark_cicd.yaml`). Their grants, for reference:
 - **`zagg-benchmark-deploy`** (test tier) — update the test function + stage the
   layer:
   - `lambda:UpdateFunctionCode`, `lambda:UpdateFunctionConfiguration`,
-    `lambda:PublishLayerVersion`, `lambda:GetFunction`,
+    `lambda:PublishLayerVersion`, `lambda:GetLayerVersion`, `lambda:GetFunction`,
     `lambda:GetFunctionConfiguration` on `process-shard-test` (+ its `-deps`
     layer). `GetFunctionConfiguration` is required: `deploy_lambda.sh` calls
     `aws lambda wait function-updated`, whose waiter polls it.
-  - `s3:PutObject` on `s3://sliderule-public/lambda-test/*` (the staged layer).
+    `GetLayerVersion` is required: `update-function-configuration --layers`
+    validates the versioned layer ARN.
+  - `s3:PutObject`/`s3:GetObject` on `s3://sliderule-public/lambda-test/*` (the staged layer).
 - **`zagg-lambda-release`** (release tier) — update **production** + publish:
-  - the same five `lambda:*` actions (incl. `lambda:GetFunctionConfiguration`)
+  - the same six `lambda:*` actions (incl. `lambda:GetLayerVersion`)
     on `process-shard` (+ `process-shard-deps`).
   - `s3:PutObject`/`s3:GetObject` on `s3://sliderule-public-cors/*` (distribute).
 

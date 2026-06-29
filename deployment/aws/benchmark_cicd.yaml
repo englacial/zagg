@@ -181,8 +181,12 @@ Resources:
                 Resource: !Sub "arn:aws:lambda:${AWS::Region}:${AWS::AccountId}:function:${TestFunctionName}"
               - Sid: PublishTestLayer
                 Effect: Allow
-                Action: lambda:PublishLayerVersion
-                Resource: !Sub "arn:aws:lambda:${AWS::Region}:${AWS::AccountId}:layer:${TestFunctionName}-deps"
+                # GetLayerVersion: update-function-configuration --layers validates
+                # the layer version (acts on the versioned ARN, hence the :* resource).
+                Action: [lambda:PublishLayerVersion, lambda:GetLayerVersion]
+                Resource:
+                  - !Sub "arn:aws:lambda:${AWS::Region}:${AWS::AccountId}:layer:${TestFunctionName}-deps"
+                  - !Sub "arn:aws:lambda:${AWS::Region}:${AWS::AccountId}:layer:${TestFunctionName}-deps:*"
               - Sid: StageTestLayer
                 Effect: Allow
                 Action: [s3:PutObject, s3:GetObject]
@@ -220,8 +224,12 @@ Resources:
                 Resource: !Sub "arn:aws:lambda:${AWS::Region}:${AWS::AccountId}:function:${BenchmarkFunctionName}"
               - Sid: PublishProdLayer
                 Effect: Allow
-                Action: lambda:PublishLayerVersion
-                Resource: !Sub "arn:aws:lambda:${AWS::Region}:${AWS::AccountId}:layer:${BenchmarkFunctionName}-deps"
+                # GetLayerVersion: update-function-configuration --layers validates
+                # the layer version (acts on the versioned ARN, hence the :* resource).
+                Action: [lambda:PublishLayerVersion, lambda:GetLayerVersion]
+                Resource:
+                  - !Sub "arn:aws:lambda:${AWS::Region}:${AWS::AccountId}:layer:${BenchmarkFunctionName}-deps"
+                  - !Sub "arn:aws:lambda:${AWS::Region}:${AWS::AccountId}:layer:${BenchmarkFunctionName}-deps:*"
               - Sid: DistributeZips
                 Effect: Allow
                 Action: [s3:PutObject, s3:GetObject]
