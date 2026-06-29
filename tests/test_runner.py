@@ -404,13 +404,30 @@ class TestInvokeLambdaCellRetry:
         client.invoke.return_value = self._function_error_response(
             '{"errorType": "Runtime.OutOfMemory"}'
         )
-        result = self._invoke(client)
+        # max_retries=5 proves the deterministic return is invariant to the
+        # budget -- a FunctionError no longer consumes attempts at all (#119).
+        result = self._invoke(client, max_retries=5)
         # A deterministic FunctionError is invoked exactly once, regardless of
         # max_retries, and the recorded error reflects the OOM (not masked).
         assert client.invoke.call_count == 1
         assert result["retries"] == 0
         assert result["error"].startswith("Lambda OOM:")
         assert result["status_code"] is None
+
+    def test_timeout_function_error_not_retried(self):
+        from unittest.mock import MagicMock
+
+        client = MagicMock()
+        client.invoke.return_value = self._function_error_response(
+            "Task timed out after 720.00 seconds"
+        )
+        # Timeouts already returned immediately pre-#119; pin that the shared
+        # simplified branch keeps that behavior (single invoke, timeout=True).
+        result = self._invoke(client, max_retries=5)
+        assert client.invoke.call_count == 1
+        assert result["retries"] == 0
+        assert result["timeout"] is True
+        assert result["error"].startswith("Lambda timeout:")
 
     def test_generic_function_error_not_retried(self):
         from unittest.mock import MagicMock
