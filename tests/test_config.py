@@ -1821,4 +1821,5 @@ class TestMerra2StormTemplate:
         assert specs["anom_tqv_full"]["is_anomaly"] is True
         for spec in specs.values():
             assert spec["spatial_func"] in registry.list_spatial_funcs()
+            assert spec["temporal_reducer"] in registry.list_reducers()
             assert spec["mask"] in registry.list_mask_providers()
