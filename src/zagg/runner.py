@@ -1092,6 +1092,9 @@ def _invoke_lambda_cell(
                     is_timeout = True
                     last_error = f"Lambda timeout: {error_payload[:100]}"
                 elif "Runtime.OutOfMemory" in error_payload:
+                    # ``Runtime.OutOfMemory`` is AWS's documented errorType for an
+                    # OOM-killed invocation; if AWS reworded it the tag would just
+                    # fall to the generic branch below (still no retry).
                     last_error = f"Lambda OOM: {error_payload[:100]}"
                 else:
                     last_error = f"Lambda error ({function_error}): {error_payload[:100]}"
