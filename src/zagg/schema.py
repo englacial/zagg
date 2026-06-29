@@ -16,7 +16,7 @@ from zagg.config import PipelineConfig
 from zagg.grids.healpix import HEALPIX_BASE_CELLS, HealpixGrid
 
 
-class ProcessingMetadata(TypedDict):
+class ProcessingMetadata(TypedDict, total=False):
     shard_key: int
     cells_with_data: int
     total_obs: int
@@ -24,6 +24,13 @@ class ProcessingMetadata(TypedDict):
     files_processed: int
     duration_s: float
     error: str | None
+    # Peak resident memory (RSS) of the worker process in MB. Stamped by the
+    # Lambda handler from ``resource.getrusage`` after the write phase (issue
+    # #120); absent on the local runner path, hence ``total=False``.
+    max_memory_mb: float
+    # Per-phase wall timings (read/index/aggregate/write), present only when the
+    # worker is dispatched with ``profile=True`` (issue #100).
+    phase_timings: dict[str, float]
 
 
 def xdggs_spec(
