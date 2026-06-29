@@ -701,6 +701,39 @@ def test_panel_layout_rect_left_healpix_right_largest_on_top():
     ]
 
 
+def test_panel_layout_all_rect_single_column():
+    import plot_series
+
+    # No HEALPix targets -> a single (left) column, still largest-shard-first.
+    specs = [
+        ("gain_bias_rect_6km", "gain_bias", "rectilinear", 36.0),
+        ("gain_bias_rect_3km", "gain_bias", "rectilinear", 9.0),
+    ]
+    rows = [_rec_row("c0", t, agg=a, grid=g, area=ar) for t, a, g, ar in specs]
+    grid, nrows, ncols = plot_series._panel_layout(update_series.records_to_frame(rows))
+    assert (nrows, ncols) == (2, 1)
+    assert grid == [["gain_bias_rect_6km"], ["gain_bias_rect_3km"]]
+
+
+def test_panel_layout_same_area_distinct_resolutions_dont_collide():
+    import plot_series
+
+    # Two same-aggregator rect targets with identical area but different grid_size
+    # must land in distinct rows (rank tie-broken on grid_size), not overwrite.
+    specs = [
+        ("gain_bias_rect_a", "gain_bias", "rectilinear", 9.0),
+        ("gain_bias_rect_b", "gain_bias", "rectilinear", 9.0),
+    ]
+    rows = [_rec_row("c0", t, agg=a, grid=g, area=ar) for t, a, g, ar in specs]
+    # Give them distinct grid_size so the tie-break separates them.
+    frame = update_series.records_to_frame(rows)
+    frame.loc[frame["target"] == "gain_bias_rect_a", "grid_size"] = "3km"
+    frame.loc[frame["target"] == "gain_bias_rect_b", "grid_size"] = "4km"
+    grid, nrows, ncols = plot_series._panel_layout(frame)
+    assert (nrows, ncols) == (2, 1)
+    assert {grid[0][0], grid[1][0]} == {"gain_bias_rect_a", "gain_bias_rect_b"}
+
+
 def test_make_figure_drops_failed_run_zeros(tmp_path, monkeypatch):
     # A zero cost/runtime is a failed run: it must NOT be a connected datapoint.
     # The cost line breaks at the zero (NaN, no dip to 0) and the failure shows as
@@ -737,8 +770,10 @@ def test_make_figure_drops_failed_run_zeros(tmp_path, monkeypatch):
     ys = cost_line.get_ydata()
     assert np.isnan(ys[1]) and not np.isnan(ys[0]) and not np.isnan(ys[2])
     assert 0.0 not in [y for y in ys if not np.isnan(y)]
-    # A distinct, non-line 'x' marker flags the failed run.
+    # A distinct, non-line 'x' marker flags the failed run, anchored at the failed
+    # x (index 1) -- not joined to the cost line.
     fails = [
         c for c in panel.collections if isinstance(c, PathCollection) and len(c.get_offsets()) == 1
     ]
     assert fails, "expected an 'x' failure marker at the zero point"
+    assert fails[0].get_offsets()[0][0] == 1  # the failed merge's x position
