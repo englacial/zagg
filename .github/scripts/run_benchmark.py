@@ -102,6 +102,9 @@ def run_target(
             function_name=function_name,
             overwrite=True,
             profile=True,
+            # A benchmark measures one clean invocation and records a failure as
+            # a failure -- never re-invoke (and never pay) to re-fail (#119).
+            max_retries=1,
         )
 
     return bench_metrics.build_record(
