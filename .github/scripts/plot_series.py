@@ -90,11 +90,6 @@ def make_figure(df: pd.DataFrame, cost_col: str, cost_label: str, out_png: Path)
     # every panel and across both figures -- 1.0 (red) is the OOM wall.
     norm = Normalize(vmin=0.0, vmax=1.0)
 
-    # x positions/labels share across panels (same merge points per target).
-    nx = max(len(hist[hist["target"] == t]) for t in targets)
-    x = list(range(nx))
-    labels = [str(c)[:7] for c in hist.drop_duplicates("commit").sort_values("timestamp")["commit"]]
-
     for i, target in enumerate(targets):
         ax = axes[i // ncols][i % ncols]
         sub = hist[hist["target"] == target]
@@ -120,7 +115,7 @@ def make_figure(df: pd.DataFrame, cost_col: str, cost_label: str, out_png: Path)
         ax.set_ylabel(cost_label, color="C0")
         ax.tick_params(axis="y", labelcolor="C0")
         ax.set_title(target, fontsize=10)
-        ax.set_xticks(x)
+        ax.set_xticks(xs)
 
         # Runtime on the right axis: hollow circles (not filled squares) so the
         # memory-coloured cost marker underneath stays visible (issue #125).
@@ -137,12 +132,16 @@ def make_figure(df: pd.DataFrame, cost_col: str, cost_label: str, out_png: Path)
         rt.set_ylabel("runtime (s)", color="C1")
         rt.tick_params(axis="y", labelcolor="C1")
 
-    # Only label the bottom-most populated panel in each column (shared x-axis).
+    # Only label the bottom-most populated panel in each column (shared x-axis);
+    # labels come from that panel's own target so ticks/labels stay length-matched.
     for col in range(ncols):
         last = max((i for i in range(n) if i % ncols == col), default=None)
         if last is None:
             continue
         bottom = axes[last // ncols][last % ncols]
+        sub = hist[hist["target"] == targets[last]]
+        labels = [str(c)[:7] for c in sub["commit"]]
+        bottom.set_xticks(list(range(len(sub))))
         bottom.set_xticklabels(labels, rotation=45, ha="right", fontsize=7)
 
     # Blank any unused panels in the grid.
