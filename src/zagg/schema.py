@@ -32,6 +32,11 @@ class ProcessingMetadata(TypedDict):
     # Per-phase wall timings (read/index/aggregate/write), present only when the
     # worker is dispatched with ``profile=True`` (issue #100).
     phase_timings: NotRequired[dict[str, float]]
+    # Count of per-group reads that raised during the read loop (issue #116).
+    # Present (and non-zero) only when at least one group read failed; a raised
+    # read is always a real error, so this surfaces a shard whose "no data"
+    # result is actually a read failure rather than a legitimately-empty read.
+    read_errors: NotRequired[int]
 
 
 def xdggs_spec(
