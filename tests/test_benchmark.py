@@ -301,7 +301,17 @@ def test_antarctic_88s_aoi_fixture_loads_near_turning_latitude():
 # --- update_series (parquet store) ----------------------------------------
 
 
-def _rec_row(commit, target, event="merge", cost=0.005, rt=200.0, mem=1200.0):
+def _rec_row(
+    commit,
+    target,
+    event="merge",
+    cost=0.005,
+    rt=200.0,
+    mem=1200.0,
+    agg="gain_bias",
+    grid="healpix",
+    area=10.13,
+):
     return {
         "timestamp": f"2026-01-01T00:00:0{len(commit) % 10}Z",
         "commit": commit,
@@ -309,8 +319,8 @@ def _rec_row(commit, target, event="merge", cost=0.005, rt=200.0, mem=1200.0):
         "event": event,
         "pr_number": None,
         "target": target,
-        "aggregator": "gain_bias",
-        "grid_type": "healpix",
+        "aggregator": agg,
+        "grid_type": grid,
         "grid_size": "o11",
         "shard_key": 1,
         "n_granules": 44,
@@ -318,8 +328,8 @@ def _rec_row(commit, target, event="merge", cost=0.005, rt=200.0, mem=1200.0):
         "runtime_s": rt,
         "gb_seconds": 400.0,
         "cost_per_shard_usd": cost,
-        "shard_area_km2": 10.13,
-        "cost_per_100km2_usd": cost * 100 / 10.13,
+        "shard_area_km2": area,
+        "cost_per_100km2_usd": cost * 100 / area if area else 0.0,
         "function_timeout_s": 720,
         "worker_pct_timeout": 0.28,
         "memory_gb": 2.0,
@@ -515,8 +525,13 @@ def test_make_figure_circle_runtime_and_bottom_row_labels(tmp_path, monkeypatch)
     captured = {}
     monkeypatch.setattr(plt, "close", lambda fig: captured.setdefault("fig", fig))
 
-    # 4 targets -> a 2x2 grid; two merge points each.
-    rows = [_rec_row(f"c{i}", t) for i in range(2) for t in ("t1", "t2", "t3", "t4")]
+    # Two aggregators x two grid families -> a 2x2 grid; two merge points each.
+    rows = [
+        _rec_row(f"c{i}", f"{agg}_{grid}", agg=agg, grid=grid)
+        for i in range(2)
+        for agg in ("gain_bias", "tdigest")
+        for grid in ("rectilinear", "healpix")
+    ]
     series = tmp_path / "series.parquet"
     update_series.save_series(update_series.records_to_frame(rows), series)
     out = tmp_path / "fig.png"
@@ -555,14 +570,18 @@ def test_make_figure_uneven_commit_sets_label_per_panel(tmp_path, monkeypatch):
     monkeypatch.setattr(plt, "close", lambda fig: captured.setdefault("fig", fig))
 
     # ``_rec_row`` derives the timestamp from the commit-name length, so name
-    # lengths set the merge order. The four targets carry deliberately uneven
-    # commit sets; sorted alphabetically they fill the grid as
-    # t1 t2 / t3 t4, so t3/t4 are the labelled bottom row.
+    # lengths set the merge order. Two aggregators x two grids -> a 2x2 grid; the
+    # layout puts gain_bias on the top row and tdigest on the bottom. The four
+    # targets carry deliberately uneven commit sets so each bottom panel must show
+    # its own commits in order.
+    def recs(agg, grid, commits):
+        return [_rec_row(c, f"{agg}_{grid}", agg=agg, grid=grid) for c in commits]
+
     rows = (
-        [_rec_row(c, "t1") for c in ("a", "bb", "ccc")]
-        + [_rec_row(c, "t2") for c in ("dd", "eee")]  # missing the earliest merge
-        + [_rec_row(c, "t3") for c in ("f", "gg")]
-        + [_rec_row(c, "t4") for c in ("h", "ii", "jjj", "kkkk")]
+        recs("gain_bias", "rectilinear", ("a", "bb", "ccc"))
+        + recs("gain_bias", "healpix", ("dd", "eee"))
+        + recs("tdigest", "rectilinear", ("f", "gg"))  # bottom-left
+        + recs("tdigest", "healpix", ("h", "ii", "jjj", "kkkk"))  # bottom-right
     )
     series = tmp_path / "series.parquet"
     update_series.save_series(update_series.records_to_frame(rows), series)
@@ -573,11 +592,17 @@ def test_make_figure_uneven_commit_sets_label_per_panel(tmp_path, monkeypatch):
     fig = captured["fig"]
 
     panels = {ax.get_title(): ax for ax in fig.axes if ax.get_title()}
-    # Top row (t1, t2) is hidden; the bottom row carries each panel's own commits.
-    assert not any(t.get_text() for t in panels["t1"].get_xticklabels())
-    assert not any(t.get_text() for t in panels["t2"].get_xticklabels())
-    assert [t.get_text() for t in panels["t3"].get_xticklabels()] == ["f", "gg"]
-    assert [t.get_text() for t in panels["t4"].get_xticklabels()] == ["h", "ii", "jjj", "kkkk"]
+    # Top row (gain_bias) is hidden; the bottom row (tdigest) carries each panel's
+    # own commits, even though the two panels have different commit sets.
+    assert not any(t.get_text() for t in panels["gain_bias_rectilinear"].get_xticklabels())
+    assert not any(t.get_text() for t in panels["gain_bias_healpix"].get_xticklabels())
+    assert [t.get_text() for t in panels["tdigest_rectilinear"].get_xticklabels()] == ["f", "gg"]
+    assert [t.get_text() for t in panels["tdigest_healpix"].get_xticklabels()] == [
+        "h",
+        "ii",
+        "jjj",
+        "kkkk",
+    ]
 
 
 def test_make_figure_colorbar_has_mb_twin_axis(tmp_path, monkeypatch):
@@ -644,3 +669,76 @@ def test_make_figure_cost_scatter_drawn_above_runtime_line(tmp_path, monkeypatch
     assert panel.patch.get_visible() is False  # so the runtime line shows through gaps
     scatter = next(c for c in panel.collections if isinstance(c, PathCollection))
     assert list(scatter.get_sizes()) == [90]  # marker bumped one size up
+
+
+# --- panel layout + failed-run handling (issue #121 review) ---------------
+
+
+def test_panel_layout_rect_left_healpix_right_largest_on_top():
+    import plot_series
+
+    # The eight real targets: rect (left) / healpix (right); largest shard per
+    # family on top (rect_6km~36, healpix_o10~40 above rect_3km~9, healpix_o11~10).
+    specs = [
+        ("gain_bias_rect_6km", "gain_bias", "rectilinear", 36.0),
+        ("gain_bias_healpix_o10", "gain_bias", "healpix", 40.5),
+        ("tdigest_rect_6km", "tdigest", "rectilinear", 36.0),
+        ("tdigest_healpix_o10", "tdigest", "healpix", 40.5),
+        ("gain_bias_rect_3km", "gain_bias", "rectilinear", 9.0),
+        ("gain_bias_healpix_o11", "gain_bias", "healpix", 10.1),
+        ("tdigest_rect_3km", "tdigest", "rectilinear", 9.0),
+        ("tdigest_healpix_o11", "tdigest", "healpix", 10.1),
+    ]
+    rows = [_rec_row("c0", t, agg=a, grid=g, area=ar) for t, a, g, ar in specs]
+    hist = update_series.records_to_frame(rows)
+    grid, nrows, ncols = plot_series._panel_layout(hist)
+    assert (nrows, ncols) == (4, 2)
+    assert grid == [
+        ["gain_bias_rect_6km", "gain_bias_healpix_o10"],  # largest, gain_bias
+        ["tdigest_rect_6km", "tdigest_healpix_o10"],  # largest, tdigest
+        ["gain_bias_rect_3km", "gain_bias_healpix_o11"],  # smaller, gain_bias
+        ["tdigest_rect_3km", "tdigest_healpix_o11"],  # smaller, tdigest
+    ]
+
+
+def test_make_figure_drops_failed_run_zeros(tmp_path, monkeypatch):
+    # A zero cost/runtime is a failed run: it must NOT be a connected datapoint.
+    # The cost line breaks at the zero (NaN, no dip to 0) and the failure shows as
+    # a non-connected 'x' marker so the x-axis/commit alignment is kept.
+    pytest.importorskip("matplotlib")
+    import matplotlib
+
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+    import numpy as np
+    import plot_series
+    from matplotlib.collections import PathCollection
+
+    captured = {}
+    monkeypatch.setattr(plt, "close", lambda fig: captured.setdefault("fig", fig))
+
+    # Middle merge failed (cost=runtime=0); the two flanking merges are real.
+    rows = [
+        _rec_row("c0", "t1", cost=0.005, rt=200.0),
+        _rec_row("c1", "t1", cost=0.0, rt=0.0),
+        _rec_row("ccc", "t1", cost=0.006, rt=210.0),
+    ]
+    series = tmp_path / "series.parquet"
+    update_series.save_series(update_series.records_to_frame(rows), series)
+    out = tmp_path / "fig.png"
+    assert plot_series.make_figure(
+        update_series.load_series(series), "cost_per_shard_usd", "c", out
+    )
+    fig = captured["fig"]
+
+    panel = next(ax for ax in fig.axes if ax.get_title() == "t1")
+    # Cost line: the failed middle point is NaN, so the line never connects to 0.
+    cost_line = next(ln for ln in panel.get_lines() if ln.get_linestyle() == "-")
+    ys = cost_line.get_ydata()
+    assert np.isnan(ys[1]) and not np.isnan(ys[0]) and not np.isnan(ys[2])
+    assert 0.0 not in [y for y in ys if not np.isnan(y)]
+    # A distinct, non-line 'x' marker flags the failed run.
+    fails = [
+        c for c in panel.collections if isinstance(c, PathCollection) and len(c.get_offsets()) == 1
+    ]
+    assert fails, "expected an 'x' failure marker at the zero point"
