@@ -245,6 +245,73 @@ def test_targets_manifest_consistent():
         assert n == sm_meta["n_granules"], f"{t['shardmap']}: stale n_granules"
 
 
+# --- provisional (PR-tree-only) handoff targets (issue #130) ---------------
+
+
+def test_provisional_targets_excluded_from_merge_matrix():
+    # The arrow/arrow-kernel comparison targets are PR-tree-only: "run all"
+    # (no --target) must not iterate them, so they never join the merge matrix.
+    manifest = json.loads((BENCH / "targets.json").read_text())
+    all_names = run_benchmark.all_target_names(manifest)
+    provisional = set(manifest["provisional_targets"]) - {"_comment"}
+    assert provisional, "expected provisional targets"
+    assert provisional.isdisjoint(all_names)
+    assert set(manifest["targets"]).issubset(all_names)
+
+
+def test_provisional_targets_consistent_and_carry_handoff():
+    manifest = json.loads((BENCH / "targets.json").read_text())
+    expected = {
+        "scalar_pandas_healpix_o11": "pandas",
+        "scalar_arrow_healpix_o11": "arrow",
+        "scalar_kernel_healpix_o11": "arrow-kernel",
+    }
+    for tname, handoff in expected.items():
+        t = manifest["provisional_targets"][tname]
+        assert (BENCH / t["config"]).exists(), f"{tname}: missing config"
+        assert manifest["shardmaps"][t["shardmap"]]  # shardmap is reused/known
+        assert t["handoff"] == handoff
+
+
+def test_provisional_target_resolves_and_threads_handoff(monkeypatch):
+    # /benchmark --target <provisional> must resolve and thread its handoff into agg.
+    manifest, base = run_benchmark.load_targets(str(BENCH / "targets.json"))
+    captured = {}
+
+    import zagg.runner as runner
+
+    def fake_agg(config, **kwargs):
+        captured["handoff"] = kwargs.get("handoff")
+        return {}
+
+    monkeypatch.setattr(runner, "agg", fake_agg)
+    run_benchmark.run_target(
+        "scalar_kernel_healpix_o11",
+        manifest,
+        base,
+        store="s3://b/x.zarr",
+        region="us-west-2",
+        function_name="process-shard",
+        context={"commit": "deadbee", "event": "pr"},
+        dry_run=False,
+    )
+    assert captured["handoff"] == "arrow-kernel"
+
+
+def test_scalar_config_is_kernel_able():
+    # The new scalar config must be GENUINELY scalar -- every field a pure group
+    # reduction -- so handoff="arrow-kernel" can run it end-to-end (issue #130).
+    from zagg.config import get_agg_fields, get_output_signature, load_config
+    from zagg.processing import _kernel_able
+
+    config = load_config(str(BENCH / "configs" / "atl03_scalar_healpix_o11.yaml"))
+    fields = get_agg_fields(config)
+    assert fields, "expected aggregation fields"
+    for name, meta in fields.items():
+        assert get_output_signature(meta)["kind"] == "scalar", f"{name} is not scalar"
+        assert _kernel_able(meta), f"{name} is not kernel-able"
+
+
 # --- per-target AOI override resolution (issue #121) -----------------------
 
 

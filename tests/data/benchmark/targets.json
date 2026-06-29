@@ -97,5 +97,32 @@
       "grid_type": "rectilinear",
       "grid_size": "6km"
     }
+  },
+  "provisional_targets": {
+    "_comment": "PROVISIONAL, PR-TREE-ONLY (issue #130, @espg decision https://github.com/englacial/zagg/issues/130#issuecomment-4838186259). These three scalar targets share ONE config + ONE shard (healpix_o11) and differ only by handoff (pandas / arrow / arrow-kernel) to benchmark the per-cell carrier cost and the experimental kernel reducer. They are deliberately NOT in 'targets' so they do NOT join the committed every-merge matrix until the kernel keep/drop decision is made. run_benchmark.py runs them by explicit --target name (via /benchmark); 'run all' (no --target) skips them.",
+    "scalar_pandas_healpix_o11": {
+      "config": "configs/atl03_scalar_healpix_o11.yaml",
+      "shardmap": "healpix_o11",
+      "aggregator": "scalar",
+      "grid_type": "healpix",
+      "grid_size": "o11",
+      "handoff": "pandas"
+    },
+    "scalar_arrow_healpix_o11": {
+      "config": "configs/atl03_scalar_healpix_o11.yaml",
+      "shardmap": "healpix_o11",
+      "aggregator": "scalar",
+      "grid_type": "healpix",
+      "grid_size": "o11",
+      "handoff": "arrow"
+    },
+    "scalar_kernel_healpix_o11": {
+      "config": "configs/atl03_scalar_healpix_o11.yaml",
+      "shardmap": "healpix_o11",
+      "aggregator": "scalar",
+      "grid_type": "healpix",
+      "grid_size": "o11",
+      "handoff": "arrow-kernel"
+    }
   }
 }
