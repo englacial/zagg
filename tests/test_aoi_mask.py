@@ -242,7 +242,6 @@ class TestRectilinearMask:
         assert n_chord <= 5  # the raw box is just its corners
         # The geodesic-following polygon is not the chord polygon: in a polar CRS
         # the curved edges enclose a measurably different area.
-        assert not densified.equals(chord)
         assert abs(densified.area - chord.area) / chord.area > 1e-4
 
     def test_fully_inside_aoi_all_true(self):

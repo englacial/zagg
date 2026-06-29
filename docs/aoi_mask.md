@@ -53,9 +53,10 @@ and writes it alongside the data columns.
 - **Rectilinear** reprojects the AOI polygon to the grid CRS (the same `to_crs`
   reprojection `coverage` uses) and tests each cell center with a
   prepared-geometry shapely `contains`. The WGS84 ring is **densified** before
-  reprojection (odc.geo `to_crs(resolution="auto")`, the same primitive
-  `shard_footprint` uses), so the AOI edges follow the geodesic rather than
-  collapsing to straight chords in a polar / large-extent CRS — edge-cell
+  reprojection (odc.geo `to_crs` resolution densification — the same mechanism
+  `shard_footprint` uses, here with `resolution="auto"`), so the AOI edges follow
+  the geodesic rather than collapsing to straight chords in a polar / large-extent
+  CRS — edge-cell
   membership no longer drifts by the chord-vs-arc deviation. This is rect-only:
   the HEALPix path tessellates the native `(lats, lons)` ring on the sphere and
   never reprojects a polygon.

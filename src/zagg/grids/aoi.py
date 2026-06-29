@@ -141,8 +141,9 @@ def rectilinear_aoi_polygon(polygon_parts, crs):
     (via odc.geo), returning a prepared-friendly shapely geometry in grid CRS for
     the per-cell ``contains`` test.
 
-    The ring is **densified** before reprojection (odc.geo ``to_crs(resolution=
-    "auto")``, the same primitive ``RectilinearGrid.shard_footprint`` uses), so the
+    The ring is **densified** before reprojection (odc.geo ``to_crs`` resolution
+    densification — the same mechanism ``RectilinearGrid.shard_footprint`` uses,
+    here with ``resolution="auto"`` for an extent-adaptive vertex spacing), so the
     AOI edges follow the geodesic instead of collapsing to straight chords in a
     polar / large-extent CRS. Since the mask is the *strict* deliverable, this
     keeps edge-cell membership from drifting by the chord-vs-arc deviation. This is
