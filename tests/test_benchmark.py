@@ -132,6 +132,8 @@ def test_memory_pct_of_cap_null_safe():
     assert bench_metrics.memory_pct_of_cap(None, 2.0) is None
     assert bench_metrics.memory_pct_of_cap(1000.0, None) is None
     assert bench_metrics.memory_pct_of_cap(1000.0, 0.0) is None
+    # A legacy parquet row degrades to NaN (not None) -> still treated as missing.
+    assert bench_metrics.memory_pct_of_cap(float("nan"), 2.0) is None
 
 
 def test_build_record_runtime_fallback():
@@ -383,14 +385,63 @@ def test_memory_fractions_none_when_memory_missing():
     assert plot_series.memory_fractions(sub) == [None]
 
 
-def test_make_figure_colours_markers_by_memory(tmp_path):
+def test_make_figure_colours_markers_by_memory(tmp_path, monkeypatch):
+    pytest.importorskip("matplotlib")
+    import matplotlib
+
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+    import plot_series
+    from matplotlib.collections import PathCollection
+
+    # Stop make_figure from closing the figure so we can introspect the artists.
+    captured = {}
+    real_close = plt.close
+
+    def _capture_close(fig):
+        captured["fig"] = fig  # grab the figure on its way out
+
+    monkeypatch.setattr(plt, "close", _capture_close)
+
+    # Round-trip through parquet so the (commit, target) points land in order and
+    # carry real memory; 512/2048 -> 0.25, 1963/2048 -> ~0.96 (near the red end).
+    rows = [_rec_row("c0", "t1", mem=512.0), _rec_row("c1", "t1", mem=1963.0)]
+    series = tmp_path / "series.parquet"
+    update_series.save_series(update_series.records_to_frame(rows), series)
+    df = update_series.load_series(series)
+
+    out = tmp_path / "fig.png"
+    assert plot_series.make_figure(df, "cost_per_shard_usd", "cost", out) is True
+    assert out.exists()
+    fig = captured["fig"]
+
+    # The cost markers are a scatter whose colour array IS the memory fraction.
+    scatters = [c for ax in fig.axes for c in ax.collections if isinstance(c, PathCollection)]
+    arrays = [s.get_array() for s in scatters if s.get_array() is not None]
+    assert any(
+        len(a) == 2 and a[0] == pytest.approx(0.25) and a[1] == pytest.approx(0.9585, abs=1e-3)
+        for a in arrays
+    )
+    # A colorbar (its own axes) is attached for the memory scale.
+    assert len(fig.axes) > 1
+    real_close(fig)
+
+
+def test_make_figure_null_memory_renders_uncoloured(tmp_path):
     pytest.importorskip("matplotlib")
     import plot_series
 
-    # Two points with distinct memory -> the scatter carries the fraction array,
-    # and a memory colorbar is attached to the figure.
-    rows = [_rec_row("c0", "t1", mem=512.0), _rec_row("c1", "t1", mem=1963.0)]
+    # A legacy row reads back as NaN memory -> uncoloured marker, no crash.
+    rows = [_rec_row("c0", "t1", mem=900.0), _rec_row("c1", "t1")]
+    series = tmp_path / "series.parquet"
     df = update_series.records_to_frame(rows)
+    df = df.assign(max_memory_mb=[900.0, None])
+    update_series.save_series(df, series)
     out = tmp_path / "fig.png"
-    assert plot_series.make_figure(df, "cost_per_shard_usd", "cost", out) is True
+    assert (
+        plot_series.make_figure(
+            update_series.load_series(series), "cost_per_shard_usd", "cost", out
+        )
+        is True
+    )
     assert out.exists()

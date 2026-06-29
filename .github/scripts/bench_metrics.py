@@ -95,11 +95,15 @@ def memory_pct_of_cap(max_memory_mb, memory_gb) -> float | None:
     """Fraction of the Lambda memory cap a shard peaked at (issue #120).
 
     ``max_memory_mb / (memory_gb * 1024)`` -- 0.0 at idle, ~1.0 at the OOM wall.
-    None when either input is missing or the cap is non-positive, so callers
-    (chart colouring, comment table) degrade gracefully on legacy rows. Not
-    clamped: a value slightly over 1.0 is a real OOM signal worth surfacing.
+    None when either input is missing (``None`` or the float ``NaN`` a legacy
+    parquet row degrades to) or the cap is non-positive, so callers (chart
+    colouring, comment table) degrade gracefully on legacy rows. Not clamped: a
+    value slightly over 1.0 is a real OOM signal worth surfacing.
     """
     if max_memory_mb is None or memory_gb is None:
+        return None
+    # A legacy parquet row reads back as NaN, not None, after the reindex.
+    if isinstance(max_memory_mb, float) and math.isnan(max_memory_mb):
         return None
     cap_mb = memory_gb * 1024.0
     if cap_mb <= 0:
