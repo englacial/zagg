@@ -54,12 +54,32 @@ and writes it alongside the data columns.
   reprojection `coverage` uses) and tests each cell center with a
   prepared-geometry shapely `contains`.
 
-A cell is in-AOI by its **center** (HEALPix: the MOC cell membership; rectilinear:
-the explicit center-in-polygon test), matching the cells the store already
-addresses. Boundary inclusivity differs slightly between engines — the HEALPix
-MOC keeps boundary-overlapping cells, while the rectilinear `contains` test is
-strict on the cell center — so a cell straddling the AOI edge may be marked
-differently across grid families.
+## Boundary inclusivity differs by grid family
+
+The two engines settle a cell that *straddles* the AOI edge differently, and the
+difference is **intentional and kept as-is** — each rule is the natural one for
+its engine. A client filtering on `aoi_mask` should expect slightly different
+edge semantics across grid families:
+
+- **HEALPix is overlap/coverage-based (inclusive at the boundary).**
+  `morton_coverage_moc` builds a MOC that *covers* the AOI, so a leaf cell whose
+  area overlaps the AOI — even partially, including one whose center lies just
+  outside — is in the MOC and marked `True`. The MOC is a superset cover, so the
+  HEALPix mask leans **inclusive**: it never drops a cell that touches the AOI.
+
+- **Rectilinear is a strict center test (exclusive at the boundary).** Each cell
+  is marked `True` only if its **center** falls inside the reprojected AOI polygon
+  (`prepared.contains(center_point)`). `contains` is strict — a center lying
+  *exactly on* the boundary returns `False` — so a cell straddling the edge whose
+  center is outside (or on) the polygon is **excluded**. This matches the
+  "keep-whole-cell-if-its-center-is-in" rule.
+
+So for the same AOI edge, the HEALPix mask tends to **include** an edge-overlapping
+cell while the rectilinear mask **excludes** one whose center is outside. Both are
+defensible in isolation (the HEALPix MOC is the native, decode-free primitive; the
+rect center test matches how rect cells are addressed), and the asymmetry is at
+most one cell-width at the boundary. Keep this in mind when comparing strict-AOI
+counts across a HEALPix and a rectilinear run of the same region.
 
 ## Reading the mask
 
@@ -83,13 +103,16 @@ strict = ds.where(ds["aoi_mask"])
 
 ## Notes and limits
 
-- **Local backend.** The mask is written end-to-end by the local runner. The AWS
-  Lambda worker path additionally needs the per-shard payload threaded through
-  the Lambda event/handler; that wiring is a follow-up (the handler lives in the
-  deployment infra).
+- **Both backends.** The mask is written end-to-end by the local runner **and**
+  the AWS Lambda backend. The orchestrator threads each shard's payload through
+  the Lambda event (`aoi_payload`) and `deployment/aws/lambda_handler.py` forwards
+  it to `process_shard`, mirroring the local wiring. When the flag is off the
+  event omits the key, so a flag-off Lambda run is byte-identical.
 - **WKB/WKT AOI input** (passing a native geometry rather than `(lats, lons)`
-  rings) is a deferred future phase, pending upstream mortie support
-  (espg/mortie#71).
+  rings) is **deferred**, blocked on upstream mortie geometry I/O
+  (espg/mortie#89): the pinned `mortie>=0.8.2` has no WKB/WKT entry point, so the
+  AOI is still supplied as `(lats, lons)` rings. It will be rolled in once that
+  upstream PR lands.
 
 See the runnable, data-free example in
 [`notebooks/aoi_mask.ipynb`](https://github.com/englacial/zagg/blob/main/notebooks/aoi_mask.ipynb),
