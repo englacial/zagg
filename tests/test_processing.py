@@ -1313,6 +1313,165 @@ class TestMultiChunkWorker:
                 assert np.isnan(anchor)
 
 
+class TestStreamAndFreeChunkWrites:
+    """Issue #91: a ``write_chunk`` callback streams each chunk write-then-free so
+    the worker holds ~1 chunk instead of all K. Output must stay byte-identical to
+    the accumulated ``chunk_results`` path, and K==1 is a true no-op."""
+
+    _scalar_cfg = staticmethod(TestMultiChunkWorker._scalar_cfg)
+    _patch_reads = TestMultiChunkWorker._patch_reads
+
+    def test_streaming_output_byte_identical_to_accumulated(self, monkeypatch):
+        """K=4: the carriers handed to ``write_chunk`` equal, per block index, the
+        carriers the accumulated ``chunk_results`` path produced — byte-identical."""
+        from mortie import geo2mort
+
+        from zagg.grids import from_config
+
+        cfg = self._scalar_cfg(chunk_inner=7)  # K=4
+        grid = from_config(cfg)
+        assert grid.chunks_per_shard == 4
+        shard_key = int(geo2mort(-78.5, -132.0, order=6)[0])
+        chunks = list(grid.iter_chunks(shard_key))
+        leaf = [int(cc[0]) for _b, cc in chunks]
+        df = pd.DataFrame(
+            {
+                "h_li": np.array([10.0, 11.0, 12.0, 13.0], dtype=np.float32),
+                "leaf_id": np.array(leaf, dtype=np.uint64),
+            }
+        )
+
+        # Accumulated reference.
+        self._patch_reads(monkeypatch, df.copy())
+        acc: list = []
+        process_shard(grid, shard_key, ["s3://x"], s3_credentials={}, config=cfg, chunk_results=acc)
+
+        # Streamed: collect what the callback received.
+        self._patch_reads(monkeypatch, df.copy())
+        streamed: list = []
+
+        def _wc(block_index, carrier, ragged):
+            streamed.append((block_index, carrier, ragged))
+
+        _df, _meta = process_shard(
+            grid, shard_key, ["s3://x"], s3_credentials={}, config=cfg, write_chunk=_wc
+        )
+
+        assert len(streamed) == len(acc) == 4
+        acc_by_block = {tuple(b): (c, r) for b, c, r in acc}
+        for block_index, carrier, ragged in streamed:
+            ref_carrier, ref_ragged = acc_by_block[tuple(block_index)]
+            pd.testing.assert_frame_equal(
+                carrier.reset_index(drop=True), ref_carrier.reset_index(drop=True)
+            )
+            assert ragged == ref_ragged
+
+    def test_callback_fires_once_per_chunk_and_chunk_results_untouched(self, monkeypatch):
+        """The callback is invoked exactly K times and the accumulating sink is
+        never populated when streaming (peak output memory is ~1 chunk)."""
+        from mortie import geo2mort
+
+        from zagg.grids import from_config
+
+        cfg = self._scalar_cfg(chunk_inner=7)  # K=4
+        grid = from_config(cfg)
+        shard_key = int(geo2mort(-78.5, -132.0, order=6)[0])
+        chunks = list(grid.iter_chunks(shard_key))
+        leaf = [int(cc[0]) for _b, cc in chunks]
+        df = pd.DataFrame(
+            {
+                "h_li": np.array([10.0, 11.0, 12.0, 13.0], dtype=np.float32),
+                "leaf_id": np.array(leaf, dtype=np.uint64),
+            }
+        )
+        self._patch_reads(monkeypatch, df)
+
+        # ``live`` tracks carriers still referenced by the callback's caller. The
+        # worker drops its own refs right after the call, so if the callback also
+        # drops, the carrier is collectible before the next chunk is built.
+        seen_blocks: list = []
+        max_live = {"n": 0}
+        live: list = []
+
+        def _wc(block_index, carrier, ragged):
+            seen_blocks.append(tuple(block_index))
+            live.append(carrier)
+            max_live["n"] = max(max_live["n"], len(live))
+            live.clear()  # consumer frees as it goes
+
+        _df, _meta = process_shard(
+            grid, shard_key, ["s3://x"], s3_credentials={}, config=cfg, write_chunk=_wc
+        )
+        assert len(seen_blocks) == 4
+        assert len(set(seen_blocks)) == 4  # one call per distinct chunk
+        assert max_live["n"] == 1  # never more than one chunk held at a time
+
+    def test_streaming_and_chunk_results_together_raises(self, monkeypatch):
+        """Passing both sinks is ambiguous and rejected."""
+        from mortie import geo2mort
+
+        from zagg.grids import from_config
+
+        cfg = self._scalar_cfg(chunk_inner=7)
+        grid = from_config(cfg)
+        shard_key = int(geo2mort(-78.5, -132.0, order=6)[0])
+        df = pd.DataFrame(
+            {
+                "h_li": np.array([1.0], dtype=np.float32),
+                "leaf_id": np.array([int(grid.children(shard_key)[0])], dtype=np.uint64),
+            }
+        )
+        self._patch_reads(monkeypatch, df)
+        with pytest.raises(ValueError, match="either chunk_results"):
+            process_shard(
+                grid,
+                shard_key,
+                ["s3://x"],
+                s3_credentials={},
+                config=cfg,
+                chunk_results=[],
+                write_chunk=lambda *a: None,
+            )
+
+    def test_k1_streaming_is_noop_byte_identical(self, monkeypatch):
+        """K==1: the lone carrier streamed through ``write_chunk`` equals the carrier
+        the default 2-tuple return produces — streaming changes nothing at K==1."""
+        from mortie import geo2mort
+
+        from zagg.grids import from_config
+
+        cfg = self._scalar_cfg(chunk_inner=None)  # K==1
+        grid = from_config(cfg)
+        assert grid.chunks_per_shard == 1
+        shard_key = int(geo2mort(-78.5, -132.0, order=6)[0])
+        children = grid.children(shard_key)
+        df = pd.DataFrame(
+            {
+                "h_li": np.array([5.0, 6.0], dtype=np.float32),
+                "leaf_id": np.array([int(children[0]), int(children[1])], dtype=np.uint64),
+            }
+        )
+        self._patch_reads(monkeypatch, df)
+        df_default, _ = process_shard(grid, shard_key, ["s3://x"], s3_credentials={}, config=cfg)
+
+        self._patch_reads(monkeypatch, df.copy())
+        streamed: list = []
+        df_out, _ = process_shard(
+            grid,
+            shard_key,
+            ["s3://x"],
+            s3_credentials={},
+            config=cfg,
+            write_chunk=lambda b, c, r: streamed.append((b, c, r)),
+        )
+        assert len(streamed) == 1
+        assert df_out.empty  # streamed path returns an empty carrier
+        _block, carrier, _ragged = streamed[0]
+        pd.testing.assert_frame_equal(
+            df_default.reset_index(drop=True), carrier.reset_index(drop=True)
+        )
+
+
 class TestChunkCompanionWorkedExample:
     """Issue #82 phase 5: a worked example exercising a chunk_precompute value
     stored as all three chunk-companion kinds — scalar, vector, AND ragged — and
