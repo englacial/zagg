@@ -122,6 +122,35 @@ def test_build_record_max_memory_null_safe():
     assert "max_memory_mb" in bench_metrics.RECORD_COLUMNS
 
 
+def test_codec_column_is_last_and_threaded(monkeypatch):
+    # The codec A/B label (issue #133) is the newest schema column -> appended LAST
+    # (stable-schema rule), threaded from context, and null on rows that omit it
+    # (legacy/frozen).
+    assert bench_metrics.RECORD_COLUMNS[-1] == "codec"
+    g = HealpixGrid(parent_order=11, child_order=19)
+    rec = bench_metrics.build_record(_summary(), grid=g, context={"codec": "sharded"})
+    assert rec["codec"] == "sharded"
+    # Absent in context -> null (a frozen/legacy row carries no codec).
+    legacy = bench_metrics.build_record(_summary(), grid=g, context={"target": "t"})
+    assert legacy["codec"] is None
+
+
+def test_run_target_threads_codec_into_record():
+    # run_benchmark must record the target's codec onto the row (dry-run, no AWS).
+    manifest, base = run_benchmark.load_targets(str(BENCH / "targets.json"))
+    rec = run_benchmark.run_target(
+        "tdigest_healpix_o10_inner",
+        manifest,
+        base,
+        store=None,
+        region="us-west-2",
+        function_name="process-shard",
+        context={"commit": "deadbee", "event": "pr"},
+        dry_run=True,
+    )
+    assert rec["codec"] == "inner"
+
+
 def test_memory_pct_of_cap_maps_near_red():
     # 1963 MB on a 2 GB cap -> ~0.96 (the OOM-adjacent run #1 figure, issue #120).
     pct = bench_metrics.memory_pct_of_cap(1963.0, 2.0)
@@ -234,7 +263,7 @@ def test_comment_markdown_worker_note_banner():
 def test_run_target_dry_run():
     manifest, base = run_benchmark.load_targets(str(BENCH / "targets.json"))
     rec = run_benchmark.run_target(
-        "gain_bias_healpix_o11",
+        "tdigest_healpix_o11_sharded",
         manifest,
         base,
         store=None,
@@ -243,8 +272,8 @@ def test_run_target_dry_run():
         context={"commit": "deadbee", "event": "pr"},
         dry_run=True,
     )
-    assert rec["target"] == "gain_bias_healpix_o11"
-    assert rec["aggregator"] == "gain_bias"
+    assert rec["target"] == "tdigest_healpix_o11_sharded"
+    assert rec["aggregator"] == "tdigest"
     assert rec["grid_type"] == "healpix"
     assert rec["shard_key"] == 5347394812217655307
     assert rec["shard_area_km2"] == pytest.approx(10.13, abs=0.2)
@@ -259,7 +288,7 @@ def test_main_dry_run_writes_outputs(tmp_path):
             "--targets",
             str(BENCH / "targets.json"),
             "--target",
-            "tdigest_healpix_o10",
+            "tdigest_healpix_o10_inner",
             "--dry-run",
             "--commit",
             "cafe123",
@@ -270,8 +299,8 @@ def test_main_dry_run_writes_outputs(tmp_path):
         ]
     )
     records = json.loads(out_json.read_text())
-    assert len(records) == 1 and records[0]["target"] == "tdigest_healpix_o10"
-    assert "tdigest_healpix_o10" in out_md.read_text()
+    assert len(records) == 1 and records[0]["target"] == "tdigest_healpix_o10_inner"
+    assert "tdigest_healpix_o10_inner" in out_md.read_text()
 
 
 # --- manifest integrity (the pin is internally consistent) ----------------
@@ -289,6 +318,64 @@ def test_targets_manifest_consistent():
         key, n = bench_metrics.select_densest_shard(sm)
         assert key == sm_meta["shard_key"], f"{t['shardmap']}: stale pinned shard_key"
         assert n == sm_meta["n_granules"], f"{t['shardmap']}: stale n_granules"
+
+
+# --- forward sharded-vs-inner matrix (issue #133) -------------------------
+
+
+def test_forward_matrix_is_tdigest_healpix_arrow_codec_ab():
+    # The committed merge matrix is the forward 2x3 codec A/B: every target is
+    # tdigest / HEALPix / arrow and carries a codec (sharded|inner) matched to its
+    # sharded bool, paired per order across o9/o10/o11. The carrier is config-driven
+    # (issue #132): targets inherit ``arrow`` from each config rather than restating
+    # a redundant per-target ``handoff`` key (test_committed_targets_drop_redundant_handoff).
+    manifest = json.loads((BENCH / "targets.json").read_text())
+    targets = manifest["targets"]
+    by_order: dict[str, set[str]] = {}
+    for tname, t in targets.items():
+        assert t["aggregator"] == "tdigest", tname
+        assert t["grid_type"] == "healpix", tname
+        assert "handoff" not in t, tname
+        assert t["codec"] in ("sharded", "inner"), tname
+        # codec label and the sharded bool run_benchmark applies must agree.
+        assert t["sharded"] is (t["codec"] == "sharded"), tname
+        # The target name encodes its order + codec, matching the metadata.
+        assert tname == f"tdigest_healpix_{t['grid_size']}_{t['codec']}", tname
+        by_order.setdefault(t["grid_size"], set()).add(t["codec"])
+    # Each present order is a complete A/B pair (both columns), never a half-row.
+    for order, codecs in by_order.items():
+        assert codecs == {"sharded", "inner"}, f"{order}: incomplete codec pair {codecs}"
+
+
+def test_o9_row_is_live():
+    # The o9 row landed (phase 1): its shard map is built and pinned, both columns
+    # reference it, and the _pending_o9 hold-out stanza is gone.
+    manifest = json.loads((BENCH / "targets.json").read_text())
+    assert "_pending_o9" not in manifest, "o9 hold-out stanza should be removed"
+    o9_targets = {n for n, t in manifest["targets"].items() if t["grid_size"] == "o9"}
+    assert o9_targets == {"tdigest_healpix_o9_sharded", "tdigest_healpix_o9_inner"}
+    for t in (manifest["targets"][n] for n in o9_targets):
+        assert t["shardmap"] == "healpix_o9"
+        assert t["config"] == "configs/atl03_tdigest_healpix_o9.yaml"
+    # The shardmap entry is pinned with a real (numeric) densest shard_key.
+    sm = manifest["shardmaps"]["healpix_o9"]
+    assert isinstance(sm["shard_key"], int)
+    assert sm["path"] == "shardmaps/sm_healpix_o9.json"
+    assert (BENCH / sm["path"]).exists()
+    assert (BENCH / "configs" / "atl03_tdigest_healpix_o9.yaml").exists()
+
+
+def test_every_live_shardmap_resolves_to_a_config():
+    # The drift test parametrizes over manifest["shardmaps"], and the consistency
+    # test over manifest["targets"]; both rely on every LIVE shardmap resolving to
+    # a referencing config (the drift test's _config_for_shardmap lookup). This
+    # guards that wiring -- the invariant that made o9 drop-in coverage automatic
+    # the moment its entry landed, and that keeps any future order covered too.
+    import test_benchmark_shardmap as drift
+
+    for sm_key in drift.MANIFEST["shardmaps"]:
+        cfg = drift._config_for_shardmap(sm_key)  # raises if no target references it
+        assert cfg.exists()
 
 
 # --- provisional (PR-tree-only) handoff targets (issue #130) ---------------
@@ -365,7 +452,7 @@ def test_committed_target_inherits_handoff_from_config(monkeypatch):
 
     monkeypatch.setattr(runner, "agg", fake_agg)
     run_benchmark.run_target(
-        "gain_bias_healpix_o11",
+        "tdigest_healpix_o11_sharded",
         manifest,
         base,
         store="s3://b/x.zarr",
@@ -375,6 +462,54 @@ def test_committed_target_inherits_handoff_from_config(monkeypatch):
         dry_run=False,
     )
     assert captured["handoff"] == "arrow"
+
+
+def test_sharded_knob_applied_to_grid_config(monkeypatch):
+    # The forward benchmark (issue #133) carries the ShardingCodec as a per-target
+    # ``sharded`` key so one config drives both columns: run_target must push it
+    # onto config.output['grid']['sharded'] (where get_sharded reads it) before
+    # building the grid + dispatching. A synthetic manifest pairs the o9 t-digest
+    # config (K=256, so sharded is valid) with each codec value.
+    base = BENCH
+    captured = {}
+
+    import zagg.runner as runner
+    from zagg.config import get_sharded
+
+    def fake_agg(config, **kwargs):
+        captured["sharded"] = get_sharded(config)
+        return {}
+
+    monkeypatch.setattr(runner, "agg", fake_agg)
+    for codec, want in (("sharded", True), ("inner", False)):
+        manifest = {
+            "shardmaps": {"healpix_o10": {"path": "shardmaps/sm_healpix_o10.json"}},
+            "targets": {
+                "t": {
+                    "config": "configs/atl03_tdigest_healpix_o9.yaml",
+                    "shardmap": "healpix_o10",
+                    "aggregator": "tdigest",
+                    "grid_type": "healpix",
+                    "grid_size": "o9",
+                    "handoff": "arrow",
+                    "codec": codec,
+                    "sharded": want,
+                }
+            },
+        }
+        # The o10 shardmap meta has no shard_key here; run_target reads it, so add one.
+        manifest["shardmaps"]["healpix_o10"]["shard_key"] = 0
+        run_benchmark.run_target(
+            "t",
+            manifest,
+            base,
+            store="s3://b/x.zarr",
+            region="us-west-2",
+            function_name="process-shard",
+            context={"commit": "deadbee", "event": "pr"},
+            dry_run=False,
+        )
+        assert captured["sharded"] is want, f"codec={codec} -> sharded={want}"
 
 
 def test_scalar_config_is_genuinely_scalar():
@@ -980,3 +1115,146 @@ def test_make_figure_drops_failed_run_zeros(tmp_path, monkeypatch):
     ]
     assert fails, "expected an 'x' failure marker at the zero point"
     assert fails[0].get_offsets()[0][0] == 1  # the failed merge's x position
+
+
+# --- forward sharded-vs-inner renderer (issue #133) -----------------------
+
+
+def _codec_row(commit, order, codec, **kw):
+    # A forward-matrix merge row: tdigest/healpix, carrying grid_size + codec so
+    # the renderer slots it into the fixed 2x3 (order x sharded/inner) grid.
+    r = _rec_row(commit, f"tdigest_healpix_{order}_{codec}", agg="tdigest", grid="healpix", **kw)
+    r["grid_size"] = order
+    r["codec"] = codec
+    return r
+
+
+def _full_codec_matrix(commit):
+    return [
+        _codec_row(commit, order, codec)
+        for order in ("o9", "o10", "o11")
+        for codec in ("sharded", "inner")
+    ]
+
+
+def test_codec_layout_is_fixed_2x3_sharded_inner_by_order():
+    import plot_series
+
+    hist = update_series.records_to_frame(_full_codec_matrix("c0"))
+    grid, nrows, ncols = plot_series._codec_layout(hist)
+    assert (nrows, ncols) == (3, 2)  # rows o9->o11, cols sharded/inner
+    assert grid == [
+        ["tdigest_healpix_o9_sharded", "tdigest_healpix_o9_inner"],
+        ["tdigest_healpix_o10_sharded", "tdigest_healpix_o10_inner"],
+        ["tdigest_healpix_o11_sharded", "tdigest_healpix_o11_inner"],
+    ]
+
+
+def test_codec_layout_blanks_missing_order():
+    # A history missing an order (here o9) renders that row as two blank cells;
+    # the grid is still a fixed 2x3 so the matrix shape is stable.
+    import plot_series
+
+    rows = [_codec_row("c0", o, c) for o in ("o10", "o11") for c in ("sharded", "inner")]
+    grid, nrows, ncols = plot_series._codec_layout(update_series.records_to_frame(rows))
+    assert (nrows, ncols) == (3, 2)
+    assert grid[0] == [None, None]  # o9 row blank
+    assert grid[1] == ["tdigest_healpix_o10_sharded", "tdigest_healpix_o10_inner"]
+
+
+def test_codec_and_frozen_histories_split_on_codec():
+    import plot_series
+
+    rows = _full_codec_matrix("c0") + [
+        _rec_row("c0", "gain_bias_rect_3km", agg="gain_bias", grid="rectilinear")
+    ]
+    df = update_series.records_to_frame(rows)
+    codec = plot_series._codec_history(df)
+    frozen = plot_series._frozen_history(df)
+    assert set(codec["target"]) == {r["target"] for r in _full_codec_matrix("c0")}
+    assert set(frozen["target"]) == {"gain_bias_rect_3km"}
+
+
+def test_codec_split_handles_parquet_without_codec_column():
+    # Backward-compat: the live retained parquet predates the codec column until
+    # the first new merge. A frame with NO ``codec`` column must read as all-frozen
+    # (the renderer's ``"codec" not in df.columns`` guard), never KeyError.
+    import plot_series
+
+    df = update_series.records_to_frame([_rec_row("c0", "t1"), _rec_row("c1", "t1")])
+    df = df.drop(columns=["codec"])  # simulate a pre-#133 parquet
+    assert not plot_series._codec_mask(df).any()
+    assert plot_series._codec_history(df).empty
+    assert set(plot_series._frozen_history(df)["target"]) == {"t1"}
+
+
+def test_make_codec_figure_renders_only_codec_rows(tmp_path, monkeypatch):
+    pytest.importorskip("matplotlib")
+    import matplotlib
+
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+    import plot_series
+
+    captured = {}
+    monkeypatch.setattr(plt, "close", lambda fig: captured.setdefault("fig", fig))
+
+    # Full 2x3 codec matrix + a frozen row that must NOT appear in the codec figure.
+    rows = _full_codec_matrix("c0") + [
+        _rec_row("c0", "gain_bias_rect_3km", agg="gain_bias", grid="rectilinear")
+    ]
+    series = tmp_path / "series.parquet"
+    update_series.save_series(update_series.records_to_frame(rows), series)
+    out = tmp_path / "codec.png"
+    assert plot_series.make_codec_figure(
+        update_series.load_series(series), "cost_per_shard_usd", "cost", out
+    )
+    assert out.exists()
+    titles = {ax.get_title() for ax in captured["fig"].axes if ax.get_title()}
+    assert titles == {r["target"] for r in _full_codec_matrix("c0")}
+    assert "gain_bias_rect_3km" not in titles
+
+
+def test_make_figure_frozen_ignores_codec_rows(tmp_path):
+    # The frozen figure renders nothing from a series that is all codec rows.
+    pytest.importorskip("matplotlib")
+    import plot_series
+
+    df = update_series.records_to_frame(_full_codec_matrix("c0"))
+    out = tmp_path / "frozen.png"
+    assert plot_series.make_figure(df, "cost_per_shard_usd", "cost", out) is False
+    assert not out.exists()
+
+
+def test_make_codec_latest_table_renders_codec_rows(tmp_path):
+    pytest.importorskip("matplotlib")
+    import plot_series
+
+    df = update_series.records_to_frame(_full_codec_matrix("c0"))
+    out = tmp_path / "codec_table.png"
+    assert plot_series.make_codec_latest_table(df, out) is True
+    assert out.exists()
+    # No codec rows -> nothing rendered.
+    frozen_only = update_series.records_to_frame([_rec_row("c0", "gain_bias_rect_3km")])
+    assert plot_series.make_codec_latest_table(frozen_only, tmp_path / "x.png") is False
+
+
+def test_plot_main_emits_codec_artifacts_above_frozen(tmp_path):
+    pytest.importorskip("matplotlib")
+    import plot_series
+
+    rows = _full_codec_matrix("c0") + [
+        _rec_row("c0", "gain_bias_rect_3km", agg="gain_bias", grid="rectilinear")
+    ]
+    series = tmp_path / "series.parquet"
+    update_series.save_series(update_series.records_to_frame(rows), series)
+    outdir = tmp_path / "site"
+    plot_series.main(["--series", str(series), "--out", str(outdir)])
+    # Forward codec figures + table land beside the frozen ones.
+    assert (outdir / "cost_per_shard_codec.png").exists()
+    assert (outdir / "codec_table.png").exists()
+    assert (outdir / "cost_per_shard.png").exists()  # the frozen rect row still renders
+    html = (outdir / "index.html").read_text()
+    # The forward (sharded-vs-inner) section is rendered ABOVE the frozen one.
+    assert "Sharded vs inner-chunk" in html and "Frozen historical" in html
+    assert html.index("Sharded vs inner-chunk") < html.index("Frozen historical")

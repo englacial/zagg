@@ -46,6 +46,7 @@ from zagg.config import (
     PipelineConfig,
     default_config,
     get_agg_fields,
+    get_aoi_mask,
     get_output_signature,
     output_field_signature,
 )
@@ -438,6 +439,59 @@ class RectilinearGrid:
         """Identity for rectilinear (output coord is the flat cell id)."""
         return np.asarray(cell_ids, dtype=np.int64)
 
+    def cell_centers(self, leaf_ids):
+        """Cell-center ``(xs, ys)`` in grid CRS for row-major flat ``leaf_ids``."""
+        v = np.asarray(leaf_ids, dtype=np.int64)
+        rows = v // self.width
+        cols = v % self.width
+        xs = self.xmin + (cols + 0.5) * self.res_x
+        ys = self.ymax - (rows + 0.5) * self.res_y
+        return xs, ys
+
+    # ── strict-AOI cell mask (issue #101, optional) ─────────────────────────
+
+    def aoi_polygon(self, aoi):
+        """Reproject the AOI to the grid CRS as a shapely polygon.
+
+        ``aoi`` is an :class:`~zagg.grids.aoi.AOIGeometry` (WKB/WKT or ``(lats,
+        lons)`` ring parts) or, for back-compatibility, a bare parts list. A WKB/WKT
+        source reprojects through the same odc.geo densify + ``to_crs`` path as the
+        equivalent ring, so the cell-center ``contains`` mask is identical. Built
+        once at the shard-map stage; the per-shard boolean
+        (:meth:`aoi_mask_for_children`) is precomputed against it and carried in the
+        manifest.
+        """
+        from zagg.grids.aoi import as_aoi_geometry, rectilinear_aoi_polygon_from_geometry
+
+        return rectilinear_aoi_polygon_from_geometry(as_aoi_geometry(aoi), self._geobox.crs)
+
+    def aoi_mask_for_children(self, aoi_geom, children) -> np.ndarray:
+        """Boolean over ``children`` — ``True`` where the cell center is in the AOI.
+
+        ``aoi_geom`` is the reprojected polygon (:meth:`aoi_polygon`); ``children``
+        the chunk's row-major flat cell ids (``children``). Cell centers are tested
+        with a prepared-geometry ``contains``.
+        """
+        from zagg.grids.aoi import rectilinear_mask_for_centers
+
+        xs, ys = self.cell_centers(children)
+        return rectilinear_mask_for_centers(aoi_geom, xs, ys)
+
+    def aoi_mask_from_payload(self, payload, children) -> np.ndarray:
+        """Expand a manifest per-shard payload to a per-cell bool over ``children``.
+
+        For rectilinear the payload is the in-AOI cell ids (not positional indices),
+        so membership of ``children`` against them is the mask — order-independent,
+        so a K>1 chunk that enumerates a sub-tile still maps correctly. Used by the
+        worker, which has only the JSON payload (no shapely recompute) — see
+        ``catalog.shardmap._compute_aoi_mask``.
+        """
+        true_ids = np.asarray(payload, dtype=np.int64)
+        children = np.asarray(children, dtype=np.int64)
+        if true_ids.size == 0:
+            return np.zeros(children.shape, dtype=bool)
+        return np.isin(children, true_ids)
+
     def chunk_coords(self, shard_key) -> dict:
         """No per-cell coord columns; x/y are 1D dimensional coords on the template."""
         return {}
@@ -526,6 +580,11 @@ class RectilinearGrid:
             dtype = meta.get("dtype", "float32")
             fill = meta.get("fill_value", "NaN")
             members[name] = _shard(base.with_data_type(dtype).with_fill_value(fill))
+        # Optional strict-AOI cell mask (issue #101): a bool array aligned to the
+        # (y, x) cell grid, emitted only when ``output.aoi_mask`` is on so off-runs
+        # stay byte-identical. fill_value False — unwritten cells read as out-of-AOI.
+        if get_aoi_mask(self.config):
+            members["aoi_mask"] = _shard(base.with_data_type("bool").with_fill_value(False))
         for name, meta in get_agg_fields(self.config).items():
             sig = get_output_signature(meta)
             # Ragged fields (issue #48) are CSR subgroups written fresh by

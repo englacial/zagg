@@ -42,10 +42,27 @@ aggregator).
 
 ## Plot layout (`plot_series.py`)
 
-The two GitHub-Pages charts (`cost_per_shard.png`, `cost_per_100km2.png`) lay
-their per-target panels out by a **data-driven** rule (issue #121 review), so new
-or rearranged targets follow the same convention automatically — nothing is keyed
-to today's eight targets:
+`plot_series.py` renders **two figure families**, split on the `codec` column
+(issue #133): the forward sharded-vs-inner matrix (`codec` non-null) on top, and
+the frozen historical series (`codec` null) below.
+
+### Forward matrix — fixed 2×3 (`*_codec.png` + `codec_table.png`)
+
+The forward charts (`cost_per_shard_codec.png`, `cost_per_100km2_codec.png`) lay
+the codec rows out in a **fixed** grid keyed to the experiment, not the data:
+
+- **Columns = the ShardingCodec A/B.** Left = `sharded`, right = `inner`.
+- **Rows = order, largest-first.** `o9` (top) → `o10` → `o11` (bottom). A row whose
+  order hasn't landed yet (e.g. `o9` before its shard map is built) renders blank,
+  so the matrix shape stays stable.
+
+`codec_table.png` is the latest-merge table for these rows.
+
+### Frozen historical — data-driven (`*.png` + `latest_table.png`)
+
+The frozen charts (`cost_per_shard.png`, `cost_per_100km2.png`) keep the
+**data-driven** layout (issue #121 review) for the retired rect/gain_bias rows —
+nothing is keyed to a fixed target list:
 
 - **Columns = grid family.** The **left** column is the rectilinear (`rect_*`)
   targets; the **right** column is the HEALPix targets.
@@ -57,6 +74,9 @@ to today's eight targets:
 - **Rows ordered largest-shard-first.** The largest shards sit at the **top** and
   shard size **descends** down the rows (size is ranked from `shard_area_km2`);
   same-size rows break ties on the aggregator name.
+
+### Both families
+
 - **Zeros are failed runs, not data.** A zero cost/runtime means the shard run
   failed, so it is **not** plotted as a real datapoint: the connecting line
   **breaks** at that merge (it never dips to 0) on **both** the cost and runtime
@@ -66,9 +86,10 @@ to today's eight targets:
   cost axis back down to 0. A failed shard zeros both series at the same merge, so
   the one cost `x` flags the failure for both.
 
-When adding or rearranging targets, keep these conventions — the layout is derived
-from `grid_type` / `aggregator` / `shard_area_km2`, so getting that metadata right
-in `targets.json` is what places the panel.
+When adding or rearranging targets, keep these conventions — the frozen layout is
+derived from `grid_type` / `aggregator` / `shard_area_km2`, and the forward layout
+from `grid_size` / `codec`, so getting that metadata right in `targets.json` is
+what places the panel.
 
 ## Add a target
 

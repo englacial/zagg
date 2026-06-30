@@ -13,6 +13,7 @@ extra:
 nav:
   - "index.md"
   - "quickstart.md"
+  - "Strict-AOI mask": "aoi_mask.md"
   - "API":
       - Config: "api/config.md"
       - Store: "api/store.md"

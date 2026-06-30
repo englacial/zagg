@@ -14,7 +14,7 @@ to already be deployed -- it never stands up or mutates infrastructure.
 Usage::
 
     python run_benchmark.py --targets tests/data/benchmark/targets.json \\
-        --target gain_bias_healpix_o11 --target tdigest_healpix_o11 \\
+        --target tdigest_healpix_o11_sharded --target tdigest_healpix_o11_inner \\
         --store-prefix s3://my-bucket/zagg-bench \\
         --region us-west-2 --function-name process-shard \\
         --event pr --commit "$SHA" --ref "$REF" --pr-number 123 \\
@@ -103,6 +103,13 @@ def run_target(
     # (``aggregation.handoff``, default ``"arrow"``) unless the target pins an
     # explicit override for a pandas-vs-arrow A/B; the override still wins.
     handoff = target.get("handoff") or get_handoff(config)
+    # The ShardingCodec (issue #108) is the experimental variable of the forward
+    # benchmark (issue #133): the matrix carries ``sharded: true|false`` per target
+    # so one config drives both columns. Apply it to the grid block (where
+    # ``get_sharded`` reads it) when present; absent leaves the config's own
+    # default, so frozen/legacy targets dispatch byte-identically to before.
+    if "sharded" in target:
+        config.output.setdefault("grid", {})["sharded"] = bool(target["sharded"])
     # parent_order lives in the config grid for HEALPix; the kwarg is just a
     # legacy fallback. Rect grids ignore it. ``from_config`` gives us the grid
     # object the area/cost derivation needs.
@@ -115,6 +122,10 @@ def run_target(
         grid_type=target["grid_type"],
         grid_size=target["grid_size"],
         shard_key=shard_key,
+        # ShardingCodec A/B label (issue #133), recorded into the series so the
+        # renderer can split the new matrix from frozen rows. None on targets
+        # without the key (the provisional/legacy ones).
+        codec=target.get("codec"),
     )
 
     if dry_run:
