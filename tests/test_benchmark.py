@@ -234,7 +234,7 @@ def test_comment_markdown_worker_note_banner():
 def test_run_target_dry_run():
     manifest, base = run_benchmark.load_targets(str(BENCH / "targets.json"))
     rec = run_benchmark.run_target(
-        "gain_bias_healpix_o11",
+        "tdigest_healpix_o11_sharded",
         manifest,
         base,
         store=None,
@@ -243,8 +243,8 @@ def test_run_target_dry_run():
         context={"commit": "deadbee", "event": "pr"},
         dry_run=True,
     )
-    assert rec["target"] == "gain_bias_healpix_o11"
-    assert rec["aggregator"] == "gain_bias"
+    assert rec["target"] == "tdigest_healpix_o11_sharded"
+    assert rec["aggregator"] == "tdigest"
     assert rec["grid_type"] == "healpix"
     assert rec["shard_key"] == 5347394812217655307
     assert rec["shard_area_km2"] == pytest.approx(10.13, abs=0.2)
@@ -259,7 +259,7 @@ def test_main_dry_run_writes_outputs(tmp_path):
             "--targets",
             str(BENCH / "targets.json"),
             "--target",
-            "tdigest_healpix_o10",
+            "tdigest_healpix_o10_inner",
             "--dry-run",
             "--commit",
             "cafe123",
@@ -270,8 +270,8 @@ def test_main_dry_run_writes_outputs(tmp_path):
         ]
     )
     records = json.loads(out_json.read_text())
-    assert len(records) == 1 and records[0]["target"] == "tdigest_healpix_o10"
-    assert "tdigest_healpix_o10" in out_md.read_text()
+    assert len(records) == 1 and records[0]["target"] == "tdigest_healpix_o10_inner"
+    assert "tdigest_healpix_o10_inner" in out_md.read_text()
 
 
 # --- manifest integrity (the pin is internally consistent) ----------------
