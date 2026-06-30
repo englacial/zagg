@@ -360,7 +360,8 @@ def test_o9_row_is_pending_not_live():
     for t in tmpl.values():
         assert t["config"] == "configs/atl03_tdigest_healpix_o9.yaml"
     sm = manifest["_pending_o9"]["shardmap_template"]["healpix_o9"]
-    assert not isinstance(sm["shard_key"], int), "no fabricated o9 shard_key"
+    # The key is the literal placeholder, not a (fabricated) numeric pin.
+    assert sm["shard_key"] == "<densest>", "no fabricated o9 shard_key"
     # The o9 config exists already (phase 2), even though the map is pending.
     assert (BENCH / "configs" / "atl03_tdigest_healpix_o9.yaml").exists()
 
@@ -368,8 +369,10 @@ def test_o9_row_is_pending_not_live():
 def test_o9_drift_coverage_is_automatic_once_pinned():
     # The drift test parametrizes over manifest["shardmaps"], and the consistency
     # test over manifest["targets"], so adding the healpix_o9 entry + the two o9
-    # targets (per _pending_o9) covers o9 with no test change. Guard that wiring:
-    # the drift test must still find a referencing config for every live shardmap.
+    # targets (per _pending_o9) will cover o9 with no test change. What this guards
+    # is the wiring that makes that true: every LIVE shardmap must resolve to a
+    # referencing config (the lookup the drift test relies on), so an o9 entry
+    # added the same way is covered the moment it lands.
     import test_benchmark_shardmap as drift
 
     for sm_key in drift.MANIFEST["shardmaps"]:
