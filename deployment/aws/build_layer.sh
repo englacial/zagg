@@ -58,8 +58,13 @@ fi
 # lat/lon -> grid CRS at processing time. zarr/obstore/pydantic-zarr are NOT
 # here -- they are function-level deps installed by build_function.sh.
 echo "Installing processing deps..."
+# arro3-core (issue #130) is the deployed-worker Arrow carrier, replacing pyarrow:
+# ~7 MB, zero required deps, importable (pyarrow's bindings hard-link a ~100 MB
+# unstrippable C++ core that can't fit the gate while importable). pyarrow is NOT
+# installed here -- its only use is off-Lambda zagg.catalog. Keep the pin in sync
+# with the `lambda` extra in pyproject.toml.
 $PIP install \
-    "pandas==2.2.3" "pyarrow==24.0.0" fastparquet cramjam \
+    "pandas==2.2.3" "arro3-core==0.8.1" fastparquet cramjam \
     shapely pyproj odc-geo affine cachetools \
     -c "$CONSTRAINTS" \
     -t "$OUTPUT_DIR/python" \
@@ -76,38 +81,15 @@ if [[ "$NUMPY_VERSION" == *"2.3"* ]]; then
 fi
 
 # Remove bloat. pyproj is intentionally NOT stripped (rectilinear/odc-geo assign
-# needs it); pyarrow IS kept now -- it is on the vector-write hot path and the
-# experimental arrow-kernel reducer (issue #130), but its unused C++ engines are
-# component-stripped below to stay under the combined size gate.
+# needs it). pyarrow is no longer installed (issue #130): the worker's Arrow carrier
+# is arro3-core, which needs no component strip, so the whole pyarrow strip block is
+# gone with it.
 echo "Removing bloat..."
 rm -rf "$OUTPUT_DIR/python"/xarray* \
        "$OUTPUT_DIR/python"/matplotlib* \
        "$OUTPUT_DIR/python"/lonboard* \
        "$OUTPUT_DIR/python"/boto3* \
        "$OUTPUT_DIR/python"/botocore* 2>/dev/null || true
-
-# pyarrow component strip (issue #130): drop the C++ engines the Lambda worker
-# never calls -- Flight (RPC), Substrait, Gandiva (LLVM expr JIT), Dataset, and
-# Parquet -- plus their cython modules. KEEP libarrow.so* (core), libarrow_python*
-# (numpy<->arrow), and libarrow_acero*/_acero*.so + _compute*.so (the arrow-kernel
-# hash-aggregate reducer, kept per issue #130). Parquet is stripped because
-# pyarrow.parquet is used ONLY by zagg.catalog (STAC/geoparquet fetch+build), which
-# runs OFF-Lambda with the ``catalog`` extra and never on the worker -- the layer
-# exists only for the worker, so libparquet is pure dead weight here (and recovers
-# the ~12 MB that put the combined layer+function over the 250 MB gate). The worker
-# parquet path, if any, is fastparquet+cramjam, which stay. The generic *.so strip
-# below then strips debug symbols from what remains.
-echo "Component-stripping pyarrow..."
-rm -f "$OUTPUT_DIR/python/pyarrow"/libarrow_flight* \
-      "$OUTPUT_DIR/python/pyarrow"/libarrow_substrait* \
-      "$OUTPUT_DIR/python/pyarrow"/libgandiva* \
-      "$OUTPUT_DIR/python/pyarrow"/libarrow_dataset* \
-      "$OUTPUT_DIR/python/pyarrow"/libparquet* \
-      "$OUTPUT_DIR/python/pyarrow"/_flight*.so \
-      "$OUTPUT_DIR/python/pyarrow"/_substrait*.so \
-      "$OUTPUT_DIR/python/pyarrow"/_gandiva*.so \
-      "$OUTPUT_DIR/python/pyarrow"/_dataset*.so \
-      "$OUTPUT_DIR/python/pyarrow"/_parquet*.so 2>/dev/null || true
 
 # Clean caches/tests and strip debug symbols.
 find "$OUTPUT_DIR/python" -type d -name "__pycache__" -exec rm -rf {} + 2>/dev/null || true
