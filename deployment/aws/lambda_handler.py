@@ -57,6 +57,9 @@ import resource
 import time
 from typing import Any, Dict
 
+from zarr import open_group
+from zarr.errors import GroupNotFoundError
+
 # Import cloud-agnostic processing
 from zagg.config import load_config_from_dict
 from zagg.processing import (
@@ -271,6 +274,10 @@ def _handle_process(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
         # read/index/aggregate deltas; the write phase runs in the callback below and
         # is accumulated into the same sub-dict. Default (no key) leaves it unchanged.
         profile = event.get("profile", False)
+        # Per-cell carrier (issue #130). Absent key -> "pandas", the byte-identical
+        # default worker path; "arrow" opts into the arro3-core read carrier for
+        # benchmarks. (Neither imports pyarrow; pyarrow is not in the layer.)
+        handoff = event.get("handoff", "pandas")
         sharded = getattr(grid, "sharded", False)
         store_path = event["store_path"]
         shard_key = event["shard_key"]
@@ -297,9 +304,16 @@ def _handle_process(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
             if write_error:
                 return None
             store = open_store(store_path, **_output_store_kwargs(event))
-            template_key = f"{grid.group_path}/zarr.json"
-            if not store.exists(template_key):
-                msg = f"Zarr template not found at {store_path}/{template_key}"
+            # Validate the Zarr template exists before writing. ``store`` is a zarr v3
+            # ``Store`` whose ``exists()`` is async, so open the group via the high-level
+            # sync API and catch the missing-node error instead (issue #118), in the same
+            # open-and-catch spirit as ``readers/tdigest_tensor.py``.
+            # ``GroupNotFoundError`` is raised identically on LocalStore and obstore (S3);
+            # a present-but-wrong-type node surfaces as a real error, not "missing".
+            try:
+                open_group(store, path=grid.group_path, mode="r", zarr_format=3)
+            except GroupNotFoundError:
+                msg = f"Zarr template not found at {store_path}/{grid.group_path}"
                 logger.error(msg)
                 write_error["msg"] = msg
                 return None
@@ -339,6 +353,7 @@ def _handle_process(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
             config=config,
             chunk_results=chunk_results,
             write_chunk=None if sharded else _write_chunk,
+            handoff=handoff,
             profile=profile,
         )
 

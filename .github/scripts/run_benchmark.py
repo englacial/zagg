@@ -49,6 +49,33 @@ def _resolve(base: Path, rel: str) -> Path:
     return (base / rel).resolve()
 
 
+def all_target_names(manifest: dict) -> list[str]:
+    """Names that ``run all`` iterates: the committed merge matrix only.
+
+    ``provisional_targets`` (issue #130) are PR-tree-only and runnable by explicit
+    ``--target`` name, but are deliberately excluded here so they never join the
+    permanent every-merge matrix until the carrier decision is made.
+    """
+    return list(manifest["targets"].keys())
+
+
+def _resolve_target(manifest: dict, name: str) -> dict:
+    """Look a target up in the committed matrix, then the provisional block.
+
+    ``provisional_targets`` lets ``/benchmark --target <name>`` run a PR-tree-only
+    target (the pandas-vs-arrow carrier comparison, issue #130) without that target
+    being part of ``targets`` (the committed merge matrix).
+    """
+    targets = manifest.get("targets", {})
+    if name in targets:
+        return targets[name]
+    provisional = manifest.get("provisional_targets", {})
+    if name in provisional:
+        return provisional[name]
+    known = list(targets) + list(provisional)
+    raise KeyError(f"unknown target '{name}'; have {known}")
+
+
 def run_target(
     name: str,
     manifest: dict,
@@ -63,13 +90,17 @@ def run_target(
     """Dispatch one target's shard and return its benchmark record."""
     from zagg import __version__ as zagg_version
 
-    target = manifest["targets"][name]
+    target = _resolve_target(manifest, name)
     shardmap_key = target["shardmap"]
     shardmap_meta = manifest["shardmaps"][shardmap_key]
     config_path = _resolve(base, target["config"])
     shardmap_path = _resolve(base, shardmap_meta["path"])
     shard_key = int(shardmap_meta["shard_key"])
     n_granules = shardmap_meta.get("n_granules")
+
+    # Per-cell carrier (issue #130). Default "pandas" keeps the dispatched event
+    # byte-identical to a pre-handoff run; the arrow (arro3) target sets it.
+    handoff = target.get("handoff", "pandas")
 
     config = load_config(str(config_path))
     # parent_order lives in the config grid for HEALPix; the kwarg is just a
@@ -101,7 +132,11 @@ def run_target(
             region=region,
             function_name=function_name,
             overwrite=True,
+            handoff=handoff,
             profile=True,
+            # A benchmark measures one clean invocation and records a failure as
+            # a failure -- never re-invoke (and never pay) to re-fail (#119).
+            max_retries=1,
         )
 
     return bench_metrics.build_record(
@@ -157,7 +192,10 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
 
     manifest, base = load_targets(args.targets)
-    names = args.target or list(manifest["targets"].keys())
+    # "run all" (no --target) iterates the committed merge matrix only; provisional
+    # (PR-tree-only) targets are run by explicit --target name (issue #130).
+    names = args.target or all_target_names(manifest)
+    known = set(manifest.get("targets", {})) | set(manifest.get("provisional_targets", {}))
 
     pr_number = int(args.pr_number) if args.pr_number not in (None, "", "0") else None
     context = {
@@ -170,8 +208,8 @@ def main(argv: list[str] | None = None) -> int:
 
     records = []
     for name in names:
-        if name not in manifest["targets"]:
-            raise SystemExit(f"unknown target '{name}'; have {list(manifest['targets'])}")
+        if name not in known:
+            raise SystemExit(f"unknown target '{name}'; have {sorted(known)}")
         store = None
         if args.store_prefix:
             store = f"{args.store_prefix.rstrip('/')}/{name}.zarr"
