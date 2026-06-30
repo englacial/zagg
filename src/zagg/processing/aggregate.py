@@ -26,16 +26,23 @@ logger = logging.getLogger(__name__)
 
 
 def _rss_mb() -> float:
-    """Current process RSS in MB (Linux ``/proc``; peak ``rusage`` fallback)."""
+    """Best-effort process RSS in MB; never raises (diagnostic-only).
+
+    Linux current RSS via ``/proc``; peak ``rusage`` fallback elsewhere; ``0.0`` if
+    neither is available (e.g. Windows has no ``/proc`` and may lack ``resource``).
+    """
     try:
         with open("/proc/self/statm") as f:
             return int(f.read().split()[1]) * os.sysconf("SC_PAGE_SIZE") / 1e6
     except (FileNotFoundError, OSError, ValueError):
-        import resource
-        import sys
+        try:
+            import resource
+            import sys
 
-        m = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
-        return m / 1e6 if sys.platform == "darwin" else m / 1024  # mac=bytes, linux=KB
+            m = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
+            return m / 1e6 if sys.platform == "darwin" else m / 1024  # mac=bytes, linux=KB
+        except Exception:
+            return 0.0
 
 
 def _rss_log(stage: str) -> None:
@@ -163,12 +170,13 @@ def _concat_and_group(all_reads, grid, handoff: str):
         # each column's per-read chunks into a fresh contiguous numpy array.
         cols = {n: table.column(n).combine_chunks().to_numpy() for n in table.column_names}
         _rss_log("arrow: after combine_chunks->numpy")
-        # The pooled data now lives in ``cols`` (numpy). Release EVERY Arrow buffer
+        # The pooled data now lives in ``cols`` (independent numpy copies that
+        # ``combine_chunks().to_numpy()`` owns). Release the read-stage Arrow buffers
         # before grouping -- the chunked ``table``, its ``batches``, and the per-read
-        # tables in ``all_reads`` (all zero-copy views onto the source read buffers).
-        # Without this the worker holds the pooled data twice through ``_group_columns``,
-        # which doubled peak RSS and OOM'd the densest shard at the 2 GB Lambda cap
-        # (issue #130). ``all_reads`` is not used after this call (worker.py).
+        # tables in ``all_reads`` -- so the worker doesn't hold the pooled data twice
+        # through ``_group_columns``. Without this the peak RSS doubled and OOM'd the
+        # densest shard at the 2 GB Lambda cap (issue #130). ``all_reads`` is unused
+        # after this call (worker.py).
         del table, batches
         all_reads.clear()
         _rss_log("arrow: after free Arrow buffers")
