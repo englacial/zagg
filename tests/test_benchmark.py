@@ -1023,3 +1023,133 @@ def test_make_figure_drops_failed_run_zeros(tmp_path, monkeypatch):
     ]
     assert fails, "expected an 'x' failure marker at the zero point"
     assert fails[0].get_offsets()[0][0] == 1  # the failed merge's x position
+
+
+# --- forward sharded-vs-inner renderer (issue #133) -----------------------
+
+
+def _codec_row(commit, order, codec, **kw):
+    # A forward-matrix merge row: tdigest/healpix, carrying grid_size + codec so
+    # the renderer slots it into the fixed 2x3 (order x sharded/inner) grid.
+    r = _rec_row(commit, f"tdigest_healpix_{order}_{codec}", agg="tdigest", grid="healpix", **kw)
+    r["grid_size"] = order
+    r["codec"] = codec
+    return r
+
+
+def _full_codec_matrix(commit):
+    return [
+        _codec_row(commit, order, codec)
+        for order in ("o9", "o10", "o11")
+        for codec in ("sharded", "inner")
+    ]
+
+
+def test_codec_layout_is_fixed_2x3_sharded_inner_by_order():
+    import plot_series
+
+    hist = update_series.records_to_frame(_full_codec_matrix("c0"))
+    grid, nrows, ncols = plot_series._codec_layout(hist)
+    assert (nrows, ncols) == (3, 2)  # rows o9->o11, cols sharded/inner
+    assert grid == [
+        ["tdigest_healpix_o9_sharded", "tdigest_healpix_o9_inner"],
+        ["tdigest_healpix_o10_sharded", "tdigest_healpix_o10_inner"],
+        ["tdigest_healpix_o11_sharded", "tdigest_healpix_o11_inner"],
+    ]
+
+
+def test_codec_layout_blanks_missing_order():
+    # o9 not yet landed (its shard map is blocked) -> its row is two blank cells,
+    # the grid is still a fixed 2x3 so the matrix shape is stable.
+    import plot_series
+
+    rows = [_codec_row("c0", o, c) for o in ("o10", "o11") for c in ("sharded", "inner")]
+    grid, nrows, ncols = plot_series._codec_layout(update_series.records_to_frame(rows))
+    assert (nrows, ncols) == (3, 2)
+    assert grid[0] == [None, None]  # o9 row blank
+    assert grid[1] == ["tdigest_healpix_o10_sharded", "tdigest_healpix_o10_inner"]
+
+
+def test_codec_and_frozen_histories_split_on_codec():
+    import plot_series
+
+    rows = _full_codec_matrix("c0") + [
+        _rec_row("c0", "gain_bias_rect_3km", agg="gain_bias", grid="rectilinear")
+    ]
+    df = update_series.records_to_frame(rows)
+    codec = plot_series._codec_history(df)
+    frozen = plot_series._frozen_history(df)
+    assert set(codec["target"]) == {r["target"] for r in _full_codec_matrix("c0")}
+    assert set(frozen["target"]) == {"gain_bias_rect_3km"}
+
+
+def test_make_codec_figure_renders_only_codec_rows(tmp_path, monkeypatch):
+    pytest.importorskip("matplotlib")
+    import matplotlib
+
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+    import plot_series
+
+    captured = {}
+    monkeypatch.setattr(plt, "close", lambda fig: captured.setdefault("fig", fig))
+
+    # Full 2x3 codec matrix + a frozen row that must NOT appear in the codec figure.
+    rows = _full_codec_matrix("c0") + [
+        _rec_row("c0", "gain_bias_rect_3km", agg="gain_bias", grid="rectilinear")
+    ]
+    series = tmp_path / "series.parquet"
+    update_series.save_series(update_series.records_to_frame(rows), series)
+    out = tmp_path / "codec.png"
+    assert plot_series.make_codec_figure(
+        update_series.load_series(series), "cost_per_shard_usd", "cost", out
+    )
+    assert out.exists()
+    titles = {ax.get_title() for ax in captured["fig"].axes if ax.get_title()}
+    assert titles == {r["target"] for r in _full_codec_matrix("c0")}
+    assert "gain_bias_rect_3km" not in titles
+
+
+def test_make_figure_frozen_ignores_codec_rows(tmp_path):
+    # The frozen figure renders nothing from a series that is all codec rows.
+    pytest.importorskip("matplotlib")
+    import plot_series
+
+    df = update_series.records_to_frame(_full_codec_matrix("c0"))
+    out = tmp_path / "frozen.png"
+    assert plot_series.make_figure(df, "cost_per_shard_usd", "cost", out) is False
+    assert not out.exists()
+
+
+def test_make_codec_latest_table_renders_codec_rows(tmp_path):
+    pytest.importorskip("matplotlib")
+    import plot_series
+
+    df = update_series.records_to_frame(_full_codec_matrix("c0"))
+    out = tmp_path / "codec_table.png"
+    assert plot_series.make_codec_latest_table(df, out) is True
+    assert out.exists()
+    # No codec rows -> nothing rendered.
+    frozen_only = update_series.records_to_frame([_rec_row("c0", "gain_bias_rect_3km")])
+    assert plot_series.make_codec_latest_table(frozen_only, tmp_path / "x.png") is False
+
+
+def test_plot_main_emits_codec_artifacts_above_frozen(tmp_path):
+    pytest.importorskip("matplotlib")
+    import plot_series
+
+    rows = _full_codec_matrix("c0") + [
+        _rec_row("c0", "gain_bias_rect_3km", agg="gain_bias", grid="rectilinear")
+    ]
+    series = tmp_path / "series.parquet"
+    update_series.save_series(update_series.records_to_frame(rows), series)
+    outdir = tmp_path / "site"
+    plot_series.main(["--series", str(series), "--out", str(outdir)])
+    # Forward codec figures + table land beside the frozen ones.
+    assert (outdir / "cost_per_shard_codec.png").exists()
+    assert (outdir / "codec_table.png").exists()
+    assert (outdir / "cost_per_shard.png").exists()  # the frozen rect row still renders
+    html = (outdir / "index.html").read_text()
+    # The forward (sharded-vs-inner) section is rendered ABOVE the frozen one.
+    assert "Sharded vs inner-chunk" in html and "Frozen historical" in html
+    assert html.index("Sharded vs inner-chunk") < html.index("Frozen historical")

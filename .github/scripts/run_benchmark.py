@@ -14,7 +14,7 @@ to already be deployed -- it never stands up or mutates infrastructure.
 Usage::
 
     python run_benchmark.py --targets tests/data/benchmark/targets.json \\
-        --target gain_bias_healpix_o11 --target tdigest_healpix_o11 \\
+        --target tdigest_healpix_o11_sharded --target tdigest_healpix_o11_inner \\
         --store-prefix s3://my-bucket/zagg-bench \\
         --region us-west-2 --function-name process-shard \\
         --event pr --commit "$SHA" --ref "$REF" --pr-number 123 \\
