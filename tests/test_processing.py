@@ -335,6 +335,81 @@ class TestShardOrderObjectSplit:
         # (>1), but never more than one per dispatch shard's object count.
         assert 1 < n_split <= g_split.shard_objects_per_shard
 
+    @staticmethod
+    def _mixed_config():
+        """The default scalar config extended with a vector(trailing-dim), a
+        ``resolution: chunk`` companion, and a ragged/CSR field, so the split path is
+        exercised for every field kind — not just scalars — while keeping the default's
+        ``morton`` coordinate + scalar data vars."""
+        cfg = default_config()
+        agg = cfg.aggregation
+        agg.setdefault("chunk_precompute", {})["chunk_base"] = {
+            "expression": "np.float32(np.mean(h_li))",
+            "source": "h_li",
+        }
+        # vector trailing-dim — dense AND sharded, so it rides the per-object slab.
+        agg["variables"]["h_edges"] = {
+            "expression": "np.array([np.min(h_li), np.max(h_li)])",
+            "source": "h_li",
+            "kind": "vector",
+            "trailing_shape": 2,
+            "dtype": "float32",
+        }
+        # resolution: chunk companion — dense, one block per chunk (unsharded).
+        agg["variables"]["h_chunk_base"] = {
+            "expression": "chunk_base",
+            "resolution": "chunk",
+            "dtype": "float32",
+        }
+        # per-cell ragged/CSR — written per inner chunk (unsharded).
+        agg["variables"]["h_ragged"] = {
+            "function": "np.sort",
+            "source": "h_li",
+            "kind": "ragged",
+            "inner_shape": [1],
+            "dtype": "float32",
+        }
+        return cfg
+
+    def test_split_reconstructs_vector_companion_and_ragged(self, monkeypatch):
+        """The split path reconstructs the SAME store for a config carrying every
+        field kind — a vector (trailing-dim, dense+sharded), a ``resolution: chunk``
+        companion, and a ragged/CSR field — not just scalars. Dense arrays match
+        value-for-value; the per-chunk companion + CSR keys match byte-for-byte
+        (those are written per inner chunk, independent of ``shard_order``)."""
+        cfg = self._mixed_config()
+        shard_key = self._shard_key()
+        g_default = self._grid(cfg, shard_order=None)
+        g_split = self._grid(cfg, shard_order=5)
+        assert g_split.shard_objects_per_shard == 4
+
+        df = self._df(g_default, shard_key)
+        s_default = self._run(g_default, shard_key, df, monkeypatch)
+        s_split = self._run(g_split, shard_key, df.copy(), monkeypatch)
+
+        # Every dense array (scalar h_mean, vector h_edges, chunk companion
+        # h_chunk_base) reconstructs value-for-value across the split.
+        grp_d = open_group(store=s_default, mode="r", path=str(self.CHILD))
+        grp_s = open_group(store=s_split, mode="r", path=str(self.CHILD))
+        assert set(grp_d.array_keys()) == set(grp_s.array_keys())
+        assert {"h_mean", "h_edges", "h_chunk_base"} <= set(grp_d.array_keys())
+        for name in grp_d.array_keys():
+            np.testing.assert_array_equal(
+                np.nan_to_num(grp_d[name][:], nan=-12345.0),
+                np.nan_to_num(grp_s[name][:], nan=-12345.0),
+                err_msg=f"split vs single-object differ in {name}",
+            )
+
+        # The ragged/CSR field is written per inner chunk, so its store keys are
+        # byte-for-byte identical regardless of the sharding-object split.
+        ragged_keys = [k for k in s_default._store_dict if "/h_ragged/" in k]
+        assert ragged_keys, "ragged field produced no CSR keys"
+        for k in ragged_keys:
+            assert k in s_split._store_dict, f"ragged key {k} missing under split"
+            assert s_default._store_dict[k].to_bytes() == s_split._store_dict[k].to_bytes(), (
+                f"ragged CSR bytes differ at {k}"
+            )
+
     def test_invalid_shard_order_rejected(self):
         cfg = default_config()
         # <= parent_order (other than the default) is rejected.
