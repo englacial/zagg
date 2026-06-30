@@ -61,7 +61,7 @@ from zarr import open_group
 from zarr.errors import GroupNotFoundError
 
 # Import cloud-agnostic processing
-from zagg.config import load_config_from_dict
+from zagg.config import get_handoff, load_config_from_dict
 from zagg.processing import (
     write_dataframe_to_zarr,
     write_ragged_to_zarr,
@@ -274,10 +274,14 @@ def _handle_process(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
         # read/index/aggregate deltas; the write phase runs in the callback below and
         # is accumulated into the same sub-dict. Default (no key) leaves it unchanged.
         profile = event.get("profile", False)
-        # Per-cell carrier (issue #130). Absent key -> "pandas", the byte-identical
-        # default worker path; "arrow" opts into the arro3-core read carrier for
-        # benchmarks. (Neither imports pyarrow; pyarrow is not in the layer.)
-        handoff = event.get("handoff", "pandas")
+        # Per-cell carrier (issues #130/#132). Wire protocol (A): the orchestrator
+        # injects the ``handoff`` event key only for an explicit non-default
+        # override, so an absent key means "derive from the forwarded config" via
+        # ``get_handoff(config)`` (``aggregation.handoff``, default ``"arrow"``).
+        # This keeps existing event payloads byte-identical while making the config
+        # the single source of truth. (Neither carrier imports pyarrow; pyarrow is
+        # not in the layer.)
+        handoff = event.get("handoff") or get_handoff(config)
         sharded = getattr(grid, "sharded", False)
         store_path = event["store_path"]
         shard_key = event["shard_key"]

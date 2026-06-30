@@ -1344,6 +1344,22 @@ class TestProfilePlumbing:
         )
         assert captured["handoff"] == "arrow"
 
+    def test_agg_reads_handoff_from_config_on_local(self, monkeypatch, atl06_config):
+        # issue #132: the config-derived carrier reaches the local backend too
+        # (resolution is backend-agnostic, before the local/lambda split).
+        from zagg import runner
+
+        atl06_config.aggregation["handoff"] = "pandas"
+        captured = {}
+        monkeypatch.setattr(runner, "_load_catalog", lambda p: _run_catalog())
+        monkeypatch.setattr(
+            runner,
+            "_run_local",
+            lambda *a, **k: captured.update(handoff=k.get("handoff")) or {},
+        )
+        runner.agg(atl06_config, catalog="ignored", store="./out.zarr", backend="local")
+        assert captured["handoff"] == "pandas"
+
 
 class TestWorkerPhaseTimings:
     """``process_shard(profile=...)`` emits ``phase_timings`` only when set, and
