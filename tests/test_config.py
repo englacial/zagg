@@ -1126,7 +1126,7 @@ class TestHandoff:
         validate_config(_cfg_with_handoff())  # should not raise
 
     def test_invalid_handoff_rejected_at_load(self):
-        with pytest.raises(ValueError, match="aggregation.handoff must be 'pandas' or 'arrow'"):
+        with pytest.raises(ValueError, match=r"aggregation\.handoff must be 'pandas' or 'arrow'"):
             validate_config(_cfg_with_handoff("bogus"))
 
 
