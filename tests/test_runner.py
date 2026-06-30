@@ -963,6 +963,33 @@ def _synthetic_events():
     return events
 
 
+def _patch_tabular_s3(monkeypatch):
+    """Stub ``obstore`` + ``S3Store`` for an in-memory tabular put (no live S3).
+
+    ``write_tabular`` imports both lazily from the real ``obstore`` package, so
+    patch them at their source. Records the bucket the ``S3Store`` was opened
+    for and the ``(key, payload)`` of the single put into ``captured``. Mirrors
+    the existing mocked-AWS test style.
+    """
+    import obstore
+    import obstore.store
+
+    captured: dict = {}
+
+    def _fake_s3store(bucket, **opts):
+        captured["bucket"] = bucket
+        captured["opts"] = opts
+        return object()
+
+    def _fake_put(store, key, payload):
+        captured["key"] = key
+        captured["payload"] = payload
+
+    monkeypatch.setattr(obstore.store, "S3Store", _fake_s3store)
+    monkeypatch.setattr(obstore, "put", _fake_put)
+    return captured
+
+
 class TestStrategyDispatch:
     def test_spatial_uses_spatial_strategy(self, atl06_config):
         from zagg.runner import SpatialStrategy, _get_strategy
@@ -1105,11 +1132,18 @@ class TestTemporalStrategy:
         assert summary["output_path"] is None
         assert len(summary["results"]) == 2
 
-    def test_s3_tabular_store_rejected_until_phase7(self):
-        # Remote tabular output lands with the Phase-7 Lambda handler; a local
-        # write would mangle the s3:// URI, so it is rejected with a clear error.
+    def test_s3_tabular_store_puts_single_object(self, monkeypatch):
+        # Remote tabular output (issue #12, Phase 7b): an s3:// store serialises
+        # the single Parquet object and puts it via obstore -- the same S3 stack
+        # the Zarr store uses, no local-filesystem mangling of the URI.
+        import io
+
+        import pandas as pd
+
         from zagg.config import load_config_from_dict
         from zagg.runner import agg
+
+        captured = _patch_tabular_s3(monkeypatch)
 
         cfg = load_config_from_dict(
             {
@@ -1129,8 +1163,16 @@ class TestTemporalStrategy:
                 "output": {"format": "parquet", "store": "s3://bucket/events.parquet"},
             }
         )
-        with pytest.raises(ValueError, match="s3:// store is not supported"):
-            agg(cfg, events=_synthetic_events())
+        creds = {"accessKeyId": "a", "secretAccessKey": "s", "sessionToken": "t"}
+        summary = agg(cfg, events=_synthetic_events(), output_credentials=creds)
+        assert summary["output_path"] == "s3://bucket/events.parquet"
+        assert captured["bucket"] == "bucket"
+        assert captured["key"] == "events.parquet"
+        assert captured["opts"]["access_key_id"] == "a"
+        # the payload is real Parquet bytes (PAR1 magic) for the two events
+        assert captured["payload"][:4] == b"PAR1"
+        back = pd.read_parquet(io.BytesIO(captured["payload"])).set_index("event_key")
+        assert back.loc["storm1", "max_t2m"] == pytest.approx(5.0)
 
     def test_all_error_run_writes_no_file(self, tmp_path):
         # When no event produces a row, the (column-less) tabular write is skipped

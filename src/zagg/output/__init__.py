@@ -19,7 +19,7 @@ writer by output format rather than branching inline.
 """
 
 from .base import Writer, get_writer, output_format, register_writer
-from .tabular import TabularWriter
+from .tabular import TabularWriter, write_tabular
 from .zarr_grid import ZarrGridWriter
 
 __all__ = [
@@ -29,4 +29,5 @@ __all__ = [
     "get_writer",
     "output_format",
     "register_writer",
+    "write_tabular",
 ]

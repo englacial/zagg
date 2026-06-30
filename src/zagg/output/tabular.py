@@ -60,7 +60,7 @@ class TabularWriter:
         return pd.DataFrame.from_records(records)
 
     def write(self, rows, path, *, output_format: str | None = None):
-        """Serialise result rows to ``path`` as Parquet or CSV.
+        """Serialise result rows to a local ``path`` as Parquet or CSV.
 
         Parameters
         ----------
@@ -68,7 +68,8 @@ class TabularWriter:
             Result rows (the ``summary["results"]`` shape).
         path : str or Path
             Output file. The format is inferred from the extension unless
-            ``output_format`` is given.
+            ``output_format`` is given. For an ``s3://`` target use
+            :func:`write_tabular` instead.
         output_format : str, optional
             ``"parquet"`` (default when the extension is unknown) or ``"csv"``.
             Overrides the extension.
@@ -94,3 +95,118 @@ class TabularWriter:
         else:
             raise ValueError(f"unknown tabular output format {fmt!r} (expected 'parquet' or 'csv')")
         return path
+
+    def to_bytes(self, rows, *, output_format: str = "parquet") -> bytes:
+        """Serialise result rows to an in-memory Parquet/CSV byte buffer.
+
+        The byte-producing twin of :meth:`write`, used by the remote (S3) write
+        path so the same flattening logic feeds both local files and object
+        ``put``. ``output_format`` must be an explicit ``"parquet"`` or ``"csv"``
+        (there is no path suffix to infer from).
+        """
+        import io
+
+        frame = self.to_frame(rows)
+        buf = io.BytesIO()
+        if output_format == "parquet":
+            frame.to_parquet(buf, index=False)
+        elif output_format == "csv":
+            frame.to_csv(buf, index=False)
+        else:
+            raise ValueError(
+                f"unknown tabular output format {output_format!r} (expected 'parquet' or 'csv')"
+            )
+        return buf.getvalue()
+
+
+def _resolve_format(store_path: str, output_format: str | None) -> str:
+    """Pick the concrete ``parquet``/``csv`` serialisation for ``store_path``.
+
+    An explicit ``output_format`` wins; otherwise the file suffix decides, and
+    an unknown suffix falls back to ``parquet`` (the temporal default). The
+    generic ``tabular`` alias is treated as "infer from the suffix".
+    """
+    if output_format and output_format != "tabular":
+        return output_format
+    suffix = store_path.rsplit("/", 1)[-1].lower()
+    for ext, fmt in _EXT_FORMAT.items():
+        if suffix.endswith(ext):
+            return fmt
+    return "parquet"
+
+
+def write_tabular(
+    rows,
+    store_path,
+    *,
+    output_format: str | None = None,
+    credentials: dict | None = None,
+    endpoint_url: str | None = None,
+    region: str = "us-west-2",
+) -> str:
+    """Serialise temporal result rows to a local file or an ``s3://`` object.
+
+    The single tabular write entry point shared by the local runner and the
+    Lambda ``process_event`` handler (issue #12, Phase 7b). A local path routes
+    through :meth:`TabularWriter.write`; an ``s3://`` path serialises to bytes
+    and ``put``s the single object via ``obstore`` (the same S3 stack the Zarr
+    store uses -- no ``s3fs``/``fsspec``).
+
+    Parameters
+    ----------
+    rows : list of dict
+        Result rows (the ``summary["results"]`` shape).
+    store_path : str
+        Local path or ``s3://bucket/key.parquet``.
+    output_format : str, optional
+        ``"parquet"`` (default) or ``"csv"``; inferred from the suffix when
+        omitted. ``"tabular"`` is treated as "infer from the suffix".
+    credentials : dict, optional
+        Explicit S3 write credentials (camelCase ``accessKeyId`` /
+        ``secretAccessKey`` / optional ``sessionToken``); omit to use the
+        ambient chain (execution role). Ignored for local writes.
+    endpoint_url : str, optional
+        Custom S3-compatible endpoint. Ignored for local writes.
+    region : str
+        AWS region for the S3 ``put``. Default ``"us-west-2"``.
+
+    Returns
+    -------
+    str
+        The path/URI written.
+    """
+    writer = TabularWriter()
+    if not store_path.startswith("s3://"):
+        # Let the local writer infer parquet/csv from the suffix (None == infer);
+        # a concrete format name is passed through as the explicit serialisation.
+        local_fmt = None if (output_format in (None, "tabular")) else output_format
+        return str(writer.write(rows, store_path, output_format=local_fmt))
+
+    import obstore
+    from obstore.store import S3Store
+
+    from ..store import parse_s3_path
+
+    fmt = _resolve_format(store_path, output_format)
+    payload = writer.to_bytes(rows, output_format=fmt)
+    bucket, key = parse_s3_path(store_path)
+    if not key:
+        raise ValueError(f"s3 tabular output needs an object key, got bucket only: {store_path!r}")
+
+    opts: dict = {"region": region}
+    if credentials:
+        opts["access_key_id"] = credentials["accessKeyId"]
+        opts["secret_access_key"] = credentials["secretAccessKey"]
+        if credentials.get("sessionToken"):
+            opts["session_token"] = credentials["sessionToken"]
+    if endpoint_url:
+        opts["endpoint"] = endpoint_url
+        opts["virtual_hosted_style_request"] = False
+    if not credentials:
+        from obstore.auth.boto3 import Boto3CredentialProvider
+
+        opts["credential_provider"] = Boto3CredentialProvider()
+
+    store = S3Store(bucket, **opts)
+    obstore.put(store, key, payload)
+    return store_path

@@ -422,9 +422,7 @@ def process_event(
                     continue
 
                 var_t = loaded[spec["collection"]][spec["variable"]].sel(time=t)
-                # Single transform apply path: ``anomaly: true`` is desugared to
-                # ``transform: monthly_anomaly`` in ``specs_from_config``, so a
-                # spec can never double-apply the climatology subtraction.
+                # Single transform apply path (``anomaly: true`` desugars here).
                 if spec.get("transform"):
                     var_t = plugins.get_field_transform(spec["transform"])(var_t, static_sub, spec)
                 if spec.get("negate"):
@@ -495,3 +493,93 @@ def specs_from_config(config):
             }
         )
     return specs
+
+
+# ---------------------------------------------------------------------------
+# Temporal reader (load collections + static_data from S3 / local)
+# ---------------------------------------------------------------------------
+
+
+def open_dataset(uri, *, credentials=None, endpoint_url=None, region="us-west-2"):
+    """Open a single xarray ``Dataset`` from a local path or ``s3://`` URI.
+
+    A ``.zarr`` URI opens through :func:`zagg.store.open_store` (the obstore S3
+    stack the rest of zagg uses); any other suffix (NetCDF/HDF5) is fetched as
+    bytes and opened in-memory, so the reader needs no ``s3fs``/``fsspec`` on the
+    Lambda worker. ``credentials``/``endpoint_url`` are the camelCase write/read
+    creds used elsewhere; omit to use the ambient chain (execution role).
+    """
+    import xarray as xr
+
+    if uri.endswith(".zarr"):
+        from .store import open_store
+
+        store = open_store(
+            uri, read_only=True, credentials=credentials, endpoint_url=endpoint_url, region=region
+        )
+        return xr.open_zarr(store)
+
+    if not uri.startswith("s3://"):
+        return xr.open_dataset(uri)
+
+    import io
+
+    import obstore
+    from obstore.store import S3Store
+
+    from .store import parse_s3_path
+
+    bucket, key = parse_s3_path(uri)
+    opts: dict = {"region": region}
+    if credentials:
+        opts["access_key_id"] = credentials["accessKeyId"]
+        opts["secret_access_key"] = credentials["secretAccessKey"]
+        if credentials.get("sessionToken"):
+            opts["session_token"] = credentials["sessionToken"]
+    if endpoint_url:
+        opts["endpoint"] = endpoint_url
+        opts["virtual_hosted_style_request"] = False
+    if not credentials:
+        from obstore.auth.boto3 import Boto3CredentialProvider
+
+        opts["credential_provider"] = Boto3CredentialProvider()
+    store = S3Store(bucket, **opts)
+    payload = obstore.get(store, key).bytes()
+    return xr.open_dataset(io.BytesIO(bytes(payload)))
+
+
+def read_temporal_inputs(
+    collection_uris, static_uris, *, credentials=None, endpoint_url=None, region="us-west-2"
+):
+    """Load the ``collections`` and ``static_data`` :func:`process_event` needs.
+
+    The reader half of the Lambda ``process_event`` mode (issue #12, Phase 7b),
+    mirroring what the local ``TemporalStrategy`` receives ready-made: each maps
+    a name to a dataset/array opened from S3 (or local). Collections stay full
+    ``Dataset``s; static entries are returned as single ``DataArray``s when the
+    file holds exactly one variable (the mask/anomaly providers index a single
+    field), else as the ``Dataset``.
+
+    Parameters
+    ----------
+    collection_uris : dict[str, str]
+        ``{collection_name: uri}`` for each collection the specs read.
+    static_uris : dict[str, str]
+        ``{static_name: uri}`` for e.g. ``ais_mask`` / ``climatology`` /
+        ``cell_areas``.
+    credentials, endpoint_url, region
+        Forwarded to :func:`open_dataset`.
+
+    Returns
+    -------
+    tuple[dict, dict]
+        ``(collections, static_data)`` ready for :func:`process_event`.
+    """
+    kw = {"credentials": credentials, "endpoint_url": endpoint_url, "region": region}
+    collections = {name: open_dataset(uri, **kw) for name, uri in collection_uris.items()}
+    static_data = {}
+    for name, uri in static_uris.items():
+        ds = open_dataset(uri, **kw)
+        data_vars = list(ds.data_vars)
+        static_data[name] = ds[data_vars[0]] if len(data_vars) == 1 else ds
+    return collections, static_data

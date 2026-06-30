@@ -226,3 +226,78 @@ class TestTabularWriterSerialise:
     def test_bad_format_raises(self, tmp_path):
         with pytest.raises(ValueError, match="unknown tabular output format"):
             TabularWriter().write(_result_rows(), tmp_path / "x", output_format="xml")
+
+
+class TestTabularWriterToBytes:
+    def test_parquet_bytes_round_trip(self):
+        import io
+
+        payload = TabularWriter().to_bytes(_result_rows(), output_format="parquet")
+        assert payload[:4] == b"PAR1"
+        back = pd.read_parquet(io.BytesIO(payload)).set_index("event_key")
+        assert back.loc["storm1", "max_t2m"] == pytest.approx(5.0)
+
+    def test_csv_bytes_round_trip(self):
+        payload = TabularWriter().to_bytes(_result_rows(), output_format="csv")
+        assert b"event_key" in payload
+
+    def test_bad_format_raises(self):
+        with pytest.raises(ValueError, match="unknown tabular output format"):
+            TabularWriter().to_bytes(_result_rows(), output_format="xml")
+
+
+class TestWriteTabular:
+    def test_local_path_round_trip(self, tmp_path):
+        from zagg.output import write_tabular
+
+        path = tmp_path / "events.parquet"
+        out = write_tabular(_result_rows(), str(path))
+        assert out == str(path)
+        back = pd.read_parquet(path).set_index("event_key")
+        assert back.loc["storm2", "max_t2m"] == pytest.approx(9.0)
+
+    def test_local_tabular_alias_infers_from_suffix(self, tmp_path):
+        # output_format="tabular" is the generic alias -> infer csv from .csv suffix.
+        from zagg.output import write_tabular
+
+        path = tmp_path / "events.csv"
+        write_tabular(_result_rows(), str(path), output_format="tabular")
+        back = pd.read_csv(path)
+        assert list(back["event_key"]) == ["storm1", "storm2"]
+
+    def test_s3_path_puts_single_object(self, monkeypatch):
+        import io
+
+        import obstore
+        import obstore.store
+
+        from zagg.output import write_tabular
+
+        captured = {}
+
+        def _fake_s3store(bucket, **opts):
+            captured["bucket"] = bucket
+            captured["opts"] = opts
+            return object()
+
+        def _fake_put(store, key, payload):
+            captured["key"] = key
+            captured["payload"] = payload
+
+        monkeypatch.setattr(obstore.store, "S3Store", _fake_s3store)
+        monkeypatch.setattr(obstore, "put", _fake_put)
+
+        creds = {"accessKeyId": "a", "secretAccessKey": "s", "sessionToken": "t"}
+        out = write_tabular(_result_rows(), "s3://bucket/dir/events.parquet", credentials=creds)
+        assert out == "s3://bucket/dir/events.parquet"
+        assert captured["bucket"] == "bucket"
+        assert captured["key"] == "dir/events.parquet"
+        assert captured["opts"]["access_key_id"] == "a"
+        back = pd.read_parquet(io.BytesIO(captured["payload"])).set_index("event_key")
+        assert back.loc["storm1", "max_t2m"] == pytest.approx(5.0)
+
+    def test_s3_path_without_key_raises(self):
+        from zagg.output import write_tabular
+
+        with pytest.raises(ValueError, match="object key"):
+            write_tabular(_result_rows(), "s3://bucket")

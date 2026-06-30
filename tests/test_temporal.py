@@ -291,6 +291,35 @@ class TestSpecsFromConfig:
         assert spec["transform"] == "monthly_anomaly"
         assert "is_anomaly" not in spec
 
+    def test_explicit_transform_wins_over_anomaly_sugar(self):
+        # `anomaly: true` is only sugar for the *default* transform: an explicit
+        # `transform` naming a different field-transform takes precedence (the
+        # anomaly flag is dropped, not applied on top -- no double transform).
+        from zagg.config import load_config_from_dict
+
+        config = load_config_from_dict(
+            {
+                "pipeline": {"type": "temporal"},
+                "data_source": {"reader": "xarray_s3", "collections": ["merra2"]},
+                "aggregation": {
+                    "variables": {
+                        "v": {
+                            "variable": "TQV",
+                            "collection": "merra2",
+                            "spatial_func": "weighted_mean",
+                            "temporal_reducer": "weighted_mean",
+                            "mask": "full",
+                            "anomaly": True,
+                            "transform": "detrend",
+                        }
+                    }
+                },
+                "output": {"format": "tabular", "store": "."},
+            }
+        )
+        (spec,) = specs_from_config(config)
+        assert spec["transform"] == "detrend"
+
 
 # ---------------------------------------------------------------------------
 # Spatial functions with synthetic xarray data
@@ -575,3 +604,74 @@ class TestSpatialFunctionEdges:
         # Only the two 0.5 cells (10, 40) are selected; unscaled values used.
         assert spatial_max(var, mask, None) == pytest.approx(40.0)
         assert spatial_min(var, mask, None) == pytest.approx(10.0)
+
+
+# ---------------------------------------------------------------------------
+# Temporal reader (issue #12, Phase 7b)
+# ---------------------------------------------------------------------------
+
+
+class TestTemporalReader:
+    def test_open_dataset_local_zarr(self, tmp_path):
+        xr = pytest.importorskip("xarray")
+        from zagg.temporal import open_dataset
+
+        ds = xr.Dataset(
+            {"m": (("lat", "lon"), np.ones((2, 2)))}, coords={"lat": [0, 1], "lon": [0, 1]}
+        )
+        path = tmp_path / "x.zarr"
+        ds.to_zarr(path)
+        back = open_dataset(str(path))
+        assert list(back.data_vars) == ["m"]
+
+    def test_open_dataset_s3_netcdf_fetches_bytes(self, monkeypatch):
+        # The s3:// non-zarr branch fetches object bytes and opens in-memory;
+        # stub obstore + S3Store + xr.open_dataset so no live S3 / file backend.
+        xr = pytest.importorskip("xarray")
+        import obstore
+        import obstore.store
+
+        from zagg.temporal import open_dataset
+
+        captured = {}
+        sentinel = xr.Dataset({"ais_mask": (("lat",), np.ones(2))}, coords={"lat": [0, 1]})
+
+        monkeypatch.setattr(
+            obstore.store, "S3Store", lambda bucket, **o: captured.setdefault("bucket", bucket)
+        )
+
+        class _Bytes:
+            @staticmethod
+            def bytes():
+                return b"NETCDFBYTES"
+
+        monkeypatch.setattr(obstore, "get", lambda store, key: captured.update(key=key) or _Bytes())
+        monkeypatch.setattr(
+            xr, "open_dataset", lambda buf: captured.update(opened=True) or sentinel
+        )
+
+        creds = {"accessKeyId": "a", "secretAccessKey": "s", "sessionToken": "t"}
+        out = open_dataset("s3://bucket/static/ais_mask.nc", credentials=creds)
+        assert captured["bucket"] == "bucket"
+        assert captured["key"] == "static/ais_mask.nc"
+        assert captured["opened"] is True
+        assert list(out.data_vars) == ["ais_mask"]
+
+    def test_read_temporal_inputs_squeezes_single_var_static(self, monkeypatch):
+        xr = pytest.importorskip("xarray")
+        import zagg.temporal as temporal
+        from zagg.temporal import read_temporal_inputs
+
+        coll = xr.Dataset({"T2M": (("lat",), np.ones(2))}, coords={"lat": [0, 1]})
+        # single-variable static file -> returned as a DataArray, not a Dataset
+        areas = xr.Dataset({"cell_areas": (("lat",), np.ones(2))}, coords={"lat": [0, 1]})
+
+        def _fake_open(uri, **k):
+            return coll if uri.endswith("merra2.zarr") else areas
+
+        monkeypatch.setattr(temporal, "open_dataset", _fake_open)
+        collections, static = read_temporal_inputs(
+            {"merra2": "s3://b/merra2.zarr"}, {"cell_areas": "s3://b/areas.nc"}
+        )
+        assert list(collections) == ["merra2"]
+        assert isinstance(static["cell_areas"], xr.DataArray)

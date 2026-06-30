@@ -432,9 +432,16 @@ class TemporalStrategy:
         # registry; the tabular writer serialises the rows to ``store_path``. A
         # store that is a bare directory (the default) or has no rows leaves the
         # results in-memory only -- the writer is not invoked. ``s3://`` targets
-        # land with the Phase-7 Lambda handler, so they are rejected here rather
-        # than silently mangled by a local-filesystem write.
-        output_path = _write_tabular_output(config, store_path, report.results)
+        # serialise the single Parquet/CSV object via obstore (issue #12, Phase
+        # 7b), the same S3 stack the Zarr store uses.
+        output_path = _write_tabular_output(
+            config,
+            store_path,
+            report.results,
+            credentials=output_credentials,
+            endpoint_url=output_endpoint_url,
+            region=region,
+        )
 
         summary = {
             "total_events": len(event_list),
@@ -479,22 +486,25 @@ def _get_strategy(pipeline_type: str):
 _TABULAR_SUFFIXES = (".parquet", ".pq", ".csv")
 
 
-def _write_tabular_output(config, store_path, rows):
-    """Persist temporal event rows via the config-selected output writer.
+def _write_tabular_output(
+    config,
+    store_path,
+    rows,
+    *,
+    credentials=None,
+    endpoint_url=None,
+    region="us-west-2",
+):
+    """Persist temporal event rows to the config-selected tabular store.
 
-    Resolves the writer from ``output.format`` through
-    :func:`zagg.output.get_writer` (so the registry seam is the real dispatch
-    path, not just a path-suffix sniff). Returns the written path, or ``None``
-    when nothing is written -- a directory/empty store, a ``zarr`` format (which
-    is gridded, not tabular), or an empty result set.
-
-    Raises
-    ------
-    ValueError
-        For an ``s3://`` store: remote tabular output lands with the Phase-7
-        Lambda handler; writing it locally would mangle the URI.
+    Resolves the serialisation from ``output.format`` and routes through
+    :func:`zagg.output.write_tabular`, which writes a local file or ``put``s a
+    single ``s3://`` object via obstore (issue #12, Phase 7b). Returns the
+    written path/URI, or ``None`` when nothing is written -- a directory/empty
+    store, a ``zarr`` format (which is gridded, not tabular), or an empty result
+    set.
     """
-    from zagg.output import get_writer, output_format
+    from zagg.output import output_format, write_tabular
 
     fmt = output_format(config)
     if fmt == "zarr":
@@ -503,18 +513,16 @@ def _write_tabular_output(config, store_path, rows):
         return None
     if not store_path or not store_path.lower().endswith(_TABULAR_SUFFIXES):
         return None  # a bare directory (or unset) store -- nothing to serialise to
-    if store_path.startswith("s3://"):
-        raise ValueError(
-            f"tabular output to an s3:// store is not supported yet (got {store_path!r}); "
-            "the Lambda handler that writes remote tabular output lands in Phase 7"
-        )
     if not rows:
         return None  # no events produced data -- skip the (column-less) write
-    writer = get_writer(fmt)
-    # ``tabular`` is the generic alias -- let the file suffix pick parquet/csv;
-    # a concrete format name is passed through as the explicit serialisation.
-    serialisation = None if fmt == "tabular" else fmt
-    return str(writer.write(rows, store_path, output_format=serialisation))
+    return write_tabular(
+        rows,
+        store_path,
+        output_format=fmt,
+        credentials=credentials,
+        endpoint_url=endpoint_url,
+        region=region,
+    )
 
 
 def _load_catalog(catalog_path: str) -> dict:

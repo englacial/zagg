@@ -603,3 +603,133 @@ class TestSetupTemplate:
         n_chunks = self._template_chunk_count(store, worker_grid)
         assert (n_chunks,) == worker_grid.chunk_grid_shape
         assert n_chunks == 5
+
+
+def _temporal_config_dict():
+    return {
+        "pipeline": {"type": "temporal"},
+        "data_source": {"reader": "xarray_s3", "collections": ["merra2"]},
+        "aggregation": {
+            "variables": {
+                "max_t2m": {
+                    "variable": "T2M",
+                    "collection": "merra2",
+                    "spatial_func": "max",
+                    "temporal_reducer": "max",
+                    "mask": "full",
+                }
+            }
+        },
+        "output": {"format": "parquet", "store": "s3://out/events.parquet"},
+    }
+
+
+def _temporal_inputs():
+    """One synthetic event mask + merra2 collection + cell_areas (max-T2M=5)."""
+    xr = pytest.importorskip("xarray")
+    import numpy as np
+
+    lat = np.array([-70.0, -69.5])
+    lon = np.array([0.0, 0.5])
+    time = np.array(["2020-01-01T00", "2020-01-01T03"], dtype="datetime64[ns]")
+    coords = {"time": time, "lat": lat, "lon": lon}
+    event_mask = xr.DataArray(np.ones((2, 2, 2)), dims=["time", "lat", "lon"], coords=coords)
+    temp = xr.DataArray(
+        np.stack([np.full((2, 2), 1.0), np.full((2, 2), 5.0)]),
+        dims=["time", "lat", "lon"],
+        coords=coords,
+    )
+    collections = {"merra2": xr.Dataset({"T2M": temp})}
+    areas = xr.DataArray(np.ones((2, 2)), dims=["lat", "lon"], coords={"lat": lat, "lon": lon})
+    return event_mask, collections, {"cell_areas": areas}
+
+
+def _temporal_event(**extra):
+    return {
+        "mode": "process_event",
+        "event_key": "storm1",
+        "event_mask_uri": "s3://b/mask.nc",
+        "collection_uris": {"merra2": "s3://b/merra2.zarr"},
+        "static_uris": {"cell_areas": "s3://b/areas.nc"},
+        "store_path": "s3://out/events.parquet",
+        "config": _temporal_config_dict(),
+        "s3_credentials": _CREDS,
+        **extra,
+    }
+
+
+class TestProcessEventModeGate:
+    def test_missing_event_key_rejected(self, handler_mod):
+        event = _temporal_event()
+        del event["event_key"]
+        resp = handler_mod._handle_process_event(event)
+        assert resp["statusCode"] == 400
+        assert "event_key" in json.loads(resp["body"])["error"]
+
+    def test_missing_store_path_rejected(self, handler_mod):
+        event = _temporal_event()
+        del event["store_path"]
+        resp = handler_mod._handle_process_event(event)
+        assert resp["statusCode"] == 400
+        assert "store_path" in json.loads(resp["body"])["error"]
+
+
+class TestProcessEventMode:
+    def _patch(self, handler_mod, monkeypatch):
+        """Stub the S3 readers + tabular writer; run the real process_event."""
+        import zagg.output as output
+        import zagg.temporal as temporal
+
+        event_mask, collections, static = _temporal_inputs()
+        captured = {}
+
+        monkeypatch.setattr(temporal, "open_dataset", lambda uri, **k: event_mask)
+        monkeypatch.setattr(temporal, "read_temporal_inputs", lambda *a, **k: (collections, static))
+
+        def _fake_write_tabular(rows, store_path, **kwargs):
+            captured["rows"] = rows
+            captured["store_path"] = store_path
+            captured["kwargs"] = kwargs
+            return store_path
+
+        monkeypatch.setattr(output, "write_tabular", _fake_write_tabular)
+        return captured
+
+    def test_dispatch_runs_process_event_and_writes_row(self, handler_mod, monkeypatch):
+        captured = self._patch(handler_mod, monkeypatch)
+        resp = handler_mod._handle_process_event(_temporal_event())
+        body = json.loads(resp["body"])
+        assert resp["statusCode"] == 200, body
+        assert body["event_key"] == "storm1"
+        assert body["timesteps_processed"] == 2
+        assert body["output_path"] == "s3://out/events.parquet"
+        # one flattened row carrying the event_key + max-T2M result
+        (row,) = captured["rows"]
+        assert row["event_key"] == "storm1"
+        assert row["results"]["max_t2m"] == pytest.approx(5.0)
+
+    def test_lambda_handler_routes_process_event_mode(self, handler_mod, monkeypatch):
+        # the top-level dispatcher routes mode="process_event" here.
+        self._patch(handler_mod, monkeypatch)
+        resp = handler_mod.lambda_handler(_temporal_event(), _context())
+        assert resp["statusCode"] == 200, json.loads(resp["body"])
+
+    def test_output_credentials_forwarded_to_writer(self, handler_mod, monkeypatch):
+        captured = self._patch(handler_mod, monkeypatch)
+        out_creds = {"accessKeyId": "w", "secretAccessKey": "x", "region": "eu-west-1"}
+        handler_mod._handle_process_event(_temporal_event(output_credentials=out_creds))
+        assert captured["kwargs"]["credentials"] == out_creds
+        assert captured["kwargs"]["region"] == "eu-west-1"
+
+    def test_exception_returns_500(self, handler_mod, monkeypatch):
+        import zagg.temporal as temporal
+
+        def _boom(*a, **k):
+            raise RuntimeError("read failed")
+
+        monkeypatch.setattr(temporal, "open_dataset", _boom)
+        resp = handler_mod._handle_process_event(_temporal_event())
+        body = json.loads(resp["body"])
+        assert resp["statusCode"] == 500
+        assert body["event_key"] == "storm1"
+        assert "read failed" in body["error"]

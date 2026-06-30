@@ -48,6 +48,29 @@ Finalize mode (consolidates zarr metadata after all cells complete):
 Setup and finalize exist so callers without direct S3 write access to the
 output bucket (e.g. cross-account JupyterHub orchestrators) can run the
 full pipeline using only lambda:InvokeFunction.
+
+Process-event mode (the temporal/event pipeline worker -- issue #12, Phase 7b):
+{
+    "mode": "process_event",
+    "event_key": str,           # identifier for this event row
+    "event_mask_uri": str,      # s3:// (or local) URI of the event mask
+                                #   DataArray (one variable, time x lat x lon)
+    "collection_uris": {        # {collection_name: uri} the specs read
+        "merra2_slv": "s3://.../merra2_slv.zarr", ...
+    },
+    "static_uris": {            # {static_name: uri}, e.g. ais_mask / climatology
+        "ais_mask": "s3://.../ais_mask.nc", ...
+    },
+    "store_path": str,          # s3:// (or local) tabular output, e.g. .parquet
+    "config": dict,             # temporal pipeline config (specs etc.)
+    "s3_credentials": dict (optional),     # read creds for source datasets
+    "output_credentials": dict (optional), # write creds for the tabular store
+}
+
+This mirrors the local ``zagg.runner.TemporalStrategy``: load the event's
+collections + static_data, run ``zagg.temporal.process_event`` for one event,
+and write the single flattened result row to the tabular store. One event per
+worker, fanned out the same way per-cell spatial work is.
 """
 
 import json
@@ -132,6 +155,8 @@ def lambda_handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
         return _handle_setup(event)
     if mode == "finalize":
         return _handle_finalize(event)
+    if mode in ("process_event", "temporal", "event"):
+        return _handle_process_event(event)
     return _handle_process(event, context)
 
 
@@ -180,6 +205,89 @@ def _handle_finalize(event: Dict[str, Any]) -> Dict[str, Any]:
     except Exception as e:
         logger.exception(e)
         return {"statusCode": 500, "body": json.dumps({"error": str(e), "mode": "finalize"})}
+
+
+def _read_credentials(event: Dict[str, Any], key: str) -> Dict[str, Any] | None:
+    """Return the camelCase credential block under ``event[key]`` if present.
+
+    ``s3_credentials`` reads source datasets; ``output_credentials`` writes the
+    tabular store. Either may be omitted to fall back to the execution role.
+    """
+    creds = event.get(key)
+    return creds or None
+
+
+def _handle_process_event(event: Dict[str, Any]) -> Dict[str, Any]:
+    """Temporal/event worker: one event -> one tabular row (issue #12, Phase 7b).
+
+    Mirrors the local ``zagg.runner.TemporalStrategy``: build the specs from the
+    config, load the event mask + collections + static_data from S3, run
+    ``zagg.temporal.process_event`` for the single event, and write the
+    flattened result row to the tabular ``store_path``.
+    """
+    from zagg.output import write_tabular
+    from zagg.temporal import open_dataset, process_event, read_temporal_inputs, specs_from_config
+
+    event_key = event.get("event_key")
+    logger.info(f"process_event mode: event {event_key!r}")
+    try:
+        required = ["event_key", "event_mask_uri", "store_path", "config"]
+        missing = [p for p in required if p not in event]
+        if missing:
+            error_msg = f"Missing required parameters: {', '.join(missing)}"
+            logger.error(error_msg)
+            return {"statusCode": 400, "body": json.dumps({"error": error_msg})}
+
+        config = load_config_from_dict(event["config"])
+        specs = specs_from_config(config)
+
+        read_creds = _read_credentials(event, "s3_credentials")
+        region = os.environ.get("AWS_REGION", "us-west-2")
+
+        event_mask = open_dataset(event["event_mask_uri"], credentials=read_creds, region=region)
+        # The event mask is a single-variable file; index that variable so masks
+        # operate on a DataArray (mirrors the local events= contract).
+        mask_vars = list(getattr(event_mask, "data_vars", []))
+        if mask_vars:
+            event_mask = event_mask[mask_vars[0]]
+
+        collections, static_data = read_temporal_inputs(
+            event.get("collection_uris", {}),
+            event.get("static_uris", {}),
+            credentials=read_creds,
+            region=region,
+        )
+
+        results, meta = process_event(event_key, event_mask, collections, specs, static_data)
+
+        out_creds = _read_credentials(event, "output_credentials")
+        out_endpoint = out_creds.get("endpointUrl") if out_creds else None
+        out_region = (out_creds or {}).get("region", region)
+        output_path = write_tabular(
+            [{"event_key": event_key, "results": results, "meta": meta}],
+            event["store_path"],
+            output_format=config.output.get("format"),
+            credentials=out_creds,
+            endpoint_url=out_endpoint,
+            region=out_region,
+        )
+
+        body = {
+            "ok": True,
+            "mode": "process_event",
+            "event_key": event_key,
+            "timesteps_processed": meta.get("timesteps_processed"),
+            "output_path": output_path,
+            "max_memory_mb": _max_memory_mb(),
+        }
+        logger.info(json.dumps({"event_type": "process_event_complete", **body}))
+        return {"statusCode": 200, "body": json.dumps(body)}
+    except Exception as e:
+        logger.exception(e)
+        return {
+            "statusCode": 500,
+            "body": json.dumps({"error": str(e), "mode": "process_event", "event_key": event_key}),
+        }
 
 
 def _handle_process(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
