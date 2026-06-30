@@ -527,22 +527,10 @@ def open_dataset(uri, *, credentials=None, endpoint_url=None, region="us-west-2"
     import obstore
     from obstore.store import S3Store
 
-    from .store import parse_s3_path
+    from .store import parse_s3_path, s3_store_options
 
     bucket, key = parse_s3_path(uri)
-    opts: dict = {"region": region}
-    if credentials:
-        opts["access_key_id"] = credentials["accessKeyId"]
-        opts["secret_access_key"] = credentials["secretAccessKey"]
-        if credentials.get("sessionToken"):
-            opts["session_token"] = credentials["sessionToken"]
-    if endpoint_url:
-        opts["endpoint"] = endpoint_url
-        opts["virtual_hosted_style_request"] = False
-    if not credentials:
-        from obstore.auth.boto3 import Boto3CredentialProvider
-
-        opts["credential_provider"] = Boto3CredentialProvider()
+    opts = s3_store_options(credentials=credentials, endpoint_url=endpoint_url, region=region)
     store = S3Store(bucket, **opts)
     payload = obstore.get(store, key).bytes()
     return xr.open_dataset(io.BytesIO(bytes(payload)))

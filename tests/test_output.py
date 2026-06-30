@@ -241,6 +241,31 @@ class TestTabularWriterToBytes:
         payload = TabularWriter().to_bytes(_result_rows(), output_format="csv")
         assert b"event_key" in payload
 
+    def test_parquet_bytes_round_trip_without_pyarrow(self, monkeypatch):
+        # The deployed Lambda layer ships fastparquet but NOT pyarrow (issue
+        # #130). Pin that the in-memory Parquet path (to_bytes -> BytesIO ->
+        # read_parquet) still works with pyarrow hidden, i.e. on fastparquet --
+        # this is the engine the s3 put runs on the real worker.
+        import builtins
+        import io
+        import sys
+
+        real_import = builtins.__import__
+
+        def _no_pyarrow(name, *a, **k):
+            if name == "pyarrow" or name.startswith("pyarrow."):
+                raise ImportError("pyarrow hidden for test")
+            return real_import(name, *a, **k)
+
+        for mod in [m for m in sys.modules if m == "pyarrow" or m.startswith("pyarrow.")]:
+            monkeypatch.delitem(sys.modules, mod, raising=False)
+        monkeypatch.setattr(builtins, "__import__", _no_pyarrow)
+
+        payload = TabularWriter().to_bytes(_result_rows(), output_format="parquet")
+        assert payload[:4] == b"PAR1"
+        back = pd.read_parquet(io.BytesIO(payload)).set_index("event_key")
+        assert back.loc["storm2", "max_t2m"] == pytest.approx(9.0)
+
     def test_bad_format_raises(self):
         with pytest.raises(ValueError, match="unknown tabular output format"):
             TabularWriter().to_bytes(_result_rows(), output_format="xml")

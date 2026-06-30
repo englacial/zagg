@@ -185,7 +185,7 @@ def write_tabular(
     import obstore
     from obstore.store import S3Store
 
-    from ..store import parse_s3_path
+    from ..store import parse_s3_path, s3_store_options
 
     fmt = _resolve_format(store_path, output_format)
     payload = writer.to_bytes(rows, output_format=fmt)
@@ -193,20 +193,8 @@ def write_tabular(
     if not key:
         raise ValueError(f"s3 tabular output needs an object key, got bucket only: {store_path!r}")
 
-    opts: dict = {"region": region}
-    if credentials:
-        opts["access_key_id"] = credentials["accessKeyId"]
-        opts["secret_access_key"] = credentials["secretAccessKey"]
-        if credentials.get("sessionToken"):
-            opts["session_token"] = credentials["sessionToken"]
-    if endpoint_url:
-        opts["endpoint"] = endpoint_url
-        opts["virtual_hosted_style_request"] = False
-    if not credentials:
-        from obstore.auth.boto3 import Boto3CredentialProvider
-
-        opts["credential_provider"] = Boto3CredentialProvider()
-
+    # Shares the Zarr store's credential/path-style rule (issue #12, Phase 7b).
+    opts = s3_store_options(credentials=credentials, endpoint_url=endpoint_url, region=region)
     store = S3Store(bucket, **opts)
     obstore.put(store, key, payload)
     return store_path

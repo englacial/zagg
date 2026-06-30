@@ -207,16 +207,6 @@ def _handle_finalize(event: Dict[str, Any]) -> Dict[str, Any]:
         return {"statusCode": 500, "body": json.dumps({"error": str(e), "mode": "finalize"})}
 
 
-def _read_credentials(event: Dict[str, Any], key: str) -> Dict[str, Any] | None:
-    """Return the camelCase credential block under ``event[key]`` if present.
-
-    ``s3_credentials`` reads source datasets; ``output_credentials`` writes the
-    tabular store. Either may be omitted to fall back to the execution role.
-    """
-    creds = event.get(key)
-    return creds or None
-
-
 def _handle_process_event(event: Dict[str, Any]) -> Dict[str, Any]:
     """Temporal/event worker: one event -> one tabular row (issue #12, Phase 7b).
 
@@ -241,7 +231,9 @@ def _handle_process_event(event: Dict[str, Any]) -> Dict[str, Any]:
         config = load_config_from_dict(event["config"])
         specs = specs_from_config(config)
 
-        read_creds = _read_credentials(event, "s3_credentials")
+        # s3_credentials reads source datasets; output_credentials writes the
+        # tabular store. Either may be omitted to fall back to the execution role.
+        read_creds = event.get("s3_credentials") or None
         region = os.environ.get("AWS_REGION", "us-west-2")
 
         event_mask = open_dataset(event["event_mask_uri"], credentials=read_creds, region=region)
@@ -260,9 +252,13 @@ def _handle_process_event(event: Dict[str, Any]) -> Dict[str, Any]:
 
         results, meta = process_event(event_key, event_mask, collections, specs, static_data)
 
-        out_creds = _read_credentials(event, "output_credentials")
+        out_creds = event.get("output_credentials") or None
         out_endpoint = out_creds.get("endpointUrl") if out_creds else None
         out_region = (out_creds or {}).get("region", region)
+        # ``config.output["format"]`` may be absent (None); ``write_tabular``
+        # then infers parquet/csv from the store_path suffix -- the same effect
+        # the runner gets by passing ``output_format(config)`` (which defaults to
+        # ``zarr`` and is filtered out before this temporal write).
         output_path = write_tabular(
             [{"event_key": event_key, "results": results, "meta": meta}],
             event["store_path"],
