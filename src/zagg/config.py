@@ -1186,9 +1186,11 @@ def get_shard_order(config: PipelineConfig) -> int | None:
     """Return the sharding-OBJECT order from the output grid config (issue #133 phase 8).
 
     ``shard_order`` decouples the ShardingCodec object from the dispatch shard: an
-    order strictly between ``parent_order`` and ``chunk_inner`` sizes each sharding
-    object smaller than the whole dispatch shard, so the worker writes its region in
-    per-object passes (bounding peak memory under the 2 GB cap on large/dense shards).
+    order in ``[parent_order, chunk_inner]`` sizes each sharding object — at
+    ``parent_order`` (or ``None``) one object spans the whole dispatch shard (today's
+    byte-identical write), and a finer order (``> parent_order``) makes each object
+    smaller so the worker writes its region in per-object passes (bounding peak memory
+    under the 2 GB cap on large/dense shards).
     ``None`` (default) keeps one object per dispatch shard — today's behavior, a
     byte-identical write. Only meaningful when ``sharded`` is True (the grid raises
     otherwise, validated before deployment).
