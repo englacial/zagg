@@ -86,7 +86,7 @@ def agg(
     region: str = "us-west-2",
     output_credentials: dict | None = None,
     output_endpoint_url: str | None = None,
-    handoff: str = "pandas",
+    handoff: str = "arrow",
     profile: bool = False,
     max_retries: int = 3,
 ) -> dict:
@@ -133,13 +133,14 @@ def agg(
         Custom S3-compatible endpoint for the output store (e.g. R2, MinIO).
         Overrides ``output.endpoint_url`` in the config.
     handoff : str
-        Per-cell aggregation carrier: ``"pandas"`` (default) or ``"arrow"`` (an
-        ``arro3.core`` carrier). Both produce byte-for-byte identical scalar outputs
-        (#30); ``"arrow"`` is opt-in for benchmarking the carrier cost. Honored by
-        both the ``"local"`` and ``"lambda"`` backends (issue #130): the lambda
-        backend forwards it into each cell event, and the default ``"pandas"`` keeps
-        the event payload byte-identical (no key). pyarrow is not used on either
-        path; the experimental ``arrow-kernel`` reducer was dropped with pyarrow.
+        Per-cell aggregation carrier: ``"arrow"`` (default, an ``arro3.core``
+        carrier) or ``"pandas"``. Both produce byte-for-byte identical scalar outputs
+        (#30); ``"arrow"`` is the default because it is faster and lighter on dense
+        shards (issue #130). Honored by both the ``"local"`` and ``"lambda"``
+        backends: the lambda backend forwards it into each cell event, and an
+        explicit ``"pandas"`` keeps that event payload byte-identical (no key).
+        pyarrow is not used on either path; the experimental ``arrow-kernel``
+        reducer was dropped with pyarrow.
     profile : bool
         Opt-in per-phase timing (issue #100). When ``True`` (lambda backend),
         forwards ``profile`` into each cell event so the worker emits a
@@ -351,7 +352,7 @@ def _check_signature(grid, catalog_data: dict) -> None:
 
 
 def _process_and_write(
-    shard_key, chunk_idx, records, grid, s3_creds, zarr_store, config, driver=None, handoff="pandas"
+    shard_key, chunk_idx, records, grid, s3_creds, zarr_store, config, driver=None, handoff="arrow"
 ):
     """Process a single shard and write its K finer chunks to the store.
 
@@ -421,7 +422,7 @@ def _run_local(
     driver="s3",
     output_credentials=None,
     output_endpoint_url=None,
-    handoff="pandas",
+    handoff="arrow",
 ):
     """Run processing locally via the generic dispatch loop on a thread pool.
 
@@ -561,7 +562,7 @@ def _run_lambda(
     function_name,
     output_credentials=None,
     output_endpoint_url=None,
-    handoff="pandas",
+    handoff="arrow",
     profile=False,
     max_retries=3,
 ):
@@ -1036,7 +1037,7 @@ def _invoke_lambda_cell(
     output_creds_event=None,
     max_retries=3,
     max_workers=None,
-    handoff="pandas",
+    handoff="arrow",
     profile=False,
 ):
     """Invoke Lambda for a single cell with retry logic.
@@ -1046,8 +1047,8 @@ def _invoke_lambda_cell(
     ``"profile": true`` event key so the worker emits ``phase_timings``; when
     False the event payload is byte-identical to the pre-profile path (no key).
     ``handoff`` (issue #130) forwards a ``"handoff"`` event key selecting the
-    worker's carrier/reducer; the default ``"pandas"`` omits the key, keeping the
-    event byte-identical to the pre-handoff path.
+    worker's carrier; the default ``"arrow"`` adds the key, while an explicit
+    ``"pandas"`` omits it, keeping that event byte-identical to the pre-handoff path.
     """
     wall_start = time.time()
 
@@ -1074,8 +1075,8 @@ def _invoke_lambda_cell(
     # Only add the key when profiling, so default runs stay byte-identical (#100).
     if profile:
         event["profile"] = True
-    # Only add the key for a non-default carrier, so default (pandas) runs stay
-    # byte-identical to the pre-handoff path (#130).
+    # Add the key for the arrow carrier (the default); an explicit pandas run omits
+    # it, staying byte-identical to the pre-handoff path (#130).
     if handoff and handoff != "pandas":
         event["handoff"] = handoff
 
