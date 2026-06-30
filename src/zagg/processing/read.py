@@ -306,7 +306,7 @@ def _planned_read_group(
     - the cell ``signal_conf_ph``-style 2-D structured filter would be re-read
       via the planned slices either way (the helper handles that uniformly).
 
-    Returns the same ``pandas.DataFrame`` / ``pyarrow.Table`` / ``None`` contract
+    Returns the same ``pandas.DataFrame`` / ``arro3.core.Table`` / ``None`` contract
     as :func:`_read_group`. Output rows are in plan-slice / spatial-mask /
     filter order — which matches the full-read path's row ordering because the
     plan's runs are emitted in increasing parent index.
@@ -523,17 +523,20 @@ def _planned_read_group(
         data_dict = {k: v[emask] for k, v in data_dict.items()}
 
     if arrow:
-        import pyarrow as pa
+        from arro3.core import Table
 
-        return pa.table(data_dict)
+        # arro3-core carrier (issue #130): no pyarrow on the worker. ``from_pydict``
+        # accepts the raw numpy column arrays directly (zero-copy for the contiguous
+        # dense reads here), matching the pandas carrier's columns.
+        return Table.from_pydict(data_dict)
     return pd.DataFrame(data_dict)
 
 
 def _read_group(h5obj, group: str, data_source: dict, shard_key: int, grid, arrow: bool = False):
     """Read and spatially filter one HDF5 group.
 
-    Returns a ``pandas.DataFrame`` (default) or, when ``arrow=True``, a
-    ``pyarrow.Table`` carrying the identical columns. Returns ``None`` when the
+    Returns a ``pandas.DataFrame`` (default) or, when ``arrow=True``, an
+    ``arro3.core.Table`` carrying the identical columns. Returns ``None`` when the
     group has no observations in this shard.
 
     Supports three modes (issues #43 Phase A/B/C):
@@ -749,7 +752,10 @@ def _read_group_full(
         data_dict = {k: v[emask] for k, v in data_dict.items()}
 
     if arrow:
-        import pyarrow as pa
+        from arro3.core import Table
 
-        return pa.table(data_dict)
+        # arro3-core carrier (issue #130): no pyarrow on the worker. ``from_pydict``
+        # accepts the raw numpy column arrays directly (zero-copy for the contiguous
+        # dense reads here), matching the pandas carrier's columns.
+        return Table.from_pydict(data_dict)
     return pd.DataFrame(data_dict)
