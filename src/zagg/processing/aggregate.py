@@ -2,9 +2,9 @@
 monolithic ``processing.py`` for the §4 size limit; pure relocation, no behavior
 change).
 
-Per-cell statistics, grouping, coercion, the per-chunk precompute hook, and the
-EXPERIMENTAL pyarrow kernel reducer. Depends only on ``config`` — never on the
-read or write stages — so the import DAG stays acyclic.
+Per-cell statistics, grouping, coercion, and the per-chunk precompute hook.
+Depends only on ``config`` — never on the read or write stages — so the import
+DAG stays acyclic.
 """
 
 from typing import Any
@@ -17,7 +17,6 @@ from zagg.config import (
     default_config,
     get_agg_fields,
     get_chunk_precompute,
-    get_data_vars,
     get_output_signature,
 )
 
@@ -25,8 +24,8 @@ from zagg.config import (
 def _field_sentinel(meta: dict) -> float:
     """Per-cell fill value for an agg field's empty/unused slots.
 
-    Mirrors how ``process_shard`` / :func:`_kernel_aggregate` seed their output
-    arrays: the schema-declared ``fill_value`` (default ``"NaN"`` -> ``np.nan``,
+    Mirrors how ``process_shard`` seeds its output arrays: the schema-declared
+    ``fill_value`` (default ``"NaN"`` -> ``np.nan``,
     else the literal numeric fill). Used both for scalar empty cells and for the
     padding of ``vector`` fields (issue #29 Option B).
     """
@@ -92,16 +91,20 @@ def _concat_and_group(all_reads, grid, handoff: str):
     """Concat the per-group reads and split observations by cell.
 
     Carrier-agnostic seam shared by :func:`process_shard` and its tests, so the
-    Arrow path is exercised end-to-end (including multi-table ``concat_tables``
-    ordering) rather than re-assembled inline. Both carriers feed identical numpy
-    arrays into :func:`_group_columns`, so the groupings — and the aggregations
-    computed from them — are byte-for-byte identical.
+    Arrow path is exercised end-to-end (including multi-table concat ordering)
+    rather than re-assembled inline. Both carriers feed identical numpy arrays into
+    :func:`_group_columns`, so the groupings — and the aggregations computed from
+    them — are byte-for-byte identical.
+
+    The arrow carrier is ``arro3-core`` (issue #130 path C): pyarrow is no longer a
+    runtime dependency. ``arro3`` has no whole-table concat helper, so the per-group
+    reads are concatenated by collecting their record batches into one table.
 
     Parameters
     ----------
     all_reads : list
         Per-group reads from ``_read_group``: ``pandas.DataFrame`` for the pandas
-        carrier, ``pyarrow.Table`` for the arrow carrier.
+        carrier, ``arro3.core.Table`` for the arrow carrier.
     grid : OutputGrid
         Provides ``cells_of`` to map leaf ids to child cell ids.
     handoff : {"pandas", "arrow"}
@@ -117,21 +120,24 @@ def _concat_and_group(all_reads, grid, handoff: str):
         Total observation count across all reads.
     """
     if handoff == "arrow":
-        import pyarrow as pa
+        from arro3.core import Table
 
-        table = pa.concat_tables(all_reads).combine_chunks()
+        # arro3 has no ``concat_tables``; collect every read's batches into one
+        # table (preserving order), matching pyarrow's concat semantics.
+        batches = [b for tbl in all_reads for b in tbl.to_batches()]
+        table = Table.from_batches(batches, schema=all_reads[0].schema)
         # The arrow handoff requires dense, null-free columns: ``_read_group``
-        # builds tables from raw h5coro reads (no null mask), so
-        # ``to_numpy(zero_copy_only=False)`` is dtype-exact and matches ``.values``
-        # on the pandas side. Guard the precondition so a future nullable source
-        # can't silently diverge the two carriers instead of failing loudly.
+        # builds tables from raw h5coro reads (no null mask), so ``to_numpy`` is
+        # dtype-exact and matches ``.values`` on the pandas side. Guard the
+        # precondition so a future nullable source can't silently diverge the two
+        # carriers instead of failing loudly.
         null_cols = [n for n in table.column_names if table.column(n).null_count]
         if null_cols:
             raise ValueError(f"arrow handoff requires null-free columns; got nulls in {null_cols}")
         n_obs_total = table.num_rows
-        cell_col = grid.cells_of(table.column("leaf_id").to_numpy(zero_copy_only=False))
-        col_dict = {n: table.column(n).to_numpy(zero_copy_only=False) for n in table.column_names}
-        col_arrays, cell_to_slice = _group_columns(col_dict, cell_col)
+        cols = {n: table.column(n).combine_chunks().to_numpy() for n in table.column_names}
+        cell_col = grid.cells_of(cols["leaf_id"])
+        col_arrays, cell_to_slice = _group_columns(cols, cell_col)
     else:
         df_all = pd.concat(all_reads, ignore_index=True)
         n_obs_total = len(df_all)
@@ -307,9 +313,6 @@ def calculate_cell_statistics(
     ``np.nanmin``, ``np.nansum``, ``np.nanstd``, ``np.nanmedian``, … — is
     usable directly from the config template with no special-casing, and is
     reduced with numpy's own NaN semantics (see ``test_numpy_nan_aware_functions``).
-    The experimental ``handoff="arrow-kernel"`` path is an *opt-in* acceleration
-    for the kernel-able subset only; it does not change or narrow this contract
-    (see the EXPERIMENTAL block below).
 
     Parameters
     ----------
@@ -645,224 +648,3 @@ def _aggregate_chunk_cells(
                 stats_arrays[key][i] = value
 
     return stats_arrays, ragged_payloads, ragged_cell_indices, cells_with_data
-
-
-# EXPERIMENTAL (phase 2b of #30) -----------------------------------------------
-# Dual aggregation contract
-# -------------------------
-# The DEFAULT, fully-supported contract is "any aggregation expressible in numpy",
-# including the NaN-aware family (``np.nanmean``/``np.nanvar``/``np.nanmax``/…);
-# the user picks the function in the agg template and it runs through
-# ``calculate_cell_statistics`` with numpy's own semantics (see that docstring and
-# ``test_numpy_nan_aware_functions``). Arrow kernels do NOT replace or narrow that
-# contract — they are an OPT-IN acceleration for the kernel-able subset, and the
-# user chooses numpy vs arrow per run via the ``handoff`` flag.
-#
-# Why arrow kernels aren't drop-in nan-operators: pyarrow compute has
-# ``mean``/``min_max``/``variance`` with ``skip_nulls``, but an Arrow NULL is a
-# distinct missing-value bit, NOT a float NaN — ``skip_nulls`` does not skip NaN.
-# So there is no arrow "nanmean" kernel equivalent; the kernel path instead
-# replicates numpy's NaN behaviour by hand (NaN-propagating min/max, see below)
-# rather than pretending arrow nulls and float NaN are the same thing.
-#
-# Optional pyarrow.compute hash-aggregate ("kernel") reduction path. Unlike the
-# pandas/arrow *carriers* — which feed identical numpy arrays into
-# ``calculate_cell_statistics`` and are therefore byte-for-byte identical — the
-# kernel path computes the kernel-able reductions in a single vectorised C++
-# pass (Acero ``TableGroupBy.aggregate``). pyarrow's float summation differs from
-# numpy's, so its ``mean``/``variance`` outputs are NOT byte-identical to the
-# numpy path; they agree only within ``KERNEL_RTOL`` (validated in tests and in
-# ``benchmarks/handoff_bench.py``). ``count``/``min``/``max`` ARE exact vs numpy,
-# including on NaN input: pyarrow's ``min``/``max`` kernels skip NaN by default
-# (numpy propagates it), so :func:`_kernel_aggregate` detects NaN per group and
-# overwrites those groups' min/max with NaN to restore numpy parity (NaN is a
-# value, not an Arrow null, so ``skip_nulls`` does not cover it). This lever is
-# opt-in via ``handoff="arrow-kernel"`` and exists purely so phase 3 can benchmark
-# it on real ATL03 data; it is kept gated and clearly experimental, and should be
-# dropped if that benchmark shows no material speedup (see PR #33 discussion).
-
-# Documented tolerance for kernel-vs-numpy float agreement. float32 means/variance
-# over millions of obs diverge by ~1 ULP (~1e-6 relative); 1e-5 leaves headroom.
-KERNEL_RTOL = 1e-5
-
-# numpy/config ``function`` name -> pyarrow hash-aggregate function name. Only
-# reductions that are mathematically a pure (unweighted) group reduction appear
-# here; weighted ``average``, ``quantile`` (only approximate via tdigest) and any
-# ``expression`` field fall back to the per-cell numpy path.
-# NOTE: ``"average" -> "mean"`` is currently dead for the shipped atl06 config
-# (its ``h_mean`` is a *weighted* average, which ``_kernel_able`` excludes). It is
-# kept only so an unweighted ``average`` field — if a future config defines one —
-# is kernel-able rather than silently falling back; remove it if that never lands.
-_KERNEL_FUNCS = {
-    "len": "count",
-    "count": "count",
-    "min": "min",
-    "max": "max",
-    "var": "variance",
-    "average": "mean",
-}
-
-
-def _kernel_able(meta: dict) -> bool:
-    """Whether an agg field can be computed by a pyarrow hash-aggregate kernel.
-
-    EXPERIMENTAL. Excludes expression fields, weighted ``average`` (no weighted
-    hash kernel), quantiles (only approximate tdigest), and anything whose
-    function has no pure-reduction kernel equivalent.
-    """
-    if meta.get("expression"):
-        return False
-    func = meta.get("function")
-    if func not in _KERNEL_FUNCS:
-        return False
-    # Weighted average is not a pure hash reduction.
-    if func == "average" and "weights" in (meta.get("params") or {}):
-        return False
-    return True
-
-
-def _kernel_aggregate(
-    table,
-    cell_col: np.ndarray,
-    children,
-    value_col: str,
-    config: PipelineConfig,
-    chunk_scalars: dict[str, Any] | None = None,
-) -> dict:
-    """EXPERIMENTAL pyarrow hash-aggregate reducer (phase 2b of #30).
-
-    Computes the kernel-able stats (count/min/max/variance/unweighted-mean) for
-    every child cell in one vectorised ``TableGroupBy.aggregate`` pass, then fills
-    the remaining (weighted mean, expression, quantile) fields via the per-cell
-    numpy path so output columns match the default reducer exactly in shape.
-
-    ``chunk_scalars`` (issue #30) are the per-chunk precompute values, injected
-    into each cell's namespace in the fallback per-cell loop exactly as the default
-    handoff does, so an ``expression`` field referencing a chunk anchor resolves on
-    the arrow path too. A precompute field is never kernel-able (it is an
-    ``expression``), so it always lands in ``fallback_names`` and sees the scalars.
-
-    ``count``/``min``/``max`` are EXACT vs the numpy reducer, including on NaN
-    input — pyarrow's min/max kernels skip NaN, so this function detects NaN per
-    group and propagates it (numpy semantics). The kernel-reduced float stats
-    (``mean``/``variance``) are NOT byte-identical to numpy; they agree within
-    :data:`KERNEL_RTOL` (and both yield NaN on a NaN-bearing group). Returns
-    ``stats_arrays`` (``name -> ndarray`` over ``children``) plus
-    ``cells_with_data``.
-
-    Parameters
-    ----------
-    table : pyarrow.Table
-        Concatenated, null-free observations (one row per observation). "Null-free"
-        is the Arrow-null sense; float NaN values ARE allowed and are handled with
-        numpy semantics (see above). Callers must enforce the null-free contract
-        (``process_shard`` does); this function does not re-check it.
-    cell_col : np.ndarray
-        Child cell id for each row of ``table`` (already ``grid.cells_of`` mapped,
-        so the group key is the destination cell, not the leaf id).
-    children : sequence of int
-        Child cell ids, in canonical chunk order.
-    value_col : str
-        Default value column for fields without an explicit ``source``.
-    config : PipelineConfig
-        Drives the agg-field metadata.
-    """
-    import pyarrow as pa
-
-    agg_fields = get_agg_fields(config)
-    data_vars = get_data_vars(config)
-    n_cells = len(children)
-    child_index = {int(c): i for i, c in enumerate(children)}
-
-    stats_arrays: dict[str, np.ndarray] = {}
-    for name in data_vars:
-        meta = agg_fields[name]
-        # Ragged fields (issue #48) cannot be dense-preallocated; skip them here.
-        # The kernel path does not support ragged — they have no hash-aggregate
-        # kernel equivalent — so a config mixing ragged + arrow-kernel uses the
-        # fallback for ragged fields. But the dense fallback array assignment
-        # (``stats_arrays[name][i] = value``) would crash for a list payload.
-        # Exclude ragged from both the kernel and fallback lists; the caller is
-        # responsible for collecting ragged payloads via process_shard's own loop.
-        if get_output_signature(meta)["kind"] == "ragged":
-            continue
-        zarr_dtype = np.dtype(meta.get("dtype", "float32"))
-        fill_value = meta.get("fill_value", "NaN")
-        if fill_value == "NaN":
-            stats_arrays[name] = np.full(n_cells, np.nan, dtype=zarr_dtype)
-        else:
-            stats_arrays[name] = np.zeros(n_cells, dtype=zarr_dtype)
-
-    # Ragged fields are excluded from kernel and fallback (see above).
-    dense_names = [n for n in data_vars if get_output_signature(agg_fields[n])["kind"] != "ragged"]
-    kernel_names = [n for n in dense_names if _kernel_able(agg_fields[n])]
-    fallback_names = [n for n in dense_names if n not in kernel_names]
-
-    # Group by the destination cell id (not the raw leaf id): append cell_col and
-    # run one vectorised group-by + reduction pass for all kernel-able fields.
-    keyed = table.append_column("_cell", pa.array(np.asarray(cell_col)))
-    aggregations = [
-        (agg_fields[n].get("source") or value_col, _KERNEL_FUNCS[agg_fields[n]["function"]])
-        for n in kernel_names
-    ]
-    # NaN semantics: pyarrow's ``min``/``max`` hash kernels SKIP NaN, whereas
-    # ``np.min``/``np.max`` PROPAGATE it. To keep count/min/max bit-identical to the
-    # numpy path on NaN-bearing input (ATL06 ``h_li`` can carry fill/invalid values
-    # and ``quality_filter`` is a flag check, not a NaN filter), detect NaN per
-    # group on each min/max source column and overwrite those groups' min/max with
-    # NaN below. (``count`` already matches: NaN is a value, not a null, so it is
-    # counted; ``mean``/``variance`` already propagate NaN like numpy.)
-    extrema_srcs = {
-        src for n, (src, kfunc) in zip(kernel_names, aggregations) if kfunc in ("min", "max")
-    }
-    for src in extrema_srcs:
-        is_nan = np.isnan(table.column(src).to_numpy(zero_copy_only=False))
-        keyed = keyed.append_column(f"_isnan_{src}", pa.array(is_nan))
-    aggregations_nan = [(f"_isnan_{src}", "max") for src in extrema_srcs]
-    gd = keyed.group_by("_cell").aggregate(aggregations + aggregations_nan).to_pydict()
-    group_cells = gd["_cell"]
-    group_has_nan = {src: gd[f"_isnan_{src}_max"] for src in extrema_srcs}
-    # Map each grouped row back to its position in ``children``.
-    row_to_idx = [child_index.get(int(c)) for c in group_cells]
-    for n, (src, kfunc) in zip(kernel_names, aggregations):
-        col = gd[f"{src}_{kfunc}"]
-        nan_flags = group_has_nan.get(src) if kfunc in ("min", "max") else None
-        out = stats_arrays[n]
-        for row, idx in enumerate(row_to_idx):
-            if idx is not None:
-                # Propagate NaN for min/max to match numpy (pyarrow skips NaN).
-                out[idx] = np.nan if (nan_flags is not None and nan_flags[row]) else col[row]
-
-    cells_with_data = sum(1 for idx in row_to_idx if idx is not None)
-
-    # Fallback fields (and only those) via the per-cell numpy reducer. Reuse the
-    # carrier-agnostic grouping so the slices match the default path exactly.
-    # NOTE: ``calculate_cell_statistics`` recomputes the *full* stats dict per cell,
-    # so the kernel-able stats are computed a second time here and discarded — we
-    # only read ``fallback_names`` out of it. Acceptable while experimental (the
-    # fallback set is small: weighted mean, expression, quantiles); revisit if a
-    # config makes the fallback set dominate.
-    if fallback_names:
-        col_dict = {
-            name: table.column(name).to_numpy(zero_copy_only=False) for name in table.column_names
-        }
-        col_arrays, cell_to_slice = _group_columns(col_dict, np.asarray(cell_col))
-        _empty = {col: arr[:0] for col, arr in col_arrays.items()}
-        for i, child in enumerate(children):
-            child = int(child)
-            if child in cell_to_slice:
-                s, e = cell_to_slice[child]
-                cell_data = {col: arr[s:e] for col, arr in col_arrays.items()}
-            else:
-                cell_data = _empty
-            # Inject the chunk-level precompute values (no-op when empty), so an
-            # expression fallback field can reference a chunk anchor (issue #30).
-            cell_namespace = {**cell_data, **chunk_scalars} if chunk_scalars else cell_data
-            stats = calculate_cell_statistics(cell_namespace, value_col=value_col, config=config)
-            for name in fallback_names:
-                stats_arrays[name][i] = stats[name]
-
-    return {"stats_arrays": stats_arrays, "cells_with_data": cells_with_data}
-
-
-# -- end EXPERIMENTAL kernel path ---------------------------------------------

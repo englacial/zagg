@@ -8,8 +8,8 @@ It is a package (split out of a single ~2000-line ``processing.py`` for the §4
 size limit) whose stages are:
 
 * :mod:`zagg.processing.read` — read + spatially filter HDF5 groups for a shard.
-* :mod:`zagg.processing.aggregate` — per-cell statistics, grouping, the per-chunk
-  precompute hook, and the EXPERIMENTAL pyarrow kernel reducer.
+* :mod:`zagg.processing.aggregate` — per-cell statistics, grouping, and the
+  per-chunk precompute hook.
 * :mod:`zagg.processing.write` — assemble + write the output carrier to Zarr.
 * :mod:`zagg.processing.worker` — ``process_shard`` orchestration.
 
@@ -23,8 +23,6 @@ This ``__init__`` re-exports every public + previously-importable name, so
 import h5coro
 
 from zagg.processing.aggregate import (
-    _KERNEL_FUNCS,
-    KERNEL_RTOL,
     _build_groups,
     _coerce_field_value,
     _coerce_ragged_value,
@@ -35,8 +33,6 @@ from zagg.processing.aggregate import (
     _group_columns,
     _has_ragged_fields,
     _has_vector_fields,
-    _kernel_able,
-    _kernel_aggregate,
     calculate_cell_statistics,
 )
 from zagg.processing.read import (
@@ -76,8 +72,6 @@ from zagg.processing.write import (
 # across the relocation (mirrors ``zagg.grids.__init__``'s re-export convention,
 # and is what lets ruff accept these as intentional re-exports, not dead F401s).
 __all__ = [
-    # public surface
-    "KERNEL_RTOL",
     # bound on the package so ``zagg.processing.h5coro.H5Coro`` resolves (and
     # stays monkeypatch-able) from the worker
     "h5coro",
