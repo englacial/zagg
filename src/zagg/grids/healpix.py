@@ -523,7 +523,8 @@ class HealpixGrid:
             # The inner chunk is the array's current chunk shape (``cells_per_chunk``
             # on the cells axis; a vector field's trailing payload dim is chunked
             # whole and stays whole). The outer shard widens only the cells axis to
-            # ``cells_per_shard`` (== K inner chunks); trailing dims are unchanged.
+            # the sharding object (``cells_per_shard_object`` — see below); trailing
+            # dims are unchanged.
             cg = arr.chunk_grid
             cfg = cg["configuration"] if isinstance(cg, dict) else cg.configuration
             inner = tuple(int(c) for c in cfg["chunk_shape"])
