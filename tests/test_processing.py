@@ -197,6 +197,165 @@ class TestWriteShardToZarr:
         assert np.isnan(grp["h_mean"][int(cell_ids[1])])
 
 
+class TestShardOrderObjectSplit:
+    """Issue #133 phase 8: ``shard_order`` decouples the ShardingCodec object from
+    the dispatch shard. The default (unset / == parent_order) keeps ONE object per
+    dispatch shard — byte-identical to the pre-phase-8 sharded write — while a finer
+    ``shard_order`` writes the dispatch region in per-object passes that reconstruct
+    the same logical array.
+
+    Small orders (parent 4 / chunk_inner 6 / child 7) so the fullsphere template +
+    write run fast: K = 4^(6-4) = 16 inner chunks, cells_per_chunk 4, cells_per_shard
+    64; ``shard_order=5`` gives 4 objects/shard of 16 cells each.
+    """
+
+    PARENT, INNER, CHILD = 4, 6, 7
+
+    @staticmethod
+    def _shard_key():
+        from mortie import geo2mort
+
+        return int(geo2mort(-78.5, -132.0, order=TestShardOrderObjectSplit.PARENT)[0])
+
+    def _grid(self, cfg, *, shard_order=None):
+        return HealpixGrid(
+            self.PARENT,
+            self.CHILD,
+            layout="fullsphere",
+            config=cfg,
+            chunk_inner=self.INNER,
+            sharded=True,
+            shard_order=shard_order,
+        )
+
+    @staticmethod
+    def _df(grid, shard_key):
+        # Cells in the first, a middle, and the last inner chunk so the written shard
+        # spans more than one sharding object once shard_order splits it.
+        children = grid.children(shard_key)
+        idx = [0, len(children) // 2, len(children) - 1]
+        leaf = np.array([int(children[i]) for i in idx], dtype=np.uint64)
+        return pd.DataFrame(
+            {
+                "h_li": np.array([3.0, 7.0, 2.0], dtype=np.float32),
+                "s_li": np.array([0.1, 0.1, 0.1], dtype=np.float32),
+                "leaf_id": leaf,
+            }
+        )
+
+    def _run(self, grid, shard_key, df, monkeypatch):
+        from zagg.processing import write_shard_to_zarr
+
+        calls = {"n": 0}
+
+        def one_shot(*args, **kwargs):
+            calls["n"] += 1
+            return df.copy() if calls["n"] == 1 else None
+
+        monkeypatch.setattr("zagg.processing._read_group", one_shot)
+        monkeypatch.setattr("zagg.processing.h5coro.H5Coro", lambda *a, **k: object())
+        monkeypatch.setattr("zagg.processing._make_url_rewriter", lambda driver: lambda u: u)
+
+        store = MemoryStore()
+        grid.emit_template(store)
+        chunk_results: list = []
+        process_shard(
+            grid,
+            shard_key,
+            ["s3://x"],
+            s3_credentials={},
+            config=grid.config,
+            chunk_results=chunk_results,
+        )
+        write_shard_to_zarr(chunk_results, store, grid=grid, shard_key=shard_key)
+        return store
+
+    def test_default_byte_identical_to_explicit_parent_order(self, monkeypatch):
+        """Default (``shard_order`` unset) is byte-identical to ``shard_order ==
+        parent_order`` — both keep ONE object spanning the whole dispatch shard, so
+        the on-disk store bytes match exactly (the phase-8 default-safety invariant)."""
+        cfg = default_config()
+        shard_key = self._shard_key()
+        g_default = self._grid(cfg, shard_order=None)
+        g_parent = self._grid(cfg, shard_order=self.PARENT)
+        # Both keep one object per dispatch shard.
+        assert g_default.shard_objects_per_shard == 1
+        assert g_parent.shard_objects_per_shard == 1
+
+        df = self._df(g_default, shard_key)
+        s_default = self._run(g_default, shard_key, df, monkeypatch)
+        s_parent = self._run(g_parent, shard_key, df.copy(), monkeypatch)
+
+        # Byte-for-byte equal stores (same keys, same bytes).
+        assert set(s_default._store_dict) == set(s_parent._store_dict)
+        for k, v in s_default._store_dict.items():
+            assert v.to_bytes() == s_parent._store_dict[k].to_bytes(), f"store bytes differ at {k}"
+
+    def test_split_reconstructs_same_logical_array(self, monkeypatch):
+        """A finer ``shard_order`` (multiple objects per shard) reconstructs the SAME
+        logical array, value-for-value, as the single-object default."""
+        cfg = default_config()
+        shard_key = self._shard_key()
+        g_default = self._grid(cfg, shard_order=None)
+        g_split = self._grid(cfg, shard_order=5)
+        assert g_split.shard_objects_per_shard == 4
+
+        df = self._df(g_default, shard_key)
+        s_default = self._run(g_default, shard_key, df, monkeypatch)
+        s_split = self._run(g_split, shard_key, df.copy(), monkeypatch)
+
+        grp_d = open_group(store=s_default, mode="r", path=str(self.CHILD))
+        grp_s = open_group(store=s_split, mode="r", path=str(self.CHILD))
+        for name in grp_d.array_keys():
+            a, b = grp_d[name][:], grp_s[name][:]
+            np.testing.assert_array_equal(
+                np.nan_to_num(a, nan=-12345.0),
+                np.nan_to_num(b, nan=-12345.0),
+                err_msg=f"split vs single-object differ in {name}",
+            )
+
+    def test_split_writes_multiple_objects_default_writes_one(self, monkeypatch):
+        """The default writes ONE shard object for the populated shard; the split
+        writes one object PER populated sharding sub-region (sparse: empty objects
+        are omitted)."""
+        cfg = default_config()
+        shard_key = self._shard_key()
+        g_default = self._grid(cfg, shard_order=None)
+        g_split = self._grid(cfg, shard_order=5)
+        df = self._df(g_default, shard_key)
+
+        s_default = self._run(g_default, shard_key, df, monkeypatch)
+        s_split = self._run(g_split, shard_key, df.copy(), monkeypatch)
+
+        prefix = f"{self.CHILD}/h_mean/c/"
+        n_default = len([k for k in s_default._store_dict if k.startswith(prefix)])
+        n_split = len([k for k in s_split._store_dict if k.startswith(prefix)])
+        assert n_default == 1
+        # Three cells in three distinct inner chunks land in 2-3 distinct objects
+        # (>1), but never more than one per dispatch shard's object count.
+        assert 1 < n_split <= g_split.shard_objects_per_shard
+
+    def test_invalid_shard_order_rejected(self):
+        cfg = default_config()
+        # <= parent_order (other than the default) is rejected.
+        with pytest.raises(ValueError, match="shard_order"):
+            self._grid(cfg, shard_order=self.PARENT - 1)
+        # > chunk_inner is rejected.
+        with pytest.raises(ValueError, match="shard_order"):
+            self._grid(cfg, shard_order=self.INNER + 1)
+        # shard_order without sharded=True is rejected.
+        with pytest.raises(ValueError, match="sharded=True"):
+            HealpixGrid(
+                self.PARENT,
+                self.CHILD,
+                layout="fullsphere",
+                config=cfg,
+                chunk_inner=self.INNER,
+                sharded=False,
+                shard_order=5,
+            )
+
+
 class TestCalculateCellStatistics:
     def test_empty_data_returns_zeros_and_nans(self):
         result = calculate_cell_statistics({"h_li": np.array([]), "s_li": np.array([])})
