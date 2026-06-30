@@ -7,7 +7,6 @@ from zarr.storage import MemoryStore
 from zagg.config import default_config, get_agg_fields, get_coords, get_data_vars
 from zagg.grids import HEALPIX_BASE_CELLS, HealpixGrid
 from zagg.processing import (
-    KERNEL_RTOL,
     _arrow_column,
     _broadcast_segment_to_base,
     _build_groups,
@@ -21,8 +20,6 @@ from zagg.processing import (
     _has_ragged_fields,
     _has_vector_fields,
     _iter_carrier_columns,
-    _kernel_able,
-    _kernel_aggregate,
     _predicate_mask,
     _read_group,
     _read_segment_broadcasts,
@@ -1237,81 +1234,6 @@ class TestMultiChunkWorker:
                 # Empty chunk -> NaN anchor (the n_obs==0 short-circuit), not a raise.
                 assert np.isnan(anchor)
 
-    def test_chunk_precompute_empty_inner_chunk_arrow_kernel(self, monkeypatch):
-        """Issue #82 phase 6 (review fold): the arrow-kernel path also short-circuits
-        an empty inner chunk to a NaN anchor instead of raising on ``np.min`` of an
-        empty subset. Mirrors the default-path empty-chunk test on
-        ``handoff='arrow-kernel'`` (the once-grouped O(N) per-chunk subset path)."""
-        pa = pytest.importorskip("pyarrow")
-        import zarr
-        from mortie import geo2mort
-        from zarr.storage import MemoryStore
-
-        from zagg.config import default_config
-        from zagg.grids import from_config
-        from zagg.processing import write_dataframe_to_zarr
-
-        cfg = default_config("atl06")
-        cfg.output["grid"] = {
-            "type": "healpix",
-            "parent_order": 6,
-            "chunk_inner": 7,
-            "child_order": 8,
-        }
-        cfg.aggregation["chunk_precompute"] = {
-            "anchor": {"expression": "np.float32(np.min(h_li))", "source": "h_li"}
-        }
-        cfg.aggregation["variables"] = {
-            "h_min": {"function": "min", "source": "h_li", "dtype": "float32"},
-            "offset_h": {"expression": "anchor", "resolution": "chunk", "dtype": "float32"},
-        }
-        grid = from_config(cfg)
-        assert grid.chunks_per_shard == 4
-        shard_key = int(geo2mort(-78.5, -132.0, order=6)[0])
-        chunks = list(grid.iter_chunks(shard_key))
-        populated = {0, 1}
-        leaf, h = [], []
-        for k, (_b, cc) in enumerate(chunks):
-            if k not in populated:
-                continue
-            base = 100.0 * (k + 1)
-            leaf += [int(cc[0]), int(cc[0])]
-            h += [base + 5.0, base]
-        table = pa.table(
-            {
-                "h_li": pa.array(np.array(h, dtype=np.float32)),
-                "s_li": pa.array(np.full(len(h), 0.1, dtype=np.float32)),
-                "leaf_id": pa.array(np.array(leaf, dtype=np.uint64)),
-            }
-        )
-        it = iter([table])
-        monkeypatch.setattr("zagg.processing._read_group", lambda *a, **k: next(it, None))
-        monkeypatch.setattr("zagg.processing.h5coro.H5Coro", lambda *a, **k: object())
-        monkeypatch.setattr("zagg.processing._make_url_rewriter", lambda driver: lambda u: u)
-
-        store = MemoryStore()
-        grid.emit_template(store)
-        results: list = []
-        process_shard(
-            grid,
-            shard_key,
-            ["s3://x"],
-            s3_credentials={},
-            config=cfg,
-            chunk_results=results,
-            handoff="arrow-kernel",
-        )
-        assert len(results) == 4
-        for block_index, carrier, _ragged in results:
-            write_dataframe_to_zarr(carrier, store, grid=grid, chunk_idx=block_index)
-        offset = zarr.open_array(store, path="8/offset_h", mode="r")
-        for k, (block_index, _c, _r) in enumerate(results):
-            anchor = float(offset[block_index])
-            if k in populated:
-                assert anchor == 100.0 * (k + 1)
-            else:
-                assert np.isnan(anchor)
-
 
 class TestChunkCompanionWorkedExample:
     """Issue #82 phase 5: a worked example exercising a chunk_precompute value
@@ -1502,7 +1424,7 @@ class TestArrowHandoff:
 
     def test_arrow_grouping_matches_pandas(self):
         """Arrow-carrier grouping yields byte-for-byte identical stats to pandas."""
-        pa = pytest.importorskip("pyarrow")
+        ac = pytest.importorskip("arro3.core")
         rng = np.random.default_rng(11)
         n = 500
         child_ids = np.array([100, 200, 300, 400, 500], dtype=np.int64)
@@ -1516,12 +1438,12 @@ class TestArrowHandoff:
         df = pd.DataFrame(col_dict)
         p_arrays, p_slices = _build_groups(df, cells)
 
-        # arrow carrier: read the columns back as numpy and group identically
-        table = pa.table(col_dict).combine_chunks()
+        # arrow (arro3) carrier: read the columns back as numpy and group identically
+        table = ac.Table.from_pydict({k: ac.Array.from_numpy(v) for k, v in col_dict.items()})
         a_carrier = {
-            name: table.column(name).to_numpy(zero_copy_only=False) for name in table.column_names
+            name: table.column(name).combine_chunks().to_numpy() for name in table.column_names
         }
-        a_leaf = table.column("leaf_id").to_numpy(zero_copy_only=False)
+        a_leaf = a_carrier["leaf_id"]
         a_arrays, a_slices = _group_columns(a_carrier, a_leaf)
 
         assert p_slices == a_slices
@@ -1544,7 +1466,7 @@ class TestArrowHandoff:
 
     def test_concat_and_group_arrow_matches_pandas(self):
         """_concat_and_group drives the real carrier path (incl. multi-table concat)."""
-        pa = pytest.importorskip("pyarrow")
+        ac = pytest.importorskip("arro3.core")
 
         grid = _IdentityGrid()
         cfg = default_config()
@@ -1563,7 +1485,9 @@ class TestArrowHandoff:
                 }
             )
         pandas_reads = [pd.DataFrame(r) for r in reads]
-        arrow_reads = [pa.table(r) for r in reads]
+        arrow_reads = [
+            ac.Table.from_pydict({k: ac.Array.from_numpy(v) for k, v in r.items()}) for r in reads
+        ]
 
         p_arrays, p_slices, p_n = _concat_and_group(pandas_reads, grid, "pandas")
         a_arrays, a_slices, a_n = _concat_and_group(arrow_reads, grid, "arrow")
@@ -1596,162 +1520,24 @@ class TestArrowHandoff:
         exists to catch: a null there would corrupt the cell assignment under
         ``to_numpy``, not just a single stat.
         """
-        pa = pytest.importorskip("pyarrow")
+        ac = pytest.importorskip("arro3.core")
 
-        table = pa.table(
+        table = ac.Table.from_pydict(
             {
-                "h_li": pa.array([1.0, 2.0, 3.0], type=pa.float32()),
-                "s_li": pa.array([0.1, 0.2, 0.3], type=pa.float32()),
-                "leaf_id": pa.array([100, None, 100], type=pa.int64()),
+                "h_li": ac.Array.from_numpy(np.array([1.0, 2.0, 3.0], dtype=np.float32)),
+                "s_li": ac.Array.from_numpy(np.array([0.1, 0.2, 0.3], dtype=np.float32)),
+                "leaf_id": ac.Array([100, None, 100], ac.DataType.int64()),
             }
         )
         with pytest.raises(ValueError, match="null-free"):
             _concat_and_group([table], _IdentityGrid(), "arrow")
-
-
-class TestKernelHandoff:
-    """Phase 2b of #30 (EXPERIMENTAL): the pyarrow hash-aggregate kernel reducer.
-
-    Unlike the pandas<->arrow *carrier* equivalence (byte-for-byte identical), the
-    kernel path's float mean/variance diverge from numpy by ~1 ULP, so it is
-    validated within :data:`KERNEL_RTOL`, not by exact equality.
-    """
-
-    def _numpy_reference(self, col_dict, cell_col, children, cfg):
-        """Default per-cell numpy stats, as ``name -> ndarray`` over ``children``."""
-        col_arrays, cell_to_slice = _group_columns(col_dict, cell_col)
-        empty = {c: a[:0] for c, a in col_arrays.items()}
-        out = {v: np.full(len(children), np.nan, dtype=np.float64) for v in get_data_vars(cfg)}
-        for i, child in enumerate(children):
-            child = int(child)
-            if child in cell_to_slice:
-                s, e = cell_to_slice[child]
-                cell_data = {c: a[s:e] for c, a in col_arrays.items()}
-            else:
-                cell_data = empty
-            stats = calculate_cell_statistics(cell_data, config=cfg)
-            for k, v in stats.items():
-                out[k][i] = v
-        return out
-
-    def test_kernel_able_classification(self):
-        """count/min/max/var and unweighted average are kernel-able; the rest fall back."""
-        cfg = default_config()
-        fields = get_agg_fields(cfg)
-        # Default atl06 config: count/h_min/h_max/h_variance are pure reductions;
-        # h_mean is weighted, h_sigma is an expression, the quantiles are tdigest.
-        assert _kernel_able(fields["count"])
-        assert _kernel_able(fields["h_min"])
-        assert _kernel_able(fields["h_max"])
-        assert _kernel_able(fields["h_variance"])
-        assert not _kernel_able(fields["h_mean"])  # weighted average
-        assert not _kernel_able(fields["h_sigma"])  # expression
-        assert not _kernel_able(fields["h_q50"])  # quantile
-        # Unweighted average would be kernel-able.
-        assert _kernel_able({"function": "average", "source": "h_li"})
-
-    def test_kernel_matches_numpy_within_tolerance(self):
-        """Kernel stats match the numpy reducer within KERNEL_RTOL (exact where integral)."""
-        pa = pytest.importorskip("pyarrow")
-        cfg = default_config()
-        rng = np.random.default_rng(3)
-        children = np.array([100, 200, 300, 400, 500], dtype=np.int64)
-        n = 2000
-        cells = rng.choice(children, size=n)
-        h = (rng.standard_normal(n) * 30.0).astype(np.float32)
-        s = (np.abs(rng.standard_normal(n)) + 0.01).astype(np.float32)
-        col_dict = {"h_li": h, "s_li": s, "leaf_id": cells}
-
-        ref = self._numpy_reference(col_dict, cells, children, cfg)
-        table = pa.table(col_dict)
-        kernel = _kernel_aggregate(table, cells, children, "h_li", cfg)
-        ks = kernel["stats_arrays"]
-
-        assert kernel["cells_with_data"] == len(children)
-        # count/min/max are integral or order-independent extrema: exact.
-        for name in ("count", "h_min", "h_max"):
-            np.testing.assert_array_equal(
-                np.asarray(ks[name], dtype=np.float64), ref[name], err_msg=name
-            )
-        # variance is the kernel-reduced float stat: close, not identical.
-        np.testing.assert_allclose(
-            np.asarray(ks["h_variance"], dtype=np.float64),
-            ref["h_variance"],
-            rtol=KERNEL_RTOL,
-            equal_nan=True,
-        )
-        # Fallback fields (weighted mean, expression, quantiles) stay byte-identical
-        # to numpy because the kernel path routes them through the same reducer.
-        for name in ("h_mean", "h_sigma", "h_q25", "h_q50", "h_q75"):
-            np.testing.assert_array_equal(
-                np.asarray(ks[name], dtype=np.float64), ref[name], err_msg=name
-            )
-
-    def test_kernel_empty_cells_get_fill_values(self):
-        """Cells with no observations get count=0 and NaN floats, like the default path."""
-        pa = pytest.importorskip("pyarrow")
-        cfg = default_config()
-        children = np.array([1, 2, 3], dtype=np.int64)
-        # Only cell 2 has data.
-        cells = np.array([2, 2, 2], dtype=np.int64)
-        col_dict = {
-            "h_li": np.array([1.0, 2.0, 3.0], dtype=np.float32),
-            "s_li": np.array([0.1, 0.1, 0.1], dtype=np.float32),
-            "leaf_id": cells,
-        }
-        kernel = _kernel_aggregate(pa.table(col_dict), cells, children, "h_li", cfg)
-        ks = kernel["stats_arrays"]
-        assert kernel["cells_with_data"] == 1
-        assert list(ks["count"]) == [0, 3, 0]
-        assert np.isnan(ks["h_min"][0]) and np.isnan(ks["h_min"][2])
-        assert ks["h_min"][1] == 1.0
-
-    def test_kernel_nan_matches_numpy_semantics(self):
-        """NaN-bearing cells: count/min/max stay EXACT vs numpy (NaN-propagating).
-
-        pyarrow's min/max kernels skip NaN; numpy's propagate it. _kernel_aggregate
-        must restore numpy semantics so the "count/min/max exact" contract holds on
-        the NaN-bearing ``h_li`` values ATL06 can carry (the quality_filter is a
-        flag check, not a NaN/fill filter). count is unaffected (NaN is a value, not
-        a null) and mean/variance already propagate NaN like numpy.
-        """
-        pa = pytest.importorskip("pyarrow")
-        cfg = default_config()
-        children = np.array([10, 20, 30], dtype=np.int64)
-        # cell 10: clean; cell 20: one NaN; cell 30: all NaN.
-        cells = np.array([10, 10, 10, 20, 20, 20, 30, 30], dtype=np.int64)
-        h = np.array([1.0, 2.0, 4.0, 1.0, np.nan, 3.0, np.nan, np.nan], dtype=np.float32)
-        s = np.full(len(cells), 0.1, dtype=np.float32)
-        col_dict = {"h_li": h, "s_li": s, "leaf_id": cells}
-
-        ref = self._numpy_reference(col_dict, cells, children, cfg)
-        ks = _kernel_aggregate(pa.table(col_dict), cells, children, "h_li", cfg)["stats_arrays"]
-
-        # count: exact everywhere (NaN counts as a value).
-        np.testing.assert_array_equal(np.asarray(ks["count"], dtype=np.float64), ref["count"])
-        # min/max: bit-identical to numpy, including the NaN cells (10 clean, 20/30
-        # propagate NaN). assert_array_equal treats NaN==NaN here.
-        for name in ("h_min", "h_max"):
-            np.testing.assert_array_equal(
-                np.asarray(ks[name], dtype=np.float64), ref[name], err_msg=name
-            )
-        # Clean cell 10 is finite; NaN cells 20/30 propagate to NaN.
-        assert ks["h_min"][0] == 1.0 and ks["h_max"][0] == 4.0
-        assert np.isnan(ks["h_min"][1]) and np.isnan(ks["h_max"][1])
-        assert np.isnan(ks["h_min"][2]) and np.isnan(ks["h_max"][2])
-        # mean/variance already propagate NaN in both paths -> NaN on cells 20/30.
-        for name in ("h_variance",):
-            assert np.isnan(ks[name][1]) and np.isnan(ref[name][1])
-            assert np.isnan(ks[name][2]) and np.isnan(ref[name][2])
-
-
 class _KernelShardGrid:
-    """Minimal grid stub driving the ``process_shard`` kernel branch.
+    """Minimal grid stub driving ``process_shard`` over canned reads.
 
-    Exposes only what the ``handoff="arrow-kernel"`` path post-read needs:
-    ``children``/``cells_of``/``chunk_coords`` (and ``chunk_shape`` is unused by
-    process_shard itself). Spatial read methods are bypassed because the test
-    monkeypatches ``_read_group`` to return canned tables.
+    Exposes only what the post-read path needs: ``children``/``cells_of``/
+    ``chunk_coords`` (and ``chunk_shape`` is unused by process_shard itself).
+    Spatial read methods are bypassed because the test monkeypatches
+    ``_read_group`` to return canned tables.
     """
 
     def __init__(self, children, leaf_to_cell):
@@ -1772,10 +1558,8 @@ class _KernelShardGrid:
 
 
 class TestProcessShardKernelBranch:
-    """HIGH-2 of PR #33 review: exercise the production ``process_shard`` kernel
-    branch (null guard, ``cells_of``, ``concat_tables().combine_chunks()``, and the
-    ``handoff`` validation), including NaN-bearing input so the NaN-semantics fix is
-    covered end-to-end, not only in ``_kernel_aggregate``."""
+    """Shared canned-read harness (``_patch_reads``) for ``process_shard`` tests,
+    plus the ``handoff`` validation guard."""
 
     def _patch_reads(self, monkeypatch, tables):
         """Make ``_read_group`` yield the canned tables once, then None.
@@ -1792,88 +1576,6 @@ class TestProcessShardKernelBranch:
         monkeypatch.setattr("zagg.processing.h5coro.H5Coro", lambda *a, **k: object())
         # Avoid resolving a real h5coro driver (s3driver import / creds plumbing).
         monkeypatch.setattr("zagg.processing._make_url_rewriter", lambda driver: lambda u: u)
-
-    def test_kernel_branch_matches_default_path(self, monkeypatch):
-        """process_shard(handoff="arrow-kernel") agrees with the default path on the
-        kernel-able stats (count/min/max exact, variance within KERNEL_RTOL),
-        running the real concat + null guard + cells_of."""
-        pa = pytest.importorskip("pyarrow")
-
-        cfg = default_config()
-        leaf_to_cell = {1: 10, 2: 10, 3: 20, 4: 30}
-        children = [10, 20, 30]
-        grid = _KernelShardGrid(children, leaf_to_cell)
-
-        rng = np.random.default_rng(5)
-
-        def make_table(n):
-            leaf = rng.choice([1, 2, 3, 4], size=n).astype(np.int64)
-            h = (rng.standard_normal(n) * 10.0).astype(np.float32)
-            s = (np.abs(rng.standard_normal(n)) + 0.01).astype(np.float32)
-            return pa.table({"h_li": h, "s_li": s, "leaf_id": leaf})
-
-        # Two reads -> exercises pa.concat_tables(...).combine_chunks().
-        tables = [make_table(60), make_table(25)]
-        # Reuse the same data for the default path via a copy of the iterator.
-        kernel_tables = [t for t in tables]
-        default_tables = [t for t in tables]
-
-        self._patch_reads(monkeypatch, kernel_tables)
-        df_k, meta_k = process_shard(
-            grid, 0, ["s3://x"], s3_credentials={}, config=cfg, handoff="arrow-kernel"
-        )
-
-        self._patch_reads(monkeypatch, default_tables)
-        df_d, meta_d = process_shard(
-            grid, 0, ["s3://x"], s3_credentials={}, config=cfg, handoff="arrow"
-        )
-
-        assert meta_k["cells_with_data"] == meta_d["cells_with_data"]
-        assert meta_k["total_obs"] == meta_d["total_obs"] == 85
-        for name in ("count", "h_min", "h_max"):
-            np.testing.assert_array_equal(
-                df_k[name].to_numpy(), df_d[name].to_numpy(), err_msg=name
-            )
-        np.testing.assert_allclose(
-            df_k["h_variance"].to_numpy(),
-            df_d["h_variance"].to_numpy(),
-            rtol=KERNEL_RTOL,
-            equal_nan=True,
-        )
-
-    def test_kernel_branch_nan_input(self, monkeypatch):
-        """End-to-end NaN handling through process_shard's kernel branch: a NaN in
-        ``h_li`` propagates to that cell's min/max (numpy semantics), count is
-        unaffected, and the null guard does NOT trip (NaN is not an Arrow null)."""
-        pa = pytest.importorskip("pyarrow")
-
-        cfg = default_config()
-        leaf_to_cell = {1: 10, 2: 20}
-        children = [10, 20]
-        grid = _KernelShardGrid(children, leaf_to_cell)
-
-        # cell 10 clean, cell 20 has a NaN.
-        table = pa.table(
-            {
-                "h_li": pa.array([1.0, 2.0, 4.0, 5.0, np.nan], type=pa.float32()),
-                "s_li": pa.array([0.1, 0.1, 0.1, 0.1, 0.1], type=pa.float32()),
-                "leaf_id": pa.array([1, 1, 1, 2, 2], type=pa.int64()),
-            }
-        )
-        self._patch_reads(monkeypatch, [table])
-        df, meta = process_shard(
-            grid, 0, ["s3://x"], s3_credentials={}, config=cfg, handoff="arrow-kernel"
-        )
-
-        idx = {c: i for i, c in enumerate(children)}
-        # Clean cell 10: finite extrema.
-        assert df["h_min"].to_numpy()[idx[10]] == 1.0
-        assert df["h_max"].to_numpy()[idx[10]] == 4.0
-        # NaN cell 20: min/max propagate NaN (numpy semantics), count still 2.
-        assert np.isnan(df["h_min"].to_numpy()[idx[20]])
-        assert np.isnan(df["h_max"].to_numpy()[idx[20]])
-        assert df["count"].to_numpy()[idx[20]] == 2
-        assert meta["total_obs"] == 5
 
     def test_invalid_handoff_rejected(self):
         """The ``handoff`` validation rejects unknown carriers before any read."""
@@ -4040,29 +3742,6 @@ class TestChunkPrecompute:
         np.testing.assert_array_equal(offsets, np.array([1.0, 101.0], dtype=np.float32))
         assert offsets[0] != offsets[1]
 
-    def test_arrow_kernel_runs_chunk_precompute(self, monkeypatch):
-        """The kernel path now evaluates chunk_precompute over the pooled arrow
-        table and threads the scalar through the fallback per-cell loop (issue #30,
-        item ii): the per-cell ``offset`` resolves to the pooled chunk anchor,
-        uniform across cells — same result the pandas/arrow carriers produce."""
-        pa = pytest.importorskip("pyarrow")
-        cfg = self._cfg(with_precompute=True)
-        grid = _KernelShardGrid([10, 20], {1: 10, 2: 20})
-        table = pa.table(
-            {
-                "h_ph": np.array([0.0, 2.0, 100.0, 102.0], dtype=np.float32),
-                "leaf_id": np.array([1, 1, 2, 2], dtype=np.int64),
-            }
-        )
-        TestProcessShardKernelBranch()._patch_reads(monkeypatch, [table])
-        df_out, _ = process_shard(
-            grid, 0, ["s3://x"], s3_credentials={}, config=cfg, handoff="arrow-kernel"
-        )
-        offsets = df_out["offset"].to_numpy()
-        pooled_median = np.median([0.0, 2.0, 100.0, 102.0])
-        np.testing.assert_array_equal(offsets, np.full(2, pooled_median, dtype=np.float32))
-        assert offsets[0] == offsets[1]
-
     def test_worked_template_uniform_offset_and_gain(self, monkeypatch):
         """The shipped atl03_waveform_chunk template runs end-to-end through the
         worker and emits a chunk-uniform offset_h/gain_h across two cells whose own
@@ -4191,9 +3870,11 @@ class TestChunkPrecompute:
         )
         TestProcessShardKernelBranch()._patch_reads(monkeypatch, [df])
         # vector field -> arrow table carrier.
+        import arro3.core as ac
+
         tbl, _ = process_shard(grid, 0, ["s3://x"], s3_credentials={}, config=cfg)
         anchored = tbl.column("anchored").combine_chunks()
-        block = anchored.values.to_numpy(zero_copy_only=False).reshape(2, 3)
+        block = ac.list_flatten(anchored).to_numpy().reshape(2, 3)
         chunk_vec = np.percentile([0.0, 2.0, 100.0, 102.0], [25, 50, 75]).astype(np.float32)
         # cell 10 mean = 1.0, cell 20 mean = 101.0.
         np.testing.assert_allclose(block[0], chunk_vec + np.float32(1.0), rtol=1e-5)
@@ -4254,62 +3935,6 @@ class TestChunkPrecompute:
         # Pooled dict only carries h_ph (e.g. 'other' was not read).
         with pytest.raises(ValueError, match="source column 'other' is not present"):
             _eval_chunk_precompute(cfg, {"h_ph": np.array([1.0, 2.0])})
-
-    def test_arrow_kernel_runs_non_scalar_chunk_precompute(self, monkeypatch):
-        """A NON-scalar chunk_precompute result also works on the kernel path: the
-        pooled arrow table is reduced once to a 3-vector, injected into the kernel
-        fallback namespace, and a per-cell scalar expression reduces over it (issue
-        #30, item ii). (A kind: vector OUTPUT is a separate kernel-path gap — the
-        experimental kernel reducer dense-preallocates scalars only — so the
-        per-cell field reduces the chunk array rather than emitting it whole.)"""
-        pa = pytest.importorskip("pyarrow")
-        from zagg.config import PipelineConfig
-
-        cfg = PipelineConfig(
-            data_source={"groups": ["gt1l"], "variables": {"h_ph": "/{group}/h_ph"}},
-            aggregation={
-                "chunk_precompute": {
-                    "chunk_vec": {
-                        "expression": "np.percentile(h_ph, [25, 50, 75])",
-                        "source": "h_ph",
-                        "dtype": "float32",
-                    }
-                },
-                "variables": {
-                    # per-cell scalar reduces over the injected chunk 3-vector.
-                    "anchored": {
-                        "expression": "float(np.sum(chunk_vec)) + float(np.mean(h_ph))",
-                        "source": "h_ph",
-                        "dtype": "float32",
-                    },
-                    "count": {
-                        "function": "len",
-                        "source": "h_ph",
-                        "dtype": "int32",
-                        "fill_value": 0,
-                    },
-                },
-            },
-            output={"grid": {"type": "healpix", "parent_order": 6, "child_order": 12}},
-        )
-        grid = _KernelShardGrid([10, 20], {1: 10, 2: 20})
-        table = pa.table(
-            {
-                "h_ph": np.array([0.0, 2.0, 100.0, 102.0], dtype=np.float32),
-                "leaf_id": np.array([1, 1, 2, 2], dtype=np.int64),
-            }
-        )
-        TestProcessShardKernelBranch()._patch_reads(monkeypatch, [table])
-        df_out, _ = process_shard(
-            grid, 0, ["s3://x"], s3_credentials={}, config=cfg, handoff="arrow-kernel"
-        )
-        anchored = df_out["anchored"].to_numpy()
-        chunk_sum = float(
-            np.sum(np.percentile([0.0, 2.0, 100.0, 102.0], [25, 50, 75]).astype(np.float32))
-        )
-        # cell 10 mean = 1.0, cell 20 mean = 101.0.
-        np.testing.assert_allclose(anchored[0], chunk_sum + 1.0, rtol=1e-5)
-        np.testing.assert_allclose(anchored[1], chunk_sum + 101.0, rtol=1e-5)
 
     def test_degenerate_single_photon_chunk_gain_floor(self, monkeypatch):
         """The worked template's chunk_gain floors to 0.5 on a degenerate pooled
