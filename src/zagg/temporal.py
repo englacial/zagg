@@ -341,9 +341,10 @@ def process_event(
     specs : list[dict]
         Aggregation specs (see :func:`specs_from_config`). Each must provide
         ``output_name``, ``variable``, ``collection``, ``spatial_func``,
-        ``temporal_reducer``, ``mask``; optional keys: ``is_anomaly``,
-        ``negate``, ``transform`` (field-transform name), ``trigger``
-        (event-trigger name).
+        ``temporal_reducer``, ``mask``; optional keys: ``negate``,
+        ``transform`` (field-transform name; ``anomaly: true`` desugars to
+        ``transform: monthly_anomaly`` in :func:`specs_from_config`),
+        ``trigger`` (event-trigger name).
     static_data : dict[str, xr.DataArray | xr.Dataset]
         Static fields keyed by name, e.g. ``ais_mask``, ``cell_areas``,
         ``climatology``. Spatial fields are subset to the event extent.
@@ -421,8 +422,9 @@ def process_event(
                     continue
 
                 var_t = loaded[spec["collection"]][spec["variable"]].sel(time=t)
-                if spec.get("is_anomaly"):
-                    var_t = plugins.get_field_transform("monthly_anomaly")(var_t, static_sub, spec)
+                # Single transform apply path: ``anomaly: true`` is desugared to
+                # ``transform: monthly_anomaly`` in ``specs_from_config``, so a
+                # spec can never double-apply the climatology subtraction.
                 if spec.get("transform"):
                     var_t = plugins.get_field_transform(spec["transform"])(var_t, static_sub, spec)
                 if spec.get("negate"):
@@ -459,12 +461,25 @@ def specs_from_config(config):
     -------
     list[dict]
         Each dict has keys: ``output_name``, ``variable``, ``collection``,
-        ``spatial_func``, ``temporal_reducer``, ``mask``, ``is_anomaly``,
-        ``negate``, ``precip``, and the optional generic hooks ``transform``
+        ``spatial_func``, ``temporal_reducer``, ``mask``, ``negate``,
+        ``precip``, and the optional generic hooks ``transform``
         (field-transform name) and ``trigger`` (event-trigger name).
+
+    Notes
+    -----
+    ``anomaly: true`` is pure sugar for ``transform: monthly_anomaly``: it is
+    desugared here so :func:`process_event` has a *single* transform apply path
+    (the generic ``transform`` hook) and a spec carrying both keys can never
+    double-apply the climatology subtraction (issue #12,
+    https://github.com/englacial/zagg/pull/70#issuecomment-4835411687). An
+    explicit ``transform`` wins if both are set; a same-named ``transform``
+    therefore collapses to a single application.
     """
     specs = []
     for name, meta in config.aggregation.get("variables", {}).items():
+        transform = meta.get("transform")
+        if transform is None and meta.get("anomaly", False):
+            transform = "monthly_anomaly"
         specs.append(
             {
                 "output_name": name,
@@ -473,10 +488,9 @@ def specs_from_config(config):
                 "spatial_func": meta["spatial_func"],
                 "temporal_reducer": meta["temporal_reducer"],
                 "mask": meta.get("mask", "ais"),
-                "is_anomaly": meta.get("anomaly", False),
                 "negate": meta.get("negate", False),
                 "precip": meta.get("precip", False),
-                "transform": meta.get("transform"),
+                "transform": transform,
                 "trigger": meta.get("trigger"),
             }
         )

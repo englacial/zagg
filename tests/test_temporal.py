@@ -216,7 +216,6 @@ class TestSpecsFromConfig:
             "spatial_func",
             "temporal_reducer",
             "mask",
-            "is_anomaly",
             "negate",
             "precip",
             "transform",
@@ -227,11 +226,70 @@ class TestSpecsFromConfig:
 
     def test_flag_defaults_and_overrides(self):
         specs = {s["output_name"]: s for s in specs_from_config(_temporal_config())}
-        assert specs["anom_iwv_full"]["is_anomaly"] is True
-        assert specs["max_t2m_ais"]["is_anomaly"] is False
+        # `anomaly: true` desugars to `transform: monthly_anomaly` (issue #12);
+        # `is_anomaly` is no longer a spec key.
+        assert specs["anom_iwv_full"]["transform"] == "monthly_anomaly"
+        assert specs["max_t2m_ais"]["transform"] is None
+        assert "is_anomaly" not in specs["anom_iwv_full"]
         assert specs["rainfall_ocean"]["precip"] is True
         # default mask is "ais" when omitted; here every spec sets it explicitly
         assert specs["rainfall_ocean"]["mask"] == "ocean"
+
+    def test_anomaly_sugar_equals_explicit_transform(self):
+        # (a) `anomaly: true` produces the same spec as `transform: monthly_anomaly`.
+        from zagg.config import load_config_from_dict
+
+        base = {
+            "variable": "TQV",
+            "collection": "merra2",
+            "spatial_func": "weighted_mean",
+            "temporal_reducer": "weighted_mean",
+            "mask": "full",
+        }
+        config = load_config_from_dict(
+            {
+                "pipeline": {"type": "temporal"},
+                "data_source": {"reader": "xarray_s3", "collections": ["merra2"]},
+                "aggregation": {
+                    "variables": {
+                        "sugar": {**base, "anomaly": True},
+                        "explicit": {**base, "transform": "monthly_anomaly"},
+                    }
+                },
+                "output": {"format": "tabular", "store": "."},
+            }
+        )
+        specs = {s["output_name"]: s for s in specs_from_config(config)}
+        assert specs["sugar"]["transform"] == specs["explicit"]["transform"] == "monthly_anomaly"
+
+    def test_anomaly_and_transform_does_not_double_apply(self):
+        # (b) a spec carrying BOTH `anomaly: true` and `transform: monthly_anomaly`
+        # resolves to a single `transform` -> applied exactly once, no double-apply.
+        from zagg.config import load_config_from_dict
+
+        config = load_config_from_dict(
+            {
+                "pipeline": {"type": "temporal"},
+                "data_source": {"reader": "xarray_s3", "collections": ["merra2"]},
+                "aggregation": {
+                    "variables": {
+                        "both": {
+                            "variable": "TQV",
+                            "collection": "merra2",
+                            "spatial_func": "weighted_mean",
+                            "temporal_reducer": "weighted_mean",
+                            "mask": "full",
+                            "anomaly": True,
+                            "transform": "monthly_anomaly",
+                        }
+                    }
+                },
+                "output": {"format": "tabular", "store": "."},
+            }
+        )
+        (spec,) = specs_from_config(config)
+        assert spec["transform"] == "monthly_anomaly"
+        assert "is_anomaly" not in spec
 
 
 # ---------------------------------------------------------------------------
@@ -399,6 +457,49 @@ class TestProcessEvent:
         results, _ = process_event("storm1", event_mask, collections, specs, static)
         # negated max over {-1,-5,-3} is -1
         assert results["max_t2m"] == pytest.approx(-1.0)
+
+    def test_transform_applied_exactly_once(self):
+        # The desugar gives a single transform apply path: a spec carrying a
+        # `transform` (what `anomaly: true` desugars to) runs it once per
+        # timestep, never twice. A counting transform proves no double-apply.
+        from zagg import registry
+        from zagg.config import load_config_from_dict
+
+        calls = {"n": 0}
+
+        def _counting(var_t, static_data, spec):
+            calls["n"] += 1
+            return var_t
+
+        registry.register_field_transform("counting_anomaly", _counting, replace=True)
+        try:
+            event_mask, collections, _, static = _event_inputs()
+            config = load_config_from_dict(
+                {
+                    "pipeline": {"type": "temporal"},
+                    "data_source": {"reader": "xarray_s3", "collections": ["merra2"]},
+                    "aggregation": {
+                        "variables": {
+                            "max_t2m": {
+                                "variable": "T2M",
+                                "collection": "merra2",
+                                "spatial_func": "max",
+                                "temporal_reducer": "max",
+                                "mask": "full",
+                                "anomaly": True,
+                                "transform": "counting_anomaly",
+                            }
+                        }
+                    },
+                    "output": {"format": "tabular", "store": "."},
+                }
+            )
+            specs = specs_from_config(config)
+            _, meta = process_event("storm1", event_mask, collections, specs, static)
+            # one apply per timestep, not two; 3 timesteps => 3 calls.
+            assert calls["n"] == meta["timesteps_processed"] == 3
+        finally:
+            registry.FIELD_TRANSFORMS._entries.pop("counting_anomaly", None)
 
     @pytest.mark.parametrize("batch", [None, 1, 2, 3])
     def test_sum_batching_invariant(self, batch):

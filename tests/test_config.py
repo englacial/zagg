@@ -1818,7 +1818,8 @@ class TestMerra2StormTemplate:
 
         specs = {s["output_name"]: s for s in specs_from_config(merra2_config)}
         assert set(specs) == {"max_t2m_ais", "anom_tqv_full", "total_precip_ocean"}
-        assert specs["anom_tqv_full"]["is_anomaly"] is True
+        # `anomaly: true` desugars to `transform: monthly_anomaly` (issue #12).
+        assert specs["anom_tqv_full"]["transform"] == "monthly_anomaly"
         for spec in specs.values():
             assert spec["spatial_func"] in registry.list_spatial_funcs()
             assert spec["temporal_reducer"] in registry.list_reducers()
