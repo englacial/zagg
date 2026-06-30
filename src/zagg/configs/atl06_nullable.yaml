@@ -2,11 +2,11 @@
 #
 # This mirrors atl06.yaml but declares ``aggregation.handoff: pandas`` (issue #132):
 # the arro3/arrow read carrier requires dense, null-free columns (its null_cols
-# guard raises on nulls), so a source that can carry nulls -- here h_li is kept
-# WITHOUT the atl06_quality_summary filter that atl06.yaml uses to drop invalid
-# returns, so masked/invalid h_li values survive into the per-cell columns -- must
-# use the pandas carrier, which tolerates nulls natively. The carrier travels with
-# the config; everything else is identical to atl06.yaml.
+# guard raises on nulls), so a source whose columns may carry nulls must use the
+# pandas carrier, which tolerates nulls natively. (Here the quality_filter is also
+# omitted vs atl06.yaml so invalid returns aren't pre-dropped, but nullability is a
+# property of the source data, not of that filter.) The carrier travels with the
+# config; everything else is identical to atl06.yaml.
 data_source:
   reader: h5coro
   driver: s3
