@@ -326,8 +326,7 @@ def test_targets_manifest_consistent():
 def test_forward_matrix_is_tdigest_healpix_arrow_codec_ab():
     # The committed merge matrix is the forward 2x3 codec A/B: every target is
     # tdigest / HEALPix / arrow and carries a codec (sharded|inner) matched to its
-    # sharded bool, paired per order. (o9 is pending its shard map, so the live
-    # matrix is the o10/o11 rows; the full 2x3 is asserted via the renderer test.)
+    # sharded bool, paired per order across o9/o10/o11.
     manifest = json.loads((BENCH / "targets.json").read_text())
     targets = manifest["targets"]
     by_order: dict[str, set[str]] = {}
@@ -346,33 +345,30 @@ def test_forward_matrix_is_tdigest_healpix_arrow_codec_ab():
         assert codecs == {"sharded", "inner"}, f"{order}: incomplete codec pair {codecs}"
 
 
-def test_o9_row_is_pending_not_live():
-    # The o9 row is held out of the live matrix (its shard map build is blocked):
-    # neither a target nor a shardmap references o9, and no o9 shard_key is
-    # fabricated -- it lives only as inert templates under _pending_o9.
+def test_o9_row_is_live():
+    # The o9 row landed (phase 1): its shard map is built and pinned, both columns
+    # reference it, and the _pending_o9 hold-out stanza is gone.
     manifest = json.loads((BENCH / "targets.json").read_text())
-    assert "o9" not in {t["grid_size"] for t in manifest["targets"].values()}
-    assert "healpix_o9" not in manifest["shardmaps"]
-    assert "_pending_o9" in manifest, "expected the o9 hold-out stanza"
-    # The pending templates carry the o9 config + a placeholder (non-numeric) key.
-    tmpl = manifest["_pending_o9"]["target_templates"]
-    assert set(tmpl) == {"tdigest_healpix_o9_sharded", "tdigest_healpix_o9_inner"}
-    for t in tmpl.values():
+    assert "_pending_o9" not in manifest, "o9 hold-out stanza should be removed"
+    o9_targets = {n for n, t in manifest["targets"].items() if t["grid_size"] == "o9"}
+    assert o9_targets == {"tdigest_healpix_o9_sharded", "tdigest_healpix_o9_inner"}
+    for t in (manifest["targets"][n] for n in o9_targets):
+        assert t["shardmap"] == "healpix_o9"
         assert t["config"] == "configs/atl03_tdigest_healpix_o9.yaml"
-    sm = manifest["_pending_o9"]["shardmap_template"]["healpix_o9"]
-    # The key is the literal placeholder, not a (fabricated) numeric pin.
-    assert sm["shard_key"] == "<densest>", "no fabricated o9 shard_key"
-    # The o9 config exists already (phase 2), even though the map is pending.
+    # The shardmap entry is pinned with a real (numeric) densest shard_key.
+    sm = manifest["shardmaps"]["healpix_o9"]
+    assert isinstance(sm["shard_key"], int)
+    assert sm["path"] == "shardmaps/sm_healpix_o9.json"
+    assert (BENCH / sm["path"]).exists()
     assert (BENCH / "configs" / "atl03_tdigest_healpix_o9.yaml").exists()
 
 
-def test_o9_drift_coverage_is_automatic_once_pinned():
+def test_every_live_shardmap_resolves_to_a_config():
     # The drift test parametrizes over manifest["shardmaps"], and the consistency
-    # test over manifest["targets"], so adding the healpix_o9 entry + the two o9
-    # targets (per _pending_o9) will cover o9 with no test change. What this guards
-    # is the wiring that makes that true: every LIVE shardmap must resolve to a
-    # referencing config (the lookup the drift test relies on), so an o9 entry
-    # added the same way is covered the moment it lands.
+    # test over manifest["targets"]; both rely on every LIVE shardmap resolving to
+    # a referencing config (the drift test's _config_for_shardmap lookup). This
+    # guards that wiring -- the invariant that made o9 drop-in coverage automatic
+    # the moment its entry landed, and that keeps any future order covered too.
     import test_benchmark_shardmap as drift
 
     for sm_key in drift.MANIFEST["shardmaps"]:
@@ -1119,7 +1115,7 @@ def test_codec_layout_is_fixed_2x3_sharded_inner_by_order():
 
 
 def test_codec_layout_blanks_missing_order():
-    # o9 not yet landed (its shard map is blocked) -> its row is two blank cells,
+    # A history missing an order (here o9) renders that row as two blank cells;
     # the grid is still a fixed 2x3 so the matrix shape is stable.
     import plot_series
 
