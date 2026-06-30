@@ -34,9 +34,9 @@ def _arrow_column(block: np.ndarray, sig: dict):
 
     The carrier is ``arro3-core`` (issue #130 path C): ~7 MB, zero required deps,
     importable inside the 250 MB Lambda gate — unlike pyarrow, whose Python
-    bindings hard-link a ~100 MB unstrippable C++ core. pyarrow is no longer
-    shipped in the layer; it stays a dep only for off-Lambda ``zagg.catalog`` and
-    the local-only ``handoff='arrow-kernel'`` reducer.
+    bindings hard-link a ~100 MB unstrippable C++ core. pyarrow is no longer shipped
+    in the layer or a core dep; it survives only in the off-Lambda ``catalog`` extra
+    (``zagg.catalog``, via stac-geoparquet).
     """
     from arro3.core import Array, fixed_size_list_array
 

@@ -1531,6 +1531,8 @@ class TestArrowHandoff:
         )
         with pytest.raises(ValueError, match="null-free"):
             _concat_and_group([table], _IdentityGrid(), "arrow")
+
+
 class _KernelShardGrid:
     """Minimal grid stub driving ``process_shard`` over canned reads.
 
@@ -1708,6 +1710,72 @@ class TestVectorCarrier:
         )
         assert isinstance(out, pd.DataFrame)
         np.testing.assert_array_equal(out["count"].to_numpy(), [2, 1])
+
+    def test_default_and_vector_write_path_works_without_pyarrow(self):
+        """The deployed-worker contract (issue #130 path C): the default (scalar
+        pandas) AND the vector arro3 write carrier must run with pyarrow absent —
+        the Lambda layer ships arro3-core, not pyarrow.
+
+        Run in a fresh interpreter that blocks every ``pyarrow`` import via a
+        meta-path finder, reproducing the layer's pyarrow-free closure. (A plain
+        ``sys.modules`` check is unreliable here because the test env installs
+        pyarrow transitively for the off-Lambda ``catalog`` extra, and pandas
+        eagerly imports it when present — neither of which holds on the layer.)
+        """
+        import subprocess
+        import sys
+        import textwrap
+
+        pytest.importorskip("arro3.core")
+        script = textwrap.dedent(
+            """
+            import sys
+
+            class _Blocker:
+                def find_spec(self, name, path, target=None):
+                    if name == "pyarrow" or name.startswith("pyarrow."):
+                        raise ImportError("pyarrow is blocked (deployed-layer guard)")
+                    return None
+
+            sys.meta_path.insert(0, _Blocker())
+
+            import numpy as np
+            from zagg.config import PipelineConfig, get_agg_fields, get_data_vars
+            from zagg.processing.write import _build_output, _iter_carrier_columns
+
+            class _G:
+                group_path = "g"
+                def coords_of(self, children):
+                    return {"morton": np.asarray(children, dtype=np.uint64)}
+                def chunk_coords(self, shard_key):
+                    return {"morton": np.array([0, 1], dtype=np.uint64)}
+
+            cfg = PipelineConfig(
+                data_source={"groups": ["g"]},
+                aggregation={"variables": {
+                    "count": {"function": "len"},
+                    "hist": {"function": "np.bincount", "source": "b", "kind": "vector",
+                             "trailing_shape": 3, "dtype": "int64", "fill_value": 0},
+                }},
+            )
+            stats = {"count": np.array([2, 1], dtype="int64"),
+                     "hist": np.array([[1, 0, 1], [0, 1, 0]], dtype="int64")}
+            # vector (arro3) carrier round-trips with pyarrow blocked
+            tbl = _build_output(stats, get_data_vars(cfg), get_agg_fields(cfg), _G(), 0,
+                                use_arrow=True)
+            assert dict(_iter_carrier_columns(tbl))["hist"].shape == (2, 3)
+            # default (pandas) carrier
+            scfg = PipelineConfig(data_source={"groups": ["g"]},
+                                  aggregation={"variables": {"count": {"function": "len"}}})
+            _build_output({"count": np.array([2, 1])}, ["count"],
+                          get_agg_fields(scfg), _G(), 0, use_arrow=False)
+            assert "pyarrow" not in sys.modules
+            print("OK")
+            """
+        )
+        result = subprocess.run([sys.executable, "-c", script], capture_output=True, text=True)
+        assert result.returncode == 0, f"stdout={result.stdout}\nstderr={result.stderr}"
+        assert "OK" in result.stdout
 
 
 class TestDataSource:

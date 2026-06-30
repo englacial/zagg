@@ -133,13 +133,13 @@ def agg(
         Custom S3-compatible endpoint for the output store (e.g. R2, MinIO).
         Overrides ``output.endpoint_url`` in the config.
     handoff : str
-        Per-cell aggregation carrier/reducer: ``"pandas"`` (default), ``"arrow"``,
-        or ``"arrow-kernel"`` (experimental pyarrow.compute reducer). ``"pandas"``
-        and ``"arrow"`` produce byte-for-byte identical scalar outputs (#30);
-        ``"arrow-kernel"`` agrees within ``KERNEL_RTOL`` (#33). Opt-in for
-        benchmarking. Honored by both the ``"local"`` and ``"lambda"`` backends
-        (issue #130): the lambda backend forwards it into each cell event, and the
-        default ``"pandas"`` keeps the event payload byte-identical (no key).
+        Per-cell aggregation carrier: ``"pandas"`` (default) or ``"arrow"`` (an
+        ``arro3.core`` carrier). Both produce byte-for-byte identical scalar outputs
+        (#30); ``"arrow"`` is opt-in for benchmarking the carrier cost. Honored by
+        both the ``"local"`` and ``"lambda"`` backends (issue #130): the lambda
+        backend forwards it into each cell event, and the default ``"pandas"`` keeps
+        the event payload byte-identical (no key). pyarrow is not used on either
+        path; the experimental ``arrow-kernel`` reducer was dropped with pyarrow.
     profile : bool
         Opt-in per-phase timing (issue #100). When ``True`` (lambda backend),
         forwards ``profile`` into each cell event so the worker emits a
