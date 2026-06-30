@@ -3,8 +3,13 @@
 Two figures, x-axis = labelled merge points (the locked design): (1) cost per
 shard + Lambda runtime; (2) cost per 100 km^2 + runtime. Each figure is a grid of
 per-target panels with cost on the left axis (solid) and runtime on the right
-(dashed), so a regression in either shows up against merge history. Writes the
-PNGs plus a small ``index.html`` for Pages.
+(dashed), so a regression in either shows up against merge history.
+
+Also writes a latest-merge snapshot of the most recent retained run:
+``latest_table.png`` (embedded live in the docs by raw URL, like the charts) plus
+its human/agent-readable companions ``latest.md`` and ``metrics.json`` -- the path
+an agent should follow to reference current benchmark numbers. All artifacts land
+in the output dir alongside a small ``index.html`` for Pages.
 
 matplotlib lives in the ``benchmark`` (and ``analysis``) extra, not core, so this
 is imported lazily and the plot test ``importorskip``s it -- the default test
@@ -70,6 +75,119 @@ def _merge_history(df: pd.DataFrame) -> pd.DataFrame:
     if hist.empty:
         return hist
     return hist.sort_values("timestamp").reset_index(drop=True)
+
+
+def _latest_merge(df: pd.DataFrame) -> pd.DataFrame:
+    """Rows of the single most-recent retained (merge) run, ordered by target.
+
+    The latest merge is the commit owning the newest timestamp; all of that
+    commit's per-target rows come back together (including failed/zero rows, so
+    the published snapshot shows the whole matrix, failures included).
+    """
+    hist = _merge_history(df)
+    if hist.empty:
+        return hist
+    latest_commit = hist.iloc[-1]["commit"]
+    return hist[hist["commit"] == latest_commit].sort_values("target").reset_index(drop=True)
+
+
+def latest_records(df: pd.DataFrame) -> list[dict]:
+    """Latest-merge rows as plain records. Failed/legacy cells come back as the
+    float NaN; the shared ``bench_metrics`` formatter renders those as ``n/a``
+    (and ``write_latest_metrics`` serialises them to JSON ``null``)."""
+    latest = _latest_merge(df)
+    if latest.empty:
+        return []
+    return latest.to_dict(orient="records")
+
+
+def write_latest_markdown(df: pd.DataFrame, out_md: Path) -> bool:
+    """Write the latest-merge table as ``latest.md`` (issue #110). False if no
+    retained run yet."""
+    recs = latest_records(df)
+    if not recs:
+        return False
+    out_md.parent.mkdir(parents=True, exist_ok=True)
+    out_md.write_text(bench_metrics.latest_markdown(recs))
+    return True
+
+
+def write_latest_metrics(df: pd.DataFrame, out_json: Path) -> bool:
+    """Write the latest-merge rows as machine-readable ``metrics.json`` (the path
+    agents/scripts should follow for current numbers). ``to_json`` handles the
+    numpy dtypes and NaN -> null. False if no retained run yet."""
+    latest = _latest_merge(df)
+    if latest.empty:
+        return False
+    out_json.parent.mkdir(parents=True, exist_ok=True)
+    out_json.write_text(latest.to_json(orient="records", indent=2))
+    return True
+
+
+def make_latest_table(df: pd.DataFrame, out_png: Path) -> bool:
+    """Render the latest-merge table as a PNG (embedded live in the docs by raw
+    URL, like the charts). The ``% cap`` cell is shaded on the same green->red
+    memory scale as the chart markers. False if no retained run yet."""
+    import matplotlib
+
+    matplotlib.use("Agg")  # headless CI
+    import matplotlib.pyplot as plt
+    from matplotlib.colors import Normalize
+
+    recs = latest_records(df)
+    if not recs:
+        return False
+
+    cmap = matplotlib.colormaps[MEMORY_CMAP]
+    norm = Normalize(vmin=0.0, vmax=1.0)  # fixed: 1.0 (red) is the OOM wall
+    cap_col = bench_metrics.TABLE_HEADERS.index("% cap")
+
+    cell_text, cell_colours = [], []
+    for r in recs:
+        cells = bench_metrics.format_record_cells(r)
+        cell_text.append([cells[h] for h in bench_metrics.TABLE_HEADERS])
+        row_colours = ["white"] * len(bench_metrics.TABLE_HEADERS)
+        if cells["mem_frac"] is not None:
+            row_colours[cap_col] = cmap(norm(cells["mem_frac"]))
+        cell_colours.append(row_colours)
+
+    head = recs[0]
+    nrows = len(recs)
+    fig, ax = plt.subplots(figsize=(11, 0.5 * nrows + 1.4))
+    ax.axis("off")
+    # Give the target column the room its long names need; split the rest evenly.
+    ncol = len(bench_metrics.TABLE_HEADERS)
+    col_widths = [0.26] + [(1.0 - 0.26) / (ncol - 1)] * (ncol - 1)
+    table = ax.table(
+        cellText=cell_text,
+        colLabels=bench_metrics.TABLE_HEADERS,
+        cellColours=cell_colours,
+        colWidths=col_widths,
+        loc="center",
+        cellLoc="right",
+    )
+    table.auto_set_font_size(False)
+    table.set_fontsize(9)
+    table.scale(1, 1.4)
+    for (row, col), cell in table.get_celld().items():
+        if row == 0:
+            cell.set_text_props(weight="bold")
+        if col == 0:  # left-align the target column
+            cell.set_text_props(ha="left")
+
+    commit = str(head.get("commit") or "")[:7]
+    ts = str(head.get("timestamp") or "")
+    gb = head.get("memory_gb")
+    ax.set_title(
+        f"zagg Lambda benchmark — latest merge {commit} ({ts})\n"
+        f"arm64 · {gb if gb is not None else 'n/a'} GB · one densest shard/target · "
+        "% cap shaded green→red",
+        fontsize=10,
+    )
+    out_png.parent.mkdir(parents=True, exist_ok=True)
+    fig.savefig(out_png, dpi=120, bbox_inches="tight")
+    plt.close(fig)
+    return True
 
 
 def _panel_layout(hist: pd.DataFrame) -> tuple[list[list[str | None]], int, int]:
@@ -282,14 +400,32 @@ def make_figure(df: pd.DataFrame, cost_col: str, cost_label: str, out_png: Path)
     return True
 
 
-def write_index(outdir: Path, rendered: list[str]) -> None:
+def write_index(
+    outdir: Path,
+    rendered: list[str],
+    *,
+    latest_png: bool = False,
+    has_md: bool = False,
+    has_json: bool = False,
+) -> None:
     """Emit a minimal Pages index embedding the rendered figures."""
-    if rendered:
-        imgs = "\n".join(
-            f'<h2>{name}</h2>\n<img src="{name}.png" alt="{name}">' for name in rendered
-        )
-    else:
-        imgs = "<p>No retained benchmark runs yet. Charts appear after the first merge to main.</p>"
+    blocks: list[str] = []
+    if latest_png:
+        links = []
+        if has_md:
+            links.append('<a href="latest.md">latest.md</a>')
+        if has_json:
+            links.append('<a href="metrics.json">metrics.json</a>')
+        block = '<h2>Latest merge</h2>\n<img src="latest_table.png" alt="latest benchmark table">'
+        if links:
+            block += f"\n<p>Machine-readable: {' · '.join(links)}</p>"
+        blocks.append(block)
+    blocks += [f'<h2>{name}</h2>\n<img src="{name}.png" alt="{name}">' for name in rendered]
+    if not blocks:
+        blocks = [
+            "<p>No retained benchmark runs yet. Charts appear after the first merge to main.</p>"
+        ]
+    imgs = "\n".join(blocks)
     html = (
         "<!doctype html>\n<html><head><meta charset='utf-8'>\n"
         "<title>zagg Lambda benchmark</title>\n"
@@ -317,8 +453,22 @@ def main(argv: list[str] | None = None) -> int:
     for name, (col, label) in FIGURES.items():
         if not df.empty and make_figure(df, col, label, outdir / f"{name}.png"):
             rendered.append(name)
-    write_index(outdir, rendered)
-    print(f"rendered {len(rendered)} figure(s) -> {outdir}")
+
+    # Latest-merge snapshot: a PNG (embedded live in the docs), plus its
+    # human/agent-readable companions latest.md + metrics.json (issue #110).
+    latest_png = not df.empty and make_latest_table(df, outdir / "latest_table.png")
+    has_md = not df.empty and write_latest_markdown(df, outdir / "latest.md")
+    has_json = not df.empty and write_latest_metrics(df, outdir / "metrics.json")
+
+    write_index(outdir, rendered, latest_png=latest_png, has_md=has_md, has_json=has_json)
+    extras = [
+        n
+        for n, ok in (("table", latest_png), ("latest.md", has_md), ("metrics.json", has_json))
+        if ok
+    ]
+    print(
+        f"rendered {len(rendered)} figure(s){' + ' + ', '.join(extras) if extras else ''} -> {outdir}"
+    )
     return 0
 
 

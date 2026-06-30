@@ -171,6 +171,52 @@ def test_comment_markdown_empty():
     assert "<!-- zagg-benchmark -->" in bench_metrics.comment_markdown([])
 
 
+def test_format_record_cells_shared_formatting():
+    cells = bench_metrics.format_record_cells(
+        {
+            "target": "t",
+            "total_obs": 1_234_567,
+            "runtime_s": 200.0,
+            "cost_per_shard_usd": 0.005,
+            "cost_per_100km2_usd": 0.05,
+            "worker_pct_timeout": 0.28,
+            "max_memory_mb": 1024.0,
+            "memory_gb": 2.0,
+        }
+    )
+    assert cells["obs"] == "1,234,567"
+    assert cells["cost/shard"] == "$0.00500"
+    assert cells["% cap"] == "50%"
+    assert cells["mem_frac"] == pytest.approx(0.5)
+    # Missing inputs degrade to n/a, not a crash.
+    blank = bench_metrics.format_record_cells({})
+    assert blank["obs"] == "n/a" and blank["% cap"] == "n/a" and blank["mem_frac"] is None
+
+
+def test_latest_markdown_is_retained_table_not_a_comment():
+    g = HealpixGrid(parent_order=11, child_order=19)
+    rec = bench_metrics.build_record(
+        _summary(),
+        grid=g,
+        context={
+            "target": "tdigest_healpix_o11",
+            "commit": "abcdef0123",
+            "timestamp": "2026-06-29T21:04:28Z",
+        },
+    )
+    md = bench_metrics.latest_markdown([rec])
+    assert "<!-- zagg-benchmark -->" not in md  # not a PR-upsert comment
+    assert "tdigest_healpix_o11" in md
+    assert "abcdef0" in md  # short sha
+    assert "| target |" in md  # the shared table block
+    assert "metrics.json" in md  # points agents at the machine-readable companion
+    assert "pre-merge runs are not retained" not in md  # this IS the retained point
+
+
+def test_latest_markdown_empty():
+    assert bench_metrics.latest_markdown([]) == "No benchmark records were produced."
+
+
 def test_comment_markdown_worker_note_banner():
     g = HealpixGrid(parent_order=11, child_order=19)
     rec = bench_metrics.build_record(_summary(), grid=g, context={"target": "t", "commit": "abc"})
@@ -391,6 +437,64 @@ def test_plot_series_smoke(tmp_path):
     assert (outdir / "index.html").exists()
     assert (outdir / "cost_per_shard.png").exists()
     assert (outdir / "cost_per_100km2.png").exists()
+    # Latest-merge snapshot artifacts (issue #110).
+    assert (outdir / "latest_table.png").exists()
+    assert (outdir / "latest.md").exists()
+    assert (outdir / "metrics.json").exists()
+
+
+def _latest_rows(commit, ts, **kw):
+    rows = []
+    for t in ("t1", "t2"):
+        r = _rec_row(commit, t, **kw)
+        r["timestamp"] = ts
+        rows.append(r)
+    return rows
+
+
+def test_plot_series_latest_artifacts_pick_newest_merge(tmp_path):
+    pytest.importorskip("matplotlib")
+    import plot_series
+
+    rows = _latest_rows("old111", "2026-06-01T00:00:00Z", rt=180) + _latest_rows(
+        "new999", "2026-06-29T21:00:00Z", rt=250
+    )
+    series = tmp_path / "series.parquet"
+    update_series.save_series(update_series.records_to_frame(rows), series)
+    outdir = tmp_path / "site"
+    plot_series.main(["--series", str(series), "--out", str(outdir)])
+
+    md = (outdir / "latest.md").read_text()
+    assert "new999"[:7] in md  # the newest merge...
+    assert "old111" not in md  # ...and only it
+    metrics = json.loads((outdir / "metrics.json").read_text())
+    assert {r["commit"] for r in metrics} == {"new999"}
+    assert {r["target"] for r in metrics} == {"t1", "t2"}
+
+
+def test_write_latest_metrics_is_null_safe_json(tmp_path):
+    import plot_series
+
+    # A merge whose memory wasn't reported -> NaN in the frame must serialise to
+    # JSON null, not the bare token NaN (which isn't valid JSON).
+    rows = _latest_rows("c12345", "2026-06-29T21:00:00Z", mem=None)
+    df = update_series.records_to_frame(rows)
+    out = tmp_path / "metrics.json"
+    assert plot_series.write_latest_metrics(df, out) is True
+    text = out.read_text()
+    assert "NaN" not in text  # valid JSON, no bare NaN token
+    metrics = json.loads(text)  # parses cleanly
+    assert all(r["max_memory_mb"] is None for r in metrics)
+
+
+def test_latest_records_empty_when_no_merge(tmp_path):
+    import plot_series
+
+    # Only a PR row -> no retained merge -> no latest artifacts.
+    df = update_series.records_to_frame([_rec_row("p1", "t1", event="pr")])
+    assert plot_series.latest_records(df) == []
+    assert plot_series.write_latest_markdown(df, tmp_path / "latest.md") is False
+    assert plot_series.write_latest_metrics(df, tmp_path / "metrics.json") is False
 
 
 def test_plot_series_empty_writes_placeholder(tmp_path):
