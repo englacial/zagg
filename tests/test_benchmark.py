@@ -320,6 +320,63 @@ def test_targets_manifest_consistent():
         assert n == sm_meta["n_granules"], f"{t['shardmap']}: stale n_granules"
 
 
+# --- forward sharded-vs-inner matrix (issue #133) -------------------------
+
+
+def test_forward_matrix_is_tdigest_healpix_arrow_codec_ab():
+    # The committed merge matrix is the forward 2x3 codec A/B: every target is
+    # tdigest / HEALPix / arrow and carries a codec (sharded|inner) matched to its
+    # sharded bool, paired per order. (o9 is pending its shard map, so the live
+    # matrix is the o10/o11 rows; the full 2x3 is asserted via the renderer test.)
+    manifest = json.loads((BENCH / "targets.json").read_text())
+    targets = manifest["targets"]
+    by_order: dict[str, set[str]] = {}
+    for tname, t in targets.items():
+        assert t["aggregator"] == "tdigest", tname
+        assert t["grid_type"] == "healpix", tname
+        assert t["handoff"] == "arrow", tname
+        assert t["codec"] in ("sharded", "inner"), tname
+        # codec label and the sharded bool run_benchmark applies must agree.
+        assert t["sharded"] is (t["codec"] == "sharded"), tname
+        # The target name encodes its order + codec, matching the metadata.
+        assert tname == f"tdigest_healpix_{t['grid_size']}_{t['codec']}", tname
+        by_order.setdefault(t["grid_size"], set()).add(t["codec"])
+    # Each present order is a complete A/B pair (both columns), never a half-row.
+    for order, codecs in by_order.items():
+        assert codecs == {"sharded", "inner"}, f"{order}: incomplete codec pair {codecs}"
+
+
+def test_o9_row_is_pending_not_live():
+    # The o9 row is held out of the live matrix (its shard map build is blocked):
+    # neither a target nor a shardmap references o9, and no o9 shard_key is
+    # fabricated -- it lives only as inert templates under _pending_o9.
+    manifest = json.loads((BENCH / "targets.json").read_text())
+    assert "o9" not in {t["grid_size"] for t in manifest["targets"].values()}
+    assert "healpix_o9" not in manifest["shardmaps"]
+    assert "_pending_o9" in manifest, "expected the o9 hold-out stanza"
+    # The pending templates carry the o9 config + a placeholder (non-numeric) key.
+    tmpl = manifest["_pending_o9"]["target_templates"]
+    assert set(tmpl) == {"tdigest_healpix_o9_sharded", "tdigest_healpix_o9_inner"}
+    for t in tmpl.values():
+        assert t["config"] == "configs/atl03_tdigest_healpix_o9.yaml"
+    sm = manifest["_pending_o9"]["shardmap_template"]["healpix_o9"]
+    assert not isinstance(sm["shard_key"], int), "no fabricated o9 shard_key"
+    # The o9 config exists already (phase 2), even though the map is pending.
+    assert (BENCH / "configs" / "atl03_tdigest_healpix_o9.yaml").exists()
+
+
+def test_o9_drift_coverage_is_automatic_once_pinned():
+    # The drift test parametrizes over manifest["shardmaps"], and the consistency
+    # test over manifest["targets"], so adding the healpix_o9 entry + the two o9
+    # targets (per _pending_o9) covers o9 with no test change. Guard that wiring:
+    # the drift test must still find a referencing config for every live shardmap.
+    import test_benchmark_shardmap as drift
+
+    for sm_key in drift.MANIFEST["shardmaps"]:
+        cfg = drift._config_for_shardmap(sm_key)  # raises if no target references it
+        assert cfg.exists()
+
+
 # --- provisional (PR-tree-only) handoff targets (issue #130) ---------------
 
 
@@ -1081,6 +1138,19 @@ def test_codec_and_frozen_histories_split_on_codec():
     frozen = plot_series._frozen_history(df)
     assert set(codec["target"]) == {r["target"] for r in _full_codec_matrix("c0")}
     assert set(frozen["target"]) == {"gain_bias_rect_3km"}
+
+
+def test_codec_split_handles_parquet_without_codec_column():
+    # Backward-compat: the live retained parquet predates the codec column until
+    # the first new merge. A frame with NO ``codec`` column must read as all-frozen
+    # (the renderer's ``"codec" not in df.columns`` guard), never KeyError.
+    import plot_series
+
+    df = update_series.records_to_frame([_rec_row("c0", "t1"), _rec_row("c1", "t1")])
+    df = df.drop(columns=["codec"])  # simulate a pre-#133 parquet
+    assert not plot_series._codec_mask(df).any()
+    assert plot_series._codec_history(df).empty
+    assert set(plot_series._frozen_history(df)["target"]) == {"t1"}
 
 
 def test_make_codec_figure_renders_only_codec_rows(tmp_path, monkeypatch):

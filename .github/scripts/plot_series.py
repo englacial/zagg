@@ -235,14 +235,16 @@ def make_codec_latest_table(df: pd.DataFrame, out_png: Path) -> bool:
 
 
 def _panel_layout(hist: pd.DataFrame) -> tuple[list[list[str | None]], int, int]:
-    """Place each target in a ``(row, col)`` grid, data-driven (issue #121 review).
+    """Place each FROZEN target in a ``(row, col)`` grid, data-driven (issue #121
+    review). The forward sharded-vs-inner matrix uses the fixed ``_codec_layout``
+    instead; this lays out the retained rect/gain_bias rows (issue #133 freeze).
 
     Convention: the LEFT column is the rectilinear grids, the RIGHT column is the
     HEALPix grids. A row pairs the two families at the same aggregator and the same
     *shard-size rank* within their family (so e.g. ``rect_6km`` lines up with the
     largest HEALPix shard). Rows are ordered largest-shard-first, top to bottom;
-    same-size rows break ties on the aggregator name. New targets slot in by the
-    same rule -- nothing is hardcoded to today's eight.
+    same-size rows break ties on the aggregator name. The frozen targets slot in by
+    the same rule -- nothing is hardcoded to a fixed target list.
     """
     meta = hist.dropna(subset=["target"]).drop_duplicates("target")
     rows = []
