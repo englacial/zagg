@@ -370,6 +370,72 @@ class TestIO:
         assert "output_fields" not in sm2.grid_signature
 
 
+def _aoi_config(base="atl06_polar"):
+    cfg = default_config(base)
+    cfg.output = {**cfg.output, "aoi_mask": True}
+    return cfg
+
+
+class TestBuildAOIMask:
+    """``ShardMap.build`` precomputes the strict-AOI per-shard payload (issue #101)."""
+
+    def test_off_by_default(self, catalog, grid, fake_spherely):
+        sm = ShardMap.build(catalog, grid, backend="spherely")
+        assert sm.aoi_mask is None
+        assert "aoi_mask" not in sm.metadata
+
+    def test_rectilinear_payload_populated(self, catalog, fake_spherely):
+        grid = RectilinearGrid(
+            "EPSG:32618",
+            10,
+            [359400, 4300740, 369400, 4310740],
+            [250, 250],
+            config=_aoi_config(),
+        )
+        sm = ShardMap.build(catalog, grid, backend="spherely")
+        assert sm.aoi_mask is not None
+        assert len(sm.aoi_mask) == len(sm.shard_keys)
+        assert sm.metadata["aoi_mask"] is True
+        # Each payload is a list of in-AOI cell ids that are valid children of the
+        # shard (the worker maps them by membership over children()).
+        for k, payload in zip(sm.shard_keys, sm.aoi_mask):
+            assert isinstance(payload, list)
+            children = set(int(c) for c in grid.children(int(k)))
+            assert all(int(c) in children for c in payload)
+
+    def test_healpix_payload_is_moc(self):
+        # HEALPix uses the native mortie MOC path (no spherely needed).
+        grid = HealpixGrid(6, 12, layout="fullsphere", config=_aoi_config("atl06"))
+        sm = ShardMap.build(
+            catalog=_catalog([_item("G", -76.62, -76.50)]), grid=grid, backend="mortie"
+        )
+        assert sm.aoi_mask is not None
+        assert len(sm.aoi_mask) == len(sm.shard_keys)
+
+    def test_unsupported_grid_raises(self):
+        from zagg.catalog.shardmap import _compute_aoi_mask
+
+        class _NoAOIGrid:
+            pass
+
+        with pytest.raises(ValueError, match="provides no AOI mask API"):
+            _compute_aoi_mask(_NoAOIGrid(), [(np.array([0.0]), np.array([0.0]))], [1])
+
+    def test_round_trip_carries_payload(self, catalog, fake_spherely):
+        grid = RectilinearGrid(
+            "EPSG:32618",
+            10,
+            [359400, 4300740, 369400, 4310740],
+            [250, 250],
+            config=_aoi_config(),
+        )
+        sm = ShardMap.build(catalog, grid, backend="spherely")
+        with tempfile.NamedTemporaryFile(suffix=".json", delete=False) as f:
+            sm.to_json(f.name)
+            sm2 = ShardMap.from_json(f.name)
+        assert sm2.aoi_mask == sm.aoi_mask
+
+
 class TestSpatialSignature:
     """``spatial_signature()`` is the full signature minus ``output_fields`` (#89)."""
 

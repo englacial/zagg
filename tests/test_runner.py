@@ -371,7 +371,7 @@ class TestInvokeLambdaCellEvent:
 
     _CREDS = {"accessKeyId": "a", "secretAccessKey": "s", "sessionToken": "t"}
 
-    def _captured_event(self, *, child_order, profile=False, handoff="pandas"):
+    def _captured_event(self, *, child_order, profile=False, aoi_payload=None, handoff="pandas"):
         from unittest.mock import MagicMock
 
         from zagg.runner import _invoke_lambda_cell
@@ -394,8 +394,9 @@ class TestInvokeLambdaCellEvent:
             function_name="process-shard",
             config_dict=None,
             max_workers=4,
-            handoff=handoff,
             profile=profile,
+            aoi_payload=aoi_payload,
+            handoff=handoff,
         )
         return json.loads(client.invoke.call_args.kwargs["Payload"])
 
@@ -423,6 +424,18 @@ class TestInvokeLambdaCellEvent:
         # no "profile" key is added.
         event = self._captured_event(child_order=12, profile=False)
         assert "profile" not in event
+
+    def test_aoi_payload_adds_event_key(self):
+        # issue #101: a flag-on Lambda run forwards the per-shard mask payload
+        # under the "aoi_payload" event key for the worker to expand.
+        event = self._captured_event(child_order=12, aoi_payload=[1, 2, 3])
+        assert event["aoi_payload"] == [1, 2, 3]
+
+    def test_default_event_has_no_aoi_payload_key(self):
+        # Default (flag off): no "aoi_payload" key, so the event stays
+        # byte-identical to the pre-feature path (issue #101).
+        event = self._captured_event(child_order=12)
+        assert "aoi_payload" not in event
 
     def test_handoff_adds_event_key(self):
         # issue #130: a non-default handoff forwards "handoff" into the event so
@@ -856,6 +869,151 @@ class TestSummaryKeysByteIdentical:
         assert summary["cells_error"] == 1
         assert summary["total_obs"] == 14
         assert len(summary["results"]) == 3  # raised cell excluded
+
+    def test_local_threads_aoi_payload(self, monkeypatch, atl06_config):
+        # When the manifest carries an aoi_mask list, _run_local threads each
+        # shard's payload into _process_and_write; when it doesn't, the kwarg is
+        # omitted entirely so the flag-off call is unchanged (issue #101).
+        import zagg.grids as grids_mod
+        from zagg import runner
+
+        monkeypatch.setattr(
+            runner,
+            "get_nsidc_s3_credentials",
+            lambda: {"accessKeyId": "a", "secretAccessKey": "s", "sessionToken": "t"},
+        )
+        monkeypatch.setattr(grids_mod, "from_config", lambda *a, **k: _stub_grid())
+        monkeypatch.setattr(runner, "open_store", lambda *a, **k: object())
+        monkeypatch.setattr(runner, "consolidate_metadata", lambda *a, **k: None)
+
+        seen = {}
+
+        def fake_paw(shard_key, chunk_idx, records, grid, s3_creds, zarr_store, config, **kw):
+            seen[int(shard_key)] = kw.get("aoi_payload", "OMITTED")
+            return {"shard_key": shard_key, "total_obs": 1, "error": None}
+
+        monkeypatch.setattr(runner, "_process_and_write", fake_paw)
+
+        cat = _run_catalog()
+        cat["aoi_mask"] = [[1, 2], [3], [], [4, 5]]  # parallel to shard_keys
+        runner._run_local(
+            atl06_config,
+            cat,
+            "./out.zarr",
+            12,
+            max_cells=None,
+            morton_cell=None,
+            max_workers=1,
+            overwrite=False,
+            dry_run=False,
+            region="us-west-2",
+        )
+        assert seen[10] == [1, 2]
+        assert seen[13] == [4, 5]
+
+        # No aoi_mask key -> kwarg omitted (legacy signature preserved).
+        seen.clear()
+        runner._run_local(
+            atl06_config,
+            _run_catalog(),
+            "./out.zarr",
+            12,
+            max_cells=None,
+            morton_cell=None,
+            max_workers=1,
+            overwrite=False,
+            dry_run=False,
+            region="us-west-2",
+        )
+        assert all(v == "OMITTED" for v in seen.values())
+
+    def test_lambda_threads_aoi_payload(self, monkeypatch, atl06_config):
+        # When the manifest carries an aoi_mask list, _run_lambda threads each
+        # shard's payload into _invoke_lambda_cell; when it doesn't, the kwarg is
+        # omitted so the per-cell invoke is byte-identical to the flag-off path
+        # (issue #101).
+        import boto3
+
+        import zagg.grids as grids_mod
+        from zagg import runner
+        from zagg.concurrency import ConcurrencyReport
+
+        monkeypatch.setattr(
+            runner,
+            "get_nsidc_s3_credentials",
+            lambda: {"accessKeyId": "a", "secretAccessKey": "s", "sessionToken": "t"},
+        )
+        monkeypatch.setattr(grids_mod, "from_config", lambda *a, **k: _stub_grid())
+        monkeypatch.setattr(runner, "_invoke_lambda_setup", lambda *a, **k: None)
+        monkeypatch.setattr(runner, "_invoke_lambda_finalize", lambda *a, **k: None)
+        monkeypatch.setattr(runner, "_get_function_timeout_s", lambda *a, **k: 720)
+        from unittest.mock import MagicMock
+
+        monkeypatch.setattr(boto3, "Session", lambda *a, **k: MagicMock())
+        monkeypatch.setattr(
+            runner,
+            "compute_available_workers",
+            lambda requested, *a, **k: (
+                4,
+                ConcurrencyReport(
+                    account_limit=1000,
+                    current_concurrent=0,
+                    padding=100,
+                    available=900,
+                    function_reserved=None,
+                ),
+            ),
+        )
+
+        seen = {}
+
+        def fake_cell(client, chunk_idx, shard_key, *a, **kw):
+            seen[int(shard_key)] = kw.get("aoi_payload", "OMITTED")
+            return {
+                "shard_key": shard_key,
+                "status_code": 200,
+                "body": {"total_obs": 1},
+                "error": None,
+                "timeout": False,
+            }
+
+        monkeypatch.setattr(runner, "_invoke_lambda_cell", fake_cell)
+
+        atl06_config.output = {**atl06_config.output, "aoi_mask": True}
+        cat = _run_catalog()
+        cat["aoi_mask"] = [[1, 2], [3], [], [4, 5]]  # parallel to shard_keys
+        runner._run_lambda(
+            atl06_config,
+            cat,
+            "s3://out/x.zarr",
+            12,
+            max_cells=None,
+            morton_cell=None,
+            max_workers=1,
+            overwrite=False,
+            dry_run=False,
+            region="us-west-2",
+            function_name="fn",
+        )
+        assert seen[10] == [1, 2]
+        assert seen[13] == [4, 5]
+
+        # No aoi_mask key -> kwarg omitted (legacy event preserved).
+        seen.clear()
+        runner._run_lambda(
+            atl06_config,
+            _run_catalog(),
+            "s3://out/x.zarr",
+            12,
+            max_cells=None,
+            morton_cell=None,
+            max_workers=1,
+            overwrite=False,
+            dry_run=False,
+            region="us-west-2",
+            function_name="fn",
+        )
+        assert all(v == "OMITTED" for v in seen.values())
 
     def test_lambda_summary_keys_and_cost(self, monkeypatch, atl06_config):
         import boto3

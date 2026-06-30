@@ -23,7 +23,12 @@ Event payload (default / process mode):
         "endpointUrl": str,     #   endpointUrl, and region are optional.
         "region": str
     },
-    "config": dict (optional, pipeline config as dict)
+    "config": dict (optional, pipeline config as dict),
+    "aoi_payload": list (optional, issue #101) -- this shard's strict-AOI mask
+        payload (a compact MOC for HEALPix / in-AOI cell ids for rectilinear).
+        Forwarded to ``process_shard`` so the worker fills the ``aoi_mask``
+        column; absent when ``output.aoi_mask`` is off (the column is not
+        allocated), keeping the flag-off event and outputs byte-identical.
 }
 
 Setup mode (creates the zarr template once before per-cell fan-out):
@@ -274,6 +279,11 @@ def _handle_process(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
         # read/index/aggregate deltas; the write phase runs in the callback below and
         # is accumulated into the same sub-dict. Default (no key) leaves it unchanged.
         profile = event.get("profile", False)
+        # Strict-AOI mask payload (issue #101): when present, process_shard
+        # expands it into the per-cell ``aoi_mask`` column. Absent (flag off) ->
+        # not passed, so the worker call and outputs are byte-identical. Mirrors
+        # the local runner threading aoi_payload through _process_and_write.
+        aoi_payload = event.get("aoi_payload")
         # Per-cell carrier (issue #130). Absent key -> "pandas", the byte-identical
         # default worker path; "arrow" opts into the arro3-core read carrier for
         # benchmarks. (Neither imports pyarrow; pyarrow is not in the layer.)
@@ -355,6 +365,7 @@ def _handle_process(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
             write_chunk=None if sharded else _write_chunk,
             handoff=handoff,
             profile=profile,
+            aoi_payload=aoi_payload,
         )
 
         # Sharded output (issue #108): bundle the shard's K inner chunks into one

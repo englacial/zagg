@@ -48,7 +48,15 @@ def _arrow_column(block: np.ndarray, sig: dict):
 
 
 def _build_output(
-    stats_arrays, data_vars, agg_fields, grid, shard_key, use_arrow: bool, *, children=None
+    stats_arrays,
+    data_vars,
+    agg_fields,
+    grid,
+    shard_key,
+    use_arrow: bool,
+    *,
+    children=None,
+    aoi_mask=None,
 ):
     """Assemble the per-shard output carrier from the per-cell stats blocks.
 
@@ -61,8 +69,17 @@ def _build_output(
     whole shard's ``grid.chunk_coords(shard_key)``. This is what lets the K>1 worker
     build one carrier per finer chunk. ``None`` (default) is the K==1 path — the
     coords are the shard's, byte-for-byte unchanged.
+
+    ``aoi_mask`` (issue #101): when given, a per-cell ``bool`` array aligned to this
+    chunk's cells is appended as the ``aoi_mask`` column (``True`` where the cell is
+    inside the AOI). ``None`` (default, flag off) appends nothing, so the carrier is
+    byte-for-byte unchanged.
     """
-    coords = grid.coords_of(children) if children is not None else grid.chunk_coords(shard_key)
+    coords = dict(
+        grid.coords_of(children) if children is not None else grid.chunk_coords(shard_key)
+    )
+    if aoi_mask is not None:
+        coords["aoi_mask"] = np.asarray(aoi_mask, dtype=bool)
     if not use_arrow:
         df_out = pd.DataFrame({var: stats_arrays[var] for var in data_vars})
         for col_name, vals in coords.items():
