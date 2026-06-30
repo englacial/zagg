@@ -1,5 +1,5 @@
 {
-  "description": "Pinned Lambda-benchmark targets (issue #110). Each target dispatches ONE shard -- the densest cell over the NEON SERC AOP box -- so cost/runtime deltas track code changes, not data drift. Forward matrix (issue #133): all tdigest / HEALPix / arrow, a 2x3 sharded-vs-inner ShardingCodec (issue #108) A/B across orders o9/o10/o11. The two columns of each order share ONE config + ONE shard map and differ only by the per-target codec key (sharded: true|false), which run_benchmark applies to output.grid.sharded. The o9 row is pending its shard map (see _pending_o9 below). Shard maps are shared per (grid, order): the densest shard does not depend on the codec. Rebuild + drift check: tests/test_benchmark_shardmap.py.",
+  "description": "Pinned Lambda-benchmark targets (issue #110). Each target dispatches ONE shard -- the densest cell over the NEON SERC AOP box -- so cost/runtime deltas track code changes, not data drift. Forward matrix (issue #133): all tdigest / HEALPix / arrow, a 2x3 sharded-vs-inner ShardingCodec (issue #108) A/B across orders o9/o10/o11. The two columns of each order share ONE config + ONE shard map and differ only by the per-target codec key (sharded: true|false), which run_benchmark applies to output.grid.sharded. Shard maps are shared per (grid, order): the densest shard does not depend on the codec. Rebuild + drift check: tests/test_benchmark_shardmap.py.",
   "aoi": {
     "file": "AOP_NEON.geojson",
     "name": "NEON SERC AOP box"
@@ -26,6 +26,11 @@
       "path": "shardmaps/sm_healpix_o10.json",
       "shard_key": 5347405532456026122,
       "n_granules": 50
+    },
+    "healpix_o9": {
+      "path": "shardmaps/sm_healpix_o9.json",
+      "shard_key": 5347395636851376137,
+      "n_granules": 59
     }
   },
   "targets": {
@@ -68,38 +73,26 @@
       "handoff": "arrow",
       "codec": "inner",
       "sharded": false
-    }
-  },
-  "_pending_o9": {
-    "_comment": "PENDING (issue #133, phase 1/3): the o9 row of the 2x3 matrix is held out of 'targets' AND 'shardmaps' until its shard map is built. Building sm_healpix_o9.json needs an anonymous CMR query (cmr.earthdata.nasa.gov), which the routine environment's egress denies (403). A target may not reference a missing shardmap (test_targets_manifest_consistent + the drift test both fail), and a shardmap with no referencing target fails the drift test's _config_for_shardmap lookup -- so the whole o9 row (both columns + the healpix_o9 shardmap) lands together in a follow-up commit the moment the map can be built. The o9 config (configs/atl03_tdigest_healpix_o9.yaml, parent_order 9, K=256) already exists; see shardmaps/sm_healpix_o9.TODO.md for the build command. When ready, add the healpix_o9 shardmap entry and the two o9 targets below to their respective blocks above and delete this stanza.",
-    "shardmap_template": {
-      "healpix_o9": {
-        "path": "shardmaps/sm_healpix_o9.json",
-        "shard_key": "<densest>",
-        "n_granules": "<n>"
-      }
     },
-    "target_templates": {
-      "tdigest_healpix_o9_sharded": {
-        "config": "configs/atl03_tdigest_healpix_o9.yaml",
-        "shardmap": "healpix_o9",
-        "aggregator": "tdigest",
-        "grid_type": "healpix",
-        "grid_size": "o9",
-        "handoff": "arrow",
-        "codec": "sharded",
-        "sharded": true
-      },
-      "tdigest_healpix_o9_inner": {
-        "config": "configs/atl03_tdigest_healpix_o9.yaml",
-        "shardmap": "healpix_o9",
-        "aggregator": "tdigest",
-        "grid_type": "healpix",
-        "grid_size": "o9",
-        "handoff": "arrow",
-        "codec": "inner",
-        "sharded": false
-      }
+    "tdigest_healpix_o9_sharded": {
+      "config": "configs/atl03_tdigest_healpix_o9.yaml",
+      "shardmap": "healpix_o9",
+      "aggregator": "tdigest",
+      "grid_type": "healpix",
+      "grid_size": "o9",
+      "handoff": "arrow",
+      "codec": "sharded",
+      "sharded": true
+    },
+    "tdigest_healpix_o9_inner": {
+      "config": "configs/atl03_tdigest_healpix_o9.yaml",
+      "shardmap": "healpix_o9",
+      "aggregator": "tdigest",
+      "grid_type": "healpix",
+      "grid_size": "o9",
+      "handoff": "arrow",
+      "codec": "inner",
+      "sharded": false
     }
   },
   "provisional_targets": {
