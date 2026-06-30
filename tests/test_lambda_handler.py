@@ -129,13 +129,13 @@ class TestProcessEventDispatch:
 
     def test_handoff_event_key_forwarded_to_worker(self, handler_mod, monkeypatch):
         # issue #130: an explicit handoff event key reaches process_shard so the
-        # deployed worker selects the arrow/arrow-kernel carrier/reducer.
+        # deployed worker selects the arro3 arrow carrier.
         event = _base_event(_healpix_config_dict())
         event["child_order"] = 12
-        event["handoff"] = "arrow-kernel"
+        event["handoff"] = "arrow"
         resp, captured = self._run(handler_mod, monkeypatch, event)
         assert resp["statusCode"] == 200
-        assert captured["handoff"] == "arrow-kernel"
+        assert captured["handoff"] == "arrow"
 
     def test_default_handoff_is_pandas(self, handler_mod, monkeypatch):
         # No handoff key -> the worker runs the byte-identical default ("pandas").

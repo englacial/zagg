@@ -54,7 +54,7 @@ def all_target_names(manifest: dict) -> list[str]:
 
     ``provisional_targets`` (issue #130) are PR-tree-only and runnable by explicit
     ``--target`` name, but are deliberately excluded here so they never join the
-    permanent every-merge matrix until the kernel decision is made.
+    permanent every-merge matrix until the carrier decision is made.
     """
     return list(manifest["targets"].keys())
 
@@ -63,7 +63,7 @@ def _resolve_target(manifest: dict, name: str) -> dict:
     """Look a target up in the committed matrix, then the provisional block.
 
     ``provisional_targets`` lets ``/benchmark --target <name>`` run a PR-tree-only
-    target (the arrow/arrow-kernel comparisons, issue #130) without that target
+    target (the pandas-vs-arrow carrier comparison, issue #130) without that target
     being part of ``targets`` (the committed merge matrix).
     """
     targets = manifest.get("targets", {})
@@ -98,8 +98,8 @@ def run_target(
     shard_key = int(shardmap_meta["shard_key"])
     n_granules = shardmap_meta.get("n_granules")
 
-    # Per-cell carrier/reducer (issue #130). Default "pandas" keeps the dispatched
-    # event byte-identical to a pre-handoff run; arrow/arrow-kernel targets set it.
+    # Per-cell carrier (issue #130). Default "pandas" keeps the dispatched event
+    # byte-identical to a pre-handoff run; the arrow (arro3) target sets it.
     handoff = target.get("handoff", "pandas")
 
     config = load_config(str(config_path))

@@ -373,10 +373,10 @@ class TestInvokeLambdaCellEvent:
 
     def test_handoff_adds_event_key(self):
         # issue #130: a non-default handoff forwards "handoff" into the event so
-        # the deployed worker selects the arrow/arrow-kernel carrier/reducer.
-        for h in ("arrow", "arrow-kernel"):
-            event = self._captured_event(child_order=12, handoff=h)
-            assert event["handoff"] == h
+        # the deployed worker selects the arro3 arrow carrier. (The runner forwards
+        # the string opaquely; the worker validates it.)
+        event = self._captured_event(child_order=12, handoff="arrow")
+        assert event["handoff"] == "arrow"
 
     def test_default_handoff_event_has_no_handoff_key(self):
         # Default (pandas): event payload is byte-identical to the pre-handoff
@@ -997,9 +997,9 @@ class TestProfilePlumbing:
         )
         runner.agg(
             atl06_config, catalog="ignored", store="s3://out/x.zarr",
-            backend="lambda", handoff="arrow-kernel",
+            backend="lambda", handoff="arrow",
         )
-        assert captured["handoff"] == "arrow-kernel"
+        assert captured["handoff"] == "arrow"
 
     def test_agg_default_handoff_is_pandas_on_lambda(self, monkeypatch, atl06_config):
         from zagg import runner

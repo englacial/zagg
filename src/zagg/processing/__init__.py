@@ -82,7 +82,6 @@ __all__ = [
     "write_ragged_to_zarr",
     "write_shard_to_zarr",
     # aggregate-stage helpers
-    "_KERNEL_FUNCS",
     "_build_groups",
     "_coerce_field_value",
     "_coerce_ragged_value",
@@ -93,8 +92,6 @@ __all__ = [
     "_group_columns",
     "_has_ragged_fields",
     "_has_vector_fields",
-    "_kernel_able",
-    "_kernel_aggregate",
     # read-stage helpers
     "_COMPARE",
     "_broadcast_segment_to_base",

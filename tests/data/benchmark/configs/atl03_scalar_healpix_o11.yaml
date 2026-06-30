@@ -1,18 +1,16 @@
 # ATL03 photon-height scalar template (HEALPix, multi-chunk-per-worker).
 #
 # Purely SCALAR per-cell stats over photon heights (h_ph): count, min, max, and
-# variance -- no vector and no ragged field. Every field is a pure (unweighted)
-# group reduction in ``_KERNEL_FUNCS`` (len/min/max/var), so this config is the
-# one that the experimental ``handoff="arrow-kernel"`` Acero hash-aggregate
-# reducer can run end-to-end. It exists purely to benchmark the per-cell handoff
-# (issue #130): the SAME config + SAME shard is dispatched three times --
-# pandas / arrow / arrow-kernel -- to isolate the Arrow carrier cost and the
-# kernel reducer's speedup + accuracy (pandas==arrow byte-identical; arrow-kernel
-# within KERNEL_RTOL). See the ``provisional_targets`` block in targets.json.
+# variance -- no vector and no ragged field. It exists purely to benchmark the
+# per-cell carrier handoff (issue #130): the SAME config + SAME shard is dispatched
+# twice -- pandas / arrow -- to isolate the Arrow carrier cost (pandas DataFrame vs
+# an arro3-core Arrow table; both byte-identical, neither imports pyarrow). See the
+# ``provisional_targets`` block in targets.json. (The earlier arrow-kernel reducer
+# was dropped with pyarrow -- arro3 has no hash-aggregate -- per the path-C pivot.)
 #
 # data_source / read_plan / grid match atl03_tdigest_healpix_o11.yaml exactly
 # (the segment->photon planned IO of issue #43 applies here too); only the
-# aggregation differs -- scalar-only so arrow-kernel is applicable.
+# aggregation differs (scalar-only).
 data_source:
   reader: h5coro
   driver: s3
