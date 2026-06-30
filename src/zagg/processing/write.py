@@ -85,7 +85,14 @@ def _build_output(
 
 
 def _carrier_empty(carrier) -> bool:
-    """Whether a process_shard output carrier (DataFrame or Arrow table) is empty."""
+    """Whether a process_shard output carrier (DataFrame or Arrow table) is empty.
+
+    The arro3 carrier is never built with 0 rows in practice — ``_build_output``
+    sizes it to ``prod(chunk_shape) > 0`` cells, and a no-data shard returns an
+    empty pandas DataFrame before any arro3 table is constructed (arro3 cannot build
+    a 0-length array). The ``num_rows == 0`` arm is kept as a defensive parallel to
+    the DataFrame ``.empty`` check, not a path the worker exercises.
+    """
     if isinstance(carrier, pd.DataFrame):
         return carrier.empty
     return carrier.num_rows == 0
