@@ -7,6 +7,8 @@ Depends only on ``config`` — never on the read or write stages — so the impo
 DAG stays acyclic.
 """
 
+import logging
+import os
 from typing import Any
 
 import numpy as np
@@ -19,6 +21,27 @@ from zagg.config import (
     get_chunk_precompute,
     get_output_signature,
 )
+
+logger = logging.getLogger(__name__)
+
+
+def _rss_mb() -> float:
+    """Current process RSS in MB (Linux ``/proc``; peak ``rusage`` fallback)."""
+    try:
+        with open("/proc/self/statm") as f:
+            return int(f.read().split()[1]) * os.sysconf("SC_PAGE_SIZE") / 1e6
+    except (FileNotFoundError, OSError, ValueError):
+        import resource
+        import sys
+
+        m = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
+        return m / 1e6 if sys.platform == "darwin" else m / 1024  # mac=bytes, linux=KB
+
+
+def _rss_log(stage: str) -> None:
+    """Opt-in per-stage RSS trace (set ``ZAGG_PROFILE_RSS=1``) for #130 diagnostics."""
+    if os.environ.get("ZAGG_PROFILE_RSS"):
+        logger.info(f"  [rss] {stage:34s} {_rss_mb():7.0f} MB")
 
 
 def _field_sentinel(meta: dict) -> float:
@@ -126,6 +149,7 @@ def _concat_and_group(all_reads, grid, handoff: str):
         # table (preserving order), matching pyarrow's concat semantics.
         batches = [b for tbl in all_reads for b in tbl.to_batches()]
         table = Table.from_batches(batches, schema=all_reads[0].schema)
+        _rss_log("arrow: after from_batches")
         # The arrow handoff requires dense, null-free columns: ``_read_group``
         # builds tables from raw h5coro reads (no null mask), so ``to_numpy`` is
         # dtype-exact and matches ``.values`` on the pandas side. Guard the
@@ -135,14 +159,29 @@ def _concat_and_group(all_reads, grid, handoff: str):
         if null_cols:
             raise ValueError(f"arrow handoff requires null-free columns; got nulls in {null_cols}")
         n_obs_total = table.num_rows
+        # ``combine_chunks().to_numpy()`` is the one forced copy: it concatenates
+        # each column's per-read chunks into a fresh contiguous numpy array.
         cols = {n: table.column(n).combine_chunks().to_numpy() for n in table.column_names}
+        _rss_log("arrow: after combine_chunks->numpy")
+        # The pooled data now lives in ``cols`` (numpy). Release EVERY Arrow buffer
+        # before grouping -- the chunked ``table``, its ``batches``, and the per-read
+        # tables in ``all_reads`` (all zero-copy views onto the source read buffers).
+        # Without this the worker holds the pooled data twice through ``_group_columns``,
+        # which doubled peak RSS and OOM'd the densest shard at the 2 GB Lambda cap
+        # (issue #130). ``all_reads`` is not used after this call (worker.py).
+        del table, batches
+        all_reads.clear()
+        _rss_log("arrow: after free Arrow buffers")
         cell_col = grid.cells_of(cols["leaf_id"])
         col_arrays, cell_to_slice = _group_columns(cols, cell_col)
+        _rss_log("arrow: after group")
     else:
         df_all = pd.concat(all_reads, ignore_index=True)
+        _rss_log("pandas: after concat")
         n_obs_total = len(df_all)
         cell_col = grid.cells_of(df_all["leaf_id"].values)
         col_arrays, cell_to_slice = _build_groups(df_all, cell_col)
+        _rss_log("pandas: after group")
     return col_arrays, cell_to_slice, n_obs_total
 
 
