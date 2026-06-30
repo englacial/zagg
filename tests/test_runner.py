@@ -668,6 +668,90 @@ class TestHandoffPassthrough:
         assert captured["handoff"] == "arrow"
 
 
+class TestProcessAndWriteStreaming:
+    """Issue #91: the non-sharded ``_process_and_write`` streams each chunk through a
+    ``write_chunk`` callback (no ``chunk_results`` accumulation). Drive a fake
+    ``process_shard`` that streams 1 and K>1 chunks through the callback and assert
+    the dense ``chunk_idx`` sequence + ragged keying (shard_key at K=1, block-index
+    key at K>1) — the runner-level analogue of the lambda streaming test."""
+
+    def _run(self, monkeypatch, atl06_config, *, chunks_per_shard, chunks):
+        from unittest.mock import MagicMock
+
+        import pandas as pd
+
+        from zagg import runner
+
+        cap = {"dense": [], "ragged": [], "write_chunk": None, "chunk_results": None}
+
+        def fake_process_shard(grid, shard_key, urls, **kwargs):
+            cap["write_chunk"] = kwargs.get("write_chunk")
+            cap["chunk_results"] = kwargs.get("chunk_results")
+            for block_index, carrier, ragged in chunks:
+                kwargs["write_chunk"](block_index, carrier, ragged)
+            return pd.DataFrame(), {"shard_key": shard_key, "error": None}
+
+        grid = MagicMock()
+        grid.sharded = False
+        grid.chunks_per_shard = chunks_per_shard
+        grid.chunk_grid_shape = (4,)
+
+        monkeypatch.setattr(runner, "process_shard", fake_process_shard)
+        monkeypatch.setattr(
+            runner,
+            "write_dataframe_to_zarr",
+            lambda c, st, *, grid, chunk_idx: cap["dense"].append(chunk_idx),
+        )
+        monkeypatch.setattr(
+            runner,
+            "write_ragged_to_zarr",
+            lambda r, st, *, grid, shard_key: cap["ragged"].append(shard_key),
+        )
+        # _block_index_key on a 1-D grid is block_index[0].
+        monkeypatch.setattr(runner, "_block_index_key", lambda b, g: int(b[0]))
+        runner._process_and_write(
+            5,
+            (5,),
+            [_rec(1)],
+            grid=grid,
+            s3_creds={},
+            zarr_store=None,
+            config=atl06_config,
+            driver="s3",
+        )
+        return cap
+
+    def test_k1_streams_ragged_keyed_by_shard_key(self, monkeypatch, atl06_config):
+        import pandas as pd
+
+        cap = self._run(
+            monkeypatch,
+            atl06_config,
+            chunks_per_shard=1,
+            chunks=[((5,), pd.DataFrame(), {"h": ([], [])})],
+        )
+        # Streaming seam wired: callback passed, no accumulation sink.
+        assert callable(cap["write_chunk"]) and cap["chunk_results"] is None
+        assert cap["dense"] == [(5,)]
+        assert cap["ragged"] == [5]  # K=1 -> keyed by shard_key
+
+    def test_k_gt_1_streams_ragged_keyed_by_block_index(self, monkeypatch, atl06_config):
+        import pandas as pd
+
+        cap = self._run(
+            monkeypatch,
+            atl06_config,
+            chunks_per_shard=3,
+            chunks=[
+                ((0,), pd.DataFrame(), {}),
+                ((1,), pd.DataFrame(), {"h": ([], [])}),
+                ((2,), pd.DataFrame(), {}),
+            ],
+        )
+        assert cap["dense"] == [(0,), (1,), (2,)]
+        assert cap["ragged"] == [0, 1, 2]  # K>1 -> keyed by _block_index_key
+
+
 def _stub_grid():
     from unittest.mock import MagicMock
 

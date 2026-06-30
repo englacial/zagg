@@ -16,7 +16,7 @@ import logging
 import time
 import warnings
 from datetime import datetime
-from typing import List, Tuple
+from typing import Callable, List, Tuple
 
 import numpy as np
 import pandas as pd
@@ -55,6 +55,7 @@ def process_shard(
     ragged_out: dict | None = None,
     chunk_results: list | None = None,
     aoi_payload=None,
+    write_chunk: Callable | None = None,
     profile: bool = False,
 ) -> Tuple[pd.DataFrame, ProcessingMetadata]:
     """Process one shard: read granules, filter to this shard, aggregate, return df.
@@ -119,6 +120,20 @@ def process_shard(
         returned ``df_out`` and ragged goes to ``ragged_out`` — byte-for-byte
         unchanged. A caller that passes ``None`` while the grid has K>1 cannot place
         the K carriers, so that combination raises.
+    write_chunk : callable, optional
+        Per-chunk write seam for the multi-chunk path (issue #91). When provided,
+        each chunk's ``(block_index, carrier, ragged)`` is handed to
+        ``write_chunk(block_index, carrier, ragged)`` the moment it is built and its
+        local refs are dropped, instead of being appended to ``chunk_results``. This
+        caps the worker's output-side footprint at ~1 chunk rather than holding all K
+        carriers + ragged at once (the accumulation #91 targets). The callback is the
+        consumer's existing per-chunk write body (runner / lambda handler). It is
+        accepted as the K>1 sink in place of ``chunk_results`` (passing both raises),
+        and at K==1 it streams the lone chunk exactly as the K>1 path would — a true
+        no-op vs the accumulated path (output byte-identical). When ``None`` (default),
+        the ``chunk_results`` / ``ragged_out`` behavior above is unchanged. The
+        sharded path (#108) still bundles all K via ``chunk_results`` /
+        ``write_shard_to_zarr`` and does not pass a callback.
     profile : bool, optional
         Opt-in per-phase timing (issue #100 phase 2). When ``True``, fills
         ``metadata["phase_timings"]`` with ``read`` / ``index`` / ``aggregate``
@@ -293,12 +308,29 @@ def process_shard(
     # K = number of finer Zarr chunks this shard owns (issue #30 item 3). K==1 is
     # the unchanged single-chunk path; K>1 fans the shard into ``grid.iter_chunks``.
     chunks_per_shard = int(getattr(grid, "chunks_per_shard", 1))
-    if chunks_per_shard > 1 and chunk_results is None:
+    if chunk_results is not None and write_chunk is not None:
+        raise ValueError(
+            "process_shard takes either chunk_results (accumulate) or write_chunk "
+            "(stream-and-free, issue #91), not both."
+        )
+    if write_chunk is not None and ragged_out is not None:
+        # When streaming, each chunk's ragged goes straight to write_chunk, so a
+        # ragged_out sink would be left silently empty — reject the ambiguity (as the
+        # chunk_results+write_chunk guard above does) rather than mislead the caller.
+        raise ValueError(
+            "process_shard ignores ragged_out when write_chunk is given (the chunk's "
+            "ragged is delivered to the callback); pass one or the other, not both."
+        )
+    # A K>1 grid needs one of the two multi-chunk sinks: ``chunk_results`` to
+    # accumulate the K carriers or ``write_chunk`` to stream-and-free them (#91).
+    streaming = write_chunk is not None
+    if chunks_per_shard > 1 and chunk_results is None and not streaming:
         raise ValueError(
             f"grid has chunks_per_shard={chunks_per_shard} (chunk_inner set, issue #30 "
-            f"item 3) but process_shard was called without a chunk_results sink; the K "
-            f"per-chunk carriers cannot be returned through the single df_out. Pass "
-            f"chunk_results=[] (the runner does)."
+            f"item 3) but process_shard was called without a chunk_results sink or a "
+            f"write_chunk callback (issue #91); the K per-chunk carriers cannot be "
+            f"returned through the single df_out. Pass chunk_results=[] or write_chunk=... "
+            f"(the runner does)."
         )
 
     _index_t0 = time.time() if profile else None
@@ -374,8 +406,17 @@ def process_shard(
             children=(chunk_children if chunks_per_shard > 1 else None),
             aoi_mask=chunk_aoi_mask,
         )
-        ragged = {name: (ragged_payloads[name], ragged_idx[name]) for name in ragged_payloads}
-        if chunk_results is not None:
+        ragged = (
+            {name: (ragged_payloads[name], ragged_idx[name]) for name in ragged_payloads}
+            if handoff != "arrow-kernel"
+            else {}
+        )
+        if streaming:
+            # Stream-and-free (issue #91): write this chunk now and drop its refs so
+            # peak output-side memory holds ~1 chunk, not all K. Nothing is stashed.
+            write_chunk(block_index, carrier, ragged)
+            del carrier, ragged
+        elif chunk_results is not None:
             chunk_results.append((block_index, carrier, ragged))
         else:
             # K==1 path: stash the lone chunk's carrier + ragged for the 2-tuple
@@ -398,8 +439,10 @@ def process_shard(
 
     # K==1: deliver the lone chunk's carrier as the 2-tuple ``df_out`` and its
     # ragged via ``ragged_out`` (unchanged contract). K>1: the carriers + ragged
-    # were appended to ``chunk_results``; return an empty carrier here.
-    if chunk_results is not None:
+    # were appended to ``chunk_results`` (accumulate) or already handed to
+    # ``write_chunk`` (stream, issue #91); either way nothing is stashed, so return
+    # an empty carrier here.
+    if chunk_results is not None or streaming:
         df_out = pd.DataFrame()
     else:
         df_out = single_carrier if single_carrier is not None else pd.DataFrame()
