@@ -567,7 +567,9 @@ class TestHandoffPassthrough:
         )
         assert captured["handoff"] == "arrow"
 
-    def test_default_handoff_is_pandas(self, monkeypatch, atl06_config):
+    def test_default_handoff_is_arrow(self, monkeypatch, atl06_config):
+        # issue #130: arro3/arrow is the default carrier (faster + lighter on dense
+        # shards); pandas remains available via an explicit handoff="pandas".
         from zagg import runner
 
         captured = {}
@@ -582,7 +584,7 @@ class TestHandoffPassthrough:
             0, (0,), [_rec(1)], grid=None, s3_creds={}, zarr_store=None,
             config=atl06_config, driver="s3",
         )
-        assert captured["handoff"] == "pandas"
+        assert captured["handoff"] == "arrow"
 
 
 def _stub_grid():
@@ -1001,7 +1003,8 @@ class TestProfilePlumbing:
         )
         assert captured["handoff"] == "arrow"
 
-    def test_agg_default_handoff_is_pandas_on_lambda(self, monkeypatch, atl06_config):
+    def test_agg_default_handoff_is_arrow_on_lambda(self, monkeypatch, atl06_config):
+        # issue #130: agg() defaults to the arro3/arrow carrier on the lambda backend.
         from zagg import runner
 
         captured = {}
@@ -1011,7 +1014,7 @@ class TestProfilePlumbing:
             lambda *a, **k: captured.update(handoff=k.get("handoff")) or {},
         )
         runner.agg(atl06_config, catalog="ignored", store="s3://out/x.zarr", backend="lambda")
-        assert captured["handoff"] == "pandas"
+        assert captured["handoff"] == "arrow"
 
 
 class TestWorkerPhaseTimings:
