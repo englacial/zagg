@@ -1935,7 +1935,7 @@ class TestVectorCarrier:
         """Drive process_shard on a canned read via the default (pandas) handoff;
         the output carrier (pandas vs Arrow) is chosen by the config's field kinds,
         independent of the input handoff."""
-        pytest.importorskip("pyarrow")
+        pytest.importorskip("arro3.core")
         leaf_to_cell = {1: 10, 2: 10, 3: 20}
         children = [10, 20]
         grid = _KernelShardGrid(children, leaf_to_cell)
@@ -1954,10 +1954,10 @@ class TestVectorCarrier:
         assert isinstance(df, pd.DataFrame)
 
     def test_vector_config_returns_arrow_table(self, monkeypatch):
-        pa = pytest.importorskip("pyarrow")
+        ac = pytest.importorskip("arro3.core")
         (tbl, _meta), _children = self._run(monkeypatch, self._vector_cfg())
-        assert isinstance(tbl, pa.Table)
-        assert pa.types.is_fixed_size_list(tbl.column("hist").type)
+        assert isinstance(tbl, ac.Table)
+        # arro3 marks a FixedSizeList by an integer ``list_size`` (None for scalar).
         assert tbl.column("hist").type.list_size == 3
 
     def test_scalar_columns_byte_identical_with_and_without_vector(self, monkeypatch):
@@ -1969,16 +1969,17 @@ class TestVectorCarrier:
         for name in ("count", "h_min"):
             np.testing.assert_array_equal(
                 df[name].to_numpy(),
-                tbl.column(name).to_numpy(zero_copy_only=False),
+                tbl.column(name).combine_chunks().to_numpy(),
                 err_msg=name,
             )
 
     def test_vector_column_values(self, monkeypatch):
         """The FixedSizeList payload holds each cell's per-cell vector. cell 10 has
         b=[0,2] -> bincount(minlength=3)=[1,0,1]; cell 20 has b=[1] -> [0,1,0]."""
+        ac = pytest.importorskip("arro3.core")
         (tbl, _meta), children = self._run(monkeypatch, self._vector_cfg())
         hist = tbl.column("hist").combine_chunks()
-        block = hist.values.to_numpy(zero_copy_only=False).reshape(len(children), 3)
+        block = ac.list_flatten(hist).to_numpy().reshape(len(children), 3)
         idx = {c: i for i, c in enumerate(children)}
         np.testing.assert_array_equal(block[idx[10]], [1, 0, 1])
         np.testing.assert_array_equal(block[idx[20]], [0, 1, 0])
@@ -1986,12 +1987,12 @@ class TestVectorCarrier:
     def test_arrow_column_roundtrips_through_iter(self):
         """_arrow_column -> _iter_carrier_columns recovers the (n_cells, C) block,
         the seam the dense vector writer consumes (phase 5)."""
-        pa = pytest.importorskip("pyarrow")
+        ac = pytest.importorskip("arro3.core")
         sig = {"kind": "vector", "trailing_shape": (3,), "dtype": "int64"}
         block = np.array([[1, 0, 1], [0, 1, 0]], dtype=np.int64)
         col = _arrow_column(block, sig)
-        assert pa.types.is_fixed_size_list(col.type)
-        tbl = pa.table({"hist": col})
+        assert col.type.list_size == 3
+        tbl = ac.Table.from_pydict({"hist": col})
         recovered = dict(_iter_carrier_columns(tbl))["hist"]
         np.testing.assert_array_equal(recovered, block)
 
@@ -2064,7 +2065,7 @@ class TestVectorRoundTrip:
         return PipelineConfig(data_source=cfg.data_source, aggregation=agg, output=cfg.output)
 
     def test_vector_leaf_to_zarr_to_read(self):
-        pytest.importorskip("pyarrow")
+        pytest.importorskip("arro3.core")
         from mortie import geo2mort
 
         cfg = self._vector_cfg()
@@ -2121,7 +2122,7 @@ class TestVectorRoundTrip:
         """The writer enforces the single-trailing-chunk invariant: if the target
         array chunks the trailing payload dim, ``set_block_selection`` at block 0
         would drop the rest, so the write must raise instead (issue #29)."""
-        pa = pytest.importorskip("pyarrow")
+        ac = pytest.importorskip("arro3.core")
         from zarr import create_array
 
         class _OneChunkGrid:
@@ -2138,8 +2139,8 @@ class TestVectorRoundTrip:
             dtype="float32",
             fill_value=np.float32("nan"),
         )
-        edges = pa.FixedSizeListArray.from_arrays(pa.array(np.arange(8.0, dtype="float32")), 4)
-        table = pa.table({"edges": edges})
+        edges = ac.fixed_size_list_array(ac.Array.from_numpy(np.arange(8.0, dtype="float32")), 4)
+        table = ac.Table.from_pydict({"edges": edges})
         with pytest.raises(ValueError, match="one whole chunk"):
             write_dataframe_to_zarr(table, store, grid=_OneChunkGrid(), chunk_idx=(0,))
 
@@ -2292,7 +2293,7 @@ class TestChunkResolutionCompanion:
         worker and written to a real Zarr store, stores offset_h/gain_h as
         chunk-resolution companions (one value per chunk), while waveform_counts
         stays a per-cell vector array (issue #30 items 1+2)."""
-        pytest.importorskip("pyarrow")
+        pytest.importorskip("arro3.core")
         from zagg.grids import RectilinearGrid
 
         cfg = default_config("atl03_waveform_chunk")
@@ -4067,7 +4068,7 @@ class TestChunkPrecompute:
         worker and emits a chunk-uniform offset_h/gain_h across two cells whose own
         photon distributions differ (low vs high), proving the bin-28 window is set
         once over the pooled shard, not per cell."""
-        pytest.importorskip("pyarrow")
+        pytest.importorskip("arro3.core")
         cfg = default_config("atl03_waveform_chunk")
         leaf_to_cell = {1: 10, 2: 20}
         children = [10, 20]
@@ -4085,8 +4086,8 @@ class TestChunkPrecompute:
         TestProcessShardKernelBranch()._patch_reads(monkeypatch, [df])
         tbl, _meta = process_shard(grid, 0, ["s3://x"], s3_credentials={}, config=cfg)
         # vector waveform field -> arrow table carrier.
-        offset = tbl.column("offset_h").to_numpy(zero_copy_only=False)
-        gain = tbl.column("gain_h").to_numpy(zero_copy_only=False)
+        offset = tbl.column("offset_h").combine_chunks().to_numpy()
+        gain = tbl.column("gain_h").combine_chunks().to_numpy()
         assert offset[0] == offset[1]
         assert gain[0] == gain[1]
         # chunk_offset is now the DEM anchor: floor(min(pooled dem_h)).
@@ -4314,7 +4315,7 @@ class TestChunkPrecompute:
         """The worked template's chunk_gain floors to 0.5 on a degenerate pooled
         range (single photon / all-equal heights) WITHOUT a log2(0) divide-by-zero
         warning — the range is clamped before log2 and the 0.5 m floor applies."""
-        pytest.importorskip("pyarrow")
+        pytest.importorskip("arro3.core")
         cfg = default_config("atl03_waveform_chunk")
         children = [10, 20]
         grid = _KernelShardGrid(children, {1: 10, 2: 20})
@@ -4333,7 +4334,7 @@ class TestChunkPrecompute:
         with warnings.catch_warnings():
             warnings.simplefilter("error")  # any RuntimeWarning would fail the test
             tbl, _meta = process_shard(grid, 0, ["s3://x"], s3_credentials={}, config=cfg)
-        gain = tbl.column("gain_h").to_numpy(zero_copy_only=False)
+        gain = tbl.column("gain_h").combine_chunks().to_numpy()
         np.testing.assert_array_equal(gain, np.full(2, np.float32(0.5)))
 
     def test_absent_block_matches_plain_path_values(self, monkeypatch):
