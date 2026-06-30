@@ -103,6 +103,13 @@ def run_target(
     handoff = target.get("handoff", "pandas")
 
     config = load_config(str(config_path))
+    # The ShardingCodec (issue #108) is the experimental variable of the forward
+    # benchmark (issue #133): the matrix carries ``sharded: true|false`` per target
+    # so one config drives both columns. Apply it to the grid block (where
+    # ``get_sharded`` reads it) when present; absent leaves the config's own
+    # default, so frozen/legacy targets dispatch byte-identically to before.
+    if "sharded" in target:
+        config.output.setdefault("grid", {})["sharded"] = bool(target["sharded"])
     # parent_order lives in the config grid for HEALPix; the kwarg is just a
     # legacy fallback. Rect grids ignore it. ``from_config`` gives us the grid
     # object the area/cost derivation needs.
