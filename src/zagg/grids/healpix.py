@@ -264,16 +264,19 @@ class HealpixGrid:
 
     # ── strict-AOI cell mask (issue #101, optional) ─────────────────────────
 
-    def aoi_moc(self, polygon_parts) -> np.ndarray:
+    def aoi_moc(self, aoi) -> np.ndarray:
         """Compact MOC of the AOI at ``child_order`` (native morton; issue #101).
 
-        Built once at the shard-map stage next to :meth:`coverage`. The per-shard
-        slices (:meth:`aoi_shard_moc`) ride the manifest; each worker expands its
-        slice to a cell-order boolean via :meth:`aoi_mask_for_children`.
+        ``aoi`` is an :class:`~zagg.grids.aoi.AOIGeometry` (WKB/WKT or ``(lats,
+        lons)`` ring parts) or, for back-compatibility, a bare parts list. WKB/WKT
+        rides mortie's public ``from_wkb`` / ``from_wkt`` cover entry points and
+        yields the identical MOC to the equivalent ring. Built once at the shard-map
+        stage next to :meth:`coverage`; the per-shard slices (:meth:`aoi_shard_moc`)
+        ride the manifest, expanded per worker via :meth:`aoi_mask_for_children`.
         """
-        from zagg.grids.aoi import healpix_aoi_moc
+        from zagg.grids.aoi import as_aoi_geometry, healpix_aoi_moc_from_geometry
 
-        return healpix_aoi_moc(polygon_parts, self.child_order)
+        return healpix_aoi_moc_from_geometry(as_aoi_geometry(aoi), self.child_order)
 
     def aoi_shard_moc(self, aoi_moc, shard_key) -> np.ndarray:
         """Restrict the AOI MOC to one shard (compact per-shard sub-MOC)."""

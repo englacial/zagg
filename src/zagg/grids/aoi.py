@@ -20,8 +20,12 @@ and carried per shard in the manifest JSON:
   ``contains`` test after reprojecting the AOI polygon to the grid CRS (the same
   ``to_crs`` path ``coverage`` uses).
 
-The WKB/WKT polygon-input path is deferred (espg/mortie#71) — these helpers take
-the same ``[(lats, lons), ...]`` parts contract as ``coverage``.
+The AOI polygon may be supplied either as ``[(lats, lons), ...]`` ring parts (the
+``coverage`` contract) or as a native **WKB/WKT geometry** (issue #101): the
+HEALPix MOC rides mortie's public ``from_wkb`` / ``from_wkt`` cover entry points
+(espg/mortie#89, mortie >= 0.8.3) and the rectilinear path reprojects the
+shapely-loaded geometry, so a WKB/WKT AOI yields the *identical* mask to the
+equivalent ring. :class:`AOIGeometry` normalizes either form.
 """
 
 from __future__ import annotations
@@ -76,6 +80,110 @@ def _assert_mortie_version() -> None:
         )
 
 
+# ── AOI geometry: (lats, lons) rings OR a WKB/WKT geometry ───────────────────
+#
+# The AOI may be supplied two ways (issue #101): the original
+# ``[(lats, lons), ...]`` exterior-ring parts, or a native geometry as WKB bytes /
+# WKT text. WKB/WKT ingest is routed to mortie's public ``from_wkb`` / ``from_wkt``
+# cover entry points on the HEALPix side (espg/mortie#89, mortie >= 0.8.3) and to
+# shapely's loaders on the rectilinear side, so a WKB/WKT AOI produces *exactly the
+# same* cover/mask as passing the equivalent ``(lats, lons)`` ring. ``AOIGeometry``
+# normalizes either input to a common carrier the shard-map builder consumes; a
+# default-OFF run never constructs one, so flag-off byte-identity is preserved.
+
+
+class AOIGeometry:
+    """Normalized AOI carrier — either ``(lats, lons)`` parts or a WKB/WKT geometry.
+
+    Construct with exactly one source:
+
+    - :meth:`from_parts` — the legacy ``[(lats, lons), ...]`` exterior-ring parts.
+    - :meth:`from_wkb` / :meth:`from_wkt` — a native geometry as WKB bytes / WKT
+      text (Polygon / MultiPolygon, optionally with holes).
+
+    Both engines read :attr:`parts` for the shard universe (``grid.coverage``); the
+    HEALPix MOC and rectilinear-polygon builders additionally take the carrier so a
+    WKB/WKT source rides mortie's / shapely's native loaders rather than a lossy
+    round-trip through ``parts``.
+    """
+
+    __slots__ = ("parts", "wkb", "wkt")
+
+    def __init__(self, *, parts=None, wkb=None, wkt=None):
+        self.parts = parts
+        self.wkb = wkb
+        self.wkt = wkt
+
+    @classmethod
+    def from_parts(cls, polygon_parts) -> "AOIGeometry":
+        return cls(
+            parts=[
+                (np.asarray(p[0], dtype=float), np.asarray(p[1], dtype=float))
+                for p in polygon_parts
+            ]
+        )
+
+    @classmethod
+    def from_wkb(cls, data) -> "AOIGeometry":
+        return cls(wkb=bytes(data), parts=_parts_from_shapely(_shapely_from_wkb(data)))
+
+    @classmethod
+    def from_wkt(cls, text) -> "AOIGeometry":
+        return cls(wkt=str(text), parts=_parts_from_shapely(_shapely_from_wkt(text)))
+
+
+def as_aoi_geometry(aoi) -> AOIGeometry:
+    """Coerce a user-supplied AOI to an :class:`AOIGeometry`.
+
+    Accepts an existing :class:`AOIGeometry`, WKB ``bytes``, a WKT ``str``, or the
+    legacy ``[(lats, lons), ...]`` parts list (the default path). Bytes -> WKB, a
+    ``str`` -> WKT; anything else is treated as parts.
+    """
+    if isinstance(aoi, AOIGeometry):
+        return aoi
+    if isinstance(aoi, (bytes, bytearray, memoryview)):
+        return AOIGeometry.from_wkb(aoi)
+    if isinstance(aoi, str):
+        return AOIGeometry.from_wkt(aoi)
+    return AOIGeometry.from_parts(aoi)
+
+
+def _shapely_from_wkb(data):
+    import shapely
+
+    return shapely.from_wkb(bytes(data))
+
+
+def _shapely_from_wkt(text):
+    import shapely
+
+    return shapely.from_wkt(str(text))
+
+
+def _parts_from_shapely(geom):
+    """Exterior rings of a (Multi)Polygon as ``[(lats, lons), ...]`` parts.
+
+    Mirrors ``zagg.catalog.load_polygon``: one pair per polygon exterior in WGS84
+    lat/lon order. Used so a WKB/WKT AOI still feeds ``grid.coverage`` (the shard
+    universe) through the same ``(lats, lons)`` contract as a ring AOI.
+    """
+    gtype = geom.geom_type
+    if gtype == "Polygon":
+        polys = [geom]
+    elif gtype == "MultiPolygon":
+        polys = list(geom.geoms)
+    else:
+        raise ValueError(
+            f"AOI geometry must be a Polygon or MultiPolygon (got {gtype!r}); "
+            "supply WKB/WKT for a (multi)polygon area of interest."
+        )
+    parts = []
+    for poly in polys:
+        coords = np.asarray(poly.exterior.coords, dtype=float)
+        parts.append((coords[:, 1], coords[:, 0]))  # shapely is (lon, lat)
+    return parts
+
+
 # ── HEALPix: native-morton MOC mask ──────────────────────────────────────────
 
 
@@ -94,6 +202,28 @@ def healpix_aoi_moc(polygon_parts, order: int) -> np.ndarray:
     lons_parts = [np.asarray(p[1], dtype=float) for p in polygon_parts]
     moc = np.asarray(morton_coverage_moc(lats_parts, lons_parts, order=order), dtype=np.uint64)
     return moc
+
+
+def healpix_aoi_moc_from_geometry(aoi: AOIGeometry, order: int) -> np.ndarray:
+    """AOI MOC at ``order`` from an :class:`AOIGeometry` (WKB/WKT or ring parts).
+
+    A WKB/WKT source rides mortie's public ``from_wkb`` / ``from_wkt`` cover entry
+    points (espg/mortie#89) with ``moc=True`` — which decompose the geometry and
+    route Polygon/MultiPolygon to ``morton_coverage_moc``, so the result is *exactly
+    the same* compact MOC as calling :func:`healpix_aoi_moc` on the equivalent
+    ``(lats, lons)`` ring (verified bit-for-bit in ``tests/test_aoi_mask.py``). A
+    parts source falls back to :func:`healpix_aoi_moc`.
+    """
+    _assert_mortie_version()
+    if aoi.wkb is not None:
+        from mortie import from_wkb
+
+        return np.asarray(from_wkb(aoi.wkb, order=order, moc=True), dtype=np.uint64)
+    if aoi.wkt is not None:
+        from mortie import from_wkt
+
+        return np.asarray(from_wkt(aoi.wkt, order=order, moc=True), dtype=np.uint64)
+    return healpix_aoi_moc(aoi.parts, order)
 
 
 def healpix_shard_moc(aoi_moc: np.ndarray, shard_key: int) -> np.ndarray:
@@ -170,6 +300,20 @@ def rectilinear_aoi_polygon(polygon_parts, crs):
     return geom.to_crs(crs, resolution="auto").geom
 
 
+def rectilinear_aoi_polygon_from_geometry(aoi: AOIGeometry, crs):
+    """Reprojected AOI polygon from an :class:`AOIGeometry` (WKB/WKT or ring parts).
+
+    Routes through the exterior-ring ``parts`` :class:`AOIGeometry` already extracts
+    (via shapely for WKB/WKT) into :func:`rectilinear_aoi_polygon`, so a WKB/WKT AOI
+    reprojects through the *same* odc.geo densify + ``to_crs`` path — hence the same
+    grid-CRS polygon and the same cell-center ``contains`` mask — as the equivalent
+    ``(lats, lons)`` ring. Like the ring path, rectilinear is exterior-ring strict
+    (holes in a WKB/WKT source are not subtracted, matching the legacy contract;
+    the HEALPix engine honors holes natively via ``from_geometry``).
+    """
+    return rectilinear_aoi_polygon(aoi.parts, crs)
+
+
 def rectilinear_mask_for_centers(aoi_geom, xs, ys) -> np.ndarray:
     """Boolean — ``True`` where ``(xs[i], ys[i])`` (cell centers, grid CRS) is in the AOI.
 
@@ -188,9 +332,13 @@ def rectilinear_mask_for_centers(aoi_geom, xs, ys) -> np.ndarray:
 
 __all__ = [
     "MIN_MORTIE_VERSION",
+    "AOIGeometry",
+    "as_aoi_geometry",
     "healpix_aoi_moc",
+    "healpix_aoi_moc_from_geometry",
     "healpix_shard_moc",
     "healpix_mask_for_children",
     "rectilinear_aoi_polygon",
+    "rectilinear_aoi_polygon_from_geometry",
     "rectilinear_mask_for_centers",
 ]

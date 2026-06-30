@@ -538,3 +538,130 @@ class TestEndToEndWrite:
             b = baseline._store_dict[k].to_bytes()
             f = flag_off._store_dict[k].to_bytes()
             assert b == f, k
+
+
+def _box_wkt(lat0, lon0, lat1, lon1):
+    """The same closed box as ``_box`` but as a WKT POLYGON string (lon lat order)."""
+    pts = [(lon0, lat0), (lon1, lat0), (lon1, lat1), (lon0, lat1), (lon0, lat0)]
+    coords = ", ".join(f"{x} {y}" for x, y in pts)
+    return f"POLYGON(({coords}))"
+
+
+class TestWKBWKTInput:
+    """WKB/WKT AOI input (issue #101): a geometry supplied as WKB bytes / WKT text
+    must yield the *identical* mask to the equivalent ``(lats, lons)`` ring, on both
+    the HEALPix native-morton MOC engine and the rectilinear shapely-center engine.
+    Rides mortie's public ``from_wkb`` / ``from_wkt`` (espg/mortie#89, >= 0.8.3)."""
+
+    def test_healpix_moc_wkt_equals_ring(self):
+        from zagg.grids.aoi import (
+            AOIGeometry,
+            healpix_aoi_moc,
+            healpix_aoi_moc_from_geometry,
+        )
+
+        order = 8
+        box = (10.0, 10.0, 20.0, 20.0)
+        ring = healpix_aoi_moc(_box(*box), order)
+        wkt = healpix_aoi_moc_from_geometry(AOIGeometry.from_wkt(_box_wkt(*box)), order)
+        assert wkt.dtype == np.uint64
+        np.testing.assert_array_equal(np.sort(ring), np.sort(wkt))
+
+    def test_healpix_moc_wkb_equals_ring(self):
+        import shapely
+
+        from zagg.grids.aoi import (
+            AOIGeometry,
+            healpix_aoi_moc,
+            healpix_aoi_moc_from_geometry,
+        )
+
+        order = 8
+        box = (10.0, 10.0, 20.0, 20.0)
+        wkb = shapely.from_wkt(_box_wkt(*box)).wkb
+        ring = healpix_aoi_moc(_box(*box), order)
+        geo = healpix_aoi_moc_from_geometry(AOIGeometry.from_wkb(wkb), order)
+        np.testing.assert_array_equal(np.sort(ring), np.sort(geo))
+
+    def test_healpix_mask_wkt_equals_ring_end_to_end(self):
+        # The whole per-shard mask (not just the MOC) must match: build via the grid
+        # method with a WKT AOI and with the ring AOI, and compare the cell-order
+        # boolean over a shard the AOI touches.
+        from mortie import moc_to_order
+
+        grid = HealpixGrid(parent_order=4, child_order=8, layout="fullsphere")
+        box = (10.0, 10.0, 20.0, 20.0)
+        moc_ring = grid.aoi_moc(_box(*box))
+        moc_wkt = grid.aoi_moc(_box_wkt(*box))  # str -> WKT via as_aoi_geometry
+        flat = np.unique(np.asarray(moc_to_order(moc_ring, grid.child_order), dtype=np.uint64))
+        shard = int(grid.shards_of(grid.cells_of(flat[:1]))[0])
+        children = np.asarray(grid.children(shard), dtype=np.uint64)
+        m_ring = grid.aoi_mask_for_children(grid.aoi_shard_moc(moc_ring, shard), children)
+        m_wkt = grid.aoi_mask_for_children(grid.aoi_shard_moc(moc_wkt, shard), children)
+        assert m_ring.any()
+        np.testing.assert_array_equal(m_ring, m_wkt)
+
+    def _rect_grid(self):
+        from zagg.grids import RectilinearGrid
+
+        return RectilinearGrid(
+            crs="EPSG:3413",
+            resolution=1000.0,
+            bounds=[0.0, 0.0, 20000.0, 20000.0],
+            chunk_shape=(4, 4),
+        )
+
+    def test_rectilinear_mask_wkt_equals_ring(self):
+        grid = self._rect_grid()
+        box = (60.0, -40.0, 75.0, -20.0)
+        ring_geom = grid.aoi_polygon(_box(*box))
+        wkt_geom = grid.aoi_polygon(_box_wkt(*box))  # str -> WKT
+        children = grid.children(0)
+        m_ring = grid.aoi_mask_for_children(ring_geom, children)
+        m_wkt = grid.aoi_mask_for_children(wkt_geom, children)
+        assert m_ring.shape == np.asarray(children).shape
+        np.testing.assert_array_equal(m_ring, m_wkt)
+
+    def test_rectilinear_mask_wkb_equals_ring(self):
+        import shapely
+
+        grid = self._rect_grid()
+        box = (60.0, -40.0, 75.0, -20.0)
+        wkb = shapely.from_wkt(_box_wkt(*box)).wkb
+        m_ring = grid.aoi_mask_for_children(grid.aoi_polygon(_box(*box)), grid.children(0))
+        m_wkb = grid.aoi_mask_for_children(grid.aoi_polygon(wkb), grid.children(0))
+        np.testing.assert_array_equal(m_ring, m_wkb)
+
+    def test_as_aoi_geometry_dispatch(self):
+        import shapely
+
+        from zagg.grids.aoi import AOIGeometry, as_aoi_geometry
+
+        wkt = _box_wkt(10.0, 10.0, 20.0, 20.0)
+        assert as_aoi_geometry(wkt).wkt == wkt
+        assert as_aoi_geometry(shapely.from_wkt(wkt).wkb).wkb is not None
+        passthru = AOIGeometry.from_parts(_box(10.0, 10.0, 20.0, 20.0))
+        assert as_aoi_geometry(passthru) is passthru
+        # bare parts list -> parts carrier (the legacy default path)
+        coerced = as_aoi_geometry(_box(10.0, 10.0, 20.0, 20.0))
+        assert coerced.wkb is None and coerced.wkt is None and coerced.parts is not None
+
+    def test_non_polygon_geometry_rejected(self):
+        from zagg.grids.aoi import AOIGeometry
+
+        with pytest.raises(ValueError, match="Polygon or MultiPolygon"):
+            AOIGeometry.from_wkt("LINESTRING(0 0, 1 1)")
+
+    def test_shardmap_build_threads_wkt_aoi(self):
+        # End-to-end at the shard-map stage: an explicit WKT aoi must produce the
+        # same manifest aoi_mask payload as the equivalent ring aoi (flag on).
+        from zagg.catalog.shardmap import _compute_aoi_mask
+
+        grid = HealpixGrid(parent_order=4, child_order=8, layout="fullsphere")
+        box = (10.0, 10.0, 20.0, 20.0)
+        from zagg.grids.aoi import as_aoi_geometry
+
+        shards = sorted(int(s) for s in grid.coverage(_box(*box)))[:3]
+        ring = _compute_aoi_mask(grid, as_aoi_geometry(_box(*box)), shards)
+        wkt = _compute_aoi_mask(grid, as_aoi_geometry(_box_wkt(*box)), shards)
+        assert ring == wkt

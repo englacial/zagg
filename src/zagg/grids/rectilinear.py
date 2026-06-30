@@ -450,16 +450,20 @@ class RectilinearGrid:
 
     # ── strict-AOI cell mask (issue #101, optional) ─────────────────────────
 
-    def aoi_polygon(self, polygon_parts):
-        """Reproject the AOI ``[(lats, lons), ...]`` parts to the grid CRS.
+    def aoi_polygon(self, aoi):
+        """Reproject the AOI to the grid CRS as a shapely polygon.
 
-        Built once at the shard-map stage (same ``to_crs`` reprojection
-        :meth:`coverage` uses); the per-shard boolean (:meth:`aoi_mask_for_children`)
-        is precomputed against it and carried in the manifest.
+        ``aoi`` is an :class:`~zagg.grids.aoi.AOIGeometry` (WKB/WKT or ``(lats,
+        lons)`` ring parts) or, for back-compatibility, a bare parts list. A WKB/WKT
+        source reprojects through the same odc.geo densify + ``to_crs`` path as the
+        equivalent ring, so the cell-center ``contains`` mask is identical. Built
+        once at the shard-map stage; the per-shard boolean
+        (:meth:`aoi_mask_for_children`) is precomputed against it and carried in the
+        manifest.
         """
-        from zagg.grids.aoi import rectilinear_aoi_polygon
+        from zagg.grids.aoi import as_aoi_geometry, rectilinear_aoi_polygon_from_geometry
 
-        return rectilinear_aoi_polygon(polygon_parts, self._geobox.crs)
+        return rectilinear_aoi_polygon_from_geometry(as_aoi_geometry(aoi), self._geobox.crs)
 
     def aoi_mask_for_children(self, aoi_geom, children) -> np.ndarray:
         """Boolean over ``children`` — ``True`` where the cell center is in the AOI.

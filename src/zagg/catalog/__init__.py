@@ -128,7 +128,9 @@ def load_antarctic_basins(filepath=None) -> list[tuple]:
     return [(g["Lat"].values, g["Lon"].values) for _, g in df.groupby("basin")]
 
 
-def make_shardmap(query, grid, *, region=None, backend="auto", catalog_out=None, footprint="swath"):
+def make_shardmap(
+    query, grid, *, region=None, aoi=None, backend="auto", catalog_out=None, footprint="swath"
+):
     """Fetch a Catalog and build a ShardMap in one call (concerns 1+2 chained).
 
     Parameters
@@ -139,6 +141,10 @@ def make_shardmap(query, grid, *, region=None, backend="auto", catalog_out=None,
         Output grid (typically ``from_config(config)``).
     region : list of (lats, lons), optional
         Coverage mask. Defaults to the query bbox rectangle.
+    aoi : AOIGeometry | bytes | str | list of (lats, lons), optional
+        Strict-AOI polygon for the optional ``output.aoi_mask`` (issue #101) — WKB
+        ``bytes``, WKT ``str``, an :class:`~zagg.grids.aoi.AOIGeometry`, or ring
+        parts. ``None`` reuses ``region``. Forwarded to :meth:`ShardMap.build`.
     backend : str
         Geometry backend for the shard map.
     catalog_out : str, optional
@@ -162,7 +168,7 @@ def make_shardmap(query, grid, *, region=None, backend="auto", catalog_out=None,
     cat = CMRSource().fetch(query)
     if catalog_out:
         cat.to_geoparquet(catalog_out)
-    return ShardMap.build(cat, grid, region=region, backend=backend, footprint=footprint)
+    return ShardMap.build(cat, grid, region=region, aoi=aoi, backend=backend, footprint=footprint)
 
 
 def main():
@@ -205,6 +211,16 @@ examples:
     spatial = parser.add_argument_group("spatial (choose one)")
     spatial.add_argument("--polygon", help="GeoJSON area of interest")
     spatial.add_argument("--bbox", help="lon_min,lat_min,lon_max,lat_max")
+    parser.add_argument(
+        "--aoi-wkt",
+        help="Strict-AOI polygon as WKT (text or a path to a .wkt file) for "
+        "output.aoi_mask (issue #101). Defaults to --polygon/--bbox coverage.",
+    )
+    parser.add_argument(
+        "--aoi-wkb",
+        help="Strict-AOI polygon as a path to a binary WKB file for output.aoi_mask "
+        "(issue #101). Defaults to --polygon/--bbox coverage.",
+    )
 
     parser.add_argument("--backend", default="auto", choices=["auto", "spherely", "mortie"])
     parser.add_argument(
@@ -251,6 +267,22 @@ examples:
     else:
         parser.error("provide --polygon or --bbox")
 
+    # Strict-AOI geometry (issue #101), optional and independent of coverage:
+    # WKB/WKT supplies the AOI polygon for output.aoi_mask while coverage still
+    # uses --polygon/--bbox. Mutually exclusive; ``None`` -> mask reuses coverage.
+    if args.aoi_wkt and args.aoi_wkb:
+        parser.error("provide at most one of --aoi-wkt / --aoi-wkb")
+    aoi = None
+    if args.aoi_wkb:
+        from pathlib import Path
+
+        aoi = Path(args.aoi_wkb).read_bytes()
+    elif args.aoi_wkt:
+        from pathlib import Path
+
+        p = Path(args.aoi_wkt)
+        aoi = p.read_text() if p.exists() else args.aoi_wkt
+
     query = Query(args.short_name, args.version, start, end, region=bbox, provider=args.provider)
     cat = CMRSource().fetch(query, preserve_thumbnails=args.preserve_thumbnails)
     print(f"Fetched {len(cat)} granules ({query.collection})")
@@ -258,7 +290,9 @@ examples:
         cat.to_geoparquet(args.catalog_out)
         print(f"Catalog -> {args.catalog_out}")
 
-    sm = ShardMap.build(cat, grid, region=parts, backend=args.backend, footprint=args.footprint)
+    sm = ShardMap.build(
+        cat, grid, region=parts, aoi=aoi, backend=args.backend, footprint=args.footprint
+    )
     out = args.output or f"shardmap_{args.short_name}_{start}_{end}.json"
     sm.to_json(out)
     print(

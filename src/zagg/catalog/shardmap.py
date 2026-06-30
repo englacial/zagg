@@ -183,32 +183,36 @@ def _region_parts(region, metadata) -> list:
     return [(np.array([y0, y0, y1, y1, y0]), np.array([x0, x1, x1, x0, x0]))]
 
 
-def _compute_aoi_mask(grid, parts, shard_keys) -> list:
+def _compute_aoi_mask(grid, aoi, shard_keys) -> list:
     """Per-shard strict-AOI mask payload (issue #101), parallel to ``shard_keys``.
 
-    HEALPix: each entry is the shard's compact sub-MOC of the AOI (``uint64`` words
-    as ints). Rectilinear: each entry is the True-cell indices into the shard's
-    ``children`` order (cell centers inside the reprojected AOI). The worker expands
-    the entry to a per-cell bool over ``children(shard_key)`` at write time.
+    ``aoi`` is an :class:`~zagg.grids.aoi.AOIGeometry` (WKB/WKT geometry or ``(lats,
+    lons)`` ring parts). HEALPix: each entry is the shard's compact sub-MOC of the
+    AOI (``uint64`` words as ints). Rectilinear: each entry is the True-cell indices
+    into the shard's ``children`` order (cell centers inside the reprojected AOI).
+    The worker expands the entry to a per-cell bool over ``children(shard_key)`` at
+    write time.
 
     Computed once here (the shard-map stage) so the local worker expands it with
     no region plumbing — the mask depends only on (grid, AOI), never on
     observations. Dispatches on the same HEALPix predicate the rest of this module
     uses (``parent_order`` + ``child_order``), then branches to the native morton
-    ``aoi_moc`` path vs the rectilinear shapely-center ``aoi_polygon`` path. A grid
-    that is neither (no AOI API) with the flag on is a misconfiguration, raised here
-    rather than left to a cryptic ``AttributeError`` downstream.
+    ``aoi_moc`` path vs the rectilinear shapely-center ``aoi_polygon`` path (each
+    consuming the same ``aoi`` carrier, so a WKB/WKT AOI yields the identical mask
+    to the equivalent ring). A grid that is neither (no AOI API) with the flag on is
+    a misconfiguration, raised here rather than left to a cryptic ``AttributeError``
+    downstream.
     """
     is_healpix = hasattr(grid, "parent_order") and hasattr(grid, "child_order")
     if is_healpix:
-        aoi_moc = grid.aoi_moc(parts)
+        aoi_moc = grid.aoi_moc(aoi)
         return [[int(w) for w in grid.aoi_shard_moc(aoi_moc, int(k))] for k in shard_keys]
     if hasattr(grid, "aoi_polygon"):
         # Rectilinear (or any center-test grid): the in-AOI cell ids per shard.
         # Storing cell IDS (not positional indices) keeps the worker expansion
         # order-independent, so a K>1 chunk that enumerates a sub-tile still maps
         # correctly via membership.
-        aoi_geom = grid.aoi_polygon(parts)
+        aoi_geom = grid.aoi_polygon(aoi)
         out = []
         for k in shard_keys:
             children = np.asarray(grid.children(int(k)))
@@ -405,6 +409,7 @@ class ShardMap:
         grid,
         *,
         region=None,
+        aoi=None,
         backend: str = "auto",
         mortie_order: int | None = None,
         footprint: str = "swath",
@@ -420,6 +425,13 @@ class ShardMap:
             ``spatial_signature``).
         region : list of (lats, lons), optional
             Coverage mask in WGS84. Defaults to the catalog bbox rectangle.
+        aoi : AOIGeometry | bytes | str | list of (lats, lons), optional
+            Strict-AOI polygon for the optional ``output.aoi_mask`` (issue #101),
+            supplied as an :class:`~zagg.grids.aoi.AOIGeometry`, WKB ``bytes``, WKT
+            ``str``, or ``(lats, lons)`` ring parts. ``None`` (default) reuses
+            ``region`` (or the bbox rectangle), so a ring run is unchanged. Only
+            consulted when ``output.aoi_mask`` is on — a flag-off run never builds
+            it and stays byte-identical.
         backend : {"auto", "spherely", "mortie"}
             Geometry backend. ``"auto"`` -> spherely when importable, else
             mortie for HEALPix grids (non-HEALPix grids require spherely and
@@ -523,10 +535,14 @@ class ShardMap:
         # so the worker can package the per-cell bool with no region plumbing. Only
         # when ``output.aoi_mask`` is on — otherwise the manifest is unchanged.
         from zagg.config import get_aoi_mask
+        from zagg.grids.aoi import as_aoi_geometry
 
         grid_config = getattr(grid, "config", None)
+        # The AOI defaults to the coverage ``region`` (ring parts) when no explicit
+        # WKB/WKT/parts ``aoi`` is given, so a ring run is unchanged; an explicit
+        # ``aoi`` (e.g. WKB/WKT) drives the mask while ``coverage`` still uses parts.
         aoi_mask = (
-            _compute_aoi_mask(grid, parts, shard_keys)
+            _compute_aoi_mask(grid, as_aoi_geometry(aoi if aoi is not None else parts), shard_keys)
             if grid_config is not None and get_aoi_mask(grid_config)
             else None
         )
