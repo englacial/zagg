@@ -343,6 +343,54 @@ def test_provisional_target_resolves_and_threads_handoff(monkeypatch):
     assert captured["handoff"] == "arrow"
 
 
+def test_sharded_knob_applied_to_grid_config(monkeypatch):
+    # The forward benchmark (issue #133) carries the ShardingCodec as a per-target
+    # ``sharded`` key so one config drives both columns: run_target must push it
+    # onto config.output['grid']['sharded'] (where get_sharded reads it) before
+    # building the grid + dispatching. A synthetic manifest pairs the o9 t-digest
+    # config (K=256, so sharded is valid) with each codec value.
+    base = BENCH
+    captured = {}
+
+    import zagg.runner as runner
+    from zagg.config import get_sharded
+
+    def fake_agg(config, **kwargs):
+        captured["sharded"] = get_sharded(config)
+        return {}
+
+    monkeypatch.setattr(runner, "agg", fake_agg)
+    for codec, want in (("sharded", True), ("inner", False)):
+        manifest = {
+            "shardmaps": {"healpix_o10": {"path": "shardmaps/sm_healpix_o10.json"}},
+            "targets": {
+                "t": {
+                    "config": "configs/atl03_tdigest_healpix_o9.yaml",
+                    "shardmap": "healpix_o10",
+                    "aggregator": "tdigest",
+                    "grid_type": "healpix",
+                    "grid_size": "o9",
+                    "handoff": "arrow",
+                    "codec": codec,
+                    "sharded": want,
+                }
+            },
+        }
+        # The o10 shardmap meta has no shard_key here; run_target reads it, so add one.
+        manifest["shardmaps"]["healpix_o10"]["shard_key"] = 0
+        run_benchmark.run_target(
+            "t",
+            manifest,
+            base,
+            store="s3://b/x.zarr",
+            region="us-west-2",
+            function_name="process-shard",
+            context={"commit": "deadbee", "event": "pr"},
+            dry_run=False,
+        )
+        assert captured["sharded"] is want, f"codec={codec} -> sharded={want}"
+
+
 def test_scalar_config_is_genuinely_scalar():
     # The scalar benchmark config must be GENUINELY scalar -- every field a plain
     # per-cell stat (no vector/ragged) -- so the pandas/arrow carrier comparison
