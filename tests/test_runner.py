@@ -371,7 +371,7 @@ class TestInvokeLambdaCellEvent:
 
     _CREDS = {"accessKeyId": "a", "secretAccessKey": "s", "sessionToken": "t"}
 
-    def _captured_event(self, *, child_order, profile=False):
+    def _captured_event(self, *, child_order, profile=False, handoff="pandas"):
         from unittest.mock import MagicMock
 
         from zagg.runner import _invoke_lambda_cell
@@ -394,6 +394,7 @@ class TestInvokeLambdaCellEvent:
             function_name="process-shard",
             config_dict=None,
             max_workers=4,
+            handoff=handoff,
             profile=profile,
         )
         return json.loads(client.invoke.call_args.kwargs["Payload"])
@@ -422,6 +423,181 @@ class TestInvokeLambdaCellEvent:
         # no "profile" key is added.
         event = self._captured_event(child_order=12, profile=False)
         assert "profile" not in event
+
+    def test_handoff_adds_event_key(self):
+        # issue #130: a non-default handoff forwards "handoff" into the event so
+        # the deployed worker selects the arro3 arrow carrier. (The runner forwards
+        # the string opaquely; the worker validates it.)
+        event = self._captured_event(child_order=12, handoff="arrow")
+        assert event["handoff"] == "arrow"
+
+    def test_default_handoff_event_has_no_handoff_key(self):
+        # Default (pandas): event payload is byte-identical to the pre-handoff
+        # path; no "handoff" key is added (#130).
+        event = self._captured_event(child_order=12, handoff="pandas")
+        assert "handoff" not in event
+
+
+class TestInvokeLambdaCellRetry:
+    """Retry policy (#119): deterministic ``FunctionError``s (OOM / runtime
+    crash) return immediately -- they are never re-invoked -- while transient
+    client-side faults (throttle/network) still retry with backoff.
+    """
+
+    _CREDS = {"accessKeyId": "a", "secretAccessKey": "s", "sessionToken": "t"}
+
+    def _invoke(self, client, *, max_retries=3):
+        from zagg.runner import _invoke_lambda_cell
+
+        return _invoke_lambda_cell(
+            client, (0,), 12345, 6, 12,
+            ["s3://b/g.h5"], "s3://out/x.zarr", self._CREDS,
+            function_name="process-shard", config_dict=None, max_workers=4,
+            max_retries=max_retries,
+        )
+
+    def _function_error_response(self, error_payload):
+        from unittest.mock import MagicMock
+
+        payload = MagicMock()
+        payload.read.return_value = error_payload.encode()
+        return {"Payload": payload, "FunctionError": "Unhandled"}
+
+    def test_oom_function_error_not_retried(self):
+        from unittest.mock import MagicMock
+
+        client = MagicMock()
+        client.invoke.return_value = self._function_error_response(
+            '{"errorType": "Runtime.OutOfMemory"}'
+        )
+        # max_retries=5 proves the deterministic return is invariant to the
+        # budget -- a FunctionError no longer consumes attempts at all (#119).
+        result = self._invoke(client, max_retries=5)
+        # A deterministic FunctionError is invoked exactly once, regardless of
+        # max_retries, and the recorded error reflects the OOM (not masked).
+        assert client.invoke.call_count == 1
+        assert result["retries"] == 0
+        assert result["error"].startswith("Lambda OOM:")
+        assert result["status_code"] is None
+
+    def test_timeout_function_error_not_retried(self):
+        from unittest.mock import MagicMock
+
+        client = MagicMock()
+        client.invoke.return_value = self._function_error_response(
+            "Task timed out after 720.00 seconds"
+        )
+        # Timeouts already returned immediately pre-#119; pin that the shared
+        # simplified branch keeps that behavior (single invoke, timeout=True).
+        result = self._invoke(client, max_retries=5)
+        assert client.invoke.call_count == 1
+        assert result["retries"] == 0
+        assert result["timeout"] is True
+        assert result["error"].startswith("Lambda timeout:")
+
+    def test_generic_function_error_not_retried(self):
+        from unittest.mock import MagicMock
+
+        client = MagicMock()
+        client.invoke.return_value = self._function_error_response(
+            '{"errorType": "RuntimeError", "errorMessage": "boom"}'
+        )
+        result = self._invoke(client)
+        assert client.invoke.call_count == 1
+        assert result["retries"] == 0
+        assert result["error"].startswith("Lambda error (Unhandled):")
+
+    def test_transient_client_error_retried_with_backoff(self, monkeypatch):
+        from unittest.mock import MagicMock
+
+        import zagg.runner as runner
+
+        sleeps = []
+        monkeypatch.setattr(runner.time, "sleep", lambda s: sleeps.append(s))
+
+        ok_payload = MagicMock()
+        ok_payload.read.return_value = json.dumps(
+            {"statusCode": 200, "body": json.dumps({"total_obs": 7, "duration_s": 1.0})}
+        ).encode()
+        ok = {"Payload": ok_payload, "FunctionError": None}
+
+        client = MagicMock()
+        client.invoke.side_effect = [
+            Exception("TooManyRequestsException: Rate exceeded"),
+            ok,
+        ]
+        result = self._invoke(client)
+        # Transient fault retried: invoked twice, slept once with backoff.
+        assert client.invoke.call_count == 2
+        assert len(sleeps) == 1
+        assert result["status_code"] == 200
+        assert result["retries"] == 1
+
+    def test_non_retryable_client_error_breaks(self, monkeypatch):
+        from unittest.mock import MagicMock
+
+        import zagg.runner as runner
+
+        sleeps = []
+        monkeypatch.setattr(runner.time, "sleep", lambda s: sleeps.append(s))
+
+        client = MagicMock()
+        client.invoke.side_effect = Exception("AccessDeniedException")
+        result = self._invoke(client)
+        # A non-transient client error is not retried (break), no backoff sleep.
+        assert client.invoke.call_count == 1
+        assert sleeps == []
+        assert result["error"] == "AccessDeniedException"
+
+
+class TestMaxRetriesPassthrough:
+    """`agg(max_retries=...)` threads the per-cell retry budget down to
+    ``_invoke_lambda_cell`` on the lambda backend (#119), default 3."""
+
+    def _drive(self, monkeypatch, atl06_config, catalog_file, **agg_kwargs):
+        import boto3
+
+        import zagg.grids as grids_mod
+        from zagg import runner
+        from zagg.concurrency import ConcurrencyReport
+
+        captured = {}
+
+        monkeypatch.setattr(runner, "get_nsidc_s3_credentials",
+                            lambda: {"accessKeyId": "a", "secretAccessKey": "s",
+                                     "sessionToken": "t"})
+        monkeypatch.setattr(grids_mod, "from_config", lambda *a, **k: _stub_grid())
+        monkeypatch.setattr(runner, "_invoke_lambda_setup", lambda *a, **k: None)
+        monkeypatch.setattr(runner, "_invoke_lambda_finalize", lambda *a, **k: None)
+        monkeypatch.setattr(runner, "_get_function_timeout_s", lambda *a, **k: 720)
+        from unittest.mock import MagicMock
+        monkeypatch.setattr(boto3, "Session", lambda *a, **k: MagicMock())
+        monkeypatch.setattr(
+            runner, "compute_available_workers",
+            lambda requested, *a, **k: (
+                1,
+                ConcurrencyReport(account_limit=1000, current_concurrent=0,
+                                  padding=100, available=900, function_reserved=None),
+            ),
+        )
+
+        def _fake_cell(*a, **k):
+            captured["max_retries"] = k.get("max_retries")
+            return {"status_code": 200, "body": {"total_obs": 1}, "error": None,
+                    "lambda_duration": 1.0, "shard_key": 0}
+
+        monkeypatch.setattr(runner, "_invoke_lambda_cell", _fake_cell)
+        agg(atl06_config, catalog=catalog_file, store="s3://out/x.zarr",
+            backend="lambda", **agg_kwargs)
+        return captured
+
+    def test_max_retries_threaded_end_to_end(self, monkeypatch, atl06_config, catalog_file):
+        captured = self._drive(monkeypatch, atl06_config, catalog_file, max_retries=1)
+        assert captured["max_retries"] == 1
+
+    def test_default_max_retries_is_three(self, monkeypatch, atl06_config, catalog_file):
+        captured = self._drive(monkeypatch, atl06_config, catalog_file)
+        assert captured["max_retries"] == 3
 
 
 class TestHandoffPassthrough:
@@ -452,7 +628,9 @@ class TestHandoffPassthrough:
         )
         assert captured["handoff"] == "arrow"
 
-    def test_default_handoff_is_pandas(self, monkeypatch, atl06_config):
+    def test_default_handoff_is_arrow(self, monkeypatch, atl06_config):
+        # issue #130: arro3/arrow is the default carrier (faster + lighter on dense
+        # shards); pandas remains available via an explicit handoff="pandas".
         from zagg import runner
 
         captured = {}
@@ -474,7 +652,7 @@ class TestHandoffPassthrough:
             config=atl06_config,
             driver="s3",
         )
-        assert captured["handoff"] == "pandas"
+        assert captured["handoff"] == "arrow"
 
 
 def _stub_grid():
@@ -1213,6 +1391,35 @@ class TestProfilePlumbing:
         )
         runner.agg(atl06_config, catalog="ignored", store="s3://out/x.zarr", backend="lambda")
         assert captured["profile"] is False
+
+    def test_agg_threads_handoff_into_run_lambda(self, monkeypatch, atl06_config):
+        # issue #130: agg(handoff=...) reaches the lambda backend (it was local-only).
+        from zagg import runner
+
+        captured = {}
+        monkeypatch.setattr(runner, "_load_catalog", lambda p: _run_catalog())
+        monkeypatch.setattr(
+            runner, "_run_lambda",
+            lambda *a, **k: captured.update(handoff=k.get("handoff")) or {},
+        )
+        runner.agg(
+            atl06_config, catalog="ignored", store="s3://out/x.zarr",
+            backend="lambda", handoff="arrow",
+        )
+        assert captured["handoff"] == "arrow"
+
+    def test_agg_default_handoff_is_arrow_on_lambda(self, monkeypatch, atl06_config):
+        # issue #130: agg() defaults to the arro3/arrow carrier on the lambda backend.
+        from zagg import runner
+
+        captured = {}
+        monkeypatch.setattr(runner, "_load_catalog", lambda p: _run_catalog())
+        monkeypatch.setattr(
+            runner, "_run_lambda",
+            lambda *a, **k: captured.update(handoff=k.get("handoff")) or {},
+        )
+        runner.agg(atl06_config, catalog="ignored", store="s3://out/x.zarr", backend="lambda")
+        assert captured["handoff"] == "arrow"
 
 
 class TestWorkerPhaseTimings:

@@ -1,16 +1,22 @@
 name: Lambda Benchmark
 
 # Cost/runtime regression tracking on real Lambda (issues #110, #25).
-#   * non-fork PR to main, non-draft -> run + post an (ephemeral) PR comment
-#   * push to main (a merge)        -> run + retain to the `benchmarks` data
-#                                      branch and re-render the Pages charts
-# Tier 2 (issue #25): a benchmark only reflects the PR if the DEPLOYED worker is
-# the PR's code. When the change is "lambda-affecting" (touches src/zagg,
-# deployment/aws, or pyproject) and the deploy is configured, we build the arm64
-# zips and update the `process-shard-test` function, then benchmark against it.
+#   push to main (a merge) -> run + retain to the `benchmarks` data branch and
+#                             re-render the Pages charts.
+#
+# PRs do NOT auto-benchmark. A non-draft PR used to trigger a run, but that meant
+# frequent PR pushes evicted the pending main merge from the shared concurrency
+# slot (so merges got cancelled, not queued), and a PR run could also collide
+# with a merge run on the single shared `process-shard-test` function. Benchmark a
+# PR on demand instead with the `/benchmark` slash command (or the `benchmark`
+# label) -- see lambda-benchmark-command.yml.
+#
+# Tier 2 (issue #25): a merge benchmark reflects the merged code only if the
+# DEPLOYED worker IS that code. When the merge is "lambda-affecting" (touches
+# src/zagg, deployment/aws, or pyproject) and the deploy is configured, we build
+# the arm64 zips and update `process-shard-test`, then benchmark against it.
 # Otherwise we benchmark the stable function (correct for orchestrator/doc-only
-# changes, and the path before the AWS-side deploy is set up). Fork PRs never
-# deploy (handled in lambda-benchmark-command.yml).
+# changes, and the path before the AWS-side deploy is set up).
 #
 # The whole workflow is serialized (a single shared `test` function), so two
 # runs can't deploy/benchmark over each other.
@@ -21,15 +27,6 @@ on:
   # (tests/data/benchmark) -- but never for docs (*.md, incl. the matrix README).
   # Doc/CI-only merges shouldn't pay for a run or add a redundant series point.
   # Use workflow_dispatch to benchmark on demand (e.g. after a workflow/runner edit).
-  pull_request:
-    branches: [main]
-    types: [opened, synchronize, reopened, ready_for_review]
-    paths:
-      - 'src/zagg/**'
-      - 'deployment/aws/**'
-      - 'pyproject.toml'
-      - 'tests/data/benchmark/**'
-      - '!**/*.md'
   push:
     branches: [main]
     paths:
@@ -47,8 +44,6 @@ on:
 
 permissions:
   contents: read
-  id-token: write
-  pull-requests: write
 
 concurrency:
   group: lambda-benchmark
@@ -56,36 +51,31 @@ concurrency:
 
 jobs:
   # Decide whether to deploy + benchmark the `test` function (lambda-affecting,
-  # configured, non-fork) or just benchmark the stable function.
+  # configured) or just benchmark the stable function.
   detect:
     runs-on: ubuntu-latest
     outputs:
       affecting: ${{ steps.d.outputs.affecting }}
       function_name: ${{ steps.d.outputs.function_name }}
-      worker_note: ${{ steps.d.outputs.worker_note }}
     steps:
       - uses: actions/checkout@v5
         with:
           fetch-depth: 0
-          ref: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.sha || github.sha }}
+          ref: ${{ github.sha }}
       - id: d
         env:
           DEPLOY_ROLE: ${{ vars.BENCHMARK_DEPLOY_ROLE_ARN }}
           TEST_FN: ${{ vars.BENCHMARK_TEST_FUNCTION_NAME }}
           STAGE_BUCKET: ${{ vars.BENCHMARK_TEST_STAGE_BUCKET }}
           STABLE_FN: ${{ vars.BENCHMARK_FUNCTION_NAME }}
-          IS_FORK: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name != github.repository }}
           EVENT: ${{ github.event_name }}
-          PR_BASE: ${{ github.event.pull_request.base.sha }}
-          PR_HEAD: ${{ github.event.pull_request.head.sha }}
           PUSH_BEFORE: ${{ github.event.before }}
           PUSH_AFTER: ${{ github.sha }}
         run: |
           set -euo pipefail
-          # Tier-2 deploy is possible only when fully configured and not a fork.
+          # Tier-2 deploy is possible only when fully configured.
           deployable=true
           { [ -n "$DEPLOY_ROLE" ] && [ -n "$TEST_FN" ] && [ -n "$STAGE_BUCKET" ]; } || deployable=false
-          [ "$IS_FORK" = "true" ] && deployable=false
 
           # Does the change touch the deployed Lambda closure? (Over-detection is
           # safe -- it just redeploys; under-detection would benchmark stale code.)
@@ -93,7 +83,7 @@ jobs:
           if [ "$EVENT" = "workflow_dispatch" ]; then
             touched=true
           else
-            if [ "$EVENT" = "pull_request" ]; then BASE="$PR_BASE"; HEAD="$PR_HEAD"; else BASE="$PUSH_BEFORE"; HEAD="$PUSH_AFTER"; fi
+            BASE="$PUSH_BEFORE"; HEAD="$PUSH_AFTER"
             if ! git cat-file -e "${BASE}^{commit}" 2>/dev/null; then BASE="${HEAD}~1"; fi
             # No error-masking: a git diff failure aborts the run (set -e) rather
             # than silently reading as "not affecting" -> benchmarking stale code.
@@ -101,20 +91,13 @@ jobs:
             if echo "$CHANGED" | grep -qE '^(src/zagg/|deployment/aws/|pyproject\.toml)'; then touched=true; fi
           fi
 
-          note=""
           if [ "$deployable" = "true" ] && [ "$touched" = "true" ]; then
             echo "affecting=true" >> "$GITHUB_OUTPUT"
             echo "function_name=$TEST_FN" >> "$GITHUB_OUTPUT"
           else
             echo "affecting=false" >> "$GITHUB_OUTPUT"
             echo "function_name=$STABLE_FN" >> "$GITHUB_OUTPUT"
-            # Benchmarking stable, but the change touches deployed code -> the
-            # numbers don't reflect this PR's worker. Flag it in the comment.
-            if [ "$touched" = "true" ]; then
-              note="Worker = stable \`main\`, not this PR's code — it changes lambda-deployed code but wasn't redeployed, so cost/runtime here don't reflect it. Real numbers land on merge."
-            fi
           fi
-          echo "worker_note=$note" >> "$GITHUB_OUTPUT"
 
   # Build the arm64 zips and update process-shard-test in place (only when the
   # change is lambda-affecting). Serialized with the benchmark via the workflow
@@ -129,7 +112,7 @@ jobs:
     steps:
       - uses: actions/checkout@v5
         with:
-          ref: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.sha || github.sha }}
+          ref: ${{ github.sha }}
       - name: Build arm64 layer
         run: |
           docker run --rm \
@@ -155,7 +138,7 @@ jobs:
           STAGE_BUCKET: ${{ vars.BENCHMARK_TEST_STAGE_BUCKET }}
           FUNCTION_NAME: ${{ vars.BENCHMARK_TEST_FUNCTION_NAME }}
           REGION: ${{ vars.BENCHMARK_AWS_REGION }}
-          SHA: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.sha || github.sha }}
+          SHA: ${{ github.sha }}
         run: |
           set -euo pipefail
           KEY="lambda-test/${SHA}/lambda_layer_arm64.zip"
@@ -167,65 +150,15 @@ jobs:
             --function-zip "$(ls deployment/builds/lambda_function_arm64_*.zip)" \
             --region "$REGION"
 
-  pr-comment:
+  merge-publish:
     needs: [detect, deploy-test]
-    # Same-repo PRs only (forks can't be trusted with the role); skip drafts.
     # !cancelled() lets this run when deploy-test was skipped (non-affecting);
     # a deploy *failure* skips the benchmark (don't measure a broken deploy).
     if: >-
       !cancelled() &&
       vars.BENCHMARK_ROLE_ARN != '' &&
       needs.detect.result == 'success' &&
-      (needs.deploy-test.result == 'success' || needs.deploy-test.result == 'skipped') &&
-      github.event_name == 'pull_request' &&
-      github.event.pull_request.head.repo.full_name == github.repository &&
-      github.event.pull_request.draft == false
-    runs-on: ubuntu-latest
-    steps:
-      - name: Checkout PR head
-        uses: actions/checkout@v5
-        with:
-          ref: ${{ github.event.pull_request.head.sha }}
-
-      - name: Run benchmark
-        uses: ./.github/actions/run-benchmark
-        with:
-          role-arn: ${{ vars.BENCHMARK_ROLE_ARN }}
-          aws-region: ${{ vars.BENCHMARK_AWS_REGION }}
-          function-name: ${{ needs.detect.outputs.function_name }}
-          store-prefix: ${{ vars.BENCHMARK_STORE_PREFIX }}
-          edl-token: ${{ secrets.EARTHDATA_TOKEN }}
-          event: pr
-          commit: ${{ github.event.pull_request.head.sha }}
-          ref-label: ${{ github.head_ref }}
-          pr-number: ${{ github.event.pull_request.number }}
-          worker-note: ${{ needs.detect.outputs.worker_note }}
-
-      - name: Upsert PR comment
-        uses: actions/github-script@v7
-        with:
-          script: |
-            const fs = require('fs');
-            const body = fs.readFileSync('comment.md', 'utf8');
-            const marker = '<!-- zagg-benchmark -->';
-            const { owner, repo } = context.repo;
-            const issue_number = context.payload.pull_request.number;
-            const { data: comments } = await github.rest.issues.listComments({ owner, repo, issue_number });
-            const existing = comments.find(c => c.body && c.body.includes(marker));
-            if (existing) {
-              await github.rest.issues.updateComment({ owner, repo, comment_id: existing.id, body });
-            } else {
-              await github.rest.issues.createComment({ owner, repo, issue_number, body });
-            }
-
-  merge-publish:
-    needs: [detect, deploy-test]
-    if: >-
-      !cancelled() &&
-      vars.BENCHMARK_ROLE_ARN != '' &&
-      needs.detect.result == 'success' &&
-      (needs.deploy-test.result == 'success' || needs.deploy-test.result == 'skipped') &&
-      (github.event_name == 'push' || github.event_name == 'workflow_dispatch')
+      (needs.deploy-test.result == 'success' || needs.deploy-test.result == 'skipped')
     runs-on: ubuntu-latest
     # contents: write to push the series + charts to the benchmarks branch.
     permissions:

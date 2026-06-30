@@ -1,0 +1,25 @@
+{
+  "type": "FeatureCollection",
+  "features": [
+    {
+      "type": "Feature",
+      "properties": {
+        "name": "Antarctic 88S dense (ICESat-2 turning-latitude stress target)",
+        "note": "Near the +/-88 deg turning latitude, ICESat-2 ground-track density peaks, so the densest shard here is far heavier than NEON's 44-50 granules. HEALPix is CRS-agnostic; a rectilinear analog would need a polar CRS (e.g. EPSG:3031). See issue #121.",
+        "source_crs": "EPSG:4326"
+      },
+      "geometry": {
+        "type": "Polygon",
+        "coordinates": [
+          [
+            [-180.0, -88.0],
+            [180.0, -88.0],
+            [180.0, -87.7],
+            [-180.0, -87.7],
+            [-180.0, -88.0]
+          ]
+        ]
+      }
+    }
+  ]
+}

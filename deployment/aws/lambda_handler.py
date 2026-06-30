@@ -57,6 +57,9 @@ import resource
 import time
 from typing import Any, Dict
 
+from zarr import open_group
+from zarr.errors import GroupNotFoundError
+
 # Import cloud-agnostic processing
 from zagg.config import load_config_from_dict
 from zagg.processing import (
@@ -268,6 +271,10 @@ def _handle_process(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
         # read/index/aggregate deltas; the write phase runs here, so we bracket it
         # below and merge it in. Default (no key) leaves the worker path unchanged.
         profile = event.get("profile", False)
+        # Per-cell carrier (issue #130). Absent key -> "pandas", the byte-identical
+        # default worker path; "arrow" opts into the arro3-core read carrier for
+        # benchmarks. (Neither imports pyarrow; pyarrow is not in the layer.)
+        handoff = event.get("handoff", "pandas")
         chunk_results: list = []
         _df_out, metadata = process_shard(
             grid,
@@ -276,6 +283,7 @@ def _handle_process(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
             s3_credentials=s3_creds,
             config=config,
             chunk_results=chunk_results,
+            handoff=handoff,
             profile=profile,
         )
 
@@ -286,10 +294,17 @@ def _handle_process(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
             store_path = event["store_path"]
             store = open_store(store_path, **_output_store_kwargs(event))
 
-            # Validate that Zarr template exists before writing
-            template_key = f"{grid.group_path}/zarr.json"
-            if not store.exists(template_key):
-                error_msg = f"Zarr template not found at {store_path}/{template_key}"
+            # Validate that the Zarr template exists before writing. ``store`` is a
+            # zarr v3 ``Store`` whose ``exists()`` is async, so open the group via
+            # the high-level sync API and catch the missing-node error instead
+            # (issue #118), in the same open-and-catch spirit as
+            # ``readers/tdigest_tensor.py``. ``GroupNotFoundError`` is raised
+            # identically on the LocalStore and obstore-backed (S3) paths; a
+            # present-but-wrong-type node surfaces as a real error, not "missing".
+            try:
+                open_group(store, path=grid.group_path, mode="r", zarr_format=3)
+            except GroupNotFoundError:
+                error_msg = f"Zarr template not found at {store_path}/{grid.group_path}"
                 logger.error(error_msg)
                 metadata["error"] = error_msg
                 return {

@@ -162,7 +162,59 @@ def build_record(
 def _fmt(value, spec: str = "") -> str:
     if value is None:
         return "n/a"
+    # A failed/legacy row reads back as the float NaN (not None) from parquet;
+    # render it as n/a too, and never let it reach ``format(nan, ',d')`` (raises).
+    if isinstance(value, float) and math.isnan(value):
+        return "n/a"
     return format(value, spec) if spec else str(value)
+
+
+# Column headers for every rendered benchmark table -- the PR comment, the
+# published ``latest.md``, and the latest-table PNG all use these in this order.
+TABLE_HEADERS = [
+    "target",
+    "obs",
+    "runtime (s)",
+    "cost/shard",
+    "cost/100 km²",
+    "% timeout",
+    "mem (MB)",
+    "% cap",
+]
+
+
+def format_record_cells(r: dict) -> dict:
+    """Display strings for one record's benchmark columns (keyed by header), plus
+    the raw memory fraction under ``mem_frac`` (``None`` when unknown).
+
+    One formatting source so a number renders identically wherever a benchmark
+    table is drawn -- the markdown tables and the PNG -- and never disagree.
+    """
+    mem_frac = memory_pct_of_cap(r.get("max_memory_mb"), r.get("memory_gb"))
+    obs = r.get("total_obs")
+    return {
+        "target": _fmt(r.get("target")),
+        "obs": _fmt(obs, ",d") if obs is not None else "n/a",
+        "runtime (s)": _fmt(r.get("runtime_s"), ".1f"),
+        "cost/shard": "$" + _fmt(r.get("cost_per_shard_usd"), ".5f"),
+        "cost/100 km²": "$" + _fmt(r.get("cost_per_100km2_usd"), ".5f"),
+        "% timeout": _fmt(r.get("worker_pct_timeout"), ".0%"),
+        "mem (MB)": _fmt(r.get("max_memory_mb"), ".0f"),
+        "% cap": _fmt(mem_frac, ".0%"),
+        "mem_frac": mem_frac,
+    }
+
+
+def _table_block(records: list[dict]) -> list[str]:
+    """Markdown table lines (header + alignment + one row per record)."""
+    lines = [
+        "| " + " | ".join(TABLE_HEADERS) + " |",
+        "| " + " | ".join(["---"] + ["---:"] * (len(TABLE_HEADERS) - 1)) + " |",
+    ]
+    for r in records:
+        cells = format_record_cells(r)
+        lines.append("| " + " | ".join(cells[h] for h in TABLE_HEADERS) + " |")
+    return lines
 
 
 def comment_markdown(records: list[dict], worker_note: str = "") -> str:
@@ -185,28 +237,38 @@ def comment_markdown(records: list[dict], worker_note: str = "") -> str:
     lines = [marker, f"### Lambda benchmark — `{_fmt(head.get('commit'))[:7]}`", ""]
     if worker_note:
         lines += [f"> ⚠️ {worker_note}", ""]
-    lines += [
-        "| target | obs | runtime (s) | cost/shard | cost/100 km² | % timeout | mem (MB) | % cap |",
-        "| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |",
-    ]
-    for r in records:
-        mem_pct = memory_pct_of_cap(r.get("max_memory_mb"), r.get("memory_gb"))
-        lines.append(
-            "| {target} | {obs} | {rt} | ${cost} | ${c100} | {pct} | {mem} | {mempct} |".format(
-                target=_fmt(r.get("target")),
-                obs=_fmt(r.get("total_obs"), ",d") if r.get("total_obs") is not None else "n/a",
-                rt=_fmt(r.get("runtime_s"), ".1f"),
-                cost=_fmt(r.get("cost_per_shard_usd"), ".5f"),
-                c100=_fmt(r.get("cost_per_100km2_usd"), ".5f"),
-                pct=_fmt(r.get("worker_pct_timeout"), ".0%"),
-                mem=_fmt(r.get("max_memory_mb"), ".0f"),
-                mempct=_fmt(mem_pct, ".0%"),
-            )
-        )
+    lines += _table_block(records)
     lines += [
         "",
         f"_arm64 · {_fmt(head.get('memory_gb'))} GB · "
         f"${_fmt(head.get('price_per_gb_sec'))}/GB-s · one shard/target · "
         "pre-merge runs are not retained._",
     ]
+    return "\n".join(lines)
+
+
+def latest_markdown(records: list[dict]) -> str:
+    """Render the *retained* latest-merge table, published as ``latest.md`` on the
+    benchmarks branch (issue #110).
+
+    Same columns as the PR comment, but without the upsert marker / worker-note
+    and with a retained-merge footer. This is the human-readable companion to the
+    machine-readable ``metrics.json`` written beside it -- both are the path an
+    agent should follow to reference current benchmark numbers, rather than
+    scraping the chart/table images.
+    """
+    if not records:
+        return "No benchmark records were produced."
+
+    head = records[0]
+    lines = [
+        f"### Latest Lambda benchmark — `{_fmt(head.get('commit'))[:7]}`",
+        "",
+        f"_{_fmt(head.get('timestamp'))} · arm64 · {_fmt(head.get('memory_gb'))} GB · "
+        f"${_fmt(head.get('price_per_gb_sec'))}/GB-s · one densest shard/target · "
+        "retained merge point._",
+        "",
+    ]
+    lines += _table_block(records)
+    lines += ["", "Machine-readable companion: `metrics.json` (same directory)."]
     return "\n".join(lines)

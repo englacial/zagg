@@ -14,7 +14,8 @@ the matrix from here.
 | `targets.json` | the matrix: the list of targets + the shared shard maps and their pinned densest shard |
 | `configs/*.yaml` | one pipeline config per target (data_source + aggregation + `output.grid`) |
 | `shardmaps/*.json` | one shard map per `(grid, order)` — **shared** by both aggregators on that grid |
-| `AOP_NEON.geojson` | the AOI (NEON SERC AOP box) every shard map is built over |
+| `AOP_NEON.geojson` | the **default** AOI (NEON SERC AOP box) shard maps are built over |
+| `antarctic_88s.geojson` | a non-default AOI near the ±88° turning latitude, for an override 88°S stress target (issue #121) |
 
 The workflow calls `run_benchmark.py --targets tests/data/benchmark/targets.json`,
 which loads `targets.json` and dispatches **one shard per target** (the pinned
@@ -32,6 +33,42 @@ aggregator).
   in `targets.json` under `temporal`. AOI = `AOP_NEON.geojson`.
 - **Cost model:** arm64, 2 GB, capped at the 720 s deploy timeout (see
   `zagg.dispatch`).
+- **AOI is per shard map (issue #121).** The top-level `aoi`/`temporal`/`cmr` in
+  `targets.json` are **defaults**; a shard-map entry may override any of them.
+  A shard map built over a non-NEON box carries its own `aoi` (and usually
+  `temporal`/`cmr`); entries that omit a key inherit the default, so existing
+  NEON shard maps resolve exactly as before. The drift test
+  (`test_benchmark_shardmap.py`) rebuilds each map over its *resolved* AOI.
+
+## Plot layout (`plot_series.py`)
+
+The two GitHub-Pages charts (`cost_per_shard.png`, `cost_per_100km2.png`) lay
+their per-target panels out by a **data-driven** rule (issue #121 review), so new
+or rearranged targets follow the same convention automatically — nothing is keyed
+to today's eight targets:
+
+- **Columns = grid family.** The **left** column is the rectilinear (`rect_*`)
+  targets; the **right** column is the HEALPix targets.
+- **Rows = aggregator + resolution, aligned across families.** A row pairs the two
+  families at the **same aggregator** and the **same shard-size rank within their
+  family**, so e.g. `rect_6km` lines up with the largest HEALPix shard
+  (`healpix_o10`) and `rect_3km` with `healpix_o11`. `tdigest` rows and
+  `gain_bias` rows stay aligned.
+- **Rows ordered largest-shard-first.** The largest shards sit at the **top** and
+  shard size **descends** down the rows (size is ranked from `shard_area_km2`);
+  same-size rows break ties on the aggregator name.
+- **Zeros are failed runs, not data.** A zero cost/runtime means the shard run
+  failed, so it is **not** plotted as a real datapoint: the connecting line
+  **breaks** at that merge (it never dips to 0) on **both** the cost and runtime
+  series. The failure is shown as a single non-line-connected **`x`** marker on the
+  cost axis (distinct from the normal cost circle / runtime open-circle), pinned
+  near the axis floor so it keeps the x-axis/commit alignment without dragging the
+  cost axis back down to 0. A failed shard zeros both series at the same merge, so
+  the one cost `x` flags the failure for both.
+
+When adding or rearranging targets, keep these conventions — the layout is derived
+from `grid_type` / `aggregator` / `shard_area_km2`, so getting that metadata right
+in `targets.json` is what places the panel.
 
 ## Add a target
 
@@ -86,6 +123,62 @@ aggregator).
 
    `test_targets_manifest_consistent` re-derives the densest shard from the
    committed map and fails if the pinned `shard_key`/`n_granules` is stale.
+
+## Add a target over a different AOI (latitude sweep / polar stress)
+
+The default AOI is NEON SERC. To benchmark a **different** AOI — runtime vs.
+latitude, or the `antarctic_88s.geojson` 88°S stress target — give that shard map
+its own `aoi`/`temporal`/`cmr` *override*; absent keys fall back to the
+top-level default (issue #121).
+
+1. **AOI geojson** — drop the polygon under this directory (e.g.
+   `antarctic_88s.geojson`, already shipped). HEALPix is CRS-agnostic, so it is
+   the simplest grid for a clean latitude sweep; a rectilinear analog at high
+   latitude needs a polar CRS (e.g. `EPSG:3031`) in its config.
+
+2. **Build the shard map over that AOI** — point `--polygon` at the new geojson
+   (and `--start-date`/`--end-date` if the override narrows the window):
+
+   ```bash
+   python -m zagg.catalog \
+     --config tests/data/benchmark/configs/<your_config>.yaml \
+     --short-name ATL03 --version 007 \
+     --start-date 2018-10-13 --end-date 2025-06-01 \
+     --polygon tests/data/benchmark/antarctic_88s.geojson \
+     --backend mortie \
+     --output tests/data/benchmark/shardmaps/sm_healpix_o11_88s.json
+   ```
+
+   Pin the densest shard with `bench_metrics.select_densest_shard` as above.
+
+3. **`targets.json`** — add the shard map **with its override** and a target:
+
+   ```json
+   "shardmaps": {
+     "healpix_o11_88s": { "path": "shardmaps/sm_healpix_o11_88s.json",
+                          "shard_key": <key>, "n_granules": <n>,
+                          "aoi": { "file": "antarctic_88s.geojson", "name": "88S dense" } }
+   },
+   "targets": {
+     "gain_bias_healpix_o11_88s": { "config": "configs/atl03_gain_bias_healpix_o11.yaml",
+                                    "shardmap": "healpix_o11_88s",
+                                    "aggregator": "gain_bias",
+                                    "grid_type": "healpix",
+                                    "grid_size": "o11_88s" }
+   }
+   ```
+
+   Omit `temporal`/`cmr` to inherit the defaults, or set them to narrow the
+   window. The drift test then rebuilds *this* map over its resolved 88°S AOI.
+   A `cmr` override carries `short_name`/`version`/`provider`/`footprint` (like
+   the top-level default) but **not** `backend`: the drift test reads the
+   build backend from the committed shard map's `metadata.backend`, not from
+   `cmr`.
+
+   **High-latitude density → failure is the expected result.** Near ±88° the
+   densest shard is far heavier than NEON's 44–50 granules, so the target will
+   likely OOM or hit the 720 s / 2 GB timeout — that is the point of a stress
+   target. Label it as such (it compounds the OOM issues #117 / #119).
 
 ## Remove a target
 
