@@ -122,6 +122,10 @@ def run_target(
         grid_type=target["grid_type"],
         grid_size=target["grid_size"],
         shard_key=shard_key,
+        # ShardingCodec A/B label (issue #133), recorded into the series so the
+        # renderer can split the new matrix from frozen rows. None on targets
+        # without the key (the provisional/legacy ones).
+        codec=target.get("codec"),
     )
 
     if dry_run:

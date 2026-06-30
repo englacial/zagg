@@ -122,6 +122,35 @@ def test_build_record_max_memory_null_safe():
     assert "max_memory_mb" in bench_metrics.RECORD_COLUMNS
 
 
+def test_codec_column_is_last_and_threaded(monkeypatch):
+    # The codec A/B label (issue #133) is the newest schema column -> appended LAST
+    # (stable-schema rule), threaded from context, and null on rows that omit it
+    # (legacy/frozen).
+    assert bench_metrics.RECORD_COLUMNS[-1] == "codec"
+    g = HealpixGrid(parent_order=11, child_order=19)
+    rec = bench_metrics.build_record(_summary(), grid=g, context={"codec": "sharded"})
+    assert rec["codec"] == "sharded"
+    # Absent in context -> null (a frozen/legacy row carries no codec).
+    legacy = bench_metrics.build_record(_summary(), grid=g, context={"target": "t"})
+    assert legacy["codec"] is None
+
+
+def test_run_target_threads_codec_into_record():
+    # run_benchmark must record the target's codec onto the row (dry-run, no AWS).
+    manifest, base = run_benchmark.load_targets(str(BENCH / "targets.json"))
+    rec = run_benchmark.run_target(
+        "tdigest_healpix_o10_inner",
+        manifest,
+        base,
+        store=None,
+        region="us-west-2",
+        function_name="process-shard",
+        context={"commit": "deadbee", "event": "pr"},
+        dry_run=True,
+    )
+    assert rec["codec"] == "inner"
+
+
 def test_memory_pct_of_cap_maps_near_red():
     # 1963 MB on a 2 GB cap -> ~0.96 (the OOM-adjacent run #1 figure, issue #120).
     pct = bench_metrics.memory_pct_of_cap(1963.0, 2.0)
