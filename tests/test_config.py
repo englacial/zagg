@@ -19,6 +19,7 @@ from zagg.config import (
     get_filters,
     get_levels,
     get_output_signature,
+    get_pipeline_type,
     get_sharded,
     get_store_path,
     load_config,
@@ -99,6 +100,95 @@ class TestDefaultConfig:
     def test_nonexistent_raises(self):
         with pytest.raises(FileNotFoundError):
             default_config("nonexistent")
+
+
+# ---------------------------------------------------------------------------
+# Pipeline type (issue #12 Phase 0)
+# ---------------------------------------------------------------------------
+
+
+class TestPipelineType:
+    def test_default_is_spatial_no_key(self, atl06_config):
+        # Existing configs (no ``pipeline`` key) keep defaulting to spatial,
+        # preserving the back-compat contract for every shipped YAML.
+        assert get_pipeline_type(atl06_config) == "spatial"
+
+    def test_explicit_spatial(self):
+        cfg = load_config_from_dict(
+            {
+                "pipeline": {"type": "spatial"},
+                "data_source": {"reader": "h5coro"},
+                "aggregation": {"variables": {"x": {"source": "h", "function": "np.mean"}}},
+                "output": {"store": "."},
+            }
+        )
+        assert get_pipeline_type(cfg) == "spatial"
+
+    def test_unknown_type_raises(self):
+        cfg = load_config_from_dict(
+            {
+                "pipeline": {"type": "bogus"},
+                "data_source": {"reader": "h5coro"},
+                "aggregation": {},
+                "output": {},
+            }
+        )
+        with pytest.raises(ValueError, match="pipeline.type must be one of"):
+            get_pipeline_type(cfg)
+
+    def test_validate_accepts_well_formed_temporal(self):
+        # Phase 5: a temporal config with the four required per-variable spec
+        # keys validates (the spatial grid cross-checks are skipped entirely).
+        cfg = load_config_from_dict(
+            {
+                "pipeline": {"type": "temporal"},
+                "data_source": {"reader": "xarray_s3", "collections": ["merra2"]},
+                "aggregation": {
+                    "variables": {
+                        "max_t2m": {
+                            "variable": "T2M",
+                            "collection": "merra2",
+                            "spatial_func": "max",
+                            "temporal_reducer": "max",
+                            "mask": "ais",
+                        }
+                    }
+                },
+                "output": {"format": "tabular", "store": "."},
+            }
+        )
+        validate_config(cfg)  # no raise
+
+    def test_validate_temporal_missing_spec_key_raises(self):
+        # A temporal variable lacking a required spec key fails at load time
+        # rather than silently shipping.
+        cfg = load_config_from_dict(
+            {
+                "pipeline": {"type": "temporal"},
+                "data_source": {"reader": "xarray_s3"},
+                "aggregation": {"variables": {"x": {"variable": "T2M"}}},
+                "output": {"store": "."},
+            }
+        )
+        with pytest.raises(ValueError, match="missing required key"):
+            validate_config(cfg)
+
+    def test_validate_temporal_requires_variables(self):
+        cfg = load_config_from_dict(
+            {
+                "pipeline": {"type": "event"},
+                "data_source": {"reader": "xarray_s3"},
+                "aggregation": {"coordinates": {}},
+                "output": {"store": "."},
+            }
+        )
+        with pytest.raises(ValueError, match="aggregation.variables"):
+            validate_config(cfg)
+
+    def test_pipeline_must_be_mapping(self):
+        cfg = PipelineConfig(pipeline="spatial")  # type: ignore[arg-type]
+        with pytest.raises(ValueError, match="pipeline must be a mapping"):
+            get_pipeline_type(cfg)
 
 
 # ---------------------------------------------------------------------------
@@ -1695,3 +1785,42 @@ class TestRaggedKind:
         entries = output_field_signature(atl06_config)
         for e in entries:
             assert e["inner_shape"] == [], f"{e['name']!r} has non-empty inner_shape"
+
+
+class TestMerra2StormTemplate:
+    """The packaged temporal-pipeline example (issue #12, Phase 7)."""
+
+    @pytest.fixture
+    def merra2_config(self):
+        from importlib import resources
+
+        import zagg.configs
+
+        ref = resources.files(zagg.configs).joinpath("merra2_storm.yaml")
+        with resources.as_file(ref) as p:
+            return load_config(str(p))
+
+    def test_is_temporal_pipeline(self, merra2_config):
+        assert get_pipeline_type(merra2_config) == "temporal"
+
+    def test_validates(self, merra2_config):
+        validate_config(merra2_config)  # no raise
+
+    def test_output_is_parquet(self, merra2_config):
+        from zagg.output import output_format
+
+        assert output_format(merra2_config) == "parquet"
+        assert merra2_config.output["store"].endswith(".parquet")
+
+    def test_specs_resolve_registered_capabilities(self, merra2_config):
+        from zagg import registry
+        from zagg.temporal import specs_from_config
+
+        specs = {s["output_name"]: s for s in specs_from_config(merra2_config)}
+        assert set(specs) == {"max_t2m_ais", "anom_tqv_full", "total_precip_ocean"}
+        # `anomaly: true` desugars to `transform: monthly_anomaly` (issue #12).
+        assert specs["anom_tqv_full"]["transform"] == "monthly_anomaly"
+        for spec in specs.values():
+            assert spec["spatial_func"] in registry.list_spatial_funcs()
+            assert spec["temporal_reducer"] in registry.list_reducers()
+            assert spec["mask"] in registry.list_mask_providers()
