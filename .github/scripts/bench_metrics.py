@@ -54,6 +54,11 @@ RECORD_COLUMNS = [
     # Appended for issue #120 (stable schema -> new columns go last). Peak worker
     # RSS in MB; null on rows recorded before the worker reported it.
     "max_memory_mb",
+    # Appended for issue #133: the ShardingCodec A/B variable -- "sharded" or
+    # "inner" (the forward matrix's two columns). Null on legacy/frozen rows that
+    # predate the codec axis, so the renderer splits new (codec.notna) from frozen
+    # (codec.isna) series on this column.
+    "codec",
 ]
 
 
@@ -155,6 +160,9 @@ def build_record(
         "zagg_version": zagg_version,
         # Null-safe: absent on an empty/legacy summary -> None -> null parquet cell.
         "max_memory_mb": summary.get("max_memory_mb"),
+        # The ShardingCodec A/B label (issue #133), carried in by run_benchmark from
+        # the target. None on targets that don't set it (legacy/frozen rows).
+        "codec": context.get("codec"),
     }
     return record
 
