@@ -343,6 +343,40 @@ def test_provisional_target_resolves_and_threads_handoff(monkeypatch):
     assert captured["handoff"] == "arrow"
 
 
+def test_committed_targets_drop_redundant_handoff(monkeypatch):
+    # issue #132: the merge-matrix targets no longer restate the carrier; they
+    # inherit it from each config. Only the provisional A/B targets pin handoff.
+    manifest = json.loads((BENCH / "targets.json").read_text())
+    for tname, t in manifest["targets"].items():
+        assert "handoff" not in t, f"{tname}: handoff should be inherited from the config"
+
+
+def test_committed_target_inherits_handoff_from_config(monkeypatch):
+    # issue #132: a committed target with no handoff key inherits the config carrier
+    # (get_handoff -> "arrow" for the benchmark configs, which set no handoff).
+    manifest, base = run_benchmark.load_targets(str(BENCH / "targets.json"))
+    captured = {}
+
+    import zagg.runner as runner
+
+    def fake_agg(config, **kwargs):
+        captured["handoff"] = kwargs.get("handoff")
+        return {}
+
+    monkeypatch.setattr(runner, "agg", fake_agg)
+    run_benchmark.run_target(
+        "gain_bias_healpix_o11",
+        manifest,
+        base,
+        store="s3://b/x.zarr",
+        region="us-west-2",
+        function_name="process-shard",
+        context={"commit": "deadbee", "event": "pr"},
+        dry_run=False,
+    )
+    assert captured["handoff"] == "arrow"
+
+
 def test_scalar_config_is_genuinely_scalar():
     # The scalar benchmark config must be GENUINELY scalar -- every field a plain
     # per-cell stat (no vector/ragged) -- so the pandas/arrow carrier comparison

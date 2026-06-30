@@ -81,12 +81,16 @@ def process_shard(
     driver : str, optional
         ``"s3"`` (default) or ``"https"``.
     handoff : str, optional
-        Per-cell aggregation carrier: ``"pandas"`` (default) or ``"arrow"``. Both
-        feed identical numpy arrays into the same numpy reductions, so scalar
-        outputs are byte-for-byte identical; only the read→concat→extract
-        representation differs (pandas DataFrames vs ``arro3.core`` Tables). The
-        ``"arrow"`` carrier is opt-in for benchmarking the carrier cost (issue
-        #130). pyarrow is not used on either path.
+        Per-cell aggregation carrier: ``"pandas"`` or ``"arrow"``. Both feed
+        identical numpy arrays into the same numpy reductions, so scalar outputs
+        are byte-for-byte identical; only the read→concat→extract representation
+        differs (pandas DataFrames vs ``arro3.core`` Tables). The carrier is
+        normally declared per-pipeline in the aggregation config
+        (``aggregation.handoff``, default ``"arrow"`` — issue #132) and resolved by
+        the caller (``agg`` / the Lambda handler) via
+        :func:`zagg.config.get_handoff`; this parameter's own ``"pandas"`` default
+        is only a no-config safety net for direct callers. pyarrow is not used on
+        either path.
     ragged_out : dict, optional
         Out-param sink for ``kind: ragged`` (CSR) fields (issue #48). When a dict
         is passed, it is filled in place with ``{field_name: (values_list,

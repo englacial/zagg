@@ -1129,6 +1129,15 @@ class TestHandoff:
         with pytest.raises(ValueError, match=r"aggregation\.handoff must be 'pandas' or 'arrow'"):
             validate_config(_cfg_with_handoff("bogus"))
 
+    def test_shipped_atl06_declares_arrow(self):
+        # The shipped atl06 config now declares its carrier explicitly (issue #132).
+        assert get_handoff(default_config("atl06")) == "arrow"
+
+    def test_shipped_nullable_example_selects_pandas(self):
+        # The nullable-source example ships with the pandas carrier and validates.
+        cfg = default_config("atl06_nullable")  # default_config runs validate_config
+        assert get_handoff(cfg) == "pandas"
+
 
 # ---------------------------------------------------------------------------
 # Output grid validation

@@ -46,64 +46,56 @@
       "shardmap": "healpix_o11",
       "aggregator": "gain_bias",
       "grid_type": "healpix",
-      "grid_size": "o11",
-      "handoff": "arrow"
+      "grid_size": "o11"
     },
     "tdigest_healpix_o11": {
       "config": "configs/atl03_tdigest_healpix_o11.yaml",
       "shardmap": "healpix_o11",
       "aggregator": "tdigest",
       "grid_type": "healpix",
-      "grid_size": "o11",
-      "handoff": "arrow"
+      "grid_size": "o11"
     },
     "gain_bias_healpix_o10": {
       "config": "configs/atl03_gain_bias_healpix_o10.yaml",
       "shardmap": "healpix_o10",
       "aggregator": "gain_bias",
       "grid_type": "healpix",
-      "grid_size": "o10",
-      "handoff": "arrow"
+      "grid_size": "o10"
     },
     "tdigest_healpix_o10": {
       "config": "configs/atl03_tdigest_healpix_o10.yaml",
       "shardmap": "healpix_o10",
       "aggregator": "tdigest",
       "grid_type": "healpix",
-      "grid_size": "o10",
-      "handoff": "arrow"
+      "grid_size": "o10"
     },
     "gain_bias_rect_3km": {
       "config": "configs/atl03_gain_bias_rect_3km.yaml",
       "shardmap": "rect_3km",
       "aggregator": "gain_bias",
       "grid_type": "rectilinear",
-      "grid_size": "3km",
-      "handoff": "arrow"
+      "grid_size": "3km"
     },
     "tdigest_rect_3km": {
       "config": "configs/atl03_tdigest_rect_3km.yaml",
       "shardmap": "rect_3km",
       "aggregator": "tdigest",
       "grid_type": "rectilinear",
-      "grid_size": "3km",
-      "handoff": "arrow"
+      "grid_size": "3km"
     },
     "gain_bias_rect_6km": {
       "config": "configs/atl03_gain_bias_rect_6km.yaml",
       "shardmap": "rect_6km",
       "aggregator": "gain_bias",
       "grid_type": "rectilinear",
-      "grid_size": "6km",
-      "handoff": "arrow"
+      "grid_size": "6km"
     },
     "tdigest_rect_6km": {
       "config": "configs/atl03_tdigest_rect_6km.yaml",
       "shardmap": "rect_6km",
       "aggregator": "tdigest",
       "grid_type": "rectilinear",
-      "grid_size": "6km",
-      "handoff": "arrow"
+      "grid_size": "6km"
     }
   },
   "provisional_targets": {
