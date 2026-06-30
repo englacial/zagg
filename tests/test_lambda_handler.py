@@ -183,8 +183,14 @@ class TestProcessEventWriteLoop:
         cap = {"dense": [], "ragged": []}
 
         def fake_process_shard(grid, shard_key, granule_urls, **kwargs):
-            sink = kwargs["chunk_results"]
-            sink.extend(chunks)
+            # Non-sharded path streams via write_chunk (issue #91); sharded path
+            # accumulates via chunk_results. Mirror process_shard's own dispatch.
+            wc = kwargs.get("write_chunk")
+            if wc is not None:
+                for block_index, carrier, ragged in chunks:
+                    wc(block_index, carrier, ragged)
+            else:
+                kwargs["chunk_results"].extend(chunks)
             meta = {
                 "shard_key": shard_key,
                 "cells_with_data": 1,
@@ -206,9 +212,12 @@ class TestProcessEventWriteLoop:
 
         # grid stub: a 1-D companion (single-element block index), exposes
         # chunk_grid_shape so _block_index_key is exercised on its real path.
+        # ``chunks_per_shard`` fixes K (issue #91): the handler now derives the
+        # K==1-vs-K>1 ragged-key choice from the grid, not the chunk count.
         grid_stub = MagicMock()
         grid_stub.group_path = "8"
         grid_stub.chunk_grid_shape = (4,)
+        grid_stub.chunks_per_shard = len(chunks)
         # Regular (non-sharded) write path — a MagicMock attr is truthy by default,
         # so pin it off explicitly (issue #108 routes sharded grids elsewhere).
         grid_stub.sharded = False
@@ -239,6 +248,56 @@ class TestProcessEventWriteLoop:
         # K>1 -> ragged keyed by _block_index_key(block_index) == 0/1/2, NOT shard_key.
         assert [k for k, _r in cap["ragged"]] == [0, 1, 2]
 
+    def test_non_sharded_streams_via_write_chunk_not_chunk_results(self, handler_mod, monkeypatch):
+        """Issue #91: the non-sharded handler hands ``process_shard`` a ``write_chunk``
+        callback (streaming) and no ``chunk_results`` sink, so output memory is never
+        accumulated. The callback writes each chunk as it arrives."""
+        import zagg.grids as grids
+        import zagg.processing as processing
+
+        seen = {}
+
+        def fake_process_shard(grid, shard_key, granule_urls, **kwargs):
+            seen["write_chunk"] = kwargs.get("write_chunk")
+            seen["chunk_results"] = kwargs.get("chunk_results")
+            # Stream two chunks through the callback.
+            kwargs["write_chunk"]((0,), pd.DataFrame(), {})
+            kwargs["write_chunk"]((1,), pd.DataFrame(), {})
+            return pd.DataFrame(), {
+                "shard_key": shard_key,
+                "cells_with_data": 1,
+                "total_obs": 1,
+                "duration_s": 0.0,
+                "error": None,
+            }
+
+        store = MagicMock()
+        grid_stub = MagicMock()
+        grid_stub.group_path = "8"
+        grid_stub.chunk_grid_shape = (4,)
+        grid_stub.chunks_per_shard = 2
+        grid_stub.sharded = False
+        written = []
+        monkeypatch.setattr(processing, "process_shard", fake_process_shard)
+        monkeypatch.setattr(grids, "from_config", lambda *a, **k: grid_stub)
+        monkeypatch.setattr(handler_mod, "open_store", lambda *a, **k: store)
+        # The template check runs via ``open_group`` (issue #118); stub it to succeed.
+        monkeypatch.setattr(handler_mod, "open_group", lambda *a, **k: MagicMock())
+        monkeypatch.setattr(
+            handler_mod,
+            "write_dataframe_to_zarr",
+            lambda c, st, *, grid, chunk_idx: written.append(chunk_idx),
+        )
+        monkeypatch.setattr(handler_mod, "write_ragged_to_zarr", lambda *a, **k: None)
+
+        event = _base_event(_healpix_config_dict())
+        event["child_order"] = 12
+        resp = handler_mod._handle_process(event, _context())
+        assert resp["statusCode"] == 200
+        assert callable(seen["write_chunk"])  # streaming seam wired
+        assert seen["chunk_results"] is None  # no accumulation sink
+        assert written == [(0,), (1,)]  # each chunk written as it streamed
+
     def test_k_eq_1_ragged_keyed_by_shard_key(self, handler_mod, monkeypatch):
         """K=1: the lone chunk's ragged CSR is persisted (the gap this phase closes:
         the old handler never called write_ragged_to_zarr), keyed by shard_key."""
@@ -252,6 +311,61 @@ class TestProcessEventWriteLoop:
         # Single chunk -> ragged keyed by shard_key (cell-resolution contract).
         assert len(cap["ragged"]) == 1
         assert cap["ragged"][0][0] == event["shard_key"]
+
+    def test_streaming_later_chunk_write_failure_partial_writes_and_500(
+        self, handler_mod, monkeypatch
+    ):
+        """Issue #91: when a LATER streamed chunk's write raises after an earlier one
+        already wrote, the failure is recorded → 500, the earlier write stands, and
+        remaining chunks are skipped (the write_error short-circuit)."""
+        import zagg.grids as grids
+        import zagg.processing as processing
+
+        def fake_process_shard(grid, shard_key, granule_urls, **kwargs):
+            chunks = [
+                ((0,), pd.DataFrame(), {}),
+                ((1,), pd.DataFrame(), {}),
+                ((2,), pd.DataFrame(), {}),
+            ]
+            for block_index, carrier, ragged in chunks:
+                kwargs["write_chunk"](block_index, carrier, ragged)
+            return pd.DataFrame(), {
+                "shard_key": shard_key,
+                "cells_with_data": 1,
+                "total_obs": 1,
+                "duration_s": 0.0,
+                "error": None,
+            }
+
+        store = MagicMock()
+        grid_stub = MagicMock()
+        grid_stub.group_path = "8"
+        grid_stub.chunk_grid_shape = (4,)
+        grid_stub.chunks_per_shard = 3
+        grid_stub.sharded = False
+
+        written = []
+
+        def fake_write_dense(c, st, *, grid, chunk_idx):
+            if chunk_idx == (1,):  # the SECOND chunk's write blows up
+                raise RuntimeError("boom")
+            written.append(chunk_idx)
+
+        monkeypatch.setattr(processing, "process_shard", fake_process_shard)
+        monkeypatch.setattr(grids, "from_config", lambda *a, **k: grid_stub)
+        monkeypatch.setattr(handler_mod, "open_store", lambda *a, **k: store)
+        # The template check runs via ``open_group`` (issue #118); stub it to succeed.
+        monkeypatch.setattr(handler_mod, "open_group", lambda *a, **k: MagicMock())
+        monkeypatch.setattr(handler_mod, "write_dataframe_to_zarr", fake_write_dense)
+        monkeypatch.setattr(handler_mod, "write_ragged_to_zarr", lambda *a, **k: None)
+
+        event = _base_event(_healpix_config_dict())
+        event["child_order"] = 12
+        resp = handler_mod._handle_process(event, _context())
+        assert resp["statusCode"] == 500
+        assert "Failed to write zarr" in json.loads(resp["body"])["error"]
+        # Chunk 0 wrote; chunk 1 raised; chunk 2 was skipped (short-circuit).
+        assert written == [(0,)]
 
 
 class TestProcessEventProfile:
@@ -282,7 +396,14 @@ class TestProcessEventProfile:
 
         def fake_process_shard(grid, shard_key, granule_urls, **kwargs):
             cap["profile"] = kwargs.get("profile")
-            kwargs["chunk_results"].extend(chunks)
+            # Mirror process_shard's dispatch: stream via write_chunk when given,
+            # else accumulate into chunk_results (issue #91).
+            wc = kwargs.get("write_chunk")
+            if wc is not None:
+                for block_index, carrier, ragged in chunks:
+                    wc(block_index, carrier, ragged)
+            else:
+                kwargs["chunk_results"].extend(chunks)
             meta = {
                 "shard_key": shard_key,
                 "cells_with_data": 1,
@@ -298,6 +419,8 @@ class TestProcessEventProfile:
         grid_stub = MagicMock()
         grid_stub.group_path = "8"
         grid_stub.chunk_grid_shape = (4,)
+        # K fixed by the grid (issue #91); these profile cases are all K==1 (≤1 chunk).
+        grid_stub.chunks_per_shard = max(len(chunks), 1)
         # Regular (non-sharded) write path — a MagicMock attr is truthy by default,
         # so pin it off explicitly (issue #108 routes sharded grids elsewhere).
         grid_stub.sharded = False
@@ -419,7 +542,14 @@ class TestTemplateExistenceGuard:
         import zagg.processing as processing
 
         def fake_process_shard(grid, shard_key, granule_urls, **kwargs):
-            kwargs["chunk_results"].append(((0,), pd.DataFrame(), {}))
+            # Non-sharded path streams via write_chunk (issue #91); sharded path
+            # accumulates via chunk_results. Mirror process_shard's own dispatch so
+            # the template guard (now lazy, inside the write callback) still runs.
+            wc = kwargs.get("write_chunk")
+            if wc is not None:
+                wc((0,), pd.DataFrame(), {})
+            else:
+                kwargs["chunk_results"].append(((0,), pd.DataFrame(), {}))
             meta = {
                 "shard_key": shard_key,
                 "cells_with_data": 1,
@@ -475,7 +605,14 @@ class TestTemplateExistenceGuard:
         import zagg.processing as processing
 
         def fake_process_shard(grid, shard_key, granule_urls, **kwargs):
-            kwargs["chunk_results"].append(((0,), pd.DataFrame(), {}))
+            # Mirror process_shard's dispatch: stream via write_chunk when given
+            # (non-sharded, issue #91), else accumulate into chunk_results, so the
+            # real ``open_group`` guard inside the write callback is exercised.
+            wc = kwargs.get("write_chunk")
+            if wc is not None:
+                wc((0,), pd.DataFrame(), {})
+            else:
+                kwargs["chunk_results"].append(((0,), pd.DataFrame(), {}))
             meta = {
                 "shard_key": shard_key,
                 "cells_with_data": 1,

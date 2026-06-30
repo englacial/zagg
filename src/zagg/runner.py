@@ -365,7 +365,28 @@ def _process_and_write(
     byte-for-byte the single-chunk path. ``chunk_idx`` is retained for the K==1
     callers/signature but the per-chunk block index from ``iter_chunks`` is used.
     """
-    chunk_results: list = []
+    # K==1 vs K>1 is fixed by the grid, not the materialized list (issue #91): at
+    # K==1 the lone chunk IS the shard so its CSR subgroup is keyed by ``shard_key``;
+    # at K>1 each finer chunk is keyed by its own block index. Deriving it from the
+    # grid lets the non-sharded path stream (no materialized count needed).
+    single_chunk = int(getattr(grid, "chunks_per_shard", 1)) == 1
+
+    def _write_chunk(block_index, carrier, ragged):
+        # write_dataframe_to_zarr no-ops on an empty carrier (DataFrame or Arrow
+        # table), so no carrier-specific emptiness check is needed here.
+        write_dataframe_to_zarr(carrier, zarr_store, grid=grid, chunk_idx=block_index)
+        # Persist this chunk's ragged (CSR) fields — one CSR group per field per
+        # chunk (issue #48). No-ops when ``ragged`` is empty.
+        ragged_key = int(shard_key) if single_chunk else _block_index_key(block_index, grid)
+        write_ragged_to_zarr(ragged, zarr_store, grid=grid, shard_key=ragged_key)
+
+    # Sharded output (issue #108): the shard's K inner chunks bundle into one
+    # ShardingCodec shard object — write the whole shard in one block selection per
+    # dense array (a per-inner-chunk loop would read-modify-write the shard object).
+    # That path needs all K at once, so it accumulates via ``chunk_results``; the
+    # non-sharded path streams each chunk write-then-free via ``write_chunk`` (#91).
+    sharded = getattr(grid, "sharded", False)
+    chunk_results: list | None = [] if sharded else None
     _df_out, metadata = process_shard(
         grid,
         int(shard_key),
@@ -375,35 +396,10 @@ def _process_and_write(
         driver=driver,
         handoff=handoff,
         chunk_results=chunk_results,
+        write_chunk=None if sharded else _write_chunk,
     )
-    # Sharded output (issue #108): the shard's K inner chunks bundle into one
-    # ShardingCodec shard object — write the whole shard in one block selection per
-    # dense array (a per-inner-chunk loop would read-modify-write the shard object).
-    if getattr(grid, "sharded", False):
+    if sharded:
         write_shard_to_zarr(chunk_results, zarr_store, grid=grid, shard_key=int(shard_key))
-        return metadata
-    single_chunk = len(chunk_results) == 1
-    for block_index, carrier, ragged in chunk_results:
-        # write_dataframe_to_zarr no-ops on an empty carrier (DataFrame or Arrow
-        # table), so no carrier-specific emptiness check is needed here.
-        write_dataframe_to_zarr(
-            carrier,
-            zarr_store,
-            grid=grid,
-            chunk_idx=block_index,
-        )
-        # Persist this chunk's ragged (CSR) fields — one CSR group per field per
-        # chunk (issue #48). At K==1 the chunk IS the shard, so the CSR subgroup is
-        # keyed by ``shard_key`` (the phase-4b cell-resolution contract); at K>1
-        # each finer chunk is keyed by its own block index so the K groups stay
-        # distinct. No-ops when ``ragged`` is empty.
-        ragged_key = int(shard_key) if single_chunk else _block_index_key(block_index, grid)
-        write_ragged_to_zarr(
-            ragged,
-            zarr_store,
-            grid=grid,
-            shard_key=ragged_key,
-        )
     return metadata
 
 
