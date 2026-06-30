@@ -58,8 +58,13 @@ fi
 # lat/lon -> grid CRS at processing time. zarr/obstore/pydantic-zarr are NOT
 # here -- they are function-level deps installed by build_function.sh.
 echo "Installing processing deps..."
+# arro3-core (issue #130) is the deployed-worker Arrow carrier, replacing pyarrow:
+# ~7 MB, zero required deps, importable (pyarrow's bindings hard-link a ~100 MB
+# unstrippable C++ core that can't fit the gate while importable). pyarrow is NOT
+# installed here -- its only use is off-Lambda zagg.catalog. Keep the pin in sync
+# with the `lambda` extra in pyproject.toml.
 $PIP install \
-    "pandas==2.2.3" fastparquet cramjam \
+    "pandas==2.2.3" "arro3-core==0.8.1" fastparquet cramjam \
     shapely pyproj odc-geo affine cachetools \
     -c "$CONSTRAINTS" \
     -t "$OUTPUT_DIR/python" \
@@ -76,11 +81,11 @@ if [[ "$NUMPY_VERSION" == *"2.3"* ]]; then
 fi
 
 # Remove bloat. pyproj is intentionally NOT stripped (rectilinear/odc-geo assign
-# needs it); pyarrow stays stripped (catalog fetch/build only, never the
-# processing path).
+# needs it). pyarrow is no longer installed (issue #130): the worker's Arrow carrier
+# is arro3-core, which needs no component strip, so the whole pyarrow strip block is
+# gone with it.
 echo "Removing bloat..."
-rm -rf "$OUTPUT_DIR/python"/pyarrow* \
-       "$OUTPUT_DIR/python"/xarray* \
+rm -rf "$OUTPUT_DIR/python"/xarray* \
        "$OUTPUT_DIR/python"/matplotlib* \
        "$OUTPUT_DIR/python"/lonboard* \
        "$OUTPUT_DIR/python"/boto3* \

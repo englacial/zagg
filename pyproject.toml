@@ -28,11 +28,17 @@ dependencies = [
     "numpy>=2.0",
     "pandas>=2.2",
     "h5coro>=1.0.3",
-    "mortie>=0.8.2",
+    "mortie>=0.8.3",
     "earthaccess",
     "boto3",
     "fastparquet",
-    "pyarrow",
+    # arro3-core is the deployed-worker Arrow carrier (issue #130): ~7 MB, zero
+    # required runtime deps, importable inside the 250 MB Lambda gate — unlike
+    # pyarrow, whose bindings hard-link a ~100 MB unstrippable C++ core. pyarrow is
+    # NOT a core dep: after the pivot its only remaining direct use is off-Lambda
+    # zagg.catalog, so it lives in the `catalog` extra (forced anyway by
+    # stac-geoparquet).
+    "arro3-core>=0.8.1",
     "pydantic-zarr>=0.9.1",
     "zarr>=3.1.5",
     "obstore>=0.8.2",
@@ -46,6 +52,9 @@ dependencies = [
 lambda = [
     "numpy==2.2.6",
     "pandas==2.2.3",
+    # arro3-core replaces pyarrow as the deployed-worker Arrow carrier (issue #130).
+    # Keep this pin in sync with deployment/aws/build_layer.sh.
+    "arro3-core==0.8.1",
     "h5coro==1.0.4",
     "cramjam",
     "astropy",
@@ -58,8 +67,19 @@ lambda = [
 # it separately for the exact-S2 catalog backend; without it, `auto` falls back
 # to mortie (HEALPix) / shapely (rectilinear):
 #   pip install "spherely @ https://github.com/espg/spherely/releases/download/v0.1.1-spatialindex/spherely-0.1.1+spatialindex-cp312-cp312-manylinux_2_28_x86_64.whl"
+# pyarrow lives here (not core): zagg.catalog (STAC/geoparquet build) is the only
+# direct pyarrow user after the issue #130 pivot, and stac-geoparquet hard-requires
+# pyarrow anyway. catalog runs off-Lambda, so pyarrow never reaches the worker/layer.
 catalog = [
     "stac-geoparquet>=0.7.0",
+    "pyarrow",
+]
+# Interactive shard-map viewer (issue #38). Optional — kept out of core and out
+# of `lambda` so the deployment layer stays lean. `pip install zagg[viz]`.
+# ipyleaflet is a Jupyter widget; @espg approved adding it for the viewer
+# (https://github.com/englacial/zagg/issues/38#issuecomment-4713639466).
+viz = [
+    "ipyleaflet>=0.19",
 ]
 analysis = [
     "cubed>=0.24.0",
@@ -71,9 +91,9 @@ analysis = [
     "matplotlib>=3.10.8",
     "notebook",
 ]
-# Lean extra for the Lambda-benchmark CI plotting step (issue #110). pyarrow is
-# already a core dep; this just pulls in matplotlib (same pin as analysis) so the
-# benchmark workflow doesn't install the heavy analysis stack.
+# Lean extra for the Lambda-benchmark CI plotting step (issue #110): just pulls in
+# matplotlib (same pin as analysis) so the benchmark workflow doesn't install the
+# heavy analysis stack.
 benchmark = [
     "matplotlib>=3.10.8",
 ]

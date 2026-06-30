@@ -33,10 +33,7 @@ from zagg.processing.aggregate import (
     _aggregate_chunk_cells,
     _concat_and_group,
     _eval_chunk_precompute,
-    _group_columns,
-    _has_ragged_fields,
     _has_vector_fields,
-    _kernel_aggregate,
     _pool_chunk_columns,
 )
 from zagg.processing.write import _build_output
@@ -84,16 +81,12 @@ def process_shard(
     driver : str, optional
         ``"s3"`` (default) or ``"https"``.
     handoff : str, optional
-        Per-cell aggregation carrier: ``"pandas"`` (default), ``"arrow"``, or the
-        EXPERIMENTAL ``"arrow-kernel"``. ``"pandas"`` and ``"arrow"`` share
-        :func:`_group_columns` and the same numpy reductions, so scalar outputs
-        are byte-for-byte identical; only the read→concat→extract representation
-        differs. ``"arrow-kernel"`` (phase 2b of #30) instead reduces via
-        ``pyarrow.compute`` hash-aggregate kernels: ``count``/``min``/``max`` stay
-        exact vs numpy (NaN included — see :func:`_kernel_aggregate`), while its
-        float ``mean``/``variance`` differ by ~1 ULP (agree within
-        :data:`KERNEL_RTOL`, not byte identical). All three are opt-in while
-        benchmarked (issue #30).
+        Per-cell aggregation carrier: ``"pandas"`` (default) or ``"arrow"``. Both
+        feed identical numpy arrays into the same numpy reductions, so scalar
+        outputs are byte-for-byte identical; only the read→concat→extract
+        representation differs (pandas DataFrames vs ``arro3.core`` Tables). The
+        ``"arrow"`` carrier is opt-in for benchmarking the carrier cost (issue
+        #130). pyarrow is not used on either path.
     ragged_out : dict, optional
         Out-param sink for ``kind: ragged`` (CSR) fields (issue #48). When a dict
         is passed, it is filled in place with ``{field_name: (values_list,
@@ -146,8 +139,8 @@ def process_shard(
     """
     if config is None:
         config = default_config()
-    if handoff not in ("pandas", "arrow", "arrow-kernel"):
-        raise ValueError(f"handoff must be 'pandas', 'arrow', or 'arrow-kernel', got {handoff!r}")
+    if handoff not in ("pandas", "arrow"):
+        raise ValueError(f"handoff must be 'pandas' or 'arrow', got {handoff!r}")
     data_source = config.data_source
 
     shard_key = int(shard_key)
@@ -203,9 +196,10 @@ def process_shard(
     # Build URL rewriter for the active driver
     _rewrite_url = _processing._make_url_rewriter(driver)
 
-    use_arrow = handoff in ("arrow", "arrow-kernel")
+    use_arrow = handoff == "arrow"
     all_reads = []
     files_processed = 0
+    read_errors = 0
 
     # Opt-in per-phase timing (issue #100). Only allocated when profiling so the
     # default path stays byte-identical (no dict, no time.time() calls).
@@ -234,7 +228,14 @@ def process_shard(
                     if chunk is not None:
                         all_reads.append(chunk)
                 except Exception as e:
-                    logger.debug(f"  Error reading track {g}: {e}")
+                    # A raised read error is always a real failure: a
+                    # legitimately-empty group returns ``None`` (no exception),
+                    # so promoting this to WARNING does not get noisy on shards
+                    # where many granules simply contribute 0 photons (issue
+                    # #116). Logging it at DEBUG hid the dem_h broadcast failure
+                    # behind the misleading "No data after filtering" below.
+                    read_errors += 1
+                    logger.warning(f"  Error reading track {g}: {e}")
                     continue
 
             files_processed += 1
@@ -259,12 +260,26 @@ def process_shard(
 
     logger.info(f"  Processed {files_processed}/{len(granule_urls)} files")
     metadata["files_processed"] = files_processed
+    if read_errors:
+        metadata["read_errors"] = read_errors
     if profile:
         phase_timings["read"] = time.time() - _read_t0
 
     if not all_reads:
-        logger.info(f"  No data after filtering for shard {shard_key} - skipping")
-        metadata["error"] = "No data after filtering"
+        # Distinguish a genuinely-empty read from one where a group read raised
+        # (issue #116): a raised read is a real error masquerading as "no data",
+        # so report it as such instead of the misleading text. Some groups may
+        # have returned ``None`` (legitimately empty) rather than raised, so the
+        # message is "no data AND N raised", not "all groups raised".
+        if read_errors:
+            logger.warning(
+                f"  No data after filtering for shard {shard_key} and "
+                f"{read_errors} group read(s) raised - skipping"
+            )
+            metadata["error"] = f"No data after filtering ({read_errors} group reads raised)"
+        else:
+            logger.info(f"  No data after filtering for shard {shard_key} - skipping")
+            metadata["error"] = "No data after filtering"
         metadata["duration_s"] = (datetime.now() - start_time).total_seconds()
         if profile:
             metadata["phase_timings"] = phase_timings
@@ -295,33 +310,10 @@ def process_shard(
     # so the gain/offset anchor must be reduced over each chunk's own observations,
     # not the whole pooled shard. At K==1 the lone chunk == the whole shard, so the
     # anchor is identical to the old shard-level reduction (byte-for-byte unchanged).
-    if handoff == "arrow-kernel":
-        # EXPERIMENTAL (phase 2b of #30): reduce via pyarrow hash-aggregate kernels.
-        if _has_ragged_fields(config):
-            raise NotImplementedError(
-                "handoff='arrow-kernel' does not support ragged fields (issue #48); "
-                "use handoff='pandas' or 'arrow' instead"
-            )
-        import pyarrow as pa
-
-        table = pa.concat_tables(all_reads).combine_chunks()
-        null_cols = [n for n in table.column_names if table.column(n).null_count]
-        if null_cols:
-            raise ValueError(f"arrow handoff requires null-free columns; got nulls in {null_cols}")
-        n_obs_total = table.num_rows
-        cell_col = grid.cells_of(table.column("leaf_id").to_numpy(zero_copy_only=False))
-        logger.info(f"  Read {n_obs_total:,} observations")
-        pooled = {n: table.column(n).to_numpy(zero_copy_only=False) for n in table.column_names}
-        # Group the pooled columns by cell ONCE (issue #82 phase 6), exactly as the
-        # default path's ``cell_to_slice`` does, so the per-chunk precompute subset is
-        # a contiguous gather (O(N) total) rather than a shard-wide ``np.isin`` rescan
-        # on every one of the K iterations (O(K·N)).
-        pooled_sorted, pooled_to_slice = _group_columns(pooled, cell_col)
-    else:
-        # Concat the per-group reads and split observations by cell (carrier-
-        # agnostic; both carriers feed identical numpy arrays into _group_columns).
-        col_arrays, cell_to_slice, n_obs_total = _concat_and_group(all_reads, grid, handoff)
-        logger.info(f"  Read {n_obs_total:,} observations")
+    # Concat the per-group reads and split observations by cell (carrier-agnostic;
+    # both carriers feed identical numpy arrays into _group_columns).
+    col_arrays, cell_to_slice, n_obs_total = _concat_and_group(all_reads, grid, handoff)
+    logger.info(f"  Read {n_obs_total:,} observations")
 
     if profile:
         phase_timings["index"] = time.time() - _index_t0
@@ -345,35 +337,20 @@ def process_shard(
     single_ragged: dict = {}
     for block_index, chunk_children in chunk_iter:
         chunk_children = np.asarray(chunk_children)
-        if handoff == "arrow-kernel":
-            # Per-chunk precompute (issue #82 phase 6): reduce the anchor over only
-            # this chunk's observations, gathered from the once-grouped pooled columns
-            # (contiguous slices, not a shard-wide rescan). An empty chunk yields
-            # length-0 columns, which ``_eval_chunk_precompute`` short-circuits to NaN
-            # anchors rather than raising on ``np.min`` of an empty array.
-            chunk_pooled = _pool_chunk_columns(pooled_sorted, pooled_to_slice, chunk_children)
-            chunk_scalars = _eval_chunk_precompute(config, chunk_pooled)
-            kernel = _kernel_aggregate(
-                table, cell_col, chunk_children, "h_li", config, chunk_scalars=chunk_scalars
-            )
-            stats_arrays = kernel["stats_arrays"]
-            cells_with_data += kernel["cells_with_data"]
-            ragged_payloads: dict[str, list] = {}
-        else:
-            # Per-chunk precompute (issue #82 phase 6): pool only this chunk's rows
-            # from the shard's sorted column arrays, then reduce the anchor over them.
-            chunk_pooled = _pool_chunk_columns(col_arrays, cell_to_slice, chunk_children)
-            chunk_scalars = _eval_chunk_precompute(config, chunk_pooled)
-            stats_arrays, ragged_payloads, ragged_idx, cwd = _aggregate_chunk_cells(
-                chunk_children,
-                col_arrays,
-                cell_to_slice,
-                chunk_scalars,
-                config,
-                data_vars,
-                agg_fields,
-            )
-            cells_with_data += cwd
+        # Per-chunk precompute (issue #82 phase 6): pool only this chunk's rows
+        # from the shard's sorted column arrays, then reduce the anchor over them.
+        chunk_pooled = _pool_chunk_columns(col_arrays, cell_to_slice, chunk_children)
+        chunk_scalars = _eval_chunk_precompute(config, chunk_pooled)
+        stats_arrays, ragged_payloads, ragged_idx, cwd = _aggregate_chunk_cells(
+            chunk_children,
+            col_arrays,
+            cell_to_slice,
+            chunk_scalars,
+            config,
+            data_vars,
+            agg_fields,
+        )
+        cells_with_data += cwd
         # Strict-AOI per-cell mask (issue #101): expand the shard's manifest payload
         # over THIS chunk's cells (order-aligned with the carrier). None when the
         # flag is off, so the carrier is byte-for-byte unchanged. A non-None payload
@@ -397,11 +374,7 @@ def process_shard(
             children=(chunk_children if chunks_per_shard > 1 else None),
             aoi_mask=chunk_aoi_mask,
         )
-        ragged = (
-            {name: (ragged_payloads[name], ragged_idx[name]) for name in ragged_payloads}
-            if handoff != "arrow-kernel"
-            else {}
-        )
+        ragged = {name: (ragged_payloads[name], ragged_idx[name]) for name in ragged_payloads}
         if chunk_results is not None:
             chunk_results.append((block_index, carrier, ragged))
         else:

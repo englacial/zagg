@@ -73,12 +73,22 @@ def _expand_mask_to_base(
     for p, keep in enumerate(coarse_mask):
         if not keep:
             continue
+        cnt = int(count_arr[p])
+        # Empty parents cover no base rows. Real ATL03 marks them with
+        # ``count == 0`` AND ``ph_index_beg == 0`` (issue #116), so under
+        # ``index_base=1`` they would otherwise give ``beg = 0 - 1 = -1`` and
+        # raise below; skip them, mirroring the non-empty-only contract
+        # ``read_plan.plan_read`` already uses (its ``cnt > 0`` skip). Skipping
+        # intentionally bypasses the ``beg < 0`` validation for these parents --
+        # correct, since they map to zero base rows (a non-empty parent with
+        # ``beg < 0`` still raises).
+        if cnt == 0:
+            continue
         beg = int(index_beg_arr[p]) - index_base
         if beg < 0:
             raise ValueError(
                 f"index_beg_arr[{p}]={index_beg_arr[p]} is less than index_base={index_base}"
             )
-        cnt = int(count_arr[p])
         out[beg : beg + cnt] = True
     return out
 
@@ -131,12 +141,22 @@ def _broadcast_segment_to_base(
     else:
         out = np.zeros(total_base_size, dtype=seg_values.dtype)
     for p in range(len(seg_values)):
+        cnt = int(count_arr[p])
+        # Empty segments cover no photons. Real ATL03 marks them with
+        # ``count == 0`` AND ``ph_index_beg == 0`` (issue #116, see
+        # ``read_plan.plan_read``'s ``cnt > 0`` skip); under ``index_base=1``
+        # that gives ``beg = 0 - 1 = -1`` and would raise below, which is what
+        # made the gain_bias dem_h broadcast drop every photon. Skip them; this
+        # intentionally bypasses the ``beg < 0`` / ``beg + cnt > base`` checks
+        # for empties (they map to zero base rows). A non-empty segment with
+        # ``beg < 0`` or an over-extending range still raises below.
+        if cnt == 0:
+            continue
         beg = int(index_beg_arr[p]) - index_base
         if beg < 0:
             raise ValueError(
                 f"index_beg_arr[{p}]={index_beg_arr[p]} is less than index_base={index_base}"
             )
-        cnt = int(count_arr[p])
         if beg + cnt > total_base_size:
             raise ValueError(
                 f"segment {p} range [{beg}:{beg + cnt}] exceeds base size {total_base_size}; "
@@ -286,7 +306,7 @@ def _planned_read_group(
     - the cell ``signal_conf_ph``-style 2-D structured filter would be re-read
       via the planned slices either way (the helper handles that uniformly).
 
-    Returns the same ``pandas.DataFrame`` / ``pyarrow.Table`` / ``None`` contract
+    Returns the same ``pandas.DataFrame`` / ``arro3.core.Table`` / ``None`` contract
     as :func:`_read_group`. Output rows are in plan-slice / spatial-mask /
     filter order — which matches the full-read path's row ordering because the
     plan's runs are emitted in increasing parent index.
@@ -503,17 +523,20 @@ def _planned_read_group(
         data_dict = {k: v[emask] for k, v in data_dict.items()}
 
     if arrow:
-        import pyarrow as pa
+        from arro3.core import Table
 
-        return pa.table(data_dict)
+        # arro3-core carrier (issue #130): no pyarrow on the worker. ``from_pydict``
+        # accepts the raw numpy column arrays directly (zero-copy for the contiguous
+        # dense reads here), matching the pandas carrier's columns.
+        return Table.from_pydict(data_dict)
     return pd.DataFrame(data_dict)
 
 
 def _read_group(h5obj, group: str, data_source: dict, shard_key: int, grid, arrow: bool = False):
     """Read and spatially filter one HDF5 group.
 
-    Returns a ``pandas.DataFrame`` (default) or, when ``arrow=True``, a
-    ``pyarrow.Table`` carrying the identical columns. Returns ``None`` when the
+    Returns a ``pandas.DataFrame`` (default) or, when ``arrow=True``, an
+    ``arro3.core.Table`` carrying the identical columns. Returns ``None`` when the
     group has no observations in this shard.
 
     Supports three modes (issues #43 Phase A/B/C):
@@ -729,7 +752,10 @@ def _read_group_full(
         data_dict = {k: v[emask] for k, v in data_dict.items()}
 
     if arrow:
-        import pyarrow as pa
+        from arro3.core import Table
 
-        return pa.table(data_dict)
+        # arro3-core carrier (issue #130): no pyarrow on the worker. ``from_pydict``
+        # accepts the raw numpy column arrays directly (zero-copy for the contiguous
+        # dense reads here), matching the pandas carrier's columns.
+        return Table.from_pydict(data_dict)
     return pd.DataFrame(data_dict)

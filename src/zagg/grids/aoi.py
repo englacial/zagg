@@ -28,24 +28,31 @@ from __future__ import annotations
 
 import numpy as np
 
-# mortie's MOC coverage API is 1..29 (espg/mortie#59 + #70, shipped in 0.8.2).
-# The AOI MOC is built at ``child_order`` (the cell resolution), which can exceed
-# the legacy order-18 cap, so we assert the resolved mortie ships the lifted cap
-# rather than silently mis-sizing the mask against an 18-capped build.
-MIN_MORTIE_VERSION = "0.8.2"
+# mortie's MOC coverage API is 1..29 (espg/mortie#59 + #70, shipped in 0.8.2) and
+# its public WKB/WKT/geometry cover entry points (``from_wkb`` / ``from_wkt`` /
+# ``from_geometry``, espg/mortie#89) ship in 0.8.3. The AOI MOC is built at
+# ``child_order`` (the cell resolution), which can exceed the legacy order-18 cap,
+# and the WKB/WKT AOI path calls those public entry points — so we assert the
+# resolved mortie is >= 0.8.3 rather than silently mis-sizing the mask against an
+# 18-capped build or reaching for a WKB/WKT API that isn't there.
+MIN_MORTIE_VERSION = "0.8.3"
 
 
 def _assert_mortie_version() -> None:
-    """Fail loudly if the resolved mortie predates the order-29 MOC cap (0.8.2).
+    """Fail loudly if the resolved mortie predates the WKB/WKT cover API (0.8.3).
 
     Against an order-18-capped build ``morton_coverage_moc(..., order=child_order)``
     raises for any ``child_order > 18``, so the AOI mask would silently come back
     empty (the swallowing ``except`` paths elsewhere) or wrongly sized. Assert here
     so a stale environment is a clear error at use, not a quiet bad mask.
 
-    Uses PEP 440 ordering (via ``packaging``) so a pre-release like ``0.8.2.devN``
-    — which is *before* the 0.8.2 tag that shipped the cap lift, hence still
-    18-capped — is correctly rejected, not waved through by a digits-only parse.
+    The WKB/WKT AOI path additionally needs the public ``from_wkb`` / ``from_wkt``
+    cover entry points (espg/mortie#89), which ship in the same 0.8.3 release, so a
+    single ``>= 0.8.3`` gate covers both the MOC cap and the geometry-ingest API.
+
+    Uses PEP 440 ordering (via ``packaging``) so a pre-release like ``0.8.3.devN``
+    — which is *before* the 0.8.3 tag, hence missing the public entry points — is
+    correctly rejected, not waved through by a digits-only parse.
     """
     import mortie
     from packaging.version import InvalidVersion, Version
@@ -63,7 +70,8 @@ def _assert_mortie_version() -> None:
     if resolved < Version(MIN_MORTIE_VERSION):
         raise RuntimeError(
             f"aoi_mask requires mortie >= {MIN_MORTIE_VERSION} (the order-29 MOC "
-            f"coverage cap, espg/mortie#59 + #70); resolved {raw}. Upgrade mortie "
+            f"coverage cap, espg/mortie#59 + #70, plus the public WKB/WKT cover "
+            f"entry points, espg/mortie#89); resolved {raw}. Upgrade mortie "
             "or disable output.aoi_mask."
         )
 

@@ -31,14 +31,20 @@ def _arrow_column(block: np.ndarray, sig: dict):
     list. Keeping the vector path a list-carrier (rather than a bespoke 2-D
     column) is what lets the future ragged t-digest slot in as a variable-length
     ``List<FixedSizeList<2>>`` through the same seam (issue #29 Tier 2).
+
+    The carrier is ``arro3-core`` (issue #130 path C): ~7 MB, zero required deps,
+    importable inside the 250 MB Lambda gate — unlike pyarrow, whose Python
+    bindings hard-link a ~100 MB unstrippable C++ core. pyarrow is no longer shipped
+    in the layer or a core dep; it survives only in the off-Lambda ``catalog`` extra
+    (``zagg.catalog``, via stac-geoparquet).
     """
-    import pyarrow as pa
+    from arro3.core import Array, fixed_size_list_array
 
     if sig["kind"] != "vector":
-        return pa.array(block)
+        return Array.from_numpy(np.ascontiguousarray(block))
     width = int(np.prod(sig["trailing_shape"]))
     flat = np.ascontiguousarray(block).reshape(-1)
-    return pa.FixedSizeListArray.from_arrays(pa.array(flat), width)
+    return fixed_size_list_array(Array.from_numpy(flat), width)
 
 
 def _build_output(
@@ -54,9 +60,9 @@ def _build_output(
 ):
     """Assemble the per-shard output carrier from the per-cell stats blocks.
 
-    Returns a ``pandas.DataFrame`` for a pure-scalar config (unchanged) or a
-    ``pyarrow.Table`` when any ``vector`` field is present, in both cases with the
-    data-variable columns followed by the grid's per-cell coord columns.
+    Returns a ``pandas.DataFrame`` for a pure-scalar config (unchanged) or an
+    ``arro3.core.Table`` when any ``vector`` field is present, in both cases with
+    the data-variable columns followed by the grid's per-cell coord columns.
 
     ``children`` (issue #30 item 3): when given, the coord columns are computed
     for that explicit chunk's cells via ``grid.coords_of(children)`` instead of the
@@ -80,7 +86,7 @@ def _build_output(
             df_out[col_name] = vals
         return df_out
 
-    import pyarrow as pa
+    from arro3.core import Array, Table
 
     columns = {
         var: _arrow_column(stats_arrays[var], get_output_signature(agg_fields[var]))
@@ -91,12 +97,19 @@ def _build_output(
         # pandas carrier (#71), so both carriers share one on-disk dtype guarantee
         # rather than relying on MortonIndexArray.__array__ returning uint64.
         arr = morton_words(vals) if is_morton_array(vals) else np.asarray(vals)
-        columns[col_name] = pa.array(arr)
-    return pa.table(columns)
+        columns[col_name] = Array.from_numpy(np.ascontiguousarray(arr))
+    return Table.from_pydict(columns)
 
 
 def _carrier_empty(carrier) -> bool:
-    """Whether a process_shard output carrier (DataFrame or Arrow table) is empty."""
+    """Whether a process_shard output carrier (DataFrame or Arrow table) is empty.
+
+    The arro3 carrier is never built with 0 rows in practice — ``_build_output``
+    sizes it to ``prod(chunk_shape) > 0`` cells, and a no-data shard returns an
+    empty pandas DataFrame before any arro3 table is constructed (arro3 cannot build
+    a 0-length array). The ``num_rows == 0`` arm is kept as a defensive parallel to
+    the DataFrame ``.empty`` check, not a path the worker exercises.
+    """
     if isinstance(carrier, pd.DataFrame):
         return carrier.empty
     return carrier.num_rows == 0
@@ -113,8 +126,8 @@ def write_dataframe_to_zarr(
 
     Parameters
     ----------
-    df_out : pandas.DataFrame or pyarrow.Table
-        Coordinate + data-variable columns. A ``pyarrow.Table`` is used when the
+    df_out : pandas.DataFrame or arro3.core.Table
+        Coordinate + data-variable columns. An ``arro3.core.Table`` is used when the
         config declares any ``vector`` field (issue #29): its ``FixedSizeList``
         columns carry the per-cell ``trailing_shape`` payload, written to a
         Zarr array with a trailing dimension. Cell count must equal
@@ -596,14 +609,17 @@ def _iter_carrier_columns(carrier):
             yield name, values
         return
 
-    import pyarrow as pa
+    from arro3.core import list_flatten
 
     n_rows = carrier.num_rows
     for name in carrier.column_names:
         col = carrier.column(name).combine_chunks()
-        if pa.types.is_fixed_size_list(col.type):
-            width = col.type.list_size
-            flat = col.values.to_numpy(zero_copy_only=False)
+        # arro3 marks a FixedSizeList by an integer ``list_size`` (None for scalar
+        # types), so the per-cell width and the 2-D reshape mirror the pyarrow path
+        # exactly — the numpy block written to Zarr is byte-for-byte unchanged.
+        width = col.type.list_size
+        if width is not None:
+            flat = list_flatten(col).to_numpy()
             yield name, flat.reshape(n_rows, width)
         else:
-            yield name, col.to_numpy(zero_copy_only=False)
+            yield name, col.to_numpy()

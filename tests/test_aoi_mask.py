@@ -119,7 +119,7 @@ class TestHealpixMOCMask:
         )
 
     def test_child_order_above_18_does_not_raise(self):
-        # 0.8.2 lifted the MOC cap to 29: a child_order > 18 must build a real MOC
+        # 0.8.2+ lifted the MOC cap to 29: a child_order > 18 must build a real MOC
         # (an order-18-capped build would raise). Keep the AOI small so it's fast.
         grid = HealpixGrid(parent_order=10, child_order=20, layout="fullsphere")
         parts = _box(10.0, 10.0, 10.05, 10.05)
@@ -132,11 +132,11 @@ def test_mortie_version_asserted(monkeypatch):
 
     from zagg.grids import aoi
 
-    for bad in ("0.8.1", "0.8.2.dev1", "0.7.2"):
+    for bad in ("0.8.1", "0.8.2", "0.8.3.dev1", "0.7.2"):
         monkeypatch.setattr(mortie, "__version__", bad, raising=False)
         with pytest.raises(RuntimeError, match="aoi_mask requires mortie"):
             aoi._assert_mortie_version()
-    for ok in ("0.8.2", "0.8.3", "0.9.0", "1.0.0"):
+    for ok in ("0.8.3", "0.9.0", "1.0.0"):
         monkeypatch.setattr(mortie, "__version__", ok, raising=False)
         aoi._assert_mortie_version()  # no raise
 

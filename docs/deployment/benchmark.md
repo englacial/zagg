@@ -10,6 +10,22 @@ data branch; they update live (the docs embed them by raw URL, so no docs rebuil
 is needed). See [Lambda benchmark CI/CD setup](benchmark-cicd.md) for how the
 pipeline is wired.
 
+## Latest merge
+
+A snapshot of the most recent merge's per-target numbers — runtime, cost, and peak
+memory (the `% cap` cell is shaded green→red on the same scale as the chart
+markers). Like the charts, it updates live by raw URL.
+
+![Latest benchmark table](https://raw.githubusercontent.com/englacial/zagg/benchmarks/site/latest_table.png)
+
+**Referencing these numbers programmatically?** Pull the machine-readable
+companions instead of scraping the image:
+[`metrics.json`](https://raw.githubusercontent.com/englacial/zagg/benchmarks/site/metrics.json)
+(the latest merge's records) or
+[`latest.md`](https://raw.githubusercontent.com/englacial/zagg/benchmarks/site/latest.md)
+(the same table as markdown). The full retained history is `series.parquet` on the
+[`benchmarks` branch](https://github.com/englacial/zagg/tree/benchmarks).
+
 ## Cost per shard vs runtime
 
 ![Cost per shard](https://raw.githubusercontent.com/englacial/zagg/benchmarks/site/cost_per_shard.png)

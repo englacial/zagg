@@ -171,6 +171,52 @@ def test_comment_markdown_empty():
     assert "<!-- zagg-benchmark -->" in bench_metrics.comment_markdown([])
 
 
+def test_format_record_cells_shared_formatting():
+    cells = bench_metrics.format_record_cells(
+        {
+            "target": "t",
+            "total_obs": 1_234_567,
+            "runtime_s": 200.0,
+            "cost_per_shard_usd": 0.005,
+            "cost_per_100km2_usd": 0.05,
+            "worker_pct_timeout": 0.28,
+            "max_memory_mb": 1024.0,
+            "memory_gb": 2.0,
+        }
+    )
+    assert cells["obs"] == "1,234,567"
+    assert cells["cost/shard"] == "$0.00500"
+    assert cells["% cap"] == "50%"
+    assert cells["mem_frac"] == pytest.approx(0.5)
+    # Missing inputs degrade to n/a, not a crash.
+    blank = bench_metrics.format_record_cells({})
+    assert blank["obs"] == "n/a" and blank["% cap"] == "n/a" and blank["mem_frac"] is None
+
+
+def test_latest_markdown_is_retained_table_not_a_comment():
+    g = HealpixGrid(parent_order=11, child_order=19)
+    rec = bench_metrics.build_record(
+        _summary(),
+        grid=g,
+        context={
+            "target": "tdigest_healpix_o11",
+            "commit": "abcdef0123",
+            "timestamp": "2026-06-29T21:04:28Z",
+        },
+    )
+    md = bench_metrics.latest_markdown([rec])
+    assert "<!-- zagg-benchmark -->" not in md  # not a PR-upsert comment
+    assert "tdigest_healpix_o11" in md
+    assert "abcdef0" in md  # short sha
+    assert "| target |" in md  # the shared table block
+    assert "metrics.json" in md  # points agents at the machine-readable companion
+    assert "pre-merge runs are not retained" not in md  # this IS the retained point
+
+
+def test_latest_markdown_empty():
+    assert bench_metrics.latest_markdown([]) == "No benchmark records were produced."
+
+
 def test_comment_markdown_worker_note_banner():
     g = HealpixGrid(parent_order=11, child_order=19)
     rec = bench_metrics.build_record(_summary(), grid=g, context={"target": "t", "commit": "abc"})
@@ -245,10 +291,138 @@ def test_targets_manifest_consistent():
         assert n == sm_meta["n_granules"], f"{t['shardmap']}: stale n_granules"
 
 
+# --- provisional (PR-tree-only) handoff targets (issue #130) ---------------
+
+
+def test_provisional_targets_excluded_from_merge_matrix():
+    # The pandas/arrow carrier-comparison targets are PR-tree-only: "run all"
+    # (no --target) must not iterate them, so they never join the merge matrix.
+    manifest = json.loads((BENCH / "targets.json").read_text())
+    all_names = run_benchmark.all_target_names(manifest)
+    provisional = set(manifest["provisional_targets"]) - {"_comment"}
+    assert provisional, "expected provisional targets"
+    assert provisional.isdisjoint(all_names)
+    assert set(manifest["targets"]).issubset(all_names)
+
+
+def test_provisional_targets_consistent_and_carry_handoff():
+    manifest = json.loads((BENCH / "targets.json").read_text())
+    expected = {
+        "scalar_pandas_healpix_o11": "pandas",
+        "scalar_arrow_healpix_o11": "arrow",
+    }
+    for tname, handoff in expected.items():
+        t = manifest["provisional_targets"][tname]
+        assert (BENCH / t["config"]).exists(), f"{tname}: missing config"
+        assert manifest["shardmaps"][t["shardmap"]]  # shardmap is reused/known
+        assert t["handoff"] == handoff
+
+
+def test_provisional_target_resolves_and_threads_handoff(monkeypatch):
+    # /benchmark --target <provisional> must resolve and thread its handoff into agg.
+    manifest, base = run_benchmark.load_targets(str(BENCH / "targets.json"))
+    captured = {}
+
+    import zagg.runner as runner
+
+    def fake_agg(config, **kwargs):
+        captured["handoff"] = kwargs.get("handoff")
+        return {}
+
+    monkeypatch.setattr(runner, "agg", fake_agg)
+    run_benchmark.run_target(
+        "scalar_arrow_healpix_o11",
+        manifest,
+        base,
+        store="s3://b/x.zarr",
+        region="us-west-2",
+        function_name="process-shard",
+        context={"commit": "deadbee", "event": "pr"},
+        dry_run=False,
+    )
+    assert captured["handoff"] == "arrow"
+
+
+def test_scalar_config_is_genuinely_scalar():
+    # The scalar benchmark config must be GENUINELY scalar -- every field a plain
+    # per-cell stat (no vector/ragged) -- so the pandas/arrow carrier comparison
+    # isolates carrier cost, not output shape (issue #130).
+    from zagg.config import get_agg_fields, get_output_signature, load_config
+
+    config = load_config(str(BENCH / "configs" / "atl03_scalar_healpix_o11.yaml"))
+    fields = get_agg_fields(config)
+    assert fields, "expected aggregation fields"
+    for name, meta in fields.items():
+        assert get_output_signature(meta)["kind"] == "scalar", f"{name} is not scalar"
+
+
+# --- per-target AOI override resolution (issue #121) -----------------------
+
+
+def test_override_resolution_falls_back_to_defaults():
+    # A shard map with no override inherits the top-level aoi/temporal/cmr
+    # *by identity* -- existing NEON entries resolve byte-identically to today.
+    import test_benchmark_shardmap as drift
+
+    aoi, temporal, cmr = drift.resolve_aoi_temporal_cmr({"path": "x", "shard_key": 0})
+    assert aoi is drift.MANIFEST["aoi"]
+    assert temporal is drift.MANIFEST["temporal"]
+    assert cmr is drift.MANIFEST["cmr"]
+
+
+def test_override_resolution_uses_overrides():
+    import test_benchmark_shardmap as drift
+
+    sm_meta = {
+        "path": "x",
+        "shard_key": 0,
+        "aoi": {"file": "antarctic_88s.geojson", "name": "88S dense"},
+        "temporal": {"start": "2019-01-01", "end": "2020-01-01"},
+        "cmr": {"short_name": "ATL03", "version": "007", "provider": "P", "footprint": "swath"},
+    }
+    aoi, temporal, cmr = drift.resolve_aoi_temporal_cmr(sm_meta)
+    assert aoi == sm_meta["aoi"]
+    assert temporal == sm_meta["temporal"]
+    assert cmr == sm_meta["cmr"]
+
+
+def test_override_resolution_partial_override():
+    # aoi overridden, temporal/cmr omitted -> override wins, rest falls back.
+    import test_benchmark_shardmap as drift
+
+    sm_meta = {"path": "x", "shard_key": 0, "aoi": {"file": "f.geojson", "name": "n"}}
+    aoi, temporal, cmr = drift.resolve_aoi_temporal_cmr(sm_meta)
+    assert aoi == sm_meta["aoi"]
+    assert temporal is drift.MANIFEST["temporal"]
+    assert cmr is drift.MANIFEST["cmr"]
+
+
+def test_antarctic_88s_aoi_fixture_loads_near_turning_latitude():
+    # The 88S stress-target AOI ships as a usable fixture even before its built
+    # shard map / live target lands (that step needs CMR + a re-pin). It must
+    # load and sit near the +/-88 deg ICESat-2 turning latitude (issue #121).
+    from zagg.catalog import load_polygon, polygon_to_bbox
+
+    parts = load_polygon(str(BENCH / "antarctic_88s.geojson"))
+    minx, miny, maxx, maxy = polygon_to_bbox(parts)
+    assert miny <= -87.5 and maxy <= -87.0  # well into the high-density polar band
+    assert -90.0 <= miny < maxy <= -80.0
+
+
 # --- update_series (parquet store) ----------------------------------------
 
 
-def _rec_row(commit, target, event="merge", cost=0.005, rt=200.0, mem=1200.0):
+def _rec_row(
+    commit,
+    target,
+    event="merge",
+    cost=0.005,
+    rt=200.0,
+    mem=1200.0,
+    agg="gain_bias",
+    grid="healpix",
+    area=10.13,
+):
     return {
         "timestamp": f"2026-01-01T00:00:0{len(commit) % 10}Z",
         "commit": commit,
@@ -256,8 +430,8 @@ def _rec_row(commit, target, event="merge", cost=0.005, rt=200.0, mem=1200.0):
         "event": event,
         "pr_number": None,
         "target": target,
-        "aggregator": "gain_bias",
-        "grid_type": "healpix",
+        "aggregator": agg,
+        "grid_type": grid,
         "grid_size": "o11",
         "shard_key": 1,
         "n_granules": 44,
@@ -265,8 +439,8 @@ def _rec_row(commit, target, event="merge", cost=0.005, rt=200.0, mem=1200.0):
         "runtime_s": rt,
         "gb_seconds": 400.0,
         "cost_per_shard_usd": cost,
-        "shard_area_km2": 10.13,
-        "cost_per_100km2_usd": cost * 100 / 10.13,
+        "shard_area_km2": area,
+        "cost_per_100km2_usd": cost * 100 / area if area else 0.0,
         "function_timeout_s": 720,
         "worker_pct_timeout": 0.28,
         "memory_gb": 2.0,
@@ -328,6 +502,64 @@ def test_plot_series_smoke(tmp_path):
     assert (outdir / "index.html").exists()
     assert (outdir / "cost_per_shard.png").exists()
     assert (outdir / "cost_per_100km2.png").exists()
+    # Latest-merge snapshot artifacts (issue #110).
+    assert (outdir / "latest_table.png").exists()
+    assert (outdir / "latest.md").exists()
+    assert (outdir / "metrics.json").exists()
+
+
+def _latest_rows(commit, ts, **kw):
+    rows = []
+    for t in ("t1", "t2"):
+        r = _rec_row(commit, t, **kw)
+        r["timestamp"] = ts
+        rows.append(r)
+    return rows
+
+
+def test_plot_series_latest_artifacts_pick_newest_merge(tmp_path):
+    pytest.importorskip("matplotlib")
+    import plot_series
+
+    rows = _latest_rows("old111", "2026-06-01T00:00:00Z", rt=180) + _latest_rows(
+        "new999", "2026-06-29T21:00:00Z", rt=250
+    )
+    series = tmp_path / "series.parquet"
+    update_series.save_series(update_series.records_to_frame(rows), series)
+    outdir = tmp_path / "site"
+    plot_series.main(["--series", str(series), "--out", str(outdir)])
+
+    md = (outdir / "latest.md").read_text()
+    assert "new999"[:7] in md  # the newest merge...
+    assert "old111" not in md  # ...and only it
+    metrics = json.loads((outdir / "metrics.json").read_text())
+    assert {r["commit"] for r in metrics} == {"new999"}
+    assert {r["target"] for r in metrics} == {"t1", "t2"}
+
+
+def test_write_latest_metrics_is_null_safe_json(tmp_path):
+    import plot_series
+
+    # A merge whose memory wasn't reported -> NaN in the frame must serialise to
+    # JSON null, not the bare token NaN (which isn't valid JSON).
+    rows = _latest_rows("c12345", "2026-06-29T21:00:00Z", mem=None)
+    df = update_series.records_to_frame(rows)
+    out = tmp_path / "metrics.json"
+    assert plot_series.write_latest_metrics(df, out) is True
+    text = out.read_text()
+    assert "NaN" not in text  # valid JSON, no bare NaN token
+    metrics = json.loads(text)  # parses cleanly
+    assert all(r["max_memory_mb"] is None for r in metrics)
+
+
+def test_latest_records_empty_when_no_merge(tmp_path):
+    import plot_series
+
+    # Only a PR row -> no retained merge -> no latest artifacts.
+    df = update_series.records_to_frame([_rec_row("p1", "t1", event="pr")])
+    assert plot_series.latest_records(df) == []
+    assert plot_series.write_latest_markdown(df, tmp_path / "latest.md") is False
+    assert plot_series.write_latest_metrics(df, tmp_path / "metrics.json") is False
 
 
 def test_plot_series_empty_writes_placeholder(tmp_path):
@@ -445,3 +677,272 @@ def test_make_figure_null_memory_renders_uncoloured(tmp_path):
         is True
     )
     assert out.exists()
+
+
+def test_make_figure_circle_runtime_and_bottom_row_labels(tmp_path, monkeypatch):
+    # The benchmark-plot polish (PR #123 fold of #125's chart): runtime markers
+    # are circles (not squares) so the memory-coloured cost marker shows through,
+    # and only the bottom-row panels carry commit labels -- the upper rows are
+    # blanked by hand (``tick_params(labelbottom=False)``), not a shared x-axis.
+    pytest.importorskip("matplotlib")
+    import matplotlib
+
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+    import plot_series
+
+    captured = {}
+    monkeypatch.setattr(plt, "close", lambda fig: captured.setdefault("fig", fig))
+
+    # Two aggregators x two grid families -> a 2x2 grid; two merge points each.
+    rows = [
+        _rec_row(f"c{i}", f"{agg}_{grid}", agg=agg, grid=grid)
+        for i in range(2)
+        for agg in ("gain_bias", "tdigest")
+        for grid in ("rectilinear", "healpix")
+    ]
+    series = tmp_path / "series.parquet"
+    update_series.save_series(update_series.records_to_frame(rows), series)
+    out = tmp_path / "fig.png"
+    assert plot_series.make_figure(
+        update_series.load_series(series), "cost_per_shard_usd", "c", out
+    )
+    fig = captured["fig"]
+
+    # Right-axis runtime lines use round ('o') markers, never squares ('s').
+    markers = [ln.get_marker() for ax in fig.axes for ln in ax.get_lines()]
+    assert "o" in markers and "s" not in markers
+
+    # Only the bottom-row panels show tick labels; the top row's are hidden so the
+    # commit labels aren't repeated up the grid.
+    base = [ax for ax in fig.axes if ax.get_title()]  # the 4 panels (twins/cbar have no title)
+    base.sort(key=lambda ax: ax.get_subplotspec().rowspan.start)
+    top, bottom = base[:2], base[2:]
+    assert all(not any(t.get_text() for t in ax.get_xticklabels()) for ax in top)
+    assert all(any(t.get_text() for t in ax.get_xticklabels()) for ax in bottom)
+
+
+def test_make_figure_uneven_commit_sets_label_per_panel(tmp_path, monkeypatch):
+    # Regression for the per-target x-label misalignment class: when targets have
+    # *different* commit sets (some missing an early merge), each bottom panel must
+    # carry ITS OWN commits in order -- not another panel's labels. A uniform-commit
+    # fixture can't catch this. Four targets -> a 2x2 grid, so this also exercises
+    # the row-hiding pass (top row blanked, bottom row labelled).
+    pytest.importorskip("matplotlib")
+    import matplotlib
+
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+    import plot_series
+
+    captured = {}
+    monkeypatch.setattr(plt, "close", lambda fig: captured.setdefault("fig", fig))
+
+    # ``_rec_row`` derives the timestamp from the commit-name length, so name
+    # lengths set the merge order. Two aggregators x two grids -> a 2x2 grid; the
+    # layout puts gain_bias on the top row and tdigest on the bottom. The four
+    # targets carry deliberately uneven commit sets so each bottom panel must show
+    # its own commits in order.
+    def recs(agg, grid, commits):
+        return [_rec_row(c, f"{agg}_{grid}", agg=agg, grid=grid) for c in commits]
+
+    rows = (
+        recs("gain_bias", "rectilinear", ("a", "bb", "ccc"))
+        + recs("gain_bias", "healpix", ("dd", "eee"))
+        + recs("tdigest", "rectilinear", ("f", "gg"))  # bottom-left
+        + recs("tdigest", "healpix", ("h", "ii", "jjj", "kkkk"))  # bottom-right
+    )
+    series = tmp_path / "series.parquet"
+    update_series.save_series(update_series.records_to_frame(rows), series)
+    out = tmp_path / "fig.png"
+    assert plot_series.make_figure(
+        update_series.load_series(series), "cost_per_shard_usd", "c", out
+    )
+    fig = captured["fig"]
+
+    panels = {ax.get_title(): ax for ax in fig.axes if ax.get_title()}
+    # Top row (gain_bias) is hidden; the bottom row (tdigest) carries each panel's
+    # own commits, even though the two panels have different commit sets.
+    assert not any(t.get_text() for t in panels["gain_bias_rectilinear"].get_xticklabels())
+    assert not any(t.get_text() for t in panels["gain_bias_healpix"].get_xticklabels())
+    assert [t.get_text() for t in panels["tdigest_rectilinear"].get_xticklabels()] == ["f", "gg"]
+    assert [t.get_text() for t in panels["tdigest_healpix"].get_xticklabels()] == [
+        "h",
+        "ii",
+        "jjj",
+        "kkkk",
+    ]
+
+
+def test_make_figure_colorbar_has_mb_twin_axis(tmp_path, monkeypatch):
+    # The colorbar carries a second axis reading the same scale in absolute MB
+    # (issue #120 polish): MB = fraction-of-cap * cap_mb. cap_mb = 2 GB here, so a
+    # marker at 1536/2048 = 0.75 of cap must read 1536 MB on the twin axis.
+    pytest.importorskip("matplotlib")
+    import matplotlib
+
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+    import plot_series
+
+    captured = {}
+    monkeypatch.setattr(plt, "close", lambda fig: captured.setdefault("fig", fig))
+
+    rows = [_rec_row("c0", "t1", mem=1024.0), _rec_row("c1", "t1", mem=1536.0)]
+    series = tmp_path / "series.parquet"
+    update_series.save_series(update_series.records_to_frame(rows), series)
+    out = tmp_path / "fig.png"
+    assert plot_series.make_figure(
+        update_series.load_series(series), "cost_per_shard_usd", "c", out
+    )
+    fig = captured["fig"]
+
+    # The colorbar axes own one secondary (child) axis; its forward transform maps
+    # a fraction-of-cap to MB.
+    cbar_ax = next(ax for ax in fig.axes if ax.get_xlabel() == "peak memory (% of cap)")
+    (mb_ax,) = cbar_ax.child_axes
+    assert mb_ax.get_xlabel() == "peak memory (MB)"
+    fwd = mb_ax._functions[0]
+    assert fwd(0.75) == pytest.approx(1536.0)  # 0.75 * 2 GB cap
+
+
+def test_make_figure_cost_scatter_drawn_above_runtime_line(tmp_path, monkeypatch):
+    # The memory-coloured cost circles must sit ON TOP of the runtime twin's
+    # open-circle/dashed-line glyph. The twin axis is drawn after the host, so the
+    # fix raises the host axes' z-order above the twin (and hides the host patch).
+    pytest.importorskip("matplotlib")
+    import matplotlib
+
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+    import plot_series
+    from matplotlib.collections import PathCollection
+
+    captured = {}
+    monkeypatch.setattr(plt, "close", lambda fig: captured.setdefault("fig", fig))
+
+    rows = [_rec_row("c0", "t1", mem=1024.0), _rec_row("c1", "t1", mem=1536.0)]
+    series = tmp_path / "series.parquet"
+    update_series.save_series(update_series.records_to_frame(rows), series)
+    out = tmp_path / "fig.png"
+    assert plot_series.make_figure(
+        update_series.load_series(series), "cost_per_shard_usd", "c", out
+    )
+    fig = captured["fig"]
+
+    panel = next(
+        ax for ax in fig.axes if any(isinstance(c, PathCollection) for c in ax.collections)
+    )
+    (twin,) = [ax for ax in fig.axes if ax is not panel and ax.bbox.bounds == panel.bbox.bounds]
+    assert panel.get_zorder() > twin.get_zorder()  # cost circles render over the runtime line
+    assert panel.patch.get_visible() is False  # so the runtime line shows through gaps
+    scatter = next(c for c in panel.collections if isinstance(c, PathCollection))
+    assert list(scatter.get_sizes()) == [90]  # marker bumped one size up
+
+
+# --- panel layout + failed-run handling (issue #121 review) ---------------
+
+
+def test_panel_layout_rect_left_healpix_right_largest_on_top():
+    import plot_series
+
+    # The eight real targets: rect (left) / healpix (right); largest shard per
+    # family on top (rect_6km~36, healpix_o10~40 above rect_3km~9, healpix_o11~10).
+    specs = [
+        ("gain_bias_rect_6km", "gain_bias", "rectilinear", 36.0),
+        ("gain_bias_healpix_o10", "gain_bias", "healpix", 40.5),
+        ("tdigest_rect_6km", "tdigest", "rectilinear", 36.0),
+        ("tdigest_healpix_o10", "tdigest", "healpix", 40.5),
+        ("gain_bias_rect_3km", "gain_bias", "rectilinear", 9.0),
+        ("gain_bias_healpix_o11", "gain_bias", "healpix", 10.1),
+        ("tdigest_rect_3km", "tdigest", "rectilinear", 9.0),
+        ("tdigest_healpix_o11", "tdigest", "healpix", 10.1),
+    ]
+    rows = [_rec_row("c0", t, agg=a, grid=g, area=ar) for t, a, g, ar in specs]
+    hist = update_series.records_to_frame(rows)
+    grid, nrows, ncols = plot_series._panel_layout(hist)
+    assert (nrows, ncols) == (4, 2)
+    assert grid == [
+        ["gain_bias_rect_6km", "gain_bias_healpix_o10"],  # largest, gain_bias
+        ["tdigest_rect_6km", "tdigest_healpix_o10"],  # largest, tdigest
+        ["gain_bias_rect_3km", "gain_bias_healpix_o11"],  # smaller, gain_bias
+        ["tdigest_rect_3km", "tdigest_healpix_o11"],  # smaller, tdigest
+    ]
+
+
+def test_panel_layout_all_rect_single_column():
+    import plot_series
+
+    # No HEALPix targets -> a single (left) column, still largest-shard-first.
+    specs = [
+        ("gain_bias_rect_6km", "gain_bias", "rectilinear", 36.0),
+        ("gain_bias_rect_3km", "gain_bias", "rectilinear", 9.0),
+    ]
+    rows = [_rec_row("c0", t, agg=a, grid=g, area=ar) for t, a, g, ar in specs]
+    grid, nrows, ncols = plot_series._panel_layout(update_series.records_to_frame(rows))
+    assert (nrows, ncols) == (2, 1)
+    assert grid == [["gain_bias_rect_6km"], ["gain_bias_rect_3km"]]
+
+
+def test_panel_layout_same_area_distinct_resolutions_dont_collide():
+    import plot_series
+
+    # Two same-aggregator rect targets with identical area but different grid_size
+    # must land in distinct rows (rank tie-broken on grid_size), not overwrite.
+    specs = [
+        ("gain_bias_rect_a", "gain_bias", "rectilinear", 9.0),
+        ("gain_bias_rect_b", "gain_bias", "rectilinear", 9.0),
+    ]
+    rows = [_rec_row("c0", t, agg=a, grid=g, area=ar) for t, a, g, ar in specs]
+    # Give them distinct grid_size so the tie-break separates them.
+    frame = update_series.records_to_frame(rows)
+    frame.loc[frame["target"] == "gain_bias_rect_a", "grid_size"] = "3km"
+    frame.loc[frame["target"] == "gain_bias_rect_b", "grid_size"] = "4km"
+    grid, nrows, ncols = plot_series._panel_layout(frame)
+    assert (nrows, ncols) == (2, 1)
+    assert {grid[0][0], grid[1][0]} == {"gain_bias_rect_a", "gain_bias_rect_b"}
+
+
+def test_make_figure_drops_failed_run_zeros(tmp_path, monkeypatch):
+    # A zero cost/runtime is a failed run: it must NOT be a connected datapoint.
+    # The cost line breaks at the zero (NaN, no dip to 0) and the failure shows as
+    # a non-connected 'x' marker so the x-axis/commit alignment is kept.
+    pytest.importorskip("matplotlib")
+    import matplotlib
+
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+    import numpy as np
+    import plot_series
+    from matplotlib.collections import PathCollection
+
+    captured = {}
+    monkeypatch.setattr(plt, "close", lambda fig: captured.setdefault("fig", fig))
+
+    # Middle merge failed (cost=runtime=0); the two flanking merges are real.
+    rows = [
+        _rec_row("c0", "t1", cost=0.005, rt=200.0),
+        _rec_row("c1", "t1", cost=0.0, rt=0.0),
+        _rec_row("ccc", "t1", cost=0.006, rt=210.0),
+    ]
+    series = tmp_path / "series.parquet"
+    update_series.save_series(update_series.records_to_frame(rows), series)
+    out = tmp_path / "fig.png"
+    assert plot_series.make_figure(
+        update_series.load_series(series), "cost_per_shard_usd", "c", out
+    )
+    fig = captured["fig"]
+
+    panel = next(ax for ax in fig.axes if ax.get_title() == "t1")
+    # Cost line: the failed middle point is NaN, so the line never connects to 0.
+    cost_line = next(ln for ln in panel.get_lines() if ln.get_linestyle() == "-")
+    ys = cost_line.get_ydata()
+    assert np.isnan(ys[1]) and not np.isnan(ys[0]) and not np.isnan(ys[2])
+    assert 0.0 not in [y for y in ys if not np.isnan(y)]
+    # A distinct, non-line 'x' marker flags the failed run, anchored at the failed
+    # x (index 1) -- not joined to the cost line.
+    fails = [
+        c for c in panel.collections if isinstance(c, PathCollection) and len(c.get_offsets()) == 1
+    ]
+    assert fails, "expected an 'x' failure marker at the zero point"
+    assert fails[0].get_offsets()[0][0] == 1  # the failed merge's x position

@@ -86,8 +86,9 @@ def agg(
     region: str = "us-west-2",
     output_credentials: dict | None = None,
     output_endpoint_url: str | None = None,
-    handoff: str = "pandas",
+    handoff: str = "arrow",
     profile: bool = False,
+    max_retries: int = 3,
 ) -> dict:
     """Run the aggregation pipeline.
 
@@ -132,15 +133,27 @@ def agg(
         Custom S3-compatible endpoint for the output store (e.g. R2, MinIO).
         Overrides ``output.endpoint_url`` in the config.
     handoff : str
-        Per-cell aggregation carrier: ``"pandas"`` (default) or ``"arrow"``.
-        Both produce byte-for-byte identical scalar outputs (#30); ``"arrow"``
-        is opt-in for benchmarking. Only honored by the ``"local"`` backend.
+        Per-cell aggregation carrier: ``"arrow"`` (default, an ``arro3.core``
+        carrier) or ``"pandas"``. Both produce byte-for-byte identical scalar outputs
+        (#30); ``"arrow"`` is the default because it is faster and lighter on dense
+        shards (issue #130). Honored by both the ``"local"`` and ``"lambda"``
+        backends: the lambda backend forwards it into each cell event, and an
+        explicit ``"pandas"`` keeps that event payload byte-identical (no key).
+        pyarrow is not used on either path; the experimental ``arrow-kernel``
+        reducer was dropped with pyarrow.
     profile : bool
         Opt-in per-phase timing (issue #100). When ``True`` (lambda backend),
         forwards ``profile`` into each cell event so the worker emits a
         ``phase_timings`` (read/index/aggregate) sub-dict, and the run prints a
         per-phase worker breakdown. Default ``False`` leaves the worker path and
         per-cell event payload byte-identical -- no probe tax.
+    max_retries : int
+        Lambda-only (issue #119). Per-cell retry budget for *transient*
+        client-side faults (throttle/network) in ``_invoke_lambda_cell``;
+        deterministic Lambda ``FunctionError``s (timeout, OOM, unhandled
+        exception) are never retried regardless. Default ``3``. Ignored by the
+        ``"local"`` backend. Set to ``1`` (e.g. the CI benchmark) to measure one
+        clean invocation and record a failure as a failure.
 
     Returns
     -------
@@ -222,7 +235,9 @@ def agg(
             function_name=function_name,
             output_credentials=output_credentials,
             output_endpoint_url=resolved_endpoint,
+            handoff=handoff,
             profile=profile,
+            max_retries=max_retries,
         )
     else:
         raise ValueError(f"Unknown backend: {backend!r} (expected 'local' or 'lambda')")
@@ -358,7 +373,7 @@ def _process_and_write(
     zarr_store,
     config,
     driver=None,
-    handoff="pandas",
+    handoff="arrow",
     aoi_payload=None,
 ):
     """Process a single shard and write its K finer chunks to the store.
@@ -430,7 +445,7 @@ def _run_local(
     driver="s3",
     output_credentials=None,
     output_endpoint_url=None,
-    handoff="pandas",
+    handoff="arrow",
 ):
     """Run processing locally via the generic dispatch loop on a thread pool.
 
@@ -581,7 +596,9 @@ def _run_lambda(
     function_name,
     output_credentials=None,
     output_endpoint_url=None,
+    handoff="arrow",
     profile=False,
+    max_retries=3,
 ):
     """Run processing via AWS Lambda invocation.
 
@@ -708,7 +725,9 @@ def _run_lambda(
             function_name=function_name,
             config_dict=config_dict,
             output_creds_event=output_creds_event,
+            max_retries=max_retries,
             max_workers=state["workers"],
+            handoff=handoff,
             profile=profile,
             **extra,
         )
@@ -1064,6 +1083,7 @@ def _invoke_lambda_cell(
     output_creds_event=None,
     max_retries=3,
     max_workers=None,
+    handoff="arrow",
     profile=False,
     aoi_payload=None,
 ):
@@ -1077,6 +1097,9 @@ def _invoke_lambda_cell(
     (a compact MOC for HEALPix / in-AOI cell ids for rect) under the
     ``"aoi_payload"`` event key so the worker expands the ``aoi_mask`` column;
     when ``None`` (flag off) the key is omitted and the payload stays identical.
+    ``handoff`` (issue #130) forwards a ``"handoff"`` event key selecting the
+    worker's carrier; the default ``"arrow"`` adds the key, while an explicit
+    ``"pandas"`` omits it, keeping that event byte-identical to the pre-handoff path.
     """
     wall_start = time.time()
 
@@ -1107,6 +1130,10 @@ def _invoke_lambda_cell(
     # to the pre-feature event (issue #101).
     if aoi_payload is not None:
         event["aoi_payload"] = aoi_payload
+    # Add the key for the arrow carrier (the default); an explicit pandas run omits
+    # it, staying byte-identical to the pre-handoff path (#130).
+    if handoff and handoff != "pandas":
+        event["handoff"] = handoff
 
     last_error = None
     for attempt in range(max_retries):
@@ -1123,14 +1150,25 @@ def _invoke_lambda_cell(
             function_error = response.get("FunctionError")
             is_timeout = False
             if function_error:
+                # Every ``FunctionError`` on a synchronous invoke is deterministic
+                # for a given shard -- a timeout, ``Runtime.OutOfMemory``, or an
+                # exception that escaped the handler -- so none are retried: they
+                # all return immediately, exactly as timeouts already did (#119).
+                # (Transient throttle/network faults are a separate channel,
+                # retried with backoff in the ``except`` block below.) The error
+                # is tagged with its real mode so a benchmark records an OOM as an
+                # OOM rather than masking it behind a later retry's outcome.
                 error_payload = response["Payload"].read().decode("utf-8")
                 if "Task timed out" in error_payload:
                     is_timeout = True
                     last_error = f"Lambda timeout: {error_payload[:100]}"
+                elif "Runtime.OutOfMemory" in error_payload:
+                    # ``Runtime.OutOfMemory`` is AWS's documented errorType for an
+                    # OOM-killed invocation; if AWS reworded it the tag would just
+                    # fall to the generic branch below (still no retry).
+                    last_error = f"Lambda OOM: {error_payload[:100]}"
                 else:
                     last_error = f"Lambda error ({function_error}): {error_payload[:100]}"
-                if not is_timeout:
-                    continue
 
             result = json.loads(response["Payload"].read()) if not function_error else {}
             try:
