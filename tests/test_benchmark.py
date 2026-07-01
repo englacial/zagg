@@ -425,6 +425,71 @@ def test_main_dry_run_exempt_from_fail_on_empty(tmp_path):
     assert rc == 0
 
 
+def test_main_dispatches_targets_concurrently(tmp_path, monkeypatch):
+    # Two targets must be in-flight at once for a Barrier(2) to release; a serial
+    # loop would block forever on the first wait() and the timeout would trip it.
+    # Also asserts the output records are re-ordered back to the requested order
+    # even though completion order is nondeterministic (issue #137).
+    import threading
+
+    barrier = threading.Barrier(2, timeout=10)
+
+    def fake(name, *a, **k):
+        barrier.wait()  # rendezvous: only clears if both targets run concurrently
+        return _fake_record(name, total_obs=1, max_memory_mb=100.0)
+
+    monkeypatch.setattr(run_benchmark, "run_target", fake)
+    out_json = tmp_path / "metrics.json"
+    rc = run_benchmark.main(
+        [
+            "--targets",
+            str(BENCH / "targets.json"),
+            "--target",
+            "tdigest_healpix_o10_inner",
+            "--target",
+            "tdigest_healpix_o10_sharded",
+            "--commit",
+            "cafe123",
+            "--out-json",
+            str(out_json),
+        ]
+    )
+    assert rc == 0
+    recs = json.loads(out_json.read_text())
+    assert [r["target"] for r in recs] == [
+        "tdigest_healpix_o10_inner",
+        "tdigest_healpix_o10_sharded",
+    ]
+
+
+def test_main_unknown_target_fails_before_any_dispatch(tmp_path, monkeypatch):
+    # An unknown target name aborts before the pool spins up -- no target is
+    # dispatched (so we never pay for a partial run on a typo'd matrix).
+    called = {"n": 0}
+
+    def fake(name, *a, **k):
+        called["n"] += 1
+        return _fake_record(name, total_obs=1, max_memory_mb=100.0)
+
+    monkeypatch.setattr(run_benchmark, "run_target", fake)
+    with pytest.raises(SystemExit, match="unknown target"):
+        run_benchmark.main(
+            [
+                "--targets",
+                str(BENCH / "targets.json"),
+                "--target",
+                "tdigest_healpix_o10_inner",
+                "--target",
+                "does_not_exist",
+                "--commit",
+                "cafe123",
+                "--out-json",
+                str(tmp_path / "metrics.json"),
+            ]
+        )
+    assert called["n"] == 0  # no dispatch happened
+
+
 # --- manifest integrity (the pin is internally consistent) ----------------
 
 
