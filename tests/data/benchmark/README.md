@@ -31,7 +31,7 @@ aggregator).
   deterministic rule in `bench_metrics.select_densest_shard`.
 - **Temporal pin:** `2018-10-13 .. 2025-06-01` (full multi-year slice), recorded
   in `targets.json` under `temporal`. AOI = `AOP_NEON.geojson`.
-- **Cost model:** arm64, 2 GB, capped at the 720 s deploy timeout (see
+- **Cost model:** arm64, 2 GB, capped at the 900 s deploy timeout (see
   `zagg.dispatch`).
 - **AOI is per shard map (issue #121).** The top-level `aoi`/`temporal`/`cmr` in
   `targets.json` are **defaults**; a shard-map entry may override any of them.
@@ -198,7 +198,7 @@ top-level default (issue #121).
 
    **High-latitude density → failure is the expected result.** Near ±88° the
    densest shard is far heavier than NEON's 44–50 granules, so the target will
-   likely OOM or hit the 720 s / 2 GB timeout — that is the point of a stress
+   likely OOM or hit the 900 s / 2 GB timeout — that is the point of a stress
    target. Label it as such (it compounds the OOM issues #117 / #119).
 
 ## Remove a target

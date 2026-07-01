@@ -998,8 +998,9 @@ def _log_concurrency_report(report: ConcurrencyReport, max_workers: int) -> None
 
 # Function Timeout fallback when get_function_configuration can't be read
 # (permission denied, etc.). Mirrors the CloudFormation default in
-# deployment/aws/template.yaml (Timeout Default: 720).
-_DEFAULT_FUNCTION_TIMEOUT_S = 720
+# deployment/aws/template.yaml (Timeout Default: 900, the Lambda hard
+# ceiling — bumped from 720 for the 88S stress shards, issue #148).
+_DEFAULT_FUNCTION_TIMEOUT_S = 900
 
 
 def _get_function_timeout_s(lambda_client, function_name):
