@@ -316,6 +316,30 @@ def test_main_fails_on_empty_target(tmp_path, monkeypatch):
     assert rc == 1
 
 
+def test_main_fails_on_null_memory_alone(tmp_path, monkeypatch):
+    # The guard is `not total_obs OR max_memory_mb is None`: a target that recorded
+    # observations but no memory reading must still fail, so the `max_memory_mb is
+    # None` clause is exercised independently of the obs=0 clause (issue #145).
+    monkeypatch.setattr(
+        run_benchmark,
+        "run_target",
+        lambda name, *a, **k: _fake_record(name, total_obs=999, max_memory_mb=None),
+    )
+    rc = run_benchmark.main(
+        [
+            "--targets",
+            str(BENCH / "targets.json"),
+            "--target",
+            "tdigest_healpix_o10_inner",
+            "--commit",
+            "cafe123",
+            "--out-json",
+            str(tmp_path / "metrics.json"),
+        ]
+    )
+    assert rc == 1
+
+
 def test_main_no_fail_on_empty_opts_out(tmp_path, monkeypatch):
     monkeypatch.setattr(
         run_benchmark,
@@ -380,6 +404,25 @@ def test_main_dry_run_writes_outputs(tmp_path):
     records = json.loads(out_json.read_text())
     assert len(records) == 1 and records[0]["target"] == "tdigest_healpix_o10_inner"
     assert "tdigest_healpix_o10_inner" in out_md.read_text()
+
+
+def test_main_dry_run_exempt_from_fail_on_empty(tmp_path):
+    # --dry-run emits empty metrics by design, so --fail-on-empty (default on) must
+    # NOT trip on it -- main() returns 0 even though total_obs is null (issue #145).
+    rc = run_benchmark.main(
+        [
+            "--targets",
+            str(BENCH / "targets.json"),
+            "--target",
+            "tdigest_healpix_o10_inner",
+            "--dry-run",
+            "--commit",
+            "cafe123",
+            "--out-json",
+            str(tmp_path / "metrics.json"),
+        ]
+    )
+    assert rc == 0
 
 
 # --- manifest integrity (the pin is internally consistent) ----------------
