@@ -971,6 +971,10 @@ class TestRaggedWriteFanout:
         from zagg.processing.write import _write_ragged_fanout
 
         grid, writes = self._grid_and_writes(6)
+        # Pin the fd ceiling high so the parallel run truly takes the pool branch
+        # (else a low-ulimit host could clamp workers to 1 and silently compare
+        # serial-vs-serial, proving nothing).
+        monkeypatch.setattr(wmod, "fd_safe_max_workers", lambda: 128)
         s_par = MemoryStore()
         _write_ragged_fanout([(r, k) for r, k in writes], s_par, grid=grid)
 
@@ -981,6 +985,33 @@ class TestRaggedWriteFanout:
         assert set(s_par._store_dict) == set(s_ser._store_dict)
         for key, val in s_par._store_dict.items():
             assert val.to_bytes() == s_ser._store_dict[key].to_bytes(), f"differ at {key}"
+
+    def test_fanout_cap_respects_fd_ceiling(self, monkeypatch):
+        """The pool is sized ``min(128, len(writes), fd_safe_max_workers())``; an fd
+        ceiling of 1 forces the serial branch (no pool constructed)."""
+        import zagg.processing.write as wmod
+        from zagg.processing.write import _write_ragged_fanout
+
+        grid, writes = self._grid_and_writes(10)
+        recorded: dict = {}
+        real_tpe = wmod.ThreadPoolExecutor
+
+        def spy_tpe(max_workers):
+            recorded["workers"] = max_workers
+            return real_tpe(max_workers=max_workers)
+
+        monkeypatch.setattr(wmod, "ThreadPoolExecutor", spy_tpe)
+
+        # fd ceiling (4) clamps below both 128 and len(writes)=10.
+        monkeypatch.setattr(wmod, "fd_safe_max_workers", lambda: 4)
+        _write_ragged_fanout([(r, k) for r, k in writes], MemoryStore(), grid=grid)
+        assert recorded["workers"] == 4
+
+        # fd ceiling of 1 -> serial branch, ThreadPoolExecutor never constructed.
+        recorded.clear()
+        monkeypatch.setattr(wmod, "fd_safe_max_workers", lambda: 1)
+        _write_ragged_fanout([(r, k) for r, k in writes], MemoryStore(), grid=grid)
+        assert "workers" not in recorded
 
     def test_fanout_surfaces_write_failure(self, monkeypatch):
         """A failure in any subgroup write is re-raised (not silently swallowed)."""
