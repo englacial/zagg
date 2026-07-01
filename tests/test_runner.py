@@ -571,6 +571,146 @@ class TestInvokeLambdaCellRetry:
         assert result["error"] == "AccessDeniedException"
 
 
+class TestInvokeLambdaCellAsync:
+    """Async dispatch (issue #151): ``result_url`` switches the invoke to
+    ``InvocationType="Event"`` and the result comes from polling the
+    worker-written envelope instead of the (discarded) response payload."""
+
+    _CREDS = {"accessKeyId": "a", "secretAccessKey": "s", "sessionToken": "t"}
+
+    def _invoke(self, client, result_fetch, *, max_retries=3, poll_timeout_s=10.0):
+        from zagg.runner import _invoke_lambda_cell
+
+        return _invoke_lambda_cell(
+            client,
+            (0,),
+            12345,
+            6,
+            12,
+            ["s3://b/g.h5"],
+            "s3://out/x.zarr",
+            self._CREDS,
+            function_name="process-shard",
+            config_dict=None,
+            max_workers=4,
+            max_retries=max_retries,
+            result_url="s3://out/x.zarr.status/run1/12345.json",
+            result_fetch=result_fetch,
+            poll_timeout_s=poll_timeout_s,
+        )
+
+    @staticmethod
+    def _envelope(body):
+        return {"statusCode": 200, "body": json.dumps(body)}
+
+    def test_event_invoke_carries_result_url(self):
+        from unittest.mock import MagicMock
+
+        client = MagicMock()
+        client.invoke.return_value = {"StatusCode": 202}
+        self._invoke(client, lambda: self._envelope({"total_obs": 1, "duration_s": 1.0}))
+        kwargs = client.invoke.call_args.kwargs
+        assert kwargs["InvocationType"] == "Event"
+        event = json.loads(kwargs["Payload"])
+        assert event["result_url"] == "s3://out/x.zarr.status/run1/12345.json"
+
+    def test_result_envelope_maps_to_sync_result_shape(self):
+        from unittest.mock import MagicMock
+
+        client = MagicMock()
+        client.invoke.return_value = {"StatusCode": 202}
+        result = self._invoke(
+            client,
+            lambda: self._envelope({"total_obs": 7, "duration_s": 3.5, "max_memory_mb": 800.0}),
+        )
+        assert result["status_code"] == 200
+        assert result["body"]["total_obs"] == 7
+        assert result["lambda_duration"] == 3.5
+        assert result["error"] is None
+        assert result["timeout"] is False
+        assert result["retries"] == 0
+        assert result["granule_count"] == 1
+
+    def test_polls_until_result_lands(self, monkeypatch):
+        from unittest.mock import MagicMock
+
+        import zagg.runner as runner
+
+        sleeps = []
+        monkeypatch.setattr(runner.time, "sleep", lambda s: sleeps.append(s))
+        client = MagicMock()
+        client.invoke.return_value = {"StatusCode": 202}
+        fetch = MagicMock(
+            side_effect=[None, None, self._envelope({"total_obs": 1, "duration_s": 1.0})]
+        )
+        result = self._invoke(client, fetch)
+        assert fetch.call_count == 3
+        assert len(sleeps) == 2  # slept between the misses
+        assert result["status_code"] == 200
+
+    def test_missing_result_at_deadline_records_error_without_retry(self):
+        from unittest.mock import MagicMock
+
+        client = MagicMock()
+        client.invoke.return_value = {"StatusCode": 202}
+        # poll_timeout_s=0 -> the first miss is already past the deadline.
+        result = self._invoke(client, lambda: None, max_retries=5, poll_timeout_s=0.0)
+        # One Event invoke, no re-invoke: a missing result is deterministic
+        # (worker timeout / OOM / crash), mirroring the sync FunctionError rule.
+        assert client.invoke.call_count == 1
+        assert result["status_code"] is None
+        assert "no worker result within" in result["error"]
+
+    def test_worker_error_envelope_surfaces_body_error(self):
+        from unittest.mock import MagicMock
+
+        client = MagicMock()
+        client.invoke.return_value = {"StatusCode": 202}
+        result = self._invoke(
+            client,
+            lambda: {"statusCode": 500, "body": json.dumps({"error": "Failed to write zarr"})},
+        )
+        assert result["status_code"] == 500
+        assert result["error"] == "Failed to write zarr"
+
+    def test_transient_dispatch_error_still_retried(self, monkeypatch):
+        from unittest.mock import MagicMock
+
+        import zagg.runner as runner
+
+        sleeps = []
+        monkeypatch.setattr(runner.time, "sleep", lambda s: sleeps.append(s))
+        client = MagicMock()
+        client.invoke.side_effect = [
+            Exception("TooManyRequestsException: Rate exceeded"),
+            {"StatusCode": 202},
+        ]
+        result = self._invoke(client, lambda: self._envelope({"total_obs": 1, "duration_s": 1.0}))
+        # The throttled *dispatch* is transient and retried; the poll then runs.
+        assert client.invoke.call_count == 2
+        assert result["status_code"] == 200
+        assert result["retries"] == 1
+
+
+class TestResultFetcher:
+    """The lazy per-run result store + fetch closure (issue #151)."""
+
+    def test_fetch_reads_written_envelope_and_none_when_absent(self, tmp_path):
+        import obstore
+
+        from zagg.runner import _result_fetcher
+        from zagg.store import open_object_store
+
+        prefix = str(tmp_path / "x.zarr.status" / "run1")
+        box: dict = {}
+        fetch = _result_fetcher(box, prefix, None, "us-west-2", "12345.json")
+        assert fetch() is None  # nothing written yet
+        writer = open_object_store(prefix)
+        obstore.put(writer, "12345.json", json.dumps({"statusCode": 200, "body": "{}"}).encode())
+        assert fetch() == {"statusCode": 200, "body": "{}"}
+        assert "store" in box  # built lazily, cached for subsequent cells
+
+
 class TestMaxRetriesPassthrough:
     """`agg(max_retries=...)` threads the per-cell retry budget down to
     ``_invoke_lambda_cell`` on the lambda backend (#119), default 3."""
@@ -638,6 +778,99 @@ class TestMaxRetriesPassthrough:
     def test_default_max_retries_is_three(self, monkeypatch, atl06_config, catalog_file):
         captured = self._drive(monkeypatch, atl06_config, catalog_file)
         assert captured["max_retries"] == 3
+
+
+class TestInvocationPassthrough:
+    """`agg(invocation=...)` selects async (default) vs legacy sync dispatch
+    (issue #151); async threads the per-shard result channel into the cell
+    invoke. Same mocked drive as ``TestMaxRetriesPassthrough``."""
+
+    def _drive(self, monkeypatch, atl06_config, catalog_file, **agg_kwargs):
+        from unittest.mock import MagicMock
+
+        import boto3
+
+        import zagg.grids as grids_mod
+        from zagg import runner
+        from zagg.concurrency import ConcurrencyReport
+
+        captured = {}
+
+        monkeypatch.setattr(
+            runner,
+            "get_nsidc_s3_credentials",
+            lambda: {"accessKeyId": "a", "secretAccessKey": "s", "sessionToken": "t"},
+        )
+        monkeypatch.setattr(grids_mod, "from_config", lambda *a, **k: _stub_grid())
+        monkeypatch.setattr(runner, "_invoke_lambda_setup", lambda *a, **k: None)
+        monkeypatch.setattr(runner, "_invoke_lambda_finalize", lambda *a, **k: None)
+        monkeypatch.setattr(runner, "_get_function_timeout_s", lambda *a, **k: 720)
+        monkeypatch.setattr(boto3, "Session", lambda *a, **k: MagicMock())
+        monkeypatch.setattr(
+            runner,
+            "compute_available_workers",
+            lambda requested, *a, **k: (
+                1,
+                ConcurrencyReport(
+                    account_limit=1000,
+                    current_concurrent=0,
+                    padding=100,
+                    available=900,
+                    function_reserved=None,
+                ),
+            ),
+        )
+
+        def _fake_cell(*a, **k):
+            captured.update(
+                result_url=k.get("result_url"),
+                result_fetch=k.get("result_fetch"),
+                poll_timeout_s=k.get("poll_timeout_s"),
+            )
+            return {
+                "status_code": 200,
+                "body": {"total_obs": 1},
+                "error": None,
+                "lambda_duration": 1.0,
+                "shard_key": 0,
+            }
+
+        monkeypatch.setattr(runner, "_invoke_lambda_cell", _fake_cell)
+        agg(
+            atl06_config,
+            catalog=catalog_file,
+            store="s3://out/x.zarr",
+            backend="lambda",
+            **agg_kwargs,
+        )
+        return captured
+
+    def test_default_async_threads_result_channel(self, monkeypatch, atl06_config, catalog_file):
+        captured = self._drive(monkeypatch, atl06_config, catalog_file)
+        # <store>.status/<run_id>/<shard_key>.json, run_id unique per run.
+        assert captured["result_url"].startswith("s3://out/x.zarr.status/")
+        assert captured["result_url"].endswith(".json")
+        assert callable(captured["result_fetch"])
+        # _drive pins the function timeout at 720 -> deadline 720 + margin.
+        from zagg.runner import _ASYNC_POLL_MARGIN_S
+
+        assert captured["poll_timeout_s"] == 720 + _ASYNC_POLL_MARGIN_S
+
+    def test_sync_invocation_omits_result_channel(self, monkeypatch, atl06_config, catalog_file):
+        captured = self._drive(monkeypatch, atl06_config, catalog_file, invocation="sync")
+        assert captured["result_url"] is None
+        assert captured["result_fetch"] is None
+        assert captured["poll_timeout_s"] is None
+
+    def test_unknown_invocation_raises(self, atl06_config, catalog_file):
+        with pytest.raises(ValueError, match="Unknown invocation"):
+            agg(
+                atl06_config,
+                catalog=catalog_file,
+                store="s3://out/x.zarr",
+                backend="lambda",
+                invocation="poll",
+            )
 
 
 class TestHandoffPassthrough:
