@@ -432,6 +432,9 @@ def test_main_dispatches_targets_concurrently(tmp_path, monkeypatch):
     # even though completion order is nondeterministic (issue #137).
     import threading
 
+    import zagg.auth as zauth
+
+    monkeypatch.setattr(zauth, "ensure_logged_in", lambda: None)  # no real login
     barrier = threading.Barrier(2, timeout=10)
 
     def fake(name, *a, **k):
@@ -460,6 +463,67 @@ def test_main_dispatches_targets_concurrently(tmp_path, monkeypatch):
         "tdigest_healpix_o10_inner",
         "tdigest_healpix_o10_sharded",
     ]
+
+
+def test_main_warms_auth_once_before_parallel_dispatch(tmp_path, monkeypatch):
+    # With >1 target and a real (non-dry-run) dispatch, main() authenticates ONCE
+    # up front so the concurrent targets don't race earthaccess's global auth
+    # singleton (issue #137). run_target is stubbed so no real AWS/agg is touched.
+    import zagg.auth as zauth
+
+    calls = {"login": 0, "targets": []}
+    monkeypatch.setattr(
+        zauth, "ensure_logged_in", lambda: calls.__setitem__("login", calls["login"] + 1)
+    )
+    monkeypatch.setattr(
+        run_benchmark,
+        "run_target",
+        lambda name, *a, **k: (
+            calls["targets"].append(name) or _fake_record(name, total_obs=1, max_memory_mb=100.0)
+        ),
+    )
+    rc = run_benchmark.main(
+        [
+            "--targets",
+            str(BENCH / "targets.json"),
+            "--target",
+            "tdigest_healpix_o10_inner",
+            "--target",
+            "tdigest_healpix_o10_sharded",
+            "--commit",
+            "cafe123",
+            "--out-json",
+            str(tmp_path / "metrics.json"),
+        ]
+    )
+    assert rc == 0
+    assert calls["login"] == 1  # exactly one warm-up, before the fan-out
+    assert len(calls["targets"]) == 2
+
+
+def test_main_skips_auth_warmup_on_dry_run(tmp_path, monkeypatch):
+    # --dry-run does no dispatch, so it must not authenticate (no creds in CI dry
+    # runs / local wiring checks).
+    import zagg.auth as zauth
+
+    warmed = {"n": 0}
+    monkeypatch.setattr(zauth, "ensure_logged_in", lambda: warmed.__setitem__("n", warmed["n"] + 1))
+    run_benchmark.main(
+        [
+            "--targets",
+            str(BENCH / "targets.json"),
+            "--target",
+            "tdigest_healpix_o10_inner",
+            "--target",
+            "tdigest_healpix_o10_sharded",
+            "--dry-run",
+            "--commit",
+            "cafe123",
+            "--out-json",
+            str(tmp_path / "metrics.json"),
+        ]
+    )
+    assert warmed["n"] == 0
 
 
 def test_main_unknown_target_fails_before_any_dispatch(tmp_path, monkeypatch):
