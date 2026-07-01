@@ -29,6 +29,14 @@ Event payload (default / process mode):
         Forwarded to ``process_shard`` so the worker fills the ``aoi_mask``
         column; absent when ``output.aoi_mask`` is off (the column is not
         allocated), keeping the flag-off event and outputs byte-identical.
+    "result_url": str (optional, issue #151) -- where to ALSO write this
+        invocation's response envelope as JSON (e.g.
+        "s3://bucket/out.zarr.status/<run_id>/<shard_key>.json"). Set by the
+        orchestrator's async dispatch (InvocationType="Event", which discards
+        the return value); the orchestrator polls this object instead of
+        holding a synchronous connection open while the shard runs. Written
+        with the output-store credentials. Absent -> no write, and the event
+        and behavior are byte-identical to the synchronous path.
 }
 
 Setup mode (creates the zarr template once before per-cell fan-out):
@@ -237,7 +245,34 @@ def lambda_handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
         return _handle_setup(event)
     if mode == "finalize":
         return _handle_finalize(event)
-    return _handle_process(event, context)
+    response = _handle_process(event, context)
+    # Async result channel (issue #151): on an Event invoke the return value is
+    # discarded, so mirror the response envelope to the orchestrator-supplied
+    # result_url for it to poll. Covers every branch (200 / 400 / 500) because
+    # it wraps the whole process handler.
+    if event.get("result_url"):
+        _write_result(event["result_url"], response, event)
+    return response
+
+
+def _write_result(result_url: str, response: Dict[str, Any], event: Dict[str, Any]) -> None:
+    """Write the response envelope to ``result_url`` as JSON (issue #151).
+
+    Uses the same credentials/endpoint resolution as the output store. Never
+    raises: on failure the orchestrator's poll times out and records the shard
+    as failed, and the cause lands here in CloudWatch.
+    """
+    import obstore
+
+    from zagg.store import open_object_store
+
+    try:
+        prefix, key = result_url.rsplit("/", 1)
+        store = open_object_store(prefix, **_output_store_kwargs(event))
+        obstore.put(store, key, json.dumps(response).encode())
+        logger.info(f"Wrote async result to {result_url}")
+    except Exception as e:
+        logger.error(f"Failed to write async result to {result_url}: {e}")
 
 
 def _handle_setup(event: Dict[str, Any]) -> Dict[str, Any]:
