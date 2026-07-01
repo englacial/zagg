@@ -21,6 +21,21 @@ GRANULE_DIR="${GRANULE_DIR:-$HOME/ignore/zagg_neon_atl03_test_shard/granules}"
 BUILD_DIR="${SHIM_BUILD_DIR:-${TMPDIR:-/tmp}/zagg-shim-build}"
 IMAGE=zagg-bench-shim
 
+# sliderule-minimal-build.patch is written against this rev; a drifted clone
+# could fuzz-apply and emit rows misattributed to the stated base
+SLIDERULE_REV="${SLIDERULE_REV:-ce4be309}"
+actual_rev="$(git -C "$SLIDERULE_SRC" rev-parse --short=8 HEAD)"
+if [ "$actual_rev" != "$SLIDERULE_REV" ]; then
+    echo "error: sliderule clone at $SLIDERULE_SRC is $actual_rev, patch expects $SLIDERULE_REV" >&2
+    echo "       (check out the expected rev, or override SLIDERULE_REV= knowingly)" >&2
+    exit 1
+fi
+podman image exists zagg-bench-h5coro || {
+    echo "error: base image zagg-bench-h5coro missing; build it first:" >&2
+    echo "       podman build -t zagg-bench-h5coro -f bench/h5coro/Containerfile bench/h5coro" >&2
+    exit 1
+}
+
 mkdir -p "$BUILD_DIR"
 
 run() { # run a command in the shim container (granules mounted ro when present)

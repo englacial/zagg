@@ -3,7 +3,7 @@ sliderule minimal-build workarounds for the zagg h5coro benchmark shim
 generated against sliderule v5.4.3 (ce4be309, 2026-06-16).
 
 Benchmark-only change:
-  * Asset.h — the Asset constructor and attributes_t sit in the classs single
+  * Asset.h — the Asset constructor and attributes_t sit in the class's single
     private: section; the shim constructs an Asset directly (lua_State* == NULL,
     which LuaObject tolerates), so that section becomes public.
 
