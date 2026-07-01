@@ -119,6 +119,14 @@ def main() -> None:
     out = Path(args.out) if args.out else Path(__file__).parent / "requests" / f"o{args.order}.json"
     out.parent.mkdir(parents=True, exist_ok=True)
     n_calls = sum(len(c) for c in calls_by_resource.values())
+    # every recorded call must land under a shardmap basename, or replay would
+    # silently drop it (resource keys come from H5Coro.resource; guard the invariant)
+    unmatched = set(calls_by_resource) - set(names)
+    if unmatched:
+        sys.exit(f"recorded calls for resources not in the shardmap: {sorted(unmatched)[:3]}...")
+    empty = [n for n in names if not calls_by_resource.get(n)]
+    if empty:
+        print(f"note: {len(empty)} granules produced no readDatasets calls: {empty[:3]}...")
     payload = {
         "meta": {
             "order": args.order,
