@@ -9,6 +9,7 @@ other grids.
 
 import importlib.util
 import json
+import time
 import warnings
 from dataclasses import asdict
 from pathlib import Path
@@ -842,3 +843,72 @@ class TestSetupTemplate:
         n_chunks = self._template_chunk_count(store, worker_grid)
         assert (n_chunks,) == worker_grid.chunk_grid_shape
         assert n_chunks == 5
+
+
+class TestPeakRSSSampler:
+    """Issue #141: per-invocation peak-RSS sampling. ``max_memory_mb`` must reflect
+    the CURRENT invocation's peak (sampled ``VmRSS``), not the warm container's
+    lifetime ``ru_maxrss`` high-water. Uses a controlled ``_read_vmrss_kib`` feed so
+    the assertions don't depend on real RSS or thread timing."""
+
+    @staticmethod
+    def _feeder(values_kib):
+        """A ``_read_vmrss_kib`` stub that yields ``values_kib`` in order then holds
+        the last value (so late samples keep reading the tail, not None)."""
+        it = iter(values_kib)
+        last = [values_kib[-1]]
+
+        def read():
+            try:
+                last[0] = next(it)
+            except StopIteration:
+                pass
+            return last[0]
+
+        return read
+
+    def test_read_vmrss_kib_reads_current_rss(self, handler_mod):
+        val = handler_mod._read_vmrss_kib()
+        if val is None:
+            pytest.skip("no /proc/self/status (non-Linux dev host)")
+        assert isinstance(val, int) and val > 0
+
+    def test_sampler_reports_peak_not_last(self, handler_mod, monkeypatch):
+        # Feed 100 -> 300 -> 150 MB; the sampler must report the PEAK (300), not
+        # the first or last sample.
+        monkeypatch.setattr(
+            handler_mod,
+            "_read_vmrss_kib",
+            self._feeder([100 * 1024, 300 * 1024, 150 * 1024]),
+        )
+        s = handler_mod._PeakRSSSampler(interval_s=0.001).start()
+        time.sleep(0.05)
+        s.stop()
+        assert s.peak_mb == pytest.approx(300.0)
+
+    def test_two_samplers_report_independent_peaks(self, handler_mod, monkeypatch):
+        # The crux of #141: a light invocation after a heavy one on the same warm
+        # process reads its OWN (smaller) peak -- unlike ru_maxrss, which would stay
+        # stuck at the heavy high-water.
+        monkeypatch.setattr(handler_mod, "_read_vmrss_kib", self._feeder([100 * 1024, 900 * 1024]))
+        heavy = handler_mod._PeakRSSSampler(interval_s=0.001).start()
+        time.sleep(0.03)
+        heavy.stop()
+
+        monkeypatch.setattr(handler_mod, "_read_vmrss_kib", self._feeder([90 * 1024, 120 * 1024]))
+        light = handler_mod._PeakRSSSampler(interval_s=0.001).start()
+        time.sleep(0.03)
+        light.stop()
+
+        assert heavy.peak_mb == pytest.approx(900.0)
+        assert light.peak_mb == pytest.approx(120.0)
+        assert light.peak_mb < heavy.peak_mb  # the whole point of #141
+
+    def test_sampler_unavailable_off_linux_returns_none(self, handler_mod, monkeypatch):
+        # No /proc/self/status -> the sampler is a no-op and peak_mb is None, so the
+        # caller falls back to ru_maxrss.
+        monkeypatch.setattr(handler_mod, "_read_vmrss_kib", lambda: None)
+        s = handler_mod._PeakRSSSampler().start()
+        s.stop()
+        assert s.peak_mb is None
+        assert s._thread is None  # never spawned
