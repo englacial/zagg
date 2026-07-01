@@ -55,7 +55,13 @@ def _h5coro_read_granule(path: str, calls: list) -> dict:
             ]
             promise = h5.readDatasets(request, block=True)
             for e in entries:
-                out[(ci, e["dataset"])] = np.asarray(promise[e["dataset"]])
+                values = promise[e["dataset"]]
+                if values is None:
+                    # h5coro's reader thread catches per-dataset errors and returns a
+                    # null result; baking np.asarray(None) into a digest would be
+                    # nondeterministic garbage — fail loudly instead
+                    raise RuntimeError(f"null read for {e['dataset']} in {path}")
+                out[(ci, e["dataset"])] = np.asarray(values)
     finally:
         if hasattr(h5, "close"):
             h5.close()
@@ -75,10 +81,20 @@ def max_rss_mb() -> float:
 
 
 def checksum(arr: np.ndarray) -> str:
+    """sha256 over little-endian-canonical dtype + shape + bytes.
+
+    Byte order is normalized so a backend returning identical values in the
+    other endianness (e.g. a compiled reader on a different platform) hashes
+    identically; on little-endian hosts this is a no-op and digests match the
+    phase-1 references.
+    """
+    arr = np.ascontiguousarray(arr)
+    if arr.dtype.byteorder == ">" or (arr.dtype.byteorder == "=" and sys.byteorder == "big"):
+        arr = arr.astype(arr.dtype.newbyteorder("<"))
     h = hashlib.sha256()
     h.update(arr.dtype.str.encode())
     h.update(str(arr.shape).encode())
-    h.update(np.ascontiguousarray(arr).tobytes())
+    h.update(arr.tobytes())
     return h.hexdigest()
 
 
@@ -134,7 +150,7 @@ def bucket_profile(stats: pstats.Stats) -> dict:
     return {"total_s": round(grand, 3), **{k: round(v, 3) for k, v in totals.items()}}
 
 
-def run(args: argparse.Namespace) -> None:
+def run(args: argparse.Namespace, write_row: bool = True) -> None:
     payload = json.loads(Path(args.requests).read_text())
     granule_dir = Path(os.path.expanduser(args.granule_dir))
     read_granule = ADAPTERS[args.adapter]
@@ -146,22 +162,33 @@ def run(args: argparse.Namespace) -> None:
     checksums: dict[str, str] = {}
     mismatches: list[str] = []
     per_granule = []
-    wall0, cpu0 = time.perf_counter(), time.process_time()
+    # only the read windows are timed; checksum/gate cost is reported separately
+    # so it can't dilute the speedup of a fast backend
+    wall = cpu = gate_s = 0.0
+    skipped = 0
     for g in payload["granules"]:
         if not g["calls"]:
+            skipped += 1
             continue
         path = granule_dir / g["resource"]
-        g0 = time.perf_counter()
+        w0, c0 = time.perf_counter(), time.process_time()
         out = read_granule(str(path), g["calls"])
-        per_granule.append(round(time.perf_counter() - g0, 3))
+        dw = time.perf_counter() - w0
+        wall += dw
+        cpu += time.process_time() - c0
+        per_granule.append(round(dw, 3))
+        g0 = time.perf_counter()
         for (ci, ds), arr in out.items():
             key = f"{g['resource']}:{ci}:{ds}"
             digest = checksum(arr)
             checksums[key] = digest
             if baseline is not None and baseline.get(key) != digest:
                 mismatches.append(key)
+        gate_s += time.perf_counter() - g0
         del out
-    wall, cpu = time.perf_counter() - wall0, time.process_time() - cpu0
+    if baseline is not None:
+        # a variant that silently *omits* arrays must not pass the gate
+        mismatches.extend(f"missing:{k}" for k in baseline if k not in checksums)
 
     results_dir = Path(args.requests).parent.parent / "results"
     results_dir.mkdir(parents=True, exist_ok=True)
@@ -185,20 +212,25 @@ def run(args: argparse.Namespace) -> None:
         "platform": sys.platform,
         "wall_s": round(wall, 3),
         "cpu_s": round(cpu, 3),
+        "gate_s": round(gate_s, 3),
         "max_rss_mb": round(max_rss_mb(), 1),
         "n_arrays": len(checksums),
         "n_granules": len(per_granule),
+        "skipped_granules": skipped,
         "correctness": "baseline-written"
         if args.write_baseline
         else ("pass" if baseline is not None else "unchecked"),
         "per_granule_wall_s": per_granule,
     }
-    out_path = results_dir / f"replay_{label}_{args.variant}.json"
-    out_path.write_text(json.dumps(result, indent=1) + "\n")
-    print(
-        f"{args.variant} on {label}: wall {wall:.1f}s cpu {cpu:.1f}s rss {max_rss_mb():.0f}MB "
-        f"({len(checksums)} arrays, correctness={result['correctness']}) -> {out_path}"
+    status = (
+        f"{args.variant} on {label}: read wall {wall:.1f}s cpu {cpu:.1f}s "
+        f"rss {max_rss_mb():.0f}MB ({len(checksums)} arrays, correctness={result['correctness']})"
     )
+    if write_row:
+        out_path = results_dir / f"replay_{label}_{args.variant}.json"
+        out_path.write_text(json.dumps(result, indent=1) + "\n")
+        status += f" -> {out_path}"
+    print(status)
 
 
 def main() -> None:
@@ -213,9 +245,11 @@ def main() -> None:
     args = ap.parse_args()
 
     if args.profile:
+        # profiled runs never write a replay row: instrumentation inflates the
+        # timings, and overwriting the clean row would poison cross-variant tables
         prof = cProfile.Profile()
         prof.enable()
-        run(args)
+        run(args, write_row=False)
         prof.disable()
         stats = pstats.Stats(prof)
         label = Path(args.requests).stem
