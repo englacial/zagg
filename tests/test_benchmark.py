@@ -280,6 +280,85 @@ def test_run_target_dry_run():
     assert rec["total_obs"] is None  # no dispatch in dry-run
 
 
+def _fake_record(target, *, total_obs, max_memory_mb):
+    # Minimal record with the fields main()'s per-target print + the empty-metrics
+    # guard read (issue #145). Enough to drive main() without a real dispatch.
+    return {
+        "target": target,
+        "total_obs": total_obs,
+        "runtime_s": None,
+        "cost_per_shard_usd": None,
+        "cost_per_100km2_usd": None,
+        "max_memory_mb": max_memory_mb,
+    }
+
+
+def test_main_fails_on_empty_target(tmp_path, monkeypatch):
+    # A silent OOM comes back as obs=0 / max_memory_mb=None; main() must exit
+    # non-zero so the job goes red instead of retaining a junk row (issue #145).
+    monkeypatch.setattr(
+        run_benchmark,
+        "run_target",
+        lambda name, *a, **k: _fake_record(name, total_obs=0, max_memory_mb=None),
+    )
+    rc = run_benchmark.main(
+        [
+            "--targets",
+            str(BENCH / "targets.json"),
+            "--target",
+            "tdigest_healpix_o10_inner",
+            "--commit",
+            "cafe123",
+            "--out-json",
+            str(tmp_path / "metrics.json"),
+        ]
+    )
+    assert rc == 1
+
+
+def test_main_no_fail_on_empty_opts_out(tmp_path, monkeypatch):
+    monkeypatch.setattr(
+        run_benchmark,
+        "run_target",
+        lambda name, *a, **k: _fake_record(name, total_obs=0, max_memory_mb=None),
+    )
+    rc = run_benchmark.main(
+        [
+            "--targets",
+            str(BENCH / "targets.json"),
+            "--target",
+            "tdigest_healpix_o10_inner",
+            "--no-fail-on-empty",
+            "--commit",
+            "cafe123",
+            "--out-json",
+            str(tmp_path / "metrics.json"),
+        ]
+    )
+    assert rc == 0
+
+
+def test_main_passes_on_populated_target(tmp_path, monkeypatch):
+    monkeypatch.setattr(
+        run_benchmark,
+        "run_target",
+        lambda name, *a, **k: _fake_record(name, total_obs=12345, max_memory_mb=800.0),
+    )
+    rc = run_benchmark.main(
+        [
+            "--targets",
+            str(BENCH / "targets.json"),
+            "--target",
+            "tdigest_healpix_o10_inner",
+            "--commit",
+            "cafe123",
+            "--out-json",
+            str(tmp_path / "metrics.json"),
+        ]
+    )
+    assert rc == 0
+
+
 def test_main_dry_run_writes_outputs(tmp_path):
     out_json = tmp_path / "metrics.json"
     out_md = tmp_path / "comment.md"

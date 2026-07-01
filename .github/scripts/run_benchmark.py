@@ -200,6 +200,15 @@ def main(argv: list[str] | None = None) -> int:
         help="One-line banner for the PR comment when the benchmarked worker is "
         "the stable deploy, not this PR's code (issue #25).",
     )
+    parser.add_argument(
+        "--fail-on-empty",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Exit non-zero if any real target comes back with zero observations "
+        "or null peak memory -- the signature of a silent OOM that would "
+        "otherwise keep the job green (issue #145). Skipped under --dry-run, "
+        "which emits empty metrics by design; --no-fail-on-empty opts out.",
+    )
     args = parser.parse_args(argv)
 
     manifest, base = load_targets(args.targets)
@@ -247,6 +256,22 @@ def main(argv: list[str] | None = None) -> int:
         Path(args.out_comment).write_text(
             bench_metrics.comment_markdown(records, worker_note=args.worker_note)
         )
+
+    # A silently OOM'd target records obs=0 / max_memory_mb=None but the job
+    # otherwise stays green, so a memory regression can merge (and land a junk
+    # series row) unnoticed (issue #145). Fail loudly on any real target that
+    # came back empty; --dry-run emits empty metrics by design, so it's exempt.
+    if args.fail_on_empty and not args.dry_run:
+        empty = [
+            r["target"] for r in records if not r.get("total_obs") or r.get("max_memory_mb") is None
+        ]
+        if empty:
+            print(
+                "benchmark target(s) returned empty metrics (obs=0 / "
+                f"max_memory_mb=None), likely a silent OOM: {', '.join(empty)}",
+                file=sys.stderr,
+            )
+            return 1
     return 0
 
 
