@@ -912,3 +912,83 @@ class TestPeakRSSSampler:
         s.stop()
         assert s.peak_mb is None
         assert s._thread is None  # never spawned
+
+
+class TestAsyncResultWrite:
+    """``result_url`` (issue #151): ``lambda_handler`` mirrors the process
+    response envelope to the orchestrator-supplied object so an async (Event)
+    invoke -- whose return value Lambda discards -- has a pollable result.
+    Absent key -> no write, byte-identical to the synchronous path."""
+
+    def _ok_event(self, monkeypatch, result_url=None):
+        import zagg.grids as grids
+        import zagg.processing as processing
+
+        def fake_process_shard(grid, shard_key, granule_urls, **kwargs):
+            meta = {
+                "shard_key": shard_key,
+                "cells_with_data": 0,
+                "total_obs": 7,
+                "granule_count": len(granule_urls),
+                "files_processed": 0,
+                "duration_s": 0.5,
+                "error": None,
+            }
+            return pd.DataFrame(), meta
+
+        monkeypatch.setattr(processing, "process_shard", fake_process_shard)
+        monkeypatch.setattr(grids, "from_config", lambda *a, **k: MagicMock())
+        event = _base_event(_healpix_config_dict())
+        event["child_order"] = 12
+        if result_url is not None:
+            event["result_url"] = result_url
+        return event
+
+    def test_result_url_writes_response_envelope(self, handler_mod, monkeypatch, tmp_path):
+        url = str(tmp_path / "status" / "12345.json")
+        event = self._ok_event(monkeypatch, result_url=url)
+        resp = handler_mod.lambda_handler(event, _context())
+        assert resp["statusCode"] == 200
+        written = json.loads(Path(url).read_text())
+        assert written == resp
+        assert json.loads(written["body"])["total_obs"] == 7
+
+    def test_gate_failure_envelope_also_written(self, handler_mod, monkeypatch, tmp_path):
+        # A 400 (bad event) is mirrored too, so the poller learns fast instead
+        # of waiting out the whole deadline.
+        url = str(tmp_path / "status" / "bad.json")
+        event = self._ok_event(monkeypatch, result_url=url)
+        del event["shard_key"]
+        resp = handler_mod.lambda_handler(event, _context())
+        assert resp["statusCode"] == 400
+        assert json.loads(Path(url).read_text()) == resp
+
+    def test_no_result_url_no_write(self, handler_mod, monkeypatch, tmp_path):
+        event = self._ok_event(monkeypatch)
+        resp = handler_mod.lambda_handler(event, _context())
+        assert resp["statusCode"] == 200
+        assert list(tmp_path.iterdir()) == []  # nothing written anywhere
+
+    def test_write_failure_never_raises(self, handler_mod, monkeypatch, tmp_path):
+        import obstore
+
+        def boom(*a, **k):
+            raise RuntimeError("s3 down")
+
+        monkeypatch.setattr(obstore, "put", boom)
+        url = str(tmp_path / "status" / "12345.json")
+        event = self._ok_event(monkeypatch, result_url=url)
+        resp = handler_mod.lambda_handler(event, _context())
+        # The invocation result is unaffected; the failure is CloudWatch-only.
+        assert resp["statusCode"] == 200
+        assert not Path(url).exists()
+
+    def test_setup_mode_ignores_result_url(self, handler_mod, monkeypatch, tmp_path):
+        # The result channel is per-cell (process mode) only.
+        monkeypatch.setattr(
+            handler_mod, "_handle_setup", lambda event: {"statusCode": 200, "body": "{}"}
+        )
+        url = str(tmp_path / "status" / "setup.json")
+        resp = handler_mod.lambda_handler({"mode": "setup", "result_url": url}, _context())
+        assert resp["statusCode"] == 200
+        assert not Path(url).exists()
