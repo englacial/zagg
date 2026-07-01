@@ -1,0 +1,33 @@
+# Linux arm64 environment for the hidefix spike (phase 4 of issue #149).
+#
+# PyPI ships no linux-aarch64 wheel for hidefix 0.12.0 (only x86_64/macOS/win),
+# so the extension is compiled from the sdist with a pinned Rust toolchain. The
+# crate's default `static` feature builds and bundles libhdf5 (hdf5-metno-src,
+# needs cmake) — no system libhdf5 package is required at build or run time.
+# `hfxidx`, the crate's index-serialization CLI (bincode/flexbuffers rows feed
+# issue #148), is built from the same crate version.
+#
+#   podman build -t zagg-bench-hidefix -f bench/h5coro/Containerfile.hidefix bench/h5coro
+#   podman run --rm -v "$PWD":/work -v ~/ignore/zagg_neon_atl03_test_shard/granules:/granules:ro \
+#       zagg-bench-hidefix python /work/bench/h5coro/hidefix_spike.py \
+#       --requests /work/bench/h5coro/requests/o10.json --granule-dir /granules \
+#       --baseline /work/bench/h5coro/results/checksums_o10.json \
+#       --variant hidefix-0.12.0-linux-arm64 --hfxidx /usr/local/bin/hfxidx
+FROM zagg-bench-h5coro
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        build-essential cmake curl pkg-config \
+    && rm -rf /var/lib/apt/lists/*
+
+RUN curl -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal --default-toolchain 1.96.0
+ENV PATH="/root/.cargo/bin:${PATH}"
+
+# python extension (maturin build backend resolved via pip build isolation)
+RUN pip install --no-cache-dir --no-binary hidefix "hidefix==0.12.0"
+
+# index-serialization CLI (not part of the wheel; needed for #148 numbers)
+RUN cargo install hidefix --version 0.12.0 --features clap,bincode,flexbuffers \
+        --root /usr/local \
+    && rm -rf /root/.cargo/registry
+
+WORKDIR /work
