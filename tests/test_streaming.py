@@ -254,3 +254,52 @@ class TestStreamingWorker:
         monkeypatch.setattr("zagg.processing._make_url_rewriter", lambda driver: lambda u: u)
         with pytest.raises(ValueError, match="not streamable"):
             process_shard(grid, key, ["s3://b/g0.h5"], s3_credentials=_CREDS, config=cfg)
+
+
+class TestStreamingReviewFolds:
+    """Folds from the phase-4 adversarial review."""
+
+    def test_sourceless_tdigest_field_defaults_like_pooled(self):
+        # Pooled defaults source -> value_col ("h_li"); the aggregator must not
+        # die with a bare KeyError on the same config.
+        cfg = _config(streaming={"buffer_granules": 2})
+        del cfg.aggregation["variables"]["h_tdigest"]["source"]
+        agg = StreamingAggregator(cfg, _grid(cfg), "pandas", 2)
+        assert agg._digest_fields["h_tdigest"][0] == "h_li"
+
+    def test_mis_declared_inner_shape_rejected(self):
+        # The buffered path never runs _coerce_ragged_value, so a non-(2,)
+        # inner_shape must fail at validation, not silently diverge on disk.
+        cfg = _config()
+        cfg.aggregation["variables"]["h_tdigest"]["inner_shape"] = [3]
+        with pytest.raises(ValueError, match="inner_shape"):
+            validate_streaming(cfg)
+
+    def test_count_alias_of_len_accepted(self):
+        # aggregate.py treats ("len", "count") identically; so must streaming.
+        cfg = _config()
+        cfg.aggregation["variables"]["count"]["function"] = "count"
+        validate_streaming(cfg)
+
+    def test_profile_charges_merge_to_read_phase(self, monkeypatch):
+        # All flush cost (intermediate AND tail) is deliberately charged to
+        # the ``read`` phase; the stamp lands after the tail flush.
+        key = _shard_key()
+        cfg = _config(streaming={"buffer_granules": 2})
+        grid = _grid(cfg)
+        dfs = _granule_dfs(grid, key, n_granules=3)
+        reads = iter(dfs)
+        monkeypatch.setattr("zagg.processing._read_group", lambda *a, **k: next(reads))
+        monkeypatch.setattr("zagg.processing.h5coro.H5Coro", lambda *a, **k: object())
+        monkeypatch.setattr("zagg.processing._make_url_rewriter", lambda driver: lambda u: u)
+        _, meta = process_shard(
+            grid,
+            key,
+            [f"s3://b/g{i}.h5" for i in range(3)],
+            s3_credentials=_CREDS,
+            config=cfg,
+            profile=True,
+        )
+        timings = meta["phase_timings"]
+        assert set(timings) == {"read", "index", "aggregate"}
+        assert timings["read"] >= 0

@@ -84,11 +84,22 @@ def validate_streaming(config: PipelineConfig) -> None:
                     f"field '{name}': ragged function {meta.get('function')!r} has no "
                     f"merge law (only {_TDIGEST_FUNCTION})"
                 )
+            elif tuple(sig["inner_shape"]) != (2,):
+                # The pooled path validates payload shape per cell via
+                # _coerce_ragged_value; the buffered path stores merged digests
+                # directly, so a mis-declared inner_shape must fail HERE, not
+                # silently disagree with the store schema readers key on.
+                problems.append(
+                    f"field '{name}': tdigest payloads are (k, 2) centroids; "
+                    f"declared inner_shape {list(sig['inner_shape'])} cannot stream"
+                )
         elif sig["kind"] == "scalar":
-            if meta.get("function") != "len":
+            # ``count`` is the pooled path's alias of ``len`` (aggregate.py);
+            # both merge by summation.
+            if meta.get("function") not in ("len", "count"):
                 problems.append(
                     f"field '{name}': scalar function {meta.get('function')!r} is not "
-                    "mergeable (only 'len')"
+                    "mergeable (only 'len'/'count')"
                 )
         else:
             problems.append(f"field '{name}': kind '{sig['kind']}' cannot stream")
@@ -120,7 +131,11 @@ class StreamingAggregator:
         for name, meta in agg_fields.items():
             if get_output_signature(meta)["kind"] == "ragged":
                 delta = int((meta.get("params") or {}).get("delta", _DEFAULT_DELTA))
-                self._digest_fields[name] = (meta["source"], delta)
+                # Mirror the pooled path's source default (aggregate.py:
+                # ``meta.get("source") or value_col`` with the worker's
+                # ``value_col="h_li"``) so a config that runs pooled doesn't die
+                # here with a bare KeyError when streaming is turned on.
+                self._digest_fields[name] = (meta.get("source") or "h_li", delta)
             else:
                 self._count_fields.append(name)
         self.counts: dict[int, int] = {}

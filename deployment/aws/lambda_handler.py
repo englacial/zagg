@@ -276,7 +276,17 @@ def _handle_extract(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
     driver = event.get("driver", "s3")
     s3_creds = event["s3_credentials"]
     if driver == "https":
-        credentials = s3_creds.get("edl_token", s3_creds)
+        # Same fail-fast posture as the s3 branch: a missing token would pass
+        # the whole creds dict downstream as the bearer token and burn the
+        # batch on 401s instead of returning a 400 here.
+        if "edl_token" not in s3_creds:
+            error_msg = "Missing s3_credentials keys: edl_token (required for driver='https')"
+            logger.error(error_msg)
+            return {
+                "statusCode": 400,
+                "body": json.dumps({"error": error_msg, "mode": "extract"}),
+            }
+        credentials = s3_creds["edl_token"]
     else:
         # Mirror process mode's credential-shape gate: missing keys would map to
         # present-but-None kwargs, silently falling back to the execution role

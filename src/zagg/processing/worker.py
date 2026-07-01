@@ -301,11 +301,16 @@ def process_shard(
     metadata["files_processed"] = files_processed
     if read_errors:
         metadata["read_errors"] = read_errors
-    if profile:
-        phase_timings["read"] = time.time() - _read_t0
 
     if buffered is not None:
-        buffered.flush()  # drain the tail buffer (< buffer_granules granules)
+        # Drain the tail buffer (< buffer_granules granules) BEFORE the read
+        # stamp: intermediate flushes already run inside the read loop
+        # (granule_done -> flush), so under profiling the streaming path
+        # deliberately charges ALL group+merge cost to ``read`` — the tail
+        # flush must not fall between phases and vanish from the accounting.
+        buffered.flush()
+    if profile:
+        phase_timings["read"] = time.time() - _read_t0
 
     if buffered.empty if buffered is not None else not all_reads:
         # Distinguish a genuinely-empty read from one where a group read raised

@@ -1021,3 +1021,12 @@ class TestExtractMode:
         assert result["statusCode"] == 400
         body = json.loads(result["body"])
         assert "secretAccessKey" in body["error"] and "sessionToken" in body["error"]
+
+    def test_https_driver_missing_edl_token_rejected_fast(self, handler_mod):
+        # https branch has the same fail-fast gate: no edl_token is a 400, not
+        # a whole-batch 401 burn with the creds dict as the bearer token.
+        result = handler_mod.lambda_handler(
+            self._event(driver="https", s3_credentials={"accessKeyId": "a"}), _context()
+        )
+        assert result["statusCode"] == 400
+        assert "edl_token" in json.loads(result["body"])["error"]
