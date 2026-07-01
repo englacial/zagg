@@ -660,6 +660,10 @@ class TestInvokeLambdaCellAsync:
         assert client.invoke.call_count == 1
         assert result["status_code"] is None
         assert "no worker result within" in result["error"]
+        # Self-diagnosing against a deployed worker that predates result_url
+        # support: the error names the remedies (redeploy / invocation="sync").
+        assert "predates result_url support" in result["error"]
+        assert 'invocation="sync"' in result["error"]
 
     def test_worker_error_envelope_surfaces_body_error(self):
         from unittest.mock import MagicMock
@@ -708,6 +712,68 @@ class TestInvokeLambdaCellAsync:
         assert client.invoke.call_count == 2
         assert result["status_code"] == 200
         assert result["retries"] == 1
+
+    def test_oversized_async_payload_raises_before_dispatch(self):
+        # Event invokes cap at 256 KB (vs 6 MB sync); the pre-flight fails with
+        # a remedy instead of surfacing Lambda's raw
+        # RequestEntityTooLargeException. Realistic trigger: a large strict-AOI
+        # aoi_payload (issue #101).
+        from unittest.mock import MagicMock
+
+        from zagg.runner import _ASYNC_PAYLOAD_CAP_BYTES, _invoke_lambda_cell
+
+        client = MagicMock()
+        big_aoi = list(range(_ASYNC_PAYLOAD_CAP_BYTES // 4))  # >250 KB serialized
+        with pytest.raises(ValueError, match='pass invocation="sync"'):
+            _invoke_lambda_cell(
+                client,
+                (0,),
+                12345,
+                6,
+                12,
+                ["s3://b/g.h5"],
+                "s3://out/x.zarr",
+                self._CREDS,
+                function_name="process-shard",
+                config_dict=None,
+                max_workers=4,
+                aoi_payload=big_aoi,
+                result_url="s3://out/x.zarr.status/run1/12345.json",
+                result_fetch=lambda: None,
+                poll_timeout_s=10.0,
+            )
+        client.invoke.assert_not_called()
+
+    def test_oversized_payload_allowed_on_sync_path(self):
+        # The same event is fine synchronously (6 MB request cap) -- the gate
+        # applies only to Event dispatch, so invocation="sync" is a real remedy.
+        from unittest.mock import MagicMock
+
+        from zagg.runner import _ASYNC_PAYLOAD_CAP_BYTES, _invoke_lambda_cell
+
+        payload = MagicMock()
+        payload.read.return_value = json.dumps(
+            {"statusCode": 200, "body": json.dumps({"total_obs": 0, "duration_s": 0.0})}
+        ).encode()
+        client = MagicMock()
+        client.invoke.return_value = {"Payload": payload, "FunctionError": None}
+        big_aoi = list(range(_ASYNC_PAYLOAD_CAP_BYTES // 4))
+        result = _invoke_lambda_cell(
+            client,
+            (0,),
+            12345,
+            6,
+            12,
+            ["s3://b/g.h5"],
+            "s3://out/x.zarr",
+            self._CREDS,
+            function_name="process-shard",
+            config_dict=None,
+            max_workers=4,
+            aoi_payload=big_aoi,
+        )
+        assert client.invoke.call_count == 1
+        assert result["status_code"] == 200
 
 
 class TestResultFetcher:

@@ -1056,6 +1056,12 @@ _DEFAULT_FUNCTION_TIMEOUT_S = 720
 _ASYNC_POLL_MARGIN_S = 90.0
 _ASYNC_POLL_INTERVAL_S = 5.0
 
+# Async (Event) invoke requests cap at 256 KB (vs 6 MB synchronous). Budget a
+# little under it so the dispatch pre-flight fails with a remedy before
+# Lambda's raw RequestEntityTooLargeException does; the realistic trigger is a
+# large strict-AOI ``aoi_payload`` (issue #101).
+_ASYNC_PAYLOAD_CAP_BYTES = 250 * 1024
+
 
 def _result_fetcher(box, prefix, output_creds_event, region, key):
     """Zero-arg fetch closure for one shard's async result object (#151).
@@ -1149,7 +1155,12 @@ def _poll_lambda_result(
             cause = (
                 f"result fetch failing: {fetch_error}"
                 if fetch_error is not None
-                else "worker timeout, OOM, or crash before writing its result -- check CloudWatch"
+                else (
+                    "worker timed out, was OOM-killed, or crashed before "
+                    "writing its result (check CloudWatch) -- or the deployed "
+                    "worker predates result_url support: redeploy the "
+                    'function, or pass invocation="sync"'
+                )
             )
             return {
                 "shard_key": shard_key,
@@ -1318,6 +1329,19 @@ def _invoke_lambda_cell(
         event["result_url"] = result_url
         invocation_type = "Event"
 
+    # json.dumps is ASCII by default, so len() is the request byte size. Gate
+    # async payloads against the 256 KB Event cap with a remedy, up front,
+    # rather than letting every attempt fail on Lambda's raw
+    # RequestEntityTooLargeException (issue #151).
+    payload = json.dumps(event)
+    if invocation_type == "Event" and len(payload) > _ASYNC_PAYLOAD_CAP_BYTES:
+        raise ValueError(
+            f"cell {shard_key} event payload is {len(payload):,} bytes, over the "
+            f"{_ASYNC_PAYLOAD_CAP_BYTES:,}-byte async dispatch budget (Lambda caps "
+            'Event invokes at 256 KB): pass invocation="sync" for this run, or '
+            "shrink the per-cell payload (e.g. the strict-AOI aoi_payload)"
+        )
+
     last_error = None
     for attempt in range(max_retries):
         try:
@@ -1327,7 +1351,7 @@ def _invoke_lambda_cell(
             response = lambda_client.invoke(
                 FunctionName=function_name,
                 InvocationType=invocation_type,
-                Payload=json.dumps(event),
+                Payload=payload,
             )
             if result_url is not None:
                 # 202 accepted -- an Event invoke returns no payload; the
