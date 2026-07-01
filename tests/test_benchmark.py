@@ -558,8 +558,14 @@ def test_main_unknown_target_fails_before_any_dispatch(tmp_path, monkeypatch):
 
 
 def test_targets_manifest_consistent():
+    # Provisional targets (issue #130 block) are included: the 88S stress
+    # targets (issue #148) live there, and their shard-map pins must be just as
+    # internally consistent as the committed matrix's.
     manifest = json.loads((BENCH / "targets.json").read_text())
-    for tname, t in manifest["targets"].items():
+    provisional = {
+        k: v for k, v in manifest.get("provisional_targets", {}).items() if k != "_comment"
+    }
+    for tname, t in {**manifest["targets"], **provisional}.items():
         assert (BENCH / t["config"]).exists(), f"{tname}: missing config"
         sm_meta = manifest["shardmaps"][t["shardmap"]]
         sm_path = BENCH / sm_meta["path"]
