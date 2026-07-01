@@ -1,5 +1,5 @@
 {
-  "description": "Pinned Lambda-benchmark targets (issue #110). Each target dispatches ONE shard -- the densest cell over the NEON SERC AOP box -- so cost/runtime deltas track code changes, not data drift. Forward matrix (issue #133): all tdigest / HEALPix / arrow, a 2x3 sharded-vs-inner ShardingCodec (issue #108) A/B across orders o9/o10/o11. The two columns of each order share ONE config + ONE shard map and differ only by the per-target codec key (sharded: true|false), which run_benchmark applies to output.grid.sharded. Shard maps are shared per (grid, order): the densest shard does not depend on the codec. Rebuild + drift check: tests/test_benchmark_shardmap.py.",
+  "description": "Pinned Lambda-benchmark targets (issue #110). Each target dispatches ONE shard -- the densest cell over the NEON SERC AOP box -- so cost/runtime deltas track code changes, not data drift. Forward matrix (issue #133): all tdigest / HEALPix / arrow, a 2x3 sharded-vs-inner ShardingCodec (issue #108) A/B across orders o9/o10/o11. The two columns of each order share ONE config + ONE shard map and differ only by the per-target codec key (sharded: true|false), which run_benchmark applies to output.grid.sharded. The carrier is config-driven (issue #132): aggregation.handoff defaults to arrow, so the matrix targets carry no redundant per-target handoff key. Shard maps are shared per (grid, order): the densest shard does not depend on the codec. Rebuild + drift check: tests/test_benchmark_shardmap.py.",
   "aoi": {
     "file": "AOP_NEON.geojson",
     "name": "NEON SERC AOP box"
@@ -40,7 +40,6 @@
       "aggregator": "tdigest",
       "grid_type": "healpix",
       "grid_size": "o11",
-      "handoff": "arrow",
       "codec": "sharded",
       "sharded": true
     },
@@ -50,7 +49,6 @@
       "aggregator": "tdigest",
       "grid_type": "healpix",
       "grid_size": "o11",
-      "handoff": "arrow",
       "codec": "inner",
       "sharded": false
     },
@@ -60,7 +58,6 @@
       "aggregator": "tdigest",
       "grid_type": "healpix",
       "grid_size": "o10",
-      "handoff": "arrow",
       "codec": "sharded",
       "sharded": true
     },
@@ -70,7 +67,6 @@
       "aggregator": "tdigest",
       "grid_type": "healpix",
       "grid_size": "o10",
-      "handoff": "arrow",
       "codec": "inner",
       "sharded": false
     },
@@ -80,7 +76,6 @@
       "aggregator": "tdigest",
       "grid_type": "healpix",
       "grid_size": "o9",
-      "handoff": "arrow",
       "codec": "sharded",
       "sharded": true
     },
@@ -90,7 +85,6 @@
       "aggregator": "tdigest",
       "grid_type": "healpix",
       "grid_size": "o9",
-      "handoff": "arrow",
       "codec": "inner",
       "sharded": false
     }

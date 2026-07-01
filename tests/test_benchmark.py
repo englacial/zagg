@@ -326,14 +326,16 @@ def test_targets_manifest_consistent():
 def test_forward_matrix_is_tdigest_healpix_arrow_codec_ab():
     # The committed merge matrix is the forward 2x3 codec A/B: every target is
     # tdigest / HEALPix / arrow and carries a codec (sharded|inner) matched to its
-    # sharded bool, paired per order across o9/o10/o11.
+    # sharded bool, paired per order across o9/o10/o11. The carrier is config-driven
+    # (issue #132): targets inherit ``arrow`` from each config rather than restating
+    # a redundant per-target ``handoff`` key (test_committed_targets_drop_redundant_handoff).
     manifest = json.loads((BENCH / "targets.json").read_text())
     targets = manifest["targets"]
     by_order: dict[str, set[str]] = {}
     for tname, t in targets.items():
         assert t["aggregator"] == "tdigest", tname
         assert t["grid_type"] == "healpix", tname
-        assert t["handoff"] == "arrow", tname
+        assert "handoff" not in t, tname
         assert t["codec"] in ("sharded", "inner"), tname
         # codec label and the sharded bool run_benchmark applies must agree.
         assert t["sharded"] is (t["codec"] == "sharded"), tname
@@ -417,6 +419,40 @@ def test_provisional_target_resolves_and_threads_handoff(monkeypatch):
     monkeypatch.setattr(runner, "agg", fake_agg)
     run_benchmark.run_target(
         "scalar_arrow_healpix_o11",
+        manifest,
+        base,
+        store="s3://b/x.zarr",
+        region="us-west-2",
+        function_name="process-shard",
+        context={"commit": "deadbee", "event": "pr"},
+        dry_run=False,
+    )
+    assert captured["handoff"] == "arrow"
+
+
+def test_committed_targets_drop_redundant_handoff(monkeypatch):
+    # issue #132: the merge-matrix targets no longer restate the carrier; they
+    # inherit it from each config. Only the provisional A/B targets pin handoff.
+    manifest = json.loads((BENCH / "targets.json").read_text())
+    for tname, t in manifest["targets"].items():
+        assert "handoff" not in t, f"{tname}: handoff should be inherited from the config"
+
+
+def test_committed_target_inherits_handoff_from_config(monkeypatch):
+    # issue #132: a committed target with no handoff key inherits the config carrier
+    # (get_handoff -> "arrow" for the benchmark configs, which set no handoff).
+    manifest, base = run_benchmark.load_targets(str(BENCH / "targets.json"))
+    captured = {}
+
+    import zagg.runner as runner
+
+    def fake_agg(config, **kwargs):
+        captured["handoff"] = kwargs.get("handoff")
+        return {}
+
+    monkeypatch.setattr(runner, "agg", fake_agg)
+    run_benchmark.run_target(
+        "tdigest_healpix_o11_sharded",
         manifest,
         base,
         store="s3://b/x.zarr",

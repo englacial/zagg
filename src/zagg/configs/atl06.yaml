@@ -13,6 +13,11 @@ data_source:
     value: 0
 
 aggregation:
+  # Per-cell carrier (issue #132): "arrow" (arro3 Table, faster + lighter on dense
+  # shards) or "pandas" (DataFrame, tolerates nullable columns). Default "arrow";
+  # declared here so the carrier travels with the rest of the aggregation settings.
+  # A nullable/sparse source should set "pandas" (see atl06_nullable.yaml).
+  handoff: arrow
   coordinates:
     cell_ids:
       dtype: uint64

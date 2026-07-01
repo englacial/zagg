@@ -31,6 +31,7 @@ from zagg.config import (
     PipelineConfig,
     get_child_order,
     get_driver,
+    get_handoff,
     get_layout,
     get_output_endpoint_url,
     get_output_region,
@@ -86,7 +87,7 @@ def agg(
     region: str = "us-west-2",
     output_credentials: dict | None = None,
     output_endpoint_url: str | None = None,
-    handoff: str = "arrow",
+    handoff: str | None = None,
     profile: bool = False,
     max_retries: int = 3,
 ) -> dict:
@@ -132,15 +133,18 @@ def agg(
     output_endpoint_url : str, optional
         Custom S3-compatible endpoint for the output store (e.g. R2, MinIO).
         Overrides ``output.endpoint_url`` in the config.
-    handoff : str
-        Per-cell aggregation carrier: ``"arrow"`` (default, an ``arro3.core``
-        carrier) or ``"pandas"``. Both produce byte-for-byte identical scalar outputs
-        (#30); ``"arrow"`` is the default because it is faster and lighter on dense
-        shards (issue #130). Honored by both the ``"local"`` and ``"lambda"``
-        backends: the lambda backend forwards it into each cell event, and an
-        explicit ``"pandas"`` keeps that event payload byte-identical (no key).
-        pyarrow is not used on either path; the experimental ``arrow-kernel``
-        reducer was dropped with pyarrow.
+    handoff : str, optional
+        Per-cell aggregation carrier: ``"arrow"`` (an ``arro3.core`` carrier) or
+        ``"pandas"``. Both produce byte-for-byte identical scalar outputs (#30);
+        ``"arrow"`` is faster and lighter on dense shards (issue #130). Default
+        ``None`` reads the carrier from the config (``aggregation.handoff``, itself
+        defaulting to ``"arrow"`` — issue #132) via :func:`get_handoff`; an explicit
+        kwarg overrides the config, mirroring the ``driver`` precedence. Honored by
+        both the ``"local"`` and ``"lambda"`` backends: the lambda backend forwards
+        a non-default carrier into each cell event, and an absent key keeps that
+        event payload byte-identical (the worker then derives the carrier from the
+        forwarded config). pyarrow is not used on either path; the experimental
+        ``arrow-kernel`` reducer was dropped with pyarrow.
     profile : bool
         Opt-in per-phase timing (issue #100). When ``True`` (lambda backend),
         forwards ``profile`` into each cell event so the worker emits a
@@ -177,6 +181,10 @@ def agg(
     # Resolve driver: kwarg > config > default
     resolved_driver = driver or get_driver(config)
 
+    # Resolve carrier: explicit kwarg > config (aggregation.handoff > "arrow").
+    # Mirrors the driver precedence above (issue #132).
+    resolved_handoff = handoff if handoff is not None else get_handoff(config)
+
     # Output endpoint/region are non-secret: runtime kwarg > config.
     resolved_endpoint = output_endpoint_url or get_output_endpoint_url(config)
     config_region = get_output_region(config)
@@ -211,7 +219,7 @@ def agg(
             driver=resolved_driver,
             output_credentials=output_credentials,
             output_endpoint_url=resolved_endpoint,
-            handoff=handoff,
+            handoff=resolved_handoff,
         )
     elif backend == "lambda":
         if max_workers is None:
@@ -235,7 +243,7 @@ def agg(
             function_name=function_name,
             output_credentials=output_credentials,
             output_endpoint_url=resolved_endpoint,
-            handoff=handoff,
+            handoff=resolved_handoff,
             profile=profile,
             max_retries=max_retries,
         )

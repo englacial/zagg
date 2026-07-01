@@ -208,6 +208,13 @@ def validate_config(config: PipelineConfig) -> None:
         if layout is not None and layout not in ("dense", "fullsphere"):
             raise ValueError(f"output.grid.layout must be 'dense' or 'fullsphere' (got {layout!r})")
 
+    # Validate the optional per-cell carrier (issue #132). Mirrors the worker's
+    # ``{"pandas", "arrow"}`` guard (worker.py) so a typo in the aggregation YAML
+    # fails at load, not deep in a worker.
+    handoff = config.aggregation.get("handoff")
+    if handoff is not None and handoff not in ("pandas", "arrow"):
+        raise ValueError(f"aggregation.handoff must be 'pandas' or 'arrow' (got {handoff!r})")
+
     # Optional strict-AOI cell mask (issue #101), default off. Must be a bool.
     aoi_mask = config.output.get("aoi_mask")
     if aoi_mask is not None and not isinstance(aoi_mask, bool):
@@ -1112,6 +1119,30 @@ def get_driver(config: PipelineConfig) -> str:
         ``"s3"`` or ``"https"``. Defaults to ``"s3"``.
     """
     return config.data_source.get("driver", "s3")
+
+
+def get_handoff(config: PipelineConfig) -> str:
+    """Return the per-cell aggregation carrier from the aggregation config (issue #132).
+
+    The ``handoff`` knob lives on the ``aggregation`` block, default ``"arrow"``,
+    and selects the per-cell read->concat->extract carrier: ``"arrow"`` (an
+    ``arro3.core`` Table, faster + lighter on dense shards) or ``"pandas"`` (a
+    DataFrame, which tolerates nullable columns natively). Both feed identical
+    numpy arrays into the same reductions, so scalar outputs are byte-for-byte
+    identical (issues #130/#131). A pipeline declares its carrier next to the rest
+    of its aggregation settings rather than relying on a global default; the
+    explicit ``handoff=`` kwarg still overrides this value.
+
+    Parameters
+    ----------
+    config : PipelineConfig
+
+    Returns
+    -------
+    str
+        ``"arrow"`` (default) or ``"pandas"``.
+    """
+    return config.aggregation.get("handoff", "arrow")
 
 
 def get_child_order(config: PipelineConfig) -> int:

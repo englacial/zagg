@@ -463,9 +463,17 @@ class TestInvokeLambdaCellRetry:
         from zagg.runner import _invoke_lambda_cell
 
         return _invoke_lambda_cell(
-            client, (0,), 12345, 6, 12,
-            ["s3://b/g.h5"], "s3://out/x.zarr", self._CREDS,
-            function_name="process-shard", config_dict=None, max_workers=4,
+            client,
+            (0,),
+            12345,
+            6,
+            12,
+            ["s3://b/g.h5"],
+            "s3://out/x.zarr",
+            self._CREDS,
+            function_name="process-shard",
+            config_dict=None,
+            max_workers=4,
             max_retries=max_retries,
         )
 
@@ -576,32 +584,51 @@ class TestMaxRetriesPassthrough:
 
         captured = {}
 
-        monkeypatch.setattr(runner, "get_nsidc_s3_credentials",
-                            lambda: {"accessKeyId": "a", "secretAccessKey": "s",
-                                     "sessionToken": "t"})
+        monkeypatch.setattr(
+            runner,
+            "get_nsidc_s3_credentials",
+            lambda: {"accessKeyId": "a", "secretAccessKey": "s", "sessionToken": "t"},
+        )
         monkeypatch.setattr(grids_mod, "from_config", lambda *a, **k: _stub_grid())
         monkeypatch.setattr(runner, "_invoke_lambda_setup", lambda *a, **k: None)
         monkeypatch.setattr(runner, "_invoke_lambda_finalize", lambda *a, **k: None)
         monkeypatch.setattr(runner, "_get_function_timeout_s", lambda *a, **k: 720)
         from unittest.mock import MagicMock
+
         monkeypatch.setattr(boto3, "Session", lambda *a, **k: MagicMock())
         monkeypatch.setattr(
-            runner, "compute_available_workers",
+            runner,
+            "compute_available_workers",
             lambda requested, *a, **k: (
                 1,
-                ConcurrencyReport(account_limit=1000, current_concurrent=0,
-                                  padding=100, available=900, function_reserved=None),
+                ConcurrencyReport(
+                    account_limit=1000,
+                    current_concurrent=0,
+                    padding=100,
+                    available=900,
+                    function_reserved=None,
+                ),
             ),
         )
 
         def _fake_cell(*a, **k):
             captured["max_retries"] = k.get("max_retries")
-            return {"status_code": 200, "body": {"total_obs": 1}, "error": None,
-                    "lambda_duration": 1.0, "shard_key": 0}
+            return {
+                "status_code": 200,
+                "body": {"total_obs": 1},
+                "error": None,
+                "lambda_duration": 1.0,
+                "shard_key": 0,
+            }
 
         monkeypatch.setattr(runner, "_invoke_lambda_cell", _fake_cell)
-        agg(atl06_config, catalog=catalog_file, store="s3://out/x.zarr",
-            backend="lambda", **agg_kwargs)
+        agg(
+            atl06_config,
+            catalog=catalog_file,
+            store="s3://out/x.zarr",
+            backend="lambda",
+            **agg_kwargs,
+        )
         return captured
 
     def test_max_retries_threaded_end_to_end(self, monkeypatch, atl06_config, catalog_file):
@@ -1409,27 +1436,87 @@ class TestProfilePlumbing:
         captured = {}
         monkeypatch.setattr(runner, "_load_catalog", lambda p: _run_catalog())
         monkeypatch.setattr(
-            runner, "_run_lambda",
+            runner,
+            "_run_lambda",
             lambda *a, **k: captured.update(handoff=k.get("handoff")) or {},
         )
         runner.agg(
-            atl06_config, catalog="ignored", store="s3://out/x.zarr",
-            backend="lambda", handoff="arrow",
+            atl06_config,
+            catalog="ignored",
+            store="s3://out/x.zarr",
+            backend="lambda",
+            handoff="arrow",
         )
         assert captured["handoff"] == "arrow"
 
     def test_agg_default_handoff_is_arrow_on_lambda(self, monkeypatch, atl06_config):
-        # issue #130: agg() defaults to the arro3/arrow carrier on the lambda backend.
+        # issue #132: with no kwarg and no config field, agg() resolves the carrier
+        # from get_handoff(config), which defaults to arrow.
         from zagg import runner
 
         captured = {}
         monkeypatch.setattr(runner, "_load_catalog", lambda p: _run_catalog())
         monkeypatch.setattr(
-            runner, "_run_lambda",
+            runner,
+            "_run_lambda",
             lambda *a, **k: captured.update(handoff=k.get("handoff")) or {},
         )
         runner.agg(atl06_config, catalog="ignored", store="s3://out/x.zarr", backend="lambda")
         assert captured["handoff"] == "arrow"
+
+    def test_agg_reads_handoff_from_config(self, monkeypatch, atl06_config):
+        # issue #132: with no kwarg, the carrier comes from aggregation.handoff so a
+        # nullable-source pipeline can declare pandas in its YAML.
+        from zagg import runner
+
+        atl06_config.aggregation["handoff"] = "pandas"
+        captured = {}
+        monkeypatch.setattr(runner, "_load_catalog", lambda p: _run_catalog())
+        monkeypatch.setattr(
+            runner,
+            "_run_lambda",
+            lambda *a, **k: captured.update(handoff=k.get("handoff")) or {},
+        )
+        runner.agg(atl06_config, catalog="ignored", store="s3://out/x.zarr", backend="lambda")
+        assert captured["handoff"] == "pandas"
+
+    def test_agg_handoff_kwarg_overrides_config(self, monkeypatch, atl06_config):
+        # issue #132: an explicit handoff= kwarg wins over aggregation.handoff,
+        # mirroring the driver precedence.
+        from zagg import runner
+
+        atl06_config.aggregation["handoff"] = "pandas"
+        captured = {}
+        monkeypatch.setattr(runner, "_load_catalog", lambda p: _run_catalog())
+        monkeypatch.setattr(
+            runner,
+            "_run_lambda",
+            lambda *a, **k: captured.update(handoff=k.get("handoff")) or {},
+        )
+        runner.agg(
+            atl06_config,
+            catalog="ignored",
+            store="s3://out/x.zarr",
+            backend="lambda",
+            handoff="arrow",
+        )
+        assert captured["handoff"] == "arrow"
+
+    def test_agg_reads_handoff_from_config_on_local(self, monkeypatch, atl06_config):
+        # issue #132: the config-derived carrier reaches the local backend too
+        # (resolution is backend-agnostic, before the local/lambda split).
+        from zagg import runner
+
+        atl06_config.aggregation["handoff"] = "pandas"
+        captured = {}
+        monkeypatch.setattr(runner, "_load_catalog", lambda p: _run_catalog())
+        monkeypatch.setattr(
+            runner,
+            "_run_local",
+            lambda *a, **k: captured.update(handoff=k.get("handoff")) or {},
+        )
+        runner.agg(atl06_config, catalog="ignored", store="./out.zarr", backend="local")
+        assert captured["handoff"] == "pandas"
 
 
 class TestWorkerPhaseTimings:

@@ -34,7 +34,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import bench_metrics  # noqa: E402
 
-from zagg.config import load_config  # noqa: E402
+from zagg.config import get_handoff, load_config  # noqa: E402
 from zagg.grids import from_config  # noqa: E402
 
 
@@ -98,11 +98,11 @@ def run_target(
     shard_key = int(shardmap_meta["shard_key"])
     n_granules = shardmap_meta.get("n_granules")
 
-    # Per-cell carrier (issue #130). Default "pandas" keeps the dispatched event
-    # byte-identical to a pre-handoff run; the arrow (arro3) target sets it.
-    handoff = target.get("handoff", "pandas")
-
     config = load_config(str(config_path))
+    # Per-cell carrier (issues #130/#132). Inherit from the config
+    # (``aggregation.handoff``, default ``"arrow"``) unless the target pins an
+    # explicit override for a pandas-vs-arrow A/B; the override still wins.
+    handoff = target.get("handoff") or get_handoff(config)
     # The ShardingCodec (issue #108) is the experimental variable of the forward
     # benchmark (issue #133): the matrix carries ``sharded: true|false`` per target
     # so one config drives both columns. Apply it to the grid block (where

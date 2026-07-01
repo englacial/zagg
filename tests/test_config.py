@@ -17,6 +17,7 @@ from zagg.config import (
     get_coords,
     get_data_vars,
     get_filters,
+    get_handoff,
     get_levels,
     get_output_signature,
     get_sharded,
@@ -1088,6 +1089,54 @@ class TestOutputHelpers:
             }
         )
         assert get_store_path(cfg) == "s3://bucket/prefix.zarr"
+
+
+# ---------------------------------------------------------------------------
+# Carrier handoff config helper + validation (issue #132)
+# ---------------------------------------------------------------------------
+
+
+def _cfg_with_handoff(handoff=None) -> PipelineConfig:
+    """Minimal valid config; sets aggregation.handoff only when given."""
+    aggregation = {"variables": {"c": {"function": "len", "source": "h_li", "dtype": "int32"}}}
+    if handoff is not None:
+        aggregation["handoff"] = handoff
+    return PipelineConfig(
+        data_source={"variables": {"h_li": "/path"}},
+        aggregation=aggregation,
+        output={"grid": {"type": "healpix", "parent_order": 6, "child_order": 12}},
+    )
+
+
+class TestHandoff:
+    def test_default_is_arrow(self, atl06_config):
+        assert get_handoff(atl06_config) == "arrow"
+
+    def test_explicit_pandas(self):
+        assert get_handoff(_cfg_with_handoff("pandas")) == "pandas"
+
+    def test_explicit_arrow(self):
+        assert get_handoff(_cfg_with_handoff("arrow")) == "arrow"
+
+    def test_valid_handoff_validates(self):
+        validate_config(_cfg_with_handoff("pandas"))  # should not raise
+        validate_config(_cfg_with_handoff("arrow"))
+
+    def test_absent_handoff_validates(self):
+        validate_config(_cfg_with_handoff())  # should not raise
+
+    def test_invalid_handoff_rejected_at_load(self):
+        with pytest.raises(ValueError, match=r"aggregation\.handoff must be 'pandas' or 'arrow'"):
+            validate_config(_cfg_with_handoff("bogus"))
+
+    def test_shipped_atl06_declares_arrow(self):
+        # The shipped atl06 config now declares its carrier explicitly (issue #132).
+        assert get_handoff(default_config("atl06")) == "arrow"
+
+    def test_shipped_nullable_example_selects_pandas(self):
+        # The nullable-source example ships with the pandas carrier and validates.
+        cfg = default_config("atl06_nullable")  # default_config runs validate_config
+        assert get_handoff(cfg) == "pandas"
 
 
 # ---------------------------------------------------------------------------
