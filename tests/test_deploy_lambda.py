@@ -71,10 +71,11 @@ def test_deploy_sequence(tmp_path):
     assert "lambda wait function-updated" in log[2]  # settle before code update
     assert "lambda update-function-code" in log[3]
     assert f"fileb://{fn_zip}" in log[3]
-    # Async-invoke hygiene (issue #151): retries pinned to 0, bounded event age.
+    # Async-invoke hygiene (issue #151): retries pinned to 0, event age under
+    # the runner's poll margin (see ProcessFnAsyncConfig in template.yaml).
     assert "lambda put-function-event-invoke-config" in log[4]
     assert "--maximum-retry-attempts 0" in log[4]
-    assert "--maximum-event-age-in-seconds 900" in log[4]
+    assert "--maximum-event-age-in-seconds 60" in log[4]
 
 
 def test_event_invoke_config_failure_is_nonfatal(tmp_path):

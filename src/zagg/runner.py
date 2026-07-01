@@ -1116,8 +1116,19 @@ def _poll_lambda_result(
     if poll_timeout_s is None:
         poll_timeout_s = _DEFAULT_FUNCTION_TIMEOUT_S + _ASYNC_POLL_MARGIN_S
     deadline = wall_start + poll_timeout_s
+    fetch_error = None
     while True:
-        result = result_fetch()
+        # A fetch fault (S3 blip, throttled GET) must NOT escape into the
+        # invoke retry classifier -- re-dispatching a still-running shard
+        # duplicates work and cost. Treat it as a miss and keep polling; a
+        # *persistent* fault (e.g. missing s3:GetObject) surfaces in the
+        # deadline error below instead of masquerading as a worker crash.
+        try:
+            result = result_fetch()
+            fetch_error = None
+        except Exception as e:
+            fetch_error = e
+            result = None
         if result is not None:
             try:
                 body = json.loads(result.get("body", "{}"))
@@ -1135,17 +1146,18 @@ def _poll_lambda_result(
                 "granule_count": granule_count,
             }
         if time.time() >= deadline:
+            cause = (
+                f"result fetch failing: {fetch_error}"
+                if fetch_error is not None
+                else "worker timeout, OOM, or crash before writing its result -- check CloudWatch"
+            )
             return {
                 "shard_key": shard_key,
                 "status_code": None,
                 "body": {},
                 "wall_time": time.time() - wall_start,
                 "lambda_duration": 0,
-                "error": (
-                    f"no worker result within {poll_timeout_s:.0f}s (worker "
-                    "timeout, OOM, or crash before writing its result -- "
-                    "check CloudWatch)"
-                ),
+                "error": f"no worker result within {poll_timeout_s:.0f}s ({cause})",
                 "retries": retries,
                 "granule_count": granule_count,
             }
