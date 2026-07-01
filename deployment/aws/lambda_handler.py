@@ -50,6 +50,17 @@ Finalize mode (consolidates zarr metadata after all cells complete):
     "output_credentials": dict (optional, same shape as process mode),
 }
 
+Extract mode (chunk-boundary geometry extraction, issue #148 — one parquet per
+granule under an S3 prefix; a batch of granules per invocation for the fan-out):
+{
+    "mode": "extract",
+    "granule_urls": [str, ...],
+    "output_prefix": str,       # e.g. "s3://bucket/boundaries/" (execution role writes)
+    "s3_credentials": dict,     # same shape as process mode (NSIDC read side)
+    "driver": "s3" | "https" (optional, default "s3"),
+    "block_chunks": int (optional, chunks per streamed read),
+}
+
 Setup and finalize exist so callers without direct S3 write access to the
 output bucket (e.g. cross-account JupyterHub orchestrators) can run the
 full pipeline using only lambda:InvokeFunction.
@@ -230,14 +241,73 @@ def lambda_handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
     """Dispatch on event mode.
 
     Default ``mode`` (or no mode) runs per-cell processing. ``mode="setup"``
-    creates the zarr template; ``mode="finalize"`` consolidates metadata.
+    creates the zarr template; ``mode="finalize"`` consolidates metadata;
+    ``mode="extract"`` extracts chunk-boundary geometry parquets (issue #148).
     """
     mode = event.get("mode", "process")
     if mode == "setup":
         return _handle_setup(event)
     if mode == "finalize":
         return _handle_finalize(event)
+    if mode == "extract":
+        return _handle_extract(event, context)
     return _handle_process(event, context)
+
+
+def _handle_extract(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
+    """Chunk-boundary geometry extraction (issue #148).
+
+    Runs as a mode of the existing function (no second CFN function — same
+    layer, role, memory, and the shared ``Timeout``) so the fan-out is just
+    many ``mode="extract"`` invocations, each over a batch of granules. The
+    body lives in :mod:`zagg.catalog.extract` (layer-safe: h5coro + pandas +
+    fastparquet only); per-granule ``wall_s`` in the response feeds the
+    full-catalog cost estimate the issue asks for.
+    """
+    from zagg.catalog.extract import run_extraction
+
+    t0 = time.time()
+    missing = [p for p in ("granule_urls", "output_prefix", "s3_credentials") if p not in event]
+    if missing:
+        error_msg = f"Missing required parameters: {', '.join(missing)}"
+        logger.error(error_msg)
+        return {"statusCode": 400, "body": json.dumps({"error": error_msg, "mode": "extract"})}
+
+    driver = event.get("driver", "s3")
+    s3_creds = event["s3_credentials"]
+    if driver == "https":
+        credentials = s3_creds.get("edl_token", s3_creds)
+    else:
+        credentials = {
+            "aws_access_key_id": s3_creds.get("accessKeyId"),
+            "aws_secret_access_key": s3_creds.get("secretAccessKey"),
+            "aws_session_token": s3_creds.get("sessionToken"),
+        }
+
+    try:
+        kwargs = {}
+        if "block_chunks" in event:
+            kwargs["block_chunks"] = int(event["block_chunks"])
+        results = run_extraction(
+            event["granule_urls"],
+            event["output_prefix"],
+            driver=driver,
+            credentials=credentials,
+            **kwargs,
+        )
+        n_failed = sum(1 for r in results if not r["ok"])
+        body = {
+            "mode": "extract",
+            "granules": results,
+            "granule_count": len(results),
+            "failed": n_failed,
+            "duration_s": round(time.time() - t0, 3),
+            "max_memory_mb": _max_memory_mb(),
+        }
+        return {"statusCode": 200 if n_failed == 0 else 500, "body": json.dumps(body)}
+    except Exception as e:
+        logger.exception(e)
+        return {"statusCode": 500, "body": json.dumps({"error": str(e), "mode": "extract"})}
 
 
 def _handle_setup(event: Dict[str, Any]) -> Dict[str, Any]:

@@ -912,3 +912,102 @@ class TestPeakRSSSampler:
         s.stop()
         assert s.peak_mb is None
         assert s._thread is None  # never spawned
+
+
+class TestExtractMode:
+    """mode="extract" (issue #148): chunk-boundary geometry extraction."""
+
+    def _event(self, **over):
+        ev = {
+            "mode": "extract",
+            "granule_urls": ["s3://bucket/ATL03_a.h5"],
+            "output_prefix": "s3://out/boundaries/",
+            "s3_credentials": _CREDS,
+        }
+        ev.update(over)
+        return ev
+
+    def test_missing_params_rejected(self, handler_mod):
+        result = handler_mod.lambda_handler({"mode": "extract"}, _context())
+        assert result["statusCode"] == 400
+        body = json.loads(result["body"])
+        assert "granule_urls" in body["error"]
+        assert "output_prefix" in body["error"]
+
+    def test_dispatch_maps_credentials_and_returns_summary(self, handler_mod, monkeypatch):
+        import zagg.catalog.extract as ext
+
+        captured = {}
+
+        def fake_run(urls, prefix, *, driver, credentials, **kw):
+            captured.update(urls=urls, prefix=prefix, driver=driver, credentials=credentials)
+            return [
+                {
+                    "granule": "ATL03_a.h5",
+                    "ok": True,
+                    "wall_s": 1.5,
+                    "n_chunks": 3,
+                    "output": f"{prefix}ATL03_a.boundaries.parquet",
+                }
+            ]
+
+        monkeypatch.setattr(ext, "run_extraction", fake_run)
+        result = handler_mod.lambda_handler(self._event(), _context())
+        assert result["statusCode"] == 200
+        body = json.loads(result["body"])
+        assert body["mode"] == "extract"
+        assert body["granule_count"] == 1 and body["failed"] == 0
+        assert body["granules"][0]["wall_s"] == 1.5  # per-granule cost datum (#148)
+        assert body["duration_s"] >= 0 and body["max_memory_mb"] > 0
+        # process-mode creds are remapped to h5coro's kwargs, s3 driver default.
+        assert captured["driver"] == "s3"
+        assert captured["credentials"] == {
+            "aws_access_key_id": "a",
+            "aws_secret_access_key": "s",
+            "aws_session_token": "t",
+        }
+
+    def test_https_driver_uses_edl_token(self, handler_mod, monkeypatch):
+        import zagg.catalog.extract as ext
+
+        captured = {}
+
+        def fake_run(urls, prefix, *, driver, credentials, **kw):
+            captured.update(driver=driver, credentials=credentials)
+            return []
+
+        monkeypatch.setattr(ext, "run_extraction", fake_run)
+        ev = self._event(driver="https", s3_credentials={"edl_token": "tok"})
+        handler_mod.lambda_handler(ev, _context())
+        assert captured == {"driver": "https", "credentials": "tok"}
+
+    def test_partial_failure_maps_to_500(self, handler_mod, monkeypatch):
+        import zagg.catalog.extract as ext
+
+        monkeypatch.setattr(
+            ext,
+            "run_extraction",
+            lambda *a, **k: [
+                {"granule": "a.h5", "ok": True, "wall_s": 1.0, "n_chunks": 2, "output": "x"},
+                {"granule": "b.h5", "ok": False, "error": "boom"},
+            ],
+        )
+        result = handler_mod.lambda_handler(
+            self._event(granule_urls=["s3://b/a.h5", "s3://b/b.h5"]), _context()
+        )
+        assert result["statusCode"] == 500
+        body = json.loads(result["body"])
+        assert body["failed"] == 1 and body["granule_count"] == 2
+
+    def test_block_chunks_forwarded(self, handler_mod, monkeypatch):
+        import zagg.catalog.extract as ext
+
+        captured = {}
+
+        def fake_run(urls, prefix, *, driver, credentials, **kw):
+            captured.update(kw)
+            return []
+
+        monkeypatch.setattr(ext, "run_extraction", fake_run)
+        handler_mod.lambda_handler(self._event(block_chunks=4), _context())
+        assert captured == {"block_chunks": 4}
