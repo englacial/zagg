@@ -1,0 +1,14 @@
+# Linux arm64 benchmark environment for the h5coro read-path investigation
+# (issue #149). Replay needs only numpy + h5coro; zagg itself is not imported
+# by bench_replay.py. Runs natively (no qemu) on Apple Silicon via podman.
+#
+#   podman build -t zagg-bench-h5coro -f bench/h5coro/Containerfile bench/h5coro
+#   podman run --rm -v "$PWD":/work -v ~/ignore/zagg_neon_atl03_test_shard/granules:/granules:ro \
+#       zagg-bench-h5coro python /work/bench/h5coro/bench_replay.py \
+#       --requests /work/bench/h5coro/requests/o10.json --granule-dir /granules \
+#       --variant h5coro-1.0.4-linux --baseline /work/bench/h5coro/results/checksums_o10.json
+FROM python:3.12-slim
+
+RUN pip install --no-cache-dir numpy "h5coro==1.0.4" py-spy
+
+WORKDIR /work

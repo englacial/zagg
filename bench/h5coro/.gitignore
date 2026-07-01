@@ -1,0 +1,3 @@
+# binary cProfile dumps are re-derivable (bench_replay.py --profile); keep the
+# bucketed profile_*.json summaries in git instead
+results/*.pstats

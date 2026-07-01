@@ -1,0 +1,13 @@
+{
+ "total_s": 139.616,
+ "inflate": 1.616,
+ "shuffle": 97.096,
+ "btree": 0.514,
+ "slice_assembly": 2.712,
+ "metadata": 0.195,
+ "field_unpack": 0.484,
+ "zlib_c": 21.382,
+ "file_io": 3.571,
+ "np_convert": 0.018,
+ "other": 12.027
+}
