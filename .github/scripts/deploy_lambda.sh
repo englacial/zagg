@@ -48,13 +48,15 @@ aws lambda update-function-code \
 # Async-invoke hygiene (issue #151): the runner dispatches with
 # InvocationType=Event and polls for worker-written results; Lambda's async
 # defaults would re-run a timed-out/OOM'd shard twice with delays, so pin
-# retries to 0 and bound queued-event age to the runner's poll window
-# (mirrors ProcessFnAsyncConfig in deployment/aws/template.yaml). Warn-only:
-# the deploy role may not yet carry lambda:PutFunctionEventInvokeConfig, and
-# the pipeline still works (just noisier on worker crashes) without it.
+# retries to 0, and keep event age under the runner's 90 s poll margin so no
+# delivery starts after the runner stops listening (mirrors
+# ProcessFnAsyncConfig in deployment/aws/template.yaml -- keep in sync).
+# Warn-only: the deploy role may not yet carry
+# lambda:PutFunctionEventInvokeConfig, and the pipeline still works (just
+# noisier on worker crashes) without it.
 aws lambda put-function-event-invoke-config \
   --function-name "$FUNCTION" --maximum-retry-attempts 0 \
-  --maximum-event-age-in-seconds 900 --region "$REGION" \
+  --maximum-event-age-in-seconds 60 --region "$REGION" \
   || echo "WARN: could not set event-invoke config on $FUNCTION (needs lambda:PutFunctionEventInvokeConfig); async service retries stay at the default" >&2
 
 echo "deployed $FUNCTION (layer $LAYER_ARN)"

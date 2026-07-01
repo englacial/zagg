@@ -172,18 +172,23 @@ Resources:
         S3Key: !Ref FunctionS3Key
 
   # Async-invoke hygiene (issue #151): the runner dispatches per-cell events
-  # with InvocationType=Event and polls for the worker-written result object.
-  # Lambda's async defaults would re-run a timed-out/OOM'd shard twice with
-  # delays -- re-failing deterministic failures at extra cost and risking late
-  # writes into a store the caller has moved on from -- so pin retries to 0 and
-  # bound queued-event age to the runner's poll window (Timeout + margin).
+  # with InvocationType=Event and polls for the worker-written result object
+  # until Timeout + a 90 s margin. Lambda's async defaults would re-run a
+  # timed-out/OOM'd shard twice with delays -- re-failing deterministic
+  # failures at extra cost and risking late writes into a store the caller has
+  # moved on from -- so pin retries to 0. Event age must stay UNDER the poll
+  # margin so no first delivery can start after the runner stops listening (a
+  # late run would write into the store post-finalize); 60 is the API minimum
+  # and leaves >=30 s of the margin for the result write. A delivery delayed
+  # past it is dropped and the runner records the shard failed at its
+  # deadline -- strictly better than a zombie write.
   ProcessFnAsyncConfig:
     Type: AWS::Lambda::EventInvokeConfig
     Properties:
       FunctionName: !Ref ProcessFn
       Qualifier: "$LATEST"
       MaximumRetryAttempts: 0
-      MaximumEventAgeInSeconds: 900
+      MaximumEventAgeInSeconds: 60
 
 Outputs:
   FunctionArn:

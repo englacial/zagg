@@ -673,6 +673,24 @@ class TestInvokeLambdaCellAsync:
         assert result["status_code"] == 500
         assert result["error"] == "Failed to write zarr"
 
+    def test_fetch_fault_is_contained_not_reinvoked(self):
+        # A poll-side fault (S3 blip / missing s3:GetObject) must never escape
+        # into the invoke retry classifier -- that would re-dispatch a shard
+        # that is still running. It's treated as a miss; at the deadline the
+        # persistent cause is surfaced instead of a phantom "worker crash".
+        from unittest.mock import MagicMock
+
+        client = MagicMock()
+        client.invoke.return_value = {"StatusCode": 202}
+
+        def denied():
+            raise Exception("PermissionDenied: s3:GetObject")
+
+        result = self._invoke(client, denied, max_retries=5, poll_timeout_s=0.0)
+        assert client.invoke.call_count == 1  # never re-dispatched
+        assert "no worker result within" in result["error"]
+        assert "PermissionDenied" in result["error"]
+
     def test_transient_dispatch_error_still_retried(self, monkeypatch):
         from unittest.mock import MagicMock
 
