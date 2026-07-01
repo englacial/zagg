@@ -12,7 +12,52 @@ Call ONCE in the orchestrator before processing. Credentials are valid
 for approximately 1 hour.
 """
 
+import logging
+import time
+
 import earthaccess
+
+logger = logging.getLogger(__name__)
+
+# ``earthaccess.login()`` makes an HTTPS call to ``urs.earthdata.nasa.gov`` to
+# validate/mint credentials, and that call fails transiently on CI runners -- an
+# IPv6 no-route (``OSError: [Errno 101] Network is unreachable``, addressed at the
+# resolver level in the benchmark workflow, issue #137) or a brief network blip.
+# A bounded retry/backoff lets a genuinely transient failure self-heal instead of
+# taking down the whole run/benchmark on the first attempt (issue #137).
+_LOGIN_MAX_ATTEMPTS = 3
+_LOGIN_BACKOFF_BASE_S = 2.0
+
+
+def _login_with_retry():
+    """Return an authenticated ``earthaccess`` session, retrying transient failures.
+
+    Retries ``earthaccess.login()`` up to ``_LOGIN_MAX_ATTEMPTS`` with exponential
+    backoff (2s, 4s, ...) on ``OSError``. That base class covers both the bare
+    ``OSError: [Errno 101]`` no-route *and* ``requests.exceptions.ConnectionError``
+    (which subclasses ``IOError``/``OSError``), i.e. the connection/timeout family
+    the login can raise. The final attempt's exception propagates unchanged, so a
+    genuine, persistent auth failure still surfaces rather than being masked.
+    """
+    last_exc: OSError | None = None
+    for attempt in range(1, _LOGIN_MAX_ATTEMPTS + 1):
+        try:
+            return earthaccess.login()
+        except OSError as exc:
+            last_exc = exc
+            if attempt == _LOGIN_MAX_ATTEMPTS:
+                break
+            backoff = _LOGIN_BACKOFF_BASE_S * (2 ** (attempt - 1))
+            logger.warning(
+                "earthaccess.login() failed (attempt %d/%d): %s; retrying in %.0fs",
+                attempt,
+                _LOGIN_MAX_ATTEMPTS,
+                exc,
+                backoff,
+            )
+            time.sleep(backoff)
+    assert last_exc is not None  # loop ran >=1 time and every attempt failed
+    raise last_exc
 
 
 def get_edl_token() -> str:
@@ -26,7 +71,7 @@ def get_edl_token() -> str:
     str
         Bearer token string.
     """
-    auth = earthaccess.login()
+    auth = _login_with_retry()
     return auth.token["access_token"]
 
 
@@ -62,5 +107,5 @@ def get_nsidc_s3_credentials() -> dict:
     }
     ```
     """
-    auth = earthaccess.login()
+    auth = _login_with_retry()
     return auth.get_s3_credentials(daac="NSIDC")
