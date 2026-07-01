@@ -163,11 +163,20 @@ jobs:
           pr-number: ${{ needs.check.outputs.pr_number }}
           worker-note: ${{ needs.check.outputs.worker_note }}
 
+      # always(): a silent-OOM target now fails the benchmark step (--fail-on-empty,
+      # issue #145), but the maintainer who ran /benchmark should still see WHY --
+      # the just-written comment.md carries the obs=0 row. Skip cleanly if the run
+      # died before writing it (e.g. login failure -> no comment to post).
       - name: Upsert PR comment
+        if: always()
         uses: actions/github-script@v7
         with:
           script: |
             const fs = require('fs');
+            if (!fs.existsSync('comment.md')) {
+              core.info('no comment.md (benchmark did not get far enough); skipping');
+              return;
+            }
             const body = fs.readFileSync('comment.md', 'utf8');
             const marker = '<!-- zagg-benchmark -->';
             const { owner, repo } = context.repo;
