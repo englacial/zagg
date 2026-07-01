@@ -94,16 +94,19 @@ def _max_memory_mb() -> float:
 
 
 def _reclaim_memory() -> None:
-    """Return freed heap to the OS at invocation teardown (issue #139).
+    """Reclaim Python objects at invocation teardown (issues #139, #143).
 
-    Lambda reuses warm containers, and neither CPython's pymalloc arenas nor
-    glibc's malloc heap hand freed memory back to the OS on their own, so a
-    subsequent invocation on a warm container starts near the *previous*
-    invocation's RSS high-water and can OOM (``Max Memory Used`` is
-    per-container-lifetime). A ``gc.collect()`` reclaims unreachable Python
-    objects but does NOT drop RSS by itself; glibc's ``malloc_trim(0)`` releases
-    the freed top-of-heap back to the OS, so the next invocation on the same
-    container starts near baseline.
+    Lambda reuses warm containers, so a subsequent invocation on a warm
+    container starts near the *previous* invocation's RSS and can OOM
+    (``Max Memory Used`` is per-container-lifetime). The reliable fix for the
+    glibc-arena retention that drives this is the allocator env vars set on the
+    function itself (``MALLOC_ARENA_MAX``/``MALLOC_TRIM_THRESHOLD_`` in
+    ``template.yaml``, issue #143) -- those take effect at libc init and flatten
+    warm-container growth to ~0. The ``malloc_trim(0)`` below is retained as a
+    harmless secondary: it only trims the top of the main arena, so on its own
+    it does *not* reliably return the retained secondary-arena numpy blocks
+    (hence the env-var fix supersedes it as the primary mechanism), but the
+    ``gc.collect()`` still reclaims unreachable Python objects.
 
     Called once per invocation (O(heap) -- negligible next to read/aggregate/
     write) and behavior-neutral: it only frees memory the invocation is done
