@@ -1,0 +1,28 @@
+# Linux arm64 build/run environment for the sliderule C++ H5Coro shim
+# (phase 3 of issue #149). Extends the replay image (python:3.12-slim +
+# numpy + h5coro==1.0.4) with the toolchain and the deps of a *minimal*
+# sliderule build: packages/core needs Lua 5.3 + libcurl + RapidJSON +
+# readline; packages/h5coro needs zlib; everything else is toggled OFF
+# (see shim/build.sh for the exact cmake flags).
+#
+# The sliderule sources themselves are NOT baked into this image: build.sh
+# mounts the host clone read-only, copies it to a writable scratch mount and
+# applies sliderule-minimal-build.patch there (host clone never modified).
+# The patch (rationale per hunk in its header) covers: exposing the private
+# Asset ctor/attributes_t for the shim, linking libuuid in core (hence
+# uuid-dev below), and #ifdef-guarding cross-package code in core that does
+# not compile with the aws/geo packages toggled OFF.
+#
+#   podman build -t zagg-bench-shim -f bench/h5coro/shim/Containerfile.shim bench/h5coro/shim
+#   bash bench/h5coro/shim/build.sh all     # build + smoke + replay (o10, o9)
+FROM zagg-bench-h5coro
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        cmake g++ make patch \
+        liblua5.3-dev libcurl4-openssl-dev rapidjson-dev libreadline-dev zlib1g-dev \
+        uuid-dev \
+    && rm -rf /var/lib/apt/lists/*
+
+RUN pip install --no-cache-dir pybind11
+
+WORKDIR /work

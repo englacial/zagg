@@ -21,6 +21,9 @@ repos:
       - id: check-yaml
         exclude: mkdocs.yml
       - id: trailing-whitespace
+        # diff context lines in staged patch files carry meaningful trailing
+        # whitespace; "fixing" them corrupts the patch
+        exclude: '\.patch$'
   - repo: https://github.com/pre-commit/mirrors-mypy
     rev: v1.19.1
     hooks:

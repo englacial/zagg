@@ -1,0 +1,136 @@
+sliderule minimal-build workarounds for the zagg h5coro benchmark shim
+(issue #149 phase 3). Applies with `patch -p1` at the sliderule source root;
+generated against sliderule v5.4.3 (ce4be309, 2026-06-16).
+
+Benchmark-only change:
+  * Asset.h — the Asset constructor and attributes_t sit in the classs single
+    private: section; the shim constructs an Asset directly (lua_State* == NULL,
+    which LuaObject tolerates), so that section becomes public.
+
+Minimal-build fixes (core does not compile with the aws/geo/... packages OFF;
+upstream evidently always builds with them ON):
+  * core/CMakeLists.txt — OutputLib.cpp uses uuid/uuid.h but only the geo
+    package links libuuid; link it in core.
+  * DeduplicateRunner.cpp — unguarded #include "GeoLib.h" (geo pkg), unused.
+  * EndpointObject.cpp — unguarded #include "SecretManager.h" (aws pkg); all
+    uses already sit under #ifdef __aws__.
+  * RequestParameters.cpp — samplers (FieldMap<GeoFields>) is declared under
+    #ifdef __geo__ in the header but used unguarded in the .cpp; guard the
+    three sampler lua methods, their meta-table entries, and the sampler
+    branches of luaExport/luaEncode.
+
+diff -ruN a/packages/core/CMakeLists.txt b/packages/core/CMakeLists.txt
+--- a/packages/core/CMakeLists.txt	2026-07-01 15:30:09
++++ b/packages/core/CMakeLists.txt	2026-07-01 15:30:09
+@@ -3,6 +3,7 @@
+ find_package (CURL REQUIRED)
+ find_package (RapidJSON REQUIRED)
+ find_library (READLINE_LIB readline REQUIRED)
++find_library (UUID_LIB uuid REQUIRED) # OutputLib.cpp uses uuid/uuid.h; upstream only links uuid via the geo package
+
+ # core
+ message (STATUS "Including core package")
+@@ -18,6 +19,9 @@
+
+ # rapidjson
+ target_include_directories (slideruleLib PUBLIC ${RapidJSON_INCLUDE_DIR})
++
++# uuid
++target_link_libraries (slideruleLib PUBLIC ${UUID_LIB})
+
+ # readline
+ target_compile_definitions (slideruleLib PUBLIC "$<$<CONFIG:Release>:LUA_USE_READLINE>")
+diff -ruN a/packages/core/package/Asset.h b/packages/core/package/Asset.h
+--- a/packages/core/package/Asset.h	2026-07-01 15:30:09
++++ b/packages/core/package/Asset.h	2026-07-01 15:30:09
+@@ -121,7 +121,7 @@
+         const char*     getIndex        (void) const;
+         const char*     getEndpoint     (void) const;
+
+-    private:
++    public: // PATCHED (zagg benchmark shim): expose Asset ctor + attributes_t
+
+         /*--------------------------------------------------------------------
+          * Constants
+diff -ruN a/packages/core/package/DeduplicateRunner.cpp b/packages/core/package/DeduplicateRunner.cpp
+--- a/packages/core/package/DeduplicateRunner.cpp	2026-07-01 15:30:09
++++ b/packages/core/package/DeduplicateRunner.cpp	2026-07-01 15:30:09
+@@ -39,7 +39,9 @@
+ #include <string_view>
+
+ #include "OsApi.h"
++#ifdef __geo__
+ #include "GeoLib.h"
++#endif
+ #include "DeduplicateRunner.h"
+
+ /******************************************************************************
+diff -ruN a/packages/core/package/EndpointObject.cpp b/packages/core/package/EndpointObject.cpp
+--- a/packages/core/package/EndpointObject.cpp	2026-07-01 15:30:09
++++ b/packages/core/package/EndpointObject.cpp	2026-07-01 15:30:09
+@@ -39,7 +39,9 @@
+ #include "EndpointObject.h"
+ #include "EventLib.h"
+ #include "OsApi.h"
++#ifdef __aws__
+ #include "SecretManager.h"
++#endif
+ #include "StringLib.h"
+ #include "SystemConfig.h"
+
+diff -ruN a/packages/core/package/RequestParameters.cpp b/packages/core/package/RequestParameters.cpp
+--- a/packages/core/package/RequestParameters.cpp	2026-07-01 15:30:09
++++ b/packages/core/package/RequestParameters.cpp	2026-07-01 15:30:09
+@@ -56,9 +56,11 @@
+     {"hasoutput",   luaHasOutput},
+     {"witharrow",   luaHasArrowOutput},
+     {"withlas",     luaHasLasOutput},
++#ifdef __geo__
+     {"samplers",    luaGetSamplers},
+     {"withsamplers",luaWithSamplers},
+     {"setcatalog",  luaSetCatalog},
++#endif
+     {NULL,          NULL}
+ };
+
+@@ -84,7 +86,11 @@
+         }
+         else
+         {
++#ifdef __geo__
+             lua_obj->samplers[sampler].toLua(L);
++#else
++            lua_pushnil(L);
++#endif
+         }
+     }
+     catch(const RunTimeException& e)
+@@ -113,8 +119,12 @@
+         }
+         else
+         {
++#ifdef __geo__
+             const string& json_str = lua_obj->samplers[sampler].toJson();
+             lua_pushstring(L, json_str.c_str());
++#else
++            lua_pushnil(L);
++#endif
+         }
+     }
+     catch(const RunTimeException& e)
+@@ -316,6 +326,7 @@
+     return 1;
+ }
+
++#ifdef __geo__
+ /*----------------------------------------------------------------------------
+  * luaGetSamplers
+  *----------------------------------------------------------------------------*/
+@@ -391,6 +402,7 @@
+     }
+     return returnLuaStatus(L, status);
+ }
++#endif
+
+ /*----------------------------------------------------------------------------
+  * polyIncludes

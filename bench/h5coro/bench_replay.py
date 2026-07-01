@@ -8,8 +8,9 @@ variant is hard-gated against them — a variant that returns different bytes
 fails, it does not get a benchmark row.
 
 Adapters: ``h5coro`` (the pure-Python package as installed — the current-code
-baseline or the numpy-patched comparable, depending on the active environment).
-Phase 3 adds ``shim`` (sliderule C++ via pybind11); phase 4 adds ``hidefix``.
+baseline or the numpy-patched comparable, depending on the active environment)
+and ``shim`` (sliderule C++ H5Coro via the pybind11 module in ``shim/``, built
+and run in a container by ``shim/build.sh``); phase 4 adds ``hidefix``.
 
 Usage (repo root)::
 
@@ -68,7 +69,31 @@ def _h5coro_read_granule(path: str, calls: list) -> dict:
     return out
 
 
-ADAPTERS = {"h5coro": _h5coro_read_granule}
+def _shim_read_granule(path: str, calls: list) -> dict:
+    # sliderule C++ H5Coro via the pybind11 shim (bench/h5coro/shim/); one
+    # Context per granule, so calls are flattened into a single request list
+    # (they run serially either way, and the h5coro adapter likewise shares
+    # one file handle per granule)
+    import h5shim
+
+    keys = []
+    requests = []
+    for ci, entries in enumerate(calls):
+        for e in entries:
+            hs = e["hyperslice"]
+            if hs is None:
+                requests.append((e["dataset"], None, None))
+            else:
+                # captured workloads only ever slice dimension 0 (row ranges);
+                # remaining dims are read in full by the shim
+                assert len(hs) == 1, f"unsupported hyperslice {hs} for {e['dataset']}"
+                requests.append((e["dataset"], int(hs[0][0]), int(hs[0][1])))
+            keys.append((ci, e["dataset"]))
+    arrays = h5shim.read(path, requests)
+    return dict(zip(keys, arrays, strict=True))
+
+
+ADAPTERS = {"h5coro": _h5coro_read_granule, "shim": _shim_read_granule}
 
 
 # ---------------------------------------------------------------------------
