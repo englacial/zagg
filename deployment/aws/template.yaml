@@ -88,7 +88,7 @@ Parameters:
       number of per-thread malloc arenas so freed numpy/glibc heap is returned
       to the OS between warm invocations instead of accumulating toward the
       memory cap. Must be set as an env var (it takes effect at libc init; a
-      runtime mallopt/malloc_trim from Python does not). Set empty to unset.
+      runtime mallopt/malloc_trim from Python does not). Set empty to fall back to the glibc default (the key is still emitted, just empty).
 
   MallocTrimThreshold:
     Type: String
@@ -96,7 +96,7 @@ Parameters:
     Description: >-
       glibc MALLOC_TRIM_THRESHOLD_ for the process function (issue #143). 0
       trims freed top-of-heap back to the OS immediately, independently
-      flattening warm-container memory growth. Set empty to unset.
+      flattening warm-container memory growth. Set empty to fall back to the glibc default (the key is still emitted, just empty).
 
 Conditions:
   ShouldCreateBucket: !Equals [!Ref CreateOutputBucket, "true"]
