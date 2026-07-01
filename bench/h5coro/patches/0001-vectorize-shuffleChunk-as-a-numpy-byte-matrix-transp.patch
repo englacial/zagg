@@ -1,0 +1,41 @@
+From 9b4778aa243f2293daa3d52a2f60830c59881810 Mon Sep 17 00:00:00 2001
+From: espg <refuge@rocktalus.com>
+Date: Wed, 1 Jul 2026 14:55:52 -0700
+Subject: [PATCH] vectorize shuffleChunk as a numpy byte-matrix transpose
+
+---
+ h5coro/h5dataset.py | 15 ++++++++-------
+ 1 file changed, 8 insertions(+), 7 deletions(-)
+
+diff --git a/h5coro/h5dataset.py b/h5coro/h5dataset.py
+index 5910454..0c34246 100644
+--- a/h5coro/h5dataset.py
++++ b/h5coro/h5dataset.py
+@@ -2183,16 +2183,17 @@ class H5Dataset:
+     def shuffleChunk(self, input, output_offset, output_size, type_size):
+         if self.resourceObject.errorChecking and (type_size < 0 or type_size > 8):
+             raise FatalError(f'invalid data size to perform shuffle on: {type_size}')
+-        output = bytearray(output_size)
+-        dst_index = 0
++        # the shuffle filter stores byte v of element e at input[v * block + e];
++        # undoing it is a transpose of the (type_size, block) byte matrix, windowed
++        # to the requested elements
+         shuffle_block_size = int(len(input) / type_size)
+         elements_to_shuffle = int(output_size / type_size)
+         start_element = int(output_offset / type_size)
+-        for element_index in range(start_element, start_element + elements_to_shuffle):
+-            for val_index in range(0, type_size):
+-                src_index = (val_index * shuffle_block_size) + element_index
+-                output[dst_index] = input[src_index]
+-                dst_index += 1
++        blocks = numpy.frombuffer(input, dtype=numpy.uint8, count=type_size * shuffle_block_size)
++        window = blocks.reshape(type_size, shuffle_block_size)[:, start_element:start_element + elements_to_shuffle]
++        output = window.transpose().tobytes()
++        if len(output) < output_size: # ragged tail: match the zero padding of bytearray(output_size)
++            output += bytes(output_size - len(output))
+         return output
+ 
+     #######################
+-- 
+2.50.1 (Apple Git-155)
+
