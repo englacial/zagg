@@ -61,8 +61,9 @@ import json
 import logging
 import os
 import resource
+import threading
 import time
-from typing import Any, Dict
+from typing import Any, Dict, Optional
 
 from zarr import open_group
 from zarr.errors import GroupNotFoundError
@@ -91,6 +92,75 @@ def _max_memory_mb() -> float:
     Memory Used" closely.
     """
     return resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / 1024.0
+
+
+def _read_vmrss_kib() -> Optional[int]:
+    """Current resident set size in KiB from ``/proc/self/status``, or None off Linux.
+
+    ``VmRSS`` is the process's *current* RSS (not a high-water mark), reported in
+    KiB. Returns None when ``/proc/self/status`` is absent/unreadable (macOS/dev),
+    so callers fall back to ``ru_maxrss``.
+    """
+    try:
+        with open("/proc/self/status") as f:
+            for line in f:
+                if line.startswith("VmRSS:"):
+                    return int(line.split()[1])  # "VmRSS:\t   12345 kB"
+    except (OSError, ValueError, IndexError):
+        return None
+    return None
+
+
+class _PeakRSSSampler:
+    """Sample THIS invocation's peak current RSS on a daemon thread (issue #141).
+
+    ``ru_maxrss`` is a per-*process* high-water mark, so on a warm/reused Lambda
+    container it reports the max over every prior invocation, not this one --
+    making ``max_memory_mb`` untrustworthy on warm containers (it can only ever
+    rise, so it also can't reflect #140's teardown reclaim). This polls the
+    *current* RSS (``VmRSS``) at a fixed interval and records the max while it
+    runs, so the reported peak reflects the current invocation. #140's teardown
+    ``malloc_trim`` returns current RSS to ~baseline between invokes, so a warm
+    container starts each invocation low and the sampled peak is clean.
+
+    Off Linux (no ``/proc/self/status``) it degrades to a no-op and ``peak_mb`` is
+    None, so the caller falls back to ``ru_maxrss``. Sampling overhead is one small
+    file read per tick -- negligible next to read/aggregate/write.
+    """
+
+    def __init__(self, interval_s: float = 0.05):
+        self._interval_s = interval_s
+        self._stop = threading.Event()
+        self._thread: Optional[threading.Thread] = None
+        self._peak_kib = 0
+        self._available = _read_vmrss_kib() is not None
+
+    def start(self) -> "_PeakRSSSampler":
+        if self._available:
+            self._thread = threading.Thread(target=self._run, name="peak-rss", daemon=True)
+            self._thread.start()
+        return self
+
+    def stop(self) -> None:
+        self._stop.set()
+        if self._thread is not None:
+            self._thread.join(timeout=1.0)
+
+    def _run(self) -> None:
+        # Sample immediately, then every interval until stopped.
+        while True:
+            cur = _read_vmrss_kib()
+            if cur is not None and cur > self._peak_kib:
+                self._peak_kib = cur
+            if self._stop.wait(self._interval_s):
+                return
+
+    @property
+    def peak_mb(self) -> Optional[float]:
+        """Peak sampled RSS in MB, or None if unavailable (fall back to ru_maxrss)."""
+        if not self._available or self._peak_kib == 0:
+            return None
+        return self._peak_kib / 1024.0
 
 
 def _reclaim_memory() -> None:
@@ -241,6 +311,11 @@ def _handle_process(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
             }
         )
     )
+
+    # Per-invocation peak-RSS sampler (issue #141): sample current VmRSS on a
+    # daemon thread for the whole invocation so ``max_memory_mb`` reflects THIS
+    # run, not the warm container's lifetime high-water. Stopped in ``finally``.
+    rss_sampler = _PeakRSSSampler().start()
 
     try:
         # Validate required parameters. ``child_order`` is HEALPix-specific and
@@ -434,10 +509,18 @@ def _handle_process(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
         if profile and not metadata.get("error") and "phase_timings" in metadata and store_box:
             metadata["phase_timings"]["write"] = _write_elapsed
 
-        # Peak worker RSS (issue #120): captured here, after the write phase, so
-        # it covers the full invocation. Threaded back via the result body so the
-        # orchestrator can surface OOM-proximity without CloudWatch access.
-        metadata["max_memory_mb"] = _max_memory_mb()
+        # Peak worker RSS (issues #120, #141): captured here, after the write phase,
+        # so it covers the full invocation. ``max_memory_mb`` is the per-invocation
+        # sampled peak (``VmRSS``), trustworthy on warm containers; ``ru_maxrss`` is
+        # kept as ``container_hwm_mb`` (the container-lifetime high-water) so the
+        # distinction is explicit. Off Linux the sampler is a no-op, so fall back to
+        # ``ru_maxrss``. Threaded back via the result body so the orchestrator can
+        # surface OOM-proximity without CloudWatch access.
+        metadata["container_hwm_mb"] = _max_memory_mb()
+        sampled_peak = rss_sampler.peak_mb
+        metadata["max_memory_mb"] = (
+            sampled_peak if sampled_peak is not None else metadata["container_hwm_mb"]
+        )
 
         # Log structured result
         logger.info(
@@ -485,6 +568,9 @@ def _handle_process(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
             ),
         }
     finally:
+        # Stop the per-invocation RSS sampler (issue #141) before the teardown
+        # reclaim, so its thread isn't sampling while ``malloc_trim`` runs.
+        rss_sampler.stop()
         # Warm-container memory reclaim (issue #139): once per invocation, after
         # the write completes and the buffers above are dropped, hand freed heap
         # back to the OS so the next invoke on this warm container starts near
