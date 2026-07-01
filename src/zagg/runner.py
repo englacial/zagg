@@ -691,9 +691,14 @@ def _run_lambda(
         # Configure the dispatch boto3 client. max_pool_connections is sized to
         # the clamped worker count so connections cannot outrun the
         # file-descriptor budget. Built here (not before) so the pool tracks
-        # the probe's clamp.
+        # the probe's clamp. read_timeout must exceed the function Timeout
+        # (900 s since issue #148 — the Lambda ceiling) with headroom, or a
+        # shard running to the ceiling trips the client-side botocore read
+        # timeout first: that matches the retryable "Read timeout" pattern, so
+        # a deterministic function timeout would be re-invoked (and re-billed)
+        # instead of surfacing as the Lambda's own "Task timed out" error.
         boto_config = Config(
-            read_timeout=900,
+            read_timeout=960,
             connect_timeout=10,
             retries={"max_attempts": 0},
             max_pool_connections=clamped,
