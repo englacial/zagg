@@ -202,6 +202,72 @@ class TestProcessEventDispatch:
         assert body["max_memory_mb"] > 0.0
 
 
+class TestReclaimMemory:
+    """Issue #139: each invocation hands freed heap back to the OS at teardown so
+    a warm-container reuse starts near baseline instead of the prior invocation's
+    RSS high-water. The reclaim runs once per invocation in a ``finally`` (both
+    the success and unhandled-exception paths)."""
+
+    def test_reclaim_memory_never_raises(self, handler_mod):
+        # The helper is guarded: on a non-glibc dev host (no libc.so.6) or a libc
+        # lacking malloc_trim it must be a silent no-op, never an exception.
+        handler_mod._reclaim_memory()  # would raise on the dev platform if unguarded
+
+    def test_success_path_calls_reclaim_once(self, handler_mod, monkeypatch):
+        import zagg.grids as grids
+        import zagg.processing as processing
+
+        calls = {"n": 0}
+        monkeypatch.setattr(
+            handler_mod, "_reclaim_memory", lambda: calls.__setitem__("n", calls["n"] + 1)
+        )
+
+        def fake_process_shard(grid, shard_key, granule_urls, **kwargs):
+            meta = {
+                "shard_key": shard_key,
+                "cells_with_data": 0,
+                "total_obs": 0,
+                "granule_count": len(granule_urls),
+                "files_processed": 0,
+                "duration_s": 0.0,
+                "error": None,
+            }
+            return pd.DataFrame(), meta
+
+        monkeypatch.setattr(processing, "process_shard", fake_process_shard)
+        monkeypatch.setattr(grids, "from_config", lambda *a, **k: MagicMock())
+
+        event = _base_event(_healpix_config_dict())
+        event["child_order"] = 12
+        resp = handler_mod._handle_process(event, _context())
+        assert resp["statusCode"] == 200
+        assert calls["n"] == 1
+
+    def test_reclaim_runs_on_exception_path(self, handler_mod, monkeypatch):
+        # An unhandled error mid-invocation must still trigger the teardown reclaim
+        # (it lives in a ``finally``), so a crashed warm invocation doesn't strand
+        # its high-water for the next one.
+        import zagg.grids as grids
+        import zagg.processing as processing
+
+        calls = {"n": 0}
+        monkeypatch.setattr(
+            handler_mod, "_reclaim_memory", lambda: calls.__setitem__("n", calls["n"] + 1)
+        )
+
+        def boom(*a, **k):
+            raise RuntimeError("kaboom")
+
+        monkeypatch.setattr(processing, "process_shard", boom)
+        monkeypatch.setattr(grids, "from_config", lambda *a, **k: MagicMock())
+
+        event = _base_event(_healpix_config_dict())
+        event["child_order"] = 12
+        resp = handler_mod._handle_process(event, _context())
+        assert resp["statusCode"] == 500
+        assert calls["n"] == 1
+
+
 class TestProcessEventWriteLoop:
     """Issue #82 phase 7: the handler drives ``process_shard`` with a
     ``chunk_results`` sink and writes each chunk's dense region (at its own
