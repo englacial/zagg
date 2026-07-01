@@ -77,16 +77,15 @@ Every dataset in both workloads read correctly — **no unreadable datasets**:
 | variant | requests | wall_s | cpu_s | max_rss_mb | correctness |
 |---|---|---|---|---|---|
 | h5coro-1.0.4-linux-arm64 (baseline) | o10 | 93.5 | 98.2 | 248 | pass |
-| **hidefix-0.12.0-linux-arm64** | o10 | **16.0** | 16.4 | 155 | pass |
+| **hidefix-0.12.0-linux-arm64** | o10 | **15.5** | 16.1 | 155 | pass |
 | h5coro-1.0.4-linux-arm64 (baseline) | o9 | 129.0 | 133.6 | 282 | pass |
-| **hidefix-0.12.0-linux-arm64** | o9 | **24.0** | 23.1 | 162 | pass |
+| **hidefix-0.12.0-linux-arm64** | o9 | **20.8** | 20.9 | 161 | pass |
 
-≈ **5.8× (o10) / 5.4× (o9)** faster than h5coro 1.0.4, at ~55–60% of the RSS.
-(Baseline rows are the post-fold re-measured ones — read windows only, gate
-cost excluded; the hidefix walls above still include ~1 s of gate cost and
-slightly *understate* hidefix — they'll be re-measured with the aligned
-timing window in the phase-5 canonical pass.) macOS host reference rows (not
-primary): o10 13.3 s, o9 16.1 s vs h5coro 84.8 s / 116.5 s.
+≈ **6.0× (o10) / 6.2× (o9)** faster than h5coro 1.0.4, at ~55–60% of the RSS.
+(All four rows use the aligned read-window timing — index build + reads timed,
+checksum gate excluded and reported as `gate_s`; hidefix rows re-measured in
+the phase-5 canonical pass.) macOS host reference rows (not primary): o10
+13.3 s, o9 16.1 s vs h5coro 84.8 s / 116.5 s.
 
 **Where hidefix's time goes**: index build dominates. Of the 16.0 s o10 wall,
 10.2 s is `hidefix.Index()` construction (the metadata/B-tree walk, hidefix's
@@ -150,7 +149,7 @@ linux-arm64 container:
 ## Verdict
 
 - **(a) as the compiled reader**: works today — full coverage and byte-exact
-  correctness on this workload, 5.4–5.8× wall over h5coro 1.0.4, native
+  correctness on this workload, 6.0–6.2× wall over h5coro 1.0.4, native
   hyperslices, lower RSS. Costs to weigh: no linux-aarch64 wheel (source
   build with Rust in the Lambda layer pipeline, or vendor a wheel), heavy pip
   deps (xarray/netcdf4/pandas), LGPL-3.0, local-file API only (no
