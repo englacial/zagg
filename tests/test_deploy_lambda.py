@@ -62,7 +62,7 @@ def test_deploy_sequence(tmp_path):
         env=env,
     )
     log = (tmp_path / "aws.log").read_text().splitlines()
-    # Four calls, in order.
+    # Five calls, in order.
     assert "lambda publish-layer-version" in log[0]
     assert "process-shard-test-deps" in log[0]  # layer named after the function
     assert "S3Key=lambda-test/abc/lambda_layer_arm64.zip" in log[0]
@@ -71,6 +71,45 @@ def test_deploy_sequence(tmp_path):
     assert "lambda wait function-updated" in log[2]  # settle before code update
     assert "lambda update-function-code" in log[3]
     assert f"fileb://{fn_zip}" in log[3]
+    # Async-invoke hygiene (issue #151): retries pinned to 0, bounded event age.
+    assert "lambda put-function-event-invoke-config" in log[4]
+    assert "--maximum-retry-attempts 0" in log[4]
+    assert "--maximum-event-age-in-seconds 900" in log[4]
+
+
+def test_event_invoke_config_failure_is_nonfatal(tmp_path):
+    # issue #151: the deploy role may not yet carry
+    # lambda:PutFunctionEventInvokeConfig; a denied config call must warn, not
+    # fail the deploy (the pipeline works without it, just with default async
+    # service retries).
+    if shutil.which("bash") is None:
+        pytest.skip("bash unavailable")
+    bindir = tmp_path / "bin"
+    bindir.mkdir()
+    (bindir / "aws").write_text(
+        STUB_AWS.replace(
+            "exit 0",
+            'if [ "$2" = "put-function-event-invoke-config" ]; then exit 1; fi\nexit 0',
+        )
+    )
+    (bindir / "aws").chmod(0o755)
+    fn_zip = tmp_path / "fn.zip"
+    fn_zip.write_bytes(b"zip")
+
+    env = {
+        **os.environ,
+        "PATH": f"{bindir}:{os.environ['PATH']}",
+        "AWS_LOG": str(tmp_path / "aws.log"),
+    }
+    result = subprocess.run(
+        ["bash", str(SCRIPT), "--function", "f", "--layer-bucket", "b", "--layer-key", "k"]
+        + ["--function-zip", str(fn_zip), "--region", "us-west-2"],
+        capture_output=True,
+        text=True,
+        env=env,
+    )
+    assert result.returncode == 0
+    assert "WARN: could not set event-invoke config" in result.stderr
 
 
 def test_missing_required_arg_errors(tmp_path):

@@ -192,6 +192,16 @@ class TestTemplateEnvironment:
         assert params["MallocArenaMax"]["Default"] == "2"
         assert params["MallocTrimThreshold"]["Default"] == "0"
 
+    def test_async_event_invoke_config_pins_retries(self):
+        # issue #151: the runner's async dispatch relies on service retries
+        # being 0 (a re-run of a deterministic failure re-fails at extra cost
+        # and can write into a store the caller has moved on from) and on
+        # queued events not outliving the runner's poll window.
+        props = self._load_template()["Resources"]["ProcessFnAsyncConfig"]["Properties"]
+        assert props["FunctionName"] == {"Ref": "ProcessFn"}
+        assert props["MaximumRetryAttempts"] == 0
+        assert props["MaximumEventAgeInSeconds"] == 900
+
 
 class TestPackageConsistency:
     """Verify dependency specifications are consistent across build scripts."""

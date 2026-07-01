@@ -124,9 +124,10 @@ Resources:
                 "token.actions.githubusercontent.com:aud": "sts.amazonaws.com"
               StringLike:
                 "token.actions.githubusercontent.com:sub": !Sub "repo:${GitHubRepo}:*"
-      # No S3: the Zarr template write happens INSIDE the Lambda (runner.py
-      # "the orchestrator only needs lambda:InvokeFunction; no direct S3 access"),
-      # so the orchestrator never touches the output bucket directly.
+      # S3 writes still happen INSIDE the Lambda (runner.py: the Zarr template /
+      # data writes need no orchestrator S3 access). The one orchestrator read
+      # is the async result poll (issue #151): workers mirror per-shard result
+      # JSON to <store>.status/<run_id>/ and the runner GETs it.
       Policies:
         - PolicyName: invoke-and-probe
           PolicyDocument:
@@ -148,6 +149,13 @@ Resources:
                 Effect: Allow
                 Action: [lambda:GetAccountSettings, cloudwatch:GetMetricStatistics]
                 Resource: "*"
+              # Async-dispatch result polling (issue #151): read the per-shard
+              # result objects the workers write next to the benchmark output
+              # store (BENCHMARK_STORE_PREFIX lives in this bucket).
+              - Sid: PollAsyncResults
+                Effect: Allow
+                Action: s3:GetObject
+                Resource: !Sub "arn:aws:s3:::${BenchmarkStoreBucket}/*"
 
   # --- tier-2 test-deploy role (issue #25 §9) --------------------------------
   DeployRole:
@@ -176,6 +184,8 @@ Resources:
                 Action:
                   - lambda:UpdateFunctionCode
                   - lambda:UpdateFunctionConfiguration
+                  # deploy_lambda.sh pins async retries to 0 (issue #151).
+                  - lambda:PutFunctionEventInvokeConfig
                   - lambda:GetFunction
                   - lambda:GetFunctionConfiguration
                 Resource: !Sub "arn:aws:lambda:${AWS::Region}:${AWS::AccountId}:function:${TestFunctionName}"
@@ -219,6 +229,8 @@ Resources:
                 Action:
                   - lambda:UpdateFunctionCode
                   - lambda:UpdateFunctionConfiguration
+                  # deploy_lambda.sh pins async retries to 0 (issue #151).
+                  - lambda:PutFunctionEventInvokeConfig
                   - lambda:GetFunction
                   - lambda:GetFunctionConfiguration
                 Resource: !Sub "arn:aws:lambda:${AWS::Region}:${AWS::AccountId}:function:${BenchmarkFunctionName}"
