@@ -55,6 +55,8 @@ output bucket (e.g. cross-account JupyterHub orchestrators) can run the
 full pipeline using only lambda:InvokeFunction.
 """
 
+import ctypes
+import gc
 import json
 import logging
 import os
@@ -89,6 +91,31 @@ def _max_memory_mb() -> float:
     Memory Used" closely.
     """
     return resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / 1024.0
+
+
+def _reclaim_memory() -> None:
+    """Return freed heap to the OS at invocation teardown (issue #139).
+
+    Lambda reuses warm containers, and neither CPython's pymalloc arenas nor
+    glibc's malloc heap hand freed memory back to the OS on their own, so a
+    subsequent invocation on a warm container starts near the *previous*
+    invocation's RSS high-water and can OOM (``Max Memory Used`` is
+    per-container-lifetime). A ``gc.collect()`` reclaims unreachable Python
+    objects but does NOT drop RSS by itself; glibc's ``malloc_trim(0)`` releases
+    the freed top-of-heap back to the OS, so the next invocation on the same
+    container starts near baseline.
+
+    Called once per invocation (O(heap) -- negligible next to read/aggregate/
+    write) and behavior-neutral: it only frees memory the invocation is done
+    with. Guarded so it is a no-op off glibc (macOS/dev has no ``libc.so.6``,
+    non-glibc libcs may lack ``malloc_trim``) -- it never raises.
+    """
+    gc.collect()
+    try:
+        ctypes.CDLL("libc.so.6").malloc_trim(0)
+    except (OSError, AttributeError):
+        # No glibc (no libc.so.6) or no malloc_trim symbol -- nothing to trim.
+        logger.debug("malloc_trim unavailable; skipping heap reclaim", exc_info=True)
 
 
 def _output_store_kwargs(event: Dict[str, Any]) -> Dict[str, Any]:
@@ -429,6 +456,12 @@ def _handle_process(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
         logger.info("Lambda invocation completed successfully")
         logger.info("=" * 70)
 
+        # Drop the invocation's large output buffers before the teardown reclaim
+        # (issue #139): the response body is just ``metadata`` (small), so freeing
+        # the shard's carrier / accumulated K chunk carriers here lets the
+        # ``_reclaim_memory`` call in ``finally`` return their heap to the OS.
+        del _df_out, chunk_results
+
         return {
             "statusCode": 200 if not metadata.get("error") else 500,
             "body": json.dumps(metadata),
@@ -448,3 +481,9 @@ def _handle_process(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
                 }
             ),
         }
+    finally:
+        # Warm-container memory reclaim (issue #139): once per invocation, after
+        # the write completes and the buffers above are dropped, hand freed heap
+        # back to the OS so the next invoke on this warm container starts near
+        # baseline instead of the prior invocation's RSS high-water.
+        _reclaim_memory()
