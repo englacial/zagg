@@ -80,6 +80,24 @@ Parameters:
     Default: 720
     Description: Function timeout in seconds.
 
+  MallocArenaMax:
+    Type: String
+    Default: "2"
+    Description: >-
+      glibc MALLOC_ARENA_MAX for the process function (issue #143). Caps the
+      number of per-thread malloc arenas so freed numpy/glibc heap is returned
+      to the OS between warm invocations instead of accumulating toward the
+      memory cap. Must be set as an env var (it takes effect at libc init; a
+      runtime mallopt/malloc_trim from Python does not). Set empty to unset.
+
+  MallocTrimThreshold:
+    Type: String
+    Default: "0"
+    Description: >-
+      glibc MALLOC_TRIM_THRESHOLD_ for the process function (issue #143). 0
+      trims freed top-of-heap back to the OS immediately, independently
+      flattening warm-container memory growth. Set empty to unset.
+
 Conditions:
   ShouldCreateBucket: !Equals [!Ref CreateOutputBucket, "true"]
   ShouldCreateRole: !Equals [!Ref CreateExecutionRole, "true"]
@@ -145,6 +163,10 @@ Resources:
       Timeout: !Ref Timeout
       Role: !If [ShouldCreateRole, !GetAtt ExecutionRole.Arn, !Ref ExecutionRoleArn]
       Layers: [!Ref DepsLayer]
+      Environment:
+        Variables:
+          MALLOC_ARENA_MAX: !Ref MallocArenaMax
+          MALLOC_TRIM_THRESHOLD_: !Ref MallocTrimThreshold
       Code:
         S3Bucket: !Ref ArtifactBucket
         S3Key: !Ref FunctionS3Key
