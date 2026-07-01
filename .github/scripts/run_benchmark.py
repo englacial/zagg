@@ -28,7 +28,14 @@ import datetime as dt
 import json
 import os
 import sys
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
+
+# Benchmark targets are launched concurrently (issue #137). Each target is one
+# independent single-shard Lambda dispatch, so this bounds how many run at once;
+# the matrix is small (~single digits), so the cap only guards a pathological
+# manifest.
+_MAX_TARGET_CONCURRENCY = 16
 
 # Allow ``import bench_metrics`` whether run as a script or imported by tests.
 sys.path.insert(0, str(Path(__file__).resolve().parent))
@@ -226,14 +233,17 @@ def main(argv: list[str] | None = None) -> int:
         "pr_number": pr_number,
     }
 
-    records = []
+    # Validate every requested target up front so an unknown name fails before any
+    # dispatch (and before the pool spins up).
     for name in names:
         if name not in known:
             raise SystemExit(f"unknown target '{name}'; have {sorted(known)}")
+
+    def _dispatch(name: str) -> dict:
         store = None
         if args.store_prefix:
             store = f"{args.store_prefix.rstrip('/')}/{name}.zarr"
-        record = run_target(
+        return run_target(
             name,
             manifest,
             base,
@@ -243,9 +253,24 @@ def main(argv: list[str] | None = None) -> int:
             context=context,
             dry_run=args.dry_run,
         )
-        records.append(record)
+
+    # Launch all targets concurrently (issue #137). Each is an independent
+    # single-shard Lambda dispatch, so fanning them out is cold-favoring (a fresh
+    # container per concurrent invoke) and cuts wall-clock ~N x; the runtime metric
+    # is billable worker-seconds (init-independent), so en-masse launch doesn't bias
+    # it. Results are collected then re-ordered back to ``names`` for deterministic
+    # output/series rows; a target that raises propagates (aborting the run) exactly
+    # as the prior serial loop did.
+    records_by_name: dict = {}
+    max_workers = min(len(names), _MAX_TARGET_CONCURRENCY) or 1
+    with ThreadPoolExecutor(max_workers=max_workers) as pool:
+        futures = {pool.submit(_dispatch, name): name for name in names}
+        for fut in as_completed(futures):
+            records_by_name[futures[fut]] = fut.result()
+    records = [records_by_name[name] for name in names]
+    for record in records:
         print(
-            f"[{name}] obs={record['total_obs']} runtime_s={record['runtime_s']} "
+            f"[{record['target']}] obs={record['total_obs']} runtime_s={record['runtime_s']} "
             f"cost/shard=${record['cost_per_shard_usd']} "
             f"cost/100km2=${record['cost_per_100km2_usd']} "
             f"max_memory_mb={record['max_memory_mb']}"
