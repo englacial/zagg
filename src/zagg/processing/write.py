@@ -7,11 +7,14 @@ Assembles the per-shard output carrier and writes it to the Zarr template
 stays acyclic.
 """
 
+from concurrent.futures import ThreadPoolExecutor, as_completed
+
 import numpy as np
 import pandas as pd
 from zarr import config, open_array
 from zarr.abc.store import Store
 
+from zagg.concurrency import fd_safe_max_workers
 from zagg.config import (
     PipelineConfig,
     get_agg_fields,
@@ -19,6 +22,13 @@ from zagg.config import (
 )
 from zagg.csr import write_csr
 from zagg.grids.morton import is_morton_array, morton_words
+
+# The sharded path's K ragged (CSR) subgroup writes fan out over a bounded thread
+# pool (issue #142): each inner chunk emits an independent CSR group at a disjoint
+# prefix, so they are write-independent and latency-bound (~K×3 tiny objects), and
+# a serial loop dominated a t-digest shard's write time. 128 mirrors the dense
+# path's ``async.concurrency`` budget (issue #108).
+_RAGGED_WRITE_CONCURRENCY = 128
 
 
 def _arrow_column(block: np.ndarray, sig: dict):
@@ -299,16 +309,20 @@ def write_shard_to_zarr(
     # accumulated and written independently; preserve encounter order for stable,
     # deterministic writes. Companions + ragged stay per inner chunk (unsharded).
     objects: dict = {}
+    ragged_writes: list = []
     for block_index, carrier, ragged in chunk_results:
         if not _carrier_empty(carrier):
             objects.setdefault(_object_block(block_index), []).append((block_index, carrier))
-        # Companions + ragged for this inner chunk are not sharded: write them
-        # straight through (companion array is one block per chunk; ragged is CSR).
+        # Companions for this inner chunk are not sharded: write them straight
+        # through (one block per chunk). Ragged (CSR) subgroups are collected and
+        # fanned out below (issue #142) -- they target disjoint prefixes, so the
+        # per-chunk serial loop needlessly dominated a t-digest shard's write time.
         if chunk_res_fields:
             _write_companion_columns(carrier, store, grid, block_index, chunk_res_fields)
-        write_ragged_to_zarr(
-            ragged, store, grid=grid, shard_key=_block_index_key(block_index, grid)
-        )
+        if ragged:
+            ragged_writes.append((ragged, _block_index_key(block_index, grid)))
+
+    _write_ragged_fanout(ragged_writes, store, grid=grid)
 
     # One accumulate→write→free pass per sharding object: each holds at most one
     # object's slab resident at a time (the phase-8 memory bound).
@@ -357,6 +371,59 @@ def write_shard_to_zarr(
                         )
                 array.set_block_selection(block_idx, slab)
     return store
+
+
+def _write_ragged_fanout(ragged_writes: list, store: Store, *, grid) -> None:
+    """Write the sharded shard's K ragged (CSR) subgroups concurrently (issue #142).
+
+    On the sharded path :func:`write_shard_to_zarr` already holds all K inner-chunk
+    carriers resident (it bundles the dense side into one shard object), and each
+    inner chunk emits an independent CSR subgroup at a disjoint prefix
+    (``{group_path}/{field}/{block_key}/...``). Those writes are therefore
+    embarrassingly parallel and latency-bound (~K×3 tiny objects, tens of MB), so a
+    serial loop dominated a t-digest shard's write time. Fan them out over a bounded
+    ``ThreadPoolExecutor``; the on-disk layout is unchanged (still one CSR group per
+    inner chunk -- only the write scheduling differs), and concurrent writes to
+    disjoint keys of one store are already zagg's model (the dispatcher fans cells
+    over threads onto a shared store).
+
+    The bound is ``min(_RAGGED_WRITE_CONCURRENCY, len(writes), fd_safe_max_workers())``
+    so this per-worker inner fan-out respects the same open-file ceiling the Lambda
+    dispatcher guards (:func:`zagg.concurrency.fd_safe_max_workers`) -- each in-flight
+    write holds a store socket. A failure in any subgroup is surfaced (not swallowed):
+    the first exception is re-raised after the pool drains, tagged with how many of
+    the K writes failed.
+
+    (The non-sharded/streaming path deliberately stays serial: it writes-then-frees
+    each chunk to bound peak memory (issue #91), so it never holds the K carriers at
+    once to parallelize.)
+    """
+    if not ragged_writes:
+        return
+    workers = min(_RAGGED_WRITE_CONCURRENCY, len(ragged_writes), fd_safe_max_workers())
+    if workers <= 1:
+        for ragged, ragged_key in ragged_writes:
+            write_ragged_to_zarr(ragged, store, grid=grid, shard_key=ragged_key)
+        return
+
+    errors: list = []
+    with ThreadPoolExecutor(max_workers=workers) as pool:
+        futures = {
+            pool.submit(write_ragged_to_zarr, ragged, store, grid=grid, shard_key=ragged_key): (
+                ragged_key
+            )
+            for ragged, ragged_key in ragged_writes
+        }
+        for fut in as_completed(futures):
+            exc = fut.exception()
+            if exc is not None:
+                errors.append((futures[fut], exc))
+    if errors:
+        first_key, first_exc = errors[0]
+        raise RuntimeError(
+            f"ragged (CSR) write failed for {len(errors)} of {len(ragged_writes)} "
+            f"subgroup(s) on the sharded path (first failing shard_key {first_key})"
+        ) from first_exc
 
 
 def _write_companion_columns(carrier, store, grid, block_index, chunk_res_fields):

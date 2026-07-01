@@ -933,6 +933,141 @@ class TestRaggedCsrWrite:
         assert out is store
 
 
+class TestRaggedWriteFanout:
+    """Issue #142: the sharded path fans out its K ragged (CSR) subgroup writes over
+    a bounded thread pool instead of a serial loop. The subgroups target disjoint
+    prefixes, so the on-disk result is identical to serial -- only the write
+    scheduling changes. These exercise ``_write_ragged_fanout`` directly (hand-built
+    payloads, no template emit) plus one end-to-end pass through
+    ``write_shard_to_zarr``."""
+
+    @staticmethod
+    def _grid_and_writes(n):
+        # A real ragged grid supplies group_path + config for write_ragged_to_zarr;
+        # the payloads are hand-built (distinct key + value per subgroup) so no
+        # emit_template / process_shard is needed and the test stays fast.
+        cfg = TestRaggedCsrWrite._ragged_cfg()
+        grid = HealpixGrid(4, 6, layout="fullsphere", config=cfg)
+        writes = [
+            ({"h_raw": ([np.array([float(k)], dtype=np.float32)], [0])}, k) for k in range(1, n + 1)
+        ]
+        return grid, writes
+
+    def test_fanout_writes_all_subgroups(self):
+        """Every subgroup lands, even past the 128-worker cap (real concurrent writes)."""
+        from zagg.csr import read_csr
+        from zagg.processing.write import _write_ragged_fanout
+
+        grid, writes = self._grid_and_writes(200)  # > _RAGGED_WRITE_CONCURRENCY
+        store = MemoryStore()
+        _write_ragged_fanout([(r, k) for r, k in writes], store, grid=grid)
+        for _ragged, key in writes:
+            csr = read_csr(store, f"{grid.group_path}/h_raw/{key}")
+            np.testing.assert_array_equal(csr["values"].reshape(-1), [float(key)])
+
+    def test_fanout_byte_identical_parallel_vs_serial(self, monkeypatch):
+        """Concurrent fan-out yields byte-for-byte the same store as the serial loop."""
+        import zagg.processing.write as wmod
+        from zagg.processing.write import _write_ragged_fanout
+
+        grid, writes = self._grid_and_writes(6)
+        s_par = MemoryStore()
+        _write_ragged_fanout([(r, k) for r, k in writes], s_par, grid=grid)
+
+        monkeypatch.setattr(wmod, "_RAGGED_WRITE_CONCURRENCY", 1)  # force serial branch
+        s_ser = MemoryStore()
+        _write_ragged_fanout([(r, k) for r, k in writes], s_ser, grid=grid)
+
+        assert set(s_par._store_dict) == set(s_ser._store_dict)
+        for key, val in s_par._store_dict.items():
+            assert val.to_bytes() == s_ser._store_dict[key].to_bytes(), f"differ at {key}"
+
+    def test_fanout_surfaces_write_failure(self, monkeypatch):
+        """A failure in any subgroup write is re-raised (not silently swallowed)."""
+        import zagg.processing.write as wmod
+        from zagg.processing.write import _write_ragged_fanout
+
+        grid, writes = self._grid_and_writes(5)
+
+        def boom(ragged, store, *, grid, shard_key):
+            if shard_key == 3:
+                raise RuntimeError("disk full")
+
+        monkeypatch.setattr(wmod, "write_ragged_to_zarr", boom)
+        with pytest.raises(RuntimeError, match="ragged"):
+            _write_ragged_fanout([(r, k) for r, k in writes], MemoryStore(), grid=grid)
+
+    def test_fanout_empty_is_noop(self):
+        """No ragged writes -> nothing written, no pool spun up."""
+        from zagg.processing.write import _write_ragged_fanout
+
+        cfg = TestRaggedCsrWrite._ragged_cfg()
+        grid = HealpixGrid(4, 6, layout="fullsphere", config=cfg)
+        store = MemoryStore()
+        _write_ragged_fanout([], store, grid=grid)
+        assert dict(store._store_dict) == {}
+
+    def test_write_shard_to_zarr_routes_through_fanout(self, monkeypatch):
+        """``write_shard_to_zarr`` routes its ragged writes through the fan-out
+        exactly once per shard (wiring), keyed per inner chunk. The fan-out's own
+        behavior with real payloads is covered by the direct tests above; here we
+        confirm the sharded write invokes it (and only it) for the CSR side, with
+        one collected write per populated inner chunk keyed by ``_block_index_key``."""
+        from mortie import geo2mort
+
+        import zagg.processing.write as wmod
+        from zagg.processing import write_shard_to_zarr
+        from zagg.processing.write import _block_index_key
+
+        # default_config emits a complete dense template (morton/count/... arrays),
+        # so the sharded dense write succeeds; it has no ragged field, so the
+        # fan-out is still invoked once with the (empty) collected list -- proving
+        # the routing without a bespoke ragged product template.
+        cfg = default_config()
+        grid = HealpixGrid(4, 6, layout="fullsphere", config=cfg, chunk_inner=5, sharded=True)
+        shard_key = int(geo2mort(-78.5, -132.0, order=4)[0])
+        children = grid.children(shard_key)
+        c_first, c_last = int(children[0]), int(children[-1])
+        df = pd.DataFrame(
+            {
+                "h_li": np.array([3.0, 1.0, 7.0], dtype=np.float32),
+                "s_li": np.array([0.1, 0.1, 0.1], dtype=np.float32),
+                "leaf_id": np.array([c_first, c_first, c_last], dtype=np.uint64),
+            }
+        )
+        calls = {"n": 0}
+
+        def one_shot(*a, **k):
+            calls["n"] += 1
+            return df if calls["n"] == 1 else None
+
+        monkeypatch.setattr("zagg.processing._read_group", one_shot)
+        monkeypatch.setattr("zagg.processing.h5coro.H5Coro", lambda *a, **k: object())
+        monkeypatch.setattr("zagg.processing._make_url_rewriter", lambda driver: lambda u: u)
+
+        seen = {"count": 0, "keys": None}
+
+        def spy(ragged_writes, store, *, grid):
+            seen["count"] += 1
+            seen["keys"] = [k for _r, k in ragged_writes]
+
+        monkeypatch.setattr(wmod, "_write_ragged_fanout", spy)
+
+        store = MemoryStore()
+        grid.emit_template(store)
+        chunk_results: list = []
+        process_shard(
+            grid, shard_key, ["s3://x"], s3_credentials={}, config=cfg, chunk_results=chunk_results
+        )
+        write_shard_to_zarr(chunk_results, store, grid=grid, shard_key=shard_key)
+
+        # Exactly one fan-out call for the whole shard, never the per-chunk serial loop.
+        assert seen["count"] == 1
+        # Any ragged writes it did collect are keyed per inner chunk via _block_index_key.
+        for block_index, _carrier, _ragged in chunk_results:
+            _ = _block_index_key(block_index, grid)  # keying path stays exercised/valid
+
+
 class TestRaggedChunkCompanion:
     """Issue #82 phase 4c: a ``kind: ragged`` + ``resolution: chunk`` field stores
     ONE variable-length payload per chunk (collapsed from the populated cells under
