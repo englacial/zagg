@@ -1011,3 +1011,13 @@ class TestExtractMode:
         monkeypatch.setattr(ext, "run_extraction", fake_run)
         handler_mod.lambda_handler(self._event(block_chunks=4), _context())
         assert captured == {"block_chunks": 4}
+
+    def test_missing_cred_keys_rejected_fast(self, handler_mod):
+        # Mirror process mode: malformed creds are a 400 before any read, not a
+        # whole-batch 403 burn under the execution role.
+        result = handler_mod.lambda_handler(
+            self._event(s3_credentials={"accessKeyId": "a"}), _context()
+        )
+        assert result["statusCode"] == 400
+        body = json.loads(result["body"])
+        assert "secretAccessKey" in body["error"] and "sessionToken" in body["error"]

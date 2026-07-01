@@ -1515,3 +1515,29 @@ def test_plot_main_emits_codec_artifacts_above_frozen(tmp_path):
     # The forward (sharded-vs-inner) section is rendered ABOVE the frozen one.
     assert "Sharded vs inner-chunk" in html and "Frozen historical" in html
     assert html.index("Sharded vs inner-chunk") < html.index("Frozen historical")
+
+
+def test_88s_nested_pin_invariant():
+    # The 88S o10 stress pin must live INSIDE the pinned o9 stress shard (one
+    # o9 extraction pass covers both orders, issue #148). This runs offline in
+    # milliseconds — the gated weekly drift job must not be the only guard on
+    # the nesting or on the nested_in reference itself.
+    import test_benchmark_shardmap as drift
+
+    from zagg.config import load_config
+    from zagg.grids import from_config
+
+    manifest = json.loads((BENCH / "targets.json").read_text())
+    nested = {k: v for k, v in manifest["shardmaps"].items() if "nested_in" in v}
+    assert "healpix_o10_88s" in nested  # the pin this guards
+    for sm_key, sm_meta in nested.items():
+        parent_meta = manifest["shardmaps"].get(sm_meta["nested_in"])
+        assert parent_meta is not None, f"{sm_key}: nested_in references a missing entry"
+        parent_grid = from_config(
+            load_config(str(drift._config_for_shardmap(sm_meta["nested_in"])))
+        )
+        containing = drift._containing_shard(parent_grid, int(sm_meta["shard_key"]))
+        assert containing == int(parent_meta["shard_key"]), (
+            f"{sm_key}: pinned shard {sm_meta['shard_key']} is not inside its "
+            f"nested_in parent {parent_meta['shard_key']} (got {containing})"
+        )

@@ -211,3 +211,59 @@ def test_run_extraction_isolates_failures(tmp_path, monkeypatch):
         ["/data/ATL03_a.h5"], str(tmp_path / "out"), driver="file", scratch_dir=str(tmp_path)
     )
     assert results == [{"granule": "ATL03_a.h5", "ok": False, "error": "no such granule"}]
+
+
+def test_empty_beam_schema_matches_populated(tmp_path):
+    # An empty (or missing-beam) granule must not drift the parquet schema:
+    # int columns stay int64 and beam stays a string column, so the phase-3
+    # consumer reads one schema regardless of beam population.
+    from fastparquet import ParquetFile
+
+    populated, _ = extract_granule_boundaries(_StubH5({"gt1l": _beam(CHUNK)}), "a.h5")
+    empty, _ = extract_granule_boundaries(_StubH5({"gt1l": _beam(0)}), "b.h5")
+    assert list(empty.dtypes.astype(str)) == list(populated.dtypes.astype(str))
+    for i, df in enumerate((populated, empty)):
+        path = tmp_path / f"g{i}.parquet"
+        write_boundaries_parquet(df, {"granule": "g"}, str(path))
+    schema_a = {
+        c.name: c.type for c in ParquetFile(str(tmp_path / "g0.parquet")).schema.schema_elements
+    }
+    schema_b = {
+        c.name: c.type for c in ParquetFile(str(tmp_path / "g1.parquet")).schema.schema_elements
+    }
+    assert schema_a == schema_b
+
+
+def test_run_extraction_cleans_scratch_on_upload_failure(tmp_path, monkeypatch):
+    # A failed delivery must not leak the scratch parquet (Lambda /tmp is
+    # 512 MB and warm containers revisit it across the fan-out).
+    import zagg.catalog.extract as ext
+
+    beams = {"gt1l": _beam(CHUNK)}
+    monkeypatch.setattr(ext, "_resolve_h5coro_driver", lambda driver: object)
+
+    class _FakeH5Coro:
+        def __init__(self, *a, **k):
+            self._stub = _StubH5(beams)
+
+        def list(self, *a, **k):
+            return self._stub.list(*a, **k)
+
+        def readDatasets(self, *a, **k):  # noqa: N802 (mirror real h5coro API)
+            return self._stub.readDatasets(*a, **k)
+
+    import h5coro
+
+    monkeypatch.setattr(h5coro, "H5Coro", _FakeH5Coro)
+
+    def broken_put(local, prefix, name):
+        raise OSError("upload failed")
+
+    monkeypatch.setattr(ext, "_put_parquet", broken_put)
+    scratch = tmp_path / "scratch"
+    scratch.mkdir()
+    results = run_extraction(
+        ["/data/ATL03_a.h5"], str(tmp_path / "out"), driver="file", scratch_dir=str(scratch)
+    )
+    assert results[0]["ok"] is False and "upload failed" in results[0]["error"]
+    assert list(scratch.iterdir()) == []  # no leaked parquet

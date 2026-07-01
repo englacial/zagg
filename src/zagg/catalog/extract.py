@@ -35,6 +35,25 @@ import pandas as pd
 
 ATL03_BEAMS = ("gt1l", "gt1r", "gt2l", "gt2r", "gt3l", "gt3r")
 
+#: Boundary-row schema, single source of truth for empty and populated frames
+#: (an untyped empty ``DataFrame`` would drift the parquet schema: float64
+#: ``chunk``/``n_photons`` — or even a DOUBLE ``beam`` — on empty-beam granules).
+_BOUNDARY_DTYPES = {
+    "beam": "object",
+    "chunk": "int64",
+    "start_lat": "float64",
+    "start_lon": "float64",
+    "end_lat": "float64",
+    "end_lon": "float64",
+    "n_photons": "int64",
+}
+
+
+def _empty_boundaries() -> pd.DataFrame:
+    """Zero-row boundary frame with the full, correctly-typed schema."""
+    return pd.DataFrame({c: pd.Series(dtype=t) for c, t in _BOUNDARY_DTYPES.items()})
+
+
 #: Chunks per streamed read. Each block read holds ``block_chunks`` chunks of
 #: lat + lon float64 (~25 MB at the ATL03 100k chunk size) — flat regardless of
 #: beam length — while amortizing the one-chunk re-decompression the
@@ -92,9 +111,8 @@ def extract_beam_boundaries(
     the cost of re-decompressing one chunk per block.
     """
     n, chunk = heights_chunk_grid(h5obj, beam)
-    cols = ("beam", "chunk", "start_lat", "start_lon", "end_lat", "end_lon", "n_photons")
     if n == 0:
-        return pd.DataFrame({c: [] for c in cols})
+        return _empty_boundaries()
 
     lat_path = f"/{beam}/heights/lat_ph"
     lon_path = f"/{beam}/heights/lon_ph"
@@ -124,7 +142,8 @@ def extract_beam_boundaries(
                     c1 - c0,
                 )
             )
-    return pd.DataFrame(rows, columns=list(cols))
+    df = pd.DataFrame(rows, columns=list(_BOUNDARY_DTYPES))
+    return df.astype(_BOUNDARY_DTYPES)
 
 
 def extract_granule_boundaries(
@@ -154,8 +173,7 @@ def extract_granule_boundaries(
             continue
         chunk_sizes.add(chunk)
         parts.append(extract_beam_boundaries(h5obj, beam, block_chunks=block_chunks))
-    cols = ("beam", "chunk", "start_lat", "start_lon", "end_lat", "end_lon", "n_photons")
-    df = pd.concat(parts, ignore_index=True) if parts else pd.DataFrame({c: [] for c in cols})
+    df = pd.concat(parts, ignore_index=True) if parts else _empty_boundaries()
     meta = {
         "granule": granule_id,
         "chunk_size": max(chunk_sizes) if chunk_sizes else None,
@@ -271,9 +289,14 @@ def run_extraction(
             df, meta = extract_granule_boundaries(h5obj, granule_id, block_chunks=block_chunks)
             name = f"{granule_id.removesuffix('.h5')}.boundaries.parquet"
             local = os.path.join(scratch_dir, name)
-            write_boundaries_parquet(df, meta, local)
-            dest = _put_parquet(local, output_prefix, name)
-            os.remove(local)
+            # try/finally: a failed upload must not leak the scratch parquet --
+            # Lambda's warm-container /tmp is 512 MB and the fan-out revisits it.
+            try:
+                write_boundaries_parquet(df, meta, local)
+                dest = _put_parquet(local, output_prefix, name)
+            finally:
+                if os.path.exists(local):
+                    os.remove(local)
             results.append(
                 {
                     "granule": granule_id,
