@@ -239,6 +239,15 @@ def main(argv: list[str] | None = None) -> int:
         if name not in known:
             raise SystemExit(f"unknown target '{name}'; have {sorted(known)}")
 
+    # Authenticate once up front so the concurrent targets below don't race to
+    # initialize earthaccess's process-global auth singleton (issue #137). Skipped
+    # under --dry-run (no dispatch, no auth) and pointless for a single target (no
+    # fan-out); each agg() still logs in, but now hits the warmed singleton.
+    if not args.dry_run and len(names) > 1:
+        from zagg.auth import ensure_logged_in
+
+        ensure_logged_in()
+
     def _dispatch(name: str) -> dict:
         store = None
         if args.store_prefix:

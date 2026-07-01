@@ -103,3 +103,10 @@ def test_get_nsidc_s3_credentials_uses_retry(monkeypatch):
     creds = auth.get_nsidc_s3_credentials()
     assert creds["accessKeyId"] == "AK"
     assert creds["daac"] == "NSIDC"  # login().get_s3_credentials(daac="NSIDC")
+
+
+def test_ensure_logged_in_warms_singleton_with_retry(monkeypatch):
+    """The pre-fan-out warm-up authenticates once and rides the same retry."""
+    calls = _login_seq(monkeypatch, OSError(101, "unreachable"), _FakeAuth())
+    auth.ensure_logged_in()  # returns None; must not raise
+    assert calls["n"] == 2  # transient failure retried, then succeeded

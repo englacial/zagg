@@ -33,11 +33,13 @@ def _login_with_retry():
     """Return an authenticated ``earthaccess`` session, retrying transient failures.
 
     Retries ``earthaccess.login()`` up to ``_LOGIN_MAX_ATTEMPTS`` with exponential
-    backoff (2s, 4s, ...) on ``OSError``. That base class covers both the bare
-    ``OSError: [Errno 101]`` no-route *and* ``requests.exceptions.ConnectionError``
-    (which subclasses ``IOError``/``OSError``), i.e. the connection/timeout family
-    the login can raise. The final attempt's exception propagates unchanged, so a
-    genuine, persistent auth failure still surfaces rather than being masked.
+    backoff (2s, 4s, ...) on ``OSError``. That base class is the whole ``requests``
+    IO/HTTP-error family -- every ``requests.exceptions.RequestException`` subclasses
+    ``IOError``/``OSError`` -- so it covers the bare ``OSError: [Errno 101]`` no-route,
+    ``ConnectionError``, and ``Timeout`` that the login can raise transiently. A
+    genuinely-rejected credential surfaces as ``earthaccess``'s own
+    ``LoginAttemptFailure`` (not an ``OSError``), so it fails fast rather than being
+    retried; and the final attempt's exception propagates unchanged either way.
     """
     last_exc: OSError | None = None
     for attempt in range(1, _LOGIN_MAX_ATTEMPTS + 1):
@@ -58,6 +60,20 @@ def _login_with_retry():
             time.sleep(backoff)
     assert last_exc is not None  # loop ran >=1 time and every attempt failed
     raise last_exc
+
+
+def ensure_logged_in() -> None:
+    """Warm the ``earthaccess`` auth singleton once, up front (issue #137).
+
+    ``earthaccess.login()`` mutates process-global auth/store singletons, so a
+    caller that fans work out across threads (e.g. the parallel benchmark) should
+    authenticate ONCE before the fan-out -- otherwise the concurrent workers race
+    to initialize that shared singleton. Calling this first populates it serially,
+    so the in-worker logins become cheap hits. Uses the same bounded retry as the
+    credential helpers; honors this module's "call once in the orchestrator"
+    contract.
+    """
+    _login_with_retry()
 
 
 def get_edl_token() -> str:
