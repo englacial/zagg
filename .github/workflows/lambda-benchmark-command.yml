@@ -139,6 +139,16 @@ jobs:
           rm -rf src/zagg
           cp -r _fork/src/zagg src/zagg
 
+      # The runner resolves urs.earthdata.nasa.gov to an AAAA record but has no
+      # usable IPv6 route, so earthaccess.login() (inside run_benchmark.py) dies
+      # immediately with `[Errno 101] Network is unreachable` (issue #137).
+      # Raising the getaddrinfo precedence of IPv4-mapped addresses makes glibc
+      # return+try the A record first, so the login handshake takes the routable
+      # IPv4 path. Runner-only config -- the shipped package and user auth are
+      # untouched.
+      - name: Prefer IPv4 for Earthdata login (issue #137)
+        run: echo 'precedence ::ffff:0:0/96 100' | sudo tee -a /etc/gai.conf
+
       - name: Run benchmark (base harness, fork package)
         uses: ./.github/actions/run-benchmark
         with:
