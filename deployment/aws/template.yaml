@@ -77,8 +77,11 @@ Parameters:
 
   Timeout:
     Type: Number
-    Default: 720
-    Description: Function timeout in seconds.
+    Default: 900
+    Description: >-
+      Function timeout in seconds. 900 is the Lambda hard ceiling — bumped from
+      720 for the 88S stress shards (issue #148); there is no timeout lever
+      beyond this, only smaller shards or cheaper reads.
 
   MallocArenaMax:
     Type: String

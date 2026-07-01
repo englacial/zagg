@@ -52,9 +52,32 @@ pytestmark = [
 ]
 
 
+def _containing_shard(parent_grid, shard_key: int) -> int:
+    """The parent-grid shard containing a finer shard (via its center point).
+
+    HEALPix cells nest, so a finer cell's center maps unambiguously into its
+    containing coarser cell; routing through ``assign``/``shards_of`` keeps this
+    on the same mortie machinery the shard maps themselves are built with.
+    """
+    import numpy as np
+    from mortie import mort2geo
+
+    lat, lon = mort2geo(np.array([shard_key], dtype=np.uint64))
+    leaf = parent_grid.assign(np.atleast_1d(lat), np.atleast_1d(lon))
+    return int(parent_grid.shards_of(leaf)[0])
+
+
 def _config_for_shardmap(sm_key: str) -> Path:
-    """Any target's config that uses this shard map (config sets the grid)."""
-    for target in MANIFEST["targets"].values():
+    """Any target's config that uses this shard map (config sets the grid).
+
+    Searches the committed matrix first, then ``provisional_targets`` (issue
+    #130 block) — the 88S stress shard maps (issue #148) are referenced only by
+    provisional targets, and the drift check still needs their grid config.
+    """
+    provisional = {
+        k: v for k, v in MANIFEST.get("provisional_targets", {}).items() if k != "_comment"
+    }
+    for target in list(MANIFEST["targets"].values()) + list(provisional.values()):
         if target["shardmap"] == sm_key:
             return BENCH / target["config"]
     raise AssertionError(f"no target references shardmap '{sm_key}'")
@@ -96,9 +119,24 @@ def test_pinned_shardmap_no_drift(sm_key):
         catalog, grid, region=parts, backend=backend, footprint=cmr["footprint"]
     )
 
-    key, n = bench_metrics.select_densest_shard(
-        {"shard_keys": rebuilt.shard_keys, "granules": rebuilt.granules}
-    )
+    # A nested pin (issue #148: the 88S o10 stress shard is the densest o10
+    # shard INSIDE the pinned o9 stress shard, so one o9 extraction pass covers
+    # both orders) is compared against the same nested quantity, not the global
+    # densest — otherwise a correct rebuild would read as drift.
+    shard_keys, granules = rebuilt.shard_keys, rebuilt.granules
+    nested_in = sm_meta.get("nested_in")
+    if nested_in:
+        parent_key = int(MANIFEST["shardmaps"][nested_in]["shard_key"])
+        parent_grid = from_config(load_config(str(_config_for_shardmap(nested_in))))
+        keep = [
+            i
+            for i, k in enumerate(shard_keys)
+            if int(_containing_shard(parent_grid, int(k))) == parent_key
+        ]
+        shard_keys = [shard_keys[i] for i in keep]
+        granules = [granules[i] for i in keep]
+
+    key, n = bench_metrics.select_densest_shard({"shard_keys": shard_keys, "granules": granules})
     pinned_n = sm_meta["n_granules"]
     # Tie-tolerant: the densest *count* is the stable quantity; an equally-dense
     # reselection (different key, same count) is fine -- a count drift is not.
