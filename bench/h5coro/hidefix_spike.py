@@ -119,25 +119,35 @@ def main() -> None:
     mismatches: list[str] = []
     failures: list[dict] = []
     per_granule = []
-    wall0, cpu0 = time.perf_counter(), time.process_time()
+    seen_keys: set[str] = set()
+    # match bench_replay.py's convention: only index build + reads are timed;
+    # the checksum gate is accumulated separately as gate_s
+    wall = cpu = gate_s = 0.0
+    skipped = 0
     for g in payload["granules"]:
         if not g["calls"]:
+            skipped += 1
             continue
         path = granule_dir / g["resource"]
-        g0 = time.perf_counter()
+        g0, c0 = time.perf_counter(), time.process_time()
         idx = hidefix.Index(str(path))
         build_s = time.perf_counter() - g0
         out, fails = read_granule(idx, g["calls"])
         gwall = time.perf_counter() - g0
+        wall += gwall
+        cpu += time.process_time() - c0
         for f in fails:
             f["resource"] = g["resource"]
         failures.extend(fails)
+        t_gate = time.perf_counter()
         for (ci, ds), arr in out.items():
             key = f"{g['resource']}:{ci}:{ds}"
+            seen_keys.add(key)
             if baseline.get(key) == checksum(arr):
                 n_pass += 1
             else:
                 mismatches.append(key)
+        gate_s += time.perf_counter() - t_gate
         per_granule.append(
             {
                 "resource": g["resource"],
@@ -147,15 +157,16 @@ def main() -> None:
             }
         )
         del out, idx
-    wall, cpu = time.perf_counter() - wall0, time.process_time() - cpu0
+    # a variant that silently omits arrays must not pass the gate (bench_replay parity)
+    missing = [k for k in baseline if k not in seen_keys]
 
     if args.hfxidx:
         for row in per_granule:
             row.update(serialize_index(args.hfxidx, granule_dir / row["resource"]))
 
     n_expected = sum(len(entries) for g in payload["granules"] for entries in g["calls"])
-    if mismatches:
-        correctness = f"fail: {len(mismatches)}/{n_expected} mismatched"
+    if mismatches or missing:
+        correctness = f"fail: {len(mismatches)} mismatched + {len(missing)} missing of {n_expected}"
     elif failures:
         correctness = f"partial: {n_pass}/{n_expected}"
     else:
@@ -170,9 +181,11 @@ def main() -> None:
         "platform": sys.platform,
         "wall_s": round(wall, 3),
         "cpu_s": round(cpu, 3),
+        "gate_s": round(gate_s, 3),
         "max_rss_mb": round(max_rss_mb(), 1),
         "n_arrays": n_pass + len(mismatches),
         "n_granules": len(per_granule),
+        "skipped_granules": skipped,
         "correctness": correctness,
         "index_build_s_total": round(sum(r["index_build_s"] for r in per_granule), 3),
         "index_size_bytes_total": sum(s for s in sizes if s) if any(sizes) else None,
@@ -191,9 +204,11 @@ def main() -> None:
         f"(index build {result['index_build_s_total']}s, {result['n_arrays']} arrays, "
         f"correctness={correctness}) -> {out_path}"
     )
-    if mismatches:
+    if mismatches or missing:
         for k in mismatches[:10]:
             print(f"  MISMATCH {k}")
+        for k in missing[:10]:
+            print(f"  MISSING {k}")
         sys.exit(1)
     if failures:
         for f in failures[:10]:

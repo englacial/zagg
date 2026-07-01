@@ -1,17 +1,17 @@
-From 9b4778aa243f2293daa3d52a2f60830c59881810 Mon Sep 17 00:00:00 2001
+From 6c7bb7f633a02edc17e99f3c875f8a460b5ade92 Mon Sep 17 00:00:00 2001
 From: espg <refuge@rocktalus.com>
 Date: Wed, 1 Jul 2026 14:55:52 -0700
 Subject: [PATCH] vectorize shuffleChunk as a numpy byte-matrix transpose
 
 ---
- h5coro/h5dataset.py | 15 ++++++++-------
- 1 file changed, 8 insertions(+), 7 deletions(-)
+ h5coro/h5dataset.py | 20 +++++++++++++-------
+ 1 file changed, 13 insertions(+), 7 deletions(-)
 
 diff --git a/h5coro/h5dataset.py b/h5coro/h5dataset.py
-index 5910454..0c34246 100644
+index 5910454..49efed7 100644
 --- a/h5coro/h5dataset.py
 +++ b/h5coro/h5dataset.py
-@@ -2183,16 +2183,17 @@ class H5Dataset:
+@@ -2183,16 +2183,22 @@ class H5Dataset:
      def shuffleChunk(self, input, output_offset, output_size, type_size):
          if self.resourceObject.errorChecking and (type_size < 0 or type_size > 8):
              raise FatalError(f'invalid data size to perform shuffle on: {type_size}')
@@ -28,6 +28,11 @@ index 5910454..0c34246 100644
 -                src_index = (val_index * shuffle_block_size) + element_index
 -                output[dst_index] = input[src_index]
 -                dst_index += 1
++        if start_element + elements_to_shuffle > shuffle_block_size:
++            # numpy slicing would silently clamp + zero-pad here; the loop this
++            # replaces raised IndexError on a window past the chunk, so stay loud
++            raise FatalError(f'shuffle window exceeds chunk: '
++                             f'{start_element + elements_to_shuffle} > {shuffle_block_size}')
 +        blocks = numpy.frombuffer(input, dtype=numpy.uint8, count=type_size * shuffle_block_size)
 +        window = blocks.reshape(type_size, shuffle_block_size)[:, start_element:start_element + elements_to_shuffle]
 +        output = window.transpose().tobytes()
