@@ -44,7 +44,7 @@ PYTHONPATH=<dir with flatbuffers> python bench/offsets/fetch_88s_sample.py \
 
 ### Cross-validation gate (NEON cache, 61 granules)
 
-**61 granules × 184,616 chunks, zero mismatches** — `(elem_start, elem_end,
+**61 granules, 184,616 chunks total, zero mismatches** — `(elem_start, elem_end,
 byte_offset, nbytes)` byte-identical chunk-for-chunk across h5py, the h5coro
 B-tree walk (plus `filter_mask` between those two), and hidefix's index
 (`hfxidx` flexbuffers dump; chunk records decoded as little-endian u64
@@ -65,6 +65,12 @@ local one.
 | ATL03_20181014103720 | 5,116 | 1 (4 MiB) | 5.0 s | 458 s |
 | ATL03_20220125022450 | 7,368 | 1 (4 MiB) | 3.6 s | 848 s |
 | ATL03_20250601165401 | 2,988 | 1 (4 MiB) | 3.7 s | 206 s |
+
+(Honesty note: the committed `report_88s.json` was produced before the
+extractor-vs-extractor compares gained `filter_mask` parity with the NEON
+gate, so its 88S compares cover `(elem_start, elem_end, byte_offset,
+nbytes)`; `filter_mask` is 0 on all 15,472 chunks of the committed streamed
+parquets, and the strict compare is what the script runs now.)
 
 The headline: **streaming extraction needs one 4 MiB ranged GET.** NSIDC's
 files keep the metadata (object headers + chunk B-trees) in the front of the
@@ -110,7 +116,15 @@ the marginal cost is ~zero — the numbers above are the *standalone* ceiling.
   #152 (one worker → one object, no coordination); a per-shard rollup is a
   cheap post-pass if GET count ever matters. The committed
   `results/neon_offsets.parquet` is such a rollup (61 granules, 184,616
-  rows, 1.3 MB gzip).
+  rows, 1.3 MB gzip): the route-(b) per-granule frames from step 1
+  concatenated and rewritten with fastparquet `compression="gzip"` (meta key
+  `zagg:offsets_meta` records source + row count).
+- Provenance of the committed 88S sample parquets: written by
+  `fetch_88s_sample.py`'s *streamed* leg (route (b) over `HTTPDriver`);
+  verifiable against `results/report_88s.json`, whose per-granule
+  `stream.extract_wall_s` equals each parquet's `zagg:offsets_meta`
+  `wall_s`. A `transport` field in the meta dict is a worthwhile refinement
+  if this graduates from bench tooling.
 
 ## Convergence with the hidefix index (#155)
 
