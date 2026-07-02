@@ -2,8 +2,10 @@
  "summary": {
   "granules": 61,
   "chunks": 184616,
-  "failures": 0
+  "failures": 0,
+  "uncovered_granules": 0
  },
+ "uncovered": [],
  "granules": [
   {
    "granule": "ATL03_20190105163308_01260202_007_01.h5",
