@@ -30,8 +30,9 @@ import tempfile
 import time
 from pathlib import Path
 
-from crosscheck_hidefix import compare, make_index, parse_hidefix_fx
+from crosscheck_hidefix import STRICT_VALUE_COLS, compare, make_index, parse_hidefix_fx
 from extract_offsets import (
+    DEFAULT_DATASETS,
     extract_offsets_h5coro,
     extract_offsets_h5py,
     write_offsets_parquet,
@@ -63,8 +64,15 @@ def _counting_driver_class(base, stats: dict):
     class Counting(base):
         def read(self, pos, size):
             stats["n_gets"] += 1
-            stats["bytes"] += size
+            stats["bytes"] += size  # requested size (== received for a 206 range hit)
             return super().read(pos, size)
+
+        def copy(self, max_connections=None):
+            # base.copy() hardcodes the base class, which would let reads
+            # escape the counter on any driver-copying path (e.g. h5coro's
+            # forked multiProcess B-tree readers -- unused here, but cheap to
+            # stay correct against).
+            return type(self)(self.resource, self.cached_credentials, max_connections)
 
     return Counting
 
@@ -94,12 +102,26 @@ def stream_extract(url: str, token: str) -> tuple[object, dict, dict]:
 
 
 def download(url: str, token: str, dest_dir: Path) -> tuple[Path, float]:
-    """Fetch one granule over HTTPS with the EDL token; returns (path, wall_s)."""
+    """Fetch one granule over HTTPS with the EDL token; returns (path, wall_s).
+
+    The bearer token is only presented to the EDL/NSIDC host — requests
+    strips ``Authorization`` on the cross-host redirect to the presigned S3
+    URL, which is also why that hop still authenticates (the signature is in
+    the query string). Caveat: the caller holds the file in a
+    ``TemporaryDirectory``, which a SIGKILL mid-download would strand in
+    ``$TMPDIR`` — check for leftover ``ATL03_*.h5`` there after any hard
+    abort (EOSDIS no-redistribute).
+    """
     import requests
 
     dest = dest_dir / url.rsplit("/", 1)[-1]
     t0 = time.time()
-    with requests.get(url, headers={"Authorization": f"Bearer {token}"}, stream=True) as r:
+    with requests.get(
+        url,
+        headers={"Authorization": f"Bearer {token}"},
+        stream=True,
+        timeout=(10, 60),  # connect, per-read; a stalled socket must not hang forever
+    ) as r:
         r.raise_for_status()
         with open(dest, "wb") as f:
             for chunk in r.iter_content(chunk_size=1 << 20):
@@ -145,14 +167,16 @@ def main(argv: list[str] | None = None) -> int:
                     h5obj.close()
                 rec["local_wall_s"] = {"h5py": meta_a["wall_s"], "h5coro": meta_b["wall_s"]}
                 results = [
-                    compare(df_a, df_b, "h5py-vs-h5coro"),
-                    compare(df_s, df_b, "https-vs-local-h5coro"),
+                    compare(df_a, df_b, "h5py-vs-h5coro", value_cols=STRICT_VALUE_COLS),
+                    compare(df_s, df_b, "https-vs-local-h5coro", value_cols=STRICT_VALUE_COLS),
                 ]
                 if not args.skip_hidefix:
                     fx = Path(tmp) / f"{gid.removesuffix('.h5')}.fx"
                     make_index(local, fx)
                     df_h = parse_hidefix_fx(fx)
-                    df_h = df_h[df_h["dataset"].isin(set(df_a["dataset"]))]
+                    # intent-scoped, matching crosscheck_hidefix.main (a
+                    # dataset both routes dropped must surface as right_only)
+                    df_h = df_h[df_h["dataset"].isin(DEFAULT_DATASETS)]
                     results.append(compare(df_a, df_h, "h5py-vs-hidefix"))
                 rec["results"] = results
                 rec["ok"] = all(r["ok"] for r in results)
