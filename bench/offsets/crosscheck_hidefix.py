@@ -36,20 +36,23 @@ import subprocess
 from pathlib import Path
 
 import pandas as pd
-from extract_offsets import OFFSETS_DTYPES, _chunk_rows, read_offsets_parquet
+from extract_offsets import DEFAULT_DATASETS, OFFSETS_DTYPES, _chunk_rows, read_offsets_parquet
 
 PODMAN_IMAGE = "zagg-bench-hidefix"
 
 #: Join key + compared values (everything the arm-(2b) reader consumes).
 KEY_COLS = ["beam", "dataset", "chunk_idx"]
 VALUE_COLS = ["elem_start", "elem_end", "byte_offset", "nbytes"]
+#: For extractor-vs-extractor pairs both sides carry the filter mask too;
+#: hidefix's index does not store it, so hidefix pairs compare VALUE_COLS.
+STRICT_VALUE_COLS = VALUE_COLS + ["filter_mask"]
 GATE_COLS = ["chunk_idx"] + VALUE_COLS
 
 
 def make_index(granule: Path, fx_path: Path, image: str = PODMAN_IMAGE) -> None:
     """Run hfxidx in the PR #150 container to serialize one granule's index."""
     fx_path.parent.mkdir(parents=True, exist_ok=True)
-    subprocess.run(
+    proc = subprocess.run(
         [
             "podman",
             "run",
@@ -65,9 +68,14 @@ def make_index(granule: Path, fx_path: Path, image: str = PODMAN_IMAGE) -> None:
             "--out-type",
             "flexbuffers",
         ],
-        check=True,
+        check=False,
         capture_output=True,
+        text=True,
     )
+    if proc.returncode != 0:  # surface hfxidx/podman stderr, not just the exit code
+        raise RuntimeError(
+            f"hfxidx failed for {granule.name} (rc={proc.returncode}):\n{proc.stderr}"
+        )
 
 
 def parse_hidefix_fx(fx_path: Path) -> pd.DataFrame:
@@ -114,17 +122,19 @@ def parse_hidefix_fx(fx_path: Path) -> pd.DataFrame:
     )
 
 
-def compare(ours: pd.DataFrame, theirs: pd.DataFrame, label: str) -> dict:
+def compare(
+    ours: pd.DataFrame, theirs: pd.DataFrame, label: str, value_cols: list[str] = VALUE_COLS
+) -> dict:
     """Chunk-for-chunk comparison on the gate columns; returns a result dict."""
-    m = ours[KEY_COLS + VALUE_COLS].merge(
-        theirs[KEY_COLS + VALUE_COLS],
+    m = ours[KEY_COLS + value_cols].merge(
+        theirs[KEY_COLS + value_cols],
         on=KEY_COLS,
         how="outer",
         suffixes=("_a", "_b"),
         indicator=True,
     )
     bad = m["_merge"] != "both"
-    for c in VALUE_COLS:
+    for c in value_cols:
         bad |= m[f"{c}_a"] != m[f"{c}_b"]
     mismatches = m[bad]
     return {
@@ -132,7 +142,9 @@ def compare(ours: pd.DataFrame, theirs: pd.DataFrame, label: str) -> dict:
         "n_chunks": int(len(m)),
         "n_mismatch": int(len(mismatches)),
         "ok": len(mismatches) == 0,
-        "mismatch_sample": mismatches.head(20).to_dict(orient="records"),
+        # to_json round-trip: join misses leave float NaN, which json.dumps
+        # would emit as bare (non-strict) NaN; to_json maps them to null.
+        "mismatch_sample": json.loads(mismatches.head(20).to_json(orient="records")),
     }
 
 
@@ -155,6 +167,11 @@ def main(argv: list[str] | None = None) -> int:
     parquets = sorted((offsets_dir / "h5py").glob("*.offsets.parquet"))
     if not parquets:
         raise SystemExit(f"no offsets parquets under {offsets_dir}/h5py — run extract_offsets.py")
+    # coverage is judged against the cache, not the parquet glob: a granule
+    # the extractor never produced output for must fail, not vanish.
+    cached = {p.name for p in Path(args.granule_dir).expanduser().glob("*.h5")}
+    covered = {p.name.removesuffix(".offsets.parquet") + ".h5" for p in parquets}
+    uncovered = sorted(cached - covered)
 
     report: list[dict] = []
     total = {"granules": 0, "chunks": 0, "failures": 0}
@@ -168,11 +185,13 @@ def main(argv: list[str] | None = None) -> int:
                 raise SystemExit(f"missing {fx} (pass --make-index to generate)")
             make_index(Path(args.granule_dir).expanduser() / gid, fx, args.image)
         # hidefix indexes every dataset under a beam (bckgrd_atlas/ etc.);
-        # the gate covers the read-path datasets the extractor scopes to.
+        # the gate covers the read-path datasets the extractor *targets*
+        # (intent, not observation — a dataset our side dropped entirely must
+        # surface as right_only, not vanish from the join).
         df_h = parse_hidefix_fx(fx)
-        df_h = df_h[df_h["dataset"].isin(set(df_a["dataset"]))]
+        df_h = df_h[df_h["dataset"].isin(DEFAULT_DATASETS)]
         results = [
-            compare(df_a, df_b, "h5py-vs-h5coro"),
+            compare(df_a, df_b, "h5py-vs-h5coro", value_cols=STRICT_VALUE_COLS),
             compare(df_a, df_h, "h5py-vs-hidefix"),
             compare(df_b, df_h, "h5coro-vs-hidefix"),
         ]
@@ -183,16 +202,17 @@ def main(argv: list[str] | None = None) -> int:
         total["failures"] += 0 if ok else 1
         print(f"{gid}: {'OK' if ok else 'MISMATCH'} ({results[0]['n_chunks']} chunks)")
 
-    summary = {"summary": total, "granules": report}
+    total["uncovered_granules"] = len(uncovered)
+    summary = {"summary": total, "uncovered": uncovered, "granules": report}
     if args.report_out:
         out = Path(args.report_out)
         out.parent.mkdir(parents=True, exist_ok=True)
         out.write_text(json.dumps(summary, indent=1) + "\n")
     print(
         f"cross-check: {total['granules']} granules, {total['chunks']} chunks, "
-        f"{total['failures']} failing granules"
+        f"{total['failures']} failing, {len(uncovered)} cached granules without offsets"
     )
-    return 1 if total["failures"] else 0
+    return 1 if total["failures"] or uncovered else 0
 
 
 if __name__ == "__main__":
