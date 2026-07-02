@@ -231,24 +231,30 @@ def extract_offsets_h5coro(
     for beam in beams:
         for dataset in datasets:
             path = f"/{beam}/{dataset}"
-            try:
-                ds = H5Dataset(h5obj, path, earlyExit=True, metaOnly=True, enableAttributes=False)
-            except Exception:
+            ds = H5Dataset(h5obj, path, earlyExit=True, metaOnly=True, enableAttributes=False)
+            if ds.meta.typeSize == 0:
+                # metaOnly never raises for an absent path -- the traversal
+                # just leaves default metadata. Mirror h5py: a whole missing
+                # beam is recorded and skipped; a missing dataset inside a
+                # present beam is a schema violation and raises.
                 if dataset == datasets[0]:
                     missing.append(beam)
                     break
-                raise
+                raise KeyError(path)
             dims = tuple(int(x) for x in ds.meta.dimensions or ())
             if not dims or 0 in dims:
                 continue
+            if ds.meta.address == INVALID_VALUE[h5obj.offsetSize]:
+                continue  # no allocated storage (mirrors h5py get_offset() is None)
             if ds.meta.layout == H5Dataset.CHUNKED_LAYOUT:
-                if ds.meta.address == INVALID_VALUE[h5obj.offsetSize]:
-                    continue  # chunked but no allocated chunks
                 chunk_dims = tuple(int(x) for x in ds.meta.chunkDimensions)
                 rows.extend(_chunk_rows(beam, dataset, dims, chunk_dims, _walk_chunk_btree(ds)))
-            else:  # contiguous: one pseudo-chunk, no filters
-                nbytes = ds.meta.typeSize * math.prod(dims)
-                rows.append((beam, dataset, 0, 0, dims[0], ds.meta.address, nbytes, 0))
+            elif ds.meta.layout == H5Dataset.CONTIGUOUS_LAYOUT:
+                # one pseudo-chunk, no filters; meta.size is the layout
+                # message's storage size. COMPACT data lives inside the object
+                # header, not at a file offset -- skip it (h5py's get_offset()
+                # returns None there, so route (a) skips it too).
+                rows.append((beam, dataset, 0, 0, dims[0], ds.meta.address, ds.meta.size, 0))
     df = _finalize(rows, granule_id)
     meta = {
         "granule": granule_id,
@@ -319,7 +325,11 @@ def main(argv: list[str] | None = None) -> int:
                 df, meta = extract_offsets_h5py(str(path), gid)
             else:
                 h5obj = _open_h5coro(str(path))
-                df, meta = extract_offsets_h5coro(h5obj, gid)
+                try:
+                    df, meta = extract_offsets_h5coro(h5obj, gid)
+                finally:  # FileDriver holds the fd; don't leak one per granule
+                    if hasattr(h5obj, "close"):
+                        h5obj.close()
             dest = out_dir / route / f"{gid.removesuffix('.h5')}.offsets.parquet"
             dest.parent.mkdir(parents=True, exist_ok=True)
             write_offsets_parquet(df, meta, dest)
