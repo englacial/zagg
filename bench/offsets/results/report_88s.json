@@ -1,0 +1,122 @@
+[
+ {
+  "granule": "ATL03_20181014103720_02410111_007_01.h5",
+  "url": "https://data.nsidc.earthdatacloud.nasa.gov/nsidc-cumulus-prod-protected/ATLAS/ATL03/007/2018/10/14/ATL03_20181014103720_02410111_007_01.h5",
+  "stream": {
+   "extract_wall_s": 0.061,
+   "total_wall_s": 4.961,
+   "n_gets": 1,
+   "mb_transferred": 4.0
+  },
+  "n_chunks": 5116,
+  "download_wall_s": 458.1,
+  "local_wall_s": {
+   "h5py": 0.034,
+   "h5coro": 0.039
+  },
+  "results": [
+   {
+    "comparison": "h5py-vs-h5coro",
+    "n_chunks": 5116,
+    "n_mismatch": 0,
+    "ok": true,
+    "mismatch_sample": []
+   },
+   {
+    "comparison": "https-vs-local-h5coro",
+    "n_chunks": 5116,
+    "n_mismatch": 0,
+    "ok": true,
+    "mismatch_sample": []
+   },
+   {
+    "comparison": "h5py-vs-hidefix",
+    "n_chunks": 5116,
+    "n_mismatch": 0,
+    "ok": true,
+    "mismatch_sample": []
+   }
+  ],
+  "ok": true
+ },
+ {
+  "granule": "ATL03_20220125022450_05161411_007_01.h5",
+  "url": "https://data.nsidc.earthdatacloud.nasa.gov/nsidc-cumulus-prod-protected/ATLAS/ATL03/007/2022/01/25/ATL03_20220125022450_05161411_007_01.h5",
+  "stream": {
+   "extract_wall_s": 0.064,
+   "total_wall_s": 3.643,
+   "n_gets": 1,
+   "mb_transferred": 4.0
+  },
+  "n_chunks": 7368,
+  "download_wall_s": 847.6,
+  "local_wall_s": {
+   "h5py": 0.038,
+   "h5coro": 0.054
+  },
+  "results": [
+   {
+    "comparison": "h5py-vs-h5coro",
+    "n_chunks": 7368,
+    "n_mismatch": 0,
+    "ok": true,
+    "mismatch_sample": []
+   },
+   {
+    "comparison": "https-vs-local-h5coro",
+    "n_chunks": 7368,
+    "n_mismatch": 0,
+    "ok": true,
+    "mismatch_sample": []
+   },
+   {
+    "comparison": "h5py-vs-hidefix",
+    "n_chunks": 7368,
+    "n_mismatch": 0,
+    "ok": true,
+    "mismatch_sample": []
+   }
+  ],
+  "ok": true
+ },
+ {
+  "granule": "ATL03_20250601165401_11722711_007_01.h5",
+  "url": "https://data.nsidc.earthdatacloud.nasa.gov/nsidc-cumulus-prod-protected/ATLAS/ATL03/007/2025/06/01/ATL03_20250601165401_11722711_007_01.h5",
+  "stream": {
+   "extract_wall_s": 0.048,
+   "total_wall_s": 3.659,
+   "n_gets": 1,
+   "mb_transferred": 4.0
+  },
+  "n_chunks": 2988,
+  "download_wall_s": 206.3,
+  "local_wall_s": {
+   "h5py": 0.031,
+   "h5coro": 0.025
+  },
+  "results": [
+   {
+    "comparison": "h5py-vs-h5coro",
+    "n_chunks": 2988,
+    "n_mismatch": 0,
+    "ok": true,
+    "mismatch_sample": []
+   },
+   {
+    "comparison": "https-vs-local-h5coro",
+    "n_chunks": 2988,
+    "n_mismatch": 0,
+    "ok": true,
+    "mismatch_sample": []
+   },
+   {
+    "comparison": "h5py-vs-hidefix",
+    "n_chunks": 2988,
+    "n_mismatch": 0,
+    "ok": true,
+    "mismatch_sample": []
+   }
+  ],
+  "ok": true
+ }
+]
