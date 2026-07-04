@@ -1576,6 +1576,393 @@ def _patch_tabular_s3(monkeypatch):
     return captured
 
 
+def _uri_events():
+    """Two URI-shaped events for the lambda temporal backend (Phase 8)."""
+    return [
+        {
+            "event_key": "storm1",
+            "event_mask_uri": "s3://b/masks/storm1.nc",
+            "collection_uris": {"merra2": "s3://b/merra2.zarr"},
+            "static_uris": {"cell_areas": "s3://b/areas.nc"},
+        },
+        {
+            "event_key": "storm2",
+            "event_mask_uri": "s3://b/masks/storm2.nc",
+            "collection_uris": {"merra2": "s3://b/merra2.zarr"},
+            "static_uris": {"cell_areas": "s3://b/areas.nc"},
+        },
+    ]
+
+
+def _temporal_s3_config():
+    from zagg.config import load_config_from_dict
+
+    cfg = _temporal_config()
+    d = {
+        "pipeline": {"type": "temporal"},
+        "data_source": {"reader": "xarray_s3", "collections": ["merra2"]},
+        "aggregation": cfg.aggregation,
+        "output": {"format": "parquet", "store": "s3://out/events.parquet"},
+    }
+    return load_config_from_dict(d)
+
+
+class TestInvokeLambdaEvent:
+    """Payload/retry contract of ``_invoke_lambda_event`` (issue #12, Phase 8).
+
+    The payload must match ``_handle_process_event``'s expected params exactly;
+    retries share ``zagg.dispatch.LAMBDA_RETRY`` (one classifier list);
+    ``FunctionError``s are deterministic and never retried; async re-keys the
+    polled envelope to ``event_key``."""
+
+    _EV = {
+        "event_key": "storm1",
+        "event_mask_uri": "s3://b/masks/storm1.nc",
+        "collection_uris": {"merra2": "s3://b/merra2.zarr"},
+        "static_uris": {"cell_areas": "s3://b/areas.nc"},
+    }
+
+    def _client(self, body=None, function_error=None):
+        from unittest.mock import MagicMock
+
+        client = MagicMock()
+        payload = MagicMock()
+        if function_error:
+            payload.read.return_value = function_error.encode()
+            client.invoke.return_value = {"FunctionError": "Unhandled", "Payload": payload}
+        else:
+            body = body or {"ok": True, "results": {"max_t2m": 5.0}, "duration_s": 1.5}
+            payload.read.return_value = json.dumps(
+                {"statusCode": 200, "body": json.dumps(body)}
+            ).encode()
+            client.invoke.return_value = {"Payload": payload}
+        return client
+
+    def test_payload_matches_process_event_contract(self):
+        from zagg import runner
+
+        client = self._client()
+        result = runner._invoke_lambda_event(
+            client,
+            dict(self._EV, s3_credentials={"accessKeyId": "a"}),
+            function_name="process-shard",
+            config_dict={"pipeline": {"type": "temporal"}},
+            output_creds_event={"accessKeyId": "w"},
+        )
+        event = json.loads(client.invoke.call_args.kwargs["Payload"])
+        assert event["mode"] == "process_event"
+        assert event["event_key"] == "storm1"
+        assert event["event_mask_uri"] == "s3://b/masks/storm1.nc"
+        assert event["collection_uris"] == {"merra2": "s3://b/merra2.zarr"}
+        assert event["static_uris"] == {"cell_areas": "s3://b/areas.nc"}
+        assert event["config"] == {"pipeline": {"type": "temporal"}}
+        assert event["return_results"] is True
+        assert event["s3_credentials"] == {"accessKeyId": "a"}
+        assert event["output_credentials"] == {"accessKeyId": "w"}
+        assert "store_path" not in event  # driver writes; worker must not
+        assert client.invoke.call_args.kwargs["InvocationType"] == "RequestResponse"
+        assert result["event_key"] == "storm1"
+        assert result["status_code"] == 200
+        assert result["body"]["results"]["max_t2m"] == 5.0
+        assert result["lambda_duration"] == 1.5
+        assert result["error"] is None
+
+    def test_optional_keys_omitted_when_absent(self):
+        from zagg import runner
+
+        client = self._client()
+        runner._invoke_lambda_event(
+            client,
+            dict(self._EV),
+            function_name="process-shard",
+            config_dict={},
+        )
+        event = json.loads(client.invoke.call_args.kwargs["Payload"])
+        assert "s3_credentials" not in event
+        assert "output_credentials" not in event
+        assert "result_url" not in event
+
+    def test_function_error_not_retried(self):
+        from zagg import runner
+
+        client = self._client(function_error="Task timed out after 720 seconds")
+        result = runner._invoke_lambda_event(
+            client,
+            dict(self._EV),
+            function_name="process-shard",
+            config_dict={},
+            max_retries=3,
+        )
+        assert client.invoke.call_count == 1
+        assert result["timeout"] is True
+        assert "Lambda timeout" in result["error"]
+        assert result["retries"] == 0
+
+    def test_transient_error_retried_with_backoff(self, monkeypatch):
+        from zagg import runner
+
+        sleeps = []
+        monkeypatch.setattr(runner.time, "sleep", lambda s: sleeps.append(s))
+        client = self._client()
+        good = client.invoke.return_value
+        client.invoke.side_effect = [
+            Exception("TooManyRequestsException: Rate exceeded"),
+            good,
+        ]
+        result = runner._invoke_lambda_event(
+            client,
+            dict(self._EV),
+            function_name="process-shard",
+            config_dict={},
+            max_retries=3,
+        )
+        assert client.invoke.call_count == 2
+        assert len(sleeps) == 1
+        assert result["status_code"] == 200
+        assert result["retries"] == 1
+
+    def test_unretryable_error_breaks_out(self, monkeypatch):
+        from zagg import runner
+
+        sleeps = []
+        monkeypatch.setattr(runner.time, "sleep", lambda s: sleeps.append(s))
+        client = self._client()
+        client.invoke.side_effect = Exception("AccessDeniedException")
+        result = runner._invoke_lambda_event(
+            client,
+            dict(self._EV),
+            function_name="process-shard",
+            config_dict={},
+            max_retries=3,
+        )
+        assert client.invoke.call_count == 1
+        assert sleeps == []
+        assert result["status_code"] is None
+        assert "AccessDeniedException" in result["error"]
+
+    def test_async_polls_and_rekeys_envelope(self):
+        from zagg import runner
+
+        client = self._client()
+        fetched = {
+            "statusCode": 200,
+            "body": json.dumps(
+                {"results": {"max_t2m": 5.0}, "timesteps_processed": 2, "duration_s": 2.0}
+            ),
+        }
+        result = runner._invoke_lambda_event(
+            client,
+            dict(self._EV),
+            function_name="process-shard",
+            config_dict={},
+            result_url="s3://out/events.parquet.status/run/storm1.json",
+            result_fetch=lambda: fetched,
+            poll_timeout_s=5,
+        )
+        event = json.loads(client.invoke.call_args.kwargs["Payload"])
+        assert client.invoke.call_args.kwargs["InvocationType"] == "Event"
+        assert event["result_url"] == "s3://out/events.parquet.status/run/storm1.json"
+        assert result["event_key"] == "storm1"
+        assert "shard_key" not in result and "granule_count" not in result
+        assert result["body"]["results"]["max_t2m"] == 5.0
+        assert result["lambda_duration"] == 2.0
+
+    def test_async_payload_over_cap_raises(self):
+        from zagg import runner
+
+        client = self._client()
+        fat = dict(self._EV, static_uris={"blob": "x" * (runner._ASYNC_PAYLOAD_CAP_BYTES + 1)})
+        with pytest.raises(ValueError, match="async dispatch budget"):
+            runner._invoke_lambda_event(
+                client,
+                fat,
+                function_name="process-shard",
+                config_dict={},
+                result_url="s3://out/x.status/run/storm1.json",
+                result_fetch=lambda: None,
+                poll_timeout_s=5,
+            )
+        client.invoke.assert_not_called()
+
+
+class TestTemporalLambdaStrategy:
+    """``backend="lambda"`` temporal fan-out (issue #12, Phase 8): one
+    ``process_event`` invoke per event, rows collected driver-side, one tabular
+    write, per-event failure isolation, spatial machinery reused (preflight
+    probe seams, LambdaExecutor, LAMBDA_RETRY)."""
+
+    def _drive(self, monkeypatch, *, events=None, fake_invoke=None, **agg_kwargs):
+        from unittest.mock import MagicMock
+
+        import boto3
+
+        from zagg import runner
+        from zagg.concurrency import ConcurrencyReport
+
+        captured = {"invokes": [], "written": None}
+
+        monkeypatch.setattr(boto3, "Session", lambda *a, **k: MagicMock())
+        monkeypatch.setattr(runner, "_get_function_timeout_s", lambda *a, **k: 720)
+        monkeypatch.setattr(
+            runner,
+            "compute_available_workers",
+            lambda requested, *a, **k: (
+                min(requested, 4),
+                ConcurrencyReport(
+                    account_limit=1000,
+                    current_concurrent=0,
+                    padding=100,
+                    available=900,
+                    function_reserved=None,
+                ),
+            ),
+        )
+
+        def _default_invoke(client, ev, **kwargs):
+            captured["invokes"].append((ev, kwargs))
+            return {
+                "event_key": ev["event_key"],
+                "status_code": 200,
+                "body": {
+                    "results": {"max_t2m": 5.0},
+                    "timesteps_processed": 2,
+                    "duration_s": 1.0,
+                },
+                "wall_time": 1.0,
+                "lambda_duration": 1.0,
+                "error": None,
+                "retries": 0,
+                "timeout": False,
+            }
+
+        monkeypatch.setattr(runner, "_invoke_lambda_event", fake_invoke or _default_invoke)
+
+        def _fake_write(config, store_path, rows, **kwargs):
+            captured["written"] = {"store_path": store_path, "rows": rows, "kwargs": kwargs}
+            return store_path
+
+        monkeypatch.setattr(runner, "_write_tabular_output", _fake_write)
+
+        summary = agg(
+            _temporal_s3_config(),
+            backend="lambda",
+            events=_uri_events() if events is None else events,
+            **agg_kwargs,
+        )
+        return summary, captured
+
+    def test_one_invoke_per_event_and_rows_written_once(self, monkeypatch):
+        summary, captured = self._drive(monkeypatch)
+        assert len(captured["invokes"]) == 2
+        keys = sorted(ev["event_key"] for ev, _ in captured["invokes"])
+        assert keys == ["storm1", "storm2"]
+        # the driver writes the collected rows exactly once, local-shape rows
+        written = captured["written"]
+        assert written["store_path"] == "s3://out/events.parquet"
+        assert len(written["rows"]) == 2
+        row = next(r for r in written["rows"] if r["event_key"] == "storm1")
+        assert row["results"]["max_t2m"] == 5.0
+        assert row["meta"]["timesteps_processed"] == 2
+        assert summary["backend"] == "lambda"
+        assert summary["total_events"] == 2
+        assert summary["events_with_data"] == 2
+        assert summary["events_error"] == 0
+        assert summary["timesteps_processed"] == 4
+        assert summary["output_path"] == "s3://out/events.parquet"
+        assert summary["gb_seconds"] == pytest.approx(2.0 * 2.0)  # 2 s x 2 GB
+        assert summary["results"] == written["rows"]
+
+    def test_async_wiring_threads_result_channel(self, monkeypatch):
+        summary, captured = self._drive(monkeypatch)  # invocation defaults to async
+        for ev, kwargs in captured["invokes"]:
+            url = kwargs["result_url"]
+            assert url.startswith("s3://out/events.parquet.status/")
+            assert url.endswith(f"/{ev['event_key']}.json")
+            assert callable(kwargs["result_fetch"])
+            assert kwargs["poll_timeout_s"] == 720 + 90.0
+        assert summary["function_timeout_s"] == 720
+
+    def test_sync_invocation_omits_result_channel(self, monkeypatch):
+        _, captured = self._drive(monkeypatch, invocation="sync")
+        for _, kwargs in captured["invokes"]:
+            assert "result_url" not in kwargs
+            assert "result_fetch" not in kwargs
+
+    def test_one_failed_event_does_not_kill_the_run(self, monkeypatch):
+        def _invoke(client, ev, **kwargs):
+            if ev["event_key"] == "storm1":
+                return {
+                    "event_key": "storm1",
+                    "status_code": None,
+                    "body": {},
+                    "wall_time": 1.0,
+                    "lambda_duration": 0,
+                    "error": "Lambda timeout: Task timed out",
+                    "retries": 0,
+                }
+            return {
+                "event_key": ev["event_key"],
+                "status_code": 200,
+                "body": {"results": {"max_t2m": 9.0}, "timesteps_processed": 2},
+                "wall_time": 1.0,
+                "lambda_duration": 1.0,
+                "error": None,
+                "retries": 0,
+                "timeout": False,
+            }
+
+        summary, captured = self._drive(monkeypatch, fake_invoke=_invoke)
+        assert summary["events_error"] == 1
+        assert summary["events_with_data"] == 1
+        (row,) = captured["written"]["rows"]  # only the good event lands a row
+        assert row["event_key"] == "storm2"
+
+    def test_rejects_tuple_events(self, monkeypatch):
+        with pytest.raises(ValueError, match="dicts with 'event_key'"):
+            self._drive(monkeypatch, events=_synthetic_events())
+
+    def test_rejects_non_s3_store(self, monkeypatch):
+        from zagg.config import load_config_from_dict
+
+        cfg = _temporal_s3_config()
+        d = {
+            "pipeline": {"type": "temporal"},
+            "data_source": {"reader": "xarray_s3", "collections": ["merra2"]},
+            "aggregation": cfg.aggregation,
+            "output": {"format": "parquet", "store": "./events.parquet"},
+        }
+        with pytest.raises(ValueError, match="s3:// store path"):
+            agg(load_config_from_dict(d), backend="lambda", events=_uri_events())
+
+    def test_rejects_non_tabular_store(self, monkeypatch):
+        from zagg.config import load_config_from_dict
+
+        cfg = _temporal_s3_config()
+        d = {
+            "pipeline": {"type": "temporal"},
+            "data_source": {"reader": "xarray_s3", "collections": ["merra2"]},
+            "aggregation": cfg.aggregation,
+            "output": {"format": "parquet", "store": "s3://out/events"},
+        }
+        with pytest.raises(ValueError, match="tabular store path"):
+            agg(load_config_from_dict(d), backend="lambda", events=_uri_events())
+
+    def test_dry_run_reports_lambda_backend(self, monkeypatch):
+        summary = agg(
+            _temporal_s3_config(),
+            backend="lambda",
+            events=_uri_events(),
+            dry_run=True,
+        )
+        assert summary == {
+            "dry_run": True,
+            "total_events": 2,
+            "n_specs": 1,
+            "store_path": "s3://out/events.parquet",
+            "backend": "lambda",
+        }
+
+
 class TestStrategyDispatch:
     def test_spatial_uses_spatial_strategy(self, atl06_config):
         from zagg.runner import SpatialStrategy, _get_strategy
@@ -1640,11 +2027,13 @@ class TestTemporalStrategy:
         with pytest.raises(ValueError, match="requires events="):
             agg(_temporal_config())
 
-    def test_lambda_backend_rejected(self):
+    def test_unknown_backend_rejected(self):
+        # lambda is supported since Phase 8 (TestTemporalLambdaStrategy); an
+        # unknown backend still fails fast.
         from zagg.runner import agg
 
-        with pytest.raises(ValueError, match="only the 'local' backend"):
-            agg(_temporal_config(), events=_synthetic_events(), backend="lambda")
+        with pytest.raises(ValueError, match="Unknown backend"):
+            agg(_temporal_config(), events=_synthetic_events(), backend="cluster")
 
     def test_failing_event_counted_as_error(self):
         # A spec referencing a missing variable makes process_event raise; the

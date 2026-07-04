@@ -975,6 +975,92 @@ class TestProcessEventMode:
         assert "read failed" in body["error"]
 
 
+class TestProcessEventReturnResults:
+    """``return_results`` (issue #12, Phase 8): the fan-out driver's contract.
+
+    The worker returns its flattened result values in the response body and
+    skips the tabular write (the driver collects rows and writes the single
+    object once), and ``store_path`` drops out of the required-parameter gate.
+    ``lambda_handler`` also mirrors process_event envelopes to ``result_url``
+    so the async (Event-invoke) fan-out has a pollable result."""
+
+    def _patch(self, handler_mod, monkeypatch):
+        import zagg.output as output
+        import zagg.temporal as temporal
+
+        event_mask, collections, static = _temporal_inputs()
+        captured = {"writes": 0}
+
+        monkeypatch.setattr(temporal, "open_dataset", lambda uri, **k: event_mask)
+        monkeypatch.setattr(temporal, "read_temporal_inputs", lambda *a, **k: (collections, static))
+
+        def _fake_write_tabular(rows, store_path, **kwargs):
+            captured["writes"] += 1
+            return store_path
+
+        monkeypatch.setattr(output, "write_tabular", _fake_write_tabular)
+        return captured
+
+    def test_returns_values_and_skips_write(self, handler_mod, monkeypatch):
+        captured = self._patch(handler_mod, monkeypatch)
+        event = _temporal_event(return_results=True)
+        del event["store_path"]
+        resp = handler_mod._handle_process_event(event)
+        body = json.loads(resp["body"])
+        assert resp["statusCode"] == 200, body
+        assert body["results"]["max_t2m"] == pytest.approx(5.0)
+        assert isinstance(body["results"]["max_t2m"], float)  # JSON-safe scalar
+        assert body["output_path"] is None
+        assert body["timesteps_processed"] == 2
+        assert body["duration_s"] >= 0
+        assert captured["writes"] == 0  # driver writes; worker must not
+
+    def test_store_path_still_required_without_flag(self, handler_mod):
+        event = _temporal_event()
+        del event["store_path"]
+        resp = handler_mod._handle_process_event(event)
+        assert resp["statusCode"] == 400
+        assert "store_path" in json.loads(resp["body"])["error"]
+
+    def test_gate_still_rejects_missing_mask_uri(self, handler_mod):
+        event = _temporal_event(return_results=True)
+        del event["event_mask_uri"]
+        resp = handler_mod._handle_process_event(event)
+        assert resp["statusCode"] == 400
+        assert "event_mask_uri" in json.loads(resp["body"])["error"]
+
+    def test_direct_invoke_body_has_no_results_key(self, handler_mod, monkeypatch):
+        # Without the flag the existing single-invoke contract is unchanged.
+        self._patch(handler_mod, monkeypatch)
+        resp = handler_mod._handle_process_event(_temporal_event())
+        assert "results" not in json.loads(resp["body"])
+
+    def test_result_url_mirrors_process_event_envelope(self, handler_mod, monkeypatch, tmp_path):
+        self._patch(handler_mod, monkeypatch)
+        url = str(tmp_path / "status" / "storm1.json")
+        event = _temporal_event(return_results=True, result_url=url)
+        del event["store_path"]
+        resp = handler_mod.lambda_handler(event, _context())
+        assert resp["statusCode"] == 200
+        written = json.loads(Path(url).read_text())
+        assert written == resp
+        assert json.loads(written["body"])["results"]["max_t2m"] == pytest.approx(5.0)
+
+    def test_result_url_mirrors_500_envelope(self, handler_mod, monkeypatch, tmp_path):
+        import zagg.temporal as temporal
+
+        def _boom(*a, **k):
+            raise RuntimeError("read failed")
+
+        monkeypatch.setattr(temporal, "open_dataset", _boom)
+        url = str(tmp_path / "status" / "storm1.json")
+        resp = handler_mod.lambda_handler(
+            _temporal_event(return_results=True, result_url=url), _context()
+        )
+        assert resp["statusCode"] == 500
+        assert json.loads(Path(url).read_text()) == resp
+
+
 class TestPeakRSSSampler:
     """Issue #141: per-invocation peak-RSS sampling. ``max_memory_mb`` must reflect
     the CURRENT invocation's peak (sampled ``VmRSS``), not the warm container's

@@ -178,12 +178,15 @@ def agg(
         ``"local"`` backend.
 
     events : iterable, optional
-        Temporal pipeline only (``pipeline.type: temporal``/``event``): an
-        iterable of ``(event_key, event_mask, collections, static_data)`` tuples
-        fed one-per-worker to :func:`zagg.temporal.process_event`. Ignored by
-        the spatial path. Until the Phase-6/7 event reader + catalog land, the
-        caller supplies events directly (e.g. from a notebook), which is enough
-        to run a temporal config end-to-end on the local backend.
+        Temporal pipeline only (``pipeline.type: temporal``/``event``), one
+        work unit per event. Local backend: ``(event_key, event_mask,
+        collections, static_data)`` tuples fed to
+        :func:`zagg.temporal.process_event` in-process. Lambda backend:
+        URI-shaped dicts (``{"event_key", "event_mask_uri", "collection_uris",
+        "static_uris", "s3_credentials"?}``) fanned out one ``process_event``
+        invoke per event (see :func:`_run_lambda_events`). Ignored by the
+        spatial path. Until the event reader + catalog land, the caller
+        supplies events directly (e.g. from a notebook).
     Returns
     -------
     dict
@@ -344,11 +347,14 @@ class TemporalStrategy:
 
     Drives :func:`zagg.temporal.process_event` over the merged ``dispatch.py``
     primitives: one work unit per event, fanned out on a
-    :class:`~zagg.dispatch.LocalExecutor` (the Lambda backend lands with the
-    Phase-7 handler). ``specs_from_config(config)`` is resolved once and shared
-    across every event. Each event is an
-    ``(event_key, event_mask, collections, static_data)`` tuple supplied via the
-    ``events`` argument until the Phase-6/7 reader + catalog land.
+    :class:`~zagg.dispatch.LocalExecutor` (``backend="local"``) or one Lambda
+    ``process_event`` invoke per event via :func:`_run_lambda_events`
+    (``backend="lambda"``, issue #12 Phase 8). ``specs_from_config(config)`` is
+    resolved once and shared across every event. Until the event reader/catalog
+    land, events are supplied via the ``events`` argument: in-memory
+    ``(event_key, event_mask, collections, static_data)`` tuples on the local
+    backend, URI-shaped dicts on the lambda backend (the worker loads inputs
+    from S3 itself).
     """
 
     def run(
@@ -376,16 +382,15 @@ class TemporalStrategy:
     ):
         from zagg.temporal import process_event, specs_from_config
 
-        if backend != "local":
-            raise ValueError(
-                f"temporal pipeline supports only the 'local' backend today "
-                f"(got {backend!r}); the Lambda handler lands in Phase 7"
-            )
+        if backend not in ("local", "lambda"):
+            raise ValueError(f"Unknown backend: {backend!r} (expected 'local' or 'lambda')")
         if events is None:
             raise ValueError(
-                "temporal pipeline requires events= (an iterable of "
-                "(event_key, event_mask, collections, static_data) tuples); the "
-                "event reader/catalog lands in a later phase"
+                "temporal pipeline requires events= (local backend: an iterable "
+                "of (event_key, event_mask, collections, static_data) tuples; "
+                "lambda backend: an iterable of URI dicts -- see "
+                "_run_lambda_events); the event reader/catalog lands in a later "
+                "phase"
             )
 
         store_path = store or get_store_path(config)
@@ -400,8 +405,22 @@ class TemporalStrategy:
                 "total_events": len(event_list),
                 "n_specs": len(specs),
                 "store_path": store_path,
-                "backend": "local",
+                "backend": backend,
             }
+
+        if backend == "lambda":
+            return _run_lambda_events(
+                config,
+                event_list,
+                store_path,
+                max_workers=max_workers,
+                region=region,
+                function_name=function_name,
+                output_credentials=output_credentials,
+                output_endpoint_url=output_endpoint_url,
+                max_retries=max_retries,
+                invocation=invocation,
+            )
 
         if max_workers is None:
             max_workers = 4
@@ -508,6 +527,236 @@ def _get_strategy(pipeline_type: str):
         return _STRATEGIES[pipeline_type]()
     except KeyError:  # pragma: no cover - get_pipeline_type already gates the set
         raise ValueError(f"No strategy for pipeline.type={pipeline_type!r}") from None
+
+
+def _run_lambda_events(
+    config,
+    events,
+    store_path,
+    *,
+    max_workers,
+    region,
+    function_name,
+    output_credentials=None,
+    output_endpoint_url=None,
+    max_retries=3,
+    invocation="async",
+):
+    """Fan the temporal pipeline out one event per Lambda invoke (issue #12, Phase 8).
+
+    Mirrors the spatial ``_run_lambda`` transport -- the preflight concurrency
+    probe, the pool-sized boto3 client, ``LambdaExecutor`` +
+    :func:`zagg.dispatch.dispatch`, and the issue-151 async Event-invoke +
+    result-object poll -- but each work unit is one event handled by the
+    worker's ``mode="process_event"``, reproducing the antarctic_AR_dataset
+    orchestrator's one-invocation-per-storm fan-out on zagg's stack. Workers
+    run with ``return_results`` set: each returns its flattened result values
+    in the response envelope (mirrored through ``result_url`` on async runs)
+    and skips its own store write; the driver collects the rows and writes the
+    single tabular object once, so N workers never race the shared
+    ``store_path``. No setup/finalize invokes -- tabular output has no zarr
+    template or metadata consolidation.
+
+    ``events`` items are URI-shaped dicts (the by-reference twin of the local
+    backend's in-memory tuples): ``{"event_key", "event_mask_uri",
+    "collection_uris", "static_uris", "s3_credentials"?}``. The worker loads
+    each event's inputs from S3 itself, which keeps the async request payload
+    far under the 256 KB Event cap (masks travel by URI, not by value -- unlike
+    the AR repo's inline base64 masks, which only fit a synchronous invoke).
+    """
+    from dataclasses import asdict
+
+    import boto3
+    from botocore.config import Config
+
+    event_list = list(events)
+    for ev in event_list:
+        if not isinstance(ev, dict) or "event_key" not in ev or "event_mask_uri" not in ev:
+            raise ValueError(
+                "lambda temporal events must be dicts with 'event_key' and "
+                "'event_mask_uri' (plus optional 'collection_uris' / "
+                "'static_uris' / 's3_credentials') -- the worker loads inputs "
+                f"from S3 by URI; got: {ev!r}"
+            )
+    if not store_path or not store_path.startswith("s3://"):
+        raise ValueError(f"Lambda backend requires s3:// store path, got: {store_path}")
+    if not store_path.lower().endswith(_TABULAR_SUFFIXES):
+        raise ValueError(
+            "lambda temporal output requires a concrete tabular store path "
+            f"(suffix in {_TABULAR_SUFFIXES}) so the collected rows have a "
+            f"target, got: {store_path!r}"
+        )
+    if invocation not in ("async", "sync"):
+        raise ValueError(f"Unknown invocation: {invocation!r} (expected 'async' or 'sync')")
+    if function_name is None:
+        function_name = os.environ.get("ZAGG_LAMBDA_FUNCTION_NAME", "process-shard")
+
+    n = len(event_list)
+    logger.info(f"Processing {n} events (lambda)")
+    if max_workers is None:
+        # The AR-repo orchestrator's default fan-out width (one storm per
+        # worker); the preflight probe clamps it to account concurrency anyway.
+        max_workers = 1000
+    max_workers = min(max_workers, n) if n else 1
+
+    config_dict = asdict(config)
+    output_creds_event = _build_output_creds_event(
+        output_credentials,
+        output_endpoint_url,
+        region,
+    )
+
+    # Async result channel (issue #151), same contract as the spatial path: a
+    # per-run unique status prefix next to the tabular store; each worker
+    # mirrors its envelope to <prefix>/<event_key>.json and the dispatch
+    # threads poll for it instead of holding a synchronous connection open.
+    result_prefix = None
+    result_box: dict = {}
+    if invocation == "async":
+        result_prefix = f"{store_path.rstrip('/')}.status/{uuid.uuid4().hex}"
+        logger.info(f"Async worker results at {result_prefix}")
+
+    session = boto3.Session()
+    state: dict = {}
+
+    def _preflight(n_units):
+        # Same probe/clamp/pool-sizing as the spatial _run_lambda preflight,
+        # referencing the same module seams (compute_available_workers /
+        # _get_function_timeout_s) so tests patch one set of objects.
+        probe_lambda = session.client("lambda", region_name=region)
+        cloudwatch_client = session.client("cloudwatch", region_name=region)
+        clamped, concurrency_report = compute_available_workers(
+            max_workers,
+            probe_lambda,
+            cloudwatch_client,
+            function_name,
+        )
+        _log_concurrency_report(concurrency_report, clamped)
+        boto_config = Config(
+            read_timeout=900,
+            connect_timeout=10,
+            retries={"max_attempts": 0},
+            max_pool_connections=clamped,
+        )
+        state["workers"] = clamped
+        state["lambda_client"] = session.client(
+            "lambda",
+            region_name=region,
+            config=boto_config,
+        )
+        state["function_timeout_s"] = _get_function_timeout_s(state["lambda_client"], function_name)
+        return PreflightReport(workers=clamped, detail=concurrency_report)
+
+    def _event_work(ev):
+        extra = {}
+        if result_prefix is not None:
+            key = f"{ev['event_key']}.json"
+            extra["result_url"] = f"{result_prefix}/{key}"
+            extra["result_fetch"] = _result_fetcher(
+                result_box, result_prefix, output_creds_event, region, key
+            )
+            extra["poll_timeout_s"] = state["function_timeout_s"] + _ASYNC_POLL_MARGIN_S
+        return _invoke_lambda_event(
+            state["lambda_client"],
+            ev,
+            function_name=function_name,
+            config_dict=config_dict,
+            output_creds_event=output_creds_event,
+            max_retries=max_retries,
+            max_workers=state["workers"],
+            **extra,
+        )
+
+    executor = LambdaExecutor(
+        _event_work,
+        preflight_fn=_preflight,
+        pool_factory=ThreadPoolExecutor,
+        # Tabular output has no metadata to consolidate; keep the executor
+        # contract without a finalize invoke.
+        finalize_fn=lambda: None,
+    )
+    executor.preflight(n)
+    max_workers = state["workers"]
+
+    start_time = time.time()
+    rows: list[dict] = []
+
+    def _accumulate(report, i, result):
+        event_key = result.get("event_key")
+        body = result.get("body") or {}
+        error = result.get("error")
+        if result.get("status_code") == 200 and not error:
+            timesteps = body.get("timesteps_processed") or 0
+            report.total_obs += timesteps
+            report.cells_with_data += 1
+            rows.append(
+                {
+                    "event_key": event_key,
+                    "results": body.get("results") or {},
+                    "meta": {"timesteps_processed": timesteps},
+                }
+            )
+        else:
+            report.cells_error += 1
+            logger.warning(f"  [{i}/{n}] event {event_key}: {error}")
+        report.results.append(result)
+
+        if i % 50 == 0:
+            elapsed = time.time() - start_time
+            rate = i / elapsed if elapsed > 0 else 0
+            logger.info(f"  [{i:4d}/{n}] {rate:.1f} events/s")
+
+    try:
+        report = dispatch(
+            executor,
+            event_list,
+            retry=LAMBDA_RETRY,
+            accumulate=_accumulate,
+            on_submit_error=lambda e: raise_for_fd_exhaustion(e, max_workers),
+        )
+    finally:
+        executor.shutdown()
+    wall_time = time.time() - start_time
+
+    # One tabular write for the whole run, from the driver -- same call the
+    # local backend makes, so the output object and summary schema match.
+    output_path = _write_tabular_output(
+        config,
+        store_path,
+        rows,
+        credentials=output_credentials,
+        endpoint_url=output_endpoint_url,
+        region=region,
+    )
+
+    # Cost presentation mirrors the spatial path: one multiply over the summed
+    # per-event durations the report accumulated.
+    total_lambda_time = report.cost.compute_time_s
+    gb_seconds = total_lambda_time * LAMBDA_MEMORY_GB
+    estimated_cost = gb_seconds * LAMBDA_PRICE_PER_GB_SEC
+
+    summary = {
+        "total_events": n,
+        "events_with_data": report.cells_with_data,
+        "events_error": report.cells_error,
+        "timesteps_processed": report.total_obs,
+        "wall_time_s": wall_time,
+        "lambda_time_s": total_lambda_time,
+        "gb_seconds": gb_seconds,
+        "price_per_gb_sec": LAMBDA_PRICE_PER_GB_SEC,
+        "estimated_cost_usd": estimated_cost,
+        "function_timeout_s": state.get("function_timeout_s", _DEFAULT_FUNCTION_TIMEOUT_S),
+        "store_path": store_path,
+        "output_path": output_path,
+        "backend": "lambda",
+        "results": rows,
+    }
+    logger.info(
+        f"Done: {report.cells_with_data} events, {report.total_obs} timesteps, "
+        f"{report.cells_error} errors, {wall_time:.1f}s, "
+        f"~${estimated_cost:.4f} ({gb_seconds:.1f} GB-s)"
+    )
+    return summary
 
 
 #: ``output.store`` suffixes that name a concrete tabular output *file* (vs a
@@ -1385,6 +1634,142 @@ def _fetch_result(result_store, key):
     except (FileNotFoundError, NotFoundError):
         return None
     return json.loads(bytes(data))
+
+
+def _invoke_lambda_event(
+    lambda_client,
+    ev,
+    *,
+    function_name,
+    config_dict,
+    output_creds_event=None,
+    max_retries=3,
+    max_workers=None,
+    result_url=None,
+    result_fetch=None,
+    poll_timeout_s=None,
+):
+    """Invoke the Lambda ``process_event`` mode for one temporal event (issue #12, Phase 8).
+
+    The temporal twin of :func:`_invoke_lambda_cell`: the same deterministic
+    no-retry rule for ``FunctionError``s (#119), the same transient client-side
+    retry -- classified and backed off by the shared
+    :data:`zagg.dispatch.LAMBDA_RETRY` policy, so the retryable-substring list
+    lives in one place instead of a third copy -- and the same issue-151 async
+    channel (``result_url`` flips the invoke to fire-and-forget and
+    :func:`_poll_lambda_result` collects the worker's mirrored envelope).
+    Returns the per-event result dict the dispatch accumulator folds, keyed by
+    ``event_key`` where the spatial path carries ``shard_key``.
+
+    The payload sets ``return_results`` so the worker returns its flattened
+    values in the response body and skips its own tabular write (the driver
+    writes once). ``output_creds_event`` is forwarded only for the async result
+    mirror; ``ev["s3_credentials"]``, when present, carries per-event read
+    credentials for the source datasets.
+    """
+    wall_start = time.time()
+
+    event = {
+        "mode": "process_event",
+        "event_key": ev["event_key"],
+        "event_mask_uri": ev["event_mask_uri"],
+        "collection_uris": ev.get("collection_uris", {}),
+        "static_uris": ev.get("static_uris", {}),
+        "config": config_dict,
+        # The driver collects rows and writes the single tabular object; the
+        # worker returns values instead of racing a shared store_path write.
+        "return_results": True,
+    }
+    if ev.get("s3_credentials"):
+        event["s3_credentials"] = ev["s3_credentials"]
+    if output_creds_event is not None:
+        event["output_credentials"] = output_creds_event
+
+    invocation_type = "RequestResponse"
+    if result_url is not None:
+        event["result_url"] = result_url
+        invocation_type = "Event"
+
+    payload = json.dumps(event)
+    if invocation_type == "Event" and len(payload) > _ASYNC_PAYLOAD_CAP_BYTES:
+        raise ValueError(
+            f"event {ev['event_key']!r} payload is {len(payload):,} bytes, over "
+            f"the {_ASYNC_PAYLOAD_CAP_BYTES:,}-byte async dispatch budget (Lambda "
+            'caps Event invokes at 256 KB): pass invocation="sync" for this run, '
+            "or slim the event (masks/collections travel as URIs, not inline data)"
+        )
+
+    last_error = None
+    for attempt in range(max_retries):
+        try:
+            response = lambda_client.invoke(
+                FunctionName=function_name,
+                InvocationType=invocation_type,
+                Payload=payload,
+            )
+            if result_url is not None:
+                # 202 accepted -- the worker's envelope lands at result_url;
+                # poll with the shared spatial machinery and re-key the result
+                # to the temporal shape.
+                polled = _poll_lambda_result(
+                    result_fetch,
+                    ev["event_key"],
+                    0,
+                    wall_start,
+                    attempt,
+                    poll_timeout_s,
+                )
+                polled["event_key"] = polled.pop("shard_key")
+                polled.pop("granule_count", None)
+                return polled
+
+            function_error = response.get("FunctionError")
+            is_timeout = False
+            if function_error:
+                # Deterministic for a given event (timeout / OOM / escaped
+                # exception) -- never retried, mirroring the spatial rule (#119).
+                error_payload = response["Payload"].read().decode("utf-8")
+                if "Task timed out" in error_payload:
+                    is_timeout = True
+                    last_error = f"Lambda timeout: {error_payload[:100]}"
+                elif "Runtime.OutOfMemory" in error_payload:
+                    last_error = f"Lambda OOM: {error_payload[:100]}"
+                else:
+                    last_error = f"Lambda error ({function_error}): {error_payload[:100]}"
+
+            result = json.loads(response["Payload"].read()) if not function_error else {}
+            try:
+                body = json.loads(result.get("body", "{}"))
+            except (json.JSONDecodeError, TypeError):
+                body = {}
+
+            return {
+                "event_key": ev["event_key"],
+                "status_code": result.get("statusCode"),
+                "body": body,
+                "wall_time": time.time() - wall_start,
+                "lambda_duration": body.get("duration_s", 0),
+                "error": last_error if function_error else body.get("error"),
+                "retries": attempt,
+                "timeout": is_timeout,
+            }
+        except Exception as e:
+            raise_for_fd_exhaustion(e, max_workers)
+            last_error = str(e)
+            if LAMBDA_RETRY.classify(e):
+                time.sleep(LAMBDA_RETRY.backoff(attempt))
+            else:
+                break
+
+    return {
+        "event_key": ev["event_key"],
+        "status_code": None,
+        "body": {},
+        "wall_time": time.time() - wall_start,
+        "lambda_duration": 0,
+        "error": last_error,
+        "retries": max_retries,
+    }
 
 
 def _poll_lambda_result(

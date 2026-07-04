@@ -74,6 +74,12 @@ Process-event mode (the temporal/event pipeline worker -- issue #12, Phase 7b):
     "config": dict,             # temporal pipeline config (specs etc.)
     "s3_credentials": dict (optional),     # read creds for source datasets
     "output_credentials": dict (optional), # write creds for the tabular store
+    "return_results": bool (optional),  # fan-out driver mode (issue #12 Phase
+                                        #   8): skip the worker-side tabular
+                                        #   write, return the flattened result
+                                        #   values in the response body (and
+                                        #   via "result_url" on Event invokes);
+                                        #   "store_path" is then optional
 }
 
 This mirrors the local ``zagg.runner.TemporalStrategy``: load the event's
@@ -269,7 +275,12 @@ def lambda_handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
     if mode == "finalize":
         return _handle_finalize(event)
     if mode in ("process_event", "temporal", "event"):
-        return _handle_process_event(event)
+        response = _handle_process_event(event)
+        # Async result channel (issue #151 / #12 Phase 8): mirror the envelope
+        # for the temporal fan-out's poll, same contract as process mode below.
+        if event.get("result_url"):
+            _write_result(event["result_url"], response, event)
+        return response
     response = _handle_process(event, context)
     # Async result channel (issue #151): on an Event invoke the return value is
     # discarded, so mirror the response envelope to the orchestrator-supplied
@@ -360,8 +371,16 @@ def _handle_process_event(event: Dict[str, Any]) -> Dict[str, Any]:
 
     event_key = event.get("event_key")
     logger.info(f"process_event mode: event {event_key!r}")
+    start_time = time.time()
     try:
-        required = ["event_key", "event_mask_uri", "store_path", "config"]
+        # The fan-out driver (issue #12, Phase 8) sets return_results=True: the
+        # flattened result values ride back in the response body (async: via
+        # result_url) and the driver writes the single tabular object once, so
+        # N workers never race a shared store_path -- which is then optional.
+        return_results = bool(event.get("return_results"))
+        required = ["event_key", "event_mask_uri", "config"]
+        if not return_results:
+            required.append("store_path")
         missing = [p for p in required if p not in event]
         if missing:
             error_msg = f"Missing required parameters: {', '.join(missing)}"
@@ -392,21 +411,24 @@ def _handle_process_event(event: Dict[str, Any]) -> Dict[str, Any]:
 
         results, meta = process_event(event_key, event_mask, collections, specs, static_data)
 
-        out_creds = event.get("output_credentials") or None
-        out_endpoint = out_creds.get("endpointUrl") if out_creds else None
-        out_region = (out_creds or {}).get("region", region)
-        # ``config.output["format"]`` may be absent (None); ``write_tabular``
-        # then infers parquet/csv from the store_path suffix -- the same effect
-        # the runner gets by passing ``output_format(config)`` (which defaults to
-        # ``zarr`` and is filtered out before this temporal write).
-        output_path = write_tabular(
-            [{"event_key": event_key, "results": results, "meta": meta}],
-            event["store_path"],
-            output_format=config.output.get("format"),
-            credentials=out_creds,
-            endpoint_url=out_endpoint,
-            region=out_region,
-        )
+        if return_results:
+            output_path = None
+        else:
+            out_creds = event.get("output_credentials") or None
+            out_endpoint = out_creds.get("endpointUrl") if out_creds else None
+            out_region = (out_creds or {}).get("region", region)
+            # ``config.output["format"]`` may be absent (None); ``write_tabular``
+            # then infers parquet/csv from the store_path suffix -- the same effect
+            # the runner gets by passing ``output_format(config)`` (which defaults to
+            # ``zarr`` and is filtered out before this temporal write).
+            output_path = write_tabular(
+                [{"event_key": event_key, "results": results, "meta": meta}],
+                event["store_path"],
+                output_format=config.output.get("format"),
+                credentials=out_creds,
+                endpoint_url=out_endpoint,
+                region=out_region,
+            )
 
         body = {
             "ok": True,
@@ -414,8 +436,13 @@ def _handle_process_event(event: Dict[str, Any]) -> Dict[str, Any]:
             "event_key": event_key,
             "timesteps_processed": meta.get("timesteps_processed"),
             "output_path": output_path,
+            "duration_s": round(time.time() - start_time, 2),
             "max_memory_mb": _max_memory_mb(),
         }
+        if return_results:
+            # JSON-safe scalars (numpy floats don't json.dumps), mirroring the
+            # antarctic_AR_dataset worker's float-cast return contract.
+            body["results"] = {k: (None if v is None else float(v)) for k, v in results.items()}
         logger.info(json.dumps({"event_type": "process_event_complete", **body}))
         return {"statusCode": 200, "body": json.dumps(body)}
     except Exception as e:
