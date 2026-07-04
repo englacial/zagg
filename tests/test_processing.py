@@ -2502,6 +2502,105 @@ class TestVectorRoundTrip:
             write_dataframe_to_zarr(table, store, grid=_OneChunkGrid(), chunk_idx=(0,))
 
 
+class TestTypedMortonCarrier:
+    """Issue #135: the arrow carrier keeps the ``morton`` coordinate as mortie's
+    ``morton_index`` extension column end-to-end; the write boundary extracts the
+    packed uint64 words, so on-disk output stays byte-identical to the pandas
+    carrier AND to the pre-#135 uint64-strip carrier. The pandas path is untouched."""
+
+    @staticmethod
+    def _setup():
+        from mortie import geo2mort
+
+        cfg = default_config("atl06")
+        grid = HealpixGrid(2, 4, layout="fullsphere", config=cfg)
+        # Southern parent: its order-4 children set bit 63 (the #71 sign hazard).
+        parent = int(geo2mort(-78.5, -132.0, order=2)[0])
+        n = len(grid.children(parent))
+        rng = np.random.default_rng(135)
+        stats = {
+            var: (
+                rng.integers(0, 9, n).astype(np.int32)
+                if var == "count"
+                else rng.random(n).astype(np.float32)
+            )
+            for var in get_data_vars(cfg)
+        }
+        return cfg, grid, parent, stats
+
+    def _carrier(self, cfg, grid, parent, stats, use_arrow):
+        return _build_output(
+            stats, get_data_vars(cfg), get_agg_fields(cfg), grid, parent, use_arrow=use_arrow
+        )
+
+    def test_arrow_carrier_morton_is_extension_typed(self):
+        pytest.importorskip("arro3.core")
+        from zagg.grids.morton import is_morton_arrow
+
+        cfg, grid, parent, stats = self._setup()
+        carrier = self._carrier(cfg, grid, parent, stats, use_arrow=True)
+        assert is_morton_arrow(carrier.column("morton"))
+        # cell_ids stays a plain NESTED uint64 column, no extension metadata.
+        assert not is_morton_arrow(carrier.column("cell_ids"))
+
+    def test_extraction_yields_uint64_words(self):
+        pytest.importorskip("arro3.core")
+        cfg, grid, parent, stats = self._setup()
+        carrier = self._carrier(cfg, grid, parent, stats, use_arrow=True)
+        cols = dict(_iter_carrier_columns(carrier))
+        words = cols["morton"]
+        assert words.dtype == np.uint64
+        np.testing.assert_array_equal(words, np.asarray(grid.children(parent), dtype=np.uint64))
+        # Southern children set bit 63: intact as uint64 (#71).
+        assert (words.view(np.int64) < 0).any()
+
+    @staticmethod
+    def _store_bytes(carrier, grid, parent):
+        store = MemoryStore()
+        grid.emit_template(store)
+        write_dataframe_to_zarr(carrier, store, grid=grid, chunk_idx=grid.block_index(parent))
+        return {k: v.to_bytes() for k, v in store._store_dict.items()}
+
+    def test_store_bytes_identical_across_carriers(self):
+        """Typed-arrow, pandas, and the pre-#135 uint64-strip carrier all write the
+        same bytes — the extension type lives at the interchange layer only."""
+        ac = pytest.importorskip("arro3.core")
+        from zagg.config import get_output_signature
+        from zagg.grids.morton import is_morton_array, morton_words
+
+        cfg, grid, parent, stats = self._setup()
+        agg_fields = get_agg_fields(cfg)
+
+        typed = self._store_bytes(
+            self._carrier(cfg, grid, parent, stats, use_arrow=True), grid, parent
+        )
+        via_pandas = self._store_bytes(
+            self._carrier(cfg, grid, parent, stats, use_arrow=False), grid, parent
+        )
+        # Reproduce the pre-#135 carrier exactly: the deliberate uint64 strip.
+        columns = {
+            var: _arrow_column(stats[var], get_output_signature(agg_fields[var]))
+            for var in get_data_vars(cfg)
+        }
+        for name, vals in grid.chunk_coords(parent).items():
+            arr = morton_words(vals) if is_morton_array(vals) else np.asarray(vals)
+            columns[name] = ac.Array.from_numpy(np.ascontiguousarray(arr))
+        stripped = self._store_bytes(ac.Table.from_pydict(columns), grid, parent)
+
+        assert typed.keys() == via_pandas.keys() == stripped.keys()
+        for key in typed:
+            assert typed[key] == via_pandas[key], f"arrow vs pandas differ at {key}"
+            assert typed[key] == stripped[key], f"typed vs pre-#135 strip differ at {key}"
+
+    def test_pandas_carrier_untouched(self):
+        from zagg.grids.morton import is_morton_array
+
+        cfg, grid, parent, stats = self._setup()
+        df = self._carrier(cfg, grid, parent, stats, use_arrow=False)
+        assert isinstance(df, pd.DataFrame)
+        assert is_morton_array(df["morton"].values)
+
+
 class TestChunkResolutionCompanion:
     """Issue #30 item 2: a ``resolution: chunk`` field is written ONCE per chunk to
     a companion array shaped at the chunk grid (main.shape // chunk_shape), indexed
