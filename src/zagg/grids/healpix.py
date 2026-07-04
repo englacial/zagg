@@ -524,12 +524,15 @@ class HealpixGrid:
         """Canonical fingerprint of the grid's defining parameters.
 
         The full fingerprint: the spatial layout (:meth:`spatial_signature`)
-        plus the Option-B output-field set. ``nests_with`` (#29) keys on the
-        latter; the shard-map reuse guard keys on the former (#89).
+        plus the Option-B output-field set and the ``cell_ids_encoding``
+        (issue #135 — mixed encodings must never co-aggregate; ``nests_with``
+        keys on both). The shard-map reuse guard keys on the spatial part
+        only (#89).
         """
         return {
             **self.spatial_signature(),
             "output_fields": output_field_signature(self.config),
+            "cell_ids_encoding": self.cell_ids_encoding,
         }
 
     def nests_with(self, other) -> bool:
@@ -538,9 +541,14 @@ class HealpixGrid:
         Any two HEALPix grids nest (the nested hierarchy subdivides 4-for-1 at
         every order), provided they declare the same Option-B output-field set
         (issue #29) — co-aggregated grids must produce the same scalar/vector
-        schema. Cross-family (e.g. rectilinear) never nests.
+        schema — and the same ``cell_ids_encoding`` (issue #135): NESTED ids
+        and morton words are different id spaces, so a consumer joining
+        co-aggregated products on ``cell_ids`` would silently mismatch.
+        Cross-family (e.g. rectilinear) never nests.
         """
         if not isinstance(other, HealpixGrid):
+            return False
+        if self.cell_ids_encoding != other.cell_ids_encoding:
             return False
         return output_field_signature(self.config) == output_field_signature(other.config)
 

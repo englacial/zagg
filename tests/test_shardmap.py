@@ -540,13 +540,20 @@ class TestBuildAOIMask:
 
 
 class TestSpatialSignature:
-    """``spatial_signature()`` is the full signature minus ``output_fields`` (#89)."""
+    """``spatial_signature()`` is the full signature minus the co-aggregation
+    components — ``output_fields`` (#89) and, for HEALPix, ``cell_ids_encoding``
+    (issue #135)."""
 
     def test_healpix_excludes_output_fields(self):
         g = HealpixGrid(6, 12, layout="fullsphere")
         spatial = g.spatial_signature()
         assert "output_fields" not in spatial
-        assert g.signature() == {**spatial, "output_fields": g.signature()["output_fields"]}
+        assert "cell_ids_encoding" not in spatial
+        assert g.signature() == {
+            **spatial,
+            "output_fields": g.signature()["output_fields"],
+            "cell_ids_encoding": "nested",
+        }
 
     def test_rectilinear_excludes_output_fields(self, grid):
         spatial = grid.spatial_signature()

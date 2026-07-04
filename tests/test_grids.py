@@ -819,6 +819,25 @@ class TestCellIdsEncoding:
         with pytest.raises(ValueError, match="Unknown cell_ids_encoding"):
             self._grid("ring")
 
+    def test_signature_records_encoding(self):
+        # The full fingerprint carries the encoding (issue #135) so the
+        # validate_compatible rejection message names the actual mismatch;
+        # spatial_signature (shard-map reuse) deliberately does not.
+        assert self._grid().signature()["cell_ids_encoding"] == "nested"
+        assert self._grid("morton").signature()["cell_ids_encoding"] == "morton"
+        assert "cell_ids_encoding" not in self._grid("morton").spatial_signature()
+
+    def test_mixed_encodings_do_not_nest(self):
+        # NESTED ids and morton words are different id spaces: co-aggregating
+        # them would let a consumer join on cell_ids and silently mismatch.
+        nested, morton = self._grid(), self._grid("morton")
+        assert not nested.nests_with(morton)
+        assert not morton.nests_with(nested)
+        # Same encoding still nests — including default vs explicit "nested",
+        # so the gate changes nothing for anyone not using the flag.
+        assert nested.nests_with(self._grid("nested"))
+        assert morton.nests_with(self._grid("morton"))
+
 
 class TestChunkInnerMultiChunk:
     """Issue #30 item 3: an optional finer ``chunk_inner`` level between shard and
