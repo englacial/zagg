@@ -457,9 +457,9 @@ class TemporalStrategy:
             executor.shutdown()
         wall_time = time.time() - start_time
 
-        # Persist the event rows through the output writer the config selects
-        # (issue #12, Phase 6). ``output.format`` resolves a writer from the
-        # registry; the tabular writer serialises the rows to ``store_path``. A
+        # Persist the event rows to the tabular output the config selects
+        # (issue #12, Phase 6). ``output.format`` picks the serialisation; the
+        # tabular writer serialises the rows to ``store_path``. A
         # store that is a bare directory (the default) or has no rows leaves the
         # results in-memory only -- the writer is not invoked. ``s3://`` targets
         # serialise the single Parquet/CSV object via obstore (issue #12, Phase

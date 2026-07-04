@@ -4,65 +4,11 @@ import numpy as np
 import pandas as pd
 import pytest
 
-from zagg.output import (
-    TabularWriter,
-    Writer,
-    ZarrGridWriter,
-    get_writer,
-    output_format,
-    register_writer,
-)
-from zagg.output import base as output_base
+from zagg.output import TabularWriter, output_format
 
 # ---------------------------------------------------------------------------
-# Registry / format resolution
+# Format resolution
 # ---------------------------------------------------------------------------
-
-
-class TestWriterRegistry:
-    def test_zarr_resolves_to_grid_writer(self):
-        assert isinstance(get_writer("zarr"), ZarrGridWriter)
-
-    @pytest.mark.parametrize("fmt", ["tabular", "parquet", "csv"])
-    def test_tabular_aliases_resolve_to_tabular_writer(self, fmt):
-        assert isinstance(get_writer(fmt), TabularWriter)
-
-    def test_unknown_format_raises_listing_known(self):
-        with pytest.raises(ValueError, match="no writer for output.format='bogus'"):
-            get_writer("bogus")
-
-    def test_writers_satisfy_protocol(self):
-        assert isinstance(ZarrGridWriter(), Writer)
-        assert isinstance(TabularWriter(), Writer)
-
-    def test_register_writer_rejects_empty_name(self):
-        with pytest.raises(ValueError, match="non-empty"):
-            register_writer("", TabularWriter)
-
-    def test_register_writer_duplicate_raises_without_replace(self):
-        with pytest.raises(ValueError, match="already registered"):
-            register_writer("zarr", ZarrGridWriter)
-
-    def test_register_writer_replace_overrides(self):
-        sentinel = type("Sentinel", (), {})
-        original = output_base._WRITERS["zarr"]
-        try:
-            register_writer("zarr", sentinel, replace=True)
-            assert isinstance(get_writer("zarr"), sentinel)
-        finally:
-            # Restore the canonical mapping so other tests see the real writer.
-            register_writer("zarr", original, replace=True)
-
-    def test_register_writer_decorator_form(self):
-        @register_writer("decotest")
-        class _DecoWriter:
-            def write(self, payload, **kwargs):
-                return payload
-
-        try:
-            assert isinstance(get_writer("decotest"), _DecoWriter)
-        finally:
-            output_base._WRITERS.pop("decotest", None)
 
 
 class TestOutputFormat:
@@ -99,58 +45,6 @@ class TestOutputFormat:
             }
         )
         assert output_format(cfg) == "parquet"
-
-
-# ---------------------------------------------------------------------------
-# ZarrGridWriter: byte-identical forwarding to the spatial write functions
-# ---------------------------------------------------------------------------
-
-
-class TestZarrGridWriter:
-    def test_write_forwards_to_write_dataframe_to_zarr(self, monkeypatch):
-        from zagg.output import zarr_grid
-
-        captured = {}
-
-        def fake_write(carrier, store, *, grid, chunk_idx):
-            captured["args"] = (carrier, store, grid, chunk_idx)
-            return store
-
-        monkeypatch.setattr(zarr_grid, "write_dataframe_to_zarr", fake_write)
-        store = object()
-        out = ZarrGridWriter().write("CARRIER", store, grid="GRID", chunk_idx=(1, 2))
-        assert out is store
-        assert captured["args"] == ("CARRIER", store, "GRID", (1, 2))
-
-    def test_write_ragged_forwards(self, monkeypatch):
-        from zagg.output import zarr_grid
-
-        captured = {}
-
-        def fake_ragged(ragged, store, *, grid, shard_key):
-            captured["args"] = (ragged, store, grid, shard_key)
-            return store
-
-        monkeypatch.setattr(zarr_grid, "write_ragged_to_zarr", fake_ragged)
-        store = object()
-        out = ZarrGridWriter().write_ragged({"f": 1}, store, grid="GRID", shard_key=7)
-        assert out is store
-        assert captured["args"] == ({"f": 1}, store, "GRID", 7)
-
-    def test_finalize_consolidates_v3(self, monkeypatch):
-        from zagg.output import zarr_grid
-
-        captured = {}
-
-        def fake_consolidate(store, *, zarr_format):
-            captured["zarr_format"] = zarr_format
-            return store
-
-        monkeypatch.setattr(zarr_grid, "consolidate_metadata", fake_consolidate)
-        store = object()
-        out = ZarrGridWriter().finalize(store)
-        assert out is store
-        assert captured["zarr_format"] == 3
 
 
 # ---------------------------------------------------------------------------

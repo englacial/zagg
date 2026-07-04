@@ -459,8 +459,8 @@ def specs_from_config(config):
     -------
     list[dict]
         Each dict has keys: ``output_name``, ``variable``, ``collection``,
-        ``spatial_func``, ``temporal_reducer``, ``mask``, ``negate``,
-        ``precip``, and the optional generic hooks ``transform``
+        ``spatial_func``, ``temporal_reducer``, ``mask``, ``negate``, and the
+        optional generic hooks ``transform``
         (field-transform name) and ``trigger`` (event-trigger name).
 
     Notes
@@ -487,7 +487,6 @@ def specs_from_config(config):
                 "temporal_reducer": meta["temporal_reducer"],
                 "mask": meta.get("mask", "ais"),
                 "negate": meta.get("negate", False),
-                "precip": meta.get("precip", False),
                 "transform": transform,
                 "trigger": meta.get("trigger"),
             }
@@ -525,13 +524,13 @@ def open_dataset(uri, *, credentials=None, endpoint_url=None, region="us-west-2"
     import io
 
     import obstore
-    from obstore.store import S3Store
 
-    from .store import parse_s3_path, s3_store_options
+    from .store import open_object_store, parse_s3_path
 
     bucket, key = parse_s3_path(uri)
-    opts = s3_store_options(credentials=credentials, endpoint_url=endpoint_url, region=region)
-    store = S3Store(bucket, **opts)
+    store = open_object_store(
+        f"s3://{bucket}", credentials=credentials, endpoint_url=endpoint_url, region=region
+    )
     payload = obstore.get(store, key).bytes()
     return xr.open_dataset(io.BytesIO(bytes(payload)))
 

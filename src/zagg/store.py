@@ -165,39 +165,4 @@ def parse_s3_path(path: str) -> tuple[str, str]:
     return bucket, prefix
 
 
-def s3_store_options(
-    credentials: dict | None = None,
-    endpoint_url: str | None = None,
-    region: str = "us-west-2",
-) -> dict:
-    """Build ``obstore.store.S3Store`` keyword options from zagg-style creds.
-
-    The single place that maps camelCase ``credentials`` /
-    ``endpoint_url`` / ``region`` onto ``S3Store`` options, so the Zarr store
-    (:func:`_open_s3_store`) and the temporal reader/tabular writer share one
-    rule. ``virtual_hosted_style_request=False`` (path-style addressing) is
-    enabled whenever explicit ``credentials`` *or* an ``endpoint_url`` is
-    supplied -- required for dotted bucket names over TLS and for non-AWS
-    S3-compatible endpoints. With **neither** supplied, an ambient
-    ``Boto3CredentialProvider`` is attached; an ``endpoint_url`` alone (e.g.
-    anonymous MinIO/R2) takes the explicit branch and leaves credentials to the
-    endpoint. ``bucket``/``prefix`` are left to the caller.
-    """
-    opts: dict = {"region": region}
-    if credentials or endpoint_url:
-        opts["virtual_hosted_style_request"] = False
-    if credentials:
-        opts["access_key_id"] = credentials["accessKeyId"]
-        opts["secret_access_key"] = credentials["secretAccessKey"]
-        if credentials.get("sessionToken"):
-            opts["session_token"] = credentials["sessionToken"]
-    if endpoint_url:
-        opts["endpoint"] = endpoint_url
-    if not credentials and not endpoint_url:
-        from obstore.auth.boto3 import Boto3CredentialProvider
-
-        opts["credential_provider"] = Boto3CredentialProvider()
-    return opts
-
-
-__all__ = ["open_object_store", "open_store", "parse_s3_path", "s3_store_options"]
+__all__ = ["open_object_store", "open_store", "parse_s3_path"]

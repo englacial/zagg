@@ -20,8 +20,6 @@ from pathlib import Path
 
 import pandas as pd
 
-from .base import register_writer
-
 #: File-extension -> serialisation format, so a bare path picks the writer.
 _EXT_FORMAT = {
     ".parquet": "parquet",
@@ -30,9 +28,6 @@ _EXT_FORMAT = {
 }
 
 
-@register_writer("tabular")
-@register_writer("parquet")
-@register_writer("csv")
 class TabularWriter:
     """Writer for tabular temporal/event output (``output.format: tabular``).
 
@@ -183,9 +178,8 @@ def write_tabular(
         return str(writer.write(rows, store_path, output_format=local_fmt))
 
     import obstore
-    from obstore.store import S3Store
 
-    from ..store import parse_s3_path, s3_store_options
+    from ..store import open_object_store, parse_s3_path
 
     fmt = _resolve_format(store_path, output_format)
     payload = writer.to_bytes(rows, output_format=fmt)
@@ -193,8 +187,10 @@ def write_tabular(
     if not key:
         raise ValueError(f"s3 tabular output needs an object key, got bucket only: {store_path!r}")
 
-    # Shares the Zarr store's credential/path-style rule (issue #12, Phase 7b).
-    opts = s3_store_options(credentials=credentials, endpoint_url=endpoint_url, region=region)
-    store = S3Store(bucket, **opts)
+    # Shares the Zarr store's credential/path-style rule via open_object_store
+    # (issue #151), the same helper the async result poll uses.
+    store = open_object_store(
+        f"s3://{bucket}", credentials=credentials, endpoint_url=endpoint_url, region=region
+    )
     obstore.put(store, key, payload)
     return store_path

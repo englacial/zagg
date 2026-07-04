@@ -192,7 +192,6 @@ def _temporal_config():
                         "spatial_func": "weighted_sum",
                         "temporal_reducer": "sum",
                         "mask": "ocean",
-                        "precip": True,
                     },
                 }
             },
@@ -217,7 +216,6 @@ class TestSpecsFromConfig:
             "temporal_reducer",
             "mask",
             "negate",
-            "precip",
             "transform",
             "trigger",
         }
@@ -231,7 +229,6 @@ class TestSpecsFromConfig:
         assert specs["anom_iwv_full"]["transform"] == "monthly_anomaly"
         assert specs["max_t2m_ais"]["transform"] is None
         assert "is_anomaly" not in specs["anom_iwv_full"]
-        assert specs["rainfall_ocean"]["precip"] is True
         # default mask is "ais" when omitted; here every spec sets it explicitly
         assert specs["rainfall_ocean"]["mask"] == "ocean"
 
