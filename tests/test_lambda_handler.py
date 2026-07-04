@@ -1110,3 +1110,14 @@ class TestAsyncResultWrite:
         resp = handler_mod.lambda_handler({"mode": "setup", "result_url": url}, _context())
         assert resp["statusCode"] == 200
         assert not Path(url).exists()
+
+    def test_extract_mode_ignores_result_url(self, handler_mod, monkeypatch, tmp_path):
+        # Extract mode (issue #148) dispatches before the result_url mirror,
+        # which stays process-mode-only -- pin the seam like setup mode above.
+        monkeypatch.setattr(
+            handler_mod, "_handle_extract", lambda event, context: {"statusCode": 200, "body": "{}"}
+        )
+        url = str(tmp_path / "status" / "extract.json")
+        resp = handler_mod.lambda_handler({"mode": "extract", "result_url": url}, _context())
+        assert resp["statusCode"] == 200
+        assert not Path(url).exists()

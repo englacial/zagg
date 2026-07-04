@@ -214,6 +214,17 @@ class TestTemplateEnvironment:
         ):
             assert extract[key] == process[key], f"ExtractFn.{key} diverges from ProcessFn"
 
+    def test_extract_fn_async_config_mirrors_process_fn(self):
+        # The twin's EventInvokeConfig must stay in lockstep too (issues #148 /
+        # #151): without it, Lambda's async defaults would re-run a failed
+        # extraction up to 2 more times at up to 900 s each.
+        resources = self._load_template()["Resources"]
+        process = dict(resources["ProcessFnAsyncConfig"]["Properties"])
+        extract = dict(resources["ExtractFnAsyncConfig"]["Properties"])
+        assert extract.pop("FunctionName") == {"Ref": "ExtractFn"}
+        assert process.pop("FunctionName") == {"Ref": "ProcessFn"}
+        assert extract == process  # Qualifier, retries, event age identical
+
     def test_async_event_invoke_config_pins_retries(self):
         # issue #151: the runner's async dispatch relies on service retries
         # being 0 (a re-run of a deterministic failure re-fails at extra cost

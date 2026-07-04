@@ -92,6 +92,11 @@ def _chunk_shard_mask(bdf, grid, shard_key: int, samples_per_chunk: int) -> np.n
     so a chunk is matched whenever either boundary photon or any interpolated
     point lands in the shard.
     """
+    if samples_per_chunk < 2:
+        raise ValueError(
+            f"samples_per_chunk must be >= 2 so both boundary photons are tested, "
+            f"got {samples_per_chunk}"
+        )
 
     def _xyz(lat_deg, lon_deg):
         lat, lon = np.radians(lat_deg), np.radians(lon_deg)
@@ -153,23 +158,28 @@ def _plan_from_boundaries(
     return plan, n_base
 
 
-def _make_boundary_read_fn(h5obj, chunk_size: int):
+def _make_boundary_read_fn(h5obj):
     """Hyperslice reader that sidesteps h5coro's chunk-aligned-start bug.
 
     Every a-priori slice starts exactly on a chunk boundary — precisely the
     reads h5coro's B-tree start-edge off-by-one fails wholesale (a hyperslice
     beginning at ``k * chunk_size``, k > 0, spuriously matches the preceding
-    chunk; see :mod:`zagg.catalog.extract`). Mirror the extractor's workaround:
-    start one element early and drop it, costing one re-decompressed chunk per
-    run. Valid for every heights dataset because the chunk grid is aligned
-    (verified at extraction time by ``heights_chunk_grid``).
+    chunk; see :mod:`zagg.catalog.extract`). Mirror the extractor's workaround
+    for **every** nonzero start — unconditional, so it depends on no chunk-size
+    metadata: plan starts are chunk-aligned by construction (the only exception
+    is the clamp to 0, which the bug spares), and shifting a hypothetical
+    non-aligned start one element early is harmless since the extra element is
+    dropped. Costs one re-decompressed chunk per run.
     """
 
     def _read_fn(path, hyperslice=None):
         if hyperslice is None:
             return h5obj.readDatasets([path])[path]
+        # Plans built here always carry a single contiguous range per run
+        # (plan_read emits chunk_lists as one [start, end) pair per slice).
+        assert len(hyperslice) == 1, f"expected single-range hyperslice, got {hyperslice}"
         start, end = hyperslice[0]
-        r0 = start - 1 if start > 0 and start % chunk_size == 0 else start
+        r0 = start - 1 if start > 0 else start
         arr = h5obj.readDatasets([{"dataset": path, "hyperslice": [(r0, end)]}])[path]
         return arr[start - r0 :]
 
@@ -210,7 +220,7 @@ def _apriori_read_group(
             "boundary parquet (the worker passes it when the feature is on)"
         )
 
-    bdf, meta = _load_boundaries(prefix, granule_url)
+    bdf, _meta = _load_boundaries(prefix, granule_url)
     beam = group.strip("/").split("/")[0]
     bdf = bdf[bdf["beam"] == beam]
     if bdf.empty:
@@ -229,8 +239,7 @@ def _apriori_read_group(
     if plan.full_read:
         return _read_group_full(h5obj, group, data_source, shard_key, grid, arrow=arrow)
 
-    chunk_size = int(meta.get("chunk_size") or bdf["n_photons"].max())
-    read_fn = _make_boundary_read_fn(h5obj, chunk_size)
+    read_fn = _make_boundary_read_fn(h5obj)
     return _execute_plan_group(
         h5obj, group, data_source, shard_key, grid, plan, n_base, arrow, read_fn=read_fn
     )

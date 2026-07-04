@@ -218,6 +218,18 @@ Resources:
         S3Bucket: !Ref ArtifactBucket
         S3Key: !Ref FunctionS3Key
 
+  # Same async-invoke hygiene as ProcessFnAsyncConfig (issue #151), completing
+  # the twin: retries pinned to 0 so a deterministic extraction failure on an
+  # async fan-out is not re-billed at up to 900 s per service retry, and event
+  # age pinned to the API-minimum 60 s.
+  ExtractFnAsyncConfig:
+    Type: AWS::Lambda::EventInvokeConfig
+    Properties:
+      FunctionName: !Ref ExtractFn
+      Qualifier: "$LATEST"
+      MaximumRetryAttempts: 0
+      MaximumEventAgeInSeconds: 60
+
 Outputs:
   FunctionArn:
     Description: ARN of the deployed Lambda function.

@@ -610,7 +610,10 @@ def _read_group(
     rp = data_source.get("read_plan")
     levels = data_source.get("levels")
     base_level = data_source.get("base_level")
-    if isinstance(rp, dict) and rp.get("chunk_boundaries"):
+    # Presence check, not truthiness: an empty/misconfigured ``chunk_boundaries``
+    # block must fail loudly inside the a-priori path (missing ``prefix``), not
+    # silently run another arm and corrupt the benchmark comparison.
+    if isinstance(rp, dict) and "chunk_boundaries" in rp:
         from zagg.processing.apriori import _apriori_read_group
 
         return _apriori_read_group(

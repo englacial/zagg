@@ -300,6 +300,26 @@ class TestAprioriReadGroup:
         with pytest.raises(ValueError, match="prefix"):
             self._read(ds, granule_url=f"/data/{GRANULE}")
 
+    @pytest.mark.parametrize("empty", [{}, None])
+    def test_empty_block_fails_loudly_not_falls_back(self, empty):
+        # The dispatch gate is a PRESENCE check: a present-but-empty (or null)
+        # chunk_boundaries block must raise inside the a-priori path, never
+        # silently run another arm and corrupt the benchmark comparison. The
+        # config also carries spatial_index, so a truthiness gate would have
+        # quietly taken the planned path instead.
+        ds = _data_source(chunk_boundaries={"prefix": "unused"}, spatial_index=True)
+        ds["read_plan"]["chunk_boundaries"] = empty
+        with pytest.raises(ValueError, match="prefix"):
+            self._read(ds, granule_url=f"/data/{GRANULE}")
+
+    def test_samples_per_chunk_below_two_rejected(self, tmp_path):
+        # < 2 samples cannot include both boundary photons (the documented
+        # contract); np.linspace(0, 1, 1) would silently test only the start.
+        _write_parquet(tmp_path)
+        ds = _data_source(chunk_boundaries={"prefix": str(tmp_path), "samples_per_chunk": 1})
+        with pytest.raises(ValueError, match="samples_per_chunk"):
+            self._read(ds, granule_url=f"/data/{GRANULE}")
+
 
 class TestLoadBoundaries:
     def test_s3_prefix_stages_through_boto3(self, tmp_path, monkeypatch):

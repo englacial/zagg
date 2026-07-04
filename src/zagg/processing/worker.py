@@ -219,8 +219,9 @@ def process_shard(
     # the granule identity to locate its boundary parquet. The kwarg is passed
     # only when the feature is on, so monkeypatched ``_read_group`` fakes (and
     # the production call) keep their existing signature byte-for-byte.
+    # Presence check, mirroring ``_read_group``'s dispatch gate exactly.
     _rp = data_source.get("read_plan")
-    apriori = isinstance(_rp, dict) and bool(_rp.get("chunk_boundaries"))
+    apriori = isinstance(_rp, dict) and "chunk_boundaries" in _rp
 
     use_arrow = handoff == "arrow"
     all_reads = []
