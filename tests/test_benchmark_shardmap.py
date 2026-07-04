@@ -5,6 +5,12 @@ Rebuilds each pinned shard map from CMR (same AOI + temporal window + grid as
 silent change in CMR coverage that would move the benchmark target gets caught
 loudly instead of surfacing as a phantom cost/runtime regression.
 
+An entry carrying ``catalog_parquet`` (issue #148) rebuilds from that committed
+stac-geoparquet snapshot instead of re-fetching CMR — build the catalog once,
+save the parquet, reuse it — so heavy AOIs (the 88S ring is a ~20 min fetch of
+35,639 granules) don't re-download weekly; the rebuild then guards the
+shardmap-build + pin deterministically.
+
 This needs the network (CMR) and, for the rectilinear maps, the exact-S2
 ``spherely`` backend, so it is decoupled from the unit suite: it runs only when
 ``ZAGG_BENCHMARK_DRIFT=1`` is set (the `benchmark-drift` workflow does this on a
@@ -52,9 +58,32 @@ pytestmark = [
 ]
 
 
+def _containing_shard(parent_grid, shard_key: int) -> int:
+    """The parent-grid shard containing a finer shard (via its center point).
+
+    HEALPix cells nest, so a finer cell's center maps unambiguously into its
+    containing coarser cell; routing through ``assign``/``shards_of`` keeps this
+    on the same mortie machinery the shard maps themselves are built with.
+    """
+    import numpy as np
+    from mortie import mort2geo
+
+    lat, lon = mort2geo(np.array([shard_key], dtype=np.uint64))
+    leaf = parent_grid.assign(np.atleast_1d(lat), np.atleast_1d(lon))
+    return int(parent_grid.shards_of(leaf)[0])
+
+
 def _config_for_shardmap(sm_key: str) -> Path:
-    """Any target's config that uses this shard map (config sets the grid)."""
-    for target in MANIFEST["targets"].values():
+    """Any target's config that uses this shard map (config sets the grid).
+
+    Searches the committed matrix first, then ``provisional_targets`` (issue
+    #130 block) — the 88S stress shard maps (issue #148) are referenced only by
+    provisional targets, and the drift check still needs their grid config.
+    """
+    provisional = {
+        k: v for k, v in MANIFEST.get("provisional_targets", {}).items() if k != "_comment"
+    }
+    for target in list(MANIFEST["targets"].values()) + list(provisional.values()):
         if target["shardmap"] == sm_key:
             return BENCH / target["config"]
     raise AssertionError(f"no target references shardmap '{sm_key}'")
@@ -64,7 +93,7 @@ def _config_for_shardmap(sm_key: str) -> Path:
 def test_pinned_shardmap_no_drift(sm_key):
     from zagg.catalog import load_polygon, polygon_to_bbox
     from zagg.catalog.shardmap import ShardMap
-    from zagg.catalog.sources import CMRSource, Query
+    from zagg.catalog.sources import Catalog, CMRSource, Query
     from zagg.config import load_config
     from zagg.grids import from_config
 
@@ -81,24 +110,47 @@ def test_pinned_shardmap_no_drift(sm_key):
     aoi, temporal, cmr = resolve_aoi_temporal_cmr(sm_meta)
     # aoi.file is relative to the manifest dir, like the config/shardmap paths.
     parts = load_polygon(str(BENCH / aoi["file"]))
-    bbox = polygon_to_bbox(parts)
 
-    query = Query(
-        cmr["short_name"],
-        cmr["version"],
-        temporal["start"],
-        temporal["end"],
-        region=bbox,
-        provider=cmr["provider"],
-    )
-    catalog = CMRSource().fetch(query)
+    if sm_meta.get("catalog_parquet"):
+        # Build-once catalog (issue #148): an entry carrying ``catalog_parquet``
+        # rebuilds from the committed stac-geoparquet snapshot instead of
+        # re-fetching CMR -- the drift check then guards the shardmap build +
+        # pin deterministically and offline, per the catalog design (fetch
+        # once, save the parquet, reuse). Regenerate the snapshot only to
+        # deliberately re-pin.
+        catalog = Catalog.from_geoparquet(str(BENCH / sm_meta["catalog_parquet"]))
+    else:
+        query = Query(
+            cmr["short_name"],
+            cmr["version"],
+            temporal["start"],
+            temporal["end"],
+            region=polygon_to_bbox(parts),
+            provider=cmr["provider"],
+        )
+        catalog = CMRSource().fetch(query)
     rebuilt = ShardMap.build(
         catalog, grid, region=parts, backend=backend, footprint=cmr["footprint"]
     )
 
-    key, n = bench_metrics.select_densest_shard(
-        {"shard_keys": rebuilt.shard_keys, "granules": rebuilt.granules}
-    )
+    # A nested pin (issue #148: the 88S o10 stress shard is the densest o10
+    # shard INSIDE the pinned o9 stress shard, so one o9 extraction pass covers
+    # both orders) is compared against the same nested quantity, not the global
+    # densest — otherwise a correct rebuild would read as drift.
+    shard_keys, granules = rebuilt.shard_keys, rebuilt.granules
+    nested_in = sm_meta.get("nested_in")
+    if nested_in:
+        parent_key = int(MANIFEST["shardmaps"][nested_in]["shard_key"])
+        parent_grid = from_config(load_config(str(_config_for_shardmap(nested_in))))
+        keep = [
+            i
+            for i, k in enumerate(shard_keys)
+            if int(_containing_shard(parent_grid, int(k))) == parent_key
+        ]
+        shard_keys = [shard_keys[i] for i in keep]
+        granules = [granules[i] for i in keep]
+
+    key, n = bench_metrics.select_densest_shard({"shard_keys": shard_keys, "granules": granules})
     pinned_n = sm_meta["n_granules"]
     # Tie-tolerant: the densest *count* is the stable quantity; an equally-dense
     # reselection (different key, same count) is fine -- a count drift is not.

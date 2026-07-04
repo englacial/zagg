@@ -351,6 +351,14 @@ class InlineIndex(VirtualIndex):
                     "index backend 'inline' requires data_source.read_plan.spatial_index "
                     "(chunk-aligned addressing plugs into the planned read path)"
                 )
+            if "chunk_boundaries" in rp:
+                # The a-priori arm (issue #148 arm 2a) takes precedence over
+                # spatial_index inside _read_group, which would silently bypass
+                # this backend's chunk-map addressing -- reject the combination.
+                raise ValueError(
+                    "index backend 'inline' and read_plan.chunk_boundaries (the "
+                    "a-priori arm) are mutually exclusive; drop one of them"
+                )
 
     @classmethod
     def from_index_config(cls, index_cfg: dict) -> "InlineIndex":
@@ -412,7 +420,7 @@ class InlineIndex(VirtualIndex):
         key = write_manifest(granule_manifest(maps), self.store, granule_id)
         logger.info(f"  inline write-back: {len(maps)} dataset(s) -> {self.store}/{key}")
 
-    def read_group(self, h5obj, group, data_source, shard_key, grid, arrow=False):
+    def read_group(self, h5obj, group, data_source, shard_key, grid, arrow=False, granule_url=None):
         from zagg.processing.read import _planned_read_group, _validate_planned_config
 
         rp = data_source.get("read_plan")

@@ -79,13 +79,23 @@ class VirtualIndex:
         return cls()
 
     def read_group(
-        self, h5obj, group: str, data_source: dict, shard_key: int, grid, arrow: bool = False
+        self,
+        h5obj,
+        group: str,
+        data_source: dict,
+        shard_key: int,
+        grid,
+        arrow: bool = False,
+        granule_url: str | None = None,
     ):
         """Read + spatially filter one HDF5 group for one shard.
 
         Same contract as ``zagg.processing._read_group``: returns a
         ``pandas.DataFrame`` / ``arro3.core.Table`` carrier, or ``None`` when
-        the group has no observations in this shard.
+        the group has no observations in this shard. ``granule_url`` is passed
+        by the worker only when the a-priori chunk-boundary arm (issue #148
+        arm 2a, ``read_plan.chunk_boundaries``) is configured — it locates the
+        granule's boundary parquet on that route and is omitted otherwise.
         """
         raise NotImplementedError
 

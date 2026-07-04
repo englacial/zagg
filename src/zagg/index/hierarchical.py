@@ -20,10 +20,16 @@ class HierarchicalIndex(VirtualIndex):
     # No backend-specific keys: today's path is configured by the existing
     # ``data_source.read_plan`` / ``levels`` surface, not the index block.
 
-    def read_group(self, h5obj, group, data_source, shard_key, grid, arrow=False):
+    def read_group(self, h5obj, group, data_source, shard_key, grid, arrow=False, granule_url=None):
         # Resolve through the package namespace at call time (not an import-time
         # binding) so tests that ``monkeypatch.setattr("zagg.processing._read_group",
         # ...)`` keep intercepting the worker's reads, exactly as before the seam.
         import zagg.processing as _processing
 
-        return _processing._read_group(h5obj, group, data_source, shard_key, grid, arrow=arrow)
+        # ``granule_url`` is forwarded only when set (the a-priori arm), so
+        # monkeypatched ``_read_group`` fakes keep their existing signature on
+        # every other path -- mirroring the worker's presence-gated kwarg.
+        kwargs = {"arrow": arrow}
+        if granule_url is not None:
+            kwargs["granule_url"] = granule_url
+        return _processing._read_group(h5obj, group, data_source, shard_key, grid, **kwargs)

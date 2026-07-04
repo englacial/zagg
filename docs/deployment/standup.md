@@ -46,7 +46,7 @@ to hand-assemble zips or wire up the IAM role yourself.
 `template.yaml` provisions (see the file for the authoritative definition):
 
 - **`ProcessFn`** -- the `process-shard` Lambda (`python3.12`, handler
-  `lambda_handler.lambda_handler`, default 2048 MB / 720 s timeout), wired to the
+  `lambda_handler.lambda_handler`, default 2048 MB / 900 s timeout), wired to the
   layer and execution role.
 - **`DepsLayer`** -- the dependency layer version (`<FunctionName>-deps`).
 - **`ExecutionRole`** -- created only when `CreateExecutionRole=true` (the

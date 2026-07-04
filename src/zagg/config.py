@@ -83,6 +83,9 @@ _SET_OPS = frozenset({"in", "not_in"})
 FILTER_OPS = _SCALAR_OPS | _SET_OPS
 
 
+_PIPELINE_TYPES = frozenset({"spatial", "temporal", "event"})
+
+
 @dataclass
 class PipelineConfig:
     """Full pipeline configuration.
@@ -99,6 +102,12 @@ class PipelineConfig:
         Optional path to granule catalog JSON.
     bounds : dict or None
         Optional temporal/spatial bounds for filtering.
+    pipeline : dict
+        Pipeline kind selector (issue #12). ``{"type": "spatial"}`` (default)
+        runs the point-cloud->grid aggregation path; ``"temporal"`` /
+        ``"event"`` route to the event-streaming engines added in later
+        phases. Absent ``pipeline`` key in YAML defaults to ``spatial`` for
+        backward compatibility with every existing config.
     """
 
     data_source: DataSourceDict = field(default_factory=dict)
@@ -106,6 +115,20 @@ class PipelineConfig:
     output: dict = field(default_factory=dict)
     catalog: str | None = None
     bounds: dict | None = None
+    pipeline: dict = field(default_factory=lambda: {"type": "spatial"})
+
+
+def get_pipeline_type(config: PipelineConfig) -> str:
+    """Return the pipeline kind, defaulting to ``"spatial"``.
+
+    Centralised so dispatch / strategy selection has a single source of truth.
+    """
+    if not isinstance(config.pipeline, dict):
+        raise ValueError("pipeline must be a mapping with a 'type' key")
+    t = config.pipeline.get("type", "spatial")
+    if t not in _PIPELINE_TYPES:
+        raise ValueError(f"pipeline.type must be one of {sorted(_PIPELINE_TYPES)} (got {t!r})")
+    return t
 
 
 def load_config(path: str) -> PipelineConfig:
@@ -145,6 +168,7 @@ def load_config_from_dict(d: dict) -> PipelineConfig:
         output=d.get("output", {}),
         catalog=d.get("catalog"),
         bounds=d.get("bounds"),
+        pipeline=d.get("pipeline", {"type": "spatial"}),
     )
 
 
@@ -187,6 +211,16 @@ def validate_config(config: PipelineConfig) -> None:
     ValueError
         On any validation failure.
     """
+    # Pipeline kind drives which validation branch runs; spatial keeps the
+    # full grid + aggregation cross-checks below. Temporal/event pipelines
+    # validate their own (much smaller) spec shape and return early -- they
+    # carry no output grid and run through the event-streaming engine
+    # (``zagg.temporal.process_event``) rather than the point-cloud path.
+    ptype = get_pipeline_type(config)
+    if ptype != "spatial":
+        _validate_temporal_config(config)
+        return
+
     # Required sections
     for section in ("data_source", "aggregation", "output"):
         val = getattr(config, section)
@@ -323,6 +357,38 @@ def validate_config(config: PipelineConfig) -> None:
 
         # Validate the output-kind declaration (kind + trailing_shape + dtype)
         _validate_output_kind(name, meta)
+
+
+# Required per-variable keys for a temporal/event aggregation spec. ``mask``
+# is optional (``specs_from_config`` defaults it to ``"ais"``); capability
+# *names* (spatial_func / temporal_reducer / mask) are resolved by the registry
+# at run time, not here -- a typo surfaces as a clean ``UnknownCapability`` from
+# ``process_event`` rather than a load-time guess about which plugins are
+# installed.
+_TEMPORAL_SPEC_KEYS = ("variable", "collection", "spatial_func", "temporal_reducer")
+
+
+def _validate_temporal_config(config: PipelineConfig) -> None:
+    """Validate a temporal/event pipeline config (issue #12, Phase 5).
+
+    Temporal pipelines carry no output grid; the only cross-check is that the
+    ``aggregation.variables`` block names, per variable, the four keys
+    :data:`_TEMPORAL_SPEC_KEYS` that :func:`zagg.temporal.specs_from_config`
+    requires (the rest are optional flags with defaults). Raises ``ValueError``
+    on a missing section or key.
+    """
+    if not config.aggregation:
+        raise ValueError("Missing required section: aggregation")
+    variables = config.aggregation.get("variables")
+    if not variables:
+        raise ValueError("temporal pipeline requires aggregation.variables")
+    for name, meta in variables.items():
+        missing = [k for k in _TEMPORAL_SPEC_KEYS if k not in meta]
+        if missing:
+            raise ValueError(
+                f"temporal variable '{name}' is missing required key(s): "
+                f"{', '.join(missing)} (need {', '.join(_TEMPORAL_SPEC_KEYS)})"
+            )
 
 
 def _validate_chunk_precompute(aggregation: dict, ds_vars: set[str]) -> None:

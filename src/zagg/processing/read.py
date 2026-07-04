@@ -317,16 +317,13 @@ def _planned_read_group(
     filter order — which matches the full-read path's row ordering because the
     plan's runs are emitted in increasing parent index.
 
-    ``read_fn`` is the base-rate addressing seam (issue #160): a
-    ``read_fn(path, hyperslice=None) -> array`` callable used for every
-    planned base-rate read (coords, variables, filter datasets). ``None``
-    (default) uses plain h5coro hyperslice reads — today's path. An index
-    backend may supply its own (e.g. ``inline``'s chunk-aligned reader);
-    selection (the plan), the coarse-level reads, and everything downstream
-    of the returned columns are identical regardless.
+    ``read_fn`` is the base-rate addressing seam (issue #160), forwarded to
+    :func:`_execute_plan_group`: an index backend may supply its own reader
+    (e.g. ``inline``'s boundary-safe chunk-map reads); ``None`` (default) uses
+    the plain h5coro hyperslice bridge — today's path. Selection (the plan),
+    the coarse-level reads, and everything downstream of the returned columns
+    are identical regardless.
     """
-    coordinates = data_source["coordinates"]
-    variables = data_source["variables"]
     levels = data_source["levels"]
     base_level_key = data_source["base_level"]
     rp = data_source["read_plan"]
@@ -402,11 +399,43 @@ def _planned_read_group(
         # of the file. Defer to the full-coord-read path; semantics identical.
         return _read_group_full(h5obj, group, data_source, shard_key, grid, arrow=arrow)
 
-    # h5coro-compatible reader callback for execute_read_plan (unless the
-    # caller supplied its own addressing seam — issue #160).
-    if read_fn is None:
+    return _execute_plan_group(
+        h5obj, group, data_source, shard_key, grid, plan, n_base, arrow, read_fn=read_fn
+    )
 
-        def read_fn(path, hyperslice=None):
+
+def _execute_plan_group(
+    h5obj,
+    group: str,
+    data_source: dict,
+    shard_key: int,
+    grid,
+    plan,
+    n_base,
+    arrow=False,
+    read_fn=None,
+):
+    """Execute a computed :class:`~zagg.read_plan.ReadPlan` over one group.
+
+    The shared back half of the planned read: base coords + variables + filter
+    datasets are read only over ``plan``'s slices, then the exact photon-level
+    shard mask, structured/cross-level/expression filters, and segment-level
+    broadcasts are applied — identical semantics regardless of how the plan was
+    computed (:func:`_planned_read_group`'s geolocation-rate mortie mask, or the
+    a-priori chunk-boundary plan of issue #148 arm 2a). ``read_fn`` overrides
+    the h5coro hyperslice callback (the a-priori path substitutes one that works
+    around h5coro's chunk-aligned-start B-tree bug); ``None`` uses the plain
+    ``readDatasets`` bridge.
+    """
+    coordinates = data_source["coordinates"]
+    variables = data_source["variables"]
+    levels = data_source.get("levels") or {}
+    base_level_key = data_source.get("base_level")
+
+    _read_fn = read_fn
+    if _read_fn is None:
+        # h5coro-compatible reader callback for execute_read_plan.
+        def _read_fn(path, hyperslice=None):
             if hyperslice is None:
                 return h5obj.readDatasets([path])[path]
             return h5obj.readDatasets([{"dataset": path, "hyperslice": hyperslice}])[path]
@@ -427,8 +456,8 @@ def _planned_read_group(
 
     lat_path = coordinates["latitude"].format(group=group)
     lon_path = coordinates["longitude"].format(group=group)
-    lats = execute_read_plan(plan, read_fn, lat_path, np.float64)
-    lons = execute_read_plan(plan, read_fn, lon_path, np.float64)
+    lats = execute_read_plan(plan, _read_fn, lat_path, np.float64)
+    lons = execute_read_plan(plan, _read_fn, lon_path, np.float64)
 
     if len(lats) == 0:
         return None
@@ -451,7 +480,7 @@ def _planned_read_group(
         paths_seen.add(path)
         # dtype hint isn't load-bearing -- execute_read_plan dtype-casts via
         # np.asarray, which is a no-op when the source dtype already matches.
-        arrays_by_path[path] = execute_read_plan(plan, read_fn, path, None)
+        arrays_by_path[path] = execute_read_plan(plan, _read_fn, path, None)
 
     # Base-level structured filters: ANDed keep-masks over the concatenated reads.
     keep_mask: np.ndarray | None = None
@@ -549,14 +578,30 @@ def _planned_read_group(
     return pd.DataFrame(data_dict)
 
 
-def _read_group(h5obj, group: str, data_source: dict, shard_key: int, grid, arrow: bool = False):
+def _read_group(
+    h5obj,
+    group: str,
+    data_source: dict,
+    shard_key: int,
+    grid,
+    arrow: bool = False,
+    granule_url: str | None = None,
+):
     """Read and spatially filter one HDF5 group.
 
     Returns a ``pandas.DataFrame`` (default) or, when ``arrow=True``, an
     ``arro3.core.Table`` carrying the identical columns. Returns ``None`` when the
     group has no observations in this shard.
 
-    Supports three modes (issues #43 Phase A/B/C):
+    When ``data_source.read_plan.chunk_boundaries`` is set (issue #148 arm 2a),
+    the read is planned a priori from the granule's chunk-boundary parquet —
+    no geolocation-rate coordinate read — via
+    :func:`zagg.processing.apriori._apriori_read_group`; ``granule_url``
+    (passed by the worker only when the feature is on) locates the parquet.
+    Takes precedence over ``spatial_index`` so the benchmark configs can keep
+    both keys and select the arm with ``chunk_boundaries`` alone.
+
+    Otherwise supports three modes (issues #43 Phase A/B/C):
 
     *Flat* (no ``levels``/``base_level`` in ``data_source``): unchanged from Phase A —
     all structured filters are applied directly to base-rate data.
@@ -578,6 +623,15 @@ def _read_group(h5obj, group: str, data_source: dict, shard_key: int, grid, arro
     produce row-for-row identical output (#43 Phase C parity).
     """
     rp = data_source.get("read_plan")
+    # Presence check, not truthiness: an empty/misconfigured ``chunk_boundaries``
+    # block must fail loudly inside the a-priori path (missing ``prefix``), not
+    # silently run another arm and corrupt the benchmark comparison.
+    if isinstance(rp, dict) and "chunk_boundaries" in rp:
+        from zagg.processing.apriori import _apriori_read_group
+
+        return _apriori_read_group(
+            h5obj, group, data_source, shard_key, grid, arrow=arrow, granule_url=granule_url
+        )
     # Truthy-checking ``levels``/``base_level`` would route an empty ``{}`` (a
     # config typo, easy to do) back to the full-read path silently. Reject
     # incomplete configurations explicitly instead -- the planned path is
@@ -672,9 +726,10 @@ def _read_group_full(
             level_key = f["level"]
             lvl = levels[level_key]
             flag_path = f["dataset"].format(group=group)
-            # Read the coarse flag array (full level, no hyperslice — we need all parents
-            # to align with link arrays which are also full-length).
-            coarse_data = h5obj.readDatasets([{"dataset": flag_path}])
+            # Read the coarse flag array in full ("hyperslice": [] is h5coro's
+            # full-read form; the key is required on dict entries — issue #157).
+            # We need all parents to align with the full-length link arrays.
+            coarse_data = h5obj.readDatasets([{"dataset": flag_path, "hyperslice": []}])
             coarse_arr = coarse_data[flag_path]
             coarse_fmask = _predicate_mask(coarse_arr, f)
             # Read the link arrays from this level.
@@ -684,8 +739,8 @@ def _read_group_full(
             cnt_path = link["count"].format(group=group)
             link_data = h5obj.readDatasets(
                 [
-                    {"dataset": ibeg_path},
-                    {"dataset": cnt_path},
+                    {"dataset": ibeg_path, "hyperslice": []},
+                    {"dataset": cnt_path, "hyperslice": []},
                 ]
             )
             ibeg_arr = link_data[ibeg_path]

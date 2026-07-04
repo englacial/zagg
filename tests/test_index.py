@@ -585,6 +585,15 @@ class TestInlineReadGroup:
         with pytest.raises(ValueError, match="not accepted by backend 'inline'"):
             validate_index_config({"backend": "inline", "on_miss": "fallback"})
 
+    def test_inline_rejects_apriori_chunk_boundaries(self):
+        # The a-priori arm (issue #148 arm 2a) takes precedence inside
+        # _read_group, which would silently bypass inline's chunk-map
+        # addressing -- the combination is a config error.
+        ds = _fixture_data_source()
+        ds["read_plan"]["chunk_boundaries"] = {"prefix": "s3://x/boundaries/"}
+        with pytest.raises(ValueError, match="mutually exclusive"):
+            validate_index_config({"backend": "inline"}, ds)
+
 
 class TestInlineWorker:
     def _cfg(self, index=None):

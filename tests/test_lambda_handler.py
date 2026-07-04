@@ -845,6 +845,244 @@ class TestSetupTemplate:
         assert n_chunks == 5
 
 
+def _temporal_config_dict():
+    return {
+        "pipeline": {"type": "temporal"},
+        "data_source": {"reader": "xarray_s3", "collections": ["merra2"]},
+        "aggregation": {
+            "variables": {
+                "max_t2m": {
+                    "variable": "T2M",
+                    "collection": "merra2",
+                    "spatial_func": "max",
+                    "temporal_reducer": "max",
+                    "mask": "full",
+                }
+            }
+        },
+        "output": {"format": "parquet", "store": "s3://out/events.parquet"},
+    }
+
+
+def _temporal_inputs():
+    """One synthetic event mask + merra2 collection + cell_areas (max-T2M=5)."""
+    xr = pytest.importorskip("xarray")
+    import numpy as np
+
+    lat = np.array([-70.0, -69.5])
+    lon = np.array([0.0, 0.5])
+    time = np.array(["2020-01-01T00", "2020-01-01T03"], dtype="datetime64[ns]")
+    coords = {"time": time, "lat": lat, "lon": lon}
+    event_mask = xr.DataArray(np.ones((2, 2, 2)), dims=["time", "lat", "lon"], coords=coords)
+    temp = xr.DataArray(
+        np.stack([np.full((2, 2), 1.0), np.full((2, 2), 5.0)]),
+        dims=["time", "lat", "lon"],
+        coords=coords,
+    )
+    collections = {"merra2": xr.Dataset({"T2M": temp})}
+    areas = xr.DataArray(np.ones((2, 2)), dims=["lat", "lon"], coords={"lat": lat, "lon": lon})
+    return event_mask, collections, {"cell_areas": areas}
+
+
+def _temporal_event(**extra):
+    return {
+        "mode": "process_event",
+        "event_key": "storm1",
+        "event_mask_uri": "s3://b/mask.nc",
+        "collection_uris": {"merra2": "s3://b/merra2.zarr"},
+        "static_uris": {"cell_areas": "s3://b/areas.nc"},
+        "store_path": "s3://out/events.parquet",
+        "config": _temporal_config_dict(),
+        "s3_credentials": _CREDS,
+        **extra,
+    }
+
+
+class TestProcessEventModeGate:
+    def test_missing_event_key_rejected(self, handler_mod):
+        event = _temporal_event()
+        del event["event_key"]
+        resp = handler_mod._handle_process_event(event)
+        assert resp["statusCode"] == 400
+        assert "event_key" in json.loads(resp["body"])["error"]
+
+    def test_missing_store_path_rejected(self, handler_mod):
+        event = _temporal_event()
+        del event["store_path"]
+        resp = handler_mod._handle_process_event(event)
+        assert resp["statusCode"] == 400
+        assert "store_path" in json.loads(resp["body"])["error"]
+
+
+class TestProcessEventMode:
+    def _patch(self, handler_mod, monkeypatch):
+        """Stub the S3 readers + tabular writer; run the real process_event."""
+        import zagg.output as output
+        import zagg.temporal as temporal
+
+        event_mask, collections, static = _temporal_inputs()
+        captured = {}
+
+        monkeypatch.setattr(temporal, "open_dataset", lambda uri, **k: event_mask)
+        monkeypatch.setattr(temporal, "read_temporal_inputs", lambda *a, **k: (collections, static))
+
+        def _fake_write_tabular(rows, store_path, **kwargs):
+            captured["rows"] = rows
+            captured["store_path"] = store_path
+            captured["kwargs"] = kwargs
+            return store_path
+
+        monkeypatch.setattr(output, "write_tabular", _fake_write_tabular)
+        return captured
+
+    def test_dispatch_runs_process_event_and_writes_row(self, handler_mod, monkeypatch):
+        captured = self._patch(handler_mod, monkeypatch)
+        resp = handler_mod._handle_process_event(_temporal_event())
+        body = json.loads(resp["body"])
+        assert resp["statusCode"] == 200, body
+        assert body["event_key"] == "storm1"
+        assert body["timesteps_processed"] == 2
+        assert body["output_path"] == "s3://out/events.parquet"
+        # one flattened row carrying the event_key + max-T2M result
+        (row,) = captured["rows"]
+        assert row["event_key"] == "storm1"
+        assert row["results"]["max_t2m"] == pytest.approx(5.0)
+
+    def test_lambda_handler_routes_process_event_mode(self, handler_mod, monkeypatch):
+        # the top-level dispatcher routes mode="process_event" here.
+        self._patch(handler_mod, monkeypatch)
+        resp = handler_mod.lambda_handler(_temporal_event(), _context())
+        assert resp["statusCode"] == 200, json.loads(resp["body"])
+
+    def test_output_credentials_forwarded_to_writer(self, handler_mod, monkeypatch):
+        captured = self._patch(handler_mod, monkeypatch)
+        out_creds = {"accessKeyId": "w", "secretAccessKey": "x", "region": "eu-west-1"}
+        handler_mod._handle_process_event(_temporal_event(output_credentials=out_creds))
+        assert captured["kwargs"]["credentials"] == out_creds
+        assert captured["kwargs"]["region"] == "eu-west-1"
+
+    def test_exception_returns_500(self, handler_mod, monkeypatch):
+        import zagg.temporal as temporal
+
+        def _boom(*a, **k):
+            raise RuntimeError("read failed")
+
+        monkeypatch.setattr(temporal, "open_dataset", _boom)
+        resp = handler_mod._handle_process_event(_temporal_event())
+        body = json.loads(resp["body"])
+        assert resp["statusCode"] == 500
+        assert body["event_key"] == "storm1"
+        assert "read failed" in body["error"]
+
+
+class TestProcessEventReturnResults:
+    """``return_results`` (issue #12, Phase 8): the fan-out driver's contract.
+
+    The worker returns its flattened result values in the response body and
+    skips the tabular write (the driver collects rows and writes the single
+    object once), and ``store_path`` drops out of the required-parameter gate.
+    ``lambda_handler`` also mirrors process_event envelopes to ``result_url``
+    so the async (Event-invoke) fan-out has a pollable result."""
+
+    def _patch(self, handler_mod, monkeypatch):
+        import zagg.output as output
+        import zagg.temporal as temporal
+
+        event_mask, collections, static = _temporal_inputs()
+        captured = {"writes": 0}
+
+        monkeypatch.setattr(temporal, "open_dataset", lambda uri, **k: event_mask)
+        monkeypatch.setattr(temporal, "read_temporal_inputs", lambda *a, **k: (collections, static))
+
+        def _fake_write_tabular(rows, store_path, **kwargs):
+            captured["writes"] += 1
+            return store_path
+
+        monkeypatch.setattr(output, "write_tabular", _fake_write_tabular)
+        return captured
+
+    def test_returns_values_and_skips_write(self, handler_mod, monkeypatch):
+        captured = self._patch(handler_mod, monkeypatch)
+        event = _temporal_event(return_results=True)
+        del event["store_path"]
+        resp = handler_mod._handle_process_event(event)
+        body = json.loads(resp["body"])
+        assert resp["statusCode"] == 200, body
+        assert body["results"]["max_t2m"] == pytest.approx(5.0)
+        assert isinstance(body["results"]["max_t2m"], float)  # JSON-safe scalar
+        assert body["output_path"] is None
+        assert body["timesteps_processed"] == 2
+        assert body["duration_s"] >= 0
+        assert body["meta"]["n_specs"] == 1  # full meta rides back for the driver
+        assert captured["writes"] == 0  # driver writes; worker must not
+
+    def test_non_float_result_value_passes_through(self, handler_mod, monkeypatch):
+        # A custom reducer may return a non-float scalar (e.g. a label); the
+        # float cast must not turn that event into a 500 -- it passes through,
+        # matching what the direct-write path hands write_tabular.
+        import zagg.temporal as temporal
+
+        event_mask, collections, static = _temporal_inputs()
+        monkeypatch.setattr(temporal, "open_dataset", lambda uri, **k: event_mask)
+        monkeypatch.setattr(temporal, "read_temporal_inputs", lambda *a, **k: (collections, static))
+        monkeypatch.setattr(
+            temporal,
+            "process_event",
+            lambda *a, **k: ({"label": "landfall", "peak": 5.0}, {"timesteps_processed": 2}),
+        )
+        event = _temporal_event(return_results=True)
+        del event["store_path"]
+        resp = handler_mod._handle_process_event(event)
+        body = json.loads(resp["body"])
+        assert resp["statusCode"] == 200, body
+        assert body["results"] == {"label": "landfall", "peak": 5.0}
+
+    def test_store_path_still_required_without_flag(self, handler_mod):
+        event = _temporal_event()
+        del event["store_path"]
+        resp = handler_mod._handle_process_event(event)
+        assert resp["statusCode"] == 400
+        assert "store_path" in json.loads(resp["body"])["error"]
+
+    def test_gate_still_rejects_missing_mask_uri(self, handler_mod):
+        event = _temporal_event(return_results=True)
+        del event["event_mask_uri"]
+        resp = handler_mod._handle_process_event(event)
+        assert resp["statusCode"] == 400
+        assert "event_mask_uri" in json.loads(resp["body"])["error"]
+
+    def test_direct_invoke_body_has_no_results_key(self, handler_mod, monkeypatch):
+        # Without the flag the existing single-invoke contract is unchanged.
+        self._patch(handler_mod, monkeypatch)
+        resp = handler_mod._handle_process_event(_temporal_event())
+        assert "results" not in json.loads(resp["body"])
+
+    def test_result_url_mirrors_process_event_envelope(self, handler_mod, monkeypatch, tmp_path):
+        self._patch(handler_mod, monkeypatch)
+        url = str(tmp_path / "status" / "storm1.json")
+        event = _temporal_event(return_results=True, result_url=url)
+        del event["store_path"]
+        resp = handler_mod.lambda_handler(event, _context())
+        assert resp["statusCode"] == 200
+        written = json.loads(Path(url).read_text())
+        assert written == resp
+        assert json.loads(written["body"])["results"]["max_t2m"] == pytest.approx(5.0)
+
+    def test_result_url_mirrors_500_envelope(self, handler_mod, monkeypatch, tmp_path):
+        import zagg.temporal as temporal
+
+        def _boom(*a, **k):
+            raise RuntimeError("read failed")
+
+        monkeypatch.setattr(temporal, "open_dataset", _boom)
+        url = str(tmp_path / "status" / "storm1.json")
+        resp = handler_mod.lambda_handler(
+            _temporal_event(return_results=True, result_url=url), _context()
+        )
+        assert resp["statusCode"] == 500
+        assert json.loads(Path(url).read_text()) == resp
+
+
 class TestPeakRSSSampler:
     """Issue #141: per-invocation peak-RSS sampling. ``max_memory_mb`` must reflect
     the CURRENT invocation's peak (sampled ``VmRSS``), not the warm container's
@@ -912,6 +1150,124 @@ class TestPeakRSSSampler:
         s.stop()
         assert s.peak_mb is None
         assert s._thread is None  # never spawned
+
+
+class TestExtractMode:
+    """mode="extract" (issue #148): chunk-boundary geometry extraction."""
+
+    def _event(self, **over):
+        ev = {
+            "mode": "extract",
+            "granule_urls": ["s3://bucket/ATL03_a.h5"],
+            "output_prefix": "s3://out/boundaries/",
+            "s3_credentials": _CREDS,
+        }
+        ev.update(over)
+        return ev
+
+    def test_missing_params_rejected(self, handler_mod):
+        result = handler_mod.lambda_handler({"mode": "extract"}, _context())
+        assert result["statusCode"] == 400
+        body = json.loads(result["body"])
+        assert "granule_urls" in body["error"]
+        assert "output_prefix" in body["error"]
+
+    def test_dispatch_maps_credentials_and_returns_summary(self, handler_mod, monkeypatch):
+        import zagg.catalog.extract as ext
+
+        captured = {}
+
+        def fake_run(urls, prefix, *, driver, credentials, **kw):
+            captured.update(urls=urls, prefix=prefix, driver=driver, credentials=credentials)
+            return [
+                {
+                    "granule": "ATL03_a.h5",
+                    "ok": True,
+                    "wall_s": 1.5,
+                    "n_chunks": 3,
+                    "output": f"{prefix}ATL03_a.boundaries.parquet",
+                }
+            ]
+
+        monkeypatch.setattr(ext, "run_extraction", fake_run)
+        result = handler_mod.lambda_handler(self._event(), _context())
+        assert result["statusCode"] == 200
+        body = json.loads(result["body"])
+        assert body["mode"] == "extract"
+        assert body["granule_count"] == 1 and body["failed"] == 0
+        assert body["granules"][0]["wall_s"] == 1.5  # per-granule cost datum (#148)
+        assert body["duration_s"] >= 0 and body["max_memory_mb"] > 0
+        # process-mode creds are remapped to h5coro's kwargs, s3 driver default.
+        assert captured["driver"] == "s3"
+        assert captured["credentials"] == {
+            "aws_access_key_id": "a",
+            "aws_secret_access_key": "s",
+            "aws_session_token": "t",
+        }
+
+    def test_https_driver_uses_edl_token(self, handler_mod, monkeypatch):
+        import zagg.catalog.extract as ext
+
+        captured = {}
+
+        def fake_run(urls, prefix, *, driver, credentials, **kw):
+            captured.update(driver=driver, credentials=credentials)
+            return []
+
+        monkeypatch.setattr(ext, "run_extraction", fake_run)
+        ev = self._event(driver="https", s3_credentials={"edl_token": "tok"})
+        handler_mod.lambda_handler(ev, _context())
+        assert captured == {"driver": "https", "credentials": "tok"}
+
+    def test_partial_failure_maps_to_500(self, handler_mod, monkeypatch):
+        import zagg.catalog.extract as ext
+
+        monkeypatch.setattr(
+            ext,
+            "run_extraction",
+            lambda *a, **k: [
+                {"granule": "a.h5", "ok": True, "wall_s": 1.0, "n_chunks": 2, "output": "x"},
+                {"granule": "b.h5", "ok": False, "error": "boom"},
+            ],
+        )
+        result = handler_mod.lambda_handler(
+            self._event(granule_urls=["s3://b/a.h5", "s3://b/b.h5"]), _context()
+        )
+        assert result["statusCode"] == 500
+        body = json.loads(result["body"])
+        assert body["failed"] == 1 and body["granule_count"] == 2
+
+    def test_block_chunks_forwarded(self, handler_mod, monkeypatch):
+        import zagg.catalog.extract as ext
+
+        captured = {}
+
+        def fake_run(urls, prefix, *, driver, credentials, **kw):
+            captured.update(kw)
+            return []
+
+        monkeypatch.setattr(ext, "run_extraction", fake_run)
+        handler_mod.lambda_handler(self._event(block_chunks=4), _context())
+        assert captured == {"block_chunks": 4}
+
+    def test_missing_cred_keys_rejected_fast(self, handler_mod):
+        # Mirror process mode: malformed creds are a 400 before any read, not a
+        # whole-batch 403 burn under the execution role.
+        result = handler_mod.lambda_handler(
+            self._event(s3_credentials={"accessKeyId": "a"}), _context()
+        )
+        assert result["statusCode"] == 400
+        body = json.loads(result["body"])
+        assert "secretAccessKey" in body["error"] and "sessionToken" in body["error"]
+
+    def test_https_driver_missing_edl_token_rejected_fast(self, handler_mod):
+        # https branch has the same fail-fast gate: no edl_token is a 400, not
+        # a whole-batch 401 burn with the creds dict as the bearer token.
+        result = handler_mod.lambda_handler(
+            self._event(driver="https", s3_credentials={"accessKeyId": "a"}), _context()
+        )
+        assert result["statusCode"] == 400
+        assert "edl_token" in json.loads(result["body"])["error"]
 
 
 class TestAsyncResultWrite:
@@ -990,5 +1346,16 @@ class TestAsyncResultWrite:
         )
         url = str(tmp_path / "status" / "setup.json")
         resp = handler_mod.lambda_handler({"mode": "setup", "result_url": url}, _context())
+        assert resp["statusCode"] == 200
+        assert not Path(url).exists()
+
+    def test_extract_mode_ignores_result_url(self, handler_mod, monkeypatch, tmp_path):
+        # Extract mode (issue #148) dispatches before the result_url mirror,
+        # which stays process-mode-only -- pin the seam like setup mode above.
+        monkeypatch.setattr(
+            handler_mod, "_handle_extract", lambda event, context: {"statusCode": 200, "body": "{}"}
+        )
+        url = str(tmp_path / "status" / "extract.json")
+        resp = handler_mod.lambda_handler({"mode": "extract", "result_url": url}, _context())
         assert resp["statusCode"] == 200
         assert not Path(url).exists()
