@@ -12,6 +12,16 @@ co-located Zarr v3 arrays under a common prefix::
 This mirrors the standard CSR layout: ``values[offsets[k]:offsets[k+1]]`` is the
 payload for cell ``cell_ids[k]``.  Cells absent from ``cell_ids`` have no data.
 
+A *located* ragged field (issue #87) adds a fourth array::
+
+    {field_name}/locations -- flat uint64 morton location words, one per
+                              values row, SHARING offsets/cell_ids
+
+so ``locations[offsets[k]:offsets[k+1]]`` is cell ``cell_ids[k]``'s per-element
+location vector.  The shared offsets are valid because :func:`write_csr`
+enforces equal per-cell lengths.  Value-only fields are byte-identical to the
+pre-#87 three-array layout (no probe, no extra key).
+
 Profiling note (IO vs compute)
 -------------------------------
 For a typical ATL06 shard (4096 cells, ~100–1000 t-digest centroids per cell),

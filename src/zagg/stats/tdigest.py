@@ -62,6 +62,13 @@ Wire as a ragged reducer in a YAML config::
 
 ``calculate_cell_statistics`` calls ``build_tdigest(values, delta=512)`` per
 cell and stores the ``(k, 2)`` centroid array in the ragged field.
+
+Adding ``location: leaf_id`` to the field (issue #87) passes the cell's
+per-observation order-29 morton point words as ``locations=``; the reducer then
+returns a ``(digest, locations)`` pair whose second element is the ``(k,)``
+uint64 per-centroid location — the deepest morton cell enclosing each
+centroid's members (``mortie.common_ancestor``), stored as a companion CSR
+array. See ``zagg/configs/atl03_tdigest_located_healpix.yaml``.
 """
 
 from __future__ import annotations

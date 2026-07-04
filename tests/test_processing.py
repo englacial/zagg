@@ -1021,6 +1021,56 @@ class TestLocatedRaggedAggregation:
             seen.extend(int(w) for w in locs)
         assert sorted(seen) == sorted(int(w) for w in leaf)
 
+    def test_end_to_end_located_write_then_read(self, monkeypatch):
+        """Full path (issue #87 phase 5): synthetic obs → assign (point-kind) →
+        located digest (delta=1 forces centroid merges) → CSR companion write →
+        ``read_locations`` — and every stored location CONTAINS all of its cell's
+        contributing point words (the mixed-order containment acceptance)."""
+        from mortie import common_ancestor
+        from zarr.storage import MemoryStore
+
+        from zagg.readers import read_locations
+
+        cfg = self._located_cfg()
+        cfg.aggregation["variables"]["h_tdigest"]["params"] = {"delta": 1}
+        grid = HealpixGrid(6, 8, layout="fullsphere", config=cfg)
+        rng = np.random.default_rng(89)
+        lats = -78.5 + rng.uniform(-1e-3, 1e-3, 12)
+        lons = -132.0 + rng.uniform(-1e-3, 1e-3, 12)
+        leaf = np.asarray(grid.assign(lats, lons))
+        shard_key = int(np.unique(grid.shards_of(leaf))[0])
+        assert np.all(grid.shards_of(leaf) == shard_key)
+        df = pd.DataFrame({"h_li": rng.standard_normal(12).astype(np.float32), "leaf_id": leaf})
+        self._patch_reads(monkeypatch, df)
+
+        store = MemoryStore()
+        ragged: dict = {}
+        process_shard(grid, shard_key, ["s3://x"], s3_credentials={}, config=cfg, ragged_out=ragged)
+        write_ragged_to_zarr(ragged, store, grid=grid, shard_key=shard_key)
+
+        cell_of = grid.cells_of(leaf)
+        children = grid.children(shard_key)
+        out = list(read_locations(store, f"{grid.group_path}/h_tdigest"))
+        assert out and all(locs.dtype == np.uint64 for _, _, locs in out)
+        covered = 0
+        for morton, cell_pos, locs in out:
+            assert morton == shard_key
+            members = leaf[cell_of == int(children[cell_pos])]
+            assert len(members) > 0
+            for w in members:
+                # Containment: folding a member back into some stored location
+                # leaves it unchanged (common_ancestor identity).
+                assert any(
+                    int(common_ancestor(np.array([anc, w], dtype=np.uint64))) == int(anc)
+                    for anc in locs
+                )
+            covered += len(members)
+        assert covered == len(leaf)  # every observation is located somewhere
+        # delta=1 forced real merges: at least one location is a coarsened
+        # (below-order-29) enclosing cell, not a raw point word.
+        all_locs = np.concatenate([locs for _, _, locs in out])
+        assert not set(int(w) for w in all_locs) <= set(int(w) for w in leaf)
+
     def test_unlocated_field_keeps_two_tuple(self, monkeypatch):
         # The pre-#87 ragged sink contract is untouched for unlocated fields.
         cfg = self._located_cfg()

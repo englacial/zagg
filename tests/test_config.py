@@ -1813,3 +1813,18 @@ class TestLocationChannel:
         # (no new key), so existing shard-map signatures still match.
         plain = output_field_signature(_ragged_cfg(inner_shape=[2]))[0]
         assert "location" not in plain
+
+    def test_located_builtin_config_loads_and_validates(self):
+        """The shipped located t-digest template (issue #87) loads, validates,
+        and differs from the value-only template ONLY by the location channel."""
+        located = default_config("atl03_tdigest_located_healpix")
+        plain = default_config("atl03_tdigest_healpix")
+        sig = get_output_signature(get_agg_fields(located)["h_tdigest"])
+        assert sig["location"] == "leaf_id"
+        assert sig["kind"] == "ragged" and sig["inner_shape"] == (2,)
+        # Same read plan and grid; the only variables delta is the location key.
+        assert located.data_source == plain.data_source
+        assert located.output == plain.output
+        located_meta = dict(get_agg_fields(located)["h_tdigest"])
+        located_meta.pop("location")
+        assert located_meta == get_agg_fields(plain)["h_tdigest"]
