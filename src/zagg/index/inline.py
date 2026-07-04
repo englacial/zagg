@@ -50,7 +50,12 @@ logger = logging.getLogger(__name__)
 #: are PR #159's offsets schema; ``chunk_offset``/``dtype``/``shape``/
 #: ``chunk_shape``/``gzip``/``shuffle`` are the per-dataset decode metadata
 #: the ``sidecar`` consumer's ``Index.from_chunks`` reconstruction needs
-#: (tuples as JSON so the parquet stays flat and self-describing).
+#: (tuples as JSON so the parquet stays flat and self-describing). Contract
+#: pins (espg decisions relayed on PR #163): ``dtype`` is the byte-order-
+#: explicit ``np.dtype(...).str`` form (``<f4``, ``|i1`` -- never bare
+#: ``float32``), and ``gzip`` stays a *boolean* (filter presence; the deflate
+#: level is invisible to h5coro's metadata parse and irrelevant for decode --
+#: the binding maps the bool).
 MANIFEST_DTYPES = {
     "dataset": "object",
     "chunk_idx": "int64",

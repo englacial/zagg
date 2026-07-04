@@ -76,9 +76,9 @@ identical manifests. One row per HDF5 chunk:
 | `byte_offset`, `nbytes` | stored (compressed) chunk extent in the file |
 | `filter_mask` | HDF5 per-chunk filter mask (0 = all filters applied) |
 | `chunk_offset` | per-dim dataspace offset, JSON list |
-| `dtype` | numpy dtype string (e.g. `<f4`) |
+| `dtype` | byte-order-explicit numpy dtype string (`np.dtype(...).str`, e.g. `<f4`, `|i1`) |
 | `shape`, `chunk_shape` | per-dataset dims, JSON lists |
-| `gzip`, `shuffle` | filter-pipeline flags |
+| `gzip`, `shuffle` | filter-pipeline flags (booleans by contract — deflate level is irrelevant for decode) |
 
 Contiguous (unchunked) datasets appear as a single pseudo-chunk. This is the
 schema a `sidecar` consumer reconstructs its decode index from.

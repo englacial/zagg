@@ -722,6 +722,18 @@ class TestGranuleManifest:
         assert len(df) == 0
         assert df["chunk_idx"].dtype == np.int64
 
+    def test_dtype_strings_carry_explicit_byte_order(self):
+        # from_chunks contract pin (espg decision relayed on the PR thread):
+        # dtype strings are byte-order-explicit np.dtype(...).str forms
+        # ('<f4', '|i1'), never bare names; gzip stays a boolean.
+        h5obj = _open_fixture()
+        paths = [f"/gt1l/heights/{name}" for name in _HEIGHTS] + ["/gt1l/geolocation/ph_index_beg"]
+        df = granule_manifest({p: build_chunk_map(h5obj, p) for p in paths})
+        assert set(df[df["dataset"] == "/gt1l/heights/signal_conf_ph"]["dtype"]) == {"|i1"}
+        assert set(df[df["dataset"] == "/gt1l/heights/lat_ph"]["dtype"]) == {"<f8"}
+        assert df["dtype"].str.match(r"^[<>|][a-z]\d+$").all()
+        assert df["gzip"].dtype == np.dtype(bool)
+
 
 class TestInlineWriteBackWorker:
     def _run(self, tmp_path, index):
