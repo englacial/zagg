@@ -1283,9 +1283,14 @@ def _run_lambda(
         # Configure the dispatch boto3 client. max_pool_connections is sized to
         # the clamped worker count so connections cannot outrun the
         # file-descriptor budget. Built here (not before) so the pool tracks
-        # the probe's clamp.
+        # the probe's clamp. read_timeout must exceed the function Timeout
+        # (900 s since issue #148 — the Lambda ceiling) with headroom, or a
+        # shard running to the ceiling trips the client-side botocore read
+        # timeout first: that matches the retryable "Read timeout" pattern, so
+        # a deterministic function timeout would be re-invoked (and re-billed)
+        # instead of surfacing as the Lambda's own "Task timed out" error.
         boto_config = Config(
-            read_timeout=900,
+            read_timeout=960,
             connect_timeout=10,
             retries={"max_attempts": 0},
             max_pool_connections=clamped,
@@ -1604,8 +1609,9 @@ def _log_concurrency_report(report: ConcurrencyReport, max_workers: int) -> None
 
 # Function Timeout fallback when get_function_configuration can't be read
 # (permission denied, etc.). Mirrors the CloudFormation default in
-# deployment/aws/template.yaml (Timeout Default: 720).
-_DEFAULT_FUNCTION_TIMEOUT_S = 720
+# deployment/aws/template.yaml (Timeout Default: 900, the Lambda hard
+# ceiling — bumped from 720 for the 88S stress shards, issue #148).
+_DEFAULT_FUNCTION_TIMEOUT_S = 900
 
 # Async-dispatch polling (issue #151). The poll deadline is the function
 # Timeout plus this margin (async queue latency + the worker's result write);

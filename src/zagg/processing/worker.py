@@ -215,10 +215,33 @@ def process_shard(
     # Build URL rewriter for the active driver
     _rewrite_url = _processing._make_url_rewriter(driver)
 
+    # A-priori chunk-boundary plan (issue #148 arm 2a): ``_read_group`` needs
+    # the granule identity to locate its boundary parquet. The kwarg is passed
+    # only when the feature is on, so monkeypatched ``_read_group`` fakes (and
+    # the production call) keep their existing signature byte-for-byte.
+    # Presence check, mirroring ``_read_group``'s dispatch gate exactly.
+    _rp = data_source.get("read_plan")
+    apriori = isinstance(_rp, dict) and "chunk_boundaries" in _rp
+
     use_arrow = handoff == "arrow"
     all_reads = []
     files_processed = 0
     read_errors = 0
+
+    # Streaming buffered merge (issue #148 phase 4): when
+    # ``aggregation.streaming`` is set, reads accumulate for ``buffer_granules``
+    # granules and fold into running per-cell state instead of pooling the whole
+    # shard — peak memory is one buffer + digest state, independent of granule
+    # count. Validated up front (mergeable reducers only); ``None`` (default) is
+    # the unchanged pooled path.
+    from zagg.processing.streaming import StreamingAggregator, get_streaming
+
+    streaming_cfg = get_streaming(config)
+    buffered = (
+        StreamingAggregator(config, grid, handoff, streaming_cfg["buffer_granules"])
+        if streaming_cfg is not None
+        else None
+    )
 
     # Opt-in per-phase timing (issue #100). Only allocated when profiling so the
     # default path stays byte-identical (no dict, no time.time() calls).
@@ -241,11 +264,17 @@ def process_shard(
 
             for g in data_source["groups"]:
                 try:
+                    read_kwargs = {"arrow": use_arrow}
+                    if apriori:
+                        read_kwargs["granule_url"] = s3_url
                     chunk = _processing._read_group(
-                        h5obj, g, data_source, shard_key, grid, arrow=use_arrow
+                        h5obj, g, data_source, shard_key, grid, **read_kwargs
                     )
                     if chunk is not None:
-                        all_reads.append(chunk)
+                        if buffered is not None:
+                            buffered.add_read(chunk)
+                        else:
+                            all_reads.append(chunk)
                 except Exception as e:
                     # A raised read error is always a real failure: a
                     # legitimately-empty group returns ``None`` (no exception),
@@ -258,6 +287,8 @@ def process_shard(
                     continue
 
             files_processed += 1
+            if buffered is not None:
+                buffered.granule_done()
 
         except Exception as e:
             logger.warning(f"  Error processing file {s3_url}: {e}")
@@ -281,10 +312,18 @@ def process_shard(
     metadata["files_processed"] = files_processed
     if read_errors:
         metadata["read_errors"] = read_errors
+
+    if buffered is not None:
+        # Drain the tail buffer (< buffer_granules granules) BEFORE the read
+        # stamp: intermediate flushes already run inside the read loop
+        # (granule_done -> flush), so under profiling the streaming path
+        # deliberately charges ALL group+merge cost to ``read`` — the tail
+        # flush must not fall between phases and vanish from the accounting.
+        buffered.flush()
     if profile:
         phase_timings["read"] = time.time() - _read_t0
 
-    if not all_reads:
+    if buffered.empty if buffered is not None else not all_reads:
         # Distinguish a genuinely-empty read from one where a group read raised
         # (issue #116): a raised read is a real error masquerading as "no data",
         # so report it as such instead of the misleading text. Some groups may
@@ -347,9 +386,16 @@ def process_shard(
     # not the whole pooled shard. At K==1 the lone chunk == the whole shard, so the
     # anchor is identical to the old shard-level reduction (byte-for-byte unchanged).
     # Concat the per-group reads and split observations by cell (carrier-agnostic;
-    # both carriers feed identical numpy arrays into _group_columns).
-    col_arrays, cell_to_slice, n_obs_total = _concat_and_group(all_reads, grid, handoff)
-    logger.info(f"  Read {n_obs_total:,} observations")
+    # both carriers feed identical numpy arrays into _group_columns). The buffered
+    # path (issue #148 phase 4) already grouped-and-merged per flush, so its
+    # running state replaces the shard-wide pool.
+    if buffered is not None:
+        col_arrays, cell_to_slice = {}, {}
+        n_obs_total = buffered.n_obs_total
+        logger.info(f"  Read {n_obs_total:,} observations ({buffered.flushes} buffer flushes)")
+    else:
+        col_arrays, cell_to_slice, n_obs_total = _concat_and_group(all_reads, grid, handoff)
+        logger.info(f"  Read {n_obs_total:,} observations")
 
     if profile:
         phase_timings["index"] = time.time() - _index_t0
@@ -373,19 +419,27 @@ def process_shard(
     single_ragged: dict = {}
     for block_index, chunk_children in chunk_iter:
         chunk_children = np.asarray(chunk_children)
-        # Per-chunk precompute (issue #82 phase 6): pool only this chunk's rows
-        # from the shard's sorted column arrays, then reduce the anchor over them.
-        chunk_pooled = _pool_chunk_columns(col_arrays, cell_to_slice, chunk_children)
-        chunk_scalars = _eval_chunk_precompute(config, chunk_pooled)
-        stats_arrays, ragged_payloads, ragged_idx, cwd = _aggregate_chunk_cells(
-            chunk_children,
-            col_arrays,
-            cell_to_slice,
-            chunk_scalars,
-            config,
-            data_vars,
-            agg_fields,
-        )
+        if buffered is not None:
+            # Buffered path (issue #148 phase 4): emit this chunk's outputs from
+            # the running merged state; chunk_precompute is rejected at validation
+            # so there are no chunk scalars to evaluate.
+            stats_arrays, ragged_payloads, ragged_idx, cwd = buffered.chunk_outputs(
+                chunk_children, agg_fields
+            )
+        else:
+            # Per-chunk precompute (issue #82 phase 6): pool only this chunk's rows
+            # from the shard's sorted column arrays, then reduce the anchor over them.
+            chunk_pooled = _pool_chunk_columns(col_arrays, cell_to_slice, chunk_children)
+            chunk_scalars = _eval_chunk_precompute(config, chunk_pooled)
+            stats_arrays, ragged_payloads, ragged_idx, cwd = _aggregate_chunk_cells(
+                chunk_children,
+                col_arrays,
+                cell_to_slice,
+                chunk_scalars,
+                config,
+                data_vars,
+                agg_fields,
+            )
         cells_with_data += cwd
         # Strict-AOI per-cell mask (issue #101): expand the shard's manifest payload
         # over THIS chunk's cells (order-aligned with the carrier). None when the

@@ -31,7 +31,7 @@ aggregator).
   deterministic rule in `bench_metrics.select_densest_shard`.
 - **Temporal pin:** `2018-10-13 .. 2025-06-01` (full multi-year slice), recorded
   in `targets.json` under `temporal`. AOI = `AOP_NEON.geojson`.
-- **Cost model:** arm64, 2 GB, capped at the 720 s deploy timeout (see
+- **Cost model:** arm64, 2 GB, capped at the 900 s deploy timeout (see
   `zagg.dispatch`).
 - **AOI is per shard map (issue #121).** The top-level `aoi`/`temporal`/`cmr` in
   `targets.json` are **defaults**; a shard-map entry may override any of them.
@@ -145,6 +145,36 @@ what places the panel.
    `test_targets_manifest_consistent` re-derives the densest shard from the
    committed map and fails if the pinned `shard_key`/`n_granules` is stale.
 
+## The 88°S stress targets (issue #148)
+
+`tdigest_healpix_o9_88s` / `tdigest_healpix_o10_88s` are **provisional**
+(PR-tree-only) probes against the worst-case shard of the whole mission: the
+ICESat-2 turning-latitude ring, where all ~1,387 RGTs converge. They reuse the
+NEON tdigest configs and temporal window; only the AOI override differs.
+
+- **Pins.** o9: the ring's densest shard by granule count (5,620 granules over
+  576 ring shards / 2.04M pairs / 35,639 catalog granules — ~95× NEON o9's 59).
+  o10: the densest o10 shard **nested inside** the pinned o9 shard
+  (`nested_in` in `targets.json`; 4,605 granules vs the global o10 max of
+  4,642 at another longitude), so one o9 boundary-extraction pass covers both
+  orders. The drift test derives the same nested quantity when `nested_in` is
+  set.
+- **Pruned shard maps.** The full ring maps are ~0.7 GB (o9) / ~1.7 GB (o10) of
+  JSON, so the committed `sm_healpix_o{9,10}_88s.json` keep **only the pinned
+  shard** (see `metadata.pruned`). The benchmark dispatches only that shard;
+  re-pinning means rebuilding the full map (step 2 below).
+- **Build the catalog once.** The ring catalog is a ~20 min CMR fetch, so save
+  it when (re)building (`--catalog-out
+  tests/data/benchmark/catalogs/cat_88s.parquet`) and point the shard-map
+  entry's `catalog_parquet` key at the committed snapshot: the drift test then
+  rebuilds from the parquet instead of re-fetching CMR weekly (it becomes a
+  deterministic, offline guard on the shardmap build + pin). Regenerate the
+  snapshot only to deliberately re-pin.
+- **Run on demand** via explicit `--target` (they are provisional so a red
+  stress run never fails the every-merge matrix): OOM/timeout at 2 GB / 900 s
+  is the *expected* baseline result until the issue #148 streaming/cached-read
+  work lands.
+
 ## Add a target over a different AOI (latitude sweep / polar stress)
 
 The default AOI is NEON SERC. To benchmark a **different** AOI — runtime vs.
@@ -156,6 +186,13 @@ top-level default (issue #121).
    `antarctic_88s.geojson`, already shipped). HEALPix is CRS-agnostic, so it is
    the simplest grid for a clean latitude sweep; a rectilinear analog at high
    latitude needs a polar CRS (e.g. `EPSG:3031`) in its config.
+
+   **Full-longitude rings must be sectorized.** A single lat/lon rectangle
+   spanning `-180..180` collapses under spherical polygon fill (mortie traces
+   the ring's edges as great circles, so coverage degenerates to an
+   antimeridian sliver — 10 cells instead of ~576 at o9). `antarctic_88s.geojson`
+   is therefore a MultiPolygon of eight 45° sectors with vertices sampled every
+   1° of longitude; follow that pattern for any AOI that wraps the globe.
 
 2. **Build the shard map over that AOI** — point `--polygon` at the new geojson
    (and `--start-date`/`--end-date` if the override narrows the window):
@@ -198,7 +235,7 @@ top-level default (issue #121).
 
    **High-latitude density → failure is the expected result.** Near ±88° the
    densest shard is far heavier than NEON's 44–50 granules, so the target will
-   likely OOM or hit the 720 s / 2 GB timeout — that is the point of a stress
+   likely OOM or hit the 900 s / 2 GB timeout — that is the point of a stress
    target. Label it as such (it compounds the OOM issues #117 / #119).
 
 ## Remove a target

@@ -308,7 +308,7 @@ you want the raw artifacts.
 ## Cost and safety notes
 
 - **Bounded spend.** Each run dispatches **one** shard per target, hard-capped by
-  the Lambda timeout (720 s deploy default ≤ 900 s AWS max) — pennies per run.
+  the Lambda timeout (900 s deploy default, the AWS max — issue #148) — pennies per run.
   The auto PR job has per-PR concurrency, so rapid pushes don't stack billed runs.
 - **No fork auto-runs.** Fork PRs never get the role automatically; a write/admin
   maintainer must opt in per PR (`/benchmark` or the `benchmark` label). Doing so

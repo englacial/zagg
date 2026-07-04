@@ -35,9 +35,11 @@ from zagg.processing.aggregate import (
     _has_vector_fields,
     calculate_cell_statistics,
 )
+from zagg.processing.apriori import _apriori_read_group, _plan_from_boundaries
 from zagg.processing.read import (
     _COMPARE,
     _broadcast_segment_to_base,
+    _execute_plan_group,
     _expand_mask_to_base,
     _level_coord_paths,
     _make_url_rewriter,
@@ -94,8 +96,11 @@ __all__ = [
     "_has_vector_fields",
     # read-stage helpers
     "_COMPARE",
+    "_apriori_read_group",
     "_broadcast_segment_to_base",
+    "_execute_plan_group",
     "_expand_mask_to_base",
+    "_plan_from_boundaries",
     "_level_coord_paths",
     "_make_url_rewriter",
     "_planned_read_group",

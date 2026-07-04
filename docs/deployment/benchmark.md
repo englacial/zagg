@@ -2,8 +2,8 @@
 
 Cost and runtime of the zagg compute pipeline on AWS Lambda, tracked per merge to
 `main` (issue #110). Each point dispatches the **single densest shard** over the
-NEON SERC AOP box — arm64, 2 GB, one shard per target, capped by the 720 s deploy
-timeout — so deltas track code changes, not data drift.
+NEON SERC AOP box — arm64, 2 GB, one shard per target, capped by the 900 s deploy
+timeout (the Lambda ceiling, issue #148) — so deltas track code changes, not data drift.
 
 The charts below are rendered on every merge and published to the `benchmarks`
 data branch; they update live (the docs embed them by raw URL, so no docs rebuild
