@@ -645,6 +645,95 @@ class TestMortonCoordinate:
         np.testing.assert_array_equal(morton_words(to_morton_array(stored)), expected)
 
 
+class TestMortonArrowAdapter:
+    """The typed Arrow legs of the morton boundary (issue #135): morton_to_arrow /
+    morton_from_arrow / is_morton_arrow carry mortie's ``morton_index`` extension
+    type over the PyCapsule interface, mirroring the uint64 round-trip suite above."""
+
+    def test_extension_name_pins_mortie_constant(self):
+        import mortie.arrow
+
+        from zagg.grids.morton import MORTON_EXTENSION_NAME
+
+        assert MORTON_EXTENSION_NAME == mortie.arrow.EXTENSION_NAME
+
+    def test_to_arrow_carries_extension_type(self, cfg):
+        from zagg.grids.morton import is_morton_arrow, morton_to_arrow
+
+        g = HealpixGrid(parent_order=6, child_order=8, layout="fullsphere", config=cfg)
+        coords = g.chunk_coords(_valid_parents(1)[0])
+        arr = morton_to_arrow(coords["morton"])
+        assert is_morton_arrow(arr)
+
+    def test_to_arrow_accepts_raw_words(self):
+        from zagg.grids.morton import is_morton_arrow, morton_from_arrow, morton_to_arrow
+
+        words = np.array([123456789, (1 << 63) | 42], dtype=np.uint64)
+        arr = morton_to_arrow(words)
+        assert is_morton_arrow(arr)
+        np.testing.assert_array_equal(np.asarray(morton_from_arrow(arr)._data), words)
+
+    def test_words_roundtrip_through_arrow(self, cfg):
+        """to_arrow -> from_arrow reconstructs the same packed words the typed
+        coordinate carries — the Arrow legs are a skin, not a re-encoding."""
+        from mortie import generate_morton_children
+
+        from zagg.grids.morton import morton_from_arrow, morton_to_arrow, morton_words
+
+        g = HealpixGrid(parent_order=6, child_order=8, layout="fullsphere", config=cfg)
+        parent = _valid_parents(1)[0]
+        coords = g.chunk_coords(parent)
+        back = morton_from_arrow(morton_to_arrow(coords["morton"]))
+        np.testing.assert_array_equal(morton_words(back), generate_morton_children(int(parent), 8))
+
+    def test_southern_bit63_words_roundtrip(self):
+        """Southern (base 7-11) words set bit 63; the Arrow legs keep them intact
+        as uint64 — the same #71 sign hazard the storage round-trip guards."""
+        from mortie import clip2order, geo2mort
+
+        from zagg.grids.morton import morton_from_arrow, morton_to_arrow, morton_words
+
+        leaf = geo2mort(np.array([-78.5]), np.array([-132.0]), order=18)
+        cells = np.asarray(clip2order(8, leaf), dtype=np.uint64)
+        words = morton_words(morton_from_arrow(morton_to_arrow(cells)))
+        np.testing.assert_array_equal(words, cells)
+        assert words.dtype == np.uint64
+        assert (words.view(np.int64) < 0).any()
+
+    def test_sentinel_null_roundtrip(self):
+        """The all-zero empty sentinel crosses the boundary as an Arrow null and
+        comes back as the sentinel, so isna() round-trips."""
+        from zagg.grids.morton import morton_from_arrow, morton_to_arrow, to_morton_array
+
+        words = np.array([123456789, 0, 42], dtype=np.uint64)
+        back = morton_from_arrow(morton_to_arrow(to_morton_array(words)))
+        np.testing.assert_array_equal(np.asarray(back._data), words)
+        np.testing.assert_array_equal(back.isna(), [False, True, False])
+
+    def test_from_arrow_accepts_chunked_column(self):
+        """A table column (ChunkedArray) round-trips too — the write path hands
+        columns, not bare arrays."""
+        from arro3.core import Table
+
+        from zagg.grids.morton import is_morton_arrow, morton_from_arrow, morton_to_arrow
+
+        words = np.array([7, 11, 13], dtype=np.uint64)
+        tbl = Table.from_pydict({"morton": morton_to_arrow(words)})
+        col = tbl.column("morton")
+        assert is_morton_arrow(col)
+        np.testing.assert_array_equal(np.asarray(morton_from_arrow(col)._data), words)
+
+    def test_is_morton_arrow_false_for_plain_columns(self):
+        from arro3.core import Array, Table
+
+        from zagg.grids.morton import is_morton_arrow
+
+        tbl = Table.from_pydict({"x": Array.from_numpy(np.arange(3, dtype=np.uint64))})
+        assert not is_morton_arrow(tbl.column("x"))
+        assert not is_morton_arrow(tbl.column("x").combine_chunks())
+        assert not is_morton_arrow(np.arange(3))  # no Arrow field at all
+
+
 class TestChunkInnerMultiChunk:
     """Issue #30 item 3: an optional finer ``chunk_inner`` level between shard and
     cell, native units per grid (HEALPix order, rectilinear shape). One shard owns
