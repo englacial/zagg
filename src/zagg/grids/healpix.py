@@ -395,20 +395,15 @@ class HealpixGrid:
         a lone point, an area cell would misreport its extent). Point and area
         words share the same path prefix — ``clip2order`` coarsening is
         bit-identical — so ``cells_of`` / ``shards_of`` (and every dense output)
-        are unchanged. Encoding rides ``MortonIndexArray.from_latlon(...,
-        points=True)`` unwrapped via :func:`zagg.grids.morton.morton_words`
-        (the numpy-level ``geo2mort`` has no point kind yet; swapping to one is
-        the planned phase 6 of issue #87).
+        are unchanged. Encoding rides the numpy-level ``geo2mort(...,
+        points=True)`` (mortie 0.8.5, espg/mortie#100 — the issue #87 phase-6
+        surface, replacing the pandas ``MortonIndexArray`` wrapper + unwrap).
         """
-        from mortie import MortonIndexArray
-
-        from zagg.grids.morton import morton_words
+        from mortie import geo2mort
 
         # Passing the order explicitly is a self-check: point encoding is
         # order-29-only, so mortie raises loudly if HEALPIX_REF_ORDER ever drifts.
-        return morton_words(
-            MortonIndexArray.from_latlon(lats, lons, order=HEALPIX_REF_ORDER, points=True)
-        )
+        return geo2mort(lats, lons, order=HEALPIX_REF_ORDER, points=True)
 
     def shards_of(self, leaf_ids) -> np.ndarray:
         """Vectorized parent-morton lookup. ``leaf_ids`` at :data:`HEALPIX_REF_ORDER`."""
