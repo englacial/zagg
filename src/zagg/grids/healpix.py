@@ -172,7 +172,16 @@ class HealpixGrid:
         # cell_ids coordinate encoding (issue #135): "nested" (default, the DGGS
         # standard) or "morton" (emit the packed morton words as cell_ids — a
         # test/prototype capability). Default is byte-identical to a pre-flag run.
+        # Re-validated here (not only in validate_config) because both coords_of
+        # (the cell_ids values) and _dggs_attrs (the recorded indexing_scheme)
+        # interpret this string: an unvalidated third value would write NESTED
+        # values while recording a different scheme — a mis-decode for consumers.
         self.cell_ids_encoding = get_cell_ids_encoding(self.config)
+        if self.cell_ids_encoding not in ("nested", "morton"):
+            raise ValueError(
+                f"Unknown cell_ids_encoding: {self.cell_ids_encoding!r} "
+                "(expected 'nested' or 'morton')"
+            )
         self._position_map: dict[int, int] | None = None
         if populated_shards is not None:
             self.set_populated_shards(populated_shards)

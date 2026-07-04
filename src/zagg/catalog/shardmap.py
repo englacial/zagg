@@ -629,7 +629,7 @@ class ShardMap:
 
         table = pq.read_table(path)
         raw = (table.schema.metadata or {}).get(cls._PARQUET_META_KEY)
-        if raw is None or "granules" not in table.column_names:
+        if raw is None or not {"shard_keys", "granules"}.issubset(table.column_names):
             raise ValueError(f"{path}: not a zagg ShardMap parquet manifest")
         d = json.loads(raw)
         if "grid_signature" not in d:

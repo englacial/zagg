@@ -726,6 +726,7 @@ def _iter_carrier_columns(carrier):
         return
 
     from arro3.core import list_flatten
+    from mortie.arrow import import_c_array
 
     n_rows = carrier.num_rows
     for name in carrier.column_names:
@@ -736,8 +737,6 @@ def _iter_carrier_columns(carrier):
         # write (Arrow nulls -> the all-zero sentinel), keeping the stored dtype
         # plain uint64 (#71).
         if is_morton_arrow(col):
-            from mortie.arrow import import_c_array
-
             yield name, import_c_array(col)
             continue
         # arro3 marks a FixedSizeList by an integer ``list_size`` (None for scalar

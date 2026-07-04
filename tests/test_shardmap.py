@@ -434,6 +434,44 @@ class TestParquetIO:
             with pytest.raises(ValueError, match="not a zagg ShardMap parquet manifest"):
                 ShardMap.from_parquet(f.name)
 
+    def test_missing_shard_keys_column_rejected_cleanly(self):
+        # A file carrying the zagg meta key and granules but no shard_keys must
+        # hit the clean ValueError, not a bare pyarrow KeyError.
+        pa_mod = pytest.importorskip("pyarrow")
+        pq = pytest.importorskip("pyarrow.parquet")
+        table = pa_mod.table({"granules": pa_mod.array(["[]"])}).replace_schema_metadata(
+            {ShardMap._PARQUET_META_KEY: b'{"metadata": {}, "grid_signature": {}}'}
+        )
+        with tempfile.NamedTemporaryFile(suffix=".parquet", delete=False) as f:
+            pq.write_table(table, f.name)
+            with pytest.raises(ValueError, match="not a zagg ShardMap parquet manifest"):
+                ShardMap.from_parquet(f.name)
+
+    def test_extension_stripped_column_still_loads(self):
+        # import_c_array reads plain uint64 storage too (verified on mortie
+        # 0.8.4), so a manifest whose shard_keys column lost the extension type
+        # still rehydrates with the correct keys.
+        pa_mod = pytest.importorskip("pyarrow")
+        pq = pytest.importorskip("pyarrow.parquet")
+        sm = self._sm()
+        stripped = pa_mod.table(
+            {
+                "shard_keys": pa_mod.array(np.asarray(sm.shard_keys, dtype=np.uint64)),
+                "granules": pa_mod.array([json.dumps(g) for g in sm.granules]),
+            }
+        ).replace_schema_metadata(
+            {
+                ShardMap._PARQUET_META_KEY: json.dumps(
+                    {"metadata": sm.metadata, "grid_signature": sm.grid_signature}
+                ).encode()
+            }
+        )
+        with tempfile.NamedTemporaryFile(suffix=".parquet", delete=False) as f:
+            pq.write_table(stripped, f.name)
+            sm2 = ShardMap.from_parquet(f.name)
+        assert sm2.shard_keys == sm.shard_keys
+        assert sm2.granules == sm.granules
+
 
 def _aoi_config(base="atl06_polar"):
     cfg = default_config(base)

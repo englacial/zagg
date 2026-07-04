@@ -2600,6 +2600,42 @@ class TestTypedMortonCarrier:
         assert isinstance(df, pd.DataFrame)
         assert is_morton_array(df["morton"].values)
 
+    def test_store_bytes_identical_with_sentinel_nulls(self):
+        """A morton column bearing the all-zero empty sentinel crosses the arro3
+        carrier as an Arrow null; the write boundary must still land a literal
+        uint64 0 on disk — byte-identical to the pandas carrier and the pre-#135
+        strip (which wrote the 0 with no validity bitmap in play)."""
+        ac = pytest.importorskip("arro3.core")
+        from zagg.grids.morton import morton_to_arrow, to_morton_array
+
+        cfg, grid, parent, stats = self._setup()
+        # Fabricate the coordinate columns directly: real children with the first
+        # word replaced by the sentinel (0), so the typed column carries a null.
+        words = np.asarray(grid.children(parent), dtype=np.uint64).copy()
+        words[0] = 0
+        cell_ids = grid.encode_cell_ids(grid.children(parent))
+        mia = to_morton_array(words)
+        assert mia.isna()[0]  # the sentinel really is a missing entry
+
+        typed_cols = {var: ac.Array.from_numpy(stats[var]) for var in get_data_vars(cfg)}
+        typed_cols["morton"] = morton_to_arrow(mia)
+        typed_cols["cell_ids"] = ac.Array.from_numpy(np.asarray(cell_ids))
+        typed = self._store_bytes(ac.Table.from_pydict(typed_cols), grid, parent)
+
+        strip_cols = dict(typed_cols)
+        strip_cols["morton"] = ac.Array.from_numpy(words)  # the pre-#135 strip
+        stripped = self._store_bytes(ac.Table.from_pydict(strip_cols), grid, parent)
+
+        df = pd.DataFrame({var: stats[var] for var in get_data_vars(cfg)})
+        df["morton"] = mia
+        df["cell_ids"] = cell_ids
+        via_pandas = self._store_bytes(df, grid, parent)
+
+        assert typed.keys() == via_pandas.keys() == stripped.keys()
+        for key in typed:
+            assert typed[key] == via_pandas[key], f"arrow vs pandas differ at {key}"
+            assert typed[key] == stripped[key], f"typed vs strip differ at {key}"
+
 
 class TestChunkResolutionCompanion:
     """Issue #30 item 2: a ``resolution: chunk`` field is written ONCE per chunk to

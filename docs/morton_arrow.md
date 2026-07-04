@@ -54,6 +54,13 @@ output:
 
 The default (key absent or `nested`) is byte-identical to a pre-flag run.
 
+Note the grid's `spatial_signature()` (recorded in ShardMap manifests) stays
+`nested` regardless of the flag — deliberately, so shard maps remain reusable
+across encodings: the flag changes coordinate *values*, not the spatial layout.
+Only the store's `dggs.indexing_scheme` attribute tracks the active encoding.
+(The pre-existing `output.grid.indexing_scheme` config key is descriptive only
+and must stay `nested`; `cell_ids_encoding` is the knob.)
+
 ## Shardmap parquet manifests
 
 `ShardMap.to_parquet` / `ShardMap.from_parquet` are the Arrow-native siblings
