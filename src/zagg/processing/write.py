@@ -493,7 +493,9 @@ def write_ragged_to_zarr(
         ``{field_name: (values_list, cell_ids)}`` as filled by ``process_shard``'s
         ``ragged_out`` sink. Empty (or all-empty payloads) writes empty CSR arrays
         (``write_csr`` skips empties), so a shard with no ragged data is a clean
-        no-op rather than a special case.
+        no-op rather than a special case. A located field (issue #87) arrives as
+        ``(values_list, cell_ids, locations_list)`` and additionally writes a
+        ``{field}/{shard_key}/locations`` uint64 array sharing the offsets.
     store : Store
         Zarr-compatible store.
     grid : OutputGrid
@@ -513,7 +515,14 @@ def write_ragged_to_zarr(
     agg_fields = get_agg_fields(grid.config) if getattr(grid, "config", None) else {}
     chunk_res_fields = _chunk_resolution_fields(getattr(grid, "config", None))
     shard_key = int(shard_key)
-    for name, (values_list, cell_ids) in ragged.items():
+    for name, entry in ragged.items():
+        # Located fields (issue #87) deliver (values_list, cell_ids, locations_list);
+        # unlocated fields keep the 2-tuple.
+        if len(entry) == 3:
+            values_list, cell_ids, locations_list = entry
+        else:
+            values_list, cell_ids = entry
+            locations_list = None
         sig = get_output_signature(agg_fields[name]) if name in agg_fields else {}
         dtype = sig.get("dtype") or "float32"
         if name in chunk_res_fields:
@@ -537,6 +546,7 @@ def write_ragged_to_zarr(
             values_list,
             cell_ids,
             dtype=dtype,
+            locations_list=locations_list,
         )
     return store
 

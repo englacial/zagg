@@ -299,3 +299,63 @@ class TestReadRawValues:
         _write_chunk(store, "f", 1, {0: rng.standard_normal(5_000)}, delta=64)
         with pytest.raises(ValueError, match="not losslessly recoverable"):
             list(read_raw_values(store, "f"))
+
+
+class TestReadLocations:
+    """Issue #87: the location-channel reader yields per-cell uint64 morton
+    vectors aligned with the digest rows the other readers see."""
+
+    @staticmethod
+    def _point_words(n, seed):
+        from mortie import MortonIndexArray
+
+        rng = np.random.default_rng(seed)
+        lats = 45.0 + rng.uniform(-1e-4, 1e-4, n)
+        lons = 45.0 + rng.uniform(-1e-4, 1e-4, n)
+        return np.asarray(MortonIndexArray.from_latlon(lats, lons, points=True)._data)
+
+    def _located_store(self, delta=512):
+        store = MemoryStore()
+        vals = {3: np.array([3.0, 1.0, 2.0]), 9: np.array([5.0, 4.0])}
+        locs_in = {3: self._point_words(3, 1), 9: self._point_words(2, 2)}
+        cell_ids = sorted(vals)
+        pairs = [build_tdigest(vals[c], delta=delta, locations=locs_in[c]) for c in cell_ids]
+        write_csr(
+            store,
+            "f/42",
+            [p[0] for p in pairs],
+            cell_ids,
+            locations_list=[p[1] for p in pairs],
+        )
+        return store, vals, locs_in
+
+    def test_yields_per_cell_uint64_vectors(self):
+        from zagg.readers.tdigest_tensor import read_locations
+
+        store, vals, locs_in = self._located_store()
+        out = {(m, c): locs for m, c, locs in read_locations(store, "f")}
+        assert set(out) == {(42, 3), (42, 9)}
+        for (_, cid), locs in out.items():
+            assert locs.dtype == np.uint64
+            # Loss-free regime: locations are the cell's point words co-sorted
+            # with the values (digest rows sort by mean).
+            expected = locs_in[cid][np.argsort(vals[cid], kind="stable")]
+            np.testing.assert_array_equal(locs, expected)
+
+    def test_aligned_with_read_raw_values(self):
+        from zagg.readers.tdigest_tensor import read_locations
+
+        store, vals, _ = self._located_store()
+        raw = {(m, c): v for m, c, v in read_raw_values(store, "f")}
+        locs = {(m, c): loc for m, c, loc in read_locations(store, "f")}
+        assert set(raw) == set(locs)
+        for key in raw:
+            assert len(raw[key]) == len(locs[key])
+
+    def test_value_only_field_raises_clearly(self):
+        from zagg.readers.tdigest_tensor import read_locations
+
+        store = MemoryStore()
+        _write_chunk(store, "f", 7, {0: np.array([1.0, 2.0])})
+        with pytest.raises(ValueError, match="has no locations array"):
+            list(read_locations(store, "f"))
