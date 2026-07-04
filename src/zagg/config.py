@@ -315,6 +315,25 @@ def validate_config(config: PipelineConfig) -> None:
         # Validate the output-kind declaration (kind + trailing_shape + dtype)
         _validate_output_kind(name, meta)
 
+        # Located ragged fields (issue #87): the location column is the
+        # per-observation morton the HEALPix read path supplies as ``leaf_id``
+        # (or a declared data column). Rect grids have no per-obs morton, so a
+        # located field on any non-HEALPix grid is a config error — raise here
+        # rather than emit garbage downstream.
+        location = meta.get("location")
+        if location is not None:
+            if location != "leaf_id" and location not in ds_vars:
+                raise ValueError(
+                    f"Variable '{name}': location '{location}' is not 'leaf_id' or a "
+                    f"data_source variable (available: {sorted(ds_vars)})"
+                )
+            grid_type = (grid or {}).get("type")
+            if grid_type != "healpix":
+                raise ValueError(
+                    f"Variable '{name}': 'location' requires a healpix output grid "
+                    f"(the per-observation morton column); got grid type {grid_type!r}"
+                )
+
 
 def _validate_chunk_precompute(aggregation: dict, ds_vars: set[str]) -> None:
     """Validate the ``aggregation.chunk_precompute`` block (issue #30, item 1).
@@ -466,6 +485,13 @@ def _validate_output_kind(name: str, meta: dict) -> None:
             f"Variable '{name}': output kind '{kind}' is not supported (allowed: {allowed})"
         )
 
+    # ``location`` (issue #87) is the ragged location channel; other kinds have
+    # no companion CSR array to carry it.
+    if "location" in meta and kind != "ragged":
+        raise ValueError(
+            f"Variable '{name}': 'location' is only valid for kind 'ragged', not '{kind}'"
+        )
+
     # resolution (cell default, or chunk). A chunk-resolution field stores one
     # value per chunk in a companion array (issue #30 item 2). ``scalar`` and
     # ``vector`` chunk companions are wired (issue #82): a scalar companion is a
@@ -534,6 +560,28 @@ def _validate_output_kind(name: str, meta: dict) -> None:
             f"Variable '{name}': function {meta['function']!r} produces a scalar "
             f"count and cannot be combined with kind 'ragged'"
         )
+
+    # Optional location channel (issue #87): the reducer also receives the named
+    # per-observation morton column (``locations=`` kwarg) and returns a
+    # ``(payload, locations)`` pair, stored as a uint64 companion CSR array. Only
+    # a ``function`` reducer can accept the kwarg, and the chunk-uniform collapse
+    # of ``resolution: chunk`` has no location fold — reject both combinations.
+    location = meta.get("location")
+    if location is not None:
+        if not isinstance(location, str):
+            raise ValueError(
+                f"Variable '{name}': 'location' must be a column name string (got {location!r})"
+            )
+        if "function" not in meta:
+            raise ValueError(
+                f"Variable '{name}': 'location' requires a 'function' reducer "
+                f"(an expression cannot receive the locations column)"
+            )
+        if resolution == "chunk":
+            raise ValueError(
+                f"Variable '{name}': 'location' is not supported with "
+                f"'resolution: chunk' (locations are folded per cell)"
+            )
 
 
 def _validate_trailing_shape(name: str, trailing_shape, key_name: str = "trailing_shape") -> None:
@@ -1021,6 +1069,8 @@ def get_output_signature(meta: dict) -> dict:
         ``resolution`` is ``"cell"`` (default — one value per aggregation cell) or
         ``"chunk"`` (issue #30 item 2 — one value per chunk, stored in a companion
         array shaped at the chunk grid and indexed by ``grid.block_index``).
+        ``location`` is the ragged location channel's column name (issue #87), or
+        ``None`` when the field carries no location.
     """
     kind = meta.get("kind", "scalar")
     if kind == "vector":
@@ -1040,6 +1090,9 @@ def get_output_signature(meta: dict) -> dict:
         "inner_shape": inner_shape,
         "dtype": meta.get("dtype"),
         "resolution": meta.get("resolution", "cell"),
+        # Ragged location channel (issue #87): the per-observation morton column
+        # the reducer folds per centroid; ``None`` for unlocated fields.
+        "location": meta.get("location"),
     }
 
 
@@ -1066,15 +1119,19 @@ def output_field_signature(config: PipelineConfig) -> list[dict]:
     fields = []
     for name, meta in get_agg_fields(config).items():
         sig = get_output_signature(meta)
-        fields.append(
-            {
-                "name": name,
-                "kind": sig["kind"],
-                "trailing_shape": list(sig["trailing_shape"]),
-                "inner_shape": list(sig["inner_shape"]),
-                "dtype": sig["dtype"],
-            }
-        )
+        entry = {
+            "name": name,
+            "kind": sig["kind"],
+            "trailing_shape": list(sig["trailing_shape"]),
+            "inner_shape": list(sig["inner_shape"]),
+            "dtype": sig["dtype"],
+        }
+        # A location channel changes the store schema (a uint64 companion CSR
+        # array — issue #87), so it belongs in the signature; keyed only when set
+        # so existing shard-map signatures are byte-identical.
+        if sig["location"] is not None:
+            entry["location"] = sig["location"]
+        fields.append(entry)
     return sorted(fields, key=lambda f: f["name"])
 
 

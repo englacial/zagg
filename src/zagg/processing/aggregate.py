@@ -474,6 +474,31 @@ def calculate_cell_statistics(
                 resolved_params[pkey] = pval
 
         func = resolve_function(func_name)
+
+        # Located ragged field (issue #87): hand the reducer the named
+        # per-observation morton column and accept a ``(payload, locations)``
+        # pair — the uint64 locations ride beside the payload into the CSR
+        # companion array. Only the HEALPix read path supplies ``leaf_id``, so a
+        # missing column is a grid/config mismatch, reported clearly.
+        if sig["kind"] == "ragged" and sig["location"] is not None:
+            loc_col = sig["location"]
+            if loc_col not in cell_data:
+                raise ValueError(
+                    f"ragged field {name!r} declares location: {loc_col!r} but that "
+                    f"column is not in the cell data (available: {sorted(cell_data)}); "
+                    f"per-observation mortons require a HEALPix grid"
+                )
+            payload, locations = func(values, locations=cell_data[loc_col], **resolved_params)
+            payload = _coerce_ragged_value(payload, sig)
+            locations = np.ascontiguousarray(np.asarray(locations, dtype=np.uint64))
+            if locations.shape != (payload.shape[0],):
+                raise ValueError(
+                    f"ragged field {name!r}: locations shape {locations.shape} does not "
+                    f"match the payload's {payload.shape[0]} elements"
+                )
+            result[name] = (payload, locations)
+            continue
+
         out = func(values, **resolved_params)
         # Scalar fields stay byte-for-byte identical to the pre-#29 path; a
         # declared ``vector`` field coerces to its trailing_shape (issue #29); a
@@ -635,22 +660,28 @@ def _aggregate_chunk_cells(
     the whole shard's, so this is byte-for-byte the old single-chunk loop.
 
     Returns ``(stats_arrays, ragged_payloads, ragged_cell_indices,
-    cells_with_data)``: dense fields preallocated to ``(n_cells, *trailing_shape)``
-    and filled per cell; ragged fields collected as ``(payloads, cell_indices)``
-    keyed by the cell's position in ``children`` (the chunk-local index the CSR
-    writer expects).
+    ragged_locations, cells_with_data)``: dense fields preallocated to
+    ``(n_cells, *trailing_shape)`` and filled per cell; ragged fields collected
+    as ``(payloads, cell_indices)`` keyed by the cell's position in ``children``
+    (the chunk-local index the CSR writer expects). ``ragged_locations`` holds
+    the per-cell uint64 location vectors for located fields only (issue #87) —
+    keyed like ``ragged_payloads`` and index-aligned with them; unlocated fields
+    have no entry.
     """
     children = np.asarray(children)
     n_cells = len(children)
     stats_arrays: dict = {}
     ragged_payloads: dict[str, list] = {}
     ragged_cell_indices: dict[str, list[int]] = {}
+    ragged_locations: dict[str, list] = {}
     for name in data_vars:
         meta = agg_fields[name]
         sig = get_output_signature(meta)
         if sig["kind"] == "ragged":
             ragged_payloads[name] = []
             ragged_cell_indices[name] = []
+            if sig["location"] is not None:
+                ragged_locations[name] = []
             continue
         # Vector fields (issue #29) get a per-cell (n_cells, *trailing_shape) block;
         # scalars keep the 1-D (n_cells,) layout, unchanged.
@@ -685,6 +716,15 @@ def _aggregate_chunk_cells(
         )
         for key, value in stats.items():
             if key in ragged_payloads:
+                if isinstance(value, tuple):
+                    # Located ragged field (issue #87): a (payload, locations)
+                    # pair; both are collected index-aligned, empties skipped.
+                    payload, locations = value
+                    if payload.size > 0:
+                        ragged_payloads[key].append(payload)
+                        ragged_locations[key].append(locations)
+                        ragged_cell_indices[key].append(i)
+                    continue
                 # Ragged field: collect non-empty payloads with their chunk-local
                 # cell index. Empty cells (``_empty_cell_value`` -> []) are skipped.
                 arr_val = np.asarray(value)
@@ -694,4 +734,4 @@ def _aggregate_chunk_cells(
             else:
                 stats_arrays[key][i] = value
 
-    return stats_arrays, ragged_payloads, ragged_cell_indices, cells_with_data
+    return stats_arrays, ragged_payloads, ragged_cell_indices, ragged_locations, cells_with_data

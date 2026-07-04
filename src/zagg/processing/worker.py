@@ -97,7 +97,10 @@ def process_shard(
         is passed, it is filled in place with ``{field_name: (values_list,
         cell_ids)}`` — ``values_list`` the per-populated-cell payload arrays and
         ``cell_ids`` their position in the chunk's ``children`` block — for the
-        caller to hand to :func:`zagg.processing.write.write_ragged_to_zarr`. The
+        caller to hand to :func:`zagg.processing.write.write_ragged_to_zarr`. A
+        located field (issue #87) delivers ``(values_list, cell_ids,
+        locations_list)`` instead, the third element its per-cell uint64
+        location vectors, index-aligned with ``values_list``. The
         return value stays the 2-tuple ``(df_out, metadata)`` so existing 2-tuple
         callers are unaffected; ``None`` (default) collects-then-discards the
         ragged payloads exactly as before (byte-for-byte unchanged). At K>1 (see
@@ -377,7 +380,7 @@ def process_shard(
         # from the shard's sorted column arrays, then reduce the anchor over them.
         chunk_pooled = _pool_chunk_columns(col_arrays, cell_to_slice, chunk_children)
         chunk_scalars = _eval_chunk_precompute(config, chunk_pooled)
-        stats_arrays, ragged_payloads, ragged_idx, cwd = _aggregate_chunk_cells(
+        stats_arrays, ragged_payloads, ragged_idx, ragged_locs, cwd = _aggregate_chunk_cells(
             chunk_children,
             col_arrays,
             cell_to_slice,
@@ -410,8 +413,17 @@ def process_shard(
             children=(chunk_children if chunks_per_shard > 1 else None),
             aoi_mask=chunk_aoi_mask,
         )
+        # A located field (issue #87) carries its per-cell uint64 location vectors
+        # as a third element; unlocated fields keep the 2-tuple contract unchanged.
         ragged = (
-            {name: (ragged_payloads[name], ragged_idx[name]) for name in ragged_payloads}
+            {
+                name: (
+                    (ragged_payloads[name], ragged_idx[name], ragged_locs[name])
+                    if name in ragged_locs
+                    else (ragged_payloads[name], ragged_idx[name])
+                )
+                for name in ragged_payloads
+            }
             if handoff != "arrow-kernel"
             else {}
         )
