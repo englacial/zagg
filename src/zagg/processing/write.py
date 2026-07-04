@@ -74,6 +74,14 @@ def _build_output(
     ``arro3.core.Table`` when any ``vector`` field is present, in both cases with
     the data-variable columns followed by the grid's per-cell coord columns.
 
+    On both carriers the ``morton`` coordinate is TYPED (issue #135): the pandas
+    carrier holds the mortie ``MortonIndexArray`` (#71), and the arro3 carrier
+    holds mortie's ``morton_index`` Arrow extension column
+    (:func:`zagg.grids.morton.morton_to_arrow`). The type lives at the
+    interchange layer only — ``_iter_carrier_columns`` extracts the packed
+    ``uint64`` words at the write boundary, so the on-disk dtype is plain
+    ``uint64`` either way.
+
     ``children`` (issue #30 item 3): when given, the coord columns are computed
     for that explicit chunk's cells via ``grid.coords_of(children)`` instead of the
     whole shard's ``grid.chunk_coords(shard_key)``. This is what lets the K>1 worker
@@ -701,7 +709,10 @@ def _iter_carrier_columns(carrier):
 
     Scalar columns yield a 1-D array; a ``FixedSizeList<C>`` Arrow column yields a
     2-D ``(n_cells, C)`` array (the per-cell vector block), so the writer can map
-    it onto the Zarr trailing payload dimension (issue #29).
+    it onto the Zarr trailing payload dimension (issue #29). A typed morton
+    column — ``MortonIndexArray`` on the pandas carrier (#71), the
+    ``morton_index`` Arrow extension column on the arro3 carrier (issue #135) —
+    yields its packed ``uint64`` words, the on-disk form.
     """
     if isinstance(carrier, pd.DataFrame):
         for name, series in carrier.items():

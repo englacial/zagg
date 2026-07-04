@@ -25,6 +25,7 @@ nav:
       - "Architecture": "design/architecture.md"
       - "Schema": "design/schema.md"
       - "Sharded output": "sharding.md"
+      - "Typed morton boundary": "morton_arrow.md"
   - "Deployment":
       - "Standing Up the Backend": "deployment/standup.md"
       - "AWS Lambda": "deployment/lambda.md"

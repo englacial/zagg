@@ -2,14 +2,19 @@
 
 The ``morton`` output coordinate is carried in memory as a mortie
 :class:`~mortie.morton_index.MortonIndexArray` (a pandas ExtensionArray over the
-packed ``uint64`` Morton words). On disk it is stored as plain ``uint64`` — Zarr
-stores numpy dtypes, not pandas extension dtypes — and reconstructed as a
-``MortonIndexArray`` on read.
+packed ``uint64`` Morton words), and crosses the Arrow carrier boundary as
+mortie's ``morton_index`` Arrow **extension type** over the PyCapsule C Data
+Interface (:func:`morton_to_arrow` / :func:`morton_from_arrow`; mortie >= 0.8.4,
+issue #135) — typed on both the pandas and arro3 surfaces, no pyarrow on the
+worker path. On disk it is stored as plain ``uint64`` — Zarr stores numpy
+dtypes, and the extension metadata lives at the interchange layer only — and
+reconstructed as a ``MortonIndexArray`` on read.
 
 This is the contained #71 migration: only the ``morton`` coordinate adopts the
-type. ``cell_ids`` stays NESTED ``uint64`` (the DGGS coordinate, unchanged), and
-the internal leaf/cell/shard morton arithmetic (``cells_of`` / ``shards_of`` /
-``children``) stays on plain ``uint64`` ndarrays.
+type. ``cell_ids`` stays NESTED ``uint64`` by default (the DGGS coordinate;
+``output.grid.cell_ids_encoding: morton`` optionally emits the morton words
+instead — issue #135), and the internal leaf/cell/shard morton arithmetic
+(``cells_of`` / ``shards_of`` / ``children``) stays on plain ``uint64`` ndarrays.
 
 Storing the raw ``uint64`` words (rather than a reinterpreted ``int64``) is what
 removes the sign hazard: the packed word's prefix is ``base+1``, so base cells
