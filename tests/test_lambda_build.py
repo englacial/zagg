@@ -192,6 +192,21 @@ class TestTemplateEnvironment:
         assert params["MallocArenaMax"]["Default"] == "2"
         assert params["MallocTrimThreshold"]["Default"] == "0"
 
+    def test_async_event_invoke_config_pins_retries(self):
+        # issue #151: the runner's async dispatch relies on service retries
+        # being 0 (a re-run of a deterministic failure re-fails at extra cost
+        # and can write into a store the caller has moved on from) and on the
+        # event age staying UNDER the runner's poll margin, so no first
+        # delivery can start after the runner stops listening (a late run
+        # would write into the store post-finalize).
+        from zagg.runner import _ASYNC_POLL_MARGIN_S
+
+        props = self._load_template()["Resources"]["ProcessFnAsyncConfig"]["Properties"]
+        assert props["FunctionName"] == {"Ref": "ProcessFn"}
+        assert props["MaximumRetryAttempts"] == 0
+        assert props["MaximumEventAgeInSeconds"] == 60  # API minimum
+        assert props["MaximumEventAgeInSeconds"] < _ASYNC_POLL_MARGIN_S
+
 
 class TestPackageConsistency:
     """Verify dependency specifications are consistent across build scripts."""

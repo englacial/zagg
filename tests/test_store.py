@@ -6,7 +6,7 @@ from unittest import mock
 import pytest
 from zarr.storage import LocalStore
 
-from zagg.store import open_store, parse_s3_path
+from zagg.store import open_object_store, open_store, parse_s3_path
 
 
 @pytest.fixture
@@ -103,6 +103,49 @@ class TestOpenS3Store:
         assert kwargs["endpoint"] == "https://minio.local"
         assert kwargs["virtual_hosted_style_request"] is False
         assert "credential_provider" not in kwargs
+
+
+class TestOpenObjectStore:
+    """Raw obstore store for side-channel objects (issue #151): same path and
+    credential handling as ``open_store``, but no Zarr wrapper."""
+
+    def test_local_roundtrip_creates_dir(self, tmp_path):
+        import obstore
+
+        store = open_object_store(str(tmp_path / "x.zarr.status" / "run1"))
+        obstore.put(store, "12345.json", b'{"statusCode": 200}')
+        got = bytes(obstore.get(store, "12345.json").bytes())
+        assert got == b'{"statusCode": 200}'
+
+    def test_local_missing_object_raises_not_found(self, tmp_path):
+        import obstore
+        from obstore.exceptions import NotFoundError
+
+        store = open_object_store(str(tmp_path / "status"))
+        with pytest.raises((FileNotFoundError, NotFoundError)):
+            obstore.get(store, "nope.json")
+
+    def test_s3_returns_bare_store_with_ambient_creds(self, mock_s3):
+        s3_cls, prov_cls = mock_s3
+        store = open_object_store("s3://bucket/prefix.zarr.status/run1")
+        # The raw S3Store, not wrapped in zarr's ObjectStore.
+        assert store is s3_cls.return_value
+        _, kwargs = s3_cls.call_args
+        assert kwargs["credential_provider"] is prov_cls.return_value
+
+    def test_s3_explicit_creds_and_endpoint(self, mock_s3):
+        s3_cls, prov_cls = mock_s3
+        creds = {"accessKeyId": "AKIA", "secretAccessKey": "secret", "sessionToken": "tok"}
+        open_object_store(
+            "s3://bucket/foo.zarr.status/run1",
+            credentials=creds,
+            endpoint_url="https://minio.local",
+        )
+        _, kwargs = s3_cls.call_args
+        assert kwargs["access_key_id"] == "AKIA"
+        assert kwargs["endpoint"] == "https://minio.local"
+        assert kwargs["virtual_hosted_style_request"] is False
+        prov_cls.assert_not_called()
 
 
 class TestParseS3Path:
