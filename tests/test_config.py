@@ -1293,7 +1293,12 @@ def _cfg_with_cell_ids_encoding(encoding=None, grid_type="healpix") -> PipelineC
     if encoding is not None:
         grid["cell_ids_encoding"] = encoding
     return PipelineConfig(
-        data_source={"variables": {"h_li": "/path"}},
+        data_source={
+            "reader": "h5coro",
+            "groups": ["gt1l"],
+            "coordinates": {"latitude": "/lat", "longitude": "/lon"},
+            "variables": {"h_li": "/path"},
+        },
         aggregation={"variables": {"c": {"function": "len", "source": "h_li", "dtype": "int32"}}},
         output={"grid": grid},
     )
