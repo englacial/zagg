@@ -66,6 +66,12 @@ class DataSourceDict(TypedDict):
     # ``levels`` + ``base_level`` take precedence for the read path.
     levels: NotRequired[dict[str, LevelDict]]
     base_level: NotRequired[str]
+    # Virtual chunk-index backend block (issue #160). Absent → the default
+    # ``hierarchical`` path, byte-identical. ``backend`` names a registered
+    # backend (builtin or ``zagg.index_backends`` entry point); the remaining
+    # keys are backend-specific and validated against the backend's declared
+    # ``config_keys`` — irrelevant keys are config errors, not ignored.
+    index: NotRequired[dict]
 
 
 # Structured-predicate comparison operators (issue #43). ``in``/``not_in`` take a
@@ -239,6 +245,9 @@ def validate_config(config: PipelineConfig) -> None:
 
     # Cross-check: each filter's level field must name a key in levels (issue #43)
     _validate_filter_levels(config.data_source)
+
+    # Virtual chunk-index backend block (issue #160)
+    _validate_index(config.data_source)
 
     # Segment-level (non-base) ``variables`` mappings (issue #30) become real
     # per-photon columns in the pooled shard data once broadcast, so they are valid
@@ -850,6 +859,22 @@ def _validate_filter_levels(data_source: dict) -> None:
                 f"filter[{i}]: level {lvl!r} is not a key in levels "
                 f"(available: {sorted(level_keys)})"
             )
+
+
+def _validate_index(data_source: dict) -> None:
+    """Validate the optional ``data_source.index`` block (issue #160).
+
+    Delegates to :func:`zagg.index.validate_index_config` (lazy import — the
+    backend registry knows each backend's accepted keys, including entry-point
+    backends this module cannot enumerate). Absent block → the default
+    hierarchical path, nothing to check.
+    """
+    index_cfg = data_source.get("index")
+    if index_cfg is None:
+        return
+    from zagg.index import validate_index_config
+
+    validate_index_config(index_cfg, data_source)
 
 
 def get_levels(config: "PipelineConfig") -> dict | None:
