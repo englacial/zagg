@@ -1013,7 +1013,29 @@ class TestProcessEventReturnResults:
         assert body["output_path"] is None
         assert body["timesteps_processed"] == 2
         assert body["duration_s"] >= 0
+        assert body["meta"]["n_specs"] == 1  # full meta rides back for the driver
         assert captured["writes"] == 0  # driver writes; worker must not
+
+    def test_non_float_result_value_passes_through(self, handler_mod, monkeypatch):
+        # A custom reducer may return a non-float scalar (e.g. a label); the
+        # float cast must not turn that event into a 500 -- it passes through,
+        # matching what the direct-write path hands write_tabular.
+        import zagg.temporal as temporal
+
+        event_mask, collections, static = _temporal_inputs()
+        monkeypatch.setattr(temporal, "open_dataset", lambda uri, **k: event_mask)
+        monkeypatch.setattr(temporal, "read_temporal_inputs", lambda *a, **k: (collections, static))
+        monkeypatch.setattr(
+            temporal,
+            "process_event",
+            lambda *a, **k: ({"label": "landfall", "peak": 5.0}, {"timesteps_processed": 2}),
+        )
+        event = _temporal_event(return_results=True)
+        del event["store_path"]
+        resp = handler_mod._handle_process_event(event)
+        body = json.loads(resp["body"])
+        assert resp["statusCode"] == 200, body
+        assert body["results"] == {"label": "landfall", "peak": 5.0}
 
     def test_store_path_still_required_without_flag(self, handler_mod):
         event = _temporal_event()

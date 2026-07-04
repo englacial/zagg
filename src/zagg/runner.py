@@ -586,6 +586,18 @@ def _run_lambda_events(
             f"(suffix in {_TABULAR_SUFFIXES}) so the collected rows have a "
             f"target, got: {store_path!r}"
         )
+    from zagg.output import output_format
+
+    if output_format(config) == "zarr":
+        # output.format defaults to "zarr" (the spatial store); left there, the
+        # post-fan-out _write_tabular_output would silently skip the write and
+        # discard every collected row after the Lambda spend. Fail before
+        # invoking anything.
+        raise ValueError(
+            "lambda temporal output requires output.format: parquet/csv/tabular "
+            '(it defaults to "zarr", which has no tabular target) -- set it in '
+            "the config so the collected rows are written"
+        )
     if invocation not in ("async", "sync"):
         raise ValueError(f"Unknown invocation: {invocation!r} (expected 'async' or 'sync')")
     if function_name is None:
@@ -693,7 +705,10 @@ def _run_lambda_events(
                 {
                     "event_key": event_key,
                     "results": body.get("results") or {},
-                    "meta": {"timesteps_processed": timesteps},
+                    # Full worker meta (n_specs/collections/...) when returned;
+                    # fall back to the envelope's timestep count so the row
+                    # shape matches the local backend either way.
+                    "meta": body.get("meta") or {"timesteps_processed": timesteps},
                 }
             )
         else:
@@ -735,6 +750,15 @@ def _run_lambda_events(
     gb_seconds = total_lambda_time * LAMBDA_MEMORY_GB
     estimated_cost = gb_seconds * LAMBDA_PRICE_PER_GB_SEC
 
+    # Failed events keep their error detail (rows carry successes only), so a
+    # caller can see *which* events failed and why, not just the count --
+    # mirroring the AR orchestrator's collected errors list.
+    failures = [
+        {"event_key": r.get("event_key"), "error": r.get("error")}
+        for r in report.results
+        if r.get("status_code") != 200 or r.get("error")
+    ]
+
     summary = {
         "total_events": n,
         "events_with_data": report.cells_with_data,
@@ -750,6 +774,7 @@ def _run_lambda_events(
         "output_path": output_path,
         "backend": "lambda",
         "results": rows,
+        "failures": failures,
     }
     logger.info(
         f"Done: {report.cells_with_data} events, {report.total_obs} timesteps, "

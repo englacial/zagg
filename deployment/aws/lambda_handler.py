@@ -276,16 +276,12 @@ def lambda_handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
         return _handle_finalize(event)
     if mode in ("process_event", "temporal", "event"):
         response = _handle_process_event(event)
-        # Async result channel (issue #151 / #12 Phase 8): mirror the envelope
-        # for the temporal fan-out's poll, same contract as process mode below.
-        if event.get("result_url"):
-            _write_result(event["result_url"], response, event)
-        return response
-    response = _handle_process(event, context)
+    else:
+        response = _handle_process(event, context)
     # Async result channel (issue #151): on an Event invoke the return value is
     # discarded, so mirror the response envelope to the orchestrator-supplied
-    # result_url for it to poll. Covers every branch (200 / 400 / 500) because
-    # it wraps the whole process handler.
+    # result_url for it to poll. Covers every branch (200 / 400 / 500) of both
+    # per-unit handlers (spatial process, temporal process_event -- #12 Phase 8).
     if event.get("result_url"):
         _write_result(event["result_url"], response, event)
     return response
@@ -356,6 +352,16 @@ def _handle_finalize(event: Dict[str, Any]) -> Dict[str, Any]:
     except Exception as e:
         logger.exception(e)
         return {"statusCode": 500, "body": json.dumps({"error": str(e), "mode": "finalize"})}
+
+
+def _json_scalar(v: Any) -> Any:
+    """Coerce one result value to a JSON-safe scalar (numpy float -> float)."""
+    if v is None:
+        return None
+    try:
+        return float(v)
+    except (TypeError, ValueError):
+        return v
 
 
 def _handle_process_event(event: Dict[str, Any]) -> Dict[str, Any]:
@@ -441,8 +447,14 @@ def _handle_process_event(event: Dict[str, Any]) -> Dict[str, Any]:
         }
         if return_results:
             # JSON-safe scalars (numpy floats don't json.dumps), mirroring the
-            # antarctic_AR_dataset worker's float-cast return contract.
-            body["results"] = {k: (None if v is None else float(v)) for k, v in results.items()}
+            # antarctic_AR_dataset worker's float-cast return contract. A value
+            # a registered custom reducer returns that isn't float-castable
+            # (e.g. a label string) passes through unchanged, matching what the
+            # direct-write path hands write_tabular.
+            body["results"] = {k: _json_scalar(v) for k, v in results.items()}
+            # Full per-event metadata (n_specs/collections/timesteps) so the
+            # driver-side rows match the local backend's row shape exactly.
+            body["meta"] = meta
         logger.info(json.dumps({"event_type": "process_event_complete", **body}))
         return {"statusCode": 200, "body": json.dumps(body)}
     except Exception as e:

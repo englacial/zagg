@@ -1827,6 +1827,7 @@ class TestTemporalLambdaStrategy:
                     "results": {"max_t2m": 5.0},
                     "timesteps_processed": 2,
                     "duration_s": 1.0,
+                    "meta": {"timesteps_processed": 2, "n_specs": 1, "collections": ["merra2"]},
                 },
                 "wall_time": 1.0,
                 "lambda_duration": 1.0,
@@ -1863,6 +1864,7 @@ class TestTemporalLambdaStrategy:
         row = next(r for r in written["rows"] if r["event_key"] == "storm1")
         assert row["results"]["max_t2m"] == 5.0
         assert row["meta"]["timesteps_processed"] == 2
+        assert row["meta"]["n_specs"] == 1  # full worker meta passes through
         assert summary["backend"] == "lambda"
         assert summary["total_events"] == 2
         assert summary["events_with_data"] == 2
@@ -1871,6 +1873,7 @@ class TestTemporalLambdaStrategy:
         assert summary["output_path"] == "s3://out/events.parquet"
         assert summary["gb_seconds"] == pytest.approx(2.0 * 2.0)  # 2 s x 2 GB
         assert summary["results"] == written["rows"]
+        assert summary["failures"] == []
 
     def test_async_wiring_threads_result_channel(self, monkeypatch):
         summary, captured = self._drive(monkeypatch)  # invocation defaults to async
@@ -1916,6 +1919,10 @@ class TestTemporalLambdaStrategy:
         assert summary["events_with_data"] == 1
         (row,) = captured["written"]["rows"]  # only the good event lands a row
         assert row["event_key"] == "storm2"
+        # the failure keeps its error detail in the summary
+        (failure,) = summary["failures"]
+        assert failure["event_key"] == "storm1"
+        assert "timeout" in failure["error"]
 
     def test_rejects_tuple_events(self, monkeypatch):
         with pytest.raises(ValueError, match="dicts with 'event_key'"):
@@ -1945,6 +1952,21 @@ class TestTemporalLambdaStrategy:
             "output": {"format": "parquet", "store": "s3://out/events"},
         }
         with pytest.raises(ValueError, match="tabular store path"):
+            agg(load_config_from_dict(d), backend="lambda", events=_uri_events())
+
+    def test_rejects_default_zarr_format(self, monkeypatch):
+        # output.format left at the "zarr" default would silently skip the
+        # post-fan-out tabular write; fail before invoking anything.
+        from zagg.config import load_config_from_dict
+
+        cfg = _temporal_s3_config()
+        d = {
+            "pipeline": {"type": "temporal"},
+            "data_source": {"reader": "xarray_s3", "collections": ["merra2"]},
+            "aggregation": cfg.aggregation,
+            "output": {"store": "s3://out/events.parquet"},  # no format key
+        }
+        with pytest.raises(ValueError, match="output.format"):
             agg(load_config_from_dict(d), backend="lambda", events=_uri_events())
 
     def test_dry_run_reports_lambda_backend(self, monkeypatch):
