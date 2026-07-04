@@ -58,6 +58,35 @@ Finalize mode (consolidates zarr metadata after all cells complete):
     "output_credentials": dict (optional, same shape as process mode),
 }
 
+Process-event mode (the temporal/event pipeline worker -- issue #12, Phase 7b):
+{
+    "mode": "process_event",
+    "event_key": str,           # identifier for this event row
+    "event_mask_uri": str,      # s3:// (or local) URI of the event mask
+                                #   DataArray (one variable, time x lat x lon)
+    "collection_uris": {        # {collection_name: uri} the specs read
+        "merra2_slv": "s3://.../merra2_slv.zarr", ...
+    },
+    "static_uris": {            # {static_name: uri}, e.g. ais_mask / climatology
+        "ais_mask": "s3://.../ais_mask.nc", ...
+    },
+    "store_path": str,          # s3:// (or local) tabular output, e.g. .parquet
+    "config": dict,             # temporal pipeline config (specs etc.)
+    "s3_credentials": dict (optional),     # read creds for source datasets
+    "output_credentials": dict (optional), # write creds for the tabular store
+    "return_results": bool (optional),  # fan-out driver mode (issue #12 Phase
+                                        #   8): skip the worker-side tabular
+                                        #   write, return the flattened result
+                                        #   values in the response body (and
+                                        #   via "result_url" on Event invokes);
+                                        #   "store_path" is then optional
+}
+
+This mirrors the local ``zagg.runner.TemporalStrategy``: load the event's
+collections + static_data, run ``zagg.temporal.process_event`` for one event,
+and write the single flattened result row to the tabular store. One event per
+worker, fanned out the same way per-cell spatial work is.
+
 Setup and finalize exist so callers without direct S3 write access to the
 output bucket (e.g. cross-account JupyterHub orchestrators) can run the
 full pipeline using only lambda:InvokeFunction.
@@ -245,11 +274,14 @@ def lambda_handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
         return _handle_setup(event)
     if mode == "finalize":
         return _handle_finalize(event)
-    response = _handle_process(event, context)
+    if mode in ("process_event", "temporal", "event"):
+        response = _handle_process_event(event)
+    else:
+        response = _handle_process(event, context)
     # Async result channel (issue #151): on an Event invoke the return value is
     # discarded, so mirror the response envelope to the orchestrator-supplied
-    # result_url for it to poll. Covers every branch (200 / 400 / 500) because
-    # it wraps the whole process handler.
+    # result_url for it to poll. Covers every branch (200 / 400 / 500) of both
+    # per-unit handlers (spatial process, temporal process_event -- #12 Phase 8).
     if event.get("result_url"):
         _write_result(event["result_url"], response, event)
     return response
@@ -320,6 +352,117 @@ def _handle_finalize(event: Dict[str, Any]) -> Dict[str, Any]:
     except Exception as e:
         logger.exception(e)
         return {"statusCode": 500, "body": json.dumps({"error": str(e), "mode": "finalize"})}
+
+
+def _json_scalar(v: Any) -> Any:
+    """Coerce one result value to a JSON-safe scalar (numpy float -> float)."""
+    if v is None:
+        return None
+    try:
+        return float(v)
+    except (TypeError, ValueError):
+        return v
+
+
+def _handle_process_event(event: Dict[str, Any]) -> Dict[str, Any]:
+    """Temporal/event worker: one event -> one tabular row (issue #12, Phase 7b).
+
+    Mirrors the local ``zagg.runner.TemporalStrategy``: build the specs from the
+    config, load the event mask + collections + static_data from S3, run
+    ``zagg.temporal.process_event`` for the single event, and write the
+    flattened result row to the tabular ``store_path``.
+    """
+    from zagg.output import write_tabular
+    from zagg.temporal import open_dataset, process_event, read_temporal_inputs, specs_from_config
+
+    event_key = event.get("event_key")
+    logger.info(f"process_event mode: event {event_key!r}")
+    start_time = time.time()
+    try:
+        # The fan-out driver (issue #12, Phase 8) sets return_results=True: the
+        # flattened result values ride back in the response body (async: via
+        # result_url) and the driver writes the single tabular object once, so
+        # N workers never race a shared store_path -- which is then optional.
+        return_results = bool(event.get("return_results"))
+        required = ["event_key", "event_mask_uri", "config"]
+        if not return_results:
+            required.append("store_path")
+        missing = [p for p in required if p not in event]
+        if missing:
+            error_msg = f"Missing required parameters: {', '.join(missing)}"
+            logger.error(error_msg)
+            return {"statusCode": 400, "body": json.dumps({"error": error_msg})}
+
+        config = load_config_from_dict(event["config"])
+        specs = specs_from_config(config)
+
+        # s3_credentials reads source datasets; output_credentials writes the
+        # tabular store. Either may be omitted to fall back to the execution role.
+        read_creds = event.get("s3_credentials") or None
+        region = os.environ.get("AWS_REGION", "us-west-2")
+
+        event_mask = open_dataset(event["event_mask_uri"], credentials=read_creds, region=region)
+        # The event mask is a single-variable file; index that variable so masks
+        # operate on a DataArray (mirrors the local events= contract).
+        mask_vars = list(getattr(event_mask, "data_vars", []))
+        if mask_vars:
+            event_mask = event_mask[mask_vars[0]]
+
+        collections, static_data = read_temporal_inputs(
+            event.get("collection_uris", {}),
+            event.get("static_uris", {}),
+            credentials=read_creds,
+            region=region,
+        )
+
+        results, meta = process_event(event_key, event_mask, collections, specs, static_data)
+
+        if return_results:
+            output_path = None
+        else:
+            out_creds = event.get("output_credentials") or None
+            out_endpoint = out_creds.get("endpointUrl") if out_creds else None
+            out_region = (out_creds or {}).get("region", region)
+            # ``config.output["format"]`` may be absent (None); ``write_tabular``
+            # then infers parquet/csv from the store_path suffix -- the same effect
+            # the runner gets by passing ``output_format(config)`` (which defaults to
+            # ``zarr`` and is filtered out before this temporal write).
+            output_path = write_tabular(
+                [{"event_key": event_key, "results": results, "meta": meta}],
+                event["store_path"],
+                output_format=config.output.get("format"),
+                credentials=out_creds,
+                endpoint_url=out_endpoint,
+                region=out_region,
+            )
+
+        body = {
+            "ok": True,
+            "mode": "process_event",
+            "event_key": event_key,
+            "timesteps_processed": meta.get("timesteps_processed"),
+            "output_path": output_path,
+            "duration_s": round(time.time() - start_time, 2),
+            "max_memory_mb": _max_memory_mb(),
+        }
+        if return_results:
+            # JSON-safe scalars (numpy floats don't json.dumps), mirroring the
+            # antarctic_AR_dataset worker's float-cast return contract. A value
+            # a registered custom reducer returns that isn't float-castable
+            # (e.g. a label string) passes through unchanged, matching what the
+            # direct-write path hands write_tabular.
+            body["results"] = {k: _json_scalar(v) for k, v in results.items()}
+            # Full per-event metadata (n_specs/collections/timesteps) so the
+            # driver-side rows match the local backend's row shape exactly.
+            body["meta"] = meta
+        logger.info(json.dumps({"event_type": "process_event_complete", **body}))
+        return {"statusCode": 200, "body": json.dumps(body)}
+    except Exception as e:
+        logger.exception(e)
+        return {
+            "statusCode": 500,
+            "body": json.dumps({"error": str(e), "mode": "process_event", "event_key": event_key}),
+        }
 
 
 def _handle_process(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
