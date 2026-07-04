@@ -31,6 +31,29 @@
       "path": "shardmaps/sm_healpix_o9.json",
       "shard_key": 5347395636851376137,
       "n_granules": 59
+    },
+    "healpix_o9_88s": {
+      "path": "shardmaps/sm_healpix_o9_88s.json",
+      "shard_key": 11530494877603201033,
+      "n_granules": 5620,
+      "aoi": {
+        "file": "antarctic_88s.geojson",
+        "name": "Antarctic 88S ring"
+      },
+      "note": "88S stress pin (issue #148): the worst shard by granule count over the full turning-latitude ring (576 o9 shards, 2.04M pairs, 35,639 catalog granules). The committed map is PRUNED to this one shard (metadata.pruned); the full map is ~0.7 GB. Expected to OOM/timeout at 2 GB -- that is the point (see README).",
+      "catalog_parquet": "catalogs/cat_88s.parquet"
+    },
+    "healpix_o10_88s": {
+      "path": "shardmaps/sm_healpix_o10_88s.json",
+      "shard_key": 11530494877603201034,
+      "n_granules": 4605,
+      "nested_in": "healpix_o9_88s",
+      "aoi": {
+        "file": "antarctic_88s.geojson",
+        "name": "Antarctic 88S ring"
+      },
+      "note": "88S stress pin (issue #148), NESTED: the densest o10 shard inside the pinned o9 stress shard (nested_in), not the global o10 densest (4,642 at another ring longitude), so one o9 extraction pass covers both orders per the issue #148 decisions. The drift test derives the nested densest when nested_in is set. Committed map PRUNED to this shard (full map ~1.7 GB).",
+      "catalog_parquet": "catalogs/cat_88s.parquet"
     }
   },
   "targets": {
@@ -90,7 +113,7 @@
     }
   },
   "provisional_targets": {
-    "_comment": "PROVISIONAL, PR-TREE-ONLY (issue #130). These two scalar targets share ONE config + ONE shard (healpix_o11) and differ only by handoff (pandas / arrow) to benchmark the per-cell carrier cost: pandas DataFrame vs an arro3-core Arrow table. Both produce byte-identical scalar output and neither imports pyarrow. (The experimental arrow-kernel reducer was dropped with pyarrow per @espg's path-C decision https://github.com/englacial/zagg/pull/131#issuecomment-4838785058, since arro3 has no hash-aggregate.) They are deliberately NOT in 'targets' so they do NOT join the committed every-merge matrix until the carrier keep/drop decision is made. run_benchmark.py runs them by explicit --target name (via /benchmark); 'run all' (no --target) skips them.",
+    "_comment": "PROVISIONAL, PR-TREE-ONLY (issue #130). The two scalar targets share ONE config + ONE shard (healpix_o11) and differ only by handoff (pandas / arrow) to benchmark the per-cell carrier cost: pandas DataFrame vs an arro3-core Arrow table. Both produce byte-identical scalar output and neither imports pyarrow. (The experimental arrow-kernel reducer was dropped with pyarrow per @espg's path-C decision https://github.com/englacial/zagg/pull/131#issuecomment-4838785058, since arro3 has no hash-aggregate.) The two *_88s targets are the issue #148 stress probes: on-demand runs against the pinned worst 88S ring shard, expected to OOM/timeout until the streaming/cached-read work lands -- they must NOT join the every-merge matrix (a red benchmark job every merge). All entries here are deliberately NOT in 'targets': run_benchmark.py runs them by explicit --target name (via /benchmark); 'run all' (no --target) skips them.",
     "scalar_pandas_healpix_o11": {
       "config": "configs/atl03_scalar_healpix_o11.yaml",
       "shardmap": "healpix_o11",
@@ -106,6 +129,20 @@
       "grid_type": "healpix",
       "grid_size": "o11",
       "handoff": "arrow"
+    },
+    "tdigest_healpix_o9_88s": {
+      "config": "configs/atl03_tdigest_healpix_o9.yaml",
+      "shardmap": "healpix_o9_88s",
+      "aggregator": "tdigest",
+      "grid_type": "healpix",
+      "grid_size": "o9_88s"
+    },
+    "tdigest_healpix_o10_88s": {
+      "config": "configs/atl03_tdigest_healpix_o10.yaml",
+      "shardmap": "healpix_o10_88s",
+      "aggregator": "tdigest",
+      "grid_type": "healpix",
+      "grid_size": "o10_88s"
     }
   }
 }

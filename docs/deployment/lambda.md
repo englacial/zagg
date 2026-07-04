@@ -19,7 +19,7 @@ The Lambda function processes a single morton cell (order 6) by:
 │  ──────────────────────────────────────────────────────────  │
 │  Runtime: Python 3.12                                       │
 │  Memory: 2048 MB (2 GB)                                     │
-│  Timeout: 720s (12 minutes)                                 │
+│  Timeout: 900s (15 minutes)                                 │
 │  ──────────────────────────────────────────────────────────  │
 │  Code (~5 MB):                                              │
 │    - deployment/aws/lambda_handler.py (AWS wrapper)         │
@@ -214,7 +214,7 @@ aws lambda create-function \
   --role arn:aws:iam::ACCOUNT_ID:role/lambda-execution-role \
   --handler lambda_handler.lambda_handler \
   --zip-file fileb://deployment/aws/function.zip \
-  --timeout 720 \
+  --timeout 900 \
   --memory-size 2048 \
   --layers arn:aws:lambda:REGION:ACCOUNT_ID:layer:zagg-layer-arm64:VERSION
 ```
@@ -285,7 +285,7 @@ raises the FD ceiling it can use.
 |--------|-------|
 | Average execution time | 2--3 minutes per cell |
 | Maximum execution time | 10 minutes |
-| Lambda timeout | 12 minutes (720s) |
+| Lambda timeout | 15 minutes (900s) |
 | Configured memory | 2048 MB |
 | Typical memory usage | 1--1.5 GB |
 | Cold start | 3--5 seconds |
