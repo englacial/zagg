@@ -1337,6 +1337,28 @@ class TestCellIdsEncoding:
     def test_rectilinear_without_encoding_still_validates(self):
         validate_config(_cfg_with_cell_ids_encoding(grid_type="rectilinear"))
 
+    def test_present_but_null_key_falls_back_to_nested(self):
+        # YAML `cell_ids_encoding:` (explicit null) must behave like an absent
+        # key: the accessor returns "nested" (never None) and validation passes,
+        # so the store attrs stay byte-identical to a pre-flag run.
+        from zagg.config import get_cell_ids_encoding
+
+        cfg = _cfg_with_cell_ids_encoding()
+        cfg.output["grid"]["cell_ids_encoding"] = None
+        assert get_cell_ids_encoding(cfg) == "nested"
+        validate_config(cfg)
+
+    def test_legacy_indexing_scheme_key_is_descriptive_only(self):
+        # The shipped configs carry output.grid.indexing_scheme: nested, which no
+        # code reads; setting it to "morton" would otherwise silently do nothing.
+        # It must fail loudly and point at the real knob.
+        cfg = _cfg_with_cell_ids_encoding()
+        cfg.output["grid"]["indexing_scheme"] = "nested"
+        validate_config(cfg)  # the shipped value stays valid
+        cfg.output["grid"]["indexing_scheme"] = "morton"
+        with pytest.raises(ValueError, match="cell_ids_encoding: morton"):
+            validate_config(cfg)
+
 
 # ---------------------------------------------------------------------------
 # Bounds validation

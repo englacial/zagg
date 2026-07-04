@@ -256,6 +256,17 @@ def validate_config(config: PipelineConfig) -> None:
                     "output.grid.cell_ids_encoding only applies to healpix grids "
                     f"(grid type is {grid['type']!r})"
                 )
+        # The legacy output.grid.indexing_scheme key is descriptive only (the
+        # shipped configs carry "nested"); it does NOT select the cell_ids
+        # encoding. Reject any other value so a user reaching for it lands on the
+        # real knob instead of a silently-NESTED store.
+        legacy_scheme = grid.get("indexing_scheme")
+        if legacy_scheme is not None and legacy_scheme != "nested":
+            raise ValueError(
+                f"output.grid.indexing_scheme is descriptive and must be 'nested' "
+                f"(got {legacy_scheme!r}); to emit morton words as cell_ids set "
+                f"output.grid.cell_ids_encoding: morton"
+            )
 
     # Validate the optional per-cell carrier (issue #132). Mirrors the worker's
     # ``{"pandas", "arrow"}`` guard (worker.py) so a typo in the aggregation YAML
@@ -1322,8 +1333,8 @@ def get_cell_ids_encoding(config: PipelineConfig) -> str:
     ``"nested"`` (default) stores the standardized NESTED HEALPix cell IDs.
     ``"morton"`` stores the packed morton words instead — the same ``uint64``
     words the ``morton`` coordinate carries — opening test/prototype flows that
-    index by morton directly. Default behavior (key absent or ``"nested"``) is
-    byte-identical to a pre-flag run.
+    index by morton directly. Default behavior (key absent, explicit ``null``,
+    or ``"nested"``) is byte-identical to a pre-flag run.
 
     Parameters
     ----------
@@ -1334,7 +1345,9 @@ def get_cell_ids_encoding(config: PipelineConfig) -> str:
     str
         ``"nested"`` (default) or ``"morton"``.
     """
-    return config.output.get("grid", {}).get("cell_ids_encoding", "nested")
+    # A present-but-null key (YAML ``cell_ids_encoding:``) must fall back to the
+    # default too — the same treatment ``from_config`` gives a null ``layout``.
+    return config.output.get("grid", {}).get("cell_ids_encoding") or "nested"
 
 
 def get_store_path(config: PipelineConfig) -> str | None:

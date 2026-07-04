@@ -811,6 +811,14 @@ class TestCellIdsEncoding:
         # shard maps stay reusable across the flag (#89).
         assert self._grid("morton").spatial_signature() == self._grid().spatial_signature()
 
+    def test_unknown_encoding_rejected_at_grid_construction(self):
+        # coords_of (values) and _dggs_attrs (recorded scheme) both interpret the
+        # string, so a grid built from an UNVALIDATED config must reject a third
+        # value here — otherwise NESTED values would be recorded under a foreign
+        # scheme name and consumers would mis-decode every cell.
+        with pytest.raises(ValueError, match="Unknown cell_ids_encoding"):
+            self._grid("ring")
+
 
 class TestChunkInnerMultiChunk:
     """Issue #30 item 3: an optional finer ``chunk_inner`` level between shard and

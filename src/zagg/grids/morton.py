@@ -108,7 +108,8 @@ def is_morton_arrow(col) -> bool:
     field = getattr(col, "field", None)
     if field is None:
         return False
-    return dict(field.metadata_str).get(_EXTENSION_NAME_KEY) == MORTON_EXTENSION_NAME
+    # metadata_str is already a plain dict on arro3 — no copy on the write path.
+    return field.metadata_str.get(_EXTENSION_NAME_KEY) == MORTON_EXTENSION_NAME
 
 
 __all__ = [
