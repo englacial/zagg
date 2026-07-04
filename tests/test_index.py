@@ -1,5 +1,7 @@
 """Virtual chunk-index backends: protocol, registry, config, worker seam (issue #160)."""
 
+from pathlib import Path
+
 import numpy as np
 import pandas as pd
 import pytest
@@ -14,6 +16,7 @@ from zagg.index import (
     validate_index_config,
 )
 from zagg.index.hierarchical import HierarchicalIndex
+from zagg.index.inline import InlineIndex, build_chunk_map
 from zagg.processing import _read_group, process_shard
 from zagg.registry import UnknownCapability
 
@@ -347,3 +350,257 @@ class TestWorkerSeam:
                 s3_credentials={},
                 config=_worker_cfg(index={"backend": "hierarchical", "store": "s3://x/"}),
             )
+
+
+# ---------------------------------------------------------------------------
+# Inline backend (issue #160 phase 2): chunk map + chunk-aligned planned reads
+#
+# These tests read a real (tiny, committed) HDF5 fixture through h5coro's
+# FileDriver: the v1 chunk B-tree the inline backend walks is not reachable
+# through stubs. See tests/data/index/make_fixture.py for the fixture's
+# layout (20 segments x 128 photons, one empty segment, 256-photon chunks,
+# gzip+shuffle) and regeneration instructions (h5py, offline only).
+# ---------------------------------------------------------------------------
+
+FIXTURE_H5 = Path(__file__).parent / "data" / "index" / "atl03_mini.h5"
+
+
+def _open_fixture():
+    from h5coro import filedriver
+    from h5coro import h5coro as h5c
+
+    return h5c.H5Coro(str(FIXTURE_H5), filedriver.FileDriver, errorChecking=True, verbose=False)
+
+
+def _fixture_data_source(**extra):
+    """ATL03-shaped hierarchical data_source over the fixture (mirrors the
+    shipped atl03.yaml: photon base level, segment spatial index, TEP filter)."""
+    ds = {
+        "groups": ["gt1l", "gt2l"],
+        "coordinates": {
+            "latitude": "/{group}/heights/lat_ph",
+            "longitude": "/{group}/heights/lon_ph",
+        },
+        "variables": {"h_ph": "/{group}/heights/h_ph"},
+        "filters": [
+            {"dataset": "/{group}/heights/signal_conf_ph", "column": 0, "op": "ne", "value": -2}
+        ],
+        "base_level": "photons",
+        "levels": {
+            "photons": {
+                "path": "/{group}/heights",
+                "coordinates": {"latitude": "lat_ph", "longitude": "lon_ph"},
+                "link": None,
+            },
+            "segments": {
+                "path": "/{group}/geolocation",
+                "coordinates": {
+                    "latitude": "reference_photon_lat",
+                    "longitude": "reference_photon_lon",
+                },
+                "link": {
+                    "to": "photons",
+                    "index_beg": "/{group}/geolocation/ph_index_beg",
+                    "count": "/{group}/geolocation/segment_ph_cnt",
+                    "index_base": 1,
+                },
+            },
+        },
+        "read_plan": {"spatial_index": "segments", "pad": 1},
+    }
+    ds.update(extra)
+    return ds
+
+
+class _LeafSetGrid:
+    """Fixture grid: leaf id == round(lat) (photon lat == its segment index,
+    gt2l offset +100), shard 1 == a chosen leaf set. Segment- and photon-rate
+    masks agree exactly, so hierarchical and inline see the same selection."""
+
+    def __init__(self, leaves):
+        self._leaves = np.asarray(sorted(leaves), dtype=np.int64)
+
+    def assign(self, lats, lons):
+        return np.round(np.asarray(lats)).astype(np.int64)
+
+    def shards_of(self, leaf_ids):
+        return np.isin(leaf_ids, self._leaves).astype(np.int64)
+
+
+class _LeafCellGrid(_LeafSetGrid):
+    """Adds the post-read surface ``process_shard`` needs (single cell)."""
+
+    def children(self, shard_key):
+        return np.array([0], dtype=np.int64)
+
+    def cells_of(self, leaf_ids):
+        return np.zeros(len(leaf_ids), dtype=np.int64)
+
+    def chunk_coords(self, shard_key):
+        return {"cell_lat": np.zeros(1), "cell_lon": np.zeros(1)}
+
+
+# Segment sets chosen against the fixture geometry (128-photon segments,
+# 256-photon chunks, segment 8 empty): padding by 1 puts the plan start at
+# an ODD multiple of 128 (not a chunk boundary) so the h5coro start-edge
+# off-by-one (PR #152) stays out of the *hierarchical* reference path.
+_UNALIGNED_LEAVES = (4, 5, 13, 14, 104, 105)  # plan starts 384 / 1408 (+gt2l 384)
+# Padding {3,4,5} starts the plan at segment 2 -> photon 256 == chunk boundary.
+_ALIGNED_LEAVES = (3, 4, 5)
+
+
+class TestChunkMap:
+    def test_chunked_dataset_map(self):
+        h5obj = _open_fixture()
+        cm = build_chunk_map(h5obj, "/gt1l/heights/h_ph")
+        assert cm.dims == (2432,)
+        assert cm.chunk_dims == (256,)
+        assert cm.elem_start.tolist() == [256 * k for k in range(10)]
+        assert cm.elem_end.tolist() == [256 * k + 256 for k in range(9)] + [2432]
+        assert (cm.nbytes > 0).all()
+        assert (cm.filter_mask == 0).all()  # gzip+shuffle applied to every chunk
+        assert len(set(cm.byte_offset.tolist())) == len(cm)  # distinct file offsets
+
+    def test_2d_dataset_collapses_trailing_dim(self):
+        h5obj = _open_fixture()
+        cm = build_chunk_map(h5obj, "/gt1l/heights/signal_conf_ph")
+        assert cm.dims == (2432, 5)
+        assert cm.chunk_dims == (256, 5)
+        assert len(cm) == 10  # one row per first-axis chunk position
+
+    def test_contiguous_dataset_pseudo_chunk(self):
+        h5obj = _open_fixture()
+        cm = build_chunk_map(h5obj, "/gt1l/geolocation/ph_index_beg")
+        assert len(cm) == 1
+        assert (cm.elem_start[0], cm.elem_end[0]) == (0, 20)
+        assert cm.nbytes[0] == 20 * 8  # int64, uncompressed
+        assert cm.filter_mask[0] == 0
+
+    def test_missing_dataset_raises_keyerror(self):
+        h5obj = _open_fixture()
+        with pytest.raises(KeyError, match="nope"):
+            build_chunk_map(h5obj, "/gt1l/heights/nope")
+
+    def test_aligned_cover(self):
+        h5obj = _open_fixture()
+        cm = build_chunk_map(h5obj, "/gt1l/heights/h_ph")
+        assert cm.aligned_cover(300, 400) == (256, 512)
+        assert cm.aligned_cover(256, 512) == (256, 512)  # already aligned
+        assert cm.aligned_cover(0, 10) == (0, 256)
+        assert cm.aligned_cover(2400, 2432) == (2304, 2432)  # partial last chunk
+        assert cm.aligned_cover(255, 257) == (0, 512)  # straddles a boundary
+        with pytest.raises(ValueError, match="outside dataset extent"):
+            cm.aligned_cover(2400, 3000)
+
+
+class TestInlineReadGroup:
+    def _read_both(self, group, leaves, arrow=False):
+        ds = _fixture_data_source()
+        grid = _LeafSetGrid(leaves)
+        out_h = HierarchicalIndex().read_group(_open_fixture(), group, ds, 1, grid, arrow=arrow)
+        out_i = InlineIndex().read_group(_open_fixture(), group, ds, 1, grid, arrow=arrow)
+        return out_h, out_i
+
+    @pytest.mark.parametrize("group", ["gt1l", "gt2l"])
+    def test_row_identical_to_hierarchical(self, group):
+        df_h, df_i = self._read_both(group, _UNALIGNED_LEAVES)
+        assert df_h is not None and len(df_h) > 0
+        pd.testing.assert_frame_equal(df_i, df_h)
+        for col in df_h.columns:
+            assert df_i[col].to_numpy().tobytes() == df_h[col].to_numpy().tobytes()
+
+    def test_arrow_carrier_identical(self):
+        t_h, t_i = self._read_both("gt1l", _UNALIGNED_LEAVES, arrow=True)
+        assert t_h.column_names == t_i.column_names
+        for name in t_h.column_names:
+            a_h = np.asarray(t_h.column(name))
+            a_i = np.asarray(t_i.column(name))
+            assert a_i.tobytes() == a_h.tobytes()
+
+    def test_empty_shard_returns_none(self):
+        df_h, df_i = self._read_both("gt1l", (77,))  # no such leaf
+        assert df_h is None and df_i is None
+
+    def test_chunk_boundary_start_succeeds_where_plain_hyperslice_fails(self):
+        # Padding {3,4,5} starts the plan exactly on photon 256 (an interior
+        # chunk boundary). h5coro 1.0.4's B-tree start-edge intersection drops
+        # such hyperslices (PR #152 off-by-one; the read comes back None), so
+        # the hierarchical reference CANNOT serve this shard...
+        ds = _fixture_data_source()
+        grid = _LeafSetGrid(_ALIGNED_LEAVES)
+        with pytest.raises(Exception):
+            HierarchicalIndex().read_group(_open_fixture(), "gt1l", ds, 1, grid)
+        # ...while inline's one-element-early chunk-aligned read sidesteps it.
+        # Gate the output against numpy ground truth from full-array reads.
+        df_i = InlineIndex().read_group(_open_fixture(), "gt1l", ds, 1, grid)
+        h5obj = _open_fixture()
+        paths = [
+            "/gt1l/heights/lat_ph",
+            "/gt1l/heights/lon_ph",
+            "/gt1l/heights/h_ph",
+            "/gt1l/heights/signal_conf_ph",
+        ]
+        full = h5obj.readDatasets(paths)
+        leaf = np.round(full["/gt1l/heights/lat_ph"]).astype(np.int64)
+        keep = np.isin(leaf, np.asarray(_ALIGNED_LEAVES)) & (
+            full["/gt1l/heights/signal_conf_ph"][:, 0] != -2
+        )
+        assert df_i["h_ph"].to_numpy().tobytes() == full["/gt1l/heights/h_ph"][keep].tobytes()
+        assert df_i["leaf_id"].to_numpy().tolist() == leaf[keep].tolist()
+
+    def test_inline_requires_read_plan_config(self):
+        ds = _fixture_data_source()
+        del ds["read_plan"]
+        with pytest.raises(ValueError, match="requires data_source.read_plan.spatial_index"):
+            validate_index_config({"backend": "inline"}, ds)
+        with pytest.raises(ValueError, match="requires data_source.read_plan.spatial_index"):
+            InlineIndex().read_group(_open_fixture(), "gt1l", ds, 1, _LeafSetGrid((4,)))
+
+    def test_inline_accepts_no_stray_keys(self):
+        with pytest.raises(ValueError, match="not accepted by backend 'inline'"):
+            validate_index_config({"backend": "inline", "on_miss": "fallback"})
+
+
+class TestInlineWorker:
+    def _cfg(self, index=None):
+        ds = _fixture_data_source(**({"index": index} if index else {}))
+        return PipelineConfig(
+            data_source=ds,
+            aggregation={
+                "variables": {
+                    "count": {
+                        "function": "len",
+                        "source": "h_ph",
+                        "dtype": "int32",
+                        "fill_value": 0,
+                    },
+                    "h_min": {"function": "min", "source": "h_ph", "dtype": "float32"},
+                    "h_mean": {"function": "mean", "source": "h_ph", "dtype": "float32"},
+                }
+            },
+            output={"store": "unused"},
+        )
+
+    def test_process_shard_inline_byte_identical_to_hierarchical(self):
+        from h5coro import filedriver
+
+        grid = _LeafCellGrid(_UNALIGNED_LEAVES)
+        outs = {}
+        for name, index in [("hier", None), ("inline", {"backend": "inline"})]:
+            df, meta = process_shard(
+                grid,
+                1,
+                [str(FIXTURE_H5)],
+                s3_credentials={},
+                h5coro_driver=filedriver.FileDriver,
+                config=self._cfg(index),
+            )
+            assert meta["error"] is None
+            assert meta["files_processed"] == 1
+            outs[name] = (df, meta)
+        df_h, meta_h = outs["hier"]
+        df_i, meta_i = outs["inline"]
+        assert meta_i["total_obs"] == meta_h["total_obs"] > 0
+        pd.testing.assert_frame_equal(df_i, df_h)
+        for col in df_h.columns:
+            assert df_i[col].to_numpy().tobytes() == df_h[col].to_numpy().tobytes()

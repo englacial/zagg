@@ -102,8 +102,9 @@ def _builtin_backends() -> dict[str, type[VirtualIndex]]:
     """The in-tree backends. Imported lazily so ``zagg.config`` validation can
     import this module without pulling the processing stack."""
     from zagg.index.hierarchical import HierarchicalIndex
+    from zagg.index.inline import InlineIndex
 
-    return {HierarchicalIndex.name: HierarchicalIndex}
+    return {HierarchicalIndex.name: HierarchicalIndex, InlineIndex.name: InlineIndex}
 
 
 def available_index_backends() -> dict[str, type[VirtualIndex]]:

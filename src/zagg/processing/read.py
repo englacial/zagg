@@ -285,7 +285,13 @@ def _level_coord_paths(level: dict, group: str) -> tuple[str, str]:
 
 
 def _planned_read_group(
-    h5obj, group: str, data_source: dict, shard_key: int, grid, arrow: bool = False
+    h5obj,
+    group: str,
+    data_source: dict,
+    shard_key: int,
+    grid,
+    arrow: bool = False,
+    read_fn=None,
 ):
     """Planned (AOI-bounded) read of one HDF5 group via the coarse spatial index.
 
@@ -310,6 +316,14 @@ def _planned_read_group(
     as :func:`_read_group`. Output rows are in plan-slice / spatial-mask /
     filter order — which matches the full-read path's row ordering because the
     plan's runs are emitted in increasing parent index.
+
+    ``read_fn`` is the base-rate addressing seam (issue #160): a
+    ``read_fn(path, hyperslice=None) -> array`` callable used for every
+    planned base-rate read (coords, variables, filter datasets). ``None``
+    (default) uses plain h5coro hyperslice reads — today's path. An index
+    backend may supply its own (e.g. ``inline``'s chunk-aligned reader);
+    selection (the plan), the coarse-level reads, and everything downstream
+    of the returned columns are identical regardless.
     """
     coordinates = data_source["coordinates"]
     variables = data_source["variables"]
@@ -388,11 +402,14 @@ def _planned_read_group(
         # of the file. Defer to the full-coord-read path; semantics identical.
         return _read_group_full(h5obj, group, data_source, shard_key, grid, arrow=arrow)
 
-    # h5coro-compatible reader callback for execute_read_plan.
-    def _read_fn(path, hyperslice=None):
-        if hyperslice is None:
-            return h5obj.readDatasets([path])[path]
-        return h5obj.readDatasets([{"dataset": path, "hyperslice": hyperslice}])[path]
+    # h5coro-compatible reader callback for execute_read_plan (unless the
+    # caller supplied its own addressing seam — issue #160).
+    if read_fn is None:
+
+        def read_fn(path, hyperslice=None):
+            if hyperslice is None:
+                return h5obj.readDatasets([path])[path]
+            return h5obj.readDatasets([{"dataset": path, "hyperslice": hyperslice}])[path]
 
     # ---- Read base coords + variables + filter datasets over the planned slices.
     filters = filters_from_data_source(data_source)
@@ -410,8 +427,8 @@ def _planned_read_group(
 
     lat_path = coordinates["latitude"].format(group=group)
     lon_path = coordinates["longitude"].format(group=group)
-    lats = execute_read_plan(plan, _read_fn, lat_path, np.float64)
-    lons = execute_read_plan(plan, _read_fn, lon_path, np.float64)
+    lats = execute_read_plan(plan, read_fn, lat_path, np.float64)
+    lons = execute_read_plan(plan, read_fn, lon_path, np.float64)
 
     if len(lats) == 0:
         return None
@@ -434,7 +451,7 @@ def _planned_read_group(
         paths_seen.add(path)
         # dtype hint isn't load-bearing -- execute_read_plan dtype-casts via
         # np.asarray, which is a no-op when the source dtype already matches.
-        arrays_by_path[path] = execute_read_plan(plan, _read_fn, path, None)
+        arrays_by_path[path] = execute_read_plan(plan, read_fn, path, None)
 
     # Base-level structured filters: ANDed keep-masks over the concatenated reads.
     keep_mask: np.ndarray | None = None
