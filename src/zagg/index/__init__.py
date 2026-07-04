@@ -26,8 +26,9 @@ never imports an external backend's dependencies (e.g. hidefix)::
 
 Each entry point resolves directly to a :class:`VirtualIndex` subclass. A
 builtin name cannot be shadowed; a broken entry point is logged and skipped.
-Discovery is not cached: it runs once per :func:`index_from_config` call
-(once per shard), which is negligible next to the reads it configures.
+The entry-point scan is memoized per interpreter (like ``zagg.registry``'s
+discovery); a failed ``entry_points()`` lookup is not cached, so the next
+call retries.
 """
 
 from __future__ import annotations
@@ -107,31 +108,46 @@ def _builtin_backends() -> dict[str, type[VirtualIndex]]:
     return {HierarchicalIndex.name: HierarchicalIndex, InlineIndex.name: InlineIndex}
 
 
+# Memoized entry-point discoveries (``None`` = not yet scanned, or the last
+# scan failed and should be retried). Worst case under concurrent first use is
+# a duplicate scan — idempotent, so no lock is needed (unlike zagg.registry,
+# whose plugins run arbitrary ``register()`` callables).
+_EP_BACKENDS: dict[str, type[VirtualIndex]] | None = None
+
+
 def available_index_backends() -> dict[str, type[VirtualIndex]]:
     """Builtins merged with ``zagg.index_backends`` entry-point discoveries.
 
     Builtins win a name collision (logged at ERROR, entry point skipped); a
     failing ``ep.load()`` is logged and skipped so one broken plugin cannot
-    take down the read path.
+    take down the read path. The scan runs once per interpreter (entry points
+    cannot change mid-run); a failed lookup is retried on the next call.
     """
+    global _EP_BACKENDS
     backends = _builtin_backends()
-    try:
-        eps = metadata.entry_points(group=INDEX_BACKENDS_GROUP)
-    except Exception:
-        logger.exception("%s entry-point lookup failed; using builtins only", INDEX_BACKENDS_GROUP)
-        return backends
-    for ep in eps:
-        if ep.name in backends:
-            logger.error(
-                "%s entry point %r collides with a registered backend; skipped",
-                INDEX_BACKENDS_GROUP,
-                ep.name,
-            )
-            continue
+    if _EP_BACKENDS is None:
         try:
-            backends[ep.name] = ep.load()
+            eps = metadata.entry_points(group=INDEX_BACKENDS_GROUP)
         except Exception:
-            logger.exception("Failed to load %s entry point %r", INDEX_BACKENDS_GROUP, ep.name)
+            logger.exception(
+                "%s entry-point lookup failed; using builtins only", INDEX_BACKENDS_GROUP
+            )
+            return backends
+        discovered: dict[str, type[VirtualIndex]] = {}
+        for ep in eps:
+            if ep.name in backends:
+                logger.error(
+                    "%s entry point %r collides with a registered backend; skipped",
+                    INDEX_BACKENDS_GROUP,
+                    ep.name,
+                )
+                continue
+            try:
+                discovered[ep.name] = ep.load()
+            except Exception:
+                logger.exception("Failed to load %s entry point %r", INDEX_BACKENDS_GROUP, ep.name)
+        _EP_BACKENDS = discovered
+    backends.update(_EP_BACKENDS)
     return backends
 
 
@@ -160,7 +176,13 @@ def validate_index_config(index_cfg: Any, data_source: dict | None = None) -> No
             "data_source.index.backend is required and must be a string "
             "(omit the whole index block for the default hierarchical path)"
         )
-    cls = get_index_backend(backend)
+    try:
+        cls = get_index_backend(backend)
+    except UnknownCapability as e:
+        # Config validation surfaces ValueError everywhere else in
+        # zagg.config; keep that contract here (UnknownCapability stays the
+        # runtime-resolution error, matching zagg.registry).
+        raise ValueError(f"data_source.index: {e}") from e
     extra = set(index_cfg) - {"backend"} - set(cls.config_keys)
     if extra:
         raise ValueError(

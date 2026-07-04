@@ -32,7 +32,7 @@ does not accept (e.g. `store` under `hierarchical`, or `on_miss` under
 | backend | ships in | mechanism |
 |---|---|---|
 | `hierarchical` (default) | zagg | coarse geolocation read + `plan_read` + h5coro hyperslices — the pre-existing path behind the protocol seam |
-| `inline` | zagg | builds each dataset's chunk map at read time (pure-Python B-tree walk, metadata-only) and issues the planned reads chunk-aligned; optional `write_back` persists granule manifests to the store |
+| `inline` | zagg | builds each dataset's chunk map at read time (pure-Python B-tree walk, metadata-only) and issues boundary-safe planned reads; optional `write_back` persists granule manifests to the store |
 | `sidecar` | external (`h5coro-hidefix`) | precomputed granule-keyed sidecar manifests fetched from the store; discovered via the entry-point group below |
 
 `inline` never *reads* the store — it recomputes every granule every run. It
@@ -43,11 +43,13 @@ mode; consuming a populated store is the `sidecar` backend's job.
 
 Selection still comes from the coarse spatial index, so `inline` requires the
 hierarchical read surface: `data_source.read_plan.spatial_index` plus
-`levels`/`base_level` (see the shipped `atl03.yaml`). Reads are issued on
-chunk boundaries and trimmed to the planned ranges, so output is
-row-identical to `hierarchical`. (Chunk-aligned reads also start one element
-early: h5coro's B-tree start-edge intersection drops hyperslices that begin
-exactly on an interior chunk boundary.)
+`levels`/`base_level` (see the shipped `atl03.yaml`). Planned reads are
+issued as-is — h5coro already inflates exactly the covering chunks — so
+output is row-identical to `hierarchical`, with one exception the chunk map
+makes detectable: a read that starts exactly on an interior chunk boundary
+(which h5coro's B-tree start-edge intersection drops entirely) is shifted
+one element early and trimmed, so `inline` survives shards the plain
+hyperslice read fails on.
 
 ## Write-back manifests
 
@@ -59,7 +61,12 @@ reprocessing changes the key). `store` may be a local directory or an
 role), never the granule-read credentials. A failed write is logged and the
 read continues.
 
-One row per HDF5 chunk of every dataset the planned read touched:
+Coverage per visited group is deterministic — every dataset the config can
+touch (base-rate coordinates, variables, and filter datasets, plus the
+spatial-index level's coordinate and link arrays), built metadata-only up
+front, so a group that contributes no rows to this shard (or degrades to a
+full read) is still fully covered and concurrent shards of one granule write
+identical manifests. One row per HDF5 chunk:
 
 | column | meaning |
 |---|---|

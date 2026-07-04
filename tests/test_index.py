@@ -126,6 +126,9 @@ def _patch_entry_points(monkeypatch, eps):
         assert group == zindex.INDEX_BACKENDS_GROUP
         return list(eps)
 
+    # Discovery is memoized per interpreter; reset so this test's fake entry
+    # points are actually scanned (monkeypatch restores the prior cache after).
+    monkeypatch.setattr(zindex, "_EP_BACKENDS", None)
     monkeypatch.setattr(zindex.metadata, "entry_points", fake_entry_points)
 
 
@@ -180,10 +183,26 @@ class TestBackendRegistry:
         def exploding_entry_points(*, group):
             raise RuntimeError("importlib.metadata unhappy")
 
+        monkeypatch.setattr(zindex, "_EP_BACKENDS", None)
         monkeypatch.setattr(zindex.metadata, "entry_points", exploding_entry_points)
         with caplog.at_level("ERROR", logger="zagg.index"):
             backends = available_index_backends()
         assert backends["hierarchical"] is HierarchicalIndex
+        # A failed lookup is not cached: the next call retries the scan.
+        assert zindex._EP_BACKENDS is None
+
+    def test_discovery_memoized(self, monkeypatch):
+        calls = []
+
+        def counting_entry_points(*, group):
+            calls.append(group)
+            return [_FakeEntryPoint("external", _ExternalIndex)]
+
+        monkeypatch.setattr(zindex, "_EP_BACKENDS", None)
+        monkeypatch.setattr(zindex.metadata, "entry_points", counting_entry_points)
+        assert get_index_backend("external") is _ExternalIndex
+        assert get_index_backend("external") is _ExternalIndex
+        assert len(calls) == 1  # one scan per interpreter, not per resolution
 
 
 # ---------------------------------------------------------------------------
@@ -201,7 +220,9 @@ class TestIndexConfigValidation:
             validate_index_config({})
 
     def test_unknown_backend_rejected(self):
-        with pytest.raises(UnknownCapability, match="index_backend 'sidecar'"):
+        # Config validation keeps zagg.config's ValueError contract; the
+        # KeyError-shaped UnknownCapability is the runtime-resolution error.
+        with pytest.raises(ValueError, match="index_backend 'sidecar'"):
             validate_index_config({"backend": "sidecar"})
 
     def test_irrelevant_keys_are_errors_not_ignored(self):
@@ -486,16 +507,15 @@ class TestChunkMap:
         with pytest.raises(KeyError, match="nope"):
             build_chunk_map(h5obj, "/gt1l/heights/nope")
 
-    def test_aligned_cover(self):
+    def test_starts_on_boundary(self):
         h5obj = _open_fixture()
         cm = build_chunk_map(h5obj, "/gt1l/heights/h_ph")
-        assert cm.aligned_cover(300, 400) == (256, 512)
-        assert cm.aligned_cover(256, 512) == (256, 512)  # already aligned
-        assert cm.aligned_cover(0, 10) == (0, 256)
-        assert cm.aligned_cover(2400, 2432) == (2304, 2432)  # partial last chunk
-        assert cm.aligned_cover(255, 257) == (0, 512)  # straddles a boundary
-        with pytest.raises(ValueError, match="outside dataset extent"):
-            cm.aligned_cover(2400, 3000)
+        assert cm.starts_on_boundary(0)
+        assert cm.starts_on_boundary(256)
+        assert cm.starts_on_boundary(2304)  # last (partial) chunk's start
+        assert not cm.starts_on_boundary(255)
+        assert not cm.starts_on_boundary(257)
+        assert not cm.starts_on_boundary(2432)  # dataset end, not a chunk start
 
 
 class TestInlineReadGroup:
@@ -720,6 +740,20 @@ class TestInlineWriteBackWorker:
             ),
         )
 
+    def _expected_datasets(self, beams=("gt1l", "gt2l")):
+        # Deterministic coverage per visited group: base-rate coords +
+        # variables + filter datasets, plus the spatial-index level's coord
+        # and link arrays (the bench extractor's manifest convention).
+        geoloc = (
+            "reference_photon_lat",
+            "reference_photon_lon",
+            "ph_index_beg",
+            "segment_ph_cnt",
+        )
+        return {f"/{beam}/heights/{name}" for beam in beams for name in _HEIGHTS} | {
+            f"/{beam}/geolocation/{name}" for beam in beams for name in geoloc
+        }
+
     def test_round_trip_to_local_store(self, tmp_path):
         store = tmp_path / "zagg-index" / "ATL03" / "007"  # created by open_object_store
         df_out, meta = self._run(
@@ -730,15 +764,47 @@ class TestInlineWriteBackWorker:
         assert manifest_path.is_file()
         df = pd.read_parquet(manifest_path, engine="fastparquet")
         assert list(df.columns) == list(MANIFEST_DTYPES)
-        # Coverage is lazy: exactly the datasets the planned read touched --
-        # coords + variable + filter dataset, per group (both beams matched).
-        expected = {f"/{beam}/heights/{name}" for beam in ("gt1l", "gt2l") for name in _HEIGHTS}
-        assert set(df["dataset"]) == expected
+        assert set(df["dataset"]) == self._expected_datasets()
         h5obj = _open_fixture()
         cm = build_chunk_map(h5obj, "/gt1l/heights/h_ph")
         got = df[df["dataset"] == "/gt1l/heights/h_ph"].sort_values("chunk_idx")
         assert got["byte_offset"].tolist() == cm.byte_offset.tolist()
         assert got["nbytes"].tolist() == cm.nbytes.tolist()
+
+    def test_coverage_deterministic_for_empty_groups(self, tmp_path):
+        # A shard matching only gt1l leaves: gt2l's read returns None before
+        # the read seam runs, but the manifest still covers gt2l's datasets
+        # (prebuilt per visited group), so concurrent shards of one granule
+        # write identical manifests and last-writer-wins is idempotent.
+        from h5coro import filedriver
+
+        store = tmp_path / "idx"
+        df_out, meta = process_shard(
+            _LeafCellGrid((4, 5)),  # gt1l only; gt2l lats are 100+
+            1,
+            [str(FIXTURE_H5)],
+            s3_credentials={},
+            h5coro_driver=filedriver.FileDriver,
+            config=PipelineConfig(
+                data_source=_fixture_data_source(
+                    index={"backend": "inline", "write_back": True, "store": str(store)}
+                ),
+                aggregation={
+                    "variables": {
+                        "count": {
+                            "function": "len",
+                            "source": "h_ph",
+                            "dtype": "int32",
+                            "fill_value": 0,
+                        }
+                    }
+                },
+                output={"store": "unused"},
+            ),
+        )
+        assert meta["error"] is None
+        df = pd.read_parquet(store / "atl03_mini.parquet", engine="fastparquet")
+        assert set(df["dataset"]) == self._expected_datasets()
 
     def test_write_back_off_writes_nothing(self, tmp_path):
         df_out, meta = self._run(tmp_path, {"backend": "inline"})

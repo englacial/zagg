@@ -578,22 +578,31 @@ def _read_group(h5obj, group: str, data_source: dict, shard_key: int, grid, arro
     produce row-for-row identical output (#43 Phase C parity).
     """
     rp = data_source.get("read_plan")
-    levels = data_source.get("levels")
-    base_level = data_source.get("base_level")
     # Truthy-checking ``levels``/``base_level`` would route an empty ``{}`` (a
     # config typo, easy to do) back to the full-read path silently. Reject
     # incomplete configurations explicitly instead -- the planned path is
     # gated only when ``spatial_index`` is set, and *then* requires a real
     # multi-level structure to operate on.
     if isinstance(rp, dict) and rp.get("spatial_index"):
-        if not isinstance(levels, dict) or not levels:
-            raise ValueError(
-                "data_source.read_plan.spatial_index requires a non-empty 'levels' mapping"
-            )
-        if not base_level:
-            raise ValueError("data_source.read_plan.spatial_index requires 'base_level'")
+        _validate_planned_config(data_source)
         return _planned_read_group(h5obj, group, data_source, shard_key, grid, arrow=arrow)
     return _read_group_full(h5obj, group, data_source, shard_key, grid, arrow=arrow)
+
+
+def _validate_planned_config(data_source: dict) -> None:
+    """Completeness gate for the planned (spatial-index) route.
+
+    Shared by :func:`_read_group`'s dispatch and any index backend that
+    plugs into :func:`_planned_read_group` directly (issue #160 —
+    ``inline``), so the accepted-config surface cannot drift between them.
+    """
+    levels = data_source.get("levels")
+    if not isinstance(levels, dict) or not levels:
+        raise ValueError(
+            "data_source.read_plan.spatial_index requires a non-empty 'levels' mapping"
+        )
+    if not data_source.get("base_level"):
+        raise ValueError("data_source.read_plan.spatial_index requires 'base_level'")
 
 
 def _read_group_full(

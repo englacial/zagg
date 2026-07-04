@@ -7,9 +7,11 @@ metadata-only, ~1 ranged GET + tens of ms per granule (the B-trees live in
 the front-of-file metadata block NSIDC keeps inside h5coro's first cache
 line; measured on PR #159's ``bench/offsets`` route (b), cross-validated
 there against h5py and hidefix chunk-for-chunk over 61 granules with zero
-mismatches). Planned reads are then issued on chunk boundaries, so every GET
-maps to whole stored chunks; the exact planned element ranges are sliced
-back out, keeping output row-identical to ``hierarchical``.
+mismatches). Planned reads are issued as-is — the h5coro decoder already
+inflates exactly the covering chunks — except that the chunk map lets reads
+that start exactly on an interior chunk boundary be detected and shifted one
+element early (see below), keeping output row-identical to ``hierarchical``
+while surviving inputs the plain hyperslice read drops.
 
 The chunk map is also the write-back payload: with ``write_back: true``
 (opt-in — issue #160 Q2) plus a ``store``, every granule's accumulated chunk
@@ -28,12 +30,12 @@ issue #148) — chunk-aligned reads start one element early and trim.
 
 from __future__ import annotations
 
+import io
 import json
 import logging
 import math
-import tempfile
 from dataclasses import dataclass, field
-from pathlib import Path, PurePosixPath
+from pathlib import PurePosixPath
 from urllib.parse import urlsplit
 
 import numpy as np
@@ -100,13 +102,10 @@ class ChunkMap:
     def __len__(self) -> int:
         return len(self.elem_start)
 
-    def aligned_cover(self, start: int, end: int) -> tuple[int, int]:
-        """Smallest chunk-aligned half-open range covering ``[start, end)``."""
-        if not (0 <= start < end <= self.dims[0]):
-            raise ValueError(f"range [{start}, {end}) outside dataset extent {self.dims[0]}")
-        i0 = max(int(np.searchsorted(self.elem_start, start, side="right")) - 1, 0)
-        i1 = min(int(np.searchsorted(self.elem_end, end, side="left")), len(self) - 1)
-        return int(self.elem_start[i0]), int(self.elem_end[i1])
+    def starts_on_boundary(self, elem: int) -> bool:
+        """True when ``elem`` is exactly a chunk's first-axis start offset."""
+        i = int(np.searchsorted(self.elem_start, elem))
+        return i < len(self) and int(self.elem_start[i]) == elem
 
 
 def _walk_chunk_btree(ds) -> list[tuple[tuple[int, ...], int, int, int]]:
@@ -293,8 +292,8 @@ def write_manifest(df: pd.DataFrame, store_path: str, granule_id: str) -> str:
     a local directory (created if absent) or an ``s3://bucket/prefix`` URI
     (ambient credentials — the worker/extraction role, per the issue #160 IAM
     notes; granule-read credentials are never used for the store). Parquet is
-    written with fastparquet (core dep, layer-safe — no pyarrow). Returns the
-    object key.
+    written with fastparquet (core dep, layer-safe — no pyarrow), serialized
+    in memory. Returns the object key.
     """
     import obstore
 
@@ -302,10 +301,9 @@ def write_manifest(df: pd.DataFrame, store_path: str, granule_id: str) -> str:
 
     store = open_object_store(store_path)
     key = f"{granule_id}.parquet"
-    with tempfile.TemporaryDirectory() as tmp:
-        tmp_file = Path(tmp) / key
-        df.to_parquet(tmp_file, engine="fastparquet", index=False)
-        obstore.put(store, key, tmp_file.read_bytes())
+    buf = io.BytesIO()
+    df.to_parquet(buf, engine="fastparquet", index=False)
+    obstore.put(store, key, buf.getvalue())
     return key
 
 
@@ -361,6 +359,40 @@ class InlineIndex(VirtualIndex):
             store=index_cfg.get("store"),
         )
 
+    def _prebuild_group_maps(self, h5obj, group: str, data_source: dict) -> None:
+        """Build the chunk maps for every dataset this group's read can touch.
+
+        The manifest set per group: base-rate coordinates + variables +
+        base-level structured-filter datasets (what ``execute_read_plan``
+        addresses), plus the spatial-index level's coordinate and link arrays
+        (read in full by the planned route, and part of the bench extractor's
+        manifest convention). Missing datasets raise ``KeyError`` — the same
+        group-read failure the data read would produce.
+        """
+        from zagg.config import filters_from_data_source
+        from zagg.processing.read import _level_coord_paths
+
+        paths = [tmpl.format(group=group) for tmpl in data_source["coordinates"].values()]
+        paths += [tmpl.format(group=group) for tmpl in data_source["variables"].values()]
+        base_level = data_source.get("base_level")
+        for f in filters_from_data_source(data_source):
+            if "expression" in f:
+                continue
+            if f.get("level") is None or f.get("level") == base_level:
+                paths.append(f["dataset"].format(group=group))
+        si_lvl = (data_source.get("levels") or {}).get(
+            (data_source.get("read_plan") or {}).get("spatial_index")
+        )
+        if isinstance(si_lvl, dict):
+            paths.extend(_level_coord_paths(si_lvl, group))
+            link = si_lvl.get("link") or {}
+            for key in ("index_beg", "count"):
+                if key in link:
+                    paths.append(link[key].format(group=group))
+        for path in dict.fromkeys(paths):
+            if path not in self._pending:
+                self._pending[path] = build_chunk_map(h5obj, path)
+
     def finish_granule(self, h5obj, granule_url: str) -> None:
         """Write-back seam: persist the granule's accumulated chunk maps.
 
@@ -381,21 +413,22 @@ class InlineIndex(VirtualIndex):
         logger.info(f"  inline write-back: {len(maps)} dataset(s) -> {self.store}/{key}")
 
     def read_group(self, h5obj, group, data_source, shard_key, grid, arrow=False):
-        from zagg.processing.read import _planned_read_group
+        from zagg.processing.read import _planned_read_group, _validate_planned_config
 
-        levels = data_source.get("levels")
-        base_level = data_source.get("base_level")
         rp = data_source.get("read_plan")
-        # Same completeness gate as ``_read_group``'s planned route — reject
-        # incomplete configurations explicitly rather than degrading silently.
+        # inline is planned-route only: without a spatial index it would have
+        # to silently fall back to the full read (ignoring the chunk map),
+        # so reject rather than degrade. Completeness of the planned config
+        # itself is the shared gate from the read module.
         if not (isinstance(rp, dict) and rp.get("spatial_index")):
             raise ValueError("index backend 'inline' requires data_source.read_plan.spatial_index")
-        if not isinstance(levels, dict) or not levels:
-            raise ValueError(
-                "data_source.read_plan.spatial_index requires a non-empty 'levels' mapping"
-            )
-        if not base_level:
-            raise ValueError("data_source.read_plan.spatial_index requires 'base_level'")
+        _validate_planned_config(data_source)
+        if self.write_back:
+            # Deterministic write-back coverage (metadata-only, ~ms): built up
+            # front so routes that bypass the read seam — the ``full_read``
+            # selectivity fallback and empty-shard early returns — still
+            # contribute this group's datasets to the granule manifest.
+            self._prebuild_group_maps(h5obj, group, data_source)
         return _planned_read_group(
             h5obj,
             group,
@@ -407,7 +440,16 @@ class InlineIndex(VirtualIndex):
         )
 
     def _chunk_aligned_read_fn(self, h5obj):
-        """Build the addressing seam: planned ranges → whole-chunk reads.
+        """Build the addressing seam: planned ranges, boundary-safe.
+
+        The plain planned read is already chunk-minimal with the h5coro
+        decoder (it inflates exactly the covering chunks), so ranges are
+        issued as-is — except when a range starts exactly on an interior
+        chunk boundary, which h5coro's B-tree start-edge intersection drops
+        entirely (PR #152 off-by-one, issue #148 thread). The chunk map makes
+        those starts detectable: shift one element early and trim, paying one
+        extra chunk inflate only in that case (the bench extractor's
+        workaround, applied surgically).
 
         Chunk maps are built lazily per dataset (first planned read of that
         path) and cached for the life of the returned callable — i.e. one
@@ -427,21 +469,11 @@ class InlineIndex(VirtualIndex):
                 cm = maps[path] = build_chunk_map(h5obj, path)
             parts = []
             for s, e in hyperslice:
-                if len(cm) == 0:
-                    # No allocated storage (degenerate file): defer to the
-                    # plain read so the error surface matches hierarchical.
-                    parts.append(
-                        h5obj.readDatasets([{"dataset": path, "hyperslice": [(s, e)]}])[path]
-                    )
-                    continue
-                cs, ce = cm.aligned_cover(s, e)
-                # Start one element early when the cover begins on an interior
-                # chunk boundary: h5coro's B-tree start-edge intersection
-                # drops exactly-aligned starts (PR #152 off-by-one, issue #148
-                # thread) — the same workaround the bench extractor ships.
-                lo = cs - 1 if cs > 0 else 0
-                arr = h5obj.readDatasets([{"dataset": path, "hyperslice": [(lo, ce)]}])[path]
-                parts.append(arr[s - lo : e - lo])
+                lo = s
+                if s > 0 and len(cm) and cm.starts_on_boundary(s):
+                    lo = s - 1  # h5coro start-edge workaround (see docstring)
+                arr = h5obj.readDatasets([{"dataset": path, "hyperslice": [(lo, e)]}])[path]
+                parts.append(arr[s - lo :])
             return parts[0] if len(parts) == 1 else np.concatenate(parts)
 
         return read_fn
