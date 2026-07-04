@@ -1,0 +1,50 @@
+# Temporal-pipeline example (issue #12): storm attributes from MERRA-2 reanalysis.
+#
+# Mirrors the antarctic_AR_dataset use case -- track a storm footprint across
+# timesteps, apply a per-timestep spatial function under a mask, then reduce
+# across time into one scalar per attribute. The output is flat tabular (one row
+# per event x scalar columns), written to Parquet -- not a gridded Zarr store.
+#
+# Capability *names* (spatial_func / temporal_reducer / mask / anomaly transform)
+# resolve through zagg.registry at run time; the built-ins used here are
+# registered in zagg.temporal.
+pipeline:
+  type: temporal
+
+data_source:
+  reader: xarray_s3
+  # Plural collections joined along time; each worker reads all of them per event.
+  collections:
+    - merra2_slv   # single-level: T2M, TQV, SLP
+    - merra2_flx   # surface flux: PRECTOT
+  # Static fields the mask providers / anomaly transform consume (see
+  # zagg.temporal: ais_mask drives the ais/ocean masks, climatology the anomaly).
+  static_data:
+    ais_mask: s3://example-bucket/static/ais_mask.nc
+    climatology: s3://example-bucket/static/merra2_monthly_climatology.nc
+
+aggregation:
+  variables:
+    max_t2m_ais:
+      variable: T2M
+      collection: merra2_slv
+      spatial_func: max
+      temporal_reducer: max
+      mask: ais
+    anom_tqv_full:
+      variable: TQV
+      collection: merra2_slv
+      spatial_func: weighted_mean
+      temporal_reducer: weighted_mean
+      mask: full
+      anomaly: true
+    total_precip_ocean:
+      variable: PRECTOT
+      collection: merra2_flx
+      spatial_func: weighted_sum
+      temporal_reducer: sum
+      mask: ocean
+
+output:
+  format: parquet
+  store: s3://example-bucket/output/merra2_storm_attributes.parquet
