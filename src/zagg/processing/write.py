@@ -21,7 +21,7 @@ from zagg.config import (
     get_output_signature,
 )
 from zagg.csr import write_csr
-from zagg.grids.morton import is_morton_array, morton_words
+from zagg.grids.morton import is_morton_array, is_morton_arrow, morton_to_arrow, morton_words
 
 # The sharded path's K ragged (CSR) subgroup writes fan out over a bounded thread
 # pool (issue #142): each inner chunk emits an independent CSR group at a disjoint
@@ -103,11 +103,15 @@ def _build_output(
         for var in data_vars
     }
     for col_name, vals in coords.items():
-        # Route the morton coordinate through the same uint64 boundary as the
-        # pandas carrier (#71), so both carriers share one on-disk dtype guarantee
-        # rather than relying on MortonIndexArray.__array__ returning uint64.
-        arr = morton_words(vals) if is_morton_array(vals) else np.asarray(vals)
-        columns[col_name] = Array.from_numpy(np.ascontiguousarray(arr))
+        # The typed morton coordinate crosses into the arro3 carrier as mortie's
+        # ``morton_index`` extension column (issue #135) — zero-copy over the
+        # PyCapsule interface, no pyarrow. The extension metadata lives at the
+        # interchange layer only: the write boundary (``_iter_carrier_columns``)
+        # extracts the packed uint64 words, so on-disk stays plain uint64 (#71).
+        if is_morton_array(vals):
+            columns[col_name] = morton_to_arrow(vals)
+        else:
+            columns[col_name] = Array.from_numpy(np.ascontiguousarray(np.asarray(vals)))
     return Table.from_pydict(columns)
 
 
@@ -715,6 +719,16 @@ def _iter_carrier_columns(carrier):
     n_rows = carrier.num_rows
     for name in carrier.column_names:
         col = carrier.column(name).combine_chunks()
+        # A typed morton column (mortie's ``morton_index`` extension type; issue
+        # #135) is the arro3 mirror of the pandas MortonIndexArray branch above:
+        # pull the packed uint64 words over the C Data Interface for the on-disk
+        # write (Arrow nulls -> the all-zero sentinel), keeping the stored dtype
+        # plain uint64 (#71).
+        if is_morton_arrow(col):
+            from mortie.arrow import import_c_array
+
+            yield name, import_c_array(col)
+            continue
         # arro3 marks a FixedSizeList by an integer ``list_size`` (None for scalar
         # types), so the per-cell width and the 2-D reshape mirror the pyarrow path
         # exactly — the numpy block written to Zarr is byte-for-byte unchanged.
