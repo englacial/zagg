@@ -143,6 +143,14 @@ Resources:
               - Effect: Allow
                 Action: s3:ListBucket
                 Resource: !Sub "arn:aws:s3:::${OutputBucketName}"
+              # Virtual-index store (issue #160): granule-keyed chunk-manifest
+              # write-back (inline backend) + sidecar reads, scoped to the
+              # public zagg-index prefix only.
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:PutObject
+                Resource: arn:aws:s3:::sliderule-public-cors/zagg-index/*
 
   DepsLayer:
     Type: AWS::Lambda::LayerVersion
