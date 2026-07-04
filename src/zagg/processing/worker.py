@@ -215,6 +215,13 @@ def process_shard(
     # Build URL rewriter for the active driver
     _rewrite_url = _processing._make_url_rewriter(driver)
 
+    # A-priori chunk-boundary plan (issue #148 arm 2a): ``_read_group`` needs
+    # the granule identity to locate its boundary parquet. The kwarg is passed
+    # only when the feature is on, so monkeypatched ``_read_group`` fakes (and
+    # the production call) keep their existing signature byte-for-byte.
+    _rp = data_source.get("read_plan")
+    apriori = isinstance(_rp, dict) and bool(_rp.get("chunk_boundaries"))
+
     use_arrow = handoff == "arrow"
     all_reads = []
     files_processed = 0
@@ -256,8 +263,11 @@ def process_shard(
 
             for g in data_source["groups"]:
                 try:
+                    read_kwargs = {"arrow": use_arrow}
+                    if apriori:
+                        read_kwargs["granule_url"] = s3_url
                     chunk = _processing._read_group(
-                        h5obj, g, data_source, shard_key, grid, arrow=use_arrow
+                        h5obj, g, data_source, shard_key, grid, **read_kwargs
                     )
                     if chunk is not None:
                         if buffered is not None:
