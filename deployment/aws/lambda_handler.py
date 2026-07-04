@@ -292,9 +292,12 @@ def _write_result(result_url: str, response: Dict[str, Any], event: Dict[str, An
 def _handle_extract(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
     """Chunk-boundary geometry extraction (issue #148).
 
-    Runs as a mode of the existing function (no second CFN function — same
-    layer, role, memory, and the shared ``Timeout``) so the fan-out is just
-    many ``mode="extract"`` invocations, each over a batch of granules. The
+    Runs both as a mode of the process function (incremental updates ride the
+    existing deployment) and on the dedicated ``ExtractFn`` twin in
+    ``template.yaml`` (full-archive runs get their own concurrency pool) —
+    same code zip, layer, role, memory, and the shared ``Timeout``, so the
+    fan-out is just many ``mode="extract"`` invocations over granule batches
+    against either function. The
     body lives in :mod:`zagg.catalog.extract` (layer-safe: h5coro + pandas +
     fastparquet only); per-granule ``wall_s`` in the response feeds the
     full-catalog cost estimate the issue asks for.

@@ -163,6 +163,13 @@ NEON tdigest configs and temporal window; only the AOI override differs.
   JSON, so the committed `sm_healpix_o{9,10}_88s.json` keep **only the pinned
   shard** (see `metadata.pruned`). The benchmark dispatches only that shard;
   re-pinning means rebuilding the full map (step 2 below).
+- **Build the catalog once.** The ring catalog is a ~20 min CMR fetch, so save
+  it when (re)building (`--catalog-out
+  tests/data/benchmark/catalogs/cat_88s.parquet`) and point the shard-map
+  entry's `catalog_parquet` key at the committed snapshot: the drift test then
+  rebuilds from the parquet instead of re-fetching CMR weekly (it becomes a
+  deterministic, offline guard on the shardmap build + pin). Regenerate the
+  snapshot only to deliberately re-pin.
 - **Run on demand** via explicit `--target` (they are provisional so a red
   stress run never fails the every-merge matrix): OOM/timeout at 2 GB / 900 s
   is the *expected* baseline result until the issue #148 streaming/cached-read

@@ -192,6 +192,28 @@ class TestTemplateEnvironment:
         assert params["MallocArenaMax"]["Default"] == "2"
         assert params["MallocTrimThreshold"]["Default"] == "0"
 
+    def test_extract_fn_mirrors_process_fn(self):
+        # issue #148: extraction is both a mode of ProcessFn and a dedicated
+        # twin function (own concurrency pool for full-archive runs). The twin
+        # must stay in lockstep with ProcessFn -- same handler/code/layer/role/
+        # timeout/memory/env -- differing only in FunctionName.
+        resources = self._load_template()["Resources"]
+        process = resources["ProcessFn"]["Properties"]
+        extract = resources["ExtractFn"]["Properties"]
+        assert extract["FunctionName"] == {"Sub": "${FunctionName}-extract"}
+        for key in (
+            "Handler",
+            "Runtime",
+            "Architectures",
+            "MemorySize",
+            "Timeout",
+            "Role",
+            "Layers",
+            "Environment",
+            "Code",
+        ):
+            assert extract[key] == process[key], f"ExtractFn.{key} diverges from ProcessFn"
+
     def test_async_event_invoke_config_pins_retries(self):
         # issue #151: the runner's async dispatch relies on service retries
         # being 0 (a re-run of a deterministic failure re-fails at extra cost

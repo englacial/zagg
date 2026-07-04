@@ -193,10 +193,38 @@ Resources:
       MaximumRetryAttempts: 0
       MaximumEventAgeInSeconds: 60
 
+  # Dedicated chunk-boundary extraction function (issue #148). Extraction is
+  # ALSO a mode of ProcessFn (mode="extract" — the incremental-update path);
+  # this twin exists for full-archive extraction runs, giving them their own
+  # concurrency/throttling pool so a catalog-wide fan-out cannot starve
+  # per-cell processing. Same code zip, layer, role, memory, and the shared
+  # 900 s Timeout — only the function name differs.
+  ExtractFn:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub "${FunctionName}-extract"
+      Handler: lambda_handler.lambda_handler
+      Runtime: python3.12
+      Architectures: [!Ref Architecture]
+      MemorySize: !Ref MemorySize
+      Timeout: !Ref Timeout
+      Role: !If [ShouldCreateRole, !GetAtt ExecutionRole.Arn, !Ref ExecutionRoleArn]
+      Layers: [!Ref DepsLayer]
+      Environment:
+        Variables:
+          MALLOC_ARENA_MAX: !Ref MallocArenaMax
+          MALLOC_TRIM_THRESHOLD_: !Ref MallocTrimThreshold
+      Code:
+        S3Bucket: !Ref ArtifactBucket
+        S3Key: !Ref FunctionS3Key
+
 Outputs:
   FunctionArn:
     Description: ARN of the deployed Lambda function.
     Value: !GetAtt ProcessFn.Arn
+  ExtractFunctionArn:
+    Description: ARN of the dedicated extraction Lambda function (issue #148).
+    Value: !GetAtt ExtractFn.Arn
   FunctionName:
     Description: Name of the deployed Lambda function.
     Value: !Ref ProcessFn
