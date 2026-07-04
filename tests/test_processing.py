@@ -1,3 +1,5 @@
+import gc
+
 import numpy as np
 import pandas as pd
 import pytest
@@ -3516,6 +3518,31 @@ class TestCoarseFilterHypersliceKey:
         h5 = _FakeH5({"/x": np.arange(3.0)})
         out = h5.readDatasets([{"dataset": "/x", "hyperslice": []}])
         np.testing.assert_array_equal(out["/x"], np.arange(3.0))
+
+    @pytest.mark.filterwarnings("ignore::pytest.PytestUnraisableExceptionWarning")
+    def test_real_h5promise_requires_hyperslice_on_dict_entries(self):
+        # Monkeypatch-free check against the INSTALLED h5coro: ``H5Promise``
+        # indexes ``dataset["hyperslice"]`` unconditionally (1.0.4,
+        # h5promise.py:80) — synchronously, before any resource access, which
+        # is why a ``None`` resource suffices. Pins the stubs' contract on the
+        # real driver so an upstream normalization change surfaces here.
+        h5promise = pytest.importorskip("h5coro.h5promise")
+        kwargs = {"earlyExit": True, "metaOnly": False, "enableAttributes": False}
+        # Bare dict — the pre-fix zagg shape (issue #157): KeyError.
+        with pytest.raises(KeyError, match="hyperslice"):
+            h5promise.H5Promise(None, {"x": {"dataset": "x"}}, True, **kwargs)
+        # Fixed shape: entry handling passes. The None resource fails further
+        # down (there is no real file), but never with the missing-key KeyError.
+        try:
+            h5promise.H5Promise(None, {"x": {"dataset": "x", "hyperslice": []}}, True, **kwargs)
+        except KeyError:
+            pytest.fail('dict entry with "hyperslice": [] must pass H5Promise entry handling')
+        except Exception:
+            pass  # downstream of entry handling — expected with a None resource
+        # h5coro's half-constructed H5Dataset raises in ``__del__`` when the
+        # failed promise is collected; collect it here so the unraisable stays
+        # confined to this test (and is filtered by the mark above).
+        gc.collect()
 
 
 # ---------------------------------------------------------------------------
