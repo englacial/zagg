@@ -14,6 +14,7 @@ from zagg.config import (
     default_config,
     get_agg_fields,
     get_aoi_mask,
+    get_cell_ids_encoding,
     get_output_signature,
     output_field_signature,
 )
@@ -168,6 +169,10 @@ class HealpixGrid:
         self.shard_objects_per_shard = 4 ** (shard_obj_order - parent_order)
         self.layout = layout
         self.config = config or default_config("atl06")
+        # cell_ids coordinate encoding (issue #135): "nested" (default, the DGGS
+        # standard) or "morton" (emit the packed morton words as cell_ids — a
+        # test/prototype capability). Default is byte-identical to a pre-flag run.
+        self.cell_ids_encoding = get_cell_ids_encoding(self.config)
         self._position_map: dict[int, int] | None = None
         if populated_shards is not None:
             self.set_populated_shards(populated_shards)
@@ -464,7 +469,9 @@ class HealpixGrid:
 
         ``morton`` is a mortie ``MortonIndexArray`` (the typed coordinate; #71);
         it is stored as ``uint64`` on disk via :mod:`zagg.grids.morton`. ``cell_ids``
-        stays NESTED ``uint64`` (the DGGS coordinate, unchanged).
+        is NESTED ``uint64`` (the DGGS coordinate) by default; the
+        ``output.grid.cell_ids_encoding: morton`` flag (issue #135) emits the
+        packed morton words instead.
         """
         return self.coords_of(self.children(shard_key))
 
@@ -477,9 +484,13 @@ class HealpixGrid:
         ``chunk_coords`` is just ``coords_of(children(shard_key))``.
         """
         children = np.asarray(children)
+        if self.cell_ids_encoding == "morton":
+            cell_ids = np.asarray(children, dtype=np.uint64)
+        else:
+            cell_ids = self.encode_cell_ids(children)
         return {
             "morton": to_morton_array(children),
-            "cell_ids": self.encode_cell_ids(children),
+            "cell_ids": cell_ids,
         }
 
     # ── identity / nesting ───────────────────────────────────────────────
@@ -650,7 +661,12 @@ class HealpixGrid:
             "dggs": {
                 "name": "healpix",
                 "refinement_level": self.child_order,
-                "indexing_scheme": "nested",
+                # cell_ids_encoding: morton (issue #135) stores packed morton words
+                # as cell_ids, so the recorded scheme must not claim "nested" — a
+                # consumer decoding morton words as NESTED ids would mis-place every
+                # cell. "morton" is outside the DGGS convention's standard schemes;
+                # the flag is a test/prototype capability.
+                "indexing_scheme": self.cell_ids_encoding,
                 "spatial_dimension": "cells",
                 "ellipsoid": {
                     "name": "WGS84",

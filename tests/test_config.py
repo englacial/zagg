@@ -1190,6 +1190,59 @@ class TestOutputGridValidation:
             validate_config(cfg)
 
 
+def _cfg_with_cell_ids_encoding(encoding=None, grid_type="healpix") -> PipelineConfig:
+    """Minimal valid config; sets output.grid.cell_ids_encoding only when given."""
+    grid: dict = {"type": grid_type, "parent_order": 6, "child_order": 12}
+    if grid_type == "rectilinear":
+        grid = {
+            "type": "rectilinear",
+            "crs": "EPSG:3031",
+            "resolution": 100,
+            "bounds": [0, 0, 1000, 1000],
+        }
+    if encoding is not None:
+        grid["cell_ids_encoding"] = encoding
+    return PipelineConfig(
+        data_source={"variables": {"h_li": "/path"}},
+        aggregation={"variables": {"c": {"function": "len", "source": "h_li", "dtype": "int32"}}},
+        output={"grid": grid},
+    )
+
+
+class TestCellIdsEncoding:
+    """Issue #135: optional output.grid.cell_ids_encoding — "nested" (default,
+    the DGGS standard) or "morton" (emit packed morton words as cell_ids)."""
+
+    def test_default_is_nested(self):
+        from zagg.config import get_cell_ids_encoding
+
+        assert get_cell_ids_encoding(_cfg_with_cell_ids_encoding()) == "nested"
+
+    def test_explicit_values_accessor(self):
+        from zagg.config import get_cell_ids_encoding
+
+        assert get_cell_ids_encoding(_cfg_with_cell_ids_encoding("nested")) == "nested"
+        assert get_cell_ids_encoding(_cfg_with_cell_ids_encoding("morton")) == "morton"
+
+    def test_valid_values_validate(self):
+        validate_config(_cfg_with_cell_ids_encoding())  # absent
+        validate_config(_cfg_with_cell_ids_encoding("nested"))
+        validate_config(_cfg_with_cell_ids_encoding("morton"))
+
+    def test_invalid_value_rejected_at_load(self):
+        with pytest.raises(ValueError, match="cell_ids_encoding must be 'nested' or 'morton'"):
+            validate_config(_cfg_with_cell_ids_encoding("bogus"))
+
+    def test_rejected_on_rectilinear(self):
+        # Rectilinear grids have no cell_ids coordinate; the knob would silently
+        # do nothing, so it is rejected at load.
+        with pytest.raises(ValueError, match="only applies to healpix"):
+            validate_config(_cfg_with_cell_ids_encoding("morton", grid_type="rectilinear"))
+
+    def test_rectilinear_without_encoding_still_validates(self):
+        validate_config(_cfg_with_cell_ids_encoding(grid_type="rectilinear"))
+
+
 # ---------------------------------------------------------------------------
 # Bounds validation
 # ---------------------------------------------------------------------------
