@@ -646,9 +646,10 @@ def _read_group_full(
             level_key = f["level"]
             lvl = levels[level_key]
             flag_path = f["dataset"].format(group=group)
-            # Read the coarse flag array (full level, no hyperslice — we need all parents
-            # to align with link arrays which are also full-length).
-            coarse_data = h5obj.readDatasets([{"dataset": flag_path}])
+            # Read the coarse flag array in full ("hyperslice": [] is h5coro's
+            # full-read form; the key is required on dict entries — issue #157).
+            # We need all parents to align with the full-length link arrays.
+            coarse_data = h5obj.readDatasets([{"dataset": flag_path, "hyperslice": []}])
             coarse_arr = coarse_data[flag_path]
             coarse_fmask = _predicate_mask(coarse_arr, f)
             # Read the link arrays from this level.
@@ -658,8 +659,8 @@ def _read_group_full(
             cnt_path = link["count"].format(group=group)
             link_data = h5obj.readDatasets(
                 [
-                    {"dataset": ibeg_path},
-                    {"dataset": cnt_path},
+                    {"dataset": ibeg_path, "hyperslice": []},
+                    {"dataset": cnt_path, "hyperslice": []},
                 ]
             )
             ibeg_arr = link_data[ibeg_path]

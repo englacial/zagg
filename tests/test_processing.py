@@ -2989,7 +2989,11 @@ class TestVectorChunkResolutionCompanion:
 class _FakeH5:
     """Stub h5coro object: ``readDatasets`` returns canned arrays by path.
 
-    Honors the ``hyperslice`` bound so sliced reads mirror the real driver.
+    Honors the ``hyperslice`` bound so sliced reads mirror the real driver,
+    including h5coro's strict dict contract: only *string* entries are
+    normalized to ``{"dataset": ..., "hyperslice": []}``; dict entries must
+    carry ``"hyperslice"`` themselves (``H5Promise`` indexes it
+    unconditionally — issue #157), and ``[]`` means a full read.
     """
 
     def __init__(self, arrays):
@@ -3003,8 +3007,8 @@ class _FakeH5:
                 continue
             path = d["dataset"]
             arr = self._arrays[path]
-            hs = d.get("hyperslice")
-            if hs is not None:
+            hs = d["hyperslice"]  # KeyError on missing key, as in real h5coro
+            if hs:
                 lo, hi = hs[0]
                 arr = arr[lo:hi]
             out[path] = arr
@@ -3482,6 +3486,36 @@ class TestReadGroupCrossLevel:
         }
         df = _read_group(h5, "gt1l", ds, 0, _ShardGrid())
         assert df["h"].tolist() == [1.0, 3.0]
+
+
+class TestCoarseFilterHypersliceKey:
+    """Issue #157: coarse-filter reads must pass dict entries WITH ``"hyperslice"``.
+
+    h5coro 1.0.4 normalizes only *string* entries to ``{"dataset": ...,
+    "hyperslice": []}``; dict entries pass through unchanged and ``H5Promise``
+    indexes ``dataset["hyperslice"]`` unconditionally, so a dict without the
+    key raises ``KeyError`` (swallowed by the worker's per-group except into a
+    silent 0-obs shard). The stubs here replicate that strict contract, so the
+    :class:`TestReadGroupCrossLevel` cases above regression-guard the fix;
+    these tests pin the stubs' strictness so a tolerant ``.get`` can't creep
+    back in and re-hide the bug behind mocked reads.
+    """
+
+    def test_fake_h5_rejects_dict_without_hyperslice(self):
+        h5 = _FakeH5({"/x": np.arange(3.0)})
+        with pytest.raises(KeyError, match="hyperslice"):
+            h5.readDatasets([{"dataset": "/x"}])
+
+    def test_serve_datasets_rejects_dict_without_hyperslice(self):
+        with pytest.raises(KeyError, match="hyperslice"):
+            _serve_datasets({"/x": np.arange(3.0)}, [{"dataset": "/x"}])
+
+    def test_empty_hyperslice_is_full_read(self):
+        # "hyperslice": [] is h5coro's own normalization of a full read —
+        # exactly what the coarse flag + link-array reads now pass.
+        h5 = _FakeH5({"/x": np.arange(3.0)})
+        out = h5.readDatasets([{"dataset": "/x", "hyperslice": []}])
+        np.testing.assert_array_equal(out["/x"], np.arange(3.0))
 
 
 # ---------------------------------------------------------------------------
@@ -4688,7 +4722,8 @@ def _release_cfg():
 
 def _serve_datasets(arrays, datasets):
     """Shared ``readDatasets`` body: honor the same path/hyperslice contract as
-    :class:`_FakeH5` (mirrors the real h5coro driver)."""
+    :class:`_FakeH5` (mirrors the real h5coro driver, including the strict
+    dict-entry ``"hyperslice"`` requirement — issue #157)."""
     out = {}
     for d in datasets:
         if isinstance(d, str):
@@ -4696,8 +4731,8 @@ def _serve_datasets(arrays, datasets):
             continue
         path = d["dataset"]
         arr = arrays[path]
-        hs = d.get("hyperslice")
-        if hs is not None:
+        hs = d["hyperslice"]  # KeyError on missing key, as in real h5coro
+        if hs:
             lo, hi = hs[0]
             arr = arr[lo:hi]
         out[path] = arr
@@ -4830,7 +4865,7 @@ class TestProcessShardCacheRelease:
                     path = d if isinstance(d, str) else d["dataset"]
                     buf = self._buffers[path]
                     arr = np.frombuffer(buf, dtype=self._dtypes[path])  # view into buffer
-                    if not isinstance(d, str) and d.get("hyperslice") is not None:
+                    if not isinstance(d, str) and d["hyperslice"]:
                         lo, hi = d["hyperslice"][0]
                         arr = arr[lo:hi]
                     out[path] = arr
