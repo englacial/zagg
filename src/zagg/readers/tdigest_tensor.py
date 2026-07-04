@@ -234,6 +234,20 @@ def _resolve_chunk_morton(
     return {k: int(m) for k, m in zip(sorted(shard_keys, key=int), morton)}
 
 
+def _shard_groups(
+    store: Store, field: str, zarr_format: Literal[2, 3]
+) -> tuple[list[str], dict[str, int]]:
+    """Enumerate a field's per-shard CSR subgroups and their morton ids.
+
+    The shared reader preamble: subgroup names under ``field`` (the ``morton``
+    coordinate array is a sibling, not a shard) plus the name → morton map from
+    :func:`_resolve_chunk_morton`.
+    """
+    group = zarr.open_group(store, path=field, mode="r", zarr_format=zarr_format)
+    shard_keys = sorted(k for k in group.group_keys() if k != "morton")
+    return shard_keys, _resolve_chunk_morton(store, field, shard_keys, zarr_format)
+
+
 def read_tensors(
     store: Store,
     field: str,
@@ -295,9 +309,7 @@ def read_tensors(
     out_dtype = _TENSOR_DTYPES[dtype]
     is_float = np.issubdtype(out_dtype, np.floating)
 
-    group = zarr.open_group(store, path=field, mode="r", zarr_format=zarr_format)
-    shard_keys = sorted(k for k in group.group_keys() if k != "morton")
-    morton_of = _resolve_chunk_morton(store, field, shard_keys, zarr_format)
+    shard_keys, morton_of = _shard_groups(store, field, zarr_format)
 
     for key in shard_keys:
         cells = iter_csr_cells(read_csr(store, f"{field}/{key}", zarr_format=zarr_format))
@@ -361,9 +373,7 @@ def read_raw_values(
         If any cell's digest carries a merged centroid (weight > 1), so the raw
         values cannot be recovered without loss.
     """
-    group = zarr.open_group(store, path=field, mode="r", zarr_format=zarr_format)
-    shard_keys = sorted(k for k in group.group_keys() if k != "morton")
-    morton_of = _resolve_chunk_morton(store, field, shard_keys, zarr_format)
+    shard_keys, morton_of = _shard_groups(store, field, zarr_format)
 
     for key in shard_keys:
         morton = morton_of[key]
@@ -420,13 +430,31 @@ def read_locations(
     ValueError
         If the field was not written with a location channel.
     """
-    group = zarr.open_group(store, path=field, mode="r", zarr_format=zarr_format)
-    shard_keys = sorted(k for k in group.group_keys() if k != "morton")
-    morton_of = _resolve_chunk_morton(store, field, shard_keys, zarr_format)
+    shard_keys, morton_of = _shard_groups(store, field, zarr_format)
 
     for key in shard_keys:
-        csr = read_csr(store, f"{field}/{key}", zarr_format=zarr_format, locations=True)
-        locations = csr["locations"]
-        offsets = csr["offsets"]
-        for k, cid in enumerate(csr["cell_ids"]):
+        # Open only the three arrays this reader needs — skipping ``values``
+        # halves the bytes read for a locations-only sweep (the digest payload
+        # is the field's largest array and is not consumed here).
+        prefix = f"{field}/{key}"
+        try:
+            locations = np.asarray(
+                zarr.open_array(
+                    store, path=f"{prefix}/locations", mode="r", zarr_format=zarr_format
+                )[...]
+            )
+        except (FileNotFoundError, KeyError) as e:
+            raise ValueError(
+                f"{prefix!r} has no locations array; it was not written as a "
+                f"located ragged field (declare 'location:' on the field — issue #87)"
+            ) from e
+        offsets = np.asarray(
+            zarr.open_array(store, path=f"{prefix}/offsets", mode="r", zarr_format=zarr_format)[...]
+        )
+        cell_ids = np.asarray(
+            zarr.open_array(store, path=f"{prefix}/cell_ids", mode="r", zarr_format=zarr_format)[
+                ...
+            ]
+        )
+        for k, cid in enumerate(cell_ids):
             yield int(morton_of[key]), int(cid), locations[offsets[k] : offsets[k + 1]]

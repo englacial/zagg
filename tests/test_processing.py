@@ -933,6 +933,14 @@ class TestRaggedCsrWrite:
         assert out is store
 
 
+def _bad_located_reducer(values, locations=None, **_kw):
+    """Located reducer returning int64 locations (dtype-guard fixture)."""
+    return (
+        np.asarray([[1.0, 1.0]], dtype=np.float32),
+        np.asarray([-1], dtype=np.int64),
+    )
+
+
 class TestLocatedRaggedAggregation:
     """Issue #87 phase 3: a ``location: leaf_id`` ragged field hands the reducer
     the per-observation morton column and threads the resulting per-centroid
@@ -1061,8 +1069,9 @@ class TestLocatedRaggedAggregation:
                 # Containment: folding a member back into some stored location
                 # leaves it unchanged (common_ancestor identity).
                 assert any(
-                    int(common_ancestor(np.array([anc, w], dtype=np.uint64))) == int(anc)
-                    for anc in locs
+                    int(common_ancestor(np.array([enclosing, w], dtype=np.uint64)))
+                    == int(enclosing)
+                    for enclosing in locs
                 )
             covered += len(members)
         assert covered == len(leaf)  # every observation is located somewhere
@@ -1070,6 +1079,46 @@ class TestLocatedRaggedAggregation:
         # (below-order-29) enclosing cell, not a raw point word.
         all_locs = np.concatenate([locs for _, _, locs in out])
         assert not set(int(w) for w in all_locs) <= set(int(w) for w in leaf)
+
+    def test_empty_cell_returns_located_pair(self):
+        # The located contract is a (payload, locations) pair even for empty
+        # cells, so direct callers can always unpack (review fold, issue #87).
+        cfg = self._located_cfg()
+        stats = calculate_cell_statistics({"h_li": np.array([])}, config=cfg)
+        payload, locs = stats["h_tdigest"]
+        assert payload.shape == (0, 2) and payload.dtype == np.float32
+        assert locs.shape == (0,) and locs.dtype == np.uint64
+
+    def test_non_uint64_locations_raise(self):
+        # A silent uint64 cast would wrap garbage into plausible morton words.
+        cfg = self._located_cfg()
+        cfg.aggregation["variables"]["h_tdigest"]["function"] = (
+            "test_processing._bad_located_reducer"
+        )
+        with pytest.raises(ValueError, match="is not uint64"):
+            calculate_cell_statistics(
+                {"h_li": np.array([1.0]), "leaf_id": np.array([3], dtype=np.uint64)},
+                config=cfg,
+            )
+
+    def test_chunk_resolution_located_write_raises(self):
+        # location + resolution: chunk is rejected at validation, but an
+        # unvalidated config (direct PipelineConfig) must still fail loudly in
+        # the writer rather than silently dropping the channel (review fold).
+        from zarr.storage import MemoryStore
+
+        cfg = self._located_cfg()
+        cfg.aggregation["variables"]["h_tdigest"]["resolution"] = "chunk"
+        grid = HealpixGrid(6, 8, layout="fullsphere", config=cfg)
+        payload = np.array([[1.0, 1.0]], dtype=np.float32)
+        locs = np.array([9], dtype=np.uint64)
+        with pytest.raises(ValueError, match="cell-resolution only"):
+            write_ragged_to_zarr(
+                {"h_tdigest": ([payload], [0], [locs])},
+                MemoryStore(),
+                grid=grid,
+                shard_key=0,
+            )
 
     def test_unlocated_field_keeps_two_tuple(self, monkeypatch):
         # The pre-#87 ragged sink contract is untouched for unlocated fields.

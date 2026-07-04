@@ -1,6 +1,7 @@
 """YAML-driven pipeline configuration for zagg."""
 
 import importlib
+import inspect
 import re
 from collections.abc import Callable
 from dataclasses import dataclass, field
@@ -327,12 +328,41 @@ def validate_config(config: PipelineConfig) -> None:
                     f"Variable '{name}': location '{location}' is not 'leaf_id' or a "
                     f"data_source variable (available: {sorted(ds_vars)})"
                 )
-            grid_type = (grid or {}).get("type")
+            # An absent output.grid defaults to healpix everywhere else (the
+            # grid factory's ``grid_cfg.get("type", "healpix")``), so mirror
+            # that default here rather than falsely rejecting a valid config.
+            grid_type = grid.get("type") if grid is not None else "healpix"
             if grid_type != "healpix":
                 raise ValueError(
                     f"Variable '{name}': 'location' requires a healpix output grid "
                     f"(the per-observation morton column); got grid type {grid_type!r}"
                 )
+            # The location channel is injected as the reducer's ``locations=``
+            # kwarg (aggregate.py), so a params entry of that name would collide
+            # (TypeError deep in the per-cell loop) and a reducer that cannot
+            # accept the kwarg would crash on every populated cell — reject both
+            # at load time instead.
+            if "locations" in meta.get("params", {}):
+                raise ValueError(
+                    f"Variable '{name}': params may not name 'locations' — it is "
+                    f"reserved for the location channel (issue #87)"
+                )
+            if has_func:
+                func = resolve_function(meta["function"])
+                try:
+                    func_params = inspect.signature(func).parameters
+                except (TypeError, ValueError):
+                    func_params = None  # ufuncs/builtins: not introspectable
+                if func_params is not None and "locations" not in func_params:
+                    has_var_kw = any(
+                        p.kind == inspect.Parameter.VAR_KEYWORD for p in func_params.values()
+                    )
+                    if not has_var_kw:
+                        raise ValueError(
+                            f"Variable '{name}': function {meta['function']!r} does not "
+                            f"accept a 'locations' keyword, which 'location' requires "
+                            f"(use a located reducer, e.g. zagg.stats.tdigest.build_tdigest)"
+                        )
 
 
 def _validate_chunk_precompute(aggregation: dict, ds_vars: set[str]) -> None:

@@ -33,3 +33,21 @@ def mock_dataframe_factory():
         return df
 
     return _create
+
+
+def point_words(n, seed, lat0=45.0, lon0=45.0, spread=1e-4):
+    """Order-29 point-kind morton words for ``n`` points near one location.
+
+    Shared fixture helper for the location channel (issue #87). Jitter is tiny
+    so all words share a HEALPix base cell (the same guarantee one grid cell's
+    observations carry), as ``mortie.common_ancestor`` requires. Unwrapped via
+    the sanctioned :func:`zagg.grids.morton.morton_words` boundary adapter.
+    """
+    from mortie import MortonIndexArray
+
+    from zagg.grids.morton import morton_words
+
+    rng = np.random.default_rng(seed)
+    lats = lat0 + rng.uniform(-spread, spread, n)
+    lons = lon0 + rng.uniform(-spread, spread, n)
+    return morton_words(MortonIndexArray.from_latlon(lats, lons, points=True))

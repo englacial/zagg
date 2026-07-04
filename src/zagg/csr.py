@@ -103,8 +103,19 @@ def write_csr(
     dtype = np.dtype(dtype)
 
     # Filter out empty payloads (cells with no data contribute nothing to CSR).
-    # Locations ride the same filter so they stay index-aligned.
-    locs_or_none = locations_list if locations_list is not None else [None] * len(values_list)
+    # Locations ride the same filter so they stay index-aligned. Check the empty
+    # entries' locations BEFORE filtering — a non-empty location vector on an
+    # empty payload is an upstream misalignment and must raise, not vanish.
+    locs_or_none: list[np.ndarray | None] = (
+        list(locations_list) if locations_list is not None else [None] * len(values_list)
+    )
+    if locations_list is not None:
+        for i, (arr, loc) in enumerate(zip(values_list, locations_list)):
+            if np.asarray(arr).size == 0 and np.asarray(loc).size > 0:
+                raise ValueError(
+                    f"locations at index {i} are non-empty but the payload is empty; "
+                    f"the location channel must stay aligned with the payload"
+                )
     non_empty = [
         (arr, cid, loc)
         for arr, cid, loc in zip(values_list, cell_ids, locs_or_none)
@@ -203,21 +214,25 @@ def read_csr(
         With ``locations=True``, also ``"locations"`` — flat uint64 morton words
         sharing ``offsets`` with ``values``.
     """
-    values = zarr.open_array(store, path=f"{field_name}/values", mode="r", zarr_format=zarr_format)[
-        ...
-    ]
-    offsets = zarr.open_array(
-        store, path=f"{field_name}/offsets", mode="r", zarr_format=zarr_format
-    )[...]
-    cell_ids = zarr.open_array(
-        store, path=f"{field_name}/cell_ids", mode="r", zarr_format=zarr_format
-    )[...]
+    values = np.asarray(
+        zarr.open_array(store, path=f"{field_name}/values", mode="r", zarr_format=zarr_format)[...]
+    )
+    offsets = np.asarray(
+        zarr.open_array(store, path=f"{field_name}/offsets", mode="r", zarr_format=zarr_format)[...]
+    )
+    cell_ids = np.asarray(
+        zarr.open_array(store, path=f"{field_name}/cell_ids", mode="r", zarr_format=zarr_format)[
+            ...
+        ]
+    )
     out = {"values": values, "offsets": offsets, "cell_ids": cell_ids}
     if locations:
         try:
-            out["locations"] = zarr.open_array(
-                store, path=f"{field_name}/locations", mode="r", zarr_format=zarr_format
-            )[...]
+            out["locations"] = np.asarray(
+                zarr.open_array(
+                    store, path=f"{field_name}/locations", mode="r", zarr_format=zarr_format
+                )[...]
+            )
         except (FileNotFoundError, KeyError) as e:
             raise ValueError(
                 f"{field_name!r} has no locations array; it was not written as a "

@@ -529,6 +529,15 @@ def write_ragged_to_zarr(
             # resolution: chunk — collapse the populated cells to the single chunk
             # payload (chunk-uniform, like scalar/vector companions) and store it as
             # a one-entry CSR (the lone chunk at cell_ids == [0]).
+            # ``location`` + ``resolution: chunk`` is rejected at config validation,
+            # but a config built without validate_config (direct PipelineConfig /
+            # Lambda dict payload) could still deliver a located triple here — fail
+            # loudly rather than silently dropping the location channel (issue #87).
+            if locations_list is not None:
+                raise ValueError(
+                    f"ragged field {name!r} is resolution: chunk but carries a location "
+                    f"channel; located ragged fields are cell-resolution only"
+                )
             chunk_payload = _chunk_uniform_ragged(name, values_list)
             if chunk_payload is None:
                 continue  # whole chunk is fill — nothing to record

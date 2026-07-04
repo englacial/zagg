@@ -2,6 +2,7 @@
 
 import numpy as np
 import pytest
+from conftest import point_words as _point_words
 
 from zagg.stats.tdigest import (
     build_tdigest,
@@ -185,21 +186,6 @@ class TestMergeTDigests:
         )
 
 
-def _point_words(n, seed, lat0=45.0, lon0=45.0, spread=1e-4):
-    """Order-29 point-kind morton words for ``n`` points near one location.
-
-    Jitter is tiny so all words share a HEALPix base cell (the same guarantee
-    one grid cell's observations carry), as ``common_ancestor`` requires.
-    """
-    from mortie import MortonIndexArray
-
-    rng = np.random.default_rng(seed)
-    lats = lat0 + rng.uniform(-spread, spread, n)
-    lons = lon0 + rng.uniform(-spread, spread, n)
-    arr = MortonIndexArray.from_latlon(lats, lons, points=True)
-    return np.asarray(arr._data, dtype=np.uint64)
-
-
 def _contains(ancestor, member):
     """True when ``ancestor``'s cell contains ``member`` (mortie fold identity)."""
     from mortie import common_ancestor
@@ -237,8 +223,8 @@ class TestLocatedBuildTDigest:
         from mortie import common_ancestor
 
         assert int(out_locs[0]) == int(common_ancestor(locs[: int(digest[0, 1])]))
-        for anc in out_locs:
-            assert any(_contains(anc, m) for m in locs)
+        for enclosing in out_locs:
+            assert any(_contains(enclosing, m) for m in locs)
 
     def test_nan_values_drop_their_locations(self):
         values = np.array([1.0, np.nan, 2.0, np.nan, 3.0])
@@ -251,6 +237,12 @@ class TestLocatedBuildTDigest:
         digest, locs = build_tdigest(np.array([]), locations=np.array([], dtype=np.uint64))
         assert digest.shape == (0, 2)
         assert locs.shape == (0,) and locs.dtype == np.uint64
+
+    def test_non_uint64_locations_raise(self):
+        # A silent cast would truncate a mis-declared float column into
+        # plausible-looking morton words (review fold).
+        with pytest.raises(ValueError, match="is not uint64"):
+            build_tdigest(np.array([1.0, 2.0]), locations=np.array([1.5, 2.5]))
 
     def test_mismatched_lengths_raise(self):
         with pytest.raises(ValueError, match="locations shape"):
@@ -286,7 +278,7 @@ class TestLocatedMergeTDigests:
         assert locs.dtype == np.uint64 and len(locs) == len(merged)
         # Every input centroid location is contained by some merged location.
         for member in np.concatenate([l1, l2]):
-            assert any(_contains(anc, member) for anc in locs)
+            assert any(_contains(enclosing, member) for enclosing in locs)
 
     def test_empty_sides(self):
         (d1, l1), _ = self._located_pair(50, 512, 5)
@@ -299,6 +291,11 @@ class TestLocatedMergeTDigests:
         assert np.array_equal(locs, l1)
         merged, locs = merge_tdigests(empty, empty, locations1=no_locs, locations2=no_locs)
         assert merged.shape == (0, 2) and locs.shape == (0,)
+
+    def test_non_uint64_locations_raise(self):
+        (d1, l1), _ = self._located_pair(10, 512, 8)
+        with pytest.raises(ValueError, match="is not uint64"):
+            merge_tdigests(d1, d1, locations1=l1, locations2=l1.astype(np.int64))
 
     def test_one_sided_locations_raise(self):
         (d1, l1), _ = self._located_pair(10, 512, 6)

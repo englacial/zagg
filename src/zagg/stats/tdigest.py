@@ -160,7 +160,15 @@ def build_tdigest(
     values = np.asarray(values, dtype=np.float64)
     finite = np.isfinite(values)
     if locations is not None:
-        locations = np.asarray(locations, dtype=np.uint64)
+        locations = np.asarray(locations)
+        if locations.dtype != np.uint64:
+            # A silent uint64 cast would truncate a float column (e.g. a
+            # mis-declared ``location:``) into garbage morton words — require
+            # packed uint64 words outright (what ``assign`` supplies as leaf_id).
+            raise ValueError(
+                f"locations dtype {locations.dtype} is not uint64; pass packed "
+                f"morton point words (the per-observation leaf_id column)"
+            )
         if locations.shape != values.shape:
             raise ValueError(
                 f"locations shape {locations.shape} does not match values shape {values.shape}"
@@ -257,7 +265,11 @@ def merge_tdigests(
         prior located merge).  Pass both or neither.  A merged centroid's
         location is ``mortie.common_ancestor`` over its members' locations —
         mixed orders fold fine, so an already-collapsed low-order mean-morton
-        merges with fresh order-29 point words.
+        merges with fresh order-29 point words.  All locations folded into one
+        merged centroid must share a HEALPix base cell (guaranteed when both
+        digests come from the same grid cell); mortie raises ``ValueError``
+        otherwise — cross-base roll-ups need ``mortie.split_base_cells`` and
+        are out of scope here.
 
     Returns
     -------
@@ -271,9 +283,13 @@ def merge_tdigests(
     d1 = np.asarray(d1, dtype=np.float64)
     d2 = np.asarray(d2, dtype=np.float64)
     if located:
-        locations1 = np.asarray(locations1, dtype=np.uint64)
-        locations2 = np.asarray(locations2, dtype=np.uint64)
+        locations1 = np.asarray(locations1)
+        locations2 = np.asarray(locations2)
         for d, locs, tag in ((d1, locations1, "locations1"), (d2, locations2, "locations2")):
+            if locs.dtype != np.uint64:
+                raise ValueError(
+                    f"{tag} dtype {locs.dtype} is not uint64; pass packed morton words"
+                )
             if locs.shape != (len(d),):
                 raise ValueError(f"{tag} shape {locs.shape} does not match {len(d)} centroids")
 
@@ -282,15 +298,24 @@ def merge_tdigests(
         return (empty, np.empty(0, dtype=np.uint64)) if located else empty
     if d1.size == 0:
         d2_out = np.asarray(d2, dtype=np.float32)
-        return (d2_out, locations2) if located else d2_out
+        if locations2 is not None:
+            # Copy so the returned channel never aliases the caller's array.
+            return d2_out, locations2.copy()
+        return d2_out
     if d2.size == 0:
         d1_out = np.asarray(d1, dtype=np.float32)
-        return (d1_out, locations1) if located else d1_out
+        if locations1 is not None:
+            return d1_out, locations1.copy()
+        return d1_out
 
     combined = np.concatenate([d1, d2], axis=0)
     order = np.argsort(combined[:, 0], kind="stable")
     combined = combined[order]
-    combined_locs = np.concatenate([locations1, locations2])[order] if located else None
+    combined_locs = (
+        np.concatenate([locations1, locations2])[order]
+        if locations1 is not None and locations2 is not None
+        else None
+    )
 
     delta_f = float(delta)
     n_total = float(combined[:, 1].sum())
@@ -334,7 +359,7 @@ def merge_tdigests(
     out = np.empty((len(means), 2), dtype=np.float32)
     out[:, 0] = means
     out[:, 1] = weights
-    if located:
+    if combined_locs is not None:
         return out, _centroid_ancestors(combined_locs, starts, len(combined))
     return out
 

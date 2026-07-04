@@ -1758,8 +1758,28 @@ class TestRaggedKind:
 
 class TestLocationChannel:
     def test_located_ragged_validates(self):
-        cfg = _ragged_cfg(inner_shape=[2], location="leaf_id")
+        cfg = _ragged_cfg(
+            inner_shape=[2],
+            location="leaf_id",
+            function="zagg.stats.tdigest.build_tdigest",
+        )
         validate_config(cfg)
+
+    def test_location_requires_locations_capable_function(self):
+        # np.mean has no ``locations`` kwarg — reject at load, not per cell.
+        cfg = _ragged_cfg(inner_shape=[2], location="leaf_id", function="mean")
+        with pytest.raises(ValueError, match="does not accept a 'locations' keyword"):
+            validate_config(cfg)
+
+    def test_location_params_collision_rejected(self):
+        cfg = _ragged_cfg(
+            inner_shape=[2],
+            location="leaf_id",
+            function="zagg.stats.tdigest.build_tdigest",
+            params={"locations": "h_ph"},
+        )
+        with pytest.raises(ValueError, match="reserved for the location channel"):
+            validate_config(cfg)
 
     def test_signature_carries_location(self):
         sig = get_output_signature({"kind": "ragged", "inner_shape": [2], "location": "leaf_id"})
@@ -1794,6 +1814,17 @@ class TestLocationChannel:
         cfg = _ragged_cfg(inner_shape=[2], location="not_a_column")
         with pytest.raises(ValueError, match="is not 'leaf_id' or a data_source variable"):
             validate_config(cfg)
+
+    def test_location_defaults_to_healpix_when_grid_absent(self):
+        # No output.grid block defaults to healpix everywhere else (the grid
+        # factory), so a located field must validate the same way (review fold).
+        cfg = _ragged_cfg(
+            inner_shape=[2],
+            location="leaf_id",
+            function="zagg.stats.tdigest.build_tdigest",
+        )
+        cfg.output = {"store_path": "s3://x"}
+        validate_config(cfg)
 
     def test_location_requires_healpix_grid(self):
         cfg = _ragged_cfg(inner_shape=[2], location="leaf_id")

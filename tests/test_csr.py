@@ -191,6 +191,13 @@ class TestLocationsChannel:
         with pytest.raises(ValueError, match="has no locations array"):
             read_csr(store, "f", locations=True)
 
+    def test_nonempty_locations_on_empty_payload_raise(self):
+        # An upstream misalignment must fail loudly, not vanish in the filter.
+        payloads = [np.empty((0, 2), dtype=np.float32)]
+        locs = [np.array([7], dtype=np.uint64)]
+        with pytest.raises(ValueError, match="payload is empty"):
+            write_csr(MemoryStore(), "f", payloads, [0], locations_list=locs)
+
     def test_read_without_locations_flag_unchanged(self):
         store = MemoryStore()
         write_csr(store, "f", self._PAYLOADS, self._CELL_IDS, locations_list=self._LOCS)

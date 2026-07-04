@@ -307,12 +307,9 @@ class TestReadLocations:
 
     @staticmethod
     def _point_words(n, seed):
-        from mortie import MortonIndexArray
+        from conftest import point_words
 
-        rng = np.random.default_rng(seed)
-        lats = 45.0 + rng.uniform(-1e-4, 1e-4, n)
-        lons = 45.0 + rng.uniform(-1e-4, 1e-4, n)
-        return np.asarray(MortonIndexArray.from_latlon(lats, lons, points=True)._data)
+        return point_words(n, seed)
 
     def _located_store(self, delta=512):
         store = MemoryStore()
