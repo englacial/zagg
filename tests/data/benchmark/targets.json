@@ -1,5 +1,5 @@
 {
-  "description": "Pinned Lambda-benchmark targets (issue #110). Each target dispatches ONE shard -- the densest cell over the NEON SERC AOP box -- so cost/runtime deltas track code changes, not data drift. Shard maps are shared per (grid, order): the densest shard does not depend on the aggregator. Rebuild + drift check: tests/test_benchmark_shardmap.py.",
+  "description": "Pinned Lambda-benchmark targets (issue #110). Each target dispatches ONE shard -- the densest cell over the NEON SERC AOP box -- so cost/runtime deltas track code changes, not data drift. Forward matrix (issue #133): all tdigest / HEALPix / arrow, a 2x3 sharded-vs-inner ShardingCodec (issue #108) A/B across orders o9/o10/o11. The two columns of each order share ONE config + ONE shard map and differ only by the per-target codec key (sharded: true|false), which run_benchmark applies to output.grid.sharded. The carrier is config-driven (issue #132): aggregation.handoff defaults to arrow, so the matrix targets carry no redundant per-target handoff key. Shard maps are shared per (grid, order): the densest shard does not depend on the codec. Rebuild + drift check: tests/test_benchmark_shardmap.py.",
   "aoi": {
     "file": "AOP_NEON.geojson",
     "name": "NEON SERC AOP box"
@@ -27,83 +27,66 @@
       "shard_key": 5347405532456026122,
       "n_granules": 50
     },
-    "rect_3km": {
-      "path": "shardmaps/sm_rect_3km.json",
-      "shard_key": 0,
-      "n_granules": 44,
-      "note": "Rectilinear (UTM 18N) ~order-11 analog: 3 km shard, 9 km2. Built with the exact-S2 spherely backend. 4-way tie at 44 granules; lowest-key tiebreak -> shard 0. Drift test is tie-tolerant (granule count, not exact key)."
-    },
-    "rect_6km": {
-      "path": "shardmaps/sm_rect_6km.json",
-      "shard_key": 0,
-      "n_granules": 47,
-      "note": "Rectilinear (UTM 18N) ~order-10 analog: 6 km shard, 36 km2. 2-way tie at 47 granules; lowest-key tiebreak -> shard 0."
+    "healpix_o9": {
+      "path": "shardmaps/sm_healpix_o9.json",
+      "shard_key": 5347395636851376137,
+      "n_granules": 59
     }
   },
   "targets": {
-    "gain_bias_healpix_o11": {
-      "config": "configs/atl03_gain_bias_healpix_o11.yaml",
-      "shardmap": "healpix_o11",
-      "aggregator": "gain_bias",
-      "grid_type": "healpix",
-      "grid_size": "o11",
-      "handoff": "arrow"
-    },
-    "tdigest_healpix_o11": {
+    "tdigest_healpix_o11_sharded": {
       "config": "configs/atl03_tdigest_healpix_o11.yaml",
       "shardmap": "healpix_o11",
       "aggregator": "tdigest",
       "grid_type": "healpix",
       "grid_size": "o11",
-      "handoff": "arrow"
+      "codec": "sharded",
+      "sharded": true
     },
-    "gain_bias_healpix_o10": {
-      "config": "configs/atl03_gain_bias_healpix_o10.yaml",
-      "shardmap": "healpix_o10",
-      "aggregator": "gain_bias",
+    "tdigest_healpix_o11_inner": {
+      "config": "configs/atl03_tdigest_healpix_o11.yaml",
+      "shardmap": "healpix_o11",
+      "aggregator": "tdigest",
       "grid_type": "healpix",
-      "grid_size": "o10",
-      "handoff": "arrow"
+      "grid_size": "o11",
+      "codec": "inner",
+      "sharded": false
     },
-    "tdigest_healpix_o10": {
+    "tdigest_healpix_o10_sharded": {
       "config": "configs/atl03_tdigest_healpix_o10.yaml",
       "shardmap": "healpix_o10",
       "aggregator": "tdigest",
       "grid_type": "healpix",
       "grid_size": "o10",
-      "handoff": "arrow"
+      "codec": "sharded",
+      "sharded": true
     },
-    "gain_bias_rect_3km": {
-      "config": "configs/atl03_gain_bias_rect_3km.yaml",
-      "shardmap": "rect_3km",
-      "aggregator": "gain_bias",
-      "grid_type": "rectilinear",
-      "grid_size": "3km",
-      "handoff": "arrow"
-    },
-    "tdigest_rect_3km": {
-      "config": "configs/atl03_tdigest_rect_3km.yaml",
-      "shardmap": "rect_3km",
+    "tdigest_healpix_o10_inner": {
+      "config": "configs/atl03_tdigest_healpix_o10.yaml",
+      "shardmap": "healpix_o10",
       "aggregator": "tdigest",
-      "grid_type": "rectilinear",
-      "grid_size": "3km",
-      "handoff": "arrow"
+      "grid_type": "healpix",
+      "grid_size": "o10",
+      "codec": "inner",
+      "sharded": false
     },
-    "gain_bias_rect_6km": {
-      "config": "configs/atl03_gain_bias_rect_6km.yaml",
-      "shardmap": "rect_6km",
-      "aggregator": "gain_bias",
-      "grid_type": "rectilinear",
-      "grid_size": "6km",
-      "handoff": "arrow"
-    },
-    "tdigest_rect_6km": {
-      "config": "configs/atl03_tdigest_rect_6km.yaml",
-      "shardmap": "rect_6km",
+    "tdigest_healpix_o9_sharded": {
+      "config": "configs/atl03_tdigest_healpix_o9.yaml",
+      "shardmap": "healpix_o9",
       "aggregator": "tdigest",
-      "grid_type": "rectilinear",
-      "grid_size": "6km",
-      "handoff": "arrow"
+      "grid_type": "healpix",
+      "grid_size": "o9",
+      "codec": "sharded",
+      "sharded": true
+    },
+    "tdigest_healpix_o9_inner": {
+      "config": "configs/atl03_tdigest_healpix_o9.yaml",
+      "shardmap": "healpix_o9",
+      "aggregator": "tdigest",
+      "grid_type": "healpix",
+      "grid_size": "o9",
+      "codec": "inner",
+      "sharded": false
     }
   },
   "provisional_targets": {

@@ -122,6 +122,35 @@ def test_build_record_max_memory_null_safe():
     assert "max_memory_mb" in bench_metrics.RECORD_COLUMNS
 
 
+def test_codec_column_is_last_and_threaded(monkeypatch):
+    # The codec A/B label (issue #133) is the newest schema column -> appended LAST
+    # (stable-schema rule), threaded from context, and null on rows that omit it
+    # (legacy/frozen).
+    assert bench_metrics.RECORD_COLUMNS[-1] == "codec"
+    g = HealpixGrid(parent_order=11, child_order=19)
+    rec = bench_metrics.build_record(_summary(), grid=g, context={"codec": "sharded"})
+    assert rec["codec"] == "sharded"
+    # Absent in context -> null (a frozen/legacy row carries no codec).
+    legacy = bench_metrics.build_record(_summary(), grid=g, context={"target": "t"})
+    assert legacy["codec"] is None
+
+
+def test_run_target_threads_codec_into_record():
+    # run_benchmark must record the target's codec onto the row (dry-run, no AWS).
+    manifest, base = run_benchmark.load_targets(str(BENCH / "targets.json"))
+    rec = run_benchmark.run_target(
+        "tdigest_healpix_o10_inner",
+        manifest,
+        base,
+        store=None,
+        region="us-west-2",
+        function_name="process-shard",
+        context={"commit": "deadbee", "event": "pr"},
+        dry_run=True,
+    )
+    assert rec["codec"] == "inner"
+
+
 def test_memory_pct_of_cap_maps_near_red():
     # 1963 MB on a 2 GB cap -> ~0.96 (the OOM-adjacent run #1 figure, issue #120).
     pct = bench_metrics.memory_pct_of_cap(1963.0, 2.0)
@@ -234,7 +263,7 @@ def test_comment_markdown_worker_note_banner():
 def test_run_target_dry_run():
     manifest, base = run_benchmark.load_targets(str(BENCH / "targets.json"))
     rec = run_benchmark.run_target(
-        "gain_bias_healpix_o11",
+        "tdigest_healpix_o11_sharded",
         manifest,
         base,
         store=None,
@@ -243,12 +272,115 @@ def test_run_target_dry_run():
         context={"commit": "deadbee", "event": "pr"},
         dry_run=True,
     )
-    assert rec["target"] == "gain_bias_healpix_o11"
-    assert rec["aggregator"] == "gain_bias"
+    assert rec["target"] == "tdigest_healpix_o11_sharded"
+    assert rec["aggregator"] == "tdigest"
     assert rec["grid_type"] == "healpix"
     assert rec["shard_key"] == 5347394812217655307
     assert rec["shard_area_km2"] == pytest.approx(10.13, abs=0.2)
     assert rec["total_obs"] is None  # no dispatch in dry-run
+
+
+def _fake_record(target, *, total_obs, max_memory_mb):
+    # Minimal record with the fields main()'s per-target print + the empty-metrics
+    # guard read (issue #145). Enough to drive main() without a real dispatch.
+    return {
+        "target": target,
+        "total_obs": total_obs,
+        "runtime_s": None,
+        "cost_per_shard_usd": None,
+        "cost_per_100km2_usd": None,
+        "max_memory_mb": max_memory_mb,
+    }
+
+
+def test_main_fails_on_empty_target(tmp_path, monkeypatch):
+    # A silent OOM comes back as obs=0 / max_memory_mb=None; main() must exit
+    # non-zero so the job goes red instead of retaining a junk row (issue #145).
+    monkeypatch.setattr(
+        run_benchmark,
+        "run_target",
+        lambda name, *a, **k: _fake_record(name, total_obs=0, max_memory_mb=None),
+    )
+    rc = run_benchmark.main(
+        [
+            "--targets",
+            str(BENCH / "targets.json"),
+            "--target",
+            "tdigest_healpix_o10_inner",
+            "--commit",
+            "cafe123",
+            "--out-json",
+            str(tmp_path / "metrics.json"),
+        ]
+    )
+    assert rc == 1
+
+
+def test_main_fails_on_null_memory_alone(tmp_path, monkeypatch):
+    # The guard is `not total_obs OR max_memory_mb is None`: a target that recorded
+    # observations but no memory reading must still fail, so the `max_memory_mb is
+    # None` clause is exercised independently of the obs=0 clause (issue #145).
+    monkeypatch.setattr(
+        run_benchmark,
+        "run_target",
+        lambda name, *a, **k: _fake_record(name, total_obs=999, max_memory_mb=None),
+    )
+    rc = run_benchmark.main(
+        [
+            "--targets",
+            str(BENCH / "targets.json"),
+            "--target",
+            "tdigest_healpix_o10_inner",
+            "--commit",
+            "cafe123",
+            "--out-json",
+            str(tmp_path / "metrics.json"),
+        ]
+    )
+    assert rc == 1
+
+
+def test_main_no_fail_on_empty_opts_out(tmp_path, monkeypatch):
+    monkeypatch.setattr(
+        run_benchmark,
+        "run_target",
+        lambda name, *a, **k: _fake_record(name, total_obs=0, max_memory_mb=None),
+    )
+    rc = run_benchmark.main(
+        [
+            "--targets",
+            str(BENCH / "targets.json"),
+            "--target",
+            "tdigest_healpix_o10_inner",
+            "--no-fail-on-empty",
+            "--commit",
+            "cafe123",
+            "--out-json",
+            str(tmp_path / "metrics.json"),
+        ]
+    )
+    assert rc == 0
+
+
+def test_main_passes_on_populated_target(tmp_path, monkeypatch):
+    monkeypatch.setattr(
+        run_benchmark,
+        "run_target",
+        lambda name, *a, **k: _fake_record(name, total_obs=12345, max_memory_mb=800.0),
+    )
+    rc = run_benchmark.main(
+        [
+            "--targets",
+            str(BENCH / "targets.json"),
+            "--target",
+            "tdigest_healpix_o10_inner",
+            "--commit",
+            "cafe123",
+            "--out-json",
+            str(tmp_path / "metrics.json"),
+        ]
+    )
+    assert rc == 0
 
 
 def test_main_dry_run_writes_outputs(tmp_path):
@@ -259,7 +391,7 @@ def test_main_dry_run_writes_outputs(tmp_path):
             "--targets",
             str(BENCH / "targets.json"),
             "--target",
-            "tdigest_healpix_o10",
+            "tdigest_healpix_o10_inner",
             "--dry-run",
             "--commit",
             "cafe123",
@@ -270,8 +402,156 @@ def test_main_dry_run_writes_outputs(tmp_path):
         ]
     )
     records = json.loads(out_json.read_text())
-    assert len(records) == 1 and records[0]["target"] == "tdigest_healpix_o10"
-    assert "tdigest_healpix_o10" in out_md.read_text()
+    assert len(records) == 1 and records[0]["target"] == "tdigest_healpix_o10_inner"
+    assert "tdigest_healpix_o10_inner" in out_md.read_text()
+
+
+def test_main_dry_run_exempt_from_fail_on_empty(tmp_path):
+    # --dry-run emits empty metrics by design, so --fail-on-empty (default on) must
+    # NOT trip on it -- main() returns 0 even though total_obs is null (issue #145).
+    rc = run_benchmark.main(
+        [
+            "--targets",
+            str(BENCH / "targets.json"),
+            "--target",
+            "tdigest_healpix_o10_inner",
+            "--dry-run",
+            "--commit",
+            "cafe123",
+            "--out-json",
+            str(tmp_path / "metrics.json"),
+        ]
+    )
+    assert rc == 0
+
+
+def test_main_dispatches_targets_concurrently(tmp_path, monkeypatch):
+    # Two targets must be in-flight at once for a Barrier(2) to release; a serial
+    # loop would block forever on the first wait() and the timeout would trip it.
+    # Also asserts the output records are re-ordered back to the requested order
+    # even though completion order is nondeterministic (issue #137).
+    import threading
+
+    import zagg.auth as zauth
+
+    monkeypatch.setattr(zauth, "ensure_logged_in", lambda: None)  # no real login
+    barrier = threading.Barrier(2, timeout=10)
+
+    def fake(name, *a, **k):
+        barrier.wait()  # rendezvous: only clears if both targets run concurrently
+        return _fake_record(name, total_obs=1, max_memory_mb=100.0)
+
+    monkeypatch.setattr(run_benchmark, "run_target", fake)
+    out_json = tmp_path / "metrics.json"
+    rc = run_benchmark.main(
+        [
+            "--targets",
+            str(BENCH / "targets.json"),
+            "--target",
+            "tdigest_healpix_o10_inner",
+            "--target",
+            "tdigest_healpix_o10_sharded",
+            "--commit",
+            "cafe123",
+            "--out-json",
+            str(out_json),
+        ]
+    )
+    assert rc == 0
+    recs = json.loads(out_json.read_text())
+    assert [r["target"] for r in recs] == [
+        "tdigest_healpix_o10_inner",
+        "tdigest_healpix_o10_sharded",
+    ]
+
+
+def test_main_warms_auth_once_before_parallel_dispatch(tmp_path, monkeypatch):
+    # With >1 target and a real (non-dry-run) dispatch, main() authenticates ONCE
+    # up front so the concurrent targets don't race earthaccess's global auth
+    # singleton (issue #137). run_target is stubbed so no real AWS/agg is touched.
+    import zagg.auth as zauth
+
+    calls = {"login": 0, "targets": []}
+    monkeypatch.setattr(
+        zauth, "ensure_logged_in", lambda: calls.__setitem__("login", calls["login"] + 1)
+    )
+    monkeypatch.setattr(
+        run_benchmark,
+        "run_target",
+        lambda name, *a, **k: (
+            calls["targets"].append(name) or _fake_record(name, total_obs=1, max_memory_mb=100.0)
+        ),
+    )
+    rc = run_benchmark.main(
+        [
+            "--targets",
+            str(BENCH / "targets.json"),
+            "--target",
+            "tdigest_healpix_o10_inner",
+            "--target",
+            "tdigest_healpix_o10_sharded",
+            "--commit",
+            "cafe123",
+            "--out-json",
+            str(tmp_path / "metrics.json"),
+        ]
+    )
+    assert rc == 0
+    assert calls["login"] == 1  # exactly one warm-up, before the fan-out
+    assert len(calls["targets"]) == 2
+
+
+def test_main_skips_auth_warmup_on_dry_run(tmp_path, monkeypatch):
+    # --dry-run does no dispatch, so it must not authenticate (no creds in CI dry
+    # runs / local wiring checks).
+    import zagg.auth as zauth
+
+    warmed = {"n": 0}
+    monkeypatch.setattr(zauth, "ensure_logged_in", lambda: warmed.__setitem__("n", warmed["n"] + 1))
+    run_benchmark.main(
+        [
+            "--targets",
+            str(BENCH / "targets.json"),
+            "--target",
+            "tdigest_healpix_o10_inner",
+            "--target",
+            "tdigest_healpix_o10_sharded",
+            "--dry-run",
+            "--commit",
+            "cafe123",
+            "--out-json",
+            str(tmp_path / "metrics.json"),
+        ]
+    )
+    assert warmed["n"] == 0
+
+
+def test_main_unknown_target_fails_before_any_dispatch(tmp_path, monkeypatch):
+    # An unknown target name aborts before the pool spins up -- no target is
+    # dispatched (so we never pay for a partial run on a typo'd matrix).
+    called = {"n": 0}
+
+    def fake(name, *a, **k):
+        called["n"] += 1
+        return _fake_record(name, total_obs=1, max_memory_mb=100.0)
+
+    monkeypatch.setattr(run_benchmark, "run_target", fake)
+    with pytest.raises(SystemExit, match="unknown target"):
+        run_benchmark.main(
+            [
+                "--targets",
+                str(BENCH / "targets.json"),
+                "--target",
+                "tdigest_healpix_o10_inner",
+                "--target",
+                "does_not_exist",
+                "--commit",
+                "cafe123",
+                "--out-json",
+                str(tmp_path / "metrics.json"),
+            ]
+        )
+    assert called["n"] == 0  # no dispatch happened
 
 
 # --- manifest integrity (the pin is internally consistent) ----------------
@@ -289,6 +569,64 @@ def test_targets_manifest_consistent():
         key, n = bench_metrics.select_densest_shard(sm)
         assert key == sm_meta["shard_key"], f"{t['shardmap']}: stale pinned shard_key"
         assert n == sm_meta["n_granules"], f"{t['shardmap']}: stale n_granules"
+
+
+# --- forward sharded-vs-inner matrix (issue #133) -------------------------
+
+
+def test_forward_matrix_is_tdigest_healpix_arrow_codec_ab():
+    # The committed merge matrix is the forward 2x3 codec A/B: every target is
+    # tdigest / HEALPix / arrow and carries a codec (sharded|inner) matched to its
+    # sharded bool, paired per order across o9/o10/o11. The carrier is config-driven
+    # (issue #132): targets inherit ``arrow`` from each config rather than restating
+    # a redundant per-target ``handoff`` key (test_committed_targets_drop_redundant_handoff).
+    manifest = json.loads((BENCH / "targets.json").read_text())
+    targets = manifest["targets"]
+    by_order: dict[str, set[str]] = {}
+    for tname, t in targets.items():
+        assert t["aggregator"] == "tdigest", tname
+        assert t["grid_type"] == "healpix", tname
+        assert "handoff" not in t, tname
+        assert t["codec"] in ("sharded", "inner"), tname
+        # codec label and the sharded bool run_benchmark applies must agree.
+        assert t["sharded"] is (t["codec"] == "sharded"), tname
+        # The target name encodes its order + codec, matching the metadata.
+        assert tname == f"tdigest_healpix_{t['grid_size']}_{t['codec']}", tname
+        by_order.setdefault(t["grid_size"], set()).add(t["codec"])
+    # Each present order is a complete A/B pair (both columns), never a half-row.
+    for order, codecs in by_order.items():
+        assert codecs == {"sharded", "inner"}, f"{order}: incomplete codec pair {codecs}"
+
+
+def test_o9_row_is_live():
+    # The o9 row landed (phase 1): its shard map is built and pinned, both columns
+    # reference it, and the _pending_o9 hold-out stanza is gone.
+    manifest = json.loads((BENCH / "targets.json").read_text())
+    assert "_pending_o9" not in manifest, "o9 hold-out stanza should be removed"
+    o9_targets = {n for n, t in manifest["targets"].items() if t["grid_size"] == "o9"}
+    assert o9_targets == {"tdigest_healpix_o9_sharded", "tdigest_healpix_o9_inner"}
+    for t in (manifest["targets"][n] for n in o9_targets):
+        assert t["shardmap"] == "healpix_o9"
+        assert t["config"] == "configs/atl03_tdigest_healpix_o9.yaml"
+    # The shardmap entry is pinned with a real (numeric) densest shard_key.
+    sm = manifest["shardmaps"]["healpix_o9"]
+    assert isinstance(sm["shard_key"], int)
+    assert sm["path"] == "shardmaps/sm_healpix_o9.json"
+    assert (BENCH / sm["path"]).exists()
+    assert (BENCH / "configs" / "atl03_tdigest_healpix_o9.yaml").exists()
+
+
+def test_every_live_shardmap_resolves_to_a_config():
+    # The drift test parametrizes over manifest["shardmaps"], and the consistency
+    # test over manifest["targets"]; both rely on every LIVE shardmap resolving to
+    # a referencing config (the drift test's _config_for_shardmap lookup). This
+    # guards that wiring -- the invariant that made o9 drop-in coverage automatic
+    # the moment its entry landed, and that keeps any future order covered too.
+    import test_benchmark_shardmap as drift
+
+    for sm_key in drift.MANIFEST["shardmaps"]:
+        cfg = drift._config_for_shardmap(sm_key)  # raises if no target references it
+        assert cfg.exists()
 
 
 # --- provisional (PR-tree-only) handoff targets (issue #130) ---------------
@@ -341,6 +679,88 @@ def test_provisional_target_resolves_and_threads_handoff(monkeypatch):
         dry_run=False,
     )
     assert captured["handoff"] == "arrow"
+
+
+def test_committed_targets_drop_redundant_handoff(monkeypatch):
+    # issue #132: the merge-matrix targets no longer restate the carrier; they
+    # inherit it from each config. Only the provisional A/B targets pin handoff.
+    manifest = json.loads((BENCH / "targets.json").read_text())
+    for tname, t in manifest["targets"].items():
+        assert "handoff" not in t, f"{tname}: handoff should be inherited from the config"
+
+
+def test_committed_target_inherits_handoff_from_config(monkeypatch):
+    # issue #132: a committed target with no handoff key inherits the config carrier
+    # (get_handoff -> "arrow" for the benchmark configs, which set no handoff).
+    manifest, base = run_benchmark.load_targets(str(BENCH / "targets.json"))
+    captured = {}
+
+    import zagg.runner as runner
+
+    def fake_agg(config, **kwargs):
+        captured["handoff"] = kwargs.get("handoff")
+        return {}
+
+    monkeypatch.setattr(runner, "agg", fake_agg)
+    run_benchmark.run_target(
+        "tdigest_healpix_o11_sharded",
+        manifest,
+        base,
+        store="s3://b/x.zarr",
+        region="us-west-2",
+        function_name="process-shard",
+        context={"commit": "deadbee", "event": "pr"},
+        dry_run=False,
+    )
+    assert captured["handoff"] == "arrow"
+
+
+def test_sharded_knob_applied_to_grid_config(monkeypatch):
+    # The forward benchmark (issue #133) carries the ShardingCodec as a per-target
+    # ``sharded`` key so one config drives both columns: run_target must push it
+    # onto config.output['grid']['sharded'] (where get_sharded reads it) before
+    # building the grid + dispatching. A synthetic manifest pairs the o9 t-digest
+    # config (K=256, so sharded is valid) with each codec value.
+    base = BENCH
+    captured = {}
+
+    import zagg.runner as runner
+    from zagg.config import get_sharded
+
+    def fake_agg(config, **kwargs):
+        captured["sharded"] = get_sharded(config)
+        return {}
+
+    monkeypatch.setattr(runner, "agg", fake_agg)
+    for codec, want in (("sharded", True), ("inner", False)):
+        manifest = {
+            "shardmaps": {"healpix_o10": {"path": "shardmaps/sm_healpix_o10.json"}},
+            "targets": {
+                "t": {
+                    "config": "configs/atl03_tdigest_healpix_o9.yaml",
+                    "shardmap": "healpix_o10",
+                    "aggregator": "tdigest",
+                    "grid_type": "healpix",
+                    "grid_size": "o9",
+                    "handoff": "arrow",
+                    "codec": codec,
+                    "sharded": want,
+                }
+            },
+        }
+        # The o10 shardmap meta has no shard_key here; run_target reads it, so add one.
+        manifest["shardmaps"]["healpix_o10"]["shard_key"] = 0
+        run_benchmark.run_target(
+            "t",
+            manifest,
+            base,
+            store="s3://b/x.zarr",
+            region="us-west-2",
+            function_name="process-shard",
+            context={"commit": "deadbee", "event": "pr"},
+            dry_run=False,
+        )
+        assert captured["sharded"] is want, f"codec={codec} -> sharded={want}"
 
 
 def test_scalar_config_is_genuinely_scalar():
@@ -946,3 +1366,146 @@ def test_make_figure_drops_failed_run_zeros(tmp_path, monkeypatch):
     ]
     assert fails, "expected an 'x' failure marker at the zero point"
     assert fails[0].get_offsets()[0][0] == 1  # the failed merge's x position
+
+
+# --- forward sharded-vs-inner renderer (issue #133) -----------------------
+
+
+def _codec_row(commit, order, codec, **kw):
+    # A forward-matrix merge row: tdigest/healpix, carrying grid_size + codec so
+    # the renderer slots it into the fixed 2x3 (order x sharded/inner) grid.
+    r = _rec_row(commit, f"tdigest_healpix_{order}_{codec}", agg="tdigest", grid="healpix", **kw)
+    r["grid_size"] = order
+    r["codec"] = codec
+    return r
+
+
+def _full_codec_matrix(commit):
+    return [
+        _codec_row(commit, order, codec)
+        for order in ("o9", "o10", "o11")
+        for codec in ("sharded", "inner")
+    ]
+
+
+def test_codec_layout_is_fixed_2x3_sharded_inner_by_order():
+    import plot_series
+
+    hist = update_series.records_to_frame(_full_codec_matrix("c0"))
+    grid, nrows, ncols = plot_series._codec_layout(hist)
+    assert (nrows, ncols) == (3, 2)  # rows o9->o11, cols sharded/inner
+    assert grid == [
+        ["tdigest_healpix_o9_sharded", "tdigest_healpix_o9_inner"],
+        ["tdigest_healpix_o10_sharded", "tdigest_healpix_o10_inner"],
+        ["tdigest_healpix_o11_sharded", "tdigest_healpix_o11_inner"],
+    ]
+
+
+def test_codec_layout_blanks_missing_order():
+    # A history missing an order (here o9) renders that row as two blank cells;
+    # the grid is still a fixed 2x3 so the matrix shape is stable.
+    import plot_series
+
+    rows = [_codec_row("c0", o, c) for o in ("o10", "o11") for c in ("sharded", "inner")]
+    grid, nrows, ncols = plot_series._codec_layout(update_series.records_to_frame(rows))
+    assert (nrows, ncols) == (3, 2)
+    assert grid[0] == [None, None]  # o9 row blank
+    assert grid[1] == ["tdigest_healpix_o10_sharded", "tdigest_healpix_o10_inner"]
+
+
+def test_codec_and_frozen_histories_split_on_codec():
+    import plot_series
+
+    rows = _full_codec_matrix("c0") + [
+        _rec_row("c0", "gain_bias_rect_3km", agg="gain_bias", grid="rectilinear")
+    ]
+    df = update_series.records_to_frame(rows)
+    codec = plot_series._codec_history(df)
+    frozen = plot_series._frozen_history(df)
+    assert set(codec["target"]) == {r["target"] for r in _full_codec_matrix("c0")}
+    assert set(frozen["target"]) == {"gain_bias_rect_3km"}
+
+
+def test_codec_split_handles_parquet_without_codec_column():
+    # Backward-compat: the live retained parquet predates the codec column until
+    # the first new merge. A frame with NO ``codec`` column must read as all-frozen
+    # (the renderer's ``"codec" not in df.columns`` guard), never KeyError.
+    import plot_series
+
+    df = update_series.records_to_frame([_rec_row("c0", "t1"), _rec_row("c1", "t1")])
+    df = df.drop(columns=["codec"])  # simulate a pre-#133 parquet
+    assert not plot_series._codec_mask(df).any()
+    assert plot_series._codec_history(df).empty
+    assert set(plot_series._frozen_history(df)["target"]) == {"t1"}
+
+
+def test_make_codec_figure_renders_only_codec_rows(tmp_path, monkeypatch):
+    pytest.importorskip("matplotlib")
+    import matplotlib
+
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+    import plot_series
+
+    captured = {}
+    monkeypatch.setattr(plt, "close", lambda fig: captured.setdefault("fig", fig))
+
+    # Full 2x3 codec matrix + a frozen row that must NOT appear in the codec figure.
+    rows = _full_codec_matrix("c0") + [
+        _rec_row("c0", "gain_bias_rect_3km", agg="gain_bias", grid="rectilinear")
+    ]
+    series = tmp_path / "series.parquet"
+    update_series.save_series(update_series.records_to_frame(rows), series)
+    out = tmp_path / "codec.png"
+    assert plot_series.make_codec_figure(
+        update_series.load_series(series), "cost_per_shard_usd", "cost", out
+    )
+    assert out.exists()
+    titles = {ax.get_title() for ax in captured["fig"].axes if ax.get_title()}
+    assert titles == {r["target"] for r in _full_codec_matrix("c0")}
+    assert "gain_bias_rect_3km" not in titles
+
+
+def test_make_figure_frozen_ignores_codec_rows(tmp_path):
+    # The frozen figure renders nothing from a series that is all codec rows.
+    pytest.importorskip("matplotlib")
+    import plot_series
+
+    df = update_series.records_to_frame(_full_codec_matrix("c0"))
+    out = tmp_path / "frozen.png"
+    assert plot_series.make_figure(df, "cost_per_shard_usd", "cost", out) is False
+    assert not out.exists()
+
+
+def test_make_codec_latest_table_renders_codec_rows(tmp_path):
+    pytest.importorskip("matplotlib")
+    import plot_series
+
+    df = update_series.records_to_frame(_full_codec_matrix("c0"))
+    out = tmp_path / "codec_table.png"
+    assert plot_series.make_codec_latest_table(df, out) is True
+    assert out.exists()
+    # No codec rows -> nothing rendered.
+    frozen_only = update_series.records_to_frame([_rec_row("c0", "gain_bias_rect_3km")])
+    assert plot_series.make_codec_latest_table(frozen_only, tmp_path / "x.png") is False
+
+
+def test_plot_main_emits_codec_artifacts_above_frozen(tmp_path):
+    pytest.importorskip("matplotlib")
+    import plot_series
+
+    rows = _full_codec_matrix("c0") + [
+        _rec_row("c0", "gain_bias_rect_3km", agg="gain_bias", grid="rectilinear")
+    ]
+    series = tmp_path / "series.parquet"
+    update_series.save_series(update_series.records_to_frame(rows), series)
+    outdir = tmp_path / "site"
+    plot_series.main(["--series", str(series), "--out", str(outdir)])
+    # Forward codec figures + table land beside the frozen ones.
+    assert (outdir / "cost_per_shard_codec.png").exists()
+    assert (outdir / "codec_table.png").exists()
+    assert (outdir / "cost_per_shard.png").exists()  # the frozen rect row still renders
+    html = (outdir / "index.html").read_text()
+    # The forward (sharded-vs-inner) section is rendered ABOVE the frozen one.
+    assert "Sharded vs inner-chunk" in html and "Frozen historical" in html
+    assert html.index("Sharded vs inner-chunk") < html.index("Frozen historical")

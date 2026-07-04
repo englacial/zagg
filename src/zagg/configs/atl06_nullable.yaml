@@ -1,0 +1,51 @@
+# ATL06 land-ice height, nullable-source example selecting the pandas carrier.
+#
+# This mirrors atl06.yaml but declares ``aggregation.handoff: pandas`` (issue #132):
+# the arro3/arrow read carrier requires dense, null-free columns (its null_cols
+# guard raises on nulls), so a source whose columns may carry nulls must use the
+# pandas carrier, which tolerates nulls natively. (Here the quality_filter is also
+# omitted vs atl06.yaml so invalid returns aren't pre-dropped, but nullability is a
+# property of the source data, not of that filter.) The carrier travels with the
+# config; everything else is identical to atl06.yaml.
+data_source:
+  reader: h5coro
+  driver: s3
+  groups: [gt1l, gt1r, gt2l, gt2r, gt3l, gt3r]
+  coordinates:
+    latitude: "/{group}/land_ice_segments/latitude"
+    longitude: "/{group}/land_ice_segments/longitude"
+  variables:
+    h_li: "/{group}/land_ice_segments/h_li"
+    s_li: "/{group}/land_ice_segments/h_li_sigma"
+
+aggregation:
+  # Nullable source -> pandas carrier (arrow's null_cols guard would raise).
+  handoff: pandas
+  coordinates:
+    cell_ids:
+      dtype: uint64
+      fill_value: 0
+    morton:
+      dtype: uint64
+      fill_value: 0
+  variables:
+    count:
+      function: len
+      source: h_li
+      dtype: int32
+      fill_value: 0
+    h_min:
+      function: min
+      source: h_li
+      dtype: float32
+    h_max:
+      function: max
+      source: h_li
+      dtype: float32
+
+output:
+  grid:
+    type: healpix
+    indexing_scheme: nested
+    parent_order: 6
+    child_order: 12

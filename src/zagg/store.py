@@ -48,6 +48,34 @@ def open_store(
     return LocalStore(Path(path).resolve(), read_only=read_only)
 
 
+def open_object_store(
+    path: str,
+    credentials: dict | None = None,
+    endpoint_url: str | None = None,
+    **kwargs,
+):
+    """Open a raw obstore store for small side-channel objects (issue #151).
+
+    Unlike :func:`open_store` (which wraps the backend in a Zarr ``Store``),
+    this returns the bare obstore store for plain byte get/put of non-Zarr
+    objects -- e.g. the per-shard async result JSON a Lambda worker writes next
+    to the output store for the orchestrator to poll. Path forms and credential
+    handling match ``open_store``; a local directory is created if absent.
+    """
+    if path.startswith("s3://"):
+        return _s3_object_store(
+            path,
+            credentials=credentials,
+            endpoint_url=endpoint_url,
+            **kwargs,
+        )
+    from obstore.store import LocalStore as ObstoreLocalStore
+
+    local = Path(path).resolve()
+    local.mkdir(parents=True, exist_ok=True)
+    return ObstoreLocalStore(local)
+
+
 def _open_s3_store(
     path: str,
     read_only: bool = False,
@@ -64,15 +92,77 @@ def _open_s3_store(
     path-style addressing is enabled (so dotted bucket names and
     S3-compatible endpoints work over TLS).
     """
-    from obstore.store import S3Store
     from zarr.storage import ObjectStore
+
+    s3 = _s3_object_store(path, credentials=credentials, endpoint_url=endpoint_url, **kwargs)
+    return ObjectStore(store=s3, read_only=read_only)
+
+
+def _s3_object_store(
+    path: str,
+    credentials: dict | None = None,
+    endpoint_url: str | None = None,
+    **kwargs,
+):
+    """Build the raw obstore ``S3Store`` for ``path`` (credential rules above)."""
+    from obstore.store import S3Store
 
     bucket, prefix = parse_s3_path(path)
     region = kwargs.pop("region", "us-west-2")
 
-    opts = s3_store_options(credentials=credentials, endpoint_url=endpoint_url, region=region)
-    s3 = S3Store(bucket, prefix=prefix, **opts, **kwargs)
-    return ObjectStore(store=s3, read_only=read_only)
+    if credentials or endpoint_url:
+        opts = {
+            "bucket": bucket,
+            "prefix": prefix,
+            "region": region,
+            # Path-style addressing: required for dotted bucket names (TLS) and
+            # for non-AWS S3-compatible endpoints.
+            "virtual_hosted_style_request": False,
+        }
+        if credentials:
+            opts["access_key_id"] = credentials["accessKeyId"]
+            opts["secret_access_key"] = credentials["secretAccessKey"]
+            if credentials.get("sessionToken"):
+                opts["session_token"] = credentials["sessionToken"]
+        if endpoint_url:
+            opts["endpoint"] = endpoint_url
+        s3 = S3Store(**opts, **kwargs)
+    else:
+        from obstore.auth.boto3 import Boto3CredentialProvider
+
+        s3 = S3Store(
+            bucket,
+            prefix=prefix,
+            region=region,
+            credential_provider=Boto3CredentialProvider(),
+            **kwargs,
+        )
+    return s3
+
+
+def parse_s3_path(path: str) -> tuple[str, str]:
+    """Parse an ``s3://bucket/prefix`` path into bucket and prefix.
+
+    Parameters
+    ----------
+    path : str
+        S3 URI (must start with ``s3://``).
+
+    Returns
+    -------
+    tuple of (bucket, prefix)
+
+    Raises
+    ------
+    ValueError
+        If path does not start with ``s3://``.
+    """
+    if not path.startswith("s3://"):
+        raise ValueError(f"Not an S3 path: {path}")
+    parts = path[5:].split("/", 1)
+    bucket = parts[0]
+    prefix = parts[1] if len(parts) > 1 else ""
+    return bucket, prefix
 
 
 def s3_store_options(
@@ -110,29 +200,4 @@ def s3_store_options(
     return opts
 
 
-def parse_s3_path(path: str) -> tuple[str, str]:
-    """Parse an ``s3://bucket/prefix`` path into bucket and prefix.
-
-    Parameters
-    ----------
-    path : str
-        S3 URI (must start with ``s3://``).
-
-    Returns
-    -------
-    tuple of (bucket, prefix)
-
-    Raises
-    ------
-    ValueError
-        If path does not start with ``s3://``.
-    """
-    if not path.startswith("s3://"):
-        raise ValueError(f"Not an S3 path: {path}")
-    parts = path[5:].split("/", 1)
-    bucket = parts[0]
-    prefix = parts[1] if len(parts) > 1 else ""
-    return bucket, prefix
-
-
-__all__ = ["open_store", "parse_s3_path", "s3_store_options"]
+__all__ = ["open_object_store", "open_store", "parse_s3_path", "s3_store_options"]

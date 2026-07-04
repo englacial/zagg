@@ -16,6 +16,7 @@ import logging
 import os
 import statistics
 import time
+import uuid
 import warnings
 from concurrent.futures import ThreadPoolExecutor
 
@@ -31,6 +32,7 @@ from zagg.config import (
     PipelineConfig,
     get_child_order,
     get_driver,
+    get_handoff,
     get_layout,
     get_output_endpoint_url,
     get_output_region,
@@ -55,7 +57,7 @@ from zagg.processing import (
     write_shard_to_zarr,
 )
 from zagg.processing.write import _block_index_key
-from zagg.store import open_store
+from zagg.store import open_object_store, open_store
 
 logger = logging.getLogger(__name__)
 
@@ -87,9 +89,10 @@ def agg(
     region: str = "us-west-2",
     output_credentials: dict | None = None,
     output_endpoint_url: str | None = None,
-    handoff: str = "arrow",
+    handoff: str | None = None,
     profile: bool = False,
     max_retries: int = 3,
+    invocation: str = "async",
     events=None,
 ) -> dict:
     """Run the aggregation pipeline.
@@ -134,15 +137,18 @@ def agg(
     output_endpoint_url : str, optional
         Custom S3-compatible endpoint for the output store (e.g. R2, MinIO).
         Overrides ``output.endpoint_url`` in the config.
-    handoff : str
-        Per-cell aggregation carrier: ``"arrow"`` (default, an ``arro3.core``
-        carrier) or ``"pandas"``. Both produce byte-for-byte identical scalar outputs
-        (#30); ``"arrow"`` is the default because it is faster and lighter on dense
-        shards (issue #130). Honored by both the ``"local"`` and ``"lambda"``
-        backends: the lambda backend forwards it into each cell event, and an
-        explicit ``"pandas"`` keeps that event payload byte-identical (no key).
-        pyarrow is not used on either path; the experimental ``arrow-kernel``
-        reducer was dropped with pyarrow.
+    handoff : str, optional
+        Per-cell aggregation carrier: ``"arrow"`` (an ``arro3.core`` carrier) or
+        ``"pandas"``. Both produce byte-for-byte identical scalar outputs (#30);
+        ``"arrow"`` is faster and lighter on dense shards (issue #130). Default
+        ``None`` reads the carrier from the config (``aggregation.handoff``, itself
+        defaulting to ``"arrow"`` — issue #132) via :func:`get_handoff`; an explicit
+        kwarg overrides the config, mirroring the ``driver`` precedence. Honored by
+        both the ``"local"`` and ``"lambda"`` backends: the lambda backend forwards
+        a non-default carrier into each cell event, and an absent key keeps that
+        event payload byte-identical (the worker then derives the carrier from the
+        forwarded config). pyarrow is not used on either path; the experimental
+        ``arrow-kernel`` reducer was dropped with pyarrow.
     profile : bool
         Opt-in per-phase timing (issue #100). When ``True`` (lambda backend),
         forwards ``profile`` into each cell event so the worker emits a
@@ -156,6 +162,21 @@ def agg(
         exception) are never retried regardless. Default ``3``. Ignored by the
         ``"local"`` backend. Set to ``1`` (e.g. the CI benchmark) to measure one
         clean invocation and record a failure as a failure.
+    invocation : str
+        Lambda-only (issue #151). ``"async"`` (default) dispatches each cell
+        with ``InvocationType="Event"`` and polls a per-shard result object the
+        worker writes next to the output store
+        (``<store>.status/<run_id>/<shard_key>.json``), so no synchronous
+        connection sits idle while the shard runs -- shards longer than a NAT
+        idle window (~4 min on GitHub-hosted runners) complete reliably, and
+        the 6 MB synchronous response cap no longer applies. Requires (a) a
+        deployed worker that honors the ``result_url`` event key and (b) the
+        caller to have read access to the output bucket for the poll. Note the
+        async request payload cap is 256 KB (vs 6 MB synchronous); pass
+        ``"sync"`` for older deployed workers or extreme per-cell payloads
+        (granule-dense shards with large AOI masks). Ignored by the
+        ``"local"`` backend.
+
     events : iterable, optional
         Temporal pipeline only (``pipeline.type: temporal``/``event``): an
         iterable of ``(event_key, event_mask, collections, static_data)`` tuples
@@ -163,7 +184,6 @@ def agg(
         the spatial path. Until the Phase-6/7 event reader + catalog land, the
         caller supplies events directly (e.g. from a notebook), which is enough
         to run a temporal config end-to-end on the local backend.
-
     Returns
     -------
     dict
@@ -193,6 +213,7 @@ def agg(
         handoff=handoff,
         profile=profile,
         max_retries=max_retries,
+        invocation=invocation,
         events=events,
     )
 
@@ -226,6 +247,7 @@ class SpatialStrategy:
         handoff,
         profile=False,
         max_retries=3,
+        invocation="async",
         events=None,
     ):
         # Resolve catalog and store
@@ -243,6 +265,10 @@ class SpatialStrategy:
 
         # Resolve driver: kwarg > config > default
         resolved_driver = driver or get_driver(config)
+
+        # Resolve carrier: explicit kwarg > config (aggregation.handoff > "arrow").
+        # Mirrors the driver precedence above (issue #132).
+        resolved_handoff = handoff if handoff is not None else get_handoff(config)
 
         # Output endpoint/region are non-secret: runtime kwarg > config.
         resolved_endpoint = output_endpoint_url or get_output_endpoint_url(config)
@@ -278,7 +304,7 @@ class SpatialStrategy:
                 driver=resolved_driver,
                 output_credentials=output_credentials,
                 output_endpoint_url=resolved_endpoint,
-                handoff=handoff,
+                handoff=resolved_handoff,
             )
         elif backend == "lambda":
             if max_workers is None:
@@ -286,6 +312,8 @@ class SpatialStrategy:
             max_workers = min(max_workers, n_cells)
             if not store_path.startswith("s3://"):
                 raise ValueError(f"Lambda backend requires s3:// store path, got: {store_path}")
+            if invocation not in ("async", "sync"):
+                raise ValueError(f"Unknown invocation: {invocation!r} (expected 'async' or 'sync')")
             if function_name is None:
                 function_name = os.environ.get("ZAGG_LAMBDA_FUNCTION_NAME", "process-shard")
             return _run_lambda(
@@ -302,9 +330,10 @@ class SpatialStrategy:
                 function_name=function_name,
                 output_credentials=output_credentials,
                 output_endpoint_url=resolved_endpoint,
-                handoff=handoff,
+                handoff=resolved_handoff,
                 profile=profile,
                 max_retries=max_retries,
+                invocation=invocation,
             )
         else:
             raise ValueError(f"Unknown backend: {backend!r} (expected 'local' or 'lambda')")
@@ -342,6 +371,7 @@ class TemporalStrategy:
         handoff,
         profile=False,
         max_retries=3,
+        invocation="async",
         events=None,
     ):
         from zagg.temporal import process_event, specs_from_config
@@ -581,6 +611,19 @@ def _select_cells(
     return pairs
 
 
+def _aoi_payload_map(catalog_data: dict) -> dict:
+    """Map ``shard_key -> AOI mask payload`` from a loaded manifest (issue #101).
+
+    Returns ``{}`` when the manifest has no ``aoi_mask`` list (the flag was off at
+    build), so the worker appends no mask column and outputs are byte-identical.
+    The ``aoi_mask`` list is parallel to ``shard_keys``.
+    """
+    aoi = catalog_data.get("aoi_mask")
+    if not aoi:
+        return {}
+    return {int(k): payload for k, payload in zip(catalog_data["shard_keys"], aoi)}
+
+
 def _dry_run_summary(cells: list[tuple], store_path: str) -> dict:
     """Return summary without processing.
 
@@ -634,7 +677,16 @@ def _check_signature(grid, catalog_data: dict) -> None:
 
 
 def _process_and_write(
-    shard_key, chunk_idx, records, grid, s3_creds, zarr_store, config, driver=None, handoff="arrow"
+    shard_key,
+    chunk_idx,
+    records,
+    grid,
+    s3_creds,
+    zarr_store,
+    config,
+    driver=None,
+    handoff="arrow",
+    aoi_payload=None,
 ):
     """Process a single shard and write its K finer chunks to the store.
 
@@ -647,7 +699,28 @@ def _process_and_write(
     byte-for-byte the single-chunk path. ``chunk_idx`` is retained for the K==1
     callers/signature but the per-chunk block index from ``iter_chunks`` is used.
     """
-    chunk_results: list = []
+    # K==1 vs K>1 is fixed by the grid, not the materialized list (issue #91): at
+    # K==1 the lone chunk IS the shard so its CSR subgroup is keyed by ``shard_key``;
+    # at K>1 each finer chunk is keyed by its own block index. Deriving it from the
+    # grid lets the non-sharded path stream (no materialized count needed).
+    single_chunk = int(getattr(grid, "chunks_per_shard", 1)) == 1
+
+    def _write_chunk(block_index, carrier, ragged):
+        # write_dataframe_to_zarr no-ops on an empty carrier (DataFrame or Arrow
+        # table), so no carrier-specific emptiness check is needed here.
+        write_dataframe_to_zarr(carrier, zarr_store, grid=grid, chunk_idx=block_index)
+        # Persist this chunk's ragged (CSR) fields — one CSR group per field per
+        # chunk (issue #48). No-ops when ``ragged`` is empty.
+        ragged_key = int(shard_key) if single_chunk else _block_index_key(block_index, grid)
+        write_ragged_to_zarr(ragged, zarr_store, grid=grid, shard_key=ragged_key)
+
+    # Sharded output (issue #108): the shard's K inner chunks bundle into one
+    # ShardingCodec shard object — write the whole shard in one block selection per
+    # dense array (a per-inner-chunk loop would read-modify-write the shard object).
+    # That path needs all K at once, so it accumulates via ``chunk_results``; the
+    # non-sharded path streams each chunk write-then-free via ``write_chunk`` (#91).
+    sharded = getattr(grid, "sharded", False)
+    chunk_results: list | None = [] if sharded else None
     _df_out, metadata = process_shard(
         grid,
         int(shard_key),
@@ -657,35 +730,11 @@ def _process_and_write(
         driver=driver,
         handoff=handoff,
         chunk_results=chunk_results,
+        aoi_payload=aoi_payload,
+        write_chunk=None if sharded else _write_chunk,
     )
-    # Sharded output (issue #108): the shard's K inner chunks bundle into one
-    # ShardingCodec shard object — write the whole shard in one block selection per
-    # dense array (a per-inner-chunk loop would read-modify-write the shard object).
-    if getattr(grid, "sharded", False):
+    if sharded:
         write_shard_to_zarr(chunk_results, zarr_store, grid=grid, shard_key=int(shard_key))
-        return metadata
-    single_chunk = len(chunk_results) == 1
-    for block_index, carrier, ragged in chunk_results:
-        # write_dataframe_to_zarr no-ops on an empty carrier (DataFrame or Arrow
-        # table), so no carrier-specific emptiness check is needed here.
-        write_dataframe_to_zarr(
-            carrier,
-            zarr_store,
-            grid=grid,
-            chunk_idx=block_index,
-        )
-        # Persist this chunk's ragged (CSR) fields — one CSR group per field per
-        # chunk (issue #48). At K==1 the chunk IS the shard, so the CSR subgroup is
-        # keyed by ``shard_key`` (the phase-4b cell-resolution contract); at K>1
-        # each finer chunk is keyed by its own block index so the K groups stay
-        # distinct. No-ops when ``ragged`` is empty.
-        ragged_key = int(shard_key) if single_chunk else _block_index_key(block_index, grid)
-        write_ragged_to_zarr(
-            ragged,
-            zarr_store,
-            grid=grid,
-            shard_key=ragged_key,
-        )
     return metadata
 
 
@@ -718,6 +767,10 @@ def _run_local(
     all_shards = list(catalog_data["shard_keys"])
 
     cells = _select_cells(catalog_data, morton_cell=morton_cell, max_cells=max_cells)
+    # Strict-AOI per-shard mask payload (issue #101), keyed by shard for the
+    # per-cell lookup. Empty dict when the manifest carries no ``aoi_mask`` (flag
+    # off) — the worker then appends no column and outputs stay byte-identical.
+    aoi_by_shard = _aoi_payload_map(catalog_data)
     logger.info(
         f"Processing {len(cells)} of {len(all_shards)} cells (local, {max_workers} workers, driver={driver})"
     )
@@ -757,6 +810,12 @@ def _run_local(
     # error path nothing is appended to ``results``, matching the old behavior.
     def _cell_work(payload):
         shard_key, records = payload
+        # Only thread aoi_payload when the manifest actually carries a mask (flag
+        # on); otherwise omit the kwarg entirely so the flag-off call is identical
+        # to the pre-feature signature.
+        extra = {}
+        if aoi_by_shard:
+            extra["aoi_payload"] = aoi_by_shard.get(int(shard_key))
         try:
             meta = _process_and_write(
                 shard_key,
@@ -768,6 +827,7 @@ def _run_local(
                 config,
                 driver=driver,
                 handoff=handoff,
+                **extra,
             )
             return {"shard_key": shard_key, "ok": True, "meta": meta}
         except Exception as e:
@@ -847,6 +907,7 @@ def _run_lambda(
     handoff="arrow",
     profile=False,
     max_retries=3,
+    invocation="async",
 ):
     """Run processing via AWS Lambda invocation.
 
@@ -865,6 +926,11 @@ def _run_lambda(
     from botocore.config import Config
 
     all_shards = list(catalog_data["shard_keys"])
+    # Strict-AOI per-shard mask payload (issue #101), keyed by shard for the
+    # per-cell event. Empty dict when the manifest carries no ``aoi_mask`` (flag
+    # off) — the per-cell invoke then omits the ``aoi_payload`` event key, so the
+    # event payload and the worker's outputs stay byte-identical.
+    aoi_by_shard = _aoi_payload_map(catalog_data)
     grid_type = config.output.get("grid", {}).get("type", "healpix")
     parent_order = get_parent_order(config) if grid_type == "healpix" else None
 
@@ -902,6 +968,19 @@ def _run_lambda(
         output_endpoint_url,
         region,
     )
+
+    # Async result channel (issue #151): a per-run unique status prefix next to
+    # the output store. Each worker mirrors its response envelope to
+    # <prefix>/<shard_key>.json and the dispatch threads poll for it instead of
+    # holding a synchronous invoke connection open -- GitHub-hosted runners sit
+    # behind a ~4 min NAT idle timeout that severed every >250 s benchmark
+    # target. The run_id keeps reruns into the same store from reading stale
+    # results. ``invocation="sync"`` skips the channel (legacy RequestResponse).
+    result_prefix = None
+    result_box: dict = {}
+    if invocation == "async":
+        result_prefix = f"{store_path.rstrip('/')}.status/{uuid.uuid4().hex}"
+        logger.info(f"Async worker results at {result_prefix}")
 
     # The dispatch lambda_client is built inside preflight() (once the probe
     # has clamped the worker count, which sizes its connection pool), so the
@@ -943,6 +1022,9 @@ def _run_lambda(
             region_name=region,
             config=boto_config,
         )
+        # Read the function Timeout once, pre-fan-out: the async poll deadline
+        # is keyed to it (issue #151), and the summary reports it (#100).
+        state["function_timeout_s"] = _get_function_timeout_s(state["lambda_client"], function_name)
         return PreflightReport(workers=clamped, detail=concurrency_report)
 
     # Per-cell invoke, bound to everything but the (shard_key, records) pair so
@@ -950,6 +1032,23 @@ def _run_lambda(
     # inline ``executor.submit(_invoke_lambda_cell, ...)`` passed.
     def _cell_work(payload):
         shard_key, records = payload
+        # Only thread aoi_payload when the manifest carries a mask (flag on);
+        # otherwise omit the kwarg so the event payload is byte-identical to the
+        # pre-feature path (issue #101). Mirrors the local runner's _cell_work.
+        extra = {}
+        if aoi_by_shard:
+            extra["aoi_payload"] = aoi_by_shard.get(int(shard_key))
+        # Async dispatch (issue #151): where the worker writes this shard's
+        # result, how to poll for it, and how long before giving up (function
+        # timeout + queue/write margin). Sync runs pass none of these, keeping
+        # the invoke byte-identical to the legacy path.
+        if result_prefix is not None:
+            key = f"{int(shard_key)}.json"
+            extra["result_url"] = f"{result_prefix}/{key}"
+            extra["result_fetch"] = _result_fetcher(
+                result_box, result_prefix, output_creds_event, region, key
+            )
+            extra["poll_timeout_s"] = state["function_timeout_s"] + _ASYNC_POLL_MARGIN_S
         return _invoke_lambda_cell(
             state["lambda_client"],
             grid.block_index(int(shard_key)),
@@ -966,6 +1065,7 @@ def _run_lambda(
             max_workers=state["workers"],
             handoff=handoff,
             profile=profile,
+            **extra,
         )
 
     executor = LambdaExecutor(
@@ -1063,7 +1163,7 @@ def _run_lambda(
     # the billed per-cell durations plus the max's share of the function
     # Timeout -- the safety margin that flags a skewed shardmap (one fat cell
     # dominating wall time). Raw material already lives in report.results.
-    function_timeout_s = _get_function_timeout_s(state.get("lambda_client"), function_name)
+    function_timeout_s = state.get("function_timeout_s", _DEFAULT_FUNCTION_TIMEOUT_S)
     durations = [r["lambda_duration"] for r in report.results if r.get("lambda_duration")]
     if durations:
         worker_max_s = max(durations)
@@ -1233,6 +1333,133 @@ def _log_concurrency_report(report: ConcurrencyReport, max_workers: int) -> None
 # deployment/aws/template.yaml (Timeout Default: 720).
 _DEFAULT_FUNCTION_TIMEOUT_S = 720
 
+# Async-dispatch polling (issue #151). The poll deadline is the function
+# Timeout plus this margin (async queue latency + the worker's result write);
+# past it the worker either timed out, was OOM-killed, or crashed before
+# writing -- all deterministic, so the shard is recorded failed, not retried.
+# The interval keeps a full 1700-worker fan-out to ~a few hundred S3 GETs/s.
+_ASYNC_POLL_MARGIN_S = 90.0
+_ASYNC_POLL_INTERVAL_S = 5.0
+
+# Async (Event) invoke requests cap at 256 KB (vs 6 MB synchronous). Budget a
+# little under it so the dispatch pre-flight fails with a remedy before
+# Lambda's raw RequestEntityTooLargeException does; the realistic trigger is a
+# large strict-AOI ``aoi_payload`` (issue #101).
+_ASYNC_PAYLOAD_CAP_BYTES = 250 * 1024
+
+
+def _result_fetcher(box, prefix, output_creds_event, region, key):
+    """Zero-arg fetch closure for one shard's async result object (#151).
+
+    The obstore store is built lazily on the first poll and shared across all
+    cells via ``box`` (a plain dict; a benign first-poll race just builds it
+    twice), so runs whose dispatch is fully mocked (tests) never touch
+    obstore/S3. Credential resolution mirrors the worker's
+    ``_output_store_kwargs``: the explicit output-credentials block when
+    supplied, else the ambient chain.
+    """
+
+    def fetch():
+        store = box.get("store")
+        if store is None:
+            kwargs = {"region": region}
+            if output_creds_event:
+                kwargs["region"] = output_creds_event.get("region", region)
+                kwargs["credentials"] = output_creds_event
+                if output_creds_event.get("endpointUrl"):
+                    kwargs["endpoint_url"] = output_creds_event["endpointUrl"]
+            store = open_object_store(prefix, **kwargs)
+            box["store"] = store
+        return _fetch_result(store, key)
+
+    return fetch
+
+
+def _fetch_result(result_store, key):
+    """Read one worker-written result envelope; None while it hasn't landed."""
+    import obstore
+    from obstore.exceptions import NotFoundError
+
+    try:
+        data = obstore.get(result_store, key).bytes()
+    except (FileNotFoundError, NotFoundError):
+        return None
+    return json.loads(bytes(data))
+
+
+def _poll_lambda_result(
+    result_fetch,
+    shard_key,
+    granule_count,
+    wall_start,
+    retries,
+    poll_timeout_s,
+    poll_interval_s=_ASYNC_POLL_INTERVAL_S,
+):
+    """Poll for one async invoke's worker-written result object (issue #151).
+
+    Returns the same result-dict shape as the synchronous path so the dispatch
+    accumulator and summary are unchanged. A result missing at the deadline
+    means the worker timed out, was OOM-killed, or crashed before its write --
+    deterministic outcomes, so (like sync FunctionErrors, #119) it is recorded
+    as the shard's failure rather than re-invoked.
+    """
+    if poll_timeout_s is None:
+        poll_timeout_s = _DEFAULT_FUNCTION_TIMEOUT_S + _ASYNC_POLL_MARGIN_S
+    deadline = wall_start + poll_timeout_s
+    fetch_error = None
+    while True:
+        # A fetch fault (S3 blip, throttled GET) must NOT escape into the
+        # invoke retry classifier -- re-dispatching a still-running shard
+        # duplicates work and cost. Treat it as a miss and keep polling; a
+        # *persistent* fault (e.g. missing s3:GetObject) surfaces in the
+        # deadline error below instead of masquerading as a worker crash.
+        try:
+            result = result_fetch()
+            fetch_error = None
+        except Exception as e:
+            fetch_error = e
+            result = None
+        if result is not None:
+            try:
+                body = json.loads(result.get("body", "{}"))
+            except (json.JSONDecodeError, TypeError):
+                body = {}
+            return {
+                "shard_key": shard_key,
+                "status_code": result.get("statusCode"),
+                "body": body,
+                "wall_time": time.time() - wall_start,
+                "lambda_duration": body.get("duration_s", 0),
+                "error": body.get("error"),
+                "retries": retries,
+                "timeout": False,
+                "granule_count": granule_count,
+            }
+        if time.time() >= deadline:
+            cause = (
+                f"result fetch failing: {fetch_error}"
+                if fetch_error is not None
+                else (
+                    "worker timed out, was OOM-killed, or crashed before "
+                    "writing its result (check CloudWatch) -- or the deployed "
+                    "worker predates result_url support: redeploy the "
+                    'function, or pass invocation="sync"'
+                )
+            )
+            return {
+                "shard_key": shard_key,
+                "status_code": None,
+                "body": {},
+                "wall_time": time.time() - wall_start,
+                "lambda_duration": 0,
+                "error": f"no worker result within {poll_timeout_s:.0f}s ({cause})",
+                "retries": retries,
+                "granule_count": granule_count,
+            }
+        # Sub-second jitter de-synchronizes the fan-out's poll bursts.
+        time.sleep(poll_interval_s + (time.time() % 1))
+
 
 def _get_function_timeout_s(lambda_client, function_name):
     """Read the function's configured Timeout (seconds), once.
@@ -1321,6 +1548,10 @@ def _invoke_lambda_cell(
     max_workers=None,
     handoff="arrow",
     profile=False,
+    aoi_payload=None,
+    result_url=None,
+    result_fetch=None,
+    poll_timeout_s=None,
 ):
     """Invoke Lambda for a single cell with retry logic.
 
@@ -1328,9 +1559,20 @@ def _invoke_lambda_cell(
     (#28); it does not affect dispatch. ``profile`` (issue #100) forwards a
     ``"profile": true`` event key so the worker emits ``phase_timings``; when
     False the event payload is byte-identical to the pre-profile path (no key).
+    ``aoi_payload`` (issue #101) forwards the per-shard strict-AOI mask payload
+    (a compact MOC for HEALPix / in-AOI cell ids for rect) under the
+    ``"aoi_payload"`` event key so the worker expands the ``aoi_mask`` column;
+    when ``None`` (flag off) the key is omitted and the payload stays identical.
     ``handoff`` (issue #130) forwards a ``"handoff"`` event key selecting the
     worker's carrier; the default ``"arrow"`` adds the key, while an explicit
     ``"pandas"`` omits it, keeping that event byte-identical to the pre-handoff path.
+    ``result_url`` (issue #151) switches the invoke to fire-and-forget
+    (``InvocationType="Event"``): the worker mirrors its response envelope to
+    that object and ``result_fetch`` (a zero-arg callable returning the parsed
+    envelope, or None while absent) polls for it until ``poll_timeout_s``. No
+    connection sits idle while the shard runs, so long shards survive NAT idle
+    timeouts (GitHub-hosted runners sever synchronous invokes at ~4 min). When
+    ``None`` (legacy sync path) the invoke is byte-identical to before.
     """
     wall_start = time.time()
 
@@ -1357,10 +1599,33 @@ def _invoke_lambda_cell(
     # Only add the key when profiling, so default runs stay byte-identical (#100).
     if profile:
         event["profile"] = True
+    # Only add the AOI key when the flag is on; flag-off runs stay byte-identical
+    # to the pre-feature event (issue #101).
+    if aoi_payload is not None:
+        event["aoi_payload"] = aoi_payload
     # Add the key for the arrow carrier (the default); an explicit pandas run omits
     # it, staying byte-identical to the pre-handoff path (#130).
     if handoff and handoff != "pandas":
         event["handoff"] = handoff
+    # Async dispatch (issue #151): tell the worker where to mirror its response
+    # envelope and fire-and-forget. Absent -> the legacy synchronous invoke.
+    invocation_type = "RequestResponse"
+    if result_url is not None:
+        event["result_url"] = result_url
+        invocation_type = "Event"
+
+    # json.dumps is ASCII by default, so len() is the request byte size. Gate
+    # async payloads against the 256 KB Event cap with a remedy, up front,
+    # rather than letting every attempt fail on Lambda's raw
+    # RequestEntityTooLargeException (issue #151).
+    payload = json.dumps(event)
+    if invocation_type == "Event" and len(payload) > _ASYNC_PAYLOAD_CAP_BYTES:
+        raise ValueError(
+            f"cell {shard_key} event payload is {len(payload):,} bytes, over the "
+            f"{_ASYNC_PAYLOAD_CAP_BYTES:,}-byte async dispatch budget (Lambda caps "
+            'Event invokes at 256 KB): pass invocation="sync" for this run, or '
+            "shrink the per-cell payload (e.g. the strict-AOI aoi_payload)"
+        )
 
     last_error = None
     for attempt in range(max_retries):
@@ -1370,9 +1635,20 @@ def _invoke_lambda_cell(
             # cross-account callers. The tail data was unused anyway.
             response = lambda_client.invoke(
                 FunctionName=function_name,
-                InvocationType="RequestResponse",
-                Payload=json.dumps(event),
+                InvocationType=invocation_type,
+                Payload=payload,
             )
+            if result_url is not None:
+                # 202 accepted -- an Event invoke returns no payload; the
+                # worker's envelope lands at result_url instead. Poll for it.
+                return _poll_lambda_result(
+                    result_fetch,
+                    shard_key,
+                    len(granule_urls),
+                    wall_start,
+                    attempt,
+                    poll_timeout_s,
+                )
 
             function_error = response.get("FunctionError")
             is_timeout = False

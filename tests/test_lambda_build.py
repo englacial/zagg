@@ -152,6 +152,62 @@ class TestLambdaHandlerSyntax:
         compile(invoker.read_text(), str(invoker), "exec")
 
 
+class TestTemplateEnvironment:
+    """The CloudFormation template must wire the glibc allocator tunables (#143).
+
+    Set as Lambda ``Environment`` variables (they take effect at libc init, so a
+    runtime ``mallopt``/``malloc_trim`` from Python is not enough), driven by
+    CloudFormation Parameters so they stay tunable without a template edit.
+    """
+
+    @staticmethod
+    def _load_template():
+        import yaml
+
+        class _CfnLoader(yaml.SafeLoader):
+            pass
+
+        def _cfn_multi(loader, tag_suffix, node):
+            # Treat CloudFormation short-form intrinsics (!Ref, !Sub, !GetAtt,
+            # !If, ...) as generic {TagSuffix: value} mappings so PyYAML can
+            # parse the template without choking on the unknown tags.
+            if isinstance(node, yaml.ScalarNode):
+                return {tag_suffix: loader.construct_scalar(node)}
+            if isinstance(node, yaml.SequenceNode):
+                return {tag_suffix: loader.construct_sequence(node)}
+            return {tag_suffix: loader.construct_mapping(node)}
+
+        _CfnLoader.add_multi_constructor("!", _cfn_multi)
+        template = REPO_ROOT / "deployment" / "aws" / "template.yaml"
+        return yaml.load(template.read_text(), Loader=_CfnLoader)
+
+    def test_process_fn_carries_malloc_tunables(self):
+        tpl = self._load_template()
+        env = tpl["Resources"]["ProcessFn"]["Properties"]["Environment"]["Variables"]
+        assert env["MALLOC_ARENA_MAX"] == {"Ref": "MallocArenaMax"}
+        assert env["MALLOC_TRIM_THRESHOLD_"] == {"Ref": "MallocTrimThreshold"}
+
+    def test_malloc_parameters_have_expected_defaults(self):
+        params = self._load_template()["Parameters"]
+        assert params["MallocArenaMax"]["Default"] == "2"
+        assert params["MallocTrimThreshold"]["Default"] == "0"
+
+    def test_async_event_invoke_config_pins_retries(self):
+        # issue #151: the runner's async dispatch relies on service retries
+        # being 0 (a re-run of a deterministic failure re-fails at extra cost
+        # and can write into a store the caller has moved on from) and on the
+        # event age staying UNDER the runner's poll margin, so no first
+        # delivery can start after the runner stops listening (a late run
+        # would write into the store post-finalize).
+        from zagg.runner import _ASYNC_POLL_MARGIN_S
+
+        props = self._load_template()["Resources"]["ProcessFnAsyncConfig"]["Properties"]
+        assert props["FunctionName"] == {"Ref": "ProcessFn"}
+        assert props["MaximumRetryAttempts"] == 0
+        assert props["MaximumEventAgeInSeconds"] == 60  # API minimum
+        assert props["MaximumEventAgeInSeconds"] < _ASYNC_POLL_MARGIN_S
+
+
 class TestPackageConsistency:
     """Verify dependency specifications are consistent across build scripts."""
 

@@ -8,10 +8,11 @@
 # there is a single source of truth for the notebook dependencies (pyproject.toml).
 #
 # Only PyPI/conda-forge resolvable packages appear here: no ``git+`` URLs and no
-# spherely fork. The three Binder-runnable notebooks
-# (custom_aggregations, rasterized_zarr, jupyterhub_example) read the public,
-# anonymous source.coop store or synthetic data, so the exact-S2 spherely
-# SpatialIndex backend is never on their import path.
+# spherely fork. The Binder-runnable notebooks read synthetic data, the public
+# anonymous source.coop store, or anonymous CMR-STAC granule *metadata*
+# (jupyterhub_example, shardmap_viewer) -- all of which use the default HEALPix
+# ``mortie`` backend, so the exact-S2 spherely SpatialIndex backend is never on
+# their import path.
 name: zagg-binder
 channels:
   - conda-forge

@@ -371,7 +371,7 @@ class TestInvokeLambdaCellEvent:
 
     _CREDS = {"accessKeyId": "a", "secretAccessKey": "s", "sessionToken": "t"}
 
-    def _captured_event(self, *, child_order, profile=False, handoff="pandas"):
+    def _captured_event(self, *, child_order, profile=False, aoi_payload=None, handoff="pandas"):
         from unittest.mock import MagicMock
 
         from zagg.runner import _invoke_lambda_cell
@@ -394,8 +394,9 @@ class TestInvokeLambdaCellEvent:
             function_name="process-shard",
             config_dict=None,
             max_workers=4,
-            handoff=handoff,
             profile=profile,
+            aoi_payload=aoi_payload,
+            handoff=handoff,
         )
         return json.loads(client.invoke.call_args.kwargs["Payload"])
 
@@ -424,6 +425,18 @@ class TestInvokeLambdaCellEvent:
         event = self._captured_event(child_order=12, profile=False)
         assert "profile" not in event
 
+    def test_aoi_payload_adds_event_key(self):
+        # issue #101: a flag-on Lambda run forwards the per-shard mask payload
+        # under the "aoi_payload" event key for the worker to expand.
+        event = self._captured_event(child_order=12, aoi_payload=[1, 2, 3])
+        assert event["aoi_payload"] == [1, 2, 3]
+
+    def test_default_event_has_no_aoi_payload_key(self):
+        # Default (flag off): no "aoi_payload" key, so the event stays
+        # byte-identical to the pre-feature path (issue #101).
+        event = self._captured_event(child_order=12)
+        assert "aoi_payload" not in event
+
     def test_handoff_adds_event_key(self):
         # issue #130: a non-default handoff forwards "handoff" into the event so
         # the deployed worker selects the arro3 arrow carrier. (The runner forwards
@@ -450,9 +463,17 @@ class TestInvokeLambdaCellRetry:
         from zagg.runner import _invoke_lambda_cell
 
         return _invoke_lambda_cell(
-            client, (0,), 12345, 6, 12,
-            ["s3://b/g.h5"], "s3://out/x.zarr", self._CREDS,
-            function_name="process-shard", config_dict=None, max_workers=4,
+            client,
+            (0,),
+            12345,
+            6,
+            12,
+            ["s3://b/g.h5"],
+            "s3://out/x.zarr",
+            self._CREDS,
+            function_name="process-shard",
+            config_dict=None,
+            max_workers=4,
             max_retries=max_retries,
         )
 
@@ -550,6 +571,230 @@ class TestInvokeLambdaCellRetry:
         assert result["error"] == "AccessDeniedException"
 
 
+class TestInvokeLambdaCellAsync:
+    """Async dispatch (issue #151): ``result_url`` switches the invoke to
+    ``InvocationType="Event"`` and the result comes from polling the
+    worker-written envelope instead of the (discarded) response payload."""
+
+    _CREDS = {"accessKeyId": "a", "secretAccessKey": "s", "sessionToken": "t"}
+
+    def _invoke(self, client, result_fetch, *, max_retries=3, poll_timeout_s=10.0):
+        from zagg.runner import _invoke_lambda_cell
+
+        return _invoke_lambda_cell(
+            client,
+            (0,),
+            12345,
+            6,
+            12,
+            ["s3://b/g.h5"],
+            "s3://out/x.zarr",
+            self._CREDS,
+            function_name="process-shard",
+            config_dict=None,
+            max_workers=4,
+            max_retries=max_retries,
+            result_url="s3://out/x.zarr.status/run1/12345.json",
+            result_fetch=result_fetch,
+            poll_timeout_s=poll_timeout_s,
+        )
+
+    @staticmethod
+    def _envelope(body):
+        return {"statusCode": 200, "body": json.dumps(body)}
+
+    def test_event_invoke_carries_result_url(self):
+        from unittest.mock import MagicMock
+
+        client = MagicMock()
+        client.invoke.return_value = {"StatusCode": 202}
+        self._invoke(client, lambda: self._envelope({"total_obs": 1, "duration_s": 1.0}))
+        kwargs = client.invoke.call_args.kwargs
+        assert kwargs["InvocationType"] == "Event"
+        event = json.loads(kwargs["Payload"])
+        assert event["result_url"] == "s3://out/x.zarr.status/run1/12345.json"
+
+    def test_result_envelope_maps_to_sync_result_shape(self):
+        from unittest.mock import MagicMock
+
+        client = MagicMock()
+        client.invoke.return_value = {"StatusCode": 202}
+        result = self._invoke(
+            client,
+            lambda: self._envelope({"total_obs": 7, "duration_s": 3.5, "max_memory_mb": 800.0}),
+        )
+        assert result["status_code"] == 200
+        assert result["body"]["total_obs"] == 7
+        assert result["lambda_duration"] == 3.5
+        assert result["error"] is None
+        assert result["timeout"] is False
+        assert result["retries"] == 0
+        assert result["granule_count"] == 1
+
+    def test_polls_until_result_lands(self, monkeypatch):
+        from unittest.mock import MagicMock
+
+        import zagg.runner as runner
+
+        sleeps = []
+        monkeypatch.setattr(runner.time, "sleep", lambda s: sleeps.append(s))
+        client = MagicMock()
+        client.invoke.return_value = {"StatusCode": 202}
+        fetch = MagicMock(
+            side_effect=[None, None, self._envelope({"total_obs": 1, "duration_s": 1.0})]
+        )
+        result = self._invoke(client, fetch)
+        assert fetch.call_count == 3
+        assert len(sleeps) == 2  # slept between the misses
+        assert result["status_code"] == 200
+
+    def test_missing_result_at_deadline_records_error_without_retry(self):
+        from unittest.mock import MagicMock
+
+        client = MagicMock()
+        client.invoke.return_value = {"StatusCode": 202}
+        # poll_timeout_s=0 -> the first miss is already past the deadline.
+        result = self._invoke(client, lambda: None, max_retries=5, poll_timeout_s=0.0)
+        # One Event invoke, no re-invoke: a missing result is deterministic
+        # (worker timeout / OOM / crash), mirroring the sync FunctionError rule.
+        assert client.invoke.call_count == 1
+        assert result["status_code"] is None
+        assert "no worker result within" in result["error"]
+        # Self-diagnosing against a deployed worker that predates result_url
+        # support: the error names the remedies (redeploy / invocation="sync").
+        assert "predates result_url support" in result["error"]
+        assert 'invocation="sync"' in result["error"]
+
+    def test_worker_error_envelope_surfaces_body_error(self):
+        from unittest.mock import MagicMock
+
+        client = MagicMock()
+        client.invoke.return_value = {"StatusCode": 202}
+        result = self._invoke(
+            client,
+            lambda: {"statusCode": 500, "body": json.dumps({"error": "Failed to write zarr"})},
+        )
+        assert result["status_code"] == 500
+        assert result["error"] == "Failed to write zarr"
+
+    def test_fetch_fault_is_contained_not_reinvoked(self):
+        # A poll-side fault (S3 blip / missing s3:GetObject) must never escape
+        # into the invoke retry classifier -- that would re-dispatch a shard
+        # that is still running. It's treated as a miss; at the deadline the
+        # persistent cause is surfaced instead of a phantom "worker crash".
+        from unittest.mock import MagicMock
+
+        client = MagicMock()
+        client.invoke.return_value = {"StatusCode": 202}
+
+        def denied():
+            raise Exception("PermissionDenied: s3:GetObject")
+
+        result = self._invoke(client, denied, max_retries=5, poll_timeout_s=0.0)
+        assert client.invoke.call_count == 1  # never re-dispatched
+        assert "no worker result within" in result["error"]
+        assert "PermissionDenied" in result["error"]
+
+    def test_transient_dispatch_error_still_retried(self, monkeypatch):
+        from unittest.mock import MagicMock
+
+        import zagg.runner as runner
+
+        sleeps = []
+        monkeypatch.setattr(runner.time, "sleep", lambda s: sleeps.append(s))
+        client = MagicMock()
+        client.invoke.side_effect = [
+            Exception("TooManyRequestsException: Rate exceeded"),
+            {"StatusCode": 202},
+        ]
+        result = self._invoke(client, lambda: self._envelope({"total_obs": 1, "duration_s": 1.0}))
+        # The throttled *dispatch* is transient and retried; the poll then runs.
+        assert client.invoke.call_count == 2
+        assert result["status_code"] == 200
+        assert result["retries"] == 1
+
+    def test_oversized_async_payload_raises_before_dispatch(self):
+        # Event invokes cap at 256 KB (vs 6 MB sync); the pre-flight fails with
+        # a remedy instead of surfacing Lambda's raw
+        # RequestEntityTooLargeException. Realistic trigger: a large strict-AOI
+        # aoi_payload (issue #101).
+        from unittest.mock import MagicMock
+
+        from zagg.runner import _ASYNC_PAYLOAD_CAP_BYTES, _invoke_lambda_cell
+
+        client = MagicMock()
+        big_aoi = list(range(_ASYNC_PAYLOAD_CAP_BYTES // 4))  # >250 KB serialized
+        with pytest.raises(ValueError, match='pass invocation="sync"'):
+            _invoke_lambda_cell(
+                client,
+                (0,),
+                12345,
+                6,
+                12,
+                ["s3://b/g.h5"],
+                "s3://out/x.zarr",
+                self._CREDS,
+                function_name="process-shard",
+                config_dict=None,
+                max_workers=4,
+                aoi_payload=big_aoi,
+                result_url="s3://out/x.zarr.status/run1/12345.json",
+                result_fetch=lambda: None,
+                poll_timeout_s=10.0,
+            )
+        client.invoke.assert_not_called()
+
+    def test_oversized_payload_allowed_on_sync_path(self):
+        # The same event is fine synchronously (6 MB request cap) -- the gate
+        # applies only to Event dispatch, so invocation="sync" is a real remedy.
+        from unittest.mock import MagicMock
+
+        from zagg.runner import _ASYNC_PAYLOAD_CAP_BYTES, _invoke_lambda_cell
+
+        payload = MagicMock()
+        payload.read.return_value = json.dumps(
+            {"statusCode": 200, "body": json.dumps({"total_obs": 0, "duration_s": 0.0})}
+        ).encode()
+        client = MagicMock()
+        client.invoke.return_value = {"Payload": payload, "FunctionError": None}
+        big_aoi = list(range(_ASYNC_PAYLOAD_CAP_BYTES // 4))
+        result = _invoke_lambda_cell(
+            client,
+            (0,),
+            12345,
+            6,
+            12,
+            ["s3://b/g.h5"],
+            "s3://out/x.zarr",
+            self._CREDS,
+            function_name="process-shard",
+            config_dict=None,
+            max_workers=4,
+            aoi_payload=big_aoi,
+        )
+        assert client.invoke.call_count == 1
+        assert result["status_code"] == 200
+
+
+class TestResultFetcher:
+    """The lazy per-run result store + fetch closure (issue #151)."""
+
+    def test_fetch_reads_written_envelope_and_none_when_absent(self, tmp_path):
+        import obstore
+
+        from zagg.runner import _result_fetcher
+        from zagg.store import open_object_store
+
+        prefix = str(tmp_path / "x.zarr.status" / "run1")
+        box: dict = {}
+        fetch = _result_fetcher(box, prefix, None, "us-west-2", "12345.json")
+        assert fetch() is None  # nothing written yet
+        writer = open_object_store(prefix)
+        obstore.put(writer, "12345.json", json.dumps({"statusCode": 200, "body": "{}"}).encode())
+        assert fetch() == {"statusCode": 200, "body": "{}"}
+        assert "store" in box  # built lazily, cached for subsequent cells
+
+
 class TestMaxRetriesPassthrough:
     """`agg(max_retries=...)` threads the per-cell retry budget down to
     ``_invoke_lambda_cell`` on the lambda backend (#119), default 3."""
@@ -563,32 +808,51 @@ class TestMaxRetriesPassthrough:
 
         captured = {}
 
-        monkeypatch.setattr(runner, "get_nsidc_s3_credentials",
-                            lambda: {"accessKeyId": "a", "secretAccessKey": "s",
-                                     "sessionToken": "t"})
+        monkeypatch.setattr(
+            runner,
+            "get_nsidc_s3_credentials",
+            lambda: {"accessKeyId": "a", "secretAccessKey": "s", "sessionToken": "t"},
+        )
         monkeypatch.setattr(grids_mod, "from_config", lambda *a, **k: _stub_grid())
         monkeypatch.setattr(runner, "_invoke_lambda_setup", lambda *a, **k: None)
         monkeypatch.setattr(runner, "_invoke_lambda_finalize", lambda *a, **k: None)
         monkeypatch.setattr(runner, "_get_function_timeout_s", lambda *a, **k: 720)
         from unittest.mock import MagicMock
+
         monkeypatch.setattr(boto3, "Session", lambda *a, **k: MagicMock())
         monkeypatch.setattr(
-            runner, "compute_available_workers",
+            runner,
+            "compute_available_workers",
             lambda requested, *a, **k: (
                 1,
-                ConcurrencyReport(account_limit=1000, current_concurrent=0,
-                                  padding=100, available=900, function_reserved=None),
+                ConcurrencyReport(
+                    account_limit=1000,
+                    current_concurrent=0,
+                    padding=100,
+                    available=900,
+                    function_reserved=None,
+                ),
             ),
         )
 
         def _fake_cell(*a, **k):
             captured["max_retries"] = k.get("max_retries")
-            return {"status_code": 200, "body": {"total_obs": 1}, "error": None,
-                    "lambda_duration": 1.0, "shard_key": 0}
+            return {
+                "status_code": 200,
+                "body": {"total_obs": 1},
+                "error": None,
+                "lambda_duration": 1.0,
+                "shard_key": 0,
+            }
 
         monkeypatch.setattr(runner, "_invoke_lambda_cell", _fake_cell)
-        agg(atl06_config, catalog=catalog_file, store="s3://out/x.zarr",
-            backend="lambda", **agg_kwargs)
+        agg(
+            atl06_config,
+            catalog=catalog_file,
+            store="s3://out/x.zarr",
+            backend="lambda",
+            **agg_kwargs,
+        )
         return captured
 
     def test_max_retries_threaded_end_to_end(self, monkeypatch, atl06_config, catalog_file):
@@ -598,6 +862,99 @@ class TestMaxRetriesPassthrough:
     def test_default_max_retries_is_three(self, monkeypatch, atl06_config, catalog_file):
         captured = self._drive(monkeypatch, atl06_config, catalog_file)
         assert captured["max_retries"] == 3
+
+
+class TestInvocationPassthrough:
+    """`agg(invocation=...)` selects async (default) vs legacy sync dispatch
+    (issue #151); async threads the per-shard result channel into the cell
+    invoke. Same mocked drive as ``TestMaxRetriesPassthrough``."""
+
+    def _drive(self, monkeypatch, atl06_config, catalog_file, **agg_kwargs):
+        from unittest.mock import MagicMock
+
+        import boto3
+
+        import zagg.grids as grids_mod
+        from zagg import runner
+        from zagg.concurrency import ConcurrencyReport
+
+        captured = {}
+
+        monkeypatch.setattr(
+            runner,
+            "get_nsidc_s3_credentials",
+            lambda: {"accessKeyId": "a", "secretAccessKey": "s", "sessionToken": "t"},
+        )
+        monkeypatch.setattr(grids_mod, "from_config", lambda *a, **k: _stub_grid())
+        monkeypatch.setattr(runner, "_invoke_lambda_setup", lambda *a, **k: None)
+        monkeypatch.setattr(runner, "_invoke_lambda_finalize", lambda *a, **k: None)
+        monkeypatch.setattr(runner, "_get_function_timeout_s", lambda *a, **k: 720)
+        monkeypatch.setattr(boto3, "Session", lambda *a, **k: MagicMock())
+        monkeypatch.setattr(
+            runner,
+            "compute_available_workers",
+            lambda requested, *a, **k: (
+                1,
+                ConcurrencyReport(
+                    account_limit=1000,
+                    current_concurrent=0,
+                    padding=100,
+                    available=900,
+                    function_reserved=None,
+                ),
+            ),
+        )
+
+        def _fake_cell(*a, **k):
+            captured.update(
+                result_url=k.get("result_url"),
+                result_fetch=k.get("result_fetch"),
+                poll_timeout_s=k.get("poll_timeout_s"),
+            )
+            return {
+                "status_code": 200,
+                "body": {"total_obs": 1},
+                "error": None,
+                "lambda_duration": 1.0,
+                "shard_key": 0,
+            }
+
+        monkeypatch.setattr(runner, "_invoke_lambda_cell", _fake_cell)
+        agg(
+            atl06_config,
+            catalog=catalog_file,
+            store="s3://out/x.zarr",
+            backend="lambda",
+            **agg_kwargs,
+        )
+        return captured
+
+    def test_default_async_threads_result_channel(self, monkeypatch, atl06_config, catalog_file):
+        captured = self._drive(monkeypatch, atl06_config, catalog_file)
+        # <store>.status/<run_id>/<shard_key>.json, run_id unique per run.
+        assert captured["result_url"].startswith("s3://out/x.zarr.status/")
+        assert captured["result_url"].endswith(".json")
+        assert callable(captured["result_fetch"])
+        # _drive pins the function timeout at 720 -> deadline 720 + margin.
+        from zagg.runner import _ASYNC_POLL_MARGIN_S
+
+        assert captured["poll_timeout_s"] == 720 + _ASYNC_POLL_MARGIN_S
+
+    def test_sync_invocation_omits_result_channel(self, monkeypatch, atl06_config, catalog_file):
+        captured = self._drive(monkeypatch, atl06_config, catalog_file, invocation="sync")
+        assert captured["result_url"] is None
+        assert captured["result_fetch"] is None
+        assert captured["poll_timeout_s"] is None
+
+    def test_unknown_invocation_raises(self, atl06_config, catalog_file):
+        with pytest.raises(ValueError, match="Unknown invocation"):
+            agg(
+                atl06_config,
+                catalog=catalog_file,
+                store="s3://out/x.zarr",
+                backend="lambda",
+                invocation="poll",
+            )
 
 
 class TestHandoffPassthrough:
@@ -653,6 +1010,90 @@ class TestHandoffPassthrough:
             driver="s3",
         )
         assert captured["handoff"] == "arrow"
+
+
+class TestProcessAndWriteStreaming:
+    """Issue #91: the non-sharded ``_process_and_write`` streams each chunk through a
+    ``write_chunk`` callback (no ``chunk_results`` accumulation). Drive a fake
+    ``process_shard`` that streams 1 and K>1 chunks through the callback and assert
+    the dense ``chunk_idx`` sequence + ragged keying (shard_key at K=1, block-index
+    key at K>1) — the runner-level analogue of the lambda streaming test."""
+
+    def _run(self, monkeypatch, atl06_config, *, chunks_per_shard, chunks):
+        from unittest.mock import MagicMock
+
+        import pandas as pd
+
+        from zagg import runner
+
+        cap = {"dense": [], "ragged": [], "write_chunk": None, "chunk_results": None}
+
+        def fake_process_shard(grid, shard_key, urls, **kwargs):
+            cap["write_chunk"] = kwargs.get("write_chunk")
+            cap["chunk_results"] = kwargs.get("chunk_results")
+            for block_index, carrier, ragged in chunks:
+                kwargs["write_chunk"](block_index, carrier, ragged)
+            return pd.DataFrame(), {"shard_key": shard_key, "error": None}
+
+        grid = MagicMock()
+        grid.sharded = False
+        grid.chunks_per_shard = chunks_per_shard
+        grid.chunk_grid_shape = (4,)
+
+        monkeypatch.setattr(runner, "process_shard", fake_process_shard)
+        monkeypatch.setattr(
+            runner,
+            "write_dataframe_to_zarr",
+            lambda c, st, *, grid, chunk_idx: cap["dense"].append(chunk_idx),
+        )
+        monkeypatch.setattr(
+            runner,
+            "write_ragged_to_zarr",
+            lambda r, st, *, grid, shard_key: cap["ragged"].append(shard_key),
+        )
+        # _block_index_key on a 1-D grid is block_index[0].
+        monkeypatch.setattr(runner, "_block_index_key", lambda b, g: int(b[0]))
+        runner._process_and_write(
+            5,
+            (5,),
+            [_rec(1)],
+            grid=grid,
+            s3_creds={},
+            zarr_store=None,
+            config=atl06_config,
+            driver="s3",
+        )
+        return cap
+
+    def test_k1_streams_ragged_keyed_by_shard_key(self, monkeypatch, atl06_config):
+        import pandas as pd
+
+        cap = self._run(
+            monkeypatch,
+            atl06_config,
+            chunks_per_shard=1,
+            chunks=[((5,), pd.DataFrame(), {"h": ([], [])})],
+        )
+        # Streaming seam wired: callback passed, no accumulation sink.
+        assert callable(cap["write_chunk"]) and cap["chunk_results"] is None
+        assert cap["dense"] == [(5,)]
+        assert cap["ragged"] == [5]  # K=1 -> keyed by shard_key
+
+    def test_k_gt_1_streams_ragged_keyed_by_block_index(self, monkeypatch, atl06_config):
+        import pandas as pd
+
+        cap = self._run(
+            monkeypatch,
+            atl06_config,
+            chunks_per_shard=3,
+            chunks=[
+                ((0,), pd.DataFrame(), {}),
+                ((1,), pd.DataFrame(), {"h": ([], [])}),
+                ((2,), pd.DataFrame(), {}),
+            ],
+        )
+        assert cap["dense"] == [(0,), (1,), (2,)]
+        assert cap["ragged"] == [0, 1, 2]  # K>1 -> keyed by _block_index_key
 
 
 def _stub_grid():
@@ -772,6 +1213,151 @@ class TestSummaryKeysByteIdentical:
         assert summary["cells_error"] == 1
         assert summary["total_obs"] == 14
         assert len(summary["results"]) == 3  # raised cell excluded
+
+    def test_local_threads_aoi_payload(self, monkeypatch, atl06_config):
+        # When the manifest carries an aoi_mask list, _run_local threads each
+        # shard's payload into _process_and_write; when it doesn't, the kwarg is
+        # omitted entirely so the flag-off call is unchanged (issue #101).
+        import zagg.grids as grids_mod
+        from zagg import runner
+
+        monkeypatch.setattr(
+            runner,
+            "get_nsidc_s3_credentials",
+            lambda: {"accessKeyId": "a", "secretAccessKey": "s", "sessionToken": "t"},
+        )
+        monkeypatch.setattr(grids_mod, "from_config", lambda *a, **k: _stub_grid())
+        monkeypatch.setattr(runner, "open_store", lambda *a, **k: object())
+        monkeypatch.setattr(runner, "consolidate_metadata", lambda *a, **k: None)
+
+        seen = {}
+
+        def fake_paw(shard_key, chunk_idx, records, grid, s3_creds, zarr_store, config, **kw):
+            seen[int(shard_key)] = kw.get("aoi_payload", "OMITTED")
+            return {"shard_key": shard_key, "total_obs": 1, "error": None}
+
+        monkeypatch.setattr(runner, "_process_and_write", fake_paw)
+
+        cat = _run_catalog()
+        cat["aoi_mask"] = [[1, 2], [3], [], [4, 5]]  # parallel to shard_keys
+        runner._run_local(
+            atl06_config,
+            cat,
+            "./out.zarr",
+            12,
+            max_cells=None,
+            morton_cell=None,
+            max_workers=1,
+            overwrite=False,
+            dry_run=False,
+            region="us-west-2",
+        )
+        assert seen[10] == [1, 2]
+        assert seen[13] == [4, 5]
+
+        # No aoi_mask key -> kwarg omitted (legacy signature preserved).
+        seen.clear()
+        runner._run_local(
+            atl06_config,
+            _run_catalog(),
+            "./out.zarr",
+            12,
+            max_cells=None,
+            morton_cell=None,
+            max_workers=1,
+            overwrite=False,
+            dry_run=False,
+            region="us-west-2",
+        )
+        assert all(v == "OMITTED" for v in seen.values())
+
+    def test_lambda_threads_aoi_payload(self, monkeypatch, atl06_config):
+        # When the manifest carries an aoi_mask list, _run_lambda threads each
+        # shard's payload into _invoke_lambda_cell; when it doesn't, the kwarg is
+        # omitted so the per-cell invoke is byte-identical to the flag-off path
+        # (issue #101).
+        import boto3
+
+        import zagg.grids as grids_mod
+        from zagg import runner
+        from zagg.concurrency import ConcurrencyReport
+
+        monkeypatch.setattr(
+            runner,
+            "get_nsidc_s3_credentials",
+            lambda: {"accessKeyId": "a", "secretAccessKey": "s", "sessionToken": "t"},
+        )
+        monkeypatch.setattr(grids_mod, "from_config", lambda *a, **k: _stub_grid())
+        monkeypatch.setattr(runner, "_invoke_lambda_setup", lambda *a, **k: None)
+        monkeypatch.setattr(runner, "_invoke_lambda_finalize", lambda *a, **k: None)
+        monkeypatch.setattr(runner, "_get_function_timeout_s", lambda *a, **k: 720)
+        from unittest.mock import MagicMock
+
+        monkeypatch.setattr(boto3, "Session", lambda *a, **k: MagicMock())
+        monkeypatch.setattr(
+            runner,
+            "compute_available_workers",
+            lambda requested, *a, **k: (
+                4,
+                ConcurrencyReport(
+                    account_limit=1000,
+                    current_concurrent=0,
+                    padding=100,
+                    available=900,
+                    function_reserved=None,
+                ),
+            ),
+        )
+
+        seen = {}
+
+        def fake_cell(client, chunk_idx, shard_key, *a, **kw):
+            seen[int(shard_key)] = kw.get("aoi_payload", "OMITTED")
+            return {
+                "shard_key": shard_key,
+                "status_code": 200,
+                "body": {"total_obs": 1},
+                "error": None,
+                "timeout": False,
+            }
+
+        monkeypatch.setattr(runner, "_invoke_lambda_cell", fake_cell)
+
+        atl06_config.output = {**atl06_config.output, "aoi_mask": True}
+        cat = _run_catalog()
+        cat["aoi_mask"] = [[1, 2], [3], [], [4, 5]]  # parallel to shard_keys
+        runner._run_lambda(
+            atl06_config,
+            cat,
+            "s3://out/x.zarr",
+            12,
+            max_cells=None,
+            morton_cell=None,
+            max_workers=1,
+            overwrite=False,
+            dry_run=False,
+            region="us-west-2",
+            function_name="fn",
+        )
+        assert seen[10] == [1, 2]
+        assert seen[13] == [4, 5]
+
+        # No aoi_mask key -> kwarg omitted (legacy event preserved).
+        seen.clear()
+        runner._run_lambda(
+            atl06_config,
+            _run_catalog(),
+            "s3://out/x.zarr",
+            12,
+            max_cells=None,
+            morton_cell=None,
+            max_workers=1,
+            overwrite=False,
+            dry_run=False,
+            region="us-west-2",
+            function_name="fn",
+        )
+        assert all(v == "OMITTED" for v in seen.values())
 
     def test_lambda_summary_keys_and_cost(self, monkeypatch, atl06_config):
         import boto3
@@ -1230,21 +1816,30 @@ def _run_lambda_with_durations(
     from zagg import runner
     from zagg.concurrency import ConcurrencyReport
 
-    monkeypatch.setattr(runner, "get_nsidc_s3_credentials",
-                        lambda: {"accessKeyId": "a", "secretAccessKey": "s",
-                                 "sessionToken": "t"})
+    monkeypatch.setattr(
+        runner,
+        "get_nsidc_s3_credentials",
+        lambda: {"accessKeyId": "a", "secretAccessKey": "s", "sessionToken": "t"},
+    )
     monkeypatch.setattr(grids_mod, "from_config", lambda *a, **k: _stub_grid())
     monkeypatch.setattr(runner, "_invoke_lambda_setup", lambda *a, **k: None)
     monkeypatch.setattr(runner, "_invoke_lambda_finalize", lambda *a, **k: None)
     monkeypatch.setattr(runner, "_get_function_timeout_s", lambda *a, **k: timeout)
     from unittest.mock import MagicMock
+
     monkeypatch.setattr(boto3, "Session", lambda *a, **k: MagicMock())
     monkeypatch.setattr(
-        runner, "compute_available_workers",
+        runner,
+        "compute_available_workers",
         lambda requested, *a, **k: (
             1,  # 1 worker -> deterministic completion order for the iter()
-            ConcurrencyReport(account_limit=1000, current_concurrent=0,
-                              padding=100, available=900, function_reserved=None),
+            ConcurrencyReport(
+                account_limit=1000,
+                current_concurrent=0,
+                padding=100,
+                available=900,
+                function_reserved=None,
+            ),
         ),
     )
     it = iter(durations)
@@ -1256,14 +1851,27 @@ def _run_lambda_with_durations(
             body["phase_timings"] = phase_timings
         if mem_it is not None:
             body["max_memory_mb"] = next(mem_it)
-        return {"status_code": 200, "body": body, "error": None,
-                "lambda_duration": next(it), "shard_key": 0}
+        return {
+            "status_code": 200,
+            "body": body,
+            "error": None,
+            "lambda_duration": next(it),
+            "shard_key": 0,
+        }
 
     monkeypatch.setattr(runner, "_invoke_lambda_cell", _fake_cell)
     return runner._run_lambda(
-        atl06_config, _run_catalog(), "s3://out/x.zarr", 12,
-        max_cells=None, morton_cell=None, max_workers=1700, overwrite=False,
-        dry_run=False, region="us-west-2", function_name="process-shard",
+        atl06_config,
+        _run_catalog(),
+        "s3://out/x.zarr",
+        12,
+        max_cells=None,
+        morton_cell=None,
+        max_workers=1700,
+        overwrite=False,
+        dry_run=False,
+        region="us-west-2",
+        function_name="process-shard",
         profile=profile,
     )
 
@@ -1276,9 +1884,7 @@ class TestWorkerRuntimeStats:
         import statistics
 
         durations = [10.0, 20.0, 30.0, 100.0]
-        summary = _run_lambda_with_durations(
-            monkeypatch, atl06_config, durations, timeout=720
-        )
+        summary = _run_lambda_with_durations(monkeypatch, atl06_config, durations, timeout=720)
         assert summary["function_timeout_s"] == 720
         assert summary["worker_max_s"] == 100.0
         assert summary["worker_median_s"] == statistics.median(durations)
@@ -1294,9 +1900,7 @@ class TestWorkerRuntimeStats:
 
     def test_empty_durations_degrade_to_none(self, monkeypatch, atl06_config):
         # All cells report zero/falsy lambda_duration -> no distribution.
-        summary = _run_lambda_with_durations(
-            monkeypatch, atl06_config, [0, 0, 0, 0], timeout=720
-        )
+        summary = _run_lambda_with_durations(monkeypatch, atl06_config, [0, 0, 0, 0], timeout=720)
         assert summary["worker_max_s"] is None
         assert summary["worker_median_s"] is None
         assert summary["worker_pstdev_s"] is None
@@ -1305,9 +1909,7 @@ class TestWorkerRuntimeStats:
         assert summary["function_timeout_s"] == 720
 
     def test_orchestrator_brackets_present_and_nonnegative(self, monkeypatch, atl06_config):
-        summary = _run_lambda_with_durations(
-            monkeypatch, atl06_config, [1.0, 2.0, 3.0, 4.0]
-        )
+        summary = _run_lambda_with_durations(monkeypatch, atl06_config, [1.0, 2.0, 3.0, 4.0])
         for key in ("setup_s", "fanout_s", "finalize_s"):
             assert key in summary
             assert summary[key] >= 0.0
@@ -1328,9 +1930,7 @@ class TestWorkerMemory:
 
     def test_max_memory_none_when_unreported(self, monkeypatch, atl06_config):
         # No worker stamped memory (e.g. an older deployed layer) -> null, not 0.
-        summary = _run_lambda_with_durations(
-            monkeypatch, atl06_config, [1.0, 2.0, 3.0, 4.0]
-        )
+        summary = _run_lambda_with_durations(monkeypatch, atl06_config, [1.0, 2.0, 3.0, 4.0])
         assert summary["max_memory_mb"] is None
 
 
@@ -1383,17 +1983,18 @@ class TestProfilePlumbing:
     set, the per-cell ``phase_timings`` roll up into ``worker_phase_max``."""
 
     def test_default_run_omits_worker_phase_max(self, monkeypatch, atl06_config):
-        summary = _run_lambda_with_durations(
-            monkeypatch, atl06_config, [1.0, 2.0, 3.0, 4.0]
-        )
+        summary = _run_lambda_with_durations(monkeypatch, atl06_config, [1.0, 2.0, 3.0, 4.0])
         assert "worker_phase_max" not in summary
 
     def test_profile_run_rolls_up_phase_max(self, monkeypatch, atl06_config):
         # Every cell reports the same phase_timings; the rollup is the per-phase
         # max across cells.
         summary = _run_lambda_with_durations(
-            monkeypatch, atl06_config, [1.0, 2.0, 3.0, 4.0],
-            profile=True, phase_timings={"read": 5.0, "index": 1.0, "aggregate": 2.0},
+            monkeypatch,
+            atl06_config,
+            [1.0, 2.0, 3.0, 4.0],
+            profile=True,
+            phase_timings={"read": 5.0, "index": 1.0, "aggregate": 2.0},
         )
         assert summary["worker_phase_max"] == {"read": 5.0, "index": 1.0, "aggregate": 2.0}
 
@@ -1417,8 +2018,11 @@ class TestProfilePlumbing:
         monkeypatch.setattr(runner, "_load_catalog", lambda p: _run_catalog())
         monkeypatch.setattr(runner, "_run_lambda", fake_run_lambda)
         runner.agg(
-            atl06_config, catalog="ignored", store="s3://out/x.zarr",
-            backend="lambda", profile=True,
+            atl06_config,
+            catalog="ignored",
+            store="s3://out/x.zarr",
+            backend="lambda",
+            profile=True,
         )
         assert captured["profile"] is True
 
@@ -1428,7 +2032,8 @@ class TestProfilePlumbing:
         captured = {}
         monkeypatch.setattr(runner, "_load_catalog", lambda p: _run_catalog())
         monkeypatch.setattr(
-            runner, "_run_lambda",
+            runner,
+            "_run_lambda",
             lambda *a, **k: captured.update(profile=k.get("profile")) or {},
         )
         runner.agg(atl06_config, catalog="ignored", store="s3://out/x.zarr", backend="lambda")
@@ -1441,27 +2046,87 @@ class TestProfilePlumbing:
         captured = {}
         monkeypatch.setattr(runner, "_load_catalog", lambda p: _run_catalog())
         monkeypatch.setattr(
-            runner, "_run_lambda",
+            runner,
+            "_run_lambda",
             lambda *a, **k: captured.update(handoff=k.get("handoff")) or {},
         )
         runner.agg(
-            atl06_config, catalog="ignored", store="s3://out/x.zarr",
-            backend="lambda", handoff="arrow",
+            atl06_config,
+            catalog="ignored",
+            store="s3://out/x.zarr",
+            backend="lambda",
+            handoff="arrow",
         )
         assert captured["handoff"] == "arrow"
 
     def test_agg_default_handoff_is_arrow_on_lambda(self, monkeypatch, atl06_config):
-        # issue #130: agg() defaults to the arro3/arrow carrier on the lambda backend.
+        # issue #132: with no kwarg and no config field, agg() resolves the carrier
+        # from get_handoff(config), which defaults to arrow.
         from zagg import runner
 
         captured = {}
         monkeypatch.setattr(runner, "_load_catalog", lambda p: _run_catalog())
         monkeypatch.setattr(
-            runner, "_run_lambda",
+            runner,
+            "_run_lambda",
             lambda *a, **k: captured.update(handoff=k.get("handoff")) or {},
         )
         runner.agg(atl06_config, catalog="ignored", store="s3://out/x.zarr", backend="lambda")
         assert captured["handoff"] == "arrow"
+
+    def test_agg_reads_handoff_from_config(self, monkeypatch, atl06_config):
+        # issue #132: with no kwarg, the carrier comes from aggregation.handoff so a
+        # nullable-source pipeline can declare pandas in its YAML.
+        from zagg import runner
+
+        atl06_config.aggregation["handoff"] = "pandas"
+        captured = {}
+        monkeypatch.setattr(runner, "_load_catalog", lambda p: _run_catalog())
+        monkeypatch.setattr(
+            runner,
+            "_run_lambda",
+            lambda *a, **k: captured.update(handoff=k.get("handoff")) or {},
+        )
+        runner.agg(atl06_config, catalog="ignored", store="s3://out/x.zarr", backend="lambda")
+        assert captured["handoff"] == "pandas"
+
+    def test_agg_handoff_kwarg_overrides_config(self, monkeypatch, atl06_config):
+        # issue #132: an explicit handoff= kwarg wins over aggregation.handoff,
+        # mirroring the driver precedence.
+        from zagg import runner
+
+        atl06_config.aggregation["handoff"] = "pandas"
+        captured = {}
+        monkeypatch.setattr(runner, "_load_catalog", lambda p: _run_catalog())
+        monkeypatch.setattr(
+            runner,
+            "_run_lambda",
+            lambda *a, **k: captured.update(handoff=k.get("handoff")) or {},
+        )
+        runner.agg(
+            atl06_config,
+            catalog="ignored",
+            store="s3://out/x.zarr",
+            backend="lambda",
+            handoff="arrow",
+        )
+        assert captured["handoff"] == "arrow"
+
+    def test_agg_reads_handoff_from_config_on_local(self, monkeypatch, atl06_config):
+        # issue #132: the config-derived carrier reaches the local backend too
+        # (resolution is backend-agnostic, before the local/lambda split).
+        from zagg import runner
+
+        atl06_config.aggregation["handoff"] = "pandas"
+        captured = {}
+        monkeypatch.setattr(runner, "_load_catalog", lambda p: _run_catalog())
+        monkeypatch.setattr(
+            runner,
+            "_run_local",
+            lambda *a, **k: captured.update(handoff=k.get("handoff")) or {},
+        )
+        runner.agg(atl06_config, catalog="ignored", store="./out.zarr", backend="local")
+        assert captured["handoff"] == "pandas"
 
 
 class TestWorkerPhaseTimings:
@@ -1474,7 +2139,7 @@ class TestWorkerPhaseTimings:
         from zagg.processing import worker
 
         # Stub the read/group/aggregate seams so process_shard runs without I/O.
-        monkeypatch.setattr(worker._processing, "_make_url_rewriter", lambda d: (lambda u: u))
+        monkeypatch.setattr(worker._processing, "_make_url_rewriter", lambda d: lambda u: u)
 
         class _H5:
             def __init__(self, *a, **k):
@@ -1485,23 +2150,29 @@ class TestWorkerPhaseTimings:
 
         monkeypatch.setattr(worker._processing, "h5coro", type("M", (), {"H5Coro": _H5}))
         monkeypatch.setattr(
-            worker._processing, "_read_group",
-            lambda *a, **k: (object() if with_data else None),
+            worker._processing,
+            "_read_group",
+            lambda *a, **k: object() if with_data else None,
         )
         monkeypatch.setattr(
-            worker, "_concat_and_group",
+            worker,
+            "_concat_and_group",
             lambda reads, grid, handoff: ({"leaf_id": np.array([0])}, {0: slice(0, 1)}, 1),
         )
         monkeypatch.setattr(worker, "_has_vector_fields", lambda config: False)
         monkeypatch.setattr(worker, "_eval_chunk_precompute", lambda config, pooled: {})
         monkeypatch.setattr(worker, "_pool_chunk_columns", lambda *a, **k: {})
         monkeypatch.setattr(
-            worker, "_aggregate_chunk_cells",
+            worker,
+            "_aggregate_chunk_cells",
             lambda *a, **k: ({}, {}, {}, 1),
         )
-        monkeypatch.setattr(worker, "_build_output", lambda *a, **k: __import__("pandas").DataFrame())
+        monkeypatch.setattr(
+            worker, "_build_output", lambda *a, **k: __import__("pandas").DataFrame()
+        )
 
         from unittest.mock import MagicMock
+
         grid = MagicMock()
         grid.chunks_per_shard = 1
         grid.block_index.return_value = (0,)
@@ -1509,10 +2180,16 @@ class TestWorkerPhaseTimings:
         del grid.iter_chunks  # force the K==1 fallback path
 
         from zagg.config import default_config
+
         _df, meta = worker.process_shard(
-            grid, 0, ["s3://b/g.h5"], s3_credentials={"accessKeyId": "a"},
-            config=default_config("atl06"), driver="s3",
-            h5coro_driver=object(), profile=profile,
+            grid,
+            0,
+            ["s3://b/g.h5"],
+            s3_credentials={"accessKeyId": "a"},
+            config=default_config("atl06"),
+            driver="s3",
+            h5coro_driver=object(),
+            profile=profile,
         )
         return meta
 

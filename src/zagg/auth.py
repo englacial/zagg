@@ -12,7 +12,68 @@ Call ONCE in the orchestrator before processing. Credentials are valid
 for approximately 1 hour.
 """
 
+import logging
+import time
+
 import earthaccess
+
+logger = logging.getLogger(__name__)
+
+# ``earthaccess.login()`` makes an HTTPS call to ``urs.earthdata.nasa.gov`` to
+# validate/mint credentials, and that call fails transiently on CI runners -- an
+# IPv6 no-route (``OSError: [Errno 101] Network is unreachable``, addressed at the
+# resolver level in the benchmark workflow, issue #137) or a brief network blip.
+# A bounded retry/backoff lets a genuinely transient failure self-heal instead of
+# taking down the whole run/benchmark on the first attempt (issue #137).
+_LOGIN_MAX_ATTEMPTS = 3
+_LOGIN_BACKOFF_BASE_S = 2.0
+
+
+def _login_with_retry():
+    """Return an authenticated ``earthaccess`` session, retrying transient failures.
+
+    Retries ``earthaccess.login()`` up to ``_LOGIN_MAX_ATTEMPTS`` with exponential
+    backoff (2s, 4s, ...) on ``OSError``. That base class is the whole ``requests``
+    IO/HTTP-error family -- every ``requests.exceptions.RequestException`` subclasses
+    ``IOError``/``OSError`` -- so it covers the bare ``OSError: [Errno 101]`` no-route,
+    ``ConnectionError``, and ``Timeout`` that the login can raise transiently. A
+    genuinely-rejected credential surfaces as ``earthaccess``'s own
+    ``LoginAttemptFailure`` (not an ``OSError``), so it fails fast rather than being
+    retried; and the final attempt's exception propagates unchanged either way.
+    """
+    last_exc: OSError | None = None
+    for attempt in range(1, _LOGIN_MAX_ATTEMPTS + 1):
+        try:
+            return earthaccess.login()
+        except OSError as exc:
+            last_exc = exc
+            if attempt == _LOGIN_MAX_ATTEMPTS:
+                break
+            backoff = _LOGIN_BACKOFF_BASE_S * (2 ** (attempt - 1))
+            logger.warning(
+                "earthaccess.login() failed (attempt %d/%d): %s; retrying in %.0fs",
+                attempt,
+                _LOGIN_MAX_ATTEMPTS,
+                exc,
+                backoff,
+            )
+            time.sleep(backoff)
+    assert last_exc is not None  # loop ran >=1 time and every attempt failed
+    raise last_exc
+
+
+def ensure_logged_in() -> None:
+    """Warm the ``earthaccess`` auth singleton once, up front (issue #137).
+
+    ``earthaccess.login()`` mutates process-global auth/store singletons, so a
+    caller that fans work out across threads (e.g. the parallel benchmark) should
+    authenticate ONCE before the fan-out -- otherwise the concurrent workers race
+    to initialize that shared singleton. Calling this first populates it serially,
+    so the in-worker logins become cheap hits. Uses the same bounded retry as the
+    credential helpers; honors this module's "call once in the orchestrator"
+    contract.
+    """
+    _login_with_retry()
 
 
 def get_edl_token() -> str:
@@ -26,7 +87,7 @@ def get_edl_token() -> str:
     str
         Bearer token string.
     """
-    auth = earthaccess.login()
+    auth = _login_with_retry()
     return auth.token["access_token"]
 
 
@@ -62,5 +123,5 @@ def get_nsidc_s3_credentials() -> dict:
     }
     ```
     """
-    auth = earthaccess.login()
+    auth = _login_with_retry()
     return auth.get_s3_credentials(daac="NSIDC")

@@ -23,7 +23,20 @@ Event payload (default / process mode):
         "endpointUrl": str,     #   endpointUrl, and region are optional.
         "region": str
     },
-    "config": dict (optional, pipeline config as dict)
+    "config": dict (optional, pipeline config as dict),
+    "aoi_payload": list (optional, issue #101) -- this shard's strict-AOI mask
+        payload (a compact MOC for HEALPix / in-AOI cell ids for rectilinear).
+        Forwarded to ``process_shard`` so the worker fills the ``aoi_mask``
+        column; absent when ``output.aoi_mask`` is off (the column is not
+        allocated), keeping the flag-off event and outputs byte-identical.
+    "result_url": str (optional, issue #151) -- where to ALSO write this
+        invocation's response envelope as JSON (e.g.
+        "s3://bucket/out.zarr.status/<run_id>/<shard_key>.json"). Set by the
+        orchestrator's async dispatch (InvocationType="Event", which discards
+        the return value); the orchestrator polls this object instead of
+        holding a synchronous connection open while the shard runs. Written
+        with the output-store credentials. Absent -> no write, and the event
+        and behavior are byte-identical to the synchronous path.
 }
 
 Setup mode (creates the zarr template once before per-cell fan-out):
@@ -44,10 +57,6 @@ Finalize mode (consolidates zarr metadata after all cells complete):
     "store_path": str,
     "output_credentials": dict (optional, same shape as process mode),
 }
-
-Setup and finalize exist so callers without direct S3 write access to the
-output bucket (e.g. cross-account JupyterHub orchestrators) can run the
-full pipeline using only lambda:InvokeFunction.
 
 Process-event mode (the temporal/event pipeline worker -- issue #12, Phase 7b):
 {
@@ -71,20 +80,27 @@ This mirrors the local ``zagg.runner.TemporalStrategy``: load the event's
 collections + static_data, run ``zagg.temporal.process_event`` for one event,
 and write the single flattened result row to the tabular store. One event per
 worker, fanned out the same way per-cell spatial work is.
+
+Setup and finalize exist so callers without direct S3 write access to the
+output bucket (e.g. cross-account JupyterHub orchestrators) can run the
+full pipeline using only lambda:InvokeFunction.
 """
 
+import ctypes
+import gc
 import json
 import logging
 import os
 import resource
+import threading
 import time
-from typing import Any, Dict
+from typing import Any, Dict, Optional
 
 from zarr import open_group
 from zarr.errors import GroupNotFoundError
 
 # Import cloud-agnostic processing
-from zagg.config import load_config_from_dict
+from zagg.config import get_handoff, load_config_from_dict
 from zagg.processing import (
     write_dataframe_to_zarr,
     write_ragged_to_zarr,
@@ -107,6 +123,103 @@ def _max_memory_mb() -> float:
     Memory Used" closely.
     """
     return resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / 1024.0
+
+
+def _read_vmrss_kib() -> Optional[int]:
+    """Current resident set size in KiB from ``/proc/self/status``, or None off Linux.
+
+    ``VmRSS`` is the process's *current* RSS (not a high-water mark), reported in
+    KiB. Returns None when ``/proc/self/status`` is absent/unreadable (macOS/dev),
+    so callers fall back to ``ru_maxrss``.
+    """
+    try:
+        with open("/proc/self/status") as f:
+            for line in f:
+                if line.startswith("VmRSS:"):
+                    return int(line.split()[1])  # "VmRSS:\t   12345 kB"
+    except (OSError, ValueError, IndexError):
+        return None
+    return None
+
+
+class _PeakRSSSampler:
+    """Sample THIS invocation's peak current RSS on a daemon thread (issue #141).
+
+    ``ru_maxrss`` is a per-*process* high-water mark, so on a warm/reused Lambda
+    container it reports the max over every prior invocation, not this one --
+    making ``max_memory_mb`` untrustworthy on warm containers (it can only ever
+    rise, so it also can't reflect #140's teardown reclaim). This polls the
+    *current* RSS (``VmRSS``) at a fixed interval and records the max while it
+    runs, so the reported peak reflects the current invocation. #140's teardown
+    ``malloc_trim`` returns current RSS to ~baseline between invokes, so a warm
+    container starts each invocation low and the sampled peak is clean.
+
+    Off Linux (no ``/proc/self/status``) it degrades to a no-op and ``peak_mb`` is
+    None, so the caller falls back to ``ru_maxrss``. Sampling overhead is one small
+    file read per tick -- negligible next to read/aggregate/write.
+    """
+
+    def __init__(self, interval_s: float = 0.05):
+        self._interval_s = interval_s
+        self._stop = threading.Event()
+        self._thread: Optional[threading.Thread] = None
+        self._peak_kib = 0
+        self._available = _read_vmrss_kib() is not None
+
+    def start(self) -> "_PeakRSSSampler":
+        if self._available:
+            self._thread = threading.Thread(target=self._run, name="peak-rss", daemon=True)
+            self._thread.start()
+        return self
+
+    def stop(self) -> None:
+        self._stop.set()
+        if self._thread is not None:
+            self._thread.join(timeout=1.0)
+
+    def _run(self) -> None:
+        # Sample immediately, then every interval until stopped.
+        while True:
+            cur = _read_vmrss_kib()
+            if cur is not None and cur > self._peak_kib:
+                self._peak_kib = cur
+            if self._stop.wait(self._interval_s):
+                return
+
+    @property
+    def peak_mb(self) -> Optional[float]:
+        """Peak sampled RSS in MB, or None if unavailable (fall back to ru_maxrss)."""
+        if not self._available or self._peak_kib == 0:
+            return None
+        return self._peak_kib / 1024.0
+
+
+def _reclaim_memory() -> None:
+    """Reclaim Python objects at invocation teardown (issues #139, #143).
+
+    Lambda reuses warm containers, so a subsequent invocation on a warm
+    container starts near the *previous* invocation's RSS and can OOM
+    (``Max Memory Used`` is per-container-lifetime). The reliable fix for the
+    glibc-arena retention that drives this is the allocator env vars set on the
+    function itself (``MALLOC_ARENA_MAX``/``MALLOC_TRIM_THRESHOLD_`` in
+    ``template.yaml``, issue #143) -- those take effect at libc init and flatten
+    warm-container growth to ~0. The ``malloc_trim(0)`` below is retained as a
+    harmless secondary: it only trims the top of the main arena, so on its own
+    it does *not* reliably return the retained secondary-arena numpy blocks
+    (hence the env-var fix supersedes it as the primary mechanism), but the
+    ``gc.collect()`` still reclaims unreachable Python objects.
+
+    Called once per invocation (O(heap) -- negligible next to read/aggregate/
+    write) and behavior-neutral: it only frees memory the invocation is done
+    with. Guarded so it is a no-op off glibc (macOS/dev has no ``libc.so.6``,
+    non-glibc libcs may lack ``malloc_trim``) -- it never raises.
+    """
+    gc.collect()
+    try:
+        ctypes.CDLL("libc.so.6").malloc_trim(0)
+    except (OSError, AttributeError):
+        # No glibc (no libc.so.6) or no malloc_trim symbol -- nothing to trim.
+        logger.debug("malloc_trim unavailable; skipping heap reclaim", exc_info=True)
 
 
 def _output_store_kwargs(event: Dict[str, Any]) -> Dict[str, Any]:
@@ -157,7 +270,34 @@ def lambda_handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
         return _handle_finalize(event)
     if mode in ("process_event", "temporal", "event"):
         return _handle_process_event(event)
-    return _handle_process(event, context)
+    response = _handle_process(event, context)
+    # Async result channel (issue #151): on an Event invoke the return value is
+    # discarded, so mirror the response envelope to the orchestrator-supplied
+    # result_url for it to poll. Covers every branch (200 / 400 / 500) because
+    # it wraps the whole process handler.
+    if event.get("result_url"):
+        _write_result(event["result_url"], response, event)
+    return response
+
+
+def _write_result(result_url: str, response: Dict[str, Any], event: Dict[str, Any]) -> None:
+    """Write the response envelope to ``result_url`` as JSON (issue #151).
+
+    Uses the same credentials/endpoint resolution as the output store. Never
+    raises: on failure the orchestrator's poll times out and records the shard
+    as failed, and the cause lands here in CloudWatch.
+    """
+    import obstore
+
+    from zagg.store import open_object_store
+
+    try:
+        prefix, key = result_url.rsplit("/", 1)
+        store = open_object_store(prefix, **_output_store_kwargs(event))
+        obstore.put(store, key, json.dumps(response).encode())
+        logger.info(f"Wrote async result to {result_url}")
+    except Exception as e:
+        logger.error(f"Failed to write async result to {result_url}: {e}")
 
 
 def _handle_setup(event: Dict[str, Any]) -> Dict[str, Any]:
@@ -311,6 +451,11 @@ def _handle_process(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
         )
     )
 
+    # Per-invocation peak-RSS sampler (issue #141): sample current VmRSS on a
+    # daemon thread for the whole invocation so ``max_memory_mb`` reflects THIS
+    # run, not the warm container's lifetime high-water. Stopped in ``finally``.
+    rss_sampler = _PeakRSSSampler().start()
+
     try:
         # Validate required parameters. ``child_order`` is HEALPix-specific and
         # only required once the grid is known to be HEALPix (checked below);
@@ -363,111 +508,158 @@ def _handle_process(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
 
         grid = from_config(config, parent_order=event.get("parent_order"))
 
-        # Process the shard using cloud-agnostic function. A ``chunk_results`` sink
-        # is required for K>1 grids (issue #82 phase 7): ``process_shard`` reads the
-        # granules once and returns one ``(block_index, carrier, ragged)`` per finer
-        # Zarr chunk through the sink. At K==1 the sink holds exactly one entry whose
-        # ``block_index`` equals ``event["chunk_idx"]``, so the write is unchanged.
+        # Process the shard using cloud-agnostic function. A K>1 grid needs a
+        # multi-chunk sink (issue #82 phase 7): ``process_shard`` reads the granules
+        # once and yields one ``(block_index, carrier, ragged)`` per finer Zarr chunk.
+        # The non-sharded path streams each chunk write-then-free via a ``write_chunk``
+        # callback (issue #91) so peak output memory holds ~1 chunk instead of all K;
+        # the sharded path (#108) must bundle all K, so it still accumulates via
+        # ``chunk_results``. At K==1 the lone chunk's ``block_index`` equals
+        # ``event["chunk_idx"]`` and the write is byte-identical either way.
         from zagg.processing import process_shard
 
         # Opt-in per-phase timing (issue #100). When the orchestrator forwards
         # ``profile``, ``process_shard`` fills ``metadata["phase_timings"]`` with
-        # read/index/aggregate deltas; the write phase runs here, so we bracket it
-        # below and merge it in. Default (no key) leaves the worker path unchanged.
+        # read/index/aggregate deltas; the write phase runs in the callback below and
+        # is accumulated into the same sub-dict. Default (no key) leaves it unchanged.
         profile = event.get("profile", False)
-        # Per-cell carrier (issue #130). Absent key -> "pandas", the byte-identical
-        # default worker path; "arrow" opts into the arro3-core read carrier for
-        # benchmarks. (Neither imports pyarrow; pyarrow is not in the layer.)
-        handoff = event.get("handoff", "pandas")
-        chunk_results: list = []
+        # Strict-AOI mask payload (issue #101): when present, process_shard
+        # expands it into the per-cell ``aoi_mask`` column. Absent (flag off) ->
+        # not passed, so the worker call and outputs are byte-identical. Mirrors
+        # the local runner threading aoi_payload through _process_and_write.
+        aoi_payload = event.get("aoi_payload")
+        # Per-cell carrier (issues #130/#132). Wire protocol (A): the orchestrator
+        # injects the ``handoff`` event key only for an explicit non-default
+        # override, so an absent key means "derive from the forwarded config" via
+        # ``get_handoff(config)`` (``aggregation.handoff``, default ``"arrow"``).
+        # This keeps existing event payloads byte-identical while making the config
+        # the single source of truth. (Neither carrier imports pyarrow; pyarrow is
+        # not in the layer.)
+        handoff = event.get("handoff") or get_handoff(config)
+        sharded = getattr(grid, "sharded", False)
+        store_path = event["store_path"]
+        shard_key = event["shard_key"]
+        # K==1 vs K>1 is fixed by the grid, not the chunk count (issue #91), so the
+        # streaming callback can pick the ragged key without a materialized list: at
+        # K==1 the chunk IS the shard (keyed by ``shard_key``); at K>1 each finer
+        # chunk is keyed by its own block index.
+        single_chunk = int(getattr(grid, "chunks_per_shard", 1)) == 1
+
+        # Lazy store + one-time template check, opened on the FIRST chunk write so a
+        # no-data shard (zero chunks) never touches the store, exactly as before. A
+        # missing template or a failed write is RECORDED (not raised) so ``metadata``
+        # from ``process_shard`` survives — the buffered path returned its 500 with
+        # that metadata; folding the error in after the stream preserves that body.
+        store_box: dict = {}
+        write_error: dict = {}
+        _write_elapsed = 0.0
+
+        def _get_store():
+            """Open + template-check once; returns the store, or None if the template
+            is missing (recording the error so the write is skipped)."""
+            if "store" in store_box:
+                return store_box["store"]
+            if write_error:
+                return None
+            store = open_store(store_path, **_output_store_kwargs(event))
+            # Validate the Zarr template exists before writing. ``store`` is a zarr v3
+            # ``Store`` whose ``exists()`` is async, so open the group via the high-level
+            # sync API and catch the missing-node error instead (issue #118), in the same
+            # open-and-catch spirit as ``readers/tdigest_tensor.py``.
+            # ``GroupNotFoundError`` is raised identically on LocalStore and obstore (S3);
+            # a present-but-wrong-type node surfaces as a real error, not "missing".
+            try:
+                open_group(store, path=grid.group_path, mode="r", zarr_format=3)
+            except GroupNotFoundError:
+                msg = f"Zarr template not found at {store_path}/{grid.group_path}"
+                logger.error(msg)
+                write_error["msg"] = msg
+                return None
+            logger.info(f"  Writing data to {store_path}...")
+            store_box["store"] = store
+            return store
+
+        def _write_chunk(block_index, carrier, ragged):
+            nonlocal _write_elapsed
+            if write_error:
+                return  # a prior chunk failed (or template missing) — skip the rest
+            store = _get_store()
+            if store is None:
+                return  # template missing — recorded in write_error, skip the rest
+            _t0 = time.time() if profile else None
+            try:
+                # write_dataframe_to_zarr no-ops on an empty carrier, so no per-chunk
+                # emptiness check is needed. Use each chunk's own block_index.
+                write_dataframe_to_zarr(carrier, store, grid=grid, chunk_idx=block_index)
+                ragged_key = int(shard_key) if single_chunk else _block_index_key(block_index, grid)
+                write_ragged_to_zarr(ragged, store, grid=grid, shard_key=ragged_key)
+            except Exception as e:
+                # Mirror the buffered path's ``except``: record the failure, stop
+                # writing, and let the run surface a 500 after process_shard returns.
+                logger.error(f"Failed to write zarr to {store_path}: {e}")
+                write_error["msg"] = f"Failed to write zarr: {e}"
+                return
+            if profile:
+                _write_elapsed += time.time() - _t0
+
+        chunk_results: list | None = [] if sharded else None
         _df_out, metadata = process_shard(
             grid,
-            event["shard_key"],
+            shard_key,
             event["granule_urls"],
             s3_credentials=s3_creds,
             config=config,
             chunk_results=chunk_results,
+            write_chunk=None if sharded else _write_chunk,
             handoff=handoff,
             profile=profile,
+            aoi_payload=aoi_payload,
         )
 
-        # Write Zarr to store: one dense region per chunk plus its ragged (CSR)
-        # companion. Mirrors the local runner's K>1 write loop (``_process_and_write``).
-        _write_t0 = time.time() if profile else None
-        if chunk_results:
-            store_path = event["store_path"]
-            store = open_store(store_path, **_output_store_kwargs(event))
-
-            # Validate that the Zarr template exists before writing. ``store`` is a
-            # zarr v3 ``Store`` whose ``exists()`` is async, so open the group via
-            # the high-level sync API and catch the missing-node error instead
-            # (issue #118), in the same open-and-catch spirit as
-            # ``readers/tdigest_tensor.py``. ``GroupNotFoundError`` is raised
-            # identically on the LocalStore and obstore-backed (S3) paths; a
-            # present-but-wrong-type node surfaces as a real error, not "missing".
-            try:
-                open_group(store, path=grid.group_path, mode="r", zarr_format=3)
-            except GroupNotFoundError:
-                error_msg = f"Zarr template not found at {store_path}/{grid.group_path}"
-                logger.error(error_msg)
-                metadata["error"] = error_msg
-                return {
-                    "statusCode": 500,
-                    "body": json.dumps(metadata),
-                }
-
-            logger.info(f"  Writing data to {store_path}...")
-
-            single_chunk = len(chunk_results) == 1
-            shard_key = event["shard_key"]
-            try:
-                # Sharded output (issue #108): bundle the shard's K inner chunks into
-                # one ShardingCodec shard object — write the whole shard in one block
-                # selection per dense array (mirrors the local runner). A per-inner-
-                # chunk loop would read-modify-write the same shard object.
-                if getattr(grid, "sharded", False):
+        # Sharded output (issue #108): bundle the shard's K inner chunks into one
+        # ShardingCodec shard object — one block selection per dense array (a per-
+        # inner-chunk loop would read-modify-write the same shard object). This path
+        # accumulated all K, so it opens + validates + writes here (same recording).
+        if sharded and chunk_results:
+            store = _get_store()
+            if store is not None:
+                _write_t0 = time.time() if profile else None
+                try:
                     write_shard_to_zarr(chunk_results, store, grid=grid, shard_key=int(shard_key))
-                else:
-                    for block_index, carrier, ragged in chunk_results:
-                        # write_dataframe_to_zarr no-ops on an empty carrier, so no
-                        # per-chunk emptiness check is needed. Use each chunk's own
-                        # block_index (from iter_chunks), not event["chunk_idx"].
-                        write_dataframe_to_zarr(
-                            carrier,
-                            store,
-                            grid=grid,
-                            chunk_idx=block_index,
-                        )
-                        # Persist this chunk's ragged (CSR) fields (issue #48). At K==1
-                        # the chunk IS the shard, so the CSR subgroup is keyed by
-                        # ``shard_key`` (cell-resolution contract); at K>1 each finer
-                        # chunk is keyed by its own block index. No-ops when empty.
-                        ragged_key = (
-                            int(shard_key) if single_chunk else _block_index_key(block_index, grid)
-                        )
-                        write_ragged_to_zarr(
-                            ragged,
-                            store,
-                            grid=grid,
-                            shard_key=ragged_key,
-                        )
-                # Record the write-phase timing (issue #100) only on a clean write:
-                # read/index/aggregate come from ``process_shard``; ``write`` is owned
-                # here and joins the same sub-dict. Recording inside the ``try`` (and
-                # after the early-return template-missing 500) keeps ``write`` absent
-                # on every failure path, so the runner's per-phase max rollup never
-                # folds in a time-to-failure as a real write duration. The no-data
-                # path returns earlier without writing, so ``write`` stays absent too.
-                if profile and "phase_timings" in metadata:
-                    metadata["phase_timings"]["write"] = time.time() - _write_t0
-            except Exception as e:
-                logger.error(f"Failed to write zarr to {store_path}: {e}")
-                metadata["error"] = f"Failed to write zarr: {e}"
+                    if profile:
+                        _write_elapsed += time.time() - _write_t0
+                except Exception as e:
+                    logger.error(f"Failed to write zarr to {store_path}: {e}")
+                    write_error["msg"] = f"Failed to write zarr: {e}"
 
-        # Peak worker RSS (issue #120): captured here, after the write phase, so
-        # it covers the full invocation. Threaded back via the result body so the
-        # orchestrator can surface OOM-proximity without CloudWatch access.
-        metadata["max_memory_mb"] = _max_memory_mb()
+        # A recorded template-missing / write failure folds into ``metadata`` so the
+        # response surfaces a 500 with the structured log, exactly as the buffered
+        # ``except`` / early-return branches did (now carrying the worker metadata).
+        if write_error:
+            metadata["error"] = write_error["msg"]
+
+        # Record the write-phase timing (issue #100): read/index/aggregate come from
+        # ``process_shard``; ``write`` is the time spent in the streaming callback /
+        # sharded write. Only attach it on a clean write (no ``error``) so a time-to-
+        # failure is never folded in as a real write duration; the no-data path wrote
+        # nothing (``_write_elapsed`` stays 0) but also has no chunks, so writing 0 is
+        # harmless — gate on a populated ``phase_timings`` and no error to match the
+        # old "write absent on failure / no-data" contract.
+        if profile and not metadata.get("error") and "phase_timings" in metadata and store_box:
+            metadata["phase_timings"]["write"] = _write_elapsed
+
+        # Peak worker RSS (issues #120, #141): captured here, after the write phase,
+        # so it covers the full invocation. ``max_memory_mb`` is the per-invocation
+        # sampled peak (``VmRSS``), trustworthy on warm containers; ``ru_maxrss`` is
+        # kept as ``container_hwm_mb`` (the container-lifetime high-water) so the
+        # distinction is explicit. Off Linux the sampler is a no-op, so fall back to
+        # ``ru_maxrss``. Threaded back via the result body so the orchestrator can
+        # surface OOM-proximity without CloudWatch access.
+        metadata["container_hwm_mb"] = _max_memory_mb()
+        sampled_peak = rss_sampler.peak_mb
+        metadata["max_memory_mb"] = (
+            sampled_peak if sampled_peak is not None else metadata["container_hwm_mb"]
+        )
 
         # Log structured result
         logger.info(
@@ -489,6 +681,12 @@ def _handle_process(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
         logger.info("Lambda invocation completed successfully")
         logger.info("=" * 70)
 
+        # Drop the invocation's large output buffers before the teardown reclaim
+        # (issue #139): the response body is just ``metadata`` (small), so freeing
+        # the shard's carrier / accumulated K chunk carriers here lets the
+        # ``_reclaim_memory`` call in ``finally`` return their heap to the OS.
+        del _df_out, chunk_results
+
         return {
             "statusCode": 200 if not metadata.get("error") else 500,
             "body": json.dumps(metadata),
@@ -508,3 +706,12 @@ def _handle_process(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
                 }
             ),
         }
+    finally:
+        # Stop the per-invocation RSS sampler (issue #141) before the teardown
+        # reclaim, so its thread isn't sampling while ``malloc_trim`` runs.
+        rss_sampler.stop()
+        # Warm-container memory reclaim (issue #139): once per invocation, after
+        # the write completes and the buffers above are dropped, hand freed heap
+        # back to the OS so the next invoke on this warm container starts near
+        # baseline instead of the prior invocation's RSS high-water.
+        _reclaim_memory()

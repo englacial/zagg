@@ -7,11 +7,14 @@ Assembles the per-shard output carrier and writes it to the Zarr template
 stays acyclic.
 """
 
+from concurrent.futures import ThreadPoolExecutor, as_completed
+
 import numpy as np
 import pandas as pd
 from zarr import config, open_array
 from zarr.abc.store import Store
 
+from zagg.concurrency import fd_safe_max_workers
 from zagg.config import (
     PipelineConfig,
     get_agg_fields,
@@ -19,6 +22,13 @@ from zagg.config import (
 )
 from zagg.csr import write_csr
 from zagg.grids.morton import is_morton_array, morton_words
+
+# The sharded path's K ragged (CSR) subgroup writes fan out over a bounded thread
+# pool (issue #142): each inner chunk emits an independent CSR group at a disjoint
+# prefix, so they are write-independent and latency-bound (~K×3 tiny objects), and
+# a serial loop dominated a t-digest shard's write time. 128 mirrors the dense
+# path's ``async.concurrency`` budget (issue #108).
+_RAGGED_WRITE_CONCURRENCY = 128
 
 
 def _arrow_column(block: np.ndarray, sig: dict):
@@ -48,7 +58,15 @@ def _arrow_column(block: np.ndarray, sig: dict):
 
 
 def _build_output(
-    stats_arrays, data_vars, agg_fields, grid, shard_key, use_arrow: bool, *, children=None
+    stats_arrays,
+    data_vars,
+    agg_fields,
+    grid,
+    shard_key,
+    use_arrow: bool,
+    *,
+    children=None,
+    aoi_mask=None,
 ):
     """Assemble the per-shard output carrier from the per-cell stats blocks.
 
@@ -61,8 +79,17 @@ def _build_output(
     whole shard's ``grid.chunk_coords(shard_key)``. This is what lets the K>1 worker
     build one carrier per finer chunk. ``None`` (default) is the K==1 path — the
     coords are the shard's, byte-for-byte unchanged.
+
+    ``aoi_mask`` (issue #101): when given, a per-cell ``bool`` array aligned to this
+    chunk's cells is appended as the ``aoi_mask`` column (``True`` where the cell is
+    inside the AOI). ``None`` (default, flag off) appends nothing, so the carrier is
+    byte-for-byte unchanged.
     """
-    coords = grid.coords_of(children) if children is not None else grid.chunk_coords(shard_key)
+    coords = dict(
+        grid.coords_of(children) if children is not None else grid.chunk_coords(shard_key)
+    )
+    if aoi_mask is not None:
+        coords["aoi_mask"] = np.asarray(aoi_mask, dtype=bool)
     if not use_arrow:
         df_out = pd.DataFrame({var: stats_arrays[var] for var in data_vars})
         for col_name, vals in coords.items():
@@ -248,19 +275,64 @@ def write_shard_to_zarr(
     Store
     """
     chunk_res_fields = _chunk_resolution_fields(getattr(grid, "config", None))
-    shard_block = tuple(int(i) for i in grid.block_index(shard_key))
-    slab_shape = tuple(int(s) for s in grid.shard_slab_shape())
     inner_shape = tuple(int(s) for s in grid.chunk_shape)
 
-    # Accumulate each dense per-cell column into one shard-wide slab; companions
-    # and ragged are written per inner chunk via the existing seams.
-    slabs: dict = {}
+    # Sharding-object split (issue #133 phase 8): a ShardingCodec object normally
+    # spans the whole dispatch shard, so the K inner chunks accumulate into ONE slab
+    # written in one ``set_block_selection``. ``shard_order`` sizes the object SMALLER
+    # than the dispatch shard, so the worker writes its region in per-object passes
+    # (accumulate→write→free), bounding peak memory under the 2 GB cap. A grid without
+    # the object-split methods (or at the default ``shard_order``) yields ONE object
+    # spanning the whole shard — byte-identical to the pre-phase-8 single-object write.
+    use_object_split = hasattr(grid, "shard_object_block") and hasattr(
+        grid, "shard_object_slab_shape"
+    )
+    if use_object_split:
+        slab_shape = tuple(int(s) for s in grid.shard_object_slab_shape())
+
+        def _object_block(block_index):
+            return tuple(int(i) for i in grid.shard_object_block(block_index))
+
+        def _local_region(block_index):
+            return grid.shard_object_local_region(block_index)
+    else:
+        slab_shape = tuple(int(s) for s in grid.shard_slab_shape())
+        shard_block = tuple(int(i) for i in grid.block_index(shard_key))
+
+        def _object_block(block_index):
+            return shard_block
+
+        def _local_region(block_index):
+            return grid.shard_local_region(block_index, shard_key)
+
+    # Group the dispatch shard's inner chunks by sharding object so each object is
+    # accumulated and written independently; preserve encounter order for stable,
+    # deterministic writes. Companions + ragged stay per inner chunk (unsharded).
+    objects: dict = {}
+    ragged_writes: list = []
     for block_index, carrier, ragged in chunk_results:
         if not _carrier_empty(carrier):
-            region = grid.shard_local_region(block_index, shard_key)
+            objects.setdefault(_object_block(block_index), []).append((block_index, carrier))
+        # Companions for this inner chunk are not sharded: write them straight
+        # through (one block per chunk). Ragged (CSR) subgroups are collected and
+        # fanned out below (issue #142) -- they target disjoint prefixes, so the
+        # per-chunk serial loop needlessly dominated a t-digest shard's write time.
+        if chunk_res_fields:
+            _write_companion_columns(carrier, store, grid, block_index, chunk_res_fields)
+        if ragged:
+            ragged_writes.append((ragged, _block_index_key(block_index, grid)))
+
+    _write_ragged_fanout(ragged_writes, store, grid=grid)
+
+    # One accumulate→write→free pass per sharding object: each holds at most one
+    # object's slab resident at a time (the phase-8 memory bound).
+    for obj_block, members in objects.items():
+        slabs: dict = {}
+        for block_index, carrier in members:
+            region = _local_region(block_index)
             for name, values in _iter_carrier_columns(carrier):
                 if name in chunk_res_fields:
-                    continue  # companion (resolution: chunk) — handled below, unsharded
+                    continue  # companion (resolution: chunk) — handled per chunk above
                 values = np.asarray(values)
                 trailing = values.shape[1:]
                 if name not in slabs:
@@ -273,39 +345,85 @@ def write_shard_to_zarr(
                     fill = array.metadata.fill_value
                     slabs[name] = np.full((*slab_shape, *trailing), fill, dtype=values.dtype)
                 slabs[name][region] = values.reshape((*inner_shape, *trailing))
-        # Companions + ragged for this inner chunk are not sharded: write them
-        # straight through (companion array is one block per chunk; ragged is CSR).
-        if chunk_res_fields:
-            _write_companion_columns(carrier, store, grid, block_index, chunk_res_fields)
-        write_ragged_to_zarr(
-            ragged, store, grid=grid, shard_key=_block_index_key(block_index, grid)
-        )
 
-    # One block selection per dense array == one shard object write.
-    for name, slab in slabs.items():
-        trailing = slab.shape[len(slab_shape) :]
-        block_idx = (*shard_block, *((0,) * len(trailing)))
-        with config.set({"async.concurrency": 128}):
-            array = open_array(
-                store,
-                path=f"{grid.group_path}/{name}",
-                zarr_format=3,
-                consolidated=False,
-            )
-            if trailing:
-                # Mirror write_dataframe_to_zarr's single-trailing-chunk invariant
-                # (issue #29): a vector field's trailing payload dim must be one whole
-                # (inner) chunk, or set_block_selection at trailing block 0 would
-                # silently write only part of it.
-                target_trailing_chunks = array.chunks[len(slab_shape) :]
-                if target_trailing_chunks != trailing:
-                    raise ValueError(
-                        f"vector field {name!r}: trailing chunk "
-                        f"{target_trailing_chunks} must equal trailing shape "
-                        f"{trailing} (the payload dim must be one whole chunk)"
-                    )
-            array.set_block_selection(block_idx, slab)
+        # One block selection per dense array == one shard object write.
+        for name, slab in slabs.items():
+            trailing = slab.shape[len(slab_shape) :]
+            block_idx = (*obj_block, *((0,) * len(trailing)))
+            with config.set({"async.concurrency": 128}):
+                array = open_array(
+                    store,
+                    path=f"{grid.group_path}/{name}",
+                    zarr_format=3,
+                    consolidated=False,
+                )
+                if trailing:
+                    # Mirror write_dataframe_to_zarr's single-trailing-chunk invariant
+                    # (issue #29): a vector field's trailing payload dim must be one whole
+                    # (inner) chunk, or set_block_selection at trailing block 0 would
+                    # silently write only part of it.
+                    target_trailing_chunks = array.chunks[len(slab_shape) :]
+                    if target_trailing_chunks != trailing:
+                        raise ValueError(
+                            f"vector field {name!r}: trailing chunk "
+                            f"{target_trailing_chunks} must equal trailing shape "
+                            f"{trailing} (the payload dim must be one whole chunk)"
+                        )
+                array.set_block_selection(block_idx, slab)
     return store
+
+
+def _write_ragged_fanout(ragged_writes: list, store: Store, *, grid) -> None:
+    """Write the sharded shard's K ragged (CSR) subgroups concurrently (issue #142).
+
+    On the sharded path :func:`write_shard_to_zarr` already holds all K inner-chunk
+    carriers resident (it bundles the dense side into one shard object), and each
+    inner chunk emits an independent CSR subgroup at a disjoint prefix
+    (``{group_path}/{field}/{block_key}/...``). Those writes are therefore
+    embarrassingly parallel and latency-bound (~K×3 tiny objects, tens of MB), so a
+    serial loop dominated a t-digest shard's write time. Fan them out over a bounded
+    ``ThreadPoolExecutor``; the on-disk layout is unchanged (still one CSR group per
+    inner chunk -- only the write scheduling differs), and concurrent writes to
+    disjoint keys of one store are already zagg's model (the dispatcher fans cells
+    over threads onto a shared store).
+
+    The bound is ``min(_RAGGED_WRITE_CONCURRENCY, len(writes), fd_safe_max_workers())``
+    so this per-worker inner fan-out respects the same open-file ceiling the Lambda
+    dispatcher guards (:func:`zagg.concurrency.fd_safe_max_workers`) -- each in-flight
+    write holds a store socket. A failure in any subgroup is surfaced (not swallowed):
+    the first exception is re-raised after the pool drains, tagged with how many of
+    the K writes failed.
+
+    (The non-sharded/streaming path deliberately stays serial: it writes-then-frees
+    each chunk to bound peak memory (issue #91), so it never holds the K carriers at
+    once to parallelize.)
+    """
+    if not ragged_writes:
+        return
+    workers = min(_RAGGED_WRITE_CONCURRENCY, len(ragged_writes), fd_safe_max_workers())
+    if workers <= 1:
+        for ragged, ragged_key in ragged_writes:
+            write_ragged_to_zarr(ragged, store, grid=grid, shard_key=ragged_key)
+        return
+
+    errors: list = []
+    with ThreadPoolExecutor(max_workers=workers) as pool:
+        futures = {
+            pool.submit(write_ragged_to_zarr, ragged, store, grid=grid, shard_key=ragged_key): (
+                ragged_key
+            )
+            for ragged, ragged_key in ragged_writes
+        }
+        for fut in as_completed(futures):
+            exc = fut.exception()
+            if exc is not None:
+                errors.append((futures[fut], exc))
+    if errors:
+        first_key, first_exc = errors[0]
+        raise RuntimeError(
+            f"ragged (CSR) write failed for {len(errors)} of {len(ragged_writes)} "
+            f"subgroup(s) on the sharded path (first failing shard_key {first_key})"
+        ) from first_exc
 
 
 def _write_companion_columns(carrier, store, grid, block_index, chunk_res_fields):

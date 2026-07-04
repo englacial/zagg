@@ -14,7 +14,7 @@ to already be deployed -- it never stands up or mutates infrastructure.
 Usage::
 
     python run_benchmark.py --targets tests/data/benchmark/targets.json \\
-        --target gain_bias_healpix_o11 --target tdigest_healpix_o11 \\
+        --target tdigest_healpix_o11_sharded --target tdigest_healpix_o11_inner \\
         --store-prefix s3://my-bucket/zagg-bench \\
         --region us-west-2 --function-name process-shard \\
         --event pr --commit "$SHA" --ref "$REF" --pr-number 123 \\
@@ -28,13 +28,20 @@ import datetime as dt
 import json
 import os
 import sys
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
+
+# Benchmark targets are launched concurrently (issue #137). Each target is one
+# independent single-shard Lambda dispatch, so this bounds how many run at once;
+# the matrix is small (~single digits), so the cap only guards a pathological
+# manifest.
+_MAX_TARGET_CONCURRENCY = 16
 
 # Allow ``import bench_metrics`` whether run as a script or imported by tests.
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import bench_metrics  # noqa: E402
 
-from zagg.config import load_config  # noqa: E402
+from zagg.config import get_handoff, load_config  # noqa: E402
 from zagg.grids import from_config  # noqa: E402
 
 
@@ -98,11 +105,18 @@ def run_target(
     shard_key = int(shardmap_meta["shard_key"])
     n_granules = shardmap_meta.get("n_granules")
 
-    # Per-cell carrier (issue #130). Default "pandas" keeps the dispatched event
-    # byte-identical to a pre-handoff run; the arrow (arro3) target sets it.
-    handoff = target.get("handoff", "pandas")
-
     config = load_config(str(config_path))
+    # Per-cell carrier (issues #130/#132). Inherit from the config
+    # (``aggregation.handoff``, default ``"arrow"``) unless the target pins an
+    # explicit override for a pandas-vs-arrow A/B; the override still wins.
+    handoff = target.get("handoff") or get_handoff(config)
+    # The ShardingCodec (issue #108) is the experimental variable of the forward
+    # benchmark (issue #133): the matrix carries ``sharded: true|false`` per target
+    # so one config drives both columns. Apply it to the grid block (where
+    # ``get_sharded`` reads it) when present; absent leaves the config's own
+    # default, so frozen/legacy targets dispatch byte-identically to before.
+    if "sharded" in target:
+        config.output.setdefault("grid", {})["sharded"] = bool(target["sharded"])
     # parent_order lives in the config grid for HEALPix; the kwarg is just a
     # legacy fallback. Rect grids ignore it. ``from_config`` gives us the grid
     # object the area/cost derivation needs.
@@ -115,6 +129,10 @@ def run_target(
         grid_type=target["grid_type"],
         grid_size=target["grid_size"],
         shard_key=shard_key,
+        # ShardingCodec A/B label (issue #133), recorded into the series so the
+        # renderer can split the new matrix from frozen rows. None on targets
+        # without the key (the provisional/legacy ones).
+        codec=target.get("codec"),
     )
 
     if dry_run:
@@ -189,6 +207,15 @@ def main(argv: list[str] | None = None) -> int:
         help="One-line banner for the PR comment when the benchmarked worker is "
         "the stable deploy, not this PR's code (issue #25).",
     )
+    parser.add_argument(
+        "--fail-on-empty",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Exit non-zero if any real target comes back with zero observations "
+        "or null peak memory -- the signature of a silent OOM that would "
+        "otherwise keep the job green (issue #145). Skipped under --dry-run, "
+        "which emits empty metrics by design; --no-fail-on-empty opts out.",
+    )
     args = parser.parse_args(argv)
 
     manifest, base = load_targets(args.targets)
@@ -206,14 +233,26 @@ def main(argv: list[str] | None = None) -> int:
         "pr_number": pr_number,
     }
 
-    records = []
+    # Validate every requested target up front so an unknown name fails before any
+    # dispatch (and before the pool spins up).
     for name in names:
         if name not in known:
             raise SystemExit(f"unknown target '{name}'; have {sorted(known)}")
+
+    # Authenticate once up front so the concurrent targets below don't race to
+    # initialize earthaccess's process-global auth singleton (issue #137). Skipped
+    # under --dry-run (no dispatch, no auth) and pointless for a single target (no
+    # fan-out); each agg() still logs in, but now hits the warmed singleton.
+    if not args.dry_run and len(names) > 1:
+        from zagg.auth import ensure_logged_in
+
+        ensure_logged_in()
+
+    def _dispatch(name: str) -> dict:
         store = None
         if args.store_prefix:
             store = f"{args.store_prefix.rstrip('/')}/{name}.zarr"
-        record = run_target(
+        return run_target(
             name,
             manifest,
             base,
@@ -223,9 +262,24 @@ def main(argv: list[str] | None = None) -> int:
             context=context,
             dry_run=args.dry_run,
         )
-        records.append(record)
+
+    # Launch all targets concurrently (issue #137). Each is an independent
+    # single-shard Lambda dispatch, so fanning them out is cold-favoring (a fresh
+    # container per concurrent invoke) and cuts wall-clock ~N x; the runtime metric
+    # is billable worker-seconds (init-independent), so en-masse launch doesn't bias
+    # it. Results are collected then re-ordered back to ``names`` for deterministic
+    # output/series rows; a target that raises propagates (aborting the run) exactly
+    # as the prior serial loop did.
+    records_by_name: dict = {}
+    max_workers = min(len(names), _MAX_TARGET_CONCURRENCY) or 1
+    with ThreadPoolExecutor(max_workers=max_workers) as pool:
+        futures = {pool.submit(_dispatch, name): name for name in names}
+        for fut in as_completed(futures):
+            records_by_name[futures[fut]] = fut.result()
+    records = [records_by_name[name] for name in names]
+    for record in records:
         print(
-            f"[{name}] obs={record['total_obs']} runtime_s={record['runtime_s']} "
+            f"[{record['target']}] obs={record['total_obs']} runtime_s={record['runtime_s']} "
             f"cost/shard=${record['cost_per_shard_usd']} "
             f"cost/100km2=${record['cost_per_100km2_usd']} "
             f"max_memory_mb={record['max_memory_mb']}"
@@ -236,6 +290,22 @@ def main(argv: list[str] | None = None) -> int:
         Path(args.out_comment).write_text(
             bench_metrics.comment_markdown(records, worker_note=args.worker_note)
         )
+
+    # A silently OOM'd target records obs=0 / max_memory_mb=None but the job
+    # otherwise stays green, so a memory regression can merge (and land a junk
+    # series row) unnoticed (issue #145). Fail loudly on any real target that
+    # came back empty; --dry-run emits empty metrics by design, so it's exempt.
+    if args.fail_on_empty and not args.dry_run:
+        empty = [
+            r["target"] for r in records if not r.get("total_obs") or r.get("max_memory_mb") is None
+        ]
+        if empty:
+            print(
+                "benchmark target(s) returned empty metrics (obs=0 / "
+                f"max_memory_mb=None), likely a silent OOM: {', '.join(empty)}",
+                file=sys.stderr,
+            )
+            return 1
     return 0
 
 

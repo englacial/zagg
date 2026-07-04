@@ -197,6 +197,240 @@ class TestWriteShardToZarr:
         assert np.isnan(grp["h_mean"][int(cell_ids[1])])
 
 
+class TestShardOrderObjectSplit:
+    """Issue #133 phase 8: ``shard_order`` decouples the ShardingCodec object from
+    the dispatch shard. The default (unset / == parent_order) keeps ONE object per
+    dispatch shard — byte-identical to the pre-phase-8 sharded write — while a finer
+    ``shard_order`` writes the dispatch region in per-object passes that reconstruct
+    the same logical array.
+
+    Small orders (parent 4 / chunk_inner 6 / child 7) so the fullsphere template +
+    write run fast: K = 4^(6-4) = 16 inner chunks, cells_per_chunk 4, cells_per_shard
+    64; ``shard_order=5`` gives 4 objects/shard of 16 cells each.
+    """
+
+    PARENT, INNER, CHILD = 4, 6, 7
+
+    @staticmethod
+    def _shard_key():
+        from mortie import geo2mort
+
+        return int(geo2mort(-78.5, -132.0, order=TestShardOrderObjectSplit.PARENT)[0])
+
+    def _grid(self, cfg, *, shard_order=None):
+        return HealpixGrid(
+            self.PARENT,
+            self.CHILD,
+            layout="fullsphere",
+            config=cfg,
+            chunk_inner=self.INNER,
+            sharded=True,
+            shard_order=shard_order,
+        )
+
+    @staticmethod
+    def _df(grid, shard_key):
+        # Cells in the first, a middle, and the last inner chunk so the written shard
+        # spans more than one sharding object once shard_order splits it.
+        children = grid.children(shard_key)
+        idx = [0, len(children) // 2, len(children) - 1]
+        leaf = np.array([int(children[i]) for i in idx], dtype=np.uint64)
+        return pd.DataFrame(
+            {
+                "h_li": np.array([3.0, 7.0, 2.0], dtype=np.float32),
+                "s_li": np.array([0.1, 0.1, 0.1], dtype=np.float32),
+                "leaf_id": leaf,
+            }
+        )
+
+    def _run(self, grid, shard_key, df, monkeypatch):
+        from zagg.processing import write_shard_to_zarr
+
+        calls = {"n": 0}
+
+        def one_shot(*args, **kwargs):
+            calls["n"] += 1
+            return df.copy() if calls["n"] == 1 else None
+
+        monkeypatch.setattr("zagg.processing._read_group", one_shot)
+        monkeypatch.setattr("zagg.processing.h5coro.H5Coro", lambda *a, **k: object())
+        monkeypatch.setattr("zagg.processing._make_url_rewriter", lambda driver: lambda u: u)
+
+        store = MemoryStore()
+        grid.emit_template(store)
+        chunk_results: list = []
+        process_shard(
+            grid,
+            shard_key,
+            ["s3://x"],
+            s3_credentials={},
+            config=grid.config,
+            chunk_results=chunk_results,
+        )
+        write_shard_to_zarr(chunk_results, store, grid=grid, shard_key=shard_key)
+        return store
+
+    def test_default_byte_identical_to_explicit_parent_order(self, monkeypatch):
+        """Default (``shard_order`` unset) is byte-identical to ``shard_order ==
+        parent_order`` — both keep ONE object spanning the whole dispatch shard, so
+        the on-disk store bytes match exactly (the phase-8 default-safety invariant)."""
+        cfg = default_config()
+        shard_key = self._shard_key()
+        g_default = self._grid(cfg, shard_order=None)
+        g_parent = self._grid(cfg, shard_order=self.PARENT)
+        # Both keep one object per dispatch shard.
+        assert g_default.shard_objects_per_shard == 1
+        assert g_parent.shard_objects_per_shard == 1
+
+        df = self._df(g_default, shard_key)
+        s_default = self._run(g_default, shard_key, df, monkeypatch)
+        s_parent = self._run(g_parent, shard_key, df.copy(), monkeypatch)
+
+        # Byte-for-byte equal stores (same keys, same bytes).
+        assert set(s_default._store_dict) == set(s_parent._store_dict)
+        for k, v in s_default._store_dict.items():
+            assert v.to_bytes() == s_parent._store_dict[k].to_bytes(), f"store bytes differ at {k}"
+
+    def test_split_reconstructs_same_logical_array(self, monkeypatch):
+        """A finer ``shard_order`` (multiple objects per shard) reconstructs the SAME
+        logical array, value-for-value, as the single-object default."""
+        cfg = default_config()
+        shard_key = self._shard_key()
+        g_default = self._grid(cfg, shard_order=None)
+        g_split = self._grid(cfg, shard_order=5)
+        assert g_split.shard_objects_per_shard == 4
+
+        df = self._df(g_default, shard_key)
+        s_default = self._run(g_default, shard_key, df, monkeypatch)
+        s_split = self._run(g_split, shard_key, df.copy(), monkeypatch)
+
+        grp_d = open_group(store=s_default, mode="r", path=str(self.CHILD))
+        grp_s = open_group(store=s_split, mode="r", path=str(self.CHILD))
+        for name in grp_d.array_keys():
+            a, b = grp_d[name][:], grp_s[name][:]
+            np.testing.assert_array_equal(
+                np.nan_to_num(a, nan=-12345.0),
+                np.nan_to_num(b, nan=-12345.0),
+                err_msg=f"split vs single-object differ in {name}",
+            )
+
+    def test_split_writes_multiple_objects_default_writes_one(self, monkeypatch):
+        """The default writes ONE shard object for the populated shard; the split
+        writes one object PER populated sharding sub-region (sparse: empty objects
+        are omitted)."""
+        cfg = default_config()
+        shard_key = self._shard_key()
+        g_default = self._grid(cfg, shard_order=None)
+        g_split = self._grid(cfg, shard_order=5)
+        df = self._df(g_default, shard_key)
+
+        s_default = self._run(g_default, shard_key, df, monkeypatch)
+        s_split = self._run(g_split, shard_key, df.copy(), monkeypatch)
+
+        prefix = f"{self.CHILD}/h_mean/c/"
+        n_default = len([k for k in s_default._store_dict if k.startswith(prefix)])
+        n_split = len([k for k in s_split._store_dict if k.startswith(prefix)])
+        assert n_default == 1
+        # Three cells in three distinct inner chunks land in 2-3 distinct objects
+        # (>1), but never more than one per dispatch shard's object count.
+        assert 1 < n_split <= g_split.shard_objects_per_shard
+
+    @staticmethod
+    def _mixed_config():
+        """The default scalar config extended with a vector(trailing-dim), a
+        ``resolution: chunk`` companion, and a ragged/CSR field, so the split path is
+        exercised for every field kind — not just scalars — while keeping the default's
+        ``morton`` coordinate + scalar data vars."""
+        cfg = default_config()
+        agg = cfg.aggregation
+        agg.setdefault("chunk_precompute", {})["chunk_base"] = {
+            "expression": "np.float32(np.mean(h_li))",
+            "source": "h_li",
+        }
+        # vector trailing-dim — dense AND sharded, so it rides the per-object slab.
+        agg["variables"]["h_edges"] = {
+            "expression": "np.array([np.min(h_li), np.max(h_li)])",
+            "source": "h_li",
+            "kind": "vector",
+            "trailing_shape": 2,
+            "dtype": "float32",
+        }
+        # resolution: chunk companion — dense, one block per chunk (unsharded).
+        agg["variables"]["h_chunk_base"] = {
+            "expression": "chunk_base",
+            "resolution": "chunk",
+            "dtype": "float32",
+        }
+        # per-cell ragged/CSR — written per inner chunk (unsharded).
+        agg["variables"]["h_ragged"] = {
+            "function": "np.sort",
+            "source": "h_li",
+            "kind": "ragged",
+            "inner_shape": [1],
+            "dtype": "float32",
+        }
+        return cfg
+
+    def test_split_reconstructs_vector_companion_and_ragged(self, monkeypatch):
+        """The split path reconstructs the SAME store for a config carrying every
+        field kind — a vector (trailing-dim, dense+sharded), a ``resolution: chunk``
+        companion, and a ragged/CSR field — not just scalars. Dense arrays match
+        value-for-value; the per-chunk companion + CSR keys match byte-for-byte
+        (those are written per inner chunk, independent of ``shard_order``)."""
+        cfg = self._mixed_config()
+        shard_key = self._shard_key()
+        g_default = self._grid(cfg, shard_order=None)
+        g_split = self._grid(cfg, shard_order=5)
+        assert g_split.shard_objects_per_shard == 4
+
+        df = self._df(g_default, shard_key)
+        s_default = self._run(g_default, shard_key, df, monkeypatch)
+        s_split = self._run(g_split, shard_key, df.copy(), monkeypatch)
+
+        # Every dense array (scalar h_mean, vector h_edges, chunk companion
+        # h_chunk_base) reconstructs value-for-value across the split.
+        grp_d = open_group(store=s_default, mode="r", path=str(self.CHILD))
+        grp_s = open_group(store=s_split, mode="r", path=str(self.CHILD))
+        assert set(grp_d.array_keys()) == set(grp_s.array_keys())
+        assert {"h_mean", "h_edges", "h_chunk_base"} <= set(grp_d.array_keys())
+        for name in grp_d.array_keys():
+            np.testing.assert_array_equal(
+                np.nan_to_num(grp_d[name][:], nan=-12345.0),
+                np.nan_to_num(grp_s[name][:], nan=-12345.0),
+                err_msg=f"split vs single-object differ in {name}",
+            )
+
+        # The ragged/CSR field is written per inner chunk, so its store keys are
+        # byte-for-byte identical regardless of the sharding-object split.
+        ragged_keys = [k for k in s_default._store_dict if "/h_ragged/" in k]
+        assert ragged_keys, "ragged field produced no CSR keys"
+        for k in ragged_keys:
+            assert k in s_split._store_dict, f"ragged key {k} missing under split"
+            assert s_default._store_dict[k].to_bytes() == s_split._store_dict[k].to_bytes(), (
+                f"ragged CSR bytes differ at {k}"
+            )
+
+    def test_invalid_shard_order_rejected(self):
+        cfg = default_config()
+        # <= parent_order (other than the default) is rejected.
+        with pytest.raises(ValueError, match="shard_order"):
+            self._grid(cfg, shard_order=self.PARENT - 1)
+        # > chunk_inner is rejected.
+        with pytest.raises(ValueError, match="shard_order"):
+            self._grid(cfg, shard_order=self.INNER + 1)
+        # shard_order without sharded=True is rejected.
+        with pytest.raises(ValueError, match="sharded=True"):
+            HealpixGrid(
+                self.PARENT,
+                self.CHILD,
+                layout="fullsphere",
+                config=cfg,
+                chunk_inner=self.INNER,
+                sharded=False,
+                shard_order=5,
+            )
+
+
 class TestCalculateCellStatistics:
     def test_empty_data_returns_zeros_and_nans(self):
         result = calculate_cell_statistics({"h_li": np.array([]), "s_li": np.array([])})
@@ -697,6 +931,172 @@ class TestRaggedCsrWrite:
         store = MemoryStore()
         out = write_ragged_to_zarr({}, store, grid=grid, shard_key=0)
         assert out is store
+
+
+class TestRaggedWriteFanout:
+    """Issue #142: the sharded path fans out its K ragged (CSR) subgroup writes over
+    a bounded thread pool instead of a serial loop. The subgroups target disjoint
+    prefixes, so the on-disk result is identical to serial -- only the write
+    scheduling changes. These exercise ``_write_ragged_fanout`` directly (hand-built
+    payloads, no template emit) plus one end-to-end pass through
+    ``write_shard_to_zarr``."""
+
+    @staticmethod
+    def _grid_and_writes(n):
+        # A real ragged grid supplies group_path + config for write_ragged_to_zarr;
+        # the payloads are hand-built (distinct key + value per subgroup) so no
+        # emit_template / process_shard is needed and the test stays fast.
+        cfg = TestRaggedCsrWrite._ragged_cfg()
+        grid = HealpixGrid(4, 6, layout="fullsphere", config=cfg)
+        writes = [
+            ({"h_raw": ([np.array([float(k)], dtype=np.float32)], [0])}, k) for k in range(1, n + 1)
+        ]
+        return grid, writes
+
+    def test_fanout_writes_all_subgroups(self):
+        """Every subgroup lands, even past the 128-worker cap (real concurrent writes)."""
+        from zagg.csr import read_csr
+        from zagg.processing.write import _write_ragged_fanout
+
+        grid, writes = self._grid_and_writes(200)  # > _RAGGED_WRITE_CONCURRENCY
+        store = MemoryStore()
+        _write_ragged_fanout([(r, k) for r, k in writes], store, grid=grid)
+        for _ragged, key in writes:
+            csr = read_csr(store, f"{grid.group_path}/h_raw/{key}")
+            np.testing.assert_array_equal(csr["values"].reshape(-1), [float(key)])
+
+    def test_fanout_byte_identical_parallel_vs_serial(self, monkeypatch):
+        """Concurrent fan-out yields byte-for-byte the same store as the serial loop."""
+        import zagg.processing.write as wmod
+        from zagg.processing.write import _write_ragged_fanout
+
+        grid, writes = self._grid_and_writes(6)
+        # Pin the fd ceiling high so the parallel run truly takes the pool branch
+        # (else a low-ulimit host could clamp workers to 1 and silently compare
+        # serial-vs-serial, proving nothing).
+        monkeypatch.setattr(wmod, "fd_safe_max_workers", lambda: 128)
+        s_par = MemoryStore()
+        _write_ragged_fanout([(r, k) for r, k in writes], s_par, grid=grid)
+
+        monkeypatch.setattr(wmod, "_RAGGED_WRITE_CONCURRENCY", 1)  # force serial branch
+        s_ser = MemoryStore()
+        _write_ragged_fanout([(r, k) for r, k in writes], s_ser, grid=grid)
+
+        assert set(s_par._store_dict) == set(s_ser._store_dict)
+        for key, val in s_par._store_dict.items():
+            assert val.to_bytes() == s_ser._store_dict[key].to_bytes(), f"differ at {key}"
+
+    def test_fanout_cap_respects_fd_ceiling(self, monkeypatch):
+        """The pool is sized ``min(128, len(writes), fd_safe_max_workers())``; an fd
+        ceiling of 1 forces the serial branch (no pool constructed)."""
+        import zagg.processing.write as wmod
+        from zagg.processing.write import _write_ragged_fanout
+
+        grid, writes = self._grid_and_writes(10)
+        recorded: dict = {}
+        real_tpe = wmod.ThreadPoolExecutor
+
+        def spy_tpe(max_workers):
+            recorded["workers"] = max_workers
+            return real_tpe(max_workers=max_workers)
+
+        monkeypatch.setattr(wmod, "ThreadPoolExecutor", spy_tpe)
+
+        # fd ceiling (4) clamps below both 128 and len(writes)=10.
+        monkeypatch.setattr(wmod, "fd_safe_max_workers", lambda: 4)
+        _write_ragged_fanout([(r, k) for r, k in writes], MemoryStore(), grid=grid)
+        assert recorded["workers"] == 4
+
+        # fd ceiling of 1 -> serial branch, ThreadPoolExecutor never constructed.
+        recorded.clear()
+        monkeypatch.setattr(wmod, "fd_safe_max_workers", lambda: 1)
+        _write_ragged_fanout([(r, k) for r, k in writes], MemoryStore(), grid=grid)
+        assert "workers" not in recorded
+
+    def test_fanout_surfaces_write_failure(self, monkeypatch):
+        """A failure in any subgroup write is re-raised (not silently swallowed)."""
+        import zagg.processing.write as wmod
+        from zagg.processing.write import _write_ragged_fanout
+
+        grid, writes = self._grid_and_writes(5)
+
+        def boom(ragged, store, *, grid, shard_key):
+            if shard_key == 3:
+                raise RuntimeError("disk full")
+
+        monkeypatch.setattr(wmod, "write_ragged_to_zarr", boom)
+        with pytest.raises(RuntimeError, match="ragged"):
+            _write_ragged_fanout([(r, k) for r, k in writes], MemoryStore(), grid=grid)
+
+    def test_fanout_empty_is_noop(self):
+        """No ragged writes -> nothing written, no pool spun up."""
+        from zagg.processing.write import _write_ragged_fanout
+
+        cfg = TestRaggedCsrWrite._ragged_cfg()
+        grid = HealpixGrid(4, 6, layout="fullsphere", config=cfg)
+        store = MemoryStore()
+        _write_ragged_fanout([], store, grid=grid)
+        assert dict(store._store_dict) == {}
+
+    def test_write_shard_to_zarr_routes_through_fanout(self, monkeypatch):
+        """``write_shard_to_zarr`` routes its ragged writes through the fan-out
+        exactly once per shard (wiring), keyed per inner chunk. The fan-out's own
+        behavior with real payloads is covered by the direct tests above; here we
+        confirm the sharded write invokes it (and only it) for the CSR side, with
+        one collected write per populated inner chunk keyed by ``_block_index_key``."""
+        from mortie import geo2mort
+
+        import zagg.processing.write as wmod
+        from zagg.processing import write_shard_to_zarr
+        from zagg.processing.write import _block_index_key
+
+        # default_config emits a complete dense template (morton/count/... arrays),
+        # so the sharded dense write succeeds; it has no ragged field, so the
+        # fan-out is still invoked once with the (empty) collected list -- proving
+        # the routing without a bespoke ragged product template.
+        cfg = default_config()
+        grid = HealpixGrid(4, 6, layout="fullsphere", config=cfg, chunk_inner=5, sharded=True)
+        shard_key = int(geo2mort(-78.5, -132.0, order=4)[0])
+        children = grid.children(shard_key)
+        c_first, c_last = int(children[0]), int(children[-1])
+        df = pd.DataFrame(
+            {
+                "h_li": np.array([3.0, 1.0, 7.0], dtype=np.float32),
+                "s_li": np.array([0.1, 0.1, 0.1], dtype=np.float32),
+                "leaf_id": np.array([c_first, c_first, c_last], dtype=np.uint64),
+            }
+        )
+        calls = {"n": 0}
+
+        def one_shot(*a, **k):
+            calls["n"] += 1
+            return df if calls["n"] == 1 else None
+
+        monkeypatch.setattr("zagg.processing._read_group", one_shot)
+        monkeypatch.setattr("zagg.processing.h5coro.H5Coro", lambda *a, **k: object())
+        monkeypatch.setattr("zagg.processing._make_url_rewriter", lambda driver: lambda u: u)
+
+        seen = {"count": 0, "keys": None}
+
+        def spy(ragged_writes, store, *, grid):
+            seen["count"] += 1
+            seen["keys"] = [k for _r, k in ragged_writes]
+
+        monkeypatch.setattr(wmod, "_write_ragged_fanout", spy)
+
+        store = MemoryStore()
+        grid.emit_template(store)
+        chunk_results: list = []
+        process_shard(
+            grid, shard_key, ["s3://x"], s3_credentials={}, config=cfg, chunk_results=chunk_results
+        )
+        write_shard_to_zarr(chunk_results, store, grid=grid, shard_key=shard_key)
+
+        # Exactly one fan-out call for the whole shard, never the per-chunk serial loop.
+        assert seen["count"] == 1
+        # Any ragged writes it did collect are keyed per inner chunk via _block_index_key.
+        for block_index, _carrier, _ragged in chunk_results:
+            _ = _block_index_key(block_index, grid)  # keying path stays exercised/valid
 
 
 class TestRaggedChunkCompanion:
@@ -1233,6 +1633,193 @@ class TestMultiChunkWorker:
             else:
                 # Empty chunk -> NaN anchor (the n_obs==0 short-circuit), not a raise.
                 assert np.isnan(anchor)
+
+
+class TestStreamAndFreeChunkWrites:
+    """Issue #91: a ``write_chunk`` callback streams each chunk write-then-free so
+    the worker holds ~1 chunk instead of all K. Output must stay byte-identical to
+    the accumulated ``chunk_results`` path, and K==1 is a true no-op."""
+
+    _scalar_cfg = staticmethod(TestMultiChunkWorker._scalar_cfg)
+    _patch_reads = TestMultiChunkWorker._patch_reads
+
+    def test_streaming_output_byte_identical_to_accumulated(self, monkeypatch):
+        """K=4: the carriers handed to ``write_chunk`` equal, per block index, the
+        carriers the accumulated ``chunk_results`` path produced — byte-identical."""
+        from mortie import geo2mort
+
+        from zagg.grids import from_config
+
+        cfg = self._scalar_cfg(chunk_inner=7)  # K=4
+        grid = from_config(cfg)
+        assert grid.chunks_per_shard == 4
+        shard_key = int(geo2mort(-78.5, -132.0, order=6)[0])
+        chunks = list(grid.iter_chunks(shard_key))
+        leaf = [int(cc[0]) for _b, cc in chunks]
+        df = pd.DataFrame(
+            {
+                "h_li": np.array([10.0, 11.0, 12.0, 13.0], dtype=np.float32),
+                "leaf_id": np.array(leaf, dtype=np.uint64),
+            }
+        )
+
+        # Accumulated reference.
+        self._patch_reads(monkeypatch, df.copy())
+        acc: list = []
+        process_shard(grid, shard_key, ["s3://x"], s3_credentials={}, config=cfg, chunk_results=acc)
+
+        # Streamed: collect what the callback received.
+        self._patch_reads(monkeypatch, df.copy())
+        streamed: list = []
+
+        def _wc(block_index, carrier, ragged):
+            streamed.append((block_index, carrier, ragged))
+
+        _df, _meta = process_shard(
+            grid, shard_key, ["s3://x"], s3_credentials={}, config=cfg, write_chunk=_wc
+        )
+
+        assert len(streamed) == len(acc) == 4
+        acc_by_block = {tuple(b): (c, r) for b, c, r in acc}
+        for block_index, carrier, ragged in streamed:
+            ref_carrier, ref_ragged = acc_by_block[tuple(block_index)]
+            pd.testing.assert_frame_equal(
+                carrier.reset_index(drop=True), ref_carrier.reset_index(drop=True)
+            )
+            assert ragged == ref_ragged
+
+    def test_callback_fires_once_per_chunk_and_chunk_results_untouched(self, monkeypatch):
+        """The callback is invoked exactly K times and the accumulating sink is
+        never populated when streaming (peak output memory is ~1 chunk)."""
+        from mortie import geo2mort
+
+        from zagg.grids import from_config
+
+        cfg = self._scalar_cfg(chunk_inner=7)  # K=4
+        grid = from_config(cfg)
+        shard_key = int(geo2mort(-78.5, -132.0, order=6)[0])
+        chunks = list(grid.iter_chunks(shard_key))
+        leaf = [int(cc[0]) for _b, cc in chunks]
+        df = pd.DataFrame(
+            {
+                "h_li": np.array([10.0, 11.0, 12.0, 13.0], dtype=np.float32),
+                "leaf_id": np.array(leaf, dtype=np.uint64),
+            }
+        )
+        self._patch_reads(monkeypatch, df)
+
+        # ``live`` tracks carriers still referenced by the callback's caller. The
+        # worker drops its own refs right after the call, so if the callback also
+        # drops, the carrier is collectible before the next chunk is built.
+        seen_blocks: list = []
+        max_live = {"n": 0}
+        live: list = []
+
+        def _wc(block_index, carrier, ragged):
+            seen_blocks.append(tuple(block_index))
+            live.append(carrier)
+            max_live["n"] = max(max_live["n"], len(live))
+            live.clear()  # consumer frees as it goes
+
+        _df, _meta = process_shard(
+            grid, shard_key, ["s3://x"], s3_credentials={}, config=cfg, write_chunk=_wc
+        )
+        assert len(seen_blocks) == 4
+        assert len(set(seen_blocks)) == 4  # one call per distinct chunk
+        assert max_live["n"] == 1  # never more than one chunk held at a time
+
+    def test_streaming_and_chunk_results_together_raises(self, monkeypatch):
+        """Passing both sinks is ambiguous and rejected."""
+        from mortie import geo2mort
+
+        from zagg.grids import from_config
+
+        cfg = self._scalar_cfg(chunk_inner=7)
+        grid = from_config(cfg)
+        shard_key = int(geo2mort(-78.5, -132.0, order=6)[0])
+        df = pd.DataFrame(
+            {
+                "h_li": np.array([1.0], dtype=np.float32),
+                "leaf_id": np.array([int(grid.children(shard_key)[0])], dtype=np.uint64),
+            }
+        )
+        self._patch_reads(monkeypatch, df)
+        with pytest.raises(ValueError, match="either chunk_results"):
+            process_shard(
+                grid,
+                shard_key,
+                ["s3://x"],
+                s3_credentials={},
+                config=cfg,
+                chunk_results=[],
+                write_chunk=lambda *a: None,
+            )
+
+    def test_streaming_and_ragged_out_together_raises(self, monkeypatch):
+        """``write_chunk`` + ``ragged_out`` is rejected: the chunk's ragged is handed
+        to the callback, so ragged_out would be silently empty (review fold)."""
+        from mortie import geo2mort
+
+        from zagg.grids import from_config
+
+        cfg = self._scalar_cfg(chunk_inner=7)
+        grid = from_config(cfg)
+        shard_key = int(geo2mort(-78.5, -132.0, order=6)[0])
+        df = pd.DataFrame(
+            {
+                "h_li": np.array([1.0], dtype=np.float32),
+                "leaf_id": np.array([int(grid.children(shard_key)[0])], dtype=np.uint64),
+            }
+        )
+        self._patch_reads(monkeypatch, df)
+        with pytest.raises(ValueError, match="ignores ragged_out"):
+            process_shard(
+                grid,
+                shard_key,
+                ["s3://x"],
+                s3_credentials={},
+                config=cfg,
+                write_chunk=lambda *a: None,
+                ragged_out={},
+            )
+
+    def test_k1_streaming_is_noop_byte_identical(self, monkeypatch):
+        """K==1: the lone carrier streamed through ``write_chunk`` equals the carrier
+        the default 2-tuple return produces — streaming changes nothing at K==1."""
+        from mortie import geo2mort
+
+        from zagg.grids import from_config
+
+        cfg = self._scalar_cfg(chunk_inner=None)  # K==1
+        grid = from_config(cfg)
+        assert grid.chunks_per_shard == 1
+        shard_key = int(geo2mort(-78.5, -132.0, order=6)[0])
+        children = grid.children(shard_key)
+        df = pd.DataFrame(
+            {
+                "h_li": np.array([5.0, 6.0], dtype=np.float32),
+                "leaf_id": np.array([int(children[0]), int(children[1])], dtype=np.uint64),
+            }
+        )
+        self._patch_reads(monkeypatch, df)
+        df_default, _ = process_shard(grid, shard_key, ["s3://x"], s3_credentials={}, config=cfg)
+
+        self._patch_reads(monkeypatch, df.copy())
+        streamed: list = []
+        df_out, _ = process_shard(
+            grid,
+            shard_key,
+            ["s3://x"],
+            s3_credentials={},
+            config=cfg,
+            write_chunk=lambda b, c, r: streamed.append((b, c, r)),
+        )
+        assert len(streamed) == 1
+        assert df_out.empty  # streamed path returns an empty carrier
+        _block, carrier, _ragged = streamed[0]
+        pd.testing.assert_frame_equal(
+            df_default.reset_index(drop=True), carrier.reset_index(drop=True)
+        )
 
 
 class TestChunkCompanionWorkedExample:

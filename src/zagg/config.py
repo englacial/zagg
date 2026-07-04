@@ -242,6 +242,18 @@ def validate_config(config: PipelineConfig) -> None:
         if layout is not None and layout not in ("dense", "fullsphere"):
             raise ValueError(f"output.grid.layout must be 'dense' or 'fullsphere' (got {layout!r})")
 
+    # Validate the optional per-cell carrier (issue #132). Mirrors the worker's
+    # ``{"pandas", "arrow"}`` guard (worker.py) so a typo in the aggregation YAML
+    # fails at load, not deep in a worker.
+    handoff = config.aggregation.get("handoff")
+    if handoff is not None and handoff not in ("pandas", "arrow"):
+        raise ValueError(f"aggregation.handoff must be 'pandas' or 'arrow' (got {handoff!r})")
+
+    # Optional strict-AOI cell mask (issue #101), default off. Must be a bool.
+    aoi_mask = config.output.get("aoi_mask")
+    if aoi_mask is not None and not isinstance(aoi_mask, bool):
+        raise ValueError(f"output.aoi_mask must be a boolean (got {aoi_mask!r})")
+
     # Validate bounds structure (optional)
     if config.bounds is not None:
         allowed_keys = {"temporal", "spatial"}
@@ -1175,6 +1187,30 @@ def get_driver(config: PipelineConfig) -> str:
     return config.data_source.get("driver", "s3")
 
 
+def get_handoff(config: PipelineConfig) -> str:
+    """Return the per-cell aggregation carrier from the aggregation config (issue #132).
+
+    The ``handoff`` knob lives on the ``aggregation`` block, default ``"arrow"``,
+    and selects the per-cell read->concat->extract carrier: ``"arrow"`` (an
+    ``arro3.core`` Table, faster + lighter on dense shards) or ``"pandas"`` (a
+    DataFrame, which tolerates nullable columns natively). Both feed identical
+    numpy arrays into the same reductions, so scalar outputs are byte-for-byte
+    identical (issues #130/#131). A pipeline declares its carrier next to the rest
+    of its aggregation settings rather than relying on a global default; the
+    explicit ``handoff=`` kwarg still overrides this value.
+
+    Parameters
+    ----------
+    config : PipelineConfig
+
+    Returns
+    -------
+    str
+        ``"arrow"`` (default) or ``"pandas"``.
+    """
+    return config.aggregation.get("handoff", "arrow")
+
+
 def get_child_order(config: PipelineConfig) -> int:
     """Return child_order from the output grid config.
 
@@ -1248,6 +1284,23 @@ def get_sharded(config: PipelineConfig) -> bool:
     return bool(config.output.get("grid", {}).get("sharded", False))
 
 
+def get_shard_order(config: PipelineConfig) -> int | None:
+    """Return the sharding-OBJECT order from the output grid config (issue #133 phase 8).
+
+    ``shard_order`` decouples the ShardingCodec object from the dispatch shard: an
+    order in ``[parent_order, chunk_inner]`` sizes each sharding object — at
+    ``parent_order`` (or ``None``) one object spans the whole dispatch shard (today's
+    byte-identical write), and a finer order (``> parent_order``) makes each object
+    smaller so the worker writes its region in per-object passes (bounding peak memory
+    under the 2 GB cap on large/dense shards).
+    ``None`` (default) keeps one object per dispatch shard — today's behavior, a
+    byte-identical write. Only meaningful when ``sharded`` is True (the grid raises
+    otherwise, validated before deployment).
+    """
+    val = config.output.get("grid", {}).get("shard_order")
+    return None if val is None else int(val)
+
+
 def get_store_path(config: PipelineConfig) -> str | None:
     """Return the store path from the output config, or None.
 
@@ -1260,6 +1313,25 @@ def get_store_path(config: PipelineConfig) -> str | None:
     str or None
     """
     return config.output.get("store")
+
+
+def get_aoi_mask(config: PipelineConfig) -> bool:
+    """Whether the optional strict-AOI cell mask is enabled (issue #101).
+
+    ``output.aoi_mask: true`` packages a per-cell boolean ``aoi_mask`` array
+    aligned to the output cell grid, ``True`` where the cell is inside the AOI.
+    Defaults to ``False`` — when off, no array is emitted and outputs are
+    byte-identical to a run without the feature.
+
+    Parameters
+    ----------
+    config : PipelineConfig
+
+    Returns
+    -------
+    bool
+    """
+    return bool(config.output.get("aoi_mask", False))
 
 
 def get_output_endpoint_url(config: PipelineConfig) -> str | None:
