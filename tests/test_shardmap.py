@@ -370,6 +370,71 @@ class TestIO:
         assert "output_fields" not in sm2.grid_signature
 
 
+class TestParquetIO:
+    """Issue #135 phase 5: the parquet manifest form carries ``shard_keys`` as
+    mortie's ``morton_index`` pyarrow extension type (registered on import) —
+    typed morton columns on the catalog side, off the worker path."""
+
+    @staticmethod
+    def _sm(aoi_mask=None):
+        return ShardMap(
+            {"type": "healpix", "indexing_scheme": "nested", "parent_order": 6},
+            [1050, 1051, 1201],
+            [
+                [{"id": "g1", "s3": "s3://a/g1.h5", "https": "https://a/g1.h5"}],
+                [],
+                [{"id": "g2", "s3": None, "https": "https://a/g2.h5"}],
+            ],
+            {"backend": "mortie", "total_shards": 3},
+            aoi_mask,
+        )
+
+    def test_round_trip(self):
+        pytest.importorskip("pyarrow")
+        sm = self._sm()
+        with tempfile.NamedTemporaryFile(suffix=".parquet", delete=False) as f:
+            sm.to_parquet(f.name)
+            sm2 = ShardMap.from_parquet(f.name)
+        assert sm2.shard_keys == sm.shard_keys
+        assert sm2.granules == sm.granules
+        assert sm2.grid_signature == sm.grid_signature
+        assert sm2.metadata == sm.metadata
+        assert sm2.aoi_mask is None
+
+    def test_shard_keys_column_is_extension_typed(self):
+        pq = pytest.importorskip("pyarrow.parquet")
+        import mortie.arrow
+
+        sm = self._sm()
+        with tempfile.NamedTemporaryFile(suffix=".parquet", delete=False) as f:
+            sm.to_parquet(f.name)
+            table = pq.read_table(f.name)
+        col_type = table.column("shard_keys").type
+        assert col_type.extension_name == mortie.arrow.EXTENSION_NAME
+        # The words survive byte-equal through the typed column.
+        np.testing.assert_array_equal(
+            mortie.arrow.import_c_array(table.column("shard_keys")),
+            np.asarray(sm.shard_keys, dtype=np.uint64),
+        )
+
+    def test_aoi_mask_round_trips_when_present(self):
+        pytest.importorskip("pyarrow")
+        aoi = [[1, 2, 3], [], [7]]
+        sm = self._sm(aoi_mask=aoi)
+        with tempfile.NamedTemporaryFile(suffix=".parquet", delete=False) as f:
+            sm.to_parquet(f.name)
+            sm2 = ShardMap.from_parquet(f.name)
+        assert sm2.aoi_mask == aoi
+
+    def test_foreign_parquet_rejected(self):
+        pa_mod = pytest.importorskip("pyarrow")
+        pq = pytest.importorskip("pyarrow.parquet")
+        with tempfile.NamedTemporaryFile(suffix=".parquet", delete=False) as f:
+            pq.write_table(pa_mod.table({"x": pa_mod.array([1, 2])}), f.name)
+            with pytest.raises(ValueError, match="not a zagg ShardMap parquet manifest"):
+                ShardMap.from_parquet(f.name)
+
+
 def _aoi_config(base="atl06_polar"):
     cfg = default_config(base)
     cfg.output = {**cfg.output, "aoi_mask": True}

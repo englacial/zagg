@@ -584,5 +584,64 @@ class ShardMap:
             d.get("aoi_mask"),
         )
 
+    # Schema-metadata key for the manifest's non-columnar payload (parquet form).
+    _PARQUET_META_KEY = b"zagg:shardmap_meta"
+
+    def to_parquet(self, path: str) -> None:
+        """Write the manifest as parquet with a TYPED morton ``shard_keys`` column.
+
+        The Arrow-native sibling of :meth:`to_json` (issue #135): ``shard_keys``
+        carries mortie's ``morton_index`` pyarrow extension type (registered by
+        mortie on import), so any Arrow-aware consumer sees morton words, not
+        anonymous ints. ``granules`` (and ``aoi_mask`` when present) ride as
+        per-shard JSON strings — the same self-contained payloads the JSON form
+        stores — and ``metadata``/``grid_signature`` live in the schema metadata,
+        mirroring the ``Catalog`` geoparquet convention (``sources.py``).
+
+        Requires pyarrow (the off-Lambda ``catalog`` extra); the worker path
+        never calls this — the runner dispatches from the JSON manifest.
+        """
+        import pyarrow as pa
+        import pyarrow.parquet as pq
+        from mortie.arrow import from_morton_index
+
+        words = np.asarray(self.shard_keys, dtype=np.uint64)
+        columns: dict = {
+            "shard_keys": from_morton_index(words),
+            "granules": pa.array([json.dumps(g) for g in self.granules]),
+        }
+        if self.aoi_mask is not None:
+            columns["aoi_mask"] = pa.array([json.dumps(m) for m in self.aoi_mask])
+        meta = json.dumps({"metadata": self.metadata, "grid_signature": self.grid_signature})
+        table = pa.table(columns).replace_schema_metadata({self._PARQUET_META_KEY: meta.encode()})
+        pq.write_table(table, path)
+
+    @classmethod
+    def from_parquet(cls, path: str) -> "ShardMap":
+        """Load a manifest from the parquet form written by :meth:`to_parquet`.
+
+        Importing :mod:`mortie.arrow` first registers the ``morton_index``
+        extension type, so the ``shard_keys`` column rehydrates typed; the words
+        are pulled over the C Data Interface (``import_c_array``) regardless.
+        """
+        import pyarrow.parquet as pq
+        from mortie.arrow import import_c_array
+
+        table = pq.read_table(path)
+        raw = (table.schema.metadata or {}).get(cls._PARQUET_META_KEY)
+        if raw is None or "granules" not in table.column_names:
+            raise ValueError(f"{path}: not a zagg ShardMap parquet manifest")
+        d = json.loads(raw)
+        if "grid_signature" not in d:
+            raise ValueError(f"{path}: missing required key 'grid_signature'")
+        shard_keys = [int(w) for w in import_c_array(table.column("shard_keys"))]
+        granules = [json.loads(g) for g in table.column("granules").to_pylist()]
+        aoi_mask = (
+            [json.loads(m) for m in table.column("aoi_mask").to_pylist()]
+            if "aoi_mask" in table.column_names
+            else None
+        )
+        return cls(d["grid_signature"], shard_keys, granules, d.get("metadata", {}), aoi_mask)
+
 
 __all__ = ["ShardMap"]
