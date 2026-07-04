@@ -28,7 +28,7 @@ dependencies = [
     "numpy>=2.0",
     "pandas>=2.2",
     "h5coro>=1.0.3",
-    "mortie>=0.8.3",
+    "mortie>=0.8.4",
     "earthaccess",
     "boto3",
     "fastparquet",
