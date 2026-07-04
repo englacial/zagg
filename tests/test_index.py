@@ -16,7 +16,12 @@ from zagg.index import (
     validate_index_config,
 )
 from zagg.index.hierarchical import HierarchicalIndex
-from zagg.index.inline import InlineIndex, build_chunk_map
+from zagg.index.inline import (
+    MANIFEST_DTYPES,
+    InlineIndex,
+    build_chunk_map,
+    granule_manifest,
+)
 from zagg.processing import _read_group, process_shard
 from zagg.registry import UnknownCapability
 
@@ -604,3 +609,158 @@ class TestInlineWorker:
         pd.testing.assert_frame_equal(df_i, df_h)
         for col in df_h.columns:
             assert df_i[col].to_numpy().tobytes() == df_h[col].to_numpy().tobytes()
+
+
+# ---------------------------------------------------------------------------
+# Inline write-back (issue #160 phase 3): granule-keyed manifest to the store
+# ---------------------------------------------------------------------------
+
+_HEIGHTS = ("lat_ph", "lon_ph", "h_ph", "signal_conf_ph")
+
+
+class TestInlineWriteBackConfig:
+    def test_write_back_must_be_bool(self):
+        with pytest.raises(ValueError, match="write_back must be a boolean"):
+            validate_index_config({"backend": "inline", "write_back": "yes"})
+
+    def test_write_back_requires_store(self):
+        with pytest.raises(ValueError, match="requires 'store'"):
+            validate_index_config({"backend": "inline", "write_back": True})
+
+    def test_store_without_write_back_rejected(self):
+        # inline never READS the store (that's sidecar) -- a bare store key is
+        # a config error per the issue's irrelevant-keys-are-errors semantics.
+        with pytest.raises(ValueError, match="only meaningful"):
+            validate_index_config({"backend": "inline", "store": "s3://b/p/"})
+
+    def test_valid_write_back_block(self, tmp_path):
+        ds = _fixture_data_source()
+        validate_index_config({"backend": "inline", "write_back": True, "store": str(tmp_path)}, ds)
+        backend = index_from_config(
+            PipelineConfig(
+                data_source=_fixture_data_source(
+                    index={"backend": "inline", "write_back": True, "store": str(tmp_path)}
+                )
+            )
+        )
+        assert isinstance(backend, InlineIndex)
+        assert backend.write_back is True
+        assert backend.store == str(tmp_path)
+
+
+class TestGranuleManifest:
+    def test_rows_match_chunk_maps(self):
+        h5obj = _open_fixture()
+        paths = [
+            "/gt1l/heights/h_ph",
+            "/gt1l/heights/signal_conf_ph",
+            "/gt1l/geolocation/ph_index_beg",
+        ]
+        maps = {p: build_chunk_map(h5obj, p) for p in paths}
+        df = granule_manifest(maps)
+        assert list(df.columns) == list(MANIFEST_DTYPES)
+        assert df["dataset"].tolist() == sorted(df["dataset"].tolist())
+
+        h_ph = df[df["dataset"] == "/gt1l/heights/h_ph"]
+        cm = maps["/gt1l/heights/h_ph"]
+        assert len(h_ph) == 10
+        assert h_ph["chunk_idx"].tolist() == list(range(10))
+        assert h_ph["byte_offset"].tolist() == cm.byte_offset.tolist()
+        assert h_ph["nbytes"].tolist() == cm.nbytes.tolist()
+        assert h_ph["elem_start"].tolist() == cm.elem_start.tolist()
+        assert h_ph["elem_end"].tolist() == cm.elem_end.tolist()
+        assert set(h_ph["dtype"]) == {"<f4"}
+        assert h_ph["gzip"].all() and h_ph["shuffle"].all()
+        assert set(h_ph["shape"]) == {"[2432]"}
+        assert set(h_ph["chunk_shape"]) == {"[256]"}
+        assert h_ph["chunk_offset"].tolist() == [f"[{256 * k}]" for k in range(10)]
+
+        conf = df[df["dataset"] == "/gt1l/heights/signal_conf_ph"]
+        assert len(conf) == 10  # trailing chunk grid is 1-wide, one real chunk per row
+        assert set(conf["shape"]) == {"[2432, 5]"}
+        assert set(conf["chunk_shape"]) == {"[256, 5]"}
+        assert conf["chunk_offset"].iloc[1] == "[256, 0]"
+
+        contig = df[df["dataset"] == "/gt1l/geolocation/ph_index_beg"]
+        assert len(contig) == 1
+        assert contig.iloc[0]["nbytes"] == 20 * 8
+        assert contig.iloc[0]["dtype"] == "<i8"
+        assert not contig.iloc[0]["gzip"] and not contig.iloc[0]["shuffle"]
+
+    def test_empty_maps_give_typed_empty_frame(self):
+        df = granule_manifest({})
+        assert list(df.columns) == list(MANIFEST_DTYPES)
+        assert len(df) == 0
+        assert df["chunk_idx"].dtype == np.int64
+
+
+class TestInlineWriteBackWorker:
+    def _run(self, tmp_path, index):
+        from h5coro import filedriver
+
+        return process_shard(
+            _LeafCellGrid(_UNALIGNED_LEAVES),
+            1,
+            [str(FIXTURE_H5)],
+            s3_credentials={},
+            h5coro_driver=filedriver.FileDriver,
+            config=PipelineConfig(
+                data_source=_fixture_data_source(index=index),
+                aggregation={
+                    "variables": {
+                        "count": {
+                            "function": "len",
+                            "source": "h_ph",
+                            "dtype": "int32",
+                            "fill_value": 0,
+                        }
+                    }
+                },
+                output={"store": "unused"},
+            ),
+        )
+
+    def test_round_trip_to_local_store(self, tmp_path):
+        store = tmp_path / "zagg-index" / "ATL03" / "007"  # created by open_object_store
+        df_out, meta = self._run(
+            tmp_path, {"backend": "inline", "write_back": True, "store": str(store)}
+        )
+        assert meta["error"] is None
+        manifest_path = store / "atl03_mini.parquet"  # granule id == URL stem
+        assert manifest_path.is_file()
+        df = pd.read_parquet(manifest_path, engine="fastparquet")
+        assert list(df.columns) == list(MANIFEST_DTYPES)
+        # Coverage is lazy: exactly the datasets the planned read touched --
+        # coords + variable + filter dataset, per group (both beams matched).
+        expected = {f"/{beam}/heights/{name}" for beam in ("gt1l", "gt2l") for name in _HEIGHTS}
+        assert set(df["dataset"]) == expected
+        h5obj = _open_fixture()
+        cm = build_chunk_map(h5obj, "/gt1l/heights/h_ph")
+        got = df[df["dataset"] == "/gt1l/heights/h_ph"].sort_values("chunk_idx")
+        assert got["byte_offset"].tolist() == cm.byte_offset.tolist()
+        assert got["nbytes"].tolist() == cm.nbytes.tolist()
+
+    def test_write_back_off_writes_nothing(self, tmp_path):
+        df_out, meta = self._run(tmp_path, {"backend": "inline"})
+        assert meta["error"] is None
+        assert list(tmp_path.rglob("*.parquet")) == []
+
+    def test_store_failure_degrades_to_plain_inline_read(self, tmp_path, caplog):
+        # A store path that is an existing FILE cannot become a directory:
+        # the write-back raises, the worker logs, and the shard still returns.
+        blocker = tmp_path / "blocked"
+        blocker.write_text("not a directory")
+        with caplog.at_level("WARNING"):
+            df_out, meta = self._run(
+                tmp_path, {"backend": "inline", "write_back": True, "store": str(blocker)}
+            )
+        assert meta["error"] is None
+        assert meta["files_processed"] == 1
+        assert meta["total_obs"] > 0
+        assert any("finish_granule failed" in r.message for r in caplog.records)
+
+    def test_finish_granule_drains_pending_when_off(self):
+        backend = InlineIndex()
+        backend._pending["/x"] = object()
+        backend.finish_granule(object(), "s3://b/g.h5")
+        assert backend._pending == {}
