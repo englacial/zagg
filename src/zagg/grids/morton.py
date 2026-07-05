@@ -2,14 +2,19 @@
 
 The ``morton`` output coordinate is carried in memory as a mortie
 :class:`~mortie.morton_index.MortonIndexArray` (a pandas ExtensionArray over the
-packed ``uint64`` Morton words). On disk it is stored as plain ``uint64`` — Zarr
-stores numpy dtypes, not pandas extension dtypes — and reconstructed as a
-``MortonIndexArray`` on read.
+packed ``uint64`` Morton words), and crosses the Arrow carrier boundary as
+mortie's ``morton_index`` Arrow **extension type** over the PyCapsule C Data
+Interface (:func:`morton_to_arrow` / :func:`morton_from_arrow`; mortie >= 0.8.4,
+issue #135) — typed on both the pandas and arro3 surfaces, no pyarrow on the
+worker path. On disk it is stored as plain ``uint64`` — Zarr stores numpy
+dtypes, and the extension metadata lives at the interchange layer only — and
+reconstructed as a ``MortonIndexArray`` on read.
 
 This is the contained #71 migration: only the ``morton`` coordinate adopts the
-type. ``cell_ids`` stays NESTED ``uint64`` (the DGGS coordinate, unchanged), and
-the internal leaf/cell/shard morton arithmetic (``cells_of`` / ``shards_of`` /
-``children``) stays on plain ``uint64`` ndarrays.
+type. ``cell_ids`` stays NESTED ``uint64`` by default (the DGGS coordinate;
+``output.grid.cell_ids_encoding: morton`` optionally emits the morton words
+instead — issue #135), and the internal leaf/cell/shard morton arithmetic
+(``cells_of`` / ``shards_of`` / ``children``) stays on plain ``uint64`` ndarrays.
 
 Storing the raw ``uint64`` words (rather than a reinterpreted ``int64``) is what
 removes the sign hazard: the packed word's prefix is ``base+1``, so base cells
@@ -20,6 +25,13 @@ keeps them non-negative and the Z-order intact (espg/zagg#71).
 from __future__ import annotations
 
 import numpy as np
+
+# Wire name of mortie's Arrow extension type (``mortie.arrow.EXTENSION_NAME``),
+# carried as ``ARROW:extension:name`` field metadata over the PyCapsule C Data
+# Interface (issue #135). Mirrored here so the hot-path metadata check needs no
+# import; a test pins it against mortie's constant.
+MORTON_EXTENSION_NAME = "mortie.morton_index"
+_EXTENSION_NAME_KEY = "ARROW:extension:name"
 
 
 def is_morton_array(values) -> bool:
@@ -55,4 +67,57 @@ def to_morton_array(words):
     return MortonIndexArray.from_words(np.asarray(words, dtype=np.uint64))
 
 
-__all__ = ["is_morton_array", "morton_words", "to_morton_array"]
+def morton_to_arrow(values):
+    """Export ``values`` as a typed ``arro3.core.Array`` (issue #135).
+
+    The Arrow leg of the boundary: the returned array carries mortie's
+    ``morton_index`` extension type in its field metadata
+    (:data:`MORTON_EXTENSION_NAME`), pulled zero-copy over the PyCapsule C Data
+    Interface (``MortonIndexArray.__arrow_c_array__``; mortie >= 0.8.4) — no
+    pyarrow on the path. Accepts a ``MortonIndexArray`` or any
+    ``uint64``-coercible array-like of packed words; the all-zero empty sentinel
+    is exported as an Arrow null.
+    """
+    from arro3.core import Array
+
+    if not is_morton_array(values):
+        values = to_morton_array(values)
+    return Array.from_arrow(values)
+
+
+def morton_from_arrow(col):
+    """Reconstruct a ``MortonIndexArray`` from a typed Arrow column.
+
+    The inverse of :func:`morton_to_arrow`: ``col`` is any Arrow C-Data source
+    (an ``arro3.core.Array``, a chunked ``ChunkedArray`` column, or a
+    ``(schema, array)`` capsule pair). Arrow nulls come back as the all-zero
+    empty sentinel word, so ``isna`` round-trips.
+    """
+    from mortie import MortonIndexArray
+
+    return MortonIndexArray.from_arrow(col)
+
+
+def is_morton_arrow(col) -> bool:
+    """True if ``col`` is an Arrow array/column carrying the morton extension type.
+
+    Reads the ``ARROW:extension:name`` field metadata (present on both an
+    ``arro3.core.Array`` and a table column's ``ChunkedArray``); anything
+    without field metadata is not a typed morton column.
+    """
+    field = getattr(col, "field", None)
+    if field is None:
+        return False
+    # metadata_str is already a plain dict on arro3 — no copy on the write path.
+    return field.metadata_str.get(_EXTENSION_NAME_KEY) == MORTON_EXTENSION_NAME
+
+
+__all__ = [
+    "MORTON_EXTENSION_NAME",
+    "is_morton_array",
+    "is_morton_arrow",
+    "morton_from_arrow",
+    "morton_to_arrow",
+    "morton_words",
+    "to_morton_array",
+]

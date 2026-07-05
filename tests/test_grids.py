@@ -679,6 +679,200 @@ class TestMortonCoordinate:
         np.testing.assert_array_equal(morton_words(to_morton_array(stored)), expected)
 
 
+class TestMortonArrowAdapter:
+    """The typed Arrow legs of the morton boundary (issue #135): morton_to_arrow /
+    morton_from_arrow / is_morton_arrow carry mortie's ``morton_index`` extension
+    type over the PyCapsule interface, mirroring the uint64 round-trip suite above."""
+
+    def test_extension_name_pins_mortie_constant(self):
+        import mortie.arrow
+
+        from zagg.grids.morton import MORTON_EXTENSION_NAME
+
+        assert MORTON_EXTENSION_NAME == mortie.arrow.EXTENSION_NAME
+
+    def test_to_arrow_carries_extension_type(self, cfg):
+        from zagg.grids.morton import is_morton_arrow, morton_to_arrow
+
+        g = HealpixGrid(parent_order=6, child_order=8, layout="fullsphere", config=cfg)
+        coords = g.chunk_coords(_valid_parents(1)[0])
+        arr = morton_to_arrow(coords["morton"])
+        assert is_morton_arrow(arr)
+
+    def test_to_arrow_accepts_raw_words(self):
+        from zagg.grids.morton import is_morton_arrow, morton_from_arrow, morton_to_arrow
+
+        words = np.array([123456789, (1 << 63) | 42], dtype=np.uint64)
+        arr = morton_to_arrow(words)
+        assert is_morton_arrow(arr)
+        np.testing.assert_array_equal(np.asarray(morton_from_arrow(arr)._data), words)
+
+    def test_words_roundtrip_through_arrow(self, cfg):
+        """to_arrow -> from_arrow reconstructs the same packed words the typed
+        coordinate carries — the Arrow legs are a skin, not a re-encoding."""
+        from mortie import generate_morton_children
+
+        from zagg.grids.morton import morton_from_arrow, morton_to_arrow, morton_words
+
+        g = HealpixGrid(parent_order=6, child_order=8, layout="fullsphere", config=cfg)
+        parent = _valid_parents(1)[0]
+        coords = g.chunk_coords(parent)
+        back = morton_from_arrow(morton_to_arrow(coords["morton"]))
+        np.testing.assert_array_equal(morton_words(back), generate_morton_children(int(parent), 8))
+
+    def test_southern_bit63_words_roundtrip(self):
+        """Southern (base 7-11) words set bit 63; the Arrow legs keep them intact
+        as uint64 — the same #71 sign hazard the storage round-trip guards."""
+        from mortie import clip2order, geo2mort
+
+        from zagg.grids.morton import morton_from_arrow, morton_to_arrow, morton_words
+
+        leaf = geo2mort(np.array([-78.5]), np.array([-132.0]), order=18)
+        cells = np.asarray(clip2order(8, leaf), dtype=np.uint64)
+        words = morton_words(morton_from_arrow(morton_to_arrow(cells)))
+        np.testing.assert_array_equal(words, cells)
+        assert words.dtype == np.uint64
+        assert (words.view(np.int64) < 0).any()
+
+    def test_sentinel_null_roundtrip(self):
+        """The all-zero empty sentinel crosses the boundary as an Arrow null and
+        comes back as the sentinel, so isna() round-trips."""
+        from zagg.grids.morton import morton_from_arrow, morton_to_arrow, to_morton_array
+
+        words = np.array([123456789, 0, 42], dtype=np.uint64)
+        back = morton_from_arrow(morton_to_arrow(to_morton_array(words)))
+        np.testing.assert_array_equal(np.asarray(back._data), words)
+        np.testing.assert_array_equal(back.isna(), [False, True, False])
+
+    def test_from_arrow_accepts_chunked_column(self):
+        """A table column (ChunkedArray) round-trips too — the write path hands
+        columns, not bare arrays."""
+        from arro3.core import Table
+
+        from zagg.grids.morton import is_morton_arrow, morton_from_arrow, morton_to_arrow
+
+        words = np.array([7, 11, 13], dtype=np.uint64)
+        tbl = Table.from_pydict({"morton": morton_to_arrow(words)})
+        col = tbl.column("morton")
+        assert is_morton_arrow(col)
+        np.testing.assert_array_equal(np.asarray(morton_from_arrow(col)._data), words)
+
+    def test_is_morton_arrow_false_for_plain_columns(self):
+        from arro3.core import Array, Table
+
+        from zagg.grids.morton import is_morton_arrow
+
+        tbl = Table.from_pydict({"x": Array.from_numpy(np.arange(3, dtype=np.uint64))})
+        assert not is_morton_arrow(tbl.column("x"))
+        assert not is_morton_arrow(tbl.column("x").combine_chunks())
+        assert not is_morton_arrow(np.arange(3))  # no Arrow field at all
+
+
+class TestCellIdsEncoding:
+    """Issue #135: ``output.grid.cell_ids_encoding`` — ``cell_ids`` stays NESTED
+    HEALPix uint64 by default; ``morton`` emits the packed morton words instead
+    (a test/prototype capability). Default behavior is byte-identical."""
+
+    @staticmethod
+    def _cfg(encoding=None):
+        cfg = default_config("atl06")
+        if encoding is not None:
+            cfg.output["grid"]["cell_ids_encoding"] = encoding
+        return cfg
+
+    def _grid(self, encoding=None):
+        return HealpixGrid(
+            parent_order=6, child_order=8, layout="fullsphere", config=self._cfg(encoding)
+        )
+
+    def test_default_and_explicit_nested_identical(self):
+        parent = _valid_parents(1)[0]
+        default = self._grid().chunk_coords(parent)
+        nested = self._grid("nested").chunk_coords(parent)
+        np.testing.assert_array_equal(default["cell_ids"], nested["cell_ids"])
+        np.testing.assert_array_equal(
+            np.asarray(default["morton"]._data), np.asarray(nested["morton"]._data)
+        )
+        # Default stays the NESTED encode, unchanged.
+        g = self._grid()
+        np.testing.assert_array_equal(default["cell_ids"], g.encode_cell_ids(g.children(parent)))
+
+    def test_morton_encoding_emits_words(self):
+        from zagg.grids.morton import morton_words
+
+        g = self._grid("morton")
+        parent = _valid_parents(1)[0]
+        coords = g.chunk_coords(parent)
+        children = np.asarray(g.children(parent), dtype=np.uint64)
+        assert coords["cell_ids"].dtype == np.uint64
+        np.testing.assert_array_equal(coords["cell_ids"], children)
+        # The morton coordinate itself is unchanged (still the typed array).
+        np.testing.assert_array_equal(morton_words(coords["morton"]), children)
+
+    def test_morton_encoding_roundtrips_through_zarr(self):
+        import pandas as pd
+
+        from zagg.processing import write_dataframe_to_zarr
+
+        cfg = self._cfg("morton")
+        g = HealpixGrid(parent_order=6, child_order=8, layout="fullsphere", config=cfg)
+        store = MemoryStore()
+        g.emit_template(store)
+
+        parent = _valid_parents(1)[0]
+        coords = g.chunk_coords(parent)
+        n = len(coords["cell_ids"])
+        df = pd.DataFrame({"cell_ids": coords["cell_ids"]})
+        df["morton"] = coords["morton"]
+        for var in get_data_vars(cfg):
+            df[var] = np.zeros(n, dtype=np.int32 if var == "count" else np.float32)
+        chunk_idx = g.block_index(parent)
+        write_dataframe_to_zarr(df, store, grid=g, chunk_idx=chunk_idx)
+
+        grp = open_group(store, path="8", mode="r")
+        start = chunk_idx[0] * n
+        stored = grp["cell_ids"][start : start + n]
+        np.testing.assert_array_equal(stored, np.asarray(g.children(parent), dtype=np.uint64))
+        assert stored.dtype == np.uint64
+
+    def test_dggs_attrs_record_encoding(self):
+        assert self._grid()._dggs_attrs()["dggs"]["indexing_scheme"] == "nested"
+        assert self._grid("nested")._dggs_attrs()["dggs"]["indexing_scheme"] == "nested"
+        assert self._grid("morton")._dggs_attrs()["dggs"]["indexing_scheme"] == "morton"
+
+    def test_spatial_signature_unchanged_by_encoding(self):
+        # The encoding changes coordinate VALUES, not the spatial layout, so
+        # shard maps stay reusable across the flag (#89).
+        assert self._grid("morton").spatial_signature() == self._grid().spatial_signature()
+
+    def test_unknown_encoding_rejected_at_grid_construction(self):
+        # coords_of (values) and _dggs_attrs (recorded scheme) both interpret the
+        # string, so a grid built from an UNVALIDATED config must reject a third
+        # value here — otherwise NESTED values would be recorded under a foreign
+        # scheme name and consumers would mis-decode every cell.
+        with pytest.raises(ValueError, match="Unknown cell_ids_encoding"):
+            self._grid("ring")
+
+    def test_signature_records_encoding(self):
+        # The full fingerprint carries the encoding (issue #135) so the
+        # validate_compatible rejection message names the actual mismatch;
+        # spatial_signature (shard-map reuse) deliberately does not.
+        assert self._grid().signature()["cell_ids_encoding"] == "nested"
+        assert self._grid("morton").signature()["cell_ids_encoding"] == "morton"
+        assert "cell_ids_encoding" not in self._grid("morton").spatial_signature()
+
+    def test_mixed_encodings_do_not_nest(self):
+        # NESTED ids and morton words are different id spaces: co-aggregating
+        # them would let a consumer join on cell_ids and silently mismatch.
+        nested, morton = self._grid(), self._grid("morton")
+        assert not nested.nests_with(morton)
+        assert not morton.nests_with(nested)
+        # Same encoding still nests — including default vs explicit "nested",
+        # so the gate changes nothing for anyone not using the flag.
+        assert nested.nests_with(self._grid("nested"))
+        assert morton.nests_with(self._grid("morton"))
+
+
 class TestChunkInnerMultiChunk:
     """Issue #30 item 3: an optional finer ``chunk_inner`` level between shard and
     cell, native units per grid (HEALPix order, rectilinear shape). One shard owns

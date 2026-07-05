@@ -21,7 +21,7 @@ from zagg.config import (
     get_output_signature,
 )
 from zagg.csr import write_csr
-from zagg.grids.morton import is_morton_array, morton_words
+from zagg.grids.morton import is_morton_array, is_morton_arrow, morton_to_arrow, morton_words
 
 # The sharded path's K ragged (CSR) subgroup writes fan out over a bounded thread
 # pool (issue #142): each inner chunk emits an independent CSR group at a disjoint
@@ -74,6 +74,14 @@ def _build_output(
     ``arro3.core.Table`` when any ``vector`` field is present, in both cases with
     the data-variable columns followed by the grid's per-cell coord columns.
 
+    On both carriers the ``morton`` coordinate is TYPED (issue #135): the pandas
+    carrier holds the mortie ``MortonIndexArray`` (#71), and the arro3 carrier
+    holds mortie's ``morton_index`` Arrow extension column
+    (:func:`zagg.grids.morton.morton_to_arrow`). The type lives at the
+    interchange layer only — ``_iter_carrier_columns`` extracts the packed
+    ``uint64`` words at the write boundary, so the on-disk dtype is plain
+    ``uint64`` either way.
+
     ``children`` (issue #30 item 3): when given, the coord columns are computed
     for that explicit chunk's cells via ``grid.coords_of(children)`` instead of the
     whole shard's ``grid.chunk_coords(shard_key)``. This is what lets the K>1 worker
@@ -103,11 +111,15 @@ def _build_output(
         for var in data_vars
     }
     for col_name, vals in coords.items():
-        # Route the morton coordinate through the same uint64 boundary as the
-        # pandas carrier (#71), so both carriers share one on-disk dtype guarantee
-        # rather than relying on MortonIndexArray.__array__ returning uint64.
-        arr = morton_words(vals) if is_morton_array(vals) else np.asarray(vals)
-        columns[col_name] = Array.from_numpy(np.ascontiguousarray(arr))
+        # The typed morton coordinate crosses into the arro3 carrier as mortie's
+        # ``morton_index`` extension column (issue #135) — zero-copy over the
+        # PyCapsule interface, no pyarrow. The extension metadata lives at the
+        # interchange layer only: the write boundary (``_iter_carrier_columns``)
+        # extracts the packed uint64 words, so on-disk stays plain uint64 (#71).
+        if is_morton_array(vals):
+            columns[col_name] = morton_to_arrow(vals)
+        else:
+            columns[col_name] = Array.from_numpy(np.ascontiguousarray(np.asarray(vals)))
     return Table.from_pydict(columns)
 
 
@@ -716,7 +728,10 @@ def _iter_carrier_columns(carrier):
 
     Scalar columns yield a 1-D array; a ``FixedSizeList<C>`` Arrow column yields a
     2-D ``(n_cells, C)`` array (the per-cell vector block), so the writer can map
-    it onto the Zarr trailing payload dimension (issue #29).
+    it onto the Zarr trailing payload dimension (issue #29). A typed morton
+    column — ``MortonIndexArray`` on the pandas carrier (#71), the
+    ``morton_index`` Arrow extension column on the arro3 carrier (issue #135) —
+    yields its packed ``uint64`` words, the on-disk form.
     """
     if isinstance(carrier, pd.DataFrame):
         for name, series in carrier.items():
@@ -730,10 +745,19 @@ def _iter_carrier_columns(carrier):
         return
 
     from arro3.core import list_flatten
+    from mortie.arrow import import_c_array
 
     n_rows = carrier.num_rows
     for name in carrier.column_names:
         col = carrier.column(name).combine_chunks()
+        # A typed morton column (mortie's ``morton_index`` extension type; issue
+        # #135) is the arro3 mirror of the pandas MortonIndexArray branch above:
+        # pull the packed uint64 words over the C Data Interface for the on-disk
+        # write (Arrow nulls -> the all-zero sentinel), keeping the stored dtype
+        # plain uint64 (#71).
+        if is_morton_arrow(col):
+            yield name, import_c_array(col)
+            continue
         # arro3 marks a FixedSizeList by an integer ``list_size`` (None for scalar
         # types), so the per-cell width and the 2-D reshape mirror the pyarrow path
         # exactly — the numpy block written to Zarr is byte-for-byte unchanged.

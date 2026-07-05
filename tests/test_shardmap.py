@@ -370,6 +370,109 @@ class TestIO:
         assert "output_fields" not in sm2.grid_signature
 
 
+class TestParquetIO:
+    """Issue #135 phase 5: the parquet manifest form carries ``shard_keys`` as
+    mortie's ``morton_index`` pyarrow extension type (registered on import) —
+    typed morton columns on the catalog side, off the worker path."""
+
+    @staticmethod
+    def _sm(aoi_mask=None):
+        return ShardMap(
+            {"type": "healpix", "indexing_scheme": "nested", "parent_order": 6},
+            [1050, 1051, 1201],
+            [
+                [{"id": "g1", "s3": "s3://a/g1.h5", "https": "https://a/g1.h5"}],
+                [],
+                [{"id": "g2", "s3": None, "https": "https://a/g2.h5"}],
+            ],
+            {"backend": "mortie", "total_shards": 3},
+            aoi_mask,
+        )
+
+    def test_round_trip(self):
+        pytest.importorskip("pyarrow")
+        sm = self._sm()
+        with tempfile.NamedTemporaryFile(suffix=".parquet", delete=False) as f:
+            sm.to_parquet(f.name)
+            sm2 = ShardMap.from_parquet(f.name)
+        assert sm2.shard_keys == sm.shard_keys
+        assert sm2.granules == sm.granules
+        assert sm2.grid_signature == sm.grid_signature
+        assert sm2.metadata == sm.metadata
+        assert sm2.aoi_mask is None
+
+    def test_shard_keys_column_is_extension_typed(self):
+        pq = pytest.importorskip("pyarrow.parquet")
+        import mortie.arrow
+
+        sm = self._sm()
+        with tempfile.NamedTemporaryFile(suffix=".parquet", delete=False) as f:
+            sm.to_parquet(f.name)
+            table = pq.read_table(f.name)
+        col_type = table.column("shard_keys").type
+        assert col_type.extension_name == mortie.arrow.EXTENSION_NAME
+        # The words survive byte-equal through the typed column.
+        np.testing.assert_array_equal(
+            mortie.arrow.import_c_array(table.column("shard_keys")),
+            np.asarray(sm.shard_keys, dtype=np.uint64),
+        )
+
+    def test_aoi_mask_round_trips_when_present(self):
+        pytest.importorskip("pyarrow")
+        aoi = [[1, 2, 3], [], [7]]
+        sm = self._sm(aoi_mask=aoi)
+        with tempfile.NamedTemporaryFile(suffix=".parquet", delete=False) as f:
+            sm.to_parquet(f.name)
+            sm2 = ShardMap.from_parquet(f.name)
+        assert sm2.aoi_mask == aoi
+
+    def test_foreign_parquet_rejected(self):
+        pa_mod = pytest.importorskip("pyarrow")
+        pq = pytest.importorskip("pyarrow.parquet")
+        with tempfile.NamedTemporaryFile(suffix=".parquet", delete=False) as f:
+            pq.write_table(pa_mod.table({"x": pa_mod.array([1, 2])}), f.name)
+            with pytest.raises(ValueError, match="not a zagg ShardMap parquet manifest"):
+                ShardMap.from_parquet(f.name)
+
+    def test_missing_shard_keys_column_rejected_cleanly(self):
+        # A file carrying the zagg meta key and granules but no shard_keys must
+        # hit the clean ValueError, not a bare pyarrow KeyError.
+        pa_mod = pytest.importorskip("pyarrow")
+        pq = pytest.importorskip("pyarrow.parquet")
+        table = pa_mod.table({"granules": pa_mod.array(["[]"])}).replace_schema_metadata(
+            {ShardMap._PARQUET_META_KEY: b'{"metadata": {}, "grid_signature": {}}'}
+        )
+        with tempfile.NamedTemporaryFile(suffix=".parquet", delete=False) as f:
+            pq.write_table(table, f.name)
+            with pytest.raises(ValueError, match="not a zagg ShardMap parquet manifest"):
+                ShardMap.from_parquet(f.name)
+
+    def test_extension_stripped_column_still_loads(self):
+        # import_c_array reads plain uint64 storage too (verified on mortie
+        # 0.8.4), so a manifest whose shard_keys column lost the extension type
+        # still rehydrates with the correct keys.
+        pa_mod = pytest.importorskip("pyarrow")
+        pq = pytest.importorskip("pyarrow.parquet")
+        sm = self._sm()
+        stripped = pa_mod.table(
+            {
+                "shard_keys": pa_mod.array(np.asarray(sm.shard_keys, dtype=np.uint64)),
+                "granules": pa_mod.array([json.dumps(g) for g in sm.granules]),
+            }
+        ).replace_schema_metadata(
+            {
+                ShardMap._PARQUET_META_KEY: json.dumps(
+                    {"metadata": sm.metadata, "grid_signature": sm.grid_signature}
+                ).encode()
+            }
+        )
+        with tempfile.NamedTemporaryFile(suffix=".parquet", delete=False) as f:
+            pq.write_table(stripped, f.name)
+            sm2 = ShardMap.from_parquet(f.name)
+        assert sm2.shard_keys == sm.shard_keys
+        assert sm2.granules == sm.granules
+
+
 def _aoi_config(base="atl06_polar"):
     cfg = default_config(base)
     cfg.output = {**cfg.output, "aoi_mask": True}
@@ -437,13 +540,20 @@ class TestBuildAOIMask:
 
 
 class TestSpatialSignature:
-    """``spatial_signature()`` is the full signature minus ``output_fields`` (#89)."""
+    """``spatial_signature()`` is the full signature minus the co-aggregation
+    components — ``output_fields`` (#89) and, for HEALPix, ``cell_ids_encoding``
+    (issue #135)."""
 
     def test_healpix_excludes_output_fields(self):
         g = HealpixGrid(6, 12, layout="fullsphere")
         spatial = g.spatial_signature()
         assert "output_fields" not in spatial
-        assert g.signature() == {**spatial, "output_fields": g.signature()["output_fields"]}
+        assert "cell_ids_encoding" not in spatial
+        assert g.signature() == {
+            **spatial,
+            "output_fields": g.signature()["output_fields"],
+            "cell_ids_encoding": "nested",
+        }
 
     def test_rectilinear_excludes_output_fields(self, grid):
         spatial = grid.spatial_signature()
