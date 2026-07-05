@@ -79,7 +79,16 @@ def validate_streaming(config: PipelineConfig) -> None:
         elif sig["resolution"] != "cell":
             problems.append(f"field '{name}': resolution '{sig['resolution']}' cannot stream")
         elif sig["kind"] == "ragged":
-            if meta.get("function") != _TDIGEST_FUNCTION:
+            if sig["location"] is not None:
+                # The located channel (issue #87) has a merge law (located
+                # merge_tdigests), but the streaming state does not thread
+                # per-cell locations yet — reject rather than silently dropping
+                # the channel from the store.
+                problems.append(
+                    f"field '{name}': located ragged fields (location: "
+                    f"{sig['location']!r}) cannot stream yet"
+                )
+            elif meta.get("function") != _TDIGEST_FUNCTION:
                 problems.append(
                     f"field '{name}': ragged function {meta.get('function')!r} has no "
                     f"merge law (only {_TDIGEST_FUNCTION})"

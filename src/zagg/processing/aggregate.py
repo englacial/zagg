@@ -413,7 +413,9 @@ def calculate_cell_statistics(
             empty[name] = _empty_cell_value(meta)
         return empty
 
-    result = {}
+    # Values are scalars, arrays, or (payload, locations) pairs for located
+    # ragged fields (issue #87).
+    result: dict[str, Any] = {}
     for name, meta in agg_fields.items():
         func_name = meta.get("function")
         expression = meta.get("expression")
@@ -474,6 +476,39 @@ def calculate_cell_statistics(
                 resolved_params[pkey] = pval
 
         func = resolve_function(func_name)
+
+        # Located ragged field (issue #87): hand the reducer the named
+        # per-observation morton column and accept a ``(payload, locations)``
+        # pair — the uint64 locations ride beside the payload into the CSR
+        # companion array. Only the HEALPix read path supplies ``leaf_id``, so a
+        # missing column is a grid/config mismatch, reported clearly.
+        if sig["kind"] == "ragged" and sig["location"] is not None:
+            loc_col = sig["location"]
+            if loc_col not in cell_data:
+                raise ValueError(
+                    f"ragged field {name!r} declares location: {loc_col!r} but that "
+                    f"column is not in the cell data (available: {sorted(cell_data)}); "
+                    f"per-observation mortons require a HEALPix grid"
+                )
+            payload, locations = func(values, locations=cell_data[loc_col], **resolved_params)
+            payload = _coerce_ragged_value(payload, sig)
+            locations = np.ascontiguousarray(np.asarray(locations))
+            if locations.dtype != np.uint64:
+                # A silent uint64 cast would wrap negative/float garbage into
+                # plausible-looking morton words; require the reducer to return
+                # uint64 outright (as build_tdigest does).
+                raise ValueError(
+                    f"ragged field {name!r}: locations dtype {locations.dtype} is not "
+                    f"uint64; the reducer must return packed morton words"
+                )
+            if locations.shape != (payload.shape[0],):
+                raise ValueError(
+                    f"ragged field {name!r}: locations shape {locations.shape} does not "
+                    f"match the payload's {payload.shape[0]} elements"
+                )
+            result[name] = (payload, locations)
+            continue
+
         out = func(values, **resolved_params)
         # Scalar fields stay byte-for-byte identical to the pre-#29 path; a
         # declared ``vector`` field coerces to its trailing_shape (issue #29); a
@@ -497,10 +532,20 @@ def _empty_cell_value(meta: dict):
     ``trailing_shape`` array filled with its schema-declared sentinel
     (:func:`_field_sentinel`), so empty and populated cells emit the same shape.
     A ``ragged`` field (issue #48) returns an empty list ``[]`` — the CSR writer
-    handles absent cells by leaving them out of ``cell_ids``.
+    handles absent cells by leaving them out of ``cell_ids``. A *located* ragged
+    field (issue #87) returns an empty ``(payload, locations)`` pair instead,
+    keeping the pair contract uniform for direct callers.
     """
     sig = get_output_signature(meta)
     if sig["kind"] == "ragged":
+        if sig["location"] is not None:
+            # A located field's contract is a (payload, locations) pair even for
+            # empty cells (issue #87), so direct callers can always unpack.
+            dtype = np.dtype(sig["dtype"]) if sig["dtype"] is not None else np.dtype("float32")
+            return (
+                np.empty((0, *sig["inner_shape"]), dtype=dtype),
+                np.empty(0, dtype=np.uint64),
+            )
         return []
     if sig["kind"] == "vector":
         dtype = np.dtype(sig["dtype"]) if sig["dtype"] is not None else np.dtype("float32")
@@ -635,22 +680,28 @@ def _aggregate_chunk_cells(
     the whole shard's, so this is byte-for-byte the old single-chunk loop.
 
     Returns ``(stats_arrays, ragged_payloads, ragged_cell_indices,
-    cells_with_data)``: dense fields preallocated to ``(n_cells, *trailing_shape)``
-    and filled per cell; ragged fields collected as ``(payloads, cell_indices)``
-    keyed by the cell's position in ``children`` (the chunk-local index the CSR
-    writer expects).
+    ragged_locations, cells_with_data)``: dense fields preallocated to
+    ``(n_cells, *trailing_shape)`` and filled per cell; ragged fields collected
+    as ``(payloads, cell_indices)`` keyed by the cell's position in ``children``
+    (the chunk-local index the CSR writer expects). ``ragged_locations`` holds
+    the per-cell uint64 location vectors for located fields only (issue #87) —
+    keyed like ``ragged_payloads`` and index-aligned with them; unlocated fields
+    have no entry.
     """
     children = np.asarray(children)
     n_cells = len(children)
     stats_arrays: dict = {}
     ragged_payloads: dict[str, list] = {}
     ragged_cell_indices: dict[str, list[int]] = {}
+    ragged_locations: dict[str, list] = {}
     for name in data_vars:
         meta = agg_fields[name]
         sig = get_output_signature(meta)
         if sig["kind"] == "ragged":
             ragged_payloads[name] = []
             ragged_cell_indices[name] = []
+            if sig["location"] is not None:
+                ragged_locations[name] = []
             continue
         # Vector fields (issue #29) get a per-cell (n_cells, *trailing_shape) block;
         # scalars keep the 1-D (n_cells,) layout, unchanged.
@@ -687,11 +738,28 @@ def _aggregate_chunk_cells(
             if key in ragged_payloads:
                 # Ragged field: collect non-empty payloads with their chunk-local
                 # cell index. Empty cells (``_empty_cell_value`` -> []) are skipped.
-                arr_val = np.asarray(value)
-                if arr_val.size > 0:
-                    ragged_payloads[key].append(arr_val)
-                    ragged_cell_indices[key].append(i)
+                # A located field (issue #87) delivers a (payload, locations) pair;
+                # its locations are collected index-aligned with the payloads.
+                if isinstance(value, tuple):
+                    payload, locations = value
+                else:
+                    payload, locations = np.asarray(value), None
+                if payload.size == 0:
+                    continue
+                # Fail fast if the value's shape disagrees with the declared
+                # signature (a located field must deliver its pair; empty cells
+                # are exempt as they were skipped above) — a silent mismatch
+                # would surface much later as a CSR length error in the writer.
+                if (key in ragged_locations) != (locations is not None):
+                    raise ValueError(
+                        f"ragged field {key!r}: located/unlocated mismatch between the "
+                        f"declared signature and the reducer's return"
+                    )
+                ragged_payloads[key].append(payload)
+                ragged_cell_indices[key].append(i)
+                if locations is not None:
+                    ragged_locations[key].append(locations)
             else:
                 stats_arrays[key][i] = value
 
-    return stats_arrays, ragged_payloads, ragged_cell_indices, cells_with_data
+    return stats_arrays, ragged_payloads, ragged_cell_indices, ragged_locations, cells_with_data

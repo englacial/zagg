@@ -98,6 +98,14 @@ class TestStreamingConfig:
         with pytest.raises(ValueError, match="merge law"):
             validate_streaming(cfg)
 
+    def test_located_ragged_rejected(self):
+        # The located channel (issue #87) is not threaded through the
+        # streaming state yet; reject rather than silently drop it.
+        cfg = _config()
+        cfg.aggregation["variables"]["h_tdigest"]["location"] = "leaf_id"
+        with pytest.raises(ValueError, match="located ragged fields .* cannot stream"):
+            validate_streaming(cfg)
+
     def test_chunk_precompute_rejected(self):
         cfg = _config()
         cfg.aggregation["chunk_precompute"] = {"anchor": {"function": "mean", "source": "h_ph"}}

@@ -62,6 +62,13 @@ Wire as a ragged reducer in a YAML config::
 
 ``calculate_cell_statistics`` calls ``build_tdigest(values, delta=512)`` per
 cell and stores the ``(k, 2)`` centroid array in the ragged field.
+
+Adding ``location: leaf_id`` to the field (issue #87) passes the cell's
+per-observation order-29 morton point words as ``locations=``; the reducer then
+returns a ``(digest, locations)`` pair whose second element is the ``(k,)``
+uint64 per-centroid location — the deepest morton cell enclosing each
+centroid's members (``mortie.common_ancestor``), stored as a companion CSR
+array. See ``zagg/configs/atl03_tdigest_located_healpix.yaml``.
 """
 
 from __future__ import annotations
@@ -92,10 +99,31 @@ def _k1_scale(q: float, delta: float) -> float:
     return delta * (float(np.arcsin(2.0 * qc - 1.0)) / np.pi + 0.5)
 
 
+def _centroid_ancestors(locations: np.ndarray, starts: list[int], n: int) -> np.ndarray:
+    """Reduce per-member morton locations to one enclosing cell per centroid.
+
+    ``locations`` is member-ordered (aligned with the sorted values / combined
+    centroids), ``starts`` the first member index of each centroid.  Each
+    centroid's location is ``mortie.common_ancestor`` over its members' words —
+    the deepest cell containing all of them (issue #87).  Mixed-order input is
+    fine (a below-order-29 mean-morton from a prior merge folds with fresh
+    order-29 points), and a single member returns itself with its point kind
+    preserved, so a 1-obs centroid round-trips its exact order-29 point word.
+    """
+    from mortie import common_ancestor
+
+    bounds = [*starts, n]
+    out = np.empty(len(starts), dtype=np.uint64)
+    for j in range(len(starts)):
+        out[j] = common_ancestor(locations[bounds[j] : bounds[j + 1]])
+    return out
+
+
 def build_tdigest(
     values: np.ndarray,
     delta: int = _DEFAULT_DELTA,
-) -> np.ndarray:
+    locations: np.ndarray | None = None,
+) -> np.ndarray | tuple[np.ndarray, np.ndarray]:
     """Build a t-digest sketch from a 1-D array of values.
 
     Parameters
@@ -106,33 +134,74 @@ def build_tdigest(
     delta : int, optional
         Compression parameter.  Larger δ → more centroids → more accurate.
         Default 512.  Typical values: 128, 256, 512, 1024.
+    locations : ndarray, optional
+        Per-observation ``uint64`` morton point words (issue #87), aligned with
+        ``values``; observations dropped for NaN values drop their location too.
+        When given, each centroid also carries a location: the deepest morton
+        cell enclosing its members' words (``mortie.common_ancestor``), which
+        for a 1-obs centroid is that observation's exact point word.  All words
+        must share one HEALPix base cell (guaranteed when they come from one
+        grid cell's observations; mortie raises otherwise).
 
     Returns
     -------
     ndarray, shape (k, 2), dtype float32
         Sorted centroid array.  Column 0 is centroid mean; column 1 is weight
         (number of observations merged into that centroid).
+        With ``locations``, returns a ``(digest, locs)`` tuple instead, where
+        ``locs`` is the ``(k,)`` uint64 per-centroid location vector.
 
     Notes
     -----
-    Returns an empty ``(0, 2)`` array when ``values`` is empty or all-NaN.
+    Returns an empty ``(0, 2)`` array when ``values`` is empty or all-NaN
+    (an empty ``(digest, locs)`` pair with ``locations``).  The digest itself
+    is identical with or without ``locations``.
     """
     values = np.asarray(values, dtype=np.float64)
-    values = values[np.isfinite(values)]
+    finite = np.isfinite(values)
+    if locations is not None:
+        locations = np.asarray(locations)
+        if locations.dtype != np.uint64:
+            # A silent uint64 cast would truncate a float column (e.g. a
+            # mis-declared ``location:``) into garbage morton words — require
+            # packed uint64 words outright (what ``assign`` supplies as leaf_id).
+            raise ValueError(
+                f"locations dtype {locations.dtype} is not uint64; pass packed "
+                f"morton point words (the per-observation leaf_id column)"
+            )
+        if locations.shape != values.shape:
+            raise ValueError(
+                f"locations shape {locations.shape} does not match values shape {values.shape}"
+            )
+        locations = locations[finite]
+    values = values[finite]
     n = len(values)
     if n == 0:
-        return np.empty((0, 2), dtype=np.float32)
+        empty = np.empty((0, 2), dtype=np.float32)
+        if locations is not None:
+            return empty, np.empty(0, dtype=np.uint64)
+        return empty
 
-    sorted_vals = np.sort(values)
+    if locations is not None:
+        # Stable co-sort so equal values keep a deterministic location order.
+        order = np.argsort(values, kind="stable")
+        sorted_vals = values[order]
+        locations = locations[order]
+    else:
+        sorted_vals = np.sort(values)
     n_total = float(n)
     delta_f = float(delta)
 
     # Centroids accumulated as parallel lists (faster than growing a 2-D array).
+    # ``starts`` records each centroid's first member index in the sorted order,
+    # so the location channel can reduce member words per centroid afterwards.
     means: list[float] = []
     weights: list[float] = []
+    starts: list[int] = []
 
     cur_mean = sorted_vals[0]
     cur_weight = 1.0
+    cur_start = 0
     # k1 scale value at the current centroid's left edge — the cumulative rank
     # fraction *before* its first observation. Observation i extends the
     # centroid's right edge to rank (i + 1); it joins the centroid while the
@@ -151,16 +220,21 @@ def build_tdigest(
         else:
             means.append(cur_mean)
             weights.append(cur_weight)
+            starts.append(cur_start)
             cur_mean = v
             cur_weight = 1.0
+            cur_start = i
             k_left = _k1_scale(i / n_total, delta_f)
 
     means.append(cur_mean)
     weights.append(cur_weight)
+    starts.append(cur_start)
 
     out = np.empty((len(means), 2), dtype=np.float32)
     out[:, 0] = means
     out[:, 1] = weights
+    if locations is not None:
+        return out, _centroid_ancestors(locations, starts, n)
     return out
 
 
@@ -168,7 +242,9 @@ def merge_tdigests(
     d1: np.ndarray,
     d2: np.ndarray,
     delta: int = _DEFAULT_DELTA,
-) -> np.ndarray:
+    locations1: np.ndarray | None = None,
+    locations2: np.ndarray | None = None,
+) -> np.ndarray | tuple[np.ndarray, np.ndarray]:
     """Merge two t-digest centroid arrays into one.
 
     Concatenates the centroid arrays, sorts by mean, and re-compresses with
@@ -183,34 +259,74 @@ def merge_tdigests(
         Second centroid array.
     delta : int, optional
         Compression parameter (same default as :func:`build_tdigest`).
+    locations1, locations2 : ndarray, optional
+        Per-centroid ``uint64`` morton locations (issue #87) aligned with
+        ``d1`` / ``d2``, as returned by the located :func:`build_tdigest` (or a
+        prior located merge).  Pass both or neither.  A merged centroid's
+        location is ``mortie.common_ancestor`` over its members' locations —
+        mixed orders fold fine, so an already-collapsed low-order mean-morton
+        merges with fresh order-29 point words.  All locations folded into one
+        merged centroid must share a HEALPix base cell (guaranteed when both
+        digests come from the same grid cell); mortie raises ``ValueError``
+        otherwise — cross-base roll-ups need ``mortie.split_base_cells`` and
+        are out of scope here.
 
     Returns
     -------
     ndarray, shape (k_merged, 2), dtype float32
-        Merged and re-compressed centroid array.
+        Merged and re-compressed centroid array.  With locations, returns a
+        ``(digest, locs)`` tuple, ``locs`` the ``(k_merged,)`` uint64 vector.
     """
+    located = locations1 is not None or locations2 is not None
+    if located and (locations1 is None) != (locations2 is None):
+        raise ValueError("pass both locations1 and locations2, or neither")
     d1 = np.asarray(d1, dtype=np.float64)
     d2 = np.asarray(d2, dtype=np.float64)
+    if located:
+        locations1 = np.asarray(locations1)
+        locations2 = np.asarray(locations2)
+        for d, locs, tag in ((d1, locations1, "locations1"), (d2, locations2, "locations2")):
+            if locs.dtype != np.uint64:
+                raise ValueError(
+                    f"{tag} dtype {locs.dtype} is not uint64; pass packed morton words"
+                )
+            if locs.shape != (len(d),):
+                raise ValueError(f"{tag} shape {locs.shape} does not match {len(d)} centroids")
 
     if d1.size == 0 and d2.size == 0:
-        return np.empty((0, 2), dtype=np.float32)
+        empty = np.empty((0, 2), dtype=np.float32)
+        return (empty, np.empty(0, dtype=np.uint64)) if located else empty
     if d1.size == 0:
-        return np.asarray(d2, dtype=np.float32)
+        d2_out = np.asarray(d2, dtype=np.float32)
+        if locations2 is not None:
+            # Copy so the returned channel never aliases the caller's array.
+            return d2_out, locations2.copy()
+        return d2_out
     if d2.size == 0:
-        return np.asarray(d1, dtype=np.float32)
+        d1_out = np.asarray(d1, dtype=np.float32)
+        if locations1 is not None:
+            return d1_out, locations1.copy()
+        return d1_out
 
     combined = np.concatenate([d1, d2], axis=0)
     order = np.argsort(combined[:, 0], kind="stable")
     combined = combined[order]
+    combined_locs = (
+        np.concatenate([locations1, locations2])[order]
+        if locations1 is not None and locations2 is not None
+        else None
+    )
 
     delta_f = float(delta)
     n_total = float(combined[:, 1].sum())
 
     means: list[float] = []
     weights: list[float] = []
+    starts: list[int] = []
 
     cur_mean = float(combined[0, 0])
     cur_weight = float(combined[0, 1])
+    cur_start = 0
     # Cumulative weight before the current centroid's first sub-centroid, and
     # the k1 scale value at that left edge. A sub-centroid merges in while the
     # combined centroid still spans ≤ 1 unit of the k1 scale.
@@ -229,17 +345,22 @@ def merge_tdigests(
         else:
             means.append(cur_mean)
             weights.append(cur_weight)
+            starts.append(cur_start)
             cum_left += cur_weight
             k_left = _k1_scale(cum_left / n_total, delta_f)
             cur_mean = v_mean
             cur_weight = v_weight
+            cur_start = i
 
     means.append(cur_mean)
     weights.append(cur_weight)
+    starts.append(cur_start)
 
     out = np.empty((len(means), 2), dtype=np.float32)
     out[:, 0] = means
     out[:, 1] = weights
+    if combined_locs is not None:
+        return out, _centroid_ancestors(combined_locs, starts, len(combined))
     return out
 
 

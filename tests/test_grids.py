@@ -258,6 +258,40 @@ class TestReferenceOrder:
         assert mx > np.iinfo(np.int64).max  # would be negative if stored signed
         assert mx <= np.iinfo(np.uint64).max
 
+    def test_assign_emits_point_kind_words(self):
+        # ``assign`` encodes point-kind (Kind::Point) order-29 words (issue #87),
+        # distinct from the order-29 *area* words ``geo2mort`` emits: a point word
+        # marks a location of unknown extent, which ``common_ancestor`` preserves
+        # for a lone observation.
+        from mortie import common_ancestor, geo2mort
+
+        rng = np.random.default_rng(87)
+        lats = rng.uniform(-89, 89, 500)
+        lons = rng.uniform(-179, 179, 500)
+        g = HealpixGrid(parent_order=11, child_order=19, layout="fullsphere")
+        leaves = np.asarray(g.assign(lats, lons))
+        assert leaves.dtype == np.uint64
+        area = np.asarray(geo2mort(lats, lons, order=29))
+        assert not np.array_equal(leaves, area)  # point kind, not area
+        # A single point word is its own common ancestor (kind preserved).
+        for w in leaves[:10]:
+            assert int(common_ancestor(np.array([w], dtype=np.uint64))) == int(w)
+
+    def test_point_kind_coarsening_matches_area_kind(self):
+        # The byte-identity enabler for issue #87: point and area words share the
+        # same path prefix, so ``cells_of``/``shards_of`` coarsening — and every
+        # dense output derived from it — is bit-identical to the old area encode.
+        from mortie import clip2order, geo2mort
+
+        rng = np.random.default_rng(88)
+        lats = rng.uniform(-89, 89, 5000)
+        lons = rng.uniform(-179, 179, 5000)
+        g = HealpixGrid(parent_order=11, child_order=19, layout="fullsphere")
+        leaves = g.assign(lats, lons)
+        area = geo2mort(lats, lons, order=29)
+        assert np.array_equal(g.cells_of(leaves), clip2order(19, area))
+        assert np.array_equal(g.shards_of(leaves), clip2order(11, area))
+
     def test_order_19_template_emits(self):
         # The order-19 + chunk_inner template emits sanely: cell-resolution arrays
         # at the full 12*4^19 grid, ``resolution: chunk`` companions at the chunk

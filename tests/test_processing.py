@@ -935,6 +935,212 @@ class TestRaggedCsrWrite:
         assert out is store
 
 
+def _bad_located_reducer(values, locations=None, **_kw):
+    """Located reducer returning int64 locations (dtype-guard fixture)."""
+    return (
+        np.asarray([[1.0, 1.0]], dtype=np.float32),
+        np.asarray([-1], dtype=np.int64),
+    )
+
+
+class TestLocatedRaggedAggregation:
+    """Issue #87 phase 3: a ``location: leaf_id`` ragged field hands the reducer
+    the per-observation morton column and threads the resulting per-centroid
+    uint64 location vectors through ``_aggregate_chunk_cells`` into the ragged
+    sink as a ``(values_list, cell_ids, locations_list)`` triple."""
+
+    @staticmethod
+    def _located_cfg():
+        from zagg.config import PipelineConfig
+
+        return PipelineConfig(
+            data_source={"groups": ["g"]},
+            aggregation={
+                "variables": {
+                    "h_tdigest": {
+                        "function": "zagg.stats.tdigest.build_tdigest",
+                        "source": "h_li",
+                        "kind": "ragged",
+                        "inner_shape": [2],
+                        "location": "leaf_id",
+                        "dtype": "float32",
+                    },
+                }
+            },
+        )
+
+    def _patch_reads(self, monkeypatch, df):
+        calls = {"n": 0}
+
+        def one_shot(*args, **kwargs):
+            calls["n"] += 1
+            return df if calls["n"] == 1 else None
+
+        monkeypatch.setattr("zagg.processing._read_group", one_shot)
+        monkeypatch.setattr("zagg.processing.h5coro.H5Coro", lambda *a, **k: object())
+        monkeypatch.setattr("zagg.processing._make_url_rewriter", lambda driver: lambda u: u)
+
+    def test_calculate_cell_statistics_returns_located_pair(self):
+        cfg = self._located_cfg()
+        grid = HealpixGrid(6, 8, layout="fullsphere", config=cfg)
+        rng = np.random.default_rng(87)
+        lats = -78.5 + rng.uniform(-1e-4, 1e-4, 4)
+        lons = -132.0 + rng.uniform(-1e-4, 1e-4, 4)
+        leaf = np.asarray(grid.assign(lats, lons))
+        h_li = np.array([3.0, 1.0, 2.0, 4.0])
+        stats = calculate_cell_statistics({"h_li": h_li, "leaf_id": leaf}, config=cfg)
+        payload, locs = stats["h_tdigest"]
+        assert payload.dtype == np.float32 and payload.shape == (4, 2)
+        assert locs.dtype == np.uint64 and locs.shape == (4,)
+        # Weight-1 centroids (n <= delta) round-trip the exact order-29 point
+        # words, co-sorted with the values.
+        np.testing.assert_array_equal(locs, leaf[np.argsort(h_li, kind="stable")])
+
+    def test_missing_location_column_raises(self):
+        cfg = self._located_cfg()
+        with pytest.raises(ValueError, match="location: 'leaf_id' but that column"):
+            calculate_cell_statistics({"h_li": np.array([1.0, 2.0])}, config=cfg)
+
+    def test_ragged_out_carries_location_triple(self, monkeypatch):
+        cfg = self._located_cfg()
+        grid = HealpixGrid(6, 8, layout="fullsphere", config=cfg)
+        rng = np.random.default_rng(88)
+        lats = -78.5 + rng.uniform(-1e-3, 1e-3, 6)
+        lons = -132.0 + rng.uniform(-1e-3, 1e-3, 6)
+        leaf = np.asarray(grid.assign(lats, lons))
+        shard_key = int(np.unique(grid.shards_of(leaf))[0])
+        assert np.all(grid.shards_of(leaf) == shard_key)  # single-shard fixture
+        df = pd.DataFrame(
+            {
+                "h_li": np.arange(6, dtype=np.float32),
+                "leaf_id": leaf,
+            }
+        )
+        self._patch_reads(monkeypatch, df)
+
+        ragged: dict = {}
+        process_shard(grid, shard_key, ["s3://x"], s3_credentials={}, config=cfg, ragged_out=ragged)
+        values_list, cell_ids, locations_list = ragged["h_tdigest"]
+        assert len(values_list) == len(cell_ids) == len(locations_list) > 0
+        # Per cell: uint64 locations, index-aligned with the payload, and (in the
+        # loss-free weight-1 regime) exactly that cell's point words.
+        seen = []
+        for payload, locs in zip(values_list, locations_list):
+            assert locs.dtype == np.uint64
+            assert locs.shape == (payload.shape[0],)
+            seen.extend(int(w) for w in locs)
+        assert sorted(seen) == sorted(int(w) for w in leaf)
+
+    def test_end_to_end_located_write_then_read(self, monkeypatch):
+        """Full path (issue #87 phase 5): synthetic obs → assign (point-kind) →
+        located digest (delta=1 forces centroid merges) → CSR companion write →
+        ``read_locations`` — and every stored location CONTAINS all of its cell's
+        contributing point words (the mixed-order containment acceptance)."""
+        from mortie import common_ancestor
+        from zarr.storage import MemoryStore
+
+        from zagg.readers import read_locations
+
+        cfg = self._located_cfg()
+        cfg.aggregation["variables"]["h_tdigest"]["params"] = {"delta": 1}
+        grid = HealpixGrid(6, 8, layout="fullsphere", config=cfg)
+        rng = np.random.default_rng(89)
+        lats = -78.5 + rng.uniform(-1e-3, 1e-3, 12)
+        lons = -132.0 + rng.uniform(-1e-3, 1e-3, 12)
+        leaf = np.asarray(grid.assign(lats, lons))
+        shard_key = int(np.unique(grid.shards_of(leaf))[0])
+        assert np.all(grid.shards_of(leaf) == shard_key)
+        df = pd.DataFrame({"h_li": rng.standard_normal(12).astype(np.float32), "leaf_id": leaf})
+        self._patch_reads(monkeypatch, df)
+
+        store = MemoryStore()
+        ragged: dict = {}
+        process_shard(grid, shard_key, ["s3://x"], s3_credentials={}, config=cfg, ragged_out=ragged)
+        write_ragged_to_zarr(ragged, store, grid=grid, shard_key=shard_key)
+
+        cell_of = grid.cells_of(leaf)
+        children = grid.children(shard_key)
+        out = list(read_locations(store, f"{grid.group_path}/h_tdigest"))
+        assert out and all(locs.dtype == np.uint64 for _, _, locs in out)
+        covered = 0
+        for morton, cell_pos, locs in out:
+            assert morton == shard_key
+            members = leaf[cell_of == int(children[cell_pos])]
+            assert len(members) > 0
+            for w in members:
+                # Containment: folding a member back into some stored location
+                # leaves it unchanged (common_ancestor identity).
+                assert any(
+                    int(common_ancestor(np.array([enclosing, w], dtype=np.uint64)))
+                    == int(enclosing)
+                    for enclosing in locs
+                )
+            covered += len(members)
+        assert covered == len(leaf)  # every observation is located somewhere
+        # delta=1 forced real merges: at least one location is a coarsened
+        # (below-order-29) enclosing cell, not a raw point word.
+        all_locs = np.concatenate([locs for _, _, locs in out])
+        assert not set(int(w) for w in all_locs) <= set(int(w) for w in leaf)
+
+    def test_empty_cell_returns_located_pair(self):
+        # The located contract is a (payload, locations) pair even for empty
+        # cells, so direct callers can always unpack (review fold, issue #87).
+        cfg = self._located_cfg()
+        stats = calculate_cell_statistics({"h_li": np.array([])}, config=cfg)
+        payload, locs = stats["h_tdigest"]
+        assert payload.shape == (0, 2) and payload.dtype == np.float32
+        assert locs.shape == (0,) and locs.dtype == np.uint64
+
+    def test_non_uint64_locations_raise(self):
+        # A silent uint64 cast would wrap garbage into plausible morton words.
+        cfg = self._located_cfg()
+        cfg.aggregation["variables"]["h_tdigest"]["function"] = (
+            "test_processing._bad_located_reducer"
+        )
+        with pytest.raises(ValueError, match="is not uint64"):
+            calculate_cell_statistics(
+                {"h_li": np.array([1.0]), "leaf_id": np.array([3], dtype=np.uint64)},
+                config=cfg,
+            )
+
+    def test_chunk_resolution_located_write_raises(self):
+        # location + resolution: chunk is rejected at validation, but an
+        # unvalidated config (direct PipelineConfig) must still fail loudly in
+        # the writer rather than silently dropping the channel (review fold).
+        from zarr.storage import MemoryStore
+
+        cfg = self._located_cfg()
+        cfg.aggregation["variables"]["h_tdigest"]["resolution"] = "chunk"
+        grid = HealpixGrid(6, 8, layout="fullsphere", config=cfg)
+        payload = np.array([[1.0, 1.0]], dtype=np.float32)
+        locs = np.array([9], dtype=np.uint64)
+        with pytest.raises(ValueError, match="cell-resolution only"):
+            write_ragged_to_zarr(
+                {"h_tdigest": ([payload], [0], [locs])},
+                MemoryStore(),
+                grid=grid,
+                shard_key=0,
+            )
+
+    def test_unlocated_field_keeps_two_tuple(self, monkeypatch):
+        # The pre-#87 ragged sink contract is untouched for unlocated fields.
+        cfg = self._located_cfg()
+        del cfg.aggregation["variables"]["h_tdigest"]["location"]
+        grid = HealpixGrid(6, 8, layout="fullsphere", config=cfg)
+        children = grid.children(int(grid.shards_of(grid.assign([-78.5], [-132.0]))[0]))
+        shard_key = int(grid.shards_of(np.asarray([children[0]]))[0])
+        df = pd.DataFrame(
+            {
+                "h_li": np.array([1.0, 2.0], dtype=np.float32),
+                "leaf_id": np.array([int(children[0])] * 2, dtype=np.uint64),
+            }
+        )
+        self._patch_reads(monkeypatch, df)
+        ragged: dict = {}
+        process_shard(grid, shard_key, ["s3://x"], s3_credentials={}, config=cfg, ragged_out=ragged)
+        assert len(ragged["h_tdigest"]) == 2
+
+
 class TestRaggedWriteFanout:
     """Issue #142: the sharded path fans out its K ragged (CSR) subgroup writes over
     a bounded thread pool instead of a serial loop. The subgroups target disjoint

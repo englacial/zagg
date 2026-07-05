@@ -8,6 +8,7 @@ import pytest
 
 from zagg.config import (
     PipelineConfig,
+    _validate_output_kind,
     default_config,
     evaluate_expression,
     get_agg_fields,
@@ -1535,6 +1536,7 @@ class TestGetOutputSignature:
             "inner_shape": (),
             "dtype": "float32",
             "resolution": "cell",
+            "location": None,
         }
 
     def test_scalar_default_dtype_none(self):
@@ -1545,6 +1547,7 @@ class TestGetOutputSignature:
             "inner_shape": (),
             "dtype": None,
             "resolution": "cell",
+            "location": None,
         }
 
     def test_vector_int_signature(self):
@@ -1555,6 +1558,7 @@ class TestGetOutputSignature:
             "inner_shape": (),
             "dtype": "float32",
             "resolution": "cell",
+            "location": None,
         }
 
     def test_vector_list_signature(self):
@@ -1815,6 +1819,7 @@ class TestRaggedKind:
             "inner_shape": (2,),
             "dtype": "float32",
             "resolution": "cell",
+            "location": None,
         }
 
     def test_ragged_inner_shape_int_normalized(self):
@@ -1914,6 +1919,116 @@ class TestRaggedKind:
         entries = output_field_signature(atl06_config)
         for e in entries:
             assert e["inner_shape"] == [], f"{e['name']!r} has non-empty inner_shape"
+
+
+# ---------------------------------------------------------------------------
+# Ragged location channel (issue #87)
+# ---------------------------------------------------------------------------
+
+
+class TestLocationChannel:
+    def test_located_ragged_validates(self):
+        cfg = _ragged_cfg(
+            inner_shape=[2],
+            location="leaf_id",
+            function="zagg.stats.tdigest.build_tdigest",
+        )
+        validate_config(cfg)
+
+    def test_location_requires_locations_capable_function(self):
+        # np.mean has no ``locations`` kwarg — reject at load, not per cell.
+        cfg = _ragged_cfg(inner_shape=[2], location="leaf_id", function="mean")
+        with pytest.raises(ValueError, match="does not accept a 'locations' keyword"):
+            validate_config(cfg)
+
+    def test_location_params_collision_rejected(self):
+        cfg = _ragged_cfg(
+            inner_shape=[2],
+            location="leaf_id",
+            function="zagg.stats.tdigest.build_tdigest",
+            params={"locations": "h_ph"},
+        )
+        with pytest.raises(ValueError, match="reserved for the location channel"):
+            validate_config(cfg)
+
+    def test_signature_carries_location(self):
+        sig = get_output_signature({"kind": "ragged", "inner_shape": [2], "location": "leaf_id"})
+        assert sig["location"] == "leaf_id"
+
+    def test_location_rejected_for_scalar_and_vector(self):
+        with pytest.raises(ValueError, match="only valid for kind 'ragged'"):
+            _validate_output_kind("f", {"function": "min", "location": "leaf_id"})
+        with pytest.raises(ValueError, match="only valid for kind 'ragged'"):
+            _validate_output_kind(
+                "f",
+                {"function": "min", "kind": "vector", "trailing_shape": 4, "location": "leaf_id"},
+            )
+
+    def test_location_requires_function(self):
+        cfg = _ragged_cfg(inner_shape=[2], location="leaf_id", expression="np.sort(h_ph)")
+        del cfg.aggregation["variables"]["h_ph_tdigest"]["function"]
+        with pytest.raises(ValueError, match="requires a 'function' reducer"):
+            validate_config(cfg)
+
+    def test_location_rejected_at_chunk_resolution(self):
+        cfg = _ragged_cfg(inner_shape=[2], location="leaf_id", resolution="chunk")
+        with pytest.raises(ValueError, match="not supported with 'resolution: chunk'"):
+            validate_config(cfg)
+
+    def test_location_must_be_string(self):
+        cfg = _ragged_cfg(inner_shape=[2], location=29)
+        with pytest.raises(ValueError, match="must be a column name string"):
+            validate_config(cfg)
+
+    def test_location_unknown_column_rejected(self):
+        cfg = _ragged_cfg(inner_shape=[2], location="not_a_column")
+        with pytest.raises(ValueError, match="is not 'leaf_id' or a data_source variable"):
+            validate_config(cfg)
+
+    def test_location_defaults_to_healpix_when_grid_absent(self):
+        # No output.grid block defaults to healpix everywhere else (the grid
+        # factory), so a located field must validate the same way (review fold).
+        cfg = _ragged_cfg(
+            inner_shape=[2],
+            location="leaf_id",
+            function="zagg.stats.tdigest.build_tdigest",
+        )
+        cfg.output = {"store_path": "s3://x"}
+        validate_config(cfg)
+
+    def test_location_requires_healpix_grid(self):
+        cfg = _ragged_cfg(inner_shape=[2], location="leaf_id")
+        cfg.output["grid"] = {
+            "type": "rectilinear",
+            "crs": "EPSG:3857",
+            "resolution": 100,
+            "bounds": [0, 0, 1, 1],
+        }
+        with pytest.raises(ValueError, match="requires a healpix output grid"):
+            validate_config(cfg)
+
+    def test_output_field_signature_includes_location_only_when_set(self):
+        located = output_field_signature(_ragged_cfg(inner_shape=[2], location="leaf_id"))[0]
+        assert located["location"] == "leaf_id"
+        # Unlocated fields keep the pre-#87 signature entries byte-identical
+        # (no new key), so existing shard-map signatures still match.
+        plain = output_field_signature(_ragged_cfg(inner_shape=[2]))[0]
+        assert "location" not in plain
+
+    def test_located_builtin_config_loads_and_validates(self):
+        """The shipped located t-digest template (issue #87) loads, validates,
+        and differs from the value-only template ONLY by the location channel."""
+        located = default_config("atl03_tdigest_located_healpix")
+        plain = default_config("atl03_tdigest_healpix")
+        sig = get_output_signature(get_agg_fields(located)["h_tdigest"])
+        assert sig["location"] == "leaf_id"
+        assert sig["kind"] == "ragged" and sig["inner_shape"] == (2,)
+        # Same read plan and grid; the only variables delta is the location key.
+        assert located.data_source == plain.data_source
+        assert located.output == plain.output
+        located_meta = dict(get_agg_fields(located)["h_tdigest"])
+        located_meta.pop("location")
+        assert located_meta == get_agg_fields(plain)["h_tdigest"]
 
 
 class TestMerra2StormTemplate:

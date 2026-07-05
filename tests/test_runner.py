@@ -2576,7 +2576,7 @@ class TestWorkerPhaseTimings:
         monkeypatch.setattr(
             worker,
             "_aggregate_chunk_cells",
-            lambda *a, **k: ({}, {}, {}, 1),
+            lambda *a, **k: ({}, {}, {}, {}, 1),
         )
         monkeypatch.setattr(
             worker, "_build_output", lambda *a, **k: __import__("pandas").DataFrame()

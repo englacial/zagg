@@ -402,14 +402,22 @@ class HealpixGrid:
     def assign(self, lats, lons) -> np.ndarray:
         """Map (lat, lon) points to morton IDs at the HEALPix reference order.
 
-        Returns morton at :data:`HEALPIX_REF_ORDER` — the finest order zagg
-        resolves to. ``cells_of`` / ``shards_of`` then coarsen this down to
-        ``child_order`` / ``parent_order`` via ``clip2order``, so the reference
-        must be at least as fine as the grid's ``child_order``.
+        Returns **point-kind** morton words at :data:`HEALPIX_REF_ORDER` (issue
+        #87): mortie's ``Kind::Point`` encoding marks the word as a location of
+        unknown extent rather than an order-29 area cell, so the per-observation
+        ``leaf_id`` can feed a ``location`` channel (``common_ancestor`` preserves
+        a lone point, an area cell would misreport its extent). Point and area
+        words share the same path prefix — ``clip2order`` coarsening is
+        bit-identical — so ``cells_of`` / ``shards_of`` (and every dense output)
+        are unchanged. Encoding rides the numpy-level ``geo2mort(...,
+        points=True)`` (mortie 0.8.5, espg/mortie#100 — the issue #87 phase-6
+        surface, replacing the pandas ``MortonIndexArray`` wrapper + unwrap).
         """
         from mortie import geo2mort
 
-        return geo2mort(lats, lons, order=HEALPIX_REF_ORDER)
+        # Passing the order explicitly is a self-check: point encoding is
+        # order-29-only, so mortie raises loudly if HEALPIX_REF_ORDER ever drifts.
+        return geo2mort(lats, lons, order=HEALPIX_REF_ORDER, points=True)
 
     def shards_of(self, leaf_ids) -> np.ndarray:
         """Vectorized parent-morton lookup. ``leaf_ids`` at :data:`HEALPIX_REF_ORDER`."""

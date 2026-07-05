@@ -12,6 +12,16 @@ co-located Zarr v3 arrays under a common prefix::
 This mirrors the standard CSR layout: ``values[offsets[k]:offsets[k+1]]`` is the
 payload for cell ``cell_ids[k]``.  Cells absent from ``cell_ids`` have no data.
 
+A *located* ragged field (issue #87) adds a fourth array::
+
+    {field_name}/locations -- flat uint64 morton location words, one per
+                              values row, SHARING offsets/cell_ids
+
+so ``locations[offsets[k]:offsets[k+1]]`` is cell ``cell_ids[k]``'s per-element
+location vector.  The shared offsets are valid because :func:`write_csr`
+enforces equal per-cell lengths.  Value-only fields are byte-identical to the
+pre-#87 three-array layout (no probe, no extra key).
+
 Profiling note (IO vs compute)
 -------------------------------
 For a typical ATL06 shard (4096 cells, ~100–1000 t-digest centroids per cell),
@@ -41,6 +51,7 @@ def write_csr(
     *,
     dtype: str | np.dtype = "float32",
     zarr_format: int = 3,
+    locations_list: list[np.ndarray] | None = None,
 ) -> None:
     """Write a ragged field to a Zarr store as three CSR arrays.
 
@@ -63,30 +74,63 @@ def write_csr(
         Dtype for the ``values`` array.  Default ``"float32"``.
     zarr_format : int, optional
         Zarr format version.  Default 3.
+    locations_list : list of ndarray, optional
+        Per-cell ``uint64`` morton location vectors (issue #87), index-aligned
+        with ``values_list``; each element has one word per payload element.
+        Written as a fourth array ``{field_name}/locations`` **sharing**
+        ``offsets``/``cell_ids`` with ``values`` (the shared offsets are valid
+        because the per-cell lengths are enforced equal).  ``None`` (default)
+        writes exactly the pre-#87 three arrays, byte-identical.
 
     Raises
     ------
     ValueError
-        If ``values_list`` and ``cell_ids`` have different lengths, or if any
-        element of ``values_list`` has an inconsistent inner shape.
+        If ``values_list`` and ``cell_ids`` have different lengths, if any
+        element of ``values_list`` has an inconsistent inner shape, or if a
+        ``locations_list`` entry's length disagrees with its payload.
     """
     if len(values_list) != len(cell_ids):
         raise ValueError(
             f"values_list (len {len(values_list)}) and cell_ids (len {len(cell_ids)}) "
             "must have the same length"
         )
+    if locations_list is not None and len(locations_list) != len(values_list):
+        raise ValueError(
+            f"locations_list (len {len(locations_list)}) and values_list "
+            f"(len {len(values_list)}) must have the same length"
+        )
 
     dtype = np.dtype(dtype)
 
     # Filter out empty payloads (cells with no data contribute nothing to CSR).
-    non_empty = [(arr, cid) for arr, cid in zip(values_list, cell_ids) if np.asarray(arr).size > 0]
+    # Locations ride the same filter so they stay index-aligned. Check the empty
+    # entries' locations BEFORE filtering — a non-empty location vector on an
+    # empty payload is an upstream misalignment and must raise, not vanish.
+    locs_or_none: list[np.ndarray | None] = (
+        list(locations_list) if locations_list is not None else [None] * len(values_list)
+    )
+    if locations_list is not None:
+        for i, (arr, loc) in enumerate(zip(values_list, locations_list)):
+            if np.asarray(arr).size == 0 and np.asarray(loc).size > 0:
+                raise ValueError(
+                    f"locations at index {i} are non-empty but the payload is empty; "
+                    f"the location channel must stay aligned with the payload"
+                )
+    non_empty = [
+        (arr, cid, loc)
+        for arr, cid, loc in zip(values_list, cell_ids, locs_or_none)
+        if np.asarray(arr).size > 0
+    ]
 
+    flat_locs: np.ndarray | None = None
     if not non_empty:
         flat = np.empty(0, dtype=dtype)
         offsets = np.zeros(1, dtype=np.int64)
         ids_arr = np.empty(0, dtype=np.int64)
+        if locations_list is not None:
+            flat_locs = np.empty(0, dtype=np.uint64)
     else:
-        arrays, ids = zip(*non_empty)
+        arrays, ids, locs = zip(*non_empty)
         arrays = [np.asarray(a, dtype=dtype) for a in arrays]
         # Validate consistent inner shape.
         inner = arrays[0].shape[1:] if arrays[0].ndim > 1 else ()
@@ -100,10 +144,21 @@ def write_csr(
         lengths = np.array([a.shape[0] for a in arrays], dtype=np.int64)
         offsets = np.concatenate([[0], np.cumsum(lengths)])
         ids_arr = np.array(ids, dtype=np.int64)
+        if locations_list is not None:
+            locs = [np.asarray(loc, dtype=np.uint64) for loc in locs]
+            for i, (a, loc) in enumerate(zip(arrays, locs)):
+                if loc.shape != (a.shape[0],):
+                    raise ValueError(
+                        f"locations at index {i} have shape {loc.shape}, expected "
+                        f"({a.shape[0]},) to share the payload's offsets"
+                    )
+            flat_locs = np.concatenate(locs) if locs else np.empty(0, dtype=np.uint64)
 
     _write_array(store, f"{field_name}/values", flat, zarr_format=zarr_format)
     _write_array(store, f"{field_name}/offsets", offsets, zarr_format=zarr_format)
     _write_array(store, f"{field_name}/cell_ids", ids_arr, zarr_format=zarr_format)
+    if flat_locs is not None:
+        _write_array(store, f"{field_name}/locations", flat_locs, zarr_format=zarr_format)
 
 
 def _write_array(store: Store, path: str, data: np.ndarray, *, zarr_format: int = 3) -> None:
@@ -130,6 +185,7 @@ def read_csr(
     field_name: str,
     *,
     zarr_format: int = 3,
+    locations: bool = False,
 ) -> dict[str, np.ndarray]:
     """Read CSR arrays written by :func:`write_csr`.
 
@@ -142,6 +198,11 @@ def read_csr(
     zarr_format : int, optional
         Zarr format version.  Must match the version used when writing.
         Default 3.
+    locations : bool, optional
+        Also read the ``{field_name}/locations`` companion (issue #87) into a
+        ``"locations"`` key.  Opt-in so value-only reads stay free of the extra
+        store probe.  Raises a clear error when the field carries no location
+        channel.
 
     Returns
     -------
@@ -150,17 +211,34 @@ def read_csr(
         - ``offsets`` : length ``n_populated + 1``; ``values[offsets[k]:offsets[k+1]]``
           is the payload for cell ``cell_ids[k]``.
         - ``cell_ids`` : which cells (by chunk position) have data.
+        With ``locations=True``, also ``"locations"`` — flat uint64 morton words
+        sharing ``offsets`` with ``values``.
     """
-    values = zarr.open_array(store, path=f"{field_name}/values", mode="r", zarr_format=zarr_format)[
-        ...
-    ]
-    offsets = zarr.open_array(
-        store, path=f"{field_name}/offsets", mode="r", zarr_format=zarr_format
-    )[...]
-    cell_ids = zarr.open_array(
-        store, path=f"{field_name}/cell_ids", mode="r", zarr_format=zarr_format
-    )[...]
-    return {"values": values, "offsets": offsets, "cell_ids": cell_ids}
+    values = np.asarray(
+        zarr.open_array(store, path=f"{field_name}/values", mode="r", zarr_format=zarr_format)[...]
+    )
+    offsets = np.asarray(
+        zarr.open_array(store, path=f"{field_name}/offsets", mode="r", zarr_format=zarr_format)[...]
+    )
+    cell_ids = np.asarray(
+        zarr.open_array(store, path=f"{field_name}/cell_ids", mode="r", zarr_format=zarr_format)[
+            ...
+        ]
+    )
+    out = {"values": values, "offsets": offsets, "cell_ids": cell_ids}
+    if locations:
+        try:
+            out["locations"] = np.asarray(
+                zarr.open_array(
+                    store, path=f"{field_name}/locations", mode="r", zarr_format=zarr_format
+                )[...]
+            )
+        except (FileNotFoundError, KeyError) as e:
+            raise ValueError(
+                f"{field_name!r} has no locations array; it was not written as a "
+                f"located ragged field (declare 'location:' on the field — issue #87)"
+            ) from e
+    return out
 
 
 def iter_csr_cells(
