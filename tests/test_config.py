@@ -12,6 +12,7 @@ from zagg.config import (
     default_config,
     evaluate_expression,
     get_agg_fields,
+    get_aoi_mask,
     get_base_level,
     get_child_order,
     get_chunk_precompute,
@@ -2068,3 +2069,54 @@ class TestMerra2StormTemplate:
             assert spec["spatial_func"] in registry.list_spatial_funcs()
             assert spec["temporal_reducer"] in registry.list_reducers()
             assert spec["mask"] in registry.list_mask_providers()
+
+
+class TestSercExampleConfigs:
+    """The packaged sponsor-example pair (issue #168): one shardmap, two configs."""
+
+    @staticmethod
+    def _load(name):
+        from importlib import resources
+
+        import zagg.configs
+
+        ref = resources.files(zagg.configs).joinpath(name)
+        with resources.as_file(ref) as p:
+            return load_config(str(p))
+
+    @pytest.fixture
+    def serc_tdigest(self):
+        return self._load("atl03_tdigest_serc.yaml")
+
+    @pytest.fixture
+    def serc_gain_bias(self):
+        return self._load("atl03_gain_bias_serc.yaml")
+
+    def test_validate(self, serc_tdigest, serc_gain_bias):
+        validate_config(serc_tdigest)  # no raise (load_config already validated)
+        validate_config(serc_gain_bias)
+
+    def test_index_blocks_validate(self, serc_tdigest, serc_gain_bias):
+        from zagg.index import validate_index_config
+
+        for cfg in (serc_tdigest, serc_gain_bias):
+            validate_index_config(cfg.data_source["index"], cfg.data_source)  # no raise
+        # tdigest populates the granule-keyed cache; gain_bias reads inline-only.
+        assert serc_tdigest.data_source["index"]["write_back"] is True
+        assert "write_back" not in serc_gain_bias.data_source["index"]
+
+    def test_shared_spatial_signature(self, serc_tdigest, serc_gain_bias):
+        # The reuse contract (issue #89): identical spatial signatures mean one
+        # ShardMap (notebooks/data/sm_serc_healpix_o10.json) serves both configs.
+        from zagg.grids import from_config
+
+        assert (
+            from_config(serc_tdigest).spatial_signature()
+            == from_config(serc_gain_bias).spatial_signature()
+        )
+
+    def test_strict_aoi_and_location_channel(self, serc_tdigest, serc_gain_bias):
+        assert get_aoi_mask(serc_tdigest) and get_aoi_mask(serc_gain_bias)
+        located = get_agg_fields(serc_tdigest)["h_tdigest"]
+        assert located["kind"] == "ragged"
+        assert located["location"] == "leaf_id"
