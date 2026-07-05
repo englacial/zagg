@@ -29,11 +29,12 @@ dependencies = [
     "pandas>=2.2",
     "h5coro>=1.0.3",
     # Compiled hidefix chunk reader for the `sidecar` index backend (issue #149;
-    # espg sign-off on the #149 thread). NOTE: 0.1.1 ships only the compiled
-    # reader — no zagg_backend module / zagg.index_backends entry point yet, so
-    # `sidecar` does not register from this version. Bump the floor when the
-    # upstream release with the entry point lands.
-    "h5coro-hidefix>=0.1.1",
+    # espg sign-off on the #149 thread). Floor is 0.2.0: the first release
+    # expected to ship the zagg_backend module + zagg.index_backends entry
+    # point (0.1.1 carries only the compiled reader, so `sidecar` does not
+    # register from it). 0.2.0 is not on PyPI yet — resolution fails until
+    # upstream publishes it.
+    "h5coro-hidefix>=0.2.0",
     "mortie>=0.8.5",
     "earthaccess",
     "boto3",
@@ -64,7 +65,7 @@ lambda = [
     "h5coro==1.0.4",
     # Keep this pin in sync with deployment/aws/build_layer.sh (abi3
     # manylinux_2_28 wheels cover both layer arches, ~2.2 MB each).
-    "h5coro-hidefix==0.1.1",
+    "h5coro-hidefix==0.2.0",
     "cramjam",
     "astropy",
 ]
