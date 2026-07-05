@@ -191,6 +191,20 @@ class TestBackendRegistry:
         # A failed lookup is not cached: the next call retries the scan.
         assert zindex._EP_BACKENDS is None
 
+    def test_real_environment_discovery(self, monkeypatch):
+        # issue #149: h5coro-hidefix is a core dep, but 0.1.1 ships only the
+        # compiled reader — no zagg.index_backends entry point — so `sidecar`
+        # is NOT expected here yet. Scan the *real* installed entry points
+        # (reset the memo, don't fake the lookup): builtins must resolve, and
+        # if a future h5coro-hidefix release does register `sidecar`, it must
+        # be a VirtualIndex subclass rather than failing this test.
+        monkeypatch.setattr(zindex, "_EP_BACKENDS", None)
+        backends = available_index_backends()
+        assert backends["hierarchical"] is HierarchicalIndex
+        assert backends["inline"] is InlineIndex
+        if "sidecar" in backends:  # flips once upstream ships the entry point
+            assert issubclass(backends["sidecar"], VirtualIndex)
+
     def test_discovery_memoized(self, monkeypatch):
         calls = []
 
@@ -219,9 +233,13 @@ class TestIndexConfigValidation:
         with pytest.raises(ValueError, match="backend is required"):
             validate_index_config({})
 
-    def test_unknown_backend_rejected(self):
+    def test_unknown_backend_rejected(self, monkeypatch):
         # Config validation keeps zagg.config's ValueError contract; the
         # KeyError-shaped UnknownCapability is the runtime-resolution error.
+        # Entry points are pinned empty so this stays a *unknown*-name test
+        # even after a future h5coro-hidefix release registers `sidecar`
+        # for real (issue #149).
+        _patch_entry_points(monkeypatch, [])
         with pytest.raises(ValueError, match="index_backend 'sidecar'"):
             validate_index_config({"backend": "sidecar"})
 
