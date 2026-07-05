@@ -1,0 +1,119 @@
+# ATL03 per-chunk gain/bias waveform over the NEON SERC AOP box (sponsor
+# end-to-end example).
+#
+# The second aggregation of ``notebooks/sponsor_end_to_end.ipynb``, run from
+# the SAME shardmap as atl03_tdigest_serc.yaml (identical output.grid, so the
+# spatial signatures match and the map is built once — issue #89). Aggregation
+# follows the o10 benchmark gain/bias template
+# (tests/data/benchmark/configs/atl03_gain_bias_healpix_o10.yaml): per-chunk
+# 128-bin waveform counts anchored by a DEM-derived offset with a
+# power-of-two gain, stored once per Zarr chunk as ``offset_h``/``gain_h``
+# companion fields (issue #30).
+#
+# The ``index`` block reads through the virtual chunk-index seam (issue #160).
+# The tdigest run already populated the granule-keyed manifest cache under
+# ``zagg-index/ATL03/007/`` (inline + write_back); with h5coro-hidefix >= 0.2
+# installed this run consumes it directly by swapping the block to
+#
+#   index:
+#     backend: sidecar
+#     store: s3://sliderule-public-cors/zagg-index/ATL03/007
+#     on_miss: fallback          # hierarchical path for uncovered granules
+#
+# ``inline`` (below) keeps the config runnable with zagg alone: it rebuilds
+# each chunk map in-memory (~1 GET + ~20 ms per granule) without touching the
+# cache.
+data_source:
+  reader: h5coro
+  driver: s3
+  groups: [gt1l, gt1r, gt2l, gt2r, gt3l, gt3r]
+  coordinates:
+    latitude: "/{group}/heights/lat_ph"
+    longitude: "/{group}/heights/lon_ph"
+  variables:
+    h_ph: "/{group}/heights/h_ph"
+  filters:
+    - dataset: "/{group}/heights/signal_conf_ph"
+      column: 0                  # land surface type; TEP is uniform across columns
+      op: ne
+      value: -2
+  base_level: photons
+  levels:
+    photons:
+      path: "/{group}/heights"
+      coordinates: {latitude: lat_ph, longitude: lon_ph}
+      link: null
+    segments:
+      path: "/{group}/geolocation"
+      coordinates: {latitude: reference_photon_lat, longitude: reference_photon_lon}
+      # Segment-level readable variable (issue #30): dem_h is one value per ~100
+      # photons; broadcast to the photon rows via the link below as a per-photon
+      # ``dem_h`` column the chunk_precompute reduces.
+      variables:
+        dem_h: "/{group}/geophys_corr/dem_h"
+      link:
+        to: photons
+        index_beg: "/{group}/geolocation/ph_index_beg"
+        count: "/{group}/geolocation/segment_ph_cnt"
+        index_base: 1            # ATL03 ph_index_beg is 1-based per the v3 dict
+  read_plan:
+    spatial_index: segments
+    pad: 1                       # one segment of padding on each side per #43
+  index:
+    backend: inline
+    # swap to ``backend: sidecar`` + ``on_miss: fallback`` (h5coro-hidefix) to
+    # consume the manifests the tdigest run wrote back — see header comment.
+
+aggregation:
+  coordinates:
+    cell_ids:
+      dtype: uint64
+      fill_value: 0
+    morton:
+      dtype: uint64
+      fill_value: 0
+  # Evaluated ONCE per inner chunk over that chunk's pooled photons, before the
+  # per-cell loop; the names below enter the per-cell expression namespace.
+  chunk_precompute:
+    chunk_gain:
+      expression: "np.float32(np.maximum(0.5, 2.0 ** np.ceil(np.log2(np.maximum(1e-6, np.max(h_ph) - np.min(h_ph)) / 128.0))))"
+      source: h_ph
+      dtype: float32
+    chunk_offset:
+      # DEM-anchored: the chunk's absolute frame is the reference DEM, not the
+      # photon cloud's own median. dem_h rides the segment->photon broadcast above.
+      expression: "np.float32(np.floor(np.min(dem_h)))"
+      source: dem_h
+      dtype: float32
+  variables:
+    waveform_counts:
+      kind: vector
+      trailing_shape: 128
+      # references the chunk-level anchor/gain, so every cell in the chunk shares
+      # one bin window (the floor(min(dem_h)) anchor at bin 28).
+      expression: "np.histogram(h_ph, 128, (chunk_offset - 27.0 * chunk_gain, chunk_offset + 101.0 * chunk_gain))[0].astype('uint32')"
+      source: h_ph
+      dtype: uint32
+      fill_value: 0
+    offset_h:
+      # the chunk bin-0 anchor elevation, recorded ONCE per chunk.
+      expression: "chunk_offset"
+      source: h_ph
+      dtype: float32
+      resolution: chunk
+    gain_h:
+      # the chunk vertical bin width (m), recorded ONCE per chunk.
+      expression: "chunk_gain"
+      source: h_ph
+      dtype: float32
+      resolution: chunk
+
+output:
+  grid:
+    type: healpix
+    indexing_scheme: nested
+    parent_order: 10             # shard / dispatch unit: 4^(19-10) = 512x512 cells
+    chunk_inner: 13              # inner Zarr chunk: 4^(19-13) = 64x64 cells (K=64 per shard)
+    child_order: 19              # leaf cell resolution (~10 m)
+  aoi_mask: true                 # strict-AOI cell mask (issue #101)
+  store: s3://sliderule-public-cors/zagg-examples/serc/gain_bias.zarr
