@@ -49,6 +49,7 @@ from zagg.processing.read import (
     _read_group_full,
     _read_segment_broadcasts,
     _segment_level_variables,
+    _validate_planned_config,
 )
 
 # ``worker`` imports this package (``import zagg.processing as _processing``) but
@@ -109,6 +110,7 @@ __all__ = [
     "_read_group_full",
     "_read_segment_broadcasts",
     "_segment_level_variables",
+    "_validate_planned_config",
     # write-stage helpers
     "_arrow_column",
     "_block_index_key",

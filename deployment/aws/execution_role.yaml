@@ -73,6 +73,14 @@ Resources:
                 Effect: Allow
                 Action: s3:ListBucket
                 Resource: !Sub "arn:aws:s3:::${OutputBucketName}"
+              # Virtual-index store (issue #160) -- keep in lockstep with the
+              # inline ExecutionRole in template.yaml.
+              - Sid: ReadWriteZaggIndexStore
+                Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:PutObject
+                Resource: arn:aws:s3:::sliderule-public-cors/zagg-index/*
 
 Outputs:
   RoleArn:

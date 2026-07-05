@@ -6,10 +6,13 @@ change).
 output carrier; ``process_morton_cell`` is the deprecated HEALPix alias. This is
 the only stage that reaches across read/aggregate/write.
 
-The ``h5coro`` module and the ``_read_group`` / ``_make_url_rewriter`` helpers are
-referenced through the :mod:`zagg.processing` package namespace at call time so
-existing tests that ``monkeypatch.setattr("zagg.processing._read_group", ...)``
-(etc.) continue to patch the symbols ``process_shard`` actually calls.
+The ``h5coro`` module and the ``_make_url_rewriter`` helper are referenced
+through the :mod:`zagg.processing` package namespace at call time so existing
+tests that ``monkeypatch.setattr("zagg.processing.<name>", ...)`` continue to
+patch the symbols ``process_shard`` actually calls. Group reads go through the
+configured virtual chunk-index backend (issue #160, ``data_source.index``);
+the default ``hierarchical`` backend resolves ``zagg.processing._read_group``
+the same call-time way, so patching that symbol still intercepts reads.
 """
 
 import logging
@@ -29,6 +32,7 @@ from zagg.config import (
     get_data_vars,
     get_output_signature,
 )
+from zagg.index import index_from_config
 from zagg.processing.aggregate import (
     _aggregate_chunk_cells,
     _concat_and_group,
@@ -165,6 +169,11 @@ def process_shard(
         raise ValueError(f"handoff must be 'pandas' or 'arrow', got {handoff!r}")
     data_source = config.data_source
 
+    # Resolve the virtual chunk-index backend (issue #160). An absent
+    # ``data_source.index`` block resolves to ``hierarchical`` — today's read
+    # path, byte-identical.
+    index_backend = index_from_config(config)
+
     shard_key = int(shard_key)
     logger.info(f"Processing shard: {shard_key}")
     start_time = datetime.now()
@@ -270,7 +279,7 @@ def process_shard(
                     read_kwargs = {"arrow": use_arrow}
                     if apriori:
                         read_kwargs["granule_url"] = s3_url
-                    chunk = _processing._read_group(
+                    chunk = index_backend.read_group(
                         h5obj, g, data_source, shard_key, grid, **read_kwargs
                     )
                     if chunk is not None:
@@ -288,6 +297,14 @@ def process_shard(
                     read_errors += 1
                     logger.warning(f"  Error reading track {g}: {e}")
                     continue
+
+            # Per-granule backend hook (issue #160): side effects only (e.g.
+            # ``inline`` write-back). A failure here never fails the read —
+            # the granule's data is already in ``all_reads``.
+            try:
+                index_backend.finish_granule(h5obj, s3_url)
+            except Exception:
+                logger.warning(f"  index backend finish_granule failed for {s3_url}", exc_info=True)
 
             files_processed += 1
             if buffered is not None:

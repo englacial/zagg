@@ -192,6 +192,42 @@ class TestTemplateEnvironment:
         assert params["MallocArenaMax"]["Default"] == "2"
         assert params["MallocTrimThreshold"]["Default"] == "0"
 
+    def test_execution_role_grants_zagg_index_store(self):
+        # issue #160: inline write-back + sidecar reads target the public
+        # zagg-index prefix; the shared execution role gets Get/Put scoped to
+        # exactly that prefix (never the bucket), in BOTH copies of the role
+        # (inline ExecutionRole here, admin-created execution_role.yaml).
+        arn = "arn:aws:s3:::sliderule-public-cors/zagg-index/*"
+
+        def _index_statements(role_props):
+            stmts = role_props["Policies"][0]["PolicyDocument"]["Statement"]
+            return [s for s in stmts if s.get("Resource") == arn]
+
+        tpl_role = self._load_template()["Resources"]["ExecutionRole"]["Properties"]
+        matches = _index_statements(tpl_role)
+        assert len(matches) == 1
+        assert sorted(matches[0]["Action"]) == ["s3:GetObject", "s3:PutObject"]
+
+        import yaml
+
+        class _CfnLoader(yaml.SafeLoader):
+            pass
+
+        def _cfn_multi(loader, tag_suffix, node):
+            if isinstance(node, yaml.ScalarNode):
+                return {tag_suffix: loader.construct_scalar(node)}
+            if isinstance(node, yaml.SequenceNode):
+                return {tag_suffix: loader.construct_sequence(node)}
+            return {tag_suffix: loader.construct_mapping(node)}
+
+        _CfnLoader.add_multi_constructor("!", _cfn_multi)
+        role_tpl = REPO_ROOT / "deployment" / "aws" / "execution_role.yaml"
+        ext = yaml.load(role_tpl.read_text(), Loader=_CfnLoader)
+        ext_role = ext["Resources"]["ExecutionRole"]["Properties"]
+        ext_matches = _index_statements(ext_role)
+        assert len(ext_matches) == 1
+        assert sorted(ext_matches[0]["Action"]) == ["s3:GetObject", "s3:PutObject"]
+
     def test_extract_fn_mirrors_process_fn(self):
         # issue #148: extraction is both a mode of ProcessFn and a dedicated
         # twin function (own concurrency pool for full-archive runs). The twin

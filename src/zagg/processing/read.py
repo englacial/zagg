@@ -285,7 +285,13 @@ def _level_coord_paths(level: dict, group: str) -> tuple[str, str]:
 
 
 def _planned_read_group(
-    h5obj, group: str, data_source: dict, shard_key: int, grid, arrow: bool = False
+    h5obj,
+    group: str,
+    data_source: dict,
+    shard_key: int,
+    grid,
+    arrow: bool = False,
+    read_fn=None,
 ):
     """Planned (AOI-bounded) read of one HDF5 group via the coarse spatial index.
 
@@ -310,6 +316,13 @@ def _planned_read_group(
     as :func:`_read_group`. Output rows are in plan-slice / spatial-mask /
     filter order — which matches the full-read path's row ordering because the
     plan's runs are emitted in increasing parent index.
+
+    ``read_fn`` is the base-rate addressing seam (issue #160), forwarded to
+    :func:`_execute_plan_group`: an index backend may supply its own reader
+    (e.g. ``inline``'s boundary-safe chunk-map reads); ``None`` (default) uses
+    the plain h5coro hyperslice bridge — today's path. Selection (the plan),
+    the coarse-level reads, and everything downstream of the returned columns
+    are identical regardless.
     """
     levels = data_source["levels"]
     base_level_key = data_source["base_level"]
@@ -386,7 +399,9 @@ def _planned_read_group(
         # of the file. Defer to the full-coord-read path; semantics identical.
         return _read_group_full(h5obj, group, data_source, shard_key, grid, arrow=arrow)
 
-    return _execute_plan_group(h5obj, group, data_source, shard_key, grid, plan, n_base, arrow)
+    return _execute_plan_group(
+        h5obj, group, data_source, shard_key, grid, plan, n_base, arrow, read_fn=read_fn
+    )
 
 
 def _execute_plan_group(
@@ -608,8 +623,6 @@ def _read_group(
     produce row-for-row identical output (#43 Phase C parity).
     """
     rp = data_source.get("read_plan")
-    levels = data_source.get("levels")
-    base_level = data_source.get("base_level")
     # Presence check, not truthiness: an empty/misconfigured ``chunk_boundaries``
     # block must fail loudly inside the a-priori path (missing ``prefix``), not
     # silently run another arm and corrupt the benchmark comparison.
@@ -625,14 +638,25 @@ def _read_group(
     # gated only when ``spatial_index`` is set, and *then* requires a real
     # multi-level structure to operate on.
     if isinstance(rp, dict) and rp.get("spatial_index"):
-        if not isinstance(levels, dict) or not levels:
-            raise ValueError(
-                "data_source.read_plan.spatial_index requires a non-empty 'levels' mapping"
-            )
-        if not base_level:
-            raise ValueError("data_source.read_plan.spatial_index requires 'base_level'")
+        _validate_planned_config(data_source)
         return _planned_read_group(h5obj, group, data_source, shard_key, grid, arrow=arrow)
     return _read_group_full(h5obj, group, data_source, shard_key, grid, arrow=arrow)
+
+
+def _validate_planned_config(data_source: dict) -> None:
+    """Completeness gate for the planned (spatial-index) route.
+
+    Shared by :func:`_read_group`'s dispatch and any index backend that
+    plugs into :func:`_planned_read_group` directly (issue #160 —
+    ``inline``), so the accepted-config surface cannot drift between them.
+    """
+    levels = data_source.get("levels")
+    if not isinstance(levels, dict) or not levels:
+        raise ValueError(
+            "data_source.read_plan.spatial_index requires a non-empty 'levels' mapping"
+        )
+    if not data_source.get("base_level"):
+        raise ValueError("data_source.read_plan.spatial_index requires 'base_level'")
 
 
 def _read_group_full(
