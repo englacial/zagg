@@ -62,6 +62,10 @@ class TestLambdaImports:
         """mortie is needed for morton code operations."""
         import mortie  # noqa: F401
 
+    def test_h5coro_hidefix_available(self):
+        """h5coro-hidefix ships the compiled reader for the sidecar backend (issue #149)."""
+        import h5coro_hidefix  # noqa: F401
+
 
 class TestFunctionBuild:
     """Test that the function code build script works correctly."""
@@ -335,4 +339,19 @@ class TestPackageConsistency:
         core_floor = Version(self._core_floor("h5coro"))
         assert lambda_pin >= core_floor, (
             f"[lambda] pins h5coro=={lambda_pin} but core requires h5coro>={core_floor}"
+        )
+
+    def test_h5coro_hidefix_version_consistent(self):
+        """Lambda [extra] and the build script must pin the same h5coro-hidefix version."""
+        self._assert_lockstep("h5coro-hidefix", "build_layer.sh")
+
+    def test_h5coro_hidefix_lambda_pin_satisfies_core_floor(self):
+        """The [lambda] exact pin must not fall below the core h5coro-hidefix floor."""
+        from packaging.version import Version
+
+        lambda_pin = Version(self._lambda_extra_pin("h5coro-hidefix"))
+        core_floor = Version(self._core_floor("h5coro-hidefix"))
+        assert lambda_pin >= core_floor, (
+            f"[lambda] pins h5coro-hidefix=={lambda_pin} "
+            f"but core requires h5coro-hidefix>={core_floor}"
         )

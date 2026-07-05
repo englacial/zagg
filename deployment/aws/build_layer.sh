@@ -70,8 +70,12 @@ $PIP install \
     -t "$OUTPUT_DIR/python" \
     --no-cache-dir
 
-echo "Installing h5coro and mortie (--no-deps)..."
-$PIP install "h5coro==1.0.4" mortie --no-deps -t "$OUTPUT_DIR/python" --no-cache-dir
+# h5coro-hidefix (issue #149): compiled hidefix chunk reader backing the
+# `sidecar` index backend. abi3 manylinux_2_28 wheel (~2.2 MB) on both arches;
+# its only runtime dep is numpy (already installed above). Keep the pin in
+# sync with the `lambda` extra in pyproject.toml.
+echo "Installing h5coro, h5coro-hidefix and mortie (--no-deps)..."
+$PIP install "h5coro==1.0.4" "h5coro-hidefix==0.1.1" mortie --no-deps -t "$OUTPUT_DIR/python" --no-cache-dir
 
 # Verify numpy stayed < 2.3
 NUMPY_VERSION=$(ls "$OUTPUT_DIR/python" | grep -E "^numpy-" | head -1)
