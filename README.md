@@ -113,6 +113,14 @@ uv run python -m zagg --config atl06.yaml --catalog catalog.json --dry-run
 
 The store path and output grid parameters are defined in the YAML config (`output.store`, `output.grid.child_order`) and can be overridden via `--store` on the command line.
 
+**Read backends** (`data_source.index`, issue #160/#170). Reads go through a pluggable chunk-index backend; the default is the compiled fast path:
+
+- `inline` *(default)* — builds each granule's chunk map at read time (metadata-only, ~1 ranged GET) and decodes through the compiled [h5coro-hidefix](https://github.com/espg/h5coro-hidefix) reader. Works for every chunked-HDF5 data source — planned (ATL03-style hierarchical) and flat alike; datasets the compiled reader cannot serve degrade to h5coro per dataset. With `write_back: true` + `store:`, persists the chunk maps as granule-keyed parquet manifests, populating the sidecar cache.
+- `sidecar` — fetches precomputed manifests from `store:` instead of walking metadata; `on_miss: fallback | error | build` controls behavior for uncovered granules (`build` self-populates the store). Fastest once the cache exists.
+- `hierarchical` — the pure-Python h5coro read, byte-compatible baseline; select explicitly to pin it (the benchmark matrix's uncached column does).
+
+`data_source.read_workers` (default 8) bounds the per-worker read fan-out on the compiled paths: each in-flight read overlaps S3 latency and decodes with the GIL released. Peak worker memory grows with width — dial down for dense shards.
+
 ### Step 4: Visualize Results
 
 The output Zarr is a public DGGS dataset. The included notebook rasterizes HEALPix cells to a polar stereographic grid for fast rendering with `imshow`.
