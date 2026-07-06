@@ -73,14 +73,16 @@ Resources:
                 Effect: Allow
                 Action: s3:ListBucket
                 Resource: !Sub "arn:aws:s3:::${OutputBucketName}"
-              # Virtual-index store (issue #160) -- keep in lockstep with the
-              # inline ExecutionRole in template.yaml.
-              - Sid: ReadWriteZaggIndexStore
+              # Public sliderule-public-cors bucket (index write-back +
+              # worker-written output zarr stores; espg, PR #176) -- keep in
+              # lockstep with the inline ExecutionRole in template.yaml.
+              - Sid: ReadWritePublicCorsObjects
                 Effect: Allow
                 Action:
                   - s3:GetObject
                   - s3:PutObject
-                Resource: arn:aws:s3:::sliderule-public-cors/zagg-index/*
+                  - s3:DeleteObject
+                Resource: arn:aws:s3:::sliderule-public-cors/*
 
 Outputs:
   RoleArn:
