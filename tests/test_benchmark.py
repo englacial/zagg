@@ -589,6 +589,7 @@ def test_forward_matrix_is_tdigest_healpix_arrow_codec_ab():
     manifest = json.loads((BENCH / "targets.json").read_text())
     targets = manifest["targets"]
     by_order: dict[str, set[str]] = {}
+    by_order_reads: dict[str, set[str]] = {}
     for tname, t in targets.items():
         assert t["aggregator"] == "tdigest", tname
         assert t["grid_type"] == "healpix", tname
@@ -596,12 +597,22 @@ def test_forward_matrix_is_tdigest_healpix_arrow_codec_ab():
         assert t["codec"] in ("sharded", "inner"), tname
         # codec label and the sharded bool run_benchmark applies must agree.
         assert t["sharded"] is (t["codec"] == "sharded"), tname
+        if t.get("read") == "cached":
+            # Cached-read column (issue #170): inner codec only, sidecar
+            # config companion, named by its read axis instead of codec.
+            assert t["codec"] == "inner", tname
+            assert tname == f"tdigest_healpix_{t['grid_size']}_cached", tname
+            assert t["config"].endswith(f"{t['grid_size']}_cached.yaml"), tname
+            by_order_reads.setdefault(t["grid_size"], set()).add("cached")
+            continue
         # The target name encodes its order + codec, matching the metadata.
         assert tname == f"tdigest_healpix_{t['grid_size']}_{t['codec']}", tname
         by_order.setdefault(t["grid_size"], set()).add(t["codec"])
     # Each present order is a complete A/B pair (both columns), never a half-row.
     for order, codecs in by_order.items():
         assert codecs == {"sharded", "inner"}, f"{order}: incomplete codec pair {codecs}"
+    # And each order carries its cached-read column (issue #170).
+    assert set(by_order_reads) == set(by_order), "cached column missing for some order"
 
 
 def test_o9_row_is_live():
@@ -610,10 +621,20 @@ def test_o9_row_is_live():
     manifest = json.loads((BENCH / "targets.json").read_text())
     assert "_pending_o9" not in manifest, "o9 hold-out stanza should be removed"
     o9_targets = {n for n, t in manifest["targets"].items() if t["grid_size"] == "o9"}
-    assert o9_targets == {"tdigest_healpix_o9_sharded", "tdigest_healpix_o9_inner"}
-    for t in (manifest["targets"][n] for n in o9_targets):
+    assert o9_targets == {
+        "tdigest_healpix_o9_sharded",
+        "tdigest_healpix_o9_inner",
+        "tdigest_healpix_o9_cached",  # cached-read column, issue #170
+    }
+    for n in o9_targets:
+        t = manifest["targets"][n]
         assert t["shardmap"] == "healpix_o9"
-        assert t["config"] == "configs/atl03_tdigest_healpix_o9.yaml"
+        expected = (
+            "configs/atl03_tdigest_healpix_o9_cached.yaml"
+            if t.get("read") == "cached"
+            else "configs/atl03_tdigest_healpix_o9.yaml"
+        )
+        assert t["config"] == expected
     # The shardmap entry is pinned with a real (numeric) densest shard_key.
     sm = manifest["shardmaps"]["healpix_o9"]
     assert isinstance(sm["shard_key"], int)

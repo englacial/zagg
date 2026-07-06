@@ -1,31 +1,18 @@
-# ATL03 photon-height t-digest template (HEALPix, multi-chunk-per-worker).
+# Cached-read companion of atl03_tdigest_healpix_o9.yaml (issue #170 phase 5).
 #
-# Per-cell approximate-quantile sketch: each grid cell stores a t-digest of its
-# photon heights (h_ph) as a ``kind: ragged`` CSR field. A t-digest is a small,
-# mergeable set of (mean, weight) centroids from which any quantile (median,
-# p5/p95, IQR, ...) is recovered at read time -- far cheaper than storing every
-# photon, and exact-enough in the tails. The reducer is the pure-numpy
-# ``zagg.stats.tdigest.build_tdigest`` (issue #48), resolved as the field's
-# ``function`` via ``zagg.config.resolve_function`` (dotted path). ``delta`` is
-# the centroid budget (accuracy knob): ~delta centroids per cell regardless of
-# photon count. Read the digests back with ``zagg.readers.tdigest_tensor``.
-#
-# Grid is HEALPix nested at child_order 19 (the ~10 m cell, now that mortie 0.8.1
-# resolves past the old order-18 reference cap). Multi-chunk-per-worker (issue
-# #30 item 3) is on: one shard (the dispatch unit, parent_order 10 = 512x512
-# cells) owns K = 64 finer Zarr chunks (chunk_inner 13 = 64x64 cells each). The
-# worker reads the shard's granules once and writes 64 chunk regions + 64 CSR
-# groups, one per inner chunk. chunk_inner unset would collapse to K=1 (shard ==
-# chunk), byte-identical to the single-chunk path.
-#
-# Confidence filter, multi-level form and read_plan match atl03.yaml (the planned
-# segment->photon IO of issue #43 applies here too); only the aggregation differs.
+# Identical grid/aggregation/shardmap to the uncached baseline; the ONLY
+# difference is the read backend: `sidecar` consumes the granule-keyed chunk
+# manifests under zagg-index/ATL03/007 (shared with the sponsor example and
+# populated on first run via `on_miss: build`, which delegates to
+# inline+write_back). Column semantics: baseline = pure-h5coro uncached read,
+# this = compiled (hidefix) read against the manifest cache.
 data_source:
-  # Pinned read backend (issue #170): the UNCACHED pure-h5coro baseline
-  # column. The package default flipped to the compiled `inline` path; an
-  # unpinned config would silently move this series onto the fast path.
+  # Cached compiled read (issue #170): consume (or on first run, build) the
+  # granule-keyed sidecar manifests -- the CACHED benchmark column.
   index:
-    backend: hierarchical
+    backend: sidecar
+    on_miss: build
+    store: s3://sliderule-public-cors/zagg-index/ATL03/007
   reader: h5coro
   driver: s3
   groups: [gt1l, gt1r, gt2l, gt2r, gt3l, gt3r]
@@ -91,6 +78,6 @@ output:
   grid:
     type: healpix
     indexing_scheme: nested
-    parent_order: 10             # shard / dispatch unit: 4^(19-10) = 512x512 cells
-    chunk_inner: 13              # inner Zarr chunk: 4^(19-13) = 64x64 cells (K=64 per shard)
+    parent_order: 9              # shard / dispatch unit: 4^(19-9) = 1024x1024 cells
+    chunk_inner: 13              # inner Zarr chunk: 4^(19-13) = 64x64 cells (K=256 per shard)
     child_order: 19              # leaf cell resolution (~10 m)
