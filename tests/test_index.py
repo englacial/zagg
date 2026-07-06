@@ -392,7 +392,11 @@ class TestWorkerSeam:
         assert meta["files_processed"] == 1
         assert meta["total_obs"] == 3
         assert meta["error"] is None
-        assert any("finish_granule failed" in r.message for r in caplog.records)
+        rec = next(r for r in caplog.records if "finish_granule failed" in r.message)
+        # Reason inlined, no exc_info: a folded traceback would trip the
+        # WorkerErrorCount metric filter (issue #175) on this tolerated path.
+        assert "write-back store unreachable" in rec.message
+        assert rec.exc_info is None
 
     def test_bad_index_block_fails_before_any_read(self, monkeypatch):
         # Resolution happens up front, so a bad block is a loud config error,

@@ -298,7 +298,10 @@ class TestTemplateEnvironment:
         # otherwise all terms must appear in the line.
         terms = re.findall(r'(\??)"([^"]*)"', pattern)
         assert terms, f"unparsed filter pattern: {pattern!r}"
-        any_mode = all(q == "?" for q, _ in terms)
+        # CloudWatch defines no mixed ?/plain term list; keep the template
+        # within the uniform subset this evaluator models (review fold).
+        assert len({q for q, _ in terms}) == 1, f"mixed ?/plain terms: {pattern!r}"
+        any_mode = terms[0][0] == "?"
         hits = [t in line for _, t in terms]
         return any(hits) if any_mode else all(hits)
 
