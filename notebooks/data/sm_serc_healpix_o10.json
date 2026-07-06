@@ -19,7 +19,7 @@
     "footprint": "swath",
     "total_shards": 9,
     "total_pairs": 326,
-    "build_wall_s": 0.68,
+    "build_wall_s": 0.674,
     "mortie_order": 13,
     "aoi_mask": true
   },
