@@ -44,7 +44,16 @@ def _config(streaming=None, delta=128):
     if streaming is not None:
         agg["streaming"] = streaming
     return PipelineConfig(
-        data_source={"reader": "h5coro", "driver": "s3", "groups": ["gt1l"]},
+        # The worker-integration tests below fake reads by monkeypatching
+        # ``zagg.processing._read_group`` — the hierarchical backend's seam.
+        # Pin it: the inline default (issue #170) reads through the compiled
+        # path and never calls ``_read_group``, so the fakes would be bypassed.
+        data_source={
+            "reader": "h5coro",
+            "driver": "s3",
+            "groups": ["gt1l"],
+            "index": {"backend": "hierarchical"},
+        },
         aggregation=agg,
     )
 

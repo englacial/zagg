@@ -382,5 +382,10 @@ class TestWorkerSeam:
 
         ds = _data_source()
         ds["reader"] = "h5coro"
+        # The seam under test is the hierarchical backend's ``_read_group``
+        # delegation; the inline default (issue #170) never calls it, so pin
+        # the backend (the sibling test keeps hierarchical via its
+        # ``chunk_boundaries`` carve-out in ``index_from_config``).
+        ds["index"] = {"backend": "hierarchical"}
         _, meta = self._run(monkeypatch, ds, fake)
         assert meta["error"] == "No data after filtering"
