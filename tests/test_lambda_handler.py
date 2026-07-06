@@ -1152,6 +1152,122 @@ class TestPeakRSSSampler:
         assert s._thread is None  # never spawned
 
 
+class TestContainerTelemetry:
+    """Issue #171 (detect-and-report): every per-unit envelope carries the
+    sandbox's container telemetry -- cold/warm sentinel, invocations-served
+    generation, start RSS, sandbox id, init timestamp -- stamped once per
+    invocation at dispatcher entry, so repeat invocations on one warm process
+    report generations 1, 2, ... The per-invocation *peak* stays the existing
+    ``max_memory_mb`` (issue #141) -- telemetry adds the start-RSS ratchet
+    signal without duplicating it."""
+
+    @pytest.fixture(autouse=True)
+    def _fresh_container(self, handler_mod, monkeypatch):
+        # handler_mod is module-scoped, so the generation counter persists
+        # across tests: reset it so each test starts on a "cold" sandbox.
+        monkeypatch.setattr(handler_mod, "_INVOCATIONS_SERVED", 0)
+
+    def _process_event(self, monkeypatch, **extra):
+        import zagg.grids as grids
+        import zagg.processing as processing
+
+        def fake_process_shard(grid, shard_key, granule_urls, **kwargs):
+            meta = {
+                "shard_key": shard_key,
+                "cells_with_data": 0,
+                "total_obs": 0,
+                "granule_count": len(granule_urls),
+                "files_processed": 0,
+                "duration_s": 0.0,
+                "error": None,
+            }
+            return pd.DataFrame(), meta
+
+        monkeypatch.setattr(processing, "process_shard", fake_process_shard)
+        monkeypatch.setattr(grids, "from_config", lambda *a, **k: MagicMock())
+        event = _base_event(_healpix_config_dict())
+        event["child_order"] = 12
+        event.update(extra)
+        return event
+
+    def test_warm_repeat_invocations_ratchet_the_generation(self, handler_mod, monkeypatch):
+        # Two invocations in one process (a warm sandbox): the first is cold /
+        # generation 1, the second warm / generation 2, same init timestamp.
+        event = self._process_event(monkeypatch)
+        first = json.loads(handler_mod.lambda_handler(event, _context())["body"])
+        second = json.loads(handler_mod.lambda_handler(event, _context())["body"])
+        assert first["container_cold"] is True and first["container_generation"] == 1
+        assert second["container_cold"] is False and second["container_generation"] == 2
+        assert first["container_init_ts"] == second["container_init_ts"]
+        assert first["container_init_ts"] == handler_mod._CONTAINER_INIT_TS
+
+    def test_rss_start_sampled_at_entry(self, handler_mod, monkeypatch):
+        monkeypatch.setattr(handler_mod, "_read_vmrss_kib", lambda: 512 * 1024)
+        event = self._process_event(monkeypatch)
+        body = json.loads(handler_mod.lambda_handler(event, _context())["body"])
+        assert body["rss_start_mb"] == pytest.approx(512.0)
+
+    def test_rss_start_none_off_linux(self, handler_mod, monkeypatch):
+        # No /proc/self/status (dev host): rss_start_mb degrades to None, the
+        # same fallback posture as the #141 sampler.
+        monkeypatch.setattr(handler_mod, "_read_vmrss_kib", lambda: None)
+        event = self._process_event(monkeypatch)
+        body = json.loads(handler_mod.lambda_handler(event, _context())["body"])
+        assert body["rss_start_mb"] is None
+
+    def test_sandbox_id_from_log_stream(self, handler_mod, monkeypatch):
+        monkeypatch.setenv("AWS_LAMBDA_LOG_STREAM_NAME", "2026/07/06/[$LATEST]abc123")
+        event = self._process_event(monkeypatch)
+        body = json.loads(handler_mod.lambda_handler(event, _context())["body"])
+        assert body["sandbox_id"] == "2026/07/06/[$LATEST]abc123"
+
+    def test_gate_failure_envelope_carries_telemetry(self, handler_mod, monkeypatch):
+        # 400s carry telemetry too: the attach seam sits at the dispatcher, so
+        # failures can be stratified by container state (e.g. an OOM'd gen-4).
+        event = self._process_event(monkeypatch)
+        del event["shard_key"]
+        resp = handler_mod.lambda_handler(event, _context())
+        assert resp["statusCode"] == 400
+        body = json.loads(resp["body"])
+        assert body["container_cold"] is True and body["container_generation"] == 1
+
+    def test_setup_counts_toward_generation_but_body_unchanged(self, handler_mod, monkeypatch):
+        # A setup invoke warms the sandbox (generation ticks) but its body stays
+        # byte-identical -- telemetry rides only in per-unit envelopes.
+        monkeypatch.setattr(
+            handler_mod, "_handle_setup", lambda event: {"statusCode": 200, "body": "{}"}
+        )
+        setup_resp = handler_mod.lambda_handler({"mode": "setup"}, _context())
+        assert json.loads(setup_resp["body"]) == {}
+        event = self._process_event(monkeypatch)
+        body = json.loads(handler_mod.lambda_handler(event, _context())["body"])
+        assert body["container_generation"] == 2  # setup served first
+        assert body["container_cold"] is False
+
+    def test_process_event_mode_carries_telemetry(self, handler_mod, monkeypatch):
+        import zagg.output as output
+        import zagg.temporal as temporal
+
+        event_mask, collections, static = _temporal_inputs()
+        monkeypatch.setattr(temporal, "open_dataset", lambda uri, **k: event_mask)
+        monkeypatch.setattr(temporal, "read_temporal_inputs", lambda *a, **k: (collections, static))
+        monkeypatch.setattr(output, "write_tabular", lambda rows, store_path, **k: store_path)
+        resp = handler_mod.lambda_handler(_temporal_event(), _context())
+        body = json.loads(resp["body"])
+        assert resp["statusCode"] == 200, body
+        assert body["container_cold"] is True and body["container_generation"] == 1
+
+    def test_mirrored_result_carries_telemetry(self, handler_mod, monkeypatch, tmp_path):
+        # The result_url mirror writes the POST-attach envelope, so the async
+        # poller sees the same telemetry a sync caller would.
+        url = str(tmp_path / "status" / "12345.json")
+        event = self._process_event(monkeypatch, result_url=url)
+        resp = handler_mod.lambda_handler(event, _context())
+        written = json.loads(Path(url).read_text())
+        assert written == resp
+        assert json.loads(written["body"])["container_generation"] == 1
+
+
 class TestExtractMode:
     """mode="extract" (issue #148): chunk-boundary geometry extraction."""
 

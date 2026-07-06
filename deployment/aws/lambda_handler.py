@@ -130,6 +130,63 @@ from zagg.store import open_store
 logger = logging.getLogger()
 logger.setLevel(logging.INFO)
 
+# Container-lifetime telemetry (issue #171, the detect-and-report half of the
+# PR #172 plan). Module globals persist across warm invocations of the same
+# sandbox: the import timestamp marks container init (imports run exactly once
+# per sandbox), and the counter counts invocations served -- the sandbox's
+# "generation". Together with per-invocation start RSS they make the #169
+# warm-container RSS ratchet (959 -> 1650 -> 2029 -> OOM across four fleet
+# runs on the same 9 sandboxes) visible in every result envelope instead of
+# requiring CloudWatch forensics.
+_CONTAINER_INIT_TS = time.time()
+_INVOCATIONS_SERVED = 0
+
+
+def _container_telemetry() -> Dict[str, Any]:
+    """Per-invocation container-telemetry block (issue #171).
+
+    Called exactly once per invocation, at handler entry: increments the
+    sandbox's invocations-served counter and snapshots the *start* RSS --
+    the ratchet signal (a fresh container starts near baseline; a dirty one
+    starts near the previous invocation's retained RSS). ``container_cold``
+    is ``generation == 1`` by construction. ``sandbox_id`` is the CloudWatch
+    log-stream name, unique per sandbox, so the orchestrator can group
+    per-shard results by physical container. Off Linux ``rss_start_mb`` is
+    None (no ``/proc/self/status``), mirroring the #141 sampler fallback.
+    """
+    global _INVOCATIONS_SERVED
+    _INVOCATIONS_SERVED += 1
+    start_kib = _read_vmrss_kib()
+    return {
+        "container_cold": _INVOCATIONS_SERVED == 1,
+        "container_generation": _INVOCATIONS_SERVED,
+        "rss_start_mb": start_kib / 1024.0 if start_kib is not None else None,
+        "sandbox_id": os.environ.get("AWS_LAMBDA_LOG_STREAM_NAME"),
+        "container_init_ts": _CONTAINER_INIT_TS,
+    }
+
+
+def _attach_container_telemetry(
+    response: Dict[str, Any], telemetry: Dict[str, Any]
+) -> Dict[str, Any]:
+    """Merge the telemetry block into a per-unit response body (issue #171).
+
+    The body is a JSON string (Lambda proxy shape); parse-merge-redump at the
+    dispatcher gives one seam covering both per-unit handlers (spatial process,
+    temporal process_event) and every status branch (200/400/500), so the
+    orchestrator can stratify failures -- e.g. an OOM'd generation-4 shard --
+    by container state, not just successes. A non-dict/undecodable body passes
+    through untouched (never turn a valid error envelope into a crash).
+    """
+    try:
+        body = json.loads(response.get("body", "{}"))
+    except (json.JSONDecodeError, TypeError):
+        return response
+    if not isinstance(body, dict):
+        return response
+    body.update(telemetry)
+    return {**response, "body": json.dumps(body)}
+
 
 def _max_memory_mb() -> float:
     """Peak resident set size of this worker in MB (issue #120).
@@ -282,6 +339,11 @@ def lambda_handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
     ``mode="extract"`` extracts chunk-boundary geometry parquets (issue #148);
     ``mode="process_event"`` runs the temporal/event worker (issue #12).
     """
+    # Count EVERY invocation toward the sandbox's generation (issue #171): a
+    # setup/finalize/extract invoke warms the container just like a shard does,
+    # so the next shard on this sandbox is genuinely generation N+1. Snapshot
+    # start RSS here, before any per-unit work inflates it.
+    telemetry = _container_telemetry()
     mode = event.get("mode", "process")
     if mode == "setup":
         return _handle_setup(event)
@@ -295,6 +357,10 @@ def lambda_handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
         response = _handle_process_event(event)
     else:
         response = _handle_process(event, context)
+    # Container telemetry rides in every per-unit envelope (issue #171) -- the
+    # setup/finalize/extract bodies stay byte-identical (their consumers don't
+    # aggregate container state).
+    response = _attach_container_telemetry(response, telemetry)
     # Async result channel (issue #151): on an Event invoke the return value is
     # discarded, so mirror the response envelope to the orchestrator-supplied
     # result_url for it to poll. Covers every branch (200 / 400 / 500) of both
