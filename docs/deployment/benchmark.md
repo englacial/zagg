@@ -10,6 +10,19 @@ data branch; they update live (the docs embed them by raw URL, so no docs rebuil
 is needed). See [Lambda benchmark CI/CD setup](benchmark-cicd.md) for how the
 pipeline is wired.
 
+### Container regime
+
+Benchmark points run with the default `force_cold=False`, so they measure the
+**warm regime** — the same reused containers a routine fleet sees. Since issue
+#171 each run's summary carries container telemetry (`worker_cold_starts` /
+`worker_warm_starts` / `worker_rss_start_max_by_gen`, rolled up from the
+per-worker `container_cold` / `container_generation` / `rss_start_mb` envelope
+fields), so a memory outlier can be stratified by whether its shard landed on a
+fresh or a reused (higher-generation) sandbox. `agg(..., force_cold=True)`
+remains the explicit all-cold certification baseline (it needs
+`lambda:UpdateFunctionConfiguration` on the caller — see
+[Warm-container memory and self-recycle](lambda.md#warm-container-memory-and-self-recycle)).
+
 ## Sharded vs inner-chunk (tdigest, HEALPix)
 
 The forward benchmark (issue #133) is a **2×3 matrix** measuring the ShardingCodec

@@ -101,6 +101,15 @@ worker, fanned out the same way per-cell spatial work is.
 Setup and finalize exist so callers without direct S3 write access to the
 output bucket (e.g. cross-account JupyterHub orchestrators) can run the
 full pipeline using only lambda:InvokeFunction.
+
+Every per-unit response envelope (process / process_event, all status
+branches, including the ``result_url`` mirror) additionally carries container
+telemetry -- ``container_cold`` / ``container_generation`` / ``rss_start_mb``
+/ ``sandbox_id`` / ``container_init_ts`` (issue #171; see
+``_container_telemetry``) -- and after a successful async result mirror the
+worker may self-recycle a bloated sandbox (``_maybe_self_recycle``, gated by
+the ``ZAGG_RECYCLE_RSS_MB`` / ``ZAGG_RECYCLE_MAX_INVOCATIONS`` function env
+vars).
 """
 
 import ctypes
