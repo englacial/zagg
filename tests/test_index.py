@@ -591,9 +591,13 @@ class TestInlineReadGroup:
         assert df_i["h_ph"].to_numpy().tobytes() == full["/gt1l/heights/h_ph"][keep].tobytes()
         assert df_i["leaf_id"].to_numpy().tolist() == leaf[keep].tolist()
 
-    def test_compiled_decoder_engaged(self, monkeypatch):
+    def test_compiled_decoder_engaged(self, monkeypatch, caplog):
         # Byte-parity alone can't distinguish the compiled route from a silent
-        # per-dataset fallback; pin that the hidefix Index is actually built.
+        # per-dataset fallback; pin that the hidefix Index is actually built
+        # AND that no dataset degraded (the spy alone fires on the attempt,
+        # not the success -- review finding, PR #173).
+        import logging
+
         import h5coro_hidefix.manifest as hh_manifest
 
         calls = []
@@ -604,11 +608,14 @@ class TestInlineReadGroup:
             return orig(columns)
 
         monkeypatch.setattr(hh_manifest, "datasets_from_manifest", spy)
-        df = InlineIndex().read_group(
-            _open_fixture(), "gt1l", _fixture_data_source(), 1, _LeafSetGrid(_UNALIGNED_LEAVES)
-        )
+        with caplog.at_level(logging.WARNING, logger="zagg.index.inline"):
+            df = InlineIndex().read_group(
+                _open_fixture(), "gt1l", _fixture_data_source(), 1, _LeafSetGrid(_UNALIGNED_LEAVES)
+            )
         assert df is not None and len(df) > 0
         assert calls, "compiled decode was never engaged"
+        assert "compiled decode unavailable" not in caplog.text
+        assert "no chunk map" not in caplog.text
 
     def test_falls_back_to_h5coro_on_compiled_failure(self, monkeypatch, caplog):
         # A broken Index reconstruction degrades per dataset (warning, h5coro
@@ -628,6 +635,52 @@ class TestInlineReadGroup:
         df_h = HierarchicalIndex().read_group(_open_fixture(), "gt1l", ds, 1, grid)
         pd.testing.assert_frame_equal(df_i, df_h)
         assert "compiled decode unavailable" in caplog.text
+
+    def test_bad_dataset_degrades_alone(self, monkeypatch, caplog):
+        # A dataset hidefix rejects pins only ITSELF to the fallback; the
+        # group's other datasets stay compiled (PR #173 review: a shared
+        # Index rebuilt from all maps degraded innocent paths in cascade).
+        import logging
+
+        import h5coro_hidefix.manifest as hh_manifest
+
+        orig = hh_manifest.datasets_from_manifest
+        bad = "/gt1l/heights/h_ph"
+
+        def picky(columns):
+            if bad in set(columns["dataset"]):
+                raise ValueError("unsupported chunk table")
+            return orig(columns)
+
+        monkeypatch.setattr(hh_manifest, "datasets_from_manifest", picky)
+        ds = _fixture_data_source()
+        grid = _LeafSetGrid(_UNALIGNED_LEAVES)
+        with caplog.at_level(logging.WARNING, logger="zagg.index.inline"):
+            df_i = InlineIndex().read_group(_open_fixture(), "gt1l", ds, 1, grid)
+        df_h = HierarchicalIndex().read_group(_open_fixture(), "gt1l", ds, 1, grid)
+        pd.testing.assert_frame_equal(df_i, df_h)
+        warned = [r.message for r in caplog.records if "compiled decode unavailable" in r.message]
+        assert len(warned) == 1 and bad in warned[0]
+
+    def test_none_buffer_surfaces_as_io_error(self, monkeypatch):
+        # h5coro drivers swallow exceptions and return None on failed ranged
+        # reads; that's transient I/O, not a decode defect -- it must raise,
+        # not silently pin the dataset to the slow path (PR #173 review).
+        # Exercised at the read_fn seam: h5coro's own readDatasets also
+        # issues caching=False requests, so a read_group-wide patch breaks
+        # the selection reads before the compiled path is ever reached.
+        h5obj = _open_fixture()
+        read_fn = InlineIndex()._chunk_aligned_read_fn(h5obj)
+        orig = h5obj.ioRequest
+
+        def flaky(pos, size, caching=True, **kwargs):
+            if caching is False:  # the compiled data reads pass this
+                return None
+            return orig(pos, size, caching=caching, **kwargs)
+
+        monkeypatch.setattr(h5obj, "ioRequest", flaky)
+        with pytest.raises(OSError, match="ranged read failed"):
+            read_fn("/gt1l/heights/h_ph", [(0, 100)])
 
     def test_inline_requires_read_plan_config(self):
         ds = _fixture_data_source()
