@@ -31,6 +31,11 @@
 # chunks (chunk_inner 13 = 64x64 cells). The worker reads the shard once and
 # writes 16 chunk regions + 16 offset_h/gain_h companion slices.
 data_source:
+  # Pinned read backend (issue #170): the UNCACHED pure-h5coro baseline
+  # column. The package default flipped to the compiled `inline` path; an
+  # unpinned config would silently move this series onto the fast path.
+  index:
+    backend: hierarchical
   reader: h5coro
   driver: s3
   groups: [gt1l, gt1r, gt2l, gt2r, gt3l, gt3r]

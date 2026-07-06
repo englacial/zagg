@@ -1,5 +1,5 @@
 {
-  "description": "Pinned Lambda-benchmark targets (issue #110). Each target dispatches ONE shard -- the densest cell over the NEON SERC AOP box -- so cost/runtime deltas track code changes, not data drift. Forward matrix (issue #133): all tdigest / HEALPix / arrow, a 2x3 sharded-vs-inner ShardingCodec (issue #108) A/B across orders o9/o10/o11. The two columns of each order share ONE config + ONE shard map and differ only by the per-target codec key (sharded: true|false), which run_benchmark applies to output.grid.sharded. The carrier is config-driven (issue #132): aggregation.handoff defaults to arrow, so the matrix targets carry no redundant per-target handoff key. Shard maps are shared per (grid, order): the densest shard does not depend on the codec. Rebuild + drift check: tests/test_benchmark_shardmap.py.",
+  "description": "Pinned Lambda-benchmark targets (issue #110). Each target dispatches ONE shard -- the densest cell over the NEON SERC AOP box -- so cost/runtime deltas track code changes, not data drift. Forward matrix (issue #133): all tdigest / HEALPix / arrow, a 2x3 sharded-vs-inner ShardingCodec (issue #108) A/B across orders o9/o10/o11. The two columns of each order share ONE config + ONE shard map and differ only by the per-target codec key (sharded: true|false), which run_benchmark applies to output.grid.sharded. The carrier is config-driven (issue #132): aggregation.handoff defaults to arrow, so the matrix targets carry no redundant per-target handoff key. Shard maps are shared per (grid, order): the densest shard does not depend on the codec. Rebuild + drift check: tests/test_benchmark_shardmap.py. Cached-read columns (issue #170): each healpix tdigest order carries a *_cached companion target -- identical config except the read backend (sidecar over zagg-index/ATL03/007 granule manifests, self-populating via on_miss: build) -- so the matrix tracks the uncached pure-h5coro baseline and the compiled cached read side by side.",
   "aoi": {
     "file": "AOP_NEON.geojson",
     "name": "NEON SERC AOP box"
@@ -75,6 +75,16 @@
       "codec": "inner",
       "sharded": false
     },
+    "tdigest_healpix_o11_cached": {
+      "config": "configs/atl03_tdigest_healpix_o11_cached.yaml",
+      "shardmap": "healpix_o11",
+      "aggregator": "tdigest",
+      "grid_type": "healpix",
+      "grid_size": "o11",
+      "codec": "inner",
+      "sharded": false,
+      "read": "cached"
+    },
     "tdigest_healpix_o10_sharded": {
       "config": "configs/atl03_tdigest_healpix_o10.yaml",
       "shardmap": "healpix_o10",
@@ -93,6 +103,16 @@
       "codec": "inner",
       "sharded": false
     },
+    "tdigest_healpix_o10_cached": {
+      "config": "configs/atl03_tdigest_healpix_o10_cached.yaml",
+      "shardmap": "healpix_o10",
+      "aggregator": "tdigest",
+      "grid_type": "healpix",
+      "grid_size": "o10",
+      "codec": "inner",
+      "sharded": false,
+      "read": "cached"
+    },
     "tdigest_healpix_o9_sharded": {
       "config": "configs/atl03_tdigest_healpix_o9.yaml",
       "shardmap": "healpix_o9",
@@ -110,6 +130,16 @@
       "grid_size": "o9",
       "codec": "inner",
       "sharded": false
+    },
+    "tdigest_healpix_o9_cached": {
+      "config": "configs/atl03_tdigest_healpix_o9_cached.yaml",
+      "shardmap": "healpix_o9",
+      "aggregator": "tdigest",
+      "grid_type": "healpix",
+      "grid_size": "o9",
+      "codec": "inner",
+      "sharded": false,
+      "read": "cached"
     }
   },
   "provisional_targets": {

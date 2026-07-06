@@ -1,22 +1,18 @@
-# ATL03 photon-height scalar template (HEALPix, multi-chunk-per-worker).
+# Cached-read companion of atl03_tdigest_healpix_o11.yaml (issue #170 phase 5).
 #
-# Purely SCALAR per-cell stats over photon heights (h_ph): count, min, max, and
-# variance -- no vector and no ragged field. It exists purely to benchmark the
-# per-cell carrier handoff (issue #130): the SAME config + SAME shard is dispatched
-# twice -- pandas / arrow -- to isolate the Arrow carrier cost (pandas DataFrame vs
-# an arro3-core Arrow table; both byte-identical, neither imports pyarrow). See the
-# ``provisional_targets`` block in targets.json. (The earlier arrow-kernel reducer
-# was dropped with pyarrow -- arro3 has no hash-aggregate -- per the path-C pivot.)
-#
-# data_source / read_plan / grid match atl03_tdigest_healpix_o11.yaml exactly
-# (the segment->photon planned IO of issue #43 applies here too); only the
-# aggregation differs (scalar-only).
+# Identical grid/aggregation/shardmap to the uncached baseline; the ONLY
+# difference is the read backend: `sidecar` consumes the granule-keyed chunk
+# manifests under zagg-index/ATL03/007 (shared with the sponsor example and
+# populated on first run via `on_miss: build`, which delegates to
+# inline+write_back). Column semantics: baseline = pure-h5coro uncached read,
+# this = compiled (hidefix) read against the manifest cache.
 data_source:
-  # Pinned read backend (issue #170): the UNCACHED pure-h5coro baseline
-  # column. The package default flipped to the compiled `inline` path; an
-  # unpinned config would silently move this series onto the fast path.
+  # Cached compiled read (issue #170): consume (or on first run, build) the
+  # granule-keyed sidecar manifests -- the CACHED benchmark column.
   index:
-    backend: hierarchical
+    backend: sidecar
+    on_miss: build
+    store: s3://sliderule-public-cors/zagg-index/ATL03/007
   reader: h5coro
   driver: s3
   groups: [gt1l, gt1r, gt2l, gt2r, gt3l, gt3r]
@@ -62,18 +58,21 @@ aggregation:
       source: h_ph
       dtype: int32
       fill_value: 0
-    h_min:
-      function: min
+    h_tdigest:
+      # Per-cell t-digest of photon heights: a ragged (CSR) field whose payload
+      # is an (n_centroids, 2) array of (mean, weight) centroids. ``build_tdigest``
+      # is called as build_tdigest(h_ph_values, delta=256); ``inner_shape: [2]``
+      # declares the per-element centroid width. To store ONE digest per chunk
+      # instead of per cell, add ``resolution: chunk`` (one CSR payload per inner
+      # chunk under the chunk-uniform contract).
+      kind: ragged
+      function: "zagg.stats.tdigest.build_tdigest"
       source: h_ph
+      inner_shape: [2]
+      params:
+        delta: 256
       dtype: float32
-    h_max:
-      function: max
-      source: h_ph
-      dtype: float32
-    h_variance:
-      function: var
-      source: h_ph
-      dtype: float32
+      fill_value: 0
 
 output:
   grid:
