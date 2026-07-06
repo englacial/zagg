@@ -309,8 +309,8 @@ mechanisms address this (issue #171):
   mirrored to its `result_url`, the handler exits the sandbox
   (`os._exit(0)`) when current RSS ≥ `ZAGG_RECYCLE_RSS_MB` (template
   default 1400) or the sandbox has served `ZAGG_RECYCLE_MAX_INVOCATIONS`
-  (template default 8) invocations. Set either to `0`/empty to disable that
-  check. The next invocation then starts on a fresh container instead of
+  (template default 1 — recycle after every invocation, the cold-every-time
+  posture) invocations. Set either to `0`/empty to disable that check. The next invocation then starts on a fresh container instead of
   ratcheting toward OOM. Synchronous invocations never self-recycle (the
   response would be lost).
 

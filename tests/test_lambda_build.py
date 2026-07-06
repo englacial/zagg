@@ -205,11 +205,12 @@ class TestTemplateEnvironment:
         # issue #171: the worker self-recycle knobs ride the function
         # environment with template defaults (1400 MB on the 2047 MB cap --
         # ~650 MB of headroom over the observed ~700-1100 MB/invocation
-        # retention -- and a generation cap of 8 as belt-and-suspenders).
+        # retention -- and a generation cap of 1: recycle after every
+        # invocation, the cold-every-time posture; issue #175).
         tpl = self._load_template()
         params = tpl["Parameters"]
         assert params["RecycleRssMb"]["Default"] == "1400"
-        assert params["RecycleMaxInvocations"]["Default"] == "8"
+        assert params["RecycleMaxInvocations"]["Default"] == "1"
         env = tpl["Resources"]["ProcessFn"]["Properties"]["Environment"]["Variables"]
         assert env["ZAGG_RECYCLE_RSS_MB"] == {"Ref": "RecycleRssMb"}
         assert env["ZAGG_RECYCLE_MAX_INVOCATIONS"] == {"Ref": "RecycleMaxInvocations"}
