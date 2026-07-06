@@ -119,7 +119,7 @@ Parameters:
 
   RecycleMaxInvocations:
     Type: String
-    Default: "0"
+    Default: "1"
     Description: >-
       ZAGG_RECYCLE_MAX_INVOCATIONS for the worker self-recycle (issue #171):
       belt-and-suspenders generation cap -- recycle the sandbox (same
