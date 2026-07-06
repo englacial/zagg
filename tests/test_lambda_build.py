@@ -215,12 +215,15 @@ class TestTemplateEnvironment:
         assert env["ZAGG_RECYCLE_RSS_MB"] == {"Ref": "RecycleRssMb"}
         assert env["ZAGG_RECYCLE_MAX_INVOCATIONS"] == {"Ref": "RecycleMaxInvocations"}
 
-    def test_execution_role_grants_zagg_index_store(self):
-        # issue #160: inline write-back + sidecar reads target the public
-        # zagg-index prefix; the shared execution role gets Get/Put scoped to
-        # exactly that prefix (never the bucket), in BOTH copies of the role
-        # (inline ExecutionRole here, admin-created execution_role.yaml).
-        arn = "arn:aws:s3:::sliderule-public-cors/zagg-index/*"
+    def test_execution_role_grants_public_cors_bucket(self):
+        # The shared execution role gets Get/Put/Delete on the whole public
+        # sliderule-public-cors bucket -- deliberate scope (espg, PR #176):
+        # virtual-index write-back + sidecar reads (zagg-index/*, issue #160)
+        # AND worker-written output zarr stores (e.g. zagg-examples/*) -- in
+        # BOTH copies of the role (inline ExecutionRole here, admin-created
+        # execution_role.yaml).
+        arn = "arn:aws:s3:::sliderule-public-cors/*"
+        actions = ["s3:DeleteObject", "s3:GetObject", "s3:PutObject"]
 
         def _index_statements(role_props):
             stmts = role_props["Policies"][0]["PolicyDocument"]["Statement"]
@@ -229,7 +232,7 @@ class TestTemplateEnvironment:
         tpl_role = self._load_template()["Resources"]["ExecutionRole"]["Properties"]
         matches = _index_statements(tpl_role)
         assert len(matches) == 1
-        assert sorted(matches[0]["Action"]) == ["s3:GetObject", "s3:PutObject"]
+        assert sorted(matches[0]["Action"]) == actions
 
         import yaml
 
@@ -249,7 +252,7 @@ class TestTemplateEnvironment:
         ext_role = ext["Resources"]["ExecutionRole"]["Properties"]
         ext_matches = _index_statements(ext_role)
         assert len(ext_matches) == 1
-        assert sorted(ext_matches[0]["Action"]) == ["s3:GetObject", "s3:PutObject"]
+        assert sorted(ext_matches[0]["Action"]) == actions
 
     def test_extract_fn_mirrors_process_fn(self):
         # issue #148: extraction is both a mode of ProcessFn and a dedicated

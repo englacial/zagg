@@ -171,14 +171,17 @@ Resources:
               - Effect: Allow
                 Action: s3:ListBucket
                 Resource: !Sub "arn:aws:s3:::${OutputBucketName}"
-              # Virtual-index store (issue #160): granule-keyed chunk-manifest
-              # write-back (inline backend) + sidecar reads, scoped to the
-              # public zagg-index prefix only.
+              # Public sliderule-public-cors bucket, whole-bucket by intent
+              # (espg, PR #176): virtual-index write-back + sidecar reads
+              # (zagg-index/*, issue #160) AND worker-written output zarr
+              # stores (e.g. zagg-examples/*); Delete covers store overwrite
+              # and manifest cleanup.
               - Effect: Allow
                 Action:
                   - s3:GetObject
                   - s3:PutObject
-                Resource: arn:aws:s3:::sliderule-public-cors/zagg-index/*
+                  - s3:DeleteObject
+                Resource: arn:aws:s3:::sliderule-public-cors/*
 
   DepsLayer:
     Type: AWS::Lambda::LayerVersion
