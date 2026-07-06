@@ -122,10 +122,12 @@ Parameters:
     Default: "1"
     Description: >-
       ZAGG_RECYCLE_MAX_INVOCATIONS for the worker self-recycle (issue #171):
-      belt-and-suspenders generation cap -- recycle the sandbox (same
-      after-result-mirror mechanics as RecycleRssMb) once it has served this
-      many invocations, bounding retention modes the RSS check misses. Set
-      "0" or empty to disable the generation check.
+      generation cap -- recycle the sandbox (same after-result-mirror
+      mechanics as RecycleRssMb) once it has served this many invocations.
+      The default "1" recycles after every invocation (cold-every-time);
+      raise it to make this a belt-and-suspenders cap over the RSS check,
+      bounding retention modes that check misses. Set "0" or empty to
+      disable the generation check.
 
 Conditions:
   ShouldCreateBucket: !Equals [!Ref CreateOutputBucket, "true"]
@@ -176,8 +178,7 @@ Resources:
                 Action:
                   - s3:GetObject
                   - s3:PutObject
-                  - s3:DeleteObject
-                Resource: arn:aws:s3:::sliderule-public-cors/*
+                Resource: arn:aws:s3:::sliderule-public-cors/zagg-index/*
 
   DepsLayer:
     Type: AWS::Lambda::LayerVersion

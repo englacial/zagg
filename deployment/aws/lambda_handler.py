@@ -239,9 +239,11 @@ def _maybe_self_recycle() -> None:
       against a 2047 MB cap, so the template's 1400 catches a dirty sandbox
       after roughly one heavy retention while leaving the triggering
       invocation ~650 MB of headroom to complete first.
-    - ``ZAGG_RECYCLE_MAX_INVOCATIONS`` -- generation cap (template 8),
-      belt-and-suspenders for retention modes the RSS read misses (and the
-      only check that fires off-Linux, where RSS reads are None).
+    - ``ZAGG_RECYCLE_MAX_INVOCATIONS`` -- generation cap (template default
+      1: recycle after every invocation, the cold-every-time posture; raise
+      it for a belt-and-suspenders cap over retention modes the RSS read
+      misses -- and the only check that fires off-Linux, where RSS reads
+      are None).
 
     Emits one CloudWatch-searchable line (``ZAGG_SELF_RECYCLE ...``) before
     exiting so dashboards can split intentional recycles from real crashes
