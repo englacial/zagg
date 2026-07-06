@@ -193,9 +193,12 @@ def agg(
         the update cannot be applied: an explicit request hard-fails instead
         of quietly not certifying. Costs one config-update round trip plus a
         few seconds of cold init per container, and chills the warm pool for
-        every concurrent user of the function -- which is why routine runs
-        leave it off even under the warm-container RSS ratchet (issues
-        #139/#169). Ignored by the ``"local"`` backend.
+        every concurrent user of the function. Routine protection against
+        the warm-container RSS ratchet (issues #139/#169) does not need this
+        flag: workers self-recycle bloated sandboxes via the
+        ``ZAGG_RECYCLE_RSS_MB`` / ``ZAGG_RECYCLE_MAX_INVOCATIONS`` function
+        env vars (issue #171), independently of ``force_cold`` -- both can
+        be on. Ignored by the ``"local"`` backend.
 
     events : iterable, optional
         Temporal pipeline only (``pipeline.type: temporal``/``event``), one

@@ -290,6 +290,54 @@ raises the FD ceiling it can use.
 | Typical memory usage | 1--1.5 GB |
 | Cold start | 3--5 seconds |
 
+## Warm-container memory and self-recycle
+
+Warm (reused) sandboxes retain process RSS across invocations — the issue
+#169 forensics showed container-lifetime memory ratcheting 959 → 1650 →
+2029 MB → OOM at the 2047 MB cap across four back-to-back fleet runs on the
+same 9 sandboxes, even with the glibc allocator tunables
+(`MALLOC_ARENA_MAX`/`MALLOC_TRIM_THRESHOLD_`, issue #143) deployed. Two
+mechanisms address this (issue #171):
+
+- **Container telemetry** — every worker result envelope carries
+  `container_cold`, `container_generation`, `rss_start_mb`, `sandbox_id`,
+  and `container_init_ts`; the run summary rolls these into
+  `worker_cold_starts` / `worker_warm_starts` /
+  `worker_rss_start_max_by_gen` (flat across generations = healthy;
+  climbing = the ratchet).
+- **Self-recycle** — after an async invocation's result envelope is safely
+  mirrored to its `result_url`, the handler exits the sandbox
+  (`os._exit(0)`) when current RSS ≥ `ZAGG_RECYCLE_RSS_MB` (template
+  default 1400) or the sandbox has served `ZAGG_RECYCLE_MAX_INVOCATIONS`
+  (template default 8) invocations. Set either to `0`/empty to disable that
+  check. The next invocation then starts on a fresh container instead of
+  ratcheting toward OOM. Synchronous invocations never self-recycle (the
+  response would be lost).
+
+!!! info "Self-recycles look like runtime failures in CloudWatch"
+    A self-exit after the result write is counted as a runtime error by
+    Lambda's `Errors` metric — **cosmetically only**: the result object at
+    `result_url` is the source of truth for the orchestrator (issue #153),
+    and `MaximumRetryAttempts: 0` in the template guarantees no zombie
+    retry. Each recycle logs one structured line first:
+
+    ```
+    ZAGG_SELF_RECYCLE rss_mb=<current> generation=<n> threshold=<crossed limit>
+    ```
+
+    To keep dashboards honest, split intentional recycles from real crashes
+    with a [metric filter](https://docs.aws.amazon.com/AmazonCloudWatch/latest/logs/MonitoringLogData.html)
+    on the function's log group, pattern `ZAGG_SELF_RECYCLE`, and subtract
+    (or graph separately) from `AWS/Lambda Errors`.
+
+For guaranteed all-cold fleets (certification/benchmark baselines) there is
+also the dispatch-side big hammer: `agg(..., force_cold=True)` bumps a
+`ZAGG_COLD_EPOCH` function-environment marker before fan-out, invalidating
+every warm sandbox at once. It requires `lambda:GetFunctionConfiguration` +
+`lambda:UpdateFunctionConfiguration` on the *caller* and chills the warm
+pool for all users of the function, so it is off by default and independent
+of the self-recycle knobs (both can be enabled).
+
 ## Cost Estimate
 
 **Per invocation** (180s average, 2 GB memory): ~$0.006

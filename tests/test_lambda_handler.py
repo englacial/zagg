@@ -1202,10 +1202,23 @@ class TestContainerTelemetry:
         assert first["container_init_ts"] == handler_mod._CONTAINER_INIT_TS
 
     def test_rss_start_sampled_at_entry(self, handler_mod, monkeypatch):
-        monkeypatch.setattr(handler_mod, "_read_vmrss_kib", lambda: 512 * 1024)
+        # The telemetry snapshot is the invocation's FIRST _read_vmrss_kib
+        # call (dispatcher entry, before the #141 sampler even probes): feed
+        # 512 MB to that call only, 2000 MB to every later one. A post-work
+        # sample would report 2000 and corrupt the #169 ratchet signal --
+        # start RSS must be what the sandbox retained BEFORE this
+        # invocation's work (review finding, PR #172).
+        calls = {"n": 0}
+
+        def feed():
+            calls["n"] += 1
+            return (512 if calls["n"] == 1 else 2000) * 1024
+
+        monkeypatch.setattr(handler_mod, "_read_vmrss_kib", feed)
         event = self._process_event(monkeypatch)
         body = json.loads(handler_mod.lambda_handler(event, _context())["body"])
         assert body["rss_start_mb"] == pytest.approx(512.0)
+        assert calls["n"] > 1  # later reads happened (sampler), all post-entry
 
     def test_rss_start_none_off_linux(self, handler_mod, monkeypatch):
         # No /proc/self/status (dev host): rss_start_mb degrades to None, the
@@ -1266,6 +1279,159 @@ class TestContainerTelemetry:
         written = json.loads(Path(url).read_text())
         assert written == resp
         assert json.loads(written["body"])["container_generation"] == 1
+
+
+class TestSelfRecycle:
+    """Issue #171 (self-recycling workers): after -- and only after -- the
+    invocation's result envelope is successfully mirrored to ``result_url``,
+    the handler destroys a bloated sandbox via the injectable ``_exit`` seam,
+    gated by the ``ZAGG_RECYCLE_RSS_MB`` / ``ZAGG_RECYCLE_MAX_INVOCATIONS``
+    env knobs. The #153 async channel makes this safe: the orchestrator polls
+    the result object, not the Lambda response, and retries are pinned to 0."""
+
+    @pytest.fixture(autouse=True)
+    def _fresh_container(self, handler_mod, monkeypatch):
+        monkeypatch.setattr(handler_mod, "_INVOCATIONS_SERVED", 0)
+        monkeypatch.delenv("ZAGG_RECYCLE_RSS_MB", raising=False)
+        monkeypatch.delenv("ZAGG_RECYCLE_MAX_INVOCATIONS", raising=False)
+
+    def _process_event(self, monkeypatch, **extra):
+        import zagg.grids as grids
+        import zagg.processing as processing
+
+        def fake_process_shard(grid, shard_key, granule_urls, **kwargs):
+            meta = {
+                "shard_key": shard_key,
+                "cells_with_data": 0,
+                "total_obs": 0,
+                "granule_count": len(granule_urls),
+                "files_processed": 0,
+                "duration_s": 0.0,
+                "error": None,
+            }
+            return pd.DataFrame(), meta
+
+        monkeypatch.setattr(processing, "process_shard", fake_process_shard)
+        monkeypatch.setattr(grids, "from_config", lambda *a, **k: MagicMock())
+        event = _base_event(_healpix_config_dict())
+        event["child_order"] = 12
+        event.update(extra)
+        return event
+
+    @staticmethod
+    def _spy_exit(handler_mod, monkeypatch, calls):
+        monkeypatch.setattr(handler_mod, "_exit", lambda code: calls.append(("exit", code)))
+
+    def test_result_mirror_completes_before_exit(self, handler_mod, monkeypatch):
+        # THE load-bearing ordering (issue #153): the S3 result mirror must
+        # return before the sandbox dies, or the run loses the shard.
+        calls = []
+        monkeypatch.setenv("ZAGG_RECYCLE_RSS_MB", "100")
+        monkeypatch.setattr(handler_mod, "_read_vmrss_kib", lambda: 200 * 1024)
+        monkeypatch.setattr(
+            handler_mod,
+            "_write_result",
+            lambda url, resp, ev: (calls.append(("mirror", url)), True)[1],
+        )
+        self._spy_exit(handler_mod, monkeypatch, calls)
+        event = self._process_event(monkeypatch, result_url="s3://b/status/1.json")
+        resp = handler_mod.lambda_handler(event, _context())
+        assert resp["statusCode"] == 200
+        assert [c[0] for c in calls] == ["mirror", "exit"]
+        assert calls[1] == ("exit", 0)
+
+    def test_rss_threshold_triggers(self, handler_mod, monkeypatch, tmp_path, caplog):
+        calls = []
+        monkeypatch.setenv("ZAGG_RECYCLE_RSS_MB", "1400")
+        monkeypatch.setattr(handler_mod, "_read_vmrss_kib", lambda: 1500 * 1024)
+        self._spy_exit(handler_mod, monkeypatch, calls)
+        url = str(tmp_path / "status" / "1.json")
+        event = self._process_event(monkeypatch, result_url=url)
+        with caplog.at_level("INFO"):
+            handler_mod.lambda_handler(event, _context())
+        assert calls == [("exit", 0)]
+        assert Path(url).exists()  # mirror landed before the exit
+        # One structured, CloudWatch-searchable line (dashboard metric filter).
+        assert "ZAGG_SELF_RECYCLE rss_mb=1500 generation=1 threshold=1400" in caplog.text
+
+    def test_below_threshold_no_recycle(self, handler_mod, monkeypatch):
+        calls = []
+        monkeypatch.setenv("ZAGG_RECYCLE_RSS_MB", "1400")
+        monkeypatch.setattr(handler_mod, "_read_vmrss_kib", lambda: 800 * 1024)
+        monkeypatch.setattr(handler_mod, "_write_result", lambda *a: True)
+        self._spy_exit(handler_mod, monkeypatch, calls)
+        event = self._process_event(monkeypatch, result_url="s3://b/status/1.json")
+        handler_mod.lambda_handler(event, _context())
+        assert calls == []
+
+    def test_generation_cap_triggers_on_nth_invocation(self, handler_mod, monkeypatch, caplog):
+        calls = []
+        monkeypatch.setenv("ZAGG_RECYCLE_MAX_INVOCATIONS", "2")
+        monkeypatch.setattr(handler_mod, "_read_vmrss_kib", lambda: None)  # RSS check inert
+        monkeypatch.setattr(handler_mod, "_write_result", lambda *a: True)
+        self._spy_exit(handler_mod, monkeypatch, calls)
+        event = self._process_event(monkeypatch, result_url="s3://b/status/1.json")
+        handler_mod.lambda_handler(event, _context())
+        assert calls == []  # generation 1 < cap
+        with caplog.at_level("INFO"):
+            handler_mod.lambda_handler(event, _context())
+        assert calls == [("exit", 0)]  # generation 2 hits the cap
+        assert "ZAGG_SELF_RECYCLE rss_mb=n/a generation=2 threshold=2" in caplog.text
+
+    def test_disabled_by_default_and_by_zero(self, handler_mod, monkeypatch):
+        # No env vars (and explicit "0") -> never recycles, however bloated:
+        # a stack without the template defaults behaves exactly as pre-#171.
+        calls = []
+        monkeypatch.setattr(handler_mod, "_read_vmrss_kib", lambda: 4000 * 1024)
+        monkeypatch.setattr(handler_mod, "_write_result", lambda *a: True)
+        self._spy_exit(handler_mod, monkeypatch, calls)
+        event = self._process_event(monkeypatch, result_url="s3://b/status/1.json")
+        handler_mod.lambda_handler(event, _context())
+        monkeypatch.setenv("ZAGG_RECYCLE_RSS_MB", "0")
+        monkeypatch.setenv("ZAGG_RECYCLE_MAX_INVOCATIONS", "0")
+        handler_mod.lambda_handler(event, _context())
+        assert calls == []
+
+    def test_sync_path_never_recycles(self, handler_mod, monkeypatch):
+        # No result_url (synchronous invoke): the response would be lost, so
+        # the recycle must not run even with both thresholds crossed.
+        calls = []
+        monkeypatch.setenv("ZAGG_RECYCLE_RSS_MB", "100")
+        monkeypatch.setenv("ZAGG_RECYCLE_MAX_INVOCATIONS", "1")
+        monkeypatch.setattr(handler_mod, "_read_vmrss_kib", lambda: 2000 * 1024)
+        self._spy_exit(handler_mod, monkeypatch, calls)
+        event = self._process_event(monkeypatch)  # no result_url
+        resp = handler_mod.lambda_handler(event, _context())
+        assert resp["statusCode"] == 200
+        assert calls == []
+
+    def test_failed_mirror_skips_recycle(self, handler_mod, monkeypatch, tmp_path):
+        # A failed result write returns False (poll deadline will record the
+        # shard failed); the sandbox must NOT also self-destruct on it.
+        import obstore
+
+        calls = []
+        monkeypatch.setenv("ZAGG_RECYCLE_RSS_MB", "100")
+        monkeypatch.setattr(handler_mod, "_read_vmrss_kib", lambda: 2000 * 1024)
+        monkeypatch.setattr(
+            obstore, "put", lambda *a, **k: (_ for _ in ()).throw(RuntimeError("s3 down"))
+        )
+        self._spy_exit(handler_mod, monkeypatch, calls)
+        url = str(tmp_path / "status" / "1.json")
+        event = self._process_event(monkeypatch, result_url=url)
+        resp = handler_mod.lambda_handler(event, _context())
+        assert resp["statusCode"] == 200  # invocation result unaffected (#151)
+        assert calls == []
+
+    def test_non_numeric_knob_disables_check(self, handler_mod, monkeypatch):
+        calls = []
+        monkeypatch.setenv("ZAGG_RECYCLE_RSS_MB", "lots")
+        monkeypatch.setattr(handler_mod, "_read_vmrss_kib", lambda: 2000 * 1024)
+        monkeypatch.setattr(handler_mod, "_write_result", lambda *a: True)
+        self._spy_exit(handler_mod, monkeypatch, calls)
+        event = self._process_event(monkeypatch, result_url="s3://b/status/1.json")
+        handler_mod.lambda_handler(event, _context())
+        assert calls == []
 
 
 class TestExtractMode:
