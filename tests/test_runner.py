@@ -2582,13 +2582,16 @@ class TestForceCold:
         )
         assert calls == []
 
-    def test_agg_defaults_force_cold_on(self):
-        # espg's call on PR #172: the public default is True.
+    def test_agg_defaults_force_cold_off(self):
+        # espg's decision on the PR #172 plan: default False. force_cold is
+        # the explicit certification-run tool (it needs a broad write
+        # permission and chills every caller's warm pool), not a tax on every
+        # agg() call; routine ratchet protection is worker-side instead.
         import inspect
 
         from zagg.runner import agg
 
-        assert inspect.signature(agg).parameters["force_cold"].default is True
+        assert inspect.signature(agg).parameters["force_cold"].default is False
 
 
 class TestProfilePlumbing:
