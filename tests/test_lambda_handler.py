@@ -36,6 +36,26 @@ def handler_mod():
     return mod
 
 
+@pytest.fixture(autouse=True)
+def _no_real_recycle(handler_mod, monkeypatch):
+    """Module-wide self-recycle hygiene (issue #171, review finding PR #172).
+
+    A dev shell exporting ``ZAGG_RECYCLE_*`` must never let a mirror-path test
+    reach the REAL ``os._exit`` -- that kills pytest mid-suite with a
+    success-looking exit code 0 (the module-scoped ``handler_mod`` keeps
+    ``_INVOCATIONS_SERVED`` climbing across tests, so the generation cap WILL
+    fire). Scrub the knobs and make any unexpected exit LOUD; ``TestSelfRecycle``
+    re-enables the knobs and replaces the seam per test.
+    """
+
+    def _unexpected_exit(code):
+        raise AssertionError(f"unexpected self-recycle _exit({code}) in tests")
+
+    monkeypatch.delenv("ZAGG_RECYCLE_RSS_MB", raising=False)
+    monkeypatch.delenv("ZAGG_RECYCLE_MAX_INVOCATIONS", raising=False)
+    monkeypatch.setattr(handler_mod, "_exit", _unexpected_exit)
+
+
 def _context():
     ctx = MagicMock()
     ctx.aws_request_id = "req-1"
