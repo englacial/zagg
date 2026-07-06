@@ -314,21 +314,37 @@ mechanisms address this (issue #171):
   ratcheting toward OOM. Synchronous invocations never self-recycle (the
   response would be lost).
 
-!!! info "Self-recycles look like runtime failures in CloudWatch"
+!!! warning "The raw `Errors` metric is 100% noise under this posture"
     A self-exit after the result write is counted as a runtime error by
     Lambda's `Errors` metric — **cosmetically only**: the result object at
     `result_url` is the source of truth for the orchestrator (issue #153),
     and `MaximumRetryAttempts: 0` in the template guarantees no zombie
-    retry. Each recycle logs one structured line first:
+    retry. With the default `RecycleMaxInvocations=1`, *every* async
+    invocation self-recycles, so raw `Errors` ≈ invocation count. Each
+    recycle logs one structured line first:
 
     ```
     ZAGG_SELF_RECYCLE rss_mb=<current> generation=<n> threshold=<crossed limit>
     ```
 
-    To keep dashboards honest, split intentional recycles from real crashes
-    with a [metric filter](https://docs.aws.amazon.com/AmazonCloudWatch/latest/logs/MonitoringLogData.html)
-    on the function's log group, pattern `ZAGG_SELF_RECYCLE`, and subtract
-    (or graph separately) from `AWS/Lambda Errors`.
+    The template materializes the real-vs-expected split as CloudWatch
+    metrics (namespace `zagg/lambda`, per function): metric filters on both
+    log groups publish `ProcessSelfRecycleCount` / `ExtractSelfRecycleCount`
+    (the `ZAGG_SELF_RECYCLE` line — expected exits) and
+    `ProcessWorkerErrorCount` / `ExtractWorkerErrorCount` (genuine failure
+    signatures only: `[ERROR]` lines, tracebacks, `Task timed out`,
+    `Runtime.OutOfMemory`, nonzero runtime exits — a clean self-exit
+    reports "Runtime exited *without providing a reason*" and is
+    deliberately not matched). **Alarm and dashboard on
+    `WorkerErrorCount`, never on the raw `Errors` metric.**
+
+    Two operational corollaries: **never attach an async `OnFailure`
+    destination** (SQS/SNS/EventBridge) to these functions while the
+    recycle-every-invocation posture is active — it would receive every
+    invocation; and on a **fresh** stack create with
+    `CreateLogMetricFilters=false`, invoke each function once (Lambda
+    creates the log groups lazily; the filters need them to exist), then
+    update the stack with `true`.
 
 For guaranteed all-cold fleets (certification/benchmark baselines) there is
 also the dispatch-side big hammer: `agg(..., force_cold=True)` bumps a

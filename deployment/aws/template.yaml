@@ -129,9 +129,25 @@ Parameters:
       bounding retention modes that check misses. Set "0" or empty to
       disable the generation check.
 
+  CreateLogMetricFilters:
+    Type: String
+    Default: "true"
+    AllowedValues: ["true", "false"]
+    Description: >-
+      Create the CloudWatch metric filters that split intentional
+      self-recycles from genuine worker failures (issue #175): under the
+      cold-every-time posture (RecycleMaxInvocations=1) every async
+      invocation self-exits and counts in Lambda's raw Errors metric, so
+      alarms must key on zagg/lambda WorkerErrorCount instead. Lambda
+      creates /aws/lambda/<fn> log groups lazily on first invocation and
+      AWS::Logs::MetricFilter requires the group to exist, so on a FRESH
+      stack: create with "false", invoke each function once, then update
+      the stack with "true". Existing deployments keep the default.
+
 Conditions:
   ShouldCreateBucket: !Equals [!Ref CreateOutputBucket, "true"]
   ShouldCreateRole: !Equals [!Ref CreateExecutionRole, "true"]
+  ShouldCreateMetricFilters: !Equals [!Ref CreateLogMetricFilters, "true"]
 
 Resources:
   OutputBucket:
@@ -272,6 +288,80 @@ Resources:
       Qualifier: "$LATEST"
       MaximumRetryAttempts: 0
       MaximumEventAgeInSeconds: 60
+
+  # Error-signal recovery under the cold-every-time posture (issue #175):
+  # with RecycleMaxInvocations=1 every async invocation self-exits after its
+  # result mirror, so Lambda's raw Errors metric is 100% noise. These filters
+  # publish the split to the zagg/lambda namespace, per function:
+  #   *SelfRecycleCount  -- the handler's ZAGG_SELF_RECYCLE line (expected).
+  #   *WorkerErrorCount  -- genuine failure signatures only: handler-logged
+  #     [ERROR] lines, unhandled-exception tracebacks, runtime timeouts,
+  #     OOM kills, and nonzero runtime exits. The patterns are deliberately
+  #     DISJOINT from the recycle path: a self-recycle logs at [INFO] and
+  #     exits 0, which the runtime reports as "Runtime exited without
+  #     providing a reason" -- not matched ("Runtime exited with error" is).
+  # The filters reference the implicit /aws/lambda/<fn> log groups by name
+  # rather than owning AWS::Logs::LogGroup resources: adopting a group Lambda
+  # already created fails stack CREATE/UPDATE with "already exists", the
+  # non-recoverable path for deployed stacks. See CreateLogMetricFilters for
+  # the fresh-stack ordering caveat.
+  ProcessSelfRecycleFilter:
+    Type: AWS::Logs::MetricFilter
+    Condition: ShouldCreateMetricFilters
+    DependsOn: ProcessFn
+    Properties:
+      LogGroupName: !Sub "/aws/lambda/${FunctionName}"
+      FilterPattern: '"ZAGG_SELF_RECYCLE"'
+      MetricTransformations:
+        - MetricNamespace: zagg/lambda
+          MetricName: ProcessSelfRecycleCount
+          MetricValue: "1"
+          DefaultValue: 0
+
+  ProcessWorkerErrorFilter:
+    Type: AWS::Logs::MetricFilter
+    Condition: ShouldCreateMetricFilters
+    DependsOn: ProcessFn
+    Properties:
+      LogGroupName: !Sub "/aws/lambda/${FunctionName}"
+      FilterPattern: >-
+        ?"Task timed out" ?"Runtime.OutOfMemory"
+        ?"Runtime exited with error" ?"[ERROR]"
+        ?"Traceback (most recent call last)"
+      MetricTransformations:
+        - MetricNamespace: zagg/lambda
+          MetricName: ProcessWorkerErrorCount
+          MetricValue: "1"
+          DefaultValue: 0
+
+  ExtractSelfRecycleFilter:
+    Type: AWS::Logs::MetricFilter
+    Condition: ShouldCreateMetricFilters
+    DependsOn: ExtractFn
+    Properties:
+      LogGroupName: !Sub "/aws/lambda/${FunctionName}-extract"
+      FilterPattern: '"ZAGG_SELF_RECYCLE"'
+      MetricTransformations:
+        - MetricNamespace: zagg/lambda
+          MetricName: ExtractSelfRecycleCount
+          MetricValue: "1"
+          DefaultValue: 0
+
+  ExtractWorkerErrorFilter:
+    Type: AWS::Logs::MetricFilter
+    Condition: ShouldCreateMetricFilters
+    DependsOn: ExtractFn
+    Properties:
+      LogGroupName: !Sub "/aws/lambda/${FunctionName}-extract"
+      FilterPattern: >-
+        ?"Task timed out" ?"Runtime.OutOfMemory"
+        ?"Runtime exited with error" ?"[ERROR]"
+        ?"Traceback (most recent call last)"
+      MetricTransformations:
+        - MetricNamespace: zagg/lambda
+          MetricName: ExtractWorkerErrorCount
+          MetricValue: "1"
+          DefaultValue: 0
 
 Outputs:
   FunctionArn:
