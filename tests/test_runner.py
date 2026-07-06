@@ -817,6 +817,7 @@ class TestMaxRetriesPassthrough:
         monkeypatch.setattr(runner, "_invoke_lambda_setup", lambda *a, **k: None)
         monkeypatch.setattr(runner, "_invoke_lambda_finalize", lambda *a, **k: None)
         monkeypatch.setattr(runner, "_get_function_timeout_s", lambda *a, **k: 720)
+        monkeypatch.setattr(runner, "_force_cold_containers", lambda *a, **k: None)
         from unittest.mock import MagicMock
 
         monkeypatch.setattr(boto3, "Session", lambda *a, **k: MagicMock())
@@ -889,6 +890,7 @@ class TestInvocationPassthrough:
         monkeypatch.setattr(runner, "_invoke_lambda_setup", lambda *a, **k: None)
         monkeypatch.setattr(runner, "_invoke_lambda_finalize", lambda *a, **k: None)
         monkeypatch.setattr(runner, "_get_function_timeout_s", lambda *a, **k: 720)
+        monkeypatch.setattr(runner, "_force_cold_containers", lambda *a, **k: None)
         monkeypatch.setattr(boto3, "Session", lambda *a, **k: MagicMock())
         monkeypatch.setattr(
             runner,
@@ -1291,6 +1293,7 @@ class TestSummaryKeysByteIdentical:
         monkeypatch.setattr(runner, "_invoke_lambda_setup", lambda *a, **k: None)
         monkeypatch.setattr(runner, "_invoke_lambda_finalize", lambda *a, **k: None)
         monkeypatch.setattr(runner, "_get_function_timeout_s", lambda *a, **k: 720)
+        monkeypatch.setattr(runner, "_force_cold_containers", lambda *a, **k: None)
         from unittest.mock import MagicMock
 
         monkeypatch.setattr(boto3, "Session", lambda *a, **k: MagicMock())
@@ -1375,6 +1378,7 @@ class TestSummaryKeysByteIdentical:
         monkeypatch.setattr(runner, "_invoke_lambda_setup", lambda *a, **k: None)
         monkeypatch.setattr(runner, "_invoke_lambda_finalize", lambda *a, **k: None)
         monkeypatch.setattr(runner, "_get_function_timeout_s", lambda *a, **k: 720)
+        monkeypatch.setattr(runner, "_force_cold_containers", lambda *a, **k: None)
         from unittest.mock import MagicMock
 
         monkeypatch.setattr(boto3, "Session", lambda *a, **k: MagicMock())
@@ -1450,6 +1454,7 @@ class TestSummaryKeysByteIdentical:
         monkeypatch.setattr(runner, "_invoke_lambda_setup", lambda *a, **k: None)
         monkeypatch.setattr(runner, "_invoke_lambda_finalize", lambda *a, **k: None)
         monkeypatch.setattr(runner, "_get_function_timeout_s", lambda *a, **k: 720)
+        monkeypatch.setattr(runner, "_force_cold_containers", lambda *a, **k: None)
         from unittest.mock import MagicMock
 
         monkeypatch.setattr(boto3, "Session", lambda *a, **k: MagicMock())
@@ -1803,6 +1808,7 @@ class TestTemporalLambdaStrategy:
 
         monkeypatch.setattr(boto3, "Session", lambda *a, **k: MagicMock())
         monkeypatch.setattr(runner, "_get_function_timeout_s", lambda *a, **k: 720)
+        monkeypatch.setattr(runner, "_force_cold_containers", lambda *a, **k: None)
         monkeypatch.setattr(
             runner,
             "compute_available_workers",
@@ -2393,49 +2399,117 @@ class TestGetFunctionTimeout:
 class TestForceCold:
     """``force_cold`` (issue #171): merge a per-run ``ZAGG_COLD_EPOCH`` env
     marker pre-fan-out so every warm sandbox is invalidated, preserving the
-    existing environment; failures raise instead of degrading to warm."""
+    existing environment; failures raise instead of degrading to warm. The
+    poll accepts only this update's states (marker match), so a stale
+    ``Successful`` from the prior update never returns early."""
 
-    @staticmethod
-    def _client(env=None, statuses=("InProgress", "Successful")):
-        from unittest.mock import MagicMock
+    class _FakeLambdaClient:
+        """Stateful double mirroring the real API: every
+        ``get_function_configuration`` response carries BOTH ``Environment``
+        and ``LastUpdateStatus`` (the AWS shape), and the environment only
+        reflects the update after ``lag`` post-update reads (eventual
+        consistency)."""
 
-        client = MagicMock()
-        # First get_function_configuration read returns the environment; the
-        # poll loop's reads consume ``statuses`` one per call.
-        responses = iter(
-            [{"Environment": {"Variables": dict(env or {})}}]
-            + [{"LastUpdateStatus": s} for s in statuses]
-        )
-        client.get_function_configuration.side_effect = lambda **k: next(responses)
-        return client
+        def __init__(self, env=None, statuses=("InProgress", "Successful"), lag=0):
+            self.env = dict(env or {})
+            self.pending_env = None
+            self.statuses = list(statuses)
+            self.lag = lag  # reads before the new env becomes visible
+            self.update_calls = []
+            self.update_error = None
+            self._updated = False
+
+        def get_function_configuration(self, FunctionName):  # noqa: N803 (boto3 API)
+            if self._updated:
+                if self.lag > 0:
+                    self.lag -= 1
+                    # Stale read: prior env, prior (terminal) status.
+                    return {
+                        "Environment": {"Variables": dict(self.env)},
+                        "LastUpdateStatus": "Successful",
+                    }
+                self.env = dict(self.pending_env)
+                status = self.statuses.pop(0) if len(self.statuses) > 1 else self.statuses[0]
+                return {
+                    "Environment": {"Variables": dict(self.env)},
+                    "LastUpdateStatus": status,
+                }
+            return {
+                "Environment": {"Variables": dict(self.env)},
+                "LastUpdateStatus": "Successful",  # prior update's terminal state
+            }
+
+        def update_function_configuration(self, FunctionName, Environment):  # noqa: N803
+            if self.update_error is not None:
+                err, self.update_error = self.update_error, None
+                raise err
+            self.update_calls.append(Environment["Variables"])
+            self.pending_env = dict(Environment["Variables"])
+            self._updated = True
 
     def test_merges_marker_and_preserves_env(self):
         from zagg.runner import _force_cold_containers
 
-        client = self._client(env={"MALLOC_ARENA_MAX": "2"})
+        client = self._FakeLambdaClient(env={"MALLOC_ARENA_MAX": "2"})
         _force_cold_containers(client, "process-shard", poll_interval_s=0)
-        (_, kwargs) = client.update_function_configuration.call_args
-        sent = kwargs["Environment"]["Variables"]
+        sent = client.update_calls[0]
         assert sent["MALLOC_ARENA_MAX"] == "2"
         assert len(sent["ZAGG_COLD_EPOCH"]) == 32  # uuid4 hex, unique per run
-        assert kwargs["FunctionName"] == "process-shard"
+
+    def test_stale_successful_from_prior_update_is_not_accepted(self):
+        # Eventual consistency: the first post-update reads still show the
+        # PRIOR env with LastUpdateStatus=Successful. The poll must keep
+        # waiting for the marker, not return on the stale terminal state.
+        from zagg.runner import _force_cold_containers
+
+        client = self._FakeLambdaClient(statuses=("InProgress", "Successful"), lag=2)
+        _force_cold_containers(client, "process-shard", poll_interval_s=0)
+        # 1 env read + 2 stale + InProgress + Successful = 5 reads minimum;
+        # early acceptance of a stale Successful would have used only 2.
+        assert client.lag == 0
+
+    def test_resource_conflict_retries_until_free(self):
+        from zagg.runner import _force_cold_containers
+
+        class _ConflictError(Exception):
+            response = {"Error": {"Code": "ResourceConflictException"}}
+
+        client = self._FakeLambdaClient()
+        client.update_error = _ConflictError("update in progress")
+        _force_cold_containers(client, "process-shard", poll_interval_s=0)
+        assert len(client.update_calls) == 1  # succeeded on the retry
 
     def test_raises_when_update_denied(self):
         import pytest
 
         from zagg.runner import _force_cold_containers
 
-        client = self._client()
-        client.update_function_configuration.side_effect = RuntimeError("AccessDenied")
+        class _DeniedError(Exception):
+            response = {"Error": {"Code": "AccessDeniedException"}}
+
+        client = self._FakeLambdaClient()
+        client.update_error = _DeniedError("AccessDenied")
         with pytest.raises(RuntimeError, match="UpdateFunctionConfiguration"):
             _force_cold_containers(client, "process-shard", poll_interval_s=0)
+
+    def test_raises_when_configuration_unreadable(self):
+        import pytest
+
+        from zagg.runner import _force_cold_containers
+
+        class _Client:
+            def get_function_configuration(self, FunctionName):  # noqa: N803
+                raise RuntimeError("AccessDenied")
+
+        with pytest.raises(RuntimeError, match="GetFunctionConfiguration"):
+            _force_cold_containers(_Client(), "process-shard", poll_interval_s=0)
 
     def test_raises_on_failed_update(self):
         import pytest
 
         from zagg.runner import _force_cold_containers
 
-        client = self._client(statuses=("Failed",))
+        client = self._FakeLambdaClient(statuses=("Failed",))
         with pytest.raises(RuntimeError, match="LastUpdateStatus=Failed"):
             _force_cold_containers(client, "process-shard", poll_interval_s=0)
 
@@ -2444,7 +2518,7 @@ class TestForceCold:
 
         from zagg.runner import _force_cold_containers
 
-        client = self._client(statuses=("InProgress",) * 50)
+        client = self._FakeLambdaClient(statuses=("InProgress",))
         with pytest.raises(RuntimeError, match="warm containers"):
             _force_cold_containers(client, "process-shard", wait_s=0, poll_interval_s=0)
 
@@ -2456,13 +2530,23 @@ class TestForceCold:
         _run_lambda_with_durations(monkeypatch, atl06_config, [1.0, 2.0, 3.0, 4.0], force_cold=True)
         assert calls == ["process-shard"]
 
-    def test_default_run_never_touches_configuration(self, monkeypatch, atl06_config):
+    def test_opt_out_never_touches_configuration(self, monkeypatch, atl06_config):
         from zagg import runner
 
         calls = []
         monkeypatch.setattr(runner, "_force_cold_containers", lambda client, fn: calls.append(fn))
-        _run_lambda_with_durations(monkeypatch, atl06_config, [1.0, 2.0, 3.0, 4.0])
+        _run_lambda_with_durations(
+            monkeypatch, atl06_config, [1.0, 2.0, 3.0, 4.0], force_cold=False
+        )
         assert calls == []
+
+    def test_agg_defaults_force_cold_on(self):
+        # espg's call on PR #172: the public default is True.
+        import inspect
+
+        from zagg.runner import agg
+
+        assert inspect.signature(agg).parameters["force_cold"].default is True
 
 
 class TestProfilePlumbing:
