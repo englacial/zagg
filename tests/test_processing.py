@@ -119,6 +119,15 @@ class TestWriteShardToZarr:
         monkeypatch.setattr("zagg.processing._read_group", one_shot)
         monkeypatch.setattr("zagg.processing.h5coro.H5Coro", lambda *a, **k: object())
         monkeypatch.setattr("zagg.processing._make_url_rewriter", lambda driver: lambda u: u)
+        # These tests pin worker/aggregation logic, not the read backend: pin
+        # the hierarchical delegation seam the one_shot stub intercepts (the
+        # issue #170 default otherwise resolves to inline, which reads through
+        # its own chunk-aligned path and hits the object() h5obj stub).
+        from zagg.index.hierarchical import HierarchicalIndex
+
+        monkeypatch.setattr(
+            "zagg.processing.worker.index_from_config", lambda cfg: HierarchicalIndex()
+        )
 
     def _read_df(self, grid, shard_key):
         # Two distinct cells in two distinct inner chunks of the shard, so the
@@ -257,6 +266,15 @@ class TestShardOrderObjectSplit:
         monkeypatch.setattr("zagg.processing._read_group", one_shot)
         monkeypatch.setattr("zagg.processing.h5coro.H5Coro", lambda *a, **k: object())
         monkeypatch.setattr("zagg.processing._make_url_rewriter", lambda driver: lambda u: u)
+        # These tests pin worker/aggregation logic, not the read backend: pin
+        # the hierarchical delegation seam the one_shot stub intercepts (the
+        # issue #170 default otherwise resolves to inline, which reads through
+        # its own chunk-aligned path and hits the object() h5obj stub).
+        from zagg.index.hierarchical import HierarchicalIndex
+
+        monkeypatch.setattr(
+            "zagg.processing.worker.index_from_config", lambda cfg: HierarchicalIndex()
+        )
 
         store = MemoryStore()
         grid.emit_template(store)
@@ -822,6 +840,15 @@ class TestRaggedCsrWrite:
         monkeypatch.setattr("zagg.processing._read_group", one_shot)
         monkeypatch.setattr("zagg.processing.h5coro.H5Coro", lambda *a, **k: object())
         monkeypatch.setattr("zagg.processing._make_url_rewriter", lambda driver: lambda u: u)
+        # These tests pin worker/aggregation logic, not the read backend: pin
+        # the hierarchical delegation seam the one_shot stub intercepts (the
+        # issue #170 default otherwise resolves to inline, which reads through
+        # its own chunk-aligned path and hits the object() h5obj stub).
+        from zagg.index.hierarchical import HierarchicalIndex
+
+        monkeypatch.setattr(
+            "zagg.processing.worker.index_from_config", lambda cfg: HierarchicalIndex()
+        )
 
     @staticmethod
     def _shard_grid(cfg):
@@ -979,6 +1006,15 @@ class TestLocatedRaggedAggregation:
         monkeypatch.setattr("zagg.processing._read_group", one_shot)
         monkeypatch.setattr("zagg.processing.h5coro.H5Coro", lambda *a, **k: object())
         monkeypatch.setattr("zagg.processing._make_url_rewriter", lambda driver: lambda u: u)
+        # These tests pin worker/aggregation logic, not the read backend: pin
+        # the hierarchical delegation seam the one_shot stub intercepts (the
+        # issue #170 default otherwise resolves to inline, which reads through
+        # its own chunk-aligned path and hits the object() h5obj stub).
+        from zagg.index.hierarchical import HierarchicalIndex
+
+        monkeypatch.setattr(
+            "zagg.processing.worker.index_from_config", lambda cfg: HierarchicalIndex()
+        )
 
     def test_calculate_cell_statistics_returns_located_pair(self):
         cfg = self._located_cfg()
@@ -1283,6 +1319,15 @@ class TestRaggedWriteFanout:
         monkeypatch.setattr("zagg.processing._read_group", one_shot)
         monkeypatch.setattr("zagg.processing.h5coro.H5Coro", lambda *a, **k: object())
         monkeypatch.setattr("zagg.processing._make_url_rewriter", lambda driver: lambda u: u)
+        # These tests pin worker/aggregation logic, not the read backend: pin
+        # the hierarchical delegation seam the one_shot stub intercepts (the
+        # issue #170 default otherwise resolves to inline, which reads through
+        # its own chunk-aligned path and hits the object() h5obj stub).
+        from zagg.index.hierarchical import HierarchicalIndex
+
+        monkeypatch.setattr(
+            "zagg.processing.worker.index_from_config", lambda cfg: HierarchicalIndex()
+        )
 
         seen = {"count": 0, "keys": None}
 
@@ -1353,6 +1398,15 @@ class TestRaggedChunkCompanion:
         monkeypatch.setattr("zagg.processing._read_group", one_shot)
         monkeypatch.setattr("zagg.processing.h5coro.H5Coro", lambda *a, **k: object())
         monkeypatch.setattr("zagg.processing._make_url_rewriter", lambda driver: lambda u: u)
+        # These tests pin worker/aggregation logic, not the read backend: pin
+        # the hierarchical delegation seam the one_shot stub intercepts (the
+        # issue #170 default otherwise resolves to inline, which reads through
+        # its own chunk-aligned path and hits the object() h5obj stub).
+        from zagg.index.hierarchical import HierarchicalIndex
+
+        monkeypatch.setattr(
+            "zagg.processing.worker.index_from_config", lambda cfg: HierarchicalIndex()
+        )
 
     def test_healpix_chunk_ragged_collapses_to_one_payload(self, monkeypatch):
         """HEALPix: a chunk-resolution ragged field writes ONE chunk payload, even
@@ -1536,6 +1590,15 @@ class TestMultiChunkWorker:
         monkeypatch.setattr("zagg.processing._read_group", one_shot)
         monkeypatch.setattr("zagg.processing.h5coro.H5Coro", lambda *a, **k: object())
         monkeypatch.setattr("zagg.processing._make_url_rewriter", lambda driver: lambda u: u)
+        # These tests pin worker/aggregation logic, not the read backend: pin
+        # the hierarchical delegation seam the one_shot stub intercepts (the
+        # issue #170 default otherwise resolves to inline, which reads through
+        # its own chunk-aligned path and hits the object() h5obj stub).
+        from zagg.index.hierarchical import HierarchicalIndex
+
+        monkeypatch.setattr(
+            "zagg.processing.worker.index_from_config", lambda cfg: HierarchicalIndex()
+        )
 
     def test_k_gt_1_yields_one_carrier_per_chunk(self, monkeypatch):
         """K=4: process_shard returns 4 chunk_results, each a carrier at its own
@@ -2047,6 +2110,15 @@ class TestChunkCompanionWorkedExample:
         monkeypatch.setattr("zagg.processing._read_group", one_shot)
         monkeypatch.setattr("zagg.processing.h5coro.H5Coro", lambda *a, **k: object())
         monkeypatch.setattr("zagg.processing._make_url_rewriter", lambda driver: lambda u: u)
+        # These tests pin worker/aggregation logic, not the read backend: pin
+        # the hierarchical delegation seam the one_shot stub intercepts (the
+        # issue #170 default otherwise resolves to inline, which reads through
+        # its own chunk-aligned path and hits the object() h5obj stub).
+        from zagg.index.hierarchical import HierarchicalIndex
+
+        monkeypatch.setattr(
+            "zagg.processing.worker.index_from_config", lambda cfg: HierarchicalIndex()
+        )
 
     def test_scalar_vector_ragged_chunk_companions_roundtrip(self, monkeypatch):
         import zarr
@@ -2373,6 +2445,15 @@ class TestProcessShardKernelBranch:
         monkeypatch.setattr("zagg.processing.h5coro.H5Coro", lambda *a, **k: object())
         # Avoid resolving a real h5coro driver (s3driver import / creds plumbing).
         monkeypatch.setattr("zagg.processing._make_url_rewriter", lambda driver: lambda u: u)
+        # These tests pin worker/aggregation logic, not the read backend: pin
+        # the hierarchical delegation seam the fake_read_group stub intercepts
+        # (the issue #170 default otherwise resolves to inline, which reads
+        # through its own chunk-aligned path and hits the object() h5obj stub).
+        from zagg.index.hierarchical import HierarchicalIndex
+
+        monkeypatch.setattr(
+            "zagg.processing.worker.index_from_config", lambda cfg: HierarchicalIndex()
+        )
 
     def test_invalid_handoff_rejected(self):
         """The ``handoff`` validation rejects unknown carriers before any read."""
@@ -3042,6 +3123,15 @@ class TestChunkResolutionCompanion:
         monkeypatch.setattr("zagg.processing._read_group", one_shot)
         monkeypatch.setattr("zagg.processing.h5coro.H5Coro", lambda *a, **k: object())
         monkeypatch.setattr("zagg.processing._make_url_rewriter", lambda driver: lambda u: u)
+        # These tests pin worker/aggregation logic, not the read backend: pin
+        # the hierarchical delegation seam the one_shot stub intercepts (the
+        # issue #170 default otherwise resolves to inline, which reads through
+        # its own chunk-aligned path and hits the object() h5obj stub).
+        from zagg.index.hierarchical import HierarchicalIndex
+
+        monkeypatch.setattr(
+            "zagg.processing.worker.index_from_config", lambda cfg: HierarchicalIndex()
+        )
 
         carrier, _meta = process_shard(grid, shard_key, ["s3://x"], s3_credentials={}, config=cfg)
         chunk_idx = grid.block_index(shard_key)

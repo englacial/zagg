@@ -682,13 +682,80 @@ class TestInlineReadGroup:
         with pytest.raises(OSError, match="ranged read failed"):
             read_fn("/gt1l/heights/h_ph", [(0, 100)])
 
-    def test_inline_requires_read_plan_config(self):
-        ds = _fixture_data_source()
-        del ds["read_plan"]
-        with pytest.raises(ValueError, match="requires data_source.read_plan.spatial_index"):
-            validate_index_config({"backend": "inline"}, ds)
-        with pytest.raises(ValueError, match="requires data_source.read_plan.spatial_index"):
-            InlineIndex().read_group(_open_fixture(), "gt1l", ds, 1, _LeafSetGrid((4,)))
+    def test_inline_serves_flat_sources(self):
+        # issue #170 phase 2: a read-plan-less (flat) data source takes the
+        # full-read route through the same compiled seam -- row-identical to
+        # hierarchical. This is the shape most non-ATL03 targets have.
+        ds = {
+            "groups": ["gt1l", "gt2l"],
+            "coordinates": {
+                "latitude": "/{group}/heights/lat_ph",
+                "longitude": "/{group}/heights/lon_ph",
+            },
+            "variables": {"h_ph": "/{group}/heights/h_ph"},
+            "filters": [
+                {
+                    "dataset": "/{group}/heights/signal_conf_ph",
+                    "column": 0,
+                    "op": "ne",
+                    "value": -2,
+                }
+            ],
+        }
+        validate_index_config({"backend": "inline"}, ds)  # accepted, not rejected
+        grid = _LeafSetGrid(_UNALIGNED_LEAVES)
+        df_i = InlineIndex().read_group(_open_fixture(), "gt1l", ds, 1, grid)
+        # Gate against numpy ground truth from full-array reads (the
+        # hierarchical reference trips h5coro's PR #152 start-edge off-by-one
+        # here: this leaf set's flat-route window starts exactly on a chunk
+        # boundary — which the compiled route survives by construction).
+        h5obj = _open_fixture()
+        full = h5obj.readDatasets(
+            [
+                "/gt1l/heights/lat_ph",
+                "/gt1l/heights/h_ph",
+                "/gt1l/heights/signal_conf_ph",
+            ]
+        )
+        leaf = np.round(full["/gt1l/heights/lat_ph"]).astype(np.int64)
+        keep = np.isin(leaf, np.asarray(_UNALIGNED_LEAVES)) & (
+            full["/gt1l/heights/signal_conf_ph"][:, 0] != -2
+        )
+        assert df_i is not None and len(df_i) == int(keep.sum()) > 0
+        assert df_i["h_ph"].to_numpy().tobytes() == full["/gt1l/heights/h_ph"][keep].tobytes()
+        assert df_i["leaf_id"].to_numpy().tolist() == leaf[keep].tolist()
+
+    def test_flat_source_engages_compiled_decoder(self, monkeypatch, caplog):
+        # The flat route must actually decode through hidefix, not silently
+        # fall back per dataset (mirrors test_compiled_decoder_engaged).
+        import logging
+
+        import h5coro_hidefix.manifest as hh_manifest
+
+        calls = []
+        orig = hh_manifest.datasets_from_manifest
+
+        def spy(columns):
+            calls.append(1)
+            return orig(columns)
+
+        monkeypatch.setattr(hh_manifest, "datasets_from_manifest", spy)
+        ds = {
+            "groups": ["gt1l"],
+            "coordinates": {
+                "latitude": "/{group}/heights/lat_ph",
+                "longitude": "/{group}/heights/lon_ph",
+            },
+            "variables": {"h_ph": "/{group}/heights/h_ph"},
+        }
+        with caplog.at_level(logging.WARNING, logger="zagg.index.inline"):
+            df = InlineIndex().read_group(
+                _open_fixture(), "gt1l", ds, 1, _LeafSetGrid(_UNALIGNED_LEAVES)
+            )
+        assert df is not None and len(df) > 0
+        assert calls, "compiled decode was never engaged on the flat route"
+        assert "compiled decode unavailable" not in caplog.text
+        assert "no chunk map" not in caplog.text
 
     def test_inline_accepts_no_stray_keys(self):
         with pytest.raises(ValueError, match="not accepted by backend 'inline'"):

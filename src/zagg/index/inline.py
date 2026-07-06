@@ -347,16 +347,12 @@ class InlineIndex(VirtualIndex):
                 "index.store is only meaningful for backend 'inline' with "
                 "write_back: true (inline never reads the store)"
             )
-        # The chunk map drives *addressing*; selection still needs the coarse
-        # spatial index, so the hierarchical read_plan surface is required.
+        # Both read routes accept this backend (issue #170 phase 2): sources
+        # with read_plan.spatial_index take the planned route, read-plan-less
+        # (flat) sources the full-read route -- same compiled addressing seam.
         if data_source is not None:
             rp = data_source.get("read_plan")
-            if not (isinstance(rp, dict) and rp.get("spatial_index")):
-                raise ValueError(
-                    "index backend 'inline' requires data_source.read_plan.spatial_index "
-                    "(chunk-aligned addressing plugs into the planned read path)"
-                )
-            if "chunk_boundaries" in rp:
+            if isinstance(rp, dict) and "chunk_boundaries" in rp:
                 # The a-priori arm (issue #148 arm 2a) takes precedence over
                 # spatial_index inside _read_group, which would silently bypass
                 # this backend's chunk-map addressing -- reject the combination.
@@ -426,30 +422,35 @@ class InlineIndex(VirtualIndex):
         logger.info(f"  inline write-back: {len(maps)} dataset(s) -> {self.store}/{key}")
 
     def read_group(self, h5obj, group, data_source, shard_key, grid, arrow=False, granule_url=None):
-        from zagg.processing.read import _planned_read_group, _validate_planned_config
+        from zagg.processing.read import (
+            _planned_read_group,
+            _read_group_full,
+            _validate_planned_config,
+        )
 
         rp = data_source.get("read_plan")
-        # inline is planned-route only: without a spatial index it would have
-        # to silently fall back to the full read (ignoring the chunk map),
-        # so reject rather than degrade. Completeness of the planned config
-        # itself is the shared gate from the read module.
-        if not (isinstance(rp, dict) and rp.get("spatial_index")):
-            raise ValueError("index backend 'inline' requires data_source.read_plan.spatial_index")
-        _validate_planned_config(data_source)
+        # Two routes, one addressing seam (issue #170 phase 2): sources with a
+        # spatial index take the planned (chunk-aligned hyperslice) route;
+        # read-plan-less (flat) sources take the full-read route — both decode
+        # through the compiled read_fn, so non-ATL03-shaped products get the
+        # fast path too. Completeness of the planned config is the shared
+        # gate from the read module.
+        planned = isinstance(rp, dict) and bool(rp.get("spatial_index"))
+        if planned:
+            _validate_planned_config(data_source)
         if self.write_back:
             # Deterministic write-back coverage (metadata-only, ~ms): built up
             # front so routes that bypass the read seam — the ``full_read``
             # selectivity fallback and empty-shard early returns — still
             # contribute this group's datasets to the granule manifest.
             self._prebuild_group_maps(h5obj, group, data_source)
-        return _planned_read_group(
-            h5obj,
-            group,
-            data_source,
-            shard_key,
-            grid,
-            arrow=arrow,
-            read_fn=self._chunk_aligned_read_fn(h5obj),
+        read_fn = self._chunk_aligned_read_fn(h5obj)
+        if planned:
+            return _planned_read_group(
+                h5obj, group, data_source, shard_key, grid, arrow=arrow, read_fn=read_fn
+            )
+        return _read_group_full(
+            h5obj, group, data_source, shard_key, grid, arrow=arrow, read_fn=read_fn
         )
 
     def _chunk_aligned_read_fn(self, h5obj):

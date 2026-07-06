@@ -193,7 +193,7 @@ def _segment_level_variables(data_source: dict) -> dict[str, dict[str, str]]:
 
 
 def _read_segment_broadcasts(
-    h5obj, group: str, data_source: dict, levels: dict, n_base: int
+    h5obj, group: str, data_source: dict, levels: dict, n_base: int, read_fn=None
 ) -> dict[str, np.ndarray]:
     """Read each segment-level variable and broadcast it to a base-rate column (issue #30).
 
@@ -215,9 +215,13 @@ def _read_segment_broadcasts(
         index_base = int(link.get("index_base", 0))
         ibeg_path = link["index_beg"].format(group=group)
         cnt_path = link["count"].format(group=group)
-        link_data = h5obj.readDatasets([ibeg_path, cnt_path])
-        ibeg_arr = link_data[ibeg_path]
-        cnt_arr = link_data[cnt_path]
+        if read_fn is None:
+            link_data = h5obj.readDatasets([ibeg_path, cnt_path])
+            ibeg_arr = link_data[ibeg_path]
+            cnt_arr = link_data[cnt_path]
+        else:
+            ibeg_arr = read_fn(ibeg_path)
+            cnt_arr = read_fn(cnt_path)
         for col_name, tmpl in mapping.items():
             if col_name in base_cols:
                 raise ValueError(
@@ -225,7 +229,10 @@ def _read_segment_broadcasts(
                     f"collides with a data_source.variables column"
                 )
             seg_path = tmpl.format(group=group)
-            seg_values = np.asarray(h5obj.readDatasets([seg_path])[seg_path])
+            if read_fn is None:
+                seg_values = np.asarray(h5obj.readDatasets([seg_path])[seg_path])
+            else:
+                seg_values = np.asarray(read_fn(seg_path))
             out[col_name] = _broadcast_segment_to_base(
                 seg_values, ibeg_arr, cnt_arr, index_base, n_base
             )
@@ -660,7 +667,7 @@ def _validate_planned_config(data_source: dict) -> None:
 
 
 def _read_group_full(
-    h5obj, group: str, data_source: dict, shard_key: int, grid, arrow: bool = False
+    h5obj, group: str, data_source: dict, shard_key: int, grid, arrow: bool = False, read_fn=None
 ):
     """Full-coord-read variant of :func:`_read_group` (the pre-#49-Phase-C path).
 
@@ -673,6 +680,12 @@ def _read_group_full(
     Kept as the explicit fallback for: groups whose ``data_source`` declares no
     ``read_plan.spatial_index``; ``plan_read``'s selectivity fallback
     (``full_read=True``); and the legacy flat (no-levels) form.
+
+    ``read_fn`` (issue #170 phase 2) is the same addressing seam
+    :func:`_planned_read_group` takes — ``(path, hyperslice|None) -> array``
+    — so index backends (``inline``) can route this path's decode through the
+    compiled reader too, giving read-plan-less (flat) data sources the fast
+    decode. ``None`` keeps the batched h5coro reads byte-identical.
     """
     coordinates = data_source["coordinates"]
     variables = data_source["variables"]
@@ -694,7 +707,10 @@ def _read_group_full(
 
     # Resolve coordinate paths
     coord_paths = [path.format(group=group) for path in coordinates.values()]
-    coord_data = h5obj.readDatasets(coord_paths)
+    if read_fn is None:
+        coord_data = h5obj.readDatasets(coord_paths)
+    else:
+        coord_data = {p: read_fn(p) for p in coord_paths}
 
     lat_path = coordinates["latitude"].format(group=group)
     lon_path = coordinates["longitude"].format(group=group)
@@ -729,22 +745,29 @@ def _read_group_full(
             # Read the coarse flag array in full ("hyperslice": [] is h5coro's
             # full-read form; the key is required on dict entries — issue #157).
             # We need all parents to align with the full-length link arrays.
-            coarse_data = h5obj.readDatasets([{"dataset": flag_path, "hyperslice": []}])
-            coarse_arr = coarse_data[flag_path]
+            if read_fn is None:
+                coarse_data = h5obj.readDatasets([{"dataset": flag_path, "hyperslice": []}])
+                coarse_arr = coarse_data[flag_path]
+            else:
+                coarse_arr = read_fn(flag_path)
             coarse_fmask = _predicate_mask(coarse_arr, f)
             # Read the link arrays from this level.
             link = lvl["link"]
             index_base = int(link.get("index_base", 0))
             ibeg_path = link["index_beg"].format(group=group)
             cnt_path = link["count"].format(group=group)
-            link_data = h5obj.readDatasets(
-                [
-                    {"dataset": ibeg_path, "hyperslice": []},
-                    {"dataset": cnt_path, "hyperslice": []},
-                ]
-            )
-            ibeg_arr = link_data[ibeg_path]
-            cnt_arr = link_data[cnt_path]
+            if read_fn is None:
+                link_data = h5obj.readDatasets(
+                    [
+                        {"dataset": ibeg_path, "hyperslice": []},
+                        {"dataset": cnt_path, "hyperslice": []},
+                    ]
+                )
+                ibeg_arr = link_data[ibeg_path]
+                cnt_arr = link_data[cnt_path]
+            else:
+                ibeg_arr = read_fn(ibeg_path)
+                cnt_arr = read_fn(cnt_path)
             expanded = _expand_mask_to_base(coarse_fmask, ibeg_arr, cnt_arr, index_base, len(lats))
             cross_mask = expanded if cross_mask is None else (cross_mask & expanded)
         if cross_mask is not None and np.sum(cross_mask[min_idx:max_idx]) == 0:
@@ -765,7 +788,10 @@ def _read_group_full(
             datasets.append({"dataset": path, "hyperslice": [(min_idx, max_idx)]})
             paths_seen.add(path)
 
-    data = h5obj.readDatasets(datasets)
+    if read_fn is None:
+        data = h5obj.readDatasets(datasets)
+    else:
+        data = {d["dataset"]: read_fn(d["dataset"], d["hyperslice"]) for d in datasets}
 
     # Apply spatial mask to sliced data
     mask_sliced = mask_spatial[min_idx:max_idx]
@@ -788,7 +814,9 @@ def _read_group_full(
     # Segment-level variables (issue #30): read each declared non-base-level
     # variable and broadcast it to a base-rate per-photon column (length len(lats))
     # so it can be sliced through the same masks as the base-rate variables below.
-    seg_broadcasts = _read_segment_broadcasts(h5obj, group, data_source, levels or {}, len(lats))
+    seg_broadcasts = _read_segment_broadcasts(
+        h5obj, group, data_source, levels or {}, len(lats), read_fn=read_fn
+    )
 
     # Build dataframe (variables sliced to spatial mask, then to the keep-mask)
     leaf_sliced = leaf_ids[min_idx:max_idx][mask_sliced]
