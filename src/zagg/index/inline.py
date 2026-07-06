@@ -477,28 +477,42 @@ class InlineIndex(VirtualIndex):
         datasets are disjoint from every other group's, so nothing is
         rebuilt or leaked across granules. Under ``write_back`` the cache is
         the instance's pending dict instead, accumulating the granule's maps
-        across groups for ``finish_granule`` to persist. The in-memory
-        ``Index`` is rebuilt (~ms) whenever a new dataset's map lands.
+        across groups for ``finish_granule`` to persist. Each dataset gets
+        its own single-dataset in-memory ``Index`` (~ms), so a spec hidefix
+        rejects degrades that dataset alone.
         """
         maps: dict[str, ChunkMap] = self._pending if self.write_back else {}
-        state: dict = {"vidx": None, "n_maps": -1}
+        # One single-dataset Index per path (~ms each): a dataset whose spec
+        # hidefix rejects (nonzero filter_mask, non-tiling chunk table) then
+        # pins only ITSELF to the fallback — a shared Index rebuilt from all
+        # of ``maps`` would fail every subsequent dataset's reconstruction
+        # and degrade innocent paths with it (review finding, PR #173).
+        indices: dict = {}
         direct: set[str] = set()  # datasets pinned to the h5coro decoder
 
-        def _vidx():
-            if state["n_maps"] != len(maps):
+        def _vidx_for(path):
+            vidx = indices.get(path)
+            if vidx is None:
                 from h5coro_hidefix import Index
                 from h5coro_hidefix.manifest import datasets_from_manifest
 
-                state["vidx"] = Index.from_chunks(
-                    "inline", datasets_from_manifest(granule_manifest(maps))
+                vidx = indices[path] = Index.from_chunks(
+                    "inline", datasets_from_manifest(granule_manifest({path: maps[path]}))
                 )
-                state["n_maps"] = len(maps)
-            return state["vidx"]
+            return vidx
 
         def _compiled(path, start, end):
-            vidx = _vidx()
+            vidx = _vidx_for(path)
             addrs, sizes, _ = vidx.read_plan(path, start, end)
-            buffers = [h5obj.ioRequest(int(a), int(s), caching=False) for a, s in zip(addrs, sizes)]
+            buffers = []
+            for a, s in zip(addrs, sizes):
+                buf = h5obj.ioRequest(int(a), int(s), caching=False)
+                if buf is None:
+                    # h5coro's S3 driver swallows exceptions and returns None;
+                    # surface it as I/O so it is never misclassified as a
+                    # decode failure (review finding, PR #173).
+                    raise OSError(f"ranged read failed for {path} at {int(a)}+{int(s)}")
+                buffers.append(buf)
             return vidx.read_from_buffers(path, buffers, start, end)
 
         def _h5coro_read(path, hyperslice, cm):
@@ -529,6 +543,8 @@ class InlineIndex(VirtualIndex):
                         return _compiled(path, None, None)
                     parts = [_compiled(path, s, e) for s, e in hyperslice]
                     return parts[0] if len(parts) == 1 else np.concatenate(parts)
+                except OSError:
+                    raise  # transient I/O, not a decode problem: fail the read loudly
                 except Exception as exc:
                     direct.add(path)
                     logger.warning(
