@@ -461,10 +461,19 @@ def _execute_plan_group(
     ]
     expressions = [f for f in filters if "expression" in f]
 
+    # Read fan-out (issue #170 phase 4): only when an index backend supplied
+    # a compiled read_fn -- the hierarchical h5coro path (read_fn None) keeps
+    # its serial reads (see _read_workers).
+    workers = _read_workers(data_source) if read_fn is not None else 1
+
     lat_path = coordinates["latitude"].format(group=group)
     lon_path = coordinates["longitude"].format(group=group)
-    lats = execute_read_plan(plan, _read_fn, lat_path, np.float64)
-    lons = execute_read_plan(plan, _read_fn, lon_path, np.float64)
+    coord_arrays = _read_paths_pooled(
+        [(lat_path, np.float64), (lon_path, np.float64)],
+        lambda p, dt: execute_read_plan(plan, _read_fn, p, dt),
+        workers,
+    )
+    lats, lons = coord_arrays[lat_path], coord_arrays[lon_path]
 
     if len(lats) == 0:
         return None
@@ -479,15 +488,14 @@ def _execute_plan_group(
     # each distinct path once (the variable and filter dataset paths can coincide).
     var_paths = {col: tmpl.format(group=group) for col, tmpl in variables.items()}
     filter_paths = {id(f): f["dataset"].format(group=group) for f in base_structured}
-    paths_seen: set[str] = set()
-    arrays_by_path: dict[str, np.ndarray] = {}
-    for path in list(var_paths.values()) + list(filter_paths.values()):
-        if path in paths_seen:
-            continue
-        paths_seen.add(path)
-        # dtype hint isn't load-bearing -- execute_read_plan dtype-casts via
-        # np.asarray, which is a no-op when the source dtype already matches.
-        arrays_by_path[path] = execute_read_plan(plan, _read_fn, path, None)
+    # dtype hint isn't load-bearing -- execute_read_plan dtype-casts via
+    # np.asarray, which is a no-op when the source dtype already matches.
+    # dict.fromkeys: read each distinct path once, in first-seen order.
+    arrays_by_path: dict[str, np.ndarray] = _read_paths_pooled(
+        [(p, None) for p in dict.fromkeys(list(var_paths.values()) + list(filter_paths.values()))],
+        lambda p, dt: execute_read_plan(plan, _read_fn, p, dt),
+        workers,
+    )
 
     # Base-level structured filters: ANDed keep-masks over the concatenated reads.
     keep_mask: np.ndarray | None = None
@@ -666,6 +674,39 @@ def _validate_planned_config(data_source: dict) -> None:
         raise ValueError("data_source.read_plan.spatial_index requires 'base_level'")
 
 
+def _read_workers(data_source: dict) -> int:
+    """``data_source.read_workers``: per-worker read concurrency (issue #170).
+
+    Applies only to reads routed through an index backend's compiled
+    ``read_fn`` (each is one blocking ranged fetch + a GIL-released decode,
+    so threads overlap S3 latency and use both Lambda vCPUs); the
+    hierarchical h5coro path keeps its serial batched reads regardless — it
+    is the pinned uncached benchmark baseline. Default 8. Peak RSS grows
+    with width (each in-flight read holds its compressed buffers + decoded
+    output), so dense-shard configs can dial it down; ``1`` is serial.
+    """
+    w = data_source.get("read_workers", 8)
+    if isinstance(w, bool) or not isinstance(w, int) or w < 1:
+        raise ValueError(f"data_source.read_workers must be an integer >= 1 (got {w!r})")
+    return w
+
+
+def _read_paths_pooled(entries, read_one, workers: int) -> dict:
+    """Run ``read_one(path, dtype)`` per (path, dtype) entry, fanned across a
+    bounded thread pool when ``workers > 1`` (issue #170 phase 4). Results
+    are keyed by path, so completion order cannot affect output; a failed
+    read re-raises at collection exactly as the serial loop would. Serial
+    (entry order) when ``workers <= 1`` or there is a single entry.
+    """
+    if workers <= 1 or len(entries) <= 1:
+        return {p: read_one(p, dt) for p, dt in entries}
+    from concurrent.futures import ThreadPoolExecutor
+
+    with ThreadPoolExecutor(max_workers=min(workers, len(entries))) as pool:
+        futures = {p: pool.submit(read_one, p, dt) for p, dt in entries}
+        return {p: f.result() for p, f in futures.items()}
+
+
 def _read_group_full(
     h5obj, group: str, data_source: dict, shard_key: int, grid, arrow: bool = False, read_fn=None
 ):
@@ -705,12 +746,20 @@ def _read_group_full(
     ]
     expressions = [f for f in filters if "expression" in f]
 
+    # Read fan-out (issue #170 phase 4): only when an index backend supplied
+    # a compiled read_fn -- see _read_workers.
+    workers = _read_workers(data_source) if read_fn is not None else 1
+
     # Resolve coordinate paths
     coord_paths = [path.format(group=group) for path in coordinates.values()]
     if read_fn is None:
         coord_data = h5obj.readDatasets(coord_paths)
     else:
-        coord_data = {p: read_fn(p) for p in coord_paths}
+        coord_data = _read_paths_pooled(
+            [(p, None) for p in dict.fromkeys(coord_paths)],
+            lambda p, dt: read_fn(p),
+            workers,
+        )
 
     lat_path = coordinates["latitude"].format(group=group)
     lon_path = coordinates["longitude"].format(group=group)
@@ -791,7 +840,12 @@ def _read_group_full(
     if read_fn is None:
         data = h5obj.readDatasets(datasets)
     else:
-        data = {d["dataset"]: read_fn(d["dataset"], d["hyperslice"]) for d in datasets}
+        hyperslices = {d["dataset"]: d["hyperslice"] for d in datasets}
+        data = _read_paths_pooled(
+            [(p, None) for p in hyperslices],
+            lambda p, dt: read_fn(p, hyperslices[p]),
+            workers,
+        )
 
     # Apply spatial mask to sliced data
     mask_sliced = mask_spatial[min_idx:max_idx]

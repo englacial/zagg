@@ -769,6 +769,30 @@ class TestInlineReadGroup:
         assert "compiled decode unavailable" not in caplog.text
         assert "no chunk map" not in caplog.text
 
+    def test_read_workers_pool_byte_identical(self):
+        # issue #170 phase 4: pooled reads (read_workers > 1) are keyed by
+        # path, so completion order cannot leak into output -- byte-identical
+        # to the serial form on both routes.
+        grid = _LeafSetGrid(_UNALIGNED_LEAVES)
+        df1 = InlineIndex().read_group(
+            _open_fixture(), "gt1l", _fixture_data_source(read_workers=1), 1, grid
+        )
+        df8 = InlineIndex().read_group(
+            _open_fixture(), "gt1l", _fixture_data_source(read_workers=8), 1, grid
+        )
+        pd.testing.assert_frame_equal(df8, df1)
+        for col in df1.columns:
+            assert df8[col].to_numpy().tobytes() == df1[col].to_numpy().tobytes()
+
+    def test_read_workers_validation(self):
+        from zagg.processing.read import _read_workers
+
+        for bad in (0, -1, True, "eight", 2.5):
+            with pytest.raises(ValueError, match="read_workers"):
+                _read_workers({"read_workers": bad})
+        assert _read_workers({}) == 8
+        assert _read_workers({"read_workers": 3}) == 3
+
     def test_inline_accepts_no_stray_keys(self):
         with pytest.raises(ValueError, match="not accepted by backend 'inline'"):
             validate_index_config({"backend": "inline", "on_miss": "fallback"})
