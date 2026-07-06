@@ -93,7 +93,7 @@ def agg(
     profile: bool = False,
     max_retries: int = 3,
     invocation: str = "async",
-    force_cold: bool = True,
+    force_cold: bool = False,
     events=None,
 ) -> dict:
     """Run the aggregation pipeline.
@@ -178,22 +178,24 @@ def agg(
         (granule-dense shards with large AOI masks). Ignored by the
         ``"local"`` backend.
     force_cold : bool
-        Lambda-only (issue #171). When ``True`` (the default -- espg's call
-        on PR #172), merge a per-run ``ZAGG_COLD_EPOCH`` marker into the
-        function's environment before fan-out and wait for the update to
-        apply -- any configuration change invalidates every warm sandbox, so
-        each worker starts on a fresh container. Guards against the
-        warm-container RSS ratchet (issues #139/#169): consecutive fleet
-        runs reuse sandboxes that retain memory across invocations and can
-        OOM within a few generations. Existing environment variables (e.g.
+        Lambda-only (issue #171), default ``False``. The explicit big-hammer
+        for certification runs -- benchmark baselines, memory forensics, or
+        any run that must be provably unaffected by prior container state:
+        merge a per-run ``ZAGG_COLD_EPOCH`` marker into the function's
+        environment before fan-out and wait for the update to apply -- any
+        configuration change invalidates every warm sandbox, so each worker
+        starts on a fresh container. Existing environment variables (e.g.
         the issue #143 malloc tunables) are preserved. Requires
         ``lambda:GetFunctionConfiguration`` and
-        ``lambda:UpdateFunctionConfiguration`` on the caller, and raises --
-        rather than silently degrading to warm containers -- when the update
-        cannot be applied; pass ``force_cold=False`` for callers without the
-        update permission (dispatch is then byte-identical to pre-#171).
-        Costs one config-update round trip plus a few seconds of cold init
-        per container. Ignored by the ``"local"`` backend.
+        ``lambda:UpdateFunctionConfiguration`` on the caller -- a broad
+        write on the production function, which is why this is opt-in --
+        and raises (rather than silently degrading to warm containers) when
+        the update cannot be applied: an explicit request hard-fails instead
+        of quietly not certifying. Costs one config-update round trip plus a
+        few seconds of cold init per container, and chills the warm pool for
+        every concurrent user of the function -- which is why routine runs
+        leave it off even under the warm-container RSS ratchet (issues
+        #139/#169). Ignored by the ``"local"`` backend.
 
     events : iterable, optional
         Temporal pipeline only (``pipeline.type: temporal``/``event``), one
