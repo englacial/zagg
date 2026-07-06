@@ -7,11 +7,17 @@ metadata-only, ~1 ranged GET + tens of ms per granule (the B-trees live in
 the front-of-file metadata block NSIDC keeps inside h5coro's first cache
 line; measured on PR #159's ``bench/offsets`` route (b), cross-validated
 there against h5py and hidefix chunk-for-chunk over 61 granules with zero
-mismatches). Planned reads are issued as-is — the h5coro decoder already
-inflates exactly the covering chunks — except that the chunk map lets reads
-that start exactly on an interior chunk boundary be detected and shifted one
-element early (see below), keeping output row-identical to ``hierarchical``
-while surviving inputs the plain hyperslice read drops.
+mismatches). Decode goes through the compiled h5coro-hidefix reader (issue
+#170): the chunk map reconstructs a per-dataset in-memory ``Index`` whose
+``read_from_buffers`` inflates exactly the covering chunks, byte-identical
+to h5py/h5coro, with the GIL released. Both read routes are served — the
+planned (chunk-aligned hyperslice) route for sources with
+``read_plan.spatial_index``, and the full-read route for read-plan-less
+(flat) sources — so this backend is the package default for every data
+source. Datasets the compiled reader cannot serve degrade to the h5coro
+decoder per dataset, where the chunk map still lets reads that start
+exactly on an interior chunk boundary be detected and shifted one element
+early (see below).
 
 The chunk map is also the write-back payload: with ``write_back: true``
 (opt-in — issue #160 Q2) plus a ``store``, every granule's accumulated chunk
