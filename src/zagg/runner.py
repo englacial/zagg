@@ -93,7 +93,7 @@ def agg(
     profile: bool = False,
     max_retries: int = 3,
     invocation: str = "async",
-    force_cold: bool = False,
+    force_cold: bool = True,
     events=None,
 ) -> dict:
     """Run the aggregation pipeline.
@@ -178,20 +178,22 @@ def agg(
         (granule-dense shards with large AOI masks). Ignored by the
         ``"local"`` backend.
     force_cold : bool
-        Lambda-only (issue #171). When ``True``, merge a per-run
-        ``ZAGG_COLD_EPOCH`` marker into the function's environment before
-        fan-out and wait for the update to apply -- any configuration change
-        invalidates every warm sandbox, so each worker starts on a fresh
-        container. Guards against the warm-container RSS ratchet (issues
-        #139/#169): consecutive fleet runs reuse sandboxes that retain memory
-        across invocations and can OOM within a few generations. Existing
-        environment variables (e.g. the issue #143 malloc tunables) are
-        preserved. Requires ``lambda:GetFunctionConfiguration`` and
+        Lambda-only (issue #171). When ``True`` (the default -- espg's call
+        on PR #172), merge a per-run ``ZAGG_COLD_EPOCH`` marker into the
+        function's environment before fan-out and wait for the update to
+        apply -- any configuration change invalidates every warm sandbox, so
+        each worker starts on a fresh container. Guards against the
+        warm-container RSS ratchet (issues #139/#169): consecutive fleet
+        runs reuse sandboxes that retain memory across invocations and can
+        OOM within a few generations. Existing environment variables (e.g.
+        the issue #143 malloc tunables) are preserved. Requires
+        ``lambda:GetFunctionConfiguration`` and
         ``lambda:UpdateFunctionConfiguration`` on the caller, and raises --
         rather than silently degrading to warm containers -- when the update
-        cannot be applied. Costs one config-update round trip plus a few
-        seconds of cold init per container. Default ``False``: no config
-        touch, byte-identical dispatch. Ignored by the ``"local"`` backend.
+        cannot be applied; pass ``force_cold=False`` for callers without the
+        update permission (dispatch is then byte-identical to pre-#171).
+        Costs one config-update round trip plus a few seconds of cold init
+        per container. Ignored by the ``"local"`` backend.
 
     events : iterable, optional
         Temporal pipeline only (``pipeline.type: temporal``/``event``), one
@@ -1918,40 +1920,61 @@ def _force_cold_containers(lambda_client, function_name, *, wait_s=120, poll_int
     Unlike :func:`_get_function_timeout_s`, failures raise: the caller asked
     for cold containers explicitly, so silently proceeding warm would defeat
     the run's memory isolation.
+
+    The poll accepts only *this* update's terminal states: the API is
+    eventually consistent, so a ``Successful`` read immediately after
+    ``update_function_configuration`` can still describe the *prior* update
+    -- acceptance additionally requires the polled environment to carry this
+    run's marker. A ``ResourceConflictException`` on the update (another
+    configuration change in flight -- a concurrent ``force_cold`` run or a
+    deploy) retries until the deadline instead of surfacing as a
+    permissions error.
     """
     token = uuid.uuid4().hex
-    env = dict(
-        (
-            lambda_client.get_function_configuration(FunctionName=function_name).get("Environment")
-            or {}
-        ).get("Variables")
-        or {}
-    )
-    env["ZAGG_COLD_EPOCH"] = token
+    deadline = time.time() + wait_s
     try:
-        lambda_client.update_function_configuration(
-            FunctionName=function_name, Environment={"Variables": env}
-        )
+        current = lambda_client.get_function_configuration(FunctionName=function_name)
     except Exception as exc:
         raise RuntimeError(
-            f"force_cold: updating {function_name} configuration failed ({exc}). The "
+            f"force_cold: reading {function_name} configuration failed ({exc}). The "
             "caller needs lambda:GetFunctionConfiguration and "
             "lambda:UpdateFunctionConfiguration; pass force_cold=False to dispatch "
             "onto warm containers instead."
         ) from exc
-    deadline = time.time() + wait_s
+    env = dict((current.get("Environment") or {}).get("Variables") or {})
+    env["ZAGG_COLD_EPOCH"] = token
     while True:
-        status = lambda_client.get_function_configuration(FunctionName=function_name).get(
-            "LastUpdateStatus"
-        )
-        if status == "Successful":
-            logger.info(f"force_cold: warm sandboxes invalidated (ZAGG_COLD_EPOCH={token})")
-            return
-        if status == "Failed":
-            raise RuntimeError(
-                f"force_cold: {function_name} configuration update failed server-side "
-                "(LastUpdateStatus=Failed); check the function state in the console"
+        try:
+            lambda_client.update_function_configuration(
+                FunctionName=function_name, Environment={"Variables": env}
             )
+            break
+        except Exception as exc:
+            response = getattr(exc, "response", None)
+            code = response.get("Error", {}).get("Code", "") if isinstance(response, dict) else ""
+            if code == "ResourceConflictException" and time.time() < deadline:
+                time.sleep(poll_interval_s)  # another config update in flight; retry
+                continue
+            raise RuntimeError(
+                f"force_cold: updating {function_name} configuration failed ({exc}). The "
+                "caller needs lambda:UpdateFunctionConfiguration; pass force_cold=False "
+                "to dispatch onto warm containers instead."
+            ) from exc
+    while True:
+        cfg = lambda_client.get_function_configuration(FunctionName=function_name)
+        status = cfg.get("LastUpdateStatus")
+        marker = ((cfg.get("Environment") or {}).get("Variables") or {}).get("ZAGG_COLD_EPOCH")
+        if marker == token:
+            # Only this update's states count: a Successful (or Failed) read
+            # without the marker describes the prior configuration.
+            if status == "Successful":
+                logger.info(f"force_cold: warm sandboxes invalidated (ZAGG_COLD_EPOCH={token})")
+                return
+            if status == "Failed":
+                raise RuntimeError(
+                    f"force_cold: {function_name} configuration update failed server-side "
+                    "(LastUpdateStatus=Failed); check the function state in the console"
+                )
         if time.time() >= deadline:
             raise RuntimeError(
                 f"force_cold: {function_name} configuration update still {status!r} "
