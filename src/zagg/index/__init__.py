@@ -209,17 +209,30 @@ def validate_index_config(index_cfg: Any, data_source: dict | None = None) -> No
 def index_from_config(config) -> VirtualIndex:
     """Construct the configured backend from a ``PipelineConfig``.
 
-    An absent ``data_source.index`` block is (still) the zero-change path:
-    today's hierarchical read, byte-identical. The issue #170 default flip
-    to ``inline`` lands as ONE unconditional change (espg call on the #170
-    thread, 2026-07-06) once the compiled full-read route makes ``inline``
-    serve read-plan-less (flat) data sources too.
+    An absent ``data_source.index`` block resolves to ``inline`` — the
+    compiled (h5coro-hidefix) decode, output row-identical to
+    ``hierarchical`` — for **every** data source (issue #170; one
+    unconditional flip, espg decision on the #170 thread 2026-07-06):
+    planned sources take chunk-aligned hyperslices, read-plan-less (flat)
+    sources the compiled full-read route. Datasets the compiled reader
+    cannot serve degrade per dataset inside the backend. An explicit
+    ``{backend: hierarchical}`` block pins the pure-h5coro path (the
+    uncached benchmark baseline). The one exception: a-priori
+    ``read_plan.chunk_boundaries`` (issue #148 arm 2a) takes precedence
+    inside ``_read_group`` and is mutually exclusive with inline's
+    addressing, so those sources keep the hierarchical default.
     """
-    index_cfg = (config.data_source or {}).get("index")
+    ds = config.data_source or {}
+    index_cfg = ds.get("index")
     if index_cfg is None:
-        from zagg.index.hierarchical import HierarchicalIndex
+        rp = ds.get("read_plan")
+        if isinstance(rp, dict) and "chunk_boundaries" in rp:
+            from zagg.index.hierarchical import HierarchicalIndex
 
-        return HierarchicalIndex()
+            return HierarchicalIndex()
+        from zagg.index.inline import InlineIndex
+
+        return InlineIndex()
     # Re-validate here (cheap) so dict-built configs that skipped
     # ``validate_config`` (e.g. hand-rolled Lambda payloads) fail loudly at
     # backend resolution rather than deep in a group read.

@@ -2876,6 +2876,13 @@ class TestWorkerPhaseTimings:
             "_read_group",
             lambda *a, **k: object() if with_data else None,
         )
+        # This test pins the worker's phase brackets, not the read backend:
+        # pin the hierarchical delegation seam the _read_group stub intercepts
+        # (the issue #170 default otherwise resolves to inline, which reads
+        # through its own chunk-aligned path and hits the _H5 stub).
+        from zagg.index.hierarchical import HierarchicalIndex
+
+        monkeypatch.setattr(worker, "index_from_config", lambda cfg: HierarchicalIndex())
         monkeypatch.setattr(
             worker,
             "_concat_and_group",
