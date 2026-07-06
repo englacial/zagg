@@ -6,6 +6,7 @@ These tests verify that:
 3. The zagg package can be imported as Lambda would see it
 """
 
+import re
 import subprocess
 from pathlib import Path
 
@@ -253,6 +254,89 @@ class TestTemplateEnvironment:
         ext_matches = _index_statements(ext_role)
         assert len(ext_matches) == 1
         assert sorted(ext_matches[0]["Action"]) == actions
+
+    def test_metric_filters_publish_recycle_error_split(self):
+        # issue #175: under RecycleMaxInvocations=1 every async invocation
+        # self-exits, so Lambda's raw Errors metric is pure noise. The
+        # template publishes the real-vs-expected split to zagg/lambda, per
+        # function, gated on CreateLogMetricFilters (fresh stacks: Lambda
+        # creates the implicit log groups only on first invocation, and
+        # MetricFilter requires the group to exist).
+        tpl = self._load_template()
+        assert tpl["Parameters"]["CreateLogMetricFilters"]["Default"] == "true"
+        assert tpl["Conditions"]["ShouldCreateMetricFilters"] == {
+            "Equals": [{"Ref": "CreateLogMetricFilters"}, "true"]
+        }
+        expected = {
+            "ProcessSelfRecycleFilter": ("/aws/lambda/${FunctionName}", "ProcessSelfRecycleCount"),
+            "ProcessWorkerErrorFilter": ("/aws/lambda/${FunctionName}", "ProcessWorkerErrorCount"),
+            "ExtractSelfRecycleFilter": (
+                "/aws/lambda/${FunctionName}-extract",
+                "ExtractSelfRecycleCount",
+            ),
+            "ExtractWorkerErrorFilter": (
+                "/aws/lambda/${FunctionName}-extract",
+                "ExtractWorkerErrorCount",
+            ),
+        }
+        for name, (group, metric) in expected.items():
+            fltr = tpl["Resources"][name]
+            assert fltr["Type"] == "AWS::Logs::MetricFilter"
+            assert fltr["Condition"] == "ShouldCreateMetricFilters"
+            props = fltr["Properties"]
+            assert props["LogGroupName"] == {"Sub": group}
+            (mt,) = props["MetricTransformations"]
+            assert mt["MetricNamespace"] == "zagg/lambda"
+            assert mt["MetricName"] == metric
+            assert mt["MetricValue"] == "1"
+            assert mt["DefaultValue"] == 0
+
+    @staticmethod
+    def _filter_matches(pattern, line):
+        # Evaluator for the CloudWatch Logs term-filter subset the template
+        # uses: quoted terms only; a leading ? on every term means OR,
+        # otherwise all terms must appear in the line.
+        terms = re.findall(r'(\??)"([^"]*)"', pattern)
+        assert terms, f"unparsed filter pattern: {pattern!r}"
+        any_mode = all(q == "?" for q, _ in terms)
+        hits = [t in line for _, t in terms]
+        return any(hits) if any_mode else all(hits)
+
+    def test_metric_filter_patterns_are_disjoint(self):
+        # The recycle signature must NEVER count as a real error: a
+        # self-recycle logs ZAGG_SELF_RECYCLE at [INFO] and exits 0, which
+        # the runtime reports as "Runtime exited without providing a reason"
+        # -- distinct from a real nonzero exit's "Runtime exited with error".
+        res = self._load_template()["Resources"]
+        recycle = res["ProcessSelfRecycleFilter"]["Properties"]["FilterPattern"]
+        errors = res["ProcessWorkerErrorFilter"]["Properties"]["FilterPattern"]
+        # The Extract twins carry byte-identical patterns.
+        assert res["ExtractSelfRecycleFilter"]["Properties"]["FilterPattern"] == recycle
+        assert res["ExtractWorkerErrorFilter"]["Properties"]["FilterPattern"] == errors
+
+        recycle_lines = [
+            # the handler's structured line (lambda_handler._maybe_self_recycle)
+            "[INFO]\t2026-07-06T22:00:00Z\treq-1\t"
+            "ZAGG_SELF_RECYCLE rss_mb=1450 generation=1 threshold=1",
+            # the runtime's report for the recycle's clean os._exit(0)
+            "RequestId: req-1 Error: Runtime exited without providing a reason Runtime.ExitError",
+        ]
+        error_lines = [
+            "[ERROR]\t2026-07-06T22:00:00Z\treq-2\tFailed to write async result to s3://b/k: boom",
+            "Traceback (most recent call last):",
+            "2026-07-06T22:00:00Z req-3 Task timed out after 900.00 seconds",
+            "REPORT RequestId: req-4\tStatus: error\tError Type: Runtime.OutOfMemory",
+            "RequestId: req-5 Error: Runtime exited with error: exit status 1 Runtime.ExitError",
+        ]
+        assert self._filter_matches(recycle, recycle_lines[0])
+        for line in recycle_lines:
+            assert not self._filter_matches(errors, line)
+        for line in error_lines:
+            assert self._filter_matches(errors, line)
+        # ordinary INFO traffic matches neither metric
+        quiet = "[INFO]\t2026-07-06T22:00:00Z\treq-6\tLambda invocation started"
+        assert not self._filter_matches(recycle, quiet)
+        assert not self._filter_matches(errors, quiet)
 
     def test_extract_fn_mirrors_process_fn(self):
         # issue #148: extraction is both a mode of ProcessFn and a dedicated
