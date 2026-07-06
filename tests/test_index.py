@@ -591,6 +591,44 @@ class TestInlineReadGroup:
         assert df_i["h_ph"].to_numpy().tobytes() == full["/gt1l/heights/h_ph"][keep].tobytes()
         assert df_i["leaf_id"].to_numpy().tolist() == leaf[keep].tolist()
 
+    def test_compiled_decoder_engaged(self, monkeypatch):
+        # Byte-parity alone can't distinguish the compiled route from a silent
+        # per-dataset fallback; pin that the hidefix Index is actually built.
+        import h5coro_hidefix.manifest as hh_manifest
+
+        calls = []
+        orig = hh_manifest.datasets_from_manifest
+
+        def spy(columns):
+            calls.append(1)
+            return orig(columns)
+
+        monkeypatch.setattr(hh_manifest, "datasets_from_manifest", spy)
+        df = InlineIndex().read_group(
+            _open_fixture(), "gt1l", _fixture_data_source(), 1, _LeafSetGrid(_UNALIGNED_LEAVES)
+        )
+        assert df is not None and len(df) > 0
+        assert calls, "compiled decode was never engaged"
+
+    def test_falls_back_to_h5coro_on_compiled_failure(self, monkeypatch, caplog):
+        # A broken Index reconstruction degrades per dataset (warning, h5coro
+        # decode) and never aborts the shard; rows stay identical.
+        import logging
+
+        import h5coro_hidefix.manifest as hh_manifest
+
+        def boom(columns):
+            raise RuntimeError("boom")
+
+        monkeypatch.setattr(hh_manifest, "datasets_from_manifest", boom)
+        ds = _fixture_data_source()
+        grid = _LeafSetGrid(_UNALIGNED_LEAVES)
+        with caplog.at_level(logging.WARNING, logger="zagg.index.inline"):
+            df_i = InlineIndex().read_group(_open_fixture(), "gt1l", ds, 1, grid)
+        df_h = HierarchicalIndex().read_group(_open_fixture(), "gt1l", ds, 1, grid)
+        pd.testing.assert_frame_equal(df_i, df_h)
+        assert "compiled decode unavailable" in caplog.text
+
     def test_inline_requires_read_plan_config(self):
         ds = _fixture_data_source()
         del ds["read_plan"]

@@ -453,33 +453,57 @@ class InlineIndex(VirtualIndex):
         )
 
     def _chunk_aligned_read_fn(self, h5obj):
-        """Build the addressing seam: planned ranges, boundary-safe.
+        """Build the addressing seam: planned ranges, compiled decode.
 
-        The plain planned read is already chunk-minimal with the h5coro
-        decoder (it inflates exactly the covering chunks), so ranges are
-        issued as-is — except when a range starts exactly on an interior
-        chunk boundary, which h5coro's B-tree start-edge intersection drops
-        entirely (PR #152 off-by-one, issue #148 thread). The chunk map makes
-        those starts detectable: shift one element early and trim, paying one
-        extra chunk inflate only in that case (the bench extractor's
-        workaround, applied surgically).
+        The chunk maps this backend already builds are exactly what
+        ``h5coro_hidefix.Index.from_chunks`` consumes (the same
+        ``granule_manifest`` columns ``write_back`` persists), so decode goes
+        through the compiled reader (issue #170): plan the covering chunks,
+        fetch their byte ranges through the worker's h5coro driver
+        (``ioRequest`` — no second credential path), and inflate with
+        ``read_from_buffers`` (byte-identical to h5py/h5coro, GIL released).
+        Datasets the compiled route cannot serve — undecodable dtypes
+        (strings, compounds), empty chunk maps, reconstruction failures —
+        degrade to the h5coro decoder per dataset with a warning, never
+        aborting the shard. The h5coro fallback keeps the PR #152 start-edge
+        workaround: a range starting exactly on an interior chunk boundary
+        is shifted one element early and trimmed (h5coro's B-tree start-edge
+        intersection drops the chunk entirely); the compiled reader has
+        exact ``[start, end)`` semantics and needs no workaround.
 
-        Chunk maps are built lazily per dataset (first planned read of that
-        path) and cached for the life of the returned callable — i.e. one
+        Chunk maps are built lazily per dataset (first read of that path)
+        and cached for the life of the returned callable — i.e. one
         ``read_group`` call, which is exactly one (granule, group): a group's
         datasets are disjoint from every other group's, so nothing is
         rebuilt or leaked across granules. Under ``write_back`` the cache is
         the instance's pending dict instead, accumulating the granule's maps
-        across groups for ``finish_granule`` to persist.
+        across groups for ``finish_granule`` to persist. The in-memory
+        ``Index`` is rebuilt (~ms) whenever a new dataset's map lands.
         """
         maps: dict[str, ChunkMap] = self._pending if self.write_back else {}
+        state: dict = {"vidx": None, "n_maps": -1}
+        direct: set[str] = set()  # datasets pinned to the h5coro decoder
 
-        def read_fn(path, hyperslice=None):
+        def _vidx():
+            if state["n_maps"] != len(maps):
+                from h5coro_hidefix import Index
+                from h5coro_hidefix.manifest import datasets_from_manifest
+
+                state["vidx"] = Index.from_chunks(
+                    "inline", datasets_from_manifest(granule_manifest(maps))
+                )
+                state["n_maps"] = len(maps)
+            return state["vidx"]
+
+        def _compiled(path, start, end):
+            vidx = _vidx()
+            addrs, sizes, _ = vidx.read_plan(path, start, end)
+            buffers = [h5obj.ioRequest(int(a), int(s), caching=False) for a, s in zip(addrs, sizes)]
+            return vidx.read_from_buffers(path, buffers, start, end)
+
+        def _h5coro_read(path, hyperslice, cm):
             if hyperslice is None:
                 return h5obj.readDatasets([path])[path]
-            cm = maps.get(path)
-            if cm is None:
-                cm = maps[path] = build_chunk_map(h5obj, path)
             parts = []
             for s, e in hyperslice:
                 lo = s
@@ -488,5 +512,28 @@ class InlineIndex(VirtualIndex):
                 arr = h5obj.readDatasets([{"dataset": path, "hyperslice": [(lo, e)]}])[path]
                 parts.append(arr[s - lo :])
             return parts[0] if len(parts) == 1 else np.concatenate(parts)
+
+        def read_fn(path, hyperslice=None):
+            cm = maps.get(path)
+            if cm is None and path not in direct:
+                try:
+                    cm = maps[path] = build_chunk_map(h5obj, path)
+                except Exception:
+                    if hyperslice is not None:
+                        raise  # planned reads required the map before #170 too
+                    direct.add(path)
+                    logger.warning(f"  no chunk map for {path}; reading through h5coro")
+            if path not in direct:
+                try:
+                    if hyperslice is None:
+                        return _compiled(path, None, None)
+                    parts = [_compiled(path, s, e) for s, e in hyperslice]
+                    return parts[0] if len(parts) == 1 else np.concatenate(parts)
+                except Exception as exc:
+                    direct.add(path)
+                    logger.warning(
+                        f"  compiled decode unavailable for {path} ({exc}); reading through h5coro"
+                    )
+            return _h5coro_read(path, hyperslice, cm)
 
         return read_fn
