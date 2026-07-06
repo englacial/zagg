@@ -119,7 +119,7 @@ Parameters:
 
   RecycleMaxInvocations:
     Type: String
-    Default: "8"
+    Default: "0"
     Description: >-
       ZAGG_RECYCLE_MAX_INVOCATIONS for the worker self-recycle (issue #171):
       belt-and-suspenders generation cap -- recycle the sandbox (same
@@ -176,7 +176,8 @@ Resources:
                 Action:
                   - s3:GetObject
                   - s3:PutObject
-                Resource: arn:aws:s3:::sliderule-public-cors/zagg-index/*
+                  - s3:DeleteObject
+                Resource: arn:aws:s3:::sliderule-public-cors/*
 
   DepsLayer:
     Type: AWS::Lambda::LayerVersion
