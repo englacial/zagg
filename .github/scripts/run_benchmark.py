@@ -133,6 +133,10 @@ def run_target(
         # renderer can split the new matrix from frozen rows. None on targets
         # without the key (the provisional/legacy ones).
         codec=target.get("codec"),
+        # Read-axis label (issue #170): the *_cached targets share codec
+        # "inner" with the real inner column, so the renderer needs this to
+        # give them their own panel instead of silently overwriting it.
+        read=target.get("read"),
     )
 
     if dry_run:

@@ -1420,11 +1420,13 @@ def test_codec_layout_is_fixed_2x3_sharded_inner_by_order():
 
     hist = update_series.records_to_frame(_full_codec_matrix("c0"))
     grid, nrows, ncols = plot_series._codec_layout(hist)
-    assert (nrows, ncols) == (3, 2)  # rows o9->o11, cols sharded/inner
+    assert (nrows, ncols) == (3, 3)  # rows o9->o11, cols sharded/inner/cached (issue #170)
+    # Third column is the issue #170 cached-read slot; blank here because this
+    # synthetic history carries no cached rows.
     assert grid == [
-        ["tdigest_healpix_o9_sharded", "tdigest_healpix_o9_inner"],
-        ["tdigest_healpix_o10_sharded", "tdigest_healpix_o10_inner"],
-        ["tdigest_healpix_o11_sharded", "tdigest_healpix_o11_inner"],
+        ["tdigest_healpix_o9_sharded", "tdigest_healpix_o9_inner", None],
+        ["tdigest_healpix_o10_sharded", "tdigest_healpix_o10_inner", None],
+        ["tdigest_healpix_o11_sharded", "tdigest_healpix_o11_inner", None],
     ]
 
 
@@ -1435,9 +1437,9 @@ def test_codec_layout_blanks_missing_order():
 
     rows = [_codec_row("c0", o, c) for o in ("o10", "o11") for c in ("sharded", "inner")]
     grid, nrows, ncols = plot_series._codec_layout(update_series.records_to_frame(rows))
-    assert (nrows, ncols) == (3, 2)
-    assert grid[0] == [None, None]  # o9 row blank
-    assert grid[1] == ["tdigest_healpix_o10_sharded", "tdigest_healpix_o10_inner"]
+    assert (nrows, ncols) == (3, 3)  # cached col, issue #170
+    assert grid[0] == [None, None, None]  # o9 row blank (incl. cached col, issue #170)
+    assert grid[1] == ["tdigest_healpix_o10_sharded", "tdigest_healpix_o10_inner", None]
 
 
 def test_codec_and_frozen_histories_split_on_codec():

@@ -282,6 +282,16 @@ def validate_config(config: PipelineConfig) -> None:
     if handoff is not None and handoff not in ("pandas", "arrow"):
         raise ValueError(f"aggregation.handoff must be 'pandas' or 'arrow' (got {handoff!r})")
 
+    # Validate the optional read fan-out width (issue #170). Mirrors the read
+    # module's guard (_read_workers) so a config typo is rejected at
+    # submission -- inside the worker the same error would be swallowed into
+    # per-group read_errors and surface as a silently-empty shard.
+    read_workers = (config.data_source or {}).get("read_workers")
+    if read_workers is not None and (
+        isinstance(read_workers, bool) or not isinstance(read_workers, int) or read_workers < 1
+    ):
+        raise ValueError(f"data_source.read_workers must be an integer >= 1 (got {read_workers!r})")
+
     # Optional strict-AOI cell mask (issue #101), default off. Must be a bool.
     aoi_mask = config.output.get("aoi_mask")
     if aoi_mask is not None and not isinstance(aoi_mask, bool):

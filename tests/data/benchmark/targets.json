@@ -143,7 +143,7 @@
     }
   },
   "provisional_targets": {
-    "_comment": "PROVISIONAL, PR-TREE-ONLY (issue #130). The two scalar targets share ONE config + ONE shard (healpix_o11) and differ only by handoff (pandas / arrow) to benchmark the per-cell carrier cost: pandas DataFrame vs an arro3-core Arrow table. Both produce byte-identical scalar output and neither imports pyarrow. (The experimental arrow-kernel reducer was dropped with pyarrow per @espg's path-C decision https://github.com/englacial/zagg/pull/131#issuecomment-4838785058, since arro3 has no hash-aggregate.) The two *_88s targets are the issue #148 stress probes: on-demand runs against the pinned worst 88S ring shard, expected to OOM/timeout until the streaming/cached-read work lands -- they must NOT join the every-merge matrix (a red benchmark job every merge). All entries here are deliberately NOT in 'targets': run_benchmark.py runs them by explicit --target name (via /benchmark); 'run all' (no --target) skips them.",
+    "_comment": "PROVISIONAL, PR-TREE-ONLY (issue #130). The two scalar targets share ONE config + ONE shard (healpix_o11) and differ only by handoff (pandas / arrow) to benchmark the per-cell carrier cost: pandas DataFrame vs an arro3-core Arrow table. Both produce byte-identical scalar output and neither imports pyarrow. (The experimental arrow-kernel reducer was dropped with pyarrow per @espg's path-C decision https://github.com/englacial/zagg/pull/131#issuecomment-4838785058, since arro3 has no hash-aggregate.) The two *_88s targets are the issue #148 stress probes: on-demand runs against the pinned worst 88S ring shard, expected to OOM/timeout until the streaming/cached-read work lands -- they must NOT join the every-merge matrix (a red benchmark job every merge). All entries here are deliberately NOT in 'targets': run_benchmark.py runs them by explicit --target name (via /benchmark); 'run all' (no --target) skips them. The *_88s_cached companions (issue #170) are the arm the base _88s probes were waiting for: same pinned 88S shard, read through the sidecar/compiled path (self-populating manifests) -- the base _88s targets stay pinned to the hierarchical baseline (issue #148 arm 1, the honest uncached reference), so the pair measures exactly the cached-vs-uncached delta at the pole.",
     "scalar_pandas_healpix_o11": {
       "config": "configs/atl03_scalar_healpix_o11.yaml",
       "shardmap": "healpix_o11",
@@ -167,12 +167,28 @@
       "grid_type": "healpix",
       "grid_size": "o9_88s"
     },
+    "tdigest_healpix_o9_88s_cached": {
+      "config": "configs/atl03_tdigest_healpix_o9_cached.yaml",
+      "shardmap": "healpix_o9_88s",
+      "aggregator": "tdigest",
+      "grid_type": "healpix",
+      "grid_size": "o9_88s",
+      "read": "cached"
+    },
     "tdigest_healpix_o10_88s": {
       "config": "configs/atl03_tdigest_healpix_o10.yaml",
       "shardmap": "healpix_o10_88s",
       "aggregator": "tdigest",
       "grid_type": "healpix",
       "grid_size": "o10_88s"
+    },
+    "tdigest_healpix_o10_88s_cached": {
+      "config": "configs/atl03_tdigest_healpix_o10_cached.yaml",
+      "shardmap": "healpix_o10_88s",
+      "aggregator": "tdigest",
+      "grid_type": "healpix",
+      "grid_size": "o10_88s",
+      "read": "cached"
     }
   }
 }
