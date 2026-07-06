@@ -817,7 +817,6 @@ class TestMaxRetriesPassthrough:
         monkeypatch.setattr(runner, "_invoke_lambda_setup", lambda *a, **k: None)
         monkeypatch.setattr(runner, "_invoke_lambda_finalize", lambda *a, **k: None)
         monkeypatch.setattr(runner, "_get_function_timeout_s", lambda *a, **k: 720)
-        monkeypatch.setattr(runner, "_force_cold_containers", lambda *a, **k: None)
         from unittest.mock import MagicMock
 
         monkeypatch.setattr(boto3, "Session", lambda *a, **k: MagicMock())
@@ -890,7 +889,6 @@ class TestInvocationPassthrough:
         monkeypatch.setattr(runner, "_invoke_lambda_setup", lambda *a, **k: None)
         monkeypatch.setattr(runner, "_invoke_lambda_finalize", lambda *a, **k: None)
         monkeypatch.setattr(runner, "_get_function_timeout_s", lambda *a, **k: 720)
-        monkeypatch.setattr(runner, "_force_cold_containers", lambda *a, **k: None)
         monkeypatch.setattr(boto3, "Session", lambda *a, **k: MagicMock())
         monkeypatch.setattr(
             runner,
@@ -1293,7 +1291,6 @@ class TestSummaryKeysByteIdentical:
         monkeypatch.setattr(runner, "_invoke_lambda_setup", lambda *a, **k: None)
         monkeypatch.setattr(runner, "_invoke_lambda_finalize", lambda *a, **k: None)
         monkeypatch.setattr(runner, "_get_function_timeout_s", lambda *a, **k: 720)
-        monkeypatch.setattr(runner, "_force_cold_containers", lambda *a, **k: None)
         from unittest.mock import MagicMock
 
         monkeypatch.setattr(boto3, "Session", lambda *a, **k: MagicMock())
@@ -1378,7 +1375,6 @@ class TestSummaryKeysByteIdentical:
         monkeypatch.setattr(runner, "_invoke_lambda_setup", lambda *a, **k: None)
         monkeypatch.setattr(runner, "_invoke_lambda_finalize", lambda *a, **k: None)
         monkeypatch.setattr(runner, "_get_function_timeout_s", lambda *a, **k: 720)
-        monkeypatch.setattr(runner, "_force_cold_containers", lambda *a, **k: None)
         from unittest.mock import MagicMock
 
         monkeypatch.setattr(boto3, "Session", lambda *a, **k: MagicMock())
@@ -1454,7 +1450,6 @@ class TestSummaryKeysByteIdentical:
         monkeypatch.setattr(runner, "_invoke_lambda_setup", lambda *a, **k: None)
         monkeypatch.setattr(runner, "_invoke_lambda_finalize", lambda *a, **k: None)
         monkeypatch.setattr(runner, "_get_function_timeout_s", lambda *a, **k: 720)
-        monkeypatch.setattr(runner, "_force_cold_containers", lambda *a, **k: None)
         from unittest.mock import MagicMock
 
         monkeypatch.setattr(boto3, "Session", lambda *a, **k: MagicMock())
@@ -1808,7 +1803,6 @@ class TestTemporalLambdaStrategy:
 
         monkeypatch.setattr(boto3, "Session", lambda *a, **k: MagicMock())
         monkeypatch.setattr(runner, "_get_function_timeout_s", lambda *a, **k: 720)
-        monkeypatch.setattr(runner, "_force_cold_containers", lambda *a, **k: None)
         monkeypatch.setattr(
             runner,
             "compute_available_workers",
