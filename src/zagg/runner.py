@@ -1941,6 +1941,7 @@ def _force_cold_containers(lambda_client, function_name, *, wait_s=120, poll_int
             "lambda:UpdateFunctionConfiguration; pass force_cold=False to dispatch "
             "onto warm containers instead."
         ) from exc
+    prior = ((current.get("Environment") or {}).get("Variables") or {}).get("ZAGG_COLD_EPOCH")
     env = dict((current.get("Environment") or {}).get("Variables") or {})
     env["ZAGG_COLD_EPOCH"] = token
     while True:
@@ -1952,9 +1953,16 @@ def _force_cold_containers(lambda_client, function_name, *, wait_s=120, poll_int
         except Exception as exc:
             response = getattr(exc, "response", None)
             code = response.get("Error", {}).get("Code", "") if isinstance(response, dict) else ""
-            if code == "ResourceConflictException" and time.time() < deadline:
-                time.sleep(poll_interval_s)  # another config update in flight; retry
-                continue
+            if code == "ResourceConflictException":
+                if time.time() < deadline:
+                    time.sleep(poll_interval_s)  # another config update in flight; retry
+                    continue
+                raise RuntimeError(
+                    f"force_cold: {function_name} has had another configuration update "
+                    f"in flight for the whole {wait_s}s deadline "
+                    "(ResourceConflictException); retry the run, or pass "
+                    "force_cold=False to dispatch onto warm containers."
+                ) from exc
             raise RuntimeError(
                 f"force_cold: updating {function_name} configuration failed ({exc}). The "
                 "caller needs lambda:UpdateFunctionConfiguration; pass force_cold=False "
@@ -1975,6 +1983,19 @@ def _force_cold_containers(lambda_client, function_name, *, wait_s=120, poll_int
                     f"force_cold: {function_name} configuration update failed server-side "
                     "(LastUpdateStatus=Failed); check the function state in the console"
                 )
+        elif marker != prior and status == "Successful":
+            # Superseded: a third epoch value means a CONCURRENT update (e.g.
+            # another force_cold run) was accepted after ours. Lambda
+            # serializes configuration updates, so its acceptance proves ours
+            # applied first (or was subsumed) -- either way every warm sandbox
+            # is already invalidated, which is the outcome the caller asked
+            # for. (Review finding, PR #172: without this branch the poll
+            # spins to deadline and reports a failure that didn't happen.)
+            logger.info(
+                "force_cold: superseded by a concurrent configuration update "
+                "(warm sandboxes already invalidated)"
+            )
+            return
         if time.time() >= deadline:
             raise RuntimeError(
                 f"force_cold: {function_name} configuration update still {status!r} "

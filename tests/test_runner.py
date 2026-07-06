@@ -2522,6 +2522,48 @@ class TestForceCold:
         with pytest.raises(RuntimeError, match="warm containers"):
             _force_cold_containers(client, "process-shard", wait_s=0, poll_interval_s=0)
 
+    def test_superseded_by_concurrent_update_counts_as_success(self):
+        # A concurrent run's update replaced our marker after ours was
+        # accepted; Lambda serializes configuration updates, so every warm
+        # sandbox was invalidated regardless -- the poll must count that as
+        # success, not spin to deadline (review finding, PR #172).
+        from zagg.runner import _force_cold_containers
+
+        class _Client:
+            def __init__(self):
+                self.updated = False
+
+            def get_function_configuration(self, FunctionName):  # noqa: N803
+                if self.updated:
+                    return {
+                        "Environment": {"Variables": {"ZAGG_COLD_EPOCH": "someone-else"}},
+                        "LastUpdateStatus": "Successful",
+                    }
+                return {"Environment": {"Variables": {}}, "LastUpdateStatus": "Successful"}
+
+            def update_function_configuration(self, FunctionName, Environment):  # noqa: N803
+                self.updated = True
+
+        _force_cold_containers(_Client(), "process-shard", poll_interval_s=0)
+
+    def test_conflict_past_deadline_reports_conflict_not_permissions(self):
+        import pytest
+
+        from zagg.runner import _force_cold_containers
+
+        class _ConflictError(Exception):
+            response = {"Error": {"Code": "ResourceConflictException"}}
+
+        class _Client:
+            def get_function_configuration(self, FunctionName):  # noqa: N803
+                return {"Environment": {"Variables": {}}, "LastUpdateStatus": "Successful"}
+
+            def update_function_configuration(self, FunctionName, Environment):  # noqa: N803
+                raise _ConflictError("in flight")
+
+        with pytest.raises(RuntimeError, match="another configuration update"):
+            _force_cold_containers(_Client(), "process-shard", wait_s=0, poll_interval_s=0)
+
     def test_run_lambda_forces_cold_before_dispatch(self, monkeypatch, atl06_config):
         from zagg import runner
 
