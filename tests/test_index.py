@@ -277,8 +277,20 @@ class TestIndexConfigValidation:
 
 
 class TestIndexFromConfig:
-    def test_absent_block_resolves_hierarchical(self):
+    def test_absent_block_resolves_inline(self):
+        # issue #170 phase 3: the compiled inline read is the default for
+        # every data source -- flat (like this one) and planned alike.
         backend = index_from_config(_worker_cfg())
+        assert isinstance(backend, InlineIndex)
+        backend = index_from_config(_worker_cfg(read_plan={"spatial_index": "segments"}))
+        assert isinstance(backend, InlineIndex)
+
+    def test_absent_block_with_apriori_boundaries_stays_hierarchical(self):
+        # a-priori chunk_boundaries take precedence inside _read_group and
+        # are mutually exclusive with inline's addressing.
+        backend = index_from_config(
+            _worker_cfg(read_plan={"chunk_boundaries": {"prefix": "s3://x/boundaries/"}})
+        )
         assert isinstance(backend, HierarchicalIndex)
 
     def test_explicit_hierarchical(self):

@@ -444,7 +444,7 @@ class InlineIndex(VirtualIndex):
             # selectivity fallback and empty-shard early returns — still
             # contribute this group's datasets to the granule manifest.
             self._prebuild_group_maps(h5obj, group, data_source)
-        read_fn = self._chunk_aligned_read_fn(h5obj)
+        read_fn = self._chunk_aligned_read_fn(h5obj, planned=planned)
         if planned:
             return _planned_read_group(
                 h5obj, group, data_source, shard_key, grid, arrow=arrow, read_fn=read_fn
@@ -453,7 +453,7 @@ class InlineIndex(VirtualIndex):
             h5obj, group, data_source, shard_key, grid, arrow=arrow, read_fn=read_fn
         )
 
-    def _chunk_aligned_read_fn(self, h5obj):
+    def _chunk_aligned_read_fn(self, h5obj, *, planned=True):
         """Build the addressing seam: planned ranges, compiled decode.
 
         The chunk maps this backend already builds are exactly what
@@ -522,7 +522,7 @@ class InlineIndex(VirtualIndex):
             parts = []
             for s, e in hyperslice:
                 lo = s
-                if s > 0 and len(cm) and cm.starts_on_boundary(s):
+                if s > 0 and cm is not None and len(cm) and cm.starts_on_boundary(s):
                     lo = s - 1  # h5coro start-edge workaround (see docstring)
                 arr = h5obj.readDatasets([{"dataset": path, "hyperslice": [(lo, e)]}])[path]
                 parts.append(arr[s - lo :])
@@ -534,8 +534,11 @@ class InlineIndex(VirtualIndex):
                 try:
                     cm = maps[path] = build_chunk_map(h5obj, path)
                 except Exception:
-                    if hyperslice is not None:
-                        raise  # planned reads required the map before #170 too
+                    if planned and hyperslice is not None:
+                        # The planned route required the map before #170 too:
+                        # without it the boundary workaround can't run, and a
+                        # plain hyperslice read may trip the PR #152 edge.
+                        raise
                     direct.add(path)
                     logger.warning(f"  no chunk map for {path}; reading through h5coro")
             if path not in direct:
