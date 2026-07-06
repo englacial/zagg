@@ -245,6 +245,28 @@ class TestStreamingWorker:
         assert meta["total_obs"] > 0
         assert highwater["n"] <= 2  # one read per granule (single group)
 
+    def test_streaming_via_backend_seam_unpinned_config(self, monkeypatch):
+        # Review fold (PR #176): the other worker tests pin the backend in
+        # config; this one leaves the config UNPINNED (the inline default,
+        # issue #170) and stubs the backend at the worker's
+        # ``index_from_config`` seam instead (the test_processing.py idiom)
+        # -- guarding that the streaming buffer mechanics are independent of
+        # how the backend resolves. Exercising the compiled inline decode
+        # itself needs real HDF5 fixtures (issue #175 tracks the gap).
+        from zagg.index.hierarchical import HierarchicalIndex
+
+        key = _shard_key()
+        cfg = _config(streaming={"buffer_granules": 2})
+        del cfg.data_source["index"]
+        monkeypatch.setattr(
+            "zagg.processing.worker.index_from_config", lambda c: HierarchicalIndex()
+        )
+        grid = _grid(cfg)
+        dfs = _granule_dfs(grid, key, n_granules=3)
+        df_s, ragged, meta = _run(monkeypatch, cfg, grid, key, dfs)
+        assert meta["total_obs"] > 0
+        assert "h_tdigest" in ragged
+
     def test_streaming_empty_shard_matches_pooled_no_data(self, monkeypatch):
         key = _shard_key()
         cfg = _config(streaming={"buffer_granules": 2})
