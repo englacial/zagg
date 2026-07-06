@@ -37,6 +37,20 @@ class ProcessingMetadata(TypedDict):
     # read is always a real error, so this surfaces a shard whose "no data"
     # result is actually a read failure rather than a legitimately-empty read.
     read_errors: NotRequired[int]
+    # Container telemetry (issue #171), stamped by the Lambda handler's
+    # dispatcher into every per-unit envelope (all status branches) so the
+    # runner can surface the warm-container RSS ratchet (#169). Absent on the
+    # local runner path. ``container_cold``: first invocation on this sandbox.
+    # ``container_generation``: invocations this sandbox has served (all
+    # modes). ``rss_start_mb``: process RSS at handler entry -- the ratchet
+    # signal (None off Linux). ``sandbox_id``: CloudWatch log-stream name,
+    # unique per sandbox. ``container_init_ts``: module-import epoch seconds.
+    # The per-invocation *peak* is the existing ``max_memory_mb`` (issue #141).
+    container_cold: NotRequired[bool]
+    container_generation: NotRequired[int]
+    rss_start_mb: NotRequired[float | None]
+    sandbox_id: NotRequired[str | None]
+    container_init_ts: NotRequired[float]
 
 
 def xdggs_spec(

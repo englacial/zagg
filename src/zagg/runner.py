@@ -787,6 +787,11 @@ def _run_lambda_events(
         if r.get("status_code") != 200 or r.get("error")
     ]
 
+    # Container-telemetry rollup (issue #171), same additive fields as the
+    # spatial summary; the raw envelopes live in report.results (summary
+    # "results" carries the collected tabular rows instead).
+    container_stats = _container_telemetry_summary([r.get("body") or {} for r in report.results])
+
     summary = {
         "total_events": n,
         "events_with_data": report.cells_with_data,
@@ -803,12 +808,14 @@ def _run_lambda_events(
         "backend": "lambda",
         "results": rows,
         "failures": failures,
+        **container_stats,
     }
     logger.info(
         f"Done: {report.cells_with_data} events, {report.total_obs} timesteps, "
         f"{report.cells_error} errors, {wall_time:.1f}s, "
         f"~${estimated_cost:.4f} ({gb_seconds:.1f} GB-s)"
     )
+    _log_container_stats(container_stats)
     return summary
 
 
@@ -1494,6 +1501,10 @@ def _run_lambda(
     ]
     max_memory_mb = max(worker_memory) if worker_memory else None
 
+    # Container-telemetry rollup (issue #171): cold/warm counts + the ratchet
+    # view (max start-RSS per sandbox generation) from the worker envelopes.
+    container_stats = _container_telemetry_summary([r.get("body") or {} for r in report.results])
+
     # Per-phase worker breakdown (issue #100 phase 2), only when --profile fed
     # the workers a "profile" event so they emitted body["phase_timings"]. Roll
     # the straggler (max) per phase across cells, matching the wall-time framing.
@@ -1528,6 +1539,7 @@ def _run_lambda(
         "backend": "lambda",
         "function_name": function_name,
         "results": report.results,
+        **container_stats,
     }
     if profile:
         summary["worker_phase_max"] = worker_phase_max
@@ -1552,6 +1564,7 @@ def _run_lambda(
     if profile and worker_phase_max:
         breakdown = ", ".join(f"{phase} {secs:.0f}s" for phase, secs in worker_phase_max.items())
         logger.info(f"Worker phases (max across cells): {breakdown}")
+    _log_container_stats(container_stats)
     return summary
 
 
@@ -2004,6 +2017,54 @@ def _force_cold_containers(lambda_client, function_name, *, wait_s=120, poll_int
                 f"after {wait_s}s; workers would reuse warm containers"
             )
         time.sleep(poll_interval_s)
+
+
+def _container_telemetry_summary(bodies):
+    """Aggregate worker container telemetry into additive summary fields (issue #171).
+
+    ``bodies`` are the parsed per-unit result bodies. Workers stamp
+    ``container_cold`` / ``container_generation`` / ``rss_start_mb`` into every
+    envelope (the detect-and-report half of the PR #172 plan), and this rolls
+    them up into the fleet-level view that makes the #169 warm-container RSS
+    ratchet visible in the run summary instead of requiring CloudWatch
+    forensics: how many shards ran on fresh vs reused sandboxes, and the max
+    start-RSS at each sandbox generation (a healthy fleet is flat across
+    generations; the ratchet climbs). All three fields are ``None`` when no
+    worker reported telemetry (older deployed workers), so consumers can
+    distinguish "no data" from a genuinely all-warm run.
+    """
+    reported = [b for b in bodies if b.get("container_generation") is not None]
+    if not reported:
+        return {
+            "worker_cold_starts": None,
+            "worker_warm_starts": None,
+            "worker_rss_start_max_by_gen": None,
+        }
+    cold = sum(1 for b in reported if b.get("container_cold"))
+    by_gen: dict = {}
+    for b in reported:
+        rss = b.get("rss_start_mb")
+        if rss is not None:
+            gen = int(b["container_generation"])
+            by_gen[gen] = max(by_gen.get(gen, 0.0), float(rss))
+    return {
+        "worker_cold_starts": cold,
+        "worker_warm_starts": len(reported) - cold,
+        "worker_rss_start_max_by_gen": dict(sorted(by_gen.items())),
+    }
+
+
+def _log_container_stats(container_stats):
+    """One summary log line for the container-telemetry rollup (issue #171)."""
+    if container_stats.get("worker_cold_starts") is None:
+        return
+    by_gen = container_stats["worker_rss_start_max_by_gen"] or {}
+    ratchet = ", ".join(f"gen{g} {mb:.0f}MB" for g, mb in by_gen.items()) or "n/a"
+    logger.info(
+        f"Containers: {container_stats['worker_cold_starts']} cold / "
+        f"{container_stats['worker_warm_starts']} warm; max start-RSS by "
+        f"generation: {ratchet}"
+    )
 
 
 def _get_function_timeout_s(lambda_client, function_name):

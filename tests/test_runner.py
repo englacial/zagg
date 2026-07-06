@@ -1158,6 +1158,11 @@ class TestSummaryKeysByteIdentical:
         "worker_pstdev_s",
         "worker_pct_timeout",
         "max_memory_mb",
+        # Container-telemetry rollup (issue #171); additive, None-valued when
+        # no worker envelope carried telemetry (older deployed workers).
+        "worker_cold_starts",
+        "worker_warm_starts",
+        "worker_rss_start_max_by_gen",
     }
 
     def test_local_summary_keys_and_counts(self, monkeypatch, atl06_config):
@@ -1875,6 +1880,35 @@ class TestTemporalLambdaStrategy:
         assert summary["results"] == written["rows"]
         assert summary["failures"] == []
 
+    def test_temporal_summary_carries_container_rollup(self, monkeypatch):
+        # Issue #171: the temporal path aggregates the same worker container
+        # telemetry as the spatial path (additive summary fields, shared helper).
+        def _invoke(client, ev, **kwargs):
+            gen = 1 if ev["event_key"] == "storm1" else 2
+            return {
+                "event_key": ev["event_key"],
+                "status_code": 200,
+                "body": {
+                    "results": {"max_t2m": 5.0},
+                    "timesteps_processed": 2,
+                    "duration_s": 1.0,
+                    "meta": {"timesteps_processed": 2},
+                    "container_cold": gen == 1,
+                    "container_generation": gen,
+                    "rss_start_mb": 300.0 * gen,
+                },
+                "wall_time": 1.0,
+                "lambda_duration": 1.0,
+                "error": None,
+                "retries": 0,
+                "timeout": False,
+            }
+
+        summary, _ = self._drive(monkeypatch, fake_invoke=_invoke)
+        assert summary["worker_cold_starts"] == 1
+        assert summary["worker_warm_starts"] == 1
+        assert summary["worker_rss_start_max_by_gen"] == {1: 300.0, 2: 600.0}
+
     def test_async_wiring_threads_result_channel(self, monkeypatch):
         summary, captured = self._drive(monkeypatch)  # invocation defaults to async
         for ev, kwargs in captured["invokes"]:
@@ -2211,6 +2245,7 @@ def _run_lambda_with_durations(
     profile=False,
     phase_timings=None,
     memories=None,
+    containers=None,
     **run_kwargs,
 ):
     """Drive ``_run_lambda`` over synthetic per-cell durations.
@@ -2221,6 +2256,9 @@ def _run_lambda_with_durations(
     ``phase_timings`` is set it is attached to each cell result body.
     ``memories`` (issue #120), when given, is consumed one per cell and attached
     as ``body["max_memory_mb"]`` so the peak-memory rollup can be pinned.
+    ``containers`` (issue #171), when given, is consumed one per cell and merged
+    into each body (container_cold/container_generation/rss_start_mb dicts) so
+    the container-telemetry rollup can be pinned.
     """
     import boto3
 
@@ -2256,6 +2294,7 @@ def _run_lambda_with_durations(
     )
     it = iter(durations)
     mem_it = iter(memories) if memories is not None else None
+    cont_it = iter(containers) if containers is not None else None
 
     def _fake_cell(*a, **k):
         body = {"total_obs": 1}
@@ -2263,6 +2302,8 @@ def _run_lambda_with_durations(
             body["phase_timings"] = phase_timings
         if mem_it is not None:
             body["max_memory_mb"] = next(mem_it)
+        if cont_it is not None:
+            body.update(next(cont_it))
         return {
             "status_code": 200,
             "body": body,
@@ -2586,6 +2627,76 @@ class TestForceCold:
         from zagg.runner import agg
 
         assert inspect.signature(agg).parameters["force_cold"].default is False
+
+
+class TestContainerTelemetrySummary:
+    """Issue #171 (detect-and-report): the runner rolls the workers' container
+    telemetry into additive summary fields -- cold/warm counts and the max
+    start-RSS per sandbox generation (the #169 ratchet made visible)."""
+
+    def test_rollup_counts_and_ratchet(self):
+        from zagg.runner import _container_telemetry_summary
+
+        bodies = [
+            {"container_cold": True, "container_generation": 1, "rss_start_mb": 310.0},
+            {"container_cold": False, "container_generation": 2, "rss_start_mb": 959.0},
+            {"container_cold": False, "container_generation": 2, "rss_start_mb": 640.0},
+            {"container_cold": False, "container_generation": 3, "rss_start_mb": 1650.0},
+        ]
+        stats = _container_telemetry_summary(bodies)
+        assert stats["worker_cold_starts"] == 1
+        assert stats["worker_warm_starts"] == 3
+        # Max per generation, ordered: the ratchet signature (climbing start-RSS).
+        assert stats["worker_rss_start_max_by_gen"] == {1: 310.0, 2: 959.0, 3: 1650.0}
+
+    def test_no_telemetry_is_none_not_zero(self):
+        # Older deployed workers stamp no container fields: the rollup must be
+        # None (no data), never 0 cold / 0 warm (which would read as all-warm).
+        from zagg.runner import _container_telemetry_summary
+
+        stats = _container_telemetry_summary([{"total_obs": 1}, {}])
+        assert stats == {
+            "worker_cold_starts": None,
+            "worker_warm_starts": None,
+            "worker_rss_start_max_by_gen": None,
+        }
+
+    def test_mixed_fleet_counts_only_reporting_workers(self):
+        # A mid-rollout fleet (some workers redeployed, some not): only the
+        # envelopes that carry telemetry are counted, and a missing
+        # rss_start_mb (non-Linux fallback) is skipped, not treated as 0.
+        from zagg.runner import _container_telemetry_summary
+
+        bodies = [
+            {"container_cold": True, "container_generation": 1, "rss_start_mb": None},
+            {"total_obs": 1},  # pre-telemetry worker
+        ]
+        stats = _container_telemetry_summary(bodies)
+        assert stats["worker_cold_starts"] == 1
+        assert stats["worker_warm_starts"] == 0
+        assert stats["worker_rss_start_max_by_gen"] == {}
+
+    def test_lambda_summary_carries_rollup(self, monkeypatch, atl06_config):
+        containers = [
+            {"container_cold": True, "container_generation": 1, "rss_start_mb": 300.0},
+            {"container_cold": True, "container_generation": 1, "rss_start_mb": 320.0},
+            {"container_cold": False, "container_generation": 2, "rss_start_mb": 1100.0},
+            {"container_cold": False, "container_generation": 2, "rss_start_mb": 900.0},
+        ]
+        summary = _run_lambda_with_durations(
+            monkeypatch, atl06_config, [1.0, 1.0, 1.0, 1.0], containers=containers
+        )
+        assert summary["worker_cold_starts"] == 2
+        assert summary["worker_warm_starts"] == 2
+        assert summary["worker_rss_start_max_by_gen"] == {1: 320.0, 2: 1100.0}
+
+    def test_lambda_summary_without_telemetry_is_none(self, monkeypatch, atl06_config):
+        # Default fake bodies carry no container fields -> the additive keys
+        # exist but are None, so downstream consumers see "no data".
+        summary = _run_lambda_with_durations(monkeypatch, atl06_config, [1.0, 1.0, 1.0, 1.0])
+        assert summary["worker_cold_starts"] is None
+        assert summary["worker_warm_starts"] is None
+        assert summary["worker_rss_start_max_by_gen"] is None
 
 
 class TestProfilePlumbing:
