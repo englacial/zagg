@@ -290,7 +290,10 @@ def _panel_layout(hist: pd.DataFrame) -> tuple[list[list[str | None]], int, int]
 # o9 -> o11 top-to-bottom (largest shard on top, matching the frozen figure's
 # largest-first convention). Unlike ``_panel_layout`` this is keyed to the codec
 # axis, not the rect/healpix split the frozen rows use.
-CODEC_COLS = ["sharded", "inner"]
+# "cached" is the issue #170 read-axis column: those targets carry codec
+# "inner" (the codec key still drives output.grid.sharded) plus read="cached",
+# and must not collide with the real inner panel in the slot map below.
+CODEC_COLS = ["sharded", "inner", "cached"]
 CODEC_ROWS = ["o9", "o10", "o11"]
 
 
@@ -304,7 +307,10 @@ def _codec_layout(hist: pd.DataFrame) -> tuple[list[list[str | None]], int, int]
     by_slot: dict[tuple[str, str], str] = {}
     meta = hist.dropna(subset=["target"]).drop_duplicates("target")
     for _, r in meta.iterrows():
-        by_slot[(str(r.get("grid_size", "")), str(r.get("codec", "")))] = r["target"]
+        # Read-aware slot label (issue #170): cached targets get their own
+        # column; everything else keys on the codec exactly as before.
+        label = "cached" if str(r.get("read", "")) == "cached" else str(r.get("codec", ""))
+        by_slot[(str(r.get("grid_size", "")), label)] = r["target"]
     grid: list[list[str | None]] = [
         [by_slot.get((order, codec)) for codec in CODEC_COLS] for order in CODEC_ROWS
     ]
