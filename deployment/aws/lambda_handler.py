@@ -188,6 +188,74 @@ def _attach_container_telemetry(
     return {**response, "body": json.dumps(body)}
 
 
+# Injectable exit seam (issue #171): module-level so tests can monkeypatch it.
+# ``os._exit`` (not sys.exit) is deliberate -- the sandbox is being discarded,
+# not shut down gracefully, and the exit must not be catchable en route.
+_exit = os._exit
+
+
+def _recycle_limit(name: str) -> float:
+    """Read one self-recycle knob from the environment; 0.0 == disabled.
+
+    Absent, empty, "0", or non-numeric (logged) all disable the check, so a
+    stack deployed without the template.yaml defaults behaves exactly as
+    before this feature existed.
+    """
+    raw = os.environ.get(name, "").strip()
+    if not raw:
+        return 0.0
+    try:
+        return float(raw)
+    except ValueError:
+        logger.warning(f"{name}={raw!r} is not numeric; recycle check disabled")
+        return 0.0
+
+
+def _maybe_self_recycle() -> None:
+    """Destroy this sandbox when it is too bloated to trust (issue #171).
+
+    Called ONLY after the invocation's result envelope was successfully
+    mirrored to its ``result_url`` (the issue #151/#153 async channel): the
+    orchestrator polls that S3 object, not the Lambda response, so once the
+    mirror has landed the invocation is operationally complete and exiting
+    loses nothing; ``MaximumRetryAttempts: 0`` (template.yaml) guarantees the
+    cosmetically "failed" invocation is never re-driven. Never called on the
+    synchronous path, where exiting would lose the response.
+
+    Two independent knobs (function env vars with template.yaml defaults;
+    absent/empty/0 disables that check):
+
+    - ``ZAGG_RECYCLE_RSS_MB`` -- recycle when current RSS is at/over this
+      many MB. The #169 ratchet retained ~700-1100 MB per heavy invocation
+      against a 2047 MB cap, so the template's 1400 catches a dirty sandbox
+      after roughly one heavy retention while leaving the triggering
+      invocation ~650 MB of headroom to complete first.
+    - ``ZAGG_RECYCLE_MAX_INVOCATIONS`` -- generation cap (template 8),
+      belt-and-suspenders for retention modes the RSS read misses (and the
+      only check that fires off-Linux, where RSS reads are None).
+
+    Emits one CloudWatch-searchable line (``ZAGG_SELF_RECYCLE ...``) before
+    exiting so dashboards can split intentional recycles from real crashes
+    (metric-filter note in docs/deployment/lambda.md).
+    """
+    rss_limit = _recycle_limit("ZAGG_RECYCLE_RSS_MB")
+    gen_limit = _recycle_limit("ZAGG_RECYCLE_MAX_INVOCATIONS")
+    kib = _read_vmrss_kib()
+    rss_mb = kib / 1024.0 if kib is not None else None
+    generation = _INVOCATIONS_SERVED
+    if rss_limit > 0 and rss_mb is not None and rss_mb >= rss_limit:
+        threshold = rss_limit
+    elif gen_limit > 0 and generation >= gen_limit:
+        threshold = gen_limit
+    else:
+        return
+    rss_repr = f"{rss_mb:.0f}" if rss_mb is not None else "n/a"
+    logger.info(
+        f"ZAGG_SELF_RECYCLE rss_mb={rss_repr} generation={generation} threshold={threshold:g}"
+    )
+    _exit(0)
+
+
 def _max_memory_mb() -> float:
     """Peak resident set size of this worker in MB (issue #120).
 
@@ -366,16 +434,27 @@ def lambda_handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
     # result_url for it to poll. Covers every branch (200 / 400 / 500) of both
     # per-unit handlers (spatial process, temporal process_event -- #12 Phase 8).
     if event.get("result_url"):
-        _write_result(event["result_url"], response, event)
+        mirrored = _write_result(event["result_url"], response, event)
+        # Self-recycle strictly AFTER a successful result mirror (issue #171):
+        # the orchestrator polls the result object, not the Lambda response
+        # (#151/#153), so at this point the invocation is complete from the
+        # run's perspective and destroying a bloated sandbox loses nothing.
+        # Sync invokes never reach here (no result_url) -- exiting would lose
+        # their response -- and a failed mirror skips the recycle (the shard
+        # is recorded failed at the poll deadline; don't also churn the
+        # sandbox on what may be a transient S3 fault).
+        if mirrored:
+            _maybe_self_recycle()
     return response
 
 
-def _write_result(result_url: str, response: Dict[str, Any], event: Dict[str, Any]) -> None:
+def _write_result(result_url: str, response: Dict[str, Any], event: Dict[str, Any]) -> bool:
     """Write the response envelope to ``result_url`` as JSON (issue #151).
 
     Uses the same credentials/endpoint resolution as the output store. Never
     raises: on failure the orchestrator's poll times out and records the shard
-    as failed, and the cause lands here in CloudWatch.
+    as failed, and the cause lands here in CloudWatch. Returns True only when
+    the write landed -- the self-recycle gate (issue #171) keys on it.
     """
     import obstore
 
@@ -386,8 +465,10 @@ def _write_result(result_url: str, response: Dict[str, Any], event: Dict[str, An
         store = open_object_store(prefix, **_output_store_kwargs(event))
         obstore.put(store, key, json.dumps(response).encode())
         logger.info(f"Wrote async result to {result_url}")
+        return True
     except Exception as e:
         logger.error(f"Failed to write async result to {result_url}: {e}")
+        return False
 
 
 def _handle_extract(event: Dict[str, Any], context: Any) -> Dict[str, Any]:

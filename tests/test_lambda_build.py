@@ -201,6 +201,19 @@ class TestTemplateEnvironment:
         assert params["MallocArenaMax"]["Default"] == "2"
         assert params["MallocTrimThreshold"]["Default"] == "0"
 
+    def test_self_recycle_env_defaults(self):
+        # issue #171: the worker self-recycle knobs ride the function
+        # environment with template defaults (1400 MB on the 2047 MB cap --
+        # ~650 MB of headroom over the observed ~700-1100 MB/invocation
+        # retention -- and a generation cap of 8 as belt-and-suspenders).
+        tpl = self._load_template()
+        params = tpl["Parameters"]
+        assert params["RecycleRssMb"]["Default"] == "1400"
+        assert params["RecycleMaxInvocations"]["Default"] == "8"
+        env = tpl["Resources"]["ProcessFn"]["Properties"]["Environment"]["Variables"]
+        assert env["ZAGG_RECYCLE_RSS_MB"] == {"Ref": "RecycleRssMb"}
+        assert env["ZAGG_RECYCLE_MAX_INVOCATIONS"] == {"Ref": "RecycleMaxInvocations"}
+
     def test_execution_role_grants_zagg_index_store(self):
         # issue #160: inline write-back + sidecar reads target the public
         # zagg-index prefix; the shared execution role gets Get/Put scoped to

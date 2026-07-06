@@ -101,6 +101,32 @@ Parameters:
       trims freed top-of-heap back to the OS immediately, independently
       flattening warm-container memory growth. Set empty to fall back to the glibc default (the key is still emitted, just empty).
 
+  RecycleRssMb:
+    Type: String
+    Default: "1400"
+    Description: >-
+      ZAGG_RECYCLE_RSS_MB for the worker self-recycle (issue #171): after an
+      async invocation's result is safely mirrored to its result_url, the
+      handler exits the sandbox when current RSS meets/exceeds this many MB,
+      forcing the next invocation cold instead of ratcheting toward OOM
+      (issue #169 observed ~700-1100 MB retained per heavy invocation on a
+      2047 MB cap; 1400 leaves ~650 MB of headroom so the triggering
+      invocation itself still completes). The self-exit is AFTER the result
+      write, so the run loses nothing; it shows up as a runtime failure in
+      CloudWatch error metrics only (cosmetic -- the result object is the
+      source of truth, and MaximumRetryAttempts is 0). Set "0" or empty to
+      disable the RSS check.
+
+  RecycleMaxInvocations:
+    Type: String
+    Default: "8"
+    Description: >-
+      ZAGG_RECYCLE_MAX_INVOCATIONS for the worker self-recycle (issue #171):
+      belt-and-suspenders generation cap -- recycle the sandbox (same
+      after-result-mirror mechanics as RecycleRssMb) once it has served this
+      many invocations, bounding retention modes the RSS check misses. Set
+      "0" or empty to disable the generation check.
+
 Conditions:
   ShouldCreateBucket: !Equals [!Ref CreateOutputBucket, "true"]
   ShouldCreateRole: !Equals [!Ref CreateExecutionRole, "true"]
@@ -178,6 +204,8 @@ Resources:
         Variables:
           MALLOC_ARENA_MAX: !Ref MallocArenaMax
           MALLOC_TRIM_THRESHOLD_: !Ref MallocTrimThreshold
+          ZAGG_RECYCLE_RSS_MB: !Ref RecycleRssMb
+          ZAGG_RECYCLE_MAX_INVOCATIONS: !Ref RecycleMaxInvocations
       Code:
         S3Bucket: !Ref ArtifactBucket
         S3Key: !Ref FunctionS3Key
@@ -222,6 +250,8 @@ Resources:
         Variables:
           MALLOC_ARENA_MAX: !Ref MallocArenaMax
           MALLOC_TRIM_THRESHOLD_: !Ref MallocTrimThreshold
+          ZAGG_RECYCLE_RSS_MB: !Ref RecycleRssMb
+          ZAGG_RECYCLE_MAX_INVOCATIONS: !Ref RecycleMaxInvocations
       Code:
         S3Bucket: !Ref ArtifactBucket
         S3Key: !Ref FunctionS3Key
