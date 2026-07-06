@@ -209,8 +209,11 @@ def validate_index_config(index_cfg: Any, data_source: dict | None = None) -> No
 def index_from_config(config) -> VirtualIndex:
     """Construct the configured backend from a ``PipelineConfig``.
 
-    An absent ``data_source.index`` block is the zero-change upgrade path:
-    today's hierarchical read, byte-identical.
+    An absent ``data_source.index`` block is (still) the zero-change path:
+    today's hierarchical read, byte-identical. The issue #170 default flip
+    to ``inline`` lands as ONE unconditional change (espg call on the #170
+    thread, 2026-07-06) once the compiled full-read route makes ``inline``
+    serve read-plan-less (flat) data sources too.
     """
     index_cfg = (config.data_source or {}).get("index")
     if index_cfg is None:
