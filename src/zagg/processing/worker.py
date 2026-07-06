@@ -303,8 +303,12 @@ def process_shard(
             # the granule's data is already in ``all_reads``.
             try:
                 index_backend.finish_granule(h5obj, s3_url)
-            except Exception:
-                logger.warning(f"  index backend finish_granule failed for {s3_url}", exc_info=True)
+            except Exception as e:
+                # Inline the reason instead of ``exc_info=True`` (the sibling
+                # tolerated-warning style above): a folded traceback in the
+                # log would trip the WorkerErrorCount metric filter (issue
+                # #175) on a path that never fails the read.
+                logger.warning(f"  index backend finish_granule failed for {s3_url}: {e}")
 
             files_processed += 1
             if buffered is not None:
