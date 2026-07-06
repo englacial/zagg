@@ -59,6 +59,10 @@ RECORD_COLUMNS = [
     # predate the codec axis, so the renderer splits new (codec.notna) from frozen
     # (codec.isna) series on this column.
     "codec",
+    # Read-axis label (issue #170): "cached" on the sidecar-read companion
+    # targets, None otherwise. Keeps the cached column out of the inner
+    # codec slot in the renderer; legacy rows read back NaN and key on codec.
+    "read",
 ]
 
 
@@ -163,6 +167,7 @@ def build_record(
         # The ShardingCodec A/B label (issue #133), carried in by run_benchmark from
         # the target. None on targets that don't set it (legacy/frozen rows).
         "codec": context.get("codec"),
+        "read": context.get("read"),
     }
     return record
 

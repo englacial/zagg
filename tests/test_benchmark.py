@@ -123,16 +123,22 @@ def test_build_record_max_memory_null_safe():
 
 
 def test_codec_column_is_last_and_threaded(monkeypatch):
-    # The codec A/B label (issue #133) is the newest schema column -> appended LAST
-    # (stable-schema rule), threaded from context, and null on rows that omit it
-    # (legacy/frozen).
-    assert bench_metrics.RECORD_COLUMNS[-1] == "codec"
+    # Stable-schema rule: new columns append LAST. The read axis (issue #170)
+    # is now the newest column; codec (issue #133) sits just before it. Both
+    # are threaded from context and null on rows that omit them (legacy/frozen).
+    assert bench_metrics.RECORD_COLUMNS[-1] == "read"
+    assert bench_metrics.RECORD_COLUMNS[-2] == "codec"
     g = HealpixGrid(parent_order=11, child_order=19)
     rec = bench_metrics.build_record(_summary(), grid=g, context={"codec": "sharded"})
     assert rec["codec"] == "sharded"
     # Absent in context -> null (a frozen/legacy row carries no codec).
+    cached = bench_metrics.build_record(
+        _summary(), grid=g, context={"codec": "inner", "read": "cached"}
+    )
+    assert cached["read"] == "cached"
     legacy = bench_metrics.build_record(_summary(), grid=g, context={"target": "t"})
     assert legacy["codec"] is None
+    assert legacy["read"] is None
 
 
 def test_run_target_threads_codec_into_record():
@@ -1415,6 +1421,35 @@ def _full_codec_matrix(commit):
     ]
 
 
+def _cached_row(commit, order):
+    # Issue #170 cached-read companion: codec stays "inner" (it still drives
+    # output.grid.sharded); the read axis is what slots it into the third
+    # renderer column. Built through bench_metrics.build_record so the test
+    # pins the WHOLE pipe -- ctx -> record -> frame -> layout (the first fold
+    # of this finding wired the layout but dropped the key in the record).
+    import bench_metrics
+
+    ctx = dict(
+        timestamp=f"2026-01-01T00:00:0{len(commit) % 10}Z",
+        commit=commit,
+        ref="main",
+        event="merge",
+        target=f"tdigest_healpix_{order}_cached",
+        aggregator="tdigest",
+        grid_type="healpix",
+        grid_size=order,
+        shard_key=0,
+        codec="inner",
+        read="cached",
+    )
+    g = HealpixGrid(parent_order=int(order[1:]), child_order=19)
+    return bench_metrics.build_record(
+        {"lambda_time_s": 200.0, "estimated_cost_usd": 0.005, "max_memory_mb": 1200.0},
+        grid=g,
+        context=ctx,
+    )
+
+
 def test_codec_layout_is_fixed_2x3_sharded_inner_by_order():
     import plot_series
 
@@ -1427,6 +1462,26 @@ def test_codec_layout_is_fixed_2x3_sharded_inner_by_order():
         ["tdigest_healpix_o9_sharded", "tdigest_healpix_o9_inner", None],
         ["tdigest_healpix_o10_sharded", "tdigest_healpix_o10_inner", None],
         ["tdigest_healpix_o11_sharded", "tdigest_healpix_o11_inner", None],
+    ]
+    # With cached rows present (issue #170), each lands in its own column and
+    # the real inner target keeps its slot -- the cached companion shares
+    # codec "inner", so a regression here silently overwrites the inner panel.
+    hist = update_series.records_to_frame(
+        _full_codec_matrix("c0") + [_cached_row("c0", o) for o in ("o9", "o10", "o11")]
+    )
+    grid, _, _ = plot_series._codec_layout(hist)
+    assert grid == [
+        ["tdigest_healpix_o9_sharded", "tdigest_healpix_o9_inner", "tdigest_healpix_o9_cached"],
+        [
+            "tdigest_healpix_o10_sharded",
+            "tdigest_healpix_o10_inner",
+            "tdigest_healpix_o10_cached",
+        ],
+        [
+            "tdigest_healpix_o11_sharded",
+            "tdigest_healpix_o11_inner",
+            "tdigest_healpix_o11_cached",
+        ],
     ]
 
 
