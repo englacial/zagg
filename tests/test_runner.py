@@ -2211,6 +2211,7 @@ def _run_lambda_with_durations(
     profile=False,
     phase_timings=None,
     memories=None,
+    **run_kwargs,
 ):
     """Drive ``_run_lambda`` over synthetic per-cell durations.
 
@@ -2284,6 +2285,7 @@ def _run_lambda_with_durations(
         region="us-west-2",
         function_name="process-shard",
         profile=profile,
+        **run_kwargs,
     )
 
 
@@ -2386,6 +2388,81 @@ class TestGetFunctionTimeout:
                 return {"Timeout": "not-a-number"}
 
         assert _get_function_timeout_s(_Client(), "process-shard") == _DEFAULT_FUNCTION_TIMEOUT_S
+
+
+class TestForceCold:
+    """``force_cold`` (issue #171): merge a per-run ``ZAGG_COLD_EPOCH`` env
+    marker pre-fan-out so every warm sandbox is invalidated, preserving the
+    existing environment; failures raise instead of degrading to warm."""
+
+    @staticmethod
+    def _client(env=None, statuses=("InProgress", "Successful")):
+        from unittest.mock import MagicMock
+
+        client = MagicMock()
+        # First get_function_configuration read returns the environment; the
+        # poll loop's reads consume ``statuses`` one per call.
+        responses = iter(
+            [{"Environment": {"Variables": dict(env or {})}}]
+            + [{"LastUpdateStatus": s} for s in statuses]
+        )
+        client.get_function_configuration.side_effect = lambda **k: next(responses)
+        return client
+
+    def test_merges_marker_and_preserves_env(self):
+        from zagg.runner import _force_cold_containers
+
+        client = self._client(env={"MALLOC_ARENA_MAX": "2"})
+        _force_cold_containers(client, "process-shard", poll_interval_s=0)
+        (_, kwargs) = client.update_function_configuration.call_args
+        sent = kwargs["Environment"]["Variables"]
+        assert sent["MALLOC_ARENA_MAX"] == "2"
+        assert len(sent["ZAGG_COLD_EPOCH"]) == 32  # uuid4 hex, unique per run
+        assert kwargs["FunctionName"] == "process-shard"
+
+    def test_raises_when_update_denied(self):
+        import pytest
+
+        from zagg.runner import _force_cold_containers
+
+        client = self._client()
+        client.update_function_configuration.side_effect = RuntimeError("AccessDenied")
+        with pytest.raises(RuntimeError, match="UpdateFunctionConfiguration"):
+            _force_cold_containers(client, "process-shard", poll_interval_s=0)
+
+    def test_raises_on_failed_update(self):
+        import pytest
+
+        from zagg.runner import _force_cold_containers
+
+        client = self._client(statuses=("Failed",))
+        with pytest.raises(RuntimeError, match="LastUpdateStatus=Failed"):
+            _force_cold_containers(client, "process-shard", poll_interval_s=0)
+
+    def test_raises_when_update_never_lands(self):
+        import pytest
+
+        from zagg.runner import _force_cold_containers
+
+        client = self._client(statuses=("InProgress",) * 50)
+        with pytest.raises(RuntimeError, match="warm containers"):
+            _force_cold_containers(client, "process-shard", wait_s=0, poll_interval_s=0)
+
+    def test_run_lambda_forces_cold_before_dispatch(self, monkeypatch, atl06_config):
+        from zagg import runner
+
+        calls = []
+        monkeypatch.setattr(runner, "_force_cold_containers", lambda client, fn: calls.append(fn))
+        _run_lambda_with_durations(monkeypatch, atl06_config, [1.0, 2.0, 3.0, 4.0], force_cold=True)
+        assert calls == ["process-shard"]
+
+    def test_default_run_never_touches_configuration(self, monkeypatch, atl06_config):
+        from zagg import runner
+
+        calls = []
+        monkeypatch.setattr(runner, "_force_cold_containers", lambda client, fn: calls.append(fn))
+        _run_lambda_with_durations(monkeypatch, atl06_config, [1.0, 2.0, 3.0, 4.0])
+        assert calls == []
 
 
 class TestProfilePlumbing:

@@ -93,6 +93,7 @@ def agg(
     profile: bool = False,
     max_retries: int = 3,
     invocation: str = "async",
+    force_cold: bool = False,
     events=None,
 ) -> dict:
     """Run the aggregation pipeline.
@@ -176,6 +177,21 @@ def agg(
         ``"sync"`` for older deployed workers or extreme per-cell payloads
         (granule-dense shards with large AOI masks). Ignored by the
         ``"local"`` backend.
+    force_cold : bool
+        Lambda-only (issue #171). When ``True``, merge a per-run
+        ``ZAGG_COLD_EPOCH`` marker into the function's environment before
+        fan-out and wait for the update to apply -- any configuration change
+        invalidates every warm sandbox, so each worker starts on a fresh
+        container. Guards against the warm-container RSS ratchet (issues
+        #139/#169): consecutive fleet runs reuse sandboxes that retain memory
+        across invocations and can OOM within a few generations. Existing
+        environment variables (e.g. the issue #143 malloc tunables) are
+        preserved. Requires ``lambda:GetFunctionConfiguration`` and
+        ``lambda:UpdateFunctionConfiguration`` on the caller, and raises --
+        rather than silently degrading to warm containers -- when the update
+        cannot be applied. Costs one config-update round trip plus a few
+        seconds of cold init per container. Default ``False``: no config
+        touch, byte-identical dispatch. Ignored by the ``"local"`` backend.
 
     events : iterable, optional
         Temporal pipeline only (``pipeline.type: temporal``/``event``), one
@@ -217,6 +233,7 @@ def agg(
         profile=profile,
         max_retries=max_retries,
         invocation=invocation,
+        force_cold=force_cold,
         events=events,
     )
 
@@ -251,6 +268,7 @@ class SpatialStrategy:
         profile=False,
         max_retries=3,
         invocation="async",
+        force_cold=False,
         events=None,
     ):
         # Resolve catalog and store
@@ -337,6 +355,7 @@ class SpatialStrategy:
                 profile=profile,
                 max_retries=max_retries,
                 invocation=invocation,
+                force_cold=force_cold,
             )
         else:
             raise ValueError(f"Unknown backend: {backend!r} (expected 'local' or 'lambda')")
@@ -378,6 +397,7 @@ class TemporalStrategy:
         profile=False,
         max_retries=3,
         invocation="async",
+        force_cold=False,
         events=None,
     ):
         from zagg.temporal import process_event, specs_from_config
@@ -420,6 +440,7 @@ class TemporalStrategy:
                 output_endpoint_url=output_endpoint_url,
                 max_retries=max_retries,
                 invocation=invocation,
+                force_cold=force_cold,
             )
 
         if max_workers is None:
@@ -541,6 +562,7 @@ def _run_lambda_events(
     output_endpoint_url=None,
     max_retries=3,
     invocation="async",
+    force_cold=False,
 ):
     """Fan the temporal pipeline out one event per Lambda invoke (issue #12, Phase 8).
 
@@ -657,6 +679,8 @@ def _run_lambda_events(
             config=boto_config,
         )
         state["function_timeout_s"] = _get_function_timeout_s(state["lambda_client"], function_name)
+        if force_cold:
+            _force_cold_containers(state["lambda_client"], function_name)
         return PreflightReport(workers=clamped, detail=concurrency_report)
 
     def _event_work(ev):
@@ -1182,6 +1206,7 @@ def _run_lambda(
     profile=False,
     max_retries=3,
     invocation="async",
+    force_cold=False,
 ):
     """Run processing via AWS Lambda invocation.
 
@@ -1304,6 +1329,8 @@ def _run_lambda(
         # Read the function Timeout once, pre-fan-out: the async poll deadline
         # is keyed to it (issue #151), and the summary reports it (#100).
         state["function_timeout_s"] = _get_function_timeout_s(state["lambda_client"], function_name)
+        if force_cold:
+            _force_cold_containers(state["lambda_client"], function_name)
         return PreflightReport(workers=clamped, detail=concurrency_report)
 
     # Per-cell invoke, bound to everything but the (shard_key, records) pair so
@@ -1875,6 +1902,62 @@ def _poll_lambda_result(
             }
         # Sub-second jitter de-synchronizes the fan-out's poll bursts.
         time.sleep(poll_interval_s + (time.time() % 1))
+
+
+def _force_cold_containers(lambda_client, function_name, *, wait_s=120, poll_interval_s=2.0):
+    """Invalidate every warm sandbox before fan-out (issue #171).
+
+    Warm containers retain process RSS across invocations (the #139/#169
+    ratchet), so consecutive fleet runs inherit dirty sandboxes that OOM
+    within a few generations. Any function-configuration change invalidates
+    all warm sandboxes at once: merge a per-run ``ZAGG_COLD_EPOCH`` marker
+    into the environment (preserving existing variables -- e.g. the issue
+    #143 malloc tunables) and wait for the update to apply before the first
+    invoke.
+
+    Unlike :func:`_get_function_timeout_s`, failures raise: the caller asked
+    for cold containers explicitly, so silently proceeding warm would defeat
+    the run's memory isolation.
+    """
+    token = uuid.uuid4().hex
+    env = dict(
+        (
+            lambda_client.get_function_configuration(FunctionName=function_name).get("Environment")
+            or {}
+        ).get("Variables")
+        or {}
+    )
+    env["ZAGG_COLD_EPOCH"] = token
+    try:
+        lambda_client.update_function_configuration(
+            FunctionName=function_name, Environment={"Variables": env}
+        )
+    except Exception as exc:
+        raise RuntimeError(
+            f"force_cold: updating {function_name} configuration failed ({exc}). The "
+            "caller needs lambda:GetFunctionConfiguration and "
+            "lambda:UpdateFunctionConfiguration; pass force_cold=False to dispatch "
+            "onto warm containers instead."
+        ) from exc
+    deadline = time.time() + wait_s
+    while True:
+        status = lambda_client.get_function_configuration(FunctionName=function_name).get(
+            "LastUpdateStatus"
+        )
+        if status == "Successful":
+            logger.info(f"force_cold: warm sandboxes invalidated (ZAGG_COLD_EPOCH={token})")
+            return
+        if status == "Failed":
+            raise RuntimeError(
+                f"force_cold: {function_name} configuration update failed server-side "
+                "(LastUpdateStatus=Failed); check the function state in the console"
+            )
+        if time.time() >= deadline:
+            raise RuntimeError(
+                f"force_cold: {function_name} configuration update still {status!r} "
+                f"after {wait_s}s; workers would reuse warm containers"
+            )
+        time.sleep(poll_interval_s)
 
 
 def _get_function_timeout_s(lambda_client, function_name):
