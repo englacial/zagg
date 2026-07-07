@@ -31,6 +31,11 @@ from zagg.grids.morton import is_morton_array, is_morton_arrow, morton_to_arrow,
 # path's ``async.concurrency`` budget (issue #108).
 _RAGGED_WRITE_CONCURRENCY = 128
 
+# Cap on the per-failure roll call logged when sharded CSR writes fail
+# (issue #186): enough to show the race signature across subgroups without
+# flooding CloudWatch when many of the K writes fail at once.
+_RAGGED_FAILURE_LOG_CAP = 20
+
 logger = logging.getLogger(__name__)
 
 
@@ -439,18 +444,20 @@ def _write_ragged_fanout(ragged_writes: list, store: Store, *, grid) -> None:
         # the operator — the worker envelope and CloudWatch both record only
         # this summary string — so log the first failure's full traceback
         # here, and carry its type + message in the summary text too. A
-        # bounded one-line-per-failure roll call makes the race signature
-        # ACROSS subgroups visible (which keys, same or different errors)
-        # without flooding the log when many of the K writes fail at once.
-        for key, exc in errors[:20]:
-            logger.error(f"  ragged (CSR) subgroup {key}: {type(exc).__name__}: {exc}")
-        if len(errors) > 20:
-            logger.error(f"  ... and {len(errors) - 20} more subgroup write failure(s)")
+        # bounded one-line-per-failure roll call (after the header, so the
+        # indented lines read as its continuation) makes the race signature
+        # ACROSS subgroups visible (which keys, same or different errors).
         logger.error(
             f"ragged (CSR) subgroup write failed (shard_key {first_key}): "
             f"{type(first_exc).__name__}: {first_exc}",
             exc_info=first_exc,
         )
+        if len(errors) > 1:
+            for key, exc in errors[:_RAGGED_FAILURE_LOG_CAP]:
+                logger.error(f"  ragged (CSR) subgroup {key}: {type(exc).__name__}: {exc}")
+            if len(errors) > _RAGGED_FAILURE_LOG_CAP:
+                n_more = len(errors) - _RAGGED_FAILURE_LOG_CAP
+                logger.error(f"  ... and {n_more} more subgroup write failure(s)")
         raise RuntimeError(
             f"ragged (CSR) write failed for {len(errors)} of {len(ragged_writes)} "
             f"subgroup(s) on the sharded path (first failing shard_key {first_key}: "
