@@ -135,6 +135,27 @@ class TestS3RetryConfig:
         _, kwargs = s3_cls.call_args
         assert kwargs["retry_config"] == custom
 
+    def test_explicit_none_gets_default(self, mock_s3):
+        """``retry_config=None`` means the zagg default, not obstore's
+        fast-burn default (a bare ``setdefault`` would let None through)."""
+        from zagg.store import _S3_RETRY_CONFIG
+
+        s3_cls, _ = mock_s3
+        open_store("s3://bucket/prefix.zarr", retry_config=None)
+        _, kwargs = s3_cls.call_args
+        assert kwargs["retry_config"] == _S3_RETRY_CONFIG
+
+    def test_default_not_aliased(self, mock_s3):
+        """Each store gets its own copy — mutating one store's config must
+        not edit the module-level default (nested ``backoff`` included)."""
+        from zagg.store import _S3_RETRY_CONFIG
+
+        s3_cls, _ = mock_s3
+        open_store("s3://bucket/prefix.zarr")
+        _, kwargs = s3_cls.call_args
+        assert kwargs["retry_config"] is not _S3_RETRY_CONFIG
+        assert kwargs["retry_config"]["backoff"] is not _S3_RETRY_CONFIG["backoff"]
+
     def test_default_paces_retries(self, tmp_path):
         """End-to-end through ``open_object_store`` against a local always-503
         endpoint: retries are paced by real exponential backoff (a small
@@ -188,6 +209,7 @@ class TestS3RetryConfig:
                 obstore.put(store, "zarr.json", b"{}")
         finally:
             srv.shutdown()
+            srv.server_close()
         # 1 initial request + exactly max_retries retries: the override reached
         # the client, which is the plumbing under test (backoff jitter is
         # uniform from zero, so per-gap timing floors would flake).

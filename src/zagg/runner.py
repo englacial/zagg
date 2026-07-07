@@ -20,6 +20,7 @@ import uuid
 import warnings
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import replace
+from datetime import timedelta
 
 from zarr import consolidate_metadata
 
@@ -1714,6 +1715,21 @@ _ASYNC_POLL_INTERVAL_S = 5.0
 # large strict-AOI ``aoi_payload`` (issue #101).
 _ASYNC_PAYLOAD_CAP_BYTES = 250 * 1024
 
+# The result poller owns its retrying at the loop level (a fetch every
+# _ASYNC_POLL_INTERVAL_S until the deadline), so its store gets a short
+# per-request policy instead of the paced store-level default (issue #186):
+# a 5xx during one fetch must not block for minutes and silently overrun the
+# poll deadline, which is only checked between fetches.
+_POLL_RETRY_CONFIG = {
+    "max_retries": 2,
+    "retry_timeout": timedelta(seconds=15),
+    "backoff": {
+        "init_backoff": timedelta(milliseconds=500),
+        "max_backoff": timedelta(seconds=2),
+        "base": 2,
+    },
+}
+
 
 def _result_fetcher(box, prefix, output_creds_event, region, key):
     """Zero-arg fetch closure for one shard's async result object (#151).
@@ -1729,7 +1745,7 @@ def _result_fetcher(box, prefix, output_creds_event, region, key):
     def fetch():
         store = box.get("store")
         if store is None:
-            kwargs = {"region": region}
+            kwargs = {"region": region, "retry_config": _POLL_RETRY_CONFIG}
             if output_creds_event:
                 kwargs["region"] = output_creds_event.get("region", region)
                 kwargs["credentials"] = output_creds_event

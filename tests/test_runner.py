@@ -794,6 +794,27 @@ class TestResultFetcher:
         assert fetch() == {"statusCode": 200, "body": "{}"}
         assert "store" in box  # built lazily, cached for subsequent cells
 
+    def test_poller_store_uses_short_retry_config(self, monkeypatch):
+        """The poller loop owns retrying (issue #186): its store must carry
+        the short ``_POLL_RETRY_CONFIG``, not the paced store-level default —
+        one fetch blocking for minutes would silently overrun the poll
+        deadline, which is only checked between fetches."""
+        import zagg.runner as runner
+
+        captured: dict = {}
+
+        def fake_open(prefix, **kwargs):
+            captured.update(kwargs)
+            return object()
+
+        monkeypatch.setattr(runner, "open_object_store", fake_open)
+        monkeypatch.setattr(runner, "_fetch_result", lambda store, key: None)
+        fetch = runner._result_fetcher(
+            {}, "s3://bucket/x.zarr.status/run1", None, "us-west-2", "1.json"
+        )
+        assert fetch() is None
+        assert captured["retry_config"] == runner._POLL_RETRY_CONFIG
+
 
 class TestMaxRetriesPassthrough:
     """`agg(max_retries=...)` threads the per-cell retry budget down to
