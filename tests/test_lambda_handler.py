@@ -222,6 +222,39 @@ class TestProcessEventDispatch:
         assert isinstance(body["max_memory_mb"], float)
         assert body["max_memory_mb"] > 0.0
 
+    def test_body_reports_cpu_seconds(self, handler_mod, monkeypatch):
+        """Issue #180 phase 3: every invocation stamps ``cpu_seconds`` (this
+        invocation's user+sys CPU across all threads) next to
+        ``max_memory_mb`` so the orchestrator can compute utilization =
+        cpu_seconds / duration_s per worker without CloudWatch access."""
+        event = _base_event(_healpix_config_dict())
+        event["child_order"] = 12
+        resp, _ = self._run(handler_mod, monkeypatch, event)
+        body = json.loads(resp["body"])
+        assert isinstance(body["cpu_seconds"], float)
+        assert body["cpu_seconds"] >= 0.0
+
+    def test_cpu_seconds_is_per_invocation_delta(self, handler_mod, monkeypatch):
+        """``os.times()`` is process-cumulative (a warm container keeps
+        accruing), so the stamped value must be the entry->stamp delta of
+        user+sys, never the raw counter."""
+        import os as _os
+
+        calls = {"n": 0}
+
+        def fake_times():
+            calls["n"] += 1
+            if calls["n"] == 1:  # the handler-entry snapshot
+                return _os.times_result((10.0, 5.0, 0.0, 0.0, 100.0))
+            return _os.times_result((12.5, 5.5, 0.0, 0.0, 103.0))
+
+        monkeypatch.setattr(handler_mod.os, "times", fake_times)
+        event = _base_event(_healpix_config_dict())
+        event["child_order"] = 12
+        resp, _ = self._run(handler_mod, monkeypatch, event)
+        body = json.loads(resp["body"])
+        assert body["cpu_seconds"] == pytest.approx(3.0)
+
 
 class TestReclaimMemory:
     """Issue #139: each invocation hands freed heap back to the OS at teardown so
