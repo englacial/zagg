@@ -105,6 +105,96 @@ class TestOpenS3Store:
         assert "credential_provider" not in kwargs
 
 
+class TestS3RetryConfig:
+    """Issue #186: S3 stores get a paced retry policy by default. obstore's
+    default (10 retries, 100 ms init backoff, uniform jitter) exhausts its whole
+    budget in ~2-4 s under a sustained 503 SlowDown burst — near-immediate
+    retries that amplify the throttle instead of riding it out."""
+
+    def test_default_retry_config_ambient(self, mock_s3):
+        from zagg.store import _S3_RETRY_CONFIG
+
+        s3_cls, _ = mock_s3
+        open_store("s3://bucket/prefix.zarr")
+        _, kwargs = s3_cls.call_args
+        assert kwargs["retry_config"] == _S3_RETRY_CONFIG
+
+    def test_default_retry_config_explicit_creds(self, mock_s3):
+        from zagg.store import _S3_RETRY_CONFIG
+
+        s3_cls, _ = mock_s3
+        creds = {"accessKeyId": "AKIA", "secretAccessKey": "secret"}
+        open_object_store("s3://bucket/foo.zarr.status/run1", credentials=creds)
+        _, kwargs = s3_cls.call_args
+        assert kwargs["retry_config"] == _S3_RETRY_CONFIG
+
+    def test_caller_override_wins(self, mock_s3):
+        s3_cls, _ = mock_s3
+        custom = {"max_retries": 2}
+        open_store("s3://bucket/prefix.zarr", retry_config=custom)
+        _, kwargs = s3_cls.call_args
+        assert kwargs["retry_config"] == custom
+
+    def test_default_paces_retries(self, tmp_path):
+        """End-to-end through ``open_object_store`` against a local always-503
+        endpoint: retries are paced by real exponential backoff (a small
+        override keeps the test fast; the default values are pinned above).
+        With obstore's default policy the same request burns 10 retries with
+        sub-second gaps."""
+        import http.server
+        import threading
+        import time
+        from datetime import timedelta
+
+        import obstore
+
+        times: list[float] = []
+
+        class SlowDown(http.server.BaseHTTPRequestHandler):
+            def do_PUT(self):
+                times.append(time.monotonic())
+                body = (
+                    b"<Error><Code>SlowDown</Code>"
+                    b"<Message>Please reduce your request rate.</Message></Error>"
+                )
+                self.send_response(503)
+                self.send_header("Content-Type", "application/xml")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+
+            def log_message(self, *args):
+                pass
+
+        srv = http.server.ThreadingHTTPServer(("127.0.0.1", 0), SlowDown)
+        threading.Thread(target=srv.serve_forever, daemon=True).start()
+        try:
+            store = open_object_store(
+                "s3://bkt/prefix",
+                credentials={"accessKeyId": "x", "secretAccessKey": "y"},
+                endpoint_url=f"http://127.0.0.1:{srv.server_address[1]}",
+                client_options={"allow_http": True},
+                retry_config={
+                    "max_retries": 2,
+                    "retry_timeout": timedelta(seconds=30),
+                    "backoff": {
+                        "init_backoff": timedelta(milliseconds=400),
+                        "max_backoff": timedelta(seconds=2),
+                        "base": 2,
+                    },
+                },
+            )
+            with pytest.raises(Exception, match="SlowDown|503|Server"):
+                obstore.put(store, "zarr.json", b"{}")
+        finally:
+            srv.shutdown()
+        # 1 initial request + exactly max_retries retries: the override reached
+        # the client, which is the plumbing under test (backoff jitter is
+        # uniform from zero, so per-gap timing floors would flake).
+        assert len(times) == 3
+        assert times[-1] - times[0] < 10
+
+
 class TestOpenObjectStore:
     """Raw obstore store for side-channel objects (issue #151): same path and
     credential handling as ``open_store``, but no Zarr wrapper."""
