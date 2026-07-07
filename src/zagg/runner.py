@@ -19,6 +19,7 @@ import time
 import uuid
 import warnings
 from concurrent.futures import ThreadPoolExecutor
+from dataclasses import replace
 
 from zarr import consolidate_metadata
 
@@ -964,6 +965,26 @@ def _resolve_urls(records: list, driver: str | None) -> list[str]:
     return [r[key] for r in records if r.get(key)]
 
 
+def _clamped_data_source(data_source: dict, n_granules: int) -> dict | None:
+    """Per-cell ``granule_workers`` clamp: ``min(K, n_granules)`` (issue #184).
+
+    The shardmap gives the dispatcher each cell's granule count up front, so a
+    2-granule cell never asks the worker for a 4-wide pool (the issue #185
+    default). Returns a shallow-copied ``data_source`` carrying the clamped
+    width when it is below the configured/default K, else ``None`` — the
+    caller then passes the shared config through untouched, keeping unclamped
+    cell payloads byte-identical. Just the simple ``min()`` policy; the
+    worker still resolves the value through its ``_granule_workers`` guard.
+    """
+    from zagg.processing.worker import _granule_workers
+
+    k = _granule_workers(data_source)
+    clamped = min(k, max(int(n_granules), 1))
+    if clamped == k:
+        return None
+    return {**data_source, "granule_workers": clamped}
+
+
 def _check_signature(grid, catalog_data: dict) -> None:
     """Refuse a ShardMap built for a different *spatial* grid than the run config.
 
@@ -1128,6 +1149,11 @@ def _run_local(
         extra = {}
         if aoi_by_shard:
             extra["aoi_payload"] = aoi_by_shard.get(int(shard_key))
+        # Per-cell granule_workers clamp (issue #184): min(K, n_granules), so
+        # a small cell doesn't spin idle reader threads; unclamped cells pass
+        # the shared config through untouched.
+        ds = _clamped_data_source(config.data_source, len(records))
+        cell_config = replace(config, data_source=ds) if ds is not None else config
         try:
             meta = _process_and_write(
                 shard_key,
@@ -1136,7 +1162,7 @@ def _run_local(
                 grid,
                 s3_creds,
                 zarr_store,
-                config,
+                cell_config,
                 driver=driver,
                 handoff=handoff,
                 **extra,
@@ -1369,6 +1395,11 @@ def _run_lambda(
                 result_box, result_prefix, output_creds_event, region, key
             )
             extra["poll_timeout_s"] = state["function_timeout_s"] + _ASYNC_POLL_MARGIN_S
+        # Per-cell granule_workers clamp (issue #184): the worker reads the
+        # width from the event's config, so the clamp rides a per-cell copy
+        # of it; unclamped cells send the shared config_dict byte-identical.
+        ds = _clamped_data_source(config.data_source, len(records))
+        cell_config_dict = {**config_dict, "data_source": ds} if ds is not None else config_dict
         return _invoke_lambda_cell(
             state["lambda_client"],
             grid.block_index(int(shard_key)),
@@ -1379,7 +1410,7 @@ def _run_lambda(
             store_path,
             s3_creds,
             function_name=function_name,
-            config_dict=config_dict,
+            config_dict=cell_config_dict,
             output_creds_event=output_creds_event,
             max_retries=max_retries,
             max_workers=state["workers"],
