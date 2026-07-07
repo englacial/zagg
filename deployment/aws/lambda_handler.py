@@ -777,6 +777,11 @@ def _handle_process(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
     # run, not the warm container's lifetime high-water. Stopped in ``finally``.
     rss_sampler = _PeakRSSSampler().start()
 
+    # Per-invocation CPU baseline (issue #180 phase 3): ``os.times()`` is
+    # process-cumulative (like ``ru_maxrss``), so snapshot at entry and diff at
+    # the telemetry stamp below for THIS invocation's user+sys seconds.
+    cpu_t0 = os.times()
+
     try:
         # Validate required parameters. ``child_order`` is HEALPix-specific and
         # only required once the grid is known to be HEALPix (checked below);
@@ -980,6 +985,17 @@ def _handle_process(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
         sampled_peak = rss_sampler.peak_mb
         metadata["max_memory_mb"] = (
             sampled_peak if sampled_peak is not None else metadata["container_hwm_mb"]
+        )
+
+        # Per-invocation CPU seconds (issue #180 phase 3): user+sys consumed by
+        # this invocation across ALL threads (``os.times()`` aggregates the
+        # process, so the granule/read pools' work is counted), diffed against
+        # the handler-entry snapshot. utilization = cpu_seconds / duration_s is
+        # the K-sweep A/B's vCPU-saturation signal, per invocation, without
+        # CloudWatch access.
+        cpu_t1 = os.times()
+        metadata["cpu_seconds"] = round(
+            (cpu_t1.user - cpu_t0.user) + (cpu_t1.system - cpu_t0.system), 3
         )
 
         # Log structured result
