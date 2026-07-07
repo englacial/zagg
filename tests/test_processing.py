@@ -5473,7 +5473,8 @@ class TestGranuleReadPool:
         for bad in (0, -1, 1.5, "2", True, False):
             with pytest.raises(ValueError, match="granule_workers"):
                 _granule_workers({"granule_workers": bad})
-        assert _granule_workers({}) == 1  # default: serial, today's behavior
+        # Default K=4, from the PR #183 K-sweep evidence (issue #185).
+        assert _granule_workers({}) == 4
         assert _granule_workers({"granule_workers": 3}) == 3
 
     def test_bad_granule_workers_fails_before_any_read(self, monkeypatch):
@@ -5488,9 +5489,11 @@ class TestGranuleReadPool:
         with pytest.raises(ValueError, match="granule_workers"):
             process_shard(_ReleaseGrid(), 0, ["s3://a"], s3_credentials={}, config=cfg)
 
-    def test_default_serial_never_touches_the_pool(self, monkeypatch):
-        # granule_workers absent -> the serial loop; the pool must not even be
-        # constructed, so the default path carries zero threading machinery.
+    def test_k1_never_touches_the_pool(self, monkeypatch):
+        # granule_workers: 1 -> the serial loop; the pool must not even be
+        # constructed, so the serial escape hatch carries zero threading
+        # machinery. (The default is 4 since issue #185 -- pooled -- so the
+        # serial guarantee is now opt-in rather than the default.)
         import zagg.processing.worker as worker_mod
 
         def exploding_pool(*a, **k):
@@ -5499,10 +5502,35 @@ class TestGranuleReadPool:
         monkeypatch.setattr(worker_mod, "ThreadPoolExecutor", exploding_pool)
         factory, _ = self._tagged_factory()
         self._patch_h5(monkeypatch, factory)
+        cfg = _release_cfg()
+        cfg.data_source["granule_workers"] = 1
         df_out, meta = process_shard(
-            _ReleaseGrid(), 0, ["s3://a", "s3://b"], s3_credentials={}, config=_release_cfg()
+            _ReleaseGrid(), 0, ["s3://a", "s3://b"], s3_credentials={}, config=cfg
         )
         assert meta["files_processed"] == 2
+
+    def test_default_output_identical_to_serial(self, monkeypatch):
+        # The new default (K=4, issue #185) folds in submission order, so a
+        # default-config run is byte-identical to an explicit serial one.
+        results = {}
+        for workers in (1, None):
+            factory, _ = self._tagged_factory(slow_urls=("s3://a",))
+            self._patch_h5(monkeypatch, factory)
+            cfg = _release_cfg()
+            if workers is not None:
+                cfg.data_source["granule_workers"] = workers
+            results[workers] = process_shard(
+                _ReleaseGrid(),
+                0,
+                ["s3://a", "s3://b", "s3://c"],
+                s3_credentials={},
+                config=cfg,
+            )
+        df_serial, meta_serial = results[1]
+        df_default, meta_default = results[None]
+        pd.testing.assert_frame_equal(df_serial, df_default)
+        for key in ("files_processed", "total_obs", "cells_with_data", "error"):
+            assert meta_serial[key] == meta_default[key]
 
     def test_pooled_output_identical_to_serial(self, monkeypatch):
         # Distinct per-granule data; the slowest granule is submitted FIRST so
