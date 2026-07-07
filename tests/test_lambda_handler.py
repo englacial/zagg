@@ -1442,6 +1442,25 @@ class TestSelfRecycle:
         assert "ZAGG_SELF_RECYCLE rss_mb=n/a async_served=1 generation=2 threshold=1" in caplog.text
         assert json.loads(resp["body"])["container_generation"] == 2  # telemetry: true gen
 
+    def test_failed_mirror_still_bills_recycle_budget(self, handler_mod, monkeypatch):
+        # Issue #177 review fold: a failed mirror skips the recycle itself
+        # (transient S3 fault -- don't also churn the sandbox), but the async
+        # invocation WAS served, so it must still burn the budget: with cap 2,
+        # a failed-mirror invoke plus one successful invoke recycles. (Billing
+        # only mirrored invokes would let a flaky mirror extend the sandbox
+        # past its cap -- the pre-#177 generation counter counted it too.)
+        calls = []
+        monkeypatch.setenv("ZAGG_RECYCLE_MAX_INVOCATIONS", "2")
+        monkeypatch.setattr(handler_mod, "_read_vmrss_kib", lambda: None)
+        outcomes = iter([False, True])
+        monkeypatch.setattr(handler_mod, "_write_result", lambda *a: next(outcomes))
+        self._spy_exit(handler_mod, monkeypatch, calls)
+        event = self._process_event(monkeypatch, result_url="s3://b/status/1.json")
+        handler_mod.lambda_handler(event, _context())
+        assert calls == []  # mirror failed: billed, but no recycle
+        handler_mod.lambda_handler(event, _context())
+        assert calls == [("exit", 0)]  # budget spent (2 >= 2), counting the failed one
+
     def test_disabled_by_default_and_by_zero(self, handler_mod, monkeypatch):
         # No env vars (and explicit "0") -> never recycles, however bloated:
         # a stack without the template defaults behaves exactly as pre-#171.

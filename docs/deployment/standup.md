@@ -32,10 +32,10 @@ to hand-assemble zips or wire up the IAM role yourself.
    `x86_64`) -- `lambda_layer_<arch>.zip` and
    `lambda_function_<arch>_py312.zip`.
 3. **Verifies the minor is actually staged and asks for confirmation.** The
-   layer key is HEAD-checked on the distribution bucket before any stack
-   call; an unstaged minor (e.g. one derived from a repo ahead of the last
-   release) fails fast with the staged minors listed, instead of surfacing
-   as a CloudFormation `NoSuchKey` rollback. The resolved bucket/keys/version
+   layer and function keys are HEAD-checked on the distribution bucket before
+   any stack call; an unstaged minor (e.g. one derived from a repo ahead of
+   the last release) fails fast with the staged minors listed, instead of
+   surfacing as a CloudFormation `NoSuchKey` rollback. The resolved bucket/keys/version
    are then echoed and the script prompts before deploying (pass `--yes` to
    skip the prompt in unattended runs).
 4. **Stages code into a same-region bucket if needed.** CloudFormation requires
