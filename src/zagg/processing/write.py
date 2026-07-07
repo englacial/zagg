@@ -7,6 +7,7 @@ Assembles the per-shard output carrier and writes it to the Zarr template
 stays acyclic.
 """
 
+import logging
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import numpy as np
@@ -29,6 +30,8 @@ from zagg.grids.morton import is_morton_array, is_morton_arrow, morton_to_arrow,
 # a serial loop dominated a t-digest shard's write time. 128 mirrors the dense
 # path's ``async.concurrency`` budget (issue #108).
 _RAGGED_WRITE_CONCURRENCY = 128
+
+logger = logging.getLogger(__name__)
 
 
 def _arrow_column(block: np.ndarray, sig: dict):
@@ -432,9 +435,19 @@ def _write_ragged_fanout(ragged_writes: list, store: Store, *, grid) -> None:
                 errors.append((futures[fut], exc))
     if errors:
         first_key, first_exc = errors[0]
+        # Observability (issue #186 ask 1): the chained cause never reaches
+        # the operator — the worker envelope and CloudWatch both record only
+        # this summary string — so log the first failure's full traceback
+        # here, and carry its type + message in the summary text too.
+        logger.error(
+            f"ragged (CSR) subgroup write failed (shard_key {first_key}): "
+            f"{type(first_exc).__name__}: {first_exc}",
+            exc_info=first_exc,
+        )
         raise RuntimeError(
             f"ragged (CSR) write failed for {len(errors)} of {len(ragged_writes)} "
-            f"subgroup(s) on the sharded path (first failing shard_key {first_key})"
+            f"subgroup(s) on the sharded path (first failing shard_key {first_key}: "
+            f"{type(first_exc).__name__}: {first_exc})"
         ) from first_exc
 
 
