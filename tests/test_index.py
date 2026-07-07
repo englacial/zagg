@@ -875,6 +875,68 @@ class TestSelectionReads:
         assert df is not None
         assert self.SELECTION_PATHS in calls  # the one batched selection read
 
+    def test_segment_variable_reads_bypass_readdatasets(self):
+        # issue #179 fold: the segment-level variable + link reads
+        # (_read_segment_broadcasts) ride the same read_fn seam on the
+        # planned route — fully compiled under inline, rows identical to
+        # hierarchical.
+        ds = _fixture_data_source()
+        ds["levels"]["segments"]["variables"] = {
+            "seg_lat": "/{group}/geolocation/reference_photon_lat"
+        }
+        grid = _LeafSetGrid(_UNALIGNED_LEAVES)
+        h5obj = _open_fixture()
+        calls = self._record_read_datasets(h5obj)
+        df_i = InlineIndex().read_group(h5obj, "gt1l", ds, 1, grid)
+        assert calls == []
+        assert "seg_lat" in df_i.columns
+        df_h = HierarchicalIndex().read_group(_open_fixture(), "gt1l", ds, 1, grid)
+        pd.testing.assert_frame_equal(df_i, df_h)
+
+    def test_cross_level_filter_reads_bypass_readdatasets(self):
+        # issue #179 fold: cross-level (Phase B) coarse flag + link reads take
+        # the compiled, pooled seam too. The ne -1 predicate keeps every
+        # segment, so rows stay identical to hierarchical.
+        ds = _fixture_data_source()
+        ds["filters"] = ds["filters"] + [
+            {
+                "dataset": "/{group}/geolocation/segment_ph_cnt",
+                "op": "ne",
+                "value": -1,
+                "level": "segments",
+            }
+        ]
+        grid = _LeafSetGrid(_UNALIGNED_LEAVES)
+        h5obj = _open_fixture()
+        calls = self._record_read_datasets(h5obj)
+        df_i = InlineIndex().read_group(h5obj, "gt1l", ds, 1, grid)
+        assert calls == []
+        df_h = HierarchicalIndex().read_group(_open_fixture(), "gt1l", ds, 1, grid)
+        pd.testing.assert_frame_equal(df_i, df_h)
+
+    def test_full_read_fallback_keeps_compiled_route(self):
+        # issue #179 fold: plan.full_read (selectivity above threshold — 0.0
+        # forces it) defers to _read_group_full WITH the backend's read_fn,
+        # so the fallback stays compiled instead of dropping to serial h5coro.
+        # Baseline: the planned route at the default threshold — full-read and
+        # planned output is row-identical (#43 Phase C parity), and the
+        # hierarchical FULL-read route can't serve this shard at all (its mask
+        # starts on a chunk boundary, photon 512 — the PR #152 h5coro
+        # start-edge bug the compiled route is immune to).
+        ds = _fixture_data_source(
+            read_plan={"spatial_index": "segments", "pad": 1, "full_read_threshold": 0.0}
+        )
+        grid = _LeafSetGrid(_UNALIGNED_LEAVES)
+        h5obj = _open_fixture()
+        calls = self._record_read_datasets(h5obj)
+        df_i = InlineIndex().read_group(h5obj, "gt1l", ds, 1, grid)
+        assert calls == []
+        assert df_i is not None and len(df_i) > 0
+        df_h = HierarchicalIndex().read_group(
+            _open_fixture(), "gt1l", _fixture_data_source(), 1, grid
+        )
+        pd.testing.assert_frame_equal(df_i, df_h)
+
     def test_selection_dataset_degrades_alone(self, monkeypatch, caplog):
         # A selection dataset the compiled reader rejects degrades to the
         # h5coro decoder per dataset — same seam as the data reads (PR #173

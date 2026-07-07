@@ -485,9 +485,10 @@ class InlineIndex(VirtualIndex):
             _validate_planned_config(data_source)
         if self.write_back:
             # Deterministic write-back coverage (metadata-only, ~ms): built up
-            # front so routes that bypass the read seam — the ``full_read``
-            # selectivity fallback and empty-shard early returns — still
-            # contribute this group's datasets to the granule manifest.
+            # front so routes that bypass the read seam — empty-shard early
+            # returns (and, before issue #179 routed it through read_fn, the
+            # ``full_read`` selectivity fallback) — still contribute this
+            # group's datasets to the granule manifest.
             self._prebuild_group_maps(h5obj, group, data_source)
         read_fn = self._chunk_aligned_read_fn(h5obj, planned=planned)
         if planned:

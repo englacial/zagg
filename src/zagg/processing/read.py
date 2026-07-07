@@ -421,7 +421,11 @@ def _planned_read_group(
     if plan.full_read:
         # Selectivity above threshold: many small reads would still sum to most
         # of the file. Defer to the full-coord-read path; semantics identical.
-        return _read_group_full(h5obj, group, data_source, shard_key, grid, arrow=arrow)
+        # ``read_fn`` rides along (issue #179): the fallback keeps the compiled
+        # + pooled addressing instead of dropping to serial h5coro.
+        return _read_group_full(
+            h5obj, group, data_source, shard_key, grid, arrow=arrow, read_fn=read_fn
+        )
 
     return _execute_plan_group(
         h5obj, group, data_source, shard_key, grid, plan, n_base, arrow, read_fn=read_fn
@@ -448,8 +452,10 @@ def _execute_plan_group(
     computed (:func:`_planned_read_group`'s geolocation-rate mortie mask, or the
     a-priori chunk-boundary plan of issue #148 arm 2a). ``read_fn`` overrides
     the h5coro hyperslice callback (the a-priori path substitutes one that works
-    around h5coro's chunk-aligned-start B-tree bug); ``None`` uses the plain
-    ``readDatasets`` bridge.
+    around h5coro's chunk-aligned-start B-tree bug) and also serves the
+    cross-level coarse-filter reads and segment-level broadcasts (issue #179 —
+    the whole planned read is one addressing seam); ``None`` uses the plain
+    ``readDatasets`` bridge throughout.
     """
     coordinates = data_source["coordinates"]
     variables = data_source["variables"]
@@ -536,7 +542,18 @@ def _execute_plan_group(
             cf_flag_path = f["dataset"].format(group=group)
             cf_ibeg_path = cf_link["index_beg"].format(group=group)
             cf_cnt_path = cf_link["count"].format(group=group)
-            cf_data = h5obj.readDatasets([cf_flag_path, cf_ibeg_path, cf_cnt_path])
+            # Coarse flag + link arrays through the same compiled, pooled
+            # seam as the selection reads (issue #179); ``read_fn is None``
+            # keeps the batched h5coro read byte-identical.
+            cf_paths = [cf_flag_path, cf_ibeg_path, cf_cnt_path]
+            if read_fn is None:
+                cf_data = h5obj.readDatasets(cf_paths)
+            else:
+                cf_data = _read_paths_pooled(
+                    [(p, None) for p in dict.fromkeys(cf_paths)],
+                    lambda p, dt: read_fn(p),
+                    workers,
+                )
             cf_flag = cf_data[cf_flag_path]
             cf_ibeg = cf_data[cf_ibeg_path]
             cf_cnt = cf_data[cf_cnt_path]
@@ -554,8 +571,12 @@ def _execute_plan_group(
     # Segment-level variables (issue #30): read each declared non-base-level
     # variable and broadcast it to a base-rate per-photon column (length n_base),
     # then subset to the concatenated planned indices so it lines up with the
-    # base-rate variables before the spatial / keep masks below.
-    seg_broadcasts = _read_segment_broadcasts(h5obj, group, data_source, levels, n_base)
+    # base-rate variables before the spatial / keep masks below. ``read_fn``
+    # rides along (issue #179) so the coarse variable + link reads keep the
+    # compiled addressing; ``None`` keeps the serial h5coro path.
+    seg_broadcasts = _read_segment_broadcasts(
+        h5obj, group, data_source, levels, n_base, read_fn=read_fn
+    )
     if seg_broadcasts:
         seg_global_idx = np.concatenate(
             [np.arange(s, e, dtype=np.int64) for s, e in plan.base_slices]
