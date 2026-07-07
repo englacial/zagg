@@ -148,7 +148,7 @@ def _open_s3_store(
         # Interactive read population: fail fast on a dead endpoint (comment
         # on the constant). Set here so _s3_object_store's write-policy
         # default doesn't kick in; an explicit caller retry_config still wins.
-        kwargs["retry_config"] = copy.deepcopy(_S3_READONLY_RETRY_CONFIG)
+        kwargs["retry_config"] = _S3_READONLY_RETRY_CONFIG
     s3 = _s3_object_store(path, credentials=credentials, endpoint_url=endpoint_url, **kwargs)
     return ObjectStore(store=s3, read_only=read_only)
 
@@ -165,10 +165,13 @@ def _s3_object_store(
     bucket, prefix = parse_s3_path(path)
     region = kwargs.pop("region", "us-west-2")
     if kwargs.get("retry_config") is None:
-        # Deep copy so no store's kwargs alias the module default (obstore
-        # only reads it at construction, but a future mutation of one store's
-        # config must not edit the global).
-        kwargs["retry_config"] = copy.deepcopy(_S3_RETRY_CONFIG)
+        kwargs["retry_config"] = _S3_RETRY_CONFIG
+    # Deep copy unconditionally so no store's kwargs alias a module-level
+    # default — whichever seam it arrived through (here, the read-only branch
+    # in _open_s3_store, or a caller passing a constant like the runner's
+    # _POLL_RETRY_CONFIG). obstore only reads it at construction, but a
+    # future mutation of one store's config must not edit a shared global.
+    kwargs["retry_config"] = copy.deepcopy(kwargs["retry_config"])
 
     if credentials or endpoint_url:
         opts = {
@@ -191,6 +194,9 @@ def _s3_object_store(
         # Anonymous read of a public bucket: no credential provider —
         # Boto3CredentialProvider raises without ambient AWS credentials,
         # which anonymous environments (e.g. binder) lack by definition.
+        # Addressing style is deliberately left to obstore's default, exactly
+        # matching the construction the example notebooks used directly
+        # (unlike the credentialed branch, which pins path-style above).
         s3 = S3Store(bucket, prefix=prefix, region=region, **kwargs)
     else:
         from obstore.auth.boto3 import Boto3CredentialProvider
