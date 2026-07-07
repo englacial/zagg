@@ -324,12 +324,13 @@ def _planned_read_group(
     filter order — which matches the full-read path's row ordering because the
     plan's runs are emitted in increasing parent index.
 
-    ``read_fn`` is the base-rate addressing seam (issue #160), forwarded to
-    :func:`_execute_plan_group`: an index backend may supply its own reader
-    (e.g. ``inline``'s boundary-safe chunk-map reads); ``None`` (default) uses
-    the plain h5coro hyperslice bridge — today's path. Selection (the plan),
-    the coarse-level reads, and everything downstream of the returned columns
-    are identical regardless.
+    ``read_fn`` is the addressing seam (issue #160): an index backend may
+    supply its own reader (e.g. ``inline``'s boundary-safe chunk-map reads).
+    It serves the coarse selection reads here (issue #179 — compiled + pooled)
+    and is forwarded to :func:`_execute_plan_group` for the base-rate data
+    reads; ``None`` (default) uses the plain h5coro bridge — the hierarchical
+    baseline. Selection semantics (the plan) and everything downstream of the
+    returned columns are identical regardless.
     """
     levels = data_source["levels"]
     base_level_key = data_source["base_level"]
@@ -349,12 +350,28 @@ def _planned_read_group(
         )
     index_base = int(link.get("index_base", 0))
 
-    # Read coarse-level coordinates + link arrays in one go (small — geolocation
-    # rate is ~30x lighter than photon rate on ATL03).
+    # Read coarse-level coordinates + link arrays (small — geolocation rate is
+    # ~30x lighter than photon rate on ATL03). With a backend-supplied
+    # ``read_fn`` these selection reads take the same compiled, pooled route as
+    # the data reads (issue #179): four independent full-dataset reads per
+    # group is exactly the fan-out the ``read_workers`` pool wants, and until
+    # now they were serial uncompiled h5coro on every backend — roughly half
+    # the read wall on dense shards. ``read_fn`` degrades per dataset inside
+    # the backend (inline) or falls the group back via ``on_miss`` (sidecar),
+    # so behavior on misses matches the data reads. ``None`` keeps the batched
+    # h5coro read byte-identical (the pinned hierarchical baseline).
     si_lat_path, si_lon_path = _level_coord_paths(si_lvl, group)
     ibeg_path = link["index_beg"].format(group=group)
     cnt_path = link["count"].format(group=group)
-    coarse_data = h5obj.readDatasets([si_lat_path, si_lon_path, ibeg_path, cnt_path])
+    selection_paths = [si_lat_path, si_lon_path, ibeg_path, cnt_path]
+    if read_fn is None:
+        coarse_data = h5obj.readDatasets(selection_paths)
+    else:
+        coarse_data = _read_paths_pooled(
+            [(p, None) for p in dict.fromkeys(selection_paths)],
+            lambda p, dt: read_fn(p),
+            _read_workers(data_source),
+        )
     coarse_lats = coarse_data[si_lat_path]
     coarse_lons = coarse_data[si_lon_path]
     ibeg_arr = coarse_data[ibeg_path]

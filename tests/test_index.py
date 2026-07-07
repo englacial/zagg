@@ -811,6 +811,97 @@ class TestInlineReadGroup:
             validate_index_config({"backend": "inline"}, ds)
 
 
+class TestSelectionReads:
+    """Issue #179 (folded into #180): the planned route's selection reads —
+    segment-rate geolocation coordinates + link arrays — go through the same
+    compiled, pooled ``read_fn`` seam as the data reads when an index backend
+    supplies one, and stay serial batched h5coro when it doesn't."""
+
+    SELECTION_PATHS = [
+        "/gt1l/geolocation/reference_photon_lat",
+        "/gt1l/geolocation/reference_photon_lon",
+        "/gt1l/geolocation/ph_index_beg",
+        "/gt1l/geolocation/segment_ph_cnt",
+    ]
+
+    @staticmethod
+    def _record_read_datasets(h5obj):
+        """Shadow ``h5obj.readDatasets`` with a delegating recorder."""
+        calls = []
+        orig = h5obj.readDatasets
+
+        def recorder(datasets, **kwargs):
+            calls.append(datasets)
+            return orig(datasets, **kwargs)
+
+        h5obj.readDatasets = recorder
+        return calls
+
+    def test_inline_selection_reads_bypass_readdatasets(self):
+        # With the inline backend every dataset of a planned group read —
+        # selection AND data — is served by the compiled route; the uncompiled
+        # ``readDatasets`` API is never touched, and rows stay identical to
+        # the hierarchical baseline.
+        ds = _fixture_data_source()
+        grid = _LeafSetGrid(_UNALIGNED_LEAVES)
+        h5obj = _open_fixture()
+        calls = self._record_read_datasets(h5obj)
+        df_i = InlineIndex().read_group(h5obj, "gt1l", ds, 1, grid)
+        assert calls == []
+        df_h = HierarchicalIndex().read_group(_open_fixture(), "gt1l", ds, 1, grid)
+        pd.testing.assert_frame_equal(df_i, df_h)
+
+    def test_inline_selection_reads_pooled_row_identical(self):
+        # The pooled selection reads (read_workers > 1 fans the 4 datasets
+        # across threads) key results by path, so completion order cannot
+        # perturb the plan or the output.
+        grid = _LeafSetGrid(_UNALIGNED_LEAVES)
+        df_serial = InlineIndex().read_group(
+            _open_fixture(), "gt1l", _fixture_data_source(read_workers=1), 1, grid
+        )
+        df_pooled = InlineIndex().read_group(
+            _open_fixture(), "gt1l", _fixture_data_source(read_workers=8), 1, grid
+        )
+        pd.testing.assert_frame_equal(df_serial, df_pooled)
+
+    def test_hierarchical_selection_reads_unchanged(self):
+        # No backend read_fn (the pinned uncached baseline): the selection
+        # reads keep the single batched ``readDatasets`` call, byte-for-byte.
+        ds = _fixture_data_source()
+        grid = _LeafSetGrid(_UNALIGNED_LEAVES)
+        h5obj = _open_fixture()
+        calls = self._record_read_datasets(h5obj)
+        df = HierarchicalIndex().read_group(h5obj, "gt1l", ds, 1, grid)
+        assert df is not None
+        assert self.SELECTION_PATHS in calls  # the one batched selection read
+
+    def test_selection_dataset_degrades_alone(self, monkeypatch, caplog):
+        # A selection dataset the compiled reader rejects degrades to the
+        # h5coro decoder per dataset — same seam as the data reads (PR #173
+        # convention) — and rows stay identical to hierarchical.
+        import logging
+
+        import h5coro_hidefix.manifest as hh_manifest
+
+        orig = hh_manifest.datasets_from_manifest
+        bad = "/gt1l/geolocation/reference_photon_lat"
+
+        def picky(columns):
+            if bad in set(columns["dataset"]):
+                raise ValueError("unsupported chunk table")
+            return orig(columns)
+
+        monkeypatch.setattr(hh_manifest, "datasets_from_manifest", picky)
+        ds = _fixture_data_source()
+        grid = _LeafSetGrid(_UNALIGNED_LEAVES)
+        with caplog.at_level(logging.WARNING, logger="zagg.index.inline"):
+            df_i = InlineIndex().read_group(_open_fixture(), "gt1l", ds, 1, grid)
+        df_h = HierarchicalIndex().read_group(_open_fixture(), "gt1l", ds, 1, grid)
+        pd.testing.assert_frame_equal(df_i, df_h)
+        warned = [r.message for r in caplog.records if "compiled decode unavailable" in r.message]
+        assert len(warned) == 1 and bad in warned[0]
+
+
 class TestInlineWorker:
     def _cfg(self, index=None):
         ds = _fixture_data_source(**({"index": index} if index else {}))
