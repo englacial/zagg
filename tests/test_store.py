@@ -176,6 +176,17 @@ class TestS3RetryConfig:
         _, kwargs = s3_cls.call_args
         assert kwargs["retry_config"] == custom
 
+    def test_anonymous_read_skips_credential_provider(self, mock_s3):
+        """``skip_signature=True`` (public bucket, e.g. the example notebooks
+        on binder) must not construct ``Boto3CredentialProvider`` — it raises
+        without ambient AWS credentials, which anonymous environments lack."""
+        s3_cls, prov_cls = mock_s3
+        open_store("s3://bucket/public.zarr", read_only=True, skip_signature=True)
+        _, kwargs = s3_cls.call_args
+        assert kwargs["skip_signature"] is True
+        assert "credential_provider" not in kwargs
+        prov_cls.assert_not_called()
+
     def test_default_not_aliased(self, mock_s3):
         """Each store gets its own copy — mutating one store's config must
         not edit the module-level default (nested ``backoff`` included)."""

@@ -634,7 +634,9 @@ class TestTemporalReader:
         sentinel = xr.Dataset({"ais_mask": (("lat",), np.ones(2))}, coords={"lat": [0, 1]})
 
         monkeypatch.setattr(
-            obstore.store, "S3Store", lambda bucket, **o: captured.setdefault("bucket", bucket)
+            obstore.store,
+            "S3Store",
+            lambda bucket, **o: captured.update(bucket=bucket, opts=o) or None,
         )
 
         class _Bytes:
@@ -653,6 +655,11 @@ class TestTemporalReader:
         assert captured["key"] == "static/ais_mask.nc"
         assert captured["opened"] is True
         assert list(out.data_vars) == ["ais_mask"]
+        # Pure read of a static input: same short policy as the .zarr branch
+        # (issue #186) — not the 180 s write default.
+        from zagg.store import _S3_READONLY_RETRY_CONFIG
+
+        assert captured["opts"]["retry_config"] == _S3_READONLY_RETRY_CONFIG
 
     def test_read_temporal_inputs_squeezes_single_var_static(self, monkeypatch):
         xr = pytest.importorskip("xarray")

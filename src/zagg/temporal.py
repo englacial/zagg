@@ -525,11 +525,17 @@ def open_dataset(uri, *, credentials=None, endpoint_url=None, region="us-west-2"
 
     import obstore
 
-    from .store import open_object_store, parse_s3_path
+    from .store import _S3_READONLY_RETRY_CONFIG, open_object_store, parse_s3_path
 
     bucket, key = parse_s3_path(uri)
+    # Pure read of a static input: same failure-latency policy as the .zarr
+    # branch above (open_object_store has no read_only concept, issue #186).
     store = open_object_store(
-        f"s3://{bucket}", credentials=credentials, endpoint_url=endpoint_url, region=region
+        f"s3://{bucket}",
+        credentials=credentials,
+        endpoint_url=endpoint_url,
+        region=region,
+        retry_config=_S3_READONLY_RETRY_CONFIG,
     )
     payload = obstore.get(store, key).bytes()
     return xr.open_dataset(io.BytesIO(bytes(payload)))
