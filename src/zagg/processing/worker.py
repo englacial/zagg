@@ -52,11 +52,16 @@ logger = logging.getLogger(__name__)
 def _granule_workers(data_source: dict) -> int:
     """``data_source.granule_workers``: granules in flight per shard (issue #180).
 
-    Default **1** — today's serial granule loop, byte-identical (opt-in until
-    the fleet A/B picks a default, same measure-then-flip discipline as #170's
-    ``read_workers``). Validated at submission (``validate_config``) and
-    re-checked here with the same int>=1 / bool-trap guard so hand-rolled
-    worker payloads fail loudly before any read.
+    Default **4** — picked from the PR #183 K-sweep fleet A/B (issue #185:
+    K=4 inline read 296.9 s vs 0.17's 323 s median on the o9 NEON AOI; the
+    #170 measure-then-flip discipline, flipped). Output stays byte-identical
+    to serial by construction — results fold in submission order — the
+    default just no longer *executes* serially; ``1`` restores the serial
+    loop. Validated at submission (``validate_config``) and re-checked here
+    with the same int>=1 / bool-trap guard so hand-rolled worker payloads
+    fail loudly before any read. The dispatcher clamps each cell's width to
+    ``min(K, n_granules)`` (issue #184) so small shards don't spin idle
+    threads.
 
     Sizing note (review finding, PR #183): this pool composes multiplicatively
     with ``read_workers`` (and under ``sidecar`` its chunk-fetch pool too), so
@@ -65,7 +70,7 @@ def _granule_workers(data_source: dict) -> int:
     down as K rises, and watch ``read_errors`` (queueing + the 5 s timeout can
     surface as spurious read failures, not slowdowns) in the K-sweep A/B.
     """
-    w = data_source.get("granule_workers", 1)
+    w = data_source.get("granule_workers", 4)
     if isinstance(w, bool) or not isinstance(w, int) or w < 1:
         raise ValueError(f"data_source.granule_workers must be an integer >= 1 (got {w!r})")
     return w
