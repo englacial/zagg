@@ -191,30 +191,22 @@ class TestTemplateEnvironment:
         template = REPO_ROOT / "deployment" / "aws" / "template.yaml"
         return yaml.load(template.read_text(), Loader=_CfnLoader)
 
-    def test_process_fn_carries_malloc_tunables(self):
+    def test_process_fn_declares_runtime_env_vars(self):
+        # Existence-only (espg call, 2026-07-07): values/defaults are
+        # operator-tunable, and pinning them turned every tuning change into
+        # a test edit. What this still guards is the #144 failure class --
+        # an env var the deployed runtime consumes (glibc allocator tunables,
+        # #143; worker self-recycle knobs, #171) silently never reaching the
+        # function's Environment block.
         tpl = self._load_template()
         env = tpl["Resources"]["ProcessFn"]["Properties"]["Environment"]["Variables"]
-        assert env["MALLOC_ARENA_MAX"] == {"Ref": "MallocArenaMax"}
-        assert env["MALLOC_TRIM_THRESHOLD_"] == {"Ref": "MallocTrimThreshold"}
-
-    def test_malloc_parameters_have_expected_defaults(self):
-        params = self._load_template()["Parameters"]
-        assert params["MallocArenaMax"]["Default"] == "2"
-        assert params["MallocTrimThreshold"]["Default"] == "0"
-
-    def test_self_recycle_env_defaults(self):
-        # issue #171: the worker self-recycle knobs ride the function
-        # environment with template defaults (1400 MB on the 2047 MB cap --
-        # ~650 MB of headroom over the observed ~700-1100 MB/invocation
-        # retention -- and a generation cap of 1: recycle after every
-        # invocation, the cold-every-time posture; issue #175).
-        tpl = self._load_template()
-        params = tpl["Parameters"]
-        assert params["RecycleRssMb"]["Default"] == "1400"
-        assert params["RecycleMaxInvocations"]["Default"] == "1"
-        env = tpl["Resources"]["ProcessFn"]["Properties"]["Environment"]["Variables"]
-        assert env["ZAGG_RECYCLE_RSS_MB"] == {"Ref": "RecycleRssMb"}
-        assert env["ZAGG_RECYCLE_MAX_INVOCATIONS"] == {"Ref": "RecycleMaxInvocations"}
+        for var in (
+            "MALLOC_ARENA_MAX",
+            "MALLOC_TRIM_THRESHOLD_",
+            "ZAGG_RECYCLE_RSS_MB",
+            "ZAGG_RECYCLE_MAX_INVOCATIONS",
+        ):
+            assert var in env, f"ProcessFn.Environment must declare {var}"
 
     def test_execution_role_grants_public_cors_bucket(self):
         # The shared execution role gets Get/Put/Delete on the whole public
