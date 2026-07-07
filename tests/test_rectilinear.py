@@ -459,30 +459,40 @@ class TestSharded:
         np.testing.assert_array_equal(arr, expected)
 
 
-class TestThreadLocalTransformer:
-    """Issue #180 (review finding): ``assign`` runs on the granule pool's
-    worker threads, and a shared pyproj Transformer is only documented
-    thread-safe from pyproj 3.7.0 (unpinned) — so each thread caches its own,
-    with identical construction and byte-identical outputs."""
+class TestTransformerThreadSafety:
+    """Issue #180 (review finding 3): ``assign`` runs on the granule pool's
+    worker threads sharing one pyproj ``Transformer``. Concurrent
+    ``.transform()`` is thread-safe from pyproj 3.7.0 — enforced by the
+    ``pyproject.toml`` floor (espg-authorized dependency change) rather than a
+    code-side mitigation."""
 
-    def test_per_thread_instances_identical_results(self, grid):
+    def test_pyproj_floor_matches_pyproject(self):
+        # The runtime floor the shared-Transformer contract depends on. If
+        # this fails, the environment predates the pyproject pin.
+        from importlib.metadata import version
+
+        major, minor, *_ = (int(x) for x in version("pyproj").split(".")[:2])
+        assert (major, minor) >= (3, 7)
+
+    def test_shared_transformer_concurrent_use(self, grid):
         import threading
 
-        tx_main = grid._transformer_to_grid()
-        assert grid._transformer_to_grid() is tx_main  # cached within a thread
+        tx = grid._transformer_to_grid()
+        assert grid._transformer_to_grid() is tx  # one shared instance
+        expected = tx.transform(-45.0, -70.0)  # always_xy: (lon, lat)
+        results = {}
 
-        box = {}
-        t = threading.Thread(target=lambda: box.update(tx=grid._transformer_to_grid()))
-        t.start()
-        t.join()
-        assert box["tx"] is not tx_main  # a pool thread never shares main's
-        # Identical construction -> identical transforms (always_xy: lon, lat).
-        assert box["tx"].transform(-45.0, -70.0) == tx_main.transform(-45.0, -70.0)
+        def use(k):
+            results[k] = tx.transform(-45.0, -70.0)
+
+        threads = [threading.Thread(target=use, args=(i,)) for i in range(4)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+        assert all(r == expected for r in results.values())
 
     def test_assign_unchanged(self, grid):
-        # The per-thread cache is invisible to assign's outputs.
         lats = np.array([-70.0, -75.0])
         lons = np.array([-45.0, 90.0])
-        leaf1 = grid.assign(lats, lons)
-        leaf2 = grid.assign(lats, lons)
-        np.testing.assert_array_equal(leaf1, leaf2)
+        np.testing.assert_array_equal(grid.assign(lats, lons), grid.assign(lats, lons))
