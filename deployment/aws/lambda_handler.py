@@ -149,6 +149,14 @@ logger.setLevel(logging.INFO)
 # requiring CloudWatch forensics.
 _CONTAINER_INIT_TS = time.time()
 _INVOCATIONS_SERVED = 0
+# Recycle budget (issue #177), counted separately from the true generation
+# above: only recycle-eligible (async, result_url-mirrored) invocations are
+# billed against ``ZAGG_RECYCLE_MAX_INVOCATIONS``. A synchronous setup/
+# finalize invoke still warms the sandbox (the generation keeps counting it,
+# and telemetry keeps reporting it) but must not consume the worker budget --
+# MAX_INVOCATIONS=1 means "one heavy async invocation per container", not
+# "one invocation of any kind".
+_ASYNC_INVOCATIONS_SERVED = 0
 
 
 def _container_telemetry() -> Dict[str, Any]:
@@ -239,30 +247,38 @@ def _maybe_self_recycle() -> None:
       against a 2047 MB cap, so the template's 1400 catches a dirty sandbox
       after roughly one heavy retention while leaving the triggering
       invocation ~650 MB of headroom to complete first.
-    - ``ZAGG_RECYCLE_MAX_INVOCATIONS`` -- generation cap (template default
-      1: recycle after every invocation, the cold-every-time posture; raise
-      it for a belt-and-suspenders cap over retention modes the RSS read
-      misses -- and the only check that fires off-Linux, where RSS reads
-      are None).
+    - ``ZAGG_RECYCLE_MAX_INVOCATIONS`` -- cap on recycle-eligible (async)
+      invocations served, NOT the raw container generation (issue #177: the
+      runner's synchronous setup invoke warms a sandbox first, and counting
+      it made MAX_INVOCATIONS=1 deliver generation-2 workers while telemetry
+      read as if recycling had failed). Template default 1: recycle after
+      every async invocation, the cold-every-time posture; raise it for a
+      belt-and-suspenders cap over retention modes the RSS read misses --
+      and the only check that fires off-Linux, where RSS reads are None.
 
     Emits one CloudWatch-searchable line (``ZAGG_SELF_RECYCLE ...``) before
     exiting so dashboards can split intentional recycles from real crashes
-    (metric-filter note in docs/deployment/lambda.md).
+    (metric-filter note in docs/deployment/lambda.md). The line carries both
+    the async budget spent and the true container generation.
     """
+    global _ASYNC_INVOCATIONS_SERVED
+    _ASYNC_INVOCATIONS_SERVED += 1
     rss_limit = _recycle_limit("ZAGG_RECYCLE_RSS_MB")
     gen_limit = _recycle_limit("ZAGG_RECYCLE_MAX_INVOCATIONS")
     kib = _read_vmrss_kib()
     rss_mb = kib / 1024.0 if kib is not None else None
+    async_served = _ASYNC_INVOCATIONS_SERVED
     generation = _INVOCATIONS_SERVED
     if rss_limit > 0 and rss_mb is not None and rss_mb >= rss_limit:
         threshold = rss_limit
-    elif gen_limit > 0 and generation >= gen_limit:
+    elif gen_limit > 0 and async_served >= gen_limit:
         threshold = gen_limit
     else:
         return
     rss_repr = f"{rss_mb:.0f}" if rss_mb is not None else "n/a"
     logger.info(
-        f"ZAGG_SELF_RECYCLE rss_mb={rss_repr} generation={generation} threshold={threshold:g}"
+        f"ZAGG_SELF_RECYCLE rss_mb={rss_repr} async_served={async_served} "
+        f"generation={generation} threshold={threshold:g}"
     )
     _exit(0)
 
@@ -421,7 +437,8 @@ def lambda_handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
     # Count EVERY invocation toward the sandbox's generation (issue #171): a
     # setup/finalize/extract invoke warms the container just like a shard does,
     # so the next shard on this sandbox is genuinely generation N+1. Snapshot
-    # start RSS here, before any per-unit work inflates it.
+    # start RSS here, before any per-unit work inflates it. (The recycle
+    # budget is billed separately, per async invocation -- issue #177.)
     telemetry = _container_telemetry()
     mode = event.get("mode", "process")
     if mode == "setup":

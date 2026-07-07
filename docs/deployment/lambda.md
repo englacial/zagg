@@ -309,11 +309,14 @@ mechanisms address this (issue #171):
   mirrored to its `result_url`, the handler exits the sandbox
   (`os._exit(0)`) when current RSS ≥ `ZAGG_RECYCLE_RSS_MB` (template
   default 1400) or the sandbox has served `ZAGG_RECYCLE_MAX_INVOCATIONS`
-  (template default 1 — recycle after every invocation, the cold-every-time
-  posture) invocations. Set either to `0`/empty to disable that check. The
-  next invocation then starts on a fresh container instead of
-  ratcheting toward OOM. Synchronous invocations never self-recycle (the
-  response would be lost).
+  **recycle-eligible (async) invocations** (template default 1 — recycle
+  after every async invocation, the cold-every-time posture). Set either to
+  `0`/empty to disable that check. The next invocation then starts on a
+  fresh container instead of ratcheting toward OOM. Synchronous invocations
+  never self-recycle (the response would be lost) and don't consume the
+  recycle budget (issue #177: the runner's sync setup invoke warms a
+  sandbox, so counting it made `MAX_INVOCATIONS=1` deliver generation-2
+  workers); `container_generation` telemetry still counts every invocation.
 
 !!! warning "The raw `Errors` metric is 100% noise under this posture"
     A self-exit after the result write is counted as a runtime error by
@@ -325,7 +328,7 @@ mechanisms address this (issue #171):
     recycle logs one structured line first:
 
     ```
-    ZAGG_SELF_RECYCLE rss_mb=<current> generation=<n> threshold=<crossed limit>
+    ZAGG_SELF_RECYCLE rss_mb=<current> async_served=<n> generation=<n> threshold=<crossed limit>
     ```
 
     The template materializes the real-vs-expected split as CloudWatch
