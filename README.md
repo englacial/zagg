@@ -67,12 +67,14 @@ OUTPUT_BUCKET=my-results-bucket bash deployment/aws/stand_up.sh
 ```
 
 In **us-west-2** the stack reads the Lambda code straight from the public
-source.coop mirror — no staging bucket of your own needed. Outside us-west-2,
-CloudFormation requires the code in a same-region bucket, so pass a
-`STAGING_BUCKET` you own and the zips are copied there from the mirror first.
-Deploys [`deployment/aws/template.yaml`](deployment/aws/template.yaml); the
-artifacts are keyed by zagg minor version (derive from your install, or pin with
-`LAMBDA_VERSION=0.N`). Override `ARCH` for x86_64.
+distribution bucket (`s3://sliderule-public-cors/<minor>/`) — no staging bucket
+of your own needed. Outside us-west-2, CloudFormation requires the code in a
+same-region bucket, so pass a `STAGING_BUCKET` you own and the zips are copied
+there from the distribution bucket first. Deploys
+[`deployment/aws/template.yaml`](deployment/aws/template.yaml); the artifacts
+are keyed by zagg minor version (derive from your install, pin with
+`LAMBDA_VERSION=0.N`, or use `LAMBDA_VERSION=latest` for the newest published
+minor). Override `ARCH` for x86_64.
 
 **Build from source** (maintainers, or to customize the layer):
 

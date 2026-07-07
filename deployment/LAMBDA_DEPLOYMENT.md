@@ -57,20 +57,24 @@ layer, and function as a single stack from the pre-built release zips:
 OUTPUT_BUCKET=my-results-bucket bash deployment/aws/stand_up.sh
 ```
 
-The Lambda code (deps layer + function zips) lives on the public **source.coop
-mirror** (`s3://us-west-2.opendata.source.coop/englacial/zagg/lambda/<minor>/`),
-keyed by zagg minor version. CloudFormation reads Lambda code from a same-region
-bucket, so:
+The Lambda code (deps layer + function zips) lives on the public
+**distribution bucket** (`s3://sliderule-public-cors/<minor>/`), keyed by zagg
+minor version and populated by the release pipeline (`publish.yml`'s
+`distribute` job). CloudFormation reads Lambda code from a same-region bucket,
+so:
 
-- **us-west-2** — `stand_up.sh` points the stack straight at the mirror; no
-  staging bucket of your own is needed.
+- **us-west-2** — `stand_up.sh` points the stack straight at the distribution
+  bucket; no staging bucket of your own is needed.
 - **other regions** — pass `STAGING_BUCKET` (a bucket you own in `REGION`); the
-  zips are copied into it from the mirror, then the stack reads them there.
+  zips are copied into it from the distribution bucket, then the stack reads
+  them there.
 
 It then runs `aws cloudformation deploy`. The minor is read from the repo's
 latest git tag (so a clone needs no install), or the installed zagg, unless
-`LAMBDA_VERSION` is set. To (re)populate the mirror after a release,
-maintainers run `deployment/aws/publish_mirror.sh <minor>`. See
+`LAMBDA_VERSION` is set (`latest` reads the bucket's `versions.json`); the
+resolved minor is verified to be staged on the bucket before any stack call,
+and the script confirms the resolved artifacts before deploying (`--yes` skips
+the prompt). See
 [docs/deployment/lambda.md](../docs/deployment/lambda.md) for the parameter
 table and overrides.
 
@@ -206,7 +210,8 @@ aws lambda update-function-code \
 
 > The build half of this is implemented in `.github/workflows/lambda-build.yml`
 > (build + size gate + artifact upload). Automated *deploy*-on-push was never
-> wired up; the source.coop mirror + `stand_up.sh` is the deploy path instead.
+> wired up; the public distribution bucket + `stand_up.sh` is the deploy path
+> instead.
 > Kept below as the original design rationale.
 
 A GitHub Actions workflow for automated Lambda deployment should:
