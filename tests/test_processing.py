@@ -1257,8 +1257,15 @@ class TestRaggedWriteFanout:
         _write_ragged_fanout([(r, k) for r, k in writes], MemoryStore(), grid=grid)
         assert "workers" not in recorded
 
-    def test_fanout_surfaces_write_failure(self, monkeypatch):
-        """A failure in any subgroup write is re-raised (not silently swallowed)."""
+    def test_fanout_surfaces_write_failure(self, monkeypatch, caplog):
+        """A failure in any subgroup write is re-raised (not silently swallowed).
+        Issue #186 (ask 1): the chained cause never reached the operator — the
+        worker envelope and CloudWatch only record the summary string — so the
+        summary now carries the cause's type + message, and the first failure
+        is logged with its full traceback."""
+        import logging
+        import traceback
+
         import zagg.processing.write as wmod
         from zagg.processing.write import _write_ragged_fanout
 
@@ -1266,11 +1273,23 @@ class TestRaggedWriteFanout:
 
         def boom(ragged, store, *, grid, shard_key):
             if shard_key == 3:
-                raise RuntimeError("disk full")
+                raise OSError("disk full")
 
         monkeypatch.setattr(wmod, "write_ragged_to_zarr", boom)
-        with pytest.raises(RuntimeError, match="ragged"):
-            _write_ragged_fanout([(r, k) for r, k in writes], MemoryStore(), grid=grid)
+        with caplog.at_level(logging.ERROR, logger="zagg.processing.write"):
+            with pytest.raises(
+                RuntimeError, match=r"first failing shard_key 3: OSError: disk full"
+            ):
+                _write_ragged_fanout([(r, k) for r, k in writes], MemoryStore(), grid=grid)
+        rec = next(r for r in caplog.records if "subgroup write failed" in r.message)
+        assert "shard_key 3" in rec.message
+        assert "OSError: disk full" in rec.message
+        # Full traceback attached: the log shows WHERE the cause raised, not
+        # just its repr — the actual S3/zarr frame in a real reproduction.
+        assert rec.exc_info is not None
+        tb_text = "".join(traceback.format_exception(*rec.exc_info))
+        assert "OSError: disk full" in tb_text
+        assert "in boom" in tb_text
 
     def test_fanout_empty_is_noop(self):
         """No ragged writes -> nothing written, no pool spun up."""
