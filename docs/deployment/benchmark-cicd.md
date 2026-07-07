@@ -484,9 +484,10 @@ shows `production` with a reviewer.
 
 ## Distribution transition (source.coop → CORS bucket)
 
-`stand_up.sh` now prefers `sliderule-public-cors` and **falls back to the
-source.coop mirror** for any minor not yet on the new bucket — so older standups
-keep working while new releases populate the new bucket. Once enough releases have
-published to the CORS bucket, retire the source.coop mirror (and its
-`publish_mirror.sh` step) in a follow-up. Set `LAMBDA_VERSION=latest` to always
-pull the newest published minor.
+The transition is complete (issue #174): `stand_up.sh` reads **only**
+`sliderule-public-cors` — the source.coop-mirror fallback is removed, and a
+minor not staged on the CORS bucket fails fast (with the staged minors listed)
+instead of silently falling back to the retired mirror and dying as a
+CloudFormation `NoSuchKey`. Older minors that only ever lived on the mirror
+need a self-hosted copy (`DIST_BUCKET`/`DIST_PREFIX` overrides). Set
+`LAMBDA_VERSION=latest` to always pull the newest published minor.

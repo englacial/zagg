@@ -1345,6 +1345,7 @@ class TestSelfRecycle:
     @pytest.fixture(autouse=True)
     def _fresh_container(self, handler_mod, monkeypatch):
         monkeypatch.setattr(handler_mod, "_INVOCATIONS_SERVED", 0)
+        monkeypatch.setattr(handler_mod, "_ASYNC_INVOCATIONS_SERVED", 0)
         monkeypatch.delenv("ZAGG_RECYCLE_RSS_MB", raising=False)
         monkeypatch.delenv("ZAGG_RECYCLE_MAX_INVOCATIONS", raising=False)
 
@@ -1405,7 +1406,10 @@ class TestSelfRecycle:
         assert calls == [("exit", 0)]
         assert Path(url).exists()  # mirror landed before the exit
         # One structured, CloudWatch-searchable line (dashboard metric filter).
-        assert "ZAGG_SELF_RECYCLE rss_mb=1500 generation=1 threshold=1400" in caplog.text
+        assert (
+            "ZAGG_SELF_RECYCLE rss_mb=1500 async_served=1 generation=1 threshold=1400"
+            in caplog.text
+        )
 
     def test_below_threshold_no_recycle(self, handler_mod, monkeypatch):
         calls = []
@@ -1428,8 +1432,67 @@ class TestSelfRecycle:
         assert calls == []  # generation 1 < cap
         with caplog.at_level("INFO"):
             handler_mod.lambda_handler(event, _context())
-        assert calls == [("exit", 0)]  # generation 2 hits the cap
-        assert "ZAGG_SELF_RECYCLE rss_mb=n/a generation=2 threshold=2" in caplog.text
+        assert calls == [("exit", 0)]  # second async invocation hits the cap
+        assert "ZAGG_SELF_RECYCLE rss_mb=n/a async_served=2 generation=2 threshold=2" in caplog.text
+
+    def test_sync_setup_does_not_consume_recycle_budget(self, handler_mod, monkeypatch):
+        # Issue #177: a synchronous setup invoke warms the sandbox but must not
+        # be billed against the async budget -- with cap 2, setup + one worker
+        # stays below the cap (pre-fix, generation 2 >= 2 fired after the FIRST
+        # worker), and only the second worker recycles.
+        calls = []
+        monkeypatch.setenv("ZAGG_RECYCLE_MAX_INVOCATIONS", "2")
+        monkeypatch.setattr(handler_mod, "_read_vmrss_kib", lambda: None)  # RSS check inert
+        monkeypatch.setattr(handler_mod, "_write_result", lambda *a: True)
+        monkeypatch.setattr(
+            handler_mod, "_handle_setup", lambda event: {"statusCode": 200, "body": "{}"}
+        )
+        self._spy_exit(handler_mod, monkeypatch, calls)
+        handler_mod.lambda_handler({"mode": "setup"}, _context())  # sync: no result_url
+        event = self._process_event(monkeypatch, result_url="s3://b/status/1.json")
+        handler_mod.lambda_handler(event, _context())
+        assert calls == []  # async budget spent: 1 < 2 (setup didn't count)
+        handler_mod.lambda_handler(event, _context())
+        assert calls == [("exit", 0)]  # second async invocation hits the cap
+
+    def test_recycle_log_reports_true_generation(self, handler_mod, monkeypatch, caplog):
+        # Issue #177: with cap 1 after a sync setup, the recycle fires on the
+        # FIRST async worker (async_served=1) while both the log line and the
+        # envelope telemetry keep reporting the true container generation (2).
+        calls = []
+        monkeypatch.setenv("ZAGG_RECYCLE_MAX_INVOCATIONS", "1")
+        monkeypatch.setattr(handler_mod, "_read_vmrss_kib", lambda: None)
+        monkeypatch.setattr(handler_mod, "_write_result", lambda *a: True)
+        monkeypatch.setattr(
+            handler_mod, "_handle_setup", lambda event: {"statusCode": 200, "body": "{}"}
+        )
+        self._spy_exit(handler_mod, monkeypatch, calls)
+        handler_mod.lambda_handler({"mode": "setup"}, _context())
+        event = self._process_event(monkeypatch, result_url="s3://b/status/1.json")
+        with caplog.at_level("INFO"):
+            resp = handler_mod.lambda_handler(event, _context())
+        assert calls == [("exit", 0)]
+        assert "ZAGG_SELF_RECYCLE rss_mb=n/a async_served=1 generation=2 threshold=1" in caplog.text
+        assert json.loads(resp["body"])["container_generation"] == 2  # telemetry: true gen
+
+    def test_failed_mirror_still_bills_recycle_budget(self, handler_mod, monkeypatch):
+        # Issue #177 review fold: a failed mirror skips the recycle itself
+        # (transient S3 fault -- don't also churn the sandbox), but the async
+        # invocation WAS served, so it must still burn the budget: with cap 2,
+        # a failed-mirror invoke plus one successful invoke recycles. (Billing
+        # only mirrored invokes would let a flaky mirror extend the sandbox
+        # past its cap -- the pre-#177 generation counter counted it too.)
+        calls = []
+        monkeypatch.setenv("ZAGG_RECYCLE_MAX_INVOCATIONS", "2")
+        monkeypatch.setattr(handler_mod, "_read_vmrss_kib", lambda: None)
+        outcomes = iter([False, True])
+        monkeypatch.setattr(handler_mod, "_write_result", lambda *a: next(outcomes))
+        self._spy_exit(handler_mod, monkeypatch, calls)
+        event = self._process_event(monkeypatch, result_url="s3://b/status/1.json")
+        handler_mod.lambda_handler(event, _context())
+        assert calls == []  # mirror failed: billed, but no recycle
+        handler_mod.lambda_handler(event, _context())
+        assert calls == [("exit", 0)]  # budget spent (2 >= 2), counting the failed one
 
     def test_disabled_by_default_and_by_zero(self, handler_mod, monkeypatch):
         # No env vars (and explicit "0") -> never recycles, however bloated:

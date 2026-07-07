@@ -1,21 +1,27 @@
 #!/bin/bash
 # Stand up the zagg Lambda backend in your own AWS account, end to end.
 #
-# Lambda code (the deps layer + function zips) is read from the public CORS bucket
-# (s3://sliderule-public-cors), with the legacy source.coop mirror as a fallback
-# for older minors. CloudFormation requires that code to live in a SAME-REGION
-# bucket:
+# Lambda code (the deps layer + function zips) is read from the public
+# distribution bucket the release pipeline stages to (s3://sliderule-public-cors,
+# keys <minor>/<zip> — publish.yml's distribute job / distribute_zips.sh).
+# CloudFormation requires that code to live in a SAME-REGION bucket:
 #
-#   * In us-west-2 (where the sources live) the stack reads it straight from the
-#     source — no staging bucket of your own needed.
+#   * In us-west-2 (where the distribution bucket lives) the stack reads it
+#     straight from the source — no staging bucket of your own needed.
 #   * In any other region, provide STAGING_BUCKET (a bucket you own in that
 #     region); the zips are copied from the source into it first.
 #
-# Sources are keyed by zagg MINOR version (0.N.x -> 0.N). Run from a zagg git
+# Artifacts are keyed by zagg MINOR version (0.N.x -> 0.N). Run from a zagg git
 # clone and the minor is read from the latest tag (no install needed); otherwise
 # set LAMBDA_VERSION (e.g. LAMBDA_VERSION=0.2). Set LAMBDA_VERSION=latest to read
-# the newest published minor from the CORS bucket's versions.json (so a clone/
-# pip-install isn't hard-pinned to its build-time version).
+# the newest published minor from the bucket's versions.json (so a clone/
+# pip-install isn't hard-pinned to its build-time version). Whatever it resolves
+# to, the layer/function keys are verified to EXIST on the bucket before any
+# stack call — an unstaged minor fails fast with the staged minors listed,
+# instead of surfacing as a CloudFormation NoSuchKey rollback (issue #174).
+#
+# The script echoes the resolved bucket/keys/version and asks for confirmation
+# before deploying; pass --yes to skip the prompt (unattended runs).
 #
 # By default the stack creates its own Lambda execution role (needs
 # iam:CreateRole — fine if you admin your own account). In IAM-constrained
@@ -24,12 +30,21 @@
 #
 # Usage:
 #   OUTPUT_BUCKET=my-results ./stand_up.sh                              # us-west-2, stack makes the role
+#   OUTPUT_BUCKET=my-results ./stand_up.sh --yes                        # no confirm prompt
 #   REGION=us-east-1 OUTPUT_BUCKET=my-results STAGING_BUCKET=my-stage ./stand_up.sh
 #   CREATE_ROLE=false ROLE_ARN=arn:aws:iam::123:role/zagg-exec OUTPUT_BUCKET=my-results ./stand_up.sh
 #
 # Requires: aws CLI (configured).
 
 set -euo pipefail
+
+ASSUME_YES=false
+while [ $# -gt 0 ]; do
+    case "$1" in
+        --yes|-y) ASSUME_YES=true; shift ;;
+        *) echo "ERROR: unknown argument '$1' (the script is env-driven; the only flag is --yes)"; exit 2 ;;
+    esac
+done
 
 # Verbose by default: echo each AWS command (copy-pasteable) before running it.
 # The command runs in the foreground, so its stdout/stderr stream straight to you.
@@ -55,19 +70,15 @@ if [ "$CREATE_ROLE" != "true" ] && [ -z "$ROLE_ARN" ]; then
     exit 1
 fi
 
-# Distribution sources (issue #25). The public CORS bucket is primary: listable
-# (a versions.json index), keyed by minor as <minor>/<zip>. The legacy source.coop
-# mirror is the fallback for older minors that predate the new bucket (transition
-# window). Override any of these to self-host a copy.
+# Distribution source (issue #25; source.coop mirror retired in issue #174).
+# The public CORS bucket the release pipeline stages to: listable (a
+# versions.json index), keyed by minor as <minor>/<zip> (publish.yml's
+# distribute job / distribute_zips.sh). Override to self-host a copy.
 DIST_BUCKET="${DIST_BUCKET:-sliderule-public-cors}"
 DIST_PREFIX="${DIST_PREFIX:-}"                       # keys: [<prefix>/]<minor>/<zip>
 DIST_REGION="${DIST_REGION:-us-west-2}"
-MIRROR_BUCKET="${MIRROR_BUCKET:-us-west-2.opendata.source.coop}"
-MIRROR_PREFIX="${MIRROR_PREFIX:-englacial/zagg/lambda}"   # keys: <prefix>/<minor>/<zip>
-MIRROR_REGION="${MIRROR_REGION:-us-west-2}"
 
 dist_key()   { local p="$DIST_PREFIX"; [ -n "$p" ] && p="$p/"; echo "${p}${1}/${2}"; }  # minor, zip
-mirror_key() { echo "${MIRROR_PREFIX}/${1}/${2}"; }
 dist_root()  { local p="$DIST_PREFIX"; [ -n "$p" ] && p="$p/"; echo "${p}${1}"; }       # versions.json path
 
 case "$ARCH" in
@@ -100,14 +111,42 @@ else
 fi
 echo "zagg lambda artifacts: $MINOR ($ARCH), region $REGION"
 
-# Pick the source that actually holds this minor: prefer the CORS bucket; if the
-# layer isn't there (an older minor), fall back to the source.coop mirror.
+# Refuse to guess (issue #174): the resolved minor must actually be staged on
+# the distribution bucket. A HEAD on both the layer and function keys catches
+# a phantom version (e.g. one derived from post-tag main) here, with an
+# actionable message, instead of as a CloudFormation NoSuchKey mid-update.
+# The aws stderr is surfaced so a 404 (minor not staged) reads differently
+# from a network/credentials failure of the check itself.
 SRC_BUCKET="$DIST_BUCKET"; SRC_REGION="$DIST_REGION"
 SRC_LAYER_KEY="$(dist_key "$MINOR" "$LAYER_ZIP")"; SRC_FUNC_KEY="$(dist_key "$MINOR" "$FUNC_ZIP")"
-if ! aws s3api head-object --bucket "$DIST_BUCKET" --key "$SRC_LAYER_KEY" --region "$DIST_REGION" --no-sign-request >/dev/null 2>&1; then
-    echo "note: $MINOR not on s3://$DIST_BUCKET — falling back to the source.coop mirror"
-    SRC_BUCKET="$MIRROR_BUCKET"; SRC_REGION="$MIRROR_REGION"
-    SRC_LAYER_KEY="$(mirror_key "$MINOR" "$LAYER_ZIP")"; SRC_FUNC_KEY="$(mirror_key "$MINOR" "$FUNC_ZIP")"
+for KEY in "$SRC_LAYER_KEY" "$SRC_FUNC_KEY"; do
+    if ! HEAD_ERR="$(aws s3api head-object --bucket "$DIST_BUCKET" --key "$KEY" --region "$DIST_REGION" --no-sign-request 2>&1 >/dev/null)"; then
+        echo "ERROR: minor $MINOR is not staged: could not HEAD s3://$DIST_BUCKET/$KEY"
+        [ -n "$HEAD_ERR" ] && echo "       aws: $HEAD_ERR"
+        STAGED="$(aws s3 cp "s3://$DIST_BUCKET/$(dist_root versions.json)" - --region "$DIST_REGION" --no-sign-request 2>/dev/null \
+            | python3 -c 'import json,sys; print(" ".join(json.load(sys.stdin).get("minors", [])))' 2>/dev/null || true)"
+        [ -n "$STAGED" ] && echo "       Staged minors on s3://$DIST_BUCKET: $STAGED"
+        echo "       Set LAMBDA_VERSION to a staged minor, or LAMBDA_VERSION=latest for the"
+        echo "       newest published one (versions.json). A non-404 aws error above means"
+        echo "       the check itself failed (network/credentials), not that the minor is missing."
+        exit 1
+    fi
+done
+
+echo ""
+echo "Resolved deployment artifacts:"
+echo "  version:  $MINOR ($ARCH)"
+echo "  layer:    s3://$SRC_BUCKET/$SRC_LAYER_KEY"
+echo "  function: s3://$SRC_BUCKET/$SRC_FUNC_KEY"
+echo "  stack:    $STACK_NAME ($REGION)"
+if [ "$ASSUME_YES" != "true" ]; then
+    # `|| REPLY=""` keeps EOF (unattended stdin) on the abort path below with
+    # its message, instead of dying silently under `set -e`.
+    read -r -p "Proceed with deploy? [y/N] " REPLY || REPLY=""
+    case "$REPLY" in
+        [Yy]|[Yy][Ee][Ss]) ;;
+        *) echo "Aborted (pass --yes to skip this prompt)."; exit 1 ;;
+    esac
 fi
 
 if [ "$REGION" = "$SRC_REGION" ]; then
