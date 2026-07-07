@@ -114,6 +114,11 @@ output:
     indexing_scheme: nested
     parent_order: 10             # shard / dispatch unit: 4^(19-10) = 512x512 cells
     chunk_inner: 13              # inner Zarr chunk: 4^(19-13) = 64x64 cells (K=64 per shard)
+    # ShardingCodec output (issue #108/#133, decided on the #170 read-matrix
+    # evidence 2026-07-07): at identical reads, sharded collapses the
+    # per-inner-chunk aggregation grouping + K CSR writes (o9: agg 165->19 s,
+    # write 148->15 s per worker; -44% cost vs inner on the SERC AOI).
+    sharded: true
     child_order: 19              # leaf cell resolution (~10 m)
   aoi_mask: true                 # strict-AOI cell mask (issue #101)
   store: s3://sliderule-public-cors/zagg-examples/serc/gain_bias.zarr
