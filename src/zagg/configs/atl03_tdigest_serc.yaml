@@ -1,0 +1,102 @@
+# ATL03 located t-digest over the NEON SERC AOP box (sponsor end-to-end example).
+#
+# The executed half of ``notebooks/sponsor_end_to_end.ipynb``: per-cell
+# t-digests of photon height with the morton location channel (issue #87 /
+# PR #165) and the strict-AOI cell mask (issue #101), reading through the
+# virtual chunk-index seam (issue #160 / PR #163). The ``inline`` backend
+# builds each granule's chunk map at read time and *persists* it
+# (``write_back``) to the canonical granule-keyed sidecar prefix
+# ``zagg-index/<product>/<version>/<granule_id>.parquet`` — a self-populating
+# cache: any later run over these granules (this config, the gain_bias
+# companion, a different grid entirely) can consume the manifests via the
+# ``sidecar`` backend (h5coro-hidefix) instead of re-walking the B-trees.
+#
+# Grid + read plan match the o10 benchmark templates
+# (tests/data/benchmark/configs/atl03_tdigest_healpix_o10.yaml): parent_order
+# 10 shards sharing ONE shardmap with atl03_gain_bias_serc.yaml — the same
+# spatial signature, so the map is built once and reused (#89).
+data_source:
+  reader: h5coro
+  driver: s3
+  groups: [gt1l, gt1r, gt2l, gt2r, gt3l, gt3r]
+  coordinates:
+    latitude: "/{group}/heights/lat_ph"
+    longitude: "/{group}/heights/lon_ph"
+  variables:
+    h_ph: "/{group}/heights/h_ph"
+  filters:
+    - dataset: "/{group}/heights/signal_conf_ph"
+      column: 0                  # land surface type; TEP is uniform across columns
+      op: ne
+      value: -2
+  base_level: photons
+  levels:
+    photons:
+      path: "/{group}/heights"
+      coordinates: {latitude: lat_ph, longitude: lon_ph}
+      link: null
+    segments:
+      path: "/{group}/geolocation"
+      coordinates: {latitude: reference_photon_lat, longitude: reference_photon_lon}
+      link:
+        to: photons
+        index_beg: "/{group}/geolocation/ph_index_beg"
+        count: "/{group}/geolocation/segment_ph_cnt"
+        index_base: 1            # ATL03 ph_index_beg is 1-based per the v3 dict
+  read_plan:
+    spatial_index: segments
+    pad: 1                       # one segment of padding on each side per #43
+  # Virtual chunk-index (issue #160): build granule chunk maps at read time and
+  # persist them under the canonical granule-keyed prefix, populating the cache
+  # the ``sidecar`` backend (h5coro-hidefix >= 0.2) consumes on later runs.
+  index:
+    backend: inline
+    write_back: true
+    store: s3://sliderule-public-cors/zagg-index/ATL03/007
+
+aggregation:
+  coordinates:
+    cell_ids:
+      dtype: uint64
+      fill_value: 0
+    morton:
+      dtype: uint64
+      fill_value: 0
+  variables:
+    count:
+      function: len
+      source: h_ph
+      dtype: int32
+      fill_value: 0
+    h_tdigest:
+      # Located per-cell t-digest (issue #87): ``build_tdigest`` also receives
+      # the cell's per-photon order-29 morton words (``location: leaf_id``) and
+      # stores a per-centroid uint64 location vector as a companion CSR array
+      # (``h_tdigest/{shard}/locations``). Read back with
+      # ``zagg.readers.read_locations``; decode with mortie primitives.
+      kind: ragged
+      function: "zagg.stats.tdigest.build_tdigest"
+      source: h_ph
+      location: leaf_id
+      inner_shape: [2]
+      params:
+        delta: 256
+      dtype: float32
+      fill_value: 0
+
+output:
+  grid:
+    type: healpix
+    indexing_scheme: nested
+    parent_order: 10             # shard / dispatch unit: 4^(19-10) = 512x512 cells
+    chunk_inner: 13              # inner Zarr chunk: 4^(19-13) = 64x64 cells (K=64 per shard)
+    # ShardingCodec output (issue #108/#133, decided on the #170 read-matrix
+    # evidence 2026-07-07): at identical reads, sharded collapses the
+    # per-inner-chunk aggregation grouping + K CSR writes (o9: agg 165->19 s,
+    # write 148->15 s per worker; -44% cost vs inner on the SERC AOI).
+    sharded: true
+    child_order: 19              # leaf cell resolution (~10 m)
+  # Strict-AOI cell mask (issue #101): package a per-cell bool aligned to the
+  # grid, True inside the NEON SERC polygon — no observation is dropped.
+  aoi_mask: true
+  store: s3://sliderule-public-cors/zagg-examples/serc/tdigest.zarr
