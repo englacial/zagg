@@ -1116,6 +1116,36 @@ def _run_catalog():
     }
 
 
+class TestClampedDataSource:
+    """Dispatcher-side per-cell granule_workers clamp (issue #184, item 1's
+    simple ``min(K, n_granules)`` case): a copy carrying the clamped width
+    only when clamping actually lowers K, else None (shared config rides
+    through untouched, keeping unclamped payloads byte-identical)."""
+
+    def test_min_policy(self):
+        from zagg.runner import _clamped_data_source
+
+        ds = {"granule_workers": 4}
+        assert _clamped_data_source(ds, 2) == {"granule_workers": 2}
+        assert _clamped_data_source(ds, 4) is None
+        assert _clamped_data_source(ds, 9) is None
+        assert ds == {"granule_workers": 4}  # never mutated in place
+
+    def test_default_k_applies(self):
+        # The issue #185 default (K=4) clamps without an explicit key.
+        from zagg.runner import _clamped_data_source
+
+        assert _clamped_data_source({}, 2) == {"granule_workers": 2}
+        assert _clamped_data_source({}, 4) is None
+        # A degenerate 0-granule cell still sends a valid width (>= 1).
+        assert _clamped_data_source({}, 0) == {"granule_workers": 1}
+
+    def test_serial_k1_never_clamped(self):
+        from zagg.runner import _clamped_data_source
+
+        assert _clamped_data_source({"granule_workers": 1}, 5) is None
+
+
 class TestSummaryKeysByteIdentical:
     """The dispatch refactor (#63) must leave the run-summary dict keys -- and
     the data/error counting -- byte-identical for both backends.
@@ -1363,6 +1393,122 @@ class TestSummaryKeysByteIdentical:
             function_name="fn",
         )
         assert all(v == "OMITTED" for v in seen.values())
+
+    @staticmethod
+    def _clamp_catalog():
+        # Per-shard granule counts 2 / 6 / 4 / 1 against the default K=4:
+        # shards 10 and 13 clamp, 11 (above K) and 12 (exactly K) pass through.
+        cat = _run_catalog()
+        cat["granules"] = [
+            [{"s3": f"s3://b/g{i}_{j}.h5"} for j in range(n)] for i, n in enumerate((2, 6, 4, 1))
+        ]
+        return cat
+
+    def test_local_clamps_granule_workers_per_cell(self, monkeypatch, atl06_config):
+        # Issue #184 (item 1): _run_local threads a per-cell config whose
+        # granule_workers is min(K, n_granules); cells at/above K get the
+        # SHARED config object untouched.
+        import zagg.grids as grids_mod
+        from zagg import runner
+
+        monkeypatch.setattr(
+            runner,
+            "get_nsidc_s3_credentials",
+            lambda: {"accessKeyId": "a", "secretAccessKey": "s", "sessionToken": "t"},
+        )
+        monkeypatch.setattr(grids_mod, "from_config", lambda *a, **k: _stub_grid())
+        monkeypatch.setattr(runner, "open_store", lambda *a, **k: object())
+        monkeypatch.setattr(runner, "consolidate_metadata", lambda *a, **k: None)
+
+        seen, shared = {}, {}
+
+        def fake_paw(shard_key, chunk_idx, records, grid, s3_creds, zarr_store, config, **kw):
+            seen[int(shard_key)] = config.data_source.get("granule_workers", "ABSENT")
+            shared[int(shard_key)] = config is atl06_config
+            return {"shard_key": shard_key, "total_obs": 1, "error": None}
+
+        monkeypatch.setattr(runner, "_process_and_write", fake_paw)
+
+        runner._run_local(
+            atl06_config,
+            self._clamp_catalog(),
+            "./out.zarr",
+            12,
+            max_cells=None,
+            morton_cell=None,
+            max_workers=1,
+            overwrite=False,
+            dry_run=False,
+            region="us-west-2",
+        )
+        assert seen == {10: 2, 11: "ABSENT", 12: "ABSENT", 13: 1}
+        assert shared[11] and shared[12]  # unclamped cells: shared config as-is
+
+    def test_lambda_clamps_granule_workers_per_cell(self, monkeypatch, atl06_config):
+        # Issue #184 (item 1): _run_lambda's per-cell event config carries
+        # min(K, n_granules); cells at/above K keep the shared config_dict
+        # byte-identical (no granule_workers key injected).
+        import boto3
+
+        import zagg.grids as grids_mod
+        from zagg import runner
+        from zagg.concurrency import ConcurrencyReport
+
+        monkeypatch.setattr(
+            runner,
+            "get_nsidc_s3_credentials",
+            lambda: {"accessKeyId": "a", "secretAccessKey": "s", "sessionToken": "t"},
+        )
+        monkeypatch.setattr(grids_mod, "from_config", lambda *a, **k: _stub_grid())
+        monkeypatch.setattr(runner, "_invoke_lambda_setup", lambda *a, **k: None)
+        monkeypatch.setattr(runner, "_invoke_lambda_finalize", lambda *a, **k: None)
+        monkeypatch.setattr(runner, "_get_function_timeout_s", lambda *a, **k: 720)
+        from unittest.mock import MagicMock
+
+        monkeypatch.setattr(boto3, "Session", lambda *a, **k: MagicMock())
+        monkeypatch.setattr(
+            runner,
+            "compute_available_workers",
+            lambda requested, *a, **k: (
+                4,
+                ConcurrencyReport(
+                    account_limit=1000,
+                    current_concurrent=0,
+                    padding=100,
+                    available=900,
+                    function_reserved=None,
+                ),
+            ),
+        )
+
+        seen = {}
+
+        def fake_cell(client, chunk_idx, shard_key, *a, **kw):
+            seen[int(shard_key)] = kw["config_dict"]["data_source"].get("granule_workers", "ABSENT")
+            return {
+                "shard_key": shard_key,
+                "status_code": 200,
+                "body": {"total_obs": 1},
+                "error": None,
+                "timeout": False,
+            }
+
+        monkeypatch.setattr(runner, "_invoke_lambda_cell", fake_cell)
+
+        runner._run_lambda(
+            atl06_config,
+            self._clamp_catalog(),
+            "s3://out/x.zarr",
+            12,
+            max_cells=None,
+            morton_cell=None,
+            max_workers=1,
+            overwrite=False,
+            dry_run=False,
+            region="us-west-2",
+            function_name="fn",
+        )
+        assert seen == {10: 2, 11: "ABSENT", 12: "ABSENT", 13: 1}
 
     def test_lambda_summary_keys_and_cost(self, monkeypatch, atl06_config):
         import boto3
