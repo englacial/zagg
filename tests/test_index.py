@@ -1155,8 +1155,8 @@ class TestInlineWriteBackWorker:
 
     def test_finish_granule_drains_pending_when_off(self):
         backend = InlineIndex()
-        backend._pending["g"] = {"/x": object()}
-        # A resource-less h5obj falls back to the granule_url's id (issue #180).
+        backend._pending["s3://b/g.h5"] = {"/x": object()}
+        # A resource-less h5obj falls back to the full granule_url key (#180).
         backend.finish_granule(object(), "s3://b/g.h5")
         assert backend._pending == {}
 
@@ -1264,12 +1264,51 @@ class TestInlineInterleavedGranules:
         ha, hb = self._open(a), self._open(b)
         self._read_all_groups(backend, ha)
         self._read_all_groups(backend, hb)
-        assert set(backend._pending) == {"granA", "granB"}
+        # In-memory keys are the FULL resource URLs (review finding: stems can
+        # collide across prefixes); the store keys stay the id stems.
+        assert set(backend._pending) == {str(a), str(b)}
         backend.finish_granule(ha, str(a))
         # A drained + persisted; B's pending maps untouched, nothing written.
-        assert set(backend._pending) == {"granB"}
+        assert set(backend._pending) == {str(b)}
         assert (store / "granA.parquet").is_file()
         assert not (store / "granB.parquet").exists()
         backend.finish_granule(hb, str(b))
         assert backend._pending == {}
         assert (store / "granB.parquet").is_file()
+
+    def test_same_basename_granules_do_not_collide(self, tmp_path, caplog):
+        # Review finding (issue #180): two DISTINCT granules whose URLs share
+        # a basename (.../p1/granule.h5 vs .../p2/granule.h5) must not collapse
+        # to one pending entry — under the stem-keyed dict, B's reads were
+        # served through A's chunk maps and the first finish_granule drained
+        # both into one merged manifest (the second wrote nothing).
+        import logging
+        import shutil
+
+        d1, d2 = tmp_path / "p1", tmp_path / "p2"
+        d1.mkdir()
+        d2.mkdir()
+        a, b = d1 / "granule.h5", d2 / "granule.h5"
+        shutil.copyfile(FIXTURE_H5, a)
+        shutil.copyfile(FIXTURE_H5, b)
+        store = tmp_path / "store"
+        backend = InlineIndex(write_back=True, store=str(store))
+        ds = _fixture_data_source()
+        grid = _LeafSetGrid(_UNALIGNED_LEAVES)
+        ha, hb = self._open(a), self._open(b)
+        for g in ds["groups"]:  # interleave, as granule_workers=2 would
+            backend.read_group(ha, g, ds, 1, grid)
+            backend.read_group(hb, g, ds, 1, grid)
+        # Full-URL keys: two isolated entries, not one merged "granule".
+        assert set(backend._pending) == {str(a), str(b)}
+        with caplog.at_level(logging.INFO, logger="zagg.index.inline"):
+            backend.finish_granule(ha, str(a))
+            assert set(backend._pending) == {str(b)}  # B survives A's drain
+            backend.finish_granule(hb, str(b))
+        assert backend._pending == {}
+        # BOTH granules persisted their manifests (the store key is the shared
+        # stem, so the second write idempotently overwrites the first — the
+        # issue #160 last-writer-wins store convention).
+        writes = [r for r in caplog.records if "inline write-back" in r.message]
+        assert len(writes) == 2
+        assert (store / "granule.parquet").is_file()

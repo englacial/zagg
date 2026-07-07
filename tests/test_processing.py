@@ -5488,6 +5488,37 @@ class TestGranuleReadPool:
         with pytest.raises(ValueError, match="granule_workers"):
             process_shard(_ReleaseGrid(), 0, ["s3://a"], s3_credentials={}, config=cfg)
 
+    def test_sidecar_build_combo_rejected_at_worker(self, monkeypatch):
+        # Mirror of the validate_config guard for hand-rolled payloads: the
+        # installed h5coro-hidefix sidecar lazily initializes its write-back
+        # delegate without a guard, so on_miss: build cannot pool (issue #180
+        # review finding). Duck-typed on name/on_miss — zagg never imports the
+        # external backend.
+        class _FakeSidecar:
+            name = "sidecar"
+            on_miss = "build"
+
+        monkeypatch.setattr("zagg.processing.worker.index_from_config", lambda cfg: _FakeSidecar())
+
+        def exploding_factory(*a, **k):
+            raise AssertionError("no granule should be opened")
+
+        self._patch_h5(monkeypatch, exploding_factory)
+        cfg = _release_cfg()
+        cfg.data_source["granule_workers"] = 2
+        with pytest.raises(ValueError, match="on_miss: 'build'"):
+            process_shard(_ReleaseGrid(), 0, ["s3://a"], s3_credentials={}, config=cfg)
+        # Serial keeps the combo runnable (the delegate is never contended).
+        from zagg.processing.worker import _reject_racy_sidecar_build
+
+        _reject_racy_sidecar_build(object())  # non-sidecar backends: no-op
+
+        class _FallbackSidecar:
+            name = "sidecar"
+            on_miss = "fallback"
+
+        _reject_racy_sidecar_build(_FallbackSidecar())  # keyed _cache: fine
+
     def test_default_serial_never_touches_the_pool(self, monkeypatch):
         # granule_workers absent -> the serial loop; the pool must not even be
         # constructed, so the default path carries zero threading machinery.
@@ -5578,12 +5609,12 @@ class TestGranuleReadPool:
     def test_pooled_granule_failure_skips_and_continues(self, monkeypatch):
         # A failed granule (constructor raise) under the pool matches the serial
         # semantics: warn + skip, remaining granules still process and release.
+        # Gated on the URL, not a shared call counter — the factory runs on
+        # pool threads, where a counter's read-modify-write can race (review).
         log: list = []
-        calls = {"n": 0}
 
-        def factory(*a, **k):
-            calls["n"] += 1
-            if calls["n"] == 2:
+        def factory(resource_path, *a, **k):
+            if resource_path == "s3://b":
                 raise RuntimeError("h5coro open failed")
             return _CloseRecordingH5(_canned_arrays(), log)
 

@@ -457,3 +457,32 @@ class TestSharded:
             np.float32
         )
         np.testing.assert_array_equal(arr, expected)
+
+
+class TestThreadLocalTransformer:
+    """Issue #180 (review finding): ``assign`` runs on the granule pool's
+    worker threads, and a shared pyproj Transformer is only documented
+    thread-safe from pyproj 3.7.0 (unpinned) — so each thread caches its own,
+    with identical construction and byte-identical outputs."""
+
+    def test_per_thread_instances_identical_results(self, grid):
+        import threading
+
+        tx_main = grid._transformer_to_grid()
+        assert grid._transformer_to_grid() is tx_main  # cached within a thread
+
+        box = {}
+        t = threading.Thread(target=lambda: box.update(tx=grid._transformer_to_grid()))
+        t.start()
+        t.join()
+        assert box["tx"] is not tx_main  # a pool thread never shares main's
+        # Identical construction -> identical transforms (always_xy: lon, lat).
+        assert box["tx"].transform(-45.0, -70.0) == tx_main.transform(-45.0, -70.0)
+
+    def test_assign_unchanged(self, grid):
+        # The per-thread cache is invisible to assign's outputs.
+        lats = np.array([-70.0, -75.0])
+        lons = np.array([-45.0, 90.0])
+        leaf1 = grid.assign(lats, lons)
+        leaf2 = grid.assign(lats, lons)
+        np.testing.assert_array_equal(leaf1, leaf2)

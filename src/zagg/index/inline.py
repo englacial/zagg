@@ -55,11 +55,12 @@ logger = logging.getLogger(__name__)
 def _granule_id(resource) -> str:
     """Granule id from a URL / resource path: basename minus extension.
 
-    The write-back manifest key convention (issue #160), and the key isolating
-    each in-flight granule's pending chunk maps (issue #180). Mirrors
-    ``_granule_id`` in h5coro-hidefix's ``zagg_backend``: the stem survives
-    every driver URL rewrite, so ids derived from ``h5obj.resource`` (the
-    rewritten URL) and from the worker's original ``granule_url`` agree.
+    The write-back manifest **store key** convention (issue #160). Mirrors
+    ``_granule_id`` in h5coro-hidefix's ``zagg_backend``. Deliberately NOT the
+    in-memory ``_pending`` key: two distinct granules can share a basename
+    under different prefixes, so the stem would collapse them and interleave
+    chunk maps under ``granule_workers > 1`` (issue #180 review finding) —
+    ``_pending`` keys on the full resource URL instead.
     """
     return PurePosixPath(urlsplit(str(resource)).path).stem
 
@@ -346,14 +347,14 @@ class InlineIndex(VirtualIndex):
         self.write_back = bool(write_back)
         self.store = store
         # Chunk maps accumulated across each in-flight granule's groups,
-        # keyed granule id -> {dataset path -> ChunkMap} (issue #180: the
-        # worker may hold ``data_source.granule_workers`` granules in flight,
-        # and dataset paths repeat across granules, so a flat path-keyed dict
-        # would interleave granules and persist corrupted manifests).
-        # ``finish_granule`` drains exactly its granule's entry. Each granule
-        # is read by a single worker thread, so its sub-dict is never shared;
-        # the outer dict's setdefault/pop are atomic under the GIL. Only
-        # populated when writing back.
+        # keyed full resource URL -> {dataset path -> ChunkMap} (issue #180:
+        # the worker may hold ``data_source.granule_workers`` granules in
+        # flight; dataset paths repeat across granules, and even the granule
+        # id stem can collide across prefixes — review finding — so only the
+        # full URL isolates granules). ``finish_granule`` drains exactly its
+        # granule's entry. Each granule is read by a single worker thread, so
+        # its sub-dict is never shared; the outer dict's setdefault/pop are
+        # atomic under the GIL. Only populated when writing back.
         self._pending: dict[str, dict[str, ChunkMap]] = {}
 
     @classmethod
@@ -396,12 +397,14 @@ class InlineIndex(VirtualIndex):
     def _pending_for(self, h5obj) -> dict[str, ChunkMap]:
         """This granule's pending chunk maps (write-back accumulation).
 
-        Keyed by the granule id of ``h5obj.resource`` — the rewritten URL the
-        worker opened the granule with, whose stem matches ``granule_url``'s
-        (see :func:`_granule_id`) — so concurrent in-flight granules (issue
-        #180) never share chunk-map state.
+        Keyed by the FULL ``h5obj.resource`` URL — the rewritten URL the
+        worker opened the granule with — so concurrent in-flight granules
+        (issue #180) never share chunk-map state, even when their basenames
+        collide across prefixes (review finding: the id stem would collapse
+        ``.../p1/granule.h5`` and ``.../p2/granule.h5`` into one entry and
+        serve B's reads through A's chunk maps).
         """
-        return self._pending.setdefault(_granule_id(h5obj.resource), {})
+        return self._pending.setdefault(str(h5obj.resource), {})
 
     def _prebuild_group_maps(self, h5obj, group: str, data_source: dict) -> None:
         """Build the chunk maps for every dataset this group's read can touch.
@@ -442,26 +445,25 @@ class InlineIndex(VirtualIndex):
         """Write-back seam: persist the granule's accumulated chunk maps.
 
         Drains only THIS granule's pending entry (issue #180: other granules
-        may still be in flight), keyed as the read side keyed it —
-        ``h5obj.resource``'s granule id — with ``granule_url``'s as fallback
+        may still be in flight), keyed as the read side keyed it — the full
+        ``h5obj.resource`` URL — with the full ``granule_url`` as fallback
         for resource-less callers. No-op unless ``write_back`` is on. The
-        manifest key is the granule id (URL basename without extension —
-        granule ids carry product + version, so reprocessing changes the key;
-        issue #160 store convention). Raises on store failures — the worker
-        logs and continues, so a broken store degrades to plain ``inline``
-        reads.
+        manifest STORE key stays the granule id (URL basename without
+        extension — granule ids carry product + version, so reprocessing
+        changes the key; issue #160 store convention). Raises on store
+        failures — the worker logs and continues, so a broken store degrades
+        to plain ``inline`` reads.
         """
-        granule_id = _granule_id(granule_url)
         resource = getattr(h5obj, "resource", None)
-        maps = self._pending.pop(_granule_id(resource), None) if resource is not None else None
+        maps = self._pending.pop(str(resource), None) if resource is not None else None
         if maps is None:
-            maps = self._pending.pop(granule_id, {})
+            maps = self._pending.pop(granule_url, {})
         if not self.write_back:
             return
         maps = {path: cm for path, cm in maps.items() if cm.raw}
         if not maps:
             return
-        key = write_manifest(granule_manifest(maps), self.store, granule_id)
+        key = write_manifest(granule_manifest(maps), self.store, _granule_id(granule_url))
         logger.info(f"  inline write-back: {len(maps)} dataset(s) -> {self.store}/{key}")
 
     def read_group(self, h5obj, group, data_source, shard_key, grid, arrow=False, granule_url=None):

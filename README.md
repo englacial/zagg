@@ -123,6 +123,8 @@ The store path and output grid parameters are defined in the YAML config (`outpu
 
 `data_source.read_workers` (default 8) bounds the per-worker read fan-out on the compiled paths: each in-flight read overlaps S3 latency and decodes with the GIL released. Peak worker memory grows with width — dial down for dense shards.
 
+`data_source.granule_workers` (default 1 = serial) keeps K granules in flight per worker on a bounded thread pool, folded in original granule order so output is byte-identical to serial (issue #180). Opt-in until the fleet A/B picks a default. It multiplies with `read_workers` — dial `read_workers` down as K rises to stay inside the S3 connection budget; peak memory grows by roughly K granule footprints.
+
 ### Step 4: Visualize Results
 
 The output Zarr is a public DGGS dataset. The included notebook rasterizes HEALPix cells to a polar stereographic grid for fast rendering with `imshow`.

@@ -57,11 +57,44 @@ def _granule_workers(data_source: dict) -> int:
     ``read_workers``). Validated at submission (``validate_config``) and
     re-checked here with the same int>=1 / bool-trap guard so hand-rolled
     worker payloads fail loudly before any read.
+
+    Sizing note (review finding, PR #183): this pool composes multiplicatively
+    with ``read_workers`` (and under ``sidecar`` its chunk-fetch pool too), so
+    worst-case in-flight GETs is granule_workers x read_workers x fetch width
+    against h5coro S3Driver's 100-connection budget — dial ``read_workers``
+    down as K rises, and watch ``read_errors`` (queueing + the 5 s timeout can
+    surface as spurious read failures, not slowdowns) in the K-sweep A/B.
     """
     w = data_source.get("granule_workers", 1)
     if isinstance(w, bool) or not isinstance(w, int) or w < 1:
         raise ValueError(f"data_source.granule_workers must be an integer >= 1 (got {w!r})")
     return w
+
+
+def _reject_racy_sidecar_build(index_backend) -> None:
+    """Reject ``sidecar`` + ``on_miss: build`` under ``granule_workers > 1``.
+
+    The installed h5coro-hidefix (<= 0.3.0) lazy-initializes the sidecar's
+    inline write-back delegate with an unguarded check-then-act
+    (``if self._inline is None: self._inline = InlineIndex(...)`` in
+    ``zagg_backend._miss``): two granule threads hitting concurrent misses
+    can each construct a delegate, stranding the loser's already-accumulated
+    pending maps on an orphaned instance — a silently sparse manifest (issue
+    #180 review finding). zagg cannot patch the upstream lazy init, so the
+    combination is rejected here (and at submission in ``validate_config``)
+    until an h5coro-hidefix release constructs the delegate eagerly. Duck-
+    typed on the backend's ``name``/``on_miss`` so zagg core never imports
+    the external backend.
+    """
+    if getattr(index_backend, "name", "") == "sidecar":
+        if getattr(index_backend, "on_miss", None) == "build":
+            raise ValueError(
+                "data_source.granule_workers > 1 is not supported with index backend "
+                "'sidecar' + on_miss: 'build': the installed h5coro-hidefix lazily "
+                "initializes its write-back delegate without a guard, so concurrent "
+                "granules can strand pending chunk maps on an orphaned delegate "
+                "(sparse manifests). Use on_miss: fallback/error, or granule_workers: 1."
+            )
 
 
 def process_shard(
@@ -279,21 +312,24 @@ def process_shard(
     _read_t0 = time.time() if profile else None
 
     # Granule fan-out width (issue #180). Resolved before any read so a bad
-    # value is a loud config error, not N per-granule warnings.
+    # value is a loud config error, not N per-granule warnings; the one known
+    # thread-unsafe backend combination is rejected the same way.
     granule_workers = _granule_workers(data_source)
+    if granule_workers > 1:
+        _reject_racy_sidecar_build(index_backend)
 
     def _read_granule(s3_url: str) -> tuple:
         """One granule end-to-end: H5Coro open → group loop → ``finish_granule``
         → close, all in the calling thread (issue #180 — under the pool each
         granule gets its own ``H5Coro``, never shared across threads).
 
-        Returns ``(reads, group_errors)``: ``reads`` is ``[(group, carrier),
-        ...]`` for the groups that returned data (group order) with ``None``
-        (legitimately empty) groups dropped; ``group_errors`` counts raised
-        group reads, warned here but folded into ``read_errors`` by the main
-        thread (a shared ``+= 1`` from worker threads could race). Raises when
-        the granule itself fails (e.g. the open) — the caller warns and skips
-        it, shard continues (issue #116 semantics).
+        Returns ``(reads, group_errors)``: ``reads`` is the carriers of the
+        groups that returned data (group order, ``None`` — legitimately empty
+        — groups dropped); ``group_errors`` counts raised group reads, warned
+        here but folded into ``read_errors`` by the main thread (a shared
+        ``+= 1`` from worker threads could race). Raises when the granule
+        itself fails (e.g. the open) — the caller warns and skips it, shard
+        continues (issue #116 semantics).
         """
         h5obj = None
         reads: list = []
@@ -318,7 +354,7 @@ def process_shard(
                         h5obj, g, data_source, shard_key, grid, **read_kwargs
                     )
                     if chunk is not None:
-                        reads.append((g, chunk))
+                        reads.append(chunk)
                 except Exception as e:
                     # A raised read error is always a real failure: a
                     # legitimately-empty group returns ``None`` (no exception),
@@ -391,16 +427,22 @@ def process_shard(
                         reads, group_errors = future.result()
                     except Exception as e:
                         logger.warning(f"  Error processing file {s3_url}: {e}")
-                    else:
-                        yield s3_url, reads, group_errors
-                    for u in islice(urls, 1):  # top up: keep ≤ granule_workers in flight
+                        reads = None
+                    # Top up BEFORE yielding (review): the head is done either
+                    # way, so submitting its replacement here keeps the full
+                    # granule_workers in flight while the main thread folds
+                    # (including streaming granule_done flushes) — the ≤ K
+                    # bound and the fold order are unchanged.
+                    for u in islice(urls, 1):
                         in_flight.append((u, pool.submit(_read_granule, u)))
+                    if reads is not None:
+                        yield s3_url, reads, group_errors
 
     # Read files and filter spatially, folding granules in original order.
     for s3_url, reads, group_errors in _iter_granule_reads():
         read_errors += group_errors
         try:
-            for _g, chunk in reads:
+            for chunk in reads:
                 if buffered is not None:
                     buffered.add_read(chunk)
                 else:
