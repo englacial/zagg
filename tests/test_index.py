@@ -1064,6 +1064,76 @@ class TestInlineWriteBackWorker:
 
     def test_finish_granule_drains_pending_when_off(self):
         backend = InlineIndex()
-        backend._pending["/x"] = object()
+        backend._pending["g"] = {"/x": object()}
+        # A resource-less h5obj falls back to the granule_url's id (issue #180).
         backend.finish_granule(object(), "s3://b/g.h5")
         assert backend._pending == {}
+
+
+class TestInlineInterleavedGranules:
+    """Issue #180 phase 1: with granule-level read concurrency the worker may
+    interleave two granules' ``read_group`` calls on one backend instance.
+    ``_pending`` is keyed per granule (not per dataset path — paths repeat
+    across granules), so interleaved write-back reads persist manifests
+    byte-identical to serial ones instead of corrupting them."""
+
+    def _granules(self, tmp_path):
+        import shutil
+
+        a, b = tmp_path / "granA.h5", tmp_path / "granB.h5"
+        shutil.copyfile(FIXTURE_H5, a)
+        shutil.copyfile(FIXTURE_H5, b)
+        return a, b
+
+    def _open(self, path):
+        from h5coro import filedriver
+        from h5coro import h5coro as h5c
+
+        return h5c.H5Coro(str(path), filedriver.FileDriver, errorChecking=True, verbose=False)
+
+    def _read_all_groups(self, backend, h5obj):
+        ds = _fixture_data_source()
+        grid = _LeafSetGrid(_UNALIGNED_LEAVES)
+        for g in ds["groups"]:
+            backend.read_group(h5obj, g, ds, 1, grid)
+
+    def test_interleaved_manifests_byte_identical_to_serial(self, tmp_path):
+        a, b = self._granules(tmp_path)
+        serial_store, inter_store = tmp_path / "serial", tmp_path / "interleaved"
+
+        serial = InlineIndex(write_back=True, store=str(serial_store))
+        for path in (a, b):
+            h5obj = self._open(path)
+            self._read_all_groups(serial, h5obj)
+            serial.finish_granule(h5obj, str(path))
+
+        inter = InlineIndex(write_back=True, store=str(inter_store))
+        ds = _fixture_data_source()
+        grid = _LeafSetGrid(_UNALIGNED_LEAVES)
+        ha, hb = self._open(a), self._open(b)
+        for g in ds["groups"]:  # A.gt1l, B.gt1l, A.gt2l, B.gt2l
+            inter.read_group(ha, g, ds, 1, grid)
+            inter.read_group(hb, g, ds, 1, grid)
+        inter.finish_granule(ha, str(a))
+        inter.finish_granule(hb, str(b))
+
+        for name in ("granA.parquet", "granB.parquet"):
+            assert (inter_store / name).is_file()
+            assert (inter_store / name).read_bytes() == (serial_store / name).read_bytes()
+
+    def test_finish_granule_drains_only_its_granule(self, tmp_path):
+        a, b = self._granules(tmp_path)
+        store = tmp_path / "store"
+        backend = InlineIndex(write_back=True, store=str(store))
+        ha, hb = self._open(a), self._open(b)
+        self._read_all_groups(backend, ha)
+        self._read_all_groups(backend, hb)
+        assert set(backend._pending) == {"granA", "granB"}
+        backend.finish_granule(ha, str(a))
+        # A drained + persisted; B's pending maps untouched, nothing written.
+        assert set(backend._pending) == {"granB"}
+        assert (store / "granA.parquet").is_file()
+        assert not (store / "granB.parquet").exists()
+        backend.finish_granule(hb, str(b))
+        assert backend._pending == {}
+        assert (store / "granB.parquet").is_file()
