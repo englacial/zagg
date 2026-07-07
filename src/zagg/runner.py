@@ -1154,7 +1154,9 @@ def _run_local(
         # the shared config through untouched. Count the RESOLVED urls — what
         # the worker actually reads — not the raw records: _resolve_urls
         # drops href-less records, so len(records) would under-clamp a
-        # partially-resolvable cell (review finding, PR #187).
+        # partially-resolvable cell (review finding, PR #187). This resolve
+        # must stay in lockstep with _process_and_write's own
+        # _resolve_urls(records, driver) — same inputs, so same count.
         ds = _clamped_data_source(config.data_source, len(_resolve_urls(records, driver)))
         cell_config = replace(config, data_source=ds) if ds is not None else config
         try:

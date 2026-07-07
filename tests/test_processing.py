@@ -1270,6 +1270,9 @@ class TestRaggedWriteFanout:
         from zagg.processing.write import _write_ragged_fanout
 
         grid, writes = self._grid_and_writes(5)
+        # Pin the fd ceiling high so the pool branch runs (the serial branch
+        # re-raises the bare OSError, not the RuntimeError summary).
+        monkeypatch.setattr(wmod, "fd_safe_max_workers", lambda: 128)
 
         def boom(ragged, store, *, grid, shard_key):
             if shard_key == 3:
@@ -1290,6 +1293,8 @@ class TestRaggedWriteFanout:
         tb_text = "".join(traceback.format_exception(*rec.exc_info))
         assert "OSError: disk full" in tb_text
         assert "in boom" in tb_text
+        # A single failure logs no roll call — it would just repeat the header.
+        assert not any(r.message.startswith("  ragged (CSR) subgroup ") for r in caplog.records)
 
     def test_fanout_logs_each_failure_bounded(self, monkeypatch, caplog):
         """Multiple subgroup failures each get a one-line ``key: Type: msg``
@@ -1302,6 +1307,9 @@ class TestRaggedWriteFanout:
         from zagg.processing.write import _write_ragged_fanout
 
         grid, writes = self._grid_and_writes(25)
+        # Pin the fd ceiling high so the run truly takes the pool branch (the
+        # serial branch raises the first bare exception and logs no roll call).
+        monkeypatch.setattr(wmod, "fd_safe_max_workers", lambda: 128)
 
         def boom(ragged, store, *, grid, shard_key):
             raise OSError(f"reset {shard_key}")
@@ -1311,8 +1319,10 @@ class TestRaggedWriteFanout:
             with pytest.raises(RuntimeError, match=r"failed for 25 of 25"):
                 _write_ragged_fanout([(r, k) for r, k in writes], MemoryStore(), grid=grid)
         lines = [r.message for r in caplog.records]
+        # Header first (traceback record), then the roll call as its continuation.
+        assert lines[0].startswith("ragged (CSR) subgroup write failed")
         roll_call = [m for m in lines if m.startswith("  ragged (CSR) subgroup ")]
-        assert len(roll_call) == 20  # bounded roll call
+        assert len(roll_call) == wmod._RAGGED_FAILURE_LOG_CAP  # bounded roll call
         assert any("and 5 more subgroup write failure(s)" in m for m in lines)
         # Each roll-call line names its own subgroup key and its own error.
         for m in roll_call:
