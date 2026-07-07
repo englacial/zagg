@@ -1251,6 +1251,24 @@ class TestGranuleWorkersValidation:
             with pytest.raises(ValueError, match=r"data_source\.granule_workers"):
                 validate_config(self._cfg(granule_workers=bad))
 
+    def test_sidecar_build_combo_rejected(self, tmp_path):
+        # granule_workers > 1 with sidecar + on_miss: build is rejected at
+        # submission: the installed h5coro-hidefix lazily initializes its
+        # write-back delegate without a guard (issue #180 review finding).
+        index = {"backend": "sidecar", "store": str(tmp_path), "on_miss": "build"}
+        with pytest.raises(ValueError, match="on_miss: 'build'"):
+            validate_config(self._cfg(granule_workers=2, index=index))
+        # Serial (or defaulted) granule_workers keeps the combo valid...
+        validate_config(self._cfg(granule_workers=1, index=index))
+        validate_config(self._cfg(index=index))
+        # ...and other on_miss policies pool fine (per-granule-keyed _cache).
+        validate_config(
+            self._cfg(
+                granule_workers=2,
+                index={"backend": "sidecar", "store": str(tmp_path), "on_miss": "fallback"},
+            )
+        )
+
 
 # ---------------------------------------------------------------------------
 # Output grid validation

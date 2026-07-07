@@ -113,9 +113,10 @@ class VirtualIndex:
         thread, and that thread calls ``finish_granule`` after the granule's
         last group — but ``read_group``/``finish_granule`` calls for
         *different* granules may interleave across threads. Any backend state
-        that spans one granule's reads must therefore be keyed per granule
-        (e.g. by the ``h5obj.resource`` URL stem, as ``inline._pending`` and
-        the sidecar backend's ``_cache`` are), never by dataset path alone.
+        that spans one granule's reads must therefore be keyed per granule —
+        by the full ``h5obj.resource`` URL, as ``inline._pending`` is — never
+        by dataset path alone, and not by the basename stem either (stems can
+        collide across prefixes; issue #180 review finding).
         """
 
 
