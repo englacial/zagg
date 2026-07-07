@@ -71,32 +71,6 @@ def _granule_workers(data_source: dict) -> int:
     return w
 
 
-def _reject_racy_sidecar_build(index_backend) -> None:
-    """Reject ``sidecar`` + ``on_miss: build`` under ``granule_workers > 1``.
-
-    The installed h5coro-hidefix (<= 0.3.0) lazy-initializes the sidecar's
-    inline write-back delegate with an unguarded check-then-act
-    (``if self._inline is None: self._inline = InlineIndex(...)`` in
-    ``zagg_backend._miss``): two granule threads hitting concurrent misses
-    can each construct a delegate, stranding the loser's already-accumulated
-    pending maps on an orphaned instance — a silently sparse manifest (issue
-    #180 review finding). zagg cannot patch the upstream lazy init, so the
-    combination is rejected here (and at submission in ``validate_config``)
-    until an h5coro-hidefix release constructs the delegate eagerly. Duck-
-    typed on the backend's ``name``/``on_miss`` so zagg core never imports
-    the external backend.
-    """
-    if getattr(index_backend, "name", "") == "sidecar":
-        if getattr(index_backend, "on_miss", None) == "build":
-            raise ValueError(
-                "data_source.granule_workers > 1 is not supported with index backend "
-                "'sidecar' + on_miss: 'build': the installed h5coro-hidefix lazily "
-                "initializes its write-back delegate without a guard, so concurrent "
-                "granules can strand pending chunk maps on an orphaned delegate "
-                "(sparse manifests). Use on_miss: fallback/error, or granule_workers: 1."
-            )
-
-
 def process_shard(
     grid,
     shard_key: int,
@@ -312,11 +286,11 @@ def process_shard(
     _read_t0 = time.time() if profile else None
 
     # Granule fan-out width (issue #180). Resolved before any read so a bad
-    # value is a loud config error, not N per-granule warnings; the one known
-    # thread-unsafe backend combination is rejected the same way.
+    # value is a loud config error, not N per-granule warnings. (Backend
+    # thread-safety under the pool is a dependency contract, not a runtime
+    # check: sidecar's on_miss: build delegate needs h5coro-hidefix >= 0.3.1
+    # — its lazy-init race was fixed upstream — enforced by the pyproject pin.)
     granule_workers = _granule_workers(data_source)
-    if granule_workers > 1:
-        _reject_racy_sidecar_build(index_backend)
 
     def _read_granule(s3_url: str) -> tuple:
         """One granule end-to-end: H5Coro open → group loop → ``finish_granule``

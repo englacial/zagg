@@ -34,7 +34,7 @@ dependencies = [
     # point (0.1.1 carries only the compiled reader, so `sidecar` does not
     # register from it). 0.2.0 is not on PyPI yet — resolution fails until
     # upstream publishes it.
-    "h5coro-hidefix>=0.3.0",
+    "h5coro-hidefix>=0.3.1",
     "mortie>=0.8.5",
     "earthaccess",
     "boto3",
@@ -65,7 +65,7 @@ lambda = [
     "h5coro==1.0.5",
     # Keep this pin in sync with deployment/aws/build_layer.sh (abi3
     # manylinux_2_28 wheels cover both layer arches, ~2.2 MB each).
-    "h5coro-hidefix==0.3.0",
+    "h5coro-hidefix==0.3.1",
     "cramjam",
     "astropy",
 ]
