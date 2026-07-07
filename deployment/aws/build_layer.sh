@@ -75,7 +75,7 @@ $PIP install \
 # its only runtime dep is numpy (already installed above). Keep the pin in
 # sync with the `lambda` extra in pyproject.toml.
 echo "Installing h5coro, h5coro-hidefix and mortie (--no-deps)..."
-$PIP install "h5coro==1.0.4" "h5coro-hidefix==0.2.0" mortie --no-deps -t "$OUTPUT_DIR/python" --no-cache-dir
+$PIP install "h5coro==1.0.4" "h5coro-hidefix==0.3.0" mortie --no-deps -t "$OUTPUT_DIR/python" --no-cache-dir
 
 # Verify numpy stayed < 2.3
 NUMPY_VERSION=$(ls "$OUTPUT_DIR/python" | grep -E "^numpy-" | head -1)
