@@ -1291,6 +1291,35 @@ class TestRaggedWriteFanout:
         assert "OSError: disk full" in tb_text
         assert "in boom" in tb_text
 
+    def test_fanout_logs_each_failure_bounded(self, monkeypatch, caplog):
+        """Multiple subgroup failures each get a one-line ``key: Type: msg``
+        summary (issue #186: the race signature ACROSS subgroups), capped at
+        20 lines, while exactly one record — the first completed failure —
+        carries the full traceback."""
+        import logging
+
+        import zagg.processing.write as wmod
+        from zagg.processing.write import _write_ragged_fanout
+
+        grid, writes = self._grid_and_writes(25)
+
+        def boom(ragged, store, *, grid, shard_key):
+            raise OSError(f"reset {shard_key}")
+
+        monkeypatch.setattr(wmod, "write_ragged_to_zarr", boom)
+        with caplog.at_level(logging.ERROR, logger="zagg.processing.write"):
+            with pytest.raises(RuntimeError, match=r"failed for 25 of 25"):
+                _write_ragged_fanout([(r, k) for r, k in writes], MemoryStore(), grid=grid)
+        lines = [r.message for r in caplog.records]
+        roll_call = [m for m in lines if m.startswith("  ragged (CSR) subgroup ")]
+        assert len(roll_call) == 20  # bounded roll call
+        assert any("and 5 more subgroup write failure(s)" in m for m in lines)
+        # Each roll-call line names its own subgroup key and its own error.
+        for m in roll_call:
+            key = m.split("subgroup ")[1].split(":")[0]
+            assert f"reset {key}" in m
+        assert sum(1 for r in caplog.records if r.exc_info) == 1
+
     def test_fanout_empty_is_noop(self):
         """No ragged writes -> nothing written, no pool spun up."""
         from zagg.processing.write import _write_ragged_fanout

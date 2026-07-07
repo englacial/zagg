@@ -1396,11 +1396,21 @@ class TestSummaryKeysByteIdentical:
 
     @staticmethod
     def _clamp_catalog():
-        # Per-shard granule counts 2 / 6 / 4 / 1 against the default K=4:
-        # shards 10 and 13 clamp, 11 (above K) and 12 (exactly K) pass through.
+        # Per-shard record counts 2 / 6 / 6 / 1 against the default K=4:
+        # shards 10 and 13 clamp, 11 passes through (above K). Shard 12 has 6
+        # records but only 3 with an s3 href — the clamp must count the
+        # RESOLVED urls (what the worker reads), not the raw records, so it
+        # clamps to 3 (PR #187 review finding: len(records) under-clamps a
+        # partially-resolvable cell).
         cat = _run_catalog()
         cat["granules"] = [
-            [{"s3": f"s3://b/g{i}_{j}.h5"} for j in range(n)] for i, n in enumerate((2, 6, 4, 1))
+            [{"s3": f"s3://b/g0_{j}.h5"} for j in range(2)],
+            [{"s3": f"s3://b/g1_{j}.h5"} for j in range(6)],
+            [
+                {"s3": f"s3://b/g2_{j}.h5"} if j < 3 else {"https": f"https://h/g2_{j}.h5"}
+                for j in range(6)
+            ],
+            [{"s3": "s3://b/g3_0.h5"}],
         ]
         return cat
 
@@ -1441,8 +1451,8 @@ class TestSummaryKeysByteIdentical:
             dry_run=False,
             region="us-west-2",
         )
-        assert seen == {10: 2, 11: "ABSENT", 12: "ABSENT", 13: 1}
-        assert shared[11] and shared[12]  # unclamped cells: shared config as-is
+        assert seen == {10: 2, 11: "ABSENT", 12: 3, 13: 1}
+        assert shared[11]  # unclamped cell: shared config object as-is
 
     def test_lambda_clamps_granule_workers_per_cell(self, monkeypatch, atl06_config):
         # Issue #184 (item 1): _run_lambda's per-cell event config carries
@@ -1508,7 +1518,7 @@ class TestSummaryKeysByteIdentical:
             region="us-west-2",
             function_name="fn",
         )
-        assert seen == {10: 2, 11: "ABSENT", 12: "ABSENT", 13: 1}
+        assert seen == {10: 2, 11: "ABSENT", 12: 3, 13: 1}
 
     def test_lambda_summary_keys_and_cost(self, monkeypatch, atl06_config):
         import boto3

@@ -1151,8 +1151,11 @@ def _run_local(
             extra["aoi_payload"] = aoi_by_shard.get(int(shard_key))
         # Per-cell granule_workers clamp (issue #184): min(K, n_granules), so
         # a small cell doesn't spin idle reader threads; unclamped cells pass
-        # the shared config through untouched.
-        ds = _clamped_data_source(config.data_source, len(records))
+        # the shared config through untouched. Count the RESOLVED urls — what
+        # the worker actually reads — not the raw records: _resolve_urls
+        # drops href-less records, so len(records) would under-clamp a
+        # partially-resolvable cell (review finding, PR #187).
+        ds = _clamped_data_source(config.data_source, len(_resolve_urls(records, driver)))
         cell_config = replace(config, data_source=ds) if ds is not None else config
         try:
             meta = _process_and_write(
@@ -1398,7 +1401,11 @@ def _run_lambda(
         # Per-cell granule_workers clamp (issue #184): the worker reads the
         # width from the event's config, so the clamp rides a per-cell copy
         # of it; unclamped cells send the shared config_dict byte-identical.
-        ds = _clamped_data_source(config.data_source, len(records))
+        # Clamp on the RESOLVED url count — what the worker actually reads —
+        # since _resolve_urls drops href-less records (review finding,
+        # PR #187).
+        granule_urls = _resolve_urls(records, "s3")
+        ds = _clamped_data_source(config.data_source, len(granule_urls))
         cell_config_dict = {**config_dict, "data_source": ds} if ds is not None else config_dict
         return _invoke_lambda_cell(
             state["lambda_client"],
@@ -1406,7 +1413,7 @@ def _run_lambda(
             int(shard_key),
             parent_order,
             child_order,
-            _resolve_urls(records, "s3"),
+            granule_urls,
             store_path,
             s3_creds,
             function_name=function_name,
