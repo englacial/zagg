@@ -21,24 +21,34 @@ to hand-assemble zips or wire up the IAM role yourself.
 (it echoes each AWS command before running it). End to end it:
 
 1. **Resolves the artifact version.** Lambda code (the deps layer + function
-   zips) is published to a public **source.coop mirror**, keyed by zagg *minor*
-   version (`0.N.x` -> `0.N`). The minor is read from the repo's latest git tag
-   (so a fresh clone needs no install), falling back to the installed `zagg`, or
-   an explicit `LAMBDA_VERSION` override.
+   zips) is published by the release pipeline to the public
+   **`sliderule-public-cors` distribution bucket**
+   (`s3://sliderule-public-cors/<minor>/`), keyed by zagg *minor* version
+   (`0.N.x` -> `0.N`). The minor is read from the repo's latest git tag (so a
+   fresh clone needs no install), falling back to the installed `zagg`, or an
+   explicit `LAMBDA_VERSION` override (`LAMBDA_VERSION=latest` reads the
+   newest published minor from the bucket's `versions.json`).
 2. **Locates the artifacts for the chosen `ARCH`** (`arm64` default, or
    `x86_64`) -- `lambda_layer_<arch>.zip` and
    `lambda_function_<arch>_py312.zip`.
-3. **Stages code into a same-region bucket if needed.** CloudFormation requires
+3. **Verifies the minor is actually staged and asks for confirmation.** The
+   layer key is HEAD-checked on the distribution bucket before any stack
+   call; an unstaged minor (e.g. one derived from a repo ahead of the last
+   release) fails fast with the staged minors listed, instead of surfacing
+   as a CloudFormation `NoSuchKey` rollback. The resolved bucket/keys/version
+   are then echoed and the script prompts before deploying (pass `--yes` to
+   skip the prompt in unattended runs).
+4. **Stages code into a same-region bucket if needed.** CloudFormation requires
    Lambda code to live in a bucket **in the stack's own region**. In
-   **us-west-2** (where the mirror lives) the stack reads straight from the
-   mirror -- no bucket of your own required. In **any other region** you provide
+   **us-west-2** (where the distribution bucket lives) the stack reads straight
+   from it -- no bucket of your own required. In **any other region** you provide
    `STAGING_BUCKET` (a bucket you own in that region) and `stand_up.sh` copies
    the zips into it first.
-4. **Deploys `template.yaml`** with `aws cloudformation deploy
+5. **Deploys `template.yaml`** with `aws cloudformation deploy
    --capabilities CAPABILITY_NAMED_IAM`, passing the resolved architecture,
    artifact bucket/keys, output bucket, and role settings as parameter
    overrides.
-5. **Prints the stack outputs** (function ARN/name, layer ARN, role ARN, output
+6. **Prints the stack outputs** (function ARN/name, layer ARN, role ARN, output
    bucket).
 
 ## What the stack creates
@@ -66,8 +76,8 @@ to hand-assemble zips or wire up the IAM role yourself.
 
 ## `stand_up.sh` environment variables
 
-Behavior is driven entirely by environment variables (the script takes no
-positional arguments):
+Behavior is driven by environment variables; the only flag is `--yes` (skip
+the pre-deploy confirmation prompt):
 
 | Variable | Default | Purpose |
 |----------|---------|---------|
@@ -77,10 +87,10 @@ positional arguments):
 | `ROLE_ARN` | *(none)* | Pre-existing execution-role ARN, required only when `CREATE_ROLE=false` |
 | `ARCH` | `arm64` | `arm64` or `x86_64` (both py3.12) |
 | `REGION` | `us-west-2` | Deployment region |
-| `STAGING_BUCKET` | *(none)* | Required outside us-west-2: a same-region bucket the mirror zips are copied into |
-| `LAMBDA_VERSION` | *(derived)* | Lambda minor to deploy (default: the repo's latest git tag, else the installed zagg) |
+| `STAGING_BUCKET` | *(none)* | Required outside us-west-2: a same-region bucket the release zips are copied into |
+| `LAMBDA_VERSION` | *(derived)* | Lambda minor to deploy (default: the repo's latest git tag, else the installed zagg; `latest` reads `versions.json`). Whatever it resolves to must be staged on the distribution bucket -- verified before the stack call |
 | `STACK_NAME` | `zagg-backend` | CloudFormation stack name |
-| `MIRROR_BUCKET` / `MIRROR_PREFIX` / `MIRROR_REGION` | source.coop | Override to self-host the artifact mirror |
+| `DIST_BUCKET` / `DIST_PREFIX` / `DIST_REGION` | `sliderule-public-cors` / *(none)* / `us-west-2` | Override to self-host a copy of the release artifacts |
 
 These map onto the `template.yaml` parameters (`Architecture`, `ArtifactBucket`,
 `LayerS3Key`, `FunctionS3Key`, `OutputBucketName`, `CreateOutputBucket`,
@@ -104,14 +114,16 @@ CREATE_ROLE=false ROLE_ARN=arn:aws:iam::123456789012:role/zagg-exec \
 
 ## Updating and tearing down
 
-Re-running `stand_up.sh` with a newer `LAMBDA_VERSION` (or after the mirror is
-re-populated for the current minor) updates the stack in place. To remove
-everything:
+Re-running `stand_up.sh` with a newer `LAMBDA_VERSION` (or after the
+distribution bucket is re-populated for the current minor) updates the stack in
+place. To remove everything:
 
 ```bash
 aws cloudformation delete-stack --stack-name zagg-backend --region us-west-2
 ```
 
-Maintainers (re)populate the mirror after a release with
-`deployment/aws/publish_mirror.sh <minor>`, which pushes the four CI-built zips
-(plus `SHA256SUMS`) to `s3://<mirror>/englacial/zagg/lambda/<minor>/`.
+The distribution bucket is populated automatically on release: pushing a
+version tag runs `publish.yml`'s `distribute` job
+(`.github/scripts/distribute_zips.sh`), which pushes the four CI-built zips
+(plus `SHA256SUMS`) to `s3://sliderule-public-cors/<minor>/` and updates the
+top-level `versions.json` index.
