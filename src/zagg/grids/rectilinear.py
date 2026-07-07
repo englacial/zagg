@@ -34,7 +34,6 @@ filter rejects them, so they fall out of the pipeline silently.
 from __future__ import annotations
 
 import math
-import threading
 
 import numpy as np
 from affine import Affine
@@ -169,6 +168,7 @@ class RectilinearGrid:
         affine = Affine.translation(self.xmin, self.ymax) * Affine.scale(self.res_x, -self.res_y)
         self._geobox = GeoBox((self.height, self.width), affine, self.crs)
         self._tiles = GeoboxTiles(self._geobox, (self.chunk_h, self.chunk_w))
+        self._transformer = None  # lazy WGS84 -> grid CRS, for assign
 
     # ── shape properties ─────────────────────────────────────────────────
 
@@ -644,36 +644,18 @@ class RectilinearGrid:
         return (packed // self.n_col_blocks, packed % self.n_col_blocks)
 
     def _transformer_to_grid(self):
-        """WGS84 → grid CRS transformer (lat/lon → x/y), one per thread.
+        """WGS84 → grid CRS transformer (lat/lon → x/y).
 
-        ``assign`` now runs on the granule pool's worker threads (issue #180),
-        and a shared pyproj ``Transformer`` is only documented thread-safe
-        from pyproj 3.7.0 — which ``pyproject.toml`` deliberately leaves
-        unpinned (a floor is a dependency change, §4). Caching one transformer
-        per (thread, crs) in module-level thread-local storage sidesteps the
-        PROJ-context race on any pyproj version; construction is identical, so
-        outputs are byte-identical to the old shared instance.
+        Shared across the granule pool's worker threads (issue #180):
+        concurrent ``.transform()`` on one ``Transformer`` is thread-safe from
+        pyproj 3.7.0, which is the ``pyproject.toml`` floor (espg-authorized;
+        the lazy init race here is benign — construction is idempotent).
         """
-        return _thread_transformer(self.crs)
+        if self._transformer is None:
+            from pyproj import Transformer
 
-
-#: Per-thread pyproj Transformer cache (issue #180 — see
-#: ``RectilinearGrid._transformer_to_grid``). Module-level so grid instances
-#: stay free of unpicklable ``threading.local`` state.
-_TRANSFORMER_TLS = threading.local()
-
-
-def _thread_transformer(crs: str):
-    """This thread's WGS84 → ``crs`` transformer, constructed once per thread."""
-    cache = getattr(_TRANSFORMER_TLS, "by_crs", None)
-    if cache is None:
-        cache = _TRANSFORMER_TLS.by_crs = {}
-    tx = cache.get(crs)
-    if tx is None:
-        from pyproj import Transformer
-
-        tx = cache[crs] = Transformer.from_crs("EPSG:4326", crs, always_xy=True)
-    return tx
+            self._transformer = Transformer.from_crs("EPSG:4326", self.crs, always_xy=True)
+        return self._transformer
 
 
 def _whole_ratio(a: float, b: float, tol: float = 1e-9) -> bool:
