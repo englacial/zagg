@@ -186,6 +186,22 @@ class TestS3RetryConfig:
         assert kwargs["skip_signature"] is True
         assert "credential_provider" not in kwargs
         prov_cls.assert_not_called()
+        # The anonymous branch still inherits the read-only retry policy.
+        from zagg.store import _S3_READONLY_RETRY_CONFIG
+
+        assert kwargs["retry_config"] == _S3_READONLY_RETRY_CONFIG
+
+    def test_skip_signature_with_credentials_takes_credentialed_branch(self, mock_s3):
+        """Explicit credentials win over ``skip_signature``: the credentialed
+        branch is taken (signed client config), ``skip_signature`` rides
+        through kwargs for obstore to honor."""
+        s3_cls, prov_cls = mock_s3
+        creds = {"accessKeyId": "AKIA", "secretAccessKey": "secret"}
+        open_store("s3://bucket/x.zarr", credentials=creds, skip_signature=True)
+        _, kwargs = s3_cls.call_args
+        assert kwargs["access_key_id"] == "AKIA"
+        assert kwargs["skip_signature"] is True
+        prov_cls.assert_not_called()
 
     def test_default_not_aliased(self, mock_s3):
         """Each store gets its own copy — mutating one store's config must
