@@ -1,5 +1,6 @@
 """Store factory for opening Zarr stores from path strings."""
 
+import copy
 from datetime import timedelta
 from pathlib import Path
 
@@ -14,8 +15,11 @@ from zarr.storage import LocalStore
 # retries in 1.8-3.1 s). These defaults pace retries seconds apart with ~2 min
 # of headroom, which is what S3's "Please reduce your request rate" asks for.
 # ``retry_timeout`` stays at obstore's 180 s default, below the 5-minute
-# credential-validity bound its docs warn about. Callers can pass their own
-# ``retry_config`` through ``**kwargs`` to override.
+# credential-validity bound its docs warn about — and since the nominal sleep
+# sum of 12 paced retries exceeds it, the timeout (not ``max_retries``) is the
+# effective bound under a long burst. Callers can pass their own
+# ``retry_config`` through ``**kwargs`` to override (``None`` means this
+# default, not obstore's).
 _S3_RETRY_CONFIG = {
     "max_retries": 12,
     "retry_timeout": timedelta(seconds=180),
@@ -52,7 +56,9 @@ def open_store(
         Custom S3-compatible endpoint (e.g. Cloudflare R2, MinIO). Ignored
         for local stores.
     **kwargs
-        For S3 stores: ``region`` (default ``"us-west-2"``).
+        For S3 stores: ``region`` (default ``"us-west-2"``) and any obstore
+        ``S3Store`` option — notably ``retry_config``, which defaults to the
+        paced :data:`_S3_RETRY_CONFIG` policy (issue #186).
 
     Returns
     -------
@@ -130,7 +136,11 @@ def _s3_object_store(
 
     bucket, prefix = parse_s3_path(path)
     region = kwargs.pop("region", "us-west-2")
-    kwargs.setdefault("retry_config", _S3_RETRY_CONFIG)
+    if kwargs.get("retry_config") is None:
+        # Deep copy so no store's kwargs alias the module default (obstore
+        # only reads it at construction, but a future mutation of one store's
+        # config must not edit the global).
+        kwargs["retry_config"] = copy.deepcopy(_S3_RETRY_CONFIG)
 
     if credentials or endpoint_url:
         opts = {
