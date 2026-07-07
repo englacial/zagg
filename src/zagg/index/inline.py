@@ -529,7 +529,27 @@ class InlineIndex(VirtualIndex):
         ``finish_granule`` to persist. Each dataset gets
         its own single-dataset in-memory ``Index`` (~ms), so a spec hidefix
         rejects degrades that dataset alone.
+
+        Selection-shaped reads skip the walk (issue #185): on the planned
+        route a full-dataset read (``hyperslice is None``) is a segment-rate
+        selection read — data reads arrive as hyperslices — and h5coro's
+        ``readDatasets`` (4 MiB cache lines) serves those faster than the
+        compiled route once the B-tree walk is priced in (the 0.18 inline
+        regression, ~41% at ``granule_workers: 1``; the #170 matrix measured
+        the same trade). So with ``write_back`` off, an unmapped full-dataset
+        read on the planned route goes straight through ``readDatasets`` and
+        builds no chunk map. A path already mapped (e.g. one that is both a
+        data and a selection read) keeps the compiled route — the map is paid
+        for. With ``write_back`` ON nothing changes: the walk's product IS
+        the manifest payload, so selection datasets stay mapped (and served
+        compiled) to keep manifests covering them for sidecar consumers. The
+        full-read route (``planned=False``) is untouched — its compiled
+        full-dataset decode is the point of issue #170.
         """
+        # Issue #185: with write_back off there is no manifest to enrich, so
+        # the planned route's full-dataset (selection) reads bypass the
+        # chunk-map build entirely -- see read_fn below.
+        selection_direct = planned and not self.write_back
         maps: dict[str, ChunkMap] = self._pending_for(h5obj) if self.write_back else {}
         # One single-dataset Index per path (~ms each): a dataset whose spec
         # hidefix rejects (nonzero filter_mask, non-tiling chunk table) then
@@ -579,6 +599,13 @@ class InlineIndex(VirtualIndex):
         def read_fn(path, hyperslice=None):
             cm = maps.get(path)
             if cm is None and path not in direct:
+                if selection_direct and hyperslice is None:
+                    # Selection-shaped read (issue #185): serve through
+                    # h5coro's cache-line path, build no chunk map. Full
+                    # readDatasets reads never trip the PR #152 start-edge
+                    # off-by-one (that is a ranged-read quirk), so no
+                    # boundary workaround is needed here.
+                    return h5obj.readDatasets([path])[path]
                 try:
                     cm = maps[path] = build_chunk_map(h5obj, path)
                 except Exception:

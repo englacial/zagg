@@ -812,16 +812,26 @@ class TestInlineReadGroup:
 
 
 class TestSelectionReads:
-    """Issue #179 (folded into #180): the planned route's selection reads —
-    segment-rate geolocation coordinates + link arrays — go through the same
-    compiled, pooled ``read_fn`` seam as the data reads when an index backend
-    supplies one, and stay serial batched h5coro when it doesn't."""
+    """Issue #179 routed the planned route's selection reads — segment-rate
+    geolocation coordinates + link arrays — through the backend ``read_fn``
+    seam. Issue #185: inline serves those (full-dataset, no hyperslice) reads
+    straight through h5coro's ``readDatasets`` WITHOUT building chunk maps
+    when ``write_back`` is off (the shipped ``index: None`` default — the
+    B-tree walks were the 0.18 ~41% regression); with ``write_back`` ON the
+    maps ARE the manifest payload, so selection reads stay compiled and
+    manifests keep covering the selection datasets for sidecar consumers."""
 
     SELECTION_PATHS = [
         "/gt1l/geolocation/reference_photon_lat",
         "/gt1l/geolocation/reference_photon_lon",
         "/gt1l/geolocation/ph_index_beg",
         "/gt1l/geolocation/segment_ph_cnt",
+    ]
+    DATA_PATHS = [
+        "/gt1l/heights/lat_ph",
+        "/gt1l/heights/lon_ph",
+        "/gt1l/heights/h_ph",
+        "/gt1l/heights/signal_conf_ph",
     ]
 
     @staticmethod
@@ -837,17 +847,57 @@ class TestSelectionReads:
         h5obj.readDatasets = recorder
         return calls
 
-    def test_inline_selection_reads_bypass_readdatasets(self):
-        # With the inline backend every dataset of a planned group read —
-        # selection AND data — is served by the compiled route; the uncompiled
-        # ``readDatasets`` API is never touched, and rows stay identical to
-        # the hierarchical baseline.
+    @staticmethod
+    def _spy_chunk_map_builds(monkeypatch):
+        """Record every dataset path ``build_chunk_map`` walks (the map-build
+        seam: lazy read_fn builds AND write_back's ``_prebuild_group_maps``)."""
+        import zagg.index.inline as inline_mod
+
+        built = []
+        orig = inline_mod.build_chunk_map
+
+        def spy(h5obj, path):
+            built.append(path)
+            return orig(h5obj, path)
+
+        monkeypatch.setattr(inline_mod, "build_chunk_map", spy)
+        return built
+
+    def test_default_selection_reads_skip_chunk_maps(self, monkeypatch):
+        # The default path (planned, write_back off): selection reads are
+        # served whole via readDatasets — never walked into chunk maps — while
+        # the data reads keep the compiled route; rows stay identical to the
+        # hierarchical baseline (i.e. to the pre-#179 selection behavior).
+        ds = _fixture_data_source()
+        grid = _LeafSetGrid(_UNALIGNED_LEAVES)
+        h5obj = _open_fixture()
+        built = self._spy_chunk_map_builds(monkeypatch)
+        calls = self._record_read_datasets(h5obj)
+        df_i = InlineIndex().read_group(h5obj, "gt1l", ds, 1, grid)
+        assert set(built) & set(self.SELECTION_PATHS) == set()
+        assert "/gt1l/heights/h_ph" in built  # data reads still map + compile
+        # readDatasets served exactly the selection datasets, one full read
+        # each (list-of-one-path calls, no hyperslice dicts).
+        served = [d for call in calls for d in call]
+        assert all(isinstance(d, str) for d in served)
+        assert set(served) == set(self.SELECTION_PATHS)
+        df_h = HierarchicalIndex().read_group(_open_fixture(), "gt1l", ds, 1, grid)
+        pd.testing.assert_frame_equal(df_i, df_h)
+
+    def test_write_back_selection_reads_stay_compiled(self, tmp_path):
+        # write_back ON keeps the pre-#185 behavior byte-for-byte: every
+        # dataset — selection AND data — is served by the compiled route (the
+        # walk's product is the manifest payload), readDatasets is never
+        # touched, and rows stay identical to the hierarchical baseline.
         ds = _fixture_data_source()
         grid = _LeafSetGrid(_UNALIGNED_LEAVES)
         h5obj = _open_fixture()
         calls = self._record_read_datasets(h5obj)
-        df_i = InlineIndex().read_group(h5obj, "gt1l", ds, 1, grid)
+        backend = InlineIndex(write_back=True, store=str(tmp_path))
+        df_i = backend.read_group(h5obj, "gt1l", ds, 1, grid)
         assert calls == []
+        # The pending maps (the manifest payload) cover the selection datasets.
+        assert set(self.SELECTION_PATHS) <= set(backend._pending[str(h5obj.resource)])
         df_h = HierarchicalIndex().read_group(_open_fixture(), "gt1l", ds, 1, grid)
         pd.testing.assert_frame_equal(df_i, df_h)
 
@@ -875,28 +925,29 @@ class TestSelectionReads:
         assert df is not None
         assert self.SELECTION_PATHS in calls  # the one batched selection read
 
-    def test_segment_variable_reads_bypass_readdatasets(self):
-        # issue #179 fold: the segment-level variable + link reads
-        # (_read_segment_broadcasts) ride the same read_fn seam on the
-        # planned route — fully compiled under inline, rows identical to
-        # hierarchical.
+    def test_segment_variable_reads_skip_chunk_maps(self, monkeypatch):
+        # The segment-level variable + link reads (_read_segment_broadcasts)
+        # arrive as full-dataset reads on the planned route, so the issue #185
+        # heuristic serves them via readDatasets too — no chunk-map walks —
+        # with rows identical to hierarchical.
         ds = _fixture_data_source()
         ds["levels"]["segments"]["variables"] = {
             "seg_lat": "/{group}/geolocation/reference_photon_lat"
         }
         grid = _LeafSetGrid(_UNALIGNED_LEAVES)
         h5obj = _open_fixture()
-        calls = self._record_read_datasets(h5obj)
+        built = self._spy_chunk_map_builds(monkeypatch)
         df_i = InlineIndex().read_group(h5obj, "gt1l", ds, 1, grid)
-        assert calls == []
+        assert set(built) & set(self.SELECTION_PATHS) == set()
         assert "seg_lat" in df_i.columns
         df_h = HierarchicalIndex().read_group(_open_fixture(), "gt1l", ds, 1, grid)
         pd.testing.assert_frame_equal(df_i, df_h)
 
-    def test_cross_level_filter_reads_bypass_readdatasets(self):
-        # issue #179 fold: cross-level (Phase B) coarse flag + link reads take
-        # the compiled, pooled seam too. The ne -1 predicate keeps every
-        # segment, so rows stay identical to hierarchical.
+    def test_cross_level_filter_reads_skip_chunk_maps(self, monkeypatch):
+        # Cross-level (Phase B) coarse flag + link reads are full-dataset
+        # reads on the planned route — served direct, never walked. The ne -1
+        # predicate keeps every segment, so rows stay identical to
+        # hierarchical.
         ds = _fixture_data_source()
         ds["filters"] = ds["filters"] + [
             {
@@ -908,37 +959,41 @@ class TestSelectionReads:
         ]
         grid = _LeafSetGrid(_UNALIGNED_LEAVES)
         h5obj = _open_fixture()
-        calls = self._record_read_datasets(h5obj)
+        built = self._spy_chunk_map_builds(monkeypatch)
         df_i = InlineIndex().read_group(h5obj, "gt1l", ds, 1, grid)
-        assert calls == []
+        assert set(built) & set(self.SELECTION_PATHS) == set()
         df_h = HierarchicalIndex().read_group(_open_fixture(), "gt1l", ds, 1, grid)
         pd.testing.assert_frame_equal(df_i, df_h)
 
-    def test_full_read_fallback_keeps_compiled_route(self):
-        # issue #179 fold: plan.full_read (selectivity above threshold — 0.0
-        # forces it) defers to _read_group_full WITH the backend's read_fn,
-        # so the fallback stays compiled instead of dropping to serial h5coro.
-        # Baseline: the planned route at the default threshold — full-read and
-        # planned output is row-identical (#43 Phase C parity), and the
-        # hierarchical FULL-read route can't serve this shard at all (its mask
-        # starts on a chunk boundary, photon 512 — the PR #152 h5coro
-        # start-edge bug the compiled route is immune to).
+    def test_full_read_fallback_data_reads_stay_compiled(self, monkeypatch):
+        # plan.full_read (selectivity above threshold — 0.0 forces it) defers
+        # to _read_group_full WITH the backend's read_fn (issue #179). Under
+        # the issue #185 heuristic its full-dataset COORDINATE reads are
+        # served direct (no walk — matching the pre-#179 fallback, which
+        # bypassed the seam entirely), while the hyperslice DATA reads keep
+        # the compiled route — which this shard needs: its mask window starts
+        # on a chunk boundary (photon 512), the PR #152 h5coro start-edge bug
+        # the compiled route is immune to. Baseline: the planned route at the
+        # default threshold — full-read and planned output is row-identical
+        # (#43 Phase C parity).
         ds = _fixture_data_source(
             read_plan={"spatial_index": "segments", "pad": 1, "full_read_threshold": 0.0}
         )
         grid = _LeafSetGrid(_UNALIGNED_LEAVES)
         h5obj = _open_fixture()
-        calls = self._record_read_datasets(h5obj)
+        built = self._spy_chunk_map_builds(monkeypatch)
         df_i = InlineIndex().read_group(h5obj, "gt1l", ds, 1, grid)
-        assert calls == []
         assert df_i is not None and len(df_i) > 0
+        assert "/gt1l/heights/lat_ph" not in built  # full coord reads: direct
+        assert "/gt1l/heights/h_ph" in built  # ranged data reads: compiled
         df_h = HierarchicalIndex().read_group(
             _open_fixture(), "gt1l", _fixture_data_source(), 1, grid
         )
         pd.testing.assert_frame_equal(df_i, df_h)
 
-    def test_selection_dataset_degrades_alone(self, monkeypatch, caplog):
-        # A selection dataset the compiled reader rejects degrades to the
+    def test_selection_dataset_degrades_alone_under_write_back(self, monkeypatch, caplog, tmp_path):
+        # With write_back ON selection reads stay compiled (issue #185), so a
+        # selection dataset the compiled reader rejects still degrades to the
         # h5coro decoder per dataset — same seam as the data reads (PR #173
         # convention) — and rows stay identical to hierarchical.
         import logging
@@ -956,8 +1011,9 @@ class TestSelectionReads:
         monkeypatch.setattr(hh_manifest, "datasets_from_manifest", picky)
         ds = _fixture_data_source()
         grid = _LeafSetGrid(_UNALIGNED_LEAVES)
+        backend = InlineIndex(write_back=True, store=str(tmp_path))
         with caplog.at_level(logging.WARNING, logger="zagg.index.inline"):
-            df_i = InlineIndex().read_group(_open_fixture(), "gt1l", ds, 1, grid)
+            df_i = backend.read_group(_open_fixture(), "gt1l", ds, 1, grid)
         df_h = HierarchicalIndex().read_group(_open_fixture(), "gt1l", ds, 1, grid)
         pd.testing.assert_frame_equal(df_i, df_h)
         warned = [r.message for r in caplog.records if "compiled decode unavailable" in r.message]
@@ -1195,6 +1251,26 @@ class TestInlineWriteBackWorker:
         assert meta["error"] is None
         df = pd.read_parquet(store / "atl03_mini.parquet", engine="fastparquet")
         assert set(df["dataset"]) == self._expected_datasets()
+
+    def test_manifest_byte_identical_to_direct_chunk_maps(self, tmp_path):
+        # Pins the sidecar-build product (issue #185): the persisted manifest
+        # is byte-identical to one assembled directly from build_chunk_map
+        # over the deterministic per-group coverage — the selection datasets
+        # included — so the default path's skip-the-walk heuristic cannot
+        # erode what write_back runs persist.
+        from zagg.index.inline import write_manifest
+
+        store = tmp_path / "via-backend"
+        df_out, meta = self._run(
+            tmp_path, {"backend": "inline", "write_back": True, "store": str(store)}
+        )
+        assert meta["error"] is None
+        h5obj = _open_fixture()
+        direct = {p: build_chunk_map(h5obj, p) for p in self._expected_datasets()}
+        write_manifest(granule_manifest(direct), str(tmp_path / "direct"), "atl03_mini")
+        assert (store / "atl03_mini.parquet").read_bytes() == (
+            tmp_path / "direct" / "atl03_mini.parquet"
+        ).read_bytes()
 
     def test_write_back_off_writes_nothing(self, tmp_path):
         df_out, meta = self._run(tmp_path, {"backend": "inline"})
