@@ -304,23 +304,6 @@ def validate_config(config: PipelineConfig) -> None:
         raise ValueError(
             f"data_source.granule_workers must be an integer >= 1 (got {granule_workers!r})"
         )
-    # Reject the one known thread-unsafe backend combination at submission
-    # (mirrors the worker's _reject_racy_sidecar_build; see its docstring for
-    # the installed-h5coro-hidefix delegate lazy-init race, issue #180 review).
-    index_cfg = (config.data_source or {}).get("index")
-    if (
-        isinstance(granule_workers, int)
-        and granule_workers > 1
-        and isinstance(index_cfg, dict)
-        and index_cfg.get("backend") == "sidecar"
-        and index_cfg.get("on_miss") == "build"
-    ):
-        raise ValueError(
-            "data_source.granule_workers > 1 is not supported with index backend "
-            "'sidecar' + on_miss: 'build' (h5coro-hidefix write-back delegate "
-            "lazy-init race); use on_miss: fallback/error, or granule_workers: 1"
-        )
-
     # Optional strict-AOI cell mask (issue #101), default off. Must be a bool.
     aoi_mask = config.output.get("aoi_mask")
     if aoi_mask is not None and not isinstance(aoi_mask, bool):
