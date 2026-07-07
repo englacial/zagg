@@ -30,13 +30,16 @@ _S3_RETRY_CONFIG = {
     },
 }
 
-# Read-only carve-out: stores opened via ``open_store(read_only=True)`` are the
-# interactive population (notebooks, readers, read-back analysis) — for them a
-# genuinely failing endpoint should surface a clear error in ~30 s, not feel
-# hung for the full write policy above. Still paced (rides a typical throttle
-# burst), and reads are far harder to throttle anyway (S3's per-prefix GET
-# budget is ~5,500/s vs ~3,500 for PUT). Fleet workers open read-write, so the
-# issue #186 fix is unaffected.
+# Read-only carve-out: stores opened via ``open_store(read_only=True)`` (e.g.
+# readers, read-back analysis, temporal .zarr reads) — for them a genuinely
+# failing endpoint should surface a clear error quickly (nominal sleep sum
+# 15 s, so ``max_retries`` is the effective bound and the 30 s timeout a
+# ceiling), not feel hung for the full write policy above. Still paced (rides
+# a typical throttle burst), and reads are far harder to throttle anyway
+# (S3's per-prefix GET budget is ~5,500/s vs ~3,500 for PUT). Fleet workers
+# open read-write, so the issue #186 fix is unaffected. Read paths that build
+# their own client (the example notebooks) or go through
+# ``open_object_store`` (no read-only concept) are not covered.
 _S3_READONLY_RETRY_CONFIG = {
     "max_retries": 4,
     "retry_timeout": timedelta(seconds=30),

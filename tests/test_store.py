@@ -154,7 +154,20 @@ class TestS3RetryConfig:
         open_store("s3://bucket/prefix.zarr", read_only=True)
         _, kwargs = s3_cls.call_args
         assert kwargs["retry_config"] == _S3_READONLY_RETRY_CONFIG
-        assert kwargs["retry_config"] is not _S3_READONLY_RETRY_CONFIG  # no aliasing
+        # No aliasing, nested backoff included (mirrors test_default_not_aliased).
+        assert kwargs["retry_config"] is not _S3_READONLY_RETRY_CONFIG
+        assert kwargs["retry_config"]["backoff"] is not _S3_READONLY_RETRY_CONFIG["backoff"]
+
+    def test_read_only_explicit_none_gets_short_policy(self, mock_s3):
+        """``retry_config=None`` on a read-only store means the read-only
+        default (mirrors ``test_explicit_none_gets_default`` on the write
+        path — the guard is ``is None``, not key-absence)."""
+        from zagg.store import _S3_READONLY_RETRY_CONFIG
+
+        s3_cls, _ = mock_s3
+        open_store("s3://bucket/prefix.zarr", read_only=True, retry_config=None)
+        _, kwargs = s3_cls.call_args
+        assert kwargs["retry_config"] == _S3_READONLY_RETRY_CONFIG
 
     def test_read_only_override_wins(self, mock_s3):
         s3_cls, _ = mock_s3
