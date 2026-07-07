@@ -43,7 +43,7 @@ exit 0
 """
 
 
-def _run(tmp_path, *args, env_extra=None, stdin="", staged=("0.14",), versions=None):
+def _run(tmp_path, *args, env_extra=None, stdin="", staged=("0.14",), versions=None, drop=None):
     bindir = tmp_path / "bin"
     bindir.mkdir(exist_ok=True)
     (bindir / "aws").write_text(STUB_AWS)
@@ -55,6 +55,8 @@ def _run(tmp_path, *args, env_extra=None, stdin="", staged=("0.14",), versions=N
         d.mkdir(parents=True, exist_ok=True)
         (d / "lambda_layer_arm64.zip").write_bytes(b"dummy")
         (d / "lambda_function_arm64_py312.zip").write_bytes(b"dummy")
+    if drop is not None:  # simulate a partially staged minor
+        (staged_dir / drop).unlink()
 
     seed_dir = tmp_path / "seed"
     seed_dir.mkdir(exist_ok=True)
@@ -102,6 +104,21 @@ def test_unstaged_minor_fails_before_any_stack_call(tmp_path):
     assert "cloudformation" not in log
 
 
+def test_partially_staged_minor_fails_before_any_stack_call(tmp_path):
+    # Both keys are HEAD-verified (review fold): a minor with the layer staged
+    # but the function zip missing must still fail before any stack call.
+    result, log = _run(
+        tmp_path,
+        "--yes",
+        env_extra={"LAMBDA_VERSION": "0.14"},
+        drop="0.14/lambda_function_arm64_py312.zip",
+    )
+    assert result.returncode != 0
+    assert "not staged" in result.stdout
+    assert "lambda_function_arm64_py312.zip" in result.stdout
+    assert "cloudformation" not in log
+
+
 def test_staged_minor_deploys_from_distribution_bucket(tmp_path):
     # Happy path: the current release layout (sliderule-public-cors/<minor>/<zip>)
     # is what reaches `cloudformation deploy` — no source.coop anywhere.
@@ -144,9 +161,12 @@ def test_confirm_prompt_proceeds_on_y(tmp_path):
 
 
 def test_no_input_and_no_yes_aborts(tmp_path):
-    # Unattended run without --yes (EOF on stdin) must fail safe, not deploy.
+    # Unattended run without --yes (EOF on stdin) must fail safe, not deploy —
+    # and still print the actionable abort message (review fold: a bare `read`
+    # under `set -e` used to exit on EOF before reaching the message).
     result, log = _run(tmp_path, env_extra={"LAMBDA_VERSION": "0.14"}, stdin="")
     assert result.returncode != 0
+    assert "Aborted (pass --yes" in result.stdout
     assert "cloudformation" not in log
 
 

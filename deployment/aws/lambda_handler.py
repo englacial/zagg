@@ -150,8 +150,8 @@ logger.setLevel(logging.INFO)
 _CONTAINER_INIT_TS = time.time()
 _INVOCATIONS_SERVED = 0
 # Recycle budget (issue #177), counted separately from the true generation
-# above: only recycle-eligible (async, result_url-mirrored) invocations are
-# billed against ``ZAGG_RECYCLE_MAX_INVOCATIONS``. A synchronous setup/
+# above: only recycle-eligible (async ``result_url``) invocations are billed
+# against ``ZAGG_RECYCLE_MAX_INVOCATIONS``. A synchronous setup/
 # finalize invoke still warms the sandbox (the generation keeps counting it,
 # and telemetry keeps reporting it) but must not consume the worker budget --
 # MAX_INVOCATIONS=1 means "one heavy async invocation per container", not
@@ -260,9 +260,11 @@ def _maybe_self_recycle() -> None:
     exiting so dashboards can split intentional recycles from real crashes
     (metric-filter note in docs/deployment/lambda.md). The line carries both
     the async budget spent and the true container generation.
+
+    Pure check: the async budget itself is billed at the dispatcher (every
+    ``result_url`` invocation, mirror success or not), so a failed mirror --
+    which skips this call -- still burns the budget (issue #177 review fold).
     """
-    global _ASYNC_INVOCATIONS_SERVED
-    _ASYNC_INVOCATIONS_SERVED += 1
     rss_limit = _recycle_limit("ZAGG_RECYCLE_RSS_MB")
     gen_limit = _recycle_limit("ZAGG_RECYCLE_MAX_INVOCATIONS")
     kib = _read_vmrss_kib()
@@ -462,6 +464,13 @@ def lambda_handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
     # result_url for it to poll. Covers every branch (200 / 400 / 500) of both
     # per-unit handlers (spatial process, temporal process_event -- #12 Phase 8).
     if event.get("result_url"):
+        # Bill this async invocation against the recycle budget (issue #177)
+        # BEFORE the mirror-success gate: the invocation was served either
+        # way, so a failed mirror must not stretch the sandbox's budget (the
+        # pre-#177 generation counter counted it too). Only the recycle
+        # itself stays gated on the mirror landing.
+        global _ASYNC_INVOCATIONS_SERVED
+        _ASYNC_INVOCATIONS_SERVED += 1
         mirrored = _write_result(event["result_url"], response, event)
         # Self-recycle strictly AFTER a successful result mirror (issue #171):
         # the orchestrator polls the result object, not the Lambda response

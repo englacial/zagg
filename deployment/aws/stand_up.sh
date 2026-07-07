@@ -112,20 +112,26 @@ fi
 echo "zagg lambda artifacts: $MINOR ($ARCH), region $REGION"
 
 # Refuse to guess (issue #174): the resolved minor must actually be staged on
-# the distribution bucket. A HEAD on the layer key catches a phantom version
-# (e.g. one derived from post-tag main) here, with an actionable message,
-# instead of as a CloudFormation NoSuchKey mid-update.
+# the distribution bucket. A HEAD on both the layer and function keys catches
+# a phantom version (e.g. one derived from post-tag main) here, with an
+# actionable message, instead of as a CloudFormation NoSuchKey mid-update.
+# The aws stderr is surfaced so a 404 (minor not staged) reads differently
+# from a network/credentials failure of the check itself.
 SRC_BUCKET="$DIST_BUCKET"; SRC_REGION="$DIST_REGION"
 SRC_LAYER_KEY="$(dist_key "$MINOR" "$LAYER_ZIP")"; SRC_FUNC_KEY="$(dist_key "$MINOR" "$FUNC_ZIP")"
-if ! aws s3api head-object --bucket "$DIST_BUCKET" --key "$SRC_LAYER_KEY" --region "$DIST_REGION" --no-sign-request >/dev/null 2>&1; then
-    echo "ERROR: minor $MINOR is not staged: s3://$DIST_BUCKET/$SRC_LAYER_KEY does not exist."
-    STAGED="$(aws s3 cp "s3://$DIST_BUCKET/$(dist_root versions.json)" - --region "$DIST_REGION" --no-sign-request 2>/dev/null \
-        | python3 -c 'import json,sys; print(" ".join(json.load(sys.stdin).get("minors", [])))' 2>/dev/null || true)"
-    [ -n "$STAGED" ] && echo "       Staged minors on s3://$DIST_BUCKET: $STAGED"
-    echo "       Set LAMBDA_VERSION to a staged minor, or LAMBDA_VERSION=latest for the"
-    echo "       newest published one (versions.json)."
-    exit 1
-fi
+for KEY in "$SRC_LAYER_KEY" "$SRC_FUNC_KEY"; do
+    if ! HEAD_ERR="$(aws s3api head-object --bucket "$DIST_BUCKET" --key "$KEY" --region "$DIST_REGION" --no-sign-request 2>&1 >/dev/null)"; then
+        echo "ERROR: minor $MINOR is not staged: could not HEAD s3://$DIST_BUCKET/$KEY"
+        [ -n "$HEAD_ERR" ] && echo "       aws: $HEAD_ERR"
+        STAGED="$(aws s3 cp "s3://$DIST_BUCKET/$(dist_root versions.json)" - --region "$DIST_REGION" --no-sign-request 2>/dev/null \
+            | python3 -c 'import json,sys; print(" ".join(json.load(sys.stdin).get("minors", [])))' 2>/dev/null || true)"
+        [ -n "$STAGED" ] && echo "       Staged minors on s3://$DIST_BUCKET: $STAGED"
+        echo "       Set LAMBDA_VERSION to a staged minor, or LAMBDA_VERSION=latest for the"
+        echo "       newest published one (versions.json). A non-404 aws error above means"
+        echo "       the check itself failed (network/credentials), not that the minor is missing."
+        exit 1
+    fi
+done
 
 echo ""
 echo "Resolved deployment artifacts:"
@@ -134,7 +140,9 @@ echo "  layer:    s3://$SRC_BUCKET/$SRC_LAYER_KEY"
 echo "  function: s3://$SRC_BUCKET/$SRC_FUNC_KEY"
 echo "  stack:    $STACK_NAME ($REGION)"
 if [ "$ASSUME_YES" != "true" ]; then
-    read -r -p "Proceed with deploy? [y/N] " REPLY
+    # `|| REPLY=""` keeps EOF (unattended stdin) on the abort path below with
+    # its message, instead of dying silently under `set -e`.
+    read -r -p "Proceed with deploy? [y/N] " REPLY || REPLY=""
     case "$REPLY" in
         [Yy]|[Yy][Ee][Ss]) ;;
         *) echo "Aborted (pass --yes to skip this prompt)."; exit 1 ;;
