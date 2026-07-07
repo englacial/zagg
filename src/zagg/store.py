@@ -1,9 +1,30 @@
 """Store factory for opening Zarr stores from path strings."""
 
+from datetime import timedelta
 from pathlib import Path
 
 from zarr.abc.store import Store
 from zarr.storage import LocalStore
+
+# S3 retry pacing (issue #186). obstore's default policy retries 5xx/connection
+# errors up to 10 times with jittered exponential backoff from 100 ms — under a
+# sustained 503 SlowDown burst the jitter draws small sleeps and the whole
+# budget is spent in ~2-4 s of near-immediate retries, hammering the throttled
+# prefix and then surfacing the error (the trapped fleet failures burned all 10
+# retries in 1.8-3.1 s). These defaults pace retries seconds apart with ~2 min
+# of headroom, which is what S3's "Please reduce your request rate" asks for.
+# ``retry_timeout`` stays at obstore's 180 s default, below the 5-minute
+# credential-validity bound its docs warn about. Callers can pass their own
+# ``retry_config`` through ``**kwargs`` to override.
+_S3_RETRY_CONFIG = {
+    "max_retries": 12,
+    "retry_timeout": timedelta(seconds=180),
+    "backoff": {
+        "init_backoff": timedelta(seconds=1),
+        "max_backoff": timedelta(seconds=30),
+        "base": 2,
+    },
+}
 
 
 def open_store(
@@ -109,6 +130,7 @@ def _s3_object_store(
 
     bucket, prefix = parse_s3_path(path)
     region = kwargs.pop("region", "us-west-2")
+    kwargs.setdefault("retry_config", _S3_RETRY_CONFIG)
 
     if credentials or endpoint_url:
         opts = {
