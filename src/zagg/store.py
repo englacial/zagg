@@ -30,6 +30,23 @@ _S3_RETRY_CONFIG = {
     },
 }
 
+# Read-only carve-out: stores opened via ``open_store(read_only=True)`` are the
+# interactive population (notebooks, readers, read-back analysis) — for them a
+# genuinely failing endpoint should surface a clear error in ~30 s, not feel
+# hung for the full write policy above. Still paced (rides a typical throttle
+# burst), and reads are far harder to throttle anyway (S3's per-prefix GET
+# budget is ~5,500/s vs ~3,500 for PUT). Fleet workers open read-write, so the
+# issue #186 fix is unaffected.
+_S3_READONLY_RETRY_CONFIG = {
+    "max_retries": 4,
+    "retry_timeout": timedelta(seconds=30),
+    "backoff": {
+        "init_backoff": timedelta(seconds=1),
+        "max_backoff": timedelta(seconds=8),
+        "base": 2,
+    },
+}
+
 
 def open_store(
     path: str,
@@ -58,7 +75,8 @@ def open_store(
     **kwargs
         For S3 stores: ``region`` (default ``"us-west-2"``) and any obstore
         ``S3Store`` option — notably ``retry_config``, which defaults to the
-        paced :data:`_S3_RETRY_CONFIG` policy (issue #186).
+        paced :data:`_S3_RETRY_CONFIG` policy (issue #186), or the shorter
+        :data:`_S3_READONLY_RETRY_CONFIG` when ``read_only=True``.
 
     Returns
     -------
@@ -121,6 +139,11 @@ def _open_s3_store(
     """
     from zarr.storage import ObjectStore
 
+    if read_only and kwargs.get("retry_config") is None:
+        # Interactive read population: fail fast on a dead endpoint (comment
+        # on the constant). Set here so _s3_object_store's write-policy
+        # default doesn't kick in; an explicit caller retry_config still wins.
+        kwargs["retry_config"] = copy.deepcopy(_S3_READONLY_RETRY_CONFIG)
     s3 = _s3_object_store(path, credentials=credentials, endpoint_url=endpoint_url, **kwargs)
     return ObjectStore(store=s3, read_only=read_only)
 

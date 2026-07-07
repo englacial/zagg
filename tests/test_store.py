@@ -145,6 +145,24 @@ class TestS3RetryConfig:
         _, kwargs = s3_cls.call_args
         assert kwargs["retry_config"] == _S3_RETRY_CONFIG
 
+    def test_read_only_gets_short_policy(self, mock_s3):
+        """``read_only=True`` (the interactive population) fails fast on a
+        dead endpoint: the shorter read-only policy, not the write one."""
+        from zagg.store import _S3_READONLY_RETRY_CONFIG
+
+        s3_cls, _ = mock_s3
+        open_store("s3://bucket/prefix.zarr", read_only=True)
+        _, kwargs = s3_cls.call_args
+        assert kwargs["retry_config"] == _S3_READONLY_RETRY_CONFIG
+        assert kwargs["retry_config"] is not _S3_READONLY_RETRY_CONFIG  # no aliasing
+
+    def test_read_only_override_wins(self, mock_s3):
+        s3_cls, _ = mock_s3
+        custom = {"max_retries": 7}
+        open_store("s3://bucket/prefix.zarr", read_only=True, retry_config=custom)
+        _, kwargs = s3_cls.call_args
+        assert kwargs["retry_config"] == custom
+
     def test_default_not_aliased(self, mock_s3):
         """Each store gets its own copy — mutating one store's config must
         not edit the module-level default (nested ``backoff`` included)."""
