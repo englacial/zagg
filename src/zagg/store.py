@@ -37,9 +37,9 @@ _S3_RETRY_CONFIG = {
 # ceiling), not feel hung for the full write policy above. Still paced (rides
 # a typical throttle burst), and reads are far harder to throttle anyway
 # (S3's per-prefix GET budget is ~5,500/s vs ~3,500 for PUT). Fleet workers
-# open read-write, so the issue #186 fix is unaffected. Read paths that build
-# their own client (the example notebooks) or go through
-# ``open_object_store`` (no read-only concept) are not covered.
+# open read-write, so the issue #186 fix is unaffected. ``open_object_store``
+# has no read-only concept — its read-path callers pass ``retry_config``
+# explicitly (e.g. ``temporal.open_dataset``'s NetCDF branch).
 _S3_READONLY_RETRY_CONFIG = {
     "max_retries": 4,
     "retry_timeout": timedelta(seconds=30),
@@ -79,7 +79,9 @@ def open_store(
         For S3 stores: ``region`` (default ``"us-west-2"``) and any obstore
         ``S3Store`` option — notably ``retry_config``, which defaults to the
         paced :data:`_S3_RETRY_CONFIG` policy (issue #186), or the shorter
-        :data:`_S3_READONLY_RETRY_CONFIG` when ``read_only=True``.
+        :data:`_S3_READONLY_RETRY_CONFIG` when ``read_only=True``; and
+        ``skip_signature=True`` for anonymous reads of public buckets (no
+        AWS credentials needed, e.g. binder).
 
     Returns
     -------
@@ -185,6 +187,11 @@ def _s3_object_store(
         if endpoint_url:
             opts["endpoint"] = endpoint_url
         s3 = S3Store(**opts, **kwargs)
+    elif kwargs.get("skip_signature"):
+        # Anonymous read of a public bucket: no credential provider —
+        # Boto3CredentialProvider raises without ambient AWS credentials,
+        # which anonymous environments (e.g. binder) lack by definition.
+        s3 = S3Store(bucket, prefix=prefix, region=region, **kwargs)
     else:
         from obstore.auth.boto3 import Boto3CredentialProvider
 
