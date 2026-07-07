@@ -292,6 +292,19 @@ def validate_config(config: PipelineConfig) -> None:
     ):
         raise ValueError(f"data_source.read_workers must be an integer >= 1 (got {read_workers!r})")
 
+    # Validate the optional granule fan-out width (issue #180). Mirrors the
+    # worker's guard (_granule_workers) with the same rejection rationale as
+    # read_workers above.
+    granule_workers = (config.data_source or {}).get("granule_workers")
+    if granule_workers is not None and (
+        isinstance(granule_workers, bool)
+        or not isinstance(granule_workers, int)
+        or granule_workers < 1
+    ):
+        raise ValueError(
+            f"data_source.granule_workers must be an integer >= 1 (got {granule_workers!r})"
+        )
+
     # Optional strict-AOI cell mask (issue #101), default off. Must be a bool.
     aoi_mask = config.output.get("aoi_mask")
     if aoi_mask is not None and not isinstance(aoi_mask, bool):

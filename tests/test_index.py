@@ -1121,6 +1121,51 @@ class TestInlineInterleavedGranules:
             assert (inter_store / name).is_file()
             assert (inter_store / name).read_bytes() == (serial_store / name).read_bytes()
 
+    def test_worker_pool_write_back_manifests_match_serial(self, tmp_path):
+        # End-to-end (issue #180 phases 1+2): process_shard with
+        # granule_workers=2 over two write-back granules produces the same
+        # aggregation output and byte-identical manifests as the serial run.
+        from h5coro import filedriver
+
+        a, b = self._granules(tmp_path)
+
+        def run(store, workers):
+            extra = {"granule_workers": workers} if workers > 1 else {}
+            return process_shard(
+                _LeafCellGrid(_UNALIGNED_LEAVES),
+                1,
+                [str(a), str(b)],
+                s3_credentials={},
+                h5coro_driver=filedriver.FileDriver,
+                config=PipelineConfig(
+                    data_source=_fixture_data_source(
+                        index={"backend": "inline", "write_back": True, "store": str(store)},
+                        **extra,
+                    ),
+                    aggregation={
+                        "variables": {
+                            "count": {
+                                "function": "len",
+                                "source": "h_ph",
+                                "dtype": "int32",
+                                "fill_value": 0,
+                            }
+                        }
+                    },
+                    output={"store": "unused"},
+                ),
+            )
+
+        serial_store, pooled_store = tmp_path / "serial", tmp_path / "pooled"
+        df_serial, meta_serial = run(serial_store, 1)
+        df_pooled, meta_pooled = run(pooled_store, 2)
+        assert meta_serial["error"] is None and meta_pooled["error"] is None
+        assert meta_pooled["files_processed"] == 2
+        assert meta_pooled["total_obs"] == meta_serial["total_obs"]
+        pd.testing.assert_frame_equal(df_serial, df_pooled)
+        for name in ("granA.parquet", "granB.parquet"):
+            assert (pooled_store / name).read_bytes() == (serial_store / name).read_bytes()
+
     def test_finish_granule_drains_only_its_granule(self, tmp_path):
         a, b = self._granules(tmp_path)
         store = tmp_path / "store"

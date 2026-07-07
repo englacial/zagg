@@ -18,7 +18,10 @@ the same call-time way, so patching that symbol still intercepts reads.
 import logging
 import time
 import warnings
+from collections import deque
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
+from itertools import islice
 from typing import Callable, List, Tuple
 
 import numpy as np
@@ -44,6 +47,21 @@ from zagg.processing.write import _build_output
 from zagg.schema import ProcessingMetadata
 
 logger = logging.getLogger(__name__)
+
+
+def _granule_workers(data_source: dict) -> int:
+    """``data_source.granule_workers``: granules in flight per shard (issue #180).
+
+    Default **1** — today's serial granule loop, byte-identical (opt-in until
+    the fleet A/B picks a default, same measure-then-flip discipline as #170's
+    ``read_workers``). Validated at submission (``validate_config``) and
+    re-checked here with the same int>=1 / bool-trap guard so hand-rolled
+    worker payloads fail loudly before any read.
+    """
+    w = data_source.get("granule_workers", 1)
+    if isinstance(w, bool) or not isinstance(w, int) or w < 1:
+        raise ValueError(f"data_source.granule_workers must be an integer >= 1 (got {w!r})")
+    return w
 
 
 def process_shard(
@@ -260,9 +278,26 @@ def process_shard(
     phase_timings: dict | None = {} if profile else None
     _read_t0 = time.time() if profile else None
 
-    # Read files and filter spatially
-    for s3_url in granule_urls:
+    # Granule fan-out width (issue #180). Resolved before any read so a bad
+    # value is a loud config error, not N per-granule warnings.
+    granule_workers = _granule_workers(data_source)
+
+    def _read_granule(s3_url: str) -> tuple:
+        """One granule end-to-end: H5Coro open → group loop → ``finish_granule``
+        → close, all in the calling thread (issue #180 — under the pool each
+        granule gets its own ``H5Coro``, never shared across threads).
+
+        Returns ``(reads, group_errors)``: ``reads`` is ``[(group, carrier),
+        ...]`` for the groups that returned data (group order) with ``None``
+        (legitimately empty) groups dropped; ``group_errors`` counts raised
+        group reads, warned here but folded into ``read_errors`` by the main
+        thread (a shared ``+= 1`` from worker threads could race). Raises when
+        the granule itself fails (e.g. the open) — the caller warns and skips
+        it, shard continues (issue #116 semantics).
+        """
         h5obj = None
+        reads: list = []
+        group_errors = 0
         try:
             resource_path = _rewrite_url(s3_url)
 
@@ -283,10 +318,7 @@ def process_shard(
                         h5obj, g, data_source, shard_key, grid, **read_kwargs
                     )
                     if chunk is not None:
-                        if buffered is not None:
-                            buffered.add_read(chunk)
-                        else:
-                            all_reads.append(chunk)
+                        reads.append((g, chunk))
                 except Exception as e:
                     # A raised read error is always a real failure: a
                     # legitimately-empty group returns ``None`` (no exception),
@@ -294,13 +326,13 @@ def process_shard(
                     # where many granules simply contribute 0 photons (issue
                     # #116). Logging it at DEBUG hid the dem_h broadcast failure
                     # behind the misleading "No data after filtering" below.
-                    read_errors += 1
+                    group_errors += 1
                     logger.warning(f"  Error reading track {g}: {e}")
                     continue
 
             # Per-granule backend hook (issue #160): side effects only (e.g.
             # ``inline`` write-back). A failure here never fails the read —
-            # the granule's data is already in ``all_reads``.
+            # the granule's data is already in ``reads``.
             try:
                 index_backend.finish_granule(h5obj, s3_url)
             except Exception as e:
@@ -310,18 +342,12 @@ def process_shard(
                 # #175) on a path that never fails the read.
                 logger.warning(f"  index backend finish_granule failed for {s3_url}: {e}")
 
-            files_processed += 1
-            if buffered is not None:
-                buffered.granule_done()
-
-        except Exception as e:
-            logger.warning(f"  Error processing file {s3_url}: {e}")
-            continue
+            return reads, group_errors
         finally:
             # Release this granule's h5coro cache before the next one (issue #66):
             # without it each granule's unevicted cache stays resident for the whole
             # loop → Lambda OOM. ``close()`` is the live path; ``cache.clear()`` is a
-            # fallback for builds lacking it. Retained ``all_reads`` data is already
+            # fallback for builds lacking it. Retained ``reads`` data is already
             # copied off the cache lines (see PR #94), so releasing here is safe.
             if h5obj is not None:
                 try:
@@ -331,6 +357,62 @@ def process_shard(
                         h5obj.cache.clear()
                 except Exception:
                     logger.debug("h5coro cache release failed", exc_info=True)
+
+    def _iter_granule_reads():
+        """Yield ``(s3_url, reads, group_errors)`` in original ``granule_urls`` order.
+
+        ``granule_workers == 1`` reads each granule in this thread — the
+        unchanged serial loop. Above 1, up to ``granule_workers`` granules are
+        in flight on a bounded ``ThreadPoolExecutor`` (issue #180) and results
+        are folded back in submission order: the consumer blocks on the oldest
+        future, so an out-of-order completion parks in its future until its
+        turn — parked results are bounded by the pool width, and the fold
+        (hence the aggregation output) is byte-identical to serial. A granule
+        whose read raised is warned and skipped here, same as the serial
+        except-continue.
+        """
+        if granule_workers == 1:
+            for s3_url in granule_urls:
+                try:
+                    yield s3_url, *_read_granule(s3_url)
+                except Exception as e:
+                    logger.warning(f"  Error processing file {s3_url}: {e}")
+        else:
+            with ThreadPoolExecutor(
+                max_workers=granule_workers, thread_name_prefix="zagg-granule"
+            ) as pool:
+                urls = iter(granule_urls)
+                in_flight = deque(
+                    (u, pool.submit(_read_granule, u)) for u in islice(urls, granule_workers)
+                )
+                while in_flight:
+                    s3_url, future = in_flight.popleft()
+                    try:
+                        reads, group_errors = future.result()
+                    except Exception as e:
+                        logger.warning(f"  Error processing file {s3_url}: {e}")
+                    else:
+                        yield s3_url, reads, group_errors
+                    for u in islice(urls, 1):  # top up: keep ≤ granule_workers in flight
+                        in_flight.append((u, pool.submit(_read_granule, u)))
+
+    # Read files and filter spatially, folding granules in original order.
+    for s3_url, reads, group_errors in _iter_granule_reads():
+        read_errors += group_errors
+        try:
+            for _g, chunk in reads:
+                if buffered is not None:
+                    buffered.add_read(chunk)
+                else:
+                    all_reads.append(chunk)
+            files_processed += 1
+            if buffered is not None:
+                buffered.granule_done()
+        except Exception as e:
+            # Fold-side failure (e.g. a streaming flush): same tolerated
+            # warn-and-continue the serial loop's outer ``except`` applied.
+            logger.warning(f"  Error processing file {s3_url}: {e}")
+            continue
 
     logger.info(f"  Processed {files_processed}/{len(granule_urls)} files")
     metadata["files_processed"] = files_processed

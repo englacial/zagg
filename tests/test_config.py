@@ -1230,6 +1230,28 @@ class TestHandoff:
         assert get_handoff(cfg) == "pandas"
 
 
+class TestGranuleWorkersValidation:
+    """``data_source.granule_workers`` (issue #180) is validated at submission,
+    mirroring the worker's ``_granule_workers`` guard (same int>=1/bool-trap
+    pattern as ``read_workers``)."""
+
+    def _cfg(self, **ds_extra):
+        cfg = _cfg_with_handoff()
+        cfg.data_source.update(ds_extra)
+        return cfg
+
+    def test_absent_validates(self):
+        validate_config(self._cfg())  # should not raise
+
+    def test_valid_value_validates(self):
+        validate_config(self._cfg(granule_workers=4))  # should not raise
+
+    def test_bad_values_rejected_at_submission(self):
+        for bad in (0, -1, 1.5, "2", True, False):
+            with pytest.raises(ValueError, match=r"data_source\.granule_workers"):
+                validate_config(self._cfg(granule_workers=bad))
+
+
 # ---------------------------------------------------------------------------
 # Output grid validation
 # ---------------------------------------------------------------------------

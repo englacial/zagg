@@ -5411,3 +5411,247 @@ class TestProcessShardCacheRelease:
         # rather than the misleading "No data after filtering".
         assert meta["error"] == "No data after filtering (1 group reads raised)"
         assert meta["read_errors"] == 1
+
+
+class TestGranuleReadPool:
+    """Issue #180: ``data_source.granule_workers`` keeps K granules in flight
+    on a bounded thread pool, folding results in original granule order so the
+    output is byte-identical to the serial loop (the default, K == 1)."""
+
+    def _patch_h5(self, monkeypatch, factory):
+        monkeypatch.setattr("zagg.processing.h5coro.H5Coro", factory)
+        monkeypatch.setattr("zagg.processing._make_url_rewriter", lambda driver: lambda u: u)
+
+    @staticmethod
+    def _granule_arrays(tag: float, n: int = 2):
+        """Per-granule distinct arrays (h_li carries the granule tag)."""
+        return {
+            "/gt1l/lat": np.array([10.0 + i for i in range(n)]),
+            "/gt1l/lon": np.array([20.0 + i for i in range(n)]),
+            "/gt1l/h_li": np.full(n, tag, dtype=np.float32),
+        }
+
+    def _tagged_factory(self, log=None, slow_urls=(), delay=0.15):
+        """H5Coro stub factory: arrays keyed by URL tag; optional per-URL delay
+        (forcing out-of-order completions) and close/thread logging."""
+        import threading
+        import time as _time
+
+        tags = {}
+
+        class _H5(_CloseRecordingH5):
+            def __init__(self, url):
+                tag = tags.setdefault(url, float(len(tags) + 1))
+                super().__init__(
+                    TestGranuleReadPool._granule_arrays(tag),
+                    log if log is not None else [],
+                )
+                self._url = url
+                self.ctor_thread = threading.get_ident()
+
+            def readDatasets(self, datasets):  # noqa: N802 (mirror real h5coro API)
+                if self._url in slow_urls:
+                    _time.sleep(delay)
+                return super().readDatasets(datasets)
+
+            def close(self):
+                self.close_thread = threading.get_ident()
+                super().close()
+
+        instances = []
+
+        def factory(resource_path, *a, **k):
+            h5 = _H5(resource_path)
+            instances.append(h5)
+            return h5
+
+        return factory, instances
+
+    def test_granule_workers_validation(self):
+        from zagg.processing.worker import _granule_workers
+
+        for bad in (0, -1, 1.5, "2", True, False):
+            with pytest.raises(ValueError, match="granule_workers"):
+                _granule_workers({"granule_workers": bad})
+        assert _granule_workers({}) == 1  # default: serial, today's behavior
+        assert _granule_workers({"granule_workers": 3}) == 3
+
+    def test_bad_granule_workers_fails_before_any_read(self, monkeypatch):
+        # Mirror the worker-side read_workers re-check: a hand-rolled payload
+        # with a bad value is a loud config error, not N per-granule warnings.
+        def exploding_factory(*a, **k):
+            raise AssertionError("no granule should be opened")
+
+        self._patch_h5(monkeypatch, exploding_factory)
+        cfg = _release_cfg()
+        cfg.data_source["granule_workers"] = 0
+        with pytest.raises(ValueError, match="granule_workers"):
+            process_shard(_ReleaseGrid(), 0, ["s3://a"], s3_credentials={}, config=cfg)
+
+    def test_default_serial_never_touches_the_pool(self, monkeypatch):
+        # granule_workers absent -> the serial loop; the pool must not even be
+        # constructed, so the default path carries zero threading machinery.
+        import zagg.processing.worker as worker_mod
+
+        def exploding_pool(*a, **k):
+            raise AssertionError("ThreadPoolExecutor constructed on the serial path")
+
+        monkeypatch.setattr(worker_mod, "ThreadPoolExecutor", exploding_pool)
+        factory, _ = self._tagged_factory()
+        self._patch_h5(monkeypatch, factory)
+        df_out, meta = process_shard(
+            _ReleaseGrid(), 0, ["s3://a", "s3://b"], s3_credentials={}, config=_release_cfg()
+        )
+        assert meta["files_processed"] == 2
+
+    def test_pooled_output_identical_to_serial(self, monkeypatch):
+        # Distinct per-granule data; the slowest granule is submitted FIRST so
+        # completions arrive out of order — the ordered fold must still produce
+        # byte-identical output vs the serial run.
+        results = {}
+        for workers in (1, 3):
+            factory, _ = self._tagged_factory(slow_urls=("s3://a",))
+            self._patch_h5(monkeypatch, factory)
+            cfg = _release_cfg()
+            if workers > 1:
+                cfg.data_source["granule_workers"] = workers
+            results[workers] = process_shard(
+                _ReleaseGrid(),
+                0,
+                ["s3://a", "s3://b", "s3://c"],
+                s3_credentials={},
+                config=cfg,
+            )
+        df_serial, meta_serial = results[1]
+        df_pooled, meta_pooled = results[3]
+        pd.testing.assert_frame_equal(df_serial, df_pooled)
+        for key in ("files_processed", "total_obs", "cells_with_data", "error"):
+            assert meta_serial[key] == meta_pooled[key]
+
+    def test_fold_order_is_submission_order(self, monkeypatch):
+        # Granule a sleeps so b and c complete first; the reads must still fold
+        # a, b, c (out-of-order completions park until their turn).
+        import zagg.processing.worker as worker_mod
+
+        factory, _ = self._tagged_factory(slow_urls=("s3://a",))
+        self._patch_h5(monkeypatch, factory)
+        real = worker_mod._concat_and_group
+        captured = {}
+
+        def spy(reads, grid, handoff):
+            captured["order"] = [float(df["h_li"].iloc[0]) for df in reads]
+            return real(reads, grid, handoff)
+
+        monkeypatch.setattr(worker_mod, "_concat_and_group", spy)
+        cfg = _release_cfg()
+        cfg.data_source["granule_workers"] = 3
+        process_shard(
+            _ReleaseGrid(), 0, ["s3://a", "s3://b", "s3://c"], s3_credentials={}, config=cfg
+        )
+        assert captured["order"] == [1.0, 2.0, 3.0]  # tag i == submission position
+
+    def test_one_h5coro_per_granule_created_and_closed_in_its_thread(self, monkeypatch):
+        # Each granule gets its own H5Coro, opened and closed inside the same
+        # worker thread (never shared across threads), off the main thread.
+        import threading
+
+        log: list = []
+        factory, instances = self._tagged_factory(log=log)
+        self._patch_h5(monkeypatch, factory)
+        cfg = _release_cfg()
+        cfg.data_source["granule_workers"] = 2
+        df_out, meta = process_shard(
+            _ReleaseGrid(),
+            0,
+            ["s3://a", "s3://b", "s3://c", "s3://d"],
+            s3_credentials={},
+            config=cfg,
+        )
+        assert meta["files_processed"] == 4
+        assert len(instances) == 4
+        assert len([e for e in log if e[0] == "close"]) == 4  # one release per granule
+        main = threading.get_ident()
+        for h5 in instances:
+            assert h5.ctor_thread == h5.close_thread  # created + closed in one thread
+            assert h5.ctor_thread != main  # ... a pool thread, not the fold thread
+
+    def test_pooled_granule_failure_skips_and_continues(self, monkeypatch):
+        # A failed granule (constructor raise) under the pool matches the serial
+        # semantics: warn + skip, remaining granules still process and release.
+        log: list = []
+        calls = {"n": 0}
+
+        def factory(*a, **k):
+            calls["n"] += 1
+            if calls["n"] == 2:
+                raise RuntimeError("h5coro open failed")
+            return _CloseRecordingH5(_canned_arrays(), log)
+
+        self._patch_h5(monkeypatch, factory)
+        cfg = _release_cfg()
+        cfg.data_source["granule_workers"] = 2
+        df_out, meta = process_shard(
+            _ReleaseGrid(), 0, ["s3://a", "s3://b", "s3://c"], s3_credentials={}, config=cfg
+        )
+        assert len([e for e in log if e[0] == "close"]) == 2
+        assert meta["files_processed"] == 2
+        assert meta["total_obs"] == 4  # 2 photons x 2 surviving granules
+
+    def test_pooled_group_read_error_counted_not_fatal(self, monkeypatch):
+        # A raised group read inside a pooled granule increments read_errors and
+        # the shard continues — exactly the serial issue #116 semantics.
+        class _RaisingReadH5:
+            def readDatasets(self, datasets):  # noqa: N802 (mirror real h5coro API)
+                raise RuntimeError("byte-range read failed")
+
+            def close(self):
+                pass
+
+        def factory(resource_path, *a, **k):
+            if resource_path == "s3://bad":
+                return _RaisingReadH5()
+            return _CloseRecordingH5(_canned_arrays(), [])
+
+        self._patch_h5(monkeypatch, factory)
+        cfg = _release_cfg()
+        cfg.data_source["granule_workers"] = 2
+        df_out, meta = process_shard(
+            _ReleaseGrid(), 0, ["s3://bad", "s3://ok"], s3_credentials={}, config=cfg
+        )
+        assert meta["read_errors"] == 1
+        assert meta["files_processed"] == 2  # the bad granule still "processed" (0 groups)
+        assert meta["total_obs"] == 2
+
+    def test_pooled_streaming_identical_to_serial(self, monkeypatch):
+        # The pool must compose with the StreamingAggregator path (issue #148
+        # phase 4): granule_done fires per granule in fold order, so flush
+        # boundaries — and the merged output — match the serial run.
+        from zagg.config import PipelineConfig
+
+        def streaming_cfg():
+            return PipelineConfig(
+                data_source={
+                    "groups": ["gt1l"],
+                    "coordinates": {"latitude": "/{group}/lat", "longitude": "/{group}/lon"},
+                    "variables": {"h_li": "/{group}/h_li"},
+                },
+                aggregation={
+                    "variables": {"count": {"function": "len", "dtype": "int32", "fill_value": 0}},
+                    "streaming": {"buffer_granules": 2},
+                },
+            )
+
+        urls = [f"s3://{c}" for c in "abcde"]
+        results = {}
+        for workers in (1, 3):
+            factory, _ = self._tagged_factory(slow_urls=("s3://a",))
+            self._patch_h5(monkeypatch, factory)
+            cfg = streaming_cfg()
+            if workers > 1:
+                cfg.data_source["granule_workers"] = workers
+            results[workers] = process_shard(_ReleaseGrid(), 0, urls, s3_credentials={}, config=cfg)
+        df_serial, meta_serial = results[1]
+        df_pooled, meta_pooled = results[3]
+        pd.testing.assert_frame_equal(df_serial, df_pooled)
+        assert meta_serial["total_obs"] == meta_pooled["total_obs"] == 10
+        assert meta_serial["files_processed"] == meta_pooled["files_processed"] == 5
