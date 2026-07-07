@@ -106,6 +106,16 @@ class VirtualIndex:
         backends use it for per-granule side effects (e.g. ``inline``
         write-back). Failures are logged by the caller and never fail the
         read. Default: no-op.
+
+        Concurrency contract (issue #180): the worker may hold up to
+        ``data_source.granule_workers`` granules in flight on one backend
+        instance. Each granule's groups are read serially by a single worker
+        thread, and that thread calls ``finish_granule`` after the granule's
+        last group — but ``read_group``/``finish_granule`` calls for
+        *different* granules may interleave across threads. Any backend state
+        that spans one granule's reads must therefore be keyed per granule
+        (e.g. by the ``h5obj.resource`` URL stem, as ``inline._pending`` and
+        the sidecar backend's ``_cache`` are), never by dataset path alone.
         """
 
 

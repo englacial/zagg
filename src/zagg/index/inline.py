@@ -51,6 +51,19 @@ from zagg.index import VirtualIndex
 
 logger = logging.getLogger(__name__)
 
+
+def _granule_id(resource) -> str:
+    """Granule id from a URL / resource path: basename minus extension.
+
+    The write-back manifest key convention (issue #160), and the key isolating
+    each in-flight granule's pending chunk maps (issue #180). Mirrors
+    ``_granule_id`` in h5coro-hidefix's ``zagg_backend``: the stem survives
+    every driver URL rewrite, so ids derived from ``h5obj.resource`` (the
+    rewritten URL) and from the worker's original ``granule_url`` agree.
+    """
+    return PurePosixPath(urlsplit(str(resource)).path).stem
+
+
 #: Manifest row schema, single source of truth (same empty-frame-drift
 #: rationale as the bench extractor's ``OFFSETS_DTYPES``). The chunk columns
 #: are PR #159's offsets schema; ``chunk_offset``/``dtype``/``shape``/
@@ -332,10 +345,16 @@ class InlineIndex(VirtualIndex):
     def __init__(self, write_back: bool = False, store: str | None = None):
         self.write_back = bool(write_back)
         self.store = store
-        # Chunk maps accumulated across the current granule's groups (the
-        # worker reads granules serially and calls ``finish_granule`` after
-        # each one, which drains this). Only populated when writing back.
-        self._pending: dict[str, ChunkMap] = {}
+        # Chunk maps accumulated across each in-flight granule's groups,
+        # keyed granule id -> {dataset path -> ChunkMap} (issue #180: the
+        # worker may hold ``data_source.granule_workers`` granules in flight,
+        # and dataset paths repeat across granules, so a flat path-keyed dict
+        # would interleave granules and persist corrupted manifests).
+        # ``finish_granule`` drains exactly its granule's entry. Each granule
+        # is read by a single worker thread, so its sub-dict is never shared;
+        # the outer dict's setdefault/pop are atomic under the GIL. Only
+        # populated when writing back.
+        self._pending: dict[str, dict[str, ChunkMap]] = {}
 
     @classmethod
     def validate_index_config(cls, index_cfg: dict, data_source: dict | None = None) -> None:
@@ -374,6 +393,16 @@ class InlineIndex(VirtualIndex):
             store=index_cfg.get("store"),
         )
 
+    def _pending_for(self, h5obj) -> dict[str, ChunkMap]:
+        """This granule's pending chunk maps (write-back accumulation).
+
+        Keyed by the granule id of ``h5obj.resource`` — the rewritten URL the
+        worker opened the granule with, whose stem matches ``granule_url``'s
+        (see :func:`_granule_id`) — so concurrent in-flight granules (issue
+        #180) never share chunk-map state.
+        """
+        return self._pending.setdefault(_granule_id(h5obj.resource), {})
+
     def _prebuild_group_maps(self, h5obj, group: str, data_source: dict) -> None:
         """Build the chunk maps for every dataset this group's read can touch.
 
@@ -404,26 +433,34 @@ class InlineIndex(VirtualIndex):
             for key in ("index_beg", "count"):
                 if key in link:
                     paths.append(link[key].format(group=group))
+        pending = self._pending_for(h5obj)
         for path in dict.fromkeys(paths):
-            if path not in self._pending:
-                self._pending[path] = build_chunk_map(h5obj, path)
+            if path not in pending:
+                pending[path] = build_chunk_map(h5obj, path)
 
     def finish_granule(self, h5obj, granule_url: str) -> None:
         """Write-back seam: persist the granule's accumulated chunk maps.
 
-        No-op unless ``write_back`` is on. The manifest key is the granule id
-        (URL basename without extension — granule ids carry product +
-        version, so reprocessing changes the key; issue #160 store
-        convention). Raises on store failures — the worker logs and
-        continues, so a broken store degrades to plain ``inline`` reads.
+        Drains only THIS granule's pending entry (issue #180: other granules
+        may still be in flight), keyed as the read side keyed it —
+        ``h5obj.resource``'s granule id — with ``granule_url``'s as fallback
+        for resource-less callers. No-op unless ``write_back`` is on. The
+        manifest key is the granule id (URL basename without extension —
+        granule ids carry product + version, so reprocessing changes the key;
+        issue #160 store convention). Raises on store failures — the worker
+        logs and continues, so a broken store degrades to plain ``inline``
+        reads.
         """
-        maps, self._pending = self._pending, {}
+        granule_id = _granule_id(granule_url)
+        resource = getattr(h5obj, "resource", None)
+        maps = self._pending.pop(_granule_id(resource), None) if resource is not None else None
+        if maps is None:
+            maps = self._pending.pop(granule_id, {})
         if not self.write_back:
             return
         maps = {path: cm for path, cm in maps.items() if cm.raw}
         if not maps:
             return
-        granule_id = PurePosixPath(urlsplit(granule_url).path).stem
         key = write_manifest(granule_manifest(maps), self.store, granule_id)
         logger.info(f"  inline write-back: {len(maps)} dataset(s) -> {self.store}/{key}")
 
@@ -483,12 +520,14 @@ class InlineIndex(VirtualIndex):
         ``read_group`` call, which is exactly one (granule, group): a group's
         datasets are disjoint from every other group's, so nothing is
         rebuilt or leaked across granules. Under ``write_back`` the cache is
-        the instance's pending dict instead, accumulating the granule's maps
-        across groups for ``finish_granule`` to persist. Each dataset gets
+        THIS granule's pending sub-dict instead (``_pending_for`` — keyed per
+        granule so concurrent in-flight granules never interleave, issue
+        #180), accumulating the granule's maps across groups for
+        ``finish_granule`` to persist. Each dataset gets
         its own single-dataset in-memory ``Index`` (~ms), so a spec hidefix
         rejects degrades that dataset alone.
         """
-        maps: dict[str, ChunkMap] = self._pending if self.write_back else {}
+        maps: dict[str, ChunkMap] = self._pending_for(h5obj) if self.write_back else {}
         # One single-dataset Index per path (~ms each): a dataset whose spec
         # hidefix rejects (nonzero filter_mask, non-tiling chunk table) then
         # pins only ITSELF to the fallback — a shared Index rebuilt from all
