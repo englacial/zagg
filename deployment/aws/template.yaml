@@ -73,9 +73,10 @@ Parameters:
   MemorySize:
     Type: Number
     Default: 4096
-    Description: Function memory in MB. 4096 = ~2.3 vCPU; issue #180 sizing found
-      the pipeline saturates its available parallelism here at ~1.3 effective
-      cores, faster AND cheaper per AOI than 2048 (issue #193).
+    Description: >-
+      Function memory in MB. 4096 (~2.3 vCPU) is the issue #180 sizing default:
+      the pipeline saturates its available parallelism at ~1.3 effective cores,
+      faster and cheaper per AOI than 2048 (issue #193).
 
   Timeout:
     Type: Number
