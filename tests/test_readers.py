@@ -1,6 +1,7 @@
 """Tests for the t-digest → tensor read helpers — issue #79."""
 
 import math
+import warnings
 
 import numpy as np
 import pytest
@@ -356,3 +357,92 @@ class TestReadLocations:
         _write_chunk(store, "f", 7, {0: np.array([1.0, 2.0])})
         with pytest.raises(ValueError, match="has no locations array"):
             list(read_locations(store, "f"))
+
+
+class TestReadParityWithoutConsolidation:
+    """Issue #191: consolidation is now opt-out, so published stores are read
+    without a consolidated-metadata blob. Pin that every reader navigates a
+    non-consolidated store to the same bytes it would read from a consolidated
+    one — readers reach paths directly (``zarr.open_group``/``open_array`` per
+    subgroup), never the consolidated blob."""
+
+    @staticmethod
+    def _point_words(n, seed):
+        from conftest import point_words
+
+        return point_words(n, seed)
+
+    def _build_store(self):
+        """A two-shard located t-digest field, written like the worker's CSR
+        path (per-parent-morton subgroups), with no consolidated metadata."""
+        store = MemoryStore()
+        # Two coverage chunks (parent mortons 100 and 205), distinct values so
+        # read_raw_values is lossless (every centroid weight 1).
+        shards = {
+            100: {0: np.array([10.0, 11.0, 12.0]), 5: np.array([13.0, 14.0])},
+            205: {2: np.array([20.0, 21.0]), 63: np.array([22.0, 23.0, 24.0])},
+        }
+        seed = 1
+        for morton, cell_to_vals in shards.items():
+            cell_ids = sorted(cell_to_vals)
+            pairs = [
+                build_tdigest(
+                    cell_to_vals[c],
+                    delta=512,
+                    locations=self._point_words(len(cell_to_vals[c]), seed),
+                )
+                for c in cell_ids
+            ]
+            write_csr(
+                store,
+                f"h_tdigest/{morton}",
+                [p[0] for p in pairs],
+                cell_ids,
+                locations_list=[p[1] for p in pairs],
+            )
+            seed += 1
+        return store
+
+    @staticmethod
+    def _read_all(store):
+        from zagg.readers.tdigest_tensor import read_locations
+
+        tensors = {m: t for t, m in read_tensors(store, "h_tdigest", n_bins=64, resolution=0.5)}
+        raw = {(m, c): v for m, c, v in read_raw_values(store, "h_tdigest")}
+        locs = {(m, c): loc for m, c, loc in read_locations(store, "h_tdigest")}
+        return tensors, raw, locs
+
+    def test_non_consolidated_is_navigable_and_reads_parity(self):
+        store = self._build_store()
+
+        # A freshly written store carries NO consolidated-metadata blob — the
+        # default now (issue #191). Readers must still navigate it.
+        root = zarr.open_group(store, mode="r", zarr_format=3)
+        assert root.metadata.consolidated_metadata is None
+
+        tensors_plain, raw_plain, locs_plain = self._read_all(store)
+        # Sanity: the readers actually reached the data.
+        assert set(tensors_plain) == {100, 205}
+        assert (100, 0) in raw_plain and (205, 63) in raw_plain
+
+        # Consolidate the SAME store and re-read: consolidation only adds a
+        # metadata blob no reader consults, so every byte must match.
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            zarr.consolidate_metadata(store, zarr_format=3)
+        assert (
+            zarr.open_group(store, mode="r", zarr_format=3).metadata.consolidated_metadata
+            is not None
+        )
+
+        tensors_cons, raw_cons, locs_cons = self._read_all(store)
+
+        assert set(tensors_cons) == set(tensors_plain)
+        for m in tensors_plain:
+            np.testing.assert_array_equal(tensors_plain[m], tensors_cons[m])
+        assert set(raw_cons) == set(raw_plain)
+        for key in raw_plain:
+            np.testing.assert_array_equal(raw_plain[key], raw_cons[key])
+        assert set(locs_cons) == set(locs_plain)
+        for key in locs_plain:
+            np.testing.assert_array_equal(locs_plain[key], locs_cons[key])
