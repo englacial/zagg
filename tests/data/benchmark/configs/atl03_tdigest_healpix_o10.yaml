@@ -21,11 +21,10 @@
 # Confidence filter, multi-level form and read_plan match atl03.yaml (the planned
 # segment->photon IO of issue #43 applies here too); only the aggregation differs.
 data_source:
-  # Pinned read backend (issue #170): the UNCACHED pure-h5coro baseline
-  # column. The package default flipped to the compiled `inline` path; an
-  # unpinned config would silently move this series onto the fast path.
-  index:
-    backend: hierarchical
+  # issue #193: the sharded inline-vs-sidecar matrix. The read backend is set
+  # per target (index_backend: inline|sidecar) by run_benchmark; granule-level
+  # read concurrency is pinned to K=4 (issue #180 sizing sweet spot).
+  granule_workers: 4
   reader: h5coro
   driver: s3
   groups: [gt1l, gt1r, gt2l, gt2r, gt3l, gt3r]
@@ -93,4 +92,5 @@ output:
     indexing_scheme: nested
     parent_order: 10             # shard / dispatch unit: 4^(19-10) = 512x512 cells
     chunk_inner: 13              # inner Zarr chunk: 4^(19-13) = 64x64 cells (K=64 per shard)
+    sharded: true                # issue #193: sharded output fixed on for the matrix
     child_order: 19              # leaf cell resolution (~10 m)

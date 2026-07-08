@@ -117,6 +117,22 @@ def run_target(
     # default, so frozen/legacy targets dispatch byte-identically to before.
     if "sharded" in target:
         config.output.setdefault("grid", {})["sharded"] = bool(target["sharded"])
+    # Read-backend A/B (issue #193): the live matrix sets data_source.index from
+    # each target's ``index_backend`` (inline vs sidecar), so one config per
+    # order drives both columns. sidecar consumes/builds the granule-keyed
+    # manifests; inline builds the chunk map on the fly. Absent -> config's own
+    # index (frozen/legacy/provisional targets dispatch unchanged).
+    backend = target.get("index_backend")
+    if backend == "sidecar":
+        config.data_source["index"] = {
+            "backend": "sidecar",
+            "on_miss": "build",
+            "store": "s3://sliderule-public-cors/zagg-index/ATL03/007",
+        }
+    elif backend == "inline":
+        config.data_source["index"] = {"backend": "inline"}
+    elif backend == "hierarchical":
+        config.data_source["index"] = {"backend": "hierarchical"}
     # parent_order lives in the config grid for HEALPix; the kwarg is just a
     # legacy fallback. Rect grids ignore it. ``from_config`` gives us the grid
     # object the area/cost derivation needs.
@@ -137,6 +153,9 @@ def run_target(
         # "inner" with the real inner column, so the renderer needs this to
         # give them their own panel instead of silently overwriting it.
         read=target.get("read"),
+        # Read-backend axis (issue #193): "inline"|"sidecar" -- the live matrix's
+        # A/B, split by the renderer into its two columns. None on frozen rows.
+        index_backend=target.get("index_backend"),
     )
 
     if dry_run:
