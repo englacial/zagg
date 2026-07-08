@@ -294,29 +294,43 @@ def _iter_datasets(h5obj):
     for, measured on real ATL03). A node whose ``typeSize == 0`` is a group
     (or a typeless link) and is descended; anything else is a dataset yielded
     with the ``H5Dataset`` its classification already parsed, so the caller
-    can build its chunk map without re-parsing the object header. Paths are
-    absolute (leading ``/``) and visited in sorted order for determinism.
+    can build its chunk map without re-parsing the object header. Each node's
+    object header is parsed exactly once: parsing a group path populates its
+    *direct* children into ``h5obj.pathAddresses`` (h5coro traverses one level
+    to resolve the path), so the classification parse doubles as the group's
+    enumeration parse. A ``seen`` set of object-header addresses bounds the
+    recursion against a (non-ICESat-2) hard-link cycle. Paths are absolute
+    (leading ``/``) and visited in sorted order for determinism.
     """
     from h5coro.h5dataset import H5Dataset
 
-    def descend(path: str):
-        H5Dataset(h5obj, path, earlyExit=False, metaOnly=True, enableAttributes=False)
+    def child_paths(path: str) -> list[str]:
         prefix = "" if path == "/" else path.lstrip("/") + "/"
         kids = set()
         for pp in list(h5obj.pathAddresses.keys()):
             if pp.startswith(prefix):
                 rel = pp[len(prefix) :]
                 if rel and "/" not in rel:  # a direct child of ``path``
-                    kids.add(prefix + rel)
-        for kid in sorted(kids):
-            kp = "/" + kid
+                    kids.add("/" + prefix + rel)
+        return sorted(kids)
+
+    seen: set[int] = set()
+
+    def visit(path: str):
+        for kp in child_paths(path):
             ds = H5Dataset(h5obj, kp, earlyExit=False, metaOnly=True, enableAttributes=False)
-            if ds.meta.typeSize == 0:
-                yield from descend(kp)
+            if ds.meta.typeSize == 0:  # group (or typeless link): descend
+                addr = h5obj.pathAddresses.get(kp.lstrip("/"))
+                if addr in seen:
+                    continue  # hard-link cycle guard
+                seen.add(addr)
+                yield from visit(kp)  # kp's children are already in pathAddresses
             else:
                 yield kp, ds
 
-    yield from descend("/")
+    # Parse the root once to populate its direct children, then descend.
+    H5Dataset(h5obj, "/", earlyExit=False, metaOnly=True, enableAttributes=False)
+    yield from visit("/")
 
 
 def full_granule_maps(h5obj, existing: dict[str, ChunkMap]) -> dict[str, ChunkMap]:
@@ -340,6 +354,12 @@ def full_granule_maps(h5obj, existing: dict[str, ChunkMap]) -> dict[str, ChunkMa
             maps[path] = _chunk_map_from_dataset(h5obj, ds, path)
         except ValueError:
             continue  # COMPACT (or other offset-less layout): not chunk-indexable
+        except Exception as exc:
+            # Match the read path's per-dataset tolerance (a bad B-tree or an
+            # odd object header degrades that dataset to the h5coro decoder
+            # there): drop just this dataset from the manifest instead of
+            # sinking the whole granule's write-back.
+            logger.warning(f"  write-back: no chunk map for {path} ({exc}); skipping")
     return maps
 
 
@@ -467,16 +487,16 @@ class InlineIndex(VirtualIndex):
                 "index.store is only meaningful for backend 'inline' with "
                 "write_back: true (inline never reads the store)"
             )
+        if "write_back_coverage" in index_cfg and not write_back:
+            raise ValueError(
+                "index.write_back_coverage is only meaningful for backend 'inline' "
+                "with write_back: true"
+            )
         coverage = index_cfg.get("write_back_coverage", "full")
         if coverage not in cls._COVERAGE:
             raise ValueError(
                 f"index.write_back_coverage must be one of {sorted(cls._COVERAGE)} "
                 f"(got {coverage!r})"
-            )
-        if "write_back_coverage" in index_cfg and not write_back:
-            raise ValueError(
-                "index.write_back_coverage is only meaningful for backend 'inline' "
-                "with write_back: true"
             )
         # Both read routes accept this backend (issue #170 phase 2): sources
         # with read_plan.spatial_index take the planned route, read-plan-less

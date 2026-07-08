@@ -1448,6 +1448,29 @@ class TestFullCoverageWalk:
         # ...and the COMPACT dataset is dropped (no file offset).
         assert "/ancillary_data/control" not in maps
 
+    def test_full_granule_maps_tolerates_one_bad_dataset(self, monkeypatch, caplog):
+        # A single dataset whose map build raises (not a compact ValueError)
+        # must not sink the whole granule's write-back -- it degrades like the
+        # read path (log + skip), and every other dataset is still covered.
+        import zagg.index.inline as inline_mod
+        from zagg.index.inline import full_granule_maps
+
+        real = inline_mod._chunk_map_from_dataset
+
+        def flaky(h5obj, ds, path):
+            if path == "/gt2l/heights/h_ph":
+                raise RuntimeError("boom")
+            return real(h5obj, ds, path)
+
+        monkeypatch.setattr(inline_mod, "_chunk_map_from_dataset", flaky)
+        h5obj = _open_fixture()
+        with caplog.at_level("WARNING", logger="zagg.index.inline"):
+            maps = full_granule_maps(h5obj, {})
+        assert "/gt2l/heights/h_ph" not in maps  # the flaky one dropped
+        assert "/gt1l/heights/h_ph" in maps  # everything else covered
+        assert "/gt2l/heights/lat_ph" in maps
+        assert any("boom" in r.message for r in caplog.records)
+
 
 class TestInlineInterleavedGranules:
     """Issue #180 phase 1: with granule-level read concurrency the worker may
