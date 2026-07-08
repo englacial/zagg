@@ -2099,3 +2099,29 @@ class TestMerra2StormTemplate:
             assert spec["spatial_func"] in registry.list_spatial_funcs()
             assert spec["temporal_reducer"] in registry.list_reducers()
             assert spec["mask"] in registry.list_mask_providers()
+
+
+class TestConsolidateMetadataFlag:
+    """Issue #191: metadata consolidation is opt-in via output.consolidate_metadata
+    (default False) — no zagg reader depends on the consolidated blob and building
+    it is a ~70 s serial-GET finalize tax."""
+
+    def test_default_off(self):
+        from zagg.config import get_consolidate_metadata
+
+        assert get_consolidate_metadata(default_config("atl06")) is False
+
+    def test_accessor_true(self):
+        from zagg.config import get_consolidate_metadata
+
+        cfg = default_config("atl06")
+        cfg.output = {**cfg.output, "consolidate_metadata": True}
+        assert get_consolidate_metadata(cfg) is True
+
+    def test_validate_rejects_non_bool(self):
+        from zagg.config import validate_config
+
+        cfg = default_config("atl06")
+        cfg.output = {**cfg.output, "consolidate_metadata": "yes"}
+        with pytest.raises(ValueError, match="output.consolidate_metadata must be a boolean"):
+            validate_config(cfg)

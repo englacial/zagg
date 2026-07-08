@@ -3115,3 +3115,118 @@ class TestWorkerPhaseTimings:
         meta = self._run(monkeypatch, profile=True, with_data=False)
         assert meta["error"] == "No data after filtering"
         assert set(meta["phase_timings"]) == {"read"}
+
+
+class TestConsolidationGate:
+    """Issue #191: metadata consolidation is opt-in. With the flag off (default)
+    the local runner skips the ``consolidate_metadata`` call and the Lambda
+    dispatcher skips the ``mode: "finalize"`` invoke entirely; with the flag on
+    both still run, byte-identical to the pre-#191 behavior."""
+
+    def _local_consolidate_calls(self, monkeypatch, atl06_config, *, enabled):
+        import zagg.grids as grids_mod
+        from zagg import runner
+
+        monkeypatch.setattr(
+            runner,
+            "get_nsidc_s3_credentials",
+            lambda: {"accessKeyId": "a", "secretAccessKey": "s", "sessionToken": "t"},
+        )
+        monkeypatch.setattr(grids_mod, "from_config", lambda *a, **k: _stub_grid())
+        monkeypatch.setattr(runner, "open_store", lambda *a, **k: object())
+        calls = []
+        monkeypatch.setattr(runner, "consolidate_metadata", lambda *a, **k: calls.append(1))
+        monkeypatch.setattr(
+            runner,
+            "_process_and_write",
+            lambda shard_key, *a, **k: {"shard_key": shard_key, "total_obs": 1, "error": None},
+        )
+        if enabled:
+            atl06_config.output = {**atl06_config.output, "consolidate_metadata": True}
+        runner._run_local(
+            atl06_config,
+            _run_catalog(),
+            "./out.zarr",
+            12,
+            max_cells=None,
+            morton_cell=None,
+            max_workers=1,
+            overwrite=False,
+            dry_run=False,
+            region="us-west-2",
+        )
+        return len(calls)
+
+    def test_local_skips_consolidation_by_default(self, monkeypatch, atl06_config):
+        assert self._local_consolidate_calls(monkeypatch, atl06_config, enabled=False) == 0
+
+    def test_local_consolidates_when_enabled(self, monkeypatch, atl06_config):
+        assert self._local_consolidate_calls(monkeypatch, atl06_config, enabled=True) == 1
+
+    def _lambda_finalize_calls(self, monkeypatch, atl06_config, *, enabled):
+        import boto3
+
+        import zagg.grids as grids_mod
+        from zagg import runner
+        from zagg.concurrency import ConcurrencyReport
+
+        monkeypatch.setattr(
+            runner,
+            "get_nsidc_s3_credentials",
+            lambda: {"accessKeyId": "a", "secretAccessKey": "s", "sessionToken": "t"},
+        )
+        monkeypatch.setattr(grids_mod, "from_config", lambda *a, **k: _stub_grid())
+        monkeypatch.setattr(runner, "_invoke_lambda_setup", lambda *a, **k: None)
+        monkeypatch.setattr(runner, "_get_function_timeout_s", lambda *a, **k: 720)
+        calls = []
+        monkeypatch.setattr(runner, "_invoke_lambda_finalize", lambda *a, **k: calls.append(1))
+        from unittest.mock import MagicMock
+
+        monkeypatch.setattr(boto3, "Session", lambda *a, **k: MagicMock())
+        monkeypatch.setattr(
+            runner,
+            "compute_available_workers",
+            lambda requested, *a, **k: (
+                1,
+                ConcurrencyReport(
+                    account_limit=1000,
+                    current_concurrent=0,
+                    padding=100,
+                    available=900,
+                    function_reserved=None,
+                ),
+            ),
+        )
+        monkeypatch.setattr(
+            runner,
+            "_invoke_lambda_cell",
+            lambda client, chunk_idx, shard_key, *a, **k: {
+                "shard_key": shard_key,
+                "status_code": 200,
+                "body": {"total_obs": 1},
+                "error": None,
+                "timeout": False,
+            },
+        )
+        if enabled:
+            atl06_config.output = {**atl06_config.output, "consolidate_metadata": True}
+        runner._run_lambda(
+            atl06_config,
+            _run_catalog(),
+            "s3://out/x.zarr",
+            12,
+            max_cells=None,
+            morton_cell=None,
+            max_workers=1,
+            overwrite=False,
+            dry_run=False,
+            region="us-west-2",
+            function_name="fn",
+        )
+        return len(calls)
+
+    def test_lambda_skips_finalize_by_default(self, monkeypatch, atl06_config):
+        assert self._lambda_finalize_calls(monkeypatch, atl06_config, enabled=False) == 0
+
+    def test_lambda_finalizes_when_enabled(self, monkeypatch, atl06_config):
+        assert self._lambda_finalize_calls(monkeypatch, atl06_config, enabled=True) == 1
