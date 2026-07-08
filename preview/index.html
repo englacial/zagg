@@ -1,0 +1,15 @@
+<!doctype html>
+<html><head><meta charset='utf-8'>
+<title>zagg Lambda benchmark</title>
+<style>body{font-family:sans-serif;max-width:1100px;margin:2rem auto;padding:0 1rem}img{max-width:100%;height:auto;border:1px solid #ddd}</style></head>
+<body>
+<h1>zagg Lambda benchmark</h1>
+<p>arm64 · 4 GB · one shard/target · densest cell over the NEON SERC AOP box. Each point is a merge to <code>main</code>.</p>
+<h2>inline vs sidecar (sharded, K=4) — latest merge</h2>
+<img src="matrix_table.png" alt="inline vs sidecar benchmark table">
+<p>Machine-readable: <a href="latest.md">latest.md</a> · <a href="metrics.json">metrics.json</a></p>
+<h2>cost_per_shard (inline vs sidecar)</h2>
+<img src="cost_per_shard_matrix.png" alt="cost_per_shard_matrix">
+<h2>cost_per_100km2 (inline vs sidecar)</h2>
+<img src="cost_per_100km2_matrix.png" alt="cost_per_100km2_matrix">
+</body></html>
