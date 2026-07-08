@@ -1603,15 +1603,15 @@ class TestSummaryKeysByteIdentical:
         assert summary["backend"] == "lambda"
         assert summary["cells_with_data"] == 4
         assert summary["total_obs"] == 12
-        # 4 cells x 2 s x 2 GB = 16 GB-s; cost = 16 * arm64 price.
+        # 4 cells x 2 s x 4 GB = 32 GB-s; cost = 32 * arm64 price.
         assert summary["lambda_time_s"] == 8.0
-        assert summary["gb_seconds"] == 16.0
+        assert summary["gb_seconds"] == 32.0
         assert summary["price_per_gb_sec"] == 0.0000133334
-        assert summary["estimated_cost_usd"] == 16.0 * 0.0000133334
+        assert summary["estimated_cost_usd"] == 32.0 * 0.0000133334
 
     def test_lambda_cost_byte_identical_with_mixed_durations(self, monkeypatch, atl06_config):
         """estimated_cost_usd must equal the pre-refactor arithmetic order:
-        ``(sum(durations) * 2.0) * price`` computed once -- not a sum of
+        ``(sum(durations) * 4.0) * price`` computed once -- not a sum of
         per-cell ``cost_usd`` (which would diverge in the last FP ULP). Uses
         heterogeneous per-cell durations so the two orders actually differ.
         """
@@ -1676,8 +1676,8 @@ class TestSummaryKeysByteIdentical:
         )
         total = 0.1 + 0.2 + 0.3 + 12.7
         # The exact pre-refactor order: one multiply over the summed time.
-        assert summary["gb_seconds"] == total * 2.0
-        assert summary["estimated_cost_usd"] == (total * 2.0) * 0.0000133334
+        assert summary["gb_seconds"] == total * 4.0
+        assert summary["estimated_cost_usd"] == (total * 4.0) * 0.0000133334
 
 
 # ---------------------------------------------------------------------------
@@ -2053,7 +2053,7 @@ class TestTemporalLambdaStrategy:
         assert summary["events_error"] == 0
         assert summary["timesteps_processed"] == 4
         assert summary["output_path"] == "s3://out/events.parquet"
-        assert summary["gb_seconds"] == pytest.approx(2.0 * 2.0)  # 2 s x 2 GB
+        assert summary["gb_seconds"] == pytest.approx(2.0 * 4.0)  # 2 s x 4 GB
         assert summary["results"] == written["rows"]
         assert summary["failures"] == []
 
