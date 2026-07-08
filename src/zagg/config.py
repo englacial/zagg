@@ -309,6 +309,15 @@ def validate_config(config: PipelineConfig) -> None:
     if aoi_mask is not None and not isinstance(aoi_mask, bool):
         raise ValueError(f"output.aoi_mask must be a boolean (got {aoi_mask!r})")
 
+    # Optional zarr metadata consolidation (issue #191), default off. Must be a
+    # bool. No zagg reader depends on the consolidated blob, and building it is a
+    # ~70 s serial-GET finalize tax, so it is opt-in.
+    consolidate_metadata = config.output.get("consolidate_metadata")
+    if consolidate_metadata is not None and not isinstance(consolidate_metadata, bool):
+        raise ValueError(
+            f"output.consolidate_metadata must be a boolean (got {consolidate_metadata!r})"
+        )
+
     # Validate bounds structure (optional)
     if config.bounds is not None:
         allowed_keys = {"temporal", "spatial"}
@@ -1515,6 +1524,28 @@ def get_aoi_mask(config: PipelineConfig) -> bool:
     bool
     """
     return bool(config.output.get("aoi_mask", False))
+
+
+def get_consolidate_metadata(config: PipelineConfig) -> bool:
+    """Whether the finalize step consolidates zarr metadata (issue #191).
+
+    ``output.consolidate_metadata: true`` runs ``zarr.consolidate_metadata`` as a
+    finalize step after every cell completes, producing a consolidated-metadata
+    blob. Defaults to ``False``: no zagg reader opens with ``use_consolidated`` —
+    readers navigate to specific paths in a few GETs — and consolidation is an
+    optional zarr-v3 extension that costs ~70 s of serial metadata GETs per run.
+    When off, the finalize invoke is skipped entirely and stores read fine (v3
+    readers do lazy metadata reads natively).
+
+    Parameters
+    ----------
+    config : PipelineConfig
+
+    Returns
+    -------
+    bool
+    """
+    return bool(config.output.get("consolidate_metadata", False))
 
 
 def get_output_endpoint_url(config: PipelineConfig) -> str | None:

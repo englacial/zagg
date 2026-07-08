@@ -33,6 +33,7 @@ from zagg.concurrency import (
 from zagg.config import (
     PipelineConfig,
     get_child_order,
+    get_consolidate_metadata,
     get_driver,
     get_handoff,
     get_layout,
@@ -1214,7 +1215,11 @@ def _run_local(
     finally:
         executor.shutdown()
 
-    consolidate_metadata(zarr_store, zarr_format=3)
+    # Metadata consolidation is opt-in (issue #191): no zagg reader depends on the
+    # consolidated blob and building it is a ~70 s serial-GET finalize tax, so
+    # skip it unless output.consolidate_metadata is true.
+    if get_consolidate_metadata(config):
+        consolidate_metadata(zarr_store, zarr_format=3)
     wall_time = time.time() - start_time
 
     summary = {
@@ -1429,16 +1434,30 @@ def _run_lambda(
             **extra,
         )
 
+    # Metadata consolidation is opt-in (issue #191): nothing in zagg's read path
+    # uses the consolidated blob and the finalize invoke is a ~70 s serial-GET tax,
+    # so gate the invoke dispatcher-side. When off we hand the executor a no-op
+    # finalize (mirroring the temporal path's ``_run_lambda_events``, which has no
+    # metadata to consolidate) so no ``mode: "finalize"`` Lambda is dispatched.
+    if get_consolidate_metadata(config):
+
+        def _finalize_fn():
+            return _invoke_lambda_finalize(
+                state["lambda_client"],
+                function_name,
+                store_path,
+                output_creds_event=output_creds_event,
+            )
+    else:
+
+        def _finalize_fn():
+            return None
+
     executor = LambdaExecutor(
         _cell_work,
         preflight_fn=_preflight,
         pool_factory=ThreadPoolExecutor,
-        finalize_fn=lambda: _invoke_lambda_finalize(
-            state["lambda_client"],
-            function_name,
-            store_path,
-            output_creds_event=output_creds_event,
-        ),
+        finalize_fn=_finalize_fn,
     )
     # preflight() runs the probe, builds the sized client, and sizes the pool.
     executor.preflight(len(cells))
