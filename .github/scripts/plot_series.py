@@ -59,14 +59,14 @@ def memory_fractions(sub: pd.DataFrame) -> list[float | None]:
 def _memory_cap_mb(sub: pd.DataFrame) -> float:
     """Lambda memory cap in MB, for the colorbar's fraction<->MB twin axis.
 
-    Reads ``memory_gb`` (uniform across the series -- the benchmark pins 2 GB) and
+    Reads ``memory_gb`` (uniform across the series -- the benchmark pins 4 GB) and
     falls back to 2048 MB when the column is absent or empty.
     """
     if "memory_gb" in sub.columns:
         caps = sub["memory_gb"].dropna()
         if not caps.empty:
             return float(caps.iloc[0]) * 1024.0
-    return 2.0 * 1024.0
+    return 4.0 * 1024.0  # issue #193: benchmark pins 4 GB
 
 
 def _merge_history(df: pd.DataFrame) -> pd.DataFrame:

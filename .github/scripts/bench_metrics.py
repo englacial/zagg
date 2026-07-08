@@ -16,7 +16,7 @@ from __future__ import annotations
 import math
 
 # Cost model and grid types come straight from the package so the benchmark can
-# never drift from what production actually bills/uses (arm64, 2 GB -- issue #110).
+# never drift from what production actually bills/uses (arm64, 4 GB -- issue #110/#193).
 from zagg.dispatch import LAMBDA_MEMORY_GB, LAMBDA_PRICE_PER_GB_SEC
 from zagg.grids.healpix import HealpixGrid
 from zagg.grids.rectilinear import RectilinearGrid

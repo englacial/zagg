@@ -113,7 +113,8 @@
       "shardmap": "healpix_o9_88s",
       "aggregator": "tdigest",
       "grid_type": "healpix",
-      "grid_size": "o9_88s"
+      "grid_size": "o9_88s",
+      "index_backend": "hierarchical"
     },
     "tdigest_healpix_o9_88s_cached": {
       "config": "configs/atl03_tdigest_healpix_o9_cached.yaml",
@@ -121,14 +122,16 @@
       "aggregator": "tdigest",
       "grid_type": "healpix",
       "grid_size": "o9_88s",
-      "read": "cached"
+      "read": "cached",
+      "index_backend": "sidecar"
     },
     "tdigest_healpix_o10_88s": {
       "config": "configs/atl03_tdigest_healpix_o10.yaml",
       "shardmap": "healpix_o10_88s",
       "aggregator": "tdigest",
       "grid_type": "healpix",
-      "grid_size": "o10_88s"
+      "grid_size": "o10_88s",
+      "index_backend": "hierarchical"
     },
     "tdigest_healpix_o10_88s_cached": {
       "config": "configs/atl03_tdigest_healpix_o10_cached.yaml",
@@ -136,7 +139,8 @@
       "aggregator": "tdigest",
       "grid_type": "healpix",
       "grid_size": "o10_88s",
-      "read": "cached"
+      "read": "cached",
+      "index_backend": "sidecar"
     }
   },
   "_frozen_note": "Pre-#193 targets (sharded/inner codec A/B + *_cached read axis) are retired from the live matrix as of issue #193; their series rows + PNGs are retained/frozen on the benchmarks branch. The live matrix below is tdigest, sharded, inline-vs-sidecar, K=4, o9+o10 (issue #193)."
