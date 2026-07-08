@@ -63,6 +63,16 @@ RECORD_COLUMNS = [
     # targets, None otherwise. Keeps the cached column out of the inner
     # codec slot in the renderer; legacy rows read back NaN and key on codec.
     "read",
+    # Wall-time breakdown (issue #180): end-to-end AOI dispatch wall and its
+    # three phases. ``runtime_s`` above is the single worker's compute;
+    # ``total_wall_s`` is what the orchestrator actually waits (setup +
+    # fanout/poll + finalize). ``finalize_s`` is the zarr metadata
+    # consolidation invoke -- a ~fixed cost worth tracking for regression
+    # (issue #191). Null on rows recorded before these were surfaced.
+    "total_wall_s",
+    "setup_s",
+    "fanout_s",
+    "finalize_s",
 ]
 
 
@@ -168,6 +178,12 @@ def build_record(
         # the target. None on targets that don't set it (legacy/frozen rows).
         "codec": context.get("codec"),
         "read": context.get("read"),
+        # Wall-time breakdown (issue #180): total end-to-end AOI dispatch wall
+        # plus its phases, straight from the agg summary.
+        "total_wall_s": summary.get("wall_time_s"),
+        "setup_s": summary.get("setup_s"),
+        "fanout_s": summary.get("fanout_s"),
+        "finalize_s": summary.get("finalize_s"),
     }
     return record
 
@@ -188,6 +204,8 @@ TABLE_HEADERS = [
     "target",
     "obs",
     "runtime (s)",
+    "wall (s)",
+    "finalize (s)",
     "cost/shard",
     "cost/100 km²",
     "% timeout",
@@ -209,6 +227,8 @@ def format_record_cells(r: dict) -> dict:
         "target": _fmt(r.get("target")),
         "obs": _fmt(obs, ",d") if obs is not None else "n/a",
         "runtime (s)": _fmt(r.get("runtime_s"), ".1f"),
+        "wall (s)": _fmt(r.get("total_wall_s"), ".1f"),
+        "finalize (s)": _fmt(r.get("finalize_s"), ".1f"),
         "cost/shard": "$" + _fmt(r.get("cost_per_shard_usd"), ".5f"),
         "cost/100 km²": "$" + _fmt(r.get("cost_per_100km2_usd"), ".5f"),
         "% timeout": _fmt(r.get("worker_pct_timeout"), ".0%"),

@@ -85,6 +85,9 @@ def _summary():
         "function_timeout_s": 720,
         "worker_pct_timeout": 0.285,
         "max_memory_mb": 1963.0,
+        "setup_s": 5.0,
+        "fanout_s": 140.0,
+        "finalize_s": 65.0,
     }
 
 
@@ -123,11 +126,14 @@ def test_build_record_max_memory_null_safe():
 
 
 def test_codec_column_is_last_and_threaded(monkeypatch):
-    # Stable-schema rule: new columns append LAST. The read axis (issue #170)
-    # is now the newest column; codec (issue #133) sits just before it. Both
-    # are threaded from context and null on rows that omit them (legacy/frozen).
-    assert bench_metrics.RECORD_COLUMNS[-1] == "read"
-    assert bench_metrics.RECORD_COLUMNS[-2] == "codec"
+    # Stable-schema rule: new columns append LAST. codec (issue #133) and the
+    # read axis (issue #170) are threaded from context and null on rows that
+    # omit them; the wall-breakdown columns (issue #180) were appended after
+    # them, so codec/read are no longer literally last -- assert order, not
+    # tail position.
+    cols = bench_metrics.RECORD_COLUMNS
+    assert cols.index("codec") < cols.index("read") < cols.index("total_wall_s")
+    assert cols[-4:] == ["total_wall_s", "setup_s", "fanout_s", "finalize_s"]
     g = HealpixGrid(parent_order=11, child_order=19)
     rec = bench_metrics.build_record(_summary(), grid=g, context={"codec": "sharded"})
     assert rec["codec"] == "sharded"
@@ -139,6 +145,24 @@ def test_codec_column_is_last_and_threaded(monkeypatch):
     legacy = bench_metrics.build_record(_summary(), grid=g, context={"target": "t"})
     assert legacy["codec"] is None
     assert legacy["read"] is None
+
+
+def test_wall_breakdown_columns_threaded_and_rendered():
+    # issue #180: total AOI wall + its phases flow from the agg summary into
+    # the record, and total wall + finalize surface in the rendered table.
+    g = HealpixGrid(parent_order=11, child_order=19)
+    rec = bench_metrics.build_record(_summary(), grid=g, context={"target": "t"})
+    assert rec["total_wall_s"] == 210.0
+    assert rec["setup_s"] == 5.0
+    assert rec["fanout_s"] == 140.0
+    assert rec["finalize_s"] == 65.0
+    # A summary missing the phases (older worker) -> null, not a crash.
+    bare = bench_metrics.build_record({"total_obs": 1}, grid=g, context={})
+    assert bare["total_wall_s"] is None and bare["finalize_s"] is None
+    cells = bench_metrics.format_record_cells(rec)
+    assert cells["wall (s)"] == "210.0" and cells["finalize (s)"] == "65.0"
+    assert "wall (s)" in bench_metrics.TABLE_HEADERS
+    assert "finalize (s)" in bench_metrics.TABLE_HEADERS
 
 
 def test_run_target_threads_codec_into_record():
