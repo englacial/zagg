@@ -73,6 +73,9 @@ RECORD_COLUMNS = [
     "setup_s",
     "fanout_s",
     "finalize_s",
+    # Read-backend axis (issue #193): "inline" | "sidecar" -- the live matrix's
+    # A/B column. Null on frozen/legacy rows (codec/read axes predate it).
+    "index_backend",
 ]
 
 
@@ -178,6 +181,7 @@ def build_record(
         # the target. None on targets that don't set it (legacy/frozen rows).
         "codec": context.get("codec"),
         "read": context.get("read"),
+        "index_backend": context.get("index_backend"),
         # Wall-time breakdown (issue #180): total end-to-end AOI dispatch wall
         # plus its phases, straight from the agg summary.
         "total_wall_s": summary.get("wall_time_s"),

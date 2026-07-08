@@ -317,7 +317,7 @@ class LocalExecutor:
 # the constants inlined into ``_run_lambda`` before this extraction; surfaced
 # here so :meth:`LambdaExecutor.measure_cost` and the runner's presentation
 # read one source.
-LAMBDA_MEMORY_GB = 2.0
+LAMBDA_MEMORY_GB = 4.0  # issue #193: production worker sized to 4 GB (2.3 vCPU)
 LAMBDA_PRICE_PER_GB_SEC = 0.0000133334
 
 

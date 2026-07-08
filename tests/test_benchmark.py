@@ -133,7 +133,7 @@ def test_codec_column_is_last_and_threaded(monkeypatch):
     # tail position.
     cols = bench_metrics.RECORD_COLUMNS
     assert cols.index("codec") < cols.index("read") < cols.index("total_wall_s")
-    assert cols[-4:] == ["total_wall_s", "setup_s", "fanout_s", "finalize_s"]
+    assert cols[-5:] == ["total_wall_s", "setup_s", "fanout_s", "finalize_s", "index_backend"]
     g = HealpixGrid(parent_order=11, child_order=19)
     rec = bench_metrics.build_record(_summary(), grid=g, context={"codec": "sharded"})
     assert rec["codec"] == "sharded"
@@ -142,6 +142,8 @@ def test_codec_column_is_last_and_threaded(monkeypatch):
         _summary(), grid=g, context={"codec": "inner", "read": "cached"}
     )
     assert cached["read"] == "cached"
+    live = bench_metrics.build_record(_summary(), grid=g, context={"index_backend": "sidecar"})
+    assert live["index_backend"] == "sidecar"
     legacy = bench_metrics.build_record(_summary(), grid=g, context={"target": "t"})
     assert legacy["codec"] is None
     assert legacy["read"] is None
@@ -169,7 +171,7 @@ def test_run_target_threads_codec_into_record():
     # run_benchmark must record the target's codec onto the row (dry-run, no AWS).
     manifest, base = run_benchmark.load_targets(str(BENCH / "targets.json"))
     rec = run_benchmark.run_target(
-        "tdigest_healpix_o10_inner",
+        "tdigest_healpix_o10_inline",
         manifest,
         base,
         store=None,
@@ -178,7 +180,8 @@ def test_run_target_threads_codec_into_record():
         context={"commit": "deadbee", "event": "pr"},
         dry_run=True,
     )
-    assert rec["codec"] == "inner"
+    assert rec["index_backend"] == "inline"  # issue #193: the live matrix's A/B axis
+    assert rec["codec"] is None  # codec axis retired from the live matrix
 
 
 def test_memory_pct_of_cap_maps_near_red():
@@ -293,7 +296,7 @@ def test_comment_markdown_worker_note_banner():
 def test_run_target_dry_run():
     manifest, base = run_benchmark.load_targets(str(BENCH / "targets.json"))
     rec = run_benchmark.run_target(
-        "tdigest_healpix_o11_sharded",
+        "tdigest_healpix_o9_sidecar",
         manifest,
         base,
         store=None,
@@ -302,11 +305,11 @@ def test_run_target_dry_run():
         context={"commit": "deadbee", "event": "pr"},
         dry_run=True,
     )
-    assert rec["target"] == "tdigest_healpix_o11_sharded"
+    assert rec["target"] == "tdigest_healpix_o9_sidecar"
     assert rec["aggregator"] == "tdigest"
     assert rec["grid_type"] == "healpix"
-    assert rec["shard_key"] == 5347394812217655307
-    assert rec["shard_area_km2"] == pytest.approx(10.13, abs=0.2)
+    assert rec["shard_key"] == 5347395636851376137  # o9 densest cell
+    assert rec["shard_area_km2"] == pytest.approx(162.1, abs=1.0)  # o9 HEALPix cell
     assert rec["total_obs"] is None  # no dispatch in dry-run
 
 
@@ -336,7 +339,7 @@ def test_main_fails_on_empty_target(tmp_path, monkeypatch):
             "--targets",
             str(BENCH / "targets.json"),
             "--target",
-            "tdigest_healpix_o10_inner",
+            "tdigest_healpix_o10_inline",
             "--commit",
             "cafe123",
             "--out-json",
@@ -360,7 +363,7 @@ def test_main_fails_on_null_memory_alone(tmp_path, monkeypatch):
             "--targets",
             str(BENCH / "targets.json"),
             "--target",
-            "tdigest_healpix_o10_inner",
+            "tdigest_healpix_o10_inline",
             "--commit",
             "cafe123",
             "--out-json",
@@ -381,7 +384,7 @@ def test_main_no_fail_on_empty_opts_out(tmp_path, monkeypatch):
             "--targets",
             str(BENCH / "targets.json"),
             "--target",
-            "tdigest_healpix_o10_inner",
+            "tdigest_healpix_o10_inline",
             "--no-fail-on-empty",
             "--commit",
             "cafe123",
@@ -403,7 +406,7 @@ def test_main_passes_on_populated_target(tmp_path, monkeypatch):
             "--targets",
             str(BENCH / "targets.json"),
             "--target",
-            "tdigest_healpix_o10_inner",
+            "tdigest_healpix_o10_inline",
             "--commit",
             "cafe123",
             "--out-json",
@@ -421,7 +424,7 @@ def test_main_dry_run_writes_outputs(tmp_path):
             "--targets",
             str(BENCH / "targets.json"),
             "--target",
-            "tdigest_healpix_o10_inner",
+            "tdigest_healpix_o10_inline",
             "--dry-run",
             "--commit",
             "cafe123",
@@ -432,8 +435,8 @@ def test_main_dry_run_writes_outputs(tmp_path):
         ]
     )
     records = json.loads(out_json.read_text())
-    assert len(records) == 1 and records[0]["target"] == "tdigest_healpix_o10_inner"
-    assert "tdigest_healpix_o10_inner" in out_md.read_text()
+    assert len(records) == 1 and records[0]["target"] == "tdigest_healpix_o10_inline"
+    assert "tdigest_healpix_o10_inline" in out_md.read_text()
 
 
 def test_main_dry_run_exempt_from_fail_on_empty(tmp_path):
@@ -444,7 +447,7 @@ def test_main_dry_run_exempt_from_fail_on_empty(tmp_path):
             "--targets",
             str(BENCH / "targets.json"),
             "--target",
-            "tdigest_healpix_o10_inner",
+            "tdigest_healpix_o10_inline",
             "--dry-run",
             "--commit",
             "cafe123",
@@ -478,9 +481,9 @@ def test_main_dispatches_targets_concurrently(tmp_path, monkeypatch):
             "--targets",
             str(BENCH / "targets.json"),
             "--target",
-            "tdigest_healpix_o10_inner",
+            "tdigest_healpix_o10_inline",
             "--target",
-            "tdigest_healpix_o10_sharded",
+            "tdigest_healpix_o10_sidecar",
             "--commit",
             "cafe123",
             "--out-json",
@@ -490,8 +493,8 @@ def test_main_dispatches_targets_concurrently(tmp_path, monkeypatch):
     assert rc == 0
     recs = json.loads(out_json.read_text())
     assert [r["target"] for r in recs] == [
-        "tdigest_healpix_o10_inner",
-        "tdigest_healpix_o10_sharded",
+        "tdigest_healpix_o10_inline",
+        "tdigest_healpix_o10_sidecar",
     ]
 
 
@@ -517,9 +520,9 @@ def test_main_warms_auth_once_before_parallel_dispatch(tmp_path, monkeypatch):
             "--targets",
             str(BENCH / "targets.json"),
             "--target",
-            "tdigest_healpix_o10_inner",
+            "tdigest_healpix_o10_inline",
             "--target",
-            "tdigest_healpix_o10_sharded",
+            "tdigest_healpix_o10_sidecar",
             "--commit",
             "cafe123",
             "--out-json",
@@ -543,9 +546,9 @@ def test_main_skips_auth_warmup_on_dry_run(tmp_path, monkeypatch):
             "--targets",
             str(BENCH / "targets.json"),
             "--target",
-            "tdigest_healpix_o10_inner",
+            "tdigest_healpix_o10_inline",
             "--target",
-            "tdigest_healpix_o10_sharded",
+            "tdigest_healpix_o10_sidecar",
             "--dry-run",
             "--commit",
             "cafe123",
@@ -572,7 +575,7 @@ def test_main_unknown_target_fails_before_any_dispatch(tmp_path, monkeypatch):
                 "--targets",
                 str(BENCH / "targets.json"),
                 "--target",
-                "tdigest_healpix_o10_inner",
+                "tdigest_healpix_o10_inline",
                 "--target",
                 "does_not_exist",
                 "--commit",
@@ -697,7 +700,7 @@ def test_committed_target_inherits_handoff_from_config(monkeypatch):
 
     monkeypatch.setattr(runner, "agg", fake_agg)
     run_benchmark.run_target(
-        "tdigest_healpix_o11_sharded",
+        "tdigest_healpix_o9_sidecar",
         manifest,
         base,
         store="s3://b/x.zarr",
@@ -1411,6 +1414,7 @@ def _cached_row(commit, order):
     )
 
 
+@pytest.mark.skip(reason="issue #193 phase 2: codec 2x3 rendering retired; replaced by the inline/sidecar matrix layout tests")
 def test_codec_layout_is_fixed_2x3_sharded_inner_by_order():
     import plot_series
 
@@ -1421,8 +1425,8 @@ def test_codec_layout_is_fixed_2x3_sharded_inner_by_order():
     # synthetic history carries no cached rows.
     assert grid == [
         ["tdigest_healpix_o9_sharded", "tdigest_healpix_o9_inner", None],
-        ["tdigest_healpix_o10_sharded", "tdigest_healpix_o10_inner", None],
-        ["tdigest_healpix_o11_sharded", "tdigest_healpix_o11_inner", None],
+        ["tdigest_healpix_o10_sidecar", "tdigest_healpix_o10_inline", None],
+        ["tdigest_healpix_o9_sidecar", "tdigest_healpix_o9_inline", None],
     ]
     # With cached rows present (issue #170), each lands in its own column and
     # the real inner target keeps its slot -- the cached companion shares
@@ -1434,18 +1438,19 @@ def test_codec_layout_is_fixed_2x3_sharded_inner_by_order():
     assert grid == [
         ["tdigest_healpix_o9_sharded", "tdigest_healpix_o9_inner", "tdigest_healpix_o9_cached"],
         [
-            "tdigest_healpix_o10_sharded",
-            "tdigest_healpix_o10_inner",
+            "tdigest_healpix_o10_sidecar",
+            "tdigest_healpix_o10_inline",
             "tdigest_healpix_o10_cached",
         ],
         [
-            "tdigest_healpix_o11_sharded",
-            "tdigest_healpix_o11_inner",
+            "tdigest_healpix_o9_sidecar",
+            "tdigest_healpix_o9_inline",
             "tdigest_healpix_o11_cached",
         ],
     ]
 
 
+@pytest.mark.skip(reason="issue #193 phase 2: codec 2x3 rendering retired; replaced by the inline/sidecar matrix layout tests")
 def test_codec_layout_blanks_missing_order():
     # A history missing an order (here o9) renders that row as two blank cells;
     # the grid is still a fixed 2x3 so the matrix shape is stable.
@@ -1455,7 +1460,7 @@ def test_codec_layout_blanks_missing_order():
     grid, nrows, ncols = plot_series._codec_layout(update_series.records_to_frame(rows))
     assert (nrows, ncols) == (3, 3)  # cached col, issue #170
     assert grid[0] == [None, None, None]  # o9 row blank (incl. cached col, issue #170)
-    assert grid[1] == ["tdigest_healpix_o10_sharded", "tdigest_healpix_o10_inner", None]
+    assert grid[1] == ["tdigest_healpix_o10_sidecar", "tdigest_healpix_o10_inline", None]
 
 
 def test_codec_and_frozen_histories_split_on_codec():
