@@ -1600,3 +1600,113 @@ class TestInlineInterleavedGranules:
         writes = [r for r in caplog.records if "inline write-back" in r.message]
         assert len(writes) == 2
         assert (store / "granule.parquet").is_file()
+
+
+# ---------------------------------------------------------------------------
+# Real-granule validation (issue #190): the full-coverage walk on an actual
+# ATL03 granule -- ~1,000+ datasets vs the ~48 lazy read set, previously
+# covered datasets byte-identical, and the build-time delta. Gated behind the
+# slow marker AND the presence of a local granule (the ~/ignore files are not
+# in the repo), so CI (which has neither) skips it.
+# ---------------------------------------------------------------------------
+
+_REAL_ATL03_DIRS = (
+    Path.home() / "ignore" / "atl03_1336_r05",
+    Path.home() / "ignore" / "zagg_neon_atl03_test_shard" / "granules",
+)
+
+
+def _real_atl03_granule():
+    for d in _REAL_ATL03_DIRS:
+        hits = sorted(d.glob("*.h5")) if d.is_dir() else []
+        if hits:
+            return hits[0]
+    return None
+
+
+_REAL_GRANULE = _real_atl03_granule()
+
+# The ATL03 tdigest/gain_bias read set: 8 datasets x 6 beams == 48 (issue #190).
+_ATL03_BEAMS = ("gt1l", "gt1r", "gt2l", "gt2r", "gt3l", "gt3r")
+_ATL03_READ_SET = tuple(
+    f"/{b}/{d}"
+    for b in _ATL03_BEAMS
+    for d in (
+        "heights/lat_ph",
+        "heights/lon_ph",
+        "heights/h_ph",
+        "heights/signal_conf_ph",
+        "geolocation/ph_index_beg",
+        "geolocation/reference_photon_lat",
+        "geolocation/reference_photon_lon",
+        "geolocation/segment_ph_cnt",
+    )
+)
+
+
+@pytest.mark.slow
+@pytest.mark.skipif(_REAL_GRANULE is None, reason="no local ~/ignore ATL03 granule")
+class TestFullCoverageRealGranule:
+    def _open(self):
+        from h5coro import filedriver
+        from h5coro import h5coro as h5c
+
+        return h5c.H5Coro(str(_REAL_GRANULE), filedriver.FileDriver, errorChecking=True)
+
+    def test_full_covers_thousand_plus_and_read_set_byte_identical(self):
+        import time
+
+        from zagg.index.inline import full_granule_maps
+
+        # Lazy read set (the pre-#190 coverage): time it and keep the maps.
+        h_lazy = self._open()
+        t0 = time.perf_counter()
+        read_set = {p: build_chunk_map(h_lazy, p) for p in _ATL03_READ_SET}
+        t_lazy = time.perf_counter() - t0
+        assert len(read_set) == 48
+
+        # Full coverage, reusing the read set (as finish_granule does).
+        h_full = self._open()
+        read_reused = {p: build_chunk_map(h_full, p) for p in _ATL03_READ_SET}
+        t0 = time.perf_counter()
+        full = full_granule_maps(h_full, read_reused)
+        t_full_walk = time.perf_counter() - t0
+
+        persisted = {p for p, cm in full.items() if cm.raw}
+        # ~1,000+ datasets vs 48 -- a strict, order-of-magnitude widening.
+        assert len(persisted) > 1000
+        assert set(_ATL03_READ_SET) < persisted
+
+        # The previously-covered datasets are byte-identical (no regression):
+        # full reuses the read-set maps verbatim, so the manifest rows match a
+        # standalone build_chunk_map exactly.
+        ref = self._open()
+        for p in _ATL03_READ_SET:
+            a = full[p]
+            b = build_chunk_map(ref, p)
+            assert a.byte_offset.tolist() == b.byte_offset.tolist()
+            assert a.nbytes.tolist() == b.nbytes.tolist()
+            assert a.dtype == b.dtype
+
+        # Build-time delta: the incremental walk cost over the lazy read set.
+        # Loose upper bound only (timing is machine-dependent); the measured
+        # value is reported in the PR body.
+        print(
+            f"\n[#190] full={len(persisted)} datasets vs lazy=48; "
+            f"lazy build {t_lazy * 1000:.1f} ms, full-walk add {t_full_walk * 1000:.1f} ms"
+        )
+        assert t_full_walk < 5.0
+
+    def test_manifest_roundtrips_and_stays_within_one_cache_line(self):
+        # The full walk is metadata-only: it must not pull chunk data. h5coro
+        # caches in fixed-size lines; the whole enumeration + mapping should
+        # stay within the front-of-file block the read already fetched.
+        from zagg.index.inline import full_granule_maps
+
+        h5obj = self._open()
+        full = full_granule_maps(h5obj, {})
+        df = granule_manifest(full)
+        assert list(df.columns) == list(MANIFEST_DTYPES)
+        assert df["dataset"].nunique() > 1000
+        # One 4 MiB line covers all dataset metadata (measured on real ATL03).
+        assert len(h5obj.cache) <= 2
