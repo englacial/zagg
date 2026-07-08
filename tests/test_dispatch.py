@@ -113,7 +113,7 @@ class TestLambdaExecutor:
 
     def test_measure_cost_matches_arm64_pricing(self):
         ex = self._make()
-        # 3 s of Lambda compute at 2 GB.
+        # 3 s of Lambda compute at LAMBDA_MEMORY_GB (4 GB, issue #193).
         cost = ex.measure_cost({"lambda_duration": 3.0})
         assert cost.compute_time_s == 3.0
         assert cost.gb_seconds == pytest.approx(3.0 * LAMBDA_MEMORY_GB)
@@ -158,7 +158,7 @@ class TestDispatchLoop:
         assert report.total_obs == 60
         assert report.cells_error == 0
         assert len(report.results) == 3
-        # Cost is folded in by the loop: 3 cells x 1 s x 2 GB.
+        # Cost is folded in by the loop: 3 cells x 1 s x LAMBDA_MEMORY_GB (4 GB).
         assert report.cost.compute_time_s == pytest.approx(3.0)
         assert report.cost.gb_seconds == pytest.approx(3.0 * LAMBDA_MEMORY_GB)
         ex.shutdown()
