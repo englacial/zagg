@@ -25,8 +25,13 @@ maps are persisted as a granule-keyed parquet manifest
 (``<store>/<granule_id>.parquet``, the PR #159 offsets schema plus the
 per-dataset decode metadata) after its last group is read. That is how the
 sidecar store gets populated before a ``sidecar`` backend can serve it (the
-issue's deployment progression); coverage is lazy — the datasets this run's
-planned reads actually touched.
+issue's deployment progression). Coverage defaults to **full** (issue #190):
+the manifest carries chunk maps for *every* decodable dataset in the granule,
+enumerated from the same front-of-file metadata the read already cached (no
+extra chunk GETs), so one build serves any downstream config — the #163 store
+design intent. ``write_back_coverage: lazy`` restores the old behavior
+(persist only the datasets this run's planned reads touched) for a private
+run that wants the smaller manifest.
 
 Known h5coro quirk this backend must sidestep: a hyperslice starting exactly
 on an interior chunk boundary (``k * chunk_len``, ``k > 0``) trips h5coro's
@@ -190,12 +195,26 @@ def build_chunk_map(h5obj, path: str) -> ChunkMap:
     never raises on its own — it just leaves default metadata) and
     ``ValueError`` for layouts without file-offset storage (compact).
     """
-    from h5coro.h5dataset import INVALID_VALUE, H5Dataset
-    from h5coro.h5metadata import H5Metadata
+    from h5coro.h5dataset import H5Dataset
 
     ds = H5Dataset(h5obj, path, earlyExit=True, metaOnly=True, enableAttributes=False)
     if ds.meta.typeSize == 0:
         raise KeyError(path)
+    return _chunk_map_from_dataset(h5obj, ds, path)
+
+
+def _chunk_map_from_dataset(h5obj, ds, path: str) -> ChunkMap:
+    """Assemble a :class:`ChunkMap` from an already-parsed ``H5Dataset``.
+
+    The metadata-only body of :func:`build_chunk_map`, factored out so the
+    full-coverage walk (:func:`_iter_datasets`, issue #190) can map each
+    dataset from the single ``H5Dataset`` it already parsed to classify it —
+    avoiding a second object-header parse per dataset. ``ds`` must be a
+    non-group (``typeSize != 0``) metadata-only dataset.
+    """
+    from h5coro.h5dataset import INVALID_VALUE, H5Dataset
+    from h5coro.h5metadata import H5Metadata
+
     dims = tuple(int(x) for x in ds.meta.dimensions or ())
     try:
         dtype = np.dtype(
@@ -263,6 +282,65 @@ def build_chunk_map(h5obj, path: str) -> ChunkMap:
         )
     # COMPACT data lives inside the object header, not at a file offset.
     raise ValueError(f"{path}: unsupported storage layout {ds.meta.layout!r} for chunk indexing")
+
+
+def _iter_datasets(h5obj):
+    """Yield ``(path, H5Dataset)`` for every dataset in the granule.
+
+    Descends the group tree with h5coro (``metaOnly``, attributes off), so the
+    whole enumeration is served from the front-of-file metadata block h5coro
+    already cached — one ranged GET, no chunk data (issue #190; the full walk
+    stays inside the single ~4 MiB cache line the config's read already paid
+    for, measured on real ATL03). A node whose ``typeSize == 0`` is a group
+    (or a typeless link) and is descended; anything else is a dataset yielded
+    with the ``H5Dataset`` its classification already parsed, so the caller
+    can build its chunk map without re-parsing the object header. Paths are
+    absolute (leading ``/``) and visited in sorted order for determinism.
+    """
+    from h5coro.h5dataset import H5Dataset
+
+    def descend(path: str):
+        H5Dataset(h5obj, path, earlyExit=False, metaOnly=True, enableAttributes=False)
+        prefix = "" if path == "/" else path.lstrip("/") + "/"
+        kids = set()
+        for pp in list(h5obj.pathAddresses.keys()):
+            if pp.startswith(prefix):
+                rel = pp[len(prefix) :]
+                if rel and "/" not in rel:  # a direct child of ``path``
+                    kids.add(prefix + rel)
+        for kid in sorted(kids):
+            kp = "/" + kid
+            ds = H5Dataset(h5obj, kp, earlyExit=False, metaOnly=True, enableAttributes=False)
+            if ds.meta.typeSize == 0:
+                yield from descend(kp)
+            else:
+                yield kp, ds
+
+    yield from descend("/")
+
+
+def full_granule_maps(h5obj, existing: dict[str, ChunkMap]) -> dict[str, ChunkMap]:
+    """Chunk maps for **every** decodable dataset in the granule (issue #190).
+
+    The write-back full-coverage payload: enumerate the whole group tree
+    (:func:`_iter_datasets`) and map each dataset, **reusing** any map already
+    in ``existing`` (the config's read set, built during the read) so those
+    stay byte-identical to the read path and aren't re-walked. Undecodable
+    dtypes (strings/compounds) are recorded with a blank ``dtype`` and skipped
+    at read by the sidecar consumer (``datasets_from_manifest``) — the
+    include-and-skip choice, matching that consumer. COMPACT-layout datasets
+    (data in the object header, no file offset) raise :class:`ValueError` and
+    are dropped: a ranged read could never serve them.
+    """
+    maps = dict(existing)
+    for path, ds in _iter_datasets(h5obj):
+        if path in maps:
+            continue
+        try:
+            maps[path] = _chunk_map_from_dataset(h5obj, ds, path)
+        except ValueError:
+            continue  # COMPACT (or other offset-less layout): not chunk-indexable
+    return maps
 
 
 def granule_manifest(maps: dict[str, ChunkMap]) -> pd.DataFrame:
@@ -341,11 +419,27 @@ class InlineIndex(VirtualIndex):
     """
 
     name = "inline"
-    config_keys = frozenset({"write_back", "store"})
+    config_keys = frozenset({"write_back", "store", "write_back_coverage"})
 
-    def __init__(self, write_back: bool = False, store: str | None = None):
+    #: Accepted ``write_back_coverage`` values (issue #190).
+    _COVERAGE = frozenset({"full", "lazy"})
+
+    def __init__(
+        self,
+        write_back: bool = False,
+        store: str | None = None,
+        write_back_coverage: str = "full",
+    ):
         self.write_back = bool(write_back)
         self.store = store
+        # Write-back coverage (issue #190): ``full`` (default, the #163 store
+        # design intent) persists chunk maps for EVERY decodable dataset in the
+        # granule — extracted from the metadata the read already cached, so any
+        # downstream config can be served from the manifest; ``lazy`` persists
+        # only the config's read set (the pre-#190 behavior), an escape hatch
+        # for a private run that wants the smaller manifest. Neither changes
+        # what the READ path fetches.
+        self.write_back_coverage = write_back_coverage
         # Chunk maps accumulated across each in-flight granule's groups,
         # keyed full resource URL -> {dataset path -> ChunkMap} (issue #180:
         # the worker may hold ``data_source.granule_workers`` granules in
@@ -373,6 +467,17 @@ class InlineIndex(VirtualIndex):
                 "index.store is only meaningful for backend 'inline' with "
                 "write_back: true (inline never reads the store)"
             )
+        coverage = index_cfg.get("write_back_coverage", "full")
+        if coverage not in cls._COVERAGE:
+            raise ValueError(
+                f"index.write_back_coverage must be one of {sorted(cls._COVERAGE)} "
+                f"(got {coverage!r})"
+            )
+        if "write_back_coverage" in index_cfg and not write_back:
+            raise ValueError(
+                "index.write_back_coverage is only meaningful for backend 'inline' "
+                "with write_back: true"
+            )
         # Both read routes accept this backend (issue #170 phase 2): sources
         # with read_plan.spatial_index take the planned route, read-plan-less
         # (flat) sources the full-read route -- same compiled addressing seam.
@@ -392,6 +497,7 @@ class InlineIndex(VirtualIndex):
         return cls(
             write_back=index_cfg.get("write_back", False),
             store=index_cfg.get("store"),
+            write_back_coverage=index_cfg.get("write_back_coverage", "full"),
         )
 
     def _pending_for(self, h5obj) -> dict[str, ChunkMap]:
@@ -460,6 +566,13 @@ class InlineIndex(VirtualIndex):
             maps = self._pending.pop(granule_url, {})
         if not self.write_back:
             return
+        if self.write_back_coverage == "full":
+            # Widen the persisted set to every decodable dataset in the granule
+            # (issue #190): the read already cached the metadata, so this is a
+            # metadata-only walk (no extra chunk GETs) that lets the manifest
+            # serve any downstream config, not just this run's read set. The
+            # read path is untouched — only what write-back PERSISTS grows.
+            maps = full_granule_maps(h5obj, maps)
         maps = {path: cm for path, cm in maps.items() if cm.raw}
         if not maps:
             return

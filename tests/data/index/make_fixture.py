@@ -18,6 +18,19 @@ shipped ``atl03.yaml`` config reads):
   ph_index_beg,segment_ph_cnt}`` — small, **contiguous** (exercises the
   pseudo-chunk path of ``build_chunk_map``).
 
+Datasets the shipped config never reads, present so the write-back
+full-coverage walk (issue #190) has something beyond the read set to cover:
+
+- ``/{beam}/heights/delta_time`` — chunked (a non-read chunked dataset),
+  ``/{beam}/geolocation/segment_id`` — contiguous (a non-read pseudo-chunk).
+- ``/ancillary_data/atlas_sdp_gps_epoch`` — a top-level (non-beam) group the
+  read never descends into.
+- ``/ancillary_data/data_start_utc`` — a fixed-length **string** dataset: an
+  undecodable dtype the full walk records (``dtype == ""``) and the sidecar
+  consumer skips at read (include-and-skip, issue #190).
+- ``/ancillary_data/control`` — a **compact-layout** dataset (data lives in
+  the object header, no file offset): the walk skips it at write.
+
 Geometry is deterministic: 20 segments of 128 photons each, except segment 8
 which is EMPTY (``cnt == 0`` and ``ph_index_beg == 0``, the real ATL03
 empty-segment marker — issue #116), for 2432 photons total → 10 chunks of
@@ -64,7 +77,24 @@ def beam_arrays(lat_offset: int):
         "geolocation/reference_photon_lon": 0.001 * ibeg + lat_offset,
         "geolocation/ph_index_beg": ibeg,
         "geolocation/segment_ph_cnt": counts,
+        # Not in the shipped read set (issue #190 full-coverage walk fodder):
+        # a chunked dataset and a contiguous one the config never touches.
+        "heights/delta_time": (0.0001 * i).astype(np.float64),
+        "geolocation/segment_id": np.arange(N_SEG, dtype=np.int32) + 1,
     }
+
+
+def _add_compact_dataset(f, name: str, arr: np.ndarray) -> None:
+    """Create a COMPACT-layout dataset (data in the object header, no file
+    offset) via h5py's low-level API — the write-back walk skips these."""
+    import h5py
+
+    space = h5py.h5s.create_simple(arr.shape)
+    dcpl = h5py.h5p.create(h5py.h5p.DATASET_CREATE)
+    dcpl.set_layout(h5py.h5d.COMPACT)
+    tid = h5py.h5t.py_create(arr.dtype)
+    dsid = h5py.h5d.create(f.id, name.encode(), tid, space, dcpl)
+    dsid.write(h5py.h5s.ALL, h5py.h5s.ALL, np.ascontiguousarray(arr))
 
 
 def main(out_path: str = "tests/data/index/atl03_mini.h5") -> None:
@@ -82,6 +112,17 @@ def main(out_path: str = "tests/data/index/atl03_mini.h5") -> None:
                     compression_opts=(4 if chunked else None),
                     shuffle=chunked,
                 )
+        # A top-level (non-beam) group the read never descends into, holding
+        # the edge dtypes/layouts the full-coverage walk must handle (#190):
+        # a plain contiguous array, an undecodable fixed-length string, and a
+        # compact-layout dataset.
+        f.create_dataset(
+            "ancillary_data/atlas_sdp_gps_epoch", data=np.array([1.198800018e9], dtype=np.float64)
+        )
+        f.create_dataset(
+            "ancillary_data/data_start_utc", data=np.array(["2018-12-25T02:42:52Z"], dtype="S20")
+        )
+        _add_compact_dataset(f, "ancillary_data/control", np.arange(4, dtype=np.int32))
 
 
 if __name__ == "__main__":

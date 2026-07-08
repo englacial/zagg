@@ -541,6 +541,22 @@ class TestChunkMap:
         with pytest.raises(KeyError, match="nope"):
             build_chunk_map(h5obj, "/gt1l/heights/nope")
 
+    def test_string_dataset_recorded_with_blank_dtype(self):
+        # Undecodable dtype (issue #190): the chunk map is still built (valid
+        # file offsets) but dtype is blank -- the sidecar consumer skips it at
+        # read while the manifest keeps it covered.
+        h5obj = _open_fixture()
+        cm = build_chunk_map(h5obj, "/ancillary_data/data_start_utc")
+        assert cm.dtype == ""
+        assert len(cm.raw) == 1  # contiguous string -> one pseudo-chunk
+
+    def test_compact_dataset_raises_valueerror(self):
+        # COMPACT layout stores data in the object header (no file offset), so
+        # it cannot be chunk-indexed -- the full-coverage walk drops it.
+        h5obj = _open_fixture()
+        with pytest.raises(ValueError, match="unsupported storage layout"):
+            build_chunk_map(h5obj, "/ancillary_data/control")
+
     def test_starts_on_boundary(self):
         h5obj = _open_fixture()
         cm = build_chunk_map(h5obj, "/gt1l/heights/h_ph")
@@ -1100,6 +1116,40 @@ class TestInlineWriteBackConfig:
         assert isinstance(backend, InlineIndex)
         assert backend.write_back is True
         assert backend.store == str(tmp_path)
+        assert backend.write_back_coverage == "full"  # #190 default
+
+    def test_coverage_defaults_full(self):
+        assert InlineIndex(write_back=True, store="s3://b/p/").write_back_coverage == "full"
+
+    def test_coverage_bad_value_rejected(self):
+        with pytest.raises(ValueError, match="write_back_coverage must be one of"):
+            validate_index_config(
+                {
+                    "backend": "inline",
+                    "write_back": True,
+                    "store": "s3://b/p/",
+                    "write_back_coverage": "partial",
+                }
+            )
+
+    def test_coverage_without_write_back_rejected(self):
+        with pytest.raises(ValueError, match="write_back_coverage is only meaningful"):
+            validate_index_config({"backend": "inline", "write_back_coverage": "full"})
+
+    def test_lazy_coverage_from_config(self, tmp_path):
+        backend = index_from_config(
+            PipelineConfig(
+                data_source=_fixture_data_source(
+                    index={
+                        "backend": "inline",
+                        "write_back": True,
+                        "store": str(tmp_path),
+                        "write_back_coverage": "lazy",
+                    }
+                )
+            )
+        )
+        assert backend.write_back_coverage == "lazy"
 
 
 class TestGranuleManifest:
@@ -1200,6 +1250,24 @@ class TestInlineWriteBackWorker:
             f"/{beam}/geolocation/{name}" for beam in beams for name in geoloc
         }
 
+    def _full_datasets(self, beams=("gt1l", "gt2l")):
+        # Full write-back coverage (issue #190): the read set PLUS every other
+        # decodable dataset in the fixture — the non-read chunked/contiguous
+        # arrays, a top-level ancillary group, and an undecodable string
+        # (recorded, skipped at read). The COMPACT ``control`` dataset has no
+        # file offset and is NOT in the manifest.
+        extra = {f"/{beam}/heights/delta_time" for beam in beams} | {
+            f"/{beam}/geolocation/segment_id" for beam in beams
+        }
+        return (
+            self._expected_datasets(beams)
+            | extra
+            | {
+                "/ancillary_data/atlas_sdp_gps_epoch",
+                "/ancillary_data/data_start_utc",
+            }
+        )
+
     def test_round_trip_to_local_store(self, tmp_path):
         store = tmp_path / "zagg-index" / "ATL03" / "007"  # created by open_object_store
         df_out, meta = self._run(
@@ -1210,7 +1278,19 @@ class TestInlineWriteBackWorker:
         assert manifest_path.is_file()
         df = pd.read_parquet(manifest_path, engine="fastparquet")
         assert list(df.columns) == list(MANIFEST_DTYPES)
-        assert set(df["dataset"]) == self._expected_datasets()
+        # Full coverage (issue #190): every decodable dataset, not just the
+        # config's read set — which is a strict subset now.
+        covered = set(df["dataset"])
+        assert covered == self._full_datasets()
+        assert self._expected_datasets() < covered  # strict superset of the read set
+        # Spot-check datasets the config never reads are present...
+        assert {"/gt1l/heights/delta_time", "/gt2l/geolocation/segment_id"} <= covered
+        assert "/ancillary_data/atlas_sdp_gps_epoch" in covered
+        # ...the undecodable string is recorded with a blank dtype (skipped at
+        # read by the sidecar consumer)...
+        assert set(df[df["dataset"] == "/ancillary_data/data_start_utc"]["dtype"]) == {""}
+        # ...and the COMPACT dataset (no file offset) is dropped.
+        assert "/ancillary_data/control" not in covered
         h5obj = _open_fixture()
         cm = build_chunk_map(h5obj, "/gt1l/heights/h_ph")
         got = df[df["dataset"] == "/gt1l/heights/h_ph"].sort_values("chunk_idx")
@@ -1250,15 +1330,20 @@ class TestInlineWriteBackWorker:
         )
         assert meta["error"] is None
         df = pd.read_parquet(store / "atl03_mini.parquet", engine="fastparquet")
-        assert set(df["dataset"]) == self._expected_datasets()
+        # gt2l's read returns None before the read seam, but full-coverage
+        # write-back enumerates the whole granule at finish_granule, so both
+        # beams (and the shared ancillary datasets) are covered regardless of
+        # which shard matched — concurrent shards write identical manifests.
+        assert set(df["dataset"]) == self._full_datasets()
 
     def test_manifest_byte_identical_to_direct_chunk_maps(self, tmp_path):
-        # Pins the sidecar-build product (issue #185): the persisted manifest
-        # is byte-identical to one assembled directly from build_chunk_map
-        # over the deterministic per-group coverage — the selection datasets
-        # included — so the default path's skip-the-walk heuristic cannot
-        # erode what write_back runs persist.
-        from zagg.index.inline import write_manifest
+        # Pins the sidecar-build product (issues #185/#190): the persisted
+        # manifest is byte-identical to one assembled directly — the read set
+        # from build_chunk_map (as the read path builds it) widened to full
+        # coverage by full_granule_maps — so neither the default path's
+        # skip-the-walk heuristic nor the full-coverage walk erode what
+        # write_back runs persist.
+        from zagg.index.inline import full_granule_maps, write_manifest
 
         store = tmp_path / "via-backend"
         df_out, meta = self._run(
@@ -1266,7 +1351,8 @@ class TestInlineWriteBackWorker:
         )
         assert meta["error"] is None
         h5obj = _open_fixture()
-        direct = {p: build_chunk_map(h5obj, p) for p in self._expected_datasets()}
+        read_set = {p: build_chunk_map(h5obj, p) for p in self._expected_datasets()}
+        direct = full_granule_maps(h5obj, read_set)
         write_manifest(granule_manifest(direct), str(tmp_path / "direct"), "atl03_mini")
         assert (store / "atl03_mini.parquet").read_bytes() == (
             tmp_path / "direct" / "atl03_mini.parquet"
@@ -1297,6 +1383,70 @@ class TestInlineWriteBackWorker:
         # A resource-less h5obj falls back to the full granule_url key (#180).
         backend.finish_granule(object(), "s3://b/g.h5")
         assert backend._pending == {}
+
+    def test_lazy_coverage_persists_only_read_set(self, tmp_path):
+        # The escape hatch (issue #190): write_back_coverage: lazy reproduces
+        # the pre-#190 behavior -- the manifest carries exactly the config's
+        # read set, none of the non-read datasets.
+        store = tmp_path / "lazy"
+        df_out, meta = self._run(
+            tmp_path,
+            {
+                "backend": "inline",
+                "write_back": True,
+                "store": str(store),
+                "write_back_coverage": "lazy",
+            },
+        )
+        assert meta["error"] is None
+        df = pd.read_parquet(store / "atl03_mini.parquet", engine="fastparquet")
+        assert set(df["dataset"]) == self._expected_datasets()
+        assert "/gt1l/heights/delta_time" not in set(df["dataset"])
+
+
+class TestFullCoverageWalk:
+    """Issue #190: write-back full-coverage enumeration + assembly."""
+
+    def test_iter_datasets_enumerates_whole_granule(self):
+        from zagg.index.inline import _iter_datasets
+
+        h5obj = _open_fixture()
+        paths = {p for p, _ in _iter_datasets(h5obj)}
+        # Every dataset in the fixture -- both beams, the ancillary group, the
+        # string and compact datasets (groups are descended, not yielded).
+        assert "/gt1l/heights/delta_time" in paths
+        assert "/gt2l/geolocation/segment_id" in paths
+        assert {"/ancillary_data/atlas_sdp_gps_epoch", "/ancillary_data/control"} <= paths
+        assert "/ancillary_data/data_start_utc" in paths
+        assert len(paths) == 23  # 16 read set + 7 extras (control incl.)
+
+    def test_iter_datasets_yields_usable_datasets(self):
+        # The H5Dataset yielded alongside each path builds a chunk map
+        # byte-identical to a fresh build_chunk_map (no second parse needed).
+        from zagg.index.inline import _chunk_map_from_dataset, _iter_datasets
+
+        h5obj = _open_fixture()
+        ref = _open_fixture()
+        for path, ds in _iter_datasets(h5obj):
+            if path == "/ancillary_data/control":
+                continue  # compact: raises in both routes
+            a = _chunk_map_from_dataset(h5obj, ds, path)
+            b = build_chunk_map(ref, path)
+            assert a.raw == b.raw and a.dtype == b.dtype and a.dims == b.dims
+
+    def test_full_granule_maps_reuses_and_widens(self):
+        from zagg.index.inline import full_granule_maps
+
+        h5obj = _open_fixture()
+        read = {"/gt1l/heights/h_ph": build_chunk_map(h5obj, "/gt1l/heights/h_ph")}
+        maps = full_granule_maps(h5obj, read)
+        # The prebuilt map is reused verbatim...
+        assert maps["/gt1l/heights/h_ph"] is read["/gt1l/heights/h_ph"]
+        # ...the walk widens to the non-read datasets...
+        assert "/gt1l/heights/delta_time" in maps
+        assert "/ancillary_data/data_start_utc" in maps  # string kept (blank dtype)
+        # ...and the COMPACT dataset is dropped (no file offset).
+        assert "/ancillary_data/control" not in maps
 
 
 class TestInlineInterleavedGranules:
