@@ -374,7 +374,13 @@ class TestReadParityWithoutConsolidation:
 
     def _build_store(self):
         """A two-shard located t-digest field, written like the worker's CSR
-        path (per-parent-morton subgroups), with no consolidated metadata."""
+        path (per-parent-morton subgroups), with no consolidated metadata.
+
+        The leaf ShardingCodec is deliberately omitted: ``consolidate_metadata``
+        is a pure metadata-tree op (it gathers each group/array ``zarr.json``),
+        orthogonal to the leaf codec, and the per-morton CSR subgroups are
+        exactly the objects that dominate the finalize cost this PR skips — so
+        the parity claim holds without the sharding codec in the fixture."""
         store = MemoryStore()
         # Two coverage chunks (parent mortons 100 and 205), distinct values so
         # read_raw_values is lossless (every centroid weight 1).
