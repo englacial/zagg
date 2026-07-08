@@ -4,18 +4,27 @@
 <style>body{font-family:sans-serif;max-width:1100px;margin:2rem auto;padding:0 1rem}img{max-width:100%;height:auto;border:1px solid #ddd}</style></head>
 <body>
 <h1>zagg Lambda benchmark</h1>
-<p>arm64 · 2 GB · one shard/target · densest cell over the NEON SERC AOP box. Each point is a merge to <code>main</code>.</p>
-<h2>Sharded vs inner-chunk — latest merge</h2>
-<img src="codec_table.png" alt="sharded vs inner benchmark table">
+<p>arm64 · 4 GB · one shard/target · densest cell over the NEON SERC AOP box. Each point is a merge to <code>main</code>.</p>
+<h2>inline vs sidecar (sharded, K=4) — latest merge</h2>
+<img src="matrix_table.png" alt="inline vs sidecar benchmark table">
 <p>Machine-readable: <a href="latest.md">latest.md</a> · <a href="metrics.json">metrics.json</a></p>
-<h2>cost_per_shard (sharded vs inner)</h2>
-<img src="cost_per_shard_codec.png" alt="cost_per_shard_codec">
-<h2>cost_per_100km2 (sharded vs inner)</h2>
-<img src="cost_per_100km2_codec.png" alt="cost_per_100km2_codec">
-<h2>Frozen historical — latest merge</h2>
-<img src="latest_table.png" alt="latest benchmark table">
-<h2>cost_per_shard (frozen)</h2>
-<img src="cost_per_shard.png" alt="cost_per_shard">
-<h2>cost_per_100km2 (frozen)</h2>
-<img src="cost_per_100km2.png" alt="cost_per_100km2">
+<h2>cost_per_shard (inline vs sidecar)</h2>
+<img src="cost_per_shard_matrix.png" alt="cost_per_shard_matrix">
+<h2>cost_per_100km2 (inline vs sidecar)</h2>
+<img src="cost_per_100km2_matrix.png" alt="cost_per_100km2_matrix">
+<hr>
+<h2>Archived (frozen as of issue #193)</h2>
+<p>The pre-#193 codec (sharded/inner) + historical series, retained but no longer updated.</p>
+<h3>Sharded vs inner-chunk (archived)</h3>
+<img src="codec_table.png" alt="archived codec table">
+<h3>Frozen historical (archived)</h3>
+<img src="latest_table.png" alt="archived historical table">
+<h3>cost_per_shard (sharded vs inner, archived)</h3>
+<img src="cost_per_shard_codec.png" alt="archived cost_per_shard_codec">
+<h3>cost_per_shard (frozen, archived)</h3>
+<img src="cost_per_shard.png" alt="archived cost_per_shard">
+<h3>cost_per_100km2 (sharded vs inner, archived)</h3>
+<img src="cost_per_100km2_codec.png" alt="archived cost_per_100km2_codec">
+<h3>cost_per_100km2 (frozen, archived)</h3>
+<img src="cost_per_100km2.png" alt="archived cost_per_100km2">
 </body></html>
