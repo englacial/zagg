@@ -1414,7 +1414,9 @@ def _cached_row(commit, order):
     )
 
 
-@pytest.mark.skip(reason="issue #193 phase 2: codec 2x3 rendering retired; replaced by the inline/sidecar matrix layout tests")
+@pytest.mark.skip(
+    reason="issue #193 phase 2: codec 2x3 rendering retired; replaced by the inline/sidecar matrix layout tests"
+)
 def test_codec_layout_is_fixed_2x3_sharded_inner_by_order():
     import plot_series
 
@@ -1450,7 +1452,9 @@ def test_codec_layout_is_fixed_2x3_sharded_inner_by_order():
     ]
 
 
-@pytest.mark.skip(reason="issue #193 phase 2: codec 2x3 rendering retired; replaced by the inline/sidecar matrix layout tests")
+@pytest.mark.skip(
+    reason="issue #193 phase 2: codec 2x3 rendering retired; replaced by the inline/sidecar matrix layout tests"
+)
 def test_codec_layout_blanks_missing_order():
     # A history missing an order (here o9) renders that row as two blank cells;
     # the grid is still a fixed 2x3 so the matrix shape is stable.
