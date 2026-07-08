@@ -97,6 +97,21 @@ def _frozen_history(df: pd.DataFrame) -> pd.DataFrame:
     return _merge_history(df[~_codec_mask(df)])
 
 
+def _matrix_mask(df: pd.DataFrame) -> pd.Series:
+    """Boolean mask of the live matrix rows (issue #193): those carrying a
+    non-null ``index_backend`` (inline|sidecar). Absent column (a pre-#193
+    parquet) -> all False, so the matrix figures stay empty until its first
+    merge lands."""
+    if "index_backend" not in df.columns:
+        return pd.Series(False, index=df.index)
+    return df["index_backend"].notna()
+
+
+def _matrix_history(df: pd.DataFrame) -> pd.DataFrame:
+    """Retained merge points of the live inline-vs-sidecar matrix (issue #193)."""
+    return _merge_history(df[_matrix_mask(df)])
+
+
 def _latest_of(hist: pd.DataFrame) -> pd.DataFrame:
     """Rows of the single most-recent run in an already-filtered/ordered history.
 
@@ -317,6 +332,26 @@ def _codec_layout(hist: pd.DataFrame) -> tuple[list[list[str | None]], int, int]
     return grid, len(CODEC_ROWS), len(CODEC_COLS)
 
 
+# Live matrix (issue #193): read-backend A/B x order. Retired the sharded/inner
+# codec axis; those figures are frozen (see main()).
+MATRIX_COLS = ["inline", "sidecar"]
+MATRIX_ROWS = ["o9", "o10"]
+
+
+def _matrix_layout(hist: pd.DataFrame) -> tuple[list[list[str | None]], int, int]:
+    """Place each live target in the fixed ``(order, index_backend)`` grid
+    (issue #193). Columns = ``MATRIX_COLS`` (inline, sidecar); rows =
+    ``MATRIX_ROWS`` (o9, o10). Empty cell -> ``None`` (order not landed yet)."""
+    by_slot: dict[tuple[str, str], str] = {}
+    meta = hist.dropna(subset=["target"]).drop_duplicates("target")
+    for _, r in meta.iterrows():
+        by_slot[(str(r.get("grid_size", "")), str(r.get("index_backend", "")))] = r["target"]
+    grid: list[list[str | None]] = [
+        [by_slot.get((order, backend)) for backend in MATRIX_COLS] for order in MATRIX_ROWS
+    ]
+    return grid, len(MATRIX_ROWS), len(MATRIX_COLS)
+
+
 def _draw_panel(ax, sub: pd.DataFrame, cost_col: str, cost_label: str, norm) -> None:
     """Draw one cost+runtime panel for a single target's merge history.
 
@@ -517,6 +552,34 @@ def make_figure(df: pd.DataFrame, cost_col: str, cost_label: str, out_png: Path)
     )
 
 
+def make_matrix_latest_table(df: pd.DataFrame, out_png: Path) -> bool:
+    """Render the live inline-vs-sidecar latest-merge table (issue #193): the
+    ``index_backend.notna`` rows of the most recent merge. False until the new
+    matrix lands its first merge."""
+    recs = _latest_of(_matrix_history(df)).to_dict(orient="records")
+    return _render_table(recs, _table_title("zagg inline vs sidecar (sharded, K=4)", recs), out_png)
+
+
+def make_matrix_figure(df: pd.DataFrame, cost_col: str, cost_label: str, out_png: Path) -> bool:
+    """Render the live inline-vs-sidecar figure (issue #193): the
+    ``index_backend.notna`` rows in the fixed ``MATRIX_ROWS x MATRIX_COLS`` grid.
+    Returns False when no matrix rows are retained yet."""
+    hist = _matrix_history(df)
+    if hist.empty or hist["target"].dropna().empty:
+        return False
+    layout, nrows, ncols = _matrix_layout(hist)
+    return _render_panel_grid(
+        hist,
+        layout,
+        nrows,
+        ncols,
+        cost_col,
+        cost_label,
+        f"zagg inline vs sidecar (sharded, K=4) \u2014 {cost_label} vs merge history",
+        out_png,
+    )
+
+
 def make_codec_figure(df: pd.DataFrame, cost_col: str, cost_label: str, out_png: Path) -> bool:
     """Render the forward sharded-vs-inner figure (issue #133): the ``codec.notna``
     rows in a fixed 2x3 grid (cols = sharded/inner, rows = o9->o11). Returns False
@@ -540,52 +603,64 @@ def make_codec_figure(df: pd.DataFrame, cost_col: str, cost_label: str, out_png:
 
 def write_index(
     outdir: Path,
-    rendered: list[str],
-    codec_rendered: list[str],
+    matrix_rendered: list[str],
     *,
-    codec_table_png: bool = False,
-    latest_png: bool = False,
+    matrix_table_png: bool = False,
     has_md: bool = False,
     has_json: bool = False,
 ) -> None:
-    """Emit a minimal Pages index embedding the rendered figures.
-
-    Order (issue #133): the forward sharded-vs-inner section on top -- its 2x3
-    codec table then its codec charts -- then the frozen historical section
-    (latest table + frozen charts) below, so the new matrix leads."""
+    """Emit a Pages index: the live inline-vs-sidecar matrix on top (issue
+    #193), then an ARCHIVED section embedding the retained (frozen) codec +
+    historical PNGs if they still exist in ``outdir`` (they persist on the
+    benchmarks branch; this PR stopped regenerating them)."""
     blocks: list[str] = []
-    # --- forward sharded-vs-inner section (on top) ---
     links = []
     if has_md:
         links.append('<a href="latest.md">latest.md</a>')
     if has_json:
         links.append('<a href="metrics.json">metrics.json</a>')
-    if codec_table_png:
+
+    # --- live matrix section (on top) ---
+    if matrix_table_png:
         block = (
-            "<h2>Sharded vs inner-chunk — latest merge</h2>\n"
-            '<img src="codec_table.png" alt="sharded vs inner benchmark table">'
+            "<h2>inline vs sidecar (sharded, K=4) \u2014 latest merge</h2>\n"
+            '<img src="matrix_table.png" alt="inline vs sidecar benchmark table">'
         )
         if links:
-            block += f"\n<p>Machine-readable: {' · '.join(links)}</p>"
+            block += f"\n<p>Machine-readable: {' \u00b7 '.join(links)}</p>"
         blocks.append(block)
     blocks += [
-        f'<h2>{name} (sharded vs inner)</h2>\n<img src="{name}_codec.png" alt="{name}_codec">'
-        for name in codec_rendered
+        f'<h2>{name} (inline vs sidecar)</h2>\n<img src="{name}_matrix.png" alt="{name}_matrix">'
+        for name in matrix_rendered
     ]
-    # --- frozen historical section (below) ---
-    if latest_png:
-        block = (
-            "<h2>Frozen historical — latest merge</h2>\n"
-            '<img src="latest_table.png" alt="latest benchmark table">'
+
+    # --- archived section (below): retained frozen PNGs, embedded if present ---
+    archived: list[str] = []
+    if (outdir / "codec_table.png").exists():
+        archived.append(
+            "<h3>Sharded vs inner-chunk (archived)</h3>\n"
+            '<img src="codec_table.png" alt="archived codec table">'
         )
-        # The companions are linked above with the forward table; if there is no
-        # forward table, link them here so they stay reachable.
-        if links and not codec_table_png:
-            block += f"\n<p>Machine-readable: {' · '.join(links)}</p>"
-        blocks.append(block)
-    blocks += [
-        f'<h2>{name} (frozen)</h2>\n<img src="{name}.png" alt="{name}">' for name in rendered
-    ]
+    if (outdir / "latest_table.png").exists():
+        archived.append(
+            "<h3>Frozen historical (archived)</h3>\n"
+            '<img src="latest_table.png" alt="archived historical table">'
+        )
+    for name in FIGURES:
+        for suffix, tag in (("_codec", "sharded vs inner"), ("", "frozen")):
+            if (outdir / f"{name}{suffix}.png").exists():
+                archived.append(
+                    f"<h3>{name} ({tag}, archived)</h3>\n"
+                    f'<img src="{name}{suffix}.png" alt="archived {name}{suffix}">'
+                )
+    if archived:
+        blocks.append(
+            "<hr>\n<h2>Archived (frozen as of issue #193)</h2>\n"
+            "<p>The pre-#193 codec (sharded/inner) + historical series, retained "
+            "but no longer updated.</p>"
+        )
+        blocks += archived
+
     if not blocks:
         blocks = [
             "<p>No retained benchmark runs yet. Charts appear after the first merge to main.</p>"
@@ -597,8 +672,8 @@ def write_index(
         "<style>body{font-family:sans-serif;max-width:1100px;margin:2rem auto;padding:0 1rem}"
         "img{max-width:100%;height:auto;border:1px solid #ddd}</style></head>\n"
         "<body>\n<h1>zagg Lambda benchmark</h1>\n"
-        "<p>arm64 · 2 GB · one shard/target · densest cell over the NEON SERC AOP box. "
-        "Each point is a merge to <code>main</code>.</p>\n"
+        "<p>arm64 \u00b7 4 GB \u00b7 one shard/target \u00b7 densest cell over the NEON SERC "
+        "AOP box. Each point is a merge to <code>main</code>.</p>\n"
         f"{imgs}\n</body></html>\n"
     )
     (outdir / "index.html").write_text(html)
@@ -614,44 +689,42 @@ def main(argv: list[str] | None = None) -> int:
     outdir.mkdir(parents=True, exist_ok=True)
     df = pd.read_parquet(args.series) if Path(args.series).exists() else pd.DataFrame()
 
-    # Forward sharded-vs-inner figures (issue #133), rendered above the frozen
-    # ones; the frozen figures keep their original file names + layout.
-    codec_rendered, rendered = [], []
+    # Live matrix (issue #193): inline-vs-sidecar, sharded, K=4. The retired
+    # codec (sharded/inner) + frozen historical figures are NO LONGER
+    # regenerated -- their PNGs are retained on the benchmarks branch as-is
+    # (archived), and only the matrix figures below update going forward.
+    matrix_rendered: list[str] = []
     for name, (col, label) in FIGURES.items():
-        if not df.empty and make_codec_figure(df, col, label, outdir / f"{name}_codec.png"):
-            codec_rendered.append(name)
-        if not df.empty and make_figure(df, col, label, outdir / f"{name}.png"):
-            rendered.append(name)
+        if not df.empty and make_matrix_figure(df, col, label, outdir / f"{name}_matrix.png"):
+            matrix_rendered.append(name)
 
-    # Latest-merge snapshots: the forward codec table (on top) + the frozen table,
-    # each embedded live in the docs, plus the human/agent-readable companions
-    # latest.md + metrics.json (issue #110, retained across both).
-    codec_table_png = not df.empty and make_codec_latest_table(df, outdir / "codec_table.png")
-    latest_png = not df.empty and make_latest_table(df, outdir / "latest_table.png")
-    has_md = not df.empty and write_latest_markdown(df, outdir / "latest.md")
-    has_json = not df.empty and write_latest_metrics(df, outdir / "metrics.json")
+    matrix_table_png = not df.empty and make_matrix_latest_table(df, outdir / "matrix_table.png")
+    # Machine-readable companions track the live matrix's latest merge.
+    matrix_df = df[_matrix_mask(df)] if not df.empty else df
+    has_md = not matrix_df.empty and write_latest_markdown(matrix_df, outdir / "latest.md")
+    has_json = not matrix_df.empty and write_latest_metrics(matrix_df, outdir / "metrics.json")
 
     write_index(
         outdir,
-        rendered,
-        codec_rendered,
-        codec_table_png=codec_table_png,
-        latest_png=latest_png,
+        matrix_rendered,
+        matrix_table_png=matrix_table_png,
         has_md=has_md,
         has_json=has_json,
     )
     extras = [
         n
         for n, ok in (
-            ("codec_table", codec_table_png),
-            ("table", latest_png),
+            ("matrix_table", matrix_table_png),
             ("latest.md", has_md),
             ("metrics.json", has_json),
         )
         if ok
     ]
-    nfig = len(rendered) + len(codec_rendered)
-    print(f"rendered {nfig} figure(s){' + ' + ', '.join(extras) if extras else ''} -> {outdir}")
+    print(
+        f"rendered {len(matrix_rendered)} matrix figure(s)"
+        f"{' + ' + ', '.join(extras) if extras else ''} -> {outdir} "
+        "(codec + frozen tiers archived, not regenerated)"
+    )
     return 0
 
 

@@ -903,34 +903,46 @@ def _write_json(tmp_path, obj):
 # --- plot_series (smoke; needs matplotlib) --------------------------------
 
 
+def _matrix_rows(commit, **kw):
+    """Live-matrix rows (issue #193): tdigest o9/o10 x inline/sidecar, carrying
+    index_backend so plot_series.main renders the matrix figures."""
+    rows = []
+    for order in ("o9", "o10"):
+        for backend in ("inline", "sidecar"):
+            r = _rec_row(commit, f"tdigest_healpix_{order}_{backend}", **kw)
+            r["grid_size"] = order
+            r["index_backend"] = backend
+            rows.append(r)
+    return rows
+
+
 def test_plot_series_smoke(tmp_path):
     pytest.importorskip("matplotlib")
     import plot_series
 
     rows = [
-        _rec_row(f"c{i}", t, cost=0.004 + i * 0.001, rt=180 + i * 10)
-        for i in range(3)
-        for t in ("t1", "t2")
+        r for i in range(3) for r in _matrix_rows(f"c{i}", cost=0.004 + i * 0.001, rt=180 + i * 10)
     ]
     series = tmp_path / "series.parquet"
     update_series.save_series(update_series.records_to_frame(rows), series)
     outdir = tmp_path / "site"
     plot_series.main(["--series", str(series), "--out", str(outdir)])
     assert (outdir / "index.html").exists()
-    assert (outdir / "cost_per_shard.png").exists()
-    assert (outdir / "cost_per_100km2.png").exists()
-    # Latest-merge snapshot artifacts (issue #110).
-    assert (outdir / "latest_table.png").exists()
+    # Live matrix figures (issue #193): *_matrix.png + matrix_table.png.
+    assert (outdir / "cost_per_shard_matrix.png").exists()
+    assert (outdir / "cost_per_100km2_matrix.png").exists()
+    assert (outdir / "matrix_table.png").exists()
     assert (outdir / "latest.md").exists()
     assert (outdir / "metrics.json").exists()
+    # The retired codec/frozen figures are NOT regenerated.
+    assert not (outdir / "codec_table.png").exists()
+    assert not (outdir / "cost_per_shard.png").exists()
 
 
 def _latest_rows(commit, ts, **kw):
-    rows = []
-    for t in ("t1", "t2"):
-        r = _rec_row(commit, t, **kw)
+    rows = _matrix_rows(commit, **kw)
+    for r in rows:
         r["timestamp"] = ts
-        rows.append(r)
     return rows
 
 
@@ -951,7 +963,7 @@ def test_plot_series_latest_artifacts_pick_newest_merge(tmp_path):
     assert "old111" not in md  # ...and only it
     metrics = json.loads((outdir / "metrics.json").read_text())
     assert {r["commit"] for r in metrics} == {"new999"}
-    assert {r["target"] for r in metrics} == {"t1", "t2"}
+    assert {r["index_backend"] for r in metrics} == {"inline", "sidecar"}
 
 
 def test_write_latest_metrics_is_null_safe_json(tmp_path):
@@ -987,7 +999,7 @@ def test_plot_series_empty_writes_placeholder(tmp_path):
     plot_series.main(["--series", str(tmp_path / "missing.parquet"), "--out", str(outdir)])
     # No data -> index exists with placeholder, no PNGs.
     assert (outdir / "index.html").exists()
-    assert not (outdir / "cost_per_shard.png").exists()
+    assert not (outdir / "cost_per_shard_matrix.png").exists()
 
 
 def test_update_series_main_retains_merge_only(tmp_path):
@@ -1414,9 +1426,6 @@ def _cached_row(commit, order):
     )
 
 
-@pytest.mark.skip(
-    reason="issue #193 phase 2: codec 2x3 rendering retired; replaced by the inline/sidecar matrix layout tests"
-)
 def test_codec_layout_is_fixed_2x3_sharded_inner_by_order():
     import plot_series
 
@@ -1427,8 +1436,8 @@ def test_codec_layout_is_fixed_2x3_sharded_inner_by_order():
     # synthetic history carries no cached rows.
     assert grid == [
         ["tdigest_healpix_o9_sharded", "tdigest_healpix_o9_inner", None],
-        ["tdigest_healpix_o10_sidecar", "tdigest_healpix_o10_inline", None],
-        ["tdigest_healpix_o9_sidecar", "tdigest_healpix_o9_inline", None],
+        ["tdigest_healpix_o10_sharded", "tdigest_healpix_o10_inner", None],
+        ["tdigest_healpix_o11_sharded", "tdigest_healpix_o11_inner", None],
     ]
     # With cached rows present (issue #170), each lands in its own column and
     # the real inner target keeps its slot -- the cached companion shares
@@ -1440,21 +1449,18 @@ def test_codec_layout_is_fixed_2x3_sharded_inner_by_order():
     assert grid == [
         ["tdigest_healpix_o9_sharded", "tdigest_healpix_o9_inner", "tdigest_healpix_o9_cached"],
         [
-            "tdigest_healpix_o10_sidecar",
-            "tdigest_healpix_o10_inline",
+            "tdigest_healpix_o10_sharded",
+            "tdigest_healpix_o10_inner",
             "tdigest_healpix_o10_cached",
         ],
         [
-            "tdigest_healpix_o9_sidecar",
-            "tdigest_healpix_o9_inline",
+            "tdigest_healpix_o11_sharded",
+            "tdigest_healpix_o11_inner",
             "tdigest_healpix_o11_cached",
         ],
     ]
 
 
-@pytest.mark.skip(
-    reason="issue #193 phase 2: codec 2x3 rendering retired; replaced by the inline/sidecar matrix layout tests"
-)
 def test_codec_layout_blanks_missing_order():
     # A history missing an order (here o9) renders that row as two blank cells;
     # the grid is still a fixed 2x3 so the matrix shape is stable.
@@ -1464,7 +1470,43 @@ def test_codec_layout_blanks_missing_order():
     grid, nrows, ncols = plot_series._codec_layout(update_series.records_to_frame(rows))
     assert (nrows, ncols) == (3, 3)  # cached col, issue #170
     assert grid[0] == [None, None, None]  # o9 row blank (incl. cached col, issue #170)
-    assert grid[1] == ["tdigest_healpix_o10_sidecar", "tdigest_healpix_o10_inline", None]
+    assert grid[1] == ["tdigest_healpix_o10_sharded", "tdigest_healpix_o10_inner", None]
+
+
+def test_matrix_layout_is_inline_sidecar_by_order():
+    # issue #193: the live matrix is a fixed (o9,o10) x (inline,sidecar) grid.
+    import plot_series
+
+    rows = _matrix_rows("c0")
+    grid, nrows, ncols = plot_series._matrix_layout(update_series.records_to_frame(rows))
+    assert (nrows, ncols) == (2, 2)  # rows o9/o10, cols inline/sidecar
+    assert grid == [
+        ["tdigest_healpix_o9_inline", "tdigest_healpix_o9_sidecar"],
+        ["tdigest_healpix_o10_inline", "tdigest_healpix_o10_sidecar"],
+    ]
+
+
+def test_matrix_layout_blanks_missing_order():
+    # An order with no rows leaves its cells None (grid shape stays fixed 2x2).
+    import plot_series
+
+    rows = [r for r in _matrix_rows("c0") if r["grid_size"] == "o10"]
+    grid, nrows, ncols = plot_series._matrix_layout(update_series.records_to_frame(rows))
+    assert (nrows, ncols) == (2, 2)
+    assert grid[0] == [None, None]  # o9 absent
+    assert grid[1] == ["tdigest_healpix_o10_inline", "tdigest_healpix_o10_sidecar"]
+
+
+def test_matrix_history_selects_index_backend_rows():
+    # Only index_backend rows are the live matrix; codec/frozen rows excluded.
+    import plot_series
+
+    df = update_series.records_to_frame(
+        _matrix_rows("c0") + _full_codec_matrix("c0") + [_rec_row("c0", "frozen_t")]
+    )
+    hist = plot_series._matrix_history(df)
+    assert set(hist["index_backend"]) == {"inline", "sidecar"}
+    assert all(t.endswith(("_inline", "_sidecar")) for t in hist["target"])
 
 
 def test_codec_and_frozen_histories_split_on_codec():
@@ -1544,25 +1586,29 @@ def test_make_codec_latest_table_renders_codec_rows(tmp_path):
     assert plot_series.make_codec_latest_table(frozen_only, tmp_path / "x.png") is False
 
 
-def test_plot_main_emits_codec_artifacts_above_frozen(tmp_path):
+def test_plot_main_emits_matrix_and_archives_old(tmp_path):
+    # issue #193: main() renders the live inline/sidecar matrix; any retained
+    # codec/frozen PNGs already in the outdir are embedded as an ARCHIVED
+    # section below (and are NOT regenerated).
     pytest.importorskip("matplotlib")
     import plot_series
 
-    rows = _full_codec_matrix("c0") + [
-        _rec_row("c0", "gain_bias_rect_3km", agg="gain_bias", grid="rectilinear")
-    ]
+    rows = _matrix_rows("c0")
     series = tmp_path / "series.parquet"
     update_series.save_series(update_series.records_to_frame(rows), series)
     outdir = tmp_path / "site"
+    outdir.mkdir()
+    # A pre-existing archived PNG (as it would sit on the benchmarks branch).
+    (outdir / "codec_table.png").write_bytes(b"\x89PNG\r\n\x1a\n")
     plot_series.main(["--series", str(series), "--out", str(outdir)])
-    # Forward codec figures + table land beside the frozen ones.
-    assert (outdir / "cost_per_shard_codec.png").exists()
-    assert (outdir / "codec_table.png").exists()
-    assert (outdir / "cost_per_shard.png").exists()  # the frozen rect row still renders
+    # Live matrix rendered; archived PNG left untouched, embedded below.
+    assert (outdir / "matrix_table.png").exists()
+    assert (outdir / "cost_per_shard_matrix.png").exists()
+    assert not (outdir / "codec_table.png").stat().st_size > 100  # not regenerated
     html = (outdir / "index.html").read_text()
-    # The forward (sharded-vs-inner) section is rendered ABOVE the frozen one.
-    assert "Sharded vs inner-chunk" in html and "Frozen historical" in html
-    assert html.index("Sharded vs inner-chunk") < html.index("Frozen historical")
+    assert "inline vs sidecar" in html
+    assert "Archived (frozen as of issue #193)" in html
+    assert html.index("inline vs sidecar") < html.index("Archived")
 
 
 def test_88s_nested_pin_invariant():
