@@ -25,6 +25,10 @@ aggregator).
 
 ## Conventions
 
+- **Live matrix (issue #193):** tdigest, sharded output, `granule_workers=4`, at
+  **4 GB** workers — the read-backend A/B (`inline` vs `sidecar`) over **o9 + o10**.
+  Four targets: `tdigest_healpix_{o9,o10}_{inline,sidecar}`. The retired
+  sharded/inner codec + `cached` axes are frozen (retained, not rerun).
 - **One shard per target** — the *densest* cell over the AOI, so cost/runtime
   deltas track code, not data drift.
 - **Densest = most granules; ties broken by lowest `shard_key`** — the
@@ -42,26 +46,37 @@ aggregator).
 
 ## Plot layout (`plot_series.py`)
 
-`plot_series.py` renders **two figure families**, split on the `codec` column
-(issue #133): the forward sharded-vs-inner matrix (`codec` non-null) on top, and
-the frozen historical series (`codec` null) below.
+`plot_series.py` renders the **live matrix** on top, and embeds the retained
+**archived** figures (frozen as of issue #193) below.
 
-### Forward matrix — fixed 2×3 (`*_codec.png` + `codec_table.png`)
+### Live matrix — inline vs sidecar, fixed 2×2 (`*_matrix.png` + `matrix_table.png`)
 
-The forward charts (`cost_per_shard_codec.png`, `cost_per_100km2_codec.png`) lay
-the codec rows out in a **fixed** grid keyed to the experiment, not the data:
+The live matrix (issue #193) is **tdigest, sharded, `granule_workers=4`, at 4 GB**
+— the read-backend A/B. The charts (`cost_per_shard_matrix.png`,
+`cost_per_100km2_matrix.png`) lay the rows out in a **fixed** grid keyed to the
+experiment, split on the `index_backend` column:
 
-- **Columns = the ShardingCodec A/B.** Left = `sharded`, right = `inner`.
-- **Rows = order, largest-first.** `o9` (top) → `o10` → `o11` (bottom). A row whose
-  order hasn't landed yet (e.g. `o9` before its shard map is built) renders blank,
-  so the matrix shape stays stable.
+- **Columns = the read backend.** Left = `inline`, right = `sidecar`.
+- **Rows = order, largest-first.** `o9` (top) → `o10` (bottom). A row whose order
+  hasn't landed renders blank, so the shape stays stable.
 
-`codec_table.png` is the latest-merge table for these rows.
+`matrix_table.png` is the latest-merge table for these rows; `latest.md` /
+`metrics.json` track this matrix.
 
-### Frozen historical — data-driven (`*.png` + `latest_table.png`)
+### Archived: forward codec matrix (frozen, `*_codec.png` + `codec_table.png`)
 
-The frozen charts (`cost_per_shard.png`, `cost_per_100km2.png`) keep the
-**data-driven** layout (issue #121 review) for the retired rect/gain_bias rows —
+**Retired as of issue #193** — the ShardingCodec sharded-vs-inner + read (`cached`)
+A/B. Its PNGs are **retained on the `benchmarks` branch** and embedded in the
+archived section of the index, but **no longer regenerated**. It was a fixed 2×3
+grid: columns `sharded` / `inner` / `cached`, rows `o9` → `o10` → `o11`. Split on
+the `codec` column (issue #133). The render functions (`make_codec_figure`,
+`_codec_layout`) remain in `plot_series.py` for on-demand regeneration.
+
+### Archived: frozen historical — data-driven (`*.png` + `latest_table.png`)
+
+**Also frozen as of issue #193** (retained, not regenerated). The charts
+(`cost_per_shard.png`, `cost_per_100km2.png`) keep the **data-driven** layout
+(issue #121 review) for the retired rect/gain_bias rows —
 nothing is keyed to a fixed target list:
 
 - **Columns = grid family.** The **left** column is the rectilinear (`rect_*`)
@@ -86,10 +101,11 @@ nothing is keyed to a fixed target list:
   cost axis back down to 0. A failed shard zeros both series at the same merge, so
   the one cost `x` flags the failure for both.
 
-When adding or rearranging targets, keep these conventions — the frozen layout is
-derived from `grid_type` / `aggregator` / `shard_area_km2`, and the forward layout
-from `grid_size` / `codec`, so getting that metadata right in `targets.json` is
-what places the panel.
+When adding or rearranging targets, keep these conventions — the **live matrix**
+layout is derived from `grid_size` / `index_backend`, and the archived layouts from
+`grid_size` / `codec` (forward) and `grid_type` / `aggregator` / `shard_area_km2`
+(frozen historical), so getting that metadata right in `targets.json` is what
+places the panel.
 
 ## Add a target
 
