@@ -26,15 +26,18 @@ leaf zarr** under a morton digit tree::
   debris — incomplete, ignorable, safe to overwrite on retry. This is NOT
   consolidated metadata: one small PUT on an object that must exist anyway.
 
-- **Coverage tier 0 (§4, issue #200)**: the stamp carries a ``coverage``
-  payload — the shard's morton box, the canonical <= 4-member cover of its
+- **Coverage (§4, issue #200)**: the stamp carries a ``coverage`` payload —
+  tier 0 is the shard's morton box, the canonical <= 4-member cover of its
   occupied cells (:func:`zagg.grids.morton.morton_box`), padded to exactly
   four decimal-string slots with JSON-null sentinels. Zero extra requests
   (it rides the stamp PUT) and debris semantics are inherited: a torn
-  worker's coverage never becomes visible. The budgeted tier-1 MOC, the
-  end-of-run root ``coverage.moc``, and the pyramid sweep (§7) are follow-on
-  phases; the manifest's ``pyramid`` block is declared-only in round one
-  (D11/D12).
+  worker's coverage never becomes visible. Exact cell-order occupancy is a
+  zstd-compressed bitmap SIDECAR inside the leaf (``coverage.moc`` — the O8
+  resolution; the one recorded exception to the vanilla-v3 leaf), written
+  before the stamp and pointed to from the envelope; attrs stay lean and the
+  extra GET is paid only by readers that pass the box test. The end-of-run
+  root ``coverage.moc`` and the pyramid sweep (§7) are follow-on phases; the
+  manifest's ``pyramid`` block is declared-only in round one (D11/D12).
 """
 
 from __future__ import annotations
@@ -58,6 +61,13 @@ COMMIT_ATTR = "morton_hive_commit"
 COVERAGE_SPEC = "morton-moc/1"
 #: Fixed slot count of the tier-0 morton box (2-4 members, null-padded).
 COVERAGE_BOX_SLOTS = 4
+#: In-leaf occupancy-bitmap sidecar object name (issue #200 phase 2, O8) —
+#: the one recorded exception to the "vanilla zarr v3 leaf" claim: a foreign
+#: key inside ``{full_id}.zarr/``, invisible to zarr readers.
+COVERAGE_SIDECAR = "coverage.moc"
+#: zstd level for the sidecar bitmap — fixed so identical occupancy produces
+#: byte-identical sidecars across workers and backends.
+_ZSTD_LEVEL = 3
 
 
 def shard_leaf_path(store_root: str, shard_key) -> str:
@@ -200,8 +210,8 @@ def read_manifest(store_root: str, **store_kwargs) -> dict | None:
     return _read_json(open_object_store(store_root, **store_kwargs), MANIFEST_NAME)
 
 
-def build_coverage(shard_key, occupied, cell_order: int) -> dict:
-    """Tier-0 coverage payload for one shard's commit stamp (§4, issue #200).
+def build_coverage(shard_key, occupied, cell_order: int, *, bitmap: bytes | None = None) -> dict:
+    """Coverage payload for one shard's commit stamp (§4, issue #200).
 
     ``occupied`` is the shard's occupied cell words (mixed order allowed —
     the cells ``cells_with_data`` counts); the box is their canonical
@@ -216,9 +226,15 @@ def build_coverage(shard_key, occupied, cell_order: int) -> dict:
     omitted at the leaf (review finding, PR #208): the payload rides the
     commit stamp, whose ``written_at`` is the one clock and one writer;
     root/ancestor carriers add their own timestamp fields under this same
-    spec (per-carrier-optional). Raises ``ValueError`` if the box escapes
-    the shard's subtree (occupied cells from another shard are an upstream
-    bug, never stamped).
+    spec (per-carrier-optional).
+
+    ``bitmap`` (phase 2, the O8 resolution) is the encoded sidecar payload
+    from :func:`encode_coverage_bitmap`; when given the envelope grows the
+    ``encoding``/``sidecar`` pointer plus compressed/raw byte sizes. A
+    box-only envelope (``None``, the phase-1 shape) omits those keys — a
+    reader treats their absence as "box only". Raises ``ValueError`` if the
+    box escapes the shard's subtree (occupied cells from another shard are
+    an upstream bug, never stamped).
     """
     from zagg.grids.morton import morton_box, morton_decimal
 
@@ -233,12 +249,150 @@ def build_coverage(shard_key, occupied, cell_order: int) -> dict:
             f"cells must be the shard's own (the shard id is always a valid "
             f"trivial cover, so this is an upstream cell-assignment bug)"
         )
-    return {
+    coverage = {
         "spec": COVERAGE_SPEC,
         "box": labels + [None] * (COVERAGE_BOX_SLOTS - len(labels)),
         "cell_order": int(cell_order),
         "source": "worker",
     }
+    if bitmap is not None:
+        n_bits = 4 ** (int(cell_order) - _decimal_order(shard))
+        coverage.update(
+            encoding="bitmap",
+            sidecar=COVERAGE_SIDECAR,
+            nbytes=len(bitmap),
+            raw_nbytes=-(-n_bits // 8),
+        )
+    return coverage
+
+
+def _decimal_order(decimal: str) -> int:
+    """HEALPix order of a D1 decimal id (one digit per level past the base)."""
+    return len(decimal) - (2 if decimal.startswith("-") else 1)
+
+
+def _cell_ranks(shard: str, cells, cell_order: int) -> np.ndarray:
+    """Bit index of each cell in the shard-subtree bitmap (frozen convention).
+
+    Bit ``i`` is the i-th cell of the shard subtree at ``cell_order`` in
+    ascending packed-word (Z-)order — equivalently the base-4 value of the
+    cell's D1 digit tail with digits ``1..4`` mapped to ``0..3``. Raises
+    ``ValueError`` for a cell outside the subtree or not at ``cell_order``
+    (the bitmap is exact-order by construction; there is nothing conservative
+    to fall back to).
+    """
+    from zagg.grids.morton import to_morton_array
+
+    depth = int(cell_order) - _decimal_order(shard)
+    ranks = np.empty(len(cells), dtype=np.int64)
+    for i, dec in enumerate(to_morton_array(cells).decimal_repr()):
+        tail = dec[len(shard) :]
+        if not dec.startswith(shard) or len(tail) != depth:
+            raise ValueError(
+                f"cell {dec} is not an order-{cell_order} cell of shard {shard}; "
+                f"the coverage bitmap encodes exact cell-order occupancy only"
+            )
+        rank = 0
+        for ch in tail:
+            rank = rank * 4 + (int(ch) - 1)
+        ranks[i] = rank
+    return ranks
+
+
+def encode_coverage_bitmap(shard_key, occupied, cell_order: int) -> bytes:
+    """zstd-compressed exact occupancy bitmap for one shard (issue #200 phase 2).
+
+    The O8-resolved leaf encoding: a bit field over the shard subtree at
+    ``cell_order`` — ``4^(cell_order - shard_order)`` bits, bit ``i`` per the
+    :func:`_cell_ranks` convention (ascending packed-word order; base-4 digit
+    tail), packed MSB-first within each byte (``np.packbits``), zstd-
+    compressed at a fixed level. Raw size is deterministic
+    (``ceil(4^depth / 8)`` bytes) regardless of fragmentation — the property
+    that beat coarsen-to-fit ranges in the #202 item (6) measurement; the
+    bit-order convention freezes with the mortie-side spec. zstd rides
+    numcodecs, already in the tree via zarr's codec stack — no new
+    dependency.
+    """
+    from numcodecs import Zstd
+
+    from zagg.grids.morton import morton_decimal
+
+    shard = morton_decimal(shard_key)
+    depth = int(cell_order) - _decimal_order(shard)
+    if depth <= 0:
+        raise ValueError(f"cell_order {cell_order} is not below shard {shard}'s order")
+    bits = np.zeros(4**depth, dtype=np.uint8)
+    bits[_cell_ranks(shard, occupied, cell_order)] = 1
+    return bytes(Zstd(level=_ZSTD_LEVEL).encode(np.packbits(bits).tobytes()))
+
+
+def decode_coverage_bitmap(payload: bytes, shard_key, cell_order: int) -> np.ndarray:
+    """Occupied cell words from a sidecar bitmap payload (issue #200 phase 2).
+
+    The inverse of :func:`encode_coverage_bitmap`: returns the sorted packed
+    ``uint64`` cell words at ``cell_order`` whose bits are set — exact
+    occupancy, no over-coverage.
+    """
+    from numcodecs import Zstd
+
+    from zagg.grids.morton import morton_decimal, morton_word
+
+    shard = morton_decimal(shard_key)
+    depth = int(cell_order) - _decimal_order(shard)
+    raw = np.frombuffer(bytes(Zstd().decode(payload)), dtype=np.uint8)
+    bits = np.unpackbits(raw, count=4**depth)
+    words = np.empty(int(bits.sum()), dtype=np.uint64)
+    for i, rank in enumerate(np.flatnonzero(bits)):
+        digits, rank = [], int(rank)
+        for _ in range(depth):
+            digits.append(str(rank % 4 + 1))
+            rank //= 4
+        words[i] = morton_word(shard + "".join(reversed(digits)))
+    return np.sort(words)
+
+
+def write_coverage_sidecar(leaf_root: str, payload: bytes, **store_kwargs) -> None:
+    """PUT the occupancy bitmap sidecar into a leaf (issue #200 phase 2).
+
+    One object at ``{leaf}/coverage.moc`` — the recorded exception to the
+    vanilla-v3 leaf, invisible to zarr readers. Written BEFORE the commit
+    stamp so the stamp stays the leaf's FINAL write (D4): in an unstamped
+    prefix the sidecar is debris like everything else, and the wholesale
+    retry re-template clears it.
+    """
+    import obstore
+
+    obstore.put(open_object_store(leaf_root, **store_kwargs), COVERAGE_SIDECAR, payload)
+
+
+def read_coverage_bitmap(leaf_root: str, **store_kwargs) -> np.ndarray | None:
+    """A leaf's exact occupied cell words from its sidecar, or ``None``.
+
+    Gates on the committed stamp's envelope (:func:`read_coverage`): no
+    stamp, a box-only phase-1 payload (no ``encoding``/``sidecar`` keys), an
+    unknown encoding, or a missing sidecar object all read ``None`` — the
+    box is then the only index and readers degrade per D9, never to wrong
+    answers. The shard id comes from the leaf's ``{full_id}.zarr`` basename;
+    ``cell_order`` from the envelope. One GET, paid only by readers that
+    want cell-level filtering.
+    """
+    import obstore
+    from obstore.exceptions import NotFoundError
+
+    from zagg.grids.morton import morton_word
+    from zagg.store import open_store
+
+    coverage = read_coverage(open_store(leaf_root, **store_kwargs))
+    if not coverage or coverage.get("encoding") != "bitmap" or not coverage.get("sidecar"):
+        return None
+    leaf_name = leaf_root.rstrip("/").rsplit("/", 1)[-1]
+    shard = morton_word(leaf_name.removesuffix(".zarr"))
+    store = open_object_store(leaf_root, **store_kwargs)
+    try:
+        data = obstore.get(store, str(coverage["sidecar"])).bytes()
+    except (FileNotFoundError, NotFoundError):
+        return None
+    return decode_coverage_bitmap(bytes(data), shard, int(coverage["cell_order"]))
 
 
 def stamp_commit(
@@ -396,18 +550,22 @@ def process_and_write_hive(
     # Stamp ONLY a fully-written leaf: an errored shard (or one that streamed
     # no chunks) stays unstamped — debris by definition (D4). The stamp is the
     # last write, so its presence certifies everything before it landed — the
-    # coverage payload rides it (zero extra requests) and inherits its debris
-    # semantics: a torn worker's coverage never becomes visible.
+    # box payload rides it (zero extra requests), the exact-occupancy bitmap
+    # sidecar is PUT just before it (issue #200 phase 2), and both inherit
+    # its debris semantics: a torn worker's coverage never becomes visible.
     if "store" in box and not metadata.get("error"):
+        words = np.concatenate(occupied) if occupied else None
+        if words is not None and words.size == 0:
+            words = None
+        bitmap = None
+        if words is not None:
+            bitmap = encode_coverage_bitmap(shard_key, words, grid.child_order)
+            write_coverage_sidecar(leaf_path, bitmap, **store_kwargs)
         stamp_commit(
             box["store"],
             cells_with_data=metadata.get("cells_with_data", 0),
             granule_count=metadata.get("granule_count", 0),
-            coverage=build_coverage(
-                shard_key,
-                np.concatenate(occupied) if occupied else None,
-                grid.child_order,
-            ),
+            coverage=build_coverage(shard_key, words, grid.child_order, bitmap=bitmap),
         )
     return metadata
 
@@ -431,18 +589,23 @@ def _utcnow() -> str:
 __all__ = [
     "COMMIT_ATTR",
     "COVERAGE_BOX_SLOTS",
+    "COVERAGE_SIDECAR",
     "COVERAGE_SPEC",
     "HIVE_SPEC",
     "MANIFEST_NAME",
     "build_coverage",
     "build_manifest",
     "check_node_invariant",
+    "decode_coverage_bitmap",
+    "encode_coverage_bitmap",
     "ensure_manifest",
     "leaf_block_index",
     "process_and_write_hive",
     "read_commit",
     "read_coverage",
+    "read_coverage_bitmap",
     "read_manifest",
     "shard_leaf_path",
     "stamp_commit",
+    "write_coverage_sidecar",
 ]

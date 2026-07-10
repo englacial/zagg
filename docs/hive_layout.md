@@ -27,11 +27,14 @@ round — wired to the **local backend only** (see [Status](#status)).
   naturally: every order is a legal node.
 - **Full id at the leaf** (D3): `.../-5/1/1/2/3/3/3/-5112333.zarr` is
   self-describing without parsing its directory chain — greppable in
-  inventories, unambiguous if moved. Each leaf is a completely vanilla zarr v3
+  inventories, unambiguous if moved. Each leaf is a vanilla zarr v3
   store: the same group/array template as the flat layout, sized to one shard
   (dense arrays hold `cells_per_shard` cells; `resolution: chunk` companions
   hold the shard's K inner chunks; CSR ragged subgroups sit under the same
-  group path, named by the shard label at K==1).
+  group path, named by the shard label at K==1). One recorded exception
+  ([issue #200](https://github.com/englacial/zagg/issues/200), O8): the
+  `coverage.moc` occupancy-bitmap sidecar inside the leaf — a single foreign
+  key, invisible to zarr readers.
 - **Node invariant** (D5): below the root, a node contains *only* digit
   children (`[1-4]/`) and `*.zarr` objects — zero zarr metadata above the
   leaf, no shared mutable state across workers. The root alone also carries
@@ -120,6 +123,18 @@ template creates anyway. A shard that errors, or streams no chunks (no data),
 leaves no stamp; a fully empty shard leaves no `.zarr/` prefix at all (the
 leaf is created lazily on the first chunk write).
 
+The stamp also carries the shard's **coverage envelope**
+([issue #200](https://github.com/englacial/zagg/issues/200), design §4): a
+`coverage` payload with the tier-0 **morton box** (the canonical ≤ 4-member
+cover of the occupied cells, four decimal-string slots, JSON-null padded) plus
+a pointer to the **exact occupancy bitmap** — a zstd-compressed bit field over
+the shard subtree at `cell_order`, stored as the in-leaf `coverage.moc`
+sidecar (the O8 resolution). Readers AOI-reject on the box from the stamp GET
+they already make; the one extra sidecar GET is paid only when cell-level
+filtering is wanted (`zagg.hive.read_coverage` /
+`zagg.hive.read_coverage_bitmap`). The sidecar is written before the stamp,
+so it shares the debris semantics: no stamp, no visible coverage.
+
 ## Reading a hive store
 
 There is no store-root `zarr.open()` (deliberately — D12; a root hierarchy can
@@ -133,8 +148,9 @@ be added later by the sweep as a derived artifact). Readers:
    `[1-4]/` children; a `*.zarr` entry is data at that node; no digit children
    ⇒ nothing finer. Never LIST per observation in a join loop (D10).
 
-The `coverage.moc` domain declaration (§4 of the design record) is a follow-on
-issue and will remove the walk from the discovery path too.
+The store-root `coverage.moc` domain declaration (§4 of the design record) is
+phase 3 of [issue #200](https://github.com/englacial/zagg/issues/200) and will
+remove the walk from the discovery path too.
 
 ## Status
 
@@ -146,7 +162,9 @@ issue and will remove the walk from the discovery path too.
   the event config's orders, emits its own leaf template, and stamps
   completion as its final PUT. The async status channel stays at the flat
   sibling prefix (`{store_root}.status/<run_id>/…`), outside the digit tree.
-- The store-level `coverage.moc` (and any per-shard MOC stamping) waits on
-  the design in [issue #200](https://github.com/englacial/zagg/issues/200).
+- **Per-shard coverage ships** ([issue #200](https://github.com/englacial/zagg/issues/200)
+  phases 1–2): the tier-0 morton box on the commit stamp and the exact
+  zstd-bitmap `coverage.moc` sidecar inside each leaf. The store-level root
+  `coverage.moc` (the one-GET bootstrap) is phase 3.
 - Write-throughput validation at fleet scale is tracked with the benchmark
   machinery in [issue #202](https://github.com/englacial/zagg/issues/202).
