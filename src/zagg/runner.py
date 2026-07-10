@@ -1132,94 +1132,6 @@ def _process_and_write(
     return metadata
 
 
-def _leaf_block_index(grid, block_index, shard_key) -> tuple:
-    """Leaf-LOCAL storage block for a chunk in a hive leaf (issue #199 phase 2).
-
-    The hive leaf's arrays are sized to one shard, so a chunk's block index is
-    its position WITHIN the shard, not the global block ``iter_chunks`` yields.
-    Derived from the existing ``shard_local_region`` seam (the sharded path's
-    within-shard placement): the region's start divided by the chunk extent.
-    At K==1 this is always ``(0,)``.
-    """
-    region = grid.shard_local_region(block_index, shard_key)
-    return tuple(int(s.start) // int(c) for s, c in zip(region, grid.chunk_shape))
-
-
-def _process_and_write_hive(
-    shard_key,
-    records,
-    grid,
-    s3_creds,
-    store_root,
-    config,
-    *,
-    store_kwargs,
-    driver=None,
-    handoff="arrow",
-    aoi_payload=None,
-):
-    """Process one shard into its own hive leaf store (issue #199 phase 2).
-
-    The hive counterpart of :func:`_process_and_write`: the shard's output is a
-    self-describing leaf zarr at ``shard_leaf_path(store_root, shard_key)``
-    (D3), with dense chunks written at leaf-LOCAL block indices and — as the
-    shard's FINAL write — the D4 commit stamp on the leaf's root group. The
-    leaf template is emitted lazily on the first chunk write (mirroring the
-    Lambda handler's lazy store open), so a no-data shard never creates the
-    ``.zarr/`` prefix; a worker that dies mid-shard leaves an UNSTAMPED prefix
-    — debris, overwritten wholesale on retry (``overwrite=True`` on the leaf
-    template makes the retry idempotent).
-    """
-    from zagg.hive import shard_leaf_path, stamp_commit
-
-    leaf_path = shard_leaf_path(store_root, shard_key)
-    box: dict = {}
-
-    def _leaf():
-        if "store" not in box:
-            store = open_store(leaf_path, **store_kwargs)
-            # overwrite=True: any existing prefix here is either debris from a
-            # torn run (D4) or a prior committed write being redone — both are
-            # replaced wholesale; per-leaf state never blocks a retry.
-            grid.emit_shard_template(store, overwrite=True)
-            box["store"] = store
-        return box["store"]
-
-    single_chunk = int(getattr(grid, "chunks_per_shard", 1)) == 1
-
-    def _write_chunk(block_index, carrier, ragged):
-        store = _leaf()
-        local = _leaf_block_index(grid, block_index, shard_key)
-        write_dataframe_to_zarr(carrier, store, grid=grid, chunk_idx=local)
-        # CSR subgroup naming inside a leaf mirrors the flat layout: the shard
-        # label at K==1; the LOCAL chunk ordinal at K>1 (leaf arrays are
-        # 1-D — hive is HEALPix-only, validated at config load).
-        ragged_key = shard_label(grid, shard_key) if single_chunk else int(local[0])
-        write_ragged_to_zarr(ragged, store, grid=grid, shard_key=ragged_key)
-
-    _df_out, metadata = process_shard(
-        grid,
-        int(shard_key),
-        _resolve_urls(records, driver),
-        s3_credentials=s3_creds,
-        config=config,
-        driver=driver,
-        handoff=handoff,
-        aoi_payload=aoi_payload,
-        write_chunk=_write_chunk,
-    )
-    # Stamp ONLY a fully-written leaf: an errored shard (or one that streamed
-    # no chunks) stays unstamped — debris by definition (D4). The stamp is the
-    # last write, so its presence certifies everything before it landed.
-    if "store" in box and not metadata.get("error"):
-        stamp_commit(
-            box["store"],
-            cells_with_data=metadata.get("cells_with_data", 0),
-            granule_count=metadata.get("granule_count", 0),
-        )
-    return metadata
-
-
 def _run_local(
     config,
     catalog_data,
@@ -1288,8 +1200,9 @@ def _run_local(
         # Hive layout (issue #199 phase 2): no shared zarr template — zero
         # metadata above the leaves (D5). Template time writes only the root
         # manifest (D6); each shard emits its own leaf template lazily inside
-        # _process_and_write_hive.
-        from zagg.hive import build_manifest, ensure_manifest
+        # hive.process_and_write_hive (the leaf write path lives in zagg.hive,
+        # next to the manifest/stamp machinery it exercises).
+        from zagg.hive import build_manifest, ensure_manifest, process_and_write_hive
 
         ensure_manifest(
             store_path,
@@ -1326,9 +1239,9 @@ def _run_local(
         cell_config = replace(config, data_source=ds) if ds is not None else config
         try:
             if store_layout == "hive":
-                meta = _process_and_write_hive(
+                meta = process_and_write_hive(
                     shard_key,
-                    records,
+                    _resolve_urls(records, driver),
                     grid,
                     s3_creds,
                     store_path,
@@ -1571,8 +1484,15 @@ def _run_lambda(
         shard_key, records = payload
         # Rendered once per cell: the status-object name (below) and the
         # payload-cap error message in _invoke_lambda_cell both carry it
-        # (issue #199). Raising here is correct — it becomes a path component.
-        label = shard_label(grid, shard_key)
+        # (issue #199). On ASYNC runs the label becomes a path component (the
+        # status key), so it must raise on a malformed key; on SYNC runs it is
+        # purely cosmetic and a raise out of _cell_work would be RUN-fatal
+        # (dispatch() re-raises), so fall back to the raw digits instead
+        # (review finding, PR #205).
+        if result_prefix is not None:
+            label = shard_label(grid, shard_key)
+        else:
+            label = _safe_label(grid, shard_key)
         # Only thread aoi_payload when the manifest carries a mask (flag on);
         # otherwise omit the kwarg so the event payload is byte-identical to the
         # pre-feature path (issue #101). Mirrors the local runner's _cell_work.

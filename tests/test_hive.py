@@ -171,19 +171,57 @@ class TestManifest:
         again = hive.build_manifest(grid)  # fresh generated_at
         assert hive.ensure_manifest(root, again)["spec"] == "morton-hive/1"
 
-    def test_mismatched_manifest_raises(self, cfg, tmp_path):
+    def test_rerun_ignores_sweep_mutated_pyramid(self, cfg, tmp_path):
+        # The pyramid block is populated/updated by the §7 sweep BY DESIGN
+        # (D11), so the resume match-check must not compare it — else the
+        # first sweep would brick every later resume (review finding, PR #205).
+        root = str(tmp_path / "store")
+        grid = self._grid(cfg)
+        swept = hive.build_manifest(grid)
+        swept["pyramid"] = {"orders": [4, 5], "aggregation": {"count": "sum"}}
+        hive.ensure_manifest(root, swept)
+        # A later run's fresh (declared-only) manifest still resumes, and the
+        # sweep's pyramid declaration is preserved, not clobbered.
+        resumed = hive.ensure_manifest(root, hive.build_manifest(grid))
+        assert resumed["pyramid"] == swept["pyramid"]
+
+    def test_mismatched_manifest_says_clear_the_root(self, cfg, tmp_path):
+        # overwrite=True replaces the manifest ONLY; the remedy must not
+        # suggest it for an orders change (review finding, PR #205).
         root = str(tmp_path / "store")
         hive.ensure_manifest(root, hive.build_manifest(self._grid(cfg)))
         other = HealpixGrid(parent_order=5, child_order=8, layout="fullsphere", config=cfg)
-        with pytest.raises(ValueError, match="does not match"):
+        with pytest.raises(ValueError, match="clear the store root"):
             hive.ensure_manifest(root, hive.build_manifest(other))
 
-    def test_overwrite_replaces(self, cfg, tmp_path):
+    def test_overwrite_replaces_when_tree_is_empty(self, cfg, tmp_path):
         root = str(tmp_path / "store")
         hive.ensure_manifest(root, hive.build_manifest(self._grid(cfg)))
         other = HealpixGrid(parent_order=5, child_order=8, layout="fullsphere", config=cfg)
         hive.ensure_manifest(root, hive.build_manifest(other), overwrite=True)
         assert hive.read_manifest(root)["shard_order"] == 5
+
+    def test_overwrite_with_changed_orders_refuses_over_existing_shards(self, cfg, tmp_path):
+        # Committed leaves from the old orders would survive a manifest-only
+        # "re-template" as walker-discoverable, stamped, seemingly-legal
+        # mixed-order data (D2) — refuse via one delimiter-LIST (review
+        # finding, PR #205).
+        root = tmp_path / "store"
+        hive.ensure_manifest(str(root), hive.build_manifest(self._grid(cfg)))
+        (root / "-5" / "1").mkdir(parents=True)  # a {sign+base} child exists
+        (root / "-5" / "1" / "obj").write_text("x")
+        other = HealpixGrid(parent_order=5, child_order=8, layout="fullsphere", config=cfg)
+        with pytest.raises(ValueError, match="clear the store root first"):
+            hive.ensure_manifest(str(root), hive.build_manifest(other), overwrite=True)
+
+    def test_overwrite_with_same_orders_allowed_over_existing_shards(self, cfg, tmp_path):
+        # Same frozen keys -> replacing the manifest is safe even with data.
+        root = tmp_path / "store"
+        grid = self._grid(cfg)
+        hive.ensure_manifest(str(root), hive.build_manifest(grid))
+        (root / "-5" / "1").mkdir(parents=True)
+        (root / "-5" / "1" / "obj").write_text("x")
+        hive.ensure_manifest(str(root), hive.build_manifest(grid), overwrite=True)
 
     def test_read_absent_returns_none(self, tmp_path):
         assert hive.read_manifest(str(tmp_path / "empty")) is None
@@ -249,7 +287,7 @@ def _rec(n):
 
 
 class TestProcessAndWriteHive:
-    """Drive ``_process_and_write_hive`` with a fake ``process_shard`` that
+    """Drive ``hive.process_and_write_hive`` with a fake ``process_shard`` that
     streams REAL carriers, so the leaf template, dense write, CSR naming, and
     stamp ordering are all exercised against real zarr stores."""
 
@@ -281,14 +319,14 @@ class TestProcessAndWriteHive:
         }
 
     def _run(self, monkeypatch, cfg, tmp_path, fake):
-        from zagg import runner
+        import zagg.processing as processing
 
-        monkeypatch.setattr(runner, "process_shard", fake)
+        monkeypatch.setattr(processing, "process_shard", fake)
         grid = self._grid(cfg)
         shard = _shard_word()
         root = str(tmp_path / "store")
-        meta = runner._process_and_write_hive(
-            shard, [_rec(1)], grid, {}, root, cfg, store_kwargs={}, driver="s3"
+        meta = hive.process_and_write_hive(
+            shard, ["s3://bucket/granule1.h5"], grid, {}, root, cfg, store_kwargs={}
         )
         return grid, shard, root, meta
 
@@ -339,8 +377,13 @@ class TestProcessAndWriteHive:
     def test_torn_write_leaves_debris_then_retry_succeeds(self, monkeypatch, cfg, tmp_path):
         # Torn-write simulation: the worker dies after the dense write, before
         # the stamp. The prefix exists (debris), read_commit says incomplete,
-        # and a clean retry overwrites it wholesale and stamps.
-        from zagg import runner
+        # and a clean retry overwrites it WHOLESALE and stamps. The torn
+        # attempt also writes a CSR subgroup the retry does NOT rewrite, so
+        # the wholesale claim is pinned against upstream drift: if the leaf
+        # re-template merely re-put metadata instead of delete_dir-ing the
+        # prefix, the stale subgroup would survive inside a leaf whose stamp
+        # certifies it complete (review finding, PR #205).
+        import zagg.processing as processing
         from zagg.store import open_store
 
         grid = self._grid(cfg)
@@ -350,23 +393,28 @@ class TestProcessAndWriteHive:
 
         def torn(g, shard_key, urls, **kwargs):
             carrier = self._carrier(grid, shard_key)
-            kwargs["write_chunk"](grid.block_index(int(shard_key)), carrier, {})
+            stale_ragged = {"h": ([np.array([1.0])], [0])}
+            kwargs["write_chunk"](grid.block_index(int(shard_key)), carrier, stale_ragged)
             raise RuntimeError("worker died mid-shard")
 
-        monkeypatch.setattr(runner, "process_shard", torn)
+        monkeypatch.setattr(processing, "process_shard", torn)
         with pytest.raises(RuntimeError, match="died mid-shard"):
-            runner._process_and_write_hive(
-                shard, [_rec(1)], grid, {}, root, cfg, store_kwargs={}, driver="s3"
+            hive.process_and_write_hive(
+                shard, ["s3://bucket/g1.h5"], grid, {}, root, cfg, store_kwargs={}
             )
         assert os.path.exists(leaf)  # the prefix exists...
         assert hive.read_commit(open_store(leaf)) is None  # ...but is debris
+        stale = os.path.join(leaf, grid.group_path, "h", morton_decimal(shard))
+        assert os.path.exists(stale)  # the torn attempt's CSR subgroup
 
-        # Retry: same leaf, overwritten wholesale, stamped at the end.
-        monkeypatch.setattr(runner, "process_shard", self._streaming_fake(grid))
-        runner._process_and_write_hive(
-            shard, [_rec(1)], grid, {}, root, cfg, store_kwargs={}, driver="s3"
+        # Retry (no ragged this time): same leaf, overwritten wholesale —
+        # the stale subgroup is GONE — and stamped at the end.
+        monkeypatch.setattr(processing, "process_shard", self._streaming_fake(grid))
+        hive.process_and_write_hive(
+            shard, ["s3://bucket/g1.h5"], grid, {}, root, cfg, store_kwargs={}
         )
         assert hive.read_commit(open_store(leaf))["complete"] is True
+        assert not os.path.exists(stale), "stale torn-write object survived the re-template"
 
     def test_errored_shard_is_not_stamped(self, monkeypatch, cfg, tmp_path):
         # A shard that wrote chunks but ended in error stays unstamped debris.
@@ -413,20 +461,16 @@ class TestProcessAndWriteHive:
 
 class TestLeafBlockIndex:
     def test_k1_maps_to_zero(self, cfg):
-        from zagg.runner import _leaf_block_index
-
         g = HealpixGrid(6, 8, layout="fullsphere", config=cfg)
         shard = _shard_word()
         (block,) = [b for b, _ in g.iter_chunks(shard)]
-        assert _leaf_block_index(g, block, shard) == (0,)
+        assert hive.leaf_block_index(g, block, shard) == (0,)
 
     def test_k_gt_1_enumerates_local_ordinals(self, cfg):
-        from zagg.runner import _leaf_block_index
-
         g = HealpixGrid(6, 10, layout="fullsphere", config=cfg, chunk_inner=8)
         assert g.chunks_per_shard == 16
         shard = _shard_word()
-        locals_ = [_leaf_block_index(g, b, shard) for b, _ in g.iter_chunks(shard)]
+        locals_ = [hive.leaf_block_index(g, b, shard) for b, _ in g.iter_chunks(shard)]
         assert locals_ == [(i,) for i in range(16)]
 
 
@@ -463,11 +507,11 @@ class TestRunnerWiring:
 
         monkeypatch.setattr(runner, "get_nsidc_s3_credentials", lambda: {"accessKeyId": "a"})
 
-        def fake_hive_write(shard_key, records, grid, s3_creds, store_root, config, **kw):
+        def fake_hive_write(shard_key, granule_urls, grid, s3_creds, store_root, config, **kw):
             calls.append((int(shard_key), store_root))
             return {"shard_key": int(shard_key), "error": None, "total_obs": 1}
 
-        monkeypatch.setattr(runner, "_process_and_write_hive", fake_hive_write)
+        monkeypatch.setattr(hive, "process_and_write_hive", fake_hive_write)
         agg(cfg, catalog=catalog_path, store=root, backend="local")
 
         assert calls == [(shard, root)]

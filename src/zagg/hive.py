@@ -85,8 +85,7 @@ def check_node_invariant(rel_path: str) -> None:
     ok = len(parts) >= 2 and leaf.endswith(".zarr")
     if ok:
         head, digits = parts[0], parts[1:-1]
-        base = head[1:] if head.startswith("-") else head
-        ok = len(base) == 1 and base in "123456"
+        ok = _is_base_component(head)
         ok = ok and all(len(d) == 1 and d in "1234" for d in digits)
         ok = ok and leaf[: -len(".zarr")] == head + "".join(digits)
     if not ok:
@@ -123,28 +122,66 @@ def ensure_manifest(store_root: str, manifest: dict, *, overwrite: bool = False,
 
     A retry into an existing hive store must be able to proceed (that is the
     D4 debris/retry model), so an existing manifest is accepted — but only if
-    it matches the run's own (``generated_at`` aside): a mismatch means the
-    store was templated for different orders/identity, the same guard the flat
-    path gets from ``_check_signature``. ``overwrite=True`` replaces it.
-    Returns the manifest now in effect.
+    its FROZEN keys match the run's own (:data:`_FROZEN_MANIFEST_KEYS`: orders
+    + identity + schedule — the flat path's ``_check_signature`` analogue).
+    ``generated_at`` and ``pyramid`` are excluded: the pyramid block is
+    populated/updated by the §7 sweep by design (D11), so comparing it would
+    brick every resume after the first sweep.
+
+    ``overwrite=True`` replaces the MANIFEST ONLY — it never clears data. To
+    guard against the silent-corruption footgun (committed leaves from the old
+    orders would survive a "re-template" and be indistinguishable from legal
+    mixed-order data, D2), an overwrite that CHANGES the frozen keys refuses
+    when the digit tree already has children (one delimiter-LIST); clear the
+    store root first. Returns the manifest now in effect.
     """
     import obstore
 
     store = open_object_store(store_root, **store_kwargs)
     existing = _read_json(store, MANIFEST_NAME)
+    frozen_matches = existing is not None and _frozen(existing) == _frozen(manifest)
     if existing is not None and not overwrite:
-        drop = ("generated_at",)
-        if {k: v for k, v in existing.items() if k not in drop} != {
-            k: v for k, v in manifest.items() if k not in drop
-        }:
+        if not frozen_matches:
             raise ValueError(
                 f"{MANIFEST_NAME} at {store_root} does not match this run "
-                f"(existing {existing!r} vs {manifest!r}); pass overwrite=True to "
-                f"re-template the store"
+                f"(existing {existing!r} vs {manifest!r}); this store was templated "
+                f"for different orders/identity — clear the store root (or pick a "
+                f"new one) before writing with this configuration"
             )
         return existing
+    if overwrite and existing is not None and not frozen_matches:
+        # One delimiter-LIST: a {sign+base}-shaped child means shards were
+        # already written under the OLD configuration. Their leaves are
+        # stamped and walker-discoverable, so replacing just the manifest
+        # would leave them masquerading as legal mixed-order data (D2).
+        listing = obstore.list_with_delimiter(store)
+        children = [p.rstrip("/").split("/")[-1] for p in listing["common_prefixes"]]
+        if any(_is_base_component(c) for c in children):
+            raise ValueError(
+                f"refusing to overwrite {MANIFEST_NAME} at {store_root} with "
+                f"different orders/identity: the digit tree already has shard "
+                f"data (e.g. {children[0]!r}/), and overwrite replaces the "
+                f"manifest only — clear the store root first"
+            )
     obstore.put(store, MANIFEST_NAME, json.dumps(manifest, indent=1).encode())
     return manifest
+
+
+#: Manifest keys the resume match-check compares (orders + identity + schedule).
+#: ``generated_at`` (a timestamp) and ``pyramid`` (populated by the §7 sweep,
+#: D11) are mutable by design and excluded.
+_FROZEN_MANIFEST_KEYS = ("spec", "dataset", "cell_order", "shard_order", "split_schedule")
+
+
+def _frozen(manifest: dict) -> dict:
+    """The frozen-key projection of a manifest (resume/overwrite match-check)."""
+    return {k: manifest.get(k) for k in _FROZEN_MANIFEST_KEYS}
+
+
+def _is_base_component(name: str) -> bool:
+    """Whether ``name`` is a ``{sign+base}``-shaped hive root child (D5)."""
+    base = name[1:] if name.startswith("-") else name
+    return len(base) == 1 and base in "123456"
 
 
 def read_manifest(store_root: str, **store_kwargs) -> dict | None:
@@ -186,6 +223,97 @@ def read_commit(leaf_store) -> dict | None:
     return dict(stamp) if isinstance(stamp, dict) else None
 
 
+def leaf_block_index(grid, block_index, shard_key) -> tuple:
+    """Leaf-LOCAL storage block for a chunk in a hive leaf (issue #199 phase 2).
+
+    The hive leaf's arrays are sized to one shard, so a chunk's block index is
+    its position WITHIN the shard, not the global block ``iter_chunks`` yields.
+    Derived from the existing ``shard_local_region`` seam (the sharded path's
+    within-shard placement): the region's start divided by the chunk extent.
+    At K==1 this is always ``(0,)``.
+    """
+    region = grid.shard_local_region(block_index, shard_key)
+    return tuple(int(s.start) // int(c) for s, c in zip(region, grid.chunk_shape))
+
+
+def process_and_write_hive(
+    shard_key,
+    granule_urls,
+    grid,
+    s3_creds,
+    store_root,
+    config,
+    *,
+    store_kwargs,
+    driver=None,
+    handoff="arrow",
+    aoi_payload=None,
+):
+    """Process one shard into its own hive leaf store (issue #199 phase 2).
+
+    The hive counterpart of the runner's ``_process_and_write``: the shard's
+    output is a self-describing leaf zarr at
+    :func:`shard_leaf_path` ``(store_root, shard_key)`` (D3), with dense chunks
+    written at leaf-LOCAL block indices and — as the shard's FINAL write — the
+    D4 commit stamp on the leaf's root group. The leaf template is emitted
+    lazily on the first chunk write (mirroring the Lambda handler's lazy store
+    open), so a no-data shard never creates the ``.zarr/`` prefix; a worker
+    that dies mid-shard leaves an UNSTAMPED prefix — debris, overwritten
+    wholesale on retry (``overwrite=True`` on the leaf template makes the
+    retry idempotent).
+    """
+    from zagg.grids.base import shard_label
+    from zagg.processing import process_shard, write_dataframe_to_zarr, write_ragged_to_zarr
+    from zagg.store import open_store
+
+    leaf_path = shard_leaf_path(store_root, shard_key)
+    box: dict = {}
+
+    def _leaf():
+        if "store" not in box:
+            store = open_store(leaf_path, **store_kwargs)
+            # overwrite=True: any existing prefix here is either debris from a
+            # torn run (D4) or a prior committed write being redone — both are
+            # replaced wholesale; per-leaf state never blocks a retry.
+            grid.emit_shard_template(store, overwrite=True)
+            box["store"] = store
+        return box["store"]
+
+    single_chunk = int(getattr(grid, "chunks_per_shard", 1)) == 1
+
+    def _write_chunk(block_index, carrier, ragged):
+        store = _leaf()
+        local = leaf_block_index(grid, block_index, shard_key)
+        write_dataframe_to_zarr(carrier, store, grid=grid, chunk_idx=local)
+        # CSR subgroup naming inside a leaf mirrors the flat layout: the shard
+        # label at K==1; the LOCAL chunk ordinal at K>1 (leaf arrays are
+        # 1-D — hive is HEALPix-only, validated at config load).
+        ragged_key = shard_label(grid, shard_key) if single_chunk else int(local[0])
+        write_ragged_to_zarr(ragged, store, grid=grid, shard_key=ragged_key)
+
+    _df_out, metadata = process_shard(
+        grid,
+        int(shard_key),
+        granule_urls,
+        s3_credentials=s3_creds,
+        config=config,
+        driver=driver,
+        handoff=handoff,
+        aoi_payload=aoi_payload,
+        write_chunk=_write_chunk,
+    )
+    # Stamp ONLY a fully-written leaf: an errored shard (or one that streamed
+    # no chunks) stays unstamped — debris by definition (D4). The stamp is the
+    # last write, so its presence certifies everything before it landed.
+    if "store" in box and not metadata.get("error"):
+        stamp_commit(
+            box["store"],
+            cells_with_data=metadata.get("cells_with_data", 0),
+            granule_count=metadata.get("granule_count", 0),
+        )
+    return metadata
+
+
 def _read_json(obj_store, key: str) -> dict | None:
     """GET+parse one small JSON object; ``None`` when it does not exist."""
     import obstore
@@ -209,6 +337,8 @@ __all__ = [
     "build_manifest",
     "check_node_invariant",
     "ensure_manifest",
+    "leaf_block_index",
+    "process_and_write_hive",
     "read_commit",
     "read_manifest",
     "shard_leaf_path",

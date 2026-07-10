@@ -980,7 +980,7 @@ class TestInvocationPassthrough:
     (issue #151); async threads the per-shard result channel into the cell
     invoke. Same mocked drive as ``TestMaxRetriesPassthrough``."""
 
-    def _drive(self, monkeypatch, atl06_config, catalog_file, **agg_kwargs):
+    def _drive(self, monkeypatch, atl06_config, catalog_file, *, grid_factory=None, **agg_kwargs):
         from unittest.mock import MagicMock
 
         import boto3
@@ -990,13 +990,14 @@ class TestInvocationPassthrough:
         from zagg.concurrency import ConcurrencyReport
 
         captured = {}
+        grid_factory = grid_factory or _stub_grid
 
         monkeypatch.setattr(
             runner,
             "get_nsidc_s3_credentials",
             lambda: {"accessKeyId": "a", "secretAccessKey": "s", "sessionToken": "t"},
         )
-        monkeypatch.setattr(grids_mod, "from_config", lambda *a, **k: _stub_grid())
+        monkeypatch.setattr(grids_mod, "from_config", lambda *a, **k: grid_factory())
         monkeypatch.setattr(runner, "_invoke_lambda_setup", lambda *a, **k: None)
         monkeypatch.setattr(runner, "_invoke_lambda_finalize", lambda *a, **k: None)
         monkeypatch.setattr(runner, "_get_function_timeout_s", lambda *a, **k: 720)
@@ -1021,6 +1022,7 @@ class TestInvocationPassthrough:
                 result_url=k.get("result_url"),
                 result_fetch=k.get("result_fetch"),
                 poll_timeout_s=k.get("poll_timeout_s"),
+                label=k.get("label"),
             )
             return {
                 "status_code": 200,
@@ -1060,6 +1062,37 @@ class TestInvocationPassthrough:
         assert captured["result_url"] is None
         assert captured["result_fetch"] is None
         assert captured["poll_timeout_s"] is None
+
+    @staticmethod
+    def _raising_label_grid():
+        g = _stub_grid()
+        g.shard_label.side_effect = ValueError("invalid word")
+        return g
+
+    def test_sync_malformed_key_label_falls_back(self, monkeypatch, atl06_config, catalog_file):
+        # Review finding (PR #205): on SYNC runs the label never becomes a
+        # path (no status key), so a malformed key must not raise out of
+        # _cell_work — an exception there is RUN-fatal on the Lambda path.
+        # It falls back to the raw digits instead.
+        captured = self._drive(
+            monkeypatch,
+            atl06_config,
+            catalog_file,
+            invocation="sync",
+            grid_factory=self._raising_label_grid,
+        )
+        assert captured["label"] in {str(w) for w in _CATALOG_WORDS}
+
+    def test_async_malformed_key_is_fail_loud(self, monkeypatch, atl06_config, catalog_file):
+        # On ASYNC runs the label names the status object — a path component —
+        # so the same malformed key fails loudly before dispatch.
+        with pytest.raises(ValueError, match="invalid word"):
+            self._drive(
+                monkeypatch,
+                atl06_config,
+                catalog_file,
+                grid_factory=self._raising_label_grid,
+            )
 
     def test_unknown_invocation_raises(self, atl06_config, catalog_file):
         with pytest.raises(ValueError, match="Unknown invocation"):
