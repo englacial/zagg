@@ -1,15 +1,18 @@
-"""Store-root ``coverage.moc`` — issue #200 phase 3.
+"""Store-root ``coverage.moc`` — issue #200 phases 3-4.
 
 The end-of-run shard-order ranges MOC (O1 serialization, default-on for hive,
 fail-open on both backends): the config flag, the envelope builder/parser, the
 GET-union-PUT writer, the local and Lambda dispatcher legs, and the worker's
-``mode: "coverage"`` handler. Split from ``tests/test_coverage.py`` at the
-phase-3 seam (review finding, PR #208 round 3); the leaf tiers (box, bitmap,
-stamp envelope) live there.
+``mode: "coverage"`` handler — plus the phase-4 reader primitives in
+``zagg.coverage`` (envelope load, per-tier AOI intersection, O7 lazy
+staleness, the explicit refresh walk). Split from ``tests/test_coverage.py``
+at the phase-3 seam (review finding, PR #208 round 3); the leaf tiers (box,
+bitmap, stamp envelope) live there.
 """
 
 import importlib.util
 import json
+import warnings
 from pathlib import Path
 from unittest.mock import MagicMock
 
@@ -404,3 +407,228 @@ class TestHandlerCoverageMode:
         )
         assert ok["statusCode"] == 200
         assert hive.read_root_coverage(str(root))["ranges"] == [[SHARD, SHARD]]
+
+
+# ── reader primitives (phase 4) ──────────────────────────────────────────────
+
+
+@pytest.fixture(autouse=True)
+def _fresh_staleness_dedup():
+    """The warn-once dedup is process-global by design; isolate tests."""
+    from zagg import coverage
+
+    coverage._stale_warned.clear()
+    yield
+    coverage._stale_warned.clear()
+
+
+class TestLoadCoverage:
+    def test_present_envelope_loads(self, tmp_path):
+        from zagg.coverage import load_coverage
+
+        root = str(tmp_path / "store")
+        hive.write_root_coverage(root, hive.build_root_coverage(_words(SHARD), 6))
+        env = load_coverage(root)
+        assert env["encoding"] == "ranges" and env["ranges"] == [[SHARD, SHARD]]
+
+    def test_missing_reads_none(self, tmp_path):
+        from zagg.coverage import load_coverage
+
+        assert load_coverage(str(tmp_path / "empty")) is None
+
+    def test_garbage_reads_none_never_raises(self, tmp_path):
+        from zagg.coverage import load_coverage
+
+        root = tmp_path / "store"
+        root.mkdir()
+        (root / hive.ROOT_COVERAGE_NAME).write_bytes(b"garbage {")
+        assert load_coverage(str(root)) is None
+
+    def test_unknown_spec_or_encoding_reads_none(self, tmp_path):
+        from zagg.coverage import load_coverage
+
+        root = tmp_path / "store"
+        root.mkdir()
+        env = hive.build_root_coverage(_words(SHARD), 6)
+        for mutation in ({"spec": "morton-moc/2"}, {"encoding": "bitmap"}):
+            (root / hive.ROOT_COVERAGE_NAME).write_text(json.dumps({**env, **mutation}))
+            assert load_coverage(str(root)) is None
+
+
+class TestIntersections:
+    def _leaf_cov(self, *decimals):
+        return hive.build_coverage(morton_word(SHARD), _words(*decimals), 8)
+
+    def test_root_coverage_and_hit_and_miss(self):
+        from zagg.coverage import root_coverage_and
+
+        env = hive.build_root_coverage(_words(SHARD, "-5112334"), 6)
+        # An AOI at CELL order inside a covered shard intersects (mixed-order
+        # containment via moc_and)...
+        hit = root_coverage_and(env, _words(SHARD + "12"))
+        assert hit.size > 0
+        # ...a disjoint sibling misses.
+        assert root_coverage_and(env, _words("-5112331")).size == 0
+
+    def test_root_coverage_and_boundary(self):
+        from zagg.coverage import root_coverage_and
+
+        env = hive.build_root_coverage(_words(SHARD), 6)
+        # The covered shard itself (range endpoint) intersects exactly.
+        np.testing.assert_array_equal(root_coverage_and(env, _words(SHARD)), _words(SHARD))
+
+    def test_box_and_hit_and_miss(self):
+        from zagg.coverage import box_and
+
+        cov = self._leaf_cov(SHARD + "12", SHARD + "43")
+        assert box_and(cov, _words(SHARD + "12")).size > 0
+        assert box_and(cov, _words(SHARD + "121")).size > 0  # deeper AOI cell
+        assert box_and(cov, _words(SHARD + "2")).size == 0  # outside both members
+
+    def test_box_and_skips_null_slots(self):
+        from zagg.coverage import box_and
+
+        cov = self._leaf_cov(SHARD + "12")  # 1 member + 3 nulls
+        assert box_and(cov, _words(SHARD + "12")).size > 0
+
+    def test_bitmap_and_exact_and_none_fallback(self, monkeypatch, tmp_path):
+        import zagg.processing as processing
+        from zagg.coverage import bitmap_and
+        from zagg.grids import HealpixGrid
+
+        cfg = default_config("atl06")
+        grid = HealpixGrid(parent_order=6, child_order=8, layout="fullsphere", config=cfg)
+        word = morton_word(SHARD)
+        occupied = _words(SHARD + "12", SHARD + "43")
+
+        def fake(g, shard_key, urls, **kwargs):
+            import pandas as pd
+
+            from zagg.config import get_data_vars
+
+            coords = grid.chunk_coords(shard_key)
+            df = pd.DataFrame(
+                {var: 0.0 for var in get_data_vars(cfg)}, index=range(len(coords["cell_ids"]))
+            )
+            for name, vals in coords.items():
+                df[name] = vals
+            kwargs["write_chunk"](grid.block_index(int(shard_key)), df, {})
+            kwargs["occupied_out"].append(occupied)
+            return pd.DataFrame(), {
+                "shard_key": int(shard_key),
+                "cells_with_data": 2,
+                "total_obs": 2,
+                "granule_count": 1,
+                "files_processed": 1,
+                "duration_s": 0.0,
+                "error": None,
+            }
+
+        monkeypatch.setattr(processing, "process_shard", fake)
+        root = str(tmp_path / "store")
+        hive.process_and_write_hive(word, ["s3://b/g.h5"], grid, {}, root, cfg, store_kwargs={})
+        leaf = hive.shard_leaf_path(root, word)
+        # Exact: an occupied cell intersects; an unoccupied one is a
+        # DEFINITIVE miss (the bitmap is exact, unlike the box).
+        assert bitmap_and(leaf, _words(SHARD + "12")).size > 0
+        assert bitmap_and(leaf, _words(SHARD + "21")).size == 0
+        # Box-only leaf (no sidecar): None -> caller falls back to the box.
+        empty_leaf = str(tmp_path / "nothing.zarr")
+        assert bitmap_and(empty_leaf, _words(SHARD + "12")) is None
+
+
+class TestWarnIfStale:
+    def test_warns_once_per_store_on_mismatch(self, tmp_path):
+        from zagg.coverage import warn_if_stale
+
+        env = hive.build_root_coverage(_words("-5112334"), 6)  # sibling only
+        root = str(tmp_path / "store")
+        with pytest.warns(UserWarning, match="refresh_root_coverage"):
+            assert warn_if_stale(root, morton_word(SHARD), env) is True
+        # Second mismatch on the SAME store: still stale, but silent.
+        with warnings.catch_warnings():
+            warnings.simplefilter("error")
+            assert warn_if_stale(root, morton_word(SHARD), env) is True
+        # A DIFFERENT store warns independently.
+        with pytest.warns(UserWarning):
+            assert warn_if_stale(str(tmp_path / "other"), morton_word(SHARD), env) is True
+
+    def test_listed_shard_is_not_stale(self, tmp_path):
+        from zagg.coverage import warn_if_stale
+
+        env = hive.build_root_coverage(_words(SHARD, "-5112334"), 6)
+        with warnings.catch_warnings():
+            warnings.simplefilter("error")
+            assert warn_if_stale(str(tmp_path), morton_word(SHARD), env) is False
+
+    def test_no_root_moc_is_absence_not_staleness(self, tmp_path):
+        from zagg.coverage import warn_if_stale
+
+        with warnings.catch_warnings():
+            warnings.simplefilter("error")
+            assert warn_if_stale(str(tmp_path), morton_word(SHARD), None) is False
+
+    def test_malformed_envelope_counts_as_stale(self, tmp_path):
+        from zagg.coverage import warn_if_stale
+
+        with pytest.warns(UserWarning):
+            assert warn_if_stale(str(tmp_path), morton_word(SHARD), {"order": 6}) is True
+
+
+class TestRefreshRootCoverage:
+    def _store_with_leaves(self, tmp_path, stamped, debris=()):
+        from zagg.grids import HealpixGrid
+        from zagg.store import open_store
+
+        cfg = default_config("atl06")
+        grid = HealpixGrid(parent_order=6, child_order=8, layout="fullsphere", config=cfg)
+        root = str(tmp_path / "store")
+        hive.ensure_manifest(root, hive.build_manifest(grid))
+        for dec in (*stamped, *debris):
+            leaf = hive.shard_leaf_path(root, morton_word(dec))
+            store = open_store(leaf)
+            grid.emit_shard_template(store, overwrite=True)
+            if dec in stamped:
+                hive.stamp_commit(store, cells_with_data=1, granule_count=1)
+        return root
+
+    def test_rebuilds_exactly_the_stamped_set(self, tmp_path):
+        from zagg.coverage import refresh_root_coverage
+
+        # Both hemispheres (two base dirs) + one unstamped debris leaf.
+        root = self._store_with_leaves(
+            tmp_path, stamped=(SHARD, "-5112334", "5112333"), debris=("-5112331",)
+        )
+        env = refresh_root_coverage(root)
+        assert env["source"] == "refresh"
+        assert env["order"] == 6
+        np.testing.assert_array_equal(
+            hive.root_coverage_words(env),
+            np.sort(_words(SHARD, "-5112334", "5112333")),
+        )
+        # The written object matches the returned envelope.
+        assert hive.read_root_coverage(root) == env
+
+    def test_replaces_stale_root_object(self, tmp_path):
+        from zagg.coverage import refresh_root_coverage
+
+        root = self._store_with_leaves(tmp_path, stamped=(SHARD,))
+        # A stale root claims a shard that has no stamped leaf.
+        hive.write_root_coverage(root, hive.build_root_coverage(_words("-5112334"), 6))
+        env = refresh_root_coverage(root)
+        # No union: the walk is ground truth and SUPERSEDES the stale cache.
+        np.testing.assert_array_equal(hive.root_coverage_words(env), _words(SHARD))
+
+    def test_no_stamped_leaves_removes_the_cache(self, tmp_path):
+        from zagg.coverage import refresh_root_coverage
+
+        root = self._store_with_leaves(tmp_path, stamped=(), debris=(SHARD,))
+        hive.write_root_coverage(root, hive.build_root_coverage(_words(SHARD), 6))
+        assert refresh_root_coverage(root) is None
+        assert hive.read_root_coverage(root) is None
+
+    def test_not_a_hive_root_raises(self, tmp_path):
+        from zagg.coverage import refresh_root_coverage
+
+        with pytest.raises(ValueError, match="not a hive store root"):
+            refresh_root_coverage(str(tmp_path / "nowhere"))
