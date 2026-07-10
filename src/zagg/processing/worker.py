@@ -35,6 +35,7 @@ from zagg.config import (
     get_data_vars,
     get_output_signature,
 )
+from zagg.grids.base import shard_label
 from zagg.index import index_from_config
 from zagg.processing.aggregate import (
     _aggregate_chunk_cells,
@@ -205,7 +206,11 @@ def process_shard(
     index_backend = index_from_config(config)
 
     shard_key = int(shard_key)
-    logger.info(f"Processing shard: {shard_key}")
+    # Log lines carry the external shard label (decimal morton string for
+    # HEALPix — issue #199); ``shard_key`` itself stays the packed int (the
+    # canonical wire/metadata form).
+    label = shard_label(grid, shard_key)
+    logger.info(f"Processing shard: {label}")
     start_time = datetime.now()
 
     # Resolve driver
@@ -234,7 +239,7 @@ def process_shard(
 
     # Check for granules
     if not granule_urls:
-        logger.info(f"  No granules provided for shard {shard_key} - skipping")
+        logger.info(f"  No granules provided for shard {label} - skipping")
         metadata["error"] = "No granules found"
         metadata["duration_s"] = (datetime.now() - start_time).total_seconds()
         return pd.DataFrame(), metadata
@@ -458,12 +463,12 @@ def process_shard(
         # message is "no data AND N raised", not "all groups raised".
         if read_errors:
             logger.warning(
-                f"  No data after filtering for shard {shard_key} and "
+                f"  No data after filtering for shard {label} and "
                 f"{read_errors} group read(s) raised - skipping"
             )
             metadata["error"] = f"No data after filtering ({read_errors} group reads raised)"
         else:
-            logger.info(f"  No data after filtering for shard {shard_key} - skipping")
+            logger.info(f"  No data after filtering for shard {label} - skipping")
             metadata["error"] = "No data after filtering"
         metadata["duration_s"] = (datetime.now() - start_time).total_seconds()
         if profile:
@@ -628,7 +633,7 @@ def process_shard(
         metadata["phase_timings"] = phase_timings
 
     duration = (datetime.now() - start_time).total_seconds()
-    logger.info(f"Completed shard {shard_key} in {duration:.1f}s")
+    logger.info(f"Completed shard {label} in {duration:.1f}s")
 
     metadata["cells_with_data"] = cells_with_data
     metadata["total_obs"] = n_obs_total

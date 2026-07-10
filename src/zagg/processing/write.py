@@ -496,7 +496,7 @@ def write_ragged_to_zarr(
     store: Store,
     *,
     grid,
-    shard_key: int,
+    shard_key: int | str,
 ) -> Store:
     """Write a shard's ``kind: ragged`` (CSR) fields to the Zarr store (issue #48).
 
@@ -514,9 +514,10 @@ def write_ragged_to_zarr(
 
     At **cell resolution** (default) ``cell_ids[k]`` is each populated cell's
     position in the chunk's ``children`` block (the index collected by
-    ``process_shard``); the per-shard subgroup name is the ``shard_key`` (the
-    coverage cell's morton id for HEALPix), recovered by the reader directly from
-    the store.
+    ``process_shard``); the per-shard subgroup name is the ``shard_key`` label
+    (the coverage cell's **decimal morton string** for HEALPix — issue #199, D1
+    in ``docs/design/sparse_coverage.md``), recovered by the reader directly
+    from the store.
 
     At **chunk resolution** (``resolution: chunk``, issue #82) a ragged field
     stores ONE variable-length payload per chunk, not per cell. The populated
@@ -540,9 +541,10 @@ def write_ragged_to_zarr(
     grid : OutputGrid
         Provides ``group_path`` for routing the write (and ``config`` for the
         per-field dtype + resolution).
-    shard_key : int
-        Shard identifier; the CSR subgroup name (one chunk per shard at cell
-        resolution).
+    shard_key : int or str
+        CSR subgroup name, used verbatim: the grid's shard label at cell
+        resolution (``grid.shard_label`` — decimal morton string for HEALPix,
+        issue #199), or the flattened block-index int at K>1.
 
     Returns
     -------
@@ -553,7 +555,7 @@ def write_ragged_to_zarr(
         return store
     agg_fields = get_agg_fields(grid.config) if getattr(grid, "config", None) else {}
     chunk_res_fields = _chunk_resolution_fields(getattr(grid, "config", None))
-    shard_key = int(shard_key)
+    shard_key = str(shard_key)
     for name, entry in ragged.items():
         # Located fields (issue #87) deliver (values_list, cell_ids, locations_list);
         # unlocated fields keep the 2-tuple.

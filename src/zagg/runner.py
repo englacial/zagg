@@ -53,6 +53,8 @@ from zagg.dispatch import (
     PreflightReport,
     dispatch,
 )
+from zagg.grids.base import shard_label
+from zagg.grids.morton import morton_word
 from zagg.processing import (
     process_shard,
     write_dataframe_to_zarr,
@@ -170,7 +172,8 @@ def agg(
         Lambda-only (issue #151). ``"async"`` (default) dispatches each cell
         with ``InvocationType="Event"`` and polls a per-shard result object the
         worker writes next to the output store
-        (``<store>.status/<run_id>/<shard_key>.json``), so no synchronous
+        (``<store>.status/<run_id>/<shard_label>.json``, where the label is
+        the decimal morton string for HEALPix — issue #199), so no synchronous
         connection sits idle while the shard runs -- shards longer than a NAT
         idle window (~4 min on GitHub-hosted runners) complete reliably, and
         the 6 MB synchronous response cap no longer applies. Requires (a) a
@@ -906,7 +909,9 @@ def _select_cells(
     catalog_data : dict
         Loaded catalog (shard_keys/granules format).
     morton_cell : str, optional
-        Process a single shard, identified by stringified key.
+        Process a single shard. For a HEALPix catalog this is the shard's
+        decimal morton string (e.g. ``-31123`` — issue #199); for other grids
+        it is the stringified shard-key int.
     max_cells : int, optional
         Truncate to the first N shards.
 
@@ -916,7 +921,17 @@ def _select_cells(
     """
     pairs = list(zip(catalog_data["shard_keys"], catalog_data["granules"]))
     if morton_cell:
-        target = int(morton_cell)
+        grid_type = (catalog_data.get("grid_signature") or {}).get("type")
+        if grid_type == "healpix":
+            try:
+                target = morton_word(morton_cell)
+            except ValueError as e:
+                raise ValueError(
+                    f"--morton-cell {morton_cell!r} is not a decimal morton id "
+                    f"(shard ids are decimal morton strings since issue #199): {e}"
+                ) from e
+        else:
+            target = int(morton_cell)
         matches = [(k, urls) for k, urls in pairs if k == target]
         if not matches:
             raise ValueError(f"shard '{morton_cell}' not in catalog")
@@ -1045,8 +1060,12 @@ def _process_and_write(
         # table), so no carrier-specific emptiness check is needed here.
         write_dataframe_to_zarr(carrier, zarr_store, grid=grid, chunk_idx=block_index)
         # Persist this chunk's ragged (CSR) fields — one CSR group per field per
-        # chunk (issue #48). No-ops when ``ragged`` is empty.
-        ragged_key = int(shard_key) if single_chunk else _block_index_key(block_index, grid)
+        # chunk (issue #48). No-ops when ``ragged`` is empty. At K==1 the CSR
+        # subgroup is named by the grid's shard label (the decimal morton string
+        # for HEALPix — issue #199); K>1 keeps the flattened block-index int.
+        ragged_key = (
+            shard_label(grid, shard_key) if single_chunk else _block_index_key(block_index, grid)
+        )
         write_ragged_to_zarr(ragged, zarr_store, grid=grid, shard_key=ragged_key)
 
     # Sharded output (issue #108): the shard's K inner chunks bundle into one
@@ -1188,21 +1207,21 @@ def _run_local(
     n = len(cells)
 
     def _accumulate(report, i, outcome):
-        shard_key = outcome["shard_key"]
+        label = shard_label(grid, outcome["shard_key"])
         if not outcome["ok"]:
             report.cells_error += 1
-            logger.warning(f"  [{i}/{n}] {shard_key}: ERROR {outcome['error']}")
+            logger.warning(f"  [{i}/{n}] {label}: ERROR {outcome['error']}")
             return
         meta = outcome["meta"]
         report.results.append(meta)
         if meta.get("error"):
-            logger.info(f"  [{i}/{n}] {shard_key}: {meta['error']}")
+            logger.info(f"  [{i}/{n}] {label}: {meta['error']}")
         else:
             obs = meta.get("total_obs", 0)
             report.total_obs += obs
             report.cells_with_data += 1
             if i % 10 == 0 or n <= 20:
-                logger.info(f"  [{i}/{n}] {shard_key}: {obs:,} obs")
+                logger.info(f"  [{i}/{n}] {label}: {obs:,} obs")
 
     start_time = time.time()
     try:
@@ -1321,7 +1340,8 @@ def _run_lambda(
 
     # Async result channel (issue #151): a per-run unique status prefix next to
     # the output store. Each worker mirrors its response envelope to
-    # <prefix>/<shard_key>.json and the dispatch threads poll for it instead of
+    # <prefix>/<shard_label>.json (decimal morton string for HEALPix, issue
+    # #199) and the dispatch threads poll for it instead of
     # holding a synchronous invoke connection open -- GitHub-hosted runners sit
     # behind a ~4 min NAT idle timeout that severed every >250 s benchmark
     # target. The run_id keeps reruns into the same store from reading stale
@@ -1400,7 +1420,9 @@ def _run_lambda(
         # timeout + queue/write margin). Sync runs pass none of these, keeping
         # the invoke byte-identical to the legacy path.
         if result_prefix is not None:
-            key = f"{int(shard_key)}.json"
+            # Status objects are named by the shard label — the decimal morton
+            # string for HEALPix (issue #199) — not the raw packed word.
+            key = f"{shard_label(grid, shard_key)}.json"
             extra["result_url"] = f"{result_prefix}/{key}"
             extra["result_fetch"] = _result_fetcher(
                 result_box, result_prefix, output_creds_event, region, key
@@ -1496,7 +1518,9 @@ def _run_lambda(
             report.cells_with_data += 1
         elif error not in ("No granules found", "No data after filtering"):
             report.cells_error += 1
-            logger.warning(f"  [{i}/{n}] shard {result.get('shard_key')}: {error}")
+            key = result.get("shard_key")
+            label = shard_label(grid, key) if key is not None else key
+            logger.warning(f"  [{i}/{n}] shard {label}: {error}")
         report.results.append(result)
 
         if i % 50 == 0:

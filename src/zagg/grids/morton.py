@@ -67,6 +67,34 @@ def to_morton_array(words):
     return MortonIndexArray.from_words(np.asarray(words, dtype=np.uint64))
 
 
+def morton_decimal(word) -> str:
+    """Decimal morton string for one packed shard-key word (issue #199).
+
+    The external/path form of a shard id per the sparse-coverage design record
+    (``docs/design/sparse_coverage.md`` D1): the packed ``uint64`` word stays
+    the canonical in-memory/wire form, and every externally visible string —
+    CSR subgroup names, ``.status`` object keys, log lines — renders through
+    mortie's decode-through-kernel decimal repr (e.g. ``-31123``). Raises
+    ``ValueError`` on an empty or invalid word (a path component must never be
+    silently wrong).
+    """
+    from mortie import MortonIndexArray
+
+    return MortonIndexArray.from_words(np.asarray([int(word)], dtype=np.uint64)).decimal_repr()[0]
+
+
+def morton_word(label: str) -> int:
+    """Parse a decimal morton string back to its packed word (issue #199).
+
+    The inverse of :func:`morton_decimal` at the zagg boundary — used where an
+    external decimal id re-enters (``--morton-cell``, CSR subgroup names on the
+    read path). Raises ``ValueError`` on a malformed id.
+    """
+    from mortie.morton_index import _decimal_to_word
+
+    return _decimal_to_word(str(label))
+
+
 def morton_to_arrow(values):
     """Export ``values`` as a typed ``arro3.core.Array`` (issue #135).
 
@@ -116,8 +144,10 @@ __all__ = [
     "MORTON_EXTENSION_NAME",
     "is_morton_array",
     "is_morton_arrow",
+    "morton_decimal",
     "morton_from_arrow",
     "morton_to_arrow",
+    "morton_word",
     "morton_words",
     "to_morton_array",
 ]

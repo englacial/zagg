@@ -19,9 +19,11 @@ arrays ``values`` / ``offsets`` / ``cell_ids``::
 ``cell_ids[k]`` is a cell's position in the chunk's row-major ``(64, 64)``
 children block, and ``values[offsets[k]:offsets[k+1]]`` is that cell's
 ``(k_centroids, 2)`` ``(mean, weight)`` digest.  The subgroup name is the
-chunk's morton index, recovered directly from the store (issue #79 design
-decision (3)); when a sibling ``{field}/morton`` ``uint64`` coordinate array is
-present it is used in preference, mapping chunk order → morton id.
+chunk's morton index — its **decimal morton string** since issue #199 (D1 in
+``docs/design/sparse_coverage.md``) — recovered directly from the store (issue
+#79 design decision (3)); when a sibling ``{field}/morton`` ``uint64``
+coordinate array is present it is used in preference, mapping chunk order →
+morton id.
 
 The reader (generator)
 ----------------------
@@ -43,6 +45,7 @@ import zarr
 from zarr.abc.store import Store
 
 from zagg.csr import iter_csr_cells, read_csr
+from zagg.grids.morton import morton_word
 from zagg.stats.tdigest import cdf_from_tdigest, quantile_from_tdigest
 
 __all__ = [
@@ -209,6 +212,21 @@ def chunk_z_range(
     raise ValueError(f"unknown fit mode {fit!r}")
 
 
+def _subgroup_words(shard_keys: list[str]) -> dict[str, int]:
+    """Parse CSR subgroup names to their numeric keys (issue #199).
+
+    Shard-keyed subgroups are named by the decimal morton string (D1), so the
+    numeric key is the parsed packed word; block-index-keyed subgroups (the K>1
+    layout) keep plain ints. The flavor is uniform per store, so parse all
+    names as decimal morton and fall back to ``int`` if any name isn't one
+    (e.g. ``"0"`` or a digit outside ``1..4``).
+    """
+    try:
+        return {k: morton_word(k) for k in shard_keys}
+    except ValueError:
+        return {k: int(k) for k in shard_keys}
+
+
 def _resolve_chunk_morton(
     store: Store, field: str, shard_keys: list[str], zarr_format: Literal[2, 3]
 ) -> dict[str, int]:
@@ -216,22 +234,24 @@ def _resolve_chunk_morton(
 
     Prefers a sibling ``{field}/morton`` ``uint64`` coordinate array (chunk
     order → morton id); falls back to parsing the subgroup name as the parent
-    morton id (the shard key is the parent morton — see :func:`process_shard`).
+    morton id (the shard key is the parent morton — see :func:`process_shard`),
+    a decimal morton string since issue #199.
 
     The coordinate array is aligned against the subgroup names sorted
-    **numerically** (the canonical ascending-morton chunk order), not
-    lexicographically — string sorting would mis-align names of differing digit
-    counts (e.g. ``"1000"`` before ``"99"``).
+    **numerically** by parsed key (the canonical ascending-morton chunk order),
+    not lexicographically — string sorting would mis-align names of differing
+    digit counts (e.g. ``"1000"`` before ``"99"``).
     """
+    words = _subgroup_words(shard_keys)
     try:
         arr = zarr.open_array(store, path=f"{field}/morton", mode="r", zarr_format=zarr_format)
         morton = np.asarray(arr[...])
     except (FileNotFoundError, KeyError, ValueError):
-        return {k: int(k) for k in shard_keys}
+        return words
     if len(morton) != len(shard_keys):
         # Coordinate present but not 1:1 with subgroups — fall back to the names.
-        return {k: int(k) for k in shard_keys}
-    return {k: int(m) for k, m in zip(sorted(shard_keys, key=int), morton)}
+        return words
+    return {k: int(m) for k, m in zip(sorted(shard_keys, key=words.__getitem__), morton)}
 
 
 def _shard_groups(

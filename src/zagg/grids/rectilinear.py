@@ -274,6 +274,15 @@ class RectilinearGrid:
             slice(lic * self.inner_w, (lic + 1) * self.inner_w),
         )
 
+    def shard_label(self, shard_key) -> str:
+        """External string form of a rect shard key (issue #199).
+
+        Rect shard keys are packed ``(rb, cb)`` tile ints, not morton words, so
+        the label is just the int's decimal digits (unlike HEALPix, which
+        renders the decimal morton string).
+        """
+        return str(int(shard_key))
+
     @property
     def group_path(self) -> str:
         return "rectilinear"

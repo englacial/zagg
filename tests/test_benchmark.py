@@ -745,8 +745,10 @@ def test_sharded_knob_applied_to_grid_config(monkeypatch):
                 }
             },
         }
-        # The o10 shardmap meta has no shard_key here; run_target reads it, so add one.
-        manifest["shardmaps"]["healpix_o10"]["shard_key"] = 0
+        # The o10 shardmap meta has no shard_key here; run_target reads it (and
+        # renders it through grid.shard_label — issue #199), so add a valid
+        # packed morton word.
+        manifest["shardmaps"]["healpix_o10"]["shard_key"] = 5347395636851376137
         run_benchmark.run_target(
             "t",
             manifest,

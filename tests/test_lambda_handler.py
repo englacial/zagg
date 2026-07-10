@@ -377,6 +377,10 @@ class TestProcessEventWriteLoop:
         # Regular (non-sharded) write path — a MagicMock attr is truthy by default,
         # so pin it off explicitly (issue #108 routes sharded grids elsewhere).
         grid_stub.sharded = False
+        # K==1 ragged subgroups are keyed by the grid's shard label (issue #199);
+        # a deterministic stub (decimal-string shaped) pins that the handler
+        # routes through the seam rather than stringifying the raw key itself.
+        grid_stub.shard_label = lambda key: f"-{int(key)}"
 
         monkeypatch.setattr(processing, "process_shard", fake_process_shard)
         monkeypatch.setattr(grids, "from_config", lambda *a, **k: grid_stub)
@@ -454,9 +458,10 @@ class TestProcessEventWriteLoop:
         assert seen["chunk_results"] is None  # no accumulation sink
         assert written == [(0,), (1,)]  # each chunk written as it streamed
 
-    def test_k_eq_1_ragged_keyed_by_shard_key(self, handler_mod, monkeypatch):
-        """K=1: the lone chunk's ragged CSR is persisted (the gap this phase closes:
-        the old handler never called write_ragged_to_zarr), keyed by shard_key."""
+    def test_k_eq_1_ragged_keyed_by_shard_label(self, handler_mod, monkeypatch):
+        """K=1: the lone chunk's ragged CSR is persisted, keyed by the grid's
+        shard label (the decimal morton string for HEALPix — issue #199), not
+        the raw shard-key int."""
         chunks = [((0,), pd.DataFrame(), {"h_tdigest": ([], [])})]
         cap = self._patch(handler_mod, monkeypatch, chunks)
         event = _base_event(_healpix_config_dict())
@@ -464,9 +469,9 @@ class TestProcessEventWriteLoop:
         resp = handler_mod._handle_process(event, _context())
         assert resp["statusCode"] == 200
         assert cap["dense"] == [(0,)]
-        # Single chunk -> ragged keyed by shard_key (cell-resolution contract).
+        # Single chunk -> ragged keyed by the stub grid's label of shard_key.
         assert len(cap["ragged"]) == 1
-        assert cap["ragged"][0][0] == event["shard_key"]
+        assert cap["ragged"][0][0] == f"-{event['shard_key']}"
 
     def test_streaming_later_chunk_write_failure_partial_writes_and_500(
         self, handler_mod, monkeypatch

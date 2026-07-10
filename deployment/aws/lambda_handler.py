@@ -31,8 +31,9 @@ Event payload (default / process mode):
         allocated), keeping the flag-off event and outputs byte-identical.
     "result_url": str (optional, issue #151) -- where to ALSO write this
         invocation's response envelope as JSON (e.g.
-        "s3://bucket/out.zarr.status/<run_id>/<shard_key>.json"). Set by the
-        orchestrator's async dispatch (InvocationType="Event", which discards
+        "s3://bucket/out.zarr.status/<run_id>/<shard_label>.json", where the
+        label is the decimal morton string for HEALPix -- issue #199). Set by
+        the orchestrator's async dispatch (InvocationType="Event", which discards
         the return value); the orchestrator polls this object instead of
         holding a synchronous connection open while the shard runs. Written
         with the output-store credentials. Absent -> no write, and the event
@@ -127,6 +128,7 @@ from zarr.errors import GroupNotFoundError
 
 # Import cloud-agnostic processing
 from zagg.config import get_handoff, load_config_from_dict
+from zagg.grids.base import shard_label
 from zagg.processing import (
     write_dataframe_to_zarr,
     write_ragged_to_zarr,
@@ -917,7 +919,14 @@ def _handle_process(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
                 # write_dataframe_to_zarr no-ops on an empty carrier, so no per-chunk
                 # emptiness check is needed. Use each chunk's own block_index.
                 write_dataframe_to_zarr(carrier, store, grid=grid, chunk_idx=block_index)
-                ragged_key = int(shard_key) if single_chunk else _block_index_key(block_index, grid)
+                # At K==1 the CSR subgroup is named by the grid's shard label (the
+                # decimal morton string for HEALPix — issue #199); K>1 keeps the
+                # flattened block-index int. Mirrors runner._process_and_write.
+                ragged_key = (
+                    shard_label(grid, shard_key)
+                    if single_chunk
+                    else _block_index_key(block_index, grid)
+                )
                 write_ragged_to_zarr(ragged, store, grid=grid, shard_key=ragged_key)
             except Exception as e:
                 # Mirror the buffered path's ``except``: record the failure, stop

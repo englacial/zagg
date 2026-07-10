@@ -24,7 +24,7 @@ from zagg.grids.base import (
     sharded_array_spec,
     vector_array_spec,
 )
-from zagg.grids.morton import to_morton_array
+from zagg.grids.morton import morton_decimal, to_morton_array
 
 HEALPIX_BASE_CELLS: int = 12
 # Reference order at which ``assign`` resolves points before ``cells_of`` /
@@ -457,6 +457,16 @@ class HealpixGrid:
         if self._position_map is None:
             raise RuntimeError("block_index requires set_populated_shards() for dense layout")
         return (self._position_map[int(shard_key)],)
+
+    def shard_label(self, shard_key) -> str:
+        """Decimal morton string for this shard's packed word (issue #199).
+
+        The external form of a HEALPix shard id (D1 in
+        ``docs/design/sparse_coverage.md``): CSR subgroup names, ``.status``
+        object keys, and log lines all carry e.g. ``-31123``, never the raw
+        packed-word integer.
+        """
+        return morton_decimal(shard_key)
 
     def shard_footprint(self, shard_key):
         """Parent-cell polygon in WGS84 (lon, lat)."""

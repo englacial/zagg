@@ -768,6 +768,56 @@ class TestMortonArrowAdapter:
         assert not is_morton_arrow(np.arange(3))  # no Arrow field at all
 
 
+class TestShardLabel:
+    """Issue #199: shard ids surface externally as decimal morton strings (D1 in
+    ``docs/design/sparse_coverage.md``) — ``morton_decimal``/``morton_word`` are
+    the boundary pair, and ``grid.shard_label`` is the grid seam every external
+    string (CSR subgroup names, status keys, log lines) routes through."""
+
+    def test_decimal_round_trip_both_hemispheres(self):
+        from mortie import geo2mort
+
+        from zagg.grids.morton import morton_decimal, morton_word
+
+        # Southern points render signed, northern unsigned; cover both plus a
+        # spread of orders (order-0 base cells through fine cells).
+        for lat, lon in [(-78.5, -132.0), (-72.1, 25.4), (78.3, 12.0), (0.1, 0.1)]:
+            for order in (0, 6, 9, 18):
+                word = int(geo2mort(np.array([lat]), np.array([lon]), order=order)[0])
+                s = morton_decimal(word)
+                # Grammar: optional sign, base 1..6, then one 1..4 digit per order.
+                body = s.lstrip("-")
+                assert body[0] in "123456" and all(d in "1234" for d in body[1:])
+                assert len(body) == order + 1
+                # Packed word -> decimal string -> packed word is lossless.
+                assert morton_word(s) == word
+
+    def test_morton_word_rejects_malformed(self):
+        from zagg.grids.morton import morton_word
+
+        for bad in ("", "0", "7", "150", "abc", "11827859996358475782"):
+            with pytest.raises(ValueError):
+                morton_word(bad)
+
+    def test_healpix_shard_label_is_decimal(self, cfg):
+        from zagg.grids.morton import morton_decimal, morton_word
+
+        g = HealpixGrid(parent_order=6, child_order=12, config=cfg)
+        for parent in _valid_parents(3):
+            label = g.shard_label(parent)
+            assert label == morton_decimal(parent)
+            assert morton_word(label) == parent
+
+    def test_base_helper_dispatches_and_falls_back(self, cfg):
+        from zagg.grids.base import shard_label
+
+        g = HealpixGrid(parent_order=6, child_order=12, config=cfg)
+        parent = _valid_parents(1)[0]
+        assert shard_label(g, parent) == g.shard_label(parent)
+        # Minimal grid stand-ins without the method keep plain int digits.
+        assert shard_label(object(), 42) == "42"
+
+
 class TestCellIdsEncoding:
     """Issue #135: ``output.grid.cell_ids_encoding`` — ``cell_ids`` stays NESTED
     HEALPix uint64 by default; ``morton`` emits the packed morton words instead
