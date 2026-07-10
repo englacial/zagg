@@ -605,7 +605,11 @@ def _handle_setup(event: Dict[str, Any]) -> Dict[str, Any]:
     metadata above the leaves, D5); each worker emits its own leaf template.
     The optional ``dataset`` event key carries the manifest's identity block
     (the orchestrator sources it from the ShardMap metadata, same as the local
-    path). The flat path below is byte-identical to before.
+    path). The flat path below is byte-identical to before, bar one addition:
+    the success body now ECHOES the layout it acted on (``"layout"``) — a
+    stale deployment without the hive branch returns the old echo-less body,
+    which the dispatcher rejects for hive runs instead of silently letting old
+    workers write a flat store at the hive root (review finding, PR #205).
     """
     from zagg.grids import from_config
 
@@ -622,7 +626,10 @@ def _handle_setup(event: Dict[str, Any]) -> Dict[str, Any]:
                 overwrite=event.get("overwrite", False),
                 **_output_store_kwargs(event),
             )
-            return {"statusCode": 200, "body": json.dumps({"ok": True, "mode": "setup"})}
+            return {
+                "statusCode": 200,
+                "body": json.dumps({"ok": True, "mode": "setup", "layout": "hive"}),
+            }
         store = open_store(event["store_path"], **_output_store_kwargs(event))
         # Build the grid exactly as the worker does (from_config), so the
         # template's chunk structure can't drift from what workers write. The
@@ -643,7 +650,10 @@ def _handle_setup(event: Dict[str, Any]) -> Dict[str, Any]:
             populated_shards=populated,
         )
         grid.emit_template(store, overwrite=event.get("overwrite", False))
-        return {"statusCode": 200, "body": json.dumps({"ok": True, "mode": "setup"})}
+        return {
+            "statusCode": 200,
+            "body": json.dumps({"ok": True, "mode": "setup", "layout": "flat"}),
+        }
     except Exception as e:
         logger.exception(e)
         return {"statusCode": 500, "body": json.dumps({"error": str(e), "mode": "setup"})}

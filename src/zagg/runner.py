@@ -2290,6 +2290,15 @@ def _invoke_lambda_setup(
     from the ShardMap metadata) is threaded through for the manifest's
     identity block. The key is added only when set, so flat setup events stay
     byte-identical.
+
+    Stale-deployment guard (review finding, PR #205): a function deployed
+    before phase 3 has no hive branch — it would emit the flat GLOBAL template
+    at the hive root, return the same 200 body, and the whole run would then
+    silently write a flat store. The phase-3 handler echoes the layout it
+    acted on (``"layout"`` in the response body), and a hive dispatch REQUIRES
+    that echo — failing fast at setup with a redeploy message instead of after
+    a full fan-out. Flat dispatch does not require the echo, so a new
+    dispatcher keeps working against old deployed functions for flat runs.
     """
     event = {
         "mode": "setup",
@@ -2315,6 +2324,19 @@ def _invoke_lambda_setup(
     result = json.loads(payload)
     if result.get("statusCode") != 200:
         raise RuntimeError(f"Lambda setup error: {result.get('body')}")
+    requested = ((config_dict or {}).get("output") or {}).get("store_layout") or "flat"
+    if requested == "hive":
+        try:
+            echoed = json.loads(result.get("body") or "{}").get("layout")
+        except (TypeError, ValueError):
+            echoed = None
+        if echoed != "hive":
+            raise RuntimeError(
+                f"Lambda setup did not confirm the hive store layout (response body "
+                f"{result.get('body')!r}): the deployed function predates issue #199 "
+                f"phase 3 and would write a FLAT store at the hive root — redeploy "
+                f"the function before dispatching hive runs"
+            )
 
 
 def _invoke_lambda_finalize(lambda_client, function_name, store_path, output_creds_event=None):

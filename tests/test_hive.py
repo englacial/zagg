@@ -7,6 +7,7 @@ retry semantics (D4), and the local runner's hive write path.
 
 import json
 import os
+from dataclasses import asdict
 
 import numpy as np
 import pandas as pd
@@ -458,6 +459,38 @@ class TestProcessAndWriteHive:
                     f"non-hive child {d!r} at {dirpath}"
                 )
 
+    def test_stamp_is_the_final_write(self, monkeypatch, cfg, tmp_path):
+        """D4 ordering pin (review finding, PR #205): the commit stamp is the
+        shard's LAST write — presence certifies everything before it landed.
+        ONE test covers BOTH backends: the local dispatcher and the Lambda
+        handler execute this same ``process_and_write_hive`` function, so the
+        op ordering cannot diverge between them."""
+        import zagg.processing as processing
+
+        ops: list = []
+
+        def rec(name, fn):
+            def wrapped(*a, **k):
+                ops.append(name)
+                return fn(*a, **k)
+
+            return wrapped
+
+        grid = self._grid(cfg)
+        fake = self._streaming_fake(grid, ragged={"h": ([np.array([1.0])], [0])})
+        monkeypatch.setattr(processing, "process_shard", fake)
+        monkeypatch.setattr(
+            processing, "write_dataframe_to_zarr", rec("dense", processing.write_dataframe_to_zarr)
+        )
+        monkeypatch.setattr(
+            processing, "write_ragged_to_zarr", rec("ragged", processing.write_ragged_to_zarr)
+        )
+        monkeypatch.setattr(hive, "stamp_commit", rec("stamp", hive.stamp_commit))
+        hive.process_and_write_hive(
+            _shard_word(), ["s3://b/g1.h5"], grid, {}, str(tmp_path / "store"), cfg, store_kwargs={}
+        )
+        assert ops == ["dense", "ragged", "stamp"]
+
 
 class TestLeafBlockIndex:
     def test_k1_maps_to_zero(self, cfg):
@@ -475,8 +508,9 @@ class TestLeafBlockIndex:
 
 
 class TestRunnerWiring:
-    """The local backend writes the manifest (no shared template) under hive,
-    and the lambda backend rejects hive with a pointed error."""
+    """The local backend writes the manifest (no shared template) under hive;
+    the lambda backend dispatches hive runs (issue #199 phase 3), threading
+    the manifest's dataset identity through the setup invoke."""
 
     def _catalog(self, tmp_path):
         shard = _shard_word()
@@ -632,3 +666,85 @@ class TestRunnerWiring:
         )
         agg(cfg, catalog=catalog_path, store="s3://out/x.zarr", backend="lambda")
         assert captured["setup"]["dataset"] is None
+
+
+class TestInvokeLambdaSetupEvent:
+    """Pin the ACTUAL setup event on the wire and the stale-deployment guard
+    (review findings, PR #205). The dispatch tests above monkeypatch
+    ``_invoke_lambda_setup`` at kwarg level, so the event-shaping conditional
+    (``dataset`` added only when set) and the layout-echo assertion are
+    exercised here directly, with a mocked boto3 client capturing ``Payload``."""
+
+    @staticmethod
+    def _client(body: dict):
+        from unittest.mock import MagicMock
+
+        payload = MagicMock()
+        payload.read.return_value = json.dumps(
+            {"statusCode": 200, "body": json.dumps(body)}
+        ).encode()
+        client = MagicMock()
+        client.invoke.return_value = {"Payload": payload, "FunctionError": None}
+        return client
+
+    @staticmethod
+    def _invoke(client, config_dict, dataset=None):
+        from zagg.runner import _invoke_lambda_setup
+
+        _invoke_lambda_setup(
+            client,
+            "process-shard",
+            "s3://out/product",
+            parent_order=6,
+            child_order=12,
+            n_parent_cells=None,
+            overwrite=False,
+            config_dict=config_dict,
+            dataset=dataset,
+        )
+        return json.loads(client.invoke.call_args.kwargs["Payload"])
+
+    def test_hive_event_carries_dataset(self, cfg):
+        cfg.output["store_layout"] = "hive"
+        client = self._client({"ok": True, "mode": "setup", "layout": "hive"})
+        event = self._invoke(client, asdict(cfg), dataset={"short_name": "ATL06", "version": "007"})
+        assert event["dataset"] == {"short_name": "ATL06", "version": "007"}
+
+    def test_flat_event_omits_dataset_and_matches_baseline(self, cfg):
+        # The byte-identity claim, pinned on the wire: no "dataset" key, and
+        # the event is exactly the pre-phase-3 flat setup event.
+        config_dict = asdict(cfg)
+        client = self._client({"ok": True, "mode": "setup", "layout": "flat"})
+        event = self._invoke(client, config_dict)
+        assert "dataset" not in event
+        assert event == {
+            "mode": "setup",
+            "store_path": "s3://out/product",
+            "parent_order": 6,
+            "child_order": 12,
+            "n_parent_cells": None,
+            "overwrite": False,
+            "config": config_dict,
+        }
+
+    def test_flat_without_layout_echo_unaffected(self, cfg):
+        # Old deployed functions return the echo-less body: flat dispatch must
+        # keep working against them.
+        self._invoke(self._client({"ok": True, "mode": "setup"}), asdict(cfg))
+
+    @pytest.mark.parametrize(
+        "body",
+        [
+            {"ok": True, "mode": "setup"},  # pre-phase-3 function: no echo
+            {"ok": True, "mode": "setup", "layout": "flat"},  # wrong layout acted on
+        ],
+    )
+    def test_hive_without_hive_echo_fails_fast(self, cfg, body):
+        # Stale-deployment guard: an old function would emit the flat GLOBAL
+        # template at the hive root and return a 200 the dispatcher couldn't
+        # tell apart — the layout echo makes that fail at setup, pre-fan-out.
+        cfg.output["store_layout"] = "hive"
+        with pytest.raises(RuntimeError, match="redeploy"):
+            self._invoke(
+                self._client(body), asdict(cfg), dataset={"short_name": "A", "version": "1"}
+            )
