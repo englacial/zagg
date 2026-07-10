@@ -26,8 +26,15 @@ leaf zarr** under a morton digit tree::
   debris — incomplete, ignorable, safe to overwrite on retry. This is NOT
   consolidated metadata: one small PUT on an object that must exist anyway.
 
-The coverage MOC (§4) and pyramid sweep (§7) are follow-on issues; the
-manifest's ``pyramid`` block is declared-only in round one (D11/D12).
+- **Coverage tier 0 (§4, issue #200)**: the stamp carries a ``coverage``
+  payload — the shard's morton box, the minimal <= 4-member MOC over its
+  occupied cells (:func:`zagg.grids.morton.morton_box`), padded to exactly
+  four decimal-string slots with JSON-null sentinels. Zero extra requests
+  (it rides the stamp PUT) and debris semantics are inherited: a torn
+  worker's coverage never becomes visible. The budgeted tier-1 MOC, the
+  end-of-run root ``coverage.moc``, and the pyramid sweep (§7) are follow-on
+  phases; the manifest's ``pyramid`` block is declared-only in round one
+  (D11/D12).
 """
 
 from __future__ import annotations
@@ -47,6 +54,10 @@ HIVE_SPEC = "morton-hive/1"
 MANIFEST_NAME = "morton_hive.json"
 #: Root-group attrs key carrying the commit stamp (D4).
 COMMIT_ATTR = "morton_hive_commit"
+#: Convention version of the stamp's coverage payload (§4 tier 0, issue #200).
+COVERAGE_SPEC = "morton-moc/1"
+#: Fixed slot count of the tier-0 morton box (2-4 members, null-padded).
+COVERAGE_BOX_SLOTS = 4
 
 
 def shard_leaf_path(store_root: str, shard_key) -> str:
@@ -189,22 +200,64 @@ def read_manifest(store_root: str, **store_kwargs) -> dict | None:
     return _read_json(open_object_store(store_root, **store_kwargs), MANIFEST_NAME)
 
 
-def stamp_commit(leaf_store, *, cells_with_data: int, granule_count: int) -> None:
+def build_coverage(shard_key, occupied, cell_order: int) -> dict:
+    """Tier-0 coverage payload for one shard's commit stamp (§4, issue #200).
+
+    ``occupied`` is the shard's occupied cell words (mixed order allowed —
+    the cells ``cells_with_data`` counts); the box is their minimal
+    <= 4-member MOC (:func:`zagg.grids.morton.morton_box`). ``None``/empty
+    falls back to the trivial 1-member cover, the shard id itself — always a
+    valid ancestor of its own coverage. Members are serialized as decimal
+    morton strings (D1), padded to exactly :data:`COVERAGE_BOX_SLOTS` slots
+    with trailing ``None`` (JSON null) sentinels — the recorded pad lean.
+    ``cell_order`` records the order occupancy was measured at. No timestamp
+    of its own: the payload rides the commit stamp, whose ``written_at``
+    covers it. Raises ``ValueError`` if the box escapes the shard's subtree
+    (occupied cells from another shard are an upstream bug, never stamped).
+    """
+    from zagg.grids.morton import morton_box, morton_decimal
+
+    shard = morton_decimal(shard_key)
+    if occupied is None or len(occupied) == 0:
+        labels = [shard]
+    else:
+        labels = [morton_decimal(w) for w in morton_box(occupied)]
+    if len(labels) > COVERAGE_BOX_SLOTS or any(not s.startswith(shard) for s in labels):
+        raise ValueError(
+            f"coverage box {labels} escapes shard {shard}'s subtree — occupied "
+            f"cells must be the shard's own (the shard id is always a valid "
+            f"trivial cover, so this is an upstream cell-assignment bug)"
+        )
+    return {
+        "spec": COVERAGE_SPEC,
+        "box": labels + [None] * (COVERAGE_BOX_SLOTS - len(labels)),
+        "cell_order": int(cell_order),
+    }
+
+
+def stamp_commit(
+    leaf_store, *, cells_with_data: int, granule_count: int, coverage: dict | None = None
+) -> None:
     """Stamp a shard leaf complete — the shard's FINAL write (D4).
 
     One small PUT rewriting the leaf's root ``zarr.json`` (which the template
     already created), not consolidation. Until this lands, the leaf prefix is
     debris: a worker that dies mid-shard leaves no stamp, and a retry may
-    overwrite the prefix wholesale.
+    overwrite the prefix wholesale. ``coverage`` (issue #200) attaches the
+    tier-0 payload from :func:`build_coverage`; ``None`` writes the
+    pre-coverage stamp unchanged.
     """
     group = zarr.open_group(leaf_store, path="", mode="r+", zarr_format=3)
-    group.attrs[COMMIT_ATTR] = {
+    stamp: dict = {
         "spec": HIVE_SPEC,
         "complete": True,
         "cells_with_data": int(cells_with_data),
         "granule_count": int(granule_count),
         "written_at": _utcnow(),
     }
+    if coverage is not None:
+        stamp["coverage"] = coverage
+    group.attrs[COMMIT_ATTR] = stamp
 
 
 def read_commit(leaf_store) -> dict | None:
@@ -221,6 +274,22 @@ def read_commit(leaf_store) -> dict | None:
     stamp = group.attrs.get(COMMIT_ATTR)
     # A malformed (non-mapping) stamp is debris too — never half-trusted.
     return dict(stamp) if isinstance(stamp, dict) else None
+
+
+def read_coverage(leaf_store) -> dict | None:
+    """The leaf's tier-0 coverage payload, or ``None`` when absent (issue #200).
+
+    Rides :func:`read_commit`: debris and absent leaves read ``None``, and so
+    does a committed pre-coverage stamp (issue #199 stores carry no
+    ``coverage`` key) — older stores keep reading fine. Box members are
+    decimal morton strings; parse one back with
+    :func:`zagg.grids.morton.morton_word`.
+    """
+    stamp = read_commit(leaf_store)
+    if stamp is None:
+        return None
+    coverage = stamp.get("coverage")
+    return dict(coverage) if isinstance(coverage, dict) else None
 
 
 def leaf_block_index(grid, block_index, shard_key) -> tuple:
@@ -296,6 +365,9 @@ def process_and_write_hive(
         ragged_key = shard_label(grid, shard_key) if single_chunk else int(local[0])
         write_ragged_to_zarr(ragged, store, grid=grid, shard_key=ragged_key)
 
+    # Occupied-cell sink (issue #200): the worker already holds the shard's
+    # populated cell words; collect them here to derive the stamp's coverage.
+    occupied: list = []
     _df_out, metadata = process_shard(
         grid,
         int(shard_key),
@@ -306,16 +378,24 @@ def process_and_write_hive(
         handoff=handoff,
         aoi_payload=aoi_payload,
         write_chunk=_write_chunk,
+        occupied_out=occupied,
         profile=profile,
     )
     # Stamp ONLY a fully-written leaf: an errored shard (or one that streamed
     # no chunks) stays unstamped — debris by definition (D4). The stamp is the
-    # last write, so its presence certifies everything before it landed.
+    # last write, so its presence certifies everything before it landed — the
+    # coverage payload rides it (zero extra requests) and inherits its debris
+    # semantics: a torn worker's coverage never becomes visible.
     if "store" in box and not metadata.get("error"):
         stamp_commit(
             box["store"],
             cells_with_data=metadata.get("cells_with_data", 0),
             granule_count=metadata.get("granule_count", 0),
+            coverage=build_coverage(
+                shard_key,
+                np.concatenate(occupied) if occupied else None,
+                grid.child_order,
+            ),
         )
     return metadata
 
@@ -338,14 +418,18 @@ def _utcnow() -> str:
 
 __all__ = [
     "COMMIT_ATTR",
+    "COVERAGE_BOX_SLOTS",
+    "COVERAGE_SPEC",
     "HIVE_SPEC",
     "MANIFEST_NAME",
+    "build_coverage",
     "build_manifest",
     "check_node_invariant",
     "ensure_manifest",
     "leaf_block_index",
     "process_and_write_hive",
     "read_commit",
+    "read_coverage",
     "read_manifest",
     "shard_leaf_path",
     "stamp_commit",

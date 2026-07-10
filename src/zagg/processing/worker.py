@@ -91,6 +91,7 @@ def process_shard(
     chunk_results: list | None = None,
     aoi_payload=None,
     write_chunk: Callable | None = None,
+    occupied_out: list | None = None,
     profile: bool = False,
 ) -> Tuple[pd.DataFrame, ProcessingMetadata]:
     """Process one shard: read granules, filter to this shard, aggregate, return df.
@@ -176,6 +177,13 @@ def process_shard(
         the ``chunk_results`` / ``ragged_out`` behavior above is unchanged. The
         sharded path (#108) still bundles all K via ``chunk_results`` /
         ``write_shard_to_zarr`` and does not pass a callback.
+    occupied_out : list, optional
+        Out-param sink for the shard's occupied cells (issue #200). When a list
+        is passed, one ``uint64`` array of the distinct cell-order morton words
+        holding >= 1 observation — the cells ``cells_with_data`` counts — is
+        appended after the shard's reads are grouped. The hive write path uses
+        it to derive the commit stamp's coverage payload; ``None`` (default)
+        records nothing — byte-for-byte unchanged.
     profile : bool, optional
         Opt-in per-phase timing (issue #100 phase 2). When ``True``, fills
         ``metadata["phase_timings"]`` with ``read`` / ``index`` / ``aggregate``
@@ -528,6 +536,13 @@ def process_shard(
     else:
         col_arrays, cell_to_slice, n_obs_total = _concat_and_group(all_reads, grid, handoff)
         logger.info(f"  Read {n_obs_total:,} observations")
+
+    # Occupied-cell sink (issue #200): both paths already key per-cell state by
+    # the packed cell word — ``cell_to_slice`` pooled, ``buffered.counts``
+    # merged — so the occupied set is in hand with no extra observation pass.
+    if occupied_out is not None:
+        cells = buffered.counts if buffered is not None else cell_to_slice
+        occupied_out.append(np.fromiter(cells.keys(), dtype=np.uint64, count=len(cells)))
 
     if profile:
         phase_timings["index"] = time.time() - _index_t0

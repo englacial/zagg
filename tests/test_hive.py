@@ -405,6 +405,9 @@ class TestProcessAndWriteHive:
             )
         assert os.path.exists(leaf)  # the prefix exists...
         assert hive.read_commit(open_store(leaf)) is None  # ...but is debris
+        # No stamp -> no coverage visible either (issue #200): the tier-0
+        # payload rides the stamp, so a torn worker never publishes coverage.
+        assert hive.read_coverage(open_store(leaf)) is None
         stale = os.path.join(leaf, grid.group_path, "h", morton_decimal(shard))
         assert os.path.exists(stale)  # the torn attempt's CSR subgroup
 
