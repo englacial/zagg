@@ -966,6 +966,19 @@ def _select_cells(
     return pairs
 
 
+def _lambda_dispatch_order(cells: list[tuple]) -> list[tuple]:
+    """Order cells for lambda fan-out: biggest work first, in coarse buckets.
+
+    Stable descending sort on ``len(granule_urls).bit_length()`` (log2
+    buckets), not the exact count: granule counts are spatially
+    autocorrelated, so an exact-count sort would mostly undo
+    ``_select_cells``'s anti-prefix-locality shuffle (issue #197). Coarse
+    buckets keep the longest-first throughput heuristic while the shuffle
+    survives within each bucket.
+    """
+    return sorted(cells, key=lambda kv: len(kv[1]).bit_length(), reverse=True)
+
+
 def _safe_label(grid, shard_key) -> str:
     """Render a shard key for log/report lines; NEVER raises (issue #199).
 
@@ -980,19 +993,6 @@ def _safe_label(grid, shard_key) -> str:
         return shard_label(grid, shard_key)
     except Exception:
         return str(shard_key)
-
-
-def _lambda_dispatch_order(cells: list[tuple]) -> list[tuple]:
-    """Order cells for lambda fan-out: biggest work first, in coarse buckets.
-
-    Stable descending sort on ``len(granule_urls).bit_length()`` (log2
-    buckets), not the exact count: granule counts are spatially
-    autocorrelated, so an exact-count sort would mostly undo
-    ``_select_cells``'s anti-prefix-locality shuffle (issue #197). Coarse
-    buckets keep the longest-first throughput heuristic while the shuffle
-    survives within each bucket.
-    """
-    return sorted(cells, key=lambda kv: len(kv[1]).bit_length(), reverse=True)
 
 
 def _aoi_payload_map(catalog_data: dict) -> dict:
