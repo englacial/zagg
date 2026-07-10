@@ -36,14 +36,19 @@ leaf zarr** under a morton digit tree::
   resolution; the one recorded exception to the vanilla-v3 leaf: data reads
   are unaffected, but member enumeration warns and skips it), written
   before the stamp and pointed to from the envelope; attrs stay lean and the
-  extra GET is paid only by readers that pass the box test. The end-of-run
-  root ``coverage.moc`` and the pyramid sweep (§7) are follow-on phases; the
-  manifest's ``pyramid`` block is declared-only in round one (D11/D12).
+  extra GET is paid only by readers that pass the box test. The optional end-of-run
+  root ``coverage.moc`` (issue #200 phase 3, default-on for hive) is a
+  shard-order ranges MOC at the store root — the second root-only object,
+  written fail-open by the dispatcher (locally) or a fire-and-forget worker
+  invoke (Lambda), and a regenerable cache under D9. The pyramid sweep (§7)
+  is a follow-on; the manifest's ``pyramid`` block is declared-only in round
+  one (D11/D12).
 """
 
 from __future__ import annotations
 
 import json
+import logging
 import warnings
 from datetime import datetime, timezone
 
@@ -52,6 +57,8 @@ import zarr
 from zarr.errors import GroupNotFoundError
 
 from zagg.store import open_object_store
+
+logger = logging.getLogger(__name__)
 
 #: Convention version recorded in the manifest and the commit stamp (D6).
 HIVE_SPEC = "morton-hive/1"
@@ -72,6 +79,11 @@ COVERAGE_SIDECAR = "coverage.moc"
 #: zstd level for the sidecar bitmap — fixed so identical occupancy produces
 #: byte-identical sidecars across workers and backends.
 _ZSTD_LEVEL = 3
+#: Store-ROOT coverage object name (issue #200 phase 3): the shard-order MOC
+#: for the one-GET bootstrap — the second root-only exception to the node
+#: invariant, next to the manifest. Same name as the in-leaf sidecar
+#: (:data:`COVERAGE_SIDECAR`), different location and encoding.
+ROOT_COVERAGE_NAME = "coverage.moc"
 
 
 def shard_leaf_path(store_root: str, shard_key) -> str:
@@ -483,6 +495,152 @@ def read_coverage(leaf_store) -> dict | None:
     return dict(coverage)
 
 
+def _decimal_base(decimal: str) -> str:
+    """The ``{sign+base}`` component of a D1 decimal id."""
+    return decimal[:2] if decimal.startswith("-") else decimal[:1]
+
+
+def _decimal_rank(decimal: str) -> int:
+    """Base-4 value of a D1 digit tail (digits ``1..4`` -> ``0..3``)."""
+    rank = 0
+    for ch in decimal[len(_decimal_base(decimal)) :]:
+        rank = rank * 4 + (int(ch) - 1)
+    return rank
+
+
+def _rank_tail(rank: int, depth: int) -> str:
+    """Inverse of :func:`_decimal_rank`: the width-``depth`` digit tail."""
+    digits = []
+    for _ in range(depth):
+        digits.append(str(rank % 4 + 1))
+        rank //= 4
+    return "".join(reversed(digits))
+
+
+def build_root_coverage(shard_keys, order: int, *, source: str = "dispatcher") -> dict:
+    """Store-root coverage envelope from completed shard keys (issue #200 phase 3).
+
+    The O1 serialization: JSON ranges under the ``morton-moc/1`` envelope,
+    with ``encoding: "ranges"`` (vs the leaf sidecar's ``"bitmap"``), the
+    shard ``order``, ``source`` and ``generated_at`` — the root carrier's
+    staleness discriminators (per-carrier fields under the same spec; the
+    leaf payload deliberately omits them, see :func:`build_coverage`). A
+    range is an inclusive ``[first, last]`` run of same-order cells within
+    ONE base cell, consecutive in base-4 digit-tail rank (ascending
+    packed-word order — the bitmap's rank convention at the root). Endpoints
+    are D1 decimal STRINGS: packed u64 words exceed 2^53, so raw JSON
+    numbers would be silently mangled by any float-based parser (O1).
+    """
+    from zagg.grids.morton import to_morton_array
+
+    words = np.unique(np.asarray(shard_keys, dtype=np.uint64))
+    if words.size == 0:
+        raise ValueError("build_root_coverage requires at least one shard key")
+    decs = list(to_morton_array(words).decimal_repr())
+    bad = [d for d in decs if _decimal_order(d) != int(order)]
+    if bad:
+        raise ValueError(f"shard keys {bad[:3]} are not at shard order {order}")
+    # np.unique sorts by packed word; at a fixed order the words of one base
+    # cell are contiguous and rank-ascending, so one linear pass finds runs.
+    ranges = []
+    start = prev = decs[0]
+    for dec in decs[1:]:
+        same_run = (
+            _decimal_base(dec) == _decimal_base(prev)
+            and _decimal_rank(dec) == _decimal_rank(prev) + 1
+        )
+        if same_run:
+            prev = dec
+            continue
+        ranges.append([start, prev])
+        start = prev = dec
+    ranges.append([start, prev])
+    return {
+        "spec": COVERAGE_SPEC,
+        "encoding": "ranges",
+        "order": int(order),
+        "source": source,
+        "generated_at": _utcnow(),
+        "ranges": ranges,
+    }
+
+
+def root_coverage_words(envelope: dict) -> np.ndarray:
+    """Shard words from a root envelope's ranges (inverse of the builder).
+
+    Raises ``ValueError`` on malformed ranges (base-crossing, wrong order,
+    reversed endpoints) — same loud posture as the bitmap decoder: a corrupt
+    cache must never yield a plausible partial answer.
+    """
+    from zagg.grids.morton import morton_word
+
+    order = int(envelope["order"])
+    words = []
+    for lo, hi in envelope["ranges"]:
+        base = _decimal_base(lo)
+        lo_rank, hi_rank = _decimal_rank(lo), _decimal_rank(hi)
+        ok = _decimal_base(hi) == base and lo_rank <= hi_rank
+        ok = ok and _decimal_order(lo) == order and _decimal_order(hi) == order
+        if not ok:
+            raise ValueError(f"malformed coverage range [{lo}, {hi}] at order {order}")
+        words.extend(morton_word(base + _rank_tail(r, order)) for r in range(lo_rank, hi_rank + 1))
+    return np.unique(np.asarray(words, dtype=np.uint64))
+
+
+def write_root_coverage(store_root: str, envelope: dict, **store_kwargs) -> dict:
+    """GET-union-PUT the store-root ``coverage.moc`` (issue #200 phase 3).
+
+    Incremental runs accumulate: a parsable existing object with the same
+    spec/encoding/order is UNIONED with ``envelope`` before the PUT. An
+    unparsable or incompatible existing object is logged and OVERWRITTEN —
+    the root MOC is a regenerable cache (D9): the leaf stamps are the
+    durable truth and the §7 sweep is the authoritative rebuilder, so
+    merging with garbage would be worse than replacing it. Returns the
+    payload actually written.
+    """
+    import obstore
+
+    store = open_object_store(store_root, **store_kwargs)
+    try:
+        existing = _read_json(store, ROOT_COVERAGE_NAME)
+    except ValueError:
+        logger.warning(
+            f"existing {ROOT_COVERAGE_NAME} at {store_root} is not JSON; overwriting "
+            f"(regenerable cache — the sweep is the authoritative rebuilder)"
+        )
+        existing = None
+    merged = envelope
+    if isinstance(existing, dict):
+        compatible = (
+            existing.get("spec") == envelope.get("spec")
+            and existing.get("encoding") == envelope.get("encoding")
+            and existing.get("order") == envelope.get("order")
+        )
+        if compatible:
+            try:
+                union = np.union1d(root_coverage_words(existing), root_coverage_words(envelope))
+                merged = build_root_coverage(
+                    union, int(envelope["order"]), source=envelope.get("source", "dispatcher")
+                )
+            except (KeyError, TypeError, ValueError) as e:
+                logger.warning(
+                    f"existing {ROOT_COVERAGE_NAME} at {store_root} failed to parse ({e}); "
+                    f"overwriting (regenerable cache — the sweep rebuilds authoritatively)"
+                )
+        else:
+            logger.warning(
+                f"existing {ROOT_COVERAGE_NAME} at {store_root} has an incompatible "
+                f"envelope; overwriting (regenerable cache)"
+            )
+    obstore.put(store, ROOT_COVERAGE_NAME, json.dumps(merged, indent=1).encode())
+    return merged
+
+
+def read_root_coverage(store_root: str, **store_kwargs) -> dict | None:
+    """Read the store-root ``coverage.moc``; ``None`` when absent."""
+    return _read_json(open_object_store(store_root, **store_kwargs), ROOT_COVERAGE_NAME)
+
+
 def leaf_block_index(grid, block_index, shard_key) -> tuple:
     """Leaf-LOCAL storage block for a chunk in a hive leaf (issue #199 phase 2).
 
@@ -629,8 +787,10 @@ __all__ = [
     "COVERAGE_SPEC",
     "HIVE_SPEC",
     "MANIFEST_NAME",
+    "ROOT_COVERAGE_NAME",
     "build_coverage",
     "build_manifest",
+    "build_root_coverage",
     "check_node_invariant",
     "decode_coverage_bitmap",
     "encode_coverage_bitmap",
@@ -641,7 +801,10 @@ __all__ = [
     "read_coverage",
     "read_coverage_bitmap",
     "read_manifest",
+    "read_root_coverage",
+    "root_coverage_words",
     "shard_leaf_path",
     "stamp_commit",
     "write_coverage_sidecar",
+    "write_root_coverage",
 ]

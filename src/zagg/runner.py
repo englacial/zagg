@@ -35,6 +35,7 @@ from zagg.config import (
     PipelineConfig,
     get_child_order,
     get_consolidate_metadata,
+    get_coverage_moc,
     get_driver,
     get_handoff,
     get_layout,
@@ -1328,6 +1329,23 @@ def _run_local(
         consolidate_metadata(zarr_store, zarr_format=3)
     wall_time = time.time() - start_time
 
+    # End-of-run root coverage.moc (issue #200 phase 3; default-on for hive,
+    # O9). Built from THIS run's successful completions and GET-unioned with
+    # any existing root object; the local dispatcher can write the store
+    # directly. Fail-open: the root MOC is a regenerable cache (D9) — a
+    # failed write costs readers one walk, never a wrong answer.
+    if store_layout == "hive" and get_coverage_moc(config):
+        done = [m["shard_key"] for m in report.results if not m.get("error")]
+        if done:
+            from zagg.hive import build_root_coverage, write_root_coverage
+
+            try:
+                envelope = build_root_coverage(done, int(grid.parent_order))
+                write_root_coverage(store_path, envelope, **store_kwargs)
+                logger.info(f"Wrote root coverage.moc ({len(envelope['ranges'])} ranges)")
+            except Exception as e:
+                logger.warning(f"root coverage.moc write failed (fail-open, D9): {e}")
+
     summary = {
         "total_cells": len(cells),
         "cells_with_data": report.cells_with_data,
@@ -1660,6 +1678,54 @@ def _run_lambda(
     executor.finalize()
     finalize_s = time.time() - finalize_start
     wall_time = time.time() - start_time
+
+    # End-of-run root coverage.moc (issue #200 phase 3; default-on for hive,
+    # O9): the dispatcher cannot PUT to S3, so it builds + serializes the MOC
+    # and posts ONE fire-and-forget worker invoke that GET-unions-PUTs it.
+    # Transport rationale (espg-requested, plan question 3) — serialized
+    # ranges IN the event vs the completion list via the status channel:
+    #   - Ranges (chosen): the dispatcher already holds the completion list
+    #     in memory, so building the MOC costs milliseconds, and the payload
+    #     is bounded by construction — spatially coherent coverage collapses
+    #     to a few-KB range list, far under Lambda's 256 KB async-invoke cap,
+    #     which a raw ~50k-key completion list would break. One hop, and no
+    #     read-back race against status objects still landing from retried
+    #     stragglers.
+    #   - Completion list via .status/ (rejected): payload size would be
+    #     run-independent and the artifact replayable from durable state, but
+    #     it costs the worker a LIST + N GETs, races in-flight status writes,
+    #     and its replayability is already owned by the §7 sweep's
+    #     authoritative rebuild — the leaves are the durable truth (D9).
+    # Fail-open everywhere: a failed build/invoke logs and the run result is
+    # untouched (the root MOC is a regenerable cache).
+    if get_store_layout(config) == "hive" and get_coverage_moc(config):
+        done = [
+            r["shard_key"]
+            for r in report.results
+            if r.get("status_code") == 200 and not r.get("error")
+        ]
+        if done:
+            try:
+                from zagg.hive import build_root_coverage
+
+                envelope = build_root_coverage(done, int(parent_order))
+                # An OLD deployment silently ignores the unknown mode — safe
+                # under D9 (readers degrade to the sweep MOC or the walk),
+                # but say so, mirroring the PR #205 deploy-ordering note.
+                logger.info(
+                    f"Dispatching root coverage.moc write ({len(envelope['ranges'])} "
+                    f"ranges, fire-and-forget) — requires a redeployed function; an "
+                    f"older deployment ignores mode=coverage (harmless under D9)"
+                )
+                _invoke_lambda_coverage(
+                    state["lambda_client"],
+                    function_name,
+                    store_path,
+                    envelope,
+                    output_creds_event=output_creds_event,
+                )
+            except Exception as e:
+                logger.warning(f"root coverage.moc dispatch failed (fail-open, D9): {e}")
 
     # Cost estimate: arm64 pricing = $0.0000133334/GB-second. Compute gb_seconds
     # and cost *once* over the summed Lambda time (the report carries only the
@@ -2380,6 +2446,28 @@ def _invoke_lambda_finalize(lambda_client, function_name, store_path, output_cre
     result = json.loads(payload)
     if result.get("statusCode") != 200:
         raise RuntimeError(f"Lambda finalize error: {result.get('body')}")
+
+
+def _invoke_lambda_coverage(
+    lambda_client, function_name, store_path, envelope, output_creds_event=None
+):
+    """Fire-and-forget root ``coverage.moc`` write (issue #200 phase 3).
+
+    ``InvocationType="Event"``: ~10 ms of dispatcher wall clock, run-size
+    independent, nothing blocks on it and no response is read — failure is
+    harmless by design (the worker-side GET-union-PUT is
+    ``zagg.hive.write_root_coverage``; the root MOC is a regenerable cache,
+    D9). The envelope rides pre-serialized in the event — see the dispatch
+    site for the transport rationale vs the status channel.
+    """
+    event = {"mode": "coverage", "store_path": store_path, "coverage": envelope}
+    if output_creds_event is not None:
+        event["output_credentials"] = output_creds_event
+    lambda_client.invoke(
+        FunctionName=function_name,
+        InvocationType="Event",
+        Payload=json.dumps(event),
+    )
 
 
 def _invoke_lambda_cell(
