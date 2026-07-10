@@ -41,6 +41,7 @@ from zagg.config import (
     get_output_region,
     get_parent_order,
     get_pipeline_type,
+    get_store_layout,
     get_store_path,
 )
 from zagg.dispatch import (
@@ -346,6 +347,16 @@ class SpatialStrategy:
             max_workers = min(max_workers, n_cells)
             if not store_path.startswith("s3://"):
                 raise ValueError(f"Lambda backend requires s3:// store path, got: {store_path}")
+            if get_store_layout(config) == "hive":
+                # Phase 2 (issue #199) wires the hive layout through the local
+                # backend; the Lambda path needs a worker event-schema change
+                # (per-leaf template emit inside the function, since the
+                # orchestrator has no S3 write access) — a follow-on phase.
+                raise ValueError(
+                    "output.store_layout: hive is not wired to the lambda backend "
+                    "yet (issue #199 phase 2 lands the local backend); use "
+                    "backend='local' or the flat layout"
+                )
             if invocation not in ("async", "sync"):
                 raise ValueError(f"Unknown invocation: {invocation!r} (expected 'async' or 'sync')")
             if function_name is None:
@@ -1121,6 +1132,94 @@ def _process_and_write(
     return metadata
 
 
+def _leaf_block_index(grid, block_index, shard_key) -> tuple:
+    """Leaf-LOCAL storage block for a chunk in a hive leaf (issue #199 phase 2).
+
+    The hive leaf's arrays are sized to one shard, so a chunk's block index is
+    its position WITHIN the shard, not the global block ``iter_chunks`` yields.
+    Derived from the existing ``shard_local_region`` seam (the sharded path's
+    within-shard placement): the region's start divided by the chunk extent.
+    At K==1 this is always ``(0,)``.
+    """
+    region = grid.shard_local_region(block_index, shard_key)
+    return tuple(int(s.start) // int(c) for s, c in zip(region, grid.chunk_shape))
+
+
+def _process_and_write_hive(
+    shard_key,
+    records,
+    grid,
+    s3_creds,
+    store_root,
+    config,
+    *,
+    store_kwargs,
+    driver=None,
+    handoff="arrow",
+    aoi_payload=None,
+):
+    """Process one shard into its own hive leaf store (issue #199 phase 2).
+
+    The hive counterpart of :func:`_process_and_write`: the shard's output is a
+    self-describing leaf zarr at ``shard_leaf_path(store_root, shard_key)``
+    (D3), with dense chunks written at leaf-LOCAL block indices and — as the
+    shard's FINAL write — the D4 commit stamp on the leaf's root group. The
+    leaf template is emitted lazily on the first chunk write (mirroring the
+    Lambda handler's lazy store open), so a no-data shard never creates the
+    ``.zarr/`` prefix; a worker that dies mid-shard leaves an UNSTAMPED prefix
+    — debris, overwritten wholesale on retry (``overwrite=True`` on the leaf
+    template makes the retry idempotent).
+    """
+    from zagg.hive import shard_leaf_path, stamp_commit
+
+    leaf_path = shard_leaf_path(store_root, shard_key)
+    box: dict = {}
+
+    def _leaf():
+        if "store" not in box:
+            store = open_store(leaf_path, **store_kwargs)
+            # overwrite=True: any existing prefix here is either debris from a
+            # torn run (D4) or a prior committed write being redone — both are
+            # replaced wholesale; per-leaf state never blocks a retry.
+            grid.emit_shard_template(store, overwrite=True)
+            box["store"] = store
+        return box["store"]
+
+    single_chunk = int(getattr(grid, "chunks_per_shard", 1)) == 1
+
+    def _write_chunk(block_index, carrier, ragged):
+        store = _leaf()
+        local = _leaf_block_index(grid, block_index, shard_key)
+        write_dataframe_to_zarr(carrier, store, grid=grid, chunk_idx=local)
+        # CSR subgroup naming inside a leaf mirrors the flat layout: the shard
+        # label at K==1; the LOCAL chunk ordinal at K>1 (leaf arrays are
+        # 1-D — hive is HEALPix-only, validated at config load).
+        ragged_key = shard_label(grid, shard_key) if single_chunk else int(local[0])
+        write_ragged_to_zarr(ragged, store, grid=grid, shard_key=ragged_key)
+
+    _df_out, metadata = process_shard(
+        grid,
+        int(shard_key),
+        _resolve_urls(records, driver),
+        s3_credentials=s3_creds,
+        config=config,
+        driver=driver,
+        handoff=handoff,
+        aoi_payload=aoi_payload,
+        write_chunk=_write_chunk,
+    )
+    # Stamp ONLY a fully-written leaf: an errored shard (or one that streamed
+    # no chunks) stays unstamped — debris by definition (D4). The stamp is the
+    # last write, so its presence certifies everything before it landed.
+    if "store" in box and not metadata.get("error"):
+        stamp_commit(
+            box["store"],
+            cells_with_data=metadata.get("cells_with_data", 0),
+            granule_count=metadata.get("granule_count", 0),
+        )
+    return metadata
+
+
 def _run_local(
     config,
     catalog_data,
@@ -1179,13 +1278,29 @@ def _run_local(
     else:
         grid = from_config(config)
     _check_signature(grid, catalog_data)
-    zarr_store = open_store(
-        store_path,
-        region=region,
-        credentials=output_credentials,
-        endpoint_url=output_endpoint_url,
-    )
-    zarr_store = grid.emit_template(zarr_store, overwrite=overwrite)
+    store_layout = get_store_layout(config)
+    store_kwargs = {
+        "region": region,
+        "credentials": output_credentials,
+        "endpoint_url": output_endpoint_url,
+    }
+    if store_layout == "hive":
+        # Hive layout (issue #199 phase 2): no shared zarr template — zero
+        # metadata above the leaves (D5). Template time writes only the root
+        # manifest (D6); each shard emits its own leaf template lazily inside
+        # _process_and_write_hive.
+        from zagg.hive import build_manifest, ensure_manifest
+
+        ensure_manifest(
+            store_path,
+            build_manifest(grid, dataset=catalog_data.get("metadata")),
+            overwrite=overwrite,
+            **store_kwargs,
+        )
+        zarr_store = None
+    else:
+        zarr_store = open_store(store_path, **store_kwargs)
+        zarr_store = grid.emit_template(zarr_store, overwrite=overwrite)
 
     # Per-cell work, catching its own exceptions so one bad cell counts as an
     # error and the run continues (the old loop's ``except`` branch). The
@@ -1210,18 +1325,32 @@ def _run_local(
         ds = _clamped_data_source(config.data_source, len(_resolve_urls(records, driver)))
         cell_config = replace(config, data_source=ds) if ds is not None else config
         try:
-            meta = _process_and_write(
-                shard_key,
-                grid.block_index(int(shard_key)),
-                records,
-                grid,
-                s3_creds,
-                zarr_store,
-                cell_config,
-                driver=driver,
-                handoff=handoff,
-                **extra,
-            )
+            if store_layout == "hive":
+                meta = _process_and_write_hive(
+                    shard_key,
+                    records,
+                    grid,
+                    s3_creds,
+                    store_path,
+                    cell_config,
+                    store_kwargs=store_kwargs,
+                    driver=driver,
+                    handoff=handoff,
+                    **extra,
+                )
+            else:
+                meta = _process_and_write(
+                    shard_key,
+                    grid.block_index(int(shard_key)),
+                    records,
+                    grid,
+                    s3_creds,
+                    zarr_store,
+                    cell_config,
+                    driver=driver,
+                    handoff=handoff,
+                    **extra,
+                )
             return {"shard_key": shard_key, "ok": True, "meta": meta}
         except Exception as e:
             return {"shard_key": shard_key, "ok": False, "error": e}

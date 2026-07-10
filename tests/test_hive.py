@@ -1,0 +1,484 @@
+"""Tests for the morton-hive store layout — issue #199 phase 2.
+
+Covers the config flag, leaf-path computation + node invariant (D2/D3/D5),
+the ``morton_hive.json`` manifest (D6), the commit stamp / debris / torn-write
+retry semantics (D4), and the local runner's hive write path.
+"""
+
+import json
+import os
+
+import numpy as np
+import pandas as pd
+import pytest
+import zarr
+from zarr.storage import MemoryStore
+
+from zagg import hive
+from zagg.config import default_config, get_data_vars, validate_config
+from zagg.grids import HealpixGrid
+from zagg.grids.morton import morton_decimal, morton_word
+
+
+@pytest.fixture
+def cfg():
+    return default_config("atl06")
+
+
+def _shard_word(order=6):
+    """A real southern packed shard word (decimal form ``-5112333`` at order 6)."""
+    from mortie import geo2mort
+
+    return int(geo2mort(np.array([-78.5]), np.array([-132.0]), order=order)[0])
+
+
+# ── config flag ──────────────────────────────────────────────────────────────
+
+
+class TestStoreLayoutConfig:
+    def test_default_is_flat(self, cfg):
+        from zagg.config import get_store_layout
+
+        assert get_store_layout(cfg) == "flat"
+        validate_config(cfg)  # flat default validates unchanged
+
+    def test_hive_accepted_for_healpix(self, cfg):
+        cfg.output["store_layout"] = "hive"
+        validate_config(cfg)
+
+    def test_null_key_falls_back_to_flat(self, cfg):
+        from zagg.config import get_store_layout
+
+        cfg.output["store_layout"] = None
+        assert get_store_layout(cfg) == "flat"
+        validate_config(cfg)
+
+    def test_unknown_value_rejected(self, cfg):
+        cfg.output["store_layout"] = "tree"
+        with pytest.raises(ValueError, match="store_layout"):
+            validate_config(cfg)
+
+    def test_hive_rejects_rectilinear(self, cfg):
+        cfg.output["store_layout"] = "hive"
+        cfg.output["grid"] = {
+            "type": "rectilinear",
+            "crs": "EPSG:3031",
+            "resolution": 100,
+            "bounds": [0, 0, 1000, 1000],
+        }
+        with pytest.raises(ValueError, match="healpix"):
+            validate_config(cfg)
+
+    def test_hive_rejects_sharded(self, cfg):
+        cfg.output["store_layout"] = "hive"
+        cfg.output.setdefault("grid", {})["sharded"] = True
+        with pytest.raises(ValueError, match="sharded"):
+            validate_config(cfg)
+
+    def test_hive_rejects_consolidate_metadata(self, cfg):
+        cfg.output["store_layout"] = "hive"
+        cfg.output["consolidate_metadata"] = True
+        with pytest.raises(ValueError, match="consolidate"):
+            validate_config(cfg)
+
+
+# ── leaf paths + node invariant ──────────────────────────────────────────────
+
+
+class TestLeafPath:
+    def test_matches_mortie_hive_path(self):
+        # The convention is owned by the mortie spec: zagg's leaf path must be
+        # exactly mortie's hive_path under the store root.
+        from mortie import MortonIndexArray
+
+        word = _shard_word()
+        expected = MortonIndexArray.from_words(np.asarray([word], dtype=np.uint64)).hive_path(
+            root="s3://b/root"
+        )[0]
+        assert hive.shard_leaf_path("s3://b/root", word) == expected
+
+    def test_one_digit_per_level_full_id_leaf(self):
+        # D2/D3: sign+base, one digit per order, full decimal id at the leaf.
+        word = _shard_word()
+        assert morton_decimal(word) == "-5112333"
+        assert hive.shard_leaf_path("root", word) == "root/-5/1/1/2/3/3/3/-5112333.zarr"
+
+    def test_trailing_slash_root_normalized(self):
+        word = _shard_word()
+        assert hive.shard_leaf_path("root/", word) == hive.shard_leaf_path("root", word)
+
+    def test_negative_key_rejected(self):
+        # A signed legacy id is the DECIMAL form, not a packed word.
+        with pytest.raises(ValueError, match="packed morton word"):
+            hive.shard_leaf_path("root", -4211322)
+
+    def test_node_invariant_accepts_computed_paths(self):
+        for order in (1, 6, 11):
+            word = _shard_word(order)
+            s = morton_decimal(word)
+            head = 2 if s.startswith("-") else 1
+            rel = "/".join([s[:head], *s[head:]]) + f"/{s}.zarr"
+            hive.check_node_invariant(rel)
+
+    @pytest.mark.parametrize(
+        "bad",
+        [
+            "-4211322.zarr",  # bare leaf: no digit chain at all
+            "0/1/01.zarr",  # base digit 0
+            "-4/5/-45.zarr",  # order digit outside 1..4
+            "-4/2/-43.zarr",  # leaf id does not match the chain
+            "-4/2/-42",  # not a .zarr leaf
+            "-4/21/-421.zarr",  # grouped digits (one digit per level, D2)
+        ],
+    )
+    def test_node_invariant_rejects(self, bad):
+        with pytest.raises(ValueError, match="node invariant"):
+            hive.check_node_invariant(bad)
+
+
+# ── manifest (D6) ────────────────────────────────────────────────────────────
+
+
+class TestManifest:
+    def _grid(self, cfg):
+        return HealpixGrid(parent_order=6, child_order=8, layout="fullsphere", config=cfg)
+
+    def test_build_contents(self, cfg):
+        m = hive.build_manifest(self._grid(cfg), dataset={"short_name": "ATL06", "version": "007"})
+        assert m["spec"] == "morton-hive/1"
+        assert m["dataset"] == {"short_name": "ATL06", "version": "007"}
+        assert m["cell_order"] == 8
+        assert m["shard_order"] == 6
+        # Explicit split schedule: one digit per level down to the shard order.
+        assert m["split_schedule"] == [1] * 6
+        # Declared-only in round one (populated by the pyramid sweep, D11).
+        assert m["pyramid"] == {"orders": [], "aggregation": {}}
+        assert m["generated_at"]
+
+    def test_ensure_write_read_round_trip(self, cfg, tmp_path):
+        root = str(tmp_path / "store")
+        m = hive.build_manifest(self._grid(cfg))
+        assert hive.ensure_manifest(root, m) == m
+        assert hive.read_manifest(root) == m
+        # The object is the root-only exception: it lives at the root, as JSON.
+        assert json.loads((tmp_path / "store" / hive.MANIFEST_NAME).read_text()) == m
+
+    def test_rerun_with_matching_manifest_is_accepted(self, cfg, tmp_path):
+        # Retry semantics (D4): a rerun into the same root must proceed.
+        root = str(tmp_path / "store")
+        grid = self._grid(cfg)
+        hive.ensure_manifest(root, hive.build_manifest(grid))
+        again = hive.build_manifest(grid)  # fresh generated_at
+        assert hive.ensure_manifest(root, again)["spec"] == "morton-hive/1"
+
+    def test_mismatched_manifest_raises(self, cfg, tmp_path):
+        root = str(tmp_path / "store")
+        hive.ensure_manifest(root, hive.build_manifest(self._grid(cfg)))
+        other = HealpixGrid(parent_order=5, child_order=8, layout="fullsphere", config=cfg)
+        with pytest.raises(ValueError, match="does not match"):
+            hive.ensure_manifest(root, hive.build_manifest(other))
+
+    def test_overwrite_replaces(self, cfg, tmp_path):
+        root = str(tmp_path / "store")
+        hive.ensure_manifest(root, hive.build_manifest(self._grid(cfg)))
+        other = HealpixGrid(parent_order=5, child_order=8, layout="fullsphere", config=cfg)
+        hive.ensure_manifest(root, hive.build_manifest(other), overwrite=True)
+        assert hive.read_manifest(root)["shard_order"] == 5
+
+    def test_read_absent_returns_none(self, tmp_path):
+        assert hive.read_manifest(str(tmp_path / "empty")) is None
+
+
+# ── leaf template + commit stamp (D3/D4) ─────────────────────────────────────
+
+
+class TestLeafTemplateAndStamp:
+    def _grid(self, cfg):
+        return HealpixGrid(parent_order=6, child_order=8, layout="fullsphere", config=cfg)
+
+    def test_leaf_template_is_shard_sized(self, cfg):
+        g = self._grid(cfg)
+        store = MemoryStore()
+        g.emit_shard_template(store, overwrite=True)
+        grp = zarr.open_group(store, path=g.group_path, mode="r", zarr_format=3)
+        for name in ("morton", "cell_ids", *get_data_vars(cfg)):
+            assert grp[name].shape == (g.cells_per_shard,)
+            assert grp[name].chunks == (g.cells_per_chunk,)
+
+    def test_leaf_has_root_group_for_the_stamp(self, cfg):
+        # D4: the stamp is one attrs update on an object that exists anyway.
+        store = MemoryStore()
+        self._grid(cfg).emit_shard_template(store, overwrite=True)
+        root = zarr.open_group(store, path="", mode="r", zarr_format=3)
+        assert hive.COMMIT_ATTR not in root.attrs  # fresh leaf is unstamped
+
+    def test_emit_is_idempotent_with_overwrite(self, cfg):
+        store = MemoryStore()
+        g = self._grid(cfg)
+        g.emit_shard_template(store, overwrite=True)
+        g.emit_shard_template(store, overwrite=True)  # retry over debris
+
+    def test_sharded_grid_rejected(self, cfg):
+        g = HealpixGrid(6, 10, layout="fullsphere", config=cfg, chunk_inner=8, sharded=True)
+        with pytest.raises(ValueError, match="sharded"):
+            g.emit_shard_template(MemoryStore())
+
+    def test_stamp_round_trip_and_debris_semantics(self, cfg):
+        store = MemoryStore()
+        self._grid(cfg).emit_shard_template(store, overwrite=True)
+        # An unstamped prefix is debris: present, but not complete.
+        assert hive.read_commit(store) is None
+        hive.stamp_commit(store, cells_with_data=5, granule_count=2)
+        stamp = hive.read_commit(store)
+        assert stamp["complete"] is True
+        assert stamp["spec"] == hive.HIVE_SPEC
+        assert stamp["cells_with_data"] == 5
+        assert stamp["granule_count"] == 2
+        assert stamp["written_at"]
+
+    def test_read_commit_absent_leaf_is_none(self):
+        # Walker termination: no leaf at all is the same answer as debris.
+        assert hive.read_commit(MemoryStore()) is None
+
+
+# ── local write path (runner) ────────────────────────────────────────────────
+
+
+def _rec(n):
+    return {"id": f"g{n}", "s3": f"s3://bucket/granule{n}.h5", "https": f"https://h/g{n}.h5"}
+
+
+class TestProcessAndWriteHive:
+    """Drive ``_process_and_write_hive`` with a fake ``process_shard`` that
+    streams REAL carriers, so the leaf template, dense write, CSR naming, and
+    stamp ordering are all exercised against real zarr stores."""
+
+    def _grid(self, cfg):
+        return HealpixGrid(parent_order=6, child_order=8, layout="fullsphere", config=cfg)
+
+    def _carrier(self, grid, shard):
+        coords = grid.chunk_coords(shard)
+        n = len(coords["cell_ids"])
+        df = pd.DataFrame(
+            {
+                var: np.zeros(n, dtype=np.int32 if var == "count" else np.float32)
+                for var in get_data_vars(grid.config)
+            }
+        )
+        for name, vals in coords.items():
+            df[name] = vals
+        return df
+
+    def _meta(self, shard, error=None):
+        return {
+            "shard_key": int(shard),
+            "cells_with_data": 5,
+            "total_obs": 7,
+            "granule_count": 1,
+            "files_processed": 1,
+            "duration_s": 0.0,
+            "error": error,
+        }
+
+    def _run(self, monkeypatch, cfg, tmp_path, fake):
+        from zagg import runner
+
+        monkeypatch.setattr(runner, "process_shard", fake)
+        grid = self._grid(cfg)
+        shard = _shard_word()
+        root = str(tmp_path / "store")
+        meta = runner._process_and_write_hive(
+            shard, [_rec(1)], grid, {}, root, cfg, store_kwargs={}, driver="s3"
+        )
+        return grid, shard, root, meta
+
+    def _streaming_fake(self, grid, ragged=None):
+        def fake(g, shard_key, urls, **kwargs):
+            carrier = self._carrier(grid, shard_key)
+            kwargs["write_chunk"](grid.block_index(int(shard_key)), carrier, ragged or {})
+            return pd.DataFrame(), self._meta(shard_key)
+
+        return fake
+
+    def test_leaf_written_and_stamped(self, monkeypatch, cfg, tmp_path):
+        grid_probe = self._grid(cfg)
+        fake = self._streaming_fake(grid_probe, ragged={"h": ([np.array([1.0, 2.0])], [0])})
+        grid, shard, root, meta = self._run(monkeypatch, cfg, tmp_path, fake)
+
+        leaf = hive.shard_leaf_path(root, shard)
+        from zagg.store import open_store
+
+        leaf_store = open_store(leaf)
+        # Dense data landed at the leaf-LOCAL block 0.
+        grp = zarr.open_group(leaf_store, path=grid.group_path, mode="r", zarr_format=3)
+        np.testing.assert_array_equal(
+            np.asarray(grp["cell_ids"][:]),
+            np.asarray(grid.chunk_coords(shard)["cell_ids"]),
+        )
+        # CSR subgroup named by the shard label (decimal morton string).
+        label = morton_decimal(shard)
+        assert morton_word(label) == shard
+        sub = zarr.open_group(leaf_store, path=f"{grid.group_path}/h/{label}", mode="r")
+        assert "values" in sub.array_keys()
+        # The commit stamp is present and carries the worker's counters (D4).
+        stamp = hive.read_commit(leaf_store)
+        assert stamp["complete"] is True
+        assert stamp["cells_with_data"] == meta["cells_with_data"]
+        assert stamp["granule_count"] == meta["granule_count"]
+
+    def test_no_data_shard_leaves_no_prefix(self, monkeypatch, cfg, tmp_path):
+        # The leaf is created lazily on the first chunk write, so a no-data
+        # shard leaves NO .zarr/ prefix (absence stays trustworthy).
+        def fake(g, shard_key, urls, **kwargs):
+            return pd.DataFrame(), self._meta(shard_key, error="No granules found")
+
+        grid, shard, root, meta = self._run(monkeypatch, cfg, tmp_path, fake)
+        leaf = hive.shard_leaf_path(root, shard)
+        assert not os.path.exists(leaf)
+
+    def test_torn_write_leaves_debris_then_retry_succeeds(self, monkeypatch, cfg, tmp_path):
+        # Torn-write simulation: the worker dies after the dense write, before
+        # the stamp. The prefix exists (debris), read_commit says incomplete,
+        # and a clean retry overwrites it wholesale and stamps.
+        from zagg import runner
+        from zagg.store import open_store
+
+        grid = self._grid(cfg)
+        shard = _shard_word()
+        root = str(tmp_path / "store")
+        leaf = hive.shard_leaf_path(root, shard)
+
+        def torn(g, shard_key, urls, **kwargs):
+            carrier = self._carrier(grid, shard_key)
+            kwargs["write_chunk"](grid.block_index(int(shard_key)), carrier, {})
+            raise RuntimeError("worker died mid-shard")
+
+        monkeypatch.setattr(runner, "process_shard", torn)
+        with pytest.raises(RuntimeError, match="died mid-shard"):
+            runner._process_and_write_hive(
+                shard, [_rec(1)], grid, {}, root, cfg, store_kwargs={}, driver="s3"
+            )
+        assert os.path.exists(leaf)  # the prefix exists...
+        assert hive.read_commit(open_store(leaf)) is None  # ...but is debris
+
+        # Retry: same leaf, overwritten wholesale, stamped at the end.
+        monkeypatch.setattr(runner, "process_shard", self._streaming_fake(grid))
+        runner._process_and_write_hive(
+            shard, [_rec(1)], grid, {}, root, cfg, store_kwargs={}, driver="s3"
+        )
+        assert hive.read_commit(open_store(leaf))["complete"] is True
+
+    def test_errored_shard_is_not_stamped(self, monkeypatch, cfg, tmp_path):
+        # A shard that wrote chunks but ended in error stays unstamped debris.
+        from zagg.store import open_store
+
+        grid_probe = self._grid(cfg)
+
+        def fake(g, shard_key, urls, **kwargs):
+            carrier = self._carrier(grid_probe, shard_key)
+            kwargs["write_chunk"](grid_probe.block_index(int(shard_key)), carrier, {})
+            return pd.DataFrame(), self._meta(shard_key, error="No data after filtering (1 ...)")
+
+        grid, shard, root, _meta = self._run(monkeypatch, cfg, tmp_path, fake)
+        leaf = hive.shard_leaf_path(root, shard)
+        assert os.path.exists(leaf)
+        assert hive.read_commit(open_store(leaf)) is None
+
+    def test_tree_walk_node_invariant(self, monkeypatch, cfg, tmp_path):
+        # Walker semantics (D5): below the root only digit dirs and *.zarr
+        # nodes; no zarr metadata above the leaf; the root additionally holds
+        # only the manifest. A LIST with no digit children is thus a
+        # definitive "nothing finer exists".
+        grid_probe = self._grid(cfg)
+        fake = self._streaming_fake(grid_probe)
+        grid, shard, root, _meta = self._run(monkeypatch, cfg, tmp_path, fake)
+        hive.ensure_manifest(root, hive.build_manifest(grid))
+
+        for dirpath, dirnames, filenames in os.walk(root):
+            if dirpath == root:
+                assert filenames == [hive.MANIFEST_NAME]
+                base = [d[1:] if d.startswith("-") else d for d in dirnames]
+                assert all(len(b) == 1 and b in "123456" for b in base)
+                continue
+            if dirpath.endswith(".zarr") or ".zarr" + os.sep in dirpath:
+                continue  # inside a leaf: vanilla zarr v3, its own business
+            # An intermediate digit node: no objects (zarr.json or otherwise),
+            # only digit children and leaf dirs.
+            assert filenames == [], f"object above the leaf at {dirpath}: {filenames}"
+            for d in dirnames:
+                assert d.endswith(".zarr") or (len(d) == 1 and d in "1234"), (
+                    f"non-hive child {d!r} at {dirpath}"
+                )
+
+
+class TestLeafBlockIndex:
+    def test_k1_maps_to_zero(self, cfg):
+        from zagg.runner import _leaf_block_index
+
+        g = HealpixGrid(6, 8, layout="fullsphere", config=cfg)
+        shard = _shard_word()
+        (block,) = [b for b, _ in g.iter_chunks(shard)]
+        assert _leaf_block_index(g, block, shard) == (0,)
+
+    def test_k_gt_1_enumerates_local_ordinals(self, cfg):
+        from zagg.runner import _leaf_block_index
+
+        g = HealpixGrid(6, 10, layout="fullsphere", config=cfg, chunk_inner=8)
+        assert g.chunks_per_shard == 16
+        shard = _shard_word()
+        locals_ = [_leaf_block_index(g, b, shard) for b, _ in g.iter_chunks(shard)]
+        assert locals_ == [(i,) for i in range(16)]
+
+
+class TestRunnerWiring:
+    """The local backend writes the manifest (no shared template) under hive,
+    and the lambda backend rejects hive with a pointed error."""
+
+    def _catalog(self, tmp_path):
+        shard = _shard_word()
+        catalog = {
+            "metadata": {"short_name": "ATL06", "version": "007"},
+            "grid_signature": {
+                "type": "healpix",
+                "indexing_scheme": "nested",
+                "parent_order": 6,
+                "child_order": 12,
+                "layout": "fullsphere",
+            },
+            "shard_keys": [shard],
+            "granules": [[_rec(1)]],
+        }
+        p = tmp_path / "catalog.json"
+        p.write_text(json.dumps(catalog))
+        return str(p), shard
+
+    def test_local_hive_writes_manifest_not_template(self, monkeypatch, cfg, tmp_path):
+        from zagg import runner
+        from zagg.runner import agg
+
+        cfg.output["store_layout"] = "hive"
+        catalog_path, shard = self._catalog(tmp_path)
+        root = str(tmp_path / "out")
+        calls = []
+
+        monkeypatch.setattr(runner, "get_nsidc_s3_credentials", lambda: {"accessKeyId": "a"})
+
+        def fake_hive_write(shard_key, records, grid, s3_creds, store_root, config, **kw):
+            calls.append((int(shard_key), store_root))
+            return {"shard_key": int(shard_key), "error": None, "total_obs": 1}
+
+        monkeypatch.setattr(runner, "_process_and_write_hive", fake_hive_write)
+        agg(cfg, catalog=catalog_path, store=root, backend="local")
+
+        assert calls == [(shard, root)]
+        # Template time wrote ONLY the manifest — no shared zarr template (D5).
+        assert sorted(os.listdir(root)) == [hive.MANIFEST_NAME]
+        assert hive.read_manifest(root)["shard_order"] == 6
+
+    def test_lambda_hive_rejected(self, cfg, tmp_path):
+        from zagg.runner import agg
+
+        cfg.output["store_layout"] = "hive"
+        catalog_path, _shard = self._catalog(tmp_path)
+        with pytest.raises(ValueError, match="hive is not wired to the lambda backend"):
+            agg(cfg, catalog=catalog_path, store="s3://b/x", backend="lambda")

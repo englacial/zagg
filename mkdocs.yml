@@ -26,6 +26,7 @@ nav:
       - "Architecture": "design/architecture.md"
       - "Schema": "design/schema.md"
       - "Sharded output": "sharding.md"
+      - "Hive store layout": "hive_layout.md"
       - "Typed morton boundary": "morton_arrow.md"
   - "Deployment":
       - "Standing Up the Backend": "deployment/standup.md"

@@ -577,9 +577,38 @@ class HealpixGrid:
             spec.to_zarr(store, self.group_path, overwrite=overwrite)
         return store
 
+    def emit_shard_template(self, store: Store, *, overwrite: bool = False) -> Store:
+        """Write ONE shard's leaf-zarr template to ``store`` (issue #199 phase 2).
+
+        The hive layout (D3 in ``docs/design/sparse_coverage.md``) gives every
+        shard its own self-describing leaf zarr: the same group structure as
+        :meth:`emit_template` but with every dense array sized to a single
+        shard (``cells_per_shard`` cells, K inner chunks) and a ROOT group so
+        the D4 commit stamp is one attrs update on an object that exists
+        anyway. Writes go at leaf-LOCAL block indices (0..K-1).
+        """
+        if self.sharded:
+            # Validated at config load too; re-checked here because a leaf is a
+            # vanilla zarr v3 store (D3) — the ShardingCodec write path assumes
+            # the single shared store.
+            raise ValueError("hive leaf templates do not support sharded output")
+        spec = GroupSpec(members={self.group_path: self.shard_spec()}, attributes={})
+        with zarr_config.set({"async.concurrency": 128}):
+            spec.to_zarr(store, "", overwrite=overwrite)
+        return store
+
     def spec(self) -> GroupSpec:
         """Return the pydantic-zarr GroupSpec for this grid's template."""
         return self._spec()
+
+    def shard_spec(self) -> GroupSpec:
+        """GroupSpec for ONE shard's hive leaf (issue #199 phase 2).
+
+        Identical member set to :meth:`spec` — same dtypes, fills, chunking —
+        with the cells axis sized to one shard and the ``resolution: chunk``
+        companions sized to the shard's K inner chunks.
+        """
+        return self._group_spec(self.cells_per_shard, (self.chunks_per_shard,))
 
     # ── internals ────────────────────────────────────────────────────────
 
@@ -588,7 +617,9 @@ class HealpixGrid:
             n_pixels = HEALPIX_BASE_CELLS * (4**self.child_order)
         else:
             n_pixels = self.n_children * self.n_shards
+        return self._group_spec(n_pixels, self.chunk_grid_shape)
 
+    def _group_spec(self, n_pixels: int, chunk_grid_shape: tuple[int, ...]) -> GroupSpec:
         base = ArraySpec(
             attributes={},
             shape=(n_pixels,),
@@ -661,7 +692,7 @@ class HealpixGrid:
                 members[name] = vector_array_spec(
                     chunk_array_spec(
                         spec,
-                        chunk_grid_shape=self.chunk_grid_shape,
+                        chunk_grid_shape=chunk_grid_shape,
                         chunk_dims=("chunks",),
                     ),
                     sig,
