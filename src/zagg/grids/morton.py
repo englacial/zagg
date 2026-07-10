@@ -115,6 +115,40 @@ def morton_word(label: str) -> int:
     return _decimal_to_word(str(label))
 
 
+def morton_box(values) -> np.ndarray:
+    """Tier-0 morton box: the minimal <= 4-member MOC covering ``values`` (issue #200).
+
+    The fixed-width tier of the coverage envelope (``docs/design/
+    sparse_coverage.md`` §4): compact the occupied cells to their canonical MOC
+    via mortie's ``compress_moc`` (mixed order allowed; an occupied ancestor
+    absorbs its descendants, complete sibling quads merge), then — unless one
+    member already covers everything — split at the deepest common ancestor
+    (``common_ancestor``, the longest common decimal-string prefix) and coarsen
+    each member to that node's child level (``clip2order``). The result is the
+    ancestor's 2-4 children that intersect the occupancy, or the lone covering
+    cell: a conservative superset — no occupied cell escapes the box.
+
+    Accepts anything :func:`morton_words` does; returns sorted packed ``uint64``
+    words. Raises ``ValueError`` on empty input (and, via mortie, on a set
+    spanning HEALPix base cells — a shard's cells are one subtree by
+    construction, so the hive path never triggers it).
+    """
+    from mortie import clip2order, common_ancestor, compress_moc
+
+    words = morton_words(values)
+    if words.size == 0:
+        raise ValueError("morton_box requires at least one occupied cell")
+    occ = compress_moc(words)
+    if occ.size == 1:
+        return occ
+    # After compression every member is strictly deeper than the ancestor (a
+    # member at the ancestor's own order would contain the rest and compress
+    # to a single cell), so coarsening lands each on one of its 2-4 children.
+    anc = morton_decimal(common_ancestor(occ))
+    anc_order = len(anc) - (2 if anc.startswith("-") else 1)
+    return np.unique(clip2order(anc_order + 1, occ))
+
+
 def morton_to_arrow(values):
     """Export ``values`` as a typed ``arro3.core.Array`` (issue #135).
 
@@ -164,6 +198,7 @@ __all__ = [
     "MORTON_EXTENSION_NAME",
     "is_morton_array",
     "is_morton_arrow",
+    "morton_box",
     "morton_decimal",
     "morton_from_arrow",
     "morton_to_arrow",
