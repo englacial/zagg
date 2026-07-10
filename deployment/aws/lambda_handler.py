@@ -441,6 +441,7 @@ def lambda_handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
 
     Default ``mode`` (or no mode) runs per-cell processing. ``mode="setup"``
     creates the zarr template; ``mode="finalize"`` consolidates metadata;
+    ``mode="coverage"`` writes the store-root ``coverage.moc`` (issue #200);
     ``mode="extract"`` extracts chunk-boundary geometry parquets (issue #148);
     ``mode="process_event"`` runs the temporal/event worker (issue #12).
     """
@@ -455,6 +456,8 @@ def lambda_handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
         return _handle_setup(event)
     if mode == "finalize":
         return _handle_finalize(event)
+    if mode == "coverage":
+        return _handle_coverage(event)
     # Extract mode returns directly: the result_url mirror below is for the
     # per-unit fan-out handlers (spatial process, temporal process_event) only.
     if mode == "extract":
@@ -671,6 +674,36 @@ def _handle_finalize(event: Dict[str, Any]) -> Dict[str, Any]:
     except Exception as e:
         logger.exception(e)
         return {"statusCode": 500, "body": json.dumps({"error": str(e), "mode": "finalize"})}
+
+
+def _handle_coverage(event: Dict[str, Any]) -> Dict[str, Any]:
+    """Write/union the store-root ``coverage.moc`` (issue #200 phase 3).
+
+    Posted fire-and-forget (``InvocationType="Event"``) by the dispatcher at
+    end of run: the orchestrator can compute the shard-order MOC but cannot
+    PUT to S3, so the SERIALIZED envelope rides in the event (bounded by
+    construction — see the dispatch-site comment in ``zagg.runner``) and the
+    worker GET-unions-PUTs one root object. Nobody reads this response on
+    the Event invoke; errors are logged and fail open — the root MOC is a
+    regenerable cache (D9): readers degrade to the sweep MOC or the walk,
+    never to wrong answers.
+    """
+    from zagg.hive import write_root_coverage
+
+    logger.info(f"Coverage mode: writing root coverage.moc at {event.get('store_path')}")
+    try:
+        merged = write_root_coverage(
+            event["store_path"], event["coverage"], **_output_store_kwargs(event)
+        )
+        return {
+            "statusCode": 200,
+            "body": json.dumps(
+                {"ok": True, "mode": "coverage", "ranges": len(merged.get("ranges", []))}
+            ),
+        }
+    except Exception as e:
+        logger.exception(e)
+        return {"statusCode": 500, "body": json.dumps({"error": str(e), "mode": "coverage"})}
 
 
 def _json_scalar(v: Any) -> Any:

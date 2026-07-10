@@ -150,9 +150,15 @@ be added later by the sweep as a derived artifact). Readers:
    `[1-4]/` children; a `*.zarr` entry is data at that node; no digit children
    ⇒ nothing finer. Never LIST per observation in a join loop (D10).
 
-The store-root `coverage.moc` domain declaration (§4 of the design record) is
-phase 3 of [issue #200](https://github.com/englacial/zagg/issues/200) and will
-remove the walk from the discovery path too.
+The store-root `coverage.moc` ([issue #200](https://github.com/englacial/zagg/issues/200)
+phase 3, default-on for hive) removes the walk from the bootstrap path: one
+GET of the root object yields the shard-order coverage MOC (JSON ranges,
+decimal-string endpoints). It is written fail-open at end of run — by the
+dispatcher directly (local) or one fire-and-forget `mode: "coverage"` worker
+invoke (Lambda; an older deployment ignores the mode, which is safe: the
+object is a regenerable cache under D9, and readers degrade to the walk).
+Incremental runs union with the existing object; the §7 sweep remains the
+authoritative rebuilder.
 
 ## Status
 
@@ -164,9 +170,10 @@ remove the walk from the discovery path too.
   the event config's orders, emits its own leaf template, and stamps
   completion as its final PUT. The async status channel stays at the flat
   sibling prefix (`{store_root}.status/<run_id>/…`), outside the digit tree.
-- **Per-shard coverage ships** ([issue #200](https://github.com/englacial/zagg/issues/200)
-  phases 1–2): the tier-0 morton box on the commit stamp and the exact
-  zstd-bitmap `coverage.moc` sidecar inside each leaf. The store-level root
-  `coverage.moc` (the one-GET bootstrap) is phase 3.
+- **Coverage ships** ([issue #200](https://github.com/englacial/zagg/issues/200)
+  phases 1–3): the tier-0 morton box on the commit stamp, the exact
+  zstd-bitmap `coverage.moc` sidecar inside each leaf, and the end-of-run
+  store-root `coverage.moc` (shard-order ranges MOC, `output.coverage_moc`,
+  default on for hive) for the one-GET bootstrap.
 - Write-throughput validation at fleet scale is tracked with the benchmark
   machinery in [issue #202](https://github.com/englacial/zagg/issues/202).

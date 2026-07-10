@@ -345,6 +345,28 @@ def validate_config(config: PipelineConfig) -> None:
                 "consolidate (D5/D12) — drop output.consolidate_metadata"
             )
 
+    # End-of-run root coverage MOC (issue #200 phase 3), boolean when present.
+    # Default ON for the hive layout (O9: coverage is the default on healpix
+    # templates); it writes {store}/coverage.moc, a hive-root object, so an
+    # EXPLICIT true on a non-healpix grid or a flat-layout store is a config
+    # mistake, not a no-op — reject it pointedly. Absent simply means off
+    # there (get_coverage_moc resolves the default).
+    coverage_moc = config.output.get("coverage_moc")
+    if coverage_moc is not None and not isinstance(coverage_moc, bool):
+        raise ValueError(f"output.coverage_moc must be a boolean (got {coverage_moc!r})")
+    if coverage_moc:
+        if (grid or {}).get("type", "healpix") != "healpix":
+            raise ValueError(
+                "output.coverage_moc requires a healpix grid (the root coverage.moc "
+                "is a morton MOC; drop the flag for rectilinear output)"
+            )
+        if store_layout != "hive":
+            raise ValueError(
+                "output.coverage_moc requires output.store_layout: hive (the root "
+                "coverage.moc lives at the hive store root; flat stores have no "
+                "hive root to bootstrap from)"
+            )
+
     # Validate bounds structure (optional)
     if config.bounds is not None:
         allowed_keys = {"temporal", "spatial"}
@@ -1552,6 +1574,22 @@ def get_store_layout(config: PipelineConfig) -> str:
         ``"flat"`` (default) or ``"hive"``.
     """
     return config.output.get("store_layout") or "flat"
+
+
+def get_coverage_moc(config: PipelineConfig) -> bool:
+    """Whether the end-of-run root ``coverage.moc`` write is on (issue #200).
+
+    Default ON for hive-layout stores (O9/espg: coverage MOCs are the default
+    for healpix templates — and hive is healpix-only by validation);
+    ``output.coverage_moc: false`` opts out. Flat-layout / non-healpix
+    configs default off, and an explicit ``true`` there is rejected by
+    ``validate_config``. A present-but-null key falls back to the default,
+    like ``store_layout``.
+    """
+    flag = config.output.get("coverage_moc")
+    if flag is None:
+        return get_store_layout(config) == "hive"
+    return bool(flag)
 
 
 def get_aoi_mask(config: PipelineConfig) -> bool:

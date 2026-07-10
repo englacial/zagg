@@ -572,8 +572,10 @@ class TestRunnerWiring:
         agg(cfg, catalog=catalog_path, store=root, backend="local")
 
         assert calls == [(shard, root)]
-        # Template time wrote ONLY the manifest — no shared zarr template (D5).
-        assert sorted(os.listdir(root)) == [hive.MANIFEST_NAME]
+        # Template time wrote ONLY the manifest — no shared zarr template
+        # (D5). The end-of-run root coverage.moc (issue #200 phase 3,
+        # default-on for hive) is the only other root object.
+        assert sorted(os.listdir(root)) == [hive.ROOT_COVERAGE_NAME, hive.MANIFEST_NAME]
         assert hive.read_manifest(root)["shard_order"] == 6
 
     def test_lambda_hive_dispatches_with_manifest_dataset(self, monkeypatch, cfg, tmp_path):
