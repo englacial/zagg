@@ -29,11 +29,11 @@ set of primitives answers all of them:
    layout materializes a coordinate entry for every cell of the global grid.
    For sparse-coverage data (a continent, a flight campaign) this is waste at
    best and intractable at global orders. The fix is a **domain declaration**:
-   a store-level MOC saying "data exists on exactly these cells," letting the
+   a coverage MOC conservatively declaring where data exists, letting the
    xarray extension keep coordinates sparse and fabricate dense views lazily.
 
 The stack, bottom to top: hive store layout (§2) → static manifest (§3) →
-store MOC (§4) → reader architecture (§5) → xarray/xdggs extension (§6), with
+coverage MOCs (§4) → reader architecture (§5) → xarray/xdggs extension (§6), with
 the pyramid sweep (§7) as the post-process phase that generates all derived
 artifacts.
 
@@ -47,7 +47,7 @@ what zagg consumes:
 ```
 {store_root}/
   morton_hive.json               <- static manifest (§3); root-only exception
-  coverage.moc                   <- store MOC (§4); root-only exception
+  coverage.moc                   <- optional root MOC (§4, O9); root-only exception
   {sign+base}/{d1}/{d2}/.../     <- one digit per level (D2)
     {full_id}.zarr/              <- self-describing leaf (D3), vanilla zarr v3
 ```
@@ -121,10 +121,10 @@ the data itself). Tracks [#200](https://github.com/englacial/zagg/issues/200).
   shard's coverage is within one base cell *by construction* (a shard is a
   single subtree; its id alone is the trivial 1-member cover, so the box is
   what buys sub-shard resolution). Padded to exactly 4 slots for fixed width
-  (32 B raw; four decimal strings in attrs); pad slots are null (base-0
-  words / JSON `null` — repetition-padding is the viable alternative, since
-  repeats are idempotent under MOC algebra; sentinel choice is frozen with
-  the mortie-side spec, O8). Future *store-level* covers that cross base
+  (32 B raw; four decimal strings in attrs); pad-sentinel *lean* is null
+  (base-0 words / JSON `null`), with repetition-padding the viable
+  alternative since repeats are idempotent under MOC algebra — the choice
+  is frozen with the mortie-side spec (O8). Future *store-level* covers that cross base
   cells generalize to **≤ 12 members** (the 12 base cells). Readers
   AOI-reject on the box without parsing anything larger.
 - **Tier 1 — the budgeted shard MOC**: cell-level coverage, exact if it fits
@@ -137,7 +137,9 @@ the data itself). Tracks [#200](https://github.com/englacial/zagg/issues/200).
   The budget also picks the carrier: a KB-scale payload rides the commit
   stamp attrs (zero extra objects); a hundreds-of-KB tier becomes its own
   object inside the leaf, with only the box + achieved depth + pointer in
-  attrs (one extra GET, paid only by readers that want it).
+  attrs (one extra GET, paid only by readers that want it). If the in-leaf
+  object survives O8, it is a *noted exception* to §2's "vanilla zarr v3"
+  leaf: one foreign key inside the leaf, invisible to zarr readers.
 - **Tier 2 — exact**: the `morton` coordinate array in the leaf *is* the
   exact cell list. The MOC tiers are indexes, never truth (D9 discipline,
   applied one level down).
@@ -298,7 +300,8 @@ write path (§2) is load-bearing; this phase is optimization.
 - **O1 — MOC serialization format** for `coverage.moc`: JSON of nested-range
   pairs? Packed-word `.npy`? Needs to be frozen alongside the mortie spec
   (FITS/IVOA interop is an explicit non-goal per mortie #50).
-- **O2 — MOC depth ceiling: resolved (mortie 0.9.0).** The cap was a stale
+- **O2 — MOC depth ceiling: resolved (mortie 0.9.0)** *(entry kept here
+  for O# id stability)*. The cap was a stale
   `MAX_DEPTH = 18` constant, not a u64 limit; the coverage/MOC paths now
   reach the packed-u64 kernel ceiling (order 29), so cell-order MOCs at
   order 19 are representable today.
@@ -323,13 +326,14 @@ write path (§2) is load-bearing; this phase is optimization.
 - **O8 — shard-MOC budget, serialization, carrier, pad sentinel**: byte
   scale matched to S3/cloud conventions (candidates KB → low MB); ranges
   vs. bitmap serialization; commit-stamp attrs payload vs. in-leaf object
-  carrier; box pad sentinel (base-0/null vs. repetition). Decided against
+  carrier; box pad sentinel (base-0/null vs. repetition). Decided using
   the #202 item (6) measurement (SERC + 88S shards; the tier-0 box is the
   baseline each budget must beat; over-coverage reported in STAC
   simplification-error terms). Frozen alongside the mortie spec.
 - **O9 — end-of-run root MOC default**: on (the fire-and-forget Event
   invoke is fail-open and run-size independent) vs. off until #202's
-  full-AOI runs record the invoke round trip. Either is a one-line flag.
+  full-AOI runs record the invoke round trip. Either is a one-line flag;
+  espg leaning cautious pending the benchmark-impact numbers.
 
 ## 9. References
 
@@ -349,7 +353,8 @@ plane):
   metadata, exact WKB in data; the direct analog of the tier-0 morton box):
   <https://github.com/opengeospatial/geoparquet>
 - PostgreSQL TOAST — the ~2 KB inline threshold (portability footnote for
-  the tier-1 budget): <https://www.postgresql.org/docs/current/storage-toast.html>
+  the tier-1 budget):
+  <https://www.postgresql.org/docs/current/storage-toast.html>
 - IVOA MOC recommendation — degraded-order MOC practice; NUNIQ int64
   order-29 ceiling: <https://www.ivoa.net/documents/MOC/>
 - H3 `compactCells` — mixed-resolution minimal covers:
