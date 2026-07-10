@@ -105,11 +105,28 @@ class TestSelectCells:
 
     def test_all_cells(self):
         pairs = _select_cells(self._data(3))
-        assert [k for k, _ in pairs] == [0, 1, 2]
+        assert sorted(k for k, _ in pairs) == [0, 1, 2]
 
     def test_max_cells(self):
         pairs = _select_cells(self._data(3), max_cells=2)
-        assert [k for k, _ in pairs] == [0, 1]
+        assert sorted(k for k, _ in pairs) == [0, 1]
+
+    def test_shuffle_is_deterministic(self):
+        # Seeded from the selected shard keys (issue #197): same catalog and
+        # selection -> same order on a rerun/resume.
+        assert _select_cells(self._data(50)) == _select_cells(self._data(50))
+
+    def test_shuffle_permutes_selection(self):
+        # Fan-out order is a permutation of the selection, not morton order.
+        pairs = _select_cells(self._data(50))
+        keys = [k for k, _ in pairs]
+        assert sorted(keys) == list(range(50))
+        assert keys != list(range(50))
+
+    def test_shuffle_after_max_cells_truncation(self):
+        # max_cells keeps its morton-first-N semantics: truncate, then shuffle.
+        pairs = _select_cells(self._data(50), max_cells=10)
+        assert sorted(k for k, _ in pairs) == list(range(10))
 
     def test_morton_cell(self):
         pairs = _select_cells(self._data(3), morton_cell="1")

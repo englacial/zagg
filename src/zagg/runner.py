@@ -14,6 +14,7 @@ Usage from Python (e.g., Jupyter notebook)::
 import json
 import logging
 import os
+import random
 import statistics
 import time
 import uuid
@@ -912,7 +913,8 @@ def _select_cells(
 
     Returns
     -------
-    list of (shard_key, granule_urls) tuples.
+    list of (shard_key, granule_urls) tuples, in a deterministic shuffled
+    order (seeded from the selected shard keys, so reruns see the same order).
     """
     pairs = list(zip(catalog_data["shard_keys"], catalog_data["granules"]))
     if morton_cell:
@@ -922,7 +924,12 @@ def _select_cells(
             raise ValueError(f"shard '{morton_cell}' not in catalog")
         return matches
     if max_cells:
-        return pairs[:max_cells]
+        pairs = pairs[:max_cells]
+    # Shuffle after selection/truncation (max_cells keeps its morton-first-N
+    # subset) so concurrent fan-out doesn't write morton-contiguous -- i.e.
+    # byte-prefix-sharing -- S3 keys to one partition (issue #197). Seeded from
+    # the selected shard keys, so a rerun or resume sees the same order.
+    random.Random(",".join(str(k) for k, _ in pairs)).shuffle(pairs)
     return pairs
 
 
