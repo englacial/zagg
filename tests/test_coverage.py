@@ -1,11 +1,11 @@
 """Tier-0 coverage: the morton box on the hive commit stamp — issue #200 phase 1.
 
 Design contract: ``docs/design/sparse_coverage.md`` §4 (tiered coverage, as
-amended on PR #206). The box is the minimal <= 4-member MOC over a shard's
-occupied cells, serialized as decimal strings padded to exactly four JSON-null-
-sentinel slots, riding the D4 commit stamp — zero extra store operations,
-debris semantics inherited. Flat-layout stores are untouched (coverage is a
-hive-leaf concept).
+amended on PR #206). The box is the canonical <= 4-member cover of a shard's
+occupied cells (DCA children, each tightened — PR #208 finding 1), serialized
+as decimal strings padded to exactly four JSON-null-sentinel slots, riding the
+D4 commit stamp — zero extra store operations, debris semantics inherited.
+Flat-layout stores are untouched (coverage is a hive-leaf concept).
 """
 
 import importlib.util
@@ -27,6 +27,10 @@ from zagg.grids.morton import morton_box, morton_decimal, morton_word
 
 # Order-6 southern shard used across the hive tests (decimal form -5112333).
 SHARD = "-5112333"
+# Its northern (positive-base) mirror: the ancestor-order arithmetic and the
+# subtree prefix guard are string-form-dependent (no leading "-"), so the box
+# matrix runs on both hemispheres (PR #208 finding 2).
+NORTH = SHARD[1:]
 
 
 def _words(*decimals):
@@ -38,18 +42,22 @@ def _decimals(words):
 
 
 def _brute_force_box(decimals):
-    """Spec-literal oracle (issue #200 plan): the deepest common ancestor is
-    the longest common decimal-string prefix (D1: one digit per level); the
-    box is its children intersecting the occupied AREA — where an occupied
-    cell EQUAL to the ancestor occupies all of it. Pure string arithmetic,
-    independent of mortie's MOC kernels."""
+    """Spec-literal oracle (issue #200 plan + PR #208 finding 1): the deepest
+    common ancestor is the longest common decimal-string prefix (D1: one digit
+    per level); the box is its intersecting children, each TIGHTENED to the
+    common prefix of the occupancy inside it — where an occupied cell EQUAL to
+    the ancestor occupies all of it. Pure string arithmetic, independent of
+    mortie's MOC kernels."""
     unique = sorted(set(decimals))
     if len(unique) == 1:
         return unique
     prefix = os.path.commonprefix(unique)
     if prefix in unique:
         return [prefix]
-    return sorted({s[: len(prefix) + 1] for s in unique})
+    groups: dict = {}
+    for s in unique:
+        groups.setdefault(s[: len(prefix) + 1], []).append(s)
+    return sorted(os.path.commonprefix(g) for g in groups.values())
 
 
 def _canonical(words):
@@ -61,75 +69,87 @@ def _canonical(words):
     return compress_moc(np.asarray(words, dtype=np.uint64))
 
 
+def _random_occupancy(rng, shard, max_cells=24, max_depth=4):
+    """Random occupied cells at mixed depths within the ``shard`` subtree."""
+    n = int(rng.integers(1, max_cells))
+    return [
+        shard + "".join(rng.choice(list("1234"), size=int(rng.integers(1, max_depth + 1))))
+        for _ in range(n)
+    ]
+
+
 # ── the box function ─────────────────────────────────────────────────────────
 
 
+@pytest.fixture(params=[SHARD, NORTH], ids=["south", "north"])
+def shard(request):
+    return request.param
+
+
 class TestMortonBox:
-    def test_single_cell_is_the_box(self):
-        assert _decimals(morton_box(_words(SHARD + "1"))) == [SHARD + "1"]
+    def test_single_cell_is_the_box(self, shard):
+        assert _decimals(morton_box(_words(shard + "1"))) == [shard + "1"]
 
-    def test_duplicates_collapse(self):
-        assert _decimals(morton_box(_words(SHARD + "12", SHARD + "12"))) == [SHARD + "12"]
+    def test_duplicates_collapse(self, shard):
+        assert _decimals(morton_box(_words(shard + "12", shard + "12"))) == [shard + "12"]
 
-    def test_two_cells_in_different_children(self):
-        # DCA is the shard; the box is its two intersecting children.
-        box = morton_box(_words(SHARD + "12", SHARD + "43"))
-        assert _decimals(box) == [SHARD + "1", SHARD + "4"]
+    def test_two_cells_in_different_children(self, shard):
+        # DCA is the shard; each intersecting child is tightened to the lone
+        # occupied cell inside it (PR #208 finding 1).
+        box = morton_box(_words(shard + "12", shard + "43"))
+        assert _decimals(box) == [shard + "12", shard + "43"]
 
-    def test_cells_spanning_all_four_children(self):
-        box = morton_box(_words(*(SHARD + d + "1" for d in "1234")))
-        assert _decimals(box) == [SHARD + d for d in "1234"]
+    def test_members_tightened_within_children(self, shard):
+        # The review counterexample: {S+111, S+112, S+2} must yield
+        # [S+11, S+2] — not the looser DCA-child form [S+1, S+2].
+        box = morton_box(_words(shard + "111", shard + "112", shard + "2"))
+        assert _decimals(box) == [shard + "11", shard + "2"]
 
-    def test_mixed_depth_ancestor_absorbs_descendants(self):
+    def test_cells_spanning_all_four_children(self, shard):
+        box = morton_box(_words(*(shard + d + "1" for d in "1234")))
+        assert _decimals(box) == [shard + d + "1" for d in "1234"]
+
+    def test_mixed_depth_ancestor_absorbs_descendants(self, shard):
         # An occupied ancestor covers its whole subtree: {parent, child} is
         # the parent alone. (A naive "children of the DCA holding an occupied
         # cell" would keep only the child and DROP the parent's remaining
         # area — the superset test below is what pins this.)
-        box = morton_box(_words(SHARD + "1", SHARD + "14"))
-        assert _decimals(box) == [SHARD + "1"]
+        box = morton_box(_words(shard + "1", shard + "14"))
+        assert _decimals(box) == [shard + "1"]
 
-    def test_mixed_depth_split(self):
-        box = morton_box(_words(SHARD + "11", SHARD + "422"))
-        assert _decimals(box) == [SHARD + "1", SHARD + "4"]
+    def test_mixed_depth_split(self, shard):
+        box = morton_box(_words(shard + "11", shard + "422"))
+        assert _decimals(box) == [shard + "11", shard + "422"]
 
-    def test_complete_quad_collapses_to_parent(self):
+    def test_complete_quad_collapses_to_parent(self, shard):
         # Four complete siblings tile their parent exactly; the canonical box
         # is the parent — one member, area-identical to the four children.
-        box = morton_box(_words(*(SHARD + "1" + d for d in "1234")))
-        assert _decimals(box) == [SHARD + "1"]
+        box = morton_box(_words(*(shard + "1" + d for d in "1234")))
+        assert _decimals(box) == [shard + "1"]
 
     def test_empty_raises(self):
         with pytest.raises(ValueError, match="at least one"):
             morton_box(np.asarray([], dtype=np.uint64))
 
     @pytest.mark.parametrize("seed", range(8))
-    def test_matches_brute_force_on_random_occupancy(self, seed):
-        # Area-equal to the spec-literal oracle, never more than 4 members.
-        decs = _random_occupancy(np.random.default_rng(seed))
+    def test_matches_brute_force_on_random_occupancy(self, shard, seed):
+        # Area-equal to the spec-literal tightened oracle, never > 4 members.
+        decs = _random_occupancy(np.random.default_rng(seed), shard)
         box = morton_box(_words(*decs))
         assert 1 <= box.size <= hive.COVERAGE_BOX_SLOTS
         np.testing.assert_array_equal(_canonical(box), _canonical(_words(*_brute_force_box(decs))))
 
     @pytest.mark.parametrize("seed", range(8))
-    def test_superset_invariant_randomized(self, seed):
+    def test_superset_invariant_randomized(self, shard, seed):
         # Every occupied cell has a box member as ancestor (decimal prefix):
         # false positives cost a wasted read, false negatives are impossible.
-        decs = _random_occupancy(np.random.default_rng(seed))
+        decs = _random_occupancy(np.random.default_rng(seed), shard)
         box = _decimals(morton_box(_words(*decs)))
         for d in decs:
             assert any(d.startswith(b) for b in box), (d, box)
         # And the box never escapes the shard subtree (the shard id is always
         # a valid trivial ancestor).
-        assert all(b.startswith(SHARD) for b in box)
-
-
-def _random_occupancy(rng, max_cells=24, max_depth=4):
-    """Random occupied cells at mixed depths within the SHARD subtree."""
-    n = int(rng.integers(1, max_cells))
-    return [
-        SHARD + "".join(rng.choice(list("1234"), size=int(rng.integers(1, max_depth + 1))))
-        for _ in range(n)
-    ]
+        assert all(b.startswith(shard) for b in box)
 
 
 # ── the stamp payload ────────────────────────────────────────────────────────
@@ -156,8 +176,9 @@ class TestBuildCoverage:
         cov = self._cov(SHARD + "12", SHARD + "43", cell_order=8)
         assert cov == {
             "spec": "morton-moc/1",
-            "box": [SHARD + "1", SHARD + "4", None, None],
+            "box": [SHARD + "12", SHARD + "43", None, None],
             "cell_order": 8,
+            "source": "worker",
         }
         # JSON-safe as-is: the null sentinel is the recorded pad lean.
         assert json.loads(json.dumps(cov)) == cov
@@ -180,6 +201,14 @@ class TestBuildCoverage:
         with pytest.raises(ValueError, match="subtree"):
             self._cov(SHARD[:-1] + "41")  # sibling shard's cell
 
+    def test_northern_shard_subtree_check(self):
+        # The prefix guard has no sign character on positive bases (PR #208
+        # finding 2): both the accept and the reject arms run northern.
+        cov = hive.build_coverage(morton_word(NORTH), _words(NORTH + "12"), 8)
+        assert cov["box"] == [NORTH + "12", None, None, None]
+        with pytest.raises(ValueError, match="subtree"):
+            hive.build_coverage(morton_word(NORTH), _words(NORTH[:-1] + "41"), 8)
+
 
 class TestStampCoverage:
     def _stamped_store(self, coverage):
@@ -200,11 +229,32 @@ class TestStampCoverage:
         assert "written_at" not in cov and "generated_at" not in cov
         assert stamp["written_at"]
 
+    def test_stamp_payload_byte_cost(self):
+        # The byte-cost pin promised in the plan (issue #200) and PR #208
+        # finding 3: the tier-0 payload is fixed-width by construction — keep
+        # it (and future envelope creep) bounded on the leaf zarr.json every
+        # reader GETs.
+        cov = hive.build_coverage(morton_word(SHARD), _words(*(SHARD + d + "1" for d in "1234")), 8)
+        assert len(json.dumps(cov)) < 256
+
     def test_pre_coverage_stamp_reads_none(self):
         # Forward compat: an issue-#199 stamp (no coverage key) keeps reading
         # fine — commit still visible, coverage reads None.
         store = self._stamped_store(None)
         assert hive.read_commit(store)["complete"] is True
+        assert hive.read_coverage(store) is None
+
+    def test_unknown_spec_reads_none(self):
+        # Strict spec posture (PR #208 finding 4): an unknown/future envelope
+        # version reads as absent, never half-parsed. The raw stamp keeps the
+        # payload for whoever understands it.
+        cov = {"spec": "morton-moc/2", "box": [SHARD, None, None, None], "cell_order": 8}
+        store = self._stamped_store(cov)
+        assert hive.read_coverage(store) is None
+        assert hive.read_commit(store)["coverage"] == cov
+
+    def test_missing_spec_reads_none(self):
+        store = self._stamped_store({"box": [SHARD, None, None, None]})
         assert hive.read_coverage(store) is None
 
     def test_debris_and_absent_leaves_read_none(self):
@@ -329,8 +379,9 @@ class TestProcessAndWriteHiveCoverage:
         cov = hive.read_coverage(leaf_store)
         assert cov == {
             "spec": hive.COVERAGE_SPEC,
-            "box": [SHARD + "1", SHARD + "4", None, None],
+            "box": [SHARD + "12", SHARD + "43", None, None],
             "cell_order": int(grid.child_order),
+            "source": "worker",
         }
         # Same stamp object, no companion coverage object anywhere in the leaf
         # (the tier-0 payload rides the existing final attrs PUT).
@@ -417,4 +468,4 @@ class TestBothBackendsIdenticalPayload:
         lambda_cov = hive.read_coverage(open_store(hive.shard_leaf_path(lambda_root, self._WORD)))
         assert local_cov is not None
         assert local_cov == lambda_cov
-        assert local_cov["box"] == [shard_dec + "1", shard_dec + "4", None, None]
+        assert local_cov["box"] == [shard_dec + "12", shard_dec + "43", None, None]

@@ -27,7 +27,7 @@ leaf zarr** under a morton digit tree::
   consolidated metadata: one small PUT on an object that must exist anyway.
 
 - **Coverage tier 0 (§4, issue #200)**: the stamp carries a ``coverage``
-  payload — the shard's morton box, the minimal <= 4-member MOC over its
+  payload — the shard's morton box, the canonical <= 4-member cover of its
   occupied cells (:func:`zagg.grids.morton.morton_box`), padded to exactly
   four decimal-string slots with JSON-null sentinels. Zero extra requests
   (it rides the stamp PUT) and debris semantics are inherited: a torn
@@ -204,16 +204,21 @@ def build_coverage(shard_key, occupied, cell_order: int) -> dict:
     """Tier-0 coverage payload for one shard's commit stamp (§4, issue #200).
 
     ``occupied`` is the shard's occupied cell words (mixed order allowed —
-    the cells ``cells_with_data`` counts); the box is their minimal
-    <= 4-member MOC (:func:`zagg.grids.morton.morton_box`). ``None``/empty
+    the cells ``cells_with_data`` counts); the box is their canonical
+    <= 4-member cover (:func:`zagg.grids.morton.morton_box`). ``None``/empty
     falls back to the trivial 1-member cover, the shard id itself — always a
     valid ancestor of its own coverage. Members are serialized as decimal
     morton strings (D1), padded to exactly :data:`COVERAGE_BOX_SLOTS` slots
     with trailing ``None`` (JSON null) sentinels — the recorded pad lean.
-    ``cell_order`` records the order occupancy was measured at. No timestamp
-    of its own: the payload rides the commit stamp, whose ``written_at``
-    covers it. Raises ``ValueError`` if the box escapes the shard's subtree
-    (occupied cells from another shard are an upstream bug, never stamped).
+    ``cell_order`` records the order occupancy was measured at; ``source``
+    the producer (``"worker"`` at the leaf tier — phase-3 root and
+    sweep-composed payloads record theirs). ``generated_at`` is DELIBERATELY
+    omitted at the leaf (review finding, PR #208): the payload rides the
+    commit stamp, whose ``written_at`` is the one clock and one writer;
+    root/ancestor carriers add their own timestamp fields under this same
+    spec (per-carrier-optional). Raises ``ValueError`` if the box escapes
+    the shard's subtree (occupied cells from another shard are an upstream
+    bug, never stamped).
     """
     from zagg.grids.morton import morton_box, morton_decimal
 
@@ -232,6 +237,7 @@ def build_coverage(shard_key, occupied, cell_order: int) -> dict:
         "spec": COVERAGE_SPEC,
         "box": labels + [None] * (COVERAGE_BOX_SLOTS - len(labels)),
         "cell_order": int(cell_order),
+        "source": "worker",
     }
 
 
@@ -281,7 +287,11 @@ def read_coverage(leaf_store) -> dict | None:
 
     Rides :func:`read_commit`: debris and absent leaves read ``None``, and so
     does a committed pre-coverage stamp (issue #199 stores carry no
-    ``coverage`` key) — older stores keep reading fine. Box members are
+    ``coverage`` key) — older stores keep reading fine. STRICT on the spec
+    (review finding, PR #208): only ``spec == "morton-moc/1"`` payloads are
+    returned; a malformed dict or an unknown/future spec reads as absent
+    rather than half-parsed, so a new envelope version must be adopted here
+    deliberately instead of leaking through to box consumers. Box members are
     decimal morton strings; parse one back with
     :func:`zagg.grids.morton.morton_word`.
     """
@@ -289,7 +299,9 @@ def read_coverage(leaf_store) -> dict | None:
     if stamp is None:
         return None
     coverage = stamp.get("coverage")
-    return dict(coverage) if isinstance(coverage, dict) else None
+    if not isinstance(coverage, dict) or coverage.get("spec") != COVERAGE_SPEC:
+        return None
+    return dict(coverage)
 
 
 def leaf_block_index(grid, block_index, shard_key) -> tuple:

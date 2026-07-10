@@ -116,17 +116,21 @@ def morton_word(label: str) -> int:
 
 
 def morton_box(values) -> np.ndarray:
-    """Tier-0 morton box: the minimal <= 4-member MOC covering ``values`` (issue #200).
+    """Tier-0 morton box: canonical <= 4-member MOC covering ``values`` (issue #200).
 
     The fixed-width tier of the coverage envelope (``docs/design/
     sparse_coverage.md`` §4): compact the occupied cells to their canonical MOC
     via mortie's ``compress_moc`` (mixed order allowed; an occupied ancestor
     absorbs its descendants, complete sibling quads merge), then — unless one
     member already covers everything — split at the deepest common ancestor
-    (``common_ancestor``, the longest common decimal-string prefix) and coarsen
-    each member to that node's child level (``clip2order``). The result is the
-    ancestor's 2-4 children that intersect the occupancy, or the lone covering
-    cell: a conservative superset — no occupied cell escapes the box.
+    (``common_ancestor``, the longest common decimal-string prefix) and
+    **tighten** each of its 2-4 intersecting children to the common ancestor of
+    the occupancy inside it (review finding, PR #208). The result is
+    deterministic/canonical and a conservative superset of the input — no
+    occupied cell escapes the box — but NOT always the globally minimal
+    <= 4-member MOC (optimizing member areas under a 4-member cap is a harder
+    search); this "DCA children, each tightened" construction is the definition
+    that freezes with the mortie-side tier-0 spec.
 
     Accepts anything :func:`morton_words` does; returns sorted packed ``uint64``
     words. Raises ``ValueError`` on empty input (and, via mortie, on a set
@@ -143,10 +147,14 @@ def morton_box(values) -> np.ndarray:
         return occ
     # After compression every member is strictly deeper than the ancestor (a
     # member at the ancestor's own order would contain the rest and compress
-    # to a single cell), so coarsening lands each on one of its 2-4 children.
+    # to a single cell), so coarsening lands each on one of its 2-4 children;
+    # the per-child common_ancestor then drops each member to the deepest
+    # cell covering that child's share of the occupancy.
     anc = morton_decimal(common_ancestor(occ))
     anc_order = len(anc) - (2 if anc.startswith("-") else 1)
-    return np.unique(clip2order(anc_order + 1, occ))
+    children = clip2order(anc_order + 1, occ)
+    box = [common_ancestor(occ[children == child]) for child in np.unique(children)]
+    return np.sort(np.asarray(box, dtype=np.uint64))
 
 
 def morton_to_arrow(values):
