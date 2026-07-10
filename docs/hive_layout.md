@@ -155,10 +155,13 @@ phase 3, default-on for hive) removes the walk from the bootstrap path: one
 GET of the root object yields the shard-order coverage MOC (JSON ranges,
 decimal-string endpoints). It is written fail-open at end of run — by the
 dispatcher directly (local) or one fire-and-forget `mode: "coverage"` worker
-invoke (Lambda; an older deployment ignores the mode, which is safe: the
-object is a regenerable cache under D9, and readers degrade to the walk).
-Incremental runs union with the existing object; the §7 sweep remains the
-authoritative rebuilder.
+invoke (Lambda; an older deployment has no coverage mode and 400s the event
+in its process handler — logged, no writes, no async retry — which is safe:
+the object is a regenerable cache under D9, and readers degrade to the walk).
+Incremental runs union with the existing object; concurrent runs race
+benignly (GET-union-PUT is not atomic: last writer wins, and its union may
+miss the loser's shards until the sweep or the next run re-unions — accepted
+under D9/O7). The §7 sweep remains the authoritative rebuilder.
 
 ## Status
 
