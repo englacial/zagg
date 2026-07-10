@@ -1,0 +1,58 @@
+{
+  "description": "Full-AOI NEON benchmark targets (issue #202 legs 1+5). Unlike targets.json (ONE pinned densest shard/target), each target here dispatches ALL shards over the AOP_NEON.geojson box, so the recorded numbers are the true full-AOI cost, not a single-cell probe. Reset-series axes per issue #202: index_backend (inline vs sidecar) x aoi_mask (on vs off), o9 shards only, tdigest/sharded/granule_workers=4 fixed. Recorded PER RELEASE (not per merge). run_full_aoi_benchmark.py builds the shardmap over the AOI+temporal+cmr below from the local full catalog, then dispatches every shard. NOT consumed by run_benchmark.py or the single-shard drift test; a NEW harness owns it (leg 4a).",
+  "aoi": {
+    "file": "AOP_NEON.geojson",
+    "name": "NEON SERC AOP box"
+  },
+  "temporal": {
+    "start": "2018-10-13",
+    "end": "2026-03-15"
+  },
+  "cmr": {
+    "short_name": "ATL03",
+    "version": "007",
+    "provider": "NSIDC_CPRD",
+    "backend": "mortie",
+    "footprint": "swath"
+  },
+  "dispatch": {
+    "region": "us-west-2",
+    "function_name": "process-shard",
+    "expect_account": "742127912612",
+    "note": "process-shard on the 742127912612 deployment account; dispatch with AWS profile 'nasa'. The harness asserts the caller account matches expect_account before any billed invoke."
+  },
+  "targets": {
+    "full_aoi_neon_o9_inline_nomask": {
+      "config": "configs/atl03_tdigest_healpix_o9.yaml",
+      "aggregator": "tdigest",
+      "grid_type": "healpix",
+      "grid_size": "o9",
+      "index_backend": "inline",
+      "aoi_mask": false
+    },
+    "full_aoi_neon_o9_inline_mask": {
+      "config": "configs/atl03_tdigest_healpix_o9.yaml",
+      "aggregator": "tdigest",
+      "grid_type": "healpix",
+      "grid_size": "o9",
+      "index_backend": "inline",
+      "aoi_mask": true
+    },
+    "full_aoi_neon_o9_sidecar_nomask": {
+      "config": "configs/atl03_tdigest_healpix_o9.yaml",
+      "aggregator": "tdigest",
+      "grid_type": "healpix",
+      "grid_size": "o9",
+      "index_backend": "sidecar",
+      "aoi_mask": false
+    },
+    "full_aoi_neon_o9_sidecar_mask": {
+      "config": "configs/atl03_tdigest_healpix_o9.yaml",
+      "aggregator": "tdigest",
+      "grid_type": "healpix",
+      "grid_size": "o9",
+      "index_backend": "sidecar",
+      "aoi_mask": true
+    }
+  }
+}
