@@ -1,0 +1,56 @@
+{
+  "fixture": "neon",
+  "n_granules": 61,
+  "parent_order": 8,
+  "child_order": 19,
+  "chunk_inner": 13,
+  "K_inner_chunks_per_shard": 1024,
+  "cells_per_shard": 4194304,
+  "cells_per_chunk": 4096,
+  "delta": 512,
+  "shard_morton": 5361852015733374984,
+  "shard_obs": 29544751,
+  "n_shards_total": 639,
+  "n_cells": 153798,
+  "n_occupied_inner_chunks": 871,
+  "total_centroids": 26741827,
+  "mean_centroids_per_cell": 173.8762987815186,
+  "centroid_fill_fraction": 0.33960214605765354,
+  "csr": {
+    "objects": 6094,
+    "groups": 871,
+    "bytes": 88672438,
+    "decode_one_cell_s": 0.002256374995340593,
+    "decode_whole_shard_s": 2.5027317089989083
+  },
+  "padded": {
+    "bytes_only": {
+      "bytes": 14612955136,
+      "objects": 872
+    },
+    "zstd0": {
+      "bytes": 84610348,
+      "objects": 2
+    },
+    "zstd5": {
+      "bytes": 85718241,
+      "objects": 2
+    },
+    "blosc_zstd5": {
+      "bytes": 89301132,
+      "objects": 2
+    }
+  },
+  "padded_real_zstd0": {
+    "objects": 2,
+    "bytes": 84625478
+  },
+  "padded_decode_one_cell_s": 0.001369584002532065,
+  "padded_decode_whole_shard_s": 3.7860002919915132,
+  "ratios_padded_over_csr": {
+    "bytes_only": 164.79703801535263,
+    "zstd0": 0.954189936674573,
+    "zstd5": 0.9666841572575234,
+    "blosc_zstd5": 1.0070900723401786
+  }
+}
