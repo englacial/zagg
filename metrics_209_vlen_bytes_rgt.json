@@ -1,0 +1,100 @@
+{
+  "issue": 209,
+  "probe": "step 2 - ragged t-digest as a sharded vlen-bytes array",
+  "delta": 512,
+  "zarr": "3.2.1",
+  "rgt_dense_o9": {
+    "shard_key": "5598594461379592201",
+    "K_inner_chunks": 256,
+    "cells_per_chunk": 4096,
+    "n_granules": 29,
+    "total_obs": 60924618,
+    "delta": 512,
+    "current_csr": {
+      "objects": 611,
+      "populated_chunks": 87,
+      "bytes_on_disk": 45404521,
+      "write_s": 1.6101106249989243,
+      "read_whole_s": 0.46015574999910314,
+      "read_one_cell_s": 0.0060904991700954265,
+      "densest_cell_rows": 651
+    },
+    "vlen_bytes": {
+      "n_cells": 44152,
+      "total_centroids": 12896542,
+      "objects": 1,
+      "data_object_keys": [
+        "h_tdigest/c/0"
+      ],
+      "stored_bytes": 45380835,
+      "write_s": 0.11720895799226128,
+      "read_whole_s": 0.16062104199954774,
+      "single_cell": {
+        "gets": 2,
+        "get_bytes": 842984,
+        "read_s": 0.005083791998913512,
+        "get_detail": [
+          [
+            "h_tdigest/c/0",
+            "SuffixByteRequest(suffix=4100)",
+            4100
+          ],
+          [
+            "h_tdigest/c/0",
+            "RangeByteRequest(start=1129892, end=1968776)",
+            838884
+          ]
+        ],
+        "bitexact": true,
+        "densest_cell_rows": 651
+      },
+      "roundtrip_ok": true,
+      "roundtrip_mismatches": 0,
+      "empty_inner_omission": {
+        "K": 256,
+        "populated_inner_from_index": 87,
+        "empty_inner_from_index": 169,
+        "populated_chunks_input": 87,
+        "matches": true
+      },
+      "warnings_on_create": [
+        "UnstableSpecificationWarning"
+      ],
+      "codecs_meta": [
+        {
+          "name": "sharding_indexed",
+          "configuration": {
+            "chunk_shape": [
+              4096
+            ],
+            "codecs": [
+              {
+                "name": "vlen-bytes",
+                "configuration": {}
+              },
+              {
+                "name": "zstd",
+                "configuration": {
+                  "level": 0,
+                  "checksum": false
+                }
+              }
+            ],
+            "index_codecs": [
+              {
+                "name": "bytes",
+                "configuration": {
+                  "endian": "little"
+                }
+              },
+              {
+                "name": "crc32c"
+              }
+            ],
+            "index_location": "end"
+          }
+        }
+      ]
+    }
+  }
+}
