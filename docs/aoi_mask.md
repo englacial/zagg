@@ -7,6 +7,37 @@ by roughly one shard-cell all around, and that overhang scales with
 `parent_order` — the same AOI reports a different observation count at different
 shard orders (issue #100).
 
+## The shard is the unit of work, not the AOI
+
+This has a consequence worth stating plainly, because it surprises people reading
+granule counts: **a shard map built for an AOI intentionally reads more granules
+than a query against that AOI would return.** A granule is assigned to — and read
+for — a shard whenever its footprint touches that shard, *even if the granule
+never crosses the AOI polygon itself*. The shard is the unit of work: once a shard
+overlaps the AOI, zagg processes the whole shard, and that means reading every
+granule whose data lands anywhere in it.
+
+Concretely, over the NEON SERC box the three counts differ and all three are
+"right" for different questions:
+
+| count | question it answers |
+| --- | --- |
+| **59** | granules a CMR bounding-box query returns for the AOI |
+| **69** | granules whose footprint sphere-correctly intersects the AOI polygon |
+| **99** | granules the o9 shard map reads — everything in the shards that cover the AOI |
+
+The **99 is the correct processing count.** Those are the granules whose
+observations fall in the shards being aggregated, so reading them is required, not
+wasted — they populate the overhang cells that the covering shards legitimately
+include. The 59/69 figures describe the AOI itself, which is not the processing
+unit. (The gap grows with coarser `parent_order`, since a coarser shard reaches
+further past the AOI; it shrinks toward the AOI count as the shard order
+approaches the AOI's own scale.)
+
+If you need the *output* clipped back to the strict AOI, use `output.aoi_mask`
+(below) — but note that only masks the written cells; the granules are still read
+either way, because the shards are still processed in full.
+
 The **strict-AOI cell mask** (`output.aoi_mask`, default off) packages an
 optional per-cell boolean aligned to the output cell grid — `True` where the
 cell falls inside the AOI — so a client can recover the order-independent
