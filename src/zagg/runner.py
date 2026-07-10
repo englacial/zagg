@@ -914,7 +914,11 @@ def _select_cells(
     Returns
     -------
     list of (shard_key, granule_urls) tuples, in a deterministic shuffled
-    order (seeded from the selected shard keys, so reruns see the same order).
+    order. The seed derives from the selected shard keys, so a rerun/resume
+    with the same catalog and selection args sees the same order (a different
+    ``max_cells`` seeds differently, so its order is unrelated -- inherent to
+    truncate-first). Determinism relies on ``random.Random(str)`` seeding and
+    ``shuffle`` being stable in practice across CPython 3.12/3.13.
     """
     pairs = list(zip(catalog_data["shard_keys"], catalog_data["granules"]))
     if morton_cell:
@@ -931,6 +935,19 @@ def _select_cells(
     # the selected shard keys, so a rerun or resume sees the same order.
     random.Random(",".join(str(k) for k, _ in pairs)).shuffle(pairs)
     return pairs
+
+
+def _lambda_dispatch_order(cells: list[tuple]) -> list[tuple]:
+    """Order cells for lambda fan-out: biggest work first, in coarse buckets.
+
+    Stable descending sort on ``len(granule_urls).bit_length()`` (log2
+    buckets), not the exact count: granule counts are spatially
+    autocorrelated, so an exact-count sort would mostly undo
+    ``_select_cells``'s anti-prefix-locality shuffle (issue #197). Coarse
+    buckets keep the longest-first throughput heuristic while the shuffle
+    survives within each bucket.
+    """
+    return sorted(cells, key=lambda kv: len(kv[1]).bit_length(), reverse=True)
 
 
 def _aoi_payload_map(catalog_data: dict) -> dict:
@@ -1291,10 +1308,11 @@ def _run_lambda(
     grid_type = config.output.get("grid", {}).get("type", "healpix")
     parent_order = get_parent_order(config) if grid_type == "healpix" else None
 
-    # Sort by granule count (descending) for better throughput
+    # Biggest work first for throughput, but only in coarse buckets so the
+    # issue #197 anti-prefix-locality shuffle survives the sort.
     cells = _select_cells(catalog_data, morton_cell=morton_cell, max_cells=max_cells)
     if not morton_cell:
-        cells.sort(key=lambda kv: len(kv[1]), reverse=True)
+        cells = _lambda_dispatch_order(cells)
 
     # Worker count is logged after the pre-flight clamp (see
     # _log_concurrency_report); here max_workers is still the requested value.
