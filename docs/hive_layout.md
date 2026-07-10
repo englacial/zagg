@@ -138,11 +138,15 @@ issue and will remove the walk from the discovery path too.
 
 ## Status
 
-- The **local backend** (`backend="local"`) writes hive stores end-to-end.
-- The **Lambda backend rejects** `store_layout: hive` for now: the flat path
-  writes its template inside a `mode: "template"` invoke (the orchestrator has
-  no S3 write access), so hive needs a worker event-schema change to emit each
-  leaf template in-function — a follow-on phase of
-  [issue #199](https://github.com/englacial/zagg/issues/199).
+- **Both backends** write hive stores end-to-end through the same
+  `zagg.hive.process_and_write_hive` code path. On **Lambda**
+  ([issue #199](https://github.com/englacial/zagg/issues/199) phase 3)
+  `mode: "setup"` writes only the manifest — the orchestrator still needs no
+  S3 access — and each worker derives its leaf path from its `shard_key` +
+  the event config's orders, emits its own leaf template, and stamps
+  completion as its final PUT. The async status channel stays at the flat
+  sibling prefix (`{store_root}.status/<run_id>/…`), outside the digit tree.
+- The store-level `coverage.moc` (and any per-shard MOC stamping) waits on
+  the design in [issue #200](https://github.com/englacial/zagg/issues/200).
 - Write-throughput validation at fleet scale is tracked with the benchmark
   machinery in [issue #202](https://github.com/englacial/zagg/issues/202).

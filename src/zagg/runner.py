@@ -347,16 +347,6 @@ class SpatialStrategy:
             max_workers = min(max_workers, n_cells)
             if not store_path.startswith("s3://"):
                 raise ValueError(f"Lambda backend requires s3:// store path, got: {store_path}")
-            if get_store_layout(config) == "hive":
-                # Phase 2 (issue #199) wires the hive layout through the local
-                # backend; the Lambda path needs a worker event-schema change
-                # (per-leaf template emit inside the function, since the
-                # orchestrator has no S3 write access) — a follow-on phase.
-                raise ValueError(
-                    "output.store_layout: hive is not wired to the lambda backend "
-                    "yet (issue #199 phase 2 lands the local backend); use "
-                    "backend='local' or the flat layout"
-                )
             if invocation not in ("async", "sync"):
                 raise ValueError(f"Unknown invocation: {invocation!r} (expected 'async' or 'sync')")
             if function_name is None:
@@ -1578,6 +1568,15 @@ def _run_lambda(
     # calls that already happen, so no worker probe tax -- issue #100). They
     # decompose wall time into setup invoke / fan-out / finalize invoke so
     # "where did wall time go" is answerable from the summary.
+    # Hive layout (issue #199 phase 3): setup mode writes morton_hive.json
+    # instead of a global template. The worker builds the manifest itself from
+    # the event's config; only the dataset identity (from the ShardMap
+    # metadata, matching the local path's source) rides in the event — flat
+    # runs omit the key, keeping their setup event byte-identical.
+    dataset = None
+    if get_store_layout(config) == "hive":
+        md = catalog_data.get("metadata") or {}
+        dataset = {"short_name": md.get("short_name"), "version": md.get("version")}
     setup_start = time.time()
     _invoke_lambda_setup(
         state["lambda_client"],
@@ -1589,6 +1588,7 @@ def _run_lambda(
         overwrite=overwrite,
         config_dict=config_dict,
         output_creds_event=output_creds_event,
+        dataset=dataset,
     )
     setup_s = time.time() - setup_start
 
@@ -2281,8 +2281,16 @@ def _invoke_lambda_setup(
     overwrite,
     config_dict,
     output_creds_event=None,
+    dataset=None,
 ):
-    """Invoke Lambda in setup mode to create the zarr template."""
+    """Invoke Lambda in setup mode to create the zarr template.
+
+    For a hive-layout config (issue #199 phase 3) the worker writes
+    ``morton_hive.json`` instead; ``dataset`` (``{"short_name", "version"}``
+    from the ShardMap metadata) is threaded through for the manifest's
+    identity block. The key is added only when set, so flat setup events stay
+    byte-identical.
+    """
     event = {
         "mode": "setup",
         "store_path": store_path,
@@ -2292,6 +2300,8 @@ def _invoke_lambda_setup(
         "overwrite": overwrite,
         "config": config_dict,
     }
+    if dataset is not None:
+        event["dataset"] = dataset
     if output_creds_event is not None:
         event["output_credentials"] = output_creds_event
     response = lambda_client.invoke(

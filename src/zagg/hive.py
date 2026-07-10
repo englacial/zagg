@@ -248,19 +248,24 @@ def process_and_write_hive(
     driver=None,
     handoff="arrow",
     aoi_payload=None,
+    profile=False,
 ):
     """Process one shard into its own hive leaf store (issue #199 phase 2).
 
-    The hive counterpart of the runner's ``_process_and_write``: the shard's
-    output is a self-describing leaf zarr at
-    :func:`shard_leaf_path` ``(store_root, shard_key)`` (D3), with dense chunks
-    written at leaf-LOCAL block indices and — as the shard's FINAL write — the
-    D4 commit stamp on the leaf's root group. The leaf template is emitted
-    lazily on the first chunk write (mirroring the Lambda handler's lazy store
-    open), so a no-data shard never creates the ``.zarr/`` prefix; a worker
-    that dies mid-shard leaves an UNSTAMPED prefix — debris, overwritten
-    wholesale on retry (``overwrite=True`` on the leaf template makes the
-    retry idempotent).
+    The SHARED per-shard write path for both backends (phase 3): the local
+    runner's ``_cell_work`` and the Lambda handler's hive branch both call
+    this, so leaf templating, chunk placement, CSR naming, and stamp ordering
+    cannot drift between dispatchers. The shard's output is a self-describing
+    leaf zarr at :func:`shard_leaf_path` ``(store_root, shard_key)`` (D3), with
+    dense chunks written at leaf-LOCAL block indices and — as the shard's
+    FINAL write — the D4 commit stamp on the leaf's root group. The leaf
+    template is emitted lazily on the first chunk write (mirroring the Lambda
+    handler's lazy store open), so a no-data shard never creates the
+    ``.zarr/`` prefix; a worker that dies mid-shard leaves an UNSTAMPED prefix
+    — debris, overwritten wholesale on retry (``overwrite=True`` on the leaf
+    template makes the retry idempotent). ``profile`` forwards to
+    ``process_shard`` (issue #100); the write phase is interleaved with the
+    stream on this path, so no separate ``write`` timing is recorded.
     """
     from zagg.grids.base import shard_label
     from zagg.processing import process_shard, write_dataframe_to_zarr, write_ragged_to_zarr
@@ -301,6 +306,7 @@ def process_and_write_hive(
         handoff=handoff,
         aoi_payload=aoi_payload,
         write_chunk=_write_chunk,
+        profile=profile,
     )
     # Stamp ONLY a fully-written leaf: an errored shard (or one that streamed
     # no chunks) stays unstamped — debris by definition (D4). The stamp is the

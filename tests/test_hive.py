@@ -519,10 +519,116 @@ class TestRunnerWiring:
         assert sorted(os.listdir(root)) == [hive.MANIFEST_NAME]
         assert hive.read_manifest(root)["shard_order"] == 6
 
-    def test_lambda_hive_rejected(self, cfg, tmp_path):
+    def test_lambda_hive_dispatches_with_manifest_dataset(self, monkeypatch, cfg, tmp_path):
+        # Issue #199 phase 3: hive is wired to the lambda backend. The setup
+        # invoke carries the manifest's dataset identity (from the ShardMap
+        # metadata, same source as the local path) and the per-cell events need
+        # NO new keys — the worker derives everything from the config dict.
+        from unittest.mock import MagicMock
+
+        import boto3
+
+        from zagg import runner
+        from zagg.concurrency import ConcurrencyReport
         from zagg.runner import agg
 
         cfg.output["store_layout"] = "hive"
-        catalog_path, _shard = self._catalog(tmp_path)
-        with pytest.raises(ValueError, match="hive is not wired to the lambda backend"):
-            agg(cfg, catalog=catalog_path, store="s3://b/x", backend="lambda")
+        catalog_path, shard = self._catalog(tmp_path)
+        captured: dict = {}
+
+        monkeypatch.setattr(
+            runner,
+            "get_nsidc_s3_credentials",
+            lambda: {"accessKeyId": "a", "secretAccessKey": "s", "sessionToken": "t"},
+        )
+        monkeypatch.setattr(boto3, "Session", lambda *a, **k: MagicMock())
+        monkeypatch.setattr(runner, "_get_function_timeout_s", lambda *a, **k: 720)
+        monkeypatch.setattr(
+            runner,
+            "compute_available_workers",
+            lambda requested, *a, **k: (
+                1,
+                ConcurrencyReport(
+                    account_limit=1000,
+                    current_concurrent=0,
+                    padding=100,
+                    available=900,
+                    function_reserved=None,
+                ),
+            ),
+        )
+        monkeypatch.setattr(
+            runner, "_invoke_lambda_setup", lambda *a, **kw: captured.update(setup=kw)
+        )
+        monkeypatch.setattr(runner, "_invoke_lambda_finalize", lambda *a, **k: None)
+
+        def fake_cell(client, chunk_idx, shard_key, *a, **k):
+            captured["cell_shard_key"] = shard_key
+            return {
+                "status_code": 200,
+                "body": {"total_obs": 1},
+                "error": None,
+                "lambda_duration": 1.0,
+                "shard_key": shard_key,
+            }
+
+        monkeypatch.setattr(runner, "_invoke_lambda_cell", fake_cell)
+        agg(cfg, catalog=catalog_path, store="s3://out/product", backend="lambda")
+
+        assert captured["setup"]["dataset"] == {"short_name": "ATL06", "version": "007"}
+        # store_layout rides in the config dict already serialized into events.
+        assert captured["setup"]["config_dict"]["output"]["store_layout"] == "hive"
+        # The per-cell event schema is unchanged: shard_key stays the packed int.
+        assert captured["cell_shard_key"] == shard
+
+    def test_lambda_flat_setup_omits_dataset(self, monkeypatch, cfg, tmp_path):
+        # Flat runs keep their setup call byte-identical: dataset stays None.
+        from unittest.mock import MagicMock
+
+        import boto3
+
+        from zagg import runner
+        from zagg.concurrency import ConcurrencyReport
+        from zagg.runner import agg
+
+        catalog_path, shard = self._catalog(tmp_path)
+        captured: dict = {}
+
+        monkeypatch.setattr(
+            runner,
+            "get_nsidc_s3_credentials",
+            lambda: {"accessKeyId": "a", "secretAccessKey": "s", "sessionToken": "t"},
+        )
+        monkeypatch.setattr(boto3, "Session", lambda *a, **k: MagicMock())
+        monkeypatch.setattr(runner, "_get_function_timeout_s", lambda *a, **k: 720)
+        monkeypatch.setattr(
+            runner,
+            "compute_available_workers",
+            lambda requested, *a, **k: (
+                1,
+                ConcurrencyReport(
+                    account_limit=1000,
+                    current_concurrent=0,
+                    padding=100,
+                    available=900,
+                    function_reserved=None,
+                ),
+            ),
+        )
+        monkeypatch.setattr(
+            runner, "_invoke_lambda_setup", lambda *a, **kw: captured.update(setup=kw)
+        )
+        monkeypatch.setattr(runner, "_invoke_lambda_finalize", lambda *a, **k: None)
+        monkeypatch.setattr(
+            runner,
+            "_invoke_lambda_cell",
+            lambda *a, **k: {
+                "status_code": 200,
+                "body": {"total_obs": 1},
+                "error": None,
+                "lambda_duration": 1.0,
+                "shard_key": shard,
+            },
+        )
+        agg(cfg, catalog=catalog_path, store="s3://out/x.zarr", backend="lambda")
+        assert captured["setup"]["dataset"] is None
