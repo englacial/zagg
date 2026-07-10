@@ -127,19 +127,21 @@ the data itself). Tracks [#200](https://github.com/englacial/zagg/issues/200).
   is frozen with the mortie-side spec (O8). Future *store-level* covers that cross base
   cells generalize to **≤ 12 members** (the 12 base cells). Readers
   AOI-reject on the box without parsing anything larger.
-- **Tier 1 — the budgeted shard MOC**: cell-level coverage, exact if it fits
-  the budget, else **coarsened until it fits**. Coarsening only over-covers
-  (conservative superset): false positives cost one wasted leaf read; false
-  negatives are impossible. The achieved depth is recorded with the payload.
-  Budget scale is open (O8) and is matched to **S3/cloud conventions, not
-  database-page conventions** — candidates span KB to low MB (the PostgreSQL
-  ~2 KB TOAST inline threshold is retained only as a portability footnote).
-  The budget also picks the carrier: a KB-scale payload rides the commit
-  stamp attrs (zero extra objects); a hundreds-of-KB tier becomes its own
-  object inside the leaf, with only the box + achieved depth + pointer in
-  attrs (one extra GET, paid only by readers that want it). If the in-leaf
-  object survives O8, it is a *noted exception* to §2's "vanilla zarr v3"
-  leaf: one foreign key inside the leaf, invisible to zarr readers.
+- **Tier 1 — the exact shard bitmap** *(as O8 resolved it — the originally
+  drafted "budgeted, coarsen-to-fit MOC" was superseded by the
+  [#202 item (6) measurement](https://github.com/englacial/zagg/issues/200#issuecomment-4939264286):
+  for linear-track occupancy, coarsen-to-fit ranges at KB budgets deliver
+  only box-level filtering while a compressed bitmap reaches exact at
+  ~25 KB)*: the shard's cell-order occupancy as a **zstd-compressed bit
+  field**, one bit per subtree cell in ascending packed-word order, stored
+  as the in-leaf `coverage.moc` sidecar. Raw size is deterministic
+  (`ceil(4^depth/8)`) regardless of fragmentation; no coarsened variant is
+  built (one code path, sidecar-only). The stamp attrs carry only the box +
+  the bitmap's order + pointer + byte sizes (one extra GET, paid only by
+  readers that pass the box test). The sidecar is the *noted exception* to
+  §2's "vanilla zarr v3" leaf: one foreign key inside the leaf, ignored by
+  zarr readers (data reads unaffected; member enumeration warns and skips
+  it).
 - **Tier 2 — exact**: the `morton` coordinate array in the leaf *is* the
   exact cell list. The MOC tiers are indexes, never truth (D9 discipline,
   applied one level down).
@@ -171,10 +173,13 @@ the data itself). Tracks [#200](https://github.com/englacial/zagg/issues/200).
   cost effectively nothing and answer the actual question readers ask
   ("where is there data?") in one GET.
 
-Open items: budget scale / serialization / carrier / pad sentinel for the
-shard MOC tiers (O8, measured on
-[#202](https://github.com/englacial/zagg/issues/202) item (6)); the
-end-of-run root MOC default (O9); root-object serialization format (O1).
+O8 and O9 are **resolved** (espg-ratified on the
+[#200 thread](https://github.com/englacial/zagg/issues/200#issuecomment-4939477871),
+implemented on PR #208): the shard tier is an **exact cell-order occupancy
+bitmap, zstd-compressed, as an in-leaf sidecar object** — attrs carry only
+the tier-0 box + order + pointer + sizes, with a null pad sentinel — and the
+end-of-run root MOC **defaults on** for hive stores. The root object
+serializes per O1 as JSON ranges with decimal-string endpoints.
 
 ## 5. Layer 3: reader architecture
 
@@ -323,17 +328,31 @@ write path (§2) is load-bearing; this phase is optimization.
   doesn't list), regenerate explicitly (`refresh=True` / the sweep); no
   wall-clock staleness horizon. The incremental-run half is settled by the
   §4 lifecycle (leaves are durable truth; the sweep rebuilds correctly).
-- **O8 — shard-MOC budget, serialization, carrier, pad sentinel**: byte
-  scale matched to S3/cloud conventions (candidates KB → low MB); ranges
-  vs. bitmap serialization; commit-stamp attrs payload vs. in-leaf object
-  carrier; box pad sentinel (base-0/null vs. repetition). Decided using
-  the #202 item (6) measurement (SERC + 88S shards; the tier-0 box is the
-  baseline each budget must beat; over-coverage reported in STAC
-  simplification-error terms). Frozen alongside the mortie spec.
-- **O9 — end-of-run root MOC default**: on (the fire-and-forget Event
-  invoke is fail-open and run-size independent) vs. off until #202's
-  full-AOI runs record the invoke round trip. Either is a one-line flag;
-  espg leaning cautious pending the benchmark-impact numbers.
+  Implemented in this shape by PR #208's reader primitives
+  (`zagg.coverage`: `warn_if_stale` — once per store, never auto-walk —
+  and `refresh_root_coverage`, the explicit walk); the concurrent-run
+  GET-union-PUT race (last writer wins until re-union/sweep) is recorded
+  there as accepted under this same lean.
+- **O8 — shard-MOC budget, serialization, carrier, pad sentinel**:
+  **RESOLVED** ([espg-ratified](https://github.com/englacial/zagg/issues/200#issuecomment-4939477871),
+  from the [#202 item (6) measurement](https://github.com/englacial/zagg/issues/200#issuecomment-4939264286)):
+  no budgeted/coarsened tier — the leaf encoding is an **exact cell-order
+  bitmap, zstd-compressed, as the in-leaf `coverage.moc` sidecar** (raw size
+  deterministic at `ceil(4^depth/8)`, immune to the ragged worst case where
+  exact ranges hit MB-scale on linear-track occupancy at ~1.1 cells/range).
+  Stamp attrs carry only the tier-0 box + the bitmap's order + pointer +
+  byte sizes; pad sentinel is JSON null; the envelope gains an
+  `encoding: "ranges" | "bitmap"` discriminator. Bit convention (frozen
+  with the mortie spec, golden-vector-pinned on PR #208): bit i = the i-th
+  shard-subtree cell in ascending packed-word order (base-4 D1 digit tail,
+  digits 1..4 → 0..3), MSB-first per byte.
+- **O9 — end-of-run root MOC default**: **RESOLVED — on** for hive stores
+  ([espg](https://github.com/englacial/zagg/issues/200#issuecomment-4938859764):
+  coverage MOCs are the default for healpix templates; PR #208 implements
+  `output.coverage_moc`, default true under `store_layout: hive`, explicit
+  true rejected elsewhere). The write is fail-open on both backends; the
+  Lambda leg is one fire-and-forget `mode: "coverage"` Event invoke with the
+  pre-serialized ranges envelope.
 
 ## 9. References
 
