@@ -792,6 +792,18 @@ class TestShardLabel:
                 # Packed word -> decimal string -> packed word is lossless.
                 assert morton_word(s) == word
 
+    def test_order_29_round_trip_full_grammar_width(self):
+        # Orders 19-29 extend the decimal form past the legacy i64; one order-29
+        # AREA case pins the full grammar width (review nit, PR #205).
+        from mortie import geo2mort
+
+        from zagg.grids.morton import morton_decimal, morton_word
+
+        word = int(geo2mort(np.array([-78.5]), np.array([-132.0]), order=29)[0])
+        s = morton_decimal(word)
+        assert len(s.lstrip("-")) == 30
+        assert morton_word(s) == word
+
     def test_morton_word_rejects_malformed(self):
         from zagg.grids.morton import morton_word
 
@@ -799,14 +811,26 @@ class TestShardLabel:
             with pytest.raises(ValueError):
                 morton_word(bad)
 
+    def test_morton_decimal_raises_valueerror_on_invalid(self):
+        # The emit direction's advertised contract (review finding, PR #205):
+        # the empty sentinel raises, and a NEGATIVE input — a legacy signed
+        # decimal id where the packed word belongs — raises ValueError (not the
+        # opaque uint64-coercion OverflowError) with the remedy named.
+        from zagg.grids.morton import morton_decimal
+
+        with pytest.raises(ValueError):
+            morton_decimal(0)
+        with pytest.raises(ValueError, match="morton_word"):
+            morton_decimal(-4211322)
+
     def test_healpix_shard_label_is_decimal(self, cfg):
-        from zagg.grids.morton import morton_decimal, morton_word
+        from zagg.grids.morton import morton_word
 
         g = HealpixGrid(parent_order=6, child_order=12, config=cfg)
         for parent in _valid_parents(3):
-            label = g.shard_label(parent)
-            assert label == morton_decimal(parent)
-            assert morton_word(label) == parent
+            # The round trip through the parse-back is what carries this test
+            # (label == morton_decimal(parent) would be tautological).
+            assert morton_word(g.shard_label(parent)) == parent
 
     def test_base_helper_dispatches_and_falls_back(self, cfg):
         from zagg.grids.base import shard_label

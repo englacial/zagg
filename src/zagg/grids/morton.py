@@ -75,12 +75,23 @@ def morton_decimal(word) -> str:
     the canonical in-memory/wire form, and every externally visible string —
     CSR subgroup names, ``.status`` object keys, log lines — renders through
     mortie's decode-through-kernel decimal repr (e.g. ``-31123``). Raises
-    ``ValueError`` on an empty or invalid word (a path component must never be
-    silently wrong).
+    ``ValueError`` on an empty, invalid, or negative word (a path component
+    must never be silently wrong) — a NEGATIVE int here is usually a *legacy
+    signed decimal id* handed in where the packed word belongs; parse it with
+    ``morton_word(str(id))`` instead.
     """
+    word = int(word)
+    if word < 0:
+        # np.uint64 coercion would raise an opaque OverflowError; normalize to
+        # the documented ValueError with the likely cause spelled out.
+        raise ValueError(
+            f"packed morton word must be non-negative (got {word}); a signed "
+            f"decimal id like '-4211322' is the external form — parse it with "
+            f"morton_word(str(id))"
+        )
     from mortie import MortonIndexArray
 
-    return MortonIndexArray.from_words(np.asarray([int(word)], dtype=np.uint64)).decimal_repr()[0]
+    return MortonIndexArray.from_words(np.asarray([word], dtype=np.uint64)).decimal_repr()[0]
 
 
 def morton_word(label: str) -> int:
@@ -89,6 +100,15 @@ def morton_word(label: str) -> int:
     The inverse of :func:`morton_decimal` at the zagg boundary — used where an
     external decimal id re-enters (``--morton-cell``, CSR subgroup names on the
     read path). Raises ``ValueError`` on a malformed id.
+
+    Implementation note: this rides mortie's private-but-documented
+    ``_decimal_to_word`` (the issue-104 parse-back) rather than the public
+    ``MortonIndexArray.from_hive_path(label, suffix="")`` because the array
+    classes are built lazily and require pandas — the private function is
+    numpy-only, keeping the reader path light. The upstream ask (a public
+    numpy-only export) stands. Same non-injectivity caveat mortie documents: an
+    order-29 *point* id parses back to the *area* word (irrelevant for shard
+    keys at order <= 11; noted since this is a general boundary helper).
     """
     from mortie.morton_index import _decimal_to_word
 

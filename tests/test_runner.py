@@ -161,6 +161,50 @@ class TestSelectCells:
         with pytest.raises(ValueError, match="not a decimal morton id"):
             _select_cells(data, morton_cell="11827859996358475782")
 
+    def test_morton_cell_miss_on_legacy_catalog_hints_regenerate(self):
+        # A pre-#199 catalog stores legacy signed-i64 keys; a well-formed
+        # decimal id then misses every packed-word comparison. Hard break — no
+        # shim — but the error says why (review finding, PR #205).
+        data = {
+            "metadata": {},
+            "grid_signature": {"type": "healpix"},
+            "shard_keys": [-4211322, -4211323],
+            "granules": [[_rec(1)], [_rec(2)]],
+        }
+        with pytest.raises(ValueError, match="legacy signed decimal ids"):
+            _select_cells(data, morton_cell="-4211322")
+
+    def test_morton_cell_miss_on_packed_catalog_stays_bare(self):
+        # A genuinely absent id in a packed-word catalog keeps the plain
+        # message — the legacy hint fires only when the keys look legacy.
+        data = {
+            "metadata": {},
+            "grid_signature": {"type": "healpix"},
+            "shard_keys": [11827859996358475782],
+            "granules": [[_rec(1)]],
+        }
+        with pytest.raises(ValueError, match="not in catalog$"):
+            _select_cells(data, morton_cell="-4211321")
+
+
+class TestSafeLabel:
+    """Issue #199 (review finding, PR #205): error-reporting label rendering
+    must never raise — re-rendering the malformed key that failed a cell would
+    abort the accumulation loop precisely while reporting that failure."""
+
+    def test_falls_back_to_digits_on_invalid_key(self):
+        from zagg.runner import _safe_label
+
+        g = HealpixGrid(parent_order=6, child_order=12, config=default_config("atl06"))
+        # 0 is the empty sentinel: shard_label raises; _safe_label renders digits.
+        assert _safe_label(g, 0) == "0"
+
+    def test_renders_decimal_for_valid_key(self):
+        from zagg.runner import _safe_label
+
+        g = HealpixGrid(parent_order=6, child_order=12, config=default_config("atl06"))
+        assert _safe_label(g, 11827859996358475782) == "-4211322"
+
 
 class TestLoadCatalog:
     def test_load(self, catalog_file):
@@ -766,7 +810,7 @@ class TestInvokeLambdaCellAsync:
 
         client = MagicMock()
         big_aoi = list(range(_ASYNC_PAYLOAD_CAP_BYTES // 4))  # >250 KB serialized
-        with pytest.raises(ValueError, match='pass invocation="sync"'):
+        with pytest.raises(ValueError, match='pass invocation="sync"') as excinfo:
             _invoke_lambda_cell(
                 client,
                 (0,),
@@ -780,10 +824,14 @@ class TestInvokeLambdaCellAsync:
                 config_dict=None,
                 max_workers=4,
                 aoi_payload=big_aoi,
-                result_url="s3://out/x.zarr.status/run1/12345.json",
+                result_url="s3://out/x.zarr.status/run1/-12345.json",
                 result_fetch=lambda: None,
                 poll_timeout_s=10.0,
+                label="-12345",
             )
+        # The message names the cell by its rendered label (issue #199), not
+        # the raw packed-word digits.
+        assert "cell -12345 " in str(excinfo.value)
         client.invoke.assert_not_called()
 
     def test_oversized_payload_allowed_on_sync_path(self):

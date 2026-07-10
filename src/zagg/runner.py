@@ -934,11 +934,40 @@ def _select_cells(
             target = int(morton_cell)
         matches = [(k, urls) for k, urls in pairs if k == target]
         if not matches:
-            raise ValueError(f"shard '{morton_cell}' not in catalog")
+            msg = f"shard '{morton_cell}' not in catalog"
+            # A well-formed decimal id can still miss because the catalog itself
+            # predates the packed-word form: legacy shard_keys are signed i64
+            # decimal ids (small or negative), while packed words carry a 1..12
+            # prefix in the top 4 bits (always >= 2^60). Hard break — no shim —
+            # but say why the lookup likely failed (review finding, PR #205).
+            keys = catalog_data["shard_keys"]
+            if grid_type == "healpix" and any(int(k) < (1 << 60) for k in keys):
+                msg += (
+                    " (catalog shard_keys look like legacy signed decimal ids, not "
+                    "packed morton words — a pre-issue-199 shard map; regenerate it "
+                    "with `python -m zagg.catalog`)"
+                )
+            raise ValueError(msg)
         return matches
     if max_cells:
         return pairs[:max_cells]
     return pairs
+
+
+def _safe_label(grid, shard_key) -> str:
+    """Render a shard key for log/report lines; NEVER raises (issue #199).
+
+    ``shard_label`` -> ``morton_decimal`` raises on an invalid word — right at
+    path-construction sites (a path component must never be silently wrong),
+    wrong in error-*reporting* paths: re-rendering the same malformed key that
+    made a cell fail would abort the accumulation loop precisely while
+    reporting that failure (review finding, PR #205; mortie's own scalar repr
+    is non-raising for the same reason). Falls back to the raw digits.
+    """
+    try:
+        return shard_label(grid, shard_key)
+    except Exception:
+        return str(shard_key)
 
 
 def _aoi_payload_map(catalog_data: dict) -> dict:
@@ -1207,7 +1236,9 @@ def _run_local(
     n = len(cells)
 
     def _accumulate(report, i, outcome):
-        label = shard_label(grid, outcome["shard_key"])
+        # _safe_label, not shard_label: a malformed key that failed the cell
+        # must not also kill the loop reporting that failure (issue #199).
+        label = _safe_label(grid, outcome["shard_key"])
         if not outcome["ok"]:
             report.cells_error += 1
             logger.warning(f"  [{i}/{n}] {label}: ERROR {outcome['error']}")
@@ -1409,6 +1440,10 @@ def _run_lambda(
     # inline ``executor.submit(_invoke_lambda_cell, ...)`` passed.
     def _cell_work(payload):
         shard_key, records = payload
+        # Rendered once per cell: the status-object name (below) and the
+        # payload-cap error message in _invoke_lambda_cell both carry it
+        # (issue #199). Raising here is correct — it becomes a path component.
+        label = shard_label(grid, shard_key)
         # Only thread aoi_payload when the manifest carries a mask (flag on);
         # otherwise omit the kwarg so the event payload is byte-identical to the
         # pre-feature path (issue #101). Mirrors the local runner's _cell_work.
@@ -1422,7 +1457,7 @@ def _run_lambda(
         if result_prefix is not None:
             # Status objects are named by the shard label — the decimal morton
             # string for HEALPix (issue #199) — not the raw packed word.
-            key = f"{shard_label(grid, shard_key)}.json"
+            key = f"{label}.json"
             extra["result_url"] = f"{result_prefix}/{key}"
             extra["result_fetch"] = _result_fetcher(
                 result_box, result_prefix, output_creds_event, region, key
@@ -1453,6 +1488,7 @@ def _run_lambda(
             max_workers=state["workers"],
             handoff=handoff,
             profile=profile,
+            label=label,
             **extra,
         )
 
@@ -1519,7 +1555,8 @@ def _run_lambda(
         elif error not in ("No granules found", "No data after filtering"):
             report.cells_error += 1
             key = result.get("shard_key")
-            label = shard_label(grid, key) if key is not None else key
+            # _safe_label: error reporting must not raise on the bad key itself.
+            label = _safe_label(grid, key) if key is not None else key
             logger.warning(f"  [{i}/{n}] shard {label}: {error}")
         report.results.append(result)
 
@@ -2260,8 +2297,13 @@ def _invoke_lambda_cell(
     result_url=None,
     result_fetch=None,
     poll_timeout_s=None,
+    label=None,
 ):
     """Invoke Lambda for a single cell with retry logic.
+
+    ``label`` (issue #199) is the shard's rendered external id (decimal morton
+    string for HEALPix) for user-facing messages; ``None`` falls back to the
+    raw ``shard_key`` digits. The event payload always carries the int.
 
     ``max_workers`` is used only for the file-descriptor-exhaustion message
     (#28); it does not affect dispatch. ``profile`` (issue #100) forwards a
@@ -2329,7 +2371,7 @@ def _invoke_lambda_cell(
     payload = json.dumps(event)
     if invocation_type == "Event" and len(payload) > _ASYNC_PAYLOAD_CAP_BYTES:
         raise ValueError(
-            f"cell {shard_key} event payload is {len(payload):,} bytes, over the "
+            f"cell {label or shard_key} event payload is {len(payload):,} bytes, over the "
             f"{_ASYNC_PAYLOAD_CAP_BYTES:,}-byte async dispatch budget (Lambda caps "
             'Event invokes at 256 KB): pass invocation="sync" for this run, or '
             "shrink the per-cell payload (e.g. the strict-AOI aoi_payload)"

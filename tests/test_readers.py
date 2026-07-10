@@ -221,9 +221,9 @@ class TestReadTensors:
         store = MemoryStore()
         rng = np.random.default_rng(11)
         n = 5_000
-        _write_chunk(store, "f", "1", {0: rng.uniform(0.0, 40.0, n)})
+        _write_chunk(store, "f", "11", {0: rng.uniform(0.0, 40.0, n)})
         t, m = next(read_tensors(store, "f", n_bins=128, resolution=0.5))
-        assert m == morton_word("1")
+        assert m == morton_word("11")
         # Most of the population should land in-window (uniform [0,40] in a 64 m
         # window anchored at floor of the 5th pct).
         assert 0.8 * n <= t[0, 0].sum() <= n
@@ -285,6 +285,23 @@ class TestReadTensors:
         arr[...] = np.array([900, 901], dtype=np.uint64)
         mapping = _resolve_chunk_morton(store, "f", ["-31123", "31123"], 3)
         assert mapping == {"31123": 900, "-31123": 901}
+
+    def test_lone_digit_names_are_block_keys(self):
+        # Review finding (PR #205): "5"/"6" fit the raw decimal grammar as
+        # order-0 ids, but real shard ids always carry >= 2 digits (shard
+        # orders are >= 1) — lone digits are block-index keys, parsed as ints.
+        from zagg.readers.tdigest_tensor import _subgroup_words
+
+        assert _subgroup_words(["5", "6", "1"]) == {"5": 5, "6": 6, "1": 1}
+
+    def test_signed_name_in_block_keyed_store_raises(self):
+        # Review finding (PR #205): a signed name can never be a block index,
+        # so a store mixing decimal-id and non-id names (pre-#199 debris) must
+        # fail loudly instead of silently degrading every id to a bogus int.
+        from zagg.readers.tdigest_tensor import _subgroup_words
+
+        with pytest.raises(ValueError, match="ambiguous"):
+            _subgroup_words(["-31123", "100"])
 
     def test_raise_when_chunk_too_wide(self):
         store = MemoryStore()

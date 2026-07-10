@@ -212,19 +212,45 @@ def chunk_z_range(
     raise ValueError(f"unknown fit mode {fit!r}")
 
 
+def _is_decimal_shard_name(name: str) -> bool:
+    """Whether a CSR subgroup name fits the decimal morton *shard-id* grammar.
+
+    Grammar: optional sign, base digit ``1..6``, then one ``1..4`` digit per
+    order — with at least ONE order digit. zagg shard orders are >= 1, so a
+    real shard id always has >= 2 digits; that floor is what disambiguates the
+    lone digits ``"1".."6"``, which the raw grammar would accept as order-0 ids
+    but which in practice are small block-index keys (review finding, PR #205).
+    """
+    body = name[1:] if name.startswith("-") else name
+    return len(body) >= 2 and body[:1] in "123456" and all(d in "1234" for d in body[1:])
+
+
 def _subgroup_words(shard_keys: list[str]) -> dict[str, int]:
     """Parse CSR subgroup names to their numeric keys (issue #199).
 
     Shard-keyed subgroups are named by the decimal morton string (D1), so the
     numeric key is the parsed packed word; block-index-keyed subgroups (the K>1
-    layout) keep plain ints. The flavor is uniform per store, so parse all
-    names as decimal morton and fall back to ``int`` if any name isn't one
-    (e.g. ``"0"`` or a digit outside ``1..4``).
+    layout) keep plain non-negative ints. The flavor is decided per store:
+
+    - every name fits the shard-id grammar (:func:`_is_decimal_shard_name`)
+      -> decimal morton store; keys are the parsed packed words;
+    - otherwise -> block-keyed store; keys are ``int(name)`` — and a leading
+      ``-`` in this branch raises, because a signed name is provably NOT a
+      block index (block keys are non-negative flattened indices): a mixed
+      store (e.g. pre-#199 debris alongside decimal-named subgroups) must fail
+      loudly rather than silently mis-key every shard.
     """
-    try:
+    if shard_keys and all(_is_decimal_shard_name(k) for k in shard_keys):
         return {k: morton_word(k) for k in shard_keys}
-    except ValueError:
-        return {k: int(k) for k in shard_keys}
+    signed = [k for k in shard_keys if k.startswith("-")]
+    if signed:
+        raise ValueError(
+            f"CSR subgroup names mix decimal morton ids with non-id names "
+            f"(signed name(s) {signed[:4]} cannot be block-index keys); the "
+            f"store layout is ambiguous — likely pre-issue-199 debris next to "
+            f"decimal-named subgroups. Rewrite the store."
+        )
+    return {k: int(k) for k in shard_keys}
 
 
 def _resolve_chunk_morton(
