@@ -1,0 +1,130 @@
+{
+  "issue": 209,
+  "option": "B - one CSR blob per shard",
+  "delta": 512,
+  "note": "per-cell t-digest built by the real process_shard worker; blob = raw-concat(cell_ids,offsets,values)+single compression pass; current = per-inner-chunk zarr CSR (zstd level-0 default). Read times are LOCAL disk (no S3 latency); on S3 the object-count gap dominates. pyarrow absent from uv env so Arrow-IPC not measured.",
+  "neon_sparse_o8": {
+    "shard_key": "5347391238804865032",
+    "K_inner_chunks": 1024,
+    "cells_per_chunk": 4096,
+    "n_granules": 59,
+    "total_obs": 17850976,
+    "delta": 512,
+    "current_csr": {
+      "bytes_on_disk": 61385226,
+      "objects": 6456,
+      "populated_chunks": 922,
+      "read_whole_s": 3.2280245419970015,
+      "read_one_cell_s": 0.003825666249904316,
+      "densest_cell_rows": 651
+    },
+    "blob": {
+      "n_cells": 361667,
+      "total_centroids": 17618724,
+      "raw_uncompressed_bytes": 145289858,
+      "compressors": {
+        "zstd-3": {
+          "compressed_bytes": 60869563,
+          "ratio": 2.387,
+          "read_whole_s": 0.16780695209963598
+        },
+        "zstd-9": {
+          "compressed_bytes": 57216645,
+          "ratio": 2.539,
+          "read_whole_s": 0.1535241458499513
+        },
+        "zstd-19": {
+          "compressed_bytes": 56338108,
+          "ratio": 2.579,
+          "read_whole_s": 0.18163302289976854
+        },
+        "blosc-zstd-9-shuffle": {
+          "compressed_bytes": 55877327,
+          "ratio": 2.6,
+          "read_whole_s": 0.1723631854503765
+        },
+        "gzip-6": {
+          "compressed_bytes": 69123234,
+          "ratio": 2.102,
+          "read_whole_s": 0.2602783582995471
+        },
+        "npz-deflate": {
+          "compressed_bytes": 69122184,
+          "ratio": 2.102,
+          "read_whole_s": 0.2623986728998716
+        },
+        "arrow-ipc-zstd": {
+          "error": "ModuleNotFoundError(\"No module named 'pyarrow'\")"
+        }
+      },
+      "chosen": {
+        "format": "raw-concat + zstd-19 (single object)",
+        "objects": 1,
+        "bytes_on_disk": 56338108,
+        "read_one_cell_s": 0.200247424999543
+      }
+    }
+  },
+  "rgt_dense_o9": {
+    "shard_key": "5598594461379592201",
+    "K_inner_chunks": 256,
+    "cells_per_chunk": 4096,
+    "n_granules": 29,
+    "total_obs": 60924618,
+    "delta": 512,
+    "current_csr": {
+      "bytes_on_disk": 45404521,
+      "objects": 611,
+      "populated_chunks": 87,
+      "read_whole_s": 0.4744684170000255,
+      "read_one_cell_s": 0.005892065000080038,
+      "densest_cell_rows": 651
+    },
+    "blob": {
+      "n_cells": 44152,
+      "total_centroids": 12896542,
+      "raw_uncompressed_bytes": 103702221,
+      "compressors": {
+        "zstd-3": {
+          "compressed_bytes": 45665599,
+          "ratio": 2.271,
+          "read_whole_s": 0.14959993124939502
+        },
+        "zstd-9": {
+          "compressed_bytes": 36694504,
+          "ratio": 2.826,
+          "read_whole_s": 0.10185896874972969
+        },
+        "zstd-19": {
+          "compressed_bytes": 36020320,
+          "ratio": 2.879,
+          "read_whole_s": 0.11161101039979257
+        },
+        "blosc-zstd-9-shuffle": {
+          "compressed_bytes": 36282033,
+          "ratio": 2.858,
+          "read_whole_s": 0.11235060000035446
+        },
+        "gzip-6": {
+          "compressed_bytes": 44371535,
+          "ratio": 2.337,
+          "read_whole_s": 0.18924638335010968
+        },
+        "npz-deflate": {
+          "compressed_bytes": 44369916,
+          "ratio": 2.337,
+          "read_whole_s": 0.19036656044991104
+        },
+        "arrow-ipc-zstd": {
+          "error": "ModuleNotFoundError(\"No module named 'pyarrow'\")"
+        }
+      },
+      "chosen": {
+        "format": "raw-concat + zstd-19 (single object)",
+        "objects": 1,
+        "bytes_on_disk": 36020320,
+        "read_one_cell_s": 0.11232106460010982
+      }
+    }
+  }
+}
