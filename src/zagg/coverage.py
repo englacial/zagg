@@ -41,7 +41,9 @@ from zagg.store import open_object_store
 logger = logging.getLogger(__name__)
 
 #: Stores already warned about a stale root MOC in this process (O7: warn
-#: once per store, trust silently otherwise, never auto-walk).
+#: once per stale episode, trust silently otherwise, never auto-walk).
+#: Keyed on the slash-normalized root; reset by a successful
+#: :func:`refresh_root_coverage` so a LATER episode warns again.
 _stale_warned: set[str] = set()
 
 
@@ -143,10 +145,14 @@ def warn_if_stale(store_root: str, shard_key, envelope: dict | None) -> bool:
 
     Call when a reader holds POSITIVE evidence of a committed shard — it
     opened the leaf and read the stamp — that the store's root MOC does not
-    list (a crashed run, the benign concurrent-run union race, or an
-    out-of-band write). Returns ``True`` when stale, warning ONCE per store
-    per process with the regen suggestion; afterwards it stays silent — the
-    hot path trusts silently and never auto-walks (D10). ``envelope`` may be
+    list. The most common cause is BENIGN: a run still in progress (the root
+    MOC is written at end of run, while leaves stamp continuously — review
+    finding, PR #208 round 4); the pathological causes are a crashed run,
+    the concurrent-run union race, and out-of-band writes. Returns ``True``
+    when stale, warning ONCE per store per stale episode with the regen
+    suggestion (the latch is slash-normalized and reset by a successful
+    :func:`refresh_root_coverage`); afterwards it stays silent — the hot
+    path trusts silently and never auto-walks (D10). ``envelope`` may be
     ``None`` (no root MOC at all): that is absence, not staleness, and reads
     ``False``. Containment is checked in rank space (O(ranges), no word
     expansion); a malformed envelope counts as not-listing, i.e. stale.
@@ -161,12 +167,15 @@ def warn_if_stale(store_root: str, shard_key, envelope: dict | None) -> bool:
             return False
     except (KeyError, TypeError, ValueError):
         pass  # malformed envelope cannot vouch for the shard — stale
-    if store_root not in _stale_warned:
-        _stale_warned.add(store_root)
+    key = store_root.rstrip("/")
+    if key not in _stale_warned:
+        _stale_warned.add(key)
         warnings.warn(
             f"commit-stamped shard {decimal} is not listed by {store_root}/"
-            f"{ROOT_COVERAGE_NAME} — the root MOC is stale (crashed run, concurrent-run "
-            f"union race, or out-of-band writes); regenerate with "
+            f"{ROOT_COVERAGE_NAME} — the root MOC lags the leaves. Usually benign: a "
+            f"run still in progress writes the root MOC only at end of run. If no run "
+            f"is active, the causes are a crashed run, the concurrent-run union race, "
+            f"or out-of-band writes; regenerate with "
             f"zagg.coverage.refresh_root_coverage({store_root!r})",
             stacklevel=2,
         )
@@ -178,15 +187,23 @@ def refresh_root_coverage(store_root: str, **store_kwargs) -> dict | None:
 
     THE SANCTIONED ROBUSTNESS PATH, not the hot path: D10 forbids walking
     per read, but the strongly-consistent delimiter-LIST walk is ground
-    truth (§2), so an explicit ``refresh`` recovers from anything — crashed
-    runs, the union race, garbage objects. One LIST per digit node (root:
-    ``{sign+base}`` children; below: ``[1-4]`` digits; a ``*.zarr`` entry is
-    a leaf at that node), collecting the shards whose commit stamp is
-    present — unstamped debris is excluded, exactly as the D4 model demands.
-    The fresh envelope carries ``source: "refresh"`` and REPLACES the root
-    object (no union: the walk supersedes it). Returns the envelope written,
-    or ``None`` — deleting any existing root object — when no stamped leaf
-    exists (an empty cache would be truthful, a stale one is not).
+    truth (§2), so an explicit ``refresh`` recovers from crashed runs, the
+    union race, and garbage objects. One carve-out (review finding, PR #208
+    round 4): a stamped leaf at a NON-manifest order — hand-copied data or
+    an old-config survivor of a partial clear — cannot be represented in a
+    fixed-order ranges MOC; it is SKIPPED with a logged warning (this round
+    does not support mixed-order stores) and the root MOC is rebuilt from
+    the conforming leaves, so the escape hatch itself never dies on it. One
+    LIST per digit node (root: ``{sign+base}`` children; below: ``[1-4]``
+    digits; a ``*.zarr`` entry is a leaf at that node), collecting the
+    shards whose commit stamp is present — unstamped debris is excluded,
+    exactly as the D4 model demands. The fresh envelope carries
+    ``source: "refresh"`` and REPLACES the root object (no union: the walk
+    supersedes it). A successful refresh also re-arms the
+    :func:`warn_if_stale` once-per-episode latch for this store. Returns the
+    envelope written, or ``None`` — deleting any existing root object — when
+    no stamped leaf exists (absence is truthful, a stale cache is not, and
+    the ranges envelope has no empty form).
     """
     import obstore
     from obstore.exceptions import NotFoundError
@@ -197,6 +214,7 @@ def refresh_root_coverage(store_root: str, **store_kwargs) -> dict | None:
     manifest = read_manifest(store_root, **store_kwargs)
     if manifest is None:
         raise ValueError(f"no {MANIFEST_NAME} at {store_root} — not a hive store root")
+    order = int(manifest["shard_order"])
     store = open_object_store(store_root, **store_kwargs)
     root = store_root.rstrip("/")
     keys = []
@@ -208,21 +226,37 @@ def refresh_root_coverage(store_root: str, **store_kwargs) -> dict | None:
             rel = child.rstrip("/")
             name = rel.split("/")[-1]
             if name.endswith(".zarr"):
-                if read_commit(open_store(f"{root}/{rel}", **store_kwargs)) is not None:
-                    keys.append(morton_word(name.removesuffix(".zarr")))
+                decimal = name.removesuffix(".zarr")
+                if read_commit(open_store(f"{root}/{rel}", **store_kwargs)) is None:
+                    continue  # unstamped debris (D4)
+                if _decimal_order(decimal) != order:
+                    # A fixed-order ranges MOC cannot represent this leaf:
+                    # either corruption (old-config data surviving a partial
+                    # clear, a hand-copied leaf) or a mixed-order future this
+                    # round does not support. Skip it — the escape hatch must
+                    # not die on the store it exists to repair.
+                    logger.warning(
+                        f"refresh: skipping stamped leaf {decimal} at order "
+                        f"{_decimal_order(decimal)} under a shard_order-{order} manifest "
+                        f"(mixed-order stores are unsupported; clear or re-shard the "
+                        f"foreign-order data) — it will NOT be listed in {ROOT_COVERAGE_NAME}"
+                    )
+                    continue
+                keys.append(morton_word(decimal))
                 continue
             is_digit_node = (
                 _is_base_component(name) if prefix == "" else len(name) == 1 and name in "1234"
             )
             if is_digit_node:
                 stack.append(rel + "/")
+    _stale_warned.discard(root)
     if not keys:
         try:
             obstore.delete(store, ROOT_COVERAGE_NAME)
         except (FileNotFoundError, NotFoundError):
             pass
         return None
-    envelope = build_root_coverage(keys, int(manifest["shard_order"]), source="refresh")
+    envelope = build_root_coverage(keys, order, source="refresh")
     obstore.put(store, ROOT_COVERAGE_NAME, json.dumps(envelope, indent=1).encode())
     return envelope
 

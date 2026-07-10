@@ -180,10 +180,15 @@ enumeration (`members()`/`tree()`) emits a `ZarrUserWarning` and skips it.
   "encoding": "ranges",
   "order": 6,
   "source": "dispatcher",
-  "generated_at": "2026-07-10T22:00:00+00:00",
-  "ranges": [["-42113221", "-42113224"], ["511", "511"]]
+  "generated_at": "2026-07-10T22:59:35+00:00",
+  "ranges": [["5112333", "5112333"], ["-4211321", "-4211324"]]
 }
 ```
+
+The example above is `zagg.hive.build_root_coverage` output for the shards
+`-4211321..-4211324` plus `5112333` (all order 6) and round-trips through
+`root_coverage_words`; the test suite parses it straight out of this file so
+the reference example can never drift from the implementation.
 
 A range is an inclusive run of same-order cells within one base cell,
 consecutive in digit-tail rank; endpoints are decimal **strings** (packed
@@ -201,7 +206,8 @@ negatives are impossible; the bitmap and the root MOC are exact for what
 they list.
 
 **Staleness (O7)**: readers trust silently on the hot path. The root object
-is written fail-open at end of run and is a **regenerable cache** — a
+is written fail-open at **end of run** while leaves stamp continuously, so
+the most common gap is benign — a run still in progress. Beyond that, a
 crashed run, an out-of-band write, or the benign concurrent-run union race
 (GET-union-PUT is not atomic; last writer wins until the next re-union)
 leaves it missing shards, which degrades to "reader doesn't see the newest
@@ -262,9 +268,11 @@ under D9/O7). The §7 sweep remains the authoritative rebuilder.
   completion as its final PUT. The async status channel stays at the flat
   sibling prefix (`{store_root}.status/<run_id>/…`), outside the digit tree.
 - **Coverage ships** ([issue #200](https://github.com/englacial/zagg/issues/200)
-  phases 1–3): the tier-0 morton box on the commit stamp, the exact
-  zstd-bitmap `coverage.moc` sidecar inside each leaf, and the end-of-run
+  phases 1–4): the tier-0 morton box on the commit stamp, the exact
+  zstd-bitmap `coverage.moc` sidecar inside each leaf, the end-of-run
   store-root `coverage.moc` (shard-order ranges MOC, `output.coverage_moc`,
-  default on for hive) for the one-GET bootstrap.
+  default on for hive) for the one-GET bootstrap, plus the `zagg.coverage`
+  reader primitives (per-tier AOI intersection, O7 staleness lean, explicit
+  refresh).
 - Write-throughput validation at fleet scale is tracked with the benchmark
   machinery in [issue #202](https://github.com/englacial/zagg/issues/202).
