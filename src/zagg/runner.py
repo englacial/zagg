@@ -42,6 +42,7 @@ from zagg.config import (
     get_output_region,
     get_parent_order,
     get_pipeline_type,
+    get_store_layout,
     get_store_path,
 )
 from zagg.dispatch import (
@@ -54,6 +55,8 @@ from zagg.dispatch import (
     PreflightReport,
     dispatch,
 )
+from zagg.grids.base import shard_label
+from zagg.grids.morton import morton_word
 from zagg.processing import (
     process_shard,
     write_dataframe_to_zarr,
@@ -171,7 +174,8 @@ def agg(
         Lambda-only (issue #151). ``"async"`` (default) dispatches each cell
         with ``InvocationType="Event"`` and polls a per-shard result object the
         worker writes next to the output store
-        (``<store>.status/<run_id>/<shard_key>.json``), so no synchronous
+        (``<store>.status/<run_id>/<shard_label>.json``, where the label is
+        the decimal morton string for HEALPix — issue #199), so no synchronous
         connection sits idle while the shard runs -- shards longer than a NAT
         idle window (~4 min on GitHub-hosted runners) complete reliably, and
         the 6 MB synchronous response cap no longer applies. Requires (a) a
@@ -907,7 +911,9 @@ def _select_cells(
     catalog_data : dict
         Loaded catalog (shard_keys/granules format).
     morton_cell : str, optional
-        Process a single shard, identified by stringified key.
+        Process a single shard. For a HEALPix catalog this is the shard's
+        decimal morton string (e.g. ``-31123`` — issue #199); for other grids
+        it is the stringified shard-key int.
     max_cells : int, optional
         Truncate to the first N shards.
 
@@ -922,10 +928,33 @@ def _select_cells(
     """
     pairs = list(zip(catalog_data["shard_keys"], catalog_data["granules"]))
     if morton_cell:
-        target = int(morton_cell)
+        grid_type = (catalog_data.get("grid_signature") or {}).get("type")
+        if grid_type == "healpix":
+            try:
+                target = morton_word(morton_cell)
+            except ValueError as e:
+                raise ValueError(
+                    f"--morton-cell {morton_cell!r} is not a decimal morton id "
+                    f"(shard ids are decimal morton strings since issue #199): {e}"
+                ) from e
+        else:
+            target = int(morton_cell)
         matches = [(k, urls) for k, urls in pairs if k == target]
         if not matches:
-            raise ValueError(f"shard '{morton_cell}' not in catalog")
+            msg = f"shard '{morton_cell}' not in catalog"
+            # A well-formed decimal id can still miss because the catalog itself
+            # predates the packed-word form: legacy shard_keys are signed i64
+            # decimal ids (small or negative), while packed words carry a 1..12
+            # prefix in the top 4 bits (always >= 2^60). Hard break — no shim —
+            # but say why the lookup likely failed (review finding, PR #205).
+            keys = catalog_data["shard_keys"]
+            if grid_type == "healpix" and any(int(k) < (1 << 60) for k in keys):
+                msg += (
+                    " (catalog shard_keys look like legacy signed decimal ids, not "
+                    "packed morton words — a pre-issue-199 shard map; regenerate it "
+                    "with `python -m zagg.catalog`)"
+                )
+            raise ValueError(msg)
         return matches
     if max_cells:
         pairs = pairs[:max_cells]
@@ -935,6 +964,22 @@ def _select_cells(
     # the selected shard keys, so a rerun or resume sees the same order.
     random.Random(",".join(str(k) for k, _ in pairs)).shuffle(pairs)
     return pairs
+
+
+def _safe_label(grid, shard_key) -> str:
+    """Render a shard key for log/report lines; NEVER raises (issue #199).
+
+    ``shard_label`` -> ``morton_decimal`` raises on an invalid word — right at
+    path-construction sites (a path component must never be silently wrong),
+    wrong in error-*reporting* paths: re-rendering the same malformed key that
+    made a cell fail would abort the accumulation loop precisely while
+    reporting that failure (review finding, PR #205; mortie's own scalar repr
+    is non-raising for the same reason). Falls back to the raw digits.
+    """
+    try:
+        return shard_label(grid, shard_key)
+    except Exception:
+        return str(shard_key)
 
 
 def _lambda_dispatch_order(cells: list[tuple]) -> list[tuple]:
@@ -1069,8 +1114,12 @@ def _process_and_write(
         # table), so no carrier-specific emptiness check is needed here.
         write_dataframe_to_zarr(carrier, zarr_store, grid=grid, chunk_idx=block_index)
         # Persist this chunk's ragged (CSR) fields — one CSR group per field per
-        # chunk (issue #48). No-ops when ``ragged`` is empty.
-        ragged_key = int(shard_key) if single_chunk else _block_index_key(block_index, grid)
+        # chunk (issue #48). No-ops when ``ragged`` is empty. At K==1 the CSR
+        # subgroup is named by the grid's shard label (the decimal morton string
+        # for HEALPix — issue #199); K>1 keeps the flattened block-index int.
+        ragged_key = (
+            shard_label(grid, shard_key) if single_chunk else _block_index_key(block_index, grid)
+        )
         write_ragged_to_zarr(ragged, zarr_store, grid=grid, shard_key=ragged_key)
 
     # Sharded output (issue #108): the shard's K inner chunks bundle into one
@@ -1155,13 +1204,30 @@ def _run_local(
     else:
         grid = from_config(config)
     _check_signature(grid, catalog_data)
-    zarr_store = open_store(
-        store_path,
-        region=region,
-        credentials=output_credentials,
-        endpoint_url=output_endpoint_url,
-    )
-    zarr_store = grid.emit_template(zarr_store, overwrite=overwrite)
+    store_layout = get_store_layout(config)
+    store_kwargs = {
+        "region": region,
+        "credentials": output_credentials,
+        "endpoint_url": output_endpoint_url,
+    }
+    if store_layout == "hive":
+        # Hive layout (issue #199 phase 2): no shared zarr template — zero
+        # metadata above the leaves (D5). Template time writes only the root
+        # manifest (D6); each shard emits its own leaf template lazily inside
+        # hive.process_and_write_hive (the leaf write path lives in zagg.hive,
+        # next to the manifest/stamp machinery it exercises).
+        from zagg.hive import build_manifest, ensure_manifest, process_and_write_hive
+
+        ensure_manifest(
+            store_path,
+            build_manifest(grid, dataset=catalog_data.get("metadata")),
+            overwrite=overwrite,
+            **store_kwargs,
+        )
+        zarr_store = None
+    else:
+        zarr_store = open_store(store_path, **store_kwargs)
+        zarr_store = grid.emit_template(zarr_store, overwrite=overwrite)
 
     # Per-cell work, catching its own exceptions so one bad cell counts as an
     # error and the run continues (the old loop's ``except`` branch). The
@@ -1186,18 +1252,32 @@ def _run_local(
         ds = _clamped_data_source(config.data_source, len(_resolve_urls(records, driver)))
         cell_config = replace(config, data_source=ds) if ds is not None else config
         try:
-            meta = _process_and_write(
-                shard_key,
-                grid.block_index(int(shard_key)),
-                records,
-                grid,
-                s3_creds,
-                zarr_store,
-                cell_config,
-                driver=driver,
-                handoff=handoff,
-                **extra,
-            )
+            if store_layout == "hive":
+                meta = process_and_write_hive(
+                    shard_key,
+                    _resolve_urls(records, driver),
+                    grid,
+                    s3_creds,
+                    store_path,
+                    cell_config,
+                    store_kwargs=store_kwargs,
+                    driver=driver,
+                    handoff=handoff,
+                    **extra,
+                )
+            else:
+                meta = _process_and_write(
+                    shard_key,
+                    grid.block_index(int(shard_key)),
+                    records,
+                    grid,
+                    s3_creds,
+                    zarr_store,
+                    cell_config,
+                    driver=driver,
+                    handoff=handoff,
+                    **extra,
+                )
             return {"shard_key": shard_key, "ok": True, "meta": meta}
         except Exception as e:
             return {"shard_key": shard_key, "ok": False, "error": e}
@@ -1212,21 +1292,23 @@ def _run_local(
     n = len(cells)
 
     def _accumulate(report, i, outcome):
-        shard_key = outcome["shard_key"]
+        # _safe_label, not shard_label: a malformed key that failed the cell
+        # must not also kill the loop reporting that failure (issue #199).
+        label = _safe_label(grid, outcome["shard_key"])
         if not outcome["ok"]:
             report.cells_error += 1
-            logger.warning(f"  [{i}/{n}] {shard_key}: ERROR {outcome['error']}")
+            logger.warning(f"  [{i}/{n}] {label}: ERROR {outcome['error']}")
             return
         meta = outcome["meta"]
         report.results.append(meta)
         if meta.get("error"):
-            logger.info(f"  [{i}/{n}] {shard_key}: {meta['error']}")
+            logger.info(f"  [{i}/{n}] {label}: {meta['error']}")
         else:
             obs = meta.get("total_obs", 0)
             report.total_obs += obs
             report.cells_with_data += 1
             if i % 10 == 0 or n <= 20:
-                logger.info(f"  [{i}/{n}] {shard_key}: {obs:,} obs")
+                logger.info(f"  [{i}/{n}] {label}: {obs:,} obs")
 
     start_time = time.time()
     try:
@@ -1346,7 +1428,8 @@ def _run_lambda(
 
     # Async result channel (issue #151): a per-run unique status prefix next to
     # the output store. Each worker mirrors its response envelope to
-    # <prefix>/<shard_key>.json and the dispatch threads poll for it instead of
+    # <prefix>/<shard_label>.json (decimal morton string for HEALPix, issue
+    # #199) and the dispatch threads poll for it instead of
     # holding a synchronous invoke connection open -- GitHub-hosted runners sit
     # behind a ~4 min NAT idle timeout that severed every >250 s benchmark
     # target. The run_id keeps reruns into the same store from reading stale
@@ -1414,6 +1497,17 @@ def _run_lambda(
     # inline ``executor.submit(_invoke_lambda_cell, ...)`` passed.
     def _cell_work(payload):
         shard_key, records = payload
+        # Rendered once per cell: the status-object name (below) and the
+        # payload-cap error message in _invoke_lambda_cell both carry it
+        # (issue #199). On ASYNC runs the label becomes a path component (the
+        # status key), so it must raise on a malformed key; on SYNC runs it is
+        # purely cosmetic and a raise out of _cell_work would be RUN-fatal
+        # (dispatch() re-raises), so fall back to the raw digits instead
+        # (review finding, PR #205).
+        if result_prefix is not None:
+            label = shard_label(grid, shard_key)
+        else:
+            label = _safe_label(grid, shard_key)
         # Only thread aoi_payload when the manifest carries a mask (flag on);
         # otherwise omit the kwarg so the event payload is byte-identical to the
         # pre-feature path (issue #101). Mirrors the local runner's _cell_work.
@@ -1425,7 +1519,9 @@ def _run_lambda(
         # timeout + queue/write margin). Sync runs pass none of these, keeping
         # the invoke byte-identical to the legacy path.
         if result_prefix is not None:
-            key = f"{int(shard_key)}.json"
+            # Status objects are named by the shard label — the decimal morton
+            # string for HEALPix (issue #199) — not the raw packed word.
+            key = f"{label}.json"
             extra["result_url"] = f"{result_prefix}/{key}"
             extra["result_fetch"] = _result_fetcher(
                 result_box, result_prefix, output_creds_event, region, key
@@ -1456,6 +1552,7 @@ def _run_lambda(
             max_workers=state["workers"],
             handoff=handoff,
             profile=profile,
+            label=label,
             **extra,
         )
 
@@ -1496,6 +1593,15 @@ def _run_lambda(
     # calls that already happen, so no worker probe tax -- issue #100). They
     # decompose wall time into setup invoke / fan-out / finalize invoke so
     # "where did wall time go" is answerable from the summary.
+    # Hive layout (issue #199 phase 3): setup mode writes morton_hive.json
+    # instead of a global template. The worker builds the manifest itself from
+    # the event's config; only the dataset identity (from the ShardMap
+    # metadata, matching the local path's source) rides in the event — flat
+    # runs omit the key, keeping their setup event byte-identical.
+    dataset = None
+    if get_store_layout(config) == "hive":
+        md = catalog_data.get("metadata") or {}
+        dataset = {"short_name": md.get("short_name"), "version": md.get("version")}
     setup_start = time.time()
     _invoke_lambda_setup(
         state["lambda_client"],
@@ -1507,6 +1613,7 @@ def _run_lambda(
         overwrite=overwrite,
         config_dict=config_dict,
         output_creds_event=output_creds_event,
+        dataset=dataset,
     )
     setup_s = time.time() - setup_start
 
@@ -1521,7 +1628,10 @@ def _run_lambda(
             report.cells_with_data += 1
         elif error not in ("No granules found", "No data after filtering"):
             report.cells_error += 1
-            logger.warning(f"  [{i}/{n}] shard {result.get('shard_key')}: {error}")
+            key = result.get("shard_key")
+            # _safe_label: error reporting must not raise on the bad key itself.
+            label = _safe_label(grid, key) if key is not None else key
+            logger.warning(f"  [{i}/{n}] shard {label}: {error}")
         report.results.append(result)
 
         if i % 50 == 0:
@@ -2196,8 +2306,25 @@ def _invoke_lambda_setup(
     overwrite,
     config_dict,
     output_creds_event=None,
+    dataset=None,
 ):
-    """Invoke Lambda in setup mode to create the zarr template."""
+    """Invoke Lambda in setup mode to create the zarr template.
+
+    For a hive-layout config (issue #199 phase 3) the worker writes
+    ``morton_hive.json`` instead; ``dataset`` (``{"short_name", "version"}``
+    from the ShardMap metadata) is threaded through for the manifest's
+    identity block. The key is added only when set, so flat setup events stay
+    byte-identical.
+
+    Stale-deployment guard (review finding, PR #205): a function deployed
+    before phase 3 has no hive branch — it would emit the flat GLOBAL template
+    at the hive root, return the same 200 body, and the whole run would then
+    silently write a flat store. The phase-3 handler echoes the layout it
+    acted on (``"layout"`` in the response body), and a hive dispatch REQUIRES
+    that echo — failing fast at setup with a redeploy message instead of after
+    a full fan-out. Flat dispatch does not require the echo, so a new
+    dispatcher keeps working against old deployed functions for flat runs.
+    """
     event = {
         "mode": "setup",
         "store_path": store_path,
@@ -2207,6 +2334,8 @@ def _invoke_lambda_setup(
         "overwrite": overwrite,
         "config": config_dict,
     }
+    if dataset is not None:
+        event["dataset"] = dataset
     if output_creds_event is not None:
         event["output_credentials"] = output_creds_event
     response = lambda_client.invoke(
@@ -2220,6 +2349,19 @@ def _invoke_lambda_setup(
     result = json.loads(payload)
     if result.get("statusCode") != 200:
         raise RuntimeError(f"Lambda setup error: {result.get('body')}")
+    requested = ((config_dict or {}).get("output") or {}).get("store_layout") or "flat"
+    if requested == "hive":
+        try:
+            echoed = json.loads(result.get("body") or "{}").get("layout")
+        except (TypeError, ValueError):
+            echoed = None
+        if echoed != "hive":
+            raise RuntimeError(
+                f"Lambda setup did not confirm the hive store layout (response body "
+                f"{result.get('body')!r}): the deployed function predates issue #199 "
+                f"phase 3 and would write a FLAT store at the hive root — redeploy "
+                f"the function before dispatching hive runs"
+            )
 
 
 def _invoke_lambda_finalize(lambda_client, function_name, store_path, output_creds_event=None):
@@ -2261,8 +2403,13 @@ def _invoke_lambda_cell(
     result_url=None,
     result_fetch=None,
     poll_timeout_s=None,
+    label=None,
 ):
     """Invoke Lambda for a single cell with retry logic.
+
+    ``label`` (issue #199) is the shard's rendered external id (decimal morton
+    string for HEALPix) for user-facing messages; ``None`` falls back to the
+    raw ``shard_key`` digits. The event payload always carries the int.
 
     ``max_workers`` is used only for the file-descriptor-exhaustion message
     (#28); it does not affect dispatch. ``profile`` (issue #100) forwards a
@@ -2330,7 +2477,7 @@ def _invoke_lambda_cell(
     payload = json.dumps(event)
     if invocation_type == "Event" and len(payload) > _ASYNC_PAYLOAD_CAP_BYTES:
         raise ValueError(
-            f"cell {shard_key} event payload is {len(payload):,} bytes, over the "
+            f"cell {label or shard_key} event payload is {len(payload):,} bytes, over the "
             f"{_ASYNC_PAYLOAD_CAP_BYTES:,}-byte async dispatch budget (Lambda caps "
             'Event invokes at 256 KB): pass invocation="sync" for this run, or '
             "shrink the per-cell payload (e.g. the strict-AOI aoi_payload)"

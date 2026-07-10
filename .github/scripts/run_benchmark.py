@@ -169,7 +169,9 @@ def run_target(
             catalog=str(shardmap_path),
             store=store,
             backend="lambda",
-            morton_cell=str(shard_key),
+            # morton_cell takes the external shard label (the decimal morton
+            # string for HEALPix — issue #199), not the raw packed-word digits.
+            morton_cell=grid.shard_label(shard_key),
             region=region,
             function_name=function_name,
             overwrite=True,

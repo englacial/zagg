@@ -377,6 +377,10 @@ class TestProcessEventWriteLoop:
         # Regular (non-sharded) write path — a MagicMock attr is truthy by default,
         # so pin it off explicitly (issue #108 routes sharded grids elsewhere).
         grid_stub.sharded = False
+        # K==1 ragged subgroups are keyed by the grid's shard label (issue #199);
+        # a deterministic stub (decimal-string shaped) pins that the handler
+        # routes through the seam rather than stringifying the raw key itself.
+        grid_stub.shard_label = lambda key: f"-{int(key)}"
 
         monkeypatch.setattr(processing, "process_shard", fake_process_shard)
         monkeypatch.setattr(grids, "from_config", lambda *a, **k: grid_stub)
@@ -454,9 +458,10 @@ class TestProcessEventWriteLoop:
         assert seen["chunk_results"] is None  # no accumulation sink
         assert written == [(0,), (1,)]  # each chunk written as it streamed
 
-    def test_k_eq_1_ragged_keyed_by_shard_key(self, handler_mod, monkeypatch):
-        """K=1: the lone chunk's ragged CSR is persisted (the gap this phase closes:
-        the old handler never called write_ragged_to_zarr), keyed by shard_key."""
+    def test_k_eq_1_ragged_keyed_by_shard_label(self, handler_mod, monkeypatch):
+        """K=1: the lone chunk's ragged CSR is persisted, keyed by the grid's
+        shard label (the decimal morton string for HEALPix — issue #199), not
+        the raw shard-key int."""
         chunks = [((0,), pd.DataFrame(), {"h_tdigest": ([], [])})]
         cap = self._patch(handler_mod, monkeypatch, chunks)
         event = _base_event(_healpix_config_dict())
@@ -464,9 +469,9 @@ class TestProcessEventWriteLoop:
         resp = handler_mod._handle_process(event, _context())
         assert resp["statusCode"] == 200
         assert cap["dense"] == [(0,)]
-        # Single chunk -> ragged keyed by shard_key (cell-resolution contract).
+        # Single chunk -> ragged keyed by the stub grid's label of shard_key.
         assert len(cap["ragged"]) == 1
-        assert cap["ragged"][0][0] == event["shard_key"]
+        assert cap["ragged"][0][0] == f"-{event['shard_key']}"
 
     def test_streaming_later_chunk_write_failure_partial_writes_and_500(
         self, handler_mod, monkeypatch
@@ -821,6 +826,220 @@ class TestTemplateExistenceGuard:
         self._patch_real_store(handler_mod, monkeypatch, store)
         resp = handler_mod._handle_process(self._event(), _context())
         assert "Zarr template not found" not in resp["body"]
+
+
+class TestProcessHive:
+    """Issue #199 phase 3: under ``output.store_layout: hive`` the worker owns
+    its WHOLE leaf — it derives the leaf path from ``shard_key`` + the event
+    config's orders, emits its own leaf template, writes its data, and stamps
+    completion as its FINAL PUT — through ``zagg.hive.process_and_write_hive``,
+    the same code path the local dispatcher runs."""
+
+    # Order-6 southern shard; decimal morton string -4211322.
+    _WORD = 11827859996358475782
+
+    @staticmethod
+    def _hive_config_dict():
+        cfg = default_config("atl06")
+        cfg.output["store_layout"] = "hive"
+        return asdict(cfg)
+
+    def _event(self, tmp_path):
+        ev = _base_event(self._hive_config_dict())
+        ev["shard_key"] = self._WORD
+        ev["child_order"] = 12
+        ev["store_path"] = str(tmp_path / "hive-out")
+        return ev
+
+    @staticmethod
+    def _grid():
+        from zagg.config import load_config_from_dict
+
+        cfg = load_config_from_dict(TestProcessHive._hive_config_dict())
+        return from_config(cfg)
+
+    @staticmethod
+    def _carrier(grid, shard):
+        import numpy as np
+
+        from zagg.config import get_data_vars
+
+        coords = grid.chunk_coords(shard)
+        n = len(coords["cell_ids"])
+        df = pd.DataFrame(
+            {
+                var: np.zeros(n, dtype=np.int32 if var == "count" else np.float32)
+                for var in get_data_vars(grid.config)
+            }
+        )
+        for name, vals in coords.items():
+            df[name] = vals
+        return df
+
+    def _streaming_fake(self, grid, ragged=None, die=False):
+        def fake(g, shard_key, urls, **kwargs):
+            carrier = self._carrier(grid, shard_key)
+            kwargs["write_chunk"](grid.block_index(int(shard_key)), carrier, ragged or {})
+            if die:
+                raise RuntimeError("worker died mid-shard")
+            return pd.DataFrame(), {
+                "shard_key": int(shard_key),
+                "cells_with_data": 5,
+                "total_obs": 7,
+                "granule_count": 1,
+                "files_processed": 1,
+                "duration_s": 0.0,
+                "error": None,
+            }
+
+        return fake
+
+    def test_hive_event_writes_leaf_data_and_stamp(self, handler_mod, monkeypatch, tmp_path):
+        import numpy as np
+        import zarr
+        from mortie import MortonIndexArray
+
+        import zagg.processing as processing
+        from zagg import hive
+        from zagg.store import open_store
+
+        grid = self._grid()
+        ragged = {"h": ([np.array([1.0, 2.0])], [0])}
+        monkeypatch.setattr(processing, "process_shard", self._streaming_fake(grid, ragged))
+        event = self._event(tmp_path)
+        resp = handler_mod._handle_process(event, _context())
+        assert resp["statusCode"] == 200, resp["body"]
+        body = json.loads(resp["body"])
+        assert body["shard_key"] == self._WORD
+
+        # The leaf sits at EXACTLY mortie's hive_path under the store root.
+        words = MortonIndexArray.from_words(np.asarray([self._WORD], dtype="uint64"))
+        expected = words.hive_path(root=event["store_path"])[0]
+        assert hive.shard_leaf_path(event["store_path"], self._WORD) == expected
+        leaf_store = open_store(expected)
+
+        # Dense data landed at the leaf-local block; CSR is label-named.
+        grp = zarr.open_group(leaf_store, path=grid.group_path, mode="r", zarr_format=3)
+        np.testing.assert_array_equal(
+            np.asarray(grp["cell_ids"][:]),
+            np.asarray(grid.chunk_coords(self._WORD)["cell_ids"]),
+        )
+        sub = zarr.open_group(leaf_store, path=f"{grid.group_path}/h/-4211322", mode="r")
+        assert "values" in sub.array_keys()
+
+        # The commit stamp is present and carries the worker's counters (D4).
+        stamp = hive.read_commit(leaf_store)
+        assert stamp["complete"] is True
+        assert stamp["cells_with_data"] == 5
+        assert stamp["granule_count"] == 1
+
+    def test_hive_worker_death_leaves_debris_then_retry_cleans(
+        self, handler_mod, monkeypatch, tmp_path
+    ):
+        import os
+
+        import numpy as np
+
+        import zagg.processing as processing
+        from zagg import hive
+        from zagg.store import open_store
+
+        grid = self._grid()
+        event = self._event(tmp_path)
+        leaf = hive.shard_leaf_path(event["store_path"], self._WORD)
+        stale = os.path.join(leaf, grid.group_path, "h", "-4211322")
+
+        # Torn worker: writes a chunk + a CSR subgroup, then dies. The handler
+        # surfaces a 500 envelope; the leaf prefix exists but is UNSTAMPED.
+        torn = self._streaming_fake(grid, ragged={"h": ([np.array([1.0])], [0])}, die=True)
+        monkeypatch.setattr(processing, "process_shard", torn)
+        resp = handler_mod._handle_process(event, _context())
+        assert resp["statusCode"] == 500
+        assert "died mid-shard" in resp["body"]
+        assert os.path.exists(leaf)
+        assert hive.read_commit(open_store(leaf)) is None  # debris
+        assert os.path.exists(stale)
+
+        # Retry (no ragged this time): the leaf is overwritten WHOLESALE — the
+        # torn attempt's CSR subgroup is gone — and stamped at the end.
+        monkeypatch.setattr(processing, "process_shard", self._streaming_fake(grid))
+        resp = handler_mod._handle_process(event, _context())
+        assert resp["statusCode"] == 200, resp["body"]
+        assert hive.read_commit(open_store(leaf))["complete"] is True
+        assert not os.path.exists(stale)
+
+    def test_hive_no_data_shard_leaves_no_prefix(self, handler_mod, monkeypatch, tmp_path):
+        import os
+
+        import zagg.processing as processing
+        from zagg import hive
+
+        def fake(g, shard_key, urls, **kwargs):
+            return pd.DataFrame(), {
+                "shard_key": int(shard_key),
+                "cells_with_data": 0,
+                "total_obs": 0,
+                "granule_count": 1,
+                "files_processed": 0,
+                "duration_s": 0.0,
+                "error": "No data after filtering",
+            }
+
+        monkeypatch.setattr(processing, "process_shard", fake)
+        event = self._event(tmp_path)
+        resp = handler_mod._handle_process(event, _context())
+        assert resp["statusCode"] == 500  # error envelope, as on flat
+        assert not os.path.exists(hive.shard_leaf_path(event["store_path"], self._WORD))
+
+
+class TestSetupHive:
+    """Issue #199 phase 3: for a hive config, setup mode writes ONLY the
+    ``morton_hive.json`` manifest — no global zarr template (D5) — with the
+    same frozen-key resume/overwrite semantics as the local path."""
+
+    def _event(self, tmp_path, config_dict, **extra):
+        return {
+            "mode": "setup",
+            "store_path": str(tmp_path / "hive-out"),
+            "parent_order": 6,
+            "overwrite": False,
+            "config": config_dict,
+            "dataset": {"short_name": "ATL06", "version": "007"},
+            **extra,
+        }
+
+    def test_setup_writes_manifest_only(self, handler_mod, tmp_path):
+        import os
+
+        from zagg import hive
+
+        event = self._event(tmp_path, TestProcessHive._hive_config_dict())
+        resp = handler_mod._handle_setup(event)
+        assert resp["statusCode"] == 200, resp["body"]
+
+        manifest = hive.read_manifest(event["store_path"])
+        assert manifest["spec"] == "morton-hive/1"
+        assert manifest["dataset"] == {"short_name": "ATL06", "version": "007"}
+        assert manifest["shard_order"] == 6
+        assert manifest["cell_order"] == 12
+        # The manifest is the ONLY object: no template arrays, no zarr.json.
+        assert sorted(os.listdir(event["store_path"])) == [hive.MANIFEST_NAME]
+
+    def test_setup_frozen_key_mismatch_is_500_clear_root(self, handler_mod, tmp_path):
+        cfg = TestProcessHive._hive_config_dict()
+        assert handler_mod._handle_setup(self._event(tmp_path, cfg))["statusCode"] == 200
+        # A re-setup with different orders must fail with the pointed remedy,
+        # matching the local dispatcher's ensure_manifest semantics.
+        other = TestProcessHive._hive_config_dict()
+        other["output"]["grid"]["parent_order"] = 5
+        resp = handler_mod._handle_setup(self._event(tmp_path, other))
+        assert resp["statusCode"] == 500
+        assert "clear the store root" in json.loads(resp["body"])["error"]
+
+    def test_setup_rerun_with_matching_config_resumes(self, handler_mod, tmp_path):
+        cfg = TestProcessHive._hive_config_dict()
+        assert handler_mod._handle_setup(self._event(tmp_path, cfg))["statusCode"] == 200
+        assert handler_mod._handle_setup(self._event(tmp_path, cfg))["statusCode"] == 200
 
 
 class TestSetupTemplate:

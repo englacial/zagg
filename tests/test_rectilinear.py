@@ -180,6 +180,12 @@ class TestBlockIndex:
             assert 0 <= rb < grid.n_row_blocks
             assert 0 <= cb < grid.n_col_blocks
 
+    def test_shard_label_is_int_digits(self, grid):
+        # Rect shard keys are packed tile ints, not morton words: the external
+        # label (issue #199) stays the int's decimal digits.
+        packed = grid._pack(2, 3)
+        assert grid.shard_label(packed) == str(packed)
+
 
 class TestChildren:
     def test_children_count(self, grid):

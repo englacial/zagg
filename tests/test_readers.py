@@ -9,6 +9,7 @@ import zarr
 from zarr.storage import MemoryStore
 
 from zagg.csr import write_csr
+from zagg.grids.morton import morton_word
 from zagg.readers.tdigest_tensor import (
     _resolve_chunk_morton,
     chunk_z_range,
@@ -20,7 +21,12 @@ from zagg.stats.tdigest import build_tdigest
 
 
 def _write_chunk(store, field, morton_key, cell_to_values, *, delta=512):
-    """Write one shard subgroup of per-cell t-digests under {field}/{morton_key}."""
+    """Write one shard subgroup of per-cell t-digests under {field}/{morton_key}.
+
+    ``morton_key`` is the subgroup name: a decimal morton string for the
+    shard-keyed layout (issue #199), or a plain int for the K>1 block-keyed
+    layout.
+    """
     cell_ids = sorted(cell_to_values)
     payloads = [build_tdigest(np.asarray(cell_to_values[c]), delta=delta) for c in cell_ids]
     write_csr(store, f"{field}/{morton_key}", payloads, cell_ids)
@@ -164,14 +170,18 @@ class TestChunkZRange:
 
 
 class TestReadTensors:
+    # Two coverage chunks named by their decimal morton strings (issue #199);
+    # the readers report the parsed packed words.
+    _KEY_A, _KEY_B = "112", "243"
+
     def _store(self):
         store = MemoryStore()
         rng = np.random.default_rng(10)
-        # Two chunks (parent mortons 100 and 250), a few populated cells each.
+        # Two chunks (decimal morton names), a few populated cells each.
         _write_chunk(
             store,
             "h_tdigest",
-            100,
+            self._KEY_A,
             {
                 0: rng.uniform(10.0, 30.0, 3_000),
                 5: rng.uniform(12.0, 28.0, 2_000),
@@ -181,25 +191,26 @@ class TestReadTensors:
         _write_chunk(
             store,
             "h_tdigest",
-            250,
+            self._KEY_B,
             {7: rng.uniform(40.0, 60.0, 2_500), 63: rng.uniform(42.0, 58.0, 2_000)},
         )
         return store
 
     def test_shape_and_dtype_default(self):
         out = dict((m, t) for t, m in read_tensors(self._store(), "h_tdigest"))
-        assert set(out) == {100, 250}
+        assert set(out) == {morton_word(self._KEY_A), morton_word(self._KEY_B)}
         for t in out.values():
             assert t.shape == (64, 64, 128)
             assert t.dtype == np.uint32
 
     def test_morton_recovered_from_subgroup_name(self):
+        # Round trip at the read boundary: decimal subgroup name -> packed word.
         mortons = sorted(m for _, m in read_tensors(self._store(), "h_tdigest"))
-        assert mortons == [100, 250]
+        assert mortons == sorted(morton_word(k) for k in (self._KEY_A, self._KEY_B))
 
     def test_populated_cell_placement_rowmajor(self):
         out = dict((m, t) for t, m in read_tensors(self._store(), "h_tdigest"))
-        t = out[100]
+        t = out[morton_word(self._KEY_A)]
         # cell 5 → row 0, col 5; cell 4095 → row 63, col 63.
         assert t[0, 5].sum() > 0
         assert t[63, 63].sum() > 0
@@ -210,9 +221,9 @@ class TestReadTensors:
         store = MemoryStore()
         rng = np.random.default_rng(11)
         n = 5_000
-        _write_chunk(store, "f", 1, {0: rng.uniform(0.0, 40.0, n)})
+        _write_chunk(store, "f", "11", {0: rng.uniform(0.0, 40.0, n)})
         t, m = next(read_tensors(store, "f", n_bins=128, resolution=0.5))
-        assert m == 1
+        assert m == morton_word("11")
         # Most of the population should land in-window (uniform [0,40] in a 64 m
         # window anchored at floor of the 5th pct).
         assert 0.8 * n <= t[0, 0].sum() <= n
@@ -229,6 +240,8 @@ class TestReadTensors:
         assert t.dtype == np_dtype
 
     def test_morton_coord_array_preferred(self):
+        # Block-keyed (K>1) subgroup names — "100"/"250" are not decimal morton
+        # ids, so the reader falls back to the int parse for the whole store.
         store = MemoryStore()
         rng = np.random.default_rng(13)
         _write_chunk(store, "f", 100, {0: rng.uniform(0.0, 30.0, 2_000)})
@@ -257,6 +270,39 @@ class TestReadTensors:
         mapping = _resolve_chunk_morton(store, "f", ["99", "100", "1000"], 3)
         assert mapping == {"99": 900, "100": 901, "1000": 902}
 
+    def test_morton_coord_array_decimal_names_word_order(self):
+        # Decimal morton names align with the coord array in packed-word order
+        # (issue #199): northern-base "31123" sorts before southern "-31123",
+        # even though int/lexicographic order would put the negative first.
+        store = MemoryStore()
+        rng = np.random.default_rng(34)
+        for key in ("-31123", "31123"):
+            _write_chunk(store, "f", key, {0: rng.uniform(0.0, 30.0, 1_000)})
+        assert morton_word("31123") < morton_word("-31123")
+        arr = zarr.open_array(
+            store, path="f/morton", mode="w", shape=(2,), chunks=(2,), dtype="uint64"
+        )
+        arr[...] = np.array([900, 901], dtype=np.uint64)
+        mapping = _resolve_chunk_morton(store, "f", ["-31123", "31123"], 3)
+        assert mapping == {"31123": 900, "-31123": 901}
+
+    def test_lone_digit_names_are_block_keys(self):
+        # Review finding (PR #205): "5"/"6" fit the raw decimal grammar as
+        # order-0 ids, but real shard ids always carry >= 2 digits (shard
+        # orders are >= 1) — lone digits are block-index keys, parsed as ints.
+        from zagg.readers.tdigest_tensor import _subgroup_words
+
+        assert _subgroup_words(["5", "6", "1"]) == {"5": 5, "6": 6, "1": 1}
+
+    def test_signed_name_in_block_keyed_store_raises(self):
+        # Review finding (PR #205): a signed name can never be a block index,
+        # so a store mixing decimal-id and non-id names (pre-#199 debris) must
+        # fail loudly instead of silently degrading every id to a bogus int.
+        from zagg.readers.tdigest_tensor import _subgroup_words
+
+        with pytest.raises(ValueError, match="ambiguous"):
+            _subgroup_words(["-31123", "100"])
+
     def test_raise_when_chunk_too_wide(self):
         store = MemoryStore()
         rng = np.random.default_rng(14)
@@ -284,11 +330,11 @@ class TestReadRawValues:
         store = MemoryStore()
         # Few enough values (< delta) that build_tdigest performs no merges.
         vals = np.array([3.0, 1.0, 2.0, 5.0, 4.0])
-        _write_chunk(store, "f", 42, {7: vals}, delta=512)
+        _write_chunk(store, "f", "42", {7: vals}, delta=512)
         out = list(read_raw_values(store, "f"))
         assert len(out) == 1
         morton, cell_id, recovered = out[0]
-        assert morton == 42
+        assert morton == morton_word("42")
         assert cell_id == 7
         # Digest stores centroids sorted by mean → sorted samples.
         np.testing.assert_allclose(recovered, np.sort(vals))
@@ -332,7 +378,8 @@ class TestReadLocations:
 
         store, vals, locs_in = self._located_store()
         out = {(m, c): locs for m, c, locs in read_locations(store, "f")}
-        assert set(out) == {(42, 3), (42, 9)}
+        w = morton_word("42")
+        assert set(out) == {(w, 3), (w, 9)}
         for (_, cid), locs in out.items():
             assert locs.dtype == np.uint64
             # Loss-free regime: locations are the cell's point words co-sorted

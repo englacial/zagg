@@ -35,7 +35,10 @@ dependencies = [
     # register from it). 0.2.0 is not on PyPI yet — resolution fails until
     # upstream publishes it.
     "h5coro-hidefix>=0.3.1",
-    "mortie>=0.8.5",
+    # 0.9.0 ships the decimal-emit surface shard ids route through (issue #199):
+    # decimal_repr / to_decimal, the _decimal_to_word parse-back, hive_path, and
+    # the MortonIndexScalar decimal display.
+    "mortie>=0.9.0",
     "earthaccess",
     "boto3",
     "fastparquet",

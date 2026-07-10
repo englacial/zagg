@@ -34,13 +34,19 @@ _ATL06_SIG = {
 }
 
 
+# Packed morton words (the canonical catalog form) whose decimal morton
+# strings — the external form ``--morton-cell`` takes since issue #199 — are
+# -4211324 / -4211323 / -4211322.
+_CATALOG_WORDS = [11828422946311897094, 11828141471335186438, 11827859996358475782]
+
+
 @pytest.fixture
 def catalog_file(tmp_path):
     """A minimal Phase-5 ShardMap JSON for testing."""
     catalog = {
         "metadata": {"short_name": "ATL06", "total_shards": 3, "total_granules": 6},
         "grid_signature": _ATL06_SIG,
-        "shard_keys": [-4211324, -4211323, -4211322],
+        "shard_keys": _CATALOG_WORDS,
         "granules": [[_rec(4), _rec(5), _rec(6)], [_rec(3)], [_rec(1), _rec(2)]],
     }
     p = tmp_path / "catalog.json"
@@ -89,14 +95,27 @@ class TestDryRun:
         )
         assert result["total_cells"] == 1
 
-    def test_dry_run_invalid_morton_cell(self, atl06_config, catalog_file):
+    def test_dry_run_absent_morton_cell(self, atl06_config, catalog_file):
+        # A well-formed decimal morton id that isn't in the catalog.
         with pytest.raises(ValueError, match="not in catalog"):
             agg(
                 atl06_config,
                 catalog=catalog_file,
                 store="./out.zarr",
                 dry_run=True,
-                morton_cell="99999999",
+                morton_cell="-4211321",
+            )
+
+    def test_dry_run_malformed_morton_cell(self, atl06_config, catalog_file):
+        # HEALPix catalogs take decimal morton ids (issue #199): a raw packed
+        # word (digits outside 1..4) is rejected with a pointed message.
+        with pytest.raises(ValueError, match="not a decimal morton id"):
+            agg(
+                atl06_config,
+                catalog=catalog_file,
+                store="./out.zarr",
+                dry_run=True,
+                morton_cell="11827859996358475782",
             )
 
 
@@ -135,12 +154,79 @@ class TestSelectCells:
         assert sorted(k for k, _ in pairs) == list(range(10))
 
     def test_morton_cell(self):
+        # A non-healpix signature keeps the stringified-int parse.
         pairs = _select_cells(self._data(3), morton_cell="1")
         assert [k for k, _ in pairs] == [1]
 
     def test_invalid_morton_cell(self):
         with pytest.raises(ValueError, match="not in catalog"):
             _select_cells(self._data(2), morton_cell="99")
+
+    def test_morton_cell_healpix_decimal_round_trip(self):
+        # HEALPix catalogs store packed words; --morton-cell takes the decimal
+        # morton string and matches after the parse-back (issue #199).
+        data = {
+            "metadata": {},
+            "grid_signature": {"type": "healpix"},
+            "shard_keys": [11827859996358475782, 11828141471335186438],
+            "granules": [[_rec(1)], [_rec(2)]],
+        }
+        pairs = _select_cells(data, morton_cell="-4211322")
+        assert [k for k, _ in pairs] == [11827859996358475782]
+
+    def test_morton_cell_healpix_rejects_packed_word(self):
+        data = {
+            "metadata": {},
+            "grid_signature": {"type": "healpix"},
+            "shard_keys": [11827859996358475782],
+            "granules": [[_rec(1)]],
+        }
+        with pytest.raises(ValueError, match="not a decimal morton id"):
+            _select_cells(data, morton_cell="11827859996358475782")
+
+    def test_morton_cell_miss_on_legacy_catalog_hints_regenerate(self):
+        # A pre-#199 catalog stores legacy signed-i64 keys; a well-formed
+        # decimal id then misses every packed-word comparison. Hard break — no
+        # shim — but the error says why (review finding, PR #205).
+        data = {
+            "metadata": {},
+            "grid_signature": {"type": "healpix"},
+            "shard_keys": [-4211322, -4211323],
+            "granules": [[_rec(1)], [_rec(2)]],
+        }
+        with pytest.raises(ValueError, match="legacy signed decimal ids"):
+            _select_cells(data, morton_cell="-4211322")
+
+    def test_morton_cell_miss_on_packed_catalog_stays_bare(self):
+        # A genuinely absent id in a packed-word catalog keeps the plain
+        # message — the legacy hint fires only when the keys look legacy.
+        data = {
+            "metadata": {},
+            "grid_signature": {"type": "healpix"},
+            "shard_keys": [11827859996358475782],
+            "granules": [[_rec(1)]],
+        }
+        with pytest.raises(ValueError, match="not in catalog$"):
+            _select_cells(data, morton_cell="-4211321")
+
+
+class TestSafeLabel:
+    """Issue #199 (review finding, PR #205): error-reporting label rendering
+    must never raise — re-rendering the malformed key that failed a cell would
+    abort the accumulation loop precisely while reporting that failure."""
+
+    def test_falls_back_to_digits_on_invalid_key(self):
+        from zagg.runner import _safe_label
+
+        g = HealpixGrid(parent_order=6, child_order=12, config=default_config("atl06"))
+        # 0 is the empty sentinel: shard_label raises; _safe_label renders digits.
+        assert _safe_label(g, 0) == "0"
+
+    def test_renders_decimal_for_valid_key(self):
+        from zagg.runner import _safe_label
+
+        g = HealpixGrid(parent_order=6, child_order=12, config=default_config("atl06"))
+        assert _safe_label(g, 11827859996358475782) == "-4211322"
 
 
 class TestLambdaDispatchOrder:
@@ -776,7 +862,7 @@ class TestInvokeLambdaCellAsync:
 
         client = MagicMock()
         big_aoi = list(range(_ASYNC_PAYLOAD_CAP_BYTES // 4))  # >250 KB serialized
-        with pytest.raises(ValueError, match='pass invocation="sync"'):
+        with pytest.raises(ValueError, match='pass invocation="sync"') as excinfo:
             _invoke_lambda_cell(
                 client,
                 (0,),
@@ -790,10 +876,14 @@ class TestInvokeLambdaCellAsync:
                 config_dict=None,
                 max_workers=4,
                 aoi_payload=big_aoi,
-                result_url="s3://out/x.zarr.status/run1/12345.json",
+                result_url="s3://out/x.zarr.status/run1/-12345.json",
                 result_fetch=lambda: None,
                 poll_timeout_s=10.0,
+                label="-12345",
             )
+        # The message names the cell by its rendered label (issue #199), not
+        # the raw packed-word digits.
+        assert "cell -12345 " in str(excinfo.value)
         client.invoke.assert_not_called()
 
     def test_oversized_payload_allowed_on_sync_path(self):
@@ -942,7 +1032,7 @@ class TestInvocationPassthrough:
     (issue #151); async threads the per-shard result channel into the cell
     invoke. Same mocked drive as ``TestMaxRetriesPassthrough``."""
 
-    def _drive(self, monkeypatch, atl06_config, catalog_file, **agg_kwargs):
+    def _drive(self, monkeypatch, atl06_config, catalog_file, *, grid_factory=None, **agg_kwargs):
         from unittest.mock import MagicMock
 
         import boto3
@@ -952,13 +1042,14 @@ class TestInvocationPassthrough:
         from zagg.concurrency import ConcurrencyReport
 
         captured = {}
+        grid_factory = grid_factory or _stub_grid
 
         monkeypatch.setattr(
             runner,
             "get_nsidc_s3_credentials",
             lambda: {"accessKeyId": "a", "secretAccessKey": "s", "sessionToken": "t"},
         )
-        monkeypatch.setattr(grids_mod, "from_config", lambda *a, **k: _stub_grid())
+        monkeypatch.setattr(grids_mod, "from_config", lambda *a, **k: grid_factory())
         monkeypatch.setattr(runner, "_invoke_lambda_setup", lambda *a, **k: None)
         monkeypatch.setattr(runner, "_invoke_lambda_finalize", lambda *a, **k: None)
         monkeypatch.setattr(runner, "_get_function_timeout_s", lambda *a, **k: 720)
@@ -983,6 +1074,7 @@ class TestInvocationPassthrough:
                 result_url=k.get("result_url"),
                 result_fetch=k.get("result_fetch"),
                 poll_timeout_s=k.get("poll_timeout_s"),
+                label=k.get("label"),
             )
             return {
                 "status_code": 200,
@@ -1004,9 +1096,13 @@ class TestInvocationPassthrough:
 
     def test_default_async_threads_result_channel(self, monkeypatch, atl06_config, catalog_file):
         captured = self._drive(monkeypatch, atl06_config, catalog_file)
-        # <store>.status/<run_id>/<shard_key>.json, run_id unique per run.
+        # <store>.status/<run_id>/<shard_label>.json, run_id unique per run.
         assert captured["result_url"].startswith("s3://out/x.zarr.status/")
         assert captured["result_url"].endswith(".json")
+        # The object is named by the grid's shard label (issue #199) — the stub
+        # labels key k as "-{k}" — never the raw packed-word digits alone.
+        name = captured["result_url"].rsplit("/", 1)[1]
+        assert name in {f"-{w}.json" for w in _CATALOG_WORDS}
         assert callable(captured["result_fetch"])
         # _drive pins the function timeout at 720 -> deadline 720 + margin.
         from zagg.runner import _ASYNC_POLL_MARGIN_S
@@ -1018,6 +1114,37 @@ class TestInvocationPassthrough:
         assert captured["result_url"] is None
         assert captured["result_fetch"] is None
         assert captured["poll_timeout_s"] is None
+
+    @staticmethod
+    def _raising_label_grid():
+        g = _stub_grid()
+        g.shard_label.side_effect = ValueError("invalid word")
+        return g
+
+    def test_sync_malformed_key_label_falls_back(self, monkeypatch, atl06_config, catalog_file):
+        # Review finding (PR #205): on SYNC runs the label never becomes a
+        # path (no status key), so a malformed key must not raise out of
+        # _cell_work — an exception there is RUN-fatal on the Lambda path.
+        # It falls back to the raw digits instead.
+        captured = self._drive(
+            monkeypatch,
+            atl06_config,
+            catalog_file,
+            invocation="sync",
+            grid_factory=self._raising_label_grid,
+        )
+        assert captured["label"] in {str(w) for w in _CATALOG_WORDS}
+
+    def test_async_malformed_key_is_fail_loud(self, monkeypatch, atl06_config, catalog_file):
+        # On ASYNC runs the label names the status object — a path component —
+        # so the same malformed key fails loudly before dispatch.
+        with pytest.raises(ValueError, match="invalid word"):
+            self._drive(
+                monkeypatch,
+                atl06_config,
+                catalog_file,
+                grid_factory=self._raising_label_grid,
+            )
 
     def test_unknown_invocation_raises(self, atl06_config, catalog_file):
         with pytest.raises(ValueError, match="Unknown invocation"):
@@ -1089,8 +1216,9 @@ class TestProcessAndWriteStreaming:
     """Issue #91: the non-sharded ``_process_and_write`` streams each chunk through a
     ``write_chunk`` callback (no ``chunk_results`` accumulation). Drive a fake
     ``process_shard`` that streams 1 and K>1 chunks through the callback and assert
-    the dense ``chunk_idx`` sequence + ragged keying (shard_key at K=1, block-index
-    key at K>1) — the runner-level analogue of the lambda streaming test."""
+    the dense ``chunk_idx`` sequence + ragged keying (the grid's shard label at K=1
+    — issue #199 — block-index key at K>1) — the runner-level analogue of the
+    lambda streaming test."""
 
     def _run(self, monkeypatch, atl06_config, *, chunks_per_shard, chunks):
         from unittest.mock import MagicMock
@@ -1112,6 +1240,9 @@ class TestProcessAndWriteStreaming:
         grid.sharded = False
         grid.chunks_per_shard = chunks_per_shard
         grid.chunk_grid_shape = (4,)
+        # K==1 ragged subgroups are keyed by the grid's shard label (issue
+        # #199); a deterministic decimal-string-shaped stub pins the seam.
+        grid.shard_label = lambda key: f"-{int(key)}"
 
         monkeypatch.setattr(runner, "process_shard", fake_process_shard)
         monkeypatch.setattr(
@@ -1138,7 +1269,7 @@ class TestProcessAndWriteStreaming:
         )
         return cap
 
-    def test_k1_streams_ragged_keyed_by_shard_key(self, monkeypatch, atl06_config):
+    def test_k1_streams_ragged_keyed_by_shard_label(self, monkeypatch, atl06_config):
         import pandas as pd
 
         cap = self._run(
@@ -1150,7 +1281,7 @@ class TestProcessAndWriteStreaming:
         # Streaming seam wired: callback passed, no accumulation sink.
         assert callable(cap["write_chunk"]) and cap["chunk_results"] is None
         assert cap["dense"] == [(5,)]
-        assert cap["ragged"] == [5]  # K=1 -> keyed by shard_key
+        assert cap["ragged"] == ["-5"]  # K=1 -> keyed by the grid's shard label (#199)
 
     def test_k_gt_1_streams_ragged_keyed_by_block_index(self, monkeypatch, atl06_config):
         import pandas as pd
@@ -1176,6 +1307,9 @@ def _stub_grid():
     grid.signature.return_value = {}
     grid.spatial_signature.return_value = {}
     grid.block_index.side_effect = lambda k: (k,)
+    # Deterministic decimal-string-shaped labels (issue #199) so status keys
+    # and CSR subgroup names built off the stub are real strings.
+    grid.shard_label.side_effect = lambda k: f"-{int(k)}"
     grid.emit_template.side_effect = lambda store, overwrite=False: store
     return grid
 

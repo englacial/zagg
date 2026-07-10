@@ -318,6 +318,33 @@ def validate_config(config: PipelineConfig) -> None:
             f"output.consolidate_metadata must be a boolean (got {consolidate_metadata!r})"
         )
 
+    # Optional store layout (issue #199 phase 2): "flat" (default, today's single
+    # shared store) or "hive" (one leaf zarr per shard under a morton digit tree —
+    # docs/design/sparse_coverage.md D1-D6). Hive ids are morton decimal strings,
+    # so the layout is HEALPix-only; the sharded (ShardingCodec) write path and
+    # metadata consolidation both assume the single shared store, so they are
+    # rejected with hive rather than silently mis-writing.
+    store_layout = config.output.get("store_layout")
+    if store_layout is not None and store_layout not in ("flat", "hive"):
+        raise ValueError(f"output.store_layout must be 'flat' or 'hive' (got {store_layout!r})")
+    if store_layout == "hive":
+        if (grid or {}).get("type", "healpix") != "healpix":
+            raise ValueError(
+                "output.store_layout: hive requires a healpix grid (hive node names "
+                f"are morton decimal digits; grid type is {(grid or {}).get('type')!r})"
+            )
+        if (grid or {}).get("sharded"):
+            raise ValueError(
+                "output.store_layout: hive does not support sharded (ShardingCodec) "
+                "output yet — each hive leaf is a vanilla zarr v3 store (D3); drop "
+                "sharded or use the flat layout"
+            )
+        if consolidate_metadata:
+            raise ValueError(
+                "output.store_layout: hive has no store-root zarr hierarchy to "
+                "consolidate (D5/D12) — drop output.consolidate_metadata"
+            )
+
     # Validate bounds structure (optional)
     if config.bounds is not None:
         allowed_keys = {"temporal", "spatial"}
@@ -1505,6 +1532,26 @@ def get_store_path(config: PipelineConfig) -> str | None:
     str or None
     """
     return config.output.get("store")
+
+
+def get_store_layout(config: PipelineConfig) -> str:
+    """Return the STORE layout — flat single store vs morton hive (issue #199).
+
+    Distinct from ``output.grid.layout`` (the HEALPix *array* layout inside one
+    store): ``output.store_layout`` selects how shard output is arranged under
+    ``output.store``. ``"flat"`` (default) is today's single shared zarr store.
+    ``"hive"`` writes one self-describing leaf zarr per shard at
+    ``{store}/{sign+base}/{d1}/.../{full_id}.zarr`` with a root
+    ``morton_hive.json`` manifest and a per-leaf commit stamp — see
+    ``docs/design/sparse_coverage.md`` (D1-D6) and :mod:`zagg.hive`. A
+    present-but-null key falls back to the default, like ``layout``.
+
+    Returns
+    -------
+    str
+        ``"flat"`` (default) or ``"hive"``.
+    """
+    return config.output.get("store_layout") or "flat"
 
 
 def get_aoi_mask(config: PipelineConfig) -> bool:

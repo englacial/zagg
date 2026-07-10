@@ -258,6 +258,17 @@ class OutputGrid(Protocol):
         """
         ...
 
+    def shard_label(self, shard_key: ShardKey) -> str:
+        """External string form of a shard key (issue #199).
+
+        Used wherever a shard id surfaces outside the process — CSR subgroup
+        names, async ``.status`` object keys, log lines. HEALPix renders the
+        packed word as its decimal morton string (D1 in
+        ``docs/design/sparse_coverage.md``); rectilinear keeps the packed tile
+        int's decimal digits.
+        """
+        ...
+
     def shard_footprint(self, shard_key: ShardKey):
         """Shard polygon in WGS84 (shapely.Geometry)."""
         ...
@@ -302,10 +313,23 @@ class OutputGrid(Protocol):
         ...
 
 
+def shard_label(grid, shard_key) -> str:
+    """External string form of ``shard_key`` under ``grid`` (issue #199).
+
+    Dispatches to ``grid.shard_label`` (decimal morton string for HEALPix,
+    plain int digits for rectilinear) and falls back to ``str(int(...))`` for
+    minimal grid stand-ins that don't implement the method (the same tolerance
+    the worker extends to ``iter_chunks``).
+    """
+    fn = getattr(grid, "shard_label", None)
+    return fn(shard_key) if fn is not None else str(int(shard_key))
+
+
 __all__ = [
     "OutputGrid",
     "ShardKey",
     "InconsistentShardError",
+    "shard_label",
     "vector_array_spec",
     "chunk_array_spec",
     "sharded_array_spec",

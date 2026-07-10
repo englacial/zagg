@@ -31,15 +31,19 @@ Event payload (default / process mode):
         allocated), keeping the flag-off event and outputs byte-identical.
     "result_url": str (optional, issue #151) -- where to ALSO write this
         invocation's response envelope as JSON (e.g.
-        "s3://bucket/out.zarr.status/<run_id>/<shard_key>.json"). Set by the
-        orchestrator's async dispatch (InvocationType="Event", which discards
+        "s3://bucket/out.zarr.status/<run_id>/<shard_label>.json", where the
+        label is the decimal morton string for HEALPix -- issue #199). Set by
+        the orchestrator's async dispatch (InvocationType="Event", which discards
         the return value); the orchestrator polls this object instead of
         holding a synchronous connection open while the shard runs. Written
         with the output-store credentials. Absent -> no write, and the event
         and behavior are byte-identical to the synchronous path.
 }
 
-Setup mode (creates the zarr template once before per-cell fan-out):
+Setup mode (creates the zarr template once before per-cell fan-out; for a
+hive-layout config -- output.store_layout: hive, issue #199 -- it writes the
+morton_hive.json manifest instead, and each process-mode worker emits its own
+leaf template):
 {
     "mode": "setup",
     "store_path": str,
@@ -47,7 +51,10 @@ Setup mode (creates the zarr template once before per-cell fan-out):
     "n_parent_cells": int,      # OPTIONAL -- dense layout only (populated count)
     "overwrite": bool,
     "config": dict,             # single source of truth: child_order, chunk_inner,
-                                #   layout, and grid type all come from here
+                                #   layout, store_layout, and grid type all come from here
+    "dataset": dict (optional, hive only) -- {"short_name", "version"} identity
+        block for the manifest, sourced from the ShardMap metadata by the
+        orchestrator (matching the local dispatcher). Absent on flat runs.
     "output_credentials": dict (optional, same shape as process mode),
 }
 
@@ -126,7 +133,8 @@ from zarr import open_group
 from zarr.errors import GroupNotFoundError
 
 # Import cloud-agnostic processing
-from zagg.config import get_handoff, load_config_from_dict
+from zagg.config import get_handoff, get_store_layout, load_config_from_dict
+from zagg.grids.base import shard_label
 from zagg.processing import (
     write_dataframe_to_zarr,
     write_ragged_to_zarr,
@@ -590,12 +598,38 @@ def _handle_extract(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
 
 
 def _handle_setup(event: Dict[str, Any]) -> Dict[str, Any]:
-    """Create the zarr template at ``event['store_path']``."""
+    """Create the zarr template at ``event['store_path']``.
+
+    For a hive-layout config (issue #199 phase 3) template time writes ONLY
+    the ``morton_hive.json`` manifest — no global zarr template exists (zero
+    metadata above the leaves, D5); each worker emits its own leaf template.
+    The optional ``dataset`` event key carries the manifest's identity block
+    (the orchestrator sources it from the ShardMap metadata, same as the local
+    path). The flat path below is byte-identical to before, bar one addition:
+    the success body now ECHOES the layout it acted on (``"layout"``) — a
+    stale deployment without the hive branch returns the old echo-less body,
+    which the dispatcher rejects for hive runs instead of silently letting old
+    workers write a flat store at the hive root (review finding, PR #205).
+    """
     from zagg.grids import from_config
 
     logger.info(f"Setup mode: creating template at {event.get('store_path')}")
     try:
         config = load_config_from_dict(event["config"])
+        if get_store_layout(config) == "hive":
+            from zagg.hive import build_manifest, ensure_manifest
+
+            grid = from_config(config, parent_order=event.get("parent_order"))
+            ensure_manifest(
+                event["store_path"],
+                build_manifest(grid, dataset=event.get("dataset")),
+                overwrite=event.get("overwrite", False),
+                **_output_store_kwargs(event),
+            )
+            return {
+                "statusCode": 200,
+                "body": json.dumps({"ok": True, "mode": "setup", "layout": "hive"}),
+            }
         store = open_store(event["store_path"], **_output_store_kwargs(event))
         # Build the grid exactly as the worker does (from_config), so the
         # template's chunk structure can't drift from what workers write. The
@@ -616,7 +650,10 @@ def _handle_setup(event: Dict[str, Any]) -> Dict[str, Any]:
             populated_shards=populated,
         )
         grid.emit_template(store, overwrite=event.get("overwrite", False))
-        return {"statusCode": 200, "body": json.dumps({"ok": True, "mode": "setup"})}
+        return {
+            "statusCode": 200,
+            "body": json.dumps({"ok": True, "mode": "setup", "layout": "flat"}),
+        }
     except Exception as e:
         logger.exception(e)
         return {"statusCode": 500, "body": json.dumps({"error": str(e), "mode": "setup"})}
@@ -871,92 +908,131 @@ def _handle_process(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
         # chunk is keyed by its own block index.
         single_chunk = int(getattr(grid, "chunks_per_shard", 1)) == 1
 
-        # Lazy store + one-time template check, opened on the FIRST chunk write so a
-        # no-data shard (zero chunks) never touches the store, exactly as before. A
-        # missing template or a failed write is RECORDED (not raised) so ``metadata``
-        # from ``process_shard`` survives — the buffered path returned its 500 with
-        # that metadata; folding the error in after the stream preserves that body.
         store_box: dict = {}
         write_error: dict = {}
         _write_elapsed = 0.0
+        chunk_results: list | None = None
+        _df_out = None
 
-        def _get_store():
-            """Open + template-check once; returns the store, or None if the template
-            is missing (recording the error so the write is skipped)."""
-            if "store" in store_box:
-                return store_box["store"]
-            if write_error:
-                return None
-            store = open_store(store_path, **_output_store_kwargs(event))
-            # Validate the Zarr template exists before writing. ``store`` is a zarr v3
-            # ``Store`` whose ``exists()`` is async, so open the group via the high-level
-            # sync API and catch the missing-node error instead (issue #118), in the same
-            # open-and-catch spirit as ``readers/tdigest_tensor.py``.
-            # ``GroupNotFoundError`` is raised identically on LocalStore and obstore (S3);
-            # a present-but-wrong-type node surfaces as a real error, not "missing".
-            try:
-                open_group(store, path=grid.group_path, mode="r", zarr_format=3)
-            except GroupNotFoundError:
-                msg = f"Zarr template not found at {store_path}/{grid.group_path}"
-                logger.error(msg)
-                write_error["msg"] = msg
-                return None
-            logger.info(f"  Writing data to {store_path}...")
-            store_box["store"] = store
-            return store
+        if get_store_layout(config) == "hive":
+            # Hive layout (issue #199 phase 3): the worker owns its WHOLE leaf
+            # zarr — it derives the leaf path from shard_key + the event's
+            # config orders, emits its own leaf template (lazily, on the first
+            # chunk), writes its data, and stamps completion as its FINAL PUT
+            # (D4), on error-free shards only. process_and_write_hive is the
+            # same code path the local dispatcher runs, so leaf semantics
+            # cannot drift between backends. A write failure raises out to the
+            # handler's exception envelope: the leaf is then unstamped debris,
+            # overwritten wholesale on retry — the same recovery model as the
+            # local path (no per-chunk error recording needed).
+            from zagg.hive import process_and_write_hive
 
-        def _write_chunk(block_index, carrier, ragged):
-            nonlocal _write_elapsed
-            if write_error:
-                return  # a prior chunk failed (or template missing) — skip the rest
-            store = _get_store()
-            if store is None:
-                return  # template missing — recorded in write_error, skip the rest
-            _t0 = time.time() if profile else None
-            try:
-                # write_dataframe_to_zarr no-ops on an empty carrier, so no per-chunk
-                # emptiness check is needed. Use each chunk's own block_index.
-                write_dataframe_to_zarr(carrier, store, grid=grid, chunk_idx=block_index)
-                ragged_key = int(shard_key) if single_chunk else _block_index_key(block_index, grid)
-                write_ragged_to_zarr(ragged, store, grid=grid, shard_key=ragged_key)
-            except Exception as e:
-                # Mirror the buffered path's ``except``: record the failure, stop
-                # writing, and let the run surface a 500 after process_shard returns.
-                logger.error(f"Failed to write zarr to {store_path}: {e}")
-                write_error["msg"] = f"Failed to write zarr: {e}"
-                return
-            if profile:
-                _write_elapsed += time.time() - _t0
-
-        chunk_results: list | None = [] if sharded else None
-        _df_out, metadata = process_shard(
-            grid,
-            shard_key,
-            event["granule_urls"],
-            s3_credentials=s3_creds,
-            config=config,
-            chunk_results=chunk_results,
-            write_chunk=None if sharded else _write_chunk,
-            handoff=handoff,
-            profile=profile,
-            aoi_payload=aoi_payload,
-        )
-
-        # Sharded output (issue #108): bundle the shard's K inner chunks into one
-        # ShardingCodec shard object — one block selection per dense array (a per-
-        # inner-chunk loop would read-modify-write the same shard object). This path
-        # accumulated all K, so it opens + validates + writes here (same recording).
-        if sharded and chunk_results:
-            store = _get_store()
-            if store is not None:
-                _write_t0 = time.time() if profile else None
+            metadata = process_and_write_hive(
+                shard_key,
+                event["granule_urls"],
+                grid,
+                s3_creds,
+                store_path,
+                config,
+                store_kwargs=_output_store_kwargs(event),
+                handoff=handoff,
+                aoi_payload=aoi_payload,
+                profile=profile,
+            )
+        else:
+            # Flat layout: lazy store + one-time template check, opened on the
+            # FIRST chunk write so a no-data shard (zero chunks) never touches
+            # the store, exactly as before. A missing template or a failed
+            # write is RECORDED (not raised) so ``metadata`` from
+            # ``process_shard`` survives — the buffered path returned its 500
+            # with that metadata; folding the error in after the stream
+            # preserves that body.
+            def _get_store():
+                """Open + template-check once; returns the store, or None if the template
+                is missing (recording the error so the write is skipped)."""
+                if "store" in store_box:
+                    return store_box["store"]
+                if write_error:
+                    return None
+                store = open_store(store_path, **_output_store_kwargs(event))
+                # Validate the Zarr template exists before writing. ``store`` is a zarr v3
+                # ``Store`` whose ``exists()`` is async, so open the group via the high-level
+                # sync API and catch the missing-node error instead (issue #118), in the same
+                # open-and-catch spirit as ``readers/tdigest_tensor.py``.
+                # ``GroupNotFoundError`` is raised identically on LocalStore and obstore (S3);
+                # a present-but-wrong-type node surfaces as a real error, not "missing".
                 try:
-                    write_shard_to_zarr(chunk_results, store, grid=grid, shard_key=int(shard_key))
-                    if profile:
-                        _write_elapsed += time.time() - _write_t0
+                    open_group(store, path=grid.group_path, mode="r", zarr_format=3)
+                except GroupNotFoundError:
+                    msg = f"Zarr template not found at {store_path}/{grid.group_path}"
+                    logger.error(msg)
+                    write_error["msg"] = msg
+                    return None
+                logger.info(f"  Writing data to {store_path}...")
+                store_box["store"] = store
+                return store
+
+            def _write_chunk(block_index, carrier, ragged):
+                nonlocal _write_elapsed
+                if write_error:
+                    return  # a prior chunk failed (or template missing) — skip the rest
+                store = _get_store()
+                if store is None:
+                    return  # template missing — recorded in write_error, skip the rest
+                _t0 = time.time() if profile else None
+                try:
+                    # write_dataframe_to_zarr no-ops on an empty carrier, so no per-chunk
+                    # emptiness check is needed. Use each chunk's own block_index.
+                    write_dataframe_to_zarr(carrier, store, grid=grid, chunk_idx=block_index)
+                    # At K==1 the CSR subgroup is named by the grid's shard label (the
+                    # decimal morton string for HEALPix — issue #199); K>1 keeps the
+                    # flattened block-index int. Mirrors runner._process_and_write.
+                    ragged_key = (
+                        shard_label(grid, shard_key)
+                        if single_chunk
+                        else _block_index_key(block_index, grid)
+                    )
+                    write_ragged_to_zarr(ragged, store, grid=grid, shard_key=ragged_key)
                 except Exception as e:
+                    # Mirror the buffered path's ``except``: record the failure, stop
+                    # writing, and let the run surface a 500 after process_shard returns.
                     logger.error(f"Failed to write zarr to {store_path}: {e}")
                     write_error["msg"] = f"Failed to write zarr: {e}"
+                    return
+                if profile:
+                    _write_elapsed += time.time() - _t0
+
+            chunk_results = [] if sharded else None
+            _df_out, metadata = process_shard(
+                grid,
+                shard_key,
+                event["granule_urls"],
+                s3_credentials=s3_creds,
+                config=config,
+                chunk_results=chunk_results,
+                write_chunk=None if sharded else _write_chunk,
+                handoff=handoff,
+                profile=profile,
+                aoi_payload=aoi_payload,
+            )
+
+            # Sharded output (issue #108): bundle the shard's K inner chunks into one
+            # ShardingCodec shard object — one block selection per dense array (a per-
+            # inner-chunk loop would read-modify-write the same shard object). This path
+            # accumulated all K, so it opens + validates + writes here (same recording).
+            if sharded and chunk_results:
+                store = _get_store()
+                if store is not None:
+                    _write_t0 = time.time() if profile else None
+                    try:
+                        write_shard_to_zarr(
+                            chunk_results, store, grid=grid, shard_key=int(shard_key)
+                        )
+                        if profile:
+                            _write_elapsed += time.time() - _write_t0
+                    except Exception as e:
+                        logger.error(f"Failed to write zarr to {store_path}: {e}")
+                        write_error["msg"] = f"Failed to write zarr: {e}"
 
         # A recorded template-missing / write failure folds into ``metadata`` so the
         # response surfaces a 500 with the structured log, exactly as the buffered
