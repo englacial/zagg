@@ -6,7 +6,13 @@ import pytest
 
 from zagg.config import default_config
 from zagg.grids import HealpixGrid, RectilinearGrid, from_config
-from zagg.runner import _check_signature, _load_catalog, _select_cells, agg
+from zagg.runner import (
+    _check_signature,
+    _lambda_dispatch_order,
+    _load_catalog,
+    _select_cells,
+    agg,
+)
 
 
 @pytest.fixture
@@ -124,11 +130,28 @@ class TestSelectCells:
 
     def test_all_cells(self):
         pairs = _select_cells(self._data(3))
-        assert [k for k, _ in pairs] == [0, 1, 2]
+        assert sorted(k for k, _ in pairs) == [0, 1, 2]
 
     def test_max_cells(self):
         pairs = _select_cells(self._data(3), max_cells=2)
-        assert [k for k, _ in pairs] == [0, 1]
+        assert sorted(k for k, _ in pairs) == [0, 1]
+
+    def test_shuffle_is_deterministic(self):
+        # Seeded from the selected shard keys (issue #197): same catalog and
+        # selection -> same order on a rerun/resume.
+        assert _select_cells(self._data(50)) == _select_cells(self._data(50))
+
+    def test_shuffle_permutes_selection(self):
+        # Fan-out order is a permutation of the selection, not morton order.
+        pairs = _select_cells(self._data(50))
+        keys = [k for k, _ in pairs]
+        assert sorted(keys) == list(range(50))
+        assert keys != list(range(50))
+
+    def test_shuffle_after_max_cells_truncation(self):
+        # max_cells keeps its morton-first-N semantics: truncate, then shuffle.
+        pairs = _select_cells(self._data(50), max_cells=10)
+        assert sorted(k for k, _ in pairs) == list(range(10))
 
     def test_morton_cell(self):
         # A non-healpix signature keeps the stringified-int parse.
@@ -204,6 +227,35 @@ class TestSafeLabel:
 
         g = HealpixGrid(parent_order=6, child_order=12, config=default_config("atl06"))
         assert _safe_label(g, 11827859996358475782) == "-4211322"
+
+
+class TestLambdaDispatchOrder:
+    def _data(self, n=50):
+        # Distinct granule counts (cell i has i+1 granules): the regime where
+        # an exact-count sort would fully undo the issue #197 shuffle.
+        return {
+            "metadata": {},
+            "grid_signature": {},
+            "shard_keys": list(range(n)),
+            "granules": [[_rec(j) for j in range(i + 1)] for i in range(n)],
+        }
+
+    def test_bucketed_descending_and_shuffle_survives(self):
+        # Composed lambda ordering: seeded shuffle, then coarse-bucket sort.
+        cells = _lambda_dispatch_order(_select_cells(self._data(50)))
+        assert sorted(k for k, _ in cells) == list(range(50))
+        buckets = [len(urls).bit_length() for _, urls in cells]
+        assert buckets == sorted(buckets, reverse=True)
+        # Within the largest bucket (counts 32..50, i.e. keys 31..49) the
+        # shuffle must survive the sort: order is not morton-sorted.
+        top = [k for k, urls in cells if len(urls).bit_length() == 6]
+        assert sorted(top) == list(range(31, 50))
+        assert top != sorted(top)
+
+    def test_composed_order_is_deterministic(self):
+        once = _lambda_dispatch_order(_select_cells(self._data(50)))
+        again = _lambda_dispatch_order(_select_cells(self._data(50)))
+        assert once == again
 
 
 class TestLoadCatalog:
