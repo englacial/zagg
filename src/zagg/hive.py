@@ -33,7 +33,8 @@ leaf zarr** under a morton digit tree::
   (it rides the stamp PUT) and debris semantics are inherited: a torn
   worker's coverage never becomes visible. Exact cell-order occupancy is a
   zstd-compressed bitmap SIDECAR inside the leaf (``coverage.moc`` — the O8
-  resolution; the one recorded exception to the vanilla-v3 leaf), written
+  resolution; the one recorded exception to the vanilla-v3 leaf: data reads
+  are unaffected, but member enumeration warns and skips it), written
   before the stamp and pointed to from the envelope; attrs stay lean and the
   extra GET is paid only by readers that pass the box test. The end-of-run
   root ``coverage.moc`` and the pyramid sweep (§7) are follow-on phases; the
@@ -43,6 +44,7 @@ leaf zarr** under a morton digit tree::
 from __future__ import annotations
 
 import json
+import warnings
 from datetime import datetime, timezone
 
 import numpy as np
@@ -63,7 +65,9 @@ COVERAGE_SPEC = "morton-moc/1"
 COVERAGE_BOX_SLOTS = 4
 #: In-leaf occupancy-bitmap sidecar object name (issue #200 phase 2, O8) —
 #: the one recorded exception to the "vanilla zarr v3 leaf" claim: a foreign
-#: key inside ``{full_id}.zarr/``, invisible to zarr readers.
+#: key inside ``{full_id}.zarr/`` that zarr readers ignore (data reads are
+#: unaffected; ``members()``/``tree()`` emit a ``ZarrUserWarning`` and skip
+#: it — review finding, PR #208 round 2).
 COVERAGE_SIDECAR = "coverage.moc"
 #: zstd level for the sidecar bitmap — fixed so identical occupancy produces
 #: byte-identical sidecars across workers and backends.
@@ -321,6 +325,11 @@ def encode_coverage_bitmap(shard_key, occupied, cell_order: int) -> bytes:
     depth = int(cell_order) - _decimal_order(shard)
     if depth <= 0:
         raise ValueError(f"cell_order {cell_order} is not below shard {shard}'s order")
+    # Staging is one uint8 per BIT — 8x the raw bitmap (1 MB at the design
+    # point: order-9 shards, order-19 cells). It is bounded by the shard's
+    # cell count, which the worker already materializes for the leaf
+    # template, so no extra guard here; coarse-shard + deep-cell configs
+    # beyond that envelope are out of scope (review note, PR #208 round 2).
     bits = np.zeros(4**depth, dtype=np.uint8)
     bits[_cell_ranks(shard, occupied, cell_order)] = 1
     return bytes(Zstd(level=_ZSTD_LEVEL).encode(np.packbits(bits).tobytes()))
@@ -331,7 +340,13 @@ def decode_coverage_bitmap(payload: bytes, shard_key, cell_order: int) -> np.nda
 
     The inverse of :func:`encode_coverage_bitmap`: returns the sorted packed
     ``uint64`` cell words at ``cell_order`` whose bits are set — exact
-    occupancy, no over-coverage.
+    occupancy, no over-coverage. Posture (review finding, PR #208 round 2):
+    a CORRUPT payload — zstd garbage, or a decompressed size that is not the
+    exact raw bitmap size for the depth — raises loudly rather than
+    zero-padding/truncating to a plausible partial cell set (a false
+    negative, the one thing D9 forbids; the exact truth is intact in the
+    leaf, so surfacing beats under-reporting). A MISSING sidecar degrades to
+    ``None`` in :func:`read_coverage_bitmap`.
     """
     from numcodecs import Zstd
 
@@ -340,6 +355,13 @@ def decode_coverage_bitmap(payload: bytes, shard_key, cell_order: int) -> np.nda
     shard = morton_decimal(shard_key)
     depth = int(cell_order) - _decimal_order(shard)
     raw = np.frombuffer(bytes(Zstd().decode(payload)), dtype=np.uint8)
+    expected = -(-(4**depth) // 8)
+    if raw.size != expected:
+        raise ValueError(
+            f"coverage sidecar decompressed to {raw.size} B; an order-{cell_order} bitmap "
+            f"for shard {shard} is exactly {expected} B — refusing to zero-pad or truncate "
+            f"(a partial cell set would be a false negative)"
+        )
     bits = np.unpackbits(raw, count=4**depth)
     words = np.empty(int(bits.sum()), dtype=np.uint64)
     for i, rank in enumerate(np.flatnonzero(bits)):
@@ -355,7 +377,8 @@ def write_coverage_sidecar(leaf_root: str, payload: bytes, **store_kwargs) -> No
     """PUT the occupancy bitmap sidecar into a leaf (issue #200 phase 2).
 
     One object at ``{leaf}/coverage.moc`` — the recorded exception to the
-    vanilla-v3 leaf, invisible to zarr readers. Written BEFORE the commit
+    vanilla-v3 leaf, ignored by zarr readers (member enumeration warns and
+    skips it; data reads are unaffected). Written BEFORE the commit
     stamp so the stamp stays the leaf's FINAL write (D4): in an unstamped
     prefix the sidecar is debris like everything else, and the wholesale
     retry re-template clears it.
@@ -372,7 +395,9 @@ def read_coverage_bitmap(leaf_root: str, **store_kwargs) -> np.ndarray | None:
     stamp, a box-only phase-1 payload (no ``encoding``/``sidecar`` keys), an
     unknown encoding, or a missing sidecar object all read ``None`` — the
     box is then the only index and readers degrade per D9, never to wrong
-    answers. The shard id comes from the leaf's ``{full_id}.zarr`` basename;
+    answers. A PRESENT-but-corrupt sidecar raises instead (see
+    :func:`decode_coverage_bitmap` — degrading a corrupt payload would be
+    indistinguishable from healthy box-only coverage). The shard id comes from the leaf's ``{full_id}.zarr`` basename;
     ``cell_order`` from the envelope. One GET, paid only by readers that
     want cell-level filtering.
     """
@@ -514,8 +539,14 @@ def process_and_write_hive(
             store = open_store(leaf_path, **store_kwargs)
             # overwrite=True: any existing prefix here is either debris from a
             # torn run (D4) or a prior committed write being redone — both are
-            # replaced wholesale; per-leaf state never blocks a retry.
-            grid.emit_shard_template(store, overwrite=True)
+            # replaced wholesale; per-leaf state never blocks a retry. The
+            # overwrite enumeration warns about the prior attempt's coverage
+            # sidecar — the ONE foreign key we put there ourselves — so that
+            # specific warning is expected and suppressed; anything else in
+            # the prefix stays loud (review finding, PR #208 round 2).
+            with warnings.catch_warnings():
+                warnings.filterwarnings("ignore", message=f"Object at {COVERAGE_SIDECAR}")
+                grid.emit_shard_template(store, overwrite=True)
             box["store"] = store
         return box["store"]
 
@@ -558,7 +589,12 @@ def process_and_write_hive(
         if words is not None and words.size == 0:
             words = None
         bitmap = None
-        if words is not None:
+        # Depth 0 (child_order == parent_order, a legal one-cell-per-shard
+        # config) skips the sidecar: a 1-bit bitmap says nothing the stamp
+        # itself doesn't, and encode would raise AFTER the chunk writes,
+        # leaving the shard permanently unstampable debris (review finding,
+        # PR #208 round 2). The envelope simply omits the pointer — box only.
+        if words is not None and int(grid.child_order) > int(grid.parent_order):
             bitmap = encode_coverage_bitmap(shard_key, words, grid.child_order)
             write_coverage_sidecar(leaf_path, bitmap, **store_kwargs)
         stamp_commit(

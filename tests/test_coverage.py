@@ -321,6 +321,40 @@ class TestCoverageBitmap:
         payload = hive.encode_coverage_bitmap(morton_word(SHARD), occ, _order(SHARD) + depth)
         assert len(payload) < 4**depth // 8
 
+    def test_golden_raw_bytes(self, shard):
+        # THE WIRE-FORMAT PIN (review finding, PR #208 round 2): round-trip
+        # and determinism tests pass under ANY self-consistent bit
+        # permutation, so only fixed raw-byte vectors freeze the convention
+        # (rank = ascending packed-word order, MSB-first per byte) against a
+        # silent flip. Decompressed bytes pinned — compressed bytes are zstd-
+        # library-version-dependent; raw bytes are the frozen convention.
+        from numcodecs import Zstd
+
+        word, order = morton_word(shard), _order(shard) + 2
+        # tail "11" = rank 0 -> MSB of byte 0; tail "44" = rank 15 -> LSB of byte 1
+        one = bytes(Zstd().decode(hive.encode_coverage_bitmap(word, _words(shard + "11"), order)))
+        assert one == b"\x80\x00"
+        last = bytes(Zstd().decode(hive.encode_coverage_bitmap(word, _words(shard + "44"), order)))
+        assert last == b"\x00\x01"
+        # Depth-3 multi-cell vector freezes the rank arithmetic too:
+        # tails 111/114/241/444 -> ranks 0, 3, 28, 63.
+        occ = _words(*(shard + t for t in ("111", "114", "241", "444")))
+        multi = bytes(Zstd().decode(hive.encode_coverage_bitmap(word, occ, _order(shard) + 3)))
+        assert multi == b"\x90\x00\x00\x08\x00\x00\x00\x01"
+
+    def test_truncated_payload_rejected(self, shard):
+        # A wrong-sized payload must raise, never zero-pad to a partial cell
+        # set (false negatives, D9 — review finding, PR #208 round 2). The
+        # reviewer's case: 1 raw byte where depth 3 needs 8.
+        from numcodecs import Zstd
+
+        short = bytes(Zstd(level=3).encode(b"\xff"))
+        with pytest.raises(ValueError, match="refusing to zero-pad"):
+            hive.decode_coverage_bitmap(short, morton_word(shard), _order(shard) + 3)
+        oversized = bytes(Zstd(level=3).encode(b"\xff" * 16))
+        with pytest.raises(ValueError, match="refusing to zero-pad"):
+            hive.decode_coverage_bitmap(oversized, morton_word(shard), _order(shard) + 3)
+
     def test_wrong_order_cell_rejected(self):
         with pytest.raises(ValueError, match="exact cell-order"):
             hive.encode_coverage_bitmap(morton_word(SHARD), _words(SHARD + "1"), _order(SHARD) + 2)
@@ -485,6 +519,30 @@ class TestProcessAndWriteHiveCoverage:
         cov = hive.read_coverage(leaf_store)
         assert cov["box"] == [SHARD, None, None, None]
         assert "encoding" not in cov and "sidecar" not in cov
+        assert not os.path.exists(os.path.join(leaf, hive.COVERAGE_SIDECAR))
+        assert hive.read_coverage_bitmap(leaf) is None
+
+    def test_depth_zero_config_stamps_box_only(self, monkeypatch, tmp_path):
+        # child_order == parent_order is a legal one-cell-per-shard config
+        # (review finding, PR #208 round 2): the sidecar is skipped — a 1-bit
+        # bitmap says nothing the stamp doesn't — and the shard still stamps
+        # a box-only envelope instead of dying unstampable after its writes.
+        import os
+
+        import zagg.processing as processing
+        from zagg.store import open_store
+
+        cfg = default_config("atl06")
+        grid = HealpixGrid(parent_order=6, child_order=6, layout="fullsphere", config=cfg)
+        word = morton_word(SHARD)
+        occupied = _words(SHARD)  # the lone cell IS the shard at depth 0
+        monkeypatch.setattr(processing, "process_shard", _occupancy_fake(grid, occupied))
+        root = str(tmp_path / "store")
+        hive.process_and_write_hive(word, ["s3://b/g1.h5"], grid, {}, root, cfg, store_kwargs={})
+        leaf = hive.shard_leaf_path(root, word)
+        cov = hive.read_coverage(open_store(leaf))
+        assert cov["box"] == [SHARD, None, None, None]
+        assert "sidecar" not in cov and "encoding" not in cov
         assert not os.path.exists(os.path.join(leaf, hive.COVERAGE_SIDECAR))
         assert hive.read_coverage_bitmap(leaf) is None
 

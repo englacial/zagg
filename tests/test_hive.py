@@ -412,6 +412,12 @@ class TestProcessAndWriteHive:
         assert hive.read_coverage(open_store(leaf)) is None
         stale = os.path.join(leaf, grid.group_path, "h", morton_decimal(shard))
         assert os.path.exists(stale)  # the torn attempt's CSR subgroup
+        # Plant a sidecar in the debris: the one leaf object zarr does NOT
+        # own must also fall to the wholesale wipe (PR #208 round 2) — this
+        # goes red if the re-template ever drifts to node-by-node rewrites.
+        hive.write_coverage_sidecar(leaf, b"torn-attempt sidecar")
+        sidecar = os.path.join(leaf, hive.COVERAGE_SIDECAR)
+        assert os.path.exists(sidecar)
 
         # Retry (no ragged this time): same leaf, overwritten wholesale —
         # the stale subgroup is GONE — and stamped at the end.
@@ -421,6 +427,7 @@ class TestProcessAndWriteHive:
         )
         assert hive.read_commit(open_store(leaf))["complete"] is True
         assert not os.path.exists(stale), "stale torn-write object survived the re-template"
+        assert not os.path.exists(sidecar), "torn attempt's sidecar survived the re-template"
 
     def test_errored_shard_is_not_stamped(self, monkeypatch, cfg, tmp_path):
         # A shard that wrote chunks but ended in error stays unstamped debris.

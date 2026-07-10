@@ -34,7 +34,9 @@ round — wired to the **local backend only** (see [Status](#status)).
   group path, named by the shard label at K==1). One recorded exception
   ([issue #200](https://github.com/englacial/zagg/issues/200), O8): the
   `coverage.moc` occupancy-bitmap sidecar inside the leaf — a single foreign
-  key, invisible to zarr readers.
+  key that zarr readers ignore (data reads are unaffected; member
+  enumeration like `members()`/`tree()` emits a `ZarrUserWarning` and skips
+  it).
 - **Node invariant** (D5): below the root, a node contains *only* digit
   children (`[1-4]/`) and `*.zarr` objects — zero zarr metadata above the
   leaf, no shared mutable state across workers. The root alone also carries
