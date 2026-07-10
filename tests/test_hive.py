@@ -331,10 +331,12 @@ class TestProcessAndWriteHive:
         )
         return grid, shard, root, meta
 
-    def _streaming_fake(self, grid, ragged=None):
+    def _streaming_fake(self, grid, ragged=None, occupied=None):
         def fake(g, shard_key, urls, **kwargs):
             carrier = self._carrier(grid, shard_key)
             kwargs["write_chunk"](grid.block_index(int(shard_key)), carrier, ragged or {})
+            if occupied is not None and kwargs.get("occupied_out") is not None:
+                kwargs["occupied_out"].append(np.asarray(occupied, dtype=np.uint64))
             return pd.DataFrame(), self._meta(shard_key)
 
         return fake
@@ -480,7 +482,12 @@ class TestProcessAndWriteHive:
             return wrapped
 
         grid = self._grid(cfg)
-        fake = self._streaming_fake(grid, ragged={"h": ([np.array([1.0])], [0])})
+        shard = _shard_word()
+        fake = self._streaming_fake(
+            grid,
+            ragged={"h": ([np.array([1.0])], [0])},
+            occupied=grid.children(shard)[:2],
+        )
         monkeypatch.setattr(processing, "process_shard", fake)
         monkeypatch.setattr(
             processing, "write_dataframe_to_zarr", rec("dense", processing.write_dataframe_to_zarr)
@@ -488,11 +495,17 @@ class TestProcessAndWriteHive:
         monkeypatch.setattr(
             processing, "write_ragged_to_zarr", rec("ragged", processing.write_ragged_to_zarr)
         )
+        monkeypatch.setattr(
+            hive, "write_coverage_sidecar", rec("sidecar", hive.write_coverage_sidecar)
+        )
         monkeypatch.setattr(hive, "stamp_commit", rec("stamp", hive.stamp_commit))
         hive.process_and_write_hive(
-            _shard_word(), ["s3://b/g1.h5"], grid, {}, str(tmp_path / "store"), cfg, store_kwargs={}
+            shard, ["s3://b/g1.h5"], grid, {}, str(tmp_path / "store"), cfg, store_kwargs={}
         )
-        assert ops == ["dense", "ragged", "stamp"]
+        # The coverage sidecar (issue #200 phase 2) lands BEFORE the stamp:
+        # the stamp stays the leaf's final write, so an unstamped prefix's
+        # sidecar is debris like everything else in it.
+        assert ops == ["dense", "ragged", "sidecar", "stamp"]
 
 
 class TestLeafBlockIndex:

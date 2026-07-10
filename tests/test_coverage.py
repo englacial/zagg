@@ -1,11 +1,14 @@
-"""Tier-0 coverage: the morton box on the hive commit stamp — issue #200 phase 1.
+"""Leaf coverage on the hive commit stamp — issue #200 phases 1-2.
 
 Design contract: ``docs/design/sparse_coverage.md`` §4 (tiered coverage, as
-amended on PR #206). The box is the canonical <= 4-member cover of a shard's
-occupied cells (DCA children, each tightened — PR #208 finding 1), serialized
-as decimal strings padded to exactly four JSON-null-sentinel slots, riding the
-D4 commit stamp — zero extra store operations, debris semantics inherited.
-Flat-layout stores are untouched (coverage is a hive-leaf concept).
+amended on PR #206) plus the O8 resolution. Tier 0 is the morton box — the
+canonical <= 4-member cover of a shard's occupied cells (DCA children, each
+tightened — PR #208 finding 1), serialized as decimal strings padded to
+exactly four JSON-null-sentinel slots, riding the D4 commit stamp with zero
+extra store operations and inherited debris semantics. Exact occupancy is a
+zstd-compressed bitmap SIDECAR inside the leaf (``coverage.moc``), written
+before the stamp and pointed to from the envelope. Flat-layout stores are
+untouched (coverage is a hive-leaf concept).
 """
 
 import importlib.util
@@ -266,6 +269,73 @@ class TestStampCoverage:
         assert hive.read_coverage(store) is None
 
 
+# ── the occupancy bitmap (phase 2, O8) ───────────────────────────────────────
+
+
+class TestCoverageBitmap:
+    """Exact cell-order occupancy as a zstd bitmap: bit i = the i-th subtree
+    cell in ascending packed-word order (base-4 D1 digit tail, 1..4 -> 0..3),
+    MSB-first per byte — the frozen encoding convention."""
+
+    def _tails(self, rng, depth, n):
+        return {"".join(rng.choice(list("1234"), size=depth)) for _ in range(n)}
+
+    def test_round_trip_exact(self, shard):
+        occ = _words(shard + "12", shard + "43", shard + "21")
+        payload = hive.encode_coverage_bitmap(morton_word(shard), occ, _order(shard) + 2)
+        decoded = hive.decode_coverage_bitmap(payload, morton_word(shard), _order(shard) + 2)
+        np.testing.assert_array_equal(decoded, np.sort(occ))
+
+    @pytest.mark.parametrize("seed", range(6))
+    def test_round_trip_property(self, shard, seed):
+        # Exactness: the bitmap decodes to exactly the occupied set — no
+        # over-coverage, no false negatives (property over random occupancy).
+        rng = np.random.default_rng(seed)
+        depth = 3
+        occ = _words(*(shard + t for t in self._tails(rng, depth, int(rng.integers(1, 40)))))
+        cell_order = _order(shard) + depth
+        decoded = hive.decode_coverage_bitmap(
+            hive.encode_coverage_bitmap(morton_word(shard), occ, cell_order),
+            morton_word(shard),
+            cell_order,
+        )
+        np.testing.assert_array_equal(decoded, np.sort(occ))
+
+    def test_deterministic_bytes(self, shard):
+        # Same occupancy (any input order, duplicates included) -> the
+        # byte-identical sidecar: the backend-identity claim at byte level.
+        word, order = morton_word(shard), _order(shard) + 2
+        a = hive.encode_coverage_bitmap(word, _words(shard + "12", shard + "43"), order)
+        b = hive.encode_coverage_bitmap(
+            word, _words(shard + "43", shard + "12", shard + "43"), order
+        )
+        assert a == b
+
+    def test_zstd_compresses_fragmented_occupancy(self):
+        # Realistic fragmentation (the #202 measurement's regime: scattered
+        # cells, ~1 cell per run): compressed strictly below the deterministic
+        # raw size.
+        rng = np.random.default_rng(0)
+        depth = 7  # 16384 bits = 2 KB raw
+        occ = _words(*(SHARD + t for t in self._tails(rng, depth, 800)))
+        payload = hive.encode_coverage_bitmap(morton_word(SHARD), occ, _order(SHARD) + depth)
+        assert len(payload) < 4**depth // 8
+
+    def test_wrong_order_cell_rejected(self):
+        with pytest.raises(ValueError, match="exact cell-order"):
+            hive.encode_coverage_bitmap(morton_word(SHARD), _words(SHARD + "1"), _order(SHARD) + 2)
+
+    def test_cell_outside_shard_rejected(self):
+        with pytest.raises(ValueError, match="exact cell-order"):
+            hive.encode_coverage_bitmap(
+                morton_word(SHARD), _words(SHARD[:-1] + "412"), _order(SHARD) + 2
+            )
+
+
+def _order(decimal):
+    return len(decimal) - (2 if decimal.startswith("-") else 1)
+
+
 # ── the worker seam ──────────────────────────────────────────────────────────
 
 
@@ -317,6 +387,11 @@ class TestOccupiedOutSink:
         assert words.dtype == np.uint64
         assert sorted(int(w) for w in words) == sorted({c1, c2})
         assert meta["cells_with_data"] == 2
+        # Phase 2 exactness, against the REAL worker seam's occupancy: the
+        # sidecar bitmap round-trips to exactly the occupied set.
+        payload = hive.encode_coverage_bitmap(shard, words, grid.child_order)
+        decoded = hive.decode_coverage_bitmap(payload, shard, grid.child_order)
+        assert sorted(int(w) for w in decoded) == sorted({c1, c2})
 
 
 # ── the hive write path (both backends) ──────────────────────────────────────
@@ -372,27 +447,59 @@ class TestProcessAndWriteHiveCoverage:
         monkeypatch.setattr(processing, "process_shard", _occupancy_fake(grid, occupied_words))
         root = str(tmp_path / "store")
         hive.process_and_write_hive(shard, ["s3://b/g1.h5"], grid, {}, root, cfg, store_kwargs={})
-        return grid, open_store(hive.shard_leaf_path(root, shard))
+        leaf = hive.shard_leaf_path(root, shard)
+        return grid, leaf, open_store(leaf)
 
-    def test_stamp_gains_coverage_with_zero_extra_objects(self, monkeypatch, tmp_path):
-        grid, leaf_store = self._run(monkeypatch, tmp_path, _words(SHARD + "12", SHARD + "43"))
+    def test_stamp_carries_envelope_and_sidecar_pointer(self, monkeypatch, tmp_path):
+        import os
+
+        occupied = _words(SHARD + "12", SHARD + "43")
+        grid, leaf, leaf_store = self._run(monkeypatch, tmp_path, occupied)
+        sidecar = os.path.join(leaf, hive.COVERAGE_SIDECAR)
         cov = hive.read_coverage(leaf_store)
         assert cov == {
             "spec": hive.COVERAGE_SPEC,
             "box": [SHARD + "12", SHARD + "43", None, None],
             "cell_order": int(grid.child_order),
             "source": "worker",
+            "encoding": "bitmap",
+            "sidecar": hive.COVERAGE_SIDECAR,
+            "nbytes": os.path.getsize(sidecar),
+            "raw_nbytes": 4 ** (grid.child_order - grid.parent_order) // 8,
         }
-        # Same stamp object, no companion coverage object anywhere in the leaf
-        # (the tier-0 payload rides the existing final attrs PUT).
-        stamp = hive.read_commit(leaf_store)
-        assert stamp["coverage"] == cov
+        assert hive.read_commit(leaf_store)["coverage"] == cov
+        # Attrs stay lean: the envelope is bounded well under 1 KB — the
+        # exact payload lives in the sidecar, not the zarr.json readers GET.
+        assert len(json.dumps(cov)) < 512
+        # The sidecar decodes to exactly the worker's occupied set.
+        np.testing.assert_array_equal(hive.read_coverage_bitmap(leaf), np.sort(occupied))
 
-    def test_worker_without_occupancy_stamps_trivial_cover(self, monkeypatch, tmp_path):
+    def test_worker_without_occupancy_stamps_box_only(self, monkeypatch, tmp_path):
         # No occupied_out delivery (e.g. a legacy caller): the shard id is the
-        # trivial 1-member cover — conservative, never a false negative.
-        _grid, leaf_store = self._run(monkeypatch, tmp_path, None)
-        assert hive.read_coverage(leaf_store)["box"] == [SHARD, None, None, None]
+        # trivial 1-member cover, no sidecar, and the envelope omits the
+        # encoding/pointer keys — the phase-1 box-only shape, which the
+        # bitmap reader treats as "box only" (forward/back compat).
+        import os
+
+        _grid, leaf, leaf_store = self._run(monkeypatch, tmp_path, None)
+        cov = hive.read_coverage(leaf_store)
+        assert cov["box"] == [SHARD, None, None, None]
+        assert "encoding" not in cov and "sidecar" not in cov
+        assert not os.path.exists(os.path.join(leaf, hive.COVERAGE_SIDECAR))
+        assert hive.read_coverage_bitmap(leaf) is None
+
+    def test_unstamped_sidecar_is_debris(self, tmp_path):
+        # A sidecar in an UNSTAMPED prefix is debris: the accessor gates on
+        # the committed stamp, so it never becomes visible (D4 semantics).
+        cfg = default_config("atl06")
+        grid = HealpixGrid(parent_order=6, child_order=8, layout="fullsphere", config=cfg)
+        from zagg.store import open_store
+
+        leaf = hive.shard_leaf_path(str(tmp_path / "store"), morton_word(SHARD))
+        grid.emit_shard_template(open_store(leaf), overwrite=True)  # no stamp
+        payload = hive.encode_coverage_bitmap(morton_word(SHARD), _words(SHARD + "12"), 8)
+        hive.write_coverage_sidecar(leaf, payload)
+        assert hive.read_coverage_bitmap(leaf) is None
 
 
 # ── backend identity via the Lambda handler path ─────────────────────────────
@@ -436,7 +543,8 @@ class TestBothBackendsIdenticalPayload:
         config_dict = asdict(cfg)
         grid = from_config(load_config_from_dict(config_dict))
         shard_dec = morton_decimal(self._WORD)
-        occupied = _words(shard_dec + "12", shard_dec + "43")
+        depth = int(grid.child_order) - _order(shard_dec)
+        occupied = _words(shard_dec + "1" * depth, shard_dec + "4" * depth)
         monkeypatch.setattr(processing, "process_shard", _occupancy_fake(grid, occupied))
 
         # Local backend leg.
@@ -464,8 +572,15 @@ class TestBothBackendsIdenticalPayload:
         resp = handler_mod._handle_process(event, ctx)
         assert resp["statusCode"] == 200, resp["body"]
 
-        local_cov = hive.read_coverage(open_store(hive.shard_leaf_path(local_root, self._WORD)))
-        lambda_cov = hive.read_coverage(open_store(hive.shard_leaf_path(lambda_root, self._WORD)))
+        local_leaf = hive.shard_leaf_path(local_root, self._WORD)
+        lambda_leaf = hive.shard_leaf_path(lambda_root, self._WORD)
+        local_cov = hive.read_coverage(open_store(local_leaf))
+        lambda_cov = hive.read_coverage(open_store(lambda_leaf))
         assert local_cov is not None
         assert local_cov == lambda_cov
-        assert local_cov["box"] == [shard_dec + "12", shard_dec + "43", None, None]
+        assert local_cov["box"] == [shard_dec + "1" * depth, shard_dec + "4" * depth, None, None]
+        # And the sidecars are byte-identical: same occupancy, same encoding
+        # convention, same fixed zstd level on both backends.
+        local_bytes = Path(local_leaf, hive.COVERAGE_SIDECAR).read_bytes()
+        assert local_bytes == Path(lambda_leaf, hive.COVERAGE_SIDECAR).read_bytes()
+        np.testing.assert_array_equal(hive.read_coverage_bitmap(local_leaf), np.sort(occupied))
