@@ -1335,16 +1335,18 @@ def _run_local(
     # directly. Fail-open: the root MOC is a regenerable cache (D9) — a
     # failed write costs readers one walk, never a wrong answer.
     if store_layout == "hive" and get_coverage_moc(config):
-        done = [m["shard_key"] for m in report.results if not m.get("error")]
-        if done:
-            from zagg.hive import build_root_coverage, write_root_coverage
+        from zagg.hive import build_root_coverage, write_root_coverage
 
-            try:
+        try:
+            # Inside the try so the fail-open claim survives result-envelope
+            # refactors (review finding, PR #208 round 3).
+            done = [m["shard_key"] for m in report.results if not m.get("error")]
+            if done:
                 envelope = build_root_coverage(done, int(grid.parent_order))
                 write_root_coverage(store_path, envelope, **store_kwargs)
                 logger.info(f"Wrote root coverage.moc ({len(envelope['ranges'])} ranges)")
-            except Exception as e:
-                logger.warning(f"root coverage.moc write failed (fail-open, D9): {e}")
+        except Exception as e:
+            logger.warning(f"root coverage.moc write failed (fail-open, D9): {e}")
 
     summary = {
         "total_cells": len(cells),
@@ -1699,23 +1701,30 @@ def _run_lambda(
     # Fail-open everywhere: a failed build/invoke logs and the run result is
     # untouched (the root MOC is a regenerable cache).
     if get_store_layout(config) == "hive" and get_coverage_moc(config):
-        done = [
-            r["shard_key"]
-            for r in report.results
-            if r.get("status_code") == 200 and not r.get("error")
-        ]
-        if done:
-            try:
-                from zagg.hive import build_root_coverage
+        try:
+            from zagg.hive import build_root_coverage
 
+            # Inside the try so the fail-open claim survives result-envelope
+            # refactors (review finding, PR #208 round 3).
+            done = [
+                r["shard_key"]
+                for r in report.results
+                if r.get("status_code") == 200 and not r.get("error")
+            ]
+            if done:
                 envelope = build_root_coverage(done, int(parent_order))
-                # An OLD deployment silently ignores the unknown mode — safe
-                # under D9 (readers degrade to the sweep MOC or the walk),
-                # but say so, mirroring the PR #205 deploy-ordering note.
+                # An OLD deployment has no coverage mode: the event falls
+                # through to its process handler, which returns a LOGGED 400
+                # (missing shard_key/granule_urls...) — no writes, no result
+                # mirror, and no async redelivery (a returned 400 is a
+                # successful invocation to Lambda's Event retry machinery).
+                # Harmless under D9, but the CloudWatch line is an ERROR, not
+                # silence — mirroring the PR #205 deploy-ordering note.
                 logger.info(
                     f"Dispatching root coverage.moc write ({len(envelope['ranges'])} "
                     f"ranges, fire-and-forget) — requires a redeployed function; an "
-                    f"older deployment ignores mode=coverage (harmless under D9)"
+                    f"older deployment 400s mode=coverage in its process handler "
+                    f"(logged, no writes, no retry — harmless under D9)"
                 )
                 _invoke_lambda_coverage(
                     state["lambda_client"],
@@ -1724,8 +1733,8 @@ def _run_lambda(
                     envelope,
                     output_creds_event=output_creds_event,
                 )
-            except Exception as e:
-                logger.warning(f"root coverage.moc dispatch failed (fail-open, D9): {e}")
+        except Exception as e:
+            logger.warning(f"root coverage.moc dispatch failed (fail-open, D9): {e}")
 
     # Cost estimate: arm64 pricing = $0.0000133334/GB-second. Compute gb_seconds
     # and cost *once* over the summed Lambda time (the report carries only the

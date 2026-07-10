@@ -571,6 +571,14 @@ def root_coverage_words(envelope: dict) -> np.ndarray:
     Raises ``ValueError`` on malformed ranges (base-crossing, wrong order,
     reversed endpoints) — same loud posture as the bitmap decoder: a corrupt
     cache must never yield a plausible partial answer.
+
+    Scale note (review, PR #208 round 3): expansion is O(covered shards) in
+    a Python loop — milliseconds at coherent-run scale (the design point,
+    shard order <= 11 regional products), but a full-sphere accumulated root
+    (~3M order-9 / ~50M order-11 shards) would take minutes worker-side. An
+    interval-space union on ``[base, lo_rank, hi_rank]`` triples (O(ranges),
+    no word materialization) is the upgrade path if root objects ever reach
+    continental-accumulation scale; out of scope here.
     """
     from zagg.grids.morton import morton_word
 
@@ -595,8 +603,13 @@ def write_root_coverage(store_root: str, envelope: dict, **store_kwargs) -> dict
     unparsable or incompatible existing object is logged and OVERWRITTEN —
     the root MOC is a regenerable cache (D9): the leaf stamps are the
     durable truth and the §7 sweep is the authoritative rebuilder, so
-    merging with garbage would be worse than replacing it. Returns the
-    payload actually written.
+    merging with garbage would be worse than replacing it. CONCURRENT runs
+    race benignly (review finding, PR #208 round 3): GET-union-PUT is not
+    atomic and S3 has no compare-and-swap, so the last writer wins and its
+    union may miss the loser's shards until the sweep or the next run
+    re-unions — accepted under D9/O7 (a missing listing degrades to "reader
+    doesn't see the newest run", never a wrong answer; do NOT add a lock).
+    Returns the payload actually written.
     """
     import obstore
 
