@@ -97,6 +97,53 @@ def _build_store(shards, *, delta=512, located_locs=None):
     return store, grid, words
 
 
+class _CountingStore(MemoryStore):
+    """MemoryStore recording every satisfied GET as ``(key, byte_range, nbytes)``."""
+
+    def __init__(self, *a, **k):
+        super().__init__(*a, **k)
+        self.gets: list = []
+
+    def with_read_only(self, read_only=True):
+        s = _CountingStore(store_dict=self._store_dict, read_only=read_only)
+        s.gets = self.gets
+        return s
+
+    async def get(self, key, prototype, byte_range=None):
+        r = await super().get(key, prototype, byte_range)
+        if r is not None:
+            self.gets.append((key, byte_range, len(r)))
+        return r
+
+
+def _sharded_store(store, *, populate):
+    """A K=16 ShardingCodec'd store with one populated cell per chunk in
+    ``populate`` (local chunk ordinals); returns ``(grid, shard_word,
+    {local: global_cell})``."""
+    rng = np.random.default_rng(21)
+    cfg = _cfg()
+    cfg.output["grid"]["chunk_inner"] = 8
+    cfg.output["grid"]["sharded"] = True
+    grid = HealpixGrid(6, 12, layout="fullsphere", config=cfg, chunk_inner=8, sharded=True)
+    shard6 = morton_word(_KEY_A)
+    grid.emit_template(store)
+    morton_arr = zarr.open_array(store, path="12/morton", mode="r+")
+    shard_block = grid.block_index(shard6)[0]
+    chunk_results, targets = [], {}
+    for block, children in grid.iter_chunks(shard6):
+        local = int(block[0]) - shard_block * grid.chunks_per_shard
+        base = int(block[0]) * grid.cells_per_chunk
+        morton_arr[base : base + grid.cells_per_chunk] = np.asarray(children)
+        if local not in populate:
+            chunk_results.append((block, pd.DataFrame(), {}))
+            continue
+        payloads = [build_tdigest(rng.uniform(0.0, 30.0, 300), delta=512)]
+        chunk_results.append((block, pd.DataFrame(), {"h_tdigest": (payloads, [11])}))
+        targets[local] = base + 11
+    write_shard_to_zarr(chunk_results, store, grid=grid, shard_key=shard6)
+    return grid, shard6, targets
+
+
 class TestRasterizeCell:
     def test_empty_digest_all_zero(self):
         out = rasterize_cell(np.empty((0, 2), dtype=np.float32), 0.0, 0.5, 16)
@@ -350,6 +397,27 @@ class TestReadTensors:
         with pytest.raises(ValueError, match="no sibling 'morton' coordinate"):
             list(read_tensors(clone, "12/h_tdigest"))
 
+    def test_unknown_spec_raises_pointed(self):
+        # Version gate (review, PR #211 round 2): a future writer's attrs must
+        # be adopted deliberately, never half-parsed — the coverage-envelope
+        # discipline. Issue #210's typed-dtype migration bumps this seam.
+        store, _g, _w = _build_store({_KEY_A: {0: np.array([1.0, 2.0])}})
+        arr = zarr.open_array(store, path="12/h_tdigest", mode="r+")
+        arr.attrs["ragged"] = {**arr.attrs["ragged"], "spec": "zagg-ragged/2"}
+        with pytest.raises(ValueError, match="understands 'zagg-ragged/1' only"):
+            list(read_tensors(store, "12/h_tdigest"))
+
+    def test_garbage_element_dtype_raises_pointed(self):
+        # A corrupt dtype string surfaces as this layout's pointed error, not
+        # a bare numpy TypeError with no mention of the field or contract.
+        store, _g, _w = _build_store({_KEY_A: {0: np.array([1.0, 2.0])}})
+        arr = zarr.open_array(store, path="12/h_tdigest", mode="r+")
+        meta = dict(arr.attrs["ragged"])
+        meta["element"] = {**meta["element"], "dtype": "not-a-dtype"}
+        arr.attrs["ragged"] = meta
+        with pytest.raises(ValueError, match="unreadable element dtype"):
+            list(read_tensors(store, "12/h_tdigest"))
+
     def test_sharded_and_regular_layouts_read_identically(self):
         """Q1 pin (issue #209): the K>1 flat layouts differ on disk — one
         object per shard (ShardingCodec) vs one per inner chunk (regular) —
@@ -497,46 +565,26 @@ class TestReadCell:
         out = read_cell(store, "12/h_tdigest_locations", base + 3)
         assert out.dtype == np.uint64 and out.shape == (3,)
 
+    def test_out_of_range_and_negative_raise_pointed(self):
+        """Review (PR #211 round 2): zarr basic selection CLAMPS the slice, so
+        without the bounds guard an out-of-range cell died on a bare unpack;
+        -1 gets neither numpy wrap nor a comprehensible error."""
+        store, _grid_, _w = _build_store({_KEY_A: {0: np.array([1.0, 2.0])}})
+        n = zarr.open_array(store, path="12/h_tdigest", mode="r").shape[0]
+        with pytest.raises(IndexError, match=f"cell {n} out of range"):
+            read_cell(store, "12/h_tdigest", n)
+        with pytest.raises(IndexError, match="negative indices do not wrap"):
+            read_cell(store, "12/h_tdigest", -1)
+
     def test_two_ranged_gets_on_sharded_store(self):
         """One cell from a ShardingCodec'd store = exactly 2 ranged GETs on
         the shard object (index suffix + one inner chunk), never the whole
         object — the random-access property the layout was chosen for."""
-
-        class CountingStore(MemoryStore):
-            def __init__(self, *a, **k):
-                super().__init__(*a, **k)
-                self.gets: list = []
-
-            def with_read_only(self, read_only=True):
-                s = CountingStore(store_dict=self._store_dict, read_only=read_only)
-                s.gets = self.gets
-                return s
-
-            async def get(self, key, prototype, byte_range=None):
-                r = await super().get(key, prototype, byte_range)
-                if r is not None:
-                    self.gets.append((key, byte_range, len(r)))
-                return r
-
-        rng = np.random.default_rng(21)
-        cfg = _cfg()
-        cfg.output["grid"]["chunk_inner"] = 8
-        cfg.output["grid"]["sharded"] = True
-        grid = HealpixGrid(6, 12, layout="fullsphere", config=cfg, chunk_inner=8, sharded=True)
-        shard6 = morton_word(_KEY_A)
-        chunk_results = []
-        target = None
-        for block, _children in grid.iter_chunks(shard6):
-            payloads = [build_tdigest(rng.uniform(0.0, 30.0, 300), delta=512)]
-            chunk_results.append((block, pd.DataFrame(), {"h_tdigest": (payloads, [11])}))
-            if target is None:
-                target = int(block[0]) * grid.cells_per_chunk + 11
-        store = CountingStore()
-        grid.emit_template(store)
-        write_shard_to_zarr(chunk_results, store, grid=grid, shard_key=shard6)
+        store = _CountingStore()
+        grid, _shard6, targets = _sharded_store(store, populate=range(16))
 
         store.gets.clear()
-        digest = read_cell(store, "12/h_tdigest", target)
+        digest = read_cell(store, "12/h_tdigest", targets[0])
         assert digest.shape[1] == 2 and digest.shape[0] > 0
         data_gets = [g for g in store.gets if "/h_tdigest/c/" in g[0]]
         assert len(data_gets) == 2
@@ -544,6 +592,22 @@ class TestReadCell:
         obj_size = len(store._store_dict[obj_key].to_bytes())
         assert n0 == 16 * grid.chunks_per_shard + 4  # the shard-index suffix
         assert n1 <= obj_size // 4  # one compressed inner chunk, not the object
+
+    def test_sweep_reads_each_stored_object_once(self):
+        """Review (PR #211 round 2): the whole-store sweep reads each stored
+        span in ONE slice, so a stored object is fetched exactly ONCE (zarr
+        reads a whole outer chunk in a single GET and splits it locally) —
+        never a per-inner-chunk index re-fetch (K identical suffix reads per
+        shard, ~256 redundant round trips at production geometry)."""
+        store = _CountingStore()
+        _grid_, _shard6, targets = _sharded_store(store, populate={0, 3, 7, 12})
+        assert len(targets) == 4
+
+        store.gets.clear()
+        out = list(read_tensors(store, "12/h_tdigest"))
+        assert len(out) == 4
+        data_gets = [g for g in store.gets if "/h_tdigest/c/" in g[0]]
+        assert len(data_gets) == 1  # the whole stored object, once
 
 
 class TestReadParityWithoutConsolidation:

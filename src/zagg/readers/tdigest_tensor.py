@@ -38,6 +38,14 @@ from the sibling ``morton`` coordinate. Random access to one cell
 (:func:`read_cell`) indexes the vlen array directly — 2 ranged GETs on a
 sharded store (index suffix + one inner chunk), never the whole shard.
 
+**Hive products are read one leaf at a time**: a leaf zarr (issue #199) is
+exactly this layout scoped to one shard — the same ``{group}`` path, the
+``morton`` sibling, the versioned ragged attrs, and the whole-leaf
+ShardingCodec (one stored span) — so open the leaf store
+(``hive.shard_leaf_path``) and pass the same ``field`` path. The readers are
+store-scoped and never traverse the hive digit tree (leaf discovery is the
+walker's/coverage MOC's job, issue #200).
+
 The reader (generator)
 ----------------------
 :func:`read_tensors` yields ``(tensor, morton_index)`` one chunk at a time.
@@ -57,7 +65,7 @@ import numpy as np
 import zarr
 from zarr.abc.store import Store
 
-from zagg.grids.base import RAGGED_ELEMENT_ATTR
+from zagg.grids.base import RAGGED_ELEMENT_ATTR, RAGGED_SPEC
 from zagg.stats.tdigest import cdf_from_tdigest, quantile_from_tdigest
 
 __all__ = [
@@ -246,12 +254,27 @@ def _open_ragged(store: Store, field: str, zarr_format) -> tuple:
             f"vlen array (issue #209). Pre-issue-209 CSR stores are not readable "
             f"— rewrite the store."
         )
+    # Version gate (the coverage-envelope discipline): an unknown/future spec
+    # must fail loudly, never half-parse. This attrs seam is the INTERIM
+    # contract the issue #210 typed vlen-array dtype migration supersedes.
+    if meta.get("spec") != RAGGED_SPEC:
+        raise ValueError(
+            f"{field!r} declares ragged spec {meta.get('spec')!r}; this reader "
+            f"understands {RAGGED_SPEC!r} only — a newer writer's layout must be "
+            f"adopted deliberately, not half-parsed"
+        )
     if arr.ndim != 1:
         raise ValueError(
             f"{field!r} has {arr.ndim} dimensions; the t-digest tensor readers "
             f"consume HEALPix products (1-D cells axis)"
         )
-    dtype = np.dtype(str(element["dtype"])).newbyteorder("<")
+    try:
+        dtype = np.dtype(str(element["dtype"])).newbyteorder("<")
+    except TypeError as e:
+        raise ValueError(
+            f"{field!r} declares an unreadable element dtype "
+            f'{element["dtype"]!r} in attrs["{RAGGED_ELEMENT_ATTR}"]["element"]'
+        ) from e
     shape = tuple(int(s) for s in element["shape"])
     return arr, dtype, shape, meta
 
@@ -287,18 +310,26 @@ def _stored_chunk_spans(arr) -> list[tuple[int, int]]:
 def _iter_populated_chunks(arr) -> Iterator[tuple[int, list]]:
     """Yield ``(chunk_start, [(cell_pos, raw_bytes), ...])`` per populated chunk.
 
-    One read chunk (``arr.chunks`` cells) at a time, restricted to the stored
-    objects (:func:`_stored_chunk_spans`); chunks whose cells are all absent
-    (the ``b""`` fill) are skipped. ``cell_pos`` is the cell's row-major
-    position within the chunk — the same index the writer placed it at.
+    Restricted to the stored objects (:func:`_stored_chunk_spans`), each read
+    in ONE slice: slicing per inner chunk would re-fetch a sharded object's
+    index suffix on every ``__getitem__`` (~K redundant GETs per shard at the
+    production K=256 — review, PR #211), while the full-span slice fetches
+    the stored object ONCE (zarr reads a whole outer chunk in a single GET
+    and splits it locally). The held cost is one span's decoded payload —
+    ~141 MB at the o8 t-digest scale, the same bound the hive write side
+    documents and accepts (``process_and_write_hive``), and this is the
+    client-side bulk reader. Chunks whose cells are all absent (the ``b""``
+    fill) are skipped; ``cell_pos`` is the cell's row-major position within
+    the chunk — the same index the writer placed it at.
     """
     cells_per_chunk = int(arr.chunks[0])
     for span_start, span_stop in _stored_chunk_spans(arr):
-        for start in range(span_start, span_stop, cells_per_chunk):
-            block = arr[start : start + cells_per_chunk]
+        span = arr[span_start:span_stop]
+        for offset in range(0, span_stop - span_start, cells_per_chunk):
+            block = span[offset : offset + cells_per_chunk]
             populated = [(pos, block[pos]) for pos in range(len(block)) if len(block[pos])]
             if populated:
-                yield start, populated
+                yield span_start + offset, populated
 
 
 def _open_morton(store: Store, field: str, zarr_format):
@@ -575,11 +606,19 @@ def read_cell(
     The issue #209 single-cell path: indexing the vlen array reads exactly two
     ranged GETs on a sharded store — the shard-index suffix, then the one inner
     chunk holding the cell — never the whole shard object. ``cell`` is the
-    cell's global position on the array's cells axis. An absent/empty cell
-    returns the zero-length ``(0, *inner_shape)`` array. Works on any zagg
-    ragged vlen array — a located field's ``{field}_locations`` sibling
-    included (its elements decode as ``(n,)`` uint64 words).
+    cell's global position on the array's cells axis (no negative-index wrap).
+    An absent/empty cell returns the zero-length ``(0, *inner_shape)`` array;
+    an out-of-range index raises ``IndexError`` naming the valid range (zarr
+    basic selection would silently clamp the slice — review, PR #211). Works
+    on any zagg ragged vlen array — a located field's ``{field}_locations``
+    sibling included (its elements decode as ``(n,)`` uint64 words).
     """
     arr, elem_dtype, elem_shape, _meta = _open_ragged(store, field, zarr_format)
-    (raw,) = arr[int(cell) : int(cell) + 1]
+    cell = int(cell)
+    if not 0 <= cell < int(arr.shape[0]):
+        raise IndexError(
+            f"cell {cell} out of range for {field!r} with {int(arr.shape[0])} cells "
+            f"(valid: 0..{int(arr.shape[0]) - 1}; negative indices do not wrap)"
+        )
+    (raw,) = arr[cell : cell + 1]
     return _decode_cell(raw, elem_dtype, elem_shape)
