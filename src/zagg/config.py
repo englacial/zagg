@@ -659,7 +659,7 @@ def _validate_chunk_precompute(aggregation: dict, ds_vars: set[str]) -> None:
                 ) from e
 
 
-# Recognized per-field output kinds. ``ragged`` (CSR) is the Tier-2 carrier
+# Recognized per-field output kinds. ``ragged`` is the Tier-2 carrier
 # for variable-length per-cell outputs; see issue #48.
 OUTPUT_KINDS = ("scalar", "vector", "ragged")
 
@@ -677,7 +677,7 @@ def _validate_output_kind(name: str, meta: dict) -> None:
     ``ragged``). ``scalar`` fields need neither and stay the default path.
     ``vector`` and ``ragged`` fields may be driven by either ``function`` or
     ``expression``; ``len``/``count`` are rejected for both (they short-circuit
-    to a scalar count). See issue #29 (vector) and issue #48 (ragged/CSR).
+    to a scalar count). See issue #29 (vector) and issue #48 (ragged).
 
     A field may also declare ``resolution`` (``cell`` default, or ``chunk``).
     A ``resolution: chunk`` field (issue #30 item 2) is written ONCE per chunk
@@ -687,7 +687,7 @@ def _validate_output_kind(name: str, meta: dict) -> None:
     ``scalar``, ``vector``, and ``ragged`` kinds may all be ``resolution: chunk``
     (issue #82): a ``scalar`` companion is a plain chunk-grid array, a ``vector``
     companion appends the field's ``trailing_shape`` to the chunk grid (chunked
-    whole), and a ``ragged`` companion is CSR at chunk granularity — one
+    whole), and a ``ragged`` companion holds one
     variable-length payload per chunk, written by ``write_ragged_to_zarr`` (phase
     4c). The shape keys are validated below exactly as for cell resolution — the
     chunk axis just replaces the cell axis.
@@ -712,7 +712,7 @@ def _validate_output_kind(name: str, meta: dict) -> None:
         )
 
     # ``location`` (issue #87) is the ragged location channel; other kinds have
-    # no companion CSR array to carry it.
+    # no companion ragged array to carry it.
     if "location" in meta and kind != "ragged":
         raise ValueError(
             f"Variable '{name}': 'location' is only valid for kind 'ragged', not '{kind}'"
@@ -730,9 +730,9 @@ def _validate_output_kind(name: str, meta: dict) -> None:
         raise ValueError(
             f"Variable '{name}': resolution '{resolution}' is not supported (allowed: {allowed})"
         )
-    # ``ragged`` at chunk resolution (issue #82) is CSR at chunk granularity: one
-    # variable-length payload per chunk instead of per cell. It rides the same CSR
-    # writer as cell-resolution ragged (``write_ragged_to_zarr``), which collapses
+    # ``ragged`` at chunk resolution (issue #82) stores one variable-length
+    # payload per chunk instead of per cell. It rides the same vlen writer as
+    # cell-resolution ragged (``write_ragged_to_zarr``), which collapses
     # the populated cells to the single chunk payload under the same chunk-uniform
     # contract as scalar/vector chunk companions (raise if populated cells
     # disagree). No special shape key is needed beyond ``inner_shape``.
@@ -789,7 +789,7 @@ def _validate_output_kind(name: str, meta: dict) -> None:
 
     # Optional location channel (issue #87): the reducer also receives the named
     # per-observation morton column (``locations=`` kwarg) and returns a
-    # ``(payload, locations)`` pair, stored as a uint64 companion CSR array. Only
+    # ``(payload, locations)`` pair, stored as a uint64 companion vlen array. Only
     # a ``function`` reducer can accept the kwarg, and the chunk-uniform collapse
     # of ``resolution: chunk`` has no location fold — reject both combinations.
     location = meta.get("location")
@@ -1368,7 +1368,7 @@ def output_field_signature(config: PipelineConfig) -> list[dict]:
             "inner_shape": list(sig["inner_shape"]),
             "dtype": sig["dtype"],
         }
-        # A location channel changes the store schema (a uint64 companion CSR
+        # A location channel changes the store schema (a uint64 companion vlen
         # array — issue #87), so it belongs in the signature; keyed only when set
         # so existing shard-map signatures are byte-identical.
         if sig["location"] is not None:
