@@ -512,6 +512,21 @@ def validate_config(config: PipelineConfig) -> None:
                             f"accept a 'locations' keyword, which 'location' requires "
                             f"(use a located reducer, e.g. zagg.stats.tdigest.build_tdigest)"
                         )
+            # The location channel is stored as a SIBLING vlen array named
+            # ``{name}_locations`` (issue #209) — a name the user never wrote.
+            # A field or coordinate already claiming it would silently lose in
+            # the template members dict and interleave into the same object
+            # slab at write time (data corruption), so reject at load
+            # (review, PR #211).
+            from zagg.grids.base import ragged_locations_name
+
+            sibling = ragged_locations_name(name)
+            if sibling in agg_vars or sibling in config.aggregation.get("coordinates", {}):
+                raise ValueError(
+                    f"Variable '{name}': its location channel is stored in a sibling "
+                    f"array named '{sibling}', which collides with the declared "
+                    f"field/coordinate of that name — rename one of them (issue #209)"
+                )
 
 
 # Required per-variable keys for a temporal/event aggregation spec. ``mask``

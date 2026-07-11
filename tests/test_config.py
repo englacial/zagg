@@ -2016,6 +2016,49 @@ class TestLocationChannel:
         with pytest.raises(ValueError, match="is not 'leaf_id' or a data_source variable"):
             validate_config(cfg)
 
+    def test_sibling_locations_field_collision_rejected(self):
+        # Issue #209 (review, PR #211): the located channel lands in a SIBLING
+        # array `{field}_locations` — a name the user never wrote. A declared
+        # field claiming it would silently lose in the template members dict
+        # and interleave into the same object slab at write time.
+        cfg = _ragged_cfg(
+            inner_shape=[2],
+            location="leaf_id",
+            function="zagg.stats.tdigest.build_tdigest",
+        )
+        cfg.aggregation["variables"]["h_ph_tdigest_locations"] = {
+            "function": "min",
+            "source": "h_ph",
+            "dtype": "float32",
+        }
+        with pytest.raises(ValueError, match="sibling array named 'h_ph_tdigest_locations'"):
+            validate_config(cfg)
+
+    def test_sibling_locations_coordinate_collision_rejected(self):
+        # Same guard for coordinates — they share the template members dict.
+        cfg = _ragged_cfg(
+            inner_shape=[2],
+            location="leaf_id",
+            function="zagg.stats.tdigest.build_tdigest",
+        )
+        cfg.aggregation["coordinates"]["h_ph_tdigest_locations"] = {
+            "dtype": "uint64",
+            "fill_value": 0,
+        }
+        with pytest.raises(ValueError, match="sibling array named 'h_ph_tdigest_locations'"):
+            validate_config(cfg)
+
+    def test_locations_suffix_free_without_location(self):
+        # The sibling name is reserved only for LOCATED fields: an unlocated
+        # ragged field coexists with a `{field}_locations`-named scalar.
+        cfg = _ragged_cfg(inner_shape=[2])
+        cfg.aggregation["variables"]["h_ph_tdigest_locations"] = {
+            "function": "min",
+            "source": "h_ph",
+            "dtype": "float32",
+        }
+        validate_config(cfg)
+
     def test_location_defaults_to_healpix_when_grid_absent(self):
         # No output.grid block defaults to healpix everywhere else (the grid
         # factory), so a located field must validate the same way (review fold).

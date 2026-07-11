@@ -1355,7 +1355,7 @@ class TestRaggedVlenLayout:
             async def get(self, key, prototype, byte_range=None):
                 r = await super().get(key, prototype, byte_range)
                 if r is not None:
-                    self.gets.append((key, byte_range))
+                    self.gets.append((key, byte_range, len(r)))
                 return r
 
         grid, shard_key, chunk_results, payloads = self._sharded_setup()
@@ -1372,10 +1372,17 @@ class TestRaggedVlenLayout:
         (raw,) = arr[gpos : gpos + 1]
         np.testing.assert_array_equal(np.frombuffer(raw, "<f4").reshape(-1, 1), expected)
         (obj_key,) = self._data_keys(store, grid)
-        assert [k for k, _r in store.gets] == [obj_key, obj_key]
-        # Both GETs are ranged (index suffix, then one inner chunk) — never the
-        # whole object.
-        assert all(byte_range is not None for _k, byte_range in store.gets)
+        assert [k for k, _r, _n in store.gets] == [obj_key, obj_key]
+        # Both GETs are ranged AND small vs the object (review, PR #211: a
+        # ranged request spanning the whole object would still be a
+        # whole-shard read): the first is exactly the 16·K+4-byte index
+        # suffix, the second one compressed inner chunk (≪ the object — the
+        # setup populates ~12 similar-size chunks).
+        assert all(byte_range is not None for _k, byte_range, _n in store.gets)
+        obj_size = len(store._store_dict[obj_key].to_bytes())
+        index_size = 16 * grid.chunks_per_shard + 4
+        assert store.gets[0][2] == index_size
+        assert store.gets[1][2] <= obj_size // 4
 
     def test_hive_leaf_parity_with_flat_sharded(self):
         """The hive leaf write (``write_ragged_leaf_to_zarr``) stores the SAME
@@ -1405,6 +1412,69 @@ class TestRaggedVlenLayout:
         leaf_arr = zarr.open_array(leaf, path=f"{leaf_grid.group_path}/h_raw", mode="r")
         base = shard_block * grid.cells_per_shard
         np.testing.assert_array_equal(flat_arr[base : base + grid.cells_per_shard], leaf_arr[:])
+
+    def test_located_field_through_sharded_slab_pass(self):
+        """Review gap (PR #211): the located channel through the SHARDED
+        template/slab pass — the ``{field}_locations`` sibling is created with
+        the same shard geometry, collapses to one object, and after a fresh
+        reopen every cell's location vector is row-aligned with its digest
+        (one uint64 word per payload row)."""
+        import zarr
+        from mortie import geo2mort
+
+        from zagg.processing import write_shard_to_zarr
+
+        cfg = TestRaggedVlenWrite._ragged_cfg()
+        cfg.aggregation["variables"]["h_raw"]["location"] = "leaf_id"
+        grid = HealpixGrid(4, 8, layout="fullsphere", config=cfg, chunk_inner=6, sharded=True)
+        shard_key = int(geo2mort(-78.5, -132.0, order=4)[0])
+        shard_block = grid.block_index(shard_key)[0]
+        rng = np.random.default_rng(11)
+        chunk_results: list = []
+        expected: dict = {}
+        for block, _children in grid.iter_chunks(shard_key):
+            local = int(block[0]) - shard_block * grid.chunks_per_shard
+            if local % 3 == 2:
+                chunk_results.append((block, pd.DataFrame(), {}))
+                continue
+            cells = sorted(int(c) for c in rng.choice(grid.cells_per_chunk, 2, replace=False))
+            vals, locs = [], []
+            for n in (int(rng.integers(1, 5)), 0):  # one populated + one empty payload
+                vals.append(rng.standard_normal((n, 1)).astype(np.float32))
+                locs.append(rng.integers(1, 2**63, size=n).astype(np.uint64))
+            chunk_results.append((block, pd.DataFrame(), {"h_raw": (vals, cells, locs)}))
+            for c, v, w in zip(cells, vals, locs):
+                if v.size:
+                    expected[(local, c)] = (v, w)
+
+        store = MemoryStore()
+        grid.emit_template(store)
+        write_shard_to_zarr(chunk_results, store, grid=grid, shard_key=shard_key)
+
+        # One object per array — the sibling collapses like the payload.
+        assert len(self._data_keys(store, grid, "h_raw")) == 1
+        assert len(self._data_keys(store, grid, "h_raw_locations")) == 1
+
+        base = shard_block * grid.cells_per_shard
+        digests = zarr.open_array(store, path=f"{grid.group_path}/h_raw", mode="r")
+        locations = zarr.open_array(store, path=f"{grid.group_path}/h_raw_locations", mode="r")
+        d_block = digests[base : base + grid.cells_per_shard]
+        l_block = locations[base : base + grid.cells_per_shard]
+        seen = {}
+        for i in range(grid.chunks_per_shard):
+            for c in range(grid.cells_per_chunk):
+                raw = d_block[i * grid.cells_per_chunk + c]
+                raw_loc = l_block[i * grid.cells_per_chunk + c]
+                assert (len(raw) > 0) == (len(raw_loc) > 0)  # channels populate together
+                if len(raw):
+                    v = np.frombuffer(raw, "<f4").reshape(-1, 1)
+                    w = np.frombuffer(raw_loc, "<u8")
+                    assert w.shape == (v.shape[0],)  # row-aligned per cell
+                    seen[(i, c)] = (v, w)
+        assert set(seen) == set(expected)
+        for key, (v, w) in expected.items():
+            np.testing.assert_array_equal(seen[key][0], v, err_msg=f"payload {key}")
+            np.testing.assert_array_equal(seen[key][1], w, err_msg=f"locations {key}")
 
 
 class TestRaggedChunkCompanion:
