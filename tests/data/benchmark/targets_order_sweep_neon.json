@@ -1,0 +1,50 @@
+{
+  "description": "Order sweep (issue #202): NEON AOI at o8/o9/o10, inline nomask, for the sharding-order cost-efficiency test.",
+  "aoi": {
+    "file": "AOP_NEON.geojson",
+    "name": "NEON SERC AOP box"
+  },
+  "temporal": {
+    "start": "2018-10-13",
+    "end": "2026-03-15"
+  },
+  "cmr": {
+    "short_name": "ATL03",
+    "version": "007",
+    "provider": "NSIDC_CPRD",
+    "backend": "mortie",
+    "footprint": "swath"
+  },
+  "dispatch": {
+    "region": "us-west-2",
+    "function_name": "process-shard",
+    "expect_account": "742127912612",
+    "note": "process-shard on the 742127912612 deployment account; dispatch with AWS profile 'nasa'. The harness asserts the caller account matches expect_account before any billed invoke."
+  },
+  "targets": {
+    "order_sweep_neon_o8": {
+      "config": "configs/atl03_tdigest_healpix_o8.yaml",
+      "aggregator": "tdigest",
+      "grid_type": "healpix",
+      "grid_size": "o8",
+      "index_backend": "inline",
+      "aoi_mask": false
+    },
+    "order_sweep_neon_o9": {
+      "config": "configs/atl03_tdigest_healpix_o9.yaml",
+      "aggregator": "tdigest",
+      "grid_type": "healpix",
+      "grid_size": "o9",
+      "index_backend": "inline",
+      "aoi_mask": false
+    },
+    "order_sweep_neon_o10": {
+      "config": "configs/atl03_tdigest_healpix_o10.yaml",
+      "aggregator": "tdigest",
+      "grid_type": "healpix",
+      "grid_size": "o10",
+      "index_backend": "inline",
+      "aoi_mask": false
+    }
+  }
+}
