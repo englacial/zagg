@@ -64,7 +64,6 @@ from zagg.processing import (
     write_ragged_to_zarr,
     write_shard_to_zarr,
 )
-from zagg.processing.write import _block_index_key
 from zagg.store import open_object_store, open_store
 
 logger = logging.getLogger(__name__)
@@ -1099,29 +1098,22 @@ def _process_and_write(
     ``K = grid.chunks_per_shard`` finer Zarr chunks. ``process_shard`` reads the
     granules once and returns one ``(block_index, carrier, ragged)`` per chunk via
     ``chunk_results``; this writes each chunk's dense region (at its own
-    ``block_index``) plus its ragged (CSR) companion. At K==1 ``chunk_results`` has
-    exactly one entry whose ``block_index`` equals ``chunk_idx``, so the write is
-    byte-for-byte the single-chunk path. ``chunk_idx`` is retained for the K==1
-    callers/signature but the per-chunk block index from ``iter_chunks`` is used.
+    ``block_index``) plus its ragged vlen payloads (issue #209). At K==1
+    ``chunk_results`` has exactly one entry whose ``block_index`` equals
+    ``chunk_idx``, so the write is byte-for-byte the single-chunk path.
+    ``chunk_idx`` is retained for the K==1 callers/signature but the per-chunk
+    block index from ``iter_chunks`` is used.
     """
-    # K==1 vs K>1 is fixed by the grid, not the materialized list (issue #91): at
-    # K==1 the lone chunk IS the shard so its CSR subgroup is keyed by ``shard_key``;
-    # at K>1 each finer chunk is keyed by its own block index. Deriving it from the
-    # grid lets the non-sharded path stream (no materialized count needed).
-    single_chunk = int(getattr(grid, "chunks_per_shard", 1)) == 1
 
     def _write_chunk(block_index, carrier, ragged):
         # write_dataframe_to_zarr no-ops on an empty carrier (DataFrame or Arrow
         # table), so no carrier-specific emptiness check is needed here.
         write_dataframe_to_zarr(carrier, zarr_store, grid=grid, chunk_idx=block_index)
-        # Persist this chunk's ragged (CSR) fields — one CSR group per field per
-        # chunk (issue #48). No-ops when ``ragged`` is empty. At K==1 the CSR
-        # subgroup is named by the grid's shard label (the decimal morton string
-        # for HEALPix — issue #199); K>1 keeps the flattened block-index int.
-        ragged_key = (
-            shard_label(grid, shard_key) if single_chunk else _block_index_key(block_index, grid)
-        )
-        write_ragged_to_zarr(ragged, zarr_store, grid=grid, shard_key=ragged_key)
+        # Persist this chunk's ragged fields into their vlen-bytes arrays at the
+        # same block (issue #209). The array is regular-chunked on this
+        # unsharded path, so per-chunk writes stay independent. No-op when
+        # ``ragged`` is empty.
+        write_ragged_to_zarr(ragged, zarr_store, grid=grid, chunk_idx=block_index)
 
     # Sharded output (issue #108): the shard's K inner chunks bundle into one
     # ShardingCodec shard object — write the whole shard in one block selection per

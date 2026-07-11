@@ -50,7 +50,14 @@ from zagg.config import (
     get_output_signature,
     output_field_signature,
 )
-from zagg.grids.base import chunk_array_spec, sharded_array_spec, vector_array_spec
+from zagg.grids.base import (
+    chunk_array_spec,
+    ragged_array_spec,
+    ragged_locations_name,
+    sharded_array_spec,
+    vector_array_spec,
+    vlen_dtype_warning_suppressed,
+)
 
 OOB_SENTINEL: int = -1
 
@@ -520,7 +527,9 @@ class RectilinearGrid:
         from zarr import open_array
 
         spec = self._spec()
-        with zarr_config.set({"async.concurrency": 128}):
+        # Ragged vlen-array creation warns about the dtype NAME only
+        # (zarr-python#3517); message-scoped suppression, see grids.base.
+        with zarr_config.set({"async.concurrency": 128}), vlen_dtype_warning_suppressed():
             spec.to_zarr(store, self.group_path, overwrite=overwrite)
         # Populate the x/y coord arrays with cell-centre coordinates so
         # downstream readers (xarray, rioxarray) get usable spatial axes.
@@ -596,11 +605,34 @@ class RectilinearGrid:
             members["aoi_mask"] = _shard(base.with_data_type("bool").with_fill_value(False))
         for name, meta in get_agg_fields(self.config).items():
             sig = get_output_signature(meta)
-            # Ragged fields (issue #48) are CSR subgroups written fresh by
-            # ``write_ragged_to_zarr`` (``{name}/{shard_key}/...``), not a dense
-            # array — skip them so ``{name}`` stays a group prefix and the CSR
-            # child nodes don't collide with a dense array at the same path.
+            # Ragged fields (issue #48) are ONE vlen-bytes array on the (y, x)
+            # cell grid (issue #209 — the sharded vlen-bytes layout replacing
+            # the per-inner-chunk CSR subgroups); ``resolution: chunk`` sits on
+            # the chunk grid instead. Mirrors the HEALPix branch; a located
+            # field (issue #87) adds a sibling uint64 vlen array.
             if sig["kind"] == "ragged":
+                if sig["resolution"] == "chunk":
+                    rag_kw: dict = {
+                        "shape": self.chunk_grid_shape,
+                        "dims": ("chunk_y", "chunk_x"),
+                        "inner_chunk_shape": (1, 1),
+                    }
+                else:
+                    rag_kw = {
+                        "shape": self.array_shape,
+                        "dims": ("y", "x"),
+                        "inner_chunk_shape": self.chunk_shape,
+                        "shard_shape": (self.chunk_h, self.chunk_w) if self.sharded else None,
+                    }
+                members[name] = ragged_array_spec(
+                    element_dtype=sig["dtype"] or "float32",
+                    inner_shape=sig["inner_shape"],
+                    **rag_kw,
+                )
+                if sig.get("location"):
+                    members[ragged_locations_name(name)] = ragged_array_spec(
+                        element_dtype="uint64", **rag_kw
+                    )
                 continue
             dtype = meta.get("dtype", "float32")
             fill = meta.get("fill_value", "NaN")

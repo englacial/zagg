@@ -325,10 +325,10 @@ class TestReclaimMemory:
 class TestProcessEventWriteLoop:
     """Issue #82 phase 7: the handler drives ``process_shard`` with a
     ``chunk_results`` sink and writes each chunk's dense region (at its own
-    block_index) plus its ragged (CSR) companion — the same K>1 write loop the
-    local runner runs. These mock the writers/store to assert the loop's wiring
-    (sink passed, per-chunk block index used, ragged persisted) without a real
-    Zarr store."""
+    block_index) plus its ragged vlen payloads at the same block (issue #209) —
+    the same K>1 write loop the local runner runs. These mock the writers/store
+    to assert the loop's wiring (sink passed, per-chunk block index used,
+    ragged persisted) without a real Zarr store."""
 
     def _patch(self, handler_mod, monkeypatch, chunks):
         """Patch process_shard to fill ``chunk_results`` with ``chunks`` and capture
@@ -363,13 +363,11 @@ class TestProcessEventWriteLoop:
         def fake_write_dense(carrier, st, *, grid, chunk_idx):
             cap["dense"].append(chunk_idx)
 
-        def fake_write_ragged(ragged, st, *, grid, shard_key):
-            cap["ragged"].append((shard_key, ragged))
+        def fake_write_ragged(ragged, st, *, grid, chunk_idx):
+            cap["ragged"].append((chunk_idx, ragged))
 
-        # grid stub: a 1-D companion (single-element block index), exposes
-        # chunk_grid_shape so _block_index_key is exercised on its real path.
-        # ``chunks_per_shard`` fixes K (issue #91): the handler now derives the
-        # K==1-vs-K>1 ragged-key choice from the grid, not the chunk count.
+        # grid stub: a 1-D companion (single-element block index).
+        # ``chunks_per_shard`` fixes K (issue #91).
         grid_stub = MagicMock()
         grid_stub.group_path = "8"
         grid_stub.chunk_grid_shape = (4,)
@@ -377,10 +375,6 @@ class TestProcessEventWriteLoop:
         # Regular (non-sharded) write path — a MagicMock attr is truthy by default,
         # so pin it off explicitly (issue #108 routes sharded grids elsewhere).
         grid_stub.sharded = False
-        # K==1 ragged subgroups are keyed by the grid's shard label (issue #199);
-        # a deterministic stub (decimal-string shaped) pins that the handler
-        # routes through the seam rather than stringifying the raw key itself.
-        grid_stub.shard_label = lambda key: f"-{int(key)}"
 
         monkeypatch.setattr(processing, "process_shard", fake_process_shard)
         monkeypatch.setattr(grids, "from_config", lambda *a, **k: grid_stub)
@@ -392,7 +386,7 @@ class TestProcessEventWriteLoop:
 
     def test_k_gt_1_writes_each_chunk_region(self, handler_mod, monkeypatch):
         """K=3: the sink loop writes 3 dense regions at distinct block indices, and
-        each chunk's ragged is keyed by its own _block_index_key (not shard_key)."""
+        each chunk's ragged lands at the same per-chunk block (issue #209)."""
         chunks = [
             ((0,), pd.DataFrame(), {}),
             ((1,), pd.DataFrame(), {"h_tdigest": ([], [])}),
@@ -405,8 +399,8 @@ class TestProcessEventWriteLoop:
         assert resp["statusCode"] == 200
         # One dense write per chunk, at each chunk's own block_index.
         assert cap["dense"] == [(0,), (1,), (2,)]
-        # K>1 -> ragged keyed by _block_index_key(block_index) == 0/1/2, NOT shard_key.
-        assert [k for k, _r in cap["ragged"]] == [0, 1, 2]
+        # ... and one ragged write per chunk at the SAME block index.
+        assert [k for k, _r in cap["ragged"]] == [(0,), (1,), (2,)]
 
     def test_non_sharded_streams_via_write_chunk_not_chunk_results(self, handler_mod, monkeypatch):
         """Issue #91: the non-sharded handler hands ``process_shard`` a ``write_chunk``
@@ -458,10 +452,9 @@ class TestProcessEventWriteLoop:
         assert seen["chunk_results"] is None  # no accumulation sink
         assert written == [(0,), (1,)]  # each chunk written as it streamed
 
-    def test_k_eq_1_ragged_keyed_by_shard_label(self, handler_mod, monkeypatch):
-        """K=1: the lone chunk's ragged CSR is persisted, keyed by the grid's
-        shard label (the decimal morton string for HEALPix — issue #199), not
-        the raw shard-key int."""
+    def test_k_eq_1_ragged_written_at_chunk_block(self, handler_mod, monkeypatch):
+        """K=1: the lone chunk's ragged payloads are persisted at the chunk's own
+        block index — the same block the dense write uses (issue #209)."""
         chunks = [((0,), pd.DataFrame(), {"h_tdigest": ([], [])})]
         cap = self._patch(handler_mod, monkeypatch, chunks)
         event = _base_event(_healpix_config_dict())
@@ -469,9 +462,7 @@ class TestProcessEventWriteLoop:
         resp = handler_mod._handle_process(event, _context())
         assert resp["statusCode"] == 200
         assert cap["dense"] == [(0,)]
-        # Single chunk -> ragged keyed by the stub grid's label of shard_key.
-        assert len(cap["ragged"]) == 1
-        assert cap["ragged"][0][0] == f"-{event['shard_key']}"
+        assert [k for k, _r in cap["ragged"]] == [(0,)]
 
     def test_streaming_later_chunk_write_failure_partial_writes_and_500(
         self, handler_mod, monkeypatch
@@ -842,6 +833,16 @@ class TestProcessHive:
     def _hive_config_dict():
         cfg = default_config("atl06")
         cfg.output["store_layout"] = "hive"
+        # A declared ragged field, so the leaf template carries its vlen-bytes
+        # array (issue #209) and the fakes can stream ragged payloads for it.
+        cfg.aggregation["variables"]["h"] = {
+            "function": "np.sort",
+            "source": "h_li",
+            "kind": "ragged",
+            "inner_shape": [1],
+            "dtype": "float32",
+            "fill_value": 0,
+        }
         return asdict(cfg)
 
     def _event(self, tmp_path):
@@ -862,14 +863,16 @@ class TestProcessHive:
     def _carrier(grid, shard):
         import numpy as np
 
-        from zagg.config import get_data_vars
+        from zagg.config import get_agg_fields, get_data_vars, get_output_signature
 
         coords = grid.chunk_coords(shard)
         n = len(coords["cell_ids"])
+        agg = get_agg_fields(grid.config)
         df = pd.DataFrame(
             {
                 var: np.zeros(n, dtype=np.int32 if var == "count" else np.float32)
                 for var in get_data_vars(grid.config)
+                if get_output_signature(agg[var])["kind"] != "ragged"
             }
         )
         for name, vals in coords.items():
@@ -918,14 +921,19 @@ class TestProcessHive:
         assert hive.shard_leaf_path(event["store_path"], self._WORD) == expected
         leaf_store = open_store(expected)
 
-        # Dense data landed at the leaf-local block; CSR is label-named.
+        # Dense data landed at the leaf-local block; the ragged payload sits in
+        # its vlen-bytes array at the cell position (issue #209), ONE object.
         grp = zarr.open_group(leaf_store, path=grid.group_path, mode="r", zarr_format=3)
         np.testing.assert_array_equal(
             np.asarray(grp["cell_ids"][:]),
             np.asarray(grid.chunk_coords(self._WORD)["cell_ids"]),
         )
-        sub = zarr.open_group(leaf_store, path=f"{grid.group_path}/h/-4211322", mode="r")
-        assert "values" in sub.array_keys()
+        ragged_arr = zarr.open_array(leaf_store, path=f"{grid.group_path}/h", mode="r")
+        np.testing.assert_array_equal(np.frombuffer(ragged_arr[0:1][0], "<f4"), [1.0, 2.0])
+        import os
+
+        chunk_dir = os.path.join(expected, grid.group_path, "h", "c")
+        assert sum(len(files) for _d, _s, files in os.walk(chunk_dir)) == 1
 
         # The commit stamp is present and carries the worker's counters (D4).
         stamp = hive.read_commit(leaf_store)
@@ -947,10 +955,11 @@ class TestProcessHive:
         grid = self._grid()
         event = self._event(tmp_path)
         leaf = hive.shard_leaf_path(event["store_path"], self._WORD)
-        stale = os.path.join(leaf, grid.group_path, "h", "-4211322")
 
-        # Torn worker: writes a chunk + a CSR subgroup, then dies. The handler
-        # surfaces a 500 envelope; the leaf prefix exists but is UNSTAMPED.
+        # Torn worker: writes a chunk, then dies (its accumulated ragged never
+        # lands — the leaf ragged write is a single post-stream object, issue
+        # #209). The handler surfaces a 500 envelope; the leaf prefix exists
+        # but is UNSTAMPED.
         torn = self._streaming_fake(grid, ragged={"h": ([np.array([1.0])], [0])}, die=True)
         monkeypatch.setattr(processing, "process_shard", torn)
         resp = handler_mod._handle_process(event, _context())
@@ -958,10 +967,15 @@ class TestProcessHive:
         assert "died mid-shard" in resp["body"]
         assert os.path.exists(leaf)
         assert hive.read_commit(open_store(leaf)) is None  # debris
-        assert os.path.exists(stale)
+        # Plant a stray object in the debris the retry will NOT rewrite, so the
+        # wholesale-overwrite claim stays pinned (a metadata-only re-template
+        # would leave it behind).
+        stale = os.path.join(leaf, grid.group_path, "stale-debris")
+        with open(stale, "w") as fh:
+            fh.write("torn attempt")
 
         # Retry (no ragged this time): the leaf is overwritten WHOLESALE — the
-        # torn attempt's CSR subgroup is gone — and stamped at the end.
+        # planted debris is gone — and stamped at the end.
         monkeypatch.setattr(processing, "process_shard", self._streaming_fake(grid))
         resp = handler_mod._handle_process(event, _context())
         assert resp["statusCode"] == 200, resp["body"]
