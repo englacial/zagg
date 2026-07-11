@@ -624,15 +624,15 @@ class RectilinearGrid:
                         "inner_chunk_shape": self.chunk_shape,
                         "shard_shape": (self.chunk_h, self.chunk_w) if self.sharded else None,
                     }
+                located = ragged_locations_name(name) if sig.get("location") else None
                 members[name] = ragged_array_spec(
                     element_dtype=sig["dtype"] or "float32",
                     inner_shape=sig["inner_shape"],
+                    locations=located,
                     **rag_kw,
                 )
-                if sig.get("location"):
-                    members[ragged_locations_name(name)] = ragged_array_spec(
-                        element_dtype="uint64", **rag_kw
-                    )
+                if located:
+                    members[located] = ragged_array_spec(element_dtype="uint64", **rag_kw)
                 continue
             dtype = meta.get("dtype", "float32")
             fill = meta.get("fill_value", "NaN")
