@@ -41,8 +41,17 @@ ShardKey = Any  # int for HEALPix, tuple[int,int] for rectilinear, etc.
 #: ``np.frombuffer(a[i], dtype).reshape(-1, *inner_shape)``. A LOCATED field's
 #: payload array additionally carries ``{"locations": "<sibling array name>"}``
 #: (issue #87) — the reader binds the uint64 channel by that declaration, not
-#: by reconstructing the naming convention (review, PR #211).
+#: by reconstructing the naming convention (review, PR #211). The block is
+#: versioned (``{"spec": RAGGED_SPEC}``, the coverage-envelope discipline) so
+#: readers fail loudly on a future revision instead of half-parsing it.
 RAGGED_ELEMENT_ATTR = "ragged"
+
+#: Convention version stamped into the :data:`RAGGED_ELEMENT_ATTR` block and
+#: strict-checked by the readers (``readers/tdigest_tensor._open_ragged``).
+#: This attrs seam is the INTERIM contract: the issue #210 typed
+#: ``vlen-array<T>`` dtype migration moves the element declaration into the
+#: zarr data type itself and supersedes (bumps or removes) this marker.
+RAGGED_SPEC = "zagg-ragged/1"
 
 #: zstd level of the ragged inner codec chain — 3, matching the coverage
 #: sidecar precedent (``zagg.hive._ZSTD_LEVEL``), fixed so identical payloads
@@ -169,7 +178,7 @@ def ragged_array_spec(
         codecs = tuple(NamedConfig(**c) for c in inner_codecs)
         chunk_shape = tuple(int(c) for c in inner_chunk_shape)
     element = {"dtype": str(element_dtype), "shape": [-1, *(int(s) for s in inner_shape)]}
-    ragged_meta: dict = {"element": element}
+    ragged_meta: dict = {"spec": RAGGED_SPEC, "element": element}
     if locations is not None:
         ragged_meta["locations"] = str(locations)
     return ArraySpec(
@@ -482,6 +491,7 @@ def shard_label(grid, shard_key) -> str:
 __all__ = [
     "OutputGrid",
     "RAGGED_ELEMENT_ATTR",
+    "RAGGED_SPEC",
     "RAGGED_ZSTD_LEVEL",
     "ShardKey",
     "InconsistentShardError",

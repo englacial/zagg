@@ -499,7 +499,10 @@ def write_ragged_leaf_to_zarr(ragged_chunks: list, store: Store, *, grid) -> Sto
     — the ShardingCodec emits ONE object per leaf in place of the per-chunk CSR
     subgroups (~7 objects per populated inner chunk). A per-chunk write here
     would read-modify-write that shared object K times, which is why the hive
-    write path collects the (small) ragged payloads instead of streaming them.
+    write path collects the ragged payloads instead of streaming them — the
+    memory bound of that accumulation is quantified and accepted at the
+    collection site (``hive.process_and_write_hive``, ~200 MB peak at the o8
+    t-digest scale).
 
     ``resolution: chunk`` ragged companions are written per chunk block (their
     array is one block per chunk, unsharded — same as the scalar/vector

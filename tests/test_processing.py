@@ -939,7 +939,8 @@ class TestRaggedVlenWrite:
         assert "h_min" in product.array_keys()
         assert "h_raw" in product.array_keys()
         assert product["h_raw"].attrs["ragged"] == {
-            "element": {"dtype": "float32", "shape": [-1, 1]}
+            "spec": "zagg-ragged/1",
+            "element": {"dtype": "float32", "shape": [-1, 1]},
         }
 
         ragged: dict = {}
@@ -1105,7 +1106,10 @@ class TestLocatedRaggedAggregation:
         base = grid.block_index(shard_key)[0] * grid.cells_per_chunk
         digests = zarr.open_array(store, path=f"{grid.group_path}/h_tdigest", mode="r")
         locations = zarr.open_array(store, path=f"{grid.group_path}/h_tdigest_locations", mode="r")
-        assert locations.attrs["ragged"] == {"element": {"dtype": "uint64", "shape": [-1]}}
+        assert locations.attrs["ragged"] == {
+            "spec": "zagg-ragged/1",
+            "element": {"dtype": "uint64", "shape": [-1]},
+        }
         d_block = digests[base : base + grid.cells_per_chunk]
         l_block = locations[base : base + grid.cells_per_chunk]
         out = [
@@ -1477,6 +1481,54 @@ class TestRaggedVlenLayout:
             np.testing.assert_array_equal(seen[key][1], w, err_msg=f"locations {key}")
 
 
+class TestRaggedWriteGuards:
+    """The malformed-worker-output guards that replaced ``write_csr``'s checks
+    (issue #209; review, PR #211 round 2): each raising branch of the vlen
+    slab pass is pinned so a bad sink entry surfaces as a pointed error, not
+    silent corruption deep in the encode. (The located ``resolution: chunk``
+    rejection is pinned separately —
+    ``TestLocatedRaggedAggregation.test_chunk_resolution_located_write_raises``.)
+    All guards fire during slab assembly, before any store write, so a bare
+    ``MemoryStore`` suffices."""
+
+    @staticmethod
+    def _grid(inner=1):
+        cfg = TestRaggedVlenWrite._ragged_cfg()
+        cfg.aggregation["variables"]["h_raw"]["inner_shape"] = [inner]
+        return HealpixGrid(6, 8, layout="fullsphere", config=cfg)
+
+    def test_values_cell_ids_length_mismatch_raises(self):
+        ragged = {"h_raw": ([np.ones((1, 1), np.float32)], [0, 1])}
+        with pytest.raises(ValueError, match="must have the same length"):
+            write_ragged_to_zarr(ragged, MemoryStore(), grid=self._grid(), chunk_idx=(0,))
+
+    def test_locations_values_length_mismatch_raises(self):
+        locs = [np.array([1], np.uint64), np.array([2], np.uint64)]
+        ragged = {"h_raw": ([np.ones((1, 1), np.float32)], [0], locs)}
+        with pytest.raises(ValueError, match="locations_list .* must have the same length"):
+            write_ragged_to_zarr(ragged, MemoryStore(), grid=self._grid(), chunk_idx=(0,))
+
+    def test_per_cell_location_misalignment_raises(self):
+        # 2 payload rows vs 3 location words: the channels would silently
+        # de-align in the store.
+        ragged = {"h_raw": ([np.ones((2, 1), np.float32)], [0], [np.arange(3, dtype=np.uint64)])}
+        with pytest.raises(ValueError, match=r"expected \(2,\) to stay row-aligned"):
+            write_ragged_to_zarr(ragged, MemoryStore(), grid=self._grid(), chunk_idx=(0,))
+
+    def test_nonempty_locations_on_empty_payload_raise(self):
+        # An upstream misalignment, not a droppable channel (issue #87).
+        ragged = {"h_raw": ([np.empty((0, 1), np.float32)], [0], [np.array([7], np.uint64)])}
+        with pytest.raises(ValueError, match=r"expected \(0,\) to stay row-aligned"):
+            write_ragged_to_zarr(ragged, MemoryStore(), grid=self._grid(), chunk_idx=(0,))
+
+    def test_payload_not_tiling_inner_shape_raises(self):
+        # 3 elements cannot tile inner_shape (2,): the vlen bytes would decode
+        # to a torn final row.
+        ragged = {"h_raw": ([np.ones(3, np.float32)], [0])}
+        with pytest.raises(ValueError, match="does not tile inner_shape"):
+            write_ragged_to_zarr(ragged, MemoryStore(), grid=self._grid(inner=2), chunk_idx=(0,))
+
+
 class TestRaggedChunkCompanion:
     """Issue #82 phase 4c: a ``kind: ragged`` + ``resolution: chunk`` field stores
     ONE variable-length payload per chunk (collapsed from the populated cells under
@@ -1614,7 +1666,10 @@ class TestRaggedChunkCompanion:
         companion = product["h_chunk_edges"]
         assert companion.shape == grid.chunk_grid_shape
         assert companion.chunks == (1,)
-        assert companion.attrs["ragged"] == {"element": {"dtype": "float32", "shape": [-1, 1]}}
+        assert companion.attrs["ragged"] == {
+            "spec": "zagg-ragged/1",
+            "element": {"dtype": "float32", "shape": [-1, 1]},
+        }
 
     def test_rectilinear_chunk_ragged_roundtrip(self, monkeypatch):
         """Rectilinear: a chunk-resolution ragged field collapses + round-trips the
