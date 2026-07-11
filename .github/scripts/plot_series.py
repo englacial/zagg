@@ -97,18 +97,43 @@ def _frozen_history(df: pd.DataFrame) -> pd.DataFrame:
     return _merge_history(df[~_codec_mask(df)])
 
 
+def _aoi_axis(target: str) -> str:
+    """The AOI-mask arm of a live target: ``"mask"`` or ``"nomask"`` (issue #202).
+
+    The reset live matrix has no dedicated record column for the AOI-mask A/B
+    (``bench_metrics``/``run_benchmark`` are stable plumbing, not touched by the
+    reset), so the axis is read off the target-name suffix
+    (``..._mask`` / ``..._nomask``). ``_nomask`` does not end with ``_mask``, so
+    the plain ``endswith`` split is unambiguous."""
+    return "mask" if str(target).endswith("_mask") else "nomask"
+
+
 def _matrix_mask(df: pd.DataFrame) -> pd.Series:
-    """Boolean mask of the live matrix rows (issue #193): those carrying a
-    non-null ``index_backend`` (inline|sidecar). Absent column (a pre-#193
-    parquet) -> all False, so the matrix figures stay empty until its first
-    merge lands."""
+    """Boolean mask of the live *reset* matrix rows (issue #202): o9 rows carrying
+    a non-null ``index_backend`` (inline|sidecar) whose target names the AOI-mask
+    arm (``..._mask`` / ``..._nomask``).
+
+    The name/order gate is what resets the series to zero at the render layer: the
+    pre-reset live points (the issue #193 o9/o10 inline-vs-sidecar rows, whose
+    targets carry no ``_mask``/``_nomask`` suffix, and any o10 rows) fall outside
+    this scheme and drop out, so the corrected 2x2 begins fresh at the first
+    post-reset merge without needing to prune the benchmarks-branch series.
+    Absent ``index_backend`` column (a pre-#193 parquet) -> all False."""
     if "index_backend" not in df.columns:
         return pd.Series(False, index=df.index)
-    return df["index_backend"].notna()
+    has_backend = df["index_backend"].notna()
+    grid_size = df["grid_size"].astype(str) if "grid_size" in df.columns else ""
+    is_o9 = grid_size == "o9"
+    if "target" in df.columns:
+        aoi_suffix = df["target"].astype(str).str.endswith(("_mask", "_nomask"))
+    else:
+        aoi_suffix = pd.Series(False, index=df.index)
+    return has_backend & is_o9 & aoi_suffix.fillna(False)
 
 
 def _matrix_history(df: pd.DataFrame) -> pd.DataFrame:
-    """Retained merge points of the live inline-vs-sidecar matrix (issue #193)."""
+    """Retained merge points of the live reset matrix (issue #202): inline/sidecar
+    x AOI-mask on/off at o9."""
     return _merge_history(df[_matrix_mask(df)])
 
 
@@ -332,22 +357,27 @@ def _codec_layout(hist: pd.DataFrame) -> tuple[list[list[str | None]], int, int]
     return grid, len(CODEC_ROWS), len(CODEC_COLS)
 
 
-# Live matrix (issue #193): read-backend A/B x order. Retired the sharded/inner
-# codec axis; those figures are frozen (see main()).
+# Live matrix (issue #202 reset): read-backend A/B (columns) x AOI-mask A/B (rows),
+# o9 ONLY. Retired the o10 order axis (frozen) and the sharded/inner codec axis
+# (frozen, issue #193). Columns are inline|sidecar; rows are nomask|mask (AOI-mask
+# off on top, on below).
 MATRIX_COLS = ["inline", "sidecar"]
-MATRIX_ROWS = ["o9", "o10"]
+MATRIX_ROWS = ["nomask", "mask"]
 
 
 def _matrix_layout(hist: pd.DataFrame) -> tuple[list[list[str | None]], int, int]:
-    """Place each live target in the fixed ``(order, index_backend)`` grid
-    (issue #193). Columns = ``MATRIX_COLS`` (inline, sidecar); rows =
-    ``MATRIX_ROWS`` (o9, o10). Empty cell -> ``None`` (order not landed yet)."""
+    """Place each live target in the fixed ``(aoi_mask, index_backend)`` grid
+    (issue #202 reset). Columns = ``MATRIX_COLS`` (inline, sidecar); rows =
+    ``MATRIX_ROWS`` (nomask, mask). Empty cell -> ``None`` (arm not landed yet).
+
+    The AOI-mask row is derived from the target-name suffix via :func:`_aoi_axis`
+    (there is no record column for it); all rows are o9 (the reset is o9-only)."""
     by_slot: dict[tuple[str, str], str] = {}
     meta = hist.dropna(subset=["target"]).drop_duplicates("target")
     for _, r in meta.iterrows():
-        by_slot[(str(r.get("grid_size", "")), str(r.get("index_backend", "")))] = r["target"]
+        by_slot[(_aoi_axis(r["target"]), str(r.get("index_backend", "")))] = r["target"]
     grid: list[list[str | None]] = [
-        [by_slot.get((order, backend)) for backend in MATRIX_COLS] for order in MATRIX_ROWS
+        [by_slot.get((aoi, backend)) for backend in MATRIX_COLS] for aoi in MATRIX_ROWS
     ]
     return grid, len(MATRIX_ROWS), len(MATRIX_COLS)
 
@@ -553,17 +583,20 @@ def make_figure(df: pd.DataFrame, cost_col: str, cost_label: str, out_png: Path)
 
 
 def make_matrix_latest_table(df: pd.DataFrame, out_png: Path) -> bool:
-    """Render the live inline-vs-sidecar latest-merge table (issue #193): the
-    ``index_backend.notna`` rows of the most recent merge. False until the new
-    matrix lands its first merge."""
+    """Render the live reset-matrix latest-merge table (issue #202): the reset
+    rows (o9, inline/sidecar x mask/nomask) of the most recent merge. False until
+    the reset matrix lands its first merge."""
     recs = _latest_of(_matrix_history(df)).to_dict(orient="records")
-    return _render_table(recs, _table_title("zagg inline vs sidecar (sharded, K=4)", recs), out_png)
+    return _render_table(
+        recs, _table_title("zagg inline/sidecar x AOI-mask (sharded, K=4, o9)", recs), out_png
+    )
 
 
 def make_matrix_figure(df: pd.DataFrame, cost_col: str, cost_label: str, out_png: Path) -> bool:
-    """Render the live inline-vs-sidecar figure (issue #193): the
-    ``index_backend.notna`` rows in the fixed ``MATRIX_ROWS x MATRIX_COLS`` grid.
-    Returns False when no matrix rows are retained yet."""
+    """Render the live reset-matrix figure (issue #202): the reset rows in the
+    fixed ``MATRIX_ROWS x MATRIX_COLS`` grid (rows = AOI-mask nomask/mask,
+    columns = inline/sidecar, o9 only). Returns False when no reset rows are
+    retained yet."""
     hist = _matrix_history(df)
     if hist.empty or hist["target"].dropna().empty:
         return False
@@ -575,7 +608,7 @@ def make_matrix_figure(df: pd.DataFrame, cost_col: str, cost_label: str, out_png
         ncols,
         cost_col,
         cost_label,
-        f"zagg inline vs sidecar (sharded, K=4) \u2014 {cost_label} vs merge history",
+        f"zagg inline/sidecar x AOI-mask (sharded, K=4, o9) \u2014 {cost_label} vs merge history",
         out_png,
     )
 
@@ -601,6 +634,47 @@ def make_codec_figure(df: pd.DataFrame, cost_col: str, cost_label: str, out_png:
     )
 
 
+# --- per-release full-AOI NEON figure (issue #202, leg 1) -------------------
+#
+# The live 2x2 above is the PER-MERGE-TO-MAIN series (one densest shard/target,
+# isolating code deltas from data drift). The full-AOI NEON run is the
+# complementary PER-RELEASE series: the whole AOP_NEON box fanned out over every
+# shard, recorded per release for cost-truth (all shards, real dollar total), not
+# on every merge. The two are deliberately split (see docs/deployment/benchmark.md).
+#
+# The full-AOI run harness + its recorded schema are another agent's deliverable
+# (issue #202 leg 1; the pinned full-AOI targets land in targets_full_aoi_neon.json,
+# NOT owned here). This is the render side: a skeleton kept next to the per-merge
+# renderers so the plot lands the moment leg 1's output schema is fixed.
+
+# The columns the per-release full-AOI figure will chart once leg 1's schema lands
+# (release tag on the x-axis, these on the y). Provisional -- reconcile with leg 1.
+FULL_AOI_METRICS = {
+    "cost_total": ("total cost (USD)", "whole-AOI dollar total across all shards"),
+    "runtime_wall": ("wall time (s)", "end-to-end AOI dispatch wall"),
+}
+
+
+def make_full_aoi_release_figure(
+    df: pd.DataFrame, cost_col: str, cost_label: str, out_png: Path
+) -> bool:
+    """Render the PER-RELEASE full-AOI NEON figure (issue #202 leg 1).
+
+    Unlike the per-merge live matrix (one densest shard/target), this charts the
+    whole-AOI cost/runtime truth once per release, x-axis = release tag.
+
+    TODO(issue #202 leg 1): wire to the full-AOI harness output. Blocked on that
+    agent's recorded schema (the per-release full-AOI records + their pinned
+    targets in ``targets_full_aoi_neon.json``, owned by leg 1). Once the schema is
+    fixed, this should: (1) select the per-release full-AOI rows from ``df`` (an
+    ``event == "release"`` / ``run == "full_aoi"`` discriminator, TBD by leg 1),
+    (2) lay out one panel per ``FULL_AOI_METRICS`` entry, and (3) reuse
+    ``_render_panel_grid``'s cost+runtime panel style with the release tag on the
+    x-axis instead of the commit. Returns False until then so ``main`` skips it
+    and the Pages index simply omits the section (no broken image)."""
+    return False
+
+
 def write_index(
     outdir: Path,
     matrix_rendered: list[str],
@@ -623,14 +697,15 @@ def write_index(
     # --- live matrix section (on top) ---
     if matrix_table_png:
         block = (
-            "<h2>inline vs sidecar (sharded, K=4) \u2014 latest merge</h2>\n"
-            '<img src="matrix_table.png" alt="inline vs sidecar benchmark table">'
+            "<h2>inline/sidecar \u00d7 AOI-mask (sharded, K=4, o9) \u2014 latest merge</h2>\n"
+            '<img src="matrix_table.png" alt="inline/sidecar x AOI-mask benchmark table">'
         )
         if links:
             block += f"\n<p>Machine-readable: {' \u00b7 '.join(links)}</p>"
         blocks.append(block)
     blocks += [
-        f'<h2>{name} (inline vs sidecar)</h2>\n<img src="{name}_matrix.png" alt="{name}_matrix">'
+        f"<h2>{name} (inline/sidecar \u00d7 AOI-mask)</h2>\n"
+        f'<img src="{name}_matrix.png" alt="{name}_matrix">'
         for name in matrix_rendered
     ]
 
@@ -655,9 +730,9 @@ def write_index(
                 )
     if archived:
         blocks.append(
-            "<hr>\n<h2>Archived (frozen as of issue #193)</h2>\n"
-            "<p>The pre-#193 codec (sharded/inner) + historical series, retained "
-            "but no longer updated.</p>"
+            "<hr>\n<h2>Archived (frozen as of issues #193 / #202)</h2>\n"
+            "<p>The pre-#193 codec (sharded/inner) + historical series and the "
+            "pre-#202 o10 read-backend rows, retained but no longer updated.</p>"
         )
         blocks += archived
 
