@@ -16,6 +16,7 @@ Records per-shard runtime / lambda-seconds / cost / RSS for both passes and fits
 has both a first-run and a repeat cost curve. Billed: ~50 invocations, a-priori
 well under $1. Reuses the full-AOI harness helpers.
 """
+
 from __future__ import annotations
 
 import argparse
@@ -77,8 +78,11 @@ def build_submap(catalog_path: str, grid) -> "object":
     meta["subset"] = f"CONUS regression: {len(keep_keys)} stratified shards (issue #202)"
     sub_sm = ShardMap(full.grid_signature, keep_keys, keep_granules, meta, None)
     sub_sm.to_json(str(SUBMAP))
-    print(f"wrote {SUBMAP.name}: {len(keep_keys)} shards, "
-          f"{sum(len(g) for g in keep_granules)} granule-reads", flush=True)
+    print(
+        f"wrote {SUBMAP.name}: {len(keep_keys)} shards, "
+        f"{sum(len(g) for g in keep_granules)} granule-reads",
+        flush=True,
+    )
     return sub_sm
 
 
@@ -119,26 +123,31 @@ def dispatch(config, submap_path: str, store: str, region: str, function_name: s
         rt = float(r.get("lambda_duration") or 0.0)
         gb = rt * LAMBDA_MEMORY_GB
         body = r.get("body") or {}
-        rows.append({
-            "shard_label": grid.shard_label(int(r["shard_key"])),
-            "shard_key": int(r["shard_key"]),
-            "n_granules": r.get("granule_count"),
-            "runtime_s": rt,
-            "gb_seconds": gb,
-            "cost_usd": gb * LAMBDA_PRICE_PER_GB_SEC,
-            "max_memory_mb": body.get("max_memory_mb"),
-            "wall_time_s": r.get("wall_time"),
-            "retries": r.get("retries"),
-            "timeout": bool(r.get("timeout")),
-            "status_code": r.get("status_code"),
-            "error": r.get("error"),
-        })
+        rows.append(
+            {
+                "shard_label": grid.shard_label(int(r["shard_key"])),
+                "shard_key": int(r["shard_key"]),
+                "n_granules": r.get("granule_count"),
+                "runtime_s": rt,
+                "gb_seconds": gb,
+                "cost_usd": gb * LAMBDA_PRICE_PER_GB_SEC,
+                "max_memory_mb": body.get("max_memory_mb"),
+                "wall_time_s": r.get("wall_time"),
+                "retries": r.get("retries"),
+                "timeout": bool(r.get("timeout")),
+                "status_code": r.get("status_code"),
+                "error": r.get("error"),
+            }
+        )
     return rows, summary
 
 
 def _fit(rows: list[dict]) -> dict:
-    ok = [(r["n_granules"], r["runtime_s"]) for r in rows
-          if not r["error"] and r["runtime_s"] and r["n_granules"]]
+    ok = [
+        (r["n_granules"], r["runtime_s"])
+        for r in rows
+        if not r["error"] and r["runtime_s"] and r["n_granules"]
+    ]
     if len(ok) < 2:
         return {"n_points": len(ok), "note": "insufficient successful shards to fit"}
     g = np.array([x[0] for x in ok], float)
@@ -186,8 +195,9 @@ def main() -> int:
     print(f"pre-cold sidecar for {sample_gid}: {'PRESENT' if pre else 'absent'}", flush=True)
 
     print("\n=== COLD PASS (build sidecars) ===", flush=True)
-    cold, cold_sum = dispatch(config, str(SUBMAP), f"{args.store_prefix}-cold",
-                              args.region, args.function_name)
+    cold, cold_sum = dispatch(
+        config, str(SUBMAP), f"{args.store_prefix}-cold", args.region, args.function_name
+    )
 
     post = _manifest_exists(sample_gid)
     print(f"post-cold sidecar for {sample_gid}: {'PRESENT' if post else 'ABSENT'}", flush=True)
@@ -199,8 +209,9 @@ def main() -> int:
         )
 
     print("\n=== WARM PASS (read sidecars) ===", flush=True)
-    warm, warm_sum = dispatch(config, str(SUBMAP), f"{args.store_prefix}-warm",
-                              args.region, args.function_name)
+    warm, warm_sum = dispatch(
+        config, str(SUBMAP), f"{args.store_prefix}-warm", args.region, args.function_name
+    )
 
     out = {
         "issue": 202,
@@ -208,12 +219,18 @@ def main() -> int:
         "n_shards": len(sm.shard_keys),
         "sidecar_store": SIDECAR_STORE,
         "sidecar_write_verified": bool(post and not pre),
-        "cold": {"per_shard": cold, "fit": _fit(cold),
-                 "lambda_seconds": cold_sum.get("lambda_time_s"),
-                 "cost_usd": cold_sum.get("estimated_cost_usd")},
-        "warm": {"per_shard": warm, "fit": _fit(warm),
-                 "lambda_seconds": warm_sum.get("lambda_time_s"),
-                 "cost_usd": warm_sum.get("estimated_cost_usd")},
+        "cold": {
+            "per_shard": cold,
+            "fit": _fit(cold),
+            "lambda_seconds": cold_sum.get("lambda_time_s"),
+            "cost_usd": cold_sum.get("estimated_cost_usd"),
+        },
+        "warm": {
+            "per_shard": warm,
+            "fit": _fit(warm),
+            "lambda_seconds": warm_sum.get("lambda_time_s"),
+            "cost_usd": warm_sum.get("estimated_cost_usd"),
+        },
     }
     outp = Path(args.out)
     outp.parent.mkdir(parents=True, exist_ok=True)

@@ -53,18 +53,26 @@ def build_subset():
     lo = np.datetime64(f"{START}T00:00:00").astype("datetime64[us]").astype("int64")
     hi = np.datetime64(f"{END}T23:59:59").astype("datetime64[us]").astype("int64")
     s, e = full.column("start_datetime"), full.column("end_datetime")
-    tsub = full.filter(pc.and_(
-        pc.less_equal(s, pa.scalar(hi, "int64").cast(s.type)),
-        pc.greater_equal(e, pa.scalar(lo, "int64").cast(e.type)),
-    ))
+    tsub = full.filter(
+        pc.and_(
+            pc.less_equal(s, pa.scalar(hi, "int64").cast(s.type)),
+            pc.greater_equal(e, pa.scalar(lo, "int64").cast(e.type)),
+        )
+    )
     bb = tsub.column("bbox")
     x0, y0, x1, y1 = aoi_bbox
-    cand = tsub.filter(pc.and_(
-        pc.and_(pc.less_equal(pc.struct_field(bb, "xmin"), x1 + 3),
-                pc.greater_equal(pc.struct_field(bb, "xmax"), x0 - 3)),
-        pc.and_(pc.less_equal(pc.struct_field(bb, "ymin"), y1 + 3),
-                pc.greater_equal(pc.struct_field(bb, "ymax"), y0 - 3)),
-    ))
+    cand = tsub.filter(
+        pc.and_(
+            pc.and_(
+                pc.less_equal(pc.struct_field(bb, "xmin"), x1 + 3),
+                pc.greater_equal(pc.struct_field(bb, "xmax"), x0 - 3),
+            ),
+            pc.and_(
+                pc.less_equal(pc.struct_field(bb, "ymin"), y1 + 3),
+                pc.greater_equal(pc.struct_field(bb, "ymax"), y0 - 3),
+            ),
+        )
+    )
     cat = Catalog(cand, {"collection": "ATL03_007", "bbox": list(aoi_bbox)})
     return grid, parts, cat, cand.num_rows
 
@@ -76,19 +84,24 @@ def main():
     print(f"{'order':>6} {'granules':>9} {'densest':>8} {'wall_s':>8}", flush=True)
     for order in (9, 12, 13, 16):
         t0 = time.perf_counter()
-        sm = ShardMap.build(cat, grid, region=parts, backend="mortie",
-                            mortie_order=order, footprint="swath")
+        sm = ShardMap.build(
+            cat, grid, region=parts, backend="mortie", mortie_order=order, footprint="swath"
+        )
         wall = time.perf_counter() - t0
         dens = max((len(g) for g in sm.granules), default=0)
         print(f"{order:>6} {total_granules(sm):>9} {dens:>8} {wall:>8.2f}", flush=True)
 
     # #65 residual test: per-beam corridors at the top order.
     t0 = time.perf_counter()
-    sm_b = ShardMap.build(cat, grid, region=parts, backend="mortie",
-                          mortie_order=16, footprint="beams")
-    print(f"\nfootprint='beams' @order16: granules={total_granules(sm_b)} "
-          f"densest={max((len(g) for g in sm_b.granules), default=0)} "
-          f"wall={time.perf_counter()-t0:.2f}s", flush=True)
+    sm_b = ShardMap.build(
+        cat, grid, region=parts, backend="mortie", mortie_order=16, footprint="beams"
+    )
+    print(
+        f"\nfootprint='beams' @order16: granules={total_granules(sm_b)} "
+        f"densest={max((len(g) for g in sm_b.granules), default=0)} "
+        f"wall={time.perf_counter() - t0:.2f}s",
+        flush=True,
+    )
 
 
 if __name__ == "__main__":

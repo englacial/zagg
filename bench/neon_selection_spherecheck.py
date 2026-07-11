@@ -50,17 +50,25 @@ def main():
     lo = np.datetime64(f"{START}T00:00:00").astype("datetime64[us]").astype("int64")
     hi = np.datetime64(f"{END}T23:59:59").astype("datetime64[us]").astype("int64")
     s, e = full.column("start_datetime"), full.column("end_datetime")
-    tsub = full.filter(pc.and_(
-        pc.less_equal(s, pa.scalar(hi, "int64").cast(s.type)),
-        pc.greater_equal(e, pa.scalar(lo, "int64").cast(e.type)),
-    ))
+    tsub = full.filter(
+        pc.and_(
+            pc.less_equal(s, pa.scalar(hi, "int64").cast(s.type)),
+            pc.greater_equal(e, pa.scalar(lo, "int64").cast(e.type)),
+        )
+    )
     bb = tsub.column("bbox")
-    cand = tsub.filter(pc.and_(
-        pc.and_(pc.less_equal(pc.struct_field(bb, "xmin"), x1 + 3),
-                pc.greater_equal(pc.struct_field(bb, "xmax"), x0 - 3)),
-        pc.and_(pc.less_equal(pc.struct_field(bb, "ymin"), y1 + 3),
-                pc.greater_equal(pc.struct_field(bb, "ymax"), y0 - 3)),
-    ))
+    cand = tsub.filter(
+        pc.and_(
+            pc.and_(
+                pc.less_equal(pc.struct_field(bb, "xmin"), x1 + 3),
+                pc.greater_equal(pc.struct_field(bb, "xmax"), x0 - 3),
+            ),
+            pc.and_(
+                pc.less_equal(pc.struct_field(bb, "ymin"), y1 + 3),
+                pc.greater_equal(pc.struct_field(bb, "ymax"), y0 - 3),
+            ),
+        )
+    )
     ids = cand.column("id").to_pylist()
     geoms = cand.column("geometry").to_pylist()
 
