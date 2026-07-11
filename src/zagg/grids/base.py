@@ -424,8 +424,8 @@ class OutputGrid(Protocol):
     def shard_label(self, shard_key: ShardKey) -> str:
         """External string form of a shard key (issue #199).
 
-        Used wherever a shard id surfaces outside the process — CSR subgroup
-        names, async ``.status`` object keys, log lines. HEALPix renders the
+        Used wherever a shard id surfaces outside the process — hive leaf
+        ids, async ``.status`` object keys, log lines. HEALPix renders the
         packed word as its decimal morton string (D1 in
         ``docs/design/sparse_coverage.md``); rectilinear keeps the packed tile
         int's decimal digits.

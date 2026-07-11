@@ -129,7 +129,7 @@ def process_shard(
         is only a no-config safety net for direct callers. pyarrow is not used on
         either path.
     ragged_out : dict, optional
-        Out-param sink for ``kind: ragged`` (CSR) fields (issue #48). When a dict
+        Out-param sink for ``kind: ragged`` fields (issue #48). When a dict
         is passed, it is filled in place with ``{field_name: (values_list,
         cell_ids)}`` — ``values_list`` the per-populated-cell payload arrays and
         ``cell_ids`` their position in the chunk's ``children`` block — for the
@@ -156,7 +156,7 @@ def process_shard(
         with one ``(block_index, carrier, ragged)`` tuple per chunk —
         ``block_index`` the chunk's storage block (from ``grid.iter_chunks``),
         ``carrier`` its dense DataFrame/Table, ``ragged`` its
-        ``{field: (values_list, cell_ids)}`` CSR map — for the caller to write K
+        ``{field: (values_list, cell_ids)}`` ragged map — for the caller to write K
         regions + K companion slices. The returned 2-tuple's ``df_out`` is an empty
         carrier in that case (the real carriers live in ``chunk_results``).
         ``None`` (default) is the K==1 path: the single chunk's carrier is the
@@ -198,7 +198,7 @@ def process_shard(
     (DataFrame, metadata)
         DataFrame in canonical chunk order; metadata dict with ``shard_key``,
         ``cells_with_data``, ``total_obs``, ``granule_count``,
-        ``files_processed``, ``duration_s``, ``error``. Ragged (CSR) fields are
+        ``files_processed``, ``duration_s``, ``error``. Ragged fields are
         delivered out-of-band via ``ragged_out`` (above), not in this tuple. At
         K>1 the per-chunk carriers + ragged are delivered via ``chunk_results``.
     """

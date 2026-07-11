@@ -73,7 +73,7 @@ def morton_decimal(word) -> str:
     The external/path form of a shard id per the sparse-coverage design record
     (``docs/design/sparse_coverage.md`` D1): the packed ``uint64`` word stays
     the canonical in-memory/wire form, and every externally visible string —
-    CSR subgroup names, ``.status`` object keys, log lines — renders through
+    hive leaf ids, ``.status`` object keys, log lines — renders through
     mortie's decode-through-kernel decimal repr (e.g. ``-31123``). Raises
     ``ValueError`` on an empty, invalid, or negative word (a path component
     must never be silently wrong) — a NEGATIVE int here is usually a *legacy
@@ -98,7 +98,7 @@ def morton_word(label: str) -> int:
     """Parse a decimal morton string back to its packed word (issue #199).
 
     The inverse of :func:`morton_decimal` at the zagg boundary — used where an
-    external decimal id re-enters (``--morton-cell``, CSR subgroup names on the
+    external decimal id re-enters (``--morton-cell``, hive leaf ids on the
     read path). Raises ``ValueError`` on a malformed id.
 
     Implementation note: this rides mortie's private-but-documented

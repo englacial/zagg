@@ -465,7 +465,7 @@ class HealpixGrid:
         """Decimal morton string for this shard's packed word (issue #199).
 
         The external form of a HEALPix shard id (D1 in
-        ``docs/design/sparse_coverage.md``): CSR subgroup names, ``.status``
+        ``docs/design/sparse_coverage.md``): hive leaf ids, ``.status``
         object keys, and log lines all carry e.g. ``-31123``, never the raw
         packed-word integer.
         """

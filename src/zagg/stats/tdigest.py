@@ -67,7 +67,7 @@ Adding ``location: leaf_id`` to the field (issue #87) passes the cell's
 per-observation order-29 morton point words as ``locations=``; the reducer then
 returns a ``(digest, locations)`` pair whose second element is the ``(k,)``
 uint64 per-centroid location — the deepest morton cell enclosing each
-centroid's members (``mortie.common_ancestor``), stored as a companion CSR
+centroid's members (``mortie.common_ancestor``), stored as a companion vlen
 array. See ``zagg/configs/atl03_tdigest_located_healpix.yaml``.
 """
 

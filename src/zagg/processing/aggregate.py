@@ -329,11 +329,11 @@ def _has_vector_fields(config: PipelineConfig) -> bool:
 
 
 def _has_ragged_fields(config: PipelineConfig) -> bool:
-    """Whether any aggregation field declares a ``ragged`` (CSR) output.
+    """Whether any aggregation field declares a ``ragged`` output.
 
     Ragged fields (issue #48) carry variable-length per-cell payloads and are
-    collected separately from scalar/vector fields; they are written via the CSR
-    writer rather than the dense Zarr path.
+    collected separately from scalar/vector fields; they are written via the
+    ragged vlen writer rather than the dense Zarr path.
     """
     return any(
         get_output_signature(meta)["kind"] == "ragged" for meta in get_agg_fields(config).values()
@@ -427,8 +427,8 @@ def calculate_cell_statistics(
         # to a Python float; a ``kind: vector`` expression is coerced through the
         # same ``_coerce_field_value``/``trailing_shape``/dtype path as a vector
         # ``function`` field (issue #29). A ``kind: ragged`` expression (issue #48)
-        # returns the raw result as a numpy array — the CSR writer receives it as
-        # a variable-length per-cell payload.
+        # returns the raw result as a numpy array — the ragged writer receives it
+        # as a variable-length per-cell payload.
         if expression:
             if sig["kind"] == "vector":
                 out = _eval_expression_raw(expression, cell_data)
@@ -479,9 +479,10 @@ def calculate_cell_statistics(
 
         # Located ragged field (issue #87): hand the reducer the named
         # per-observation morton column and accept a ``(payload, locations)``
-        # pair — the uint64 locations ride beside the payload into the CSR
-        # companion array. Only the HEALPix read path supplies ``leaf_id``, so a
-        # missing column is a grid/config mismatch, reported clearly.
+        # pair — the uint64 locations ride beside the payload into the
+        # ``{field}_locations`` sibling vlen array. Only the HEALPix read path
+        # supplies ``leaf_id``, so a missing column is a grid/config mismatch,
+        # reported clearly.
         if sig["kind"] == "ragged" and sig["location"] is not None:
             loc_col = sig["location"]
             if loc_col not in cell_data:
@@ -513,7 +514,7 @@ def calculate_cell_statistics(
         # Scalar fields stay byte-for-byte identical to the pre-#29 path; a
         # declared ``vector`` field coerces to its trailing_shape (issue #29); a
         # ``ragged`` field (issue #48) returns a variable-length numpy array that
-        # the CSR writer later packs into flat + offsets + cell_ids arrays.
+        # the ragged writer later encodes as the cell's vlen-bytes payload.
         if sig["kind"] == "vector":
             result[name] = _coerce_field_value(out, sig)
         elif sig["kind"] == "ragged":
@@ -531,7 +532,7 @@ def _empty_cell_value(meta: dict):
     ``np.nan`` otherwise. A ``vector`` field (issue #29) instead gets a full
     ``trailing_shape`` array filled with its schema-declared sentinel
     (:func:`_field_sentinel`), so empty and populated cells emit the same shape.
-    A ``ragged`` field (issue #48) returns an empty list ``[]`` — the CSR writer
+    A ``ragged`` field (issue #48) returns an empty list ``[]`` — the ragged writer
     handles absent cells by leaving them out of ``cell_ids``. A *located* ragged
     field (issue #87) returns an empty ``(payload, locations)`` pair instead,
     keeping the pair contract uniform for direct callers.
@@ -557,7 +558,7 @@ def _coerce_field_value(value, sig: dict) -> np.ndarray:
     """Coerce a ``vector`` field's aggregation output to its declared signature.
 
     The field's ``function`` or ``expression`` must yield exactly
-    ``trailing_shape`` values (issue #29 Tier-1 fixed-width vectors; ragged/CSR
+    ``trailing_shape`` values (issue #29 Tier-1 fixed-width vectors; ragged
     is Tier 2). Returns a contiguous array of the declared dtype (default
     ``float32``), so every cell emits an identically-shaped slab the dense
     writer (phase 5) can stack.
@@ -577,7 +578,7 @@ def _coerce_ragged_value(value, sig: dict) -> np.ndarray:
     A ragged field (issue #48) emits a variable-length array of shape
     ``(n_elements, *inner_shape)`` per cell. This function verifies the inner
     dimensions match the declared ``inner_shape`` and returns a contiguous
-    array of the declared dtype (default ``float32``), ready for the CSR writer.
+    array of the declared dtype (default ``float32``), ready for the ragged writer.
 
     Parameters
     ----------
@@ -683,7 +684,7 @@ def _aggregate_chunk_cells(
     ragged_locations, cells_with_data)``: dense fields preallocated to
     ``(n_cells, *trailing_shape)`` and filled per cell; ragged fields collected
     as ``(payloads, cell_indices)`` keyed by the cell's position in ``children``
-    (the chunk-local index the CSR writer expects). ``ragged_locations`` holds
+    (the chunk-local index the ragged writer expects). ``ragged_locations`` holds
     the per-cell uint64 location vectors for located fields only (issue #87) —
     keyed like ``ragged_payloads`` and index-aligned with them; unlocated fields
     have no entry.
@@ -749,7 +750,7 @@ def _aggregate_chunk_cells(
                 # Fail fast if the value's shape disagrees with the declared
                 # signature (a located field must deliver its pair; empty cells
                 # are exempt as they were skipped above) — a silent mismatch
-                # would surface much later as a CSR length error in the writer.
+                # would surface much later as a length error in the ragged writer.
                 if (key in ragged_locations) != (locations is not None):
                     raise ValueError(
                         f"ragged field {key!r}: located/unlocated mismatch between the "
