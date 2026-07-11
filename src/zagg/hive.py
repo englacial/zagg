@@ -728,10 +728,19 @@ def process_and_write_hive(
     # Ragged fields accumulate across the streamed chunks (leaf-LOCAL blocks)
     # and are written ONCE after the stream (issue #209): the leaf's ragged
     # vlen array is a single ShardingCodec object spanning the shard, so a
-    # per-chunk write here would read-modify-write that object K times. Only
-    # the ragged payloads (digest bytes) are held — small next to the dense
-    # slabs the sharded flat path already buffers — so the issue #91
-    # stream-and-free bound on the dense side is unchanged.
+    # per-chunk write here would read-modify-write that object K times.
+    # Memory bound (review, PR #211): this re-adds an O(shard-payload) term to
+    # the otherwise O(chunk) streaming path (issue #91) — at the o8 t-digest
+    # scale this fix exists to unlock (sparse NEON o8: 17.6 M centroids × 8 B
+    # ≈ 141 MB of held payload; ~200 MB peak through the single write, once
+    # per-cell ``bytes``-object overhead and the assembled ~60 MB shard object
+    # are counted). Accepted deliberately: workers run 4 GB (issue #193), the
+    # dense side keeps its O(chunk) stream-and-free bound, and the
+    # accumulation is what deletes the ~K×7-object PUT storm that was ~1/3 of
+    # shard wall at CONUS scale (issue #209). If 88S-scale shards or the #148
+    # streaming budget ever say otherwise, the escape valve is spilling the
+    # ragged field back to per-inner-chunk writes against a regular-chunked
+    # vlen array (the unsharded flat layout) — named here, not built.
     ragged_chunks: list = []
 
     def _write_chunk(block_index, carrier, ragged):
