@@ -33,6 +33,7 @@ Two JSON files. ``--out-json`` is one **run record** per target::
       "target", "timestamp", "commit", "ref", "event", "pr_number",
       "aoi", "temporal": {"start","end"}, "grid_size", "grid_type",
       "aggregator", "index_backend", "aoi_mask",
+      "sidecar_cache",   # "cold"|"warm"|"unknown"|None -- labels a sidecar run as build vs read (issue #202)
       "parent_order", "child_order", "mortie_moc_order",
       "shard_area_km2", "memory_gb", "price_per_gb_sec", "zagg_version",
       "n_shards", "n_shards_ok", "n_shards_error", "total_obs",
@@ -195,6 +196,43 @@ def _apply_target_axes(config, target):
         config.output["aoi_mask"] = bool(target["aoi_mask"])
 
 
+def _sidecar_cache_state(store: str | None, sm) -> str:
+    """Probe whether the sidecar cache is already warm for this shard map.
+
+    A ``sidecar`` target runs with ``on_miss: build``, so against an EMPTY cache it
+    measures the sidecar *build* (a one-time write cost), not the warm *read* the
+    per-release matrix wants (issue #202: the 703 s cold-build once masqueraded as
+    a read). This checks one sample granule's manifest object (``<store>/<id>.parquet``)
+    and labels the run ``"warm"`` / ``"cold"`` / ``"unknown"`` so the recorded
+    number is self-describing. To get a true warm number, run a warming pass first
+    (cf. ``data/conus/run_conus_regression.py``, which does the explicit
+    cold -> verify -> warm two-pass); this probe is the interpretability guard for
+    the single-pass full-AOI harness.
+    """
+    if not store:
+        return "unknown"
+    gid = next((s[0]["id"] for s in sm.granules if s), None)
+    if gid is None:
+        return "unknown"
+    gid = gid[:-3] if gid.endswith(".h5") else gid
+    try:
+        from urllib.parse import urlparse
+
+        import boto3
+        from botocore.exceptions import ClientError
+
+        p = urlparse(store.rstrip("/"))
+        key = f"{p.path.lstrip('/')}/{gid}.parquet"
+        try:
+            boto3.client("s3").head_object(Bucket=p.netloc, Key=key)
+            return "warm"
+        except ClientError as e:
+            code = e.response.get("Error", {}).get("Code")
+            return "cold" if code in ("404", "NoSuchKey", "NotFound") else "unknown"
+    except Exception:
+        return "unknown"
+
+
 def _write_throughput(results: list[dict]) -> dict:
     retries = [int(r.get("retries") or 0) for r in results]
     slowdown = sum(
@@ -321,6 +359,11 @@ def run_target(
         "aggregator": target.get("aggregator"),
         "index_backend": target.get("index_backend"),
         "aoi_mask": bool(target.get("aoi_mask")),
+        "sidecar_cache": (
+            _sidecar_cache_state(config.data_source.get("index", {}).get("store"), sm)
+            if target.get("index_backend") == "sidecar" and not dry_run
+            else None
+        ),
         "parent_order": int(grid.parent_order),
         "child_order": int(grid.child_order),
         "mortie_moc_order": sm.metadata.get("mortie_order"),

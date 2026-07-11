@@ -96,3 +96,21 @@ def test_stratified_spans_value_range_on_peaked_distribution():
     assert len(idx) == 5
     assert len(set(idx)) == 5  # no shard picked twice
     assert picked[0] == 20 and picked[-1] == 140  # both tails represented
+
+
+def test_sidecar_cache_probe_graceful():
+    """The cache-state probe never raises; it degrades to 'unknown' (issue #202)."""
+    from types import SimpleNamespace
+
+    # no store -> unknown
+    assert rfab._sidecar_cache_state(None, SimpleNamespace(granules=[])) == "unknown"
+    # store but no granules -> unknown
+    sm_empty = SimpleNamespace(granules=[[]])
+    assert rfab._sidecar_cache_state("s3://b/prefix", sm_empty) == "unknown"
+    # store + granule but S3 unreachable/no creds -> unknown or cold, never raises
+    sm = SimpleNamespace(granules=[[{"id": "ATL03_x_007_01.h5"}]])
+    assert rfab._sidecar_cache_state("s3://nonexistent-zagg-test-bucket-xyz/p", sm) in (
+        "cold",
+        "warm",
+        "unknown",
+    )
