@@ -10,9 +10,17 @@ from __future__ import annotations
 from zagg.readers.tdigest_tensor import (
     chunk_z_range,
     rasterize_cell,
+    read_cell,
     read_locations,
     read_raw_values,
     read_tensors,
 )
 
-__all__ = ["chunk_z_range", "rasterize_cell", "read_locations", "read_raw_values", "read_tensors"]
+__all__ = [
+    "chunk_z_range",
+    "rasterize_cell",
+    "read_cell",
+    "read_locations",
+    "read_raw_values",
+    "read_tensors",
+]

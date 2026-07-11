@@ -38,7 +38,10 @@ ShardKey = Any  # int for HEALPix, tuple[int,int] for rectilinear, etc.
 #: each populated cell's value is the raw little-endian bytes of an
 #: ``(n, *inner_shape)`` array (``-1`` marks the per-cell varying count), so a
 #: reader reconstructs cell ``i`` as
-#: ``np.frombuffer(a[i], dtype).reshape(-1, *inner_shape)``.
+#: ``np.frombuffer(a[i], dtype).reshape(-1, *inner_shape)``. A LOCATED field's
+#: payload array additionally carries ``{"locations": "<sibling array name>"}``
+#: (issue #87) — the reader binds the uint64 channel by that declaration, not
+#: by reconstructing the naming convention (review, PR #211).
 RAGGED_ELEMENT_ATTR = "ragged"
 
 #: zstd level of the ragged inner codec chain — 3, matching the coverage
@@ -88,6 +91,7 @@ def ragged_array_spec(
     shard_shape=None,
     element_dtype,
     inner_shape=(),
+    locations=None,
 ):
     """Vlen-bytes ``ArraySpec`` for a ``kind: ragged`` field (issue #209).
 
@@ -128,6 +132,11 @@ def ragged_array_spec(
     inner_shape : tuple of int, optional
         Per-element trailing shape (``sig["inner_shape"]``, e.g. ``(2,)`` for
         a centroid pair). Empty for a flat per-cell vector.
+    locations : str, optional
+        Name of the located field's uint64 sibling array (issue #87),
+        declared in the payload array's attrs so a reader binds the channel
+        by METADATA, not by reconstructing the naming convention (review,
+        PR #211). ``None`` (unlocated) records nothing.
 
     Returns
     -------
@@ -160,8 +169,11 @@ def ragged_array_spec(
         codecs = tuple(NamedConfig(**c) for c in inner_codecs)
         chunk_shape = tuple(int(c) for c in inner_chunk_shape)
     element = {"dtype": str(element_dtype), "shape": [-1, *(int(s) for s in inner_shape)]}
+    ragged_meta: dict = {"element": element}
+    if locations is not None:
+        ragged_meta["locations"] = str(locations)
     return ArraySpec(
-        attributes={RAGGED_ELEMENT_ATTR: {"element": element}},
+        attributes={RAGGED_ELEMENT_ATTR: ragged_meta},
         shape=tuple(int(s) for s in shape),
         dimension_names=tuple(dims),
         data_type="variable_length_bytes",
