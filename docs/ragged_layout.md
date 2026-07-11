@@ -107,6 +107,11 @@ write path (`grids.base.ragged_array_spec`, `shard_shape` argument):
 | **sharded** (`ShardingCodec`) | sharded flat path (`write_shard_to_zarr`) and every hive leaf (`write_ragged_leaf_to_zarr`) | ONE object per shard; the shard's K inner chunks live inside it with an internal index | 2 GETs (index suffix + one ranged inner chunk) |
 | **per-inner-chunk** (regular array) | UNSHARDED per-chunk write (`write_ragged_to_zarr`, the runner / Lambda streaming callback) | one object per inner chunk | 1 GET (the object) |
 
+The GET counts are for the data objects only and exclude the one-time array-open
+metadata read (amortized across all cells of a store). The sharded 2-GET count is
+pinned by `test_two_ranged_gets_on_sharded_store`; the unsharded 1-GET count is
+analytic (a regular array indexes the single chunk holding the cell).
+
 **Why the unsharded flat K>1 path keeps per-inner-chunk objects** (the review's
 Q1 resolution): the streaming write path writes each chunk independently as it is
 produced, then frees it — the [issue #91](https://github.com/englacial/zagg/issues/91)
