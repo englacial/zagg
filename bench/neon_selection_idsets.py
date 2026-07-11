@@ -42,6 +42,7 @@ def main():
     lo = np.datetime64(f"{START}T00:00:00").astype("datetime64[us]").astype("int64")
     hi = np.datetime64(f"{END}T23:59:59").astype("datetime64[us]").astype("int64")
     import pyarrow as pa
+
     s = full.column("start_datetime")
     e = full.column("end_datetime")
     tmask = pc.and_(
@@ -51,10 +52,14 @@ def main():
     tsub = full.filter(tmask)
     bb = tsub.column("bbox")
     bmask = pc.and_(
-        pc.and_(pc.less_equal(pc.struct_field(bb, "xmin"), aoi_bbox[2]),
-                pc.greater_equal(pc.struct_field(bb, "xmax"), aoi_bbox[0])),
-        pc.and_(pc.less_equal(pc.struct_field(bb, "ymin"), aoi_bbox[3]),
-                pc.greater_equal(pc.struct_field(bb, "ymax"), aoi_bbox[1])),
+        pc.and_(
+            pc.less_equal(pc.struct_field(bb, "xmin"), aoi_bbox[2]),
+            pc.greater_equal(pc.struct_field(bb, "xmax"), aoi_bbox[0]),
+        ),
+        pc.and_(
+            pc.less_equal(pc.struct_field(bb, "ymin"), aoi_bbox[3]),
+            pc.greater_equal(pc.struct_field(bb, "ymax"), aoi_bbox[1]),
+        ),
     )
     cand = tsub.filter(bmask)
     ids = cand.column("id").to_pylist()
@@ -76,7 +81,9 @@ def main():
 
     def describe(g):
         minx, miny, maxx, maxy = g.bounds
-        return f"area={g.area:8.3f} deg^2  lon[{minx:8.3f},{maxx:8.3f}] lat[{miny:7.3f},{maxy:7.3f}]"
+        return (
+            f"area={g.area:8.3f} deg^2  lon[{minx:8.3f},{maxx:8.3f}] lat[{miny:7.3f},{maxy:7.3f}]"
+        )
 
     print("\n-- sample of CMR-selected granule footprints (should be tight ground swaths) --")
     for gid in list(inter)[:6]:
@@ -93,8 +100,10 @@ def main():
             print(f"  {gid}")
 
     areas = np.array([geom_by_id[i].area for i in local_ids])
-    print(f"\nfootprint area deg^2 over the 158: median={np.median(areas):.3f} "
-          f"p90={np.percentile(areas,90):.3f} max={areas.max():.3f}")
+    print(
+        f"\nfootprint area deg^2 over the 158: median={np.median(areas):.3f} "
+        f"p90={np.percentile(areas, 90):.3f} max={areas.max():.3f}"
+    )
     print(f"CMR-selected areas: median={np.median([geom_by_id[i].area for i in inter]):.3f}")
     print(f"local-only areas  : median={np.median([geom_by_id[i].area for i in local_only]):.3f}")
 

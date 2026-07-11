@@ -117,8 +117,10 @@ def main():
     parts = load_polygon(AOI)
     aoi_bbox = polygon_to_bbox(parts)
     print(f"AOI bbox (lon_min,lat_min,lon_max,lat_max): {aoi_bbox}")
-    print(f"grid: healpix parent_order={grid.parent_order} child_order={grid.child_order} "
-          f"chunk_order={getattr(grid, 'chunk_order', None)}")
+    print(
+        f"grid: healpix parent_order={grid.parent_order} child_order={grid.child_order} "
+        f"chunk_order={getattr(grid, 'chunk_order', None)}"
+    )
 
     o9_cells = grid.coverage(parts)
     print(f"o9 coverage cells over AOI: {len(o9_cells)} -> {list(map(int, o9_cells))}")
@@ -134,9 +136,11 @@ def main():
         sub = bbox_prefilter(tsub, aoi_bbox, pad=pad)
         cat = Catalog(sub, {"collection": "ATL03_007", "bbox": list(aoi_bbox)})
         sm = ShardMap.build(cat, grid, region=parts, backend="mortie", footprint="swath")
-        print(f"(B) full-catalog ShardMap.build [bbox pre-filter pad={pad} -> "
-              f"{sub.num_rows} rows]: total unique granules = {total_granules(sm)}, "
-              f"densest shard = {max((len(g) for g in sm.granules), default=0)}")
+        print(
+            f"(B) full-catalog ShardMap.build [bbox pre-filter pad={pad} -> "
+            f"{sub.num_rows} rows]: total unique granules = {total_granules(sm)}, "
+            f"densest shard = {max((len(g) for g in sm.granules), default=0)}"
+        )
 
     # (D)/(E) membership over the full temporal-window catalog.
     n_bbox, n_poly = polygon_membership_counts(tsub, parts, aoi_bbox)
@@ -154,8 +158,10 @@ def main():
     print(f"\n(A) CMR bbox query granules: {len(cmr_cat)}")
 
     sm_c = ShardMap.build(cmr_cat, grid, region=parts, backend="mortie", footprint="swath")
-    print(f"(C) CMR-fetch THEN ShardMap.build: total unique granules = {total_granules(sm_c)}, "
-          f"densest shard = {max((len(g) for g in sm_c.granules), default=0)}")
+    print(
+        f"(C) CMR-fetch THEN ShardMap.build: total unique granules = {total_granules(sm_c)}, "
+        f"densest shard = {max((len(g) for g in sm_c.granules), default=0)}"
+    )
 
 
 if __name__ == "__main__":
