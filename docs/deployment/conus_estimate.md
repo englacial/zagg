@@ -3,10 +3,15 @@
 **This is an estimate, not a benchmark result.** We are *not* running CONUS. This
 document sizes what a full contiguous-US (lower-48) ATL03 aggregation *would*
 cost, from (a) the real CONUS order-9 shard map we can build offline and (b) a
-per-shard cost regression fit from measured full-AOI Lambda data. The shard map,
-its summary statistics, and the operational-cost column structure are landed
-here now; the fitted regression and the dollar total are left as explicit
-placeholders until the measured per-shard data exists (leg 1 / leg 4b).
+per-shard cost regression fit from measured Lambda data. The shard map, its
+summary statistics, and **the fitted cold/warm regressions and dollar totals**
+(from a real 25-shard CONUS cold/warm dispatch, §4b) are landed here.
+
+> **The totals are an upper bound on today's codebase.** They include the issue
+> #209 t-digest write bloat (write is ~⅓ of a CONUS shard) and the #65 swath
+> over-assignment. Both are labelled below; #209 in particular revises the number
+> down materially once fixed. Recorded matrix *series* numbers are refreshed only
+> after the #209 follow-on lands (see the PR checklist).
 
 Everything here is reproducible offline from the committed artifacts (no AWS, no
 network beyond the one-time polygon fetch):
@@ -125,31 +130,75 @@ per-shard granule counts and summed.
 
 | Cost column | What it counts | Cold (first run) | Warm (repeat) |
 | --- | --- | --- | --- |
-| **Lambda GB-s** (primary) | `Σ lambda_seconds × 4 GB × $0.0000133334/GB-s` over all shards, via the per-scenario regression | _pending regression_ | _pending regression_ |
-| **S3 PUT/GET** | GETs: granule byte-range reads + (warm) sidecar reads. PUTs: zarr leaf writes for every shard + (cold) sidecar-manifest writes — so **cold PUT volume is higher** | _pending_ | _pending_ |
-| **CMR / catalog build** | one-time STAC/geoparquet catalog build for the CONUS+temporal query (amortized across the run) | _pending_ | _pending_ |
-| **CloudWatch / logs** | per-invocation log ingestion + storage (~one log stream per shard) | _pending_ | _pending_ |
+| **Lambda GB-s** (primary) | `Σ lambda_seconds × 4 GB × $0.0000133334/GB-s`, via the per-scenario regression (§4b) | 86.2 M GB-s ≈ **$1,149** | 66.9 M GB-s ≈ **$892** |
+| **S3 PUT/GET** | PUTs dominated by the #209 t-digest write (~1,792 objects/shard × 49,285 ≈ **88 M PUTs ≈ $440** cold) + sidecar writes; GETs are granule byte-range reads (NSIDC bucket) | ~**$440** (mostly #209 bloat) | ~$0.3 (no sidecar/CSR re-write; #209 fix cuts cold to ~$0.25 too) |
+| **CMR / catalog build** | one-time STAC/geoparquet catalog build (offline/local for CONUS); the run reads the committed catalog | ~$0 (one-time, offline) | ~$0 |
+| **CloudWatch / logs** | per-invocation log ingestion + storage (~one stream per shard × 49,285) | ~$1–3 | ~$1–3 |
 
-### 4b. Regression — PENDING measured per-shard data (leg 1 / leg 4b)
+Compute (Lambda GB-s) is the dominant column; the notable operational cost is the
+**cold S3 PUT storm (~$440)**, which is almost entirely the #209 write bloat and
+collapses to ~$0.25 once the ragged t-digest writes one object/shard.
 
-> **Blocked on measured full-AOI per-shard data.** The cold and warm regressions
-> require per-shard `(granules → lambda-seconds, cost, RSS)` points across a real
-> density range. The 4-shard NEON full-AOI run (leg 1) spans too narrow a density
-> band to fit a curve; the CONUS 25-shard stratified cold/warm run (leg 4b) is the
-> intended training set — see `data/conus/select_regression_shards.py` for the
-> stratified plan and its a-priori cold cost guard. Until those points are
-> recorded, the two totals below stay unfilled.
+### 4b. Regression — measured (25-shard CONUS cold/warm dispatch)
 
-- **Cold total lambda-seconds / cost:** _pending cold regression._
-- **Warm total lambda-seconds / cost:** _pending warm regression._
-- **Provisional cold proxy (not a fit, upper bound):** applying the flat #148
-  uncached rate (1.7 s/granule + ~5 s/shard overhead) to the CONUS totals
-  (3,560,313 pairs, 49,285 shards) gives a cold **ceiling** of ≈ **6.30 M
-  lambda-seconds ≈ 25.2 M GB-s ≈ $336** (single cold pass, 4 GB workers,
-  $0.0000133334/GB-s). This is an order-of-magnitude anchor only — the flat rate
-  ignores per-shard fixed overhead amortization and warm caching. Replace with
-  the fitted cold/warm regressions when the measured per-shard data lands; the
-  warm total will be lower (cached reads).
+Fit from a **real 25-shard stratified CONUS run** on the production `process-shard`
+Lambda (4 GB, inline→sidecar), spanning the full 21–144 granule/shard density band,
+each shard run twice: cold (`on_miss: build`, populates sidecars) then warm (reads
+them). Sidecar writes were verified in S3 between passes. Raw per-shard points:
+`data/conus/results/conus_regression_results.json`.
+
+| pass | fit (granules → lambda-seconds) | R² |
+| --- | --- | ---: |
+| **cold** (first run, builds sidecars) | `3.14 × granules + 210 s/shard` | 0.75 |
+| **warm** (repeat, reads sidecars) | `2.38 × granules + 167 s/shard` | 0.74 |
+
+Applied across the CONUS shape (**49,285 shards, 3,560,313 granule-reads**):
+
+| scenario | lambda-seconds | GB-s | **cost** | wall @ 2,000 workers |
+| --- | ---: | ---: | ---: | ---: |
+| **First run** (cold) | 21.5 M | 86.2 M | **$1,149** | ~3 h 00 m |
+| **Repeat** (warm) | 16.7 M | 66.9 M | **$892** | ~2 h 19 m |
+
+The sidecar cache saves ~$260/run (22%) on every reprocess, for a one-time
+~$1,149 first pass. (2,000 concurrent is above the current 1,000 account limit —
+assumes a limit increase; at 1,000 the walls are ~6 h / ~4.6 h. Wall is idealized
+perfect-packing; the slowest single shard is ~12 min, so it is concurrency-bound.)
+
+**Where the cost is: ~half is per-shard fixed overhead.** The ~200 s/shard
+intercept × 49,285 shards is $552 (cold) / $440 (warm) — **48–49% of the total**,
+as costly as all the per-granule reading combined. So the dominant cost lever is
+**shard count**, not read speed or the cache. (This is why the earlier flat-rate
+proxy — 1.7 s/granule + ~5 s/shard — anchored at ~$336: it under-modelled the
+per-shard overhead ~40×. The measured intercept is ~200 s, not ~5 s.)
+
+### 4c. Upper-bound caveats and the levers that revise it down
+
+The totals are honest for **today's** codebase but are an upper bound on three axes:
+
+1. **#209 t-digest write bloat (the big one).** Write is ~⅓ of a CONUS shard and
+   ~$440 of cold S3 PUTs, because the ragged t-digest writes ~1,792 objects/shard.
+   Fixing #209 (one sharded vlen array/shard) cuts the write phase and the PUT
+   storm directly — the single largest revision.
+2. **Coarser sharding is blocked on #209, not memory.** A NEON o8/o9/o10 order
+   sweep (`data/conus/results/order_sweep_*.json`) found o9 ~15% cheaper/shard
+   than o10 (fewer shards amortize the intercept), but **o8 times out at 900 s** —
+   an o8 shard has 4× the cells → 4× the #209 write bloat. Memory is not the
+   limit (o9/o10 peaked ~560–680 MB). So the ~half-the-cost fixed-overhead lever
+   (fewer, coarser shards) is real but gated on #209; **#209 first, then re-test o8.**
+3. **#65 swath over-assignment.** Granule→shard assignment uses the coarse CMR
+   swath polygon, so reads are an upper bound on granules that truly contribute
+   photons. Note this is *only* the swath-vs-beams envelope: CONUS is ~98.6%
+   fully-covered **interior** shards, where every assigned granule genuinely
+   crosses the shard and is correctly read — the AOI-edge over-assignment that
+   inflates a tiny box AOI does **not** apply at continental scale.
+
+**No AOI mask.** CONUS is a bulk grid, not a strict-AOI product; the vast majority
+of shards are fully covered, so `output.aoi_mask` is off and the estimate carries
+no mask compute/write.
+
+The R² ≈ 0.74 scatter reflects that granules-per-shard is a noisy cost predictor —
+observation density swings ~10× across shards (surface brightness + crossing
+geometry), so treat the totals as an **order-of-magnitude envelope**, not a quote.
 
 ## 5. Reproducibility
 
