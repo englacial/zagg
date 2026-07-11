@@ -59,13 +59,13 @@ from zagg.processing.read import (
 from zagg.processing.worker import process_morton_cell, process_shard
 from zagg.processing.write import (
     _arrow_column,
-    _block_index_key,
     _build_output,
     _carrier_empty,
     _chunk_resolution_fields,
     _chunk_uniform_value,
     _iter_carrier_columns,
     write_dataframe_to_zarr,
+    write_ragged_leaf_to_zarr,
     write_ragged_to_zarr,
     write_shard_to_zarr,
 )
@@ -82,6 +82,7 @@ __all__ = [
     "process_morton_cell",
     "process_shard",
     "write_dataframe_to_zarr",
+    "write_ragged_leaf_to_zarr",
     "write_ragged_to_zarr",
     "write_shard_to_zarr",
     # aggregate-stage helpers
@@ -113,7 +114,6 @@ __all__ = [
     "_validate_planned_config",
     # write-stage helpers
     "_arrow_column",
-    "_block_index_key",
     "_build_output",
     "_carrier_empty",
     "_chunk_resolution_fields",

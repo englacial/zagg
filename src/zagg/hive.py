@@ -685,21 +685,25 @@ def process_and_write_hive(
 
     The SHARED per-shard write path for both backends (phase 3): the local
     runner's ``_cell_work`` and the Lambda handler's hive branch both call
-    this, so leaf templating, chunk placement, CSR naming, and stamp ordering
-    cannot drift between dispatchers. The shard's output is a self-describing
-    leaf zarr at :func:`shard_leaf_path` ``(store_root, shard_key)`` (D3), with
-    dense chunks written at leaf-LOCAL block indices and — as the shard's
-    FINAL write — the D4 commit stamp on the leaf's root group. The leaf
-    template is emitted lazily on the first chunk write (mirroring the Lambda
-    handler's lazy store open), so a no-data shard never creates the
-    ``.zarr/`` prefix; a worker that dies mid-shard leaves an UNSTAMPED prefix
-    — debris, overwritten wholesale on retry (``overwrite=True`` on the leaf
-    template makes the retry idempotent). ``profile`` forwards to
-    ``process_shard`` (issue #100); the write phase is interleaved with the
-    stream on this path, so no separate ``write`` timing is recorded.
+    this, so leaf templating, chunk placement, ragged layout, and stamp
+    ordering cannot drift between dispatchers. The shard's output is a
+    self-describing leaf zarr at :func:`shard_leaf_path` ``(store_root,
+    shard_key)`` (D3), with dense chunks written at leaf-LOCAL block indices
+    and — as the shard's FINAL write — the D4 commit stamp on the leaf's root
+    group. The leaf template is emitted lazily on the first chunk write
+    (mirroring the Lambda handler's lazy store open), so a no-data shard never
+    creates the ``.zarr/`` prefix; a worker that dies mid-shard leaves an
+    UNSTAMPED prefix — debris, overwritten wholesale on retry
+    (``overwrite=True`` on the leaf template makes the retry idempotent).
+    ``profile`` forwards to ``process_shard`` (issue #100); the write phase is
+    interleaved with the stream on this path, so no separate ``write`` timing
+    is recorded.
     """
-    from zagg.grids.base import shard_label
-    from zagg.processing import process_shard, write_dataframe_to_zarr, write_ragged_to_zarr
+    from zagg.processing import (
+        process_shard,
+        write_dataframe_to_zarr,
+        write_ragged_leaf_to_zarr,
+    )
     from zagg.store import open_store
 
     leaf_path = shard_leaf_path(store_root, shard_key)
@@ -721,17 +725,21 @@ def process_and_write_hive(
             box["store"] = store
         return box["store"]
 
-    single_chunk = int(getattr(grid, "chunks_per_shard", 1)) == 1
+    # Ragged fields accumulate across the streamed chunks (leaf-LOCAL blocks)
+    # and are written ONCE after the stream (issue #209): the leaf's ragged
+    # vlen array is a single ShardingCodec object spanning the shard, so a
+    # per-chunk write here would read-modify-write that object K times. Only
+    # the ragged payloads (digest bytes) are held — small next to the dense
+    # slabs the sharded flat path already buffers — so the issue #91
+    # stream-and-free bound on the dense side is unchanged.
+    ragged_chunks: list = []
 
     def _write_chunk(block_index, carrier, ragged):
         store = _leaf()
         local = leaf_block_index(grid, block_index, shard_key)
         write_dataframe_to_zarr(carrier, store, grid=grid, chunk_idx=local)
-        # CSR subgroup naming inside a leaf mirrors the flat layout: the shard
-        # label at K==1; the LOCAL chunk ordinal at K>1 (leaf arrays are
-        # 1-D — hive is HEALPix-only, validated at config load).
-        ragged_key = shard_label(grid, shard_key) if single_chunk else int(local[0])
-        write_ragged_to_zarr(ragged, store, grid=grid, shard_key=ragged_key)
+        if ragged:
+            ragged_chunks.append((local, ragged))
 
     # Occupied-cell sink (issue #200): the worker already holds the shard's
     # populated cell words; collect them here to derive the stamp's coverage.
@@ -755,7 +763,10 @@ def process_and_write_hive(
     # box payload rides it (zero extra requests), the exact-occupancy bitmap
     # sidecar is PUT just before it (issue #200 phase 2), and both inherit
     # its debris semantics: a torn worker's coverage never becomes visible.
+    # The leaf write order is pinned: dense (streamed) -> ragged (one object,
+    # issue #209) -> coverage sidecar -> stamp.
     if "store" in box and not metadata.get("error"):
+        write_ragged_leaf_to_zarr(ragged_chunks, box["store"], grid=grid)
         words = np.concatenate(occupied) if occupied else None
         if words is not None and words.size == 0:
             words = None

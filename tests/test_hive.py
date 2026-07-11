@@ -18,7 +18,7 @@ from zarr.storage import MemoryStore
 from zagg import hive
 from zagg.config import default_config, get_data_vars, validate_config
 from zagg.grids import HealpixGrid
-from zagg.grids.morton import morton_decimal, morton_word
+from zagg.grids.morton import morton_decimal
 
 
 @pytest.fixture
@@ -289,19 +289,37 @@ def _rec(n):
 
 class TestProcessAndWriteHive:
     """Drive ``hive.process_and_write_hive`` with a fake ``process_shard`` that
-    streams REAL carriers, so the leaf template, dense write, CSR naming, and
-    stamp ordering are all exercised against real zarr stores."""
+    streams REAL carriers, so the leaf template, dense write, ragged vlen
+    layout (issue #209), and stamp ordering are all exercised against real
+    zarr stores."""
 
     def _grid(self, cfg):
+        # Declare the ragged field the streaming fakes emit, so the leaf
+        # template carries its vlen-bytes array (issue #209).
+        cfg.aggregation["variables"].setdefault(
+            "h",
+            {
+                "function": "np.sort",
+                "source": "h_li",
+                "kind": "ragged",
+                "inner_shape": [1],
+                "dtype": "float32",
+                "fill_value": 0,
+            },
+        )
         return HealpixGrid(parent_order=6, child_order=8, layout="fullsphere", config=cfg)
 
     def _carrier(self, grid, shard):
+        from zagg.config import get_agg_fields, get_output_signature
+
         coords = grid.chunk_coords(shard)
         n = len(coords["cell_ids"])
+        agg = get_agg_fields(grid.config)
         df = pd.DataFrame(
             {
                 var: np.zeros(n, dtype=np.int32 if var == "count" else np.float32)
                 for var in get_data_vars(grid.config)
+                if get_output_signature(agg[var])["kind"] != "ragged"
             }
         )
         for name, vals in coords.items():
@@ -356,11 +374,12 @@ class TestProcessAndWriteHive:
             np.asarray(grp["cell_ids"][:]),
             np.asarray(grid.chunk_coords(shard)["cell_ids"]),
         )
-        # CSR subgroup named by the shard label (decimal morton string).
-        label = morton_decimal(shard)
-        assert morton_word(label) == shard
-        sub = zarr.open_group(leaf_store, path=f"{grid.group_path}/h/{label}", mode="r")
-        assert "values" in sub.array_keys()
+        # The ragged payload sits in the leaf's vlen-bytes array at its cell
+        # position (issue #209), as ONE data object.
+        ragged_arr = zarr.open_group(leaf_store, path=grid.group_path, mode="r")["h"]
+        np.testing.assert_array_equal(np.frombuffer(ragged_arr[0:1][0], "<f4"), [1.0, 2.0])
+        chunk_dir = os.path.join(leaf, grid.group_path, "h", "c")
+        assert sum(len(files) for _d, _s, files in os.walk(chunk_dir)) == 1
         # The commit stamp is present and carries the worker's counters (D4).
         stamp = hive.read_commit(leaf_store)
         assert stamp["complete"] is True
@@ -380,12 +399,14 @@ class TestProcessAndWriteHive:
     def test_torn_write_leaves_debris_then_retry_succeeds(self, monkeypatch, cfg, tmp_path):
         # Torn-write simulation: the worker dies after the dense write, before
         # the stamp. The prefix exists (debris), read_commit says incomplete,
-        # and a clean retry overwrites it WHOLESALE and stamps. The torn
-        # attempt also writes a CSR subgroup the retry does NOT rewrite, so
-        # the wholesale claim is pinned against upstream drift: if the leaf
-        # re-template merely re-put metadata instead of delete_dir-ing the
-        # prefix, the stale subgroup would survive inside a leaf whose stamp
-        # certifies it complete (review finding, PR #205).
+        # and a clean retry overwrites it WHOLESALE and stamps. A stray object
+        # planted in the debris (one the retry does NOT rewrite) pins the
+        # wholesale claim against upstream drift: if the leaf re-template
+        # merely re-put metadata instead of delete_dir-ing the prefix, it
+        # would survive inside a leaf whose stamp certifies it complete
+        # (review finding, PR #205). The torn attempt's streamed ragged never
+        # lands at all — the leaf ragged write is a single post-stream object
+        # (issue #209), so a torn worker leaves no partial ragged data.
         import zagg.processing as processing
         from zagg.store import open_store
 
@@ -410,9 +431,12 @@ class TestProcessAndWriteHive:
         # No stamp -> no coverage visible either (issue #200): the tier-0
         # payload rides the stamp, so a torn worker never publishes coverage.
         assert hive.read_coverage(open_store(leaf)) is None
-        stale = os.path.join(leaf, grid.group_path, "h", morton_decimal(shard))
-        assert os.path.exists(stale)  # the torn attempt's CSR subgroup
-        # Plant a sidecar in the debris: the one leaf object zarr does NOT
+        # The torn attempt's ragged was accumulated, never written (issue #209).
+        assert not os.path.exists(os.path.join(leaf, grid.group_path, "h", "c"))
+        stale = os.path.join(leaf, grid.group_path, "stale-debris")
+        with open(stale, "w") as fh:
+            fh.write("torn attempt")
+        # Plant a sidecar in the debris too: the one leaf object zarr does NOT
         # own must also fall to the wholesale wipe (PR #208 round 2) — this
         # goes red if the re-template ever drifts to node-by-node rewrites.
         hive.write_coverage_sidecar(leaf, b"torn-attempt sidecar")
@@ -420,7 +444,7 @@ class TestProcessAndWriteHive:
         assert os.path.exists(sidecar)
 
         # Retry (no ragged this time): same leaf, overwritten wholesale —
-        # the stale subgroup is GONE — and stamped at the end.
+        # the planted debris is GONE — and stamped at the end.
         monkeypatch.setattr(processing, "process_shard", self._streaming_fake(grid))
         hive.process_and_write_hive(
             shard, ["s3://bucket/g1.h5"], grid, {}, root, cfg, store_kwargs={}
@@ -500,7 +524,9 @@ class TestProcessAndWriteHive:
             processing, "write_dataframe_to_zarr", rec("dense", processing.write_dataframe_to_zarr)
         )
         monkeypatch.setattr(
-            processing, "write_ragged_to_zarr", rec("ragged", processing.write_ragged_to_zarr)
+            processing,
+            "write_ragged_leaf_to_zarr",
+            rec("ragged", processing.write_ragged_leaf_to_zarr),
         )
         monkeypatch.setattr(
             hive, "write_coverage_sidecar", rec("sidecar", hive.write_coverage_sidecar)

@@ -134,13 +134,11 @@ from zarr.errors import GroupNotFoundError
 
 # Import cloud-agnostic processing
 from zagg.config import get_handoff, get_store_layout, load_config_from_dict
-from zagg.grids.base import shard_label
 from zagg.processing import (
     write_dataframe_to_zarr,
     write_ragged_to_zarr,
     write_shard_to_zarr,
 )
-from zagg.processing.write import _block_index_key
 from zagg.store import open_store
 
 # Set up structured logging
@@ -935,11 +933,6 @@ def _handle_process(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
         sharded = getattr(grid, "sharded", False)
         store_path = event["store_path"]
         shard_key = event["shard_key"]
-        # K==1 vs K>1 is fixed by the grid, not the chunk count (issue #91), so the
-        # streaming callback can pick the ragged key without a materialized list: at
-        # K==1 the chunk IS the shard (keyed by ``shard_key``); at K>1 each finer
-        # chunk is keyed by its own block index.
-        single_chunk = int(getattr(grid, "chunks_per_shard", 1)) == 1
 
         store_box: dict = {}
         write_error: dict = {}
@@ -1017,15 +1010,9 @@ def _handle_process(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
                     # write_dataframe_to_zarr no-ops on an empty carrier, so no per-chunk
                     # emptiness check is needed. Use each chunk's own block_index.
                     write_dataframe_to_zarr(carrier, store, grid=grid, chunk_idx=block_index)
-                    # At K==1 the CSR subgroup is named by the grid's shard label (the
-                    # decimal morton string for HEALPix — issue #199); K>1 keeps the
-                    # flattened block-index int. Mirrors runner._process_and_write.
-                    ragged_key = (
-                        shard_label(grid, shard_key)
-                        if single_chunk
-                        else _block_index_key(block_index, grid)
-                    )
-                    write_ragged_to_zarr(ragged, store, grid=grid, shard_key=ragged_key)
+                    # Ragged fields land in their vlen-bytes arrays at the same
+                    # block (issue #209). Mirrors runner._process_and_write.
+                    write_ragged_to_zarr(ragged, store, grid=grid, chunk_idx=block_index)
                 except Exception as e:
                     # Mirror the buffered path's ``except``: record the failure, stop
                     # writing, and let the run surface a 500 after process_shard returns.
