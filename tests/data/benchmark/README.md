@@ -25,16 +25,31 @@ aggregator).
 
 ## Conventions
 
-- **Live matrix (issue #193):** tdigest, sharded output, `granule_workers=4`, at
-  **4 GB** workers — the read-backend A/B (`inline` vs `sidecar`) over **o9 + o10**.
-  Four targets: `tdigest_healpix_{o9,o10}_{inline,sidecar}`. The retired
-  sharded/inner codec + `cached` axes are frozen (retained, not rerun).
+- **Live matrix (issue #202 reset):** tdigest, sharded output, `granule_workers=4`,
+  at **4 GB** workers, **o9 only** — a **2×2** over the read-backend A/B
+  (`inline` vs `sidecar`) **×** the strict-AOI-mask A/B (`mask` vs `nomask`). Four
+  targets: `tdigest_healpix_o9_{inline,sidecar}_{mask,nomask}`. The `mask` arm
+  dispatches the `aoi_mask`-carrying shard map (`healpix_o9_aoimask`); the `nomask`
+  arm the plain one — the mask is **manifest-driven** (`runner._aoi_payload_map`
+  reads it from the shard map, not the config), so the two arms differ only by
+  which map they dispatch. **o10 is retired** from the live set (moved to
+  `provisional_targets`, retained not rerun); the earlier sharded/inner codec +
+  `cached` axes stay frozen too.
+- **Per-merge vs per-release (issue #202).** This single-shard live matrix is the
+  **per-merge-to-`main`** series — one densest shard/target, so cost/runtime deltas
+  track *code*, not data drift. The complementary **per-release full-AOI NEON**
+  series (the whole `AOP_NEON` box fanned over every shard, for dollar-cost truth)
+  is recorded per release, not every merge; its harness + pinned targets
+  (`targets_full_aoi_neon.json`) are a separate deliverable (issue #202 leg 1) and
+  its plot is a skeleton until that schema lands (see `benchmark.md`).
 - **One shard per target** — the *densest* cell over the AOI, so cost/runtime
   deltas track code, not data drift.
 - **Densest = most granules; ties broken by lowest `shard_key`** — the
   deterministic rule in `bench_metrics.select_densest_shard`.
-- **Temporal pin:** `2018-10-13 .. 2025-06-01` (full multi-year slice), recorded
-  in `targets.json` under `temporal`. AOI = `AOP_NEON.geojson`.
+- **Temporal pin:** `2018-10-13 .. 2026-03-15` (full-mission slice — the last CMR
+  granule is `2026-03-11`; issue #202 re-pin), recorded in `targets.json` under
+  `temporal`. AOI = `AOP_NEON.geojson`. The 88°S stress pins (issue #148) keep
+  their **own** temporal window and are not re-pinned.
 - **Cost model:** arm64, 2 GB, capped at the 900 s deploy timeout (see
   `zagg.dispatch`).
 - **AOI is per shard map (issue #121).** The top-level `aoi`/`temporal`/`cmr` in
@@ -49,19 +64,40 @@ aggregator).
 `plot_series.py` renders the **live matrix** on top, and embeds the retained
 **archived** figures (frozen as of issue #193) below.
 
-### Live matrix — inline vs sidecar, fixed 2×2 (`*_matrix.png` + `matrix_table.png`)
+### Live matrix — inline/sidecar × AOI-mask, fixed 2×2 (`*_matrix.png` + `matrix_table.png`)
 
-The live matrix (issue #193) is **tdigest, sharded, `granule_workers=4`, at 4 GB**
-— the read-backend A/B. The charts (`cost_per_shard_matrix.png`,
-`cost_per_100km2_matrix.png`) lay the rows out in a **fixed** grid keyed to the
-experiment, split on the `index_backend` column:
+The live matrix (issue #202 reset) is **tdigest, sharded, `granule_workers=4`, at
+4 GB, o9 only**. The charts (`cost_per_shard_matrix.png`,
+`cost_per_100km2_matrix.png`) lay the rows out in a **fixed** 2×2 grid keyed to the
+experiment:
 
-- **Columns = the read backend.** Left = `inline`, right = `sidecar`.
-- **Rows = order, largest-first.** `o9` (top) → `o10` (bottom). A row whose order
-  hasn't landed renders blank, so the shape stays stable.
+- **Columns = the read backend.** Left = `inline`, right = `sidecar`
+  (`index_backend`).
+- **Rows = the strict-AOI-mask arm.** Top = `nomask`, bottom = `mask`. There is no
+  record column for the mask A/B (`bench_metrics`/`run_benchmark` are stable
+  plumbing), so the renderer reads the arm off the **target-name suffix**
+  (`plot_series._aoi_axis`: `…_mask` vs `…_nomask`). An arm that hasn't landed
+  renders blank, so the shape stays stable.
 
 `matrix_table.png` is the latest-merge table for these rows; `latest.md` /
 `metrics.json` track this matrix.
+
+**Series reset.** The matrix selector (`plot_series._matrix_mask`) admits only rows
+matching the reset scheme — `grid_size == "o9"`, a set `index_backend`, and a
+`…_mask`/`…_nomask` target suffix. The pre-reset live datapoints (issue #193's
+`o9`/`o10` inline-vs-sidecar rows, whose names carry no mask suffix) fall outside
+that scheme and drop out, so the corrected 2×2 begins **from zero** at the first
+post-reset merge without pruning the benchmarks-branch `series.parquet` (a physical
+prune, if wanted, is an operator action — agent pushes are scoped to `claude/*`).
+
+### Per-release full-AOI NEON (`full_aoi_*.png` — skeleton, issue #202 leg 1)
+
+The whole-`AOP_NEON`-box run fanned over **every** shard, recorded **per release**
+for dollar-cost truth (complementing the per-merge single-shard matrix above). Its
+harness + pinned targets (`targets_full_aoi_neon.json`) are a separate deliverable;
+`plot_series.make_full_aoi_release_figure` is a skeleton (returns `False`, renders
+nothing) until that output schema lands, so the Pages index simply omits the
+section for now. See `docs/deployment/benchmark.md`.
 
 ### Archived: forward codec matrix (frozen, `*_codec.png` + `codec_table.png`)
 
@@ -120,11 +156,19 @@ places the panel.
    python -m zagg.catalog \
      --config tests/data/benchmark/configs/<your_config>.yaml \
      --short-name ATL03 --version 007 \
-     --start-date 2018-10-13 --end-date 2025-06-01 \
+     --start-date 2018-10-13 --end-date 2026-03-15 \
      --polygon tests/data/benchmark/AOP_NEON.geojson \
      --backend <mortie|spherely> \
      --output tests/data/benchmark/shardmaps/sm_<grid>.json
    ```
+
+   > **Reproducing / re-pinning the NEON maps.** Build from **CMR** (as the CLI
+   > above and the drift test do), *not* from a local full-catalog geoparquet: an
+   > ATL03 STAC granule footprint is a coarse bounding quad that blankets the whole
+   > tiny NEON box, so intersecting those quads over the full catalog over-includes
+   > (a superset of CMR's finer orbit-geometry bbox search) and inflates the pins.
+   > The #148 lat-ring maps *can* rebuild offline from the catalog only because
+   > complete-ring lat-overlap is exact; a box AOI has no such equivalence.
 
    Then find the densest shard to pin:
 

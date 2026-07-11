@@ -15,9 +15,20 @@ This needs the network (CMR) and, for the rectilinear maps, the exact-S2
 ``spherely`` backend, so it is decoupled from the unit suite: it runs only when
 ``ZAGG_BENCHMARK_DRIFT=1`` is set (the `benchmark-drift` workflow does this on a
 native x86_64 runner where the spherely wheel installs). The check is
-**tie-tolerant** -- several shards tie for densest in this AOI, and the lowest-key
-tiebreak is deterministic but fragile to a +/-0 count nudge, so we compare the
-densest *granule count* (within +/-1), not the exact shard key.
+**tie-tolerant** -- several shards tie (or near-tie) for densest in this AOI, and
+the lowest-key tiebreak is deterministic but fragile to a +/-0 count nudge, so we
+compare the densest *granule count* (within +/-1), not the exact shard key.
+
+The NEON maps are pinned over the full-mission window ``2018-10-13 ..
+2026-03-15`` (issue #202 re-pin). That window makes the tie tolerance load-bearing
+for o11: its densest shard sits at 50 granules with a *close cluster of three
+shards at 49*, so a one-granule CMR nudge can reselect the densest key while the
+count stays put -- which the +/-1 count comparison (not a key comparison) absorbs
+without a false drift alarm. The AOI-mask variant (``healpix_o9_aoimask``,
+issue #202) rebuilds identically to ``healpix_o9`` here: the strict-AOI mask adds a
+per-cell column, it does not move granules, so the densest pin is the same and the
+same count check guards it. The 88S stress pins keep their own temporal window
+(issue #148) -- the re-pin does not touch them.
 """
 
 import json

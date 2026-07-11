@@ -1,0 +1,107 @@
+# ATL03 photon-height t-digest template (HEALPix) -- AOI-mask ON variant.
+#
+# Identical to atl03_tdigest_healpix_o9.yaml except ``output.aoi_mask: true``: the
+# AOI-mask-on arm of the live reset matrix (issue #202). ``output.aoi_mask``
+# (issue #101) makes ShardMap.build precompute a per-shard strict-AOI cell mask
+# (the AOP_NEON box, resolved from the coverage region) into the shard map, which
+# the worker expands to a per-cell ``aoi_mask`` column. The mask is manifest-
+# driven, so the *_mask targets dispatch the mask-carrying shard map
+# (sm_healpix_o9_aoimask.json) while the *_nomask targets dispatch the plain one.
+#
+# Per-cell approximate-quantile sketch: each grid cell stores a t-digest of its
+# photon heights (h_ph) as a ``kind: ragged`` CSR field. A t-digest is a small,
+# mergeable set of (mean, weight) centroids from which any quantile (median,
+# p5/p95, IQR, ...) is recovered at read time -- far cheaper than storing every
+# photon, and exact-enough in the tails. The reducer is the pure-numpy
+# ``zagg.stats.tdigest.build_tdigest`` (issue #48), resolved as the field's
+# ``function`` via ``zagg.config.resolve_function`` (dotted path). ``delta`` is
+# the centroid budget (accuracy knob): ~delta centroids per cell regardless of
+# photon count. Read the digests back with ``zagg.readers.tdigest_tensor``.
+#
+# Grid is HEALPix nested at child_order 19 (the ~10 m cell, now that mortie 0.8.1
+# resolves past the old order-18 reference cap). Multi-chunk-per-worker (issue
+# #30 item 3) is on: one shard (the dispatch unit, parent_order 9 = 1024x1024
+# cells) owns K = 256 finer Zarr chunks (chunk_inner 13 = 64x64 cells each). The
+# worker reads the shard's granules once and writes 256 chunk regions + 256 CSR
+# groups, one per inner chunk. chunk_inner unset would collapse to K=1 (shard ==
+# chunk), byte-identical to the single-chunk path. o9 is the heaviest of the
+# benchmark orders and the most interesting for the ShardingCodec (issue #108):
+# its 256 inner chunks bundle into one shard object.
+#
+# Confidence filter, multi-level form and read_plan match atl03.yaml (the planned
+# segment->photon IO of issue #43 applies here too); only the aggregation differs.
+data_source:
+  # issue #193: the sharded inline-vs-sidecar matrix. The read backend is set
+  # per target (index_backend: inline|sidecar) by run_benchmark; granule-level
+  # read concurrency is pinned to K=4 (issue #180 sizing sweet spot).
+  granule_workers: 4
+  reader: h5coro
+  driver: s3
+  groups: [gt1l, gt1r, gt2l, gt2r, gt3l, gt3r]
+  coordinates:
+    latitude: "/{group}/heights/lat_ph"
+    longitude: "/{group}/heights/lon_ph"
+  variables:
+    h_ph: "/{group}/heights/h_ph"
+  filters:
+    - dataset: "/{group}/heights/signal_conf_ph"
+      column: 0                  # land surface type; TEP is uniform across columns
+      op: ne
+      value: -2
+  base_level: photons
+  levels:
+    photons:
+      path: "/{group}/heights"
+      coordinates: {latitude: lat_ph, longitude: lon_ph}
+      link: null
+    segments:
+      path: "/{group}/geolocation"
+      coordinates: {latitude: reference_photon_lat, longitude: reference_photon_lon}
+      link:
+        to: photons
+        index_beg: "/{group}/geolocation/ph_index_beg"
+        count: "/{group}/geolocation/segment_ph_cnt"
+        index_base: 1            # ATL03 ph_index_beg is 1-based per the v3 dict
+  read_plan:
+    spatial_index: segments
+    pad: 1                       # one segment of padding on each side per #43
+
+aggregation:
+  coordinates:
+    cell_ids:
+      dtype: uint64
+      fill_value: 0
+    morton:
+      dtype: uint64
+      fill_value: 0
+  variables:
+    count:
+      function: len
+      source: h_ph
+      dtype: int32
+      fill_value: 0
+    h_tdigest:
+      # Per-cell t-digest of photon heights: a ragged (CSR) field whose payload
+      # is an (n_centroids, 2) array of (mean, weight) centroids. ``build_tdigest``
+      # is called as build_tdigest(h_ph_values, delta=256); ``inner_shape: [2]``
+      # declares the per-element centroid width. To store ONE digest per chunk
+      # instead of per cell, add ``resolution: chunk`` (one CSR payload per inner
+      # chunk under the chunk-uniform contract).
+      kind: ragged
+      function: "zagg.stats.tdigest.build_tdigest"
+      source: h_ph
+      inner_shape: [2]
+      params:
+        delta: 256
+      dtype: float32
+      fill_value: 0
+
+output:
+  grid:
+    type: healpix
+    indexing_scheme: nested
+    parent_order: 9              # shard / dispatch unit: 4^(19-9) = 1024x1024 cells
+    chunk_inner: 13              # inner Zarr chunk: 4^(19-13) = 64x64 cells (K=256 per shard)
+    sharded: true                # issue #193: sharded output fixed on for the matrix
+    child_order: 19              # leaf cell resolution (~10 m)
+  aoi_mask: true                 # issue #101/#202: strict-AOI per-cell mask ON (the mask arm)

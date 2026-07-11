@@ -296,7 +296,7 @@ def test_comment_markdown_worker_note_banner():
 def test_run_target_dry_run():
     manifest, base = run_benchmark.load_targets(str(BENCH / "targets.json"))
     rec = run_benchmark.run_target(
-        "tdigest_healpix_o9_sidecar",
+        "tdigest_healpix_o9_sidecar_nomask",
         manifest,
         base,
         store=None,
@@ -305,7 +305,7 @@ def test_run_target_dry_run():
         context={"commit": "deadbee", "event": "pr"},
         dry_run=True,
     )
-    assert rec["target"] == "tdigest_healpix_o9_sidecar"
+    assert rec["target"] == "tdigest_healpix_o9_sidecar_nomask"
     assert rec["aggregator"] == "tdigest"
     assert rec["grid_type"] == "healpix"
     assert rec["shard_key"] == 5347395636851376137  # o9 densest cell
@@ -700,7 +700,7 @@ def test_committed_target_inherits_handoff_from_config(monkeypatch):
 
     monkeypatch.setattr(runner, "agg", fake_agg)
     run_benchmark.run_target(
-        "tdigest_healpix_o9_sidecar",
+        "tdigest_healpix_o9_sidecar_nomask",
         manifest,
         base,
         store="s3://b/x.zarr",
@@ -906,13 +906,15 @@ def _write_json(tmp_path, obj):
 
 
 def _matrix_rows(commit, **kw):
-    """Live-matrix rows (issue #193): tdigest o9/o10 x inline/sidecar, carrying
-    index_backend so plot_series.main renders the matrix figures."""
+    """Live reset-matrix rows (issue #202): tdigest o9 x inline/sidecar x
+    mask/nomask, carrying index_backend and the ``_mask``/``_nomask`` target
+    suffix (the AOI-mask axis is read off the name -- there is no record column
+    for it) so plot_series.main renders the 2x2 reset figures."""
     rows = []
-    for order in ("o9", "o10"):
+    for aoi in ("nomask", "mask"):
         for backend in ("inline", "sidecar"):
-            r = _rec_row(commit, f"tdigest_healpix_{order}_{backend}", **kw)
-            r["grid_size"] = order
+            r = _rec_row(commit, f"tdigest_healpix_o9_{backend}_{aoi}", **kw)
+            r["grid_size"] = "o9"
             r["index_backend"] = backend
             rows.append(r)
     return rows
@@ -1475,40 +1477,69 @@ def test_codec_layout_blanks_missing_order():
     assert grid[1] == ["tdigest_healpix_o10_sharded", "tdigest_healpix_o10_inner", None]
 
 
-def test_matrix_layout_is_inline_sidecar_by_order():
-    # issue #193: the live matrix is a fixed (o9,o10) x (inline,sidecar) grid.
+def test_matrix_layout_is_inline_sidecar_by_aoi_mask():
+    # issue #202 reset: the live matrix is a fixed (nomask,mask) x (inline,sidecar)
+    # grid at o9. Rows = AOI-mask arm (off on top), cols = read backend.
     import plot_series
 
     rows = _matrix_rows("c0")
     grid, nrows, ncols = plot_series._matrix_layout(update_series.records_to_frame(rows))
-    assert (nrows, ncols) == (2, 2)  # rows o9/o10, cols inline/sidecar
+    assert (nrows, ncols) == (2, 2)  # rows nomask/mask, cols inline/sidecar
     assert grid == [
-        ["tdigest_healpix_o9_inline", "tdigest_healpix_o9_sidecar"],
-        ["tdigest_healpix_o10_inline", "tdigest_healpix_o10_sidecar"],
+        ["tdigest_healpix_o9_inline_nomask", "tdigest_healpix_o9_sidecar_nomask"],
+        ["tdigest_healpix_o9_inline_mask", "tdigest_healpix_o9_sidecar_mask"],
     ]
 
 
-def test_matrix_layout_blanks_missing_order():
-    # An order with no rows leaves its cells None (grid shape stays fixed 2x2).
+def test_matrix_layout_blanks_missing_arm():
+    # An AOI-mask arm with no rows leaves its cells None (grid stays fixed 2x2).
     import plot_series
 
-    rows = [r for r in _matrix_rows("c0") if r["grid_size"] == "o10"]
+    rows = [r for r in _matrix_rows("c0") if r["target"].endswith("_mask")]
     grid, nrows, ncols = plot_series._matrix_layout(update_series.records_to_frame(rows))
     assert (nrows, ncols) == (2, 2)
-    assert grid[0] == [None, None]  # o9 absent
-    assert grid[1] == ["tdigest_healpix_o10_inline", "tdigest_healpix_o10_sidecar"]
+    assert grid[0] == [None, None]  # nomask arm absent
+    assert grid[1] == ["tdigest_healpix_o9_inline_mask", "tdigest_healpix_o9_sidecar_mask"]
 
 
-def test_matrix_history_selects_index_backend_rows():
-    # Only index_backend rows are the live matrix; codec/frozen rows excluded.
+def test_matrix_history_selects_reset_rows():
+    # Only the reset rows (o9 + index_backend + _mask/_nomask suffix) are the live
+    # matrix; codec/frozen rows AND pre-reset o9/o10 rows (no aoi suffix) excluded.
     import plot_series
 
+    stale = _rec_row("c0", "tdigest_healpix_o10_inline")  # pre-reset live row
+    stale["grid_size"] = "o10"
+    stale["index_backend"] = "inline"
     df = update_series.records_to_frame(
-        _matrix_rows("c0") + _full_codec_matrix("c0") + [_rec_row("c0", "frozen_t")]
+        _matrix_rows("c0") + _full_codec_matrix("c0") + [stale, _rec_row("c0", "frozen_t")]
     )
     hist = plot_series._matrix_history(df)
     assert set(hist["index_backend"]) == {"inline", "sidecar"}
-    assert all(t.endswith(("_inline", "_sidecar")) for t in hist["target"])
+    assert all(t.endswith(("_mask", "_nomask")) for t in hist["target"])
+    assert "tdigest_healpix_o10_inline" not in set(hist["target"])  # stale row dropped
+
+
+def test_aoi_axis_reads_target_suffix():
+    # issue #202: the AOI-mask arm is derived from the target-name suffix (no
+    # record column). ``_nomask`` must NOT read as ``mask``.
+    import plot_series
+
+    assert plot_series._aoi_axis("tdigest_healpix_o9_inline_mask") == "mask"
+    assert plot_series._aoi_axis("tdigest_healpix_o9_sidecar_nomask") == "nomask"
+    assert plot_series._aoi_axis("tdigest_healpix_o9_inline") == "nomask"  # pre-reset name
+
+
+def test_full_aoi_release_figure_is_skeleton(tmp_path):
+    # issue #202 leg 1: the per-release full-AOI NEON figure is a render skeleton
+    # (its harness/schema are another agent's deliverable). It must no-op cleanly
+    # -- return False, write nothing -- so main() skips it and the index omits the
+    # section rather than embedding a broken image.
+    import plot_series
+
+    df = update_series.records_to_frame(_matrix_rows("c0"))
+    out = tmp_path / "full_aoi.png"
+    assert plot_series.make_full_aoi_release_figure(df, "cost_per_shard_usd", "cost", out) is False
+    assert not out.exists()
 
 
 def test_codec_and_frozen_histories_split_on_codec():
@@ -1608,9 +1639,9 @@ def test_plot_main_emits_matrix_and_archives_old(tmp_path):
     assert (outdir / "cost_per_shard_matrix.png").exists()
     assert not (outdir / "codec_table.png").stat().st_size > 100  # not regenerated
     html = (outdir / "index.html").read_text()
-    assert "inline vs sidecar" in html
-    assert "Archived (frozen as of issue #193)" in html
-    assert html.index("inline vs sidecar") < html.index("Archived")
+    assert "inline/sidecar × AOI-mask" in html
+    assert "Archived (frozen as of issues #193 / #202)" in html
+    assert html.index("inline/sidecar × AOI-mask") < html.index("Archived")
 
 
 def test_88s_nested_pin_invariant():
