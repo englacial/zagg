@@ -306,6 +306,16 @@ class TestGranuleRecordsAssets:
         assert rec["assets"]["nir"] == "https://cogs.example/s2a/B08.tif"
         assert rec["datetime"].startswith("2026-07-13T16:02:23")
 
+    def test_datetime_numeric_offset_round_trip(self, tmp_path):
+        # A numeric UTC offset (not "Z") must survive the parse -> geoparquet
+        # -> granule_records path as a UTC-aware ISO string.
+        item = _item("s2a", _s2_assets("s2a"), dt="2026-07-13T16:02:23+00:00")
+        cat = _catalog([item], {"source": "STAC"})
+        path = str(tmp_path / "cat.parquet")
+        cat.to_geoparquet(path)
+        rec = Catalog.from_geoparquet(path).granule_records()[0]
+        assert rec["datetime"] == "2026-07-13T16:02:23+00:00"
+
 
 class TestGranuleEntry:
     def test_h5_entry_shape_unchanged(self):
