@@ -251,6 +251,19 @@ class TestCollectionOptions:
         with pytest.raises(ValueError, match="time_offset"):
             validate_config(self._cfg({"merra2": {"time_offset": -30}}))
 
+    def test_time_offset_must_parse(self):
+        # A well-typed but unparseable offset fails at load, not on the worker.
+        with pytest.raises(ValueError, match="time_offset is not a valid"):
+            validate_config(self._cfg({"merra2": {"time_offset": "gibberish"}}))
+
+    def test_resample_freq_must_be_string(self):
+        with pytest.raises(ValueError, match="resample.freq"):
+            validate_config(self._cfg({"merra2": {"resample": {"freq": 3}}}))
+
+    def test_resample_freq_must_parse(self):
+        with pytest.raises(ValueError, match="resample.freq is not a valid"):
+            validate_config(self._cfg({"merra2": {"resample": {"freq": "notafreq"}}}))
+
     def test_derived_must_map_names_to_expressions(self):
         with pytest.raises(ValueError, match="derived"):
             validate_config(self._cfg({"merra2": {"derived": {"rainfall": 3}}}))
