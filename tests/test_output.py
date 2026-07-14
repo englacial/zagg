@@ -130,6 +130,14 @@ class TestTabularWriterSerialise:
         with pytest.raises(ValueError, match="unknown tabular output format"):
             TabularWriter().write(_result_rows(), tmp_path / "x", output_format="xml")
 
+    def test_bad_format_leaves_no_dir(self, tmp_path):
+        # A bad format must be rejected before the parent tree is created, so a
+        # failed write does not leave a stray empty directory behind.
+        path = tmp_path / "missing" / "x"
+        with pytest.raises(ValueError, match="unknown tabular output format"):
+            TabularWriter().write(_result_rows(), path, output_format="xml")
+        assert not path.parent.exists()
+
 
 class TestTabularWriterToBytes:
     def test_parquet_bytes_round_trip(self):
