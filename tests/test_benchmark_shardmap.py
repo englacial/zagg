@@ -24,10 +24,11 @@ The NEON maps are pinned over the full-mission window ``2018-10-13 ..
 for o11: its densest shard sits at 50 granules with a *close cluster of three
 shards at 49*, so a one-granule CMR nudge can reselect the densest key while the
 count stays put -- which the +/-1 count comparison (not a key comparison) absorbs
-without a false drift alarm. The AOI-mask variant (``healpix_o9_aoimask``,
-issue #202) rebuilds identically to ``healpix_o9`` here: the strict-AOI mask adds a
-per-cell column, it does not move granules, so the densest pin is the same and the
-same count check guards it. The 88S stress pins keep their own temporal window
+without a false drift alarm. The live matrix's AOI-mask arm reuses ``healpix_o9``
+directly (issue #202): the strict-AOI mask adds a per-cell column that doesn't move
+granules, so it is built on the fly at dispatch
+(``run_benchmark._shardmap_with_mask``) rather than committed as a separate map --
+``healpix_o9``'s pin guards both arms. The 88S stress pins keep their own temporal window
 (issue #148) -- the re-pin does not touch them.
 """
 
