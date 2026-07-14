@@ -56,6 +56,11 @@ dependencies = [
     "pyproj>=3.7.0",
     "shapely",
     "odc-geo",
+    # GeoTIFF/COG decode engine for the raster reader (issue #218, espg-ratified
+    # on the issue): ~4 MB abi3 wheels on both layer arches, sole transitive dep
+    # is obspec (pairs with obstore). Rust decode: DEFLATE + 16-bit horizontal
+    # predictor verified bit-exact against GDAL on Sentinel-2 c1 COGs.
+    "async-tiff>=0.7.2",
 ]
 
 [project.optional-dependencies]
@@ -71,6 +76,9 @@ lambda = [
     "h5coro-hidefix==0.3.1",
     "cramjam",
     "astropy",
+    # Keep this pin in sync with deployment/aws/build_layer.sh (abi3
+    # manylinux_2_28 wheels cover both layer arches, ~4 MB each) — issue #218.
+    "async-tiff==0.7.2",
 ]
 # STAC fetch + shard-map build deps. Kept out of core so the Lambda layer build
 # (which doesn't run fetch/build) stays lean.

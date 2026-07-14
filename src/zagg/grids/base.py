@@ -365,6 +365,52 @@ def sharded_array_spec(base, *, shard_shape, inner_chunk_shape):
     )
 
 
+def sample_nearest(xs, ys, src_crs, crs, transform, shape):
+    """Nearest source-pixel indices for points, under a raster's affine (#218).
+
+    The pull-NN primitive shared by the grid ``sample`` implementations: map
+    point coordinates into the raster CRS, invert the affine, and take the
+    pixel whose footprint contains each point.
+
+    Parameters
+    ----------
+    xs, ys : array-like
+        Point coordinates in ``src_crs`` (x/lon first — ``always_xy``).
+    src_crs, crs : any pyproj CRS input
+        Source CRS of the points and CRS of the raster.
+    transform : sequence of float
+        The raster's affine in STAC ``proj:transform`` / rasterio order
+        ``(a, b, c, d, e, f)``: ``x = a*col + b*row + c``,
+        ``y = d*col + e*row + f`` with (col, row) at the pixel's upper-left
+        corner. A 9-element row-major 3x3 form is accepted (trailing row
+        ignored).
+    shape : (height, width)
+        Raster shape, for the bounds mask.
+
+    Returns
+    -------
+    (rows, cols, valid)
+        ``int64`` pixel indices per point and a bool mask, ``False`` where the
+        point falls outside the raster (indices are then meaningless).
+    """
+    from pyproj import CRS, Transformer
+
+    tx = Transformer.from_crs(
+        CRS.from_user_input(src_crs), CRS.from_user_input(crs), always_xy=True
+    )
+    x, y = tx.transform(np.asarray(xs, dtype=float), np.asarray(ys, dtype=float))
+    a, b, c, d, e, f = (float(t) for t in transform[:6])
+    det = a * e - b * d
+    if det == 0.0:
+        raise ValueError(f"degenerate raster transform (zero determinant): {transform!r}")
+    dx, dy = x - c, y - f
+    cols = np.floor((e * dx - b * dy) / det).astype(np.int64)
+    rows = np.floor((a * dy - d * dx) / det).astype(np.int64)
+    h, w = shape
+    valid = (rows >= 0) & (rows < h) & (cols >= 0) & (cols < w)
+    return rows, cols, valid
+
+
 class InconsistentShardError(ValueError):
     """Raised by shard_of when input cells don't all share a shard."""
 
@@ -397,6 +443,17 @@ class OutputGrid(Protocol):
 
     def cells_of(self, leaf_ids: np.ndarray) -> np.ndarray:
         """Coarsen leaf ids to aggregation cell ids."""
+        ...
+
+    def sample(self, cells, crs, transform, shape) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+        """Nearest source-pixel ``(rows, cols, valid)`` for cell centers.
+
+        The pull-NN raster->grid primitive (issue #218): the writer samples a
+        source raster at every cell center, guaranteeing a dense grid at any
+        cell order with no collision or fill logic. ``crs``/``transform``/
+        ``shape`` describe the source raster (see
+        :func:`zagg.grids.base.sample_nearest`).
+        """
         ...
 
     def shards_of(self, leaf_ids: np.ndarray) -> np.ndarray:
