@@ -390,30 +390,43 @@ def process_raster_shard(
             continue
         groups.setdefault(e.get("time_key") or e["datetime"], []).append(e)
 
-    lonlat = None  # computed once, only if some timestep has overlapping items
-    slabs: dict = {}
-    for key, items in groups.items():
+    for key in groups:
         if key not in time_index:
             raise ValueError(
                 f"acquisition group key {key!r} is absent from the passed "
                 "time_index; time_index must be built from the same manifest "
                 "the shards were dispatched from — see raster_time_index"
             )
-        t = time_index[key]
-        sampled = [
-            _run_sync(
-                sample_item_async(
-                    grid,
-                    cells,
-                    e["assets"],
-                    bands,
-                    nodata=nodata,
-                    region=region,
-                    anonymous=anonymous,
+
+    # One event loop per shard: fan out across every item of every timestep
+    # concurrently (S3 fetches overlap), instead of one asyncio.run per item.
+    async def _sample_all():
+        return await asyncio.gather(
+            *[
+                asyncio.gather(
+                    *[
+                        sample_item_async(
+                            grid,
+                            cells,
+                            e["assets"],
+                            bands,
+                            nodata=nodata,
+                            region=region,
+                            anonymous=anonymous,
+                        )
+                        for e in items
+                    ]
                 )
-            )
-            for e in items
-        ]
+                for items in groups.values()
+            ]
+        )
+
+    group_results = _run_sync(_sample_all())
+
+    lonlat = None  # computed once, only if some timestep has overlapping items
+    slabs: dict = {}
+    for (key, _items), sampled in zip(groups.items(), group_results):
+        t = time_index[key]
         if len(sampled) == 1:
             values, valid, _center = sampled[0]
         else:

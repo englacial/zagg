@@ -203,6 +203,39 @@ class TestOwnership:
         with pytest.raises(ValueError, match="dt-absent"):
             process_raster_shard(grid, 0, granules, cfg, {})
 
+    def test_two_timesteps_two_items_concurrent(self, tmp_path):
+        # 2 datatakes x 2 overlapping tiles sampled in one event loop: each
+        # timestep's ownership combine must match the sequential golden.
+        for name, const, ox in (
+            ("a0", 100, 0.0),
+            ("b0", 200, 480.0),
+            ("a1", 50, 0.0),
+            ("b1", 75, 480.0),
+        ):
+            _write_tiff(
+                tmp_path / f"{name}.tif",
+                np.full((96, 96), const, dtype=np.uint16),
+                origin=(ORIGIN[0] + ox, ORIGIN[1]),
+            )
+        bounds = [ORIGIN[0], ORIGIN[1] - 960.0, ORIGIN[0] + 1440.0, ORIGIN[1]]
+        grid = _rect_grid(bounds, [96, 144])
+        cfg = _raster_config(bands={"red": {"asset": "red", "dtype": "uint16"}})
+        granules = [
+            _entry("A0", {"red": str(tmp_path / "a0.tif")}, T0, time_key="dt-1"),
+            _entry("B0", {"red": str(tmp_path / "b0.tif")}, T0B, time_key="dt-1"),
+            _entry("A1", {"red": str(tmp_path / "a1.tif")}, T1, time_key="dt-2"),
+            _entry("B1", {"red": str(tmp_path / "b1.tif")}, T1, time_key="dt-2"),
+        ]
+        index, _ = raster_time_index([granules])
+        slabs, meta = process_raster_shard(grid, 0, granules, cfg, index)
+        assert meta["timesteps"] == 2 and set(slabs) == {0, 1}
+        xs = ORIGIN[0] + (np.arange(144) + 0.5) * RES
+        for t, aval, bval in ((0, 100, 200), (1, 50, 75)):
+            red = slabs[t]["red"].reshape(96, 144)
+            assert (red[:, xs < 300480] == aval).all()  # A-only region
+            assert (red[:, xs > 300970] == bval).all()  # B-only region
+            assert (red[:, (xs > 300740) & (xs < 300960)] == bval).all()  # B side of overlap
+
     def test_single_item_timesteps_and_skips(self, tmp_path):
         _write_tiff(tmp_path / "a.tif", np.full((96, 96), 7, dtype=np.uint16))
         grid = _rect_grid([ORIGIN[0], ORIGIN[1] - 960.0, ORIGIN[0] + 960.0, ORIGIN[1]], [96, 96])
