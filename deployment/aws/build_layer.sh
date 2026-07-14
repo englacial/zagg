@@ -63,8 +63,13 @@ echo "Installing processing deps..."
 # unstrippable C++ core that can't fit the gate while importable). pyarrow is NOT
 # installed here -- its only use is off-Lambda zagg.catalog. Keep the pin in sync
 # with the `lambda` extra in pyproject.toml.
+# xarray + h5netcdf/h5py (issue #220): the temporal worker (process_event)
+# reads collections/masks as xarray datasets and opens NetCDF4/HDF5 bytes
+# in-memory through the h5netcdf engine (h5coro is a byte-range reader, not
+# an xarray engine). Keep the pins in sync with the `lambda` extra.
 $PIP install \
     "pandas==2.2.3" "arro3-core==0.8.1" fastparquet cramjam \
+    "xarray==2026.7.0" "h5netcdf==1.8.1" "h5py==3.16.0" \
     shapely pyproj odc-geo affine cachetools \
     -c "$CONSTRAINTS" \
     -t "$OUTPUT_DIR/python" \
@@ -87,10 +92,11 @@ fi
 # Remove bloat. pyproj is intentionally NOT stripped (rectilinear/odc-geo assign
 # needs it). pyarrow is no longer installed (issue #130): the worker's Arrow carrier
 # is arro3-core, which needs no component strip, so the whole pyarrow strip block is
-# gone with it.
+# gone with it. xarray is intentionally NOT stripped (issue #220): the temporal
+# worker (process_event) imports it and opens NetCDF bytes via h5netcdf/h5py --
+# the pins live in the [lambda] extra.
 echo "Removing bloat..."
-rm -rf "$OUTPUT_DIR/python"/xarray* \
-       "$OUTPUT_DIR/python"/matplotlib* \
+rm -rf "$OUTPUT_DIR/python"/matplotlib* \
        "$OUTPUT_DIR/python"/lonboard* \
        "$OUTPUT_DIR/python"/boto3* \
        "$OUTPUT_DIR/python"/botocore* 2>/dev/null || true
