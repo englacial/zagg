@@ -111,6 +111,15 @@ class TestTabularWriterSerialise:
         back = pd.read_csv(path)
         assert list(back["event_key"]) == ["storm1", "storm2"]
 
+    def test_creates_missing_parent_dirs(self, tmp_path):
+        # A nested relative store like ./output/zagg/out.parquet must not fail
+        # with FileNotFoundError -- the local write mkdirs its parents first.
+        path = tmp_path / "nested" / "dir" / "out.parquet"
+        out = TabularWriter().write(_result_rows(), path)
+        assert out == path
+        back = pd.read_parquet(path).set_index("event_key")
+        assert back.loc["storm1", "max_t2m"] == pytest.approx(5.0)
+
     def test_unknown_extension_defaults_to_parquet(self, tmp_path):
         path = tmp_path / "events.unknown"
         TabularWriter().write(_result_rows(), path)
