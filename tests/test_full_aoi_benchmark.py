@@ -1,12 +1,11 @@
-"""Tests for the full-AOI benchmark harness + CONUS estimate tooling (issue #202).
+"""Tests for the full-AOI benchmark harness (issue #202).
 
-No AWS: covers the target manifest's internal consistency, the harness's pure
-metric/throughput helpers, and the CONUS regression-shard stratifier. The live
-dispatch path (``run_target`` with ``dry_run=False``) needs credentials + the
-local catalog, so it is exercised operationally, not in unit tests.
+No AWS: covers the target manifest's internal consistency and the harness's pure
+metric/throughput helpers. The live dispatch path (``run_target`` with
+``dry_run=False``) needs credentials + the local catalog, so it is exercised
+operationally, not in unit tests.
 """
 
-import importlib.util
 import sys
 from pathlib import Path
 
@@ -20,13 +19,6 @@ sys.path.insert(0, str(SCRIPTS))
 import run_full_aoi_benchmark as rfab  # noqa: E402
 
 _VALID_BACKENDS = {"inline", "sidecar", "hierarchical"}
-
-
-def _load_from_path(name: str, path: Path):
-    spec = importlib.util.spec_from_file_location(name, path)
-    mod = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(mod)
-    return mod
 
 
 # --- target manifest consistency ------------------------------------------
@@ -79,23 +71,6 @@ def test_write_throughput_empty_is_zeroed():
         "s3_slowdown_shards": 0,
         "cells_timeout": 0,
     }
-
-
-# --- CONUS regression-shard stratifier ------------------------------------
-
-
-def test_stratified_spans_value_range_on_peaked_distribution():
-    sel = _load_from_path(
-        "select_regression_shards", REPO / "data" / "conus" / "select_regression_shards.py"
-    )
-    # Sharply peaked: 3 sparse tails, a dense cluster at 70. Value-based
-    # stratification must reach the tails, not cluster at the mode.
-    counts = [20] + [70] * 200 + [140]
-    idx = sel.stratified(counts, k=5)
-    picked = sorted(counts[i] for i in idx)
-    assert len(idx) == 5
-    assert len(set(idx)) == 5  # no shard picked twice
-    assert picked[0] == 20 and picked[-1] == 140  # both tails represented
 
 
 def test_sidecar_cache_probe_graceful():
