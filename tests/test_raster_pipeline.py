@@ -94,6 +94,14 @@ class TestRasterConfigValidation:
         with pytest.raises(ValueError, match="healpix"):
             validate_config(_raster_config(grid=grid))
 
+    def test_bool_fill_value_rejected(self):
+        with pytest.raises(ValueError, match="fill_value must be a number"):
+            validate_config(
+                _raster_config(
+                    bands={"red": {"asset": "red", "dtype": "uint16", "fill_value": True}}
+                )
+            )
+
     def test_get_raster_bands_normalizes(self):
         bands = get_raster_bands(_raster_config())
         assert bands["red"]["attrs"] == {"scale_factor": 0.0001, "add_offset": -0.1}

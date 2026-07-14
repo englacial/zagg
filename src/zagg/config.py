@@ -618,10 +618,12 @@ def _validate_raster_config(config: PipelineConfig) -> None:
             if not isinstance(meta.get(key), str) or not meta.get(key):
                 raise ValueError(f"band '{name}' requires a string '{key}'")
         for key in ("fill_value", "scale", "offset"):
-            if key in meta and not isinstance(meta[key], (int, float)):
+            if key in meta and (
+                not isinstance(meta[key], (int, float)) or isinstance(meta[key], bool)
+            ):
                 raise ValueError(f"band '{name}' {key} must be a number (got {meta[key]!r})")
     nodata = config.data_source.get("nodata")
-    if nodata is not None and not isinstance(nodata, (int, float)):
+    if nodata is not None and (not isinstance(nodata, (int, float)) or isinstance(nodata, bool)):
         raise ValueError(f"data_source.nodata must be a number (got {nodata!r})")
     grid = config.output.get("grid")
     if not isinstance(grid, dict) or grid.get("type") != "healpix":
