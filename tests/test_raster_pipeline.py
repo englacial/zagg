@@ -196,6 +196,13 @@ class TestOwnership:
         assert (red[:, xs > 300970] == 200).all()  # B-only region
         assert (red[:, xs < 300480] == 100).all()  # A-only region
 
+    def test_missing_time_key_in_index_raises(self, tmp_path):
+        grid = _rect_grid([ORIGIN[0], ORIGIN[1] - 960.0, ORIGIN[0] + 960.0, ORIGIN[1]], [96, 96])
+        cfg = _raster_config(bands={"red": {"asset": "red", "dtype": "uint16"}})
+        granules = [_entry("A", {"red": str(tmp_path / "a.tif")}, T0, time_key="dt-absent")]
+        with pytest.raises(ValueError, match="dt-absent"):
+            process_raster_shard(grid, 0, granules, cfg, {})
+
     def test_single_item_timesteps_and_skips(self, tmp_path):
         _write_tiff(tmp_path / "a.tif", np.full((96, 96), 7, dtype=np.uint16))
         grid = _rect_grid([ORIGIN[0], ORIGIN[1] - 960.0, ORIGIN[0] + 960.0, ORIGIN[1]], [96, 96])

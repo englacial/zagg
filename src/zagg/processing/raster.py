@@ -364,6 +364,11 @@ def process_raster_shard(
     cell takes the value from the item whose tile center is nearest
     (espg-ratified ownership rule on issue #218; subsumes same-zone dedupe).
 
+    Invariant: ``time_index`` MUST be built from the same manifest the shards
+    were dispatched from (see :func:`raster_time_index`). A granule whose
+    acquisition-group key is absent raises :class:`ValueError` naming the key,
+    rather than failing with an opaque ``KeyError`` deep in the gather.
+
     Returns
     -------
     (slabs, metadata)
@@ -388,6 +393,12 @@ def process_raster_shard(
     lonlat = None  # computed once, only if some timestep has overlapping items
     slabs: dict = {}
     for key, items in groups.items():
+        if key not in time_index:
+            raise ValueError(
+                f"acquisition group key {key!r} is absent from the passed "
+                "time_index; time_index must be built from the same manifest "
+                "the shards were dispatched from — see raster_time_index"
+            )
         t = time_index[key]
         sampled = [
             _run_sync(
