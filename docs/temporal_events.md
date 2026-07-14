@@ -52,8 +52,9 @@ inputs, keeping the async payload far under Lambda's 256 KB Event cap:
 ```
 
 - `event_mask_uri` / `static_uris` values: a single URI each (local path,
-  `s3://`; `.zarr` opens as a store, anything else is fetched as bytes and
-  opened in-memory). A single-variable file becomes a `DataArray`.
+  `s3://`; `.zarr` opens as a store, a local non-`.zarr` path opens directly,
+  and an `s3://` non-`.zarr` object is fetched as bytes and opened
+  in-memory). A single-variable file becomes a `DataArray`.
 - `collection_uris` values: one URI **or a list** — a multi-granule event
   (e.g. a storm spanning several MERRA-2 daily files) is opened per-URI,
   concatenated along `time`, and time-sorted.
@@ -106,7 +107,7 @@ Each `aggregation.variables` entry:
 | `negate` | no | negate the field (southward-positive fluxes) |
 | `trigger` | no | event-trigger name gating which timesteps update (e.g. `first_landfall`) |
 | `trigger_mask` | no | static field the trigger tests against (default `ais_mask`) |
-| `params` | no | free-form mapping passed to capabilities verbatim |
+| `params` | no | free-form mapping threaded into mask providers, field transforms, and event triggers (not spatial_funcs or reducers) |
 
 ## Capability resolution and the worker policy
 
@@ -127,5 +128,6 @@ contribution funnel.
 Credential providers run orchestrator-side, so they carry no such
 restriction; `data_source.credentials_provider` may name a plugin provider on
 either backend — including non-NASA S3-compatible sources. The spatial
-pipeline honors the same key for its source reads, defaulting to `nsidc` when
-the key is absent.
+pipeline honors the same key for its S3-driver source reads, defaulting to
+`nsidc` when the key is absent; the HTTPS driver instead authenticates with an
+EDL bearer token and does not consult credential providers.
