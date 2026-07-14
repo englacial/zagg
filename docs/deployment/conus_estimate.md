@@ -98,7 +98,11 @@ The shard tiling (dispatch units) over CONUS, at both benchmark orders — the S
 Francisco Bay inset makes the HEALPix diamond tiling legible (an o8 shard is 4× an
 o9 shard's area, so ~4× fewer, larger diamonds in the same window: 31 vs 97). The
 whole-CONUS panel is a fine mesh at this scale; the red box marks the inset window.
-Rendered from the committed shard maps by `data/conus/plot_conus_shardmap.py`.
+The land basemap is Natural Earth 1:10m land (public domain, clipped to CONUS →
+`data/conus/conus_basemap_ne10m.geojson`) — **visualization only**; it resolves the
+coastline (e.g. the SF peninsula) that the coarse `conus.geojson` shard-map AOI
+smooths out. Rendered from the committed shard maps by
+`data/conus/plot_conus_shardmap.py`.
 
 ![CONUS HEALPix shard map at order 9 — 49,285 shards of 162 km², with a San Francisco Bay inset showing the diamond tiling](conus_shardmap_o9.png)
 
