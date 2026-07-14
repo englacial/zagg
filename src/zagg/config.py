@@ -579,9 +579,10 @@ def _validate_collection_options(config: PipelineConfig) -> None:
     :func:`zagg.temporal.prepare_collection`: ``variables`` (list of names),
     ``time_offset`` (a pandas-parseable offset string), ``resample``
     (``{freq, how: sum|mean, scale}``), and ``derived`` (name -> numpy
-    expression string). Unknown option keys (e.g. ``doi``) pass through for
-    catalog tooling. Fails at load so a config typo doesn't surface as a
-    per-event worker error after the Lambda spend.
+    expression string). ``time_offset`` and ``resample.freq`` are parsed with
+    pandas here so an unparseable value fails at load rather than surfacing as
+    a per-event worker error after the Lambda spend. Unknown option keys (e.g.
+    ``doi``) pass through by design for catalog tooling metadata.
     """
     colls = (config.data_source or {}).get("collections")
     if colls is None or isinstance(colls, list):
@@ -606,11 +607,21 @@ def _validate_collection_options(config: PipelineConfig) -> None:
                 f"data_source.collections[{cname!r}].variables must be a list of names"
             )
         offset = opts.get("time_offset")
-        if offset is not None and not isinstance(offset, str):
-            raise ValueError(
-                f"data_source.collections[{cname!r}].time_offset must be an offset "
-                f"string like '-30min' (got {offset!r})"
-            )
+        if offset is not None:
+            if not isinstance(offset, str):
+                raise ValueError(
+                    f"data_source.collections[{cname!r}].time_offset must be an offset "
+                    f"string like '-30min' (got {offset!r})"
+                )
+            import pandas as pd
+
+            try:
+                pd.to_timedelta(offset)
+            except (ValueError, TypeError) as exc:
+                raise ValueError(
+                    f"data_source.collections[{cname!r}].time_offset is not a valid "
+                    f"pandas offset string (got {offset!r})"
+                ) from exc
         resample = opts.get("resample")
         if resample is not None:
             if not isinstance(resample, dict) or "freq" not in resample:
@@ -618,6 +629,21 @@ def _validate_collection_options(config: PipelineConfig) -> None:
                     f"data_source.collections[{cname!r}].resample must be a mapping "
                     "with at least 'freq' (optional: how, scale)"
                 )
+            freq = resample["freq"]
+            if not isinstance(freq, str):
+                raise ValueError(
+                    f"data_source.collections[{cname!r}].resample.freq must be a "
+                    f"frequency string like '3h' (got {freq!r})"
+                )
+            import pandas as pd
+
+            try:
+                pd.tseries.frequencies.to_offset(freq)
+            except (ValueError, TypeError) as exc:
+                raise ValueError(
+                    f"data_source.collections[{cname!r}].resample.freq is not a valid "
+                    f"pandas frequency string (got {freq!r})"
+                ) from exc
             how = resample.get("how", "sum")
             if how not in _RESAMPLE_HOWS:
                 raise ValueError(
