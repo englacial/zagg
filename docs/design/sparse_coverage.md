@@ -29,11 +29,11 @@ set of primitives answers all of them:
    layout materializes a coordinate entry for every cell of the global grid.
    For sparse-coverage data (a continent, a flight campaign) this is waste at
    best and intractable at global orders. The fix is a **domain declaration**:
-   a store-level MOC saying "data exists on exactly these cells," letting the
+   a coverage MOC conservatively declaring where data exists, letting the
    xarray extension keep coordinates sparse and fabricate dense views lazily.
 
 The stack, bottom to top: hive store layout (§2) → static manifest (§3) →
-store MOC (§4) → reader architecture (§5) → xarray/xdggs extension (§6), with
+coverage MOCs (§4) → reader architecture (§5) → xarray/xdggs extension (§6), with
 the pyramid sweep (§7) as the post-process phase that generates all derived
 artifacts.
 
@@ -47,7 +47,7 @@ what zagg consumes:
 ```
 {store_root}/
   morton_hive.json               <- static manifest (§3); root-only exception
-  coverage.moc                   <- store MOC (§4); root-only exception
+  coverage.moc                   <- optional root MOC (§4, O9); root-only exception
   {sign+base}/{d1}/{d2}/.../     <- one digit per level (D2)
     {full_id}.zarr/              <- self-describing leaf (D3), vanilla zarr v3
 ```
@@ -105,29 +105,81 @@ touched again during a run. Contents:
 This file is the reader's bootstrap: with it, every shard path is computable
 arithmetically with zero requests.
 
-## 4. Layer 2: the store MOC (domain declaration)
+## 4. Layer 2: coverage MOCs (hierarchical domain declaration)
 
-The dynamic complement to §3: *which shards actually exist*, encoded as a
-MOC — mortie's compressed multi-order coverage representation (D8).
+Coverage is declared hierarchically — **worker-owned at the leaves,
+sweep-composed above** — tiered the way cloud-geo formats split bbox /
+geometry / data (GeoParquet's `bbox` covering column vs. the WKB column vs.
+the data itself). Tracks [#200](https://github.com/englacial/zagg/issues/200).
 
-- **Built without walking S3.** The dispatcher already tracks per-shard
-  completion via the status channel; at end of run it builds the MOC from its
-  own completion list in memory (existing `morton_coverage`/MOC machinery,
-  milliseconds) and PUTs one small object. Spatially coherent coverage
-  compresses well: ~50k CONUS shards → a few KB.
-- **It is a cache, not truth** (D9). Timestamped, regenerable (from a tree
-  walk, or the next sweep). The strongly-consistent LIST walk (§2) remains
-  ground truth; a run that crashes before writing its MOC degrades to
-  walking, never to wrong answers.
+**The three tiers, per shard:**
+
+- **Tier 0 — the morton box** (fixed width): the minimal MOC with **≤ 4
+  members** (mixed order allowed) covering the shard's occupied cells.
+  Existence is guaranteed: within one base cell, any coverage has a deepest
+  common ancestor whose ≤ 4 intersecting children form a valid cover — and a
+  shard's coverage is within one base cell *by construction* (a shard is a
+  single subtree; its id alone is the trivial 1-member cover, so the box is
+  what buys sub-shard resolution). Padded to exactly 4 slots for fixed width
+  (32 B raw; four decimal strings in attrs); pad-sentinel *lean* is null
+  (base-0 words / JSON `null`), with repetition-padding the viable
+  alternative since repeats are idempotent under MOC algebra — the choice
+  is frozen with the mortie-side spec (O8). Future *store-level* covers that cross base
+  cells generalize to **≤ 12 members** (the 12 base cells). Readers
+  AOI-reject on the box without parsing anything larger.
+- **Tier 1 — the exact shard bitmap** *(as O8 resolved it — the originally
+  drafted "budgeted, coarsen-to-fit MOC" was superseded by the
+  [#202 item (6) measurement](https://github.com/englacial/zagg/issues/200#issuecomment-4939264286):
+  for linear-track occupancy, coarsen-to-fit ranges at KB budgets deliver
+  only box-level filtering while a compressed bitmap reaches exact at
+  ~25 KB)*: the shard's cell-order occupancy as a **zstd-compressed bit
+  field**, one bit per subtree cell in ascending packed-word order, stored
+  as the in-leaf `coverage.moc` sidecar. Raw size is deterministic
+  (`ceil(4^depth/8)`) regardless of fragmentation; no coarsened variant is
+  built (one code path, sidecar-only). The stamp attrs carry only the box +
+  the bitmap's order + pointer + byte sizes (one extra GET, paid only by
+  readers that pass the box test). The sidecar is the *noted exception* to
+  §2's "vanilla zarr v3" leaf: one foreign key inside the leaf, ignored by
+  zarr readers (data reads unaffected; member enumeration warns and skips
+  it).
+- **Tier 2 — exact**: the `morton` coordinate array in the leaf *is* the
+  exact cell list. The MOC tiers are indexes, never truth (D9 discipline,
+  applied one level down).
+
+**Ownership and lifecycle:**
+
+- **Leaf MOCs are worker-owned and ride the commit stamp** (D4): the payload
+  lands on (or is finalized before) the shard's final root `attrs.update()`
+  PUT. Zero extra requests in the attrs case, and debris semantics are
+  inherited automatically — a torn worker's MOC never becomes visible.
+- **Ancestor and root MOCs are composed by the §7 sweep**: union of
+  children, re-coarsened to the same budget, in the same bottom-up
+  level-by-level orchestration as overview zarrs. All regenerable caches.
+- **Optional end-of-run root `coverage.moc`** (O9): flag-gated. The
+  dispatcher cannot write S3 (only the worker execution role can), so it
+  posts its completion list to a **fire-and-forget worker invoke**
+  (`InvocationType="Event"`, ~10 ms of dispatcher wall clock, run-size
+  independent) that writes a shard-order root MOC for the one-GET
+  bootstrap. Failure is harmless: readers degrade to the sweep MOC or the
+  walk, never to wrong answers. Incremental runs: the leaves carry durable
+  truth, so the sweep is always a correct rebuilder, and the end-of-run
+  write may union with a prior root object.
+- **Everything above the leaf is a cache, not truth** (D9). Timestamped,
+  regenerable (from leaf stamps or a tree walk). The strongly-consistent
+  LIST walk (§2) remains ground truth; a run that crashes before any root
+  MOC exists degrades to walking, never to wrong answers.
 - **This replaces consolidated metadata** for extent/discovery. Consolidation
-  measured +70 s per worker and is disabled by default; the MOC costs
-  effectively nothing and answers the actual question readers ask
+  measured +70 s per worker and is disabled by default; the coverage tiers
+  cost effectively nothing and answer the actual question readers ask
   ("where is there data?") in one GET.
 
-Open items: serialization format for the `.moc` object (O1), and the
-interaction with mortie's current MOC depth ceiling (`MAX_DEPTH = 18`,
-[mortie #61](https://github.com/espg/mortie/issues/61); fine for shard orders
-≤ 11 today) (O2).
+O8 and O9 are **resolved** (espg-ratified on the
+[#200 thread](https://github.com/englacial/zagg/issues/200#issuecomment-4939477871),
+implemented on PR #208): the shard tier is an **exact cell-order occupancy
+bitmap, zstd-compressed, as an in-leaf sidecar object** — attrs carry only
+the tier-0 box + order + pointer + sizes, with a null pad sentinel — and the
+end-of-run root MOC **defaults on** for hive stores. The root object
+serializes per O1 as JSON ranges with decimal-string endpoints.
 
 ## 5. Layer 3: reader architecture
 
@@ -140,7 +192,9 @@ new wiring on the read side.
 2. GET `coverage.moc`; intersect with the query AOI's MOC (`moc_and`) →
    the populated shard set within the region. Zero LISTs.
 3. For each shard id: compute the hive path by string arithmetic
-   (digits → components), open the leaf zarr, check the commit stamp.
+   (digits → components), open the leaf zarr, check the commit stamp. The
+   stamp's morton box / shard MOC (§4) lets the reader AOI-reject the leaf
+   before touching chunk data.
 4. **Fallback / discovery walk** (no MOC, mixed orders, or verification):
    from any node, delimiter-LIST; recurse on `[1-4]/` children; a `*.zarr`
    entry is data at that node; no digit children ⇒ nothing finer. At each
@@ -193,7 +247,8 @@ be produced by shard workers anyway.
   inferred from position: a shallow zarr may equally be *coarse source* in a
   sparse region. Full pyramid cost is a geometric ~1/3 extra storage
   (4 children per order).
-- **MOC (re)generation** — refresh `coverage.moc` from the tree.
+- **MOC (re)generation** — compose ancestor MOCs bottom-up from the leaf
+  stamps (union, re-coarsen to budget) and refresh the root `coverage.moc`.
 - **Optional interop materialization**: if a use case ever demands a
   `zarr.open(store_root)`-able hierarchy or a one-GET consolidated index,
   the sweep generates it *as a derived artifact* here. Round one ships
@@ -226,9 +281,13 @@ write path (§2) is load-bearing; this phase is optimization.
 - **D6 — The convention is versioned** (`morton-hive/1`) in the manifest.
 - **D7 — One store per dataset, own orders.** Workers never mix datasets;
   interop between any pair of stores is truncation against each manifest.
-- **D8 — Store MOC as the coverage index**, built from the dispatcher's
-  completion list (no S3 walk), replacing consolidated metadata (disabled;
-  measured +70 s/worker).
+- **D8 — Coverage MOCs are hierarchical and worker-owned at the leaves**
+  (amended per #200). Each shard's tier-0 morton box + tier-1 budgeted MOC
+  rides the D4 commit stamp; ancestor/root MOCs are sweep-composed unions;
+  an optional end-of-run root MOC is written by a fire-and-forget worker
+  invoke from the dispatcher's completion list (the orchestrator has no S3
+  write access). Replaces consolidated metadata (disabled; measured
+  +70 s/worker).
 - **D9 — MOC is a regenerable cache; the tree walk is ground truth.**
 - **D10 — Arithmetic-first reads; no LISTs in join loops.**
 - **D11 — Pyramids/overviews are a second-pass sweep**, `role: overview`
@@ -246,9 +305,11 @@ write path (§2) is load-bearing; this phase is optimization.
 - **O1 — MOC serialization format** for `coverage.moc`: JSON of nested-range
   pairs? Packed-word `.npy`? Needs to be frozen alongside the mortie spec
   (FITS/IVOA interop is an explicit non-goal per mortie #50).
-- **O2 — MOC depth ceiling**: mortie's `MAX_DEPTH = 18`
-  (mortie #61) vs. cell-order MOCs. Shard-order coverage (≤ 11 today) is
-  fine; declaring *cell*-level domains at order 19+ is not, yet.
+- **O2 — MOC depth ceiling: resolved (mortie 0.9.0)** *(entry kept here
+  for O# id stability)*. The cap was a stale
+  `MAX_DEPTH = 18` constant, not a u64 limit; the coverage/MOC paths now
+  reach the packed-u64 kernel ceiling (order 29), so cell-order MOCs at
+  order 19 are representable today.
 - **O3 — Upstream target**: extend xdggs vs. standalone xarray extension.
   Depends partly on xdggs's appetite for MortonIndexDtype (#72) and
   non-dense coordinate models.
@@ -262,3 +323,58 @@ write path (§2) is load-bearing; this phase is optimization.
   global shard counts.
 - **O7 — MOC staleness policy**: stamp `generated_at` + source (dispatcher
   vs sweep); do readers warn, re-walk, or trust silently when stale?
+  Current lean (#200 thread): trust silently on the hot path (false
+  negatives only, per D9), detect lazily (warn on a stamped leaf the MOC
+  doesn't list), regenerate explicitly (`refresh=True` / the sweep); no
+  wall-clock staleness horizon. The incremental-run half is settled by the
+  §4 lifecycle (leaves are durable truth; the sweep rebuilds correctly).
+  Implemented in this shape by PR #208's reader primitives
+  (`zagg.coverage`: `warn_if_stale` — once per store, never auto-walk —
+  and `refresh_root_coverage`, the explicit walk); the concurrent-run
+  GET-union-PUT race (last writer wins until re-union/sweep) is recorded
+  there as accepted under this same lean.
+- **O8 — shard-MOC budget, serialization, carrier, pad sentinel**:
+  **RESOLVED** ([espg-ratified](https://github.com/englacial/zagg/issues/200#issuecomment-4939477871),
+  from the [#202 item (6) measurement](https://github.com/englacial/zagg/issues/200#issuecomment-4939264286)):
+  no budgeted/coarsened tier — the leaf encoding is an **exact cell-order
+  bitmap, zstd-compressed, as the in-leaf `coverage.moc` sidecar** (raw size
+  deterministic at `ceil(4^depth/8)`, immune to the ragged worst case where
+  exact ranges hit MB-scale on linear-track occupancy at ~1.1 cells/range).
+  Stamp attrs carry only the tier-0 box + the bitmap's order + pointer +
+  byte sizes; pad sentinel is JSON null; the envelope gains an
+  `encoding: "ranges" | "bitmap"` discriminator. Bit convention (frozen
+  with the mortie spec, golden-vector-pinned on PR #208): bit i = the i-th
+  shard-subtree cell in ascending packed-word order (base-4 D1 digit tail,
+  digits 1..4 → 0..3), MSB-first per byte.
+- **O9 — end-of-run root MOC default**: **RESOLVED — on** for hive stores
+  ([espg](https://github.com/englacial/zagg/issues/200#issuecomment-4938859764):
+  coverage MOCs are the default for healpix templates; PR #208 implements
+  `output.coverage_moc`, default true under `store_layout: hive`, explicit
+  true rejected elsewhere). The write is fail-open on both backends; the
+  Lambda leg is one fire-and-forget `mode: "coverage"` Event invoke with the
+  pre-serialized ranges envelope.
+
+## 9. References
+
+Community precedents for the §4 tiered-coverage conventions (budgeted
+conservative summary in the metadata plane, exact geometry in the data
+plane):
+
+- STAC best practices — footprint simplification discipline:
+  <https://github.com/radiantearth/stac-spec/blob/master/best-practices.md>
+- STAC item spec — bbox + geometry as the queryable summary:
+  <https://github.com/radiantearth/stac-spec/blob/master/item-spec/item-spec.md>
+- stactools raster-footprint — densify → reproject → simplify-to-tolerance:
+  <https://element84.com/geospatial/the-stactools-raster-footprint-utility/>
+- CMR ingest API — geometry-complexity constraints at ingest:
+  <https://cmr.earthdata.nasa.gov/ingest/site/docs/ingest/api.html>
+- GeoParquet — `bbox` covering column (fixed-size conservative cover in
+  metadata, exact WKB in data; the direct analog of the tier-0 morton box):
+  <https://github.com/opengeospatial/geoparquet>
+- PostgreSQL TOAST — the ~2 KB inline threshold (portability footnote for
+  the tier-1 budget):
+  <https://www.postgresql.org/docs/current/storage-toast.html>
+- IVOA MOC recommendation — degraded-order MOC practice; NUNIQ int64
+  order-29 ceiling: <https://www.ivoa.net/documents/MOC/>
+- H3 `compactCells` — mixed-resolution minimal covers:
+  <https://h3geo.org/docs/api/hierarchy>

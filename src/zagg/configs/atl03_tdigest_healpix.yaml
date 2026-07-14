@@ -1,7 +1,7 @@
 # ATL03 photon-height t-digest template (HEALPix, multi-chunk-per-worker).
 #
 # Per-cell approximate-quantile sketch: each grid cell stores a t-digest of its
-# photon heights (h_ph) as a ``kind: ragged`` CSR field. A t-digest is a small,
+# photon heights (h_ph) as a ``kind: ragged`` vlen-bytes field. A t-digest is a small,
 # mergeable set of (mean, weight) centroids from which any quantile (median,
 # p5/p95, IQR, ...) is recovered at read time -- far cheaper than storing every
 # photon, and exact-enough in the tails. The reducer is the pure-numpy
@@ -14,9 +14,11 @@
 # resolves past the old order-18 reference cap). Multi-chunk-per-worker (issue
 # #30 item 3) is on: one shard (the dispatch unit, parent_order 11 = 256x256
 # cells) owns K = 16 finer Zarr chunks (chunk_inner 13 = 64x64 cells each). The
-# worker reads the shard's granules once and writes 16 chunk regions + 16 CSR
-# groups, one per inner chunk. chunk_inner unset would collapse to K=1 (shard ==
-# chunk), byte-identical to the single-chunk path.
+# worker reads the shard's granules once and writes 16 chunk regions plus the
+# ragged t-digest as one vlen-bytes object per shard (issue #209 -- the sharded
+# vlen-bytes layout replacing the old per-inner-chunk CSR groups). chunk_inner
+# unset would collapse to K=1 (shard == chunk), byte-identical to the
+# single-chunk path.
 #
 # Confidence filter, multi-level form and read_plan match atl03.yaml (the planned
 # segment->photon IO of issue #43 applies here too); only the aggregation differs.
@@ -67,11 +69,11 @@ aggregation:
       dtype: int32
       fill_value: 0
     h_tdigest:
-      # Per-cell t-digest of photon heights: a ragged (CSR) field whose payload
+      # Per-cell t-digest of photon heights: a ragged (vlen-bytes) field whose payload
       # is an (n_centroids, 2) array of (mean, weight) centroids. ``build_tdigest``
       # is called as build_tdigest(h_ph_values, delta=256); ``inner_shape: [2]``
       # declares the per-element centroid width. To store ONE digest per chunk
-      # instead of per cell, add ``resolution: chunk`` (one CSR payload per inner
+      # instead of per cell, add ``resolution: chunk`` (one payload per inner
       # chunk under the chunk-uniform contract).
       kind: ragged
       function: "zagg.stats.tdigest.build_tdigest"
@@ -90,7 +92,7 @@ output:
     chunk_inner: 13              # inner Zarr chunk: 4^(19-13) = 64x64 cells (K=16 per shard)
     # ShardingCodec output (issue #108/#133, decided on the #170 read-matrix
     # evidence 2026-07-07): at identical reads, sharded collapses the
-    # per-inner-chunk aggregation grouping + K CSR writes (o9: agg 165->19 s,
+    # per-inner-chunk aggregation grouping + K per-inner-chunk writes (o9: agg 165->19 s,
     # write 148->15 s per worker; -44% cost vs inner). The benchmark matrix
     # keeps both codecs as explicit A/B columns.
     sharded: true

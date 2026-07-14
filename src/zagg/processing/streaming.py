@@ -126,7 +126,7 @@ class StreamingAggregator:
     ``len`` fields by summation, tdigest fields via ``merge_tdigests``.
     ``chunk_outputs`` then emits the exact ``(stats_arrays, ragged_payloads,
     ragged_cell_indices, cells_with_data)`` shape ``_aggregate_chunk_cells``
-    returns, so the worker's carrier/CSR construction is shared verbatim.
+    returns, so the worker's carrier/ragged construction is shared verbatim.
     """
 
     def __init__(self, config: PipelineConfig, grid, handoff: str, buffer_granules: int):

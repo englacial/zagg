@@ -1216,9 +1216,9 @@ class TestProcessAndWriteStreaming:
     """Issue #91: the non-sharded ``_process_and_write`` streams each chunk through a
     ``write_chunk`` callback (no ``chunk_results`` accumulation). Drive a fake
     ``process_shard`` that streams 1 and K>1 chunks through the callback and assert
-    the dense ``chunk_idx`` sequence + ragged keying (the grid's shard label at K=1
-    — issue #199 — block-index key at K>1) — the runner-level analogue of the
-    lambda streaming test."""
+    the dense + ragged writes both land at each chunk's own block index (the
+    ragged vlen array is block-addressed like the dense arrays — issue #209) —
+    the runner-level analogue of the lambda streaming test."""
 
     def _run(self, monkeypatch, atl06_config, *, chunks_per_shard, chunks):
         from unittest.mock import MagicMock
@@ -1240,9 +1240,6 @@ class TestProcessAndWriteStreaming:
         grid.sharded = False
         grid.chunks_per_shard = chunks_per_shard
         grid.chunk_grid_shape = (4,)
-        # K==1 ragged subgroups are keyed by the grid's shard label (issue
-        # #199); a deterministic decimal-string-shaped stub pins the seam.
-        grid.shard_label = lambda key: f"-{int(key)}"
 
         monkeypatch.setattr(runner, "process_shard", fake_process_shard)
         monkeypatch.setattr(
@@ -1253,10 +1250,8 @@ class TestProcessAndWriteStreaming:
         monkeypatch.setattr(
             runner,
             "write_ragged_to_zarr",
-            lambda r, st, *, grid, shard_key: cap["ragged"].append(shard_key),
+            lambda r, st, *, grid, chunk_idx: cap["ragged"].append(chunk_idx),
         )
-        # _block_index_key on a 1-D grid is block_index[0].
-        monkeypatch.setattr(runner, "_block_index_key", lambda b, g: int(b[0]))
         runner._process_and_write(
             5,
             (5,),
@@ -1269,7 +1264,7 @@ class TestProcessAndWriteStreaming:
         )
         return cap
 
-    def test_k1_streams_ragged_keyed_by_shard_label(self, monkeypatch, atl06_config):
+    def test_k1_streams_ragged_at_chunk_block(self, monkeypatch, atl06_config):
         import pandas as pd
 
         cap = self._run(
@@ -1281,9 +1276,9 @@ class TestProcessAndWriteStreaming:
         # Streaming seam wired: callback passed, no accumulation sink.
         assert callable(cap["write_chunk"]) and cap["chunk_results"] is None
         assert cap["dense"] == [(5,)]
-        assert cap["ragged"] == ["-5"]  # K=1 -> keyed by the grid's shard label (#199)
+        assert cap["ragged"] == [(5,)]  # same block as the dense write (issue #209)
 
-    def test_k_gt_1_streams_ragged_keyed_by_block_index(self, monkeypatch, atl06_config):
+    def test_k_gt_1_streams_ragged_at_each_chunk_block(self, monkeypatch, atl06_config):
         import pandas as pd
 
         cap = self._run(
@@ -1297,7 +1292,7 @@ class TestProcessAndWriteStreaming:
             ],
         )
         assert cap["dense"] == [(0,), (1,), (2,)]
-        assert cap["ragged"] == [0, 1, 2]  # K>1 -> keyed by _block_index_key
+        assert cap["ragged"] == [(0,), (1,), (2,)]  # K>1 -> each chunk's own block
 
 
 def _stub_grid():
@@ -1308,7 +1303,7 @@ def _stub_grid():
     grid.spatial_signature.return_value = {}
     grid.block_index.side_effect = lambda k: (k,)
     # Deterministic decimal-string-shaped labels (issue #199) so status keys
-    # and CSR subgroup names built off the stub are real strings.
+    # built off the stub are real strings.
     grid.shard_label.side_effect = lambda k: f"-{int(k)}"
     grid.emit_template.side_effect = lambda store, overwrite=False: store
     return grid

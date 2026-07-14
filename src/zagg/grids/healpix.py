@@ -21,8 +21,11 @@ from zagg.config import (
 from zagg.grids.base import (
     InconsistentShardError,
     chunk_array_spec,
+    ragged_array_spec,
+    ragged_locations_name,
     sharded_array_spec,
     vector_array_spec,
+    vlen_dtype_warning_suppressed,
 )
 from zagg.grids.morton import morton_decimal, to_morton_array
 
@@ -462,7 +465,7 @@ class HealpixGrid:
         """Decimal morton string for this shard's packed word (issue #199).
 
         The external form of a HEALPix shard id (D1 in
-        ``docs/design/sparse_coverage.md``): CSR subgroup names, ``.status``
+        ``docs/design/sparse_coverage.md``): hive leaf ids, ``.status``
         object keys, and log lines all carry e.g. ``-31123``, never the raw
         packed-word integer.
         """
@@ -573,7 +576,9 @@ class HealpixGrid:
     def emit_template(self, store: Store, *, overwrite: bool = False) -> Store:
         """Write the Zarr template (group + arrays) to ``store``."""
         spec = self._spec()
-        with zarr_config.set({"async.concurrency": 128}):
+        # Ragged vlen-array creation warns about the dtype NAME only
+        # (zarr-python#3517); message-scoped suppression, see grids.base.
+        with zarr_config.set({"async.concurrency": 128}), vlen_dtype_warning_suppressed():
             spec.to_zarr(store, self.group_path, overwrite=overwrite)
         return store
 
@@ -593,7 +598,9 @@ class HealpixGrid:
             # the single shared store.
             raise ValueError("hive leaf templates do not support sharded output")
         spec = GroupSpec(members={self.group_path: self.shard_spec()}, attributes={})
-        with zarr_config.set({"async.concurrency": 128}):
+        # Ragged vlen-array creation warns about the dtype NAME only
+        # (zarr-python#3517); message-scoped suppression, see grids.base.
+        with zarr_config.set({"async.concurrency": 128}), vlen_dtype_warning_suppressed():
             spec.to_zarr(store, "", overwrite=overwrite)
         return store
 
@@ -606,9 +613,11 @@ class HealpixGrid:
 
         Identical member set to :meth:`spec` — same dtypes, fills, chunking —
         with the cells axis sized to one shard and the ``resolution: chunk``
-        companions sized to the shard's K inner chunks.
+        companions sized to the shard's K inner chunks. The one deliberate
+        difference (``leaf=True``): a ragged field's vlen array shards across
+        the whole leaf, so a shard's digest is ONE object (issue #209).
         """
-        return self._group_spec(self.cells_per_shard, (self.chunks_per_shard,))
+        return self._group_spec(self.cells_per_shard, (self.chunks_per_shard,), leaf=True)
 
     # ── internals ────────────────────────────────────────────────────────
 
@@ -619,7 +628,9 @@ class HealpixGrid:
             n_pixels = self.n_children * self.n_shards
         return self._group_spec(n_pixels, self.chunk_grid_shape)
 
-    def _group_spec(self, n_pixels: int, chunk_grid_shape: tuple[int, ...]) -> GroupSpec:
+    def _group_spec(
+        self, n_pixels: int, chunk_grid_shape: tuple[int, ...], *, leaf: bool = False
+    ) -> GroupSpec:
         base = ArraySpec(
             attributes={},
             shape=(n_pixels,),
@@ -670,13 +681,49 @@ class HealpixGrid:
             members["aoi_mask"] = _shard(base.with_data_type("bool").with_fill_value(False))
         for name, meta in get_agg_fields(self.config).items():
             sig = get_output_signature(meta)
-            # Ragged fields (issue #48) are stored as CSR subgroups
-            # (``{name}/{shard_key}/values|offsets|cell_ids``) written fresh by
-            # ``write_ragged_to_zarr`` — NOT a dense array. Emitting a dense
-            # ``{name}`` array here would make ``{name}`` an array, and CSR's
-            # per-shard child groups under it would then collide ("only groups may
-            # have child nodes"). Skip them so ``{name}`` stays a group prefix.
+            # Ragged fields (issue #48) are ONE vlen-bytes array on the cell
+            # grid (issue #209 — the sharded vlen-bytes layout replacing the
+            # per-inner-chunk CSR subgroups). At ``resolution: chunk`` the
+            # array sits on the chunk grid instead (one payload per chunk, the
+            # ragged analogue of the scalar/vector companions). A located
+            # field (issue #87) adds a sibling uint64 vlen array.
             if sig["kind"] == "ragged":
+                if sig["resolution"] == "chunk":
+                    rag_kw: dict = {
+                        "shape": chunk_grid_shape,
+                        "dims": ("chunks",),
+                        "inner_chunk_shape": (1,),
+                    }
+                else:
+                    # The ShardingCodec outer chunk mirrors the dense arrays
+                    # when ``sharded`` (the issue #133 object split included);
+                    # a hive LEAF (unsharded, K inner chunks in one
+                    # self-describing store) shards the ragged field across
+                    # the whole leaf so a shard's digest is ONE object. The
+                    # unsharded FLAT layout stays a regular array (one object
+                    # per inner chunk — the streaming per-chunk write must not
+                    # read-modify-write a shared shard object).
+                    if self.sharded:
+                        rag_shard: tuple | None = (self.cells_per_shard_object,)
+                    elif leaf and self.chunks_per_shard > 1:
+                        rag_shard = (self.cells_per_shard,)
+                    else:
+                        rag_shard = None
+                    rag_kw = {
+                        "shape": (n_pixels,),
+                        "dims": ("cells",),
+                        "inner_chunk_shape": (self.cells_per_chunk,),
+                        "shard_shape": rag_shard,
+                    }
+                located = ragged_locations_name(name) if sig.get("location") else None
+                members[name] = ragged_array_spec(
+                    element_dtype=sig["dtype"] or "float32",
+                    inner_shape=sig["inner_shape"],
+                    locations=located,
+                    **rag_kw,
+                )
+                if located:
+                    members[located] = ragged_array_spec(element_dtype="uint64", **rag_kw)
                 continue
             dtype = meta.get("dtype", "float32")
             fill = meta.get("fill_value", "NaN")

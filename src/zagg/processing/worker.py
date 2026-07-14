@@ -91,6 +91,7 @@ def process_shard(
     chunk_results: list | None = None,
     aoi_payload=None,
     write_chunk: Callable | None = None,
+    occupied_out: list | None = None,
     profile: bool = False,
 ) -> Tuple[pd.DataFrame, ProcessingMetadata]:
     """Process one shard: read granules, filter to this shard, aggregate, return df.
@@ -128,7 +129,7 @@ def process_shard(
         is only a no-config safety net for direct callers. pyarrow is not used on
         either path.
     ragged_out : dict, optional
-        Out-param sink for ``kind: ragged`` (CSR) fields (issue #48). When a dict
+        Out-param sink for ``kind: ragged`` fields (issue #48). When a dict
         is passed, it is filled in place with ``{field_name: (values_list,
         cell_ids)}`` — ``values_list`` the per-populated-cell payload arrays and
         ``cell_ids`` their position in the chunk's ``children`` block — for the
@@ -155,7 +156,7 @@ def process_shard(
         with one ``(block_index, carrier, ragged)`` tuple per chunk —
         ``block_index`` the chunk's storage block (from ``grid.iter_chunks``),
         ``carrier`` its dense DataFrame/Table, ``ragged`` its
-        ``{field: (values_list, cell_ids)}`` CSR map — for the caller to write K
+        ``{field: (values_list, cell_ids)}`` ragged map — for the caller to write K
         regions + K companion slices. The returned 2-tuple's ``df_out`` is an empty
         carrier in that case (the real carriers live in ``chunk_results``).
         ``None`` (default) is the K==1 path: the single chunk's carrier is the
@@ -176,6 +177,13 @@ def process_shard(
         the ``chunk_results`` / ``ragged_out`` behavior above is unchanged. The
         sharded path (#108) still bundles all K via ``chunk_results`` /
         ``write_shard_to_zarr`` and does not pass a callback.
+    occupied_out : list, optional
+        Out-param sink for the shard's occupied cells (issue #200). When a list
+        is passed, one ``uint64`` array of the distinct cell-order morton words
+        holding >= 1 observation — the cells ``cells_with_data`` counts — is
+        appended after the shard's reads are grouped. The hive write path uses
+        it to derive the commit stamp's coverage payload; ``None`` (default)
+        records nothing — byte-for-byte unchanged.
     profile : bool, optional
         Opt-in per-phase timing (issue #100 phase 2). When ``True``, fills
         ``metadata["phase_timings"]`` with ``read`` / ``index`` / ``aggregate``
@@ -190,7 +198,7 @@ def process_shard(
     (DataFrame, metadata)
         DataFrame in canonical chunk order; metadata dict with ``shard_key``,
         ``cells_with_data``, ``total_obs``, ``granule_count``,
-        ``files_processed``, ``duration_s``, ``error``. Ragged (CSR) fields are
+        ``files_processed``, ``duration_s``, ``error``. Ragged fields are
         delivered out-of-band via ``ragged_out`` (above), not in this tuple. At
         K>1 the per-chunk carriers + ragged are delivered via ``chunk_results``.
     """
@@ -528,6 +536,13 @@ def process_shard(
     else:
         col_arrays, cell_to_slice, n_obs_total = _concat_and_group(all_reads, grid, handoff)
         logger.info(f"  Read {n_obs_total:,} observations")
+
+    # Occupied-cell sink (issue #200): both paths already key per-cell state by
+    # the packed cell word — ``cell_to_slice`` pooled, ``buffered.counts``
+    # merged — so the occupied set is in hand with no extra observation pass.
+    if occupied_out is not None:
+        cells = buffered.counts if buffered is not None else cell_to_slice
+        occupied_out.append(np.fromiter(cells.keys(), dtype=np.uint64, count=len(cells)))
 
     if profile:
         phase_timings["index"] = time.time() - _index_t0

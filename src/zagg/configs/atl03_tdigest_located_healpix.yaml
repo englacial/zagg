@@ -6,8 +6,8 @@
 # HEALPix cell enclosing the photons merged into it, computed by folding their
 # order-29 point-kind morton words (``HealpixGrid.assign``) through
 # ``mortie.common_ancestor``. A one-photon centroid stores its exact order-29
-# point word. On disk the locations are a uint64 companion CSR array
-# (``{field}/{shard}/locations``) sharing offsets/cell_ids with the float32
+# point word. On disk the locations are a uint64 companion vlen array
+# (the ``{field}_locations`` sibling, issue #209) row-aligned with the float32
 # digest -- one logical multivariable field, two physical arrays, each channel
 # lossless in its own dtype (an order-29 word exceeds float64's 2^53 exact-int
 # ceiling, so no interleaved float layout can carry it). Read the channel back
@@ -64,7 +64,7 @@ aggregation:
       # per-photon order-29 morton words (``locations=leaf_id``) and returns a
       # ``(digest, locations)`` pair -- the (n_centroids, 2) float32 (mean,
       # weight) array plus the (n_centroids,) uint64 per-centroid location
-      # vector, stored as the companion CSR array described above.
+      # vector, stored as the companion vlen array described above.
       kind: ragged
       function: "zagg.stats.tdigest.build_tdigest"
       source: h_ph
@@ -83,7 +83,7 @@ output:
     chunk_inner: 13              # inner Zarr chunk: 4^(19-13) = 64x64 cells (K=16 per shard)
     # ShardingCodec output (issue #108/#133, decided on the #170 read-matrix
     # evidence 2026-07-07): at identical reads, sharded collapses the
-    # per-inner-chunk aggregation grouping + K CSR writes (o9: agg 165->19 s,
+    # per-inner-chunk aggregation grouping + K per-inner-chunk writes (o9: agg 165->19 s,
     # write 148->15 s per worker; -44% cost vs inner). The benchmark matrix
     # keeps both codecs as explicit A/B columns.
     sharded: true

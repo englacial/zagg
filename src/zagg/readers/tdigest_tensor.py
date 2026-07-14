@@ -1,37 +1,58 @@
-"""Client-side reader: per-cell t-digests → fixed ``(64, 64, n_bins)`` tensors.
+"""Client-side reader: per-cell t-digests → fixed ``(side, side, n_bins)`` tensors.
 
 These are *read helpers* (issue #79) that live in-repo but sit just outside
 zagg's core write path: a client consuming a gridded Zarr product wants a dense,
 fixed-size tensor per coverage chunk, reconstructed from the per-cell t-digest
 ragged field that zagg writes (issue #48).
 
-Store layout consumed
----------------------
-The t-digest field is stored per shard as a CSR ragged group (see
-:mod:`zagg.csr`): under the field prefix, one subgroup per shard, named by the
-shard's **parent morton id** (the coverage cell), each holding the three CSR
-arrays ``values`` / ``offsets`` / ``cell_ids``::
+Store layout consumed (issue #209 — the sharded vlen-bytes layout)
+------------------------------------------------------------------
+A ragged field is ONE ``variable_length_bytes`` array on the cell grid::
 
-    {field}/{parent_morton}/values
-    {field}/{parent_morton}/offsets
-    {field}/{parent_morton}/cell_ids
+    {group}/{field}            <- vlen array; cell i holds the raw little-endian
+                                  bytes of its (n, *inner_shape) payload
+    {group}/{field}_locations  <- located fields only (issue #87): the uint64
+                                  per-row location words, row-aligned
+    {group}/morton             <- per-cell uint64 morton coordinate (zagg's
+                                  standard HEALPix coordinate array)
 
-``cell_ids[k]`` is a cell's position in the chunk's row-major ``(64, 64)``
-children block, and ``values[offsets[k]:offsets[k+1]]`` is that cell's
-``(k_centroids, 2)`` ``(mean, weight)`` digest.  The subgroup name is the
-chunk's morton index — its **decimal morton string** since issue #199 (D1 in
-``docs/design/sparse_coverage.md``) — recovered directly from the store (issue
-#79 design decision (3)); when a sibling ``{field}/morton`` ``uint64``
-coordinate array is present it is used in preference, mapping chunk order →
-morton id.
+The element interpretation is self-describing via the array attrs
+(``grids.base.RAGGED_ELEMENT_ATTR``)::
+
+    attrs["ragged"] = {"element": {"dtype": "float32", "shape": [-1, 2]},
+                       "locations": "<sibling name>"}   # located fields only
+
+so the readers decode what the writer declared rather than hardcoding a dtype,
+and bind the location channel by metadata, not naming convention. A store
+without these attrs is not a zagg ragged vlen array (pre-issue-209 CSR stores
+are a hard break) and raises a pointed error.
+
+The read plan honors the layout the writer chose: a whole-store sweep LISTs the
+array's stored chunk objects (one object per shard under the ShardingCodec, or
+one per inner chunk on the unsharded flat layout — both self-describing in the
+array metadata, so one code path reads either), then decodes per read chunk.
+Each read chunk is a square ``(side, side)`` block of cells (row-major
+``cell_id`` within the chunk, ``side = isqrt(cells_per_chunk)`` — 64 for the
+production ``chunk_inner`` configs); its coverage-cell morton id is derived
+from the sibling ``morton`` coordinate. Random access to one cell
+(:func:`read_cell`) indexes the vlen array directly — 2 ranged GETs on a
+sharded store (index suffix + one inner chunk), never the whole shard.
+
+**Hive products are read one leaf at a time**: a leaf zarr (issue #199) is
+exactly this layout scoped to one shard — the same ``{group}`` path, the
+``morton`` sibling, the versioned ragged attrs, and the whole-leaf
+ShardingCodec (one stored span) — so open the leaf store
+(``hive.shard_leaf_path``) and pass the same ``field`` path. The readers are
+store-scoped and never traverse the hive digit tree (leaf discovery is the
+walker's/coverage MOC's job, issue #200).
 
 The reader (generator)
 ----------------------
-:func:`read_tensors` opens the store and yields ``(tensor, morton_index)`` one
-chunk at a time.  Per chunk it derives a tail-trimmed z-range from the cells'
-``bottom``/``top`` quantiles, anchors a fixed ``n_bins * resolution`` window at
-the floor of that range, and rasterizes each cell's digest into per-bin counts
-via :func:`zagg.stats.tdigest.cdf_from_tdigest`.
+:func:`read_tensors` yields ``(tensor, morton_index)`` one chunk at a time.
+Per chunk it derives a tail-trimmed z-range from the cells' ``bottom``/``top``
+quantiles, anchors a fixed ``n_bins * resolution`` window at the floor of that
+range, and rasterizes each cell's digest into per-bin counts via
+:func:`zagg.stats.tdigest.cdf_from_tdigest`.
 """
 
 from __future__ import annotations
@@ -44,8 +65,7 @@ import numpy as np
 import zarr
 from zarr.abc.store import Store
 
-from zagg.csr import iter_csr_cells, read_csr
-from zagg.grids.morton import morton_word
+from zagg.grids.base import RAGGED_ELEMENT_ATTR, RAGGED_SPEC
 from zagg.stats.tdigest import cdf_from_tdigest, quantile_from_tdigest
 
 __all__ = [
@@ -54,11 +74,8 @@ __all__ = [
     "read_tensors",
     "read_raw_values",
     "read_locations",
+    "read_cell",
 ]
-
-# Coverage chunk is a 64×64 block of child cells (issue #79).
-_CHUNK_SIDE = 64
-_CHUNK_CELLS = _CHUNK_SIDE * _CHUNK_SIDE
 
 FitMode = Literal["raise", "degrade_resolution", "collapse_bins"]
 TensorDtype = Literal["uint16", "uint32", "float32"]
@@ -212,86 +229,163 @@ def chunk_z_range(
     raise ValueError(f"unknown fit mode {fit!r}")
 
 
-def _is_decimal_shard_name(name: str) -> bool:
-    """Whether a CSR subgroup name fits the decimal morton *shard-id* grammar.
+# --------------------------------------------------------------------------- #
+# vlen-bytes store access (issue #209)
+# --------------------------------------------------------------------------- #
 
-    Grammar: optional sign, base digit ``1..6``, then one ``1..4`` digit per
-    order — with at least ONE order digit. zagg shard orders are >= 1, so a
-    real shard id always has >= 2 digits; that floor is what disambiguates the
-    lone digits ``"1".."6"``, which the raw grammar would accept as order-0 ids
-    but which in practice are small block-index keys (review finding, PR #205).
+
+def _open_ragged(store: Store, field: str, zarr_format) -> tuple:
+    """Open a ragged vlen array; return ``(arr, elem_dtype, elem_shape, meta)``.
+
+    ``meta`` is the array's :data:`~zagg.grids.base.RAGGED_ELEMENT_ATTR` attrs
+    payload — the element interpretation the WRITER declared, which is what the
+    readers decode by (never a hardcoded dtype). Raises a pointed error when
+    the attrs are missing/malformed: silently guessing an element layout would
+    misinterpret every payload (pre-issue-209 CSR stores are a hard break).
     """
-    body = name[1:] if name.startswith("-") else name
-    return len(body) >= 2 and body[:1] in "123456" and all(d in "1234" for d in body[1:])
-
-
-def _subgroup_words(shard_keys: list[str]) -> dict[str, int]:
-    """Parse CSR subgroup names to their numeric keys (issue #199).
-
-    Shard-keyed subgroups are named by the decimal morton string (D1), so the
-    numeric key is the parsed packed word; block-index-keyed subgroups (the K>1
-    layout) keep plain non-negative ints. The flavor is decided per store:
-
-    - every name fits the shard-id grammar (:func:`_is_decimal_shard_name`)
-      -> decimal morton store; keys are the parsed packed words;
-    - otherwise -> block-keyed store; keys are ``int(name)`` — and a leading
-      ``-`` in this branch raises, because a signed name is provably NOT a
-      block index (block keys are non-negative flattened indices): a mixed
-      store (e.g. pre-#199 debris alongside decimal-named subgroups) must fail
-      loudly rather than silently mis-key every shard.
-    """
-    if shard_keys and all(_is_decimal_shard_name(k) for k in shard_keys):
-        return {k: morton_word(k) for k in shard_keys}
-    signed = [k for k in shard_keys if k.startswith("-")]
-    if signed:
+    arr = zarr.open_array(store, path=field, mode="r", zarr_format=zarr_format)
+    raw_meta = arr.attrs.get(RAGGED_ELEMENT_ATTR)
+    meta: dict = dict(raw_meta) if isinstance(raw_meta, dict) else {}
+    element = meta.get("element")
+    if not isinstance(element, dict) or "dtype" not in element or "shape" not in element:
         raise ValueError(
-            f"CSR subgroup names mix decimal morton ids with non-id names "
-            f"(signed name(s) {signed[:4]} cannot be block-index keys); the "
-            f"store layout is ambiguous — likely pre-issue-199 debris next to "
-            f"decimal-named subgroups. Rewrite the store."
+            f"{field!r} carries no ragged element declaration "
+            f'(attrs["{RAGGED_ELEMENT_ATTR}"]["element"]); it is not a zagg ragged '
+            f"vlen array (issue #209). Pre-issue-209 CSR stores are not readable "
+            f"— rewrite the store."
         )
-    return {k: int(k) for k in shard_keys}
-
-
-def _resolve_chunk_morton(
-    store: Store, field: str, shard_keys: list[str], zarr_format: Literal[2, 3]
-) -> dict[str, int]:
-    """Map each shard subgroup name → its morton id.
-
-    Prefers a sibling ``{field}/morton`` ``uint64`` coordinate array (chunk
-    order → morton id); falls back to parsing the subgroup name as the parent
-    morton id (the shard key is the parent morton — see :func:`process_shard`),
-    a decimal morton string since issue #199.
-
-    The coordinate array is aligned against the subgroup names sorted
-    **numerically** by parsed key (the canonical ascending-morton chunk order),
-    not lexicographically — string sorting would mis-align names of differing
-    digit counts (e.g. ``"1000"`` before ``"99"``).
-    """
-    words = _subgroup_words(shard_keys)
+    # Version gate (the coverage-envelope discipline): an unknown/future spec
+    # must fail loudly, never half-parse. This attrs seam is the INTERIM
+    # contract the issue #210 typed vlen-array dtype migration supersedes.
+    if meta.get("spec") != RAGGED_SPEC:
+        raise ValueError(
+            f"{field!r} declares ragged spec {meta.get('spec')!r}; this reader "
+            f"understands {RAGGED_SPEC!r} only — a newer writer's layout must be "
+            f"adopted deliberately, not half-parsed"
+        )
+    if arr.ndim != 1:
+        raise ValueError(
+            f"{field!r} has {arr.ndim} dimensions; the t-digest tensor readers "
+            f"consume HEALPix products (1-D cells axis)"
+        )
     try:
-        arr = zarr.open_array(store, path=f"{field}/morton", mode="r", zarr_format=zarr_format)
-        morton = np.asarray(arr[...])
-    except (FileNotFoundError, KeyError, ValueError):
-        return words
-    if len(morton) != len(shard_keys):
-        # Coordinate present but not 1:1 with subgroups — fall back to the names.
-        return words
-    return {k: int(m) for k, m in zip(sorted(shard_keys, key=words.__getitem__), morton)}
+        dtype = np.dtype(str(element["dtype"])).newbyteorder("<")
+    except TypeError as e:
+        raise ValueError(
+            f"{field!r} declares an unreadable element dtype "
+            f'{element["dtype"]!r} in attrs["{RAGGED_ELEMENT_ATTR}"]["element"]'
+        ) from e
+    shape = tuple(int(s) for s in element["shape"])
+    return arr, dtype, shape, meta
 
 
-def _shard_groups(
-    store: Store, field: str, zarr_format: Literal[2, 3]
-) -> tuple[list[str], dict[str, int]]:
-    """Enumerate a field's per-shard CSR subgroups and their morton ids.
+def _decode_cell(raw, dtype: np.dtype, shape: tuple) -> np.ndarray:
+    """One cell's payload from its raw vlen bytes, per the declared element."""
+    return np.frombuffer(bytes(raw), dtype=dtype).reshape(shape)
 
-    The shared reader preamble: subgroup names under ``field`` (the ``morton``
-    coordinate array is a sibling, not a shard) plus the name → morton map from
-    :func:`_resolve_chunk_morton`.
+
+def _stored_chunk_spans(arr) -> list[tuple[int, int]]:
+    """Cell spans ``(start, stop)`` of the array's STORED objects, ascending.
+
+    The whole-store read plan: one LIST of the array's ``c/<ordinal>`` data
+    keys instead of probing every chunk of a mostly-fill array. Under the
+    ShardingCodec an object spans a whole shard (``arr.shards``); on the
+    unsharded flat layout it is one read chunk — both derive from the array's
+    own metadata, so the sharded and per-inner-chunk layouts share this path.
+    ``zarr.core.sync.sync`` runs the store's async listing on zarr's own event
+    loop (zarr 3 exposes no public sync listing).
     """
-    group = zarr.open_group(store, path=field, mode="r", zarr_format=zarr_format)
-    shard_keys = sorted(k for k in group.group_keys() if k != "morton")
-    return shard_keys, _resolve_chunk_morton(store, field, shard_keys, zarr_format)
+    from zarr.core.sync import sync
+
+    async def _collect(gen):
+        return [key async for key in gen]
+
+    span = int((arr.shards or arr.chunks)[0])
+    prefix = f"{arr.path}/c/" if arr.path else "c/"
+    keys = sync(_collect(arr.store_path.store.list_prefix(prefix)))
+    ordinals = sorted(int(k.rsplit("/", 1)[-1]) for k in keys)
+    return [(o * span, min((o + 1) * span, int(arr.shape[0]))) for o in ordinals]
+
+
+def _iter_populated_chunks(arr) -> Iterator[tuple[int, list]]:
+    """Yield ``(chunk_start, [(cell_pos, raw_bytes), ...])`` per populated chunk.
+
+    Restricted to the stored objects (:func:`_stored_chunk_spans`), each read
+    in ONE slice: slicing per inner chunk would re-fetch a sharded object's
+    index suffix on every ``__getitem__`` (~K redundant GETs per shard at the
+    production K=256 — review, PR #211), while the full-span slice fetches
+    the stored object ONCE (zarr reads a whole outer chunk in a single GET
+    and splits it locally). The held cost is one span's decoded payload —
+    ~141 MB at the o8 t-digest scale, the same bound the hive write side
+    documents and accepts (``process_and_write_hive``), and this is the
+    client-side bulk reader. Chunks whose cells are all absent (the ``b""``
+    fill) are skipped; ``cell_pos`` is the cell's row-major position within
+    the chunk — the same index the writer placed it at.
+    """
+    cells_per_chunk = int(arr.chunks[0])
+    for span_start, span_stop in _stored_chunk_spans(arr):
+        span = arr[span_start:span_stop]
+        for offset in range(0, span_stop - span_start, cells_per_chunk):
+            block = span[offset : offset + cells_per_chunk]
+            populated = [(pos, block[pos]) for pos in range(len(block)) if len(block[pos])]
+            if populated:
+                yield span_start + offset, populated
+
+
+def _open_morton(store: Store, field: str, zarr_format):
+    """The sibling per-cell ``morton`` coordinate array (chunk identity source)."""
+    parent, _, _name = field.rpartition("/")
+    path = f"{parent}/morton" if parent else "morton"
+    try:
+        return zarr.open_array(store, path=path, mode="r", zarr_format=zarr_format)
+    except (FileNotFoundError, KeyError) as e:
+        raise ValueError(
+            f"{field!r} has no sibling 'morton' coordinate array at {path!r}; the "
+            f"vlen readers derive each chunk's coverage-cell id from the per-cell "
+            f"morton coordinate (issue #209)"
+        ) from e
+
+
+def _chunk_word(words: np.ndarray, field: str, start: int) -> int:
+    """A read chunk's coverage-cell morton id from its cells' morton words.
+
+    ``words`` are the chunk's per-cell morton coordinates (packed uint64 area
+    words at the cell order; ``0`` is the unwritten fill). The chunk id is any
+    written cell's word coarsened to the chunk order — ``cell_order -
+    log4(cells_per_chunk)`` — the same parent cell the CSR layout named its
+    subgroups by.
+    """
+    from mortie import clip2order
+
+    from zagg.grids.morton import morton_decimal
+
+    written = words[words != 0]
+    if written.size == 0:
+        raise ValueError(
+            f"chunk at cell {start} of {field!r} has ragged payloads but no written "
+            f"'morton' coordinate — the dense coordinate write did not cover it"
+        )
+    decimal = morton_decimal(int(written[0]))
+    cell_order = len(decimal) - (2 if decimal.startswith("-") else 1)
+    depth = (int(len(words)).bit_length() - 1) // 2  # log4(cells_per_chunk)
+    return int(clip2order(cell_order - depth, written[:1])[0])
+
+
+def _tensor_side(arr, field: str) -> int:
+    """Row-major square side of one read chunk (64 for the production configs)."""
+    cells_per_chunk = int(arr.chunks[0])
+    side = math.isqrt(cells_per_chunk)
+    if side * side != cells_per_chunk:
+        raise ValueError(
+            f"{field!r} read chunk holds {cells_per_chunk} cells — not a square "
+            f"block, so it cannot rasterize to a (side, side, n_bins) tensor"
+        )
+    return side
+
+
+# --------------------------------------------------------------------------- #
+# public readers
+# --------------------------------------------------------------------------- #
 
 
 def read_tensors(
@@ -308,18 +402,20 @@ def read_tensors(
 ) -> Iterator[tuple[np.ndarray, int]]:
     """Yield ``(tensor, morton_index)`` per coverage chunk of a t-digest field.
 
-    Opens the CSR ragged store for ``field`` and iterates one Zarr chunk (one
-    64×64 parent block) at a time.  For each chunk it trims the per-cell tails,
-    derives a fixed z-window (see :func:`chunk_z_range`), rasterizes every
-    populated cell's digest into ``n_bins`` counts (see :func:`rasterize_cell`),
-    and emits the ``(64, 64, n_bins)`` tensor with the chunk's morton id.
+    Sweeps the field's vlen array one read chunk (one square cell block) at a
+    time, visiting only the STORED objects. For each populated chunk it trims
+    the per-cell tails, derives a fixed z-window (see :func:`chunk_z_range`),
+    rasterizes every populated cell's digest into ``n_bins`` counts (see
+    :func:`rasterize_cell`), and emits the ``(side, side, n_bins)`` tensor with
+    the chunk's coverage-cell morton id (``side`` is 64 for the production
+    ``chunk_inner`` configs).
 
     Parameters
     ----------
     store : Store
-        Zarr store holding the per-shard CSR groups under ``field``.
+        Zarr store holding the ragged vlen array (issue #209 layout).
     field : str
-        Field prefix (e.g. ``"h_tdigest"``).
+        Array path (e.g. ``"19/h_tdigest"``).
     n_bins : int, optional
         Number of z-bins (default 128).
     resolution : float, optional
@@ -341,27 +437,29 @@ def read_tensors(
     Yields
     ------
     (tensor, morton_index) : (ndarray, int)
-        ``tensor`` has shape ``(64, 64, n_bins_out)`` and the requested dtype;
-        ``morton_index`` is the chunk's coverage-cell morton id.
+        ``tensor`` has shape ``(side, side, n_bins_out)`` and the requested
+        dtype; ``morton_index`` is the chunk's coverage-cell morton id.
 
     Raises
     ------
     ValueError
-        On an unknown ``dtype``/``fit``, or (with ``fit="raise"``) a chunk whose
-        trimmed range overflows the fixed window.
+        On an unknown ``dtype``/``fit``, a store missing the ragged element
+        attrs or the ``morton`` sibling, or (with ``fit="raise"``) a chunk
+        whose trimmed range overflows the fixed window.
     """
     if dtype not in _TENSOR_DTYPES:
         raise ValueError(f"unknown dtype {dtype!r}; expected one of {sorted(_TENSOR_DTYPES)}")
     out_dtype = _TENSOR_DTYPES[dtype]
     is_float = np.issubdtype(out_dtype, np.floating)
 
-    shard_keys, morton_of = _shard_groups(store, field, zarr_format)
+    arr, elem_dtype, elem_shape, _meta = _open_ragged(store, field, zarr_format)
+    morton = _open_morton(store, field, zarr_format)
+    side = _tensor_side(arr, field)
 
-    for key in shard_keys:
-        cells = iter_csr_cells(read_csr(store, f"{field}/{key}", zarr_format=zarr_format))
-        digests = [payload for _, payload in cells]
+    for start, populated in _iter_populated_chunks(arr):
+        cells = [(pos, _decode_cell(raw, elem_dtype, elem_shape)) for pos, raw in populated]
         z_lo, n_bins_c, resolution_c = chunk_z_range(
-            digests,
+            [digest for _pos, digest in cells],
             n_bins=n_bins,
             resolution=resolution,
             bottom=bottom,
@@ -369,19 +467,15 @@ def read_tensors(
             fit=fit,
         )
 
-        tensor = np.zeros((_CHUNK_SIDE, _CHUNK_SIDE, n_bins_c), dtype=out_dtype)
+        tensor = np.zeros((side, side, n_bins_c), dtype=out_dtype)
         for cell_id, digest in cells:
-            if not (0 <= cell_id < _CHUNK_CELLS):
-                raise ValueError(
-                    f"cell_id {cell_id} out of range for a {_CHUNK_SIDE}×{_CHUNK_SIDE} chunk"
-                )
             counts = rasterize_cell(digest, z_lo, resolution_c, n_bins_c)
             if not is_float:
                 counts = np.rint(counts)
-            row, col = divmod(cell_id, _CHUNK_SIDE)
+            row, col = divmod(cell_id, side)
             tensor[row, col, :] = counts.astype(out_dtype)
 
-        yield tensor, morton_of[key]
+        yield tensor, _chunk_word(morton[start : start + side * side], field, start)
 
 
 def read_raw_values(
@@ -401,9 +495,9 @@ def read_raw_values(
     Parameters
     ----------
     store : Store
-        Zarr store holding the per-shard CSR groups under ``field``.
+        Zarr store holding the ragged vlen array (issue #209 layout).
     field : str
-        Field prefix.
+        Array path.
     zarr_format : int, optional
         Zarr format version (default 3).
 
@@ -411,7 +505,8 @@ def read_raw_values(
     ------
     (morton_index, cell_id, values) : (int, int, ndarray)
         ``values`` is the cell's recovered 1-D sample vector (sorted ascending,
-        as the digest stores centroids by mean).
+        as the digest stores centroids by mean); ``cell_id`` its row-major
+        position within the chunk.
 
     Raises
     ------
@@ -419,22 +514,21 @@ def read_raw_values(
         If any cell's digest carries a merged centroid (weight > 1), so the raw
         values cannot be recovered without loss.
     """
-    shard_keys, morton_of = _shard_groups(store, field, zarr_format)
+    arr, elem_dtype, elem_shape, _meta = _open_ragged(store, field, zarr_format)
+    morton = _open_morton(store, field, zarr_format)
+    cells_per_chunk = int(arr.chunks[0])
 
-    for key in shard_keys:
-        morton = morton_of[key]
-        for cell_id, digest in iter_csr_cells(
-            read_csr(store, f"{field}/{key}", zarr_format=zarr_format)
-        ):
-            if len(digest) == 0:
-                continue
+    for start, populated in _iter_populated_chunks(arr):
+        word = _chunk_word(morton[start : start + cells_per_chunk], field, start)
+        for cell_id, raw in populated:
+            digest = _decode_cell(raw, elem_dtype, elem_shape)
             weights = np.asarray(digest[:, 1], dtype=np.float64)
             if np.any(weights > 1.0):
                 raise ValueError(
-                    f"cell {cell_id} (chunk {morton}) has merged centroids "
+                    f"cell {cell_id} (chunk {word}) has merged centroids "
                     "(weight > 1); raw values are not losslessly recoverable"
                 )
-            yield int(morton), int(cell_id), np.asarray(digest[:, 0], dtype=np.float64)
+            yield word, int(cell_id), np.asarray(digest[:, 0], dtype=np.float64)
 
 
 def read_locations(
@@ -446,21 +540,22 @@ def read_locations(
     """Yield ``(morton_index, cell_id, locations)`` per populated cell.
 
     The location-channel reader (issue #87): a located ragged field stores a
-    per-centroid ``uint64`` morton location vector in a ``locations`` array
-    sharing the CSR ``offsets``/``cell_ids`` with the field's ``values``, so
-    the k-th populated cell's locations are ``locations[offsets[k]:offsets[k+1]]``
-    — one word per centroid, each the deepest morton cell enclosing that
-    centroid's member observations (an exact order-29 point word for a 1-obs
-    centroid).  Decode or coarsen the words with mortie (``mort2healpix``,
-    ``clip2order``, ``common_ancestor``); geometric queries compose directly on
-    the packed words.
+    per-centroid ``uint64`` morton location vector in a sibling vlen array,
+    row-aligned with the digest — one word per centroid, each the deepest
+    morton cell enclosing that centroid's member observations (an exact
+    order-29 point word for a 1-obs centroid). The sibling is bound by the
+    payload array's attrs declaration (``attrs["ragged"]["locations"]`` —
+    issue #209), never by reconstructing the naming convention. Decode or
+    coarsen the words with mortie (``mort2healpix``, ``clip2order``,
+    ``common_ancestor``); geometric queries compose directly on the packed
+    words.
 
     Parameters
     ----------
     store : Store
-        Zarr store holding the per-shard CSR groups under ``field``.
+        Zarr store holding the ragged vlen arrays (issue #209 layout).
     field : str
-        Field prefix.
+        The PAYLOAD array's path (not the sibling's).
     zarr_format : int, optional
         Zarr format version (default 3).
 
@@ -474,33 +569,56 @@ def read_locations(
     Raises
     ------
     ValueError
-        If the field was not written with a location channel.
+        If the field declares no locations channel (it was not written as a
+        located ragged field).
     """
-    shard_keys, morton_of = _shard_groups(store, field, zarr_format)
+    _arr, _dt, _sh, meta = _open_ragged(store, field, zarr_format)
+    sibling = meta.get("locations")
+    if not sibling:
+        raise ValueError(
+            f"{field!r} declares no locations channel "
+            f'(attrs["{RAGGED_ELEMENT_ATTR}"]["locations"]); it was not written as '
+            f"a located ragged field (declare 'location:' on the field — issue #87)"
+        )
+    parent, _, _name = field.rpartition("/")
+    loc_field = f"{parent}/{sibling}" if parent else str(sibling)
+    # Sweep the SIBLING only — skipping the payload array halves the bytes
+    # read for a locations-only pass (the digest payload is not consumed here).
+    loc_arr, loc_dtype, loc_shape, _loc_meta = _open_ragged(store, loc_field, zarr_format)
+    morton = _open_morton(store, field, zarr_format)
+    cells_per_chunk = int(loc_arr.chunks[0])
 
-    for key in shard_keys:
-        # Open only the three arrays this reader needs — skipping ``values``
-        # halves the bytes read for a locations-only sweep (the digest payload
-        # is the field's largest array and is not consumed here).
-        prefix = f"{field}/{key}"
-        try:
-            locations = np.asarray(
-                zarr.open_array(
-                    store, path=f"{prefix}/locations", mode="r", zarr_format=zarr_format
-                )[...]
-            )
-        except (FileNotFoundError, KeyError) as e:
-            raise ValueError(
-                f"{prefix!r} has no locations array; it was not written as a "
-                f"located ragged field (declare 'location:' on the field — issue #87)"
-            ) from e
-        offsets = np.asarray(
-            zarr.open_array(store, path=f"{prefix}/offsets", mode="r", zarr_format=zarr_format)[...]
+    for start, populated in _iter_populated_chunks(loc_arr):
+        word = _chunk_word(morton[start : start + cells_per_chunk], loc_field, start)
+        for cell_id, raw in populated:
+            yield word, int(cell_id), _decode_cell(raw, loc_dtype, loc_shape)
+
+
+def read_cell(
+    store: Store,
+    field: str,
+    cell: int,
+    *,
+    zarr_format: Literal[2, 3] = 3,
+) -> np.ndarray:
+    """Random-access ONE cell's ragged payload, decoded per the element attrs.
+
+    The issue #209 single-cell path: indexing the vlen array reads exactly two
+    ranged GETs on a sharded store — the shard-index suffix, then the one inner
+    chunk holding the cell — never the whole shard object. ``cell`` is the
+    cell's global position on the array's cells axis (no negative-index wrap).
+    An absent/empty cell returns the zero-length ``(0, *inner_shape)`` array;
+    an out-of-range index raises ``IndexError`` naming the valid range (zarr
+    basic selection would silently clamp the slice — review, PR #211). Works
+    on any zagg ragged vlen array — a located field's ``{field}_locations``
+    sibling included (its elements decode as ``(n,)`` uint64 words).
+    """
+    arr, elem_dtype, elem_shape, _meta = _open_ragged(store, field, zarr_format)
+    cell = int(cell)
+    if not 0 <= cell < int(arr.shape[0]):
+        raise IndexError(
+            f"cell {cell} out of range for {field!r} with {int(arr.shape[0])} cells "
+            f"(valid: 0..{int(arr.shape[0]) - 1}; negative indices do not wrap)"
         )
-        cell_ids = np.asarray(
-            zarr.open_array(store, path=f"{prefix}/cell_ids", mode="r", zarr_format=zarr_format)[
-                ...
-            ]
-        )
-        for k, cid in enumerate(cell_ids):
-            yield int(morton_of[key]), int(cid), locations[offsets[k] : offsets[k + 1]]
+    (raw,) = arr[cell : cell + 1]
+    return _decode_cell(raw, elem_dtype, elem_shape)

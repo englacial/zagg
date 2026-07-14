@@ -23,12 +23,175 @@ shard list to translate.
 
 from __future__ import annotations
 
+import warnings
+from contextlib import contextmanager
 from typing import Any, Protocol, runtime_checkable
 
 import numpy as np
 from zarr.abc.store import Store
 
 ShardKey = Any  # int for HEALPix, tuple[int,int] for rectilinear, etc.
+
+#: Array-attrs key on a ragged vlen-bytes array (issue #209) recording the
+#: per-cell element interpretation. The value is
+#: ``{"element": {"dtype": "<numpy dtype>", "shape": [-1, *inner_shape]}}``:
+#: each populated cell's value is the raw little-endian bytes of an
+#: ``(n, *inner_shape)`` array (``-1`` marks the per-cell varying count), so a
+#: reader reconstructs cell ``i`` as
+#: ``np.frombuffer(a[i], dtype).reshape(-1, *inner_shape)``. A LOCATED field's
+#: payload array additionally carries ``{"locations": "<sibling array name>"}``
+#: (issue #87) — the reader binds the uint64 channel by that declaration, not
+#: by reconstructing the naming convention (review, PR #211). The block is
+#: versioned (``{"spec": RAGGED_SPEC}``, the coverage-envelope discipline) so
+#: readers fail loudly on a future revision instead of half-parsing it.
+RAGGED_ELEMENT_ATTR = "ragged"
+
+#: Convention version stamped into the :data:`RAGGED_ELEMENT_ATTR` block and
+#: strict-checked by the readers (``readers/tdigest_tensor._open_ragged``).
+#: This attrs seam is the INTERIM contract: the issue #210 typed
+#: ``vlen-array<T>`` dtype migration moves the element declaration into the
+#: zarr data type itself and supersedes (bumps or removes) this marker.
+RAGGED_SPEC = "zagg-ragged/1"
+
+#: zstd level of the ragged inner codec chain — 3, matching the coverage
+#: sidecar precedent (``zagg.hive._ZSTD_LEVEL``), fixed so identical payloads
+#: produce identical objects across workers.
+RAGGED_ZSTD_LEVEL = 3
+
+
+def ragged_locations_name(field_name: str) -> str:
+    """On-disk array name of a located ragged field's uint64 channel (issue #87).
+
+    Under the vlen-bytes layout (issue #209) the location words are a SIBLING
+    vlen array (``{field}_locations``) row-aligned with the digest payload —
+    the CSR layout's fourth in-group array cannot nest under what is now an
+    array node.
+    """
+    return f"{field_name}_locations"
+
+
+@contextmanager
+def vlen_dtype_warning_suppressed():
+    """Suppress zarr's vlen-bytes dtype-naming warning at array CREATION only.
+
+    zarr-python names the dtype ``variable_length_bytes`` in metadata while
+    the v3 registry name is ``bytes`` (zarr-python#3517, accepted both ways on
+    read), so creating a ragged vlen array emits an
+    ``UnstableSpecificationWarning`` about that naming. Scoped to the exact
+    message (the ``coverage.moc`` suppression precedent) so nothing else is
+    silenced; reads/writes/opens do not warn.
+    """
+    from zarr.errors import UnstableSpecificationWarning
+
+    with warnings.catch_warnings():
+        warnings.filterwarnings(
+            "ignore",
+            message=r"The data type \(VariableLengthBytes\(\)\)",
+            category=UnstableSpecificationWarning,
+        )
+        yield
+
+
+def ragged_array_spec(
+    *,
+    shape,
+    dims,
+    inner_chunk_shape,
+    shard_shape=None,
+    element_dtype,
+    inner_shape=(),
+    locations=None,
+):
+    """Vlen-bytes ``ArraySpec`` for a ``kind: ragged`` field (issue #209).
+
+    The sharded vlen-bytes layout: ONE zarr array with the
+    ``variable_length_bytes`` data type replaces the per-inner-chunk CSR
+    subgroups (~7 objects per populated inner chunk). Each populated cell
+    holds the raw little-endian bytes of its ``(n, *inner_shape)`` payload
+    (``n`` varies per cell); empty cells keep the ``b""`` fill, and an
+    all-empty inner chunk is omitted from the shard index — the same
+    sub-shard sparsity the dense arrays get. The element interpretation is
+    self-describing via :data:`RAGGED_ELEMENT_ATTR` in the array attrs.
+
+    Codec chain: ``[vlen-bytes, zstd(level=3)]``. The zstd deviates from the
+    dense arrays' bytes-only/uncompressed policy deliberately: a vlen payload
+    has no fixed-width raw layout to preserve, and level 3 matches the
+    coverage-sidecar precedent. With ``shard_shape`` the chain rides INSIDE a
+    ``ShardingCodec`` (outer chunk == ``shard_shape``), collapsing a shard's K
+    inner chunks to one object with an internal index — single-cell reads stay
+    2 GETs (index suffix + one ranged inner chunk). ``None`` keeps a regular
+    array chunked at ``inner_chunk_shape`` (one object per inner chunk — the
+    unsharded per-chunk-write layout).
+
+    Parameters
+    ----------
+    shape : tuple of int
+        Array shape — the grid's cell axes (or the chunk grid for a
+        ``resolution: chunk`` companion).
+    dims : tuple of str
+        Dimension names matching ``shape``.
+    inner_chunk_shape : tuple of int
+        Read-chunk shape (``grid.chunk_shape``; ``(1,)*ndim`` for a chunk
+        companion).
+    shard_shape : tuple of int, optional
+        ShardingCodec outer chunk. ``None`` (default) emits a regular array.
+    element_dtype : str
+        Numpy dtype of one payload element (recorded in attrs; the bytes are
+        little-endian).
+    inner_shape : tuple of int, optional
+        Per-element trailing shape (``sig["inner_shape"]``, e.g. ``(2,)`` for
+        a centroid pair). Empty for a flat per-cell vector.
+    locations : str, optional
+        Name of the located field's uint64 sibling array (issue #87),
+        declared in the payload array's attrs so a reader binds the channel
+        by METADATA, not by reconstructing the naming convention (review,
+        PR #211). ``None`` (unlocated) records nothing.
+
+    Returns
+    -------
+    ArraySpec
+    """
+    from pydantic_zarr.experimental.v3 import ArraySpec, NamedConfig
+
+    inner_codecs = [
+        {"name": "vlen-bytes", "configuration": {}},
+        {"name": "zstd", "configuration": {"level": RAGGED_ZSTD_LEVEL, "checksum": False}},
+    ]
+    if shard_shape is not None:
+        # Index codecs mirror ``sharded_array_spec`` (zarr's create_array default).
+        codecs: tuple = (
+            NamedConfig(
+                name="sharding_indexed",
+                configuration={
+                    "chunk_shape": [int(c) for c in inner_chunk_shape],
+                    "codecs": inner_codecs,
+                    "index_codecs": [
+                        {"name": "bytes", "configuration": {"endian": "little"}},
+                        {"name": "crc32c"},
+                    ],
+                    "index_location": "end",
+                },
+            ),
+        )
+        chunk_shape = tuple(int(c) for c in shard_shape)
+    else:
+        codecs = tuple(NamedConfig(**c) for c in inner_codecs)
+        chunk_shape = tuple(int(c) for c in inner_chunk_shape)
+    element = {"dtype": str(element_dtype), "shape": [-1, *(int(s) for s in inner_shape)]}
+    ragged_meta: dict = {"spec": RAGGED_SPEC, "element": element}
+    if locations is not None:
+        ragged_meta["locations"] = str(locations)
+    return ArraySpec(
+        attributes={RAGGED_ELEMENT_ATTR: ragged_meta},
+        shape=tuple(int(s) for s in shape),
+        dimension_names=tuple(dims),
+        data_type="variable_length_bytes",
+        chunk_grid=NamedConfig(name="regular", configuration={"chunk_shape": list(chunk_shape)}),
+        chunk_key_encoding=NamedConfig(name="default", configuration={"separator": "/"}),
+        codecs=codecs,
+        storage_transformers=(),
+        fill_value="",
+    )
 
 
 def vector_array_spec(base, sig, *, base_dims, base_chunk_shape):
@@ -261,8 +424,8 @@ class OutputGrid(Protocol):
     def shard_label(self, shard_key: ShardKey) -> str:
         """External string form of a shard key (issue #199).
 
-        Used wherever a shard id surfaces outside the process — CSR subgroup
-        names, async ``.status`` object keys, log lines. HEALPix renders the
+        Used wherever a shard id surfaces outside the process — hive leaf
+        ids, async ``.status`` object keys, log lines. HEALPix renders the
         packed word as its decimal morton string (D1 in
         ``docs/design/sparse_coverage.md``); rectilinear keeps the packed tile
         int's decimal digits.
@@ -327,10 +490,16 @@ def shard_label(grid, shard_key) -> str:
 
 __all__ = [
     "OutputGrid",
+    "RAGGED_ELEMENT_ATTR",
+    "RAGGED_SPEC",
+    "RAGGED_ZSTD_LEVEL",
     "ShardKey",
     "InconsistentShardError",
     "shard_label",
+    "ragged_array_spec",
+    "ragged_locations_name",
     "vector_array_spec",
+    "vlen_dtype_warning_suppressed",
     "chunk_array_spec",
     "sharded_array_spec",
 ]

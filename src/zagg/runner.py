@@ -35,6 +35,7 @@ from zagg.config import (
     PipelineConfig,
     get_child_order,
     get_consolidate_metadata,
+    get_coverage_moc,
     get_driver,
     get_handoff,
     get_layout,
@@ -63,7 +64,6 @@ from zagg.processing import (
     write_ragged_to_zarr,
     write_shard_to_zarr,
 )
-from zagg.processing.write import _block_index_key
 from zagg.store import open_object_store, open_store
 
 logger = logging.getLogger(__name__)
@@ -1098,29 +1098,22 @@ def _process_and_write(
     ``K = grid.chunks_per_shard`` finer Zarr chunks. ``process_shard`` reads the
     granules once and returns one ``(block_index, carrier, ragged)`` per chunk via
     ``chunk_results``; this writes each chunk's dense region (at its own
-    ``block_index``) plus its ragged (CSR) companion. At K==1 ``chunk_results`` has
-    exactly one entry whose ``block_index`` equals ``chunk_idx``, so the write is
-    byte-for-byte the single-chunk path. ``chunk_idx`` is retained for the K==1
-    callers/signature but the per-chunk block index from ``iter_chunks`` is used.
+    ``block_index``) plus its ragged vlen payloads (issue #209). At K==1
+    ``chunk_results`` has exactly one entry whose ``block_index`` equals
+    ``chunk_idx``, so the write is byte-for-byte the single-chunk path.
+    ``chunk_idx`` is retained for the K==1 callers/signature but the per-chunk
+    block index from ``iter_chunks`` is used.
     """
-    # K==1 vs K>1 is fixed by the grid, not the materialized list (issue #91): at
-    # K==1 the lone chunk IS the shard so its CSR subgroup is keyed by ``shard_key``;
-    # at K>1 each finer chunk is keyed by its own block index. Deriving it from the
-    # grid lets the non-sharded path stream (no materialized count needed).
-    single_chunk = int(getattr(grid, "chunks_per_shard", 1)) == 1
 
     def _write_chunk(block_index, carrier, ragged):
         # write_dataframe_to_zarr no-ops on an empty carrier (DataFrame or Arrow
         # table), so no carrier-specific emptiness check is needed here.
         write_dataframe_to_zarr(carrier, zarr_store, grid=grid, chunk_idx=block_index)
-        # Persist this chunk's ragged (CSR) fields — one CSR group per field per
-        # chunk (issue #48). No-ops when ``ragged`` is empty. At K==1 the CSR
-        # subgroup is named by the grid's shard label (the decimal morton string
-        # for HEALPix — issue #199); K>1 keeps the flattened block-index int.
-        ragged_key = (
-            shard_label(grid, shard_key) if single_chunk else _block_index_key(block_index, grid)
-        )
-        write_ragged_to_zarr(ragged, zarr_store, grid=grid, shard_key=ragged_key)
+        # Persist this chunk's ragged fields into their vlen-bytes arrays at the
+        # same block (issue #209). The array is regular-chunked on this
+        # unsharded path, so per-chunk writes stay independent. No-op when
+        # ``ragged`` is empty.
+        write_ragged_to_zarr(ragged, zarr_store, grid=grid, chunk_idx=block_index)
 
     # Sharded output (issue #108): the shard's K inner chunks bundle into one
     # ShardingCodec shard object — write the whole shard in one block selection per
@@ -1327,6 +1320,25 @@ def _run_local(
     if get_consolidate_metadata(config):
         consolidate_metadata(zarr_store, zarr_format=3)
     wall_time = time.time() - start_time
+
+    # End-of-run root coverage.moc (issue #200 phase 3; default-on for hive,
+    # O9). Built from THIS run's successful completions and GET-unioned with
+    # any existing root object; the local dispatcher can write the store
+    # directly. Fail-open: the root MOC is a regenerable cache (D9) — a
+    # failed write costs readers one walk, never a wrong answer.
+    if store_layout == "hive" and get_coverage_moc(config):
+        from zagg.hive import build_root_coverage, write_root_coverage
+
+        try:
+            # Inside the try so the fail-open claim survives result-envelope
+            # refactors (review finding, PR #208 round 3).
+            done = [m["shard_key"] for m in report.results if not m.get("error")]
+            if done:
+                envelope = build_root_coverage(done, int(grid.parent_order))
+                write_root_coverage(store_path, envelope, **store_kwargs)
+                logger.info(f"Wrote root coverage.moc ({len(envelope['ranges'])} ranges)")
+        except Exception as e:
+            logger.warning(f"root coverage.moc write failed (fail-open, D9): {e}")
 
     summary = {
         "total_cells": len(cells),
@@ -1660,6 +1672,61 @@ def _run_lambda(
     executor.finalize()
     finalize_s = time.time() - finalize_start
     wall_time = time.time() - start_time
+
+    # End-of-run root coverage.moc (issue #200 phase 3; default-on for hive,
+    # O9): the dispatcher cannot PUT to S3, so it builds + serializes the MOC
+    # and posts ONE fire-and-forget worker invoke that GET-unions-PUTs it.
+    # Transport rationale (espg-requested, plan question 3) — serialized
+    # ranges IN the event vs the completion list via the status channel:
+    #   - Ranges (chosen): the dispatcher already holds the completion list
+    #     in memory, so building the MOC costs milliseconds, and the payload
+    #     is bounded by construction — spatially coherent coverage collapses
+    #     to a few-KB range list, far under Lambda's 256 KB async-invoke cap,
+    #     which a raw ~50k-key completion list would break. One hop, and no
+    #     read-back race against status objects still landing from retried
+    #     stragglers.
+    #   - Completion list via .status/ (rejected): payload size would be
+    #     run-independent and the artifact replayable from durable state, but
+    #     it costs the worker a LIST + N GETs, races in-flight status writes,
+    #     and its replayability is already owned by the §7 sweep's
+    #     authoritative rebuild — the leaves are the durable truth (D9).
+    # Fail-open everywhere: a failed build/invoke logs and the run result is
+    # untouched (the root MOC is a regenerable cache).
+    if get_store_layout(config) == "hive" and get_coverage_moc(config):
+        try:
+            from zagg.hive import build_root_coverage
+
+            # Inside the try so the fail-open claim survives result-envelope
+            # refactors (review finding, PR #208 round 3).
+            done = [
+                r["shard_key"]
+                for r in report.results
+                if r.get("status_code") == 200 and not r.get("error")
+            ]
+            if done:
+                envelope = build_root_coverage(done, int(parent_order))
+                # An OLD deployment has no coverage mode: the event falls
+                # through to its process handler, which returns a LOGGED 400
+                # (missing shard_key/granule_urls...) — no writes, no result
+                # mirror, and no async redelivery (a returned 400 is a
+                # successful invocation to Lambda's Event retry machinery).
+                # Harmless under D9, but the CloudWatch line is an ERROR, not
+                # silence — mirroring the PR #205 deploy-ordering note.
+                logger.info(
+                    f"Dispatching root coverage.moc write ({len(envelope['ranges'])} "
+                    f"ranges, fire-and-forget) — requires a redeployed function; an "
+                    f"older deployment 400s mode=coverage in its process handler "
+                    f"(logged, no writes, no retry — harmless under D9)"
+                )
+                _invoke_lambda_coverage(
+                    state["lambda_client"],
+                    function_name,
+                    store_path,
+                    envelope,
+                    output_creds_event=output_creds_event,
+                )
+        except Exception as e:
+            logger.warning(f"root coverage.moc dispatch failed (fail-open, D9): {e}")
 
     # Cost estimate: arm64 pricing = $0.0000133334/GB-second. Compute gb_seconds
     # and cost *once* over the summed Lambda time (the report carries only the
@@ -2380,6 +2447,28 @@ def _invoke_lambda_finalize(lambda_client, function_name, store_path, output_cre
     result = json.loads(payload)
     if result.get("statusCode") != 200:
         raise RuntimeError(f"Lambda finalize error: {result.get('body')}")
+
+
+def _invoke_lambda_coverage(
+    lambda_client, function_name, store_path, envelope, output_creds_event=None
+):
+    """Fire-and-forget root ``coverage.moc`` write (issue #200 phase 3).
+
+    ``InvocationType="Event"``: ~10 ms of dispatcher wall clock, run-size
+    independent, nothing blocks on it and no response is read — failure is
+    harmless by design (the worker-side GET-union-PUT is
+    ``zagg.hive.write_root_coverage``; the root MOC is a regenerable cache,
+    D9). The envelope rides pre-serialized in the event — see the dispatch
+    site for the transport rationale vs the status channel.
+    """
+    event = {"mode": "coverage", "store_path": store_path, "coverage": envelope}
+    if output_creds_event is not None:
+        event["output_credentials"] = output_creds_event
+    lambda_client.invoke(
+        FunctionName=function_name,
+        InvocationType="Event",
+        Payload=json.dumps(event),
+    )
 
 
 def _invoke_lambda_cell(

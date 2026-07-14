@@ -7,36 +7,18 @@ Assembles the per-shard output carrier and writes it to the Zarr template
 stays acyclic.
 """
 
-import logging
-from concurrent.futures import ThreadPoolExecutor, as_completed
-
 import numpy as np
 import pandas as pd
 from zarr import config, open_array
 from zarr.abc.store import Store
 
-from zagg.concurrency import fd_safe_max_workers
 from zagg.config import (
     PipelineConfig,
     get_agg_fields,
     get_output_signature,
 )
-from zagg.csr import write_csr
+from zagg.grids.base import ragged_locations_name
 from zagg.grids.morton import is_morton_array, is_morton_arrow, morton_to_arrow, morton_words
-
-# The sharded path's K ragged (CSR) subgroup writes fan out over a bounded thread
-# pool (issue #142): each inner chunk emits an independent CSR group at a disjoint
-# prefix, so they are write-independent and latency-bound (~K×3 tiny objects), and
-# a serial loop dominated a t-digest shard's write time. 128 mirrors the dense
-# path's ``async.concurrency`` budget (issue #108).
-_RAGGED_WRITE_CONCURRENCY = 128
-
-# Cap on the per-failure roll call logged when sharded CSR writes fail
-# (issue #186): enough to show the race signature across subgroups without
-# flooding CloudWatch when many of the K writes fail at once.
-_RAGGED_FAILURE_LOG_CAP = 20
-
-logger = logging.getLogger(__name__)
 
 
 def _arrow_column(block: np.ndarray, sig: dict):
@@ -275,9 +257,12 @@ def write_shard_to_zarr(
     column (data vars + coords) is placed into the shard slab by the chunk's own
     region (``grid.shard_local_region(block_index, shard_key)``), reshaped to the
     inner chunk's cell shape (``grid.chunk_shape``) — grid-agnostic, so HEALPix
-    (1-D) and rectilinear (2-D) share one path. The ``resolution: chunk``
-    companions and ragged (CSR) fields are NOT sharded — they are written per inner
-    chunk via the existing seams, exactly as on the regular path.
+    (1-D) and rectilinear (2-D) share one path. Ragged fields ride the SAME
+    per-object slab pass (issue #209): their vlen-bytes array shares the dense
+    ShardingCodec geometry, so a shard's digests collapse to one object instead
+    of the old ~K×7 per-inner-chunk CSR objects. Only the ``resolution: chunk``
+    companions stay per inner chunk (their arrays are one block per chunk on the
+    coarse chunk grid, never sharded).
 
     Parameters
     ----------
@@ -327,28 +312,29 @@ def write_shard_to_zarr(
 
     # Group the dispatch shard's inner chunks by sharding object so each object is
     # accumulated and written independently; preserve encounter order for stable,
-    # deterministic writes. Companions + ragged stay per inner chunk (unsharded).
+    # deterministic writes. Companions stay per inner chunk (unsharded); ragged
+    # fields ride the SAME per-object slab pass as the dense arrays (issue #209 —
+    # their vlen-bytes array shares the dense ShardingCodec geometry), so the
+    # per-inner-chunk CSR fan-out (issues #142/#186) is gone.
     objects: dict = {}
-    ragged_writes: list = []
     for block_index, carrier, ragged in chunk_results:
-        if not _carrier_empty(carrier):
-            objects.setdefault(_object_block(block_index), []).append((block_index, carrier))
+        if not _carrier_empty(carrier) or ragged:
+            objects.setdefault(_object_block(block_index), []).append(
+                (block_index, carrier, ragged)
+            )
         # Companions for this inner chunk are not sharded: write them straight
-        # through (one block per chunk). Ragged (CSR) subgroups are collected and
-        # fanned out below (issue #142) -- they target disjoint prefixes, so the
-        # per-chunk serial loop needlessly dominated a t-digest shard's write time.
+        # through (one block per chunk) — a chunk-resolution ragged companion
+        # included (its vlen array is one block per chunk on the chunk grid).
         if chunk_res_fields:
             _write_companion_columns(carrier, store, grid, block_index, chunk_res_fields)
-        if ragged:
-            ragged_writes.append((ragged, _block_index_key(block_index, grid)))
-
-    _write_ragged_fanout(ragged_writes, store, grid=grid)
+            _write_ragged_companions(ragged, store, grid, block_index, chunk_res_fields)
 
     # One accumulate→write→free pass per sharding object: each holds at most one
     # object's slab resident at a time (the phase-8 memory bound).
     for obj_block, members in objects.items():
         slabs: dict = {}
-        for block_index, carrier in members:
+        ragged_slabs: dict = {}
+        for block_index, carrier, ragged in members:
             region = _local_region(block_index)
             for name, values in _iter_carrier_columns(carrier):
                 if name in chunk_res_fields:
@@ -365,6 +351,13 @@ def write_shard_to_zarr(
                     fill = array.metadata.fill_value
                     slabs[name] = np.full((*slab_shape, *trailing), fill, dtype=values.dtype)
                 slabs[name][region] = values.reshape((*inner_shape, *trailing))
+            # Cell-resolution ragged fields: encode this chunk's payloads into
+            # the object slab at the same region the dense columns use. Empty
+            # cells keep the b"" fill, so an all-empty inner chunk is omitted
+            # from the shard index (sub-shard sparsity, issue #209).
+            _accumulate_ragged_slabs(
+                ragged, ragged_slabs, region, grid, slab_shape, chunk_res_fields
+            )
 
         # One block selection per dense array == one shard object write.
         for name, slab in slabs.items():
@@ -390,79 +383,15 @@ def write_shard_to_zarr(
                             f"{trailing} (the payload dim must be one whole chunk)"
                         )
                 array.set_block_selection(block_idx, slab)
+
+        # ONE object write per ragged field too (issue #209): the vlen-bytes
+        # array shares the dense arrays' ShardingCodec geometry, so the whole
+        # slab lands at the same object block — the ShardingCodec emits a
+        # single object with its internal index in place of the old ~K×7
+        # per-inner-chunk CSR objects.
+        for name, slab in ragged_slabs.items():
+            _set_ragged_block(store, grid, name, tuple(obj_block), slab)
     return store
-
-
-def _write_ragged_fanout(ragged_writes: list, store: Store, *, grid) -> None:
-    """Write the sharded shard's K ragged (CSR) subgroups concurrently (issue #142).
-
-    On the sharded path :func:`write_shard_to_zarr` already holds all K inner-chunk
-    carriers resident (it bundles the dense side into one shard object), and each
-    inner chunk emits an independent CSR subgroup at a disjoint prefix
-    (``{group_path}/{field}/{block_key}/...``). Those writes are therefore
-    embarrassingly parallel and latency-bound (~K×3 tiny objects, tens of MB), so a
-    serial loop dominated a t-digest shard's write time. Fan them out over a bounded
-    ``ThreadPoolExecutor``; the on-disk layout is unchanged (still one CSR group per
-    inner chunk -- only the write scheduling differs), and concurrent writes to
-    disjoint keys of one store are already zagg's model (the dispatcher fans cells
-    over threads onto a shared store).
-
-    The bound is ``min(_RAGGED_WRITE_CONCURRENCY, len(writes), fd_safe_max_workers())``
-    so this per-worker inner fan-out respects the same open-file ceiling the Lambda
-    dispatcher guards (:func:`zagg.concurrency.fd_safe_max_workers`) -- each in-flight
-    write holds a store socket. A failure in any subgroup is surfaced (not swallowed):
-    the first exception is re-raised after the pool drains, tagged with how many of
-    the K writes failed.
-
-    (The non-sharded/streaming path deliberately stays serial: it writes-then-frees
-    each chunk to bound peak memory (issue #91), so it never holds the K carriers at
-    once to parallelize.)
-    """
-    if not ragged_writes:
-        return
-    workers = min(_RAGGED_WRITE_CONCURRENCY, len(ragged_writes), fd_safe_max_workers())
-    if workers <= 1:
-        for ragged, ragged_key in ragged_writes:
-            write_ragged_to_zarr(ragged, store, grid=grid, shard_key=ragged_key)
-        return
-
-    errors: list = []
-    with ThreadPoolExecutor(max_workers=workers) as pool:
-        futures = {
-            pool.submit(write_ragged_to_zarr, ragged, store, grid=grid, shard_key=ragged_key): (
-                ragged_key
-            )
-            for ragged, ragged_key in ragged_writes
-        }
-        for fut in as_completed(futures):
-            exc = fut.exception()
-            if exc is not None:
-                errors.append((futures[fut], exc))
-    if errors:
-        first_key, first_exc = errors[0]
-        # Observability (issue #186 ask 1): the chained cause never reaches
-        # the operator — the worker envelope and CloudWatch both record only
-        # this summary string — so log the first failure's full traceback
-        # here, and carry its type + message in the summary text too. A
-        # bounded one-line-per-failure roll call (after the header, so the
-        # indented lines read as its continuation) makes the race signature
-        # ACROSS subgroups visible (which keys, same or different errors).
-        logger.error(
-            f"ragged (CSR) subgroup write failed (shard_key {first_key}): "
-            f"{type(first_exc).__name__}: {first_exc}",
-            exc_info=first_exc,
-        )
-        if len(errors) > 1:
-            for key, exc in errors[:_RAGGED_FAILURE_LOG_CAP]:
-                logger.error(f"  ragged (CSR) subgroup {key}: {type(exc).__name__}: {exc}")
-            if len(errors) > _RAGGED_FAILURE_LOG_CAP:
-                n_more = len(errors) - _RAGGED_FAILURE_LOG_CAP
-                logger.error(f"  ... and {n_more} more subgroup write failure(s)")
-        raise RuntimeError(
-            f"ragged (CSR) write failed for {len(errors)} of {len(ragged_writes)} "
-            f"subgroup(s) on the sharded path (first failing shard_key {first_key}: "
-            f"{type(first_exc).__name__}: {first_exc})"
-        ) from first_exc
 
 
 def _write_companion_columns(carrier, store, grid, block_index, chunk_res_fields):
@@ -496,139 +425,245 @@ def write_ragged_to_zarr(
     store: Store,
     *,
     grid,
-    shard_key: int | str,
+    chunk_idx: tuple,
 ) -> Store:
-    """Write a shard's ``kind: ragged`` (CSR) fields to the Zarr store (issue #48).
+    """Write one chunk's ``kind: ragged`` fields to their vlen-bytes arrays (#209).
 
-    Mirrors the :func:`write_dataframe_to_zarr` seam for the dense path: the
-    worker collects the per-cell variable-length payloads (a ``kind: ragged``
-    field has no fixed per-cell width, so it cannot ride the dense block writer),
-    and this function persists them via :func:`zagg.csr.write_csr` — one CSR group
-    (``values`` / ``offsets`` / ``cell_ids``) per field per shard.
+    The sharded vlen-bytes layout (issue #209) replaces the per-inner-chunk CSR
+    subgroups: each ragged field is ONE ``variable_length_bytes`` array on the
+    cell grid (template: ``grids.base.ragged_array_spec``), and each populated
+    cell's value is the raw little-endian bytes of its ``(n, *inner_shape)``
+    payload — the interpretation recorded in the array's attrs
+    (``grids.base.RAGGED_ELEMENT_ATTR``). Empty cells keep the ``b""`` fill, so
+    a chunk with no ragged data leaves its inner chunk absent on disk.
 
-    Store layout (the contract the ``readers/tdigest_tensor.py`` reader consumes)::
-
-        {group_path}/{field}/{shard_key}/values
-        {group_path}/{field}/{shard_key}/offsets
-        {group_path}/{field}/{shard_key}/cell_ids
-
-    At **cell resolution** (default) ``cell_ids[k]`` is each populated cell's
-    position in the chunk's ``children`` block (the index collected by
-    ``process_shard``); the per-shard subgroup name is the ``shard_key`` label
-    (the coverage cell's **decimal morton string** for HEALPix — issue #199, D1
-    in ``docs/design/sparse_coverage.md``), recovered by the reader directly
-    from the store.
+    This is the per-chunk seam, mirroring :func:`write_dataframe_to_zarr`: it
+    writes the chunk's cells at storage block ``chunk_idx``. It is used on the
+    UNSHARDED per-chunk write paths (the runner / Lambda ``_write_chunk``
+    streaming callback), where the ragged array is regular-chunked — one object
+    per inner chunk, so per-chunk writes stay independent (no read-modify-write
+    of a shared shard object). The sharded flat path bundles all K chunks in
+    :func:`write_shard_to_zarr`; the hive leaf in
+    :func:`write_ragged_leaf_to_zarr` — one object per shard on both.
 
     At **chunk resolution** (``resolution: chunk``, issue #82) a ragged field
-    stores ONE variable-length payload per chunk, not per cell. The populated
-    cells are collapsed to that single chunk payload under the same chunk-uniform
-    contract as scalar/vector chunk companions (every populated cell must carry an
-    identical payload, else raise); it is written as a single-entry CSR with
-    ``cell_ids == [0]`` (the lone chunk), so the on-disk layout is the same three
-    arrays — a consumer reads the chunk payload as the only populated "cell".
+    stores ONE payload per chunk: the populated cells collapse under the same
+    chunk-uniform contract as scalar/vector companions, and the single payload's
+    bytes land at the chunk's block of the chunk-grid companion array.
 
     Parameters
     ----------
     ragged : dict
-        ``{field_name: (values_list, cell_ids)}`` as filled by ``process_shard``'s
-        ``ragged_out`` sink. Empty (or all-empty payloads) writes empty CSR arrays
-        (``write_csr`` skips empties), so a shard with no ragged data is a clean
-        no-op rather than a special case. A located field (issue #87) arrives as
-        ``(values_list, cell_ids, locations_list)`` and additionally writes a
-        ``{field}/{shard_key}/locations`` uint64 array sharing the offsets.
+        ``{field_name: (values_list, cell_ids)}`` as filled by ``process_shard``;
+        ``cell_ids`` are positions in THIS chunk's ``children`` block. A located
+        field (issue #87) arrives as ``(values_list, cell_ids, locations_list)``
+        and additionally writes the sibling ``{field}_locations`` uint64 vlen
+        array, row-aligned with the payload.
     store : Store
-        Zarr-compatible store.
+        Zarr store with the template (including the ragged arrays) present.
     grid : OutputGrid
-        Provides ``group_path`` for routing the write (and ``config`` for the
+        Provides ``group_path``/``chunk_shape`` (and ``config`` for the
         per-field dtype + resolution).
-    shard_key : int or str
-        CSR subgroup name, used verbatim: the grid's shard label at cell
-        resolution (``grid.shard_label`` — decimal morton string for HEALPix,
-        issue #199), or the flattened block-index int at K>1.
+    chunk_idx : tuple of int
+        The chunk's storage block index (same value handed to
+        :func:`write_dataframe_to_zarr` for the dense columns).
 
     Returns
     -------
     Store
-        The same store, with the ragged CSR arrays written.
+        The same store, with the chunk's ragged payloads written.
     """
     if not ragged:
         return store
-    agg_fields = get_agg_fields(grid.config) if getattr(grid, "config", None) else {}
     chunk_res_fields = _chunk_resolution_fields(getattr(grid, "config", None))
-    shard_key = str(shard_key)
-    for name, entry in ragged.items():
-        # Located fields (issue #87) deliver (values_list, cell_ids, locations_list);
-        # unlocated fields keep the 2-tuple.
-        if len(entry) == 3:
-            values_list, cell_ids, locations_list = entry
-        else:
-            values_list, cell_ids = entry
-            locations_list = None
-        sig = get_output_signature(agg_fields[name]) if name in agg_fields else {}
-        dtype = sig.get("dtype") or "float32"
-        if name in chunk_res_fields:
-            # resolution: chunk — collapse the populated cells to the single chunk
-            # payload (chunk-uniform, like scalar/vector companions) and store it as
-            # a one-entry CSR (the lone chunk at cell_ids == [0]).
-            # ``location`` + ``resolution: chunk`` is rejected at config validation,
-            # but a config built without validate_config (direct PipelineConfig /
-            # Lambda dict payload) could still deliver a located triple here — fail
-            # loudly rather than silently dropping the location channel (issue #87).
-            if locations_list is not None:
-                raise ValueError(
-                    f"ragged field {name!r} is resolution: chunk but carries a location "
-                    f"channel; located ragged fields are cell-resolution only"
-                )
-            chunk_payload = _chunk_uniform_ragged(name, values_list)
-            if chunk_payload is None:
-                continue  # whole chunk is fill — nothing to record
-            write_csr(
-                store,
-                f"{grid.group_path}/{name}/{shard_key}",
-                [chunk_payload],
-                [0],
-                dtype=dtype,
-            )
-            continue
-        write_csr(
-            store,
-            f"{grid.group_path}/{name}/{shard_key}",
-            values_list,
-            cell_ids,
-            dtype=dtype,
-            locations_list=locations_list,
-        )
+    chunk_idx = tuple(int(i) for i in chunk_idx)
+    inner_shape = tuple(int(s) for s in grid.chunk_shape)
+    _write_ragged_companions(ragged, store, grid, chunk_idx, chunk_res_fields)
+    slabs: dict = {}
+    _accumulate_ragged_slabs(
+        ragged, slabs, tuple(slice(0, s) for s in inner_shape), grid, inner_shape, chunk_res_fields
+    )
+    for name, slab in slabs.items():
+        _set_ragged_block(store, grid, name, chunk_idx, slab)
     return store
 
 
-def _block_index_key(block_index, grid) -> int:
-    """Flatten a chunk's block-index tuple to the CSR subgroup key (issue #48, K>1).
+def write_ragged_leaf_to_zarr(ragged_chunks: list, store: Store, *, grid) -> Store:
+    """Write a hive leaf's ragged fields in ONE array write each (issue #209).
 
-    1-D grids (the HEALPix companion grid, the typical case) yield a single-element
-    block index used directly; a multi-axis (rectilinear) block index is packed
-    row-major against the grid's ``chunk_grid_shape`` so each chunk maps to a
-    distinct CSR subgroup name. Deriving the per-axis strides from the chunk grid
-    (rather than a fixed shift) keeps the pack injective for any grid size.
+    The hive counterpart of the sharded path's slab pass: ``ragged_chunks`` is
+    ``[(local_block_index, ragged), ...]`` — one entry per streamed chunk, at
+    leaf-LOCAL blocks (``hive.leaf_block_index``). The leaf template shards a
+    ragged field's vlen array across the whole shard (``shard_spec``), so the K
+    chunks accumulate into one shard-wide object slab written in a single call
+    — the ShardingCodec emits ONE object per leaf in place of the per-chunk CSR
+    subgroups (~7 objects per populated inner chunk). A per-chunk write here
+    would read-modify-write that shared object K times, which is why the hive
+    write path collects the ragged payloads instead of streaming them — the
+    memory bound of that accumulation is quantified and accepted at the
+    collection site (``hive.process_and_write_hive``, ~200 MB peak at the o8
+    t-digest scale).
 
-    Shared by both the local runner and the Lambda handler (issue #82 phase 7) so
-    the K>1 ragged-write key is computed identically off-Lambda and on-Lambda.
+    ``resolution: chunk`` ragged companions are written per chunk block (their
+    array is one block per chunk, unsharded — same as the scalar/vector
+    companions).
     """
-    block = tuple(int(b) for b in block_index)
-    if len(block) == 1:
-        return block[0]
-    # Row-major flatten with each axis's true extent as the stride.
-    shape = tuple(int(s) for s in getattr(grid, "chunk_grid_shape", ()))
-    if len(shape) != len(block):
-        # Fall back to a generous fixed stride if the grid does not expose a
-        # matching chunk_grid_shape (keeps a unique-enough key without crashing).
-        key = 0
-        for b in block:
-            key = key * (1 << 32) + b
-        return key
-    key = 0
-    for b, extent in zip(block, shape):
-        key = key * extent + b
-    return key
+    if not any(ragged for _block, ragged in ragged_chunks):
+        return store
+    chunk_res_fields = _chunk_resolution_fields(getattr(grid, "config", None))
+    slab_shape = tuple(int(s) for s in grid.shard_slab_shape())
+    inner_shape = tuple(int(s) for s in grid.chunk_shape)
+    slabs: dict = {}
+    for block, ragged in ragged_chunks:
+        block = tuple(int(b) for b in block)
+        _write_ragged_companions(ragged, store, grid, block, chunk_res_fields)
+        region = tuple(slice(b * c, (b + 1) * c) for b, c in zip(block, inner_shape))
+        _accumulate_ragged_slabs(ragged, slabs, region, grid, slab_shape, chunk_res_fields)
+    for name, slab in slabs.items():
+        _set_ragged_block(store, grid, name, (0,) * len(slab_shape), slab)
+    return store
+
+
+def _ragged_entry(entry) -> tuple:
+    """Normalize a ragged sink entry to ``(values_list, cell_ids, locations_list)``.
+
+    Located fields (issue #87) deliver the 3-tuple; unlocated fields keep the
+    2-tuple contract (``locations_list`` is ``None``).
+    """
+    if len(entry) == 3:
+        return entry
+    values_list, cell_ids = entry
+    return values_list, cell_ids, None
+
+
+def _ragged_sig(name: str, grid) -> dict:
+    """Output signature of a ragged field, tolerant of config-less stub grids."""
+    agg_fields = get_agg_fields(grid.config) if getattr(grid, "config", None) else {}
+    if name in agg_fields:
+        return get_output_signature(agg_fields[name])
+    return {"kind": "ragged", "inner_shape": (), "dtype": None}
+
+
+def _ragged_payload_bytes(name: str, value, sig: dict) -> bytes:
+    """Raw little-endian bytes of one cell's ragged payload (the vlen wire value).
+
+    The payload must tile the field's declared ``inner_shape`` (the guard
+    ``write_csr`` enforced structurally); the byte order is pinned little-endian
+    so the stored value matches the ``RAGGED_ELEMENT_ATTR`` interpretation on
+    any producer.
+    """
+    dtype = np.dtype(sig.get("dtype") or "float32").newbyteorder("<")
+    arr = np.asarray(value, dtype=dtype)
+    inner = sig.get("inner_shape") or ()
+    width = int(np.prod(inner)) if inner else 1
+    if arr.size % width:
+        raise ValueError(
+            f"ragged field {name!r}: cell payload of {arr.size} elements does not "
+            f"tile inner_shape {tuple(inner)}"
+        )
+    return np.ascontiguousarray(arr).tobytes()
+
+
+def _accumulate_ragged_slabs(ragged, slabs, region, grid, slab_shape, chunk_res_fields) -> None:
+    """Encode one chunk's cell-resolution ragged payloads into the object slabs.
+
+    ``slabs`` maps array name → object slab of ``slab_shape`` (created lazily,
+    ``b""``-filled — the vlen fill, so untouched cells stay absent). The chunk's
+    cells land in ``slabs[...][region]`` at their ``cell_ids`` position within
+    the chunk (row-major over ``grid.chunk_shape``, grid-agnostic via
+    ``np.unravel_index``). A located field (issue #87) fills the sibling
+    ``{name}_locations`` slab row-aligned with the payload, with the same
+    per-cell length contract ``write_csr`` enforced.
+    """
+    inner_shape = tuple(int(s) for s in grid.chunk_shape)
+    for name, entry in (ragged or {}).items():
+        if name in chunk_res_fields:
+            continue  # chunk companion — written per chunk block
+        values_list, cell_ids, locations_list = _ragged_entry(entry)
+        if len(values_list) != len(cell_ids):
+            raise ValueError(
+                f"values_list (len {len(values_list)}) and cell_ids (len {len(cell_ids)}) "
+                "must have the same length"
+            )
+        sig = _ragged_sig(name, grid)
+        if name not in slabs:
+            slabs[name] = np.full(slab_shape, b"", dtype=object)
+        out = slabs[name][region]
+        loc_out = None
+        if locations_list is not None:
+            if len(locations_list) != len(values_list):
+                raise ValueError(
+                    f"locations_list (len {len(locations_list)}) and values_list "
+                    f"(len {len(values_list)}) must have the same length"
+                )
+            loc_name = ragged_locations_name(name)
+            if loc_name not in slabs:
+                slabs[loc_name] = np.full(slab_shape, b"", dtype=object)
+            loc_out = slabs[loc_name][region]
+        loc_sig = {"kind": "ragged", "inner_shape": (), "dtype": "uint64"}
+        width = int(np.prod(sig.get("inner_shape") or ()))  # prod(()) == 1
+        locs = locations_list if locations_list is not None else [None] * len(values_list)
+        for cid, value, loc in zip(cell_ids, values_list, locs):
+            payload = _ragged_payload_bytes(name, value, sig)
+            pos = np.unravel_index(int(cid), inner_shape)
+            if loc is not None and loc_out is not None:
+                n_rows = np.asarray(value).size // width
+                loc_arr = np.asarray(loc)
+                if loc_arr.shape != (n_rows,):
+                    raise ValueError(
+                        f"locations for cell {int(cid)} of {name!r} have shape "
+                        f"{loc_arr.shape}, expected ({n_rows},) to stay row-aligned "
+                        f"with the payload"
+                    )
+                if n_rows:
+                    loc_out[pos] = _ragged_payload_bytes(loc_name, loc_arr, loc_sig)
+            if payload:
+                out[pos] = payload
+
+
+def _write_ragged_companions(ragged, store, grid, block_index, chunk_res_fields) -> None:
+    """Write a chunk's ``resolution: chunk`` RAGGED companions (issue #82/#209).
+
+    The vlen analogue of :func:`_write_companion_columns`: the populated cells
+    collapse to the single chunk payload (chunk-uniform contract,
+    :func:`_chunk_uniform_ragged`), whose bytes land at the chunk's block of
+    the chunk-grid vlen array. ``location`` + ``resolution: chunk`` is rejected
+    at config validation, but a config built without ``validate_config`` could
+    still deliver a located triple here — fail loudly rather than silently
+    dropping the location channel (issue #87).
+    """
+    if not chunk_res_fields:
+        return
+    block_idx = tuple(int(i) for i in block_index)
+    for name, entry in (ragged or {}).items():
+        if name not in chunk_res_fields:
+            continue
+        values_list, _cell_ids, locations_list = _ragged_entry(entry)
+        if locations_list is not None:
+            raise ValueError(
+                f"ragged field {name!r} is resolution: chunk but carries a location "
+                f"channel; located ragged fields are cell-resolution only"
+            )
+        chunk_payload = _chunk_uniform_ragged(name, values_list)
+        if chunk_payload is None:
+            continue  # whole chunk is fill — nothing to record
+        block = np.full((1,) * len(block_idx), b"", dtype=object)
+        block[(0,) * len(block_idx)] = _ragged_payload_bytes(
+            name, chunk_payload, _ragged_sig(name, grid)
+        )
+        _set_ragged_block(store, grid, name, block_idx, block)
+
+
+def _set_ragged_block(store, grid, name, block_idx, block) -> None:
+    """One block-selection write into a ragged vlen array (issue #209)."""
+    with config.set({"async.concurrency": 128}):
+        array = open_array(
+            store,
+            path=f"{grid.group_path}/{name}",
+            zarr_format=3,
+            consolidated=False,
+        )
+        array.set_block_selection(tuple(block_idx), block)
 
 
 def _chunk_uniform_ragged(name: str, values_list: list):

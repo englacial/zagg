@@ -73,7 +73,7 @@ def morton_decimal(word) -> str:
     The external/path form of a shard id per the sparse-coverage design record
     (``docs/design/sparse_coverage.md`` D1): the packed ``uint64`` word stays
     the canonical in-memory/wire form, and every externally visible string —
-    CSR subgroup names, ``.status`` object keys, log lines — renders through
+    hive leaf ids, ``.status`` object keys, log lines — renders through
     mortie's decode-through-kernel decimal repr (e.g. ``-31123``). Raises
     ``ValueError`` on an empty, invalid, or negative word (a path component
     must never be silently wrong) — a NEGATIVE int here is usually a *legacy
@@ -98,7 +98,7 @@ def morton_word(label: str) -> int:
     """Parse a decimal morton string back to its packed word (issue #199).
 
     The inverse of :func:`morton_decimal` at the zagg boundary — used where an
-    external decimal id re-enters (``--morton-cell``, CSR subgroup names on the
+    external decimal id re-enters (``--morton-cell``, hive leaf ids on the
     read path). Raises ``ValueError`` on a malformed id.
 
     Implementation note: this rides mortie's private-but-documented
@@ -113,6 +113,48 @@ def morton_word(label: str) -> int:
     from mortie.morton_index import _decimal_to_word
 
     return _decimal_to_word(str(label))
+
+
+def morton_box(values) -> np.ndarray:
+    """Tier-0 morton box: canonical <= 4-member MOC covering ``values`` (issue #200).
+
+    The fixed-width tier of the coverage envelope (``docs/design/
+    sparse_coverage.md`` §4): compact the occupied cells to their canonical MOC
+    via mortie's ``compress_moc`` (mixed order allowed; an occupied ancestor
+    absorbs its descendants, complete sibling quads merge), then — unless one
+    member already covers everything — split at the deepest common ancestor
+    (``common_ancestor``, the longest common decimal-string prefix) and
+    **tighten** each of its 2-4 intersecting children to the common ancestor of
+    the occupancy inside it (review finding, PR #208). The result is
+    deterministic/canonical and a conservative superset of the input — no
+    occupied cell escapes the box — but NOT always the globally minimal
+    <= 4-member MOC (optimizing member areas under a 4-member cap is a harder
+    search); this "DCA children, each tightened" construction is the definition
+    that freezes with the mortie-side tier-0 spec.
+
+    Accepts anything :func:`morton_words` does; returns sorted packed ``uint64``
+    words. Raises ``ValueError`` on empty input (and, via mortie, on a set
+    spanning HEALPix base cells — a shard's cells are one subtree by
+    construction, so the hive path never triggers it).
+    """
+    from mortie import clip2order, common_ancestor, compress_moc
+
+    words = morton_words(values)
+    if words.size == 0:
+        raise ValueError("morton_box requires at least one occupied cell")
+    occ = compress_moc(words)
+    if occ.size == 1:
+        return occ
+    # After compression every member is strictly deeper than the ancestor (a
+    # member at the ancestor's own order would contain the rest and compress
+    # to a single cell), so coarsening lands each on one of its 2-4 children;
+    # the per-child common_ancestor then drops each member to the deepest
+    # cell covering that child's share of the occupancy.
+    anc = morton_decimal(common_ancestor(occ))
+    anc_order = len(anc) - (2 if anc.startswith("-") else 1)
+    children = clip2order(anc_order + 1, occ)
+    box = [common_ancestor(occ[children == child]) for child in np.unique(children)]
+    return np.sort(np.asarray(box, dtype=np.uint64))
 
 
 def morton_to_arrow(values):
@@ -164,6 +206,7 @@ __all__ = [
     "MORTON_EXTENSION_NAME",
     "is_morton_array",
     "is_morton_arrow",
+    "morton_box",
     "morton_decimal",
     "morton_from_arrow",
     "morton_to_arrow",

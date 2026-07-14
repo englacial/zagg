@@ -27,11 +27,16 @@ round — wired to the **local backend only** (see [Status](#status)).
   naturally: every order is a legal node.
 - **Full id at the leaf** (D3): `.../-5/1/1/2/3/3/3/-5112333.zarr` is
   self-describing without parsing its directory chain — greppable in
-  inventories, unambiguous if moved. Each leaf is a completely vanilla zarr v3
+  inventories, unambiguous if moved. Each leaf is a vanilla zarr v3
   store: the same group/array template as the flat layout, sized to one shard
   (dense arrays hold `cells_per_shard` cells; `resolution: chunk` companions
   hold the shard's K inner chunks; CSR ragged subgroups sit under the same
-  group path, named by the shard label at K==1).
+  group path, named by the shard label at K==1). One recorded exception
+  ([issue #200](https://github.com/englacial/zagg/issues/200), O8): the
+  `coverage.moc` occupancy-bitmap sidecar inside the leaf — a single foreign
+  key that zarr readers ignore (data reads are unaffected; member
+  enumeration like `members()`/`tree()` emits a `ZarrUserWarning` and skips
+  it).
 - **Node invariant** (D5): below the root, a node contains *only* digit
   children (`[1-4]/`) and `*.zarr` objects — zero zarr metadata above the
   leaf, no shared mutable state across workers. The root alone also carries
@@ -120,21 +125,137 @@ template creates anyway. A shard that errors, or streams no chunks (no data),
 leaves no stamp; a fully empty shard leaves no `.zarr/` prefix at all (the
 leaf is created lazily on the first chunk write).
 
+The stamp also carries the shard's **coverage envelope** — see
+[Coverage](#coverage) below. The sidecar it points to is written before the
+stamp, so coverage shares the debris semantics: no stamp, no visible coverage.
+
+## Coverage
+
+Where the data is, declared hierarchically
+([issue #200](https://github.com/englacial/zagg/issues/200), design §4 as
+amended by PR #206; O8/O9 resolved on the issue thread). Three tiers per
+shard plus one store-root object:
+
+| tier | what | where | cost to read |
+|---|---|---|---|
+| 0 — morton box | canonical ≤ 4-member cover of the occupied cells (DCA children, each tightened) | `coverage` payload on the commit stamp | free — rides the stamp GET readers already make |
+| 1 — exact bitmap | zstd-compressed bit field over the shard subtree at `cell_order` | `{full_id}.zarr/coverage.moc` sidecar | one opt-in GET |
+| 2 — exact truth | the leaf's `morton` coordinate array | the leaf's data plane | array read; the tiers above are indexes, never truth (D9) |
+| root | shard-order ranges MOC over all completed shards | `{store_root}/coverage.moc` | one GET — the discovery bootstrap |
+
+**Leaf envelope** (on the stamp, `zagg.hive.read_coverage`; strict
+`spec: morton-moc/1` gate — unknown specs read as absent):
+
+```json
+"coverage": {
+  "spec": "morton-moc/1",
+  "box": ["-42113221", "-42113224", null, null],
+  "cell_order": 12,
+  "source": "worker",
+  "encoding": "bitmap",
+  "sidecar": "coverage.moc",
+  "nbytes": 213,
+  "raw_nbytes": 512
+}
+```
+
+`box` is always exactly 4 slots, nulls trailing; members are D1 decimal
+strings. `encoding`/`sidecar`/sizes appear only when the bitmap exists — a
+box-only envelope (phase-1-era leaf, or a depth-0 `child_order ==
+parent_order` config) is read as "box only". No `generated_at`: the stamp's
+`written_at` is the one clock and one writer. Bit convention (frozen with
+the mortie-side spec): bit i = the i-th shard-subtree cell in ascending
+packed-word order (base-4 value of the D1 digit tail, digits 1..4 → 0..3),
+MSB-first per byte. A corrupt sidecar (bad zstd, wrong size) **raises**; a
+missing one degrades to `None` — a truncated bitmap must never read as a
+plausible partial cell set. The sidecar is the one foreign key inside the
+otherwise-vanilla leaf: zarr data reads are unaffected, but member
+enumeration (`members()`/`tree()`) emits a `ZarrUserWarning` and skips it.
+
+**Root envelope** (`{store_root}/coverage.moc`, `zagg.coverage.load_coverage`):
+
+```json
+{
+  "spec": "morton-moc/1",
+  "encoding": "ranges",
+  "order": 6,
+  "source": "dispatcher",
+  "generated_at": "2026-07-10T22:59:35+00:00",
+  "ranges": [["5112333", "5112333"], ["-4211321", "-4211324"]]
+}
+```
+
+The example above is `zagg.hive.build_root_coverage` output for the shards
+`-4211321..-4211324` plus `5112333` (all order 6) and round-trips through
+`root_coverage_words`; the test suite parses it straight out of this file so
+the reference example can never drift from the implementation.
+
+A range is an inclusive run of same-order cells within one base cell,
+consecutive in digit-tail rank; endpoints are decimal **strings** (packed
+u64 words exceed 2^53 and raw JSON numbers get mangled by float-based
+parsers). `source` is `"dispatcher"` (end-of-run write) or `"refresh"` (the
+explicit walk rebuild); the sweep will add its own.
+
+**Reader flow** (`zagg.coverage`): `load_coverage` → `root_coverage_and`
+against the AOI to pick candidate shards (one GET, no walk); per leaf,
+`box_and` on the stamp payload for the cheap reject, then `bitmap_and` for
+exact cell-level filtering (falls back to the box verdict with `None` when
+the leaf is box-only), then the `morton` coordinate as truth. The box is a
+conservative superset — false positives cost one wasted read, false
+negatives are impossible; the bitmap and the root MOC are exact for what
+they list.
+
+**Staleness (O7)**: readers trust silently on the hot path. The root object
+is written fail-open at **end of run** while leaves stamp continuously, so
+the most common gap is benign — a run still in progress. Beyond that, a
+crashed run, an out-of-band write, or the benign concurrent-run union race
+(GET-union-PUT is not atomic; last writer wins until the next re-union)
+leaves it missing shards, which degrades to "reader doesn't see the newest
+run", never a wrong answer. `zagg.coverage.warn_if_stale` implements the
+lazy detection lean: when a reader opens a commit-stamped leaf the root MOC
+doesn't list, it warns once per store and suggests
+`zagg.coverage.refresh_root_coverage` — the explicit delimiter-LIST walk
+that rebuilds the root MOC from the stamped leaves (debris excluded) and
+writes it with `source: "refresh"`. No reader ever auto-walks (D10).
+
+**Deploy note** (mirrors the PR #205 setup-echo note): the Lambda leg posts
+one fire-and-forget `mode: "coverage"` invoke, which requires the
+redeployed function. An **older deployment 400s the event in its process
+handler** — a logged error line in CloudWatch, but no writes, no result
+mirror, and no async redelivery — so the failure is fail-open by
+construction; the root object simply doesn't appear until the sweep or a
+refresh builds it.
+
 ## Reading a hive store
 
 There is no store-root `zarr.open()` (deliberately — D12; a root hierarchy can
 be added later by the sweep as a derived artifact). Readers:
 
 1. GET `morton_hive.json` (once, cacheable) → `shard_order`, `cell_order`.
-2. Compute a shard's leaf path by string arithmetic on its decimal id
+2. GET `coverage.moc` (`zagg.coverage.load_coverage`) → the covered shard
+   set, intersected with the AOI (`root_coverage_and`) — see
+   [Coverage](#coverage).
+3. Compute a shard's leaf path by string arithmetic on its decimal id
    (`zagg.hive.shard_leaf_path`), open the leaf zarr, and **check the commit
-   stamp** (`zagg.hive.read_commit`) before trusting the contents.
-3. Discovery without a shard list is a delimiter-LIST walk: recurse on
-   `[1-4]/` children; a `*.zarr` entry is data at that node; no digit children
-   ⇒ nothing finer. Never LIST per observation in a join loop (D10).
+   stamp** (`zagg.hive.read_commit`) before trusting the contents; the
+   stamp's coverage payload pre-filters the AOI (`box_and`/`bitmap_and`).
+4. Discovery without a root MOC falls back to the delimiter-LIST walk:
+   recurse on `[1-4]/` children; a `*.zarr` entry is data at that node; no
+   digit children ⇒ nothing finer. Never LIST per observation in a join
+   loop (D10).
 
-The `coverage.moc` domain declaration (§4 of the design record) is a follow-on
-issue and will remove the walk from the discovery path too.
+The store-root `coverage.moc` ([issue #200](https://github.com/englacial/zagg/issues/200)
+phase 3, default-on for hive) removes the walk from the bootstrap path: one
+GET of the root object yields the shard-order coverage MOC (JSON ranges,
+decimal-string endpoints). It is written fail-open at end of run — by the
+dispatcher directly (local) or one fire-and-forget `mode: "coverage"` worker
+invoke (Lambda; an older deployment has no coverage mode and 400s the event
+in its process handler — logged, no writes, no async retry — which is safe:
+the object is a regenerable cache under D9, and readers degrade to the walk).
+Incremental runs union with the existing object; concurrent runs race
+benignly (GET-union-PUT is not atomic: last writer wins, and its union may
+miss the loser's shards until the sweep or the next run re-unions — accepted
+under D9/O7). The §7 sweep remains the authoritative rebuilder.
 
 ## Status
 
@@ -146,7 +267,12 @@ issue and will remove the walk from the discovery path too.
   the event config's orders, emits its own leaf template, and stamps
   completion as its final PUT. The async status channel stays at the flat
   sibling prefix (`{store_root}.status/<run_id>/…`), outside the digit tree.
-- The store-level `coverage.moc` (and any per-shard MOC stamping) waits on
-  the design in [issue #200](https://github.com/englacial/zagg/issues/200).
+- **Coverage ships** ([issue #200](https://github.com/englacial/zagg/issues/200)
+  phases 1–4): the tier-0 morton box on the commit stamp, the exact
+  zstd-bitmap `coverage.moc` sidecar inside each leaf, the end-of-run
+  store-root `coverage.moc` (shard-order ranges MOC, `output.coverage_moc`,
+  default on for hive) for the one-GET bootstrap, plus the `zagg.coverage`
+  reader primitives (per-tier AOI intersection, O7 staleness lean, explicit
+  refresh).
 - Write-throughput validation at fleet scale is tracked with the benchmark
   machinery in [issue #202](https://github.com/englacial/zagg/issues/202).

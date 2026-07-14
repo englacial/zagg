@@ -134,13 +134,11 @@ from zarr.errors import GroupNotFoundError
 
 # Import cloud-agnostic processing
 from zagg.config import get_handoff, get_store_layout, load_config_from_dict
-from zagg.grids.base import shard_label
 from zagg.processing import (
     write_dataframe_to_zarr,
     write_ragged_to_zarr,
     write_shard_to_zarr,
 )
-from zagg.processing.write import _block_index_key
 from zagg.store import open_store
 
 # Set up structured logging
@@ -441,6 +439,7 @@ def lambda_handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
 
     Default ``mode`` (or no mode) runs per-cell processing. ``mode="setup"``
     creates the zarr template; ``mode="finalize"`` consolidates metadata;
+    ``mode="coverage"`` writes the store-root ``coverage.moc`` (issue #200);
     ``mode="extract"`` extracts chunk-boundary geometry parquets (issue #148);
     ``mode="process_event"`` runs the temporal/event worker (issue #12).
     """
@@ -455,6 +454,8 @@ def lambda_handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
         return _handle_setup(event)
     if mode == "finalize":
         return _handle_finalize(event)
+    if mode == "coverage":
+        return _handle_coverage(event)
     # Extract mode returns directly: the result_url mirror below is for the
     # per-unit fan-out handlers (spatial process, temporal process_event) only.
     if mode == "extract":
@@ -671,6 +672,36 @@ def _handle_finalize(event: Dict[str, Any]) -> Dict[str, Any]:
     except Exception as e:
         logger.exception(e)
         return {"statusCode": 500, "body": json.dumps({"error": str(e), "mode": "finalize"})}
+
+
+def _handle_coverage(event: Dict[str, Any]) -> Dict[str, Any]:
+    """Write/union the store-root ``coverage.moc`` (issue #200 phase 3).
+
+    Posted fire-and-forget (``InvocationType="Event"``) by the dispatcher at
+    end of run: the orchestrator can compute the shard-order MOC but cannot
+    PUT to S3, so the SERIALIZED envelope rides in the event (bounded by
+    construction — see the dispatch-site comment in ``zagg.runner``) and the
+    worker GET-unions-PUTs one root object. Nobody reads this response on
+    the Event invoke; errors are logged and fail open — the root MOC is a
+    regenerable cache (D9): readers degrade to the sweep MOC or the walk,
+    never to wrong answers.
+    """
+    from zagg.hive import write_root_coverage
+
+    logger.info(f"Coverage mode: writing root coverage.moc at {event.get('store_path')}")
+    try:
+        merged = write_root_coverage(
+            event["store_path"], event["coverage"], **_output_store_kwargs(event)
+        )
+        return {
+            "statusCode": 200,
+            "body": json.dumps(
+                {"ok": True, "mode": "coverage", "ranges": len(merged.get("ranges", []))}
+            ),
+        }
+    except Exception as e:
+        logger.exception(e)
+        return {"statusCode": 500, "body": json.dumps({"error": str(e), "mode": "coverage"})}
 
 
 def _json_scalar(v: Any) -> Any:
@@ -902,11 +933,6 @@ def _handle_process(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
         sharded = getattr(grid, "sharded", False)
         store_path = event["store_path"]
         shard_key = event["shard_key"]
-        # K==1 vs K>1 is fixed by the grid, not the chunk count (issue #91), so the
-        # streaming callback can pick the ragged key without a materialized list: at
-        # K==1 the chunk IS the shard (keyed by ``shard_key``); at K>1 each finer
-        # chunk is keyed by its own block index.
-        single_chunk = int(getattr(grid, "chunks_per_shard", 1)) == 1
 
         store_box: dict = {}
         write_error: dict = {}
@@ -984,15 +1010,9 @@ def _handle_process(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
                     # write_dataframe_to_zarr no-ops on an empty carrier, so no per-chunk
                     # emptiness check is needed. Use each chunk's own block_index.
                     write_dataframe_to_zarr(carrier, store, grid=grid, chunk_idx=block_index)
-                    # At K==1 the CSR subgroup is named by the grid's shard label (the
-                    # decimal morton string for HEALPix — issue #199); K>1 keeps the
-                    # flattened block-index int. Mirrors runner._process_and_write.
-                    ragged_key = (
-                        shard_label(grid, shard_key)
-                        if single_chunk
-                        else _block_index_key(block_index, grid)
-                    )
-                    write_ragged_to_zarr(ragged, store, grid=grid, shard_key=ragged_key)
+                    # Ragged fields land in their vlen-bytes arrays at the same
+                    # block (issue #209). Mirrors runner._process_and_write.
+                    write_ragged_to_zarr(ragged, store, grid=grid, chunk_idx=block_index)
                 except Exception as e:
                     # Mirror the buffered path's ``except``: record the failure, stop
                     # writing, and let the run surface a 500 after process_shard returns.
