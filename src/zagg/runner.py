@@ -1035,6 +1035,24 @@ def _aoi_payload_map(catalog_data: dict) -> dict:
     return {int(k): payload for k, payload in zip(catalog_data["shard_keys"], aoi)}
 
 
+def _resolve_source_credentials(config) -> dict:
+    """S3 read credentials for the source datasets, provider-selected.
+
+    ``data_source.credentials_provider`` names a credential-provider registry
+    entry (built-ins ``nsidc``/``gesdisc``; plugins may register others,
+    including non-NASA S3-compatible sources -- providers run
+    orchestrator-side, so the built-ins-only Lambda rule does not apply).
+    Absent, the historical spatial default (NSIDC) stands, via the module
+    global so it remains overridable.
+    """
+    name = (config.data_source or {}).get("credentials_provider")
+    if not name:
+        return get_nsidc_s3_credentials()
+    from zagg import registry
+
+    return registry.get_credential_provider(name)()
+
+
 def _dry_run_summary(cells: list[tuple], store_path: str) -> dict:
     """Return summary without processing.
 
@@ -1210,7 +1228,7 @@ def _run_local(
     if driver == "https":
         s3_creds = {"edl_token": get_edl_token()}
     else:
-        s3_creds = get_nsidc_s3_credentials()
+        s3_creds = _resolve_source_credentials(config)
 
     # Build grid from the run config (single source of truth) and refuse a
     # shard map built for a different grid. For HEALPix-dense, populated_shards
@@ -1442,8 +1460,8 @@ def _run_lambda(
     if dry_run:
         return _dry_run_summary(cells, store_path)
 
-    # Authenticate (for per-cell NSIDC reads inside the Lambda)
-    s3_creds = get_nsidc_s3_credentials()
+    # Authenticate (for per-cell source reads inside the Lambda)
+    s3_creds = _resolve_source_credentials(config)
 
     # Build grid from the run config (single source of truth); enforce the
     # shard map was built for the same grid.

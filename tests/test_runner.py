@@ -3476,3 +3476,37 @@ class TestConsolidationGate:
 
     def test_lambda_finalizes_when_enabled(self, monkeypatch, atl06_config):
         assert self._lambda_finalize_calls(monkeypatch, atl06_config, enabled=True) == 1
+
+
+class TestResolveSourceCredentials:
+    """Provider-selected source credentials, both pipelines (issue #213 Phase 6)."""
+
+    def test_default_is_nsidc_via_module_global(self, monkeypatch):
+        from zagg import runner
+        from zagg.config import PipelineConfig
+
+        monkeypatch.setattr(runner, "get_nsidc_s3_credentials", lambda: {"accessKeyId": "n"})
+        cfg = PipelineConfig(data_source={"reader": "h5coro"})
+        assert runner._resolve_source_credentials(cfg) == {"accessKeyId": "n"}
+
+    def test_named_provider_resolved_via_registry(self):
+        from zagg import registry as zagg_registry
+        from zagg import runner
+        from zagg.config import PipelineConfig
+
+        zagg_registry.register_credential_provider(
+            "test_src_provider", lambda: {"accessKeyId": "p"}, replace=True
+        )
+        try:
+            cfg = PipelineConfig(data_source={"credentials_provider": "test_src_provider"})
+            assert runner._resolve_source_credentials(cfg) == {"accessKeyId": "p"}
+        finally:
+            zagg_registry.CREDENTIAL_PROVIDERS._entries.pop("test_src_provider", None)
+
+    def test_unknown_provider_raises_with_name(self):
+        from zagg import runner
+        from zagg.config import PipelineConfig
+
+        cfg = PipelineConfig(data_source={"credentials_provider": "not_a_provider"})
+        with pytest.raises(KeyError, match="not_a_provider"):
+            runner._resolve_source_credentials(cfg)

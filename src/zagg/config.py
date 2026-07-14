@@ -73,6 +73,11 @@ class DataSourceDict(TypedDict):
     # keys are backend-specific and validated against the backend's declared
     # ``config_keys`` — irrelevant keys are config errors, not ignored.
     index: NotRequired[dict]
+    # Credential-provider registry name for source-data S3 reads (issue #213
+    # Phase 4/6): built-ins ``nsidc``/``gesdisc``; plugins may register others.
+    # Absent → the spatial default (NSIDC); temporal events may also carry
+    # per-event ``s3_credentials``, which win.
+    credentials_provider: NotRequired[str]
 
 
 # Structured-predicate comparison operators (issue #43). ``in``/``not_in`` take a
@@ -217,6 +222,15 @@ def validate_config(config: PipelineConfig) -> None:
     # validate their own (much smaller) spec shape and return early -- they
     # carry no output grid and run through the event-streaming engine
     # (``zagg.temporal.process_event``) rather than the point-cloud path.
+    # Both pipeline kinds honor a provider-selected source-credential fetch
+    # (issue #213 Phase 6), so the key's shape is checked before the branch.
+    provider = (config.data_source or {}).get("credentials_provider")
+    if provider is not None and not isinstance(provider, str):
+        raise ValueError(
+            "data_source.credentials_provider must be a credential-provider "
+            f"registry name string, e.g. 'nsidc' or 'gesdisc' (got {provider!r})"
+        )
+
     ptype = get_pipeline_type(config)
     if ptype != "spatial":
         _validate_temporal_config(config)
@@ -565,12 +579,6 @@ def _validate_temporal_config(config: PipelineConfig) -> None:
                 f"temporal variable '{name}' params must be a mapping (got {params!r})"
             )
     _validate_collection_options(config)
-    provider = (config.data_source or {}).get("credentials_provider")
-    if provider is not None and not isinstance(provider, str):
-        raise ValueError(
-            "data_source.credentials_provider must be a credential-provider "
-            f"registry name string, e.g. 'nsidc' or 'gesdisc' (got {provider!r})"
-        )
 
 
 _RESAMPLE_HOWS = ("sum", "mean")

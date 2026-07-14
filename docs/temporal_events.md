@@ -126,4 +126,6 @@ contribution funnel.
 
 Credential providers run orchestrator-side, so they carry no such
 restriction; `data_source.credentials_provider` may name a plugin provider on
-either backend.
+either backend — including non-NASA S3-compatible sources. The spatial
+pipeline honors the same key for its source reads, defaulting to `nsidc` when
+the key is absent.
