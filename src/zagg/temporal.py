@@ -547,8 +547,11 @@ def specs_from_config(config):
         Each dict has keys: ``output_name``, ``variable``, ``collection``,
         ``spatial_func``, ``temporal_reducer``, ``mask``, ``negate``, and the
         optional generic hooks ``transform`` (field-transform name),
-        ``trigger`` (event-trigger name), and ``trigger_mask`` (static-mask
-        name for the trigger).
+        ``trigger`` (event-trigger name), ``trigger_mask`` (static-mask
+        name for the trigger), and ``params`` (a free-form mapping passed
+        through verbatim -- capabilities receive the full spec, so registered
+        masks/transforms/triggers read their tuning knobs from
+        ``spec["params"]`` without any zagg change).
 
     Notes
     -----
@@ -577,6 +580,7 @@ def specs_from_config(config):
                 "transform": transform,
                 "trigger": meta.get("trigger"),
                 "trigger_mask": meta.get("trigger_mask"),
+                "params": dict(meta.get("params") or {}),
             }
         )
     return specs

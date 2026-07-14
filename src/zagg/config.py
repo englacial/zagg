@@ -559,6 +559,11 @@ def _validate_temporal_config(config: PipelineConfig) -> None:
                 f"temporal variable '{name}' is missing required key(s): "
                 f"{', '.join(missing)} (need {', '.join(_TEMPORAL_SPEC_KEYS)})"
             )
+        params = meta.get("params")
+        if params is not None and not isinstance(params, dict):
+            raise ValueError(
+                f"temporal variable '{name}' params must be a mapping (got {params!r})"
+            )
     _validate_collection_options(config)
     provider = (config.data_source or {}).get("credentials_provider")
     if provider is not None and not isinstance(provider, str):

@@ -29,6 +29,7 @@ nav:
       - "Ragged store layout": "ragged_layout.md"
       - "Hive store layout": "hive_layout.md"
       - "Typed morton boundary": "morton_arrow.md"
+      - "Temporal events": "temporal_events.md"
   - "Deployment":
       - "Standing Up the Backend": "deployment/standup.md"
       - "AWS Lambda": "deployment/lambda.md"

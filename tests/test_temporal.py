@@ -229,6 +229,7 @@ def _temporal_config():
                         "mask": "ocean",
                         "trigger": "first_intersection",
                         "trigger_mask": "grounded_mask",
+                        "params": {"lookahead_hours": 24},
                     },
                 }
             },
@@ -256,6 +257,7 @@ class TestSpecsFromConfig:
             "transform",
             "trigger",
             "trigger_mask",
+            "params",
         }
         for spec in specs:
             assert set(spec) == required, f"bad keys for {spec['output_name']}"
@@ -274,6 +276,9 @@ class TestSpecsFromConfig:
         assert specs["rainfall_ocean"]["trigger_mask"] == "grounded_mask"
         assert specs["max_t2m_ais"]["trigger"] is None
         assert specs["max_t2m_ais"]["trigger_mask"] is None
+        # params pass through verbatim for capabilities; default is {}
+        assert specs["rainfall_ocean"]["params"] == {"lookahead_hours": 24}
+        assert specs["max_t2m_ais"]["params"] == {}
 
     def test_anomaly_sugar_equals_explicit_transform(self):
         # (a) `anomaly: true` produces the same spec as `transform: monthly_anomaly`.
@@ -664,6 +669,25 @@ class TestProcessEvent:
         specs[0]["temporal_reducer"] = "sum"
         with pytest.raises(ValueError, match="cell_areas"):
             process_event("storm1", event_mask, collections, specs, {})
+
+    def test_params_reach_capabilities(self):
+        # spec["params"] is the pass-through channel for capability tuning
+        # knobs -- a registered (local-backend) provider must see it verbatim.
+        seen = {}
+
+        def _param_probe(event_mask_t, static_data, spec):
+            seen["params"] = spec.get("params")
+            return event_mask_t
+
+        registry.register_mask_provider("param_probe", _param_probe, replace=True)
+        try:
+            event_mask, collections, specs, static = _event_inputs()
+            specs[0]["mask"] = "param_probe"
+            specs[0]["params"] = {"knob": 7}
+            process_event("storm1", event_mask, collections, specs, static)
+            assert seen["params"] == {"knob": 7}
+        finally:
+            registry.MASK_PROVIDERS._entries.pop("param_probe", None)
 
     def _gated_inputs(self):
         # Trigger fixture (landfall at t1) + a variable rising 10/20/30 so the
