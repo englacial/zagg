@@ -304,6 +304,48 @@ FIELD_TRANSFORMS = registry.FIELD_TRANSFORMS
 
 
 # ---------------------------------------------------------------------------
+# Built-in event triggers
+#
+# An event trigger has signature ``fn(event_mask, static_data, spec) ->
+# timestep value(s)``; :func:`process_event` updates a spec's accumulator only
+# on the returned timesteps. Never-firing triggers return an empty array, so
+# every gated spec finalizes to NaN.
+# ---------------------------------------------------------------------------
+
+
+def first_intersection(event_mask, static_data, spec):
+    """Earliest timestep where the event overlaps a named static mask.
+
+    The mask is ``static_data[spec['trigger_mask']]`` (default ``ais_mask``),
+    so the built-in expresses "first landfall on the ice sheet" without any
+    domain knowledge: the *meaning* of the mask is config. Returns an empty
+    array when the event never intersects it.
+    """
+    static_mask = static_data[spec.get("trigger_mask") or "ais_mask"].astype(bool)
+    space_dims = [d for d in event_mask.dims if d != "time"]
+    hits = (event_mask.where(static_mask, 0) > 0).any(space_dims)
+    times = event_mask["time"].values[np.asarray(hits.values, dtype=bool)]
+    if times.size == 0:
+        return times
+    return times.min()
+
+
+registry.register_event_trigger(
+    "first_intersection",
+    first_intersection,
+    description="First timestep where the event overlaps spec['trigger_mask'] (default 'ais_mask')",
+)
+registry.register_event_trigger(
+    "first_landfall",
+    first_intersection,
+    description="Alias of first_intersection (first timestep on the ice-sheet mask)",
+)
+
+#: The event-trigger registry (``zagg.registry.EVENT_TRIGGERS``).
+EVENT_TRIGGERS = registry.EVENT_TRIGGERS
+
+
+# ---------------------------------------------------------------------------
 # Event worker core
 # ---------------------------------------------------------------------------
 
@@ -344,7 +386,9 @@ def process_event(
         ``temporal_reducer``, ``mask``; optional keys: ``negate``,
         ``transform`` (field-transform name; ``anomaly: true`` desugars to
         ``transform: monthly_anomaly`` in :func:`specs_from_config`),
-        ``trigger`` (event-trigger name).
+        ``trigger`` (event-trigger name) and ``trigger_mask`` (static-mask
+        name the trigger tests against; ``first_intersection`` defaults to
+        ``ais_mask``).
     static_data : dict[str, xr.DataArray | xr.Dataset]
         Static fields keyed by name, e.g. ``ais_mask``, ``cell_areas``,
         ``climatology``. Spatial fields are subset to the event extent.
@@ -460,8 +504,9 @@ def specs_from_config(config):
     list[dict]
         Each dict has keys: ``output_name``, ``variable``, ``collection``,
         ``spatial_func``, ``temporal_reducer``, ``mask``, ``negate``, and the
-        optional generic hooks ``transform``
-        (field-transform name) and ``trigger`` (event-trigger name).
+        optional generic hooks ``transform`` (field-transform name),
+        ``trigger`` (event-trigger name), and ``trigger_mask`` (static-mask
+        name for the trigger).
 
     Notes
     -----
@@ -489,6 +534,7 @@ def specs_from_config(config):
                 "negate": meta.get("negate", False),
                 "transform": transform,
                 "trigger": meta.get("trigger"),
+                "trigger_mask": meta.get("trigger_mask"),
             }
         )
     return specs
