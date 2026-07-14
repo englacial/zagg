@@ -8,7 +8,7 @@
 > for the whole shard and is the hard floor — for the densest o8 shards it exceeds
 > 4 GB at *any* buffer. **Chunk-scoped digest streaming** (bound the digest state
 > to one inner chunk, not the whole shard) is the architectural fix that would
-> unlock o8/o7; it is under investigation. Until then, o9 is the operating point.
+> unlock o8/o7; a code-feasibility pass scopes it as a moderate-to-deep refactor (§4c, tracked in #217). Until it lands, o9 is the operating point.
 
 **This is an estimate, not a benchmark result.** We are *not* running CONUS. This
 document sizes what a full contiguous-US (lower-48) ATL03 aggregation *would*
@@ -23,8 +23,8 @@ t-digest write (issues #209 / #211), so the pre-#211 write bloat is already gone
 > (§4c). Streaming the reads (`aggregation.streaming`) rescues *most* o8 shards at
 > 4 GB, but the whole-shard **per-cell t-digest state** is a buffer-independent
 > floor that exceeds 4 GB for the densest o8 shards — o7 OOMs outright.
-> Chunk-scoping that digest state is the fix that would unlock coarser orders
-> (under investigation); until then o9 is the recommendation. The remaining
+> Chunk-scoping that digest state would unlock coarser orders (scoped as a
+> moderate-to-deep refactor, §4c / #217); until then o9 is the recommendation. The remaining
 > upper-bound lever on the o9 total is the #65 swath over-assignment (§4d).
 
 | Order 9 @ 4 GB (measured) | cost (95 % CI) | wall @ 2,000 workers |
@@ -192,10 +192,28 @@ See `estimate_with_ci.py` / `conus_final_estimate.py`.
 
 ### 4c. Order feasibility — why o9 is the ceiling for coarsening
 
-Coarser shards (fewer of them) would amortise the per-shard intercept — but at
-CONUS scale they hit a **memory wall**. Per-shard peak RSS is driven by **photon
-volume / cell coverage (surface density), not granule count** — so it only shows
-up once you sample the whole continent, not a single site.
+**Why coarsen at all? Coarser is monotonically cheaper per unit data.** A NEON
+SERC AOI order sweep (0.24.0 sharded, inline nomask;
+`data/conus/results/order_sweep_*`) shows the incentive:
+
+| order | shards | obs | cost | $/Mobs | $/100 km² |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| **o8** | 2 | 50.7 M | $0.0359 | **$0.000708** | **$0.00277** |
+| **o9** | 4 | 24.8 M | $0.0262 | $0.001057 | $0.00405 |
+| **o10** | 9 | 11.4 M | $0.0321 | $0.002811 | $0.00881 |
+
+o8 is **~33 % cheaper per obs** than o9; o10 is **~2.7× worse** than o9. Two
+compounding reasons: fewer shards means fewer fixed-overhead payments, and fewer
+**redundant granule re-reads** — o8 extracts ~225 k obs per (shard, granule) read
+vs o9's ~87 k, i.e. less #65 swath over-assignment. So there is a real cost pull
+toward o8; the question §4c answers is whether it can *run*. (The per-order `obs`
+are deterministic; the absolute `cost` is a single-shard-set Lambda timing and is
+**n=1 noisy** at the ~±15 % level — o9 has read $0.026–0.029 across runs — so read
+the **per-unit ratios and the monotone trend**, not the exact cents.)
+
+The answer at CONUS scale: coarsening hits a **memory wall**. Per-shard peak RSS
+is driven by **cell-coverage density (surface density), not granule count** — so
+it only shows up once you sample the whole continent, not a single site.
 
 | order | shard area | CONUS shards | 4 GB result | evidence |
 | --- | ---: | ---: | --- | --- |
@@ -241,12 +259,36 @@ runtime toward the wall (176 g hit 875 s / 97 % at buffer 12). At **8 GB pooled*
 state is held whole-shard; at o8 (4× o9's cell count) the densest-coverage shards
 overflow 4 GB no matter how the reads are streamed. **Chunk-scoped digest
 streaming** — process → write → free one inner chunk's cells at a time, bounding
-digest state to ≈1/K of the shard — would decouple worker memory from shard area
-and unlock o8/o7. It is under investigation. Until it lands, **o9 at 4 GB is the
-recommendation**: its 4× smaller cell count keeps the digest state comfortably
-under 4 GB with no new machinery. (An earlier 2-shard NEON o8 test passed at
-1.5–1.8 GB — but two shards over one uniform forest site did not sample CONUS's
-photon-density range; the continental regression is what exposed the tail.)
+digest state to ≈1/K of the shard — would decouple worker memory from shard area.
+A code-feasibility pass found:
+
+- The **write side already streams-and-frees per inner chunk** (`worker.py`
+  `write_chunk` + `grid.iter_chunks`, issue #91) — but only on the **unsharded**
+  output path; the sharded ShardingCodec bundles all K inner chunks into one
+  object, so per-chunk independent writes need the flat/hive path.
+- Photon → inner-chunk routing is **cheap** (a morton prefix, `clip2order` at
+  `chunk_order`) — not the blocker.
+- The blocker is **read ordering**: granules are folded in catalog order, and an
+  ICESat-2 ground track crosses an arbitrary subset of inner chunks, so **no chunk
+  can be finalized until every granule is read** — which is exactly why the digest
+  floor equals the whole shard's occupied cells. The `StreamingAggregator` state
+  (`streaming.py`) is keyed by cell with no chunk dimension.
+- **Verdict: a moderate-to-deep change** — either a single-pass read that spills
+  photons to K on-disk partitions by chunk then digests each once (moderate, but
+  trades the RAM wall for a Lambda `/tmp` disk budget), or a K-pass / per-chunk
+  read plan (deep). It re-keys the streaming state by `(chunk, cell)` and
+  restructures the `process_shard` read/finalize interleaving; the write side is
+  unchanged. **Tracked in #217.** **Bonus:** building each chunk's digest from its complete photon set
+  is **exact**, strictly better than the current cross-buffer `merge_tdigests`
+  approximation.
+
+Until that lands, **o9 at 4 GB is the recommendation**: its 4× smaller cell count
+keeps the digest state comfortably under 4 GB with no new machinery — and, notably,
+"dispatch finer parent_order shards" *is* the zero-refactor version of chunk-
+scoping (smaller dispatch unit → intrinsically smaller digest state). (An earlier
+2-shard NEON o8 test passed at 1.5–1.8 GB — but two shards over one uniform forest
+site did not sample CONUS's photon-density range; the continental regression is
+what exposed the tail.)
 
 ### 4d. Remaining upper-bound caveat
 
