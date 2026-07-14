@@ -70,6 +70,12 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--counts", default=str(HERE / "conus_shard_granule_counts.parquet"))
     ap.add_argument("--k", type=int, default=25)
     ap.add_argument("--out", default=str(HERE / "conus_regression_shards.json"))
+    ap.add_argument(
+        "--max-granules",
+        type=int,
+        default=MAX_GRANULES,
+        help="exclude shards above this (coarser orders like o8 are denser)",
+    )
     args = ap.parse_args(argv)
 
     import pyarrow.parquet as pq
@@ -78,7 +84,7 @@ def main(argv: list[str] | None = None) -> int:
     labels = np.asarray(table.column("shard_label").to_pylist())
     counts = np.asarray(table.column("n_granules").to_pylist(), dtype=int)
 
-    eligible = counts <= MAX_GRANULES
+    eligible = counts <= args.max_granules
     n_excluded = int((~eligible).sum())
     excluded_range = None
     if n_excluded:
@@ -101,7 +107,7 @@ def main(argv: list[str] | None = None) -> int:
         "source_counts": args.counts,
         "k_requested": args.k,
         "k_selected": len(picked_labels),
-        "max_granules_cap": MAX_GRANULES,
+        "max_granules_cap": args.max_granules,
         "cold_sec_per_granule": COLD_SEC_PER_GRANULE,
         "timeout_s": TIMEOUT_S,
         "excluded_over_cap": {"n_shards": n_excluded, "granule_range": excluded_range},

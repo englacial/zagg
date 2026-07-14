@@ -80,4 +80,5 @@ output:
     indexing_scheme: nested
     parent_order: 9              # shard / dispatch unit: 4^(19-9) = 1024x1024 cells
     chunk_inner: 13              # inner Zarr chunk: 4^(19-13) = 64x64 cells (K=256 per shard)
+    sharded: true                # issue #193/#209: sharded output (was missing here; matches the plain o9 config)
     child_order: 19              # leaf cell resolution (~10 m)

@@ -1,0 +1,76 @@
+{
+  "issue": 202,
+  "region": "CONUS (contiguous US, lower-48 + DC)",
+  "polygon_reference": {
+    "path": "data/conus/conus.geojson",
+    "bbox_lonlat": [
+      -124.706553,
+      25.120779,
+      -66.979601,
+      49.383625
+    ],
+    "n_parts": 5,
+    "provenance": "unary_union of the 48 contiguous states + DC from PublicaMundi/MappingAPI us-states.json (Census-derived simplified outline), Alaska/Hawaii/Puerto_Rico dropped, buffer(0) cleaned. No extra simplification.",
+    "area_km2_epsg5070": 7805341.1
+  },
+  "temporal": {
+    "start": "2018-10-13",
+    "end": "2026-03-15"
+  },
+  "grid": {
+    "type": "healpix",
+    "parent_order": 8,
+    "child_order": 19,
+    "mortie_moc_order": 13,
+    "backend": "mortie",
+    "footprint": "swath"
+  },
+  "catalog": {
+    "path": "/Users/espg/software/zagg/data/atl03_v007/atl03_v007_full.parquet",
+    "total_granules": 555867,
+    "granules_after_prefilter": 28429,
+    "granules_intersecting_conus": 28429
+  },
+  "summary": {
+    "total_shards": 12596,
+    "total_granules_intersecting": 14187,
+    "total_pairs": 1411589,
+    "build_wall_s": 413.2
+  },
+  "granules_per_shard": {
+    "n_shards": 12596,
+    "min": 43,
+    "median": 111.0,
+    "mean": 112.07,
+    "p90": 122.0,
+    "p99": 141.04999999999927,
+    "max": 211,
+    "total_pairs": 1411589,
+    "histogram_edges": [
+      1,
+      2,
+      5,
+      10,
+      25,
+      50,
+      100
+    ],
+    "histogram_counts": [
+      0,
+      0,
+      0,
+      0,
+      1,
+      711,
+      11884
+    ]
+  },
+  "leak_check": {
+    "passed": true,
+    "margin_deg": 1.0,
+    "cell_lat_min": 25.1274,
+    "cell_lat_max": 49.5191,
+    "cell_lon_min": -124.7517,
+    "cell_lon_max": -66.943
+  }
+}
