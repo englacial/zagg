@@ -292,6 +292,22 @@ class TestSampleAsset:
         rows, cols, _ = grid.sample(cells, UTM18, TRANSFORM, (96, 96))
         np.testing.assert_array_equal(values, data[rows, cols])
 
+    def test_sync_facade_under_running_loop(self, tmp_path):
+        """The sync entry works from inside a running loop (Jupyter/Binder)."""
+        p = tmp_path / "t.tif"
+        data = _index_raster()
+        _write_tiff(p, data)
+        grid = _rect_grid()
+        cells = np.arange(96 * 96)
+
+        async def call_sync():
+            return sample_asset(grid, cells, str(p))
+
+        values, valid = asyncio.run(call_sync())
+        assert valid.all()
+        assert values.dtype == np.uint16
+        np.testing.assert_array_equal(values, data.ravel())
+
     def test_no_valid_cells_returns_fill_in_asset_dtype(self, tmp_path):
         p = tmp_path / "t.tif"
         _write_tiff(p, _index_raster())

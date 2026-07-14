@@ -20,6 +20,7 @@ carriage through the shardmap.
 from __future__ import annotations
 
 import asyncio
+import concurrent.futures
 import re
 from urllib.parse import urlparse
 
@@ -150,8 +151,23 @@ async def sample_asset_async(
 
 
 def sample_asset(grid, cells, href: str, **kwargs):
-    """Sync facade over :func:`sample_asset_async` (worker call sites are sync)."""
-    return asyncio.run(sample_asset_async(grid, cells, href, **kwargs))
+    """Sync facade over :func:`sample_asset_async` (worker call sites are sync).
+
+    Safe to call under an already-running event loop (Jupyter/Binder): when one
+    is detected the coroutine runs to completion on a one-shot worker thread and
+    the result is returned synchronously. Async callers should prefer awaiting
+    :func:`sample_asset_async` directly.
+    """
+    try:
+        asyncio.get_running_loop()
+    except RuntimeError:
+        return asyncio.run(sample_asset_async(grid, cells, href, **kwargs))
+
+    def _run():
+        return asyncio.run(sample_asset_async(grid, cells, href, **kwargs))
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=1) as ex:
+        return ex.submit(_run).result()
 
 
 __all__ = ["sample_asset", "sample_asset_async"]
