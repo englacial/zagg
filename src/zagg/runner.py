@@ -606,7 +606,10 @@ def _run_lambda_events(
 
     ``events`` items are URI-shaped dicts (the by-reference twin of the local
     backend's in-memory tuples): ``{"event_key", "event_mask_uri",
-    "collection_uris", "static_uris", "s3_credentials"?}``. The worker loads
+    "collection_uris", "static_uris", "s3_credentials"?}``. Events without
+    per-event ``s3_credentials`` get the shared credentials fetched once from
+    the ``data_source.credentials_provider`` registry name, when the config
+    sets one (issue #213 Phase 4). The worker loads
     each event's inputs from S3 itself, which keeps the async request payload
     far under the 256 KB Event cap (masks travel by URI, not by value -- unlike
     the AR repo's inline base64 masks, which only fit a synchronous invoke).
@@ -649,6 +652,20 @@ def _run_lambda_events(
         raise ValueError(f"Unknown invocation: {invocation!r} (expected 'async' or 'sync')")
     if function_name is None:
         function_name = os.environ.get("ZAGG_LAMBDA_FUNCTION_NAME", "process-shard")
+
+    # Orchestrator-side credential fetch (issue #213, Phase 4): a config-named
+    # provider is resolved through the registry and called ONCE (DAAC creds
+    # last ~1 h, far past the fan-out), then attached to every event that does
+    # not carry its own per-event s3_credentials.
+    provider_name = (config.data_source or {}).get("credentials_provider")
+    if provider_name:
+        from zagg import registry as zagg_registry
+
+        shared_creds = zagg_registry.get_credential_provider(provider_name)()
+        event_list = [
+            ev if ev.get("s3_credentials") else {**ev, "s3_credentials": shared_creds}
+            for ev in event_list
+        ]
 
     n = len(event_list)
     logger.info(f"Processing {n} events (lambda)")

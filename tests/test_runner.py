@@ -2154,7 +2154,7 @@ class TestTemporalLambdaStrategy:
     write, per-event failure isolation, spatial machinery reused (preflight
     probe seams, LambdaExecutor, LAMBDA_RETRY)."""
 
-    def _drive(self, monkeypatch, *, events=None, fake_invoke=None, **agg_kwargs):
+    def _drive(self, monkeypatch, *, events=None, fake_invoke=None, config=None, **agg_kwargs):
         from unittest.mock import MagicMock
 
         import boto3
@@ -2208,7 +2208,7 @@ class TestTemporalLambdaStrategy:
         monkeypatch.setattr(runner, "_write_tabular_output", _fake_write)
 
         summary = agg(
-            _temporal_s3_config(),
+            _temporal_s3_config() if config is None else config,
             backend="lambda",
             events=_uri_events() if events is None else events,
             **agg_kwargs,
@@ -2237,6 +2237,40 @@ class TestTemporalLambdaStrategy:
         assert summary["gb_seconds"] == pytest.approx(2.0 * 4.0)  # 2 s x 4 GB
         assert summary["results"] == written["rows"]
         assert summary["failures"] == []
+
+    def test_credentials_provider_fetched_once_and_injected(self, monkeypatch):
+        # data_source.credentials_provider resolves through the registry, is
+        # called once, and fills s3_credentials on events lacking their own;
+        # per-event credentials take precedence (issue #213 Phase 4).
+        from zagg import registry as zagg_registry
+
+        calls = {"n": 0}
+
+        def _provider():
+            calls["n"] += 1
+            return {"accessKeyId": "shared"}
+
+        zagg_registry.register_credential_provider("test_provider", _provider, replace=True)
+        try:
+            cfg = _temporal_s3_config()
+            cfg.data_source["credentials_provider"] = "test_provider"
+            events = _uri_events()
+            events[0]["s3_credentials"] = {"accessKeyId": "per-event"}
+            _, captured = self._drive(monkeypatch, config=cfg, events=events)
+            creds_by_key = {
+                ev["event_key"]: ev.get("s3_credentials") for ev, _ in captured["invokes"]
+            }
+            assert calls["n"] == 1
+            assert creds_by_key["storm1"] == {"accessKeyId": "per-event"}
+            assert creds_by_key["storm2"] == {"accessKeyId": "shared"}
+        finally:
+            zagg_registry.CREDENTIAL_PROVIDERS._entries.pop("test_provider", None)
+
+    def test_unknown_credentials_provider_fails_before_invoking(self, monkeypatch):
+        cfg = _temporal_s3_config()
+        cfg.data_source["credentials_provider"] = "not_a_provider"
+        with pytest.raises(KeyError, match="not_a_provider"):
+            self._drive(monkeypatch, config=cfg)
 
     def test_temporal_summary_carries_container_rollup(self, monkeypatch):
         # Issue #171: the temporal path aggregates the same worker container
