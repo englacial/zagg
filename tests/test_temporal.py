@@ -218,6 +218,7 @@ class TestSpecsFromConfig:
             "negate",
             "transform",
             "trigger",
+            "trigger_mask",
         }
         for spec in specs:
             assert set(spec) == required, f"bad keys for {spec['output_name']}"
@@ -417,6 +418,67 @@ class TestMaskProviders:
 
 
 # ---------------------------------------------------------------------------
+# Event triggers
+# ---------------------------------------------------------------------------
+
+
+def _trigger_inputs():
+    """3-timestep event that first touches the single ice cell at t1."""
+    xr = pytest.importorskip("xarray")
+    lat = np.array([-70.0, -69.5])
+    lon = np.array([0.0, 0.5])
+    time = np.array(["2020-01-01T00", "2020-01-01T03", "2020-01-01T06"], dtype="datetime64[ns]")
+    coords = {"time": time, "lat": lat, "lon": lon}
+    footprints = np.array(
+        [
+            [[0, 1], [1, 1]],  # t0: ocean only
+            [[1, 1], [0, 0]],  # t1: first landfall (covers the ice cell)
+            [[1, 0], [0, 0]],  # t2: still on ice
+        ],
+        dtype=float,
+    )
+    event_mask = xr.DataArray(footprints, dims=["time", "lat", "lon"], coords=coords)
+    ais = xr.DataArray(
+        np.array([[1, 0], [0, 0]], dtype=float),
+        dims=["lat", "lon"],
+        coords={"lat": lat, "lon": lon},
+    )
+    return event_mask, {"ais_mask": ais}, time
+
+
+class TestFirstIntersectionTrigger:
+    def test_returns_first_overlap_timestep(self):
+        from zagg.temporal import first_intersection
+
+        event_mask, static, time = _trigger_inputs()
+        assert first_intersection(event_mask, static, {}) == time[1]
+
+    def test_no_overlap_returns_empty(self):
+        from zagg.temporal import first_intersection
+
+        event_mask, static, _ = _trigger_inputs()
+        never = event_mask.where(event_mask["lat"] != -70.0, 0)  # clear the ice row
+        out = first_intersection(never, static, {})
+        assert np.atleast_1d(out).size == 0
+
+    def test_trigger_mask_key_selects_static_field(self):
+        from zagg.temporal import first_intersection
+
+        event_mask, static, time = _trigger_inputs()
+        # A shelf mask on the other row: the t0 footprint already covers it.
+        shelf = static["ais_mask"].copy()
+        shelf.values[:] = [[0, 0], [1, 0]]
+        out = first_intersection(event_mask, {"shelf_mask": shelf}, {"trigger_mask": "shelf_mask"})
+        assert out == time[0]
+
+    def test_registered_with_landfall_alias(self):
+        from zagg.temporal import first_intersection
+
+        assert registry.get_event_trigger("first_intersection") is first_intersection
+        assert registry.get_event_trigger("first_landfall") is first_intersection
+
+
+# ---------------------------------------------------------------------------
 # process_event end-to-end on synthetic data
 # ---------------------------------------------------------------------------
 
@@ -551,6 +613,53 @@ class TestProcessEvent:
         specs[0]["temporal_reducer"] = "sum"
         with pytest.raises(ValueError, match="cell_areas"):
             process_event("storm1", event_mask, collections, specs, {})
+
+    def _gated_inputs(self):
+        # Trigger fixture (landfall at t1) + a variable rising 10/20/30 so the
+        # captured value identifies which timestep updated the accumulator.
+        xr = pytest.importorskip("xarray")
+        event_mask, static, time = _trigger_inputs()
+        var = xr.DataArray(
+            np.stack([np.full((2, 2), v) for v in (10.0, 20.0, 30.0)]),
+            dims=["time", "lat", "lon"],
+            coords=event_mask.coords,
+        )
+        collections = {"merra2": xr.Dataset({"SLP": var})}
+        specs = [
+            {
+                "output_name": "slp_at_landfall",
+                "variable": "SLP",
+                "collection": "merra2",
+                "spatial_func": "min",
+                "temporal_reducer": "first_landfall",
+                "mask": "full",
+                "trigger": "first_landfall",
+            }
+        ]
+        return event_mask, collections, specs, static
+
+    def test_trigger_gates_to_landfall_timestep(self):
+        # Without the trigger, first_landfall (a first-value capture) would
+        # take t0's value (10); gated, it must take the landfall timestep's.
+        event_mask, collections, specs, static = self._gated_inputs()
+        results, meta = process_event("storm1", event_mask, collections, specs, static)
+        assert results["slp_at_landfall"] == pytest.approx(20.0)
+        assert meta["timesteps_processed"] == 3
+
+    def test_never_landfalling_event_yields_nan(self):
+        event_mask, collections, specs, static = self._gated_inputs()
+        never = event_mask.where(event_mask["lat"] != -70.0, 0)  # clear the ice row
+        results, _ = process_event("storm1", never, collections, specs, static)
+        assert np.isnan(results["slp_at_landfall"])
+
+    @pytest.mark.parametrize("batch", [1, 2])
+    def test_trigger_gating_survives_batching(self, batch):
+        # The triggered timestep must fire even when it falls mid-batch.
+        event_mask, collections, specs, static = self._gated_inputs()
+        results, _ = process_event(
+            "storm1", event_mask, collections, specs, static, max_resident_timesteps=batch
+        )
+        assert results["slp_at_landfall"] == pytest.approx(20.0)
 
 
 class TestSpatialFunctionEdges:
