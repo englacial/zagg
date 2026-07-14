@@ -263,6 +263,12 @@ class TestCollectionOptions:
         with pytest.raises(ValueError, match="mapping of options"):
             validate_config(self._cfg({"merra2": ["time_offset"]}))
 
+    def test_credentials_provider_must_be_string(self):
+        cfg = self._cfg(["merra2"])
+        cfg.data_source["credentials_provider"] = ["gesdisc"]
+        with pytest.raises(ValueError, match="credentials_provider"):
+            validate_config(cfg)
+
 
 # ---------------------------------------------------------------------------
 # ATL03 template

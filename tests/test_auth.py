@@ -110,3 +110,19 @@ def test_ensure_logged_in_warms_singleton_with_retry(monkeypatch):
     calls = _login_seq(monkeypatch, OSError(101, "unreachable"), _FakeAuth())
     auth.ensure_logged_in()  # returns None; must not raise
     assert calls["n"] == 2  # transient failure retried, then succeeded
+
+
+def test_gesdisc_s3_credentials_requests_gesdisc_daac(monkeypatch):
+    """GES DISC creds are the NSIDC flow parameterized by DAAC (issue #213 Phase 4)."""
+    _login_seq(monkeypatch, _FakeAuth())
+    creds = auth.get_gesdisc_s3_credentials()
+    assert creds["daac"] == "GES_DISC"
+
+
+def test_daac_credential_providers_registered():
+    """nsidc/gesdisc resolve by name so configs can select them (issue #213 Phase 4)."""
+    from zagg import registry
+
+    assert {"nsidc", "gesdisc"} <= set(registry.list_credential_providers())
+    assert registry.get_credential_provider("nsidc") is auth.get_nsidc_s3_credentials
+    assert registry.get_credential_provider("gesdisc") is auth.get_gesdisc_s3_credentials

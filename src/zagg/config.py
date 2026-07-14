@@ -560,6 +560,12 @@ def _validate_temporal_config(config: PipelineConfig) -> None:
                 f"{', '.join(missing)} (need {', '.join(_TEMPORAL_SPEC_KEYS)})"
             )
     _validate_collection_options(config)
+    provider = (config.data_source or {}).get("credentials_provider")
+    if provider is not None and not isinstance(provider, str):
+        raise ValueError(
+            "data_source.credentials_provider must be a credential-provider "
+            f"registry name string, e.g. 'nsidc' or 'gesdisc' (got {provider!r})"
+        )
 
 
 _RESAMPLE_HOWS = ("sum", "mean")

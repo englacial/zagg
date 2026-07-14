@@ -17,6 +17,8 @@ import time
 
 import earthaccess
 
+from . import registry
+
 logger = logging.getLogger(__name__)
 
 # ``earthaccess.login()`` makes an HTTPS call to ``urs.earthdata.nasa.gov`` to
@@ -123,5 +125,36 @@ def get_nsidc_s3_credentials() -> dict:
     }
     ```
     """
+    return get_daac_s3_credentials("NSIDC")
+
+
+def get_daac_s3_credentials(daac: str) -> dict:
+    """Return temporary S3 credentials for a NASA DAAC (direct S3 access).
+
+    The generic form of :func:`get_nsidc_s3_credentials` (issue #213, Phase 4):
+    same orchestrator-side call-once contract and ~1 h validity, with the DAAC
+    selected by whatever name ``earthaccess`` accepts (e.g. ``"NSIDC"``,
+    ``"GES_DISC"``). DAAC S3 endpoints are in-region only (us-west-2).
+    """
     auth = _login_with_retry()
-    return auth.get_s3_credentials(daac="NSIDC")
+    return auth.get_s3_credentials(daac=daac)
+
+
+def get_gesdisc_s3_credentials() -> dict:
+    """Return temporary S3 credentials for GES DISC (MERRA-2 and friends)."""
+    return get_daac_s3_credentials("GES_DISC")
+
+
+registry.register_credential_provider(
+    "nsidc",
+    get_nsidc_s3_credentials,
+    description="Earthdata temporary S3 credentials for NSIDC (ICESat-2 products)",
+)
+registry.register_credential_provider(
+    "gesdisc",
+    get_gesdisc_s3_credentials,
+    description="Earthdata temporary S3 credentials for GES DISC (MERRA-2 reanalysis)",
+)
+
+#: The credential-provider registry (``zagg.registry.CREDENTIAL_PROVIDERS``).
+CREDENTIAL_PROVIDERS = registry.CREDENTIAL_PROVIDERS
