@@ -17,6 +17,7 @@ from zagg.config import get_raster_bands, load_config_from_dict, validate_config
 from zagg.grids import HealpixGrid, RectilinearGrid
 from zagg.processing.raster import (
     _run_sync,
+    _shard_cell_range,
     emit_raster_template,
     process_raster_shard,
     raster_group_spec,
@@ -244,6 +245,34 @@ class TestOwnership:
             assert (red[:, xs > 300970] == bval).all()  # B-only region
             assert (red[:, (xs > 300740) & (xs < 300960)] == bval).all()  # B side of overlap
 
+    def test_three_item_ownership(self, tmp_path):
+        # Three overlapping tiles offset 480 m apart, one datatake, distinct
+        # constants: every cell must take the nearest tile center's value.
+        for name, const, ox in (("a", 100, 0.0), ("b", 200, 480.0), ("c", 300, 960.0)):
+            _write_tiff(
+                tmp_path / f"{name}.tif",
+                np.full((96, 96), const, dtype=np.uint16),
+                origin=(ORIGIN[0] + ox, ORIGIN[1]),
+            )
+        bounds = [ORIGIN[0], ORIGIN[1] - 960.0, ORIGIN[0] + 1920.0, ORIGIN[1]]
+        grid = _rect_grid(bounds, [96, 192])
+        cfg = _raster_config(bands={"red": {"asset": "red", "dtype": "uint16"}})
+        granules = [
+            _entry("A", {"red": str(tmp_path / "a.tif")}, T0, time_key="dt-1"),
+            _entry("B", {"red": str(tmp_path / "b.tif")}, T0B, time_key="dt-1"),
+            _entry("C", {"red": str(tmp_path / "c.tif")}, T0B, time_key="dt-1"),
+        ]
+        index, _ = raster_time_index([granules])
+        slabs, meta = process_raster_shard(grid, 0, granules, cfg, index)
+        assert meta["timesteps"] == 1
+        red = slabs[0]["red"].reshape(96, 192)
+        xs = ORIGIN[0] + (np.arange(192) + 0.5) * RES
+        assert (red[:, xs < 300470] == 100).all()  # A-only region
+        assert (red[:, (xs > 300740) & (xs < 300950)] == 200).all()  # A/B overlap, B nearer
+        assert (red[:, (xs > 301000) & (xs < 301180)] == 200).all()  # B/C overlap, B nearer
+        assert (red[:, (xs > 301220) & (xs < 301430)] == 300).all()  # B/C overlap, C nearer
+        assert (red[:, xs > 301450] == 300).all()  # C-only region
+
     def test_single_item_timesteps_and_skips(self, tmp_path):
         _write_tiff(tmp_path / "a.tif", np.full((96, 96), 7, dtype=np.uint16))
         grid = _rect_grid([ORIGIN[0], ORIGIN[1] - 960.0, ORIGIN[0] + 960.0, ORIGIN[1]], [96, 96])
@@ -333,3 +362,56 @@ class TestTemplateAndSlabs:
             ids[:], np.asarray(grid.encode_cell_ids(cells), dtype=np.uint64)
         )
         assert valid.sum() > 50  # the 960 m raster covers many ~97 m cells
+
+    def test_zero_time_template(self, tmp_path):
+        # An empty-times template (no datatakes yet) must emit, not crash.
+        cfg, grid, _shard = _healpix_setup(tmp_path)
+        spec = raster_group_spec(grid, cfg, 0)
+        assert tuple(spec.members["time"].shape) == (0,)
+        store = MemoryStore()
+        emit_raster_template(store, grid, cfg, np.array([], dtype=np.int64))
+        red = open_array(store, path=f"{grid.group_path}/red", zarr_format=3, consolidated=False)
+        assert red.shape == (0, 4096)
+
+    def test_time_attrs_round_trip(self, tmp_path):
+        cfg, grid, _shard = _healpix_setup(tmp_path)
+        store = MemoryStore()
+        emit_raster_template(store, grid, cfg, np.array([1_000_000, 2_000_000], dtype=np.int64))
+        tarr = open_array(store, path=f"{grid.group_path}/time", zarr_format=3, consolidated=False)
+        assert tarr.attrs["units"] == "microseconds since 1970-01-01T00:00:00"
+        assert tarr.attrs["calendar"] == "proleptic_gregorian"
+
+    def test_fullsphere_end_to_end_slab(self, tmp_path):
+        # Fullsphere layout: shape 12*4^child, one shard == cells_per_shard.
+        from mortie import clip2order, geo2mort
+
+        to_wgs = Transformer.from_crs(CRS(UTM18), CRS("EPSG:4326"), always_xy=True)
+        lon, lat = to_wgs.transform(ORIGIN[0] + 480.0, ORIGIN[1] - 480.0)
+        leaf = geo2mort(np.array([lat]), np.array([lon]), order=29, points=True)
+        shard = int(clip2order(4, leaf)[0])
+        cfg = _raster_config(
+            bands={"red": {"asset": "red", "dtype": "uint16"}},
+            grid={"type": "healpix", "parent_order": 4, "child_order": 8},
+        )
+        grid = HealpixGrid(4, 8, layout="fullsphere", config=cfg)
+        data = _index_raster()
+        _write_tiff(tmp_path / "r.tif", data)
+        granules = [_entry("g", {"red": str(tmp_path / "r.tif")}, T0, time_key="dt-1")]
+        index, times = raster_time_index([granules])
+
+        store = MemoryStore()
+        emit_raster_template(store, grid, cfg, times)
+        slabs, meta = process_raster_shard(grid, shard, granules, cfg, index)
+        for t, slab in slabs.items():
+            write_raster_slab(store, grid, shard, t, slab)
+        write_raster_coords(store, grid, shard)
+
+        red = open_array(store, path=f"{grid.group_path}/red", zarr_format=3, consolidated=False)
+        assert red.shape == (1, 12 * 4**8)  # 786432
+        start, stop = _shard_cell_range(grid, shard)
+        assert stop - start == 256  # 4^(child - parent)
+        cells = grid.children(shard)
+        rows, cols, valid = grid.sample(cells, UTM18, TRANSFORM, (96, 96))
+        got = red[0, start:stop]
+        np.testing.assert_array_equal(got[valid], data[rows[valid], cols[valid]])
+        assert (got[~valid] == 0).all()  # fill outside the raster footprint
