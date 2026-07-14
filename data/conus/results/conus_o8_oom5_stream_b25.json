@@ -1,0 +1,97 @@
+{
+  "issue": 202,
+  "temporal": {
+    "start": "2018-10-13",
+    "end": "2026-03-15"
+  },
+  "n_shards": 5,
+  "order": 8,
+  "cold_backend": "inline",
+  "cold": {
+    "per_shard": [
+      {
+        "shard_label": "321241241",
+        "shard_key": 3779012668573089800,
+        "n_granules": 120,
+        "runtime_s": 654.631919,
+        "gb_seconds": 2618.527676,
+        "cost_usd": 0.0349138769151784,
+        "max_memory_mb": 2198.01171875,
+        "wall_time_s": 675.8061938285828,
+        "retries": 0,
+        "timeout": false,
+        "status_code": 200,
+        "error": null
+      },
+      {
+        "shard_label": "322311213",
+        "shard_key": 3855397940377944072,
+        "n_granules": 85,
+        "runtime_s": 714.641107,
+        "gb_seconds": 2858.564428,
+        "cost_usd": 0.0381143829442952,
+        "max_memory_mb": 2191.890625,
+        "wall_time_s": 739.6363573074341,
+        "retries": 0,
+        "timeout": false,
+        "status_code": 200,
+        "error": null
+      },
+      {
+        "shard_label": "321242332",
+        "shard_key": 3780367266898509832,
+        "n_granules": 148,
+        "runtime_s": 0.0,
+        "gb_seconds": 0.0,
+        "cost_usd": 0.0,
+        "max_memory_mb": null,
+        "wall_time_s": 991.7664699554443,
+        "retries": 0,
+        "timeout": false,
+        "status_code": null,
+        "error": "no worker result within 990s (worker timed out, was OOM-killed, or crashed before writing its result (check CloudWatch) -- or the deployed worker predates result_url support: redeploy the function, or pass invocation=\"sync\")"
+      },
+      {
+        "shard_label": "323242322",
+        "shard_key": 3924412086230188040,
+        "n_granules": 155,
+        "runtime_s": 0.0,
+        "gb_seconds": 0.0,
+        "cost_usd": 0.0,
+        "max_memory_mb": null,
+        "wall_time_s": 993.929318189621,
+        "retries": 0,
+        "timeout": false,
+        "status_code": null,
+        "error": "no worker result within 990s (worker timed out, was OOM-killed, or crashed before writing its result (check CloudWatch) -- or the deployed worker predates result_url support: redeploy the function, or pass invocation=\"sync\")"
+      },
+      {
+        "shard_label": "323224343",
+        "shard_key": 3917815016463532040,
+        "n_granules": 176,
+        "runtime_s": 0.0,
+        "gb_seconds": 0.0,
+        "cost_usd": 0.0,
+        "max_memory_mb": null,
+        "wall_time_s": 994.8029928207397,
+        "retries": 0,
+        "timeout": false,
+        "status_code": null,
+        "error": "no worker result within 990s (worker timed out, was OOM-killed, or crashed before writing its result (check CloudWatch) -- or the deployed worker predates result_url support: redeploy the function, or pass invocation=\"sync\")"
+      }
+    ],
+    "fit": {
+      "n_points": 2,
+      "sec_per_granule": -1.7145,
+      "intercept_s": 860.38,
+      "r_squared": 1.0,
+      "granule_range": [
+        85,
+        120
+      ]
+    },
+    "lambda_seconds": 1369.273026,
+    "cost_usd": 0.0730282598594736
+  },
+  "warm": null
+}
