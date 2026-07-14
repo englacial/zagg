@@ -240,6 +240,14 @@ class TestGranuleRecordsAssets:
         assert rec["s3"] == "s3://b/g1.h5"
         assert "assets" not in rec
 
+    def test_preserved_thumbnail_keeps_pre218_shape(self):
+        # A CMR record grown a preserved thumbnail asset must not sprout
+        # ``assets``/``datetime`` -- it still has a canonical data asset (#218).
+        assets = _h5_assets("g1")
+        assets["thumbnail_0"] = {"href": "https://h/g1_thumb.jpg", "roles": ["thumbnail"]}
+        rec = _catalog([_item("g1", assets)]).granule_records()[0]
+        assert set(rec) == {"id", "https", "s3", "lats", "lons"}
+
     def test_geoparquet_round_trip_preserves_assets(self, tmp_path):
         cat = _catalog([_item("s2a", _s2_assets("s2a"))], {"source": "STAC"})
         path = str(tmp_path / "cat.parquet")

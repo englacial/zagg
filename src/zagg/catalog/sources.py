@@ -398,10 +398,12 @@ class Catalog:
             Each: ``{"id", "s3", "https", "lats", "lons"}`` where ``lats``/
             ``lons`` are the footprint exterior-ring coordinate arrays (WGS84)
             and ``s3``/``https`` are the canonical data-asset hrefs (either may
-            be None). Multi-asset items (raster sources, #218) additionally
-            carry ``assets`` (``{key: href}`` for every non-canonical asset)
-            and ``datetime`` (ISO acquisition time); canonical single-asset
-            records keep their exact pre-#218 shape.
+            be None). Records with *no* canonical data asset (raster sources,
+            #218) additionally carry ``assets`` (``{key: href}`` for every
+            non-canonical asset) and ``datetime`` (ISO acquisition time); any
+            record with a ``data``/``data_s3`` asset -- every CMR record,
+            including ``preserve_thumbnails=True`` -- keeps its exact pre-#218
+            shape.
         """
         import shapely
 
@@ -420,8 +422,9 @@ class Catalog:
                 continue
             poly = geom if geom.geom_type == "Polygon" else max(geom.geoms, key=lambda g: g.area)
             x, y = poly.exterior.coords.xy
-            data = (asset_map or {}).get("data") or {}
-            data_s3 = (asset_map or {}).get("data_s3") or {}
+            asset_map = asset_map or {}
+            data = asset_map.get("data") or {}
+            data_s3 = asset_map.get("data_s3") or {}
             rec = {
                 "id": gid,
                 "https": data.get("href"),
@@ -429,18 +432,21 @@ class Catalog:
                 "lats": np.asarray(y),
                 "lons": np.asarray(x),
             }
-            extra = {
-                k: (a or {}).get("href")
-                for k, a in (asset_map or {}).items()
-                if k not in ("data", "data_s3", "metadata") and (a or {}).get("href")
-            }
-            # Only multi-asset (raster) records grow the extra keys: canonical
-            # single-asset records stay byte-identical through granule_records
-            # -> ShardMap so existing manifests don't change shape (#218).
-            if extra:
-                rec["assets"] = extra
-                if dt is not None:
-                    rec["datetime"] = dt.isoformat()
+            # Only records with no canonical data asset (raster sources) grow
+            # the extra keys; any record carrying data/data_s3 -- every CMR
+            # record, including preserve_thumbnails -- stays byte-identical
+            # through granule_records -> ShardMap so existing manifests don't
+            # change shape (#218).
+            if "data" not in asset_map and "data_s3" not in asset_map:
+                extra = {
+                    k: (a or {}).get("href")
+                    for k, a in asset_map.items()
+                    if k not in ("data", "data_s3", "metadata") and (a or {}).get("href")
+                }
+                if extra:
+                    rec["assets"] = extra
+                    if dt is not None:
+                        rec["datetime"] = dt.isoformat()
             records.append(rec)
         return records
 
