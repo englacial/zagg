@@ -50,16 +50,19 @@ CONUS_BBOX = (-124.706553, 25.120779, -66.979601, 49.383625)
 EXPECT_ACCOUNT = "742127912612"
 
 
-def build_submap(catalog_path: str, grid) -> "object":
-    """Full CONUS shard map, subset to the 25 selected shard labels (cached)."""
+def build_submap(catalog_path: str, grid, selection_path=SELECTION, submap_path=SUBMAP) -> "object":
+    """Full CONUS shard map, subset to the selected shard labels (cached)."""
+    from pathlib import Path
+
     from zagg.catalog.shardmap import ShardMap
     from zagg.catalog.sources import Catalog
 
-    if SUBMAP.exists():
-        print(f"loading cached sub-shardmap {SUBMAP.name}", flush=True)
-        return ShardMap.from_json(str(SUBMAP))
+    selection_path, submap_path = Path(selection_path), Path(submap_path)
+    if submap_path.exists():
+        print(f"loading cached sub-shardmap {submap_path.name}", flush=True)
+        return ShardMap.from_json(str(submap_path))
 
-    want = {s["shard_label"] for s in json.loads(SELECTION.read_text())["shards"]}
+    want = {s["shard_label"] for s in json.loads(selection_path.read_text())["shards"]}
     print(f"building full CONUS shard map to extract {len(want)} shards ...", flush=True)
     catalog = Catalog.from_geoparquet(catalog_path)
     sub = _prefilter(catalog, CONUS_BBOX, START, END)
@@ -77,9 +80,9 @@ def build_submap(catalog_path: str, grid) -> "object":
     meta = dict(full.metadata or {})
     meta["subset"] = f"CONUS regression: {len(keep_keys)} stratified shards (issue #202)"
     sub_sm = ShardMap(full.grid_signature, keep_keys, keep_granules, meta, None)
-    sub_sm.to_json(str(SUBMAP))
+    sub_sm.to_json(str(submap_path))
     print(
-        f"wrote {SUBMAP.name}: {len(keep_keys)} shards, "
+        f"wrote {submap_path.name}: {len(keep_keys)} shards, "
         f"{sum(len(g) for g in keep_granules)} granule-reads",
         flush=True,
     )
@@ -92,8 +95,8 @@ def _sample_granule_id(sm) -> str:
     return gid[:-3] if gid.endswith(".h5") else gid
 
 
-def _manifest_exists(granule_id: str) -> bool:
-    uri = f"{SIDECAR_STORE}/{granule_id}.parquet"
+def _manifest_exists(granule_id: str, store: str = SIDECAR_STORE) -> bool:
+    uri = f"{store}/{granule_id}.parquet"
     r = subprocess.run(["aws", "s3", "ls", uri], capture_output=True, text=True)
     return r.returncode == 0 and bool(r.stdout.strip())
 
@@ -172,34 +175,105 @@ def main() -> int:
     ap.add_argument("--region", default="us-west-2")
     ap.add_argument("--function-name", default="process-shard")
     ap.add_argument("--out", default=str(HERE / "results" / "conus_regression_results.json"))
+    ap.add_argument("--order", type=int, default=9, help="override parent_order (e.g. 8)")
+    ap.add_argument("--config", default=str(CONFIG))
+    ap.add_argument("--selection", default=str(SELECTION))
+    ap.add_argument("--submap", default=str(SUBMAP))
+    ap.add_argument(
+        "--sidecar-store",
+        default=SIDECAR_STORE,
+        help="sidecar manifest store (used only when --index-backend is left as sidecar)",
+    )
+    ap.add_argument(
+        "--index-backend",
+        default=None,
+        help="replace data_source.index with {backend: <this>} (e.g. 'inline' for a "
+        "cache-independent, genuinely-uncached cold-start pass). Drops sidecar keys.",
+    )
+    ap.add_argument(
+        "--cold-only",
+        action="store_true",
+        help="run one uncached pass only (no sidecar write-check, no warm pass) -- the "
+        "inline cold-start estimate. Pair with --index-backend inline.",
+    )
+    ap.add_argument(
+        "--buffer-granules",
+        type=int,
+        default=None,
+        help="enable streaming aggregation with this buffer size -- bounds peak memory "
+        "to one buffer + running digests instead of pooling the whole shard (lets "
+        "coarse orders like o8 fit 4 GB).",
+    )
     ap.add_argument("--dry-run", action="store_true")
     args = ap.parse_args()
 
     from zagg.config import load_config
     from zagg.grids import from_config
 
-    config = load_config(str(CONFIG))
+    config = load_config(args.config)
+    if args.index_backend:
+        config.data_source["index"] = {"backend": args.index_backend}
+    else:
+        config.data_source["index"]["store"] = args.sidecar_store
+    if args.buffer_granules:
+        config.aggregation["streaming"] = {"buffer_granules": args.buffer_granules}
+    if args.order != 9:
+        config.output.setdefault("grid", {})["parent_order"] = args.order
     grid = from_config(config)
-    sm = build_submap(args.catalog, grid)
-    sm.to_json(str(SUBMAP))
+    sm = build_submap(args.catalog, grid, args.selection, args.submap)
+    sm.to_json(args.submap)
     counts = sorted(len(g) for g in sm.granules)
-    print(f"25-shard sub-map: granule counts {counts}", flush=True)
+    print(
+        f"{len(sm.shard_keys)}-shard sub-map (o{args.order}): granule counts {counts}", flush=True
+    )
 
     if args.dry_run:
         print("dry-run: built sub-map, no dispatch.")
         return 0
 
+    if args.cold_only:
+        _assert_account(args.region, EXPECT_ACCOUNT)
+        backend = config.data_source["index"]["backend"]
+        print(f"\n=== COLD-ONLY PASS (uncached, backend={backend}) ===", flush=True)
+        cold, cold_sum = dispatch(
+            config, args.submap, f"{args.store_prefix}-cold", args.region, args.function_name
+        )
+        out = {
+            "issue": 202,
+            "temporal": {"start": START, "end": END},
+            "n_shards": len(sm.shard_keys),
+            "order": args.order,
+            "cold_backend": backend,
+            "cold": {
+                "per_shard": cold,
+                "fit": _fit(cold),
+                "lambda_seconds": cold_sum.get("lambda_time_s"),
+                "cost_usd": cold_sum.get("estimated_cost_usd"),
+            },
+            "warm": None,
+        }
+        outp = Path(args.out)
+        outp.parent.mkdir(parents=True, exist_ok=True)
+        outp.write_text(json.dumps(out, indent=2))
+        print(f"\ncold-only fit ({backend}): {out['cold']['fit']}")
+        print(f"wrote {outp}")
+        return 0
+
     _assert_account(args.region, EXPECT_ACCOUNT)
     sample_gid = _sample_granule_id(sm)
-    pre = _manifest_exists(sample_gid)
-    print(f"pre-cold sidecar for {sample_gid}: {'PRESENT' if pre else 'absent'}", flush=True)
+    pre = _manifest_exists(sample_gid, args.sidecar_store)
+    print(
+        f"pre-cold sidecar for {sample_gid} in {args.sidecar_store}: "
+        f"{'PRESENT' if pre else 'absent'}",
+        flush=True,
+    )
 
     print("\n=== COLD PASS (build sidecars) ===", flush=True)
     cold, cold_sum = dispatch(
-        config, str(SUBMAP), f"{args.store_prefix}-cold", args.region, args.function_name
+        config, args.submap, f"{args.store_prefix}-cold", args.region, args.function_name
     )
 
-    post = _manifest_exists(sample_gid)
+    post = _manifest_exists(sample_gid, args.sidecar_store)
     print(f"post-cold sidecar for {sample_gid}: {'PRESENT' if post else 'ABSENT'}", flush=True)
     if not post:
         raise SystemExit(
@@ -210,14 +284,15 @@ def main() -> int:
 
     print("\n=== WARM PASS (read sidecars) ===", flush=True)
     warm, warm_sum = dispatch(
-        config, str(SUBMAP), f"{args.store_prefix}-warm", args.region, args.function_name
+        config, args.submap, f"{args.store_prefix}-warm", args.region, args.function_name
     )
 
     out = {
         "issue": 202,
         "temporal": {"start": START, "end": END},
         "n_shards": len(sm.shard_keys),
-        "sidecar_store": SIDECAR_STORE,
+        "order": args.order,
+        "sidecar_store": args.sidecar_store,
         "sidecar_write_verified": bool(post and not pre),
         "cold": {
             "per_shard": cold,

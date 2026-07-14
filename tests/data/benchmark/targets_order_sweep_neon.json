@@ -1,5 +1,5 @@
 {
-  "description": "Order sweep (issue #202): NEON AOI at o8/o9/o10, inline nomask, for the sharding-order cost-efficiency test.",
+  "description": "Order sweep (issue #202): NEON AOI at o7/o8/o9/o10, inline nomask, for the sharding-order cost-efficiency test.",
   "aoi": {
     "file": "AOP_NEON.geojson",
     "name": "NEON SERC AOP box"
@@ -22,6 +22,14 @@
     "note": "process-shard on the 742127912612 deployment account; dispatch with AWS profile 'nasa'. The harness asserts the caller account matches expect_account before any billed invoke."
   },
   "targets": {
+    "order_sweep_neon_o7": {
+      "config": "configs/atl03_tdigest_healpix_o7.yaml",
+      "aggregator": "tdigest",
+      "grid_type": "healpix",
+      "grid_size": "o7",
+      "index_backend": "inline",
+      "aoi_mask": false
+    },
     "order_sweep_neon_o8": {
       "config": "configs/atl03_tdigest_healpix_o8.yaml",
       "aggregator": "tdigest",

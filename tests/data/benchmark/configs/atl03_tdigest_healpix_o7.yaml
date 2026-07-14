@@ -10,15 +10,13 @@
 # the centroid budget (accuracy knob): ~delta centroids per cell regardless of
 # photon count. Read the digests back with ``zagg.readers.tdigest_tensor``.
 #
-# Grid is HEALPix nested at child_order 19 (the ~10 m cell, now that mortie 0.8.1
-# resolves past the old order-18 reference cap). Multi-chunk-per-worker (issue
-# #30 item 3) is on: one shard (the dispatch unit, parent_order 8 = 2048x2048
-# cells) owns K = 1024 finer Zarr chunks (chunk_inner 13 = 64x64 cells each). The
-# worker reads the shard's granules once and writes 1024 chunk regions + 1024 CSR
-# groups, one per inner chunk. chunk_inner unset would collapse to K=1 (shard ==
-# chunk), byte-identical to the single-chunk path. o8 is the coarsest benchmark
-# order: at ~648 km^2 a single shard spans essentially the whole NEON AOI, so its
-# densest shard aggregates the entire dataset (o9-scale in photons).
+# Grid is HEALPix nested at child_order 19 (the ~10 m cell). This is the o7
+# extension of the order sweep (issue #202): one shard (parent_order 7 =
+# 4096x4096 cells, ~2,594 km^2 -- 4x the o8 shard area) owns K = 4096 finer Zarr
+# chunks (chunk_inner 13 = 64x64 cells each), collapsed to one object/shard by
+# ``sharded: true``. o7 is the coarsest order tested: it probes whether a shard
+# 4x the o8 area still fits the 4 GB / 900 s worker (the o8->o7 headroom question)
+# and where the fewer-shards-amortize-the-intercept cost trend saturates.
 #
 # Confidence filter, multi-level form and read_plan match atl03.yaml (the planned
 # segment->photon IO of issue #43 applies here too); only the aggregation differs.
@@ -93,7 +91,7 @@ output:
   grid:
     type: healpix
     indexing_scheme: nested
-    parent_order: 8              # shard / dispatch unit: 4^(19-8) = 2048x2048 cells
-    chunk_inner: 13              # inner Zarr chunk: 4^(19-13) = 64x64 cells (K=1024 per shard)
-    sharded: true                # issue #215: was missing (unsharded); fair o8 comparison
+    parent_order: 7              # shard / dispatch unit: 4^(19-7) = 4096x4096 cells
+    chunk_inner: 13              # inner Zarr chunk: 4^(19-13) = 64x64 cells (K=4096 per shard)
+    sharded: true                # collapse the K=4096 inner chunks to one object/shard
     child_order: 19              # leaf cell resolution (~10 m)
