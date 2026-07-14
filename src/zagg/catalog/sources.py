@@ -174,7 +174,9 @@ def _page_search(url, *, params=None, body=None, timeout=60) -> list[dict]:
         nxt = next((ln for ln in doc.get("links", []) if ln.get("rel") == "next"), None)
         if not nxt or not feats:
             break
-        url = nxt.get("href", url)
+        # Require the href -- a next link without one raises KeyError loudly
+        # rather than re-requesting the current url forever (#218).
+        url = nxt["href"]
         mode = "GET" if body is None else "POST"
         if str(nxt.get("method", mode)).upper() == "POST":
             nxt_body = nxt.get("body", {})

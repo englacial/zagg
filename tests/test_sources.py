@@ -136,7 +136,12 @@ class TestPageSearch:
             [
                 _page(
                     [_item("a", _s2_assets("a"))],
-                    {"method": "POST", "body": {"next": "tok"}, "merge": True},
+                    {
+                        "href": "https://es/search",
+                        "method": "POST",
+                        "body": {"next": "tok"},
+                        "merge": True,
+                    },
                 ),
                 _page([_item("b", _s2_assets("b"))]),
             ]
@@ -151,7 +156,10 @@ class TestPageSearch:
     def test_post_flow_next_without_method_stays_post(self, fake_requests):
         fake = fake_requests(
             [
-                _page([_item("a", _s2_assets("a"))], {"body": {"next": "tok"}}),
+                _page(
+                    [_item("a", _s2_assets("a"))],
+                    {"href": "https://es/search", "body": {"next": "tok"}},
+                ),
                 _page([], None),
             ]
         )
