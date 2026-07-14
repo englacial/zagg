@@ -206,15 +206,57 @@ class TestSTACSource:
         with pytest.raises(ValueError, match="No items"):
             STACSource("https://es/v1").fetch(query)
 
+    def test_partial_missing_item_skipped_and_recorded(self, fake_requests):
+        # One item missing a requested band is skipped, not fatal; the crawl
+        # survives and the skip is recorded in catalog metadata (#218).
+        full = _item("a", _s2_assets("a"))
+        partial = _item("b", {k: v for k, v in _s2_assets("b").items() if k != "scl"})
+        fake_requests([_page([full, partial])])
+        query = STACQuery(["sentinel-2-c1-l2a"], "2026-06-01", "2026-07-13", BBOX)
+        cat = STACSource("https://es/v1", assets=["red", "nir", "scl"]).fetch(query)
+        assert len(cat) == 1
+        assert cat.metadata["skipped_items"] == {"count": 1, "examples": ["b"]}
+        recs = cat.granule_records()
+        assert [r["id"] for r in recs] == ["a"]
+        assert set(recs[0]["assets"]) == {"red", "nir", "scl"}
+
+    def test_all_skipped_raises_with_keys(self, fake_requests):
+        fake_requests([_page([_item("a", _s2_assets("a"))])])
+        query = STACQuery(["sentinel-2-c1-l2a"], "2026-06-01", "2026-07-13", BBOX)
+        with pytest.raises(ValueError, match="all requested assets.*available keys"):
+            STACSource("https://es/v1", assets=["swir16"]).fetch(query)
+
+    def test_heterogeneous_union_no_corruption(self, fake_requests):
+        # A collection union with differing asset key sets (item b has an extra
+        # band): with no keep-list both are kept and stac-geoparquet unions the
+        # asset struct -- each record must carry only its own assets (#218).
+        a = _item("a", _s2_assets("a"))
+        b_assets = _s2_assets("b")
+        b_assets["rededge"] = {"href": "https://cogs.example/b/B05.tif", "roles": ["data"]}
+        fake_requests([_page([a, _item("b", b_assets)])])
+        query = STACQuery(
+            ["sentinel-2-c1-l2a", "sentinel-2-pre-c1-l2a"], "2026-06-01", "2026-07-13", BBOX
+        )
+        cat = STACSource("https://es/v1").fetch(query)
+        assert len(cat) == 2
+        assert "skipped_items" not in cat.metadata
+        recs = {r["id"]: r for r in cat.granule_records()}
+        assert set(recs["a"]["assets"]) == {"red", "nir", "scl", "thumbnail"}
+        assert set(recs["b"]["assets"]) == {"red", "nir", "scl", "thumbnail", "rededge"}
+
 
 class TestSubsetAssets:
     def test_keeps_requested(self):
         out = _subset_assets(_item("a", _s2_assets("a")), ["red", "scl"])
         assert set(out["assets"]) == {"red", "scl"}
 
-    def test_no_match_raises(self):
-        with pytest.raises(ValueError, match="none of the requested"):
-            _subset_assets(_item("a", _s2_assets("a")), ["swir16"])
+    def test_missing_all_returns_none(self):
+        assert _subset_assets(_item("a", _s2_assets("a")), ["swir16"]) is None
+
+    def test_missing_some_returns_none(self):
+        # Partial keep set -> None (per-item strict); a partial asset map
+        # would break the Phase 2 per-band reads (#218).
+        assert _subset_assets(_item("a", _s2_assets("a")), ["red", "swir16"]) is None
 
     def test_original_item_not_mutated(self):
         item = _item("a", _s2_assets("a"))

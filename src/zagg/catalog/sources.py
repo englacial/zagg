@@ -24,6 +24,7 @@ per granule so the aggregator can pick at run time via ``data_source.driver``.
 from __future__ import annotations
 
 import json
+import logging
 from dataclasses import dataclass, field
 
 import numpy as np
@@ -136,21 +137,19 @@ def _normalize_assets(item: dict, *, preserve_thumbnails: bool) -> dict:
     return item
 
 
-def _subset_assets(item: dict, keep: list[str]) -> dict:
+def _subset_assets(item: dict, keep: list[str]) -> dict | None:
     """Keep only the ``keep`` asset keys (stable per-collection keys, #218).
 
-    Raises if an item has none of the requested keys -- a silent empty asset
-    map would surface much later as an unreadable granule.
+    Per-item strict: returns the subset item only when it carries *every*
+    requested key, else ``None`` so the caller can skip it. A partial asset
+    map would break the Phase 2 reader's per-band reads, surfacing much later
+    as an unreadable granule.
     """
     have = item.get("assets", {})
-    out = {k: have[k] for k in keep if k in have}
-    if not out:
-        raise ValueError(
-            f"item {item.get('id')!r} has none of the requested assets "
-            f"{sorted(keep)}; available: {sorted(have)}"
-        )
+    if set(keep) - set(have):
+        return None
     item = dict(item)
-    item["assets"] = out
+    item["assets"] = {k: have[k] for k in keep}
     return item
 
 
@@ -311,9 +310,28 @@ class STACSource:
         if query.max_cloud_cover is not None:
             body["query"] = {"eo:cloud_cover": {"lt": query.max_cloud_cover}}
 
-        items = _page_search(f"{self.root}/search", body=body, timeout=self.timeout)
+        crawled = _page_search(f"{self.root}/search", body=body, timeout=self.timeout)
+        items, skipped_ids = crawled, []
         if self.assets is not None:
-            items = [_subset_assets(it, self.assets) for it in items]
+            items = []
+            for it in crawled:
+                sub = _subset_assets(it, self.assets)
+                (items if sub is not None else skipped_ids).append(
+                    sub if sub is not None else it.get("id")
+                )
+            if skipped_ids:
+                logging.warning(
+                    "STACSource: skipped %d item(s) missing requested assets %s; e.g. %s",
+                    len(skipped_ids),
+                    sorted(self.assets),
+                    skipped_ids[:5],
+                )
+            if crawled and not items:
+                example = sorted((crawled[0].get("assets") or {}))
+                raise ValueError(
+                    f"No items carry all requested assets {sorted(self.assets)} "
+                    f"(e.g. available keys: {example})"
+                )
         if not items:
             raise ValueError(
                 f"No items for {query.collections} over {bbox} in "
@@ -332,6 +350,8 @@ class STACSource:
             "assets": self.assets,
             "total_granules": len(items),
         }
+        if skipped_ids:
+            meta["skipped_items"] = {"count": len(skipped_ids), "examples": skipped_ids[:5]}
         return Catalog(_attach_meta(table, meta), meta)
 
 
