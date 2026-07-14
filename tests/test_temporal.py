@@ -192,6 +192,8 @@ def _temporal_config():
                         "spatial_func": "weighted_sum",
                         "temporal_reducer": "sum",
                         "mask": "ocean",
+                        "trigger": "first_intersection",
+                        "trigger_mask": "grounded_mask",
                     },
                 }
             },
@@ -232,6 +234,11 @@ class TestSpecsFromConfig:
         assert "is_anomaly" not in specs["anom_iwv_full"]
         # default mask is "ais" when omitted; here every spec sets it explicitly
         assert specs["rainfall_ocean"]["mask"] == "ocean"
+        # trigger/trigger_mask carry their configured *values* (not just keys)
+        assert specs["rainfall_ocean"]["trigger"] == "first_intersection"
+        assert specs["rainfall_ocean"]["trigger_mask"] == "grounded_mask"
+        assert specs["max_t2m_ais"]["trigger"] is None
+        assert specs["max_t2m_ais"]["trigger_mask"] is None
 
     def test_anomaly_sugar_equals_explicit_transform(self):
         # (a) `anomaly: true` produces the same spec as `transform: monthly_anomaly`.
@@ -470,6 +477,15 @@ class TestFirstIntersectionTrigger:
         shelf.values[:] = [[0, 0], [1, 0]]
         out = first_intersection(event_mask, {"shelf_mask": shelf}, {"trigger_mask": "shelf_mask"})
         assert out == time[0]
+
+    def test_missing_static_field_raises(self):
+        # A typo'd trigger_mask must fail with the name and the available
+        # fields, not a bare KeyError from deep inside a worker.
+        from zagg.temporal import first_intersection
+
+        event_mask, static, _ = _trigger_inputs()
+        with pytest.raises(ValueError, match="shelf_mask.*ais_mask"):
+            first_intersection(event_mask, static, {"trigger_mask": "shelf_mask"})
 
     def test_registered_with_landfall_alias(self):
         from zagg.temporal import first_intersection

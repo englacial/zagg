@@ -320,8 +320,19 @@ def first_intersection(event_mask, static_data, spec):
     so the built-in expresses "first landfall on the ice sheet" without any
     domain knowledge: the *meaning* of the mask is config. Returns an empty
     array when the event never intersects it.
+
+    Like the mask providers, the static mask must already share the event
+    mask's spatial coordinates (``process_event`` subsets static fields to the
+    event extent before calling triggers); misaligned coordinates raise
+    xarray's exact-join alignment error.
     """
-    static_mask = static_data[spec.get("trigger_mask") or "ais_mask"].astype(bool)
+    name = spec.get("trigger_mask") or "ais_mask"
+    if name not in static_data:
+        raise ValueError(
+            f"event trigger requires static field {name!r}, but static_data only has "
+            f"{sorted(static_data)}"
+        )
+    static_mask = static_data[name].astype(bool)
     space_dims = [d for d in event_mask.dims if d != "time"]
     hits = (event_mask.where(static_mask, 0) > 0).any(space_dims)
     times = event_mask["time"].values[np.asarray(hits.values, dtype=bool)]
