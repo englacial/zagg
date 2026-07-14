@@ -871,3 +871,104 @@ class TestTemporalReader:
         )
         assert list(collections) == ["merra2"]
         assert isinstance(static["cell_areas"], xr.DataArray)
+
+    def test_multi_uri_collection_concats_time_sorted(self, monkeypatch):
+        # A multi-granule event: URIs open individually, concat along time,
+        # and land time-sorted even when the URI order is not.
+        xr = pytest.importorskip("xarray")
+        import zagg.temporal as temporal
+        from zagg.temporal import read_temporal_inputs
+
+        def _day(uri, **k):
+            day = int(uri[-4])
+            time = np.array([f"2020-01-0{day}T00"], dtype="datetime64[ns]")
+            return xr.Dataset({"T2M": (("time",), np.array([float(day)]))}, coords={"time": time})
+
+        monkeypatch.setattr(temporal, "open_dataset", _day)
+        collections, _ = read_temporal_inputs({"merra2": ["s3://b/d2.nc", "s3://b/d1.nc"]}, {})
+        assert list(collections["merra2"]["T2M"].values) == [1.0, 2.0]
+
+    def test_collection_options_applied_by_reader(self, monkeypatch):
+        xr = pytest.importorskip("xarray")
+        import zagg.temporal as temporal
+        from zagg.temporal import read_temporal_inputs
+
+        time = np.array(["2020-01-01T00:30"], dtype="datetime64[ns]")
+        ds = xr.Dataset({"T2M": (("time",), np.array([1.0]))}, coords={"time": time})
+        monkeypatch.setattr(temporal, "open_dataset", lambda uri, **k: ds)
+        collections, _ = read_temporal_inputs(
+            {"merra2": "s3://b/merra2.nc"},
+            {},
+            collection_options={"merra2": {"time_offset": "-30min"}},
+        )
+        assert collections["merra2"]["time"].values[0] == np.datetime64("2020-01-01T00:00", "ns")
+
+    def test_xarray_s3_reader_registered(self):
+        assert "xarray_s3" in registry.list_readers()
+        assert callable(registry.get_reader("xarray_s3"))
+
+
+# ---------------------------------------------------------------------------
+# Declarative collection options (issue #213, Phase 3)
+# ---------------------------------------------------------------------------
+
+
+class TestPrepareCollection:
+    @pytest.fixture
+    def hourly(self):
+        # 6 hourly steps stamped on the half hour (the MERRA-2 FLX layout).
+        xr = pytest.importorskip("xarray")
+        time = np.array([f"2020-01-01T{h:02d}:30" for h in range(6)], dtype="datetime64[ns]")
+        coords = {"time": time, "lat": [-70.0], "lon": [0.0]}
+        rate = xr.DataArray(
+            np.arange(1.0, 7.0).reshape(6, 1, 1), dims=["time", "lat", "lon"], coords=coords
+        )
+        return xr.Dataset({"PRECLS": rate, "PRECCU": rate * 2})
+
+    def test_falsy_options_are_identity(self, hourly):
+        from zagg.temporal import prepare_collection
+
+        assert prepare_collection(hourly, None) is hourly
+        assert prepare_collection(hourly, {}) is hourly
+
+    def test_time_offset_shifts_onto_the_hour(self, hourly):
+        from zagg.temporal import prepare_collection
+
+        out = prepare_collection(hourly, {"time_offset": "-30min"})
+        assert out["time"].values[0] == np.datetime64("2020-01-01T00:00", "ns")
+
+    def test_resample_scales_rates_into_totals(self, hourly):
+        from zagg.temporal import prepare_collection
+
+        out = prepare_collection(
+            hourly,
+            {"time_offset": "-30min", "resample": {"freq": "3h", "how": "sum", "scale": 3600}},
+        )
+        # hourly rates 1,2,3 in the first 3h bin -> (1+2+3)*3600
+        assert float(out["PRECLS"].isel(time=0, lat=0, lon=0)) == pytest.approx(6 * 3600)
+        assert out.sizes["time"] == 2
+
+    def test_derived_expression_materialized(self, hourly):
+        from zagg.temporal import prepare_collection
+
+        out = prepare_collection(hourly, {"derived": {"rainfall": "PRECLS + PRECCU"}})
+        assert float(out["rainfall"].isel(time=0, lat=0, lon=0)) == pytest.approx(3.0)
+
+    def test_variables_subsets_collection(self, hourly):
+        from zagg.temporal import prepare_collection
+
+        out = prepare_collection(hourly, {"variables": ["PRECLS"]})
+        assert list(out.data_vars) == ["PRECLS"]
+
+    def test_derived_unknown_name_raises_with_available(self, hourly):
+        from zagg.temporal import prepare_collection
+
+        with pytest.raises(ValueError, match="rainfall.*TYPO.*PRECCU"):
+            prepare_collection(hourly, {"derived": {"rainfall": "PRECLS + TYPO"}})
+
+    def test_unknown_option_keys_ignored(self, hourly):
+        # doi &c. are catalog metadata, not reader options.
+        from zagg.temporal import prepare_collection
+
+        out = prepare_collection(hourly, {"doi": "10.5067/EXAMPLE"})
+        assert list(out.data_vars) == list(hourly.data_vars)

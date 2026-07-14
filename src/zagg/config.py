@@ -559,6 +559,94 @@ def _validate_temporal_config(config: PipelineConfig) -> None:
                 f"temporal variable '{name}' is missing required key(s): "
                 f"{', '.join(missing)} (need {', '.join(_TEMPORAL_SPEC_KEYS)})"
             )
+    _validate_collection_options(config)
+
+
+_RESAMPLE_HOWS = ("sum", "mean")
+
+
+def _validate_collection_options(config: PipelineConfig) -> None:
+    """Validate ``data_source.collections`` (issue #213, Phase 3).
+
+    The block accepts a list of collection names (no options) or a mapping of
+    name -> per-collection reader options consumed by
+    :func:`zagg.temporal.prepare_collection`: ``variables`` (list of names),
+    ``time_offset`` (a pandas-parseable offset string), ``resample``
+    (``{freq, how: sum|mean, scale}``), and ``derived`` (name -> numpy
+    expression string). Unknown option keys (e.g. ``doi``) pass through for
+    catalog tooling. Fails at load so a config typo doesn't surface as a
+    per-event worker error after the Lambda spend.
+    """
+    colls = (config.data_source or {}).get("collections")
+    if colls is None or isinstance(colls, list):
+        return
+    if not isinstance(colls, dict):
+        raise ValueError(
+            "data_source.collections must be a list of names or a mapping of "
+            f"name -> options (got {type(colls).__name__})"
+        )
+    for cname, opts in colls.items():
+        if opts is None:
+            continue
+        if not isinstance(opts, dict):
+            raise ValueError(
+                f"data_source.collections[{cname!r}] must be a mapping of options (or null)"
+            )
+        variables = opts.get("variables")
+        if variables is not None and (
+            not isinstance(variables, list) or not all(isinstance(v, str) for v in variables)
+        ):
+            raise ValueError(
+                f"data_source.collections[{cname!r}].variables must be a list of names"
+            )
+        offset = opts.get("time_offset")
+        if offset is not None and not isinstance(offset, str):
+            raise ValueError(
+                f"data_source.collections[{cname!r}].time_offset must be an offset "
+                f"string like '-30min' (got {offset!r})"
+            )
+        resample = opts.get("resample")
+        if resample is not None:
+            if not isinstance(resample, dict) or "freq" not in resample:
+                raise ValueError(
+                    f"data_source.collections[{cname!r}].resample must be a mapping "
+                    "with at least 'freq' (optional: how, scale)"
+                )
+            how = resample.get("how", "sum")
+            if how not in _RESAMPLE_HOWS:
+                raise ValueError(
+                    f"data_source.collections[{cname!r}].resample.how must be one of "
+                    f"{_RESAMPLE_HOWS} (got {how!r})"
+                )
+            scale = resample.get("scale", 1)
+            if isinstance(scale, bool) or not isinstance(scale, (int, float)):
+                raise ValueError(
+                    f"data_source.collections[{cname!r}].resample.scale must be numeric "
+                    f"(got {scale!r})"
+                )
+        derived = opts.get("derived")
+        if derived is not None and (
+            not isinstance(derived, dict)
+            or not all(isinstance(k, str) and isinstance(v, str) for k, v in derived.items())
+        ):
+            raise ValueError(
+                f"data_source.collections[{cname!r}].derived must map variable names "
+                "to expression strings"
+            )
+
+
+def collection_options(config: PipelineConfig) -> dict[str, dict]:
+    """Normalize ``data_source.collections`` to ``{name: options}``.
+
+    Both config forms collapse to one shape: the list form (names only) yields
+    empty option dicts; the mapping form yields each collection's options
+    verbatim (``null`` becomes ``{}``). Consumed by the temporal reader /
+    :func:`zagg.temporal.prepare_collection`.
+    """
+    colls = (config.data_source or {}).get("collections") or []
+    if isinstance(colls, dict):
+        return {name: dict(opts or {}) for name, opts in colls.items()}
+    return {name: {} for name in colls}
 
 
 def _validate_chunk_precompute(aggregation: dict, ds_vars: set[str]) -> None:

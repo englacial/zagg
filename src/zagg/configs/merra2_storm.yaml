@@ -13,10 +13,17 @@ pipeline:
 
 data_source:
   reader: xarray_s3
-  # Plural collections joined along time; each worker reads all of them per event.
+  # Plural collections joined along time; each worker reads all of them per
+  # event. Accepts a plain list of names, or (issue #213) a mapping carrying
+  # per-collection reader options -- variables (subset), time_offset (shift
+  # half-hour stamps onto the hour), resample {freq, how, scale} (turn hourly
+  # rates into e.g. 3-hourly totals), derived (numpy-expression variables).
+  # A collection's URIs may be a list (multi-granule events concat along time).
   collections:
-    - merra2_slv   # single-level: T2M, TQV, SLP
-    - merra2_flx   # surface flux: PRECTOT
+    merra2_slv:    # single-level: T2M, TQV, SLP (3-hourly, on the hour)
+    merra2_flx:    # surface flux: PRECTOT (1-hourly rates, half-hour stamps)
+      time_offset: "-30min"
+      resample: {freq: "3h", how: sum, scale: 3600}
   # Static fields the mask providers / anomaly transform consume (see
   # zagg.temporal: ais_mask drives the ais/ocean masks, climatology the anomaly).
   static_data:

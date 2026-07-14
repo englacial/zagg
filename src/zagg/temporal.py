@@ -629,8 +629,61 @@ def open_dataset(uri, *, credentials=None, endpoint_url=None, region="us-west-2"
     return xr.open_dataset(io.BytesIO(bytes(payload)))
 
 
+def _eval_derived(name, expression, ds):
+    """Evaluate a ``derived`` variable expression over a collection's variables.
+
+    Same restricted-namespace contract as the spatial pipeline's ``expression``
+    fields (numpy + the collection's data variables; no builtins)."""
+    ns = {"__builtins__": {}, "np": np, "numpy": np, **{v: ds[v] for v in ds.data_vars}}
+    try:
+        return eval(expression, ns)  # noqa: S307
+    except NameError as e:
+        raise ValueError(
+            f"derived variable {name!r}: {e}; available variables: {sorted(ds.data_vars)}"
+        ) from None
+
+
+def prepare_collection(ds, options):
+    """Apply declarative per-collection reader options (issue #213, Phase 3).
+
+    Applied in order: ``variables`` (subset the collection), ``time_offset``
+    (shift timestamps, e.g. ``"-30min"`` moves half-hour stamps onto the hour),
+    ``resample: {freq, how, scale}`` (scale then resample -- turns 1-hourly
+    rates into e.g. 3-hourly totals), ``derived`` (materialize new variables
+    from numpy expressions over the collection's variables). The order matches
+    the MERRA-2 precip flow these options generalize; a falsy ``options``
+    returns ``ds`` unchanged. Unknown option keys (e.g. ``doi``) are ignored
+    here -- they are metadata for catalog tooling.
+    """
+    if not options:
+        return ds
+    variables = options.get("variables")
+    if variables:
+        ds = ds[list(variables)]
+    offset = options.get("time_offset")
+    if offset:
+        import pandas as pd
+
+        ds = ds.assign_coords(time=ds["time"] + pd.to_timedelta(offset).to_timedelta64())
+    resample = options.get("resample")
+    if resample:
+        scale = resample.get("scale", 1)
+        if scale != 1:
+            ds = ds * scale
+        ds = getattr(ds.resample(time=resample["freq"]), resample.get("how", "sum"))()
+    for name, expr in (options.get("derived") or {}).items():
+        ds = ds.assign(**{name: _eval_derived(name, expr, ds)})
+    return ds
+
+
 def read_temporal_inputs(
-    collection_uris, static_uris, *, credentials=None, endpoint_url=None, region="us-west-2"
+    collection_uris,
+    static_uris,
+    *,
+    credentials=None,
+    endpoint_url=None,
+    region="us-west-2",
+    collection_options=None,
 ):
     """Load the ``collections`` and ``static_data`` :func:`process_event` needs.
 
@@ -643,13 +696,19 @@ def read_temporal_inputs(
 
     Parameters
     ----------
-    collection_uris : dict[str, str]
-        ``{collection_name: uri}`` for each collection the specs read.
+    collection_uris : dict[str, str | list[str]]
+        ``{collection_name: uri or [uris]}`` for each collection the specs
+        read. A list (an event spanning several granules) is opened per-URI,
+        concatenated along ``time``, and time-sorted.
     static_uris : dict[str, str]
         ``{static_name: uri}`` for e.g. ``ais_mask`` / ``climatology`` /
         ``cell_areas``.
     credentials, endpoint_url, region
         Forwarded to :func:`open_dataset`.
+    collection_options : dict[str, dict], optional
+        Per-collection declarative options applied by
+        :func:`prepare_collection`; the runner derives this from
+        ``data_source.collections`` via :func:`zagg.config.collection_options`.
 
     Returns
     -------
@@ -657,10 +716,42 @@ def read_temporal_inputs(
         ``(collections, static_data)`` ready for :func:`process_event`.
     """
     kw = {"credentials": credentials, "endpoint_url": endpoint_url, "region": region}
-    collections = {name: open_dataset(uri, **kw) for name, uri in collection_uris.items()}
+    options = collection_options or {}
+    collections = {}
+    for name, uris in collection_uris.items():
+        uri_list = list(uris) if isinstance(uris, (list, tuple)) else [uris]
+        parts = [open_dataset(u, **kw) for u in uri_list]
+        if len(parts) == 1:
+            ds = parts[0]
+        else:
+            import xarray as xr
+
+            ds = xr.concat(parts, dim="time").sortby("time")
+        collections[name] = prepare_collection(ds, options.get(name))
     static_data = {}
     for name, uri in static_uris.items():
         ds = open_dataset(uri, **kw)
         data_vars = list(ds.data_vars)
         static_data[name] = ds[data_vars[0]] if len(data_vars) == 1 else ds
     return collections, static_data
+
+
+def _xarray_s3_reader(collection_uris, static_uris, **kwargs):
+    """Registry entry for the built-in reader.
+
+    Late-binds the module-level :func:`read_temporal_inputs` so a runtime
+    override of that name is honored by registry resolution too."""
+    return read_temporal_inputs(collection_uris, static_uris, **kwargs)
+
+
+registry.register_reader(
+    "xarray_s3",
+    _xarray_s3_reader,
+    description=(
+        "obstore/xarray reader: Zarr or NetCDF from local/s3:// URIs; multi-URI "
+        "collections concat along time; applies declarative collection_options"
+    ),
+)
+
+#: The reader registry (``zagg.registry.READERS``).
+READERS = registry.READERS
