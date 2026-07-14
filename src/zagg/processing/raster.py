@@ -247,8 +247,12 @@ async def sample_item_async(
         field -> ``{asset, dtype, fill_value, attrs}``.
     nodata : scalar, optional
         Source nodata DN; a cell whose sampled pixel equals it in ANY band is
-        marked invalid (Sentinel-2 encodes scene-footprint nodata as 0 across
-        all bands together).
+        marked invalid. This is a single *scene-wide* sentinel, not per-band:
+        for Sentinel-2 a DN of 0 means the pixel is outside the scene footprint
+        in every band, so a cell that is valid in ``red`` but reads ``scl == 0``
+        is dropped intentionally (footprint masking). Only co-declare bands that
+        share this sentinel's "no data" meaning — a band that legitimately
+        carries a 0 with different semantics would drop otherwise-valid cells.
 
     Returns
     -------
