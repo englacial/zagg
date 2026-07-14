@@ -115,6 +115,10 @@ async def sample_asset_async(
         ``values`` in the asset's dtype (``fill`` where invalid); ``valid``
         True where the cell center lands on a source pixel. Nodata masking is
         the caller's concern (e.g. Sentinel-2 encodes nodata as DN 0).
+
+    ``fill`` must be representable in the asset's dtype; a non-fitting sentinel
+    (e.g. ``-1`` or ``NaN`` into a ``uint16`` band) raises ``ValueError`` up
+    front rather than failing opaquely inside the gather.
     """
     from async_tiff import TIFF
 
@@ -126,6 +130,11 @@ async def sample_asset_async(
             "single-band rasters only; Sentinel-2 distributes one COG per band "
             f"(found samples-per-pixel = {len(ifd.bits_per_sample)})"
         )
+    dtype = _DTYPES[(int(ifd.sample_format[0]), int(ifd.bits_per_sample[0]))]
+    if not np.can_cast(np.min_scalar_type(fill), dtype):
+        raise ValueError(
+            f"fill={fill!r} is not representable in the asset dtype {np.dtype(dtype).name}"
+        )
     epsg, transform = _geo_from_ifd(ifd)
     shape = (ifd.image_height, ifd.image_width)
     rows, cols, valid = grid.sample(cells, f"EPSG:{epsg}", transform, shape)
@@ -135,22 +144,19 @@ async def sample_asset_async(
     tr, tc = vr // th, vc // tw
 
     if vr.size == 0:
-        dtype = _DTYPES[(int(ifd.sample_format[0]), int(ifd.bits_per_sample[0]))]
         return np.full(rows.shape, fill, dtype=dtype), valid
 
     pairs = np.unique(np.stack([tr, tc], axis=1), axis=0)
     tiles = await asyncio.gather(*[tiff.fetch_tile(int(c), int(r), 0) for r, c in pairs])
     decoded = await asyncio.gather(*[t.decode() for t in tiles])
 
-    gathered = None
+    gathered = np.full(vr.shape, fill, dtype=dtype)
     for (trow, tcol), dec in zip(pairs, decoded):
         arr = np.asarray(dec)[:, :, 0]
-        if gathered is None:
-            gathered = np.full(vr.shape, fill, dtype=arr.dtype)
         m = (tr == trow) & (tc == tcol)
         gathered[m] = arr[vr[m] - trow * th, vc[m] - tcol * tw]
 
-    values = np.full(rows.shape, fill, dtype=gathered.dtype)
+    values = np.full(rows.shape, fill, dtype=dtype)
     values[valid] = gathered
     return values, valid
 

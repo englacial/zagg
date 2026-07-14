@@ -317,6 +317,15 @@ class TestSampleAsset:
         assert values.dtype == np.uint16
         np.testing.assert_array_equal(values, data.ravel())
 
+    def test_fill_not_representable_in_dtype_raises(self, tmp_path):
+        """A fill sentinel outside the asset dtype fails loudly, not deep in np.full."""
+        p = tmp_path / "t.tif"
+        _write_tiff(p, _index_raster())
+        grid = _rect_grid()
+        cells = np.arange(96 * 96)
+        with pytest.raises(ValueError, match="not representable.*uint16"):
+            sample_asset(grid, cells, str(p), fill=-1)
+
     def test_multiband_asset_raises(self, tmp_path):
         """A multi-band COG fails loudly rather than silently reading band 0."""
         p = tmp_path / "rgb.tif"
