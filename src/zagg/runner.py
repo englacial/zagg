@@ -19,7 +19,7 @@ import statistics
 import time
 import uuid
 import warnings
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import replace
 from datetime import timedelta
 
@@ -228,7 +228,12 @@ def agg(
     # is dispatch-level: the spatial path is the existing code, moved verbatim
     # into SpatialStrategy so its behavior/output stays byte-identical; the
     # temporal path drives process_event over the same dispatch.py Executor.
-    strategy = _get_strategy(get_pipeline_type(config))
+    # A spatial-kind config with ``reader: raster`` routes to the pull-NN
+    # raster path (issue #218) — same shard fan-out, lean (time, cells) writes.
+    kind = get_pipeline_type(config)
+    if kind == "spatial" and (config.data_source or {}).get("reader") == "raster":
+        kind = "raster"
+    strategy = _get_strategy(kind)
     return strategy.run(
         config,
         catalog=catalog,
@@ -556,14 +561,144 @@ class TemporalStrategy:
         return summary
 
 
+class RasterStrategy:
+    """The raster pull-NN path (issue #218): ``reader: raster`` on a spatial grid.
+
+    One work unit per shard, like :class:`SpatialStrategy`, but the worker is
+    :func:`~zagg.processing.raster.process_raster_shard` and the writes are
+    ``(time, cells)`` slab assignments — the lean path that bypasses the
+    aggregation write machinery. The runner owns the global timestep index and
+    the template emission (and, later, the single-writer resize on append).
+
+    Local backend only for now: the Lambda fan-out needs a handler branch
+    under ``deployment/aws/`` (out of this PR's scope per repo conventions) —
+    tracked on issue #218.
+    """
+
+    def run(
+        self,
+        config,
+        *,
+        catalog,
+        store,
+        backend,
+        max_cells,
+        morton_cell,
+        max_workers,
+        overwrite,
+        dry_run,
+        region,
+        output_credentials,
+        output_endpoint_url,
+        **_ignored,
+    ):
+        from zagg.processing.raster import (
+            emit_raster_template,
+            process_raster_shard,
+            raster_time_index,
+            write_raster_coords,
+            write_raster_slab,
+        )
+
+        catalog_path = catalog or config.catalog
+        if not catalog_path:
+            raise ValueError("No catalog specified (pass catalog= or set catalog: in config)")
+        store_path = store or get_store_path(config)
+        if not store_path:
+            raise ValueError("No store path specified (pass store= or set output.store: in config)")
+        if backend != "local":
+            raise NotImplementedError(
+                "raster pipelines support backend='local' for now; the Lambda "
+                "handler branch is tracked on issue #218"
+            )
+
+        catalog_data = _load_catalog(catalog_path)
+        cells = _select_cells(catalog_data, morton_cell=morton_cell, max_cells=max_cells)
+        if dry_run:
+            return _dry_run_summary(cells, store_path)
+
+        from zagg.grids import from_config
+
+        all_shards = [int(s) for s in catalog_data["shard_keys"]]
+        grid = from_config(config, populated_shards=all_shards)
+        _check_signature(grid, catalog_data)
+        time_index, times_us = raster_time_index(catalog_data["granules"])
+        if not time_index:
+            raise ValueError("catalog carries no raster granule entries (no assets/datetime)")
+
+        resolved_endpoint = output_endpoint_url or get_output_endpoint_url(config)
+        zarr_store = open_store(
+            store_path,
+            region=region,
+            credentials=output_credentials,
+            endpoint_url=resolved_endpoint,
+        )
+        emit_raster_template(zarr_store, grid, config, times_us, overwrite=overwrite)
+
+        source = config.data_source or {}
+        src_kwargs = {
+            "region": source.get("source_region"),
+            "anonymous": source.get("anonymous", True),
+        }
+        max_workers = min(max_workers or 4, len(cells)) or 1
+        t0 = time.time()
+        shards_with_data = 0
+        errors = 0
+        timesteps_written = 0
+
+        def _one(pair):
+            shard_key, granules = pair
+            slabs, meta = process_raster_shard(
+                grid, int(shard_key), granules, config, time_index, **src_kwargs
+            )
+            for t_idx, slab in slabs.items():
+                write_raster_slab(zarr_store, grid, int(shard_key), t_idx, slab)
+            if slabs:
+                write_raster_coords(zarr_store, grid, int(shard_key))
+            return meta
+
+        with ThreadPoolExecutor(max_workers=max_workers) as pool:
+            futures = {pool.submit(_one, pair): pair[0] for pair in cells}
+            for fut in as_completed(futures):
+                label = shard_label(grid, futures[fut])
+                try:
+                    meta = fut.result()
+                except Exception as e:  # noqa: BLE001 - per-shard isolation, run continues
+                    errors += 1
+                    logger.warning(f"raster shard {label} failed: {e}")
+                    continue
+                if meta["timesteps"]:
+                    shards_with_data += 1
+                    timesteps_written += meta["timesteps"]
+
+        wall_time = time.time() - t0
+        summary = {
+            "total_cells": len(cells),
+            "cells_with_data": shards_with_data,
+            "cells_error": errors,
+            "total_obs": timesteps_written,
+            "timesteps": int(len(times_us)),
+            "wall_time_s": wall_time,
+            "store_path": store_path,
+            "backend": "local",
+        }
+        logger.info(
+            f"Done: {shards_with_data}/{len(cells)} shards, {len(times_us)} timesteps, "
+            f"{errors} errors, {wall_time:.1f}s"
+        )
+        return summary
+
+
 # Strategy registry, keyed by pipeline.type (issue #12, Phase 5). ``event`` and
 # ``temporal`` share the event-streaming engine; ``spatial`` is the point-cloud
-# path. New pipeline kinds register here rather than adding another branch to
-# ``agg``.
+# path. ``raster`` is selected by ``process_data`` when a spatial-kind config
+# declares ``reader: raster`` (issue #218). New pipeline kinds register here
+# rather than adding another branch to ``agg``.
 _STRATEGIES = {
     "spatial": SpatialStrategy,
     "temporal": TemporalStrategy,
     "event": TemporalStrategy,
+    "raster": RasterStrategy,
 }
 
 
