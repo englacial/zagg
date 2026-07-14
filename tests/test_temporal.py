@@ -96,6 +96,40 @@ class TestWeightedMeanAccumulator:
         assert np.isnan(acc.finalize())
 
 
+class TestMeanOfRatiosAccumulator:
+    def test_equal_weight_per_timestep(self):
+        from zagg.temporal import MeanOfRatiosAccumulator
+
+        acc = MeanOfRatiosAccumulator()
+        # ratios 5 and 6 -> 5.5; WeightedMeanAccumulator pools to 40/5 = 8
+        acc.update((10.0, 2.0))
+        acc.update((30.0, 5.0))
+        assert acc.finalize() == pytest.approx(5.5)
+
+    def test_zero_weight_timestep_skipped(self):
+        from zagg.temporal import MeanOfRatiosAccumulator
+
+        acc = MeanOfRatiosAccumulator()
+        acc.update((10.0, 2.0))
+        acc.update((0.0, 0.0))  # empty footprint: no ratio, no count
+        assert acc.finalize() == pytest.approx(5.0)
+
+    def test_none_and_nan_ignored(self):
+        from zagg.temporal import MeanOfRatiosAccumulator
+
+        acc = MeanOfRatiosAccumulator()
+        acc.update(None)
+        acc.update((np.nan, 2.0))
+        acc.update((10.0, 2.0))
+        assert acc.finalize() == pytest.approx(5.0)
+
+    def test_empty(self):
+        from zagg.temporal import MeanOfRatiosAccumulator
+
+        acc = MeanOfRatiosAccumulator()
+        assert np.isnan(acc.finalize())
+
+
 class TestFirstLandfallCapture:
     def test_captures_first(self):
         acc = FirstLandfallCapture()
@@ -127,6 +161,7 @@ class TestRegistrySeeding:
             "min",
             "sum",
             "weighted_mean",
+            "mean_of_ratios",
             "first_landfall",
         } <= set(registry.list_reducers())
 
@@ -147,7 +182,7 @@ class TestRegistrySeeding:
         assert "monthly_anomaly" in set(registry.list_field_transforms())
 
     def test_reducers_satisfy_protocol(self):
-        for name in ("max", "min", "sum", "weighted_mean", "first_landfall"):
+        for name in ("max", "min", "sum", "weighted_mean", "mean_of_ratios", "first_landfall"):
             acc = registry.get_reducer(name)()
             assert hasattr(acc, "update"), f"{name} missing update()"
             assert hasattr(acc, "finalize"), f"{name} missing finalize()"
@@ -667,6 +702,38 @@ class TestProcessEvent:
         never = event_mask.where(event_mask["lat"] != -70.0, 0)  # clear the ice row
         results, _ = process_event("storm1", never, collections, specs, static)
         assert np.isnan(results["slp_at_landfall"])
+
+    def test_mean_of_ratios_diverges_from_weighted_mean(self):
+        # A footprint growing from 1 cell to 4 cells: per-timestep ratios are
+        # 10 and 20 (mean 15), while pooled parts give 90/5 = 18. Both specs
+        # run in one pass to pin the estimators apart end-to-end.
+        xr = pytest.importorskip("xarray")
+        lat = np.array([-70.0, -69.5])
+        lon = np.array([0.0, 0.5])
+        time = np.array(["2020-01-01T00", "2020-01-01T03"], dtype="datetime64[ns]")
+        coords = {"time": time, "lat": lat, "lon": lon}
+        footprints = np.array([[[1, 0], [0, 0]], [[1, 1], [1, 1]]], dtype=float)
+        event_mask = xr.DataArray(footprints, dims=["time", "lat", "lon"], coords=coords)
+        var = xr.DataArray(
+            np.stack([np.full((2, 2), 10.0), np.full((2, 2), 20.0)]),
+            dims=["time", "lat", "lon"],
+            coords=coords,
+        )
+        collections = {"merra2": xr.Dataset({"VFLXQV": var})}
+        areas = xr.DataArray(np.ones((2, 2)), dims=["lat", "lon"], coords={"lat": lat, "lon": lon})
+        base = {
+            "variable": "VFLXQV",
+            "collection": "merra2",
+            "spatial_func": "weighted_mean",
+            "mask": "full",
+        }
+        specs = [
+            {**base, "output_name": "avg_ratio", "temporal_reducer": "mean_of_ratios"},
+            {**base, "output_name": "avg_pooled", "temporal_reducer": "weighted_mean"},
+        ]
+        results, _ = process_event("storm1", event_mask, collections, specs, {"cell_areas": areas})
+        assert results["avg_ratio"] == pytest.approx(15.0)
+        assert results["avg_pooled"] == pytest.approx(18.0)
 
     @pytest.mark.parametrize("batch", [1, 2])
     def test_trigger_gating_survives_batching(self, batch):

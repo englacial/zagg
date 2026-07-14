@@ -92,6 +92,36 @@ class WeightedMeanAccumulator:
         return np.nan
 
 
+class MeanOfRatiosAccumulator:
+    """Unweighted mean over timesteps of per-timestep weighted ratios.
+
+    Spatial functions paired with this return ``(weighted_sum, weight_sum)``
+    tuples, like :class:`WeightedMeanAccumulator` — but each timestep
+    contributes its *ratio* with equal weight, instead of pooling the parts
+    across time. The two estimators diverge whenever the footprint's weight
+    varies over time; this one matches the downstream ``compute_average``
+    reference kernel (issue #213, parity question 1). Zero-weight (empty
+    footprint) timesteps are skipped, mirroring the reference's NaN-skipping
+    time mean.
+    """
+
+    def __init__(self):
+        self.ratio_sum = 0.0
+        self.count = 0
+
+    def update(self, val):
+        if val is None:
+            return
+        weighted_sum, weight_sum = val
+        if np.isnan(weighted_sum) or np.isnan(weight_sum) or weight_sum == 0:
+            return
+        self.ratio_sum += weighted_sum / weight_sum
+        self.count += 1
+
+    def finalize(self):
+        return float(self.ratio_sum / self.count) if self.count else np.nan
+
+
 class FirstLandfallCapture:
     """Captures a value only at the first triggered (e.g. landfall) timestep."""
 
@@ -117,6 +147,7 @@ registry.register_reducer("max", MaxAccumulator)
 registry.register_reducer("min", MinAccumulator)
 registry.register_reducer("sum", SumAccumulator)
 registry.register_reducer("weighted_mean", WeightedMeanAccumulator)
+registry.register_reducer("mean_of_ratios", MeanOfRatiosAccumulator)
 registry.register_reducer("first_landfall", FirstLandfallCapture)
 
 #: The reducer registry (``zagg.registry.REDUCERS``); plugins may add more via
