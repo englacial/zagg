@@ -1260,6 +1260,44 @@ class TestProcessEventMode:
         assert body["event_key"] == "storm1"
         assert "read failed" in body["error"]
 
+    def test_reader_resolved_through_registry(self, handler_mod, monkeypatch):
+        # ``data_source.reader`` names a registered reader (issue #213 Phase 3);
+        # the worker forwards the config's collection options to it.
+        import zagg.temporal as temporal
+        from zagg import registry as zagg_registry
+
+        event_mask, collections, static = _temporal_inputs()
+        monkeypatch.setattr(temporal, "open_dataset", lambda uri, **k: event_mask)
+        captured = {}
+
+        def _custom(collection_uris, static_uris, **kwargs):
+            captured["uris"] = collection_uris
+            captured["options"] = kwargs.get("collection_options")
+            return collections, static
+
+        zagg_registry.register_reader("custom_reader", _custom, replace=True)
+        try:
+            cfg = _temporal_config_dict()
+            cfg["data_source"]["reader"] = "custom_reader"
+            cfg["data_source"]["collections"] = {"merra2": {"time_offset": "-30min"}}
+            event = _temporal_event(config=cfg, return_results=True)
+            del event["store_path"]
+            resp = handler_mod._handle_process_event(event)
+            body = json.loads(resp["body"])
+            assert resp["statusCode"] == 200, body
+            assert captured["uris"] == {"merra2": "s3://b/merra2.zarr"}
+            assert captured["options"] == {"merra2": {"time_offset": "-30min"}}
+        finally:
+            zagg_registry.READERS._entries.pop("custom_reader", None)
+
+    def test_unknown_reader_returns_500_naming_it(self, handler_mod, monkeypatch):
+        self._patch(handler_mod, monkeypatch)
+        cfg = _temporal_config_dict()
+        cfg["data_source"]["reader"] = "not_a_reader"
+        resp = handler_mod._handle_process_event(_temporal_event(config=cfg))
+        assert resp["statusCode"] == 500
+        assert "not_a_reader" in json.loads(resp["body"])["error"]
+
 
 class TestProcessEventReturnResults:
     """``return_results`` (issue #12, Phase 8): the fan-out driver's contract.

@@ -415,7 +415,8 @@ class TemporalStrategy:
         force_cold=False,
         events=None,
     ):
-        from zagg.temporal import process_event, specs_from_config
+        from zagg.config import collection_options
+        from zagg.temporal import prepare_collection, process_event, specs_from_config
 
         if backend not in ("local", "lambda"):
             raise ValueError(f"Unknown backend: {backend!r} (expected 'local' or 'lambda')")
@@ -462,12 +463,21 @@ class TemporalStrategy:
             max_workers = 4
         max_workers = min(max_workers, len(event_list)) if event_list else 1
 
+        # In-memory event tuples skip the reader, so the declarative collection
+        # options (issue #213 Phase 3) are applied here to keep the two
+        # backends' semantics identical.
+        coll_options = collection_options(config)
+
         # One work unit per event, catching its own exceptions so one bad event
         # counts as an error and the run continues -- mirrors the spatial local
         # path's tagged-envelope contract so ``_accumulate`` stays simple.
         def _event_work(payload):
             event_key, event_mask, collections, static_data = payload
             try:
+                collections = {
+                    name: prepare_collection(ds, coll_options.get(name))
+                    for name, ds in collections.items()
+                }
                 results, meta = process_event(
                     event_key,
                     event_mask,

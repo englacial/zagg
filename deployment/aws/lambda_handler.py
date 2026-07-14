@@ -82,9 +82,9 @@ Process-event mode (the temporal/event pipeline worker -- issue #12, Phase 7b):
     "event_key": str,           # identifier for this event row
     "event_mask_uri": str,      # s3:// (or local) URI of the event mask
                                 #   DataArray (one variable, time x lat x lon)
-    "collection_uris": {        # {collection_name: uri} the specs read
-        "merra2_slv": "s3://.../merra2_slv.zarr", ...
-    },
+    "collection_uris": {        # {collection_name: uri or [uris]} the specs
+        "merra2_slv": "s3://.../merra2_slv.zarr", ...  #  read; a list (multi-
+    },                          #  granule event) concats along time
     "static_uris": {            # {static_name: uri}, e.g. ais_mask / climatology
         "ais_mask": "s3://.../ais_mask.nc", ...
     },
@@ -722,8 +722,10 @@ def _handle_process_event(event: Dict[str, Any]) -> Dict[str, Any]:
     ``zagg.temporal.process_event`` for the single event, and write the
     flattened result row to the tabular ``store_path``.
     """
+    from zagg import registry as zagg_registry
+    from zagg.config import collection_options as _collection_options
     from zagg.output import write_tabular
-    from zagg.temporal import open_dataset, process_event, read_temporal_inputs, specs_from_config
+    from zagg.temporal import open_dataset, process_event, specs_from_config
 
     event_key = event.get("event_key")
     logger.info(f"process_event mode: event {event_key!r}")
@@ -758,11 +760,15 @@ def _handle_process_event(event: Dict[str, Any]) -> Dict[str, Any]:
         if mask_vars:
             event_mask = event_mask[mask_vars[0]]
 
-        collections, static_data = read_temporal_inputs(
+        # The reader resolves by name (issue #213 Phase 3): only names present
+        # in the layer's registry are reachable -- the payload stays pure data.
+        reader = zagg_registry.get_reader((config.data_source or {}).get("reader") or "xarray_s3")
+        collections, static_data = reader(
             event.get("collection_uris", {}),
             event.get("static_uris", {}),
             credentials=read_creds,
             region=region,
+            collection_options=_collection_options(config),
         )
 
         results, meta = process_event(event_key, event_mask, collections, specs, static_data)

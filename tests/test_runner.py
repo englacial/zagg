@@ -2427,6 +2427,37 @@ class TestTemporalStrategy:
         summary = agg(_temporal_config(), events=_synthetic_events(), max_cells=1)
         assert summary["total_events"] == 1
 
+    def test_collection_options_applied_on_local_backend(self):
+        # In-memory event tuples skip the reader, so the local path applies the
+        # config's per-collection options itself (issue #213 Phase 3): a
+        # derived variable declared in the config is visible to the specs.
+        from zagg.config import load_config_from_dict
+        from zagg.runner import agg
+
+        cfg_dict = {
+            "pipeline": {"type": "temporal"},
+            "data_source": {
+                "reader": "xarray_s3",
+                "collections": {"merra2": {"derived": {"t2m_double": "T2M * 2"}}},
+            },
+            "aggregation": {
+                "variables": {
+                    "max_double": {
+                        "variable": "t2m_double",
+                        "collection": "merra2",
+                        "spatial_func": "max",
+                        "temporal_reducer": "max",
+                        "mask": "full",
+                    }
+                }
+            },
+            "output": {"format": "tabular", "store": "."},
+        }
+        summary = agg(load_config_from_dict(cfg_dict), events=_synthetic_events())
+        by_key = {r["event_key"]: r for r in summary["results"]}
+        assert by_key["storm1"]["results"]["max_double"] == pytest.approx(10.0)
+        assert by_key["storm2"]["results"]["max_double"] == pytest.approx(18.0)
+
     def test_dry_run_summary(self):
         from zagg.runner import agg
 

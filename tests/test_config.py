@@ -193,6 +193,77 @@ class TestPipelineType:
             get_pipeline_type(cfg)
 
 
+class TestCollectionOptions:
+    """``data_source.collections`` mapping form + reader options (issue #213 Phase 3)."""
+
+    @staticmethod
+    def _cfg(collections):
+        return load_config_from_dict(
+            {
+                "pipeline": {"type": "temporal"},
+                "data_source": {"reader": "xarray_s3", "collections": collections},
+                "aggregation": {
+                    "variables": {
+                        "max_t2m": {
+                            "variable": "T2M",
+                            "collection": "merra2",
+                            "spatial_func": "max",
+                            "temporal_reducer": "max",
+                        }
+                    }
+                },
+                "output": {"format": "tabular", "store": "."},
+            }
+        )
+
+    def test_list_form_normalizes_to_empty_options(self):
+        from zagg.config import collection_options
+
+        cfg = self._cfg(["merra2_slv", "merra2_flx"])
+        validate_config(cfg)
+        assert collection_options(cfg) == {"merra2_slv": {}, "merra2_flx": {}}
+
+    def test_mapping_form_carries_options_and_null_is_empty(self):
+        from zagg.config import collection_options
+
+        opts = {"time_offset": "-30min", "resample": {"freq": "3h", "how": "sum", "scale": 3600}}
+        cfg = self._cfg({"merra2_slv": None, "merra2_flx": opts})
+        validate_config(cfg)
+        assert collection_options(cfg) == {"merra2_slv": {}, "merra2_flx": opts}
+
+    def test_unknown_option_keys_pass_validation(self):
+        # doi &c. are catalog metadata for downstream tooling.
+        validate_config(self._cfg({"merra2": {"doi": "10.5067/EXAMPLE"}}))
+
+    def test_resample_requires_freq(self):
+        with pytest.raises(ValueError, match="resample.*freq"):
+            validate_config(self._cfg({"merra2": {"resample": {"how": "sum"}}}))
+
+    def test_resample_how_whitelisted(self):
+        with pytest.raises(ValueError, match="resample.how"):
+            validate_config(self._cfg({"merra2": {"resample": {"freq": "3h", "how": "median"}}}))
+
+    def test_resample_scale_must_be_numeric(self):
+        with pytest.raises(ValueError, match="resample.scale"):
+            validate_config(self._cfg({"merra2": {"resample": {"freq": "3h", "scale": "3600"}}}))
+
+    def test_time_offset_must_be_string(self):
+        with pytest.raises(ValueError, match="time_offset"):
+            validate_config(self._cfg({"merra2": {"time_offset": -30}}))
+
+    def test_derived_must_map_names_to_expressions(self):
+        with pytest.raises(ValueError, match="derived"):
+            validate_config(self._cfg({"merra2": {"derived": {"rainfall": 3}}}))
+
+    def test_variables_must_be_name_list(self):
+        with pytest.raises(ValueError, match="variables"):
+            validate_config(self._cfg({"merra2": {"variables": "PRECLS"}}))
+
+    def test_collection_entry_must_be_mapping_or_null(self):
+        with pytest.raises(ValueError, match="mapping of options"):
+            validate_config(self._cfg({"merra2": ["time_offset"]}))
+
+
 # ---------------------------------------------------------------------------
 # ATL03 template
 # ---------------------------------------------------------------------------
