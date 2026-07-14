@@ -2,8 +2,13 @@
 each with a zoomed San Francisco Bay inset so the tiling is legible.
 
 Shard polygons come from ``mortie.tools.mort2polygon`` (the same parent-cell
-footprint ``HealpixGrid.shard_footprint`` uses). Outputs two PNGs under
-``docs/deployment/`` embedded in ``conus_estimate.md``.
+footprint ``HealpixGrid.shard_footprint`` uses). The land basemap is
+``conus_basemap_ne10m.geojson`` -- Natural Earth 1:10m land (public domain),
+clipped to CONUS, lightly simplified; it resolves the coastline (e.g. the SF
+peninsula / bay) that the coarse ``conus.geojson`` shard-map AOI smooths out.
+The basemap is **visualization only**; the shard map itself is still built over
+``conus.geojson``. Outputs two PNGs under ``docs/deployment/`` embedded in
+``conus_estimate.md``.
 
 Run: ``uv run --with matplotlib python data/conus/plot_conus_shardmap.py``
 """
@@ -46,7 +51,8 @@ def shard_polys(parquet: Path, step: int = 4) -> gpd.GeoDataFrame:
 
 def make_figure(parquet: Path, order: int, n_shards: int, area_km2: float, out: Path) -> None:
     gdf = shard_polys(parquet)
-    conus = gpd.read_file(str(HERE / "conus.geojson"))
+    basemap = HERE / "conus_basemap_ne10m.geojson"
+    conus = gpd.read_file(str(basemap if basemap.exists() else HERE / "conus.geojson"))
 
     fig, ax = plt.subplots(figsize=(11, 6.6))
     gdf.boundary.plot(ax=ax, linewidth=0.05, color="#3a7ca5", alpha=0.6)
