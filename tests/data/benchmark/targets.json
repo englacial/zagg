@@ -1,5 +1,5 @@
 {
-  "description": "Pinned Lambda-benchmark targets. Live matrix (issue #202 reset): tdigest aggregation, sharded output, granule_workers=4, at 4 GB workers -- a 2x2 over the read-backend A/B (inline vs sidecar) x the strict-AOI-mask A/B (mask vs nomask), o9 NEON shards ONLY. Four targets: tdigest_healpix_o9_{inline,sidecar}_{mask,nomask}. The mask arm dispatches the aoi_mask-carrying shard map (healpix_o9_aoimask); the nomask arm the plain one (the mask is manifest-driven -- runner._aoi_payload_map reads it from the map, not the config). One shard/target (the pinned densest cell). run_benchmark applies data_source.index from each target's index_backend; sharded + granule_workers live in the shared config. o10 is retired from the live set (frozen under provisional_targets, retained not rerun -- issue #202).",
+  "description": "Pinned Lambda-benchmark targets. Live matrix (issue #202 reset): tdigest aggregation, sharded output, granule_workers=4, at 4 GB workers -- a 2x2 over the read-backend A/B (inline vs sidecar) x the strict-AOI-mask A/B (mask vs nomask), o9 NEON shards ONLY. Four targets: tdigest_healpix_o9_{inline,sidecar}_{mask,nomask}. Both arms dispatch the plain healpix_o9 map; the mask arm builds the strict-AOI per-cell mask on the fly at dispatch (run_benchmark._shardmap_with_mask, mortie) from the o9_aoimask config's output.aoi_mask flag -- the derived ~190 KB mask payload is not committed (issue #202). The worker still receives the same per-cell mask via runner._aoi_payload_map. One shard/target (the pinned densest cell). run_benchmark applies data_source.index from each target's index_backend; sharded + granule_workers live in the shared config. o10 is retired from the live set (frozen under provisional_targets, retained not rerun -- issue #202).",
   "aoi": {
     "file": "AOP_NEON.geojson",
     "name": "NEON SERC AOP box"
@@ -32,13 +32,7 @@
       "path": "shardmaps/sm_healpix_o9.json",
       "shard_key": 5347395636851376137,
       "n_granules": 66,
-      "note": "Re-pinned over 2018-10-13..2026-03-15 (issue #202): densest o9 shard unchanged (5347395636851376137), granule count 59 -> 66. The nomask arm of the live matrix dispatches this plain map."
-    },
-    "healpix_o9_aoimask": {
-      "path": "shardmaps/sm_healpix_o9_aoimask.json",
-      "shard_key": 5347395636851376137,
-      "n_granules": 66,
-      "note": "issue #202: same o9 NEON shard map as healpix_o9 (same window/AOI/densest pin) but built with output.aoi_mask=true, so it carries the per-shard strict-AOI cell mask payload (aoi_mask, parallel to shard_keys). The *_mask arm of the live matrix dispatches this map; the worker expands the mask to a per-cell aoi_mask column. Granule assignment (and thus the densest pin) is identical to healpix_o9 -- the mask adds a column, it doesn't move granules."
+      "note": "Re-pinned over 2018-10-13..2026-03-15 (issue #202): densest o9 shard unchanged (5347395636851376137), granule count 59 -> 66. BOTH live-matrix arms dispatch this plain map: the nomask arm as-is; the mask arm builds the strict-AOI per-cell mask on the fly at dispatch (run_benchmark._shardmap_with_mask, mortie) -- the ~190 KB mask is derived (grid + AOI, doesn't move granules), so it is not committed (issue #202)."
     },
     "healpix_o9_88s": {
       "path": "shardmaps/sm_healpix_o9_88s.json",
@@ -83,7 +77,7 @@
     },
     "tdigest_healpix_o9_inline_mask": {
       "config": "configs/atl03_tdigest_healpix_o9_aoimask.yaml",
-      "shardmap": "healpix_o9_aoimask",
+      "shardmap": "healpix_o9",
       "aggregator": "tdigest",
       "grid_type": "healpix",
       "grid_size": "o9",
@@ -91,7 +85,7 @@
     },
     "tdigest_healpix_o9_sidecar_mask": {
       "config": "configs/atl03_tdigest_healpix_o9_aoimask.yaml",
-      "shardmap": "healpix_o9_aoimask",
+      "shardmap": "healpix_o9",
       "aggregator": "tdigest",
       "grid_type": "healpix",
       "grid_size": "o9",

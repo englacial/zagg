@@ -41,8 +41,43 @@ _MAX_TARGET_CONCURRENCY = 16
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import bench_metrics  # noqa: E402
 
-from zagg.config import get_handoff, load_config  # noqa: E402
+from zagg.config import get_aoi_mask, get_handoff, load_config  # noqa: E402
 from zagg.grids import from_config  # noqa: E402
+
+
+def _aoi_parts(geojson_path: Path):
+    """Exterior rings ``[(lats, lons), ...]`` from an AOI GeoJSON (coverage form)."""
+    import numpy as np
+    from shapely.geometry import shape
+
+    geom = shape(json.loads(Path(geojson_path).read_text())["features"][0]["geometry"])
+    polys = list(geom.geoms) if geom.geom_type == "MultiPolygon" else [geom]
+    return [
+        (np.asarray(p.exterior.coords.xy[1]), np.asarray(p.exterior.coords.xy[0])) for p in polys
+    ]
+
+
+def _shardmap_with_mask(shardmap_path: Path, grid, aoi_file: Path) -> Path:
+    """Attach the strict-AOI per-cell mask to a committed (mask-free) shard map.
+
+    The mask arm's committed map is the plain o9 map; the ~190 KB per-cell
+    ``aoi_mask`` column is *derived* (grid + AOI, mortie — it does not move
+    granules), so it is built here on the fly rather than committed (issue #202).
+    Returns a temp path carrying the plain map + the ``aoi_mask`` column; the
+    worker expands it identically to a pre-baked map. Built on the runner before
+    dispatch, so the timed Lambda invocation is unchanged.
+    """
+    import tempfile
+
+    from zagg.catalog.shardmap import ShardMap
+
+    sm = ShardMap.from_json(str(shardmap_path))
+    aoi_moc = grid.aoi_moc(_aoi_parts(aoi_file))
+    sm.aoi_mask = [[int(w) for w in grid.aoi_shard_moc(aoi_moc, int(k))] for k in sm.shard_keys]
+    sm.metadata["aoi_mask"] = True
+    out = Path(tempfile.mkdtemp(prefix="zagg-bench-mask-")) / "shardmap_aoimask.json"
+    sm.to_json(str(out))
+    return out
 
 
 def load_targets(path: str) -> tuple[dict, Path]:
@@ -163,6 +198,15 @@ def run_target(
         summary: dict = {}
     else:
         from zagg.runner import agg
+
+        # AOI-mask arm (issue #202): the committed map is the plain o9 map; build
+        # the strict-AOI per-cell mask on the fly (mortie, no spherely) and
+        # dispatch the augmented map, rather than committing the ~190 KB derived
+        # payload. The nomask arm dispatches the committed map unchanged.
+        if get_aoi_mask(config):
+            shardmap_path = _shardmap_with_mask(
+                shardmap_path, grid, _resolve(base, manifest["aoi"]["file"])
+            )
 
         summary = agg(
             config,

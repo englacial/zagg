@@ -2,11 +2,12 @@
 #
 # Identical to atl03_tdigest_healpix_o9.yaml except ``output.aoi_mask: true``: the
 # AOI-mask-on arm of the live reset matrix (issue #202). ``output.aoi_mask``
-# (issue #101) makes ShardMap.build precompute a per-shard strict-AOI cell mask
-# (the AOP_NEON box, resolved from the coverage region) into the shard map, which
-# the worker expands to a per-cell ``aoi_mask`` column. The mask is manifest-
-# driven, so the *_mask targets dispatch the mask-carrying shard map
-# (sm_healpix_o9_aoimask.json) while the *_nomask targets dispatch the plain one.
+# (issue #101) builds a per-shard strict-AOI cell mask (the AOP_NEON box) that the
+# worker expands to a per-cell ``aoi_mask`` column. Both matrix arms dispatch the
+# plain ``sm_healpix_o9.json`` map; on this (mask) arm ``run_benchmark`` sees
+# ``output.aoi_mask`` and builds the mask on the fly at dispatch
+# (``_shardmap_with_mask``, mortie) -- the derived ~190 KB payload is not committed
+# (issue #202). The mask is byte-identical to the old pre-baked map.
 #
 # Per-cell approximate-quantile sketch: each grid cell stores a t-digest of its
 # photon heights (h_ph) as a ``kind: ragged`` CSR field. A t-digest is a small,
