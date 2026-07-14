@@ -475,6 +475,18 @@ class RectilinearGrid:
         xs, ys = self.cell_centers(cells)
         return sample_nearest(xs, ys, str(self._geobox.crs), crs, transform, shape)
 
+    def cell_lonlat(self, cells) -> tuple[np.ndarray, np.ndarray]:
+        """Cell-center ``(lons, lats)`` (WGS84, always_xy order) — grid-agnostic
+        counterpart to :meth:`cell_centers` for consumers that must not care
+        which family the grid is (e.g. the raster ownership rule, #218)."""
+        from pyproj import CRS, Transformer
+
+        xs, ys = self.cell_centers(cells)
+        tx = Transformer.from_crs(
+            CRS.from_user_input(str(self._geobox.crs)), CRS.from_epsg(4326), always_xy=True
+        )
+        return tx.transform(xs, ys)
+
     # ── strict-AOI cell mask (issue #101, optional) ─────────────────────────
 
     def aoi_polygon(self, aoi):

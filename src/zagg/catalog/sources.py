@@ -276,13 +276,26 @@ class STACSource:
     assets : list of str, optional
         Asset-key keep-list (e.g. ``["red", "nir", "scl"]``). ``None`` keeps
         every asset; subsetting keeps the geoparquet struct schema lean.
+    time_key : str, optional
+        Item property naming the *acquisition group* (issue #218): items of
+        one Sentinel-2 datatake land in adjacent MGRS tiles with datetimes
+        seconds apart, so the ``(time, cell)`` timestep identity is e.g.
+        ``"s2:datatake_id"``, not the item datetime. Recorded in the catalog
+        metadata and surfaced per record by :meth:`Catalog.granule_records`.
     timeout : int
         Per-request timeout in seconds.
     """
 
-    def __init__(self, root: str, assets: list[str] | None = None, timeout: int = 60):
+    def __init__(
+        self,
+        root: str,
+        assets: list[str] | None = None,
+        time_key: str | None = None,
+        timeout: int = 60,
+    ):
         self.root = root.rstrip("/")
         self.assets = assets
+        self.time_key = time_key
         self.timeout = timeout
 
     def fetch(self, query: STACQuery, *, limit: int = 1000) -> "Catalog":
@@ -348,6 +361,7 @@ class STACSource:
             "start_date": query.start_date,
             "end_date": query.end_date,
             "bbox": list(bbox),
+            "time_key": self.time_key,
             "max_cloud_cover": query.max_cloud_cover,
             "assets": self.assets,
             "total_granules": len(items),
@@ -422,7 +436,9 @@ class Catalog:
             and ``s3``/``https`` are the canonical data-asset hrefs (either may
             be None). Records with *no* canonical data asset (raster sources,
             #218) additionally carry ``assets`` (``{key: href}`` for every
-            non-canonical asset) and ``datetime`` (ISO acquisition time); any
+            non-canonical asset), ``datetime`` (ISO acquisition time), and
+            ``time_key`` (the acquisition-group property named by the
+            catalog's ``time_key`` metadata, when present); any
             record with a ``data``/``data_s3`` asset -- every CMR record,
             including ``preserve_thumbnails=True`` -- keeps its exact pre-#218
             shape.
@@ -437,8 +453,17 @@ class Catalog:
             if "datetime" in self.table.column_names
             else [None] * len(ids)
         )
+        # Acquisition-group property (issue #218): the source records its item
+        # property name in the catalog metadata; stac-geoparquet flattens item
+        # properties to top-level columns, so it reads straight off the table.
+        tk_col = (self.metadata or {}).get("time_key")
+        tks = (
+            self.table.column(tk_col).to_pylist()
+            if tk_col and tk_col in self.table.column_names
+            else [None] * len(ids)
+        )
         records = []
-        for gid, asset_map, wkb, dt in zip(ids, assets, geoms, dts):
+        for gid, asset_map, wkb, dt, tk in zip(ids, assets, geoms, dts, tks):
             geom = shapely.from_wkb(wkb)
             if geom.is_empty or geom.geom_type not in ("Polygon", "MultiPolygon"):
                 continue
@@ -469,6 +494,8 @@ class Catalog:
                     rec["assets"] = extra
                     if dt is not None:
                         rec["datetime"] = dt.isoformat()
+                    if tk is not None:
+                        rec["time_key"] = str(tk)
             records.append(rec)
         return records
 

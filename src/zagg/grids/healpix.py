@@ -429,6 +429,13 @@ class HealpixGrid:
         lats, lons = mort2geo(np.asarray(cells))
         return np.asarray(lats), np.asarray(lons)
 
+    def cell_lonlat(self, cells) -> tuple[np.ndarray, np.ndarray]:
+        """Cell-center ``(lons, lats)`` (WGS84, always_xy order) — grid-agnostic
+        counterpart to :meth:`cell_centers` for consumers that must not care
+        which family the grid is (e.g. the raster ownership rule, #218)."""
+        lats, lons = self.cell_centers(cells)
+        return lons, lats
+
     def sample(self, cells, crs, transform, shape):
         """Nearest source-pixel ``(rows, cols, valid)`` for cell centers (#218).
 

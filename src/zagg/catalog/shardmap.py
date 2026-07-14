@@ -54,7 +54,7 @@ def _granule_entry(rec: dict) -> dict:
     ``datetime`` (ISO acquisition time).
     """
     entry = {"id": rec["id"], "s3": rec["s3"], "https": rec["https"]}
-    for key in ("assets", "datetime"):
+    for key in ("assets", "datetime", "time_key"):
         if rec.get(key) is not None:
             entry[key] = rec[key]
     return entry
