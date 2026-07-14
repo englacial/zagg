@@ -282,6 +282,12 @@ class TestCollectionOptions:
         with pytest.raises(ValueError, match="credentials_provider"):
             validate_config(cfg)
 
+    def test_spec_params_must_be_mapping(self):
+        cfg = self._cfg(["merra2"])
+        cfg.aggregation["variables"]["max_t2m"]["params"] = "knob=7"
+        with pytest.raises(ValueError, match="params must be a mapping"):
+            validate_config(cfg)
+
 
 # ---------------------------------------------------------------------------
 # ATL03 template
