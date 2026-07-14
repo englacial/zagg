@@ -1,15 +1,14 @@
 # CONUS cost estimate (issue #202, leg 4)
 
-> **⚠️ Under active revision (streaming).** The o7/o8 **"memory-infeasible"**
-> conclusion in §4c is being overturned as this is written: those OOMs are an
-> artifact of the **pooled** default aggregation (the worker holds the whole
-> shard's photons at once), **not** a hard limit. `aggregation.streaming:
-> {buffer_granules: N}` bounds peak memory to one buffer + running digests,
-> independent of shard size — and the benchmark t-digest fields are streamable.
-> A 4 GB streaming re-run of the OOM'd o8 shards + a `buffer_granules` sweep is
-> **in flight**; once it lands, §4c and the o8 numbers get rewritten (o8 likely
-> becomes feasible, reopening the coarser-is-cheaper comparison). **The order-9
-> numbers below stand;** treat the o8/o7 "infeasible" framing as provisional.
+> **Recommendation: order 9 at 4 GB.** o9 is the only order that runs CONUS
+> cleanly today (25/25 shards, RSS ≤ 2.5 GB). Coarser orders (o8/o7) would
+> amortise per-shard overhead but hit a **memory wall** that has two layers
+> (§4c): the pooled read pool (fixable — `aggregation.streaming` bounds it, and
+> it rescues *most* o8 shards) and the **per-cell t-digest state**, which is held
+> for the whole shard and is the hard floor — for the densest o8 shards it exceeds
+> 4 GB at *any* buffer. **Chunk-scoped digest streaming** (bound the digest state
+> to one inner chunk, not the whole shard) is the architectural fix that would
+> unlock o8/o7; it is under investigation. Until then, o9 is the operating point.
 
 **This is an estimate, not a benchmark result.** We are *not* running CONUS. This
 document sizes what a full contiguous-US (lower-48) ATL03 aggregation *would*
@@ -19,12 +18,14 @@ shards, both read modes, §4b). All numbers are at zagg 0.24.0 — the **sharded
 t-digest write (issues #209 / #211), so the pre-#211 write bloat is already gone.
 
 > **Headline: order 9 at 4 GB is the operating point — the only order that runs
-> CONUS at all.** The coarser orders that would amortise per-shard overhead are
-> **memory-infeasible**: an o8 shard OOMs on ~20 % of the continent at 4 GB (and
-> even at 8 GB), and o7 OOMs outright. Per-shard memory is set by **photon
-> density, not granule count**, and memory is billed — so coarsening buys nothing
-> at continental scale (§4c). The remaining upper-bound lever is the #65 swath
-> over-assignment (§4d).
+> CONUS cleanly today.** Coarser orders (o8/o7) would amortise per-shard overhead
+> but hit a memory wall driven by **cell-coverage density, not granule count**
+> (§4c). Streaming the reads (`aggregation.streaming`) rescues *most* o8 shards at
+> 4 GB, but the whole-shard **per-cell t-digest state** is a buffer-independent
+> floor that exceeds 4 GB for the densest o8 shards — o7 OOMs outright.
+> Chunk-scoping that digest state is the fix that would unlock coarser orders
+> (under investigation); until then o9 is the recommendation. The remaining
+> upper-bound lever on the o9 total is the #65 swath over-assignment (§4d).
 
 | Order 9 @ 4 GB (measured) | cost (95 % CI) | wall @ 2,000 workers |
 | --- | ---: | ---: |
@@ -192,39 +193,60 @@ See `estimate_with_ci.py` / `conus_final_estimate.py`.
 ### 4c. Order feasibility — why o9 is the ceiling for coarsening
 
 Coarser shards (fewer of them) would amortise the per-shard intercept — but at
-CONUS scale they run out of **memory**, not time. Per-shard peak RSS is driven by
-**photon volume (surface density), not granule count** — so it only shows up once
-you sample the whole continent, not a single site.
+CONUS scale they hit a **memory wall**. Per-shard peak RSS is driven by **photon
+volume / cell coverage (surface density), not granule count** — so it only shows
+up once you sample the whole continent, not a single site.
 
 | order | shard area | CONUS shards | 4 GB result | evidence |
 | --- | ---: | ---: | --- | --- |
-| **o7** | 2,594 km² | — | **OOM outright** | 1/1 NEON shard (181 gran) died ~990 s; 16.7 M cells → est. ~7 GB |
-| **o8** | 649 km² | 12,596 | **OOMs ~20 %** | 5/25 CONUS shards OOM at 4 GB; survivors already 3.5 GB (§ below) |
+| **o7** | 2,594 km² | — | **OOM outright** | 1/1 NEON shard (181 gran) died ~990 s; 16.7 M cells |
+| **o8** | 649 km² | 12,596 | **pooled: OOMs ~20 %; streamed: dense tail still OOMs** | see below |
 | **o9** | 162 km² | 49,285 | **fits cleanly** | 25/25 CONUS shards, RSS ≤ 2.5 GB |
 | **o10** | 41 km² | — | fits | 9/9 NEON shards, ~560–680 MB |
 
-**The o8 memory wall (measured).** A 25-shard stratified CONUS o8 run had **5
-shards OOM at 4 GB**, deterministically (the same 5 in both read modes), and the
-survivors already peaked at **3.5 GB**. It is **not a leak** and **not granule
-count**: an 85-granule shard OOMs while a 211-granule shard runs at 1.6 GB.
-Re-running the 5 OOM'd shards at **8 GB** confirmed the memory is genuinely large
-and photon-driven:
+**The o8 memory wall — two layers.** A 25-shard stratified CONUS o8 run OOM'd on
+**5/25 shards at 4 GB**, deterministically (same 5 in both read modes), survivors
+peaking at 3.5 GB. It is **not a leak** and **not granule count**: an 85-granule
+shard OOMs while a 211-granule shard runs at 1.6 GB. Two distinct memory sources,
+only one of which is fixable by tuning:
 
-| granules | runtime | RSS @ 8 GB | result |
-| ---: | ---: | ---: | --- |
-| 85 | 623 s | 7,207 MB | ✓ |
-| 120 | 518 s | 6,486 MB | ✓ |
-| 148 | — | — | **still fails** |
-| 155 | 857 s | 7,689 MB (94 %) | ✓ (pinned to *both* the 8 GB and 900 s ceilings) |
-| 176 | 635 s | 5,795 MB | ✓ |
+*(1) The pooled read pool (fixable).* The default worker holds the whole shard's
+photons before aggregating (`worker.py` `all_reads` → `_concat_and_group`).
+`aggregation.streaming: {buffer_granules: N}` (`processing/streaming.py`) folds
+granules incrementally, bounding the read pool to one buffer — and it **rescues
+most of the OOM'd shards at 4 GB** (3 of the 5 worst), sometimes *faster* than
+pooling (an 85-granule shard: 475 s streamed vs 623 s @ 8 GB pooled — memory-
+pressure relief).
 
-So **8 GB does not rescue o8**: 4 of 5 clear but at 5.8–7.7 GB, one still fails,
-and one pins both ceilings at once. o8 would need the 10 GB Lambda maximum just for
-margin — at **2.5× the per-GB-s price**, *and* with a residual failure/retry tail.
-There is no memory tier at which coarsening to o8 is cheaper than o9 running
-cleanly at 4 GB. (An earlier 2-shard NEON o8 test passed at 1.5–1.8 GB — but two
-shards over one uniform forest site did not sample CONUS's photon-density range;
-the continental regression is what exposed the tail.)
+*(2) The per-cell t-digest state (the hard floor).* The streaming aggregator still
+holds a running digest for **every occupied cell across the whole shard**, and
+`buffer_granules` cannot touch it. A `buffer_granules` sweep on the 5 worst shards
+shows the read pool shrinking while RSS **plateaus** at the digest-state floor:
+
+| buffer | 85 g | 120 g | 148 g | 155 g | 176 g | fit @ 4 GB |
+| ---: | --- | --- | --- | --- | --- | --- |
+| 50 | 3,703 MB / 475 s | 2,670 MB / **813 s** | OOM | OOM | 1,930 MB / 784 s | 3/5 |
+| 25 | 2,192 MB / 715 s | 2,198 MB / 655 s | OOM | OOM | OOM | 2/5 |
+| 12 | 1,901 MB / 519 s | **2,201 MB** / 694 s | OOM | OOM | 1,703 MB / **875 s** | 3/5 |
+
+The 120 g shard plateaus at ~2,200 MB (identical at buffer 25 and 12 — the read
+pool is gone, the digest state remains). For the densest-coverage shards (148 g,
+155 g) that floor alone **exceeds 4 GB**, so they OOM at *every* buffer. There is
+also a **time squeeze**: smaller buffers mean more flush/merge rounds, pushing
+runtime toward the wall (176 g hit 875 s / 97 % at buffer 12). At **8 GB pooled**,
+155 g fits (7.7 GB, 94 %) but 148 g still OOMs — so the dense tail needs 8–10 GB
+(2–2.5× the GB-s price) with a residual failure tail even then.
+
+**The real fix is architectural, not a memory tier or a buffer value.** The digest
+state is held whole-shard; at o8 (4× o9's cell count) the densest-coverage shards
+overflow 4 GB no matter how the reads are streamed. **Chunk-scoped digest
+streaming** — process → write → free one inner chunk's cells at a time, bounding
+digest state to ≈1/K of the shard — would decouple worker memory from shard area
+and unlock o8/o7. It is under investigation. Until it lands, **o9 at 4 GB is the
+recommendation**: its 4× smaller cell count keeps the digest state comfortably
+under 4 GB with no new machinery. (An earlier 2-shard NEON o8 test passed at
+1.5–1.8 GB — but two shards over one uniform forest site did not sample CONUS's
+photon-density range; the continental regression is what exposed the tail.)
 
 ### 4d. Remaining upper-bound caveat
 

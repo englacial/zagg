@@ -1,0 +1,97 @@
+{
+  "issue": 202,
+  "temporal": {
+    "start": "2018-10-13",
+    "end": "2026-03-15"
+  },
+  "n_shards": 5,
+  "order": 8,
+  "cold_backend": "inline",
+  "cold": {
+    "per_shard": [
+      {
+        "shard_label": "322311213",
+        "shard_key": 3855397940377944072,
+        "n_granules": 85,
+        "runtime_s": 475.109886,
+        "gb_seconds": 1900.439544,
+        "cost_usd": 0.0253393206159696,
+        "max_memory_mb": 3702.69921875,
+        "wall_time_s": 491.43633484840393,
+        "retries": 0,
+        "timeout": false,
+        "status_code": 200,
+        "error": null
+      },
+      {
+        "shard_label": "323224343",
+        "shard_key": 3917815016463532040,
+        "n_granules": 176,
+        "runtime_s": 784.396894,
+        "gb_seconds": 3137.587576,
+        "cost_usd": 0.0418347101858384,
+        "max_memory_mb": 1929.83203125,
+        "wall_time_s": 799.5575749874115,
+        "retries": 0,
+        "timeout": false,
+        "status_code": 200,
+        "error": null
+      },
+      {
+        "shard_label": "321241241",
+        "shard_key": 3779012668573089800,
+        "n_granules": 120,
+        "runtime_s": 812.873391,
+        "gb_seconds": 3251.493564,
+        "cost_usd": 0.0433534642862376,
+        "max_memory_mb": 2670.12890625,
+        "wall_time_s": 836.4567608833313,
+        "retries": 0,
+        "timeout": false,
+        "status_code": 200,
+        "error": null
+      },
+      {
+        "shard_label": "323242322",
+        "shard_key": 3924412086230188040,
+        "n_granules": 155,
+        "runtime_s": 0.0,
+        "gb_seconds": 0.0,
+        "cost_usd": 0.0,
+        "max_memory_mb": null,
+        "wall_time_s": 991.6768319606781,
+        "retries": 0,
+        "timeout": false,
+        "status_code": null,
+        "error": "no worker result within 990s (worker timed out, was OOM-killed, or crashed before writing its result (check CloudWatch) -- or the deployed worker predates result_url support: redeploy the function, or pass invocation=\"sync\")"
+      },
+      {
+        "shard_label": "321242332",
+        "shard_key": 3780367266898509832,
+        "n_granules": 148,
+        "runtime_s": 0.0,
+        "gb_seconds": 0.0,
+        "cost_usd": 0.0,
+        "max_memory_mb": null,
+        "wall_time_s": 995.5168101787567,
+        "retries": 0,
+        "timeout": false,
+        "status_code": null,
+        "error": "no worker result within 990s (worker timed out, was OOM-killed, or crashed before writing its result (check CloudWatch) -- or the deployed worker predates result_url support: redeploy the function, or pass invocation=\"sync\")"
+      }
+    ],
+    "fit": {
+      "n_points": 3,
+      "sec_per_granule": 3.0353,
+      "intercept_s": 305.31,
+      "r_squared": 0.5532,
+      "granule_range": [
+        85,
+        176
+      ]
+    },
+    "lambda_seconds": 2072.380171,
+    "cost_usd": 0.11052749508804559
+  },
+  "warm": null
+}
