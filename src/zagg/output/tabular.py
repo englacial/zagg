@@ -81,20 +81,21 @@ class TabularWriter:
         """
         path = Path(path)
         fmt = output_format or _EXT_FORMAT.get(path.suffix.lower(), "parquet")
+        if fmt not in ("parquet", "csv"):
+            raise ValueError(f"unknown tabular output format {fmt!r} (expected 'parquet' or 'csv')")
         frame = self.to_frame(rows)
 
         # pandas ``to_parquet``/``to_csv`` do not create missing parent
         # directories, so a nested relative ``output.store`` (e.g.
         # ``./output/zagg/ar_attributes.parquet``) would fail at write with
-        # ``FileNotFoundError``; create the parent tree first.
+        # ``FileNotFoundError``; create the parent tree first. Validate the
+        # format above this so a bad ``output_format`` leaves no stray dir.
         path.parent.mkdir(parents=True, exist_ok=True)
 
         if fmt == "parquet":
             frame.to_parquet(path, index=False)
-        elif fmt == "csv":
+        else:  # fmt == "csv"
             frame.to_csv(path, index=False)
-        else:
-            raise ValueError(f"unknown tabular output format {fmt!r} (expected 'parquet' or 'csv')")
         return path
 
     def to_bytes(self, rows, *, output_format: str = "parquet") -> bytes:
