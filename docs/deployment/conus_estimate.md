@@ -94,6 +94,16 @@ The shard coverage (7.99 M km²) exceeds the polygon area (7.81 M km²) by 2.4 %
 because o9 shards on the boundary are kept whole (the AOI-overhang effect, issue
 #101) — a real cost the estimate carries, since those edge shards dispatch in full.
 
+The shard tiling (dispatch units) over CONUS, at both benchmark orders — the San
+Francisco Bay inset makes the HEALPix diamond tiling legible (an o8 shard is 4× an
+o9 shard's area, so ~4× fewer, larger diamonds in the same window: 31 vs 97). The
+whole-CONUS panel is a fine mesh at this scale; the red box marks the inset window.
+Rendered from the committed shard maps by `data/conus/plot_conus_shardmap.py`.
+
+![CONUS HEALPix shard map at order 9 — 49,285 shards of 162 km², with a San Francisco Bay inset showing the diamond tiling](conus_shardmap_o9.png)
+
+![CONUS HEALPix shard map at order 8 — 12,596 shards of 649 km² (4× the o9 area), with a San Francisco Bay inset](conus_shardmap_o8.png)
+
 ## 3. Per-shard granule-count distribution
 
 The regression's input variable is granules-per-shard. The full distribution is
@@ -147,6 +157,19 @@ per-shard granule counts and summed.
 The repeat cache saves **~$52/run (11 %)** on reads. The pre-#211 cold **S3 PUT
 storm (~$440, ~1,792 objects/shard)** is **gone** — sharding writes one t-digest
 object per shard, so the write phase no longer dominates cold.
+
+**Why the cache is only ~11 % here (it caches the *index*, not the data).** The
+sidecar persists each granule's **chunk map** (which HDF5 byte-ranges to read), so
+it eliminates only the per-shard **index-build** phase — the fits show the cache
+cutting the per-shard intercept from **37.9 → 12.6 s** (~25 s/shard) while leaving
+the per-granule slope unchanged (~2 s/gran): the photon read itself is uncached
+either way. At CONUS o9 density (~70 granules/shard) the per-granule read (~140
+s/shard) dwarfs that ~25 s, so caching the index caps the win at ~11 % of the
+total. Two caveats on comparing to earlier testing: (1) **cold here is `inline`**
+(the compiled hidefix path, which already builds the chunk map fast) — the cache's
+larger value shows against the slow `hierarchical` pure-h5coro baseline; (2)
+sparser test shards make the fixed index a bigger fraction of the bill, whereas
+CONUS's dense shards are read-bound.
 
 ### 4a. Wall-clock at scale
 
