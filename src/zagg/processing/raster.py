@@ -121,6 +121,11 @@ async def sample_asset_async(
     store, path = _store_and_path(href, region=region, anonymous=anonymous)
     tiff = await TIFF.open(path, store=store)
     ifd = tiff.ifds[0]
+    if len(ifd.bits_per_sample) != 1:
+        raise ValueError(
+            "single-band rasters only; Sentinel-2 distributes one COG per band "
+            f"(found samples-per-pixel = {len(ifd.bits_per_sample)})"
+        )
     epsg, transform = _geo_from_ifd(ifd)
     shape = (ifd.image_height, ifd.image_width)
     rows, cols, valid = grid.sample(cells, f"EPSG:{epsg}", transform, shape)

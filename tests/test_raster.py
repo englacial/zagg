@@ -26,8 +26,13 @@ RES = 10.0
 TRANSFORM = (RES, 0.0, ORIGIN[0], 0.0, -RES, ORIGIN[1])
 
 
-def _write_tiff(path, data, *, tile=32, epsg=32618, origin=ORIGIN, res=RES, geo=True):
-    """Minimal tiled uncompressed little-endian GeoTIFF (uint16)."""
+def _write_tiff(path, data, *, tile=32, epsg=32618, origin=ORIGIN, res=RES, geo=True, bands=1):
+    """Minimal tiled uncompressed little-endian GeoTIFF (uint16).
+
+    ``bands > 1`` writes a pixel-interleaved multi-band raster (each band a copy
+    of ``data``) so the single-band guard in the reader can be exercised; the
+    ``bands == 1`` layout is byte-identical to before.
+    """
     data = np.ascontiguousarray(data, dtype=np.uint16)
     h, w = data.shape
     th = tw = tile
@@ -38,7 +43,9 @@ def _write_tiff(path, data, *, tile=32, epsg=32618, origin=ORIGIN, res=RES, geo=
             blk = np.zeros((th, tw), dtype=np.uint16)
             sub = data[r * th : (r + 1) * th, c * tw : (c + 1) * tw]
             blk[: sub.shape[0], : sub.shape[1]] = sub
-            blocks.append(blk.tobytes())
+            if bands > 1:
+                blk = np.repeat(blk[:, :, None], bands, axis=2)
+            blocks.append(np.ascontiguousarray(blk).tobytes())
     n = len(blocks)
     pos = 8
     offsets = []
@@ -59,18 +66,20 @@ def _write_tiff(path, data, *, tile=32, epsg=32618, origin=ORIGIN, res=RES, geo=
 
     off_to = extern("L", offsets) if n > 1 else offsets[0]
     off_bc = extern("L", bytecounts) if n > 1 else bytecounts[0]
+    bps = extern("H", [16] * bands) if bands > 1 else 16
+    sf = extern("H", [1] * bands) if bands > 1 else 1
     entries = [
         (256, "L", 1, w),
         (257, "L", 1, h),
-        (258, "H", 1, 16),
+        (258, "H", bands, bps),
         (259, "H", 1, 1),
         (262, "H", 1, 1),
-        (277, "H", 1, 1),
+        (277, "H", 1, bands),
         (322, "H", 1, tw),
         (323, "H", 1, th),
         (324, "L", n, off_to),
         (325, "L", n, off_bc),
-        (339, "H", 1, 1),
+        (339, "H", bands, sf),
     ]
     if geo:
         # GTModelType=1 (projected), GTRasterType=1 (area), ProjectedCSType=epsg
@@ -307,6 +316,15 @@ class TestSampleAsset:
         assert valid.all()
         assert values.dtype == np.uint16
         np.testing.assert_array_equal(values, data.ravel())
+
+    def test_multiband_asset_raises(self, tmp_path):
+        """A multi-band COG fails loudly rather than silently reading band 0."""
+        p = tmp_path / "rgb.tif"
+        _write_tiff(p, _index_raster(), bands=2)
+        grid = _rect_grid()
+        cells = np.arange(96 * 96)
+        with pytest.raises(ValueError, match="single-band"):
+            sample_asset(grid, cells, str(p))
 
     def test_no_valid_cells_returns_fill_in_asset_dtype(self, tmp_path):
         p = tmp_path / "t.tif"
