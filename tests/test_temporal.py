@@ -979,11 +979,14 @@ class TestTemporalReader:
         with pytest.raises(ValueError, match="input_credentials"):
             _input_channel("anonymous")
 
-    def test_read_temporal_inputs_extent_subsets_loads_and_frees(self, monkeypatch):
+    def test_read_temporal_inputs_extent_subsets_loads_and_closes(self, monkeypatch):
         # With an event extent, each granule is subset to it (and the
         # collection's variables), loaded, and closed before the next opens --
         # peak memory ~one granule instead of every collection whole
-        # (issue #225).
+        # (issue #225). This test asserts close() is invoked once per granule;
+        # the actual buffer release was verified empirically in the PR-226
+        # review (weakref dies after the loop). The structural guarantee here is
+        # that close() runs before the next granule opens.
         xr = pytest.importorskip("xarray")
         import zagg.temporal as temporal
         from zagg.temporal import read_temporal_inputs
@@ -1021,7 +1024,10 @@ class TestTemporalReader:
         # concat + sortby: day 1 before day 2, values loaded as plain numpy
         assert out["T2M"].values[0, 0, 0] == 1.0
         assert isinstance(out["T2M"].data, np.ndarray)
-        assert len(closed) == 2  # each granule's buffer released after load
+        # close() invoked once per granule (spy replaces the h5netcdf closer);
+        # buffer release itself verified empirically in the PR-226 review. The
+        # structural guarantee is that close runs before the next granule opens.
+        assert len(closed) == 2
 
     def test_read_temporal_inputs_no_extent_stays_lazy_shaped(self, monkeypatch):
         # Without an extent the reader returns the opened datasets untouched
