@@ -213,32 +213,39 @@ account password. Set a calendar reminder to regenerate + re-`gh secret set`
 before expiry — an expired token fails the benchmark at the NSIDC-credentials
 step.
 
-### Per-release full-AOI workflow (optional; issue #202 leg 1)
+### Per-release full-AOI workflow (issue #202 leg 1)
 
 `lambda-benchmark-fullaoi.yml` runs the **whole** AOP_NEON box over every shard on
 a version tag (`push: tags '*.*.*'`, the same event as `publish.yml`) and
 `workflow_dispatch`, appending to `full_aoi_series.parquet` on the `benchmarks`
-branch. It is **inert until its role var is set** (the job skips otherwise, so
-nothing bills), and it fails **closed** on a wrong-account dispatch (the harness
-asserts the caller's AWS account matches `targets_full_aoi_neon.json`'s
-`dispatch.expect_account` via STS before any billed invoke). Each of its vars falls
-back to the shared `BENCHMARK_*` above, so if the full-AOI run targets the same
-account/function you need **only** set the role:
+branch.
+
+**It reuses the per-merge benchmark config by default — no new variables.** Its
+role, region, and store resolve `BENCHMARK_FULLAOI_* || BENCHMARK_*`, and the
+function defaults to `process-shard`. Because the per-merge run already requires
+`BENCHMARK_ROLE_ARN`, this job **runs on the next tag with nothing extra set**,
+using that same role against `process-shard`. The only added guardrail vs. the
+per-merge run: the harness asserts the caller's AWS account equals
+`targets_full_aoi_neon.json`'s `dispatch.expect_account` (`742127912612`, where
+`process-shard` is deployed) via STS **before any billed invoke** — so if the
+reused role is in that account (it is, since that's where it already invokes
+`process-shard`) it just works, and a mismatch **fails closed** (clear error, no
+billing) rather than dispatching to the wrong account.
+
+Set the `BENCHMARK_FULLAOI_*` variables **only** to point the full-AOI run at a
+*different* account/function/store than the per-merge run (and update the
+manifest's `expect_account` to match if you retarget the account):
 
 ```bash
-# Minimal: reuse the shared benchmark config, just target the production function.
-gh variable set BENCHMARK_FULLAOI_ROLE_ARN --body "arn:aws:iam::742127912612:role/..."
-# Optional per-deployment overrides (else inherit BENCHMARK_AWS_REGION /
-# BENCHMARK_STORE_PREFIX, and FUNCTION_NAME defaults to `process-shard`):
+# OPTIONAL overrides -- omit to reuse the per-merge BENCHMARK_* config as-is.
+gh variable set BENCHMARK_FULLAOI_ROLE_ARN      --body "arn:aws:iam::ACCOUNT_ID:role/..."
 gh variable set BENCHMARK_FULLAOI_REGION        --body "REGION"
 gh variable set BENCHMARK_FULLAOI_STORE_PREFIX  --body "s3://BUCKET/PREFIX"
 gh variable set BENCHMARK_FULLAOI_FUNCTION_NAME --body "process-shard"
 ```
 
-The role must be able to invoke that function **in the account named by the
-manifest's `expect_account`** — otherwise the STS assertion trips and the run
-aborts before billing. Do the first run via `workflow_dispatch` to validate before
-relying on the tag trigger.
+Do the first run via `workflow_dispatch` to validate before relying on the tag
+trigger.
 
 **Verify**:
 
