@@ -351,6 +351,29 @@ def _chord2(lons, lats, lon0: float, lat0: float) -> np.ndarray:
     return x * x + y * y + z * z
 
 
+# Default cap on how many acquisition groups sample concurrently per shard
+# (issue #231). Mirrors ``data_source.granule_workers``' default of 4: every
+# in-flight group holds one timestep's decoded COG tiles + per-band gather
+# buffers, so the cap bounds peak sampling memory to ~K timesteps instead of
+# all T at once, while still overlapping S3 fetches at fine orders.
+_DEFAULT_SAMPLE_CONCURRENCY = 4
+
+
+def _sample_concurrency(config) -> int:
+    """``data_source.sample_concurrency``: acquisition groups in flight per shard.
+
+    Bounds the :class:`asyncio.Semaphore` over timesteps in
+    :func:`process_raster_shard` (issue #231). Default 4; ``1`` samples one
+    timestep at a time. Re-checked here with the same int>=1 / bool-trap guard
+    ``validate_config`` applies at submission, so a hand-rolled worker payload
+    fails loudly rather than passing a bad width to ``Semaphore``.
+    """
+    k = (config.data_source or {}).get("sample_concurrency", _DEFAULT_SAMPLE_CONCURRENCY)
+    if isinstance(k, bool) or not isinstance(k, int) or k < 1:
+        raise ValueError(f"data_source.sample_concurrency must be an integer >= 1 (got {k!r})")
+    return k
+
+
 def process_raster_shard(
     grid,
     shard_key: int,
@@ -402,12 +425,21 @@ def process_raster_shard(
                 "the shards were dispatched from — see raster_time_index"
             )
 
-    # One event loop per shard: fan out across every item of every timestep
-    # concurrently (S3 fetches overlap), instead of one asyncio.run per item.
+    # One event loop per shard, but bound how many acquisition groups sample
+    # concurrently: an ``asyncio.Semaphore(K)`` over the timesteps caps peak
+    # memory at ~K in-flight timesteps of decoded COG tiles + per-band gather
+    # buffers instead of all T at once (issue #231). Within a bounded group
+    # every item still fans out concurrently — adjacent MGRS tiles of one
+    # datatake are seconds apart, so the wall-clock overlap survives at fine
+    # orders.
+    k = _sample_concurrency(config)
+
     async def _sample_all():
-        return await asyncio.gather(
-            *[
-                asyncio.gather(
+        sem = asyncio.Semaphore(k)
+
+        async def _sample_group(items):
+            async with sem:
+                return await asyncio.gather(
                     *[
                         sample_item_async(
                             grid,
@@ -421,9 +453,8 @@ def process_raster_shard(
                         for e in items
                     ]
                 )
-                for items in groups.values()
-            ]
-        )
+
+        return await asyncio.gather(*[_sample_group(items) for items in groups.values()])
 
     group_results = _run_sync(_sample_all())
 
