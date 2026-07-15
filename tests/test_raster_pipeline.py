@@ -170,17 +170,20 @@ class _FakeGrid:
 
 
 class TestSampleConcurrency:
-    def test_semaphore_bounds_in_flight_groups(self, monkeypatch):
+    # k=1 serial (peak 1), an interior cap (peak k), and k>=n_groups (peak
+    # n_groups): an off-by-one in the semaphore width passes k=3 but fails k=1.
+    @pytest.mark.parametrize("k", [1, 3, 10, 12])
+    def test_semaphore_bounds_in_flight_groups(self, monkeypatch, k):
         # N single-item acquisition groups sampled under Semaphore(K): each
         # group is one ``sample_item_async`` call, so concurrent calls track
         # concurrent timesteps. An instrumented fake records the peak, which
-        # must be capped at K yet actually reach K (issue #231: the cap bounds
-        # memory without serializing the fan-out).
+        # must be capped at min(K, N) yet actually reach it (issue #231: the cap
+        # bounds memory without serializing the fan-out).
         import asyncio as _asyncio
 
         from zagg.processing import raster as raster_mod
 
-        n_cells, n_groups, k = 8, 10, 3
+        n_cells, n_groups = 8, 10
         state = {"cur": 0, "max": 0}
         lock = _asyncio.Lock()
 
@@ -207,7 +210,8 @@ class TestSampleConcurrency:
         slabs, meta = process_raster_shard(_FakeGrid(n_cells), 0, granules, cfg, index)
         assert meta["timesteps"] == n_groups
         assert set(slabs) == set(range(n_groups))
-        assert state["max"] == k  # bounded by K, and the fan-out reaches K
+        # Bounded by min(K, N), and the fan-out reaches it (not serialized).
+        assert state["max"] == min(k, n_groups)
 
 
 def _rect_grid(bounds, chunk):
