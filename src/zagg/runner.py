@@ -792,12 +792,16 @@ class RasterStrategy:
                 ev["output_credentials"] = output_creds_event
             return ev
 
+        # Substring markers for a transient invoke fault, matched
+        # case-insensitively (parity intent with _invoke_lambda_cell's policy,
+        # #119): throttles, service faults, connection resets, and read timeouts
+        # retry with jittered backoff; everything else is a deterministic error.
         transient_markers = (
-            "TooManyRequests",
-            "ServiceException",
-            "throttl",
-            "Connection",
-            "Timeout",
+            "toomanyrequests",
+            "throttling",
+            "serviceexception",
+            "connection",
+            "timeout",
         )
 
         def _one(pair):
@@ -826,9 +830,12 @@ class RasterStrategy:
                 except Exception as e:
                     raise_for_fd_exhaustion(e, max_workers)
                     last = str(e)
-                    if not any(t in last for t in transient_markers) or attempt == max_retries - 1:
+                    low = last.lower()
+                    if not any(t in low for t in transient_markers) or attempt == max_retries - 1:
                         return {"error": last, "body": {}}
-                    time.sleep(min(2**attempt, 8))
+                    # Jitter the backoff so a wide synchronous fan-out does not
+                    # retry in a synchronized wave (mirrors _invoke_lambda_cell).
+                    time.sleep(min(2**attempt, 8) * (0.5 + random.random() / 2))
             return {"error": last, "body": {}}
 
         t0 = time.time()
