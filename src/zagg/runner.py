@@ -645,6 +645,7 @@ class RasterStrategy:
         shards_with_data = 0
         errors = 0
         timesteps_written = 0
+        last_error = None
 
         def _one(pair):
             shard_key, granules = pair
@@ -665,6 +666,7 @@ class RasterStrategy:
                     meta = fut.result()
                 except Exception as e:  # noqa: BLE001 - per-shard isolation, run continues
                     errors += 1
+                    last_error = e
                     logger.warning(f"raster shard {label} failed: {e}")
                     continue
                 if meta["timesteps"]:
@@ -672,6 +674,13 @@ class RasterStrategy:
                     timesteps_written += meta["timesteps"]
 
         wall_time = time.time() - t0
+        # Per-shard isolation lets one bad shard be counted and skipped, but a
+        # run where EVERY shard raised (e.g. a config band whose ``asset`` is
+        # absent from every granule) would otherwise return a success-shaped,
+        # all-fill summary. Fail loudly instead so a caller that does not inspect
+        # ``cells_error`` cannot mistake a fully-broken run for an empty AOI.
+        if cells and errors == len(cells):
+            raise RuntimeError(f"all {errors} raster shard(s) failed; last error: {last_error}")
         summary = {
             "total_cells": len(cells),
             "cells_with_data": shards_with_data,

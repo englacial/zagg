@@ -219,6 +219,16 @@ class TestRasterAgg:
         summary = agg(cfg, catalog=sm_path, backend="local", dry_run=True)
         assert summary["dry_run"] is True and summary["total_cells"] == 1
 
+    def test_all_shards_error_raises(self, tmp_path, manifest):
+        # Point every band at an asset key absent from every granule entry, so
+        # each shard's sample_item_async raises: the run must fail loudly rather
+        # than return a success-shaped (all-fill) summary that a caller ignoring
+        # cells_error would read as an empty AOI.
+        cfg, sm_path, _shard, _data = manifest
+        cfg.data_source["bands"] = {"green": {"asset": "green", "dtype": "uint16", "fill_value": 0}}
+        with pytest.raises(RuntimeError, match="all .* raster shard"):
+            agg(cfg, catalog=sm_path, backend="local", max_workers=2)
+
     def test_lambda_backend_not_yet(self, manifest):
         cfg, sm_path, _shard, _data = manifest
         with pytest.raises(NotImplementedError, match="Lambda"):
