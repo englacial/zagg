@@ -931,6 +931,81 @@ class TestTemporalReader:
         assert "xarray_s3" in registry.list_readers()
         assert callable(registry.get_reader("xarray_s3"))
 
+    def test_open_dataset_unsigned_builds_anonymous_store(self, monkeypatch):
+        # unsigned=True routes to the skip_signature store construction: no
+        # credential provider, anonymous requests (issue #223).
+        xr = pytest.importorskip("xarray")
+        import obstore
+        import obstore.store
+
+        from zagg.temporal import open_dataset
+
+        captured = {}
+        sentinel = xr.Dataset({"mask": (("lat",), np.ones(2))}, coords={"lat": [0, 1]})
+
+        monkeypatch.setattr(
+            obstore.store,
+            "S3Store",
+            lambda bucket, **o: captured.update(bucket=bucket, opts=o) or None,
+        )
+
+        class _Bytes:
+            @staticmethod
+            def bytes():
+                return b"NETCDFBYTES"
+
+        monkeypatch.setattr(obstore, "get", lambda store, key: captured.update(key=key) or _Bytes())
+        monkeypatch.setattr(xr, "open_dataset", lambda buf: sentinel)
+
+        out = open_dataset("s3://public-bucket/masks/storm_00001.nc", unsigned=True)
+        assert captured["bucket"] == "public-bucket"
+        assert captured["opts"].get("skip_signature") is True
+        assert "access_key_id" not in captured["opts"]
+        assert list(out.data_vars) == ["mask"]
+
+    def test_open_dataset_unsigned_with_credentials_raises(self):
+        from zagg.temporal import open_dataset
+
+        with pytest.raises(ValueError, match="mutually exclusive"):
+            open_dataset("s3://b/m.nc", credentials={"accessKeyId": "a"}, unsigned=True)
+
+    def test_input_channel_forms(self):
+        from zagg.temporal import _input_channel
+
+        creds = {"accessKeyId": "a"}
+        assert _input_channel(creds) == (creds, False)
+        assert _input_channel("unsigned") == (None, True)
+        assert _input_channel(None) == (None, False)
+        with pytest.raises(ValueError, match="input_credentials"):
+            _input_channel("anonymous")
+
+    def test_read_temporal_inputs_routes_credential_channels(self, monkeypatch):
+        # collections read with the source creds; statics ride the
+        # input_credentials channel (here: unsigned) -- issue #223.
+        xr = pytest.importorskip("xarray")
+        import zagg.temporal as temporal
+        from zagg.temporal import read_temporal_inputs
+
+        seen = {}
+        ds = xr.Dataset({"T2M": (("lat",), np.ones(2))}, coords={"lat": [0, 1]})
+
+        def _capture(uri, **kwargs):
+            seen[uri] = kwargs
+            return ds
+
+        monkeypatch.setattr(temporal, "open_dataset", _capture)
+        source_creds = {"accessKeyId": "gesdisc"}
+        read_temporal_inputs(
+            {"merra2": "s3://gesdisc/day1.nc4"},
+            {"ais_mask": "s3://public/ais.nc"},
+            credentials=source_creds,
+            input_credentials="unsigned",
+        )
+        assert seen["s3://gesdisc/day1.nc4"]["credentials"] == source_creds
+        assert not seen["s3://gesdisc/day1.nc4"].get("unsigned")
+        assert seen["s3://public/ais.nc"]["credentials"] is None
+        assert seen["s3://public/ais.nc"]["unsigned"] is True
+
 
 # ---------------------------------------------------------------------------
 # Declarative collection options (issue #213, Phase 3)

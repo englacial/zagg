@@ -606,7 +606,10 @@ def _run_lambda_events(
 
     ``events`` items are URI-shaped dicts (the by-reference twin of the local
     backend's in-memory tuples): ``{"event_key", "event_mask_uri",
-    "collection_uris", "static_uris", "s3_credentials"?}``. Events without
+    "collection_uris", "static_uris", "s3_credentials"?,
+    "input_credentials"?}``. ``input_credentials`` (a creds dict or
+    ``"unsigned"``) covers the consumer-owned mask + statics; ``s3_credentials``
+    covers only the source collections (issue #223). Events without
     per-event ``s3_credentials`` get the shared credentials fetched once from
     the ``data_source.credentials_provider`` registry name, when the config
     sets one (issue #213 Phase 4). The worker loads
@@ -2082,6 +2085,8 @@ def _invoke_lambda_event(
     }
     if ev.get("s3_credentials"):
         event["s3_credentials"] = ev["s3_credentials"]
+    if ev.get("input_credentials"):
+        event["input_credentials"] = ev["input_credentials"]
     if output_creds_event is not None:
         event["output_credentials"] = output_creds_event
 

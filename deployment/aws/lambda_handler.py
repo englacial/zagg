@@ -90,7 +90,12 @@ Process-event mode (the temporal/event pipeline worker -- issue #12, Phase 7b):
     },
     "store_path": str,          # s3:// (or local) tabular output, e.g. .parquet
     "config": dict,             # temporal pipeline config (specs etc.)
-    "s3_credentials": dict (optional),     # read creds for source datasets
+    "s3_credentials": dict (optional),     # read creds for the SOURCE collections
+                                           #   only (issue #223)
+    "input_credentials": dict | "unsigned" (optional),  # consumer-owned mask +
+                                           #   statics channel: explicit creds,
+                                           #   "unsigned" (public bucket), or
+                                           #   absent -> execution role
     "output_credentials": dict (optional), # write creds for the tabular store
     "return_results": bool (optional),  # fan-out driver mode (issue #12 Phase
                                         #   8): skip the worker-side tabular
@@ -725,7 +730,7 @@ def _handle_process_event(event: Dict[str, Any]) -> Dict[str, Any]:
     from zagg import registry as zagg_registry
     from zagg.config import collection_options as _collection_options
     from zagg.output import write_tabular
-    from zagg.temporal import open_dataset, process_event, specs_from_config
+    from zagg.temporal import _input_channel, open_dataset, process_event, specs_from_config
 
     event_key = event.get("event_key")
     logger.info(f"process_event mode: event {event_key!r}")
@@ -748,12 +753,19 @@ def _handle_process_event(event: Dict[str, Any]) -> Dict[str, Any]:
         config = load_config_from_dict(event["config"])
         specs = specs_from_config(config)
 
-        # s3_credentials reads source datasets; output_credentials writes the
-        # tabular store. Either may be omitted to fall back to the execution role.
+        # Two read channels (issue #223): s3_credentials covers the SOURCE
+        # collections it was fetched for (e.g. GES DISC STS creds — scoped, so
+        # signing other buckets with them is denied cross-account);
+        # input_credentials covers the consumer-owned mask + statics (dict |
+        # "unsigned" for public buckets | absent -> execution role).
+        # output_credentials writes the tabular store.
         read_creds = event.get("s3_credentials") or None
+        in_creds, in_unsigned = _input_channel(event.get("input_credentials"))
         region = os.environ.get("AWS_REGION", "us-west-2")
 
-        event_mask = open_dataset(event["event_mask_uri"], credentials=read_creds, region=region)
+        event_mask = open_dataset(
+            event["event_mask_uri"], credentials=in_creds, region=region, unsigned=in_unsigned
+        )
         # The event mask is a single-variable file; index that variable so masks
         # operate on a DataArray (mirrors the local events= contract).
         mask_vars = list(getattr(event_mask, "data_vars", []))
@@ -769,6 +781,7 @@ def _handle_process_event(event: Dict[str, Any]) -> Dict[str, Any]:
             credentials=read_creds,
             region=region,
             collection_options=_collection_options(config),
+            input_credentials=event.get("input_credentials"),
         )
 
         results, meta = process_event(event_key, event_mask, collections, specs, static_data)

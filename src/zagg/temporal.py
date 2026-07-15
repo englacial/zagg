@@ -591,7 +591,7 @@ def specs_from_config(config):
 # ---------------------------------------------------------------------------
 
 
-def open_dataset(uri, *, credentials=None, endpoint_url=None, region="us-west-2"):
+def open_dataset(uri, *, credentials=None, endpoint_url=None, region="us-west-2", unsigned=False):
     """Open a single xarray ``Dataset`` from a local path or ``s3://`` URI.
 
     A ``.zarr`` URI opens through :func:`zagg.store.open_store` (the obstore S3
@@ -599,14 +599,25 @@ def open_dataset(uri, *, credentials=None, endpoint_url=None, region="us-west-2"
     bytes and opened in-memory, so the reader needs no ``s3fs``/``fsspec`` on the
     Lambda worker. ``credentials``/``endpoint_url`` are the camelCase write/read
     creds used elsewhere; omit to use the ambient chain (execution role).
+    ``unsigned`` sends anonymous (unsigned) requests — the mechanism for public
+    buckets, where a request *signed* by scoped credentials is denied by the
+    cross-account rule even though anonymous access is granted (issue #223).
     """
     import xarray as xr
+
+    if unsigned and credentials:
+        raise ValueError("unsigned=True and explicit credentials are mutually exclusive")
 
     if uri.endswith(".zarr"):
         from .store import open_store
 
         store = open_store(
-            uri, read_only=True, credentials=credentials, endpoint_url=endpoint_url, region=region
+            uri,
+            read_only=True,
+            credentials=credentials,
+            endpoint_url=endpoint_url,
+            region=region,
+            **({"skip_signature": True} if unsigned else {}),
         )
         return xr.open_zarr(store)
 
@@ -628,9 +639,34 @@ def open_dataset(uri, *, credentials=None, endpoint_url=None, region="us-west-2"
         endpoint_url=endpoint_url,
         region=region,
         retry_config=_S3_READONLY_RETRY_CONFIG,
+        **({"skip_signature": True} if unsigned else {}),
     )
     payload = obstore.get(store, key).bytes()
     return xr.open_dataset(io.BytesIO(bytes(payload)))
+
+
+def _input_channel(input_credentials):
+    """Resolve the consumer-input credential channel (issue #223).
+
+    ``input_credentials`` is the payload field covering ``event_mask_uri`` and
+    ``static_uris`` — consumer-owned inputs, as opposed to the source
+    collections that ``s3_credentials`` was fetched for: an explicit camelCase
+    creds dict, the string ``"unsigned"`` (anonymous requests — public
+    buckets), or ``None`` for the ambient chain (execution role).
+
+    Returns
+    -------
+    tuple[dict | None, bool]
+        ``(credentials, unsigned)`` ready for :func:`open_dataset`.
+    """
+    if input_credentials == "unsigned":
+        return None, True
+    if input_credentials is None or isinstance(input_credentials, dict):
+        return input_credentials, False
+    raise ValueError(
+        f"input_credentials must be a credentials dict, 'unsigned', or None "
+        f"(got {input_credentials!r})"
+    )
 
 
 def _eval_derived(name, expression, ds):
@@ -688,6 +724,7 @@ def read_temporal_inputs(
     endpoint_url=None,
     region="us-west-2",
     collection_options=None,
+    input_credentials=None,
 ):
     """Load the ``collections`` and ``static_data`` :func:`process_event` needs.
 
@@ -708,11 +745,19 @@ def read_temporal_inputs(
         ``{static_name: uri}`` for e.g. ``ais_mask`` / ``climatology`` /
         ``cell_areas``.
     credentials, endpoint_url, region
-        Forwarded to :func:`open_dataset`.
+        Forwarded to :func:`open_dataset` for the **collections** — the source
+        datasets these credentials were fetched for (e.g. the GES DISC STS
+        creds from ``credentials_provider``).
     collection_options : dict[str, dict], optional
         Per-collection declarative options applied by
         :func:`prepare_collection`; the runner derives this from
         ``data_source.collections`` via :func:`zagg.config.collection_options`.
+    input_credentials : dict | str | None, optional
+        Credential channel for the **consumer-owned statics** (issue #223): an
+        explicit creds dict, ``"unsigned"`` (anonymous — public buckets), or
+        ``None`` for the ambient chain. Source credentials scoped to GES DISC
+        (or any other provider) are denied on other buckets by the
+        cross-account rule, so statics must not ride the collections channel.
 
     Returns
     -------
@@ -720,6 +765,13 @@ def read_temporal_inputs(
         ``(collections, static_data)`` ready for :func:`process_event`.
     """
     kw = {"credentials": credentials, "endpoint_url": endpoint_url, "region": region}
+    in_creds, unsigned = _input_channel(input_credentials)
+    static_kw = {
+        "credentials": in_creds,
+        "endpoint_url": endpoint_url,
+        "region": region,
+        "unsigned": unsigned,
+    }
     options = collection_options or {}
     collections = {}
     for name, uris in collection_uris.items():
@@ -734,7 +786,7 @@ def read_temporal_inputs(
         collections[name] = prepare_collection(ds, options.get(name))
     static_data = {}
     for name, uri in static_uris.items():
-        ds = open_dataset(uri, **kw)
+        ds = open_dataset(uri, **static_kw)
         data_vars = list(ds.data_vars)
         static_data[name] = ds[data_vars[0]] if len(data_vars) == 1 else ds
     return collections, static_data
