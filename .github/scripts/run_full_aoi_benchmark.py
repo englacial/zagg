@@ -21,9 +21,11 @@ It does the same job in three steps, all runnable/validatable without AWS via
 3. **Dispatch** all shards via ``zagg.runner.agg`` (``morton_cell=None`` ->
    every shard; ``profile=True`` for phase timings; ``max_retries=1`` so a
    failed shard is recorded as a failure, never re-fired to re-pay -- #119).
-   Before any billed invoke it asserts the caller's AWS account matches the
-   target's ``dispatch.expect_account`` (STS ``get_caller_identity``), so a
-   wrong-profile dispatch fails closed instead of billing the wrong account.
+   If (and only if) the manifest sets an optional ``dispatch.expect_account``, it
+   asserts the caller's AWS account matches it (STS ``get_caller_identity``) before
+   any billed invoke, so a wrong-profile dispatch fails closed instead of billing
+   the wrong account. Absent by default (no account pinned -- the release run
+   reuses the per-merge benchmark role); a fork can opt in.
 
 Output schema
 -------------
@@ -478,9 +480,13 @@ def main(argv: list[str] | None = None) -> int:
     }
 
     # Fail closed on a wrong-account dispatch *before* building anything billable.
+    # expect_account is an optional opt-in guard (absent by default -- no account
+    # is pinned, so the release run reuses the per-merge role fork-friendly-ly);
+    # _assert_account no-ops and returns None when it's unset.
     if not args.dry_run:
         acct = _assert_account(args.region, manifest.get("dispatch", {}).get("expect_account"))
-        print(f"caller AWS account confirmed: {acct}", flush=True)
+        if acct:
+            print(f"caller AWS account confirmed: {acct}", flush=True)
 
     runs, shards = [], []
     for name in names:

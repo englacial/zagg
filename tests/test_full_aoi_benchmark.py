@@ -30,7 +30,10 @@ def test_full_aoi_targets_manifest_consistent():
     assert manifest["aoi"]["file"] and (base / manifest["aoi"]["file"]).exists()
     assert manifest["temporal"]["start"] and manifest["temporal"]["end"]
     dispatch = manifest["dispatch"]
-    assert dispatch["expect_account"] and dispatch["function_name"] and dispatch["region"]
+    # No account is pinned by default (fork-friendly); expect_account is an
+    # optional opt-in guard the harness no-ops when absent (issue #202).
+    assert dispatch["function_name"] and dispatch["region"]
+    assert "expect_account" not in dispatch
     assert manifest["targets"], "manifest defines no targets"
     for name, t in manifest["targets"].items():
         assert (base / t["config"]).exists(), f"{name}: missing config {t['config']}"

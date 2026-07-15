@@ -220,37 +220,23 @@ a version tag (`push: tags '*.*.*'`, the same event as `publish.yml`) and
 `workflow_dispatch`, appending to `full_aoi_series.parquet` on the `benchmarks`
 branch.
 
-**It reuses the per-merge benchmark config by default — no new variables.** Its
-role, region, and store resolve `BENCHMARK_FULLAOI_* || BENCHMARK_*`, and the
-function defaults to `process-shard`. Because the per-merge run already requires
-`BENCHMARK_ROLE_ARN`, this job **runs on the next tag with nothing extra set**,
-using that same role against `process-shard`. The only added guardrail vs. the
-per-merge run: the harness asserts the caller's AWS account equals
-`targets_full_aoi_neon.json`'s `dispatch.expect_account` (`742127912612`, where
-`process-shard` is deployed) via STS **before any billed invoke** — so if the
-reused role is in that account (it is, since that's where it already invokes
-`process-shard`) it just works, and a mismatch **fails closed** (clear error, no
-billing) rather than dispatching to the wrong account.
+**It reuses the per-merge benchmark config as-is — no new variables and no
+hardcoded account.** It reads the same `BENCHMARK_ROLE_ARN` / `BENCHMARK_AWS_REGION`
+/ `BENCHMARK_STORE_PREFIX` / `BENCHMARK_FUNCTION_NAME` the per-merge run uses, so
+once that's set up (steps above) this **runs on the next tag with nothing extra**,
+against the same function in the same account. The job is inert until
+`BENCHMARK_ROLE_ARN` is set (it skips, green, no billing). Do the first run via
+`workflow_dispatch` to validate before relying on the tag trigger.
 
-Set the `BENCHMARK_FULLAOI_*` variables **only** to point the full-AOI run at a
-*different* account/function/store than the per-merge run (and update the
-manifest's `expect_account` to match if you retarget the account):
-
-```bash
-# OPTIONAL overrides -- omit to reuse the per-merge BENCHMARK_* config as-is.
-gh variable set BENCHMARK_FULLAOI_ROLE_ARN      --body "arn:aws:iam::ACCOUNT_ID:role/..."
-gh variable set BENCHMARK_FULLAOI_REGION        --body "REGION"
-gh variable set BENCHMARK_FULLAOI_STORE_PREFIX  --body "s3://BUCKET/PREFIX"
-gh variable set BENCHMARK_FULLAOI_FUNCTION_NAME --body "process-shard"
-```
-
-Do the first run via `workflow_dispatch` to validate before relying on the tag
-trigger.
+(A fork that wants a belt-and-suspenders account check can add an optional
+`dispatch.expect_account` to `targets_full_aoi_neon.json` — the harness then asserts
+the caller's AWS account matches it before any billed invoke, and no-ops when it's
+absent. It's off by default so nothing pins a specific account number.)
 
 **Verify**:
 
 ```bash
-gh variable list   # BENCHMARK_* entries (+ any BENCHMARK_FULLAOI_* overrides)
+gh variable list   # the shared BENCHMARK_* entries (full-AOI reuses them)
 gh secret list     # EARTHDATA_TOKEN
 ```
 

@@ -12,11 +12,11 @@ name: Lambda Benchmark (full-AOI, per release)
 #   workflow_dispatch -> run on demand (the recommended way to do the first
 #     validated run before relying on the tag trigger).
 #
-# It is INERT until the full-AOI AWS vars are configured (the run job gates on the
-# resolved role ARN), so merely landing this file bills nothing. The harness fails
-# CLOSED on a wrong-account dispatch (it asserts the caller's AWS account matches
-# the manifest's dispatch.expect_account via STS before any billed invoke), so a
-# misconfigured role can never bill the wrong account.
+# It REUSES the per-merge benchmark config (the shared BENCHMARK_* repo vars) -- no
+# full-AOI-specific variables, no hardcoded account -- so once the per-merge
+# benchmark is set up this runs on the next tag with nothing extra. It is inert
+# until BENCHMARK_ROLE_ARN is set (the job gates on it), so landing this file bills
+# nothing.
 #
 # Cost note: on each release this dispatches every NEON shard (4 shards) to real
 # Lambda -- billed. NEON is small; the whole-AOI run is a handful of invokes.
@@ -43,9 +43,9 @@ concurrency:
 
 jobs:
   full-aoi:
-    # Inert until configured: the full-AOI role (dedicated var, or the shared
-    # benchmark role as a fallback) must be set, else skip (no billing).
-    if: ${{ vars.BENCHMARK_FULLAOI_ROLE_ARN != '' || vars.BENCHMARK_ROLE_ARN != '' }}
+    # Inert until configured: reuses the same benchmark role as the per-merge run,
+    # so skip (no billing) when it isn't set.
+    if: ${{ vars.BENCHMARK_ROLE_ARN != '' }}
     runs-on: ubuntu-latest
     # contents: write to push the series + charts to the benchmarks branch;
     # id-token: write for the OIDC role assumption.
@@ -53,14 +53,12 @@ jobs:
       contents: write
       id-token: write
     env:
-      # Dedicated full-AOI vars win; fall back to the shared benchmark config so a
-      # single setup works when the full-AOI run targets the same account/function.
-      ROLE_ARN: ${{ vars.BENCHMARK_FULLAOI_ROLE_ARN || vars.BENCHMARK_ROLE_ARN }}
-      AWS_REGION: ${{ vars.BENCHMARK_FULLAOI_REGION || vars.BENCHMARK_AWS_REGION }}
-      STORE_PREFIX: ${{ vars.BENCHMARK_FULLAOI_STORE_PREFIX || vars.BENCHMARK_STORE_PREFIX }}
-      # The stable production function is `process-shard` (matches the manifest's
-      # dispatch block + its expect_account assertion); override per deployment.
-      FUNCTION_NAME: ${{ vars.BENCHMARK_FULLAOI_FUNCTION_NAME || 'process-shard' }}
+      # The same shared benchmark config the per-merge run uses -- one setup, both
+      # series measure the same deployed function in the same account.
+      ROLE_ARN: ${{ vars.BENCHMARK_ROLE_ARN }}
+      AWS_REGION: ${{ vars.BENCHMARK_AWS_REGION }}
+      STORE_PREFIX: ${{ vars.BENCHMARK_STORE_PREFIX }}
+      FUNCTION_NAME: ${{ vars.BENCHMARK_FUNCTION_NAME }}
     steps:
       - name: Checkout tag
         uses: actions/checkout@v5
