@@ -1484,6 +1484,99 @@ class TestRaggedVlenLayout:
             np.testing.assert_array_equal(seen[key][1], w, err_msg=f"locations {key}")
 
 
+class TestWriteLeafToZarr:
+    """Issue #236 gates for the SHARDED hive leaf write (``write_leaf_to_zarr``):
+    every dense array (and each ragged field) collapses to ONE ShardingCodec
+    object in the leaf store, at leaf block 0, with contents byte-identical to
+    the flat sharded path's shard region — the flat↔hive parity contract."""
+
+    @staticmethod
+    def _data_keys(store, grid, field):
+        prefix = f"{grid.group_path}/{field}/"
+        return [
+            k for k in store._store_dict if k.startswith(prefix) and not k.endswith("zarr.json")
+        ]
+
+    @staticmethod
+    def _leaf_template(grid):
+        """Emit the sharded LEAF template directly from ``shard_spec`` (the
+        ``emit_shard_template`` seam still rejects a sharded grid until the
+        spec phase of issue #236 deletes the carve-out)."""
+        from pydantic_zarr.experimental.v3 import GroupSpec
+
+        from zagg.grids.base import vlen_dtype_warning_suppressed
+
+        store = MemoryStore()
+        spec = GroupSpec(members={grid.group_path: grid.shard_spec()}, attributes={})
+        with vlen_dtype_warning_suppressed():
+            spec.to_zarr(store, "")
+        return store
+
+    @staticmethod
+    def _setup(seed=7):
+        """The ragged K=16 fixture plus a dense ``h_min`` column on every
+        populated chunk (every 4th inner chunk stays entirely empty)."""
+        grid, shard_key, chunk_results, payloads = TestRaggedVlenLayout._sharded_setup(seed)
+        rng = np.random.default_rng(seed + 1)
+        dense: dict = {}
+        results = []
+        shard_block = grid.block_index(shard_key)[0]
+        for block, carrier, ragged in chunk_results:
+            if ragged:
+                vals = rng.standard_normal(grid.cells_per_chunk).astype(np.float32)
+                carrier = pd.DataFrame({"h_min": vals})
+                dense[int(block[0]) - shard_block * grid.chunks_per_shard] = vals
+            results.append((block, carrier, ragged))
+        return grid, shard_key, results, payloads, dense
+
+    def test_one_object_per_array_at_leaf_block_zero(self):
+        """THE issue #236 gate: the leaf's dense array collapses to ONE store
+        object (was K per-inner-chunk objects on the streaming path), the
+        ragged field rides the same pass, and a fresh reopen returns every
+        populated cell — empty inner chunks read fill."""
+        import zarr
+
+        from zagg.processing import write_leaf_to_zarr
+
+        grid, shard_key, chunk_results, payloads, dense = self._setup()
+        leaf = self._leaf_template(grid)
+        write_leaf_to_zarr(chunk_results, leaf, grid=grid, shard_key=shard_key)
+
+        assert len(self._data_keys(leaf, grid, "h_min")) == 1
+        assert len(self._data_keys(leaf, grid, "h_raw")) == 1
+
+        arr = zarr.open_array(leaf, path=f"{grid.group_path}/h_min", mode="r")
+        assert arr.shape == (grid.cells_per_shard,)
+        block = arr[:]
+        for local in range(grid.chunks_per_shard):
+            region = block[local * grid.cells_per_chunk : (local + 1) * grid.cells_per_chunk]
+            if local in dense:
+                np.testing.assert_array_equal(region, dense[local])
+            else:
+                assert np.all(np.isnan(region))
+
+    def test_flat_sharded_parity_byte_for_byte(self):
+        """The leaf's arrays equal the flat sharded store's shard region for
+        the SAME chunk_results — dense and ragged — so the two layouts cannot
+        drift (the flat↔hive parity acceptance criterion)."""
+        import zarr
+
+        from zagg.processing import write_leaf_to_zarr, write_shard_to_zarr
+
+        grid, shard_key, chunk_results, _payloads, _dense = self._setup()
+        flat = MemoryStore()
+        grid.emit_template(flat)
+        write_shard_to_zarr(chunk_results, flat, grid=grid, shard_key=shard_key)
+        leaf = self._leaf_template(grid)
+        write_leaf_to_zarr(chunk_results, leaf, grid=grid, shard_key=shard_key)
+
+        base = grid.block_index(shard_key)[0] * grid.cells_per_shard
+        for name in ("h_min", "h_raw"):
+            flat_arr = zarr.open_array(flat, path=f"{grid.group_path}/{name}", mode="r")
+            leaf_arr = zarr.open_array(leaf, path=f"{grid.group_path}/{name}", mode="r")
+            np.testing.assert_array_equal(flat_arr[base : base + grid.cells_per_shard], leaf_arr[:])
+
+
 class TestRaggedWriteGuards:
     """The malformed-worker-output guards that replaced ``write_csr``'s checks
     (issue #209; review, PR #211 round 2): each raising branch of the vlen

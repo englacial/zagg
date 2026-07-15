@@ -695,13 +695,18 @@ def process_and_write_hive(
     creates the ``.zarr/`` prefix; a worker that dies mid-shard leaves an
     UNSTAMPED prefix — debris, overwritten wholesale on retry
     (``overwrite=True`` on the leaf template makes the retry idempotent).
+    When ``grid.sharded`` (issue #236) the dense chunks are not streamed:
+    the K carriers accumulate and the whole leaf is written once
+    (``write_leaf_to_zarr`` — one ShardingCodec object per array), mirroring
+    the flat sharded switch in ``runner._process_and_write``.
     ``profile`` forwards to ``process_shard`` (issue #100); the write phase is
-    interleaved with the stream on this path, so no separate ``write`` timing
-    is recorded.
+    interleaved with the stream (or a single post-stream pass when sharded),
+    so no separate ``write`` timing is recorded.
     """
     from zagg.processing import (
         process_shard,
         write_dataframe_to_zarr,
+        write_leaf_to_zarr,
         write_ragged_leaf_to_zarr,
     )
     from zagg.store import open_store
@@ -724,6 +729,20 @@ def process_and_write_hive(
                 grid.emit_shard_template(store, overwrite=True)
             box["store"] = store
         return box["store"]
+
+    # Sharded leaf output (issue #236): the sharded leaf template bundles each
+    # dense array's K inner chunks into ONE ShardingCodec object, so the
+    # per-chunk streaming write below would read-modify-write that object K
+    # times (the same failure the flat sharded path warns about in
+    # ``runner._process_and_write``). Mirror the flat switch: accumulate the K
+    # carriers via ``chunk_results`` and write the whole leaf once after the
+    # stream (``write_leaf_to_zarr`` — dense + ragged, one object each). The
+    # re-added O(shard) dense term is ~1.3 MB at production geometry
+    # (parent 11 / child 19: 65,536 cells x ~20 B across the dense arrays) —
+    # trivial next to the ragged accumulation below, which this path folds
+    # into the same single-write pass.
+    sharded = getattr(grid, "sharded", False)
+    chunk_results: list | None = [] if sharded else None
 
     # Ragged fields accumulate across the streamed chunks (leaf-LOCAL blocks)
     # and are written ONCE after the stream (issue #209): the leaf's ragged
@@ -762,20 +781,29 @@ def process_and_write_hive(
         driver=driver,
         handoff=handoff,
         aoi_payload=aoi_payload,
-        write_chunk=_write_chunk,
+        chunk_results=chunk_results,
+        write_chunk=None if sharded else _write_chunk,
         occupied_out=occupied,
         profile=profile,
     )
+    # Sharded leaf: ONE whole-leaf write per array (dense + ragged together,
+    # issue #236), after the stream. The leaf template is emitted here (still
+    # lazily, via ``_leaf``), so a shard that produced no chunks never creates
+    # the ``.zarr/`` prefix — same contract as the streaming path's first
+    # ``_write_chunk``.
+    if sharded and chunk_results and not metadata.get("error"):
+        write_leaf_to_zarr(chunk_results, _leaf(), grid=grid, shard_key=int(shard_key))
     # Stamp ONLY a fully-written leaf: an errored shard (or one that streamed
     # no chunks) stays unstamped — debris by definition (D4). The stamp is the
     # last write, so its presence certifies everything before it landed — the
     # box payload rides it (zero extra requests), the exact-occupancy bitmap
     # sidecar is PUT just before it (issue #200 phase 2), and both inherit
     # its debris semantics: a torn worker's coverage never becomes visible.
-    # The leaf write order is pinned: dense (streamed) -> ragged (one object,
-    # issue #209) -> coverage sidecar -> stamp.
+    # The leaf write order is pinned: dense (streamed, or one object each when
+    # sharded) -> ragged (one object, issue #209) -> coverage sidecar -> stamp.
     if "store" in box and not metadata.get("error"):
-        write_ragged_leaf_to_zarr(ragged_chunks, box["store"], grid=grid)
+        if not sharded:
+            write_ragged_leaf_to_zarr(ragged_chunks, box["store"], grid=grid)
         words = np.concatenate(occupied) if occupied else None
         if words is not None and words.size == 0:
             words = None
