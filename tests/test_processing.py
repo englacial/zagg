@@ -5658,6 +5658,17 @@ class TestGranuleReadPool:
 
         return factory, instances
 
+    def test_shard_workers_canonical_and_legacy(self):
+        # Issue #232: shard_workers is the canonical cross-pipeline knob; the
+        # legacy granule_workers key stays honored, canonical wins when both set.
+        from zagg.processing.worker import _granule_workers
+
+        assert _granule_workers({"shard_workers": 6}) == 6
+        assert _granule_workers({"shard_workers": 6, "granule_workers": 2}) == 6
+        assert _granule_workers({"granule_workers": 2}) == 2
+        with pytest.raises(ValueError, match="shard_workers"):
+            _granule_workers({"shard_workers": 0})
+
     def test_granule_workers_validation(self):
         from zagg.processing.worker import _granule_workers
 

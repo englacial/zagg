@@ -51,7 +51,13 @@ logger = logging.getLogger(__name__)
 
 
 def _granule_workers(data_source: dict) -> int:
-    """``data_source.granule_workers``: granules in flight per shard (issue #180).
+    """Granules in flight per shard (issue #180).
+
+    Read from ``data_source.shard_workers`` — the canonical cross-pipeline
+    knob (issue #232: "source units in flight per shard"; the raster path
+    reads the same key for acquisition groups) — falling back to the legacy
+    ``granule_workers`` name, which shipped configs still carry. Canonical
+    wins when both are set.
 
     Default **4** — picked from the PR #183 K-sweep fleet A/B (issue #185:
     K=4 inline read 296.9 s vs 0.17's 323 s median on the o9 NEON AOI; the
@@ -71,9 +77,12 @@ def _granule_workers(data_source: dict) -> int:
     down as K rises, and watch ``read_errors`` (queueing + the 5 s timeout can
     surface as spurious read failures, not slowdowns) in the K-sweep A/B.
     """
-    w = data_source.get("granule_workers", 4)
+    w = data_source.get("shard_workers", data_source.get("granule_workers", 4))
     if isinstance(w, bool) or not isinstance(w, int) or w < 1:
-        raise ValueError(f"data_source.granule_workers must be an integer >= 1 (got {w!r})")
+        raise ValueError(
+            f"data_source.shard_workers (or legacy granule_workers) must be an "
+            f"integer >= 1 (got {w!r})"
+        )
     return w
 
 
