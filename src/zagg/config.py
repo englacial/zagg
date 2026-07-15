@@ -316,16 +316,13 @@ def validate_config(config: PipelineConfig) -> None:
 
     # Validate the optional granule fan-out width (issue #180). Mirrors the
     # worker's guard (_granule_workers) with the same rejection rationale as
-    # read_workers above.
-    granule_workers = (config.data_source or {}).get("granule_workers")
-    if granule_workers is not None and (
-        isinstance(granule_workers, bool)
-        or not isinstance(granule_workers, int)
-        or granule_workers < 1
-    ):
-        raise ValueError(
-            f"data_source.granule_workers must be an integer >= 1 (got {granule_workers!r})"
-        )
+    # read_workers above. ``shard_workers`` is the canonical cross-pipeline
+    # name (issue #232 — "source units in flight per shard"); the legacy
+    # ``granule_workers`` key stays honored (canonical wins when both set).
+    for _key in ("shard_workers", "granule_workers"):
+        _w = (config.data_source or {}).get(_key)
+        if _w is not None and (isinstance(_w, bool) or not isinstance(_w, int) or _w < 1):
+            raise ValueError(f"data_source.{_key} must be an integer >= 1 (got {_w!r})")
     # Optional strict-AOI cell mask (issue #101), default off. Must be a bool.
     aoi_mask = config.output.get("aoi_mask")
     if aoi_mask is not None and not isinstance(aoi_mask, bool):
@@ -625,20 +622,29 @@ def _validate_raster_config(config: PipelineConfig) -> None:
     nodata = config.data_source.get("nodata")
     if nodata is not None and (not isinstance(nodata, (int, float)) or isinstance(nodata, bool)):
         raise ValueError(f"data_source.nodata must be a number (got {nodata!r})")
-    # Optional sampling-concurrency cap (issue #231): how many acquisition
-    # groups (timesteps) sample concurrently per shard. Mirrors the
-    # read_workers/granule_workers guard so a config typo is rejected at
-    # submission, not swallowed inside the worker's event loop. Default 4
-    # (``process_raster.raster._sample_concurrency``); ``1`` is serial.
-    sample_concurrency = config.data_source.get("sample_concurrency")
-    if sample_concurrency is not None and (
-        isinstance(sample_concurrency, bool)
-        or not isinstance(sample_concurrency, int)
-        or sample_concurrency < 1
+    # Optional per-shard fan-out cap (issues #231/#232): ``shard_workers`` is
+    # the ONE cross-pipeline knob for "source units in flight per shard" —
+    # here, acquisition groups (timesteps) sampling concurrently. Guarded like
+    # read_workers so a config typo is rejected at submission, not swallowed
+    # inside the worker's event loop. Default 4
+    # (``processing.raster._shard_workers``); ``1`` is serial. NOTE: the
+    # memory cost per unit is pipeline-dependent (a granule read buffer on the
+    # spatial path vs a timestep of decoded COG tiles here) — see issue #228.
+    shard_workers = config.data_source.get("shard_workers")
+    if shard_workers is not None and (
+        isinstance(shard_workers, bool) or not isinstance(shard_workers, int) or shard_workers < 1
     ):
         raise ValueError(
-            f"data_source.sample_concurrency must be an integer >= 1 (got {sample_concurrency!r})"
+            f"data_source.shard_workers must be an integer >= 1 (got {shard_workers!r})"
         )
+    # Streamed-write slab budget (PR #232 double-buffer): ``1`` (default) is
+    # the strict serial bound; ``N`` overlaps up to N-1 slab writes with
+    # sampling at a peak of N slabs alive (``processing.raster._write_buffer``).
+    write_buffer = config.data_source.get("write_buffer")
+    if write_buffer is not None and (
+        isinstance(write_buffer, bool) or not isinstance(write_buffer, int) or write_buffer < 1
+    ):
+        raise ValueError(f"data_source.write_buffer must be an integer >= 1 (got {write_buffer!r})")
     grid = config.output.get("grid")
     if not isinstance(grid, dict) or grid.get("type") != "healpix":
         raise ValueError(

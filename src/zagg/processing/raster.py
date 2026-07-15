@@ -352,15 +352,17 @@ def _chord2(lons, lats, lon0: float, lat0: float) -> np.ndarray:
 
 
 # Default cap on how many acquisition groups sample concurrently per shard
-# (issue #231). Mirrors ``data_source.granule_workers``' default of 4: every
+# (issue #231). One knob per pipeline family (issue #232): ``shard_workers`` is
+# "source units in flight per shard" — granules on the spatial path, acquisition
+# groups (timesteps) here — mirroring the spatial default of 4: every
 # in-flight group holds one timestep's decoded COG tiles + per-band gather
 # buffers, so the cap bounds peak sampling memory to ~K timesteps instead of
 # all T at once, while still overlapping S3 fetches at fine orders.
-_DEFAULT_SAMPLE_CONCURRENCY = 4
+_DEFAULT_SHARD_WORKERS = 4
 
 
-def _sample_concurrency(config) -> int:
-    """``data_source.sample_concurrency``: acquisition groups in flight per shard.
+def _shard_workers(config) -> int:
+    """``data_source.shard_workers``: acquisition groups in flight per shard.
 
     Bounds the :class:`asyncio.Semaphore` over timesteps in
     :func:`process_raster_shard` (issue #231). Default 4; ``1`` samples one
@@ -368,10 +370,31 @@ def _sample_concurrency(config) -> int:
     ``validate_config`` applies at submission, so a hand-rolled worker payload
     fails loudly rather than passing a bad width to ``Semaphore``.
     """
-    k = (config.data_source or {}).get("sample_concurrency", _DEFAULT_SAMPLE_CONCURRENCY)
+    k = (config.data_source or {}).get("shard_workers", _DEFAULT_SHARD_WORKERS)
     if isinstance(k, bool) or not isinstance(k, int) or k < 1:
-        raise ValueError(f"data_source.sample_concurrency must be an integer >= 1 (got {k!r})")
+        raise ValueError(f"data_source.shard_workers must be an integer >= 1 (got {k!r})")
     return k
+
+
+# Streamed-write slab budget (PR #232 review): ``1`` is the strict serial
+# bound — a completed slab is written and freed before the next group drains.
+# ``N`` allows N-1 writes in flight on worker threads while the next slab
+# builds, so peak output memory holds <= N slabs; write latency then overlaps
+# sampling instead of serializing against it.
+_DEFAULT_WRITE_BUFFER = 1
+
+
+def _write_buffer(config) -> int:
+    """``data_source.write_buffer``: max slabs alive under a streamed sink.
+
+    Only meaningful when ``process_raster_shard`` runs with ``on_slab``;
+    dict-mode accumulation ignores it. Same int>=1 / bool-trap guard as the
+    sibling worker knobs.
+    """
+    n = (config.data_source or {}).get("write_buffer", _DEFAULT_WRITE_BUFFER)
+    if isinstance(n, bool) or not isinstance(n, int) or n < 1:
+        raise ValueError(f"data_source.write_buffer must be an integer >= 1 (got {n!r})")
+    return n
 
 
 def process_raster_shard(
@@ -402,10 +425,13 @@ def process_raster_shard(
     on_slab : callable, optional
         ``on_slab(t_idx, slab)`` sink invoked once per timestep as its
         acquisition group completes (issue #231). When given, the slab is
-        handed off and dropped immediately, so peak output memory holds ~1
-        timestep instead of all ``T``; the returned ``slabs`` is then empty.
-        When ``None`` (the default) every slab accumulates into ``slabs`` and
-        is returned, as before.
+        handed off and dropped immediately, so peak output memory holds
+        ``data_source.write_buffer`` slabs (default 1: written + freed before
+        the next group drains; ``N`` runs up to ``N-1`` sink calls on worker
+        threads so write latency overlaps sampling — the PR #232
+        double-buffer); the returned ``slabs`` is then empty. When ``None``
+        (the default) every slab accumulates into ``slabs`` and is returned,
+        as before, and ``write_buffer`` is ignored.
 
     Returns
     -------
@@ -444,7 +470,8 @@ def process_raster_shard(
     # every item still fans out concurrently — adjacent MGRS tiles of one
     # datatake are seconds apart, so the wall-clock overlap survives at fine
     # orders.
-    k = _sample_concurrency(config)
+    k = _shard_workers(config)
+    wb = _write_buffer(config)
 
     async def _run_all():
         sem = asyncio.Semaphore(k)
@@ -469,28 +496,53 @@ def process_raster_shard(
 
         lonlat = None  # computed once, only if some timestep has overlapping items
         slabs: dict = {}
+        # Streamed-sink hand-off. At the default ``write_buffer`` of 1 the
+        # sink runs synchronously in the loop: a completed slab is written +
+        # freed before the next group drains (the strict issue #231 bound).
+        # At N>1 (the PR #232 double-buffer) up to N-1 sink calls run on
+        # worker threads while the next slab builds — <= N slabs alive, write
+        # latency overlapped with sampling. A sink error surfaces at most one
+        # group late, at the next hand-off (or the final drain below).
+        pending: list = []
+
+        async def _emit(t, slab):
+            if wb <= 1:
+                on_slab(t, slab)
+                return
+            while len(pending) >= wb - 1:
+                await pending.pop(0)
+            pending.append(asyncio.create_task(asyncio.to_thread(on_slab, t, slab)))
+
         # Drain groups as they finish (as_completed): build each timestep's slab
-        # and hand it to the sink, so a completed slab is written + freed before
-        # the next arrives — the output side stays ~1 timestep (issue #231).
-        for fut in asyncio.as_completed(
-            [_sample_group(key, items) for key, items in groups.items()]
-        ):
-            t, sampled = await fut
-            if len(sampled) == 1:
-                values, valid, _center = sampled[0]
-            else:
-                if lonlat is None:
-                    lonlat = grid.cell_lonlat(cells)
-                values, valid = _combine_by_ownership(sampled, lonlat, bands)
-            slab = {}
-            for f, v in values.items():
-                out = v.copy()  # keep the asset dtype (np.where would promote)
-                out[~valid] = bands[f]["fill_value"]
-                slab[f] = out
-            if on_slab is not None:
-                on_slab(t, slab)  # write + free this timestep before the next
-            else:
-                slabs[t] = slab
+        # and hand it to the sink — the output side stays ~write_buffer
+        # timesteps (issues #231/#232).
+        try:
+            for fut in asyncio.as_completed(
+                [_sample_group(key, items) for key, items in groups.items()]
+            ):
+                t, sampled = await fut
+                if len(sampled) == 1:
+                    values, valid, _center = sampled[0]
+                else:
+                    if lonlat is None:
+                        lonlat = grid.cell_lonlat(cells)
+                    values, valid = _combine_by_ownership(sampled, lonlat, bands)
+                slab = {}
+                for f, v in values.items():
+                    out = v.copy()  # keep the asset dtype (np.where would promote)
+                    out[~valid] = bands[f]["fill_value"]
+                    slab[f] = out
+                if on_slab is not None:
+                    await _emit(t, slab)
+                else:
+                    slabs[t] = slab
+        except BaseException:
+            # Reap in-flight writes before propagating the primary error, so
+            # no task is left un-awaited (their own errors are secondary here).
+            await asyncio.gather(*pending, return_exceptions=True)
+            raise
+        if pending:
+            await asyncio.gather(*pending)  # propagate any trailing write error
         return slabs
 
     slabs = _run_sync(_run_all())

@@ -17,8 +17,9 @@ from zagg.config import get_raster_bands, load_config_from_dict, validate_config
 from zagg.grids import HealpixGrid, RectilinearGrid
 from zagg.processing.raster import (
     _run_sync,
-    _sample_concurrency,
     _shard_cell_range,
+    _shard_workers,
+    _write_buffer,
     emit_raster_template,
     process_raster_shard,
     raster_group_spec,
@@ -110,21 +111,21 @@ class TestRasterConfigValidation:
         assert bands["red"]["fill_value"] == 0
         assert bands["scl"]["attrs"] == {}
 
-    def test_sample_concurrency_default_and_override(self):
-        assert _sample_concurrency(_raster_config()) == 4  # issue #231 default
+    def test_shard_workers_default_and_override(self):
+        assert _shard_workers(_raster_config()) == 4  # issue #231 default
         cfg = _raster_config()
-        cfg.data_source["sample_concurrency"] = 8
-        assert _sample_concurrency(cfg) == 8
+        cfg.data_source["shard_workers"] = 8
+        assert _shard_workers(cfg) == 8
 
-    def test_sample_concurrency_rejected(self):
+    def test_shard_workers_rejected(self):
         for bad in (0, -1, True, 2.0):
             cfg = _raster_config()
-            cfg.data_source["sample_concurrency"] = bad
-            with pytest.raises(ValueError, match="sample_concurrency"):
+            cfg.data_source["shard_workers"] = bad
+            with pytest.raises(ValueError, match="shard_workers"):
                 validate_config(cfg)
             # The worker helper re-checks with the same guard (hand-rolled payload).
-            with pytest.raises(ValueError, match="sample_concurrency"):
-                _sample_concurrency(cfg)
+            with pytest.raises(ValueError, match="shard_workers"):
+                _shard_workers(cfg)
 
 
 class TestRasterTimeIndex:
@@ -202,7 +203,7 @@ class TestSampleConcurrency:
         monkeypatch.setattr(raster_mod, "sample_item_async", _fake_sample_item)
 
         cfg = _raster_config(bands={"red": {"asset": "red", "dtype": "uint16"}}, nodata=None)
-        cfg.data_source["sample_concurrency"] = k
+        cfg.data_source["shard_workers"] = k
         granules = [
             _entry(f"g{i}", {"red": f"r{i}.tif"}, T0, time_key=f"dt-{i}") for i in range(n_groups)
         ]
@@ -358,6 +359,82 @@ class TestOwnership:
         slabs, meta = process_raster_shard(grid, 0, granules, cfg, index)
         assert meta["skipped"] == 1 and meta["granule_count"] == 2
         assert (slabs[0]["red"] == 7).all()
+
+    @pytest.mark.parametrize("wb", [2, 3])
+    def test_write_buffer_bounded_and_matches(self, tmp_path, wb):
+        # PR #232 double-buffer: with write_buffer=N the sink runs on worker
+        # threads, at most N slabs are alive at once, overlap actually occurs,
+        # and the streamed output still matches dict mode exactly.
+        import threading
+        import time as _time
+
+        vals = {"dt-1": 11, "dt-2": 22, "dt-3": 33, "dt-4": 44}
+        granules = []
+        for i, (tk, v) in enumerate(vals.items()):
+            _write_tiff(tmp_path / f"s{i}.tif", np.full((96, 96), v, dtype=np.uint16))
+            granules.append(
+                _entry(
+                    f"g{i}",
+                    {"red": str(tmp_path / f"s{i}.tif")},
+                    f"2026-07-{13 + i:02d}T16:02:20+00:00",
+                    time_key=tk,
+                )
+            )
+        grid = _rect_grid([ORIGIN[0], ORIGIN[1] - 960.0, ORIGIN[0] + 960.0, ORIGIN[1]], [96, 96])
+        cfg = _raster_config(bands={"red": {"asset": "red", "dtype": "uint16"}}, nodata=None)
+        index, _ = raster_time_index([granules])
+        golden, _gm = process_raster_shard(grid, 0, granules, cfg, index)
+
+        cfg.data_source["write_buffer"] = wb
+        lock = threading.Lock()
+        live = {"now": 0, "max": 0}
+        streamed = {}
+
+        def _sink(t_idx, slab):
+            with lock:
+                live["now"] += 1
+                live["max"] = max(live["max"], live["now"])
+            _time.sleep(0.05)  # slow write: forces overlap under the buffer
+            streamed[t_idx] = slab
+            with lock:
+                live["now"] -= 1
+
+        slabs, meta = process_raster_shard(grid, 0, granules, cfg, index, on_slab=_sink)
+        assert slabs == {} and meta["timesteps"] == 4
+        assert live["max"] <= wb - 1  # sink calls in flight (slabs alive <= wb)
+        assert set(streamed) == set(golden)
+        for t in golden:
+            np.testing.assert_array_equal(streamed[t]["red"], golden[t]["red"])
+
+    def test_write_buffer_validation(self):
+        cfg = _raster_config()
+        assert _write_buffer(cfg) == 1  # default: strict serial bound
+        cfg.data_source["write_buffer"] = 2
+        assert _write_buffer(cfg) == 2
+        for bad in (0, -1, 1.5, True, "2"):
+            cfg.data_source["write_buffer"] = bad
+            with pytest.raises(ValueError, match="write_buffer"):
+                _write_buffer(cfg)
+            with pytest.raises(ValueError, match="write_buffer"):
+                validate_config(cfg)
+
+    def test_write_buffer_sink_error_propagates(self, tmp_path):
+        _write_tiff(tmp_path / "t0.tif", np.full((96, 96), 11, dtype=np.uint16))
+        _write_tiff(tmp_path / "t1.tif", np.full((96, 96), 22, dtype=np.uint16))
+        grid = _rect_grid([ORIGIN[0], ORIGIN[1] - 960.0, ORIGIN[0] + 960.0, ORIGIN[1]], [96, 96])
+        cfg = _raster_config(bands={"red": {"asset": "red", "dtype": "uint16"}}, nodata=None)
+        cfg.data_source["write_buffer"] = 2
+        granules = [
+            _entry("A", {"red": str(tmp_path / "t0.tif")}, T0, time_key="dt-1"),
+            _entry("B", {"red": str(tmp_path / "t1.tif")}, T1, time_key="dt-2"),
+        ]
+        index, _ = raster_time_index([granules])
+
+        def _sink(t_idx, slab):
+            raise OSError("s3 write failed")
+
+        with pytest.raises(OSError, match="s3 write failed"):
+            process_raster_shard(grid, 0, granules, cfg, index, on_slab=_sink)
 
     def test_on_slab_streams_and_matches_dict(self, tmp_path):
         # The on_slab sink (issue #231): each timestep's slab is handed off as
