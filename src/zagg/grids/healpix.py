@@ -74,7 +74,7 @@ class HealpixGrid:
         config: PipelineConfig | None = None,
         populated_shards: list[int] | None = None,
         chunk_inner: int | None = None,
-        sharded: bool = False,
+        sharded: bool = True,
         shard_order: int | None = None,
     ):
         if child_order < parent_order:
@@ -121,17 +121,13 @@ class HealpixGrid:
         # Sharded storage (issue #108): bundle the shard's K inner chunks into one
         # zarr ShardingCodec shard object instead of K independent regular chunk
         # objects. Only meaningful when K > 1 (a finer ``chunk_inner`` gives the
-        # shard multiple inner chunks); sharding a K==1 shard is a no-op shard of
-        # one chunk, so reject it with a clear message (validated pre-deployment,
-        # matching the grid-mismatch errors). HEALPix lands first (issue #108).
-        if sharded and self.chunks_per_shard <= 1:
-            raise ValueError(
-                "sharded output requires chunk_inner to give more than one inner "
-                f"chunk per shard (K>1), but chunk_order ({chunk_order}) == "
-                f"parent_order ({parent_order}) gives K=1; set chunk_inner finer "
-                "than parent_order (e.g. chunk_inner=13 for the 64x64 read chunk) "
-                "or disable sharded"
-            )
+        # shard multiple inner chunks). ``sharded`` defaults True (issue #215 — a
+        # missing flag should not silently cost the ~K-fold object blow-up), so a
+        # K==1 shard (no ``chunk_inner``) has nothing to bundle: sharding is a no-op
+        # there and is silently disabled, leaving single-chunk grids byte-identical
+        # to a pre-#215 unsharded write. HEALPix lands first (issue #108).
+        if self.chunks_per_shard <= 1:
+            sharded = False
         self.sharded = bool(sharded)
         # shard_order (issue #133 phase 8): decouple the sharding OBJECT from the
         # dispatch shard. A ShardingCodec object normally spans the whole dispatch

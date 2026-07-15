@@ -104,7 +104,7 @@ class TestWriteShardToZarr:
 
         kw = dict(layout="fullsphere", config=cfg, chunk_inner=7)
         sharded = HealpixGrid(6, 8, sharded=True, **kw)
-        regular = HealpixGrid(6, 8, **kw)
+        regular = HealpixGrid(6, 8, sharded=False, **kw)
         shard_key = int(geo2mort(-78.5, -132.0, order=6)[0])
         return sharded, regular, shard_key
 
@@ -1399,8 +1399,11 @@ class TestRaggedVlenLayout:
         grid, shard_key, chunk_results, payloads = self._sharded_setup()
         flat = self._write(grid, shard_key, chunk_results)
 
-        # Same config/geometry, hive-legal (unsharded) grid for the leaf.
-        leaf_grid = HealpixGrid(4, 8, layout="fullsphere", config=grid.config, chunk_inner=6)
+        # Same config/geometry, hive-legal (unsharded) grid for the leaf. sharded is
+        # explicit False now that the constructor default is True (issue #215).
+        leaf_grid = HealpixGrid(
+            4, 8, layout="fullsphere", config=grid.config, chunk_inner=6, sharded=False
+        )
         leaf = MemoryStore()
         leaf_grid.emit_shard_template(leaf)
         shard_block = grid.block_index(shard_key)[0]
@@ -1754,7 +1757,9 @@ class TestMultiChunkWorker:
         from zagg.config import default_config
 
         cfg = default_config("atl06")
-        grid = {"type": "healpix", "parent_order": 6, "child_order": 8}
+        # sharded:false pins the unsharded per-inner-chunk worker path this class
+        # exercises (issue #30 item 3) now that sharded defaults True (issue #215).
+        grid = {"type": "healpix", "parent_order": 6, "child_order": 8, "sharded": False}
         if chunk_inner is not None:
             grid["chunk_inner"] = chunk_inner
         cfg.output["grid"] = grid
@@ -1896,6 +1901,7 @@ class TestMultiChunkWorker:
             "parent_order": 6,
             "chunk_inner": 7,
             "child_order": 8,
+            "sharded": False,  # unsharded per-inner-chunk path (issue #215 default is True)
         }
         cfg.aggregation["chunk_precompute"] = {
             "anchor": {"expression": "np.float32(np.min(h_li))", "source": "h_li"}
@@ -1981,6 +1987,7 @@ class TestMultiChunkWorker:
             "parent_order": 6,
             "chunk_inner": 7,
             "child_order": 8,
+            "sharded": False,  # unsharded per-inner-chunk path (issue #215 default is True)
         }
         # gain/offset basis case: the anchor is min(h_li) over the chunk.
         cfg.aggregation["chunk_precompute"] = {
@@ -2049,6 +2056,7 @@ class TestMultiChunkWorker:
             "parent_order": 6,
             "chunk_inner": 7,
             "child_order": 8,
+            "sharded": False,  # unsharded per-inner-chunk path (issue #215 default is True)
         }
         cfg.aggregation["chunk_precompute"] = {
             "anchor": {"expression": "np.float32(np.min(h_li))", "source": "h_li"}
