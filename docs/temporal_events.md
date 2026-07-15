@@ -83,7 +83,8 @@ data_source:
   collections:
     merra2_slv:                 # no options needed
     merra2_precip:
-      variables: [PRECCU, PRECLS, PRECSN]      # subset before anything else
+      coord_round: 5                            # round lat/lon coords first (float dirt)
+      variables: [PRECCU, PRECLS, PRECSN]      # subset before the rest
       time_offset: "-30min"                     # shift stamps onto the hour
       resample: {freq: "3h", how: sum, scale: 3600}  # rates -> totals
       derived:
@@ -91,7 +92,10 @@ data_source:
       doi: "10.5067/Q5GVUVUIVGO7"               # unknown keys pass through
 ```
 
-Options apply in the order listed above (`prepare_collection`). `derived`
+Options apply in the order listed above (`prepare_collection`): `coord_round`
+runs first (it rounds the source grid's own lat/lon coordinate arrays, so a
+grid that ships float dirt still matches the rounded event/static coords),
+then `variables`, `time_offset`, `resample`, and `derived`. `derived`
 expressions evaluate in the same restricted namespace as the spatial
 pipeline's `expression` fields: numpy plus the collection's variables, no
 builtins. Unknown keys (like `doi`) are ignored by the reader — they are

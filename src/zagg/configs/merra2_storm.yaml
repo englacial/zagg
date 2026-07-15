@@ -21,7 +21,9 @@ data_source:
   # A collection's URIs may be a list (multi-granule events concat along time).
   collections:
     merra2_slv:    # single-level: T2M, TQV, SLP (3-hourly, on the hour)
+      coord_round: 5    # MERRA-2 coord arrays carry float dirt (issue #229)
     merra2_flx:    # surface flux: PRECTOT (1-hourly rates, half-hour stamps)
+      coord_round: 5    # MERRA-2 coord arrays carry float dirt (issue #229)
       time_offset: "-30min"
       resample: {freq: "3h", how: sum, scale: 3600}
   # Static fields the mask providers / anomaly transform consume (see
