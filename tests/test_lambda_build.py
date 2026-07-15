@@ -380,3 +380,32 @@ class TestTemplateEnvironment:
         assert props["MaximumRetryAttempts"] == 0
         assert props["MaximumEventAgeInSeconds"] == 60  # API minimum
         assert props["MaximumEventAgeInSeconds"] < _ASYNC_POLL_MARGIN_S
+
+
+class TestLayerExtraParity:
+    """The ``lambda`` extra pins and build_layer.sh must actually stay in sync.
+
+    The script's comments say "keep the pin in sync with the lambda extra",
+    but nothing enforced it: async-tiff (issue #218) was pinned in pyproject
+    yet absent from the layer build, shipping a 0.27.0 layer whose
+    ``mode="process_raster"`` worker died on ``No module named 'async_tiff'``.
+    This pins the contract.
+    """
+
+    def test_every_lambda_extra_pin_is_in_build_layer(self):
+        import tomllib
+
+        pyproject = tomllib.loads((REPO_ROOT / "pyproject.toml").read_text())
+        pins = pyproject["project"]["optional-dependencies"]["lambda"]
+        script = (REPO_ROOT / "deployment" / "aws" / "build_layer.sh").read_text()
+        missing = []
+        for pin in pins:
+            m = re.match(r"([A-Za-z0-9._-]+)==([A-Za-z0-9.]+)$", pin)
+            if not m:  # unpinned entries (cramjam, astropy) aren't layer-exact
+                continue
+            if f'"{pin}"' not in script:
+                missing.append(pin)
+        assert not missing, (
+            f"lambda-extra pins absent from deployment/aws/build_layer.sh: {missing} "
+            "(the layer would ship without them — see issue #218's async-tiff gap)"
+        )

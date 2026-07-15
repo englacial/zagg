@@ -82,6 +82,13 @@ $PIP install \
 echo "Installing h5coro, h5coro-hidefix and mortie (--no-deps)..."
 $PIP install "h5coro==1.0.5" "h5coro-hidefix==0.3.1" mortie --no-deps -t "$OUTPUT_DIR/python" --no-cache-dir
 
+# async-tiff (issue #218): the raster worker's GeoTIFF/COG decode engine
+# (mode="process_raster"). abi3 manylinux_2_28 wheel (~4 MB) on both arches;
+# its only dep is obspec (pure-python, tiny). Keep the pins in sync with the
+# `lambda` extra in pyproject.toml.
+echo "Installing async-tiff (+obspec)..."
+$PIP install "async-tiff==0.7.2" obspec -t "$OUTPUT_DIR/python" --no-cache-dir
+
 # Verify numpy stayed < 2.3
 NUMPY_VERSION=$(ls "$OUTPUT_DIR/python" | grep -E "^numpy-" | head -1)
 echo "Installed: $NUMPY_VERSION"
