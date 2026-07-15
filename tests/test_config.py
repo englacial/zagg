@@ -276,6 +276,12 @@ class TestCollectionOptions:
         with pytest.raises(ValueError, match="mapping of options"):
             validate_config(self._cfg({"merra2": ["time_offset"]}))
 
+    def test_coord_round_must_be_nonnegative_int(self):
+        validate_config(self._cfg({"merra2": {"coord_round": 5}}))
+        for bad in (True, -1, 5.0, "5"):
+            with pytest.raises(ValueError, match="coord_round"):
+                validate_config(self._cfg({"merra2": {"coord_round": bad}}))
+
     def test_credentials_provider_must_be_string(self):
         cfg = self._cfg(["merra2"])
         cfg.data_source["credentials_provider"] = ["gesdisc"]
