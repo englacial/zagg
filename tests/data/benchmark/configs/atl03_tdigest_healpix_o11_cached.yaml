@@ -80,4 +80,5 @@ output:
     indexing_scheme: nested
     parent_order: 11             # shard / dispatch unit: 4^(19-11) = 256x256 cells
     chunk_inner: 13              # inner Zarr chunk: 4^(19-13) = 64x64 cells (K=16 per shard)
+    sharded: true                # issue #215: explicit (also the new HEALPix default); one object/shard
     child_order: 19              # leaf cell resolution (~10 m)
