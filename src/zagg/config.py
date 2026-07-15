@@ -1721,16 +1721,18 @@ def get_layout(config: PipelineConfig) -> str:
     return config.output.get("grid", {}).get("layout", "fullsphere")
 
 
-def get_sharded(config: PipelineConfig) -> bool:
+def get_sharded(config: PipelineConfig, default: bool = False) -> bool:
     """Return whether the output grid uses ShardingCodec storage (issue #108).
 
     The ``sharded`` knob lives on the grid/chunk block next to ``chunk_inner``
-    (mirroring its accessor), default ``False``. When ``True`` the grid bundles a
-    dispatch shard's K inner chunks into one zarr shard object instead of K
-    independent regular chunk objects; it is only valid when ``chunk_inner`` gives
-    K>1 (the grid raises otherwise, validated before deployment).
+    (mirroring its accessor). When ``True`` the grid bundles a dispatch shard's K
+    inner chunks into one zarr shard object instead of K independent regular chunk
+    objects; a K==1 grid has nothing to bundle, so the grid silently no-ops it
+    (issue #215). ``default`` is the value returned when the flag is omitted —
+    ``False`` here, but ``from_config`` passes ``True`` for HEALPix flat-layout
+    output (issue #215: a missing flag should not cost the ~K-fold object blow-up).
     """
-    return bool(config.output.get("grid", {}).get("sharded", False))
+    return bool(config.output.get("grid", {}).get("sharded", default))
 
 
 def get_shard_order(config: PipelineConfig) -> int | None:
