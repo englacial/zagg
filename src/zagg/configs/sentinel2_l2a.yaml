@@ -1,0 +1,39 @@
+# Sentinel-2 L2A surface reflectance -> HEALPix (time, cells) arrays (issue #218).
+#
+# Pull-NN ingest of the Earth Search Collection-1 COGs (anonymous, us-west-2):
+# every order-19 cell (~12.4 m; the ICESat-2 ATL03/ATL06 child order, so
+# cell-ID joins are direct) takes the source pixel nearest its center --
+# dense by construction, exact uint16 DNs. Reflectance = DN * 1e-4 - 0.1,
+# recorded as CF scale_factor/add_offset attrs and never applied to the
+# stored data. Timesteps are datatakes (time_key), not item datetimes:
+# adjacent MGRS tiles of one datatake are a single (time, cells) slab, with
+# the 9,840 m tile overlap resolved by nearest-tile-center ownership.
+#
+# Catalog + shardmap (off-Lambda, `catalog` extra):
+#   from zagg.catalog.sources import STACQuery, STACSource
+#   src = STACSource("https://earth-search.aws.element84.com/v1",
+#                    assets=["red", "green", "blue", "nir", "scl"],
+#                    time_key="s2:datatake_id")
+#   cat = src.fetch(STACQuery(["sentinel-2-c1-l2a", "sentinel-2-pre-c1-l2a"],
+#                             "2026-06-01", "2026-07-01", region=bbox,
+#                             max_cloud_cover=20))
+#   ShardMap.build(cat, grid).to_json("shardmap_s2.json")
+data_source:
+  reader: raster
+  bands:
+    red: {asset: red, dtype: uint16, fill_value: 0, scale: 0.0001, offset: -0.1}
+    green: {asset: green, dtype: uint16, fill_value: 0, scale: 0.0001, offset: -0.1}
+    blue: {asset: blue, dtype: uint16, fill_value: 0, scale: 0.0001, offset: -0.1}
+    nir: {asset: nir, dtype: uint16, fill_value: 0, scale: 0.0001, offset: -0.1}
+    # Scene classification (20 m source): categorical -- pull-NN is exact, no
+    # resampling arithmetic. Value 0 is the nodata class.
+    scl: {asset: scl, dtype: uint8, fill_value: 0}
+  nodata: 0
+  anonymous: true
+
+output:
+  grid:
+    type: healpix
+    parent_order: 11
+    child_order: 19
+  store: ./sentinel2_l2a.zarr

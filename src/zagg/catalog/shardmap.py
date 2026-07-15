@@ -46,6 +46,20 @@ MORTIE_MOC_ORDER_CAP = 18
 # ── granule footprint helpers ────────────────────────────────────────────────
 
 
+def _granule_entry(rec: dict) -> dict:
+    """Self-contained per-shard granule payload (option C).
+
+    The canonical single-asset trio is always present; multi-asset records
+    (raster sources, #218) additionally carry ``assets`` (per-band hrefs) and
+    ``datetime`` (ISO acquisition time).
+    """
+    entry = {"id": rec["id"], "s3": rec["s3"], "https": rec["https"]}
+    for key in ("assets", "datetime", "time_key"):
+        if rec.get(key) is not None:
+            entry[key] = rec[key]
+    return entry
+
+
 def _to_spherely_polygon(lats, lons):
     """Build a closed sphere-aware polygon, or None on validation failure.
 
@@ -512,13 +526,7 @@ class ShardMap:
         wall = time.perf_counter() - t0
 
         shard_keys = sorted(shard_to_idx)
-        granules = [
-            [
-                {"id": records[i]["id"], "s3": records[i]["s3"], "https": records[i]["https"]}
-                for i in shard_to_idx[k]
-            ]
-            for k in shard_keys
-        ]
+        granules = [[_granule_entry(records[i]) for i in shard_to_idx[k]] for k in shard_keys]
         meta = {
             **(catalog.metadata or {}),
             "backend": chosen,

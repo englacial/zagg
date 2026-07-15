@@ -19,7 +19,7 @@ import statistics
 import time
 import uuid
 import warnings
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import replace
 from datetime import timedelta
 
@@ -228,7 +228,12 @@ def agg(
     # is dispatch-level: the spatial path is the existing code, moved verbatim
     # into SpatialStrategy so its behavior/output stays byte-identical; the
     # temporal path drives process_event over the same dispatch.py Executor.
-    strategy = _get_strategy(get_pipeline_type(config))
+    # A spatial-kind config with ``reader: raster`` routes to the pull-NN
+    # raster path (issue #218) — same shard fan-out, lean (time, cells) writes.
+    kind = get_pipeline_type(config)
+    if kind == "spatial" and (config.data_source or {}).get("reader") == "raster":
+        kind = "raster"
+    strategy = _get_strategy(kind)
     return strategy.run(
         config,
         catalog=catalog,
@@ -556,14 +561,342 @@ class TemporalStrategy:
         return summary
 
 
+class RasterStrategy:
+    """The raster pull-NN path (issue #218): ``reader: raster`` on a spatial grid.
+
+    One work unit per shard, like :class:`SpatialStrategy`, but the worker is
+    :func:`~zagg.processing.raster.process_raster_shard` and the writes are
+    ``(time, cells)`` slab assignments — the lean path that bypasses the
+    aggregation write machinery. The runner owns the global timestep index and
+    the template emission (and, later, the single-writer resize on append).
+
+    Backends: ``"local"`` (thread pool, in-process workers) and ``"lambda"``
+    (one synchronous ``mode="process_raster"`` invoke per shard —
+    espg-confirmed scope on issue #218). The lambda cut is deliberately the
+    simple transport: synchronous invokes with transient-only retries; the
+    issue-151 async result-object channel and the preflight concurrency probe
+    are follow-ups (raster shards are seconds of COG windows, well inside NAT
+    idle limits). Either way the runner owns the template + global time index
+    before fan-out (the single-writer append design).
+
+    Summary schema note: ``total_obs`` is shared with the spatial/temporal
+    strategies so a caller sees one summary shape across pipeline kinds. On the
+    raster path there is no per-cell/per-pixel observation tally, so it counts
+    the number of shard×timestep slabs written (the raster analogue of an
+    observation count); ``timesteps`` separately carries the global datatake
+    count. A dashboard summing ``total_obs`` across kinds mixes units — read it
+    per kind.
+    """
+
+    def run(
+        self,
+        config,
+        *,
+        catalog,
+        store,
+        backend,
+        max_cells,
+        morton_cell,
+        max_workers,
+        overwrite,
+        dry_run,
+        region,
+        output_credentials,
+        output_endpoint_url,
+        **_ignored,
+    ):
+        from zagg.processing.raster import (
+            emit_raster_template,
+            process_raster_shard,
+            raster_time_index,
+            write_raster_coords,
+            write_raster_slab,
+        )
+
+        catalog_path = catalog or config.catalog
+        if not catalog_path:
+            raise ValueError("No catalog specified (pass catalog= or set catalog: in config)")
+        store_path = store or get_store_path(config)
+        if not store_path:
+            raise ValueError("No store path specified (pass store= or set output.store: in config)")
+        if backend not in ("local", "lambda"):
+            raise ValueError(f"Unknown backend: {backend!r} (expected 'local' or 'lambda')")
+        if backend == "lambda" and not store_path.startswith("s3://"):
+            raise ValueError(f"Lambda backend requires s3:// store path, got: {store_path}")
+        # Fail fast rather than pay the full fan-out for per-worker 400s: a dense
+        # worker's block indexing needs populated-shard state the raster workers
+        # do not carry. The handler rejects it too (defense in depth).
+        if backend == "lambda" and get_layout(config) == "dense":
+            raise ValueError(
+                "raster lambda workers require fullsphere; dense block indexing "
+                "needs populated-shard state"
+            )
+
+        catalog_data = _load_catalog(catalog_path)
+        cells = _select_cells(catalog_data, morton_cell=morton_cell, max_cells=max_cells)
+        if dry_run:
+            return _dry_run_summary(cells, store_path)
+
+        from zagg.grids import from_config
+
+        all_shards = [int(s) for s in catalog_data["shard_keys"]]
+        grid = from_config(config, populated_shards=all_shards)
+        _check_signature(grid, catalog_data)
+        time_index, times_us = raster_time_index(catalog_data["granules"])
+        if not time_index:
+            raise ValueError("catalog carries no raster granule entries (no assets/datetime)")
+
+        resolved_endpoint = output_endpoint_url or get_output_endpoint_url(config)
+        zarr_store = open_store(
+            store_path,
+            region=region,
+            credentials=output_credentials,
+            endpoint_url=resolved_endpoint,
+        )
+        emit_raster_template(zarr_store, grid, config, times_us, overwrite=overwrite)
+
+        if backend == "lambda":
+            return self._run_lambda_shards(
+                config,
+                cells,
+                time_index,
+                grid,
+                store_path,
+                max_workers=max_workers,
+                region=region,
+                function_name=_ignored.get("function_name"),
+                max_retries=_ignored.get("max_retries") or 3,
+                output_credentials=output_credentials,
+                output_endpoint_url=resolved_endpoint,
+            )
+
+        source = config.data_source or {}
+        src_kwargs = {
+            "region": source.get("source_region"),
+            "anonymous": source.get("anonymous", True),
+        }
+        max_workers = min(max_workers or 4, len(cells)) or 1
+        t0 = time.time()
+        shards_with_data = 0
+        errors = 0
+        timesteps_written = 0
+        last_error = None
+
+        def _one(pair):
+            shard_key, granules = pair
+            slabs, meta = process_raster_shard(
+                grid, int(shard_key), granules, config, time_index, **src_kwargs
+            )
+            for t_idx, slab in slabs.items():
+                write_raster_slab(zarr_store, grid, int(shard_key), t_idx, slab)
+            if slabs:
+                write_raster_coords(zarr_store, grid, int(shard_key))
+            return meta
+
+        with ThreadPoolExecutor(max_workers=max_workers) as pool:
+            futures = {pool.submit(_one, pair): pair[0] for pair in cells}
+            for fut in as_completed(futures):
+                label = shard_label(grid, futures[fut])
+                try:
+                    meta = fut.result()
+                except Exception as e:  # noqa: BLE001 - per-shard isolation, run continues
+                    errors += 1
+                    last_error = e
+                    logger.warning(f"raster shard {label} failed: {e}")
+                    continue
+                if meta["timesteps"]:
+                    shards_with_data += 1
+                    timesteps_written += meta["timesteps"]
+
+        wall_time = time.time() - t0
+        # Per-shard isolation lets one bad shard be counted and skipped, but a
+        # run where EVERY shard raised (e.g. a config band whose ``asset`` is
+        # absent from every granule) would otherwise return a success-shaped,
+        # all-fill summary. Fail loudly instead so a caller that does not inspect
+        # ``cells_error`` cannot mistake a fully-broken run for an empty AOI.
+        if cells and errors == len(cells):
+            raise RuntimeError(f"all {errors} raster shard(s) failed; last error: {last_error}")
+        summary = {
+            "total_cells": len(cells),
+            "cells_with_data": shards_with_data,
+            "cells_error": errors,
+            # Shared summary key across strategies. For the raster path this is
+            # the count of shard×timestep slabs written, not a per-cell obs tally
+            # (see RasterStrategy docstring); ``timesteps`` is the datatake count.
+            "total_obs": timesteps_written,
+            "timesteps": int(len(times_us)),
+            "wall_time_s": wall_time,
+            "store_path": store_path,
+            "backend": "local",
+        }
+        logger.info(
+            f"Done: {shards_with_data}/{len(cells)} shards, {len(times_us)} timesteps, "
+            f"{errors} errors, {wall_time:.1f}s"
+        )
+        return summary
+
+    def _run_lambda_shards(
+        self,
+        config,
+        cells,
+        time_index,
+        grid,
+        store_path,
+        *,
+        max_workers,
+        region,
+        function_name,
+        max_retries,
+        output_credentials,
+        output_endpoint_url,
+    ):
+        """Fan shards out, one synchronous ``mode="process_raster"`` invoke each.
+
+        The worker gets the shard's ShardMap entries plus only its own slice of
+        the global time index (the template — runner-emitted before this — is
+        the shared truth for the full axis). Transient invoke faults retry with
+        backoff; a Lambda ``FunctionError`` or non-200 envelope is a shard
+        error (per-shard isolation, all-error raise as on the local backend).
+        """
+        import boto3
+        from botocore.config import Config
+
+        if function_name is None:
+            function_name = os.environ.get("ZAGG_LAMBDA_FUNCTION_NAME", "process-shard")
+        max_workers = min(max_workers or 64, len(cells)) or 1
+        client = boto3.client(
+            "lambda",
+            region_name=region,
+            config=Config(
+                max_pool_connections=max(max_workers, 10),
+                read_timeout=910,
+                retries={"max_attempts": 0},
+            ),
+        )
+        config_dict = {
+            "data_source": config.data_source,
+            "output": config.output,
+            "pipeline": config.pipeline,
+        }
+        # Normalize creds + resolved endpoint into the camelCase envelope the
+        # handler's ``_output_store_kwargs`` requires, exactly as the spatial and
+        # temporal lambda paths do — so raster inherits snake_case/STS-PascalCase
+        # cred leniency and threads a custom (R2/MinIO) output endpoint to workers.
+        output_creds_event = _build_output_creds_event(
+            output_credentials, output_endpoint_url, region
+        )
+
+        def _event(shard_key, granules):
+            keys = {e.get("time_key") or e.get("datetime") for e in granules if e.get("assets")}
+            ev = {
+                "mode": "process_raster",
+                "shard_key": int(shard_key),
+                "granules": granules,
+                "config": config_dict,
+                "store_path": store_path,
+                "time_index": {k: time_index[k] for k in keys},
+            }
+            if output_creds_event is not None:
+                ev["output_credentials"] = output_creds_event
+            return ev
+
+        # Substring markers for a transient invoke fault, matched
+        # case-insensitively (parity intent with _invoke_lambda_cell's policy,
+        # #119): throttles, service faults, connection resets, and read timeouts
+        # retry with jittered backoff; everything else is a deterministic error.
+        transient_markers = (
+            "toomanyrequests",
+            "throttling",
+            "serviceexception",
+            "connection",
+            "timeout",
+        )
+
+        def _one(pair):
+            payload = json.dumps(_event(*pair))
+            last = None
+            for attempt in range(max_retries):
+                try:
+                    resp = client.invoke(
+                        FunctionName=function_name,
+                        InvocationType="RequestResponse",
+                        Payload=payload,
+                    )
+                    raw_text = resp["Payload"].read().decode("utf-8")
+                    if resp.get("FunctionError"):
+                        # Deterministic for a given shard (timeout/OOM/unhandled):
+                        # never retried, mirroring _invoke_lambda_cell (#119).
+                        return {"error": f"Lambda error: {raw_text[:150]}", "body": {}}
+                    raw = json.loads(raw_text)
+                    body = json.loads(raw.get("body", "{}"))
+                    if raw.get("statusCode") != 200:
+                        return {
+                            "error": body.get("error", f"status {raw.get('statusCode')}"),
+                            "body": body,
+                        }
+                    return {"error": None, "body": body}
+                except Exception as e:
+                    raise_for_fd_exhaustion(e, max_workers)
+                    last = str(e)
+                    low = last.lower()
+                    if not any(t in low for t in transient_markers) or attempt == max_retries - 1:
+                        return {"error": last, "body": {}}
+                    # Jitter the backoff so a wide synchronous fan-out does not
+                    # retry in a synchronized wave (mirrors _invoke_lambda_cell).
+                    time.sleep(min(2**attempt, 8) * (0.5 + random.random() / 2))
+            return {"error": last, "body": {}}
+
+        t0 = time.time()
+        shards_with_data = 0
+        errors = 0
+        timesteps_written = 0
+        last_error = None
+        with ThreadPoolExecutor(max_workers=max_workers) as pool:
+            futures = {pool.submit(_one, pair): pair[0] for pair in cells}
+            for fut in as_completed(futures):
+                label = shard_label(grid, futures[fut])
+                result = fut.result()
+                if result["error"]:
+                    errors += 1
+                    last_error = result["error"]
+                    logger.warning(f"raster shard {label} failed: {result['error']}")
+                    continue
+                body = result["body"]
+                if body.get("timesteps"):
+                    shards_with_data += 1
+                    timesteps_written += body["timesteps"]
+
+        wall_time = time.time() - t0
+        if cells and errors == len(cells):
+            raise RuntimeError(f"all {errors} raster shard(s) failed; last error: {last_error}")
+        summary = {
+            "total_cells": len(cells),
+            "cells_with_data": shards_with_data,
+            "cells_error": errors,
+            # Shard x timestep slab tally (see the class docstring note).
+            "total_obs": timesteps_written,
+            "timesteps": int(len(time_index)),
+            "wall_time_s": wall_time,
+            "store_path": store_path,
+            "backend": "lambda",
+        }
+        logger.info(
+            f"Done (lambda): {shards_with_data}/{len(cells)} shards, "
+            f"{errors} errors, {wall_time:.1f}s"
+        )
+        return summary
+
+
 # Strategy registry, keyed by pipeline.type (issue #12, Phase 5). ``event`` and
 # ``temporal`` share the event-streaming engine; ``spatial`` is the point-cloud
-# path. New pipeline kinds register here rather than adding another branch to
-# ``agg``.
+# path. ``raster`` is selected by ``process_data`` when a spatial-kind config
+# declares ``reader: raster`` (issue #218). New pipeline kinds register here
+# rather than adding another branch to ``agg``.
 _STRATEGIES = {
     "spatial": SpatialStrategy,
     "temporal": TemporalStrategy,
     "event": TemporalStrategy,
+    "raster": RasterStrategy,
 }
 
 

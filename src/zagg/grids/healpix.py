@@ -422,6 +422,32 @@ class HealpixGrid:
         # order-29-only, so mortie raises loudly if HEALPIX_REF_ORDER ever drifts.
         return geo2mort(lats, lons, order=HEALPIX_REF_ORDER, points=True)
 
+    def cell_centers(self, cells) -> tuple[np.ndarray, np.ndarray]:
+        """Cell-center ``(lats, lons)`` (WGS84 degrees) for morton cell ids."""
+        from mortie import mort2geo
+
+        lats, lons = mort2geo(np.asarray(cells))
+        return np.asarray(lats), np.asarray(lons)
+
+    def cell_lonlat(self, cells) -> tuple[np.ndarray, np.ndarray]:
+        """Cell-center ``(lons, lats)`` (WGS84, always_xy order) — grid-agnostic
+        counterpart to :meth:`cell_centers` for consumers that must not care
+        which family the grid is (e.g. the raster ownership rule, #218)."""
+        lats, lons = self.cell_centers(cells)
+        return lons, lats
+
+    def sample(self, cells, crs, transform, shape):
+        """Nearest source-pixel ``(rows, cols, valid)`` for cell centers (#218).
+
+        Pull-NN: order-agnostic (``cells`` may be at any order — ``children()``
+        output, or finer/coarser), dense by construction over the raster's
+        footprint.
+        """
+        from zagg.grids.base import sample_nearest
+
+        lats, lons = self.cell_centers(cells)
+        return sample_nearest(lons, lats, "EPSG:4326", crs, transform, shape)
+
     def shards_of(self, leaf_ids) -> np.ndarray:
         """Vectorized parent-morton lookup. ``leaf_ids`` at :data:`HEALPIX_REF_ORDER`."""
         from mortie import clip2order

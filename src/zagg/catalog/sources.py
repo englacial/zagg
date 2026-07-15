@@ -5,17 +5,26 @@ any grid. The output is a ``Catalog`` backed by a stac-geoparquet pyarrow table
 (STAC Items with intact assets), persistable to a ``.parquet`` file and reusable
 across many ShardMap builds at different grids.
 
-``CMRSource`` is the one built-in source; it targets NASA's CMR-STAC endpoint,
-which is fully STAC-conformant. Non-CMR sources need no client of their own --
-the user exports their own STAC query to stac-geoparquet and loads it via
-``Catalog.from_geoparquet``.
+Two built-in sources:
+
+- ``CMRSource`` targets NASA's CMR-STAC endpoint (per-granule-unique asset keys,
+  single ``.h5`` data asset -- normalized to canonical ``data``/``data_s3``).
+- ``STACSource`` targets any STAC API root (issue #218), e.g. Earth Search for
+  Sentinel-2. Generic APIs use stable per-collection asset keys (``red``,
+  ``nir``, ``scl``), so assets are kept under their own keys, optionally
+  subset via the ``assets`` keep-list.
+
+Other sources still need no client of their own -- the user exports their own
+STAC query to stac-geoparquet and loads it via ``Catalog.from_geoparquet``.
 
 Endpoint (S3 vs HTTPS) is **not** chosen here: both ``data`` hrefs are preserved
 per granule so the aggregator can pick at run time via ``data_source.driver``.
 """
+
 from __future__ import annotations
 
 import json
+import logging
 from dataclasses import dataclass, field
 
 import numpy as np
@@ -61,6 +70,32 @@ class Query:
         return f"{self.short_name}_{self.version}"
 
 
+@dataclass
+class STACQuery:
+    """A generic STAC item-search query: *what, when, where* (issue #218).
+
+    Parameters
+    ----------
+    collections : list of str
+        Collection ids to search, e.g. ``["sentinel-2-c1-l2a",
+        "sentinel-2-pre-c1-l2a"]`` (query both for a gap-free S2 archive).
+    start_date, end_date : str
+        Inclusive date bounds, ``YYYY-MM-DD``.
+    region : tuple or str
+        Either a ``(lon_min, lat_min, lon_max, lat_max)`` bbox or a path to a
+        GeoJSON file (its bounding box is used for the STAC query).
+    max_cloud_cover : float, optional
+        Keep only items with ``eo:cloud_cover`` strictly below this value
+        (STAC query extension).
+    """
+
+    collections: list[str]
+    start_date: str
+    end_date: str
+    region: tuple | str
+    max_cloud_cover: float | None = None
+
+
 def _resolve_bbox(region) -> tuple[float, float, float, float]:
     """Return a ``(lon_min, lat_min, lon_max, lat_max)`` bbox from a Query region."""
     if isinstance(region, str):
@@ -100,6 +135,56 @@ def _normalize_assets(item: dict, *, preserve_thumbnails: bool) -> dict:
     item = dict(item)
     item["assets"] = out
     return item
+
+
+def _subset_assets(item: dict, keep: list[str]) -> dict | None:
+    """Keep only the ``keep`` asset keys (stable per-collection keys, #218).
+
+    Per-item strict: returns the subset item only when it carries *every*
+    requested key, else ``None`` so the caller can skip it. A partial asset
+    map would break the Phase 2 reader's per-band reads, surfacing much later
+    as an unreadable granule.
+    """
+    have = item.get("assets", {})
+    if set(keep) - set(have):
+        return None
+    item = dict(item)
+    item["assets"] = {k: have[k] for k in keep}
+    return item
+
+
+def _page_search(url, *, params=None, body=None, timeout=60) -> list[dict]:
+    """Page a STAC item-search, following ``rel=next`` links.
+
+    Starts as GET with ``params`` unless ``body`` is given (POST). A next link
+    is either a GET href or a POST href+body; per the STAC API spec ``merge``
+    folds the link body into the previous request body. When a link omits
+    ``method``, the current mode is kept.
+    """
+    items: list[dict] = []
+    while True:
+        if body is not None:
+            resp = requests.post(url, json=body, timeout=timeout)
+        else:
+            resp = requests.get(url, params=params, timeout=timeout)
+        resp.raise_for_status()
+        doc = resp.json()
+        feats = doc.get("features", [])
+        items.extend(feats)
+        nxt = next((ln for ln in doc.get("links", []) if ln.get("rel") == "next"), None)
+        if not nxt or not feats:
+            break
+        # Require the href -- a next link without one raises KeyError loudly
+        # rather than re-requesting the current url forever (#218).
+        url = nxt["href"]
+        mode = "GET" if body is None else "POST"
+        if str(nxt.get("method", mode)).upper() == "POST":
+            nxt_body = nxt.get("body", {})
+            body = {**body, **nxt_body} if (nxt.get("merge") and body) else nxt_body
+            params = None
+        else:
+            params, body = None, None
+    return items
 
 
 class CMRSource:
@@ -142,8 +227,7 @@ class CMRSource:
         datetime = f"{query.start_date}T00:00:00Z/{query.end_date}T23:59:59Z"
 
         items = self._search(provider, query.collection, bbox, datetime, limit)
-        items = [_normalize_assets(it, preserve_thumbnails=preserve_thumbnails)
-                 for it in items]
+        items = [_normalize_assets(it, preserve_thumbnails=preserve_thumbnails) for it in items]
         if not items:
             raise ValueError(
                 f"No granules for {query.collection} over {bbox} in "
@@ -168,33 +252,123 @@ class CMRSource:
     def _search(self, provider, collection, bbox, datetime, limit) -> list[dict]:
         """Page through CMR-STAC item-search, following ``rel=next`` links."""
         url = f"{_CMR_STAC_ROOT}/{provider}/search"
-        params: dict | None = {
+        params = {
             "collections": collection,
             "bbox": ",".join(str(x) for x in bbox),
             "datetime": datetime,
             "limit": limit,
         }
-        body: dict | None = None
-        items: list[dict] = []
-        while True:
-            if body is not None:
-                resp = requests.post(url, json=body, timeout=self.timeout)
-            else:
-                resp = requests.get(url, params=params, timeout=self.timeout)
-            resp.raise_for_status()
-            doc = resp.json()
-            feats = doc.get("features", [])
-            items.extend(feats)
-            nxt = next((ln for ln in doc.get("links", []) if ln.get("rel") == "next"), None)
-            if not nxt or not feats:
-                break
-            # A next link is either a GET href or a POST href+body+merge.
-            url = nxt["href"]
-            if str(nxt.get("method", "GET")).upper() == "POST":
-                params, body = None, nxt.get("body", {})
-            else:
-                params, body = None, None
-        return items
+        return _page_search(url, params=params, timeout=self.timeout)
+
+
+class STACSource:
+    """Fetch item metadata from any STAC API root (issue #218).
+
+    Searches ``{root}/search`` via POST item-search. Unlike CMR-STAC, generic
+    APIs (e.g. Earth Search, ``https://earth-search.aws.element84.com/v1``)
+    use stable per-collection asset keys, so assets are kept under their own
+    keys -- no canonical-key normalization.
+
+    Parameters
+    ----------
+    root : str
+        STAC API root URL.
+    assets : list of str, optional
+        Asset-key keep-list (e.g. ``["red", "nir", "scl"]``). ``None`` keeps
+        every asset; subsetting keeps the geoparquet struct schema lean.
+    time_key : str, optional
+        Item property naming the *acquisition group* (issue #218): items of
+        one Sentinel-2 datatake land in adjacent MGRS tiles with datetimes
+        seconds apart, so the ``(time, cell)`` timestep identity is e.g.
+        ``"s2:datatake_id"``, not the item datetime. Recorded in the catalog
+        metadata and surfaced per record by :meth:`Catalog.granule_records`.
+    timeout : int
+        Per-request timeout in seconds.
+    """
+
+    def __init__(
+        self,
+        root: str,
+        assets: list[str] | None = None,
+        time_key: str | None = None,
+        timeout: int = 60,
+    ):
+        self.root = root.rstrip("/")
+        self.assets = assets
+        self.time_key = time_key
+        self.timeout = timeout
+
+    def fetch(self, query: STACQuery, *, limit: int = 1000) -> "Catalog":
+        """Run ``query`` against the STAC API and return a ``Catalog``.
+
+        Parameters
+        ----------
+        query : STACQuery
+            What/when/where to fetch.
+        limit : int
+            Page size hint; servers clamp it and paging follows ``rel=next``.
+
+        Returns
+        -------
+        Catalog
+        """
+        import stac_geoparquet.arrow as sga
+
+        bbox = _resolve_bbox(query.region)
+        datetime = f"{query.start_date}T00:00:00Z/{query.end_date}T23:59:59Z"
+        body: dict = {
+            "collections": list(query.collections),
+            "bbox": list(bbox),
+            "datetime": datetime,
+            "limit": limit,
+        }
+        if query.max_cloud_cover is not None:
+            body["query"] = {"eo:cloud_cover": {"lt": query.max_cloud_cover}}
+
+        crawled = _page_search(f"{self.root}/search", body=body, timeout=self.timeout)
+        items, skipped_ids = crawled, []
+        if self.assets is not None:
+            items = []
+            for it in crawled:
+                sub = _subset_assets(it, self.assets)
+                (items if sub is not None else skipped_ids).append(
+                    sub if sub is not None else it.get("id")
+                )
+            if skipped_ids:
+                logging.warning(
+                    "STACSource: skipped %d item(s) missing requested assets %s; e.g. %s",
+                    len(skipped_ids),
+                    sorted(self.assets),
+                    skipped_ids[:5],
+                )
+            if crawled and not items:
+                example = sorted((crawled[0].get("assets") or {}))
+                raise ValueError(
+                    f"No items carry all requested assets {sorted(self.assets)} "
+                    f"(e.g. available keys: {example})"
+                )
+        if not items:
+            raise ValueError(
+                f"No items for {query.collections} over {bbox} in "
+                f"{query.start_date}..{query.end_date}"
+            )
+
+        table = pa.table(sga.parse_stac_items_to_arrow(items))
+        meta = {
+            "source": "STAC",
+            "root": self.root,
+            "collections": list(query.collections),
+            "start_date": query.start_date,
+            "end_date": query.end_date,
+            "bbox": list(bbox),
+            "time_key": self.time_key,
+            "max_cloud_cover": query.max_cloud_cover,
+            "assets": self.assets,
+            "total_granules": len(items),
+        }
+        if skipped_ids:
+            meta["skipped_items"] = {"count": len(skipped_ids), "examples": skipped_ids[:5]}
+        return Catalog(_attach_meta(table, meta), meta)
 
 
 def _attach_meta(table: pa.Table, meta: dict) -> pa.Table:
@@ -259,30 +433,71 @@ class Catalog:
         list of dict
             Each: ``{"id", "s3", "https", "lats", "lons"}`` where ``lats``/
             ``lons`` are the footprint exterior-ring coordinate arrays (WGS84)
-            and ``s3``/``https`` are the data-asset hrefs (either may be None).
+            and ``s3``/``https`` are the canonical data-asset hrefs (either may
+            be None). Records with *no* canonical data asset (raster sources,
+            #218) additionally carry ``assets`` (``{key: href}`` for every
+            non-canonical asset), ``datetime`` (ISO acquisition time), and
+            ``time_key`` (the acquisition-group property named by the
+            catalog's ``time_key`` metadata, when present); any
+            record with a ``data``/``data_s3`` asset -- every CMR record,
+            including ``preserve_thumbnails=True`` -- keeps its exact pre-#218
+            shape.
         """
         import shapely
 
         ids = self.table.column("id").to_pylist()
         assets = self.table.column("assets").to_pylist()
         geoms = self.table.column("geometry").to_pylist()
+        dts = (
+            self.table.column("datetime").to_pylist()
+            if "datetime" in self.table.column_names
+            else [None] * len(ids)
+        )
+        # Acquisition-group property (issue #218): the source records its item
+        # property name in the catalog metadata; stac-geoparquet flattens item
+        # properties to top-level columns, so it reads straight off the table.
+        tk_col = (self.metadata or {}).get("time_key")
+        tks = (
+            self.table.column(tk_col).to_pylist()
+            if tk_col and tk_col in self.table.column_names
+            else [None] * len(ids)
+        )
         records = []
-        for gid, asset_map, wkb in zip(ids, assets, geoms):
+        for gid, asset_map, wkb, dt, tk in zip(ids, assets, geoms, dts, tks):
             geom = shapely.from_wkb(wkb)
             if geom.is_empty or geom.geom_type not in ("Polygon", "MultiPolygon"):
                 continue
             poly = geom if geom.geom_type == "Polygon" else max(geom.geoms, key=lambda g: g.area)
             x, y = poly.exterior.coords.xy
-            data = (asset_map or {}).get("data") or {}
-            data_s3 = (asset_map or {}).get("data_s3") or {}
-            records.append({
+            asset_map = asset_map or {}
+            data = asset_map.get("data") or {}
+            data_s3 = asset_map.get("data_s3") or {}
+            rec = {
                 "id": gid,
                 "https": data.get("href"),
                 "s3": data_s3.get("href"),
                 "lats": np.asarray(y),
                 "lons": np.asarray(x),
-            })
+            }
+            # Only records with no canonical data asset (raster sources) grow
+            # the extra keys; any record carrying data/data_s3 -- every CMR
+            # record, including preserve_thumbnails -- stays byte-identical
+            # through granule_records -> ShardMap so existing manifests don't
+            # change shape (#218).
+            if "data" not in asset_map and "data_s3" not in asset_map:
+                extra = {
+                    k: (a or {}).get("href")
+                    for k, a in asset_map.items()
+                    if k not in ("data", "data_s3", "metadata") and (a or {}).get("href")
+                }
+                if extra:
+                    rec["assets"] = extra
+                    if dt is not None:
+                        rec["datetime"] = dt.isoformat()
+                    if tk is not None:
+                        rec["time_key"] = str(tk)
+            records.append(rec)
         return records
 
 
-__all__ = ["Query", "CMRSource", "Catalog"]
+__all__ = ["Query", "STACQuery", "CMRSource", "STACSource", "Catalog"]

@@ -236,6 +236,14 @@ def validate_config(config: PipelineConfig) -> None:
         _validate_temporal_config(config)
         return
 
+    # Raster pipelines (issue #218) share the spatial grid checks but replace
+    # the HDF5 read-side schema (groups/coordinates/variables) and the
+    # aggregation section with a declarative band map: pull-NN yields exactly
+    # one value per cell per timestep, so there is nothing to reduce.
+    if (config.data_source or {}).get("reader") == "raster":
+        _validate_raster_config(config)
+        return
+
     # Required sections
     for section in ("data_source", "aggregation", "output"):
         val = getattr(config, section)
@@ -579,6 +587,81 @@ def _validate_temporal_config(config: PipelineConfig) -> None:
                 f"temporal variable '{name}' params must be a mapping (got {params!r})"
             )
     _validate_collection_options(config)
+
+
+def _validate_raster_config(config: PipelineConfig) -> None:
+    """Validate a raster (pull-NN) pipeline config (issue #218).
+
+    ``data_source.bands`` maps output field name -> ``{asset, dtype, ...}``:
+    ``asset`` names the STAC asset key holding that band's GeoTIFF, ``dtype``
+    is required (bands store exact source DNs — no float default), and
+    optional ``fill_value`` (default 0), ``scale``/``offset`` (recorded as
+    ``scale_factor``/``add_offset`` array attrs, never applied to the data).
+    ``data_source.nodata`` (optional scalar) marks source nodata; a cell
+    whose sampled pixel equals it in any band is left at fill.
+    """
+    for section in ("data_source", "output"):
+        if not getattr(config, section):
+            raise ValueError(f"Missing required section: {section}")
+    if config.aggregation:
+        raise ValueError(
+            "raster pipelines take no aggregation section: pull-NN yields one "
+            "value per cell per timestep (declare bands under data_source.bands)"
+        )
+    bands = config.data_source.get("bands")
+    if not bands or not isinstance(bands, dict):
+        raise ValueError("raster pipeline requires data_source.bands (field -> {asset, dtype})")
+    for name, meta in bands.items():
+        if not isinstance(meta, dict):
+            raise ValueError(f"band '{name}' must be a mapping (got {meta!r})")
+        for key in ("asset", "dtype"):
+            if not isinstance(meta.get(key), str) or not meta.get(key):
+                raise ValueError(f"band '{name}' requires a string '{key}'")
+        for key in ("fill_value", "scale", "offset"):
+            if key in meta and (
+                not isinstance(meta[key], (int, float)) or isinstance(meta[key], bool)
+            ):
+                raise ValueError(f"band '{name}' {key} must be a number (got {meta[key]!r})")
+    nodata = config.data_source.get("nodata")
+    if nodata is not None and (not isinstance(nodata, (int, float)) or isinstance(nodata, bool)):
+        raise ValueError(f"data_source.nodata must be a number (got {nodata!r})")
+    grid = config.output.get("grid")
+    if not isinstance(grid, dict) or grid.get("type") != "healpix":
+        raise ValueError(
+            "raster pipelines currently require output.grid.type: healpix "
+            "(the rectilinear (time, y, x) template is future work — issue #218)"
+        )
+    for key in ("parent_order", "child_order"):
+        if key not in grid:
+            raise ValueError(f"output.grid.{key} is required for healpix grid")
+    if grid.get("sharded"):
+        raise ValueError(
+            "raster templates do not support sharded: true yet (issue #218); "
+            "chunks are (1, cells_per_chunk) — one object per timestep-chunk"
+        )
+
+
+def get_raster_bands(config: PipelineConfig) -> dict:
+    """Normalized ``data_source.bands``: field -> {asset, dtype, fill_value, attrs}.
+
+    ``attrs`` carries CF ``scale_factor``/``add_offset`` when the band
+    declares ``scale``/``offset`` — recorded on the array for readers, never
+    applied to the stored DNs (issue #218: exact source values).
+    """
+    out = {}
+    for name, meta in (config.data_source.get("bands") or {}).items():
+        attrs = {}
+        if "scale" in meta:
+            attrs["scale_factor"] = meta["scale"]
+        if "offset" in meta:
+            attrs["add_offset"] = meta["offset"]
+        out[name] = {
+            "asset": meta["asset"],
+            "dtype": meta["dtype"],
+            "fill_value": meta.get("fill_value", 0),
+            "attrs": attrs,
+        }
+    return out
 
 
 _RESAMPLE_HOWS = ("sum", "mean")
