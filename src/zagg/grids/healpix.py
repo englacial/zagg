@@ -123,9 +123,10 @@ class HealpixGrid:
         # objects. Only meaningful when K > 1 (a finer ``chunk_inner`` gives the
         # shard multiple inner chunks). ``sharded`` defaults True (issue #215 — a
         # missing flag should not silently cost the ~K-fold object blow-up), so a
-        # K==1 shard (no ``chunk_inner``) has nothing to bundle: sharding is a no-op
-        # there and is silently disabled, leaving single-chunk grids byte-identical
-        # to a pre-#215 unsharded write. HEALPix lands first (issue #108).
+        # K==1 shard (``chunk_inner`` unset, or no finer than ``parent_order``) has
+        # nothing to bundle: sharding is a no-op there and is silently disabled,
+        # leaving single-chunk grids byte-identical to a pre-#215 unsharded write.
+        # HEALPix lands first (issue #108).
         if self.chunks_per_shard <= 1:
             sharded = False
         self.sharded = bool(sharded)
