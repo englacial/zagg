@@ -726,7 +726,11 @@ def make_full_aoi_release_figure(
     nothing) when no full-AOI release rows are retained yet, so ``main`` / the Pages
     index simply omit the section (no broken image)."""
     hist = _full_aoi_history(df)
-    if hist.empty or hist["target"].dropna().empty:
+    # ``_full_aoi_history`` early-returns the frame unchanged when it lacks a
+    # ``target`` column, so guard the column's presence too (keeps the two guards
+    # consistent -- a non-empty frame without ``target`` returns False, not a
+    # KeyError).
+    if hist.empty or "target" not in hist.columns or hist["target"].dropna().empty:
         return False
     layout, nrows, ncols = _matrix_layout(hist)
     return _render_panel_grid(
