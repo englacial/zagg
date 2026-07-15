@@ -6,6 +6,7 @@ metric/throughput helpers. The live dispatch path (``run_target`` with
 operationally, not in unit tests.
 """
 
+import json
 import sys
 from pathlib import Path
 
@@ -37,6 +38,61 @@ def test_full_aoi_targets_manifest_consistent():
         assert isinstance(t["aoi_mask"], bool), name
         for key in ("aggregator", "grid_type", "grid_size"):
             assert t.get(key), f"{name}: missing {key}"
+
+
+def test_neon_catalog_committed_and_prefilters_nonempty():
+    # The pinned NEON catalog (cat_neon.parquet) is the committed granule set the
+    # release harness builds its shardmap from -- offline, no CMR (the cat_88s
+    # precedent, issue #148). Pinning it makes the per-release full-AOI series
+    # measure CODE change, not CMR data drift, over the whole AOI.
+    from zagg.catalog.sources import Catalog
+
+    cat_path = BENCH / "catalogs" / "cat_neon.parquet"
+    assert cat_path.exists(), "pinned NEON catalog missing"
+    cat = Catalog.from_geoparquet(str(cat_path))
+    assert len(cat) > 0
+    manifest, base = rfab.load_targets(str(BENCH / "targets_full_aoi_neon.json"))
+    _parts, bbox = rfab._aoi_parts((base / manifest["aoi"]["file"]).resolve())
+    sub = rfab._prefilter(cat, bbox, manifest["temporal"]["start"], manifest["temporal"]["end"])
+    # The committed catalog is already the AOI-bbox+temporal subset, so the
+    # harness's own prefilter is (near) idempotent and still non-empty.
+    assert len(sub) > 0
+
+
+@pytest.mark.slow
+def test_neon_catalog_builds_full_aoi_shardmap(tmp_path):
+    # End-to-end offline (no AWS): the release harness builds the whole-AOI
+    # shardmap for every target from the pinned catalog via --dry-run. Slow
+    # (mortie shardmap build, ~seconds/target); gated behind the slow marker.
+    metrics = tmp_path / "m.json"
+    shards = tmp_path / "s.json"
+    rc = rfab.main(
+        [
+            "--targets",
+            str(BENCH / "targets_full_aoi_neon.json"),
+            "--catalog",
+            str(BENCH / "catalogs" / "cat_neon.parquet"),
+            "--dry-run",
+            "--event",
+            "release",
+            "--commit",
+            "test",
+            "--ref",
+            "v0.0.0",
+            "--out-json",
+            str(metrics),
+            "--out-shards-json",
+            str(shards),
+            "--artifacts-dir",
+            str(tmp_path / "art"),
+        ]
+    )
+    assert rc == 0
+    runs = json.loads(metrics.read_text())
+    assert len(runs) == 4  # inline/sidecar x mask/nomask
+    for run in runs:
+        assert run["n_shards"] == 4  # the NEON AOI fans to 4 o9 shards
+        assert run["apriori_estimate"]["est_cost_usd"] > 0
 
 
 # --- pure helpers ----------------------------------------------------------
