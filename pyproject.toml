@@ -79,6 +79,15 @@ lambda = [
     # Keep this pin in sync with deployment/aws/build_layer.sh (abi3
     # manylinux_2_28 wheels cover both layer arches, ~4 MB each) — issue #218.
     "async-tiff==0.7.2",
+    # The temporal worker (process_event, issue #220) reads xarray datasets and
+    # opens NetCDF4/HDF5 bytes in-memory via the h5netcdf engine; h5coro is a
+    # byte-range reader, not an xarray engine, so these must ship in the layer.
+    # Pins resolved against numpy==2.2.6/pandas==2.2.3 on the layer's python;
+    # keep in sync with deployment/aws/build_layer.sh (xarray must NOT be in
+    # its strip list).
+    "xarray==2026.7.0",
+    "h5netcdf==1.8.1",
+    "h5py==3.16.0",
 ]
 # STAC fetch + shard-map build deps. Kept out of core so the Lambda layer build
 # (which doesn't run fetch/build) stays lean.
