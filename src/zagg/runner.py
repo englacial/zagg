@@ -573,6 +573,14 @@ class RasterStrategy:
     Local backend only for now: the Lambda fan-out needs a handler branch
     under ``deployment/aws/`` (out of this PR's scope per repo conventions) —
     tracked on issue #218.
+
+    Summary schema note: ``total_obs`` is shared with the spatial/temporal
+    strategies so a caller sees one summary shape across pipeline kinds. On the
+    raster path there is no per-cell/per-pixel observation tally, so it counts
+    the number of shard×timestep slabs written (the raster analogue of an
+    observation count); ``timesteps`` separately carries the global datatake
+    count. A dashboard summing ``total_obs`` across kinds mixes units — read it
+    per kind.
     """
 
     def run(
@@ -685,6 +693,9 @@ class RasterStrategy:
             "total_cells": len(cells),
             "cells_with_data": shards_with_data,
             "cells_error": errors,
+            # Shared summary key across strategies. For the raster path this is
+            # the count of shard×timestep slabs written, not a per-cell obs tally
+            # (see RasterStrategy docstring); ``timesteps`` is the datatake count.
             "total_obs": timesteps_written,
             "timesteps": int(len(times_us)),
             "wall_time_s": wall_time,
