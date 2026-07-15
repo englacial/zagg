@@ -418,6 +418,30 @@ class TestRasterLambdaBackend:
         assert summary["cells_with_data"] == 1
         assert len(fake.events) == 2  # first invoke raised (transient), retried once
 
+    def test_lambda_dense_layout_fails_fast(self, manifest, monkeypatch, tmp_path):
+        # A dense-layout config on the lambda backend must be refused up front,
+        # before any invoke — the fake client records zero events.
+        import boto3
+
+        import zagg.runner as runner_mod
+
+        cfg, sm_path, _shard, _data = manifest
+        cfg.output["grid"]["layout"] = "dense"
+
+        fake = _FakeLambdaClient(lambda event: {"statusCode": 200, "body": "{}"})
+        monkeypatch.setattr(boto3, "client", lambda *a, **k: fake)
+        real_open = runner_mod.open_store
+        monkeypatch.setattr(
+            runner_mod,
+            "open_store",
+            lambda path, **kw: (
+                str(tmp_path / "dense.zarr") if path.startswith("s3://") else real_open(path, **kw)
+            ),
+        )
+        with pytest.raises(ValueError, match="fullsphere"):
+            agg(cfg, catalog=sm_path, store="s3://bucket/out.zarr", backend="lambda")
+        assert fake.events == []
+
     def test_lambda_datetime_only_time_index(self, tmp_path, monkeypatch):
         # Granules without a time_key fall back to the datetime string as the
         # group key; the worker event's time_index must be keyed by that string.

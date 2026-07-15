@@ -623,6 +623,14 @@ class RasterStrategy:
             raise ValueError(f"Unknown backend: {backend!r} (expected 'local' or 'lambda')")
         if backend == "lambda" and not store_path.startswith("s3://"):
             raise ValueError(f"Lambda backend requires s3:// store path, got: {store_path}")
+        # Fail fast rather than pay the full fan-out for per-worker 400s: a dense
+        # worker's block indexing needs populated-shard state the raster workers
+        # do not carry. The handler rejects it too (defense in depth).
+        if backend == "lambda" and get_layout(config) == "dense":
+            raise ValueError(
+                "raster lambda workers require fullsphere; dense block indexing "
+                "needs populated-shard state"
+            )
 
         catalog_data = _load_catalog(catalog_path)
         cells = _select_cells(catalog_data, morton_cell=morton_cell, max_cells=max_cells)
