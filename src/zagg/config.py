@@ -672,7 +672,9 @@ def _validate_collection_options(config: PipelineConfig) -> None:
 
     The block accepts a list of collection names (no options) or a mapping of
     name -> per-collection reader options consumed by
-    :func:`zagg.temporal.prepare_collection`: ``variables`` (list of names),
+    :func:`zagg.temporal.prepare_collection`: ``coord_round`` (non-negative
+    int, decimals to round lat/lon coords to -- for source grids whose own
+    coordinate arrays carry float dirt), ``variables`` (list of names),
     ``time_offset`` (a pandas-parseable offset string), ``resample``
     (``{freq, how: sum|mean, scale}``), and ``derived`` (name -> numpy
     expression string). ``time_offset`` and ``resample.freq`` are parsed with
