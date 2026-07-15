@@ -1,0 +1,150 @@
+name: Lambda Benchmark (full-AOI, per release)
+
+# Per-RELEASE full-AOI cost truth (issues #110, #202 leg 1) -- the complement to
+# lambda-benchmark.yml (which runs the single densest shard per MERGE, isolating
+# code deltas from data drift). This one fans the WHOLE AOP_NEON box over EVERY
+# shard on a version tag, so the recorded numbers are the real dollar total across
+# all shards, appended to `full_aoi_series.parquet` on the `benchmarks` branch and
+# rendered into the Pages charts (docs/deployment/benchmark.md embeds them).
+#
+#   push a `*.*.*` tag (a release -- same event as publish.yml) -> run the whole
+#     AOI on the stable production function, retain the release point, re-render.
+#   workflow_dispatch -> run on demand (the recommended way to do the first
+#     validated run before relying on the tag trigger).
+#
+# It is INERT until the full-AOI AWS vars are configured (the run job gates on the
+# resolved role ARN), so merely landing this file bills nothing. The harness fails
+# CLOSED on a wrong-account dispatch (it asserts the caller's AWS account matches
+# the manifest's dispatch.expect_account via STS before any billed invoke), so a
+# misconfigured role can never bill the wrong account.
+#
+# Cost note: on each release this dispatches every NEON shard (4 shards) to real
+# Lambda -- billed. NEON is small; the whole-AOI run is a handful of invokes.
+
+on:
+  push:
+    tags:
+      - "*.*.*"
+  workflow_dispatch:
+    inputs:
+      targets:
+        description: Space-separated target keys (empty = all)
+        required: false
+        default: ""
+
+permissions:
+  contents: read
+
+# Serialized with itself; does NOT share lambda-benchmark.yml's group, so a
+# release run and a merge run don't cancel each other.
+concurrency:
+  group: lambda-benchmark-fullaoi
+  cancel-in-progress: false
+
+jobs:
+  full-aoi:
+    # Inert until configured: the full-AOI role (dedicated var, or the shared
+    # benchmark role as a fallback) must be set, else skip (no billing).
+    if: ${{ vars.BENCHMARK_FULLAOI_ROLE_ARN != '' || vars.BENCHMARK_ROLE_ARN != '' }}
+    runs-on: ubuntu-latest
+    # contents: write to push the series + charts to the benchmarks branch;
+    # id-token: write for the OIDC role assumption.
+    permissions:
+      contents: write
+      id-token: write
+    env:
+      # Dedicated full-AOI vars win; fall back to the shared benchmark config so a
+      # single setup works when the full-AOI run targets the same account/function.
+      ROLE_ARN: ${{ vars.BENCHMARK_FULLAOI_ROLE_ARN || vars.BENCHMARK_ROLE_ARN }}
+      AWS_REGION: ${{ vars.BENCHMARK_FULLAOI_REGION || vars.BENCHMARK_AWS_REGION }}
+      STORE_PREFIX: ${{ vars.BENCHMARK_FULLAOI_STORE_PREFIX || vars.BENCHMARK_STORE_PREFIX }}
+      # The stable production function is `process-shard` (matches the manifest's
+      # dispatch block + its expect_account assertion); override per deployment.
+      FUNCTION_NAME: ${{ vars.BENCHMARK_FULLAOI_FUNCTION_NAME || 'process-shard' }}
+    steps:
+      - name: Checkout tag
+        uses: actions/checkout@v5
+
+      # Same runner IPv6 workaround as lambda-benchmark.yml (issue #137): the
+      # runner resolves urs.earthdata.nasa.gov to an AAAA record with no usable
+      # IPv6 route, so earthaccess.login() (inside the orchestrator) would die with
+      # `[Errno 101] Network is unreachable`. Raising IPv4-mapped precedence makes
+      # glibc try the routable A record first. Runner-only; the package is untouched.
+      - name: Prefer IPv4 for Earthdata login (issue #137)
+        run: echo 'precedence ::ffff:0:0/96 100' | sudo tee -a /etc/gai.conf
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v6
+
+      - name: Set up Python + install zagg (with benchmark extra)
+        run: |
+          uv python install 3.12
+          uv sync --extra benchmark
+
+      - name: Assume AWS role (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ env.ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Run full-AOI benchmark (every shard over the AOI)
+        # Inputs flow through env, never interpolated into the script body, so an
+        # attacker-controlled value can't break out of the argument (matches the
+        # run-benchmark composite action's hardening).
+        env:
+          TARGETS: ${{ github.event.inputs.targets }}
+          TAG: ${{ github.ref_name }}
+          SHA: ${{ github.sha }}
+          EARTHDATA_TOKEN: ${{ secrets.EARTHDATA_TOKEN }}
+        run: |
+          set -euo pipefail
+          target_flags=()
+          for t in $TARGETS; do
+            target_flags+=(--target "$t")
+          done
+          uv run python .github/scripts/run_full_aoi_benchmark.py \
+            --targets tests/data/benchmark/targets_full_aoi_neon.json \
+            --catalog tests/data/benchmark/catalogs/cat_neon.parquet \
+            "${target_flags[@]}" \
+            --store-prefix "${STORE_PREFIX%/}/full-aoi" \
+            --region "$AWS_REGION" \
+            --function-name "$FUNCTION_NAME" \
+            --event release \
+            --commit "$SHA" \
+            --ref "$TAG" \
+            --out-json full_aoi_metrics.json \
+            --out-shards-json full_aoi_shards.json
+
+      - name: Check out benchmarks data branch
+        uses: actions/checkout@v5
+        with:
+          ref: benchmarks
+          path: _series
+          fetch-depth: 0
+
+      - name: Append full-AOI series + render charts
+        run: |
+          set -euo pipefail
+          uv run python .github/scripts/full_aoi_series.py \
+            --series _series/full_aoi_series.parquet --records full_aoi_metrics.json
+          # Re-render the Pages site: the matrix from the per-merge series (left
+          # untouched) plus the full-AOI release figures from the series just
+          # appended. --series is the existing per-merge parquet (idempotent).
+          uv run python .github/scripts/plot_series.py \
+            --series _series/series.parquet \
+            --full-aoi-series _series/full_aoi_series.parquet \
+            --out _series/site
+
+      - name: Commit + push to benchmarks branch
+        working-directory: _series
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add full_aoi_series.parquet site
+          if git diff --cached --quiet; then
+            echo "no full-AOI benchmark changes to commit"
+          else
+            git commit -m "full-aoi benchmark: ${{ github.ref_name }}"
+            git push origin benchmarks
+          fi
