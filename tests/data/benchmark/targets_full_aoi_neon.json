@@ -18,8 +18,7 @@
   "dispatch": {
     "region": "us-west-2",
     "function_name": "process-shard",
-    "expect_account": "742127912612",
-    "note": "process-shard on the 742127912612 deployment account; dispatch with AWS profile 'nasa'. The harness asserts the caller account matches expect_account before any billed invoke."
+    "note": "Default dispatch target; the workflow overrides region/function from the shared BENCHMARK_* repo vars (the same ones the per-merge run uses). No account is pinned -- the release run reuses the per-merge benchmark role, and run_benchmark.py asserts no account either. A fork may add an optional expect_account here to make the harness assert the caller account before billing (it no-ops when absent)."
   },
   "targets": {
     "full_aoi_neon_o9_inline_nomask": {
