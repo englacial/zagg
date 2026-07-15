@@ -186,6 +186,9 @@ def test_full_aoi_history_derives_avg_cost_and_filters_release():
 
 
 def test_make_full_aoi_release_figure_renders_and_empty_is_false(tmp_path):
+    # matplotlib lives in the benchmark/analysis extras, not the `test` extra CI
+    # installs -- skip the render (like the other plot_series tests) when absent.
+    pytest.importorskip("matplotlib")
     ps = pytest.importorskip("plot_series")
     df = fas.records_to_frame(
         _matrix_records("c1", "v0.24.0", 0.016) + _matrix_records("c2", "v0.25.0", 0.018)
