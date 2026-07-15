@@ -725,6 +725,7 @@ def read_temporal_inputs(
     region="us-west-2",
     collection_options=None,
     input_credentials=None,
+    extent=None,
 ):
     """Load the ``collections`` and ``static_data`` :func:`process_event` needs.
 
@@ -758,6 +759,15 @@ def read_temporal_inputs(
         ``None`` for the ambient chain. Source credentials scoped to GES DISC
         (or any other provider) are denied on other buckets by the
         cross-account rule, so statics must not ride the collections channel.
+    extent : tuple, optional
+        ``(lats, lons)`` coordinate arrays of the event (issue #225). When
+        given, every granule is subset to the event extent (and the
+        collection's ``variables``, when configured), **loaded**, and its
+        backing byte buffer released before the next granule opens — bounding
+        peak worker memory to ~one granule regardless of storm length. Without
+        it, datasets stay lazy over their full-file buffers (the pre-#225
+        behavior); on a 4 GB Lambda a multi-day, multi-collection event OOMs
+        that way.
 
     Returns
     -------
@@ -776,7 +786,17 @@ def read_temporal_inputs(
     collections = {}
     for name, uris in collection_uris.items():
         uri_list = list(uris) if isinstance(uris, (list, tuple)) else [uris]
-        parts = [open_dataset(u, **kw) for u in uri_list]
+        keep = (options.get(name) or {}).get("variables")
+        parts = []
+        for u in uri_list:
+            ds = open_dataset(u, **kw)
+            if extent is not None:
+                lats, lons = extent
+                part = ds[list(keep)] if keep else ds
+                part = part.sel(lat=lats, lon=lons).load()
+                ds.close()
+                ds = part
+            parts.append(ds)
         if len(parts) == 1:
             ds = parts[0]
         else:

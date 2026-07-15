@@ -1327,6 +1327,13 @@ class TestProcessEventMode:
         assert captured["mask_kwargs"]["credentials"] is None
         assert captured["reader_kwargs"]["credentials"] == _CREDS
         assert captured["reader_kwargs"]["input_credentials"] == "unsigned"
+        # the mask's coordinates ride to the reader so granules subset+load to
+        # the event extent (issue #225)
+        import numpy as np
+
+        lats, lons = captured["reader_kwargs"]["extent"]
+        np.testing.assert_array_equal(lats, event_mask["lat"].values)
+        np.testing.assert_array_equal(lons, event_mask["lon"].values)
 
     def test_bad_input_credentials_returns_500(self, handler_mod, monkeypatch):
         self._patch(handler_mod, monkeypatch)

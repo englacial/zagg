@@ -979,6 +979,62 @@ class TestTemporalReader:
         with pytest.raises(ValueError, match="input_credentials"):
             _input_channel("anonymous")
 
+    def test_read_temporal_inputs_extent_subsets_loads_and_frees(self, monkeypatch):
+        # With an event extent, each granule is subset to it (and the
+        # collection's variables), loaded, and closed before the next opens --
+        # peak memory ~one granule instead of every collection whole
+        # (issue #225).
+        xr = pytest.importorskip("xarray")
+        import zagg.temporal as temporal
+        from zagg.temporal import read_temporal_inputs
+
+        lat = np.arange(-80.0, -60.0, 0.5)
+        lon = np.arange(-30.0, 30.0, 0.625)
+        closed = []
+
+        def _wide(uri, **kwargs):
+            day = int(uri[-4])
+            time = np.array([f"1980-01-0{day}T00", f"1980-01-0{day}T03"], dtype="datetime64[ns]")
+            ds = xr.Dataset(
+                {
+                    "T2M": (("time", "lat", "lon"), np.full((2, lat.size, lon.size), float(day))),
+                    "SLP": (("time", "lat", "lon"), np.zeros((2, lat.size, lon.size))),
+                },
+                coords={"time": time, "lat": lat, "lon": lon},
+            )
+            ds.set_close(lambda u=uri: closed.append(u))
+            return ds
+
+        monkeypatch.setattr(temporal, "open_dataset", _wide)
+        ev_lats = np.array([-70.0, -69.5])
+        ev_lons = np.array([0.0, 0.625])
+        collections, _ = read_temporal_inputs(
+            {"merra2": ["s3://b/d2.nc", "s3://b/d1.nc"]},
+            {},
+            collection_options={"merra2": {"variables": ["T2M"]}},
+            extent=(ev_lats, ev_lons),
+        )
+        out = collections["merra2"]
+        assert list(out.data_vars) == ["T2M"]
+        np.testing.assert_array_equal(out["lat"].values, ev_lats)
+        np.testing.assert_array_equal(out["lon"].values, ev_lons)
+        # concat + sortby: day 1 before day 2, values loaded as plain numpy
+        assert out["T2M"].values[0, 0, 0] == 1.0
+        assert isinstance(out["T2M"].data, np.ndarray)
+        assert len(closed) == 2  # each granule's buffer released after load
+
+    def test_read_temporal_inputs_no_extent_stays_lazy_shaped(self, monkeypatch):
+        # Without an extent the reader returns the opened datasets untouched
+        # (pre-#225 behavior) -- callers outside the worker keep full control.
+        xr = pytest.importorskip("xarray")
+        import zagg.temporal as temporal
+        from zagg.temporal import read_temporal_inputs
+
+        ds = xr.Dataset({"T2M": (("lat",), np.ones(4))}, coords={"lat": np.arange(4.0)})
+        monkeypatch.setattr(temporal, "open_dataset", lambda uri, **k: ds)
+        collections, _ = read_temporal_inputs({"merra2": "s3://b/d1.nc"}, {})
+        assert collections["merra2"]["T2M"].sizes["lat"] == 4
+
     def test_read_temporal_inputs_routes_credential_channels(self, monkeypatch):
         # collections read with the source creds; statics ride the
         # input_credentials channel (here: unsigned) -- issue #223.
