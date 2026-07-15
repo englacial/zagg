@@ -897,10 +897,22 @@ def _handle_process_raster(event: Dict[str, Any]) -> Dict[str, Any]:
         # #231) — parity with the local RasterStrategy's per-shard streaming.
         store = open_store(event["store_path"], **_output_store_kwargs(event))
         wrote = False
+        # Opt-in phase timing (the issue #100 convention, raster flavor):
+        # ``write`` is the sink's accumulated wall and ``sample`` the
+        # remainder — the split the PR #232 double-buffer decision needs
+        # measured. Exact at write_buffer=1 (writes serialize in the loop);
+        # at write_buffer>1 writes overlap sampling, so the remainder is
+        # approximate — A/B on ``duration_s`` instead. Default (no
+        # ``profile`` key) emits nothing: the body stays byte-identical.
+        profile = bool(event.get("profile"))
+        write_s = 0.0
 
         def _write_slab(t_idx: int, slab: dict) -> None:
-            nonlocal wrote
+            nonlocal wrote, write_s
+            w0 = time.time() if profile else 0.0
             write_raster_slab(store, grid, shard_key, t_idx, slab)
+            if profile:
+                write_s += time.time() - w0
             wrote = True
 
         _slabs, meta = process_raster_shard(
@@ -927,6 +939,9 @@ def _handle_process_raster(event: Dict[str, Any]) -> Dict[str, Any]:
             "total_obs": meta["timesteps"],
             "duration_s": time.time() - start_time,
         }
+        if profile:
+            total = time.time() - start_time
+            body["phase_timings"] = {"sample": total - write_s, "write": write_s}
         return {"statusCode": 200, "body": json.dumps(body)}
     except Exception as e:
         logger.error(f"raster worker failed: {e}", exc_info=True)
