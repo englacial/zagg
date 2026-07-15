@@ -126,6 +126,11 @@ analysis = [
 # heavy analysis stack.
 benchmark = [
     "matplotlib>=3.10.8",
+    # The full-AOI harness builds its shard map from a committed stac-geoparquet
+    # catalog (zagg.catalog.sources -> pyarrow), and the series append writes
+    # parquet via pandas; both run only in CI, off-Lambda (the worker uses
+    # arro3-core, issue #130), so pyarrow lives in this CI-only extra.
+    "pyarrow",
 ]
 test = [
     "pytest>=8.0",
