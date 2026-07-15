@@ -17,6 +17,7 @@ from zagg.config import get_raster_bands, load_config_from_dict, validate_config
 from zagg.grids import HealpixGrid, RectilinearGrid
 from zagg.processing.raster import (
     _run_sync,
+    _sample_concurrency,
     _shard_cell_range,
     emit_raster_template,
     process_raster_shard,
@@ -109,6 +110,22 @@ class TestRasterConfigValidation:
         assert bands["red"]["fill_value"] == 0
         assert bands["scl"]["attrs"] == {}
 
+    def test_sample_concurrency_default_and_override(self):
+        assert _sample_concurrency(_raster_config()) == 4  # issue #231 default
+        cfg = _raster_config()
+        cfg.data_source["sample_concurrency"] = 8
+        assert _sample_concurrency(cfg) == 8
+
+    def test_sample_concurrency_rejected(self):
+        for bad in (0, -1, True, 2.0):
+            cfg = _raster_config()
+            cfg.data_source["sample_concurrency"] = bad
+            with pytest.raises(ValueError, match="sample_concurrency"):
+                validate_config(cfg)
+            # The worker helper re-checks with the same guard (hand-rolled payload).
+            with pytest.raises(ValueError, match="sample_concurrency"):
+                _sample_concurrency(cfg)
+
 
 class TestRasterTimeIndex:
     def test_time_key_groups_adjacent_tiles(self):
@@ -139,6 +156,58 @@ class TestRasterTimeIndex:
     def test_missing_datetime_raises(self):
         with pytest.raises(ValueError, match="no datetime"):
             raster_time_index([[{"id": "bad", "assets": {"red": "x"}}]])
+
+
+class _FakeGrid:
+    """Minimal grid for the sampling-concurrency test: only ``children`` is
+    touched on the single-item-per-group path (no ownership combine)."""
+
+    def __init__(self, n_cells):
+        self._n = n_cells
+
+    def children(self, shard_key):
+        return np.arange(self._n)
+
+
+class TestSampleConcurrency:
+    def test_semaphore_bounds_in_flight_groups(self, monkeypatch):
+        # N single-item acquisition groups sampled under Semaphore(K): each
+        # group is one ``sample_item_async`` call, so concurrent calls track
+        # concurrent timesteps. An instrumented fake records the peak, which
+        # must be capped at K yet actually reach K (issue #231: the cap bounds
+        # memory without serializing the fan-out).
+        import asyncio as _asyncio
+
+        from zagg.processing import raster as raster_mod
+
+        n_cells, n_groups, k = 8, 10, 3
+        state = {"cur": 0, "max": 0}
+        lock = _asyncio.Lock()
+
+        async def _fake_sample_item(
+            grid, cells, assets, bands, *, nodata=None, region=None, anonymous=True
+        ):
+            async with lock:
+                state["cur"] += 1
+                state["max"] = max(state["max"], state["cur"])
+            await _asyncio.sleep(0.02)
+            async with lock:
+                state["cur"] -= 1
+            n = len(cells)
+            return {f: np.zeros(n, dtype=np.uint16) for f in bands}, np.ones(n, bool), (0.0, 0.0)
+
+        monkeypatch.setattr(raster_mod, "sample_item_async", _fake_sample_item)
+
+        cfg = _raster_config(bands={"red": {"asset": "red", "dtype": "uint16"}}, nodata=None)
+        cfg.data_source["sample_concurrency"] = k
+        granules = [
+            _entry(f"g{i}", {"red": f"r{i}.tif"}, T0, time_key=f"dt-{i}") for i in range(n_groups)
+        ]
+        index, _ = raster_time_index([granules])
+        slabs, meta = process_raster_shard(_FakeGrid(n_cells), 0, granules, cfg, index)
+        assert meta["timesteps"] == n_groups
+        assert set(slabs) == set(range(n_groups))
+        assert state["max"] == k  # bounded by K, and the fan-out reaches K
 
 
 def _rect_grid(bounds, chunk):

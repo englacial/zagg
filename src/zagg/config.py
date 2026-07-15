@@ -625,6 +625,20 @@ def _validate_raster_config(config: PipelineConfig) -> None:
     nodata = config.data_source.get("nodata")
     if nodata is not None and (not isinstance(nodata, (int, float)) or isinstance(nodata, bool)):
         raise ValueError(f"data_source.nodata must be a number (got {nodata!r})")
+    # Optional sampling-concurrency cap (issue #231): how many acquisition
+    # groups (timesteps) sample concurrently per shard. Mirrors the
+    # read_workers/granule_workers guard so a config typo is rejected at
+    # submission, not swallowed inside the worker's event loop. Default 4
+    # (``process_raster.raster._sample_concurrency``); ``1`` is serial.
+    sample_concurrency = config.data_source.get("sample_concurrency")
+    if sample_concurrency is not None and (
+        isinstance(sample_concurrency, bool)
+        or not isinstance(sample_concurrency, int)
+        or sample_concurrency < 1
+    ):
+        raise ValueError(
+            f"data_source.sample_concurrency must be an integer >= 1 (got {sample_concurrency!r})"
+        )
     grid = config.output.get("grid")
     if not isinstance(grid, dict) or grid.get("type") != "healpix":
         raise ValueError(
