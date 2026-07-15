@@ -890,7 +890,19 @@ def _handle_process_raster(event: Dict[str, Any]) -> Dict[str, Any]:
         shard_key = int(event["shard_key"])
         time_index = {k: int(v) for k, v in event["time_index"].items()}
         source = config.data_source or {}
-        slabs, meta = process_raster_shard(
+
+        # Stream the slabs: open the store up front and write + free each
+        # timestep's slab as ``process_raster_shard`` completes its acquisition
+        # group, so peak output memory holds ~1 slab instead of all T (issue
+        # #231) — parity with the local RasterStrategy's per-shard streaming.
+        store = open_store(event["store_path"], **_output_store_kwargs(event))
+        wrote = {"any": False}
+
+        def _write_slab(t_idx: int, slab: dict) -> None:
+            write_raster_slab(store, grid, shard_key, t_idx, slab)
+            wrote["any"] = True
+
+        _slabs, meta = process_raster_shard(
             grid,
             shard_key,
             event["granules"],
@@ -898,12 +910,9 @@ def _handle_process_raster(event: Dict[str, Any]) -> Dict[str, Any]:
             time_index,
             region=source.get("source_region"),
             anonymous=source.get("anonymous", True),
+            on_slab=_write_slab,
         )
-
-        store = open_store(event["store_path"], **_output_store_kwargs(event))
-        for t_idx, slab in slabs.items():
-            write_raster_slab(store, grid, shard_key, t_idx, slab)
-        if slabs:
+        if wrote["any"]:
             write_raster_coords(store, grid, shard_key)
 
         body = {
@@ -913,7 +922,7 @@ def _handle_process_raster(event: Dict[str, Any]) -> Dict[str, Any]:
             "skipped": meta["skipped"],
             # The shared summary accumulators key on these two names: a raster
             # shard's observation tally is its shard x timestep slab count.
-            "cells_with_data": grid.cells_per_shard if slabs else 0,
+            "cells_with_data": grid.cells_per_shard if wrote["any"] else 0,
             "total_obs": meta["timesteps"],
             "duration_s": time.time() - start_time,
         }

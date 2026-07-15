@@ -117,6 +117,52 @@ class TestProcessRasterMode:
             np.asarray(grid.encode_cell_ids(cells), dtype=np.uint64),
         )
 
+    def test_handler_streams_slabs_incrementally(self, handler_mod, raster_event, monkeypatch):
+        # The handler must write + free each timestep's slab as it completes
+        # (issue #231), not accumulate all T then loop. A fake worker drives the
+        # on_slab sink per timestep and tracks how many slabs are live at each
+        # write: exactly one, proving write-then-free rather than accumulate.
+        import zagg.processing.raster as raster_mod
+
+        event, grid, _data = raster_event
+        n_time = 3
+        live = {"cur": 0, "max": 0}
+        writes = []
+        coords_calls = []
+
+        def _fake_process(grid_, shard_key, granules, config, time_index, *, on_slab=None, **kw):
+            assert on_slab is not None  # handler must pass a sink (stream, not buffer)
+            for t in range(n_time):
+                slab = {"red": np.zeros(grid_.cells_per_shard, dtype=np.uint16)}
+                live["cur"] += 1
+                live["max"] = max(live["max"], live["cur"])
+                on_slab(t, slab)  # handler writes here; the slab is dropped next loop
+                live["cur"] -= 1
+            return {}, {
+                "shard_key": int(shard_key),
+                "granule_count": 1,
+                "skipped": 0,
+                "timesteps": n_time,
+            }
+
+        monkeypatch.setattr(raster_mod, "process_raster_shard", _fake_process)
+        monkeypatch.setattr(
+            raster_mod, "write_raster_slab", lambda store, g, sk, t, slab: writes.append(t)
+        )
+        monkeypatch.setattr(
+            raster_mod, "write_raster_coords", lambda *a, **k: coords_calls.append(1)
+        )
+
+        resp = handler_mod.lambda_handler(event, MagicMock())
+        assert resp["statusCode"] == 200, resp
+        assert writes == [0, 1, 2]  # one write per timestep, in stream order
+        assert live["max"] == 1  # never more than one slab alive
+        assert coords_calls == [1]  # coords written once, after the slabs
+        body = json.loads(resp["body"])
+        assert body["timesteps"] == n_time
+        assert body["cells_with_data"] == grid.cells_per_shard
+        assert body["total_obs"] == n_time
+
     def test_missing_params_400(self, handler_mod):
         resp = handler_mod.lambda_handler({"mode": "process_raster"}, MagicMock())
         assert resp["statusCode"] == 400
