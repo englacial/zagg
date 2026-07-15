@@ -346,15 +346,16 @@ class TestFromConfig:
         assert g.chunks_per_shard == 1
         assert g.sharded is False
 
-    def test_sharded_default_off_for_hive(self, cfg):
-        # issue #215: hive is inherently unsharded (each leaf is a vanilla zarr v3
-        # store — D3), so the sharded default stays False there even at K>1,
-        # matching validate_config's hive+sharded rejection.
+    def test_sharded_default_on_for_hive(self, cfg):
+        # issue #236: hive defaults sharded, same as flat — a leaf's dense
+        # arrays collapse to one ShardingCodec object each instead of K
+        # per-inner-chunk objects PUT onto a single leaf prefix. (The #215
+        # hive carve-out is gone; explicit sharded:false still opts out.)
         cfg.output["grid"]["chunk_inner"] = 8
         cfg.output["store_layout"] = "hive"
         g = from_config(cfg, parent_order=6)
         assert g.chunks_per_shard > 1
-        assert g.sharded is False
+        assert g.sharded is True
 
     def test_sharded_flag_threads_through(self, cfg):
         # sharded on the grid block, with chunk_inner giving K>1, yields a sharded grid.

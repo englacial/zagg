@@ -70,10 +70,20 @@ class TestStoreLayoutConfig:
         with pytest.raises(ValueError, match="healpix"):
             validate_config(cfg)
 
-    def test_hive_rejects_sharded(self, cfg):
+    def test_hive_accepts_sharded(self, cfg):
+        # issue #236: the ShardingCodec IS vanilla zarr v3, so a sharded leaf
+        # stays self-describing (D3) — hive + sharded validates and writes.
         cfg.output["store_layout"] = "hive"
         cfg.output.setdefault("grid", {})["sharded"] = True
-        with pytest.raises(ValueError, match="sharded"):
+        validate_config(cfg)
+
+    def test_hive_rejects_shard_order(self, cfg):
+        # The issue #133 object split is flat-only: a hive leaf's arrays are
+        # one whole-leaf object each, so shard_order would be silently ignored.
+        cfg.output["store_layout"] = "hive"
+        cfg.output.setdefault("grid", {})["chunk_inner"] = 8
+        cfg.output["grid"]["shard_order"] = 7
+        with pytest.raises(ValueError, match="shard_order"):
             validate_config(cfg)
 
     def test_hive_rejects_consolidate_metadata(self, cfg):
@@ -257,10 +267,18 @@ class TestLeafTemplateAndStamp:
         g.emit_shard_template(store, overwrite=True)
         g.emit_shard_template(store, overwrite=True)  # retry over debris
 
-    def test_sharded_grid_rejected(self, cfg):
+    def test_sharded_leaf_template_shards_whole_leaf(self, cfg):
+        # issue #236: a sharded grid's leaf template wraps every dense array in
+        # a ShardingCodec whose outer chunk spans the WHOLE leaf (one object per
+        # array, written at leaf block 0); the inner read chunk is unchanged.
         g = HealpixGrid(6, 10, layout="fullsphere", config=cfg, chunk_inner=8, sharded=True)
-        with pytest.raises(ValueError, match="sharded"):
-            g.emit_shard_template(MemoryStore())
+        store = MemoryStore()
+        g.emit_shard_template(store, overwrite=True)
+        grp = zarr.open_group(store, path=g.group_path, mode="r", zarr_format=3)
+        for name in ("morton", "cell_ids", *get_data_vars(cfg)):
+            assert grp[name].shape == (g.cells_per_shard,)
+            assert grp[name].shards == (g.cells_per_shard,)
+            assert grp[name].chunks == (g.cells_per_chunk,)
 
     def test_stamp_round_trip_and_debris_semantics(self, cfg):
         store = MemoryStore()

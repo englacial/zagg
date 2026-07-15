@@ -613,13 +613,12 @@ class HealpixGrid:
         :meth:`emit_template` but with every dense array sized to a single
         shard (``cells_per_shard`` cells, K inner chunks) and a ROOT group so
         the D4 commit stamp is one attrs update on an object that exists
-        anyway. Writes go at leaf-LOCAL block indices (0..K-1).
+        anyway. Writes go at leaf-LOCAL block indices (0..K-1); when
+        ``sharded`` (issue #236) each dense array is instead ONE ShardingCodec
+        object spanning the whole leaf, written at leaf block 0 — the
+        ShardingCodec is vanilla zarr v3, so the leaf stays self-describing
+        (D3), same as the ragged field's sharded vlen array (issue #209).
         """
-        if self.sharded:
-            # Validated at config load too; re-checked here because a leaf is a
-            # vanilla zarr v3 store (D3) — the ShardingCodec write path assumes
-            # the single shared store.
-            raise ValueError("hive leaf templates do not support sharded output")
         spec = GroupSpec(members={self.group_path: self.shard_spec()}, attributes={})
         # Ragged vlen-array creation warns about the dtype NAME only
         # (zarr-python#3517); message-scoped suppression, see grids.base.
@@ -637,8 +636,12 @@ class HealpixGrid:
         Identical member set to :meth:`spec` — same dtypes, fills, chunking —
         with the cells axis sized to one shard and the ``resolution: chunk``
         companions sized to the shard's K inner chunks. The one deliberate
-        difference (``leaf=True``): a ragged field's vlen array shards across
-        the whole leaf, so a shard's digest is ONE object (issue #209).
+        difference (``leaf=True``): sharded arrays shard across the WHOLE
+        leaf — a ragged field's vlen array always (issue #209), the dense
+        per-cell arrays when ``sharded`` (issue #236) — so each is ONE object
+        per leaf. The issue #133 object split (``shard_order``) never applies
+        to a leaf: it exists to bound flat-path slab memory, and a leaf's
+        dense payload is MB-scale.
         """
         return self._group_spec(self.cells_per_shard, (self.chunks_per_shard,), leaf=True)
 
@@ -688,7 +691,12 @@ class HealpixGrid:
             # 8): ``cells_per_shard_object`` cells, which is ``cells_per_shard`` (the
             # whole dispatch shard) at the default ``shard_order`` and SMALLER when a
             # finer ``shard_order`` is set. The inner read chunk is unchanged.
-            shard = (self.cells_per_shard_object, *inner[1:])
+            # A hive LEAF (issue #236) always shards across the whole leaf — one
+            # object per dense array, written at leaf block 0 — never the object
+            # split (``write_leaf_to_zarr`` assumes it; ``validate_config`` rejects
+            # hive + shard_order).
+            cells = self.cells_per_shard if leaf else self.cells_per_shard_object
+            shard = (cells, *inner[1:])
             return sharded_array_spec(arr, shard_shape=shard, inner_chunk_shape=inner)
 
         members = {}
@@ -718,18 +726,19 @@ class HealpixGrid:
                         "inner_chunk_shape": (1,),
                     }
                 else:
-                    # The ShardingCodec outer chunk mirrors the dense arrays
+                    # A hive LEAF shards the ragged field across the whole
+                    # leaf (sharded or not) so a shard's digest is ONE object
+                    # (issue #209) — same whole-leaf geometry the dense arrays
+                    # take when ``sharded`` (issue #236). On the FLAT layout
+                    # the ShardingCodec outer chunk mirrors the dense arrays
                     # when ``sharded`` (the issue #133 object split included);
-                    # a hive LEAF (unsharded, K inner chunks in one
-                    # self-describing store) shards the ragged field across
-                    # the whole leaf so a shard's digest is ONE object. The
-                    # unsharded FLAT layout stays a regular array (one object
-                    # per inner chunk — the streaming per-chunk write must not
-                    # read-modify-write a shared shard object).
-                    if self.sharded:
-                        rag_shard: tuple | None = (self.cells_per_shard_object,)
-                    elif leaf and self.chunks_per_shard > 1:
-                        rag_shard = (self.cells_per_shard,)
+                    # the unsharded flat layout stays a regular array (one
+                    # object per inner chunk — the streaming per-chunk write
+                    # must not read-modify-write a shared shard object).
+                    if leaf and self.chunks_per_shard > 1:
+                        rag_shard: tuple | None = (self.cells_per_shard,)
+                    elif not leaf and self.sharded:
+                        rag_shard = (self.cells_per_shard_object,)
                     else:
                         rag_shard = None
                     rag_kw = {
