@@ -8,12 +8,13 @@ and the shipped ``sentinel2_l2a`` template config.
 import numpy as np
 import pytest
 from pyproj import CRS, Transformer
-from test_raster import ORIGIN, TRANSFORM, UTM18, _index_raster, _write_tiff
+from test_raster import ORIGIN, RES, TRANSFORM, UTM18, _index_raster, _write_tiff
 from zarr import open_array
+from zarr.errors import ContainsGroupError
 
 from zagg.catalog.shardmap import ShardMap
 from zagg.config import default_config, load_config_from_dict, validate_config
-from zagg.grids import from_config
+from zagg.grids import HealpixGrid, from_config
 from zagg.runner import agg
 
 T0 = "2026-07-13T16:02:20+00:00"
@@ -44,13 +45,18 @@ def _cfg(tmp_path):
     )
 
 
-def _shard_for_raster():
+def _shard_for_raster_at(dx):
+    """Order-10 shard covering a 96x96 raster whose origin is offset ``dx`` m east."""
     from mortie import clip2order, geo2mort
 
     to_wgs = Transformer.from_crs(CRS(UTM18), CRS("EPSG:4326"), always_xy=True)
-    lon, lat = to_wgs.transform(ORIGIN[0] + 480.0, ORIGIN[1] - 480.0)
+    lon, lat = to_wgs.transform(ORIGIN[0] + dx + 480.0, ORIGIN[1] - 480.0)
     leaf = geo2mort(np.array([lat]), np.array([lon]), order=29, points=True)
     return int(clip2order(10, leaf)[0])
+
+
+def _shard_for_raster():
+    return _shard_for_raster_at(0.0)
 
 
 def _entry(gid, href, dt, time_key):
@@ -112,6 +118,101 @@ class TestRasterAgg:
             store_path + f"/{grid.group_path}/time", zarr_format=3, consolidated=False
         )
         assert tarr.shape == (2,) and tarr[0] < tarr[1]
+
+    def test_multi_shard_disjoint_slabs(self, tmp_path):
+        # Two rasters ~7 km apart feed two DISTINCT order-10 shards in one run;
+        # each shard must read back its OWN values at its OWN cell range. A
+        # block_index/cells_per_shard off-by-one would surface one shard's DNs
+        # in the other's range and fail here (the single-shard fixture can't
+        # catch it — there is only one block).
+        cfg = _cfg(tmp_path)
+        data0 = _index_raster()
+        _write_tiff(tmp_path / "s0.tif", data0)
+        data1 = np.full((96, 96), 777, dtype=np.uint16)
+        _write_tiff(tmp_path / "s1.tif", data1, origin=(ORIGIN[0] + 7000.0, ORIGIN[1]))
+        shard0 = _shard_for_raster_at(0.0)
+        shard1 = _shard_for_raster_at(7000.0)
+        assert shard0 != shard1
+        grid = from_config(cfg, populated_shards=[shard0, shard1])
+        sm = ShardMap(
+            grid.spatial_signature(),
+            [shard0, shard1],
+            [
+                [_entry("g0", str(tmp_path / "s0.tif"), T0, "dt-1")],
+                [_entry("g1", str(tmp_path / "s1.tif"), T0, "dt-1")],
+            ],
+            {"collection": "s2-test"},
+        )
+        path = str(tmp_path / "sm2.json")
+        sm.to_json(path)
+
+        summary = agg(cfg, catalog=path, backend="local", max_workers=2)
+        assert summary["total_cells"] == 2
+        assert summary["cells_with_data"] == 2
+        assert summary["cells_error"] == 0
+        assert summary["timesteps"] == 1  # one shared datatake
+        assert summary["total_obs"] == 2  # two shard x timestep slabs written
+
+        from zagg.processing.raster import _shard_cell_range
+
+        store_path = cfg.output["store"]
+        red = open_array(store_path + f"/{grid.group_path}/red", zarr_format=3, consolidated=False)
+        transform1 = (RES, 0.0, ORIGIN[0] + 7000.0, 0.0, -RES, ORIGIN[1])
+        for shard, data, transform in (
+            (shard0, data0, TRANSFORM),
+            (shard1, data1, transform1),
+        ):
+            cells = grid.children(shard)
+            rows, cols, valid = grid.sample(cells, UTM18, transform, (96, 96))
+            assert valid.any()
+            start, stop = _shard_cell_range(grid, shard)
+            got = red[0, start:stop]
+            np.testing.assert_array_equal(got[valid], data[rows[valid], cols[valid]])
+            assert (got[~valid] == 0).all()
+
+    def test_signature_mismatch_raises(self, tmp_path, manifest):
+        # A ShardMap built under a different grid (parent 9 / child 15) than the
+        # run config (parent 10 / child 16) must be refused by _check_signature.
+        cfg, _sm_path, shard, _data = manifest
+        other = HealpixGrid(9, 15, layout="fullsphere")
+        sm = ShardMap(
+            other.spatial_signature(),
+            [shard],
+            [[_entry("g0", "x.tif", T0, "dt-1")]],
+            {},
+        )
+        path = str(tmp_path / "mismatch.json")
+        sm.to_json(path)
+        with pytest.raises(ValueError, match="different grid"):
+            agg(cfg, catalog=path, backend="local")
+
+    def test_overwrite_and_rerun(self, tmp_path, manifest):
+        # Rerun/overwrite is the only way to add timesteps today. overwrite=True
+        # re-emits the template cleanly (idempotent, then rewrites on a changed
+        # time index); overwrite=False refuses to clobber a store whose template
+        # differs from the run — a silently-different append is exactly what the
+        # single-writer resize path (still future work) must eventually own.
+        cfg, sm_path, shard, _data = manifest
+        agg(cfg, catalog=sm_path, backend="local", max_workers=2, overwrite=True)
+        # A second overwrite=True run over the identical store rewrites cleanly.
+        agg(cfg, catalog=sm_path, backend="local", max_workers=2, overwrite=True)
+
+        # A manifest with a DIFFERENT time index: one datatake instead of two.
+        grid = from_config(cfg, populated_shards=[shard])
+        one = ShardMap(
+            grid.spatial_signature(),
+            [shard],
+            [[_entry("g0", str(tmp_path / "t0.tif"), T0, "dt-1")]],
+            {"collection": "s2-test"},
+        )
+        one_path = str(tmp_path / "one.json")
+        one.to_json(one_path)
+        # overwrite=False over the existing (2-timestep) store refuses to clobber.
+        with pytest.raises(ContainsGroupError):
+            agg(cfg, catalog=one_path, backend="local", max_workers=2, overwrite=False)
+        # overwrite=True with the changed time index rewrites cleanly (1 step).
+        summary = agg(cfg, catalog=one_path, backend="local", max_workers=2, overwrite=True)
+        assert summary["timesteps"] == 1
 
     def test_dry_run(self, manifest):
         cfg, sm_path, _shard, _data = manifest
