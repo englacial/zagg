@@ -137,6 +137,11 @@ jobs:
 
       - name: Commit + push to benchmarks branch
         working-directory: _series
+        # Route the tag through env (never interpolate ${{ }} into the shell body):
+        # a git tag name may contain shell metacharacters and still match the
+        # `*.*.*` trigger, so the message is built from $TAG, not inline expansion.
+        env:
+          TAG: ${{ github.ref_name }}
         run: |
           set -euo pipefail
           git config user.name "github-actions[bot]"
@@ -145,6 +150,6 @@ jobs:
           if git diff --cached --quiet; then
             echo "no full-AOI benchmark changes to commit"
           else
-            git commit -m "full-aoi benchmark: ${{ github.ref_name }}"
+            git commit -m "full-aoi benchmark: $TAG"
             git push origin benchmarks
           fi
