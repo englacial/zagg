@@ -1298,6 +1298,42 @@ class TestProcessEventMode:
         assert resp["statusCode"] == 500
         assert "not_a_reader" in json.loads(resp["body"])["error"]
 
+    def test_input_credentials_channel_routing(self, handler_mod, monkeypatch):
+        # input_credentials covers the mask + statics; s3_credentials covers
+        # only the source collections (issue #223).
+        import zagg.output as output
+        import zagg.temporal as temporal
+
+        event_mask, collections, static = _temporal_inputs()
+        captured = {}
+
+        def _open(uri, **kwargs):
+            captured["mask_kwargs"] = kwargs
+            return event_mask
+
+        def _read(collection_uris, static_uris, **kwargs):
+            captured["reader_kwargs"] = kwargs
+            return collections, static
+
+        monkeypatch.setattr(temporal, "open_dataset", _open)
+        monkeypatch.setattr(temporal, "read_temporal_inputs", _read)
+        monkeypatch.setattr(output, "write_tabular", lambda rows, sp, **k: sp)
+
+        event = _temporal_event(input_credentials="unsigned", return_results=True)
+        del event["store_path"]
+        resp = handler_mod._handle_process_event(event)
+        assert json.loads(resp["body"])["ok"] is True
+        assert captured["mask_kwargs"]["unsigned"] is True
+        assert captured["mask_kwargs"]["credentials"] is None
+        assert captured["reader_kwargs"]["credentials"] == _CREDS
+        assert captured["reader_kwargs"]["input_credentials"] == "unsigned"
+
+    def test_bad_input_credentials_returns_500(self, handler_mod, monkeypatch):
+        self._patch(handler_mod, monkeypatch)
+        resp = handler_mod._handle_process_event(_temporal_event(input_credentials="anonymous"))
+        assert resp["statusCode"] == 500
+        assert "input_credentials" in json.loads(resp["body"])["error"]
+
 
 class TestProcessEventReturnResults:
     """``return_results`` (issue #12, Phase 8): the fan-out driver's contract.

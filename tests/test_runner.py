@@ -2007,7 +2007,7 @@ class TestInvokeLambdaEvent:
         client = self._client()
         result = runner._invoke_lambda_event(
             client,
-            dict(self._EV, s3_credentials={"accessKeyId": "a"}),
+            dict(self._EV, s3_credentials={"accessKeyId": "a"}, input_credentials="unsigned"),
             function_name="process-shard",
             config_dict={"pipeline": {"type": "temporal"}},
             output_creds_event={"accessKeyId": "w"},
@@ -2021,6 +2021,7 @@ class TestInvokeLambdaEvent:
         assert event["config"] == {"pipeline": {"type": "temporal"}}
         assert event["return_results"] is True
         assert event["s3_credentials"] == {"accessKeyId": "a"}
+        assert event["input_credentials"] == "unsigned"
         assert event["output_credentials"] == {"accessKeyId": "w"}
         assert "store_path" not in event  # driver writes; worker must not
         assert client.invoke.call_args.kwargs["InvocationType"] == "RequestResponse"
@@ -2042,6 +2043,7 @@ class TestInvokeLambdaEvent:
         )
         event = json.loads(client.invoke.call_args.kwargs["Payload"])
         assert "s3_credentials" not in event
+        assert "input_credentials" not in event
         assert "output_credentials" not in event
         assert "result_url" not in event
 

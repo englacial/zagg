@@ -47,7 +47,8 @@ inputs, keeping the async payload far under Lambda's 256 KB Event cap:
     "event_mask_uri": "s3://.../masks/storm_00042.nc",
     "collection_uris": {"merra2_slv": ["s3://.../day1.nc4", "s3://.../day2.nc4"]},
     "static_uris": {"ais_mask": "s3://.../ais_mask.nc", "cell_areas": "s3://.../areas.nc"},
-    "s3_credentials": {...},   # optional, per-event read credentials
+    "s3_credentials": {...},          # optional: read creds for the collections
+    "input_credentials": "unsigned",  # optional: mask/statics channel
 }
 ```
 
@@ -58,9 +59,15 @@ inputs, keeping the async payload far under Lambda's 256 KB Event cap:
 - `collection_uris` values: one URI **or a list** — a multi-granule event
   (e.g. a storm spanning several MERRA-2 daily files) is opened per-URI,
   concatenated along `time`, and time-sorted.
-- `s3_credentials`: optional. Events without it receive shared credentials
-  fetched once from the `data_source.credentials_provider` registry name when
-  the config sets one (`nsidc` and `gesdisc` ship as built-ins).
+- `s3_credentials`: optional; covers **only the source collections** it was
+  fetched for. Events without it receive shared credentials fetched once from
+  the `data_source.credentials_provider` registry name when the config sets
+  one (`nsidc` and `gesdisc` ship as built-ins).
+- `input_credentials`: optional; the channel for the **consumer-owned mask and
+  statics** — an explicit creds dict, `"unsigned"` (anonymous requests: the
+  correct mechanism for public buckets, since a request *signed* with scoped
+  source credentials is denied cross-account even where anonymous access is
+  granted), or absent for the worker's execution role.
 
 The full worker payload (mode, config, `return_results`, `result_url`) is
 assembled by the runner — consumers supply only the dicts above.
