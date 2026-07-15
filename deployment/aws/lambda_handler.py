@@ -774,6 +774,15 @@ def _handle_process_event(event: Dict[str, Any]) -> Dict[str, Any]:
         if mask_vars:
             event_mask = event_mask[mask_vars[0]]
 
+        # The mask is open, so the event extent is known before any collection
+        # read: the reader subsets + loads each granule to it and frees the
+        # buffer, bounding peak memory to ~one granule (issue #225 -- a 4 GB
+        # worker OOMs holding whole granules for every collection at once).
+        extent = None
+        coords = getattr(event_mask, "coords", {})
+        if "lat" in coords and "lon" in coords:
+            extent = (event_mask["lat"].values, event_mask["lon"].values)
+
         # The reader resolves by name (issue #213 Phase 3): only names present
         # in the layer's registry are reachable -- the payload stays pure data.
         reader = zagg_registry.get_reader((config.data_source or {}).get("reader") or "xarray_s3")
@@ -784,6 +793,7 @@ def _handle_process_event(event: Dict[str, Any]) -> Dict[str, Any]:
             region=region,
             collection_options=_collection_options(config),
             input_credentials=event.get("input_credentials"),
+            extent=extent,
         )
 
         results, meta = process_event(event_key, event_mask, collections, specs, static_data)
