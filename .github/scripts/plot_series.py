@@ -382,13 +382,28 @@ def _matrix_layout(hist: pd.DataFrame) -> tuple[list[list[str | None]], int, int
     return grid, len(MATRIX_ROWS), len(MATRIX_COLS)
 
 
-def _draw_panel(ax, sub: pd.DataFrame, cost_col: str, cost_label: str, norm) -> None:
-    """Draw one cost+runtime panel for a single target's merge history.
+def _draw_panel(
+    ax,
+    sub: pd.DataFrame,
+    cost_col: str,
+    cost_label: str,
+    norm,
+    *,
+    runtime_col: str = "runtime_s",
+    runtime_label: str = "runtime (s)",
+    label_col: str = "commit",
+    label_len: int | None = 7,
+) -> None:
+    """Draw one cost+runtime panel for a single target's history.
 
-    Shared by the frozen figure (``make_figure``) and the codec figure
-    (``make_codec_figure``) so both render points identically -- memory-coloured
-    cost markers (left axis), hollow-circle runtime (right axis), failed runs
-    (zero) broken out of the line and flagged with an 'x' near the floor.
+    Shared by the frozen figure (``make_figure``), the codec figure
+    (``make_codec_figure``), the live matrix, and the per-release full-AOI figure
+    so they render points identically -- memory-coloured cost markers (left axis),
+    hollow-circle runtime (right axis), failed runs (zero) broken out of the line
+    and flagged with an 'x' near the floor. The per-release full-AOI figure varies
+    the right-axis series (``total_wall_s``) and the x labels (release ``ref``, not
+    a commit sha) via ``runtime_col`` / ``label_col`` / ``label_len``; the defaults
+    keep the per-merge callers byte-identical.
     """
     xs = list(range(len(sub)))
 
@@ -436,9 +451,10 @@ def _draw_panel(ax, sub: pd.DataFrame, cost_col: str, cost_label: str, norm) -> 
     if xs:  # pin the x-range to every merge so a failed last/first run
         ax.set_xlim(xs[0] - 0.5, xs[-1] + 0.5)  # (drawn in axes-y) stays visible
 
-    # Label every panel with its own commits; the upper rows have the
+    # Label every panel with its own x identity (commit sha for the merge
+    # figures, release tag for the full-AOI figure); the upper rows have the
     # labels hidden afterwards, so only the bottom row shows them.
-    labels = [str(cm)[:7] for cm in sub["commit"]]
+    labels = [(str(cm)[:label_len] if label_len else str(cm)) for cm in sub[label_col]]
     ax.set_xticklabels(labels, rotation=45, ha="right", fontsize=7)
 
     # Runtime on the right axis: hollow circles (not filled squares) so
@@ -446,7 +462,7 @@ def _draw_panel(ax, sub: pd.DataFrame, cost_col: str, cost_label: str, norm) -> 
     # axis is drawn after ``ax``, so raise ``ax`` above it and drop
     # ``ax``'s opaque patch -- otherwise the runtime glyph sits on top of
     # the cost circles. Zero runtimes break the line the same way.
-    runtime = sub["runtime_s"].to_numpy(dtype=float)
+    runtime = sub[runtime_col].to_numpy(dtype=float)
     rt_line = [v if v != 0 else float("nan") for v in runtime]
     rt = ax.twinx()
     rt.plot(
@@ -456,9 +472,9 @@ def _draw_panel(ax, sub: pd.DataFrame, cost_col: str, cost_label: str, norm) -> 
         marker="o",
         markerfacecolor="none",
         color="C1",
-        label="runtime (s)",
+        label=runtime_label,
     )
-    rt.set_ylabel("runtime (s)", color="C1")
+    rt.set_ylabel(runtime_label, color="C1")
     rt.tick_params(axis="y", labelcolor="C1")
     ax.set_zorder(rt.get_zorder() + 1)
     ax.patch.set_visible(False)
@@ -473,13 +489,20 @@ def _render_panel_grid(
     cost_label: str,
     suptitle: str,
     out_png: Path,
+    *,
+    runtime_col: str = "runtime_s",
+    runtime_label: str = "runtime (s)",
+    label_col: str = "commit",
+    label_len: int | None = 7,
 ) -> bool:
     """Render a per-target grid of cost+runtime panels from ``layout`` + write it.
 
-    The shared body of ``make_figure`` (frozen series) and ``make_codec_figure``
-    (the 2x3 sharded-vs-inner matrix): same colour scale, colorbar (with the MB
-    twin axis), per-panel draw, and bottom-row-only commit labels. ``layout`` (and
-    its ``nrows``/``ncols``) is the only thing the two callers vary.
+    The shared body of ``make_figure`` (frozen series), ``make_codec_figure`` (the
+    2x3 sharded-vs-inner matrix), the live matrix, and the per-release full-AOI
+    figure: same colour scale, colorbar (with the MB twin axis), per-panel draw,
+    and bottom-row-only x labels. ``layout`` (and its ``nrows``/``ncols``) plus the
+    right-axis / x-label overrides (forwarded to :func:`_draw_panel`) are the only
+    things the callers vary.
     """
     import matplotlib
 
@@ -521,7 +544,17 @@ def _render_panel_grid(
                 ax.axis("off")
                 continue
             sub = hist[hist["target"] == target]
-            _draw_panel(ax, sub, cost_col, cost_label, norm)
+            _draw_panel(
+                ax,
+                sub,
+                cost_col,
+                cost_label,
+                norm,
+                runtime_col=runtime_col,
+                runtime_label=runtime_label,
+                label_col=label_col,
+                label_len=label_len,
+            )
             ax.set_title(target, fontsize=10)
 
     # Keep commit labels only on the bottom-most populated panel of each column;
@@ -642,17 +675,43 @@ def make_codec_figure(df: pd.DataFrame, cost_col: str, cost_label: str, out_png:
 # shard, recorded per release for cost-truth (all shards, real dollar total), not
 # on every merge. The two are deliberately split (see docs/deployment/benchmark.md).
 #
-# The full-AOI run harness + its recorded schema are another agent's deliverable
-# (issue #202 leg 1; the pinned full-AOI targets land in targets_full_aoi_neon.json,
-# NOT owned here). This is the render side: a skeleton kept next to the per-merge
-# renderers so the plot lands the moment leg 1's output schema is fixed.
+# This figure is rendered from a SEPARATE parquet (full_aoi_series.parquet, written
+# by full_aoi_series.py) rather than the per-merge series, because the whole-AOI run
+# record schema differs (n_shards, whole-AOI cost_usd, total_wall_s). Same 2x2 layout
+# as the live matrix (inline/sidecar x AOI-mask), but each panel is the whole-AOI
+# total (not a single shard) across RELEASES -- release tag on the x-axis.
 
-# The columns the per-release full-AOI figure will chart once leg 1's schema lands
-# (release tag on the x-axis, these on the y). Provisional -- reconcile with leg 1.
-FULL_AOI_METRICS = {
-    "cost_total": ("total cost (USD)", "whole-AOI dollar total across all shards"),
-    "runtime_wall": ("wall time (s)", "end-to-end AOI dispatch wall"),
+# Full-AOI figure name -> (series column, human label). Mirrors FIGURES (per-merge)
+# but at release cadence: the whole-AOI dollar total, and the AOI-AVERAGE cost per
+# 100 km^2 (total cost / total AOI area) -- the honest "average shard" figure the
+# single densest-shard matrix can't show (its cost/100 km^2 is the worst shard).
+FULL_AOI_FIGURES = {
+    "full_aoi_cost_total": ("cost_usd", "whole-AOI cost (USD)"),
+    "full_aoi_cost_per_100km2": ("cost_per_100km2_usd", "AOI-avg cost / 100 km² (USD)"),
 }
+
+
+def _full_aoi_history(df: pd.DataFrame) -> pd.DataFrame:
+    """Retained per-release rows of the full-AOI series, oldest release first.
+
+    The series is release-only by construction (full_aoi_series retains
+    ``event == "release"``), but we re-filter defensively and derive the
+    AOI-average ``cost_per_100km2_usd`` = ``cost_usd`` * 100 / (n_shards *
+    shard_area_km2) -- the whole-AOI cost spread over the whole AOI area, the
+    average-shard figure. Rows without the area inputs get a NaN there (the panel
+    then simply skips that metric)."""
+    if df.empty or "target" not in df.columns:
+        return df
+    hist = df.copy()
+    if "event" in hist.columns:
+        hist = hist[hist["event"] == "release"]
+    hist = hist.dropna(subset=["target"])
+    if hist.empty:
+        return hist
+    area = hist["n_shards"] * hist["shard_area_km2"]
+    hist["cost_per_100km2_usd"] = (hist["cost_usd"] * 100.0 / area).where(area > 0)
+    sort_col = "timestamp" if "timestamp" in hist.columns else "commit"
+    return hist.sort_values(sort_col).reset_index(drop=True)
 
 
 def make_full_aoi_release_figure(
@@ -661,18 +720,29 @@ def make_full_aoi_release_figure(
     """Render the PER-RELEASE full-AOI NEON figure (issue #202 leg 1).
 
     Unlike the per-merge live matrix (one densest shard/target), this charts the
-    whole-AOI cost/runtime truth once per release, x-axis = release tag.
-
-    TODO(issue #202 leg 1): wire to the full-AOI harness output. Blocked on that
-    agent's recorded schema (the per-release full-AOI records + their pinned
-    targets in ``targets_full_aoi_neon.json``, owned by leg 1). Once the schema is
-    fixed, this should: (1) select the per-release full-AOI rows from ``df`` (an
-    ``event == "release"`` / ``run == "full_aoi"`` discriminator, TBD by leg 1),
-    (2) lay out one panel per ``FULL_AOI_METRICS`` entry, and (3) reuse
-    ``_render_panel_grid``'s cost+runtime panel style with the release tag on the
-    x-axis instead of the commit. Returns False until then so ``main`` skips it
-    and the Pages index simply omits the section (no broken image)."""
-    return False
+    whole-AOI cost/runtime truth once per release, x-axis = release tag. Same 2x2
+    ``MATRIX_ROWS x MATRIX_COLS`` layout (inline/sidecar x AOI-mask) as the live
+    matrix, wall time (``total_wall_s``) on the right axis. Returns False (writing
+    nothing) when no full-AOI release rows are retained yet, so ``main`` / the Pages
+    index simply omit the section (no broken image)."""
+    hist = _full_aoi_history(df)
+    if hist.empty or hist["target"].dropna().empty:
+        return False
+    layout, nrows, ncols = _matrix_layout(hist)
+    return _render_panel_grid(
+        hist,
+        layout,
+        nrows,
+        ncols,
+        cost_col,
+        cost_label,
+        f"zagg full-AOI NEON (all shards) — {cost_label} vs release",
+        out_png,
+        runtime_col="total_wall_s",
+        runtime_label="wall (s)",
+        label_col="ref",
+        label_len=None,
+    )
 
 
 def write_index(
@@ -708,6 +778,24 @@ def write_index(
         f'<img src="{name}_matrix.png" alt="{name}_matrix">'
         for name in matrix_rendered
     ]
+
+    # --- per-release full-AOI NEON section (issue #202 leg 1) ---
+    # Keyed on the PNGs existing on disk (like the archived section below), not on
+    # whether THIS run rendered them, so the section persists across both the
+    # per-merge and per-release workflows (each re-renders only its own figures).
+    full_aoi = [
+        f'<h3>{label}</h3>\n<img src="{name}.png" alt="{name}">'
+        for name, (_col, label) in FULL_AOI_FIGURES.items()
+        if (outdir / f"{name}.png").exists()
+    ]
+    if full_aoi:
+        blocks.append(
+            "<hr>\n<h2>Per-release full-AOI NEON (all shards)</h2>\n"
+            "<p>The whole AOP_NEON box fanned over every shard, recorded per "
+            "release for dollar-cost truth (release tag on the x-axis) \u2014 the "
+            "complement to the per-merge single-densest-shard matrix above.</p>"
+        )
+        blocks += full_aoi
 
     # --- archived section (below): retained frozen PNGs, embedded if present ---
     archived: list[str] = []
@@ -758,6 +846,12 @@ def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="Render benchmark Pages charts from the series.")
     parser.add_argument("--series", required=True, help="Path to the retained parquet series")
     parser.add_argument("--out", required=True, help="Output directory (Pages site)")
+    parser.add_argument(
+        "--full-aoi-series",
+        default=None,
+        help="Path to the per-release full-AOI parquet (full_aoi_series.parquet); "
+        "renders the per-release full-AOI figures when present",
+    )
     args = parser.parse_args(argv)
 
     outdir = Path(args.out)
@@ -779,6 +873,16 @@ def main(argv: list[str] | None = None) -> int:
     has_md = not matrix_df.empty and write_latest_markdown(matrix_df, outdir / "latest.md")
     has_json = not matrix_df.empty and write_latest_metrics(matrix_df, outdir / "metrics.json")
 
+    # Per-release full-AOI figures (issue #202 leg 1), from the separate series.
+    full_aoi_rendered: list[str] = []
+    fa_path = args.full_aoi_series
+    fa_df = pd.read_parquet(fa_path) if fa_path and Path(fa_path).exists() else pd.DataFrame()
+    for name, (col, label) in FULL_AOI_FIGURES.items():
+        if not fa_df.empty and make_full_aoi_release_figure(
+            fa_df, col, label, outdir / f"{name}.png"
+        ):
+            full_aoi_rendered.append(name)
+
     write_index(
         outdir,
         matrix_rendered,
@@ -795,9 +899,10 @@ def main(argv: list[str] | None = None) -> int:
         )
         if ok
     ]
+    fa_note = f" + {len(full_aoi_rendered)} full-AOI release figure(s)" if full_aoi_rendered else ""
     print(
         f"rendered {len(matrix_rendered)} matrix figure(s)"
-        f"{' + ' + ', '.join(extras) if extras else ''} -> {outdir} "
+        f"{' + ' + ', '.join(extras) if extras else ''}{fa_note} -> {outdir} "
         "(codec + frozen tiers archived, not regenerated)"
     )
     return 0

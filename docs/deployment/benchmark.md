@@ -57,14 +57,32 @@ companions instead of scraping the image:
 The complementary **per-release** series: the whole `AOP_NEON` box fanned over
 **every** shard (not just the densest one), recorded once per release, for the
 real dollar-cost total the single-shard matrix can't show. This is cost *truth*,
-where the per-merge matrix is a code-drift *regression* tracker.
+where the per-merge matrix is a code-drift *regression* tracker. It runs on a
+version tag (`push: tags '*.*.*'`, `lambda-benchmark-fullaoi.yml`) — the whole AOI
+dispatched to the stable production function, appended to `full_aoi_series.parquet`
+on the `benchmarks` branch and rendered here. The same 2×2 axes as the live matrix
+(inline/sidecar × AOI-mask), but each panel is the whole-AOI total across
+**releases** (release tag on the x-axis), not one shard across merges.
 
-> **Skeleton — pending leg 1.** The full-AOI run harness and its pinned targets
-> (`targets_full_aoi_neon.json`) are a separate deliverable (issue #202 leg 1). The
-> render side is staged: `plot_series.make_full_aoi_release_figure` returns `False`
-> (renders nothing) until leg 1's recorded schema is fixed, so the Pages index
-> simply omits this section for now. When the schema lands, this section will embed
-> the per-release full-AOI cost + wall-time chart (release tag on the x-axis) here.
+Two views, mirroring the live matrix's cost columns:
+
+- **Whole-AOI cost (USD)** — the real dollar total across every shard.
+- **AOI-average cost / 100 km²** — that total spread over the whole AOI area
+  (`cost_usd × 100 / (n_shards × shard_area_km²)`). This is the *average*-shard
+  figure; the live matrix's cost/100 km² is the *densest* shard (worst case), so
+  this one runs lower — the honest per-area number for sizing a real AOI.
+
+### Whole-AOI cost across releases
+
+![Per-release full-AOI — whole-AOI cost](https://raw.githubusercontent.com/englacial/zagg/benchmarks/site/full_aoi_cost_total.png)
+
+### AOI-average cost per 100 km² across releases
+
+![Per-release full-AOI — AOI-average cost per 100 km²](https://raw.githubusercontent.com/englacial/zagg/benchmarks/site/full_aoi_cost_per_100km2.png)
+
+> These embed by raw URL and appear after the first tagged release runs the
+> full-AOI job; until then GitHub shows a broken-image placeholder (nothing has
+> been rendered to the `benchmarks` branch yet).
 
 ### Container regime
 
