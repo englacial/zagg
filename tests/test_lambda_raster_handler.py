@@ -190,3 +190,21 @@ class TestProcessRasterMode:
         resp = handler_mod.lambda_handler(event, MagicMock())
         assert resp["statusCode"] == 500
         assert "asset" in json.loads(resp["body"])["error"]
+
+
+class TestRasterPhaseTimings:
+    def test_profile_emits_sample_write_split(self, handler_mod, raster_event):
+        event, _grid, _data = raster_event
+        event["profile"] = True
+        resp = handler_mod.lambda_handler(event, MagicMock())
+        assert resp["statusCode"] == 200, resp
+        body = json.loads(resp["body"])
+        pt = body["phase_timings"]
+        assert set(pt) == {"sample", "write"}
+        assert pt["write"] > 0.0
+        assert pt["sample"] + pt["write"] == pytest.approx(body["duration_s"], rel=0.05)
+
+    def test_no_profile_key_no_timings(self, handler_mod, raster_event):
+        event, _grid, _data = raster_event
+        resp = handler_mod.lambda_handler(event, MagicMock())
+        assert "phase_timings" not in json.loads(resp["body"])
