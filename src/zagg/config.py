@@ -340,9 +340,11 @@ def validate_config(config: PipelineConfig) -> None:
     # Optional store layout (issue #199 phase 2): "flat" (default, today's single
     # shared store) or "hive" (one leaf zarr per shard under a morton digit tree —
     # docs/design/sparse_coverage.md D1-D6). Hive ids are morton decimal strings,
-    # so the layout is HEALPix-only; the sharded (ShardingCodec) write path and
-    # metadata consolidation both assume the single shared store, so they are
-    # rejected with hive rather than silently mis-writing.
+    # so the layout is HEALPix-only; metadata consolidation assumes the single
+    # shared store, so it is rejected with hive rather than silently mis-writing.
+    # Sharded (ShardingCodec) output works on BOTH layouts (issue #236) and is
+    # the K>1 default on both; only the issue #133 object split (shard_order) is
+    # flat-only — a hive leaf is one object per array by construction.
     store_layout = config.output.get("store_layout")
     if store_layout is not None and store_layout not in ("flat", "hive"):
         raise ValueError(f"output.store_layout must be 'flat' or 'hive' (got {store_layout!r})")
@@ -352,11 +354,11 @@ def validate_config(config: PipelineConfig) -> None:
                 "output.store_layout: hive requires a healpix grid (hive node names "
                 f"are morton decimal digits; grid type is {(grid or {}).get('type')!r})"
             )
-        if (grid or {}).get("sharded"):
+        if (grid or {}).get("shard_order") is not None:
             raise ValueError(
-                "output.store_layout: hive does not support sharded (ShardingCodec) "
-                "output yet — each hive leaf is a vanilla zarr v3 store (D3); drop "
-                "sharded or use the flat layout"
+                "output.store_layout: hive does not take grid.shard_order (it sizes "
+                "the flat layout's ShardingCodec object split, issue #133; a hive "
+                "leaf's arrays are one whole-leaf object each) — drop shard_order"
             )
         if consolidate_metadata:
             raise ValueError(
@@ -1759,8 +1761,9 @@ def get_sharded(config: PipelineConfig, default: bool = False) -> bool:
     inner chunks into one zarr shard object instead of K independent regular chunk
     objects; a K==1 grid has nothing to bundle, so the grid silently no-ops it
     (issue #215). ``default`` is the value returned when the flag is omitted —
-    ``False`` here, but ``from_config`` passes ``True`` for HEALPix flat-layout
-    output (issue #215: a missing flag should not cost the ~K-fold object blow-up).
+    ``False`` here, but ``from_config`` passes ``True`` for HEALPix output on
+    both store layouts (issue #215 flat, issue #236 hive: a missing flag should
+    not cost the ~K-fold object blow-up).
     """
     return bool(config.output.get("grid", {}).get("sharded", default))
 
