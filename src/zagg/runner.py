@@ -659,6 +659,7 @@ class RasterStrategy:
                 function_name=_ignored.get("function_name"),
                 max_retries=_ignored.get("max_retries") or 3,
                 output_credentials=output_credentials,
+                output_endpoint_url=resolved_endpoint,
             )
 
         source = config.data_source or {}
@@ -739,6 +740,7 @@ class RasterStrategy:
         function_name,
         max_retries,
         output_credentials,
+        output_endpoint_url,
     ):
         """Fan shards out, one synchronous ``mode="process_raster"`` invoke each.
 
@@ -768,6 +770,13 @@ class RasterStrategy:
             "output": config.output,
             "pipeline": config.pipeline,
         }
+        # Normalize creds + resolved endpoint into the camelCase envelope the
+        # handler's ``_output_store_kwargs`` requires, exactly as the spatial and
+        # temporal lambda paths do — so raster inherits snake_case/STS-PascalCase
+        # cred leniency and threads a custom (R2/MinIO) output endpoint to workers.
+        output_creds_event = _build_output_creds_event(
+            output_credentials, output_endpoint_url, region
+        )
 
         def _event(shard_key, granules):
             keys = {e.get("time_key") or e.get("datetime") for e in granules if e.get("assets")}
@@ -779,8 +788,8 @@ class RasterStrategy:
                 "store_path": store_path,
                 "time_index": {k: time_index[k] for k in keys},
             }
-            if output_credentials:
-                ev["output_credentials"] = output_credentials
+            if output_creds_event is not None:
+                ev["output_credentials"] = output_creds_event
             return ev
 
         transient_markers = (

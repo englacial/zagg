@@ -293,6 +293,49 @@ class TestRasterLambdaBackend:
         assert summary["total_obs"] == 2
         assert len(fake.events) == 1
 
+    def test_output_credentials_normalized_and_endpoint_threaded(
+        self, manifest, monkeypatch, tmp_path
+    ):
+        # snake_case creds + a custom output endpoint must reach the worker event
+        # as the handler-required camelCase block (accessKeyId/secretAccessKey)
+        # with endpointUrl threaded in — parity with the spatial/temporal paths.
+        import boto3
+
+        import zagg.runner as runner_mod
+
+        cfg, sm_path, _shard, _data = manifest
+
+        def responder(event):
+            body = {"timesteps": len(event["time_index"]), "cells_with_data": 4096}
+            return {"statusCode": 200, "body": json.dumps(body)}
+
+        fake = _FakeLambdaClient(responder)
+        monkeypatch.setattr(boto3, "client", lambda *a, **k: fake)
+        real_open = runner_mod.open_store
+        monkeypatch.setattr(
+            runner_mod,
+            "open_store",
+            lambda path, **kw: (
+                str(tmp_path / "creds.zarr") if path.startswith("s3://") else real_open(path, **kw)
+            ),
+        )
+        agg(
+            cfg,
+            catalog=sm_path,
+            store="s3://bucket/out.zarr",
+            backend="lambda",
+            output_credentials={
+                "aws_access_key_id": "AKIA_SNAKE",
+                "aws_secret_access_key": "SECRET_SNAKE",
+            },
+            output_endpoint_url="https://custom.r2.example.com",
+        )
+        assert len(fake.events) == 1
+        block = fake.events[0]["output_credentials"]
+        assert block["accessKeyId"] == "AKIA_SNAKE"
+        assert block["secretAccessKey"] == "SECRET_SNAKE"
+        assert block["endpointUrl"] == "https://custom.r2.example.com"
+
     def test_all_lambda_shards_error_raises(self, manifest, monkeypatch, tmp_path):
         import boto3
 
