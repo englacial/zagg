@@ -359,6 +359,110 @@ class TestRasterLambdaBackend:
         with pytest.raises(RuntimeError, match="boom"):
             agg(cfg, catalog=sm_path, store="s3://bucket/out.zarr", backend="lambda")
 
+    def test_lambda_function_error_is_shard_error(self, manifest, monkeypatch, tmp_path):
+        # A Lambda FunctionError (timeout/OOM/unhandled) is a deterministic shard
+        # error — recorded, never retried. Single shard -> all-error RuntimeError.
+        import boto3
+
+        import zagg.runner as runner_mod
+
+        cfg, sm_path, _shard, _data = manifest
+
+        def responder(event):
+            return {"__function_error__": True, "errorMessage": "boom in worker"}
+
+        fake = _FakeLambdaClient(responder)
+        monkeypatch.setattr(boto3, "client", lambda *a, **k: fake)
+        real_open = runner_mod.open_store
+        monkeypatch.setattr(
+            runner_mod,
+            "open_store",
+            lambda path, **kw: (
+                str(tmp_path / "fe.zarr") if path.startswith("s3://") else real_open(path, **kw)
+            ),
+        )
+        with pytest.raises(RuntimeError, match="Lambda error"):
+            agg(cfg, catalog=sm_path, store="s3://bucket/out.zarr", backend="lambda")
+        assert len(fake.events) == 1  # deterministic FunctionError -> no retry
+
+    def test_lambda_transient_retry_then_success(self, manifest, monkeypatch, tmp_path):
+        # A transient invoke fault (Connection reset) on the first attempt retries
+        # with backoff and succeeds on the second -> success, two recorded invokes.
+        import boto3
+
+        import zagg.runner as runner_mod
+
+        cfg, sm_path, _shard, _data = manifest
+        calls = {"n": 0}
+
+        def responder(event):
+            calls["n"] += 1
+            if calls["n"] == 1:
+                raise RuntimeError("Connection reset by peer")
+            body = {"timesteps": len(event["time_index"]), "cells_with_data": 4096}
+            return {"statusCode": 200, "body": json.dumps(body)}
+
+        fake = _FakeLambdaClient(responder)
+        monkeypatch.setattr(boto3, "client", lambda *a, **k: fake)
+        monkeypatch.setattr(runner_mod.time, "sleep", lambda *a: None)
+        real_open = runner_mod.open_store
+        monkeypatch.setattr(
+            runner_mod,
+            "open_store",
+            lambda path, **kw: (
+                str(tmp_path / "tr.zarr") if path.startswith("s3://") else real_open(path, **kw)
+            ),
+        )
+        summary = agg(cfg, catalog=sm_path, store="s3://bucket/out.zarr", backend="lambda")
+        assert summary["cells_error"] == 0
+        assert summary["cells_with_data"] == 1
+        assert len(fake.events) == 2  # first invoke raised (transient), retried once
+
+    def test_lambda_datetime_only_time_index(self, tmp_path, monkeypatch):
+        # Granules without a time_key fall back to the datetime string as the
+        # group key; the worker event's time_index must be keyed by that string.
+        import boto3
+
+        import zagg.runner as runner_mod
+
+        cfg = _cfg(tmp_path)
+        data = _index_raster()
+        _write_tiff(tmp_path / "d0.tif", data)
+        shard = _shard_for_raster()
+        grid = from_config(cfg, populated_shards=[shard])
+        entries = [
+            {
+                "id": "g0",
+                "s3": None,
+                "https": None,
+                "assets": {"red": str(tmp_path / "d0.tif")},
+                "datetime": T0,
+            }
+        ]
+        sm = ShardMap(grid.spatial_signature(), [shard], [entries], {"collection": "s2-test"})
+        sm_path = str(tmp_path / "dtonly.json")
+        sm.to_json(sm_path)
+
+        seen = {}
+
+        def responder(event):
+            seen["time_index"] = event["time_index"]
+            body = {"timesteps": 1, "cells_with_data": 4096}
+            return {"statusCode": 200, "body": json.dumps(body)}
+
+        fake = _FakeLambdaClient(responder)
+        monkeypatch.setattr(boto3, "client", lambda *a, **k: fake)
+        real_open = runner_mod.open_store
+        monkeypatch.setattr(
+            runner_mod,
+            "open_store",
+            lambda path, **kw: (
+                str(tmp_path / "dt.zarr") if path.startswith("s3://") else real_open(path, **kw)
+            ),
+        )
+        agg(cfg, catalog=sm_path, store="s3://bucket/out.zarr", backend="lambda")
+        assert set(seen["time_index"]) == {T0}
+
 
 class TestShippedTemplate:
     def test_sentinel2_l2a_config_loads_and_validates(self):
