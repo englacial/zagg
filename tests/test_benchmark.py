@@ -151,7 +151,9 @@ def test_codec_column_is_last_and_threaded(monkeypatch):
 
 def test_wall_breakdown_columns_threaded_and_rendered():
     # issue #180: total AOI wall + its phases flow from the agg summary into
-    # the record, and total wall + finalize surface in the rendered table.
+    # the record (finalize_s is retained in the series), and total wall surfaces
+    # in the rendered table. finalize is kept in the record but dropped from the
+    # rendered table (issue #202: it added noise/crowding to the table PNGs).
     g = HealpixGrid(parent_order=11, child_order=19)
     rec = bench_metrics.build_record(_summary(), grid=g, context={"target": "t"})
     assert rec["total_wall_s"] == 210.0
@@ -162,9 +164,11 @@ def test_wall_breakdown_columns_threaded_and_rendered():
     bare = bench_metrics.build_record({"total_obs": 1}, grid=g, context={})
     assert bare["total_wall_s"] is None and bare["finalize_s"] is None
     cells = bench_metrics.format_record_cells(rec)
-    assert cells["wall (s)"] == "210.0" and cells["finalize (s)"] == "65.0"
+    assert cells["wall (s)"] == "210.0"
     assert "wall (s)" in bench_metrics.TABLE_HEADERS
-    assert "finalize (s)" in bench_metrics.TABLE_HEADERS
+    # finalize is retained in the series/record but no longer a rendered column.
+    assert "finalize_s" in bench_metrics.RECORD_COLUMNS
+    assert "finalize (s)" not in bench_metrics.TABLE_HEADERS
 
 
 def test_run_target_threads_codec_into_record():
