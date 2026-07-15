@@ -355,6 +355,33 @@ class TestOwnership:
         assert meta["skipped"] == 1 and meta["granule_count"] == 2
         assert (slabs[0]["red"] == 7).all()
 
+    def test_on_slab_streams_and_matches_dict(self, tmp_path):
+        # The on_slab sink (issue #231): each timestep's slab is handed off as
+        # its group completes and NOT accumulated (returned slabs is empty),
+        # yet the streamed slabs match the buffered dict-mode output exactly.
+        _write_tiff(tmp_path / "t0.tif", np.full((96, 96), 11, dtype=np.uint16))
+        _write_tiff(tmp_path / "t1.tif", np.full((96, 96), 22, dtype=np.uint16))
+        grid = _rect_grid([ORIGIN[0], ORIGIN[1] - 960.0, ORIGIN[0] + 960.0, ORIGIN[1]], [96, 96])
+        cfg = _raster_config(bands={"red": {"asset": "red", "dtype": "uint16"}}, nodata=None)
+        granules = [
+            _entry("A", {"red": str(tmp_path / "t0.tif")}, T0, time_key="dt-1"),
+            _entry("B", {"red": str(tmp_path / "t1.tif")}, T1, time_key="dt-2"),
+        ]
+        index, _ = raster_time_index([granules])
+        golden, _gm = process_raster_shard(grid, 0, granules, cfg, index)
+
+        streamed = {}
+
+        def _sink(t_idx, slab):
+            streamed[t_idx] = slab
+
+        slabs, meta = process_raster_shard(grid, 0, granules, cfg, index, on_slab=_sink)
+        assert slabs == {}  # streamed + freed, nothing accumulated
+        assert meta["timesteps"] == 2
+        assert set(streamed) == set(golden) == {0, 1}
+        for t in golden:
+            np.testing.assert_array_equal(streamed[t]["red"], golden[t]["red"])
+
 
 def _healpix_setup(tmp_path):
     """Order-10 shard over the synthetic raster; order-16 cells (~97 m)."""

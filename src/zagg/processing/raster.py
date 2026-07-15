@@ -383,6 +383,7 @@ def process_raster_shard(
     *,
     region: str | None = None,
     anonymous: bool = True,
+    on_slab=None,
 ):
     """Process one shard of a raster pipeline: every acquisition group -> slab.
 
@@ -396,12 +397,23 @@ def process_raster_shard(
     acquisition-group key is absent raises :class:`ValueError` naming the key,
     rather than failing with an opaque ``KeyError`` deep in the gather.
 
+    Parameters
+    ----------
+    on_slab : callable, optional
+        ``on_slab(t_idx, slab)`` sink invoked once per timestep as its
+        acquisition group completes (issue #231). When given, the slab is
+        handed off and dropped immediately, so peak output memory holds ~1
+        timestep instead of all ``T``; the returned ``slabs`` is then empty.
+        When ``None`` (the default) every slab accumulates into ``slabs`` and
+        is returned, as before.
+
     Returns
     -------
     (slabs, metadata)
         ``slabs``: ``{t_idx: {field: values}}`` — one dense per-cell array per
-        band per timestep, fill where no valid source. ``metadata``: counts
-        (``granule_count``, ``skipped``, ``timesteps``, ``shard_key``).
+        band per timestep, fill where no valid source (empty when ``on_slab``
+        streamed them). ``metadata``: counts (``granule_count``, ``skipped``,
+        ``timesteps``, ``shard_key``).
     """
     from zagg.config import get_raster_bands
 
@@ -434,12 +446,12 @@ def process_raster_shard(
     # orders.
     k = _sample_concurrency(config)
 
-    async def _sample_all():
+    async def _run_all():
         sem = asyncio.Semaphore(k)
 
-        async def _sample_group(items):
+        async def _sample_group(key, items):
             async with sem:
-                return await asyncio.gather(
+                sampled = await asyncio.gather(
                     *[
                         sample_item_async(
                             grid,
@@ -453,32 +465,40 @@ def process_raster_shard(
                         for e in items
                     ]
                 )
+            return time_index[key], sampled
 
-        return await asyncio.gather(*[_sample_group(items) for items in groups.values()])
+        lonlat = None  # computed once, only if some timestep has overlapping items
+        slabs: dict = {}
+        # Drain groups as they finish (as_completed): build each timestep's slab
+        # and hand it to the sink, so a completed slab is written + freed before
+        # the next arrives — the output side stays ~1 timestep (issue #231).
+        for fut in asyncio.as_completed(
+            [_sample_group(key, items) for key, items in groups.items()]
+        ):
+            t, sampled = await fut
+            if len(sampled) == 1:
+                values, valid, _center = sampled[0]
+            else:
+                if lonlat is None:
+                    lonlat = grid.cell_lonlat(cells)
+                values, valid = _combine_by_ownership(sampled, lonlat, bands)
+            slab = {}
+            for f, v in values.items():
+                out = v.copy()  # keep the asset dtype (np.where would promote)
+                out[~valid] = bands[f]["fill_value"]
+                slab[f] = out
+            if on_slab is not None:
+                on_slab(t, slab)  # write + free this timestep before the next
+            else:
+                slabs[t] = slab
+        return slabs
 
-    group_results = _run_sync(_sample_all())
-
-    lonlat = None  # computed once, only if some timestep has overlapping items
-    slabs: dict = {}
-    for (key, _items), sampled in zip(groups.items(), group_results):
-        t = time_index[key]
-        if len(sampled) == 1:
-            values, valid, _center = sampled[0]
-        else:
-            if lonlat is None:
-                lonlat = grid.cell_lonlat(cells)
-            values, valid = _combine_by_ownership(sampled, lonlat, bands)
-        slab = {}
-        for f, v in values.items():
-            out = v.copy()  # keep the asset dtype (np.where would promote)
-            out[~valid] = bands[f]["fill_value"]
-            slab[f] = out
-        slabs[t] = slab
+    slabs = _run_sync(_run_all())
     metadata = {
         "shard_key": int(shard_key),
         "granule_count": len(granules),
         "skipped": skipped,
-        "timesteps": len(slabs),
+        "timesteps": len(groups),
     }
     return slabs, metadata
 

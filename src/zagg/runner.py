@@ -684,12 +684,25 @@ class RasterStrategy:
 
         def _one(pair):
             shard_key, granules = pair
-            slabs, meta = process_raster_shard(
-                grid, int(shard_key), granules, config, time_index, **src_kwargs
-            )
-            for t_idx, slab in slabs.items():
+            wrote = False
+
+            def _write_slab(t_idx, slab):
+                nonlocal wrote
                 write_raster_slab(zarr_store, grid, int(shard_key), t_idx, slab)
-            if slabs:
+                wrote = True
+
+            # Stream: write + free each timestep's slab as it completes (issue
+            # #231), so a shard holds ~1 slab, not all T.
+            _slabs, meta = process_raster_shard(
+                grid,
+                int(shard_key),
+                granules,
+                config,
+                time_index,
+                on_slab=_write_slab,
+                **src_kwargs,
+            )
+            if wrote:
                 write_raster_coords(zarr_store, grid, int(shard_key))
             return meta
 
