@@ -570,9 +570,14 @@ class RasterStrategy:
     aggregation write machinery. The runner owns the global timestep index and
     the template emission (and, later, the single-writer resize on append).
 
-    Local backend only for now: the Lambda fan-out needs a handler branch
-    under ``deployment/aws/`` (out of this PR's scope per repo conventions) —
-    tracked on issue #218.
+    Backends: ``"local"`` (thread pool, in-process workers) and ``"lambda"``
+    (one synchronous ``mode="process_raster"`` invoke per shard —
+    espg-confirmed scope on issue #218). The lambda cut is deliberately the
+    simple transport: synchronous invokes with transient-only retries; the
+    issue-151 async result-object channel and the preflight concurrency probe
+    are follow-ups (raster shards are seconds of COG windows, well inside NAT
+    idle limits). Either way the runner owns the template + global time index
+    before fan-out (the single-writer append design).
 
     Summary schema note: ``total_obs`` is shared with the spatial/temporal
     strategies so a caller sees one summary shape across pipeline kinds. On the
@@ -614,11 +619,10 @@ class RasterStrategy:
         store_path = store or get_store_path(config)
         if not store_path:
             raise ValueError("No store path specified (pass store= or set output.store: in config)")
-        if backend != "local":
-            raise NotImplementedError(
-                "raster pipelines support backend='local' for now; the Lambda "
-                "handler branch is tracked on issue #218"
-            )
+        if backend not in ("local", "lambda"):
+            raise ValueError(f"Unknown backend: {backend!r} (expected 'local' or 'lambda')")
+        if backend == "lambda" and not store_path.startswith("s3://"):
+            raise ValueError(f"Lambda backend requires s3:// store path, got: {store_path}")
 
         catalog_data = _load_catalog(catalog_path)
         cells = _select_cells(catalog_data, morton_cell=morton_cell, max_cells=max_cells)
@@ -642,6 +646,20 @@ class RasterStrategy:
             endpoint_url=resolved_endpoint,
         )
         emit_raster_template(zarr_store, grid, config, times_us, overwrite=overwrite)
+
+        if backend == "lambda":
+            return self._run_lambda_shards(
+                config,
+                cells,
+                time_index,
+                grid,
+                store_path,
+                max_workers=max_workers,
+                region=region,
+                function_name=_ignored.get("function_name"),
+                max_retries=_ignored.get("max_retries") or 3,
+                output_credentials=output_credentials,
+            )
 
         source = config.data_source or {}
         src_kwargs = {
@@ -704,6 +722,142 @@ class RasterStrategy:
         }
         logger.info(
             f"Done: {shards_with_data}/{len(cells)} shards, {len(times_us)} timesteps, "
+            f"{errors} errors, {wall_time:.1f}s"
+        )
+        return summary
+
+    def _run_lambda_shards(
+        self,
+        config,
+        cells,
+        time_index,
+        grid,
+        store_path,
+        *,
+        max_workers,
+        region,
+        function_name,
+        max_retries,
+        output_credentials,
+    ):
+        """Fan shards out, one synchronous ``mode="process_raster"`` invoke each.
+
+        The worker gets the shard's ShardMap entries plus only its own slice of
+        the global time index (the template — runner-emitted before this — is
+        the shared truth for the full axis). Transient invoke faults retry with
+        backoff; a Lambda ``FunctionError`` or non-200 envelope is a shard
+        error (per-shard isolation, all-error raise as on the local backend).
+        """
+        import boto3
+        from botocore.config import Config
+
+        if function_name is None:
+            function_name = os.environ.get("ZAGG_LAMBDA_FUNCTION_NAME", "process-shard")
+        max_workers = min(max_workers or 64, len(cells)) or 1
+        client = boto3.client(
+            "lambda",
+            region_name=region,
+            config=Config(
+                max_pool_connections=max(max_workers, 10),
+                read_timeout=910,
+                retries={"max_attempts": 0},
+            ),
+        )
+        config_dict = {
+            "data_source": config.data_source,
+            "output": config.output,
+            "pipeline": config.pipeline,
+        }
+
+        def _event(shard_key, granules):
+            keys = {e.get("time_key") or e.get("datetime") for e in granules if e.get("assets")}
+            ev = {
+                "mode": "process_raster",
+                "shard_key": int(shard_key),
+                "granules": granules,
+                "config": config_dict,
+                "store_path": store_path,
+                "time_index": {k: time_index[k] for k in keys},
+            }
+            if output_credentials:
+                ev["output_credentials"] = output_credentials
+            return ev
+
+        transient_markers = (
+            "TooManyRequests",
+            "ServiceException",
+            "throttl",
+            "Connection",
+            "Timeout",
+        )
+
+        def _one(pair):
+            payload = json.dumps(_event(*pair))
+            last = None
+            for attempt in range(max_retries):
+                try:
+                    resp = client.invoke(
+                        FunctionName=function_name,
+                        InvocationType="RequestResponse",
+                        Payload=payload,
+                    )
+                    raw_text = resp["Payload"].read().decode("utf-8")
+                    if resp.get("FunctionError"):
+                        # Deterministic for a given shard (timeout/OOM/unhandled):
+                        # never retried, mirroring _invoke_lambda_cell (#119).
+                        return {"error": f"Lambda error: {raw_text[:150]}", "body": {}}
+                    raw = json.loads(raw_text)
+                    body = json.loads(raw.get("body", "{}"))
+                    if raw.get("statusCode") != 200:
+                        return {
+                            "error": body.get("error", f"status {raw.get('statusCode')}"),
+                            "body": body,
+                        }
+                    return {"error": None, "body": body}
+                except Exception as e:
+                    raise_for_fd_exhaustion(e, max_workers)
+                    last = str(e)
+                    if not any(t in last for t in transient_markers) or attempt == max_retries - 1:
+                        return {"error": last, "body": {}}
+                    time.sleep(min(2**attempt, 8))
+            return {"error": last, "body": {}}
+
+        t0 = time.time()
+        shards_with_data = 0
+        errors = 0
+        timesteps_written = 0
+        last_error = None
+        with ThreadPoolExecutor(max_workers=max_workers) as pool:
+            futures = {pool.submit(_one, pair): pair[0] for pair in cells}
+            for fut in as_completed(futures):
+                label = shard_label(grid, futures[fut])
+                result = fut.result()
+                if result["error"]:
+                    errors += 1
+                    last_error = result["error"]
+                    logger.warning(f"raster shard {label} failed: {result['error']}")
+                    continue
+                body = result["body"]
+                if body.get("timesteps"):
+                    shards_with_data += 1
+                    timesteps_written += body["timesteps"]
+
+        wall_time = time.time() - t0
+        if cells and errors == len(cells):
+            raise RuntimeError(f"all {errors} raster shard(s) failed; last error: {last_error}")
+        summary = {
+            "total_cells": len(cells),
+            "cells_with_data": shards_with_data,
+            "cells_error": errors,
+            # Shard x timestep slab tally (see the class docstring note).
+            "total_obs": timesteps_written,
+            "timesteps": int(len(time_index)),
+            "wall_time_s": wall_time,
+            "store_path": store_path,
+            "backend": "lambda",
+        }
+        logger.info(
+            f"Done (lambda): {shards_with_data}/{len(cells)} shards, "
             f"{errors} errors, {wall_time:.1f}s"
         )
         return summary

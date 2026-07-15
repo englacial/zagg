@@ -462,6 +462,8 @@ def lambda_handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
         return _handle_extract(event, context)
     if mode in ("process_event", "temporal", "event"):
         response = _handle_process_event(event)
+    elif mode == "process_raster":
+        response = _handle_process_raster(event)
     else:
         response = _handle_process(event, context)
     # Container telemetry rides in every per-unit envelope (issue #171) -- the
@@ -818,6 +820,92 @@ def _handle_process_event(event: Dict[str, Any]) -> Dict[str, Any]:
         return {
             "statusCode": 500,
             "body": json.dumps({"error": str(e), "mode": "process_event", "event_key": event_key}),
+        }
+
+
+def _handle_process_raster(event: Dict[str, Any]) -> Dict[str, Any]:
+    """Raster pull-NN worker (issue #218): one shard's ``(time, cells)`` slabs.
+
+    Event keys: ``shard_key`` (int), ``granules`` (the shard's ShardMap
+    entries — per-band asset hrefs + datetime/time_key), ``config`` (raster
+    pipeline config dict), ``store_path``, ``time_index`` (``{group_key:
+    t_idx}`` for this shard's acquisition groups — the orchestrator owns the
+    global index and the template, per the issue #218 single-writer append
+    design). Source reads are anonymous by default (Earth Search COGs);
+    ``data_source.source_region``/``anonymous`` override. No
+    ``s3_credentials`` block: the raster source needs none, and the output
+    store uses ``output_credentials`` or the execution role like every other
+    mode.
+    """
+    start_time = time.time()
+    try:
+        required = ["shard_key", "granules", "config", "store_path", "time_index"]
+        missing = [p for p in required if p not in event]
+        if missing:
+            error_msg = f"Missing required parameters: {', '.join(missing)}"
+            logger.error(error_msg)
+            return {"statusCode": 400, "body": json.dumps({"error": error_msg})}
+
+        from zagg.config import get_layout
+        from zagg.grids import from_config
+        from zagg.processing.raster import (
+            process_raster_shard,
+            write_raster_coords,
+            write_raster_slab,
+        )
+
+        config = load_config_from_dict(event["config"])
+        if get_layout(config) == "dense":
+            # Dense layout keys blocks by populated-shard position, which the
+            # worker cannot reconstruct from one shard's event; fullsphere (the
+            # default) keys by nested id and needs no shared state.
+            error_msg = "raster lambda workers require output.grid.layout: fullsphere"
+            logger.error(error_msg)
+            return {"statusCode": 400, "body": json.dumps({"error": error_msg})}
+        grid = from_config(config)
+
+        shard_key = int(event["shard_key"])
+        time_index = {k: int(v) for k, v in event["time_index"].items()}
+        source = config.data_source or {}
+        slabs, meta = process_raster_shard(
+            grid,
+            shard_key,
+            event["granules"],
+            config,
+            time_index,
+            region=source.get("source_region"),
+            anonymous=source.get("anonymous", True),
+        )
+
+        store = open_store(event["store_path"], **_output_store_kwargs(event))
+        for t_idx, slab in slabs.items():
+            write_raster_slab(store, grid, shard_key, t_idx, slab)
+        if slabs:
+            write_raster_coords(store, grid, shard_key)
+
+        body = {
+            "shard_key": shard_key,
+            "timesteps": meta["timesteps"],
+            "granule_count": meta["granule_count"],
+            "skipped": meta["skipped"],
+            # The shared summary accumulators key on these two names: a raster
+            # shard's observation tally is its shard x timestep slab count.
+            "cells_with_data": grid.cells_per_shard if slabs else 0,
+            "total_obs": meta["timesteps"],
+            "duration_s": time.time() - start_time,
+        }
+        return {"statusCode": 200, "body": json.dumps(body)}
+    except Exception as e:
+        logger.error(f"raster worker failed: {e}", exc_info=True)
+        return {
+            "statusCode": 500,
+            "body": json.dumps(
+                {
+                    "error": str(e),
+                    "shard_key": event.get("shard_key"),
+                    "duration_s": time.time() - start_time,
+                }
+            ),
         }
 
 

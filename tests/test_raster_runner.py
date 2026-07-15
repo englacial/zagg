@@ -5,6 +5,8 @@ GeoTIFFs: strategy selection, template emission, shard fan-out, slab writes,
 and the shipped ``sentinel2_l2a`` template config.
 """
 
+import json
+
 import numpy as np
 import pytest
 from pyproj import CRS, Transformer
@@ -229,9 +231,89 @@ class TestRasterAgg:
         with pytest.raises(RuntimeError, match="all .* raster shard"):
             agg(cfg, catalog=sm_path, backend="local", max_workers=2)
 
-    def test_lambda_backend_not_yet(self, manifest):
+    def test_lambda_backend_requires_s3_store(self, manifest):
         cfg, sm_path, _shard, _data = manifest
-        with pytest.raises(NotImplementedError, match="Lambda"):
+        with pytest.raises(ValueError, match="s3://"):
+            agg(cfg, catalog=sm_path, backend="lambda")
+
+
+class _FakeLambdaClient:
+    """Scripted boto3 lambda client: records events, returns canned envelopes."""
+
+    def __init__(self, responder):
+        self.responder = responder
+        self.events = []
+
+    def invoke(self, **kwargs):
+        import io
+
+        event = json.loads(kwargs["Payload"])
+        self.events.append(event)
+        resp = self.responder(event)
+        out = {"Payload": io.BytesIO(json.dumps(resp).encode())}
+        if resp.get("__function_error__"):
+            out["FunctionError"] = "Unhandled"
+        return out
+
+
+class TestRasterLambdaBackend:
+    def test_events_and_summary(self, manifest, monkeypatch, tmp_path):
+        import boto3
+
+        import zagg.runner as runner_mod
+
+        cfg, sm_path, shard, _data = manifest
+
+        def responder(event):
+            assert event["mode"] == "process_raster"
+            assert event["shard_key"] == shard
+            assert set(event["time_index"]) == {"dt-1", "dt-2"}
+            assert event["config"]["data_source"]["reader"] == "raster"
+            body = {"timesteps": len(event["time_index"]), "cells_with_data": 4096}
+            return {"statusCode": 200, "body": json.dumps(body)}
+
+        fake = _FakeLambdaClient(responder)
+        monkeypatch.setattr(boto3, "client", lambda *a, **k: fake)
+        # Template emission targets the store path; keep it local by
+        # intercepting open_store for the s3 URL.
+        real_open = runner_mod.open_store
+
+        def fake_open(path, **kw):
+            if path.startswith("s3://"):
+                return str(tmp_path / "lambda_out.zarr")
+            return real_open(path, **kw)
+
+        monkeypatch.setattr(runner_mod, "open_store", fake_open)
+        summary = agg(
+            cfg, catalog=sm_path, store="s3://bucket/out.zarr", backend="lambda", max_workers=2
+        )
+        assert summary["backend"] == "lambda"
+        assert summary["total_cells"] == 1 and summary["cells_with_data"] == 1
+        assert summary["cells_error"] == 0
+        assert summary["total_obs"] == 2
+        assert len(fake.events) == 1
+
+    def test_all_lambda_shards_error_raises(self, manifest, monkeypatch, tmp_path):
+        import boto3
+
+        import zagg.runner as runner_mod
+
+        cfg, sm_path, _shard, _data = manifest
+
+        def responder(event):
+            return {"statusCode": 500, "body": json.dumps({"error": "boom"})}
+
+        fake = _FakeLambdaClient(responder)
+        monkeypatch.setattr(boto3, "client", lambda *a, **k: fake)
+        real_open = runner_mod.open_store
+        monkeypatch.setattr(
+            runner_mod,
+            "open_store",
+            lambda path, **kw: (
+                str(tmp_path / "x.zarr") if path.startswith("s3://") else real_open(path, **kw)
+            ),
+        )
+        with pytest.raises(RuntimeError, match="boom"):
             agg(cfg, catalog=sm_path, store="s3://bucket/out.zarr", backend="lambda")
 
 
