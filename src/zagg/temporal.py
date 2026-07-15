@@ -697,6 +697,7 @@ def prepare_collection(ds, options):
     """
     if not options:
         return ds
+    ds = _round_coords(ds, options.get("coord_round"))
     variables = options.get("variables")
     if variables:
         ds = ds[list(variables)]
@@ -714,6 +715,20 @@ def prepare_collection(ds, options):
     for name, expr in (options.get("derived") or {}).items():
         ds = ds.assign(**{name: _eval_derived(name, expr, ds)})
     return ds
+
+
+def _round_coords(ds, decimals):
+    """Round spatial coordinates to ``decimals`` places (issue #229).
+
+    Source grids can carry float dirt in their own coordinate arrays (MERRA-2
+    ships one dirty longitude and one dirty latitude per granule), which
+    breaks the exact-match ``.sel`` against rounded event/static coords.
+    No-op when ``decimals`` is None or a coordinate is absent.
+    """
+    if decimals is None:
+        return ds
+    updates = {c: ds[c].round(decimals) for c in ("lat", "lon") if c in ds.coords}
+    return ds.assign_coords(**updates) if updates else ds
 
 
 def read_temporal_inputs(
@@ -786,10 +801,14 @@ def read_temporal_inputs(
     collections = {}
     for name, uris in collection_uris.items():
         uri_list = list(uris) if isinstance(uris, (list, tuple)) else [uris]
-        keep = (options.get(name) or {}).get("variables")
+        opts = options.get(name) or {}
+        keep = opts.get("variables")
         parts = []
         for u in uri_list:
             ds = open_dataset(u, **kw)
+            # rounding must precede the extent .sel so it compares like with
+            # like (issue #229); prepare_collection re-applies it harmlessly
+            ds = _round_coords(ds, opts.get("coord_round"))
             if extent is not None:
                 lats, lons = extent
                 part = ds[list(keep)] if keep else ds

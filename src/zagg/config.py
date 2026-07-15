@@ -702,6 +702,14 @@ def _validate_collection_options(config: PipelineConfig) -> None:
             raise ValueError(
                 f"data_source.collections[{cname!r}].variables must be a list of names"
             )
+        coord_round = opts.get("coord_round")
+        if coord_round is not None and (
+            isinstance(coord_round, bool) or not isinstance(coord_round, int) or coord_round < 0
+        ):
+            raise ValueError(
+                f"data_source.collections[{cname!r}].coord_round must be a "
+                f"non-negative integer (got {coord_round!r})"
+            )
         offset = opts.get("time_offset")
         if offset is not None:
             if not isinstance(offset, str):

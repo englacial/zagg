@@ -1029,6 +1029,39 @@ class TestTemporalReader:
         # structural guarantee is that close runs before the next granule opens.
         assert len(closed) == 2
 
+    def test_reader_coord_round_precedes_extent_sel(self, monkeypatch):
+        # A rounded event extent must select cleanly against a granule whose
+        # native coords carry float dirt when coord_round is declared; without
+        # it the exact-match .sel fails (issue #229 -- storm_00003 on the
+        # fleet, prime-meridian bbox vs MERRA-2's dirty lon).
+        xr = pytest.importorskip("xarray")
+        import zagg.temporal as temporal
+        from zagg.temporal import read_temporal_inputs
+
+        dirty_lon = np.array([-0.625, -5.920304394294029e-13, 0.625])
+        lat = np.array([-70.0, -69.5])
+
+        def _granule(uri, **kwargs):
+            time = np.array(["1980-01-06T00"], dtype="datetime64[ns]")
+            return xr.Dataset(
+                {"T2M": (("time", "lat", "lon"), np.ones((1, 2, 3)))},
+                coords={"time": time, "lat": lat, "lon": dirty_lon},
+            )
+
+        monkeypatch.setattr(temporal, "open_dataset", _granule)
+        extent = (lat, np.array([-0.625, 0.0]))  # mask coords: rounded
+
+        with pytest.raises(KeyError):
+            read_temporal_inputs({"merra2": "s3://b/d6.nc"}, {}, extent=extent)
+
+        collections, _ = read_temporal_inputs(
+            {"merra2": "s3://b/d6.nc"},
+            {},
+            collection_options={"merra2": {"coord_round": 5}},
+            extent=extent,
+        )
+        np.testing.assert_array_equal(collections["merra2"]["lon"].values, np.array([-0.625, 0.0]))
+
     def test_read_temporal_inputs_no_extent_stays_lazy_shaped(self, monkeypatch):
         # Without an extent the reader returns the opened datasets untouched
         # (pre-#225 behavior) -- callers outside the worker keep full control.
@@ -1126,6 +1159,15 @@ class TestPrepareCollection:
 
         with pytest.raises(ValueError, match="rainfall.*TYPO.*PRECCU"):
             prepare_collection(hourly, {"derived": {"rainfall": "PRECLS + TYPO"}})
+
+    def test_coord_round_cleans_dirty_grid(self, hourly):
+        # MERRA-2 granules carry float dirt in their own coord arrays (one
+        # dirty lon per file, -5.92e-13 where 0.0 belongs) -- issue #229.
+        from zagg.temporal import prepare_collection
+
+        dirty = hourly.assign_coords(lon=[-5.920304394294029e-13])
+        out = prepare_collection(dirty, {"coord_round": 5})
+        assert out["lon"].values[0] == 0.0
 
     def test_unknown_option_keys_ignored(self, hourly):
         # doi &c. are catalog metadata, not reader options.
