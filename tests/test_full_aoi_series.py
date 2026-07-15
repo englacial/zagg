@@ -9,6 +9,8 @@ import json
 import sys
 from pathlib import Path
 
+import pytest
+
 REPO = Path(__file__).resolve().parents[1]
 SCRIPTS = REPO / ".github" / "scripts"
 sys.path.insert(0, str(SCRIPTS))
@@ -145,3 +147,57 @@ def test_main_rejects_non_list(tmp_path):
         assert "list" in str(e.code)
     else:
         raise AssertionError("expected SystemExit on non-list records JSON")
+
+
+# --- per-release full-AOI renderer (issue #202 leg 1) ---------------------
+
+
+def _matrix_records(commit, ref, cost):
+    """One release's 4 full-AOI targets (inline/sidecar x mask/nomask)."""
+    out = []
+    for ib in ("inline", "sidecar"):
+        for mask in (False, True):
+            suffix = "mask" if mask else "nomask"
+            out.append(
+                _record(
+                    commit=commit,
+                    ref=ref,
+                    target=f"full_aoi_neon_o9_{ib}_{suffix}",
+                    event="release",
+                    index_backend=ib,
+                    aoi_mask=mask,
+                    cost_usd=cost,
+                )
+            )
+    return out
+
+
+def test_full_aoi_history_derives_avg_cost_and_filters_release():
+    ps = pytest.importorskip("plot_series")
+    recs = _matrix_records("c1", "v0.24.0", cost=0.016) + [
+        _record(commit="c2", event="merge")  # non-release must not leak in
+    ]
+    df = fas.records_to_frame(recs)
+    hist = ps._full_aoi_history(df)
+    assert set(hist["event"]) == {"release"}  # merge row filtered out
+    # AOI-average cost/100 km^2 = cost_usd * 100 / (n_shards * shard_area_km2)
+    # = 0.016 * 100 / (4 * 162) = 0.0024691...
+    assert hist["cost_per_100km2_usd"].iloc[0] == pytest.approx(0.016 * 100 / (4 * 162.0))
+
+
+def test_make_full_aoi_release_figure_renders_and_empty_is_false(tmp_path):
+    ps = pytest.importorskip("plot_series")
+    df = fas.records_to_frame(
+        _matrix_records("c1", "v0.24.0", 0.016) + _matrix_records("c2", "v0.25.0", 0.018)
+    )
+    for name, (col, label) in ps.FULL_AOI_FIGURES.items():
+        out = tmp_path / f"{name}.png"
+        assert ps.make_full_aoi_release_figure(df, col, label, out) is True
+        assert out.exists() and out.stat().st_size > 0
+    # Nothing retained yet -> False (Pages index omits the section, no broken image).
+    import pandas as pd
+
+    assert (
+        ps.make_full_aoi_release_figure(pd.DataFrame(), "cost_usd", "c", tmp_path / "x.png")
+        is False
+    )
