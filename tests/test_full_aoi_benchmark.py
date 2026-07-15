@@ -62,14 +62,18 @@ def test_neon_catalog_committed_and_prefilters_nonempty():
 @pytest.mark.slow
 def test_neon_catalog_builds_full_aoi_shardmap(tmp_path):
     # End-to-end offline (no AWS): the release harness builds the whole-AOI
-    # shardmap for every target from the pinned catalog via --dry-run. Slow
-    # (mortie shardmap build, ~seconds/target); gated behind the slow marker.
+    # shardmap from the pinned catalog via --dry-run. Slow (mortie shardmap build,
+    # ~seconds); gated behind the slow marker. One target is enough to prove the
+    # catalog -> shardmap build path -- the manifest-consistency test above already
+    # covers all four target definitions.
     metrics = tmp_path / "m.json"
     shards = tmp_path / "s.json"
     rc = rfab.main(
         [
             "--targets",
             str(BENCH / "targets_full_aoi_neon.json"),
+            "--target",
+            "full_aoi_neon_o9_inline_nomask",
             "--catalog",
             str(BENCH / "catalogs" / "cat_neon.parquet"),
             "--dry-run",
@@ -89,10 +93,10 @@ def test_neon_catalog_builds_full_aoi_shardmap(tmp_path):
     )
     assert rc == 0
     runs = json.loads(metrics.read_text())
-    assert len(runs) == 4  # inline/sidecar x mask/nomask
-    for run in runs:
-        assert run["n_shards"] == 4  # the NEON AOI fans to 4 o9 shards
-        assert run["apriori_estimate"]["est_cost_usd"] > 0
+    assert len(runs) == 1
+    run = runs[0]
+    assert run["n_shards"] == 4  # the NEON AOI fans to 4 o9 shards
+    assert run["apriori_estimate"]["est_cost_usd"] > 0
 
 
 # --- pure helpers ----------------------------------------------------------
