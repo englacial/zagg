@@ -1276,6 +1276,83 @@ class TestSetupHive:
         assert handler_mod._handle_setup(self._event(tmp_path, cfg))["statusCode"] == 200
 
 
+class TestFinalizeHive:
+    """Issue #252: for a hive config, finalize mode writes the root
+    ``morton_hive.json`` — the manifest folded off the pre-worker setup path —
+    with the same frozen-key resume semantics as setup had; a flat finalize
+    event (no ``config`` key) still goes down the consolidation path."""
+
+    def _event(self, tmp_path, config_dict, **extra):
+        return {
+            "mode": "finalize",
+            "store_path": str(tmp_path / "hive-out"),
+            "parent_order": 6,
+            "overwrite": False,
+            "config": config_dict,
+            "dataset": {"short_name": "ATL06", "version": "007"},
+            **extra,
+        }
+
+    def test_finalize_writes_manifest_only(self, handler_mod, tmp_path):
+        import os
+
+        from zagg import hive
+
+        event = self._event(tmp_path, TestProcessHive._hive_config_dict())
+        resp = handler_mod._handle_finalize(event)
+        assert resp["statusCode"] == 200, resp["body"]
+        # The success body echoes the layout acted on, matching setup's echo.
+        assert json.loads(resp["body"])["layout"] == "hive"
+
+        manifest = hive.read_manifest(event["store_path"])
+        assert manifest["spec"] == "morton-hive/1"
+        assert manifest["dataset"] == {"short_name": "ATL06", "version": "007"}
+        assert manifest["shard_order"] == 6
+        assert manifest["cell_order"] == 12
+        # The manifest is the ONLY object: no consolidated zarr metadata.
+        assert sorted(os.listdir(event["store_path"])) == [hive.MANIFEST_NAME]
+
+    def test_finalize_windowed_declares_v2_manifest(self, handler_mod, tmp_path):
+        from zagg import hive
+
+        event = self._event(tmp_path, TestProcessHiveWindowed._windowed_config_dict())
+        resp = handler_mod._handle_finalize(event)
+        assert resp["statusCode"] == 200, resp["body"]
+        manifest = hive.read_manifest(event["store_path"])
+        assert manifest["spec"] == "morton-hive/2"
+        assert manifest["temporal"]["schedule"] == "yearly"
+
+    def test_finalize_frozen_key_mismatch_is_500(self, handler_mod, tmp_path):
+        cfg = TestProcessHive._hive_config_dict()
+        assert handler_mod._handle_finalize(self._event(tmp_path, cfg))["statusCode"] == 200
+        # A re-finalize with different orders must fail with the pointed
+        # remedy, matching ensure_manifest's semantics at setup time.
+        other = TestProcessHive._hive_config_dict()
+        other["output"]["grid"]["parent_order"] = 5
+        resp = handler_mod._handle_finalize(self._event(tmp_path, other))
+        assert resp["statusCode"] == 500
+        assert "clear the store root" in json.loads(resp["body"])["error"]
+
+    def test_finalize_rerun_with_matching_config_resumes(self, handler_mod, tmp_path):
+        cfg = TestProcessHive._hive_config_dict()
+        assert handler_mod._handle_finalize(self._event(tmp_path, cfg))["statusCode"] == 200
+        assert handler_mod._handle_finalize(self._event(tmp_path, cfg))["statusCode"] == 200
+
+    def test_flat_event_still_consolidates(self, handler_mod, monkeypatch, tmp_path):
+        # No "config" key -> the pre-#252 consolidation path, untouched.
+        import zarr
+
+        calls = []
+        monkeypatch.setattr(handler_mod, "open_store", lambda *a, **k: object())
+        monkeypatch.setattr(zarr, "consolidate_metadata", lambda store, **k: calls.append(store))
+        resp = handler_mod._handle_finalize(
+            {"mode": "finalize", "store_path": str(tmp_path / "flat.zarr")}
+        )
+        assert resp["statusCode"] == 200, resp["body"]
+        assert "layout" not in json.loads(resp["body"])
+        assert len(calls) == 1
+
+
 class TestSetupTemplate:
     """Issue #99: the setup handler used to hand-build the HEALPix grid and drop
     ``chunk_inner``, so the template was chunked at ``parent_order`` while workers

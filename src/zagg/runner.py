@@ -1731,18 +1731,16 @@ def _run_local(
     windowing = get_windowing(config)
     if store_layout == "hive":
         # Hive layout (issue #199 phase 2): no shared zarr template — zero
-        # metadata above the leaves (D5). Template time writes only the root
-        # manifest (D6); each shard emits its own leaf template lazily inside
-        # hive.process_and_write_hive (the leaf write path lives in zagg.hive,
-        # next to the manifest/stamp machinery it exercises).
+        # metadata above the leaves (D5); each shard emits its own leaf
+        # template lazily inside hive.process_and_write_hive (the leaf write
+        # path lives in zagg.hive, next to the manifest/stamp machinery it
+        # exercises). The root manifest write (D6) is folded into the
+        # end-of-run finalize below (issue #252): the manifest is
+        # reader-facing only — workers write self-describing leaves (D3) and
+        # never read it — so nothing runs ahead of the dispatch, mirroring
+        # the lambda backend.
         from zagg.hive import build_manifest, ensure_manifest, process_and_write_hive
 
-        ensure_manifest(
-            store_path,
-            build_manifest(grid, dataset=catalog_data.get("metadata"), windowing=windowing),
-            overwrite=overwrite,
-            **store_kwargs,
-        )
         zarr_store = None
         # Temporal fan-out (issue #246 phase 5): one work unit per (shard,
         # window). None (schedule none/absent) keeps the (shard, records)
@@ -1855,6 +1853,18 @@ def _run_local(
     # skip it unless output.consolidate_metadata is true.
     if get_consolidate_metadata(config):
         consolidate_metadata(zarr_store, zarr_format=3)
+    # End-of-run manifest write (issue #252): folded out of template time —
+    # order-correct because readers only arrive after the run. Unlike the
+    # root coverage.moc below (a regenerable cache, D9), the manifest is
+    # REQUIRED reader-facing schema (D6), so a failed write — including a
+    # frozen-key mismatch against an existing store's manifest — raises.
+    if store_layout == "hive":
+        ensure_manifest(
+            store_path,
+            build_manifest(grid, dataset=catalog_data.get("metadata"), windowing=windowing),
+            overwrite=overwrite,
+            **store_kwargs,
+        )
     wall_time = time.time() - start_time
 
     # End-of-run root coverage.moc (issue #200 phase 3; default-on for hive,
@@ -2133,7 +2143,28 @@ def _run_lambda(
     # so gate the invoke dispatcher-side. When off we hand the executor a no-op
     # finalize (mirroring the temporal path's ``_run_lambda_events``, which has no
     # metadata to consolidate) so no ``mode: "finalize"`` Lambda is dispatched.
-    if get_consolidate_metadata(config):
+    # Hive (issue #252): finalize ALWAYS runs — it carries the root
+    # morton_hive.json write, folded off the pre-worker setup path — so the
+    # consolidate_metadata gate stays flat-only. The manifest inputs (config
+    # + dataset identity from the ShardMap metadata, the same source as the
+    # local path) ride the finalize event; flat finalize events stay
+    # byte-identical.
+    if get_store_layout(config) == "hive":
+        md = catalog_data.get("metadata") or {}
+        dataset = {"short_name": md.get("short_name"), "version": md.get("version")}
+
+        def _finalize_fn():
+            return _invoke_lambda_finalize(
+                state["lambda_client"],
+                function_name,
+                store_path,
+                output_creds_event=output_creds_event,
+                config_dict=config_dict,
+                dataset=dataset,
+                parent_order=parent_order,
+                overwrite=overwrite,
+            )
+    elif get_consolidate_metadata(config):
 
         def _finalize_fn():
             return _invoke_lambda_finalize(
@@ -2157,36 +2188,35 @@ def _run_lambda(
     executor.preflight(len(cells))
     max_workers = state["workers"]
 
-    # Create template via Lambda. The template write happens inside the
-    # function so the orchestrator only needs lambda:InvokeFunction; no
-    # direct S3 access to the output bucket is required (works cleanly
-    # for cross-account callers like CryoCloud).
+    # Create template via Lambda (flat only). The template write happens
+    # inside the function so the orchestrator only needs
+    # lambda:InvokeFunction; no direct S3 access to the output bucket is
+    # required (works cleanly for cross-account callers like CryoCloud).
     # Orchestrator phase brackets (always-on; just time.time() deltas around
     # calls that already happen, so no worker probe tax -- issue #100). They
     # decompose wall time into setup invoke / fan-out / finalize invoke so
     # "where did wall time go" is answerable from the summary.
-    # Hive layout (issue #199 phase 3): setup mode writes morton_hive.json
-    # instead of a global template. The worker builds the manifest itself from
-    # the event's config; only the dataset identity (from the ShardMap
-    # metadata, matching the local path's source) rides in the event — flat
-    # runs omit the key, keeping their setup event byte-identical.
-    dataset = None
-    if get_store_layout(config) == "hive":
-        md = catalog_data.get("metadata") or {}
-        dataset = {"short_name": md.get("short_name"), "version": md.get("version")}
+    # Hive layout (issue #252): NO pre-worker setup invoke. The manifest is
+    # reader-facing and hive workers write self-describing leaves (D3), so
+    # the morton_hive.json write rides the finalize invoke instead —
+    # order-correct (readers arrive after the run) and a whole synchronous
+    # ~3.7 s pre-fan-out round-trip off the wall. setup_s keeps bracketing
+    # the phase.
     setup_start = time.time()
-    _invoke_lambda_setup(
-        state["lambda_client"],
-        function_name,
-        store_path,
-        parent_order=parent_order,
-        child_order=child_order,
-        n_parent_cells=len(all_shards) if grid_type == "healpix" and layout == "dense" else None,
-        overwrite=overwrite,
-        config_dict=config_dict,
-        output_creds_event=output_creds_event,
-        dataset=dataset,
-    )
+    if get_store_layout(config) != "hive":
+        _invoke_lambda_setup(
+            state["lambda_client"],
+            function_name,
+            store_path,
+            parent_order=parent_order,
+            child_order=child_order,
+            n_parent_cells=(
+                len(all_shards) if grid_type == "healpix" and layout == "dense" else None
+            ),
+            overwrite=overwrite,
+            config_dict=config_dict,
+            output_creds_event=output_creds_event,
+        )
     setup_s = time.time() - setup_start
 
     start_time = time.time()
@@ -2944,24 +2974,14 @@ def _invoke_lambda_setup(
     overwrite,
     config_dict,
     output_creds_event=None,
-    dataset=None,
 ):
-    """Invoke Lambda in setup mode to create the zarr template.
+    """Invoke Lambda in setup mode to create the zarr template (flat only).
 
-    For a hive-layout config (issue #199 phase 3) the worker writes
-    ``morton_hive.json`` instead; ``dataset`` (``{"short_name", "version"}``
-    from the ShardMap metadata) is threaded through for the manifest's
-    identity block. The key is added only when set, so flat setup events stay
-    byte-identical.
-
-    Stale-deployment guard (review finding, PR #205): a function deployed
-    before phase 3 has no hive branch — it would emit the flat GLOBAL template
-    at the hive root, return the same 200 body, and the whole run would then
-    silently write a flat store. The phase-3 handler echoes the layout it
-    acted on (``"layout"`` in the response body), and a hive dispatch REQUIRES
-    that echo — failing fast at setup with a redeploy message instead of after
-    a full fan-out. Flat dispatch does not require the echo, so a new
-    dispatcher keeps working against old deployed functions for flat runs.
+    Hive runs no longer dispatch setup (issue #252): the morton_hive.json
+    write is folded into the finalize invoke, so nothing runs ahead of the
+    fan-out. The flat setup event is byte-identical to the pre-#199-phase-3
+    event, so a new dispatcher keeps working against old deployed functions
+    for flat runs.
     """
     event = {
         "mode": "setup",
@@ -2972,8 +2992,6 @@ def _invoke_lambda_setup(
         "overwrite": overwrite,
         "config": config_dict,
     }
-    if dataset is not None:
-        event["dataset"] = dataset
     if output_creds_event is not None:
         event["output_credentials"] = output_creds_event
     response = lambda_client.invoke(
@@ -2987,24 +3005,36 @@ def _invoke_lambda_setup(
     result = json.loads(payload)
     if result.get("statusCode") != 200:
         raise RuntimeError(f"Lambda setup error: {result.get('body')}")
-    requested = ((config_dict or {}).get("output") or {}).get("store_layout") or "flat"
-    if requested == "hive":
-        try:
-            echoed = json.loads(result.get("body") or "{}").get("layout")
-        except (TypeError, ValueError):
-            echoed = None
-        if echoed != "hive":
-            raise RuntimeError(
-                f"Lambda setup did not confirm the hive store layout (response body "
-                f"{result.get('body')!r}): the deployed function predates issue #199 "
-                f"phase 3 and would write a FLAT store at the hive root — redeploy "
-                f"the function before dispatching hive runs"
-            )
 
 
-def _invoke_lambda_finalize(lambda_client, function_name, store_path, output_creds_event=None):
-    """Invoke Lambda in finalize mode to consolidate zarr metadata."""
+def _invoke_lambda_finalize(
+    lambda_client,
+    function_name,
+    store_path,
+    output_creds_event=None,
+    *,
+    config_dict=None,
+    dataset=None,
+    parent_order=None,
+    overwrite=False,
+):
+    """Invoke Lambda in finalize mode.
+
+    Flat: consolidates zarr metadata — the event stays byte-identical to the
+    pre-#252 one. Hive (issue #252): the event additionally carries the
+    manifest inputs (``config`` + ``parent_order`` + ``dataset`` identity +
+    ``overwrite``, mirroring the old setup event) and the worker writes the
+    root ``morton_hive.json`` instead — the manifest write folded off the
+    pre-worker critical path. The manifest is REQUIRED reader-facing schema
+    (D6), so a non-200 raises — unlike the fail-open root coverage.moc (D9).
+    """
     event = {"mode": "finalize", "store_path": store_path}
+    if config_dict is not None:
+        event["config"] = config_dict
+        event["parent_order"] = parent_order
+        event["overwrite"] = overwrite
+        if dataset is not None:
+            event["dataset"] = dataset
     if output_creds_event is not None:
         event["output_credentials"] = output_creds_event
     response = lambda_client.invoke(

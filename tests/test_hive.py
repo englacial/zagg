@@ -1063,8 +1063,9 @@ class TestLeafBlockIndex:
 
 class TestRunnerWiring:
     """The local backend writes the manifest (no shared template) under hive;
-    the lambda backend dispatches hive runs (issue #199 phase 3), threading
-    the manifest's dataset identity through the setup invoke."""
+    the lambda backend dispatches hive runs (issue #199 phase 3). The
+    manifest write is folded into finalize on both paths (issue #252) — no
+    pre-worker setup invoke, the dataset identity rides the finalize event."""
 
     def _catalog(self, tmp_path):
         shard = _shard_word()
@@ -1096,6 +1097,10 @@ class TestRunnerWiring:
         monkeypatch.setattr(runner, "get_nsidc_s3_credentials", lambda: {"accessKeyId": "a"})
 
         def fake_hive_write(shard_key, granule_urls, grid, s3_creds, store_root, config, **kw):
+            # The manifest write is folded into finalize (issue #252): while
+            # cells run, NOTHING has been written at the root — the manifest
+            # is off the critical path, not merely reordered.
+            assert not os.path.exists(os.path.join(store_root, hive.MANIFEST_NAME))
             calls.append((int(shard_key), store_root))
             return {"shard_key": int(shard_key), "error": None, "total_obs": 1}
 
@@ -1103,9 +1108,9 @@ class TestRunnerWiring:
         agg(cfg, catalog=catalog_path, store=root, backend="local")
 
         assert calls == [(shard, root)]
-        # Template time wrote ONLY the manifest — no shared zarr template
-        # (D5). The end-of-run root coverage.moc (issue #200 phase 3,
-        # default-on for hive) is the only other root object.
+        # End of run wrote ONLY the manifest — no shared zarr template (D5).
+        # The root coverage.moc (issue #200 phase 3, default-on for hive) is
+        # the only other root object.
         assert sorted(os.listdir(root)) == [hive.ROOT_COVERAGE_NAME, hive.MANIFEST_NAME]
         assert hive.read_manifest(root)["shard_order"] == 6
 
@@ -1159,10 +1164,11 @@ class TestRunnerWiring:
             assert n_objects == 1, name
         assert hive.read_commit(open_store(leaf))["complete"] is True
 
-    def test_lambda_hive_dispatches_with_manifest_dataset(self, monkeypatch, cfg, tmp_path):
-        # Issue #199 phase 3: hive is wired to the lambda backend. The setup
-        # invoke carries the manifest's dataset identity (from the ShardMap
-        # metadata, same source as the local path) and the per-cell events need
+    def test_lambda_hive_folds_manifest_into_finalize(self, monkeypatch, cfg, tmp_path):
+        # Issue #252: a hive lambda run dispatches NO setup invoke — the
+        # manifest inputs (dataset identity from the ShardMap metadata, same
+        # source as the local path) ride the finalize invoke, which runs even
+        # with consolidate_metadata off (the default). Per-cell events need
         # NO new keys — the worker derives everything from the config dict.
         from unittest.mock import MagicMock
 
@@ -1200,7 +1206,9 @@ class TestRunnerWiring:
         monkeypatch.setattr(
             runner, "_invoke_lambda_setup", lambda *a, **kw: captured.update(setup=kw)
         )
-        monkeypatch.setattr(runner, "_invoke_lambda_finalize", lambda *a, **k: None)
+        monkeypatch.setattr(
+            runner, "_invoke_lambda_finalize", lambda *a, **kw: captured.update(finalize=kw)
+        )
 
         def fake_cell(client, chunk_idx, shard_key, *a, **k):
             captured["cell_shard_key"] = shard_key
@@ -1215,14 +1223,18 @@ class TestRunnerWiring:
         monkeypatch.setattr(runner, "_invoke_lambda_cell", fake_cell)
         agg(cfg, catalog=catalog_path, store="s3://out/product", backend="lambda")
 
-        assert captured["setup"]["dataset"] == {"short_name": "ATL06", "version": "007"}
+        # NO pre-worker setup invoke: hive setup is gone from the wall.
+        assert "setup" not in captured
+        assert captured["finalize"]["dataset"] == {"short_name": "ATL06", "version": "007"}
         # store_layout rides in the config dict already serialized into events.
-        assert captured["setup"]["config_dict"]["output"]["store_layout"] == "hive"
+        assert captured["finalize"]["config_dict"]["output"]["store_layout"] == "hive"
         # The per-cell event schema is unchanged: shard_key stays the packed int.
         assert captured["cell_shard_key"] == shard
 
-    def test_lambda_flat_setup_omits_dataset(self, monkeypatch, cfg, tmp_path):
-        # Flat runs keep their setup call byte-identical: dataset stays None.
+    def test_lambda_flat_setup_and_finalize_unchanged(self, monkeypatch, cfg, tmp_path):
+        # Flat runs keep the pre-#252 lifecycle: the setup invoke still runs
+        # (no dataset threading — that was hive-only and left with the fold)
+        # and finalize stays gated on consolidate_metadata (off by default).
         from unittest.mock import MagicMock
 
         import boto3
@@ -1258,7 +1270,9 @@ class TestRunnerWiring:
         monkeypatch.setattr(
             runner, "_invoke_lambda_setup", lambda *a, **kw: captured.update(setup=kw)
         )
-        monkeypatch.setattr(runner, "_invoke_lambda_finalize", lambda *a, **k: None)
+        monkeypatch.setattr(
+            runner, "_invoke_lambda_finalize", lambda *a, **kw: captured.update(finalize=kw)
+        )
         monkeypatch.setattr(
             runner,
             "_invoke_lambda_cell",
@@ -1271,30 +1285,31 @@ class TestRunnerWiring:
             },
         )
         agg(cfg, catalog=catalog_path, store="s3://out/x.zarr", backend="lambda")
-        assert captured["setup"]["dataset"] is None
+        assert "dataset" not in captured["setup"]
+        assert "finalize" not in captured
+
+
+def _wire_client(body: dict, status_code: int = 200):
+    """Mocked boto3 lambda client capturing ``Payload`` on the wire."""
+    from unittest.mock import MagicMock
+
+    payload = MagicMock()
+    payload.read.return_value = json.dumps(
+        {"statusCode": status_code, "body": json.dumps(body)}
+    ).encode()
+    client = MagicMock()
+    client.invoke.return_value = {"Payload": payload, "FunctionError": None}
+    return client
 
 
 class TestInvokeLambdaSetupEvent:
-    """Pin the ACTUAL setup event on the wire and the stale-deployment guard
-    (review findings, PR #205). The dispatch tests above monkeypatch
-    ``_invoke_lambda_setup`` at kwarg level, so the event-shaping conditional
-    (``dataset`` added only when set) and the layout-echo assertion are
-    exercised here directly, with a mocked boto3 client capturing ``Payload``."""
+    """Pin the ACTUAL setup event on the wire. Setup is flat-only now (issue
+    #252 folded the hive manifest into finalize and the PR #205 layout-echo
+    guard into the version ping), so what remains to pin is flat byte-identity
+    against pre-phase-3 deployed functions."""
 
     @staticmethod
-    def _client(body: dict):
-        from unittest.mock import MagicMock
-
-        payload = MagicMock()
-        payload.read.return_value = json.dumps(
-            {"statusCode": 200, "body": json.dumps(body)}
-        ).encode()
-        client = MagicMock()
-        client.invoke.return_value = {"Payload": payload, "FunctionError": None}
-        return client
-
-    @staticmethod
-    def _invoke(client, config_dict, dataset=None):
+    def _invoke(client, config_dict):
         from zagg.runner import _invoke_lambda_setup
 
         _invoke_lambda_setup(
@@ -1306,21 +1321,14 @@ class TestInvokeLambdaSetupEvent:
             n_parent_cells=None,
             overwrite=False,
             config_dict=config_dict,
-            dataset=dataset,
         )
         return json.loads(client.invoke.call_args.kwargs["Payload"])
 
-    def test_hive_event_carries_dataset(self, cfg):
-        cfg.output["store_layout"] = "hive"
-        client = self._client({"ok": True, "mode": "setup", "layout": "hive"})
-        event = self._invoke(client, asdict(cfg), dataset={"short_name": "ATL06", "version": "007"})
-        assert event["dataset"] == {"short_name": "ATL06", "version": "007"}
-
-    def test_flat_event_omits_dataset_and_matches_baseline(self, cfg):
+    def test_flat_event_matches_baseline(self, cfg):
         # The byte-identity claim, pinned on the wire: no "dataset" key, and
         # the event is exactly the pre-phase-3 flat setup event.
         config_dict = asdict(cfg)
-        client = self._client({"ok": True, "mode": "setup", "layout": "flat"})
+        client = _wire_client({"ok": True, "mode": "setup", "layout": "flat"})
         event = self._invoke(client, config_dict)
         assert "dataset" not in event
         assert event == {
@@ -1336,21 +1344,46 @@ class TestInvokeLambdaSetupEvent:
     def test_flat_without_layout_echo_unaffected(self, cfg):
         # Old deployed functions return the echo-less body: flat dispatch must
         # keep working against them.
-        self._invoke(self._client({"ok": True, "mode": "setup"}), asdict(cfg))
+        self._invoke(_wire_client({"ok": True, "mode": "setup"}), asdict(cfg))
 
-    @pytest.mark.parametrize(
-        "body",
-        [
-            {"ok": True, "mode": "setup"},  # pre-phase-3 function: no echo
-            {"ok": True, "mode": "setup", "layout": "flat"},  # wrong layout acted on
-        ],
-    )
-    def test_hive_without_hive_echo_fails_fast(self, cfg, body):
-        # Stale-deployment guard: an old function would emit the flat GLOBAL
-        # template at the hive root and return a 200 the dispatcher couldn't
-        # tell apart — the layout echo makes that fail at setup, pre-fan-out.
+
+class TestInvokeLambdaFinalizeEvent:
+    """Pin the ACTUAL finalize event on the wire (issue #252): hive carries
+    the manifest inputs (mirroring the retired hive setup event); flat stays
+    byte-identical to the pre-fold finalize event."""
+
+    @staticmethod
+    def _invoke(client, **kw):
+        from zagg.runner import _invoke_lambda_finalize
+
+        _invoke_lambda_finalize(client, "process-shard", "s3://out/product", **kw)
+        return json.loads(client.invoke.call_args.kwargs["Payload"])
+
+    def test_flat_event_matches_baseline(self):
+        event = self._invoke(_wire_client({"ok": True, "mode": "finalize"}))
+        assert event == {"mode": "finalize", "store_path": "s3://out/product"}
+
+    def test_hive_event_carries_manifest_inputs(self, cfg):
         cfg.output["store_layout"] = "hive"
-        with pytest.raises(RuntimeError, match="redeploy"):
+        config_dict = asdict(cfg)
+        event = self._invoke(
+            _wire_client({"ok": True, "mode": "finalize", "layout": "hive"}),
+            config_dict=config_dict,
+            dataset={"short_name": "ATL06", "version": "007"},
+            parent_order=6,
+            overwrite=False,
+        )
+        assert event["config"] == config_dict
+        assert event["dataset"] == {"short_name": "ATL06", "version": "007"}
+        assert event["parent_order"] == 6
+        assert event["overwrite"] is False
+
+    def test_non_200_raises(self):
+        # The manifest is REQUIRED reader-facing schema (D6): a failed hive
+        # finalize must raise, unlike the fail-open root coverage.moc (D9).
+        with pytest.raises(RuntimeError, match="Lambda finalize error"):
             self._invoke(
-                self._client(body), asdict(cfg), dataset={"short_name": "A", "version": "1"}
+                _wire_client({"error": "boom", "mode": "finalize"}, status_code=500),
+                config_dict={"output": {"store_layout": "hive"}},
+                parent_order=6,
             )

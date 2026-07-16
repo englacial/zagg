@@ -43,7 +43,9 @@ Event payload (default / process mode):
 Setup mode (creates the zarr template once before per-cell fan-out; for a
 hive-layout config -- output.store_layout: hive, issue #199 -- it writes the
 morton_hive.json manifest instead, and each process-mode worker emits its own
-leaf template):
+leaf template. Current dispatchers no longer send hive setup -- the manifest
+rides finalize instead, issue #252 -- but the hive branch stays so older
+dispatchers keep working against this function):
 {
     "mode": "setup",
     "store_path": str,
@@ -58,10 +60,17 @@ leaf template):
     "output_credentials": dict (optional, same shape as process mode),
 }
 
-Finalize mode (consolidates zarr metadata after all cells complete):
+Finalize mode (after all cells complete: consolidates zarr metadata; for a
+hive-layout config -- issue #252 -- it writes the morton_hive.json manifest
+instead, folded off the pre-worker setup path):
 {
     "mode": "finalize",
     "store_path": str,
+    "config": dict (optional, hive only) -- same single-source config as setup;
+        its presence + store_layout selects the manifest write. With it ride
+        "parent_order", "overwrite", and the optional "dataset" identity
+        block, mirroring the hive setup event. Absent on flat runs (their
+        event is byte-identical to pre-#252).
     "output_credentials": dict (optional, same shape as process mode),
 }
 
@@ -672,11 +681,42 @@ def _handle_setup(event: Dict[str, Any]) -> Dict[str, Any]:
 
 
 def _handle_finalize(event: Dict[str, Any]) -> Dict[str, Any]:
-    """Consolidate zarr metadata for the store at ``event['store_path']``."""
-    from zarr import consolidate_metadata
+    """Finalize the store at ``event['store_path']``.
 
-    logger.info(f"Finalize mode: consolidating metadata at {event.get('store_path')}")
+    Flat: consolidate zarr metadata (byte-identical to before). Hive (issue
+    #252): write the root ``morton_hive.json`` manifest instead — folded off
+    the setup path so no pre-worker invoke blocks the fan-out. Order-correct
+    because the manifest is reader-facing only: workers write self-describing
+    leaves (D3) and readers arrive after the run. The manifest inputs mirror
+    the hive setup event (``config``/``parent_order``/``dataset``/
+    ``overwrite``); there is no zarr hierarchy above the leaves to
+    consolidate (D5), so the hive branch returns without touching zarr. The
+    success body echoes ``"layout": "hive"``, matching setup's echo.
+    """
+    logger.info(f"Finalize mode: finalizing store at {event.get('store_path')}")
     try:
+        if "config" in event:
+            config = load_config_from_dict(event["config"])
+            if get_store_layout(config) == "hive":
+                from zagg.config import get_windowing
+                from zagg.grids import from_config
+                from zagg.hive import build_manifest, ensure_manifest
+
+                grid = from_config(config, parent_order=event.get("parent_order"))
+                ensure_manifest(
+                    event["store_path"],
+                    build_manifest(
+                        grid, dataset=event.get("dataset"), windowing=get_windowing(config)
+                    ),
+                    overwrite=event.get("overwrite", False),
+                    **_output_store_kwargs(event),
+                )
+                return {
+                    "statusCode": 200,
+                    "body": json.dumps({"ok": True, "mode": "finalize", "layout": "hive"}),
+                }
+        from zarr import consolidate_metadata
+
         store = open_store(event["store_path"], **_output_store_kwargs(event))
         consolidate_metadata(store, zarr_format=3)
         return {"statusCode": 200, "body": json.dumps({"ok": True, "mode": "finalize"})}
