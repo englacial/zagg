@@ -1156,8 +1156,23 @@ class TestProcessHiveWindowed:
         resp = handler_mod._handle_process(event, _context())
         assert resp["statusCode"] == 200, resp["body"]
 
-        # The injected window filter pair reached the worker's config.
-        assert [f["op"] for f in seen["filters"][-2:]] == ["ge", "lt"]
+        # The injected window filter pair reached the worker's config — full
+        # dicts (level/dataset/op/value), matching how test_hive_windows.py's
+        # TestWindowedCellConfig pins the ge/lt pair off the time field.
+        assert seen["filters"][-2:] == [
+            {
+                "level": None,
+                "dataset": "/{group}/land_ice_segments/delta_time",
+                "op": "ge",
+                "value": 365 * 86400.0,
+            },
+            {
+                "level": None,
+                "dataset": "/{group}/land_ice_segments/delta_time",
+                "op": "lt",
+                "value": 730 * 86400.0,
+            },
+        ]
         assert seen["time_range_of"] == "delta_time"
         # The leaf is the WINDOWED name; its stamp carries the D15 truth.
         leaf = hive.shard_leaf_path(event["store_path"], TestProcessHive._WORD, window="2019")
