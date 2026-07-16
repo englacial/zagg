@@ -355,3 +355,50 @@ def test_mismatch_bounded_checks_range_only():
     assert bench_objects.object_count_mismatch(inside, expected) is None
     over = dict(inside, objects_total=71)
     assert "outside" in bench_objects.object_count_mismatch(over, expected)
+
+
+# --- run_benchmark._measure_objects (end-to-end, local store) ----------------
+
+
+def test_measure_objects_end_to_end(tmp_path):
+    # The per-merge harness's measurement helper against a real sharded store:
+    # clean run -> exact expectation recorded, no mismatch.
+    import run_benchmark
+
+    grid = _grid(sharded=True)
+    root = str(tmp_path / "store")
+    store = open_store(root)
+    grid.emit_template(store)
+    word = morton_word(_KEY_A)
+    _write_flat_shard(grid, store, word, sharded=True)
+
+    payload = run_benchmark._measure_objects(
+        _cfg(sharded=True), grid, root, word, region="us-west-2"
+    )
+    assert payload == {
+        "objects_total": 10,  # 6 metadata + 4 shard objects
+        "objects_expected": 10,
+        "objects_per_shard": {_KEY_A: 4},
+        "objects_mismatch": None,
+    }
+
+
+def test_measure_objects_flags_bypass(tmp_path):
+    # A store written per-inner-chunk (the issue #215 bypass) while the config
+    # and grid promise sharded output (as run_target derives them) must come
+    # back with a mismatch description for main() to hard-fail on.
+    import run_benchmark
+
+    grid_flat = _grid(sharded=False)
+    root = str(tmp_path / "store")
+    store = open_store(root)
+    grid_flat.emit_template(store)
+    word = morton_word(_KEY_A)
+    _write_flat_shard(grid_flat, store, word, sharded=False)
+
+    payload = run_benchmark._measure_objects(
+        _cfg(sharded=True), _grid(sharded=True), root, word, region="us-west-2"
+    )
+    assert payload["objects_mismatch"] is not None
+    assert payload["objects_total"] == 6 + 64  # metadata + 16 chunks x 4 arrays
+    assert payload["objects_expected"] == 10

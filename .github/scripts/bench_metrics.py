@@ -76,6 +76,15 @@ RECORD_COLUMNS = [
     # Read-backend axis (issue #193): "inline" | "sidecar" -- the live matrix's
     # A/B column. Null on frozen/legacy rows (codec/read axes predate it).
     "index_backend",
+    # Store object counts (issue #240): the measured object total of the run's
+    # output store and the config-derived expectation (null when the layout's
+    # count is data-dependent, i.e. not exact) -- the sharded-write-bypass
+    # tripwire (issue #215). Null on rows recorded before the metric existed.
+    # The per-run record additionally carries the JSON-only
+    # ``objects_per_shard`` / ``objects_mismatch`` keys, which the reindex to
+    # these columns deliberately drops from the parquet series.
+    "objects_total",
+    "objects_expected",
 ]
 
 
@@ -140,11 +149,15 @@ def build_record(
     context: dict,
     n_granules: int | None = None,
     zagg_version: str = "",
+    objects: dict | None = None,
 ) -> dict:
     """Flatten a one-shard ``agg`` summary into a benchmark record.
 
     ``context`` carries the run identity (timestamp/commit/ref/event/pr_number/
     target/aggregator/grid_type/grid_size/shard_key) that the summary does not.
+    ``objects`` (issue #240) carries the store object-count measurement from
+    ``run_benchmark._measure_objects`` -- ``None`` (dry-run / no store) leaves
+    the object columns null.
     """
     area = shard_area_km2(grid)
     cost = summary.get("estimated_cost_usd")
@@ -189,6 +202,14 @@ def build_record(
         "fanout_s": summary.get("fanout_s"),
         "finalize_s": summary.get("finalize_s"),
     }
+    # Store object counts (issue #240). The two scalar columns are retained in
+    # the parquet series; per_shard/mismatch ride the metrics.json record only
+    # (update_series's reindex drops them).
+    o = objects or {}
+    record["objects_total"] = o.get("objects_total")
+    record["objects_expected"] = o.get("objects_expected")
+    record["objects_per_shard"] = o.get("objects_per_shard")
+    record["objects_mismatch"] = o.get("objects_mismatch")
     return record
 
 
@@ -214,7 +235,28 @@ TABLE_HEADERS = [
     "% timeout",
     "mem (MB)",
     "% cap",
+    "objects",
 ]
+
+
+def _objects_cell(record: dict) -> str:
+    """``measured/expected`` store object counts (issue #240), ``n/a``-safe.
+
+    ``10/10`` when the expectation is exact, bare ``10`` when it is bounded
+    (expected null), ``n/a`` on legacy/dry-run rows (both null, or NaN from a
+    legacy parquet row).
+    """
+
+    def _num(value):
+        if value is None or (isinstance(value, float) and math.isnan(value)):
+            return None
+        return int(value)
+
+    total = _num(record.get("objects_total"))
+    if total is None:
+        return "n/a"
+    expected = _num(record.get("objects_expected"))
+    return f"{total}/{expected}" if expected is not None else str(total)
 
 
 def format_record_cells(r: dict) -> dict:
@@ -236,6 +278,7 @@ def format_record_cells(r: dict) -> dict:
         "% timeout": _fmt(r.get("worker_pct_timeout"), ".0%"),
         "mem (MB)": _fmt(r.get("max_memory_mb"), ".0f"),
         "% cap": _fmt(mem_frac, ".0%"),
+        "objects": _objects_cell(r),
         "mem_frac": mem_frac,
     }
 

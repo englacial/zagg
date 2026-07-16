@@ -40,8 +40,15 @@ _MAX_TARGET_CONCURRENCY = 16
 # Allow ``import bench_metrics`` whether run as a script or imported by tests.
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import bench_metrics  # noqa: E402
+import bench_objects  # noqa: E402
 
-from zagg.config import get_aoi_mask, get_handoff, load_config  # noqa: E402
+from zagg.config import (  # noqa: E402
+    get_aoi_mask,
+    get_coverage_moc,
+    get_handoff,
+    get_store_layout,
+    load_config,
+)
 from zagg.grids import from_config  # noqa: E402
 
 
@@ -78,6 +85,31 @@ def _shardmap_with_mask(shardmap_path: Path, grid, aoi_file: Path) -> Path:
     out = Path(tempfile.mkdtemp(prefix="zagg-bench-mask-")) / "shardmap_aoimask.json"
     sm.to_json(str(out))
     return out
+
+
+def _measure_objects(config, grid, store: str, shard_key: int, *, region: str) -> dict:
+    """LIST the run's output store and compare against the expected model (#240).
+
+    Returns the ``objects`` payload ``bench_metrics.build_record`` threads into
+    the record: measured total, the exact expectation (null when the layout's
+    count is data-dependent), the per-shard attribution, and the mismatch
+    description (null when clean) that ``main`` hard-fails on. Uses the same
+    store factory (and credentials) the dispatch just wrote through, so a LIST
+    failure is a real run failure, not a swallowed warning.
+    """
+    layout = get_store_layout(config)
+    expected = bench_objects.expected_object_counts(
+        grid, n_shards=1, store_layout=layout, coverage_moc=get_coverage_moc(config)
+    )
+    measured = bench_objects.store_object_counts(
+        store, grid=grid, shard_keys=[shard_key], store_layout=layout, region=region
+    )
+    return {
+        "objects_total": measured["objects_total"],
+        "objects_expected": expected["total_max"] if expected["exact"] else None,
+        "objects_per_shard": measured["objects_per_shard"],
+        "objects_mismatch": bench_objects.object_count_mismatch(measured, expected),
+    }
 
 
 def load_targets(path: str) -> tuple[dict, Path]:
@@ -193,6 +225,7 @@ def run_target(
         index_backend=target.get("index_backend"),
     )
 
+    objects = None
     if dry_run:
         # Wiring check only: no AWS, no dispatch. Emit a record with empty metrics.
         summary: dict = {}
@@ -225,6 +258,12 @@ def run_target(
             # a failure -- never re-invoke (and never pay) to re-fail (#119).
             max_retries=1,
         )
+        # Object-count tripwire (issue #240): LIST the store the run just wrote
+        # and compare against the config-derived expectation, so a sharded-write
+        # bypass (the issue #215 blow-up) is recorded -- and hard-failed by
+        # ``main`` -- instead of drifting as second-order cost.
+        if store:
+            objects = _measure_objects(config, grid, store, shard_key, region=region)
 
     return bench_metrics.build_record(
         summary,
@@ -232,6 +271,7 @@ def run_target(
         context=ctx,
         n_granules=n_granules,
         zagg_version=zagg_version,
+        objects=objects,
     )
 
 
@@ -284,6 +324,15 @@ def main(argv: list[str] | None = None) -> int:
         "or null peak memory -- the signature of a silent OOM that would "
         "otherwise keep the job green (issue #145). Skipped under --dry-run, "
         "which emits empty metrics by design; --no-fail-on-empty opts out.",
+    )
+    parser.add_argument(
+        "--fail-on-object-mismatch",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Exit non-zero when a target's measured store object count deviates "
+        "from the config-derived expectation -- the sharded-write-bypass "
+        "tripwire (issues #240/#215). Skipped under --dry-run (no store is "
+        "written); --no-fail-on-object-mismatch opts out.",
     )
     args = parser.parse_args(argv)
 
@@ -351,7 +400,8 @@ def main(argv: list[str] | None = None) -> int:
             f"[{record['target']}] obs={record['total_obs']} runtime_s={record['runtime_s']} "
             f"cost/shard=${record['cost_per_shard_usd']} "
             f"cost/100km2=${record['cost_per_100km2_usd']} "
-            f"max_memory_mb={record['max_memory_mb']}"
+            f"max_memory_mb={record['max_memory_mb']} "
+            f"objects={record.get('objects_total')} (expected {record.get('objects_expected')})"
         )
 
     Path(args.out_json).write_text(json.dumps(records, indent=2))
@@ -374,6 +424,21 @@ def main(argv: list[str] | None = None) -> int:
                 f"max_memory_mb=None), likely a silent OOM: {', '.join(empty)}",
                 file=sys.stderr,
             )
+            return 1
+
+    # Object-count tripwire (issue #240): a store whose object count deviates
+    # from the config-derived expectation means the write layout regressed (a
+    # sharded-write bypass writes ~K objects per array instead of one -- issue
+    # #215). Checked AFTER the outputs are written, so metrics.json/the comment
+    # still record both the measured and expected counts of the failing run.
+    if args.fail_on_object_mismatch and not args.dry_run:
+        mismatched = [r for r in records if r.get("objects_mismatch")]
+        if mismatched:
+            for r in mismatched:
+                print(
+                    f"[{r['target']}] store object-count mismatch: {r['objects_mismatch']}",
+                    file=sys.stderr,
+                )
             return 1
     return 0
 
