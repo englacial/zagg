@@ -280,6 +280,26 @@ class TestLeafTemplateAndStamp:
             assert grp[name].shards == (g.cells_per_shard,)
             assert grp[name].chunks == (g.cells_per_chunk,)
 
+    def test_sharded_leaf_template_shards_whole_leaf_under_shard_order(self, cfg):
+        # A leaf always shards across the WHOLE leaf: the issue #133 object split
+        # (shard_order) bounds flat-path slab memory and never applies to a leaf
+        # (shard_spec passes leaf=True). Construct a grid where cells_per_shard
+        # (256) and cells_per_shard_object (64) DIVERGE so this assertion actually
+        # gates the leaf-vs-object size distinction — the fixture above, with no
+        # shard_order, has the two equal and cannot catch a regression to the
+        # object size in the leaf branch.
+        g = HealpixGrid(
+            6, 10, layout="fullsphere", config=cfg, chunk_inner=8, sharded=True, shard_order=7
+        )
+        assert g.cells_per_shard != g.cells_per_shard_object  # 256 vs 64
+        store = MemoryStore()
+        g.emit_shard_template(store, overwrite=True)
+        grp = zarr.open_group(store, path=g.group_path, mode="r", zarr_format=3)
+        for name in ("morton", "cell_ids", *get_data_vars(cfg)):
+            assert grp[name].shape == (g.cells_per_shard,)
+            assert grp[name].shards == (g.cells_per_shard,)  # whole leaf, not the object
+            assert grp[name].chunks == (g.cells_per_chunk,)
+
     def test_stamp_round_trip_and_debris_semantics(self, cfg):
         store = MemoryStore()
         self._grid(cfg).emit_shard_template(store, overwrite=True)

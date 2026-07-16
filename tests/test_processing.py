@@ -1499,18 +1499,10 @@ class TestWriteLeafToZarr:
 
     @staticmethod
     def _leaf_template(grid):
-        """Emit the sharded LEAF template directly from ``shard_spec`` (the
-        ``emit_shard_template`` seam still rejects a sharded grid until the
-        spec phase of issue #236 deletes the carve-out)."""
-        from pydantic_zarr.experimental.v3 import GroupSpec
-
-        from zagg.grids.base import vlen_dtype_warning_suppressed
-
-        store = MemoryStore()
-        spec = GroupSpec(members={grid.group_path: grid.shard_spec()}, attributes={})
-        with vlen_dtype_warning_suppressed():
-            spec.to_zarr(store, "")
-        return store
+        """Emit the sharded LEAF template via ``emit_shard_template`` — post
+        issue #236 phase 2 that seam is exactly this (its sharded-grid carve-out
+        was deleted, so the hand-built ``shard_spec`` workaround is gone)."""
+        return grid.emit_shard_template(MemoryStore(), overwrite=True)
 
     @staticmethod
     def _setup(seed=7):
