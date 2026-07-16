@@ -467,17 +467,84 @@ class TestWindowedWalkerAndSidecar:
         import logging
 
         from zagg.coverage import refresh_root_coverage
+        from zagg.store import open_store
 
-        root, word, _grid = self._windowed_store(cfg, tmp_path, labels=("2024",))
-        # A leaf-shaped name whose window part breaks the frozen charset: the
-        # walk warns and skips it instead of dying (escape-hatch posture).
-        bad = tmp_path / "store" / "-5" / "1" / "1" / "2" / "3" / "3" / "3"
-        (bad / "-5112333_bad_label.zarr").mkdir()
-        (bad / "-5112333_bad_label.zarr" / "zarr.json").write_text("{}")
+        root, word, grid = self._windowed_store(cfg, tmp_path, labels=("2024",))
+        node = tmp_path / "store" / "-5" / "1" / "1" / "2" / "3" / "3" / "3"
+        # (a) An UNSTAMPED leaf whose name breaks the frozen charset is ordinary
+        # D4 debris: read_commit returns None first, so it is dropped SILENTLY,
+        # no noisier than a valid-named unstamped leaf or the foreign-order
+        # carve-out — only real data earns a warning.
+        grid.emit_shard_template(open_store(str(node / "-5112333_bad_label.zarr")), overwrite=True)
+        with caplog.at_level(logging.WARNING, logger="zagg.coverage"):
+            env = refresh_root_coverage(root)
+        assert env is not None and len(env["ranges"]) == 1
+        assert not any("malformed window label" in r.message for r in caplog.records)
+        # (b) A STAMPED leaf with the same malformed name is real (misnamed)
+        # data: the walk warns and skips it instead of dying (escape-hatch
+        # posture), and the conforming leaf still carries the coverage.
+        stamped = open_store(str(node / "-5112333_bad_label2.zarr"))
+        grid.emit_shard_template(stamped, overwrite=True)
+        hive.stamp_commit(stamped, cells_with_data=1, granule_count=1)
+        caplog.clear()
         with caplog.at_level(logging.WARNING, logger="zagg.coverage"):
             env = refresh_root_coverage(root)
         assert env is not None and len(env["ranges"]) == 1
         assert any("malformed window label" in r.message for r in caplog.records)
+
+    def test_refresh_trusts_basename_id_over_path_node(self, cfg, tmp_path):
+        # The walker keys off `split_leaf_name(name)[0]`, never re-checking
+        # `check_node_invariant`, so a stamped windowed leaf parked at the WRONG
+        # digit node is listed at its basename id, not the path's. This mirrors
+        # pre-#246 behavior for bare leaves (the walk always trusted the basename
+        # over the path); pinning it as the intended contract, not a regression.
+        import numpy as np
+
+        from zagg.config import get_windowing
+        from zagg.coverage import refresh_root_coverage
+        from zagg.store import open_store
+
+        _windowed(cfg)
+        grid = self._grid(cfg)
+        root = str(tmp_path / "store")
+        hive.ensure_manifest(root, hive.build_manifest(grid, windowing=get_windowing(cfg)))
+        word = _shard_word()  # basename id -5112333, correct node .../3/3/3
+        # Same basename, planted one digit off (.../3/3/4): the walker descends
+        # any valid digit node and trusts the basename it finds.
+        wrong = open_store(f"{root}/-5/1/1/2/3/3/4/-5112333_2025.zarr")
+        grid.emit_shard_template(wrong, overwrite=True)
+        hive.stamp_commit(wrong, cells_with_data=1, granule_count=1, window="2025")
+        env = refresh_root_coverage(root)
+        np.testing.assert_array_equal(
+            hive.root_coverage_words(env), np.asarray([word], dtype=np.uint64)
+        )
+
+    def test_refresh_dedupes_bare_and_windowed_siblings(self, cfg, tmp_path):
+        # The spec forbids mixing a bare and a windowed leaf of one id in a
+        # single store (WRITE side), but the walk must survive it: both stamp to
+        # the same shard word, so `build_root_coverage`'s np.unique dedupe lists
+        # the shard exactly once (read-side dedupe across the two name shapes).
+        import numpy as np
+
+        from zagg.config import get_windowing
+        from zagg.coverage import refresh_root_coverage
+        from zagg.store import open_store
+
+        _windowed(cfg)
+        grid = self._grid(cfg)
+        root = str(tmp_path / "store")
+        hive.ensure_manifest(root, hive.build_manifest(grid, windowing=get_windowing(cfg)))
+        word = _shard_word()
+        for label in (None, "2025"):
+            store = open_store(hive.shard_leaf_path(root, word, window=label))
+            grid.emit_shard_template(store, overwrite=True)
+            hive.stamp_commit(
+                store, cells_with_data=1, granule_count=1, **({"window": label} if label else {})
+            )
+        env = refresh_root_coverage(root)
+        np.testing.assert_array_equal(
+            hive.root_coverage_words(env), np.asarray([word], dtype=np.uint64)
+        )
 
     def test_bitmap_sidecar_round_trip_on_windowed_leaf(self, cfg, tmp_path):
         import numpy as np
