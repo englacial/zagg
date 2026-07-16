@@ -45,6 +45,7 @@ from zagg.config import (
     get_pipeline_type,
     get_store_layout,
     get_store_path,
+    get_windowing,
 )
 from zagg.dispatch import (
     LAMBDA_MEMORY_GB,
@@ -1384,6 +1385,95 @@ def _aoi_payload_map(catalog_data: dict) -> dict:
     return {int(k): payload for k, payload in zip(catalog_data["shard_keys"], aoi)}
 
 
+def _granule_time_span(record: dict):
+    """A granule record's ``(start, end)`` UTC instants, or ``None`` (issue #246).
+
+    New shardmaps carry ``time_start``/``time_end`` (from the catalog's STAC
+    ``start_datetime``/``end_datetime``); raster records carry the instant
+    ``datetime``. A record with neither (a legacy shardmap) returns ``None``
+    — the fan-out then treats it as intersecting EVERY window (conservative:
+    the worker's observation-level filter enforces correctness) and window
+    enumeration falls back to ``bounds.temporal``.
+    """
+    from zagg.windows import parse_utc
+
+    start = record.get("time_start") or record.get("datetime")
+    if start is None:
+        return None
+    end = record.get("time_end") or start
+    return parse_utc(start), parse_utc(end)
+
+
+def _windowed_units(cells: list[tuple], windowing: dict, bounds_temporal: dict | None) -> list:
+    """Expand ``(shard, records)`` pairs into ``(shard, records, window)`` units.
+
+    One work unit per (shard, window) with a non-empty granule subset (issue
+    #246 phase 5): the run's window labels come from the declared explicit
+    list, or — for generative schedules — from the union of the granules'
+    time spans (legacy shardmaps without per-granule times fall back to
+    ``bounds.temporal``, or fail with a pointed remedy). Each unit's
+    ``window`` dict carries the label plus its half-open ``[start, end)``
+    bounds converted ONCE to dataset units (the ratified fixed-offset
+    conversion); granules subset per window by span intersection, spans
+    unknown → every window (the worker filter decides membership).
+    """
+    from zagg.windows import parse_utc, utc_to_offset, window_range, windows_intersecting
+
+    schedule, declared = windowing["schedule"], windowing.get("windows")
+    spans = {id(r): _granule_time_span(r) for _k, records in cells for r in records}
+    if schedule == "explicit":
+        labels = [w["label"] for w in declared]
+    else:
+        found: set = set()
+        for span in spans.values():
+            if span is not None:
+                found.update(windows_intersecting(*span, schedule))
+        if any(span is None for span in spans.values()):
+            if not bounds_temporal:
+                raise ValueError(
+                    "windowing with a generative schedule needs per-granule time "
+                    "metadata to enumerate windows, but this shardmap predates it "
+                    "(no time_start/time_end on its granule records) — rebuild the "
+                    "shardmap with `python -m zagg.catalog`, or set bounds.temporal "
+                    "{start_date, end_date} on the run config"
+                )
+            found.update(
+                windows_intersecting(
+                    parse_utc(bounds_temporal["start_date"]),
+                    parse_utc(f"{bounds_temporal['end_date']}T23:59:59"),
+                    schedule,
+                )
+            )
+        labels = sorted(found)
+    to_dataset = {
+        "epoch": windowing["epoch"],
+        "scale": windowing["scale"],
+        "units": windowing["units"],
+    }
+    windows = []
+    for label in labels:
+        lo, hi = window_range(label, schedule, declared)
+        payload = {
+            "label": label,
+            "start": utc_to_offset(lo, **to_dataset),
+            "end": utc_to_offset(hi, **to_dataset),
+        }
+        windows.append((payload, lo, hi))
+    # Shard-major expansion: the incoming cell order (the issue #197 shuffle,
+    # the lambda biggest-first buckets) is preserved, windows fan out within it.
+    units = []
+    for shard_key, records in cells:
+        for payload, lo, hi in windows:
+            subset = [
+                r
+                for r in records
+                if (span := spans[id(r)]) is None or (span[0] < hi and span[1] >= lo)
+            ]
+            if subset:
+                units.append((shard_key, subset, payload))
+    return units
+
+
 def _resolve_source_credentials(config) -> dict:
     """S3 read credentials for the source datasets, provider-selected.
 
@@ -1597,6 +1687,7 @@ def _run_local(
         "credentials": output_credentials,
         "endpoint_url": output_endpoint_url,
     }
+    windowing = get_windowing(config)
     if store_layout == "hive":
         # Hive layout (issue #199 phase 2): no shared zarr template — zero
         # metadata above the leaves (D5). Template time writes only the root
@@ -1607,11 +1698,16 @@ def _run_local(
 
         ensure_manifest(
             store_path,
-            build_manifest(grid, dataset=catalog_data.get("metadata")),
+            build_manifest(grid, dataset=catalog_data.get("metadata"), windowing=windowing),
             overwrite=overwrite,
             **store_kwargs,
         )
         zarr_store = None
+        # Temporal fan-out (issue #246 phase 5): one work unit per (shard,
+        # window). None (schedule none/absent) keeps the (shard, records)
+        # pairs — dispatch byte-identical to pre-windowing runs.
+        if windowing is not None:
+            cells = _windowed_units(cells, windowing, (config.bounds or {}).get("temporal"))
     else:
         zarr_store = open_store(store_path, **store_kwargs)
         zarr_store = grid.emit_template(zarr_store, overwrite=overwrite)
@@ -1621,13 +1717,18 @@ def _run_local(
     # outcome is tagged in a private envelope the accumulator unpacks; on the
     # error path nothing is appended to ``results``, matching the old behavior.
     def _cell_work(payload):
-        shard_key, records = payload
+        # (shard, records) pairs, or (shard, records, window) triples when a
+        # window schedule fanned the dispatch (issue #246).
+        shard_key, records = payload[0], payload[1]
+        window = payload[2] if len(payload) > 2 else None
         # Only thread aoi_payload when the manifest actually carries a mask (flag
         # on); otherwise omit the kwarg entirely so the flag-off call is identical
-        # to the pre-feature signature.
+        # to the pre-feature signature. Same posture for the window unit.
         extra = {}
         if aoi_by_shard:
             extra["aoi_payload"] = aoi_by_shard.get(int(shard_key))
+        if window is not None:
+            extra["window"] = window
         # Per-cell granule_workers clamp (issue #184): min(K, n_granules), so
         # a small cell doesn't spin idle reader threads; unclamped cells pass
         # the shared config through untouched. Count the RESOLVED urls — what
@@ -1722,13 +1823,22 @@ def _run_local(
     # failed write costs readers one walk, never a wrong answer.
     if store_layout == "hive" and get_coverage_moc(config):
         from zagg.hive import build_root_coverage, write_root_coverage
+        from zagg.windows import union_time_range
 
         try:
             # Inside the try so the fail-open claim survives result-envelope
             # refactors (review finding, PR #208 round 3).
-            done = [m["shard_key"] for m in report.results if not m.get("error")]
+            ok_results = [m for m in report.results if not m.get("error")]
+            done = [m["shard_key"] for m in ok_results]
             if done:
-                envelope = build_root_coverage(done, int(grid.parent_order))
+                # D15: windowed runs union the leaf stamps' ISO time ranges
+                # into the root summary; unwindowed metas carry no time_range,
+                # the union is None, and the envelope stays byte-identical.
+                envelope = build_root_coverage(
+                    done,
+                    int(grid.parent_order),
+                    time_range=union_time_range(*(m.get("time_range") for m in ok_results)),
+                )
                 write_root_coverage(store_path, envelope, **store_kwargs)
                 logger.info(f"Wrote root coverage.moc ({len(envelope['ranges'])} ranges)")
         except Exception as e:
@@ -1808,6 +1918,13 @@ def _run_lambda(
 
     if dry_run:
         return _dry_run_summary(cells, store_path)
+
+    # Temporal fan-out (issue #246 phase 5): one work unit per (shard,
+    # window); the biggest-first bucket order above survives (shard-major
+    # expansion). None keeps the pairs — dispatch byte-identical.
+    windowing = get_windowing(config)
+    if windowing is not None:
+        cells = _windowed_units(cells, windowing, (config.bounds or {}).get("temporal"))
 
     # Authenticate (for per-cell source reads inside the Lambda)
     s3_creds = _resolve_source_credentials(config)
@@ -1902,7 +2019,10 @@ def _run_lambda(
     # the executor submits one payload per cell. Mirrors the kwargs the old
     # inline ``executor.submit(_invoke_lambda_cell, ...)`` passed.
     def _cell_work(payload):
-        shard_key, records = payload
+        # (shard, records) pairs, or (shard, records, window) triples when a
+        # window schedule fanned the dispatch (issue #246).
+        shard_key, records = payload[0], payload[1]
+        window = payload[2] if len(payload) > 2 else None
         # Rendered once per cell: the status-object name (below) and the
         # payload-cap error message in _invoke_lambda_cell both carry it
         # (issue #199). On ASYNC runs the label becomes a path component (the
@@ -1920,6 +2040,8 @@ def _run_lambda(
         extra = {}
         if aoi_by_shard:
             extra["aoi_payload"] = aoi_by_shard.get(int(shard_key))
+        if window is not None:
+            extra["window"] = window
         # Async dispatch (issue #151): where the worker writes this shard's
         # result, how to poll for it, and how long before giving up (function
         # timeout + queue/write margin). Sync runs pass none of these, keeping
@@ -1927,7 +2049,10 @@ def _run_lambda(
         if result_prefix is not None:
             # Status objects are named by the shard label — the decimal morton
             # string for HEALPix (issue #199) — not the raw packed word.
-            key = f"{label}.json"
+            # Windowed units suffix the window label (mirroring the leaf
+            # naming) so two windows of one shard cannot clobber each other's
+            # status object (issue #246).
+            key = f"{label}.json" if window is None else f"{label}_{window['label']}.json"
             extra["result_url"] = f"{result_prefix}/{key}"
             extra["result_fetch"] = _result_fetcher(
                 result_box, result_prefix, output_creds_event, region, key
@@ -2089,16 +2214,25 @@ def _run_lambda(
     if get_store_layout(config) == "hive" and get_coverage_moc(config):
         try:
             from zagg.hive import build_root_coverage
+            from zagg.windows import union_time_range
 
             # Inside the try so the fail-open claim survives result-envelope
             # refactors (review finding, PR #208 round 3).
-            done = [
-                r["shard_key"]
-                for r in report.results
-                if r.get("status_code") == 200 and not r.get("error")
+            ok_results = [
+                r for r in report.results if r.get("status_code") == 200 and not r.get("error")
             ]
+            done = [r["shard_key"] for r in ok_results]
             if done:
-                envelope = build_root_coverage(done, int(parent_order))
+                # D15: union the windowed workers' stamped time ranges (each
+                # body mirrors its leaf stamp's ISO strings); unwindowed
+                # bodies carry none and the envelope stays byte-identical.
+                envelope = build_root_coverage(
+                    done,
+                    int(parent_order),
+                    time_range=union_time_range(
+                        *(r.get("body", {}).get("time_range") for r in ok_results)
+                    ),
+                )
                 # An OLD deployment has no coverage mode: the event falls
                 # through to its process handler, which returns a LOGGED 400
                 # (missing shard_key/granule_urls...) — no writes, no result
@@ -2885,6 +3019,7 @@ def _invoke_lambda_cell(
     handoff="arrow",
     profile=False,
     aoi_payload=None,
+    window=None,
     result_url=None,
     result_fetch=None,
     poll_timeout_s=None,
@@ -2944,6 +3079,11 @@ def _invoke_lambda_cell(
     # to the pre-feature event (issue #101).
     if aoi_payload is not None:
         event["aoi_payload"] = aoi_payload
+    # Temporal window unit (issue #246): {"label", "start", "end"} with the
+    # half-open bounds in dataset units, converted once at dispatch. Absent
+    # (schedule none) keeps the event byte-identical to pre-windowing runs.
+    if window is not None:
+        event["window"] = window
     # Add the key for the arrow carrier (the default); an explicit pandas run omits
     # it, staying byte-identical to the pre-handoff path (#130).
     if handoff and handoff != "pandas":

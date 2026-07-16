@@ -60,27 +60,35 @@ def test_dense_fullsphere_equivalence(mock_dataframe_factory):
 
     # Dense store
     dense_grid = HealpixGrid(
-        parent_order=parent_order, child_order=child_order, layout="dense",
-        config=cfg, populated_shards=parents,
+        parent_order=parent_order,
+        child_order=child_order,
+        layout="dense",
+        config=cfg,
+        populated_shards=parents,
     )
     dense_store = MemoryStore()
     dense_grid.emit_template(dense_store)
     for parent, df in zip(parents, frames):
         write_dataframe_to_zarr(
-            df, dense_store,
+            df,
+            dense_store,
             grid=dense_grid,
             chunk_idx=dense_grid.block_index(parent),
         )
 
     # Fullsphere store
     full_grid = HealpixGrid(
-        parent_order=parent_order, child_order=child_order, layout="fullsphere", config=cfg,
+        parent_order=parent_order,
+        child_order=child_order,
+        layout="fullsphere",
+        config=cfg,
     )
     full_store = MemoryStore()
     full_grid.emit_template(full_store)
     for parent, df in zip(parents, frames):
         write_dataframe_to_zarr(
-            df, full_store,
+            df,
+            full_store,
             grid=full_grid,
             chunk_idx=full_grid.block_index(parent),
         )
@@ -101,7 +109,8 @@ def test_dense_fullsphere_equivalence(mock_dataframe_factory):
             dense_vals = dense_group[col][dense_min : dense_max + 1]
             full_vals = full_group[col][full_min : full_max + 1]
             np.testing.assert_array_equal(
-                dense_vals, full_vals,
+                dense_vals,
+                full_vals,
                 err_msg=f"layout mismatch in {col} for parent {parent}",
             )
 
@@ -117,9 +126,11 @@ def test_rectilinear_end_to_end():
     cfg = default_config("atl06_polar")
     # Small grid for test speed: 32 x 32 cells, 8x8 chunks → 4x4 chunk grid.
     grid = RectilinearGrid(
-        crs="EPSG:3031", resolution=200_000,  # large resolution → small grid
+        crs="EPSG:3031",
+        resolution=200_000,  # large resolution → small grid
         bounds=(-3_200_000, -3_200_000, 3_200_000, 3_200_000),
-        chunk_shape=(8, 8), config=cfg,
+        chunk_shape=(8, 8),
+        config=cfg,
     )
     assert grid.array_shape == (32, 32)
     assert grid.n_row_blocks == 4 and grid.n_col_blocks == 4
@@ -130,24 +141,25 @@ def test_rectilinear_end_to_end():
     # Write known values to one chunk.
     shard = grid._pack(1, 2)
     n_cells = grid.chunk_h * grid.chunk_w
-    df = pd.DataFrame({
-        "count": np.arange(n_cells, dtype=np.int32),
-        "h_min": np.linspace(-100, 100, n_cells, dtype=np.float32),
-        "h_max": np.linspace(0, 200, n_cells, dtype=np.float32),
-        "h_mean": np.linspace(-50, 150, n_cells, dtype=np.float32),
-        "h_sigma": np.full(n_cells, 0.5, dtype=np.float32),
-        "h_variance": np.full(n_cells, 1.0, dtype=np.float32),
-    })
+    df = pd.DataFrame(
+        {
+            "count": np.arange(n_cells, dtype=np.int32),
+            "h_min": np.linspace(-100, 100, n_cells, dtype=np.float32),
+            "h_max": np.linspace(0, 200, n_cells, dtype=np.float32),
+            "h_mean": np.linspace(-50, 150, n_cells, dtype=np.float32),
+            "h_sigma": np.full(n_cells, 0.5, dtype=np.float32),
+            "h_variance": np.full(n_cells, 1.0, dtype=np.float32),
+        }
+    )
     from zagg.processing import write_dataframe_to_zarr
+
     write_dataframe_to_zarr(df, store, grid=grid, chunk_idx=grid.block_index(shard))
 
     # Read back. Block (1, 2) covers rows [8, 16) and cols [16, 24).
     group = zarr.open_group(store, path=grid.group_path, mode="r")
     block = group["count"][8:16, 16:24]
     assert block.shape == (8, 8)
-    np.testing.assert_array_equal(
-        block, np.arange(n_cells, dtype=np.int32).reshape(8, 8)
-    )
+    np.testing.assert_array_equal(block, np.arange(n_cells, dtype=np.int32).reshape(8, 8))
 
     # Confirm other chunks are still fill-value (NaN for float arrays).
     assert np.all(np.isnan(group["h_mean"][0:8, 0:8]))

@@ -2025,6 +2025,75 @@ def get_windowing(config: PipelineConfig) -> dict | None:
     }
 
 
+def window_time_filters(config: PipelineConfig, start: float, end: float) -> list[dict]:
+    """Structured filters implementing one window's ``[start, end)`` (issue #246).
+
+    The observation-level window filter is exactly a pair of structured
+    predicates on the declared ``time_field`` — ``ge start`` / ``lt end`` in
+    DATASET units (converted once at dispatch) — so it rides the existing,
+    pushdown-eligible filter machinery (issue #43) on every backend instead
+    of a bespoke row filter. The field's dataset path resolves from
+    ``variables``/``coordinates`` (base level) or a hierarchical ``levels``
+    entry (the filter then carries that level and expands to base rate, the
+    Phase-B path). Appended to :func:`filters_from_data_source`'s normalized
+    output by the hive write path, preserving any declared filters.
+    """
+    windowing = get_windowing(config)
+    if windowing is None:
+        raise ValueError("window_time_filters requires a windowed config (output.windowing)")
+    field = windowing["time_field"]
+    ds = config.data_source or {}
+    path, level = None, None
+    for key in ("variables", "coordinates"):
+        p = (ds.get(key) or {}).get(field)
+        if isinstance(p, str) and p:
+            path = p
+            break
+    if path is None:
+        for lname, spec in (get_levels(config) or {}).items():
+            lvars = spec.get("variables") if isinstance(spec, dict) else None
+            if isinstance(lvars, dict) and isinstance(lvars.get(field), str):
+                # The base level's columns filter at base rate (level None).
+                path, level = lvars[field], (None if lname == get_base_level(config) else lname)
+                break
+    if path is None:
+        raise ValueError(
+            f"windowing time_field {field!r} has no dataset path in "
+            f"data_source.variables/coordinates/levels — validate_config should "
+            f"have rejected this configuration"
+        )
+    return [
+        {"level": level, "dataset": path, "op": "ge", "value": float(start)},
+        {"level": level, "dataset": path, "op": "lt", "value": float(end)},
+    ]
+
+
+def windowed_cell_config(config: PipelineConfig, window: dict) -> tuple[PipelineConfig, dict]:
+    """One work unit's config with its window filter injected (issue #246).
+
+    Returns ``(config, windowing)``: a per-unit config copy whose normalized
+    filter list gains the :func:`window_time_filters` pair for ``window``'s
+    dataset-unit ``[start, end)`` (declared filters preserved — the explicit
+    list wins over ``quality_filter`` sugar, so normalize-then-append), plus
+    the normalized windowing declaration. Raises if the config declares no
+    ``output.windowing`` — a dispatched window without one is dispatcher/
+    config drift, never guessed around.
+    """
+    from dataclasses import replace
+
+    windowing = get_windowing(config)
+    if windowing is None:
+        raise ValueError(
+            "a window was dispatched but the config declares no output.windowing "
+            "block — dispatcher/config drift, refusing to guess the time_field"
+        )
+    ds = dict(config.data_source)
+    ds["filters"] = filters_from_data_source(ds) + window_time_filters(
+        config, window["start"], window["end"]
+    )
+    return replace(config, data_source=ds), windowing
+
+
 def get_aoi_mask(config: PipelineConfig) -> bool:
     """Whether the optional strict-AOI cell mask is enabled (issue #101).
 

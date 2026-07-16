@@ -51,10 +51,14 @@ def _granule_entry(rec: dict) -> dict:
 
     The canonical single-asset trio is always present; multi-asset records
     (raster sources, #218) additionally carry ``assets`` (per-band hrefs) and
-    ``datetime`` (ISO acquisition time).
+    ``datetime`` (ISO acquisition time). ``time_start``/``time_end`` (issue
+    #246) are the granule's ISO acquisition range on any record whose catalog
+    carries STAC ``start_datetime``/``end_datetime`` — the metadata the
+    dispatcher uses to subset granules per time window; absent on maps built
+    from pre-#246 catalogs (the fan-out then degrades conservatively).
     """
     entry = {"id": rec["id"], "s3": rec["s3"], "https": rec["https"]}
-    for key in ("assets", "datetime", "time_key"):
+    for key in ("assets", "datetime", "time_key", "time_start", "time_end"):
         if rec.get(key) is not None:
             entry[key] = rec[key]
     return entry

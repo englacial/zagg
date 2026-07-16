@@ -441,7 +441,10 @@ class Catalog:
             catalog's ``time_key`` metadata, when present); any
             record with a ``data``/``data_s3`` asset -- every CMR record,
             including ``preserve_thumbnails=True`` -- keeps its exact pre-#218
-            shape.
+            shape, except that any record whose catalog carries STAC
+            ``start_datetime``/``end_datetime`` also gains ``time_start``/
+            ``time_end`` (ISO acquisition range, issue #246) for the
+            per-window dispatch subsetting.
         """
         import shapely
 
@@ -453,6 +456,19 @@ class Catalog:
             if "datetime" in self.table.column_names
             else [None] * len(ids)
         )
+
+        # Per-granule acquisition range (issue #246): STAC items carry
+        # start_datetime/end_datetime properties (every CMR granule does),
+        # flattened to columns by stac-geoparquet. Surfaced on EVERY record so
+        # the ShardMap can subset granules per time window at dispatch;
+        # catalogs without the columns (or null rows) simply omit the keys —
+        # the fan-out then degrades to its conservative every-window path.
+        def _col(name):
+            if name in self.table.column_names:
+                return self.table.column(name).to_pylist()
+            return [None] * len(ids)
+
+        t_starts, t_ends = _col("start_datetime"), _col("end_datetime")
         # Acquisition-group property (issue #218): the source records its item
         # property name in the catalog metadata; stac-geoparquet flattens item
         # properties to top-level columns, so it reads straight off the table.
@@ -463,7 +479,9 @@ class Catalog:
             else [None] * len(ids)
         )
         records = []
-        for gid, asset_map, wkb, dt, tk in zip(ids, assets, geoms, dts, tks):
+        for gid, asset_map, wkb, dt, tk, ts, te in zip(
+            ids, assets, geoms, dts, tks, t_starts, t_ends
+        ):
             geom = shapely.from_wkb(wkb)
             if geom.is_empty or geom.geom_type not in ("Polygon", "MultiPolygon"):
                 continue
@@ -479,6 +497,15 @@ class Catalog:
                 "lats": np.asarray(y),
                 "lons": np.asarray(x),
             }
+            # Acquisition range keys (issue #246), on any record whose catalog
+            # carries them (unlike the raster-only extras below): newly built
+            # ShardMaps gain per-granule time metadata; pre-#246 manifests
+            # without the keys keep reading (the dispatcher degrades
+            # conservatively).
+            if ts is not None:
+                rec["time_start"] = ts.isoformat() if hasattr(ts, "isoformat") else str(ts)
+            if te is not None:
+                rec["time_end"] = te.isoformat() if hasattr(te, "isoformat") else str(te)
             # Only records with no canonical data asset (raster sources) grow
             # the extra keys; any record carrying data/data_s3 -- every CMR
             # record, including preserve_thumbnails -- stays byte-identical

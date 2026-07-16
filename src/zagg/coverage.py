@@ -35,10 +35,9 @@ from zagg.hive import (
     read_manifest,
     read_root_coverage,
     root_coverage_words,
-    union_time_range,
 )
 from zagg.store import open_object_store
-from zagg.windows import split_leaf_name
+from zagg.windows import split_leaf_name, union_time_range
 
 logger = logging.getLogger(__name__)
 

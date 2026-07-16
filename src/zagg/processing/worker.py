@@ -101,6 +101,7 @@ def process_shard(
     aoi_payload=None,
     write_chunk: Callable | None = None,
     occupied_out: list | None = None,
+    time_range_of: str | None = None,
     profile: bool = False,
 ) -> Tuple[pd.DataFrame, ProcessingMetadata]:
     """Process one shard: read granules, filter to this shard, aggregate, return df.
@@ -193,6 +194,17 @@ def process_shard(
         appended after the shard's reads are grouped. The hive write path uses
         it to derive the commit stamp's coverage payload; ``None`` (default)
         records nothing — byte-for-byte unchanged.
+    time_range_of : str, optional
+        Column name whose observed ``[min, max]`` is reported as
+        ``metadata["time_range"]`` (issue #246): the ACTUAL dataset-unit time
+        extent of the shard's surviving observations, which the hive write
+        path converts to the windowed stamp's ISO-UTC ``time_range`` (D15
+        truth). Read AFTER all filters, off the pooled column arrays — so it
+        reflects exactly what was written. ``None`` (default) records nothing
+        — byte-for-byte unchanged. The streaming buffered path (issue #148)
+        does not pool columns, so the key is omitted there; the column must
+        be a read column (declared, e.g. the windowing ``time_field``) or the
+        key is likewise omitted.
     profile : bool, optional
         Opt-in per-phase timing (issue #100 phase 2). When ``True``, fills
         ``metadata["phase_timings"]`` with ``read`` / ``index`` / ``aggregate``
@@ -545,6 +557,14 @@ def process_shard(
     else:
         col_arrays, cell_to_slice, n_obs_total = _concat_and_group(all_reads, grid, handoff)
         logger.info(f"  Read {n_obs_total:,} observations")
+
+    # Actual time extent (issue #246): min/max of the declared time column
+    # over the pooled (post-filter) observations — two reductions on an array
+    # already in hand. The buffered/streaming path holds no pooled columns, so
+    # windowed streaming stamps simply omit their time_range (documented).
+    if time_range_of is not None and time_range_of in col_arrays and n_obs_total:
+        col = col_arrays[time_range_of]
+        metadata["time_range"] = [float(col.min()), float(col.max())]
 
     # Occupied-cell sink (issue #200): both paths already key per-cell state by
     # the packed cell word — ``cell_to_slice`` pooled, ``buffered.counts``
