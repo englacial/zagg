@@ -48,7 +48,7 @@ leaf template):
     "mode": "setup",
     "store_path": str,
     "parent_order": int,        # HEALPix fallback; config.output.grid wins
-    "n_parent_cells": int,      # OPTIONAL -- dense layout only (populated count)
+    "n_parent_cells": None,     # OPTIONAL -- ignored (dense layout removed, issue #88)
     "overwrite": bool,
     "config": dict,             # single source of truth: child_order, chunk_inner,
                                 #   layout, store_layout, and grid type all come from here
@@ -648,19 +648,9 @@ def _handle_setup(event: Dict[str, Any]) -> Dict[str, Any]:
         # old hand-built HEALPix branch dropped chunk_inner, under-chunking the
         # template at parent_order while workers wrote finer chunk_inner block
         # indices -> "block index out of bounds" (issue #99). from_config reads
-        # chunk_inner + layout from the config. n_parent_cells is inert unless
-        # the config selects layout: dense, where it threads through as
-        # populated_shards (only its count matters for emit_template).
-        populated = (
-            list(range(event["n_parent_cells"]))
-            if event.get("n_parent_cells") is not None
-            else None
-        )
-        grid = from_config(
-            config,
-            parent_order=event.get("parent_order"),
-            populated_shards=populated,
-        )
+        # chunk_inner + layout from the config. The event's n_parent_cells is
+        # ignored — the dense layout it selected was removed (issue #88).
+        grid = from_config(config, parent_order=event.get("parent_order"))
         grid.emit_template(store, overwrite=event.get("overwrite", False))
         return {
             "statusCode": 200,
@@ -873,7 +863,6 @@ def _handle_process_raster(event: Dict[str, Any]) -> Dict[str, Any]:
             logger.error(error_msg)
             return {"statusCode": 400, "body": json.dumps({"error": error_msg})}
 
-        from zagg.config import get_layout
         from zagg.grids import from_config
         from zagg.processing.raster import (
             process_raster_shard,
@@ -882,13 +871,6 @@ def _handle_process_raster(event: Dict[str, Any]) -> Dict[str, Any]:
         )
 
         config = load_config_from_dict(event["config"])
-        if get_layout(config) == "dense":
-            # Dense layout keys blocks by populated-shard position, which the
-            # worker cannot reconstruct from one shard's event; fullsphere (the
-            # default) keys by nested id and needs no shared state.
-            error_msg = "raster lambda workers require output.grid.layout: fullsphere"
-            logger.error(error_msg)
-            return {"statusCode": 400, "body": json.dumps({"error": error_msg})}
         grid = from_config(config)
 
         shard_key = int(event["shard_key"])

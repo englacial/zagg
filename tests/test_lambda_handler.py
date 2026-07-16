@@ -1330,25 +1330,20 @@ class TestSetupTemplate:
         assert (n_chunks,) == worker_grid.chunk_grid_shape
         assert n_chunks == HEALPIX_BASE_CELLS * 4**6
 
-    def test_setup_dense_layout_threads_populated_shards(self, handler_mod, monkeypatch):
-        # n_parent_cells signals the (deprecated) dense layout; the count must thread
-        # through as populated_shards so the template is sized to the populated shards
-        # (chunk count == n_parent_cells), not the full sphere. Covers the
-        # populated_shards branch the fix routes through from_config.
+    def test_setup_ignores_n_parent_cells(self, handler_mod, monkeypatch):
+        # The dense layout was removed (issue #88); a setup event still carrying
+        # n_parent_cells (an old dispatcher) gets the fullsphere template — the
+        # field is inert, not an error, so mixed-version fleets keep working.
         cfg = default_config("atl06")
-        cfg.output["grid"]["layout"] = "dense"
-        cfg_dict = asdict(cfg)
-        with pytest.warns(DeprecationWarning, match="dense is deprecated"):
-            resp, store = self._setup(
-                handler_mod, monkeypatch, cfg_dict, parent_order=6, n_parent_cells=5
-            )
+        resp, store = self._setup(
+            handler_mod, monkeypatch, asdict(cfg), parent_order=6, n_parent_cells=5
+        )
         assert resp["statusCode"] == 200, json.loads(resp["body"])
 
-        with pytest.warns(DeprecationWarning, match="dense is deprecated"):
-            worker_grid = from_config(cfg, parent_order=6, populated_shards=list(range(5)))
+        worker_grid = from_config(cfg, parent_order=6)
         n_chunks = self._template_chunk_count(store, worker_grid)
         assert (n_chunks,) == worker_grid.chunk_grid_shape
-        assert n_chunks == 5
+        assert n_chunks == HEALPIX_BASE_CELLS * 4**6
 
 
 def _temporal_config_dict():

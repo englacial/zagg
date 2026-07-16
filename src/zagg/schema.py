@@ -1,13 +1,11 @@
 """Compatibility wrappers for HEALPix Zarr template emission.
 
 The actual implementation lives on ``zagg.grids.HealpixGrid``. These functions
-preserve the pre-refactor public API: pass ``n_parent_cells`` for dense pack,
-omit it for full sphere.
+preserve the pre-refactor public API (fullsphere only; the deprecated
+``n_parent_cells`` dense pack was removed — issue #88).
 """
 
 from __future__ import annotations
-
-import warnings
 
 from pydantic_zarr.experimental.v3 import GroupSpec
 from typing_extensions import NotRequired, TypedDict
@@ -75,11 +73,9 @@ def xdggs_zarr_template(
     overwrite: bool = False,
     config: PipelineConfig | None = None,
 ) -> Store:
-    """Write a HEALPix Zarr template to ``store``.
+    """Write a full-sphere HEALPix Zarr template to ``store``.
 
-    Layout is selected by ``n_parent_cells``: when ``None`` the store gets a
-    full-sphere array of shape ``(12 · 4^child_order,)``; when set the store
-    gets a dense-pack array of shape ``(4^Δ · n_parent_cells,)``.
+    The array has shape ``(12 · 4^child_order,)``.
 
     Parameters
     ----------
@@ -90,37 +86,25 @@ def xdggs_zarr_template(
     child_order : int
         Leaf HEALPix order. Must be ``>= parent_order``.
     n_parent_cells : int, optional
-        Number of populated shards. Selects dense layout when provided.
+        Removed. Passing a value raises — the dense-pack layout it selected
+        was removed (issue #88).
     overwrite : bool, optional
         Overwrite an existing array or group at the path.
     config : PipelineConfig, optional
         Pipeline configuration. Falls back to ``default_config("atl06")``.
     """
-    if n_parent_cells is not None and n_parent_cells <= 0:
-        raise ValueError(f"n_parent_cells must be positive, got {n_parent_cells}")
-    if n_parent_cells is None:
-        grid = HealpixGrid(
-            parent_order=parent_order,
-            child_order=child_order,
-            layout="fullsphere",
-            config=config,
+    if n_parent_cells is not None:
+        raise ValueError(
+            "xdggs_zarr_template(n_parent_cells=...) selected the dense-pack "
+            "layout, which was removed (issue #88); omit n_parent_cells for "
+            "the fullsphere template"
         )
-    else:
-        warnings.warn(
-            "xdggs_zarr_template(n_parent_cells=...) produces a deprecated "
-            "dense-pack layout; omit n_parent_cells for fullsphere (the new "
-            "default).",
-            DeprecationWarning,
-            stacklevel=2,
-        )
-        # Synthetic shard identities — emit_template only needs the count.
-        grid = HealpixGrid(
-            parent_order=parent_order,
-            child_order=child_order,
-            layout="dense",
-            config=config,
-            populated_shards=list(range(n_parent_cells)),
-        )
+    grid = HealpixGrid(
+        parent_order=parent_order,
+        child_order=child_order,
+        layout="fullsphere",
+        config=config,
+    )
     return grid.emit_template(store, overwrite=overwrite)
 
 

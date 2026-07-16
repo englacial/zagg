@@ -268,8 +268,11 @@ def validate_config(config: PipelineConfig) -> None:
             if len(grid["bounds"]) != 4:
                 raise ValueError("output.grid.bounds must be [xmin, ymin, xmax, ymax]")
         layout = grid.get("layout")
-        if layout is not None and layout not in ("dense", "fullsphere"):
-            raise ValueError(f"output.grid.layout must be 'dense' or 'fullsphere' (got {layout!r})")
+        if layout is not None and layout != "fullsphere":
+            raise ValueError(
+                f"output.grid.layout must be 'fullsphere' (got {layout!r}; "
+                "the deprecated 'dense' layout was removed — issue #88)"
+            )
         # Optional cell_ids encoding (issue #135): "nested" (default, the DGGS
         # standard) or "morton" (emit the packed morton words as cell_ids — a
         # test/prototype capability). HEALPix-only: rectilinear grids have no
@@ -1911,7 +1914,8 @@ def get_layout(config: PipelineConfig) -> str:
     Returns
     -------
     str
-        ``"fullsphere"`` (default) or ``"dense"`` (deprecated).
+        ``"fullsphere"`` (the only layout; the deprecated ``"dense"`` pack
+        was removed — issue #88).
     """
     return config.output.get("grid", {}).get("layout", "fullsphere")
 

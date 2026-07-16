@@ -170,12 +170,14 @@ class TestProcessRasterMode:
         for key in ("shard_key", "granules", "config", "store_path", "time_index"):
             assert key in err
 
-    def test_dense_layout_400(self, handler_mod, raster_event):
+    def test_dense_layout_500(self, handler_mod, raster_event):
+        # The dense layout was removed (issue #88): a worker event still carrying
+        # a dense config fails loudly at grid construction.
         event, _grid, _data = raster_event
         event["config"] = _config_dict(event["store_path"], layout="dense")
         resp = handler_mod.lambda_handler(event, MagicMock())
-        assert resp["statusCode"] == 400
-        assert "fullsphere" in json.loads(resp["body"])["error"]
+        assert resp["statusCode"] == 500
+        assert "Unknown layout" in json.loads(resp["body"])["error"]
 
     def test_worker_failure_500(self, handler_mod, raster_event):
         event, _grid, _data = raster_event

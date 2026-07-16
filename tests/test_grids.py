@@ -23,14 +23,14 @@ class TestConstruction:
         with pytest.raises(ValueError, match="Unknown layout"):
             HealpixGrid(parent_order=6, child_order=8, layout="weird")
 
-    def test_default_layout_is_dense(self):
+    def test_default_layout_is_fullsphere(self):
         g = HealpixGrid(parent_order=6, child_order=8)
-        assert g.layout == "dense"
+        assert g.layout == "fullsphere"
 
-    def test_dense_needs_populated_shards_for_n(self):
-        g = HealpixGrid(parent_order=6, child_order=8, layout="dense")
-        with pytest.raises(RuntimeError, match="populated_shards"):
-            _ = g.n_shards
+    def test_removed_dense_layout_raises(self):
+        # The dense pack was removed (issue #88): constructing it is a hard error.
+        with pytest.raises(ValueError, match="Unknown layout"):
+            HealpixGrid(parent_order=6, child_order=8, layout="dense")
 
     def test_fullsphere_n_shards_is_global(self):
         g = HealpixGrid(parent_order=6, child_order=8, layout="fullsphere")
@@ -105,50 +105,8 @@ class TestBlockIndex:
         # Range check: must lie in [0, 12·4^parent_order)
         assert 0 <= g.block_index(parent)[0] < 12 * 4**6
 
-    def test_dense_uses_position_map(self):
-        shards = _valid_parents(3)
-        g = HealpixGrid(parent_order=6, child_order=8, layout="dense", populated_shards=shards)
-        for i, s in enumerate(shards):
-            assert g.block_index(s) == (i,)
-
-    def test_dense_requires_populated_shards(self):
-        g = HealpixGrid(parent_order=6, child_order=8, layout="dense")
-        with pytest.raises(RuntimeError, match="populated_shards"):
-            g.block_index(_valid_parents(1)[0])
-
-    def test_dense_preserves_insertion_order(self):
-        # Critical for byte-identical writes against a fixed catalog.
-        shards = _valid_parents(3)
-        shards_reordered = [shards[2], shards[0], shards[1]]
-        g = HealpixGrid(
-            parent_order=6,
-            child_order=8,
-            layout="dense",
-            populated_shards=shards_reordered,
-        )
-        assert g.block_index(shards_reordered[0]) == (0,)
-        assert g.block_index(shards_reordered[1]) == (1,)
-        assert g.block_index(shards_reordered[2]) == (2,)
-
 
 class TestEmitTemplate:
-    def test_dense_shape(self, cfg):
-        n_shards = 3
-        shards = list(range(n_shards))
-        g = HealpixGrid(
-            parent_order=6,
-            child_order=8,
-            layout="dense",
-            config=cfg,
-            populated_shards=shards,
-        )
-        store = MemoryStore()
-        g.emit_template(store)
-        group = open_group(store, path="8", mode="r")
-        expected = (4 ** (8 - 6) * n_shards,)
-        for name in group:
-            assert group[name].shape == expected
-
     def test_fullsphere_shape(self, cfg):
         g = HealpixGrid(parent_order=6, child_order=8, layout="fullsphere", config=cfg)
         store = MemoryStore()
@@ -160,20 +118,13 @@ class TestEmitTemplate:
 
     def test_chunk_shape_matches_shard_size(self, cfg):
         """Chunk-alignment invariant: chunks == 4^(child - parent)."""
-        for layout in ("dense", "fullsphere"):
-            g = HealpixGrid(
-                parent_order=6,
-                child_order=8,
-                layout=layout,
-                config=cfg,
-                populated_shards=[1, 2, 3] if layout == "dense" else None,
-            )
-            store = MemoryStore()
-            g.emit_template(store)
-            group = open_group(store, path="8", mode="r")
-            expected_chunks = (4 ** (8 - 6),)
-            for name in group:
-                assert group[name].chunks == expected_chunks, f"layout={layout} var={name}"
+        g = HealpixGrid(parent_order=6, child_order=8, config=cfg)
+        store = MemoryStore()
+        g.emit_template(store)
+        group = open_group(store, path="8", mode="r")
+        expected_chunks = (4 ** (8 - 6),)
+        for name in group:
+            assert group[name].chunks == expected_chunks, f"var={name}"
 
 
 class TestRoundTrip:
@@ -314,11 +265,11 @@ class TestFromConfig:
         assert g.layout == "fullsphere"
         assert g.parent_order == 6
 
-    def test_healpix_explicit_dense_warns(self, cfg):
+    def test_healpix_explicit_dense_raises(self, cfg):
+        # Removed layout (issue #88): a config still selecting dense fails loudly.
         cfg.output["grid"]["layout"] = "dense"
-        with pytest.warns(DeprecationWarning, match="dense is deprecated"):
-            g = from_config(cfg, parent_order=6, populated_shards=_valid_parents(3))
-        assert g.layout == "dense"
+        with pytest.raises(ValueError, match="Unknown layout"):
+            from_config(cfg, parent_order=6)
 
     def test_healpix_explicit_fullsphere(self, cfg):
         cfg.output["grid"]["layout"] = "fullsphere"
@@ -404,13 +355,13 @@ class TestBackcompatWrapper:
         group = open_group(store, path="8", mode="r")
         assert group["count"].shape == (HEALPIX_BASE_CELLS * 4**8,)
 
-    def test_with_n_parent_cells_means_dense(self, cfg):
+    def test_n_parent_cells_raises(self, cfg):
+        # The dense-pack selector was removed (issue #88): passing it is a hard error.
         from zagg.schema import xdggs_zarr_template
 
         store = MemoryStore()
-        xdggs_zarr_template(store, parent_order=6, child_order=8, n_parent_cells=3, config=cfg)
-        group = open_group(store, path="8", mode="r")
-        assert group["count"].shape == (4 ** (8 - 6) * 3,)
+        with pytest.raises(ValueError, match="removed"):
+            xdggs_zarr_template(store, parent_order=6, child_order=8, n_parent_cells=3, config=cfg)
 
 
 def _vector_config(bins=4, dtype="int64"):
@@ -1042,11 +993,6 @@ class TestChunkInnerMultiChunk:
             HealpixGrid(4, 8, layout="fullsphere", config=cfg, chunk_inner=3)  # < parent
         with pytest.raises(ValueError, match="chunk_inner"):
             HealpixGrid(4, 8, layout="fullsphere", config=cfg, chunk_inner=9)  # > child
-
-    def test_healpix_chunk_inner_rejected_for_dense(self):
-        cfg = default_config("atl06")
-        with pytest.raises(ValueError, match="fullsphere"):
-            HealpixGrid(4, 8, layout="dense", config=cfg, chunk_inner=6, populated_shards=[0])
 
     def test_healpix_chunk_inner_not_in_signature(self):
         # The shard-map fingerprint must be unchanged by chunk_inner (byte-identical

@@ -411,20 +411,19 @@ def test_measure_objects_flags_bypass(tmp_path):
 
 
 def test_flat_model_requires_fullsphere(tmp_path):
-    # The flat block arithmetic assumes fullsphere HEALPix: a dense-layout grid
-    # or a rect grid must fail loudly (NotImplementedError), not mis-attribute
-    # or die on a bare AttributeError (review, PR #242).
+    # The flat block arithmetic assumes fullsphere HEALPix: a rect grid must
+    # fail loudly (NotImplementedError), not mis-attribute or die on a bare
+    # AttributeError (review, PR #242). (The dense HEALPix layout the fence
+    # also guarded was removed — issue #88.)
     from zagg.grids import RectilinearGrid
 
-    cfg = _cfg(sharded=False)
-    dense = HealpixGrid(6, 12, layout="dense", config=cfg, populated_shards=[1])
     rect = RectilinearGrid(
         crs="EPSG:32618",
         resolution=10,
         bounds=[358300, 4299600, 370300, 4311600],
         chunk_shape=(300, 300),
     )
-    for grid in (dense, rect):
+    for grid in (rect,):
         with pytest.raises(NotImplementedError, match="fullsphere"):
             bench_objects.expected_object_counts(grid, n_shards=1)
         with pytest.raises(NotImplementedError, match="fullsphere"):

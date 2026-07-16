@@ -79,7 +79,7 @@ def manifest(tmp_path):
     _write_tiff(tmp_path / "t1.tif", np.full((96, 96), 555, dtype=np.uint16))
     cfg = _cfg(tmp_path)
     shard = _shard_for_raster()
-    grid = from_config(cfg, populated_shards=[shard])
+    grid = from_config(cfg)
     entries = [
         _entry("g0", str(tmp_path / "t0.tif"), T0, "dt-1"),
         _entry("g1", str(tmp_path / "t1.tif"), T1, "dt-2"),
@@ -100,7 +100,7 @@ class TestRasterAgg:
         assert summary["timesteps"] == 2
         assert summary["total_obs"] == 2
 
-        grid = from_config(cfg, populated_shards=[shard])
+        grid = from_config(cfg)
         store_path = cfg.output["store"]
         red = open_array(store_path + f"/{grid.group_path}/red", zarr_format=3, consolidated=False)
         cells = grid.children(shard)
@@ -135,7 +135,7 @@ class TestRasterAgg:
         shard0 = _shard_for_raster_at(0.0)
         shard1 = _shard_for_raster_at(7000.0)
         assert shard0 != shard1
-        grid = from_config(cfg, populated_shards=[shard0, shard1])
+        grid = from_config(cfg)
         sm = ShardMap(
             grid.spatial_signature(),
             [shard0, shard1],
@@ -200,7 +200,7 @@ class TestRasterAgg:
         agg(cfg, catalog=sm_path, backend="local", max_workers=2, overwrite=True)
 
         # A manifest with a DIFFERENT time index: one datatake instead of two.
-        grid = from_config(cfg, populated_shards=[shard])
+        grid = from_config(cfg)
         one = ShardMap(
             grid.spatial_signature(),
             [shard],
@@ -419,8 +419,9 @@ class TestRasterLambdaBackend:
         assert len(fake.events) == 2  # first invoke raised (transient), retried once
 
     def test_lambda_dense_layout_fails_fast(self, manifest, monkeypatch, tmp_path):
-        # A dense-layout config on the lambda backend must be refused up front,
-        # before any invoke — the fake client records zero events.
+        # The dense layout was removed (issue #88): a config still selecting it
+        # is refused at grid construction, before any invoke — the fake client
+        # records zero events.
         import boto3
 
         import zagg.runner as runner_mod
@@ -438,7 +439,7 @@ class TestRasterLambdaBackend:
                 str(tmp_path / "dense.zarr") if path.startswith("s3://") else real_open(path, **kw)
             ),
         )
-        with pytest.raises(ValueError, match="fullsphere"):
+        with pytest.raises(ValueError, match="Unknown layout"):
             agg(cfg, catalog=sm_path, store="s3://bucket/out.zarr", backend="lambda")
         assert fake.events == []
 
@@ -453,7 +454,7 @@ class TestRasterLambdaBackend:
         data = _index_raster()
         _write_tiff(tmp_path / "d0.tif", data)
         shard = _shard_for_raster()
-        grid = from_config(cfg, populated_shards=[shard])
+        grid = from_config(cfg)
         entries = [
             {
                 "id": "g0",

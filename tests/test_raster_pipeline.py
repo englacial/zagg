@@ -476,7 +476,7 @@ def _healpix_setup(tmp_path):
         bands={"red": {"asset": "red", "dtype": "uint16", "scale": 0.0001, "offset": -0.1}},
         grid={"type": "healpix", "parent_order": 10, "child_order": 16},
     )
-    grid = HealpixGrid(10, 16, config=cfg, populated_shards=[shard])
+    grid = HealpixGrid(10, 16, config=cfg)
     return cfg, grid, shard
 
 
@@ -485,14 +485,15 @@ class TestTemplateAndSlabs:
         cfg, grid, _shard = _healpix_setup(tmp_path)
         spec = raster_group_spec(grid, cfg, 3)
         red = spec.members["red"]
-        assert tuple(red.shape) == (3, 4096)
+        n_cells = 12 * 4**16  # fullsphere cell axis (shape is metadata; writes stay sparse)
+        assert tuple(red.shape) == (3, n_cells)
         cg = red.chunk_grid
         cfg_block = cg["configuration"] if isinstance(cg, dict) else cg.configuration
         assert tuple(cfg_block["chunk_shape"]) == (1, grid.cells_per_chunk)
         assert red.attributes["scale_factor"] == 0.0001
         assert red.attributes["add_offset"] == -0.1
         assert tuple(spec.members["time"].shape) == (3,)
-        assert tuple(spec.members["cell_ids"].shape) == (4096,)
+        assert tuple(spec.members["cell_ids"].shape) == (n_cells,)
 
     def test_sharded_grid_rejected(self, tmp_path):
         cfg, grid, _shard = _healpix_setup(tmp_path)
@@ -520,13 +521,15 @@ class TestTemplateAndSlabs:
         write_raster_coords(store, grid, shard)
 
         red = open_array(store, path=f"{grid.group_path}/red", zarr_format=3, consolidated=False)
-        assert red.shape == (2, 4096)
+        assert red.shape == (2, 12 * 4**16)
+        start, stop = _shard_cell_range(grid, shard)
+        assert stop - start == 4096  # 4^(child - parent)
         cells = grid.children(shard)
         rows, cols, valid = grid.sample(cells, UTM18, TRANSFORM, (96, 96))
-        got_t0 = red[0, :]
+        got_t0 = red[0, start:stop]
         np.testing.assert_array_equal(got_t0[valid], data[rows[valid], cols[valid]])
         assert (got_t0[~valid] == 0).all()  # fill outside the raster footprint
-        got_t1 = red[1, :]
+        got_t1 = red[1, start:stop]
         assert (got_t1[valid] == 321).all()
         # time coordinate round-trips as microseconds since epoch.
         tarr = open_array(store, path=f"{grid.group_path}/time", zarr_format=3, consolidated=False)
@@ -536,7 +539,7 @@ class TestTemplateAndSlabs:
             store, path=f"{grid.group_path}/cell_ids", zarr_format=3, consolidated=False
         )
         np.testing.assert_array_equal(
-            ids[:], np.asarray(grid.encode_cell_ids(cells), dtype=np.uint64)
+            ids[start:stop], np.asarray(grid.encode_cell_ids(cells), dtype=np.uint64)
         )
         assert valid.sum() > 50  # the 960 m raster covers many ~97 m cells
 
@@ -548,7 +551,7 @@ class TestTemplateAndSlabs:
         store = MemoryStore()
         emit_raster_template(store, grid, cfg, np.array([], dtype=np.int64))
         red = open_array(store, path=f"{grid.group_path}/red", zarr_format=3, consolidated=False)
-        assert red.shape == (0, 4096)
+        assert red.shape == (0, 12 * 4**16)
 
     def test_time_attrs_round_trip(self, tmp_path):
         cfg, grid, _shard = _healpix_setup(tmp_path)

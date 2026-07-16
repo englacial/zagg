@@ -2,8 +2,6 @@
 
 from __future__ import annotations
 
-import warnings
-
 from zagg.config import (
     PipelineConfig,
     get_child_order,
@@ -18,7 +16,6 @@ def from_config(
     config: PipelineConfig,
     *,
     parent_order: int | None = None,
-    populated_shards: list | None = None,
 ) -> OutputGrid:
     """Construct an OutputGrid from a pipeline config.
 
@@ -29,22 +26,11 @@ def from_config(
     parent_order : int, optional
         Shard order for HEALPix (typically from the catalog metadata).
         Ignored for non-HEALPix grids.
-    populated_shards : list, optional
-        Required for dense-layout HEALPix; ignored otherwise.
     """
     grid_cfg = config.output.get("grid", {})
     grid_type = grid_cfg.get("type", "healpix")
     if grid_type == "healpix":
-        explicit_layout = grid_cfg.get("layout")
-        if explicit_layout == "dense":
-            warnings.warn(
-                "output.grid.layout: dense is deprecated; switch to fullsphere "
-                "(the new default) or omit the field. Dense will be removed in "
-                "a future release.",
-                DeprecationWarning,
-                stacklevel=2,
-            )
-        layout = explicit_layout or "fullsphere"
+        layout = grid_cfg.get("layout") or "fullsphere"
         # Grid is fully defined by the config (single source of truth); the
         # parent_order kwarg is only a fallback for legacy callers.
         resolved_parent = grid_cfg.get("parent_order", parent_order)
@@ -62,7 +48,6 @@ def from_config(
             child_order=get_child_order(config),
             layout=layout,
             config=config,
-            populated_shards=populated_shards,
             chunk_inner=grid_cfg.get("chunk_inner"),
             sharded=get_sharded(config, default=True),
         )

@@ -18,7 +18,6 @@ import random
 import statistics
 import time
 import uuid
-import warnings
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import replace
 from datetime import timedelta
@@ -38,7 +37,6 @@ from zagg.config import (
     get_coverage_moc,
     get_driver,
     get_handoff,
-    get_layout,
     get_output_endpoint_url,
     get_output_region,
     get_parent_order,
@@ -68,17 +66,6 @@ from zagg.processing import (
 from zagg.store import open_object_store, open_store
 
 logger = logging.getLogger(__name__)
-
-_DENSE_DEPRECATION_MSG = (
-    "HEALPix 'dense' layout is deprecated; set output.grid.layout: fullsphere "
-    "(or omit; fullsphere is now the default). Dense will be removed in a "
-    "future release."
-)
-
-
-def _maybe_warn_dense(layout: str) -> None:
-    if layout == "dense":
-        warnings.warn(_DENSE_DEPRECATION_MSG, DeprecationWarning, stacklevel=3)
 
 
 def agg(
@@ -303,7 +290,6 @@ class SpatialStrategy:
         # child_order is HEALPix-specific (leaf order); other grids don't define it.
         grid_type = config.output.get("grid", {}).get("type", "healpix")
         child_order = get_child_order(config) if grid_type == "healpix" else None
-        _maybe_warn_dense(get_layout(config))
 
         # Resolve driver: kwarg > config > default
         resolved_driver = driver or get_driver(config)
@@ -624,14 +610,6 @@ class RasterStrategy:
             raise ValueError(f"Unknown backend: {backend!r} (expected 'local' or 'lambda')")
         if backend == "lambda" and not store_path.startswith("s3://"):
             raise ValueError(f"Lambda backend requires s3:// store path, got: {store_path}")
-        # Fail fast rather than pay the full fan-out for per-worker 400s: a dense
-        # worker's block indexing needs populated-shard state the raster workers
-        # do not carry. The handler rejects it too (defense in depth).
-        if backend == "lambda" and get_layout(config) == "dense":
-            raise ValueError(
-                "raster lambda workers require fullsphere; dense block indexing "
-                "needs populated-shard state"
-            )
 
         catalog_data = _load_catalog(catalog_path)
         cells = _select_cells(catalog_data, morton_cell=morton_cell, max_cells=max_cells)
@@ -640,8 +618,7 @@ class RasterStrategy:
 
         from zagg.grids import from_config
 
-        all_shards = [int(s) for s in catalog_data["shard_keys"]]
-        grid = from_config(config, populated_shards=all_shards)
+        grid = from_config(config)
         _check_signature(grid, catalog_data)
         time_index, times_us = raster_time_index(catalog_data["granules"])
         if not time_index:
@@ -1676,16 +1653,10 @@ def _run_local(
         s3_creds = _resolve_source_credentials(config)
 
     # Build grid from the run config (single source of truth) and refuse a
-    # shard map built for a different grid. For HEALPix-dense, populated_shards
-    # order matches the catalog's shard_keys list (sorted at build time).
+    # shard map built for a different grid.
     from zagg.grids import from_config
 
-    layout = get_layout(config)
-    grid_type = config.output.get("grid", {}).get("type", "healpix")
-    if grid_type == "healpix" and layout == "dense":
-        grid = from_config(config, populated_shards=[int(s) for s in all_shards])
-    else:
-        grid = from_config(config)
+    grid = from_config(config)
     _check_signature(grid, catalog_data)
     store_layout = get_store_layout(config)
     store_kwargs = {
@@ -1939,11 +1910,7 @@ def _run_lambda(
     # shard map was built for the same grid.
     from zagg.grids import from_config
 
-    layout = get_layout(config)
-    if grid_type == "healpix" and layout == "dense":
-        grid = from_config(config, populated_shards=[int(s) for s in all_shards])
-    else:
-        grid = from_config(config)
+    grid = from_config(config)
     _check_signature(grid, catalog_data)
     config_dict = asdict(config)
 
@@ -2146,7 +2113,6 @@ def _run_lambda(
         store_path,
         parent_order=parent_order,
         child_order=child_order,
-        n_parent_cells=len(all_shards) if grid_type == "healpix" and layout == "dense" else None,
         overwrite=overwrite,
         config_dict=config_dict,
         output_creds_event=output_creds_event,
@@ -2905,7 +2871,6 @@ def _invoke_lambda_setup(
     *,
     parent_order,
     child_order,
-    n_parent_cells,
     overwrite,
     config_dict,
     output_creds_event=None,
@@ -2933,7 +2898,10 @@ def _invoke_lambda_setup(
         "store_path": store_path,
         "parent_order": parent_order,
         "child_order": child_order,
-        "n_parent_cells": n_parent_cells,
+        # Inert since the dense layout was removed (issue #88); kept None so
+        # the setup event stays byte-identical for deployed handlers until the
+        # flat setup mode itself goes (#251 Phase 3).
+        "n_parent_cells": None,
         "overwrite": overwrite,
         "config": config_dict,
     }

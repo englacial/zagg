@@ -355,12 +355,17 @@ class TestCheckSignature:
             _check_signature(c, built)
 
 
-class TestDenseDeprecation:
-    def test_dense_layout_emits_warning(self, atl06_config, catalog_file):
+class TestDenseRemoval:
+    def test_dense_layout_rejected(self, atl06_config, catalog_file):
+        # The dense layout was removed (issue #88): a config selecting it is
+        # rejected at validation, and grid construction refuses it too
+        # (test_grids.py::test_healpix_explicit_dense_raises).
+        from zagg.config import validate_config
+
         atl06_config.output["grid"]["layout"] = "dense"
         atl06_config.catalog = catalog_file
-        with pytest.warns(DeprecationWarning, match="dense.*deprecated"):
-            agg(atl06_config, store="./out.zarr", dry_run=True)
+        with pytest.raises(ValueError, match="fullsphere"):
+            validate_config(atl06_config)
 
     def test_fullsphere_layout_does_not_warn(self, atl06_config, catalog_file):
         atl06_config.output["grid"]["layout"] = "fullsphere"

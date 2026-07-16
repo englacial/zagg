@@ -1123,7 +1123,6 @@ class TestInvokeLambdaSetupEvent:
             "s3://out/product",
             parent_order=6,
             child_order=12,
-            n_parent_cells=None,
             overwrite=False,
             config_dict=config_dict,
             dataset=dataset,
