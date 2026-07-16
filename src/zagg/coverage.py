@@ -37,6 +37,7 @@ from zagg.hive import (
     root_coverage_words,
 )
 from zagg.store import open_object_store
+from zagg.windows import split_leaf_name
 
 logger = logging.getLogger(__name__)
 
@@ -203,7 +204,11 @@ def refresh_root_coverage(store_root: str, **store_kwargs) -> dict | None:
     :func:`warn_if_stale` once-per-episode latch for this store. Returns the
     envelope written, or ``None`` — deleting any existing root object — when
     no stamped leaf exists (absence is truthful, a stale cache is not, and
-    the ranges envelope has no empty form).
+    the ranges envelope has no empty form). Windowed leaves (issue #246)
+    classify as data via the frozen first-``_`` name split; several stamped
+    windows of one shard are one covered shard (the MOC is spatial — the
+    builder de-duplicates words), and a malformed window label is skipped
+    with a warning, like the foreign-order carve-out.
     """
     import obstore
     from obstore.exceptions import NotFoundError
@@ -226,7 +231,18 @@ def refresh_root_coverage(store_root: str, **store_kwargs) -> dict | None:
             rel = child.rstrip("/")
             name = rel.split("/")[-1]
             if name.endswith(".zarr"):
-                decimal = name.removesuffix(".zarr")
+                # Windowed leaves (issue #246, D13): `{full_id}_{window}.zarr`
+                # names split on the first `_` (frozen parse rule); several
+                # windows of one shard collapse to one coverage entry below.
+                try:
+                    decimal, _window = split_leaf_name(name)
+                except ValueError:
+                    logger.warning(
+                        f"refresh: skipping leaf {name!r} with a malformed window "
+                        f"label (frozen grammar, mortie#62) — it will NOT be "
+                        f"listed in {ROOT_COVERAGE_NAME}"
+                    )
+                    continue
                 if read_commit(open_store(f"{root}/{rel}", **store_kwargs)) is None:
                     continue  # unstamped debris (D4)
                 if _decimal_order(decimal) != order:

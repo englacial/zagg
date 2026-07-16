@@ -57,6 +57,7 @@ import zarr
 from zarr.errors import GroupNotFoundError
 
 from zagg.store import open_object_store
+from zagg.windows import leaf_name, split_leaf_name
 
 logger = logging.getLogger(__name__)
 
@@ -90,13 +91,16 @@ _ZSTD_LEVEL = 3
 ROOT_COVERAGE_NAME = "coverage.moc"
 
 
-def shard_leaf_path(store_root: str, shard_key) -> str:
+def shard_leaf_path(store_root: str, shard_key, window: str | None = None) -> str:
     """Absolute path of a shard's leaf zarr under ``store_root`` (D2/D3).
 
     Computed by mortie's ``hive_path`` — the layout convention is owned by the
     mortie spec — and re-checked against the node invariant (D5) so a future
     drift in either side fails loudly instead of writing a stray prefix.
-    Raises ``ValueError`` on an invalid shard key.
+    ``window`` (issue #246, D13) selects the shard's time-windowed leaf,
+    ``{full_id}_{window}.zarr``, at the same node; ``None`` is the bare
+    schedule-``none`` leaf, byte-identical to pre-windowing paths. Raises
+    ``ValueError`` on an invalid shard key or window label.
     """
     from mortie import MortonIndexArray
 
@@ -107,6 +111,9 @@ def shard_leaf_path(store_root: str, shard_key) -> str:
             f"id with zagg.grids.morton.morton_word first"
         )
     rel = MortonIndexArray.from_words(np.asarray([word], dtype=np.uint64)).hive_path()[0]
+    if window is not None:
+        node, _sep, bare = rel.rpartition("/")
+        rel = f"{node}/{leaf_name(bare.removesuffix('.zarr'), window)}"
     check_node_invariant(rel)
     return f"{store_root.rstrip('/')}/{rel}"
 
@@ -116,19 +123,24 @@ def check_node_invariant(rel_path: str) -> None:
 
     Below the root only digit components are allowed — ``{sign+base}``
     (optional ``-``, one digit ``1..6``) at the first level, one ``1..4`` digit
-    per level after — terminating in ``{full_id}.zarr`` whose id equals the
-    concatenated components. This is the walker's contract: any other name
-    under the root (bar the manifest and the future ``coverage.moc``) breaks
-    child classification.
+    per level after — terminating in ``{full_id}.zarr`` (or the windowed
+    ``{full_id}_{window}.zarr``, issue #246: split on the first ``_``, window
+    label per the frozen grammar) whose id equals the concatenated components.
+    This is the walker's contract: any other name under the root (bar the
+    manifest and the root ``coverage.moc``) breaks child classification.
     """
     parts = rel_path.strip("/").split("/")
     leaf = parts[-1]
     ok = len(parts) >= 2 and leaf.endswith(".zarr")
     if ok:
         head, digits = parts[0], parts[1:-1]
+        try:
+            full_id, _window = split_leaf_name(leaf)
+        except ValueError:
+            full_id = None  # malformed window label -> not a legal leaf
         ok = _is_base_component(head)
         ok = ok and all(len(d) == 1 and d in "1234" for d in digits)
-        ok = ok and leaf[: -len(".zarr")] == head + "".join(digits)
+        ok = ok and full_id == head + "".join(digits)
     if not ok:
         raise ValueError(f"path {rel_path!r} violates the hive node invariant (D5)")
 
@@ -450,9 +462,11 @@ def read_coverage_bitmap(leaf_root: str, **store_kwargs) -> np.ndarray | None:
     box is then the only index and readers degrade per D9, never to wrong
     answers. A PRESENT-but-corrupt sidecar raises instead (see
     :func:`decode_coverage_bitmap` — degrading a corrupt payload would be
-    indistinguishable from healthy box-only coverage). The shard id comes from the leaf's ``{full_id}.zarr`` basename;
-    ``cell_order`` from the envelope. One GET, paid only by readers that
-    want cell-level filtering.
+    indistinguishable from healthy box-only coverage). The shard id comes
+    from the leaf basename — ``{full_id}.zarr``, or the windowed
+    ``{full_id}_{window}.zarr`` (issue #246) — via the frozen first-``_``
+    split; ``cell_order`` from the envelope. One GET, paid only by readers
+    that want cell-level filtering.
     """
     import obstore
     from obstore.exceptions import NotFoundError
@@ -463,8 +477,9 @@ def read_coverage_bitmap(leaf_root: str, **store_kwargs) -> np.ndarray | None:
     coverage = read_coverage(open_store(leaf_root, **store_kwargs))
     if not coverage or coverage.get("encoding") != "bitmap" or not coverage.get("sidecar"):
         return None
-    leaf_name = leaf_root.rstrip("/").rsplit("/", 1)[-1]
-    shard = morton_word(leaf_name.removesuffix(".zarr"))
+    # Windowed leaves (issue #246) carry `{full_id}_{window}.zarr` basenames;
+    # the shard id is the part before the first `_` (the frozen parse rule).
+    shard = morton_word(split_leaf_name(leaf_root.rstrip("/").rsplit("/", 1)[-1])[0])
     store = open_object_store(leaf_root, **store_kwargs)
     try:
         data = obstore.get(store, str(coverage["sidecar"])).bytes()

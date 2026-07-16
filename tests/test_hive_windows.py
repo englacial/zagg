@@ -309,3 +309,139 @@ class TestManifestTemporal:
         m = hive.read_manifest(str(tmp_path / "v2"))
         assert m["spec"] == "morton-hive/2"
         assert m["temporal"]["schedule"] == "yearly"
+
+
+# ── windowed leaf paths + node invariant + walker (phase 3) ──────────────────
+
+
+def _shard_word(order=6):
+    """A real southern packed shard word (decimal form ``-5112333`` at order 6)."""
+    import numpy as np
+    from mortie import geo2mort
+
+    return int(geo2mort(np.array([-78.5]), np.array([-132.0]), order=order)[0])
+
+
+class TestWindowedLeafPath:
+    def test_windowed_leaf_at_the_shard_node(self):
+        # D13: the windowed leaf sits at the SAME digit node as the bare leaf,
+        # basename `{full_id}_{window}.zarr` (frozen naming, mortie#62).
+        word = _shard_word()
+        assert (
+            hive.shard_leaf_path("root", word, window="2025")
+            == "root/-5/1/1/2/3/3/3/-5112333_2025.zarr"
+        )
+        assert (
+            hive.shard_leaf_path("root", word, window="melt-2019")
+            == "root/-5/1/1/2/3/3/3/-5112333_melt-2019.zarr"
+        )
+
+    def test_bare_path_byte_identical(self):
+        word = _shard_word()
+        assert hive.shard_leaf_path("root", word) == hive.shard_leaf_path("root", word, window=None)
+
+    def test_bad_window_label_raises(self):
+        with pytest.raises(ValueError, match="grammar"):
+            hive.shard_leaf_path("root", _shard_word(), window="melt_2019")
+
+
+class TestWindowedNodeInvariant:
+    @pytest.mark.parametrize(
+        "ok",
+        [
+            "-5/1/1/2/3/3/3/-5112333_2025.zarr",
+            "-4/2/-42_melt-2019.zarr",
+            "-4/2/-42_20251103.zarr",
+            "-4/2/-42.zarr",  # bare stays legal
+        ],
+    )
+    def test_accepts(self, ok):
+        hive.check_node_invariant(ok)
+
+    @pytest.mark.parametrize(
+        "bad",
+        [
+            "-4/2/-43_2025.zarr",  # leaf id does not match the digit chain
+            "-4/2/-42_mel_t.zarr",  # `_` inside the window label
+            "-4/2/-42_.zarr",  # empty window label
+            "-4/2/-42_" + "a" * 33 + ".zarr",  # label too long
+        ],
+    )
+    def test_rejects(self, bad):
+        with pytest.raises(ValueError, match="node invariant"):
+            hive.check_node_invariant(bad)
+
+
+class TestWindowedWalkerAndSidecar:
+    def _grid(self, cfg):
+        return HealpixGrid(parent_order=6, child_order=8, layout="fullsphere", config=cfg)
+
+    def _windowed_store(self, cfg, tmp_path, labels, debris=()):
+        from zagg.store import open_store
+
+        _windowed(cfg)
+        grid = self._grid(cfg)
+        root = str(tmp_path / "store")
+        from zagg.config import get_windowing
+
+        hive.ensure_manifest(root, hive.build_manifest(grid, windowing=get_windowing(cfg)))
+        word = _shard_word()
+        for label in (*labels, *debris):
+            leaf = hive.shard_leaf_path(root, word, window=label)
+            store = open_store(leaf)
+            grid.emit_shard_template(store, overwrite=True)
+            if label not in debris:
+                hive.stamp_commit(store, cells_with_data=1, granule_count=1)
+        return root, word, grid
+
+    def test_refresh_walks_windowed_leaves_and_dedupes(self, cfg, tmp_path):
+        import numpy as np
+
+        from zagg.coverage import refresh_root_coverage
+
+        # Two stamped windows + one debris window of the SAME shard: the root
+        # MOC is spatial, so the shard is listed exactly once.
+        root, word, _grid = self._windowed_store(
+            cfg, tmp_path, labels=("2024", "2025"), debris=("2026",)
+        )
+        env = refresh_root_coverage(root)
+        np.testing.assert_array_equal(
+            hive.root_coverage_words(env), np.asarray([word], dtype=np.uint64)
+        )
+
+    def test_refresh_skips_malformed_window_label(self, cfg, tmp_path, caplog):
+        import logging
+
+        from zagg.coverage import refresh_root_coverage
+
+        root, word, _grid = self._windowed_store(cfg, tmp_path, labels=("2024",))
+        # A leaf-shaped name whose window part breaks the frozen charset: the
+        # walk warns and skips it instead of dying (escape-hatch posture).
+        bad = tmp_path / "store" / "-5" / "1" / "1" / "2" / "3" / "3" / "3"
+        (bad / "-5112333_bad_label.zarr").mkdir()
+        (bad / "-5112333_bad_label.zarr" / "zarr.json").write_text("{}")
+        with caplog.at_level(logging.WARNING, logger="zagg.coverage"):
+            env = refresh_root_coverage(root)
+        assert env is not None and len(env["ranges"]) == 1
+        assert any("malformed window label" in r.message for r in caplog.records)
+
+    def test_bitmap_sidecar_round_trip_on_windowed_leaf(self, cfg, tmp_path):
+        import numpy as np
+
+        from zagg.store import open_store
+
+        root, word, grid = self._windowed_store(cfg, tmp_path, labels=())
+        leaf = hive.shard_leaf_path(root, word, window="2025")
+        store = open_store(leaf)
+        grid.emit_shard_template(store, overwrite=True)
+        occupied = np.sort(np.asarray(grid.children(word)[:3], dtype=np.uint64))
+        bitmap = hive.encode_coverage_bitmap(word, occupied, grid.child_order)
+        hive.write_coverage_sidecar(leaf, bitmap)
+        hive.stamp_commit(
+            store,
+            cells_with_data=3,
+            granule_count=1,
+            coverage=hive.build_coverage(word, occupied, grid.child_order, bitmap=bitmap),
+        )
+        # The shard id parses out of the WINDOWED basename (first-`_` split).
+        np.testing.assert_array_equal(hive.read_coverage_bitmap(leaf), occupied)
