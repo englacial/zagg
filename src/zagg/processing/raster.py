@@ -170,9 +170,18 @@ async def _sample_one(
     region: str | None = None,
     anonymous: bool = True,
     fill=0,
+    geom_cache: dict | None = None,
 ):
     """:func:`sample_asset_async` body, also returning the raster's center
-    ``(lon, lat)`` — the ownership rule's tile-center input (#218)."""
+    ``(lon, lat)`` — the ownership rule's tile-center input (#218).
+
+    ``geom_cache`` (issue #244) memoizes the pull-NN mapping ``(rows, cols,
+    valid)`` per ``(epsg, transform, shape)``: the mapping is invariant across
+    every timestep and band that shares a source grid, so a shard invoke
+    computes it once per distinct grid (~175 ms at o9) instead of once per
+    asset-sample. ``None`` (the default, and the public ``sample_asset*``
+    path) computes per call, unchanged.
+    """
     from async_tiff import TIFF
 
     store, path = _store_and_path(href, region=region, anonymous=anonymous)
@@ -191,7 +200,18 @@ async def _sample_one(
     epsg, transform = _geo_from_ifd(ifd)
     shape = (ifd.image_height, ifd.image_width)
     center = _raster_center_lonlat(epsg, transform, shape)
-    rows, cols, valid = grid.sample(cells, f"EPSG:{epsg}", transform, shape)
+    geom_key = (epsg, transform, shape)
+    geom = geom_cache.get(geom_key) if geom_cache is not None else None
+    if geom is None:
+        # INVARIANT (issue #244 thread): no ``await`` between this check and
+        # the store below. asyncio interleaves only at await points, so the
+        # compute-and-store is atomic on the loop and each source grid is
+        # computed exactly once per invoke — no locks needed. If this compute
+        # ever moves off-loop (``to_thread``), add per-key async locks.
+        geom = grid.sample(cells, f"EPSG:{epsg}", transform, shape)
+        if geom_cache is not None:
+            geom_cache[geom_key] = geom
+    rows, cols, valid = geom
 
     th, tw = ifd.tile_height, ifd.tile_width
     vr, vc = rows[valid], cols[valid]
@@ -271,6 +291,7 @@ async def sample_item_async(
     nodata=None,
     region: str | None = None,
     anonymous: bool = True,
+    geom_cache: dict | None = None,
 ):
     """Sample every configured band of one STAC item, concurrently.
 
@@ -313,6 +334,7 @@ async def sample_item_async(
                 region=region,
                 anonymous=anonymous,
                 fill=bands[f]["fill_value"],
+                geom_cache=geom_cache,
             )
             for f in fields
         ]
@@ -508,6 +530,12 @@ def process_raster_shard(
     # orders.
     k = _shard_workers(config)
     wb = _write_buffer(config)
+    # Pull-NN geometry memo (issue #244), scoped to THIS invoke: the (rows,
+    # cols, valid) mapping embeds the shard's cells, so per-invoke scoping
+    # makes cross-shard collisions impossible by construction. A full-year
+    # Sentinel-2 shard has exactly two distinct source grids (10 m bands,
+    # 20 m scl) — this turns 425 geometry computations into 2.
+    geom_cache: dict = {}
 
     async def _run_all():
         sem = asyncio.Semaphore(k)
@@ -524,6 +552,7 @@ def process_raster_shard(
                             nodata=nodata,
                             region=region,
                             anonymous=anonymous,
+                            geom_cache=geom_cache,
                         )
                         for e in items
                     ]
