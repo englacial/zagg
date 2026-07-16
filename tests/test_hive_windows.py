@@ -1407,8 +1407,9 @@ class TestYearlyEndToEnd:
 
         - gA: [300, 400, 401, 402] — one 2018 obs (backfill bait) + three 2019
         - gB: [800, 801, 802] — all 2020
-        - gC: [729.5, 729.75, 730.25, 730.5] — straddles the 2019/2020 boundary
-          (2020-01-01 = day 730)
+        - gC: [729.5, 729.75, 730.0, 730.25, 730.5] — straddles the 2019/2020
+          boundary (2020-01-01 = day 730); the 730.0 obs lands EXACTLY on the
+          boundary instant and (half-open [start, end): ge start) belongs to 2020
         """
         import numpy as np
 
@@ -1427,7 +1428,7 @@ class TestYearlyEndToEnd:
         return {
             "s3://bucket/granuleA.h5": h5([300.0, 400.0, 401.0, 402.0]),
             "s3://bucket/granuleB.h5": h5([800.0, 801.0, 802.0]),
-            "s3://bucket/granuleC.h5": h5([729.5, 729.75, 730.25, 730.5]),
+            "s3://bucket/granuleC.h5": h5([729.5, 729.75, 730.0, 730.25, 730.5]),
         }
 
     def _records(self):
@@ -1474,7 +1475,7 @@ class TestYearlyEndToEnd:
         grp = zarr.open_group(open_store(leaf), path=grid.group_path, mode="r", zarr_format=3)
         return int(np.asarray(grp["count"][:]).sum())
 
-    def test_boundary_straddling_observations_split_exactly(self, monkeypatch, cfg, tmp_path):
+    def test_boundary_straddling_observations_split_exactly(self, monkeypatch, tmp_path):
         from zagg.store import open_store
 
         root = str(tmp_path / "store")
@@ -1485,10 +1486,11 @@ class TestYearlyEndToEnd:
 
         # Observation-level split on delta_time (the injected ge/lt filters):
         # 2018 gets gA's single early obs; 2019 gets gA's three + gC's two
-        # pre-boundary obs; 2020 gets gB's three + gC's two post-boundary obs.
+        # pre-boundary obs; 2020 gets gB's three + gC's three at-and-post-boundary
+        # obs (the day-730.0 obs lands ON the boundary → 2020 by ge start).
         assert self._leaf_obs(root, shard, "2018", grid) == 1
         assert self._leaf_obs(root, shard, "2019", grid) == 5
-        assert self._leaf_obs(root, shard, "2020", grid) == 5
+        assert self._leaf_obs(root, shard, "2020", grid) == 6
 
         # Stamp truth (D15): window label + the ACTUAL ISO-UTC extent of what
         # was written, strictly inside the window's half-open range.
@@ -1497,14 +1499,16 @@ class TestYearlyEndToEnd:
         assert stamp["window"] == "2019"
         # day 400 = 2019-02-05; day 729.75 = 2019-12-31T18:00 (gC's last 2019 obs).
         assert stamp["time_range"] == ["2019-02-05T00:00:00+00:00", "2019-12-31T18:00:00+00:00"]
-        # Boundary membership: the 2020 leaf STARTS at day 730.25 (06:00), not
-        # at the boundary instant — half-open windows, no double-counting.
+        # Boundary membership: gC's day-730.0 obs sits EXACTLY on the boundary
+        # instant, so the 2020 leaf STARTS at 2020-01-01T00:00:00 — half-open
+        # [start, end) puts the boundary tie in 2020, with no double-counting
+        # (it is absent from 2019, whose lt end excludes it).
         stamp20 = hive.read_commit(open_store(hive.shard_leaf_path(root, shard, window="2020")))
-        assert stamp20["time_range"][0] == "2020-01-01T06:00:00+00:00"
+        assert stamp20["time_range"][0] == "2020-01-01T00:00:00+00:00"
         # Per-unit granule subsetting reached the worker: 2019 read gA + gC.
         assert stamp["granule_count"] == 2
 
-    def test_backfill_then_root_union_and_idempotent_rerun(self, monkeypatch, cfg, tmp_path):
+    def test_backfill_then_root_union_and_idempotent_rerun(self, monkeypatch, tmp_path):
         import os
 
         from zagg.coverage import refresh_root_coverage
