@@ -3057,12 +3057,23 @@ def _invoke_lambda_ping(
         raise RuntimeError(f"Lambda ping failed: {payload}")
     result = json.loads(payload)
     if result.get("statusCode") != 200:
+        try:
+            body = json.loads(result.get("body") or "{}")
+        except (TypeError, ValueError):
+            body = {}
+        if body.get("mode") == "ping":
+            # The deployed function KNOWS ping — this is validate_manifest
+            # refusing the store, not a stale deployment.
+            raise RuntimeError(
+                f"Lambda ping refused the store at {store_path}: "
+                f"{body.get('error')!r} — the store was templated for a "
+                f"different configuration; clear the store root (or pick a "
+                f"new one) before dispatching this run"
+            )
         raise RuntimeError(
-            f"Lambda ping failed (response body {result.get('body')!r}): either the "
+            f"Lambda ping failed (response body {result.get('body')!r}): the "
             f"deployed function predates the issue #252 manifest-in-finalize "
-            f"lifecycle — redeploy the function before dispatching hive runs — or "
-            f"the store at {store_path} was templated for a different "
-            f"configuration (see the body's error)"
+            f"lifecycle — redeploy the function before dispatching hive runs"
         )
     try:
         version = json.loads(result.get("body") or "{}").get("zagg_version")
