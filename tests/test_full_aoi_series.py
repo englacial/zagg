@@ -67,9 +67,10 @@ def _record(commit="c0", target="full_aoi_neon_o9_inline_nomask", event="release
             "s3_slowdown_shards": 0,
             "cells_timeout": 0,
         },
-        # Store object counts (issue #240, record-only on this leg).
+        # Store object counts (issue #240, record-only on this leg). Distinct
+        # values so a column transposition can't pass unnoticed (review).
         "objects_total": 27,
-        "objects_expected": 27,
+        "objects_expected": 25,
         "objects_mismatch": None,
     }
     r.update(over)
@@ -217,11 +218,11 @@ def test_objects_columns_retained_and_mismatch_dropped():
     # The two scalar object columns are retained in the release series; the
     # mismatch description is JSON-only (dropped by the reindex), mirroring the
     # per-merge series' JSON-only keys.
-    df = fas.records_to_frame([_record(objects_mismatch="total objects 999 != expected 27")])
+    df = fas.records_to_frame([_record(objects_mismatch="total objects 999 != expected 25")])
     assert list(df.columns) == fas.FULL_AOI_COLUMNS
     assert fas.FULL_AOI_COLUMNS[-2:] == ["objects_total", "objects_expected"]
     assert df.iloc[0]["objects_total"] == 27
-    assert df.iloc[0]["objects_expected"] == 27
+    assert df.iloc[0]["objects_expected"] == 25
     assert "objects_mismatch" not in df.columns
     # A pre-#240 record (no objects keys) degrades to null cells, not a KeyError.
     legacy = _record()
