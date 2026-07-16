@@ -1205,6 +1205,17 @@ class TestInvokeLambdaSetupEvent:
         with pytest.raises(RuntimeError, match="redeploy"):
             self._invoke(self._client({"ok": True, "mode": "setup"}), asdict(cfg))
 
+    def test_defaulted_flat_grid_needs_no_echo(self, cfg):
+        # The guard resolves the same grid-aware default (get_store_layout):
+        # a rect config defaults flat, so an echo-less body stays accepted.
+        cfg.output["grid"] = {
+            "type": "rectilinear",
+            "crs": "EPSG:3031",
+            "resolution": 500,
+            "bounds": [0, 0, 5000, 5000],
+        }
+        self._invoke(self._client({"ok": True, "mode": "setup"}), asdict(cfg))
+
     @pytest.mark.parametrize(
         "body",
         [
