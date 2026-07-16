@@ -77,6 +77,29 @@ def _geo_from_ifd(ifd) -> tuple[int, tuple[float, float, float, float, float, fl
 # pattern. Lock-guarded because the running-loop fallback in ``sample_asset``
 # and hand-rolled callers can construct from other threads; construction runs
 # under the lock deliberately (single-flight per key).
+#
+# Credential lifetime (issue #244 review): every key deployed today is
+# anonymous (``sentinel2_l2a.yaml`` sets ``anonymous: true``; runner.py:676
+# and ``sample_asset*`` default it True), so the cached ``S3Store`` carries
+# ``skip_signature=True`` and signs nothing — credentials never enter the
+# picture and warm-caching a store cannot go stale. If a *signed* store
+# (``anonymous=False``) were ever cached, sandbox-lifetime caching would only
+# be safe because of how async-tiff's Rust ``object_store``-backed ``S3Store``
+# resolves credentials, and that splits by environment:
+#   - On AWS Lambda the execution-role credentials arrive as static env vars
+#     valid for the whole sandbox lifetime and do NOT rotate mid-sandbox, so a
+#     sandbox-lifetime store cannot outlive its creds — safe by construction.
+#   - Off-Lambda (EC2 instance profile / IMDS, SSO), object_store resolves
+#     through a caching credential *provider* that refreshes on expiry per
+#     request rather than freezing a token at construction, so a warm store
+#     keeps working across rotation.
+# (The Lambda case is directly grounded; the off-Lambda refresh behavior
+# reflects object_store's documented provider design — ``S3Store`` exposes a
+# ``credential_provider`` slot — and was not source-verified against the
+# installed binary wheel.) Caveat: no explicit-credential store exists here
+# (the raster path is anonymous); do NOT add one to the cache without
+# revisiting this, since a statically-supplied token would be frozen at
+# construction and eventually go stale on a warm worker.
 _STORE_CACHE: dict = {}
 _STORE_LOCK = threading.Lock()
 
