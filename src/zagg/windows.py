@@ -75,10 +75,13 @@ _OFFSET_ERA = datetime(2017, 1, 1, tzinfo=timezone.utc)
 #: Explicit-list label charset (frozen): opaque, no ``_`` by construction —
 #: the superset grammar every window label (generative included) satisfies.
 _LABEL_RE = re.compile(r"^[0-9A-Za-z-]{1,32}$")
+#: ASCII ``[0-9]`` (not ``\d``, which also matches Unicode digits) — keeps the
+#: generative labels a strict subset of the frozen ``_LABEL_RE`` charset, so an
+#: externally supplied label round-trips through ``leaf_name``/``split_leaf_name``.
 _GENERATIVE_RE = {
-    "yearly": re.compile(r"^\d{4}$"),
-    "monthly": re.compile(r"^\d{6}$"),
-    "daily": re.compile(r"^\d{8}$"),
+    "yearly": re.compile(r"^[0-9]{4}$"),
+    "monthly": re.compile(r"^[0-9]{6}$"),
+    "daily": re.compile(r"^[0-9]{8}$"),
 }
 
 
@@ -95,7 +98,7 @@ def check_schedule(schedule: str) -> str:
     return schedule
 
 
-def parse_utc(value) -> datetime:
+def parse_utc(value: str | datetime) -> datetime:
     """Parse an ISO-8601 string (or pass through a ``datetime``) as aware UTC.
 
     A naive input is taken AS UTC (window boundaries are UTC-defined); an
@@ -149,7 +152,9 @@ def validate_label(label: str, schedule: str = "explicit") -> str:
     return label
 
 
-def window_range(label: str, schedule: str, windows: list[dict] | None = None):
+def window_range(
+    label: str, schedule: str, windows: list[dict] | None = None
+) -> tuple[datetime, datetime]:
     """The half-open UTC ``[start, end)`` of one window.
 
     Generative labels decode arithmetically. Explicit labels are OPAQUE: they
@@ -268,6 +273,14 @@ def utc_to_offset(dt: datetime, *, epoch, scale: str = "utc", units: str = "seco
     ``datetime``). See the module docstring for the fixed-offset semantics
     and tolerance; e.g. ICESat-2 ``delta_time`` is
     ``scale="gps", epoch="2018-01-01T00:00:00Z"`` (the ATLAS SDP epoch).
+
+    The <= 1 s guarantee holds only when ``epoch`` **and** ``dt`` lie on the
+    same side of 2017-01-01 (the current constant-offset era): the branch keys
+    on ``epoch`` alone and assumes the scale-UTC offset is identical at ``dt``,
+    so a post-2017 epoch with a pre-2017 ``dt`` (or an arbitrary pre-2017
+    *non-native* epoch, offset-at-epoch taken as 0) can carry up to the full
+    current offset as error. Legitimate ICESat-2/native-epoch use is exact; no
+    runtime guard is imposed.
     """
     epoch_dt = parse_utc(epoch)
     offset = epoch_offset(scale)  # validates the scale even when it cancels
@@ -278,7 +291,12 @@ def utc_to_offset(dt: datetime, *, epoch, scale: str = "utc", units: str = "seco
 
 
 def offset_to_utc(value: float, *, epoch, scale: str = "utc", units: str = "seconds") -> datetime:
-    """Inverse of :func:`utc_to_offset`: dataset time -> aware UTC instant."""
+    """Inverse of :func:`utc_to_offset`: dataset time -> aware UTC instant.
+
+    Same fixed-offset caveat as :func:`utc_to_offset`: the <= 1 s guarantee
+    holds only when ``epoch`` and the resulting instant are on the same side of
+    2017-01-01; no runtime guard is imposed.
+    """
     epoch_dt = parse_utc(epoch)
     offset = epoch_offset(scale)  # validates the scale even when it cancels
     seconds = float(value) * _unit_seconds(units)
