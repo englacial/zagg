@@ -1437,10 +1437,16 @@ def _windowed_units(cells: list[tuple], windowing: dict, bounds_temporal: dict |
                     "shardmap with `python -m zagg.catalog`, or set bounds.temporal "
                     "{start_date, end_date} on the run config"
                 )
+            # A bare ``YYYY-MM-DD`` end_date means end-of-day; a full ISO
+            # instant is parsed verbatim (appending the suffix unconditionally
+            # would corrupt e.g. ``2020-12-31T00:00:00Z`` into a parse error).
+            end_date = bounds_temporal["end_date"]
+            if isinstance(end_date, str) and len(end_date) == 10 and "T" not in end_date:
+                end_date = f"{end_date}T23:59:59"
             found.update(
                 windows_intersecting(
                     parse_utc(bounds_temporal["start_date"]),
-                    parse_utc(f"{bounds_temporal['end_date']}T23:59:59"),
+                    parse_utc(end_date),
                     schedule,
                 )
             )
