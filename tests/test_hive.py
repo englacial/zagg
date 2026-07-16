@@ -1272,10 +1272,17 @@ class TestRunnerWiring:
             }
 
         monkeypatch.setattr(runner, "_invoke_lambda_cell", fake_cell)
+        monkeypatch.setattr(
+            runner, "_invoke_lambda_ping", lambda *a, **kw: captured.update(ping=kw)
+        )
         agg(cfg, catalog=catalog_path, store="s3://out/product", backend="lambda")
 
-        # NO pre-worker setup invoke: hive setup is gone from the wall.
+        # NO manifest-writing setup invoke: what runs up front is the
+        # lightweight ping, carrying the same manifest inputs as finalize
+        # (fail-fast guard, issue #252 — decoupled from the write).
         assert "setup" not in captured
+        assert captured["ping"]["dataset"] == {"short_name": "ATL06", "version": "007"}
+        assert captured["ping"]["config_dict"]["output"]["store_layout"] == "hive"
         assert captured["finalize"]["dataset"] == {"short_name": "ATL06", "version": "007"}
         # store_layout rides in the config dict already serialized into events.
         assert captured["finalize"]["config_dict"]["output"]["store_layout"] == "hive"
@@ -1335,9 +1342,13 @@ class TestRunnerWiring:
                 "shard_key": shard,
             },
         )
+        monkeypatch.setattr(
+            runner, "_invoke_lambda_ping", lambda *a, **kw: captured.update(ping=kw)
+        )
         agg(cfg, catalog=catalog_path, store="s3://out/x.zarr", backend="lambda")
         assert "dataset" not in captured["setup"]
         assert "finalize" not in captured
+        assert "ping" not in captured
 
 
 def _wire_client(body: dict, status_code: int = 200):
@@ -1436,5 +1447,68 @@ class TestInvokeLambdaFinalizeEvent:
             self._invoke(
                 _wire_client({"error": "boom", "mode": "finalize"}, status_code=500),
                 config_dict={"output": {"store_layout": "hive"}},
+                parent_order=6,
+            )
+
+
+class TestInvokeLambdaPingEvent:
+    """Pin the ACTUAL ping event on the wire and the fail-fast guard (issue
+    #252, replacing the PR #205 layout-echo guard): the ping carries the same
+    manifest inputs as hive finalize, and any non-200 — a stale function's
+    process-handler 400 fall-through, or the handler's validate_manifest
+    refusal — raises before a single worker is dispatched."""
+
+    @staticmethod
+    def _invoke(client, config_dict, **kw):
+        from zagg.runner import _invoke_lambda_ping
+
+        _invoke_lambda_ping(
+            client,
+            "process-shard",
+            "s3://out/product",
+            config_dict=config_dict,
+            **kw,
+        )
+        return json.loads(client.invoke.call_args.kwargs["Payload"])
+
+    def test_event_carries_manifest_inputs(self, cfg):
+        cfg.output["store_layout"] = "hive"
+        config_dict = asdict(cfg)
+        event = self._invoke(
+            _wire_client({"ok": True, "mode": "ping", "zagg_version": "1.2.3"}),
+            config_dict,
+            dataset={"short_name": "ATL06", "version": "007"},
+            parent_order=6,
+            overwrite=False,
+        )
+        assert event["mode"] == "ping"
+        assert event["config"] == config_dict
+        assert event["dataset"] == {"short_name": "ATL06", "version": "007"}
+        assert event["parent_order"] == 6
+        assert event["overwrite"] is False
+
+    def test_stale_function_fall_through_fails_fast(self, cfg):
+        # A pre-#252 function doesn't know mode="ping": the event falls
+        # through to its process handler, which 400s the key-less event with
+        # ZERO writes — the dispatcher turns that into the redeploy message.
+        cfg.output["store_layout"] = "hive"
+        with pytest.raises(RuntimeError, match="redeploy"):
+            self._invoke(
+                _wire_client({"error": "shard_key required"}, status_code=400),
+                asdict(cfg),
+                parent_order=6,
+            )
+
+    def test_validate_refusal_fails_fast(self, cfg):
+        # The handler's read-only validate_manifest refusal (frozen-key
+        # mismatch, D2) surfaces the same way: pre-fan-out, run aborted.
+        cfg.output["store_layout"] = "hive"
+        with pytest.raises(RuntimeError, match="Lambda ping failed"):
+            self._invoke(
+                _wire_client(
+                    {"error": "morton_hive.json ... does not match this run", "mode": "ping"},
+                    status_code=500,
+                ),
+                asdict(cfg),
                 parent_order=6,
             )

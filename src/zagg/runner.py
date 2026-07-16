@@ -2210,14 +2210,27 @@ def _run_lambda(
     # calls that already happen, so no worker probe tax -- issue #100). They
     # decompose wall time into setup invoke / fan-out / finalize invoke so
     # "where did wall time go" is answerable from the summary.
-    # Hive layout (issue #252): NO pre-worker setup invoke. The manifest is
-    # reader-facing and hive workers write self-describing leaves (D3), so
-    # the morton_hive.json write rides the finalize invoke instead —
-    # order-correct (readers arrive after the run) and a whole synchronous
-    # ~3.7 s pre-fan-out round-trip off the wall. setup_s keeps bracketing
-    # the phase.
+    # Hive layout (issue #252): NO manifest-writing setup invoke. The
+    # manifest is reader-facing and hive workers write self-describing leaves
+    # (D3), so the morton_hive.json write rides the finalize invoke instead —
+    # order-correct (readers arrive after the run). What remains up front is
+    # one lightweight ping, decoupled from the write: fail-fast for a stale
+    # deployment and the read-only frozen-key precheck (see
+    # _invoke_lambda_ping; kept while flat exists — issue #251). setup_s
+    # keeps bracketing the phase.
     setup_start = time.time()
-    if get_store_layout(config) != "hive":
+    if get_store_layout(config) == "hive":
+        _invoke_lambda_ping(
+            state["lambda_client"],
+            function_name,
+            store_path,
+            config_dict=config_dict,
+            dataset=dataset,
+            parent_order=parent_order,
+            overwrite=overwrite,
+            output_creds_event=output_creds_event,
+        )
+    else:
         _invoke_lambda_setup(
             state["lambda_client"],
             function_name,
@@ -3019,6 +3032,74 @@ def _invoke_lambda_setup(
     result = json.loads(payload)
     if result.get("statusCode") != 200:
         raise RuntimeError(f"Lambda setup error: {result.get('body')}")
+
+
+def _invoke_lambda_ping(
+    lambda_client,
+    function_name,
+    store_path,
+    *,
+    config_dict,
+    dataset=None,
+    parent_order=None,
+    overwrite=False,
+    output_creds_event=None,
+):
+    """Pre-fan-out fail-fast ping for hive dispatch (issue #252).
+
+    One lightweight RequestResponse invoke, decoupled from the manifest WRITE
+    (which rides finalize). Two failure modes are caught before any worker is
+    dispatched:
+
+    - **Stale deployment:** a function that predates the manifest-in-finalize
+      lifecycle has no ping mode, so the event falls through to its process
+      handler's 400 with ZERO writes — strictly earlier and cheaper than the
+      retired PR #205 layout-echo guard, which only fired after a
+      pre-#199-phase-3 function had already written the flat GLOBAL template
+      at the hive root. This also gates out hive-capable-but-pre-fold
+      functions, whose finalize would not write the manifest.
+    - **Incompatible existing store:** the handler runs the read-only
+      ``zagg.hive.validate_manifest`` against the event's manifest inputs
+      (same keys as hive finalize), so a frozen-key mismatch — or an
+      overwrite into a root with shard data — refuses up front (D2) instead
+      of after the fan-out (PR #255 review fold).
+
+    Kept while flat exists (issue #251): once flat is removed, a stale
+    function just errors and the ping can be dropped.
+    """
+    event = {
+        "mode": "ping",
+        "store_path": store_path,
+        "parent_order": parent_order,
+        "overwrite": overwrite,
+        "config": config_dict,
+    }
+    if dataset is not None:
+        event["dataset"] = dataset
+    if output_creds_event is not None:
+        event["output_credentials"] = output_creds_event
+    response = lambda_client.invoke(
+        FunctionName=function_name,
+        InvocationType="RequestResponse",
+        Payload=json.dumps(event),
+    )
+    payload = response["Payload"].read().decode("utf-8")
+    if response.get("FunctionError"):
+        raise RuntimeError(f"Lambda ping failed: {payload}")
+    result = json.loads(payload)
+    if result.get("statusCode") != 200:
+        raise RuntimeError(
+            f"Lambda ping failed (response body {result.get('body')!r}): either the "
+            f"deployed function predates the issue #252 manifest-in-finalize "
+            f"lifecycle — redeploy the function before dispatching hive runs — or "
+            f"the store at {store_path} was templated for a different "
+            f"configuration (see the body's error)"
+        )
+    try:
+        version = json.loads(result.get("body") or "{}").get("zagg_version")
+    except (TypeError, ValueError):
+        version = None
+    logger.info(f"Hive preflight OK (function zagg version {version})")
 
 
 def _invoke_lambda_finalize(

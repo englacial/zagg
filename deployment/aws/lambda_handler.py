@@ -74,6 +74,25 @@ instead, folded off the pre-worker setup path):
     "output_credentials": dict (optional, same shape as process mode),
 }
 
+Ping mode (hive pre-fan-out preflight, issue #252 — writes nothing; kept while
+flat exists, issue #251):
+{
+    "mode": "ping",
+    "store_path": str,
+    "config": dict,             # same manifest inputs as hive finalize; with it
+    "parent_order": int,        #   ride "overwrite" and the optional "dataset"
+    "overwrite": bool,          #   identity block
+    "dataset": dict (optional),
+    "output_credentials": dict (optional, same shape as process mode),
+}
+Answering 200 at all is the versioning half of the guard: a function deployed
+before the issue #252 manifest-in-finalize lifecycle doesn't know the mode, so
+the event falls through to the process handler's 400 (zero writes) and the
+dispatcher fails fast with a redeploy message before any worker runs. The body
+echoes the deployed zagg version; the handler also runs the READ-ONLY
+zagg.hive.validate_manifest against any existing root so an incompatible rerun
+refuses up front (D2).
+
 Extract mode (chunk-boundary geometry extraction, issue #148 — one parquet per
 granule under an S3 prefix; a batch of granules per invocation for the fan-out):
 {
@@ -453,6 +472,7 @@ def lambda_handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
 
     Default ``mode`` (or no mode) runs per-cell processing. ``mode="setup"``
     creates the zarr template; ``mode="finalize"`` consolidates metadata;
+    ``mode="ping"`` is the hive pre-fan-out preflight (issue #252);
     ``mode="coverage"`` writes the store-root ``coverage.moc`` (issue #200);
     ``mode="extract"`` extracts chunk-boundary geometry parquets (issue #148);
     ``mode="process_event"`` runs the temporal/event worker (issue #12).
@@ -468,6 +488,8 @@ def lambda_handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
         return _handle_setup(event)
     if mode == "finalize":
         return _handle_finalize(event)
+    if mode == "ping":
+        return _handle_ping(event)
     if mode == "coverage":
         return _handle_coverage(event)
     # Extract mode returns directly: the result_url mirror below is for the
@@ -723,6 +745,52 @@ def _handle_finalize(event: Dict[str, Any]) -> Dict[str, Any]:
     except Exception as e:
         logger.exception(e)
         return {"statusCode": 500, "body": json.dumps({"error": str(e), "mode": "finalize"})}
+
+
+def _handle_ping(event: Dict[str, Any]) -> Dict[str, Any]:
+    """Hive pre-fan-out preflight (issue #252) — writes nothing.
+
+    Answering 200 at all is the versioning half of the guard: a function that
+    predates the manifest-in-finalize lifecycle doesn't know ``mode="ping"``,
+    so the event falls through to its process handler's 400 (zero writes) and
+    the dispatcher fails fast with a redeploy message before any worker is
+    dispatched. The body echoes the deployed zagg version for observability.
+
+    The store half mirrors finalize's manifest inputs and runs the READ-ONLY
+    :func:`zagg.hive.validate_manifest` against any existing root, so a run
+    into a store templated for different orders/identity refuses up front
+    (the D2 mixed-order footgun) instead of after the fan-out — the writer-
+    side guard the manifest fold would otherwise defer to finalize (PR #255
+    review fold). Kept while flat exists (issue #251): once flat is removed,
+    a stale function simply errors and the ping can be dropped.
+    """
+    logger.info(f"Ping mode: hive preflight for {event.get('store_path')}")
+    try:
+        import zagg
+
+        if "config" in event:
+            config = load_config_from_dict(event["config"])
+            if get_store_layout(config) == "hive":
+                from zagg.config import get_windowing
+                from zagg.grids import from_config
+                from zagg.hive import build_manifest, validate_manifest
+
+                grid = from_config(config, parent_order=event.get("parent_order"))
+                validate_manifest(
+                    event["store_path"],
+                    build_manifest(
+                        grid, dataset=event.get("dataset"), windowing=get_windowing(config)
+                    ),
+                    overwrite=event.get("overwrite", False),
+                    **_output_store_kwargs(event),
+                )
+        return {
+            "statusCode": 200,
+            "body": json.dumps({"ok": True, "mode": "ping", "zagg_version": zagg.__version__}),
+        }
+    except Exception as e:
+        logger.exception(e)
+        return {"statusCode": 500, "body": json.dumps({"error": str(e), "mode": "ping"})}
 
 
 def _handle_coverage(event: Dict[str, Any]) -> Dict[str, Any]:

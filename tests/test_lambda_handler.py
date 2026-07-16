@@ -1353,6 +1353,74 @@ class TestFinalizeHive:
         assert len(calls) == 1
 
 
+class TestPingMode:
+    """Issue #252: the hive pre-fan-out preflight. Answering 200 at all gates
+    the deployment generation (a pre-fold function 400s the unknown mode via
+    its process handler — zero writes); the body echoes the zagg version; and
+    the read-only validate_manifest refuses an incompatible existing store
+    BEFORE the fan-out (PR #255 review fold)."""
+
+    def _event(self, tmp_path, config_dict, **extra):
+        return {
+            "mode": "ping",
+            "store_path": str(tmp_path / "hive-out"),
+            "parent_order": 6,
+            "overwrite": False,
+            "config": config_dict,
+            "dataset": {"short_name": "ATL06", "version": "007"},
+            **extra,
+        }
+
+    def test_ping_fresh_root_is_200_and_writes_nothing(self, handler_mod, tmp_path):
+        import os
+
+        import zagg
+        from zagg import hive
+
+        event = self._event(tmp_path, TestProcessHive._hive_config_dict())
+        resp = handler_mod._handle_ping(event)
+        assert resp["statusCode"] == 200, resp["body"]
+        body = json.loads(resp["body"])
+        assert body["mode"] == "ping"
+        assert body["zagg_version"] == zagg.__version__
+        # Read-only: the preflight never writes the manifest (or anything).
+        assert not os.path.exists(os.path.join(event["store_path"], hive.MANIFEST_NAME))
+
+    def test_ping_matching_existing_store_resumes(self, handler_mod, tmp_path):
+        cfg = TestProcessHive._hive_config_dict()
+        assert handler_mod._handle_finalize(self._event(tmp_path, cfg))["statusCode"] == 200
+        assert handler_mod._handle_ping(self._event(tmp_path, cfg))["statusCode"] == 200
+
+    def test_ping_frozen_key_mismatch_is_500(self, handler_mod, tmp_path):
+        # The D2 writer-side guard, now firing BEFORE the fan-out: a store
+        # templated for different orders refuses at ping time.
+        cfg = TestProcessHive._hive_config_dict()
+        assert handler_mod._handle_finalize(self._event(tmp_path, cfg))["statusCode"] == 200
+        other = TestProcessHive._hive_config_dict()
+        other["output"]["grid"]["parent_order"] = 5
+        resp = handler_mod._handle_ping(self._event(tmp_path, other))
+        assert resp["statusCode"] == 500
+        assert "does not match this run" in json.loads(resp["body"])["error"]
+
+    def test_ping_routes_from_lambda_handler(self, handler_mod):
+        # The dispatch seam: mode="ping" answers 200 with no store touched —
+        # the versioning half of the guard needs nothing but the deployment.
+        resp = handler_mod.lambda_handler({"mode": "ping"}, _context())
+        assert resp["statusCode"] == 200, resp["body"]
+        assert json.loads(resp["body"])["mode"] == "ping"
+
+    def test_ping_event_400s_on_pre_fold_process_handler(self, handler_mod, tmp_path):
+        # What a STALE deployment does with the ping: no ping branch, so the
+        # event lands in the process handler, which rejects the key-less
+        # event with a 400 and writes nothing — the dispatcher's fail-fast.
+        import os
+
+        event = self._event(tmp_path, TestProcessHive._hive_config_dict())
+        resp = handler_mod._handle_process(event, _context())
+        assert resp["statusCode"] == 400
+        assert not os.path.exists(event["store_path"])
+
+
 class TestSetupTemplate:
     """Issue #99: the setup handler used to hand-build the HEALPix grid and drop
     ``chunk_inner``, so the template was chunked at ``parent_order`` while workers

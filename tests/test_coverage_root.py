@@ -327,6 +327,7 @@ class TestLambdaCoverageDispatch:
             ),
         )
         monkeypatch.setattr(runner, "_invoke_lambda_setup", lambda *a, **kw: None)
+        monkeypatch.setattr(runner, "_invoke_lambda_ping", lambda *a, **kw: None)
         monkeypatch.setattr(runner, "_invoke_lambda_finalize", lambda *a, **k: None)
         monkeypatch.setattr(
             runner,
