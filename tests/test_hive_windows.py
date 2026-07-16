@@ -620,6 +620,38 @@ class TestWindowedStamp:
                 time_range=["2025-01-01T00:00:00+00:00", "2025-02-01T00:00:00+00:00"],
             )
 
+    def test_reversed_time_range_rejected(self, cfg):
+        # D15 truth half fails CLOSED: a [t_max, t_min] pair never becomes
+        # durable truth (review finding, PR #248).
+        store = self._leaf(cfg)
+        with pytest.raises(ValueError, match="reversed"):
+            hive.stamp_commit(
+                store,
+                cells_with_data=1,
+                granule_count=1,
+                window="2025",
+                time_range=["2025-11-20T18:30:00+00:00", "2025-03-01T06:00:00+00:00"],
+            )
+
+    def test_wrong_length_time_range_rejected(self, cfg):
+        store = self._leaf(cfg)
+        for bad in (["2025-01-01T00:00:00+00:00"], ["a", "b", "c"]):
+            with pytest.raises(ValueError, match="2-sequence"):
+                hive.stamp_commit(
+                    store, cells_with_data=1, granule_count=1, window="2025", time_range=bad
+                )
+
+    def test_garbage_time_range_rejected(self, cfg):
+        store = self._leaf(cfg)
+        with pytest.raises(ValueError, match="2-sequence"):
+            hive.stamp_commit(
+                store,
+                cells_with_data=1,
+                granule_count=1,
+                window="2025",
+                time_range=["not-a-date", "also-not"],
+            )
+
 
 class TestCoverageFull:
     def _grid(self, cfg):
@@ -697,6 +729,48 @@ class TestCoverageFull:
         np.testing.assert_array_equal(np.sort(got), np.sort(np.intersect1d(occupied, aoi)))
         # A miss is definitive (exact encoding).
         assert bitmap_and(leaf, children[5:7]).size == 0
+
+    def _full_bitmap_leaf(self, cfg, tmp_path):
+        """A leaf with ALL children occupied but encoded as a BITMAP (not
+        "full") — the representation the "full" short-circuit claims
+        moc_and-equivalence to."""
+        import numpy as np
+
+        from zagg.store import open_store
+
+        grid = self._grid(cfg)
+        word = _shard_word()
+        leaf = hive.shard_leaf_path(str(tmp_path / "bmp"), word, window="2025")
+        store = open_store(leaf)
+        grid.emit_shard_template(store, overwrite=True)
+        occupied = np.sort(np.asarray(grid.children(word), dtype=np.uint64))
+        bitmap = hive.encode_coverage_bitmap(word, occupied, grid.child_order)
+        hive.write_coverage_sidecar(leaf, bitmap)
+        cov = hive.build_coverage(word, occupied, grid.child_order, bitmap=bitmap)
+        hive.stamp_commit(
+            store, cells_with_data=len(occupied), granule_count=1, window="2025", coverage=cov
+        )
+        return leaf
+
+    def test_full_short_circuit_matches_bitmap_for_coarse_aoi(self, cfg, tmp_path):
+        # The "full" short-circuit is `moc_and([shard], aoi)`; the bitmap path
+        # is `moc_and(all_children_at_cell_order, aoi)`. Their equality rests on
+        # moc_and COMPACTING fine children up to a coarser AOI cell. Every other
+        # "full" test here uses child-order AOIs where both trivially agree and
+        # no normalization runs; here the AOI is the shard's own order-6 word —
+        # COARSER than cell_order 8 — so the bitmap path must compact its 4^2
+        # children up to match the short-circuit. A future moc_and that stopped
+        # compacting would break this (review finding, PR #248).
+        import numpy as np
+
+        from zagg.coverage import bitmap_and
+
+        _grid, word, full_leaf, _occ = self._stamped_leaf(cfg, tmp_path, full=True)
+        bmp_leaf = self._full_bitmap_leaf(cfg, tmp_path)
+        aoi = np.asarray([word], dtype=np.uint64)  # coarser than cell_order
+        full_res, bmp_res = bitmap_and(full_leaf, aoi), bitmap_and(bmp_leaf, aoi)
+        assert full_res is not None and bmp_res is not None
+        np.testing.assert_array_equal(np.sort(full_res), np.sort(bmp_res))
 
     def test_box_only_stamp_degrades_to_none(self, cfg, tmp_path):
         import numpy as np
@@ -966,14 +1040,14 @@ class TestProcessAndWriteHiveWindowed:
             df[name] = vals
         return df
 
-    def _run(self, monkeypatch, cfg, tmp_path, *, occupied, time_range=None):
+    def _run(self, monkeypatch, cfg, tmp_path, *, occupied, time_range=None, grid=None):
         import numpy as np
         import pandas as pd
 
         import zagg.processing as processing
 
         _windowed(cfg)
-        grid = self._grid(cfg)
+        grid = grid if grid is not None else self._grid(cfg)
         shard = _shard_word()
         root = str(tmp_path / "store")
         seen: dict = {}
@@ -1052,6 +1126,35 @@ class TestProcessAndWriteHiveWindowed:
         assert stamp["coverage"]["encoding"] == "full"
         assert "sidecar" not in stamp["coverage"]
         assert not os.path.exists(os.path.join(leaf, hive.COVERAGE_SIDECAR))
+
+    def test_depth0_full_popcount_short_circuits(self, monkeypatch, cfg, tmp_path):
+        import os
+
+        import numpy as np
+
+        from zagg.coverage import bitmap_and
+        from zagg.store import open_store
+
+        # Depth-0 config: child_order == parent_order, so a shard IS one cell and
+        # the popcount threshold is 4**0 == 1 (review finding, PR #248).
+        grid0 = HealpixGrid(parent_order=6, child_order=6, layout="fullsphere", config=cfg)
+        _grid, shard, root, _meta, _seen = self._run(
+            monkeypatch,
+            cfg,
+            tmp_path,
+            grid=grid0,
+            occupied=grid0.children(_shard_word()),  # the single order-6 cell
+        )
+        leaf = hive.shard_leaf_path(root, shard, window="2019")
+        stamp = hive.read_commit(open_store(leaf))
+        # The one occupied cell is a FULL subtree: stamps "full", no sidecar, and
+        # bitmap_and short-circuits — unlike an UNWINDOWED depth-0 leaf, which
+        # stays box-only (full is gated on windowing).
+        assert stamp["coverage"]["encoding"] == "full"
+        assert "sidecar" not in stamp["coverage"]
+        assert not os.path.exists(os.path.join(leaf, hive.COVERAGE_SIDECAR))
+        aoi = np.asarray([shard], dtype=np.uint64)
+        np.testing.assert_array_equal(np.sort(bitmap_and(leaf, aoi)), np.sort(aoi))
 
     def test_window_rerun_is_idempotent_replacement(self, monkeypatch, cfg, tmp_path):
         from zagg.store import open_store
