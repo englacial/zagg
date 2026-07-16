@@ -375,9 +375,9 @@ def test_measure_objects_end_to_end(tmp_path):
     word = morton_word(_KEY_A)
     _write_flat_shard(grid, store, word, sharded=True)
 
-    payload = run_benchmark._measure_objects(
-        _cfg(sharded=True), grid, root, word, region="us-west-2"
-    )
+    cfg = _cfg(sharded=True)
+    cfg.output["store_layout"] = "flat"  # a flat-store measurement (issue #253 defaults hive)
+    payload = run_benchmark._measure_objects(cfg, grid, root, word, region="us-west-2")
     assert payload == {
         "objects_total": 10,  # 6 metadata + 4 shard objects
         "objects_expected": 10,
@@ -399,8 +399,10 @@ def test_measure_objects_flags_bypass(tmp_path):
     word = morton_word(_KEY_A)
     _write_flat_shard(grid_flat, store, word, sharded=False)
 
+    cfg = _cfg(sharded=True)
+    cfg.output["store_layout"] = "flat"  # a flat-store measurement (issue #253 defaults hive)
     payload = run_benchmark._measure_objects(
-        _cfg(sharded=True), _grid(sharded=True), root, word, region="us-west-2"
+        cfg, _grid(sharded=True), root, word, region="us-west-2"
     )
     assert payload["objects_mismatch"] is not None
     assert payload["objects_total"] == 6 + 64  # metadata + 16 chunks x 4 arrays

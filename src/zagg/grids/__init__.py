@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import warnings
+
 from zagg.config import (
     PipelineConfig,
     get_child_order,
@@ -30,7 +32,31 @@ def from_config(
     grid_cfg = config.output.get("grid", {})
     grid_type = grid_cfg.get("type", "healpix")
     if grid_type == "healpix":
-        layout = grid_cfg.get("layout") or "fullsphere"
+        # Deprecation (issue #253, mirroring the retired dense warning): the
+        # HEALPix flat/fullsphere store remains for interop/debug but hive is
+        # the default; removal is gated on the sparse-DGGS read path (#251
+        # phase 3). Raster pipelines are exempt — flat is their only store.
+        explicit_layout = grid_cfg.get("layout")
+        if (config.data_source or {}).get("reader") != "raster":
+            if config.output.get("store_layout") == "flat":
+                warnings.warn(
+                    "output.store_layout: flat is deprecated for HEALPix; hive is "
+                    "the default. Flat remains for interop/debug and will be "
+                    "removed once the sparse-DGGS read path lands (issue #251 "
+                    "phase 3).",
+                    DeprecationWarning,
+                    stacklevel=2,
+                )
+            if explicit_layout is not None:
+                warnings.warn(
+                    "output.grid.layout: fullsphere is deprecated for HEALPix; "
+                    "hive (the default store_layout) does not use it. Omit the "
+                    "key — the flat/fullsphere store it selects is removed once "
+                    "the sparse-DGGS read path lands (issue #251 phase 3).",
+                    DeprecationWarning,
+                    stacklevel=2,
+                )
+        layout = explicit_layout or "fullsphere"
         # Grid is fully defined by the config (single source of truth); the
         # parent_order kwarg is only a fallback for legacy callers.
         resolved_parent = grid_cfg.get("parent_order", parent_order)

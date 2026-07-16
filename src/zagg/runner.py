@@ -2920,7 +2920,14 @@ def _invoke_lambda_setup(
     result = json.loads(payload)
     if result.get("statusCode") != 200:
         raise RuntimeError(f"Lambda setup error: {result.get('body')}")
-    requested = ((config_dict or {}).get("output") or {}).get("store_layout") or "flat"
+    out = (config_dict or {}).get("output") or {}
+    requested = out.get("store_layout")
+    if requested is None:
+        # Mirror config.get_store_layout's grid-aware default (issue #253):
+        # HEALPix point aggregation -> hive; rectilinear / raster -> flat.
+        ds = (config_dict or {}).get("data_source") or {}
+        healpix = (out.get("grid") or {}).get("type", "healpix") == "healpix"
+        requested = "hive" if healpix and ds.get("reader") != "raster" else "flat"
     if requested == "hive":
         try:
             echoed = json.loads(result.get("body") or "{}").get("layout")

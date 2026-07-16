@@ -340,17 +340,19 @@ def validate_config(config: PipelineConfig) -> None:
             f"output.consolidate_metadata must be a boolean (got {consolidate_metadata!r})"
         )
 
-    # Optional store layout (issue #199 phase 2): "flat" (default, today's single
-    # shared store) or "hive" (one leaf zarr per shard under a morton digit tree —
-    # docs/design/sparse_coverage.md D1-D6). Hive ids are morton decimal strings,
-    # so the layout is HEALPix-only; metadata consolidation assumes the single
-    # shared store, so it is rejected with hive rather than silently mis-writing.
-    # Sharded (ShardingCodec) output works on BOTH layouts (issue #236) and is
-    # the K>1 default on both.
+    # Optional store layout (issue #199 phase 2): "hive" (one leaf zarr per
+    # shard under a morton digit tree — docs/design/sparse_coverage.md D1-D6)
+    # or "flat" (the single shared store). The default is grid-aware (issue
+    # #253, get_store_layout): HEALPix point aggregation -> hive; rectilinear
+    # and raster -> flat. Hive ids are morton decimal strings, so the layout is
+    # HEALPix-only; metadata consolidation assumes the single shared store, so
+    # it is rejected with hive (explicit or defaulted) rather than silently
+    # mis-writing. Sharded (ShardingCodec) output works on BOTH layouts (issue
+    # #236) and is the K>1 default on both.
     store_layout = config.output.get("store_layout")
     if store_layout is not None and store_layout not in ("flat", "hive"):
         raise ValueError(f"output.store_layout must be 'flat' or 'hive' (got {store_layout!r})")
-    if store_layout == "hive":
+    if get_store_layout(config) == "hive":
         if (grid or {}).get("type", "healpix") != "healpix":
             raise ValueError(
                 "output.store_layout: hive requires a healpix grid (hive node names "
@@ -377,7 +379,7 @@ def validate_config(config: PipelineConfig) -> None:
                 "output.coverage_moc requires a healpix grid (the root coverage.moc "
                 "is a morton MOC; drop the flag for rectilinear output)"
             )
-        if store_layout != "hive":
+        if get_store_layout(config) != "hive":
             raise ValueError(
                 "output.coverage_moc requires output.store_layout: hive (the root "
                 "coverage.moc lives at the hive store root; flat stores have no "
@@ -609,6 +611,15 @@ def _validate_raster_config(config: PipelineConfig) -> None:
             "raster pipelines take no aggregation section: pull-NN yields one "
             "value per cell per timestep (declare bands under data_source.bands)"
         )
+    # The raster writer targets the shared flat store only (per-timestep slabs
+    # into one template); an explicit hive would be silently ignored — reject
+    # it pointedly. Omitted defaults to flat for raster (get_store_layout,
+    # issue #253).
+    if config.output.get("store_layout") == "hive":
+        raise ValueError(
+            "output.store_layout: hive is not supported for raster pipelines "
+            "(the raster writer targets the shared flat store); drop the key"
+        )
     bands = config.data_source.get("bands")
     if not bands or not isinstance(bands, dict):
         raise ValueError("raster pipeline requires data_source.bands (field -> {asset, dtype})")
@@ -724,7 +735,7 @@ def _validate_windowing(config: PipelineConfig) -> None:
             "output.windowing requires a healpix grid (windowed leaves are a "
             f"morton-hive convention; grid type is {grid.get('type')!r})"
         )
-    if (config.output.get("store_layout") or "flat") != "hive":
+    if get_store_layout(config) != "hive":
         raise ValueError(
             "output.windowing requires output.store_layout: hive (window leaves "
             "are hive leaf zarrs; the flat shared store has no leaves to window)"
@@ -1973,23 +1984,37 @@ def get_store_path(config: PipelineConfig) -> str | None:
 
 
 def get_store_layout(config: PipelineConfig) -> str:
-    """Return the STORE layout — flat single store vs morton hive (issue #199).
+    """Return the STORE layout — morton hive vs flat single store (issue #199).
 
     Distinct from ``output.grid.layout`` (the HEALPix *array* layout inside one
     store): ``output.store_layout`` selects how shard output is arranged under
-    ``output.store``. ``"flat"`` (default) is today's single shared zarr store.
-    ``"hive"`` writes one self-describing leaf zarr per shard at
-    ``{store}/{sign+base}/{d1}/.../{full_id}.zarr`` with a root
+    ``output.store``. ``"hive"`` writes one self-describing leaf zarr per shard
+    at ``{store}/{sign+base}/{d1}/.../{full_id}.zarr`` with a root
     ``morton_hive.json`` manifest and a per-leaf commit stamp — see
-    ``docs/design/sparse_coverage.md`` (D1-D6) and :mod:`zagg.hive`. A
-    present-but-null key falls back to the default, like ``layout``.
+    ``docs/design/sparse_coverage.md`` (D1-D6) and :mod:`zagg.hive`. ``"flat"``
+    is the single shared zarr store.
+
+    The default is grid-aware (issue #253): HEALPix point aggregation defaults
+    to ``"hive"`` (the ratified profile); rectilinear grids default to
+    ``"flat"`` (hive ids are morton digits — HEALPix-only), and raster
+    pipelines default to ``"flat"`` too (the raster writer only targets the
+    shared store). An explicit HEALPix ``"flat"`` remains valid for
+    interop/debug but is deprecated — removal is gated on the sparse-DGGS read
+    path (issue #251 phase 3). A present-but-null key falls back to the
+    default, like ``layout``.
 
     Returns
     -------
     str
-        ``"flat"`` (default) or ``"hive"``.
+        ``"flat"`` or ``"hive"``.
     """
-    return config.output.get("store_layout") or "flat"
+    layout = config.output.get("store_layout")
+    if layout is not None:
+        return layout
+    grid_type = (config.output.get("grid") or {}).get("type", "healpix")
+    if grid_type == "healpix" and (config.data_source or {}).get("reader") != "raster":
+        return "hive"
+    return "flat"
 
 
 def get_coverage_moc(config: PipelineConfig) -> bool:

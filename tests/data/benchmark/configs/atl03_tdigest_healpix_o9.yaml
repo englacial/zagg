@@ -89,6 +89,7 @@ aggregation:
       fill_value: 0
 
 output:
+  store_layout: flat           # frozen flat arm (issue #253): explicit since hive became the HEALPix default
   grid:
     type: healpix
     indexing_scheme: nested

@@ -60,10 +60,19 @@ class TestCoverageMocConfig:
         assert get_coverage_moc(cfg) is True
         validate_config(cfg)
 
-    def test_default_off_for_flat(self):
+    def test_default_on_for_defaulted_hive(self):
+        # Issue #253: an empty HEALPix config now defaults to hive, so the
+        # coverage default follows (O9: coverage is the hive default).
         from zagg.config import get_coverage_moc, validate_config
 
         cfg = self._cfg()
+        assert get_coverage_moc(cfg) is True
+        validate_config(cfg)
+
+    def test_default_off_for_flat(self):
+        from zagg.config import get_coverage_moc, validate_config
+
+        cfg = self._cfg(store_layout="flat")
         assert get_coverage_moc(cfg) is False
         validate_config(cfg)
 
@@ -85,7 +94,7 @@ class TestCoverageMocConfig:
         from zagg.config import validate_config
 
         with pytest.raises(ValueError, match="store_layout: hive"):
-            validate_config(self._cfg(coverage_moc=True))
+            validate_config(self._cfg(store_layout="flat", coverage_moc=True))
 
     def test_explicit_true_on_rectilinear_rejected(self):
         from zagg.config import validate_config

@@ -271,10 +271,52 @@ class TestFromConfig:
         with pytest.raises(ValueError, match="Unknown layout"):
             from_config(cfg, parent_order=6)
 
-    def test_healpix_explicit_fullsphere(self, cfg):
+    def test_healpix_explicit_fullsphere_warns(self, cfg):
+        # Issue #253: the explicit layout key is deprecated (hive doesn't use
+        # it); still non-fatal — the grid comes up fullsphere as before.
         cfg.output["grid"]["layout"] = "fullsphere"
-        g = from_config(cfg, parent_order=6)
+        with pytest.warns(DeprecationWarning, match="fullsphere is deprecated"):
+            g = from_config(cfg, parent_order=6)
         assert g.layout == "fullsphere"
+
+    def test_healpix_explicit_flat_store_warns(self, cfg):
+        # Issue #253: explicit store_layout: flat is the deprecated
+        # interop/debug profile — warn, don't fail.
+        cfg.output["store_layout"] = "flat"
+        with pytest.warns(DeprecationWarning, match="flat is deprecated"):
+            g = from_config(cfg, parent_order=6)
+        assert g.layout == "fullsphere"
+
+    def test_healpix_defaults_do_not_warn(self, cfg):
+        # Empty HEALPix output block (no store_layout, no layout) is the
+        # ratified hive+sharded profile — silent.
+        import warnings as _w
+
+        with _w.catch_warnings():
+            _w.simplefilter("error", DeprecationWarning)
+            from_config(cfg, parent_order=6)
+
+    def test_empty_healpix_config_is_hive_sharded(self, cfg):
+        # Issue #253 acceptance: an empty HEALPix config yields hive + sharded.
+        from zagg.config import get_sharded, get_store_layout
+
+        assert get_store_layout(cfg) == "hive"
+        assert get_sharded(cfg, default=True) is True
+
+    def test_rect_explicit_flat_does_not_warn(self, cfg):
+        # Rect carve-out (issue #253): flat is not deprecated off HEALPix.
+        import warnings as _w
+
+        cfg.output["grid"] = {
+            "type": "rectilinear",
+            "crs": "EPSG:3031",
+            "resolution": 500,
+            "bounds": [0, 0, 5000, 5000],
+        }
+        cfg.output["store_layout"] = "flat"
+        with _w.catch_warnings():
+            _w.simplefilter("error", DeprecationWarning)
+            from_config(cfg)
 
     def test_unknown_grid_raises(self, cfg):
         cfg.output["grid"]["type"] = "h3"

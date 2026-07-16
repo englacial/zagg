@@ -66,7 +66,11 @@ def _context():
 
 
 def _healpix_config_dict():
-    return asdict(default_config("atl06"))
+    cfg = default_config("atl06")
+    # These are the FLAT worker-path tests; flat is explicit now that an
+    # omitted store_layout defaults to hive for HEALPix (issue #253).
+    cfg.output["store_layout"] = "flat"
+    return asdict(cfg)
 
 
 def _rectilinear_config_dict():
@@ -1309,6 +1313,7 @@ class TestSetupTemplate:
         # worker grid writes -- NOT the order-11 (12*4^11) grid the old code emitted.
         # This is the exact #99 regression: setup dropping chunk_inner.
         cfg = default_config("atl03_tdigest_healpix")
+        cfg.output["store_layout"] = "flat"  # the flat GLOBAL template path (issue #253)
         resp, store = self._setup(handler_mod, monkeypatch, asdict(cfg))
         assert resp["statusCode"] == 200, json.loads(resp["body"])
 
@@ -1322,6 +1327,7 @@ class TestSetupTemplate:
         # chunked at parent_order (12*4^6) -- still matching the worker grid. Guards
         # the unset-chunk_inner path the fix must leave byte-identical.
         cfg = default_config("atl06")  # parent_order 6, child_order 12, no chunk_inner
+        cfg.output["store_layout"] = "flat"  # the flat GLOBAL template path (issue #253)
         resp, store = self._setup(handler_mod, monkeypatch, asdict(cfg), parent_order=6)
         assert resp["statusCode"] == 200, json.loads(resp["body"])
 
@@ -1335,6 +1341,7 @@ class TestSetupTemplate:
         # n_parent_cells (an old dispatcher) gets the fullsphere template — the
         # field is inert, not an error, so mixed-version fleets keep working.
         cfg = default_config("atl06")
+        cfg.output["store_layout"] = "flat"  # the flat GLOBAL template path (issue #253)
         resp, store = self._setup(
             handler_mod, monkeypatch, asdict(cfg), parent_order=6, n_parent_cells=5
         )

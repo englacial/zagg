@@ -367,8 +367,10 @@ class TestDenseRemoval:
         with pytest.raises(ValueError, match="fullsphere"):
             validate_config(atl06_config)
 
-    def test_fullsphere_layout_does_not_warn(self, atl06_config, catalog_file):
-        atl06_config.output["grid"]["layout"] = "fullsphere"
+    def test_default_layout_does_not_warn(self, atl06_config, catalog_file):
+        # An omitted layout is the silent default path; the explicit
+        # flat/fullsphere DeprecationWarnings (issue #253) live at from_config
+        # and are covered in test_grids.py::TestFromConfig.
         atl06_config.catalog = catalog_file
         import warnings as _w
 
@@ -1403,6 +1405,8 @@ class TestSummaryKeysByteIdentical:
     }
 
     def test_local_summary_keys_and_counts(self, monkeypatch, atl06_config):
+        # Flat local path pinned explicitly (issue #253 defaults hive).
+        atl06_config.output["store_layout"] = "flat"
         import zagg.grids as grids_mod
         from zagg import runner
 
@@ -1457,6 +1461,8 @@ class TestSummaryKeysByteIdentical:
         assert len(summary["results"]) == 3  # raised cell excluded
 
     def test_local_threads_aoi_payload(self, monkeypatch, atl06_config):
+        # Flat local path pinned explicitly (issue #253 defaults hive).
+        atl06_config.output["store_layout"] = "flat"
         # When the manifest carries an aoi_mask list, _run_local threads each
         # shard's payload into _process_and_write; when it doesn't, the kwarg is
         # omitted entirely so the flag-off call is unchanged (issue #101).
@@ -1622,6 +1628,8 @@ class TestSummaryKeysByteIdentical:
         return cat
 
     def test_local_clamps_granule_workers_per_cell(self, monkeypatch, atl06_config):
+        # Flat local path pinned explicitly (issue #253 defaults hive).
+        atl06_config.output["store_layout"] = "flat"
         # Issue #184 (item 1): _run_local threads a per-cell config whose
         # granule_workers is min(K, n_granules); cells at/above K get the
         # SHARED config object untouched.

@@ -37,21 +37,58 @@ def _shard_word(order=6):
 
 
 class TestStoreLayoutConfig:
-    def test_default_is_flat(self, cfg):
+    def test_default_is_hive_for_healpix(self, cfg):
+        # Issue #253: HEALPix point aggregation defaults to hive.
         from zagg.config import get_store_layout
 
+        assert get_store_layout(cfg) == "hive"
+        validate_config(cfg)  # defaulted hive validates unchanged
+
+    def test_default_is_flat_for_rectilinear(self, cfg):
+        from zagg.config import get_store_layout
+
+        cfg.output["grid"] = {
+            "type": "rectilinear",
+            "crs": "EPSG:3031",
+            "resolution": 500,
+            "bounds": [0, 0, 5000, 5000],
+        }
         assert get_store_layout(cfg) == "flat"
-        validate_config(cfg)  # flat default validates unchanged
+        validate_config(cfg)
+
+    def test_default_is_flat_for_raster(self):
+        # The raster writer targets the shared flat store only (issue #253).
+        from zagg.config import default_config, get_store_layout
+
+        cfg = default_config("sentinel2_l2a")
+        assert (cfg.data_source or {}).get("reader") == "raster"
+        assert get_store_layout(cfg) == "flat"
+
+    def test_explicit_hive_rejected_for_raster(self):
+        from zagg.config import default_config
+
+        cfg = default_config("sentinel2_l2a")
+        cfg.output["store_layout"] = "hive"
+        with pytest.raises(ValueError, match="raster"):
+            validate_config(cfg)
+
+    def test_explicit_flat_still_accepted(self, cfg):
+        # Deprecated but valid (interop/debug) until #251 phase 3.
+        from zagg.config import get_store_layout
+
+        cfg.output["store_layout"] = "flat"
+        assert get_store_layout(cfg) == "flat"
+        validate_config(cfg)
 
     def test_hive_accepted_for_healpix(self, cfg):
         cfg.output["store_layout"] = "hive"
         validate_config(cfg)
 
-    def test_null_key_falls_back_to_flat(self, cfg):
+    def test_null_key_falls_back_to_default(self, cfg):
         from zagg.config import get_store_layout
 
         cfg.output["store_layout"] = None
-        assert get_store_layout(cfg) == "flat"
+        assert get_store_layout(cfg) == "hive"
         validate_config(cfg)
 
     def test_unknown_value_rejected(self, cfg):
@@ -1043,6 +1080,7 @@ class TestRunnerWiring:
 
     def test_lambda_flat_setup_omits_dataset(self, monkeypatch, cfg, tmp_path):
         # Flat runs keep their setup call byte-identical: dataset stays None.
+        # Flat is explicit now (issue #253: omitted store_layout -> hive).
         from unittest.mock import MagicMock
 
         import boto3
@@ -1051,6 +1089,7 @@ class TestRunnerWiring:
         from zagg.concurrency import ConcurrencyReport
         from zagg.runner import agg
 
+        cfg.output["store_layout"] = "flat"
         catalog_path, shard = self._catalog(tmp_path)
         captured: dict = {}
 
@@ -1137,7 +1176,9 @@ class TestInvokeLambdaSetupEvent:
 
     def test_flat_event_omits_dataset_and_matches_baseline(self, cfg):
         # The byte-identity claim, pinned on the wire: no "dataset" key, and
-        # the event is exactly the pre-phase-3 flat setup event.
+        # the event is exactly the pre-phase-3 flat setup event. Flat is now
+        # explicit (issue #253: an omitted store_layout defaults to hive).
+        cfg.output["store_layout"] = "flat"
         config_dict = asdict(cfg)
         client = self._client({"ok": True, "mode": "setup", "layout": "flat"})
         event = self._invoke(client, config_dict)
@@ -1154,8 +1195,15 @@ class TestInvokeLambdaSetupEvent:
 
     def test_flat_without_layout_echo_unaffected(self, cfg):
         # Old deployed functions return the echo-less body: flat dispatch must
-        # keep working against them.
+        # keep working against them (explicit flat — issue #253 defaults hive).
+        cfg.output["store_layout"] = "flat"
         self._invoke(self._client({"ok": True, "mode": "setup"}), asdict(cfg))
+
+    def test_defaulted_hive_requires_echo(self, cfg):
+        # Issue #253: an OMITTED store_layout on healpix now resolves hive, so
+        # the stale-deployment guard must fire without the hive echo too.
+        with pytest.raises(RuntimeError, match="redeploy"):
+            self._invoke(self._client({"ok": True, "mode": "setup"}), asdict(cfg))
 
     @pytest.mark.parametrize(
         "body",
