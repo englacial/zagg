@@ -21,7 +21,9 @@ from __future__ import annotations
 
 import asyncio
 import concurrent.futures
+import os
 import re
+import threading
 from urllib.parse import urlparse
 
 import numpy as np
@@ -66,33 +68,90 @@ def _geo_from_ifd(ifd) -> tuple[int, tuple[float, float, float, float, float, fl
     return int(epsg), (sx, 0.0, x - i * sx, 0.0, -sy, y + j * sy)
 
 
+# Store cache (issue #244): one obspec store per (kind, bucket-or-host-or-dir,
+# region, anonymous) per PROCESS. A fresh S3Store per asset-sample cost ~300 ms
+# of client/TLS setup and made every tile GET ride a cold connection (425
+# clients per full-year o9 invoke — the measured breakdown on the issue).
+# Module lifetime == sandbox lifetime (espg-ratified): warm Lambda invocations
+# keep their connection pools, matching the issue #171 sandbox-lifetime
+# pattern. Lock-guarded because the running-loop fallback in ``sample_asset``
+# and hand-rolled callers can construct from other threads; construction runs
+# under the lock deliberately (single-flight per key).
+#
+# Credential lifetime (issue #244 review): every key deployed today is
+# anonymous (``sentinel2_l2a.yaml`` sets ``anonymous: true``; runner.py:676
+# and ``sample_asset*`` default it True), so the cached ``S3Store`` carries
+# ``skip_signature=True`` and signs nothing — credentials never enter the
+# picture and warm-caching a store cannot go stale. If a *signed* store
+# (``anonymous=False``) were ever cached, sandbox-lifetime caching would only
+# be safe because of how async-tiff's Rust ``object_store``-backed ``S3Store``
+# resolves credentials, and that splits by environment:
+#   - On AWS Lambda the execution-role credentials arrive as static env vars
+#     valid for the whole sandbox lifetime and do NOT rotate mid-sandbox, so a
+#     sandbox-lifetime store cannot outlive its creds — safe by construction.
+#   - Off-Lambda (EC2 instance profile / IMDS, SSO), object_store resolves
+#     through a caching credential *provider* that refreshes on expiry per
+#     request rather than freezing a token at construction, so a warm store
+#     keeps working across rotation.
+# (The Lambda case is directly grounded; the off-Lambda refresh behavior
+# reflects object_store's documented provider design — ``S3Store`` exposes a
+# ``credential_provider`` slot — and was not source-verified against the
+# installed binary wheel.) Caveat: no explicit-credential store exists here
+# (the raster path is anonymous); do NOT add one to the cache without
+# revisiting this, since a statically-supplied token would be frozen at
+# construction and eventually go stale on a warm worker.
+_STORE_CACHE: dict = {}
+_STORE_LOCK = threading.Lock()
+
+
 def _store_and_path(href: str, *, region: str | None = None, anonymous: bool = True):
     """obspec store + in-store path for an asset href.
 
     Handles ``s3://bucket/key``, virtual-hosted S3 HTTPS
     (``https://bucket.s3.region.amazonaws.com/key`` -- what Earth Search
-    asset hrefs look like), plain HTTPS, and local paths.
+    asset hrefs look like), plain HTTPS, and local paths. Stores are cached
+    per ``(kind, location, region, anonymous)`` for the life of the process
+    (issue #244) — the returned store is shared, never per-call.
     """
-    from async_tiff.store import HTTPStore, LocalStore, S3Store
-
     u = urlparse(href)
     if u.scheme == "s3":
-        kw: dict = {"skip_signature": True} if anonymous else {}
-        if region:
-            kw["region"] = region
-        return S3Store(u.netloc, **kw), u.path.lstrip("/")
-    if u.scheme in ("http", "https"):
+        key = ("s3", u.netloc, region, anonymous)
+        path = u.path.lstrip("/")
+    elif u.scheme in ("http", "https"):
         m = _S3_VHOST.match(u.netloc)
         if m:
-            kw = {"region": region or m["region"]}
-            if anonymous:
-                kw["skip_signature"] = True
-            return S3Store(m["bucket"], **kw), u.path.lstrip("/")
-        return HTTPStore(f"{u.scheme}://{u.netloc}"), u.path.lstrip("/")
-    import os
+            key = ("s3", m["bucket"], region or m["region"], anonymous)
+            path = u.path.lstrip("/")
+        else:
+            key = ("http", f"{u.scheme}://{u.netloc}", None, None)
+            path = u.path.lstrip("/")
+    else:
+        d, name = os.path.split(href)
+        key = ("local", d or ".", None, None)
+        path = name
+    with _STORE_LOCK:
+        store = _STORE_CACHE.get(key)
+        if store is None:
+            store = _build_store(key)
+            _STORE_CACHE[key] = store
+    return store, path
 
-    d, name = os.path.split(href)
-    return LocalStore(d or "."), name
+
+def _build_store(key):
+    """Construct the obspec store for a cache key (see ``_STORE_CACHE``)."""
+    from async_tiff.store import HTTPStore, LocalStore, S3Store
+
+    kind, loc, region, anonymous = key
+    if kind == "s3":
+        kw: dict = {}
+        if anonymous:
+            kw["skip_signature"] = True
+        if region:
+            kw["region"] = region
+        return S3Store(loc, **kw)
+    if kind == "http":
+        return HTTPStore(loc)
+    return LocalStore(loc)
 
 
 async def sample_asset_async(
@@ -134,9 +193,18 @@ async def _sample_one(
     region: str | None = None,
     anonymous: bool = True,
     fill=0,
+    geom_cache: dict | None = None,
 ):
     """:func:`sample_asset_async` body, also returning the raster's center
-    ``(lon, lat)`` — the ownership rule's tile-center input (#218)."""
+    ``(lon, lat)`` — the ownership rule's tile-center input (#218).
+
+    ``geom_cache`` (issue #244) memoizes the pull-NN mapping ``(rows, cols,
+    valid)`` per ``(epsg, transform, shape)``: the mapping is invariant across
+    every timestep and band that shares a source grid, so a shard invoke
+    computes it once per distinct grid (~175 ms at o9) instead of once per
+    asset-sample. ``None`` (the default, and the public ``sample_asset*``
+    path) computes per call, unchanged.
+    """
     from async_tiff import TIFF
 
     store, path = _store_and_path(href, region=region, anonymous=anonymous)
@@ -155,7 +223,26 @@ async def _sample_one(
     epsg, transform = _geo_from_ifd(ifd)
     shape = (ifd.image_height, ifd.image_width)
     center = _raster_center_lonlat(epsg, transform, shape)
-    rows, cols, valid = grid.sample(cells, f"EPSG:{epsg}", transform, shape)
+    geom_key = (epsg, transform, shape)
+    geom = geom_cache.get(geom_key) if geom_cache is not None else None
+    if geom is None:
+        # INVARIANT (issue #244 thread): no ``await`` between this check and
+        # the store below. asyncio interleaves only at await points, so the
+        # compute-and-store is atomic on the loop and each source grid is
+        # computed exactly once per invoke — no locks needed. If this compute
+        # ever moves off-loop (``to_thread``), add per-key async locks.
+        # INVARIANT (issue #244 thread): the key ``(epsg, transform, shape)``
+        # is complete only because ``cells`` and ``grid`` are constants of the
+        # invoke — ``cells = grid.children(shard_key)`` is computed once (see
+        # ``process_raster_shard``) and threaded unchanged into every
+        # ``_sample_one``, and ``geom_cache`` is allocated fresh per
+        # ``process_raster_shard`` call. A future refactor that varies
+        # ``cells`` (or ``grid``) per item/group within one invoke MUST fold
+        # them into the key or drop the cache, else it returns a stale mapping.
+        geom = grid.sample(cells, f"EPSG:{epsg}", transform, shape)
+        if geom_cache is not None:
+            geom_cache[geom_key] = geom
+    rows, cols, valid = geom
 
     th, tw = ifd.tile_height, ifd.tile_width
     vr, vc = rows[valid], cols[valid]
@@ -235,6 +322,7 @@ async def sample_item_async(
     nodata=None,
     region: str | None = None,
     anonymous: bool = True,
+    geom_cache: dict | None = None,
 ):
     """Sample every configured band of one STAC item, concurrently.
 
@@ -277,6 +365,7 @@ async def sample_item_async(
                 region=region,
                 anonymous=anonymous,
                 fill=bands[f]["fill_value"],
+                geom_cache=geom_cache,
             )
             for f in fields
         ]
@@ -472,6 +561,12 @@ def process_raster_shard(
     # orders.
     k = _shard_workers(config)
     wb = _write_buffer(config)
+    # Pull-NN geometry memo (issue #244), scoped to THIS invoke: the (rows,
+    # cols, valid) mapping embeds the shard's cells, so per-invoke scoping
+    # makes cross-shard collisions impossible by construction. A full-year
+    # Sentinel-2 shard has exactly two distinct source grids (10 m bands,
+    # 20 m scl) — this turns 425 geometry computations into 2.
+    geom_cache: dict = {}
 
     async def _run_all():
         sem = asyncio.Semaphore(k)
@@ -488,6 +583,7 @@ def process_raster_shard(
                             nodata=nodata,
                             region=region,
                             anonymous=anonymous,
+                            geom_cache=geom_cache,
                         )
                         for e in items
                     ]

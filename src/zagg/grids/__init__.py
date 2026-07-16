@@ -4,7 +4,11 @@ from __future__ import annotations
 
 import warnings
 
-from zagg.config import PipelineConfig, get_child_order, get_shard_order, get_sharded
+from zagg.config import (
+    PipelineConfig,
+    get_child_order,
+    get_sharded,
+)
 from zagg.grids.base import InconsistentShardError, OutputGrid, ShardKey
 from zagg.grids.healpix import HEALPIX_BASE_CELLS, HealpixGrid
 from zagg.grids.rectilinear import OOB_SENTINEL, RectilinearGrid
@@ -46,6 +50,13 @@ def from_config(
         resolved_parent = grid_cfg.get("parent_order", parent_order)
         if resolved_parent is None:
             raise ValueError("output.grid.parent_order is required for HEALPix grids")
+        # issue #215: HEALPix output defaults to sharded — a missing flag should
+        # not silently cost the ~K-fold object blow-up (one object per inner
+        # chunk instead of one per shard). Both layouts (issue #236): flat
+        # bundles a shard's K inner chunks into one ShardingCodec object per
+        # dispatch shard; a hive leaf bundles them into one object per array.
+        # The grid no-ops sharding when K==1, so single-chunk grids stay
+        # unaffected.
         return HealpixGrid(
             parent_order=resolved_parent,
             child_order=get_child_order(config),
@@ -53,8 +64,7 @@ def from_config(
             config=config,
             populated_shards=populated_shards,
             chunk_inner=grid_cfg.get("chunk_inner"),
-            sharded=get_sharded(config),
-            shard_order=get_shard_order(config),
+            sharded=get_sharded(config, default=True),
         )
     if grid_type == "rectilinear":
         required = ("crs", "resolution", "bounds")

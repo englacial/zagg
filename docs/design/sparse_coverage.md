@@ -1,6 +1,8 @@
 # Sparse coverage & the cross-resolution read path
 
-**Status**: draft. Tracks [#198](https://github.com/englacial/zagg/issues/198).
+**Status**: draft. Tracks [#198](https://github.com/englacial/zagg/issues/198);
+temporal-partitioning amendments (D13–D15) ratified on
+[#237](https://github.com/englacial/zagg/issues/237).
 
 > All design decisions (both made and open) are consolidated in the
 > [Decisions registry](#8-decisions-registry). Inline references use **D#** for
@@ -50,6 +52,8 @@ what zagg consumes:
   coverage.moc                   <- optional root MOC (§4, O9); root-only exception
   {sign+base}/{d1}/{d2}/.../     <- one digit per level (D2)
     {full_id}.zarr/              <- self-describing leaf (D3), vanilla zarr v3
+    {full_id}_{window}.zarr/     <- time-windowed leaf (D13); naming frozen on
+                                    the mortie spec page (morton-hive/2)
 ```
 
 - **Ids are morton decimal strings** (D1): sign + base digit (constant width,
@@ -61,6 +65,27 @@ what zagg consumes:
 - **Full morton id at the leaf** (D3): `.../1/2/3/-31123.zarr/` is
   self-describing without parsing its path, greppable in inventories,
   unambiguous if moved.
+- **Time-windowed leaves** (D13, ratified on
+  [#237](https://github.com/englacial/zagg/issues/237)): a store whose
+  manifest declares a temporal window schedule (§3) partitions each shard's
+  time series into **one write-once leaf per window** at the shard node,
+  rather than one growing leaf. The node invariant is unchanged (a node may
+  hold several `*.zarr` objects — mixed orders already require that; the
+  walker classifies them as data as before). Every windowed leaf carries its
+  own D4 commit stamp, so all append/retry semantics reduce to the existing
+  ones: a torn window is debris, overwritable; **backfill** (extending the
+  series to *earlier* data) is just a new leaf for an earlier window — no
+  `resize`, no read-modify-write of committed objects, no time-axis
+  reordering; concurrent runs on different windows share no object; the
+  window is the unit of idempotent reprocessing. The rejected alternatives —
+  a high-water time index, and per-run stamp entries with array `resize` —
+  both reintroduce mutable shared state at the leaf and break the binary
+  debris rule (rationale on the #237 thread). Cross-window reads open W
+  leaves and concatenate along time; paths stay arithmetic because the
+  schedule lives in the manifest (D10 preserved). The no-partitioning
+  degenerate case (`schedule: none`) keeps the bare `{full_id}.zarr` name and
+  is byte-identical to the pre-D13 layout — a `morton-hive/1` store *is* a
+  `/2` store with `schedule: none`.
 - **Node invariant**: below the root, a node contains *only* digit children
   (`[1-4]/`) and `*.zarr` objects. Nothing else, ever — the walker's child
   classification depends on it. The root alone also carries the manifest and
@@ -101,6 +126,38 @@ touched again during a run. Contents:
   recorded explicitly for forward compatibility).
 - Pyramid declaration: which ancestor orders carry overview zarrs, and their
   aggregation methods (populated/updated by the §7 sweep).
+- **Temporal block** (D15, ratified on
+  [#237](https://github.com/englacial/zagg/issues/237)): a store carrying this
+  block declares `spec: "morton-hive/2"` (the version string of D6 covers these
+  temporal/windowed-leaf extensions). It records time
+  encoding/units/epoch/calendar, the membership timestamp field, the **window
+  schedule** (`none` | `yearly` | `monthly` | `daily` | explicit range list;
+  `quarterly` grammar-reserved), and the append policy. Label grammar and
+  boundary semantics (UTC calendar terms, half-open `[start, end)`,
+  lexicographic = chronological) are frozen on the
+  [mortie spec page](https://github.com/espg/mortie/issues/62#issuecomment-4986809092).
+  Generative schedules keep the manifest
+  write-once and static as data accrues: appending a new year to a
+  `yearly` store adds leaves the schedule already describes — no manifest
+  touch, and **no new manifests**: the store has exactly one
+  `morton_hive.json`, and each new windowed leaf brings only its own zarr
+  metadata + D4 stamp. The explicit-range-list form is the noted exception:
+  appending a window outside the declared list re-templates the manifest (a
+  rare, single-writer, template-time operation, not a worker-race write) —
+  append-heavy stores should prefer generative schedules. (This exception is
+  an implication recorded here from the ratified schedule set, not a point
+  separately ratified on the #237 thread.) Temporal *extent* is
+  deliberately **not** manifest data: actual ranges live on the leaf stamps
+  (truth) and in the root summary (cache), splitting static schema from
+  accruing state exactly the way coverage splits under D9. The default
+  schedule is `none` (no temporal partitioning; a re-run replaces the leaf —
+  the honest rename of the drafted `mission`, which made a completeness claim
+  it couldn't keep for ongoing missions) — existing aggregation stores are
+  unchanged. Ongoing missions with append intent declare a generative
+  schedule (`yearly` is the expected production default; t-digest
+  mergeability makes mission-scale statistics a read-time merge over window
+  leaves, the same approximation class as the worker's existing cross-buffer
+  merge).
 
 This file is the reader's bootstrap: with it, every shard path is computable
 arithmetically with zero requests.
@@ -142,6 +199,18 @@ the data itself). Tracks [#200](https://github.com/englacial/zagg/issues/200).
   §2's "vanilla zarr v3" leaf: one foreign key inside the leaf, ignored by
   zarr readers (data reads unaffected; member enumeration warns and skips
   it).
+
+  *D14 amendment (ratified on
+  [#237](https://github.com/englacial/zagg/issues/237)): the stamp envelope's
+  `encoding` discriminator gains a third value, **`"full"`**, meaning
+  "coverage = the entire shard subtree" — no sidecar is written. Decided by
+  one popcount at stamp time. This is the fast path for dense-by-construction
+  workloads (pull-NN raster, #218/#237): interior shards skip the sidecar
+  and its GET entirely, while edge-of-scene/swath shards write the real
+  bitmap — the **spatial union across the leaf window's acquisitions**
+  (per-timestep validity stays in the data plane as nodata, D9 applied one
+  level down). One code path with a cheap branch, not a raster special
+  case; the tier-0 box is carried unconditionally either way.*
 - **Tier 2 — exact**: the `morton` coordinate array in the leaf *is* the
   exact cell list. The MOC tiers are indexes, never truth (D9 discipline,
   applied one level down).
@@ -160,7 +229,9 @@ the data itself). Tracks [#200](https://github.com/englacial/zagg/issues/200).
   posts its completion list to a **fire-and-forget worker invoke**
   (`InvocationType="Event"`, ~10 ms of dispatcher wall clock, run-size
   independent) that writes a shard-order root MOC for the one-GET
-  bootstrap. Failure is harmless: readers degrade to the sweep MOC or the
+  bootstrap. Under D15 this root summary also carries the time-range union
+  alongside the MOC (cache, sweep-regenerable). Failure is harmless: readers
+  degrade to the sweep MOC or the
   walk, never to wrong answers. Incremental runs: the leaves carry durable
   truth, so the sweep is always a correct rebuilder, and the end-of-run
   write may union with a prior root object.
@@ -299,6 +370,45 @@ write path (§2) is load-bearing; this phase is optimization.
   layout to still-settling zarr v3 hierarchy semantics. One-way door avoided:
   a root `zarr.json` can be added later by the §7 sweep without breaking
   anything.
+- **D13 — Appendable time series = time-windowed, write-once leaves**
+  (espg-ratified on [#237](https://github.com/englacial/zagg/issues/237)).
+  One leaf per (shard, window) under a manifest-declared window schedule;
+  every leaf keeps full D4/D5 semantics (write-once, stamped, binary
+  debris, zero shared mutable state). Backfill is a new earlier-window
+  leaf; re-running a window is idempotent replacement. Rejected: a
+  high-water time index (can't extend backward) and per-run stamp entries
+  with array `resize` (mutable shared state at the leaf — attrs RMW +
+  metadata rewrite races, non-binary debris, unordered time axis on
+  backfill). Not raster-specific: `none` (default; no partitioning, bare
+  leaf names) reproduces today's aggregation stores byte-identically;
+  per-year 88S runs, seasonal subsets, and append-as-acquired are all
+  window leaves under the same convention. Leaf naming is **frozen**:
+  `{full_id}_{window}.zarr`, underscore separator, split on the first `_`
+  — grammar and boundary semantics recorded on the
+  [mortie spec page](https://github.com/espg/mortie/issues/62#issuecomment-4986809092)
+  as part of `morton-hive/2`. Reserved (lean, not decided): §7
+  overview/pyramid zarrs inherit window naming (per-window overviews, with
+  an optional all-time overview as a derived artifact).
+- **D14 — Coverage `encoding: "full"` fast path**
+  (espg-ratified on [#237](https://github.com/englacial/zagg/issues/237)).
+  The stamp's coverage envelope discriminator becomes
+  `"ranges" | "bitmap" | "full"`; `"full"` = whole-subtree coverage, no
+  sidecar written, chosen by a popcount at stamp time. Tier-0 box is
+  always carried. Edge-of-scene/swath shards (the partial case) write the
+  real bitmap as the spatial union across the leaf window's acquisitions;
+  per-timestep validity remains data-plane nodata.
+- **D15 — Temporal declaration splits like coverage**
+  (espg-ratified on [#237](https://github.com/englacial/zagg/issues/237)).
+  Manifest (`morton-hive/2`, static): time encoding + window schedule +
+  append policy. Leaf stamps (truth): each windowed leaf's actual time
+  range + acquisition/granule count. Root summary (cache): the end-of-run
+  root coverage object gains the time-range union alongside the MOC;
+  sweep-regenerable, never truth. Extent never lives in the manifest, so
+  the manifest stays write-once at template time (§3); the noted exception
+  is the explicit-range-list schedule, where appending outside the list
+  re-templates the manifest — append-heavy stores should prefer generative
+  schedules. (That exception is an implication recorded from the ratified
+  schedule set, not separately ratified on the thread.)
 
 ### 8.2 Open for review (input needed)
 
@@ -342,7 +452,8 @@ write path (§2) is load-bearing; this phase is optimization.
   exact ranges hit MB-scale on linear-track occupancy at ~1.1 cells/range).
   Stamp attrs carry only the tier-0 box + the bitmap's order + pointer +
   byte sizes; pad sentinel is JSON null; the envelope gains an
-  `encoding: "ranges" | "bitmap"` discriminator. Bit convention (frozen
+  `encoding: "ranges" | "bitmap"` discriminator (later extended by D14 to add
+  a third value, `"full"`). Bit convention (frozen
   with the mortie spec, golden-vector-pinned on PR #208): bit i = the i-th
   shard-subtree cell in ascending packed-word order (base-4 D1 digit tail,
   digits 1..4 → 0..3), MSB-first per byte.

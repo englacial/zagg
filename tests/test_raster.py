@@ -347,6 +347,55 @@ class TestSampleAsset:
 
 
 class TestStoreAndPath:
+    @pytest.fixture(autouse=True)
+    def _fresh_cache(self, monkeypatch):
+        # The store cache is process-lifetime (issue #244); isolate per test.
+        from zagg.processing import raster as raster_mod
+
+        monkeypatch.setattr(raster_mod, "_STORE_CACHE", {})
+
+    def test_same_href_reuses_store(self):
+        s1, _ = _store_and_path("s3://bkt/a.tif", region="us-west-2")
+        s2, _ = _store_and_path("s3://bkt/b.tif", region="us-west-2")
+        assert s1 is s2  # one client per (bucket, region, anonymous) — issue #244
+
+    def test_vhost_and_scheme_key_separately_but_cache(self):
+        v1, _ = _store_and_path("https://bkt.s3.us-west-2.amazonaws.com/a/B04.tif")
+        v2, _ = _store_and_path("https://bkt.s3.us-west-2.amazonaws.com/b/B08.tif")
+        assert v1 is v2
+
+    def test_distinct_keys_get_distinct_stores(self):
+        a, _ = _store_and_path("s3://bkt/a.tif", region="us-west-2")
+        b, _ = _store_and_path("s3://bkt/a.tif", region="us-west-2", anonymous=False)
+        c, _ = _store_and_path("s3://other/a.tif", region="us-west-2")
+        assert a is not b and a is not c and b is not c
+
+    def test_constructor_called_once_per_key(self, monkeypatch):
+        import async_tiff.store as ats
+
+        from zagg.processing import raster as raster_mod
+
+        calls = {"n": 0}
+        real = ats.S3Store
+
+        class _Counting:
+            def __new__(cls, *a, **k):
+                calls["n"] += 1
+                return real(*a, **k)
+
+        monkeypatch.setattr(raster_mod, "_STORE_CACHE", {})
+        monkeypatch.setattr(ats, "S3Store", _Counting)
+        for _ in range(5):
+            _store_and_path("s3://bkt/x.tif", region="us-west-2")
+        assert calls["n"] == 1
+
+    def test_local_store_reused_per_directory(self, tmp_path):
+        (tmp_path / "a.tif").write_bytes(b"x")
+        (tmp_path / "b.tif").write_bytes(b"x")
+        sa, pa = _store_and_path(str(tmp_path / "a.tif"))
+        sb, pb = _store_and_path(str(tmp_path / "b.tif"))
+        assert sa is sb and (pa, pb) == ("a.tif", "b.tif")
+
     def test_s3_scheme(self):
         store, path = _store_and_path("s3://bkt/some/key.tif", region="us-west-2")
         assert type(store).__name__ == "S3Store"

@@ -330,10 +330,32 @@ class TestFromConfig:
         with pytest.raises(ValueError, match="Unknown output.grid.type"):
             from_config(cfg, parent_order=6)
 
-    def test_sharded_default_off(self, cfg):
-        # The knob is absent by default -> regular (non-sharded) storage (issue #108).
+    def test_sharded_default_on_for_multichunk(self, cfg):
+        # issue #215: with chunk_inner giving K>1, a HEALPix flat-layout config that
+        # OMITS the flag now defaults to sharded — the safe state, so a missing line
+        # no longer silently costs the ~K-fold object blow-up.
+        cfg.output["grid"]["chunk_inner"] = 8
         g = from_config(cfg, parent_order=6)
+        assert g.sharded is True
+        assert g.chunks_per_shard > 1
+
+    def test_sharded_default_noop_for_single_chunk(self, cfg):
+        # No chunk_inner -> K==1 -> nothing to bundle, so the default is a no-op:
+        # single-chunk grids stay unsharded and byte-identical (issue #215).
+        g = from_config(cfg, parent_order=6)
+        assert g.chunks_per_shard == 1
         assert g.sharded is False
+
+    def test_sharded_default_on_for_hive(self, cfg):
+        # issue #236: hive defaults sharded, same as flat — a leaf's dense
+        # arrays collapse to one ShardingCodec object each instead of K
+        # per-inner-chunk objects PUT onto a single leaf prefix. (The #215
+        # hive carve-out is gone; explicit sharded:false still opts out.)
+        cfg.output["grid"]["chunk_inner"] = 8
+        cfg.output["store_layout"] = "hive"
+        g = from_config(cfg, parent_order=6)
+        assert g.chunks_per_shard > 1
+        assert g.sharded is True
 
     def test_sharded_flag_threads_through(self, cfg):
         # sharded on the grid block, with chunk_inner giving K>1, yields a sharded grid.
@@ -343,21 +365,31 @@ class TestFromConfig:
         assert g.sharded is True
         assert g.chunks_per_shard > 1
 
-    def test_sharded_k1_validated_pre_deployment(self, cfg):
-        # sharded without chunk_inner (K==1) is meaningless -> error at construction
-        # (validated before lambda deployment, matching the grid-mismatch errors).
-        cfg.output["grid"]["sharded"] = True
-        with pytest.raises(ValueError, match="K>1"):
-            from_config(cfg, parent_order=6)
-
-    def test_sharded_off_byte_identical_template(self, cfg):
-        # Flag off must reproduce the regular template byte-for-byte even when
-        # chunk_inner is set (sharding is purely opt-in storage form).
+    def test_sharded_explicit_off_disables(self, cfg):
+        # An explicit sharded:false opts out even at K>1 (the one-release explicit
+        # opt-out — issue #215): storage stays regular per-inner-chunk.
         cfg.output["grid"]["chunk_inner"] = 8
-        g_off = from_config(cfg, parent_order=6)
         cfg.output["grid"]["sharded"] = False
-        g_explicit_off = from_config(cfg, parent_order=6)
-        assert g_off._spec().model_dump() == g_explicit_off._spec().model_dump()
+        g = from_config(cfg, parent_order=6)
+        assert g.chunks_per_shard > 1
+        assert g.sharded is False
+
+    def test_sharded_k1_noop_not_rejected(self, cfg):
+        # sharded without chunk_inner (K==1) has nothing to bundle; the grid
+        # silently disables it rather than raising (issue #215 — the default is
+        # True, so a K==1 grid must not blow up at construction).
+        cfg.output["grid"]["sharded"] = True
+        g = from_config(cfg, parent_order=6)
+        assert g.sharded is False
+
+    def test_sharded_default_matches_explicit_true(self, cfg):
+        # The omitted-flag default now produces the SAME template as an explicit
+        # sharded:true (both collapse the K>1 inner chunks to one object; issue #215).
+        cfg.output["grid"]["chunk_inner"] = 8
+        g_default = from_config(cfg, parent_order=6)
+        cfg.output["grid"]["sharded"] = True
+        g_explicit = from_config(cfg, parent_order=6)
+        assert g_default._spec().model_dump() == g_explicit._spec().model_dump()
 
 
 class TestBackcompatWrapper:
@@ -1133,11 +1165,13 @@ class TestSharded:
             sharded=sharded,
         )
 
-    def test_k1_sharded_rejected(self):
+    def test_k1_sharded_noop(self):
         cfg = default_config("atl06")
-        # No chunk_inner -> K == 1 -> sharding is a no-op shard of one chunk.
-        with pytest.raises(ValueError, match="K>1"):
-            HealpixGrid(4, 8, layout="fullsphere", config=cfg, sharded=True)
+        # No chunk_inner -> K == 1 -> nothing to bundle: sharding is silently
+        # disabled rather than rejected, so the True default is safe on a
+        # single-chunk grid (issue #215).
+        g = HealpixGrid(4, 8, layout="fullsphere", config=cfg, sharded=True)
+        assert g.sharded is False
 
     def test_template_emits_sharding_codec(self):
         g = self._grid()
@@ -1154,10 +1188,12 @@ class TestSharded:
             assert any("sharding" in type(c).__name__.lower() for c in arr.metadata.codecs), name
 
     def test_flag_off_byte_identical_to_regular(self):
-        # Sharded OFF must reproduce the existing regular template exactly.
+        # Sharded OFF must reproduce the existing regular per-inner-chunk template
+        # exactly. Both sides pass sharded=False explicitly (the constructor default
+        # is now True — issue #215), isolating the opt-out storage form.
         g_off = self._grid(sharded=False)
         g_reg = HealpixGrid(
-            4, 8, layout="fullsphere", config=default_config("atl06"), chunk_inner=6
+            4, 8, layout="fullsphere", config=default_config("atl06"), chunk_inner=6, sharded=False
         )
         assert g_off._spec().model_dump() == g_reg._spec().model_dump()
 

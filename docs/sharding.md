@@ -7,8 +7,11 @@ unit a Lambda worker processes) from the **read granularity** (the small chunk a
 reader partial-decodes), without drowning the reader in millions of tiny objects
 at global/dense scale.
 
-It is opt-in (default off) and builds directly on `chunk_inner` — it changes
-only the *storage form* of the inner chunks, not the grid geometry.
+It builds directly on `chunk_inner` — it changes only the *storage form* of the
+inner chunks, not the grid geometry. For **HEALPix** grids it is the **default**
+whenever `chunk_inner` gives `K > 1`, on both store layouts (issue #215 flat,
+issue #236 hive); an explicit `sharded: false` opts out. For **rectilinear**
+grids it stays opt-in.
 
 ## How it relates to `chunk_inner`
 
@@ -20,7 +23,7 @@ rectilinear `chunk_inner` = `[inner_h, inner_w]`), and one shard owns
 
 `sharded` only picks how those `K` inner chunks are stored:
 
-| | `sharded: false` (default) | `sharded: true` |
+| | `sharded: false` | `sharded: true` (HEALPix default at K > 1) |
 |---|---|---|
 | storage | `K` regular chunk objects per shard | **1** shard object per shard |
 | object count | high (empties absent) | low (~`K`× fewer) |
@@ -61,11 +64,16 @@ output:
     sharded: true
 ```
 
-`sharded` is only valid when `chunk_inner` makes `K > 1` (a shard with more than
-one inner chunk). Sharding a `K == 1` shard is a no-op shard of one chunk, so it
-is **validated and rejected** at grid construction (before any Lambda
-deployment), with a clear message — matching the grid-mismatch errors zagg
-already raises.
+`sharded` only does something when `chunk_inner` makes `K > 1` (a shard with
+more than one inner chunk). At `K == 1` there is nothing to bundle:
+
+- **HEALPix** silently no-ops it (issue #215) — since `sharded` is the default,
+  a single-chunk grid must not fail at construction. An **explicit**
+  `sharded: true` at `K == 1` likewise validates and no-ops: the output is
+  byte-identical to the unsharded write (one chunk == one object either way).
+- **Rectilinear** (where `sharded` is opt-in) **rejects** `K == 1` at grid
+  construction with a clear message — an explicit flag that cannot do anything
+  is a config mistake there, not a default to tolerate.
 
 ## Storage layout
 
@@ -78,6 +86,10 @@ already raises.
 - The worker writes the whole shard in **one** `set_block_selection` per dense
   array (block selection is shard-granular on a sharded array), so a single shard
   object is produced per dispatch shard.
+- Under the **hive** store layout (issue #236) the same applies inside each
+  leaf: every dense per-cell array (and each ragged field's vlen array, issue
+  #209) is ONE `ShardingCodec` object spanning the whole leaf, written at leaf
+  block 0 — hive output is byte-identical to the flat sharded shard region.
 
 ## Reader note
 

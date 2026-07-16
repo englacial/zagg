@@ -258,7 +258,7 @@ def write_shard_to_zarr(
     region (``grid.shard_local_region(block_index, shard_key)``), reshaped to the
     inner chunk's cell shape (``grid.chunk_shape``) — grid-agnostic, so HEALPix
     (1-D) and rectilinear (2-D) share one path. Ragged fields ride the SAME
-    per-object slab pass (issue #209): their vlen-bytes array shares the dense
+    slab pass (issue #209): their vlen-bytes array shares the dense
     ShardingCodec geometry, so a shard's digests collapse to one object instead
     of the old ~K×7 per-inner-chunk CSR objects. Only the ``resolution: chunk``
     companions stay per inner chunk (their arrays are one block per chunk on the
@@ -281,116 +281,82 @@ def write_shard_to_zarr(
     """
     chunk_res_fields = _chunk_resolution_fields(getattr(grid, "config", None))
     inner_shape = tuple(int(s) for s in grid.chunk_shape)
+    slab_shape = tuple(int(s) for s in grid.shard_slab_shape())
+    shard_block = tuple(int(i) for i in grid.block_index(shard_key))
 
-    # Sharding-object split (issue #133 phase 8): a ShardingCodec object normally
-    # spans the whole dispatch shard, so the K inner chunks accumulate into ONE slab
-    # written in one ``set_block_selection``. ``shard_order`` sizes the object SMALLER
-    # than the dispatch shard, so the worker writes its region in per-object passes
-    # (accumulate→write→free), bounding peak memory under the 2 GB cap. A grid without
-    # the object-split methods (or at the default ``shard_order``) yields ONE object
-    # spanning the whole shard — byte-identical to the pre-phase-8 single-object write.
-    use_object_split = hasattr(grid, "shard_object_block") and hasattr(
-        grid, "shard_object_slab_shape"
-    )
-    if use_object_split:
-        slab_shape = tuple(int(s) for s in grid.shard_object_slab_shape())
-
-        def _object_block(block_index):
-            return tuple(int(i) for i in grid.shard_object_block(block_index))
-
-        def _local_region(block_index):
-            return grid.shard_object_local_region(block_index)
-    else:
-        slab_shape = tuple(int(s) for s in grid.shard_slab_shape())
-        shard_block = tuple(int(i) for i in grid.block_index(shard_key))
-
-        def _object_block(block_index):
-            return shard_block
-
-        def _local_region(block_index):
-            return grid.shard_local_region(block_index, shard_key)
-
-    # Group the dispatch shard's inner chunks by sharding object so each object is
-    # accumulated and written independently; preserve encounter order for stable,
-    # deterministic writes. Companions stay per inner chunk (unsharded); ragged
-    # fields ride the SAME per-object slab pass as the dense arrays (issue #209 —
-    # their vlen-bytes array shares the dense ShardingCodec geometry), so the
-    # per-inner-chunk CSR fan-out (issues #142/#186) is gone.
-    objects: dict = {}
+    # The ShardingCodec object spans the whole dispatch shard, so the K inner
+    # chunks accumulate into ONE slab per dense array written in a single
+    # ``set_block_selection`` at the shard block; ragged fields ride the same
+    # slab pass (issue #209 — their vlen-bytes array shares the dense
+    # ShardingCodec geometry), so the per-inner-chunk CSR fan-out (issues
+    # #142/#186) is gone. (The issue #133 phase-8 ``shard_order`` object
+    # split was removed by issue #238 — one object per shard is the PUT-count
+    # optimum, and nothing occupied the split's coarse-order corner.)
+    slabs: dict = {}
+    ragged_slabs: dict = {}
     for block_index, carrier, ragged in chunk_results:
-        if not _carrier_empty(carrier) or ragged:
-            objects.setdefault(_object_block(block_index), []).append(
-                (block_index, carrier, ragged)
-            )
         # Companions for this inner chunk are not sharded: write them straight
         # through (one block per chunk) — a chunk-resolution ragged companion
         # included (its vlen array is one block per chunk on the chunk grid).
         if chunk_res_fields:
             _write_companion_columns(carrier, store, grid, block_index, chunk_res_fields)
             _write_ragged_companions(ragged, store, grid, block_index, chunk_res_fields)
-
-    # One accumulate→write→free pass per sharding object: each holds at most one
-    # object's slab resident at a time (the phase-8 memory bound).
-    for obj_block, members in objects.items():
-        slabs: dict = {}
-        ragged_slabs: dict = {}
-        for block_index, carrier, ragged in members:
-            region = _local_region(block_index)
-            for name, values in _iter_carrier_columns(carrier):
-                if name in chunk_res_fields:
-                    continue  # companion (resolution: chunk) — handled per chunk above
-                values = np.asarray(values)
-                trailing = values.shape[1:]
-                if name not in slabs:
-                    array = open_array(
-                        store,
-                        path=f"{grid.group_path}/{name}",
-                        zarr_format=3,
-                        consolidated=False,
-                    )
-                    fill = array.metadata.fill_value
-                    slabs[name] = np.full((*slab_shape, *trailing), fill, dtype=values.dtype)
-                slabs[name][region] = values.reshape((*inner_shape, *trailing))
-            # Cell-resolution ragged fields: encode this chunk's payloads into
-            # the object slab at the same region the dense columns use. Empty
-            # cells keep the b"" fill, so an all-empty inner chunk is omitted
-            # from the shard index (sub-shard sparsity, issue #209).
-            _accumulate_ragged_slabs(
-                ragged, ragged_slabs, region, grid, slab_shape, chunk_res_fields
-            )
-
-        # One block selection per dense array == one shard object write.
-        for name, slab in slabs.items():
-            trailing = slab.shape[len(slab_shape) :]
-            block_idx = (*obj_block, *((0,) * len(trailing)))
-            with config.set({"async.concurrency": 128}):
+        if _carrier_empty(carrier) and not ragged:
+            continue
+        region = grid.shard_local_region(block_index, shard_key)
+        for name, values in _iter_carrier_columns(carrier):
+            if name in chunk_res_fields:
+                continue  # companion (resolution: chunk) — handled per chunk above
+            values = np.asarray(values)
+            trailing = values.shape[1:]
+            if name not in slabs:
                 array = open_array(
                     store,
                     path=f"{grid.group_path}/{name}",
                     zarr_format=3,
                     consolidated=False,
                 )
-                if trailing:
-                    # Mirror write_dataframe_to_zarr's single-trailing-chunk invariant
-                    # (issue #29): a vector field's trailing payload dim must be one whole
-                    # (inner) chunk, or set_block_selection at trailing block 0 would
-                    # silently write only part of it.
-                    target_trailing_chunks = array.chunks[len(slab_shape) :]
-                    if target_trailing_chunks != trailing:
-                        raise ValueError(
-                            f"vector field {name!r}: trailing chunk "
-                            f"{target_trailing_chunks} must equal trailing shape "
-                            f"{trailing} (the payload dim must be one whole chunk)"
-                        )
-                array.set_block_selection(block_idx, slab)
+                fill = array.metadata.fill_value
+                slabs[name] = np.full((*slab_shape, *trailing), fill, dtype=values.dtype)
+            slabs[name][region] = values.reshape((*inner_shape, *trailing))
+        # Cell-resolution ragged fields: encode this chunk's payloads into
+        # the shard slab at the same region the dense columns use. Empty
+        # cells keep the b"" fill, so an all-empty inner chunk is omitted
+        # from the shard index (sub-shard sparsity, issue #209).
+        _accumulate_ragged_slabs(ragged, ragged_slabs, region, grid, slab_shape, chunk_res_fields)
 
-        # ONE object write per ragged field too (issue #209): the vlen-bytes
-        # array shares the dense arrays' ShardingCodec geometry, so the whole
-        # slab lands at the same object block — the ShardingCodec emits a
-        # single object with its internal index in place of the old ~K×7
-        # per-inner-chunk CSR objects.
-        for name, slab in ragged_slabs.items():
-            _set_ragged_block(store, grid, name, tuple(obj_block), slab)
+    # One block selection per dense array == one shard object write.
+    for name, slab in slabs.items():
+        trailing = slab.shape[len(slab_shape) :]
+        block_idx = (*shard_block, *((0,) * len(trailing)))
+        with config.set({"async.concurrency": 128}):
+            array = open_array(
+                store,
+                path=f"{grid.group_path}/{name}",
+                zarr_format=3,
+                consolidated=False,
+            )
+            if trailing:
+                # Mirror write_dataframe_to_zarr's single-trailing-chunk invariant
+                # (issue #29): a vector field's trailing payload dim must be one whole
+                # (inner) chunk, or set_block_selection at trailing block 0 would
+                # silently write only part of it.
+                target_trailing_chunks = array.chunks[len(slab_shape) :]
+                if target_trailing_chunks != trailing:
+                    raise ValueError(
+                        f"vector field {name!r}: trailing chunk "
+                        f"{target_trailing_chunks} must equal trailing shape "
+                        f"{trailing} (the payload dim must be one whole chunk)"
+                    )
+            array.set_block_selection(block_idx, slab)
+
+    # ONE object write per ragged field too (issue #209): the vlen-bytes
+    # array shares the dense arrays' ShardingCodec geometry, so the whole
+    # slab lands at the shard block — the ShardingCodec emits a single
+    # object with its internal index in place of the old ~K×7
+    # per-inner-chunk CSR objects.
+    for name, slab in ragged_slabs.items():
+        _set_ragged_block(store, grid, name, shard_block, slab)
     return store
 
 
@@ -521,6 +487,98 @@ def write_ragged_leaf_to_zarr(ragged_chunks: list, store: Store, *, grid) -> Sto
         _accumulate_ragged_slabs(ragged, slabs, region, grid, slab_shape, chunk_res_fields)
     for name, slab in slabs.items():
         _set_ragged_block(store, grid, name, (0,) * len(slab_shape), slab)
+    return store
+
+
+def write_leaf_to_zarr(
+    chunk_results: list,
+    store: Store,
+    *,
+    grid,
+    shard_key: int,
+) -> Store:
+    """Write a SHARDED hive leaf in ONE block selection per array (issue #236).
+
+    The hive counterpart of :func:`write_shard_to_zarr` and the dense analog of
+    :func:`write_ragged_leaf_to_zarr`: ``chunk_results`` is the worker's
+    ``[(block_index, carrier, ragged), ...]`` at GLOBAL block indices (from
+    ``grid.iter_chunks``). The sharded leaf template bundles each dense per-cell
+    array's K inner chunks into a single ``ShardingCodec`` object spanning the
+    whole leaf, so the K carriers accumulate into one leaf-wide slab per array
+    written at block 0 in a single call — one object per dense array (plus one
+    per ragged field, riding the same pass as in :func:`write_shard_to_zarr`)
+    in place of the K per-inner-chunk objects the streaming path PUTs onto a
+    single leaf prefix. A per-chunk loop against these arrays would
+    read-modify-write each shard object K times (the ``runner``'s sharded-path
+    warning). Empty inner chunks stay fill, so the ShardingCodec omits them
+    from the shard index (sub-shard sparsity preserved inside the object).
+
+    A hive leaf spans exactly ONE dispatch shard and its arrays shard across
+    the whole leaf (the dense leaf payload is ~1.3 MB at production
+    geometry), so placement is
+    ``grid.shard_local_region(block_index, shard_key)`` and every write lands
+    at leaf block 0. ``resolution: chunk`` companions stay per inner chunk at
+    leaf-LOCAL blocks (their arrays are one block per chunk on the leaf's
+    chunk grid, never sharded).
+    """
+    chunk_res_fields = _chunk_resolution_fields(getattr(grid, "config", None))
+    inner_shape = tuple(int(s) for s in grid.chunk_shape)
+    slab_shape = tuple(int(s) for s in grid.shard_slab_shape())
+    slabs: dict = {}
+    ragged_slabs: dict = {}
+    for block_index, carrier, ragged in chunk_results:
+        region = grid.shard_local_region(block_index, shard_key)
+        # Companions for this inner chunk are not sharded: write them straight
+        # through at the chunk's leaf-LOCAL block (region start over the chunk
+        # extent — the ``hive.leaf_block_index`` derivation).
+        if chunk_res_fields:
+            local = tuple(int(s.start) // c for s, c in zip(region, inner_shape))
+            _write_companion_columns(carrier, store, grid, local, chunk_res_fields)
+            _write_ragged_companions(ragged, store, grid, local, chunk_res_fields)
+        if _carrier_empty(carrier) and not ragged:
+            continue
+        for name, values in _iter_carrier_columns(carrier):
+            if name in chunk_res_fields:
+                continue  # companion (resolution: chunk) — handled per chunk above
+            values = np.asarray(values)
+            trailing = values.shape[1:]
+            if name not in slabs:
+                array = open_array(
+                    store,
+                    path=f"{grid.group_path}/{name}",
+                    zarr_format=3,
+                    consolidated=False,
+                )
+                fill = array.metadata.fill_value
+                slabs[name] = np.full((*slab_shape, *trailing), fill, dtype=values.dtype)
+            slabs[name][region] = values.reshape((*inner_shape, *trailing))
+        # Cell-resolution ragged fields ride the same slab pass (issue #209).
+        _accumulate_ragged_slabs(ragged, ragged_slabs, region, grid, slab_shape, chunk_res_fields)
+
+    leaf_block = (0,) * len(slab_shape)
+    for name, slab in slabs.items():
+        trailing = slab.shape[len(slab_shape) :]
+        with config.set({"async.concurrency": 128}):
+            array = open_array(
+                store,
+                path=f"{grid.group_path}/{name}",
+                zarr_format=3,
+                consolidated=False,
+            )
+            if trailing:
+                # Single-trailing-chunk invariant (issue #29): a vector field's
+                # trailing payload dim must be one whole chunk, or the write at
+                # trailing block 0 would silently cover only part of it.
+                target_trailing_chunks = array.chunks[len(slab_shape) :]
+                if target_trailing_chunks != trailing:
+                    raise ValueError(
+                        f"vector field {name!r}: trailing chunk "
+                        f"{target_trailing_chunks} must equal trailing shape "
+                        f"{trailing} (the payload dim must be one whole chunk)"
+                    )
+            array.set_block_selection((*leaf_block, *((0,) * len(trailing))), slab)
+    for name, slab in ragged_slabs.items():
+        _set_ragged_block(store, grid, name, leaf_block, slab)
     return store
 
 

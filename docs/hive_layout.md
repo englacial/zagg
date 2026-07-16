@@ -7,8 +7,9 @@ the write-side half of the sparse-coverage design record
 D1–D6); the convention itself is owned by the mortie spec and versioned as
 `morton-hive/1`.
 
-It is opt-in (default `flat`, today's single shared store) and — in this first
-round — wired to the **local backend only** (see [Status](#status)).
+It is opt-in (default `flat`, today's single shared store) and wired to
+**both backends** — the local runner and the Lambda handler share the same
+per-shard write path (see [Status](#status)).
 
 ## Layout
 
@@ -30,8 +31,15 @@ round — wired to the **local backend only** (see [Status](#status)).
   inventories, unambiguous if moved. Each leaf is a vanilla zarr v3
   store: the same group/array template as the flat layout, sized to one shard
   (dense arrays hold `cells_per_shard` cells; `resolution: chunk` companions
-  hold the shard's K inner chunks; CSR ragged subgroups sit under the same
-  group path, named by the shard label at K==1). One recorded exception
+  hold the shard's K inner chunks). When `sharded` (the K > 1 **default**,
+  matching flat — [issue #236](https://github.com/englacial/zagg/issues/236))
+  each dense array is ONE `ShardingCodec` object spanning the whole leaf,
+  written at leaf block 0. A ragged field's vlen-bytes array is one whole-leaf
+  object whenever K > 1 — **sharded or not**
+  ([issue #209](https://github.com/englacial/zagg/issues/209)), independent of
+  the dense `sharded` toggle. The
+  ShardingCodec is itself vanilla zarr v3, so the leaf stays self-describing.
+  One recorded exception
   ([issue #200](https://github.com/englacial/zagg/issues/200), O8): the
   `coverage.moc` occupancy-bitmap sidecar inside the leaf — a single foreign
   key that zarr readers ignore (data reads are unaffected; member
@@ -55,10 +63,21 @@ output:
     child_order: 13                 # cell order
 ```
 
+`sharded` output ([docs/sharding.md](sharding.md)) is supported and is the
+default whenever `chunk_inner` gives K > 1 — same contract as flat
+([issue #236](https://github.com/englacial/zagg/issues/236)): each leaf's
+dense arrays collapse to one object apiece instead of K per-inner-chunk
+objects PUT onto a single leaf prefix. An explicit `sharded: false` opts the
+**dense** arrays back into K streaming objects — the ragged vlen array stays
+one whole-leaf object regardless
+([issue #209](https://github.com/englacial/zagg/issues/209)); an explicit
+`sharded: true` at K == 1 validates and is a no-op (nothing to bundle — the
+leaf is byte-identical either way).
+
 Validation rejects `hive` with a rectilinear grid (node names are morton
-digits), with `sharded: true` (a leaf is a vanilla zarr v3 store), and with
-`consolidate_metadata: true` (there is no store-root zarr hierarchy to
-consolidate — D5/D12).
+digits) and with `consolidate_metadata: true` (there is no store-root zarr
+hierarchy to consolidate — D5/D12). (The manifest's `shard_order` field below
+records the dispatch/tree order — it is not a config knob.)
 
 ## The manifest (`morton_hive.json`)
 
@@ -274,5 +293,12 @@ under D9/O7). The §7 sweep remains the authoritative rebuilder.
   default on for hive) for the one-GET bootstrap, plus the `zagg.coverage`
   reader primitives (per-tier AOI intersection, O7 staleness lean, explicit
   refresh).
+- **Dense arrays shard inside the leaf**
+  ([issue #236](https://github.com/englacial/zagg/issues/236)): hive output is
+  byte-identical to the flat sharded layout — one `ShardingCodec` object per
+  dense array per leaf (plus one per ragged field,
+  [issue #209](https://github.com/englacial/zagg/issues/209)), the default at
+  K > 1, so a leaf costs one PUT per dense array instead of K per-inner-chunk
+  PUTs concentrated on a single prefix.
 - Write-throughput validation at fleet scale is tracked with the benchmark
   machinery in [issue #202](https://github.com/englacial/zagg/issues/202).

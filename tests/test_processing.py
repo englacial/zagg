@@ -104,7 +104,7 @@ class TestWriteShardToZarr:
 
         kw = dict(layout="fullsphere", config=cfg, chunk_inner=7)
         sharded = HealpixGrid(6, 8, sharded=True, **kw)
-        regular = HealpixGrid(6, 8, **kw)
+        regular = HealpixGrid(6, 8, sharded=False, **kw)
         shard_key = int(geo2mort(-78.5, -132.0, order=6)[0])
         return sharded, regular, shard_key
 
@@ -208,16 +208,17 @@ class TestWriteShardToZarr:
         assert np.isnan(grp["h_mean"][int(cell_ids[1])])
 
 
-class TestShardOrderObjectSplit:
-    """Issue #133 phase 8: ``shard_order`` decouples the ShardingCodec object from
-    the dispatch shard. The default (unset / == parent_order) keeps ONE object per
-    dispatch shard — byte-identical to the pre-phase-8 sharded write — while a finer
-    ``shard_order`` writes the dispatch region in per-object passes that reconstruct
-    the same logical array.
+class TestShardedMixedFieldKinds:
+    """The sharded whole-shard write reconstructs the SAME logical arrays as the
+    unsharded per-chunk write for a config carrying every field kind — scalar,
+    vector (trailing-dim), ``resolution: chunk`` companion, and ragged vlen
+    (issue #209) — with each sharded per-cell array collapsing to ONE object.
+    (Salvaged from the issue #133 phase-8 object-split suite when the
+    ``shard_order`` knob was removed — issue #238; the field-kind gate stays.)
 
     Small orders (parent 4 / chunk_inner 6 / child 7) so the fullsphere template +
     write run fast: K = 4^(6-4) = 16 inner chunks, cells_per_chunk 4, cells_per_shard
-    64; ``shard_order=5`` gives 4 objects/shard of 16 cells each.
+    64.
     """
 
     PARENT, INNER, CHILD = 4, 6, 7
@@ -226,23 +227,22 @@ class TestShardOrderObjectSplit:
     def _shard_key():
         from mortie import geo2mort
 
-        return int(geo2mort(-78.5, -132.0, order=TestShardOrderObjectSplit.PARENT)[0])
+        return int(geo2mort(-78.5, -132.0, order=TestShardedMixedFieldKinds.PARENT)[0])
 
-    def _grid(self, cfg, *, shard_order=None):
+    def _grid(self, cfg, *, sharded=True):
         return HealpixGrid(
             self.PARENT,
             self.CHILD,
             layout="fullsphere",
             config=cfg,
             chunk_inner=self.INNER,
-            sharded=True,
-            shard_order=shard_order,
+            sharded=sharded,
         )
 
     @staticmethod
     def _df(grid, shard_key):
-        # Cells in the first, a middle, and the last inner chunk so the written shard
-        # spans more than one sharding object once shard_order splits it.
+        # Cells in the first, a middle, and the last inner chunk so the written
+        # shard spans several distinct inner chunks of the slab.
         children = grid.children(shard_key)
         idx = [0, len(children) // 2, len(children) - 1]
         leaf = np.array([int(children[i]) for i in idx], dtype=np.uint64)
@@ -287,87 +287,27 @@ class TestShardOrderObjectSplit:
             config=grid.config,
             chunk_results=chunk_results,
         )
-        write_shard_to_zarr(chunk_results, store, grid=grid, shard_key=shard_key)
+        if getattr(grid, "sharded", False):
+            write_shard_to_zarr(chunk_results, store, grid=grid, shard_key=shard_key)
+        else:
+            for block_index, carrier, ragged in chunk_results:
+                write_dataframe_to_zarr(carrier, store, grid=grid, chunk_idx=block_index)
+                write_ragged_to_zarr(ragged, store, grid=grid, chunk_idx=block_index)
         return store
-
-    def test_default_byte_identical_to_explicit_parent_order(self, monkeypatch):
-        """Default (``shard_order`` unset) is byte-identical to ``shard_order ==
-        parent_order`` — both keep ONE object spanning the whole dispatch shard, so
-        the on-disk store bytes match exactly (the phase-8 default-safety invariant)."""
-        cfg = default_config()
-        shard_key = self._shard_key()
-        g_default = self._grid(cfg, shard_order=None)
-        g_parent = self._grid(cfg, shard_order=self.PARENT)
-        # Both keep one object per dispatch shard.
-        assert g_default.shard_objects_per_shard == 1
-        assert g_parent.shard_objects_per_shard == 1
-
-        df = self._df(g_default, shard_key)
-        s_default = self._run(g_default, shard_key, df, monkeypatch)
-        s_parent = self._run(g_parent, shard_key, df.copy(), monkeypatch)
-
-        # Byte-for-byte equal stores (same keys, same bytes).
-        assert set(s_default._store_dict) == set(s_parent._store_dict)
-        for k, v in s_default._store_dict.items():
-            assert v.to_bytes() == s_parent._store_dict[k].to_bytes(), f"store bytes differ at {k}"
-
-    def test_split_reconstructs_same_logical_array(self, monkeypatch):
-        """A finer ``shard_order`` (multiple objects per shard) reconstructs the SAME
-        logical array, value-for-value, as the single-object default."""
-        cfg = default_config()
-        shard_key = self._shard_key()
-        g_default = self._grid(cfg, shard_order=None)
-        g_split = self._grid(cfg, shard_order=5)
-        assert g_split.shard_objects_per_shard == 4
-
-        df = self._df(g_default, shard_key)
-        s_default = self._run(g_default, shard_key, df, monkeypatch)
-        s_split = self._run(g_split, shard_key, df.copy(), monkeypatch)
-
-        grp_d = open_group(store=s_default, mode="r", path=str(self.CHILD))
-        grp_s = open_group(store=s_split, mode="r", path=str(self.CHILD))
-        for name in grp_d.array_keys():
-            a, b = grp_d[name][:], grp_s[name][:]
-            np.testing.assert_array_equal(
-                np.nan_to_num(a, nan=-12345.0),
-                np.nan_to_num(b, nan=-12345.0),
-                err_msg=f"split vs single-object differ in {name}",
-            )
-
-    def test_split_writes_multiple_objects_default_writes_one(self, monkeypatch):
-        """The default writes ONE shard object for the populated shard; the split
-        writes one object PER populated sharding sub-region (sparse: empty objects
-        are omitted)."""
-        cfg = default_config()
-        shard_key = self._shard_key()
-        g_default = self._grid(cfg, shard_order=None)
-        g_split = self._grid(cfg, shard_order=5)
-        df = self._df(g_default, shard_key)
-
-        s_default = self._run(g_default, shard_key, df, monkeypatch)
-        s_split = self._run(g_split, shard_key, df.copy(), monkeypatch)
-
-        prefix = f"{self.CHILD}/h_mean/c/"
-        n_default = len([k for k in s_default._store_dict if k.startswith(prefix)])
-        n_split = len([k for k in s_split._store_dict if k.startswith(prefix)])
-        assert n_default == 1
-        # Three cells in three distinct inner chunks land in 2-3 distinct objects
-        # (>1), but never more than one per dispatch shard's object count.
-        assert 1 < n_split <= g_split.shard_objects_per_shard
 
     @staticmethod
     def _mixed_config():
         """The default scalar config extended with a vector(trailing-dim), a
-        ``resolution: chunk`` companion, and a ragged/CSR field, so the split path is
-        exercised for every field kind — not just scalars — while keeping the default's
-        ``morton`` coordinate + scalar data vars."""
+        ``resolution: chunk`` companion, and a ragged field, so the sharded slab
+        pass is exercised for every field kind — not just scalars — while keeping
+        the default's ``morton`` coordinate + scalar data vars."""
         cfg = default_config()
         agg = cfg.aggregation
         agg.setdefault("chunk_precompute", {})["chunk_base"] = {
             "expression": "np.float32(np.mean(h_li))",
             "source": "h_li",
         }
-        # vector trailing-dim — dense AND sharded, so it rides the per-object slab.
+        # vector trailing-dim — dense AND sharded, so it rides the shard slab.
         agg["variables"]["h_edges"] = {
             "expression": "np.array([np.min(h_li), np.max(h_li)])",
             "source": "h_li",
@@ -391,66 +331,46 @@ class TestShardOrderObjectSplit:
         }
         return cfg
 
-    def test_split_reconstructs_vector_companion_and_ragged(self, monkeypatch):
-        """The split path reconstructs the SAME store for a config carrying every
-        field kind — a vector (trailing-dim, dense+sharded), a ``resolution: chunk``
-        companion, and a ragged vlen field (issue #209, riding the same sharded
-        slab pass) — not just scalars. Every array reconstructs value-for-value."""
+    def test_sharded_reconstructs_all_field_kinds_in_one_object_each(self, monkeypatch):
+        """The sharded whole-shard write reconstructs the SAME logical arrays as
+        the unsharded per-chunk write for every field kind — scalar h_mean,
+        vector h_edges (trailing-dim), chunk companion h_chunk_base, ragged vlen
+        h_ragged (issue #209, riding the same slab pass) — with each sharded
+        per-cell array landing as ONE store object. The ragged array holds
+        per-cell bytes objects, so it compares element-wise directly (no NaN
+        mapping)."""
         cfg = self._mixed_config()
         shard_key = self._shard_key()
-        g_default = self._grid(cfg, shard_order=None)
-        g_split = self._grid(cfg, shard_order=5)
-        assert g_split.shard_objects_per_shard == 4
+        g_sharded = self._grid(cfg, sharded=True)
+        g_regular = self._grid(cfg, sharded=False)
 
-        df = self._df(g_default, shard_key)
-        s_default = self._run(g_default, shard_key, df, monkeypatch)
-        s_split = self._run(g_split, shard_key, df.copy(), monkeypatch)
+        df = self._df(g_sharded, shard_key)
+        s_sharded = self._run(g_sharded, shard_key, df, monkeypatch)
+        s_regular = self._run(g_regular, shard_key, df.copy(), monkeypatch)
 
-        # Every array (scalar h_mean, vector h_edges, chunk companion
-        # h_chunk_base, ragged vlen h_ragged) reconstructs value-for-value
-        # across the split. The ragged array holds per-cell bytes objects, so
-        # it compares element-wise directly (no NaN mapping).
-        grp_d = open_group(store=s_default, mode="r", path=str(self.CHILD))
-        grp_s = open_group(store=s_split, mode="r", path=str(self.CHILD))
-        assert set(grp_d.array_keys()) == set(grp_s.array_keys())
-        assert {"h_mean", "h_edges", "h_chunk_base", "h_ragged"} <= set(grp_d.array_keys())
-        for name in grp_d.array_keys():
+        grp_s = open_group(store=s_sharded, mode="r", path=str(self.CHILD))
+        grp_r = open_group(store=s_regular, mode="r", path=str(self.CHILD))
+        assert set(grp_s.array_keys()) == set(grp_r.array_keys())
+        assert {"h_mean", "h_edges", "h_chunk_base", "h_ragged"} <= set(grp_s.array_keys())
+        for name in grp_s.array_keys():
             if name == "h_ragged":
                 np.testing.assert_array_equal(
-                    grp_d[name][:],
                     grp_s[name][:],
-                    err_msg="split vs single-object differ in h_ragged",
+                    grp_r[name][:],
+                    err_msg="sharded vs per-chunk differ in h_ragged",
                 )
                 continue
             np.testing.assert_array_equal(
-                np.nan_to_num(grp_d[name][:], nan=-12345.0),
                 np.nan_to_num(grp_s[name][:], nan=-12345.0),
-                err_msg=f"split vs single-object differ in {name}",
+                np.nan_to_num(grp_r[name][:], nan=-12345.0),
+                err_msg=f"sharded vs per-chunk differ in {name}",
             )
-        # ... and the split genuinely fanned the ragged field over >1 object.
-        prefix = f"{self.CHILD}/h_ragged/c/"
-        assert len([k for k in s_default._store_dict if k.startswith(prefix)]) == 1
-        assert len([k for k in s_split._store_dict if k.startswith(prefix)]) > 1
-
-    def test_invalid_shard_order_rejected(self):
-        cfg = default_config()
-        # <= parent_order (other than the default) is rejected.
-        with pytest.raises(ValueError, match="shard_order"):
-            self._grid(cfg, shard_order=self.PARENT - 1)
-        # > chunk_inner is rejected.
-        with pytest.raises(ValueError, match="shard_order"):
-            self._grid(cfg, shard_order=self.INNER + 1)
-        # shard_order without sharded=True is rejected.
-        with pytest.raises(ValueError, match="sharded=True"):
-            HealpixGrid(
-                self.PARENT,
-                self.CHILD,
-                layout="fullsphere",
-                config=cfg,
-                chunk_inner=self.INNER,
-                sharded=False,
-                shard_order=5,
-            )
+        # Sharded per-cell arrays collapse to ONE object each (the ragged vlen
+        # included); the per-chunk store fans the same cells over >1 object.
+        for name in ("h_mean", "h_ragged"):
+            prefix = f"{self.CHILD}/{name}/c/"
+            assert len([k for k in s_sharded._store_dict if k.startswith(prefix)]) == 1
+            assert len([k for k in s_regular._store_dict if k.startswith(prefix)]) > 1
 
 
 class TestCalculateCellStatistics:
@@ -1399,8 +1319,11 @@ class TestRaggedVlenLayout:
         grid, shard_key, chunk_results, payloads = self._sharded_setup()
         flat = self._write(grid, shard_key, chunk_results)
 
-        # Same config/geometry, hive-legal (unsharded) grid for the leaf.
-        leaf_grid = HealpixGrid(4, 8, layout="fullsphere", config=grid.config, chunk_inner=6)
+        # Same config/geometry, hive-legal (unsharded) grid for the leaf. sharded is
+        # explicit False now that the constructor default is True (issue #215).
+        leaf_grid = HealpixGrid(
+            4, 8, layout="fullsphere", config=grid.config, chunk_inner=6, sharded=False
+        )
         leaf = MemoryStore()
         leaf_grid.emit_shard_template(leaf)
         shard_block = grid.block_index(shard_key)[0]
@@ -1479,6 +1402,200 @@ class TestRaggedVlenLayout:
         for key, (v, w) in expected.items():
             np.testing.assert_array_equal(seen[key][0], v, err_msg=f"payload {key}")
             np.testing.assert_array_equal(seen[key][1], w, err_msg=f"locations {key}")
+
+
+class TestWriteLeafToZarr:
+    """Issue #236 gates for the SHARDED hive leaf write (``write_leaf_to_zarr``):
+    every dense array (and each ragged field) collapses to ONE ShardingCodec
+    object in the leaf store, at leaf block 0, with contents byte-identical to
+    the flat sharded path's shard region — the flat↔hive parity contract."""
+
+    @staticmethod
+    def _data_keys(store, grid, field):
+        prefix = f"{grid.group_path}/{field}/"
+        return [
+            k for k in store._store_dict if k.startswith(prefix) and not k.endswith("zarr.json")
+        ]
+
+    @staticmethod
+    def _leaf_template(grid):
+        """Emit the sharded LEAF template via ``emit_shard_template`` — post
+        issue #236 phase 2 that seam is exactly this (its sharded-grid carve-out
+        was deleted, so the hand-built ``shard_spec`` workaround is gone)."""
+        return grid.emit_shard_template(MemoryStore(), overwrite=True)
+
+    @staticmethod
+    def _setup(seed=7):
+        """The ragged K=16 fixture plus a dense ``h_min`` column on every
+        populated chunk (every 4th inner chunk stays entirely empty)."""
+        grid, shard_key, chunk_results, payloads = TestRaggedVlenLayout._sharded_setup(seed)
+        rng = np.random.default_rng(seed + 1)
+        dense: dict = {}
+        results = []
+        shard_block = grid.block_index(shard_key)[0]
+        for block, carrier, ragged in chunk_results:
+            if ragged:
+                vals = rng.standard_normal(grid.cells_per_chunk).astype(np.float32)
+                carrier = pd.DataFrame({"h_min": vals})
+                dense[int(block[0]) - shard_block * grid.chunks_per_shard] = vals
+            results.append((block, carrier, ragged))
+        return grid, shard_key, results, payloads, dense
+
+    def test_one_object_per_array_at_leaf_block_zero(self):
+        """THE issue #236 gate: the leaf's dense array collapses to ONE store
+        object (was K per-inner-chunk objects on the streaming path), the
+        ragged field rides the same pass, and a fresh reopen returns every
+        populated cell — empty inner chunks read fill."""
+        import zarr
+
+        from zagg.processing import write_leaf_to_zarr
+
+        grid, shard_key, chunk_results, payloads, dense = self._setup()
+        leaf = self._leaf_template(grid)
+        write_leaf_to_zarr(chunk_results, leaf, grid=grid, shard_key=shard_key)
+
+        assert len(self._data_keys(leaf, grid, "h_min")) == 1
+        assert len(self._data_keys(leaf, grid, "h_raw")) == 1
+
+        arr = zarr.open_array(leaf, path=f"{grid.group_path}/h_min", mode="r")
+        assert arr.shape == (grid.cells_per_shard,)
+        block = arr[:]
+        for local in range(grid.chunks_per_shard):
+            region = block[local * grid.cells_per_chunk : (local + 1) * grid.cells_per_chunk]
+            if local in dense:
+                np.testing.assert_array_equal(region, dense[local])
+            else:
+                assert np.all(np.isnan(region))
+
+    def test_flat_sharded_parity_byte_for_byte(self):
+        """The leaf's arrays equal the flat sharded store's shard region for
+        the SAME chunk_results — dense and ragged — so the two layouts cannot
+        drift (the flat↔hive parity acceptance criterion)."""
+        import zarr
+
+        from zagg.processing import write_leaf_to_zarr, write_shard_to_zarr
+
+        grid, shard_key, chunk_results, _payloads, _dense = self._setup()
+        flat = MemoryStore()
+        grid.emit_template(flat)
+        write_shard_to_zarr(chunk_results, flat, grid=grid, shard_key=shard_key)
+        leaf = self._leaf_template(grid)
+        write_leaf_to_zarr(chunk_results, leaf, grid=grid, shard_key=shard_key)
+
+        base = grid.block_index(shard_key)[0] * grid.cells_per_shard
+        for name in ("h_min", "h_raw"):
+            flat_arr = zarr.open_array(flat, path=f"{grid.group_path}/{name}", mode="r")
+            leaf_arr = zarr.open_array(leaf, path=f"{grid.group_path}/{name}", mode="r")
+            np.testing.assert_array_equal(flat_arr[base : base + grid.cells_per_shard], leaf_arr[:])
+
+    @staticmethod
+    def _companion_vector_setup(seed=3, width=3):
+        """A sharded K=16 grid whose config adds a ``kind: vector`` field and a
+        ``resolution: chunk`` companion to the dense ``h_min``, with hand-built
+        arro3 carriers on the populated inner chunks (the companion column is
+        chunk-uniform; every 4th inner chunk stays empty)."""
+        from arro3.core import Array, Table, fixed_size_list_array
+        from mortie import geo2mort
+
+        from zagg.config import PipelineConfig
+
+        cfg = PipelineConfig(
+            data_source={"groups": ["g"]},
+            aggregation={
+                "chunk_precompute": {
+                    "chunk_anchor": {"expression": "np.float32(0.0)", "source": "h_li"}
+                },
+                "variables": {
+                    "h_min": {"function": "min", "source": "h_li", "dtype": "float32"},
+                    "h_edges": {
+                        "kind": "vector",
+                        "trailing_shape": width,
+                        "expression": "np.zeros(3)",
+                        "source": "h_li",
+                        "dtype": "float32",
+                    },
+                    "h_anchor": {
+                        "expression": "chunk_anchor",
+                        "source": "h_li",
+                        "resolution": "chunk",
+                        "dtype": "float32",
+                    },
+                },
+            },
+        )
+        grid = HealpixGrid(4, 8, layout="fullsphere", config=cfg, chunk_inner=6, sharded=True)
+        shard_key = int(geo2mort(-78.5, -132.0, order=4)[0])
+        shard_block = grid.block_index(shard_key)[0]
+        rng = np.random.default_rng(seed)
+        n = grid.cells_per_chunk
+        chunk_results: list = []
+        expected: dict = {}
+        for block, _children in grid.iter_chunks(shard_key):
+            local = int(block[0]) - shard_block * grid.chunks_per_shard
+            if local % 4 == 3:
+                chunk_results.append((block, pd.DataFrame(), {}))  # empty inner chunk
+                continue
+            h_min = rng.standard_normal(n).astype(np.float32)
+            h_edges = rng.standard_normal((n, width)).astype(np.float32)
+            anchor = np.float32(local)  # one value per chunk (chunk-uniform)
+            carrier = Table.from_pydict(
+                {
+                    "h_min": Array.from_numpy(np.ascontiguousarray(h_min)),
+                    "h_edges": fixed_size_list_array(
+                        Array.from_numpy(np.ascontiguousarray(h_edges).reshape(-1)), width
+                    ),
+                    "h_anchor": Array.from_numpy(np.full(n, anchor, dtype=np.float32)),
+                }
+            )
+            chunk_results.append((block, carrier, {}))
+            expected[local] = (h_min, h_edges, anchor)
+        return grid, shard_key, chunk_results, expected
+
+    def test_companion_and_vector_flat_leaf_parity(self):
+        """The vector/trailing-dim branch and the ``resolution: chunk`` companion
+        branch of ``write_leaf_to_zarr`` (the two pieces the ragged-only fixture
+        never reached): the dense vector array collapses to ONE object with
+        byte-for-byte flat parity, and the companion lands at leaf-LOCAL blocks
+        (0..K-1) of the leaf-sized companion array, matching flat's value at the
+        GLOBAL block."""
+        import zarr
+
+        from zagg.processing import write_leaf_to_zarr, write_shard_to_zarr
+
+        grid, shard_key, chunk_results, expected = self._companion_vector_setup()
+        flat = MemoryStore()
+        grid.emit_template(flat)
+        write_shard_to_zarr(chunk_results, flat, grid=grid, shard_key=shard_key)
+        leaf = self._leaf_template(grid)
+        write_leaf_to_zarr(chunk_results, leaf, grid=grid, shard_key=shard_key)
+
+        shard_block = grid.block_index(shard_key)[0]
+        base = shard_block * grid.cells_per_shard
+        # Dense scalar + vector arrays: one object each, byte-for-byte parity.
+        for name in ("h_min", "h_edges"):
+            assert len(self._data_keys(leaf, grid, name)) == 1
+            flat_arr = zarr.open_array(flat, path=f"{grid.group_path}/{name}", mode="r")
+            leaf_arr = zarr.open_array(leaf, path=f"{grid.group_path}/{name}", mode="r")
+            np.testing.assert_array_equal(flat_arr[base : base + grid.cells_per_shard], leaf_arr[:])
+
+        # The vector array carries the payload (not both-fill): each populated
+        # inner chunk's (cells, width) block lands at its leaf-local run.
+        vec = zarr.open_array(leaf, path=f"{grid.group_path}/h_edges", mode="r")[:]
+        for local, (_h_min, h_edges, _anchor) in expected.items():
+            seg = vec[local * grid.cells_per_chunk : (local + 1) * grid.cells_per_chunk]
+            np.testing.assert_array_equal(seg, h_edges)
+
+        # resolution: chunk companion — the leaf array is leaf-sized (one block
+        # per inner chunk); each populated chunk lands at its leaf-LOCAL block,
+        # matching flat's value at the GLOBAL block, empties left at fill.
+        leaf_comp = zarr.open_array(leaf, path=f"{grid.group_path}/h_anchor", mode="r")
+        flat_comp = zarr.open_array(flat, path=f"{grid.group_path}/h_anchor", mode="r")
+        assert leaf_comp.shape == (grid.chunks_per_shard,)
+        for local, (_h_min, _h_edges, anchor) in expected.items():
+            assert leaf_comp[local] == anchor
+            assert flat_comp[shard_block * grid.chunks_per_shard + local] == anchor
+        empty = sorted(set(range(grid.chunks_per_shard)) - set(expected))
+        assert np.all(np.isnan(leaf_comp[empty]))
 
 
 class TestRaggedWriteGuards:
@@ -1754,7 +1871,9 @@ class TestMultiChunkWorker:
         from zagg.config import default_config
 
         cfg = default_config("atl06")
-        grid = {"type": "healpix", "parent_order": 6, "child_order": 8}
+        # sharded:false pins the unsharded per-inner-chunk worker path this class
+        # exercises (issue #30 item 3) now that sharded defaults True (issue #215).
+        grid = {"type": "healpix", "parent_order": 6, "child_order": 8, "sharded": False}
         if chunk_inner is not None:
             grid["chunk_inner"] = chunk_inner
         cfg.output["grid"] = grid
@@ -1896,6 +2015,7 @@ class TestMultiChunkWorker:
             "parent_order": 6,
             "chunk_inner": 7,
             "child_order": 8,
+            "sharded": False,  # unsharded per-inner-chunk path (issue #215 default is True)
         }
         cfg.aggregation["chunk_precompute"] = {
             "anchor": {"expression": "np.float32(np.min(h_li))", "source": "h_li"}
@@ -1981,6 +2101,7 @@ class TestMultiChunkWorker:
             "parent_order": 6,
             "chunk_inner": 7,
             "child_order": 8,
+            "sharded": False,  # unsharded per-inner-chunk path (issue #215 default is True)
         }
         # gain/offset basis case: the anchor is min(h_li) over the chunk.
         cfg.aggregation["chunk_precompute"] = {
@@ -2049,6 +2170,7 @@ class TestMultiChunkWorker:
             "parent_order": 6,
             "chunk_inner": 7,
             "child_order": 8,
+            "sharded": False,  # unsharded per-inner-chunk path (issue #215 default is True)
         }
         cfg.aggregation["chunk_precompute"] = {
             "anchor": {"expression": "np.float32(np.min(h_li))", "source": "h_li"}

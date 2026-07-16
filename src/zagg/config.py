@@ -340,9 +340,10 @@ def validate_config(config: PipelineConfig) -> None:
     # Optional store layout (issue #199 phase 2): "flat" (default, today's single
     # shared store) or "hive" (one leaf zarr per shard under a morton digit tree —
     # docs/design/sparse_coverage.md D1-D6). Hive ids are morton decimal strings,
-    # so the layout is HEALPix-only; the sharded (ShardingCodec) write path and
-    # metadata consolidation both assume the single shared store, so they are
-    # rejected with hive rather than silently mis-writing.
+    # so the layout is HEALPix-only; metadata consolidation assumes the single
+    # shared store, so it is rejected with hive rather than silently mis-writing.
+    # Sharded (ShardingCodec) output works on BOTH layouts (issue #236) and is
+    # the K>1 default on both.
     store_layout = config.output.get("store_layout")
     if store_layout is not None and store_layout not in ("flat", "hive"):
         raise ValueError(f"output.store_layout must be 'flat' or 'hive' (got {store_layout!r})")
@@ -351,12 +352,6 @@ def validate_config(config: PipelineConfig) -> None:
             raise ValueError(
                 "output.store_layout: hive requires a healpix grid (hive node names "
                 f"are morton decimal digits; grid type is {(grid or {}).get('type')!r})"
-            )
-        if (grid or {}).get("sharded"):
-            raise ValueError(
-                "output.store_layout: hive does not support sharded (ShardingCodec) "
-                "output yet — each hive leaf is a vanilla zarr v3 store (D3); drop "
-                "sharded or use the flat layout"
             )
         if consolidate_metadata:
             raise ValueError(
@@ -1751,33 +1746,19 @@ def get_layout(config: PipelineConfig) -> str:
     return config.output.get("grid", {}).get("layout", "fullsphere")
 
 
-def get_sharded(config: PipelineConfig) -> bool:
+def get_sharded(config: PipelineConfig, default: bool = False) -> bool:
     """Return whether the output grid uses ShardingCodec storage (issue #108).
 
     The ``sharded`` knob lives on the grid/chunk block next to ``chunk_inner``
-    (mirroring its accessor), default ``False``. When ``True`` the grid bundles a
-    dispatch shard's K inner chunks into one zarr shard object instead of K
-    independent regular chunk objects; it is only valid when ``chunk_inner`` gives
-    K>1 (the grid raises otherwise, validated before deployment).
+    (mirroring its accessor). When ``True`` the grid bundles a dispatch shard's K
+    inner chunks into one zarr shard object instead of K independent regular chunk
+    objects; a K==1 grid has nothing to bundle, so the grid silently no-ops it
+    (issue #215). ``default`` is the value returned when the flag is omitted —
+    ``False`` here, but ``from_config`` passes ``True`` for HEALPix output on
+    both store layouts (issue #215 flat, issue #236 hive: a missing flag should
+    not cost the ~K-fold object blow-up).
     """
-    return bool(config.output.get("grid", {}).get("sharded", False))
-
-
-def get_shard_order(config: PipelineConfig) -> int | None:
-    """Return the sharding-OBJECT order from the output grid config (issue #133 phase 8).
-
-    ``shard_order`` decouples the ShardingCodec object from the dispatch shard: an
-    order in ``[parent_order, chunk_inner]`` sizes each sharding object — at
-    ``parent_order`` (or ``None``) one object spans the whole dispatch shard (today's
-    byte-identical write), and a finer order (``> parent_order``) makes each object
-    smaller so the worker writes its region in per-object passes (bounding peak memory
-    under the 2 GB cap on large/dense shards).
-    ``None`` (default) keeps one object per dispatch shard — today's behavior, a
-    byte-identical write. Only meaningful when ``sharded`` is True (the grid raises
-    otherwise, validated before deployment).
-    """
-    val = config.output.get("grid", {}).get("shard_order")
-    return None if val is None else int(val)
+    return bool(config.output.get("grid", {}).get("sharded", default))
 
 
 def get_cell_ids_encoding(config: PipelineConfig) -> str:
