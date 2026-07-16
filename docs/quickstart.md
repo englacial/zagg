@@ -159,7 +159,7 @@ inner chunks bundled into one object per array — see
 An explicit `output.store_layout: flat` (the single shared zarr store) remains
 for interop/debug but is deprecated — removal is tracked in
 [issue #251](https://github.com/englacial/zagg/issues/251). Rectilinear grids
-keep the flat shared store.
+and raster pipelines keep the flat shared store.
 
 See `src/zagg/configs/atl06.yaml` for a complete example and the
 [custom aggregations notebook](https://github.com/englacial/zagg/blob/main/notebooks/custom_aggregations.ipynb)
