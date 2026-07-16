@@ -871,7 +871,14 @@ def _handle_process_raster(event: Dict[str, Any]) -> Dict[str, Any]:
         )
 
         config = load_config_from_dict(event["config"])
-        grid = from_config(config)
+        try:
+            grid = from_config(config)
+        except ValueError as e:
+            # Fail fast with a clean 400 on an invalid grid config (e.g. a
+            # stale layout: dense, removed in issue #88) instead of a retried
+            # 500 (review fold, PR #257).
+            logger.error(str(e))
+            return {"statusCode": 400, "body": json.dumps({"error": str(e)})}
 
         shard_key = int(event["shard_key"])
         time_index = {k: int(v) for k, v in event["time_index"].items()}
