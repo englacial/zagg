@@ -876,6 +876,7 @@ def _handle_process_raster(event: Dict[str, Any]) -> Dict[str, Any]:
         from zagg.config import get_layout
         from zagg.grids import from_config
         from zagg.processing.raster import (
+            new_stage_stats,
             process_raster_shard,
             write_raster_coords,
             write_raster_slab,
@@ -906,10 +907,15 @@ def _handle_process_raster(event: Dict[str, Any]) -> Dict[str, Any]:
         # remainder — the split the PR #232 double-buffer decision needs
         # measured. Exact at write_buffer=1 (writes serialize in the loop);
         # at write_buffer>1 writes overlap sampling, so the remainder is
-        # approximate — A/B on ``duration_s`` instead. Default (no
-        # ``profile`` key) emits nothing: the body stays byte-identical.
+        # approximate — A/B on ``duration_s`` instead. ``stages`` (issue
+        # #249) splits the sample bucket into per-stage work volumes +
+        # counts — attribution, not a wall decomposition: concurrent samples
+        # overlap, so stage sums can exceed ``sample`` (see
+        # ``new_stage_stats``). Default (no ``profile`` key) emits nothing:
+        # the body stays byte-identical and the sample path times nothing.
         profile = bool(event.get("profile"))
         write_s = 0.0
+        stage_stats = new_stage_stats() if profile else None
 
         def _write_slab(t_idx: int, slab: dict) -> None:
             nonlocal wrote, write_s
@@ -928,6 +934,7 @@ def _handle_process_raster(event: Dict[str, Any]) -> Dict[str, Any]:
             region=source.get("source_region"),
             anonymous=source.get("anonymous", True),
             on_slab=_write_slab,
+            stage_stats=stage_stats,
         )
         if wrote:
             write_raster_coords(store, grid, shard_key)
@@ -945,7 +952,11 @@ def _handle_process_raster(event: Dict[str, Any]) -> Dict[str, Any]:
         }
         if profile:
             total = time.time() - start_time
-            body["phase_timings"] = {"sample": total - write_s, "write": write_s}
+            body["phase_timings"] = {
+                "sample": total - write_s,
+                "write": write_s,
+                "stages": stage_stats,
+            }
         return {"statusCode": 200, "body": json.dumps(body)}
     except Exception as e:
         logger.error(f"raster worker failed: {e}", exc_info=True)

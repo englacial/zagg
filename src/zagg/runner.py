@@ -608,6 +608,7 @@ class RasterStrategy:
     ):
         from zagg.processing.raster import (
             emit_raster_template,
+            new_stage_stats,
             process_raster_shard,
             raster_time_index,
             write_raster_coords,
@@ -686,6 +687,11 @@ class RasterStrategy:
         def _one(pair):
             shard_key, granules = pair
             wrote = False
+            # Per-stage sample profiling (issue #249), the local flavor of the
+            # lambda handler's opt-in ``profile`` key: allocated only when
+            # debug logging is on, so the default path passes None and the
+            # sample path times nothing.
+            stage_stats = new_stage_stats() if logger.isEnabledFor(logging.DEBUG) else None
 
             def _write_slab(t_idx, slab):
                 nonlocal wrote
@@ -701,10 +707,15 @@ class RasterStrategy:
                 config,
                 time_index,
                 on_slab=_write_slab,
+                stage_stats=stage_stats,
                 **src_kwargs,
             )
             if wrote:
                 write_raster_coords(zarr_store, grid, int(shard_key))
+            if stage_stats is not None:
+                logger.debug(
+                    f"raster shard {shard_label(grid, int(shard_key))} stages: {stage_stats}"
+                )
             return meta
 
         with ThreadPoolExecutor(max_workers=max_workers) as pool:

@@ -200,7 +200,7 @@ class TestRasterPhaseTimings:
         assert resp["statusCode"] == 200, resp
         body = json.loads(resp["body"])
         pt = body["phase_timings"]
-        assert set(pt) == {"sample", "write"}
+        assert set(pt) == {"sample", "write", "stages"}
         assert pt["write"] > 0.0
         assert pt["sample"] + pt["write"] == pytest.approx(body["duration_s"], rel=0.05)
 
