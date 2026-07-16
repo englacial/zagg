@@ -156,6 +156,16 @@ Resources:
                 Effect: Allow
                 Action: s3:GetObject
                 Resource: !Sub "arn:aws:s3:::${BenchmarkStoreBucket}/*"
+              # Object-count metric (issue #240/#242): the harness LISTs the
+              # output store after each run to count objects (sharded-write
+              # bypass guard). Scoped to the benchmark prefix.
+              - Sid: ListBenchmarkStore
+                Effect: Allow
+                Action: s3:ListBucket
+                Resource: !Sub "arn:aws:s3:::${BenchmarkStoreBucket}"
+                Condition:
+                  StringLike:
+                    s3:prefix: "zagg-bench/*"
 
   # --- tier-2 test-deploy role (issue #25 §9) --------------------------------
   DeployRole:
