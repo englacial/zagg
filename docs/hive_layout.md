@@ -75,12 +75,9 @@ one whole-leaf object regardless
 leaf is byte-identical either way).
 
 Validation rejects `hive` with a rectilinear grid (node names are morton
-digits), with `grid.shard_order` (the flat layout's ShardingCodec object
-split, [issue #133](https://github.com/englacial/zagg/issues/133) — a hive
-leaf's arrays are one whole-leaf object each; unrelated to the manifest's
-`shard_order` field below, which records the dispatch/tree order), and with
-`consolidate_metadata: true` (there is no store-root zarr hierarchy to
-consolidate — D5/D12).
+digits) and with `consolidate_metadata: true` (there is no store-root zarr
+hierarchy to consolidate — D5/D12). (The manifest's `shard_order` field below
+records the dispatch/tree order — it is not a config knob.)
 
 ## The manifest (`morton_hive.json`)
 
