@@ -1456,7 +1456,9 @@ class TestInvokeLambdaPingEvent:
     #252, replacing the PR #205 layout-echo guard): the ping carries the same
     manifest inputs as hive finalize, and any non-200 — a stale function's
     process-handler 400 fall-through, or the handler's validate_manifest
-    refusal — raises before a single worker is dispatched."""
+    refusal — raises before a single worker is dispatched. The two modes get
+    distinct remedies: a 400 without ``mode: "ping"`` says redeploy, a 500
+    that echoes ``mode: "ping"`` says clear the store root."""
 
     @staticmethod
     def _invoke(client, config_dict, **kw):
@@ -1501,9 +1503,11 @@ class TestInvokeLambdaPingEvent:
 
     def test_validate_refusal_fails_fast(self, cfg):
         # The handler's read-only validate_manifest refusal (frozen-key
-        # mismatch, D2) surfaces the same way: pre-fan-out, run aborted.
+        # mismatch, D2) surfaces pre-fan-out with the store remedy, not
+        # redeploy: the 500 body echoes mode="ping", so the message points at
+        # clearing the store root rather than a stale deployment.
         cfg.output["store_layout"] = "hive"
-        with pytest.raises(RuntimeError, match="Lambda ping failed"):
+        with pytest.raises(RuntimeError, match="clear the store root"):
             self._invoke(
                 _wire_client(
                     {"error": "morton_hive.json ... does not match this run", "mode": "ping"},
