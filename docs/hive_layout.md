@@ -1,11 +1,13 @@
-# Hive store layout (morton-hive/1)
+# Hive store layout (morton-hive/1, /2)
 
 zagg can write each dispatch shard as its **own self-describing leaf zarr**
 under a morton digit tree, instead of into one shared flat store. The layout is
 the write-side half of the sparse-coverage design record
 ([`docs/design/sparse_coverage.md`](design/sparse_coverage.md) §2–§3, decisions
 D1–D6); the convention itself is owned by the mortie spec and versioned as
-`morton-hive/1`.
+`morton-hive/1`. A store that declares a **time-window schedule** (D13–D15,
+[Time windows](#time-windows-morton-hive2) below) is `morton-hive/2` — a
+strict superset: a `/1` store *is* a `/2` store with `schedule: none`.
 
 It is opt-in (default `flat`, today's single shared store) and wired to
 **both backends** — the local runner and the Lambda handler share the same
@@ -18,6 +20,7 @@ per-shard write path (see [Status](#status)).
   morton_hive.json               <- static manifest (root-only exception)
   {sign+base}/{d1}/.../{d_n}/    <- one decimal digit per level (D2)
     {full_id}.zarr/              <- vanilla zarr v3 leaf, one per shard (D3)
+    {full_id}_{window}.zarr/     <- time-windowed leaf (D13, morton-hive/2)
 ```
 
 - **Ids are morton decimal strings** (D1): sign + base digit (`1..6` /
@@ -79,6 +82,73 @@ digits) and with `consolidate_metadata: true` (there is no store-root zarr
 hierarchy to consolidate — D5/D12). (The manifest's `shard_order` field below
 records the dispatch/tree order — it is not a config knob.)
 
+## Time windows (morton-hive/2)
+
+A store may partition each shard's time series into **one write-once leaf per
+window** ([issue #246](https://github.com/englacial/zagg/issues/246), design
+D13–D15; grammar and boundary semantics frozen on the
+[mortie spec page](https://github.com/espg/mortie/issues/62#issuecomment-4986809092)).
+Windowed leaves keep full D4/D5 semantics — stamped, binary debris, zero
+shared state — so **backfill** is just a new earlier-window leaf, concurrent
+runs on different windows share no object, and the window is the unit of
+idempotent reprocessing (re-dispatching a window replaces its leaf wholesale).
+
+```yaml
+output:
+  store_layout: hive
+  windowing:                        # absent = schedule none = morton-hive/1
+    schedule: yearly                # none | yearly | monthly | daily | explicit
+    time_field: delta_time          # per-observation timestamp column
+                                    #   (a declared data_source column)
+    epoch: "2018-01-01T00:00:00Z"   # dataset zero as an ISO-8601 UTC instant
+    scale: gps                      # utc (default) | gps | tai
+    units: seconds                  # seconds (default) | days
+    windows:                        # explicit schedule only:
+      - {label: melt-2019, start: "2019-06-01", end: "2019-09-01"}
+      - {label: melt-2020, start: "2020-06-01", end: "2020-09-01"}
+```
+
+- **Leaf naming is frozen**: `{full_id}_{window}.zarr`, underscore separator,
+  parse by splitting on the FIRST `_`. Generative labels are ISO-derived and
+  hyphen-free (`2025`, `202511`, `20251103`), so lexicographic order =
+  chronological order; explicit labels are opaque (`[0-9A-Za-z-]{1,32}`) and
+  decode only through the declared list. `quarterly` is grammar-reserved but
+  not implemented (validation rejects it).
+- **Boundaries are UTC calendar terms, half-open `[start, end)`.** Window
+  bounds are converted to dataset units once at dispatch, using the declared
+  `epoch`/`scale`/`units` and a fixed scale offset (`GPS−UTC = 18 s`,
+  `TAI−UTC = 37 s`; stdlib `datetime` has no leap-second table) — boundaries
+  are accurate to ≤ 1 leap second, none declared since 2017.
+- **Dispatch fans one work unit per (shard, window).** The ShardMap's
+  per-granule `time_start`/`time_end` subset granules per window; inside the
+  worker an observation-level filter on `time_field` (a pair of structured
+  `ge`/`lt` predicates riding the ordinary filter machinery) splits
+  boundary-straddling granules exactly — an observation on a boundary instant
+  belongs to the *later* window. Legacy shardmaps without granule times
+  dispatch every granule to every window (the filter keeps it correct) and
+  need `bounds.temporal` to enumerate generative windows.
+- **Stamps carry the truth, the manifest the schema** (D15): each windowed
+  leaf's commit stamp records its `window` label and the ACTUAL written
+  `time_range` as ISO-8601 UTC strings; the root `coverage.moc` summary
+  carries the run's time-range union (cache, regenerable); temporal *extent*
+  never lives in the manifest, which stays write-once. Appending a new year
+  to a `yearly` store adds leaves the schedule already describes — no
+  manifest touch; the explicit list is the noted exception (appending outside
+  it re-templates).
+- **Coverage gains `encoding: "full"`** (D14): a popcount at stamp time marks
+  a fully-occupied subtree — no bitmap sidecar object is written, and readers
+  short-circuit the exact intersection through the shard's own MOC
+  membership. Partial shards keep the bitmap sidecar.
+
+Validation: `output.windowing` requires the hive layout on a healpix grid;
+`time_field` must be a declared `data_source` column (the worker can only
+filter what it reads); explicit windows must be well-formed (frozen label
+grammar, `start < end`, unique labels, disjoint ranges). Raster pipelines
+reject the block
+([issue #247](https://github.com/englacial/zagg/issues/247) tracks raster
+windowing). Changing the windowing of an existing store fails the frozen-key
+manifest check like an orders change — clear the root first.
+
 ## The manifest (`morton_hive.json`)
 
 Written **once at template time**, before any shard dispatches; never touched
@@ -102,9 +172,15 @@ order) but recorded explicitly for forward compatibility. `pyramid` is
 declared-only in round one: overview zarrs are generated by a later
 post-process sweep (D11), never at fan-out time.
 
+A windowed store ([Time windows](#time-windows-morton-hive2)) additionally
+declares `spec: "morton-hive/2"` and a `temporal` block — schedule,
+`time_field`, `epoch`/`scale`/`units`/`calendar`, the explicit windows list,
+and the append policy. Temporal *extent* is deliberately not manifest data
+(D15): actual ranges live on leaf stamps (truth) and the root summary (cache).
+
 A rerun into an existing root verifies the manifest's **frozen keys** match
 the run's own configuration (`spec`, `dataset`, `cell_order`, `shard_order`,
-`split_schedule`) and fails loudly on a mismatch — the hive analogue of the
+`split_schedule`, `temporal`) and fails loudly on a mismatch — the hive analogue of the
 flat layout's shard-map signature guard. The sweep-mutable `pyramid` block and
 the `generated_at` timestamp are deliberately excluded, so a swept store still
 resumes (and the sweep's pyramid declaration is preserved, not clobbered).
@@ -147,6 +223,9 @@ leaf is created lazily on the first chunk write).
 The stamp also carries the shard's **coverage envelope** — see
 [Coverage](#coverage) below. The sidecar it points to is written before the
 stamp, so coverage shares the debris semantics: no stamp, no visible coverage.
+A windowed leaf's stamp ([Time windows](#time-windows-morton-hive2)) declares
+`spec: "morton-hive/2"` and adds `window` (the label) plus `time_range` — the
+actual `[t_min, t_max]` written, as ISO-8601 UTC strings.
 
 ## Coverage
 

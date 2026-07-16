@@ -1100,6 +1100,117 @@ class TestProcessHive:
         assert not os.path.exists(hive.shard_leaf_path(event["store_path"], self._WORD))
 
 
+class TestProcessHiveWindowed:
+    """Issue #246: a windowed hive event threads ``window`` through the shared
+    ``process_and_write_hive`` path — windowed leaf, filter injection, ISO
+    ``time_range`` in the response body — and the setup invoke declares the
+    ``morton-hive/2`` manifest from the same forwarded config."""
+
+    @staticmethod
+    def _windowed_config_dict():
+        cfg_dict = TestProcessHive._hive_config_dict()
+        cfg_dict["data_source"]["variables"]["delta_time"] = "/{group}/land_ice_segments/delta_time"
+        cfg_dict["output"]["windowing"] = {
+            "schedule": "yearly",
+            "time_field": "delta_time",
+            "epoch": "2018-01-01T00:00:00Z",
+            "scale": "gps",
+        }
+        return cfg_dict
+
+    def test_windowed_event_writes_windowed_leaf_with_time_range(
+        self, handler_mod, monkeypatch, tmp_path
+    ):
+        import zagg.processing as processing
+        from zagg import hive
+        from zagg.config import load_config_from_dict
+        from zagg.store import open_store
+
+        cfg_dict = self._windowed_config_dict()
+        grid = from_config(load_config_from_dict(cfg_dict))
+        seen = {}
+
+        def fake(g, shard_key, urls, **kwargs):
+            seen["filters"] = kwargs["config"].data_source["filters"]
+            seen["time_range_of"] = kwargs.get("time_range_of")
+            carrier = TestProcessHive._carrier(grid, shard_key)
+            kwargs["write_chunk"](grid.block_index(int(shard_key)), carrier, {})
+            return pd.DataFrame(), {
+                "shard_key": int(shard_key),
+                "cells_with_data": 5,
+                "total_obs": 7,
+                "granule_count": 1,
+                "files_processed": 1,
+                "duration_s": 0.0,
+                "error": None,
+                # Dataset units (GPS s since 2018-01-01): days 425 and 695.
+                "time_range": [425 * 86400.0, 695 * 86400.0],
+            }
+
+        monkeypatch.setattr(processing, "process_shard", fake)
+        event = _base_event(cfg_dict)
+        event["shard_key"] = TestProcessHive._WORD
+        event["child_order"] = 12
+        event["store_path"] = str(tmp_path / "hive-out")
+        event["window"] = {"label": "2019", "start": 365 * 86400.0, "end": 730 * 86400.0}
+        resp = handler_mod._handle_process(event, _context())
+        assert resp["statusCode"] == 200, resp["body"]
+
+        # The injected window filter pair reached the worker's config.
+        assert [f["op"] for f in seen["filters"][-2:]] == ["ge", "lt"]
+        assert seen["time_range_of"] == "delta_time"
+        # The leaf is the WINDOWED name; its stamp carries the D15 truth.
+        leaf = hive.shard_leaf_path(event["store_path"], TestProcessHive._WORD, window="2019")
+        stamp = hive.read_commit(open_store(leaf))
+        assert stamp["window"] == "2019"
+        assert stamp["time_range"] == [
+            "2019-03-02T00:00:00+00:00",
+            "2019-11-27T00:00:00+00:00",
+        ]
+        # The response body mirrors the ISO strings for the dispatcher's
+        # root-summary union.
+        assert json.loads(resp["body"])["time_range"] == stamp["time_range"]
+
+    def test_unwindowed_event_stays_bare(self, handler_mod, monkeypatch, tmp_path):
+        import zagg.processing as processing
+        from zagg import hive
+        from zagg.store import open_store
+
+        grid = TestProcessHive._grid()
+        monkeypatch.setattr(
+            processing,
+            "process_shard",
+            TestProcessHive()._streaming_fake(grid),
+        )
+        event = TestProcessHive()._event(tmp_path)
+        resp = handler_mod._handle_process(event, _context())
+        assert resp["statusCode"] == 200, resp["body"]
+        stamp = hive.read_commit(
+            open_store(hive.shard_leaf_path(event["store_path"], TestProcessHive._WORD))
+        )
+        assert stamp["spec"] == "morton-hive/1"
+        assert "window" not in stamp and "time_range" not in stamp
+        assert "time_range" not in json.loads(resp["body"])
+
+    def test_setup_declares_v2_manifest(self, handler_mod, tmp_path):
+        from zagg import hive
+
+        event = {
+            "mode": "setup",
+            "store_path": str(tmp_path / "hive-out"),
+            "parent_order": 6,
+            "overwrite": False,
+            "config": self._windowed_config_dict(),
+            "dataset": {"short_name": "ATL06", "version": "007"},
+        }
+        resp = handler_mod._handle_setup(event)
+        assert resp["statusCode"] == 200, resp["body"]
+        manifest = hive.read_manifest(event["store_path"])
+        assert manifest["spec"] == "morton-hive/2"
+        assert manifest["temporal"]["schedule"] == "yearly"
+        assert manifest["temporal"]["time_field"] == "delta_time"
+
+
 class TestSetupHive:
     """Issue #199 phase 3: for a hive config, setup mode writes ONLY the
     ``morton_hive.json`` manifest — no global zarr template (D5) — with the

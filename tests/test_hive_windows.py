@@ -1296,3 +1296,191 @@ class TestShardMapTimeMetadata:
         # Legacy records without the keys stay byte-identical.
         legacy = {"id": "g", "s3": "s3://b/g.h5", "https": "https://h/g.h5"}
         assert _granule_entry(legacy) == legacy
+
+
+# ── yearly end-to-end: real read path, observation-level split (phase 6) ─────
+
+
+class _FakeH5:
+    """Stub h5coro object (the ``test_processing`` filter-fixture pattern):
+    ``readDatasets`` returns canned arrays by path, honoring hyperslices."""
+
+    def __init__(self, arrays):
+        self._arrays = arrays
+
+    def readDatasets(self, datasets):  # noqa: N802 (mirror real h5coro API)
+        out = {}
+        for d in datasets:
+            if isinstance(d, str):
+                out[d] = self._arrays[d]
+                continue
+            arr = self._arrays[d["dataset"]]
+            hs = d["hyperslice"]
+            if hs:
+                lo, hi = hs[0]
+                arr = arr[lo:hi]
+            out[d["dataset"]] = arr
+        return out
+
+
+class TestYearlyEndToEnd:
+    """The acceptance fixture (issue #246): a yearly windowed run over three
+    granules — one per year plus a boundary straddler — driven through the
+    REAL read path (``_read_group`` applies the injected window filters; only
+    the h5coro transport is faked), asserting observation-level splitting,
+    stamp truth, backfill, idempotent re-run, and the root time union."""
+
+    DAY = 86400.0
+    SHARD_DECIMAL = "-5112333"
+
+    def _cfg(self):
+        cfg = default_config("atl06")
+        cfg.data_source = {
+            "reader": "h5coro",
+            "driver": "s3",
+            "groups": ["g1"],
+            "coordinates": {"latitude": "/lat", "longitude": "/lon"},
+            "variables": {"h_li": "/h", "s_li": "/s", "delta_time": "/dt"},
+        }
+        cfg.output["store_layout"] = "hive"
+        cfg.output["windowing"] = {
+            "schedule": "yearly",
+            "time_field": "delta_time",
+            "epoch": "2018-01-01T00:00:00Z",  # ATLAS SDP epoch
+            "scale": "gps",
+        }
+        validate_config(cfg)
+        return cfg
+
+    def _fakes(self):
+        """Three granules in dataset units (GPS days since 2018-01-01):
+
+        - gA: [300, 400, 401, 402] — one 2018 obs (backfill bait) + three 2019
+        - gB: [800, 801, 802] — all 2020
+        - gC: [729.5, 729.75, 730.25, 730.5] — straddles the 2019/2020 boundary
+          (2020-01-01 = day 730)
+        """
+        import numpy as np
+
+        def h5(days):
+            n = len(days)
+            return _FakeH5(
+                {
+                    "/lat": np.full(n, -78.5),
+                    "/lon": np.full(n, -132.0),
+                    "/h": np.arange(n, dtype=np.float32),
+                    "/s": np.ones(n, dtype=np.float32),
+                    "/dt": np.asarray(days, dtype=np.float64) * self.DAY,
+                }
+            )
+
+        return {
+            "s3://bucket/granuleA.h5": h5([300.0, 400.0, 401.0, 402.0]),
+            "s3://bucket/granuleB.h5": h5([800.0, 801.0, 802.0]),
+            "s3://bucket/granuleC.h5": h5([729.5, 729.75, 730.25, 730.5]),
+        }
+
+    def _records(self):
+        return [
+            _timed_rec("A", "2018-10-28T00:00:00Z", "2019-02-07T00:00:00Z"),
+            _timed_rec("B", "2020-03-10T00:00:00Z", "2020-03-13T00:00:00Z"),
+            _timed_rec("C", "2019-12-31T12:00:00Z", "2020-01-01T12:00:00Z"),
+        ]
+
+    def _patch(self, monkeypatch, fakes):
+        from zagg.index.hierarchical import HierarchicalIndex
+
+        monkeypatch.setattr("zagg.processing.h5coro.H5Coro", lambda path, *a, **k: fakes[path])
+        monkeypatch.setattr("zagg.processing._make_url_rewriter", lambda driver: lambda u: u)
+        monkeypatch.setattr(
+            "zagg.processing.worker.index_from_config", lambda cfg: HierarchicalIndex()
+        )
+
+    def _run_units(self, monkeypatch, cfg, root, labels=None):
+        from zagg.config import get_windowing
+        from zagg.runner import _windowed_units
+
+        grid = HealpixGrid(parent_order=6, child_order=8, layout="fullsphere", config=cfg)
+        shard = _shard_word()
+        self._patch(monkeypatch, self._fakes())
+        units = _windowed_units([(shard, self._records())], get_windowing(cfg), None)
+        results = {}
+        for shard_key, records, window in units:
+            if labels is not None and window["label"] not in labels:
+                continue
+            urls = [r["s3"] for r in records]
+            results[window["label"]] = hive.process_and_write_hive(
+                shard_key, urls, grid, {}, root, cfg, store_kwargs={}, window=window
+            )
+        return grid, shard, results
+
+    def _leaf_obs(self, root, shard, label, grid):
+        import numpy as np
+        import zarr
+
+        from zagg.store import open_store
+
+        leaf = hive.shard_leaf_path(root, shard, window=label)
+        grp = zarr.open_group(open_store(leaf), path=grid.group_path, mode="r", zarr_format=3)
+        return int(np.asarray(grp["count"][:]).sum())
+
+    def test_boundary_straddling_observations_split_exactly(self, monkeypatch, cfg, tmp_path):
+        from zagg.store import open_store
+
+        root = str(tmp_path / "store")
+        c = self._cfg()
+        grid, shard, results = self._run_units(monkeypatch, c, root)
+        # Enumerated from the granule spans: 2018 (gA's early obs), 2019, 2020.
+        assert sorted(results) == ["2018", "2019", "2020"]
+
+        # Observation-level split on delta_time (the injected ge/lt filters):
+        # 2018 gets gA's single early obs; 2019 gets gA's three + gC's two
+        # pre-boundary obs; 2020 gets gB's three + gC's two post-boundary obs.
+        assert self._leaf_obs(root, shard, "2018", grid) == 1
+        assert self._leaf_obs(root, shard, "2019", grid) == 5
+        assert self._leaf_obs(root, shard, "2020", grid) == 5
+
+        # Stamp truth (D15): window label + the ACTUAL ISO-UTC extent of what
+        # was written, strictly inside the window's half-open range.
+        stamp = hive.read_commit(open_store(hive.shard_leaf_path(root, shard, window="2019")))
+        assert stamp["spec"] == "morton-hive/2"
+        assert stamp["window"] == "2019"
+        # day 400 = 2019-02-05; day 729.75 = 2019-12-31T18:00 (gC's last 2019 obs).
+        assert stamp["time_range"] == ["2019-02-05T00:00:00+00:00", "2019-12-31T18:00:00+00:00"]
+        # Boundary membership: the 2020 leaf STARTS at day 730.25 (06:00), not
+        # at the boundary instant — half-open windows, no double-counting.
+        stamp20 = hive.read_commit(open_store(hive.shard_leaf_path(root, shard, window="2020")))
+        assert stamp20["time_range"][0] == "2020-01-01T06:00:00+00:00"
+        # Per-unit granule subsetting reached the worker: 2019 read gA + gC.
+        assert stamp["granule_count"] == 2
+
+    def test_backfill_then_root_union_and_idempotent_rerun(self, monkeypatch, cfg, tmp_path):
+        import os
+
+        from zagg.coverage import refresh_root_coverage
+        from zagg.store import open_store
+
+        root = str(tmp_path / "store")
+        c = self._cfg()
+        # Later windows land first...
+        grid, shard, _ = self._run_units(monkeypatch, c, root, labels={"2019", "2020"})
+        leaf_2019 = hive.shard_leaf_path(root, shard, window="2019")
+        stamped_at = hive.read_commit(open_store(leaf_2019))["written_at"]
+        # ...then BACKFILL the earlier window: a new leaf appears next to the
+        # committed ones, which are untouched (D13 — no resize, no rewrite).
+        grid, shard, _ = self._run_units(monkeypatch, c, root, labels={"2018"})
+        assert os.path.exists(hive.shard_leaf_path(root, shard, window="2018"))
+        assert hive.read_commit(open_store(leaf_2019))["written_at"] == stamped_at
+
+        # Idempotent window re-run (D13): same window again is wholesale
+        # replacement, same content.
+        grid, shard, _ = self._run_units(monkeypatch, c, root, labels={"2019"})
+        assert self._leaf_obs(root, shard, "2019", grid) == 5
+
+        # The rebuilt root summary unions the three stamps' time ranges:
+        # day 300 = 2018-10-28 .. day 802 = 2020-03-13.
+        from zagg.config import get_windowing
+
+        hive.ensure_manifest(root, hive.build_manifest(grid, windowing=get_windowing(c)))
+        env = refresh_root_coverage(root)
+        assert env["time_range"] == ["2018-10-28T00:00:00+00:00", "2020-03-13T00:00:00+00:00"]
