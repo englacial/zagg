@@ -1576,6 +1576,115 @@ class TestWriteLeafToZarr:
             leaf_arr = zarr.open_array(leaf, path=f"{grid.group_path}/{name}", mode="r")
             np.testing.assert_array_equal(flat_arr[base : base + grid.cells_per_shard], leaf_arr[:])
 
+    @staticmethod
+    def _companion_vector_setup(seed=3, width=3):
+        """A sharded K=16 grid whose config adds a ``kind: vector`` field and a
+        ``resolution: chunk`` companion to the dense ``h_min``, with hand-built
+        arro3 carriers on the populated inner chunks (the companion column is
+        chunk-uniform; every 4th inner chunk stays empty)."""
+        from arro3.core import Array, Table, fixed_size_list_array
+        from mortie import geo2mort
+
+        from zagg.config import PipelineConfig
+
+        cfg = PipelineConfig(
+            data_source={"groups": ["g"]},
+            aggregation={
+                "chunk_precompute": {
+                    "chunk_anchor": {"expression": "np.float32(0.0)", "source": "h_li"}
+                },
+                "variables": {
+                    "h_min": {"function": "min", "source": "h_li", "dtype": "float32"},
+                    "h_edges": {
+                        "kind": "vector",
+                        "trailing_shape": width,
+                        "expression": "np.zeros(3)",
+                        "source": "h_li",
+                        "dtype": "float32",
+                    },
+                    "h_anchor": {
+                        "expression": "chunk_anchor",
+                        "source": "h_li",
+                        "resolution": "chunk",
+                        "dtype": "float32",
+                    },
+                },
+            },
+        )
+        grid = HealpixGrid(4, 8, layout="fullsphere", config=cfg, chunk_inner=6, sharded=True)
+        shard_key = int(geo2mort(-78.5, -132.0, order=4)[0])
+        shard_block = grid.block_index(shard_key)[0]
+        rng = np.random.default_rng(seed)
+        n = grid.cells_per_chunk
+        chunk_results: list = []
+        expected: dict = {}
+        for block, _children in grid.iter_chunks(shard_key):
+            local = int(block[0]) - shard_block * grid.chunks_per_shard
+            if local % 4 == 3:
+                chunk_results.append((block, pd.DataFrame(), {}))  # empty inner chunk
+                continue
+            h_min = rng.standard_normal(n).astype(np.float32)
+            h_edges = rng.standard_normal((n, width)).astype(np.float32)
+            anchor = np.float32(local)  # one value per chunk (chunk-uniform)
+            carrier = Table.from_pydict(
+                {
+                    "h_min": Array.from_numpy(np.ascontiguousarray(h_min)),
+                    "h_edges": fixed_size_list_array(
+                        Array.from_numpy(np.ascontiguousarray(h_edges).reshape(-1)), width
+                    ),
+                    "h_anchor": Array.from_numpy(np.full(n, anchor, dtype=np.float32)),
+                }
+            )
+            chunk_results.append((block, carrier, {}))
+            expected[local] = (h_min, h_edges, anchor)
+        return grid, shard_key, chunk_results, expected
+
+    def test_companion_and_vector_flat_leaf_parity(self):
+        """The vector/trailing-dim branch and the ``resolution: chunk`` companion
+        branch of ``write_leaf_to_zarr`` (the two pieces the ragged-only fixture
+        never reached): the dense vector array collapses to ONE object with
+        byte-for-byte flat parity, and the companion lands at leaf-LOCAL blocks
+        (0..K-1) of the leaf-sized companion array, matching flat's value at the
+        GLOBAL block."""
+        import zarr
+
+        from zagg.processing import write_leaf_to_zarr, write_shard_to_zarr
+
+        grid, shard_key, chunk_results, expected = self._companion_vector_setup()
+        flat = MemoryStore()
+        grid.emit_template(flat)
+        write_shard_to_zarr(chunk_results, flat, grid=grid, shard_key=shard_key)
+        leaf = self._leaf_template(grid)
+        write_leaf_to_zarr(chunk_results, leaf, grid=grid, shard_key=shard_key)
+
+        shard_block = grid.block_index(shard_key)[0]
+        base = shard_block * grid.cells_per_shard
+        # Dense scalar + vector arrays: one object each, byte-for-byte parity.
+        for name in ("h_min", "h_edges"):
+            assert len(self._data_keys(leaf, grid, name)) == 1
+            flat_arr = zarr.open_array(flat, path=f"{grid.group_path}/{name}", mode="r")
+            leaf_arr = zarr.open_array(leaf, path=f"{grid.group_path}/{name}", mode="r")
+            np.testing.assert_array_equal(flat_arr[base : base + grid.cells_per_shard], leaf_arr[:])
+
+        # The vector array carries the payload (not both-fill): each populated
+        # inner chunk's (cells, width) block lands at its leaf-local run.
+        vec = zarr.open_array(leaf, path=f"{grid.group_path}/h_edges", mode="r")[:]
+        for local, (_h_min, h_edges, _anchor) in expected.items():
+            seg = vec[local * grid.cells_per_chunk : (local + 1) * grid.cells_per_chunk]
+            np.testing.assert_array_equal(seg, h_edges)
+
+        # resolution: chunk companion — the leaf array is leaf-sized (one block
+        # per inner chunk); each populated chunk lands at its leaf-LOCAL block,
+        # matching flat's value at the GLOBAL block, empties left at fill.
+        leaf_comp = zarr.open_array(leaf, path=f"{grid.group_path}/h_anchor", mode="r")
+        flat_comp = zarr.open_array(flat, path=f"{grid.group_path}/h_anchor", mode="r")
+        assert leaf_comp.shape == (grid.chunks_per_shard,)
+        for local, (_h_min, _h_edges, anchor) in expected.items():
+            assert leaf_comp[local] == anchor
+            assert flat_comp[shard_block * grid.chunks_per_shard + local] == anchor
+        empty = sorted(set(range(grid.chunks_per_shard)) - set(expected))
+        assert np.all(np.isnan(leaf_comp[empty]))
+
 
 class TestRaggedWriteGuards:
     """The malformed-worker-output guards that replaced ``write_csr``'s checks
