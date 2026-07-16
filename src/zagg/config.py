@@ -343,8 +343,7 @@ def validate_config(config: PipelineConfig) -> None:
     # so the layout is HEALPix-only; metadata consolidation assumes the single
     # shared store, so it is rejected with hive rather than silently mis-writing.
     # Sharded (ShardingCodec) output works on BOTH layouts (issue #236) and is
-    # the K>1 default on both; only the issue #133 object split (shard_order) is
-    # flat-only — a hive leaf is one object per array by construction.
+    # the K>1 default on both.
     store_layout = config.output.get("store_layout")
     if store_layout is not None and store_layout not in ("flat", "hive"):
         raise ValueError(f"output.store_layout must be 'flat' or 'hive' (got {store_layout!r})")
@@ -353,12 +352,6 @@ def validate_config(config: PipelineConfig) -> None:
             raise ValueError(
                 "output.store_layout: hive requires a healpix grid (hive node names "
                 f"are morton decimal digits; grid type is {(grid or {}).get('type')!r})"
-            )
-        if (grid or {}).get("shard_order") is not None:
-            raise ValueError(
-                "output.store_layout: hive does not take grid.shard_order (it sizes "
-                "the flat layout's ShardingCodec object split, issue #133; a hive "
-                "leaf's arrays are one whole-leaf object each) — drop shard_order"
             )
         if consolidate_metadata:
             raise ValueError(
@@ -1766,23 +1759,6 @@ def get_sharded(config: PipelineConfig, default: bool = False) -> bool:
     not cost the ~K-fold object blow-up).
     """
     return bool(config.output.get("grid", {}).get("sharded", default))
-
-
-def get_shard_order(config: PipelineConfig) -> int | None:
-    """Return the sharding-OBJECT order from the output grid config (issue #133 phase 8).
-
-    ``shard_order`` decouples the ShardingCodec object from the dispatch shard: an
-    order in ``[parent_order, chunk_inner]`` sizes each sharding object — at
-    ``parent_order`` (or ``None``) one object spans the whole dispatch shard (today's
-    byte-identical write), and a finer order (``> parent_order``) makes each object
-    smaller so the worker writes its region in per-object passes (bounding peak memory
-    under the 2 GB cap on large/dense shards).
-    ``None`` (default) keeps one object per dispatch shard — today's behavior, a
-    byte-identical write. Only meaningful when ``sharded`` is True (the grid raises
-    otherwise, validated before deployment).
-    """
-    val = config.output.get("grid", {}).get("shard_order")
-    return None if val is None else int(val)
 
 
 def get_cell_ids_encoding(config: PipelineConfig) -> str:

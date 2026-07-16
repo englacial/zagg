@@ -7,7 +7,6 @@ import warnings
 from zagg.config import (
     PipelineConfig,
     get_child_order,
-    get_shard_order,
     get_sharded,
 )
 from zagg.grids.base import InconsistentShardError, OutputGrid, ShardKey
@@ -66,7 +65,6 @@ def from_config(
             populated_shards=populated_shards,
             chunk_inner=grid_cfg.get("chunk_inner"),
             sharded=get_sharded(config, default=True),
-            shard_order=get_shard_order(config),
         )
     if grid_type == "rectilinear":
         required = ("crs", "resolution", "bounds")

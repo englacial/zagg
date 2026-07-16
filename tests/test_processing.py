@@ -208,16 +208,17 @@ class TestWriteShardToZarr:
         assert np.isnan(grp["h_mean"][int(cell_ids[1])])
 
 
-class TestShardOrderObjectSplit:
-    """Issue #133 phase 8: ``shard_order`` decouples the ShardingCodec object from
-    the dispatch shard. The default (unset / == parent_order) keeps ONE object per
-    dispatch shard — byte-identical to the pre-phase-8 sharded write — while a finer
-    ``shard_order`` writes the dispatch region in per-object passes that reconstruct
-    the same logical array.
+class TestShardedMixedFieldKinds:
+    """The sharded whole-shard write reconstructs the SAME logical arrays as the
+    unsharded per-chunk write for a config carrying every field kind — scalar,
+    vector (trailing-dim), ``resolution: chunk`` companion, and ragged vlen
+    (issue #209) — with each sharded per-cell array collapsing to ONE object.
+    (Salvaged from the issue #133 phase-8 object-split suite when the
+    ``shard_order`` knob was removed — issue #238; the field-kind gate stays.)
 
     Small orders (parent 4 / chunk_inner 6 / child 7) so the fullsphere template +
     write run fast: K = 4^(6-4) = 16 inner chunks, cells_per_chunk 4, cells_per_shard
-    64; ``shard_order=5`` gives 4 objects/shard of 16 cells each.
+    64.
     """
 
     PARENT, INNER, CHILD = 4, 6, 7
@@ -226,23 +227,22 @@ class TestShardOrderObjectSplit:
     def _shard_key():
         from mortie import geo2mort
 
-        return int(geo2mort(-78.5, -132.0, order=TestShardOrderObjectSplit.PARENT)[0])
+        return int(geo2mort(-78.5, -132.0, order=TestShardedMixedFieldKinds.PARENT)[0])
 
-    def _grid(self, cfg, *, shard_order=None):
+    def _grid(self, cfg, *, sharded=True):
         return HealpixGrid(
             self.PARENT,
             self.CHILD,
             layout="fullsphere",
             config=cfg,
             chunk_inner=self.INNER,
-            sharded=True,
-            shard_order=shard_order,
+            sharded=sharded,
         )
 
     @staticmethod
     def _df(grid, shard_key):
-        # Cells in the first, a middle, and the last inner chunk so the written shard
-        # spans more than one sharding object once shard_order splits it.
+        # Cells in the first, a middle, and the last inner chunk so the written
+        # shard spans several distinct inner chunks of the slab.
         children = grid.children(shard_key)
         idx = [0, len(children) // 2, len(children) - 1]
         leaf = np.array([int(children[i]) for i in idx], dtype=np.uint64)
@@ -287,87 +287,27 @@ class TestShardOrderObjectSplit:
             config=grid.config,
             chunk_results=chunk_results,
         )
-        write_shard_to_zarr(chunk_results, store, grid=grid, shard_key=shard_key)
+        if getattr(grid, "sharded", False):
+            write_shard_to_zarr(chunk_results, store, grid=grid, shard_key=shard_key)
+        else:
+            for block_index, carrier, ragged in chunk_results:
+                write_dataframe_to_zarr(carrier, store, grid=grid, chunk_idx=block_index)
+                write_ragged_to_zarr(ragged, store, grid=grid, chunk_idx=block_index)
         return store
-
-    def test_default_byte_identical_to_explicit_parent_order(self, monkeypatch):
-        """Default (``shard_order`` unset) is byte-identical to ``shard_order ==
-        parent_order`` — both keep ONE object spanning the whole dispatch shard, so
-        the on-disk store bytes match exactly (the phase-8 default-safety invariant)."""
-        cfg = default_config()
-        shard_key = self._shard_key()
-        g_default = self._grid(cfg, shard_order=None)
-        g_parent = self._grid(cfg, shard_order=self.PARENT)
-        # Both keep one object per dispatch shard.
-        assert g_default.shard_objects_per_shard == 1
-        assert g_parent.shard_objects_per_shard == 1
-
-        df = self._df(g_default, shard_key)
-        s_default = self._run(g_default, shard_key, df, monkeypatch)
-        s_parent = self._run(g_parent, shard_key, df.copy(), monkeypatch)
-
-        # Byte-for-byte equal stores (same keys, same bytes).
-        assert set(s_default._store_dict) == set(s_parent._store_dict)
-        for k, v in s_default._store_dict.items():
-            assert v.to_bytes() == s_parent._store_dict[k].to_bytes(), f"store bytes differ at {k}"
-
-    def test_split_reconstructs_same_logical_array(self, monkeypatch):
-        """A finer ``shard_order`` (multiple objects per shard) reconstructs the SAME
-        logical array, value-for-value, as the single-object default."""
-        cfg = default_config()
-        shard_key = self._shard_key()
-        g_default = self._grid(cfg, shard_order=None)
-        g_split = self._grid(cfg, shard_order=5)
-        assert g_split.shard_objects_per_shard == 4
-
-        df = self._df(g_default, shard_key)
-        s_default = self._run(g_default, shard_key, df, monkeypatch)
-        s_split = self._run(g_split, shard_key, df.copy(), monkeypatch)
-
-        grp_d = open_group(store=s_default, mode="r", path=str(self.CHILD))
-        grp_s = open_group(store=s_split, mode="r", path=str(self.CHILD))
-        for name in grp_d.array_keys():
-            a, b = grp_d[name][:], grp_s[name][:]
-            np.testing.assert_array_equal(
-                np.nan_to_num(a, nan=-12345.0),
-                np.nan_to_num(b, nan=-12345.0),
-                err_msg=f"split vs single-object differ in {name}",
-            )
-
-    def test_split_writes_multiple_objects_default_writes_one(self, monkeypatch):
-        """The default writes ONE shard object for the populated shard; the split
-        writes one object PER populated sharding sub-region (sparse: empty objects
-        are omitted)."""
-        cfg = default_config()
-        shard_key = self._shard_key()
-        g_default = self._grid(cfg, shard_order=None)
-        g_split = self._grid(cfg, shard_order=5)
-        df = self._df(g_default, shard_key)
-
-        s_default = self._run(g_default, shard_key, df, monkeypatch)
-        s_split = self._run(g_split, shard_key, df.copy(), monkeypatch)
-
-        prefix = f"{self.CHILD}/h_mean/c/"
-        n_default = len([k for k in s_default._store_dict if k.startswith(prefix)])
-        n_split = len([k for k in s_split._store_dict if k.startswith(prefix)])
-        assert n_default == 1
-        # Three cells in three distinct inner chunks land in 2-3 distinct objects
-        # (>1), but never more than one per dispatch shard's object count.
-        assert 1 < n_split <= g_split.shard_objects_per_shard
 
     @staticmethod
     def _mixed_config():
         """The default scalar config extended with a vector(trailing-dim), a
-        ``resolution: chunk`` companion, and a ragged/CSR field, so the split path is
-        exercised for every field kind — not just scalars — while keeping the default's
-        ``morton`` coordinate + scalar data vars."""
+        ``resolution: chunk`` companion, and a ragged field, so the sharded slab
+        pass is exercised for every field kind — not just scalars — while keeping
+        the default's ``morton`` coordinate + scalar data vars."""
         cfg = default_config()
         agg = cfg.aggregation
         agg.setdefault("chunk_precompute", {})["chunk_base"] = {
             "expression": "np.float32(np.mean(h_li))",
             "source": "h_li",
         }
-        # vector trailing-dim — dense AND sharded, so it rides the per-object slab.
+        # vector trailing-dim — dense AND sharded, so it rides the shard slab.
         agg["variables"]["h_edges"] = {
             "expression": "np.array([np.min(h_li), np.max(h_li)])",
             "source": "h_li",
@@ -391,66 +331,46 @@ class TestShardOrderObjectSplit:
         }
         return cfg
 
-    def test_split_reconstructs_vector_companion_and_ragged(self, monkeypatch):
-        """The split path reconstructs the SAME store for a config carrying every
-        field kind — a vector (trailing-dim, dense+sharded), a ``resolution: chunk``
-        companion, and a ragged vlen field (issue #209, riding the same sharded
-        slab pass) — not just scalars. Every array reconstructs value-for-value."""
+    def test_sharded_reconstructs_all_field_kinds_in_one_object_each(self, monkeypatch):
+        """The sharded whole-shard write reconstructs the SAME logical arrays as
+        the unsharded per-chunk write for every field kind — scalar h_mean,
+        vector h_edges (trailing-dim), chunk companion h_chunk_base, ragged vlen
+        h_ragged (issue #209, riding the same slab pass) — with each sharded
+        per-cell array landing as ONE store object. The ragged array holds
+        per-cell bytes objects, so it compares element-wise directly (no NaN
+        mapping)."""
         cfg = self._mixed_config()
         shard_key = self._shard_key()
-        g_default = self._grid(cfg, shard_order=None)
-        g_split = self._grid(cfg, shard_order=5)
-        assert g_split.shard_objects_per_shard == 4
+        g_sharded = self._grid(cfg, sharded=True)
+        g_regular = self._grid(cfg, sharded=False)
 
-        df = self._df(g_default, shard_key)
-        s_default = self._run(g_default, shard_key, df, monkeypatch)
-        s_split = self._run(g_split, shard_key, df.copy(), monkeypatch)
+        df = self._df(g_sharded, shard_key)
+        s_sharded = self._run(g_sharded, shard_key, df, monkeypatch)
+        s_regular = self._run(g_regular, shard_key, df.copy(), monkeypatch)
 
-        # Every array (scalar h_mean, vector h_edges, chunk companion
-        # h_chunk_base, ragged vlen h_ragged) reconstructs value-for-value
-        # across the split. The ragged array holds per-cell bytes objects, so
-        # it compares element-wise directly (no NaN mapping).
-        grp_d = open_group(store=s_default, mode="r", path=str(self.CHILD))
-        grp_s = open_group(store=s_split, mode="r", path=str(self.CHILD))
-        assert set(grp_d.array_keys()) == set(grp_s.array_keys())
-        assert {"h_mean", "h_edges", "h_chunk_base", "h_ragged"} <= set(grp_d.array_keys())
-        for name in grp_d.array_keys():
+        grp_s = open_group(store=s_sharded, mode="r", path=str(self.CHILD))
+        grp_r = open_group(store=s_regular, mode="r", path=str(self.CHILD))
+        assert set(grp_s.array_keys()) == set(grp_r.array_keys())
+        assert {"h_mean", "h_edges", "h_chunk_base", "h_ragged"} <= set(grp_s.array_keys())
+        for name in grp_s.array_keys():
             if name == "h_ragged":
                 np.testing.assert_array_equal(
-                    grp_d[name][:],
                     grp_s[name][:],
-                    err_msg="split vs single-object differ in h_ragged",
+                    grp_r[name][:],
+                    err_msg="sharded vs per-chunk differ in h_ragged",
                 )
                 continue
             np.testing.assert_array_equal(
-                np.nan_to_num(grp_d[name][:], nan=-12345.0),
                 np.nan_to_num(grp_s[name][:], nan=-12345.0),
-                err_msg=f"split vs single-object differ in {name}",
+                np.nan_to_num(grp_r[name][:], nan=-12345.0),
+                err_msg=f"sharded vs per-chunk differ in {name}",
             )
-        # ... and the split genuinely fanned the ragged field over >1 object.
-        prefix = f"{self.CHILD}/h_ragged/c/"
-        assert len([k for k in s_default._store_dict if k.startswith(prefix)]) == 1
-        assert len([k for k in s_split._store_dict if k.startswith(prefix)]) > 1
-
-    def test_invalid_shard_order_rejected(self):
-        cfg = default_config()
-        # <= parent_order (other than the default) is rejected.
-        with pytest.raises(ValueError, match="shard_order"):
-            self._grid(cfg, shard_order=self.PARENT - 1)
-        # > chunk_inner is rejected.
-        with pytest.raises(ValueError, match="shard_order"):
-            self._grid(cfg, shard_order=self.INNER + 1)
-        # shard_order without sharded=True is rejected.
-        with pytest.raises(ValueError, match="sharded=True"):
-            HealpixGrid(
-                self.PARENT,
-                self.CHILD,
-                layout="fullsphere",
-                config=cfg,
-                chunk_inner=self.INNER,
-                sharded=False,
-                shard_order=5,
-            )
+        # Sharded per-cell arrays collapse to ONE object each (the ragged vlen
+        # included); the per-chunk store fans the same cells over >1 object.
+        for name in ("h_mean", "h_ragged"):
+            prefix = f"{self.CHILD}/{name}/c/"
+            assert len([k for k in s_sharded._store_dict if k.startswith(prefix)]) == 1
+            assert len([k for k in s_regular._store_dict if k.startswith(prefix)]) > 1
 
 
 class TestCalculateCellStatistics:

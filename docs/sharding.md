@@ -90,9 +90,6 @@ more than one inner chunk). At `K == 1` there is nothing to bundle:
   leaf: every dense per-cell array (and each ragged field's vlen array, issue
   #209) is ONE `ShardingCodec` object spanning the whole leaf, written at leaf
   block 0 — hive output is byte-identical to the flat sharded shard region.
-  `grid.shard_order` (the issue #133 object split, a flat-path memory bound) is
-  rejected with hive: a leaf's arrays are one whole-leaf object each by
-  construction.
 
 ## Reader note
 

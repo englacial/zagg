@@ -75,7 +75,6 @@ class HealpixGrid:
         populated_shards: list[int] | None = None,
         chunk_inner: int | None = None,
         sharded: bool = True,
-        shard_order: int | None = None,
     ):
         if child_order < parent_order:
             raise ValueError(
@@ -130,43 +129,6 @@ class HealpixGrid:
         if self.chunks_per_shard <= 1:
             sharded = False
         self.sharded = bool(sharded)
-        # shard_order (issue #133 phase 8): decouple the sharding OBJECT from the
-        # dispatch shard. A ShardingCodec object normally spans the whole dispatch
-        # shard (outer chunk == ``cells_per_shard``); for a large/dense shard (88S)
-        # that single object can exceed the 2 GB write cap. ``shard_order`` (an order
-        # strictly between ``parent_order`` and ``chunk_order``) sizes the sharding
-        # object SMALLER than the dispatch shard: one dispatch shard then holds
-        # ``4^(shard_order - parent_order)`` sharding objects, each spanning
-        # ``4^(child_order - shard_order)`` cells. The worker writes its dispatch
-        # region in one accumulate→write→free pass per sharding object, bounding peak
-        # memory. Default ``None`` (or ``== parent_order``) keeps ONE object per
-        # dispatch shard — byte-identical to the pre-phase-8 sharded write.
-        if shard_order is None:
-            shard_obj_order = parent_order
-        else:
-            shard_obj_order = int(shard_order)
-            # ``== parent_order`` is the explicit form of the default (one object per
-            # dispatch shard); anything finer must stay within (parent_order, chunk_order].
-            if not (parent_order <= shard_obj_order <= chunk_order):
-                raise ValueError(
-                    f"shard_order ({shard_obj_order}) must satisfy parent_order "
-                    f"({parent_order}) <= shard_order <= chunk_inner ({chunk_order}); "
-                    "unset (or == parent_order) keeps one sharding object per dispatch "
-                    "shard (today's behavior)"
-                )
-            if not sharded:
-                raise ValueError(
-                    "shard_order is only meaningful with sharded=True (it sizes the "
-                    "ShardingCodec object); set sharded: true or drop shard_order"
-                )
-        self.shard_order = shard_order
-        self.shard_obj_order = shard_obj_order
-        # Cells in one sharding object and the number of objects per dispatch shard.
-        # At the default (shard_obj_order == parent_order) these are ``cells_per_shard``
-        # and ``1`` respectively, so the ShardingCodec outer chunk and the single
-        # whole-shard write are unchanged.
-        self.cells_per_shard_object = 4 ** (child_order - shard_obj_order)
-        self.shard_objects_per_shard = 4 ** (shard_obj_order - parent_order)
         self.layout = layout
         self.config = config or default_config("atl06")
         # cell_ids coordinate encoding (issue #135): "nested" (default, the DGGS
@@ -297,47 +259,6 @@ class HealpixGrid:
         (inner_block,) = tuple(int(b) for b in block_index)
         local = inner_block - shard_block * self.chunks_per_shard
         start = local * self.cells_per_chunk
-        return (slice(start, start + self.cells_per_chunk),)
-
-    # ── sharding-object split (issue #133 phase 8) ───────────────────────────
-
-    def shard_object_slab_shape(self) -> tuple[int, ...]:
-        """Cell extent of one sharding OBJECT (issue #133 phase 8).
-
-        The slab the sharded worker assembles per dense array before ONE
-        ``set_block_selection`` at the sharding-object block — ``(cells_per_shard_object,)``
-        for HEALPix. At the default ``shard_order`` this equals
-        :meth:`shard_slab_shape` (one object spans the whole dispatch shard), so the
-        single-object write is byte-identical.
-        """
-        return (self.cells_per_shard_object,)
-
-    def shard_object_block(self, block_index) -> tuple[int, ...]:
-        """Outer (sharding-object) block index containing an inner chunk's block.
-
-        The ShardingCodec outer-chunk grid is sized at the sharding object
-        (``cells_per_shard_object``), so an inner chunk at global cell offset
-        ``inner_block · cells_per_chunk`` lands in object
-        ``inner_block · cells_per_chunk // cells_per_shard_object``. At the default
-        ``shard_order`` (one object per dispatch shard) this is exactly
-        :meth:`block_index(shard_key)`.
-        """
-        (inner_block,) = tuple(int(b) for b in block_index)
-        cell_offset = inner_block * self.cells_per_chunk
-        return (cell_offset // self.cells_per_shard_object,)
-
-    def shard_object_local_region(self, block_index) -> tuple:
-        """Slice(s) an inner chunk occupies within its sharding-OBJECT slab.
-
-        Like :meth:`shard_local_region` but local to the sharding object (sized by
-        ``shard_order``) rather than the whole dispatch shard. The inner chunk's
-        global cell offset minus the object's base offset gives the contiguous
-        ``[local, local + cells_per_chunk)`` run in the ``cells_per_shard_object`` slab.
-        """
-        (inner_block,) = tuple(int(b) for b in block_index)
-        cell_offset = inner_block * self.cells_per_chunk
-        (obj_block,) = self.shard_object_block(block_index)
-        start = cell_offset - obj_block * self.cells_per_shard_object
         return (slice(start, start + self.cells_per_chunk),)
 
     @property
@@ -639,9 +560,7 @@ class HealpixGrid:
         difference (``leaf=True``): sharded arrays shard across the WHOLE
         leaf — a ragged field's vlen array always (issue #209), the dense
         per-cell arrays when ``sharded`` (issue #236) — so each is ONE object
-        per leaf. The issue #133 object split (``shard_order``) never applies
-        to a leaf: it exists to bound flat-path slab memory, and a leaf's
-        dense payload is MB-scale.
+        per leaf.
         """
         return self._group_spec(self.cells_per_shard, (self.chunks_per_shard,), leaf=True)
 
@@ -681,22 +600,13 @@ class HealpixGrid:
                 return arr
             # The inner chunk is the array's current chunk shape (``cells_per_chunk``
             # on the cells axis; a vector field's trailing payload dim is chunked
-            # whole and stays whole). The outer shard widens only the cells axis to
-            # the sharding object (``cells_per_shard_object`` — see below); trailing
-            # dims are unchanged.
+            # whole and stays whole). The ShardingCodec OUTER chunk widens only the
+            # cells axis to the whole dispatch shard (== the whole leaf on hive,
+            # issue #236); the inner read chunk is unchanged.
             cg = arr.chunk_grid
             cfg = cg["configuration"] if isinstance(cg, dict) else cg.configuration
             inner = tuple(int(c) for c in cfg["chunk_shape"])
-            # The ShardingCodec OUTER chunk == the sharding OBJECT (issue #133 phase
-            # 8): ``cells_per_shard_object`` cells, which is ``cells_per_shard`` (the
-            # whole dispatch shard) at the default ``shard_order`` and SMALLER when a
-            # finer ``shard_order`` is set. The inner read chunk is unchanged.
-            # A hive LEAF (issue #236) always shards across the whole leaf — one
-            # object per dense array, written at leaf block 0 — never the object
-            # split (``write_leaf_to_zarr`` assumes it; ``validate_config`` rejects
-            # hive + shard_order).
-            cells = self.cells_per_shard if leaf else self.cells_per_shard_object
-            shard = (cells, *inner[1:])
+            shard = (self.cells_per_shard, *inner[1:])
             return sharded_array_spec(arr, shard_shape=shard, inner_chunk_shape=inner)
 
         members = {}
@@ -731,14 +641,12 @@ class HealpixGrid:
                     # (issue #209) — same whole-leaf geometry the dense arrays
                     # take when ``sharded`` (issue #236). On the FLAT layout
                     # the ShardingCodec outer chunk mirrors the dense arrays
-                    # when ``sharded`` (the issue #133 object split included);
-                    # the unsharded flat layout stays a regular array (one
-                    # object per inner chunk — the streaming per-chunk write
-                    # must not read-modify-write a shared shard object).
-                    if leaf and self.chunks_per_shard > 1:
+                    # when ``sharded``; the unsharded flat layout stays a
+                    # regular array (one object per inner chunk — the
+                    # streaming per-chunk write must not read-modify-write a
+                    # shared shard object).
+                    if self.sharded or (leaf and self.chunks_per_shard > 1):
                         rag_shard: tuple | None = (self.cells_per_shard,)
-                    elif not leaf and self.sharded:
-                        rag_shard = (self.cells_per_shard_object,)
                     else:
                         rag_shard = None
                     rag_kw = {
