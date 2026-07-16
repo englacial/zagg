@@ -34,9 +34,10 @@ per-shard write path (see [Status](#status)).
   hold the shard's K inner chunks). When `sharded` (the K > 1 **default**,
   matching flat — [issue #236](https://github.com/englacial/zagg/issues/236))
   each dense array is ONE `ShardingCodec` object spanning the whole leaf,
-  written at leaf block 0; a ragged field's vlen-bytes array is likewise one
-  whole-leaf object
-  ([issue #209](https://github.com/englacial/zagg/issues/209)) — the
+  written at leaf block 0. A ragged field's vlen-bytes array is one whole-leaf
+  object whenever K > 1 — **sharded or not**
+  ([issue #209](https://github.com/englacial/zagg/issues/209)), independent of
+  the dense `sharded` toggle. The
   ShardingCodec is itself vanilla zarr v3, so the leaf stays self-describing.
   One recorded exception
   ([issue #200](https://github.com/englacial/zagg/issues/200), O8): the
@@ -66,14 +67,18 @@ output:
 default whenever `chunk_inner` gives K > 1 — same contract as flat
 ([issue #236](https://github.com/englacial/zagg/issues/236)): each leaf's
 dense arrays collapse to one object apiece instead of K per-inner-chunk
-objects PUT onto a single leaf prefix. An explicit `sharded: false` opts back
-into the K streaming objects; an explicit `sharded: true` at K == 1 validates
-and is a no-op (nothing to bundle — the leaf is byte-identical either way).
+objects PUT onto a single leaf prefix. An explicit `sharded: false` opts the
+**dense** arrays back into K streaming objects — the ragged vlen array stays
+one whole-leaf object regardless
+([issue #209](https://github.com/englacial/zagg/issues/209)); an explicit
+`sharded: true` at K == 1 validates and is a no-op (nothing to bundle — the
+leaf is byte-identical either way).
 
 Validation rejects `hive` with a rectilinear grid (node names are morton
 digits), with `grid.shard_order` (the flat layout's ShardingCodec object
 split, [issue #133](https://github.com/englacial/zagg/issues/133) — a hive
-leaf's arrays are one whole-leaf object each), and with
+leaf's arrays are one whole-leaf object each; unrelated to the manifest's
+`shard_order` field below, which records the dispatch/tree order), and with
 `consolidate_metadata: true` (there is no store-root zarr hierarchy to
 consolidate — D5/D12).
 
@@ -296,7 +301,7 @@ under D9/O7). The §7 sweep remains the authoritative rebuilder.
   byte-identical to the flat sharded layout — one `ShardingCodec` object per
   dense array per leaf (plus one per ragged field,
   [issue #209](https://github.com/englacial/zagg/issues/209)), the default at
-  K > 1, so a leaf costs one PUT per array instead of K per-inner-chunk PUTs
-  concentrated on a single prefix.
+  K > 1, so a leaf costs one PUT per dense array instead of K per-inner-chunk
+  PUTs concentrated on a single prefix.
 - Write-throughput validation at fleet scale is tracked with the benchmark
   machinery in [issue #202](https://github.com/englacial/zagg/issues/202).
