@@ -92,6 +92,18 @@ class TestRasterConfigValidation:
         with pytest.raises(ValueError, match="sharded"):
             validate_config(_raster_config(grid=grid))
 
+    def test_hive_store_layout_rejected(self):
+        cfg = _raster_config()
+        cfg.output["store_layout"] = "hive"
+        with pytest.raises(ValueError, match="issue #237"):
+            validate_config(cfg)
+
+    def test_coverage_moc_rejected(self):
+        cfg = _raster_config()
+        cfg.output["coverage_moc"] = True
+        with pytest.raises(ValueError, match="issue #237"):
+            validate_config(cfg)
+
     def test_rectilinear_grid_rejected_for_now(self):
         grid = {"type": "rectilinear", "crs": UTM18, "resolution": 10, "bounds": [0, 0, 1, 1]}
         with pytest.raises(ValueError, match="healpix"):
