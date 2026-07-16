@@ -228,6 +228,27 @@ class TestManifest:
     def test_read_absent_returns_none(self, tmp_path):
         assert hive.read_manifest(str(tmp_path / "empty")) is None
 
+    def test_validate_fresh_root_returns_none_and_writes_nothing(self, cfg, tmp_path):
+        # The read-only precheck (issue #252): a fresh root has nothing to
+        # match, returns None, and must NOT write the manifest — that stays
+        # for the finalize ensure_manifest.
+        root = str(tmp_path / "store")
+        assert hive.validate_manifest(root, hive.build_manifest(self._grid(cfg))) is None
+        assert hive.read_manifest(root) is None
+
+    def test_validate_matching_returns_existing(self, cfg, tmp_path):
+        root = str(tmp_path / "store")
+        grid = self._grid(cfg)
+        written = hive.ensure_manifest(root, hive.build_manifest(grid))
+        assert hive.validate_manifest(root, hive.build_manifest(grid)) == written
+
+    def test_validate_mismatch_raises(self, cfg, tmp_path):
+        root = str(tmp_path / "store")
+        hive.ensure_manifest(root, hive.build_manifest(self._grid(cfg)))
+        other = HealpixGrid(parent_order=5, child_order=8, layout="fullsphere", config=cfg)
+        with pytest.raises(ValueError, match="does not match this run"):
+            hive.validate_manifest(root, hive.build_manifest(other))
+
 
 # ── leaf template + commit stamp (D3/D4) ─────────────────────────────────────
 
@@ -933,6 +954,36 @@ class TestRunnerWiring:
         # the only other root object.
         assert sorted(os.listdir(root)) == [hive.ROOT_COVERAGE_NAME, hive.MANIFEST_NAME]
         assert hive.read_manifest(root)["shard_order"] == 6
+
+    def test_local_hive_rerun_frozen_key_mismatch_fails_before_dispatch(
+        self, monkeypatch, cfg, tmp_path
+    ):
+        # The manifest WRITE folded to finalize (issue #252), but its read-only
+        # frozen-key precheck runs pre-dispatch (review fold): a rerun into a
+        # root templated for DIFFERENT orders (shard_order 5 vs the catalog's 6)
+        # must refuse BEFORE any cell runs — not after fan-out has already mixed
+        # new-order leaves into the old-order store (D2).
+        from zagg import runner
+        from zagg.runner import agg
+
+        cfg.output["store_layout"] = "hive"
+        catalog_path, shard = self._catalog(tmp_path)
+        root = str(tmp_path / "out")
+        other = HealpixGrid(parent_order=5, child_order=12, layout="fullsphere", config=cfg)
+        hive.ensure_manifest(root, hive.build_manifest(other))
+
+        monkeypatch.setattr(runner, "get_nsidc_s3_credentials", lambda: {"accessKeyId": "a"})
+        calls = []
+
+        def fake_hive_write(*args, **kw):
+            calls.append(args)
+            return {"error": None, "total_obs": 1}
+
+        monkeypatch.setattr(hive, "process_and_write_hive", fake_hive_write)
+        with pytest.raises(ValueError, match="clear the store root"):
+            agg(cfg, catalog=catalog_path, store=root, backend="local")
+        # Fail-fast: the precheck raised before dispatch, so no cell ran.
+        assert calls == []
 
     def test_local_hive_sharded_leaf_single_object(self, monkeypatch, cfg, tmp_path):
         """Issue #236 through the LOCAL dispatcher: a sharded K>1 hive run
