@@ -381,6 +381,12 @@ def validate_config(config: PipelineConfig) -> None:
                 "hive root to bootstrap from)"
             )
 
+    # Temporal windowing block (issue #246, morton-hive/2): nested
+    # output.windowing declares the window schedule + time encoding. Absent =
+    # schedule none = today's behavior; the block itself is hive-only (windowed
+    # leaves are a hive-layout convention), mirroring coverage_moc's posture.
+    _validate_windowing(config)
+
     # Validate bounds structure (optional)
     if config.bounds is not None:
         allowed_keys = {"temporal", "spatial"}
@@ -654,6 +660,135 @@ def _validate_raster_config(config: PipelineConfig) -> None:
             "raster templates do not support sharded: true yet (issue #218); "
             "chunks are (1, cells_per_chunk) — one object per timestep-chunk"
         )
+    # Time-windowed hive leaves are a point-pipeline capability in this round;
+    # the raster (time, cells) product's windowing is its own design (issue
+    # #247). Reject pointedly rather than silently ignoring the block —
+    # extending the early-return validation posture from issue #239.
+    if config.output.get("windowing"):
+        raise ValueError(
+            "raster pipelines do not support output.windowing yet (issue #247); "
+            "drop the block — raster output is a (time, cells) cube, not "
+            "windowed hive leaves"
+        )
+
+
+def _validate_windowing(config: PipelineConfig) -> None:
+    """Validate the ``output.windowing`` block (issue #246, morton-hive/2).
+
+    ``{schedule, time_field, epoch, scale?, units?, windows?}`` — the nested
+    form ratified on the #246 thread. Absent/null is schedule ``none``
+    (today's behavior). A present block requires the hive store layout on a
+    healpix grid (windowed leaf names are a morton-hive convention, like
+    ``coverage_moc``). ``quarterly`` is grammar-reserved on the mortie spec
+    page but NOT implemented — rejected with a pointed message. The explicit
+    windows list must be well-formed: frozen label grammar, half-open
+    ``start < end``, unique labels, non-overlapping ranges. ``time_field``
+    must name a declared ``data_source`` column so the worker actually reads
+    the membership timestamps it filters on.
+    """
+    from zagg import windows as _windows
+
+    block = config.output.get("windowing")
+    if block is None:
+        return
+    if not isinstance(block, dict):
+        raise ValueError(
+            f"output.windowing must be a mapping "
+            f"{{schedule, time_field, epoch, ...}} (got {block!r})"
+        )
+    try:
+        schedule = _windows.check_schedule(block.get("schedule", "none"))
+    except ValueError as e:
+        raise ValueError(f"output.windowing.schedule: {e}") from e
+    grid = config.output.get("grid") or {}
+    if (grid.get("type", "healpix")) != "healpix":
+        raise ValueError(
+            "output.windowing requires a healpix grid (windowed leaves are a "
+            f"morton-hive convention; grid type is {grid.get('type')!r})"
+        )
+    if (config.output.get("store_layout") or "flat") != "hive":
+        raise ValueError(
+            "output.windowing requires output.store_layout: hive (window leaves "
+            "are hive leaf zarrs; the flat shared store has no leaves to window)"
+        )
+    if schedule == "none":
+        return
+    time_field = block.get("time_field")
+    if not isinstance(time_field, str) or not time_field:
+        raise ValueError(
+            "output.windowing.time_field is required: the per-observation "
+            "timestamp column that decides window membership"
+        )
+    declared = {
+        **(config.data_source or {}).get("coordinates", {}),
+        **(config.data_source or {}).get("variables", {}),
+    }
+    if declared and time_field not in declared:
+        raise ValueError(
+            f"output.windowing.time_field {time_field!r} is not a declared "
+            f"data_source column (one of {sorted(declared)}); the worker can "
+            f"only filter on columns it reads"
+        )
+    epoch = block.get("epoch")
+    if epoch is None:
+        raise ValueError(
+            "output.windowing.epoch is required: the dataset's zero time as an "
+            "ISO-8601 UTC instant (e.g. '2018-01-01T00:00:00Z' for ICESat-2 "
+            "delta_time)"
+        )
+    try:
+        _windows.parse_utc(epoch)
+    except ValueError as e:
+        raise ValueError(f"output.windowing.epoch: {e}") from e
+    scale = block.get("scale") or "utc"
+    if scale not in _windows.EPOCH_SCALES:
+        raise ValueError(
+            f"output.windowing.scale must be one of {_windows.EPOCH_SCALES} (got {scale!r})"
+        )
+    units = block.get("units") or "seconds"
+    if units not in _windows.UNIT_SECONDS:
+        raise ValueError(
+            f"output.windowing.units must be one of {tuple(_windows.UNIT_SECONDS)} (got {units!r})"
+        )
+    declared_windows = block.get("windows")
+    if schedule != "explicit":
+        if declared_windows is not None:
+            raise ValueError(
+                f"output.windowing.windows only applies to schedule: explicit "
+                f"(the {schedule} schedule derives its windows from labels)"
+            )
+        return
+    if not isinstance(declared_windows, list) or not declared_windows:
+        raise ValueError(
+            "output.windowing.windows is required for schedule: explicit — a "
+            "non-empty list of {label, start, end} entries"
+        )
+    seen: dict = {}
+    for entry in declared_windows:
+        if not isinstance(entry, dict) or not {"label", "start", "end"} <= set(entry):
+            raise ValueError(
+                f"each explicit window must be a {{label, start, end}} mapping (got {entry!r})"
+            )
+        try:
+            label = _windows.validate_label(entry["label"], "explicit")
+            start, end = _windows.parse_utc(entry["start"]), _windows.parse_utc(entry["end"])
+        except ValueError as e:
+            raise ValueError(f"output.windowing.windows: {e}") from e
+        if not start < end:
+            raise ValueError(
+                f"explicit window {label!r} is not half-open: start "
+                f"{entry['start']!r} must precede end {entry['end']!r}"
+            )
+        if label in seen:
+            raise ValueError(f"explicit window label {label!r} is declared twice")
+        seen[label] = (start, end)
+    ordered = sorted(seen.items(), key=lambda kv: kv[1][0])
+    for (a, (_sa, ea)), (b, (sb, _eb)) in zip(ordered, ordered[1:]):
+        if ea > sb:
+            raise ValueError(
+                f"explicit windows {a!r} and {b!r} overlap; windows must be "
+                f"disjoint half-open ranges"
+            )
 
 
 def get_raster_bands(config: PipelineConfig) -> dict:
@@ -1832,6 +1967,46 @@ def get_coverage_moc(config: PipelineConfig) -> bool:
     if flag is None:
         return get_store_layout(config) == "hive"
     return bool(flag)
+
+
+def get_windowing(config: PipelineConfig) -> dict | None:
+    """The normalized temporal windowing declaration, or ``None`` (issue #246).
+
+    ``None`` — absent block, null block, or an explicit ``schedule: none`` —
+    is today's unwindowed behavior (bare leaf names, ``morton-hive/1``).
+    Otherwise a normalized dict with defaults resolved::
+
+        {"schedule", "time_field", "epoch", "scale", "units", "windows"}
+
+    ``epoch`` and explicit-window boundaries are canonicalized to ISO-8601
+    UTC strings; ``windows`` is ``None`` except for ``schedule: explicit``.
+    The same dict feeds the manifest temporal block
+    (:func:`zagg.hive.build_manifest`) and the dispatch fan-out, so the two
+    can never disagree.
+    """
+    from zagg import windows as _windows
+
+    block = config.output.get("windowing")
+    if not block or block.get("schedule", "none") == "none":
+        return None
+    declared = None
+    if block["schedule"] == "explicit":
+        declared = [
+            {
+                "label": w["label"],
+                "start": _windows.iso_utc(_windows.parse_utc(w["start"])),
+                "end": _windows.iso_utc(_windows.parse_utc(w["end"])),
+            }
+            for w in block["windows"]
+        ]
+    return {
+        "schedule": block["schedule"],
+        "time_field": block["time_field"],
+        "epoch": _windows.iso_utc(_windows.parse_utc(block["epoch"])),
+        "scale": block.get("scale") or "utc",
+        "units": block.get("units") or "seconds",
+        "windows": declared,
+    }
 
 
 def get_aoi_mask(config: PipelineConfig) -> bool:
