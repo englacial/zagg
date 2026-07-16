@@ -24,6 +24,7 @@ import concurrent.futures
 import os
 import re
 import threading
+import time
 from urllib.parse import urlparse
 
 import numpy as np
@@ -154,6 +155,38 @@ def _build_store(key):
     return LocalStore(loc)
 
 
+def new_stage_stats() -> dict:
+    """Fresh per-invoke stage accumulator for the sample path (issue #249).
+
+    The floats are wall-clock seconds (``time.time()`` deltas, the issue #100
+    convention) of **stage work volume**: each asset-sample times its own
+    stages independently and the K x bands concurrent samples of an invoke
+    overlap on one event loop, so a stage total is the sum of per-sample
+    elapsed walls *including* time suspended while sibling samples ran. The
+    sums attribute where the samples' time went (which stage differs between
+    a fast and a slow invoke) — they are NOT a wall decomposition and can
+    exceed the invoke's wall clock. That is deliberate: the ``write_buffer >
+    1`` sample/write remainder on PR #232 already showed wall splits go
+    approximate under overlap.
+
+    Keys — seconds: ``open`` (store lookup + TIFF header round trips + geo/
+    dtype parse), ``geometry`` (pull-NN mapping; a ``geom_cache`` hit records
+    ~0), ``fetch`` (tile GETs), ``decode``, ``gather`` (numpy scatter/gather).
+    Counts: ``assets`` (asset-samples), ``tiles`` (tiles fetched),
+    ``geom_hits`` (mappings served from ``geom_cache``).
+    """
+    return {
+        "open": 0.0,
+        "geometry": 0.0,
+        "fetch": 0.0,
+        "decode": 0.0,
+        "gather": 0.0,
+        "assets": 0,
+        "tiles": 0,
+        "geom_hits": 0,
+    }
+
+
 async def sample_asset_async(
     grid,
     cells,
@@ -194,6 +227,7 @@ async def _sample_one(
     anonymous: bool = True,
     fill=0,
     geom_cache: dict | None = None,
+    stage_stats: dict | None = None,
 ):
     """:func:`sample_asset_async` body, also returning the raster's center
     ``(lon, lat)`` — the ownership rule's tile-center input (#218).
@@ -204,9 +238,20 @@ async def _sample_one(
     computes it once per distinct grid (~175 ms at o9) instead of once per
     asset-sample. ``None`` (the default, and the public ``sample_asset*``
     path) computes per call, unchanged.
+
+    ``stage_stats`` (issue #249) accumulates per-stage seconds + counts in
+    place — see :func:`new_stage_stats` for the keys and the work-volume (not
+    wall-decomposition) semantics. ``None`` (the default, and the public
+    ``sample_asset*`` path) makes no timing calls at all — the hot path is
+    unchanged. Accumulation is plain ``+=`` on the event loop with no await
+    between read and write, so it is atomic by the same argument as the
+    ``geom_cache`` store below — no locks; the ``write_buffer`` sink threads
+    never touch this dict.
     """
     from async_tiff import TIFF
 
+    prof = stage_stats is not None
+    _t0 = time.time() if prof else None
     store, path = _store_and_path(href, region=region, anonymous=anonymous)
     tiff = await TIFF.open(path, store=store)
     ifd = tiff.ifds[0]
@@ -223,8 +268,14 @@ async def _sample_one(
     epsg, transform = _geo_from_ifd(ifd)
     shape = (ifd.image_height, ifd.image_width)
     center = _raster_center_lonlat(epsg, transform, shape)
+    if prof:
+        stage_stats["open"] += time.time() - _t0
+        stage_stats["assets"] += 1
+        _t0 = time.time()
     geom_key = (epsg, transform, shape)
     geom = geom_cache.get(geom_key) if geom_cache is not None else None
+    if prof and geom is not None:
+        stage_stats["geom_hits"] += 1
     if geom is None:
         # INVARIANT (issue #244 thread): no ``await`` between this check and
         # the store below. asyncio interleaves only at await points, so the
@@ -243,6 +294,8 @@ async def _sample_one(
         if geom_cache is not None:
             geom_cache[geom_key] = geom
     rows, cols, valid = geom
+    if prof:
+        stage_stats["geometry"] += time.time() - _t0
 
     th, tw = ifd.tile_height, ifd.tile_width
     vr, vc = rows[valid], cols[valid]
@@ -252,8 +305,17 @@ async def _sample_one(
         return np.full(rows.shape, fill, dtype=dtype), valid, center
 
     pairs = np.unique(np.stack([tr, tc], axis=1), axis=0)
+    if prof:
+        _t0 = time.time()
     tiles = await asyncio.gather(*[tiff.fetch_tile(int(c), int(r), 0) for r, c in pairs])
+    if prof:
+        stage_stats["fetch"] += time.time() - _t0
+        stage_stats["tiles"] += len(pairs)
+        _t0 = time.time()
     decoded = await asyncio.gather(*[t.decode() for t in tiles])
+    if prof:
+        stage_stats["decode"] += time.time() - _t0
+        _t0 = time.time()
 
     gathered = np.full(vr.shape, fill, dtype=dtype)
     for (trow, tcol), dec in zip(pairs, decoded):
@@ -263,6 +325,8 @@ async def _sample_one(
 
     values = np.full(rows.shape, fill, dtype=dtype)
     values[valid] = gathered
+    if prof:
+        stage_stats["gather"] += time.time() - _t0
     return values, valid, center
 
 
@@ -323,6 +387,7 @@ async def sample_item_async(
     region: str | None = None,
     anonymous: bool = True,
     geom_cache: dict | None = None,
+    stage_stats: dict | None = None,
 ):
     """Sample every configured band of one STAC item, concurrently.
 
@@ -366,6 +431,7 @@ async def sample_item_async(
                 anonymous=anonymous,
                 fill=bands[f]["fill_value"],
                 geom_cache=geom_cache,
+                stage_stats=stage_stats,
             )
             for f in fields
         ]
@@ -496,6 +562,7 @@ def process_raster_shard(
     region: str | None = None,
     anonymous: bool = True,
     on_slab=None,
+    stage_stats: dict | None = None,
 ):
     """Process one shard of a raster pipeline: every acquisition group -> slab.
 
@@ -521,6 +588,14 @@ def process_raster_shard(
         double-buffer); the returned ``slabs`` is then empty. When ``None``
         (the default) every slab accumulates into ``slabs`` and is returned,
         as before, and ``write_buffer`` is ignored.
+    stage_stats : dict, optional
+        Per-invoke stage accumulator from :func:`new_stage_stats` (issue
+        #249): the sample path adds per-stage seconds (``open`` / ``geometry``
+        / ``fetch`` / ``decode`` / ``gather``) and counts (``assets`` /
+        ``tiles`` / ``geom_hits``) in place. Stage seconds are work volume,
+        not a wall decomposition — concurrent samples overlap, so their sum
+        can exceed this call's wall (see :func:`new_stage_stats`). ``None``
+        (the default) makes no timing calls — the sample path is unchanged.
 
     Returns
     -------
@@ -584,6 +659,7 @@ def process_raster_shard(
                             region=region,
                             anonymous=anonymous,
                             geom_cache=geom_cache,
+                            stage_stats=stage_stats,
                         )
                         for e in items
                     ]
@@ -792,6 +868,7 @@ def write_raster_coords(store, grid, shard_key: int):
 
 
 __all__ = [
+    "new_stage_stats",
     "sample_asset",
     "sample_asset_async",
     "sample_item_async",
