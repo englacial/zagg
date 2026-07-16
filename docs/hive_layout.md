@@ -63,7 +63,7 @@ the same per-shard write path (see [Status](#status)).
 ```yaml
 output:
   store: s3://bucket/product        # becomes the hive root
-  store_layout: hive                # default: flat
+  store_layout: hive                # the HEALPix default (issue #253); may be omitted
   grid:
     type: healpix                   # hive is HEALPix-only (morton digit tree)
     parent_order: 9                 # shard order -> tree depth
