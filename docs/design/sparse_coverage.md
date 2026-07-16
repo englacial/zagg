@@ -124,18 +124,23 @@ touched again during a run. Contents:
   recorded explicitly for forward compatibility).
 - Pyramid declaration: which ancestor orders carry overview zarrs, and their
   aggregation methods (populated/updated by the §7 sweep).
-- **Temporal block** (D15, `morton-hive/2`, ratified on
-  [#237](https://github.com/englacial/zagg/issues/237)): time
+- **Temporal block** (D15, ratified on
+  [#237](https://github.com/englacial/zagg/issues/237)): a store carrying this
+  block declares `spec: "morton-hive/2"` (the version string of D6 covers these
+  temporal/windowed-leaf extensions). It records time
   encoding/units/epoch/calendar, the **window schedule**
   (`mission` | `yearly` | explicit range list), and the append policy. The
-  schedule is *generative*, so the manifest stays static as data accrues:
-  appending a new year to a `yearly` store adds leaves the schedule already
-  describes — no manifest touch, and **no new manifests**: the store has
-  exactly one `morton_hive.json`, and each new windowed leaf brings only its
-  own zarr metadata + D4 stamp. The one exception is the explicit-range-list
-  form: appending a window outside the declared list requires rewriting the
-  manifest (a rare, single-writer, template-time operation) — append-heavy
-  stores should prefer generative schedules. Temporal *extent* is
+  schedule is *generative*, so under `mission`/`yearly` the manifest is
+  write-once and stays static as data accrues: appending a new year to a
+  `yearly` store adds leaves the schedule already describes — no manifest
+  touch, and **no new manifests**: the store has exactly one
+  `morton_hive.json`, and each new windowed leaf brings only its own zarr
+  metadata + D4 stamp. The explicit-range-list form is the noted exception:
+  appending a window outside the declared list re-templates the manifest (a
+  rare, single-writer, template-time operation, not a worker-race write) —
+  append-heavy stores should prefer generative schedules. (This exception is
+  an implication recorded here from the ratified schedule set, not a point
+  separately ratified on the #237 thread.) Temporal *extent* is
   deliberately **not** manifest data: actual ranges live on the leaf stamps
   (truth) and in the root summary (cache), splitting static schema from
   accruing state exactly the way coverage splits under D9. The default
@@ -212,7 +217,9 @@ the data itself). Tracks [#200](https://github.com/englacial/zagg/issues/200).
   posts its completion list to a **fire-and-forget worker invoke**
   (`InvocationType="Event"`, ~10 ms of dispatcher wall clock, run-size
   independent) that writes a shard-order root MOC for the one-GET
-  bootstrap. Failure is harmless: readers degrade to the sweep MOC or the
+  bootstrap. Under D15 this root summary also carries the time-range union
+  alongside the MOC (cache, sweep-regenerable). Failure is harmless: readers
+  degrade to the sweep MOC or the
   walk, never to wrong answers. Incremental runs: the leaves carry durable
   truth, so the sweep is always a correct rebuilder, and the end-of-run
   write may union with a prior root object.
@@ -384,8 +391,9 @@ write path (§2) is load-bearing; this phase is optimization.
   sweep-regenerable, never truth. Extent never lives in the manifest, so
   the manifest stays write-once at template time (§3); the noted exception
   is the explicit-range-list schedule, where appending outside the list
-  rewrites the manifest — append-heavy stores should prefer generative
-  schedules.
+  re-templates the manifest — append-heavy stores should prefer generative
+  schedules. (That exception is an implication recorded from the ratified
+  schedule set, not separately ratified on the thread.)
 
 ### 8.2 Open for review (input needed)
 
@@ -429,7 +437,8 @@ write path (§2) is load-bearing; this phase is optimization.
   exact ranges hit MB-scale on linear-track occupancy at ~1.1 cells/range).
   Stamp attrs carry only the tier-0 box + the bitmap's order + pointer +
   byte sizes; pad sentinel is JSON null; the envelope gains an
-  `encoding: "ranges" | "bitmap"` discriminator. Bit convention (frozen
+  `encoding: "ranges" | "bitmap"` discriminator (later extended by D14 to add
+  a third value, `"full"`). Bit convention (frozen
   with the mortie spec, golden-vector-pinned on PR #208): bit i = the i-th
   shard-subtree cell in ascending packed-word order (base-4 D1 digit tail,
   digits 1..4 → 0..3), MSB-first per byte.
