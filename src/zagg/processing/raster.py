@@ -21,7 +21,9 @@ from __future__ import annotations
 
 import asyncio
 import concurrent.futures
+import os
 import re
+import threading
 from urllib.parse import urlparse
 
 import numpy as np
@@ -66,33 +68,67 @@ def _geo_from_ifd(ifd) -> tuple[int, tuple[float, float, float, float, float, fl
     return int(epsg), (sx, 0.0, x - i * sx, 0.0, -sy, y + j * sy)
 
 
+# Store cache (issue #244): one obspec store per (kind, bucket-or-host-or-dir,
+# region, anonymous) per PROCESS. A fresh S3Store per asset-sample cost ~300 ms
+# of client/TLS setup and made every tile GET ride a cold connection (425
+# clients per full-year o9 invoke — the measured breakdown on the issue).
+# Module lifetime == sandbox lifetime (espg-ratified): warm Lambda invocations
+# keep their connection pools, matching the issue #171 sandbox-lifetime
+# pattern. Lock-guarded because the running-loop fallback in ``sample_asset``
+# and hand-rolled callers can construct from other threads; construction runs
+# under the lock deliberately (single-flight per key).
+_STORE_CACHE: dict = {}
+_STORE_LOCK = threading.Lock()
+
+
 def _store_and_path(href: str, *, region: str | None = None, anonymous: bool = True):
     """obspec store + in-store path for an asset href.
 
     Handles ``s3://bucket/key``, virtual-hosted S3 HTTPS
     (``https://bucket.s3.region.amazonaws.com/key`` -- what Earth Search
-    asset hrefs look like), plain HTTPS, and local paths.
+    asset hrefs look like), plain HTTPS, and local paths. Stores are cached
+    per ``(kind, location, region, anonymous)`` for the life of the process
+    (issue #244) — the returned store is shared, never per-call.
     """
-    from async_tiff.store import HTTPStore, LocalStore, S3Store
-
     u = urlparse(href)
     if u.scheme == "s3":
-        kw: dict = {"skip_signature": True} if anonymous else {}
-        if region:
-            kw["region"] = region
-        return S3Store(u.netloc, **kw), u.path.lstrip("/")
-    if u.scheme in ("http", "https"):
+        key = ("s3", u.netloc, region, anonymous)
+        path = u.path.lstrip("/")
+    elif u.scheme in ("http", "https"):
         m = _S3_VHOST.match(u.netloc)
         if m:
-            kw = {"region": region or m["region"]}
-            if anonymous:
-                kw["skip_signature"] = True
-            return S3Store(m["bucket"], **kw), u.path.lstrip("/")
-        return HTTPStore(f"{u.scheme}://{u.netloc}"), u.path.lstrip("/")
-    import os
+            key = ("s3", m["bucket"], region or m["region"], anonymous)
+            path = u.path.lstrip("/")
+        else:
+            key = ("http", f"{u.scheme}://{u.netloc}", None, None)
+            path = u.path.lstrip("/")
+    else:
+        d, name = os.path.split(href)
+        key = ("local", d or ".", None, None)
+        path = name
+    with _STORE_LOCK:
+        store = _STORE_CACHE.get(key)
+        if store is None:
+            store = _build_store(key)
+            _STORE_CACHE[key] = store
+    return store, path
 
-    d, name = os.path.split(href)
-    return LocalStore(d or "."), name
+
+def _build_store(key):
+    """Construct the obspec store for a cache key (see ``_STORE_CACHE``)."""
+    from async_tiff.store import HTTPStore, LocalStore, S3Store
+
+    kind, loc, region, anonymous = key
+    if kind == "s3":
+        kw: dict = {}
+        if anonymous:
+            kw["skip_signature"] = True
+        if region:
+            kw["region"] = region
+        return S3Store(loc, **kw)
+    if kind == "http":
+        return HTTPStore(loc)
+    return LocalStore(loc)
 
 
 async def sample_asset_async(
