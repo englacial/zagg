@@ -95,13 +95,13 @@ class TestRasterConfigValidation:
     def test_hive_store_layout_rejected(self):
         cfg = _raster_config()
         cfg.output["store_layout"] = "hive"
-        with pytest.raises(ValueError, match="issue #237"):
+        with pytest.raises(ValueError, match="store_layout"):
             validate_config(cfg)
 
     def test_coverage_moc_rejected(self):
         cfg = _raster_config()
         cfg.output["coverage_moc"] = True
-        with pytest.raises(ValueError, match="issue #237"):
+        with pytest.raises(ValueError, match="coverage_moc"):
             validate_config(cfg)
 
     def test_rectilinear_grid_rejected_for_now(self):
