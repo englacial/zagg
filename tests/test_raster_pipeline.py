@@ -189,7 +189,7 @@ class TestSampleConcurrency:
         lock = _asyncio.Lock()
 
         async def _fake_sample_item(
-            grid, cells, assets, bands, *, nodata=None, region=None, anonymous=True
+            grid, cells, assets, bands, *, nodata=None, region=None, anonymous=True, **_kw
         ):
             async with lock:
                 state["cur"] += 1
@@ -592,3 +592,63 @@ class TestTemplateAndSlabs:
         got = red[0, start:stop]
         np.testing.assert_array_equal(got[valid], data[rows[valid], cols[valid]])
         assert (got[~valid] == 0).all()  # fill outside the raster footprint
+
+
+class TestGeometryCache:
+    """Issue #244: the pull-NN mapping is memoized per (epsg, transform, shape)
+    within a shard invoke — once per distinct source grid, not once per
+    asset-sample — with output byte-identical to the uncached path."""
+
+    def _run_counting(self, tmp_path, monkeypatch, n_timesteps=4, second_grid=False):
+        vals = [11, 22, 33, 44][:n_timesteps]
+        granules = []
+        for i, v in enumerate(vals):
+            _write_tiff(tmp_path / f"s{i}.tif", np.full((96, 96), v, dtype=np.uint16))
+            assets = {"red": str(tmp_path / f"s{i}.tif")}
+            if second_grid:
+                # A second, differently-shaped source grid (48x48 @ 20 m).
+                _write_tiff(tmp_path / f"c{i}.tif", np.full((48, 48), 4, dtype=np.uint16), res=20.0)
+                assets["scl"] = str(tmp_path / f"c{i}.tif")
+            granules.append(
+                _entry(f"g{i}", assets, f"2026-07-{13 + i:02d}T16:02:20+00:00", time_key=f"dt-{i}")
+            )
+        bands = {"red": {"asset": "red", "dtype": "uint16"}}
+        if second_grid:
+            bands["scl"] = {"asset": "scl", "dtype": "uint16"}
+        grid = _rect_grid([ORIGIN[0], ORIGIN[1] - 960.0, ORIGIN[0] + 960.0, ORIGIN[1]], [96, 96])
+        cfg = _raster_config(bands=bands, nodata=None)
+        index, _ = raster_time_index([granules])
+
+        calls = {"n": 0}
+        real = type(grid).sample
+
+        def _counting(self_, *a, **k):
+            calls["n"] += 1
+            return real(self_, *a, **k)
+
+        monkeypatch.setattr(type(grid), "sample", _counting)
+        slabs, meta = process_raster_shard(grid, 0, granules, cfg, index)
+        return slabs, calls["n"]
+
+    def test_one_compute_per_source_grid(self, tmp_path, monkeypatch):
+        _slabs, n = self._run_counting(tmp_path, monkeypatch, n_timesteps=4)
+        assert n == 1  # 4 timesteps x 1 band, one shared source grid
+
+    def test_two_computes_for_two_grids(self, tmp_path, monkeypatch):
+        _slabs, n = self._run_counting(tmp_path, monkeypatch, n_timesteps=3, second_grid=True)
+        assert n == 2  # 3 timesteps x 2 bands over exactly two source grids
+
+    def test_cached_output_matches_uncached(self, tmp_path):
+        _write_tiff(tmp_path / "t0.tif", _index_raster())
+        grid = _rect_grid([ORIGIN[0], ORIGIN[1] - 960.0, ORIGIN[0] + 960.0, ORIGIN[1]], [96, 96])
+        bands = get_raster_bands(_raster_config(bands={"red": {"asset": "red", "dtype": "uint16"}}))
+        assets = {"red": str(tmp_path / "t0.tif")}
+        cells = np.arange(96 * 96)
+        uncached = _run_sync(sample_item_async(grid, cells, assets, bands))
+        shared: dict = {}
+        cached1 = _run_sync(sample_item_async(grid, cells, assets, bands, geom_cache=shared))
+        cached2 = _run_sync(sample_item_async(grid, cells, assets, bands, geom_cache=shared))
+        assert len(shared) == 1
+        for got in (cached1, cached2):
+            np.testing.assert_array_equal(got[0]["red"], uncached[0]["red"])
+            np.testing.assert_array_equal(got[1], uncached[1])
