@@ -118,7 +118,11 @@ def _matrix_mask(df: pd.DataFrame) -> pd.Series:
     targets carry no ``_mask``/``_nomask`` suffix, and any o10 rows) fall outside
     this scheme and drop out, so the corrected 2x2 begins fresh at the first
     post-reset merge without needing to prune the benchmarks-branch series.
-    Absent ``index_backend`` column (a pre-#193 parquet) -> all False."""
+    Absent ``index_backend`` column (a pre-#193 parquet) -> all False.
+    Flat rows only (issue #240 phase 4): the hive regression arm is excluded
+    both by its suffix-free name and, defensively, by the ``store_layout``
+    column, so it can never claim a 2x2 panel cell (its rows stay in the
+    series). Legacy rows (null ``store_layout``) read as flat."""
     if "index_backend" not in df.columns:
         return pd.Series(False, index=df.index)
     has_backend = df["index_backend"].notna()
@@ -128,7 +132,11 @@ def _matrix_mask(df: pd.DataFrame) -> pd.Series:
         aoi_suffix = df["target"].astype(str).str.endswith(("_mask", "_nomask"))
     else:
         aoi_suffix = pd.Series(False, index=df.index)
-    return has_backend & is_o9 & aoi_suffix.fillna(False)
+    if "store_layout" in df.columns:
+        is_flat = df["store_layout"].fillna("flat") == "flat"
+    else:
+        is_flat = pd.Series(True, index=df.index)
+    return has_backend & is_o9 & aoi_suffix.fillna(False) & is_flat
 
 
 def _matrix_history(df: pd.DataFrame) -> pd.DataFrame:
@@ -704,12 +712,21 @@ def _full_aoi_history(df: pd.DataFrame) -> pd.DataFrame:
     AOI-average ``cost_per_100km2_usd`` = ``cost_usd`` * 100 / (n_shards *
     shard_area_km2) -- the whole-AOI cost spread over the whole AOI area, the
     average-shard figure. Rows without the area inputs get a NaN there (the panel
-    then simply skips that metric)."""
+    then simply skips that metric).
+
+    Flat rows only (issue #240 phase 4): the hive regression arm shares the
+    ``index_backend`` axis with a flat target, so slotting it into the fixed
+    inline/sidecar x AOI-mask grid would silently overwrite that panel cell.
+    Hive rows stay in the parquet (object counts + ``parity_ok``); charting
+    them is a follow-up once the layout axis gets its own panel row. Legacy
+    rows (null ``store_layout``) read as flat."""
     if df.empty or "target" not in df.columns:
         return df
     hist = df.copy()
     if "event" in hist.columns:
         hist = hist[hist["event"] == "release"]
+    if "store_layout" in hist.columns:
+        hist = hist[hist["store_layout"].fillna("flat") == "flat"]
     hist = hist.dropna(subset=["target"])
     if hist.empty:
         return hist

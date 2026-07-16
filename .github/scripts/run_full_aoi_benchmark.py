@@ -35,6 +35,9 @@ Two JSON files. ``--out-json`` is one **run record** per target::
       "target", "timestamp", "commit", "ref", "event", "pr_number",
       "aoi", "temporal": {"start","end"}, "grid_size", "grid_type",
       "aggregator", "index_backend", "aoi_mask",
+      "store_layout",    # "flat"|"hive" (issue #240 phase 4)
+      "parity_ok",       # flat<->hive parity verdict on a parity_with target (None elsewhere/unknown)
+      "parity",          # JSON-only parity detail (shards/arrays checked, mismatches)
       "sidecar_cache",   # "cold"|"warm"|"unknown"|None -- labels a sidecar run as build vs read (issue #202)
       "parent_order", "child_order", "mortie_moc_order",
       "shard_area_km2", "memory_gb", "price_per_gb_sec", "zagg_version",
@@ -303,6 +306,73 @@ def _apriori_estimate(counts: list[int], sec_per_granule: float) -> dict:
     }
 
 
+def _values_equal(a, b) -> bool:
+    """Content equality for one array region: NaN-aware floats, vlen bytes."""
+    a, b = np.asarray(a), np.asarray(b)
+    if a.shape != b.shape:
+        return False
+    if a.dtype == object or b.dtype == object:  # vlen-bytes ragged payloads
+        return all(x == y for x, y in zip(a.tolist(), b.tolist(), strict=True))
+    if np.issubdtype(a.dtype, np.floating):
+        return bool(np.array_equal(a, b, equal_nan=True))
+    return bool(np.array_equal(a, b))
+
+
+def _flat_hive_parity(flat_store, hive_store, grid, shard_keys, *, store_kwargs=None) -> dict:
+    """Flat<->hive output parity over dispatched shards (issue #240 item 2).
+
+    Same-config-modulo-layout check: for every dispatched shard, every
+    per-cell array's content in the hive LEAF must equal the flat store's
+    shard region (the issue #236 parity contract, here verified against the
+    REAL fleet-written stores). RECORD-ONLY and never raises (espg ruling on
+    PR #242: the release leg must not block on a flaky read) -- a per-shard
+    read failure or content mismatch lands in ``mismatches`` (``parity_ok``
+    False); a setup failure lands in ``error`` (``parity_ok`` None, unknown).
+    Requires the flat sibling target to have dispatched FIRST (targets run in
+    manifest order; the ``parity_with`` target is listed before the hive arm).
+    """
+    result: dict = {"shards_checked": 0, "arrays_checked": 0, "mismatches": []}
+    try:
+        import zarr
+
+        from zagg import hive as zhive
+        from zagg.store import open_store
+
+        kwargs = store_kwargs or {}
+        flat = open_store(flat_store, read_only=True, **kwargs)
+        # Per-cell arrays only: the shard region of the cells axis is the
+        # comparable unit (chunk-grid companions would need their own slicing;
+        # none exist in the benchmark configs).
+        names = [
+            name
+            for name, m in grid.spec().members.items()
+            if tuple(m.dimension_names or ())[:1] == ("cells",)
+        ]
+        for key in shard_keys:
+            key = int(key)
+            label = grid.shard_label(key)
+            try:
+                leaf = open_store(zhive.shard_leaf_path(hive_store, key), read_only=True, **kwargs)
+                base = int(grid.block_index(key)[0]) * grid.cells_per_shard
+                for name in names:
+                    path = f"{grid.group_path}/{name}"
+                    a = zarr.open_array(flat, path=path, mode="r")[
+                        base : base + grid.cells_per_shard
+                    ]
+                    b = zarr.open_array(leaf, path=path, mode="r")[:]
+                    if not _values_equal(a, b):
+                        result["mismatches"].append({"shard": label, "array": name})
+                    result["arrays_checked"] += 1
+                result["shards_checked"] += 1
+            except Exception as exc:  # a missing/torn leaf is a parity finding
+                result["mismatches"].append({"shard": label, "error": str(exc)})
+        result["parity_ok"] = not result["mismatches"]
+    except Exception as exc:  # record-only: never fail the release run
+        result["error"] = str(exc)
+        result["parity_ok"] = None  # unknown, not asserted-false
+    return result
+
+
 def _measure_objects_recorded(
     name, config, grid, store: str, shard_keys: list[int], n_ok: int, *, region: str
 ) -> dict:
@@ -398,6 +468,9 @@ def run_target(
         "aggregator": target.get("aggregator"),
         "index_backend": target.get("index_backend"),
         "aoi_mask": bool(target.get("aoi_mask")),
+        # Store-layout axis (issue #240 phase 4): "flat"|"hive" from the
+        # config; the renderers key the 2x2 panels on flat rows only.
+        "store_layout": get_store_layout(config),
         "sidecar_cache": (
             _sidecar_cache_state(config.data_source.get("index", {}).get("store"), sm)
             if target.get("index_backend") == "sidecar" and not dry_run
@@ -428,6 +501,8 @@ def run_target(
             objects_total=None,
             objects_expected=None,
             objects_mismatch=None,
+            parity_ok=None,
+            parity=None,
         )
         return run, []
 
@@ -476,10 +551,29 @@ def run_target(
             int(summary.get("cells_with_data") or 0),
             region=region,
         )
+    # flat<->hive output parity (issue #240 item 2): manifest-driven -- a target
+    # carrying ``parity_with`` names its flat sibling (same config modulo
+    # store_layout, already dispatched: manifest order). RECORD-ONLY; the
+    # ``parity`` detail is JSON-only, ``parity_ok`` joins the retained series.
+    parity = None
+    sibling = target.get("parity_with")
+    if sibling and store:
+        flat_store = f"{store.rsplit('/', 1)[0]}/{sibling}.zarr"
+        parity = _flat_hive_parity(
+            flat_store,
+            store,
+            grid,
+            [int(k) for k in sm.shard_keys],
+            store_kwargs={"region": region},
+        )
+        if not parity.get("parity_ok"):
+            print(f"[{name}] flat<->hive parity NOT clean: {parity}", flush=True)
     run.update(
         objects_total=objects.get("objects_total"),
         objects_expected=objects.get("objects_expected"),
         objects_mismatch=objects.get("objects_mismatch"),
+        parity_ok=(parity or {}).get("parity_ok"),
+        parity=parity,
     )
     shard_rows = _shard_records(sm, summary, target, {**context, "target": name}, grid)
     # Per-shard object attribution rides the per-shard records (the plot's

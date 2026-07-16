@@ -52,6 +52,16 @@
       "grid_size": "o9",
       "index_backend": "sidecar",
       "aoi_mask": true
+    },
+    "full_aoi_neon_o9_hive": {
+      "_comment": "Hive-layout regression arm over ALL 4 NEON shards (issue #240 item 2, unblocked by issue #236). RECORD-ONLY like the rest of the release leg (espg ruling on PR #242: a flaky-CMR release must never be blocked). parity_with names the flat sibling target (same config modulo store_layout): after this target's dispatch the harness reads BOTH stores back and records per-shard array-content parity (parity_ok + JSON detail) -- the flat sibling must run first, so this target is listed last (targets run in manifest order). Excluded from the 2x2 cost panels via the store_layout column; its rows live in the release series parquet.",
+      "config": "configs/atl03_tdigest_healpix_o9_hive.yaml",
+      "aggregator": "tdigest",
+      "grid_type": "healpix",
+      "grid_size": "o9",
+      "index_backend": "inline",
+      "aoi_mask": false,
+      "parity_with": "full_aoi_neon_o9_inline_nomask"
     }
   }
 }

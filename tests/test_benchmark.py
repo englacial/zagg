@@ -138,9 +138,9 @@ def test_codec_column_is_last_and_threaded(monkeypatch):
     # tail position.
     cols = bench_metrics.RECORD_COLUMNS
     assert cols.index("codec") < cols.index("read") < cols.index("total_wall_s")
-    # The wall breakdown (#180), read backend (#193) and object counts (#240)
-    # appended in that order.
-    assert cols[-7:] == [
+    # The wall breakdown (#180), read backend (#193), object counts (#240) and
+    # store layout (#240 phase 4) appended in that order.
+    assert cols[-8:] == [
         "total_wall_s",
         "setup_s",
         "fanout_s",
@@ -148,6 +148,7 @@ def test_codec_column_is_last_and_threaded(monkeypatch):
         "index_backend",
         "objects_total",
         "objects_expected",
+        "store_layout",
     ]
     g = HealpixGrid(parent_order=11, child_order=19)
     rec = bench_metrics.build_record(_summary(), grid=g, context={"codec": "sharded"})
@@ -1705,9 +1706,10 @@ def _objects_payload(mismatch=None):
 
 
 def test_objects_columns_are_last_and_threaded():
-    # Stable-schema rule: new columns append LAST (issue #240).
+    # Stable-schema rule: new columns append LAST (issue #240; store_layout
+    # appended after the object counts in phase 4).
     cols = bench_metrics.RECORD_COLUMNS
-    assert cols[-2:] == ["objects_total", "objects_expected"]
+    assert cols[-3:] == ["objects_total", "objects_expected", "store_layout"]
     g = HealpixGrid(parent_order=11, child_order=19)
     rec = bench_metrics.build_record(_summary(), grid=g, context={}, objects=_objects_payload())
     assert rec["objects_total"] == 10
@@ -1834,3 +1836,68 @@ def test_main_no_fail_on_object_mismatch_opts_out(tmp_path, monkeypatch):
         ]
     )
     assert rc == 0
+
+
+# --- hive layout axis (issue #240 phase 4) -----------------------------------
+
+
+def test_run_target_threads_store_layout():
+    # The hive regression arm records store_layout="hive" from its config; the
+    # flat matrix arms record "flat" (dry-run, no AWS).
+    manifest, base = run_benchmark.load_targets(str(BENCH / "targets.json"))
+    common = dict(
+        store=None,
+        region="us-west-2",
+        function_name="process-shard",
+        context={"commit": "deadbee", "event": "pr"},
+        dry_run=True,
+    )
+    hive_rec = run_benchmark.run_target("tdigest_healpix_o9_hive", manifest, base, **common)
+    assert hive_rec["store_layout"] == "hive"
+    assert hive_rec["index_backend"] == "inline"
+    assert hive_rec["shard_key"] == 5347395636851376137  # same pinned densest o9 cell
+    flat_rec = run_benchmark.run_target(
+        "tdigest_healpix_o9_inline_nomask", manifest, base, **common
+    )
+    assert flat_rec["store_layout"] == "flat"
+
+
+def test_hive_config_expected_counts_exact():
+    # The committed hive arm's model: exact, with the coverage sidecar + the
+    # store-root manifest/MOC in the fixed counts (hive defaults coverage_moc).
+    import bench_objects
+
+    from zagg.config import get_coverage_moc, get_store_layout, load_config
+    from zagg.grids import from_config
+
+    cfg = load_config(str(BENCH / "configs" / "atl03_tdigest_healpix_o9_hive.yaml"))
+    assert get_store_layout(cfg) == "hive" and get_coverage_moc(cfg) is True
+    grid = from_config(cfg)
+    exp = bench_objects.expected_object_counts(
+        grid, n_shards=1, store_layout="hive", coverage_moc=True
+    )
+    # 4 arrays (cell_ids/morton/count/h_tdigest): leaf root+group zarr.json (2)
+    # + 4 array zarr.json + 4 sharded data objects + coverage sidecar = 11;
+    # store root = morton_hive.json + coverage.moc = 2.
+    assert exp == {
+        "metadata": 2,
+        "per_shard_min": 11,
+        "per_shard_max": 11,
+        "total_min": 13,
+        "total_max": 13,
+        "exact": True,
+    }
+
+
+def test_matrix_mask_excludes_hive_rows():
+    # Defensive flat-only gate (issue #240 phase 4): even a hive row that
+    # carries an aoi suffix + inline backend must not claim a 2x2 panel cell.
+    import plot_series
+
+    hive_row = _rec_row("c0", "tdigest_healpix_o9_hive_nomask")
+    hive_row["index_backend"] = "inline"
+    hive_row["store_layout"] = "hive"
+    df = update_series.records_to_frame(_matrix_rows("c0") + [hive_row])
+    hist = plot_series._matrix_history(df)
+    assert "tdigest_healpix_o9_hive_nomask" not in set(hist["target"])
+    assert len(hist) == 4  # the flat 2x2 is untouched

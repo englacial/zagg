@@ -208,3 +208,112 @@ def test_measure_objects_recorded_never_raises(monkeypatch):
     assert out["objects_mismatch"].startswith("object-count measurement failed")
     assert "s3 unreachable" in out["objects_mismatch"]
     assert "objects_total" not in out  # nothing measured, columns stay null
+
+
+# --- flat<->hive output parity (issue #240 item 2, record-only) --------------
+
+
+def _parity_stores(tmp_path, monkeypatch):
+    """Flat + hive stores from the SAME chunk results through the production
+    writers (the issue #236 parity contract), for exercising _flat_hive_parity."""
+    import numpy as np
+    import test_hive as th
+
+    import zagg.processing as processing
+    from zagg import hive
+    from zagg.config import default_config
+    from zagg.grids import from_config
+    from zagg.processing import write_shard_to_zarr
+    from zagg.store import open_store
+
+    cfg = default_config("atl06")
+    cfg.output["store_layout"] = "hive"
+    cfg.output["grid"]["chunk_inner"] = 8  # K = 16, sharded (issue #236)
+    cfg.aggregation["variables"]["h"] = {
+        "function": "np.sort",
+        "source": "h_li",
+        "kind": "ragged",
+        "inner_shape": [1],
+        "dtype": "float32",
+        "fill_value": 0,
+    }
+    grid = from_config(cfg)
+    shard = th._shard_word()
+    fake = th._sharded_accumulate_fake(
+        grid,
+        th.TestProcessAndWriteHiveSharded._chunk_carrier,
+        th.TestProcessAndWriteHiveSharded._meta,
+        {0: {"h": ([np.array([2.5], dtype=np.float32)], [1])}},
+        occupied=grid.children(shard)[:3],
+    )
+    monkeypatch.setattr(processing, "process_shard", fake)
+    hive_root = str(tmp_path / "hive_store")
+    meta = hive.process_and_write_hive(
+        shard, ["s3://b/g1.h5"], grid, {}, hive_root, cfg, store_kwargs={}
+    )
+    assert meta["error"] is None
+
+    chunk_results: list = []
+    fake(grid, shard, [], chunk_results=chunk_results, write_chunk=None)
+    flat_root = str(tmp_path / "flat_store")
+    flat = open_store(flat_root)
+    grid.emit_template(flat)
+    write_shard_to_zarr(chunk_results, flat, grid=grid, shard_key=shard)
+    return grid, shard, flat_root, hive_root
+
+
+def test_flat_hive_parity_clean(tmp_path, monkeypatch):
+    grid, shard, flat_root, hive_root = _parity_stores(tmp_path, monkeypatch)
+    out = rfab._flat_hive_parity(flat_root, hive_root, grid, [shard])
+    assert out["parity_ok"] is True
+    assert out["mismatches"] == []
+    assert out["shards_checked"] == 1
+    # Every per-cell array compared (coords + data vars + the ragged field).
+    n_cell_arrays = sum(
+        1 for m in grid.spec().members.values() if tuple(m.dimension_names or ())[:1] == ("cells",)
+    )
+    assert out["arrays_checked"] == n_cell_arrays
+
+
+def test_flat_hive_parity_flags_content_divergence(tmp_path, monkeypatch):
+    # Tamper ONE cell in the flat store: the mismatch names the shard + array,
+    # and the helper still never raises (record-only, espg ruling on PR 242).
+    import zarr
+
+    from zagg.store import open_store
+
+    grid, shard, flat_root, hive_root = _parity_stores(tmp_path, monkeypatch)
+    base = int(grid.block_index(shard)[0]) * grid.cells_per_shard
+    arr = zarr.open_array(open_store(flat_root), path=f"{grid.group_path}/count", mode="r+")
+    arr[base + 5] = 999_999
+    out = rfab._flat_hive_parity(flat_root, hive_root, grid, [shard])
+    assert out["parity_ok"] is False
+    assert {"shard": grid.shard_label(shard), "array": "count"} in out["mismatches"]
+
+
+def test_flat_hive_parity_missing_leaf_is_a_finding_not_a_crash(tmp_path, monkeypatch):
+    grid, shard, flat_root, _hive_root = _parity_stores(tmp_path, monkeypatch)
+    out = rfab._flat_hive_parity(flat_root, str(tmp_path / "empty_hive"), grid, [shard])
+    assert out["parity_ok"] is False
+    assert out["mismatches"] and "error" in out["mismatches"][0]
+    assert out["mismatches"][0]["shard"] == grid.shard_label(shard)
+
+
+def test_hive_target_manifest_wiring():
+    # The hive arm (issue #240 phase 4): parity_with names an existing flat
+    # sibling that runs FIRST (targets dispatch in manifest order), and the
+    # hive config resolves to store_layout=hive with the same grid.
+    from zagg.config import get_store_layout, load_config
+
+    manifest, base = rfab.load_targets(str(BENCH / "targets_full_aoi_neon.json"))
+    names = list(manifest["targets"])
+    hive_t = manifest["targets"]["full_aoi_neon_o9_hive"]
+    sibling = hive_t["parity_with"]
+    assert sibling in manifest["targets"]
+    assert names.index(sibling) < names.index("full_aoi_neon_o9_hive")
+    cfg = load_config(str(base / hive_t["config"]))
+    assert get_store_layout(cfg) == "hive"
+    flat_cfg = load_config(str(base / manifest["targets"][sibling]["config"]))
+    assert get_store_layout(flat_cfg) == "flat"
+    # Same grid modulo layout: the parity comparison is only meaningful then.
+    assert cfg.output["grid"] == {**flat_cfg.output["grid"]}

@@ -85,6 +85,10 @@ RECORD_COLUMNS = [
     # these columns deliberately drops from the parquet series.
     "objects_total",
     "objects_expected",
+    # Store-layout axis (issue #240 phase 4): "flat" | "hive". Null on rows
+    # recorded before the hive arm existed (read back as flat). The renderers
+    # key the inline/sidecar x AOI-mask panels on flat rows only.
+    "store_layout",
 ]
 
 
@@ -195,6 +199,9 @@ def build_record(
         "codec": context.get("codec"),
         "read": context.get("read"),
         "index_backend": context.get("index_backend"),
+        # Store-layout axis (issue #240 phase 4): threaded from the target's
+        # config by run_benchmark; None on legacy rows (renderers read flat).
+        "store_layout": context.get("store_layout"),
         # Wall-time breakdown (issue #180): total end-to-end AOI dispatch wall
         # plus its phases, straight from the agg summary.
         "total_wall_s": summary.get("wall_time_s"),

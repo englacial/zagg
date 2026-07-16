@@ -90,6 +90,15 @@
       "grid_type": "healpix",
       "grid_size": "o9",
       "index_backend": "sidecar"
+    },
+    "tdigest_healpix_o9_hive": {
+      "_comment": "Hive-layout regression arm (issue #240 item 2, unblocked by issue #236): same o9 t-digest config with store_layout: hive, pinned densest shard, inline read path, no AOI mask. Its purpose is WRITE-PATH regression detection (the object-count tripwire hard-fails on a sharded-write bypass -- issue #215), not a cost A/B; it deliberately does NOT end in _mask/_nomask so the 2x2 matrix renderer leaves it out of the inline/sidecar x AOI-mask panels (its row still lands in the PR comment table and the retained series, keyed by the store_layout column).",
+      "config": "configs/atl03_tdigest_healpix_o9_hive.yaml",
+      "shardmap": "healpix_o9",
+      "aggregator": "tdigest",
+      "grid_type": "healpix",
+      "grid_size": "o9",
+      "index_backend": "inline"
     }
   },
   "provisional_targets": {

@@ -486,3 +486,69 @@ def test_expected_counts_sane_for_every_manifest_config():
         assert exp["metadata"] >= 3, rel  # root + group + >=1 array
         assert 1 <= exp["per_shard_min"] <= exp["per_shard_max"], rel
         assert exp["total_max"] == exp["metadata"] + exp["per_shard_max"], rel
+
+
+def test_hive_sharded_store_matches_model(tmp_path, monkeypatch):
+    # Post issue #236: a sharded K>1 hive leaf writes ONE ShardingCodec object
+    # per dense array (and one ragged object), so the hive model is EXACT.
+    # End-to-end through the local runner (real process_and_write_hive +
+    # write_leaf_to_zarr; only process_shard is faked, honoring the accumulate
+    # contract), mirroring test_hive.test_local_hive_sharded_leaf_single_object.
+    import json
+
+    import test_hive as th
+
+    import zagg.processing as processing
+    from zagg import runner
+    from zagg.config import default_config, get_coverage_moc
+    from zagg.runner import agg
+
+    cfg = default_config("atl06")
+    cfg.output["store_layout"] = "hive"
+    cfg.output["grid"]["chunk_inner"] = 8  # K = 16; sharded defaults True (#236)
+    cfg.aggregation["variables"]["h"] = {
+        "function": "np.sort",
+        "source": "h_li",
+        "kind": "ragged",
+        "inner_shape": [1],
+        "dtype": "float32",
+        "fill_value": 0,
+    }
+    grid = from_config(cfg)
+    assert grid.sharded is True and grid.chunks_per_shard == 16
+    shard = th._shard_word()
+    fake = th._sharded_accumulate_fake(
+        grid,
+        th.TestProcessAndWriteHiveSharded._chunk_carrier,
+        th.TestProcessAndWriteHiveSharded._meta,
+        {0: {"h": ([np.array([2.5], dtype=np.float32)], [1])}},
+        occupied=grid.children(shard)[:3],
+    )
+    monkeypatch.setattr(processing, "process_shard", fake)
+    monkeypatch.setattr(runner, "get_nsidc_s3_credentials", lambda: {"accessKeyId": "a"})
+    catalog = {
+        "metadata": {"short_name": "ATL06", "version": "007"},
+        "grid_signature": grid.spatial_signature(),
+        "shard_keys": [int(shard)],
+        "granules": [[{"id": "g1", "s3": "s3://b/g1.h5", "https": "https://h/g1.h5"}]],
+    }
+    cat_path = tmp_path / "catalog.json"
+    cat_path.write_text(json.dumps(catalog))
+    root = str(tmp_path / "out")
+    agg(cfg, catalog=str(cat_path), store=root, backend="local")
+
+    expected = bench_objects.expected_object_counts(
+        grid, n_shards=1, store_layout="hive", coverage_moc=get_coverage_moc(cfg)
+    )
+    measured = bench_objects.store_object_counts(
+        root, grid=grid, shard_keys=[shard], store_layout="hive"
+    )
+    # Exact: per leaf = root+group zarr.json (2) + one zarr.json AND one data
+    # object per array + the coverage sidecar; store root = manifest + MOC.
+    n_arrays = len(grid.shard_spec().members)
+    assert expected["exact"] is True
+    assert expected["per_shard_max"] == 2 + 2 * n_arrays + 1
+    assert expected["metadata"] == 2
+    assert measured["objects_total"] == expected["total_max"]
+    assert measured["objects_other"] == 0
+    assert bench_objects.object_count_mismatch(measured, expected) is None

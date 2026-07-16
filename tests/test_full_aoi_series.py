@@ -72,6 +72,10 @@ def _record(commit="c0", target="full_aoi_neon_o9_inline_nomask", event="release
         "objects_total": 27,
         "objects_expected": 25,
         "objects_mismatch": None,
+        # Layout axis + flat<->hive parity (issue #240 phase 4).
+        "store_layout": "flat",
+        "parity_ok": None,
+        "parity": None,
     }
     r.update(over)
     return r
@@ -220,7 +224,13 @@ def test_objects_columns_retained_and_mismatch_dropped():
     # per-merge series' JSON-only keys.
     df = fas.records_to_frame([_record(objects_mismatch="total objects 999 != expected 25")])
     assert list(df.columns) == fas.FULL_AOI_COLUMNS
-    assert fas.FULL_AOI_COLUMNS[-2:] == ["objects_total", "objects_expected"]
+    # Appended in order: object counts (phase 3), then layout + parity (phase 4).
+    assert fas.FULL_AOI_COLUMNS[-4:] == [
+        "objects_total",
+        "objects_expected",
+        "store_layout",
+        "parity_ok",
+    ]
     assert df.iloc[0]["objects_total"] == 27
     assert df.iloc[0]["objects_expected"] == 25
     assert "objects_mismatch" not in df.columns
@@ -250,3 +260,47 @@ def test_full_aoi_objects_figure_skips_legacy_series(tmp_path):
     df_nulls = df.assign(objects_total=np.nan)
     assert ps.make_full_aoi_release_figure(df_nulls, "objects_total", "objects", out) is False
     assert not out.exists()
+
+
+# --- hive layout axis + parity columns (issue #240 phase 4) -------------------
+
+
+def test_store_layout_and_parity_columns_retained_parity_detail_dropped():
+    rec = _record(
+        target="full_aoi_neon_o9_hive",
+        store_layout="hive",
+        parity_ok=False,
+        parity={"mismatches": [{"shard": "1121121", "array": "count"}]},
+    )
+    df = fas.records_to_frame([rec])
+    assert list(df.columns) == fas.FULL_AOI_COLUMNS
+    assert fas.FULL_AOI_COLUMNS[-2:] == ["store_layout", "parity_ok"]
+    row = df.iloc[0]
+    assert row["store_layout"] == "hive"
+    assert row["parity_ok"] == False  # noqa: E712 -- nullable bool column
+    # The nested parity detail is JSON-only (dropped from the flat series).
+    assert "parity" not in df.columns
+    flat = fas.flatten_record(rec)
+    assert "parity" not in flat
+
+
+def test_full_aoi_history_keeps_flat_rows_only(tmp_path):
+    # The hive arm shares index_backend with a flat target: slotting it into
+    # the fixed 2x2 would silently overwrite that panel cell, so the renderer
+    # keys the panels on flat rows only (hive stays in the parquet).
+    ps = pytest.importorskip("plot_series")
+    hive_rec = _record(
+        target="full_aoi_neon_o9_hive",
+        store_layout="hive",
+        index_backend="inline",
+        cost_usd=0.99,
+    )
+    df = fas.records_to_frame(_matrix_records("c1", "v0.24.0", 0.016) + [hive_rec])
+    hist = ps._full_aoi_history(df)
+    assert "full_aoi_neon_o9_hive" not in set(hist["target"])
+    assert len(hist) == 4
+    # Legacy rows (null store_layout, pre-#240-phase-4 parquet) read as flat.
+    import numpy as np
+
+    legacy = df[df["store_layout"] != "hive"].assign(store_layout=np.nan)
+    assert len(ps._full_aoi_history(legacy)) == 4
