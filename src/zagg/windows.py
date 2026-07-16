@@ -46,8 +46,11 @@ for an astropy-backed conversion.
 
 from __future__ import annotations
 
+import logging
 import re
 from datetime import datetime, timedelta, timezone
+
+logger = logging.getLogger(__name__)
 
 #: Generative window schedules: labels derive from the boundary instant and
 #: the manifest stays static as data accrues (D15).
@@ -247,6 +250,46 @@ def split_leaf_name(name: str) -> tuple[str, str | None]:
     return full_id, window
 
 
+def union_time_range(*ranges) -> list | None:
+    """The ``[min, max]`` ISO-UTC union of time ranges; ``None``s drop out.
+
+    Malformed entries (non-2-sequences, unparsable instants) are DROPPED with
+    a warning rather than raised: the union feeds cache carriers (the root
+    summary, D15) whose write paths are fail-open — a bad cached range must
+    not fail the run, and the leaf stamps remain the truth.
+    """
+    starts, ends = [], []
+    for r in ranges:
+        if r is None:
+            continue
+        try:
+            lo, hi = r
+            starts.append(parse_utc(lo))
+            ends.append(parse_utc(hi))
+        except (TypeError, ValueError) as e:
+            logger.warning(f"dropping malformed time_range {r!r} from the union ({e})")
+    if not starts:
+        return None
+    return [iso_utc(min(starts)), iso_utc(max(ends))]
+
+
+def iso_time_range(time_range, windowing: dict) -> list:
+    """Dataset-unit ``[lo, hi]`` -> ISO-8601 UTC strings (issue #246, D15).
+
+    ``windowing`` is the normalized declaration (``epoch``/``scale``/``units``)
+    the conversion is defined by — the same one the manifest records, so the
+    stamp truth and the schema can never disagree.
+    """
+    return [
+        iso_utc(
+            offset_to_utc(
+                t, epoch=windowing["epoch"], scale=windowing["scale"], units=windowing["units"]
+            )
+        )
+        for t in time_range
+    ]
+
+
 def epoch_offset(scale: str) -> int:
     """The CURRENT ``scale - UTC`` offset in seconds (0 / 18 / 37).
 
@@ -315,11 +358,13 @@ __all__ = [
     "UNIT_SECONDS",
     "check_schedule",
     "epoch_offset",
+    "iso_time_range",
     "iso_utc",
     "leaf_name",
     "offset_to_utc",
     "parse_utc",
     "split_leaf_name",
+    "union_time_range",
     "utc_to_offset",
     "validate_label",
     "window_label",

@@ -51,6 +51,7 @@ def __getattr__(name):
         return getattr(mod, name)
     raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
 
+
 __all__ = [
     "HealpixGrid",
     "OutputGrid",

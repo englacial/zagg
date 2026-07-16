@@ -57,7 +57,7 @@ import zarr
 from zarr.errors import GroupNotFoundError
 
 from zagg.store import open_object_store
-from zagg.windows import leaf_name, split_leaf_name
+from zagg.windows import leaf_name, split_leaf_name, union_time_range
 
 logger = logging.getLogger(__name__)
 
@@ -533,12 +533,11 @@ def stamp_commit(
     pre-coverage stamp unchanged.
 
     ``window``/``time_range`` (issue #246, D15): a windowed leaf's stamp is
-    the TRUTH half of the temporal split — it records the window label and
-    the actual ``[t_min, t_max]`` written, as ISO-8601 UTC strings (ratified
-    on the #246 thread; the manifest keeps only the static schedule). A
-    windowed stamp declares ``spec: "morton-hive/2"``; unwindowed stamps stay
-    ``/1``, byte-identical to pre-windowing runs. ``time_range`` without a
-    ``window`` is rejected — unwindowed leaf extent stays data-plane only.
+    the TRUTH half of the temporal split — the window label plus the actual
+    ``[t_min, t_max]`` written, as ISO-8601 UTC strings (ratified #246 Q2;
+    the manifest keeps only the static schedule). A windowed stamp declares
+    ``spec: "morton-hive/2"``; unwindowed stamps stay ``/1`` byte-identical.
+    ``time_range`` without ``window`` is rejected (no unwindowed extent claim).
     """
     if window is None and time_range is not None:
         raise ValueError(
@@ -711,31 +710,6 @@ def root_coverage_words(envelope: dict) -> np.ndarray:
     return np.unique(np.asarray(words, dtype=np.uint64))
 
 
-def union_time_range(*ranges) -> list | None:
-    """The ``[min, max]`` ISO-UTC union of time ranges; ``None``s drop out.
-
-    Malformed entries (non-2-sequences, unparsable instants) are DROPPED with
-    a warning rather than raised: the union feeds cache carriers (the root
-    summary, D15) whose write paths are fail-open — a bad cached range must
-    not fail the run, and the leaf stamps remain the truth.
-    """
-    from zagg.windows import iso_utc, parse_utc
-
-    starts, ends = [], []
-    for r in ranges:
-        if r is None:
-            continue
-        try:
-            lo, hi = r
-            starts.append(parse_utc(lo))
-            ends.append(parse_utc(hi))
-        except (TypeError, ValueError) as e:
-            logger.warning(f"dropping malformed time_range {r!r} from the union ({e})")
-    if not starts:
-        return None
-    return [iso_utc(min(starts)), iso_utc(max(ends))]
-
-
 def write_root_coverage(store_root: str, envelope: dict, **store_kwargs) -> dict:
     """GET-union-PUT the store-root ``coverage.moc`` (issue #200 phase 3).
 
@@ -828,6 +802,7 @@ def process_and_write_hive(
     handoff="arrow",
     aoi_payload=None,
     profile=False,
+    window=None,
 ):
     """Process one shard into its own hive leaf store (issue #199 phase 2).
 
@@ -850,6 +825,16 @@ def process_and_write_hive(
     ``profile`` forwards to ``process_shard`` (issue #100); the write phase is
     interleaved with the stream (or a single post-stream pass when sharded),
     so no separate ``write`` timing is recorded.
+
+    ``window`` (issue #246, D13/D15) is one dispatch unit's time window:
+    ``{"label", "start", "end"}``, bounds half-open in DATASET units
+    (converted once at dispatch). It selects the windowed leaf name, injects
+    the observation-level ``time_field`` filter (the temporal analog of
+    ``aoi_mask`` — see :func:`zagg.config.windowed_cell_config`), stamps the
+    window label + the ACTUAL written ISO-UTC time range (also returned as
+    ``metadata["time_range"]`` for the root-summary union), and arms the D14
+    popcount (``encoding: "full"``). ``None`` is byte-identical to
+    pre-windowing behavior.
     """
     from zagg.processing import (
         process_shard,
@@ -859,7 +844,17 @@ def process_and_write_hive(
     )
     from zagg.store import open_store
 
-    leaf_path = shard_leaf_path(store_root, shard_key)
+    windowing = None
+    time_range_of = None
+    if window is not None:
+        from zagg.config import windowed_cell_config
+
+        # Inject the window's observation filter into a per-unit config copy
+        # (the issue #43 machinery — see windowed_cell_config).
+        config, windowing = windowed_cell_config(config, window)
+        time_range_of = windowing["time_field"]
+
+    leaf_path = shard_leaf_path(store_root, shard_key, window=window["label"] if window else None)
     box: dict = {}
 
     def _leaf():
@@ -932,8 +927,18 @@ def process_and_write_hive(
         chunk_results=chunk_results,
         write_chunk=None if sharded else _write_chunk,
         occupied_out=occupied,
+        time_range_of=time_range_of,
         profile=profile,
     )
+    # Windowed stamp truth (D15): convert the worker's dataset-unit extent to
+    # ISO-8601 UTC once, here — the same strings feed the stamp below and the
+    # dispatcher's root-summary union (via the returned metadata).
+    time_range = None
+    if window is not None and metadata.get("time_range") is not None:
+        from zagg.windows import iso_time_range
+
+        time_range = iso_time_range(metadata["time_range"], windowing)
+        metadata["time_range"] = time_range
     # Sharded leaf: ONE whole-leaf write per array (dense + ragged together,
     # issue #236), after the stream. The leaf template is emitted here (still
     # lazily, via ``_leaf``), so a shard that produced no chunks never creates
@@ -956,19 +961,27 @@ def process_and_write_hive(
         if words is not None and words.size == 0:
             words = None
         bitmap = None
+        # D14 popcount (issue #246): a fully-occupied subtree stamps
+        # ``encoding: "full"``, no sidecar. Gated on windowing (/2 stores
+        # only) so schedule-none output stays object-for-object identical to
+        # pre-#246 runs (the mortie spec files "full" under /2).
+        depth = int(grid.child_order) - int(grid.parent_order)
+        full = window is not None and words is not None and np.unique(words).size == 4**depth
         # Depth 0 (child_order == parent_order, a legal one-cell-per-shard
         # config) skips the sidecar: a 1-bit bitmap says nothing the stamp
         # itself doesn't, and encode would raise AFTER the chunk writes,
         # leaving the shard permanently unstampable debris (review finding,
         # PR #208 round 2). The envelope simply omits the pointer — box only.
-        if words is not None and int(grid.child_order) > int(grid.parent_order):
+        if words is not None and not full and depth > 0:
             bitmap = encode_coverage_bitmap(shard_key, words, grid.child_order)
             write_coverage_sidecar(leaf_path, bitmap, **store_kwargs)
         stamp_commit(
             box["store"],
             cells_with_data=metadata.get("cells_with_data", 0),
             granule_count=metadata.get("granule_count", 0),
-            coverage=build_coverage(shard_key, words, grid.child_order, bitmap=bitmap),
+            coverage=build_coverage(shard_key, words, grid.child_order, bitmap=bitmap, full=full),
+            window=window["label"] if window else None,
+            time_range=time_range,
         )
     return metadata
 
@@ -1015,7 +1028,6 @@ __all__ = [
     "root_coverage_words",
     "shard_leaf_path",
     "stamp_commit",
-    "union_time_range",
     "write_coverage_sidecar",
     "write_root_coverage",
 ]

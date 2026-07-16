@@ -166,7 +166,7 @@ def test_run_extraction_local_prefix(tmp_path, monkeypatch):
 
     beams = {"gt1l": _beam(2 * CHUNK)}
     monkeypatch.setattr(
-        ext, "_resolve_h5coro_driver", lambda driver: (lambda *a, **k: None), raising=True
+        ext, "_resolve_h5coro_driver", lambda driver: lambda *a, **k: None, raising=True
     )
 
     class _FakeH5Coro:

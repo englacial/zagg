@@ -42,8 +42,10 @@ class TestLoadPolygon:
             json.dump(geojson, f)
 
     def test_bare_polygon(self, tmp_path):
-        geojson = {"type": "Polygon",
-                   "coordinates": [[[0, -70], [10, -70], [10, -80], [0, -80], [0, -70]]]}
+        geojson = {
+            "type": "Polygon",
+            "coordinates": [[[0, -70], [10, -70], [10, -80], [0, -80], [0, -70]]],
+        }
         path = tmp_path / "poly.geojson"
         self._write(geojson, path)
         parts = load_polygon(str(path))
@@ -53,9 +55,14 @@ class TestLoadPolygon:
         assert lats.max() == pytest.approx(-70)
 
     def test_feature(self, tmp_path):
-        geojson = {"type": "Feature", "properties": {},
-                   "geometry": {"type": "Polygon",
-                                "coordinates": [[[0, -70], [10, -70], [10, -80], [0, -80], [0, -70]]]}}
+        geojson = {
+            "type": "Feature",
+            "properties": {},
+            "geometry": {
+                "type": "Polygon",
+                "coordinates": [[[0, -70], [10, -70], [10, -80], [0, -80], [0, -70]]],
+            },
+        }
         path = tmp_path / "feat.geojson"
         self._write(geojson, path)
         assert len(load_polygon(str(path))) == 1
@@ -63,24 +70,34 @@ class TestLoadPolygon:
     def test_feature_collection(self, tmp_path):
         def feat(x):
             ring = [[x, -70], [x + 10, -70], [x + 10, -80], [x, -80], [x, -70]]
-            return {"type": "Feature", "properties": {},
-                    "geometry": {"type": "Polygon", "coordinates": [ring]}}
+            return {
+                "type": "Feature",
+                "properties": {},
+                "geometry": {"type": "Polygon", "coordinates": [ring]},
+            }
+
         geojson = {"type": "FeatureCollection", "features": [feat(0), feat(20)]}
         path = tmp_path / "fc.geojson"
         self._write(geojson, path)
         assert len(load_polygon(str(path))) == 2
 
     def test_multipolygon(self, tmp_path):
-        geojson = {"type": "MultiPolygon", "coordinates": [
-            [[[0, -70], [10, -70], [10, -80], [0, -80], [0, -70]]],
-            [[[20, -70], [30, -70], [30, -80], [20, -80], [20, -70]]]]}
+        geojson = {
+            "type": "MultiPolygon",
+            "coordinates": [
+                [[[0, -70], [10, -70], [10, -80], [0, -80], [0, -70]]],
+                [[[20, -70], [30, -70], [30, -80], [20, -80], [20, -70]]],
+            ],
+        }
         path = tmp_path / "multi.geojson"
         self._write(geojson, path)
         assert len(load_polygon(str(path))) == 2
 
     def test_lat_lon_order(self, tmp_path):
-        geojson = {"type": "Polygon",
-                   "coordinates": [[[100, -65], [110, -65], [110, -75], [100, -75], [100, -65]]]}
+        geojson = {
+            "type": "Polygon",
+            "coordinates": [[[100, -65], [110, -65], [110, -75], [100, -75], [100, -65]]],
+        }
         path = tmp_path / "order.geojson"
         self._write(geojson, path)
         lats, lons = load_polygon(str(path))[0]
@@ -94,8 +111,10 @@ class TestPolygonToBbox:
         assert polygon_to_bbox(parts) == (0.0, -80.0, 10.0, -70.0)
 
     def test_multi_part(self):
-        parts = [(np.array([-70, -80]), np.array([0, 10])),
-                 (np.array([-60, -90]), np.array([20, 30]))]
+        parts = [
+            (np.array([-70, -80]), np.array([0, 10])),
+            (np.array([-60, -90]), np.array([20, 30])),
+        ]
         assert polygon_to_bbox(parts) == (0.0, -90.0, 30.0, -60.0)
 
 

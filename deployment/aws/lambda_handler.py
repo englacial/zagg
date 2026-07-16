@@ -625,12 +625,16 @@ def _handle_setup(event: Dict[str, Any]) -> Dict[str, Any]:
     try:
         config = load_config_from_dict(event["config"])
         if get_store_layout(config) == "hive":
+            from zagg.config import get_windowing
             from zagg.hive import build_manifest, ensure_manifest
 
             grid = from_config(config, parent_order=event.get("parent_order"))
             ensure_manifest(
                 event["store_path"],
-                build_manifest(grid, dataset=event.get("dataset")),
+                # Windowed stores (issue #246) declare morton-hive/2 + the
+                # temporal block, derived from the SAME forwarded config the
+                # dispatcher fanned out on — no extra event key to drift.
+                build_manifest(grid, dataset=event.get("dataset"), windowing=get_windowing(config)),
                 overwrite=event.get("overwrite", False),
                 **_output_store_kwargs(event),
             )
@@ -1106,6 +1110,13 @@ def _handle_process(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
                 handoff=handoff,
                 aoi_payload=aoi_payload,
                 profile=profile,
+                # Temporal window unit (issue #246): {"label", "start", "end"}
+                # in dataset units, absent on unwindowed runs. The shared
+                # write path selects the windowed leaf, injects the
+                # time_field filter, and stamps window + ISO time_range; the
+                # response body (this metadata) then carries time_range back
+                # for the dispatcher's root-summary union.
+                window=event.get("window"),
             )
         else:
             # Flat layout: lazy store + one-time template check, opened on the

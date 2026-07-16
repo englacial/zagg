@@ -732,7 +732,7 @@ class TestRootTimeUnion:
     def test_union_drops_malformed_with_warning(self, caplog):
         import logging
 
-        with caplog.at_level(logging.WARNING, logger="zagg.hive"):
+        with caplog.at_level(logging.WARNING, logger="zagg.windows"):
             got = hive.union_time_range(
                 ["garbage", "2024-01-01"],
                 ["2024-06-01T00:00:00+00:00", "2024-07-01T00:00:00+00:00"],
@@ -814,3 +814,382 @@ class TestRootTimeUnion:
             )
         env = refresh_root_coverage(root)
         assert env["time_range"] == ["2024-02-01T00:00:00+00:00", "2025-03-01T00:00:00+00:00"]
+
+
+# ── dispatch fan-out + worker window wiring (phase 5) ────────────────────────
+
+
+def _timed_rec(n, start, end):
+    return {
+        "id": f"g{n}",
+        "s3": f"s3://bucket/granule{n}.h5",
+        "https": f"https://h/g{n}.h5",
+        "time_start": start,
+        "time_end": end,
+    }
+
+
+class TestWindowedUnits:
+    """``runner._windowed_units``: one work unit per (shard, window), granules
+    subset by their shardmap time spans, bounds in dataset units."""
+
+    def _windowing(self, cfg, **over):
+        from zagg.config import get_windowing
+
+        _windowed(cfg, **over)
+        return get_windowing(cfg)
+
+    def test_yearly_fanout_and_subsetting(self, cfg):
+        from zagg.runner import _windowed_units
+
+        g19 = _timed_rec(1, "2019-03-01T00:00:00Z", "2019-03-01T00:05:00Z")
+        g20 = _timed_rec(2, "2020-07-01T00:00:00Z", "2020-07-01T00:05:00Z")
+        straddle = _timed_rec(3, "2019-12-31T23:58:00Z", "2020-01-01T00:02:00Z")
+        units = _windowed_units([(11, [g19, g20, straddle])], self._windowing(cfg), None)
+        # Shard-major, chronological labels; the straddler rides BOTH windows.
+        assert [(k, w["label"], [r["id"] for r in recs]) for k, recs, w in units] == [
+            (11, "2019", ["g1", "g3"]),
+            (11, "2020", ["g2", "g3"]),
+        ]
+        # Bounds are dataset units: GPS seconds since the ATLAS SDP epoch
+        # (2018-01-01Z; post-2017 epoch -> the naive difference, exactly).
+        w2019 = units[0][2]
+        assert w2019["start"] == 365 * 86400.0
+        assert w2019["end"] == (365 + 365) * 86400.0
+
+    def test_untimed_granule_rides_every_window_with_bounds(self, cfg):
+        from zagg.runner import _windowed_units
+
+        legacy = {"id": "g0", "s3": "s3://b/g0.h5", "https": None}
+        units = _windowed_units(
+            [(11, [legacy])],
+            self._windowing(cfg),
+            {"start_date": "2019-01-01", "end_date": "2020-12-31"},
+        )
+        assert [w["label"] for _k, _r, w in units] == ["2019", "2020"]
+        assert all(recs == [legacy] for _k, recs, _w in units)
+
+    def test_untimed_granule_without_bounds_is_a_pointed_error(self, cfg):
+        from zagg.runner import _windowed_units
+
+        legacy = {"id": "g0", "s3": "s3://b/g0.h5", "https": None}
+        with pytest.raises(ValueError, match="bounds.temporal"):
+            _windowed_units([(11, [legacy])], self._windowing(cfg), None)
+
+    def test_explicit_schedule_uses_declared_windows(self, cfg):
+        from zagg.runner import _windowed_units
+
+        w = self._windowing(cfg, schedule="explicit")
+        inside = _timed_rec(1, "2019-07-01T00:00:00Z", "2019-07-01T01:00:00Z")
+        outside = _timed_rec(2, "2021-07-01T00:00:00Z", "2021-07-01T01:00:00Z")
+        units = _windowed_units([(11, [inside, outside])], w, None)
+        # Only the declared melt seasons dispatch; the 2021 granule matches
+        # neither, and the empty melt-2020 subset is skipped entirely.
+        assert [(w_["label"], [r["id"] for r in recs]) for _k, recs, w_ in units] == [
+            ("melt-2019", ["g1"])
+        ]
+
+    def test_shard_with_no_matching_granules_dispatches_nothing(self, cfg):
+        from zagg.runner import _windowed_units
+
+        g = _timed_rec(1, "2019-03-01T00:00:00Z", "2019-03-01T01:00:00Z")
+        units = _windowed_units([(11, [g]), (22, [])], self._windowing(cfg), None)
+        assert [(k, w["label"]) for k, _r, w in units] == [(11, "2019")]
+
+    def test_raster_instant_datetime_is_honored(self, cfg):
+        from zagg.runner import _windowed_units
+
+        rec = {"id": "r1", "s3": None, "https": None, "datetime": "2019-06-15T10:00:00Z"}
+        units = _windowed_units([(11, [rec])], self._windowing(cfg), None)
+        assert [w["label"] for _k, _r, w in units] == ["2019"]
+
+
+class TestWindowedCellConfig:
+    def test_injects_ge_lt_filters_on_the_time_field(self, cfg):
+        from zagg.config import windowed_cell_config
+
+        _windowed(cfg)
+        unit_cfg, windowing = windowed_cell_config(cfg, {"label": "2019", "start": 1.5, "end": 9.5})
+        got = unit_cfg.data_source["filters"]
+        # The ATL06 quality_filter sugar is normalized FIRST, then the window
+        # pair appends — declared filtering is preserved.
+        assert got[0]["dataset"] == "/{group}/land_ice_segments/atl06_quality_summary"
+        assert got[-2:] == [
+            {
+                "level": None,
+                "dataset": "/{group}/land_ice_segments/delta_time",
+                "op": "ge",
+                "value": 1.5,
+            },
+            {
+                "level": None,
+                "dataset": "/{group}/land_ice_segments/delta_time",
+                "op": "lt",
+                "value": 9.5,
+            },
+        ]
+        assert windowing["time_field"] == "delta_time"
+        # The original config is untouched (per-unit copy).
+        assert "filters" not in cfg.data_source
+
+    def test_unwindowed_config_refuses(self, cfg):
+        from zagg.config import windowed_cell_config
+
+        with pytest.raises(ValueError, match="drift"):
+            windowed_cell_config(cfg, {"label": "2019", "start": 0.0, "end": 1.0})
+
+
+class TestProcessAndWriteHiveWindowed:
+    """The shared write path threads the window end to end: leaf name, filter
+    injection, ISO time_range stamp, and the D14 popcount."""
+
+    def _grid(self, cfg):
+        return HealpixGrid(parent_order=6, child_order=8, layout="fullsphere", config=cfg)
+
+    def _carrier(self, grid, shard):
+        import numpy as np
+        import pandas as pd
+
+        from zagg.config import get_agg_fields, get_data_vars, get_output_signature
+
+        coords = grid.chunk_coords(shard)
+        n = len(coords["cell_ids"])
+        agg = get_agg_fields(grid.config)
+        df = pd.DataFrame(
+            {
+                var: np.zeros(n, dtype=np.int32 if var == "count" else np.float32)
+                for var in get_data_vars(grid.config)
+                if get_output_signature(agg[var])["kind"] != "ragged"
+            }
+        )
+        for name, vals in coords.items():
+            df[name] = vals
+        return df
+
+    def _run(self, monkeypatch, cfg, tmp_path, *, occupied, time_range=None):
+        import numpy as np
+        import pandas as pd
+
+        import zagg.processing as processing
+
+        _windowed(cfg)
+        grid = self._grid(cfg)
+        shard = _shard_word()
+        root = str(tmp_path / "store")
+        seen: dict = {}
+
+        def fake(g, shard_key, urls, **kwargs):
+            seen["config"] = kwargs["config"]
+            seen["time_range_of"] = kwargs.get("time_range_of")
+            kwargs["write_chunk"](
+                grid.block_index(int(shard_key)), self._carrier(grid, shard_key), {}
+            )
+            if kwargs.get("occupied_out") is not None:
+                kwargs["occupied_out"].append(np.asarray(occupied, dtype=np.uint64))
+            meta = {
+                "shard_key": int(shard_key),
+                "cells_with_data": len(occupied),
+                "total_obs": 7,
+                "granule_count": 1,
+                "files_processed": 1,
+                "duration_s": 0.0,
+                "error": None,
+            }
+            if time_range is not None:
+                meta["time_range"] = time_range
+            return pd.DataFrame(), meta
+
+        monkeypatch.setattr(processing, "process_shard", fake)
+        # One year window: [2019-01-01, 2020-01-01) as GPS seconds since the
+        # ATLAS SDP epoch (2018-01-01Z).
+        window = {"label": "2019", "start": 365 * 86400.0, "end": 730 * 86400.0}
+        meta = hive.process_and_write_hive(
+            shard, ["s3://b/g1.h5"], grid, {}, root, cfg, store_kwargs={}, window=window
+        )
+        return grid, shard, root, meta, seen
+
+    def test_windowed_leaf_filter_and_stamp(self, monkeypatch, cfg, tmp_path):
+        import os
+
+        from zagg.store import open_store
+
+        grid, shard, root, meta, seen = self._run(
+            monkeypatch,
+            cfg,
+            tmp_path,
+            occupied=self._grid(cfg).children(_shard_word())[:3],
+            # Dataset-unit extent from the worker: ~2019-03-02 .. ~2019-11-27.
+            time_range=[425 * 86400.0, 695 * 86400.0],
+        )
+        leaf = hive.shard_leaf_path(root, shard, window="2019")
+        assert os.path.exists(leaf)
+        # The per-unit config the worker saw carries the injected window
+        # filter pair and the time-extent sink on the declared time_field.
+        assert seen["time_range_of"] == "delta_time"
+        assert [f["op"] for f in seen["config"].data_source["filters"][-2:]] == ["ge", "lt"]
+        # The stamp is the D15 truth: window label + ACTUAL ISO-UTC extent.
+        stamp = hive.read_commit(open_store(leaf))
+        assert stamp["spec"] == "morton-hive/2"
+        assert stamp["window"] == "2019"
+        assert stamp["time_range"] == ["2019-03-02T00:00:00+00:00", "2019-11-27T00:00:00+00:00"]
+        # The dispatcher sees the SAME strings for the root-summary union.
+        assert meta["time_range"] == stamp["time_range"]
+        # Partial occupancy: the bitmap sidecar path is unchanged.
+        assert stamp["coverage"]["encoding"] == "bitmap"
+        assert os.path.exists(os.path.join(leaf, hive.COVERAGE_SIDECAR))
+
+    def test_full_popcount_skips_the_sidecar(self, monkeypatch, cfg, tmp_path):
+        import os
+
+        from zagg.store import open_store
+
+        grid, shard, root, _meta, _seen = self._run(
+            monkeypatch, cfg, tmp_path, occupied=self._grid(cfg).children(_shard_word())
+        )
+        leaf = hive.shard_leaf_path(root, shard, window="2019")
+        stamp = hive.read_commit(open_store(leaf))
+        # D14: full subtree -> encoding "full", NO sidecar object written.
+        assert stamp["coverage"]["encoding"] == "full"
+        assert "sidecar" not in stamp["coverage"]
+        assert not os.path.exists(os.path.join(leaf, hive.COVERAGE_SIDECAR))
+
+    def test_window_rerun_is_idempotent_replacement(self, monkeypatch, cfg, tmp_path):
+        from zagg.store import open_store
+
+        grid, shard, root, _m, _s = self._run(
+            monkeypatch, cfg, tmp_path, occupied=self._grid(cfg).children(_shard_word())[:2]
+        )
+        # Re-dispatching the same window overwrites the leaf wholesale (D13).
+        grid, shard, root, _m, _s = self._run(
+            monkeypatch, cfg, tmp_path, occupied=self._grid(cfg).children(_shard_word())[:2]
+        )
+        leaf = hive.shard_leaf_path(root, shard, window="2019")
+        assert hive.read_commit(open_store(leaf))["complete"] is True
+
+
+class TestWindowedRunnerWiring:
+    """Both dispatchers fan (shard, window) units into the shared write path."""
+
+    def _catalog(self, tmp_path):
+        import json as _json
+
+        shard = _shard_word()
+        catalog = {
+            "metadata": {"short_name": "ATL06", "version": "007"},
+            "grid_signature": {
+                "type": "healpix",
+                "indexing_scheme": "nested",
+                "parent_order": 6,
+                "child_order": 12,
+                "layout": "fullsphere",
+            },
+            "shard_keys": [shard],
+            "granules": [
+                [
+                    _timed_rec(1, "2019-03-01T00:00:00Z", "2019-03-01T00:05:00Z"),
+                    _timed_rec(2, "2020-07-01T00:00:00Z", "2020-07-01T00:05:00Z"),
+                    _timed_rec(3, "2019-12-31T23:58:00Z", "2020-01-01T00:02:00Z"),
+                ]
+            ],
+        }
+        p = tmp_path / "catalog.json"
+        p.write_text(_json.dumps(catalog))
+        return str(p), shard
+
+    def test_local_windowed_fanout_manifest_and_root_union(self, monkeypatch, cfg, tmp_path):
+        from zagg import runner
+        from zagg.runner import agg
+
+        _windowed(cfg)
+        catalog_path, shard = self._catalog(tmp_path)
+        root = str(tmp_path / "out")
+        calls = []
+
+        monkeypatch.setattr(runner, "get_nsidc_s3_credentials", lambda: {"accessKeyId": "a"})
+
+        def fake_hive_write(shard_key, granule_urls, grid, s3_creds, store_root, config, **kw):
+            w = kw["window"]
+            calls.append((int(shard_key), w["label"], len(granule_urls)))
+            return {
+                "shard_key": int(shard_key),
+                "error": None,
+                "total_obs": 1,
+                "time_range": [
+                    f"{w['label']}-03-01T00:00:00+00:00",
+                    f"{w['label']}-11-01T00:00:00+00:00",
+                ],
+            }
+
+        monkeypatch.setattr(hive, "process_and_write_hive", fake_hive_write)
+        agg(cfg, catalog=catalog_path, store=root, backend="local")
+
+        # One unit per (shard, window); the straddler rides both years.
+        assert sorted(calls) == [(shard, "2019", 2), (shard, "2020", 2)]
+        # The manifest declares /2 + the temporal block.
+        m = hive.read_manifest(root)
+        assert m["spec"] == "morton-hive/2"
+        assert m["temporal"]["schedule"] == "yearly"
+        # The root summary carries the run's time-range union (D15 cache).
+        env = hive.read_root_coverage(root)
+        assert env["time_range"] == ["2019-03-01T00:00:00+00:00", "2020-11-01T00:00:00+00:00"]
+
+    def test_lambda_cell_event_carries_window(self, cfg):
+        import json as _json
+        from unittest.mock import MagicMock
+
+        from zagg.runner import _invoke_lambda_cell
+
+        payload_box = MagicMock()
+        payload_box.read.return_value = _json.dumps(
+            {"statusCode": 200, "body": _json.dumps({"total_obs": 1})}
+        ).encode()
+        client = MagicMock()
+        client.invoke.return_value = {"Payload": payload_box, "FunctionError": None}
+
+        creds = {"accessKeyId": "a", "secretAccessKey": "s", "sessionToken": "t"}
+        window = {"label": "2019", "start": 365 * 86400.0, "end": 730 * 86400.0}
+        _invoke_lambda_cell(
+            client,
+            (0,),
+            _shard_word(),
+            6,
+            12,
+            ["s3://b/g1.h5"],
+            "s3://out/store",
+            creds,
+            function_name="process-shard",
+            config_dict=None,
+            window=window,
+        )
+        event = _json.loads(client.invoke.call_args.kwargs["Payload"])
+        assert event["window"] == window
+
+        # Unwindowed invoke: no "window" key — the event stays byte-identical
+        # to the pre-#246 payload.
+        _invoke_lambda_cell(
+            client,
+            (0,),
+            _shard_word(),
+            6,
+            12,
+            ["s3://b/g1.h5"],
+            "s3://out/store",
+            creds,
+            function_name="process-shard",
+            config_dict=None,
+        )
+        event = _json.loads(client.invoke.call_args.kwargs["Payload"])
+        assert "window" not in event
+
+
+class TestShardMapTimeMetadata:
+    def test_granule_entry_carries_time_range(self):
+        from zagg.catalog.shardmap import _granule_entry
+
+        rec = _timed_rec(1, "2019-03-01T00:00:00+00:00", "2019-03-01T00:05:00+00:00")
+        entry = _granule_entry(rec)
+        assert entry["time_start"] == "2019-03-01T00:00:00+00:00"
+        assert entry["time_end"] == "2019-03-01T00:05:00+00:00"
+        # Legacy records without the keys stay byte-identical.
+        legacy = {"id": "g", "s3": "s3://b/g.h5", "https": "https://h/g.h5"}
+        assert _granule_entry(legacy) == legacy

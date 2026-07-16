@@ -20,6 +20,7 @@ client-side -- so the headless render core is unchanged.
 Everything here is pure Python (no ipyleaflet): the bbox helper and the picker
 are unit-testable with just the core deps.
 """
+
 from __future__ import annotations
 
 from zagg.viz.shardmap import grid_from_signature
@@ -146,8 +147,7 @@ def pick_crs(shardmap, override=None) -> str:
     if override is not None:
         if override not in _CRS_INFO:
             raise ValueError(
-                f"unsupported crs override {override!r}; "
-                f"expected one of {sorted(_CRS_INFO)}"
+                f"unsupported crs override {override!r}; expected one of {sorted(_CRS_INFO)}"
             )
         return override
 
@@ -172,9 +172,7 @@ def crs_info(crs: str) -> dict:
         If ``crs`` is not a supported code.
     """
     if crs not in _CRS_INFO:
-        raise ValueError(
-            f"unsupported crs {crs!r}; expected one of {sorted(_CRS_INFO)}"
-        )
+        raise ValueError(f"unsupported crs {crs!r}; expected one of {sorted(_CRS_INFO)}")
     return _CRS_INFO[crs]
 
 
