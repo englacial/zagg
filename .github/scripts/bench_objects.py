@@ -116,8 +116,8 @@ def expected_object_counts(
     if store_layout == "flat":
         _require_fullsphere(grid)
         members = _member_layouts(grid)
-        # Root zarr.json + group zarr.json + one zarr.json per array.
-        metadata = 2 + len(members)
+        # Root zarr.json + group zarr.json + one zarr.json per array (exact).
+        metadata_min = metadata_max = 2 + len(members)
         lo = hi = 0
         for m in members:
             blocks = m["blocks_per_shard"]
@@ -130,9 +130,16 @@ def expected_object_counts(
                 lo += 1
     elif store_layout == "hive":
         members = _member_layouts(grid, leaf=True)
-        # Store root: the morton_hive.json manifest, plus the root coverage
-        # MOC when output.coverage_moc is on (hive default).
-        metadata = 1 + (1 if coverage_moc else 0)
+        # Store root: the morton_hive.json manifest (always written) PLUS the
+        # root coverage.moc when output.coverage_moc is on (the hive default).
+        # The root MOC is a fail-open, regenerable D9 cache
+        # (runner.write_root_coverage) — it may legitimately be ABSENT (e.g. the
+        # orchestrator role can't PUT it), so it is an OPTIONAL metadata object:
+        # the floor is the manifest alone, the ceiling adds the MOC. A real
+        # sharded-write bypass lands in the per-shard DATA counts (asserted
+        # exactly in object_count_mismatch), never in this metadata window.
+        metadata_min = 1
+        metadata_max = 1 + (1 if coverage_moc else 0)
         # Leaf fixed objects: leaf root zarr.json + group zarr.json + one
         # zarr.json per array, plus the in-leaf coverage.moc sidecar (written
         # for any populated leaf when the leaf has depth, i.e. child_order >
@@ -147,11 +154,14 @@ def expected_object_counts(
     else:
         raise ValueError(f"unknown store_layout: {store_layout!r} (expected 'flat' or 'hive')")
     return {
-        "metadata": metadata,
+        # ``metadata`` is the CEILING (kept for back-compat / display); the floor
+        # is ``metadata_min`` — equal on flat (exact), a [1, 1+moc] window on hive.
+        "metadata": metadata_max,
+        "metadata_min": metadata_min,
         "per_shard_min": lo,
         "per_shard_max": hi,
-        "total_min": metadata + n_shards * lo,
-        "total_max": metadata + n_shards * hi,
+        "total_min": metadata_min + n_shards * lo,
+        "total_max": metadata_max + n_shards * hi,
         "exact": lo == hi,
     }
 
@@ -301,32 +311,39 @@ def measure_objects(
 def object_count_mismatch(measured: dict, expected: dict) -> str | None:
     """Describe a measured-vs-expected object-count mismatch, or ``None``.
 
-    Exact expectations (the flat sharded matrix) assert the total AND each
-    shard's count — a bypass regression writing K per-chunk objects (issue
-    #215) fails both. Bounded expectations (unsharded / hive data-dependent
-    counts) assert the total stays inside ``[total_min, total_max]``.
-    Metadata is checked unconditionally (it is fixed in every layout, and the
-    #215 blow-up's CSR-subgroup ``zarr.json`` footprint lands in the metadata
-    bucket — review, PR #242), and unclassifiable keys are always a finding:
-    the model claims to know every object the run writes.
+    The real sharded-write-bypass guard (issue #215: a leaf writing K
+    per-inner-chunk objects instead of one sharded object) is the PER-SHARD DATA
+    count, asserted exactly whenever the per-shard count is deterministic
+    (``exact``). Metadata and total are checked as **windows**: on flat they
+    collapse to an exact assertion (``min == max``); on hive they widen by one
+    for the optional, fail-open D9 root ``coverage.moc`` (present or absent are
+    both valid). Unclassifiable keys are always a finding: the model claims to
+    know every object the run writes.
     """
     problems = []
     total = measured["objects_total"]
-    if measured["objects_metadata"] != expected["metadata"]:
+    meta = measured["objects_metadata"]
+    meta_lo, meta_hi = expected["metadata_min"], expected["metadata"]
+    if not (meta_lo <= meta <= meta_hi):
         problems.append(
-            f"metadata objects {measured['objects_metadata']} != expected {expected['metadata']}"
+            f"metadata objects {meta} != expected {meta_hi}"
+            if meta_lo == meta_hi
+            else f"metadata objects {meta} outside [{meta_lo}, {meta_hi}]"
         )
+    lo_t, hi_t = expected["total_min"], expected["total_max"]
+    if not (lo_t <= total <= hi_t):
+        problems.append(
+            f"total objects {total} != expected {hi_t}"
+            if lo_t == hi_t
+            else f"total objects {total} outside [{lo_t}, {hi_t}]"
+        )
+    # Per-shard DATA exactness — the #215 bypass tripwire — regardless of the
+    # metadata/total window (a bypass inflates a shard's data-object count).
     if expected["exact"]:
-        if total != expected["total_max"]:
-            problems.append(f"total objects {total} != expected {expected['total_max']}")
         per = expected["per_shard_max"]
         bad = {k: v for k, v in measured["objects_per_shard"].items() if v != per}
         if bad:
             problems.append(f"per-shard object counts != expected {per}: {bad}")
-    elif not (expected["total_min"] <= total <= expected["total_max"]):
-        problems.append(
-            f"total objects {total} outside [{expected['total_min']}, {expected['total_max']}]"
-        )
     if measured["objects_other"]:
         problems.append(
             f"{measured['objects_other']} unrecognized object key(s), "

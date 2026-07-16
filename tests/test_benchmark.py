@@ -1862,9 +1862,13 @@ def test_run_target_threads_store_layout():
     assert flat_rec["store_layout"] == "flat"
 
 
-def test_hive_config_expected_counts_exact():
-    # The committed hive arm's model: exact, with the coverage sidecar + the
-    # store-root manifest/MOC in the fixed counts (hive defaults coverage_moc).
+def test_hive_config_expected_counts_root_moc_optional():
+    # The committed hive arm's model: per-shard DATA is exact (11 objects/leaf,
+    # the sharded-write-bypass tripwire), but the store-root coverage.moc is a
+    # fail-open, regenerable D9 cache (runner.write_root_coverage) that may be
+    # present OR absent -- so store-root metadata is a [1, 2] window (the
+    # morton_hive.json manifest always; +coverage.moc when it lands) and the
+    # total is [12, 13]. A real bypass still fails on the exact per-shard count.
     import bench_objects
 
     from zagg.config import get_coverage_moc, get_store_layout, load_config
@@ -1877,13 +1881,14 @@ def test_hive_config_expected_counts_exact():
         grid, n_shards=1, store_layout="hive", coverage_moc=True
     )
     # 4 arrays (cell_ids/morton/count/h_tdigest): leaf root+group zarr.json (2)
-    # + 4 array zarr.json + 4 sharded data objects + coverage sidecar = 11;
-    # store root = morton_hive.json + coverage.moc = 2.
+    # + 4 array zarr.json + 4 sharded data objects + coverage sidecar = 11.
+    # Store root: morton_hive.json (always) + coverage.moc (optional) -> [1, 2].
     assert exp == {
         "metadata": 2,
+        "metadata_min": 1,
         "per_shard_min": 11,
         "per_shard_max": 11,
-        "total_min": 13,
+        "total_min": 12,
         "total_max": 13,
         "exact": True,
     }

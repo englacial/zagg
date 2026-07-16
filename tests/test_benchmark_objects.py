@@ -108,6 +108,7 @@ def test_expected_counts_live_matrix_config():
     exp = bench_objects.expected_object_counts(from_config(config), n_shards=1)
     assert exp == {
         "metadata": 6,
+        "metadata_min": 6,
         "per_shard_min": 4,
         "per_shard_max": 4,
         "total_min": 10,
@@ -317,6 +318,7 @@ def test_hive_store_matches_model(tmp_path, monkeypatch):
 def test_mismatch_exact_flags_total_and_per_shard():
     expected = {
         "metadata": 6,
+        "metadata_min": 6,
         "per_shard_min": 4,
         "per_shard_max": 4,
         "total_min": 10,
@@ -339,6 +341,7 @@ def test_mismatch_exact_flags_total_and_per_shard():
 def test_mismatch_bounded_checks_range_only():
     expected = {
         "metadata": 6,
+        "metadata_min": 6,
         "per_shard_min": 3,
         "per_shard_max": 64,
         "total_min": 9,
@@ -447,6 +450,7 @@ def test_mismatch_flags_metadata_drift():
     # metadata bucket, not just the total (review, PR #242).
     expected = {
         "metadata": 6,
+        "metadata_min": 6,
         "per_shard_min": 4,
         "per_shard_max": 4,
         "total_min": 10,
