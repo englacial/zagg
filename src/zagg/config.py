@@ -664,7 +664,10 @@ def _validate_raster_config(config: PipelineConfig) -> None:
     # capabilities; the raster path always writes the flat (time, cells) store
     # and never consults these keys (issue #239), so an explicit request is a
     # config mistake, not a no-op — reject it pointedly.
-    if config.output.get("store_layout") == "hive":
+    store_layout = config.output.get("store_layout")
+    if store_layout is not None and store_layout not in ("flat", "hive"):
+        raise ValueError(f"output.store_layout must be 'flat' or 'hive' (got {store_layout!r})")
+    if store_layout == "hive":
         raise ValueError(
             "output.store_layout: hive is not supported on the raster path "
             "yet — see issue #237 for the design; drop the key (raster output "
