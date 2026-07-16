@@ -63,3 +63,5 @@ site/*
 # Catalog drift baselines (large, regenerable from the cached pull via
 # bench/drift_catalog.py build). The harness + report are tracked, not these.
 bench/drift/*.json
+# local test-run output (e.g. tests writing ./out.zarr)
+out.zarr/
