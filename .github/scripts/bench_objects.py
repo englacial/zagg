@@ -20,10 +20,14 @@ so it cannot drift from what the template actually emits:
   array at K>1 gives 1..K objects (zarr's default ``write_empty_chunks=False``
   omits all-fill chunks, so empty inner chunks write nothing).
 - **hive** (per-shard leaf zarrs): store-root objects (``morton_hive.json``,
-  plus ``coverage.moc`` when ``output.coverage_moc`` is on) plus, per populated
-  leaf, the leaf metadata (root + group + per-array ``zarr.json``), the
-  in-leaf ``coverage.moc`` sidecar (depth > 0), one leaf-sharded ragged object
-  per ragged field, and 1..K objects per dense array.
+  plus ``coverage.moc`` when ``output.coverage_moc`` is on — the hive default)
+  plus, per populated leaf, the leaf metadata (root + group + per-array
+  ``zarr.json``), the in-leaf ``coverage.moc`` sidecar (depth > 0), one
+  whole-leaf ragged object per ragged field, and — since issue #236 — one
+  whole-leaf ShardingCodec object per dense array when ``sharded`` (the hive
+  default), making the sharded hive count EXACT like the flat sharded one; an
+  unsharded K>1 leaf keeps the bounded 1..K dense estimate. (The commit stamp
+  rewrites the leaf root ``zarr.json`` in place — no extra object.)
 
 Determinism caveats (documented, not modeled): a populated shard is assumed to
 write every array — true when every field aggregates the same observations

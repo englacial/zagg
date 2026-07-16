@@ -82,6 +82,14 @@ FULL_AOI_COLUMNS = [
     # reindex), like the per-merge series.
     "objects_total",
     "objects_expected",
+    # Store-layout axis + flat<->hive parity verdict (issue #240 phase 4).
+    # ``store_layout`` is "flat"|"hive" (null pre-hive rows read as flat; the
+    # renderers key the 2x2 panels on flat rows only). ``parity_ok`` is the
+    # record-only flat<->hive content-parity verdict on a ``parity_with``
+    # target (null elsewhere / unknown); the ``parity`` detail dict stays
+    # JSON-only (dropped below).
+    "store_layout",
+    "parity_ok",
 ]
 
 # run-record write_throughput key -> flat column name.
@@ -92,8 +100,9 @@ _WT_MAP = {
     "cells_timeout": "wt_cells_timeout",
 }
 
-# Nested / planning-only run-record fields that don't belong in the flat series.
-_DROP_KEYS = ("temporal", "per_shard_granules", "apriori_estimate")
+# Nested / planning-only run-record fields that don't belong in the flat series
+# ("parity" is the nested flat<->hive detail; its verdict rides "parity_ok").
+_DROP_KEYS = ("temporal", "per_shard_granules", "apriori_estimate", "parity")
 
 
 def flatten_record(record: dict) -> dict:

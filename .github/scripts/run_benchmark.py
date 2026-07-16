@@ -219,6 +219,10 @@ def run_target(
         # Read-backend axis (issue #193): "inline"|"sidecar" -- the live matrix's
         # A/B, split by the renderer into its two columns. None on frozen rows.
         index_backend=target.get("index_backend"),
+        # Store-layout axis (issue #240 phase 4): "flat"|"hive" from the
+        # target's config, so the hive regression arm is identifiable in the
+        # series (renderers key the 2x2 panels on flat rows).
+        store_layout=get_store_layout(config),
     )
 
     objects = None

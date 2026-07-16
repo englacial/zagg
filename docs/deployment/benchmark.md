@@ -34,6 +34,14 @@ frozen under `provisional_targets` (retained, not rerun), and the pre-reset live
 datapoints are dropped from the corrected series at the render layer, so the 2×2
 starts fresh at the first post-reset merge.
 
+A fifth committed target, `tdigest_healpix_o9_hive` (issue #240, unblocked by
+issue #236), runs the same config with `store_layout: hive` — a **write-path
+regression arm**, not a cost A/B: the object-count tripwire hard-fails the
+per-merge run if a leaf's sharded write is ever bypassed (the ~250× object
+blow-up of issue #215). It deliberately stays out of the 2×2 panels (keyed on
+flat rows via the `store_layout` series column); its numbers land in the PR
+comment table and the retained series.
+
 ![inline/sidecar × AOI-mask — latest merge](https://raw.githubusercontent.com/englacial/zagg/benchmarks/site/matrix_table.png)
 
 ### Cost per shard vs runtime (inline/sidecar × AOI-mask)
@@ -77,6 +85,16 @@ Three views — the live matrix's two cost columns, plus the store-layout tripwi
   step here. On this per-release leg it is **record-only** (the release still
   lands its series point); the per-merge harness *hard-fails* on the same
   mismatch.
+
+The release matrix also carries a fifth target, `full_aoi_neon_o9_hive` (issue
+#240 phase 4): the same config with `store_layout: hive` over all 4 shards,
+plus a **flat↔hive output-parity** read-back against its flat sibling
+(`parity_with` in the manifest) — per-shard, per-array content equality,
+recorded as `parity_ok` in the series. Everything on this leg — object counts
+and parity alike — is **record-only**: a release is never blocked on it (flaky
+CMR must not gate a release; the per-merge harness is the hard-fail tripwire).
+Hive rows stay out of the 2×2 cost panels (`store_layout` column) until the
+layout axis gets its own panel row.
 
 ### Whole-AOI cost across releases
 
