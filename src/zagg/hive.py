@@ -255,7 +255,14 @@ def validate_manifest(
 
 
 def ensure_manifest(store_root: str, manifest: dict, *, overwrite: bool = False, **store_kwargs):
-    """Write the root manifest once at template time; verify it on reruns.
+    """Write the root manifest at finalize / end of run; verify it on reruns.
+
+    Since issue #252 this write rides finalize rather than running once at
+    template time ahead of the fan-out — the manifest is reader-facing only
+    (D6), so keeping it off the critical path is safe. The fail-fast half of
+    the guard is exposed separately as :func:`validate_manifest`, which
+    dispatchers run pre-fan-out to refuse an incompatible existing store BEFORE
+    any leaf write (D2), even though this write now lands at the end.
 
     A retry into an existing hive store must be able to proceed (that is the
     D4 debris/retry model), so an existing manifest is accepted — but only if
