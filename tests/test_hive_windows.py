@@ -499,3 +499,251 @@ class TestWindowedWalkerAndSidecar:
         )
         # The shard id parses out of the WINDOWED basename (first-`_` split).
         np.testing.assert_array_equal(hive.read_coverage_bitmap(leaf), occupied)
+
+
+# ── windowed stamps + coverage "full" + root time union (phase 4) ────────────
+
+
+class TestWindowedStamp:
+    def _leaf(self, cfg):
+        from zarr.storage import MemoryStore
+
+        grid = HealpixGrid(parent_order=6, child_order=8, layout="fullsphere", config=cfg)
+        store = MemoryStore()
+        grid.emit_shard_template(store, overwrite=True)
+        return store
+
+    def test_windowed_stamp_round_trip(self, cfg):
+        store = self._leaf(cfg)
+        hive.stamp_commit(
+            store,
+            cells_with_data=5,
+            granule_count=2,
+            window="2025",
+            time_range=["2025-03-01T06:00:00+00:00", "2025-11-20T18:30:00+00:00"],
+        )
+        stamp = hive.read_commit(store)
+        # D15 truth half: the stamp carries the window label + the ACTUAL
+        # written range as ISO-8601 UTC strings (ratified #246 Q2), spec /2.
+        assert stamp["spec"] == "morton-hive/2"
+        assert stamp["window"] == "2025"
+        assert stamp["time_range"] == ["2025-03-01T06:00:00+00:00", "2025-11-20T18:30:00+00:00"]
+
+    def test_unwindowed_stamp_unchanged(self, cfg):
+        store = self._leaf(cfg)
+        hive.stamp_commit(store, cells_with_data=5, granule_count=2)
+        stamp = hive.read_commit(store)
+        assert stamp["spec"] == "morton-hive/1"
+        # Pin the exact pre-#246 key set: no new keys leak into unwindowed stamps.
+        assert set(stamp) == {
+            "spec",
+            "complete",
+            "cells_with_data",
+            "granule_count",
+            "written_at",
+        }
+
+    def test_time_range_requires_window(self, cfg):
+        store = self._leaf(cfg)
+        with pytest.raises(ValueError, match="windowed stamps only"):
+            hive.stamp_commit(
+                store,
+                cells_with_data=1,
+                granule_count=1,
+                time_range=["2025-01-01T00:00:00+00:00", "2025-02-01T00:00:00+00:00"],
+            )
+
+
+class TestCoverageFull:
+    def _grid(self, cfg):
+        return HealpixGrid(parent_order=6, child_order=8, layout="fullsphere", config=cfg)
+
+    def test_full_envelope_shape(self, cfg):
+        import numpy as np
+
+        word = _shard_word()
+        occupied = np.asarray(self._grid(cfg).children(word), dtype=np.uint64)
+        cov = hive.build_coverage(word, occupied, 8, full=True)
+        assert cov["encoding"] == "full"
+        # No sidecar is written or pointed to (D14): the pointer keys are absent.
+        assert "sidecar" not in cov and "nbytes" not in cov and "raw_nbytes" not in cov
+        # The tier-0 box is carried unconditionally — full occupancy collapses
+        # it to the shard's own id (the trivial 1-member cover).
+        from zagg.grids.morton import morton_decimal
+
+        assert cov["box"][0] == morton_decimal(word)
+
+    def test_full_and_bitmap_mutually_exclusive(self, cfg):
+        word = _shard_word()
+        with pytest.raises(ValueError, match="mutually exclusive"):
+            hive.build_coverage(word, None, 8, bitmap=b"x", full=True)
+
+    def _stamped_leaf(self, cfg, tmp_path, *, full):
+        import numpy as np
+
+        from zagg.store import open_store
+
+        grid = self._grid(cfg)
+        word = _shard_word()
+        root = str(tmp_path / "store")
+        leaf = hive.shard_leaf_path(root, word, window="2025")
+        store = open_store(leaf)
+        grid.emit_shard_template(store, overwrite=True)
+        if full:
+            occupied = np.asarray(grid.children(word), dtype=np.uint64)
+            cov = hive.build_coverage(word, occupied, grid.child_order, full=True)
+        else:
+            occupied = np.sort(np.asarray(grid.children(word)[:3], dtype=np.uint64))
+            bitmap = hive.encode_coverage_bitmap(word, occupied, grid.child_order)
+            hive.write_coverage_sidecar(leaf, bitmap)
+            cov = hive.build_coverage(word, occupied, grid.child_order, bitmap=bitmap)
+        hive.stamp_commit(
+            store, cells_with_data=len(occupied), granule_count=1, window="2025", coverage=cov
+        )
+        return grid, word, leaf, occupied
+
+    def test_full_leaf_writes_no_sidecar_and_short_circuits(self, cfg, tmp_path):
+        import os
+
+        import numpy as np
+
+        from zagg.coverage import bitmap_and
+
+        grid, word, leaf, _occ = self._stamped_leaf(cfg, tmp_path, full=True)
+        # The whole point of "full": NO sidecar object exists in the leaf.
+        assert not os.path.exists(os.path.join(leaf, hive.COVERAGE_SIDECAR))
+        assert hive.read_coverage_bitmap(leaf) is None  # nothing to GET
+        # bitmap_and short-circuits via the shard's own MOC membership: an AOI
+        # of two child cells intersects exactly those cells.
+        aoi = np.asarray(grid.children(word)[5:7], dtype=np.uint64)
+        np.testing.assert_array_equal(np.sort(bitmap_and(leaf, aoi)), np.sort(aoi))
+
+    def test_partial_leaf_keeps_the_bitmap_path(self, cfg, tmp_path):
+        import numpy as np
+
+        from zagg.coverage import bitmap_and
+
+        grid, word, leaf, occupied = self._stamped_leaf(cfg, tmp_path, full=False)
+        children = np.asarray(grid.children(word), dtype=np.uint64)
+        aoi = children[1:5]  # overlaps occupied[1:3] only
+        got = bitmap_and(leaf, aoi)
+        np.testing.assert_array_equal(np.sort(got), np.sort(np.intersect1d(occupied, aoi)))
+        # A miss is definitive (exact encoding).
+        assert bitmap_and(leaf, children[5:7]).size == 0
+
+    def test_box_only_stamp_degrades_to_none(self, cfg, tmp_path):
+        import numpy as np
+
+        from zagg.coverage import bitmap_and
+        from zagg.store import open_store
+
+        grid = self._grid(cfg)
+        word = _shard_word()
+        leaf = hive.shard_leaf_path(str(tmp_path / "store"), word)
+        store = open_store(leaf)
+        grid.emit_shard_template(store, overwrite=True)
+        occupied = np.asarray(grid.children(word)[:2], dtype=np.uint64)
+        hive.stamp_commit(
+            store,
+            cells_with_data=2,
+            granule_count=1,
+            coverage=hive.build_coverage(word, occupied, grid.child_order),
+        )
+        assert bitmap_and(leaf, occupied) is None  # box-only: fall back to box
+
+
+class TestRootTimeUnion:
+    def test_union_time_range(self):
+        assert hive.union_time_range(None, None) is None
+        got = hive.union_time_range(
+            ["2024-06-01T00:00:00+00:00", "2024-09-01T00:00:00+00:00"],
+            None,
+            ["2024-01-01T00:00:00+00:00", "2024-07-01T00:00:00+00:00"],
+        )
+        assert got == ["2024-01-01T00:00:00+00:00", "2024-09-01T00:00:00+00:00"]
+
+    def test_union_drops_malformed_with_warning(self, caplog):
+        import logging
+
+        with caplog.at_level(logging.WARNING, logger="zagg.hive"):
+            got = hive.union_time_range(
+                ["garbage", "2024-01-01"],
+                ["2024-06-01T00:00:00+00:00", "2024-07-01T00:00:00+00:00"],
+            )
+        assert got == ["2024-06-01T00:00:00+00:00", "2024-07-01T00:00:00+00:00"]
+        assert any("malformed time_range" in r.message for r in caplog.records)
+
+    def test_envelope_carries_time_range_only_when_given(self):
+        import numpy as np
+
+        word = _shard_word()
+        keys = np.asarray([word], dtype=np.uint64)
+        assert "time_range" not in hive.build_root_coverage(keys, 6)
+        env = hive.build_root_coverage(
+            keys, 6, time_range=["2024-01-01T00:00:00+00:00", "2025-01-01T00:00:00+00:00"]
+        )
+        assert env["time_range"] == ["2024-01-01T00:00:00+00:00", "2025-01-01T00:00:00+00:00"]
+
+    def test_write_root_coverage_unions_time_ranges(self, tmp_path):
+        import numpy as np
+
+        root = str(tmp_path / "store")
+        word = _shard_word()
+        keys = np.asarray([word], dtype=np.uint64)
+        hive.write_root_coverage(
+            root,
+            hive.build_root_coverage(
+                keys, 6, time_range=["2024-01-01T00:00:00+00:00", "2024-06-01T00:00:00+00:00"]
+            ),
+        )
+        merged = hive.write_root_coverage(
+            root,
+            hive.build_root_coverage(
+                keys, 6, time_range=["2024-03-01T00:00:00+00:00", "2025-01-01T00:00:00+00:00"]
+            ),
+        )
+        assert merged["time_range"] == ["2024-01-01T00:00:00+00:00", "2025-01-01T00:00:00+00:00"]
+        # One-sided: a later run without a range keeps the accumulated union.
+        merged = hive.write_root_coverage(root, hive.build_root_coverage(keys, 6))
+        assert merged["time_range"] == ["2024-01-01T00:00:00+00:00", "2025-01-01T00:00:00+00:00"]
+
+    def test_load_coverage_tolerates_time_range(self, tmp_path):
+        import numpy as np
+
+        from zagg.coverage import load_coverage
+
+        root = str(tmp_path / "store")
+        keys = np.asarray([_shard_word()], dtype=np.uint64)
+        hive.write_root_coverage(
+            root,
+            hive.build_root_coverage(
+                keys, 6, time_range=["2024-01-01T00:00:00+00:00", "2025-01-01T00:00:00+00:00"]
+            ),
+        )
+        env = load_coverage(root)
+        assert env is not None
+        assert env["time_range"] == ["2024-01-01T00:00:00+00:00", "2025-01-01T00:00:00+00:00"]
+
+    def test_refresh_rebuilds_time_union_from_stamps(self, cfg, tmp_path):
+        from zagg.coverage import refresh_root_coverage
+        from zagg.store import open_store
+
+        _windowed(cfg)
+        from zagg.config import get_windowing
+
+        grid = HealpixGrid(parent_order=6, child_order=8, layout="fullsphere", config=cfg)
+        root = str(tmp_path / "store")
+        hive.ensure_manifest(root, hive.build_manifest(grid, windowing=get_windowing(cfg)))
+        word = _shard_word()
+        for label, lo, hi in [
+            ("2024", "2024-02-01T00:00:00+00:00", "2024-11-01T00:00:00+00:00"),
+            ("2025", "2025-01-15T00:00:00+00:00", "2025-03-01T00:00:00+00:00"),
+        ]:
+            leaf = hive.shard_leaf_path(root, word, window=label)
+            store = open_store(leaf)
+            grid.emit_shard_template(store, overwrite=True)
+            hive.stamp_commit(
+                store, cells_with_data=1, granule_count=1, window=label, time_range=[lo, hi]
+            )
+        env = refresh_root_coverage(root)
+        assert env["time_range"] == ["2024-02-01T00:00:00+00:00", "2025-03-01T00:00:00+00:00"]

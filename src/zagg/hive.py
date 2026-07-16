@@ -284,7 +284,9 @@ def read_manifest(store_root: str, **store_kwargs) -> dict | None:
     return _read_json(open_object_store(store_root, **store_kwargs), MANIFEST_NAME)
 
 
-def build_coverage(shard_key, occupied, cell_order: int, *, bitmap: bytes | None = None) -> dict:
+def build_coverage(
+    shard_key, occupied, cell_order: int, *, bitmap: bytes | None = None, full: bool = False
+) -> dict:
     """Coverage payload for one shard's commit stamp (§4, issue #200).
 
     ``occupied`` is the shard's occupied cell words (mixed order allowed —
@@ -309,7 +311,18 @@ def build_coverage(shard_key, occupied, cell_order: int, *, bitmap: bytes | None
     reader treats their absence as "box only". Raises ``ValueError`` if the
     box escapes the shard's subtree (occupied cells from another shard are
     an upstream bug, never stamped).
+
+    ``full`` (issue #246, D14) marks whole-subtree coverage: the ``encoding``
+    discriminator becomes ``"full"`` and NO sidecar is written or pointed to
+    — the shard id itself is the exact MOC, so readers skip the sidecar GET
+    entirely. Decided by one popcount at stamp time (the caller's job);
+    mutually exclusive with ``bitmap``.
     """
+    if full and bitmap is not None:
+        raise ValueError(
+            "full=True and a bitmap payload are mutually exclusive: a fully "
+            "occupied subtree writes no sidecar (D14)"
+        )
     from zagg.grids.morton import morton_box, morton_decimal
 
     shard = morton_decimal(shard_key)
@@ -329,7 +342,9 @@ def build_coverage(shard_key, occupied, cell_order: int, *, bitmap: bytes | None
         "cell_order": int(cell_order),
         "source": "worker",
     }
-    if bitmap is not None:
+    if full:
+        coverage["encoding"] = "full"
+    elif bitmap is not None:
         n_bits = 4 ** (int(cell_order) - _decimal_order(shard))
         coverage.update(
             encoding="bitmap",
@@ -458,14 +473,19 @@ def write_coverage_sidecar(leaf_root: str, payload: bytes, **store_kwargs) -> No
     obstore.put(open_object_store(leaf_root, **store_kwargs), COVERAGE_SIDECAR, payload)
 
 
-def read_coverage_bitmap(leaf_root: str, **store_kwargs) -> np.ndarray | None:
+def read_coverage_bitmap(
+    leaf_root: str, *, coverage: dict | None = None, **store_kwargs
+) -> np.ndarray | None:
     """A leaf's exact occupied cell words from its sidecar, or ``None``.
 
     Gates on the committed stamp's envelope (:func:`read_coverage`): no
     stamp, a box-only phase-1 payload (no ``encoding``/``sidecar`` keys), an
     unknown encoding, or a missing sidecar object all read ``None`` — the
     box is then the only index and readers degrade per D9, never to wrong
-    answers. A PRESENT-but-corrupt sidecar raises instead (see
+    answers. An ``encoding: "full"`` envelope (issue #246, D14) also reads
+    ``None`` here — there IS no sidecar; the shard id itself is the exact
+    MOC and :func:`zagg.coverage.bitmap_and` short-circuits on it. Pass an
+    already-read ``coverage`` envelope to skip the stamp GET. A PRESENT-but-corrupt sidecar raises instead (see
     :func:`decode_coverage_bitmap` — degrading a corrupt payload would be
     indistinguishable from healthy box-only coverage). The shard id comes
     from the leaf basename — ``{full_id}.zarr``, or the windowed
@@ -479,7 +499,8 @@ def read_coverage_bitmap(leaf_root: str, **store_kwargs) -> np.ndarray | None:
     from zagg.grids.morton import morton_word
     from zagg.store import open_store
 
-    coverage = read_coverage(open_store(leaf_root, **store_kwargs))
+    if coverage is None:
+        coverage = read_coverage(open_store(leaf_root, **store_kwargs))
     if not coverage or coverage.get("encoding") != "bitmap" or not coverage.get("sidecar"):
         return None
     # Windowed leaves (issue #246) carry `{full_id}_{window}.zarr` basenames;
@@ -494,7 +515,13 @@ def read_coverage_bitmap(leaf_root: str, **store_kwargs) -> np.ndarray | None:
 
 
 def stamp_commit(
-    leaf_store, *, cells_with_data: int, granule_count: int, coverage: dict | None = None
+    leaf_store,
+    *,
+    cells_with_data: int,
+    granule_count: int,
+    coverage: dict | None = None,
+    window: str | None = None,
+    time_range: tuple | list | None = None,
 ) -> None:
     """Stamp a shard leaf complete — the shard's FINAL write (D4).
 
@@ -504,15 +531,32 @@ def stamp_commit(
     overwrite the prefix wholesale. ``coverage`` (issue #200) attaches the
     tier-0 payload from :func:`build_coverage`; ``None`` writes the
     pre-coverage stamp unchanged.
+
+    ``window``/``time_range`` (issue #246, D15): a windowed leaf's stamp is
+    the TRUTH half of the temporal split — it records the window label and
+    the actual ``[t_min, t_max]`` written, as ISO-8601 UTC strings (ratified
+    on the #246 thread; the manifest keeps only the static schedule). A
+    windowed stamp declares ``spec: "morton-hive/2"``; unwindowed stamps stay
+    ``/1``, byte-identical to pre-windowing runs. ``time_range`` without a
+    ``window`` is rejected — unwindowed leaf extent stays data-plane only.
     """
+    if window is None and time_range is not None:
+        raise ValueError(
+            "time_range rides windowed stamps only (D15: unwindowed leaves make "
+            "no extent claim in the stamp); pass window= as well"
+        )
     group = zarr.open_group(leaf_store, path="", mode="r+", zarr_format=3)
     stamp: dict = {
-        "spec": HIVE_SPEC,
+        "spec": HIVE_SPEC if window is None else HIVE_SPEC_V2,
         "complete": True,
         "cells_with_data": int(cells_with_data),
         "granule_count": int(granule_count),
         "written_at": _utcnow(),
     }
+    if window is not None:
+        stamp["window"] = str(window)
+        if time_range is not None:
+            stamp["time_range"] = [str(t) for t in time_range]
     if coverage is not None:
         stamp["coverage"] = coverage
     group.attrs[COMMIT_ATTR] = stamp
@@ -578,7 +622,9 @@ def _rank_tail(rank: int, depth: int) -> str:
     return "".join(reversed(digits))
 
 
-def build_root_coverage(shard_keys, order: int, *, source: str = "dispatcher") -> dict:
+def build_root_coverage(
+    shard_keys, order: int, *, source: str = "dispatcher", time_range: tuple | list | None = None
+) -> dict:
     """Store-root coverage envelope from completed shard keys (issue #200 phase 3).
 
     The O1 serialization: JSON ranges under the ``morton-moc/1`` envelope,
@@ -591,6 +637,12 @@ def build_root_coverage(shard_keys, order: int, *, source: str = "dispatcher") -
     packed-word order — the bitmap's rank convention at the root). Endpoints
     are D1 decimal STRINGS: packed u64 words exceed 2^53, so raw JSON
     numbers would be silently mangled by any float-based parser (O1).
+
+    ``time_range`` (issue #246, D15): the root summary optionally carries the
+    ``[min, max]`` ISO-8601 UTC union of the run's leaf-stamp time ranges —
+    CACHE, never truth (the per-leaf stamps are the truth; the walk and the
+    sweep regenerate this). Omitted for unwindowed stores, keeping their root
+    object byte-identical to pre-#246 runs.
     """
     from zagg.grids.morton import to_morton_array
 
@@ -616,7 +668,7 @@ def build_root_coverage(shard_keys, order: int, *, source: str = "dispatcher") -
         ranges.append([start, prev])
         start = prev = dec
     ranges.append([start, prev])
-    return {
+    envelope = {
         "spec": COVERAGE_SPEC,
         "encoding": "ranges",
         "order": int(order),
@@ -624,6 +676,9 @@ def build_root_coverage(shard_keys, order: int, *, source: str = "dispatcher") -
         "generated_at": _utcnow(),
         "ranges": ranges,
     }
+    if time_range is not None:
+        envelope["time_range"] = [str(t) for t in time_range]
+    return envelope
 
 
 def root_coverage_words(envelope: dict) -> np.ndarray:
@@ -654,6 +709,31 @@ def root_coverage_words(envelope: dict) -> np.ndarray:
             raise ValueError(f"malformed coverage range [{lo}, {hi}] at order {order}")
         words.extend(morton_word(base + _rank_tail(r, order)) for r in range(lo_rank, hi_rank + 1))
     return np.unique(np.asarray(words, dtype=np.uint64))
+
+
+def union_time_range(*ranges) -> list | None:
+    """The ``[min, max]`` ISO-UTC union of time ranges; ``None``s drop out.
+
+    Malformed entries (non-2-sequences, unparsable instants) are DROPPED with
+    a warning rather than raised: the union feeds cache carriers (the root
+    summary, D15) whose write paths are fail-open — a bad cached range must
+    not fail the run, and the leaf stamps remain the truth.
+    """
+    from zagg.windows import iso_utc, parse_utc
+
+    starts, ends = [], []
+    for r in ranges:
+        if r is None:
+            continue
+        try:
+            lo, hi = r
+            starts.append(parse_utc(lo))
+            ends.append(parse_utc(hi))
+        except (TypeError, ValueError) as e:
+            logger.warning(f"dropping malformed time_range {r!r} from the union ({e})")
+    if not starts:
+        return None
+    return [iso_utc(min(starts)), iso_utc(max(ends))]
 
 
 def write_root_coverage(store_root: str, envelope: dict, **store_kwargs) -> dict:
@@ -694,7 +774,14 @@ def write_root_coverage(store_root: str, envelope: dict, **store_kwargs) -> dict
             try:
                 union = np.union1d(root_coverage_words(existing), root_coverage_words(envelope))
                 merged = build_root_coverage(
-                    union, int(envelope["order"]), source=envelope.get("source", "dispatcher")
+                    union,
+                    int(envelope["order"]),
+                    source=envelope.get("source", "dispatcher"),
+                    # D15: incremental runs accumulate the time union too —
+                    # cache semantics identical to the spatial ranges.
+                    time_range=union_time_range(
+                        existing.get("time_range"), envelope.get("time_range")
+                    ),
                 )
             except (KeyError, TypeError, ValueError) as e:
                 logger.warning(
@@ -928,6 +1015,7 @@ __all__ = [
     "root_coverage_words",
     "shard_leaf_path",
     "stamp_commit",
+    "union_time_range",
     "write_coverage_sidecar",
     "write_root_coverage",
 ]

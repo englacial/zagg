@@ -35,6 +35,7 @@ from zagg.hive import (
     read_manifest,
     read_root_coverage,
     root_coverage_words,
+    union_time_range,
 )
 from zagg.store import open_object_store
 from zagg.windows import split_leaf_name
@@ -108,20 +109,35 @@ def box_and(coverage: dict, aoi) -> np.ndarray:
 
 
 def bitmap_and(leaf_root: str, aoi, **store_kwargs) -> np.ndarray | None:
-    """Exact cell-level intersection via a leaf's bitmap sidecar.
+    """Exact cell-level intersection via a leaf's coverage (bitmap or full).
 
-    One opt-in sidecar GET (:func:`zagg.hive.read_coverage_bitmap`), then
-    ``moc_and`` against ``aoi``. ``None`` when the leaf carries no bitmap
-    (box-only phase-1 stamp, depth-0 config, debris, absent leaf) — the
-    caller falls back to the box verdict; a present-but-corrupt sidecar
-    raises (the decoder's posture). An empty array is a definitive miss:
-    the bitmap is exact, not conservative.
+    Reads the stamp envelope once. ``encoding: "full"`` (issue #246, D14 —
+    whole-subtree coverage, no sidecar object exists) short-circuits to the
+    shard's own MOC membership: ``moc_and`` against the shard id resolves
+    containment exactly, with no bitmap GET and no cell expansion. The
+    ``"bitmap"`` path pays the one opt-in sidecar GET
+    (:func:`zagg.hive.read_coverage_bitmap`, envelope reused). ``None`` when
+    the leaf carries neither (box-only phase-1 stamp, depth-0 config, debris,
+    absent leaf) — the caller falls back to the box verdict; a
+    present-but-corrupt sidecar raises (the decoder's posture). An empty
+    array is a definitive miss: both encodings are exact, not conservative.
     """
-    occupied = read_coverage_bitmap(leaf_root, **store_kwargs)
-    if occupied is None:
+    from zagg.hive import read_coverage
+    from zagg.store import open_store
+
+    coverage = read_coverage(open_store(leaf_root, **store_kwargs))
+    if not coverage:
         return None
     from mortie import moc_and
 
+    if coverage.get("encoding") == "full":
+        from zagg.grids.morton import morton_word
+
+        word = morton_word(split_leaf_name(leaf_root.rstrip("/").rsplit("/", 1)[-1])[0])
+        return moc_and(np.asarray([word], dtype=np.uint64), np.asarray(aoi, dtype=np.uint64))
+    occupied = read_coverage_bitmap(leaf_root, coverage=coverage, **store_kwargs)
+    if occupied is None:
+        return None
     return moc_and(occupied, np.asarray(aoi, dtype=np.uint64))
 
 
@@ -222,7 +238,8 @@ def refresh_root_coverage(store_root: str, **store_kwargs) -> dict | None:
     order = int(manifest["shard_order"])
     store = open_object_store(store_root, **store_kwargs)
     root = store_root.rstrip("/")
-    keys = []
+    keys: list = []
+    time_ranges: list = []
     stack = [""]
     while stack:
         prefix = stack.pop()
@@ -243,7 +260,8 @@ def refresh_root_coverage(store_root: str, **store_kwargs) -> dict | None:
                         f"listed in {ROOT_COVERAGE_NAME}"
                     )
                     continue
-                if read_commit(open_store(f"{root}/{rel}", **store_kwargs)) is None:
+                stamp = read_commit(open_store(f"{root}/{rel}", **store_kwargs))
+                if stamp is None:
                     continue  # unstamped debris (D4)
                 if _decimal_order(decimal) != order:
                     # A fixed-order ranges MOC cannot represent this leaf:
@@ -259,6 +277,10 @@ def refresh_root_coverage(store_root: str, **store_kwargs) -> dict | None:
                     )
                     continue
                 keys.append(morton_word(decimal))
+                # D15: windowed stamps carry the leaf's actual time range;
+                # the rebuilt root summary re-derives the union from this
+                # walk's stamps (truth), superseding any cached value.
+                time_ranges.append(stamp.get("time_range"))
                 continue
             is_digit_node = (
                 _is_base_component(name) if prefix == "" else len(name) == 1 and name in "1234"
@@ -272,7 +294,9 @@ def refresh_root_coverage(store_root: str, **store_kwargs) -> dict | None:
         except (FileNotFoundError, NotFoundError):
             pass
         return None
-    envelope = build_root_coverage(keys, order, source="refresh")
+    envelope = build_root_coverage(
+        keys, order, source="refresh", time_range=union_time_range(*time_ranges)
+    )
     obstore.put(store, ROOT_COVERAGE_NAME, json.dumps(envelope, indent=1).encode())
     return envelope
 
