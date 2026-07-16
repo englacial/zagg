@@ -151,9 +151,14 @@ manifest check like an orders change — clear the root first.
 
 ## The manifest (`morton_hive.json`)
 
-Written **once at template time**, before any shard dispatches; never touched
-during a run (D6). With it, every shard path is computable arithmetically with
-zero requests:
+Written **once, at finalize** — after the fan-out, before any reader arrives
+([issue #252](https://github.com/englacial/zagg/issues/252); it rode template
+time before, but it is reader-facing only — workers write self-describing
+leaves and never read it, so the write is off the critical path). Never
+touched during a run (D6); a read-only frozen-key precheck
+(`zagg.hive.validate_manifest`) still runs before the fan-out so an
+incompatible existing store refuses up front. With the manifest, every shard
+path is computable arithmetically with zero requests:
 
 ```json
 {
@@ -316,7 +321,8 @@ doesn't list, it warns once per store and suggests
 that rebuilds the root MOC from the stamped leaves (debris excluded) and
 writes it with `source: "refresh"`. No reader ever auto-walks (D10).
 
-**Deploy note** (mirrors the PR #205 setup-echo note): the Lambda leg posts
+**Deploy note** (the sync-invoke analogue is the `mode: "ping"` preflight,
+which replaced the PR #205 setup echo — issue #252): the Lambda leg posts
 one fire-and-forget `mode: "coverage"` invoke, which requires the
 redeployed function. An **older deployment 400s the event in its process
 handler** — a logged error line in CloudWatch, but no writes, no result
@@ -360,10 +366,12 @@ under D9/O7). The §7 sweep remains the authoritative rebuilder.
 - **Both backends** write hive stores end-to-end through the same
   `zagg.hive.process_and_write_hive` code path. On **Lambda**
   ([issue #199](https://github.com/englacial/zagg/issues/199) phase 3)
-  `mode: "setup"` writes only the manifest — the orchestrator still needs no
-  S3 access — and each worker derives its leaf path from its `shard_key` +
-  the event config's orders, emits its own leaf template, and stamps
-  completion as its final PUT. The async status channel stays at the flat
+  the manifest write rides `mode: "finalize"`
+  ([issue #252](https://github.com/englacial/zagg/issues/252); a lightweight
+  `mode: "ping"` preflight keeps the pre-fan-out fail-fast) — the
+  orchestrator still needs no S3 access — and each worker derives its leaf
+  path from its `shard_key` + the event config's orders, emits its own leaf
+  template, and stamps completion as its final PUT. The async status channel stays at the flat
   sibling prefix (`{store_root}.status/<run_id>/…`), outside the digit tree.
 - **Coverage ships** ([issue #200](https://github.com/englacial/zagg/issues/200)
   phases 1–4): the tier-0 morton box on the commit stamp, the exact

@@ -114,8 +114,10 @@ leaf stores. No zarr-version coupling in either direction.
 
 ## 3. Layer 1: the static manifest (`morton_hive.json`)
 
-Written **once at template time**, before any shard dispatches. O(1); never
-touched again during a run. Contents:
+Written **once, at finalize** (issue #252 — it rode template time before, but
+it is reader-facing only and workers never read it, so the write comes off
+the pre-dispatch critical path; a read-only frozen-key precheck keeps the
+up-front refusal). O(1); never touched again during a run. Contents:
 
 - `spec`: convention version string (e.g. `"morton-hive/1"`) — the convention
   itself is versioned from day one (D6).
@@ -404,7 +406,8 @@ write path (§2) is load-bearing; this phase is optimization.
   range + acquisition/granule count. Root summary (cache): the end-of-run
   root coverage object gains the time-range union alongside the MOC;
   sweep-regenerable, never truth. Extent never lives in the manifest, so
-  the manifest stays write-once at template time (§3); the noted exception
+  the manifest stays write-once (§3; written at finalize since issue
+  #252); the noted exception
   is the explicit-range-list schedule, where appending outside the list
   re-templates the manifest — append-heavy stores should prefer generative
   schedules. (That exception is an implication recorded from the ratified

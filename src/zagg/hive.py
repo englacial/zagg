@@ -17,9 +17,10 @@ leaf zarr** under a morton digit tree::
   ``*.zarr`` objects — zero zarr metadata above the leaf, so 2,000 workers
   share no mutable state and a delimiter-LIST with no digit children is a
   definitive "nothing finer exists".
-- **Manifest (D6)**: ``morton_hive.json`` is written once at template time and
-  never touched during a run; with it every shard path is computable with zero
-  requests. The convention is versioned (``morton-hive/1``) from day one.
+- **Manifest (D6)**: ``morton_hive.json`` is written once — at finalize since
+  issue #252 (reader-facing only; workers never read it) — and never touched
+  during a run; with it every shard path is computable with zero requests.
+  The convention is versioned (``morton-hive/1``) from day one.
 - **Commit stamp (D4)**: the shard's FINAL write is a root
   ``group.attrs.update(...)`` marking completion (plus cell count, timestamp,
   granule count). A ``.zarr/`` prefix whose root metadata lacks the stamp is

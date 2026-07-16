@@ -642,9 +642,12 @@ def _handle_setup(event: Dict[str, Any]) -> Dict[str, Any]:
     For a hive-layout config (issue #199 phase 3) template time writes ONLY
     the ``morton_hive.json`` manifest — no global zarr template exists (zero
     metadata above the leaves, D5); each worker emits its own leaf template.
-    The optional ``dataset`` event key carries the manifest's identity block
-    (the orchestrator sources it from the ShardMap metadata, same as the local
-    path). The flat path below is byte-identical to before, bar one addition:
+    Current dispatchers no longer send hive setup (the manifest rides finalize
+    since issue #252); this branch stays so OLDER dispatchers keep working
+    against a redeployed function. The optional ``dataset`` event key carries
+    the manifest's identity block (the orchestrator sources it from the
+    ShardMap metadata, same as the local path).
+    The flat path below is byte-identical to before, bar one addition:
     the success body now ECHOES the layout it acted on (``"layout"``) — a
     stale deployment without the hive branch returns the old echo-less body,
     which the dispatcher rejects for hive runs instead of silently letting old
