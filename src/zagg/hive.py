@@ -555,6 +555,27 @@ def stamp_commit(
     if window is not None:
         stamp["window"] = str(window)
         if time_range is not None:
+            # The stamp is the D15 TRUTH half — it fails CLOSED on a bad range
+            # (unlike the fail-open cache union). Validate a 2-sequence of
+            # parseable UTC instants with t_min <= t_max before it becomes
+            # durable truth; the production path already builds this via
+            # windows.iso_time_range (worker min/max, ordered), so this guards
+            # direct callers. (review finding, PR #248)
+            from zagg.windows import parse_utc
+
+            try:
+                lo, hi = time_range
+                lo_dt, hi_dt = parse_utc(lo), parse_utc(hi)
+            except (TypeError, ValueError) as e:
+                raise ValueError(
+                    f"time_range must be a 2-sequence of parseable UTC instants "
+                    f"[t_min, t_max]; got {time_range!r} ({e})"
+                ) from e
+            if lo_dt > hi_dt:
+                raise ValueError(
+                    f"time_range is reversed: t_min {lo!r} follows t_max {hi!r} "
+                    f"(the D15 stamp is truth and must fail closed on a bad range)"
+                )
             stamp["time_range"] = [str(t) for t in time_range]
     if coverage is not None:
         stamp["coverage"] = coverage
