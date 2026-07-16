@@ -700,6 +700,18 @@ def _validate_windowing(config: PipelineConfig) -> None:
         schedule = _windows.check_schedule(block.get("schedule", "none"))
     except ValueError as e:
         raise ValueError(f"output.windowing.schedule: {e}") from e
+    if schedule == "none":
+        # An inert ``schedule: none`` block is equivalent to an absent block
+        # (``get_windowing`` returns ``None``, no windowed output), so it must
+        # NOT require the hive/healpix layout — this early return precedes the
+        # layout guards. A stray ``windows`` key is still rejected, mirroring
+        # the generative-schedule check below (validation symmetry).
+        if block.get("windows") is not None:
+            raise ValueError(
+                "output.windowing.windows only applies to schedule: explicit "
+                "(schedule: none produces no windowed output)"
+            )
+        return
     grid = config.output.get("grid") or {}
     if (grid.get("type", "healpix")) != "healpix":
         raise ValueError(
@@ -711,19 +723,23 @@ def _validate_windowing(config: PipelineConfig) -> None:
             "output.windowing requires output.store_layout: hive (window leaves "
             "are hive leaf zarrs; the flat shared store has no leaves to window)"
         )
-    if schedule == "none":
-        return
     time_field = block.get("time_field")
     if not isinstance(time_field, str) or not time_field:
         raise ValueError(
             "output.windowing.time_field is required: the per-observation "
             "timestamp column that decides window membership"
         )
-    declared = {
-        **(config.data_source or {}).get("coordinates", {}),
-        **(config.data_source or {}).get("variables", {}),
-    }
-    if declared and time_field not in declared:
+    # The worker can only filter on columns it actually reads: the flat
+    # data_source coordinates/variables plus any readable segment-level
+    # variable a hierarchical level declares (issue #30 mapping form,
+    # ``_segment_variable_names``). The check is unconditional — a windowing
+    # store that declares no columns cannot filter on ``time_field`` at all.
+    declared = (
+        set((config.data_source or {}).get("coordinates", {}))
+        | set((config.data_source or {}).get("variables", {}))
+        | _segment_variable_names(config.data_source or {})
+    )
+    if time_field not in declared:
         raise ValueError(
             f"output.windowing.time_field {time_field!r} is not a declared "
             f"data_source column (one of {sorted(declared)}); the worker can "
