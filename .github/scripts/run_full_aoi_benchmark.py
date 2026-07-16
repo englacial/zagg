@@ -43,6 +43,7 @@ Two JSON files. ``--out-json`` is one **run record** per target::
       "lambda_seconds", "gb_seconds", "cost_usd",             # Lambda GB-s -- the PRIMARY cost column
       "total_wall_s", "setup_s", "fanout_s", "finalize_s",
       "worker_max_s", "worker_median_s", "worker_pct_timeout", "max_memory_mb",
+      "objects_total", "objects_expected", "objects_mismatch",  # store object counts (issue #240), record-only
       "write_throughput": {                                    # leg-5 acceptance signal
         "invoke_retries_total", "invoke_throttle_shards",
         "s3_slowdown_shards", "cells_timeout"
@@ -62,7 +63,8 @@ consumes (one row per dispatched shard, tagged with its run identity)::
       "wall_time_s",          # orchestrator-observed wall for this shard
       "retries",              # invoke-level transient-fault retries (throttle)
       "timeout",              # hit the function timeout
-      "status_code", "error"  # null on success
+      "status_code", "error", # null on success
+      "objects"               # store objects attributed to this shard (issue #240; null when unmeasured)
     }
 
 Usage::
@@ -88,8 +90,14 @@ import numpy as np
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import bench_metrics  # noqa: E402
+import bench_objects  # noqa: E402
 
-from zagg.config import get_handoff, load_config  # noqa: E402
+from zagg.config import (  # noqa: E402
+    get_coverage_moc,
+    get_handoff,
+    get_store_layout,
+    load_config,
+)
 from zagg.dispatch import LAMBDA_MEMORY_GB, LAMBDA_PRICE_PER_GB_SEC  # noqa: E402
 from zagg.grids import from_config  # noqa: E402
 
@@ -295,6 +303,35 @@ def _apriori_estimate(counts: list[int], sec_per_granule: float) -> dict:
     }
 
 
+def _measure_objects_recorded(
+    name, config, grid, store: str, shard_keys: list[int], n_ok: int, *, region: str
+) -> dict:
+    """Object-count metric (issue #240), RECORD-ONLY on the release leg.
+
+    A mismatch (or a failed LIST) must never sink the release run -- the series
+    data point still lands, and the regression is visible in the recorded
+    columns / rendered panel instead. The per-merge harness is the hard-fail
+    tripwire (``run_benchmark.py``). Expected counts are modeled over the
+    shards that completed WITH data (``n_ok``) -- an errored shard may have
+    written partially, so exactness is not claimed over torn writes.
+    """
+    try:
+        objects = bench_objects.measure_objects(
+            store,
+            grid=grid,
+            shard_keys=shard_keys,
+            n_shards=n_ok,
+            store_layout=get_store_layout(config),
+            coverage_moc=get_coverage_moc(config),
+            region=region,
+        )
+    except Exception as exc:  # record-only: never fail the release run
+        objects = {"objects_mismatch": f"object-count measurement failed: {exc}"}
+    if objects.get("objects_mismatch"):
+        print(f"[{name}] store object-count mismatch: {objects['objects_mismatch']}", flush=True)
+    return objects
+
+
 def _assert_account(region: str, expect_account: str | None):
     if not expect_account:
         return None
@@ -388,6 +425,9 @@ def run_target(
             lambda_seconds=None,
             gb_seconds=None,
             cost_usd=None,
+            objects_total=None,
+            objects_expected=None,
+            objects_mismatch=None,
         )
         return run, []
 
@@ -425,7 +465,28 @@ def run_target(
         max_memory_mb=summary.get("max_memory_mb"),
         write_throughput=_write_throughput(results),
     )
+    objects: dict = {}
+    if store:
+        objects = _measure_objects_recorded(
+            name,
+            config,
+            grid,
+            store,
+            [int(k) for k in sm.shard_keys],
+            int(summary.get("cells_with_data") or 0),
+            region=region,
+        )
+    run.update(
+        objects_total=objects.get("objects_total"),
+        objects_expected=objects.get("objects_expected"),
+        objects_mismatch=objects.get("objects_mismatch"),
+    )
     shard_rows = _shard_records(sm, summary, target, {**context, "target": name}, grid)
+    # Per-shard object attribution rides the per-shard records (the plot's
+    # schema); null when unmeasured (no store) or unattributed (errored shard).
+    per_shard_objects = objects.get("objects_per_shard") or {}
+    for row in shard_rows:
+        row["objects"] = per_shard_objects.get(row["shard_label"])
     return run, shard_rows
 
 

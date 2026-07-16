@@ -97,19 +97,15 @@ def _measure_objects(config, grid, store: str, shard_key: int, *, region: str) -
     store factory (and credentials) the dispatch just wrote through, so a LIST
     failure is a real run failure, not a swallowed warning.
     """
-    layout = get_store_layout(config)
-    expected = bench_objects.expected_object_counts(
-        grid, n_shards=1, store_layout=layout, coverage_moc=get_coverage_moc(config)
+    return bench_objects.measure_objects(
+        store,
+        grid=grid,
+        shard_keys=[shard_key],
+        n_shards=1,
+        store_layout=get_store_layout(config),
+        coverage_moc=get_coverage_moc(config),
+        region=region,
     )
-    measured = bench_objects.store_object_counts(
-        store, grid=grid, shard_keys=[shard_key], store_layout=layout, region=region
-    )
-    return {
-        "objects_total": measured["objects_total"],
-        "objects_expected": expected["total_max"] if expected["exact"] else None,
-        "objects_per_shard": measured["objects_per_shard"],
-        "objects_mismatch": bench_objects.object_count_mismatch(measured, expected),
-    }
 
 
 def load_targets(path: str) -> tuple[dict, Path]:

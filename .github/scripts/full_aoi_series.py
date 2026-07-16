@@ -75,6 +75,13 @@ FULL_AOI_COLUMNS = [
     "wt_invoke_throttle_shards",
     "wt_s3_slowdown_shards",
     "wt_cells_timeout",
+    # Store object counts (issue #240, record-only on the release leg): the
+    # measured store object total and the config-derived expectation (null
+    # when the layout's count is data-dependent). The run record's
+    # ``objects_mismatch`` description stays JSON-only (dropped by the
+    # reindex), like the per-merge series.
+    "objects_total",
+    "objects_expected",
 ]
 
 # run-record write_throughput key -> flat column name.
