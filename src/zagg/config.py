@@ -660,6 +660,22 @@ def _validate_raster_config(config: PipelineConfig) -> None:
             "raster templates do not support sharded: true yet (issue #218); "
             "chunks are (1, cells_per_chunk) — one object per timestep-chunk"
         )
+    # The hive shard layout and its root coverage MOC are point-pipeline
+    # capabilities; the raster path always writes the flat (time, cells) store
+    # and never consults these keys (issue #239), so an explicit request is a
+    # config mistake, not a no-op — reject it pointedly.
+    if config.output.get("store_layout") == "hive":
+        raise ValueError(
+            "output.store_layout: hive is not supported on the raster path "
+            "yet — see issue #237 for the design; drop the key (raster output "
+            "is a flat (time, cells) store)"
+        )
+    if config.output.get("coverage_moc") is True:
+        raise ValueError(
+            "output.coverage_moc is not supported on the raster path yet — "
+            "see issue #237 for the design; drop the flag (there is no hive "
+            "store root to write coverage.moc to)"
+        )
     # Time-windowed hive leaves are a point-pipeline capability in this round;
     # the raster (time, cells) product's windowing is its own design (issue
     # #247). Reject pointedly rather than silently ignoring the block —
