@@ -184,6 +184,11 @@ def build_manifest(grid, dataset: dict | None = None, windowing: dict | None = N
             "epoch": windowing["epoch"],
             "scale": windowing["scale"],
             "units": windowing["units"],
+            # D15 records calendar alongside encoding/units/epoch. Only
+            # proleptic_gregorian is supported this round: the three scales
+            # (utc/gps/tai) all derive from stdlib datetime, which is proleptic
+            # Gregorian.
+            "calendar": "proleptic_gregorian",
             # Generative schedules append by adding leaves the schedule already
             # describes (manifest untouched); the explicit list is the noted
             # D15 exception — appending outside it re-templates the manifest.

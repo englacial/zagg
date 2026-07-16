@@ -60,6 +60,24 @@ class TestWindowingConfig:
         validate_config(cfg)
         assert get_windowing(cfg) is None
 
+    def test_schedule_none_inert_on_flat_layout(self, cfg):
+        # A ``schedule: none`` block is equivalent to an absent block, so it
+        # must validate on a flat/non-healpix store — the layout guards run
+        # only for a live (generative) schedule.
+        cfg.output["windowing"] = {"schedule": "none"}
+        validate_config(cfg)
+        assert get_windowing(cfg) is None
+
+    def test_schedule_none_rejects_stray_windows(self, cfg):
+        # Validation symmetry: a stray ``windows`` list is rejected under
+        # ``schedule: none`` just as it is under a generative schedule.
+        cfg.output["windowing"] = {
+            "schedule": "none",
+            "windows": [{"label": "x", "start": "2019-01-01", "end": "2020-01-01"}],
+        }
+        with pytest.raises(ValueError, match="schedule: explicit"):
+            validate_config(cfg)
+
     def test_yearly_normalized(self, cfg):
         _windowed(cfg)
         validate_config(cfg)
@@ -133,6 +151,41 @@ class TestWindowingConfig:
         _windowed(cfg, time_field="not_a_column")
         with pytest.raises(ValueError, match="declared data_source column"):
             validate_config(cfg)
+
+    def test_time_field_rejected_when_no_columns_declared(self, cfg):
+        # An empty read set is itself rejected: a store reading no columns
+        # cannot filter on ``time_field`` (the check is unconditional).
+        _windowed(cfg)
+        cfg.data_source["coordinates"] = {}
+        cfg.data_source["variables"] = {}
+        with pytest.raises(ValueError, match="declared data_source column"):
+            validate_config(cfg)
+
+    def test_time_field_from_level_declared_variable_accepted(self, cfg):
+        # A readable segment-level variable declared on a non-base level
+        # (issue #30 mapping form) is a valid ``time_field``: it broadcasts to
+        # a per-photon column the worker reads.
+        _windowed(cfg, time_field="seg_time")
+        cfg.data_source["base_level"] = "photons"
+        cfg.data_source["levels"] = {
+            "photons": {
+                "path": "/{group}/heights",
+                "coordinates": ["lat_ph", "lon_ph"],
+                "variables": ["h_ph"],
+            },
+            "segments": {
+                "path": "/{group}/geolocation",
+                "coordinates": ["reference_photon_lat"],
+                "variables": {"seg_time": "/{group}/geolocation/delta_time"},
+                "link": {
+                    "to": "photons",
+                    "index_beg": "/{group}/geolocation/ph_index_beg",
+                    "count": "/{group}/geolocation/segment_ph_cnt",
+                },
+            },
+        }
+        validate_config(cfg)
+        assert get_windowing(cfg)["time_field"] == "seg_time"
 
     def test_requires_epoch(self, cfg):
         _windowed(cfg, epoch=None)
@@ -261,6 +314,7 @@ class TestManifestTemporal:
             "epoch": "2018-01-01T00:00:00+00:00",
             "scale": "gps",
             "units": "seconds",
+            "calendar": "proleptic_gregorian",
             "append_policy": "new-window",
         }
 
