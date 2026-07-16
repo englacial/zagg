@@ -764,7 +764,9 @@ def _handle_ping(event: Dict[str, Any]) -> Dict[str, Any]:
     into a store templated for different orders/identity refuses up front
     (the D2 mixed-order footgun) instead of after the fan-out — the writer-
     side guard the manifest fold would otherwise defer to finalize (PR #255
-    review fold). Kept while flat exists (issue #251): once flat is removed,
+    review fold). This covers sequential reruns; two concurrent runs into the
+    same fresh root both see no manifest and only collide at the losing run's
+    finalize. Kept while flat exists (issue #251): once flat is removed,
     a stale function simply errors and the ping can be dropped.
     """
     logger.info(f"Ping mode: hive preflight for {event.get('store_path')}")
