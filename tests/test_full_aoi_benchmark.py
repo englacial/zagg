@@ -317,3 +317,70 @@ def test_hive_target_manifest_wiring():
     assert get_store_layout(flat_cfg) == "flat"
     # Same grid modulo layout: the parity comparison is only meaningful then.
     assert cfg.output["grid"] == {**flat_cfg.output["grid"]}
+
+
+def test_ok_shard_keys_is_the_cells_with_data_predicate():
+    # Errored AND granule-less shards write no hive leaf: parity must only
+    # cover status-200/no-error shards (review, PR 242 phase 4).
+    results = [
+        {"shard_key": 1, "status_code": 200, "error": None},
+        {"shard_key": 2, "status_code": 200, "error": "worker OOM"},
+        {"shard_key": 3, "status_code": 500, "error": None},
+        {"shard_key": None, "status_code": 200, "error": None},
+        {"shard_key": 4, "status_code": 200, "error": None},
+    ]
+    assert rfab._ok_shard_keys(results) == [1, 4]
+    assert rfab._ok_shard_keys([]) == []
+
+
+def test_parity_recorded_gates_on_session_targets(monkeypatch, tmp_path):
+    # --target subselection: the hive arm alone must NOT compare against a
+    # stale flat store from a prior release -- unknown, with the reason kept.
+    grid, shard, flat_root, hive_root = _parity_stores(tmp_path, monkeypatch)
+    target = {"parity_with": "flat_sibling"}
+    skipped = rfab._parity_recorded(
+        "hive_arm",
+        target,
+        hive_root,
+        grid,
+        [shard],
+        n_shards=1,
+        session_targets={"hive_arm"},  # sibling NOT dispatched this session
+        region="us-west-2",
+    )
+    assert skipped["parity_ok"] is None
+    assert "flat_sibling" in skipped["skipped"]
+    # No parity_with (the flat arms) -> None; no store (dry-ish) -> None.
+    assert (
+        rfab._parity_recorded(
+            "flat", {}, hive_root, grid, [shard], n_shards=1, session_targets=None, region="r"
+        )
+        is None
+    )
+
+
+def test_parity_recorded_runs_over_ok_shards_and_counts_skips(monkeypatch, tmp_path):
+    # With the sibling dispatched this session, parity runs over the ok-shard
+    # set and records how many dispatched shards it did not cover.
+    grid, shard, flat_root, hive_root = _parity_stores(tmp_path, monkeypatch)
+    # The harness derives flat_store from the hive store's prefix, so lay the
+    # flat store out as a sibling named <parity_with>.zarr.
+    import shutil
+
+    sibling_store = str(tmp_path / "flat_sibling.zarr")
+    shutil.move(flat_root, sibling_store)
+    hive_store = str(tmp_path / "hive_arm.zarr")
+    shutil.move(hive_root, hive_store)
+    out = rfab._parity_recorded(
+        "hive_arm",
+        {"parity_with": "flat_sibling"},
+        hive_store,
+        grid,
+        [shard],
+        n_shards=4,  # 3 dispatched shards errored/empty -> not covered
+        session_targets={"flat_sibling", "hive_arm"},
+        region="us-west-2",
+    )
+    assert out["parity_ok"] is True
+    assert out["shards_checked"] == 1
+    assert out["shards_skipped"] == 3
