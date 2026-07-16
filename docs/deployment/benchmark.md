@@ -34,13 +34,19 @@ frozen under `provisional_targets` (retained, not rerun), and the pre-reset live
 datapoints are dropped from the corrected series at the render layer, so the 2×2
 starts fresh at the first post-reset merge.
 
-A fifth committed target, `tdigest_healpix_o9_hive` (issue #240, unblocked by
-issue #236), runs the same config with `store_layout: hive` — a **write-path
-regression arm**, not a cost A/B: the object-count tripwire hard-fails the
+The fifth committed target, `tdigest_healpix_o9_hive` (issue #240, unblocked
+by issue #236), runs the same config with `store_layout: hive` — the
+**primary arm** now that hive is the HEALPix default (issue #253) and a
+**write-path regression tripwire**: the object-count check hard-fails the
 per-merge run if a leaf's sharded write is ever bypassed (the ~250× object
 blow-up of issue #215). It deliberately stays out of the 2×2 panels (keyed on
 flat rows via the `store_layout` series column); its numbers land in the PR
 comment table and the retained series.
+
+The four flat targets are the retained **flat-vs-hive migration A/B** (their
+configs pin `store_layout: flat` explicitly since the issue #253 default
+flip). No new flat arms are added; the flat arms freeze once the CONUS
+flat-vs-hive validation lands (issue #251).
 
 ![inline/sidecar × AOI-mask — latest merge](https://raw.githubusercontent.com/englacial/zagg/benchmarks/site/matrix_table.png)
 

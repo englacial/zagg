@@ -9,9 +9,13 @@ D1–D6); the convention itself is owned by the mortie spec and versioned as
 [Time windows](#time-windows-morton-hive2) below) is `morton-hive/2` — a
 strict superset: a `/1` store *is* a `/2` store with `schedule: none`.
 
-It is opt-in (default `flat`, today's single shared store) and wired to
-**both backends** — the local runner and the Lambda handler share the same
-per-shard write path (see [Status](#status)).
+It is the **default for HEALPix point aggregation** (issue #253): an omitted
+`output.store_layout` resolves to `hive`. An explicit `store_layout: flat`
+(the single shared store) remains for interop/debug but is deprecated —
+removal is gated on the sparse-DGGS read path (issue #251 phase 3);
+rectilinear grids and raster pipelines keep the flat shared store. Hive is
+wired to **both backends** — the local runner and the Lambda handler share
+the same per-shard write path (see [Status](#status)).
 
 ## Layout
 
