@@ -670,7 +670,10 @@ def _validate_raster_config(config: PipelineConfig) -> None:
             "yet — see issue #237 for the design; drop the key (raster output "
             "is a flat (time, cells) store)"
         )
-    if config.output.get("coverage_moc") is True:
+    coverage_moc = config.output.get("coverage_moc")
+    if coverage_moc is not None and not isinstance(coverage_moc, bool):
+        raise ValueError(f"output.coverage_moc must be a boolean (got {coverage_moc!r})")
+    if coverage_moc:
         raise ValueError(
             "output.coverage_moc is not supported on the raster path yet — "
             "see issue #237 for the design; drop the flag (there is no hive "
