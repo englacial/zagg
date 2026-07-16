@@ -688,6 +688,11 @@ def make_codec_figure(df: pd.DataFrame, cost_col: str, cost_label: str, out_png:
 FULL_AOI_FIGURES = {
     "full_aoi_cost_total": ("cost_usd", "whole-AOI cost (USD)"),
     "full_aoi_cost_per_100km2": ("cost_per_100km2_usd", "AOI-avg cost / 100 km² (USD)"),
+    # Store object total (issue #240, record-only on this leg): a sharded-write
+    # bypass multiplies the store's object count ~K-fold (issue #215), so the
+    # regression reads as a step in this panel even though the release run is
+    # never failed on it. Null on releases recorded before the metric existed.
+    "full_aoi_objects": ("objects_total", "store objects (total)"),
 }
 
 
@@ -731,6 +736,12 @@ def make_full_aoi_release_figure(
     # consistent -- a non-empty frame without ``target`` returns False, not a
     # KeyError).
     if hist.empty or "target" not in hist.columns or hist["target"].dropna().empty:
+        return False
+    # A metric column appended after the series started (e.g. objects_total,
+    # issue #240) is absent from a pre-append parquet and all-null until the
+    # first release records it: skip the figure (no broken/empty panel) rather
+    # than KeyError.
+    if cost_col not in hist.columns or hist[cost_col].dropna().empty:
         return False
     layout, nrows, ncols = _matrix_layout(hist)
     return _render_panel_grid(

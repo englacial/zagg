@@ -227,6 +227,44 @@ def store_object_counts(
     }
 
 
+def measure_objects(
+    store_path: str,
+    *,
+    grid,
+    shard_keys,
+    n_shards: int,
+    store_layout: str = "flat",
+    coverage_moc: bool = False,
+    **store_kwargs,
+) -> dict:
+    """Measure a run's store objects and compare against the expected model.
+
+    The shared harness entry point (issue #240): LISTs ``store_path``,
+    attributes per shard, and returns the record payload both harnesses
+    thread into their metrics -- measured total, the exact expectation (null
+    when the layout's count is data-dependent), the per-shard attribution,
+    and the mismatch description (null when clean). ``n_shards`` is the number
+    of shards expected to have written (the dispatch count for the per-merge
+    harness, the completed-with-data count for the full-AOI fan-out).
+    """
+    expected = expected_object_counts(
+        grid, n_shards=n_shards, store_layout=store_layout, coverage_moc=coverage_moc
+    )
+    measured = store_object_counts(
+        store_path,
+        grid=grid,
+        shard_keys=shard_keys,
+        store_layout=store_layout,
+        **store_kwargs,
+    )
+    return {
+        "objects_total": measured["objects_total"],
+        "objects_expected": expected["total_max"] if expected["exact"] else None,
+        "objects_per_shard": measured["objects_per_shard"],
+        "objects_mismatch": object_count_mismatch(measured, expected),
+    }
+
+
 def object_count_mismatch(measured: dict, expected: dict) -> str | None:
     """Describe a measured-vs-expected object-count mismatch, or ``None``.
 

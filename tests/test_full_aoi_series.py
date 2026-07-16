@@ -67,6 +67,10 @@ def _record(commit="c0", target="full_aoi_neon_o9_inline_nomask", event="release
             "s3_slowdown_shards": 0,
             "cells_timeout": 0,
         },
+        # Store object counts (issue #240, record-only on this leg).
+        "objects_total": 27,
+        "objects_expected": 27,
+        "objects_mismatch": None,
     }
     r.update(over)
     return r
@@ -204,3 +208,44 @@ def test_make_full_aoi_release_figure_renders_and_empty_is_false(tmp_path):
         ps.make_full_aoi_release_figure(pd.DataFrame(), "cost_usd", "c", tmp_path / "x.png")
         is False
     )
+
+
+# --- store object-count columns (issue #240) --------------------------------
+
+
+def test_objects_columns_retained_and_mismatch_dropped():
+    # The two scalar object columns are retained in the release series; the
+    # mismatch description is JSON-only (dropped by the reindex), mirroring the
+    # per-merge series' JSON-only keys.
+    df = fas.records_to_frame([_record(objects_mismatch="total objects 999 != expected 27")])
+    assert list(df.columns) == fas.FULL_AOI_COLUMNS
+    assert fas.FULL_AOI_COLUMNS[-2:] == ["objects_total", "objects_expected"]
+    assert df.iloc[0]["objects_total"] == 27
+    assert df.iloc[0]["objects_expected"] == 27
+    assert "objects_mismatch" not in df.columns
+    # A pre-#240 record (no objects keys) degrades to null cells, not a KeyError.
+    legacy = _record()
+    for k in ("objects_total", "objects_expected", "objects_mismatch"):
+        del legacy[k]
+    old = fas.records_to_frame([legacy])
+    assert old.iloc[0]["objects_total"] is None or str(old.iloc[0]["objects_total"]) == "nan"
+
+
+def test_full_aoi_objects_figure_skips_legacy_series(tmp_path):
+    # A pre-#240 series parquet has no objects_total column (or an all-null
+    # one): the objects figure must skip cleanly (False, no file), while the
+    # cost figures still render -- no broken panel on old data.
+    pytest.importorskip("matplotlib")
+    ps = pytest.importorskip("plot_series")
+    assert "full_aoi_objects" in ps.FULL_AOI_FIGURES
+    df = fas.records_to_frame(_matrix_records("c1", "v0.24.0", 0.016))
+    old = df.drop(columns=["objects_total", "objects_expected"])
+    out = tmp_path / "objects.png"
+    assert ps.make_full_aoi_release_figure(old, "objects_total", "objects", out) is False
+    assert not out.exists()
+    # All-null column (post-append reindex of legacy rows) -> same skip.
+    import numpy as np
+
+    df_nulls = df.assign(objects_total=np.nan)
+    assert ps.make_full_aoi_release_figure(df_nulls, "objects_total", "objects", out) is False
+    assert not out.exists()

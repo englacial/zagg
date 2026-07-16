@@ -64,13 +64,19 @@ on the `benchmarks` branch and rendered here. The same 2×2 axes as the live mat
 (inline/sidecar × AOI-mask), but each panel is the whole-AOI total across
 **releases** (release tag on the x-axis), not one shard across merges.
 
-Two views, mirroring the live matrix's cost columns:
+Three views — the live matrix's two cost columns, plus the store-layout tripwire:
 
 - **Whole-AOI cost (USD)** — the real dollar total across every shard.
 - **AOI-average cost / 100 km²** — that total spread over the whole AOI area
   (`cost_usd × 100 / (n_shards × shard_area_km²)`). This is the *average*-shard
   figure; the live matrix's cost/100 km² is the *densest* shard (worst case), so
   this one runs lower — the honest per-area number for sizing a real AOI.
+- **Store objects (total)** — the output store's object count after the run,
+  against a config-derived expectation (issue #240). A sharded-write bypass
+  multiplies this ~K-fold (the issue #215 blow-up), so the regression reads as a
+  step here. On this per-release leg it is **record-only** (the release still
+  lands its series point); the per-merge harness *hard-fails* on the same
+  mismatch.
 
 ### Whole-AOI cost across releases
 
@@ -79,6 +85,10 @@ Two views, mirroring the live matrix's cost columns:
 ### AOI-average cost per 100 km² across releases
 
 ![Per-release full-AOI — AOI-average cost per 100 km²](https://raw.githubusercontent.com/englacial/zagg/benchmarks/site/full_aoi_cost_per_100km2.png)
+
+### Store object count across releases
+
+![Per-release full-AOI — store objects](https://raw.githubusercontent.com/englacial/zagg/benchmarks/site/full_aoi_objects.png)
 
 > These embed by raw URL and appear after the first tagged release runs the
 > full-AOI job; until then GitHub shows a broken-image placeholder (nothing has

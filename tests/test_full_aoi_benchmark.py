@@ -100,6 +100,8 @@ def test_neon_catalog_builds_full_aoi_shardmap(tmp_path):
     run = runs[0]
     assert run["n_shards"] == 4  # the NEON AOI fans to 4 o9 shards
     assert run["apriori_estimate"]["est_cost_usd"] > 0
+    # Dry-run writes no store -> object-count columns stay null (issue #240).
+    assert run["objects_total"] is None and run["objects_mismatch"] is None
 
 
 # --- pure helpers ----------------------------------------------------------
@@ -152,3 +154,57 @@ def test_sidecar_cache_probe_graceful():
         "warm",
         "unknown",
     )
+
+
+# --- store object-count metric (issue #240, record-only) --------------------
+
+
+def test_measure_objects_recorded_passthrough(monkeypatch):
+    # Happy path: the shared measurement payload passes straight through.
+    payload = {
+        "objects_total": 27,
+        "objects_expected": 27,
+        "objects_per_shard": {"1121121": 6},
+        "objects_mismatch": None,
+    }
+    calls = {}
+
+    def fake_measure(store, **kwargs):
+        calls["args"] = (store, kwargs)
+        return dict(payload)
+
+    monkeypatch.setattr(rfab.bench_objects, "measure_objects", fake_measure)
+    from zagg.config import load_config
+    from zagg.grids import from_config
+
+    cfg = load_config(str(BENCH / "configs" / "atl03_tdigest_healpix_o9.yaml"))
+    grid = from_config(cfg)
+    out = rfab._measure_objects_recorded(
+        "t", cfg, grid, "s3://b/t.zarr", [1, 2], 2, region="us-west-2"
+    )
+    assert out == payload
+    store, kwargs = calls["args"]
+    assert store == "s3://b/t.zarr"
+    assert kwargs["shard_keys"] == [1, 2]
+    assert kwargs["n_shards"] == 2  # completed-with-data count, not dispatch count
+    assert kwargs["store_layout"] == "flat"
+
+
+def test_measure_objects_recorded_never_raises(monkeypatch):
+    # RECORD-ONLY: a failed LIST must not sink the release run -- it degrades
+    # to an objects_mismatch note on the record instead.
+    def boom(store, **kwargs):
+        raise RuntimeError("s3 unreachable")
+
+    monkeypatch.setattr(rfab.bench_objects, "measure_objects", boom)
+    from zagg.config import load_config
+    from zagg.grids import from_config
+
+    cfg = load_config(str(BENCH / "configs" / "atl03_tdigest_healpix_o9.yaml"))
+    grid = from_config(cfg)
+    out = rfab._measure_objects_recorded(
+        "t", cfg, grid, "s3://b/t.zarr", [1], 1, region="us-west-2"
+    )
+    assert out["objects_mismatch"].startswith("object-count measurement failed")
+    assert "s3 unreachable" in out["objects_mismatch"]
+    assert "objects_total" not in out  # nothing measured, columns stay null
