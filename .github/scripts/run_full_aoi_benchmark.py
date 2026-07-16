@@ -373,6 +373,49 @@ def _flat_hive_parity(flat_store, hive_store, grid, shard_keys, *, store_kwargs=
     return result
 
 
+def _ok_shard_keys(results) -> list[int]:
+    """Shard keys that completed WITH data — the ``cells_with_data`` predicate.
+
+    Mirrors the runner's counter (status 200, no error); errored shards AND
+    "no granules"/"no data" shards write no hive leaf, so parity must not
+    read their absence as content divergence (review, PR #242).
+    """
+    return [
+        int(r["shard_key"])
+        for r in results
+        if r.get("status_code") == 200 and not r.get("error") and r.get("shard_key") is not None
+    ]
+
+
+def _parity_recorded(
+    name, target, store, grid, ok_shards, *, n_shards, session_targets, region
+) -> dict | None:
+    """Run the flat<->hive parity read-back for a ``parity_with`` target.
+
+    Returns ``None`` when the target declares no sibling (or has no store).
+    Skips with ``parity_ok: None`` + a ``skipped`` reason when the sibling was
+    not dispatched this session (``--target`` subselection would otherwise
+    compare against a STALE flat store from a prior release -- review,
+    PR #242); the full-manifest release path always dispatches the sibling
+    first (manifest order), so this gate is a no-op there. ``shards_skipped``
+    records how many dispatched shards parity did not cover (errored/empty).
+    """
+    sibling = target.get("parity_with")
+    if not (sibling and store):
+        return None
+    if session_targets is not None and sibling not in session_targets:
+        return {
+            "parity_ok": None,
+            "skipped": f"sibling {sibling!r} not dispatched this session",
+        }
+    flat_store = f"{store.rsplit('/', 1)[0]}/{sibling}.zarr"
+    parity = _flat_hive_parity(flat_store, store, grid, ok_shards, store_kwargs={"region": region})
+    parity["shards_skipped"] = int(n_shards) - len(ok_shards)
+    if not parity.get("parity_ok"):
+        print(f"[{name}] flat<->hive parity NOT clean: {parity}", flush=True)
+    return parity
+
+
 def _measure_objects_recorded(
     name, config, grid, store: str, shard_keys: list[int], n_ok: int, *, region: str
 ) -> dict:
@@ -430,6 +473,7 @@ def run_target(
     dry_run,
     sec_per_granule,
     artifacts_dir,
+    session_targets=None,
 ) -> tuple[dict, list[dict]]:
     from zagg import __version__ as zagg_version
 
@@ -555,19 +599,19 @@ def run_target(
     # carrying ``parity_with`` names its flat sibling (same config modulo
     # store_layout, already dispatched: manifest order). RECORD-ONLY; the
     # ``parity`` detail is JSON-only, ``parity_ok`` joins the retained series.
-    parity = None
-    sibling = target.get("parity_with")
-    if sibling and store:
-        flat_store = f"{store.rsplit('/', 1)[0]}/{sibling}.zarr"
-        parity = _flat_hive_parity(
-            flat_store,
-            store,
-            grid,
-            [int(k) for k in sm.shard_keys],
-            store_kwargs={"region": region},
-        )
-        if not parity.get("parity_ok"):
-            print(f"[{name}] flat<->hive parity NOT clean: {parity}", flush=True)
+    # Compared over the shards that completed WITH data (review, PR #242): an
+    # errored or granule-less shard writes no leaf, so including it would flip
+    # parity_ok on an infra failure, not a content divergence.
+    parity = _parity_recorded(
+        name,
+        target,
+        store,
+        grid,
+        _ok_shard_keys(results),
+        n_shards=n_shards,
+        session_targets=session_targets,
+        region=region,
+    )
     run.update(
         objects_total=objects.get("objects_total"),
         objects_expected=objects.get("objects_expected"),
@@ -658,6 +702,10 @@ def main(argv: list[str] | None = None) -> int:
             dry_run=args.dry_run,
             sec_per_granule=args.sec_per_granule,
             artifacts_dir=args.artifacts_dir,
+            # Parity gate (review, PR #242): the flat sibling must have been
+            # dispatched THIS session, or the read-back would compare against
+            # a stale store from a prior release.
+            session_targets=set(names),
         )
         runs.append(run)
         shards.extend(shard_rows)
