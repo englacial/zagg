@@ -149,7 +149,7 @@ class TestWindowingConfig:
 
     def test_time_field_must_be_declared(self, cfg):
         _windowed(cfg, time_field="not_a_column")
-        with pytest.raises(ValueError, match="declared data_source column"):
+        with pytest.raises(ValueError, match="base-rate data_source column"):
             validate_config(cfg)
 
     def test_time_field_rejected_when_no_columns_declared(self, cfg):
@@ -158,13 +158,22 @@ class TestWindowingConfig:
         _windowed(cfg)
         cfg.data_source["coordinates"] = {}
         cfg.data_source["variables"] = {}
-        with pytest.raises(ValueError, match="declared data_source column"):
+        with pytest.raises(ValueError, match="base-rate data_source column"):
             validate_config(cfg)
 
-    def test_time_field_from_level_declared_variable_accepted(self, cfg):
-        # A readable segment-level variable declared on a non-base level
-        # (issue #30 mapping form) is a valid ``time_field``: it broadcasts to
-        # a per-photon column the worker reads.
+    def test_time_field_coordinate_rejected(self, cfg):
+        # A coordinate ``time_field`` is rejected: the stamp time_range is
+        # pooled from read VARIABLE columns, never coordinates (a lat/lon
+        # coordinate is not a timestamp), so it would filter yet silently drop
+        # the stamp. It must be declared as a variable.
+        _windowed(cfg, time_field="latitude")
+        with pytest.raises(ValueError, match="coordinate"):
+            validate_config(cfg)
+
+    def test_time_field_from_non_base_level_rejected(self, cfg):
+        # A segment-rate (non-base) level column is rejected this round: window
+        # membership would be decided per whole segment, not per observation,
+        # so the per-observation split process_and_write_hive promises fails.
         _windowed(cfg, time_field="seg_time")
         cfg.data_source["base_level"] = "photons"
         cfg.data_source["levels"] = {
@@ -184,8 +193,36 @@ class TestWindowingConfig:
                 },
             },
         }
+        with pytest.raises(ValueError, match="segment-rate window membership"):
+            validate_config(cfg)
+
+    def test_time_field_base_rate_accepted_in_hierarchical_config(self, cfg):
+        # In a hierarchical (levels) config the base level reads its columns
+        # from ``data_source.variables`` (a base-level ``variables`` mapping is
+        # forbidden). A base-rate ``time_field`` declared there filters at base
+        # rate (level None) — per-observation membership — so it is accepted
+        # even alongside a segment-level link.
+        _windowed(cfg, time_field="delta_time")
+        cfg.data_source["base_level"] = "photons"
+        cfg.data_source["levels"] = {
+            "photons": {
+                "path": "/{group}/heights",
+                "coordinates": ["lat_ph", "lon_ph"],
+                "variables": ["h_ph"],
+            },
+            "segments": {
+                "path": "/{group}/geolocation",
+                "coordinates": ["reference_photon_lat"],
+                "variables": {"seg_h": "/{group}/geolocation/h"},
+                "link": {
+                    "to": "photons",
+                    "index_beg": "/{group}/geolocation/ph_index_beg",
+                    "count": "/{group}/geolocation/segment_ph_cnt",
+                },
+            },
+        }
         validate_config(cfg)
-        assert get_windowing(cfg)["time_field"] == "seg_time"
+        assert get_windowing(cfg)["time_field"] == "delta_time"
 
     def test_requires_epoch(self, cfg):
         _windowed(cfg, epoch=None)
@@ -942,6 +979,19 @@ class TestWindowedUnits:
         )
         assert [w["label"] for _k, _r, w in units] == ["2019", "2020"]
         assert all(recs == [legacy] for _k, recs, _w in units)
+
+    def test_bounds_full_iso_end_date_accepted(self, cfg):
+        from zagg.runner import _windowed_units
+
+        # A full ISO end_date must parse as-is (not get a T23:59:59 suffix
+        # appended, which would corrupt it into a parse error).
+        legacy = {"id": "g0", "s3": "s3://b/g0.h5", "https": None}
+        units = _windowed_units(
+            [(11, [legacy])],
+            self._windowing(cfg),
+            {"start_date": "2019-01-01", "end_date": "2020-12-31T00:00:00Z"},
+        )
+        assert [w["label"] for _k, _r, w in units] == ["2019", "2020"]
 
     def test_untimed_granule_without_bounds_is_a_pointed_error(self, cfg):
         from zagg.runner import _windowed_units

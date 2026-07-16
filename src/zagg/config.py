@@ -683,8 +683,11 @@ def _validate_windowing(config: PipelineConfig) -> None:
     page but NOT implemented — rejected with a pointed message. The explicit
     windows list must be well-formed: frozen label grammar, half-open
     ``start < end``, unique labels, non-overlapping ranges. ``time_field``
-    must name a declared ``data_source`` column so the worker actually reads
-    the membership timestamps it filters on.
+    must name a declared BASE-RATE ``data_source`` variable (a flat
+    ``variables`` entry or the base level's ``variables``) — a coordinate or
+    a non-base (segment-rate) level column is rejected, since the stamp
+    ``time_range`` is pooled from read variable columns and window membership
+    is decided per observation.
     """
     from zagg import windows as _windows
 
@@ -729,21 +732,37 @@ def _validate_windowing(config: PipelineConfig) -> None:
             "output.windowing.time_field is required: the per-observation "
             "timestamp column that decides window membership"
         )
-    # The worker can only filter on columns it actually reads: the flat
-    # data_source coordinates/variables plus any readable segment-level
-    # variable a hierarchical level declares (issue #30 mapping form,
-    # ``_segment_variable_names``). The check is unconditional — a windowing
-    # store that declares no columns cannot filter on ``time_field`` at all.
-    declared = (
-        set((config.data_source or {}).get("coordinates", {}))
-        | set((config.data_source or {}).get("variables", {}))
-        | _segment_variable_names(config.data_source or {})
-    )
+    # ``time_field`` must be a BASE-RATE variable column, i.e. a
+    # ``data_source.variables`` entry (the base level reads its columns from
+    # there too — ``_validate_levels`` forbids a base-level ``variables``
+    # mapping). The stamp ``time_range`` (a windowed leaf's headline truth) is
+    # pooled from the read VARIABLE columns (``col_arrays`` in the worker),
+    # never from ``coordinates`` — so a coordinate ``time_field`` would filter
+    # yet silently drop the stamp, and a lat/lon coordinate is not a timestamp
+    # anyway. A non-base (segment-rate) level column is rejected too: window
+    # membership would be decided per whole segment, not per observation,
+    # which is not supported this round (see ``window_time_filters``).
+    ds = config.data_source or {}
+    declared = set(ds.get("variables") or {})
     if time_field not in declared:
+        if time_field in set(ds.get("coordinates") or {}):
+            raise ValueError(
+                f"output.windowing.time_field {time_field!r} is a data_source "
+                f"coordinate; the stamp time_range is pooled from read variable "
+                f"columns and a coordinate is not read as a timestamp. Declare it "
+                f"under data_source.variables (or the base level's variables)."
+            )
+        if time_field in _segment_variable_names(ds):
+            raise ValueError(
+                f"output.windowing.time_field {time_field!r} is declared on a "
+                f"non-base (segment-rate) level; segment-rate window membership is "
+                f"not supported yet (whole segments would be kept or dropped). "
+                f"Declare it on the base level or data_source.variables."
+            )
         raise ValueError(
             f"output.windowing.time_field {time_field!r} is not a declared "
-            f"data_source column (one of {sorted(declared)}); the worker can "
-            f"only filter on columns it reads"
+            f"base-rate data_source column (one of {sorted(declared)}); the "
+            f"worker filters per observation on variable columns it reads"
         )
     epoch = block.get("epoch")
     if epoch is None:
@@ -2032,39 +2051,28 @@ def window_time_filters(config: PipelineConfig, start: float, end: float) -> lis
     predicates on the declared ``time_field`` — ``ge start`` / ``lt end`` in
     DATASET units (converted once at dispatch) — so it rides the existing,
     pushdown-eligible filter machinery (issue #43) on every backend instead
-    of a bespoke row filter. The field's dataset path resolves from
-    ``variables``/``coordinates`` (base level) or a hierarchical ``levels``
-    entry (the filter then carries that level and expands to base rate, the
-    Phase-B path). Appended to :func:`filters_from_data_source`'s normalized
-    output by the hive write path, preserving any declared filters.
+    of a bespoke row filter. ``_validate_windowing`` restricts ``time_field``
+    to a base-rate ``data_source.variables`` entry (the base level reads its
+    columns from there too), so the predicate always filters at base rate
+    (``level=None``, per observation); a coordinate or non-base/segment-rate
+    ``time_field`` is rejected at validation and never reaches here. Appended
+    to :func:`filters_from_data_source`'s normalized output by the hive write
+    path, preserving any declared filters.
     """
     windowing = get_windowing(config)
     if windowing is None:
         raise ValueError("window_time_filters requires a windowed config (output.windowing)")
     field = windowing["time_field"]
-    ds = config.data_source or {}
-    path, level = None, None
-    for key in ("variables", "coordinates"):
-        p = (ds.get(key) or {}).get(field)
-        if isinstance(p, str) and p:
-            path = p
-            break
-    if path is None:
-        for lname, spec in (get_levels(config) or {}).items():
-            lvars = spec.get("variables") if isinstance(spec, dict) else None
-            if isinstance(lvars, dict) and isinstance(lvars.get(field), str):
-                # The base level's columns filter at base rate (level None).
-                path, level = lvars[field], (None if lname == get_base_level(config) else lname)
-                break
-    if path is None:
+    path = ((config.data_source or {}).get("variables") or {}).get(field)
+    if not (isinstance(path, str) and path):
         raise ValueError(
-            f"windowing time_field {field!r} has no dataset path in "
-            f"data_source.variables/coordinates/levels — validate_config should "
-            f"have rejected this configuration"
+            f"windowing time_field {field!r} has no base-rate dataset path in "
+            f"data_source.variables — validate_config should have rejected "
+            f"this configuration"
         )
     return [
-        {"level": level, "dataset": path, "op": "ge", "value": float(start)},
-        {"level": level, "dataset": path, "op": "lt", "value": float(end)},
+        {"level": None, "dataset": path, "op": "ge", "value": float(start)},
+        {"level": None, "dataset": path, "op": "lt", "value": float(end)},
     ]
 
 
