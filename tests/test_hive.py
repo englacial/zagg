@@ -579,6 +579,34 @@ class TestProcessAndWriteHive:
         assert ops == ["dense", "ragged", "sidecar", "stamp"]
 
 
+def _sharded_accumulate_fake(
+    grid, chunk_carrier, meta, ragged_by_local=None, occupied=None, error=None
+):
+    """A ``process_shard`` fake honoring the sharded accumulate contract (issue
+    #236): fills ``chunk_results`` (asserting the switch passed no
+    ``write_chunk``), every 4th inner chunk entirely empty. ``chunk_carrier``
+    builds one chunk's carrier and ``meta`` the returned metadata, so both the
+    dispatcher-level tests here and the runner-wiring test can share one fake
+    without cross-class instantiation."""
+
+    def fake(g, shard_key, urls, **kwargs):
+        sink = kwargs.get("chunk_results")
+        assert sink is not None and kwargs.get("write_chunk") is None
+        shard_block = grid.block_index(int(shard_key))[0]
+        for block, children in grid.iter_chunks(int(shard_key)):
+            local = int(block[0]) - shard_block * grid.chunks_per_shard
+            if local % 4 == 3:
+                sink.append((block, pd.DataFrame(), {}))
+                continue
+            ragged = (ragged_by_local or {}).get(local, {})
+            sink.append((block, chunk_carrier(grid, children), ragged))
+        if occupied is not None and kwargs.get("occupied_out") is not None:
+            kwargs["occupied_out"].append(np.asarray(occupied, dtype=np.uint64))
+        return pd.DataFrame(), meta(shard_key, error=error)
+
+    return fake
+
+
 class TestProcessAndWriteHiveSharded:
     """Issue #236: with a sharded K>1 grid the shared hive worker path
     accumulates the K chunk carriers (``write_chunk=None``) and writes the
@@ -624,7 +652,8 @@ class TestProcessAndWriteHiveSharded:
             df[name] = v
         return df
 
-    def _meta(self, shard, error=None):
+    @staticmethod
+    def _meta(shard, error=None):
         return {
             "shard_key": int(shard),
             "cells_with_data": 5,
@@ -636,26 +665,14 @@ class TestProcessAndWriteHiveSharded:
         }
 
     def _accumulate_fake(self, grid, ragged_by_local=None, occupied=None, error=None):
-        """A ``process_shard`` fake honoring the accumulate contract: fills
-        ``chunk_results`` (asserting the issue #236 switch passed no
-        ``write_chunk``), every 4th inner chunk entirely empty."""
-
-        def fake(g, shard_key, urls, **kwargs):
-            sink = kwargs.get("chunk_results")
-            assert sink is not None and kwargs.get("write_chunk") is None
-            shard_block = grid.block_index(int(shard_key))[0]
-            for block, children in grid.iter_chunks(int(shard_key)):
-                local = int(block[0]) - shard_block * grid.chunks_per_shard
-                if local % 4 == 3:
-                    sink.append((block, pd.DataFrame(), {}))
-                    continue
-                ragged = (ragged_by_local or {}).get(local, {})
-                sink.append((block, self._chunk_carrier(grid, children), ragged))
-            if occupied is not None and kwargs.get("occupied_out") is not None:
-                kwargs["occupied_out"].append(np.asarray(occupied, dtype=np.uint64))
-            return pd.DataFrame(), self._meta(shard_key, error=error)
-
-        return fake
+        return _sharded_accumulate_fake(
+            grid,
+            self._chunk_carrier,
+            self._meta,
+            ragged_by_local=ragged_by_local,
+            occupied=occupied,
+            error=error,
+        )
 
     @staticmethod
     def _leaf_object_count(leaf, grid, name):
@@ -768,6 +785,60 @@ class TestProcessAndWriteHiveSharded:
         )
         assert meta["error"] == "boom"
         assert not os.path.exists(hive.shard_leaf_path(root, shard))
+
+    def test_torn_write_leaves_debris_then_retry_succeeds(self, monkeypatch, cfg, tmp_path):
+        # Sharded twin of the streaming torn-write test: the sharded switch
+        # defers every dense+ragged write to ONE post-stream
+        # ``write_leaf_to_zarr``, so a worker that dies inside/after that write
+        # (before ``stamp_commit``) leaves an UNSTAMPED prefix — debris. The
+        # template is emitted (prefix exists) and the arrays land, but no stamp
+        # follows, so ``read_commit`` is None. A clean retry overwrites the leaf
+        # WHOLESALE and stamps. A stray object planted in the debris (one the
+        # retry does NOT rewrite) pins the wholesale claim: a metadata-only
+        # re-template would leave it inside a leaf whose stamp certifies it
+        # complete (review findings, PR #205/#208).
+        import zagg.processing as processing
+        from zagg.store import open_store
+
+        grid = self._grid(cfg)
+        shard = _shard_word()
+        root = str(tmp_path / "store")
+        leaf = hive.shard_leaf_path(root, shard)
+
+        fake = self._accumulate_fake(grid, {0: {"h": ([np.array([1.0])], [0])}})
+        monkeypatch.setattr(processing, "process_shard", fake)
+        real_leaf_write = processing.write_leaf_to_zarr
+
+        def torn_leaf(*a, **k):
+            real_leaf_write(*a, **k)  # the arrays land (prefix exists)...
+            raise RuntimeError("worker died mid-shard")  # ...but no stamp follows
+
+        monkeypatch.setattr(processing, "write_leaf_to_zarr", torn_leaf)
+        with pytest.raises(RuntimeError, match="died mid-shard"):
+            hive.process_and_write_hive(
+                shard, ["s3://b/g1.h5"], grid, {}, root, cfg, store_kwargs={}
+            )
+        assert os.path.exists(leaf)  # the prefix exists...
+        assert hive.read_commit(open_store(leaf)) is None  # ...but is debris
+        # No stamp -> no coverage visible either (issue #200): a torn worker
+        # never publishes coverage.
+        assert hive.read_coverage(open_store(leaf)) is None
+        stale = os.path.join(leaf, grid.group_path, "stale-debris")
+        with open(stale, "w") as fh:
+            fh.write("torn attempt")
+        # Plant a sidecar in the debris too: the one leaf object zarr does NOT
+        # own must also fall to the wholesale wipe (PR #208 round 2).
+        hive.write_coverage_sidecar(leaf, b"torn-attempt sidecar")
+        sidecar = os.path.join(leaf, hive.COVERAGE_SIDECAR)
+        assert os.path.exists(sidecar)
+
+        # Retry with the real leaf writer: same leaf, overwritten wholesale —
+        # the planted debris is GONE — and stamped at the end.
+        monkeypatch.setattr(processing, "write_leaf_to_zarr", real_leaf_write)
+        hive.process_and_write_hive(shard, ["s3://b/g1.h5"], grid, {}, root, cfg, store_kwargs={})
+        assert hive.read_commit(open_store(leaf))["complete"] is True
+        assert not os.path.exists(stale), "stale torn-write object survived the re-template"
+        assert not os.path.exists(sidecar), "torn attempt's sidecar survived the re-template"
 
     def test_k1_explicit_sharded_true_is_noop(self, monkeypatch, cfg, tmp_path):
         """K==1 no-op parity, matching flat (issue #215): explicit
@@ -914,8 +985,15 @@ class TestRunnerWiring:
         grid = from_config(cfg, parent_order=6)
         assert grid.sharded is True and grid.chunks_per_shard == 16
 
-        helper = TestProcessAndWriteHiveSharded()
-        fake = helper._accumulate_fake(grid, {0: {"h": ([np.array([2.5])], [1])}})
+        # Share the sharded accumulate fake via the module-level helper (its
+        # carrier/meta are the sharded class's statics) — no cross-class
+        # instantiation.
+        fake = _sharded_accumulate_fake(
+            grid,
+            TestProcessAndWriteHiveSharded._chunk_carrier,
+            TestProcessAndWriteHiveSharded._meta,
+            {0: {"h": ([np.array([2.5])], [1])}},
+        )
 
         from zagg import runner
 
