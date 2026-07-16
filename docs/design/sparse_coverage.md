@@ -117,7 +117,8 @@ leaf stores. No zarr-version coupling in either direction.
 Written **once, at finalize** (issue #252 — it rode template time before, but
 it is reader-facing only and workers never read it, so the write comes off
 the pre-dispatch critical path; a read-only frozen-key precheck keeps the
-up-front refusal). O(1); never touched again during a run. Contents:
+up-front refusal on reruns — concurrent first writes still collide only at
+finalize). O(1); never touched again during a run. Contents:
 
 - `spec`: convention version string (e.g. `"morton-hive/1"`) — the convention
   itself is versioned from day one (D6).

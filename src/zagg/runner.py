@@ -3027,7 +3027,11 @@ def _invoke_lambda_ping(
       ``zagg.hive.validate_manifest`` against the event's manifest inputs
       (same keys as hive finalize), so a frozen-key mismatch — or an
       overwrite into a root with shard data — refuses up front (D2) instead
-      of after the fan-out (PR #255 review fold).
+      of after the fan-out (PR #255 review fold). This covers sequential
+      reruns; two CONCURRENT runs racing into the same fresh root both see
+      no manifest and only collide at the losing run's finalize — a window
+      the old setup-time write closed for the second-to-arrive dispatch.
+      Same last-writer caveat the manifest write itself has always had.
 
     Kept while flat exists (issue #251): once flat is removed, a stale
     function just errors and the ping can be dropped.

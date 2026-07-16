@@ -157,7 +157,9 @@ time before, but it is reader-facing only — workers write self-describing
 leaves and never read it, so the write is off the critical path). Never
 touched during a run (D6); a read-only frozen-key precheck
 (`zagg.hive.validate_manifest`) still runs before the fan-out so an
-incompatible existing store refuses up front. With the manifest, every shard
+incompatible existing store refuses up front on reruns (two concurrent first
+writes into a fresh root still collide only at the losing run's finalize).
+With the manifest, every shard
 path is computable arithmetically with zero requests:
 
 ```json
