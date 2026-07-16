@@ -55,6 +55,10 @@ class TestGoldenVectors:
         assert w.window_label(_dt(2025, 6, 15, 12), "yearly") == "2025"
         assert w.window_range("2025", "yearly") == (_dt(2025, 1, 1), _dt(2026, 1, 1))
         assert w.leaf_name("-31123", "2025") == "-31123_2025.zarr"
+        # Width-valid but not a real year: the raise comes from datetime(), not
+        # the regex (calendar validity is deferred to window_range).
+        with pytest.raises(ValueError):
+            w.window_range("0000", "yearly")
 
     def test_monthly(self):
         # | monthly | YYYYMM | -31123_202511.zarr | calendar month |
@@ -63,6 +67,11 @@ class TestGoldenVectors:
         assert w.leaf_name("-31123", "202511") == "-31123_202511.zarr"
         # December rolls the year.
         assert w.window_range("202512", "monthly") == (_dt(2025, 12, 1), _dt(2026, 1, 1))
+        # Width-valid but out-of-range month: raised by datetime(), not the regex.
+        with pytest.raises(ValueError):
+            w.window_range("202513", "monthly")
+        with pytest.raises(ValueError):
+            w.window_range("202500", "monthly")
 
     def test_daily(self):
         # | daily | YYYYMMDD | -31123_20251103.zarr | calendar day |
@@ -247,6 +256,15 @@ class TestEpochConversion:
         naive = (_dt(2020, 1, 1) - _dt(1980, 1, 6)).total_seconds()
         assert w.utc_to_offset(_dt(2020, 1, 1), epoch=epoch, scale="gps") == naive + 18
         assert w.offset_to_utc(naive + 18, epoch=epoch, scale="gps") == _dt(2020, 1, 1)
+
+    def test_tai_native_epoch(self):
+        # TAI seconds since the TAI epoch (1958-01-01, offset 0 by definition):
+        # the full current TAI-UTC offset (+37) applies — the pre-2017 branch,
+        # symmetric with the GPS +18 case above.
+        epoch = "1958-01-01T00:00:00Z"
+        naive = (_dt(2020, 1, 1) - _dt(1958, 1, 1)).total_seconds()
+        assert w.utc_to_offset(_dt(2020, 1, 1), epoch=epoch, scale="tai") == naive + 37
+        assert w.offset_to_utc(naive + 37, epoch=epoch, scale="tai") == _dt(2020, 1, 1)
 
     def test_utc_scale_is_naive_difference(self):
         epoch = "2000-01-01T00:00:00Z"
