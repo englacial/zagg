@@ -962,6 +962,10 @@ class TestProcessHive:
         # Hive defaults sharded now, same as flat (issue #236).
         assert grid.sharded is True and grid.chunks_per_shard == 16
 
+        # Same sharded accumulate contract as test_hive's ``_sharded_accumulate_fake``
+        # (sink filled, no ``write_chunk``); kept inline because this variant fills
+        # EVERY chunk (no every-4th-empty) so the cell_ids parity assertion below
+        # covers the whole leaf, and uses this module's chunk-level ``_carrier_of``.
         def fake(g, shard_key, urls, **kwargs):
             sink = kwargs.get("chunk_results")
             assert sink is not None and kwargs.get("write_chunk") is None
