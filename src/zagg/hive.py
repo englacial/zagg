@@ -203,23 +203,26 @@ def build_manifest(grid, dataset: dict | None = None, windowing: dict | None = N
     return manifest
 
 
-def ensure_manifest(store_root: str, manifest: dict, *, overwrite: bool = False, **store_kwargs):
-    """Write the root manifest once at template time; verify it on reruns.
+def validate_manifest(
+    store_root: str, manifest: dict, *, overwrite: bool = False, **store_kwargs
+) -> dict | None:
+    """Read-only frozen-key precheck — the fail-fast half of the manifest guard.
 
-    A retry into an existing hive store must be able to proceed (that is the
-    D4 debris/retry model), so an existing manifest is accepted — but only if
-    its FROZEN keys match the run's own (:data:`_FROZEN_MANIFEST_KEYS`: orders
-    + identity + schedule — the flat path's ``_check_signature`` analogue).
-    ``generated_at`` and ``pyramid`` are excluded: the pyramid block is
-    populated/updated by the §7 sweep by design (D11), so comparing it would
-    brick every resume after the first sweep.
+    Split out of :func:`ensure_manifest` when the manifest WRITE moved to
+    finalize (issue #252). The write folding off the critical path is fine for
+    readers (they only arrive after the run), but it dragged the writer-side
+    guard along with it — so an incompatible rerun could write mixed-order
+    leaves before the check ever fired (D2). This function is the guard on its
+    own: dispatchers call it BEFORE fan-out to refuse an incompatible existing
+    store up front, while the actual write stays off the critical path in
+    :func:`ensure_manifest` at finalize.
 
-    ``overwrite=True`` replaces the MANIFEST ONLY — it never clears data. To
-    guard against the silent-corruption footgun (committed leaves from the old
-    orders would survive a "re-template" and be indistinguishable from legal
-    mixed-order data, D2), an overwrite that CHANGES the frozen keys refuses
-    when the digit tree already has children (one delimiter-LIST); clear the
-    store root first. Returns the manifest now in effect.
+    Performs exactly the checks :func:`ensure_manifest` does and writes nothing:
+    reads the existing manifest; on an existing store whose FROZEN keys mismatch
+    (:data:`_FROZEN_MANIFEST_KEYS`) it raises — the same ``does not match this
+    run`` refusal without ``overwrite``, and the same ``list_with_delimiter``
+    shard-data refusal with ``overwrite`` (the D2 old-order-masquerade footgun).
+    Returns the existing manifest (``None`` on a fresh root).
     """
     import obstore
 
@@ -249,6 +252,33 @@ def ensure_manifest(store_root: str, manifest: dict, *, overwrite: bool = False,
                 f"data (e.g. {children[0]!r}/), and overwrite replaces the "
                 f"manifest only — clear the store root first"
             )
+    return existing
+
+
+def ensure_manifest(store_root: str, manifest: dict, *, overwrite: bool = False, **store_kwargs):
+    """Write the root manifest once at template time; verify it on reruns.
+
+    A retry into an existing hive store must be able to proceed (that is the
+    D4 debris/retry model), so an existing manifest is accepted — but only if
+    its FROZEN keys match the run's own (:data:`_FROZEN_MANIFEST_KEYS`: orders
+    + identity + schedule — the flat path's ``_check_signature`` analogue).
+    ``generated_at`` and ``pyramid`` are excluded: the pyramid block is
+    populated/updated by the §7 sweep by design (D11), so comparing it would
+    brick every resume after the first sweep.
+
+    ``overwrite=True`` replaces the MANIFEST ONLY — it never clears data. To
+    guard against the silent-corruption footgun (committed leaves from the old
+    orders would survive a "re-template" and be indistinguishable from legal
+    mixed-order data, D2), an overwrite that CHANGES the frozen keys refuses
+    when the digit tree already has children (one delimiter-LIST); clear the
+    store root first. Returns the manifest now in effect.
+    """
+    import obstore
+
+    store = open_object_store(store_root, **store_kwargs)
+    existing = validate_manifest(store_root, manifest, overwrite=overwrite, **store_kwargs)
+    if existing is not None and not overwrite:
+        return existing
     obstore.put(store, MANIFEST_NAME, json.dumps(manifest, indent=1).encode())
     return manifest
 

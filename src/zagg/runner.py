@@ -1739,9 +1739,23 @@ def _run_local(
         # reader-facing only — workers write self-describing leaves (D3) and
         # never read it — so nothing runs ahead of the dispatch, mirroring
         # the lambda backend.
-        from zagg.hive import build_manifest, ensure_manifest, process_and_write_hive
+        from zagg.hive import (
+            build_manifest,
+            ensure_manifest,
+            process_and_write_hive,
+            validate_manifest,
+        )
 
         zarr_store = None
+        # Build the manifest once, up front, and reuse it at finalize. The WRITE
+        # is folded into the end-of-run ensure_manifest (D6), but its read-only
+        # frozen-key precheck (review fold, issue #252) runs HERE — fail-fast
+        # against an incompatible existing store before any leaf write (D2), so
+        # a misdirected rerun refuses in ~0s instead of mixing new-order leaves
+        # into an old-order store and only raising afterward. The write itself
+        # stays off the critical path in the finalize block below.
+        manifest = build_manifest(grid, dataset=catalog_data.get("metadata"), windowing=windowing)
+        validate_manifest(store_path, manifest, overwrite=overwrite, **store_kwargs)
         # Temporal fan-out (issue #246 phase 5): one work unit per (shard,
         # window). None (schedule none/absent) keeps the (shard, records)
         # pairs — dispatch byte-identical to pre-windowing runs.
@@ -1861,7 +1875,7 @@ def _run_local(
     if store_layout == "hive":
         ensure_manifest(
             store_path,
-            build_manifest(grid, dataset=catalog_data.get("metadata"), windowing=windowing),
+            manifest,
             overwrite=overwrite,
             **store_kwargs,
         )
