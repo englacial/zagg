@@ -941,6 +941,96 @@ class TestProcessHive:
         assert stamp["cells_with_data"] == 5
         assert stamp["granule_count"] == 1
 
+    def test_hive_sharded_event_writes_single_object_leaf(self, handler_mod, monkeypatch, tmp_path):
+        """Issue #236 through the LAMBDA dispatcher: a sharded K>1 hive event
+        takes the accumulate switch inside the shared ``process_and_write_hive``
+        (``chunk_results`` sink, no ``write_chunk``), so every leaf array lands
+        as ONE ShardingCodec object and the leaf is stamped complete."""
+        import os
+
+        import numpy as np
+        import zarr
+
+        import zagg.processing as processing
+        from zagg import hive
+        from zagg.config import get_data_vars, load_config_from_dict
+        from zagg.store import open_store
+
+        cfg_dict = self._hive_config_dict()
+        cfg_dict["output"]["grid"]["chunk_inner"] = 8
+        grid = from_config(load_config_from_dict(cfg_dict))
+        # Hive defaults sharded now, same as flat (issue #236).
+        assert grid.sharded is True and grid.chunks_per_shard == 16
+
+        def fake(g, shard_key, urls, **kwargs):
+            sink = kwargs.get("chunk_results")
+            assert sink is not None and kwargs.get("write_chunk") is None
+            shard_block = grid.block_index(int(shard_key))[0]
+            for block, children in grid.iter_chunks(int(shard_key)):
+                local = int(block[0]) - shard_block * grid.chunks_per_shard
+                ragged = {"h": ([np.array([1.0, 2.0])], [0])} if local == 0 else {}
+                sink.append((block, self._carrier_of(grid, children), ragged))
+            return pd.DataFrame(), {
+                "shard_key": int(shard_key),
+                "cells_with_data": 5,
+                "total_obs": 7,
+                "granule_count": 1,
+                "files_processed": 1,
+                "duration_s": 0.0,
+                "error": None,
+            }
+
+        monkeypatch.setattr(processing, "process_shard", fake)
+        event = _base_event(cfg_dict)
+        event["shard_key"] = self._WORD
+        event["child_order"] = 12
+        event["store_path"] = str(tmp_path / "hive-out")
+        resp = handler_mod._handle_process(event, _context())
+        assert resp["statusCode"] == 200, resp["body"]
+
+        leaf = hive.shard_leaf_path(event["store_path"], self._WORD)
+        leaf_store = open_store(leaf)
+        cfg = load_config_from_dict(cfg_dict)
+        for name in ("morton", "cell_ids", "h", *get_data_vars(cfg)):
+            chunk_dir = os.path.join(leaf, grid.group_path, name, "c")
+            n_objects = sum(len(files) for _d, _s, files in os.walk(chunk_dir))
+            assert n_objects == 1, name
+        # Whole-leaf contents readable after a fresh open; stamp is present.
+        grp = zarr.open_group(leaf_store, path=grid.group_path, mode="r", zarr_format=3)
+        np.testing.assert_array_equal(
+            np.asarray(grp["cell_ids"][:]),
+            np.asarray(grid.chunk_coords(self._WORD)["cell_ids"]),
+        )
+        assert hive.read_commit(leaf_store)["complete"] is True
+
+    @staticmethod
+    def _carrier_of(grid, children):
+        """Per-chunk carrier (K>1): coords + zeroed dense vars for one chunk's
+        ``children`` (the chunk-level analog of ``_carrier``)."""
+        import numpy as np
+
+        from zagg.config import get_agg_fields, get_data_vars, get_output_signature
+
+        coords = grid.coords_of(children)
+        n = len(children)
+        agg = get_agg_fields(grid.config)
+        # count is 1-based so no slab is all-fill (an all-fill slab is omitted
+        # from the store entirely, which is correct but not what this asserts).
+        df = pd.DataFrame(
+            {
+                var: (
+                    np.arange(1, n + 1, dtype=np.int32)
+                    if var == "count"
+                    else np.zeros(n, dtype=np.float32)
+                )
+                for var in get_data_vars(grid.config)
+                if get_output_signature(agg[var])["kind"] != "ragged"
+            }
+        )
+        for name, vals in coords.items():
+            df[name] = vals
+        return df
+
     def test_hive_worker_death_leaves_debris_then_retry_cleans(
         self, handler_mod, monkeypatch, tmp_path
     ):
