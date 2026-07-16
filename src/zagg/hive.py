@@ -62,6 +62,10 @@ logger = logging.getLogger(__name__)
 
 #: Convention version recorded in the manifest and the commit stamp (D6).
 HIVE_SPEC = "morton-hive/1"
+#: The temporal superset convention (issue #246, D13/D15): declared iff the
+#: manifest carries a temporal block; a ``/1`` store *is* a ``/2`` store with
+#: ``schedule: none``, so ``/1`` stays the spec written for unwindowed stores.
+HIVE_SPEC_V2 = "morton-hive/2"
 #: Root manifest object name (the root-only exception to the node invariant).
 MANIFEST_NAME = "morton_hive.json"
 #: Root-group attrs key carrying the commit stamp (D4).
@@ -129,7 +133,7 @@ def check_node_invariant(rel_path: str) -> None:
         raise ValueError(f"path {rel_path!r} violates the hive node invariant (D5)")
 
 
-def build_manifest(grid, dataset: dict | None = None) -> dict:
+def build_manifest(grid, dataset: dict | None = None, windowing: dict | None = None) -> dict:
     """Build the static ``morton_hive.json`` payload for one store (§3, D6).
 
     ``grid`` supplies the orders; ``dataset`` (typically the ShardMap's
@@ -138,10 +142,19 @@ def build_manifest(grid, dataset: dict | None = None) -> dict:
     to the shard order) but recorded explicitly for forward compatibility; the
     ``pyramid`` block is declared-only in round one (D11: overviews are a
     second-pass sweep, never written at fan-out time).
+
+    ``windowing`` (issue #246) is the normalized declaration from
+    :func:`zagg.config.get_windowing`; when given, the manifest declares
+    ``spec: "morton-hive/2"`` and carries the D15 **temporal block** — the
+    STATIC schema half of the temporal split (schedule, time encoding, the
+    membership ``time_field``, the explicit windows list, and the append
+    policy). Temporal EXTENT deliberately never lives here: actual ranges are
+    leaf-stamp truth and root-summary cache. ``None`` writes the ``/1``
+    manifest byte-identical to pre-windowing runs.
     """
     dataset = dataset or {}
-    return {
-        "spec": HIVE_SPEC,
+    manifest = {
+        "spec": HIVE_SPEC_V2 if windowing else HIVE_SPEC,
         "dataset": {
             "short_name": dataset.get("short_name"),
             "version": dataset.get("version"),
@@ -152,6 +165,24 @@ def build_manifest(grid, dataset: dict | None = None) -> dict:
         "pyramid": {"orders": [], "aggregation": {}},
         "generated_at": _utcnow(),
     }
+    if windowing:
+        temporal = {
+            "schedule": windowing["schedule"],
+            "time_field": windowing["time_field"],
+            "epoch": windowing["epoch"],
+            "scale": windowing["scale"],
+            "units": windowing["units"],
+            # Generative schedules append by adding leaves the schedule already
+            # describes (manifest untouched); the explicit list is the noted
+            # D15 exception — appending outside it re-templates the manifest.
+            "append_policy": (
+                "re-template" if windowing["schedule"] == "explicit" else "new-window"
+            ),
+        }
+        if windowing.get("windows"):
+            temporal["windows"] = windowing["windows"]
+        manifest["temporal"] = temporal
+    return manifest
 
 
 def ensure_manifest(store_root: str, manifest: dict, *, overwrite: bool = False, **store_kwargs):
@@ -204,10 +235,20 @@ def ensure_manifest(store_root: str, manifest: dict, *, overwrite: bool = False,
     return manifest
 
 
-#: Manifest keys the resume match-check compares (orders + identity + schedule).
-#: ``generated_at`` (a timestamp) and ``pyramid`` (populated by the §7 sweep,
-#: D11) are mutable by design and excluded.
-_FROZEN_MANIFEST_KEYS = ("spec", "dataset", "cell_order", "shard_order", "split_schedule")
+#: Manifest keys the resume match-check compares (orders + identity + split
+#: and temporal schedules — a windowing change re-partitions the leaf names,
+#: so it must refuse resume exactly like an orders change). ``generated_at``
+#: (a timestamp) and ``pyramid`` (populated by the §7 sweep, D11) are mutable
+#: by design and excluded. ``temporal`` projects to ``None`` on both sides for
+#: pre-#246 manifests, so existing stores resume unchanged.
+_FROZEN_MANIFEST_KEYS = (
+    "spec",
+    "dataset",
+    "cell_order",
+    "shard_order",
+    "split_schedule",
+    "temporal",
+)
 
 
 def _frozen(manifest: dict) -> dict:
@@ -847,6 +888,7 @@ __all__ = [
     "COVERAGE_SIDECAR",
     "COVERAGE_SPEC",
     "HIVE_SPEC",
+    "HIVE_SPEC_V2",
     "MANIFEST_NAME",
     "ROOT_COVERAGE_NAME",
     "build_coverage",
