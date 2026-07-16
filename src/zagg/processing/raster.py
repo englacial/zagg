@@ -171,7 +171,8 @@ def new_stage_stats() -> dict:
 
     Keys — seconds: ``open`` (store lookup + TIFF header round trips + geo/
     dtype parse), ``geometry`` (pull-NN mapping; a ``geom_cache`` hit records
-    ~0), ``fetch`` (tile GETs), ``decode``, ``gather`` (numpy scatter/gather).
+    ~0), ``fetch`` (tile GETs), ``decode``, ``gather`` (tile-index derivation
+    + numpy scatter/gather).
     Counts: ``assets`` (asset-samples), ``tiles`` (tiles fetched),
     ``geom_hits`` (mappings served from ``geom_cache``).
     """
@@ -296,16 +297,20 @@ async def _sample_one(
     rows, cols, valid = geom
     if prof:
         stage_stats["geometry"] += time.time() - _t0
+        _t0 = time.time()
 
     th, tw = ifd.tile_height, ifd.tile_width
     vr, vc = rows[valid], cols[valid]
     tr, tc = vr // th, vc // tw
 
     if vr.size == 0:
+        if prof:
+            stage_stats["gather"] += time.time() - _t0
         return np.full(rows.shape, fill, dtype=dtype), valid, center
 
     pairs = np.unique(np.stack([tr, tc], axis=1), axis=0)
     if prof:
+        stage_stats["gather"] += time.time() - _t0
         _t0 = time.time()
     tiles = await asyncio.gather(*[tiff.fetch_tile(int(c), int(r), 0) for r, c in pairs])
     if prof:
