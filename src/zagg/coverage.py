@@ -223,8 +223,9 @@ def refresh_root_coverage(store_root: str, **store_kwargs) -> dict | None:
     the ranges envelope has no empty form). Windowed leaves (issue #246)
     classify as data via the frozen first-``_`` name split; several stamped
     windows of one shard are one covered shard (the MOC is spatial — the
-    builder de-duplicates words), and a malformed window label is skipped
-    with a warning, like the foreign-order carve-out.
+    builder de-duplicates words), and a malformed window label on a STAMPED
+    leaf is skipped with a warning, like the foreign-order carve-out —
+    unstamped malformed debris stays silent, as ordinary debris does.
     """
     import obstore
     from obstore.exceptions import NotFoundError
@@ -248,21 +249,30 @@ def refresh_root_coverage(store_root: str, **store_kwargs) -> dict | None:
             rel = child.rstrip("/")
             name = rel.split("/")[-1]
             if name.endswith(".zarr"):
+                # Read the commit stamp FIRST — it opens the full rel path, not
+                # the decimal, so it needs no name split. Unstamped debris drops
+                # SILENTLY here, malformed name or not, exactly as valid-named
+                # debris (D4) and the foreign-order carve-out below do: only real
+                # data ever earns a warning.
+                stamp = read_commit(open_store(f"{root}/{rel}", **store_kwargs))
+                if stamp is None:
+                    continue  # unstamped debris (D4)
                 # Windowed leaves (issue #246, D13): `{full_id}_{window}.zarr`
                 # names split on the first `_` (frozen parse rule); several
                 # windows of one shard collapse to one coverage entry below.
                 try:
                     decimal, _window = split_leaf_name(name)
                 except ValueError:
+                    # A STAMPED leaf (real data) whose name breaks the frozen
+                    # grammar — warn only past the stamp gate, the same "only
+                    # complain about real data" posture as the foreign-order
+                    # branch. The escape hatch stays alive on it either way.
                     logger.warning(
-                        f"refresh: skipping leaf {name!r} with a malformed window "
-                        f"label (frozen grammar, mortie#62) — it will NOT be "
+                        f"refresh: skipping STAMPED leaf {name!r} with a malformed "
+                        f"window label (frozen grammar, mortie#62) — it will NOT be "
                         f"listed in {ROOT_COVERAGE_NAME}"
                     )
                     continue
-                stamp = read_commit(open_store(f"{root}/{rel}", **store_kwargs))
-                if stamp is None:
-                    continue  # unstamped debris (D4)
                 if _decimal_order(decimal) != order:
                     # A fixed-order ranges MOC cannot represent this leaf:
                     # either corruption (old-config data surviving a partial
