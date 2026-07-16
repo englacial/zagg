@@ -231,6 +231,14 @@ async def _sample_one(
         # compute-and-store is atomic on the loop and each source grid is
         # computed exactly once per invoke — no locks needed. If this compute
         # ever moves off-loop (``to_thread``), add per-key async locks.
+        # INVARIANT (issue #244 thread): the key ``(epsg, transform, shape)``
+        # is complete only because ``cells`` and ``grid`` are constants of the
+        # invoke — ``cells = grid.children(shard_key)`` is computed once (see
+        # ``process_raster_shard``) and threaded unchanged into every
+        # ``_sample_one``, and ``geom_cache`` is allocated fresh per
+        # ``process_raster_shard`` call. A future refactor that varies
+        # ``cells`` (or ``grid``) per item/group within one invoke MUST fold
+        # them into the key or drop the cache, else it returns a stale mapping.
         geom = grid.sample(cells, f"EPSG:{epsg}", transform, shape)
         if geom_cache is not None:
             geom_cache[geom_key] = geom
