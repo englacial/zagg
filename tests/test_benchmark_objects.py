@@ -402,3 +402,87 @@ def test_measure_objects_flags_bypass(tmp_path):
     assert payload["objects_mismatch"] is not None
     assert payload["objects_total"] == 6 + 64  # metadata + 16 chunks x 4 arrays
     assert payload["objects_expected"] == 10
+
+
+# --- review folds (PR #242) ---------------------------------------------------
+
+
+def test_flat_model_requires_fullsphere(tmp_path):
+    # The flat block arithmetic assumes fullsphere HEALPix: a dense-layout grid
+    # or a rect grid must fail loudly (NotImplementedError), not mis-attribute
+    # or die on a bare AttributeError (review, PR #242).
+    from zagg.grids import RectilinearGrid
+
+    cfg = _cfg(sharded=False)
+    dense = HealpixGrid(6, 12, layout="dense", config=cfg, populated_shards=[1])
+    rect = RectilinearGrid(
+        crs="EPSG:32618",
+        resolution=10,
+        bounds=[358300, 4299600, 370300, 4311600],
+        chunk_shape=(300, 300),
+    )
+    for grid in (dense, rect):
+        with pytest.raises(NotImplementedError, match="fullsphere"):
+            bench_objects.expected_object_counts(grid, n_shards=1)
+        with pytest.raises(NotImplementedError, match="fullsphere"):
+            bench_objects.store_object_counts(str(tmp_path), grid=grid, shard_keys=[])
+    # The hive path attributes by leaf prefix (layout-agnostic) -- unaffected.
+    assert bench_objects.expected_object_counts(
+        _grid(sharded=False), n_shards=1, store_layout="hive"
+    )
+
+
+def test_list_store_keys_absent_local_path_raises(tmp_path):
+    # open_object_store mkdir's an absent local path; a mistyped store must
+    # fail as "not found", not count as an empty store (review, PR #242).
+    missing = tmp_path / "typo.zarr"
+    with pytest.raises(FileNotFoundError, match="store not found"):
+        bench_objects.list_store_keys(str(missing))
+    assert not missing.exists()  # and no stray directory was created
+
+
+def test_mismatch_flags_metadata_drift():
+    # Metadata is checked unconditionally: an extra zarr.json (the issue #215
+    # CSR-subgroup footprint) offset by a missing data object must name the
+    # metadata bucket, not just the total (review, PR #242).
+    expected = {
+        "metadata": 6,
+        "per_shard_min": 4,
+        "per_shard_max": 4,
+        "total_min": 10,
+        "total_max": 10,
+        "exact": True,
+    }
+    measured = {
+        "objects_total": 10,  # compensated: +1 metadata, -1 data
+        "objects_metadata": 7,
+        "objects_per_shard": {"1121121": 3},
+        "objects_other": 0,
+        "other_keys": [],
+    }
+    msg = bench_objects.object_count_mismatch(measured, expected)
+    assert "metadata objects 7 != expected 6" in msg
+
+
+def test_expected_counts_sane_for_every_manifest_config():
+    # Every config referenced by either manifest (live matrix, provisional,
+    # 88s, cached, full-AOI) must resolve through the model without error and
+    # with sane structure -- so an unpinned provisional target can't hit the
+    # hard-fail tripwire with a config the model has never seen (review,
+    # PR #242).
+    import json
+
+    configs = set()
+    for manifest_name in ("targets.json", "targets_full_aoi_neon.json"):
+        manifest = json.loads((BENCH / manifest_name).read_text())
+        for block in ("targets", "provisional_targets"):
+            for tname, t in manifest.get(block, {}).items():
+                if isinstance(t, dict) and "config" in t:
+                    configs.add(t["config"])
+    assert configs  # the manifests define targets
+    for rel in sorted(configs):
+        grid = from_config(load_config(str(BENCH / rel)))
+        exp = bench_objects.expected_object_counts(grid, n_shards=1)
+        assert exp["metadata"] >= 3, rel  # root + group + >=1 array
+        assert 1 <= exp["per_shard_min"] <= exp["per_shard_max"], rel
+        assert exp["total_max"] == exp["metadata"] + exp["per_shard_max"], rel

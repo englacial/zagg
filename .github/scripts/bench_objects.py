@@ -46,6 +46,24 @@ from __future__ import annotations
 # axis); the hive layout attributes by leaf prefix and is layout-agnostic.
 
 
+def _require_fullsphere(grid) -> None:
+    """Fence the flat model/attribution to its assumption (review, PR #242).
+
+    The flat-layout block arithmetic assumes the 1-D fullsphere HEALPix layout
+    (contiguous nested ids under a parent). A rect grid would die on a bare
+    ``AttributeError`` and a dense-layout HEALPix grid would silently
+    mis-attribute -- fail loudly instead. Every benchmark manifest target is
+    fullsphere HEALPix today; extend the model when a real non-fullsphere
+    target exists.
+    """
+    layout = getattr(grid, "layout", None)
+    if layout != "fullsphere":
+        raise NotImplementedError(
+            "flat object-count model assumes fullsphere HEALPix; got "
+            f"layout={layout!r} ({type(grid).__name__})"
+        )
+
+
 def _member_layouts(grid, *, leaf: bool = False) -> list[dict]:
     """Per-array storage layout facts from the grid's own template spec.
 
@@ -92,6 +110,7 @@ def expected_object_counts(
     ``total_min == total_max`` is the asserted total.
     """
     if store_layout == "flat":
+        _require_fullsphere(grid)
         members = _member_layouts(grid)
         # Root zarr.json + group zarr.json + one zarr.json per array.
         metadata = 2 + len(members)
@@ -140,10 +159,19 @@ def list_store_keys(store_path: str, **store_kwargs) -> list[str]:
     whose prefix join is "/"-delimited, so sibling prefixes like the Lambda
     ``<store>.status/`` result channel are never swept into the count.
     """
+    from pathlib import Path
+
     import obstore
 
     from zagg.store import open_object_store
 
+    # ``open_object_store`` mkdir's an absent LOCAL path (load-bearing for its
+    # side-channel-JSON writers), which here would count a mistyped store as 0
+    # objects (review, PR #242). Fail as "not found" instead; s3 paths keep the
+    # factory's behavior (a wrong prefix lists empty, and the count mismatch
+    # still fails the run).
+    if not store_path.startswith("s3://") and not Path(store_path).exists():
+        raise FileNotFoundError(f"store not found: {store_path}")
     store = open_object_store(store_path, **store_kwargs)
     keys: list[str] = []
     for batch in obstore.list(store):
@@ -174,6 +202,7 @@ def store_object_counts(
     metadata = 0
 
     if store_layout == "flat":
+        _require_fullsphere(grid)
         members = {m["name"]: m for m in _member_layouts(grid)}
         label_of = {int(grid.block_index(int(k))[0]): grid.shard_label(int(k)) for k in shard_keys}
         group = grid.group_path
@@ -272,11 +301,17 @@ def object_count_mismatch(measured: dict, expected: dict) -> str | None:
     shard's count — a bypass regression writing K per-chunk objects (issue
     #215) fails both. Bounded expectations (unsharded / hive data-dependent
     counts) assert the total stays inside ``[total_min, total_max]``.
-    Unclassifiable keys are always a finding: the model claims to know every
-    object the run writes.
+    Metadata is checked unconditionally (it is fixed in every layout, and the
+    #215 blow-up's CSR-subgroup ``zarr.json`` footprint lands in the metadata
+    bucket — review, PR #242), and unclassifiable keys are always a finding:
+    the model claims to know every object the run writes.
     """
     problems = []
     total = measured["objects_total"]
+    if measured["objects_metadata"] != expected["metadata"]:
+        problems.append(
+            f"metadata objects {measured['objects_metadata']} != expected {expected['metadata']}"
+        )
     if expected["exact"]:
         if total != expected["total_max"]:
             problems.append(f"total objects {total} != expected {expected['total_max']}")
