@@ -114,7 +114,12 @@ def test_build_record_cost_per_100km2():
     assert rec["n_granules"] == 44
     assert rec["zagg_version"] == "9.9.9"
     assert rec["max_memory_mb"] == 1963.0  # threaded from the summary (issue #120)
-    assert set(rec) == set(bench_metrics.RECORD_COLUMNS)
+    # The record is the series schema plus the two JSON-only object-count keys
+    # (issue #240) that update_series's reindex deliberately drops.
+    assert set(rec) == set(bench_metrics.RECORD_COLUMNS) | {
+        "objects_per_shard",
+        "objects_mismatch",
+    }
 
 
 def test_build_record_max_memory_null_safe():
@@ -133,7 +138,17 @@ def test_codec_column_is_last_and_threaded(monkeypatch):
     # tail position.
     cols = bench_metrics.RECORD_COLUMNS
     assert cols.index("codec") < cols.index("read") < cols.index("total_wall_s")
-    assert cols[-5:] == ["total_wall_s", "setup_s", "fanout_s", "finalize_s", "index_backend"]
+    # The wall breakdown (#180), read backend (#193) and object counts (#240)
+    # appended in that order.
+    assert cols[-7:] == [
+        "total_wall_s",
+        "setup_s",
+        "fanout_s",
+        "finalize_s",
+        "index_backend",
+        "objects_total",
+        "objects_expected",
+    ]
     g = HealpixGrid(parent_order=11, child_order=19)
     rec = bench_metrics.build_record(_summary(), grid=g, context={"codec": "sharded"})
     assert rec["codec"] == "sharded"
@@ -669,6 +684,7 @@ def test_provisional_target_resolves_and_threads_handoff(monkeypatch):
         return {}
 
     monkeypatch.setattr(runner, "agg", fake_agg)
+    monkeypatch.setattr(run_benchmark, "_measure_objects", lambda *a, **k: None)
     run_benchmark.run_target(
         "scalar_arrow_healpix_o11",
         manifest,
@@ -703,6 +719,7 @@ def test_committed_target_inherits_handoff_from_config(monkeypatch):
         return {}
 
     monkeypatch.setattr(runner, "agg", fake_agg)
+    monkeypatch.setattr(run_benchmark, "_measure_objects", lambda *a, **k: None)
     run_benchmark.run_target(
         "tdigest_healpix_o9_sidecar_nomask",
         manifest,
@@ -733,6 +750,7 @@ def test_sharded_knob_applied_to_grid_config(monkeypatch):
         return {}
 
     monkeypatch.setattr(runner, "agg", fake_agg)
+    monkeypatch.setattr(run_benchmark, "_measure_objects", lambda *a, **k: None)
     for codec, want in (("sharded", True), ("inner", False)):
         manifest = {
             "shardmaps": {"healpix_o10": {"path": "shardmaps/sm_healpix_o10.json"}},
@@ -1672,3 +1690,147 @@ def test_88s_nested_pin_invariant():
             f"{sm_key}: pinned shard {sm_meta['shard_key']} is not inside its "
             f"nested_in parent {parent_meta['shard_key']} (got {containing})"
         )
+
+
+# --- store object-count tripwire (issue #240) --------------------------------
+
+
+def _objects_payload(mismatch=None):
+    return {
+        "objects_total": 10,
+        "objects_expected": 10,
+        "objects_per_shard": {"1121121": 4},
+        "objects_mismatch": mismatch,
+    }
+
+
+def test_objects_columns_are_last_and_threaded():
+    # Stable-schema rule: new columns append LAST (issue #240).
+    cols = bench_metrics.RECORD_COLUMNS
+    assert cols[-2:] == ["objects_total", "objects_expected"]
+    g = HealpixGrid(parent_order=11, child_order=19)
+    rec = bench_metrics.build_record(_summary(), grid=g, context={}, objects=_objects_payload())
+    assert rec["objects_total"] == 10
+    assert rec["objects_expected"] == 10
+    # per_shard/mismatch ride the metrics.json record only -- deliberately NOT
+    # series columns (update_series's reindex drops them).
+    assert rec["objects_per_shard"] == {"1121121": 4}
+    assert rec["objects_mismatch"] is None
+    assert "objects_per_shard" not in cols and "objects_mismatch" not in cols
+    # No measurement (dry-run / legacy) -> null columns, not a crash.
+    bare = bench_metrics.build_record(_summary(), grid=g, context={})
+    assert bare["objects_total"] is None and bare["objects_expected"] is None
+
+
+def test_objects_cell_rendered_in_table():
+    assert "objects" in bench_metrics.TABLE_HEADERS
+    g = HealpixGrid(parent_order=11, child_order=19)
+    rec = bench_metrics.build_record(_summary(), grid=g, context={}, objects=_objects_payload())
+    assert bench_metrics.format_record_cells(rec)["objects"] == "10/10"
+    # Bounded (non-exact) expectation records measured only.
+    bounded = dict(rec, objects_expected=None)
+    assert bench_metrics.format_record_cells(bounded)["objects"] == "10"
+    # Legacy parquet rows degrade to NaN; empty records have nothing.
+    legacy = dict(rec, objects_total=float("nan"))
+    assert bench_metrics.format_record_cells(legacy)["objects"] == "n/a"
+    assert bench_metrics.format_record_cells({})["objects"] == "n/a"
+
+
+def test_run_target_measures_objects_when_store_written(monkeypatch, tmp_path):
+    # A real (non-dry) dispatch with a store must LIST it and thread the
+    # measurement into the record; the pinned shard key is what gets attributed.
+    manifest, base = run_benchmark.load_targets(str(BENCH / "targets.json"))
+    calls = {}
+
+    def fake_agg(config, **kwargs):
+        return {"total_obs": 5, "max_memory_mb": 100.0}
+
+    def fake_measure(config, grid, store, shard_key, *, region):
+        calls["measure"] = (store, int(shard_key), region)
+        return _objects_payload()
+
+    monkeypatch.setattr("zagg.runner.agg", fake_agg)
+    monkeypatch.setattr(run_benchmark, "_measure_objects", fake_measure)
+    store = str(tmp_path / "t.zarr")
+    rec = run_benchmark.run_target(
+        "tdigest_healpix_o9_inline_nomask",
+        manifest,
+        base,
+        store=store,
+        region="us-west-2",
+        function_name="process-shard",
+        context={"commit": "deadbee", "event": "pr"},
+        dry_run=False,
+    )
+    assert calls["measure"] == (store, 5347395636851376137, "us-west-2")
+    assert rec["objects_total"] == 10 and rec["objects_expected"] == 10
+
+
+def test_run_target_dry_run_skips_object_measurement(monkeypatch):
+    # Dry-run writes no store, so nothing is LISTed and the columns stay null.
+    manifest, base = run_benchmark.load_targets(str(BENCH / "targets.json"))
+    monkeypatch.setattr(
+        run_benchmark,
+        "_measure_objects",
+        lambda *a, **k: pytest.fail("dry-run must not LIST a store"),
+    )
+    rec = run_benchmark.run_target(
+        "tdigest_healpix_o9_inline_nomask",
+        manifest,
+        base,
+        store="s3://bucket/t.zarr",
+        region="us-west-2",
+        function_name="process-shard",
+        context={"commit": "deadbee", "event": "pr"},
+        dry_run=True,
+    )
+    assert rec["objects_total"] is None and rec["objects_mismatch"] is None
+
+
+def test_main_fails_on_object_mismatch(tmp_path, monkeypatch):
+    # The tripwire (issues #240/#215): a mismatch hard-fails the run, but only
+    # AFTER metrics.json is written so the failing counts are still recorded.
+    def fake_run_target(name, *a, **k):
+        rec = _fake_record(name, total_obs=100, max_memory_mb=800.0)
+        rec["objects_mismatch"] = "total objects 1030 != expected 10"
+        return rec
+
+    monkeypatch.setattr(run_benchmark, "run_target", fake_run_target)
+    out_json = tmp_path / "metrics.json"
+    rc = run_benchmark.main(
+        [
+            "--targets",
+            str(BENCH / "targets.json"),
+            "--target",
+            "tdigest_healpix_o10_inline",
+            "--commit",
+            "cafe123",
+            "--out-json",
+            str(out_json),
+        ]
+    )
+    assert rc == 1
+    assert json.loads(out_json.read_text())[0]["objects_mismatch"].startswith("total objects")
+
+
+def test_main_no_fail_on_object_mismatch_opts_out(tmp_path, monkeypatch):
+    def fake_run_target(name, *a, **k):
+        rec = _fake_record(name, total_obs=100, max_memory_mb=800.0)
+        rec["objects_mismatch"] = "total objects 1030 != expected 10"
+        return rec
+
+    monkeypatch.setattr(run_benchmark, "run_target", fake_run_target)
+    rc = run_benchmark.main(
+        [
+            "--targets",
+            str(BENCH / "targets.json"),
+            "--target",
+            "tdigest_healpix_o10_inline",
+            "--no-fail-on-object-mismatch",
+            "--commit",
+            "cafe123",
+            "--out-json",
+            str(tmp_path / "metrics.json"),
+        ]
+    )
+    assert rc == 0
