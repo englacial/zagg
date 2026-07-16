@@ -52,8 +52,8 @@ what zagg consumes:
   coverage.moc                   <- optional root MOC (§4, O9); root-only exception
   {sign+base}/{d1}/{d2}/.../     <- one digit per level (D2)
     {full_id}.zarr/              <- self-describing leaf (D3), vanilla zarr v3
-    {full_id}@{window}.zarr/     <- time-windowed leaf (D13); exact naming
-                                    frozen with the mortie spec (morton-hive/2)
+    {full_id}_{window}.zarr/     <- time-windowed leaf (D13); naming frozen on
+                                    the mortie spec page (morton-hive/2)
 ```
 
 - **Ids are morton decimal strings** (D1): sign + base digit (constant width,
@@ -82,8 +82,10 @@ what zagg consumes:
   both reintroduce mutable shared state at the leaf and break the binary
   debris rule (rationale on the #237 thread). Cross-window reads open W
   leaves and concatenate along time; paths stay arithmetic because the
-  schedule lives in the manifest (D10 preserved). The single-window
-  degenerate case (`mission`) is byte-identical to the pre-D13 layout.
+  schedule lives in the manifest (D10 preserved). The no-partitioning
+  degenerate case (`schedule: none`) keeps the bare `{full_id}.zarr` name and
+  is byte-identical to the pre-D13 layout — a `morton-hive/1` store *is* a
+  `/2` store with `schedule: none`.
 - **Node invariant**: below the root, a node contains *only* digit children
   (`[1-4]/`) and `*.zarr` objects. Nothing else, ever — the walker's child
   classification depends on it. The root alone also carries the manifest and
@@ -128,10 +130,14 @@ touched again during a run. Contents:
   [#237](https://github.com/englacial/zagg/issues/237)): a store carrying this
   block declares `spec: "morton-hive/2"` (the version string of D6 covers these
   temporal/windowed-leaf extensions). It records time
-  encoding/units/epoch/calendar, the **window schedule**
-  (`mission` | `yearly` | explicit range list), and the append policy. The
-  schedule is *generative*, so under `mission`/`yearly` the manifest is
-  write-once and stays static as data accrues: appending a new year to a
+  encoding/units/epoch/calendar, the membership timestamp field, the **window
+  schedule** (`none` | `yearly` | `monthly` | `daily` | explicit range list;
+  `quarterly` grammar-reserved), and the append policy. Label grammar and
+  boundary semantics (UTC calendar terms, half-open `[start, end)`,
+  lexicographic = chronological) are frozen on the
+  [mortie spec page](https://github.com/espg/mortie/issues/62#issuecomment-4986809092).
+  Generative schedules keep the manifest
+  write-once and static as data accrues: appending a new year to a
   `yearly` store adds leaves the schedule already describes — no manifest
   touch, and **no new manifests**: the store has exactly one
   `morton_hive.json`, and each new windowed leaf brings only its own zarr
@@ -144,8 +150,14 @@ touched again during a run. Contents:
   deliberately **not** manifest data: actual ranges live on the leaf stamps
   (truth) and in the root summary (cache), splitting static schema from
   accruing state exactly the way coverage splits under D9. The default
-  schedule is `mission` (one window) — existing aggregation stores are
-  unchanged.
+  schedule is `none` (no temporal partitioning; a re-run replaces the leaf —
+  the honest rename of the drafted `mission`, which made a completeness claim
+  it couldn't keep for ongoing missions) — existing aggregation stores are
+  unchanged. Ongoing missions with append intent declare a generative
+  schedule (`yearly` is the expected production default; t-digest
+  mergeability makes mission-scale statistics a read-time merge over window
+  leaves, the same approximation class as the worker's existing cross-buffer
+  merge).
 
 This file is the reader's bootstrap: with it, every shard path is computable
 arithmetically with zero requests.
@@ -367,13 +379,16 @@ write path (§2) is load-bearing; this phase is optimization.
   high-water time index (can't extend backward) and per-run stamp entries
   with array `resize` (mutable shared state at the leaf — attrs RMW +
   metadata rewrite races, non-binary debris, unordered time axis on
-  backfill). Not raster-specific: `mission` (default, single window)
-  reproduces today's aggregation stores byte-identically; per-year 88S
-  runs, seasonal subsets, and append-as-acquired are all window leaves
-  under the same convention. Leaf naming (`{full_id}@{window}.zarr` or
-  similar) is frozen with the mortie spec page
-  ([mortie #62](https://github.com/espg/mortie/issues/62)) as part of
-  `morton-hive/2`.
+  backfill). Not raster-specific: `none` (default; no partitioning, bare
+  leaf names) reproduces today's aggregation stores byte-identically;
+  per-year 88S runs, seasonal subsets, and append-as-acquired are all
+  window leaves under the same convention. Leaf naming is **frozen**:
+  `{full_id}_{window}.zarr`, underscore separator, split on the first `_`
+  — grammar and boundary semantics recorded on the
+  [mortie spec page](https://github.com/espg/mortie/issues/62#issuecomment-4986809092)
+  as part of `morton-hive/2`. Reserved (lean, not decided): §7
+  overview/pyramid zarrs inherit window naming (per-window overviews, with
+  an optional all-time overview as a derived artifact).
 - **D14 — Coverage `encoding: "full"` fast path**
   (espg-ratified on [#237](https://github.com/englacial/zagg/issues/237)).
   The stamp's coverage envelope discriminator becomes
