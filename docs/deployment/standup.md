@@ -45,9 +45,10 @@ to hand-assemble zips or wire up the IAM role yourself.
    `STAGING_BUCKET` (a bucket you own in that region) and `stand_up.sh` copies
    the zips into it first.
 5. **Deploys `template.yaml`** with `aws cloudformation deploy
-   --capabilities CAPABILITY_NAMED_IAM`, passing the resolved architecture,
-   artifact bucket/keys, output bucket, and role settings as parameter
-   overrides.
+   --capabilities CAPABILITY_NAMED_IAM CAPABILITY_AUTO_EXPAND` (the latter
+   acknowledges the `AWS::LanguageExtensions` macro that expands the
+   worker-size variants), passing the resolved architecture, artifact
+   bucket/keys, output bucket, and role settings as parameter overrides.
 6. **Prints the stack outputs** (function ARN/name, layer ARN, role ARN, output
    bucket).
 
@@ -56,8 +57,29 @@ to hand-assemble zips or wire up the IAM role yourself.
 `template.yaml` provisions (see the file for the authoritative definition):
 
 - **`ProcessFn`** -- the `process-shard` Lambda (`python3.12`, handler
-  `lambda_handler.lambda_handler`, default 2048 MB / 900 s timeout), wired to the
-  layer and execution role.
+  `lambda_handler.lambda_handler`, default 4096 MB / 900 s timeout), wired to the
+  layer and execution role -- plus its `-extract` twin (own concurrency pool
+  for full-archive extraction runs).
+- **The worker-size variants** -- six additional functions sharing the same
+  code, layer, and role, pre-provisioned so a run can pick its memory//tmp
+  size by *name* with no admin-role config swap (selected via the config
+  `worker:` block or `agg(function_name=...)` -- see
+  [AWS Lambda](lambda.md#worker-size-variants)):
+
+  | Function | Memory | `/tmp` |
+  |----------|--------|--------|
+  | `process-shard-2048` | 2048 MB | 512 MB |
+  | `process-shard-4096` | 4096 MB | 512 MB |
+  | `process-shard-8192` | 8192 MB | 512 MB |
+  | `process-shard-2048-disk` | 2048 MB | 4096 MB |
+  | `process-shard-4096-disk` | 4096 MB | 6144 MB |
+  | `process-shard-8192-disk` | 8192 MB | 10240 MB |
+
+  `-disk` `/tmp` is memory + 2048 MB (10240 is Lambda's ceiling). The
+  unsuffixed `process-shard`/`-extract` pair stays the no-config default.
+  Each variant carries the same async-invoke hygiene (retries 0 / event age
+  60 s) and self-recycle/worker-error metric-filter pair as the base
+  function; idle variants cost nothing (Lambda bills invocations only).
 - **`DepsLayer`** -- the dependency layer version (`<FunctionName>-deps`).
 - **`ExecutionRole`** -- created only when `CreateExecutionRole=true` (the
   default). It trusts `lambda.amazonaws.com` and is scoped least-privilege to

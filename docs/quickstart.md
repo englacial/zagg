@@ -150,6 +150,9 @@ output:
 # Optional top-level fields:
 catalog: catalog_ATL06_cycle22_order6.json
 store: ./output.zarr
+worker:            # lambda backend: pick a pre-provisioned worker size
+  memory: 2048     # 2048 | 4096 | 8192 (see docs/deployment/lambda.md)
+  extra_disk: false
 ```
 
 See `src/zagg/configs/atl06.yaml` for a complete example and the
