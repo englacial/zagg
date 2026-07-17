@@ -982,7 +982,18 @@ def _handle_process_raster(event: Dict[str, Any]) -> Dict[str, Any]:
     """
     start_time = time.time()
     try:
-        required = ["shard_key", "granules", "config", "store_path", "time_index"]
+        # The hive path (issue #247) needs no ``time_index``: the worker
+        # builds its own leaf-local index from the dispatched subset. Peek at
+        # the raw config dict (no load yet) so a flat event — including one
+        # with no config at all — reports the flat requirements byte-identical
+        # to before.
+        cfg_dict = event.get("config")
+        hive = isinstance(cfg_dict, dict) and (
+            (cfg_dict.get("output") or {}).get("store_layout") == "hive"
+        )
+        required = ["shard_key", "granules", "config", "store_path"]
+        if not hive:
+            required.append("time_index")
         missing = [p for p in required if p not in event]
         if missing:
             error_msg = f"Missing required parameters: {', '.join(missing)}"
@@ -1009,8 +1020,53 @@ def _handle_process_raster(event: Dict[str, Any]) -> Dict[str, Any]:
         grid = from_config(config)
 
         shard_key = int(event["shard_key"])
-        time_index = {k: int(v) for k, v in event["time_index"].items()}
         source = config.data_source or {}
+        profile = bool(event.get("profile"))
+
+        if hive:
+            # Hive branch (issue #247), mirroring the aggregation one: the
+            # worker owns its WHOLE leaf — process_and_write_raster_hive is
+            # the same code path the local dispatcher runs (leaf template +
+            # slabs + coverage + D4 commit stamp), so leaf semantics cannot
+            # drift between backends. ``window`` ({"label", ...}) is the
+            # dispatch unit's time window, absent on schedule-none stores; the
+            # response mirrors the stamped ISO ``time_range`` back for the
+            # dispatcher's root-summary union. A write failure raises into the
+            # 500 envelope: the leaf is then unstamped debris, replaced
+            # wholesale on retry (D13).
+            from zagg.processing.raster import process_and_write_raster_hive
+
+            meta = process_and_write_raster_hive(
+                shard_key,
+                event["granules"],
+                grid,
+                event["store_path"],
+                config,
+                store_kwargs=_output_store_kwargs(event),
+                window=event.get("window"),
+                profile=profile,
+                region=source.get("source_region"),
+                anonymous=source.get("anonymous", True),
+            )
+            body = {
+                "shard_key": shard_key,
+                "timesteps": meta["timesteps"],
+                "granule_count": meta["granule_count"],
+                "skipped": meta["skipped"],
+                # Shared summary keys (see the flat branch below): a raster
+                # unit's obs tally is its timestep count; cells_with_data
+                # counts the leaf's occupied-cell union via the stamp input.
+                "cells_with_data": meta.get("cells_with_data", 0),
+                "total_obs": meta["timesteps"],
+                "duration_s": time.time() - start_time,
+            }
+            if meta.get("time_range") is not None:
+                body["time_range"] = meta["time_range"]
+            if profile and "phase_timings" in meta:
+                body["phase_timings"] = meta["phase_timings"]
+            return {"statusCode": 200, "body": json.dumps(body)}
+
+        time_index = {k: int(v) for k, v in event["time_index"].items()}
 
         # Stream the slabs: open the store up front and write + free each
         # timestep's slab as ``process_raster_shard`` completes its acquisition
@@ -1029,7 +1085,6 @@ def _handle_process_raster(event: Dict[str, Any]) -> Dict[str, Any]:
         # overlap, so stage sums can exceed ``sample`` (see
         # ``new_stage_stats``). Default (no ``profile`` key) emits nothing:
         # the body stays byte-identical and the sample path times nothing.
-        profile = bool(event.get("profile"))
         write_s = 0.0
         stage_stats = new_stage_stats() if profile else None
 

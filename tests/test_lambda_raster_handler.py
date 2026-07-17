@@ -247,3 +247,97 @@ class TestRasterPhaseTimings:
         assert resp["statusCode"] == 200, resp
         assert seen["stage_stats"] is None
         assert "phase_timings" not in json.loads(resp["body"])
+
+
+class TestProcessRasterHiveMode:
+    """The hive branch of mode="process_raster" (issue #247 phase 4)."""
+
+    def _hive_event(self, tmp_path, window=None, windowing=None):
+        data = np.full((96, 96), 555, dtype=np.uint16)
+        _write_tiff(tmp_path / "h0.tif", data)
+        store_path = str(tmp_path / "hive_out")
+        cfg_dict = _config_dict(store_path)
+        cfg_dict["output"]["store_layout"] = "hive"
+        if windowing:
+            cfg_dict["output"]["windowing"] = windowing
+        entry = {
+            "id": "g0",
+            "s3": None,
+            "https": None,
+            "assets": {"red": str(tmp_path / "h0.tif")},
+            "datetime": T0,
+            "time_key": "dt-1",
+        }
+        event = {
+            "mode": "process_raster",
+            "shard_key": _shard_for_raster(),
+            "granules": [entry],
+            "config": cfg_dict,
+            "store_path": store_path,
+        }
+        if window:
+            event["window"] = window
+        return event
+
+    def test_windowed_leaf_written_and_stamped(self, handler_mod, tmp_path):
+        from zagg import hive
+
+        event = self._hive_event(
+            tmp_path,
+            window={"label": "20260713"},
+            windowing={"schedule": "daily"},
+        )
+        resp = handler_mod.lambda_handler(event, MagicMock())
+        assert resp["statusCode"] == 200, resp
+        body = json.loads(resp["body"])
+        assert body["timesteps"] == 1 and body["total_obs"] == 1
+        # The response mirrors the stamped ISO time range for the dispatcher's
+        # root-summary union.
+        assert body["time_range"] == [T0, T0]
+        leaf = hive.shard_leaf_path(event["store_path"], event["shard_key"], window="20260713")
+        stamp = hive.read_commit(leaf)
+        assert stamp and stamp["complete"] and stamp["spec"] == "morton-hive/2"
+        assert stamp["window"] == "20260713"
+        assert body["cells_with_data"] == stamp["cells_with_data"] > 0
+
+    def test_schedule_none_bare_leaf(self, handler_mod, tmp_path):
+        from zagg import hive
+
+        event = self._hive_event(tmp_path)  # no window, no windowing block
+        resp = handler_mod.lambda_handler(event, MagicMock())
+        assert resp["statusCode"] == 200, resp
+        body = json.loads(resp["body"])
+        assert "time_range" not in body
+        leaf = hive.shard_leaf_path(event["store_path"], event["shard_key"])
+        stamp = hive.read_commit(leaf)
+        assert stamp and stamp["spec"] == "morton-hive/1" and "window" not in stamp
+
+    def test_hive_missing_params_omit_time_index(self, handler_mod):
+        # A hive event needs no time_index: the 400 for an empty hive event
+        # names the other four requirements only.
+        event = {
+            "mode": "process_raster",
+            "config": {"output": {"store_layout": "hive"}},
+        }
+        resp = handler_mod.lambda_handler(event, MagicMock())
+        assert resp["statusCode"] == 400
+        err = json.loads(resp["body"])["error"]
+        assert "time_index" not in err
+        for key in ("shard_key", "granules", "store_path"):
+            assert key in err
+
+    def test_flat_missing_params_unchanged(self, handler_mod):
+        # Flat (and config-less) events keep the pre-#247 requirement list.
+        resp = handler_mod.lambda_handler({"mode": "process_raster"}, MagicMock())
+        assert resp["statusCode"] == 400
+        assert "time_index" in json.loads(resp["body"])["error"]
+
+    def test_profile_rides_hive_meta(self, handler_mod, tmp_path):
+        event = self._hive_event(tmp_path, window={"label": "20260713"})
+        event["profile"] = True
+        resp = handler_mod.lambda_handler(event, MagicMock())
+        assert resp["statusCode"] == 200, resp
+        pt = json.loads(resp["body"])["phase_timings"]
+        assert set(pt) == {"sample", "write", "stages"}
+        assert pt["write"] > 0.0
+        assert pt["stages"]["assets"] == 1

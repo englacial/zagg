@@ -1109,6 +1109,7 @@ def process_and_write_raster_hive(
     # Stamp ONLY a leaf that wrote slabs: a unit that streamed nothing has no
     # prefix, and a worker error raised out above, leaving debris (D4). Write
     # order is pinned: dense slabs -> coverage sidecar -> stamp.
+    meta["cells_with_data"] = 0
     if "store" in box:
         _t0 = time.time() if profile else None
         words = occupied[0] if occupied and occupied[0].size else None
@@ -1130,9 +1131,10 @@ def process_and_write_raster_hive(
             if instants:
                 time_range = [_us_iso(min(instants)), _us_iso(max(instants))]
                 meta["time_range"] = time_range
+        meta["cells_with_data"] = int(words.size) if words is not None else 0
         stamp_commit(
             box["store"],
-            cells_with_data=int(words.size) if words is not None else 0,
+            cells_with_data=meta["cells_with_data"],
             granule_count=meta["granule_count"] - meta["skipped"],
             coverage=build_coverage(
                 int(shard_key), words, grid.child_order, bitmap=bitmap, full=full

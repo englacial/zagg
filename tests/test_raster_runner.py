@@ -593,8 +593,178 @@ class TestRasterHiveLocalBackend:
         cov = hive.read_root_coverage(store_path)
         assert cov["time_range"] == [T0, T1]
 
-    def test_lambda_backend_hive_not_yet(self, manifest):
-        cfg, sm_path, _shard, _data = manifest
+
+class TestRasterHiveLambdaBackend:
+    """Lambda raster hive dispatch (issue #247 phase 4): lifecycle + events."""
+
+    def test_lifecycle_and_event_shapes(self, manifest, monkeypatch):
+        # The hive manifest rides the issue #252 hybrid lifecycle: ping (read-
+        # only precheck) -> async setup (manifest write) -> per-unit process
+        # invokes (no time_index; window on windowed units) -> finalize
+        # backstop -> fire-and-forget coverage. Scripted responder, no writes.
+        import boto3
+
+        cfg, sm_path, shard, _data = manifest
         cfg.output["store_layout"] = "hive"
-        with pytest.raises(ValueError, match="phase 4 of issue #247"):
-            agg(cfg, catalog=sm_path, store="s3://bucket/out.zarr", backend="lambda")
+        cfg.output["windowing"] = {"schedule": "daily"}
+
+        def responder(event):
+            mode = event["mode"]
+            if mode == "ping":
+                body = {"ok": True, "mode": "ping", "zagg_version": "test"}
+                return {"statusCode": 200, "body": json.dumps(body)}
+            if mode in ("setup", "coverage"):
+                return {"statusCode": 200, "body": "{}"}  # Event invokes: unread
+            if mode == "finalize":
+                body = {"ok": True, "mode": "finalize", "layout": "hive"}
+                return {"statusCode": 200, "body": json.dumps(body)}
+            assert mode == "process_raster"
+            label = event["window"]["label"]
+            body = {
+                "shard_key": event["shard_key"],
+                "timesteps": 1,
+                "cells_with_data": 7,
+                "time_range": {
+                    "20260713": [T0, T0],
+                    "20260718": [T1, T1],
+                }[label],
+            }
+            return {"statusCode": 200, "body": json.dumps(body)}
+
+        fake = _FakeLambdaClient(responder)
+        monkeypatch.setattr(boto3, "client", lambda *a, **k: fake)
+        summary = agg(
+            cfg, catalog=sm_path, store="s3://bucket/out.zarr", backend="lambda", max_workers=2
+        )
+        assert summary["total_cells"] == 2  # two (shard, window) units
+        assert summary["cells_with_data"] == 2
+
+        modes = [e["mode"] for e in fake.events]
+        assert modes[:2] == ["ping", "setup"]
+        assert modes[-2:] == ["finalize", "coverage"]
+        assert modes[2:-2] == ["process_raster", "process_raster"]
+        # Lifecycle events carry the manifest inputs (config + parent_order +
+        # dataset identity), mirroring the aggregation hive path.
+        for ev in fake.events[:2] + [fake.events[-2]]:
+            assert ev["config"]["output"]["store_layout"] == "hive"
+            assert ev["parent_order"] == 10
+            assert "dataset" in ev
+        # Hive process events: no time_index (leaf-local axis), window payload
+        # with the daily labels, one unit per (shard, window).
+        procs = fake.events[2:-2]
+        assert all("time_index" not in ev for ev in procs)
+        assert sorted(ev["window"]["label"] for ev in procs) == ["20260713", "20260718"]
+        assert all(ev["shard_key"] == shard for ev in procs)
+        # Root coverage rides serialized in the event, with the D15 time union.
+        cov = fake.events[-1]["coverage"]
+        assert cov["encoding"] == "ranges"
+        assert cov["time_range"] == [T0, T1]
+
+    def test_flat_events_unchanged(self, manifest, monkeypatch, tmp_path):
+        # The flat event set is byte-identical to pre-#247 runs: exactly the
+        # same keys, no lifecycle invokes (template stays runner-emitted).
+        import boto3
+
+        import zagg.runner as runner_mod
+
+        cfg, sm_path, _shard, _data = manifest
+
+        def responder(event):
+            body = {"timesteps": len(event["time_index"]), "cells_with_data": 4096}
+            return {"statusCode": 200, "body": json.dumps(body)}
+
+        fake = _FakeLambdaClient(responder)
+        monkeypatch.setattr(boto3, "client", lambda *a, **k: fake)
+        real_open = runner_mod.open_store
+        monkeypatch.setattr(
+            runner_mod,
+            "open_store",
+            lambda path, **kw: (
+                str(tmp_path / "flat.zarr") if path.startswith("s3://") else real_open(path, **kw)
+            ),
+        )
+        agg(cfg, catalog=sm_path, store="s3://bucket/out.zarr", backend="lambda")
+        assert len(fake.events) == 1
+        assert set(fake.events[0]) == {
+            "mode",
+            "shard_key",
+            "granules",
+            "config",
+            "store_path",
+            "time_index",
+        }
+
+    def test_parity_with_local_backend(self, manifest, monkeypatch, tmp_path):
+        # Both dispatchers, same inputs -> identical leaf sets and stamps
+        # (bar the write clocks): the lambda run drives the REAL handler
+        # (deployment/aws/lambda_handler.py) with s3:// paths remapped onto
+        # tmp_path, the local run writes directly; then compare.
+        import importlib.util
+        from pathlib import Path
+        from unittest.mock import MagicMock
+
+        import boto3
+
+        import zagg.hive as hive
+        import zagg.store as store_mod
+
+        spec = importlib.util.spec_from_file_location(
+            "zagg_lambda_handler_parity",
+            Path(__file__).parent.parent / "deployment" / "aws" / "lambda_handler.py",
+        )
+        handler_mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(handler_mod)
+
+        cfg, sm_path, shard, _data = manifest
+        cfg.output["store_layout"] = "hive"
+        cfg.output["windowing"] = {"schedule": "daily"}
+
+        s3root = tmp_path / "s3root"
+
+        def _translate(path):
+            return str(s3root / path.removeprefix("s3://")) if path.startswith("s3://") else path
+
+        real_open_store = store_mod.open_store
+        real_open_object = hive.open_object_store
+        monkeypatch.setattr(
+            store_mod, "open_store", lambda path, **kw: real_open_store(_translate(path))
+        )
+        monkeypatch.setattr(
+            hive, "open_object_store", lambda path, **kw: real_open_object(_translate(path))
+        )
+        # The handler binds open_store at its own import; patch that binding too.
+        monkeypatch.setattr(
+            handler_mod, "open_store", lambda path, **kw: real_open_store(_translate(path))
+        )
+
+        def responder(event):
+            return handler_mod.lambda_handler(event, MagicMock())
+
+        fake = _FakeLambdaClient(responder)
+        monkeypatch.setattr(boto3, "client", lambda *a, **k: fake)
+        lam = agg(
+            cfg, catalog=sm_path, store="s3://bucket/out.zarr", backend="lambda", max_workers=2
+        )
+        assert lam["cells_with_data"] == 2 and lam["cells_error"] == 0
+        lam_root = str(s3root / "bucket/out.zarr")
+
+        loc_root = str(tmp_path / "local_out.zarr")
+        loc = agg(cfg, catalog=sm_path, store=loc_root, backend="local", max_workers=2)
+        assert loc["cells_with_data"] == 2
+
+        def _leaves(root):
+            return sorted(
+                str(p.relative_to(root)) for p in Path(root).rglob("*.zarr") if p.is_dir()
+            )
+
+        assert _leaves(lam_root) == _leaves(loc_root) != []
+        for rel in _leaves(loc_root):
+            a = hive.read_commit(f"{lam_root}/{rel}")
+            b = hive.read_commit(f"{loc_root}/{rel}")
+            assert a is not None and b is not None
+            a.pop("written_at"), b.pop("written_at")
+            assert a == b
+        # Manifests agree on the frozen keys (generated_at differs).
+        ma, mb = hive.read_manifest(lam_root), hive.read_manifest(loc_root)
+        for key in ("spec", "dataset", "cell_order", "shard_order", "temporal"):
+            assert ma.get(key) == mb.get(key)
