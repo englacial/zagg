@@ -314,7 +314,13 @@ def process_shard(
 
     streaming_cfg = get_streaming(config)
     buffered = (
-        StreamingAggregator(config, grid, handoff, streaming_cfg["buffer_granules"])
+        StreamingAggregator(
+            config,
+            grid,
+            handoff,
+            streaming_cfg["buffer_granules"],
+            state_layout=streaming_cfg["state_layout"],
+        )
         if streaming_cfg is not None
         else None
     )
