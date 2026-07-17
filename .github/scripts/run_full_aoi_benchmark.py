@@ -46,6 +46,7 @@ Two JSON files. ``--out-json`` is one **run record** per target::
       "lambda_seconds", "gb_seconds", "cost_usd",             # Lambda GB-s -- the PRIMARY cost column
       "total_wall_s", "setup_s", "fanout_s", "finalize_s",
       "worker_max_s", "worker_median_s", "worker_pct_timeout", "max_memory_mb",
+      "worker_phase_max": {"read", "index", "aggregate"},     # straggler (max) seconds/phase (issue #250)
       "objects_total", "objects_expected", "objects_mismatch",  # store object counts (issue #240), record-only
       "write_throughput": {                                    # leg-5 acceptance signal
         "invoke_retries_total", "invoke_throttle_shards",
@@ -582,6 +583,11 @@ def run_target(
         worker_median_s=summary.get("worker_median_s"),
         worker_pct_timeout=summary.get("worker_pct_timeout"),
         max_memory_mb=summary.get("max_memory_mb"),
+        # Worker per-phase straggler split (issue #250): {phase: max seconds
+        # across shards}, emitted because this harness runs profile=True. The
+        # dict rides the JSON record whole; the series flattens the known
+        # phases (read/index/aggregate) into phase_*_s columns, null-safe.
+        worker_phase_max=summary.get("worker_phase_max"),
         write_throughput=_write_throughput(results),
     )
     objects: dict = {}

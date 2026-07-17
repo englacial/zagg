@@ -61,6 +61,9 @@ def _record(commit="c0", target="full_aoi_neon_o9_inline_nomask", event="release
         "worker_median_s": 70.0,
         "worker_pct_timeout": 0.0,
         "max_memory_mb": 2200.0,
+        # Worker per-phase straggler split (issue #250), emitted under
+        # profile=True. Distinct values so a column transposition can't pass.
+        "worker_phase_max": {"read": 60.0, "index": 5.0, "aggregate": 30.0},
         "write_throughput": {
             "invoke_retries_total": 2,
             "invoke_throttle_shards": 1,
@@ -92,6 +95,26 @@ def test_flatten_spreads_write_throughput_and_drops_nested():
     assert "write_throughput" not in flat
     for k in ("temporal", "per_shard_granules", "apriori_estimate"):
         assert k not in flat
+
+
+def test_flatten_spreads_worker_phase_max_and_drops_nested():
+    # The worker phase split (issue #250) lifts into phase_*_s scalar columns...
+    flat = fas.flatten_record(_record())
+    assert flat["phase_read_s"] == 60.0
+    assert flat["phase_index_s"] == 5.0
+    assert flat["phase_aggregate_s"] == 30.0
+    assert "worker_phase_max" not in flat
+    # ...null-safe: no profiling / dry run -> None cells, not a KeyError.
+    flat2 = fas.flatten_record(_record(worker_phase_max=None))
+    assert flat2["phase_read_s"] is None
+    rec = _record()
+    del rec["worker_phase_max"]
+    flat3 = fas.flatten_record(rec)
+    assert flat3["phase_aggregate_s"] is None
+    # A phase the worker grows later stays JSON-only (no stray column leaks).
+    df = fas.records_to_frame([_record(worker_phase_max={"read": 1.0, "write": 9.0})])
+    assert list(df.columns) == fas.FULL_AOI_COLUMNS
+    assert df.iloc[0]["phase_read_s"] == 1.0
 
 
 def test_flatten_missing_write_throughput_yields_nulls():
@@ -224,12 +247,16 @@ def test_objects_columns_retained_and_mismatch_dropped():
     # per-merge series' JSON-only keys.
     df = fas.records_to_frame([_record(objects_mismatch="total objects 999 != expected 25")])
     assert list(df.columns) == fas.FULL_AOI_COLUMNS
-    # Appended in order: object counts (phase 3), then layout + parity (phase 4).
-    assert fas.FULL_AOI_COLUMNS[-4:] == [
+    # Appended in order: object counts (phase 3), then layout + parity (phase
+    # 4), then the worker phase split (issue #250).
+    assert fas.FULL_AOI_COLUMNS[-7:] == [
         "objects_total",
         "objects_expected",
         "store_layout",
         "parity_ok",
+        "phase_read_s",
+        "phase_index_s",
+        "phase_aggregate_s",
     ]
     assert df.iloc[0]["objects_total"] == 27
     assert df.iloc[0]["objects_expected"] == 25
@@ -274,7 +301,7 @@ def test_store_layout_and_parity_columns_retained_parity_detail_dropped():
     )
     df = fas.records_to_frame([rec])
     assert list(df.columns) == fas.FULL_AOI_COLUMNS
-    assert fas.FULL_AOI_COLUMNS[-2:] == ["store_layout", "parity_ok"]
+    assert fas.FULL_AOI_COLUMNS[-5:-3] == ["store_layout", "parity_ok"]
     row = df.iloc[0]
     assert row["store_layout"] == "hive"
     assert row["parity_ok"] == False  # noqa: E712 -- nullable bool column
