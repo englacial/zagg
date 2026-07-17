@@ -2,9 +2,9 @@ AWSTemplateFormatVersion: "2010-09-09"
 # The AWS::LanguageExtensions macro provides Fn::ForEach, which stamps the
 # issue #235 worker-size variants from one parameterized block per resource
 # family instead of ~24 hand-written near-identical resources. The macro runs
-# server-side at change-set creation (stand_up.sh deploys via change sets, so
-# no mechanical change there); the expansion is deterministic and visible in
-# the change set, or post-deploy via
+# server-side at change-set creation (stand_up.sh deploys via change sets and
+# passes CAPABILITY_AUTO_EXPAND to acknowledge the macro); the expansion is
+# deterministic and visible in the change set, or post-deploy via
 # `aws cloudformation get-template --template-stage Processed`.
 Transform: AWS::LanguageExtensions
 Description: >-
