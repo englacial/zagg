@@ -193,6 +193,43 @@ class TestRasterConfigValidation:
         with pytest.raises(ValueError, match="half-open"):
             validate_config(cfg)
 
+    def test_windowing_explicit_list_normalizes(self):
+        # Issue #247: the happy path for schedule: explicit — a valid two-window
+        # list normalizes through get_windowing with each boundary canonicalized
+        # to ISO-8601 UTC, mirroring the generative case in
+        # test_windowing_validates_and_normalizes so both normalizations stay locked.
+        from zagg.config import get_windowing
+
+        cfg = _raster_config()
+        cfg.output["store_layout"] = "hive"
+        cfg.output["windowing"] = {
+            "schedule": "explicit",
+            "windows": [
+                {"label": "q1", "start": "2019-01-01", "end": "2019-04-01"},
+                {"label": "q2", "start": "2019-04-01", "end": "2019-07-01"},
+            ],
+        }
+        validate_config(cfg)
+        assert get_windowing(cfg) == {
+            "schedule": "explicit",
+            "time_field": "datetime",
+            "epoch": "1970-01-01T00:00:00+00:00",
+            "scale": "utc",
+            "units": "seconds",
+            "windows": [
+                {
+                    "label": "q1",
+                    "start": "2019-01-01T00:00:00+00:00",
+                    "end": "2019-04-01T00:00:00+00:00",
+                },
+                {
+                    "label": "q2",
+                    "start": "2019-04-01T00:00:00+00:00",
+                    "end": "2019-07-01T00:00:00+00:00",
+                },
+            ],
+        }
+
     def test_rectilinear_grid_rejected_for_now(self):
         grid = {"type": "rectilinear", "crs": UTM18, "resolution": 10, "bounds": [0, 0, 1, 1]}
         with pytest.raises(ValueError, match="healpix"):
