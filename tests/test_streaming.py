@@ -351,6 +351,12 @@ class TestArenaLayout:
                 streaming={"buffer_granules": buffer_granules, "state_layout": layout},
                 delta=delta,
             )
+            # Serial reads: the granule pool (default 4) drains the fake-read
+            # iterator from worker threads, so which granule gets which frame
+            # is scheduling-dependent — buffer composition then varies run to
+            # run, and cross-buffer merge_tdigests is not associative. Byte
+            # equality between two separate runs needs a pinned composition.
+            cfg.data_source["shard_workers"] = 1
             grid = _grid(cfg)
             results.append(_run(monkeypatch, cfg, grid, key, dfs_fn(grid, key)))
         return results
