@@ -245,18 +245,19 @@ def test_make_full_aoi_release_figure_renders_and_empty_is_false(tmp_path):
 
 
 def test_full_aoi_phase_series_spec():
-    # The display spec: setup is the headline, the worker split + totals follow,
-    # and finalize (~0 on the full-AOI path) is deliberately NOT displayed.
+    # The display spec: setup is the headline, then the worker split, finalize,
+    # and the worker totals. finalize stays displayed (issue #252 / PR #255):
+    # ~0 on flat, but on hive it is the idempotent manifest backstop.
     ps = pytest.importorskip("plot_series")
     assert list(ps.FULL_AOI_PHASE_SERIES) == [
         "setup_s",
         "phase_read_s",
         "phase_index_s",
         "phase_aggregate_s",
+        "finalize_s",
         "worker_max_s",
         "worker_median_s",
     ]
-    assert "finalize_s" not in ps.FULL_AOI_PHASE_SERIES
 
 
 def test_full_aoi_phase_figure_renders_and_skips_when_no_data(tmp_path):
