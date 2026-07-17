@@ -1498,6 +1498,42 @@ class TestInvokeLambdaSetupEvent:
         # with no function payload), so nothing can block on it.
         client.invoke.return_value["Payload"].read.assert_not_called()
 
+    def test_hive_async_event_threads_creds_and_overwrite(self, cfg):
+        # The async setup is the PRIMARY manifest write and fire-and-forget
+        # (no response read), so a drifted ``output_credentials`` key or
+        # ``overwrite`` flag would fail SILENTLY — the miss only surfacing as
+        # the finalize backstop doing the "primary" write. Pin the two
+        # conditional branches on the wire: overwrite=True and an
+        # output_creds_event both reach the Event payload exactly.
+        from zagg.runner import _invoke_lambda_setup_async
+
+        cfg.output["store_layout"] = "hive"
+        config_dict = asdict(cfg)
+        client = _wire_client({"ok": True, "mode": "setup", "layout": "hive"})
+        creds = {"aws_access_key_id": "AK", "aws_secret_access_key": "SK"}
+        _invoke_lambda_setup_async(
+            client,
+            "process-shard",
+            "s3://out/product",
+            config_dict=config_dict,
+            dataset={"short_name": "ATL06", "version": "007"},
+            parent_order=6,
+            overwrite=True,
+            output_creds_event=creds,
+        )
+        kwargs = client.invoke.call_args.kwargs
+        assert kwargs["InvocationType"] == "Event"
+        assert json.loads(kwargs["Payload"]) == {
+            "mode": "setup",
+            "store_path": "s3://out/product",
+            "parent_order": 6,
+            "overwrite": True,
+            "config": config_dict,
+            "dataset": {"short_name": "ATL06", "version": "007"},
+            "output_credentials": creds,
+        }
+        client.invoke.return_value["Payload"].read.assert_not_called()
+
 
 class TestInvokeLambdaFinalizeEvent:
     """Pin the ACTUAL finalize event on the wire (issue #252): hive carries
