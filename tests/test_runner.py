@@ -3512,3 +3512,176 @@ class TestResolveSourceCredentials:
         cfg = PipelineConfig(data_source={"credentials_provider": "not_a_provider"})
         with pytest.raises(KeyError, match="not_a_provider"):
             runner._resolve_source_credentials(cfg)
+
+
+# ---------------------------------------------------------------------------
+# Worker-size variant selection (issue #235)
+# ---------------------------------------------------------------------------
+
+
+class TestResolveFunctionName:
+    """Issue #235: one resolver for all three Lambda paths. Explicit
+    ``function_name`` wins verbatim; else env base (default ``process-shard``)
+    plus the config ``worker:`` block's ``-<memory>[-disk]`` suffix; no block
+    keeps the bare base name (byte-identical prior behavior)."""
+
+    def test_no_block_no_env_default(self, monkeypatch):
+        from zagg.config import PipelineConfig
+        from zagg.runner import _resolve_function_name
+
+        monkeypatch.delenv("ZAGG_LAMBDA_FUNCTION_NAME", raising=False)
+        assert _resolve_function_name(PipelineConfig(), None) == "process-shard"
+
+    def test_no_block_env_base(self, monkeypatch):
+        from zagg.config import PipelineConfig
+        from zagg.runner import _resolve_function_name
+
+        monkeypatch.setenv("ZAGG_LAMBDA_FUNCTION_NAME", "process-shard-test")
+        assert _resolve_function_name(PipelineConfig(), None) == "process-shard-test"
+
+    def test_block_appends_memory_suffix(self, monkeypatch):
+        from zagg.config import PipelineConfig
+        from zagg.runner import _resolve_function_name
+
+        monkeypatch.delenv("ZAGG_LAMBDA_FUNCTION_NAME", raising=False)
+        cfg = PipelineConfig(worker={"memory": 2048})
+        assert _resolve_function_name(cfg, None) == "process-shard-2048"
+
+    def test_block_extra_disk_appends_disk_suffix(self, monkeypatch):
+        from zagg.config import PipelineConfig
+        from zagg.runner import _resolve_function_name
+
+        monkeypatch.delenv("ZAGG_LAMBDA_FUNCTION_NAME", raising=False)
+        cfg = PipelineConfig(worker={"memory": 4096, "extra_disk": True})
+        assert _resolve_function_name(cfg, None) == "process-shard-4096-disk"
+
+    def test_block_extra_disk_false_no_disk_suffix(self, monkeypatch):
+        from zagg.config import PipelineConfig
+        from zagg.runner import _resolve_function_name
+
+        monkeypatch.delenv("ZAGG_LAMBDA_FUNCTION_NAME", raising=False)
+        cfg = PipelineConfig(worker={"memory": 8192, "extra_disk": False})
+        assert _resolve_function_name(cfg, None) == "process-shard-8192"
+
+    def test_block_composes_with_env_base(self, monkeypatch):
+        # A test stack (FUNCTION_NAME=process-shard-test at standup) gets the
+        # same size variants; the env base composes with the config suffix.
+        from zagg.config import PipelineConfig
+        from zagg.runner import _resolve_function_name
+
+        monkeypatch.setenv("ZAGG_LAMBDA_FUNCTION_NAME", "process-shard-test")
+        cfg = PipelineConfig(worker={"memory": 8192, "extra_disk": True})
+        assert _resolve_function_name(cfg, None) == "process-shard-test-8192-disk"
+
+    def test_explicit_kwarg_wins_verbatim(self, monkeypatch):
+        # The orchestrator override: kwarg beats both the block and the env.
+        from zagg.config import PipelineConfig
+        from zagg.runner import _resolve_function_name
+
+        monkeypatch.setenv("ZAGG_LAMBDA_FUNCTION_NAME", "ignored")
+        cfg = PipelineConfig(worker={"memory": 2048, "extra_disk": True})
+        assert _resolve_function_name(cfg, "my-exact-fn") == "my-exact-fn"
+
+
+class TestLambdaDispatchFunctionSelection:
+    """The spatial lambda branch must hand the RESOLVED name to the transport
+    (whose ``client.invoke(FunctionName=...)`` plumbing is covered by the
+    TestInvokeLambdaCell* suites). Stub ``_run_lambda`` at the dispatch seam
+    and assert what each (config, kwarg, env) combination resolves to."""
+
+    def _dispatch(self, monkeypatch, config, catalog_file, **agg_kwargs):
+        from zagg import runner
+
+        seen = {}
+
+        def _stub(config, catalog_data, store_path, child_order, **kwargs):
+            seen.update(kwargs)
+            return {"stub": True}
+
+        monkeypatch.setattr(runner, "_run_lambda", _stub)
+        result = agg(
+            config,
+            catalog=catalog_file,
+            store="s3://bucket/out.zarr",
+            backend="lambda",
+            **agg_kwargs,
+        )
+        assert result == {"stub": True}
+        return seen["function_name"]
+
+    def test_no_block_regression(self, monkeypatch, atl06_config, catalog_file):
+        # Byte-identical prior behavior: no worker block, no kwarg, no env.
+        monkeypatch.delenv("ZAGG_LAMBDA_FUNCTION_NAME", raising=False)
+        assert self._dispatch(monkeypatch, atl06_config, catalog_file) == "process-shard"
+
+    def test_worker_block_selects_variant(self, monkeypatch, atl06_config, catalog_file):
+        monkeypatch.delenv("ZAGG_LAMBDA_FUNCTION_NAME", raising=False)
+        atl06_config.worker = {"memory": 2048, "extra_disk": True}
+        assert self._dispatch(monkeypatch, atl06_config, catalog_file) == "process-shard-2048-disk"
+
+    def test_kwarg_wins_over_block(self, monkeypatch, atl06_config, catalog_file):
+        atl06_config.worker = {"memory": 2048}
+        resolved = self._dispatch(
+            monkeypatch, atl06_config, catalog_file, function_name="pinned-fn"
+        )
+        assert resolved == "pinned-fn"
+
+    def test_env_base_composes_with_block(self, monkeypatch, atl06_config, catalog_file):
+        monkeypatch.setenv("ZAGG_LAMBDA_FUNCTION_NAME", "process-shard-test")
+        atl06_config.worker = {"memory": 4096}
+        assert self._dispatch(monkeypatch, atl06_config, catalog_file) == "process-shard-test-4096"
+
+
+class TestCliFunctionNameDefault:
+    """Issue #235: ``--function-name`` must default to ``None`` (resolved in
+    the runner), not env-or-``process-shard`` — the old eager default reached
+    ``agg`` as an explicit kwarg and silently masked the config ``worker:``
+    selection."""
+
+    def test_default_is_none(self, monkeypatch):
+        import zagg.__main__ as cli
+
+        monkeypatch.setenv("ZAGG_LAMBDA_FUNCTION_NAME", "process-shard-test")
+        captured = {}
+
+        def _fake_agg(config, **kwargs):
+            captured.update(kwargs)
+            return {
+                "total_cells": 0,
+                "granules_per_cell_min": 0,
+                "granules_per_cell_max": 0,
+                "granules_per_cell_avg": 0.0,
+                "store_path": "x",
+            }
+
+        monkeypatch.setattr(cli, "agg", _fake_agg)
+        monkeypatch.setattr(cli, "load_config", lambda path: object())
+        monkeypatch.setattr("sys.argv", ["zagg", "--config", "c.yaml", "--dry-run"])
+        cli.main()
+        # None reaches agg: the resolver (not argparse) applies the env/config
+        # fallback, so the worker block is honored.
+        assert captured["function_name"] is None
+
+    def test_explicit_flag_passes_verbatim(self, monkeypatch):
+        import zagg.__main__ as cli
+
+        captured = {}
+
+        def _fake_agg(config, **kwargs):
+            captured.update(kwargs)
+            return {
+                "total_cells": 0,
+                "granules_per_cell_min": 0,
+                "granules_per_cell_max": 0,
+                "granules_per_cell_avg": 0.0,
+                "store_path": "x",
+            }
+
+        monkeypatch.setattr(cli, "agg", _fake_agg)
+        monkeypatch.setattr(cli, "load_config", lambda path: object())
+        monkeypatch.setattr(
+            "sys.argv",
+            ["zagg", "--config", "c.yaml", "--dry-run", "--function-name", "my-exact-fn"],
+        )
+        cli.main()
+        assert captured["function_name"] == "my-exact-fn"

@@ -10,7 +10,6 @@ Usage:
 import argparse
 import json
 import logging
-import os
 
 from zagg.config import load_config
 from zagg.runner import agg, normalize_output_credentials
@@ -76,8 +75,11 @@ examples:
     )
     parser.add_argument(
         "--function-name",
-        default=os.environ.get("ZAGG_LAMBDA_FUNCTION_NAME", "process-shard"),
-        help="Lambda function name (default: env ZAGG_LAMBDA_FUNCTION_NAME or 'process-shard')",
+        default=None,
+        help="Lambda function name; an explicit value wins verbatim. Default: "
+        "env ZAGG_LAMBDA_FUNCTION_NAME (or 'process-shard') plus the config "
+        "worker: block's variant suffix (issue #235). Resolved in the runner "
+        "so the config selection is not silently masked.",
     )
     args = parser.parse_args()
 

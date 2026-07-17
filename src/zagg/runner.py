@@ -81,6 +81,30 @@ def _maybe_warn_dense(layout: str) -> None:
         warnings.warn(_DENSE_DEPRECATION_MSG, DeprecationWarning, stacklevel=3)
 
 
+def _resolve_function_name(config, function_name):
+    """Resolve the Lambda function to invoke (issue #235).
+
+    Precedence: an explicit ``function_name`` (``agg`` kwarg /
+    ``--function-name``) wins verbatim; otherwise the base name comes from
+    ``ZAGG_LAMBDA_FUNCTION_NAME`` (default ``"process-shard"``) and the
+    config's optional top-level ``worker:`` block appends the
+    pre-provisioned variant suffix — ``-<memory>``, plus ``-disk`` when
+    ``extra_disk`` is true (validated against the provisioned set at config
+    load). No block -> the bare base name, byte-identical prior behavior.
+    Shared by the spatial, raster, and temporal Lambda paths.
+    """
+    if function_name is not None:
+        return function_name
+    base = os.environ.get("ZAGG_LAMBDA_FUNCTION_NAME", "process-shard")
+    worker = config.worker
+    if not worker:
+        return base
+    suffix = f"-{worker['memory']}"
+    if worker.get("extra_disk"):
+        suffix += "-disk"
+    return base + suffix
+
+
 def agg(
     config: PipelineConfig,
     *,
@@ -132,8 +156,11 @@ def agg(
     dry_run : bool
         Preview what would be processed without running.
     function_name : str, optional
-        Lambda function name. Defaults to env ``ZAGG_LAMBDA_FUNCTION_NAME``
-        or ``"process-shard"``. Only used with ``backend="lambda"``.
+        Lambda function name; an explicit value wins verbatim. Default
+        resolves env ``ZAGG_LAMBDA_FUNCTION_NAME`` (or ``"process-shard"``)
+        plus the config ``worker:`` block's pre-provisioned variant suffix
+        (``-<memory>``/``-disk``, issue #235) via
+        :func:`_resolve_function_name`. Only used with ``backend="lambda"``.
     region : str
         AWS region for S3 and Lambda. Default ``"us-west-2"``.
     output_credentials : dict, optional
@@ -356,8 +383,7 @@ class SpatialStrategy:
                 raise ValueError(f"Lambda backend requires s3:// store path, got: {store_path}")
             if invocation not in ("async", "sync"):
                 raise ValueError(f"Unknown invocation: {invocation!r} (expected 'async' or 'sync')")
-            if function_name is None:
-                function_name = os.environ.get("ZAGG_LAMBDA_FUNCTION_NAME", "process-shard")
+            function_name = _resolve_function_name(config, function_name)
             return _run_lambda(
                 config,
                 catalog_data,
@@ -775,8 +801,7 @@ class RasterStrategy:
         import boto3
         from botocore.config import Config
 
-        if function_name is None:
-            function_name = os.environ.get("ZAGG_LAMBDA_FUNCTION_NAME", "process-shard")
+        function_name = _resolve_function_name(config, function_name)
         max_workers = min(max_workers or 64, len(cells)) or 1
         client = boto3.client(
             "lambda",
@@ -1000,8 +1025,7 @@ def _run_lambda_events(
         )
     if invocation not in ("async", "sync"):
         raise ValueError(f"Unknown invocation: {invocation!r} (expected 'async' or 'sync')")
-    if function_name is None:
-        function_name = os.environ.get("ZAGG_LAMBDA_FUNCTION_NAME", "process-shard")
+    function_name = _resolve_function_name(config, function_name)
 
     # Orchestrator-side credential fetch (issue #213, Phase 4): a config-named
     # provider is resolved through the registry and called ONCE (DAAC creds
