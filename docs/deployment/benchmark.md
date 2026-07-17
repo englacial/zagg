@@ -72,7 +72,8 @@ on the `benchmarks` branch and rendered here. The same 2×2 axes as the live mat
 (inline/sidecar × AOI-mask), but each panel is the whole-AOI total across
 **releases** (release tag on the x-axis), not one shard across merges.
 
-Three views — the live matrix's two cost columns, plus the store-layout tripwire:
+Four views — the live matrix's two cost columns, the store-layout tripwire, and
+the phase breakdown:
 
 - **Whole-AOI cost (USD)** — the real dollar total across every shard.
 - **AOI-average cost / 100 km²** — that total spread over the whole AOI area
@@ -85,6 +86,9 @@ Three views — the live matrix's two cost columns, plus the store-layout tripwi
   step here. On this per-release leg it is **record-only** (the release still
   lands its series point); the per-merge harness *hard-fails* on the same
   mismatch.
+- **Per-phase seconds** — where wall time actually goes, release over release
+  (issue #250): the **setup** invoke plus the worker **read / index /
+  aggregate** split, framed by the worker max/median totals.
 
 The release matrix also carries a fifth target, `full_aoi_neon_o9_hive` (issue
 #240 phase 4): the same config with `store_layout: hive` over all 4 shards,
@@ -107,6 +111,31 @@ layout axis gets its own panel row.
 ### Store object count across releases
 
 ![Per-release full-AOI — store objects](https://raw.githubusercontent.com/englacial/zagg/benchmarks/site/full_aoi_objects.png)
+
+### Per-phase timings across releases
+
+Where wall time goes, per release (issue #250) — the same 2×2 target panels,
+seconds on the y-axis, one line per phase:
+
+- **setup** (the headline, drawn emphasized) — the single setup Lambda fired
+  once per arm *before* the fan-out. On a flat-layout store it writes the
+  **entire fullsphere** zarr template just to land 4 NEON shards (~104–110 s,
+  the dense-fullsphere waste of `docs/design/sparse_coverage.md` §1); hive
+  writes one leaf lazily per shard and collapses it to ~3.7 s, so the
+  flat→hive migration (issue #236) reads as a visible collapse of this line.
+  Note `setup_s` is a real billed invoke but is *excluded* from both
+  `total_wall_s` and `cost_usd` — see `setup_cost_usd` below.
+- **read / index / aggregate** — the worker phase split the harness's
+  `profile=True` dispatch emits (`worker_phase_max`), rolled up as the
+  straggler (**max across shards**), matching the wall-time framing.
+- **worker total (max / median)** — the per-worker billed-duration totals that
+  frame the split.
+
+`finalize` is omitted (~0 on the full-AOI path). Phase cells are null on
+releases recorded before the capture landed, so those lines simply start at
+the first release that recorded them.
+
+![Per-release full-AOI — per-phase seconds](https://raw.githubusercontent.com/englacial/zagg/benchmarks/site/full_aoi_phases.png)
 
 > These embed by raw URL and appear after the first tagged release runs the
 > full-AOI job; until then GitHub shows a broken-image placeholder (nothing has
