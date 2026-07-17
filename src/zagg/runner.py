@@ -186,11 +186,16 @@ def agg(
         forwarded config). pyarrow is not used on either path; the experimental
         ``arrow-kernel`` reducer was dropped with pyarrow.
     profile : bool
-        Opt-in per-phase timing (issue #100). When ``True`` (lambda backend),
-        forwards ``profile`` into each cell event so the worker emits a
-        ``phase_timings`` (read/index/aggregate/write — issue #249) sub-dict, and the run prints a
-        per-phase worker breakdown. Default ``False`` leaves the worker path and
-        per-cell event payload byte-identical -- no probe tax.
+        Opt-in per-phase timing (issue #100). On the *point* path, ``True``
+        (lambda backend only) forwards ``profile`` into each cell event so the
+        worker emits a ``phase_timings`` (read/index/aggregate/write — issue
+        #249) sub-dict, and the run prints a per-phase worker breakdown. On the
+        *raster* path, ``True`` profiles on **both** backends: the worker emits
+        the issue #249 stage set (open/geometry/fetch/decode/gather + write),
+        rolled up into ``summary["worker_stage_max"]`` (straggler-maxed seconds)
+        and ``summary["worker_stage_counts"]`` (summed work counts) rather than
+        printed. Default ``False`` leaves the worker path and per-cell event
+        payload byte-identical -- no probe tax.
     max_retries : int
         Lambda-only (issue #119). Per-cell retry budget for *transient*
         client-side faults (throttle/network) in ``_invoke_lambda_cell``;
