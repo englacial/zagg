@@ -43,9 +43,9 @@ Event payload (default / process mode):
 Setup mode (creates the zarr template once before per-cell fan-out; for a
 hive-layout config -- output.store_layout: hive, issue #199 -- it writes the
 morton_hive.json manifest instead, and each process-mode worker emits its own
-leaf template. Current dispatchers no longer send hive setup -- the manifest
-rides finalize instead, issue #252 -- but the hive branch stays so older
-dispatchers keep working against this function):
+leaf template. Current dispatchers send hive setup as a fire-and-forget Event
+invoke right after the ping -- the primary manifest write, issue #252 hybrid
+-- and older synchronous dispatchers keep working against this function):
 {
     "mode": "setup",
     "store_path": str,
@@ -61,8 +61,8 @@ dispatchers keep working against this function):
 }
 
 Finalize mode (after all cells complete: consolidates zarr metadata; for a
-hive-layout config -- issue #252 -- it writes the morton_hive.json manifest
-instead, folded off the pre-worker setup path):
+hive-layout config -- issue #252 hybrid -- it re-ensures the morton_hive.json
+manifest instead, the idempotent backstop for the async init-time setup write):
 {
     "mode": "finalize",
     "store_path": str,
@@ -86,7 +86,7 @@ flat exists, issue #251):
     "output_credentials": dict (optional, same shape as process mode),
 }
 Answering 200 at all is the versioning half of the guard: a function deployed
-before the issue #252 manifest-in-finalize lifecycle doesn't know the mode, so
+before the issue #252 hive dispatch lifecycle doesn't know the mode, so
 the event falls through to the process handler's 400 (zero writes) and the
 dispatcher fails fast with a redeploy message before any worker runs. The body
 echoes the deployed zagg version; the handler also runs the READ-ONLY
@@ -642,9 +642,11 @@ def _handle_setup(event: Dict[str, Any]) -> Dict[str, Any]:
     For a hive-layout config (issue #199 phase 3) template time writes ONLY
     the ``morton_hive.json`` manifest — no global zarr template exists (zero
     metadata above the leaves, D5); each worker emits its own leaf template.
-    Current dispatchers no longer send hive setup (the manifest rides finalize
-    since issue #252); this branch stays so OLDER dispatchers keep working
-    against a redeployed function. The optional ``dataset`` event key carries
+    Current dispatchers send hive setup as a fire-and-forget Event invoke
+    right after the ping (issue #252 hybrid) — this branch is the PRIMARY
+    manifest write, run off the critical path, with finalize as idempotent
+    backstop; older synchronous dispatchers keep working against it
+    unchanged. The optional ``dataset`` event key carries
     the manifest's identity block (the orchestrator sources it from the
     ShardMap metadata, same as the local path).
     The flat path below is byte-identical to before, bar one addition:
@@ -709,14 +711,15 @@ def _handle_finalize(event: Dict[str, Any]) -> Dict[str, Any]:
     """Finalize the store at ``event['store_path']``.
 
     Flat: consolidate zarr metadata (byte-identical to before). Hive (issue
-    #252): write the root ``morton_hive.json`` manifest instead — folded off
-    the setup path so no pre-worker invoke blocks the fan-out. Order-correct
-    because the manifest is reader-facing only: workers write self-describing
-    leaves (D3) and readers arrive after the run. The manifest inputs mirror
-    the hive setup event (``config``/``parent_order``/``dataset``/
-    ``overwrite``); there is no zarr hierarchy above the leaves to
-    consolidate (D5), so the hive branch returns without touching zarr. The
-    success body echoes ``"layout": "hive"``, matching setup's echo.
+    #252 hybrid): re-ensure the root ``morton_hive.json`` manifest — the
+    idempotent BACKSTOP for the async init-time setup invoke (a frozen-key-
+    matching manifest is accepted, no second PUT). Worker Event invokes run
+    with retries 0 (template.yaml EventInvokeConfig), so a lost async init
+    write is never redelivered — this backstop self-heals it. The manifest
+    inputs mirror the hive setup event (``config``/``parent_order``/
+    ``dataset``/``overwrite``); there is no zarr hierarchy above the leaves
+    to consolidate (D5), so the hive branch returns without touching zarr.
+    The success body echoes ``"layout": "hive"``, matching setup's echo.
     """
     logger.info(f"Finalize mode: finalizing store at {event.get('store_path')}")
     try:
@@ -754,20 +757,20 @@ def _handle_ping(event: Dict[str, Any]) -> Dict[str, Any]:
     """Hive pre-fan-out preflight (issue #252) — writes nothing.
 
     Answering 200 at all is the versioning half of the guard: a function that
-    predates the manifest-in-finalize lifecycle doesn't know ``mode="ping"``,
+    predates the issue #252 hive lifecycle doesn't know ``mode="ping"``,
     so the event falls through to its process handler's 400 (zero writes) and
     the dispatcher fails fast with a redeploy message before any worker is
     dispatched. The body echoes the deployed zagg version for observability.
 
-    The store half mirrors finalize's manifest inputs and runs the READ-ONLY
-    :func:`zagg.hive.validate_manifest` against any existing root, so a run
-    into a store templated for different orders/identity refuses up front
-    (the D2 mixed-order footgun) instead of after the fan-out — the writer-
-    side guard the manifest fold would otherwise defer to finalize (PR #255
-    review fold). This covers sequential reruns; two concurrent runs into the
-    same fresh root both see no manifest and only collide at the losing run's
-    finalize. Kept while flat exists (issue #251): once flat is removed,
-    a stale function simply errors and the ping can be dropped.
+    The store half mirrors setup/finalize's manifest inputs and runs the
+    READ-ONLY :func:`zagg.hive.validate_manifest` against any existing root,
+    so a run into a store templated for different orders/identity refuses up
+    front (the D2 mixed-order footgun) instead of after the fan-out (PR #255
+    review fold). This covers sequential reruns; two concurrent runs into
+    the same fresh root both pass here, colliding within seconds of init
+    once the async setup write lands (issue #252 hybrid). Kept while flat
+    exists (issue #251): once flat is removed, a stale function simply
+    errors and the ping can be dropped.
     """
     logger.info(f"Ping mode: hive preflight for {event.get('store_path')}")
     try:

@@ -209,14 +209,16 @@ def validate_manifest(
 ) -> dict | None:
     """Read-only frozen-key precheck — the fail-fast half of the manifest guard.
 
-    Split out of :func:`ensure_manifest` when the manifest WRITE moved to
-    finalize (issue #252). The write folding off the critical path is fine for
-    readers (they only arrive after the run), but it dragged the writer-side
-    guard along with it — so an incompatible rerun could write mixed-order
-    leaves before the check ever fired (D2). This function is the guard on its
-    own: dispatchers call it BEFORE fan-out to refuse an incompatible existing
-    store up front, while the actual write stays off the critical path in
-    :func:`ensure_manifest` at finalize.
+    Split out of :func:`ensure_manifest` when the manifest WRITE came off the
+    synchronous pre-dispatch path (issue #252). The write moving off the
+    critical path is fine for readers, but it dragged the writer-side guard
+    along with it — so an incompatible rerun could write mixed-order leaves
+    before the check ever fired (D2). This function is the guard on its own:
+    the lambda ping runs it BEFORE fan-out to refuse an incompatible existing
+    store up front, while the write itself rides the async init-time setup
+    invoke with a finalize backstop (issue #252 hybrid; the local dispatcher
+    writes directly at init via :func:`ensure_manifest`, which calls this
+    first).
 
     Performs exactly the checks :func:`ensure_manifest` does and writes nothing:
     reads the existing manifest; on an existing store whose FROZEN keys mismatch
@@ -257,14 +259,18 @@ def validate_manifest(
 
 
 def ensure_manifest(store_root: str, manifest: dict, *, overwrite: bool = False, **store_kwargs):
-    """Write the root manifest at finalize / end of run; verify it on reruns.
+    """Write the root manifest; verify it on reruns (idempotent).
 
-    Since issue #252 this write rides finalize rather than running once at
-    template time ahead of the fan-out — the manifest is reader-facing only
-    (D6), so keeping it off the critical path is safe. The fail-fast half of
-    the guard is exposed separately as :func:`validate_manifest`, which
-    dispatchers run pre-fan-out to refuse an incompatible existing store BEFORE
-    any leaf write (D2), even though this write now lands at the end.
+    Lifecycle (issue #252 hybrid): the PRIMARY write runs at init — the local
+    dispatcher writes directly pre-dispatch; the lambda dispatcher fires the
+    ``mode="setup"`` hive branch as a fire-and-forget Event invoke right
+    after the ping — so the manifest lands seconds into the run and a reader
+    can consume completed leaves while the store builds. Finalize calls this
+    again as an idempotent BACKSTOP (an existing frozen-key-matching manifest
+    is accepted — no second PUT): worker Event invokes run with retries 0, so
+    a lost async init write self-heals at finalize. The fail-fast half of the
+    guard is exposed separately as :func:`validate_manifest` (the ping's
+    read-only precheck), which this function runs first.
 
     A retry into an existing hive store must be able to proceed (that is the
     D4 debris/retry model), so an existing manifest is accepted — but only if
