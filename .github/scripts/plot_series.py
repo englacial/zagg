@@ -703,6 +703,23 @@ FULL_AOI_FIGURES = {
     "full_aoi_objects": ("objects_total", "store objects (total)"),
 }
 
+# Per-release phase-breakdown series (issue #250): column -> legend label, in
+# draw order. ``setup_s`` is the HEADLINE line -- the flat fullsphere-template
+# tax (one Lambda writing the whole global template before the fan-out,
+# ~104 s flat vs ~3.7 s hive), drawn emphasized so the flat->hive migration
+# (issue #236) reads as a visible collapse. read/index/aggregate are the worker
+# straggler split (max across shards, ``worker_phase_max`` under profile=True);
+# worker max/median frame the per-worker total. ``finalize_s`` is deliberately
+# omitted (~0 on the full-AOI path -- the issue #250 display spec).
+FULL_AOI_PHASE_SERIES = {
+    "setup_s": "setup (fullsphere template)",
+    "phase_read_s": "read (max)",
+    "phase_index_s": "index (max)",
+    "phase_aggregate_s": "aggregate (max)",
+    "worker_max_s": "worker total (max)",
+    "worker_median_s": "worker total (median)",
+}
+
 
 def _full_aoi_history(df: pd.DataFrame) -> pd.DataFrame:
     """Retained per-release rows of the full-AOI series, oldest release first.
@@ -777,6 +794,102 @@ def make_full_aoi_release_figure(
     )
 
 
+def make_full_aoi_phase_figure(df: pd.DataFrame, out_png: Path) -> bool:
+    """Render the per-release full-AOI PHASE-BREAKDOWN figure (issue #250).
+
+    One panel per target (the same 2x2 ``MATRIX_ROWS x MATRIX_COLS`` layout as
+    the cost figures), each plotting :data:`FULL_AOI_PHASE_SERIES` in seconds
+    against release tags -- where wall time actually goes, release over release.
+    Null cells (rows recorded before a column existed, or a run without
+    profiling) simply break the line, so a legacy series still renders its
+    ``setup_s`` / worker lines. Returns False (writing nothing) when no
+    full-AOI release rows -- or none of the phase columns -- carry data, so the
+    Pages index omits the section instead of embedding a broken image.
+    """
+    import matplotlib
+
+    matplotlib.use("Agg")  # headless CI
+    import matplotlib.pyplot as plt
+
+    hist = _full_aoi_history(df)
+    if hist.empty or "target" not in hist.columns or hist["target"].dropna().empty:
+        return False
+    cols = [c for c in FULL_AOI_PHASE_SERIES if c in hist.columns and hist[c].notna().any()]
+    if not cols:
+        return False
+
+    layout, nrows, ncols = _matrix_layout(hist)
+    fig, axes = plt.subplots(
+        nrows,
+        ncols,
+        figsize=(7 * ncols, 3.2 * nrows),
+        squeeze=False,
+        gridspec_kw={"wspace": 0.3},
+    )
+    # Stable colour per series regardless of which columns carry data, so the
+    # same phase keeps its colour as columns backfill across releases.
+    color_of = {c: f"C{i}" for i, c in enumerate(FULL_AOI_PHASE_SERIES)}
+    legend_ax = None
+    for r in range(nrows):
+        for c in range(ncols):
+            target = layout[r][c]
+            ax = axes[r][c]
+            if target is None:  # no target at this slot -> blank panel
+                ax.axis("off")
+                continue
+            sub = hist[hist["target"] == target]
+            xs = list(range(len(sub)))
+            for col in cols:
+                ys = sub[col].to_numpy(dtype=float)
+                if col == "setup_s":  # the headline: emphasized, drawn on top
+                    ax.plot(
+                        xs,
+                        ys,
+                        "-o",
+                        color="black",
+                        linewidth=2.2,
+                        markersize=5,
+                        zorder=3,
+                        label=FULL_AOI_PHASE_SERIES[col],
+                    )
+                else:  # worker totals dashed; the phase split solid
+                    style = "--o" if col.startswith("worker") else "-o"
+                    ax.plot(
+                        xs,
+                        ys,
+                        style,
+                        color=color_of[col],
+                        markersize=4,
+                        label=FULL_AOI_PHASE_SERIES[col],
+                    )
+            ax.set_title(target, fontsize=10)
+            ax.set_ylabel("seconds")
+            ax.set_xticks(xs)
+            ax.set_xticklabels([str(v) for v in sub["ref"]], rotation=45, ha="right", fontsize=7)
+            if xs:
+                ax.set_xlim(xs[0] - 0.5, xs[-1] + 0.5)
+            legend_ax = legend_ax or ax
+
+    # Bottom-row-only release labels, matching _render_panel_grid's convention.
+    for c in range(ncols):
+        last = max((r for r in range(nrows) if layout[r][c] is not None), default=None)
+        for r in range(nrows):
+            if layout[r][c] is not None and r != last:
+                axes[r][c].tick_params(labelbottom=False)
+
+    # Figure-level legend just below the suptitle (anchored so the two never
+    # overlap; bbox_inches="tight" keeps both in frame).
+    handles, labels = legend_ax.get_legend_handles_labels()
+    fig.legend(
+        handles, labels, loc="upper center", ncol=len(cols), fontsize=8, bbox_to_anchor=(0.5, 1.01)
+    )
+    fig.suptitle("zagg full-AOI NEON — per-phase seconds vs release (finalize ~0, omitted)", y=1.05)
+    out_png.parent.mkdir(parents=True, exist_ok=True)
+    fig.savefig(out_png, dpi=120, bbox_inches="tight")
+    plt.close(fig)
+    return True
+
+
 def write_index(
     outdir: Path,
     matrix_rendered: list[str],
@@ -820,6 +933,11 @@ def write_index(
         for name, (_col, label) in FULL_AOI_FIGURES.items()
         if (outdir / f"{name}.png").exists()
     ]
+    if (outdir / "full_aoi_phases.png").exists():  # phase breakdown (issue #250)
+        full_aoi.append(
+            "<h3>per-phase seconds (setup / read / index / aggregate)</h3>\n"
+            '<img src="full_aoi_phases.png" alt="full_aoi_phases">'
+        )
     if full_aoi:
         blocks.append(
             "<hr>\n<h2>Per-release full-AOI NEON (all shards)</h2>\n"
@@ -914,6 +1032,10 @@ def main(argv: list[str] | None = None) -> int:
             fa_df, col, label, outdir / f"{name}.png"
         ):
             full_aoi_rendered.append(name)
+    # Phase-breakdown figure (issue #250): its own renderer (seconds per phase,
+    # not the cost+runtime dual-axis panels the FULL_AOI_FIGURES loop draws).
+    if not fa_df.empty and make_full_aoi_phase_figure(fa_df, outdir / "full_aoi_phases.png"):
+        full_aoi_rendered.append("full_aoi_phases")
 
     write_index(
         outdir,

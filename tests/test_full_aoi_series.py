@@ -238,6 +238,58 @@ def test_make_full_aoi_release_figure_renders_and_empty_is_false(tmp_path):
     )
 
 
+# --- per-release phase-breakdown figure (issue #250) ------------------------
+
+
+def test_full_aoi_phase_series_spec():
+    # The display spec: setup is the headline, the worker split + totals follow,
+    # and finalize (~0 on the full-AOI path) is deliberately NOT displayed.
+    ps = pytest.importorskip("plot_series")
+    assert list(ps.FULL_AOI_PHASE_SERIES) == [
+        "setup_s",
+        "phase_read_s",
+        "phase_index_s",
+        "phase_aggregate_s",
+        "worker_max_s",
+        "worker_median_s",
+    ]
+    assert "finalize_s" not in ps.FULL_AOI_PHASE_SERIES
+
+
+def test_full_aoi_phase_figure_renders_and_skips_when_no_data(tmp_path):
+    pytest.importorskip("matplotlib")
+    ps = pytest.importorskip("plot_series")
+    df = fas.records_to_frame(
+        _matrix_records("c1", "v0.24.0", 0.016) + _matrix_records("c2", "v0.25.0", 0.018)
+    )
+    out = tmp_path / "full_aoi_phases.png"
+    assert ps.make_full_aoi_phase_figure(df, out) is True
+    assert out.exists() and out.stat().st_size > 0
+    # Nothing retained yet -> False (Pages index omits the section).
+    import pandas as pd
+
+    assert ps.make_full_aoi_phase_figure(pd.DataFrame(), tmp_path / "x.png") is False
+    # Rows present but every phase column all-null -> same skip, no broken panel.
+    import numpy as np
+
+    nulls = df.assign(**{c: np.nan for c in ps.FULL_AOI_PHASE_SERIES})
+    assert ps.make_full_aoi_phase_figure(nulls, tmp_path / "y.png") is False
+    assert not (tmp_path / "y.png").exists()
+
+
+def test_full_aoi_phase_figure_renders_legacy_series_without_phase_columns(tmp_path):
+    # A pre-#250 parquet has no phase_*_s columns but does carry setup_s and the
+    # worker totals: the figure must still render from those (null-safe), not
+    # KeyError on the missing columns.
+    pytest.importorskip("matplotlib")
+    ps = pytest.importorskip("plot_series")
+    df = fas.records_to_frame(_matrix_records("c1", "v0.24.0", 0.016))
+    legacy = df.drop(columns=["phase_read_s", "phase_index_s", "phase_aggregate_s"])
+    out = tmp_path / "legacy_phases.png"
+    assert ps.make_full_aoi_phase_figure(legacy, out) is True
+    assert out.exists() and out.stat().st_size > 0
+
+
 # --- store object-count columns (issue #240) --------------------------------
 
 
