@@ -88,21 +88,109 @@ class TestRasterConfigValidation:
         with pytest.raises(ValueError, match="requires a string 'dtype'"):
             validate_config(_raster_config(bands={"red": {"asset": "red"}}))
 
-    def test_sharded_rejected(self):
+    def test_sharded_rejected_permanently(self):
+        # Espg-ratified on issue #247: sharded raster output is a PERMANENT
+        # exclusion (per-timestep slab streaming would read-modify-write the
+        # ShardingCodec object), not a deferral — the message says why.
         grid = {"type": "healpix", "parent_order": 10, "child_order": 16, "sharded": True}
-        with pytest.raises(ValueError, match="sharded"):
+        with pytest.raises(ValueError, match="read-modify-write"):
             validate_config(_raster_config(grid=grid))
 
-    def test_hive_store_layout_rejected(self):
+    def test_hive_store_layout_validates(self):
+        # Issue #247: raster + hive is legal (the issue #239 stopgap is gone).
         cfg = _raster_config()
         cfg.output["store_layout"] = "hive"
-        with pytest.raises(ValueError, match="store_layout"):
+        validate_config(cfg)
+
+    def test_hive_plus_sharded_rejected(self):
+        grid = {"type": "healpix", "parent_order": 10, "child_order": 16, "sharded": True}
+        cfg = _raster_config(grid=grid)
+        cfg.output["store_layout"] = "hive"
+        with pytest.raises(ValueError, match="read-modify-write"):
             validate_config(cfg)
 
-    def test_coverage_moc_rejected(self):
+    def test_coverage_moc_validates_on_hive(self):
+        cfg = _raster_config()
+        cfg.output["store_layout"] = "hive"
+        cfg.output["coverage_moc"] = True
+        validate_config(cfg)
+
+    def test_coverage_moc_rejected_on_flat(self):
+        # The shared check (issue #200 posture): an explicit true without the
+        # hive layout is a config mistake, not a no-op.
         cfg = _raster_config()
         cfg.output["coverage_moc"] = True
-        with pytest.raises(ValueError, match="coverage_moc"):
+        with pytest.raises(ValueError, match="store_layout: hive"):
+            validate_config(cfg)
+
+    def test_windowing_validates_and_normalizes(self):
+        # Issue #247 (ratified): raster window membership is the acquisition's
+        # STAC datetime — time_field is optional and the manifest records the
+        # resolved field plus the fixed ISO-instant encoding.
+        from zagg.config import get_windowing
+
+        cfg = _raster_config()
+        cfg.output["store_layout"] = "hive"
+        cfg.output["windowing"] = {"schedule": "yearly"}
+        validate_config(cfg)
+        assert get_windowing(cfg) == {
+            "schedule": "yearly",
+            "time_field": "datetime",
+            "epoch": "1970-01-01T00:00:00+00:00",
+            "scale": "utc",
+            "units": "seconds",
+            "windows": None,
+        }
+
+    def test_windowing_explicit_time_field_datetime_accepted(self):
+        cfg = _raster_config()
+        cfg.output["store_layout"] = "hive"
+        cfg.output["windowing"] = {"schedule": "yearly", "time_field": "datetime"}
+        validate_config(cfg)
+
+    def test_windowing_other_time_field_rejected(self):
+        cfg = _raster_config()
+        cfg.output["store_layout"] = "hive"
+        cfg.output["windowing"] = {"schedule": "yearly", "time_field": "delta_time"}
+        with pytest.raises(ValueError, match="STAC"):
+            validate_config(cfg)
+
+    def test_windowing_conversion_knobs_rejected(self):
+        # epoch/scale/units describe a dataset-unit time_field conversion;
+        # STAC datetimes are already ISO-8601 UTC — nothing to configure.
+        for knob, value in (("epoch", "2018-01-01"), ("scale", "gps"), ("units", "days")):
+            cfg = _raster_config()
+            cfg.output["store_layout"] = "hive"
+            cfg.output["windowing"] = {"schedule": "yearly", knob: value}
+            with pytest.raises(ValueError, match=f"output.windowing.{knob}"):
+                validate_config(cfg)
+
+    def test_windowing_requires_hive_layout(self):
+        # raster + flat + windowing lands on the SHARED hive-only check.
+        cfg = _raster_config()
+        cfg.output["windowing"] = {"schedule": "yearly"}
+        with pytest.raises(ValueError, match="store_layout: hive"):
+            validate_config(cfg)
+
+    def test_windowing_schedule_none_inert(self):
+        from zagg.config import get_windowing
+
+        cfg = _raster_config()
+        cfg.output["store_layout"] = "hive"
+        cfg.output["windowing"] = {"schedule": "none"}
+        validate_config(cfg)
+        assert get_windowing(cfg) is None
+
+    def test_windowing_explicit_list_validated(self):
+        cfg = _raster_config()
+        cfg.output["store_layout"] = "hive"
+        cfg.output["windowing"] = {
+            "schedule": "explicit",
+            "windows": [
+                {"label": "a", "start": "2019-02-01", "end": "2019-01-01"},
+            ],
+        }
+        with pytest.raises(ValueError, match="half-open"):
             validate_config(cfg)
 
     def test_rectilinear_grid_rejected_for_now(self):
