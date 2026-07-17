@@ -970,13 +970,26 @@ class TestRunnerWiring:
         root = str(tmp_path / "out")
 
         monkeypatch.setattr(runner, "get_nsidc_s3_credentials", lambda: {"accessKeyId": "a"})
+        removed = []
 
         def fake_hive_write(shard_key, granule_urls, grid, s3_creds, store_root, config, **kw):
-            os.remove(os.path.join(store_root, hive.MANIFEST_NAME))
+            # The init write is PRIMARY, so the manifest must already be at the
+            # root when a cell runs — assert THEN remove, recording it. A
+            # regressed init write (assert fails) or a swallowed
+            # FileNotFoundError leaves ``removed`` empty, so the post-run check
+            # below fails loudly instead of staying green on finalize alone
+            # (``_cell_work`` swallows cell exceptions into an error envelope).
+            path = os.path.join(store_root, hive.MANIFEST_NAME)
+            assert os.path.exists(path)
+            os.remove(path)
+            removed.append(True)
             return {"shard_key": int(shard_key), "error": None, "total_obs": 1}
 
         monkeypatch.setattr(hive, "process_and_write_hive", fake_hive_write)
         agg(cfg, catalog=catalog_path, store=root, backend="local")
+        # The cell saw the init-written manifest and removed it (init→lost);
+        # finalize restored it (lost→restored).
+        assert removed == [True]
         assert hive.read_manifest(root)["shard_order"] == 6
 
     def test_local_hive_rerun_frozen_key_mismatch_fails_before_dispatch(
