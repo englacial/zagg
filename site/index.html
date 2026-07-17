@@ -4,34 +4,40 @@
 <style>body{font-family:sans-serif;max-width:1100px;margin:2rem auto;padding:0 1rem}img{max-width:100%;height:auto;border:1px solid #ddd}</style></head>
 <body>
 <h1>zagg Lambda benchmark</h1>
-<p>arm64 · 4 GB · one shard/target · densest cell over the NEON SERC AOP box. Each point is a merge to <code>main</code>.</p>
-<h2>inline/sidecar × AOI-mask (sharded, K=4, o9) — latest merge</h2>
-<img src="matrix_table.png" alt="inline/sidecar x AOI-mask benchmark table">
+<p>arm64 · 4 GB · o9 · hive · tdigest · NEON SERC AOP box · per release (full AOI) and per merge (single densest shard).</p>
+<hr>
+<h2>Per commit to main (single densest shard)</h2>
+<p>One configuration — o9, hive, sharded, tdigest, no AOI mask — isolating code deltas from data drift (merge sha on the x-axis).</p>
+<h3>Latest merge</h3>
+<img src="merge_table.png" alt="latest merge benchmark table">
 <p>Machine-readable: <a href="latest.md">latest.md</a> · <a href="metrics.json">metrics.json</a></p>
-<h2>cost_per_shard (inline/sidecar × AOI-mask)</h2>
-<img src="cost_per_shard_matrix.png" alt="cost_per_shard_matrix">
-<h2>cost_per_100km2 (inline/sidecar × AOI-mask)</h2>
-<img src="cost_per_100km2_matrix.png" alt="cost_per_100km2_matrix">
+<h3>Summary — total billed cost (lambda-s ⇔ USD) and wall</h3>
+<img src="merge_summary.png" alt="merge_summary">
+<h3>Diagnostics — per-phase seconds</h3>
+<img src="merge_phases.png" alt="merge_phases">
 <hr>
-<h2>Per-release full-AOI NEON (all shards)</h2>
-<p>The whole AOP_NEON box fanned over every shard, recorded per release for dollar-cost truth (release tag on the x-axis) — the complement to the per-merge single-densest-shard matrix above.</p>
-<h3>whole-AOI cost (USD)</h3>
-<img src="full_aoi_cost_total.png" alt="full_aoi_cost_total">
-<h3>AOI-avg cost / 100 km² (USD)</h3>
-<img src="full_aoi_cost_per_100km2.png" alt="full_aoi_cost_per_100km2">
-<hr>
-<h2>Archived (frozen as of issues #193 / #202)</h2>
-<p>The pre-#193 codec (sharded/inner) + historical series and the pre-#202 o10 read-backend rows, retained but no longer updated.</p>
-<h3>Sharded vs inner-chunk (archived)</h3>
-<img src="codec_table.png" alt="archived codec table">
-<h3>Frozen historical (archived)</h3>
-<img src="latest_table.png" alt="archived historical table">
+<h2>Archived (frozen as of issues #193 / #202 / #250)</h2>
+<p>The pre-#193 codec + historical series, the pre-#250 inline/sidecar × AOI-mask 2×2, and the per-100 km² figures — retained but no longer updated.</p>
+<h3>inline/sidecar × AOI-mask table (archived)</h3>
+<img src="matrix_table.png" alt="archived matrix_table.png">
+<h3>Sharded vs inner-chunk table (archived)</h3>
+<img src="codec_table.png" alt="archived codec_table.png">
+<h3>Frozen historical table (archived)</h3>
+<img src="latest_table.png" alt="archived latest_table.png">
+<h3>cost_per_shard (inline/sidecar × AOI-mask, archived)</h3>
+<img src="cost_per_shard_matrix.png" alt="archived cost_per_shard_matrix">
 <h3>cost_per_shard (sharded vs inner, archived)</h3>
 <img src="cost_per_shard_codec.png" alt="archived cost_per_shard_codec">
 <h3>cost_per_shard (frozen, archived)</h3>
 <img src="cost_per_shard.png" alt="archived cost_per_shard">
+<h3>cost_per_100km2 (inline/sidecar × AOI-mask, archived)</h3>
+<img src="cost_per_100km2_matrix.png" alt="archived cost_per_100km2_matrix">
 <h3>cost_per_100km2 (sharded vs inner, archived)</h3>
 <img src="cost_per_100km2_codec.png" alt="archived cost_per_100km2_codec">
 <h3>cost_per_100km2 (frozen, archived)</h3>
 <img src="cost_per_100km2.png" alt="archived cost_per_100km2">
+<h3>whole-AOI cost (USD) (archived)</h3>
+<img src="full_aoi_cost_total.png" alt="archived full_aoi_cost_total">
+<h3>AOI-avg cost / 100 km² (USD) (archived)</h3>
+<img src="full_aoi_cost_per_100km2.png" alt="archived full_aoi_cost_per_100km2">
 </body></html>
