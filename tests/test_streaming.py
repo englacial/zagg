@@ -69,24 +69,40 @@ class TestStreamingConfig:
         assert get_streaming(_config(streaming={})) == {
             "buffer_granules": 50,
             "state_layout": "dict",
+            "arena_backing": "memory",
         }
 
     def test_explicit_buffer(self):
         assert get_streaming(_config(streaming={"buffer_granules": 7})) == {
             "buffer_granules": 7,
             "state_layout": "dict",
+            "arena_backing": "memory",
         }
 
     def test_arena_layout_accepted(self):
         assert get_streaming(_config(streaming={"state_layout": "arena"})) == {
             "buffer_granules": 50,
             "state_layout": "arena",
+            "arena_backing": "memory",
         }
+
+    def test_arena_tmp_backing_accepted(self):
+        block = {"state_layout": "arena", "arena_backing": "tmp"}
+        assert get_streaming(_config(streaming=block))["arena_backing"] == "tmp"
 
     @pytest.mark.parametrize("bad", ["csr", 1, None])
     def test_bad_state_layout_raises(self, bad):
         with pytest.raises(ValueError, match="state_layout"):
             get_streaming(_config(streaming={"state_layout": bad}))
+
+    @pytest.mark.parametrize("bad", ["disk", 1, None])
+    def test_bad_arena_backing_raises(self, bad):
+        with pytest.raises(ValueError, match="arena_backing"):
+            get_streaming(_config(streaming={"state_layout": "arena", "arena_backing": bad}))
+
+    def test_tmp_backing_requires_arena(self):
+        with pytest.raises(ValueError, match="requires state_layout: arena"):
+            get_streaming(_config(streaming={"arena_backing": "tmp"}))
 
     @pytest.mark.parametrize("bad", [0, -1, "50", 2.5])
     def test_bad_buffer_raises(self, bad):
@@ -464,6 +480,69 @@ class TestArenaLayout:
         out = _ranges_to_indices(np.array([5, 20, 3]), np.array([2, 0, 3]))
         np.testing.assert_array_equal(out, [5, 6, 3, 4, 5])
         assert _ranges_to_indices(np.array([], dtype=int), np.array([], dtype=int)).size == 0
+
+
+class TestArenaTmpBacking:
+    """arena_backing: tmp (issue #217) — unlinked /tmp memmaps, same bytes out."""
+
+    def test_matches_memory_backed_arena(self, monkeypatch):
+        # Identical allocation contents through the same fold sequence — only
+        # the buffer's backing differs, so output equality must be exact.
+        key = _shard_key()
+        results = []
+        for backing in ("memory", "tmp"):
+            cfg = _config(
+                streaming={
+                    "buffer_granules": 1,
+                    "state_layout": "arena",
+                    "arena_backing": backing,
+                },
+                delta=256,
+            )
+            cfg.data_source["shard_workers"] = 1
+            grid = _grid(cfg)
+            dfs = _granule_dfs_cells(grid, key, [[0, 4, 8], [2, 4, 10], [1, 8, 9]], seed=7)
+            results.append(_run(monkeypatch, cfg, grid, key, dfs))
+        (df_m, ragged_m, meta_m), (df_t, ragged_t, meta_t) = results
+        pd.testing.assert_frame_equal(df_m, df_t)
+        assert meta_m["cells_with_data"] == meta_t["cells_with_data"]
+        vals_m, idx_m = ragged_m["h_tdigest"]
+        vals_t, idx_t = ragged_t["h_tdigest"]
+        assert idx_m == idx_t
+        for x, y in zip(vals_m, vals_t, strict=True):
+            np.testing.assert_array_equal(x, y)
+
+    def test_state_lives_on_memmap_and_leaves_no_files(self, tmp_path, monkeypatch):
+        # The steady arena must actually be a memmap (the backing is doing
+        # something), and the anonymous-mapping trick must leave zero files
+        # behind — /tmp persists across warm Lambda invokes, so any leak
+        # accumulates until the function dies.
+        import tempfile
+
+        monkeypatch.setattr(tempfile, "tempdir", str(tmp_path))
+        cfg = _config(
+            streaming={"buffer_granules": 2, "state_layout": "arena", "arena_backing": "tmp"}
+        )
+        agg = StreamingAggregator(
+            cfg, _grid(cfg), "pandas", 2, state_layout="arena", arena_backing="tmp"
+        )
+        key = _shard_key()
+        for df in _granule_dfs(_grid(cfg), key, n_granules=3):
+            agg.add_read(df)
+            agg.granule_done()
+        agg.flush()
+        assert isinstance(agg._arenas["h_tdigest"], np.memmap)
+        assert list(tmp_path.iterdir()) == []
+
+    def test_memory_backing_stays_plain_ndarray(self):
+        cfg = _config(streaming={"buffer_granules": 2, "state_layout": "arena"})
+        agg = StreamingAggregator(cfg, _grid(cfg), "pandas", 2, state_layout="arena")
+        key = _shard_key()
+        for df in _granule_dfs(_grid(cfg), key, n_granules=2):
+            agg.add_read(df)
+            agg.granule_done()
+        agg.flush()
+        assert not isinstance(agg._arenas["h_tdigest"], np.memmap)
 
 
 class TestStreamingReviewFolds:

@@ -320,6 +320,7 @@ def process_shard(
             handoff,
             streaming_cfg["buffer_granules"],
             state_layout=streaming_cfg["state_layout"],
+            arena_backing=streaming_cfg["arena_backing"],
         )
         if streaming_cfg is not None
         else None
