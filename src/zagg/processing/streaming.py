@@ -297,6 +297,17 @@ class StreamingAggregator:
             return self._cells.size == 0 and not self._buffer
         return not self.counts and not self._buffer
 
+    def occupied_cells(self) -> np.ndarray:
+        """Populated cell words as a ``uint64`` array (issue #200 coverage sink).
+
+        Layout-agnostic: the dict layout keys ``self.counts``, the arena layout
+        holds the sorted ids in ``self._cells``. Read after the final flush, so
+        both mirror the merged running state.
+        """
+        if self.state_layout == "arena":
+            return self._cells
+        return np.fromiter(self.counts.keys(), dtype=np.uint64, count=len(self.counts))
+
     def chunk_outputs(self, children, agg_fields: dict):
         """Emit one chunk's aggregation outputs from the running state.
 
