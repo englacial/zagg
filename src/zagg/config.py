@@ -91,6 +91,12 @@ FILTER_OPS = _SCALAR_OPS | _SET_OPS
 
 _PIPELINE_TYPES = frozenset({"spatial", "temporal", "event"})
 
+# Memory sizes (MB) of the pre-provisioned Lambda worker-size variants
+# (issue #235). Must match template.yaml's WorkerMemorySizes parameter — the
+# runner resolves ``worker:`` to a ``<base>-<memory>[-disk]`` function name,
+# so an unlisted size would dispatch to a function that does not exist.
+WORKER_MEMORIES = frozenset({2048, 4096, 8192})
+
 
 @dataclass
 class PipelineConfig:
@@ -114,6 +120,14 @@ class PipelineConfig:
         ``"event"`` route to the event-streaming engines added in later
         phases. Absent ``pipeline`` key in YAML defaults to ``spatial`` for
         backward compatibility with every existing config.
+    worker : dict or None
+        Optional Lambda worker-size selector (issue #235):
+        ``{"memory": 2048|4096|8192, "extra_disk": bool}``. The runner
+        resolves it to a pre-provisioned function-name suffix
+        (``-<memory>``, plus ``-disk`` when ``extra_disk`` is true) on the
+        lambda backend; an explicit ``function_name`` kwarg wins over it.
+        Absent block -> the unsuffixed default function, byte-identical
+        prior behavior. Ignored by the local backend.
     """
 
     data_source: DataSourceDict = field(default_factory=dict)
@@ -122,6 +136,7 @@ class PipelineConfig:
     catalog: str | None = None
     bounds: dict | None = None
     pipeline: dict = field(default_factory=lambda: {"type": "spatial"})
+    worker: dict | None = None
 
 
 def get_pipeline_type(config: PipelineConfig) -> str:
@@ -175,6 +190,7 @@ def load_config_from_dict(d: dict) -> PipelineConfig:
         catalog=d.get("catalog"),
         bounds=d.get("bounds"),
         pipeline=d.get("pipeline", {"type": "spatial"}),
+        worker=d.get("worker"),
     )
 
 
@@ -230,6 +246,11 @@ def validate_config(config: PipelineConfig) -> None:
             "data_source.credentials_provider must be a credential-provider "
             f"registry name string, e.g. 'nsidc' or 'gesdisc' (got {provider!r})"
         )
+
+    # The optional top-level worker block (issue #235) selects a
+    # pre-provisioned Lambda size variant on any pipeline kind, so it is
+    # validated before the kind branch, like credentials_provider above.
+    _validate_worker(config)
 
     ptype = get_pipeline_type(config)
     if ptype != "spatial":
@@ -556,6 +577,38 @@ def validate_config(config: PipelineConfig) -> None:
 # ``process_event`` rather than a load-time guess about which plugins are
 # installed.
 _TEMPORAL_SPEC_KEYS = ("variable", "collection", "spatial_func", "temporal_reducer")
+
+
+def _validate_worker(config: PipelineConfig) -> None:
+    """Validate the optional top-level ``worker:`` block (issue #235).
+
+    ``{memory, extra_disk?}`` selects one of the pre-provisioned Lambda
+    worker-size variants: ``memory`` (required, one of
+    :data:`WORKER_MEMORIES`) picks the ``-<memory>`` function, and
+    ``extra_disk: true`` (optional, default false) the ``-disk`` twin with
+    ``/tmp`` sized memory + 2048 MB. Fails at load — a typo here would
+    otherwise surface as a per-shard ResourceNotFound after the fan-out
+    starts. Absent block is today's behavior (unsuffixed function).
+    """
+    worker = config.worker
+    if worker is None:
+        return
+    if not isinstance(worker, dict):
+        raise ValueError(f"worker must be a mapping {{memory, extra_disk?}} (got {worker!r})")
+    unknown = set(worker) - {"memory", "extra_disk"}
+    if unknown:
+        raise ValueError(
+            f"Unknown worker keys: {sorted(unknown)} (allowed: 'memory', 'extra_disk')"
+        )
+    memory = worker.get("memory")
+    if isinstance(memory, bool) or memory not in WORKER_MEMORIES:
+        raise ValueError(
+            f"worker.memory must be one of {sorted(WORKER_MEMORIES)} MB — the "
+            f"pre-provisioned variant sizes (issue #235) — (got {memory!r})"
+        )
+    extra_disk = worker.get("extra_disk")
+    if extra_disk is not None and not isinstance(extra_disk, bool):
+        raise ValueError(f"worker.extra_disk must be a boolean (got {extra_disk!r})")
 
 
 def _validate_temporal_config(config: PipelineConfig) -> None:
