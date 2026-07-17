@@ -45,7 +45,9 @@ hive-layout config -- output.store_layout: hive, issue #199 -- it writes the
 morton_hive.json manifest instead, and each process-mode worker emits its own
 leaf template. Current dispatchers send hive setup as a fire-and-forget Event
 invoke right after the ping -- the primary manifest write, issue #252 hybrid
--- and older synchronous dispatchers keep working against this function):
+-- and older synchronous dispatchers keep working against this function. For
+a raster-pipeline config -- data_source.reader: raster, issue #264 -- it
+writes the raster (time, cells) template instead, from a synchronous invoke):
 {
     "mode": "setup",
     "store_path": str,
@@ -57,6 +59,10 @@ invoke right after the ping -- the primary manifest write, issue #252 hybrid
     "dataset": dict (optional, hive only) -- {"short_name", "version"} identity
         block for the manifest, sourced from the ShardMap metadata by the
         orchestrator (matching the local dispatcher). Absent on flat runs.
+    "times_us": [int, ...] (raster only, issue #264) -- the catalog-derived
+        time coordinate, int64 microseconds since the epoch; the orchestrator
+        owns the global timestep index and threads it here so the template
+        write needs no S3 access from the dispatcher.
     "output_credentials": dict (optional, same shape as process mode),
 }
 
@@ -639,6 +645,16 @@ def _handle_extract(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
 def _handle_setup(event: Dict[str, Any]) -> Dict[str, Any]:
     """Create the zarr template at ``event['store_path']``.
 
+    For a raster-pipeline config (``data_source.reader: raster``, issue #264)
+    this writes the ``(time, cells)`` raster template + its ``time``
+    coordinate via ``emit_raster_template`` — the orchestrator dispatches it
+    as a synchronous setup invoke before fan-out (the template is
+    load-bearing: workers write slabs into its arrays), so an invoke-only
+    dispatcher (the CI OIDC role) never needs S3 write access. ``times_us``
+    (the catalog-derived int64 time coordinate) rides in the event; the
+    success body echoes ``"pipeline": "raster"`` so the dispatcher can refuse
+    a stale deployment that fell through to the point-path template below.
+
     For a hive-layout config (issue #199 phase 3) template time writes ONLY
     the ``morton_hive.json`` manifest — no global zarr template exists (zero
     metadata above the leaves, D5); each worker emits its own leaf template.
@@ -660,6 +676,28 @@ def _handle_setup(event: Dict[str, Any]) -> Dict[str, Any]:
     logger.info(f"Setup mode: creating template at {event.get('store_path')}")
     try:
         config = load_config_from_dict(event["config"])
+        if (config.data_source or {}).get("reader") == "raster":
+            import numpy as np
+
+            from zagg.processing.raster import emit_raster_template
+
+            store = open_store(event["store_path"], **_output_store_kwargs(event))
+            grid = from_config(config)
+            times_us = np.asarray(event["times_us"], dtype=np.int64)
+            emit_raster_template(
+                store, grid, config, times_us, overwrite=event.get("overwrite", False)
+            )
+            return {
+                "statusCode": 200,
+                "body": json.dumps(
+                    {
+                        "ok": True,
+                        "mode": "setup",
+                        "pipeline": "raster",
+                        "timesteps": int(times_us.size),
+                    }
+                ),
+            }
         if get_store_layout(config) == "hive":
             from zagg.config import get_windowing
             from zagg.hive import build_manifest, ensure_manifest

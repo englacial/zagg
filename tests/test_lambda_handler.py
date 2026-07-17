@@ -1275,6 +1275,13 @@ class TestSetupHive:
         assert handler_mod._handle_setup(self._event(tmp_path, cfg))["statusCode"] == 200
         assert handler_mod._handle_setup(self._event(tmp_path, cfg))["statusCode"] == 200
 
+    def test_hive_setup_body_pinned_no_raster_echo(self, handler_mod, tmp_path):
+        # Hive setup must keep its exact pre-#264 body: the raster branch
+        # (data_source.reader == "raster") never fires on a hive point config.
+        resp = handler_mod._handle_setup(self._event(tmp_path, TestProcessHive._hive_config_dict()))
+        assert resp["statusCode"] == 200, resp["body"]
+        assert json.loads(resp["body"]) == {"ok": True, "mode": "setup", "layout": "hive"}
+
 
 class TestFinalizeHive:
     """Issue #252 (hybrid): for a hive config, finalize mode re-ensures the
@@ -1476,6 +1483,15 @@ class TestSetupTemplate:
         n_chunks = self._template_chunk_count(store, worker_grid)
         assert (n_chunks,) == worker_grid.chunk_grid_shape
         assert n_chunks == HEALPIX_BASE_CELLS * 4**6
+
+    def test_flat_setup_body_pinned_no_raster_echo(self, handler_mod, monkeypatch):
+        # The raster setup branch (issue #264) keys on data_source.reader ==
+        # "raster": a point-path config must keep the flat branch and its
+        # exact pre-#264 body -- no "pipeline" echo, no "times_us" read.
+        cfg = default_config("atl06")
+        resp, _store = self._setup(handler_mod, monkeypatch, asdict(cfg), parent_order=6)
+        assert resp["statusCode"] == 200, resp["body"]
+        assert json.loads(resp["body"]) == {"ok": True, "mode": "setup", "layout": "flat"}
 
     def test_setup_dense_layout_threads_populated_shards(self, handler_mod, monkeypatch):
         # n_parent_cells signals the (deprecated) dense layout; the count must thread
