@@ -448,15 +448,20 @@ def _measure_objects_recorded(
 
 
 def _setup_cost_usd(setup_s):
-    """Billed dollars of the one-per-arm setup invoke (issue #250 item 3).
+    """Billed dollars of the SYNC setup path (issue #250 item 3).
 
-    ``setup_s`` is billed (a real Lambda invoke) but excluded from both
+    ``setup_s`` is billed (real Lambda invokes) but excluded from both
     ``total_wall_s`` and ``cost_usd`` (worker durations only), so on a flat
     store the chart's dollar figure ran ~18% low. Kept as its OWN column --
     ``cost_usd`` semantics are untouched, so the retained history stays
-    comparable. ``setup_s`` is the orchestrator wall around the invoke (the
-    summary carries no billed duration for the setup Lambda), so this slightly
-    overstates by the invoke round-trip overhead. None-safe (dry runs)."""
+    comparable. Layout split (issue #252 hybrid, PR #255): on FLAT rows
+    ``setup_s`` is the orchestrator wall around the sync fullsphere-template
+    invoke (no billed duration in the summary, so this slightly overstates by
+    the round-trip overhead); on HIVE rows it is only the preflight ping +
+    the ~10 ms async Event dispatch -- the manifest write's real billed GB-s
+    is fire-and-forget and unobservable from the orchestrator, so this column
+    measures the sync setup-path residue only, never an invented async cost.
+    None-safe (dry runs)."""
     if setup_s is None:
         return None
     return round(float(setup_s) * LAMBDA_MEMORY_GB * LAMBDA_PRICE_PER_GB_SEC, 6)
