@@ -241,17 +241,43 @@ class StreamingAggregator:
         buffer is an **anonymous** file mapping: the file is unlinked the
         moment the mapping exists, so the mapping itself is the only
         reference — space frees on GC and nothing can accumulate in ``/tmp``
-        across warm Lambda invokes. The payoff is failure mode: dirty pages
-        are file-backed page cache the kernel can write back and reclaim
+        across warm Lambda invokes. The reclaim payoff holds only where
+        ``/tmp`` is genuinely disk-backed (Lambda ephemeral storage): dirty
+        pages are file-backed page cache the kernel can write back and reclaim
         under cgroup pressure, so an oversized flush transient degrades into
-        paging instead of an OOM kill of anonymous heap.
+        paging instead of an OOM kill of anonymous heap. Where ``/tmp`` is
+        tmpfs (common on dev/CI boxes) those pages are RAM that counts against
+        the same cgroup and cannot be evicted — no benefit, strictly extra
+        overhead.
+
+        ``mode="w+"`` grows the file with a single sparse seek+write, so the
+        allocation succeeds even when the filesystem cannot hold the full
+        buffer; the shortfall only surfaces later as an **uncatchable SIGBUS**
+        on the page-fault writes that fill the mapping. To turn that deferred
+        crash into a clean loud error we check free space against the request
+        up front and refuse if it won't fit. ``arena_backing: tmp`` therefore
+        requires ephemeral storage sized above the arena flush transient — up
+        to three of these buffers (old + staging + bounded merge) can be live
+        at once during a fold, so size for their combined peak, not one buffer.
         """
         if self.arena_backing != "tmp" or n_rows == 0:
             return np.empty((n_rows, 2), dtype=np.float32)
         import os
         import tempfile
 
-        fd, path = tempfile.mkstemp(suffix=".arena")
+        tmp_dir = tempfile.gettempdir()
+        need_bytes = n_rows * 2 * np.dtype(np.float32).itemsize
+        st = os.statvfs(tmp_dir)
+        avail_bytes = st.f_bavail * st.f_frsize
+        if avail_bytes < need_bytes:
+            raise RuntimeError(
+                f"arena_backing: tmp needs {need_bytes} bytes for a centroid buffer but "
+                f"{tmp_dir!r} has only {avail_bytes} free; raise the function's ephemeral "
+                "storage / EphemeralStorage size (up to three such buffers — old + staging + "
+                "bounded merge — can be live concurrently during a fold, so size for their "
+                "combined peak). Overflow otherwise surfaces as an uncatchable SIGBUS on write."
+            )
+        fd, path = tempfile.mkstemp(suffix=".arena", dir=tmp_dir)
         try:
             mapped = np.memmap(path, dtype=np.float32, mode="w+", shape=(n_rows, 2))
         finally:
