@@ -183,11 +183,13 @@ else
 fi
 
 echo "Deploying stack $STACK_NAME..."
+# CAPABILITY_AUTO_EXPAND acknowledges the AWS::LanguageExtensions macro expansion
+# (issue #235); harmless if the change-set path would have processed it anyway.
 run aws cloudformation deploy \
     --template-file "$SCRIPT_DIR/template.yaml" \
     --stack-name "$STACK_NAME" \
     --region "$REGION" \
-    --capabilities CAPABILITY_NAMED_IAM \
+    --capabilities CAPABILITY_NAMED_IAM CAPABILITY_AUTO_EXPAND \
     --parameter-overrides \
         Architecture="$ARCH" \
         FunctionName="$FUNCTION_NAME" \
