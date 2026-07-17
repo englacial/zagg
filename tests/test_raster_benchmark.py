@@ -185,6 +185,48 @@ def test_run_target_dispatches_via_agg_and_records_summary(monkeypatch, tmp_path
     assert df.iloc[0]["count_tiles"] == 1300
 
 
+def test_run_target_applies_store_layout_override(tmp_path):
+    # The harness's per-target store_layout override (the issue #237 hive-flip
+    # path) applies + re-validates the layout inside run_target itself. Flat is
+    # valid today, so the override rides end-to-end into the record; hive still
+    # trips today's gate (issue #239) through run_target -- proving the promotion
+    # path executes the override + re-validation, not just a manual validate.
+    import copy
+
+    manifest, base = rrb.load_targets(str(BENCH / "targets_raster_neon.json"))
+    ctx = {"timestamp": "t", "commit": "c", "ref": "v0.0.0", "event": "release"}
+
+    flat = copy.deepcopy(manifest)
+    flat["targets"]["raster_s2_neon_2025"]["store_layout"] = "flat"
+    run = rrb.run_target(
+        "raster_s2_neon_2025",
+        flat,
+        base,
+        store="s3://bucket/raster_s2_neon_2025.zarr",
+        region="us-west-2",
+        function_name="process-shard",
+        context=ctx,
+        dry_run=True,
+        artifacts_dir=str(tmp_path),
+    )
+    assert run["store_layout"] == "flat"
+
+    hive = copy.deepcopy(manifest)
+    hive["targets"]["raster_s2_neon_2025"]["store_layout"] = "hive"
+    with pytest.raises(ValueError, match="issue #237"):
+        rrb.run_target(
+            "raster_s2_neon_2025",
+            hive,
+            base,
+            store="s3://bucket/raster_s2_neon_2025.zarr",
+            region="us-west-2",
+            function_name="process-shard",
+            context=ctx,
+            dry_run=True,
+            artifacts_dir=str(tmp_path),
+        )
+
+
 def _record(commit="c0", target="raster_s2_neon_2025", event="release", **over):
     r = {
         "target": target,
