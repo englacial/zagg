@@ -1045,6 +1045,49 @@ class TestRasterHiveWorker:
         red = open_array(leaf + f"/{grid.group_path}/red", zarr_format=3, consolidated=False)
         assert red.shape == (2, grid.cells_per_shard)
 
+    def test_disjoint_timesteps_coverage_is_union(self, tmp_path):
+        # D14 spatial union across acquisitions: two timesteps whose footprints
+        # occupy DISJOINT cell subsets of one shard must stamp coverage = the
+        # OR of both. A regression dropping the union (e.g. sampling only the
+        # last group) would decode to one timestep's set, which — since neither
+        # is a superset of the other — this test rejects.
+        from zagg import hive
+        from zagg.processing.raster import process_and_write_raster_hive
+
+        cfg, grid, shard = _healpix_setup(tmp_path)
+        # Second raster shifted ~480 m west: overlapping but neither footprint
+        # covers the other, so each timestep owns shard cells the other misses
+        # (the shard's covered patch sits at the raster's east edge, so a west
+        # shift keeps both timesteps' exclusive cells inside this shard).
+        origin1 = (ORIGIN[0] - 480.0, ORIGIN[1])
+        transform1 = (RES, 0.0, origin1[0], 0.0, -RES, origin1[1])
+        _write_tiff(tmp_path / "d0.tif", np.full((96, 96), 555, dtype=np.uint16))
+        _write_tiff(tmp_path / "d1.tif", np.full((96, 96), 777, dtype=np.uint16), origin=origin1)
+        granules = [
+            _entry("g0", {"red": str(tmp_path / "d0.tif")}, T0, time_key="dt-1"),
+            _entry("g1", {"red": str(tmp_path / "d1.tif")}, T1, time_key="dt-2"),
+        ]
+
+        cells = grid.children(shard)
+        _r0, _c0, valid0 = grid.sample(cells, UTM18, TRANSFORM, (96, 96))
+        _r1, _c1, valid1 = grid.sample(cells, UTM18, transform1, (96, 96))
+        # Premise: both timesteps land cells, and neither is a superset — some
+        # cell is valid in exactly one, so the union is strictly larger.
+        assert valid0.any() and valid1.any()
+        assert (valid0 & ~valid1).any() and (valid1 & ~valid0).any()
+        union = valid0 | valid1
+
+        root = str(tmp_path / "hivestore")
+        process_and_write_raster_hive(
+            shard, granules, grid, root, cfg, store_kwargs={}, window=None
+        )
+        leaf = hive.shard_leaf_path(root, shard)
+        stamp = hive.read_commit(leaf)
+        assert stamp and stamp["complete"]
+        assert stamp["cells_with_data"] == int(union.sum())
+        got = hive.read_coverage_bitmap(leaf, coverage=stamp["coverage"])
+        np.testing.assert_array_equal(got, np.sort(np.asarray(cells, dtype=np.uint64)[union]))
+
     def test_no_data_unit_creates_no_prefix(self, tmp_path):
         from zagg import hive
         from zagg.processing.raster import process_and_write_raster_hive
