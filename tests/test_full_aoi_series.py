@@ -55,6 +55,7 @@ def _record(commit="c0", target="full_aoi_neon_o9_inline_nomask", event="release
         "cost_usd": 0.016,
         "total_wall_s": 120.0,
         "setup_s": 3.0,
+        "setup_cost_usd": 0.000156,
         "fanout_s": 110.0,
         "finalize_s": 7.0,
         "worker_max_s": 100.0,
@@ -133,6 +134,8 @@ def test_records_to_frame_is_column_stable():
     assert list(df.columns) == fas.FULL_AOI_COLUMNS
     assert df.iloc[0]["cost_usd"] == 0.016
     assert df.iloc[0]["n_shards"] == 4
+    # setup_cost_usd rides its own column (issue #250 item 3), never cost_usd.
+    assert df.iloc[0]["setup_cost_usd"] == 0.000156
 
 
 def test_append_dedups_last_write_per_commit_target():
@@ -300,8 +303,8 @@ def test_objects_columns_retained_and_mismatch_dropped():
     df = fas.records_to_frame([_record(objects_mismatch="total objects 999 != expected 25")])
     assert list(df.columns) == fas.FULL_AOI_COLUMNS
     # Appended in order: object counts (phase 3), then layout + parity (phase
-    # 4), then the worker phase split (issue #250).
-    assert fas.FULL_AOI_COLUMNS[-7:] == [
+    # 4), then the worker phase split + setup cost (issue #250).
+    assert fas.FULL_AOI_COLUMNS[-8:] == [
         "objects_total",
         "objects_expected",
         "store_layout",
@@ -309,6 +312,7 @@ def test_objects_columns_retained_and_mismatch_dropped():
         "phase_read_s",
         "phase_index_s",
         "phase_aggregate_s",
+        "setup_cost_usd",
     ]
     assert df.iloc[0]["objects_total"] == 27
     assert df.iloc[0]["objects_expected"] == 25
@@ -353,7 +357,7 @@ def test_store_layout_and_parity_columns_retained_parity_detail_dropped():
     )
     df = fas.records_to_frame([rec])
     assert list(df.columns) == fas.FULL_AOI_COLUMNS
-    assert fas.FULL_AOI_COLUMNS[-5:-3] == ["store_layout", "parity_ok"]
+    assert fas.FULL_AOI_COLUMNS[-6:-4] == ["store_layout", "parity_ok"]
     row = df.iloc[0]
     assert row["store_layout"] == "hive"
     assert row["parity_ok"] == False  # noqa: E712 -- nullable bool column
