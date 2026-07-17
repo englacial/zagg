@@ -44,7 +44,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-from zagg.config import load_config  # noqa: E402
+from zagg.config import get_store_layout, load_config, validate_config  # noqa: E402
 from zagg.dispatch import LAMBDA_MEMORY_GB, LAMBDA_PRICE_PER_GB_SEC  # noqa: E402
 from zagg.grids import from_config  # noqa: E402
 
@@ -76,6 +76,14 @@ def run_target(
 
     target = manifest["targets"][name]
     config = load_config(str(_resolve(base, target["config"])))
+    # Hive flip path (espg directive on PR #261; blocked on issue #237): a
+    # target may pin store_layout, applied + re-validated here so promoting
+    # the pending hive target into "targets" is the ONLY change needed when
+    # issue #237 lands. Today the raster path rejects hive (issue #239), so
+    # the pending target fails fast rather than dispatching a wrong layout.
+    if target.get("store_layout"):
+        config.output["store_layout"] = target["store_layout"]
+        validate_config(config)
     grid = from_config(config)
 
     cat = Catalog.from_geoparquet(str(_resolve(base, target["catalog"])))
@@ -106,6 +114,9 @@ def run_target(
         "parent_order": int(grid.parent_order),
         "child_order": int(grid.child_order),
         "n_shards": len(cells),
+        # Forward-compatible layout axis (null-safe pre-hive: reads "flat");
+        # distinguishes the hive rows the #237 flip will add to the series.
+        "store_layout": get_store_layout(config),
         "shardmap_build_s": round(build_s, 2),
         "per_shard_granules": sorted(counts),
         "memory_gb": LAMBDA_MEMORY_GB,

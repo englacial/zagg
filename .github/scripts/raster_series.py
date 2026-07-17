@@ -74,6 +74,9 @@ RASTER_COLUMNS = [
     # now reports the sampled per-invocation peak, point-path parity). Null on
     # rows recorded before the worker reported it.
     "max_memory_mb",
+    # Store-layout axis: "flat" today; "hive" rows arrive when issue #237
+    # lands and the pending manifest target is promoted. Null reads as flat.
+    "store_layout",
 ]
 
 # run-record stage_max key -> flat column ("write" is the handler's write

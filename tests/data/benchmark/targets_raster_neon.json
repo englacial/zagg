@@ -22,5 +22,18 @@
       "grid_size": "o9",
       "collection": "sentinel-2-c1-l2a"
     }
+  },
+  "pending_targets": {
+    "_comment": "Blocked on issue #237 (hive store layout for the raster pipeline) -- espg directive on PR #261: the raster leg is hive as soon as upstream supports it. The harness already applies a target's store_layout override and re-validates, so when issue #237 lands the ONLY change is moving this target into 'targets' (replacing the flat one) and deleting the tripwire test test_pending_hive_target_blocked_on_237. Until then the raster config path rejects hive pointedly (issue #239), so this target fails fast if dispatched early.",
+    "raster_s2_neon_2025_hive": {
+      "config": "configs/s2_neon_o9.yaml",
+      "catalog": "catalogs/cat_s2_neon_2025.parquet",
+      "pipeline": "raster",
+      "grid_type": "healpix",
+      "grid_size": "o9",
+      "collection": "sentinel-2-c1-l2a",
+      "store_layout": "hive",
+      "blocked_by": "#237"
+    }
   }
 }
