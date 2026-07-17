@@ -572,12 +572,17 @@ def process_shard(
         col = col_arrays[time_range_of]
         metadata["time_range"] = [float(col.min()), float(col.max())]
 
-    # Occupied-cell sink (issue #200): both paths already key per-cell state by
-    # the packed cell word — ``cell_to_slice`` pooled, ``buffered.counts``
-    # merged — so the occupied set is in hand with no extra observation pass.
+    # Occupied-cell sink (issue #200): both paths already hold the shard's
+    # populated cell words — ``cell_to_slice`` pooled, the streaming running
+    # state merged (dict counts or arena cell ids, via ``occupied_cells``) — so
+    # the occupied set is in hand with no extra observation pass.
     if occupied_out is not None:
-        cells = buffered.counts if buffered is not None else cell_to_slice
-        occupied_out.append(np.fromiter(cells.keys(), dtype=np.uint64, count=len(cells)))
+        if buffered is not None:
+            occupied_out.append(buffered.occupied_cells())
+        else:
+            occupied_out.append(
+                np.fromiter(cell_to_slice.keys(), dtype=np.uint64, count=len(cell_to_slice))
+            )
 
     if profile:
         phase_timings["index"] = time.time() - _index_t0

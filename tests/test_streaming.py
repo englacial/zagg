@@ -415,6 +415,36 @@ class TestArenaLayout:
         arena = _run(monkeypatch, arena_cfg, _grid(arena_cfg), key, list(dfs))
         self._assert_identical(pooled, arena)
 
+    def test_occupied_out_fed_under_arena(self, monkeypatch):
+        # Regression (issue #217): the occupied-cell sink (issue #200, feeds the
+        # coverage/MOC stamp) must be populated under arena layout, not just
+        # dict — the arena keeps state in _cells, never touching self.counts.
+        key = _shard_key()
+        cell_lists = [[0, 4, 8], [2, 4, 10], [1, 8, 9]]
+        occ = {}
+        for layout in ("dict", "arena"):
+            cfg = _config(
+                streaming={"buffer_granules": 1, "state_layout": layout},
+            )
+            grid = _grid(cfg)
+            dfs = _granule_dfs_cells(grid, key, cell_lists, seed=5)
+            reads = iter(dfs)
+            monkeypatch.setattr("zagg.processing._read_group", lambda *a, **k: next(reads))
+            monkeypatch.setattr("zagg.processing.h5coro.H5Coro", lambda *a, **k: object())
+            monkeypatch.setattr("zagg.processing._make_url_rewriter", lambda driver: lambda u: u)
+            sink: list = []
+            process_shard(
+                grid,
+                key,
+                [f"s3://b/g{i}.h5" for i in range(len(dfs))],
+                s3_credentials=_CREDS,
+                config=cfg,
+                occupied_out=sink,
+            )
+            occ[layout] = np.concatenate(sink) if sink else np.empty(0, dtype=np.uint64)
+        assert occ["arena"].size > 0
+        np.testing.assert_array_equal(np.sort(occ["arena"]), np.sort(occ["dict"]))
+
     def test_empty_property(self):
         cfg = _config(streaming={"buffer_granules": 2, "state_layout": "arena"})
         agg = StreamingAggregator(cfg, _grid(cfg), "pandas", 2, state_layout="arena")
