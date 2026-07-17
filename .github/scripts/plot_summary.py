@@ -265,11 +265,14 @@ def make_diagnostics_figure(
     x_col: str,
     out_png: Path,
     suptitle: str,
+    ylabel: str = "seconds",
 ) -> bool:
-    """One panel PER metric (phase or stage), seconds vs x — never stacked.
+    """One panel PER metric (phase or stage), ``ylabel`` vs x — never stacked.
 
     Panels whose column is absent or all-null are skipped; no panels -> False
     (the Pages index omits the section instead of embedding a broken image).
+    ``ylabel`` defaults to seconds (the phase/stage figures); the object-count
+    figure passes ``"objects"`` so its count axis is not mislabelled.
     Markers carry the memory colour scale where available.
     """
     import matplotlib
@@ -295,7 +298,7 @@ def make_diagnostics_figure(
         ax = axes[i // ncols][i % ncols]
         _draw_series(ax, xs, hist[col].to_numpy(float), fracs=fracs, norm=norm)
         ax.set_title(title, fontsize=10)
-        ax.set_ylabel("seconds")
+        ax.set_ylabel(ylabel)
         _finish_axis(ax, xs, labels)
     for j in range(len(live), nrows * ncols):  # blank the unused grid slots
         axes[j // ncols][j % ncols].axis("off")
@@ -328,4 +331,5 @@ def make_release_objects_figure(hist: pd.DataFrame, out_png: Path) -> bool:
         "ref",
         out_png,
         "zagg full-AOI point — store objects vs release (issue #240 tripwire)",
+        ylabel="objects",
     )
