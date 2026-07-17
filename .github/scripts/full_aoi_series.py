@@ -97,6 +97,10 @@ FULL_AOI_COLUMNS = [
     "phase_read_s",
     "phase_index_s",
     "phase_aggregate_s",
+    # The setup invoke's billed dollars (issue #250 item 3): its own column,
+    # NOT folded into cost_usd (worker GB-seconds), so the retained history's
+    # cost semantics stay comparable. Null on pre-#250 rows and dry runs.
+    "setup_cost_usd",
 ]
 
 # run-record write_throughput key -> flat column name.

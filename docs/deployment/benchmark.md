@@ -135,6 +135,12 @@ seconds on the y-axis, one line per phase:
 releases recorded before the capture landed, so those lines simply start at
 the first release that recorded them.
 
+The series also records **`setup_cost_usd`** — the setup invoke's billed
+dollars (`setup_s × memory_gb × price/GB-s`). It is kept as its *own* column
+rather than folded into `cost_usd` (worker GB-seconds only), so the retained
+cost history stays comparable across releases; add the two for the honest
+whole-run dollar total.
+
 ![Per-release full-AOI — per-phase seconds](https://raw.githubusercontent.com/englacial/zagg/benchmarks/site/full_aoi_phases.png)
 
 > These embed by raw URL and appear after the first tagged release runs the
