@@ -30,7 +30,8 @@ import pandas as pd
 
 # Flat on-disk schema for the full-AOI release series. Ordered for a stable
 # on-disk layout; new columns append at the end. The harness's nested
-# ``write_throughput`` dict is flattened to the ``wt_*`` scalar columns below, and
+# ``write_throughput`` dict is flattened to the ``wt_*`` scalar columns below,
+# and ``worker_phase_max`` to the ``phase_*_s`` columns, and
 # the non-scalar run-record fields (temporal, per_shard_granules, apriori_estimate)
 # are dropped -- they are dry-run planning aids, not charted release metrics.
 FULL_AOI_COLUMNS = [
