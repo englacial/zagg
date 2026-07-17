@@ -123,6 +123,28 @@ class TestRasterConfigValidation:
         with pytest.raises(ValueError, match="store_layout: hive"):
             validate_config(cfg)
 
+    def test_hive_consolidate_metadata_rejected(self):
+        # Issue #247: raster now routes through the shared store-layout check,
+        # so hive + consolidate_metadata: true hits the "no store-root zarr
+        # hierarchy" rejection (D5/D12) just like the point path.
+        cfg = _raster_config()
+        cfg.output["store_layout"] = "hive"
+        cfg.output["consolidate_metadata"] = True
+        with pytest.raises(ValueError, match="no store-root zarr hierarchy"):
+            validate_config(cfg)
+
+    def test_coverage_moc_defaults_on_for_hive(self):
+        # get_coverage_moc defaults ON for raster+hive (O9 root coverage) and
+        # OFF for raster flat — the shared default resolution now covers raster.
+        from zagg.config import get_coverage_moc
+
+        hive = _raster_config()
+        hive.output["store_layout"] = "hive"
+        assert get_coverage_moc(hive) is True
+
+        flat = _raster_config()
+        assert get_coverage_moc(flat) is False
+
     def test_windowing_validates_and_normalizes(self):
         # Issue #247 (ratified): raster window membership is the acquisition's
         # STAC datetime — time_field is optional and the manifest records the
