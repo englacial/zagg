@@ -1733,9 +1733,10 @@ def _objects_payload(mismatch=None):
 
 def test_objects_columns_are_last_and_threaded():
     # Stable-schema rule: new columns append LAST (issue #240; store_layout
-    # appended after the object counts in phase 4).
+    # appended after the object counts in phase 4; the #250/#256 phase split
+    # appended after those).
     cols = bench_metrics.RECORD_COLUMNS
-    assert cols[-3:] == ["objects_total", "objects_expected", "store_layout"]
+    assert cols[-7:-4] == ["objects_total", "objects_expected", "store_layout"]
     g = HealpixGrid(parent_order=11, child_order=19)
     rec = bench_metrics.build_record(_summary(), grid=g, context={}, objects=_objects_payload())
     assert rec["objects_total"] == 10
