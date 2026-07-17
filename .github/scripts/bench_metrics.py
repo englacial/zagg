@@ -66,9 +66,13 @@ RECORD_COLUMNS = [
     # Wall-time breakdown (issue #180): end-to-end AOI dispatch wall and its
     # three phases. ``runtime_s`` above is the single worker's compute;
     # ``total_wall_s`` is what the orchestrator actually waits (setup +
-    # fanout/poll + finalize). ``finalize_s`` is the zarr metadata
-    # consolidation invoke -- a ~fixed cost worth tracking for regression
-    # (issue #191). Null on rows recorded before these were surfaced.
+    # fanout/poll + finalize). ``finalize_s`` is the finalize invoke: zarr
+    # metadata consolidation on flat (issue #191); on hive it is the
+    # idempotent morton_hive.json backstop (issue #252 hybrid -- the primary
+    # manifest write fires as an async Event invoke at init) -- keep it
+    # displayed. ``setup_s`` on hive rows is the lightweight preflight ping
+    # plus the ~10 ms Event dispatch of the manifest write. Null on rows
+    # recorded before these were surfaced.
     "total_wall_s",
     "setup_s",
     "fanout_s",

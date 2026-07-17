@@ -6,6 +6,7 @@ and the shipped ``sentinel2_l2a`` template config.
 """
 
 import json
+import logging
 
 import numpy as np
 import pytest
@@ -120,6 +121,23 @@ class TestRasterAgg:
             store_path + f"/{grid.group_path}/time", zarr_format=3, consolidated=False
         )
         assert tarr.shape == (2,) and tarr[0] < tarr[1]
+
+    def test_debug_logging_emits_stage_stats(self, tmp_path, manifest, caplog):
+        # Issue #249, local flavor: stages are collected + logged per shard
+        # only when debug logging is on (espg-ratified on the issue).
+        cfg, sm_path, _shard, _data = manifest
+        with caplog.at_level(logging.DEBUG, logger="zagg.runner"):
+            agg(cfg, catalog=sm_path, backend="local", max_workers=2)
+        stage_msgs = [r.message for r in caplog.records if "stages:" in r.message]
+        assert len(stage_msgs) == 1  # one shard -> one debug line
+        assert "'assets': 2" in stage_msgs[0]  # 2 timesteps x 1 band
+        assert "'geom_hits': 1" in stage_msgs[0]  # one shared source grid
+
+    def test_no_debug_no_stage_logging(self, tmp_path, manifest, caplog):
+        cfg, sm_path, _shard, _data = manifest
+        with caplog.at_level(logging.INFO, logger="zagg.runner"):
+            agg(cfg, catalog=sm_path, backend="local", max_workers=2)
+        assert not [r for r in caplog.records if "stages:" in r.message]
 
     def test_multi_shard_disjoint_slabs(self, tmp_path):
         # Two rasters ~7 km apart feed two DISTINCT order-10 shards in one run;

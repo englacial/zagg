@@ -3145,6 +3145,19 @@ class TestProfilePlumbing:
         )
         assert summary["worker_phase_max"] == {"read": 5.0, "index": 1.0, "aggregate": 2.0}
 
+    def test_rollup_carries_write_phase(self, monkeypatch, atl06_config):
+        # Issue #249: the rollup iterates the body's phase keys generically, so
+        # the additive ``write`` phase (hive worker split, PR #256) flows into
+        # worker_phase_max with no special-casing.
+        summary = _run_lambda_with_durations(
+            monkeypatch,
+            atl06_config,
+            [1.0, 2.0, 3.0, 4.0],
+            profile=True,
+            phase_timings={"read": 5.0, "index": 1.0, "aggregate": 2.0, "write": 0.75},
+        )
+        assert summary["worker_phase_max"]["write"] == 0.75
+
     def test_profile_run_with_no_phase_timings_is_empty(self, monkeypatch, atl06_config):
         # profile=True but workers emitted no phase_timings (e.g. handler bridge
         # not yet wired): the key is present but empty, never raising.

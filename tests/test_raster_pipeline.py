@@ -21,6 +21,7 @@ from zagg.processing.raster import (
     _shard_workers,
     _write_buffer,
     emit_raster_template,
+    new_stage_stats,
     process_raster_shard,
     raster_group_spec,
     raster_time_index,
@@ -664,3 +665,68 @@ class TestGeometryCache:
         for got in (cached1, cached2):
             np.testing.assert_array_equal(got[0]["red"], uncached[0]["red"])
             np.testing.assert_array_equal(got[1], uncached[1])
+
+
+class TestStageStats:
+    """Issue #249: opt-in per-stage sample profiling via ``stage_stats``."""
+
+    _STAGES = ("open", "geometry", "fetch", "decode", "gather")
+
+    def _run(self, tmp_path, n_timesteps=3, second_grid=True, stage_stats=None):
+        # Mirrors TestGeomCache._run_counting: n timesteps of a 96x96 10 m
+        # 'red' plus (optionally) a 48x48 20 m 'scl' — two distinct source
+        # grids exercising the geom_cache hit accounting.
+        vals = [11, 22, 33, 44][:n_timesteps]
+        granules = []
+        for i, v in enumerate(vals):
+            _write_tiff(tmp_path / f"s{i}.tif", np.full((96, 96), v, dtype=np.uint16))
+            assets = {"red": str(tmp_path / f"s{i}.tif")}
+            if second_grid:
+                _write_tiff(tmp_path / f"c{i}.tif", np.full((48, 48), 4, dtype=np.uint16), res=20.0)
+                assets["scl"] = str(tmp_path / f"c{i}.tif")
+            granules.append(
+                _entry(f"g{i}", assets, f"2026-07-{13 + i:02d}T16:02:20+00:00", time_key=f"dt-{i}")
+            )
+        bands = {"red": {"asset": "red", "dtype": "uint16"}}
+        if second_grid:
+            bands["scl"] = {"asset": "scl", "dtype": "uint16"}
+        grid = _rect_grid([ORIGIN[0], ORIGIN[1] - 960.0, ORIGIN[0] + 960.0, ORIGIN[1]], [96, 96])
+        cfg = _raster_config(bands=bands, nodata=None)
+        index, _ = raster_time_index([granules])
+        return process_raster_shard(grid, 0, granules, cfg, index, stage_stats=stage_stats)
+
+    def test_counts_and_stage_seconds(self, tmp_path):
+        stats = new_stage_stats()
+        _slabs, meta = self._run(tmp_path, n_timesteps=3, second_grid=True, stage_stats=stats)
+        assert meta["timesteps"] == 3
+        assert stats["assets"] == 6  # 3 timesteps x 2 bands
+        assert stats["geom_hits"] == 4  # assets - 2 distinct source grids
+        assert stats["tiles"] >= stats["assets"]  # every sample fetches >= 1 tile
+        assert all(stats[k] >= 0.0 for k in self._STAGES)
+        assert sum(stats[k] for k in self._STAGES) > 0.0
+
+    def test_profiled_output_matches_default(self, tmp_path):
+        golden, _m = self._run(tmp_path)
+        stats = new_stage_stats()
+        profiled, _m2 = self._run(tmp_path, stage_stats=stats)
+        assert stats["assets"] == 6
+        assert set(golden) == set(profiled)
+        for t in golden:
+            assert set(golden[t]) == set(profiled[t])
+            for f in golden[t]:
+                np.testing.assert_array_equal(golden[t][f], profiled[t][f])
+
+    def test_default_path_makes_no_timing_calls(self, tmp_path, monkeypatch):
+        # The issue #249 zero-overhead gate: with stage_stats=None the sample
+        # path must never call time.time(). Rebind raster.py's module-level
+        # ``time`` name to a booby trap — only this module's calls are caught.
+        import zagg.processing.raster as raster_mod
+
+        class _Boom:
+            @staticmethod
+            def time():
+                raise AssertionError("time.time() called on the unprofiled sample path")
+
+        monkeypatch.setattr(raster_mod, "time", _Boom)
+        _slabs, meta = self._run(tmp_path, n_timesteps=1, second_grid=False)
+        assert meta["timesteps"] == 1

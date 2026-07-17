@@ -188,7 +188,7 @@ def agg(
     profile : bool
         Opt-in per-phase timing (issue #100). When ``True`` (lambda backend),
         forwards ``profile`` into each cell event so the worker emits a
-        ``phase_timings`` (read/index/aggregate) sub-dict, and the run prints a
+        ``phase_timings`` (read/index/aggregate/write — issue #249) sub-dict, and the run prints a
         per-phase worker breakdown. Default ``False`` leaves the worker path and
         per-cell event payload byte-identical -- no probe tax.
     max_retries : int
@@ -634,6 +634,7 @@ class RasterStrategy:
     ):
         from zagg.processing.raster import (
             emit_raster_template,
+            new_stage_stats,
             process_raster_shard,
             raster_time_index,
             write_raster_coords,
@@ -712,6 +713,11 @@ class RasterStrategy:
         def _one(pair):
             shard_key, granules = pair
             wrote = False
+            # Per-stage sample profiling (issue #249), the local flavor of the
+            # lambda handler's opt-in ``profile`` key: allocated only when
+            # debug logging is on, so the default path passes None and the
+            # sample path times nothing.
+            stage_stats = new_stage_stats() if logger.isEnabledFor(logging.DEBUG) else None
 
             def _write_slab(t_idx, slab):
                 nonlocal wrote
@@ -727,10 +733,15 @@ class RasterStrategy:
                 config,
                 time_index,
                 on_slab=_write_slab,
+                stage_stats=stage_stats,
                 **src_kwargs,
             )
             if wrote:
                 write_raster_coords(zarr_store, grid, int(shard_key))
+            if stage_stats is not None:
+                logger.debug(
+                    f"raster shard {shard_label(grid, int(shard_key))} stages: {stage_stats}"
+                )
             return meta
 
         with ThreadPoolExecutor(max_workers=max_workers) as pool:
@@ -1720,19 +1731,29 @@ def _run_local(
     windowing = get_windowing(config)
     if store_layout == "hive":
         # Hive layout (issue #199 phase 2): no shared zarr template — zero
-        # metadata above the leaves (D5). Template time writes only the root
-        # manifest (D6); each shard emits its own leaf template lazily inside
-        # hive.process_and_write_hive (the leaf write path lives in zagg.hive,
-        # next to the manifest/stamp machinery it exercises).
-        from zagg.hive import build_manifest, ensure_manifest, process_and_write_hive
-
-        ensure_manifest(
-            store_path,
-            build_manifest(grid, dataset=catalog_data.get("metadata"), windowing=windowing),
-            overwrite=overwrite,
-            **store_kwargs,
+        # metadata above the leaves (D5); each shard emits its own leaf
+        # template lazily inside hive.process_and_write_hive (the leaf write
+        # path lives in zagg.hive, next to the manifest/stamp machinery it
+        # exercises). The root manifest (D6) is written HERE, pre-dispatch
+        # (issue #252 hybrid): the local dispatcher writes the store
+        # directly, so the write costs ~0 wall and a reader can consume
+        # completed leaves while the run builds — mirroring the lambda
+        # backend's async init-time setup invoke.
+        from zagg.hive import (
+            build_manifest,
+            ensure_manifest,
+            process_and_write_hive,
         )
+
         zarr_store = None
+        # Build the manifest once, up front, and reuse it at finalize.
+        # ensure_manifest runs the read-only validate_manifest frozen-key
+        # precheck before its PUT, so the pre-dispatch fail-fast (review
+        # fold, issue #252) is preserved: a rerun into an incompatible
+        # existing store refuses in ~0s, before any leaf write (D2), instead
+        # of mixing new-order leaves into an old-order store.
+        manifest = build_manifest(grid, dataset=catalog_data.get("metadata"), windowing=windowing)
+        ensure_manifest(store_path, manifest, overwrite=overwrite, **store_kwargs)
         # Temporal fan-out (issue #246 phase 5): one work unit per (shard,
         # window). None (schedule none/absent) keeps the (shard, records)
         # pairs — dispatch byte-identical to pre-windowing runs.
@@ -1844,6 +1865,20 @@ def _run_local(
     # skip it unless output.consolidate_metadata is true.
     if get_consolidate_metadata(config):
         consolidate_metadata(zarr_store, zarr_format=3)
+    # End-of-run manifest backstop (issue #252 hybrid): the manifest already
+    # landed pre-dispatch above; this idempotent re-ensure (a frozen-key-
+    # matching manifest is accepted — no second PUT) self-heals a root whose
+    # manifest was lost mid-run, mirroring the lambda path where the init
+    # write is a retries-0 Event invoke. Unlike the root coverage.moc below
+    # (a regenerable cache, D9), the manifest is REQUIRED reader-facing
+    # schema (D6), so a failed backstop raises.
+    if store_layout == "hive":
+        ensure_manifest(
+            store_path,
+            manifest,
+            overwrite=overwrite,
+            **store_kwargs,
+        )
     wall_time = time.time() - start_time
 
     # End-of-run root coverage.moc (issue #200 phase 3; default-on for hive,
@@ -2122,7 +2157,29 @@ def _run_lambda(
     # so gate the invoke dispatcher-side. When off we hand the executor a no-op
     # finalize (mirroring the temporal path's ``_run_lambda_events``, which has no
     # metadata to consolidate) so no ``mode: "finalize"`` Lambda is dispatched.
-    if get_consolidate_metadata(config):
+    # Hive (issue #252 hybrid): finalize ALWAYS runs — its ensure_manifest
+    # is the idempotent BACKSTOP for the async init-time manifest write (a
+    # retries-0 Event invoke is never redelivered if lost; finalize
+    # self-heals it) — so the consolidate_metadata gate stays flat-only. The
+    # manifest inputs (config + dataset identity from the ShardMap metadata,
+    # the same source as the local path) ride the finalize event; flat
+    # finalize events stay byte-identical.
+    if get_store_layout(config) == "hive":
+        md = catalog_data.get("metadata") or {}
+        dataset = {"short_name": md.get("short_name"), "version": md.get("version")}
+
+        def _finalize_fn():
+            return _invoke_lambda_finalize(
+                state["lambda_client"],
+                function_name,
+                store_path,
+                output_creds_event=output_creds_event,
+                config_dict=config_dict,
+                dataset=dataset,
+                parent_order=parent_order,
+                overwrite=overwrite,
+            )
+    elif get_consolidate_metadata(config):
 
         def _finalize_fn():
             return _invoke_lambda_finalize(
@@ -2146,36 +2203,62 @@ def _run_lambda(
     executor.preflight(len(cells))
     max_workers = state["workers"]
 
-    # Create template via Lambda. The template write happens inside the
-    # function so the orchestrator only needs lambda:InvokeFunction; no
-    # direct S3 access to the output bucket is required (works cleanly
-    # for cross-account callers like CryoCloud).
+    # Create template via Lambda (flat only). The template write happens
+    # inside the function so the orchestrator only needs
+    # lambda:InvokeFunction; no direct S3 access to the output bucket is
+    # required (works cleanly for cross-account callers like CryoCloud).
     # Orchestrator phase brackets (always-on; just time.time() deltas around
     # calls that already happen, so no worker probe tax -- issue #100). They
     # decompose wall time into setup invoke / fan-out / finalize invoke so
     # "where did wall time go" is answerable from the summary.
-    # Hive layout (issue #199 phase 3): setup mode writes morton_hive.json
-    # instead of a global template. The worker builds the manifest itself from
-    # the event's config; only the dataset identity (from the ShardMap
-    # metadata, matching the local path's source) rides in the event — flat
-    # runs omit the key, keeping their setup event byte-identical.
-    dataset = None
-    if get_store_layout(config) == "hive":
-        md = catalog_data.get("metadata") or {}
-        dataset = {"short_name": md.get("short_name"), "version": md.get("version")}
+    # Hive layout (issue #252 hybrid): NO synchronous manifest-writing setup
+    # invoke. First the lightweight ping — fail-fast for a stale deployment
+    # plus the read-only frozen-key precheck (see _invoke_lambda_ping; kept
+    # while flat exists — issue #251) — then the manifest write fires as a
+    # fire-and-forget Event invoke of the existing mode="setup" hive branch
+    # (~10 ms, the root-coverage dispatch precedent below): the manifest
+    # typically lands within seconds of init (best-effort — the Event invoke
+    # shares worker concurrency and runs retries-0, so under throttling or a
+    # dropped invoke the write defers to the finalize backstop), so a reader
+    # can consume completed leaves while the store builds, and finalize's
+    # ensure_manifest demotes to an idempotent backstop. setup_s keeps
+    # bracketing the phase (ping + Event dispatch).
     setup_start = time.time()
-    _invoke_lambda_setup(
-        state["lambda_client"],
-        function_name,
-        store_path,
-        parent_order=parent_order,
-        child_order=child_order,
-        n_parent_cells=len(all_shards) if grid_type == "healpix" and layout == "dense" else None,
-        overwrite=overwrite,
-        config_dict=config_dict,
-        output_creds_event=output_creds_event,
-        dataset=dataset,
-    )
+    if get_store_layout(config) == "hive":
+        _invoke_lambda_ping(
+            state["lambda_client"],
+            function_name,
+            store_path,
+            config_dict=config_dict,
+            dataset=dataset,
+            parent_order=parent_order,
+            overwrite=overwrite,
+            output_creds_event=output_creds_event,
+        )
+        _invoke_lambda_setup_async(
+            state["lambda_client"],
+            function_name,
+            store_path,
+            config_dict=config_dict,
+            dataset=dataset,
+            parent_order=parent_order,
+            overwrite=overwrite,
+            output_creds_event=output_creds_event,
+        )
+    else:
+        _invoke_lambda_setup(
+            state["lambda_client"],
+            function_name,
+            store_path,
+            parent_order=parent_order,
+            child_order=child_order,
+            n_parent_cells=(
+                len(all_shards) if grid_type == "healpix" and layout == "dense" else None
+            ),
+            overwrite=overwrite,
+            config_dict=config_dict,
+            output_creds_event=output_creds_event,
+        )
     setup_s = time.time() - setup_start
 
     start_time = time.time()
@@ -2933,24 +3016,15 @@ def _invoke_lambda_setup(
     overwrite,
     config_dict,
     output_creds_event=None,
-    dataset=None,
 ):
-    """Invoke Lambda in setup mode to create the zarr template.
+    """Invoke Lambda in setup mode to create the zarr template (flat only).
 
-    For a hive-layout config (issue #199 phase 3) the worker writes
-    ``morton_hive.json`` instead; ``dataset`` (``{"short_name", "version"}``
-    from the ShardMap metadata) is threaded through for the manifest's
-    identity block. The key is added only when set, so flat setup events stay
-    byte-identical.
-
-    Stale-deployment guard (review finding, PR #205): a function deployed
-    before phase 3 has no hive branch — it would emit the flat GLOBAL template
-    at the hive root, return the same 200 body, and the whole run would then
-    silently write a flat store. The phase-3 handler echoes the layout it
-    acted on (``"layout"`` in the response body), and a hive dispatch REQUIRES
-    that echo — failing fast at setup with a redeploy message instead of after
-    a full fan-out. Flat dispatch does not require the echo, so a new
-    dispatcher keeps working against old deployed functions for flat runs.
+    Hive runs no longer dispatch setup SYNCHRONOUSLY (issue #252 hybrid):
+    the morton_hive.json write fires as a fire-and-forget Event invoke of
+    the same setup mode instead (``_invoke_lambda_setup_async``), so nothing
+    but the ping runs ahead of the fan-out. The flat setup event is
+    byte-identical to the pre-#199-phase-3 event, so a new dispatcher keeps
+    working against old deployed functions for flat runs.
     """
     event = {
         "mode": "setup",
@@ -2958,6 +3032,113 @@ def _invoke_lambda_setup(
         "parent_order": parent_order,
         "child_order": child_order,
         "n_parent_cells": n_parent_cells,
+        "overwrite": overwrite,
+        "config": config_dict,
+    }
+    if output_creds_event is not None:
+        event["output_credentials"] = output_creds_event
+    response = lambda_client.invoke(
+        FunctionName=function_name,
+        InvocationType="RequestResponse",
+        Payload=json.dumps(event),
+    )
+    payload = response["Payload"].read().decode("utf-8")
+    if response.get("FunctionError"):
+        raise RuntimeError(f"Lambda setup failed: {payload}")
+    result = json.loads(payload)
+    if result.get("statusCode") != 200:
+        raise RuntimeError(f"Lambda setup error: {result.get('body')}")
+
+
+def _invoke_lambda_setup_async(
+    lambda_client,
+    function_name,
+    store_path,
+    *,
+    config_dict,
+    dataset=None,
+    parent_order=None,
+    overwrite=False,
+    output_creds_event=None,
+):
+    """Fire-and-forget hive manifest write at init (issue #252 hybrid).
+
+    One ``InvocationType="Event"`` invoke of the existing ``mode="setup"``
+    hive branch (~10 ms of dispatcher wall, the root-coverage dispatch
+    precedent), posted immediately after the ping passes: the handler runs
+    ``ensure_manifest(build_manifest(...))`` in parallel with the worker
+    fan-out, so ``morton_hive.json`` typically lands within seconds of init
+    (best-effort: the Event invoke shares worker concurrency and runs
+    retries-0 — under throttling or a dropped invoke the write defers to the
+    finalize backstop) and a reader can start consuming completed leaves while
+    the store builds. The event
+    carries the same manifest inputs as the ping/finalize events (``config``
+    + ``parent_order`` + ``dataset`` identity + ``overwrite`` — the retired
+    synchronous hive setup event's shape). No response is read; a lost Event
+    invoke (retries 0, issue #151 hygiene) is self-healed by finalize's
+    idempotent ensure_manifest backstop — see ``_invoke_lambda_finalize``.
+    """
+    event = {
+        "mode": "setup",
+        "store_path": store_path,
+        "parent_order": parent_order,
+        "overwrite": overwrite,
+        "config": config_dict,
+    }
+    if dataset is not None:
+        event["dataset"] = dataset
+    if output_creds_event is not None:
+        event["output_credentials"] = output_creds_event
+    lambda_client.invoke(
+        FunctionName=function_name,
+        InvocationType="Event",
+        Payload=json.dumps(event),
+    )
+
+
+def _invoke_lambda_ping(
+    lambda_client,
+    function_name,
+    store_path,
+    *,
+    config_dict,
+    dataset=None,
+    parent_order=None,
+    overwrite=False,
+    output_creds_event=None,
+):
+    """Pre-fan-out fail-fast ping for hive dispatch (issue #252).
+
+    One lightweight RequestResponse invoke, decoupled from the manifest WRITE
+    (which fires right after this ping as an async Event invoke of the setup
+    mode — issue #252 hybrid). Two failure modes are caught before any worker
+    is dispatched:
+
+    - **Stale deployment:** a function that predates the issue #252 hive
+      lifecycle has no ping mode, so the event falls through to its process
+      handler's 400 with ZERO writes — strictly earlier and cheaper than the
+      retired PR #205 layout-echo guard, which only fired after a
+      pre-#199-phase-3 function had already written the flat GLOBAL template
+      at the hive root. This also gates out hive-capable-but-pre-#252
+      functions, which lack this precheck and finalize's manifest backstop.
+    - **Incompatible existing store:** the handler runs the read-only
+      ``zagg.hive.validate_manifest`` against the event's manifest inputs
+      (same keys as hive setup/finalize), so a frozen-key mismatch — or an
+      overwrite into a root with shard data — refuses up front (D2) instead
+      of after the fan-out (PR #255 review fold). This covers sequential
+      reruns; two CONCURRENT runs racing into the same fresh root both pass
+      here, but with the manifest landing seconds after init (the async
+      setup invoke) the loser's collision window shrinks from run-length to
+      seconds. Same last-writer caveat the manifest write itself has always
+      had.
+
+    Kept while flat exists (issue #251): once flat is removed, a stale
+    function just errors and the ping can be dropped.
+    """
+    event = {
+        "mode": "ping",
+        "store_path": store_path,
+        "parent_order": parent_order,
         "overwrite": overwrite,
         "config": config_dict,
     }
@@ -2972,28 +3153,67 @@ def _invoke_lambda_setup(
     )
     payload = response["Payload"].read().decode("utf-8")
     if response.get("FunctionError"):
-        raise RuntimeError(f"Lambda setup failed: {payload}")
+        raise RuntimeError(f"Lambda ping failed: {payload}")
     result = json.loads(payload)
     if result.get("statusCode") != 200:
-        raise RuntimeError(f"Lambda setup error: {result.get('body')}")
-    requested = ((config_dict or {}).get("output") or {}).get("store_layout") or "flat"
-    if requested == "hive":
         try:
-            echoed = json.loads(result.get("body") or "{}").get("layout")
+            body = json.loads(result.get("body") or "{}")
         except (TypeError, ValueError):
-            echoed = None
-        if echoed != "hive":
+            body = {}
+        if body.get("mode") == "ping":
+            # The deployed function KNOWS ping — this is validate_manifest
+            # refusing the store, not a stale deployment.
             raise RuntimeError(
-                f"Lambda setup did not confirm the hive store layout (response body "
-                f"{result.get('body')!r}): the deployed function predates issue #199 "
-                f"phase 3 and would write a FLAT store at the hive root — redeploy "
-                f"the function before dispatching hive runs"
+                f"Lambda ping refused the store at {store_path}: "
+                f"{body.get('error')!r} — the store was templated for a "
+                f"different configuration; clear the store root (or pick a "
+                f"new one) before dispatching this run"
             )
+        raise RuntimeError(
+            f"Lambda ping failed (response body {result.get('body')!r}): the "
+            f"deployed function predates the issue #252 hive dispatch "
+            f"lifecycle — redeploy the function before dispatching hive runs"
+        )
+    try:
+        version = json.loads(result.get("body") or "{}").get("zagg_version")
+    except (TypeError, ValueError):
+        version = None
+    logger.info(f"Hive preflight OK (function zagg version {version})")
 
 
-def _invoke_lambda_finalize(lambda_client, function_name, store_path, output_creds_event=None):
-    """Invoke Lambda in finalize mode to consolidate zarr metadata."""
+def _invoke_lambda_finalize(
+    lambda_client,
+    function_name,
+    store_path,
+    output_creds_event=None,
+    *,
+    config_dict=None,
+    dataset=None,
+    parent_order=None,
+    overwrite=False,
+):
+    """Invoke Lambda in finalize mode.
+
+    Flat: consolidates zarr metadata — the event stays byte-identical to the
+    pre-#252 one. Hive (issue #252 hybrid): the event additionally carries
+    the manifest inputs (``config`` + ``parent_order`` + ``dataset`` identity
+    + ``overwrite``, mirroring the hive setup event) and the worker's
+    ``ensure_manifest`` acts as the idempotent BACKSTOP for the async
+    init-time write — a frozen-key-matching existing manifest is accepted, no
+    second PUT. The backstop is load-bearing: worker Event invokes run with
+    retries 0 (template.yaml EventInvokeConfig, issue #151 hygiene), so a
+    lost async init write is never redelivered — finalize self-heals it;
+    symmetrically, finalize failure is no longer load-bearing for manifest
+    existence. The manifest is REQUIRED reader-facing schema (D6), so a
+    non-200 still raises — unlike the fail-open root coverage.moc (D9).
+    """
     event = {"mode": "finalize", "store_path": store_path}
+    if config_dict is not None:
+        event["config"] = config_dict
+        event["parent_order"] = parent_order
+        event["overwrite"] = overwrite
+        if dataset is not None:
+            event["dataset"] = dataset
     if output_creds_event is not None:
         event["output_credentials"] = output_creds_event
     response = lambda_client.invoke(

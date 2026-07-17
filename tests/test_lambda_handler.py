@@ -1276,6 +1276,153 @@ class TestSetupHive:
         assert handler_mod._handle_setup(self._event(tmp_path, cfg))["statusCode"] == 200
 
 
+class TestFinalizeHive:
+    """Issue #252 (hybrid): for a hive config, finalize mode re-ensures the
+    root ``morton_hive.json`` — the idempotent backstop for the async
+    init-time setup write, so a manifest absent at finalize (a lost retries-0
+    Event invoke) still ends up written — with the same frozen-key resume
+    semantics as setup; a flat finalize event (no ``config`` key) still goes
+    down the consolidation path."""
+
+    def _event(self, tmp_path, config_dict, **extra):
+        return {
+            "mode": "finalize",
+            "store_path": str(tmp_path / "hive-out"),
+            "parent_order": 6,
+            "overwrite": False,
+            "config": config_dict,
+            "dataset": {"short_name": "ATL06", "version": "007"},
+            **extra,
+        }
+
+    def test_finalize_writes_manifest_only(self, handler_mod, tmp_path):
+        import os
+
+        from zagg import hive
+
+        event = self._event(tmp_path, TestProcessHive._hive_config_dict())
+        resp = handler_mod._handle_finalize(event)
+        assert resp["statusCode"] == 200, resp["body"]
+        # The success body echoes the layout acted on, matching setup's echo.
+        assert json.loads(resp["body"])["layout"] == "hive"
+
+        manifest = hive.read_manifest(event["store_path"])
+        assert manifest["spec"] == "morton-hive/1"
+        assert manifest["dataset"] == {"short_name": "ATL06", "version": "007"}
+        assert manifest["shard_order"] == 6
+        assert manifest["cell_order"] == 12
+        # The manifest is the ONLY object: no consolidated zarr metadata.
+        assert sorted(os.listdir(event["store_path"])) == [hive.MANIFEST_NAME]
+
+    def test_finalize_windowed_declares_v2_manifest(self, handler_mod, tmp_path):
+        from zagg import hive
+
+        event = self._event(tmp_path, TestProcessHiveWindowed._windowed_config_dict())
+        resp = handler_mod._handle_finalize(event)
+        assert resp["statusCode"] == 200, resp["body"]
+        manifest = hive.read_manifest(event["store_path"])
+        assert manifest["spec"] == "morton-hive/2"
+        assert manifest["temporal"]["schedule"] == "yearly"
+
+    def test_finalize_frozen_key_mismatch_is_500(self, handler_mod, tmp_path):
+        cfg = TestProcessHive._hive_config_dict()
+        assert handler_mod._handle_finalize(self._event(tmp_path, cfg))["statusCode"] == 200
+        # A re-finalize with different orders must fail with the pointed
+        # remedy, matching ensure_manifest's semantics at setup time.
+        other = TestProcessHive._hive_config_dict()
+        other["output"]["grid"]["parent_order"] = 5
+        resp = handler_mod._handle_finalize(self._event(tmp_path, other))
+        assert resp["statusCode"] == 500
+        assert "clear the store root" in json.loads(resp["body"])["error"]
+
+    def test_finalize_rerun_with_matching_config_resumes(self, handler_mod, tmp_path):
+        cfg = TestProcessHive._hive_config_dict()
+        assert handler_mod._handle_finalize(self._event(tmp_path, cfg))["statusCode"] == 200
+        assert handler_mod._handle_finalize(self._event(tmp_path, cfg))["statusCode"] == 200
+
+    def test_flat_event_still_consolidates(self, handler_mod, monkeypatch, tmp_path):
+        # No "config" key -> the pre-#252 consolidation path, untouched.
+        import zarr
+
+        calls = []
+        monkeypatch.setattr(handler_mod, "open_store", lambda *a, **k: object())
+        monkeypatch.setattr(zarr, "consolidate_metadata", lambda store, **k: calls.append(store))
+        resp = handler_mod._handle_finalize(
+            {"mode": "finalize", "store_path": str(tmp_path / "flat.zarr")}
+        )
+        assert resp["statusCode"] == 200, resp["body"]
+        assert "layout" not in json.loads(resp["body"])
+        assert len(calls) == 1
+
+
+class TestPingMode:
+    """Issue #252: the hive pre-fan-out preflight. Answering 200 at all gates
+    the deployment generation (a pre-fold function 400s the unknown mode via
+    its process handler — zero writes); the body echoes the zagg version; and
+    the read-only validate_manifest refuses an incompatible existing store
+    BEFORE the fan-out (PR #255 review fold)."""
+
+    def _event(self, tmp_path, config_dict, **extra):
+        return {
+            "mode": "ping",
+            "store_path": str(tmp_path / "hive-out"),
+            "parent_order": 6,
+            "overwrite": False,
+            "config": config_dict,
+            "dataset": {"short_name": "ATL06", "version": "007"},
+            **extra,
+        }
+
+    def test_ping_fresh_root_is_200_and_writes_nothing(self, handler_mod, tmp_path):
+        import os
+
+        import zagg
+        from zagg import hive
+
+        event = self._event(tmp_path, TestProcessHive._hive_config_dict())
+        resp = handler_mod._handle_ping(event)
+        assert resp["statusCode"] == 200, resp["body"]
+        body = json.loads(resp["body"])
+        assert body["mode"] == "ping"
+        assert body["zagg_version"] == zagg.__version__
+        # Read-only: the preflight never writes the manifest (or anything).
+        assert not os.path.exists(os.path.join(event["store_path"], hive.MANIFEST_NAME))
+
+    def test_ping_matching_existing_store_resumes(self, handler_mod, tmp_path):
+        cfg = TestProcessHive._hive_config_dict()
+        assert handler_mod._handle_finalize(self._event(tmp_path, cfg))["statusCode"] == 200
+        assert handler_mod._handle_ping(self._event(tmp_path, cfg))["statusCode"] == 200
+
+    def test_ping_frozen_key_mismatch_is_500(self, handler_mod, tmp_path):
+        # The D2 writer-side guard, now firing BEFORE the fan-out: a store
+        # templated for different orders refuses at ping time.
+        cfg = TestProcessHive._hive_config_dict()
+        assert handler_mod._handle_finalize(self._event(tmp_path, cfg))["statusCode"] == 200
+        other = TestProcessHive._hive_config_dict()
+        other["output"]["grid"]["parent_order"] = 5
+        resp = handler_mod._handle_ping(self._event(tmp_path, other))
+        assert resp["statusCode"] == 500
+        assert "does not match this run" in json.loads(resp["body"])["error"]
+
+    def test_ping_routes_from_lambda_handler(self, handler_mod):
+        # The dispatch seam: mode="ping" answers 200 with no store touched —
+        # the versioning half of the guard needs nothing but the deployment.
+        resp = handler_mod.lambda_handler({"mode": "ping"}, _context())
+        assert resp["statusCode"] == 200, resp["body"]
+        assert json.loads(resp["body"])["mode"] == "ping"
+
+    def test_ping_event_400s_on_pre_fold_process_handler(self, handler_mod, tmp_path):
+        # What a STALE deployment does with the ping: no ping branch, so the
+        # event lands in the process handler, which rejects the key-less
+        # event with a 400 and writes nothing — the dispatcher's fail-fast.
+        import os
+
+        event = self._event(tmp_path, TestProcessHive._hive_config_dict())
+        resp = handler_mod._handle_process(event, _context())
+        assert resp["statusCode"] == 400
+        assert not os.path.exists(event["store_path"])
+
+
 class TestSetupTemplate:
     """Issue #99: the setup handler used to hand-build the HEALPix grid and drop
     ``chunk_inner``, so the template was chunked at ``parent_order`` while workers

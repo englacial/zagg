@@ -228,6 +228,27 @@ class TestManifest:
     def test_read_absent_returns_none(self, tmp_path):
         assert hive.read_manifest(str(tmp_path / "empty")) is None
 
+    def test_validate_fresh_root_returns_none_and_writes_nothing(self, cfg, tmp_path):
+        # The read-only precheck (issue #252): a fresh root has nothing to
+        # match, returns None, and must NOT write the manifest — that stays
+        # for the finalize ensure_manifest.
+        root = str(tmp_path / "store")
+        assert hive.validate_manifest(root, hive.build_manifest(self._grid(cfg))) is None
+        assert hive.read_manifest(root) is None
+
+    def test_validate_matching_returns_existing(self, cfg, tmp_path):
+        root = str(tmp_path / "store")
+        grid = self._grid(cfg)
+        written = hive.ensure_manifest(root, hive.build_manifest(grid))
+        assert hive.validate_manifest(root, hive.build_manifest(grid)) == written
+
+    def test_validate_mismatch_raises(self, cfg, tmp_path):
+        root = str(tmp_path / "store")
+        hive.ensure_manifest(root, hive.build_manifest(self._grid(cfg)))
+        other = HealpixGrid(parent_order=5, child_order=8, layout="fullsphere", config=cfg)
+        with pytest.raises(ValueError, match="does not match this run"):
+            hive.validate_manifest(root, hive.build_manifest(other))
+
 
 # ── leaf template + commit stamp (D3/D4) ─────────────────────────────────────
 
@@ -866,6 +887,186 @@ class TestProcessAndWriteHiveSharded:
                 assert outs["on"][rel] == outs["off"][rel], rel
 
 
+class TestHiveProfileWritePhase:
+    """Issue #249 (PR #256): opt-in ``profile`` adds an additive ``write``
+    phase to the hive worker's ``phase_timings``, next to process_shard's
+    read/index/aggregate — the same split the flat Lambda handler has carried
+    since issue #100. Default off: zero timing calls and byte-identical
+    output."""
+
+    _grid = TestProcessAndWriteHive._grid
+    _carrier = TestProcessAndWriteHive._carrier
+    _meta = TestProcessAndWriteHive._meta
+
+    # The read/index/aggregate values the profiled process_shard fake seeds,
+    # so tests can pin that the write split leaves them untouched.
+    _SHARD_PHASES = {"read": 1.0, "index": 0.5, "aggregate": 0.25}
+
+    def _profiled_fake(self, grid, ragged=None, error=None):
+        """Streaming fake honoring the real profile contract: seeds
+        ``metadata['phase_timings']`` only when ``profile=True`` arrives."""
+
+        def fake(g, shard_key, urls, **kwargs):
+            meta = self._meta(shard_key, error=error)
+            if kwargs.get("profile"):
+                meta["phase_timings"] = dict(self._SHARD_PHASES)
+            if error is None:
+                carrier = self._carrier(grid, shard_key)
+                kwargs["write_chunk"](grid.block_index(int(shard_key)), carrier, ragged or {})
+            return pd.DataFrame(), meta
+
+        return fake
+
+    def _run(self, monkeypatch, cfg, tmp_path, fake, *, profile=False, name="store"):
+        import zagg.processing as processing
+
+        monkeypatch.setattr(processing, "process_shard", fake)
+        grid = self._grid(cfg)
+        shard = _shard_word()
+        root = str(tmp_path / name)
+        meta = hive.process_and_write_hive(
+            shard,
+            ["s3://bucket/granule1.h5"],
+            grid,
+            {},
+            root,
+            cfg,
+            store_kwargs={},
+            profile=profile,
+        )
+        return grid, shard, root, meta
+
+    def test_profile_adds_nonnegative_write_phase(self, monkeypatch, cfg, tmp_path):
+        fake = self._profiled_fake(self._grid(cfg), ragged={"h": ([np.array([1.0, 2.0])], [0])})
+        _grid, _shard, _root, meta = self._run(monkeypatch, cfg, tmp_path, fake, profile=True)
+        timings = meta["phase_timings"]
+        # Additive: the process_shard phases keep their names and values.
+        assert set(timings) == {"read", "index", "aggregate", "write"}
+        assert {k: timings[k] for k in self._SHARD_PHASES} == self._SHARD_PHASES
+        assert timings["write"] >= 0.0
+
+    def test_sharded_leaf_write_counted(self, monkeypatch, cfg, tmp_path):
+        # K>1 sharded: the single post-stream write_leaf_to_zarr pass lands in
+        # the same write bucket.
+        import zagg.processing as processing
+
+        sharded_helper = TestProcessAndWriteHiveSharded()
+        grid = sharded_helper._grid(cfg)
+
+        def meta_with_phases(shard_key, error=None):
+            meta = self._meta(shard_key, error=error)
+            meta["phase_timings"] = dict(self._SHARD_PHASES)
+            return meta
+
+        fake = _sharded_accumulate_fake(grid, sharded_helper._chunk_carrier, meta_with_phases)
+        monkeypatch.setattr(processing, "process_shard", fake)
+        shard = _shard_word()
+        meta = hive.process_and_write_hive(
+            shard,
+            ["s3://b/g1.h5"],
+            grid,
+            {},
+            str(tmp_path / "store"),
+            cfg,
+            store_kwargs={},
+            profile=True,
+        )
+        assert meta["phase_timings"]["write"] >= 0.0
+        assert set(meta["phase_timings"]) == {"read", "index", "aggregate", "write"}
+
+    def test_errored_shard_omits_write(self, monkeypatch, cfg, tmp_path):
+        # Same gate as the flat handler (issue #100): a shard that wrote no
+        # leaf carries no write phase — read/index/aggregate stay as reported.
+        fake = self._profiled_fake(self._grid(cfg), error="No granules found")
+        _grid, _shard, root, meta = self._run(monkeypatch, cfg, tmp_path, fake, profile=True)
+        assert meta["phase_timings"] == self._SHARD_PHASES
+        assert "write" not in meta["phase_timings"]
+
+    def test_default_path_makes_no_timing_calls(self, monkeypatch, cfg, tmp_path):
+        # The issue #249 zero-overhead gate, hive edition: without profile the
+        # write path must never call time.time(). Rebind hive.py's module-level
+        # ``time`` name to a booby trap — only this module's calls are caught.
+        class _Boom:
+            @staticmethod
+            def time():
+                raise AssertionError("time.time() called on the unprofiled hive write path")
+
+        monkeypatch.setattr(hive, "time", _Boom)
+        fake = self._profiled_fake(self._grid(cfg), ragged={"h": ([np.array([1.0, 2.0])], [0])})
+        _grid, shard, root, meta = self._run(monkeypatch, cfg, tmp_path, fake)
+        assert "phase_timings" not in meta
+        # The leaf still landed, fully stamped.
+        from zagg.store import open_store
+
+        leaf = hive.shard_leaf_path(root, shard)
+        assert hive.read_commit(open_store(leaf))["complete"] is True
+
+    def test_sharded_default_path_makes_no_timing_calls(self, monkeypatch, cfg, tmp_path):
+        # Sharded edition of the trap (review finding): the post-stream
+        # write_leaf_to_zarr bracket must also make zero time.time() calls
+        # when profile is off — the streaming trap above never executes it.
+        import zagg.processing as processing
+
+        class _Boom:
+            @staticmethod
+            def time():
+                raise AssertionError("time.time() called on the unprofiled sharded write path")
+
+        monkeypatch.setattr(hive, "time", _Boom)
+        sharded_helper = TestProcessAndWriteHiveSharded()
+        grid = sharded_helper._grid(cfg)
+        fake = _sharded_accumulate_fake(grid, sharded_helper._chunk_carrier, self._meta)
+        monkeypatch.setattr(processing, "process_shard", fake)
+        shard = _shard_word()
+        root = str(tmp_path / "store")
+        meta = hive.process_and_write_hive(
+            shard, ["s3://b/g1.h5"], grid, {}, root, cfg, store_kwargs={}
+        )
+        assert "phase_timings" not in meta
+        # The sharded leaf still landed, fully stamped.
+        from zagg.store import open_store
+
+        leaf = hive.shard_leaf_path(root, shard)
+        assert hive.read_commit(open_store(leaf))["complete"] is True
+
+    def test_profiled_leaf_bytes_match_unprofiled(self, monkeypatch, cfg, tmp_path):
+        # Parity: profiling changes the returned metadata only — the leaf's
+        # file set and bytes are identical (stamp compared modulo timestamp),
+        # the same comparison the K==1 sharded no-op test pins.
+        grid_probe = self._grid(cfg)
+        ragged = {"h": ([np.array([1.0, 2.0])], [0])}
+        outs: dict = {}
+        leaves: dict = {}
+        for tag, profile in (("on", True), ("off", False)):
+            fake = self._profiled_fake(grid_probe, ragged=ragged)
+            _grid, shard, root, meta = self._run(
+                monkeypatch, cfg, tmp_path, fake, profile=profile, name=tag
+            )
+            leaf = hive.shard_leaf_path(root, shard)
+            leaves[tag] = meta
+            files = {}
+            for dirpath, _dirs, filenames in os.walk(leaf):
+                for f in filenames:
+                    p = os.path.join(dirpath, f)
+                    with open(p, "rb") as fh:
+                        files[os.path.relpath(p, leaf)] = fh.read()
+            outs[tag] = files
+        assert sorted(outs["on"]) == sorted(outs["off"])
+        for rel in outs["on"]:
+            if rel == "zarr.json":
+                on = json.loads(outs["on"][rel])
+                off = json.loads(outs["off"][rel])
+                on["attributes"][hive.COMMIT_ATTR].pop("written_at")
+                off["attributes"][hive.COMMIT_ATTR].pop("written_at")
+                assert on == off
+            else:
+                assert outs["on"][rel] == outs["off"][rel], rel
+        # And the metadata differs ONLY by the phase_timings sub-dict.
+        on_meta = {k: v for k, v in leaves["on"].items() if k != "phase_timings"}
+        assert on_meta == leaves["off"]
+        assert "phase_timings" not in leaves["off"]
+
+
 class TestLeafBlockIndex:
     def test_k1_maps_to_zero(self, cfg):
         g = HealpixGrid(6, 8, layout="fullsphere", config=cfg)
@@ -883,8 +1084,11 @@ class TestLeafBlockIndex:
 
 class TestRunnerWiring:
     """The local backend writes the manifest (no shared template) under hive;
-    the lambda backend dispatches hive runs (issue #199 phase 3), threading
-    the manifest's dataset identity through the setup invoke."""
+    the lambda backend dispatches hive runs (issue #199 phase 3). Manifest
+    lifecycle (issue #252 hybrid): the write lands at INIT — directly on the
+    local path, as a fire-and-forget Event invoke of the setup mode right
+    after the ping on the lambda path — and finalize re-ensures it as an
+    idempotent backstop."""
 
     def _catalog(self, tmp_path):
         shard = _shard_word()
@@ -904,7 +1108,7 @@ class TestRunnerWiring:
         p.write_text(json.dumps(catalog))
         return str(p), shard
 
-    def test_local_hive_writes_manifest_not_template(self, monkeypatch, cfg, tmp_path):
+    def test_local_hive_writes_manifest_before_cells(self, monkeypatch, cfg, tmp_path):
         from zagg import runner
         from zagg.runner import agg
 
@@ -916,6 +1120,10 @@ class TestRunnerWiring:
         monkeypatch.setattr(runner, "get_nsidc_s3_credentials", lambda: {"accessKeyId": "a"})
 
         def fake_hive_write(shard_key, granule_urls, grid, s3_creds, store_root, config, **kw):
+            # The manifest lands at init (issue #252 hybrid): by the time any
+            # cell runs it is already at the root, so a reader can consume
+            # completed leaves while the store builds.
+            assert os.path.exists(os.path.join(store_root, hive.MANIFEST_NAME))
             calls.append((int(shard_key), store_root))
             return {"shard_key": int(shard_key), "error": None, "total_obs": 1}
 
@@ -923,11 +1131,77 @@ class TestRunnerWiring:
         agg(cfg, catalog=catalog_path, store=root, backend="local")
 
         assert calls == [(shard, root)]
-        # Template time wrote ONLY the manifest — no shared zarr template
-        # (D5). The end-of-run root coverage.moc (issue #200 phase 3,
+        # The run wrote ONLY the manifest at the root — no shared zarr
+        # template (D5). The root coverage.moc (issue #200 phase 3,
         # default-on for hive) is the only other root object.
         assert sorted(os.listdir(root)) == [hive.ROOT_COVERAGE_NAME, hive.MANIFEST_NAME]
         assert hive.read_manifest(root)["shard_order"] == 6
+
+    def test_local_hive_finalize_backstop_restores_lost_manifest(self, monkeypatch, cfg, tmp_path):
+        # Issue #252 hybrid: the init-time write is primary, but finalize
+        # keeps ensure_manifest as an idempotent backstop — a manifest lost
+        # mid-run (simulated by deleting it inside the cell) is back at the
+        # root by end of run.
+        from zagg import runner
+        from zagg.runner import agg
+
+        cfg.output["store_layout"] = "hive"
+        catalog_path, shard = self._catalog(tmp_path)
+        root = str(tmp_path / "out")
+
+        monkeypatch.setattr(runner, "get_nsidc_s3_credentials", lambda: {"accessKeyId": "a"})
+        removed = []
+
+        def fake_hive_write(shard_key, granule_urls, grid, s3_creds, store_root, config, **kw):
+            # The init write is PRIMARY, so the manifest must already be at the
+            # root when a cell runs — assert THEN remove, recording it. A
+            # regressed init write (assert fails) or a swallowed
+            # FileNotFoundError leaves ``removed`` empty, so the post-run check
+            # below fails loudly instead of staying green on finalize alone
+            # (``_cell_work`` swallows cell exceptions into an error envelope).
+            path = os.path.join(store_root, hive.MANIFEST_NAME)
+            assert os.path.exists(path)
+            os.remove(path)
+            removed.append(True)
+            return {"shard_key": int(shard_key), "error": None, "total_obs": 1}
+
+        monkeypatch.setattr(hive, "process_and_write_hive", fake_hive_write)
+        agg(cfg, catalog=catalog_path, store=root, backend="local")
+        # The cell saw the init-written manifest and removed it (init→lost);
+        # finalize restored it (lost→restored).
+        assert removed == [True]
+        assert hive.read_manifest(root)["shard_order"] == 6
+
+    def test_local_hive_rerun_frozen_key_mismatch_fails_before_dispatch(
+        self, monkeypatch, cfg, tmp_path
+    ):
+        # The manifest write runs at init (issue #252 hybrid) and
+        # ensure_manifest runs the validate_manifest frozen-key precheck
+        # first: a rerun into a root templated for DIFFERENT orders
+        # (shard_order 5 vs the catalog's 6) must refuse BEFORE any cell
+        # runs — not after fan-out has already mixed new-order leaves into
+        # the old-order store (D2).
+        from zagg import runner
+        from zagg.runner import agg
+
+        cfg.output["store_layout"] = "hive"
+        catalog_path, shard = self._catalog(tmp_path)
+        root = str(tmp_path / "out")
+        other = HealpixGrid(parent_order=5, child_order=12, layout="fullsphere", config=cfg)
+        hive.ensure_manifest(root, hive.build_manifest(other))
+
+        monkeypatch.setattr(runner, "get_nsidc_s3_credentials", lambda: {"accessKeyId": "a"})
+        calls = []
+
+        def fake_hive_write(*args, **kw):
+            calls.append(args)
+            return {"error": None, "total_obs": 1}
+
+        monkeypatch.setattr(hive, "process_and_write_hive", fake_hive_write)
+        with pytest.raises(ValueError, match="clear the store root"):
+            agg(cfg, catalog=catalog_path, store=root, backend="local")
+        # Fail-fast: the precheck raised before dispatch, so no cell ran.
+        assert calls == []
 
     def test_local_hive_sharded_leaf_single_object(self, monkeypatch, cfg, tmp_path):
         """Issue #236 through the LOCAL dispatcher: a sharded K>1 hive run
@@ -979,11 +1253,14 @@ class TestRunnerWiring:
             assert n_objects == 1, name
         assert hive.read_commit(open_store(leaf))["complete"] is True
 
-    def test_lambda_hive_dispatches_with_manifest_dataset(self, monkeypatch, cfg, tmp_path):
-        # Issue #199 phase 3: hive is wired to the lambda backend. The setup
-        # invoke carries the manifest's dataset identity (from the ShardMap
-        # metadata, same source as the local path) and the per-cell events need
-        # NO new keys — the worker derives everything from the config dict.
+    def test_lambda_hive_fires_async_setup_after_ping(self, monkeypatch, cfg, tmp_path):
+        # Issue #252 hybrid: a hive lambda run dispatches NO synchronous
+        # setup invoke. The lifecycle is ping (fail-fast, both guards) →
+        # async Event setup (the manifest write, before any worker fan-out
+        # → progressive reads) → workers → finalize (idempotent backstop,
+        # which runs even with consolidate_metadata off — the default) and
+        # carries the same manifest inputs. Per-cell events need NO new
+        # keys — the worker derives everything from the config dict.
         from unittest.mock import MagicMock
 
         import boto3
@@ -995,6 +1272,7 @@ class TestRunnerWiring:
         cfg.output["store_layout"] = "hive"
         catalog_path, shard = self._catalog(tmp_path)
         captured: dict = {}
+        order: list = []
 
         monkeypatch.setattr(
             runner,
@@ -1017,12 +1295,21 @@ class TestRunnerWiring:
                 ),
             ),
         )
-        monkeypatch.setattr(
-            runner, "_invoke_lambda_setup", lambda *a, **kw: captured.update(setup=kw)
-        )
-        monkeypatch.setattr(runner, "_invoke_lambda_finalize", lambda *a, **k: None)
+
+        def _capture(name):
+            def _f(*a, **kw):
+                order.append(name)
+                captured[name] = kw
+
+            return _f
+
+        monkeypatch.setattr(runner, "_invoke_lambda_setup", _capture("setup"))
+        monkeypatch.setattr(runner, "_invoke_lambda_setup_async", _capture("setup_async"))
+        monkeypatch.setattr(runner, "_invoke_lambda_finalize", _capture("finalize"))
+        monkeypatch.setattr(runner, "_invoke_lambda_ping", _capture("ping"))
 
         def fake_cell(client, chunk_idx, shard_key, *a, **k):
+            order.append("cell")
             captured["cell_shard_key"] = shard_key
             return {
                 "status_code": 200,
@@ -1035,14 +1322,27 @@ class TestRunnerWiring:
         monkeypatch.setattr(runner, "_invoke_lambda_cell", fake_cell)
         agg(cfg, catalog=catalog_path, store="s3://out/product", backend="lambda")
 
-        assert captured["setup"]["dataset"] == {"short_name": "ATL06", "version": "007"}
+        # NO synchronous setup invoke; the manifest write (async setup) fires
+        # AFTER the ping passes and BEFORE any worker — so the manifest lands
+        # seconds into the run — and finalize backstops it at the end.
+        assert "setup" not in captured
+        assert order == ["ping", "setup_async", "cell", "finalize"]
+        assert captured["ping"]["dataset"] == {"short_name": "ATL06", "version": "007"}
+        assert captured["ping"]["config_dict"]["output"]["store_layout"] == "hive"
+        # The async setup carries the same manifest inputs as ping/finalize.
+        assert captured["setup_async"]["dataset"] == {"short_name": "ATL06", "version": "007"}
+        assert captured["setup_async"]["config_dict"]["output"]["store_layout"] == "hive"
+        assert captured["setup_async"]["parent_order"] == 6
+        assert captured["finalize"]["dataset"] == {"short_name": "ATL06", "version": "007"}
         # store_layout rides in the config dict already serialized into events.
-        assert captured["setup"]["config_dict"]["output"]["store_layout"] == "hive"
+        assert captured["finalize"]["config_dict"]["output"]["store_layout"] == "hive"
         # The per-cell event schema is unchanged: shard_key stays the packed int.
         assert captured["cell_shard_key"] == shard
 
-    def test_lambda_flat_setup_omits_dataset(self, monkeypatch, cfg, tmp_path):
-        # Flat runs keep their setup call byte-identical: dataset stays None.
+    def test_lambda_flat_setup_and_finalize_unchanged(self, monkeypatch, cfg, tmp_path):
+        # Flat runs keep the pre-#252 lifecycle: the setup invoke still runs
+        # (no dataset threading — that was hive-only and left with the fold)
+        # and finalize stays gated on consolidate_metadata (off by default).
         from unittest.mock import MagicMock
 
         import boto3
@@ -1078,7 +1378,9 @@ class TestRunnerWiring:
         monkeypatch.setattr(
             runner, "_invoke_lambda_setup", lambda *a, **kw: captured.update(setup=kw)
         )
-        monkeypatch.setattr(runner, "_invoke_lambda_finalize", lambda *a, **k: None)
+        monkeypatch.setattr(
+            runner, "_invoke_lambda_finalize", lambda *a, **kw: captured.update(finalize=kw)
+        )
         monkeypatch.setattr(
             runner,
             "_invoke_lambda_cell",
@@ -1090,31 +1392,43 @@ class TestRunnerWiring:
                 "shard_key": shard,
             },
         )
+        monkeypatch.setattr(
+            runner, "_invoke_lambda_ping", lambda *a, **kw: captured.update(ping=kw)
+        )
+        monkeypatch.setattr(
+            runner, "_invoke_lambda_setup_async", lambda *a, **kw: captured.update(setup_async=kw)
+        )
         agg(cfg, catalog=catalog_path, store="s3://out/x.zarr", backend="lambda")
-        assert captured["setup"]["dataset"] is None
+        assert "dataset" not in captured["setup"]
+        assert "finalize" not in captured
+        assert "ping" not in captured
+        # The async manifest write is hive-only (issue #252 hybrid).
+        assert "setup_async" not in captured
+
+
+def _wire_client(body: dict, status_code: int = 200):
+    """Mocked boto3 lambda client capturing ``Payload`` on the wire."""
+    from unittest.mock import MagicMock
+
+    payload = MagicMock()
+    payload.read.return_value = json.dumps(
+        {"statusCode": status_code, "body": json.dumps(body)}
+    ).encode()
+    client = MagicMock()
+    client.invoke.return_value = {"Payload": payload, "FunctionError": None}
+    return client
 
 
 class TestInvokeLambdaSetupEvent:
-    """Pin the ACTUAL setup event on the wire and the stale-deployment guard
-    (review findings, PR #205). The dispatch tests above monkeypatch
-    ``_invoke_lambda_setup`` at kwarg level, so the event-shaping conditional
-    (``dataset`` added only when set) and the layout-echo assertion are
-    exercised here directly, with a mocked boto3 client capturing ``Payload``."""
+    """Pin the ACTUAL setup events on the wire. The synchronous invoke is
+    flat-only now (issue #252 moved the hive manifest write to an async
+    Event invoke of the same setup mode, and the PR #205 layout-echo guard
+    into the version ping): pin flat byte-identity against pre-phase-3
+    deployed functions, and the hive async event + its fire-and-forget
+    InvocationType."""
 
     @staticmethod
-    def _client(body: dict):
-        from unittest.mock import MagicMock
-
-        payload = MagicMock()
-        payload.read.return_value = json.dumps(
-            {"statusCode": 200, "body": json.dumps(body)}
-        ).encode()
-        client = MagicMock()
-        client.invoke.return_value = {"Payload": payload, "FunctionError": None}
-        return client
-
-    @staticmethod
-    def _invoke(client, config_dict, dataset=None):
+    def _invoke(client, config_dict):
         from zagg.runner import _invoke_lambda_setup
 
         _invoke_lambda_setup(
@@ -1126,21 +1440,14 @@ class TestInvokeLambdaSetupEvent:
             n_parent_cells=None,
             overwrite=False,
             config_dict=config_dict,
-            dataset=dataset,
         )
         return json.loads(client.invoke.call_args.kwargs["Payload"])
 
-    def test_hive_event_carries_dataset(self, cfg):
-        cfg.output["store_layout"] = "hive"
-        client = self._client({"ok": True, "mode": "setup", "layout": "hive"})
-        event = self._invoke(client, asdict(cfg), dataset={"short_name": "ATL06", "version": "007"})
-        assert event["dataset"] == {"short_name": "ATL06", "version": "007"}
-
-    def test_flat_event_omits_dataset_and_matches_baseline(self, cfg):
+    def test_flat_event_matches_baseline(self, cfg):
         # The byte-identity claim, pinned on the wire: no "dataset" key, and
         # the event is exactly the pre-phase-3 flat setup event.
         config_dict = asdict(cfg)
-        client = self._client({"ok": True, "mode": "setup", "layout": "flat"})
+        client = _wire_client({"ok": True, "mode": "setup", "layout": "flat"})
         event = self._invoke(client, config_dict)
         assert "dataset" not in event
         assert event == {
@@ -1156,21 +1463,182 @@ class TestInvokeLambdaSetupEvent:
     def test_flat_without_layout_echo_unaffected(self, cfg):
         # Old deployed functions return the echo-less body: flat dispatch must
         # keep working against them.
-        self._invoke(self._client({"ok": True, "mode": "setup"}), asdict(cfg))
+        self._invoke(_wire_client({"ok": True, "mode": "setup"}), asdict(cfg))
 
-    @pytest.mark.parametrize(
-        "body",
-        [
-            {"ok": True, "mode": "setup"},  # pre-phase-3 function: no echo
-            {"ok": True, "mode": "setup", "layout": "flat"},  # wrong layout acted on
-        ],
-    )
-    def test_hive_without_hive_echo_fails_fast(self, cfg, body):
-        # Stale-deployment guard: an old function would emit the flat GLOBAL
-        # template at the hive root and return a 200 the dispatcher couldn't
-        # tell apart — the layout echo makes that fail at setup, pre-fan-out.
+    def test_hive_async_event_matches_baseline(self, cfg):
+        # The async init-time manifest write (issue #252 hybrid): a
+        # fire-and-forget InvocationType="Event" invoke of the hive setup
+        # branch, carrying exactly the manifest inputs the ping/finalize
+        # events pin (config + parent_order + dataset identity + overwrite).
+        from zagg.runner import _invoke_lambda_setup_async
+
+        cfg.output["store_layout"] = "hive"
+        config_dict = asdict(cfg)
+        client = _wire_client({"ok": True, "mode": "setup", "layout": "hive"})
+        _invoke_lambda_setup_async(
+            client,
+            "process-shard",
+            "s3://out/product",
+            config_dict=config_dict,
+            dataset={"short_name": "ATL06", "version": "007"},
+            parent_order=6,
+            overwrite=False,
+        )
+        kwargs = client.invoke.call_args.kwargs
+        assert kwargs["InvocationType"] == "Event"
+        assert json.loads(kwargs["Payload"]) == {
+            "mode": "setup",
+            "store_path": "s3://out/product",
+            "parent_order": 6,
+            "overwrite": False,
+            "config": config_dict,
+            "dataset": {"short_name": "ATL06", "version": "007"},
+        }
+        # Fire-and-forget: no response is read (an Event invoke returns 202
+        # with no function payload), so nothing can block on it.
+        client.invoke.return_value["Payload"].read.assert_not_called()
+
+    def test_hive_async_event_threads_creds_and_overwrite(self, cfg):
+        # The async setup is the PRIMARY manifest write and fire-and-forget
+        # (no response read), so a drifted ``output_credentials`` key or
+        # ``overwrite`` flag would fail SILENTLY — the miss only surfacing as
+        # the finalize backstop doing the "primary" write. Pin the two
+        # conditional branches on the wire: overwrite=True and an
+        # output_creds_event both reach the Event payload exactly.
+        from zagg.runner import _invoke_lambda_setup_async
+
+        cfg.output["store_layout"] = "hive"
+        config_dict = asdict(cfg)
+        client = _wire_client({"ok": True, "mode": "setup", "layout": "hive"})
+        creds = {"aws_access_key_id": "AK", "aws_secret_access_key": "SK"}
+        _invoke_lambda_setup_async(
+            client,
+            "process-shard",
+            "s3://out/product",
+            config_dict=config_dict,
+            dataset={"short_name": "ATL06", "version": "007"},
+            parent_order=6,
+            overwrite=True,
+            output_creds_event=creds,
+        )
+        kwargs = client.invoke.call_args.kwargs
+        assert kwargs["InvocationType"] == "Event"
+        assert json.loads(kwargs["Payload"]) == {
+            "mode": "setup",
+            "store_path": "s3://out/product",
+            "parent_order": 6,
+            "overwrite": True,
+            "config": config_dict,
+            "dataset": {"short_name": "ATL06", "version": "007"},
+            "output_credentials": creds,
+        }
+        client.invoke.return_value["Payload"].read.assert_not_called()
+
+
+class TestInvokeLambdaFinalizeEvent:
+    """Pin the ACTUAL finalize event on the wire (issue #252): hive carries
+    the manifest inputs (mirroring the retired hive setup event); flat stays
+    byte-identical to the pre-fold finalize event."""
+
+    @staticmethod
+    def _invoke(client, **kw):
+        from zagg.runner import _invoke_lambda_finalize
+
+        _invoke_lambda_finalize(client, "process-shard", "s3://out/product", **kw)
+        return json.loads(client.invoke.call_args.kwargs["Payload"])
+
+    def test_flat_event_matches_baseline(self):
+        event = self._invoke(_wire_client({"ok": True, "mode": "finalize"}))
+        assert event == {"mode": "finalize", "store_path": "s3://out/product"}
+
+    def test_hive_event_carries_manifest_inputs(self, cfg):
+        cfg.output["store_layout"] = "hive"
+        config_dict = asdict(cfg)
+        event = self._invoke(
+            _wire_client({"ok": True, "mode": "finalize", "layout": "hive"}),
+            config_dict=config_dict,
+            dataset={"short_name": "ATL06", "version": "007"},
+            parent_order=6,
+            overwrite=False,
+        )
+        assert event["config"] == config_dict
+        assert event["dataset"] == {"short_name": "ATL06", "version": "007"}
+        assert event["parent_order"] == 6
+        assert event["overwrite"] is False
+
+    def test_non_200_raises(self):
+        # The manifest is REQUIRED reader-facing schema (D6): a failed hive
+        # finalize must raise, unlike the fail-open root coverage.moc (D9).
+        with pytest.raises(RuntimeError, match="Lambda finalize error"):
+            self._invoke(
+                _wire_client({"error": "boom", "mode": "finalize"}, status_code=500),
+                config_dict={"output": {"store_layout": "hive"}},
+                parent_order=6,
+            )
+
+
+class TestInvokeLambdaPingEvent:
+    """Pin the ACTUAL ping event on the wire and the fail-fast guard (issue
+    #252, replacing the PR #205 layout-echo guard): the ping carries the same
+    manifest inputs as hive finalize, and any non-200 — a stale function's
+    process-handler 400 fall-through, or the handler's validate_manifest
+    refusal — raises before a single worker is dispatched. The two modes get
+    distinct remedies: a 400 without ``mode: "ping"`` says redeploy, a 500
+    that echoes ``mode: "ping"`` says clear the store root."""
+
+    @staticmethod
+    def _invoke(client, config_dict, **kw):
+        from zagg.runner import _invoke_lambda_ping
+
+        _invoke_lambda_ping(
+            client,
+            "process-shard",
+            "s3://out/product",
+            config_dict=config_dict,
+            **kw,
+        )
+        return json.loads(client.invoke.call_args.kwargs["Payload"])
+
+    def test_event_carries_manifest_inputs(self, cfg):
+        cfg.output["store_layout"] = "hive"
+        config_dict = asdict(cfg)
+        event = self._invoke(
+            _wire_client({"ok": True, "mode": "ping", "zagg_version": "1.2.3"}),
+            config_dict,
+            dataset={"short_name": "ATL06", "version": "007"},
+            parent_order=6,
+            overwrite=False,
+        )
+        assert event["mode"] == "ping"
+        assert event["config"] == config_dict
+        assert event["dataset"] == {"short_name": "ATL06", "version": "007"}
+        assert event["parent_order"] == 6
+        assert event["overwrite"] is False
+
+    def test_stale_function_fall_through_fails_fast(self, cfg):
+        # A pre-#252 function doesn't know mode="ping": the event falls
+        # through to its process handler, which 400s the key-less event with
+        # ZERO writes — the dispatcher turns that into the redeploy message.
         cfg.output["store_layout"] = "hive"
         with pytest.raises(RuntimeError, match="redeploy"):
             self._invoke(
-                self._client(body), asdict(cfg), dataset={"short_name": "A", "version": "1"}
+                _wire_client({"error": "shard_key required"}, status_code=400),
+                asdict(cfg),
+                parent_order=6,
+            )
+
+    def test_validate_refusal_fails_fast(self, cfg):
+        # The handler's read-only validate_manifest refusal (frozen-key
+        # mismatch, D2) surfaces pre-fan-out with the store remedy, not
+        # redeploy: the 500 body echoes mode="ping", so the message points at
+        # clearing the store root rather than a stale deployment.
+        cfg.output["store_layout"] = "hive"
+        with pytest.raises(RuntimeError, match="clear the store root"):
+            self._invoke(
+                _wire_client(
+                    {"error": "morton_hive.json ... does not match this run", "mode": "ping"},
+                    status_code=500,
+                ),
+                asdict(cfg),
+                parent_order=6,
             )

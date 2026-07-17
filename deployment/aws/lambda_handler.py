@@ -43,7 +43,9 @@ Event payload (default / process mode):
 Setup mode (creates the zarr template once before per-cell fan-out; for a
 hive-layout config -- output.store_layout: hive, issue #199 -- it writes the
 morton_hive.json manifest instead, and each process-mode worker emits its own
-leaf template):
+leaf template. Current dispatchers send hive setup as a fire-and-forget Event
+invoke right after the ping -- the primary manifest write, issue #252 hybrid
+-- and older synchronous dispatchers keep working against this function):
 {
     "mode": "setup",
     "store_path": str,
@@ -58,12 +60,38 @@ leaf template):
     "output_credentials": dict (optional, same shape as process mode),
 }
 
-Finalize mode (consolidates zarr metadata after all cells complete):
+Finalize mode (after all cells complete: consolidates zarr metadata; for a
+hive-layout config -- issue #252 hybrid -- it re-ensures the morton_hive.json
+manifest instead, the idempotent backstop for the async init-time setup write):
 {
     "mode": "finalize",
     "store_path": str,
+    "config": dict (optional, hive only) -- same single-source config as setup;
+        its presence + store_layout selects the manifest write. With it ride
+        "parent_order", "overwrite", and the optional "dataset" identity
+        block, mirroring the hive setup event. Absent on flat runs (their
+        event is byte-identical to pre-#252).
     "output_credentials": dict (optional, same shape as process mode),
 }
+
+Ping mode (hive pre-fan-out preflight, issue #252 — writes nothing; kept while
+flat exists, issue #251):
+{
+    "mode": "ping",
+    "store_path": str,
+    "config": dict,             # same manifest inputs as hive finalize; with it
+    "parent_order": int,        #   ride "overwrite" and the optional "dataset"
+    "overwrite": bool,          #   identity block
+    "dataset": dict (optional),
+    "output_credentials": dict (optional, same shape as process mode),
+}
+Answering 200 at all is the versioning half of the guard: a function deployed
+before the issue #252 hive dispatch lifecycle doesn't know the mode, so
+the event falls through to the process handler's 400 (zero writes) and the
+dispatcher fails fast with a redeploy message before any worker runs. The body
+echoes the deployed zagg version; the handler also runs the READ-ONLY
+zagg.hive.validate_manifest against any existing root so an incompatible rerun
+refuses up front (D2).
 
 Extract mode (chunk-boundary geometry extraction, issue #148 — one parquet per
 granule under an S3 prefix; a batch of granules per invocation for the fan-out):
@@ -444,6 +472,7 @@ def lambda_handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
 
     Default ``mode`` (or no mode) runs per-cell processing. ``mode="setup"``
     creates the zarr template; ``mode="finalize"`` consolidates metadata;
+    ``mode="ping"`` is the hive pre-fan-out preflight (issue #252);
     ``mode="coverage"`` writes the store-root ``coverage.moc`` (issue #200);
     ``mode="extract"`` extracts chunk-boundary geometry parquets (issue #148);
     ``mode="process_event"`` runs the temporal/event worker (issue #12).
@@ -459,6 +488,8 @@ def lambda_handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
         return _handle_setup(event)
     if mode == "finalize":
         return _handle_finalize(event)
+    if mode == "ping":
+        return _handle_ping(event)
     if mode == "coverage":
         return _handle_coverage(event)
     # Extract mode returns directly: the result_url mirror below is for the
@@ -611,9 +642,14 @@ def _handle_setup(event: Dict[str, Any]) -> Dict[str, Any]:
     For a hive-layout config (issue #199 phase 3) template time writes ONLY
     the ``morton_hive.json`` manifest — no global zarr template exists (zero
     metadata above the leaves, D5); each worker emits its own leaf template.
-    The optional ``dataset`` event key carries the manifest's identity block
-    (the orchestrator sources it from the ShardMap metadata, same as the local
-    path). The flat path below is byte-identical to before, bar one addition:
+    Current dispatchers send hive setup as a fire-and-forget Event invoke
+    right after the ping (issue #252 hybrid) — this branch is the PRIMARY
+    manifest write, run off the critical path, with finalize as idempotent
+    backstop; older synchronous dispatchers keep working against it
+    unchanged. The optional ``dataset`` event key carries
+    the manifest's identity block (the orchestrator sources it from the
+    ShardMap metadata, same as the local path).
+    The flat path below is byte-identical to before, bar one addition:
     the success body now ECHOES the layout it acted on (``"layout"``) — a
     stale deployment without the hive branch returns the old echo-less body,
     which the dispatcher rejects for hive runs instead of silently letting old
@@ -672,17 +708,97 @@ def _handle_setup(event: Dict[str, Any]) -> Dict[str, Any]:
 
 
 def _handle_finalize(event: Dict[str, Any]) -> Dict[str, Any]:
-    """Consolidate zarr metadata for the store at ``event['store_path']``."""
-    from zarr import consolidate_metadata
+    """Finalize the store at ``event['store_path']``.
 
-    logger.info(f"Finalize mode: consolidating metadata at {event.get('store_path')}")
+    Flat: consolidate zarr metadata (byte-identical to before). Hive (issue
+    #252 hybrid): re-ensure the root ``morton_hive.json`` manifest — the
+    idempotent BACKSTOP for the async init-time setup invoke (a frozen-key-
+    matching manifest is accepted, no second PUT). Worker Event invokes run
+    with retries 0 (template.yaml EventInvokeConfig), so a lost async init
+    write is never redelivered — this backstop self-heals it. The manifest
+    inputs mirror the hive setup event (``config``/``parent_order``/
+    ``dataset``/``overwrite``); there is no zarr hierarchy above the leaves
+    to consolidate (D5), so the hive branch returns without touching zarr.
+    The success body echoes ``"layout": "hive"``, matching setup's echo.
+    """
+    logger.info(f"Finalize mode: finalizing store at {event.get('store_path')}")
     try:
+        if "config" in event:
+            config = load_config_from_dict(event["config"])
+            if get_store_layout(config) == "hive":
+                from zagg.config import get_windowing
+                from zagg.grids import from_config
+                from zagg.hive import build_manifest, ensure_manifest
+
+                grid = from_config(config, parent_order=event.get("parent_order"))
+                ensure_manifest(
+                    event["store_path"],
+                    build_manifest(
+                        grid, dataset=event.get("dataset"), windowing=get_windowing(config)
+                    ),
+                    overwrite=event.get("overwrite", False),
+                    **_output_store_kwargs(event),
+                )
+                return {
+                    "statusCode": 200,
+                    "body": json.dumps({"ok": True, "mode": "finalize", "layout": "hive"}),
+                }
+        from zarr import consolidate_metadata
+
         store = open_store(event["store_path"], **_output_store_kwargs(event))
         consolidate_metadata(store, zarr_format=3)
         return {"statusCode": 200, "body": json.dumps({"ok": True, "mode": "finalize"})}
     except Exception as e:
         logger.exception(e)
         return {"statusCode": 500, "body": json.dumps({"error": str(e), "mode": "finalize"})}
+
+
+def _handle_ping(event: Dict[str, Any]) -> Dict[str, Any]:
+    """Hive pre-fan-out preflight (issue #252) — writes nothing.
+
+    Answering 200 at all is the versioning half of the guard: a function that
+    predates the issue #252 hive lifecycle doesn't know ``mode="ping"``,
+    so the event falls through to its process handler's 400 (zero writes) and
+    the dispatcher fails fast with a redeploy message before any worker is
+    dispatched. The body echoes the deployed zagg version for observability.
+
+    The store half mirrors setup/finalize's manifest inputs and runs the
+    READ-ONLY :func:`zagg.hive.validate_manifest` against any existing root,
+    so a run into a store templated for different orders/identity refuses up
+    front (the D2 mixed-order footgun) instead of after the fan-out (PR #255
+    review fold). This covers sequential reruns; two concurrent runs into
+    the same fresh root both pass here, colliding within seconds of init
+    once the async setup write lands (issue #252 hybrid). Kept while flat
+    exists (issue #251): once flat is removed, a stale function simply
+    errors and the ping can be dropped.
+    """
+    logger.info(f"Ping mode: hive preflight for {event.get('store_path')}")
+    try:
+        import zagg
+
+        if "config" in event:
+            config = load_config_from_dict(event["config"])
+            if get_store_layout(config) == "hive":
+                from zagg.config import get_windowing
+                from zagg.grids import from_config
+                from zagg.hive import build_manifest, validate_manifest
+
+                grid = from_config(config, parent_order=event.get("parent_order"))
+                validate_manifest(
+                    event["store_path"],
+                    build_manifest(
+                        grid, dataset=event.get("dataset"), windowing=get_windowing(config)
+                    ),
+                    overwrite=event.get("overwrite", False),
+                    **_output_store_kwargs(event),
+                )
+        return {
+            "statusCode": 200,
+            "body": json.dumps({"ok": True, "mode": "ping", "zagg_version": zagg.__version__}),
+        }
+    except Exception as e:
+        logger.exception(e)
+        return {"statusCode": 500, "body": json.dumps({"error": str(e), "mode": "ping"})}
 
 
 def _handle_coverage(event: Dict[str, Any]) -> Dict[str, Any]:
@@ -876,6 +992,7 @@ def _handle_process_raster(event: Dict[str, Any]) -> Dict[str, Any]:
         from zagg.config import get_layout
         from zagg.grids import from_config
         from zagg.processing.raster import (
+            new_stage_stats,
             process_raster_shard,
             write_raster_coords,
             write_raster_slab,
@@ -906,10 +1023,15 @@ def _handle_process_raster(event: Dict[str, Any]) -> Dict[str, Any]:
         # remainder — the split the PR #232 double-buffer decision needs
         # measured. Exact at write_buffer=1 (writes serialize in the loop);
         # at write_buffer>1 writes overlap sampling, so the remainder is
-        # approximate — A/B on ``duration_s`` instead. Default (no
-        # ``profile`` key) emits nothing: the body stays byte-identical.
+        # approximate — A/B on ``duration_s`` instead. ``stages`` (issue
+        # #249) splits the sample bucket into per-stage work volumes +
+        # counts — attribution, not a wall decomposition: concurrent samples
+        # overlap, so stage sums can exceed ``sample`` (see
+        # ``new_stage_stats``). Default (no ``profile`` key) emits nothing:
+        # the body stays byte-identical and the sample path times nothing.
         profile = bool(event.get("profile"))
         write_s = 0.0
+        stage_stats = new_stage_stats() if profile else None
 
         def _write_slab(t_idx: int, slab: dict) -> None:
             nonlocal wrote, write_s
@@ -928,6 +1050,7 @@ def _handle_process_raster(event: Dict[str, Any]) -> Dict[str, Any]:
             region=source.get("source_region"),
             anonymous=source.get("anonymous", True),
             on_slab=_write_slab,
+            stage_stats=stage_stats,
         )
         if wrote:
             write_raster_coords(store, grid, shard_key)
@@ -945,7 +1068,11 @@ def _handle_process_raster(event: Dict[str, Any]) -> Dict[str, Any]:
         }
         if profile:
             total = time.time() - start_time
-            body["phase_timings"] = {"sample": total - write_s, "write": write_s}
+            body["phase_timings"] = {
+                "sample": total - write_s,
+                "write": write_s,
+                "stages": stage_stats,
+            }
         return {"statusCode": 200, "body": json.dumps(body)}
     except Exception as e:
         logger.error(f"raster worker failed: {e}", exc_info=True)

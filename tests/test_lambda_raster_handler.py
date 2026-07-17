@@ -200,11 +200,50 @@ class TestRasterPhaseTimings:
         assert resp["statusCode"] == 200, resp
         body = json.loads(resp["body"])
         pt = body["phase_timings"]
-        assert set(pt) == {"sample", "write"}
+        assert set(pt) == {"sample", "write", "stages"}
         assert pt["write"] > 0.0
         assert pt["sample"] + pt["write"] == pytest.approx(body["duration_s"], rel=0.05)
 
     def test_no_profile_key_no_timings(self, handler_mod, raster_event):
         event, _grid, _data = raster_event
         resp = handler_mod.lambda_handler(event, MagicMock())
+        assert "phase_timings" not in json.loads(resp["body"])
+
+    def test_profile_emits_stage_split(self, handler_mod, raster_event):
+        # Issue #249: the sample bucket split per stage + counts, additive
+        # next to the unchanged sample/write keys.
+        event, _grid, _data = raster_event
+        event["profile"] = True
+        resp = handler_mod.lambda_handler(event, MagicMock())
+        assert resp["statusCode"] == 200, resp
+        stages = json.loads(resp["body"])["phase_timings"]["stages"]
+        floats = ("open", "geometry", "fetch", "decode", "gather")
+        assert set(stages) == {*floats, "assets", "tiles", "geom_hits"}
+        assert stages["assets"] == 1  # 1 timestep x 1 band
+        assert stages["geom_hits"] == 0  # single asset, nothing to hit
+        assert stages["tiles"] >= 1
+        assert all(stages[k] >= 0.0 for k in floats)
+        assert sum(stages[k] for k in floats) > 0.0
+
+    def test_no_profile_passes_no_stage_stats(self, handler_mod, raster_event, monkeypatch):
+        # Zero-overhead gate: without ``profile`` the worker must receive
+        # stage_stats=None so the sample path makes no timing calls at all.
+        import zagg.processing.raster as raster_mod
+
+        event, _grid, _data = raster_event
+        seen = {}
+
+        def _fake(grid_, shard_key, granules, config, time_index, *, stage_stats=None, **kw):
+            seen["stage_stats"] = stage_stats
+            return {}, {
+                "shard_key": int(shard_key),
+                "granule_count": 1,
+                "skipped": 0,
+                "timesteps": 0,
+            }
+
+        monkeypatch.setattr(raster_mod, "process_raster_shard", _fake)
+        resp = handler_mod.lambda_handler(event, MagicMock())
+        assert resp["statusCode"] == 200, resp
+        assert seen["stage_stats"] is None
         assert "phase_timings" not in json.loads(resp["body"])
