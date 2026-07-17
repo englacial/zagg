@@ -72,11 +72,14 @@ def _ranges_to_indices(starts: np.ndarray, lengths: np.ndarray) -> np.ndarray:
 def get_streaming(config: PipelineConfig) -> dict | None:
     """Return the ``aggregation.streaming`` block, or ``None`` (pooled path).
 
-    The block is ``{"buffer_granules": int, "state_layout": "dict"|"arena"}``;
-    ``buffer_granules`` must be a positive int. ``state_layout`` (issue #217)
-    picks the running-state container: ``"dict"`` (default, per-cell ndarrays)
-    or ``"arena"`` (contiguous CSR buffers — same merge sequence, same bytes
-    out, ~24 B/cell overhead instead of ~290). Absent block -> ``None`` so
+    The block is ``{"buffer_granules": int, "state_layout": "dict"|"arena",
+    "arena_backing": "memory"|"tmp"}``; ``buffer_granules`` must be a positive
+    int. ``state_layout`` (issue #217) picks the running-state container:
+    ``"dict"`` (default, per-cell ndarrays) or ``"arena"`` (contiguous CSR
+    buffers — same merge sequence, same bytes out, ~24 B/cell overhead instead
+    of ~290). ``arena_backing: tmp`` (arena only) puts the centroid buffers in
+    unlinked ``/tmp``-backed memmaps so flush transients page under memory
+    pressure instead of OOM-killing the worker. Absent block -> ``None`` so
     existing configs are untouched.
     """
     block = config.aggregation.get("streaming")
@@ -95,7 +98,21 @@ def get_streaming(config: PipelineConfig) -> dict | None:
         raise ValueError(
             f"aggregation.streaming.state_layout must be 'dict' or 'arena' (got {state_layout!r})"
         )
-    return {"buffer_granules": buffer_granules, "state_layout": state_layout}
+    arena_backing = block.get("arena_backing", "memory")
+    if arena_backing not in ("memory", "tmp"):
+        raise ValueError(
+            f"aggregation.streaming.arena_backing must be 'memory' or 'tmp' (got {arena_backing!r})"
+        )
+    if arena_backing == "tmp" and state_layout != "arena":
+        raise ValueError(
+            "aggregation.streaming.arena_backing: tmp requires state_layout: arena "
+            "(the dict layout has no contiguous buffers to back with a file)"
+        )
+    return {
+        "buffer_granules": buffer_granules,
+        "state_layout": state_layout,
+        "arena_backing": arena_backing,
+    }
 
 
 def validate_streaming(config: PipelineConfig) -> None:
@@ -171,12 +188,14 @@ class StreamingAggregator:
         handoff: str,
         buffer_granules: int,
         state_layout: str = "dict",
+        arena_backing: str = "memory",
     ):
         validate_streaming(config)
         self.grid = grid
         self.handoff = handoff
         self.buffer_granules = buffer_granules
         self.state_layout = state_layout
+        self.arena_backing = arena_backing
         agg_fields = get_agg_fields(config)
         self._count_fields: list[str] = []
         self._digest_fields: dict[str, tuple[str, int]] = {}  # name -> (source, delta)
@@ -214,6 +233,31 @@ class StreamingAggregator:
         self.flushes = 0
         self._buffer: list = []
         self._buffered_granules = 0
+
+    def _alloc_arena(self, n_rows: int) -> np.ndarray:
+        """Allocate one centroid buffer: RAM, or a ``/tmp``-backed memmap.
+
+        Under ``arena_backing: tmp`` (issue #217, the spill/arena hybrid) the
+        buffer is an **anonymous** file mapping: the file is unlinked the
+        moment the mapping exists, so the mapping itself is the only
+        reference — space frees on GC and nothing can accumulate in ``/tmp``
+        across warm Lambda invokes. The payoff is failure mode: dirty pages
+        are file-backed page cache the kernel can write back and reclaim
+        under cgroup pressure, so an oversized flush transient degrades into
+        paging instead of an OOM kill of anonymous heap.
+        """
+        if self.arena_backing != "tmp" or n_rows == 0:
+            return np.empty((n_rows, 2), dtype=np.float32)
+        import os
+        import tempfile
+
+        fd, path = tempfile.mkstemp(suffix=".arena")
+        try:
+            mapped = np.memmap(path, dtype=np.float32, mode="w+", shape=(n_rows, 2))
+        finally:
+            os.close(fd)
+            os.unlink(path)
+        return mapped
 
     def add_read(self, chunk) -> None:
         """Buffer one group read (the carrier ``_read_group`` returned)."""
@@ -293,7 +337,7 @@ class StreamingAggregator:
             # ndarrays transiently costs more than the state itself).
             bound_fresh = np.minimum(ends - starts, cap)
             stage_off = np.concatenate(([0], np.cumsum(bound_fresh)))
-            stage = np.empty((int(stage_off[-1]), 2), dtype=np.float32)
+            stage = self._alloc_arena(int(stage_off[-1]))
             k_fresh = np.empty(len(fresh_cells), dtype=np.int64)
             for j in range(len(fresh_cells)):
                 d = build_tdigest(col_arrays[source][starts[j] : ends[j]], delta=delta)
@@ -311,7 +355,7 @@ class StreamingAggregator:
             k_bound[pos_fresh] = k_fresh
             k_bound[pos_fresh[ovl_idx]] = np.minimum(k_old[held_pos] + k_fresh[ovl_idx], cap)
             bound_off = np.concatenate(([0], np.cumsum(k_bound)))
-            bound_arena = np.empty((int(bound_off[-1]), 2), dtype=np.float32)
+            bound_arena = self._alloc_arena(int(bound_off[-1]))
             k_exact = k_bound.copy()
 
             src = _ranges_to_indices(offsets[:-1][keep], k_old[keep])
@@ -343,10 +387,15 @@ class StreamingAggregator:
             self._poisoned = name
 
             # Compact the bounded layout to exact CSR in one vectorized gather
-            # (merge compression leaves slack only inside merged slots).
+            # (merge compression leaves slack only inside merged slots). The
+            # gather lands directly in a fresh factory buffer (``out=``) so
+            # the compacted state inherits the configured backing instead of
+            # fancy-indexing into an anonymous RAM copy.
             new_offsets = np.concatenate(([0], np.cumsum(k_exact)))
             src = _ranges_to_indices(bound_off[:-1], k_exact)
-            self._offsets[name], self._arenas[name] = new_offsets, bound_arena[src]
+            new_arena = self._alloc_arena(int(new_offsets[-1]))
+            np.take(bound_arena, src, axis=0, out=new_arena)
+            self._offsets[name], self._arenas[name] = new_offsets, new_arena
             self._poisoned = None
 
         self._cells, self._cell_counts = union, new_counts
