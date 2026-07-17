@@ -115,12 +115,13 @@ def test_apriori_estimate_scales_with_granules():
     assert est["est_cost_usd"] > 0
 
 
-def test_setup_cost_usd_math_and_none_safe():
-    # The setup invoke's billed dollars (issue #250 item 3): wall x GB x $/GB-s,
-    # its own column -- cost_usd (worker GB-seconds) is untouched.
+def test_invoke_cost_usd_math_and_none_safe():
+    # Sync-invoke billed dollars (issue #250 items 3+6): wall x GB x $/GB-s,
+    # its own columns (setup_cost_usd / finalize_cost_usd) -- cost_usd
+    # (worker GB-seconds) is untouched.
     expected = 104.0 * rfab.LAMBDA_MEMORY_GB * rfab.LAMBDA_PRICE_PER_GB_SEC
-    assert rfab._setup_cost_usd(104.0) == pytest.approx(expected, abs=1e-6)
-    assert rfab._setup_cost_usd(None) is None
+    assert rfab._invoke_cost_usd(104.0) == pytest.approx(expected, abs=1e-6)
+    assert rfab._invoke_cost_usd(None) is None
 
 
 def test_write_throughput_counts_retries_and_slowdown():

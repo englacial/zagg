@@ -246,69 +246,120 @@ def test_make_full_aoi_release_figure_renders_and_empty_is_false(tmp_path):
 # --- per-release phase-breakdown figure (issue #250) ------------------------
 
 
-def test_full_aoi_phase_series_spec():
-    # The display spec: setup is the headline, then the worker split, finalize,
-    # and the worker totals. finalize stays displayed (issue #252 / PR #255):
-    # ~0 on flat, but on hive it is the idempotent manifest backstop.
-    ps = pytest.importorskip("plot_series")
-    assert list(ps.FULL_AOI_PHASE_SERIES) == [
-        "setup_s",
-        "phase_read_s",
-        "phase_index_s",
-        "phase_aggregate_s",
-        "finalize_s",
-        "worker_max_s",
-        "worker_median_s",
+def _release_records(commit, ref, cost):
+    """One release's single collapsed point-leg record (issue #250)."""
+    return [
+        _record(
+            commit=commit,
+            ref=ref,
+            target="full_aoi_neon_o9_hive_mask",
+            store_layout="hive",
+            aoi_mask=True,
+            cost_usd=cost,
+            setup_cost_usd=0.0002,
+            finalize_cost_usd=0.0001,
+        )
     ]
 
 
-def test_full_aoi_phase_figure_renders_and_skips_when_no_data(tmp_path):
-    pytest.importorskip("matplotlib")
-    ps = pytest.importorskip("plot_series")
+def test_point_release_history_derivations():
+    # plot_summary display derivations (the series stays emission truth):
+    # agg = index + aggregate, and the summed billed total = cost_usd +
+    # setup_cost_usd + finalize_cost_usd with an exact seconds<->USD relabel.
+    psu = pytest.importorskip("plot_summary")
     df = fas.records_to_frame(
-        _matrix_records("c1", "v0.24.0", 0.016) + _matrix_records("c2", "v0.25.0", 0.018)
+        _release_records("c1", "v0.31.0", 0.016)
+        + [_record(commit="c9", event="merge")]  # non-release must not leak in
     )
-    out = tmp_path / "full_aoi_phases.png"
-    assert ps.make_full_aoi_phase_figure(df, out) is True
+    hist = psu.point_release_history(df)
+    assert set(hist["event"]) == {"release"}
+    row = hist.iloc[0]
+    assert row["phase_agg_s"] == pytest.approx(5.0 + 30.0)  # index + aggregate
+    assert row["total_cost_usd"] == pytest.approx(0.016 + 0.0002 + 0.0001)
+    assert row["total_billed_s"] == pytest.approx(row["total_cost_usd"] / psu._USD_PER_LAMBDA_S)
+    # Legacy rows (no cost split columns) degrade to the worker cost alone.
+    legacy = df[df["event"] == "release"].drop(
+        columns=["setup_cost_usd", "finalize_cost_usd", "phase_index_s"]
+    )
+    lrow = psu.point_release_history(legacy).iloc[0]
+    assert lrow["total_cost_usd"] == pytest.approx(0.016)
+    assert lrow["phase_agg_s"] == pytest.approx(30.0)  # aggregate alone (min_count=1)
+
+
+def test_summary_and_point_diagnostics_render(tmp_path):
+    pytest.importorskip("matplotlib")
+    psu = pytest.importorskip("plot_summary")
+    df = fas.records_to_frame(
+        _release_records("c1", "v0.31.0", 0.016) + _release_records("c2", "v0.32.0", 0.018)
+    )
+    hist = psu.point_release_history(df)
+    out = tmp_path / "full_aoi_summary.png"
+    assert psu.make_summary_figure([("point", hist, "ref")], out) is True
     assert out.exists() and out.stat().st_size > 0
-    # Nothing retained yet -> False (Pages index omits the section).
+    # Empty rows are skipped; all-empty -> False, nothing written.
     import pandas as pd
 
-    assert ps.make_full_aoi_phase_figure(pd.DataFrame(), tmp_path / "x.png") is False
-    # Rows present but every phase column all-null -> same skip, no broken panel.
+    assert psu.make_summary_figure([("point", pd.DataFrame(), "ref")], tmp_path / "x.png") is False
+    diag = tmp_path / "full_aoi_point_phases.png"
+    assert (
+        psu.make_diagnostics_figure(hist, psu.POINT_PHASE_PANELS, "ref", diag, "point phases")
+        is True
+    )
+    assert diag.exists() and diag.stat().st_size > 0
+    # The approved panel set: read / agg / write / setup / finalize -- never
+    # the raw index+aggregate pair, and finalize kept per issue #252.
+    cols = [c for c, _t in psu.POINT_PHASE_PANELS]
+    assert cols == ["phase_read_s", "phase_agg_s", "phase_write_s", "setup_s", "finalize_s"]
+
+
+def test_diagnostics_skips_when_no_panel_has_data(tmp_path):
+    pytest.importorskip("matplotlib")
+    psu = pytest.importorskip("plot_summary")
     import numpy as np
 
-    nulls = df.assign(**{c: np.nan for c in ps.FULL_AOI_PHASE_SERIES})
-    assert ps.make_full_aoi_phase_figure(nulls, tmp_path / "y.png") is False
-    assert not (tmp_path / "y.png").exists()
-
-
-def test_full_aoi_phase_figure_renders_legacy_series_without_phase_columns(tmp_path):
-    # A pre-#250 parquet has no phase_*_s columns but does carry setup_s and the
-    # worker totals: the figure must still render from those (null-safe), not
-    # KeyError on the missing columns.
-    pytest.importorskip("matplotlib")
-    ps = pytest.importorskip("plot_series")
-    df = fas.records_to_frame(_matrix_records("c1", "v0.24.0", 0.016))
-    legacy = df.drop(columns=["phase_read_s", "phase_index_s", "phase_aggregate_s"])
-    out = tmp_path / "legacy_phases.png"
-    assert ps.make_full_aoi_phase_figure(legacy, out) is True
-    assert out.exists() and out.stat().st_size > 0
-
-
-def test_full_aoi_phase_figure_skips_when_all_slots_off_matrix(tmp_path):
-    # Rows whose index_backend is null map off the inline/sidecar matrix, so
-    # every panel slot stays None. The figure must honour its "return False,
-    # write nothing" contract rather than deref a None legend_ax and crash.
-    pytest.importorskip("matplotlib")
-    ps = pytest.importorskip("plot_series")
-    recs = _matrix_records("c1", "v0.24.0", 0.016)
-    for r in recs:
-        r["index_backend"] = None
-    df = fas.records_to_frame(recs)
-    out = tmp_path / "off_matrix_phases.png"
-    assert ps.make_full_aoi_phase_figure(df, out) is False
+    df = fas.records_to_frame(_release_records("c1", "v0.31.0", 0.016))
+    hist = psu.point_release_history(df)
+    nulls = hist.assign(**{c: np.nan for c, _t in psu.POINT_PHASE_PANELS})
+    out = tmp_path / "y.png"
+    assert psu.make_diagnostics_figure(nulls, psu.POINT_PHASE_PANELS, "ref", out, "t") is False
     assert not out.exists()
+
+
+def test_merge_history_selects_live_target_only():
+    # The per-merge derivations key on the collapsed live hive target; retired
+    # 2x2 rows and non-merge events stay out.
+    psu = pytest.importorskip("plot_summary")
+    import pandas as pd
+
+    rows = [
+        {
+            "timestamp": "2026-07-16T00:00:00Z",
+            "commit": "a1",
+            "event": "merge",
+            "target": psu.LIVE_MERGE_TARGET,
+            "cost_per_shard_usd": 0.00443,
+            "setup_s": 3.7,
+            "finalize_s": 1.2,
+            "phase_index_s": 14.0,
+            "phase_aggregate_s": 7.8,
+            "total_wall_s": 88.0,
+            "max_memory_mb": 1650.0,
+            "memory_gb": 4.0,
+        },
+        {
+            "timestamp": "2026-07-15T00:00:00Z",
+            "commit": "a0",
+            "event": "merge",
+            "target": "tdigest_healpix_o9_inline_nomask",  # retired arm
+            "cost_per_shard_usd": 0.005,
+        },
+    ]
+    hist = psu.merge_history(pd.DataFrame(rows))
+    assert list(hist["target"]) == [psu.LIVE_MERGE_TARGET]
+    row = hist.iloc[0]
+    sync_usd = (3.7 + 1.2) * psu._USD_PER_LAMBDA_S
+    assert row["total_cost_usd"] == pytest.approx(0.00443 + sync_usd)
+    assert row["phase_agg_s"] == pytest.approx(21.8)
 
 
 # --- store object-count columns (issue #240) --------------------------------
@@ -322,8 +373,8 @@ def test_objects_columns_retained_and_mismatch_dropped():
     assert list(df.columns) == fas.FULL_AOI_COLUMNS
     # Appended in order: object counts (phase 3), then layout + parity (phase
     # 4), then the worker phase split + setup cost (issue #250), then the
-    # #256 write split.
-    assert fas.FULL_AOI_COLUMNS[-9:] == [
+    # #256 write split + finalize cost.
+    assert fas.FULL_AOI_COLUMNS[-10:] == [
         "objects_total",
         "objects_expected",
         "store_layout",
@@ -333,6 +384,7 @@ def test_objects_columns_retained_and_mismatch_dropped():
         "phase_aggregate_s",
         "setup_cost_usd",
         "phase_write_s",
+        "finalize_cost_usd",
     ]
     assert df.iloc[0]["objects_total"] == 27
     assert df.iloc[0]["objects_expected"] == 25
@@ -377,7 +429,7 @@ def test_store_layout_and_parity_columns_retained_parity_detail_dropped():
     )
     df = fas.records_to_frame([rec])
     assert list(df.columns) == fas.FULL_AOI_COLUMNS
-    assert fas.FULL_AOI_COLUMNS[-7:-5] == ["store_layout", "parity_ok"]
+    assert fas.FULL_AOI_COLUMNS[-8:-6] == ["store_layout", "parity_ok"]
     row = df.iloc[0]
     assert row["store_layout"] == "hive"
     assert row["parity_ok"] == False  # noqa: E712 -- nullable bool column

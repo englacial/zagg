@@ -984,34 +984,56 @@ def _matrix_rows(commit, **kw):
     return rows
 
 
+def _live_rows(commit, ts=None, **kw):
+    """Live per-merge rows post-#250 collapse: the single hive target, with the
+    wall/phase fields the summary + diagnostics renderers derive from."""
+    r = _rec_row(commit, "tdigest_healpix_o9_hive", **kw)
+    r["grid_size"] = "o9"
+    r["index_backend"] = "inline"
+    r["store_layout"] = "hive"
+    r["total_wall_s"] = 88.0
+    r["setup_s"] = 3.7
+    r["finalize_s"] = 1.2
+    r["phase_read_s"] = 46.2
+    r["phase_index_s"] = 14.0
+    r["phase_aggregate_s"] = 7.8
+    r["phase_write_s"] = 8.9
+    if ts:
+        r["timestamp"] = ts
+    return [r]
+
+
 def test_plot_series_smoke(tmp_path):
     pytest.importorskip("matplotlib")
     import plot_series
 
     rows = [
-        r for i in range(3) for r in _matrix_rows(f"c{i}", cost=0.004 + i * 0.001, rt=180 + i * 10)
+        r
+        for i in range(3)
+        for r in _live_rows(f"c{i}", ts=f"2026-07-0{i + 1}T00:00:00Z", cost=0.004 + i * 0.001)
     ]
     series = tmp_path / "series.parquet"
     update_series.save_series(update_series.records_to_frame(rows), series)
     outdir = tmp_path / "site"
     plot_series.main(["--series", str(series), "--out", str(outdir)])
     assert (outdir / "index.html").exists()
-    # Live matrix figures (issue #193): *_matrix.png + matrix_table.png.
-    assert (outdir / "cost_per_shard_matrix.png").exists()
-    assert (outdir / "cost_per_100km2_matrix.png").exists()
-    assert (outdir / "matrix_table.png").exists()
+    # The issue #250 layout: per-merge summary + diagnostics + latest table.
+    assert (outdir / "merge_summary.png").exists()
+    assert (outdir / "merge_phases.png").exists()
+    assert (outdir / "merge_table.png").exists()
     assert (outdir / "latest.md").exists()
     assert (outdir / "metrics.json").exists()
-    # The retired codec/frozen figures are NOT regenerated.
+    # The retired matrix/codec/frozen figures are NOT regenerated.
+    assert not (outdir / "matrix_table.png").exists()
+    assert not (outdir / "cost_per_shard_matrix.png").exists()
     assert not (outdir / "codec_table.png").exists()
     assert not (outdir / "cost_per_shard.png").exists()
+    # Per-100 km2 leaves the display everywhere (issue #250 item 7).
+    assert "cost/100" not in (outdir / "latest.md").read_text()
 
 
 def _latest_rows(commit, ts, **kw):
-    rows = _matrix_rows(commit, **kw)
-    for r in rows:
-        r["timestamp"] = ts
-    return rows
+    return _live_rows(commit, ts=ts, **kw)
 
 
 def test_plot_series_latest_artifacts_pick_newest_merge(tmp_path):
@@ -1031,7 +1053,9 @@ def test_plot_series_latest_artifacts_pick_newest_merge(tmp_path):
     assert "old111" not in md  # ...and only it
     metrics = json.loads((outdir / "metrics.json").read_text())
     assert {r["commit"] for r in metrics} == {"new999"}
-    assert {r["index_backend"] for r in metrics} == {"inline", "sidecar"}
+    assert {r["target"] for r in metrics} == {"tdigest_healpix_o9_hive"}
+    # Display drop (issue #250 item 7): the column stays in the parquet only.
+    assert all("cost_per_100km2_usd" not in r for r in metrics)
 
 
 def test_write_latest_metrics_is_null_safe_json(tmp_path):
@@ -1683,29 +1707,33 @@ def test_make_codec_latest_table_renders_codec_rows(tmp_path):
     assert plot_series.make_codec_latest_table(frozen_only, tmp_path / "x.png") is False
 
 
-def test_plot_main_emits_matrix_and_archives_old(tmp_path):
-    # issue #193: main() renders the live inline/sidecar matrix; any retained
-    # codec/frozen PNGs already in the outdir are embedded as an ARCHIVED
-    # section below (and are NOT regenerated).
+def test_plot_main_emits_live_sections_and_archives_old(tmp_path):
+    # issue #250: main() renders the collapsed live per-merge section; any
+    # retained matrix/codec/frozen PNGs already in the outdir are embedded as
+    # an ARCHIVED section below (and are NOT regenerated).
     pytest.importorskip("matplotlib")
     import plot_series
 
-    rows = _matrix_rows("c0")
+    rows = _live_rows("c0")
     series = tmp_path / "series.parquet"
     update_series.save_series(update_series.records_to_frame(rows), series)
     outdir = tmp_path / "site"
     outdir.mkdir()
-    # A pre-existing archived PNG (as it would sit on the benchmarks branch).
+    # Pre-existing archived PNGs (as they sit on the benchmarks branch): the
+    # pre-#250 matrix table and a codec table.
     (outdir / "codec_table.png").write_bytes(b"\x89PNG\r\n\x1a\n")
+    (outdir / "matrix_table.png").write_bytes(b"\x89PNG\r\n\x1a\n")
     plot_series.main(["--series", str(series), "--out", str(outdir)])
-    # Live matrix rendered; archived PNG left untouched, embedded below.
-    assert (outdir / "matrix_table.png").exists()
-    assert (outdir / "cost_per_shard_matrix.png").exists()
+    # Live section rendered; archived PNGs left untouched, embedded below.
+    assert (outdir / "merge_table.png").exists()
+    assert (outdir / "merge_summary.png").exists()
     assert not (outdir / "codec_table.png").stat().st_size > 100  # not regenerated
+    assert not (outdir / "matrix_table.png").stat().st_size > 100
     html = (outdir / "index.html").read_text()
-    assert "inline/sidecar × AOI-mask" in html
-    assert "Archived (frozen as of issues #193 / #202)" in html
-    assert html.index("inline/sidecar × AOI-mask") < html.index("Archived")
+    assert "Per commit to main" in html
+    assert "Archived (frozen as of issues #193 / #202 / #250)" in html
+    assert html.index("Per commit to main") < html.index("Archived")
+    assert "matrix_table.png" in html  # the retired 2x2 table, embedded as archived
 
 
 def test_88s_nested_pin_invariant():

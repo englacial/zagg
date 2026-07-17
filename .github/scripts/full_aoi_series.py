@@ -106,6 +106,11 @@ FULL_AOI_COLUMNS = [
     # emitted alongside read/index/aggregate under profile=True. Null on rows
     # recorded before the split landed on the deployed worker.
     "phase_write_s",
+    # The finalize invoke's billed dollars (issue #250 item 6 synthesis): the
+    # setup_cost_usd pattern applied to finalize_s (the hive manifest
+    # backstop, issue #252). The SUMMED total (cost_usd + setup + finalize)
+    # is a display-side derivation; cost_usd itself stays worker GB-seconds.
+    "finalize_cost_usd",
 ]
 
 # run-record write_throughput key -> flat column name.
