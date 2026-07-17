@@ -761,6 +761,67 @@ def _combine_by_ownership(sampled, lonlat, bands):
 _TIME_ATTRS = {"units": "microseconds since 1970-01-01T00:00:00", "calendar": "proleptic_gregorian"}
 
 
+def _raster_array_spec(shape, chunks, dims, dtype, fill, attrs=None):
+    """ArraySpec shared by the flat template and the hive leaf spec."""
+    from pydantic_zarr.experimental.v3 import ArraySpec, NamedConfig
+
+    return ArraySpec(
+        attributes=attrs or {},
+        shape=shape,
+        dimension_names=dims,
+        data_type=dtype,
+        chunk_grid=NamedConfig(name="regular", configuration={"chunk_shape": chunks}),
+        chunk_key_encoding=NamedConfig(name="default", configuration={"separator": "/"}),
+        codecs=(
+            NamedConfig(name="bytes", configuration={"endian": "little"}),
+            NamedConfig(name="zstd", configuration={"level": 3, "checksum": False}),
+        ),
+        storage_transformers=(),
+        fill_value=fill,
+    )
+
+
+def _check_raster_grid(grid) -> None:
+    """Shared template guards: no sharded output, 1-D cell axis only."""
+    if getattr(grid, "sharded", False):
+        # Permanent exclusion (espg-ratified on issue #247), mirroring the
+        # validate_config message: per-timestep slab streaming would
+        # read-modify-write each ShardingCodec object.
+        raise ValueError(
+            "raster templates do not support sharded output (per-timestep slab "
+            "streaming would read-modify-write each ShardingCodec object)"
+        )
+    if len(grid.array_shape) != 1:
+        raise ValueError(
+            "raster templates currently require a 1-D cell axis (HEALPix); "
+            "the rectilinear (time, y, x) variant is future work (issue #218)"
+        )
+
+
+def _raster_members(grid, config, n_time: int, n_cells: int) -> dict:
+    """The ``time``/``cell_ids``/band ArraySpec members for one raster store."""
+    from zagg.config import get_raster_bands
+
+    members = {
+        "time": _raster_array_spec(
+            (n_time,), (max(n_time, 1),), ("time",), "int64", 0, dict(_TIME_ATTRS)
+        ),
+        "cell_ids": _raster_array_spec(
+            (n_cells,), (grid.cells_per_chunk,), ("cells",), "uint64", 0
+        ),
+    }
+    for name, meta in get_raster_bands(config).items():
+        members[name] = _raster_array_spec(
+            (n_time, n_cells),
+            (1, grid.cells_per_chunk),
+            ("time", "cells"),
+            meta["dtype"],
+            meta["fill_value"],
+            meta["attrs"] or {},
+        )
+    return members
+
+
 def raster_group_spec(grid, config, n_time: int):
     """pydantic-zarr GroupSpec for the raster ``(time, cells)`` template.
 
@@ -769,49 +830,11 @@ def raster_group_spec(grid, config, n_time: int):
     Plus ``time`` (int64 microseconds, CF attrs) and ``cell_ids`` (uint64,
     written per shard by :func:`write_raster_coords`).
     """
-    from pydantic_zarr.experimental.v3 import ArraySpec, GroupSpec, NamedConfig
+    from pydantic_zarr.experimental.v3 import GroupSpec
 
-    from zagg.config import get_raster_bands
-
-    if getattr(grid, "sharded", False):
-        raise ValueError("raster templates do not support sharded output yet (issue #218)")
+    _check_raster_grid(grid)
     n_pixels = int(np.prod(grid.array_shape))
-    if len(grid.array_shape) != 1:
-        raise ValueError(
-            "raster templates currently require a 1-D cell axis (HEALPix); "
-            "the rectilinear (time, y, x) variant is future work (issue #218)"
-        )
-
-    def _arr(shape, chunks, dims, dtype, fill, attrs=None):
-        return ArraySpec(
-            attributes=attrs or {},
-            shape=shape,
-            dimension_names=dims,
-            data_type=dtype,
-            chunk_grid=NamedConfig(name="regular", configuration={"chunk_shape": chunks}),
-            chunk_key_encoding=NamedConfig(name="default", configuration={"separator": "/"}),
-            codecs=(
-                NamedConfig(name="bytes", configuration={"endian": "little"}),
-                NamedConfig(name="zstd", configuration={"level": 3, "checksum": False}),
-            ),
-            storage_transformers=(),
-            fill_value=fill,
-        )
-
-    members = {
-        "time": _arr((n_time,), (max(n_time, 1),), ("time",), "int64", 0, dict(_TIME_ATTRS)),
-        "cell_ids": _arr((n_pixels,), (grid.cells_per_chunk,), ("cells",), "uint64", 0),
-    }
-    for name, meta in get_raster_bands(config).items():
-        members[name] = _arr(
-            (n_time, n_pixels),
-            (1, grid.cells_per_chunk),
-            ("time", "cells"),
-            meta["dtype"],
-            meta["fill_value"],
-            meta["attrs"] or {},
-        )
-    return GroupSpec(members=members, attributes={})
+    return GroupSpec(members=_raster_members(grid, config, n_time, n_pixels), attributes={})
 
 
 def emit_raster_template(store, grid, config, times_us: np.ndarray, *, overwrite: bool = False):
@@ -824,6 +847,76 @@ def emit_raster_template(store, grid, config, times_us: np.ndarray, *, overwrite
         spec.to_zarr(store, grid.group_path, overwrite=overwrite)
         arr = open_array(store, path=f"{grid.group_path}/time", zarr_format=3, consolidated=False)
         arr[:] = np.asarray(times_us, dtype=np.int64)
+    return store
+
+
+def raster_leaf_spec(grid, config, n_time: int):
+    """GroupSpec for ONE shard's hive leaf zarr (issue #247, D3/D13).
+
+    The raster analog of ``HealpixGrid.shard_spec``: the same member set as
+    :func:`raster_group_spec` — ``time``/``cell_ids`` plus one ``(time,
+    cells)`` array per band, same dtypes/fills/chunking — with the cells axis
+    sized to a single shard (``cells_per_shard``) and the time axis to the
+    LEAF's own acquisitions (``n_time`` = the groups intersecting this shard
+    × window, known at dispatch from the catalog). Wrapped in a ROOT group
+    (members under ``grid.group_path``, mirroring ``emit_shard_template``) so
+    the D4 commit stamp is one attrs update on an object that exists anyway.
+    """
+    from pydantic_zarr.experimental.v3 import GroupSpec
+
+    _check_raster_grid(grid)
+    inner = GroupSpec(
+        members=_raster_members(grid, config, n_time, grid.cells_per_shard), attributes={}
+    )
+    return GroupSpec(members={grid.group_path: inner}, attributes={})
+
+
+def emit_raster_leaf_template(
+    store, grid, config, shard_key: int, times_us: np.ndarray, *, overwrite: bool = False
+):
+    """Write one leaf's template plus its ``time`` and ``cell_ids`` coords.
+
+    Unlike the flat path (template at fan-out time, coords per shard after
+    the slabs), a leaf's coordinates are fully known at template time — the
+    time axis is the leaf's own acquisition groups and ``cell_ids`` is the
+    shard's children — so both are written here, once. Called lazily on the
+    first slab (mirroring ``process_and_write_hive``'s lazy ``_leaf``) with
+    ``overwrite=True`` so a no-data shard never creates the ``.zarr/`` prefix
+    and a retry replaces debris wholesale (D4).
+    """
+    from zarr import config as zarr_config
+    from zarr import open_array
+
+    spec = raster_leaf_spec(grid, config, int(len(times_us)))
+    cell_ids = grid.encode_cell_ids(grid.children(int(shard_key)))
+    with zarr_config.set({"async.concurrency": 128}):
+        spec.to_zarr(store, "", overwrite=overwrite)
+        arr = open_array(store, path=f"{grid.group_path}/time", zarr_format=3, consolidated=False)
+        arr[:] = np.asarray(times_us, dtype=np.int64)
+        arr = open_array(
+            store, path=f"{grid.group_path}/cell_ids", zarr_format=3, consolidated=False
+        )
+        arr[:] = np.asarray(cell_ids, dtype=np.uint64)
+    return store
+
+
+def write_raster_leaf_slab(store, grid, t_idx: int, slab: dict):
+    """Write one timestep's slab at LEAF-LOCAL indices: ``array[t, :] = values``.
+
+    The leaf's arrays span exactly one shard, so the cell axis needs no
+    block offset (contrast :func:`write_raster_slab`); ``t_idx`` is the
+    leaf-local timestep from the leaf's own time index. Chunk-aligned by
+    construction (whole rows of ``(1, cells_per_chunk)`` chunks).
+    """
+    from zarr import config as zarr_config
+    from zarr import open_array
+
+    with zarr_config.set({"async.concurrency": 128}):
+        for name, values in slab.items():
+            arr = open_array(
+                store, path=f"{grid.group_path}/{name}", zarr_format=3, consolidated=False
+            )
+            arr[int(t_idx), :] = np.asarray(values, dtype=arr.dtype)
     return store
 
 
@@ -880,7 +973,10 @@ __all__ = [
     "raster_time_index",
     "process_raster_shard",
     "raster_group_spec",
+    "raster_leaf_spec",
     "emit_raster_template",
+    "emit_raster_leaf_template",
     "write_raster_slab",
+    "write_raster_leaf_slab",
     "write_raster_coords",
 ]

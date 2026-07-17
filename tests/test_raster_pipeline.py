@@ -695,6 +695,103 @@ class TestTemplateAndSlabs:
         assert (got[~valid] == 0).all()  # fill outside the raster footprint
 
 
+class TestLeafTemplate:
+    """Per-(shard, window) hive leaf templates (issue #247 phase 2)."""
+
+    def test_leaf_spec_shapes_and_root_group(self, tmp_path):
+        from zagg.processing.raster import raster_leaf_spec
+
+        cfg, grid, _shard = _healpix_setup(tmp_path)
+        spec = raster_leaf_spec(grid, cfg, 3)
+        inner = spec.members[grid.group_path]  # root group wraps the members (D4 stamp target)
+        red = inner.members["red"]
+        assert tuple(red.shape) == (3, grid.cells_per_shard)
+        cg = red.chunk_grid
+        cfg_block = cg["configuration"] if isinstance(cg, dict) else cg.configuration
+        assert tuple(cfg_block["chunk_shape"]) == (1, grid.cells_per_chunk)
+        assert red.attributes["scale_factor"] == 0.0001
+        assert tuple(inner.members["time"].shape) == (3,)
+        assert tuple(inner.members["cell_ids"].shape) == (grid.cells_per_shard,)
+
+    def test_leaf_spec_sharded_rejected(self, tmp_path):
+        from zagg.processing.raster import raster_leaf_spec
+
+        cfg, grid, _shard = _healpix_setup(tmp_path)
+        grid.sharded = True
+        with pytest.raises(ValueError, match="read-modify-write"):
+            raster_leaf_spec(grid, cfg, 1)
+
+    def test_leaf_template_round_trip(self, tmp_path):
+        # Emit one leaf, stream the shard's slabs into it at leaf-local
+        # indices, and read everything back: per-band dtype/fill, the leaf's
+        # own time axis, and the shard's cell_ids — written at template time,
+        # not per-slab.
+        from zagg.processing.raster import emit_raster_leaf_template, write_raster_leaf_slab
+
+        cfg, grid, shard = _healpix_setup(tmp_path)
+        data = _index_raster()
+        _write_tiff(tmp_path / "t0.tif", data)
+        _write_tiff(tmp_path / "t1.tif", np.full((96, 96), 321, dtype=np.uint16))
+        granules = [
+            _entry("g0", {"red": str(tmp_path / "t0.tif")}, T0, time_key="dt-1"),
+            _entry("g1", {"red": str(tmp_path / "t1.tif")}, T1, time_key="dt-2"),
+        ]
+        index, times = raster_time_index([granules])
+
+        store = MemoryStore()
+        emit_raster_leaf_template(store, grid, cfg, shard, times)
+        slabs, _meta = process_raster_shard(grid, shard, granules, cfg, index)
+        for t, slab in slabs.items():
+            write_raster_leaf_slab(store, grid, t, slab)
+
+        red = open_array(store, path=f"{grid.group_path}/red", zarr_format=3, consolidated=False)
+        assert red.shape == (2, grid.cells_per_shard)
+        assert red.dtype == np.uint16 and red.fill_value == 0
+        cells = grid.children(shard)
+        rows, cols, valid = grid.sample(cells, UTM18, TRANSFORM, (96, 96))
+        got_t0 = red[0, :]
+        np.testing.assert_array_equal(got_t0[valid], data[rows[valid], cols[valid]])
+        assert (got_t0[~valid] == 0).all()
+        assert (red[1, :][valid] == 321).all()
+        tarr = open_array(store, path=f"{grid.group_path}/time", zarr_format=3, consolidated=False)
+        np.testing.assert_array_equal(tarr[:], times)
+        assert tarr.attrs["units"] == "microseconds since 1970-01-01T00:00:00"
+        ids = open_array(
+            store, path=f"{grid.group_path}/cell_ids", zarr_format=3, consolidated=False
+        )
+        np.testing.assert_array_equal(
+            ids[:], np.asarray(grid.encode_cell_ids(cells), dtype=np.uint64)
+        )
+
+    def test_leaf_overwrite_replaces_wholesale(self, tmp_path):
+        # Retry semantics (D4): re-emitting with overwrite=True replaces the
+        # prior attempt's arrays — a NARROWER time axis must not leave stale
+        # timesteps behind.
+        from zagg.processing.raster import emit_raster_leaf_template
+
+        cfg, grid, shard = _healpix_setup(tmp_path)
+        store = MemoryStore()
+        emit_raster_leaf_template(store, grid, cfg, shard, np.array([1, 2, 3], dtype=np.int64))
+        emit_raster_leaf_template(
+            store, grid, cfg, shard, np.array([9], dtype=np.int64), overwrite=True
+        )
+        red = open_array(store, path=f"{grid.group_path}/red", zarr_format=3, consolidated=False)
+        assert red.shape == (1, grid.cells_per_shard)
+        tarr = open_array(store, path=f"{grid.group_path}/time", zarr_format=3, consolidated=False)
+        np.testing.assert_array_equal(tarr[:], [9])
+
+    def test_flat_template_unchanged_by_refactor(self, tmp_path):
+        # The shared-members refactor must leave the FLAT template spec
+        # byte-identical: same member set, shapes, chunking, codecs.
+        cfg, grid, _shard = _healpix_setup(tmp_path)
+        spec = raster_group_spec(grid, cfg, 2)
+        assert set(spec.members) == {"time", "cell_ids", "red"}
+        assert tuple(spec.members["red"].shape) == (2, 4096)
+        codecs = spec.members["red"].codecs
+        names = [c["name"] if isinstance(c, dict) else c.name for c in codecs]
+        assert names == ["bytes", "zstd"]
+
+
 class TestGeometryCache:
     """Issue #244: the pull-NN mapping is memoized per (epsg, transform, shape)
     within a shard invoke — once per distinct source grid, not once per
