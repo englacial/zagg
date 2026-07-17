@@ -1,4 +1,12 @@
 AWSTemplateFormatVersion: "2010-09-09"
+# The AWS::LanguageExtensions macro provides Fn::ForEach, which stamps the
+# issue #235 worker-size variants from one parameterized block per resource
+# family instead of ~24 hand-written near-identical resources. The macro runs
+# server-side at change-set creation (stand_up.sh deploys via change sets, so
+# no mechanical change there); the expansion is deterministic and visible in
+# the change set, or post-deploy via
+# `aws cloudformation get-template --template-stage Processed`.
+Transform: AWS::LanguageExtensions
 Description: >-
   zagg serverless backend — Lambda execution role, dependency layer, and the
   process-shard Lambda function. By default the stack creates its own execution
@@ -145,7 +153,30 @@ Parameters:
       creates /aws/lambda/<fn> log groups lazily on first invocation and
       AWS::Logs::MetricFilter requires the group to exist, so on a FRESH
       stack: create with "false", invoke each function once, then update
-      the stack with "true". Existing deployments keep the default.
+      the stack with "true". This covers all 8 log groups — the base
+      function, its -extract twin, and the 6 worker-size variants
+      (issue #235). Existing deployments keep the default.
+
+  WorkerMemorySizes:
+    Type: CommaDelimitedList
+    Default: "2048,4096,8192"
+    Description: >-
+      Memory sizes (MB) of the pre-provisioned worker-size variants
+      (issue #235). Each size S stamps two functions via Fn::ForEach:
+      <FunctionName>-S (default 512 MB /tmp) and <FunctionName>-S-disk
+      (/tmp from the WorkerDiskTmp mapping — keep that table in sync with
+      this list). The unsuffixed function and its -extract twin are
+      independent of this list and stay the no-config default.
+
+Mappings:
+  # /tmp for the -disk variants is memory + 2048 MB (issue #235 thread
+  # decision); 10240 for the 8192 variant is exactly Lambda's
+  # EphemeralStorage ceiling, so the rule holds with no clamping. Keys must
+  # cover every WorkerMemorySizes entry.
+  WorkerDiskTmp:
+    "2048": {SizeMb: 4096}
+    "4096": {SizeMb: 6144}
+    "8192": {SizeMb: 10240}
 
 Conditions:
   ShouldCreateBucket: !Equals [!Ref CreateOutputBucket, "true"]
@@ -366,6 +397,139 @@ Resources:
           MetricValue: "1"
           DefaultValue: 0
 
+  # Pre-provisioned worker-size variants (issue #235): same code zip, layer,
+  # role, timeout, and env as ProcessFn — selected at run time by function
+  # name (config `worker:` block / agg(function_name=...)), so per-run sizing
+  # needs no admin-role config mutation. Two Fn::ForEach loops over
+  # WorkerMemorySizes stamp, per size S: <FunctionName>-S (this loop, default
+  # 512 MB /tmp) and <FunctionName>-S-disk (next loop, /tmp from
+  # WorkerDiskTmp). Each variant carries the issue #151 EventInvokeConfig and
+  # the issue #175 self-recycle/worker-error metric-filter pair, mirroring
+  # the unsuffixed function's blocks above. The variant FunctionName strings
+  # are assembled ONLY in each loop's `FunctionName: !Sub` line.
+  'Fn::ForEach::WorkerSizeVariants':
+    - WorkerMemory
+    - !Ref WorkerMemorySizes
+    - 'WorkerFn${WorkerMemory}':
+        Type: AWS::Lambda::Function
+        Properties:
+          FunctionName: !Sub "${FunctionName}-${WorkerMemory}"
+          Handler: lambda_handler.lambda_handler
+          Runtime: python3.12
+          Architectures: [!Ref Architecture]
+          MemorySize: !Ref WorkerMemory
+          Timeout: !Ref Timeout
+          Role: !If [ShouldCreateRole, !GetAtt ExecutionRole.Arn, !Ref ExecutionRoleArn]
+          Layers: [!Ref DepsLayer]
+          Environment:
+            Variables:
+              MALLOC_ARENA_MAX: !Ref MallocArenaMax
+              MALLOC_TRIM_THRESHOLD_: !Ref MallocTrimThreshold
+              ZAGG_RECYCLE_RSS_MB: !Ref RecycleRssMb
+              ZAGG_RECYCLE_MAX_INVOCATIONS: !Ref RecycleMaxInvocations
+          Code:
+            S3Bucket: !Ref ArtifactBucket
+            S3Key: !Ref FunctionS3Key
+      'WorkerFn${WorkerMemory}AsyncConfig':
+        Type: AWS::Lambda::EventInvokeConfig
+        Properties:
+          FunctionName: !Ref 'WorkerFn${WorkerMemory}'
+          Qualifier: "$LATEST"
+          MaximumRetryAttempts: 0
+          MaximumEventAgeInSeconds: 60
+      'WorkerFn${WorkerMemory}SelfRecycleFilter':
+        Type: AWS::Logs::MetricFilter
+        Condition: ShouldCreateMetricFilters
+        DependsOn: 'WorkerFn${WorkerMemory}'
+        Properties:
+          LogGroupName: !Sub "/aws/lambda/${FunctionName}-${WorkerMemory}"
+          FilterPattern: '"ZAGG_SELF_RECYCLE"'
+          MetricTransformations:
+            - MetricNamespace: zagg/lambda
+              MetricName: 'Worker${WorkerMemory}SelfRecycleCount'
+              MetricValue: "1"
+              DefaultValue: 0
+      'WorkerFn${WorkerMemory}WorkerErrorFilter':
+        Type: AWS::Logs::MetricFilter
+        Condition: ShouldCreateMetricFilters
+        DependsOn: 'WorkerFn${WorkerMemory}'
+        Properties:
+          LogGroupName: !Sub "/aws/lambda/${FunctionName}-${WorkerMemory}"
+          FilterPattern: >-
+            ?"Task timed out" ?"Runtime.OutOfMemory"
+            ?"Runtime exited with error" ?"[ERROR]"
+            ?"Traceback (most recent call last)"
+          MetricTransformations:
+            - MetricNamespace: zagg/lambda
+              MetricName: 'Worker${WorkerMemory}WorkerErrorCount'
+              MetricValue: "1"
+              DefaultValue: 0
+
+  # The -disk trio (issue #235 / #217): identical to the loop above except
+  # for the -disk name suffix and an explicit EphemeralStorage from the
+  # WorkerDiskTmp mapping (memory + 2048 MB). EphemeralStorage appears ONLY
+  # here — the default-512 trio omits it (512 is free; extra /tmp bills per
+  # GB-s above 512, idle functions cost nothing either way).
+  'Fn::ForEach::WorkerDiskVariants':
+    - WorkerMemory
+    - !Ref WorkerMemorySizes
+    - 'WorkerFn${WorkerMemory}Disk':
+        Type: AWS::Lambda::Function
+        Properties:
+          FunctionName: !Sub "${FunctionName}-${WorkerMemory}-disk"
+          Handler: lambda_handler.lambda_handler
+          Runtime: python3.12
+          Architectures: [!Ref Architecture]
+          MemorySize: !Ref WorkerMemory
+          Timeout: !Ref Timeout
+          Role: !If [ShouldCreateRole, !GetAtt ExecutionRole.Arn, !Ref ExecutionRoleArn]
+          Layers: [!Ref DepsLayer]
+          EphemeralStorage:
+            Size: !FindInMap [WorkerDiskTmp, !Ref WorkerMemory, SizeMb]
+          Environment:
+            Variables:
+              MALLOC_ARENA_MAX: !Ref MallocArenaMax
+              MALLOC_TRIM_THRESHOLD_: !Ref MallocTrimThreshold
+              ZAGG_RECYCLE_RSS_MB: !Ref RecycleRssMb
+              ZAGG_RECYCLE_MAX_INVOCATIONS: !Ref RecycleMaxInvocations
+          Code:
+            S3Bucket: !Ref ArtifactBucket
+            S3Key: !Ref FunctionS3Key
+      'WorkerFn${WorkerMemory}DiskAsyncConfig':
+        Type: AWS::Lambda::EventInvokeConfig
+        Properties:
+          FunctionName: !Ref 'WorkerFn${WorkerMemory}Disk'
+          Qualifier: "$LATEST"
+          MaximumRetryAttempts: 0
+          MaximumEventAgeInSeconds: 60
+      'WorkerFn${WorkerMemory}DiskSelfRecycleFilter':
+        Type: AWS::Logs::MetricFilter
+        Condition: ShouldCreateMetricFilters
+        DependsOn: 'WorkerFn${WorkerMemory}Disk'
+        Properties:
+          LogGroupName: !Sub "/aws/lambda/${FunctionName}-${WorkerMemory}-disk"
+          FilterPattern: '"ZAGG_SELF_RECYCLE"'
+          MetricTransformations:
+            - MetricNamespace: zagg/lambda
+              MetricName: 'Worker${WorkerMemory}DiskSelfRecycleCount'
+              MetricValue: "1"
+              DefaultValue: 0
+      'WorkerFn${WorkerMemory}DiskWorkerErrorFilter':
+        Type: AWS::Logs::MetricFilter
+        Condition: ShouldCreateMetricFilters
+        DependsOn: 'WorkerFn${WorkerMemory}Disk'
+        Properties:
+          LogGroupName: !Sub "/aws/lambda/${FunctionName}-${WorkerMemory}-disk"
+          FilterPattern: >-
+            ?"Task timed out" ?"Runtime.OutOfMemory"
+            ?"Runtime exited with error" ?"[ERROR]"
+            ?"Traceback (most recent call last)"
+          MetricTransformations:
+            - MetricNamespace: zagg/lambda
+              MetricName: 'Worker${WorkerMemory}DiskWorkerErrorCount'
+              MetricValue: "1"
+              DefaultValue: 0
+
 Outputs:
   FunctionArn:
     Description: ARN of the deployed Lambda function.
@@ -385,3 +549,12 @@ Outputs:
   OutputBucket:
     Description: Bucket where results are written.
     Value: !Ref OutputBucketName
+  'Fn::ForEach::WorkerVariantArns':
+    - WorkerMemory
+    - !Ref WorkerMemorySizes
+    - 'WorkerFn${WorkerMemory}Arn':
+        Description: 'ARN of the ${WorkerMemory} MB worker-size variant (issue #235).'
+        Value: !GetAtt 'WorkerFn${WorkerMemory}.Arn'
+      'WorkerFn${WorkerMemory}DiskArn':
+        Description: 'ARN of the ${WorkerMemory} MB extra-disk worker variant (issue #235).'
+        Value: !GetAtt 'WorkerFn${WorkerMemory}Disk.Arn'

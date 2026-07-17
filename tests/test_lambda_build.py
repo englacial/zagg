@@ -382,6 +382,172 @@ class TestTemplateEnvironment:
         assert props["MaximumEventAgeInSeconds"] < _ASYNC_POLL_MARGIN_S
 
 
+class TestWorkerSizeVariants:
+    """The Fn::ForEach worker-size variants must expand as ratified (issue #235).
+
+    The template declares the 6 pre-provisioned variants (memories 2048/4096/
+    8192, each with a default-512 and a -disk /tmp twin) via two
+    ``Fn::ForEach`` loops under the ``AWS::LanguageExtensions`` transform.
+    ``_expand_foreach`` renders those loops the way the transform does —
+    textual ``${Identifier}`` substitution plus ``!Ref Identifier``
+    replacement per collection value — so these tests pin the concrete
+    function set (names, memories, /tmp sizes) without a deploy.
+    """
+
+    _SIZES = ("2048", "4096", "8192")
+    _DISK_TMP = {"2048": 4096, "4096": 6144, "8192": 10240}
+    _LAMBDA_EPHEMERAL_CEILING_MB = 10240
+
+    @staticmethod
+    def _expand_foreach(tpl, section):
+        """Expand ``Fn::ForEach::*`` keys of ``section`` to concrete entries."""
+
+        def _subst(node, ident, value):
+            if isinstance(node, dict):
+                if node == {"Ref": ident}:
+                    return value
+                return {_subst(k, ident, value): _subst(v, ident, value) for k, v in node.items()}
+            if isinstance(node, list):
+                return [_subst(item, ident, value) for item in node]
+            if isinstance(node, str):
+                return node.replace("${" + ident + "}", value)
+            return node
+
+        out = {}
+        for key, node in section.items():
+            if not key.startswith("Fn::ForEach::"):
+                out[key] = node
+                continue
+            ident, collection, fragment = node
+            if isinstance(collection, dict) and "Ref" in collection:
+                collection = tpl["Parameters"][collection["Ref"]]["Default"].split(",")
+            for value in collection:
+                for frag_key, frag_val in fragment.items():
+                    expanded_key = _subst(frag_key, ident, value)
+                    assert expanded_key not in out, f"duplicate logical id {expanded_key}"
+                    out[expanded_key] = _subst(frag_val, ident, value)
+        return out
+
+    @classmethod
+    def _resolve_find_in_map(cls, tpl, node):
+        map_name, top_key, second_key = node["FindInMap"]
+        return tpl["Mappings"][map_name][top_key][second_key]
+
+    def _expanded_resources(self):
+        tpl = TestTemplateEnvironment._load_template()
+        return tpl, self._expand_foreach(tpl, tpl["Resources"])
+
+    def test_language_extensions_transform_declared(self):
+        # Fn::ForEach only exists under the macro; without the Transform the
+        # loops would deploy as (invalid) literal resources.
+        tpl = TestTemplateEnvironment._load_template()
+        assert tpl["Transform"] == "AWS::LanguageExtensions"
+
+    def test_size_list_and_disk_mapping_stay_in_sync(self):
+        # One source of truth for the sizes: the CommaDelimitedList default.
+        # The -disk /tmp mapping must cover exactly those sizes.
+        tpl = TestTemplateEnvironment._load_template()
+        sizes = tuple(tpl["Parameters"]["WorkerMemorySizes"]["Default"].split(","))
+        assert sizes == self._SIZES
+        assert set(tpl["Mappings"]["WorkerDiskTmp"]) == set(sizes)
+
+    def test_foreach_expands_to_six_variants(self):
+        # The ratified matrix: 3 memories x {default 512 /tmp, -disk /tmp =
+        # memory + 2048} -> 6 functions; the top -disk size sits exactly at
+        # Lambda's EphemeralStorage ceiling (no clamping).
+        tpl, resources = self._expanded_resources()
+        for size in self._SIZES:
+            std = resources[f"WorkerFn{size}"]["Properties"]
+            assert std["FunctionName"] == {"Sub": f"${{FunctionName}}-{size}"}
+            assert std["MemorySize"] == size
+            assert "EphemeralStorage" not in std  # default 512 MB /tmp
+            disk = resources[f"WorkerFn{size}Disk"]["Properties"]
+            assert disk["FunctionName"] == {"Sub": f"${{FunctionName}}-{size}-disk"}
+            assert disk["MemorySize"] == size
+            tmp_mb = self._resolve_find_in_map(tpl, disk["EphemeralStorage"]["Size"])
+            assert tmp_mb == self._DISK_TMP[size] == int(size) + 2048
+        assert self._DISK_TMP["8192"] == self._LAMBDA_EPHEMERAL_CEILING_MB
+
+    def test_variants_mirror_process_fn(self):
+        # Same lockstep contract as ExtractFn (test_extract_fn_mirrors_
+        # process_fn): variants share code/layer/role/timeout/env with
+        # ProcessFn, differing only in FunctionName, MemorySize, and (disk
+        # trio) EphemeralStorage.
+        _, resources = self._expanded_resources()
+        process = resources["ProcessFn"]["Properties"]
+        for size in self._SIZES:
+            for logical in (f"WorkerFn{size}", f"WorkerFn{size}Disk"):
+                variant = resources[logical]["Properties"]
+                for key in (
+                    "Handler",
+                    "Runtime",
+                    "Architectures",
+                    "Timeout",
+                    "Role",
+                    "Layers",
+                    "Environment",
+                    "Code",
+                ):
+                    assert variant[key] == process[key], f"{logical}.{key} diverges from ProcessFn"
+
+    def test_variant_async_configs_mirror_process_fn(self):
+        # issue #151 hygiene on every variant: retries 0, event age 60.
+        _, resources = self._expanded_resources()
+        process = dict(resources["ProcessFnAsyncConfig"]["Properties"])
+        process.pop("FunctionName")
+        for size in self._SIZES:
+            for logical in (f"WorkerFn{size}", f"WorkerFn{size}Disk"):
+                cfg = dict(resources[f"{logical}AsyncConfig"]["Properties"])
+                assert cfg.pop("FunctionName") == {"Ref": logical}
+                assert cfg == process  # Qualifier, retries, event age identical
+
+    def test_variant_metric_filters_mirror_process_fn(self):
+        # issue #175 split on every variant's log group, with per-function
+        # metric names (unique across the whole template) and patterns
+        # byte-identical to the unsuffixed function's.
+        _, resources = self._expanded_resources()
+        recycle = resources["ProcessSelfRecycleFilter"]["Properties"]["FilterPattern"]
+        errors = resources["ProcessWorkerErrorFilter"]["Properties"]["FilterPattern"]
+        for size in self._SIZES:
+            for logical, group_suffix, metric_stem in (
+                (f"WorkerFn{size}", f"-{size}", f"Worker{size}"),
+                (f"WorkerFn{size}Disk", f"-{size}-disk", f"Worker{size}Disk"),
+            ):
+                for kind, pattern, metric in (
+                    ("SelfRecycleFilter", recycle, f"{metric_stem}SelfRecycleCount"),
+                    ("WorkerErrorFilter", errors, f"{metric_stem}WorkerErrorCount"),
+                ):
+                    fltr = resources[f"{logical}{kind}"]
+                    assert fltr["Type"] == "AWS::Logs::MetricFilter"
+                    assert fltr["Condition"] == "ShouldCreateMetricFilters"
+                    assert fltr["DependsOn"] == logical
+                    props = fltr["Properties"]
+                    assert props["LogGroupName"] == {
+                        "Sub": f"/aws/lambda/${{FunctionName}}{group_suffix}"
+                    }
+                    assert props["FilterPattern"] == pattern
+                    (mt,) = props["MetricTransformations"]
+                    assert mt["MetricNamespace"] == "zagg/lambda"
+                    assert mt["MetricName"] == metric
+                    assert mt["MetricValue"] == "1"
+                    assert mt["DefaultValue"] == 0
+        names = [
+            fltr["Properties"]["MetricTransformations"][0]["MetricName"]
+            for fltr in resources.values()
+            if isinstance(fltr, dict) and fltr.get("Type") == "AWS::Logs::MetricFilter"
+        ]
+        assert len(names) == len(set(names)) == 16  # 8 functions x 2 filters
+
+    def test_outputs_expose_variant_arns(self):
+        tpl = TestTemplateEnvironment._load_template()
+        outputs = self._expand_foreach(tpl, tpl["Outputs"])
+        for size in self._SIZES:
+            assert outputs[f"WorkerFn{size}Arn"]["Value"] == {"GetAtt": f"WorkerFn{size}.Arn"}
+            assert outputs[f"WorkerFn{size}DiskArn"]["Value"] == {
+                "GetAtt": f"WorkerFn{size}Disk.Arn"
+            }
+
+
 class TestLayerExtraParity:
     """The ``lambda`` extra pins and build_layer.sh must actually stay in sync.
 
