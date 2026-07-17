@@ -165,8 +165,11 @@ Parameters:
       (issue #235). Each size S stamps two functions via Fn::ForEach:
       <FunctionName>-S (default 512 MB /tmp) and <FunctionName>-S-disk
       (/tmp from the WorkerDiskTmp mapping — keep that table in sync with
-      this list). The unsuffixed function and its -extract twin are
-      independent of this list and stay the no-config default.
+      this list). This is not a free-form knob: any added size needs a
+      matching WorkerDiskTmp entry and must keep memory+2048 within Lambda's
+      10240 MB /tmp ceiling (so nothing above 8192). The unsuffixed function
+      and its -extract twin are independent of this list and stay the
+      no-config default.
 
 Mappings:
   # /tmp for the -disk variants is memory + 2048 MB (issue #235 thread
