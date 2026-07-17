@@ -81,7 +81,7 @@ def _maybe_warn_dense(layout: str) -> None:
         warnings.warn(_DENSE_DEPRECATION_MSG, DeprecationWarning, stacklevel=3)
 
 
-def _resolve_function_name(config, function_name):
+def _resolve_function_name(config: PipelineConfig, function_name: str | None) -> str:
     """Resolve the Lambda function to invoke (issue #235).
 
     Precedence: an explicit ``function_name`` (``agg`` kwarg /
