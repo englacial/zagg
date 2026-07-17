@@ -94,6 +94,26 @@ def test_dry_run_builds_shardmap_offline(tmp_path):
     assert df.iloc[0]["stage_fetch_s"] is None or str(df.iloc[0]["stage_fetch_s"]) == "nan"
 
 
+def test_pending_hive_target_blocked_on_237():
+    # The hive raster leg (espg directive on PR #261) waits in pending_targets
+    # until issue #237 lands upstream. This TRIPWIRE pins today's gate: the
+    # raster path still rejects hive (issue #239). When issue #237 merges and
+    # this stops raising, promote the pending target into "targets" (the
+    # harness already applies the store_layout override) and delete this test.
+    from zagg.config import load_config, validate_config
+
+    manifest, base = rrb.load_targets(str(BENCH / "targets_raster_neon.json"))
+    pend = manifest["pending_targets"]["raster_s2_neon_2025_hive"]
+    assert pend["store_layout"] == "hive" and pend["blocked_by"] == "#237"
+    assert pend["config"] == manifest["targets"]["raster_s2_neon_2025"]["config"]
+    cfg = load_config(str(base / pend["config"]))
+    cfg.output["store_layout"] = "hive"
+    with pytest.raises(ValueError, match="issue #237"):
+        validate_config(cfg)
+    # pending_targets never joins the default dispatch set.
+    assert "raster_s2_neon_2025_hive" not in manifest["targets"]
+
+
 def test_live_dispatch_requires_store_prefix(tmp_path):
     with pytest.raises(SystemExit, match="store-prefix"):
         rrb.main(
@@ -209,6 +229,7 @@ def _record(commit="c0", target="raster_s2_neon_2025", event="release", **over):
         "stage_counts": {"assets": 425, "tiles": 1300, "geom_hits": 81},
         # Peak worker RSS, max across shards (issue #250 raster parity).
         "max_memory_mb": 2890.0,
+        "store_layout": "flat",  # hive rows arrive with the issue #237 flip
     }
     r.update(over)
     return r
@@ -235,7 +256,8 @@ def test_records_to_frame_column_stable_and_unknown_stage_stays_json():
     # Memory rides the series (issue #250 raster parity): retained, and the
     # renderers colour raster markers from it + memory_gb like the point legs.
     assert df.iloc[0]["max_memory_mb"] == 2890.0
-    assert rs.RASTER_COLUMNS[-1] == "max_memory_mb"
+    assert df.iloc[0]["store_layout"] == "flat"
+    assert rs.RASTER_COLUMNS[-2:] == ["max_memory_mb", "store_layout"]
 
 
 def test_append_dedups_and_main_retains_release_only(tmp_path):
