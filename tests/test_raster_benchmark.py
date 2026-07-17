@@ -179,6 +179,105 @@ def test_median_helper():
     assert rrb._median([1.0, 2.0, 9.0]) == 2.0
 
 
+# --- dispatch transport (mocked boto, no AWS) -------------------------------
+
+
+class _FakePayload:
+    def __init__(self, text: str):
+        self._text = text
+
+    def read(self):
+        return self._text.encode("utf-8")
+
+
+class _FakeLambdaClient:
+    """Records each shard's event and replays a scripted invoke envelope."""
+
+    def __init__(self, responder):
+        self._responder = responder
+        self.events: list[dict] = []
+
+    def invoke(self, **kwargs):
+        # boto's invoke uses PascalCase kwargs (FunctionName/InvocationType/Payload).
+        event = json.loads(kwargs["Payload"])
+        self.events.append(event)
+        return self._responder(event)
+
+
+def _envelope(body: dict, status: int = 200) -> dict:
+    # The nested Lambda proxy shape the harness unwraps: outer JSON with a
+    # string ``body`` that is itself JSON.
+    return {"Payload": _FakePayload(json.dumps({"statusCode": status, "body": json.dumps(body)}))}
+
+
+def _dispatch_config():
+    from types import SimpleNamespace
+
+    return SimpleNamespace(
+        data_source={"reader": "raster"}, output={"store_layout": "flat"}, pipeline="raster"
+    )
+
+
+def _install_fake_lambda(monkeypatch, responder) -> _FakeLambdaClient:
+    # ``_dispatch_shards`` imports boto3 internally, so patch the attribute.
+    client = _FakeLambdaClient(responder)
+    monkeypatch.setattr("boto3.client", lambda *a, **k: client)
+    return client
+
+
+def _dispatch_one(monkeypatch, responder, shard_key=1):
+    client = _install_fake_lambda(monkeypatch, responder)
+    cells = [(shard_key, [{"assets": {"red": "u"}, "time_key": "t1"}])]
+    results = rrb._dispatch_shards(
+        cells,
+        _dispatch_config(),
+        {"t1": ["a"], "t2": ["b"]},  # t2 belongs to another shard's slice
+        "s3://bucket/x.zarr",
+        region="us-west-2",
+        function_name="process-shard",
+    )
+    return client, results
+
+
+def test_dispatch_shards_happy_path(monkeypatch):
+    client, results = _dispatch_one(
+        monkeypatch, lambda event: _envelope({"duration_s": 120.0, "timesteps": 3}), shard_key=7
+    )
+    assert len(results) == 1
+    r = results[0]
+    assert r["error"] is None and r["body"]["duration_s"] == 120.0
+    # The event is the runner's raster envelope: mode/profile/int key, the
+    # store path, and ONLY this shard's own time-index slice (never global).
+    event = client.events[0]
+    assert event["mode"] == "process_raster" and event["profile"] is True
+    assert event["shard_key"] == 7 and isinstance(event["shard_key"], int)
+    assert event["store_path"] == "s3://bucket/x.zarr"
+    assert event["time_index"] == {"t1": ["a"]}
+
+
+def test_dispatch_shards_function_error(monkeypatch):
+    _client, results = _dispatch_one(
+        monkeypatch,
+        lambda event: {"Payload": _FakePayload("boom traceback"), "FunctionError": "Unhandled"},
+    )
+    assert results[0]["error"].startswith("Lambda error:") and "body" not in results[0]
+
+
+def test_dispatch_shards_non_200_surfaces_body_error(monkeypatch):
+    _client, results = _dispatch_one(
+        monkeypatch, lambda event: _envelope({"error": "shard blew up"}, status=500)
+    )
+    assert results[0]["error"] == "shard blew up" and "body" not in results[0]
+
+
+def test_dispatch_shards_exception_becomes_error_string(monkeypatch):
+    def _boom(event):
+        raise RuntimeError("network down")
+
+    _client, results = _dispatch_one(monkeypatch, _boom)
+    assert results[0]["error"] == "network down" and "body" not in results[0]
+
+
 # --- raster series append core ----------------------------------------------
 
 
