@@ -116,8 +116,11 @@ leaf stores. No zarr-version coupling in either direction.
 
 Written **asynchronously at init** (issue #252 hybrid — the write comes off
 the synchronous pre-dispatch path: the Lambda leg posts a fire-and-forget
-setup invoke right after the fail-fast ping, so the manifest lands seconds
-into the run and readers can consume completed leaves mid-run; finalize
+setup invoke right after the fail-fast ping, so the manifest typically lands
+within seconds of init (best-effort: the Event invoke shares worker
+concurrency and runs retries-0, deferring to the finalize backstop under
+throttling or a dropped invoke) and readers can consume completed leaves
+mid-run; finalize
 keeps an idempotent backstop that self-heals a lost async write; a read-only
 frozen-key precheck keeps the up-front refusal on reruns — concurrent first
 writes now collide within seconds of init). O(1); otherwise never touched

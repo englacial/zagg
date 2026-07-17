@@ -264,8 +264,11 @@ def ensure_manifest(store_root: str, manifest: dict, *, overwrite: bool = False,
     Lifecycle (issue #252 hybrid): the PRIMARY write runs at init — the local
     dispatcher writes directly pre-dispatch; the lambda dispatcher fires the
     ``mode="setup"`` hive branch as a fire-and-forget Event invoke right
-    after the ping — so the manifest lands seconds into the run and a reader
-    can consume completed leaves while the store builds. Finalize calls this
+    after the ping — so the manifest typically lands within seconds of init
+    (best-effort: the Event invoke shares worker concurrency and runs
+    retries-0, deferring to the finalize backstop under throttling or a
+    dropped invoke) and a reader can consume completed leaves while the store
+    builds. Finalize calls this
     again as an idempotent BACKSTOP (an existing frozen-key-matching manifest
     is accepted — no second PUT): worker Event invokes run with retries 0, so
     a lost async init write self-heals at finalize. The fail-fast half of the

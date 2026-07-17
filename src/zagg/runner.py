@@ -2217,10 +2217,12 @@ def _run_lambda(
     # while flat exists — issue #251) — then the manifest write fires as a
     # fire-and-forget Event invoke of the existing mode="setup" hive branch
     # (~10 ms, the root-coverage dispatch precedent below): the manifest
-    # lands seconds into the run, so a reader can consume completed leaves
-    # while the store builds, and finalize's ensure_manifest demotes to an
-    # idempotent backstop. setup_s keeps bracketing the phase (ping + Event
-    # dispatch).
+    # typically lands within seconds of init (best-effort — the Event invoke
+    # shares worker concurrency and runs retries-0, so under throttling or a
+    # dropped invoke the write defers to the finalize backstop), so a reader
+    # can consume completed leaves while the store builds, and finalize's
+    # ensure_manifest demotes to an idempotent backstop. setup_s keeps
+    # bracketing the phase (ping + Event dispatch).
     setup_start = time.time()
     if get_store_layout(config) == "hive":
         _invoke_lambda_ping(
@@ -3065,8 +3067,11 @@ def _invoke_lambda_setup_async(
     hive branch (~10 ms of dispatcher wall, the root-coverage dispatch
     precedent), posted immediately after the ping passes: the handler runs
     ``ensure_manifest(build_manifest(...))`` in parallel with the worker
-    fan-out, so ``morton_hive.json`` lands seconds into the run and a reader
-    can start consuming completed leaves while the store builds. The event
+    fan-out, so ``morton_hive.json`` typically lands within seconds of init
+    (best-effort: the Event invoke shares worker concurrency and runs
+    retries-0 — under throttling or a dropped invoke the write defers to the
+    finalize backstop) and a reader can start consuming completed leaves while
+    the store builds. The event
     carries the same manifest inputs as the ping/finalize events (``config``
     + ``parent_order`` + ``dataset`` identity + ``overwrite`` — the retired
     synchronous hive setup event's shape). No response is read; a lost Event

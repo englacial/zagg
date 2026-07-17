@@ -155,9 +155,12 @@ Written **asynchronously at init**
 ([issue #252](https://github.com/englacial/zagg/issues/252) hybrid): the
 local dispatcher writes it directly before dispatch; the Lambda leg fires
 the existing `mode: "setup"` hive branch as a fire-and-forget Event invoke
-immediately after the `mode: "ping"` preflight passes, so the manifest lands
-seconds into the run and a reader can start consuming completed leaves while
-the store builds. Finalize re-ensures it as an **idempotent backstop** (a
+immediately after the `mode: "ping"` preflight passes, so the manifest
+typically lands within seconds of init (best-effort: the Event invoke shares
+worker concurrency and runs retries-0, deferring to the finalize backstop
+under throttling or a dropped invoke) and a reader can start consuming
+completed leaves while the store builds. Finalize re-ensures it as an
+**idempotent backstop** (a
 frozen-key-matching manifest is accepted — no second PUT): worker Event
 invokes run with retries 0, so a lost async init write self-heals at end of
 run, and a run that crashes mid-fan-out still left a manifest at init.
