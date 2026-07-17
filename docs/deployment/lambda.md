@@ -177,6 +177,47 @@ execution role for you; the only exception is an account whose deploy identity
 [Execution Role](execution-role.md) for that IAM-constrained, legacy/unverified
 path.
 
+### Worker-size variants {#worker-size-variants}
+
+The stack pre-provisions six size variants of the worker (issue #235) --
+same code, layer, and role as `process-shard`, differing only in memory and
+`/tmp` -- so a run picks its size by *function name*, with no
+admin-role `UpdateFunctionConfiguration` swap and no serialization between
+concurrent runs of different workloads:
+
+| Function | Memory | `/tmp` |
+|----------|--------|--------|
+| `process-shard-2048` | 2048 MB | 512 MB |
+| `process-shard-4096` | 4096 MB | 512 MB |
+| `process-shard-8192` | 8192 MB | 512 MB |
+| `process-shard-2048-disk` | 2048 MB | 4096 MB |
+| `process-shard-4096-disk` | 4096 MB | 6144 MB |
+| `process-shard-8192-disk` | 8192 MB | 10240 MB |
+
+Select a variant from the aggregation YAML with the optional top-level
+`worker:` block (alongside `pipeline:`):
+
+```yaml
+worker:
+  memory: 2048       # one of 2048 | 4096 | 8192
+  extra_disk: false  # true -> the -disk twin (/tmp = memory + 2048 MB)
+```
+
+Resolution precedence (`_resolve_function_name` in `zagg/runner.py`): an
+explicit `agg(function_name=...)` / `--function-name` wins verbatim; else the
+base name from `ZAGG_LAMBDA_FUNCTION_NAME` (default `process-shard`, so test
+stacks compose -- e.g. `process-shard-test-2048`) gets the `worker:` suffix
+appended; no block invokes the unsuffixed default, exactly as before. Invalid
+`worker:` values fail at config load with the allowed set named.
+
+!!! note "Cost caveat: memory buys vCPU"
+    Lambda allocates vCPU proportional to memory, so halving memory halves
+    $/GB-s **and** halves compute. CPU-bound shards (e.g. dense ATL03
+    aggregation) stretch in duration and eat most of the savings; I/O-bound
+    work (raster sampling, temporal readers) keeps nearly the full 2x. Pick
+    the per-template default from the workload's bottleneck, not price alone
+    (see the issue #213 utilization analysis).
+
 ### Legacy / manual deploy {#legacy-manual-deploy}
 
 !!! warning "Not the recommended path"
