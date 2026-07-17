@@ -44,9 +44,12 @@ _TDIGEST_FUNCTION = "zagg.stats.tdigest.build_tdigest"
 
 
 #: Safe per-cell slot bound for staged tdigest builds/merges, as a multiple of
-#: the field's delta: the k-1 compression law lands at <= ~1.13*delta centroids
-#: (measured: 289 max at delta=256, 578 at delta=512), so 2*delta never
-#: truncates; asserted at every staged write.
+#: the field's delta. On heavy-tailed adversarial inputs (Cauchy/Pareto) the
+#: k-1 compression law peaks near ~1.55*delta centroids (measured: 388 at
+#: delta=256, 776 at delta=512, 1544 at delta=1024) — well above the ~1.13*delta
+#: seen on well-behaved data — so keep the factor at 2: 2*delta clears that
+#: worst case and never truncates; asserted at every staged write. Do not
+#: tighten below the ~1.55*delta adversarial bound.
 _K_SLOT_FACTOR = 2
 
 #: Shared zero-size arena so releasing a field's old buffer needs no allocation.
