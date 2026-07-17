@@ -43,6 +43,16 @@ from zagg.stats.tdigest import _DEFAULT_DELTA, build_tdigest, merge_tdigests
 _TDIGEST_FUNCTION = "zagg.stats.tdigest.build_tdigest"
 
 
+#: Safe per-cell slot bound for staged tdigest builds/merges, as a multiple of
+#: the field's delta: the k-1 compression law lands at <= ~1.13*delta centroids
+#: (measured: 289 max at delta=256, 578 at delta=512), so 2*delta never
+#: truncates; asserted at every staged write.
+_K_SLOT_FACTOR = 2
+
+#: Shared zero-size arena so releasing a field's old buffer needs no allocation.
+_EMPTY_ARENA = np.empty((0, 2), dtype=np.float32)
+
+
 def _ranges_to_indices(starts: np.ndarray, lengths: np.ndarray) -> np.ndarray:
     """Element indices for concatenated ``[start, start+length)`` ranges.
 
@@ -233,14 +243,17 @@ class StreamingAggregator:
         self._buffered_granules = 0
 
     def _fold_arena(self, col_arrays, cell_to_slice) -> None:
-        """Rebuild the CSR state with this flush's cells folded in.
+        """Rebuild the CSR state with this flush's cells folded in — staged.
 
-        Sizes are exact before allocation: fresh digests (and, for cells
-        already held, their merges) are built first, so the new arena is
-        allocated once at its final size and filled — untouched cells by a
-        vectorized element gather, touched cells by per-cell slice writes.
-        Transients are one buffer's digests plus the old arena, freed on
-        return; the steady state is pure ndarrays with no per-cell objects.
+        Every intermediate is a bulk array, never a per-cell object list:
+        fresh digests are built straight into a bounded staging arena (slot
+        bound ``min(n, 2*delta)`` — group sizes are known before any build),
+        old-only and fresh-only cells move by vectorized element gathers, and
+        only genuine merges loop. A final one-gather compaction squeezes the
+        merge-compression slack back out. Flush transient is therefore old +
+        staging + bounded-new (all payload-sized, freed in stages) — the naive
+        rebuild's list of ~1M small fresh-digest ndarrays measurably cost more
+        than the state itself (issue #217 A/B replay).
         """
         fresh_cells = np.fromiter(cell_to_slice, dtype=np.uint64, count=len(cell_to_slice))
         order = np.argsort(fresh_cells)
@@ -258,35 +271,70 @@ class StreamingAggregator:
         new_counts[pos_old] = self._cell_counts
         np.add.at(new_counts, pos_fresh, ends - starts)
 
+        keep = ~np.isin(self._cells, fresh_cells, assume_unique=True)
+        ovl_idx = np.nonzero(overlap)[0]
+        held_pos = np.searchsorted(self._cells, fresh_cells[overlap])
+
         for name, (source, delta) in self._digest_fields.items():
             offsets, arena = self._offsets[name], self._arenas[name]
             k_old = np.diff(offsets)
-            # Fresh (and merged, for held cells) digests first — the same
-            # build/merge calls the dict layout makes — so every cell's final
-            # length is known before the single allocation below.
-            held_pos = np.searchsorted(self._cells, fresh_cells[overlap])
-            digests = []
+            cap = _K_SLOT_FACTOR * delta
+
+            # Stage fresh digests straight into a bounded arena — group sizes
+            # are known before any build (k <= min(n, cap)), so no per-cell
+            # object list ever exists (a 1M-cell flush as a list of small
+            # ndarrays transiently costs more than the state itself).
+            bound_fresh = np.minimum(ends - starts, cap)
+            stage_off = np.concatenate(([0], np.cumsum(bound_fresh)))
+            stage = np.empty((int(stage_off[-1]), 2), dtype=np.float32)
+            k_fresh = np.empty(len(fresh_cells), dtype=np.int64)
             for j in range(len(fresh_cells)):
                 d = build_tdigest(col_arrays[source][starts[j] : ends[j]], delta=delta)
-                digests.append(d)
-            for j, i_old in zip(np.nonzero(overlap)[0], held_pos, strict=True):
-                held = arena[offsets[i_old] : offsets[i_old + 1]]
-                digests[j] = merge_tdigests(held, digests[j], delta=delta)
+                assert len(d) <= bound_fresh[j], (
+                    f"tdigest returned {len(d)} centroids > slot bound {bound_fresh[j]} "
+                    f"(delta={delta}) — the {_K_SLOT_FACTOR}*delta compression bound broke"
+                )
+                stage[stage_off[j] : stage_off[j] + len(d)] = d
+                k_fresh[j] = len(d)
 
-            k_new = np.zeros(len(union), dtype=np.int64)
-            k_new[pos_old] = k_old
-            k_new[pos_fresh] = [len(d) for d in digests]
-            new_offsets = np.concatenate(([0], np.cumsum(k_new)))
-            new_arena = np.empty((int(new_offsets[-1]), 2), dtype=np.float32)
+            # Bounded merged layout: exact slots for old-only / fresh-only
+            # cells, min(k_old + k_fresh, cap) for merges.
+            k_bound = np.zeros(len(union), dtype=np.int64)
+            k_bound[pos_old] = k_old
+            k_bound[pos_fresh] = k_fresh
+            k_bound[pos_fresh[ovl_idx]] = np.minimum(k_old[held_pos] + k_fresh[ovl_idx], cap)
+            bound_off = np.concatenate(([0], np.cumsum(k_bound)))
+            bound_arena = np.empty((int(bound_off[-1]), 2), dtype=np.float32)
+            k_exact = k_bound.copy()
 
-            keep = ~np.isin(self._cells, fresh_cells, assume_unique=True)
             src = _ranges_to_indices(offsets[:-1][keep], k_old[keep])
-            dst = _ranges_to_indices(new_offsets[:-1][pos_old[keep]], k_old[keep])
-            new_arena[dst] = arena[src]
-            for j, i_union in enumerate(pos_fresh):
-                d = digests[j]
-                new_arena[new_offsets[i_union] : new_offsets[i_union] + len(d)] = d
-            self._offsets[name], self._arenas[name] = new_offsets, new_arena
+            dst = _ranges_to_indices(bound_off[:-1][pos_old[keep]], k_old[keep])
+            bound_arena[dst] = arena[src]
+            solo = ~overlap
+            src = _ranges_to_indices(stage_off[:-1][solo], k_fresh[solo])
+            dst = _ranges_to_indices(bound_off[:-1][pos_fresh[solo]], k_fresh[solo])
+            bound_arena[dst] = stage[src]
+            for j, i_old in zip(ovl_idx, held_pos, strict=True):
+                held = arena[offsets[i_old] : offsets[i_old + 1]]
+                fresh = stage[stage_off[j] : stage_off[j] + k_fresh[j]]
+                d = merge_tdigests(held, fresh, delta=delta)
+                u = pos_fresh[j]
+                assert len(d) <= k_bound[u], (
+                    f"merged tdigest {len(d)} centroids > slot bound {k_bound[u]} "
+                    f"(delta={delta}) — the {_K_SLOT_FACTOR}*delta compression bound broke"
+                )
+                bound_arena[bound_off[u] : bound_off[u] + len(d)] = d
+                k_exact[u] = len(d)
+            # Release the old arena and staging before compaction so the
+            # compaction peak is bound + exact, not old + stage + bound + exact.
+            self._arenas[name] = _EMPTY_ARENA
+            del arena, stage
+
+            # Compact the bounded layout to exact CSR in one vectorized gather
+            # (merge compression leaves slack only inside merged slots).
+            new_offsets = np.concatenate(([0], np.cumsum(k_exact)))
+            src = _ranges_to_indices(bound_off[:-1], k_exact)
+            self._offsets[name], self._arenas[name] = new_offsets, bound_arena[src]
 
         self._cells, self._cell_counts = union, new_counts
 
