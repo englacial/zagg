@@ -47,7 +47,7 @@ Two JSON files. ``--out-json`` is one **run record** per target::
       "setup_cost_usd",                                       # setup invoke's billed dollars (issue #250)
       "total_wall_s", "setup_s", "fanout_s", "finalize_s",
       "worker_max_s", "worker_median_s", "worker_pct_timeout", "max_memory_mb",
-      "worker_phase_max": {"read", "index", "aggregate"},     # straggler (max) seconds/phase (issue #250)
+      "worker_phase_max": {"read", "index", "aggregate", "write"},  # straggler (max) s/phase (#250/#256)
       "objects_total", "objects_expected", "objects_mismatch",  # store object counts (issue #240), record-only
       "write_throughput": {                                    # leg-5 acceptance signal
         "invoke_retries_total", "invoke_throttle_shards",
