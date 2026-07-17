@@ -201,21 +201,34 @@ def _cap_mb(hist: pd.DataFrame) -> float:
     return 4.0 * 1024.0
 
 
+def _summary_ready(hist: pd.DataFrame) -> bool:
+    """A hist charts only if it carries non-null billed + wall totals.
+
+    Both panels are indexed unguarded below, so a frame missing either column
+    (or with it all-null) is skipped like an empty hist rather than crashing --
+    keeping the renderer's "return False, never raise" contract.
+    """
+    return not hist.empty and all(
+        c in hist.columns and hist[c].notna().any() for c in ("total_billed_s", "total_wall_s")
+    )
+
+
 def make_summary_figure(rows: list[tuple[str, pd.DataFrame, str]], out_png: Path) -> bool:
     """The top-level summary: one row per pipeline, columns = cost | wall.
 
-    ``rows`` is ``[(row_label, hist, x_col), ...]`` (empty hists are skipped).
-    Left panels chart ``total_billed_s`` with a right-hand USD axis that is an
-    EXACT relabeling (fixed 4 GB price); right panels chart ``total_wall_s``.
-    Markers carry the unchanged memory colour scale where the series reports
-    memory (the raster handler doesn't -- its markers stay uncoloured).
+    ``rows`` is ``[(row_label, hist, x_col), ...]`` (empty hists, or hists
+    lacking the billed/wall totals, are skipped). Left panels chart
+    ``total_billed_s`` with a right-hand USD axis that is an EXACT relabeling
+    (fixed 4 GB price); right panels chart ``total_wall_s``. Markers carry the
+    unchanged memory colour scale where the series reports memory (the raster
+    handler doesn't -- its markers stay uncoloured).
     """
     import matplotlib
 
     matplotlib.use("Agg")  # headless CI
     import matplotlib.pyplot as plt
 
-    rows = [(label, hist, x_col) for label, hist, x_col in rows if not hist.empty]
+    rows = [(label, hist, x_col) for label, hist, x_col in rows if _summary_ready(hist)]
     if not rows:
         return False
 
