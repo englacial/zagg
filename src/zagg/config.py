@@ -2124,9 +2124,13 @@ def get_windowing(config: PipelineConfig) -> dict | None:
 
     ``epoch`` and explicit-window boundaries are canonicalized to ISO-8601
     UTC strings; ``windows`` is ``None`` except for ``schedule: explicit``.
-    The same dict feeds the manifest temporal block
-    (:func:`zagg.hive.build_manifest`) and the dispatch fan-out, so the two
-    can never disagree.
+    On the raster branch (``reader: raster``) ``time_field`` is the fixed STAC
+    ``datetime`` and ``epoch``/``scale``/``units`` are hardcoded to the
+    Unix-epoch UTC-seconds encoding any ISO instant normalizes to, rather than
+    canonicalizing a declared ``epoch`` off the block (``_validate_windowing``
+    rejects those conversion knobs there). The same dict feeds the manifest
+    temporal block (:func:`zagg.hive.build_manifest`) and the dispatch fan-out,
+    so the two can never disagree.
     """
     from zagg import windows as _windows
 
