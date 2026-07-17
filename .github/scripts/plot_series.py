@@ -870,6 +870,12 @@ def make_full_aoi_phase_figure(df: pd.DataFrame, out_png: Path) -> bool:
                 ax.set_xlim(xs[0] - 0.5, xs[-1] + 0.5)
             legend_ax = legend_ax or ax
 
+    # No slot populated (e.g. every row's index_backend is null -> off-matrix):
+    # skip the section rather than deref a None legend_ax and crash the render.
+    if legend_ax is None:
+        plt.close(fig)
+        return False
+
     # Bottom-row-only release labels, matching _render_panel_grid's convention.
     for c in range(ncols):
         last = max((r for r in range(nrows) if layout[r][c] is not None), default=None)

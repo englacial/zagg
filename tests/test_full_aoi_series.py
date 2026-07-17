@@ -293,6 +293,21 @@ def test_full_aoi_phase_figure_renders_legacy_series_without_phase_columns(tmp_p
     assert out.exists() and out.stat().st_size > 0
 
 
+def test_full_aoi_phase_figure_skips_when_all_slots_off_matrix(tmp_path):
+    # Rows whose index_backend is null map off the inline/sidecar matrix, so
+    # every panel slot stays None. The figure must honour its "return False,
+    # write nothing" contract rather than deref a None legend_ax and crash.
+    pytest.importorskip("matplotlib")
+    ps = pytest.importorskip("plot_series")
+    recs = _matrix_records("c1", "v0.24.0", 0.016)
+    for r in recs:
+        r["index_backend"] = None
+    df = fas.records_to_frame(recs)
+    out = tmp_path / "off_matrix_phases.png"
+    assert ps.make_full_aoi_phase_figure(df, out) is False
+    assert not out.exists()
+
+
 # --- store object-count columns (issue #240) --------------------------------
 
 
