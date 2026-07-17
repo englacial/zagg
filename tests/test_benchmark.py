@@ -138,9 +138,10 @@ def test_codec_column_is_last_and_threaded(monkeypatch):
     # tail position.
     cols = bench_metrics.RECORD_COLUMNS
     assert cols.index("codec") < cols.index("read") < cols.index("total_wall_s")
-    # The wall breakdown (#180), read backend (#193), object counts (#240) and
-    # store layout (#240 phase 4) appended in that order.
-    assert cols[-8:] == [
+    # The wall breakdown (#180), read backend (#193), object counts (#240),
+    # store layout (#240 phase 4) and worker phase split (#250/#256) appended
+    # in that order.
+    assert cols[-12:] == [
         "total_wall_s",
         "setup_s",
         "fanout_s",
@@ -149,6 +150,10 @@ def test_codec_column_is_last_and_threaded(monkeypatch):
         "objects_total",
         "objects_expected",
         "store_layout",
+        "phase_read_s",
+        "phase_index_s",
+        "phase_aggregate_s",
+        "phase_write_s",
     ]
     g = HealpixGrid(parent_order=11, child_order=19)
     rec = bench_metrics.build_record(_summary(), grid=g, context={"codec": "sharded"})
@@ -185,6 +190,27 @@ def test_wall_breakdown_columns_threaded_and_rendered():
     # finalize is retained in the series/record but no longer a rendered column.
     assert "finalize_s" in bench_metrics.RECORD_COLUMNS
     assert "finalize (s)" not in bench_metrics.TABLE_HEADERS
+
+
+def test_worker_phase_split_threaded_null_safe():
+    # issues #250/#256: the RAW emitted phase names (read/index/aggregate +
+    # the #256 write split) flatten from summary["worker_phase_max"] into
+    # phase_*_s columns; the display's agg = index + aggregate mapping is
+    # render-time only. Distinct values so a transposition can't pass.
+    g = HealpixGrid(parent_order=11, child_order=19)
+    summ = dict(_summary(), worker_phase_max={"read": 46.2, "index": 14.1, "aggregate": 7.7})
+    rec = bench_metrics.build_record(summ, grid=g, context={"target": "t"})
+    assert rec["phase_read_s"] == 46.2
+    assert rec["phase_index_s"] == 14.1
+    assert rec["phase_aggregate_s"] == 7.7
+    assert rec["phase_write_s"] is None  # pre-write-split worker -> null cell
+    # No profiling / legacy summary -> all null, not a KeyError.
+    bare = bench_metrics.build_record(_summary(), grid=g, context={})
+    assert bare["phase_read_s"] is None and bare["phase_write_s"] is None
+    # An unknown future phase stays out of the record (schema-stable).
+    extra = dict(_summary(), worker_phase_max={"read": 1.0, "warmup": 9.0})
+    rec2 = bench_metrics.build_record(extra, grid=g, context={})
+    assert "phase_warmup_s" not in rec2 and rec2["phase_read_s"] == 1.0
 
 
 def test_run_target_threads_codec_into_record():

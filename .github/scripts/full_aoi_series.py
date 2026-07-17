@@ -102,6 +102,10 @@ FULL_AOI_COLUMNS = [
     # NOT folded into cost_usd (worker GB-seconds), so the retained history's
     # cost semantics stay comparable. Null on pre-#250 rows and dry runs.
     "setup_cost_usd",
+    # The #256 write split: worker leaf write-out seconds (max across shards),
+    # emitted alongside read/index/aggregate under profile=True. Null on rows
+    # recorded before the split landed on the deployed worker.
+    "phase_write_s",
 ]
 
 # run-record write_throughput key -> flat column name.
@@ -112,12 +116,14 @@ _WT_MAP = {
     "cells_timeout": "wt_cells_timeout",
 }
 
-# run-record worker_phase_max key -> flat column name (issue #250). Any phase
-# the worker grows later stays JSON-only until a column is appended here.
+# run-record worker_phase_max key -> flat column name (issue #250; ``write``
+# is the #256 split). Any phase the worker grows later stays JSON-only until a
+# column is appended here.
 _PHASE_MAP = {
     "read": "phase_read_s",
     "index": "phase_index_s",
     "aggregate": "phase_aggregate_s",
+    "write": "phase_write_s",
 }
 
 # Nested / planning-only run-record fields that don't belong in the flat series

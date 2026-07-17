@@ -93,7 +93,26 @@ RECORD_COLUMNS = [
     # recorded before the hive arm existed (read back as flat). The renderers
     # key the inline/sidecar x AOI-mask panels on flat rows only.
     "store_layout",
+    # Worker phase split (issues #250/#256): straggler (max across cells)
+    # seconds per phase from ``summary["worker_phase_max"]`` (profile=True).
+    # The RAW emitted phase names are retained -- read/index/aggregate plus
+    # the #256 ``write`` split; the approved display maps agg = index +
+    # aggregate at RENDER time, so the series stays emission truth. Null on
+    # rows recorded before the capture (or a phase before its split landed).
+    "phase_read_s",
+    "phase_index_s",
+    "phase_aggregate_s",
+    "phase_write_s",
 ]
+
+# summary["worker_phase_max"] key -> series column (issues #250/#256). A phase
+# the worker grows later stays out of the series until a column appends here.
+PHASE_MAP = {
+    "read": "phase_read_s",
+    "index": "phase_index_s",
+    "aggregate": "phase_aggregate_s",
+    "write": "phase_write_s",
+}
 
 
 def select_densest_shard(shardmap: dict) -> tuple[int, int]:
@@ -213,6 +232,11 @@ def build_record(
         "fanout_s": summary.get("fanout_s"),
         "finalize_s": summary.get("finalize_s"),
     }
+    # Worker phase split (issues #250/#256), null-safe: a summary without
+    # profiling (or a pre-write-split worker) leaves the missing phases null.
+    wpm = summary.get("worker_phase_max") or {}
+    for src, col in PHASE_MAP.items():
+        record[col] = wpm.get(src)
     # Store object counts (issue #240). The two scalar columns are retained in
     # the parquet series; per_shard/mismatch ride the metrics.json record only
     # (update_series's reindex drops them).
