@@ -834,14 +834,10 @@ class RasterStrategy:
                         envelope = build_root_coverage(
                             done,
                             int(grid.parent_order),
-                            time_range=union_time_range(
-                                *(m.get("time_range") for m in ok_metas)
-                            ),
+                            time_range=union_time_range(*(m.get("time_range") for m in ok_metas)),
                         )
                         write_root_coverage(store_path, envelope, **store_kwargs)
-                        logger.info(
-                            f"Wrote root coverage.moc ({len(envelope['ranges'])} ranges)"
-                        )
+                        logger.info(f"Wrote root coverage.moc ({len(envelope['ranges'])} ranges)")
                 except Exception as e:
                     logger.warning(f"root coverage.moc write failed (fail-open, D9): {e}")
         # Per-shard isolation lets one bad shard be counted and skipped, but a
