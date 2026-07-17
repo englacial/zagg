@@ -29,20 +29,26 @@ Two release legs (`lambda-benchmark-fullaoi.yml`, tag-triggered):
 - **Raster pipeline** (`targets_raster_neon.json`, one target) — Sentinel-2
   Collection-1 L2A over 2025 (the pinned Earth Search catalog
   `cat_s2_neon_2025.parquet`, 85 items — offline, fixed across releases), o9
-  shards, pull-NN `(time, cells)` ingest. Its own harness
-  (`run_raster_benchmark.py`) owns the profiled per-shard dispatch and its own
-  `raster_series.parquet`. Two deviations from the target end-state, pending
-  upstream support: **no hive yet** (issue #237 is open; the raster path
-  rejects `store_layout`, issue #239) and **no strict AOI mask** (issue #101
-  is point-path-only) — the AOI scoping is the catalog's STAC-query clip.
+  shards, pull-NN `(time, cells)` ingest. The harness
+  (`run_raster_benchmark.py`) dispatches through `agg(profile=True)` — the
+  runner's raster path threads the profile key to the workers and rolls their
+  stage timings, billed durations and peak RSS into the summary — and retains
+  its own `raster_series.parquet`. Two deviations from the target end-state,
+  pending upstream: **hive is gated, not absent** — the manifest carries a
+  `pending_targets` hive variant the harness can already dispatch (a
+  `store_layout` override + re-validate), promoted to live the moment issue
+  #237 lands (the raster path rejects hive until then, issue #239) — and **no
+  strict AOI mask** (issue #101 is point-path-only); the AOI scoping is the
+  catalog's STAC-query clip.
 
 ### Summary — total billed cost and wall time
 
 One row per pipeline: **total billed cost** on a dual axis — billed
 lambda-seconds (left) and USD (right, an *exact* relabeling at the fixed 4 GB
-price) — and overall wall, against the release tag. Markers carry the peak-RSS
-colour scale (green→red % of the 4 GB cap, MB twin axis) where the worker
-reports memory; the raster handler does not, so its markers are uncoloured.
+price) — and overall wall, against the release tag. Markers on both rows carry
+the peak-RSS colour scale (green→red % of the 4 GB cap, MB twin axis): the
+raster worker reports the same sampled per-invocation peak as the point path
+(issue #141 convention; raster parity added by issue #250).
 
 The point pipeline's dollar figure is the **summed total**:
 `cost_usd + setup_cost_usd + finalize_cost_usd`. The sync setup and finalize
