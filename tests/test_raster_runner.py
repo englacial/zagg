@@ -768,3 +768,98 @@ class TestRasterHiveLambdaBackend:
         ma, mb = hive.read_manifest(lam_root), hive.read_manifest(loc_root)
         for key in ("spec", "dataset", "cell_order", "shard_order", "temporal"):
             assert ma.get(key) == mb.get(key)
+
+
+class TestRasterHiveIdempotency:
+    """Window re-run + backfill (D13) and the flat-raster default pin
+    (issue #247 phase 5)."""
+
+    def _snapshot(self, root):
+        from pathlib import Path
+
+        out = {}
+        for p in Path(root).rglob("*"):
+            if p.is_file():
+                out[str(p.relative_to(root))] = p.read_bytes()
+        return out
+
+    def _one_granule_map(self, tmp_path, cfg, shard, href, dt, key, name):
+        grid = from_config(cfg, populated_shards=[shard])
+        sm = ShardMap(
+            grid.spatial_signature(),
+            [shard],
+            [[_entry("g", href, dt, key)]],
+            {"collection": "s2-test"},
+        )
+        path = str(tmp_path / name)
+        sm.to_json(path)
+        return path
+
+    def test_window_rerun_and_backfill(self, tmp_path, manifest):
+        from pathlib import Path
+
+        from zagg import hive
+
+        cfg, sm_path, shard, _data = manifest
+        cfg.output["store_layout"] = "hive"
+        cfg.output["windowing"] = {"schedule": "daily"}
+        store_path = cfg.output["store"]
+        t1_map = self._one_granule_map(
+            tmp_path, cfg, shard, str(tmp_path / "t1.tif"), T1, "dt-2", "t1only.json"
+        )
+        t0_map = self._one_granule_map(
+            tmp_path, cfg, shard, str(tmp_path / "t0.tif"), T0, "dt-1", "t0only.json"
+        )
+
+        # Full run: both daily windows land.
+        agg(cfg, catalog=sm_path, backend="local", max_workers=2)
+        leaf_a = hive.shard_leaf_path(store_path, shard, window="20260713")
+        leaf_b = hive.shard_leaf_path(store_path, shard, window="20260718")
+        before_a = self._snapshot(leaf_a)
+        manifest_bytes = Path(store_path, "morton_hive.json").read_bytes()
+
+        # Re-dispatch window B only: leaf B is replaced wholesale, sibling
+        # window A stays byte-untouched, the manifest is not rewritten.
+        stamp_b_before = hive.read_commit(leaf_b)
+        agg(cfg, catalog=t1_map, backend="local", max_workers=2)
+        assert self._snapshot(leaf_a) == before_a
+        stamp_b_after = hive.read_commit(leaf_b)
+        assert stamp_b_after["complete"] and stamp_b_after["window"] == "20260718"
+        assert stamp_b_after["time_range"] == stamp_b_before["time_range"]
+        assert Path(store_path, "morton_hive.json").read_bytes() == manifest_bytes
+
+        # Backfill into a FRESH store: start with the later window, then add
+        # the earlier one — a new leaf appears, the committed later leaf and
+        # the manifest stay byte-untouched (D13: no resize, no manifest touch).
+        cfg.output["store"] = str(tmp_path / "backfill.zarr")
+        store2 = cfg.output["store"]
+        agg(cfg, catalog=t1_map, backend="local", max_workers=2)
+        leaf_b2 = hive.shard_leaf_path(store2, shard, window="20260718")
+        before_b2 = self._snapshot(leaf_b2)
+        manifest2 = Path(store2, "morton_hive.json").read_bytes()
+
+        agg(cfg, catalog=t0_map, backend="local", max_workers=2)
+        leaf_a2 = hive.shard_leaf_path(store2, shard, window="20260713")
+        assert hive.read_commit(leaf_a2)["window"] == "20260713"  # new earlier leaf
+        assert self._snapshot(leaf_b2) == before_b2  # committed leaf untouched
+        assert Path(store2, "morton_hive.json").read_bytes() == manifest2
+        # The root summary now spans both windows (cache union, D15).
+        cov = hive.read_root_coverage(store2)
+        assert cov["time_range"] == [T0, T1]
+
+    def test_flat_default_pin_no_hive_objects(self, tmp_path, manifest):
+        # store_layout unset -> the flat (time, cells) store, with no hive
+        # artifacts anywhere in the tree: the default output is object-for-
+        # object what pre-#247 runs wrote (the flat write path is untouched;
+        # this pins the absence of new objects).
+        from pathlib import Path
+
+        cfg, sm_path, _shard, _data = manifest
+        summary = agg(cfg, catalog=sm_path, backend="local", max_workers=2)
+        assert summary["cells_with_data"] == 1
+        store = Path(cfg.output["store"])
+        grid = from_config(cfg)
+        assert sorted(p.name for p in store.iterdir()) == sorted(["zarr.json", grid.group_path])
+        names = {p.name for p in store.rglob("*")}
+        assert "morton_hive.json" not in names
+        assert "coverage.moc" not in names

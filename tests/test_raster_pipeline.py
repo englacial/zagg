@@ -1095,3 +1095,83 @@ class TestRasterHiveWorker:
         assert stamp and stamp["complete"]
         red = open_array(leaf + f"/{grid.group_path}/red", zarr_format=3, consolidated=False)
         assert red.shape == (1, grid.cells_per_shard)
+
+
+class TestRasterHivePopcount:
+    """D14 popcount: interior shard stamps "full" (no sidecar), edge shard
+    writes the real bitmap (issue #247 phase 5)."""
+
+    def _setup(self, tmp_path):
+        # Coarse shards (order 14, ~400 m) with 16 order-16 children (~100 m):
+        # the 960 m raster fully covers interior shards and clips edge ones.
+        from mortie import clip2order, geo2mort
+
+        cfg = _raster_config(
+            bands={"red": {"asset": "red", "dtype": "uint16"}},
+            grid={"type": "healpix", "parent_order": 14, "child_order": 16},
+        )
+        data = np.full((96, 96), 555, dtype=np.uint16)  # no nodata anywhere
+        _write_tiff(tmp_path / "full.tif", data)
+        granules = [_entry("g0", {"red": str(tmp_path / "full.tif")}, T0, time_key="dt-1")]
+        to_wgs = Transformer.from_crs(CRS(UTM18), CRS("EPSG:4326"), always_xy=True)
+
+        def shard_at(dx, dy):
+            lon, lat = to_wgs.transform(ORIGIN[0] + dx, ORIGIN[1] - dy)
+            leaf = geo2mort(np.array([lat]), np.array([lon]), order=29, points=True)
+            return int(clip2order(14, leaf)[0])
+
+        return cfg, granules, shard_at, str(tmp_path / "store")
+
+    def _coverage_counts(self, cfg, grid, shard):
+        cells = grid.children(shard)
+        _r, _c, valid = grid.sample(cells, UTM18, TRANSFORM, (96, 96))
+        return int(valid.sum()), grid.cells_per_shard
+
+    def test_interior_full_no_sidecar_edge_bitmap(self, tmp_path):
+        import os as _os
+
+        from zagg import hive
+        from zagg.grids import HealpixGrid
+        from zagg.processing.raster import process_and_write_raster_hive
+
+        cfg, granules, shard_at, root = self._setup(tmp_path)
+        interior = shard_at(480.0, 480.0)  # raster center
+        grid = HealpixGrid(14, 16, config=cfg, populated_shards=[interior])
+        n_valid, n_cells = self._coverage_counts(cfg, grid, interior)
+        assert n_valid == n_cells  # the fixture premise: fully covered shard
+
+        process_and_write_raster_hive(
+            interior, granules, grid, root, cfg, store_kwargs={}, window={"label": "20260713"}
+        )
+        leaf = hive.shard_leaf_path(root, interior, window="20260713")
+        stamp = hive.read_commit(leaf)
+        assert stamp["coverage"]["encoding"] == "full"
+        assert "sidecar" not in stamp["coverage"]
+        # Asserted via object listing: NO coverage.moc object in the leaf.
+        assert "coverage.moc" not in _os.listdir(leaf)
+        # And the reader short-circuits: no bitmap to fetch.
+        assert hive.read_coverage_bitmap(leaf, coverage=stamp["coverage"]) is None
+
+        # An edge-of-scene shard: hunt along the raster's top edge for one the
+        # scene only clips (the frozen fixture geometry guarantees several).
+        edge = None
+        for dx in range(0, 960, 60):
+            cand = shard_at(float(dx), 20.0)
+            g = HealpixGrid(14, 16, config=cfg, populated_shards=[cand])
+            nv, nc = self._coverage_counts(cfg, g, cand)
+            if 0 < nv < nc:
+                edge, egrid, e_valid = cand, g, nv
+                break
+        assert edge is not None, "fixture drift: no partially-covered shard found"
+
+        process_and_write_raster_hive(
+            edge, granules, egrid, root, cfg, store_kwargs={}, window={"label": "20260713"}
+        )
+        eleaf = hive.shard_leaf_path(root, edge, window="20260713")
+        estamp = hive.read_commit(eleaf)
+        assert estamp["coverage"]["encoding"] == "bitmap"
+        assert estamp["cells_with_data"] == e_valid
+        # Asserted via object listing: the real bitmap sidecar object exists.
+        assert "coverage.moc" in _os.listdir(eleaf)
+        got = hive.read_coverage_bitmap(eleaf, coverage=estamp["coverage"])
+        assert got is not None and got.size == e_valid
