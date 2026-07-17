@@ -1701,6 +1701,13 @@ def _raster_windowed_units(cells: list[tuple], windowing: dict) -> list:
     (the worker would skip them anyway). Shard-major expansion preserves the
     incoming cell order; windows are chronological (= lexicographic) within
     a shard, declared order for explicit schedules.
+
+    ``windows_intersecting(earliest, earliest, ...)`` returns at most one
+    label, so ``labels[0]`` is THE window containing the group's instant,
+    never a first-match tiebreak: explicit windows are validated disjoint
+    (:func:`~zagg.config._validate_windowing_windows` rejects overlapping
+    declared ranges) and generative windows partition time, so no instant can
+    fall in two declared windows at once.
     """
     from zagg.windows import parse_utc, windows_intersecting
 
