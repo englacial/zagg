@@ -114,11 +114,14 @@ leaf stores. No zarr-version coupling in either direction.
 
 ## 3. Layer 1: the static manifest (`morton_hive.json`)
 
-Written **once, at finalize** (issue #252 — it rode template time before, but
-it is reader-facing only and workers never read it, so the write comes off
-the pre-dispatch critical path; a read-only frozen-key precheck keeps the
-up-front refusal on reruns — concurrent first writes still collide only at
-finalize). O(1); never touched again during a run. Contents:
+Written **asynchronously at init** (issue #252 hybrid — the write comes off
+the synchronous pre-dispatch path: the Lambda leg posts a fire-and-forget
+setup invoke right after the fail-fast ping, so the manifest lands seconds
+into the run and readers can consume completed leaves mid-run; finalize
+keeps an idempotent backstop that self-heals a lost async write; a read-only
+frozen-key precheck keeps the up-front refusal on reruns — concurrent first
+writes now collide within seconds of init). O(1); otherwise never touched
+again during a run. Contents:
 
 - `spec`: convention version string (e.g. `"morton-hive/1"`) — the convention
   itself is versioned from day one (D6).
@@ -407,8 +410,8 @@ write path (§2) is load-bearing; this phase is optimization.
   range + acquisition/granule count. Root summary (cache): the end-of-run
   root coverage object gains the time-range union alongside the MOC;
   sweep-regenerable, never truth. Extent never lives in the manifest, so
-  the manifest stays write-once (§3; written at finalize since issue
-  #252); the noted exception
+  the manifest stays write-once (§3; written async at init with a finalize
+  backstop since issue #252); the noted exception
   is the explicit-range-list schedule, where appending outside the list
   re-templates the manifest — append-heavy stores should prefer generative
   schedules. (That exception is an implication recorded from the ratified

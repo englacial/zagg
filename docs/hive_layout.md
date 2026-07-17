@@ -151,14 +151,21 @@ manifest check like an orders change — clear the root first.
 
 ## The manifest (`morton_hive.json`)
 
-Written **once, at finalize** — after the fan-out, before any reader arrives
-([issue #252](https://github.com/englacial/zagg/issues/252); it rode template
-time before, but it is reader-facing only — workers write self-describing
-leaves and never read it, so the write is off the critical path). Never
-touched during a run (D6); a read-only frozen-key precheck
+Written **asynchronously at init**
+([issue #252](https://github.com/englacial/zagg/issues/252) hybrid): the
+local dispatcher writes it directly before dispatch; the Lambda leg fires
+the existing `mode: "setup"` hive branch as a fire-and-forget Event invoke
+immediately after the `mode: "ping"` preflight passes, so the manifest lands
+seconds into the run and a reader can start consuming completed leaves while
+the store builds. Finalize re-ensures it as an **idempotent backstop** (a
+frozen-key-matching manifest is accepted — no second PUT): worker Event
+invokes run with retries 0, so a lost async init write self-heals at end of
+run, and a run that crashes mid-fan-out still left a manifest at init.
+Otherwise never touched during a run (D6); the read-only frozen-key precheck
 (`zagg.hive.validate_manifest`) still runs before the fan-out so an
 incompatible existing store refuses up front on reruns (two concurrent first
-writes into a fresh root still collide only at the losing run's finalize).
+writes into a fresh root now collide within seconds of init, not at the
+losing run's finalize).
 With the manifest, every shard
 path is computable arithmetically with zero requests:
 
@@ -368,10 +375,11 @@ under D9/O7). The §7 sweep remains the authoritative rebuilder.
 - **Both backends** write hive stores end-to-end through the same
   `zagg.hive.process_and_write_hive` code path. On **Lambda**
   ([issue #199](https://github.com/englacial/zagg/issues/199) phase 3)
-  the manifest write rides `mode: "finalize"`
-  ([issue #252](https://github.com/englacial/zagg/issues/252); a lightweight
-  `mode: "ping"` preflight keeps the pre-fan-out fail-fast) — the
-  orchestrator still needs no S3 access — and each worker derives its leaf
+  the manifest write fires as an async `mode: "setup"` Event invoke at init,
+  with `mode: "finalize"` as its idempotent backstop
+  ([issue #252](https://github.com/englacial/zagg/issues/252) hybrid; a
+  lightweight `mode: "ping"` preflight keeps the pre-fan-out fail-fast) —
+  the orchestrator still needs no S3 access — and each worker derives its leaf
   path from its `shard_key` + the event config's orders, emits its own leaf
   template, and stamps completion as its final PUT. The async status channel stays at the flat
   sibling prefix (`{store_root}.status/<run_id>/…`), outside the digit tree.

@@ -904,9 +904,11 @@ class TestLeafBlockIndex:
 
 class TestRunnerWiring:
     """The local backend writes the manifest (no shared template) under hive;
-    the lambda backend dispatches hive runs (issue #199 phase 3). The
-    manifest write is folded into finalize on both paths (issue #252) — no
-    pre-worker setup invoke, the dataset identity rides the finalize event."""
+    the lambda backend dispatches hive runs (issue #199 phase 3). Manifest
+    lifecycle (issue #252 hybrid): the write lands at INIT — directly on the
+    local path, as a fire-and-forget Event invoke of the setup mode right
+    after the ping on the lambda path — and finalize re-ensures it as an
+    idempotent backstop."""
 
     def _catalog(self, tmp_path):
         shard = _shard_word()
@@ -926,7 +928,7 @@ class TestRunnerWiring:
         p.write_text(json.dumps(catalog))
         return str(p), shard
 
-    def test_local_hive_writes_manifest_not_template(self, monkeypatch, cfg, tmp_path):
+    def test_local_hive_writes_manifest_before_cells(self, monkeypatch, cfg, tmp_path):
         from zagg import runner
         from zagg.runner import agg
 
@@ -938,10 +940,10 @@ class TestRunnerWiring:
         monkeypatch.setattr(runner, "get_nsidc_s3_credentials", lambda: {"accessKeyId": "a"})
 
         def fake_hive_write(shard_key, granule_urls, grid, s3_creds, store_root, config, **kw):
-            # The manifest write is folded into finalize (issue #252): while
-            # cells run, NOTHING has been written at the root — the manifest
-            # is off the critical path, not merely reordered.
-            assert not os.path.exists(os.path.join(store_root, hive.MANIFEST_NAME))
+            # The manifest lands at init (issue #252 hybrid): by the time any
+            # cell runs it is already at the root, so a reader can consume
+            # completed leaves while the store builds.
+            assert os.path.exists(os.path.join(store_root, hive.MANIFEST_NAME))
             calls.append((int(shard_key), store_root))
             return {"shard_key": int(shard_key), "error": None, "total_obs": 1}
 
@@ -949,20 +951,43 @@ class TestRunnerWiring:
         agg(cfg, catalog=catalog_path, store=root, backend="local")
 
         assert calls == [(shard, root)]
-        # End of run wrote ONLY the manifest — no shared zarr template (D5).
-        # The root coverage.moc (issue #200 phase 3, default-on for hive) is
-        # the only other root object.
+        # The run wrote ONLY the manifest at the root — no shared zarr
+        # template (D5). The root coverage.moc (issue #200 phase 3,
+        # default-on for hive) is the only other root object.
         assert sorted(os.listdir(root)) == [hive.ROOT_COVERAGE_NAME, hive.MANIFEST_NAME]
+        assert hive.read_manifest(root)["shard_order"] == 6
+
+    def test_local_hive_finalize_backstop_restores_lost_manifest(self, monkeypatch, cfg, tmp_path):
+        # Issue #252 hybrid: the init-time write is primary, but finalize
+        # keeps ensure_manifest as an idempotent backstop — a manifest lost
+        # mid-run (simulated by deleting it inside the cell) is back at the
+        # root by end of run.
+        from zagg import runner
+        from zagg.runner import agg
+
+        cfg.output["store_layout"] = "hive"
+        catalog_path, shard = self._catalog(tmp_path)
+        root = str(tmp_path / "out")
+
+        monkeypatch.setattr(runner, "get_nsidc_s3_credentials", lambda: {"accessKeyId": "a"})
+
+        def fake_hive_write(shard_key, granule_urls, grid, s3_creds, store_root, config, **kw):
+            os.remove(os.path.join(store_root, hive.MANIFEST_NAME))
+            return {"shard_key": int(shard_key), "error": None, "total_obs": 1}
+
+        monkeypatch.setattr(hive, "process_and_write_hive", fake_hive_write)
+        agg(cfg, catalog=catalog_path, store=root, backend="local")
         assert hive.read_manifest(root)["shard_order"] == 6
 
     def test_local_hive_rerun_frozen_key_mismatch_fails_before_dispatch(
         self, monkeypatch, cfg, tmp_path
     ):
-        # The manifest WRITE folded to finalize (issue #252), but its read-only
-        # frozen-key precheck runs pre-dispatch (review fold): a rerun into a
-        # root templated for DIFFERENT orders (shard_order 5 vs the catalog's 6)
-        # must refuse BEFORE any cell runs — not after fan-out has already mixed
-        # new-order leaves into the old-order store (D2).
+        # The manifest write runs at init (issue #252 hybrid) and
+        # ensure_manifest runs the validate_manifest frozen-key precheck
+        # first: a rerun into a root templated for DIFFERENT orders
+        # (shard_order 5 vs the catalog's 6) must refuse BEFORE any cell
+        # runs — not after fan-out has already mixed new-order leaves into
+        # the old-order store (D2).
         from zagg import runner
         from zagg.runner import agg
 
@@ -1035,12 +1060,14 @@ class TestRunnerWiring:
             assert n_objects == 1, name
         assert hive.read_commit(open_store(leaf))["complete"] is True
 
-    def test_lambda_hive_folds_manifest_into_finalize(self, monkeypatch, cfg, tmp_path):
-        # Issue #252: a hive lambda run dispatches NO setup invoke — the
-        # manifest inputs (dataset identity from the ShardMap metadata, same
-        # source as the local path) ride the finalize invoke, which runs even
-        # with consolidate_metadata off (the default). Per-cell events need
-        # NO new keys — the worker derives everything from the config dict.
+    def test_lambda_hive_fires_async_setup_after_ping(self, monkeypatch, cfg, tmp_path):
+        # Issue #252 hybrid: a hive lambda run dispatches NO synchronous
+        # setup invoke. The lifecycle is ping (fail-fast, both guards) →
+        # async Event setup (the manifest write, before any worker fan-out
+        # → progressive reads) → workers → finalize (idempotent backstop,
+        # which runs even with consolidate_metadata off — the default) and
+        # carries the same manifest inputs. Per-cell events need NO new
+        # keys — the worker derives everything from the config dict.
         from unittest.mock import MagicMock
 
         import boto3
@@ -1052,6 +1079,7 @@ class TestRunnerWiring:
         cfg.output["store_layout"] = "hive"
         catalog_path, shard = self._catalog(tmp_path)
         captured: dict = {}
+        order: list = []
 
         monkeypatch.setattr(
             runner,
@@ -1074,14 +1102,21 @@ class TestRunnerWiring:
                 ),
             ),
         )
-        monkeypatch.setattr(
-            runner, "_invoke_lambda_setup", lambda *a, **kw: captured.update(setup=kw)
-        )
-        monkeypatch.setattr(
-            runner, "_invoke_lambda_finalize", lambda *a, **kw: captured.update(finalize=kw)
-        )
+
+        def _capture(name):
+            def _f(*a, **kw):
+                order.append(name)
+                captured[name] = kw
+
+            return _f
+
+        monkeypatch.setattr(runner, "_invoke_lambda_setup", _capture("setup"))
+        monkeypatch.setattr(runner, "_invoke_lambda_setup_async", _capture("setup_async"))
+        monkeypatch.setattr(runner, "_invoke_lambda_finalize", _capture("finalize"))
+        monkeypatch.setattr(runner, "_invoke_lambda_ping", _capture("ping"))
 
         def fake_cell(client, chunk_idx, shard_key, *a, **k):
+            order.append("cell")
             captured["cell_shard_key"] = shard_key
             return {
                 "status_code": 200,
@@ -1092,17 +1127,19 @@ class TestRunnerWiring:
             }
 
         monkeypatch.setattr(runner, "_invoke_lambda_cell", fake_cell)
-        monkeypatch.setattr(
-            runner, "_invoke_lambda_ping", lambda *a, **kw: captured.update(ping=kw)
-        )
         agg(cfg, catalog=catalog_path, store="s3://out/product", backend="lambda")
 
-        # NO manifest-writing setup invoke: what runs up front is the
-        # lightweight ping, carrying the same manifest inputs as finalize
-        # (fail-fast guard, issue #252 — decoupled from the write).
+        # NO synchronous setup invoke; the manifest write (async setup) fires
+        # AFTER the ping passes and BEFORE any worker — so the manifest lands
+        # seconds into the run — and finalize backstops it at the end.
         assert "setup" not in captured
+        assert order == ["ping", "setup_async", "cell", "finalize"]
         assert captured["ping"]["dataset"] == {"short_name": "ATL06", "version": "007"}
         assert captured["ping"]["config_dict"]["output"]["store_layout"] == "hive"
+        # The async setup carries the same manifest inputs as ping/finalize.
+        assert captured["setup_async"]["dataset"] == {"short_name": "ATL06", "version": "007"}
+        assert captured["setup_async"]["config_dict"]["output"]["store_layout"] == "hive"
+        assert captured["setup_async"]["parent_order"] == 6
         assert captured["finalize"]["dataset"] == {"short_name": "ATL06", "version": "007"}
         # store_layout rides in the config dict already serialized into events.
         assert captured["finalize"]["config_dict"]["output"]["store_layout"] == "hive"
@@ -1165,10 +1202,15 @@ class TestRunnerWiring:
         monkeypatch.setattr(
             runner, "_invoke_lambda_ping", lambda *a, **kw: captured.update(ping=kw)
         )
+        monkeypatch.setattr(
+            runner, "_invoke_lambda_setup_async", lambda *a, **kw: captured.update(setup_async=kw)
+        )
         agg(cfg, catalog=catalog_path, store="s3://out/x.zarr", backend="lambda")
         assert "dataset" not in captured["setup"]
         assert "finalize" not in captured
         assert "ping" not in captured
+        # The async manifest write is hive-only (issue #252 hybrid).
+        assert "setup_async" not in captured
 
 
 def _wire_client(body: dict, status_code: int = 200):
@@ -1185,10 +1227,12 @@ def _wire_client(body: dict, status_code: int = 200):
 
 
 class TestInvokeLambdaSetupEvent:
-    """Pin the ACTUAL setup event on the wire. Setup is flat-only now (issue
-    #252 folded the hive manifest into finalize and the PR #205 layout-echo
-    guard into the version ping), so what remains to pin is flat byte-identity
-    against pre-phase-3 deployed functions."""
+    """Pin the ACTUAL setup events on the wire. The synchronous invoke is
+    flat-only now (issue #252 moved the hive manifest write to an async
+    Event invoke of the same setup mode, and the PR #205 layout-echo guard
+    into the version ping): pin flat byte-identity against pre-phase-3
+    deployed functions, and the hive async event + its fire-and-forget
+    InvocationType."""
 
     @staticmethod
     def _invoke(client, config_dict):
@@ -1227,6 +1271,39 @@ class TestInvokeLambdaSetupEvent:
         # Old deployed functions return the echo-less body: flat dispatch must
         # keep working against them.
         self._invoke(_wire_client({"ok": True, "mode": "setup"}), asdict(cfg))
+
+    def test_hive_async_event_matches_baseline(self, cfg):
+        # The async init-time manifest write (issue #252 hybrid): a
+        # fire-and-forget InvocationType="Event" invoke of the hive setup
+        # branch, carrying exactly the manifest inputs the ping/finalize
+        # events pin (config + parent_order + dataset identity + overwrite).
+        from zagg.runner import _invoke_lambda_setup_async
+
+        cfg.output["store_layout"] = "hive"
+        config_dict = asdict(cfg)
+        client = _wire_client({"ok": True, "mode": "setup", "layout": "hive"})
+        _invoke_lambda_setup_async(
+            client,
+            "process-shard",
+            "s3://out/product",
+            config_dict=config_dict,
+            dataset={"short_name": "ATL06", "version": "007"},
+            parent_order=6,
+            overwrite=False,
+        )
+        kwargs = client.invoke.call_args.kwargs
+        assert kwargs["InvocationType"] == "Event"
+        assert json.loads(kwargs["Payload"]) == {
+            "mode": "setup",
+            "store_path": "s3://out/product",
+            "parent_order": 6,
+            "overwrite": False,
+            "config": config_dict,
+            "dataset": {"short_name": "ATL06", "version": "007"},
+        }
+        # Fire-and-forget: no response is read (an Event invoke returns 202
+        # with no function payload), so nothing can block on it.
+        client.invoke.return_value["Payload"].read.assert_not_called()
 
 
 class TestInvokeLambdaFinalizeEvent:

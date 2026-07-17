@@ -1277,10 +1277,12 @@ class TestSetupHive:
 
 
 class TestFinalizeHive:
-    """Issue #252: for a hive config, finalize mode writes the root
-    ``morton_hive.json`` — the manifest folded off the pre-worker setup path —
-    with the same frozen-key resume semantics as setup had; a flat finalize
-    event (no ``config`` key) still goes down the consolidation path."""
+    """Issue #252 (hybrid): for a hive config, finalize mode re-ensures the
+    root ``morton_hive.json`` — the idempotent backstop for the async
+    init-time setup write, so a manifest absent at finalize (a lost retries-0
+    Event invoke) still ends up written — with the same frozen-key resume
+    semantics as setup; a flat finalize event (no ``config`` key) still goes
+    down the consolidation path."""
 
     def _event(self, tmp_path, config_dict, **extra):
         return {
