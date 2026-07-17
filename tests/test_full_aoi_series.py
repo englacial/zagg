@@ -306,6 +306,16 @@ def test_summary_and_point_diagnostics_render(tmp_path):
         is True
     )
     assert diag.exists() and diag.stat().st_size > 0
+    # The ylabel keyword lets the object-count figure relabel its non-seconds
+    # axis (review): renders with a custom label just like the default.
+    obj = tmp_path / "full_aoi_point_labelled.png"
+    assert (
+        psu.make_diagnostics_figure(
+            hist, psu.POINT_PHASE_PANELS, "ref", obj, "point phases", ylabel="objects"
+        )
+        is True
+    )
+    assert obj.exists() and obj.stat().st_size > 0
     # The approved panel set: read / agg / write / setup / finalize -- never
     # the raw index+aggregate pair, and finalize kept per issue #252.
     cols = [c for c, _t in psu.POINT_PHASE_PANELS]
