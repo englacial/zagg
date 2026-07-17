@@ -974,3 +974,124 @@ class TestStageStats:
         monkeypatch.setattr(raster_mod, "time", _Boom)
         _slabs, meta = self._run(tmp_path, n_timesteps=1, second_grid=False)
         assert meta["timesteps"] == 1
+
+
+class TestRasterHiveWorker:
+    """The shared per-(shard, window) hive leaf write path (issue #247 phase 3)."""
+
+    def _setup(self, tmp_path, value=555):
+        cfg, grid, shard = _healpix_setup(tmp_path)
+        data = np.full((96, 96), value, dtype=np.uint16)
+        _write_tiff(tmp_path / "h0.tif", data)
+        _write_tiff(tmp_path / "h1.tif", np.full((96, 96), 777, dtype=np.uint16))
+        granules = [
+            _entry("g0", {"red": str(tmp_path / "h0.tif")}, T0, time_key="dt-1"),
+            _entry("g1", {"red": str(tmp_path / "h1.tif")}, T1, time_key="dt-2"),
+        ]
+        return cfg, grid, shard, granules, str(tmp_path / "hivestore")
+
+    def test_windowed_leaf_stamp_and_coverage(self, tmp_path):
+        from zagg import hive
+        from zagg.processing.raster import process_and_write_raster_hive
+
+        cfg, grid, shard, granules, root = self._setup(tmp_path)
+        meta = process_and_write_raster_hive(
+            shard,
+            granules[:1],
+            grid,
+            root,
+            cfg,
+            store_kwargs={},
+            window={"label": "20260713"},
+        )
+        leaf = hive.shard_leaf_path(root, shard, window="20260713")
+        stamp = hive.read_commit(leaf)
+        assert stamp and stamp["complete"] and stamp["spec"] == "morton-hive/2"
+        assert stamp["window"] == "20260713"
+        # D15 truth: the unit's actual acquisition extent (one instant here).
+        assert stamp["time_range"] == [T0, T0]
+        assert meta["time_range"] == [T0, T0]
+        assert stamp["granule_count"] == 1
+        # Occupied union = cells whose center lands on the (nodata-free) raster.
+        cells = grid.children(shard)
+        _rows, _cols, valid = grid.sample(cells, UTM18, TRANSFORM, (96, 96))
+        assert stamp["cells_with_data"] == int(valid.sum())
+        # Edge shard (raster covers a fraction of the shard): real bitmap
+        # sidecar, decoding to exactly the occupied cells.
+        assert stamp["coverage"]["encoding"] == "bitmap"
+        got = hive.read_coverage_bitmap(leaf, coverage=stamp["coverage"])
+        np.testing.assert_array_equal(got, np.sort(np.asarray(cells, dtype=np.uint64)[valid]))
+        # Leaf data at leaf-local indices, leaf-local time axis of length 1.
+        red = open_array(leaf + f"/{grid.group_path}/red", zarr_format=3, consolidated=False)
+        assert red.shape == (1, grid.cells_per_shard)
+        assert (red[0, :][valid] == 555).all()
+
+    def test_schedule_none_bare_leaf(self, tmp_path):
+        from zagg import hive
+        from zagg.processing.raster import process_and_write_raster_hive
+
+        cfg, grid, shard, granules, root = self._setup(tmp_path)
+        meta = process_and_write_raster_hive(
+            shard, granules, grid, root, cfg, store_kwargs={}, window=None
+        )
+        assert meta["timesteps"] == 2 and "time_range" not in meta
+        leaf = hive.shard_leaf_path(root, shard)  # bare {full_id}.zarr name
+        stamp = hive.read_commit(leaf)
+        assert stamp and stamp["spec"] == "morton-hive/1"
+        assert "window" not in stamp and "time_range" not in stamp
+        # D14 "full" is gated off without a window — even full occupancy would
+        # stamp a bitmap; here the shard is edge-covered anyway.
+        assert stamp["coverage"]["encoding"] == "bitmap"
+        red = open_array(leaf + f"/{grid.group_path}/red", zarr_format=3, consolidated=False)
+        assert red.shape == (2, grid.cells_per_shard)
+
+    def test_no_data_unit_creates_no_prefix(self, tmp_path):
+        from zagg import hive
+        from zagg.processing.raster import process_and_write_raster_hive
+
+        cfg, grid, shard, _granules, root = self._setup(tmp_path)
+        meta = process_and_write_raster_hive(
+            shard, [], grid, root, cfg, store_kwargs={}, window={"label": "20260713"}
+        )
+        assert meta["timesteps"] == 0
+        leaf = hive.shard_leaf_path(root, shard, window="20260713")
+        import os as _os
+
+        assert not _os.path.exists(leaf)
+
+    def test_torn_worker_debris_and_rerun_replaces(self, tmp_path, monkeypatch):
+        import zagg.processing.raster as raster_mod
+        from zagg import hive
+        from zagg.processing.raster import process_and_write_raster_hive
+
+        cfg, grid, shard, granules, root = self._setup(tmp_path)
+        real_write = raster_mod.write_raster_leaf_slab
+        calls = {"n": 0}
+
+        def _tear(store, g, t, slab):
+            calls["n"] += 1
+            if calls["n"] == 2:
+                raise RuntimeError("torn mid-shard")
+            return real_write(store, g, t, slab)
+
+        monkeypatch.setattr(raster_mod, "write_raster_leaf_slab", _tear)
+        with pytest.raises(RuntimeError, match="torn"):
+            process_and_write_raster_hive(
+                shard, granules, grid, root, cfg, store_kwargs={}, window=None
+            )
+        leaf = hive.shard_leaf_path(root, shard)
+        import os as _os
+
+        assert _os.path.exists(leaf)  # prefix exists...
+        assert hive.read_commit(leaf) is None  # ...but unstamped: debris (D4)
+
+        # Re-run replaces the leaf WHOLESALE (D13): a narrower time axis must
+        # not leave the torn attempt's arrays or extra timesteps behind.
+        monkeypatch.setattr(raster_mod, "write_raster_leaf_slab", real_write)
+        process_and_write_raster_hive(
+            shard, granules[:1], grid, root, cfg, store_kwargs={}, window=None
+        )
+        stamp = hive.read_commit(leaf)
+        assert stamp and stamp["complete"]
+        red = open_array(leaf + f"/{grid.group_path}/red", zarr_format=3, consolidated=False)
+        assert red.shape == (1, grid.cells_per_shard)

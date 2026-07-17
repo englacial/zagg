@@ -635,6 +635,7 @@ class RasterStrategy:
         from zagg.processing.raster import (
             emit_raster_template,
             new_stage_stats,
+            process_and_write_raster_hive,
             process_raster_shard,
             raster_time_index,
             write_raster_coords,
@@ -675,13 +676,42 @@ class RasterStrategy:
             raise ValueError("catalog carries no raster granule entries (no assets/datetime)")
 
         resolved_endpoint = output_endpoint_url or get_output_endpoint_url(config)
-        zarr_store = open_store(
-            store_path,
-            region=region,
-            credentials=output_credentials,
-            endpoint_url=resolved_endpoint,
-        )
-        emit_raster_template(zarr_store, grid, config, times_us, overwrite=overwrite)
+        store_layout = get_store_layout(config)
+        windowing = get_windowing(config)
+        store_kwargs = {
+            "region": region,
+            "credentials": output_credentials,
+            "endpoint_url": resolved_endpoint,
+        }
+        manifest = None
+        if store_layout == "hive":
+            # Hive layout (issue #247): no flat global template — zero zarr
+            # metadata above the leaves (D5); each unit emits its own leaf
+            # template lazily inside process_and_write_raster_hive. The root
+            # manifest (D6) is written here pre-dispatch on the local backend
+            # (the issue #252 hybrid's local flavor; the lambda backend rides
+            # the ping -> async-setup lifecycle instead).
+            if backend == "lambda":
+                raise ValueError(
+                    "raster store_layout: hive on the lambda backend lands in "
+                    "phase 4 of issue #247; use backend='local' for now"
+                )
+            from zagg.hive import build_manifest, ensure_manifest
+
+            zarr_store = None
+            manifest = build_manifest(
+                grid, dataset=catalog_data.get("metadata"), windowing=windowing
+            )
+            ensure_manifest(store_path, manifest, overwrite=overwrite, **store_kwargs)
+            # Temporal fan-out: one work unit per (shard, window), membership
+            # decided at dispatch from the acquisitions' STAC datetimes. None
+            # (schedule none/absent) keeps the (shard, records) pairs — one
+            # bare leaf per shard carrying the full time axis (D13).
+            if windowing is not None:
+                cells = _raster_windowed_units(cells, windowing)
+        else:
+            zarr_store = open_store(store_path, **store_kwargs)
+            emit_raster_template(zarr_store, grid, config, times_us, overwrite=overwrite)
 
         if backend == "lambda":
             return self._run_lambda_shards(
@@ -709,9 +739,13 @@ class RasterStrategy:
         errors = 0
         timesteps_written = 0
         last_error = None
+        ok_metas: list = []
 
         def _one(pair):
-            shard_key, granules = pair
+            # (shard, records) pairs, or (shard, records, window) triples when
+            # a window schedule fanned the dispatch (issue #247).
+            shard_key, granules = pair[0], pair[1]
+            window = pair[2] if len(pair) > 2 else None
             wrote = False
             # Per-stage sample profiling (issue #249), the local flavor of the
             # lambda handler's opt-in ``profile`` key: allocated only when
@@ -719,25 +753,42 @@ class RasterStrategy:
             # sample path times nothing.
             stage_stats = new_stage_stats() if logger.isEnabledFor(logging.DEBUG) else None
 
-            def _write_slab(t_idx, slab):
-                nonlocal wrote
-                write_raster_slab(zarr_store, grid, int(shard_key), t_idx, slab)
-                wrote = True
+            if store_layout == "hive":
+                # Shared per-(shard, window) leaf write path (same function
+                # the lambda hive branch runs): leaf template + slabs +
+                # coverage + commit stamp, D4 debris semantics on error.
+                meta = process_and_write_raster_hive(
+                    int(shard_key),
+                    granules,
+                    grid,
+                    store_path,
+                    config,
+                    store_kwargs=store_kwargs,
+                    window=window,
+                    stage_stats=stage_stats,
+                    **src_kwargs,
+                )
+            else:
 
-            # Stream: write + free each timestep's slab as it completes (issue
-            # #231), so a shard holds ~1 slab, not all T.
-            _slabs, meta = process_raster_shard(
-                grid,
-                int(shard_key),
-                granules,
-                config,
-                time_index,
-                on_slab=_write_slab,
-                stage_stats=stage_stats,
-                **src_kwargs,
-            )
-            if wrote:
-                write_raster_coords(zarr_store, grid, int(shard_key))
+                def _write_slab(t_idx, slab):
+                    nonlocal wrote
+                    write_raster_slab(zarr_store, grid, int(shard_key), t_idx, slab)
+                    wrote = True
+
+                # Stream: write + free each timestep's slab as it completes
+                # (issue #231), so a shard holds ~1 slab, not all T.
+                _slabs, meta = process_raster_shard(
+                    grid,
+                    int(shard_key),
+                    granules,
+                    config,
+                    time_index,
+                    on_slab=_write_slab,
+                    stage_stats=stage_stats,
+                    **src_kwargs,
+                )
+                if wrote:
+                    write_raster_coords(zarr_store, grid, int(shard_key))
             if stage_stats is not None:
                 logger.debug(
                     f"raster shard {shard_label(grid, int(shard_key))} stages: {stage_stats}"
@@ -755,11 +806,44 @@ class RasterStrategy:
                     last_error = e
                     logger.warning(f"raster shard {label} failed: {e}")
                     continue
+                ok_metas.append(meta)
                 if meta["timesteps"]:
                     shards_with_data += 1
                     timesteps_written += meta["timesteps"]
 
         wall_time = time.time() - t0
+        if store_layout == "hive":
+            # End-of-run manifest backstop (issue #252 hybrid, local flavor):
+            # idempotent re-ensure — a frozen-key-matching manifest is
+            # accepted with no second PUT; required reader-facing schema
+            # (D6), so a failure raises. Then the root coverage.moc union
+            # (issue #200 phase 3; D15 time union) — a regenerable cache
+            # (D9), fail-open.
+            from zagg.hive import ensure_manifest
+
+            ensure_manifest(store_path, manifest, overwrite=overwrite, **store_kwargs)
+            if get_coverage_moc(config):
+                from zagg.hive import build_root_coverage, write_root_coverage
+                from zagg.windows import union_time_range
+
+                try:
+                    # Only units that wrote (and stamped) a leaf: timesteps==0
+                    # means the lazy template never fired — no leaf to cover.
+                    done = [m["shard_key"] for m in ok_metas if m.get("timesteps")]
+                    if done:
+                        envelope = build_root_coverage(
+                            done,
+                            int(grid.parent_order),
+                            time_range=union_time_range(
+                                *(m.get("time_range") for m in ok_metas)
+                            ),
+                        )
+                        write_root_coverage(store_path, envelope, **store_kwargs)
+                        logger.info(
+                            f"Wrote root coverage.moc ({len(envelope['ranges'])} ranges)"
+                        )
+                except Exception as e:
+                    logger.warning(f"root coverage.moc write failed (fail-open, D9): {e}")
         # Per-shard isolation lets one bad shard be counted and skipped, but a
         # run where EVERY shard raised (e.g. a config band whose ``asset`` is
         # absent from every granule) would otherwise return a success-shaped,
@@ -1512,6 +1596,49 @@ def _windowed_units(cells: list[tuple], windowing: dict, bounds_temporal: dict |
             ]
             if subset:
                 units.append((shard_key, subset, payload))
+    return units
+
+
+def _raster_windowed_units(cells: list[tuple], windowing: dict) -> list:
+    """Expand raster ``(shard, records)`` pairs into ``(shard, records, window)`` units.
+
+    The raster analog of :func:`_windowed_units` (issue #247): membership is
+    decided HERE, at dispatch — there is no worker-side observation filter.
+    An acquisition GROUP (entries sharing a ``time_key``, the
+    :func:`~zagg.processing.raster.raster_time_index` grouping) belongs to
+    the window containing its earliest STAC ``datetime`` within the shard —
+    the group's leaf time coordinate — so a datatake's adjacent MGRS tiles
+    never split across leaves at a window boundary. Explicit schedules DROP
+    groups outside every declared window (nothing downstream would filter
+    them); generative schedules always place a group. Window payloads carry
+    only the label: bounds stay UTC-calendar terms and no dataset-unit
+    conversion exists on the raster path. Asset-less records are dropped
+    (the worker would skip them anyway). Shard-major expansion preserves the
+    incoming cell order; windows are chronological (= lexicographic) within
+    a shard, declared order for explicit schedules.
+    """
+    from zagg.windows import parse_utc, windows_intersecting
+
+    schedule, declared = windowing["schedule"], windowing.get("windows")
+    label_order = [w["label"] for w in declared] if schedule == "explicit" else None
+    units = []
+    for shard_key, records in cells:
+        groups: dict = {}
+        for e in records:
+            if not e.get("assets"):
+                continue
+            if not e.get("datetime"):
+                raise ValueError(f"raster granule entry {e.get('id')!r} carries no datetime")
+            groups.setdefault(e.get("time_key") or e["datetime"], []).append(e)
+        by_window: dict = {}
+        for _key, items in groups.items():
+            earliest = min(parse_utc(e["datetime"]) for e in items)
+            labels = windows_intersecting(earliest, earliest, schedule, declared)
+            if labels:
+                by_window.setdefault(labels[0], []).extend(items)
+        for label in label_order if label_order is not None else sorted(by_window):
+            if label in by_window:
+                units.append((shard_key, by_window[label], {"label": label}))
     return units
 
 

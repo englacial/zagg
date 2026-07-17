@@ -513,3 +513,88 @@ class TestShippedTemplate:
         assert cfg.data_source["reader"] == "raster"
         assert cfg.data_source["bands"]["scl"]["dtype"] == "uint8"
         assert cfg.output["grid"]["child_order"] == 19
+
+
+class TestRasterHiveLocalBackend:
+    """Local raster hive runs (issue #247 phase 3): manifest, leaves, coverage."""
+
+    def test_schedule_none_end_to_end(self, tmp_path, manifest):
+        from pathlib import Path
+
+        from zagg import hive
+
+        cfg, sm_path, shard, data = manifest
+        cfg.output["store_layout"] = "hive"
+        summary = agg(cfg, catalog=sm_path, backend="local", max_workers=2)
+        assert summary["cells_with_data"] == 1 and summary["cells_error"] == 0
+
+        store_path = cfg.output["store"]
+        # Root manifest: /1 spec (schedule none), no temporal block.
+        m = hive.read_manifest(store_path)
+        assert m["spec"] == "morton-hive/1" and "temporal" not in m
+        # No store-root zarr objects (D5): only the manifest, the root
+        # coverage.moc, and the digit tree.
+        root_children = sorted(p.name for p in Path(store_path).iterdir())
+        assert "zarr.json" not in root_children
+        assert {"morton_hive.json", "coverage.moc"} <= set(root_children)
+        # One bare leaf carrying the FULL time axis, stamped /1.
+        leaf = hive.shard_leaf_path(store_path, shard)
+        stamp = hive.read_commit(leaf)
+        assert stamp and stamp["complete"] and stamp["spec"] == "morton-hive/1"
+        assert "window" not in stamp and "time_range" not in stamp
+        grid = from_config(cfg, populated_shards=[shard])
+        red = open_array(leaf + f"/{grid.group_path}/red", zarr_format=3, consolidated=False)
+        assert red.shape == (2, grid.cells_per_shard)
+        cells = grid.children(shard)
+        rows, cols, valid = grid.sample(cells, UTM18, TRANSFORM, (96, 96))
+        np.testing.assert_array_equal(red[0, :][valid], data[rows[valid], cols[valid]])
+        assert (red[1, :][valid] == 555).all()
+        # Root coverage.moc (default-on for hive) covers the shard, no
+        # time_range on an unwindowed store.
+        cov = hive.read_root_coverage(store_path)
+        assert cov is not None and "time_range" not in cov
+        np.testing.assert_array_equal(
+            hive.root_coverage_words(cov), np.asarray([shard], dtype=np.uint64)
+        )
+
+    def test_windowed_daily_leaves(self, tmp_path, manifest):
+        from zagg import hive
+
+        cfg, sm_path, shard, data = manifest
+        cfg.output["store_layout"] = "hive"
+        cfg.output["windowing"] = {"schedule": "daily"}
+        summary = agg(cfg, catalog=sm_path, backend="local", max_workers=2)
+        # Two datatakes on different days -> two (shard, window) units.
+        assert summary["total_cells"] == 2
+        assert summary["cells_with_data"] == 2 and summary["cells_error"] == 0
+
+        store_path = cfg.output["store"]
+        m = hive.read_manifest(store_path)
+        assert m["spec"] == "morton-hive/2"
+        assert m["temporal"]["schedule"] == "daily"
+        assert m["temporal"]["time_field"] == "datetime"  # the resolved field
+        grid = from_config(cfg, populated_shards=[shard])
+        for label, instant, value_check in (
+            ("20260713", T0, None),
+            ("20260718", T1, 555),
+        ):
+            leaf = hive.shard_leaf_path(store_path, shard, window=label)
+            stamp = hive.read_commit(leaf)
+            assert stamp and stamp["spec"] == "morton-hive/2"
+            assert stamp["window"] == label
+            assert stamp["time_range"] == [instant, instant]
+            red = open_array(leaf + f"/{grid.group_path}/red", zarr_format=3, consolidated=False)
+            assert red.shape == (1, grid.cells_per_shard)
+            if value_check is not None:
+                cells = grid.children(shard)
+                _r, _c, valid = grid.sample(cells, UTM18, TRANSFORM, (96, 96))
+                assert (red[0, :][valid] == value_check).all()
+        # Root summary unions the two windowed stamps' time ranges (D15).
+        cov = hive.read_root_coverage(store_path)
+        assert cov["time_range"] == [T0, T1]
+
+    def test_lambda_backend_hive_not_yet(self, manifest):
+        cfg, sm_path, _shard, _data = manifest
+        cfg.output["store_layout"] = "hive"
+        with pytest.raises(ValueError, match="phase 4 of issue #247"):
+            agg(cfg, catalog=sm_path, store="s3://bucket/out.zarr", backend="lambda")
