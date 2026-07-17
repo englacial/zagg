@@ -300,6 +300,12 @@ def test_summary_and_point_diagnostics_render(tmp_path):
     import pandas as pd
 
     assert psu.make_summary_figure([("point", pd.DataFrame(), "ref")], tmp_path / "x.png") is False
+    # A frame missing the billed/wall totals is skipped like an empty hist --
+    # no unguarded KeyError (review). Sole such row -> False, nothing written.
+    nowall = hist.drop(columns=["total_wall_s"])
+    miss = tmp_path / "miss.png"
+    assert psu.make_summary_figure([("point", nowall, "ref")], miss) is False
+    assert not miss.exists()
     diag = tmp_path / "full_aoi_point_phases.png"
     assert (
         psu.make_diagnostics_figure(hist, psu.POINT_PHASE_PANELS, "ref", diag, "point phases")
