@@ -866,6 +866,158 @@ class TestProcessAndWriteHiveSharded:
                 assert outs["on"][rel] == outs["off"][rel], rel
 
 
+class TestHiveProfileWritePhase:
+    """Issue #249 (PR #256): opt-in ``profile`` adds an additive ``write``
+    phase to the hive worker's ``phase_timings``, next to process_shard's
+    read/index/aggregate — the same split the flat Lambda handler has carried
+    since issue #100. Default off: zero timing calls and byte-identical
+    output."""
+
+    _grid = TestProcessAndWriteHive._grid
+    _carrier = TestProcessAndWriteHive._carrier
+    _meta = TestProcessAndWriteHive._meta
+
+    # The read/index/aggregate values the profiled process_shard fake seeds,
+    # so tests can pin that the write split leaves them untouched.
+    _SHARD_PHASES = {"read": 1.0, "index": 0.5, "aggregate": 0.25}
+
+    def _profiled_fake(self, grid, ragged=None, error=None):
+        """Streaming fake honoring the real profile contract: seeds
+        ``metadata['phase_timings']`` only when ``profile=True`` arrives."""
+
+        def fake(g, shard_key, urls, **kwargs):
+            meta = self._meta(shard_key, error=error)
+            if kwargs.get("profile"):
+                meta["phase_timings"] = dict(self._SHARD_PHASES)
+            if error is None:
+                carrier = self._carrier(grid, shard_key)
+                kwargs["write_chunk"](grid.block_index(int(shard_key)), carrier, ragged or {})
+            return pd.DataFrame(), meta
+
+        return fake
+
+    def _run(self, monkeypatch, cfg, tmp_path, fake, *, profile=False, name="store"):
+        import zagg.processing as processing
+
+        monkeypatch.setattr(processing, "process_shard", fake)
+        grid = self._grid(cfg)
+        shard = _shard_word()
+        root = str(tmp_path / name)
+        meta = hive.process_and_write_hive(
+            shard,
+            ["s3://bucket/granule1.h5"],
+            grid,
+            {},
+            root,
+            cfg,
+            store_kwargs={},
+            profile=profile,
+        )
+        return grid, shard, root, meta
+
+    def test_profile_adds_nonnegative_write_phase(self, monkeypatch, cfg, tmp_path):
+        fake = self._profiled_fake(self._grid(cfg), ragged={"h": ([np.array([1.0, 2.0])], [0])})
+        _grid, _shard, _root, meta = self._run(monkeypatch, cfg, tmp_path, fake, profile=True)
+        timings = meta["phase_timings"]
+        # Additive: the process_shard phases keep their names and values.
+        assert set(timings) == {"read", "index", "aggregate", "write"}
+        assert {k: timings[k] for k in self._SHARD_PHASES} == self._SHARD_PHASES
+        assert timings["write"] >= 0.0
+
+    def test_sharded_leaf_write_counted(self, monkeypatch, cfg, tmp_path):
+        # K>1 sharded: the single post-stream write_leaf_to_zarr pass lands in
+        # the same write bucket.
+        import zagg.processing as processing
+
+        sharded_helper = TestProcessAndWriteHiveSharded()
+        grid = sharded_helper._grid(cfg)
+
+        def meta_with_phases(shard_key, error=None):
+            meta = self._meta(shard_key, error=error)
+            meta["phase_timings"] = dict(self._SHARD_PHASES)
+            return meta
+
+        fake = _sharded_accumulate_fake(grid, sharded_helper._chunk_carrier, meta_with_phases)
+        monkeypatch.setattr(processing, "process_shard", fake)
+        shard = _shard_word()
+        meta = hive.process_and_write_hive(
+            shard,
+            ["s3://b/g1.h5"],
+            grid,
+            {},
+            str(tmp_path / "store"),
+            cfg,
+            store_kwargs={},
+            profile=True,
+        )
+        assert meta["phase_timings"]["write"] >= 0.0
+        assert set(meta["phase_timings"]) == {"read", "index", "aggregate", "write"}
+
+    def test_errored_shard_omits_write(self, monkeypatch, cfg, tmp_path):
+        # Same gate as the flat handler (issue #100): a shard that wrote no
+        # leaf carries no write phase — read/index/aggregate stay as reported.
+        fake = self._profiled_fake(self._grid(cfg), error="No granules found")
+        _grid, _shard, root, meta = self._run(monkeypatch, cfg, tmp_path, fake, profile=True)
+        assert meta["phase_timings"] == self._SHARD_PHASES
+        assert "write" not in meta["phase_timings"]
+
+    def test_default_path_makes_no_timing_calls(self, monkeypatch, cfg, tmp_path):
+        # The issue #249 zero-overhead gate, hive edition: without profile the
+        # write path must never call time.time(). Rebind hive.py's module-level
+        # ``time`` name to a booby trap — only this module's calls are caught.
+        class _Boom:
+            @staticmethod
+            def time():
+                raise AssertionError("time.time() called on the unprofiled hive write path")
+
+        monkeypatch.setattr(hive, "time", _Boom)
+        fake = self._profiled_fake(self._grid(cfg), ragged={"h": ([np.array([1.0, 2.0])], [0])})
+        _grid, shard, root, meta = self._run(monkeypatch, cfg, tmp_path, fake)
+        assert "phase_timings" not in meta
+        # The leaf still landed, fully stamped.
+        from zagg.store import open_store
+
+        leaf = hive.shard_leaf_path(root, shard)
+        assert hive.read_commit(open_store(leaf))["complete"] is True
+
+    def test_profiled_leaf_bytes_match_unprofiled(self, monkeypatch, cfg, tmp_path):
+        # Parity: profiling changes the returned metadata only — the leaf's
+        # file set and bytes are identical (stamp compared modulo timestamp),
+        # the same comparison the K==1 sharded no-op test pins.
+        grid_probe = self._grid(cfg)
+        ragged = {"h": ([np.array([1.0, 2.0])], [0])}
+        outs: dict = {}
+        leaves: dict = {}
+        for tag, profile in (("on", True), ("off", False)):
+            fake = self._profiled_fake(grid_probe, ragged=ragged)
+            _grid, shard, root, meta = self._run(
+                monkeypatch, cfg, tmp_path, fake, profile=profile, name=tag
+            )
+            leaf = hive.shard_leaf_path(root, shard)
+            leaves[tag] = meta
+            files = {}
+            for dirpath, _dirs, filenames in os.walk(leaf):
+                for f in filenames:
+                    p = os.path.join(dirpath, f)
+                    with open(p, "rb") as fh:
+                        files[os.path.relpath(p, leaf)] = fh.read()
+            outs[tag] = files
+        assert sorted(outs["on"]) == sorted(outs["off"])
+        for rel in outs["on"]:
+            if rel == "zarr.json":
+                on = json.loads(outs["on"][rel])
+                off = json.loads(outs["off"][rel])
+                on["attributes"][hive.COMMIT_ATTR].pop("written_at")
+                off["attributes"][hive.COMMIT_ATTR].pop("written_at")
+                assert on == off
+            else:
+                assert outs["on"][rel] == outs["off"][rel], rel
+        # And the metadata differs ONLY by the phase_timings sub-dict.
+        on_meta = {k: v for k, v in leaves["on"].items() if k != "phase_timings"}
+        assert on_meta == leaves["off"]
+        assert "phase_timings" not in leaves["off"]
+
+
 class TestLeafBlockIndex:
     def test_k1_maps_to_zero(self, cfg):
         g = HealpixGrid(6, 8, layout="fullsphere", config=cfg)
