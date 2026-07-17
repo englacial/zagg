@@ -206,6 +206,10 @@ class StreamingAggregator:
         self._arenas: dict[str, np.ndarray] = {
             n: np.empty((0, 2), dtype=np.float32) for n in self._digest_fields
         }
+        # Set to the field name while its arena is released for compaction and
+        # cleared once compaction lands; a lingering value means a compaction
+        # failed mid-rebuild and the running state is unusable (see update()).
+        self._poisoned: str | None = None
         self.n_obs_total = 0
         self.flushes = 0
         self._buffer: list = []
@@ -330,14 +334,20 @@ class StreamingAggregator:
                 k_exact[u] = len(d)
             # Release the old arena and staging before compaction so the
             # compaction peak is bound + exact, not old + stage + bound + exact.
+            # This leaves the field transiently inconsistent (arena emptied,
+            # offsets still describing the pre-merge layout); poison it so a
+            # failed gather below (e.g. OOM) can't be caught and then read as a
+            # silent no-digest result. Cleared once compaction lands atomically.
             self._arenas[name] = _EMPTY_ARENA
             del arena, stage
+            self._poisoned = name
 
             # Compact the bounded layout to exact CSR in one vectorized gather
             # (merge compression leaves slack only inside merged slots).
             new_offsets = np.concatenate(([0], np.cumsum(k_exact)))
             src = _ranges_to_indices(bound_off[:-1], k_exact)
             self._offsets[name], self._arenas[name] = new_offsets, bound_arena[src]
+            self._poisoned = None
 
         self._cells, self._cell_counts = union, new_counts
 
@@ -410,6 +420,11 @@ class StreamingAggregator:
         count, empty cells 0 (the pooled ``len`` over an empty slice), digests
         only where nonempty — via one ``searchsorted`` over the sorted cell ids.
         """
+        if self._poisoned is not None:
+            raise RuntimeError(
+                f"streaming digest state for {self._poisoned!r} was left inconsistent "
+                "by a failed compaction; the running state is unusable"
+            )
         cells = children.astype(np.uint64)
         pos = np.searchsorted(self._cells, cells)
         pos_c = np.minimum(pos, max(self._cells.size - 1, 0))

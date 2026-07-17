@@ -485,6 +485,32 @@ class TestStreamingReviewFolds:
         cfg.aggregation["variables"]["count"]["function"] = "count"
         validate_streaming(cfg)
 
+    def test_poisoned_arena_state_raises_loudly(self):
+        # A compaction that fails mid-rebuild releases the field's arena but
+        # leaves its offsets stale; a later chunk_outputs must raise, not
+        # silently emit no digests (issue #217 fold).
+        from zagg.config import get_agg_fields
+
+        cfg = _config(streaming={"buffer_granules": 1, "state_layout": "arena"})
+        grid = _grid(cfg)
+        key = _shard_key()
+        agg = StreamingAggregator(cfg, grid, "pandas", 1, state_layout="arena")
+        children = grid.children(key)
+        cells = np.array([int(children[0]), int(children[1])], dtype=np.uint64)
+        agg.add_read(
+            pd.DataFrame(
+                {
+                    "h_ph": np.arange(20, dtype=np.float32),
+                    "leaf_id": np.repeat(cells, 10),
+                }
+            )
+        )
+        agg.flush()
+        assert agg._cells.size == 2  # state populated, so a read would emit digests
+        agg._poisoned = "h_tdigest"
+        with pytest.raises(RuntimeError, match="failed compaction"):
+            agg.chunk_outputs(children, get_agg_fields(cfg))
+
     def test_profile_charges_merge_to_read_phase(self, monkeypatch):
         # All flush cost (intermediate AND tail) is deliberately charged to
         # the ``read`` phase; the stamp lands after the tail flush.
