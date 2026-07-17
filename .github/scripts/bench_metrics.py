@@ -260,13 +260,14 @@ def _fmt(value, spec: str = "") -> str:
 
 # Column headers for every rendered benchmark table -- the PR comment, the
 # published ``latest.md``, and the latest-table PNG all use these in this order.
+# Per-100 km² normalization is dropped from ALL rendered outputs (issue #250
+# item 7, espg-approved); ``cost_per_100km2_usd`` stays in the parquet history.
 TABLE_HEADERS = [
     "target",
     "obs",
     "runtime (s)",
     "wall (s)",
     "cost/shard",
-    "cost/100 km²",
     "% timeout",
     "mem (MB)",
     "% cap",
@@ -309,7 +310,6 @@ def format_record_cells(r: dict) -> dict:
         "runtime (s)": _fmt(r.get("runtime_s"), ".1f"),
         "wall (s)": _fmt(r.get("total_wall_s"), ".1f"),
         "cost/shard": "$" + _fmt(r.get("cost_per_shard_usd"), ".5f"),
-        "cost/100 km²": "$" + _fmt(r.get("cost_per_100km2_usd"), ".5f"),
         "% timeout": _fmt(r.get("worker_pct_timeout"), ".0%"),
         "mem (MB)": _fmt(r.get("max_memory_mb"), ".0f"),
         "% cap": _fmt(mem_frac, ".0%"),
