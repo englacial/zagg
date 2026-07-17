@@ -981,6 +981,11 @@ def _handle_process_raster(event: Dict[str, Any]) -> Dict[str, Any]:
     mode.
     """
     start_time = time.time()
+    # Per-invocation peak-RSS sampler (issue #141 convention; raster parity
+    # for issue #250): the body reports THIS invocation's sampled peak, with
+    # the container-lifetime ``ru_maxrss`` high-water as the off-Linux
+    # fallback -- exactly the point-path split.
+    rss_sampler = _PeakRSSSampler().start()
     try:
         required = ["shard_key", "granules", "config", "store_path", "time_index"]
         missing = [p for p in required if p not in event]
@@ -1066,6 +1071,14 @@ def _handle_process_raster(event: Dict[str, Any]) -> Dict[str, Any]:
             "total_obs": meta["timesteps"],
             "duration_s": time.time() - start_time,
         }
+        # Worker memory telemetry (issue #250): sampled per-invocation peak,
+        # container high-water fallback (see the process-mode stamp).
+        rss_sampler.stop()
+        body["container_hwm_mb"] = _max_memory_mb()
+        sampled_peak = rss_sampler.peak_mb
+        body["max_memory_mb"] = (
+            sampled_peak if sampled_peak is not None else body["container_hwm_mb"]
+        )
         if profile:
             total = time.time() - start_time
             body["phase_timings"] = {
@@ -1086,6 +1099,8 @@ def _handle_process_raster(event: Dict[str, Any]) -> Dict[str, Any]:
                 }
             ),
         }
+    finally:
+        rss_sampler.stop()  # idempotent; ends the daemon thread on error paths too
 
 
 def _handle_process(event: Dict[str, Any], context: Any) -> Dict[str, Any]:

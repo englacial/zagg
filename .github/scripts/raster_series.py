@@ -4,8 +4,7 @@ The raster sibling of ``full_aoi_series.py``. The per-release raster leg
 (``run_raster_benchmark.py --out-json``) records the Sentinel-2 pipeline over
 the NEON AOI once per release; its record shape differs materially from the
 point-pipeline run record (per-stage work volumes + counts instead of the
-worker read/index/aggregate/write phases; no memory column -- the raster
-handler reports no RSS), so it lives in its OWN parquet
+worker read/index/aggregate/write phases), so it lives in its OWN parquet
 (``raster_series.parquet``) -- the same reasoning that split
 ``full_aoi_series.parquet`` from the per-merge series.
 
@@ -71,6 +70,10 @@ RASTER_COLUMNS = [
     "count_assets",
     "count_tiles",
     "count_geom_hits",
+    # Peak worker RSS in MB, max across shards (issue #250: the raster worker
+    # now reports the sampled per-invocation peak, point-path parity). Null on
+    # rows recorded before the worker reported it.
+    "max_memory_mb",
 ]
 
 # run-record stage_max key -> flat column ("write" is the handler's write
