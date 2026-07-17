@@ -95,8 +95,8 @@ def point_release_history(fa_df: pd.DataFrame) -> pd.DataFrame:
 def raster_release_history(r_df: pd.DataFrame) -> pd.DataFrame:
     """Release rows of the raster series, ordered, with the billed totals.
 
-    The raster leg has no sync setup/finalize invokes (harness-owned template),
-    so its total is ``cost_usd`` directly.
+    The raster leg has no sync setup/finalize invokes (the runner emits the
+    template, reported as ``template_s``), so its total is ``cost_usd`` directly.
     """
     if r_df.empty or "target" not in r_df.columns:
         return pd.DataFrame()
@@ -220,8 +220,8 @@ def make_summary_figure(rows: list[tuple[str, pd.DataFrame, str]], out_png: Path
     lacking the billed/wall totals, are skipped). Left panels chart
     ``total_billed_s`` with a right-hand USD axis that is an EXACT relabeling
     (fixed 4 GB price); right panels chart ``total_wall_s``. Markers carry the
-    unchanged memory colour scale where the series reports memory (the raster
-    handler doesn't -- its markers stay uncoloured).
+    unchanged memory colour scale where the series reports memory (both the
+    point and raster handlers now report ``max_memory_mb``).
     """
     import matplotlib
 
