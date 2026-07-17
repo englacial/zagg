@@ -704,18 +704,22 @@ FULL_AOI_FIGURES = {
 }
 
 # Per-release phase-breakdown series (issue #250): column -> legend label, in
-# draw order. ``setup_s`` is the HEADLINE line -- the flat fullsphere-template
-# tax (one Lambda writing the whole global template before the fan-out,
-# ~104 s flat vs ~3.7 s hive), drawn emphasized so the flat->hive migration
-# (issue #236) reads as a visible collapse. read/index/aggregate are the worker
-# straggler split (max across shards, ``worker_phase_max`` under profile=True);
-# worker max/median frame the per-worker total. ``finalize_s`` is deliberately
-# omitted (~0 on the full-AOI path -- the issue #250 display spec).
+# draw order. ``setup_s`` is the HEADLINE line, drawn emphasized: on flat rows
+# it is the sync fullsphere-template invoke (one Lambda writing the whole
+# global template before the fan-out, ~104 s to land 4 NEON shards); on hive
+# rows (issue #252 hybrid, PR #255) it is only the preflight ping + the
+# ~10 ms async Event dispatch of the manifest write -- so the flat->hive
+# migration (issue #236) reads as a visible collapse. read/index/aggregate are
+# the worker straggler split (max across shards, ``worker_phase_max`` under
+# profile=True); worker max/median frame the per-worker total. ``finalize_s``
+# stays displayed (issue #252 asks #250 to keep it): ~0 on flat, but on hive
+# it is the load-bearing idempotent manifest backstop.
 FULL_AOI_PHASE_SERIES = {
-    "setup_s": "setup (fullsphere template)",
+    "setup_s": "setup (flat: fullsphere template)",
     "phase_read_s": "read (max)",
     "phase_index_s": "index (max)",
     "phase_aggregate_s": "aggregate (max)",
+    "finalize_s": "finalize (hive: manifest backstop)",
     "worker_max_s": "worker total (max)",
     "worker_median_s": "worker total (median)",
 }
@@ -889,7 +893,7 @@ def make_full_aoi_phase_figure(df: pd.DataFrame, out_png: Path) -> bool:
     fig.legend(
         handles, labels, loc="upper center", ncol=len(cols), fontsize=8, bbox_to_anchor=(0.5, 1.01)
     )
-    fig.suptitle("zagg full-AOI NEON — per-phase seconds vs release (finalize ~0, omitted)", y=1.05)
+    fig.suptitle("zagg full-AOI NEON — per-phase seconds vs release", y=1.05)
     out_png.parent.mkdir(parents=True, exist_ok=True)
     fig.savefig(out_png, dpi=120, bbox_inches="tight")
     plt.close(fig)
