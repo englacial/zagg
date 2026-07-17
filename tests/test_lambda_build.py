@@ -388,10 +388,11 @@ class TestWorkerSizeVariants:
     The template declares the 6 pre-provisioned variants (memories 2048/4096/
     8192, each with a default-512 and a -disk /tmp twin) via two
     ``Fn::ForEach`` loops under the ``AWS::LanguageExtensions`` transform.
-    ``_expand_foreach`` renders those loops the way the transform does —
-    textual ``${Identifier}`` substitution plus ``!Ref Identifier``
-    replacement per collection value — so these tests pin the concrete
-    function set (names, memories, /tmp sizes) without a deploy.
+    ``_expand_foreach`` models the transform for the constructs this template
+    uses — textual ``${Identifier}`` substitution plus ``!Ref Identifier``
+    replacement per collection value, with the collection taken from the
+    parameter's ``Default`` — so these tests pin the concrete function set
+    (names, memories, /tmp sizes) for the default size list without a deploy.
     """
 
     _SIZES = ("2048", "4096", "8192")
