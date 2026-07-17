@@ -87,8 +87,8 @@ the phase breakdown:
   lands its series point); the per-merge harness *hard-fails* on the same
   mismatch.
 - **Per-phase seconds** — where wall time actually goes, release over release
-  (issue #250): the **setup** invoke plus the worker **read / index /
-  aggregate** split, framed by the worker max/median totals.
+  (issue #250): the **setup** invoke, the worker **read / index / aggregate**
+  split, and **finalize**, framed by the worker max/median totals.
 
 The release matrix also carries a fifth target, `full_aoi_neon_o9_hive` (issue
 #240 phase 4): the same config with `store_layout: hive` over all 4 shards,
@@ -117,29 +117,37 @@ layout axis gets its own panel row.
 Where wall time goes, per release (issue #250) — the same 2×2 target panels,
 seconds on the y-axis, one line per phase:
 
-- **setup** (the headline, drawn emphasized) — the single setup Lambda fired
-  once per arm *before* the fan-out. On a flat-layout store it writes the
-  **entire fullsphere** zarr template just to land 4 NEON shards (~104–110 s,
-  the dense-fullsphere waste of `docs/design/sparse_coverage.md` §1); hive
-  writes one leaf lazily per shard and collapses it to ~3.7 s, so the
+- **setup** (the headline, drawn emphasized) — the sync setup path run *before*
+  the fan-out. On a **flat**-layout store it is the single setup Lambda writing
+  the **entire fullsphere** zarr template just to land 4 NEON shards
+  (~104–110 s, the dense-fullsphere waste of `docs/design/sparse_coverage.md`
+  §1). On **hive** (the issue #252 hybrid lifecycle) there is *no* synchronous
+  manifest-writing setup invoke at all: `setup_s` is only the preflight ping
+  plus the ~10 ms async Event dispatch of the manifest write — so the
   flat→hive migration (issue #236) reads as a visible collapse of this line.
   Note `setup_s` is a real billed invoke but is *excluded* from both
   `total_wall_s` and `cost_usd` — see `setup_cost_usd` below.
 - **read / index / aggregate** — the worker phase split the harness's
   `profile=True` dispatch emits (`worker_phase_max`), rolled up as the
   straggler (**max across shards**), matching the wall-time framing.
+- **finalize** — kept in the panel (issue #252 asks issue #250 to display it):
+  ~0 on flat (zarr metadata consolidation), but on hive it is the
+  **idempotent `morton_hive.json` manifest backstop** — load-bearing, since
+  the primary manifest write fires as an async Event invoke at init and is
+  never redelivered if lost.
 - **worker total (max / median)** — the per-worker billed-duration totals that
   frame the split.
 
-`finalize` is omitted (~0 on the full-AOI path). Phase cells are null on
-releases recorded before the capture landed, so those lines simply start at
-the first release that recorded them.
+Phase cells are null on releases recorded before the capture landed, so those
+lines simply start at the first release that recorded them.
 
-The series also records **`setup_cost_usd`** — the setup invoke's billed
+The series also records **`setup_cost_usd`** — the sync setup path's billed
 dollars (`setup_s × memory_gb × price/GB-s`). It is kept as its *own* column
 rather than folded into `cost_usd` (worker GB-seconds only), so the retained
 cost history stays comparable across releases; add the two for the honest
-whole-run dollar total.
+whole-run dollar total. On hive rows the async manifest write's billed GB-s is
+unobservable from the orchestrator, so there `setup_cost_usd` covers only the
+sync residue (ping + dispatch).
 
 ![Per-release full-AOI — per-phase seconds](https://raw.githubusercontent.com/englacial/zagg/benchmarks/site/full_aoi_phases.png)
 
