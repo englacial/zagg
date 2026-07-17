@@ -980,6 +980,34 @@ class TestHiveProfileWritePhase:
         leaf = hive.shard_leaf_path(root, shard)
         assert hive.read_commit(open_store(leaf))["complete"] is True
 
+    def test_sharded_default_path_makes_no_timing_calls(self, monkeypatch, cfg, tmp_path):
+        # Sharded edition of the trap (review finding): the post-stream
+        # write_leaf_to_zarr bracket must also make zero time.time() calls
+        # when profile is off — the streaming trap above never executes it.
+        import zagg.processing as processing
+
+        class _Boom:
+            @staticmethod
+            def time():
+                raise AssertionError("time.time() called on the unprofiled sharded write path")
+
+        monkeypatch.setattr(hive, "time", _Boom)
+        sharded_helper = TestProcessAndWriteHiveSharded()
+        grid = sharded_helper._grid(cfg)
+        fake = _sharded_accumulate_fake(grid, sharded_helper._chunk_carrier, self._meta)
+        monkeypatch.setattr(processing, "process_shard", fake)
+        shard = _shard_word()
+        root = str(tmp_path / "store")
+        meta = hive.process_and_write_hive(
+            shard, ["s3://b/g1.h5"], grid, {}, root, cfg, store_kwargs={}
+        )
+        assert "phase_timings" not in meta
+        # The sharded leaf still landed, fully stamped.
+        from zagg.store import open_store
+
+        leaf = hive.shard_leaf_path(root, shard)
+        assert hive.read_commit(open_store(leaf))["complete"] is True
+
     def test_profiled_leaf_bytes_match_unprofiled(self, monkeypatch, cfg, tmp_path):
         # Parity: profiling changes the returned metadata only — the leaf's
         # file set and bytes are identical (stamp compared modulo timestamp),
