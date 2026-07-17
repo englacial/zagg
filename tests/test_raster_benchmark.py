@@ -111,174 +111,58 @@ def test_live_dispatch_requires_store_prefix(tmp_path):
 # --- stage rollup ------------------------------------------------------------
 
 
-def _body(stages=None, write=None, timesteps=3, duration=100.0):
-    body = {"timesteps": timesteps, "duration_s": duration}
-    if stages is not None or write is not None:
-        body["phase_timings"] = {"sample": duration - (write or 0.0), "write": write}
-        body["phase_timings"]["stages"] = stages
-    return body
+def test_run_target_dispatches_via_agg_and_records_summary(monkeypatch, tmp_path):
+    # The harness dispatches through zagg.runner.agg (issue #250: the runner
+    # owns the profiled raster transport) with profile=True and the benchmark
+    # no-re-pay policy, and maps the summary's rollups onto the run record.
+    import zagg.runner as runner_mod
 
+    captured = {}
 
-def test_stage_rollup_maxes_seconds_and_sums_counts():
-    b1 = _body(
-        stages={
-            "open": 10.0,
-            "geometry": 2.0,
-            "fetch": 50.0,
-            "decode": 30.0,
-            "gather": 15.0,
-            "assets": 40,
-            "tiles": 120,
-            "geom_hits": 4,
-        },
-        write=5.0,
-    )
-    b2 = _body(
-        stages={
-            "open": 8.0,
-            "geometry": 3.0,
-            "fetch": 70.0,
-            "decode": 20.0,
-            "gather": 12.0,
-            "assets": 35,
-            "tiles": 100,
-            "geom_hits": 30,
-        },
-        write=9.0,
-    )
-    stage_max, stage_counts = rrb.stage_rollup([b1, b2])
-    # Straggler max per stage second (never a sum -- work volume, not wall)...
-    assert stage_max == {
-        "open": 10.0,
-        "geometry": 3.0,
-        "fetch": 70.0,
-        "decode": 30.0,
-        "gather": 15.0,
-        "write": 9.0,
-    }
-    # ...counts are run totals.
-    assert stage_counts == {"assets": 75, "tiles": 220, "geom_hits": 34}
+    def fake_agg(config, **kwargs):
+        captured.update(kwargs)
+        return {
+            "cells_with_data": 4,
+            "cells_error": 0,
+            "total_obs": 250,
+            "timesteps": 70,
+            "wall_time_s": 693.0,
+            "template_s": 1.1,
+            "lambda_time_s": 2036.0,
+            "worker_max_s": 687.0,
+            "worker_median_s": 480.0,
+            "max_memory_mb": 2890.0,
+            "worker_stage_max": {"open": 38.0, "fetch": 512.0, "write": 41.0},
+            "worker_stage_counts": {"assets": 425, "tiles": 1300, "geom_hits": 81},
+        }
 
-
-def test_stage_rollup_unprofiled_bodies_yield_empty():
-    # A pre-#256 worker returns no phase_timings: the rollup must come back
-    # empty (-> null series cells), never zero-fake a measurement.
-    stage_max, stage_counts = rrb.stage_rollup([{"timesteps": 2, "duration_s": 50.0}])
-    assert stage_max == {} and stage_counts == {}
-    # An unknown future stage stays out of the rollup (schema-stable).
-    odd = _body(stages={"open": 1.0, "warp": 9.0, "assets": 2})
-    stage_max2, counts2 = rrb.stage_rollup([odd])
-    assert "warp" not in stage_max2 and stage_max2["open"] == 1.0
-    assert counts2 == {"assets": 2}
-
-
-def test_median_helper():
-    assert rrb._median([]) is None
-    assert rrb._median([3.0]) == 3.0
-    assert rrb._median([1.0, 3.0]) == 2.0
-    assert rrb._median([1.0, 2.0, 9.0]) == 2.0
-
-
-# --- dispatch transport (mocked boto, no AWS) -------------------------------
-
-
-class _FakePayload:
-    def __init__(self, text: str):
-        self._text = text
-
-    def read(self):
-        return self._text.encode("utf-8")
-
-
-class _FakeLambdaClient:
-    """Records each shard's event and replays a scripted invoke envelope."""
-
-    def __init__(self, responder):
-        self._responder = responder
-        self.events: list[dict] = []
-
-    def invoke(self, **kwargs):
-        # boto's invoke uses PascalCase kwargs (FunctionName/InvocationType/Payload).
-        event = json.loads(kwargs["Payload"])
-        self.events.append(event)
-        return self._responder(event)
-
-
-def _envelope(body: dict, status: int = 200) -> dict:
-    # The nested Lambda proxy shape the harness unwraps: outer JSON with a
-    # string ``body`` that is itself JSON.
-    return {"Payload": _FakePayload(json.dumps({"statusCode": status, "body": json.dumps(body)}))}
-
-
-def _dispatch_config():
-    from types import SimpleNamespace
-
-    return SimpleNamespace(
-        data_source={"reader": "raster"}, output={"store_layout": "flat"}, pipeline="raster"
-    )
-
-
-def _install_fake_lambda(monkeypatch, responder) -> _FakeLambdaClient:
-    # ``_dispatch_shards`` imports boto3 internally, so patch the attribute.
-    client = _FakeLambdaClient(responder)
-    monkeypatch.setattr("boto3.client", lambda *a, **k: client)
-    return client
-
-
-def _dispatch_one(monkeypatch, responder, shard_key=1):
-    client = _install_fake_lambda(monkeypatch, responder)
-    cells = [(shard_key, [{"assets": {"red": "u"}, "time_key": "t1"}])]
-    results = rrb._dispatch_shards(
-        cells,
-        _dispatch_config(),
-        {"t1": ["a"], "t2": ["b"]},  # t2 belongs to another shard's slice
-        "s3://bucket/x.zarr",
+    monkeypatch.setattr(runner_mod, "agg", fake_agg)
+    manifest, base = rrb.load_targets(str(BENCH / "targets_raster_neon.json"))
+    run = rrb.run_target(
+        "raster_s2_neon_2025",
+        manifest,
+        base,
+        store="s3://bucket/raster_s2_neon_2025.zarr",
         region="us-west-2",
         function_name="process-shard",
+        context={"timestamp": "t", "commit": "c", "ref": "v0.0.0", "event": "release"},
+        dry_run=False,
+        artifacts_dir=str(tmp_path),
     )
-    return client, results
-
-
-def test_dispatch_shards_happy_path(monkeypatch):
-    client, results = _dispatch_one(
-        monkeypatch, lambda event: _envelope({"duration_s": 120.0, "timesteps": 3}), shard_key=7
-    )
-    assert len(results) == 1
-    r = results[0]
-    assert r["error"] is None and r["body"]["duration_s"] == 120.0
-    # The event is the runner's raster envelope: mode/profile/int key, the
-    # store path, and ONLY this shard's own time-index slice (never global).
-    event = client.events[0]
-    assert event["mode"] == "process_raster" and event["profile"] is True
-    assert event["shard_key"] == 7 and isinstance(event["shard_key"], int)
-    assert event["store_path"] == "s3://bucket/x.zarr"
-    assert event["time_index"] == {"t1": ["a"]}
-
-
-def test_dispatch_shards_function_error(monkeypatch):
-    _client, results = _dispatch_one(
-        monkeypatch,
-        lambda event: {"Payload": _FakePayload("boom traceback"), "FunctionError": "Unhandled"},
-    )
-    assert results[0]["error"].startswith("Lambda error:") and "body" not in results[0]
-
-
-def test_dispatch_shards_non_200_surfaces_body_error(monkeypatch):
-    _client, results = _dispatch_one(
-        monkeypatch, lambda event: _envelope({"error": "shard blew up"}, status=500)
-    )
-    assert results[0]["error"] == "shard blew up" and "body" not in results[0]
-
-
-def test_dispatch_shards_exception_becomes_error_string(monkeypatch):
-    def _boom(event):
-        raise RuntimeError("network down")
-
-    _client, results = _dispatch_one(monkeypatch, _boom)
-    assert results[0]["error"] == "network down" and "body" not in results[0]
-
-
-# --- raster series append core ----------------------------------------------
+    assert captured["profile"] is True
+    assert captured["max_retries"] == 1  # never re-pay a failed shard (#119)
+    assert captured["backend"] == "lambda" and captured["morton_cell"] is None
+    assert captured["catalog"].endswith("sm_raster_s2_neon_2025.json")
+    assert run["lambda_seconds"] == 2036.0
+    assert run["gb_seconds"] == pytest.approx(2036.0 * rrb.LAMBDA_MEMORY_GB)
+    assert run["total_wall_s"] == pytest.approx(1.1 + 693.0)
+    assert run["max_memory_mb"] == 2890.0
+    assert run["stage_max"]["fetch"] == 512.0
+    assert run["stage_counts"]["tiles"] == 1300
+    # The nested dicts flatten into the series columns downstream.
+    df = rs.records_to_frame([run])
+    assert df.iloc[0]["stage_fetch_s"] == 512.0
+    assert df.iloc[0]["count_tiles"] == 1300
 
 
 def _record(commit="c0", target="raster_s2_neon_2025", event="release", **over):

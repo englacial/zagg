@@ -588,6 +588,31 @@ class TemporalStrategy:
         return summary
 
 
+# Stage keys of the per-shard raster profile (issue #249): float seconds vs
+# int counts, split so the rollup straggler-maxes seconds and sums counts.
+_RASTER_STAGE_SECONDS = ("open", "geometry", "fetch", "decode", "gather")
+_RASTER_STAGE_COUNTS = ("assets", "tiles", "geom_hits")
+
+
+def _fold_raster_stages(stage_max: dict, stage_counts: dict, stages: dict, write_s) -> None:
+    """Fold one shard's stage stats into the run rollup (issue #250).
+
+    Seconds are straggler-maxed across shards (the ``worker_phase_max``
+    framing); counts are summed run totals. ``write_s`` (the handler's write
+    bucket / the local path's timed slab writes) rides next to the issue #249
+    stage set as ``"write"``. Unknown future stages are ignored so the summary
+    schema stays stable; an unprofiled shard folds nothing.
+    """
+    for key in _RASTER_STAGE_SECONDS:
+        if key in stages:
+            stage_max[key] = max(stage_max.get(key, 0.0), float(stages[key]))
+    for key in _RASTER_STAGE_COUNTS:
+        if key in stages:
+            stage_counts[key] = stage_counts.get(key, 0) + int(stages[key])
+    if write_s is not None:
+        stage_max["write"] = max(stage_max.get("write", 0.0), float(write_s))
+
+
 class RasterStrategy:
     """The raster pull-NN path (issue #218): ``reader: raster`` on a spatial grid.
 
@@ -613,6 +638,16 @@ class RasterStrategy:
     observation count); ``timesteps`` separately carries the global datatake
     count. A dashboard summing ``total_obs`` across kinds mixes units — read it
     per kind.
+
+    ``profile=True`` (issue #250) threads the opt-in ``profile`` event key to
+    the workers (byte-identical payload when off) and rolls their
+    ``phase_timings`` up into ``summary["worker_stage_max"]`` (straggler-maxed
+    seconds per issue #249 stage + the ``write`` bucket) and
+    ``summary["worker_stage_counts"]`` (summed work counts); the local backend
+    profiles the same stages in-process. The lambda summary also carries the
+    always-on worker rollups ``template_s`` / ``lambda_time_s`` /
+    ``worker_max_s`` / ``worker_median_s`` / ``max_memory_mb`` (null-safe on
+    workers predating the fields) so the release benchmark reads one summary.
     """
 
     def run(
@@ -630,6 +665,7 @@ class RasterStrategy:
         region,
         output_credentials,
         output_endpoint_url,
+        profile=False,
         **_ignored,
     ):
         from zagg.processing.raster import (
@@ -681,7 +717,12 @@ class RasterStrategy:
             credentials=output_credentials,
             endpoint_url=resolved_endpoint,
         )
+        # Template emission is orchestrator-owned; time it (always-on, the
+        # issue #180 bracket convention) so the benchmark harness can split
+        # setup-ish wall from the fan-out (issue #250).
+        template_t0 = time.time()
         emit_raster_template(zarr_store, grid, config, times_us, overwrite=overwrite)
+        template_s = time.time() - template_t0
 
         if backend == "lambda":
             return self._run_lambda_shards(
@@ -696,6 +737,8 @@ class RasterStrategy:
                 max_retries=_ignored.get("max_retries") or 3,
                 output_credentials=output_credentials,
                 output_endpoint_url=resolved_endpoint,
+                profile=profile,
+                template_s=template_s,
             )
 
         source = config.data_source or {}
@@ -714,14 +757,20 @@ class RasterStrategy:
             shard_key, granules = pair
             wrote = False
             # Per-stage sample profiling (issue #249), the local flavor of the
-            # lambda handler's opt-in ``profile`` key: allocated only when
-            # debug logging is on, so the default path passes None and the
-            # sample path times nothing.
-            stage_stats = new_stage_stats() if logger.isEnabledFor(logging.DEBUG) else None
+            # lambda handler's opt-in ``profile`` key: allocated when profiling
+            # (issue #250) or when debug logging is on, so the default path
+            # passes None and the sample path times nothing.
+            stage_stats = (
+                new_stage_stats() if profile or logger.isEnabledFor(logging.DEBUG) else None
+            )
+            write_s = 0.0
 
             def _write_slab(t_idx, slab):
-                nonlocal wrote
+                nonlocal wrote, write_s
+                w0 = time.time() if profile else 0.0
                 write_raster_slab(zarr_store, grid, int(shard_key), t_idx, slab)
+                if profile:
+                    write_s += time.time() - w0
                 wrote = True
 
             # Stream: write + free each timestep's slab as it completes (issue
@@ -742,14 +791,16 @@ class RasterStrategy:
                 logger.debug(
                     f"raster shard {shard_label(grid, int(shard_key))} stages: {stage_stats}"
                 )
-            return meta
+            return meta, stage_stats, write_s
 
+        stage_max: dict = {}
+        stage_counts: dict = {}
         with ThreadPoolExecutor(max_workers=max_workers) as pool:
             futures = {pool.submit(_one, pair): pair[0] for pair in cells}
             for fut in as_completed(futures):
                 label = shard_label(grid, futures[fut])
                 try:
-                    meta = fut.result()
+                    meta, stage_stats, write_s = fut.result()
                 except Exception as e:  # noqa: BLE001 - per-shard isolation, run continues
                     errors += 1
                     last_error = e
@@ -758,6 +809,8 @@ class RasterStrategy:
                 if meta["timesteps"]:
                     shards_with_data += 1
                     timesteps_written += meta["timesteps"]
+                if profile and stage_stats is not None:
+                    _fold_raster_stages(stage_max, stage_counts, stage_stats, write_s)
 
         wall_time = time.time() - t0
         # Per-shard isolation lets one bad shard be counted and skipped, but a
@@ -777,9 +830,15 @@ class RasterStrategy:
             "total_obs": timesteps_written,
             "timesteps": int(len(times_us)),
             "wall_time_s": wall_time,
+            "template_s": template_s,
             "store_path": store_path,
             "backend": "local",
         }
+        if profile:
+            # Straggler-maxed stage seconds + summed work counts (issue #250);
+            # stage seconds are work volume, never a wall decomposition.
+            summary["worker_stage_max"] = stage_max
+            summary["worker_stage_counts"] = stage_counts
         logger.info(
             f"Done: {shards_with_data}/{len(cells)} shards, {len(times_us)} timesteps, "
             f"{errors} errors, {wall_time:.1f}s"
@@ -800,6 +859,8 @@ class RasterStrategy:
         max_retries,
         output_credentials,
         output_endpoint_url,
+        profile=False,
+        template_s=None,
     ):
         """Fan shards out, one synchronous ``mode="process_raster"`` invoke each.
 
@@ -846,6 +907,11 @@ class RasterStrategy:
                 "store_path": store_path,
                 "time_index": {k: time_index[k] for k in keys},
             }
+            if profile:
+                # Opt-in (issue #250): the worker then emits phase_timings
+                # (write bucket + issue #249 stages). Absent -> the payload is
+                # byte-identical to the pre-profile path (the #100 convention).
+                ev["profile"] = True
             if output_creds_event is not None:
                 ev["output_credentials"] = output_creds_event
             return ev
@@ -901,6 +967,7 @@ class RasterStrategy:
         errors = 0
         timesteps_written = 0
         last_error = None
+        ok_bodies: list[dict] = []
         with ThreadPoolExecutor(max_workers=max_workers) as pool:
             futures = {pool.submit(_one, pair): pair[0] for pair in cells}
             for fut in as_completed(futures):
@@ -912,6 +979,7 @@ class RasterStrategy:
                     logger.warning(f"raster shard {label} failed: {result['error']}")
                     continue
                 body = result["body"]
+                ok_bodies.append(body)
                 if body.get("timesteps"):
                     shards_with_data += 1
                     timesteps_written += body["timesteps"]
@@ -919,6 +987,10 @@ class RasterStrategy:
         wall_time = time.time() - t0
         if cells and errors == len(cells):
             raise RuntimeError(f"all {errors} raster shard(s) failed; last error: {last_error}")
+        # Worker telemetry rollup (issue #250): billed durations and peak RSS,
+        # null-safe on bodies from a worker that predates either field.
+        durations = [float(b["duration_s"]) for b in ok_bodies if b.get("duration_s") is not None]
+        mems = [float(b["max_memory_mb"]) for b in ok_bodies if b.get("max_memory_mb") is not None]
         summary = {
             "total_cells": len(cells),
             "cells_with_data": shards_with_data,
@@ -927,9 +999,27 @@ class RasterStrategy:
             "total_obs": timesteps_written,
             "timesteps": int(len(time_index)),
             "wall_time_s": wall_time,
+            "template_s": template_s,
+            "lambda_time_s": sum(durations) if durations else None,
+            "worker_max_s": max(durations) if durations else None,
+            "worker_median_s": statistics.median(durations) if durations else None,
+            "max_memory_mb": max(mems) if mems else None,
             "store_path": store_path,
             "backend": "lambda",
         }
+        if profile:
+            # Straggler-maxed stage seconds (+ the write bucket) and summed
+            # work counts across shards (issue #250); the stage seconds are
+            # work volume (overlapped samples), never a wall decomposition.
+            stage_max: dict = {}
+            stage_counts: dict = {}
+            for body in ok_bodies:
+                pt = body.get("phase_timings") or {}
+                _fold_raster_stages(
+                    stage_max, stage_counts, pt.get("stages") or {}, pt.get("write")
+                )
+            summary["worker_stage_max"] = stage_max
+            summary["worker_stage_counts"] = stage_counts
         logger.info(
             f"Done (lambda): {shards_with_data}/{len(cells)} shards, "
             f"{errors} errors, {wall_time:.1f}s"
