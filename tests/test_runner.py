@@ -3632,6 +3632,72 @@ class TestLambdaDispatchFunctionSelection:
         assert self._dispatch(monkeypatch, atl06_config, catalog_file) == "process-shard-test-4096"
 
 
+class TestLambdaResolverSeamRasterEvents:
+    """Issue #235: the raster (``_run_lambda_shards``) and temporal-events
+    (``_run_lambda_events``) Lambda paths must route their function name
+    through ``_resolve_function_name`` exactly as the spatial path does. Stub
+    the resolver to record its ``(config, function_name)`` args and halt at the
+    seam with a sentinel error, then drive each path far enough to hit it --
+    guarding against a future edit dropping the resolver call on either path."""
+
+    def _seam_stub(self):
+        seen = {}
+
+        def _stub(config, function_name):
+            seen["config"] = config
+            seen["function_name"] = function_name
+            raise RuntimeError("seam reached")
+
+        return seen, _stub
+
+    def test_events_path_routes_through_resolver(self, monkeypatch):
+        from zagg import runner
+        from zagg.config import PipelineConfig
+
+        seen, stub = self._seam_stub()
+        monkeypatch.setattr(runner, "_resolve_function_name", stub)
+        # output.format must be tabular (not the "zarr" default) to clear the
+        # temporal guard preceding the resolver call.
+        config = PipelineConfig(output={"format": "parquet"})
+        with pytest.raises(RuntimeError, match="seam reached"):
+            runner._run_lambda_events(
+                config,
+                [{"event_key": "e", "event_mask_uri": "s3://b/m.npy"}],
+                "s3://b/out.parquet",
+                max_workers=1,
+                region="us-west-2",
+                function_name="pinned-events",
+            )
+        assert seen["config"] is config
+        assert seen["function_name"] == "pinned-events"
+
+    def test_raster_path_routes_through_resolver(self, monkeypatch):
+        from zagg import runner
+        from zagg.config import PipelineConfig
+
+        seen, stub = self._seam_stub()
+        monkeypatch.setattr(runner, "_resolve_function_name", stub)
+        config = PipelineConfig()
+        # The resolver call is the first statement after the boto3 imports and
+        # before ``boto3.client``, so tiny dummies never get used.
+        with pytest.raises(RuntimeError, match="seam reached"):
+            runner.RasterStrategy()._run_lambda_shards(
+                config,
+                {},
+                {},
+                None,
+                "s3://b/out.zarr",
+                max_workers=1,
+                region="us-west-2",
+                function_name="pinned-raster",
+                max_retries=1,
+                output_credentials=None,
+                output_endpoint_url=None,
+            )
+        assert seen["config"] is config
+        assert seen["function_name"] == "pinned-raster"
+
+
 class TestCliFunctionNameDefault:
     """Issue #235: ``--function-name`` must default to ``None`` (resolved in
     the runner), not env-or-``process-shard`` — the old eager default reached
