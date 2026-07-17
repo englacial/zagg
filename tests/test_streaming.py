@@ -155,6 +155,55 @@ class TestStreamingConfig:
             validate_streaming(cfg)
 
 
+# --- arena tmp allocation ----------------------------------------------------
+
+
+class TestArenaTmpAlloc:
+    def _agg(self, cfg):
+        return StreamingAggregator(
+            cfg,
+            _grid(cfg),
+            "pandas",
+            50,
+            state_layout="arena",
+            arena_backing="tmp",
+        )
+
+    def test_alloc_raises_when_tmp_too_small(self, monkeypatch):
+        import os as _os
+
+        cfg = _config(streaming={"state_layout": "arena", "arena_backing": "tmp"})
+        agg = self._agg(cfg)
+        real = _os.statvfs(".")
+
+        class _Tiny:
+            f_bavail = 1
+            f_frsize = real.f_frsize
+
+        monkeypatch.setattr(_os, "statvfs", lambda _p: _Tiny())
+        with pytest.raises(RuntimeError, match="ephemeral"):
+            agg._alloc_arena(100_000)
+
+    def test_alloc_happy_path_allocates(self):
+        cfg = _config(streaming={"state_layout": "arena", "arena_backing": "tmp"})
+        agg = self._agg(cfg)
+        buf = agg._alloc_arena(16)
+        assert buf.shape == (16, 2)
+        assert buf.dtype == np.float32
+
+    def test_alloc_zero_rows_skips_statvfs(self, monkeypatch):
+        import os as _os
+
+        cfg = _config(streaming={"state_layout": "arena", "arena_backing": "tmp"})
+        agg = self._agg(cfg)
+
+        def _boom(_p):
+            raise AssertionError("statvfs should not run for an empty buffer")
+
+        monkeypatch.setattr(_os, "statvfs", _boom)
+        assert agg._alloc_arena(0).shape == (0, 2)
+
+
 # --- worker integration ------------------------------------------------------
 
 
