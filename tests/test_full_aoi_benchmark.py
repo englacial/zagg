@@ -76,7 +76,7 @@ def test_neon_catalog_builds_full_aoi_shardmap(tmp_path):
             "--targets",
             str(BENCH / "targets_full_aoi_neon.json"),
             "--target",
-            "full_aoi_neon_o9_inline_nomask",
+            "full_aoi_neon_o9_hive_mask",
             "--catalog",
             str(BENCH / "catalogs" / "cat_neon.parquet"),
             "--dry-run",
@@ -307,24 +307,19 @@ def test_flat_hive_parity_missing_leaf_is_a_finding_not_a_crash(tmp_path, monkey
     assert out["mismatches"][0]["shard"] == grid.shard_label(shard)
 
 
-def test_hive_target_manifest_wiring():
-    # The hive arm (issue #240 phase 4): parity_with names an existing flat
-    # sibling that runs FIRST (targets dispatch in manifest order), and the
-    # hive config resolves to store_layout=hive with the same grid.
+def test_release_leg_is_single_hive_mask_target():
+    # The issue #250 collapse: the point-pipeline release leg is ONE target --
+    # the per-merge hive config plus the strict AOI binary mask. The retired
+    # 2x2 / parity arms are gone from the manifest (their series rows remain).
     from zagg.config import get_store_layout, load_config
 
     manifest, base = rfab.load_targets(str(BENCH / "targets_full_aoi_neon.json"))
-    names = list(manifest["targets"])
-    hive_t = manifest["targets"]["full_aoi_neon_o9_hive"]
-    sibling = hive_t["parity_with"]
-    assert sibling in manifest["targets"]
-    assert names.index(sibling) < names.index("full_aoi_neon_o9_hive")
-    cfg = load_config(str(base / hive_t["config"]))
+    assert list(manifest["targets"]) == ["full_aoi_neon_o9_hive_mask"]
+    t = manifest["targets"]["full_aoi_neon_o9_hive_mask"]
+    assert t["aoi_mask"] is True
+    assert "parity_with" not in t  # no flat sibling runs anymore
+    cfg = load_config(str(base / t["config"]))
     assert get_store_layout(cfg) == "hive"
-    flat_cfg = load_config(str(base / manifest["targets"][sibling]["config"]))
-    assert get_store_layout(flat_cfg) == "flat"
-    # Same grid modulo layout: the parity comparison is only meaningful then.
-    assert cfg.output["grid"] == {**flat_cfg.output["grid"]}
 
 
 def test_ok_shard_keys_is_the_cells_with_data_predicate():

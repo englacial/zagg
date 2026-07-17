@@ -675,6 +675,21 @@ def test_every_live_shardmap_resolves_to_a_config():
 # --- provisional (PR-tree-only) handoff targets (issue #130) ---------------
 
 
+def test_merge_matrix_collapsed_to_single_hive_config():
+    # The issue #250 collapse (espg-approved restructure on PR #256): "run all"
+    # is exactly the one hive configuration; the retired 2x2 arms stay
+    # resolvable by explicit --target from provisional_targets.
+    manifest, base = run_benchmark.load_targets(str(BENCH / "targets.json"))
+    assert run_benchmark.all_target_names(manifest) == ["tdigest_healpix_o9_hive"]
+    for retired in (
+        "tdigest_healpix_o9_inline_nomask",
+        "tdigest_healpix_o9_sidecar_nomask",
+        "tdigest_healpix_o9_inline_mask",
+        "tdigest_healpix_o9_sidecar_mask",
+    ):
+        assert run_benchmark._resolve_target(manifest, retired)["grid_size"] == "o9"
+
+
 def test_provisional_targets_excluded_from_merge_matrix():
     # The pandas/arrow carrier-comparison targets are PR-tree-only: "run all"
     # (no --target) must not iterate them, so they never join the merge matrix.

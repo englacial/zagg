@@ -1,5 +1,5 @@
 {
-  "description": "Pinned Lambda-benchmark targets. Live matrix (issue #202 reset): tdigest aggregation, sharded output, granule_workers=4, at 4 GB workers -- a 2x2 over the read-backend A/B (inline vs sidecar) x the strict-AOI-mask A/B (mask vs nomask), o9 NEON shards ONLY. Four targets: tdigest_healpix_o9_{inline,sidecar}_{mask,nomask}. Both arms dispatch the plain healpix_o9 map; the mask arm builds the strict-AOI per-cell mask on the fly at dispatch (run_benchmark._shardmap_with_mask, mortie) from the o9_aoimask config's output.aoi_mask flag -- the derived ~190 KB mask payload is not committed (issue #202). The worker still receives the same per-cell mask via runner._aoi_payload_map. One shard/target (the pinned densest cell). run_benchmark applies data_source.index from each target's index_backend; sharded + granule_workers live in the shared config. o10 is retired from the live set (frozen under provisional_targets, retained not rerun -- issue #202).",
+  "description": "Benchmark targets: pinned configs + shard maps per issues #110/#133/#193/#202, collapsed to a SINGLE live per-merge configuration per issue #250 (espg-approved restructure on PR #256): o9, hive store layout, sharded output, tdigest, inline read, no AOI mask, granule_workers=4, 4 GB. The former inline/sidecar x mask/nomask 2x2 (issue #202 reset) is retired to provisional_targets (runnable by explicit --target, frozen rows retained in the series; its figures move to the Archived section). The live target doubles as the write-path regression arm: the object-count tripwire hard-fails the merge run on a sharded-write bypass (issue #215). Every-merge run dispatches ONE pinned densest shard (run_benchmark.py) with profile=True so the worker phase split (read/index/aggregate/write) lands in the series.",
   "aoi": {
     "file": "AOP_NEON.geojson",
     "name": "NEON SERC AOP box"
@@ -59,40 +59,8 @@
     }
   },
   "targets": {
-    "tdigest_healpix_o9_inline_nomask": {
-      "config": "configs/atl03_tdigest_healpix_o9.yaml",
-      "shardmap": "healpix_o9",
-      "aggregator": "tdigest",
-      "grid_type": "healpix",
-      "grid_size": "o9",
-      "index_backend": "inline"
-    },
-    "tdigest_healpix_o9_sidecar_nomask": {
-      "config": "configs/atl03_tdigest_healpix_o9.yaml",
-      "shardmap": "healpix_o9",
-      "aggregator": "tdigest",
-      "grid_type": "healpix",
-      "grid_size": "o9",
-      "index_backend": "sidecar"
-    },
-    "tdigest_healpix_o9_inline_mask": {
-      "config": "configs/atl03_tdigest_healpix_o9_aoimask.yaml",
-      "shardmap": "healpix_o9",
-      "aggregator": "tdigest",
-      "grid_type": "healpix",
-      "grid_size": "o9",
-      "index_backend": "inline"
-    },
-    "tdigest_healpix_o9_sidecar_mask": {
-      "config": "configs/atl03_tdigest_healpix_o9_aoimask.yaml",
-      "shardmap": "healpix_o9",
-      "aggregator": "tdigest",
-      "grid_type": "healpix",
-      "grid_size": "o9",
-      "index_backend": "sidecar"
-    },
     "tdigest_healpix_o9_hive": {
-      "_comment": "Hive-layout regression arm (issue #240 item 2, unblocked by issue #236): same o9 t-digest config with store_layout: hive, pinned densest shard, inline read path, no AOI mask. Its purpose is WRITE-PATH regression detection (the object-count tripwire hard-fails on a sharded-write bypass -- issue #215), not a cost A/B; it deliberately does NOT end in _mask/_nomask so the 2x2 matrix renderer leaves it out of the inline/sidecar x AOI-mask panels (its row still lands in the PR comment table and the retained series, keyed by the store_layout column).",
+      "_comment": "The whole per-merge leg (issue #250 collapse): o9 t-digest, store_layout: hive, sharded, pinned densest shard, inline read path, no AOI mask. Still the write-path regression arm (object-count tripwire hard-fails on a sharded-write bypass -- issue #215).",
       "config": "configs/atl03_tdigest_healpix_o9_hive.yaml",
       "shardmap": "healpix_o9",
       "aggregator": "tdigest",
@@ -102,7 +70,7 @@
     }
   },
   "provisional_targets": {
-    "_comment": "PROVISIONAL, PR-TREE-ONLY (issue #130). The two scalar targets share ONE config + ONE shard (healpix_o11) and differ only by handoff (pandas / arrow) to benchmark the per-cell carrier cost: pandas DataFrame vs an arro3-core Arrow table. Both produce byte-identical scalar output and neither imports pyarrow. (The experimental arrow-kernel reducer was dropped with pyarrow per @espg's path-C decision https://github.com/englacial/zagg/pull/131#issuecomment-4838785058, since arro3 has no hash-aggregate.) The two *_88s targets are the issue #148 stress probes: on-demand runs against the pinned worst 88S ring shard, expected to OOM/timeout until the streaming/cached-read work lands -- they must NOT join the every-merge matrix (a red benchmark job every merge). The two tdigest_healpix_o10_{inline,sidecar} entries are the FROZEN o10 read-backend A/B (issue #202 reset): o10 dropped out of the live every-merge matrix (now o9-only) but is retained here -- runnable on demand, its shard-map pin still drift-guarded -- rather than deleted (archived, not rerun). All entries here are deliberately NOT in 'targets': run_benchmark.py runs them by explicit --target name (via /benchmark); 'run all' (no --target) skips them. The *_88s_cached companions (issue #170) are the arm the base _88s probes were waiting for: same pinned 88S shard, read through the sidecar/compiled path (self-populating manifests) -- the base _88s targets stay pinned to the hierarchical baseline (issue #148 arm 1, the honest uncached reference), so the pair measures exactly the cached-vs-uncached delta at the pole.",
+    "_comment": "PROVISIONAL, PR-TREE-ONLY (issue #130). The two scalar targets share ONE config + ONE shard (healpix_o11) and differ only by handoff (pandas / arrow) to benchmark the per-cell carrier cost: pandas DataFrame vs an arro3-core Arrow table. Both produce byte-identical scalar output and neither imports pyarrow. (The experimental arrow-kernel reducer was dropped with pyarrow per @espg's path-C decision https://github.com/englacial/zagg/pull/131#issuecomment-4838785058, since arro3 has no hash-aggregate.) The two *_88s targets are the issue #148 stress probes: on-demand runs against the pinned worst 88S ring shard, expected to OOM/timeout until the streaming/cached-read work lands -- they must NOT join the every-merge matrix (a red benchmark job every merge). The two tdigest_healpix_o10_{inline,sidecar} entries are the FROZEN o10 read-backend A/B (issue #202 reset): o10 dropped out of the live every-merge matrix (now o9-only) but is retained here -- runnable on demand, its shard-map pin still drift-guarded -- rather than deleted (archived, not rerun). All entries here are deliberately NOT in 'targets': run_benchmark.py runs them by explicit --target name (via /benchmark); 'run all' (no --target) skips them. The *_88s_cached companions (issue #170) are the arm the base _88s probes were waiting for: same pinned 88S shard, read through the sidecar/compiled path (self-populating manifests) -- the base _88s targets stay pinned to the hierarchical baseline (issue #148 arm 1, the honest uncached reference), so the pair measures exactly the cached-vs-uncached delta at the pole. The tdigest_healpix_o9_{inline,sidecar}_{mask,nomask} 2x2 (issue #202 reset) was retired from the live matrix by the issue #250 collapse (per-merge leg = the single hive config); retained here so /benchmark --target can still run an arm on demand.",
     "tdigest_healpix_o10_inline": {
       "config": "configs/atl03_tdigest_healpix_o10.yaml",
       "shardmap": "healpix_o10",
@@ -167,6 +135,38 @@
       "grid_type": "healpix",
       "grid_size": "o10_88s",
       "read": "cached",
+      "index_backend": "sidecar"
+    },
+    "tdigest_healpix_o9_inline_nomask": {
+      "config": "configs/atl03_tdigest_healpix_o9.yaml",
+      "shardmap": "healpix_o9",
+      "aggregator": "tdigest",
+      "grid_type": "healpix",
+      "grid_size": "o9",
+      "index_backend": "inline"
+    },
+    "tdigest_healpix_o9_sidecar_nomask": {
+      "config": "configs/atl03_tdigest_healpix_o9.yaml",
+      "shardmap": "healpix_o9",
+      "aggregator": "tdigest",
+      "grid_type": "healpix",
+      "grid_size": "o9",
+      "index_backend": "sidecar"
+    },
+    "tdigest_healpix_o9_inline_mask": {
+      "config": "configs/atl03_tdigest_healpix_o9_aoimask.yaml",
+      "shardmap": "healpix_o9",
+      "aggregator": "tdigest",
+      "grid_type": "healpix",
+      "grid_size": "o9",
+      "index_backend": "inline"
+    },
+    "tdigest_healpix_o9_sidecar_mask": {
+      "config": "configs/atl03_tdigest_healpix_o9_aoimask.yaml",
+      "shardmap": "healpix_o9",
+      "aggregator": "tdigest",
+      "grid_type": "healpix",
+      "grid_size": "o9",
       "index_backend": "sidecar"
     }
   },
