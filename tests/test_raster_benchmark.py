@@ -207,6 +207,8 @@ def _record(commit="c0", target="raster_s2_neon_2025", event="release", **over):
             "write": 41.0,
         },
         "stage_counts": {"assets": 425, "tiles": 1300, "geom_hits": 81},
+        # Peak worker RSS, max across shards (issue #250 raster parity).
+        "max_memory_mb": 2890.0,
     }
     r.update(over)
     return r
@@ -230,6 +232,10 @@ def test_records_to_frame_column_stable_and_unknown_stage_stays_json():
     assert list(df.columns) == rs.RASTER_COLUMNS
     assert df.iloc[0]["stage_open_s"] == 1.0
     assert "stage_warp_s" not in df.columns
+    # Memory rides the series (issue #250 raster parity): retained, and the
+    # renderers colour raster markers from it + memory_gb like the point legs.
+    assert df.iloc[0]["max_memory_mb"] == 2890.0
+    assert rs.RASTER_COLUMNS[-1] == "max_memory_mb"
 
 
 def test_append_dedups_and_main_retains_release_only(tmp_path):
