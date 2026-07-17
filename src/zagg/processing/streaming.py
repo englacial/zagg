@@ -43,11 +43,28 @@ from zagg.stats.tdigest import _DEFAULT_DELTA, build_tdigest, merge_tdigests
 _TDIGEST_FUNCTION = "zagg.stats.tdigest.build_tdigest"
 
 
+def _ranges_to_indices(starts: np.ndarray, lengths: np.ndarray) -> np.ndarray:
+    """Element indices for concatenated ``[start, start+length)`` ranges.
+
+    Vectorized (no per-range Python loop): for the arena rebuild it turns the
+    kept cells' old/new offset ranges into flat gather/scatter indices.
+    """
+    total = int(lengths.sum())
+    if total == 0:
+        return np.empty(0, dtype=np.int64)
+    shifts = np.concatenate(([0], np.cumsum(lengths)[:-1]))
+    return np.arange(total, dtype=np.int64) + np.repeat(starts - shifts, lengths)
+
+
 def get_streaming(config: PipelineConfig) -> dict | None:
     """Return the ``aggregation.streaming`` block, or ``None`` (pooled path).
 
-    The block is ``{"buffer_granules": int}``; ``buffer_granules`` must be a
-    positive int. Absent block -> ``None`` so existing configs are untouched.
+    The block is ``{"buffer_granules": int, "state_layout": "dict"|"arena"}``;
+    ``buffer_granules`` must be a positive int. ``state_layout`` (issue #217)
+    picks the running-state container: ``"dict"`` (default, per-cell ndarrays)
+    or ``"arena"`` (contiguous CSR buffers — same merge sequence, same bytes
+    out, ~24 B/cell overhead instead of ~290). Absent block -> ``None`` so
+    existing configs are untouched.
     """
     block = config.aggregation.get("streaming")
     if block is None:
@@ -60,7 +77,12 @@ def get_streaming(config: PipelineConfig) -> dict | None:
             f"aggregation.streaming.buffer_granules must be a positive int "
             f"(got {buffer_granules!r})"
         )
-    return {"buffer_granules": buffer_granules}
+    state_layout = block.get("state_layout", "dict")
+    if state_layout not in ("dict", "arena"):
+        raise ValueError(
+            f"aggregation.streaming.state_layout must be 'dict' or 'arena' (got {state_layout!r})"
+        )
+    return {"buffer_granules": buffer_granules, "state_layout": state_layout}
 
 
 def validate_streaming(config: PipelineConfig) -> None:
@@ -129,11 +151,19 @@ class StreamingAggregator:
     returns, so the worker's carrier/ragged construction is shared verbatim.
     """
 
-    def __init__(self, config: PipelineConfig, grid, handoff: str, buffer_granules: int):
+    def __init__(
+        self,
+        config: PipelineConfig,
+        grid,
+        handoff: str,
+        buffer_granules: int,
+        state_layout: str = "dict",
+    ):
         validate_streaming(config)
         self.grid = grid
         self.handoff = handoff
         self.buffer_granules = buffer_granules
+        self.state_layout = state_layout
         agg_fields = get_agg_fields(config)
         self._count_fields: list[str] = []
         self._digest_fields: dict[str, tuple[str, int]] = {}  # name -> (source, delta)
@@ -149,6 +179,20 @@ class StreamingAggregator:
                 self._count_fields.append(name)
         self.counts: dict[int, int] = {}
         self.digests: dict[str, dict[int, np.ndarray]] = {n: {} for n in self._digest_fields}
+        # Arena layout (issue #217): the same running state held as contiguous
+        # CSR buffers — sorted cell ids + parallel counts, and per digest field
+        # one packed centroid buffer addressed by offsets. Identical merge
+        # sequence to the dict layout (same build/merge calls in the same
+        # order), so the emitted bytes match; only the container differs
+        # (~24 B/cell instead of ~290 B of dict-slot + ndarray-header overhead).
+        self._cells = np.empty(0, dtype=np.uint64)
+        self._cell_counts = np.empty(0, dtype=np.int64)
+        self._offsets: dict[str, np.ndarray] = {
+            n: np.zeros(1, dtype=np.int64) for n in self._digest_fields
+        }
+        self._arenas: dict[str, np.ndarray] = {
+            n: np.empty((0, 2), dtype=np.float32) for n in self._digest_fields
+        }
         self.n_obs_total = 0
         self.flushes = 0
         self._buffer: list = []
@@ -173,21 +217,84 @@ class StreamingAggregator:
 
         col_arrays, cell_to_slice, n_obs = _concat_and_group(self._buffer, self.grid, self.handoff)
         self.n_obs_total += n_obs
-        for cell, (start, end) in cell_to_slice.items():
-            self.counts[cell] = self.counts.get(cell, 0) + (end - start)
-            for name, (source, delta) in self._digest_fields.items():
-                fresh = build_tdigest(col_arrays[source][start:end], delta=delta)
-                held = self.digests[name].get(cell)
-                self.digests[name][cell] = (
-                    fresh if held is None else merge_tdigests(held, fresh, delta=delta)
-                )
+        if self.state_layout == "arena":
+            self._fold_arena(col_arrays, cell_to_slice)
+        else:
+            for cell, (start, end) in cell_to_slice.items():
+                self.counts[cell] = self.counts.get(cell, 0) + (end - start)
+                for name, (source, delta) in self._digest_fields.items():
+                    fresh = build_tdigest(col_arrays[source][start:end], delta=delta)
+                    held = self.digests[name].get(cell)
+                    self.digests[name][cell] = (
+                        fresh if held is None else merge_tdigests(held, fresh, delta=delta)
+                    )
         self.flushes += 1
         self._buffer = []
         self._buffered_granules = 0
 
+    def _fold_arena(self, col_arrays, cell_to_slice) -> None:
+        """Rebuild the CSR state with this flush's cells folded in.
+
+        Sizes are exact before allocation: fresh digests (and, for cells
+        already held, their merges) are built first, so the new arena is
+        allocated once at its final size and filled — untouched cells by a
+        vectorized element gather, touched cells by per-cell slice writes.
+        Transients are one buffer's digests plus the old arena, freed on
+        return; the steady state is pure ndarrays with no per-cell objects.
+        """
+        fresh_cells = np.fromiter(cell_to_slice, dtype=np.uint64, count=len(cell_to_slice))
+        order = np.argsort(fresh_cells)
+        fresh_cells = fresh_cells[order]
+        slices = list(cell_to_slice.values())
+        starts = np.array([slices[i][0] for i in order], dtype=np.int64)
+        ends = np.array([slices[i][1] for i in order], dtype=np.int64)
+
+        union = np.union1d(self._cells, fresh_cells)
+        pos_old = np.searchsorted(union, self._cells)
+        pos_fresh = np.searchsorted(union, fresh_cells)
+        overlap = np.isin(fresh_cells, self._cells, assume_unique=True)
+
+        new_counts = np.zeros(len(union), dtype=np.int64)
+        new_counts[pos_old] = self._cell_counts
+        np.add.at(new_counts, pos_fresh, ends - starts)
+
+        for name, (source, delta) in self._digest_fields.items():
+            offsets, arena = self._offsets[name], self._arenas[name]
+            k_old = np.diff(offsets)
+            # Fresh (and merged, for held cells) digests first — the same
+            # build/merge calls the dict layout makes — so every cell's final
+            # length is known before the single allocation below.
+            held_pos = np.searchsorted(self._cells, fresh_cells[overlap])
+            digests = []
+            for j in range(len(fresh_cells)):
+                d = build_tdigest(col_arrays[source][starts[j] : ends[j]], delta=delta)
+                digests.append(d)
+            for j, i_old in zip(np.nonzero(overlap)[0], held_pos, strict=True):
+                held = arena[offsets[i_old] : offsets[i_old + 1]]
+                digests[j] = merge_tdigests(held, digests[j], delta=delta)
+
+            k_new = np.zeros(len(union), dtype=np.int64)
+            k_new[pos_old] = k_old
+            k_new[pos_fresh] = [len(d) for d in digests]
+            new_offsets = np.concatenate(([0], np.cumsum(k_new)))
+            new_arena = np.empty((int(new_offsets[-1]), 2), dtype=np.float32)
+
+            keep = ~np.isin(self._cells, fresh_cells, assume_unique=True)
+            src = _ranges_to_indices(offsets[:-1][keep], k_old[keep])
+            dst = _ranges_to_indices(new_offsets[:-1][pos_old[keep]], k_old[keep])
+            new_arena[dst] = arena[src]
+            for j, i_union in enumerate(pos_fresh):
+                d = digests[j]
+                new_arena[new_offsets[i_union] : new_offsets[i_union] + len(d)] = d
+            self._offsets[name], self._arenas[name] = new_offsets, new_arena
+
+        self._cells, self._cell_counts = union, new_counts
+
     @property
     def empty(self) -> bool:
         """True when no observation ever survived filtering (mirror of no reads)."""
+        if self.state_layout == "arena":
+            return self._cells.size == 0 and not self._buffer
         return not self.counts and not self._buffer
 
     def chunk_outputs(self, children, agg_fields: dict):
@@ -210,6 +317,10 @@ class StreamingAggregator:
         ragged_payloads: dict[str, list] = {n: [] for n in self._digest_fields}
         ragged_cell_indices: dict[str, list[int]] = {n: [] for n in self._digest_fields}
 
+        if self.state_layout == "arena":
+            return self._chunk_outputs_arena(
+                children, stats_arrays, ragged_payloads, ragged_cell_indices
+            )
         cells_with_data = 0
         for i, child in enumerate(children):
             cell = int(child)
@@ -229,3 +340,26 @@ class StreamingAggregator:
                     ragged_payloads[name].append(digest)
                     ragged_cell_indices[name].append(i)
         return stats_arrays, ragged_payloads, ragged_cell_indices, cells_with_data
+
+    def _chunk_outputs_arena(self, children, stats_arrays, ragged_payloads, ragged_cell_indices):
+        """Arena-layout ``chunk_outputs``: vectorized lookup instead of dict gets.
+
+        Same emitted values as the dict branch — occupied cells carry their
+        count, empty cells 0 (the pooled ``len`` over an empty slice), digests
+        only where nonempty — via one ``searchsorted`` over the sorted cell ids.
+        """
+        cells = children.astype(np.uint64)
+        pos = np.searchsorted(self._cells, cells)
+        pos_c = np.minimum(pos, max(self._cells.size - 1, 0))
+        occupied = (self._cells[pos_c] == cells) if self._cells.size else np.zeros(len(cells), bool)
+        counts = np.where(occupied, self._cell_counts[pos_c], 0)
+        for name in self._count_fields:
+            stats_arrays[name][:] = counts.astype(stats_arrays[name].dtype)
+        for name in self._digest_fields:
+            offsets, arena = self._offsets[name], self._arenas[name]
+            for i in np.nonzero(occupied)[0]:
+                lo, hi = offsets[pos[i]], offsets[pos[i] + 1]
+                if hi > lo:
+                    ragged_payloads[name].append(arena[lo:hi])
+                    ragged_cell_indices[name].append(int(i))
+        return stats_arrays, ragged_payloads, ragged_cell_indices, int(occupied.sum())

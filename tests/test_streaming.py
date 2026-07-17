@@ -66,10 +66,27 @@ class TestStreamingConfig:
         assert get_streaming(_config()) is None
 
     def test_block_defaults_buffer(self):
-        assert get_streaming(_config(streaming={})) == {"buffer_granules": 50}
+        assert get_streaming(_config(streaming={})) == {
+            "buffer_granules": 50,
+            "state_layout": "dict",
+        }
 
     def test_explicit_buffer(self):
-        assert get_streaming(_config(streaming={"buffer_granules": 7})) == {"buffer_granules": 7}
+        assert get_streaming(_config(streaming={"buffer_granules": 7})) == {
+            "buffer_granules": 7,
+            "state_layout": "dict",
+        }
+
+    def test_arena_layout_accepted(self):
+        assert get_streaming(_config(streaming={"state_layout": "arena"})) == {
+            "buffer_granules": 50,
+            "state_layout": "arena",
+        }
+
+    @pytest.mark.parametrize("bad", ["csr", 1, None])
+    def test_bad_state_layout_raises(self, bad):
+        with pytest.raises(ValueError, match="state_layout"):
+            get_streaming(_config(streaming={"state_layout": bad}))
 
     @pytest.mark.parametrize("bad", [0, -1, "50", 2.5])
     def test_bad_buffer_raises(self, bad):
@@ -293,6 +310,124 @@ class TestStreamingWorker:
         monkeypatch.setattr("zagg.processing._make_url_rewriter", lambda driver: lambda u: u)
         with pytest.raises(ValueError, match="not streamable"):
             process_shard(grid, key, ["s3://b/g0.h5"], s3_credentials=_CREDS, config=cfg)
+
+
+def _granule_dfs_cells(grid, shard_key, cell_idx_lists, obs_per_cell=50, seed=0, nan_cells=()):
+    """One DataFrame per granule over caller-chosen child-cell indices.
+
+    Unlike ``_granule_dfs`` (fixed three cells), each granule can hit a
+    different cell subset — exercising the arena rebuild's insert / merge /
+    keep paths. Cells in ``nan_cells`` get all-NaN heights (an empty digest
+    but a nonzero count).
+    """
+    rng = np.random.default_rng(seed)
+    children = grid.children(shard_key)
+    dfs = []
+    for idxs in cell_idx_lists:
+        leaf, h = [], []
+        for ci in idxs:
+            leaf.extend([int(children[ci])] * obs_per_cell)
+            vals = rng.normal(0.0, 10.0, obs_per_cell)
+            h.extend([np.nan] * obs_per_cell if ci in nan_cells else vals)
+        dfs.append(
+            pd.DataFrame(
+                {
+                    "h_ph": np.array(h, dtype=np.float32),
+                    "leaf_id": np.array(leaf, dtype=np.uint64),
+                }
+            )
+        )
+    return dfs
+
+
+class TestArenaLayout:
+    """state_layout: arena (issue #217) — same bytes out, different container."""
+
+    def _ab(self, monkeypatch, dfs_fn, buffer_granules, delta=256):
+        key = _shard_key()
+        results = []
+        for layout in ("dict", "arena"):
+            cfg = _config(
+                streaming={"buffer_granules": buffer_granules, "state_layout": layout},
+                delta=delta,
+            )
+            grid = _grid(cfg)
+            results.append(_run(monkeypatch, cfg, grid, key, dfs_fn(grid, key)))
+        return results
+
+    def _assert_identical(self, a, b):
+        df_a, ragged_a, meta_a = a
+        df_b, ragged_b, meta_b = b
+        pd.testing.assert_frame_equal(df_a, df_b)
+        assert meta_a["total_obs"] == meta_b["total_obs"]
+        assert meta_a["cells_with_data"] == meta_b["cells_with_data"]
+        vals_a, idx_a = ragged_a["h_tdigest"]
+        vals_b, idx_b = ragged_b["h_tdigest"]
+        assert idx_a == idx_b
+        for x, y in zip(vals_a, vals_b, strict=True):
+            np.testing.assert_array_equal(x, y)
+
+    def test_matches_dict_multi_flush_overlapping_cells(self, monkeypatch):
+        # Same merge sequence => byte-identical output; 7 granules at buffer 2
+        # is 4 flushes over the same three cells (merge path every flush).
+        dict_out, arena_out = self._ab(
+            monkeypatch,
+            lambda g, k: _granule_dfs(g, k, n_granules=7, obs_per_cell=200, seed=3),
+            buffer_granules=2,
+        )
+        self._assert_identical(dict_out, arena_out)
+
+    def test_matches_dict_disjoint_and_inserted_cells(self, monkeypatch):
+        # Per-granule flushes where later flushes insert cells between held
+        # ones and partially overlap them: exercises the rebuild's insert,
+        # merge, and vectorized keep-gather paths together.
+        cell_lists = [[0, 4, 8], [2, 4, 10], [1, 8, 9], [0, 10, 15]]
+        dict_out, arena_out = self._ab(
+            monkeypatch,
+            lambda g, k: _granule_dfs_cells(g, k, cell_lists, seed=7),
+            buffer_granules=1,
+        )
+        self._assert_identical(dict_out, arena_out)
+
+    def test_matches_dict_with_all_nan_cell(self, monkeypatch):
+        # An all-NaN cell holds a zero-length digest (k=0) but a real count —
+        # the arena must keep the empty range through rebuilds and omit it
+        # from the ragged payloads exactly like the dict layout.
+        cell_lists = [[0, 3], [0, 3], [3, 5]]
+        dict_out, arena_out = self._ab(
+            monkeypatch,
+            lambda g, k: _granule_dfs_cells(g, k, cell_lists, seed=11, nan_cells={3}),
+            buffer_granules=1,
+        )
+        self._assert_identical(dict_out, arena_out)
+        df, ragged, _ = arena_out
+        # cell 3 counted but digest-less: counts exact, one fewer payload.
+        vals, idx = ragged["h_tdigest"]
+        assert len(vals) == df["count"].astype(bool).sum() - 1
+
+    def test_single_buffer_byte_identical_to_pooled(self, monkeypatch):
+        # One flush == one pooled build — exact, same as the dict layout.
+        key = _shard_key()
+        pooled_cfg = _config()
+        arena_cfg = _config(streaming={"buffer_granules": 10, "state_layout": "arena"})
+        dfs = _granule_dfs(_grid(pooled_cfg), key, n_granules=4)
+        pooled = _run(monkeypatch, pooled_cfg, _grid(pooled_cfg), key, list(dfs))
+        arena = _run(monkeypatch, arena_cfg, _grid(arena_cfg), key, list(dfs))
+        self._assert_identical(pooled, arena)
+
+    def test_empty_property(self):
+        cfg = _config(streaming={"buffer_granules": 2, "state_layout": "arena"})
+        agg = StreamingAggregator(cfg, _grid(cfg), "pandas", 2, state_layout="arena")
+        assert agg.empty
+        agg.add_read(pd.DataFrame({"h_ph": [1.0], "leaf_id": np.array([1], dtype="uint64")}))
+        assert not agg.empty
+
+    def test_ranges_to_indices(self):
+        from zagg.processing.streaming import _ranges_to_indices
+
+        out = _ranges_to_indices(np.array([5, 20, 3]), np.array([2, 0, 3]))
+        np.testing.assert_array_equal(out, [5, 6, 3, 4, 5])
+        assert _ranges_to_indices(np.array([], dtype=int), np.array([], dtype=int)).size == 0
 
 
 class TestStreamingReviewFolds:
