@@ -306,7 +306,10 @@ class TestWindowingConfig:
         )
         validate_config(cfg)
 
-    def test_raster_rejects_windowing_pointing_at_247(self):
+    def test_raster_windowing_validates_on_hive(self):
+        # Issue #247: raster + hive + windowing is legal; membership is the
+        # acquisition's STAC datetime, so no time_field is required. The full
+        # raster windowing matrix lives in test_raster_pipeline.py.
         c = default_config("atl06")
         c.data_source = {
             "reader": "raster",
@@ -314,9 +317,10 @@ class TestWindowingConfig:
         }
         c.aggregation = {}
         c.output["grid"] = {"type": "healpix", "parent_order": 6, "child_order": 12}
+        c.output["store_layout"] = "hive"
         c.output["windowing"] = {"schedule": "yearly"}
-        with pytest.raises(ValueError, match="issue #247"):
-            validate_config(c)
+        validate_config(c)
+        assert get_windowing(c)["time_field"] == "datetime"
 
 
 # ── manifest temporal block + spec bump (phase 2) ────────────────────────────

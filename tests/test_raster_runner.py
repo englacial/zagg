@@ -743,3 +743,376 @@ class TestShippedTemplate:
         assert cfg.data_source["reader"] == "raster"
         assert cfg.data_source["bands"]["scl"]["dtype"] == "uint8"
         assert cfg.output["grid"]["child_order"] == 19
+
+
+class TestRasterHiveLocalBackend:
+    """Local raster hive runs (issue #247 phase 3): manifest, leaves, coverage."""
+
+    def test_schedule_none_end_to_end(self, tmp_path, manifest):
+        from pathlib import Path
+
+        from zagg import hive
+
+        cfg, sm_path, shard, data = manifest
+        cfg.output["store_layout"] = "hive"
+        summary = agg(cfg, catalog=sm_path, backend="local", max_workers=2)
+        assert summary["cells_with_data"] == 1 and summary["cells_error"] == 0
+
+        store_path = cfg.output["store"]
+        # Root manifest: /1 spec (schedule none), no temporal block.
+        m = hive.read_manifest(store_path)
+        assert m["spec"] == "morton-hive/1" and "temporal" not in m
+        # No store-root zarr objects (D5): only the manifest, the root
+        # coverage.moc, and the digit tree.
+        root_children = sorted(p.name for p in Path(store_path).iterdir())
+        assert "zarr.json" not in root_children
+        assert {"morton_hive.json", "coverage.moc"} <= set(root_children)
+        # One bare leaf carrying the FULL time axis, stamped /1.
+        leaf = hive.shard_leaf_path(store_path, shard)
+        stamp = hive.read_commit(leaf)
+        assert stamp and stamp["complete"] and stamp["spec"] == "morton-hive/1"
+        assert "window" not in stamp and "time_range" not in stamp
+        grid = from_config(cfg, populated_shards=[shard])
+        red = open_array(leaf + f"/{grid.group_path}/red", zarr_format=3, consolidated=False)
+        assert red.shape == (2, grid.cells_per_shard)
+        cells = grid.children(shard)
+        rows, cols, valid = grid.sample(cells, UTM18, TRANSFORM, (96, 96))
+        np.testing.assert_array_equal(red[0, :][valid], data[rows[valid], cols[valid]])
+        assert (red[1, :][valid] == 555).all()
+        # Root coverage.moc (default-on for hive) covers the shard, no
+        # time_range on an unwindowed store.
+        cov = hive.read_root_coverage(store_path)
+        assert cov is not None and "time_range" not in cov
+        np.testing.assert_array_equal(
+            hive.root_coverage_words(cov), np.asarray([shard], dtype=np.uint64)
+        )
+
+    def test_windowed_daily_leaves(self, tmp_path, manifest):
+        from zagg import hive
+
+        cfg, sm_path, shard, data = manifest
+        cfg.output["store_layout"] = "hive"
+        cfg.output["windowing"] = {"schedule": "daily"}
+        summary = agg(cfg, catalog=sm_path, backend="local", max_workers=2)
+        # Two datatakes on different days -> two (shard, window) units.
+        assert summary["total_cells"] == 2
+        assert summary["cells_with_data"] == 2 and summary["cells_error"] == 0
+
+        store_path = cfg.output["store"]
+        m = hive.read_manifest(store_path)
+        assert m["spec"] == "morton-hive/2"
+        assert m["temporal"]["schedule"] == "daily"
+        assert m["temporal"]["time_field"] == "datetime"  # the resolved field
+        grid = from_config(cfg, populated_shards=[shard])
+        for label, instant, value_check in (
+            ("20260713", T0, None),
+            ("20260718", T1, 555),
+        ):
+            leaf = hive.shard_leaf_path(store_path, shard, window=label)
+            stamp = hive.read_commit(leaf)
+            assert stamp and stamp["spec"] == "morton-hive/2"
+            assert stamp["window"] == label
+            assert stamp["time_range"] == [instant, instant]
+            red = open_array(leaf + f"/{grid.group_path}/red", zarr_format=3, consolidated=False)
+            assert red.shape == (1, grid.cells_per_shard)
+            if value_check is not None:
+                cells = grid.children(shard)
+                _r, _c, valid = grid.sample(cells, UTM18, TRANSFORM, (96, 96))
+                assert (red[0, :][valid] == value_check).all()
+        # Root summary unions the two windowed stamps' time ranges (D15).
+        cov = hive.read_root_coverage(store_path)
+        assert cov["time_range"] == [T0, T1]
+
+
+class TestRasterHiveLambdaBackend:
+    """Lambda raster hive dispatch (issue #247 phase 4): lifecycle + events."""
+
+    def test_lifecycle_and_event_shapes(self, manifest, monkeypatch):
+        # The hive manifest rides the issue #252 hybrid lifecycle: ping (read-
+        # only precheck) -> async setup (manifest write) -> per-unit process
+        # invokes (no time_index; window on windowed units) -> finalize
+        # backstop -> fire-and-forget coverage. Scripted responder, no writes.
+        import boto3
+
+        cfg, sm_path, shard, _data = manifest
+        cfg.output["store_layout"] = "hive"
+        cfg.output["windowing"] = {"schedule": "daily"}
+
+        def responder(event):
+            mode = event["mode"]
+            if mode == "ping":
+                body = {"ok": True, "mode": "ping", "zagg_version": "test"}
+                return {"statusCode": 200, "body": json.dumps(body)}
+            if mode in ("setup", "coverage"):
+                return {"statusCode": 200, "body": "{}"}  # Event invokes: unread
+            if mode == "finalize":
+                body = {"ok": True, "mode": "finalize", "layout": "hive"}
+                return {"statusCode": 200, "body": json.dumps(body)}
+            assert mode == "process_raster"
+            label = event["window"]["label"]
+            body = {
+                "shard_key": event["shard_key"],
+                "timesteps": 1,
+                "cells_with_data": 7,
+                "time_range": {
+                    "20260713": [T0, T0],
+                    "20260718": [T1, T1],
+                }[label],
+            }
+            return {"statusCode": 200, "body": json.dumps(body)}
+
+        fake = _FakeLambdaClient(responder)
+        monkeypatch.setattr(boto3, "client", lambda *a, **k: fake)
+        summary = agg(
+            cfg, catalog=sm_path, store="s3://bucket/out.zarr", backend="lambda", max_workers=2
+        )
+        assert summary["total_cells"] == 2  # two (shard, window) units
+        assert summary["cells_with_data"] == 2
+
+        modes = [e["mode"] for e in fake.events]
+        assert modes[:2] == ["ping", "setup"]
+        assert modes[-2:] == ["finalize", "coverage"]
+        assert modes[2:-2] == ["process_raster", "process_raster"]
+        # Lifecycle events carry the manifest inputs (config + parent_order +
+        # dataset identity), mirroring the aggregation hive path.
+        for ev in fake.events[:2] + [fake.events[-2]]:
+            assert ev["config"]["output"]["store_layout"] == "hive"
+            assert ev["parent_order"] == 10
+            assert "dataset" in ev
+        # Hive process events: no time_index (leaf-local axis), window payload
+        # with the daily labels, one unit per (shard, window).
+        procs = fake.events[2:-2]
+        assert all("time_index" not in ev for ev in procs)
+        assert sorted(ev["window"]["label"] for ev in procs) == ["20260713", "20260718"]
+        assert all(ev["shard_key"] == shard for ev in procs)
+        # Root coverage rides serialized in the event, with the D15 time union.
+        cov = fake.events[-1]["coverage"]
+        assert cov["encoding"] == "ranges"
+        assert cov["time_range"] == [T0, T1]
+
+    def test_all_failed_finalizes_before_raise(self, manifest, monkeypatch):
+        # All-shards-failed still runs the finalize backstop BEFORE the
+        # all-failed raise, mirroring the local backend: on Lambda the
+        # pre-dispatch setup write is a droppable retries-0 async invoke, so
+        # finalize is the only reliable manifest write and must run even when
+        # every shard errored. Nothing succeeded, so no coverage invoke fires.
+        import boto3
+
+        cfg, sm_path, _shard, _data = manifest
+        cfg.output["store_layout"] = "hive"
+        cfg.output["windowing"] = {"schedule": "daily"}
+
+        def responder(event):
+            mode = event["mode"]
+            if mode == "process_raster":
+                return {"statusCode": 500, "body": json.dumps({"error": "boom"})}
+            return {"statusCode": 200, "body": "{}"}
+
+        fake = _FakeLambdaClient(responder)
+        monkeypatch.setattr(boto3, "client", lambda *a, **k: fake)
+        with pytest.raises(RuntimeError, match="boom"):
+            agg(cfg, catalog=sm_path, store="s3://bucket/out.zarr", backend="lambda", max_workers=2)
+
+        modes = [e["mode"] for e in fake.events]
+        # Every shard 500s (two daily windows), so the run raises — but the
+        # finalize backstop lands after the process events and before the raise.
+        assert "finalize" in modes
+        assert "coverage" not in modes  # nothing succeeded -> done empty
+        proc_idx = [i for i, m in enumerate(modes) if m == "process_raster"]
+        assert proc_idx and modes.index("finalize") > max(proc_idx)
+
+    def test_flat_process_events_unchanged(self, manifest, monkeypatch):
+        # Flat PROCESS events are byte-identical to pre-#247 runs — exactly
+        # the pre-hive key set, no window/hive keys — inside the issue #264
+        # lifecycle (ping -> sync raster setup -> fan-out), and no hive
+        # lifecycle invokes (no finalize/coverage) ride a flat run.
+        import boto3
+
+        cfg, sm_path, _shard, _data = manifest
+
+        def responder(event):
+            body = {"timesteps": len(event["time_index"]), "cells_with_data": 4096}
+            return {"statusCode": 200, "body": json.dumps(body)}
+
+        fake = _FakeLambdaClient(_lifecycle(responder))
+        monkeypatch.setattr(boto3, "client", lambda *a, **k: fake)
+        agg(cfg, catalog=sm_path, store="s3://bucket/out.zarr", backend="lambda")
+        assert [e["mode"] for e in fake.events] == ["ping", "setup", "process_raster"]
+        assert set(fake.events[-1]) == {
+            "mode",
+            "shard_key",
+            "granules",
+            "config",
+            "store_path",
+            "time_index",
+        }
+
+    def test_parity_with_local_backend(self, manifest, monkeypatch, tmp_path):
+        # Both dispatchers, same inputs -> identical leaf sets and stamps
+        # (bar the write clocks): the lambda run drives the REAL handler
+        # (deployment/aws/lambda_handler.py) with s3:// paths remapped onto
+        # tmp_path, the local run writes directly; then compare.
+        import importlib.util
+        from pathlib import Path
+        from unittest.mock import MagicMock
+
+        import boto3
+
+        import zagg.hive as hive
+        import zagg.store as store_mod
+
+        spec = importlib.util.spec_from_file_location(
+            "zagg_lambda_handler_parity",
+            Path(__file__).parent.parent / "deployment" / "aws" / "lambda_handler.py",
+        )
+        handler_mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(handler_mod)
+
+        cfg, sm_path, shard, _data = manifest
+        cfg.output["store_layout"] = "hive"
+        cfg.output["windowing"] = {"schedule": "daily"}
+
+        s3root = tmp_path / "s3root"
+
+        def _translate(path):
+            return str(s3root / path.removeprefix("s3://")) if path.startswith("s3://") else path
+
+        real_open_store = store_mod.open_store
+        real_open_object = hive.open_object_store
+        monkeypatch.setattr(
+            store_mod, "open_store", lambda path, **kw: real_open_store(_translate(path))
+        )
+        monkeypatch.setattr(
+            hive, "open_object_store", lambda path, **kw: real_open_object(_translate(path))
+        )
+        # The handler binds open_store at its own import; patch that binding too.
+        monkeypatch.setattr(
+            handler_mod, "open_store", lambda path, **kw: real_open_store(_translate(path))
+        )
+
+        def responder(event):
+            return handler_mod.lambda_handler(event, MagicMock())
+
+        fake = _FakeLambdaClient(responder)
+        monkeypatch.setattr(boto3, "client", lambda *a, **k: fake)
+        lam = agg(
+            cfg, catalog=sm_path, store="s3://bucket/out.zarr", backend="lambda", max_workers=2
+        )
+        assert lam["cells_with_data"] == 2 and lam["cells_error"] == 0
+        lam_root = str(s3root / "bucket/out.zarr")
+
+        loc_root = str(tmp_path / "local_out.zarr")
+        loc = agg(cfg, catalog=sm_path, store=loc_root, backend="local", max_workers=2)
+        assert loc["cells_with_data"] == 2
+
+        def _leaves(root):
+            return sorted(
+                str(p.relative_to(root)) for p in Path(root).rglob("*.zarr") if p.is_dir()
+            )
+
+        assert _leaves(lam_root) == _leaves(loc_root) != []
+        for rel in _leaves(loc_root):
+            a = hive.read_commit(f"{lam_root}/{rel}")
+            b = hive.read_commit(f"{loc_root}/{rel}")
+            assert a is not None and b is not None
+            a.pop("written_at"), b.pop("written_at")
+            assert a == b
+        # Manifests agree on the frozen keys (generated_at differs).
+        ma, mb = hive.read_manifest(lam_root), hive.read_manifest(loc_root)
+        for key in ("spec", "dataset", "cell_order", "shard_order", "temporal"):
+            assert ma.get(key) == mb.get(key)
+
+
+class TestRasterHiveIdempotency:
+    """Window re-run + backfill (D13) and the flat-raster default pin
+    (issue #247 phase 5)."""
+
+    def _snapshot(self, root):
+        from pathlib import Path
+
+        out = {}
+        for p in Path(root).rglob("*"):
+            if p.is_file():
+                out[str(p.relative_to(root))] = p.read_bytes()
+        return out
+
+    def _one_granule_map(self, tmp_path, cfg, shard, href, dt, key, name):
+        grid = from_config(cfg, populated_shards=[shard])
+        sm = ShardMap(
+            grid.spatial_signature(),
+            [shard],
+            [[_entry("g", href, dt, key)]],
+            {"collection": "s2-test"},
+        )
+        path = str(tmp_path / name)
+        sm.to_json(path)
+        return path
+
+    def test_window_rerun_and_backfill(self, tmp_path, manifest):
+        from pathlib import Path
+
+        from zagg import hive
+
+        cfg, sm_path, shard, _data = manifest
+        cfg.output["store_layout"] = "hive"
+        cfg.output["windowing"] = {"schedule": "daily"}
+        store_path = cfg.output["store"]
+        t1_map = self._one_granule_map(
+            tmp_path, cfg, shard, str(tmp_path / "t1.tif"), T1, "dt-2", "t1only.json"
+        )
+        t0_map = self._one_granule_map(
+            tmp_path, cfg, shard, str(tmp_path / "t0.tif"), T0, "dt-1", "t0only.json"
+        )
+
+        # Full run: both daily windows land.
+        agg(cfg, catalog=sm_path, backend="local", max_workers=2)
+        leaf_a = hive.shard_leaf_path(store_path, shard, window="20260713")
+        leaf_b = hive.shard_leaf_path(store_path, shard, window="20260718")
+        before_a = self._snapshot(leaf_a)
+        manifest_bytes = Path(store_path, "morton_hive.json").read_bytes()
+
+        # Re-dispatch window B only: leaf B is replaced wholesale, sibling
+        # window A stays byte-untouched, the manifest is not rewritten.
+        stamp_b_before = hive.read_commit(leaf_b)
+        agg(cfg, catalog=t1_map, backend="local", max_workers=2)
+        assert self._snapshot(leaf_a) == before_a
+        stamp_b_after = hive.read_commit(leaf_b)
+        assert stamp_b_after["complete"] and stamp_b_after["window"] == "20260718"
+        assert stamp_b_after["time_range"] == stamp_b_before["time_range"]
+        assert Path(store_path, "morton_hive.json").read_bytes() == manifest_bytes
+
+        # Backfill into a FRESH store: start with the later window, then add
+        # the earlier one — a new leaf appears, the committed later leaf and
+        # the manifest stay byte-untouched (D13: no resize, no manifest touch).
+        cfg.output["store"] = str(tmp_path / "backfill.zarr")
+        store2 = cfg.output["store"]
+        agg(cfg, catalog=t1_map, backend="local", max_workers=2)
+        leaf_b2 = hive.shard_leaf_path(store2, shard, window="20260718")
+        before_b2 = self._snapshot(leaf_b2)
+        manifest2 = Path(store2, "morton_hive.json").read_bytes()
+
+        agg(cfg, catalog=t0_map, backend="local", max_workers=2)
+        leaf_a2 = hive.shard_leaf_path(store2, shard, window="20260713")
+        assert hive.read_commit(leaf_a2)["window"] == "20260713"  # new earlier leaf
+        assert self._snapshot(leaf_b2) == before_b2  # committed leaf untouched
+        assert Path(store2, "morton_hive.json").read_bytes() == manifest2
+        # The root summary now spans both windows (cache union, D15).
+        cov = hive.read_root_coverage(store2)
+        assert cov["time_range"] == [T0, T1]
+
+    def test_flat_default_pin_no_hive_objects(self, tmp_path, manifest):
+        # store_layout unset -> the flat (time, cells) store, with no hive
+        # artifacts anywhere in the tree: the default output is object-for-
+        # object what pre-#247 runs wrote (the flat write path is untouched;
+        # this pins the absence of new objects).
+        from pathlib import Path
+
+        cfg, sm_path, _shard, _data = manifest
+        summary = agg(cfg, catalog=sm_path, backend="local", max_workers=2)
+        assert summary["cells_with_data"] == 1
+        store = Path(cfg.output["store"])
+        grid = from_config(cfg)
+        assert sorted(p.name for p in store.iterdir()) == sorted(["zarr.json", grid.group_path])
+        names = {p.name for p in store.rglob("*")}
+        assert "morton_hive.json" not in names
+        assert "coverage.moc" not in names
