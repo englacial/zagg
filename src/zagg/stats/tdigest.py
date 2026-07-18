@@ -449,7 +449,14 @@ def merge_tdigests_kway(
         return (out, locs[0].copy()) if located else out
 
     combined = np.concatenate(arrs, axis=0)
-    order = np.argsort(combined[:, 0], kind="stable")
+    # lexsort on (mean, weight) — primary key means, secondary weights — so the
+    # centroid order is intrinsic to (mean, weight) and independent of the input
+    # digest order. A stable argsort on mean alone breaks ties by concatenation
+    # position (i.e. input order), which makes the k-way fold permutation-
+    # dependent when means tie across digests (discrete/quantized sources).
+    # Sub-centroids with identical (mean, weight) are interchangeable, so their
+    # residual order does not affect the result (issue #279).
+    order = np.lexsort((combined[:, 1], combined[:, 0]))
     combined = combined[order]
     out_means, out_weights, starts = _compress(combined[:, 0], combined[:, 1], float(delta))
     out = np.empty((len(out_means), 2), dtype=np.float32)

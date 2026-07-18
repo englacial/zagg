@@ -578,6 +578,25 @@ class TestMergeTDigestsKway:
         for perm in ([2, 0, 4, 1, 5, 3], [5, 4, 3, 2, 1, 0], [1, 3, 5, 0, 2, 4]):
             assert np.array_equal(ref, merge_tdigests_kway([ds[i] for i in perm], delta=256))
 
+    def test_order_independent_with_tied_means(self):
+        """Discrete/quantized sources tie means across digests; the k-way fold
+        must still be permutation-invariant (lexsort tie-break, issue #279).
+
+        A stable argsort on mean alone would break these ties by concatenation
+        order, so a permuted digest list could emit different bytes.
+        """
+        rng = np.random.default_rng(279)
+        # Integers in a tiny range → every digest shares the same handful of
+        # distinct means, so cross-digest ties are guaranteed.
+        ds = [
+            build_tdigest(rng.integers(0, 5, size=4000).astype(np.float64), delta=256)
+            for _ in range(6)
+        ]
+        ref = merge_tdigests_kway(ds, delta=256)
+        assert np.array_equal(ref, merge_tdigests_kway(list(reversed(ds)), delta=256))
+        for perm in ([2, 0, 4, 1, 5, 3], [5, 4, 3, 2, 1, 0], [1, 3, 5, 0, 2, 4]):
+            assert np.array_equal(ref, merge_tdigests_kway([ds[i] for i in perm], delta=256))
+
     def test_pairwise_fold_is_order_dependent(self):
         """Contrast: the pairwise left-fold is NOT associative (issue #279)."""
         ds = self._digests(2, 6)
