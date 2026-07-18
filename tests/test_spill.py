@@ -599,6 +599,47 @@ class TestSpillWorkerSingleBlock:
             pd.testing.assert_frame_equal(car_p, car_s)
             _assert_ragged_identical(rag_p, rag_s)
 
+    def test_consumed_group_re_request_trips(self):
+        # The single-block exact reduce reads each partition group back exactly
+        # once (read_partition close=True deletes it), relying on iter_chunks
+        # visiting a group's chunks contiguously. If a consumed group were ever
+        # re-requested, _load_partition must raise — not fall into the
+        # empty-columns branch and ship silent zeros for a populated group.
+        cfg = _config(streaming={"buffer_granules": 2, "mode": "spill"})
+        grid = _grid(cfg, parent=2, child=5, chunk_inner=3)
+        assert grid.chunks_per_shard == 4
+        agg = SpillAggregator(cfg, grid, "pandas", 2)
+        children = np.asarray(grid.children(_shard_key(order=2)), dtype=np.uint64)
+        parts = partition_ids(grid, children)
+        groups = np.unique(parts)
+        assert len(groups) >= 3
+
+        def _append(cell):
+            cell = np.asarray([int(cell)], dtype=np.uint64)
+            agg._block.append(
+                partition_ids(grid, cell),
+                cell,
+                {"h_ph": np.zeros(1, np.float32), "leaf_id": cell.copy()},
+            )
+
+        key_a, key_b = int(groups[0]), int(groups[1])
+        _append(children[parts == groups[0]][0])
+        _append(children[parts == groups[1]][0])
+
+        agg._load_partition(key_a)  # consume group A
+        assert key_a in agg._consumed
+        agg._load_partition(key_b)  # single-slot cache evicts A, consumes B
+        with pytest.raises(RuntimeError, match="re-requested after it was read-and-closed"):
+            agg._load_partition(key_a)  # revisiting A trips the invariant
+
+        # A genuinely-unpopulated group (never read, never consumed) is still a
+        # legitimate empty load, indistinguishable code paths kept apart.
+        untouched = int(groups[2])
+        assert untouched not in agg._consumed
+        agg._load_partition(untouched)
+        assert agg._loaded[0] == untouched
+        assert agg._loaded[2] == {}
+
     def test_occupied_out_matches_pooled(self, monkeypatch):
         key = _shard_key()
         occ = {}

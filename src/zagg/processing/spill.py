@@ -470,8 +470,12 @@ class SpillAggregator:
         # Single-block reduce cache: (part_key, col_arrays, cell_to_slice) for
         # the most recently loaded partition. Chunks sharing a partition group
         # reuse it, and iter_chunks visits each group as one contiguous run,
-        # so every group is read back exactly once.
+        # so every group is read back exactly once. ``_consumed`` tripwires that
+        # invariant: a group re-requested after its read-and-close raises rather
+        # than silently emitting the empty-columns else-branch (see
+        # _load_partition).
         self._loaded: tuple | None = None
+        self._consumed: set[int] = set()
         self.n_obs_total = 0
         self.flushes = 0
         self.spill_bytes = 0
@@ -659,6 +663,18 @@ class SpillAggregator:
             cells, cols = self._block.read_partition(key, close=True)
             self.spill_read_s += time.perf_counter() - t0
             col_arrays, cell_to_slice = _group_columns(cols, cells)
+            self._consumed.add(key)  # read-and-closed: this group is now gone
+        elif key in self._consumed:
+            # The group was read once (close=True deleted its partition) and is
+            # being requested again: iter_chunks did NOT visit its chunks
+            # contiguously. The empty-columns branch below would silently emit
+            # zeros for a genuinely-populated group, so abort the shard loudly.
+            raise RuntimeError(
+                f"spill group {key} re-requested after it was read-and-closed; "
+                f"the single-block exact reduce relies on iter_chunks visiting "
+                f"each partition group's chunks contiguously (every group read "
+                f"back exactly once)"
+            )
         else:
             # Empty chunk: length-0 columns per the block schema — the same
             # shape the pooled path's _pool_chunk_columns hands an empty chunk.
