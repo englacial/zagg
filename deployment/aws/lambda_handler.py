@@ -684,6 +684,14 @@ def _handle_setup(event: Dict[str, Any]) -> Dict[str, Any]:
             store = open_store(event["store_path"], **_output_store_kwargs(event))
             grid = from_config(config)
             times_us = np.asarray(event["times_us"], dtype=np.int64)
+            if times_us.size == 0:
+                # A zero-timestep template is degenerate: the arrays get a
+                # 0-length time axis no worker can slab-write into.
+                # RasterStrategy.run refuses an empty catalog before it would
+                # dispatch (runner.py); guard the load-bearing invoke-only
+                # writer too, so a hand-rolled or drifted event can't write an
+                # unusable success-shaped store (issue #264).
+                raise ValueError("raster setup received empty times_us (no timesteps to template)")
             emit_raster_template(
                 store, grid, config, times_us, overwrite=event.get("overwrite", False)
             )
