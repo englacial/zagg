@@ -9,6 +9,8 @@
 <p>The whole AOP_NEON box, every shard, once per release tag — the point (tdigest, hive, AOI mask) and raster (Sentinel-2 2025) legs.</p>
 <h3>Summary — total billed cost (lambda-s ⇔ USD) and wall</h3>
 <img src="full_aoi_summary.png" alt="full_aoi_summary">
+<h3>Point pipeline — latest release (with time-to-first-consumer)</h3>
+<img src="full_aoi_point_table.png" alt="full_aoi_point_table">
 <h3>Point pipeline — per-phase seconds (max shard)</h3>
 <img src="full_aoi_point_phases.png" alt="full_aoi_point_phases">
 <h3>Store objects (issue #240 tripwire)</h3>
@@ -16,9 +18,6 @@
 <hr>
 <h2>Per commit to main (single densest shard)</h2>
 <p>One configuration — o9, hive, sharded, tdigest, no AOI mask — isolating code deltas from data drift (merge sha on the x-axis).</p>
-<h3>Latest merge</h3>
-<img src="merge_table.png" alt="latest merge benchmark table">
-<p>Machine-readable: <a href="latest.md">latest.md</a> · <a href="metrics.json">metrics.json</a></p>
 <h3>Summary — total billed cost (lambda-s ⇔ USD) and wall</h3>
 <img src="merge_summary.png" alt="merge_summary">
 <h3>Diagnostics — per-phase seconds</h3>
