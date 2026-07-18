@@ -701,11 +701,14 @@ class TestInvokeLambdaRasterSetupEvent:
     def test_non_200_raises(self, tmp_path):
         from test_hive import _wire_client
 
-        with pytest.raises(RuntimeError, match="Lambda raster setup error"):
+        with pytest.raises(RuntimeError, match="Lambda raster setup error") as excinfo:
             self._invoke(
                 _wire_client({"error": "boom", "mode": "setup"}, status_code=500),
                 {"data_source": {}},
             )
+        # A raising pre-#264 flat branch also 500s; the message must carry the
+        # redeploy hint since a 500 can't be told apart from a genuine failure.
+        assert "redeploy" in str(excinfo.value)
 
     def test_missing_pipeline_echo_raises_redeploy(self, tmp_path):
         # A stale function's flat branch answers 200 with the layout echo but
