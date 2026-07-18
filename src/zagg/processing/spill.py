@@ -478,8 +478,16 @@ class SpillAggregator:
         self._digests: dict[str, dict[int, np.ndarray]] = {n: {} for n in self._digest_fields}
         # k-way fold accumulator: for order-independent fields, each block's
         # per-cell digest is stashed here and collapsed once at finalize
-        # (merge_tdigests_kway), rather than pairwise-folded per block. Each part
-        # is a saturated per-block digest and blocks are few, so this stays small.
+        # (merge_tdigests_kway), rather than pairwise-folded per block. Holding
+        # all parts to finalize is by design: order-independence forbids
+        # incremental collapse (folding subsets then combining is a tree
+        # reduction of a non-associative op, which reintroduces the very
+        # order-dependence k-way exists to remove). Cost is bounded: each part is
+        # a saturated ≤δ-centroid digest (~4 KB at δ=512, δ·8 bytes), so peak is
+        # ~B×C×(δ·8) over B closed blocks and C occupied cells — small relative
+        # to the multi-GB per-partition build peak the block threshold already
+        # reserves. Tighter memory-budget accounting against that reservation is
+        # owned by the #280 parallel-reduce work.
         self._digest_parts: dict[str, dict[int, list[np.ndarray]]] = {
             n: {} for n, (_, _, pairwise) in self._digest_fields.items() if not pairwise
         }
