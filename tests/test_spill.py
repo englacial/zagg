@@ -158,6 +158,40 @@ class TestPartitionRouting:
             seen.append(int(ids[0]))
         assert len(set(seen)) == grid.chunks_per_shard
 
+    def test_partition_groups_capped_at_64_contiguous(self):
+        # Production geometry (chunk_inner: 13) puts 1,024 inner chunks in an
+        # o8 shard; one file per inner chunk would blow Lambda's ~1,024 nofile
+        # default. Routing caps at 4**_GROUP_LEVELS = 64 contiguous groups.
+        from zagg.processing.spill import _GROUP_LEVELS, _group_order
+
+        grid = HealpixGrid(2, 8, layout="fullsphere", chunk_inner=7)
+        assert grid.chunks_per_shard == 1024
+        assert _group_order(grid) == grid.parent_order + _GROUP_LEVELS
+        shard = _shard(grid)
+        children = np.sort(np.asarray(grid.children(shard), dtype=np.uint64))
+        ids = partition_ids(grid, children)
+        assert len(np.unique(ids)) == 4**_GROUP_LEVELS
+        # Contiguous grouping: over morton-sorted cells the group id never
+        # revisits an earlier value, so each group is one contiguous cell span
+        # (and iter_chunks reads each group's file back exactly once).
+        changes = np.flatnonzero(np.diff(ids)) + 1
+        assert len(changes) == 4**_GROUP_LEVELS - 1
+        # Every inner chunk maps into exactly one group.
+        for _, chunk_children in grid.iter_chunks(shard):
+            cids = partition_ids(grid, np.asarray(chunk_children))
+            assert len(np.unique(cids)) == 1
+        # And the writer opens at most 64 files for a full-shard append.
+        block = SpillBlock()
+        block.append(ids, children, {"v": np.zeros(len(children), dtype=np.float32)})
+        assert len(block.partition_keys()) == 4**_GROUP_LEVELS
+        block.close()
+
+    def test_group_order_uncapped_below_64(self):
+        from zagg.processing.spill import _group_order
+
+        grid = HealpixGrid(2, 5, layout="fullsphere", chunk_inner=3)
+        assert _group_order(grid) == grid.chunk_order  # 4 chunks: no grouping
+
     def test_k1_grid_is_single_partition(self):
         grid = HealpixGrid(2, 5, layout="fullsphere")
         ids = partition_ids(grid, np.asarray(grid.children(_shard(grid)), dtype=np.uint64))
@@ -539,6 +573,27 @@ class TestSpillWorkerSingleBlock:
             results.append(sink)
         pooled, spilled = results
         assert len(pooled) == len(spilled) == 4
+        for (blk_p, car_p, rag_p), (blk_s, car_s, rag_s) in zip(pooled, spilled, strict=True):
+            assert blk_p == blk_s
+            pd.testing.assert_frame_equal(car_p, car_s)
+            _assert_ragged_identical(rag_p, rag_s)
+
+    def test_capped_groups_byte_identical_to_pooled(self, monkeypatch):
+        # Group cap binding (chunks_per_shard > 64): one partition file holds
+        # several chunks' rows; each chunk's outputs still gather only its own
+        # cells from the cached group, byte-identical to pooled.
+        key = _shard_key(order=2)
+        results = []
+        for streaming in (None, {"buffer_granules": 2, "mode": "spill"}):
+            cfg = _config(streaming=streaming)
+            grid = _grid(cfg, parent=2, child=6, chunk_inner=6)
+            assert grid.chunks_per_shard == 256  # -> 64 groups of 4 chunks
+            dfs = _granule_dfs(grid, key, [[0, 40, 200], [5, 40, 255], [0, 200, 254]], seed=3)
+            sink: list = []
+            _run(monkeypatch, cfg, grid, key, dfs, chunk_results=sink)
+            results.append(sink)
+        pooled, spilled = results
+        assert len(pooled) == len(spilled) == 256
         for (blk_p, car_p, rag_p), (blk_s, car_s, rag_s) in zip(pooled, spilled, strict=True):
             assert blk_p == blk_s
             pd.testing.assert_frame_equal(car_p, car_s)

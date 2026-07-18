@@ -16,16 +16,19 @@ Key mechanics:
   ``tempfile.mkstemp`` and **unlinked immediately**; the open file object is
   the only reference, so space frees when the partition is closed (or the
   process dies) and nothing can leak across warm Lambda invokes — there is no
-  teardown pathway to miss. Fd count is K per block (K = the grid's inner
-  chunks per shard, ≤ ~64), well under limits.
+  teardown pathway to miss. Fd count is bounded at ``4**_GROUP_LEVELS`` (64)
+  partition-group files per block, well under Lambda's ~1,024 nofile default
+  even at production geometry (``chunk_inner: 13`` = 1,024 inner chunks per
+  o8 shard).
 - Records are packed columnar segments: per append, the cell words
   (``uint64``) followed by each declared column's values in schema order,
   raw bytes, no framing — segment row counts live in memory on the writer
   (same process reads them back). Read-back is ``seek(0)`` + ``readinto``
   straight into preallocated arrays: exact bytes in, exact bytes out.
-- The partition key is the observation's inner-chunk id (``clip2order`` at
-  ``grid.chunk_order`` — :func:`partition_ids`); with ``chunk_inner`` unset
-  (K == 1) everything lands in a single partition.
+- The partition key is the observation's partition-group id — the inner
+  chunk when the shard owns ≤ 64, else a contiguous group of inner chunks
+  (``clip2order`` at :func:`_group_order` — :func:`partition_ids`); with
+  ``chunk_inner`` unset (K == 1) everything lands in a single partition.
 - Byte accounting is exact on write (``bytes_written`` sums each segment's
   ``nbytes``): it is both the block-threshold input and the ``spill_bytes``
   metric (the espg-approved /tmp throughput instrumentation).
@@ -103,21 +106,44 @@ def check_tmp_headroom(need_bytes: int, tmp_dir: str | None = None) -> None:
         )
 
 
+#: Partition-group depth below the shard order: at most ``4**_GROUP_LEVELS``
+#: (= 64) partition files per block. Production HEALPix configs pin
+#: ``chunk_inner: 13``, which at an o8 dispatch shard is 4^5 = 1,024 inner
+#: chunks — one file per inner chunk would blow Lambda's ~1,024 nofile
+#: default. Grouping instead clips cells to ``parent_order + _GROUP_LEVELS``:
+#: each group is a morton cell whose children at ``chunk_order`` are a
+#: **contiguous** run of inner chunks, so a group's file still reads back as
+#: one contiguous cell span for the pooled per-chunk build, and the reduce
+#: working set divides by the group count (64 is ample: ~3 GB of spill reads
+#: back in ~50 MB units) without approaching the fd limit.
+_GROUP_LEVELS = 3
+
+
+def _group_order(grid) -> int:
+    """The morton order spill partitions are keyed at (grouped inner chunks)."""
+    return min(int(grid.chunk_order), int(grid.parent_order) + _GROUP_LEVELS)
+
+
 def partition_ids(grid, cells: np.ndarray) -> np.ndarray:
-    """Spill partition key per cell: the enclosing inner-chunk id.
+    """Spill partition key per cell: the enclosing partition-*group* id.
 
     HEALPix grids with a finer ``chunk_inner`` (K > 1) coarsen each
-    child-order cell word to ``grid.chunk_order`` via ``mortie.clip2order`` —
-    the same words ``grid.iter_chunks`` enumerates, so a chunk's partition is
-    found by clipping any of its children. Every other case (``chunk_inner``
-    unset, rectilinear, minimal test stubs) is a single partition: key 0.
+    child-order cell word to :func:`_group_order` via ``mortie.clip2order`` —
+    ``grid.chunk_order`` itself when the shard owns ≤ ``4**_GROUP_LEVELS``
+    inner chunks (a group == one inner chunk, the words ``grid.iter_chunks``
+    enumerates), else a coarser prefix so at most 64 partition files exist per
+    block. Either way a chunk's partition is found by clipping any of its
+    children, and ``iter_chunks`` order visits each group as one contiguous
+    run (morton children of a group cell are consecutive), so every group is
+    read back exactly once. Every other case (``chunk_inner`` unset,
+    rectilinear, minimal test stubs) is a single partition: key 0.
     """
     cells = np.asarray(cells)
     if int(getattr(grid, "chunks_per_shard", 1)) <= 1 or not hasattr(grid, "chunk_order"):
         return np.zeros(len(cells), dtype=np.uint64)
     from mortie import clip2order
 
-    return np.asarray(clip2order(grid.chunk_order, cells.astype(np.uint64)))
+    return np.asarray(clip2order(_group_order(grid), cells.astype(np.uint64)))
 
 
 def _readinto(f, arr: np.ndarray) -> None:
@@ -415,8 +441,12 @@ class SpillAggregator:
                     self._digest_fields[name] = (meta.get("source") or "h_li", delta)
                 else:
                     self._count_fields.append(name)
-        k = int(getattr(grid, "chunks_per_shard", 1)) if hasattr(grid, "chunk_order") else 1
-        self._n_partitions = max(k, 1)
+        if hasattr(grid, "chunk_order") and int(getattr(grid, "chunks_per_shard", 1)) > 1:
+            # Partition-group count: 4^levels below the shard order, capped at
+            # 4**_GROUP_LEVELS files per block (see _GROUP_LEVELS).
+            self._n_partitions = 4 ** (_group_order(grid) - int(grid.parent_order))
+        else:
+            self._n_partitions = 1
         if block_bytes is not None:
             self.block_bytes = int(block_bytes)
             check_tmp_headroom(max(_MIN_SPILL_BYTES, self.block_bytes), self.tmp_dir)
@@ -438,8 +468,9 @@ class SpillAggregator:
         # Per-flush unique cell words; unioned lazily by occupied_cells().
         self._occupied: list[np.ndarray] = []
         # Single-block reduce cache: (part_key, col_arrays, cell_to_slice) for
-        # the most recently loaded partition (chunks sharing a partition — the
-        # K==1-partition case — reuse it; each partition is read once).
+        # the most recently loaded partition. Chunks sharing a partition group
+        # reuse it, and iter_chunks visits each group as one contiguous run,
+        # so every group is read back exactly once.
         self._loaded: tuple | None = None
         self.n_obs_total = 0
         self.flushes = 0
