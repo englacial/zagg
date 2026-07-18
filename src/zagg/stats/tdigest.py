@@ -99,6 +99,69 @@ def _k1_scale(q: float, delta: float) -> float:
     return delta * (float(np.arcsin(2.0 * qc - 1.0)) / np.pi + 0.5)
 
 
+def _k1_scale_array(q: np.ndarray, delta: float) -> np.ndarray:
+    """Vectorized :func:`_k1_scale` over an array of rank fractions.
+
+    Evaluating the ``arcsin`` for every rank in **one** ufunc call is the whole
+    point: the scalar per-observation ``float(np.arcsin(...))`` in the old
+    compression loop was numpy-dispatch-bound, so hoisting it here is what turns
+    the ``O(n)`` Python loop into an ``O(delta)`` one (issue #279).
+    """
+    qc = np.clip(q, 0.0, 1.0)
+    return delta * (np.arcsin(2.0 * qc - 1.0) / np.pi + 0.5)
+
+
+def _compress(
+    means: np.ndarray, weights: np.ndarray, delta: float
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """k1-bounded greedy compression of sorted weighted sub-centroids.
+
+    Shared core for both :func:`build_tdigest` (unit weights over sorted values)
+    and the merge paths (weighted sub-centroids). ``means`` must be ascending
+    and ``weights`` strictly positive, both 1-D float64.
+
+    Returns ``(out_means, out_weights, starts)``: the compressed centroid means
+    (weighted averages), their weights, and ``starts`` — each output centroid's
+    first sub-centroid index, which the located channel reduces over.
+
+    The centroid **boundaries and weights are bit-identical** to the old scalar
+    loop (same k1 values at the same rank fractions, same ``span ≤ 1`` rule);
+    only the means differ, at the float-ULP level, because they are formed as a
+    single weighted ``sum / weight`` rather than an incremental Welford update.
+    Instead of testing every sub-centroid, this jumps straight to each
+    centroid's right edge with one ``searchsorted`` per centroid — so the loop
+    runs ~delta times regardless of ``n`` (issue #279).
+    """
+    n = len(means)
+    cumw = np.cumsum(weights)
+    total = float(cumw[-1])
+    # k1 at each sub-centroid's right edge (cumulative rank fraction cumw[i]/total).
+    # Monotonic in i (weights > 0), so searchsorted can locate boundaries.
+    k_right = _k1_scale_array(cumw / total, delta)
+    k_left0 = float(_k1_scale_array(np.zeros(1), delta)[0])
+
+    starts_list: list[int] = []
+    s = 0
+    while s < n:
+        starts_list.append(s)
+        # Left edge of the centroid starting at s: k1(cumw[s-1]/total), which is
+        # exactly k_right[s-1] (0-edge for s == 0). A sub-centroid i joins while
+        # k_right[i] - k_left <= 1; the first i that breaks it opens the next
+        # centroid. searchsorted(side="right") is that first breaking index.
+        k_left = k_left0 if s == 0 else float(k_right[s - 1])
+        e = int(np.searchsorted(k_right, k_left + 1.0, side="right"))
+        if e <= s:
+            # The very next sub-centroid already overflows the k-span (steep tail):
+            # the centroid holds only its start. Guarantees forward progress.
+            e = s + 1
+        s = e
+
+    starts = np.asarray(starts_list, dtype=np.int64)
+    out_weights = np.add.reduceat(weights, starts)
+    out_means = np.add.reduceat(means * weights, starts) / out_weights
+    return out_means, out_weights, starts
+
+
 def _centroid_ancestors(locations: np.ndarray, starts: list[int], n: int) -> np.ndarray:
     """Reduce per-member morton locations to one enclosing cell per centroid.
 
@@ -189,52 +252,20 @@ def build_tdigest(
         locations = locations[order]
     else:
         sorted_vals = np.sort(values)
-    n_total = float(n)
-    delta_f = float(delta)
 
-    # Centroids accumulated as parallel lists (faster than growing a 2-D array).
-    # ``starts`` records each centroid's first member index in the sorted order,
-    # so the location channel can reduce member words per centroid afterwards.
-    means: list[float] = []
-    weights: list[float] = []
-    starts: list[int] = []
+    # Unit-weight sub-centroids (one per observation); ``_compress`` greedily
+    # merges adjacent ones under the k1 budget. ``starts`` records each output
+    # centroid's first member index in the sorted order, so the location channel
+    # can reduce member words per centroid afterwards.
+    out_means, out_weights, starts = _compress(
+        sorted_vals, np.ones(n, dtype=np.float64), float(delta)
+    )
 
-    cur_mean = sorted_vals[0]
-    cur_weight = 1.0
-    cur_start = 0
-    # k1 scale value at the current centroid's left edge — the cumulative rank
-    # fraction *before* its first observation. Observation i extends the
-    # centroid's right edge to rank (i + 1); it joins the centroid while the
-    # centroid still spans ≤ 1 unit of the k1 scale, otherwise it opens a fresh
-    # centroid. This keeps the digest to ~delta centroids and loss-free until
-    # the count exceeds delta.
-    k_left = _k1_scale(0.0, delta_f)
-
-    for i in range(1, n):
-        v = sorted_vals[i]
-        k_right = _k1_scale((i + 1) / n_total, delta_f)
-        if k_right - k_left <= 1.0:
-            # Merge: update running mean via Welford one-pass update.
-            cur_mean += (v - cur_mean) / (cur_weight + 1.0)
-            cur_weight += 1.0
-        else:
-            means.append(cur_mean)
-            weights.append(cur_weight)
-            starts.append(cur_start)
-            cur_mean = v
-            cur_weight = 1.0
-            cur_start = i
-            k_left = _k1_scale(i / n_total, delta_f)
-
-    means.append(cur_mean)
-    weights.append(cur_weight)
-    starts.append(cur_start)
-
-    out = np.empty((len(means), 2), dtype=np.float32)
-    out[:, 0] = means
-    out[:, 1] = weights
+    out = np.empty((len(out_means), 2), dtype=np.float32)
+    out[:, 0] = out_means
+    out[:, 1] = out_weights
     if locations is not None:
-        return out, _centroid_ancestors(locations, starts, n)
+        return out, _centroid_ancestors(locations, starts.tolist(), n)
     return out
 
 
