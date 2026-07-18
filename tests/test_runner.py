@@ -3700,6 +3700,8 @@ class TestLambdaResolverSeamRasterEvents:
                 {},
                 None,
                 "s3://b/out.zarr",
+                times_us=[0],
+                overwrite=False,
                 max_workers=1,
                 region="us-west-2",
                 function_name="pinned-raster",
