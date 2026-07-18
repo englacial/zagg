@@ -323,11 +323,12 @@ def _default_block_bytes(n_partitions: int, tmp_dir: str | None = None) -> int:
 
     The formula: a closing block's reduce working set is its **largest
     partition** (~block/K) at the measured :data:`_BUILD_MULT` build peak
-    (columns + sort copies + outputs), live alongside the read buffer — so
-    block bytes ≲ ``0.8 x (memory - read buffer - outputs) x K /
-    _BUILD_MULT``. The read buffer and output carriers aren't measurable up
-    front; they are budgeted at 25% of memory combined, giving ``0.8 x 0.75 /
-    3 x memory x K = 0.2 x memory x K``. ``/tmp`` must additionally hold the
+    (read-back columns + sort copies + per-cell outputs — outputs are inside
+    this multiple, charged here and nowhere else), live alongside the read
+    buffer — so block bytes ≲ ``0.8 x (memory - read buffer) x K /
+    _BUILD_MULT``. The read buffer (plus slack) isn't measurable up front; it
+    is budgeted at 25% of memory, giving ``0.8 x 0.75 / 3 x memory x K = 0.2 x
+    memory x K``. ``/tmp`` must additionally hold the
     closing block beside the filling one, so the result is capped at 45% of
     the spill directory's current free space. A finer ``chunk_inner`` raises
     K and with it the usable block (the build unit is one partition, not the
