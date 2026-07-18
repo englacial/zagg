@@ -25,6 +25,17 @@ def mock_s3(monkeypatch):
     return s3_cls, prov_cls
 
 
+@pytest.fixture(autouse=True)
+def _clear_object_store_cache():
+    """Reset the process-global ambient store cache (issue #287) around every
+    test so one test's cached store can't leak into another's assertions."""
+    from zagg import store
+
+    store._OBJECT_STORE_CACHE.clear()
+    yield
+    store._OBJECT_STORE_CACHE.clear()
+
+
 class TestOpenStore:
     def test_local_absolute_path(self, tmp_path):
         store = open_store(str(tmp_path / "test.zarr"))
@@ -316,6 +327,61 @@ class TestOpenObjectStore:
         assert kwargs["endpoint"] == "https://minio.local"
         assert kwargs["virtual_hosted_style_request"] is False
         prov_cls.assert_not_called()
+
+
+class TestObjectStoreCache:
+    """Ambient ``s3://`` stores are memoized per process (issue #287): the
+    sidecar manifest fetch calls ``open_object_store(self.store)`` once per
+    granule, and each call previously rebuilt a ``Boto3CredentialProvider``
+    (~300 ms credential-chain walk) on the read hot path."""
+
+    def test_ambient_store_built_once_and_reused(self, mock_s3):
+        s3_cls, prov_cls = mock_s3
+        p = "s3://sliderule-public-cors/zagg-index/ATL03/007"
+        stores = [open_object_store(p) for _ in range(5)]
+        # One construction total; the credential chain is walked once, not 5x.
+        assert s3_cls.call_count == 1
+        assert prov_cls.call_count == 1
+        # Every caller gets the same shared store.
+        assert all(s is stores[0] for s in stores)
+
+    def test_distinct_paths_get_distinct_stores(self, mock_s3):
+        s3_cls, _ = mock_s3
+        open_object_store("s3://bucket/a")
+        open_object_store("s3://bucket/b")
+        assert s3_cls.call_count == 2
+
+    def test_explicit_credentials_bypass_cache(self, mock_s3):
+        s3_cls, _ = mock_s3
+        creds = {"accessKeyId": "AKIA", "secretAccessKey": "secret"}
+        open_object_store("s3://bucket/a", credentials=creds)
+        open_object_store("s3://bucket/a", credentials=creds)
+        # A statically-supplied token must never be cached (it would freeze on a
+        # warm worker) -- each call builds fresh.
+        assert s3_cls.call_count == 2
+
+    def test_endpoint_bypasses_cache(self, mock_s3):
+        s3_cls, _ = mock_s3
+        open_object_store("s3://bucket/a", endpoint_url="https://minio.local")
+        open_object_store("s3://bucket/a", endpoint_url="https://minio.local")
+        assert s3_cls.call_count == 2
+
+    def test_kwargs_bypass_cache(self, mock_s3):
+        """A caller passing any kwargs (e.g. the read-only retry config on the
+        temporal path) falls through to a fresh build -- the cache is scoped to
+        the sidecar's bare ``open_object_store(path)`` call only."""
+        s3_cls, _ = mock_s3
+        from zagg.store import _S3_READONLY_RETRY_CONFIG
+
+        open_object_store("s3://bucket/a", retry_config=_S3_READONLY_RETRY_CONFIG)
+        open_object_store("s3://bucket/a", retry_config=_S3_READONLY_RETRY_CONFIG)
+        assert s3_cls.call_count == 2
+
+    def test_local_paths_not_cached(self, tmp_path):
+        s1 = open_object_store(str(tmp_path / "s"))
+        s2 = open_object_store(str(tmp_path / "s"))
+        # Local stores are cheap and unaffected -- fresh each call, not cached.
+        assert s1 is not s2
 
 
 class TestParseS3Path:

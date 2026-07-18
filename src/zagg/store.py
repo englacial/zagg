@@ -1,6 +1,7 @@
 """Store factory for opening Zarr stores from path strings."""
 
 import copy
+import threading
 from datetime import timedelta
 from pathlib import Path
 
@@ -98,6 +99,26 @@ def open_store(
     return LocalStore(Path(path).resolve(), read_only=read_only)
 
 
+# Ambient-credential object-store cache (issue #287): one obstore ``S3Store``
+# per ``s3://`` path per PROCESS, for the ambient (execution-role) hot path only.
+# The sidecar index backend (``h5coro_hidefix.zagg_backend.SidecarIndex``) calls
+# ``open_object_store(self.store)`` once per granule to fetch that granule's
+# manifest parquet; without this cache each call built a fresh
+# ``Boto3CredentialProvider`` whose ``__init__`` eagerly walks the botocore
+# credential chain (~300 ms of client/TLS + "Found credentials..." per granule),
+# on the read critical path — 675 rebuilds on one 784-granule o9 shard. Mirrors
+# the raster ``_STORE_CACHE`` (issue #244). Module lifetime == sandbox lifetime:
+# ``Boto3CredentialProvider`` refreshes per call (30-min ttl) and Lambda role
+# creds are static per sandbox, so a cached store cannot outlive its creds.
+# Scoped deliberately to the ``credentials is None and endpoint_url is None and
+# not kwargs`` case (the sidecar's exact call): explicit-credential output
+# writes, custom endpoints, and retry-config/anonymous callers fall through to a
+# fresh build, byte-identical to before — a statically-supplied token must NOT
+# be cached (it would freeze on a warm worker).
+_OBJECT_STORE_CACHE: dict = {}
+_OBJECT_STORE_LOCK = threading.Lock()
+
+
 def open_object_store(
     path: str,
     credentials: dict | None = None,
@@ -111,8 +132,20 @@ def open_object_store(
     objects -- e.g. the per-shard async result JSON a Lambda worker writes next
     to the output store for the orchestrator to poll. Path forms and credential
     handling match ``open_store``; a local directory is created if absent.
+
+    Ambient ``s3://`` stores (no explicit ``credentials``/``endpoint_url`` and no
+    extra ``kwargs``) are cached per process and reused across calls (issue #287)
+    -- this is the sidecar manifest-fetch hot path. Every other call builds a
+    fresh store, unchanged.
     """
     if path.startswith("s3://"):
+        if credentials is None and endpoint_url is None and not kwargs:
+            with _OBJECT_STORE_LOCK:
+                store = _OBJECT_STORE_CACHE.get(path)
+                if store is None:
+                    store = _s3_object_store(path)
+                    _OBJECT_STORE_CACHE[path] = store
+            return store
         return _s3_object_store(
             path,
             credentials=credentials,
