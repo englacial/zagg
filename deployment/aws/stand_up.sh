@@ -82,10 +82,12 @@ DIST_REGION="${DIST_REGION:-us-west-2}"
 # dist bucket no longer allows anonymous reads (issue #267), so an unsigned
 # request 403s even for callers whose credentials could read it. Set
 # STAND_UP_ANON=1 to restore unsigned reads against a genuinely public mirror
-# (e.g. a self-hosted DIST_BUCKET copy). Expanded unquoted (single flag, no
-# spaces) so the empty default vanishes — macOS bash 3.2 + `set -u` rejects
-# the empty-array idiom.
-DIST_SIGN="${STAND_UP_ANON:+--no-sign-request}"
+# (e.g. a self-hosted DIST_BUCKET copy); only truthy values enable it, so
+# STAND_UP_ANON=0/false means signed as intended. Expanded unquoted (single
+# flag, no spaces) so the empty default vanishes — macOS bash 3.2 + `set -u`
+# rejects the empty-array idiom.
+DIST_SIGN=""
+case "${STAND_UP_ANON:-}" in 1|true|yes) DIST_SIGN="--no-sign-request" ;; esac
 
 dist_key()   { local p="$DIST_PREFIX"; [ -n "$p" ] && p="$p/"; echo "${p}${1}/${2}"; }  # minor, zip
 dist_root()  { local p="$DIST_PREFIX"; [ -n "$p" ] && p="$p/"; echo "${p}${1}"; }       # versions.json path
