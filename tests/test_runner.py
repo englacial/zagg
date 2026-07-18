@@ -985,6 +985,8 @@ class TestMaxRetriesPassthrough:
         )
         monkeypatch.setattr(grids_mod, "from_config", lambda *a, **k: _stub_grid())
         monkeypatch.setattr(runner, "_invoke_lambda_setup", lambda *a, **k: None)
+        # Flat lambda lifecycle pinned explicitly (issue #253 defaults hive).
+        atl06_config.output["store_layout"] = "flat"
         monkeypatch.setattr(runner, "_invoke_lambda_finalize", lambda *a, **k: None)
         monkeypatch.setattr(runner, "_get_function_timeout_s", lambda *a, **k: 720)
         from unittest.mock import MagicMock
@@ -1058,6 +1060,8 @@ class TestInvocationPassthrough:
         )
         monkeypatch.setattr(grids_mod, "from_config", lambda *a, **k: grid_factory())
         monkeypatch.setattr(runner, "_invoke_lambda_setup", lambda *a, **k: None)
+        # Flat lambda lifecycle pinned explicitly (issue #253 defaults hive).
+        atl06_config.output["store_layout"] = "flat"
         monkeypatch.setattr(runner, "_invoke_lambda_finalize", lambda *a, **k: None)
         monkeypatch.setattr(runner, "_get_function_timeout_s", lambda *a, **k: 720)
         monkeypatch.setattr(boto3, "Session", lambda *a, **k: MagicMock())
@@ -1537,6 +1541,8 @@ class TestSummaryKeysByteIdentical:
         )
         monkeypatch.setattr(grids_mod, "from_config", lambda *a, **k: _stub_grid())
         monkeypatch.setattr(runner, "_invoke_lambda_setup", lambda *a, **k: None)
+        # Flat lambda lifecycle pinned explicitly (issue #253 defaults hive).
+        atl06_config.output["store_layout"] = "flat"
         monkeypatch.setattr(runner, "_invoke_lambda_finalize", lambda *a, **k: None)
         monkeypatch.setattr(runner, "_get_function_timeout_s", lambda *a, **k: 720)
         from unittest.mock import MagicMock
@@ -1686,6 +1692,8 @@ class TestSummaryKeysByteIdentical:
         )
         monkeypatch.setattr(grids_mod, "from_config", lambda *a, **k: _stub_grid())
         monkeypatch.setattr(runner, "_invoke_lambda_setup", lambda *a, **k: None)
+        # Flat lambda lifecycle pinned explicitly (issue #253 defaults hive).
+        atl06_config.output["store_layout"] = "flat"
         monkeypatch.setattr(runner, "_invoke_lambda_finalize", lambda *a, **k: None)
         monkeypatch.setattr(runner, "_get_function_timeout_s", lambda *a, **k: 720)
         from unittest.mock import MagicMock
@@ -1749,6 +1757,8 @@ class TestSummaryKeysByteIdentical:
         )
         monkeypatch.setattr(grids_mod, "from_config", lambda *a, **k: _stub_grid())
         monkeypatch.setattr(runner, "_invoke_lambda_setup", lambda *a, **k: None)
+        # Flat lambda lifecycle pinned explicitly (issue #253 defaults hive).
+        atl06_config.output["store_layout"] = "flat"
         monkeypatch.setattr(runner, "_invoke_lambda_finalize", lambda *a, **k: None)
         monkeypatch.setattr(runner, "_get_function_timeout_s", lambda *a, **k: 720)
         from unittest.mock import MagicMock
@@ -1824,6 +1834,8 @@ class TestSummaryKeysByteIdentical:
         )
         monkeypatch.setattr(grids_mod, "from_config", lambda *a, **k: _stub_grid())
         monkeypatch.setattr(runner, "_invoke_lambda_setup", lambda *a, **k: None)
+        # Flat lambda lifecycle pinned explicitly (issue #253 defaults hive).
+        atl06_config.output["store_layout"] = "flat"
         monkeypatch.setattr(runner, "_invoke_lambda_finalize", lambda *a, **k: None)
         monkeypatch.setattr(runner, "_get_function_timeout_s", lambda *a, **k: 720)
         from unittest.mock import MagicMock
@@ -2711,6 +2723,8 @@ def _run_lambda_with_durations(
     )
     monkeypatch.setattr(grids_mod, "from_config", lambda *a, **k: _stub_grid())
     monkeypatch.setattr(runner, "_invoke_lambda_setup", lambda *a, **k: None)
+    # Flat lambda lifecycle pinned explicitly (issue #253 defaults hive).
+    atl06_config.output["store_layout"] = "flat"
     monkeypatch.setattr(runner, "_invoke_lambda_finalize", lambda *a, **k: None)
     monkeypatch.setattr(runner, "_get_function_timeout_s", lambda *a, **k: timeout)
     from unittest.mock import MagicMock
@@ -3451,6 +3465,8 @@ class TestConsolidationGate:
         )
         monkeypatch.setattr(grids_mod, "from_config", lambda *a, **k: _stub_grid())
         monkeypatch.setattr(runner, "_invoke_lambda_setup", lambda *a, **k: None)
+        # Flat lambda lifecycle pinned explicitly (issue #253 defaults hive).
+        atl06_config.output["store_layout"] = "flat"
         monkeypatch.setattr(runner, "_get_function_timeout_s", lambda *a, **k: 720)
         calls = []
         monkeypatch.setattr(runner, "_invoke_lambda_finalize", lambda *a, **k: calls.append(1))

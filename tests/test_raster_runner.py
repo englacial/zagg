@@ -753,6 +753,26 @@ class TestShippedTemplate:
 class TestRasterHiveLocalBackend:
     """Local raster hive runs (issue #247 phase 3): manifest, leaves, coverage."""
 
+    def test_defaulted_layout_dispatches_hive(self, tmp_path, manifest):
+        # Issue #253 phase 4: an OMITTED store_layout on a healpix raster
+        # config resolves hive (the grid-keyed, pipeline-agnostic default) and
+        # dispatches down the issue #247 hive path — manifest + stamped leaf,
+        # no flat global template at the store root.
+        from pathlib import Path
+
+        from zagg import hive
+
+        cfg, sm_path, shard, _data = manifest
+        del cfg.output["store_layout"]  # the fixture pins flat; drop for the default
+        summary = agg(cfg, catalog=sm_path, backend="local", max_workers=2)
+        assert summary["cells_with_data"] == 1 and summary["cells_error"] == 0
+
+        store_path = cfg.output["store"]
+        assert hive.read_manifest(store_path)["spec"] == "morton-hive/1"
+        stamp = hive.read_commit(hive.shard_leaf_path(store_path, shard))
+        assert stamp and stamp["complete"]
+        assert "zarr.json" not in {p.name for p in Path(store_path).iterdir()}  # D5
+
     def test_schedule_none_end_to_end(self, tmp_path, manifest):
         from pathlib import Path
 
@@ -894,6 +914,58 @@ class TestRasterHiveLambdaBackend:
         cov = fake.events[-1]["coverage"]
         assert cov["encoding"] == "ranges"
         assert cov["time_range"] == [T0, T1]
+
+    def test_defaulted_layout_dispatches_hive(self, manifest, monkeypatch):
+        # Issue #253 phase 4, lambda dispatcher: a healpix raster config with
+        # NO store_layout key runs the hive lifecycle (ping -> async setup ->
+        # hive process events -> finalize/coverage), not the issue #264 flat
+        # sync-setup path. The default resolves in get_store_layout on both
+        # ends — the events forward the config untouched, no injected key.
+        import boto3
+
+        cfg, sm_path, shard, _data = manifest
+        del cfg.output["store_layout"]  # the fixture pins flat; drop for the default
+
+        def responder(event):
+            mode = event["mode"]
+            if mode == "ping":
+                body = {"ok": True, "mode": "ping", "zagg_version": "test"}
+                return {"statusCode": 200, "body": json.dumps(body)}
+            if mode in ("setup", "coverage"):
+                return {"statusCode": 200, "body": "{}"}  # Event invokes: unread
+            if mode == "finalize":
+                body = {"ok": True, "mode": "finalize", "layout": "hive"}
+                return {"statusCode": 200, "body": json.dumps(body)}
+            assert mode == "process_raster"
+            body = {
+                "shard_key": event["shard_key"],
+                "timesteps": 2,
+                "cells_with_data": 7,
+                "time_range": [T0, T1],
+            }
+            return {"statusCode": 200, "body": json.dumps(body)}
+
+        fake = _FakeLambdaClient(responder)
+        monkeypatch.setattr(boto3, "client", lambda *a, **k: fake)
+        summary = agg(
+            cfg, catalog=sm_path, store="s3://bucket/out.zarr", backend="lambda", max_workers=2
+        )
+        assert summary["cells_with_data"] == 1
+
+        modes = [e["mode"] for e in fake.events]
+        assert modes[:2] == ["ping", "setup"]
+        assert modes[-2:] == ["finalize", "coverage"]
+        procs = [e for e in fake.events if e["mode"] == "process_raster"]
+        # Hive-shaped process events: leaf-local time axis, no flat time_index;
+        # schedule none -> no window payload.
+        assert procs == [e for e in fake.events[2:-2]]
+        assert all("time_index" not in ev and "window" not in ev for ev in procs)
+        assert all(ev["shard_key"] == shard for ev in procs)
+        # No sync flat raster setup: no event carries the flat template's
+        # times_us, and the forwarded config still has no store_layout key.
+        assert all("times_us" not in ev for ev in fake.events)
+        for ev in fake.events[:2] + [fake.events[-2]]:
+            assert "store_layout" not in ev["config"]["output"]
 
     def test_all_failed_finalizes_before_raise(self, manifest, monkeypatch):
         # All-shards-failed still runs the finalize backstop BEFORE the

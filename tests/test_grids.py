@@ -303,6 +303,28 @@ class TestFromConfig:
         assert get_store_layout(cfg) == "hive"
         assert get_sharded(cfg, default=True) is True
 
+    def test_raster_explicit_flat_store_warns(self):
+        # Uniform deprecation (issue #253 phase 4): flat-on-HEALPix is the
+        # deprecated interop profile for EVERY pipeline — raster included, now
+        # that raster + hive is the real write path (issue #247).
+        rcfg = default_config("sentinel2_l2a")
+        rcfg.output["store_layout"] = "flat"
+        with pytest.warns(DeprecationWarning, match="flat is deprecated"):
+            from_config(rcfg)
+
+    def test_raster_defaults_do_not_warn(self):
+        # A defaulted healpix raster config resolves hive (issue #253: the
+        # grid-keyed default is pipeline-agnostic) — and stays silent.
+        import warnings as _w
+
+        from zagg.config import get_store_layout
+
+        rcfg = default_config("sentinel2_l2a")
+        assert get_store_layout(rcfg) == "hive"
+        with _w.catch_warnings():
+            _w.simplefilter("error", DeprecationWarning)
+            from_config(rcfg)
+
     def test_rect_explicit_flat_does_not_warn(self, cfg):
         # Rect carve-out (issue #253): flat is not deprecated off HEALPix.
         import warnings as _w
