@@ -313,7 +313,7 @@ def process_shard(
     # after the reads — full pooled reducer surface, byte-identical to pooled
     # in the single-block regime. ``None`` (default) is the unchanged pooled
     # path.
-    from zagg.processing.spill import SpillAggregator, SpillOverflowError
+    from zagg.processing.spill import SpillAggregator, SpillOverflowError, SpillReduceError
     from zagg.processing.streaming import StreamingAggregator, get_streaming
 
     streaming_cfg = get_streaming(config)
@@ -469,10 +469,13 @@ def process_shard(
             files_processed += 1
             if buffered is not None:
                 buffered.granule_done()
-        except SpillOverflowError:
-            # A spill block overflowed under a non-mergeable config: this is a
-            # config/capacity error for the whole shard, not a per-granule
-            # hiccup — propagate loudly instead of warn-and-continue.
+        except (SpillOverflowError, SpillReduceError):
+            # A spill block overflowed under a non-mergeable config
+            # (SpillOverflowError), or an overlap-thread reduce failed and its
+            # parked error surfaced at the next block close (SpillReduceError):
+            # both are shard-level failures, not per-granule hiccups — a
+            # swallowed SpillReduceError would silently drop a block from the
+            # emitted output — so propagate loudly instead of warn-and-continue.
             raise
         except Exception as e:
             # Fold-side failure (e.g. a streaming flush): same tolerated

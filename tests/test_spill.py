@@ -33,6 +33,7 @@ from zagg.processing.spill import (
     SpillAggregator,
     SpillBlock,
     SpillOverflowError,
+    SpillReduceError,
     check_tmp_headroom,
     partition_ids,
 )
@@ -627,6 +628,26 @@ class TestSpillWorkerMultiBlock:
         with pytest.raises(SpillOverflowError, match="memory tier"):
             _run(monkeypatch, cfg, grid, _shard_key(), dfs)
 
+    def test_overlap_reduce_error_raises_through_worker(self, monkeypatch):
+        # A failed overlap-thread reduce surfaces at the next block close, on
+        # the granule_done -> flush -> _close_block path inside the worker's
+        # read loop. Its tolerated per-granule except must re-raise
+        # SpillReduceError, not warn-and-continue and emit merged state that
+        # silently drops the failed block (the finding TestSpillOverlap misses
+        # by driving SpillAggregator directly).
+        self._force_tiny_blocks(monkeypatch)
+        cfg = _config(streaming={"buffer_granules": 1, "mode": "spill"})
+        grid = _grid(cfg)
+        key = _shard_key()
+        dfs = _granule_dfs(grid, key, _CELL_LISTS, seed=3)
+
+        def boom(self, block):
+            raise ValueError("synthetic reduce failure")
+
+        monkeypatch.setattr(SpillAggregator, "_fold_block", boom)
+        with pytest.raises(SpillReduceError, match="overlap thread"):
+            _run(monkeypatch, cfg, grid, key, dfs)
+
 
 class TestSpillOverlap:
     """Async read/reduce overlap (phase 5): one reducer thread, same bytes."""
@@ -673,7 +694,7 @@ class TestSpillOverlap:
             raise ValueError("synthetic reduce failure")
 
         monkeypatch.setattr(SpillAggregator, "_fold_block", boom)
-        with pytest.raises(RuntimeError, match="overlap thread"):
+        with pytest.raises(SpillReduceError, match="overlap thread"):
             self._drive(cfg, dfs)
 
     def test_reduce_error_propagates_at_finalize(self, monkeypatch):
@@ -697,7 +718,7 @@ class TestSpillOverlap:
         agg.add_read(dfs[0])
         agg.granule_done()  # one flush -> one closed block, failing on the thread
         agg.flush()
-        with pytest.raises(RuntimeError, match="overlap thread"):
+        with pytest.raises(SpillReduceError, match="overlap thread"):
             agg.chunk_outputs(grid.children(key), get_agg_fields(cfg))
         agg.close()
 

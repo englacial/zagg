@@ -69,6 +69,19 @@ class SpillOverflowError(RuntimeError):
     """
 
 
+class SpillReduceError(RuntimeError):
+    """An overlap-thread block reduce failed; the merged state is incomplete.
+
+    Raised by :meth:`SpillAggregator._join_reducer` when the parked reducer
+    exception surfaces at the next block close — which happens inside the
+    worker's per-granule read loop. Deliberately a distinct type (like
+    :class:`SpillOverflowError`) so the worker's tolerated per-granule
+    ``except`` re-raises it instead of downgrading it to warn-and-continue:
+    a dropped block silently omitted from the emitted output must abort the
+    shard, not be logged and swallowed.
+    """
+
+
 def check_tmp_headroom(need_bytes: int, tmp_dir: str | None = None) -> None:
     """Refuse to enable spill when ``/tmp`` cannot hold its working set.
 
@@ -529,7 +542,7 @@ class SpillAggregator:
             self._reducer = None
         if self._reduce_err is not None:
             err, self._reduce_err = self._reduce_err, None
-            raise RuntimeError(
+            raise SpillReduceError(
                 "spill block reduce failed on the overlap thread; the merged "
                 "running state is incomplete"
             ) from err
