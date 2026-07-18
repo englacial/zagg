@@ -1882,6 +1882,64 @@ def test_run_target_measures_objects_when_store_written(monkeypatch, tmp_path):
     assert rec["objects_total"] == 10 and rec["objects_expected"] == 10
 
 
+def test_run_target_spill_routes_disk_and_bills_ephemeral(monkeypatch, tmp_path):
+    # issue #272: a spill target injects streaming.mode=spill + the worker block,
+    # dispatches to the -disk variant resolved OFF the base name, and records
+    # tmp_mb so bench_metrics folds the ephemeral /tmp cost into the shard cost.
+    manifest, base = run_benchmark.load_targets(str(BENCH / "targets.json"))
+    seen = {}
+
+    def fake_agg(config, **kwargs):
+        seen["function_name"] = kwargs.get("function_name")
+        seen["mode"] = config.aggregation.get("streaming", {}).get("mode")
+        seen["worker"] = config.worker
+        return {"total_obs": 5, "worker_max_s": 200.0, "estimated_cost_usd": 0.002}
+
+    monkeypatch.setattr("zagg.runner.agg", fake_agg)
+    monkeypatch.setattr(run_benchmark, "_measure_objects", lambda *a, **k: {})
+    store = str(tmp_path / "spill.zarr")
+    rec = run_benchmark.run_target(
+        "tdigest_healpix_o9_hive",
+        manifest,
+        base,
+        store=store,
+        region="us-west-2",
+        function_name="process-shard",
+        context={"commit": "c", "event": "merge"},
+        dry_run=False,
+    )
+    # The -disk variant is resolved off the base the run selected.
+    assert seen["function_name"] == "process-shard-4096-disk"
+    assert seen["mode"] == "spill"
+    assert seen["worker"] == {"memory": 4096, "extra_disk": True}
+    assert rec["streaming_mode"] == "spill"
+    assert rec["tmp_mb"] == 6144
+    eph = 200.0 * 5.5 * bench_metrics.LAMBDA_EPHEMERAL_PRICE_PER_GB_SEC
+    assert rec["ephemeral_cost_usd"] == pytest.approx(eph)
+    assert rec["cost_per_shard_usd"] == pytest.approx(0.002 + eph)
+
+    # A non-worker target dispatches to the base name unchanged, no /tmp cost.
+    seen2 = {}
+
+    def fake_agg2(config, **kwargs):
+        seen2["function_name"] = kwargs.get("function_name")
+        return {"total_obs": 5, "worker_max_s": 100.0, "estimated_cost_usd": 0.001}
+
+    monkeypatch.setattr("zagg.runner.agg", fake_agg2)
+    rec2 = run_benchmark.run_target(
+        "tdigest_healpix_o9_inline_nomask",
+        manifest,
+        base,
+        store=store,
+        region="us-west-2",
+        function_name="process-shard",
+        context={"commit": "c", "event": "merge"},
+        dry_run=False,
+    )
+    assert seen2["function_name"] == "process-shard"
+    assert rec2["tmp_mb"] is None and rec2["streaming_mode"] is None
+
+
 def test_run_target_dry_run_skips_object_measurement(monkeypatch):
     # Dry-run writes no store, so nothing is LISTed and the columns stay null.
     manifest, base = run_benchmark.load_targets(str(BENCH / "targets.json"))
