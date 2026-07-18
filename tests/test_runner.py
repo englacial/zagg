@@ -3569,6 +3569,158 @@ class TestConsolidationGate:
         assert self._lambda_finalize_calls(monkeypatch, atl06_config, enabled=True) == 1
 
 
+class TestManifestChecker:
+    """Overlapped morton_hive.json check replacing the blocking finalize
+    backstop on the hive path (issue #274 Fix 2)."""
+
+    def test_checker_sets_found_on_first_hit_and_joins(self):
+        from zagg.runner import _start_manifest_checker
+
+        found, _stop, thread = _start_manifest_checker(lambda: True, interval_s=0.01)
+        thread.join(timeout=2)
+        assert not thread.is_alive()  # stops the moment the manifest is present
+        assert found.is_set()
+
+    def test_checker_stays_unset_while_absent_then_stops(self):
+        import itertools
+
+        from zagg.runner import _start_manifest_checker
+
+        calls = itertools.count()
+
+        def absent():
+            next(calls)
+            return False
+
+        found, stop, thread = _start_manifest_checker(absent, interval_s=0.01)
+        import time as _time
+
+        _time.sleep(0.05)  # let it re-check across a few ticks
+        assert not found.is_set()
+        stop.set()
+        thread.join(timeout=2)
+        assert not thread.is_alive()  # joins cleanly once stopped
+        assert not found.is_set()
+        assert next(calls) > 1  # re-checked, never gave up on its own
+
+    def test_transient_predicate_fault_is_swallowed(self):
+        from zagg.runner import _start_manifest_checker
+
+        state = {"n": 0}
+
+        def flaky():
+            state["n"] += 1
+            if state["n"] == 1:
+                raise RuntimeError("S3 blip")  # a GET fault must not kill it
+            return True
+
+        found, _stop, thread = _start_manifest_checker(flaky, interval_s=0.01)
+        thread.join(timeout=2)
+        assert found.is_set()
+
+    def _hive_finalize_calls(self, monkeypatch, atl06_config, *, manifest_present):
+        import threading
+        from unittest.mock import MagicMock
+
+        import boto3
+
+        import zagg.grids as grids_mod
+        from zagg import runner
+        from zagg.concurrency import ConcurrencyReport
+
+        monkeypatch.setattr(
+            runner,
+            "get_nsidc_s3_credentials",
+            lambda: {"accessKeyId": "a", "secretAccessKey": "s", "sessionToken": "t"},
+        )
+        monkeypatch.setattr(grids_mod, "from_config", lambda *a, **k: _stub_grid())
+        atl06_config.output["store_layout"] = "hive"
+        atl06_config.output["coverage_moc"] = False  # skip the root-coverage dispatch
+        monkeypatch.setattr(runner, "_get_function_timeout_s", lambda *a, **k: 720)
+        monkeypatch.setattr(runner, "_invoke_lambda_ping", lambda *a, **k: None)
+        monkeypatch.setattr(runner, "_invoke_lambda_setup_async", lambda *a, **k: None)
+        monkeypatch.setattr(boto3, "Session", lambda *a, **k: MagicMock())
+        monkeypatch.setattr(
+            runner,
+            "compute_available_workers",
+            lambda requested, *a, **k: (
+                1,
+                ConcurrencyReport(
+                    account_limit=1000,
+                    current_concurrent=0,
+                    padding=100,
+                    available=900,
+                    function_reserved=None,
+                ),
+            ),
+        )
+        monkeypatch.setattr(
+            runner,
+            "_invoke_lambda_cell",
+            lambda client, chunk_idx, shard_key, *a, **k: {
+                "shard_key": shard_key,
+                "status_code": 200,
+                "body": {"total_obs": 1},
+                "error": None,
+                "timeout": False,
+            },
+        )
+        # Control the overlapped checker's verdict deterministically -- no real
+        # thread or obstore GET: return a settled Event and capture the predicate.
+        captured = {}
+
+        def fake_checker(check_present, **k):
+            captured["predicate"] = check_present
+            found = threading.Event()
+            if manifest_present:
+                found.set()
+            thread = MagicMock()
+            captured["thread"] = thread
+            return found, threading.Event(), thread
+
+        monkeypatch.setattr(runner, "_start_manifest_checker", fake_checker)
+        calls = []
+        monkeypatch.setattr(runner, "_invoke_lambda_finalize", lambda *a, **k: calls.append(1))
+        runner._run_lambda(
+            atl06_config,
+            _run_catalog(),
+            "s3://out/x.zarr",
+            12,
+            max_cells=None,
+            morton_cell=None,
+            max_workers=1,
+            overwrite=False,
+            dry_run=False,
+            region="us-west-2",
+            function_name="fn",
+        )
+        return len(calls), captured
+
+    def test_hive_skips_finalize_when_manifest_present(self, monkeypatch, atl06_config):
+        n, captured = self._hive_finalize_calls(monkeypatch, atl06_config, manifest_present=True)
+        assert n == 0  # backstop invoke skipped -- happy path, ~0 wall
+        captured["thread"].join.assert_called()  # checker joined, run didn't hang
+
+    def test_hive_invokes_finalize_when_manifest_absent(self, monkeypatch, atl06_config):
+        n, _ = self._hive_finalize_calls(monkeypatch, atl06_config, manifest_present=False)
+        assert n == 1  # rare lost async write -> self-heal via the backstop
+
+    def test_checker_predicate_reads_manifest_at_store_root(self, monkeypatch, atl06_config):
+        import zagg.hive as hive
+
+        seen = {}
+        monkeypatch.setattr(
+            hive,
+            "read_manifest",
+            lambda root, **k: seen.setdefault("root", root) or {"ok": 1},
+        )
+        _n, captured = self._hive_finalize_calls(monkeypatch, atl06_config, manifest_present=True)
+        # The predicate handed to the checker reads morton_hive.json at the store
+        # root via the poller's output-store path (issue #274 Fix 2).
+        assert captured["predicate"]() is True
+        assert seen["root"] == "s3://out/x.zarr"
+
+
 class TestResolveSourceCredentials:
     """Provider-selected source credentials, both pipelines (issue #213 Phase 6)."""
 
