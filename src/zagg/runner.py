@@ -1045,9 +1045,15 @@ class RasterStrategy:
                     timesteps_written += body["timesteps"]
 
         wall_time = time.time() - t0
-        if cells and errors == len(cells):
-            raise RuntimeError(f"all {errors} raster shard(s) failed; last error: {last_error}")
         if store_layout == "hive":
+            # Finalize-backstop-before-all-failed-raise, mirroring the local
+            # backend (where ensure_manifest + root coverage run ahead of the
+            # identical raise). On Lambda the pre-dispatch manifest write is the
+            # droppable retries-0 async ``setup`` invoke, so finalize is the only
+            # reliable manifest write — it must run even when every shard failed.
+            # With every shard failed ``done`` is empty, so no coverage invoke
+            # fires (natural gating); the finalize backstop still runs.
+            #
             # Finalize backstop (issue #252 hybrid): idempotent ensure_manifest
             # worker-side — required reader-facing schema (D6), so a failure
             # raises, unlike the fail-open coverage dispatch below.
@@ -1088,6 +1094,8 @@ class RasterStrategy:
                         )
                 except Exception as e:
                     logger.warning(f"root coverage.moc dispatch failed (fail-open, D9): {e}")
+        if cells and errors == len(cells):
+            raise RuntimeError(f"all {errors} raster shard(s) failed; last error: {last_error}")
         summary = {
             "total_cells": len(cells),
             "cells_with_data": shards_with_data,

@@ -660,6 +660,37 @@ class TestRasterHiveLambdaBackend:
         assert cov["encoding"] == "ranges"
         assert cov["time_range"] == [T0, T1]
 
+    def test_all_failed_finalizes_before_raise(self, manifest, monkeypatch):
+        # All-shards-failed still runs the finalize backstop BEFORE the
+        # all-failed raise, mirroring the local backend: on Lambda the
+        # pre-dispatch setup write is a droppable retries-0 async invoke, so
+        # finalize is the only reliable manifest write and must run even when
+        # every shard errored. Nothing succeeded, so no coverage invoke fires.
+        import boto3
+
+        cfg, sm_path, _shard, _data = manifest
+        cfg.output["store_layout"] = "hive"
+        cfg.output["windowing"] = {"schedule": "daily"}
+
+        def responder(event):
+            mode = event["mode"]
+            if mode == "process_raster":
+                return {"statusCode": 500, "body": json.dumps({"error": "boom"})}
+            return {"statusCode": 200, "body": "{}"}
+
+        fake = _FakeLambdaClient(responder)
+        monkeypatch.setattr(boto3, "client", lambda *a, **k: fake)
+        with pytest.raises(RuntimeError, match="boom"):
+            agg(cfg, catalog=sm_path, store="s3://bucket/out.zarr", backend="lambda", max_workers=2)
+
+        modes = [e["mode"] for e in fake.events]
+        # Every shard 500s (two daily windows), so the run raises — but the
+        # finalize backstop lands after the process events and before the raise.
+        assert "finalize" in modes
+        assert "coverage" not in modes  # nothing succeeded -> done empty
+        proc_idx = [i for i, m in enumerate(modes) if m == "process_raster"]
+        assert proc_idx and modes.index("finalize") > max(proc_idx)
+
     def test_flat_events_unchanged(self, manifest, monkeypatch, tmp_path):
         # The flat event set is byte-identical to pre-#247 runs: exactly the
         # same keys, no lifecycle invokes (template stays runner-emitted).
