@@ -6,8 +6,10 @@ from conftest import point_words as _point_words
 
 from zagg.stats.tdigest import (
     build_tdigest,
+    build_tdigest_pairwise,
     cdf_from_tdigest,
     merge_tdigests,
+    merge_tdigests_kway,
     quantile_from_tdigest,
 )
 
@@ -557,3 +559,121 @@ class TestCdfFromTDigest:
             x = quantile_from_tdigest(digest, q)
             frac = cdf_from_tdigest(digest, x) / total
             assert abs(frac - q) < 0.03, f"q={q}: round-trip frac={frac:.4f}"
+
+
+class TestMergeTDigestsKway:
+    """The order-independent k-way fold (issue #279)."""
+
+    @staticmethod
+    def _digests(seed, k, delta=256):
+        rng = np.random.default_rng(seed)
+        # Enough obs per digest (well past δ) that the k-way vs pairwise fold
+        # actually compresses — the loss-free regime makes them coincide.
+        return [build_tdigest(rng.standard_normal(4000), delta=delta) for _ in range(k)]
+
+    def test_order_independent(self):
+        ds = self._digests(1, 6)
+        ref = merge_tdigests_kway(ds, delta=256)
+        assert np.array_equal(ref, merge_tdigests_kway(list(reversed(ds)), delta=256))
+        for perm in ([2, 0, 4, 1, 5, 3], [5, 4, 3, 2, 1, 0], [1, 3, 5, 0, 2, 4]):
+            assert np.array_equal(ref, merge_tdigests_kway([ds[i] for i in perm], delta=256))
+
+    def test_pairwise_fold_is_order_dependent(self):
+        """Contrast: the pairwise left-fold is NOT associative (issue #279)."""
+        ds = self._digests(2, 6)
+
+        def fold(seq):
+            held = None
+            for d in seq:
+                held = d if held is None else merge_tdigests(held, d, delta=256)
+            return held
+
+        fwd, rev = fold(ds), fold(list(reversed(ds)))
+        assert not np.array_equal(fwd, rev)  # order matters for pairwise
+
+    def test_kway_differs_from_pairwise_past_two(self):
+        """3+ compressing digests: k-way (single pass) ≠ pairwise left-fold."""
+        ds = self._digests(3, 3)
+        kway = merge_tdigests_kway(ds, delta=256)
+        pair = merge_tdigests(merge_tdigests(ds[0], ds[1], delta=256), ds[2], delta=256)
+        assert not np.array_equal(kway, pair)
+
+    def test_weights_sum_to_total(self):
+        ds = self._digests(4, 5)
+        merged = merge_tdigests_kway(ds, delta=256)
+        expected = sum(float(d[:, 1].sum()) for d in ds)
+        np.testing.assert_almost_equal(float(merged[:, 1].sum()), expected, decimal=2)
+
+    def test_centroid_count_bounded(self):
+        ds = self._digests(5, 8, delta=128)
+        merged = merge_tdigests_kway(ds, delta=128)
+        assert len(merged) <= 4 * 128
+
+    def test_means_sorted(self):
+        merged = merge_tdigests_kway(self._digests(6, 4), delta=256)
+        assert np.all(merged[1:, 0] >= merged[:-1, 0])
+
+    def test_empty_list(self):
+        out = merge_tdigests_kway([])
+        assert out.shape == (0, 2) and out.dtype == np.dtype("float32")
+
+    def test_all_empty(self):
+        empty = np.empty((0, 2), dtype=np.float32)
+        out = merge_tdigests_kway([empty, empty])
+        assert out.shape == (0, 2)
+
+    def test_single_nonempty_returned_as_is(self):
+        d = build_tdigest(np.arange(10.0))
+        out = merge_tdigests_kway([d])
+        np.testing.assert_array_equal(out, d.astype(np.float32))
+
+    def test_skips_empty_digests(self):
+        d1 = build_tdigest(np.arange(100.0), delta=64)
+        d2 = build_tdigest(np.arange(100.0, 200.0), delta=64)
+        empty = np.empty((0, 2), dtype=np.float32)
+        with_gaps = merge_tdigests_kway([empty, d1, empty, d2, empty], delta=64)
+        clean = merge_tdigests_kway([d1, d2], delta=64)
+        np.testing.assert_array_equal(with_gaps, clean)
+
+    def test_matches_one_shot_quantiles_within_tolerance(self):
+        rng = np.random.default_rng(11)
+        parts_raw = [rng.standard_normal(4000) for _ in range(5)]
+        pooled = np.concatenate(parts_raw)
+        merged = merge_tdigests_kway([build_tdigest(p, delta=512) for p in parts_raw], delta=512)
+        for q in (0.1, 0.5, 0.9):
+            assert abs(quantile_from_tdigest(merged, q) - float(np.quantile(pooled, q))) < 0.05
+
+    def test_located_channel_contains_contributors(self):
+        (d1, l1), (d2, l2) = (
+            build_tdigest(np.linspace(0, 1, 40), delta=4, locations=_point_words(40, seed=1)),
+            build_tdigest(np.linspace(0, 1, 40), delta=4, locations=_point_words(40, seed=2)),
+        )
+        merged, locs = merge_tdigests_kway([d1, d2], delta=4, locations=[l1, l2])
+        assert locs.dtype == np.uint64 and len(locs) == len(merged)
+        for member in np.concatenate([l1, l2]):
+            assert any(_contains(enclosing, member) for enclosing in locs)
+
+    def test_located_length_mismatch_raises(self):
+        d = build_tdigest(np.arange(10.0))
+        with pytest.raises(ValueError, match="does not match|arrays but digests"):
+            merge_tdigests_kway([d, d], locations=[np.empty(len(d), dtype=np.uint64)])
+
+
+class TestBuildTDigestPairwise:
+    """The pairwise-fold reducer variant (issue #279) — identical build output."""
+
+    def test_output_identical_to_standard(self):
+        rng = np.random.default_rng(21)
+        vals = rng.standard_normal(3000)
+        for delta in (8, 128, 512):
+            np.testing.assert_array_equal(
+                build_tdigest_pairwise(vals, delta=delta), build_tdigest(vals, delta=delta)
+            )
+
+    def test_located_output_identical_to_standard(self):
+        vals = np.linspace(0.0, 1.0, 200)
+        locs = _point_words(200, seed=3)
+        d_p, l_p = build_tdigest_pairwise(vals, delta=32, locations=locs)
+        d_s, l_s = build_tdigest(vals, delta=32, locations=locs)
+        np.testing.assert_array_equal(d_p, d_s)
+        np.testing.assert_array_equal(l_p, l_s)

@@ -55,7 +55,12 @@ from zagg.config import (
     get_data_vars,
     get_output_signature,
 )
-from zagg.stats.tdigest import _DEFAULT_DELTA, build_tdigest, merge_tdigests
+from zagg.stats.tdigest import (
+    _DEFAULT_DELTA,
+    build_tdigest,
+    merge_tdigests,
+    merge_tdigests_kway,
+)
 
 #: Floor for the spill-enable /tmp check: below this, even a degraded
 #: many-block run is pointless — fail at config time instead of thrashing.
@@ -433,12 +438,18 @@ class SpillAggregator:
         except ValueError:
             self._mergeable = False
         self._count_fields: list[str] = []
-        self._digest_fields: dict[str, tuple[str, int]] = {}  # name -> (source, delta)
+        # name -> (source, delta, pairwise). ``pairwise`` selects the cross-block
+        # fold law: False -> order-independent k-way (build_tdigest, the default),
+        # True -> pairwise left-fold (build_tdigest_pairwise). See issue #279.
+        self._digest_fields: dict[str, tuple[str, int, bool]] = {}
         if self._mergeable:
+            from zagg.processing.streaming import _TDIGEST_PAIRWISE_FUNCTION
+
             for name, meta in agg_fields.items():
                 if get_output_signature(meta)["kind"] == "ragged":
                     delta = int((meta.get("params") or {}).get("delta", _DEFAULT_DELTA))
-                    self._digest_fields[name] = (meta.get("source") or "h_li", delta)
+                    pairwise = meta.get("function") == _TDIGEST_PAIRWISE_FUNCTION
+                    self._digest_fields[name] = (meta.get("source") or "h_li", delta, pairwise)
                 else:
                     self._count_fields.append(name)
         if hasattr(grid, "chunk_order") and int(getattr(grid, "chunks_per_shard", 1)) > 1:
@@ -465,6 +476,13 @@ class SpillAggregator:
         # Cross-block mergeable running state (only ever fed on block close).
         self._counts: dict[int, int] = {}
         self._digests: dict[str, dict[int, np.ndarray]] = {n: {} for n in self._digest_fields}
+        # k-way fold accumulator: for order-independent fields, each block's
+        # per-cell digest is stashed here and collapsed once at finalize
+        # (merge_tdigests_kway), rather than pairwise-folded per block. Each part
+        # is a saturated per-block digest and blocks are few, so this stays small.
+        self._digest_parts: dict[str, dict[int, list[np.ndarray]]] = {
+            n: {} for n, (_, _, pairwise) in self._digest_fields.items() if not pairwise
+        }
         # Per-flush unique cell words; unioned lazily by occupied_cells().
         self._occupied: list[np.ndarray] = []
         # Single-block reduce cache: (part_key, col_arrays, cell_to_slice) for
@@ -598,10 +616,12 @@ class SpillAggregator:
     def _fold_block(self, block: SpillBlock) -> None:
         """Fold one block into the running mergeable state, per partition.
 
-        This is the StreamingAggregator merge sequence at block granularity:
-        counts by summation (exact), tdigests built fresh per cell and merged
-        under the field's delta — one merge round per block instead of per
-        buffer, which is the ~6x merge-CPU collapse the design targets.
+        Counts fold by summation (exact). tdigests are built fresh per cell and
+        then, per the field's fold law: **k-way** fields stash the block digest
+        for one order-independent collapse at finalize (:meth:`_finalize_kway`);
+        **pairwise** fields merge it into the running digest here. Either way it
+        is one build round per block instead of per buffer — the ~6x merge-CPU
+        collapse the design targets (issue #279).
         """
         from zagg.processing.aggregate import _group_columns
 
@@ -613,12 +633,30 @@ class SpillAggregator:
             del cells, cols
             for cell, (start, end) in cell_to_slice.items():
                 self._counts[cell] = self._counts.get(cell, 0) + (end - start)
-                for name, (source, delta) in self._digest_fields.items():
+                for name, (source, delta, pairwise) in self._digest_fields.items():
                     fresh = build_tdigest(col_arrays[source][start:end], delta=delta)
-                    held = self._digests[name].get(cell)
-                    self._digests[name][cell] = (
-                        fresh if held is None else merge_tdigests(held, fresh, delta=delta)
-                    )
+                    if pairwise:
+                        held = self._digests[name].get(cell)
+                        self._digests[name][cell] = (
+                            fresh if held is None else merge_tdigests(held, fresh, delta=delta)
+                        )
+                    else:
+                        self._digest_parts[name].setdefault(cell, []).append(fresh)
+
+    def _finalize_kway(self) -> None:
+        """Collapse each k-way field's per-block parts into one digest per cell.
+
+        Runs once, after the final block is folded and before the first emission.
+        The single-pass k-way merge is order-independent (t-digest merge is not
+        associative), so the result does not depend on block reduce order — the
+        property #280 relies on to parallelize the reducer.
+        """
+        for name, cell_parts in self._digest_parts.items():
+            delta = self._digest_fields[name][1]
+            dest = self._digests[name]
+            for cell, parts in cell_parts.items():
+                dest[cell] = merge_tdigests_kway(parts, delta=delta)
+            cell_parts.clear()
 
     # -- post-read emission ----------------------------------------------------
 
@@ -640,6 +678,7 @@ class SpillAggregator:
         key = int(partition_ids(self.grid, children[:1])[0]) if len(children) else 0
         if self._loaded is None or self._loaded[0] != key:
             self._load_partition(key)
+        assert self._loaded is not None  # _load_partition always sets it before returning
         _, col_arrays, cell_to_slice = self._loaded
         chunk_pooled = _pool_chunk_columns(col_arrays, cell_to_slice, children)
         chunk_scalars = _eval_chunk_precompute(self.config, chunk_pooled)
@@ -688,12 +727,14 @@ class SpillAggregator:
         if not self._finalized:
             # Join the in-flight overlap reduce (its failure re-raises here),
             # then fold the final (still-open, never threshold-closed) block
-            # into the running state once, before the first emission.
+            # into the running state once, before the first emission. The k-way
+            # collapse runs after every block is folded so it sees all parts.
             self._join_reducer()
             try:
                 self._fold_block(self._block)
             finally:
                 self._block.close()
+            self._finalize_kway()
             self._finalized = True
         children = np.asarray(children)
         n_cells = len(children)

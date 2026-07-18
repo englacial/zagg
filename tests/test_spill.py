@@ -296,6 +296,13 @@ def _base_variables(delta=256):
     }
 
 
+def _pairwise_variables(delta=256):
+    """Like :func:`_base_variables` but the pairwise-fold reducer (issue #279)."""
+    variables = _base_variables(delta=delta)
+    variables["h_tdigest"]["function"] = "zagg.stats.tdigest.build_tdigest_pairwise"
+    return variables
+
+
 def _config(streaming=None, variables=None, chunk_precompute=None):
     agg = {"variables": variables or _base_variables()}
     if streaming is not None:
@@ -704,10 +711,11 @@ class TestSpillWorkerMultiBlock:
         # Every flush crosses the threshold -> one closed block per flush.
         monkeypatch.setattr("zagg.processing.spill._default_block_bytes", lambda k, tmp_dir=None: 1)
 
-    def test_mergeable_multi_block_byte_identical_to_merge_mode(self, monkeypatch):
-        # One block per flush == one merge round per flush: exactly merge
-        # mode's per-cell build+merge sequence, so the bytes must match it
-        # (and counts stay exact by summation).
+    def test_pairwise_multi_block_byte_identical_to_merge_mode(self, monkeypatch):
+        # The pairwise reducer folds identically per block on both paths, so
+        # spill multi-block must match merge mode byte-for-byte — even when the
+        # fold actually compresses (δ=16 with ~150 obs on the busiest cells, so
+        # this is not the loss-free regime where every law coincides). See #279.
         self._force_tiny_blocks(monkeypatch)
         key = _shard_key()
         results = []
@@ -715,7 +723,7 @@ class TestSpillWorkerMultiBlock:
             {"buffer_granules": 2, "mode": "merge"},
             {"buffer_granules": 2, "mode": "spill"},
         ):
-            cfg = _config(streaming=streaming)
+            cfg = _config(streaming=streaming, variables=_pairwise_variables(delta=16))
             grid = _grid(cfg)
             dfs = _granule_dfs(grid, key, _CELL_LISTS, seed=9)
             results.append(_run(monkeypatch, cfg, grid, key, dfs))
@@ -726,8 +734,54 @@ class TestSpillWorkerMultiBlock:
         vals_m, idx_m = ragged_m["h_tdigest"]
         vals_s, idx_s = ragged_s["h_tdigest"]
         assert idx_m == idx_s
+        # At least one cell spans 3 blocks and compresses, so this is a real test.
+        assert any(float(a[:, 1].sum()) > 16 * 1.27 for a in vals_s)
         for a, b in zip(vals_m, vals_s, strict=True):
             np.testing.assert_array_equal(a, b)
+
+    def test_standard_kway_diverges_from_pairwise_multi_block(self, monkeypatch):
+        # Intended #279 behavior: the standard (k-way) reducer folds a cell's
+        # 3+ blocks in one pass, the pairwise reducer folds them left-to-right,
+        # so the ragged bytes differ on the busiest cells — while counts (exact
+        # by summation) stay identical between the two.
+        self._force_tiny_blocks(monkeypatch)
+        key = _shard_key()
+        out = {}
+        for tag, variables in (("std", _base_variables(delta=16)), ("pw", _pairwise_variables(16))):
+            cfg = _config(streaming={"buffer_granules": 2, "mode": "spill"}, variables=variables)
+            grid = _grid(cfg)
+            dfs = _granule_dfs(grid, key, _CELL_LISTS, seed=9)
+            out[tag] = _run(monkeypatch, cfg, grid, key, dfs)
+        (df_std, ragged_std, _), (df_pw, ragged_pw, _) = out["std"], out["pw"]
+        pd.testing.assert_series_equal(df_std["count"], df_pw["count"])  # counts unchanged
+        vals_std, idx_std = ragged_std["h_tdigest"]
+        vals_pw, idx_pw = ragged_pw["h_tdigest"]
+        assert idx_std == idx_pw
+        assert any(not np.array_equal(a, b) for a, b in zip(vals_std, vals_pw, strict=True)), (
+            "k-way and pairwise should diverge on the multi-block cells"
+        )
+
+    def test_standard_kway_multi_block_tracks_pooled_quantiles(self, monkeypatch):
+        # Correctness: the standard k-way fold over many blocks estimates the
+        # same quantiles (within t-digest tolerance) as a one-shot pooled build.
+        from zagg.stats.tdigest import quantile_from_tdigest
+
+        self._force_tiny_blocks(monkeypatch)
+        key = _shard_key()
+        pooled_cfg = _config()  # no streaming -> one-shot pooled build per cell
+        spill_cfg = _config(streaming={"buffer_granules": 2, "mode": "spill"})
+        grid_p, grid_s = _grid(pooled_cfg), _grid(spill_cfg)
+        dfs = _granule_dfs(grid_p, key, _CELL_LISTS, obs_per_cell=200, seed=4)
+        _, ragged_p, _ = _run(monkeypatch, pooled_cfg, grid_p, key, list(dfs))
+        _, ragged_s, _ = _run(monkeypatch, spill_cfg, grid_s, key, list(dfs))
+        vals_p, idx_p = ragged_p["h_tdigest"]
+        vals_s, idx_s = ragged_s["h_tdigest"]
+        assert idx_p == idx_s
+        by_cell_p = dict(zip(idx_p, vals_p, strict=True))
+        for cell_i, ds in zip(idx_s, vals_s, strict=True):
+            dp = by_cell_p[cell_i]
+            for q in (0.1, 0.5, 0.9):
+                assert abs(quantile_from_tdigest(ds, q) - quantile_from_tdigest(dp, q)) < 1.0
 
     def test_multi_block_actually_engaged_and_counts_exact(self, monkeypatch):
         self._force_tiny_blocks(monkeypatch)

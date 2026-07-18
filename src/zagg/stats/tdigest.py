@@ -73,12 +73,16 @@ array. See ``zagg/configs/atl03_tdigest_located_healpix.yaml``.
 
 from __future__ import annotations
 
+from typing import overload
+
 import numpy as np
 
 __all__ = [
     "build_tdigest",
+    "build_tdigest_pairwise",
     "cdf_from_tdigest",
     "merge_tdigests",
+    "merge_tdigests_kway",
     "quantile_from_tdigest",
 ]
 
@@ -174,6 +178,12 @@ def _centroid_ancestors(locations: np.ndarray, starts: list[int], n: int) -> np.
     return out
 
 
+@overload
+def build_tdigest(values: np.ndarray, delta: int = ..., locations: None = ...) -> np.ndarray: ...
+@overload
+def build_tdigest(
+    values: np.ndarray, delta: int = ..., *, locations: np.ndarray
+) -> tuple[np.ndarray, np.ndarray]: ...
 def build_tdigest(
     values: np.ndarray,
     delta: int = _DEFAULT_DELTA,
@@ -261,6 +271,19 @@ def build_tdigest(
     return out
 
 
+@overload
+def merge_tdigests(
+    d1: np.ndarray, d2: np.ndarray, delta: int = ..., locations1: None = ..., locations2: None = ...
+) -> np.ndarray: ...
+@overload
+def merge_tdigests(
+    d1: np.ndarray,
+    d2: np.ndarray,
+    delta: int = ...,
+    *,
+    locations1: np.ndarray,
+    locations2: np.ndarray,
+) -> tuple[np.ndarray, np.ndarray]: ...
 def merge_tdigests(
     d1: np.ndarray,
     d2: np.ndarray,
@@ -350,6 +373,109 @@ def merge_tdigests(
     if combined_locs is not None:
         return out, _centroid_ancestors(combined_locs, starts.tolist(), len(combined))
     return out
+
+
+@overload
+def merge_tdigests_kway(
+    digests: list[np.ndarray], delta: int = ..., locations: None = ...
+) -> np.ndarray: ...
+@overload
+def merge_tdigests_kway(
+    digests: list[np.ndarray], delta: int = ..., *, locations: list[np.ndarray]
+) -> tuple[np.ndarray, np.ndarray]: ...
+def merge_tdigests_kway(
+    digests: list[np.ndarray],
+    delta: int = _DEFAULT_DELTA,
+    locations: list[np.ndarray] | None = None,
+) -> np.ndarray | tuple[np.ndarray, np.ndarray]:
+    """Merge many t-digests in one pass — **order-independent**.
+
+    Concatenates every centroid array, sorts by mean once, and re-compresses
+    under the k1 budget. Unlike a left-fold of pairwise :func:`merge_tdigests`,
+    the result does **not** depend on the order the digests are combined (t-digest
+    merge is not associative), and it holds the centroid count at the δ budget
+    instead of drifting above it (issue #279). This is the fold law for the
+    standard ``build_tdigest`` reducer on the spill path, where each input is a
+    saturated per-block digest and the block count is small.
+
+    Parameters
+    ----------
+    digests : list of ndarray
+        Centroid arrays ``(k, 2)`` as returned by :func:`build_tdigest`. Empty
+        digests are skipped.
+    delta : int, optional
+        Compression parameter (same default as :func:`build_tdigest`).
+    locations : list of ndarray, optional
+        Per-digest ``uint64`` morton location vectors (issue #87), aligned with
+        ``digests`` (one array per digest, each aligned with that digest's
+        centroids). Pass for the located channel or omit entirely. All folded
+        locations must share a HEALPix base cell (mortie raises otherwise).
+
+    Returns
+    -------
+    ndarray, shape (k_merged, 2), dtype float32
+        Merged, re-compressed centroid array. With ``locations``, returns a
+        ``(digest, locs)`` tuple.
+    """
+    located = locations is not None
+    if locations is not None and len(locations) != len(digests):
+        raise ValueError(f"locations has {len(locations)} arrays but digests has {len(digests)}")
+    arrs: list[np.ndarray] = []
+    locs: list[np.ndarray] = []
+    for i, d in enumerate(digests):
+        d = np.asarray(d, dtype=np.float64)
+        if d.size == 0:
+            continue
+        arrs.append(d)
+        if locations is not None:
+            li = np.asarray(locations[i])
+            if li.dtype != np.uint64:
+                raise ValueError(
+                    f"locations[{i}] dtype {li.dtype} is not uint64; pass packed morton words"
+                )
+            if li.shape != (len(d),):
+                raise ValueError(
+                    f"locations[{i}] shape {li.shape} does not match {len(d)} centroids"
+                )
+            locs.append(li)
+
+    if not arrs:
+        empty = np.empty((0, 2), dtype=np.float32)
+        return (empty, np.empty(0, dtype=np.uint64)) if located else empty
+    if len(arrs) == 1:
+        # A single contributor is already a valid digest; no re-compression, and
+        # copy the location channel so the return never aliases the caller.
+        out = arrs[0].astype(np.float32)
+        return (out, locs[0].copy()) if located else out
+
+    combined = np.concatenate(arrs, axis=0)
+    order = np.argsort(combined[:, 0], kind="stable")
+    combined = combined[order]
+    out_means, out_weights, starts = _compress(combined[:, 0], combined[:, 1], float(delta))
+    out = np.empty((len(out_means), 2), dtype=np.float32)
+    out[:, 0] = out_means
+    out[:, 1] = out_weights
+    if located:
+        combined_locs = np.concatenate(locs)[order]
+        return out, _centroid_ancestors(combined_locs, starts.tolist(), len(combined))
+    return out
+
+
+def build_tdigest_pairwise(
+    values: np.ndarray,
+    delta: int = _DEFAULT_DELTA,
+    locations: np.ndarray | None = None,
+) -> np.ndarray | tuple[np.ndarray, np.ndarray]:
+    """t-digest build whose cross-block fold uses the **pairwise** merge law.
+
+    Output is identical to :func:`build_tdigest` — the difference is downstream,
+    in the spill reducer: ``build_tdigest_pairwise`` fields fold with a pairwise
+    left-fold of :func:`merge_tdigests` (order-dependent, drifts above the δ
+    budget, marginally finer far tail), whereas ``build_tdigest`` folds with the
+    order-independent :func:`merge_tdigests_kway`. This reducer preserves the
+    pre-#279 end-to-end fold semantics for anyone who wants them.
+    """
+    return build_tdigest(values, delta=delta, locations=locations)
 
 
 def quantile_from_tdigest(digest: np.ndarray, q: float) -> float:

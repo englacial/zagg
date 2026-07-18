@@ -119,6 +119,16 @@ class TestStreamingConfig:
         with pytest.raises(ValueError, match="merge law"):
             validate_streaming(cfg)
 
+    def test_pairwise_tdigest_reducer_is_streamable(self):
+        # build_tdigest_pairwise carries the pairwise merge law (issue #279),
+        # so it must validate as a mergeable ragged reducer just like the
+        # standard build_tdigest.
+        cfg = _config()
+        cfg.aggregation["variables"]["h_tdigest"]["function"] = (
+            "zagg.stats.tdigest.build_tdigest_pairwise"
+        )
+        validate_streaming(cfg)
+
     def test_located_ragged_rejected(self):
         # The located channel (issue #87) is not threaded through the
         # streaming state yet; reject rather than silently drop it.
