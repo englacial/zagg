@@ -17,7 +17,7 @@ refuse non-mergeable configs loudly.
 Byte-equality tests pin ``shard_workers: 1``: the granule thread pool drains
 the shared fake-read iterator from worker threads, so which granule gets
 which frame is scheduling-dependent and buffer/pool composition varies run to
-run (see tests/test_streaming.py::TestArenaLayout._ab).
+run (a trap first hit in the issue #217 arena A/B tests).
 """
 
 import tempfile
@@ -411,16 +411,11 @@ class TestSpillConfig:
         with pytest.raises(ValueError, match="mode"):
             get_streaming(_config(streaming={"mode": bad}))
 
-    @pytest.mark.parametrize(
-        "block",
-        [
-            {"mode": "spill", "state_layout": "arena"},
-            {"mode": "spill", "state_layout": "arena", "arena_backing": "tmp"},
-        ],
-    )
-    def test_spill_rejects_arena_knobs(self, block):
-        with pytest.raises(ValueError, match="spill takes no state_layout"):
-            get_streaming(_config(streaming=block))
+    def test_removed_arena_knobs_rejected_with_spill(self):
+        # The #260 knobs are gone (phase 6); a stale arena config must fail
+        # loudly as an unknown key, never silently run.
+        with pytest.raises(ValueError, match="unknown key"):
+            get_streaming(_config(streaming={"mode": "spill", "state_layout": "arena"}))
 
     def test_non_mergeable_config_is_accepted_by_spill(self):
         # The whole point of spill: reducers merge-mode validation rejects are

@@ -321,14 +321,7 @@ def process_shard(
     if spill_mode:
         buffered = SpillAggregator(config, grid, handoff, streaming_cfg["buffer_granules"])
     elif streaming_cfg is not None:
-        buffered = StreamingAggregator(
-            config,
-            grid,
-            handoff,
-            streaming_cfg["buffer_granules"],
-            state_layout=streaming_cfg["state_layout"],
-            arena_backing=streaming_cfg["arena_backing"],
-        )
+        buffered = StreamingAggregator(config, grid, handoff, streaming_cfg["buffer_granules"])
     else:
         buffered = None
 
@@ -586,7 +579,7 @@ def process_shard(
 
     # Occupied-cell sink (issue #200): both paths already hold the shard's
     # populated cell words — ``cell_to_slice`` pooled, the streaming running
-    # state merged (dict counts or arena cell ids, via ``occupied_cells``) — so
+    # state merged (via ``occupied_cells``) — so
     # the occupied set is in hand with no extra observation pass.
     if occupied_out is not None:
         if buffered is not None:
