@@ -1266,3 +1266,363 @@ class TestRasterHiveIdempotency:
         names = {p.name for p in store.rglob("*")}
         assert "morton_hive.json" not in names
         assert "coverage.moc" not in names
+
+
+class TestInvokeLambdaRaster:
+    """Sync/async transport of ``_invoke_lambda_raster`` (issue #218/#286).
+
+    The raster twin of ``TestInvokeLambdaCell``: the sync path reads the worker
+    envelope off the ``RequestResponse`` payload (byte-identical to the pre-#286
+    transport); the async path (``result_url``) flips to a fire-and-forget
+    ``Event`` invoke and polls the worker-mirrored result object. A
+    ``FunctionError`` / non-200 is a deterministic shard error, never retried;
+    only transient client-side invoke faults back off.
+    """
+
+    _EVENT = {
+        "mode": "process_raster",
+        "shard_key": 12345,
+        "granules": [{"assets": {"red": "s3://b/t0.tif"}, "time_key": "dt-1"}],
+        "config": {"data_source": {"reader": "raster"}},
+        "store_path": "s3://out/x.zarr",
+    }
+
+    def _client(self, body=None, status=200, function_error=False):
+        import io
+        from unittest.mock import MagicMock
+
+        client = MagicMock()
+        if function_error:
+            payload = MagicMock()
+            payload.read.return_value = b"Task timed out after 900.00 seconds"
+            client.invoke.return_value = {"FunctionError": "Unhandled", "Payload": payload}
+        else:
+            body = body if body is not None else {"timesteps": 2, "duration_s": 1.5}
+            env = {"statusCode": status, "body": json.dumps(body)}
+            client.invoke.return_value = {"Payload": io.BytesIO(json.dumps(env).encode())}
+        return client
+
+    def test_sync_reads_response_and_omits_result_url(self):
+        from zagg import runner
+
+        client = self._client(body={"timesteps": 2, "duration_s": 1.5})
+        result = runner._invoke_lambda_raster(
+            client, dict(self._EVENT), function_name="process-shard"
+        )
+        event = json.loads(client.invoke.call_args.kwargs["Payload"])
+        assert client.invoke.call_args.kwargs["InvocationType"] == "RequestResponse"
+        assert "result_url" not in event  # byte-identical to the pre-#286 event
+        assert result == {"error": None, "body": {"timesteps": 2, "duration_s": 1.5}}
+
+    def test_sync_function_error_is_shard_error_not_retried(self):
+        from zagg import runner
+
+        client = self._client(function_error=True)
+        result = runner._invoke_lambda_raster(
+            client, dict(self._EVENT), function_name="process-shard", max_retries=3
+        )
+        assert client.invoke.call_count == 1  # deterministic, never retried (#119)
+        assert result["body"] == {}
+        assert "Lambda error" in result["error"]
+
+    def test_sync_non_200_surfaces_body_error(self):
+        from zagg import runner
+
+        client = self._client(body={"error": "boom"}, status=500)
+        result = runner._invoke_lambda_raster(
+            client, dict(self._EVENT), function_name="process-shard"
+        )
+        assert result["error"] == "boom"
+        assert result["body"] == {"error": "boom"}
+
+    def test_async_event_invoke_carries_result_url_and_polls(self):
+        from zagg import runner
+
+        client = self._client()  # sync payload is ignored on the async path
+        fetched = (
+            {"statusCode": 200, "body": json.dumps({"timesteps": 2, "duration_s": 2.0})},
+            None,
+        )
+        result = runner._invoke_lambda_raster(
+            client,
+            dict(self._EVENT),
+            function_name="process-shard",
+            result_url="s3://out/x.zarr.status/run1/12345.json",
+            result_fetch=lambda: fetched,
+            poll_timeout_s=10,
+        )
+        event = json.loads(client.invoke.call_args.kwargs["Payload"])
+        assert client.invoke.call_args.kwargs["InvocationType"] == "Event"
+        assert event["result_url"] == "s3://out/x.zarr.status/run1/12345.json"
+        assert result == {"error": None, "body": {"timesteps": 2, "duration_s": 2.0}}
+
+    def test_async_tolerates_result_landing_after_a_delay(self, monkeypatch):
+        from zagg import runner
+
+        monkeypatch.setattr(runner.time, "sleep", lambda *a: None)
+        landed = {"statusCode": 200, "body": json.dumps({"timesteps": 2})}
+        seen = {"n": 0}
+
+        def fetch():
+            seen["n"] += 1
+            return (landed, None) if seen["n"] >= 3 else None  # two misses, then lands
+
+        client = self._client()
+        result = runner._invoke_lambda_raster(
+            client,
+            dict(self._EVENT),
+            function_name="process-shard",
+            result_url="s3://out/x.zarr.status/run1/12345.json",
+            result_fetch=fetch,
+            poll_timeout_s=30,
+        )
+        assert client.invoke.call_count == 1  # ONE Event invoke, then polled
+        assert seen["n"] >= 3
+        assert result["body"] == {"timesteps": 2}
+
+    def test_async_missing_result_at_deadline_is_error_without_reinvoke(self):
+        from zagg import runner
+
+        client = self._client()
+        result = runner._invoke_lambda_raster(
+            client,
+            dict(self._EVENT),
+            function_name="process-shard",
+            result_url="s3://out/x.zarr.status/run1/12345.json",
+            result_fetch=lambda: None,  # never lands
+            poll_timeout_s=0.0,  # first miss is already past the deadline
+        )
+        assert client.invoke.call_count == 1  # a still-running shard is NOT re-dispatched
+        assert result["body"] == {}
+        assert "no worker result" in result["error"]
+
+    def test_async_oversized_payload_raises_before_dispatch(self):
+        from zagg import runner
+
+        fat = dict(
+            self._EVENT,
+            granules=[{"blob": "x" * (runner._ASYNC_PAYLOAD_CAP_BYTES + 1)}],
+        )
+        client = self._client()
+        with pytest.raises(ValueError, match="async dispatch budget"):
+            runner._invoke_lambda_raster(
+                client,
+                fat,
+                function_name="process-shard",
+                result_url="s3://out/x.zarr.status/run1/12345.json",
+                result_fetch=lambda: None,
+                poll_timeout_s=10,
+            )
+        client.invoke.assert_not_called()
+
+    def test_async_transient_invoke_fault_retries_then_polls(self, monkeypatch):
+        from zagg import runner
+
+        monkeypatch.setattr(runner.time, "sleep", lambda *a: None)
+        client = self._client()
+        client.invoke.side_effect = [
+            Exception("Connection reset by peer"),  # transient -> retry
+            {"StatusCode": 202},  # Event accepted
+        ]
+        fetched = ({"statusCode": 200, "body": json.dumps({"timesteps": 1})}, None)
+        result = runner._invoke_lambda_raster(
+            client,
+            dict(self._EVENT),
+            function_name="process-shard",
+            max_retries=3,
+            result_url="s3://out/x.zarr.status/run1/12345.json",
+            result_fetch=lambda: fetched,
+            poll_timeout_s=10,
+        )
+        assert client.invoke.call_count == 2
+        assert result == {"error": None, "body": {"timesteps": 1}}
+
+
+class TestRasterLambdaAsyncBackend:
+    """Async shard fan-out (issue #286): the DEFAULT lambda raster transport.
+
+    Each shard fires ``InvocationType="Event"`` and the dispatcher polls a
+    per-shard result object the worker mirrors, so a shard longer than a GitHub
+    runner's ~4 min NAT idle tolerance no longer severs the dispatcher. The
+    ping/setup lifecycle stays synchronous so the load-bearing template write
+    lands before fan-out (issue #264). A real run's poll reads S3; here an
+    in-memory result box (a patched ``_result_fetcher``) stands in -- no AWS,
+    no obstore.
+    """
+
+    def _wire(self, monkeypatch, proc_body, *, delay=0, timeout=720):
+        import io
+
+        import boto3
+
+        import zagg.runner as runner_mod
+
+        results: dict = {}
+        calls: list = []  # (mode, InvocationType)
+        events: list = []
+
+        def _envelope(body):
+            raw = json.dumps({"statusCode": 200, "body": json.dumps(body)}).encode()
+            return {"Payload": io.BytesIO(raw)}
+
+        class _AsyncFake:
+            def invoke(self, **kwargs):
+                event = json.loads(kwargs["Payload"])
+                mode = event.get("mode")
+                calls.append((mode, kwargs["InvocationType"]))
+                events.append(event)
+                if mode == "ping":
+                    return _envelope({"ok": True, "mode": "ping", "zagg_version": "test"})
+                if mode == "setup":
+                    return _envelope(
+                        {
+                            "ok": True,
+                            "mode": "setup",
+                            "pipeline": "raster",
+                            "timesteps": len(event.get("times_us", [])),
+                        }
+                    )
+                if mode == "finalize":
+                    return _envelope({"ok": True, "mode": "finalize", "layout": "hive"})
+                if mode == "coverage":
+                    return {"StatusCode": 202, "Payload": io.BytesIO(b"")}
+                # #286: the shard fan-out is fire-and-forget Event + result_url.
+                assert mode == "process_raster"
+                assert kwargs["InvocationType"] == "Event"
+                assert event.get("result_url")
+                results[event["result_url"]] = proc_body(event)
+                return {"StatusCode": 202, "Payload": io.BytesIO(b"")}
+
+            def get_function_configuration(self, **kwargs):
+                return {"Timeout": timeout}
+
+        fake = _AsyncFake()
+        fake.results, fake.calls, fake.events = results, calls, events  # type: ignore[attr-defined]
+        monkeypatch.setattr(boto3, "client", lambda *a, **k: fake)
+
+        miss: dict = {}
+
+        def fake_fetcher(box, prefix, creds, region, key):
+            url = f"{prefix}/{key}"
+
+            def fetch():
+                if miss.get(url, 0) < delay:
+                    miss[url] = miss.get(url, 0) + 1
+                    return None
+                resp = results.get(url)
+                return (resp, None) if resp is not None else None
+
+            return fetch
+
+        monkeypatch.setattr(runner_mod, "_result_fetcher", fake_fetcher)
+        monkeypatch.setattr(runner_mod.time, "sleep", lambda *a: None)
+        return fake
+
+    def _flat_body(self, event):
+        return {
+            "statusCode": 200,
+            "body": json.dumps(
+                {"timesteps": len(event["time_index"]), "cells_with_data": 4096, "duration_s": 3.0}
+            ),
+        }
+
+    def test_default_async_threads_result_channel(self, manifest, monkeypatch):
+        cfg, sm_path, _shard, _data = manifest
+        fake = self._wire(monkeypatch, self._flat_body)
+        summary = agg(
+            cfg, catalog=sm_path, store="s3://bucket/out.zarr", backend="lambda", max_workers=2
+        )
+        # Lifecycle stays synchronous; ONLY the shard fan-out is Event (#264/#286).
+        assert fake.calls == [
+            ("ping", "RequestResponse"),
+            ("setup", "RequestResponse"),
+            ("process_raster", "Event"),
+        ]
+        proc = fake.events[-1]
+        assert proc["result_url"].startswith("s3://bucket/out.zarr.status/")
+        assert proc["result_url"].endswith(".json")
+        # Summary reads back from the polled result object, same shape as sync.
+        assert summary["backend"] == "lambda"
+        assert summary["cells_with_data"] == 1 and summary["cells_error"] == 0
+        assert summary["total_obs"] == 2
+        assert summary["lambda_time_s"] == 3.0
+
+    def test_result_object_named_by_shard_label(self, manifest, monkeypatch):
+        import zagg.runner as runner_mod
+
+        cfg, sm_path, shard, _data = manifest
+        fake = self._wire(monkeypatch, self._flat_body)
+        agg(cfg, catalog=sm_path, store="s3://bucket/out.zarr", backend="lambda", max_workers=2)
+        grid = from_config(cfg)
+        proc = fake.events[-1]
+        name = proc["result_url"].rsplit("/", 1)[1]
+        assert name == f"{runner_mod.shard_label(grid, shard)}.json"
+
+    def test_tolerates_delayed_result_object(self, manifest, monkeypatch):
+        # The object appears only after two polls miss: the dispatcher keeps
+        # polling (issue #286) rather than recording the shard failed.
+        cfg, sm_path, _shard, _data = manifest
+        self._wire(monkeypatch, self._flat_body, delay=2)
+        summary = agg(
+            cfg, catalog=sm_path, store="s3://bucket/out.zarr", backend="lambda", max_workers=2
+        )
+        assert summary["cells_with_data"] == 1 and summary["cells_error"] == 0
+        assert summary["total_obs"] == 2
+
+    def test_sync_invocation_omits_result_channel(self, manifest, monkeypatch):
+        # Belt-and-suspenders on the byte-identical guarantee: invocation="sync"
+        # keeps the shard on RequestResponse with no result_url on the event.
+        import boto3
+
+        cfg, sm_path, _shard, _data = manifest
+
+        def responder(event):
+            return {
+                "statusCode": 200,
+                "body": json.dumps({"timesteps": len(event["time_index"])}),
+            }
+
+        fake = _FakeLambdaClient(_lifecycle(responder))
+        monkeypatch.setattr(boto3, "client", lambda *a, **k: fake)
+        agg(
+            cfg,
+            catalog=sm_path,
+            store="s3://bucket/out.zarr",
+            backend="lambda",
+            max_workers=2,
+            invocation="sync",
+        )
+        proc = [e for e in fake.events if e["mode"] == "process_raster"][0]
+        assert "result_url" not in proc
+
+    def test_hive_result_objects_suffix_window_label(self, manifest, monkeypatch):
+        # Hive windowed units (issue #247): two windows of one shard get
+        # DISTINCT result objects (label suffixed), so their async envelopes
+        # cannot clobber each other. Setup/coverage stay Event (issue #252),
+        # ping/finalize sync, and the two shards are Event (#286).
+        import zagg.runner as runner_mod
+
+        cfg, sm_path, shard, _data = manifest
+        cfg.output["store_layout"] = "hive"
+        cfg.output["windowing"] = {"schedule": "daily"}
+
+        def proc_body(event):
+            return {
+                "statusCode": 200,
+                "body": json.dumps(
+                    {"shard_key": event["shard_key"], "timesteps": 1, "cells_with_data": 7}
+                ),
+            }
+
+        fake = self._wire(monkeypatch, proc_body)
+        summary = agg(
+            cfg, catalog=sm_path, store="s3://bucket/out.zarr", backend="lambda", max_workers=2
+        )
+        procs = [e for e in fake.events if e["mode"] == "process_raster"]
+        assert len(procs) == 2  # two (shard, window) units
+        assert all(it == "Event" for m, it in fake.calls if m == "process_raster")
+        grid = from_config(cfg)
+        lbl = runner_mod.shard_label(grid, shard)
+        names = sorted(e["result_url"].rsplit("/", 1)[1] for e in procs)
+        assert names == sorted([f"{lbl}_20260713.json", f"{lbl}_20260718.json"])
+        assert summary["cells_with_data"] == 2 and summary["cells_error"] == 0
