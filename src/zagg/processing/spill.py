@@ -7,8 +7,10 @@ per-partition packed files in ``/tmp``** and aggregation happens once, after
 the reads, from complete per-cell data — reproducing the pooled path's
 results byte-for-byte in the single-block regime.
 
-This module is the phase-1 surface: the block/partition writer + reader and
-the standalone ``/tmp`` capacity guard. Key mechanics:
+The module has two layers: the block/partition writer + reader
+(:class:`SpillBlock`) with the standalone ``/tmp`` capacity guard, and
+:class:`SpillAggregator`, the worker-facing state machine that drives them.
+Key mechanics:
 
 - One append file per (block, partition). The file is created with
   ``tempfile.mkstemp`` and **unlinked immediately**; the open file object is
