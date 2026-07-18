@@ -3264,6 +3264,11 @@ def _invoke_lambda_raster_setup(
         "store_path": store_path,
         "overwrite": overwrite,
         "config": config_dict,
+        # times_us rides inline in this sync RequestResponse payload (6 MB
+        # cap, not the 256 KB async/Event cap); int64 μs stamps serialize at
+        # ~17 B each → ~350K-timestep headroom, orders above any real catalog
+        # (the pinned NEON benchmark catalog is 85 items). No chunking
+        # fallback — a pathological series would surface as a boto ClientError.
         "times_us": [int(t) for t in times_us],
     }
     if output_creds_event is not None:
