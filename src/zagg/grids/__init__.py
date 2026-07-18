@@ -65,9 +65,11 @@ def from_config(
         # disable sharding, so a config that only set `sharded: true` still paid a
         # whole-shard object fetch per single-cell read. Derive the 64x64
         # (= 4^6 = 4096-cell) inner chunk the flagship configs hand-set as
-        # `chunk_inner: 13`, clamped into [parent_order, child_order]. When
-        # child_order - 6 <= parent_order the shard already spans <= one inner
-        # chunk, so leave it None (the value would just reproduce the K==1 no-op).
+        # `chunk_inner: 13` — chunk_order = child_order - 6, engaged only when it
+        # exceeds parent_order. When child_order - 6 <= parent_order the shard
+        # already spans <= one inner chunk, so leave it None (the value would just
+        # reproduce the K==1 no-op). (child_order - 6 <= child_order always, so no
+        # upper bound is needed — the constructor's parent<=chunk<=child holds.)
         # fullsphere only: dense (deprecated) rejects chunk_inner finer than the
         # parent order (multi-chunk-per-shard block indexing is unsupported there).
         if chunk_inner is None and sharded and layout == "fullsphere":
