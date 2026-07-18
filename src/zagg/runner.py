@@ -16,6 +16,7 @@ import logging
 import os
 import random
 import statistics
+import threading
 import time
 import uuid
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -2493,11 +2494,28 @@ def _run_lambda(
     # manifest inputs (config + dataset identity from the ShardMap metadata,
     # the same source as the local path) ride the finalize event; flat
     # finalize events stay byte-identical.
+    # Hive manifest checker handles (issue #274 Fix 2): the background thread is
+    # started after the async setup invoke (below) and joined at fan-out end;
+    # _finalize_fn reads ``manifest_found`` to decide whether the backstop invoke
+    # is still needed. None on the flat path (no checker runs there).
+    manifest_found = None
+    manifest_stop = None
+    manifest_thread = None
+
     if get_store_layout(config) == "hive":
         md = catalog_data.get("metadata") or {}
         dataset = {"short_name": md.get("short_name"), "version": md.get("version")}
 
         def _finalize_fn():
+            # issue #274 Fix 2: the checker overlapped the fan-out. Manifest
+            # present -> the async init write (#252) landed; SKIP the backstop
+            # invoke (happy path, ~0 wall). Absent -> rare lost retries-0 Event
+            # write; invoke the finalize backstop to self-heal (unchanged path).
+            if manifest_found is not None and manifest_found.is_set():
+                logger.info(
+                    "morton_hive.json present (overlapped check) -- skipping finalize backstop"
+                )
+                return None
             return _invoke_lambda_finalize(
                 state["lambda_client"],
                 function_name,
@@ -2574,6 +2592,16 @@ def _run_lambda(
             overwrite=overwrite,
             output_creds_event=output_creds_event,
         )
+        # Overlap the fan-out with the client-side morton_hive.json check
+        # (issue #274 Fix 2): the async setup write above typically lands
+        # within seconds, so by finalize the flag is set and the blocking
+        # backstop invoke is skipped. Reads via the poller's output-store path.
+        from zagg.hive import read_manifest
+
+        manifest_kwargs = _output_store_kwargs(output_creds_event, region)
+        manifest_found, manifest_stop, manifest_thread = _start_manifest_checker(
+            lambda: read_manifest(store_path, **manifest_kwargs) is not None
+        )
     else:
         _invoke_lambda_setup(
             state["lambda_client"],
@@ -2622,6 +2650,13 @@ def _run_lambda(
         )
     finally:
         executor.shutdown()
+        # Stop the overlapped manifest checker and read its verdict (#274 Fix 2).
+        # It ran the whole fan-out; stopping now wakes it from its interval wait
+        # and joins cleanly (a final check already ran), leaving manifest_found
+        # settled before _finalize_fn consults it.
+        if manifest_stop is not None:
+            manifest_stop.set()
+            manifest_thread.join(timeout=_MANIFEST_CHECK_JOIN_TIMEOUT_S)
     fanout_s = time.time() - start_time
 
     # Consolidate metadata via Lambda (same rationale as setup -- avoids
@@ -2897,6 +2932,14 @@ _DEFAULT_FUNCTION_TIMEOUT_S = 900
 _ASYNC_POLL_MARGIN_S = 90.0
 _ASYNC_POLL_INTERVAL_S = 5.0
 
+# Hive manifest checker (issue #274 Fix 2). The morton_hive.json backstop is
+# confirmed CLIENT-side, overlapped with the fan-out, instead of a blocking
+# finalize invoke: a background thread GETs the manifest every INTERVAL until
+# it's present (async init write, #252), then the finalize backstop is skipped.
+# JOIN_TIMEOUT bounds the wait when stopping the checker at fan-out end.
+_MANIFEST_CHECK_INTERVAL_S = 10.0
+_MANIFEST_CHECK_JOIN_TIMEOUT_S = 30.0
+
 # Async (Event) invoke requests cap at 256 KB (vs 6 MB synchronous). Budget a
 # little under it so the dispatch pre-flight fails with a remedy before
 # Lambda's raw RequestEntityTooLargeException does; the realistic trigger is a
@@ -2919,27 +2962,37 @@ _POLL_RETRY_CONFIG = {
 }
 
 
+def _output_store_kwargs(output_creds_event, region):
+    """obstore kwargs for the output store, shared by the async result poller
+    and the hive manifest checker (issues #151, #274).
+
+    Mirrors the worker's ``_output_store_kwargs``: the explicit
+    output-credentials block when supplied, else the ambient chain. Carries the
+    short per-request :data:`_POLL_RETRY_CONFIG` (issue #186) so a single 5xx
+    can't block for minutes and silently overrun a poll/check deadline.
+    """
+    kwargs = {"region": region, "retry_config": _POLL_RETRY_CONFIG}
+    if output_creds_event:
+        kwargs["region"] = output_creds_event.get("region", region)
+        kwargs["credentials"] = output_creds_event
+        if output_creds_event.get("endpointUrl"):
+            kwargs["endpoint_url"] = output_creds_event["endpointUrl"]
+    return kwargs
+
+
 def _result_fetcher(box, prefix, output_creds_event, region, key):
     """Zero-arg fetch closure for one shard's async result object (#151).
 
     The obstore store is built lazily on the first poll and shared across all
     cells via ``box`` (a plain dict; a benign first-poll race just builds it
     twice), so runs whose dispatch is fully mocked (tests) never touch
-    obstore/S3. Credential resolution mirrors the worker's
-    ``_output_store_kwargs``: the explicit output-credentials block when
-    supplied, else the ambient chain.
+    obstore/S3.
     """
 
     def fetch():
         store = box.get("store")
         if store is None:
-            kwargs = {"region": region, "retry_config": _POLL_RETRY_CONFIG}
-            if output_creds_event:
-                kwargs["region"] = output_creds_event.get("region", region)
-                kwargs["credentials"] = output_creds_event
-                if output_creds_event.get("endpointUrl"):
-                    kwargs["endpoint_url"] = output_creds_event["endpointUrl"]
-            store = open_object_store(prefix, **kwargs)
+            store = open_object_store(prefix, **_output_store_kwargs(output_creds_event, region))
             box["store"] = store
         return _fetch_result(store, key)
 
@@ -2947,15 +3000,57 @@ def _result_fetcher(box, prefix, output_creds_event, region, key):
 
 
 def _fetch_result(result_store, key):
-    """Read one worker-written result envelope; None while it hasn't landed."""
+    """Read one worker-written result envelope + its S3 post time (#151, #274).
+
+    Returns ``(envelope, last_modified)`` -- the parsed JSON envelope and the
+    result object's ``LastModified`` (obstore ``GetResult.meta["last_modified"]``,
+    an ``ObjectMeta`` TypedDict), which IS the moment the worker POSTed its
+    ``.status`` result. ``None`` while the object hasn't landed. The post time
+    is the true result-ready wall, independent of poll cadence (issue #274 Fix 1).
+    """
     import obstore
     from obstore.exceptions import NotFoundError
 
     try:
-        data = obstore.get(result_store, key).bytes()
+        response = obstore.get(result_store, key)
+        last_modified = response.meta["last_modified"]
+        data = response.bytes()
     except (FileNotFoundError, NotFoundError):
         return None
-    return json.loads(bytes(data))
+    return json.loads(bytes(data)), last_modified
+
+
+def _start_manifest_checker(check_present, *, interval_s=_MANIFEST_CHECK_INTERVAL_S):
+    """Overlap the hive fan-out with a background morton_hive.json check (#274 Fix 2).
+
+    ``check_present`` is a zero-arg predicate returning True once the manifest is
+    readable. The moment it is, ``found`` is set and the thread stops; otherwise
+    it re-checks every ``interval_s`` until ``stop`` is set (the caller sets it and
+    joins at fan-out end). The dispatcher NEVER blocks on this -- it overlaps the
+    (hundreds-of-seconds) fan-out, so the async init-time manifest write (#252) has
+    landed by the first check in practice and the finalize backstop is skipped. A
+    transient GET fault is swallowed and retried next tick, never fatal. At least
+    one check always runs (even if ``stop`` is already set), so joining right after
+    an instant fan-out still yields a definitive present/absent verdict. Returns
+    ``(found, stop, thread)``; the thread is a daemon.
+    """
+    found = threading.Event()
+    stop = threading.Event()
+
+    def _run():
+        while True:
+            try:
+                if check_present():
+                    found.set()
+            except Exception:
+                pass  # transient GET fault -- re-check next tick, never fatal
+            if found.is_set() or stop.is_set():
+                return
+            stop.wait(interval_s)
+
+    thread = threading.Thread(target=_run, name="hive-manifest-check", daemon=True)
+    thread.start()
+    return found, stop, thread
 
 
 def _invoke_lambda_event(
@@ -3124,21 +3219,32 @@ def _poll_lambda_result(
         # *persistent* fault (e.g. missing s3:GetObject) surfaces in the
         # deadline error below instead of masquerading as a worker crash.
         try:
-            result = result_fetch()
+            fetched = result_fetch()
             fetch_error = None
         except Exception as e:
             fetch_error = e
-            result = None
-        if result is not None:
+            fetched = None
+        if fetched is not None:
+            result, post_time = fetched
             try:
                 body = json.loads(result.get("body", "{}"))
             except (json.JSONDecodeError, TypeError):
                 body = {}
+            # Result-ready wall (issue #274 Fix 1): measure to when the worker
+            # POSTed its .status result (the object's S3 LastModified), not to
+            # when this poll happened to catch it -- so the reported wall is the
+            # same true value at any poll cadence. Fall back to the real clock
+            # only if the store reported no timestamp (defensive; S3 always has
+            # one). ~+-1s LastModified granularity is accepted (issue decision).
+            if post_time is not None:
+                wall_time = post_time.timestamp() - wall_start
+            else:
+                wall_time = time.time() - wall_start
             return {
                 "shard_key": shard_key,
                 "status_code": result.get("statusCode"),
                 "body": body,
-                "wall_time": time.time() - wall_start,
+                "wall_time": wall_time,
                 "lambda_duration": body.get("duration_s", 0),
                 "error": body.get("error"),
                 "retries": retries,
