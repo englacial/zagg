@@ -460,11 +460,14 @@ class TestBlockThreshold:
 
         monkeypatch.setattr(spill.os, "statvfs", lambda _p: _Big())
         one = spill._default_block_bytes(1)
-        # 0.8 x 0.75 x mem / _BUILD_MULT: the phase-3 replays measured the
-        # partition build (columns + sort copies + outputs) peaking at
-        # ~2.6-3.5x the partition bytes, so the reservation divides by 3 —
-        # without it a derived K=1 block builds at ~3x its bytes and OOMs.
-        assert one == int(0.8 * 0.75 * 4096 * 2**20 / spill._BUILD_MULT)
+        # Pin the measured multiplier: phase-3 replays peaked at ~2.73-3.50x
+        # the partition bytes (columns + sort copies + outputs), so the
+        # reservation divides by 3. Do not lower without re-measuring the replay.
+        assert spill._BUILD_MULT == 3
+        # Compare against the literal (not spill._BUILD_MULT), so an unreviewed
+        # change to the constant fails here instead of moving the expectation
+        # with it — without the /3 a K=1 block builds at ~3x its bytes and OOMs.
+        assert one == int(0.8 * 0.75 * 4096 * 2**20 / 3)
         # K divides the build unit (one partition), so it multiplies the block.
         assert spill._default_block_bytes(4) == 4 * one
 
