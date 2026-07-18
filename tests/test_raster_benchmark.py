@@ -32,14 +32,15 @@ def test_raster_targets_manifest_consistent():
     assert (base / t["config"]).exists()
     assert (base / t["catalog"]).exists()
     assert t["pipeline"] == "raster"
-    # The config must actually route to the raster pipeline and stay on the
-    # lambda-compatible layout (fullsphere; no hive until issue #237).
+    # The config must route to the raster pipeline on the production hive store
+    # layout (issue #237 promoted, ratified on issue #272); grid geometry stays
+    # fullsphere (hive/flat is the store axis, not the grid geometry).
     from zagg.config import get_layout, get_store_layout, load_config
 
     cfg = load_config(str(base / t["config"]))
     assert (cfg.data_source or {}).get("reader") == "raster"
     assert get_layout(cfg) == "fullsphere"
-    assert get_store_layout(cfg) == "flat"
+    assert get_store_layout(cfg) == "hive"
 
 
 def test_pinned_s2_catalog_carries_raster_entries():
@@ -92,26 +93,6 @@ def test_dry_run_builds_shardmap_offline(tmp_path):
     assert "stage_max" not in run
     df = rs.records_to_frame(runs)
     assert df.iloc[0]["stage_fetch_s"] is None or str(df.iloc[0]["stage_fetch_s"]) == "nan"
-
-
-def test_pending_hive_target_awaits_promotion():
-    # The hive raster leg (espg directive on PR #261) waits in pending_targets.
-    # The issue #239 gate this tripwire used to pin is GONE — raster + hive is
-    # legal since issue #247 — but the ratified #247 phasing runs the hive
-    # benchmark arm AFTER that PR, so the target stays pending here: the
-    # follow-up promotes it into "targets" (the harness already applies the
-    # store_layout override) and deletes this test.
-    from zagg.config import load_config, validate_config
-
-    manifest, base = rrb.load_targets(str(BENCH / "targets_raster_neon.json"))
-    pend = manifest["pending_targets"]["raster_s2_neon_2025_hive"]
-    assert pend["store_layout"] == "hive" and pend["blocked_by"] == "#237"
-    assert pend["config"] == manifest["targets"]["raster_s2_neon_2025"]["config"]
-    cfg = load_config(str(base / pend["config"]))
-    cfg.output["store_layout"] = "hive"
-    validate_config(cfg)  # the promotion path is open (issue #247)
-    # pending_targets never joins the default dispatch set.
-    assert "raster_s2_neon_2025_hive" not in manifest["targets"]
 
 
 def test_live_dispatch_requires_store_prefix(tmp_path):
