@@ -204,6 +204,50 @@ class TestProcessRasterMode:
         assert "asset" in json.loads(resp["body"])["error"]
 
 
+class TestProcessRasterResultMirror:
+    """``result_url`` async channel for ``mode="process_raster"`` (issue #286).
+
+    The handler-level mirror (issue #151) is mode-agnostic: any per-unit
+    handler that falls through ``lambda_handler`` -- spatial ``process``,
+    temporal ``process_event``, and raster ``process_raster`` -- has its
+    response envelope written to ``result_url`` on an async (Event) invoke.
+    These tests pin that the raster branch reaches the mirror when the event
+    carries ``result_url`` and stays byte-identical (no write) when it does
+    not, so the dispatcher's async poll (issue #286) has an object to read.
+    """
+
+    def test_mirrors_envelope_to_result_url(self, handler_mod, raster_event, monkeypatch):
+        event, _grid, _data = raster_event
+        event["result_url"] = "s3://bucket/out.zarr.status/run1/12345.json"
+        captured = {}
+        monkeypatch.setattr(
+            handler_mod,
+            "_write_result",
+            lambda url, resp, ev: captured.update(url=url, resp=resp) or True,
+        )
+        resp = handler_mod.lambda_handler(event, MagicMock())
+        # The response is returned AND mirrored to result_url with the exact
+        # same envelope the poller will read back.
+        assert resp["statusCode"] == 200
+        assert captured["url"] == event["result_url"]
+        assert captured["resp"] is resp
+        assert json.loads(resp["body"])["timesteps"] == 1
+
+    def test_no_result_url_is_byte_identical(self, handler_mod, raster_event, monkeypatch):
+        # Absent result_url (sync invoke): the mirror is never touched and the
+        # response is exactly the pre-#286 envelope -- the local/sync path is
+        # unaffected.
+        event, _grid, _data = raster_event
+        called = []
+        monkeypatch.setattr(
+            handler_mod, "_write_result", lambda *a: called.append(a) or True
+        )
+        resp = handler_mod.lambda_handler(event, MagicMock())
+        assert called == []
+        assert resp["statusCode"] == 200
+        assert json.loads(resp["body"])["timesteps"] == 1
+
+
 class TestRasterSetupMode:
     """Issue #264: ``mode="setup"`` with a raster config writes the
     ``(time, cells)`` template + ``time`` coordinate handler-side, so the
