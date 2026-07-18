@@ -11,6 +11,7 @@ import pytest
 from pyproj import CRS, Transformer
 from test_raster import ORIGIN, RES, TRANSFORM, UTM18, _index_raster, _write_tiff
 from zarr import open_array
+from zarr.errors import ContainsGroupError
 from zarr.storage import MemoryStore
 
 from zagg.config import get_raster_bands, load_config_from_dict, validate_config
@@ -562,6 +563,27 @@ class TestTemplateAndSlabs:
         emit_raster_template(store, grid, cfg, np.array([], dtype=np.int64))
         red = open_array(store, path=f"{grid.group_path}/red", zarr_format=3, consolidated=False)
         assert red.shape == (0, 4096)
+
+    def test_overwrite_false_refuses_same_count_different_values(self, tmp_path):
+        # overwrite=False must refuse a rerun whose timestep COUNT is unchanged
+        # but whose time values differ: to_zarr's shape guard doesn't catch it,
+        # so without an explicit check the unconditional time write would
+        # silently clobber the coordinate workers slab-write against (issue
+        # #264). An identical rerun stays idempotent; overwrite=True rewrites.
+        cfg, grid, _shard = _healpix_setup(tmp_path)
+        store = MemoryStore()
+        emit_raster_template(store, grid, cfg, np.array([100, 200], dtype=np.int64))
+        # Idempotent: same values, overwrite=False, no raise.
+        emit_raster_template(store, grid, cfg, np.array([100, 200], dtype=np.int64))
+        # Same count, shifted values: refused, and the store is left untouched.
+        with pytest.raises(ContainsGroupError):
+            emit_raster_template(store, grid, cfg, np.array([100, 999], dtype=np.int64))
+        tarr = open_array(store, path=f"{grid.group_path}/time", zarr_format=3, consolidated=False)
+        np.testing.assert_array_equal(tarr[:], np.array([100, 200], dtype=np.int64))
+        # overwrite=True rewrites the shifted coordinate cleanly.
+        emit_raster_template(store, grid, cfg, np.array([100, 999], dtype=np.int64), overwrite=True)
+        tarr = open_array(store, path=f"{grid.group_path}/time", zarr_format=3, consolidated=False)
+        np.testing.assert_array_equal(tarr[:], np.array([100, 999], dtype=np.int64))
 
     def test_time_attrs_round_trip(self, tmp_path):
         cfg, grid, _shard = _healpix_setup(tmp_path)
