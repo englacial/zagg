@@ -499,7 +499,10 @@ class TestWorkerSizeVariants:
         for size in self._SIZES:
             for logical in (f"WorkerFn{size}", f"WorkerFn{size}Disk"):
                 cfg = dict(resources[f"{logical}AsyncConfig"]["Properties"])
-                assert cfg.pop("FunctionName") == {"Ref": logical}
+                # Looped logical-id refs use the nested Fn::Sub form — the
+                # ForEach transform does not substitute bare Ref strings
+                # (issue #269; live-validated by the first real standup).
+                assert cfg.pop("FunctionName") == {"Ref": {"Fn::Sub": logical}}
                 assert cfg == process  # Qualifier, retries, event age identical
 
     def test_variant_metric_filters_mirror_process_fn(self):
@@ -521,21 +524,31 @@ class TestWorkerSizeVariants:
                     fltr = resources[f"{logical}{kind}"]
                     assert fltr["Type"] == "AWS::Logs::MetricFilter"
                     assert fltr["Condition"] == "ShouldCreateMetricFilters"
-                    assert fltr["DependsOn"] == logical
+                    # DependsOn forbids intrinsics, so looped filters order
+                    # after their function implicitly instead: LogGroupName
+                    # derives from Ref(function) == the function name
+                    # (issue #269).
+                    assert "DependsOn" not in fltr
                     props = fltr["Properties"]
                     assert props["LogGroupName"] == {
-                        "Sub": f"/aws/lambda/${{FunctionName}}{group_suffix}"
+                        "Sub": [
+                            "/aws/lambda/${WorkerName}",
+                            {"WorkerName": {"Ref": {"Fn::Sub": logical}}},
+                        ]
                     }
                     assert props["FilterPattern"] == pattern
                     (mt,) = props["MetricTransformations"]
                     assert mt["MetricNamespace"] == "zagg/lambda"
-                    assert mt["MetricName"] == metric
+                    assert mt["MetricName"] == {"Sub": metric}
                     assert mt["MetricValue"] == "1"
                     assert mt["DefaultValue"] == 0
         names = [
-            fltr["Properties"]["MetricTransformations"][0]["MetricName"]
-            for fltr in resources.values()
-            if isinstance(fltr, dict) and fltr.get("Type") == "AWS::Logs::MetricFilter"
+            _n["Sub"] if isinstance(_n, dict) else _n
+            for _n in (
+                fltr["Properties"]["MetricTransformations"][0]["MetricName"]
+                for fltr in resources.values()
+                if isinstance(fltr, dict) and fltr.get("Type") == "AWS::Logs::MetricFilter"
+            )
         ]
         assert len(names) == len(set(names)) == 16  # 8 functions x 2 filters
 
@@ -543,9 +556,14 @@ class TestWorkerSizeVariants:
         tpl = TestTemplateEnvironment._load_template()
         outputs = self._expand_foreach(tpl, tpl["Outputs"])
         for size in self._SIZES:
-            assert outputs[f"WorkerFn{size}Arn"]["Value"] == {"GetAtt": f"WorkerFn{size}.Arn"}
+            # GetAtt on a looped logical id takes the two-element list form
+            # with a nested Sub (issue #269) — the dotted-string form is not
+            # substituted by the transform.
+            assert outputs[f"WorkerFn{size}Arn"]["Value"] == {
+                "GetAtt": [{"Sub": f"WorkerFn{size}"}, "Arn"]
+            }
             assert outputs[f"WorkerFn{size}DiskArn"]["Value"] == {
-                "GetAtt": f"WorkerFn{size}Disk.Arn"
+                "GetAtt": [{"Sub": f"WorkerFn{size}Disk"}, "Arn"]
             }
 
 
