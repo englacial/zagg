@@ -30,8 +30,14 @@ import bench_metrics  # noqa: E402
 
 from zagg.dispatch import LAMBDA_MEMORY_GB, LAMBDA_PRICE_PER_GB_SEC  # noqa: E402
 
-# The collapsed live per-merge target (issue #250): the single hive config.
-LIVE_MERGE_TARGET = "tdigest_healpix_o9_hive"
+# The live per-merge leg. Issue #272 re-expands the #250 single-target collapse
+# to the read-backend A/B on the shipping spill+disk path: two arms, plotted as
+# two lines per figure -- inline (green) and sidecar (purple).
+LIVE_MERGE_TARGETS = ("tdigest_healpix_o9_hive", "tdigest_healpix_o9_hive_sidecar")
+LIVE_MERGE_TARGET = LIVE_MERGE_TARGETS[0]  # inline arm; retained for callers/tests
+# Per-arm plot identity (issue #272): read backend -> (legend label, line colour).
+MERGE_ARM_LABEL = {LIVE_MERGE_TARGETS[0]: "inline", LIVE_MERGE_TARGETS[1]: "sidecar"}
+MERGE_ARM_COLOR = {LIVE_MERGE_TARGETS[0]: "green", LIVE_MERGE_TARGETS[1]: "purple"}
 
 # Series version floor (issue #272): only rows at/after this release are plotted.
 # Pre-0.33.0 rows are wrong -- their cost estimates predate the ~100 s async
@@ -153,7 +159,7 @@ def merge_history(df: pd.DataFrame) -> pd.DataFrame:
     """
     if df.empty or "target" not in df.columns:
         return pd.DataFrame()
-    hist = df[(df.get("event") == "merge") & (df["target"] == LIVE_MERGE_TARGET)].copy()
+    hist = df[(df.get("event") == "merge") & (df["target"].isin(LIVE_MERGE_TARGETS))].copy()
     hist = _at_or_after_floor(hist)
     if hist.empty:
         return hist
@@ -187,10 +193,14 @@ def _mem_norm_and_fracs(hist: pd.DataFrame):
     return Normalize(vmin=vmin, vmax=vmax), fracs
 
 
-def _draw_series(ax, xs, ys, *, fracs, norm, color="C0"):
-    """One line + memory-coloured markers (uncoloured grey when unknown)."""
+def _draw_series(ax, xs, ys, *, fracs, norm, color="C0", label=None):
+    """One line + memory-coloured markers (uncoloured grey when unknown).
+
+    ``label`` (issue #272) names the line for a legend -- used to distinguish
+    the inline (green) and sidecar (purple) arms overlaid on one panel.
+    """
     line = [v if v == v else float("nan") for v in ys]  # NaN-safe passthrough
-    ax.plot(xs, line, "-", color=color, zorder=1)
+    ax.plot(xs, line, "-", color=color, zorder=1, label=label)
     colors = [f if f is not None else float("nan") for f in fracs]
     ax.scatter(
         xs,
@@ -306,6 +316,102 @@ def make_summary_figure(rows: list[tuple[str, pd.DataFrame, str]], out_png: Path
     return True
 
 
+def _merge_commits(hist: pd.DataFrame) -> list:
+    """Time-ordered unique commits across both arms -- the shared A/B x-axis."""
+    ordered = hist.sort_values("timestamp") if "timestamp" in hist.columns else hist
+    return list(dict.fromkeys(ordered["commit"]))
+
+
+def _arm_aligned(sub: pd.DataFrame, commits: list, col: str) -> list:
+    """One arm's per-commit values of ``col`` (NaN where the arm lacks a commit)."""
+    by_commit = sub.drop_duplicates("commit").set_index("commit")
+    series = by_commit[col] if col in by_commit.columns else None
+    out = []
+    for c in commits:
+        v = series.get(c) if (series is not None and c in series.index) else None
+        out.append(float(v) if (v is not None and v == v) else float("nan"))
+    return out
+
+
+def make_merge_ab_figure(hist: pd.DataFrame, out_png: Path) -> bool:
+    """Per-merge read-backend A/B overlay (issue #272): cost | wall panels, each
+    with two lines on a shared time-ordered commit x-axis -- inline (green) and
+    sidecar (purple), spill+disk -- with memory-coloured markers and a legend.
+    ``hist`` is ``merge_history`` output (both arms). False on no plottable data.
+    """
+    import matplotlib
+
+    matplotlib.use("Agg")  # headless CI
+    import matplotlib.pyplot as plt
+
+    need = {"total_billed_s", "total_wall_s", "target", "commit"}
+    if hist.empty or not need.issubset(hist.columns):
+        return False
+    commits = _merge_commits(hist)  # shared, time-ordered x-axis
+    if not commits:
+        return False
+    xs = list(range(len(commits)))
+    norm, _ = _mem_norm_and_fracs(hist)
+
+    fig, (cost_ax, wall_ax) = plt.subplots(1, 2, figsize=(14, 3.6), gridspec_kw={"wspace": 0.35})
+    drew = False
+    for target in LIVE_MERGE_TARGETS:
+        sub = hist[hist["target"] == target]
+        if sub.empty:
+            continue
+        drew = True
+        fracs = [
+            bench_metrics.memory_pct_of_cap(m, g)
+            for m, g in zip(
+                _arm_aligned(sub, commits, "max_memory_mb"),
+                _arm_aligned(sub, commits, "memory_gb"),
+                strict=True,
+            )
+        ]
+        color, lbl = MERGE_ARM_COLOR[target], MERGE_ARM_LABEL[target]
+        _draw_series(
+            cost_ax,
+            xs,
+            _arm_aligned(sub, commits, "total_billed_s"),
+            fracs=fracs,
+            norm=norm,
+            color=color,
+            label=lbl,
+        )
+        _draw_series(
+            wall_ax,
+            xs,
+            _arm_aligned(sub, commits, "total_wall_s"),
+            fracs=fracs,
+            norm=norm,
+            color=color,
+            label=lbl,
+        )
+    if not drew:
+        plt.close(fig)
+        return False
+
+    labels = [str(c)[:7] for c in commits]
+    cost_ax.set_ylabel("billed lambda-seconds")
+    cost_ax.set_title("per-merge — total billed cost", fontsize=10)
+    usd = cost_ax.secondary_yaxis(
+        1.0, functions=(lambda s: s * _USD_PER_LAMBDA_S, lambda d: d / _USD_PER_LAMBDA_S)
+    )
+    usd.set_ylabel("USD")
+    cost_ax.legend(title="read backend", fontsize=8)
+    _finish_axis(cost_ax, xs, labels)
+    wall_ax.set_ylabel("overall wall (s)")
+    wall_ax.set_title("per-merge — wall", fontsize=10)
+    wall_ax.legend(title="read backend", fontsize=8)
+    _finish_axis(wall_ax, xs, labels)
+    _add_colorbar(fig, [cost_ax, wall_ax], norm, _cap_mb(hist))
+    fig.suptitle("zagg per-merge — inline (green) vs sidecar (purple), spill+disk", y=1.03)
+    out_png.parent.mkdir(parents=True, exist_ok=True)
+    fig.savefig(out_png, dpi=120, bbox_inches="tight")
+    plt.close(fig)
+    return True
+
+
 def make_diagnostics_figure(
     hist: pd.DataFrame,
     panels: list[tuple[str, str]],
@@ -313,6 +419,7 @@ def make_diagnostics_figure(
     out_png: Path,
     suptitle: str,
     ylabel: str = "seconds",
+    arm_col: str | None = None,
 ) -> bool:
     """One panel PER metric (phase or stage), ``ylabel`` vs x — never stacked.
 
@@ -320,7 +427,10 @@ def make_diagnostics_figure(
     (the Pages index omits the section instead of embedding a broken image).
     ``ylabel`` defaults to seconds (the phase/stage figures); the object-count
     figure passes ``"objects"`` so its count axis is not mislabelled.
-    Markers carry the memory colour scale where available.
+    Markers carry the memory colour scale where available. ``arm_col`` (issue
+    #272) overlays the two read-backend arms per panel on a shared commit axis
+    -- inline (green), sidecar (purple) -- for the per-merge diagnostics; None
+    keeps the single-series per-release behaviour.
     """
     import matplotlib
 
@@ -339,11 +449,41 @@ def make_diagnostics_figure(
         nrows, ncols, figsize=(5.2 * ncols, 3.0 * nrows), squeeze=False, gridspec_kw={"wspace": 0.3}
     )
     norm, fracs = _mem_norm_and_fracs(hist)
-    xs = list(range(len(hist)))
-    labels = [str(v)[:7] if x_col == "commit" else str(v) for v in hist[x_col]]
+    if arm_col is not None:
+        commits = _merge_commits(hist)
+        xs = list(range(len(commits)))
+        labels = [str(c)[:7] for c in commits]
+    else:
+        xs = list(range(len(hist)))
+        labels = [str(v)[:7] if x_col == "commit" else str(v) for v in hist[x_col]]
     for i, (col, title) in enumerate(live):
         ax = axes[i // ncols][i % ncols]
-        _draw_series(ax, xs, hist[col].to_numpy(float), fracs=fracs, norm=norm)
+        if arm_col is not None:
+            for target in LIVE_MERGE_TARGETS:
+                sub = hist[hist[arm_col] == target]
+                if sub.empty:
+                    continue
+                arm_fracs = [
+                    bench_metrics.memory_pct_of_cap(m, g)
+                    for m, g in zip(
+                        _arm_aligned(sub, commits, "max_memory_mb"),
+                        _arm_aligned(sub, commits, "memory_gb"),
+                        strict=True,
+                    )
+                ]
+                _draw_series(
+                    ax,
+                    xs,
+                    _arm_aligned(sub, commits, col),
+                    fracs=arm_fracs,
+                    norm=norm,
+                    color=MERGE_ARM_COLOR[target],
+                    label=MERGE_ARM_LABEL[target],
+                )
+            if i == 0:
+                ax.legend(title="read backend", fontsize=7)
+        else:
+            _draw_series(ax, xs, hist[col].to_numpy(float), fracs=fracs, norm=norm)
         ax.set_title(title, fontsize=10)
         ax.set_ylabel(ylabel)
         _finish_axis(ax, xs, labels)
