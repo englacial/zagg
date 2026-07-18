@@ -41,7 +41,7 @@ def _record(commit="c0", target="full_aoi_neon_o9_inline_nomask", event="release
         "shard_area_km2": 162.0,
         "memory_gb": 4.0,
         "price_per_gb_sec": 1.3e-05,
-        "zagg_version": "0.25.0",
+        "zagg_version": "0.33.0",
         "n_shards": 4,
         "n_shards_ok": 4,
         "n_shards_error": 0,
@@ -376,6 +376,39 @@ def test_merge_history_selects_live_target_only():
     sync_usd = (3.7 + 1.2) * psu._USD_PER_LAMBDA_S
     assert row["total_cost_usd"] == pytest.approx(0.00443 + sync_usd)
     assert row["phase_agg_s"] == pytest.approx(21.8)
+
+
+def test_history_floors_below_0_33_0():
+    # issue #272: rows below the 0.33.0 series floor are dropped at render (their
+    # cost predates the ~100 s async-setup term, and the last pre-floor point was
+    # a no-run recorded as 0 s that collapses the axis). A dev build AFTER 0.33.0
+    # is kept; a missing version can't be proven at/after the floor, so it drops.
+    psu = pytest.importorskip("plot_summary")
+    import pandas as pd
+
+    def _row(commit, ver, **over):
+        r = {
+            "timestamp": f"2026-06-{commit[-2:]}T00:00:00Z",
+            "commit": commit,
+            "event": "merge",
+            "target": psu.LIVE_MERGE_TARGET,
+            "cost_per_shard_usd": 0.004,
+            "total_wall_s": 88.0,
+        }
+        if ver is not None:
+            r["zagg_version"] = ver
+        r.update(over)
+        return r
+
+    rows = [
+        _row("c01", "0.31.0"),  # pre-floor
+        _row("c15", "0.31.1", cost_per_shard_usd=0.0, total_wall_s=0.0),  # 0 s no-run
+        _row("c20", None),  # missing version -> unprovable -> dropped
+        _row("c25", "0.33.0"),  # exactly the floor -> kept
+        _row("c28", "0.33.1.dev5+gabc"),  # dev build after 0.33.0 -> kept
+    ]
+    hist = psu.merge_history(pd.DataFrame(rows))
+    assert list(hist["commit"]) == ["c25", "c28"]
 
 
 # --- store object-count columns (issue #240) --------------------------------
