@@ -677,6 +677,18 @@ def _handle_setup(event: Dict[str, Any]) -> Dict[str, Any]:
     logger.info(f"Setup mode: creating template at {event.get('store_path')}")
     try:
         config = load_config_from_dict(event["config"])
+        from zagg.config import get_layout
+
+        if get_layout(config) == "dense":
+            # The dense layout was removed (issue #88): reject the stale deployed
+            # event with a clean 400 (the PR #257 fold pattern) instead of letting
+            # from_config raise into the generic 500 below — one guard for the
+            # hive, raster, and flat branches alike.
+            error_msg = (
+                "setup requires output.grid.layout: fullsphere (dense was removed — issue #88)"
+            )
+            logger.error(error_msg)
+            return {"statusCode": 400, "body": json.dumps({"error": error_msg})}
         # Layout splits BEFORE pipeline (issue #247): a hive store's template
         # time writes ONLY the manifest regardless of pipeline kind (D5 — the
         # raster hive worker emits its own per-leaf templates, exactly like
@@ -704,20 +716,8 @@ def _handle_setup(event: Dict[str, Any]) -> Dict[str, Any]:
         if (config.data_source or {}).get("reader") == "raster":
             import numpy as np
 
-            from zagg.config import get_layout
             from zagg.processing.raster import emit_raster_template
 
-            if get_layout(config) == "dense":
-                # Symmetry with the worker (_handle_process_raster): the dense
-                # layout was removed outright (issue #88), so from_config below
-                # would raise — surfacing as a retried 500 from this invoke-only
-                # path. Reject the stale deployed event with the worker's clean
-                # 400 instead (the PR #257 fold pattern); validate_config
-                # rejects dense pre-dispatch too, so this is defense-in-depth
-                # (issue #264).
-                error_msg = "raster lambda workers require output.grid.layout: fullsphere"
-                logger.error(error_msg)
-                return {"statusCode": 400, "body": json.dumps({"error": error_msg})}
             store = open_store(event["store_path"], **_output_store_kwargs(event))
             grid = from_config(config)
             times_us = np.asarray(event["times_us"], dtype=np.int64)

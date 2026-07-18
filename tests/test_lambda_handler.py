@@ -1490,6 +1490,16 @@ class TestSetupTemplate:
         assert (n_chunks,) == worker_grid.chunk_grid_shape
         assert n_chunks == HEALPIX_BASE_CELLS * 4**6
 
+    def test_setup_dense_layout_400(self, handler_mod, monkeypatch):
+        # The dense layout was removed (issue #88): a point-path setup event still
+        # carrying a dense config gets the shared early guard's clean 400, not an
+        # opaque from_config 500 — parity with the raster branch (issue #253).
+        cfg = default_config("atl06")
+        cfg.output["grid"]["layout"] = "dense"
+        resp, _store = self._setup(handler_mod, monkeypatch, asdict(cfg), parent_order=6)
+        assert resp["statusCode"] == 400, json.loads(resp["body"])
+        assert "fullsphere" in json.loads(resp["body"])["error"]
+
     def test_flat_setup_body_pinned_no_raster_echo(self, handler_mod, monkeypatch):
         # The raster setup branch (issue #264) keys on data_source.reader ==
         # "raster": a point-path config must keep the flat branch and its
