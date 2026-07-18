@@ -304,27 +304,26 @@ def process_shard(
     files_processed = 0
     read_errors = 0
 
-    # Streaming buffered merge (issue #148 phase 4): when
+    # Streaming buffered aggregation (issue #148 phase 4): when
     # ``aggregation.streaming`` is set, reads accumulate for ``buffer_granules``
-    # granules and fold into running per-cell state instead of pooling the whole
-    # shard — peak memory is one buffer + digest state, independent of granule
-    # count. Validated up front (mergeable reducers only); ``None`` (default) is
-    # the unchanged pooled path.
+    # granules and are flushed instead of pooling the whole shard. ``mode:
+    # merge`` (default) folds each flush into running per-cell state (mergeable
+    # reducers only, validated up front); ``mode: spill`` (issue #217) appends
+    # the grouped flush to per-partition ``/tmp`` files and aggregates once
+    # after the reads — full pooled reducer surface, byte-identical to pooled
+    # in the single-block regime. ``None`` (default) is the unchanged pooled
+    # path.
+    from zagg.processing.spill import SpillAggregator, SpillOverflowError, SpillReduceError
     from zagg.processing.streaming import StreamingAggregator, get_streaming
 
     streaming_cfg = get_streaming(config)
-    buffered = (
-        StreamingAggregator(
-            config,
-            grid,
-            handoff,
-            streaming_cfg["buffer_granules"],
-            state_layout=streaming_cfg["state_layout"],
-            arena_backing=streaming_cfg["arena_backing"],
-        )
-        if streaming_cfg is not None
-        else None
-    )
+    spill_mode = streaming_cfg is not None and streaming_cfg["mode"] == "spill"
+    if spill_mode:
+        buffered = SpillAggregator(config, grid, handoff, streaming_cfg["buffer_granules"])
+    elif streaming_cfg is not None:
+        buffered = StreamingAggregator(config, grid, handoff, streaming_cfg["buffer_granules"])
+    else:
+        buffered = None
 
     # Opt-in per-phase timing (issue #100). Only allocated when profiling so the
     # default path stays byte-identical (no dict, no time.time() calls).
@@ -470,6 +469,14 @@ def process_shard(
             files_processed += 1
             if buffered is not None:
                 buffered.granule_done()
+        except (SpillOverflowError, SpillReduceError):
+            # A spill block overflowed under a non-mergeable config
+            # (SpillOverflowError), or an overlap-thread reduce failed and its
+            # parked error surfaced at the next block close (SpillReduceError):
+            # both are shard-level failures, not per-granule hiccups — a
+            # swallowed SpillReduceError would silently drop a block from the
+            # emitted output — so propagate loudly instead of warn-and-continue.
+            raise
         except Exception as e:
             # Fold-side failure (e.g. a streaming flush): same tolerated
             # warn-and-continue the serial loop's outer ``except`` applied.
@@ -575,7 +582,7 @@ def process_shard(
 
     # Occupied-cell sink (issue #200): both paths already hold the shard's
     # populated cell words — ``cell_to_slice`` pooled, the streaming running
-    # state merged (dict counts or arena cell ids, via ``occupied_cells``) — so
+    # state merged (via ``occupied_cells``) — so
     # the occupied set is in hand with no extra observation pass.
     if occupied_out is not None:
         if buffered is not None:
@@ -607,7 +614,16 @@ def process_shard(
     single_ragged: dict = {}
     for block_index, chunk_children in chunk_iter:
         chunk_children = np.asarray(chunk_children)
-        if buffered is not None:
+        if spill_mode:
+            # Spill path (issue #217): the chunk's partition is read back and
+            # driven through the pooled aggregation machinery (single-block) or
+            # emitted from the cross-block merged state (multi-block); either
+            # way the return is the full _aggregate_chunk_cells 5-tuple, so
+            # located ragged fields and chunk_precompute are served.
+            stats_arrays, ragged_payloads, ragged_idx, ragged_locs, cwd = buffered.chunk_outputs(
+                chunk_children, agg_fields
+            )
+        elif buffered is not None:
             # Buffered path (issue #148 phase 4): emit this chunk's outputs from
             # the running merged state; chunk_precompute is rejected at validation
             # so there are no chunk scalars to evaluate. Located ragged fields
@@ -616,7 +632,7 @@ def process_shard(
             stats_arrays, ragged_payloads, ragged_idx, cwd = buffered.chunk_outputs(
                 chunk_children, agg_fields
             )
-            ragged_locs: dict = {}
+            ragged_locs = {}
         else:
             # Per-chunk precompute (issue #82 phase 6): pool only this chunk's rows
             # from the shard's sorted column arrays, then reduce the anchor over them.
@@ -684,8 +700,21 @@ def process_shard(
 
     logger.info(f"  Statistics: {cells_with_data} cells with data")
 
+    if spill_mode:
+        # Every partition was consumed by the chunk loop; this releases any
+        # remainder (defensive) and the cached grouped partition.
+        buffered.close()
+
     if profile:
         phase_timings["aggregate"] = time.time() - _aggregate_t0
+        if spill_mode:
+            # The espg-approved /tmp throughput instrumentation (issue #217):
+            # exact bytes spilled plus the wall spent in partition appends and
+            # read-backs. Read-backs can land in either the read phase (block
+            # closes mid-read) or the aggregate phase (single-block reduce).
+            phase_timings["spill_write_s"] = buffered.spill_write_s
+            phase_timings["spill_read_s"] = buffered.spill_read_s
+            phase_timings["spill_bytes"] = buffered.spill_bytes
         metadata["phase_timings"] = phase_timings
 
     duration = (datetime.now() - start_time).total_seconds()

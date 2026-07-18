@@ -69,13 +69,33 @@ def from_config(
         # dispatch shard; a hive leaf bundles them into one object per array.
         # The grid no-ops sharding when K==1, so single-chunk grids stay
         # unaffected.
+        child_order = get_child_order(config)
+        sharded = get_sharded(config, default=True)
+        chunk_inner = grid_cfg.get("chunk_inner")
+        # issue #259: with sharding on (the default) but chunk_inner omitted, the
+        # grid used to fall to chunk_order == parent_order — K==1 — and silently
+        # disable sharding, so a config that only set `sharded: true` still paid a
+        # whole-shard object fetch per single-cell read. Derive the 64x64
+        # (= 4^6 = 4096-cell) inner chunk the flagship configs hand-set as
+        # `chunk_inner: 13` — chunk_order = child_order - 6, engaged only when it
+        # exceeds parent_order. When child_order - 6 <= parent_order the shard
+        # already spans <= one inner chunk, so leave it None (the value would just
+        # reproduce the K==1 no-op). (child_order - 6 <= child_order always, so no
+        # upper bound is needed — the constructor's parent<=chunk<=child holds.)
+        # Gate on fullsphere (the sole supported geometry since issue #88 removed
+        # dense) so any other layout falls straight through to the constructor's
+        # "Unknown layout" error rather than deriving first.
+        if chunk_inner is None and sharded and layout == "fullsphere":
+            derived = child_order - 6
+            if derived > resolved_parent:
+                chunk_inner = derived
         return HealpixGrid(
             parent_order=resolved_parent,
-            child_order=get_child_order(config),
+            child_order=child_order,
             layout=layout,
             config=config,
-            chunk_inner=grid_cfg.get("chunk_inner"),
-            sharded=get_sharded(config, default=True),
+            chunk_inner=chunk_inner,
+            sharded=sharded,
         )
     if grid_type == "rectilinear":
         required = ("crs", "resolution", "bounds")

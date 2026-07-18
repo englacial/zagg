@@ -406,6 +406,58 @@ class TestFromConfig:
         g_explicit = from_config(cfg, parent_order=6)
         assert g_default._spec().model_dump() == g_explicit._spec().model_dump()
 
+    def test_chunk_inner_derived_when_omitted(self):
+        # issue #259: fullsphere + sharded default + chunk_inner omitted derives the
+        # 64x64 (= 4^6 = 4096-cell) inner chunk (chunk_order == child_order - 6),
+        # engaging sharding instead of silently no-oping to a whole-shard single-cell
+        # read. The derived value reproduces the flagship configs' hand-set
+        # chunk_inner: 13 (parent 11 / child 19).
+        cfg = default_config("atl03_gain_bias_healpix")
+        del cfg.output["grid"]["chunk_inner"]
+        g = from_config(cfg)
+        assert g.chunk_order == 13
+        assert g.cells_per_chunk == 4**6  # 64x64
+        assert g.chunks_per_shard == 4 ** (13 - 11)  # K == 16
+        assert g.sharded is True
+
+    def test_chunk_inner_derivation_floors_at_parent(self, cfg):
+        # child_order - 6 <= parent_order: the shard already spans <= one 64x64
+        # inner chunk, so the derivation leaves chunk_inner None (K==1 no-op).
+        # The atl06 fixture is parent 6 / child 12 -> 12 - 6 == 6 == parent.
+        g = from_config(cfg, parent_order=6)
+        assert g.chunk_order == 6
+        assert g.chunks_per_shard == 1
+        assert g.sharded is False
+
+    def test_chunk_inner_explicit_not_overridden(self):
+        # An explicit chunk_inner is honored verbatim, never replaced by the
+        # derived 64x64 target.
+        cfg = default_config("atl03_gain_bias_healpix")
+        cfg.output["grid"]["chunk_inner"] = 15
+        g = from_config(cfg)
+        assert g.chunk_order == 15
+
+    def test_chunk_inner_not_derived_when_unsharded(self):
+        # An explicit sharded:false opts out of the derivation too: with no
+        # bundling, a derived inner chunk would just add K regular objects with
+        # no benefit, so the grid stays K==1 / one object per shard.
+        cfg = default_config("atl03_gain_bias_healpix")
+        del cfg.output["grid"]["chunk_inner"]
+        cfg.output["grid"]["sharded"] = False
+        g = from_config(cfg)
+        assert g.sharded is False
+        assert g.chunks_per_shard == 1
+
+    def test_chunk_inner_derivation_leaves_dense_raising(self):
+        # Dense was removed (issue #88): a config still selecting it must raise
+        # "Unknown layout". The #259 derivation is fullsphere-gated, so an omitted
+        # chunk_inner does not mask or alter that — the clean error still surfaces.
+        cfg = default_config("atl03_gain_bias_healpix")
+        del cfg.output["grid"]["chunk_inner"]
+        cfg.output["grid"]["layout"] = "dense"
+        with pytest.raises(ValueError, match="Unknown layout"):
+            from_config(cfg)
+
 
 class TestBackcompatWrapper:
     """xdggs_zarr_template (the public API) must keep producing the same
