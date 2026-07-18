@@ -679,8 +679,19 @@ def _handle_setup(event: Dict[str, Any]) -> Dict[str, Any]:
         if (config.data_source or {}).get("reader") == "raster":
             import numpy as np
 
+            from zagg.config import get_layout
             from zagg.processing.raster import emit_raster_template
 
+            if get_layout(config) == "dense":
+                # Symmetry with the worker (_handle_process_raster): dense keys
+                # blocks by populated-shard position, unreconstructable from an
+                # invoke-only setup event, so from_config below would raise an
+                # opaque RuntimeError -> 500. Reject it with the worker's clean
+                # 400 instead. RasterStrategy.run rejects dense pre-dispatch too
+                # (runner.py), so this is defense-in-depth (issue #264).
+                error_msg = "raster lambda workers require output.grid.layout: fullsphere"
+                logger.error(error_msg)
+                return {"statusCode": 400, "body": json.dumps({"error": error_msg})}
             store = open_store(event["store_path"], **_output_store_kwargs(event))
             grid = from_config(config)
             times_us = np.asarray(event["times_us"], dtype=np.int64)
