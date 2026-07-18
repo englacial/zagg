@@ -516,6 +516,8 @@ class TestWorkerSizeVariants:
             for logical, group_suffix, metric_stem in (
                 (f"WorkerFn{size}", f"-{size}", f"Worker{size}"),
                 (f"WorkerFn{size}Disk", f"-{size}-disk", f"Worker{size}Disk"),
+                # Test-env -disk variants (issue #272): the per-merge spill arm.
+                (f"WorkerTestFn{size}Disk", f"-test-{size}-disk", f"WorkerTest{size}Disk"),
             ):
                 for kind, pattern, metric in (
                     ("SelfRecycleFilter", recycle, f"{metric_stem}SelfRecycleCount"),
@@ -550,7 +552,7 @@ class TestWorkerSizeVariants:
                 if isinstance(fltr, dict) and fltr.get("Type") == "AWS::Logs::MetricFilter"
             )
         ]
-        assert len(names) == len(set(names)) == 16  # 8 functions x 2 filters
+        assert len(names) == len(set(names)) == 22  # 11 functions x 2 (8 + 3 test-disk, #272)
 
     def test_outputs_expose_variant_arns(self):
         tpl = TestTemplateEnvironment._load_template()

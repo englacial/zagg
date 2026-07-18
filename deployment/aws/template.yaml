@@ -551,6 +551,79 @@ Resources:
               MetricValue: "1"
               DefaultValue: 0
 
+  # Test-env -disk variants (issue #272): the per-MERGE benchmark dispatches to
+  # the freshly-deployed test function (``${FunctionName}-test``), so its spill
+  # arm resolves to ``${FunctionName}-test-<size>-disk``. This mirrors the
+  # WorkerDiskVariants loop above with a ``-test-`` infix so those functions
+  # exist. CAVEAT (review): like the stable variants these are stamped with the
+  # stack artifact (``FunctionS3Key``) at standup, so the per-PR deploy-test step
+  # (lambda-benchmark.yml -> deploy_lambda.sh) must ALSO update-function-code
+  # these, or the per-merge spill arm runs stale/stable code, not the PR's.
+  'Fn::ForEach::WorkerTestDiskVariants':
+    - WorkerMemory
+    - !Ref WorkerMemorySizes
+    - 'WorkerTestFn${WorkerMemory}Disk':
+        Type: AWS::Lambda::Function
+        Properties:
+          FunctionName: !Sub "${FunctionName}-test-${WorkerMemory}-disk"
+          Handler: lambda_handler.lambda_handler
+          Runtime: python3.12
+          Architectures: [!Ref Architecture]
+          MemorySize: !Ref WorkerMemory
+          Timeout: !Ref Timeout
+          Role: !If [ShouldCreateRole, !GetAtt ExecutionRole.Arn, !Ref ExecutionRoleArn]
+          Layers: [!Ref DepsLayer]
+          EphemeralStorage:
+            Size: !FindInMap [WorkerDiskTmp, !Ref WorkerMemory, SizeMb]
+          Environment:
+            Variables:
+              MALLOC_ARENA_MAX: !Ref MallocArenaMax
+              MALLOC_TRIM_THRESHOLD_: !Ref MallocTrimThreshold
+              ZAGG_RECYCLE_RSS_MB: !Ref RecycleRssMb
+              ZAGG_RECYCLE_MAX_INVOCATIONS: !Ref RecycleMaxInvocations
+          Code:
+            S3Bucket: !Ref ArtifactBucket
+            S3Key: !Ref FunctionS3Key
+      'WorkerTestFn${WorkerMemory}DiskAsyncConfig':
+        Type: AWS::Lambda::EventInvokeConfig
+        Properties:
+          FunctionName: !Ref
+            'Fn::Sub': 'WorkerTestFn${WorkerMemory}Disk'
+          Qualifier: "$LATEST"
+          MaximumRetryAttempts: 0
+          MaximumEventAgeInSeconds: 60
+      'WorkerTestFn${WorkerMemory}DiskSelfRecycleFilter':
+        Type: AWS::Logs::MetricFilter
+        Condition: ShouldCreateMetricFilters
+        Properties:
+          LogGroupName: !Sub
+            - '/aws/lambda/${WorkerName}'
+            - WorkerName: !Ref
+                'Fn::Sub': 'WorkerTestFn${WorkerMemory}Disk'
+          FilterPattern: '"ZAGG_SELF_RECYCLE"'
+          MetricTransformations:
+            - MetricNamespace: zagg/lambda
+              MetricName: !Sub 'WorkerTest${WorkerMemory}DiskSelfRecycleCount'
+              MetricValue: "1"
+              DefaultValue: 0
+      'WorkerTestFn${WorkerMemory}DiskWorkerErrorFilter':
+        Type: AWS::Logs::MetricFilter
+        Condition: ShouldCreateMetricFilters
+        Properties:
+          LogGroupName: !Sub
+            - '/aws/lambda/${WorkerName}'
+            - WorkerName: !Ref
+                'Fn::Sub': 'WorkerTestFn${WorkerMemory}Disk'
+          FilterPattern: >-
+            ?"Task timed out" ?"Runtime.OutOfMemory"
+            ?"Runtime exited with error" ?"[ERROR]"
+            ?"Traceback (most recent call last)"
+          MetricTransformations:
+            - MetricNamespace: zagg/lambda
+              MetricName: !Sub 'WorkerTest${WorkerMemory}DiskWorkerErrorCount'
+              MetricValue: "1"
+              DefaultValue: 0
+
 Outputs:
   FunctionArn:
     Description: ARN of the deployed Lambda function.
@@ -584,4 +657,9 @@ Outputs:
         Description: 'ARN of the extra-disk worker variant (issue #235).'
         Value: !GetAtt
           - !Sub 'WorkerFn${WorkerMemory}Disk'
+          - Arn
+      'WorkerTestFn${WorkerMemory}DiskArn':
+        Description: 'ARN of the test-env extra-disk worker variant (issue #272).'
+        Value: !GetAtt
+          - !Sub 'WorkerTestFn${WorkerMemory}Disk'
           - Arn
