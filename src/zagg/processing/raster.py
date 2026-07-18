@@ -818,12 +818,29 @@ def emit_raster_template(store, grid, config, times_us: np.ndarray, *, overwrite
     """Write the raster template and its ``time`` coordinate values."""
     from zarr import config as zarr_config
     from zarr import open_array
+    from zarr.errors import ArrayNotFoundError, ContainsGroupError
 
+    times_us = np.asarray(times_us, dtype=np.int64)
     spec = raster_group_spec(grid, config, int(len(times_us)))
+    time_path = f"{grid.group_path}/time"
     with zarr_config.set({"async.concurrency": 128}):
+        if not overwrite:
+            # ``to_zarr(overwrite=False)`` only refuses a template whose SPEC
+            # differs (a changed timestep COUNT -> different ``time`` shape ->
+            # ContainsGroupError). A store already holding a same-length but
+            # different-valued time axis slips past it, and the unconditional
+            # ``arr[:]`` below would silently rewrite the coordinate the
+            # workers slab-write against. Refuse that too, so overwrite=False
+            # uniformly won't clobber a differing template (issue #264).
+            try:
+                existing = open_array(store, path=time_path, zarr_format=3, consolidated=False)
+            except ArrayNotFoundError:
+                existing = None
+            if existing is not None and not np.array_equal(existing[:], times_us):
+                raise ContainsGroupError(store, grid.group_path)
         spec.to_zarr(store, grid.group_path, overwrite=overwrite)
-        arr = open_array(store, path=f"{grid.group_path}/time", zarr_format=3, consolidated=False)
-        arr[:] = np.asarray(times_us, dtype=np.int64)
+        arr = open_array(store, path=time_path, zarr_format=3, consolidated=False)
+        arr[:] = times_us
     return store
 
 

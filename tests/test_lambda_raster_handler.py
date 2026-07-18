@@ -328,6 +328,29 @@ class TestRasterSetupMode:
         )
         np.testing.assert_array_equal(tarr[:], np.asarray(changed, dtype=np.int64))
 
+    def test_setup_rerun_same_count_different_values_500(self, handler_mod, tmp_path):
+        # A rerun over a different catalog with the SAME timestep count but
+        # shifted values must refuse (500) without overwrite, not silently
+        # rewrite the persisted time coord out from under the workers' time
+        # index (issue #264). The original coordinate is left intact.
+        store_path = tmp_path / "samect.zarr"
+        first = handler_mod._handle_setup(self._setup_event(store_path, self.TIMES))
+        assert first["statusCode"] == 200, first["body"]
+        shifted = [self.TIMES[0], self.TIMES[1] + 86_400_000_000]
+        refuse = handler_mod._handle_setup(self._setup_event(store_path, shifted))
+        assert refuse["statusCode"] == 500
+        grid = from_config(load_config_from_dict(_config_dict(store_path)))
+        tarr = open_array(
+            str(store_path) + f"/{grid.group_path}/time", zarr_format=3, consolidated=False
+        )
+        np.testing.assert_array_equal(tarr[:], np.asarray(self.TIMES, dtype=np.int64))
+        redo = handler_mod._handle_setup(self._setup_event(store_path, shifted, overwrite=True))
+        assert redo["statusCode"] == 200, redo["body"]
+        tarr = open_array(
+            str(store_path) + f"/{grid.group_path}/time", zarr_format=3, consolidated=False
+        )
+        np.testing.assert_array_equal(tarr[:], np.asarray(shifted, dtype=np.int64))
+
 
 class TestRasterPhaseTimings:
     def test_profile_emits_sample_write_split(self, handler_mod, raster_event):
