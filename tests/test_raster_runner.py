@@ -413,8 +413,11 @@ class TestRasterLambdaBackend:
 
         fake = _FakeLambdaClient(responder)
         monkeypatch.setattr(boto3, "client", lambda *a, **k: fake)
-        with pytest.raises(RuntimeError, match="redeploy"):
+        with pytest.raises(RuntimeError, match="redeploy") as excinfo:
             agg(cfg, catalog=sm_path, store="s3://bucket/out.zarr", backend="lambda")
+        # The shared ping is pipeline-neutral (issue #264): a raster operator
+        # must not get hive-worded guidance for a raster run.
+        assert "hive" not in str(excinfo.value).lower()
         assert [e["mode"] for e in fake.events] == ["ping"]
 
     def test_stale_setup_echo_fails_fast_no_fanout(self, manifest, monkeypatch):

@@ -3373,14 +3373,14 @@ def _invoke_lambda_ping(
             )
         raise RuntimeError(
             f"Lambda ping failed (response body {result.get('body')!r}): the "
-            f"deployed function predates the issue #252 hive dispatch "
-            f"lifecycle — redeploy the function before dispatching hive runs"
+            f"deployed function predates the issue #252 dispatch lifecycle — "
+            f"redeploy the function before dispatching this run"
         )
     try:
         version = json.loads(result.get("body") or "{}").get("zagg_version")
     except (TypeError, ValueError):
         version = None
-    logger.info(f"Hive preflight OK (function zagg version {version})")
+    logger.info(f"Preflight OK (function zagg version {version})")
 
 
 def _invoke_lambda_finalize(
