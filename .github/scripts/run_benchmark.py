@@ -196,6 +196,26 @@ def run_target(
         config.data_source["index"] = {"backend": "inline"}
     elif backend == "hierarchical":
         config.data_source["index"] = {"backend": "hierarchical"}
+    # Streaming-mode axis (issue #272): a target may run the spill path on the
+    # disk-provisioned worker (issue #235/#258) instead of the default merge
+    # path. Inject the mode into the aggregation block and the worker-size
+    # selector into ``config.worker``; the target's ``worker`` block resolves the
+    # pre-provisioned ``-disk`` variant OFF the base function name (so the release
+    # ``process-shard`` -> ``process-shard-4096-disk`` and the per-merge test
+    # ``process-shard-test`` -> ``process-shard-test-4096-disk``). ``tmp_mb`` (the
+    # #258 rule: memory + 2048 for ``-disk``, else 512) is threaded into the
+    # record so bench_metrics can bill the ephemeral /tmp cost.
+    streaming_mode = target.get("streaming_mode")
+    if streaming_mode:
+        config.aggregation.setdefault("streaming", {})["mode"] = streaming_mode
+    worker = target.get("worker")
+    tmp_mb = None
+    resolved_function_name = function_name
+    if worker:
+        config.worker = dict(worker)
+        suffix = f"-{worker['memory']}" + ("-disk" if worker.get("extra_disk") else "")
+        resolved_function_name = function_name + suffix
+        tmp_mb = worker["memory"] + 2048 if worker.get("extra_disk") else 512
     # parent_order lives in the config grid for HEALPix; the kwarg is just a
     # legacy fallback. Rect grids ignore it. ``from_config`` gives us the grid
     # object the area/cost derivation needs.
@@ -223,6 +243,10 @@ def run_target(
         # target's config, so the hive regression arm is identifiable in the
         # series (renderers key the 2x2 panels on flat rows).
         store_layout=get_store_layout(config),
+        # Streaming-mode + ephemeral axis (issue #272): "spill" on the -disk arm,
+        # its /tmp size for the ephemeral cost. None on the default merge targets.
+        streaming_mode=streaming_mode,
+        tmp_mb=tmp_mb,
     )
 
     objects = None
@@ -250,7 +274,7 @@ def run_target(
             # string for HEALPix — issue #199), not the raw packed-word digits.
             morton_cell=grid.shard_label(shard_key),
             region=region,
-            function_name=function_name,
+            function_name=resolved_function_name,
             overwrite=True,
             handoff=handoff,
             profile=True,
