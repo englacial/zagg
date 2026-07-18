@@ -615,16 +615,20 @@ class RasterStrategy:
     the template emission (and, later, the single-writer resize on append).
 
     Backends: ``"local"`` (thread pool, in-process workers) and ``"lambda"``
-    (one synchronous ``mode="process_raster"`` invoke per shard —
-    espg-confirmed scope on issue #218). The lambda cut is deliberately the
-    simple transport: synchronous invokes with transient-only retries; the
-    issue-151 async result-object channel and the preflight concurrency probe
-    are follow-ups (raster shards are seconds of COG windows, well inside NAT
-    idle limits). Either way the runner owns the global time index before
-    fan-out (the single-writer append design); the template write is
-    orchestrator-side on the local backend but rides the sync setup invoke on
-    lambda (issue #264 — the dispatcher may hold an invoke-only role with no
-    S3 write access, e.g. the CI OIDC benchmark role).
+    (one ``mode="process_raster"`` invoke per shard — espg-confirmed scope on
+    issue #218). The lambda shard fan-out defaults to the issue-151 async
+    result-object channel (``invocation="async"``, issue #286): each shard is
+    a fire-and-forget ``InvocationType="Event"`` invoke and the dispatcher
+    polls a per-shard result object the worker mirrors, so a shard running
+    longer than a GitHub runner's ~4 min synchronous-HTTP (NAT idle) tolerance
+    no longer severs the dispatcher. ``invocation="sync"`` keeps the legacy
+    synchronous ``RequestResponse`` transport (byte-identical events, no
+    result object). The preflight concurrency probe stays a follow-up. Either
+    way the runner owns the global time index before fan-out (the
+    single-writer append design); the template write is orchestrator-side on
+    the local backend but rides the SYNC setup invoke on lambda even under
+    async shard dispatch (issue #264 — the dispatcher may hold an invoke-only
+    role with no S3 write access, e.g. the CI OIDC benchmark role).
 
     Summary schema note: ``total_obs`` is shared with the spatial/temporal
     strategies so a caller sees one summary shape across pipeline kinds. On the
@@ -661,6 +665,7 @@ class RasterStrategy:
         output_credentials,
         output_endpoint_url,
         profile=False,
+        invocation="async",
         **_ignored,
     ):
         from zagg.processing.raster import (
@@ -738,6 +743,7 @@ class RasterStrategy:
                 store_layout=store_layout,
                 dataset={"short_name": md.get("short_name"), "version": md.get("version")},
                 profile=profile,
+                invocation=invocation,
             )
 
         # Local backend: template emission stays orchestrator-owned (the
@@ -940,8 +946,23 @@ class RasterStrategy:
         store_layout="flat",
         dataset=None,
         profile=False,
+        invocation="async",
     ):
-        """Fan shards out, one synchronous ``mode="process_raster"`` invoke each.
+        """Fan shards out, one ``mode="process_raster"`` invoke each.
+
+        The shard fan-out defaults to the issue-151 async result-object
+        channel (``invocation="async"``, issue #286): each shard is a
+        fire-and-forget ``InvocationType="Event"`` invoke and the dispatcher
+        polls ``<store>.status/<run>/<shard_label>.json`` (per-window suffix on
+        hive) for the worker's mirrored envelope, with the poll deadline keyed
+        to the function timeout + margin. No synchronous connection sits open
+        while a shard runs, so a shard longer than a GitHub runner's ~4 min NAT
+        idle tolerance survives (the #286 failure mode). ``invocation="sync"``
+        keeps the legacy synchronous ``RequestResponse`` invoke, byte-identical
+        to the pre-#286 transport (no ``result_url`` on the event). The
+        ping/setup lifecycle stays SYNCHRONOUS under either mode (only the
+        shard fan-out goes async) so the load-bearing template write still
+        lands before fan-out (issue #264, below).
 
         Before fan-out the lifecycle is ping → setup. Flat (issue #264): the
         lightweight ``mode="ping"`` fails fast on a pre-#252 deployment with
@@ -965,6 +986,8 @@ class RasterStrategy:
         import boto3
         from botocore.config import Config
 
+        if invocation not in ("async", "sync"):
+            raise ValueError(f"Unknown invocation: {invocation!r} (expected 'async' or 'sync')")
         function_name = _resolve_function_name(config, function_name)
         max_workers = min(max_workers or 64, len(cells)) or 1
         client = boto3.client(
@@ -988,6 +1011,23 @@ class RasterStrategy:
         output_creds_event = _build_output_creds_event(
             output_credentials, output_endpoint_url, region
         )
+        # Async result channel (issue #286, mirroring the spatial #151 path): a
+        # per-run unique ``.status`` prefix next to the output store. Each shard
+        # worker mirrors its response envelope to <prefix>/<shard_label>.json
+        # (per-window suffix on hive, issue #247) and the dispatch threads poll
+        # for it instead of holding a synchronous invoke open — GitHub-hosted
+        # runners sit behind a ~4 min NAT idle timeout that severs longer
+        # synchronous shards. The poll deadline is keyed to the function
+        # Timeout, read once here. ``invocation="sync"`` skips the channel
+        # (legacy RequestResponse). Only the SHARD fan-out goes async; the
+        # ping/setup lifecycle below stays synchronous (issue #264).
+        result_prefix = None
+        result_box: dict = {}
+        function_timeout_s = _DEFAULT_FUNCTION_TIMEOUT_S
+        if invocation == "async":
+            result_prefix = f"{store_path.rstrip('/')}.status/{uuid.uuid4().hex}"
+            function_timeout_s = _get_function_timeout_s(client, function_name)
+            logger.info(f"Async raster results at {result_prefix}")
         # Ping → setup, bracketed as template_s (the setup-ish wall the
         # benchmark splits from fan-out, issue #250). Flat: the template is
         # load-bearing before fan-out — workers write slabs into its arrays —
@@ -1066,51 +1106,36 @@ class RasterStrategy:
                 ev["output_credentials"] = output_creds_event
             return ev
 
-        # Substring markers for a transient invoke fault, matched
-        # case-insensitively (parity intent with _invoke_lambda_cell's policy,
-        # #119): throttles, service faults, connection resets, and read timeouts
-        # retry with jittered backoff; everything else is a deterministic error.
-        transient_markers = (
-            "toomanyrequests",
-            "throttling",
-            "serviceexception",
-            "connection",
-            "timeout",
-        )
-
         def _one(pair):
-            payload = json.dumps(_event(*pair))
-            last = None
-            for attempt in range(max_retries):
-                try:
-                    resp = client.invoke(
-                        FunctionName=function_name,
-                        InvocationType="RequestResponse",
-                        Payload=payload,
-                    )
-                    raw_text = resp["Payload"].read().decode("utf-8")
-                    if resp.get("FunctionError"):
-                        # Deterministic for a given shard (timeout/OOM/unhandled):
-                        # never retried, mirroring _invoke_lambda_cell (#119).
-                        return {"error": f"Lambda error: {raw_text[:150]}", "body": {}}
-                    raw = json.loads(raw_text)
-                    body = json.loads(raw.get("body", "{}"))
-                    if raw.get("statusCode") != 200:
-                        return {
-                            "error": body.get("error", f"status {raw.get('statusCode')}"),
-                            "body": body,
-                        }
-                    return {"error": None, "body": body}
-                except Exception as e:
-                    raise_for_fd_exhaustion(e, max_workers)
-                    last = str(e)
-                    low = last.lower()
-                    if not any(t in low for t in transient_markers) or attempt == max_retries - 1:
-                        return {"error": last, "body": {}}
-                    # Jitter the backoff so a wide synchronous fan-out does not
-                    # retry in a synchronized wave (mirrors _invoke_lambda_cell).
-                    time.sleep(min(2**attempt, 8) * (0.5 + random.random() / 2))
-            return {"error": last, "body": {}}
+            # (shard, records) pairs, or (shard, records, window) triples when a
+            # window schedule fanned the dispatch (issue #247).
+            shard_key = pair[0]
+            window = pair[2] if len(pair) > 2 else None
+            event = _event(*pair)
+            extra = {}
+            # Async dispatch (issue #286): tell the worker where to mirror its
+            # envelope, how to poll for it, and how long to wait (function
+            # timeout + margin). Status objects are named by the shard label —
+            # the decimal morton string for HEALPix (issue #199) — with the
+            # window label suffixed on hive so two windows of one shard cannot
+            # clobber each other's object (mirroring the leaf naming, #246).
+            # Sync runs pass none of these, keeping the event byte-identical.
+            if result_prefix is not None:
+                label = shard_label(grid, int(shard_key))
+                key = f"{label}.json" if window is None else f"{label}_{window['label']}.json"
+                extra["result_url"] = f"{result_prefix}/{key}"
+                extra["result_fetch"] = _result_fetcher(
+                    result_box, result_prefix, output_creds_event, region, key
+                )
+                extra["poll_timeout_s"] = function_timeout_s + _ASYNC_POLL_MARGIN_S
+            return _invoke_lambda_raster(
+                client,
+                event,
+                function_name=function_name,
+                max_retries=max_retries,
+                max_workers=max_workers,
+                **extra,
+            )
 
         t0 = time.time()
         shards_with_data = 0
@@ -3274,6 +3299,116 @@ def _poll_lambda_result(
             }
         # Sub-second jitter de-synchronizes the fan-out's poll bursts.
         time.sleep(poll_interval_s + (time.time() % 1))
+
+
+def _invoke_lambda_raster(
+    lambda_client,
+    event,
+    *,
+    function_name,
+    max_retries=3,
+    max_workers=None,
+    result_url=None,
+    result_fetch=None,
+    poll_timeout_s=None,
+):
+    """Invoke Lambda ``mode="process_raster"`` for one shard (issue #218/#286).
+
+    Returns ``{"error": str | None, "body": dict}`` -- the shape
+    :meth:`RasterStrategy._run_lambda_shards` folds into its summary. Sync
+    (``result_url`` absent) reads the worker's envelope off the
+    ``RequestResponse`` payload, byte-identical to the pre-#286 transport.
+    Async (``result_url`` present, issue #286) flips the invoke to
+    fire-and-forget ``InvocationType="Event"`` and polls ``result_fetch`` (a
+    zero-arg callable returning the parsed envelope + post time, or None while
+    absent) for the worker's mirrored envelope until ``poll_timeout_s`` -- no
+    synchronous connection sits open while the shard runs, so a shard longer
+    than a GitHub runner's ~4 min NAT idle tolerance survives (the #286
+    failure mode). The raster twin of :func:`_invoke_lambda_cell`: a
+    ``FunctionError`` / non-200 envelope is a deterministic shard error, never
+    retried (#119); only transient client-side invoke faults back off and retry.
+    """
+    # Transient invoke-fault markers, matched case-insensitively (parity with
+    # _invoke_lambda_cell's policy, #119): throttles, service faults,
+    # connection resets, and read timeouts retry with jittered backoff;
+    # everything else is a deterministic shard error.
+    transient_markers = (
+        "toomanyrequests",
+        "throttling",
+        "serviceexception",
+        "connection",
+        "timeout",
+    )
+    invocation_type = "RequestResponse"
+    if result_url is not None:
+        # Rebuild so the event dict the caller holds stays free of result_url
+        # (the sync-path invariant) — only this Event copy carries it.
+        event = {**event, "result_url": result_url}
+        invocation_type = "Event"
+
+    # json.dumps is ASCII by default, so len() is the request byte size. Gate
+    # async payloads against the 256 KB Event cap with a remedy up front,
+    # mirroring _invoke_lambda_cell, rather than letting Lambda reject each
+    # attempt with a raw RequestEntityTooLargeException.
+    payload = json.dumps(event)
+    if invocation_type == "Event" and len(payload) > _ASYNC_PAYLOAD_CAP_BYTES:
+        raise ValueError(
+            f"raster shard {event.get('shard_key')} event payload is {len(payload):,} "
+            f"bytes, over the {_ASYNC_PAYLOAD_CAP_BYTES:,}-byte async dispatch budget "
+            '(Lambda caps Event invokes at 256 KB): pass invocation="sync" for this '
+            "run, or dispatch fewer granules per shard"
+        )
+
+    wall_start = time.time()
+    last = None
+    for attempt in range(max_retries):
+        try:
+            resp = lambda_client.invoke(
+                FunctionName=function_name,
+                InvocationType=invocation_type,
+                Payload=payload,
+            )
+            if result_url is not None:
+                # 202 accepted -- an Event invoke returns no payload; the worker
+                # mirrors its envelope to result_url. Poll with the shared
+                # spatial machinery and map to the raster {error, body} shape.
+                polled = _poll_lambda_result(
+                    result_fetch,
+                    int(event["shard_key"]),
+                    0,
+                    wall_start,
+                    attempt,
+                    poll_timeout_s,
+                )
+                body = polled.get("body") or {}
+                error = polled.get("error")
+                status = polled.get("status_code")
+                if not error and status is not None and status != 200:
+                    error = body.get("error", f"status {status}")
+                return {"error": error, "body": body}
+            raw_text = resp["Payload"].read().decode("utf-8")
+            if resp.get("FunctionError"):
+                # Deterministic for a given shard (timeout/OOM/unhandled):
+                # never retried, mirroring _invoke_lambda_cell (#119).
+                return {"error": f"Lambda error: {raw_text[:150]}", "body": {}}
+            raw = json.loads(raw_text)
+            body = json.loads(raw.get("body", "{}"))
+            if raw.get("statusCode") != 200:
+                return {
+                    "error": body.get("error", f"status {raw.get('statusCode')}"),
+                    "body": body,
+                }
+            return {"error": None, "body": body}
+        except Exception as e:
+            raise_for_fd_exhaustion(e, max_workers)
+            last = str(e)
+            low = last.lower()
+            if not any(t in low for t in transient_markers) or attempt == max_retries - 1:
+                return {"error": last, "body": {}}
+            # Jitter the backoff so a wide fan-out does not retry in a
+            # synchronized wave (mirrors _invoke_lambda_cell).
+            time.sleep(min(2**attempt, 8) * (0.5 + random.random() / 2))
+    return {"error": last, "body": {}}
 
 
 def _force_cold_containers(lambda_client, function_name, *, wait_s=120, poll_interval_s=2.0):

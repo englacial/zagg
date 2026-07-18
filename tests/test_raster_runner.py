@@ -325,6 +325,12 @@ class TestRasterLambdaBackend:
     # orchestrator (the template rides the sync setup invoke), so these tests
     # no longer intercept open_store for the s3 URL — a regression to an
     # orchestrator-side write would surface as a real-S3 attempt.
+    #
+    # Issue #286: the shard fan-out now DEFAULTS to the async result-object
+    # channel; these tests pin ``invocation="sync"`` so they remain the
+    # byte-identical synchronous-transport regression suite (no result_url on
+    # the shard event, RequestResponse invoke). The async default is covered by
+    # TestRasterLambdaAsyncBackend / TestInvokeLambdaRaster.
 
     def test_events_and_summary(self, manifest, monkeypatch, tmp_path):
         import boto3
@@ -342,7 +348,12 @@ class TestRasterLambdaBackend:
         fake = _FakeLambdaClient(_lifecycle(responder))
         monkeypatch.setattr(boto3, "client", lambda *a, **k: fake)
         summary = agg(
-            cfg, catalog=sm_path, store="s3://bucket/out.zarr", backend="lambda", max_workers=2
+            cfg,
+            catalog=sm_path,
+            store="s3://bucket/out.zarr",
+            backend="lambda",
+            max_workers=2,
+            invocation="sync",
         )
         assert summary["backend"] == "lambda"
         assert summary["total_cells"] == 1 and summary["cells_with_data"] == 1
@@ -383,7 +394,7 @@ class TestRasterLambdaBackend:
             return real_open(path, **kw)
 
         monkeypatch.setattr(runner_mod, "open_store", guard_open)
-        agg(cfg, catalog=sm_path, store="s3://bucket/out.zarr", backend="lambda")
+        agg(cfg, catalog=sm_path, store="s3://bucket/out.zarr", backend="lambda", invocation="sync")
         assert [e["mode"] for e in fake.events] == ["ping", "setup", "process_raster"]
         ping, setup = fake.events[0], fake.events[1]
         expected_config = {
@@ -418,7 +429,13 @@ class TestRasterLambdaBackend:
         fake = _FakeLambdaClient(responder)
         monkeypatch.setattr(boto3, "client", lambda *a, **k: fake)
         with pytest.raises(RuntimeError, match="redeploy") as excinfo:
-            agg(cfg, catalog=sm_path, store="s3://bucket/out.zarr", backend="lambda")
+            agg(
+                cfg,
+                catalog=sm_path,
+                store="s3://bucket/out.zarr",
+                backend="lambda",
+                invocation="sync",
+            )
         # The shared ping is pipeline-neutral (issue #264): a raster operator
         # must not get hive-worded guidance for a raster run.
         assert "hive" not in str(excinfo.value).lower()
@@ -449,7 +466,13 @@ class TestRasterLambdaBackend:
         fake = _FakeLambdaClient(responder)
         monkeypatch.setattr(boto3, "client", lambda *a, **k: fake)
         with pytest.raises(RuntimeError, match="issue #264 raster setup branch"):
-            agg(cfg, catalog=sm_path, store="s3://bucket/out.zarr", backend="lambda")
+            agg(
+                cfg,
+                catalog=sm_path,
+                store="s3://bucket/out.zarr",
+                backend="lambda",
+                invocation="sync",
+            )
         assert [e["mode"] for e in fake.events] == ["ping", "setup"]
 
     def test_lambda_profile_threads_key_and_rolls_up(self, manifest, monkeypatch, tmp_path):
@@ -493,6 +516,7 @@ class TestRasterLambdaBackend:
             backend="lambda",
             max_workers=2,
             profile=True,
+            invocation="sync",
         )
         assert summary["worker_stage_max"] == {
             "open": 1.0,
@@ -536,6 +560,7 @@ class TestRasterLambdaBackend:
                 "aws_secret_access_key": "SECRET_SNAKE",
             },
             output_endpoint_url="https://custom.r2.example.com",
+            invocation="sync",
         )
         assert [e["mode"] for e in fake.events] == ["ping", "setup", "process_raster"]
         for event in fake.events:
@@ -555,7 +580,13 @@ class TestRasterLambdaBackend:
         fake = _FakeLambdaClient(_lifecycle(responder))
         monkeypatch.setattr(boto3, "client", lambda *a, **k: fake)
         with pytest.raises(RuntimeError, match="boom"):
-            agg(cfg, catalog=sm_path, store="s3://bucket/out.zarr", backend="lambda")
+            agg(
+                cfg,
+                catalog=sm_path,
+                store="s3://bucket/out.zarr",
+                backend="lambda",
+                invocation="sync",
+            )
 
     def test_lambda_function_error_is_shard_error(self, manifest, monkeypatch, tmp_path):
         # A Lambda FunctionError (timeout/OOM/unhandled) is a deterministic shard
@@ -570,7 +601,13 @@ class TestRasterLambdaBackend:
         fake = _FakeLambdaClient(_lifecycle(responder))
         monkeypatch.setattr(boto3, "client", lambda *a, **k: fake)
         with pytest.raises(RuntimeError, match="Lambda error"):
-            agg(cfg, catalog=sm_path, store="s3://bucket/out.zarr", backend="lambda")
+            agg(
+                cfg,
+                catalog=sm_path,
+                store="s3://bucket/out.zarr",
+                backend="lambda",
+                invocation="sync",
+            )
         # deterministic FunctionError -> no retry
         assert [e["mode"] for e in fake.events] == ["ping", "setup", "process_raster"]
 
@@ -594,7 +631,9 @@ class TestRasterLambdaBackend:
         fake = _FakeLambdaClient(_lifecycle(responder))
         monkeypatch.setattr(boto3, "client", lambda *a, **k: fake)
         monkeypatch.setattr(runner_mod.time, "sleep", lambda *a: None)
-        summary = agg(cfg, catalog=sm_path, store="s3://bucket/out.zarr", backend="lambda")
+        summary = agg(
+            cfg, catalog=sm_path, store="s3://bucket/out.zarr", backend="lambda", invocation="sync"
+        )
         assert summary["cells_error"] == 0
         assert summary["cells_with_data"] == 1
         # first shard invoke raised (transient), retried once
@@ -617,7 +656,13 @@ class TestRasterLambdaBackend:
         fake = _FakeLambdaClient(lambda event: {"statusCode": 200, "body": "{}"})
         monkeypatch.setattr(boto3, "client", lambda *a, **k: fake)
         with pytest.raises(ValueError, match="fullsphere"):
-            agg(cfg, catalog=sm_path, store="s3://bucket/out.zarr", backend="lambda")
+            agg(
+                cfg,
+                catalog=sm_path,
+                store="s3://bucket/out.zarr",
+                backend="lambda",
+                invocation="sync",
+            )
         assert fake.events == []
 
     def test_lambda_datetime_only_time_index(self, tmp_path, monkeypatch):
@@ -652,7 +697,7 @@ class TestRasterLambdaBackend:
 
         fake = _FakeLambdaClient(_lifecycle(responder))
         monkeypatch.setattr(boto3, "client", lambda *a, **k: fake)
-        agg(cfg, catalog=sm_path, store="s3://bucket/out.zarr", backend="lambda")
+        agg(cfg, catalog=sm_path, store="s3://bucket/out.zarr", backend="lambda", invocation="sync")
         assert set(seen["time_index"]) == {T0}
 
 
@@ -850,7 +895,12 @@ class TestRasterHiveLocalBackend:
 
 
 class TestRasterHiveLambdaBackend:
-    """Lambda raster hive dispatch (issue #247 phase 4): lifecycle + events."""
+    """Lambda raster hive dispatch (issue #247 phase 4): lifecycle + events.
+
+    Pinned ``invocation="sync"`` (issue #286): these exercise the hive
+    lifecycle under the synchronous shard transport. The async shard fan-out
+    (default) is covered by TestRasterLambdaAsyncBackend.
+    """
 
     def test_lifecycle_and_event_shapes(self, manifest, monkeypatch):
         # The hive manifest rides the issue #252 hybrid lifecycle: ping (read-
@@ -889,7 +939,12 @@ class TestRasterHiveLambdaBackend:
         fake = _FakeLambdaClient(responder)
         monkeypatch.setattr(boto3, "client", lambda *a, **k: fake)
         summary = agg(
-            cfg, catalog=sm_path, store="s3://bucket/out.zarr", backend="lambda", max_workers=2
+            cfg,
+            catalog=sm_path,
+            store="s3://bucket/out.zarr",
+            backend="lambda",
+            max_workers=2,
+            invocation="sync",
         )
         assert summary["total_cells"] == 2  # two (shard, window) units
         assert summary["cells_with_data"] == 2
@@ -948,7 +1003,12 @@ class TestRasterHiveLambdaBackend:
         fake = _FakeLambdaClient(responder)
         monkeypatch.setattr(boto3, "client", lambda *a, **k: fake)
         summary = agg(
-            cfg, catalog=sm_path, store="s3://bucket/out.zarr", backend="lambda", max_workers=2
+            cfg,
+            catalog=sm_path,
+            store="s3://bucket/out.zarr",
+            backend="lambda",
+            max_workers=2,
+            invocation="sync",
         )
         assert summary["cells_with_data"] == 1
 
@@ -988,7 +1048,14 @@ class TestRasterHiveLambdaBackend:
         fake = _FakeLambdaClient(responder)
         monkeypatch.setattr(boto3, "client", lambda *a, **k: fake)
         with pytest.raises(RuntimeError, match="boom"):
-            agg(cfg, catalog=sm_path, store="s3://bucket/out.zarr", backend="lambda", max_workers=2)
+            agg(
+                cfg,
+                catalog=sm_path,
+                store="s3://bucket/out.zarr",
+                backend="lambda",
+                max_workers=2,
+                invocation="sync",
+            )
 
         modes = [e["mode"] for e in fake.events]
         # Every shard 500s (two daily windows), so the run raises — but the
@@ -1013,7 +1080,7 @@ class TestRasterHiveLambdaBackend:
 
         fake = _FakeLambdaClient(_lifecycle(responder))
         monkeypatch.setattr(boto3, "client", lambda *a, **k: fake)
-        agg(cfg, catalog=sm_path, store="s3://bucket/out.zarr", backend="lambda")
+        agg(cfg, catalog=sm_path, store="s3://bucket/out.zarr", backend="lambda", invocation="sync")
         assert [e["mode"] for e in fake.events] == ["ping", "setup", "process_raster"]
         assert set(fake.events[-1]) == {
             "mode",
@@ -1073,7 +1140,12 @@ class TestRasterHiveLambdaBackend:
         fake = _FakeLambdaClient(responder)
         monkeypatch.setattr(boto3, "client", lambda *a, **k: fake)
         lam = agg(
-            cfg, catalog=sm_path, store="s3://bucket/out.zarr", backend="lambda", max_workers=2
+            cfg,
+            catalog=sm_path,
+            store="s3://bucket/out.zarr",
+            backend="lambda",
+            max_workers=2,
+            invocation="sync",
         )
         assert lam["cells_with_data"] == 2 and lam["cells_error"] == 0
         lam_root = str(s3root / "bucket/out.zarr")
