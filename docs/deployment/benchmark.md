@@ -33,7 +33,14 @@ Two release legs (`lambda-benchmark-fullaoi.yml`, tag-triggered):
   (`run_raster_benchmark.py`) dispatches through `agg(profile=True)` — the
   runner's raster path threads the profile key to the workers and rolls their
   stage timings, billed durations and peak RSS into the summary — and retains
-  its own `raster_series.parquet`. Two deviations from the target end-state,
+  its own `raster_series.parquet`. The dispatch is invoke-only end to end
+  (issue #264): after the issue #252 preflight ping, the `(time, cells)`
+  template is written by a synchronous `mode="setup"` Lambda invoke before
+  fan-out — recorded as `template_s`, the raster analogue of the point path's
+  `setup_s` — so the leg runs cleanly under the `zagg-benchmark` OIDC role's
+  no-S3 grant (the "template write happens inside the Lambda" invariant in
+  [Lambda benchmark CI/CD setup](benchmark-cicd.md) now holds for both legs).
+  Two deviations from the target end-state,
   pending upstream: **hive is gated, not absent** — the manifest carries a
   `pending_targets` hive variant the harness can already dispatch (a
   `store_layout` override + re-validate), promoted to live the moment issue

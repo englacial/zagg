@@ -1444,12 +1444,14 @@ class TestInvokeLambdaSetupEvent:
         return json.loads(client.invoke.call_args.kwargs["Payload"])
 
     def test_flat_event_matches_baseline(self, cfg):
-        # The byte-identity claim, pinned on the wire: no "dataset" key, and
-        # the event is exactly the pre-phase-3 flat setup event.
+        # The byte-identity claim, pinned on the wire: no "dataset" key, no
+        # raster "times_us" key (issue #264 uses a separate helper), and the
+        # event is exactly the pre-phase-3 flat setup event.
         config_dict = asdict(cfg)
         client = _wire_client({"ok": True, "mode": "setup", "layout": "flat"})
         event = self._invoke(client, config_dict)
         assert "dataset" not in event
+        assert "times_us" not in event
         assert event == {
             "mode": "setup",
             "store_path": "s3://out/product",
