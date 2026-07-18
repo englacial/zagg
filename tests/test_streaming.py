@@ -68,6 +68,7 @@ class TestStreamingConfig:
     def test_block_defaults_buffer(self):
         assert get_streaming(_config(streaming={})) == {
             "buffer_granules": 50,
+            "mode": "merge",
             "state_layout": "dict",
             "arena_backing": "memory",
         }
@@ -75,6 +76,7 @@ class TestStreamingConfig:
     def test_explicit_buffer(self):
         assert get_streaming(_config(streaming={"buffer_granules": 7})) == {
             "buffer_granules": 7,
+            "mode": "merge",
             "state_layout": "dict",
             "arena_backing": "memory",
         }
@@ -82,6 +84,7 @@ class TestStreamingConfig:
     def test_arena_layout_accepted(self):
         assert get_streaming(_config(streaming={"state_layout": "arena"})) == {
             "buffer_granules": 50,
+            "mode": "merge",
             "state_layout": "arena",
             "arena_backing": "memory",
         }

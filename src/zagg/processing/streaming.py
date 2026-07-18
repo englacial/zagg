@@ -72,15 +72,22 @@ def _ranges_to_indices(starts: np.ndarray, lengths: np.ndarray) -> np.ndarray:
 def get_streaming(config: PipelineConfig) -> dict | None:
     """Return the ``aggregation.streaming`` block, or ``None`` (pooled path).
 
-    The block is ``{"buffer_granules": int, "state_layout": "dict"|"arena",
-    "arena_backing": "memory"|"tmp"}``; ``buffer_granules`` must be a positive
-    int. ``state_layout`` (issue #217) picks the running-state container:
-    ``"dict"`` (default, per-cell ndarrays) or ``"arena"`` (contiguous CSR
-    buffers — same merge sequence, same bytes out, ~24 B/cell overhead instead
-    of ~290). ``arena_backing: tmp`` (arena only) puts the centroid buffers in
+    The block is ``{"buffer_granules": int, "mode": "merge"|"spill",
+    "state_layout": "dict"|"arena", "arena_backing": "memory"|"tmp"}``;
+    ``buffer_granules`` must be a positive int. ``mode`` (issue #217) picks
+    where a full buffer goes: ``"merge"`` (default — fold into running
+    per-cell state, today's behavior, mergeable reducers only) or ``"spill"``
+    (append the grouped buffer to per-partition ``/tmp`` files and aggregate
+    once after the reads — every pooled reducer, byte-identical to pooled in
+    the single-block regime; see :mod:`zagg.processing.spill`).
+    ``state_layout`` picks the merge-mode running-state container: ``"dict"``
+    (default, per-cell ndarrays) or ``"arena"`` (contiguous CSR buffers —
+    same merge sequence, same bytes out, ~24 B/cell overhead instead of
+    ~290). ``arena_backing: tmp`` (arena only) puts the centroid buffers in
     unlinked ``/tmp``-backed memmaps so flush transients page under memory
-    pressure instead of OOM-killing the worker. Absent block -> ``None`` so
-    existing configs are untouched.
+    pressure instead of OOM-killing the worker. Both are merge-mode knobs and
+    cannot combine with ``mode: spill``. Absent block -> ``None`` so existing
+    configs are untouched.
     """
     block = config.aggregation.get("streaming")
     if block is None:
@@ -93,6 +100,9 @@ def get_streaming(config: PipelineConfig) -> dict | None:
             f"aggregation.streaming.buffer_granules must be a positive int "
             f"(got {buffer_granules!r})"
         )
+    mode = block.get("mode", "merge")
+    if mode not in ("merge", "spill"):
+        raise ValueError(f"aggregation.streaming.mode must be 'merge' or 'spill' (got {mode!r})")
     state_layout = block.get("state_layout", "dict")
     if state_layout not in ("dict", "arena"):
         raise ValueError(
@@ -108,8 +118,14 @@ def get_streaming(config: PipelineConfig) -> dict | None:
             "aggregation.streaming.arena_backing: tmp requires state_layout: arena "
             "(the dict layout has no contiguous buffers to back with a file)"
         )
+    if mode == "spill" and (state_layout != "dict" or arena_backing != "memory"):
+        raise ValueError(
+            "aggregation.streaming.mode: spill takes no state_layout/arena_backing "
+            "(those shape merge-mode running state; spill holds no running state)"
+        )
     return {
         "buffer_granules": buffer_granules,
+        "mode": mode,
         "state_layout": state_layout,
         "arena_backing": arena_backing,
     }

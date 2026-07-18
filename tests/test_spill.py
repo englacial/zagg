@@ -1,23 +1,44 @@
-"""Spill-partition writer/reader (issue #217, phase 1).
+"""Spill-partition aggregation (issue #217).
 
-The spill files must (a) round-trip every byte exactly (they replace the
-in-memory pool, so any loss is silent data corruption), (b) route rows to the
-partition of their enclosing inner chunk, (c) leave nothing in ``/tmp`` — the
-files are unlinked at birth and every fd is accounted for — and (d) fail
-loudly, naming the ``-disk`` variant fix, when ``/tmp`` cannot hold the spill.
+Phase 1 — the spill files must (a) round-trip every byte exactly (they
+replace the in-memory pool, so any loss is silent data corruption), (b) route
+rows to the partition of their enclosing inner chunk, (c) leave nothing in
+``/tmp`` — the files are unlinked at birth and every fd is accounted for —
+and (d) fail loudly, naming the ``-disk`` variant fix, when ``/tmp`` cannot
+hold the spill.
+
+Phase 2 — ``aggregation.streaming.mode: spill`` in the worker: single-block
+output must be **byte-identical to the pooled path** across the full pooled
+reducer surface (scalar functions, expressions, vectors, tdigest, located
+ragged, chunk_precompute — reducers merge-mode streaming could never serve);
+multi-block must combine mergeable reducers exactly like merge mode and
+refuse non-mergeable configs loudly.
+
+Byte-equality tests pin ``shard_workers: 1``: the granule thread pool drains
+the shared fake-read iterator from worker threads, so which granule gets
+which frame is scheduling-dependent and buffer/pool composition varies run to
+run (see tests/test_streaming.py::TestArenaLayout._ab).
 """
 
 import tempfile
 
 import numpy as np
+import pandas as pd
 import pytest
 
+from zagg.config import PipelineConfig
 from zagg.grids import HealpixGrid
+from zagg.processing import process_shard
 from zagg.processing.spill import (
+    SpillAggregator,
     SpillBlock,
+    SpillOverflowError,
     check_tmp_headroom,
     partition_ids,
 )
+from zagg.processing.streaming import get_streaming
+
+_CREDS = {"accessKeyId": "a", "secretAccessKey": "s", "sessionToken": "t"}
 
 
 def _cols(n, seed=0):
@@ -207,6 +228,393 @@ class TestByteAccounting:
         block.append(part_ids, cells, cols)
         assert block.bytes_written == 2 * expect
         block.close()
+
+
+def _base_variables(delta=256):
+    return {
+        "count": {"function": "len", "source": "h_ph", "dtype": "int32", "fill_value": 0},
+        "h_tdigest": {
+            "kind": "ragged",
+            "function": "zagg.stats.tdigest.build_tdigest",
+            "source": "h_ph",
+            "inner_shape": [2],
+            "params": {"delta": delta},
+            "dtype": "float32",
+            "fill_value": 0,
+        },
+    }
+
+
+def _config(streaming=None, variables=None, chunk_precompute=None):
+    agg = {"variables": variables or _base_variables()}
+    if streaming is not None:
+        agg["streaming"] = streaming
+    if chunk_precompute is not None:
+        agg["chunk_precompute"] = chunk_precompute
+    return PipelineConfig(
+        # Fake reads monkeypatch ``zagg.processing._read_group`` — pin the
+        # hierarchical backend so the seam is actually exercised, and pin
+        # shard_workers=1 for deterministic buffer composition (see module
+        # docstring).
+        data_source={
+            "reader": "h5coro",
+            "driver": "s3",
+            "groups": ["gt1l"],
+            "index": {"backend": "hierarchical"},
+            "shard_workers": 1,
+        },
+        aggregation=agg,
+    )
+
+
+def _matrix_variables():
+    """Every pooled reducer kind: the surface merge-mode streaming rejects."""
+    variables = _base_variables()
+    variables.update(
+        {
+            "h_mean": {"function": "nanmean", "source": "h_ph"},
+            "h_spread": {"expression": "np.nanmax(h_ph) - np.nanmin(h_ph)"},
+            "h_anchor": {"expression": "anchor"},
+            "h_hist": {
+                "expression": "np.histogram(h_ph, bins=4, range=(-40.0, 40.0))[0]",
+                "kind": "vector",
+                "trailing_shape": [4],
+                "dtype": "float32",
+            },
+            "h_tdigest_loc": {
+                "kind": "ragged",
+                "function": "zagg.stats.tdigest.build_tdigest",
+                "source": "h_ph",
+                "inner_shape": [2],
+                "params": {"delta": 128},
+                "dtype": "float32",
+                "fill_value": 0,
+                "location": "leaf_id",
+            },
+        }
+    )
+    return variables
+
+
+_ANCHOR = {"anchor": {"function": "min", "source": "h_ph", "dtype": "float32"}}
+
+
+def _grid(cfg, parent=6, child=8, **kw):
+    return HealpixGrid(parent, child, layout="fullsphere", config=cfg, **kw)
+
+
+def _shard_key(order=6):
+    from mortie import geo2mort
+
+    return int(geo2mort(-78.5, -132.0, order=order)[0])
+
+
+def _granule_dfs(grid, shard_key, cell_idx_lists, obs_per_cell=50, seed=0, nan_cells=()):
+    """One DataFrame per granule over caller-chosen child-cell indices."""
+    rng = np.random.default_rng(seed)
+    children = grid.children(shard_key)
+    dfs = []
+    for idxs in cell_idx_lists:
+        leaf, h = [], []
+        for ci in idxs:
+            leaf.extend([int(children[ci])] * obs_per_cell)
+            vals = rng.normal(0.0, 10.0, obs_per_cell)
+            h.extend([np.nan] * obs_per_cell if ci in nan_cells else vals)
+        dfs.append(
+            pd.DataFrame(
+                {
+                    "h_ph": np.array(h, dtype=np.float32),
+                    "leaf_id": np.array(leaf, dtype=np.uint64),
+                }
+            )
+        )
+    return dfs
+
+
+def _run(monkeypatch, cfg, grid, shard_key, dfs, **kwargs):
+    """process_shard over len(dfs) fake granules; returns (df_out, ragged, meta)."""
+    reads = iter(dfs)
+    monkeypatch.setattr("zagg.processing._read_group", lambda *a, **k: next(reads))
+    monkeypatch.setattr("zagg.processing.h5coro.H5Coro", lambda *a, **k: object())
+    monkeypatch.setattr("zagg.processing._make_url_rewriter", lambda driver: lambda u: u)
+    ragged: dict = {}
+    if "chunk_results" not in kwargs:
+        kwargs["ragged_out"] = ragged
+    df_out, meta = process_shard(
+        grid,
+        shard_key,
+        [f"s3://b/g{i}.h5" for i in range(len(dfs))],
+        s3_credentials=_CREDS,
+        config=cfg,
+        **kwargs,
+    )
+    return df_out, ragged, meta
+
+
+_CELL_LISTS = [[0, 4, 8], [2, 4, 10], [1, 8, 9], [0, 10, 15], [4, 8, 10]]
+
+
+def _assert_carrier_identical(a, b):
+    """Byte-equality for either carrier (DataFrame, or arro3 Table when the
+    config carries vector fields — ``_has_vector_fields`` flips the handoff)."""
+    if isinstance(a, pd.DataFrame) and isinstance(b, pd.DataFrame):
+        pd.testing.assert_frame_equal(a, b)
+        return
+    from zagg.processing.write import _iter_carrier_columns
+
+    cols_a, cols_b = dict(_iter_carrier_columns(a)), dict(_iter_carrier_columns(b))
+    assert list(cols_a) == list(cols_b)
+    for name in cols_a:
+        np.testing.assert_array_equal(cols_a[name], cols_b[name])
+        assert cols_a[name].dtype == cols_b[name].dtype
+
+
+def _assert_ragged_identical(ragged_p, ragged_s):
+    assert set(ragged_p) == set(ragged_s)
+    for name in ragged_p:
+        pay_p, idx_p, *locs_p = ragged_p[name]
+        pay_s, idx_s, *locs_s = ragged_s[name]
+        assert idx_p == idx_s
+        for a, b in zip(pay_p, pay_s, strict=True):
+            np.testing.assert_array_equal(a, b)
+        assert len(locs_p) == len(locs_s)
+        if locs_p:
+            for a, b in zip(locs_p[0], locs_s[0], strict=True):
+                np.testing.assert_array_equal(a, b)
+
+
+class TestSpillConfig:
+    def test_mode_defaults_to_merge(self):
+        assert get_streaming(_config(streaming={}))["mode"] == "merge"
+
+    def test_spill_mode_accepted(self):
+        assert get_streaming(_config(streaming={"mode": "spill"}))["mode"] == "spill"
+
+    @pytest.mark.parametrize("bad", ["disk", 1, None])
+    def test_bad_mode_raises(self, bad):
+        with pytest.raises(ValueError, match="mode"):
+            get_streaming(_config(streaming={"mode": bad}))
+
+    @pytest.mark.parametrize(
+        "block",
+        [
+            {"mode": "spill", "state_layout": "arena"},
+            {"mode": "spill", "state_layout": "arena", "arena_backing": "tmp"},
+        ],
+    )
+    def test_spill_rejects_arena_knobs(self, block):
+        with pytest.raises(ValueError, match="spill takes no state_layout"):
+            get_streaming(_config(streaming=block))
+
+    def test_non_mergeable_config_is_accepted_by_spill(self):
+        # The whole point of spill: reducers merge-mode validation rejects are
+        # exact in the single-block regime.
+        cfg = _config(
+            streaming={"mode": "spill"},
+            variables=_matrix_variables(),
+            chunk_precompute=_ANCHOR,
+        )
+        agg = SpillAggregator(cfg, _grid(cfg), "pandas", 25)
+        assert not agg._mergeable
+        agg.close()
+
+    def test_guard_fires_at_construction(self, monkeypatch):
+        import os as _os
+
+        real = _os.statvfs(tempfile.gettempdir())
+
+        class _Tiny:
+            f_bavail = 1
+            f_frsize = real.f_frsize
+
+        cfg = _config(streaming={"mode": "spill"})
+        grid = _grid(cfg)
+        monkeypatch.setattr(_os, "statvfs", lambda _p: _Tiny())
+        with pytest.raises(RuntimeError, match="-disk"):
+            SpillAggregator(cfg, grid, "pandas", 25)
+
+
+class TestSpillWorkerSingleBlock:
+    """Single-block spill == pooled, byte for byte, on every reducer."""
+
+    def _ab(self, monkeypatch, variables, chunk_precompute=None, nan_cells=(), buffer=2):
+        key = _shard_key()
+        results = []
+        for streaming in (None, {"buffer_granules": buffer, "mode": "spill"}):
+            cfg = _config(
+                streaming=streaming, variables=variables, chunk_precompute=chunk_precompute
+            )
+            grid = _grid(cfg)
+            dfs = _granule_dfs(grid, key, _CELL_LISTS, seed=7, nan_cells=nan_cells)
+            results.append(_run(monkeypatch, cfg, grid, key, dfs))
+        return results
+
+    def test_full_reducer_matrix_byte_identical_to_pooled(self, monkeypatch):
+        (df_p, ragged_p, meta_p), (df_s, ragged_s, meta_s) = self._ab(
+            monkeypatch, _matrix_variables(), chunk_precompute=_ANCHOR
+        )
+        _assert_carrier_identical(df_p, df_s)
+        assert meta_p["total_obs"] == meta_s["total_obs"]
+        assert meta_p["cells_with_data"] == meta_s["cells_with_data"]
+        _assert_ragged_identical(ragged_p, ragged_s)
+
+    def test_nan_cells_byte_identical_to_pooled(self, monkeypatch):
+        # An all-NaN cell: zero-length digest but a real count, NaN mean.
+        (df_p, ragged_p, _), (df_s, ragged_s, _) = self._ab(
+            monkeypatch, _matrix_variables(), chunk_precompute=_ANCHOR, nan_cells={4}
+        )
+        _assert_carrier_identical(df_p, df_s)
+        _assert_ragged_identical(ragged_p, ragged_s)
+
+    def test_tdigest_multi_flush_byte_identical_to_pooled(self, monkeypatch):
+        # Merge mode is only exact when one flush == one pooled build; spill
+        # must be exact at ANY flush count (no merges exist to approximate).
+        (df_p, ragged_p, _), (df_s, ragged_s, _) = self._ab(
+            monkeypatch, _base_variables(), buffer=1
+        )
+        pd.testing.assert_frame_equal(df_p, df_s)
+        _assert_ragged_identical(ragged_p, ragged_s)
+
+    def test_k_gt_1_chunks_byte_identical_to_pooled(self, monkeypatch):
+        # K=4 partitions: each chunk's outputs come from its own partition.
+        key = _shard_key(order=2)
+        results = []
+        for streaming in (None, {"buffer_granules": 2, "mode": "spill"}):
+            cfg = _config(streaming=streaming)
+            grid = _grid(cfg, parent=2, child=5, chunk_inner=3)
+            assert grid.chunks_per_shard == 4
+            dfs = _granule_dfs(grid, key, [[0, 20, 40], [5, 20, 60], [0, 40, 63]], seed=3)
+            sink: list = []
+            _run(monkeypatch, cfg, grid, key, dfs, chunk_results=sink)
+            results.append(sink)
+        pooled, spilled = results
+        assert len(pooled) == len(spilled) == 4
+        for (blk_p, car_p, rag_p), (blk_s, car_s, rag_s) in zip(pooled, spilled, strict=True):
+            assert blk_p == blk_s
+            pd.testing.assert_frame_equal(car_p, car_s)
+            _assert_ragged_identical(rag_p, rag_s)
+
+    def test_occupied_out_matches_pooled(self, monkeypatch):
+        key = _shard_key()
+        occ = {}
+        for label, streaming in (
+            ("pooled", None),
+            ("spill", {"buffer_granules": 1, "mode": "spill"}),
+        ):
+            cfg = _config(streaming=streaming)
+            grid = _grid(cfg)
+            dfs = _granule_dfs(grid, key, _CELL_LISTS, seed=5)
+            sink: list = []
+            _run(monkeypatch, cfg, grid, key, dfs, occupied_out=sink)
+            occ[label] = np.concatenate(sink) if sink else np.empty(0, dtype=np.uint64)
+        assert occ["spill"].size > 0
+        np.testing.assert_array_equal(np.sort(occ["spill"]), np.sort(occ["pooled"]))
+
+    def test_empty_shard_matches_pooled_no_data(self, monkeypatch):
+        cfg = _config(streaming={"buffer_granules": 2, "mode": "spill"})
+        grid = _grid(cfg)
+        monkeypatch.setattr("zagg.processing._read_group", lambda *a, **k: None)
+        monkeypatch.setattr("zagg.processing.h5coro.H5Coro", lambda *a, **k: object())
+        monkeypatch.setattr("zagg.processing._make_url_rewriter", lambda driver: lambda u: u)
+        df_out, meta = process_shard(
+            grid, _shard_key(), ["s3://b/g0.h5"], s3_credentials=_CREDS, config=cfg
+        )
+        assert df_out.empty
+        assert meta["error"] == "No data after filtering"
+
+    def test_no_tmp_files_left_behind(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(tempfile, "tempdir", str(tmp_path))
+        cfg = _config(streaming={"buffer_granules": 2, "mode": "spill"})
+        grid = _grid(cfg)
+        dfs = _granule_dfs(grid, _shard_key(), _CELL_LISTS, seed=1)
+        _, _, meta = _run(monkeypatch, cfg, grid, _shard_key(), dfs)
+        assert meta["total_obs"] > 0
+        assert list(tmp_path.iterdir()) == []
+
+    def test_profile_carries_spill_instrumentation(self, monkeypatch):
+        key = _shard_key()
+        cfg = _config(streaming={"buffer_granules": 2, "mode": "spill"})
+        grid = _grid(cfg)
+        dfs = _granule_dfs(grid, key, _CELL_LISTS, seed=1)
+        _, _, meta = _run(monkeypatch, cfg, grid, key, dfs, profile=True)
+        timings = meta["phase_timings"]
+        assert set(timings) == {
+            "read",
+            "index",
+            "aggregate",
+            "spill_write_s",
+            "spill_read_s",
+            "spill_bytes",
+        }
+        assert timings["spill_bytes"] > 0
+        assert timings["spill_write_s"] >= 0
+        assert timings["spill_read_s"] >= 0
+
+
+class TestSpillWorkerMultiBlock:
+    """Forced multi-block via an injected tiny threshold."""
+
+    def _force_tiny_blocks(self, monkeypatch):
+        # Every flush crosses the threshold -> one closed block per flush.
+        monkeypatch.setattr("zagg.processing.spill._default_block_bytes", lambda k, tmp_dir=None: 1)
+
+    def test_mergeable_multi_block_byte_identical_to_merge_mode(self, monkeypatch):
+        # One block per flush == one merge round per flush: exactly merge
+        # mode's per-cell build+merge sequence, so the bytes must match it
+        # (and counts stay exact by summation).
+        self._force_tiny_blocks(monkeypatch)
+        key = _shard_key()
+        results = []
+        for streaming in (
+            {"buffer_granules": 2, "mode": "merge"},
+            {"buffer_granules": 2, "mode": "spill"},
+        ):
+            cfg = _config(streaming=streaming)
+            grid = _grid(cfg)
+            dfs = _granule_dfs(grid, key, _CELL_LISTS, seed=9)
+            results.append(_run(monkeypatch, cfg, grid, key, dfs))
+        (df_m, ragged_m, meta_m), (df_s, ragged_s, meta_s) = results
+        pd.testing.assert_frame_equal(df_m, df_s)
+        assert meta_m["total_obs"] == meta_s["total_obs"]
+        assert meta_m["cells_with_data"] == meta_s["cells_with_data"]
+        vals_m, idx_m = ragged_m["h_tdigest"]
+        vals_s, idx_s = ragged_s["h_tdigest"]
+        assert idx_m == idx_s
+        for a, b in zip(vals_m, vals_s, strict=True):
+            np.testing.assert_array_equal(a, b)
+
+    def test_multi_block_actually_engaged_and_counts_exact(self, monkeypatch):
+        self._force_tiny_blocks(monkeypatch)
+        closes = {"n": 0}
+        orig = SpillAggregator._close_block
+
+        def counting(self):
+            closes["n"] += 1
+            orig(self)
+
+        monkeypatch.setattr(SpillAggregator, "_close_block", counting)
+        key = _shard_key()
+        pooled_cfg = _config()
+        spill_cfg = _config(streaming={"buffer_granules": 1, "mode": "spill"})
+        grid_p, grid_s = _grid(pooled_cfg), _grid(spill_cfg)
+        dfs = _granule_dfs(grid_p, key, _CELL_LISTS, seed=2)
+        df_p, _, _ = _run(monkeypatch, pooled_cfg, grid_p, key, list(dfs))
+        df_s, _, _ = _run(monkeypatch, spill_cfg, grid_s, key, list(dfs))
+        assert closes["n"] >= len(_CELL_LISTS)  # every flush closed a block
+        pd.testing.assert_series_equal(df_p["count"], df_s["count"])
+
+    def test_non_mergeable_overflow_raises_loudly(self, monkeypatch):
+        # The worker's tolerated per-granule except must NOT swallow this.
+        self._force_tiny_blocks(monkeypatch)
+        cfg = _config(
+            streaming={"buffer_granules": 1, "mode": "spill"},
+            variables=_matrix_variables(),
+            chunk_precompute=_ANCHOR,
+        )
+        grid = _grid(cfg)
+        dfs = _granule_dfs(grid, _shard_key(), _CELL_LISTS, seed=2)
+        with pytest.raises(SpillOverflowError, match="memory tier"):
+            _run(monkeypatch, cfg, grid, _shard_key(), dfs)
 
 
 class TestTmpGuard:
