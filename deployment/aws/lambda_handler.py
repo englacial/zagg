@@ -988,9 +988,8 @@ def _handle_process_raster(event: Dict[str, Any]) -> Dict[str, Any]:
         # with no config at all — reports the flat requirements byte-identical
         # to before.
         cfg_dict = event.get("config")
-        hive = isinstance(cfg_dict, dict) and (
-            (cfg_dict.get("output") or {}).get("store_layout") == "hive"
-        )
+        output = cfg_dict.get("output") if isinstance(cfg_dict, dict) else None
+        hive = isinstance(output, dict) and output.get("store_layout") == "hive"
         required = ["shard_key", "granules", "config", "store_path"]
         if not hive:
             required.append("time_index")

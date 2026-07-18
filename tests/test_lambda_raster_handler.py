@@ -332,6 +332,19 @@ class TestProcessRasterHiveMode:
         assert resp["statusCode"] == 400
         assert "time_index" in json.loads(resp["body"])["error"]
 
+    def test_malformed_output_falls_through_to_flat(self, handler_mod):
+        # A config whose ``output`` is a truthy non-dict (e.g. a string) must
+        # not raise AttributeError in the pre-load hive peek (an opaque 500);
+        # the shape-safe peek treats it as non-hive, so the event falls through
+        # to the flat requirements (time_index included) and the clean 400.
+        event = {"mode": "process_raster", "config": {"output": "hive"}}
+        resp = handler_mod.lambda_handler(event, MagicMock())
+        assert resp["statusCode"] == 400
+        err = json.loads(resp["body"])["error"]
+        assert "time_index" in err
+        for key in ("shard_key", "granules", "store_path"):
+            assert key in err
+
     def test_profile_rides_hive_meta(self, handler_mod, tmp_path):
         event = self._hive_event(tmp_path, window={"label": "20260713"})
         event["profile"] = True
