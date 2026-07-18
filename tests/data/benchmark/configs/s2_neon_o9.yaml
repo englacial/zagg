@@ -8,11 +8,10 @@
 # over the SERC box, 4^10 order-19 cells each; the same override espg's
 # operational S2 SERC run pins).
 #
-# Layout notes: this live leg PINS ``store_layout: flat`` -- since the issue
-# #253 default flip an unpinned healpix raster config resolves to hive (legal
-# since issue #247), and the leg stays flat until the pending_targets hive
-# variant is deliberately promoted (targets_raster_neon.json; espg directive
-# on PR #261). ``sharded`` does not apply to the (time, cells) slab writes.
+# Layout notes: ``store_layout: hive`` -- the production default for HEALPix
+# raster since issues #247/#253 (issue #237 promoted, ratified by @espg on
+# issue #272; the flat interop profile is deprecated). ``sharded`` does not
+# apply to the (time, cells) slab writes (raster is never sharded, issue #247).
 data_source:
   reader: raster
   bands:
@@ -27,9 +26,9 @@ data_source:
   anonymous: true
 
 output:
-  # Pinned: the retained flat arm (deprecated-but-valid interop profile,
-  # issue #253); the hive raster leg waits in pending_targets.
-  store_layout: flat
+  # Hive: the promoted production default for HEALPix raster (issue #237,
+  # ratified issue #272). One leaf zarr object per array per dispatch shard.
+  store_layout: hive
   grid:
     type: healpix
     indexing_scheme: nested
