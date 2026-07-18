@@ -120,10 +120,15 @@ def _compress(
     (weighted averages), their weights, and ``starts`` — each output centroid's
     first sub-centroid index, which the located channel reduces over.
 
-    The centroid **boundaries and weights are bit-identical** to the old scalar
-    loop (same k1 values at the same rank fractions, same ``span ≤ 1`` rule);
-    only the means differ, at the float-ULP level, because they are formed as a
-    single weighted ``sum / weight`` rather than an incremental Welford update.
+    This reproduces the old scalar loop's greedy rule (same k1 values at the same
+    rank fractions, same ``span ≤ 1`` join test) and was verified bit-identical
+    to it across randomized trials. Exact equality is not guaranteed *by
+    construction*, though: the join comparison is re-associated (``searchsorted``
+    on ``k_left + 1.0`` vs the loop's ``k_right - k_left <= 1.0``) and the rank
+    denominator uses ``cumw[-1]`` vs a pairwise ``.sum()``, so a boundary sitting
+    within an ULP of a 1.0 k-span could in principle flip. Means additionally
+    differ at the float-ULP level, being formed as a single weighted
+    ``sum / weight`` rather than an incremental Welford update.
     Instead of testing every sub-centroid, this jumps straight to each
     centroid's right edge with one ``searchsorted`` per centroid — so the loop
     runs ~delta times regardless of ``n`` (issue #279).
