@@ -3285,11 +3285,20 @@ def _invoke_lambda_raster_setup(
     if result.get("statusCode") != 200:
         # A pre-#264 function reaches the flat branch and calls
         # grid.emit_template on the raster config, which can raise (a raster
-        # template has no point-path shape) → 500. A 500 is indistinguishable
-        # from a genuine failure here, so surface the redeploy hint alongside
-        # the body rather than swallowing the stale-deployment case.
+        # template has no point-path shape) → 500 — indistinguishable from a
+        # genuine failure, so it carries the redeploy hint. But the only non-200
+        # a correctly-deployed function returns on the normal runner path is the
+        # legitimate ContainsGroupError overwrite-refusal (a store already
+        # holding a different-valued group), for which "redeploy" is noise. Gate
+        # the hedge off that case with a conservative, best-effort match on
+        # zarr's "A group exists in store" text (messaging only, not control
+        # flow): always surface the handler body; append the redeploy hedge only
+        # when the body does NOT look like the overwrite refusal.
+        body_repr = result.get("body")
+        if "a group exists in store" in str(body_repr).lower():
+            raise RuntimeError(f"Lambda raster setup error: {body_repr}")
         raise RuntimeError(
-            f"Lambda raster setup error: {result.get('body')} — if this is a "
+            f"Lambda raster setup error: {body_repr} — if this is a "
             f"pre-#264 deployment, its flat point-path branch may have raised "
             f"on the raster config; redeploy the function, then rerun with "
             f"overwrite to replace anything it wrote"

@@ -701,14 +701,27 @@ class TestInvokeLambdaRasterSetupEvent:
     def test_non_200_raises(self, tmp_path):
         from test_hive import _wire_client
 
+        # A generic 500 can't be told apart from a raising pre-#264 flat branch,
+        # so the message must carry the redeploy hint.
         with pytest.raises(RuntimeError, match="Lambda raster setup error") as excinfo:
             self._invoke(
                 _wire_client({"error": "boom", "mode": "setup"}, status_code=500),
                 {"data_source": {}},
             )
-        # A raising pre-#264 flat branch also 500s; the message must carry the
-        # redeploy hint since a 500 can't be told apart from a genuine failure.
         assert "redeploy" in str(excinfo.value)
+
+        # The legitimate ContainsGroupError overwrite-refusal is the only non-200
+        # a correctly-deployed function returns on the normal path; it must
+        # surface the store message WITHOUT the inapplicable redeploy hedge.
+        err = "A group exists in store 's3://out/product' at path ''"
+        with pytest.raises(RuntimeError, match="Lambda raster setup error") as excinfo:
+            self._invoke(
+                _wire_client({"error": err, "mode": "setup"}, status_code=500),
+                {"data_source": {}},
+            )
+        msg = str(excinfo.value)
+        assert "redeploy" not in msg
+        assert "A group exists in store" in msg
 
     def test_missing_pipeline_echo_raises_redeploy(self, tmp_path):
         # A stale function's flat branch answers 200 with the layout echo but
