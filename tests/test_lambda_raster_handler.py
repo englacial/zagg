@@ -45,7 +45,10 @@ def _config_dict(store_path, layout=None):
             "bands": {"red": {"asset": "red", "dtype": "uint16", "fill_value": 0}},
             "nodata": 0,
         },
-        "output": {"grid": grid, "store": str(store_path)},
+        # store_layout pinned flat: these tests pin the FLAT (time, cells)
+        # worker/setup path; since issue #253 an unpinned healpix raster
+        # config resolves hive. Hive tests override it per test.
+        "output": {"grid": grid, "store": str(store_path), "store_layout": "flat"},
     }
 
 
@@ -177,11 +180,14 @@ class TestProcessRasterMode:
             assert key in err
 
     def test_dense_layout_400(self, handler_mod, raster_event):
+        # The dense layout was removed (issue #88): a worker event still carrying
+        # a dense config fails fast with a clean 400 at grid construction, not a
+        # retried 500 (review fold, PR #257).
         event, _grid, _data = raster_event
         event["config"] = _config_dict(event["store_path"], layout="dense")
         resp = handler_mod.lambda_handler(event, MagicMock())
         assert resp["statusCode"] == 400
-        assert "fullsphere" in json.loads(resp["body"])["error"]
+        assert "Unknown layout" in json.loads(resp["body"])["error"]
 
     def test_worker_failure_500(self, handler_mod, raster_event):
         event, _grid, _data = raster_event

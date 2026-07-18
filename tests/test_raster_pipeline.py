@@ -120,6 +120,7 @@ class TestRasterConfigValidation:
         # The shared check (issue #200 posture): an explicit true without the
         # hive layout is a config mistake, not a no-op.
         cfg = _raster_config()
+        cfg.output["store_layout"] = "flat"  # explicit: healpix defaults hive (issue #253)
         cfg.output["coverage_moc"] = True
         with pytest.raises(ValueError, match="store_layout: hive"):
             validate_config(cfg)
@@ -144,6 +145,7 @@ class TestRasterConfigValidation:
         assert get_coverage_moc(hive) is True
 
         flat = _raster_config()
+        flat.output["store_layout"] = "flat"  # explicit: healpix defaults hive (issue #253)
         assert get_coverage_moc(flat) is False
 
     def test_windowing_validates_and_normalizes(self):
@@ -191,6 +193,7 @@ class TestRasterConfigValidation:
     def test_windowing_requires_hive_layout(self):
         # raster + flat + windowing lands on the SHARED hive-only check.
         cfg = _raster_config()
+        cfg.output["store_layout"] = "flat"  # explicit: healpix defaults hive (issue #253)
         cfg.output["windowing"] = {"schedule": "yearly"}
         with pytest.raises(ValueError, match="store_layout: hive"):
             validate_config(cfg)
@@ -637,7 +640,7 @@ def _healpix_setup(tmp_path):
         bands={"red": {"asset": "red", "dtype": "uint16", "scale": 0.0001, "offset": -0.1}},
         grid={"type": "healpix", "parent_order": 10, "child_order": 16},
     )
-    grid = HealpixGrid(10, 16, config=cfg, populated_shards=[shard])
+    grid = HealpixGrid(10, 16, config=cfg)
     return cfg, grid, shard
 
 
@@ -646,14 +649,15 @@ class TestTemplateAndSlabs:
         cfg, grid, _shard = _healpix_setup(tmp_path)
         spec = raster_group_spec(grid, cfg, 3)
         red = spec.members["red"]
-        assert tuple(red.shape) == (3, 4096)
+        n_cells = 12 * 4**16  # fullsphere cell axis (shape is metadata; writes stay sparse)
+        assert tuple(red.shape) == (3, n_cells)
         cg = red.chunk_grid
         cfg_block = cg["configuration"] if isinstance(cg, dict) else cg.configuration
         assert tuple(cfg_block["chunk_shape"]) == (1, grid.cells_per_chunk)
         assert red.attributes["scale_factor"] == 0.0001
         assert red.attributes["add_offset"] == -0.1
         assert tuple(spec.members["time"].shape) == (3,)
-        assert tuple(spec.members["cell_ids"].shape) == (4096,)
+        assert tuple(spec.members["cell_ids"].shape) == (n_cells,)
 
     def test_sharded_grid_rejected(self, tmp_path):
         cfg, grid, _shard = _healpix_setup(tmp_path)
@@ -681,13 +685,15 @@ class TestTemplateAndSlabs:
         write_raster_coords(store, grid, shard)
 
         red = open_array(store, path=f"{grid.group_path}/red", zarr_format=3, consolidated=False)
-        assert red.shape == (2, 4096)
+        assert red.shape == (2, 12 * 4**16)
+        start, stop = _shard_cell_range(grid, shard)
+        assert stop - start == 4096  # 4^(child - parent)
         cells = grid.children(shard)
         rows, cols, valid = grid.sample(cells, UTM18, TRANSFORM, (96, 96))
-        got_t0 = red[0, :]
+        got_t0 = red[0, start:stop]
         np.testing.assert_array_equal(got_t0[valid], data[rows[valid], cols[valid]])
         assert (got_t0[~valid] == 0).all()  # fill outside the raster footprint
-        got_t1 = red[1, :]
+        got_t1 = red[1, start:stop]
         assert (got_t1[valid] == 321).all()
         # time coordinate round-trips as microseconds since epoch.
         tarr = open_array(store, path=f"{grid.group_path}/time", zarr_format=3, consolidated=False)
@@ -697,7 +703,7 @@ class TestTemplateAndSlabs:
             store, path=f"{grid.group_path}/cell_ids", zarr_format=3, consolidated=False
         )
         np.testing.assert_array_equal(
-            ids[:], np.asarray(grid.encode_cell_ids(cells), dtype=np.uint64)
+            ids[start:stop], np.asarray(grid.encode_cell_ids(cells), dtype=np.uint64)
         )
         assert valid.sum() > 50  # the 960 m raster covers many ~97 m cells
 
@@ -709,7 +715,7 @@ class TestTemplateAndSlabs:
         store = MemoryStore()
         emit_raster_template(store, grid, cfg, np.array([], dtype=np.int64))
         red = open_array(store, path=f"{grid.group_path}/red", zarr_format=3, consolidated=False)
-        assert red.shape == (0, 4096)
+        assert red.shape == (0, 12 * 4**16)
 
     def test_overwrite_false_refuses_same_count_different_values(self, tmp_path):
         # overwrite=False must refuse a rerun whose timestep COUNT is unchanged
@@ -867,7 +873,9 @@ class TestLeafTemplate:
         cfg, grid, _shard = _healpix_setup(tmp_path)
         spec = raster_group_spec(grid, cfg, 2)
         assert set(spec.members) == {"time", "cell_ids", "red"}
-        assert tuple(spec.members["red"].shape) == (2, 4096)
+        # Fullsphere cell axis (issue #88: the dense pack is gone; shape is
+        # metadata — writes stay sparse).
+        assert tuple(spec.members["red"].shape) == (2, 12 * 4**16)
         codecs = spec.members["red"].codecs
         names = [c["name"] if isinstance(c, dict) else c.name for c in codecs]
         assert names == ["bytes", "zstd"]
@@ -1201,7 +1209,7 @@ class TestRasterHivePopcount:
 
         cfg, granules, shard_at, root = self._setup(tmp_path)
         interior = shard_at(480.0, 480.0)  # raster center
-        grid = HealpixGrid(14, 16, config=cfg, populated_shards=[interior])
+        grid = HealpixGrid(14, 16, config=cfg)
         n_valid, n_cells = self._coverage_counts(cfg, grid, interior)
         assert n_valid == n_cells  # the fixture premise: fully covered shard
 
@@ -1222,7 +1230,7 @@ class TestRasterHivePopcount:
         edge = None
         for dx in range(0, 960, 60):
             cand = shard_at(float(dx), 20.0)
-            g = HealpixGrid(14, 16, config=cfg, populated_shards=[cand])
+            g = HealpixGrid(14, 16, config=cfg)
             nv, nc = self._coverage_counts(cfg, g, cand)
             if 0 < nv < nc:
                 edge, egrid, e_valid = cand, g, nv

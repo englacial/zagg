@@ -9,9 +9,15 @@ D1–D6); the convention itself is owned by the mortie spec and versioned as
 [Time windows](#time-windows-morton-hive2) below) is `morton-hive/2` — a
 strict superset: a `/1` store *is* a `/2` store with `schedule: none`.
 
-It is opt-in (default `flat`, today's single shared store) and wired to
-**both backends** — the local runner and the Lambda handler share the same
-per-shard write path (see [Status](#status)).
+It is the **default for HEALPix output** (issue #253) — point aggregation
+and the raster pipeline alike (issue #247; the hive/flat split sits one
+abstraction above the pipeline kind): an omitted `output.store_layout`
+resolves to `hive`. An explicit `store_layout: flat` (the single shared
+store) remains for interop/debug but is deprecated — removal is gated on the
+sparse-DGGS read path (issue #251 phase 3);
+rectilinear grids keep the flat shared store. Hive is
+wired to **both backends** — the local runner and the Lambda handler share
+the same per-shard write path (see [Status](#status)).
 
 ## Layout
 
@@ -59,7 +65,7 @@ per-shard write path (see [Status](#status)).
 ```yaml
 output:
   store: s3://bucket/product        # becomes the hive root
-  store_layout: hive                # default: flat
+  store_layout: hive                # the HEALPix default (issue #253); may be omitted
   grid:
     type: healpix                   # hive is HEALPix-only (morton digit tree)
     parent_order: 9                 # shard order -> tree depth
@@ -143,10 +149,11 @@ output:
 Validation: `output.windowing` requires the hive layout on a healpix grid;
 `time_field` must be a declared `data_source` column (the worker can only
 filter what it reads); explicit windows must be well-formed (frozen label
-grammar, `start < end`, unique labels, disjoint ranges). Raster pipelines
-reject the block
-([issue #247](https://github.com/englacial/zagg/issues/247) tracks raster
-windowing). Changing the windowing of an existing store fails the frozen-key
+grammar, `start < end`, unique labels, disjoint ranges). On the raster path
+([issue #247](https://github.com/englacial/zagg/issues/247)) membership is
+the acquisition's STAC `datetime`: `time_field` is optional (fixed to
+`datetime`) and the `epoch`/`scale`/`units` conversion knobs are rejected.
+Changing the windowing of an existing store fails the frozen-key
 manifest check like an orders change — clear the root first.
 
 ## The manifest (`morton_hive.json`)

@@ -972,9 +972,8 @@ def write_raster_leaf_slab(store, grid, t_idx: int, slab: dict):
 def _shard_cell_range(grid, shard_key: int) -> tuple[int, int]:
     """The shard's contiguous cell-axis extent ``[start, stop)``.
 
-    Dense layout: ``block_index`` is the shard's position in
-    ``populated_shards``; fullsphere: the parent's nested id. Both are the
-    shard's block on a ``cells_per_shard``-strided axis.
+    ``block_index`` is the parent's nested id — the shard's block on a
+    ``cells_per_shard``-strided axis.
     """
     start = int(grid.block_index(int(shard_key))[0]) * grid.cells_per_shard
     return start, start + grid.cells_per_shard

@@ -3459,40 +3459,6 @@ class TestChunkResolutionCompanion:
         assert np.count_nonzero(~np.isnan(rgroup["offset_h"][:])) == 1
         assert np.count_nonzero(~np.isnan(rgroup["gain_h"][:])) == 1
 
-    def test_dense_healpix_companion_at_populated_shard_position(self):
-        """Dense HEALPix layout: the companion is shaped (n_shards,) and a shard's
-        value lands at its position in populated_shards (block_index), not at the
-        parent nested id (issue #30 item 2; fold of review finding)."""
-        from mortie import geo2mort
-
-        cfg = self._chunk_cfg("atl06")
-        shards = [
-            int(geo2mort(la, lo, order=6)[0])
-            for la, lo in [(-78.5, -132.0), (-72.1, 25.4), (-65.0, -45.0)]
-        ]
-        grid = HealpixGrid(6, 8, layout="dense", config=cfg, populated_shards=shards)
-        store = MemoryStore()
-        grid.emit_template(store)
-        group = open_group(store=store, mode="r", path="8")
-        assert grid.chunk_grid_shape == (len(shards),)
-        assert group["anchor_h"].shape == (len(shards),)
-
-        parent = shards[1]
-        n = len(grid.children(parent))
-        stats = {
-            "count": np.zeros(n, dtype="float32"),
-            "anchor_h": np.full(n, 99.0, dtype="float32"),
-        }
-        carrier = _build_output(
-            stats, get_data_vars(cfg), get_agg_fields(cfg), grid, parent, use_arrow=False
-        )
-        chunk_idx = grid.block_index(parent)
-        assert chunk_idx == (1,)  # position in populated_shards, not nested id
-        write_dataframe_to_zarr(carrier, store, grid=grid, chunk_idx=chunk_idx)
-        companion = open_group(store=store, mode="r", path="8")["anchor_h"][:]
-        assert companion[1] == np.float32(99.0)
-        assert np.count_nonzero(~np.isnan(companion)) == 1
-
     def test_empty_cell0_compound_expr_writes_chunk_value_not_nan(self):
         """Fold of review [MED]: with a COMPOUND resolution: chunk expression (not a
         bare precompute name), an empty cell 0 used to poison the companion with NaN

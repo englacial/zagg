@@ -37,21 +37,62 @@ def _shard_word(order=6):
 
 
 class TestStoreLayoutConfig:
-    def test_default_is_flat(self, cfg):
+    def test_default_is_hive_for_healpix(self, cfg):
+        # Issue #253: HEALPix point aggregation defaults to hive.
         from zagg.config import get_store_layout
 
+        assert get_store_layout(cfg) == "hive"
+        validate_config(cfg)  # defaulted hive validates unchanged
+
+    def test_default_is_flat_for_rectilinear(self, cfg):
+        from zagg.config import get_store_layout
+
+        cfg.output["grid"] = {
+            "type": "rectilinear",
+            "crs": "EPSG:3031",
+            "resolution": 500,
+            "bounds": [0, 0, 5000, 5000],
+        }
         assert get_store_layout(cfg) == "flat"
-        validate_config(cfg)  # flat default validates unchanged
+        validate_config(cfg)
+
+    def test_default_is_hive_for_raster(self):
+        # The default is grid-keyed, not pipeline-keyed (issue #253 rework on
+        # the landed issue #247 raster hive path): a healpix raster config
+        # with no store_layout resolves hive and validates.
+        from zagg.config import default_config, get_store_layout
+
+        cfg = default_config("sentinel2_l2a")
+        assert (cfg.data_source or {}).get("reader") == "raster"
+        assert get_store_layout(cfg) == "hive"
+        validate_config(cfg)
+
+    def test_explicit_hive_accepted_for_raster(self):
+        # Raster + hive is legal since issue #247 (the issue #239 stopgap and
+        # this PR's interim carve-out are both gone).
+        from zagg.config import default_config
+
+        cfg = default_config("sentinel2_l2a")
+        cfg.output["store_layout"] = "hive"
+        validate_config(cfg)
+
+    def test_explicit_flat_still_accepted(self, cfg):
+        # Deprecated but valid (interop/debug) until #251 phase 3.
+        from zagg.config import get_store_layout
+
+        cfg.output["store_layout"] = "flat"
+        assert get_store_layout(cfg) == "flat"
+        validate_config(cfg)
 
     def test_hive_accepted_for_healpix(self, cfg):
         cfg.output["store_layout"] = "hive"
         validate_config(cfg)
 
-    def test_null_key_falls_back_to_flat(self, cfg):
+    def test_null_key_falls_back_to_default(self, cfg):
         from zagg.config import get_store_layout
 
         cfg.output["store_layout"] = None
-        assert get_store_layout(cfg) == "flat"
+        assert get_store_layout(cfg) == "hive"
         validate_config(cfg)
 
     def test_unknown_value_rejected(self, cfg):
@@ -1343,6 +1384,7 @@ class TestRunnerWiring:
         # Flat runs keep the pre-#252 lifecycle: the setup invoke still runs
         # (no dataset threading — that was hive-only and left with the fold)
         # and finalize stays gated on consolidate_metadata (off by default).
+        # Flat is explicit now (issue #253: omitted store_layout -> hive).
         from unittest.mock import MagicMock
 
         import boto3
@@ -1351,6 +1393,7 @@ class TestRunnerWiring:
         from zagg.concurrency import ConcurrencyReport
         from zagg.runner import agg
 
+        cfg.output["store_layout"] = "flat"
         catalog_path, shard = self._catalog(tmp_path)
         captured: dict = {}
 
@@ -1437,7 +1480,6 @@ class TestInvokeLambdaSetupEvent:
             "s3://out/product",
             parent_order=6,
             child_order=12,
-            n_parent_cells=None,
             overwrite=False,
             config_dict=config_dict,
         )
@@ -1446,7 +1488,9 @@ class TestInvokeLambdaSetupEvent:
     def test_flat_event_matches_baseline(self, cfg):
         # The byte-identity claim, pinned on the wire: no "dataset" key, no
         # raster "times_us" key (issue #264 uses a separate helper), and the
-        # event is exactly the pre-phase-3 flat setup event.
+        # event is exactly the pre-phase-3 flat setup event. Flat is now
+        # explicit (issue #253: an omitted store_layout defaults to hive).
+        cfg.output["store_layout"] = "flat"
         config_dict = asdict(cfg)
         client = _wire_client({"ok": True, "mode": "setup", "layout": "flat"})
         event = self._invoke(client, config_dict)
@@ -1464,7 +1508,10 @@ class TestInvokeLambdaSetupEvent:
 
     def test_flat_without_layout_echo_unaffected(self, cfg):
         # Old deployed functions return the echo-less body: flat dispatch must
-        # keep working against them.
+        # keep working against them (explicit flat — issue #253 defaults hive;
+        # the defaulted-hive stale-deployment guard is the ping now, issue
+        # #252, pinned by the ping tests above).
+        cfg.output["store_layout"] = "flat"
         self._invoke(_wire_client({"ok": True, "mode": "setup"}), asdict(cfg))
 
     def test_hive_async_event_matches_baseline(self, cfg):

@@ -43,6 +43,10 @@ def _cfg(tmp_path):
             "output": {
                 "grid": {"type": "healpix", "parent_order": 10, "child_order": 16},
                 "store": str(tmp_path / "out.zarr"),
+                # Pinned: these tests pin the FLAT (time, cells) write path;
+                # since issue #253 an unpinned healpix raster config resolves
+                # hive. Hive tests override this to "hive" per test.
+                "store_layout": "flat",
             },
         }
     )
@@ -80,7 +84,7 @@ def manifest(tmp_path):
     _write_tiff(tmp_path / "t1.tif", np.full((96, 96), 555, dtype=np.uint16))
     cfg = _cfg(tmp_path)
     shard = _shard_for_raster()
-    grid = from_config(cfg, populated_shards=[shard])
+    grid = from_config(cfg)
     entries = [
         _entry("g0", str(tmp_path / "t0.tif"), T0, "dt-1"),
         _entry("g1", str(tmp_path / "t1.tif"), T1, "dt-2"),
@@ -101,7 +105,7 @@ class TestRasterAgg:
         assert summary["timesteps"] == 2
         assert summary["total_obs"] == 2
 
-        grid = from_config(cfg, populated_shards=[shard])
+        grid = from_config(cfg)
         store_path = cfg.output["store"]
         red = open_array(store_path + f"/{grid.group_path}/red", zarr_format=3, consolidated=False)
         cells = grid.children(shard)
@@ -168,7 +172,7 @@ class TestRasterAgg:
         shard0 = _shard_for_raster_at(0.0)
         shard1 = _shard_for_raster_at(7000.0)
         assert shard0 != shard1
-        grid = from_config(cfg, populated_shards=[shard0, shard1])
+        grid = from_config(cfg)
         sm = ShardMap(
             grid.spatial_signature(),
             [shard0, shard1],
@@ -233,7 +237,7 @@ class TestRasterAgg:
         agg(cfg, catalog=sm_path, backend="local", max_workers=2, overwrite=True)
 
         # A manifest with a DIFFERENT time index: one datatake instead of two.
-        grid = from_config(cfg, populated_shards=[shard])
+        grid = from_config(cfg)
         one = ShardMap(
             grid.spatial_signature(),
             [shard],
@@ -602,8 +606,9 @@ class TestRasterLambdaBackend:
         ]
 
     def test_lambda_dense_layout_fails_fast(self, manifest, monkeypatch, tmp_path):
-        # A dense-layout config on the lambda backend must be refused up front,
-        # before any invoke — the fake client records zero events.
+        # The dense layout was removed (issue #88): a config still selecting it
+        # is refused at grid construction, before any invoke — the fake client
+        # records zero events.
         import boto3
 
         cfg, sm_path, _shard, _data = manifest
@@ -624,7 +629,7 @@ class TestRasterLambdaBackend:
         data = _index_raster()
         _write_tiff(tmp_path / "d0.tif", data)
         shard = _shard_for_raster()
-        grid = from_config(cfg, populated_shards=[shard])
+        grid = from_config(cfg)
         entries = [
             {
                 "id": "g0",
@@ -748,6 +753,26 @@ class TestShippedTemplate:
 class TestRasterHiveLocalBackend:
     """Local raster hive runs (issue #247 phase 3): manifest, leaves, coverage."""
 
+    def test_defaulted_layout_dispatches_hive(self, tmp_path, manifest):
+        # Issue #253 phase 4: an OMITTED store_layout on a healpix raster
+        # config resolves hive (the grid-keyed, pipeline-agnostic default) and
+        # dispatches down the issue #247 hive path — manifest + stamped leaf,
+        # no flat global template at the store root.
+        from pathlib import Path
+
+        from zagg import hive
+
+        cfg, sm_path, shard, _data = manifest
+        del cfg.output["store_layout"]  # the fixture pins flat; drop for the default
+        summary = agg(cfg, catalog=sm_path, backend="local", max_workers=2)
+        assert summary["cells_with_data"] == 1 and summary["cells_error"] == 0
+
+        store_path = cfg.output["store"]
+        assert hive.read_manifest(store_path)["spec"] == "morton-hive/1"
+        stamp = hive.read_commit(hive.shard_leaf_path(store_path, shard))
+        assert stamp and stamp["complete"]
+        assert "zarr.json" not in {p.name for p in Path(store_path).iterdir()}  # D5
+
     def test_schedule_none_end_to_end(self, tmp_path, manifest):
         from pathlib import Path
 
@@ -772,7 +797,7 @@ class TestRasterHiveLocalBackend:
         stamp = hive.read_commit(leaf)
         assert stamp and stamp["complete"] and stamp["spec"] == "morton-hive/1"
         assert "window" not in stamp and "time_range" not in stamp
-        grid = from_config(cfg, populated_shards=[shard])
+        grid = from_config(cfg)
         red = open_array(leaf + f"/{grid.group_path}/red", zarr_format=3, consolidated=False)
         assert red.shape == (2, grid.cells_per_shard)
         cells = grid.children(shard)
@@ -803,7 +828,7 @@ class TestRasterHiveLocalBackend:
         assert m["spec"] == "morton-hive/2"
         assert m["temporal"]["schedule"] == "daily"
         assert m["temporal"]["time_field"] == "datetime"  # the resolved field
-        grid = from_config(cfg, populated_shards=[shard])
+        grid = from_config(cfg)
         for label, instant, value_check in (
             ("20260713", T0, None),
             ("20260718", T1, 555),
@@ -889,6 +914,58 @@ class TestRasterHiveLambdaBackend:
         cov = fake.events[-1]["coverage"]
         assert cov["encoding"] == "ranges"
         assert cov["time_range"] == [T0, T1]
+
+    def test_defaulted_layout_dispatches_hive(self, manifest, monkeypatch):
+        # Issue #253 phase 4, lambda dispatcher: a healpix raster config with
+        # NO store_layout key runs the hive lifecycle (ping -> async setup ->
+        # hive process events -> finalize/coverage), not the issue #264 flat
+        # sync-setup path. The default resolves in get_store_layout on both
+        # ends — the events forward the config untouched, no injected key.
+        import boto3
+
+        cfg, sm_path, shard, _data = manifest
+        del cfg.output["store_layout"]  # the fixture pins flat; drop for the default
+
+        def responder(event):
+            mode = event["mode"]
+            if mode == "ping":
+                body = {"ok": True, "mode": "ping", "zagg_version": "test"}
+                return {"statusCode": 200, "body": json.dumps(body)}
+            if mode in ("setup", "coverage"):
+                return {"statusCode": 200, "body": "{}"}  # Event invokes: unread
+            if mode == "finalize":
+                body = {"ok": True, "mode": "finalize", "layout": "hive"}
+                return {"statusCode": 200, "body": json.dumps(body)}
+            assert mode == "process_raster"
+            body = {
+                "shard_key": event["shard_key"],
+                "timesteps": 2,
+                "cells_with_data": 7,
+                "time_range": [T0, T1],
+            }
+            return {"statusCode": 200, "body": json.dumps(body)}
+
+        fake = _FakeLambdaClient(responder)
+        monkeypatch.setattr(boto3, "client", lambda *a, **k: fake)
+        summary = agg(
+            cfg, catalog=sm_path, store="s3://bucket/out.zarr", backend="lambda", max_workers=2
+        )
+        assert summary["cells_with_data"] == 1
+
+        modes = [e["mode"] for e in fake.events]
+        assert modes[:2] == ["ping", "setup"]
+        assert modes[-2:] == ["finalize", "coverage"]
+        procs = [e for e in fake.events if e["mode"] == "process_raster"]
+        # Hive-shaped process events: leaf-local time axis, no flat time_index;
+        # schedule none -> no window payload.
+        assert procs == [e for e in fake.events[2:-2]]
+        assert all("time_index" not in ev and "window" not in ev for ev in procs)
+        assert all(ev["shard_key"] == shard for ev in procs)
+        # No sync flat raster setup: no event carries the flat template's
+        # times_us, and the forwarded config still has no store_layout key.
+        assert all("times_us" not in ev for ev in fake.events)
+        for ev in fake.events[:2] + [fake.events[-2]]:
+            assert "store_layout" not in ev["config"]["output"]
 
     def test_all_failed_finalizes_before_raise(self, manifest, monkeypatch):
         # All-shards-failed still runs the finalize backstop BEFORE the
@@ -1037,7 +1114,7 @@ class TestRasterHiveIdempotency:
         return out
 
     def _one_granule_map(self, tmp_path, cfg, shard, href, dt, key, name):
-        grid = from_config(cfg, populated_shards=[shard])
+        grid = from_config(cfg)
         sm = ShardMap(
             grid.spatial_signature(),
             [shard],
@@ -1100,9 +1177,10 @@ class TestRasterHiveIdempotency:
         cov = hive.read_root_coverage(store2)
         assert cov["time_range"] == [T0, T1]
 
-    def test_flat_default_pin_no_hive_objects(self, tmp_path, manifest):
-        # store_layout unset -> the flat (time, cells) store, with no hive
-        # artifacts anywhere in the tree: the default output is object-for-
+    def test_flat_pin_no_hive_objects(self, tmp_path, manifest):
+        # Explicit store_layout: flat (the fixture pin; since issue #253 the
+        # healpix default is hive) -> the flat (time, cells) store, with no
+        # hive artifacts anywhere in the tree: flat output is object-for-
         # object what pre-#247 runs wrote (the flat write path is untouched;
         # this pins the absence of new objects).
         from pathlib import Path

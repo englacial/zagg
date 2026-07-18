@@ -40,13 +40,13 @@ Two release legs (`lambda-benchmark-fullaoi.yml`, tag-triggered):
   `setup_s` — so the leg runs cleanly under the `zagg-benchmark` OIDC role's
   no-S3 grant (the "template write happens inside the Lambda" invariant in
   [Lambda benchmark CI/CD setup](benchmark-cicd.md) now holds for both legs).
-  Two deviations from the target end-state,
-  pending upstream: **hive is gated, not absent** — the manifest carries a
-  `pending_targets` hive variant the harness can already dispatch (a
-  `store_layout` override + re-validate), promoted to live the moment issue
-  #237 lands (the raster path rejects hive until then, issue #239) — and **no
-  strict AOI mask** (issue #101 is point-path-only); the AOI scoping is the
-  catalog's STAC-query clip.
+  Two deviations from the target end-state:
+  **the live target still pins `store_layout: flat`** — raster + hive is now
+  legal and is the defaulted profile (issues #247/#253: an unpinned healpix
+  raster config writes hive leaves), so the manifest's `pending_targets` hive
+  variant is unblocked and awaits promotion as a deliberate benchmark-manifest
+  change — and **no strict AOI mask** (issue #101 is point-path-only); the
+  AOI scoping is the catalog's STAC-query clip.
 
 ### Summary — total billed cost and wall time
 

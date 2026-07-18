@@ -66,7 +66,11 @@ def _context():
 
 
 def _healpix_config_dict():
-    return asdict(default_config("atl06"))
+    cfg = default_config("atl06")
+    # These are the FLAT worker-path tests; flat is explicit now that an
+    # omitted store_layout defaults to hive for HEALPix (issue #253).
+    cfg.output["store_layout"] = "flat"
+    return asdict(cfg)
 
 
 def _rectilinear_config_dict():
@@ -1463,6 +1467,7 @@ class TestSetupTemplate:
         # worker grid writes -- NOT the order-11 (12*4^11) grid the old code emitted.
         # This is the exact #99 regression: setup dropping chunk_inner.
         cfg = default_config("atl03_tdigest_healpix")
+        cfg.output["store_layout"] = "flat"  # the flat GLOBAL template path (issue #253)
         resp, store = self._setup(handler_mod, monkeypatch, asdict(cfg))
         assert resp["statusCode"] == 200, json.loads(resp["body"])
 
@@ -1476,6 +1481,7 @@ class TestSetupTemplate:
         # chunked at parent_order (12*4^6) -- still matching the worker grid. Guards
         # the unset-chunk_inner path the fix must leave byte-identical.
         cfg = default_config("atl06")  # parent_order 6, child_order 12, no chunk_inner
+        cfg.output["store_layout"] = "flat"  # the flat GLOBAL template path (issue #253)
         resp, store = self._setup(handler_mod, monkeypatch, asdict(cfg), parent_order=6)
         assert resp["statusCode"] == 200, json.loads(resp["body"])
 
@@ -1484,34 +1490,41 @@ class TestSetupTemplate:
         assert (n_chunks,) == worker_grid.chunk_grid_shape
         assert n_chunks == HEALPIX_BASE_CELLS * 4**6
 
+    def test_setup_dense_layout_400(self, handler_mod, monkeypatch):
+        # The dense layout was removed (issue #88): a point-path setup event still
+        # carrying a dense config gets the shared early guard's clean 400, not an
+        # opaque from_config 500 — parity with the raster branch (issue #253).
+        cfg = default_config("atl06")
+        cfg.output["grid"]["layout"] = "dense"
+        resp, _store = self._setup(handler_mod, monkeypatch, asdict(cfg), parent_order=6)
+        assert resp["statusCode"] == 400, json.loads(resp["body"])
+        assert "fullsphere" in json.loads(resp["body"])["error"]
+
     def test_flat_setup_body_pinned_no_raster_echo(self, handler_mod, monkeypatch):
         # The raster setup branch (issue #264) keys on data_source.reader ==
         # "raster": a point-path config must keep the flat branch and its
         # exact pre-#264 body -- no "pipeline" echo, no "times_us" read.
         cfg = default_config("atl06")
+        cfg.output["store_layout"] = "flat"  # the flat GLOBAL template path (issue #253)
         resp, _store = self._setup(handler_mod, monkeypatch, asdict(cfg), parent_order=6)
         assert resp["statusCode"] == 200, resp["body"]
         assert json.loads(resp["body"]) == {"ok": True, "mode": "setup", "layout": "flat"}
 
-    def test_setup_dense_layout_threads_populated_shards(self, handler_mod, monkeypatch):
-        # n_parent_cells signals the (deprecated) dense layout; the count must thread
-        # through as populated_shards so the template is sized to the populated shards
-        # (chunk count == n_parent_cells), not the full sphere. Covers the
-        # populated_shards branch the fix routes through from_config.
+    def test_setup_ignores_n_parent_cells(self, handler_mod, monkeypatch):
+        # The dense layout was removed (issue #88); a setup event still carrying
+        # n_parent_cells (an old dispatcher) gets the fullsphere template — the
+        # field is inert, not an error, so mixed-version fleets keep working.
         cfg = default_config("atl06")
-        cfg.output["grid"]["layout"] = "dense"
-        cfg_dict = asdict(cfg)
-        with pytest.warns(DeprecationWarning, match="dense is deprecated"):
-            resp, store = self._setup(
-                handler_mod, monkeypatch, cfg_dict, parent_order=6, n_parent_cells=5
-            )
+        cfg.output["store_layout"] = "flat"  # the flat GLOBAL template path (issue #253)
+        resp, store = self._setup(
+            handler_mod, monkeypatch, asdict(cfg), parent_order=6, n_parent_cells=5
+        )
         assert resp["statusCode"] == 200, json.loads(resp["body"])
 
-        with pytest.warns(DeprecationWarning, match="dense is deprecated"):
-            worker_grid = from_config(cfg, parent_order=6, populated_shards=list(range(5)))
+        worker_grid = from_config(cfg, parent_order=6)
         n_chunks = self._template_chunk_count(store, worker_grid)
         assert (n_chunks,) == worker_grid.chunk_grid_shape
-        assert n_chunks == 5
+        assert n_chunks == HEALPIX_BASE_CELLS * 4**6
 
 
 def _temporal_config_dict():

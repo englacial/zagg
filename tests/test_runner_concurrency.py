@@ -96,8 +96,11 @@ class TestProbeClampsWorkers:
                 "shard_key": 0,
             },
         )
+        cfg = default_config("atl06")
+        # Flat lambda lifecycle pinned explicitly (issue #253 defaults hive).
+        cfg.output["store_layout"] = "flat"
         summary = runner._run_lambda(
-            default_config("atl06"),
+            cfg,
             _catalog(),
             "s3://out/x.zarr",
             12,
@@ -126,9 +129,12 @@ class TestFdExhaustionSurfaces:
 
         monkeypatch.setattr(runner, "_invoke_lambda_cell", _boom)
 
+        cfg = default_config("atl06")
+        # Flat lambda lifecycle pinned explicitly (issue #253 defaults hive).
+        cfg.output["store_layout"] = "flat"
         with pytest.raises(OSError) as exc_info:
             runner._run_lambda(
-                default_config("atl06"),
+                cfg,
                 _catalog(),
                 "s3://out/x.zarr",
                 12,

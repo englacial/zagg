@@ -43,13 +43,9 @@ HEALPIX_REF_ORDER: int = 29
 class HealpixGrid:
     """HEALPix DGGS output grid.
 
-    Two layouts:
-
-    - ``"dense"``  shape ``(4^Δ · n_shards,)``. Chunks indexed by their
-      position in ``populated_shards`` (catalog order). Requires
-      ``populated_shards`` for ``block_index`` / ``emit_template``.
-    - ``"fullsphere"``  shape ``(12 · 4^child_order,)``. Chunks indexed
-      directly by parent morton ID. Stateless; no shard list needed.
+    One array layout — ``"fullsphere"``: shape ``(12 · 4^child_order,)``,
+    chunks indexed directly by parent nested ID. Stateless; no shard list
+    needed. (The deprecated ``"dense"`` pack was removed — issue #88.)
 
     Parameters
     ----------
@@ -57,22 +53,18 @@ class HealpixGrid:
         Shard (chunk) order.
     child_order : int
         Leaf cell order.
-    layout : {"dense", "fullsphere"}, optional
-        Storage layout. Defaults to ``"dense"`` (matches pre-refactor behavior).
+    layout : {"fullsphere"}, optional
+        Storage layout. ``"fullsphere"`` is the only (and default) value.
     config : PipelineConfig, optional
         Aggregation schema. Defaults to the built-in atl06 config.
-    populated_shards : iterable of int, optional
-        Parent morton IDs that will be written. Required for dense layout.
-        Order is preserved (used as the storage-block ordering).
     """
 
     def __init__(
         self,
         parent_order: int,
         child_order: int,
-        layout: Literal["dense", "fullsphere"] = "dense",
+        layout: Literal["fullsphere"] = "fullsphere",
         config: PipelineConfig | None = None,
-        populated_shards: list[int] | None = None,
         chunk_inner: int | None = None,
         sharded: bool = True,
     ):
@@ -80,8 +72,8 @@ class HealpixGrid:
             raise ValueError(
                 f"child_order ({child_order}) must be >= parent_order ({parent_order})"
             )
-        if layout not in ("dense", "fullsphere"):
-            raise ValueError(f"Unknown layout: {layout!r} (expected 'dense' or 'fullsphere')")
+        if layout != "fullsphere":
+            raise ValueError(f"Unknown layout: {layout!r} (expected 'fullsphere')")
         # chunk_inner (issue #30 item 3): an optional finer ZARR-chunk order between
         # the shard order (parent_order) and the cell order (child_order). One shard
         # (the dispatch unit) then owns K = 4^(chunk_order - parent_order) chunks.
@@ -94,14 +86,6 @@ class HealpixGrid:
             raise ValueError(
                 f"chunk_inner order ({chunk_order}) must satisfy parent_order "
                 f"({parent_order}) <= chunk_inner <= child_order ({child_order})"
-            )
-        if chunk_inner is not None and chunk_order != parent_order and layout != "fullsphere":
-            # Dense layout keys companion/main blocks by populated-shard POSITION;
-            # resolving K finer chunk positions per shard there is a separate concern
-            # (issue #30 item 3 lands fullsphere first). Reject rather than mis-index.
-            raise ValueError(
-                "chunk_inner finer than parent_order requires layout='fullsphere' "
-                "(dense multi-chunk-per-shard block indexing is not yet supported)"
             )
         self.parent_order = parent_order
         self.child_order = child_order
@@ -144,36 +128,15 @@ class HealpixGrid:
                 f"Unknown cell_ids_encoding: {self.cell_ids_encoding!r} "
                 "(expected 'nested' or 'morton')"
             )
-        self._position_map: dict[int, int] | None = None
-        if populated_shards is not None:
-            self.set_populated_shards(populated_shards)
-
-    def set_populated_shards(self, shards) -> None:
-        """Set the populated-shard list (dense layout only).
-
-        Preserves input order — that order becomes the storage-block order.
-        No-op for fullsphere layout.
-        """
-        if self.layout == "fullsphere":
-            return
-        self._position_map = {int(s): i for i, s in enumerate(shards)}
 
     @property
     def n_shards(self) -> int:
         """Number of shards in the storage layout."""
-        if self.layout == "fullsphere":
-            return HEALPIX_BASE_CELLS * (4**self.parent_order)
-        if self._position_map is None:
-            raise RuntimeError(
-                "HealpixGrid(layout='dense') requires populated_shards before n_shards"
-            )
-        return len(self._position_map)
+        return HEALPIX_BASE_CELLS * (4**self.parent_order)
 
     @property
     def array_shape(self) -> tuple[int, ...]:
-        if self.layout == "fullsphere":
-            return (HEALPIX_BASE_CELLS * (4**self.child_order),)
-        return (self.n_children * self.n_shards,)
+        return (HEALPIX_BASE_CELLS * (4**self.child_order),)
 
     @property
     def chunk_shape(self) -> tuple[int, ...]:
@@ -190,8 +153,8 @@ class HealpixGrid:
         """Number of chunks (``array_shape // chunk_shape``) for companion arrays.
 
         A ``resolution: chunk`` field (issue #30 item 2) stores one value per
-        chunk here. Equals ``12·4^chunk_order`` for fullsphere (``== 12·4^parent_order``
-        when ``chunk_inner`` is unset) and ``n_shards`` for dense.
+        chunk here. Equals ``12·4^chunk_order`` (``== 12·4^parent_order`` when
+        ``chunk_inner`` is unset).
 
         Indexing: at K==1 (``chunk_inner`` unset) the per-chunk index IS
         :meth:`block_index` (one chunk per shard). At K>1 (issue #30 item 3) the
@@ -391,19 +354,14 @@ class HealpixGrid:
     def block_index(self, shard_key) -> tuple[int, ...]:
         """Storage block index for this parent morton ID.
 
-        For fullsphere layout, returns the parent's HEALPix nested cell ID
-        (chunks are keyed by parent nested-ID, not by morton — morton is
-        sparse/1-4-digit while nested-ID is contiguous in ``[0, 12·4^p)``).
-        For dense layout, returns the position in ``populated_shards``.
+        Returns the parent's HEALPix nested cell ID (chunks are keyed by
+        parent nested-ID, not by morton — morton is sparse/1-4-digit while
+        nested-ID is contiguous in ``[0, 12·4^p)``).
         """
-        if self.layout == "fullsphere":
-            from mortie import mort2healpix
+        from mortie import mort2healpix
 
-            healpix, _ = mort2healpix(np.asarray([int(shard_key)]))
-            return (int(healpix[0]),)
-        if self._position_map is None:
-            raise RuntimeError("block_index requires set_populated_shards() for dense layout")
-        return (self._position_map[int(shard_key)],)
+        healpix, _ = mort2healpix(np.asarray([int(shard_key)]))
+        return (int(healpix[0]),)
 
     def shard_label(self, shard_key) -> str:
         """Decimal morton string for this shard's packed word (issue #199).
@@ -567,10 +525,7 @@ class HealpixGrid:
     # ── internals ────────────────────────────────────────────────────────
 
     def _spec(self) -> GroupSpec:
-        if self.layout == "fullsphere":
-            n_pixels = HEALPIX_BASE_CELLS * (4**self.child_order)
-        else:
-            n_pixels = self.n_children * self.n_shards
+        n_pixels = HEALPIX_BASE_CELLS * (4**self.child_order)
         return self._group_spec(n_pixels, self.chunk_grid_shape)
 
     def _group_spec(

@@ -289,8 +289,11 @@ def validate_config(config: PipelineConfig) -> None:
             if len(grid["bounds"]) != 4:
                 raise ValueError("output.grid.bounds must be [xmin, ymin, xmax, ymax]")
         layout = grid.get("layout")
-        if layout is not None and layout not in ("dense", "fullsphere"):
-            raise ValueError(f"output.grid.layout must be 'dense' or 'fullsphere' (got {layout!r})")
+        if layout is not None and layout != "fullsphere":
+            raise ValueError(
+                f"output.grid.layout must be 'fullsphere' (got {layout!r}; "
+                "the deprecated 'dense' layout was removed — issue #88)"
+            )
         # Optional cell_ids encoding (issue #135): "nested" (default, the DGGS
         # standard) or "morton" (emit the packed morton words as cell_ids — a
         # test/prototype capability). HEALPix-only: rectilinear grids have no
@@ -690,14 +693,17 @@ def _validate_raster_config(config: PipelineConfig) -> None:
 def _validate_store_layout_keys(config: PipelineConfig) -> None:
     """Shared ``output.store_layout`` / ``coverage_moc`` cross-checks.
 
-    Optional store layout (issue #199 phase 2): "flat" (default, today's single
-    shared store) or "hive" (one leaf zarr per shard under a morton digit tree —
-    ``docs/design/sparse_coverage.md`` D1-D6). Hive ids are morton decimal
-    strings, so the layout is HEALPix-only; metadata consolidation assumes the
-    single shared store, so it is rejected with hive rather than silently
-    mis-writing. Called from both the point-pipeline and raster validation
-    branches (issue #247: raster + hive is legal, so the checks live in one
-    place; the issue #239 stopgap rejections are gone).
+    Optional store layout (issue #199 phase 2): "hive" (one leaf zarr per
+    shard under a morton digit tree — ``docs/design/sparse_coverage.md``
+    D1-D6) or "flat" (the single shared store). The default is grid-aware
+    (issue #253, ``get_store_layout``): HEALPix -> hive, rectilinear -> flat —
+    so the hive gates below resolve through the default, not the raw key.
+    Hive ids are morton decimal strings, so the layout is HEALPix-only;
+    metadata consolidation assumes the single shared store, so it is rejected
+    with hive (explicit or defaulted) rather than silently mis-writing. Called
+    from both the point-pipeline and raster validation branches (issue #247:
+    raster + hive is legal, so the checks live in one place; the issue #239
+    stopgap rejections are gone).
 
     The end-of-run root coverage MOC (issue #200 phase 3) is boolean when
     present, default ON for the hive layout (O9); it writes
@@ -710,7 +716,7 @@ def _validate_store_layout_keys(config: PipelineConfig) -> None:
     store_layout = config.output.get("store_layout")
     if store_layout is not None and store_layout not in ("flat", "hive"):
         raise ValueError(f"output.store_layout must be 'flat' or 'hive' (got {store_layout!r})")
-    if store_layout == "hive":
+    if get_store_layout(config) == "hive":
         if (grid or {}).get("type", "healpix") != "healpix":
             raise ValueError(
                 "output.store_layout: hive requires a healpix grid (hive node names "
@@ -730,7 +736,7 @@ def _validate_store_layout_keys(config: PipelineConfig) -> None:
                 "output.coverage_moc requires a healpix grid (the root coverage.moc "
                 "is a morton MOC; drop the flag for rectilinear output)"
             )
-        if store_layout != "hive":
+        if get_store_layout(config) != "hive":
             raise ValueError(
                 "output.coverage_moc requires output.store_layout: hive (the root "
                 "coverage.moc lives at the hive store root; flat stores have no "
@@ -790,7 +796,7 @@ def _validate_windowing(config: PipelineConfig) -> None:
             "output.windowing requires a healpix grid (windowed leaves are a "
             f"morton-hive convention; grid type is {grid.get('type')!r})"
         )
-    if (config.output.get("store_layout") or "flat") != "hive":
+    if get_store_layout(config) != "hive":
         raise ValueError(
             "output.windowing requires output.store_layout: hive (window leaves "
             "are hive leaf zarrs; the flat shared store has no leaves to window)"
@@ -2020,7 +2026,8 @@ def get_layout(config: PipelineConfig) -> str:
     Returns
     -------
     str
-        ``"fullsphere"`` (default) or ``"dense"`` (deprecated).
+        ``"fullsphere"`` (the only layout; the deprecated ``"dense"`` pack
+        was removed — issue #88).
     """
     return config.output.get("grid", {}).get("layout", "fullsphere")
 
@@ -2078,23 +2085,35 @@ def get_store_path(config: PipelineConfig) -> str | None:
 
 
 def get_store_layout(config: PipelineConfig) -> str:
-    """Return the STORE layout — flat single store vs morton hive (issue #199).
+    """Return the STORE layout — morton hive vs flat single store (issue #199).
 
     Distinct from ``output.grid.layout`` (the HEALPix *array* layout inside one
     store): ``output.store_layout`` selects how shard output is arranged under
-    ``output.store``. ``"flat"`` (default) is today's single shared zarr store.
-    ``"hive"`` writes one self-describing leaf zarr per shard at
-    ``{store}/{sign+base}/{d1}/.../{full_id}.zarr`` with a root
+    ``output.store``. ``"hive"`` writes one self-describing leaf zarr per shard
+    at ``{store}/{sign+base}/{d1}/.../{full_id}.zarr`` with a root
     ``morton_hive.json`` manifest and a per-leaf commit stamp — see
-    ``docs/design/sparse_coverage.md`` (D1-D6) and :mod:`zagg.hive`. A
-    present-but-null key falls back to the default, like ``layout``.
+    ``docs/design/sparse_coverage.md`` (D1-D6) and :mod:`zagg.hive`. ``"flat"``
+    is the single shared zarr store.
+
+    The default is grid-aware and pipeline-agnostic (issue #253): HEALPix
+    grids default to ``"hive"`` (the ratified profile — for point aggregation
+    AND the raster path, which writes hive leaves per issue #247); rectilinear
+    grids default to ``"flat"`` (hive ids are morton digits — HEALPix-only).
+    An explicit HEALPix ``"flat"`` remains valid for interop/debug but is
+    deprecated — removal is gated on the sparse-DGGS read path (issue #251
+    phase 3). A present-but-null key falls back to the default, like
+    ``layout``.
 
     Returns
     -------
     str
-        ``"flat"`` (default) or ``"hive"``.
+        ``"flat"`` or ``"hive"``.
     """
-    return config.output.get("store_layout") or "flat"
+    layout = config.output.get("store_layout")
+    if layout is not None:
+        return layout
+    grid_type = (config.output.get("grid") or {}).get("type", "healpix")
+    return "hive" if grid_type == "healpix" else "flat"
 
 
 def get_coverage_moc(config: PipelineConfig) -> bool:

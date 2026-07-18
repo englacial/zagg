@@ -18,7 +18,6 @@ def from_config(
     config: PipelineConfig,
     *,
     parent_order: int | None = None,
-    populated_shards: list | None = None,
 ) -> OutputGrid:
     """Construct an OutputGrid from a pipeline config.
 
@@ -29,18 +28,31 @@ def from_config(
     parent_order : int, optional
         Shard order for HEALPix (typically from the catalog metadata).
         Ignored for non-HEALPix grids.
-    populated_shards : list, optional
-        Required for dense-layout HEALPix; ignored otherwise.
     """
     grid_cfg = config.output.get("grid", {})
     grid_type = grid_cfg.get("type", "healpix")
     if grid_type == "healpix":
+        # Deprecation (issue #253, mirroring the retired dense warning): the
+        # HEALPix flat/fullsphere store remains for interop/debug but hive is
+        # the default — uniformly, raster included (issue #247 made raster +
+        # hive the real write path); removal is gated on the sparse-DGGS read
+        # path (#251 phase 3).
         explicit_layout = grid_cfg.get("layout")
-        if explicit_layout == "dense":
+        if config.output.get("store_layout") == "flat":
             warnings.warn(
-                "output.grid.layout: dense is deprecated; switch to fullsphere "
-                "(the new default) or omit the field. Dense will be removed in "
-                "a future release.",
+                "output.store_layout: flat is deprecated for HEALPix; hive is "
+                "the default. Flat remains for interop/debug and will be "
+                "removed once the sparse-DGGS read path lands (issue #251 "
+                "phase 3).",
+                DeprecationWarning,
+                stacklevel=2,
+            )
+        if explicit_layout is not None:
+            warnings.warn(
+                "output.grid.layout: fullsphere is deprecated for HEALPix; "
+                "hive (the default store_layout) does not use it. Omit the "
+                "key — the flat/fullsphere store it selects is removed once "
+                "the sparse-DGGS read path lands (issue #251 phase 3).",
                 DeprecationWarning,
                 stacklevel=2,
             )
@@ -62,7 +74,6 @@ def from_config(
             child_order=get_child_order(config),
             layout=layout,
             config=config,
-            populated_shards=populated_shards,
             chunk_inner=grid_cfg.get("chunk_inner"),
             sharded=get_sharded(config, default=True),
         )
