@@ -779,16 +779,19 @@ def make_full_aoi_release_figure(
 
 def write_index(
     outdir: Path,
-    matrix_rendered: list[str],
     *,
-    matrix_table_png: bool = False,
+    live_table_png: bool = False,
     has_md: bool = False,
     has_json: bool = False,
 ) -> None:
-    """Emit a Pages index: the live inline-vs-sidecar matrix on top (issue
-    #193), then an ARCHIVED section embedding the retained (frozen) codec +
-    historical PNGs if they still exist in ``outdir`` (they persist on the
-    benchmarks branch; this PR stopped regenerating them)."""
+    """Emit the Pages index in the issue #250 layout (espg-approved on PR #256):
+    per-release summary + diagnostics first, then the per-merge section, then an
+    ARCHIVED section embedding every retained-but-retired PNG still on disk
+    (the benchmarks branch keeps them; they are no longer regenerated).
+
+    Sections are keyed on PNGs existing on disk, not on what THIS run rendered,
+    so both workflows (per-merge and per-release) leave each other's sections
+    intact when they re-render only their own figures."""
     blocks: list[str] = []
     links = []
     if has_md:
@@ -796,63 +799,90 @@ def write_index(
     if has_json:
         links.append('<a href="metrics.json">metrics.json</a>')
 
-    # --- live matrix section (on top) ---
-    if matrix_table_png:
+    # --- per-release section (on top: full-AOI truth) ---
+    release = [
+        f'<h3>{title}</h3>\n<img src="{name}.png" alt="{name}">'
+        for name, title in (
+            ("full_aoi_summary", "Summary — total billed cost (lambda-s ⇔ USD) and wall"),
+            ("full_aoi_point_phases", "Point pipeline — per-phase seconds (max shard)"),
+            (
+                "full_aoi_raster_phases",
+                "Raster pipeline — per-stage seconds (work volume, never stacked)",
+            ),
+            ("full_aoi_objects", "Store objects (issue #240 tripwire)"),
+        )
+        if (outdir / f"{name}.png").exists()
+    ]
+    if release:
+        blocks.append(
+            "<h2>Per-release benchmarks (full-AOI NEON)</h2>\n"
+            "<p>The whole AOP_NEON box, every shard, once per release tag — the "
+            "point (tdigest, hive, AOI mask) and raster (Sentinel-2 2025) legs.</p>"
+        )
+        blocks += release
+
+    # --- per-merge section: the collapsed single hive configuration ---
+    merge_blocks: list[str] = []
+    if live_table_png:
         block = (
-            "<h2>inline/sidecar \u00d7 AOI-mask (sharded, K=4, o9) \u2014 latest merge</h2>\n"
-            '<img src="matrix_table.png" alt="inline/sidecar x AOI-mask benchmark table">'
+            '<h3>Latest merge</h3>\n<img src="merge_table.png" alt="latest merge benchmark table">'
         )
         if links:
             block += f"\n<p>Machine-readable: {' \u00b7 '.join(links)}</p>"
-        blocks.append(block)
-    blocks += [
-        f"<h2>{name} (inline/sidecar \u00d7 AOI-mask)</h2>\n"
-        f'<img src="{name}_matrix.png" alt="{name}_matrix">'
-        for name in matrix_rendered
-    ]
-
-    # --- per-release full-AOI NEON section (issue #202 leg 1) ---
-    # Keyed on the PNGs existing on disk (like the archived section below), not on
-    # whether THIS run rendered them, so the section persists across both the
-    # per-merge and per-release workflows (each re-renders only its own figures).
-    full_aoi = [
-        f'<h3>{label}</h3>\n<img src="{name}.png" alt="{name}">'
-        for name, (_col, label) in FULL_AOI_FIGURES.items()
+        merge_blocks.append(block)
+    merge_blocks += [
+        f'<h3>{title}</h3>\n<img src="{name}.png" alt="{name}">'
+        for name, title in (
+            ("merge_summary", "Summary — total billed cost (lambda-s ⇔ USD) and wall"),
+            ("merge_phases", "Diagnostics — per-phase seconds"),
+        )
         if (outdir / f"{name}.png").exists()
     ]
-    if full_aoi:
+    if merge_blocks:
         blocks.append(
-            "<hr>\n<h2>Per-release full-AOI NEON (all shards)</h2>\n"
-            "<p>The whole AOP_NEON box fanned over every shard, recorded per "
-            "release for dollar-cost truth (release tag on the x-axis) \u2014 the "
-            "complement to the per-merge single-densest-shard matrix above.</p>"
+            "<hr>\n<h2>Per commit to main (single densest shard)</h2>\n"
+            "<p>One configuration — o9, hive, sharded, tdigest, no AOI mask — "
+            "isolating code deltas from data drift (merge sha on the x-axis).</p>"
         )
-        blocks += full_aoi
+        blocks += merge_blocks
 
-    # --- archived section (below): retained frozen PNGs, embedded if present ---
+    # --- archived section: retained frozen PNGs, embedded if still present ---
     archived: list[str] = []
-    if (outdir / "codec_table.png").exists():
-        archived.append(
-            "<h3>Sharded vs inner-chunk (archived)</h3>\n"
-            '<img src="codec_table.png" alt="archived codec table">'
-        )
-    if (outdir / "latest_table.png").exists():
-        archived.append(
-            "<h3>Frozen historical (archived)</h3>\n"
-            '<img src="latest_table.png" alt="archived historical table">'
-        )
+    for png, title in (
+        ("matrix_table.png", "inline/sidecar × AOI-mask table"),
+        ("codec_table.png", "Sharded vs inner-chunk table"),
+        ("latest_table.png", "Frozen historical table"),
+    ):
+        if (outdir / png).exists():
+            archived.append(f'<h3>{title} (archived)</h3>\n<img src="{png}" alt="archived {png}">')
     for name in FIGURES:
-        for suffix, tag in (("_codec", "sharded vs inner"), ("", "frozen")):
+        for suffix, tag in (
+            ("_matrix", "inline/sidecar × AOI-mask"),
+            ("_codec", "sharded vs inner"),
+            ("", "frozen"),
+        ):
             if (outdir / f"{name}{suffix}.png").exists():
                 archived.append(
                     f"<h3>{name} ({tag}, archived)</h3>\n"
                     f'<img src="{name}{suffix}.png" alt="archived {name}{suffix}">'
                 )
+    for name, (_col, label) in FULL_AOI_FIGURES.items():
+        # full_aoi_objects stays LIVE (re-rendered above); the cost pair retires.
+        if name != "full_aoi_objects" and (outdir / f"{name}.png").exists():
+            archived.append(
+                f'<h3>{label} (archived)</h3>\n<img src="{name}.png" alt="archived {name}">'
+            )
+    if (outdir / "full_aoi_phases.png").exists():  # pre-restructure phase figure
+        archived.append(
+            "<h3>per-phase seconds, single-figure form (archived)</h3>\n"
+            '<img src="full_aoi_phases.png" alt="archived full_aoi_phases">'
+        )
     if archived:
         blocks.append(
-            "<hr>\n<h2>Archived (frozen as of issues #193 / #202)</h2>\n"
-            "<p>The pre-#193 codec (sharded/inner) + historical series and the "
-            "pre-#202 o10 read-backend rows, retained but no longer updated.</p>"
+            "<hr>\n<h2>Archived (frozen as of issues #193 / #202 / #250)</h2>\n"
+            "<p>The pre-#193 codec + historical series, the pre-#250 "
+            "inline/sidecar × AOI-mask 2×2, and the per-100 km² figures — "
+            "retained but no longer updated.</p>"
         )
         blocks += archived
 
@@ -867,8 +897,8 @@ def write_index(
         "<style>body{font-family:sans-serif;max-width:1100px;margin:2rem auto;padding:0 1rem}"
         "img{max-width:100%;height:auto;border:1px solid #ddd}</style></head>\n"
         "<body>\n<h1>zagg Lambda benchmark</h1>\n"
-        "<p>arm64 \u00b7 4 GB \u00b7 one shard/target \u00b7 densest cell over the NEON SERC "
-        "AOP box. Each point is a merge to <code>main</code>.</p>\n"
+        "<p>arm64 \u00b7 4 GB \u00b7 o9 \u00b7 hive \u00b7 tdigest \u00b7 NEON SERC AOP box \u00b7 "
+        "per release (full AOI) and per merge (single densest shard).</p>\n"
         f"{imgs}\n</body></html>\n"
     )
     (outdir / "index.html").write_text(html)
@@ -882,60 +912,109 @@ def main(argv: list[str] | None = None) -> int:
         "--full-aoi-series",
         default=None,
         help="Path to the per-release full-AOI parquet (full_aoi_series.parquet); "
-        "renders the per-release full-AOI figures when present",
+        "renders the per-release point figures when present",
+    )
+    parser.add_argument(
+        "--raster-series",
+        default=None,
+        help="Path to the per-release raster parquet (raster_series.parquet); "
+        "renders the raster diagnostics + summary row when present",
     )
     args = parser.parse_args(argv)
+
+    # The issue #250 renderers live in their own module (plot_series is at the
+    # repo's ~1000-line module ceiling); imported here, after this module is
+    # fully loaded, so plot_summary may import plot_series helpers if needed.
+    import plot_summary
 
     outdir = Path(args.out)
     outdir.mkdir(parents=True, exist_ok=True)
     df = pd.read_parquet(args.series) if Path(args.series).exists() else pd.DataFrame()
-
-    # Live matrix (issue #193): inline-vs-sidecar, sharded, K=4. The retired
-    # codec (sharded/inner) + frozen historical figures are NO LONGER
-    # regenerated -- their PNGs are retained on the benchmarks branch as-is
-    # (archived), and only the matrix figures below update going forward.
-    matrix_rendered: list[str] = []
-    for name, (col, label) in FIGURES.items():
-        if not df.empty and make_matrix_figure(df, col, label, outdir / f"{name}_matrix.png"):
-            matrix_rendered.append(name)
-
-    matrix_table_png = not df.empty and make_matrix_latest_table(df, outdir / "matrix_table.png")
-    # Machine-readable companions track the live matrix's latest merge.
-    matrix_df = df[_matrix_mask(df)] if not df.empty else df
-    has_md = not matrix_df.empty and write_latest_markdown(matrix_df, outdir / "latest.md")
-    has_json = not matrix_df.empty and write_latest_metrics(matrix_df, outdir / "metrics.json")
-
-    # Per-release full-AOI figures (issue #202 leg 1), from the separate series.
-    full_aoi_rendered: list[str] = []
     fa_path = args.full_aoi_series
     fa_df = pd.read_parquet(fa_path) if fa_path and Path(fa_path).exists() else pd.DataFrame()
-    for name, (col, label) in FULL_AOI_FIGURES.items():
-        if not fa_df.empty and make_full_aoi_release_figure(
-            fa_df, col, label, outdir / f"{name}.png"
+    r_path = args.raster_series
+    r_df = pd.read_parquet(r_path) if r_path and Path(r_path).exists() else pd.DataFrame()
+
+    rendered: list[str] = []
+
+    # --- per-merge section (issue #250 collapse): the single hive target.
+    # The retired matrix/codec/frozen figures are NO LONGER regenerated; their
+    # PNGs persist on the benchmarks branch under the Archived section.
+    merge_hist = plot_summary.merge_history(df)
+    if not merge_hist.empty:
+        if plot_summary.make_summary_figure(
+            [("per-merge point (hive, densest shard)", merge_hist, "commit")],
+            outdir / "merge_summary.png",
         ):
-            full_aoi_rendered.append(name)
+            rendered.append("merge_summary")
+        if plot_summary.make_diagnostics_figure(
+            merge_hist,
+            plot_summary.POINT_PHASE_PANELS,
+            "commit",
+            outdir / "merge_phases.png",
+            "zagg per-merge point — per-phase seconds vs merge",
+        ):
+            rendered.append("merge_phases")
+    latest = _latest_of(merge_hist).to_dict(orient="records")
+    live_table_png = _render_table(
+        latest,
+        _table_title("zagg per-merge benchmark (hive, o9)", latest),
+        outdir / "merge_table.png",
+    )
+    # Machine-readable companions track the LIVE (collapsed) target's latest
+    # merge; the per-100 km² column leaves the display (parquet keeps it).
+    display_df = merge_hist.drop(columns=["cost_per_100km2_usd"], errors="ignore")
+    has_md = not display_df.empty and write_latest_markdown(display_df, outdir / "latest.md")
+    has_json = not display_df.empty and write_latest_metrics(display_df, outdir / "metrics.json")
+
+    # --- per-release section: point + raster summary and diagnostics.
+    point_hist = plot_summary.point_release_history(fa_df)
+    raster_hist = plot_summary.raster_release_history(r_df)
+    summary_rows = [
+        ("full-AOI point (tdigest, hive, mask)", point_hist, "ref"),
+        ("full-AOI raster (S2 2025)", raster_hist, "ref"),
+    ]
+    if plot_summary.make_summary_figure(summary_rows, outdir / "full_aoi_summary.png"):
+        rendered.append("full_aoi_summary")
+    if not point_hist.empty and plot_summary.make_diagnostics_figure(
+        point_hist,
+        plot_summary.POINT_PHASE_PANELS,
+        "ref",
+        outdir / "full_aoi_point_phases.png",
+        "zagg full-AOI point — per-phase seconds vs release",
+    ):
+        rendered.append("full_aoi_point_phases")
+    if not raster_hist.empty and plot_summary.make_diagnostics_figure(
+        raster_hist,
+        plot_summary.RASTER_STAGE_PANELS,
+        "ref",
+        outdir / "full_aoi_raster_phases.png",
+        "zagg full-AOI raster — per-stage seconds vs release "
+        "(work volume: stages overlap, sums can exceed wall — never stacked)",
+    ):
+        rendered.append("full_aoi_raster_phases")
+    if plot_summary.make_release_objects_figure(point_hist, outdir / "full_aoi_objects.png"):
+        rendered.append("full_aoi_objects")
 
     write_index(
         outdir,
-        matrix_rendered,
-        matrix_table_png=matrix_table_png,
+        live_table_png=live_table_png,
         has_md=has_md,
         has_json=has_json,
     )
     extras = [
         n
         for n, ok in (
-            ("matrix_table", matrix_table_png),
+            ("merge_table", live_table_png),
             ("latest.md", has_md),
             ("metrics.json", has_json),
         )
         if ok
     ]
-    fa_note = f" + {len(full_aoi_rendered)} full-AOI release figure(s)" if full_aoi_rendered else ""
     print(
-        f"rendered {len(matrix_rendered)} matrix figure(s)"
-        f"{' + ' + ', '.join(extras) if extras else ''}{fa_note} -> {outdir} "
-        "(codec + frozen tiers archived, not regenerated)"
+        f"rendered {len(rendered)} figure(s) [{', '.join(rendered)}]"
+        f"{' + ' + ', '.join(extras) if extras else ''} -> {outdir} "
+        "(matrix/codec/frozen tiers archived, not regenerated)"
     )
     return 0
 

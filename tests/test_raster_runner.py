@@ -139,6 +139,21 @@ class TestRasterAgg:
             agg(cfg, catalog=sm_path, backend="local", max_workers=2)
         assert not [r for r in caplog.records if "stages:" in r.message]
 
+    def test_local_profile_rolls_up_stages(self, tmp_path, manifest):
+        # Issue #250: profile=True rolls the per-shard issue #249 stage stats
+        # (plus the timed write bucket) into the summary; off by default so the
+        # unprofiled summary stays byte-identical.
+        cfg, sm_path, _shard, _data = manifest
+        summary = agg(cfg, catalog=sm_path, backend="local", max_workers=2, profile=True)
+        stages = summary["worker_stage_max"]
+        assert set(stages) >= {"open", "geometry", "fetch", "decode", "gather", "write"}
+        assert all(v >= 0.0 for v in stages.values())
+        counts = summary["worker_stage_counts"]
+        assert counts["assets"] == 2  # 2 timesteps x 1 band
+        assert summary["template_s"] >= 0.0
+        bare = agg(cfg, catalog=sm_path, backend="local", max_workers=2, overwrite=True)
+        assert "worker_stage_max" not in bare and "worker_stage_counts" not in bare
+
     def test_multi_shard_disjoint_slabs(self, tmp_path):
         # Two rasters ~7 km apart feed two DISTINCT order-10 shards in one run;
         # each shard must read back its OWN values at its OWN cell range. A
@@ -310,6 +325,78 @@ class TestRasterLambdaBackend:
         assert summary["cells_error"] == 0
         assert summary["total_obs"] == 2
         assert len(fake.events) == 1
+        # No profile -> the payload stays byte-identical (no key) and the
+        # profile rollups stay out of the summary (issue #250).
+        assert "profile" not in fake.events[0]
+        assert "worker_stage_max" not in summary
+        # Always-on telemetry rollups are null-safe on a body without them.
+        assert summary["lambda_time_s"] is None and summary["max_memory_mb"] is None
+        assert summary["template_s"] >= 0.0
+
+    def test_lambda_profile_threads_key_and_rolls_up(self, manifest, monkeypatch, tmp_path):
+        # Issue #250: profile=True rides the event; the summary rolls the
+        # workers' phase_timings (stages straggler-maxed + write bucket,
+        # counts summed) and the billed-duration / peak-RSS telemetry.
+        import boto3
+
+        import zagg.runner as runner_mod
+
+        cfg, sm_path, _shard, _data = manifest
+
+        def responder(event):
+            assert event["profile"] is True
+            body = {
+                "timesteps": len(event["time_index"]),
+                "cells_with_data": 4096,
+                "duration_s": 12.5,
+                "max_memory_mb": 2890.0,
+                "phase_timings": {
+                    "sample": 10.0,
+                    "write": 2.5,
+                    "stages": {
+                        "open": 1.0,
+                        "geometry": 0.5,
+                        "fetch": 6.0,
+                        "decode": 2.0,
+                        "gather": 0.5,
+                        "assets": 4,
+                        "tiles": 12,
+                        "geom_hits": 1,
+                    },
+                },
+            }
+            return {"statusCode": 200, "body": json.dumps(body)}
+
+        fake = _FakeLambdaClient(responder)
+        monkeypatch.setattr(boto3, "client", lambda *a, **k: fake)
+        real_open = runner_mod.open_store
+
+        def fake_open(path, **kw):
+            if path.startswith("s3://"):
+                return str(tmp_path / "lambda_out.zarr")
+            return real_open(path, **kw)
+
+        monkeypatch.setattr(runner_mod, "open_store", fake_open)
+        summary = agg(
+            cfg,
+            catalog=sm_path,
+            store="s3://bucket/out.zarr",
+            backend="lambda",
+            max_workers=2,
+            profile=True,
+        )
+        assert summary["worker_stage_max"] == {
+            "open": 1.0,
+            "geometry": 0.5,
+            "fetch": 6.0,
+            "decode": 2.0,
+            "gather": 0.5,
+            "write": 2.5,
+        }
+        assert summary["worker_stage_counts"] == {"assets": 4, "tiles": 12, "geom_hits": 1}
+        assert summary["lambda_time_s"] == 12.5
+        assert summary["worker_max_s"] == 12.5 and summary["worker_median_s"] == 12.5
+        assert summary["max_memory_mb"] == 2890.0
 
     def test_output_credentials_normalized_and_endpoint_threaded(
         self, manifest, monkeypatch, tmp_path

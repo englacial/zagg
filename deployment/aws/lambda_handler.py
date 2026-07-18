@@ -981,6 +981,11 @@ def _handle_process_raster(event: Dict[str, Any]) -> Dict[str, Any]:
     mode.
     """
     start_time = time.time()
+    # Per-invocation peak-RSS sampler (issue #141 convention; raster parity
+    # for issue #250): the body reports THIS invocation's sampled peak, with
+    # the container-lifetime ``ru_maxrss`` high-water as the off-Linux
+    # fallback -- exactly the point-path split.
+    rss_sampler = _PeakRSSSampler().start()
     try:
         # The hive path (issue #247) needs no ``time_index``: the worker
         # builds its own leaf-local index from the dispatched subset. Peek at
@@ -1061,6 +1066,14 @@ def _handle_process_raster(event: Dict[str, Any]) -> Dict[str, Any]:
             }
             if meta.get("time_range") is not None:
                 body["time_range"] = meta["time_range"]
+            # Worker memory telemetry (issue #250), mirroring the flat branch:
+            # sampled per-invocation peak, container high-water fallback.
+            rss_sampler.stop()
+            body["container_hwm_mb"] = _max_memory_mb()
+            sampled_peak = rss_sampler.peak_mb
+            body["max_memory_mb"] = (
+                sampled_peak if sampled_peak is not None else body["container_hwm_mb"]
+            )
             if profile and "phase_timings" in meta:
                 body["phase_timings"] = meta["phase_timings"]
             return {"statusCode": 200, "body": json.dumps(body)}
@@ -1120,6 +1133,14 @@ def _handle_process_raster(event: Dict[str, Any]) -> Dict[str, Any]:
             "total_obs": meta["timesteps"],
             "duration_s": time.time() - start_time,
         }
+        # Worker memory telemetry (issue #250): sampled per-invocation peak,
+        # container high-water fallback (see the process-mode stamp).
+        rss_sampler.stop()
+        body["container_hwm_mb"] = _max_memory_mb()
+        sampled_peak = rss_sampler.peak_mb
+        body["max_memory_mb"] = (
+            sampled_peak if sampled_peak is not None else body["container_hwm_mb"]
+        )
         if profile:
             total = time.time() - start_time
             body["phase_timings"] = {
@@ -1140,6 +1161,8 @@ def _handle_process_raster(event: Dict[str, Any]) -> Dict[str, Any]:
                 }
             ),
         }
+    finally:
+        rss_sampler.stop()  # idempotent; ends the daemon thread on error paths too
 
 
 def _handle_process(event: Dict[str, Any], context: Any) -> Dict[str, Any]:

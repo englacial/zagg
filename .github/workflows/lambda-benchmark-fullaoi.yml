@@ -20,6 +20,13 @@ name: Lambda Benchmark (full-AOI, per release)
 #
 # Cost note: on each release this dispatches every NEON shard (4 shards) to real
 # Lambda -- billed. NEON is small; the whole-AOI run is a handful of invokes.
+#
+# Issue #250 (espg-approved restructure on PR #256): two release legs. The
+# `full-aoi` job is the POINT pipeline (collapsed to the single hive+mask
+# tdigest target in targets_full_aoi_neon.json); the `raster` job is the
+# Sentinel-2 2025 leg (targets_raster_neon.json, its own harness + series --
+# run_raster_benchmark.py owns the profiled per-shard dispatch). The raster job
+# runs AFTER the point job so their pushes to the benchmarks branch never race.
 
 on:
   push:
@@ -125,12 +132,14 @@ jobs:
           set -euo pipefail
           uv run python .github/scripts/full_aoi_series.py \
             --series _series/full_aoi_series.parquet --records full_aoi_metrics.json
-          # Re-render the Pages site: the matrix from the per-merge series (left
-          # untouched) plus the full-AOI release figures from the series just
-          # appended. --series is the existing per-merge parquet (idempotent).
+          # Re-render the Pages site: the per-merge section from its series
+          # (left untouched) plus the release figures from the series just
+          # appended. --series is the existing per-merge parquet (idempotent);
+          # --raster-series keeps the raster section fresh when it exists.
           uv run python .github/scripts/plot_series.py \
             --series _series/series.parquet \
             --full-aoi-series _series/full_aoi_series.parquet \
+            --raster-series _series/raster_series.parquet \
             --out _series/site
 
       - name: Commit + push to benchmarks branch
@@ -149,5 +158,93 @@ jobs:
             echo "no full-AOI benchmark changes to commit"
           else
             git commit -m "full-aoi benchmark: $TAG"
+            git push origin benchmarks
+          fi
+
+  # The raster release leg (issue #250): Sentinel-2 2025 over the NEON AOI,
+  # every shard, its own harness (profiled per-shard dispatch capturing the
+  # issue #249 stage set) and its own retained parquet (raster_series.parquet).
+  # All source access is anonymous (Earth Search) -- no Earthdata login, so no
+  # IPv4 workaround and no EARTHDATA_TOKEN here.
+  raster:
+    # Runs after the point leg so the two benchmarks-branch pushes never race;
+    # !cancelled() still runs it when the point leg failed (a raster release
+    # point is worth retaining on its own). Inert until the role is set.
+    needs: full-aoi
+    if: ${{ !cancelled() && vars.BENCHMARK_ROLE_ARN != '' }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      id-token: write
+    env:
+      ROLE_ARN: ${{ vars.BENCHMARK_ROLE_ARN }}
+      AWS_REGION: ${{ vars.BENCHMARK_AWS_REGION }}
+      STORE_PREFIX: ${{ vars.BENCHMARK_STORE_PREFIX }}
+      FUNCTION_NAME: ${{ vars.BENCHMARK_FUNCTION_NAME }}
+    steps:
+      - name: Checkout tag
+        uses: actions/checkout@v5
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v6
+
+      - name: Set up Python + install zagg (with benchmark extra)
+        run: |
+          uv python install 3.12
+          uv sync --extra benchmark
+
+      - name: Assume AWS role (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ env.ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Run raster benchmark (S2 2025, every shard over the AOI)
+        env:
+          TAG: ${{ github.ref_name }}
+          SHA: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          uv run python .github/scripts/run_raster_benchmark.py \
+            --targets tests/data/benchmark/targets_raster_neon.json \
+            --store-prefix "${STORE_PREFIX%/}/raster" \
+            --region "$AWS_REGION" \
+            --function-name "$FUNCTION_NAME" \
+            --event release \
+            --commit "$SHA" \
+            --ref "$TAG" \
+            --out-json raster_metrics.json
+
+      - name: Check out benchmarks data branch
+        uses: actions/checkout@v5
+        with:
+          ref: benchmarks
+          path: _series
+          fetch-depth: 0
+
+      - name: Append raster series + render charts
+        run: |
+          set -euo pipefail
+          uv run python .github/scripts/raster_series.py \
+            --series _series/raster_series.parquet --records raster_metrics.json
+          uv run python .github/scripts/plot_series.py \
+            --series _series/series.parquet \
+            --full-aoi-series _series/full_aoi_series.parquet \
+            --raster-series _series/raster_series.parquet \
+            --out _series/site
+
+      - name: Commit + push to benchmarks branch
+        working-directory: _series
+        env:
+          TAG: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add raster_series.parquet site
+          if git diff --cached --quiet; then
+            echo "no raster benchmark changes to commit"
+          else
+            git commit -m "raster benchmark: $TAG"
             git push origin benchmarks
           fi

@@ -44,8 +44,10 @@ Two JSON files. ``--out-json`` is one **run record** per target::
       "n_shards", "n_shards_ok", "n_shards_error", "total_obs",
       "aoi_mask_build_s", "shardmap_build_s",
       "lambda_seconds", "gb_seconds", "cost_usd",             # Lambda GB-s -- the PRIMARY cost column
+      "setup_cost_usd", "finalize_cost_usd",                  # sync invokes' billed dollars (issue #250)
       "total_wall_s", "setup_s", "fanout_s", "finalize_s",
       "worker_max_s", "worker_median_s", "worker_pct_timeout", "max_memory_mb",
+      "worker_phase_max": {"read", "index", "aggregate", "write"},  # straggler (max) s/phase (#250/#256)
       "objects_total", "objects_expected", "objects_mismatch",  # store object counts (issue #240), record-only
       "write_throughput": {                                    # leg-5 acceptance signal
         "invoke_retries_total", "invoke_throttle_shards",
@@ -445,6 +447,27 @@ def _measure_objects_recorded(
     return objects
 
 
+def _invoke_cost_usd(seconds):
+    """Billed dollars of a SYNC orchestrator invoke (issue #250 item 3).
+
+    ``setup_s`` is billed (real Lambda invokes) but excluded from both
+    ``total_wall_s`` and ``cost_usd`` (worker durations only), so on a flat
+    store the chart's dollar figure ran ~18% low. Kept as its OWN column --
+    ``cost_usd`` semantics are untouched, so the retained history stays
+    comparable. Layout split (issue #252 hybrid, PR #255): on FLAT rows
+    ``setup_s`` is the orchestrator wall around the sync fullsphere-template
+    invoke (no billed duration in the summary, so this slightly overstates by
+    the round-trip overhead); on HIVE rows it is only the preflight ping +
+    the ~10 ms async Event dispatch -- the manifest write's real billed GB-s
+    is fire-and-forget and unobservable from the orchestrator, so this column
+    measures the sync setup-path residue only, never an invented async cost.
+    Also applied to ``finalize_s`` (``finalize_cost_usd`` -- the hive manifest
+    backstop is a real sync invoke, issue #252). None-safe (dry runs)."""
+    if seconds is None:
+        return None
+    return round(float(seconds) * LAMBDA_MEMORY_GB * LAMBDA_PRICE_PER_GB_SEC, 6)
+
+
 def _assert_account(region: str, expect_account: str | None):
     if not expect_account:
         return None
@@ -576,12 +599,19 @@ def run_target(
         cost_usd=summary.get("estimated_cost_usd"),
         total_wall_s=summary.get("wall_time_s"),
         setup_s=summary.get("setup_s"),
+        setup_cost_usd=_invoke_cost_usd(summary.get("setup_s")),
+        finalize_cost_usd=_invoke_cost_usd(summary.get("finalize_s")),
         fanout_s=summary.get("fanout_s"),
         finalize_s=summary.get("finalize_s"),
         worker_max_s=summary.get("worker_max_s"),
         worker_median_s=summary.get("worker_median_s"),
         worker_pct_timeout=summary.get("worker_pct_timeout"),
         max_memory_mb=summary.get("max_memory_mb"),
+        # Worker per-phase straggler split (issue #250): {phase: max seconds
+        # across shards}, emitted because this harness runs profile=True. The
+        # dict rides the JSON record whole; the series flattens the known
+        # phases (read/index/aggregate) into phase_*_s columns, null-safe.
+        worker_phase_max=summary.get("worker_phase_max"),
         write_throughput=_write_throughput(results),
     )
     objects: dict = {}

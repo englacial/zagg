@@ -1,116 +1,166 @@
 # Benchmark results
 
-Cost and runtime of the zagg compute pipeline on AWS Lambda over the NEON SERC AOP
-box (issue #110), tracked as **two complementary series** (issue #202):
+Cost and runtime of the zagg compute pipeline on AWS Lambda over the NEON SERC
+AOP box, tracked as **two cadences** (issue #250 restructure, espg-approved on
+PR #256):
 
-- **Per merge to `main` — the live single-shard matrix.** Each point dispatches the
-  **single densest shard** per target — arm64, **4 GB**, one shard/target, capped by
-  the 900 s deploy timeout (the Lambda ceiling, issue #148) — so deltas track *code*
-  changes, not data drift. This is the [live matrix](#live-matrix--inlinesidecar--aoi-mask-per-merge) below.
-- **Per release — the full-AOI NEON run.** The whole `AOP_NEON` box fanned over
-  **every** shard, recorded per release for **dollar-cost truth** (real total across
-  all shards). Its harness is a separate deliverable (issue #202 leg 1); its plot is
-  a [skeleton](#per-release-full-aoi-neon-issue-202-leg-1) until that schema lands.
+- **Per release — full-AOI truth.** Every shard over the `AOP_NEON` box, once
+  per version tag: the **point pipeline** (ATL03 t-digest) and the **raster
+  pipeline** (Sentinel-2, year 2025).
+- **Per commit to `main` — regression tracking.** The **single densest shard**
+  of one pinned configuration, so deltas track *code* changes, not data drift.
 
-The pinned window is the full mission, `2018-10-13 .. 2026-03-15` (the last CMR
-granule is `2026-03-11`). The charts below are rendered on merge/release and
-published to the `benchmarks` data branch; they update live (the docs embed them by
-raw URL, so no docs rebuild is needed). See
-[Lambda benchmark CI/CD setup](benchmark-cicd.md) for how the pipeline is wired.
+All runs: arm64, **4 GB** worker, **o9** dispatch shards, tdigest (point
+pipeline), `granule_workers=4`. Costs are reported for the full run — **no
+per-100 km² normalization** (dropped from all rendered outputs; the
+`cost_per_100km2_usd` column stays in the parquet history). Charts render on
+merge/release to the `benchmarks` data branch and embed here by raw URL (no
+docs rebuild). See [Lambda benchmark CI/CD setup](benchmark-cicd.md) for the
+wiring.
 
-## Live matrix — inline/sidecar × AOI-mask (per merge)
+## Per-release benchmarks (full-AOI NEON)
 
-The live per-merge matrix (issue #202 reset) is **tdigest, sharded output,
-`granule_workers=4`, at 4 GB, o9 only** — a **2×2** over the read-backend A/B
-(`inline` vs `sidecar`) **×** the strict-AOI-mask A/B (`mask` vs `nomask`). Four
-targets: `tdigest_healpix_o9_{inline,sidecar}_{mask,nomask}`. The `mask` arm
-dispatches the `aoi_mask`-carrying shard map (`healpix_o9_aoimask`), the `nomask`
-arm the plain one; the mask is manifest-driven, so the arms differ only by which map
-they dispatch (issue #101/#202). The chart columns are the read backend (`inline`
-left, `sidecar` right); the rows are the AOI-mask arm (`nomask` top, `mask` bottom).
+Two release legs (`lambda-benchmark-fullaoi.yml`, tag-triggered):
 
-o10 was retired from this live set (an o9-only reset); its read-backend rows are
-frozen under `provisional_targets` (retained, not rerun), and the pre-reset live
-datapoints are dropped from the corrected series at the render layer, so the 2×2
-starts fresh at the first post-reset merge.
+- **Point pipeline** (`targets_full_aoi_neon.json`, one target) — o9, **hive**
+  store layout, sharded, tdigest, inline read, **with** the strict AOI binary
+  mask. Dispatched with `profile=True`, so the worker phase split lands in
+  `full_aoi_series.parquet`.
+- **Raster pipeline** (`targets_raster_neon.json`, one target) — Sentinel-2
+  Collection-1 L2A over 2025 (the pinned Earth Search catalog
+  `cat_s2_neon_2025.parquet`, 85 items — offline, fixed across releases), o9
+  shards, pull-NN `(time, cells)` ingest. The harness
+  (`run_raster_benchmark.py`) dispatches through `agg(profile=True)` — the
+  runner's raster path threads the profile key to the workers and rolls their
+  stage timings, billed durations and peak RSS into the summary — and retains
+  its own `raster_series.parquet`. Two deviations from the target end-state,
+  pending upstream: **hive is gated, not absent** — the manifest carries a
+  `pending_targets` hive variant the harness can already dispatch (a
+  `store_layout` override + re-validate), promoted to live the moment issue
+  #237 lands (the raster path rejects hive until then, issue #239) — and **no
+  strict AOI mask** (issue #101 is point-path-only); the AOI scoping is the
+  catalog's STAC-query clip.
 
-A fifth committed target, `tdigest_healpix_o9_hive` (issue #240, unblocked by
-issue #236), runs the same config with `store_layout: hive` — a **write-path
-regression arm**, not a cost A/B: the object-count tripwire hard-fails the
-per-merge run if a leaf's sharded write is ever bypassed (the ~250× object
-blow-up of issue #215). It deliberately stays out of the 2×2 panels (keyed on
-flat rows via the `store_layout` series column); its numbers land in the PR
-comment table and the retained series.
+### Summary — total billed cost and wall time
 
-![inline/sidecar × AOI-mask — latest merge](https://raw.githubusercontent.com/englacial/zagg/benchmarks/site/matrix_table.png)
+One row per pipeline: **total billed cost** on a dual axis — billed
+lambda-seconds (left) and USD (right, an *exact* relabeling at the fixed 4 GB
+price) — and overall wall, against the release tag. Markers on both rows carry
+the peak-RSS colour scale (green→red % of the 4 GB cap, MB twin axis): the
+raster worker reports the same sampled per-invocation peak as the point path
+(issue #141 convention; raster parity added by issue #250).
 
-### Cost per shard vs runtime (inline/sidecar × AOI-mask)
+The point pipeline's dollar figure is the **summed total**:
+`cost_usd + setup_cost_usd + finalize_cost_usd`. The sync setup and finalize
+invokes are billed but excluded from the worker-GB-seconds `cost_usd`, so the
+sum is the honest whole-run figure; the three stay separate columns in the
+series so the retained `cost_usd` history remains comparable (see
+"Cost columns" below).
 
-![Live matrix — cost per shard](https://raw.githubusercontent.com/englacial/zagg/benchmarks/site/cost_per_shard_matrix.png)
+![Per-release summary](https://raw.githubusercontent.com/englacial/zagg/benchmarks/site/full_aoi_summary.png)
 
-### Cost per 100 km² vs runtime (inline/sidecar × AOI-mask)
+### Diagnostics — point pipeline per-phase seconds
 
-![Live matrix — cost per 100 km²](https://raw.githubusercontent.com/englacial/zagg/benchmarks/site/cost_per_100km2_matrix.png)
+One panel per phase, seconds (straggler **max across shards**, matching the
+wall framing) vs release tag — never stacked:
+
+- **read / agg / write** — the worker split emitted under `profile=True`
+  (`worker_phase_max`). The displayed **agg = index + aggregate** (the
+  espg-approved mapping); the series retains the raw emitted phases
+  (`phase_index_s`, `phase_aggregate_s`, plus the PR #256 `write` split) so
+  the display mapping can change without rewriting history.
+- **setup** — the sync setup path. On flat it was the fullsphere-template
+  invoke (~104–110 s, the `docs/design/sparse_coverage.md` §1 waste); on hive
+  (the issue #252 hybrid) it is only the preflight ping + ~10 ms async Event
+  dispatch of the manifest write, so the flat→hive migration reads as a
+  visible collapse of this panel.
+- **finalize** — kept per issue #252: ~0 on flat, but on hive the load-bearing
+  idempotent `morton_hive.json` manifest backstop (the async init write runs
+  with retries 0; finalize self-heals a lost manifest).
+
+Phase cells are null on releases recorded before a capture landed, so panels
+simply start at the first release that recorded them.
+
+![Point per-phase diagnostics](https://raw.githubusercontent.com/englacial/zagg/benchmarks/site/full_aoi_point_phases.png)
+
+### Diagnostics — raster pipeline per-stage seconds
+
+The issue #249 stage set — `open` (store lookup + TIFF headers), `geometry`
+(pull-NN mapping; geom-cache hits ≈ 0), `fetch` (tile GETs), `decode`,
+`gather` (tile-index derivation + scatter/gather) — plus the worker `write`
+bucket, each as its own panel (max shard) vs release tag.
+
+**Stage seconds are work volume, not a wall decomposition:** concurrent
+asset-samples overlap on one event loop, so stage sums can exceed wall. The
+panels therefore show each stage as its own series and are never stacked to a
+wall total. The series also records run-total work counts
+(`count_assets` / `count_tiles` / `count_geom_hits`).
+
+![Raster per-stage diagnostics](https://raw.githubusercontent.com/englacial/zagg/benchmarks/site/full_aoi_raster_phases.png)
+
+### Store object count (issue #240 tripwire)
+
+The output store's object total vs the config-derived expectation, per
+release. A sharded-write bypass multiplies the count ~K-fold (the issue #215
+blow-up), so a write-path regression reads as a step here. **Record-only** on
+the release leg (a flaky release is never blocked on it); the per-merge
+harness *hard-fails* on the same mismatch.
+
+![Store objects](https://raw.githubusercontent.com/englacial/zagg/benchmarks/site/full_aoi_objects.png)
+
+### Cost columns
+
+`cost_usd` is the workers' billed GB-seconds — its semantics never change, so
+the retained history stays comparable. The sync orchestrator invokes get their
+own columns at the same fixed price: **`setup_cost_usd`** (`setup_s × 4 GB ×
+$/GB-s`; on hive rows `setup_s` is only the ping + async-dispatch residue —
+the fire-and-forget manifest write's billed GB-s is unobservable from the
+orchestrator and is never invented) and **`finalize_cost_usd`** (same pattern
+for the finalize invoke). The summary chart displays the sum; the parquet
+keeps the parts.
+
+## Per commit to `main`
+
+Single densest shard from the NEON AOI, **one configuration only** (issue
+#250 collapse): o9, **hive**, sharded, tdigest, inline read, **no** AOI mask,
+`granule_workers=4`, 4 GB — the former inline/sidecar × AOI-mask 2×2 is
+retired to the [archived section](#archived). The live target doubles as the
+write-path regression arm: the object-count tripwire **hard-fails** the merge
+run on a sharded-write bypass. Runs with `profile=True`, so the same
+read/agg/write phase split lands in `series.parquet`.
+
+### Latest merge
+
+![Latest merge table](https://raw.githubusercontent.com/englacial/zagg/benchmarks/site/merge_table.png)
 
 **Referencing these numbers programmatically?** Pull the machine-readable
 companions instead of scraping the image:
 [`metrics.json`](https://raw.githubusercontent.com/englacial/zagg/benchmarks/site/metrics.json)
 (the latest merge's records) or
 [`latest.md`](https://raw.githubusercontent.com/englacial/zagg/benchmarks/site/latest.md)
-(the same table as markdown). The full retained history is `series.parquet` on the
+(the same table as markdown). The full retained history is `series.parquet`
+(per-merge), `full_aoi_series.parquet` (per-release point) and
+`raster_series.parquet` (per-release raster) on the
 [`benchmarks` branch](https://github.com/englacial/zagg/tree/benchmarks).
 
-## Per-release full-AOI NEON (issue #202 leg 1)
+### Summary — total billed cost and wall time
 
-The complementary **per-release** series: the whole `AOP_NEON` box fanned over
-**every** shard (not just the densest one), recorded once per release, for the
-real dollar-cost total the single-shard matrix can't show. This is cost *truth*,
-where the per-merge matrix is a code-drift *regression* tracker. It runs on a
-version tag (`push: tags '*.*.*'`, `lambda-benchmark-fullaoi.yml`) — the whole AOI
-dispatched to the stable production function, appended to `full_aoi_series.parquet`
-on the `benchmarks` branch and rendered here. The same 2×2 axes as the live matrix
-(inline/sidecar × AOI-mask), but each panel is the whole-AOI total across
-**releases** (release tag on the x-axis), not one shard across merges.
+Same dual-axis convention as the per-release summary (billed lambda-seconds ⇔
+USD, exact relabeling; memory-coloured markers), merge sha on the x-axis. The
+total derives the sync-invoke dollars from `setup_s`/`finalize_s` at the fixed
+price and adds them to `cost_per_shard_usd`.
 
-Three views — the live matrix's two cost columns, plus the store-layout tripwire:
+![Per-merge summary](https://raw.githubusercontent.com/englacial/zagg/benchmarks/site/merge_summary.png)
 
-- **Whole-AOI cost (USD)** — the real dollar total across every shard.
-- **AOI-average cost / 100 km²** — that total spread over the whole AOI area
-  (`cost_usd × 100 / (n_shards × shard_area_km²)`). This is the *average*-shard
-  figure; the live matrix's cost/100 km² is the *densest* shard (worst case), so
-  this one runs lower — the honest per-area number for sizing a real AOI.
-- **Store objects (total)** — the output store's object count after the run,
-  against a config-derived expectation (issue #240). A sharded-write bypass
-  multiplies this ~K-fold (the issue #215 blow-up), so the regression reads as a
-  step here. On this per-release leg it is **record-only** (the release still
-  lands its series point); the per-merge harness *hard-fails* on the same
-  mismatch.
+### Diagnostics — per-phase seconds
 
-The release matrix also carries a fifth target, `full_aoi_neon_o9_hive` (issue
-#240 phase 4): the same config with `store_layout: hive` over all 4 shards,
-plus a **flat↔hive output-parity** read-back against its flat sibling
-(`parity_with` in the manifest) — per-shard, per-array content equality,
-recorded as `parity_ok` in the series. Everything on this leg — object counts
-and parity alike — is **record-only**: a release is never blocked on it (flaky
-CMR must not gate a release; the per-merge harness is the hard-fail tripwire).
-Hive rows stay out of the 2×2 cost panels (`store_layout` column) until the
-layout axis gets its own panel row.
+The same read / agg / write / setup / finalize panels as the per-release
+point diagnostics, against merge history.
 
-### Whole-AOI cost across releases
+![Per-merge diagnostics](https://raw.githubusercontent.com/englacial/zagg/benchmarks/site/merge_phases.png)
 
-![Per-release full-AOI — whole-AOI cost](https://raw.githubusercontent.com/englacial/zagg/benchmarks/site/full_aoi_cost_total.png)
-
-### AOI-average cost per 100 km² across releases
-
-![Per-release full-AOI — AOI-average cost per 100 km²](https://raw.githubusercontent.com/englacial/zagg/benchmarks/site/full_aoi_cost_per_100km2.png)
-
-### Store object count across releases
-
-![Per-release full-AOI — store objects](https://raw.githubusercontent.com/englacial/zagg/benchmarks/site/full_aoi_objects.png)
-
-> These embed by raw URL and appear after the first tagged release runs the
-> full-AOI job; until then GitHub shows a broken-image placeholder (nothing has
-> been rendered to the `benchmarks` branch yet).
+> Images appear after the first post-restructure merge/release renders to the
+> `benchmarks` branch; until then GitHub shows a broken-image placeholder.
 
 ### Container regime
 
@@ -125,74 +175,19 @@ remains the explicit all-cold certification baseline (it needs
 `lambda:UpdateFunctionConfiguration` on the caller — see
 [Warm-container memory and self-recycle](lambda.md#warm-container-memory-and-self-recycle)).
 
-## Archived: sharded vs inner-chunk (tdigest, HEALPix)
+## Archived
 
-**Frozen as of issue #193** (the read-backend A/B superseded it as the live matrix)
-and retained through the issue #202 reset — the retained rows + PNGs stay on the
-`benchmarks` branch but no new points are appended. The codec matrix (issue #133)
-was a **2×3 matrix** measuring the ShardingCodec
-([#108](https://github.com/englacial/zagg/issues/108)) head-to-head against regular
-inner chunks: all `tdigest` / HEALPix / arrow, across orders **o9 / o10 / o11**.
-Each order pins the same densest shard and runs it twice — `sharded` (the codec
-bundles a shard's K inner chunks into one Zarr shard object) vs `inner` (K
-independent chunk objects) — so the two columns are a clean A/B of the codec's
-memory / runtime / cost. o9 (K=256) is the heaviest case and the most interesting
-for the codec; the o9 row appears once its shard map lands (its build is pending a
-catalog query — see the PR thread).
+Retired series and figures are retained on the
+[`benchmarks` branch](https://github.com/englacial/zagg/tree/benchmarks) (and
+embedded at the bottom of the published Pages index) but no longer
+regenerated:
 
-The table is the latest merge's numbers (the `% cap` cell shaded green→red on the
-same scale as the chart markers); the charts below track each cell over merge
-history.
-
-![Sharded vs inner-chunk benchmark table](https://raw.githubusercontent.com/englacial/zagg/benchmarks/site/codec_table.png)
-
-(The `metrics.json` / `latest.md` companions now track the [live matrix](#live-matrix--inlinesidecar--aoi-mask-per-merge),
-not this archived codec matrix; its retained rows live in `series.parquet` on the
-[`benchmarks` branch](https://github.com/englacial/zagg/tree/benchmarks).)
-
-### Cost per shard vs runtime (sharded vs inner)
-
-![Sharded vs inner — cost per shard](https://raw.githubusercontent.com/englacial/zagg/benchmarks/site/cost_per_shard_codec.png)
-
-### Cost per 100 km² vs runtime (sharded vs inner)
-
-![Sharded vs inner — cost per 100 km²](https://raw.githubusercontent.com/englacial/zagg/benchmarks/site/cost_per_100km2_codec.png)
-
-The 2×3 grid lays the two codec columns (`sharded` left, `inner` right) across the
-three orders (o9 top → o11 bottom, largest shard first). A blank row is an order
-whose shard map hasn't landed yet.
-
----
-
-## Frozen historical benchmark
-
-The sections below are the **frozen** pre-#133 matrix — the rect / gain_bias
-targets, retired from the every-merge run. Their retained rows are kept and
-rendered unchanged for historical reference; no new points are appended.
-
-### Latest merge
-
-A snapshot of the most recent merge's per-target numbers — runtime, cost, and peak
-memory (the `% cap` cell is shaded green→red on the same scale as the chart
-markers). Like the charts, it updates live by raw URL.
-
-![Latest benchmark table](https://raw.githubusercontent.com/englacial/zagg/benchmarks/site/latest_table.png)
-
-### Cost per shard vs runtime
-
-![Cost per shard](https://raw.githubusercontent.com/englacial/zagg/benchmarks/site/cost_per_shard.png)
-
-### Cost per 100 km² vs runtime
-
-![Cost per 100 km²](https://raw.githubusercontent.com/englacial/zagg/benchmarks/site/cost_per_100km2.png)
-
----
-
-Per-target panels show **cost** (left axis) and **Lambda runtime** (right axis)
-over merge history, for the gain/bias and t-digest aggregators at HEALPix order 11
-and 10 (and the matched rectilinear grids). The full retained history lives as
-`series.parquet` on the [`benchmarks` branch](https://github.com/englacial/zagg/tree/benchmarks).
-
-> If the images above are blank, the pipeline hasn't run a merge yet — they
-> appear after the first merge to `main` once the
-> [setup](benchmark-cicd.md) is complete.
+- **inline/sidecar × AOI-mask 2×2** (issues #193/#202, retired by the issue
+  #250 collapse) — its four per-merge targets stay runnable on demand via
+  `/benchmark --target` from `provisional_targets`; the retired full-AOI 2×2
+  and parity arms' rows remain in `full_aoi_series.parquet`.
+- **Cost per 100 km² figures** (per-area normalization dropped, issue #250
+  item 7).
+- **Sharded vs inner-chunk codec matrix** (issue #133, frozen as of #193) and
+  the **pre-#133 rect/gain_bias historical matrix** — the pre-existing
+  archived tiers, unchanged.

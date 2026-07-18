@@ -96,6 +96,12 @@ class TestProcessRasterMode:
         assert body["timesteps"] == 1
         assert body["total_obs"] == 1
         assert body["cells_with_data"] == grid.cells_per_shard
+        # Worker memory telemetry (issue #250, point-path parity): the sampled
+        # per-invocation peak with the container high-water fallback -- always
+        # present and positive, profile or not.
+        assert body["max_memory_mb"] > 0
+        assert body["container_hwm_mb"] > 0
+        assert body["max_memory_mb"] <= body["container_hwm_mb"] * 1.5  # same scale
 
         shard = event["shard_key"]
         start = int(grid.block_index(shard)[0]) * grid.cells_per_shard

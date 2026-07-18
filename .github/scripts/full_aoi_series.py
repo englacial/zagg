@@ -30,7 +30,8 @@ import pandas as pd
 
 # Flat on-disk schema for the full-AOI release series. Ordered for a stable
 # on-disk layout; new columns append at the end. The harness's nested
-# ``write_throughput`` dict is flattened to the ``wt_*`` scalar columns below, and
+# ``write_throughput`` dict is flattened to the ``wt_*`` scalar columns below,
+# and ``worker_phase_max`` to the ``phase_*_s`` columns, and
 # the non-scalar run-record fields (temporal, per_shard_granules, apriori_estimate)
 # are dropped -- they are dry-run planning aids, not charted release metrics.
 FULL_AOI_COLUMNS = [
@@ -90,6 +91,26 @@ FULL_AOI_COLUMNS = [
     # JSON-only (dropped below).
     "store_layout",
     "parity_ok",
+    # Worker per-phase straggler split (issue #250): max seconds across shards
+    # per phase, flattened from the run record's ``worker_phase_max`` dict
+    # (populated because the release harness dispatches with ``profile=True``).
+    # Null on rows recorded before the capture existed and on dry runs.
+    "phase_read_s",
+    "phase_index_s",
+    "phase_aggregate_s",
+    # The setup invoke's billed dollars (issue #250 item 3): its own column,
+    # NOT folded into cost_usd (worker GB-seconds), so the retained history's
+    # cost semantics stay comparable. Null on pre-#250 rows and dry runs.
+    "setup_cost_usd",
+    # The #256 write split: worker leaf write-out seconds (max across shards),
+    # emitted alongside read/index/aggregate under profile=True. Null on rows
+    # recorded before the split landed on the deployed worker.
+    "phase_write_s",
+    # The finalize invoke's billed dollars (issue #250 item 6 synthesis): the
+    # setup_cost_usd pattern applied to finalize_s (the hive manifest
+    # backstop, issue #252). The SUMMED total (cost_usd + setup + finalize)
+    # is a display-side derivation; cost_usd itself stays worker GB-seconds.
+    "finalize_cost_usd",
 ]
 
 # run-record write_throughput key -> flat column name.
@@ -100,23 +121,37 @@ _WT_MAP = {
     "cells_timeout": "wt_cells_timeout",
 }
 
+# run-record worker_phase_max key -> flat column name (issue #250; ``write``
+# is the #256 split). Any phase the worker grows later stays JSON-only until a
+# column is appended here.
+_PHASE_MAP = {
+    "read": "phase_read_s",
+    "index": "phase_index_s",
+    "aggregate": "phase_aggregate_s",
+    "write": "phase_write_s",
+}
+
 # Nested / planning-only run-record fields that don't belong in the flat series
 # ("parity" is the nested flat<->hive detail; its verdict rides "parity_ok").
 _DROP_KEYS = ("temporal", "per_shard_granules", "apriori_estimate", "parity")
 
 
 def flatten_record(record: dict) -> dict:
-    """Flatten one run record's nested ``write_throughput`` into ``wt_*`` scalars.
+    """Flatten one run record's nested ``write_throughput`` into ``wt_*`` scalars
+    and ``worker_phase_max`` into ``phase_*_s`` scalars (issue #250).
 
-    Missing ``write_throughput`` (e.g. a dry-run record) yields null ``wt_*`` cells
-    rather than raising, so a malformed record degrades gracefully. The non-scalar
-    planning fields are dropped so the reindex to :data:`FULL_AOI_COLUMNS` produces
-    a clean flat frame.
+    Missing ``write_throughput`` / ``worker_phase_max`` (e.g. a dry-run record, or
+    a run without profiling) yields null cells rather than raising, so a malformed
+    record degrades gracefully. The non-scalar planning fields are dropped so the
+    reindex to :data:`FULL_AOI_COLUMNS` produces a clean flat frame.
     """
     r = dict(record)
     wt = r.pop("write_throughput", None) or {}
     for src, col in _WT_MAP.items():
         r[col] = wt.get(src)
+    wpm = r.pop("worker_phase_max", None) or {}
+    for src, col in _PHASE_MAP.items():
+        r[col] = wpm.get(src)
     for k in _DROP_KEYS:
         r.pop(k, None)
     return r
