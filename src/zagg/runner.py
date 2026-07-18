@@ -633,8 +633,11 @@ class RasterStrategy:
     simple transport: synchronous invokes with transient-only retries; the
     issue-151 async result-object channel and the preflight concurrency probe
     are follow-ups (raster shards are seconds of COG windows, well inside NAT
-    idle limits). Either way the runner owns the template + global time index
-    before fan-out (the single-writer append design).
+    idle limits). Either way the runner owns the global time index before
+    fan-out (the single-writer append design); the template write is
+    orchestrator-side on the local backend but rides the sync setup invoke on
+    lambda (issue #264 — the dispatcher may hold an invoke-only role with no
+    S3 write access, e.g. the CI OIDC benchmark role).
 
     Summary schema note: ``total_obs`` is shared with the spatial/temporal
     strategies so a caller sees one summary shape across pipeline kinds. On the
@@ -716,26 +719,19 @@ class RasterStrategy:
             raise ValueError("catalog carries no raster granule entries (no assets/datetime)")
 
         resolved_endpoint = output_endpoint_url or get_output_endpoint_url(config)
-        zarr_store = open_store(
-            store_path,
-            region=region,
-            credentials=output_credentials,
-            endpoint_url=resolved_endpoint,
-        )
-        # Template emission is orchestrator-owned; time it (always-on, the
-        # issue #180 bracket convention) so the benchmark harness can split
-        # setup-ish wall from the fan-out (issue #250).
-        template_t0 = time.time()
-        emit_raster_template(zarr_store, grid, config, times_us, overwrite=overwrite)
-        template_s = time.time() - template_t0
-
         if backend == "lambda":
+            # No orchestrator-side store write on the lambda path (issue
+            # #264): the template rides the sync setup invoke inside
+            # _run_lambda_shards, so the dispatcher needs only
+            # lambda:InvokeFunction (the CI OIDC invoke-only role).
             return self._run_lambda_shards(
                 config,
                 cells,
                 time_index,
                 grid,
                 store_path,
+                times_us=times_us,
+                overwrite=overwrite,
                 max_workers=max_workers,
                 region=region,
                 function_name=_ignored.get("function_name"),
@@ -743,8 +739,21 @@ class RasterStrategy:
                 output_credentials=output_credentials,
                 output_endpoint_url=resolved_endpoint,
                 profile=profile,
-                template_s=template_s,
             )
+
+        zarr_store = open_store(
+            store_path,
+            region=region,
+            credentials=output_credentials,
+            endpoint_url=resolved_endpoint,
+        )
+        # Local backend: template emission stays orchestrator-owned (the
+        # process writes the store directly); time it (always-on, the issue
+        # #180 bracket convention) so the benchmark harness can split
+        # setup-ish wall from the fan-out (issue #250).
+        template_t0 = time.time()
+        emit_raster_template(zarr_store, grid, config, times_us, overwrite=overwrite)
+        template_s = time.time() - template_t0
 
         source = config.data_source or {}
         src_kwargs = {
@@ -858,6 +867,8 @@ class RasterStrategy:
         grid,
         store_path,
         *,
+        times_us,
+        overwrite,
         max_workers,
         region,
         function_name,
@@ -865,15 +876,19 @@ class RasterStrategy:
         output_credentials,
         output_endpoint_url,
         profile=False,
-        template_s=None,
     ):
         """Fan shards out, one synchronous ``mode="process_raster"`` invoke each.
 
-        The worker gets the shard's ShardMap entries plus only its own slice of
-        the global time index (the template — runner-emitted before this — is
-        the shared truth for the full axis). Transient invoke faults retry with
-        backoff; a Lambda ``FunctionError`` or non-200 envelope is a shard
-        error (per-shard isolation, all-error raise as on the local backend).
+        Before fan-out the lifecycle is ping → sync setup (issue #264): the
+        lightweight ``mode="ping"`` fails fast on a pre-#252 deployment with
+        zero writes, then ``_invoke_lambda_raster_setup`` writes the template
+        WORKER-SIDE — the orchestrator never PUTs to the store, so an
+        invoke-only role (the CI OIDC benchmark role) dispatches cleanly. The
+        worker gets the shard's ShardMap entries plus only its own slice of
+        the global time index (the setup-emitted template is the shared truth
+        for the full axis). Transient invoke faults retry with backoff; a
+        Lambda ``FunctionError`` or non-200 envelope is a shard error
+        (per-shard isolation, all-error raise as on the local backend).
         """
         import boto3
         from botocore.config import Config
@@ -901,6 +916,30 @@ class RasterStrategy:
         output_creds_event = _build_output_creds_event(
             output_credentials, output_endpoint_url, region
         )
+        # Ping → sync setup, bracketed as template_s (the setup-ish wall the
+        # benchmark splits from fan-out, issue #250). The template is
+        # load-bearing before fan-out — workers write slabs into its arrays —
+        # so the setup invoke is synchronous (the flat point-path lifecycle,
+        # NOT the #252 async hybrid, whose artifact is not load-bearing).
+        template_t0 = time.time()
+        _invoke_lambda_ping(
+            client,
+            function_name,
+            store_path,
+            config_dict=config_dict,
+            overwrite=overwrite,
+            output_creds_event=output_creds_event,
+        )
+        _invoke_lambda_raster_setup(
+            client,
+            function_name,
+            store_path,
+            config_dict=config_dict,
+            times_us=times_us,
+            overwrite=overwrite,
+            output_creds_event=output_creds_event,
+        )
+        template_s = time.time() - template_t0
 
         def _event(shard_key, granules):
             keys = {e.get("time_key") or e.get("datetime") for e in granules if e.get("assets")}
@@ -3191,6 +3230,68 @@ def _invoke_lambda_setup_async(
     )
 
 
+def _invoke_lambda_raster_setup(
+    lambda_client,
+    function_name,
+    store_path,
+    *,
+    config_dict,
+    times_us,
+    overwrite=False,
+    output_creds_event=None,
+):
+    """Synchronous raster template write via the setup mode (issue #264).
+
+    One RequestResponse invoke of ``mode="setup"``: the handler detects the
+    raster pipeline from the event's config (``data_source.reader: raster``)
+    and runs ``emit_raster_template`` worker-side, so the orchestrator needs
+    only ``lambda:InvokeFunction`` — the CI OIDC benchmark role is
+    deliberately invoke-only and must never PUT to the store. Synchronous
+    because the template is load-bearing before fan-out (workers write slabs
+    into its arrays) — the flat point-path lifecycle, not the #252 async
+    hybrid. ``times_us`` is the catalog-derived global time coordinate
+    (int64 μs since the epoch), JSON-safe as a plain int list.
+
+    A deployed function that predates the raster setup branch would fall
+    through to the point-path ``grid.emit_template`` — wrong template, right
+    status code — so the success body must echo ``"pipeline": "raster"``
+    (the PR #205 layout-echo precedent); anything else raises a redeploy
+    error before any worker is dispatched. The ping preceding this call
+    already gated out pre-#252 functions with zero writes.
+    """
+    event = {
+        "mode": "setup",
+        "store_path": store_path,
+        "overwrite": overwrite,
+        "config": config_dict,
+        "times_us": [int(t) for t in times_us],
+    }
+    if output_creds_event is not None:
+        event["output_credentials"] = output_creds_event
+    response = lambda_client.invoke(
+        FunctionName=function_name,
+        InvocationType="RequestResponse",
+        Payload=json.dumps(event),
+    )
+    payload = response["Payload"].read().decode("utf-8")
+    if response.get("FunctionError"):
+        raise RuntimeError(f"Lambda raster setup failed: {payload}")
+    result = json.loads(payload)
+    if result.get("statusCode") != 200:
+        raise RuntimeError(f"Lambda raster setup error: {result.get('body')}")
+    try:
+        body = json.loads(result.get("body") or "{}")
+    except (TypeError, ValueError):
+        body = {}
+    if body.get("pipeline") != "raster":
+        raise RuntimeError(
+            f"Lambda raster setup fell through to the point-path template "
+            f"(response body {result.get('body')!r}): the deployed function "
+            f"predates the issue #264 raster setup branch — redeploy the "
+            f"function, then rerun with overwrite to replace anything it wrote"
+        )
+
+
 def _invoke_lambda_ping(
     lambda_client,
     function_name,
@@ -3226,6 +3327,12 @@ def _invoke_lambda_ping(
       setup invoke) the loser's collision window shrinks from run-length to
       seconds. Same last-writer caveat the manifest write itself has always
       had.
+
+    The raster lambda path reuses this ping (issue #264) ahead of its sync
+    template-writing setup invoke: a raster config carries no hive layout, so
+    only the stale-deployment half applies (the handler's manifest precheck
+    is a no-op), and the setup response's ``pipeline`` echo covers the
+    hive-capable-but-pre-#264 window this ping cannot see.
 
     Kept while flat exists (issue #251): once flat is removed, a stale
     function just errors and the ping can be dropped.

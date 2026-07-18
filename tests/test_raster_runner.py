@@ -289,11 +289,41 @@ class _FakeLambdaClient:
         return out
 
 
+def _lifecycle(responder):
+    """Wrap a per-shard responder with canned ping/setup answers (issue #264).
+
+    The lambda lifecycle is ping → sync raster setup → fan-out; tests that
+    exercise the fan-out answer the two lifecycle invokes canonically and
+    route only ``mode="process_raster"`` events to ``responder``.
+    """
+
+    def _respond(event):
+        if event["mode"] == "ping":
+            return {
+                "statusCode": 200,
+                "body": json.dumps({"ok": True, "mode": "ping", "zagg_version": "test"}),
+            }
+        if event["mode"] == "setup":
+            body = {
+                "ok": True,
+                "mode": "setup",
+                "pipeline": "raster",
+                "timesteps": len(event["times_us"]),
+            }
+            return {"statusCode": 200, "body": json.dumps(body)}
+        return responder(event)
+
+    return _respond
+
+
 class TestRasterLambdaBackend:
+    # Issue #264: the lambda path never opens or writes the store from the
+    # orchestrator (the template rides the sync setup invoke), so these tests
+    # no longer intercept open_store for the s3 URL — a regression to an
+    # orchestrator-side write would surface as a real-S3 attempt.
+
     def test_events_and_summary(self, manifest, monkeypatch, tmp_path):
         import boto3
-
-        import zagg.runner as runner_mod
 
         cfg, sm_path, shard, _data = manifest
 
@@ -305,18 +335,8 @@ class TestRasterLambdaBackend:
             body = {"timesteps": len(event["time_index"]), "cells_with_data": 4096}
             return {"statusCode": 200, "body": json.dumps(body)}
 
-        fake = _FakeLambdaClient(responder)
+        fake = _FakeLambdaClient(_lifecycle(responder))
         monkeypatch.setattr(boto3, "client", lambda *a, **k: fake)
-        # Template emission targets the store path; keep it local by
-        # intercepting open_store for the s3 URL.
-        real_open = runner_mod.open_store
-
-        def fake_open(path, **kw):
-            if path.startswith("s3://"):
-                return str(tmp_path / "lambda_out.zarr")
-            return real_open(path, **kw)
-
-        monkeypatch.setattr(runner_mod, "open_store", fake_open)
         summary = agg(
             cfg, catalog=sm_path, store="s3://bucket/out.zarr", backend="lambda", max_workers=2
         )
@@ -324,22 +344,112 @@ class TestRasterLambdaBackend:
         assert summary["total_cells"] == 1 and summary["cells_with_data"] == 1
         assert summary["cells_error"] == 0
         assert summary["total_obs"] == 2
-        assert len(fake.events) == 1
+        assert [e["mode"] for e in fake.events] == ["ping", "setup", "process_raster"]
         # No profile -> the payload stays byte-identical (no key) and the
         # profile rollups stay out of the summary (issue #250).
-        assert "profile" not in fake.events[0]
+        assert "profile" not in fake.events[-1]
         assert "worker_stage_max" not in summary
         # Always-on telemetry rollups are null-safe on a body without them.
         assert summary["lambda_time_s"] is None and summary["max_memory_mb"] is None
         assert summary["template_s"] >= 0.0
+
+    def test_lifecycle_order_and_setup_event_pinned(self, manifest, monkeypatch):
+        # The wire-level pin of the raster lifecycle (issue #264): ping →
+        # sync setup → fan-out, with the EXACT setup event on the wire —
+        # config + times_us (plain ints, the catalog-derived coordinate) +
+        # overwrite — and no orchestrator store write anywhere.
+        import boto3
+
+        import zagg.runner as runner_mod
+        from zagg.processing.raster import raster_time_index
+
+        cfg, sm_path, shard, _data = manifest
+        _idx, times_us = raster_time_index(runner_mod._load_catalog(sm_path)["granules"])
+
+        def responder(event):
+            body = {"timesteps": len(event["time_index"]), "cells_with_data": 4096}
+            return {"statusCode": 200, "body": json.dumps(body)}
+
+        fake = _FakeLambdaClient(_lifecycle(responder))
+        monkeypatch.setattr(boto3, "client", lambda *a, **k: fake)
+        real_open = runner_mod.open_store
+
+        def guard_open(path, **kw):
+            assert not path.startswith("s3://"), "orchestrator opened the s3 store"
+            return real_open(path, **kw)
+
+        monkeypatch.setattr(runner_mod, "open_store", guard_open)
+        agg(cfg, catalog=sm_path, store="s3://bucket/out.zarr", backend="lambda")
+        assert [e["mode"] for e in fake.events] == ["ping", "setup", "process_raster"]
+        ping, setup = fake.events[0], fake.events[1]
+        expected_config = {
+            "data_source": cfg.data_source,
+            "output": cfg.output,
+            "pipeline": cfg.pipeline,
+        }
+        assert ping["store_path"] == "s3://bucket/out.zarr"
+        assert ping["config"] == expected_config
+        assert setup == {
+            "mode": "setup",
+            "store_path": "s3://bucket/out.zarr",
+            "overwrite": False,
+            "config": expected_config,
+            "times_us": [int(t) for t in times_us],
+        }
+        assert all(isinstance(t, int) for t in setup["times_us"])  # JSON-safe int64
+
+    def test_stale_ping_fails_fast_no_setup(self, manifest, monkeypatch):
+        # A pre-#252 function doesn't know mode="ping" (400 fall-through with
+        # zero writes): the raster dispatch must raise the redeploy message
+        # before the setup invoke or any worker.
+        import boto3
+
+        cfg, sm_path, _shard, _data = manifest
+
+        def responder(event):
+            if event["mode"] == "ping":
+                return {"statusCode": 400, "body": json.dumps({"error": "shard_key required"})}
+            raise AssertionError(f"unexpected invoke after failed ping: {event['mode']}")
+
+        fake = _FakeLambdaClient(responder)
+        monkeypatch.setattr(boto3, "client", lambda *a, **k: fake)
+        with pytest.raises(RuntimeError, match="redeploy"):
+            agg(cfg, catalog=sm_path, store="s3://bucket/out.zarr", backend="lambda")
+        assert [e["mode"] for e in fake.events] == ["ping"]
+
+    def test_stale_setup_echo_fails_fast_no_fanout(self, manifest, monkeypatch):
+        # A function that knows ping (#252) but predates the raster setup
+        # branch (#264) falls through to the point-path template and echoes
+        # "layout" instead of "pipeline": the dispatcher must refuse with the
+        # redeploy message before any worker writes into the wrong template.
+        import boto3
+
+        cfg, sm_path, _shard, _data = manifest
+
+        def responder(event):
+            if event["mode"] == "ping":
+                return {
+                    "statusCode": 200,
+                    "body": json.dumps({"ok": True, "mode": "ping", "zagg_version": "old"}),
+                }
+            if event["mode"] == "setup":
+                return {
+                    "statusCode": 200,
+                    "body": json.dumps({"ok": True, "mode": "setup", "layout": "flat"}),
+                }
+            raise AssertionError(f"unexpected invoke after stale setup: {event['mode']}")
+
+        fake = _FakeLambdaClient(responder)
+        monkeypatch.setattr(boto3, "client", lambda *a, **k: fake)
+        with pytest.raises(RuntimeError, match="issue #264 raster setup branch"):
+            agg(cfg, catalog=sm_path, store="s3://bucket/out.zarr", backend="lambda")
+        assert [e["mode"] for e in fake.events] == ["ping", "setup"]
 
     def test_lambda_profile_threads_key_and_rolls_up(self, manifest, monkeypatch, tmp_path):
         # Issue #250: profile=True rides the event; the summary rolls the
         # workers' phase_timings (stages straggler-maxed + write bucket,
         # counts summed) and the billed-duration / peak-RSS telemetry.
         import boto3
-
-        import zagg.runner as runner_mod
 
         cfg, sm_path, _shard, _data = manifest
 
@@ -367,16 +477,8 @@ class TestRasterLambdaBackend:
             }
             return {"statusCode": 200, "body": json.dumps(body)}
 
-        fake = _FakeLambdaClient(responder)
+        fake = _FakeLambdaClient(_lifecycle(responder))
         monkeypatch.setattr(boto3, "client", lambda *a, **k: fake)
-        real_open = runner_mod.open_store
-
-        def fake_open(path, **kw):
-            if path.startswith("s3://"):
-                return str(tmp_path / "lambda_out.zarr")
-            return real_open(path, **kw)
-
-        monkeypatch.setattr(runner_mod, "open_store", fake_open)
         summary = agg(
             cfg,
             catalog=sm_path,
@@ -404,9 +506,10 @@ class TestRasterLambdaBackend:
         # snake_case creds + a custom output endpoint must reach the worker event
         # as the handler-required camelCase block (accessKeyId/secretAccessKey)
         # with endpointUrl threaded in — parity with the spatial/temporal paths.
+        # The ping + setup lifecycle invokes (issue #264) carry the same block:
+        # the setup invoke is the template WRITE, so a dropped key there would
+        # 403 the handler against an external (R2/MinIO) target.
         import boto3
-
-        import zagg.runner as runner_mod
 
         cfg, sm_path, _shard, _data = manifest
 
@@ -414,16 +517,8 @@ class TestRasterLambdaBackend:
             body = {"timesteps": len(event["time_index"]), "cells_with_data": 4096}
             return {"statusCode": 200, "body": json.dumps(body)}
 
-        fake = _FakeLambdaClient(responder)
+        fake = _FakeLambdaClient(_lifecycle(responder))
         monkeypatch.setattr(boto3, "client", lambda *a, **k: fake)
-        real_open = runner_mod.open_store
-        monkeypatch.setattr(
-            runner_mod,
-            "open_store",
-            lambda path, **kw: (
-                str(tmp_path / "creds.zarr") if path.startswith("s3://") else real_open(path, **kw)
-            ),
-        )
         agg(
             cfg,
             catalog=sm_path,
@@ -435,32 +530,23 @@ class TestRasterLambdaBackend:
             },
             output_endpoint_url="https://custom.r2.example.com",
         )
-        assert len(fake.events) == 1
-        block = fake.events[0]["output_credentials"]
-        assert block["accessKeyId"] == "AKIA_SNAKE"
-        assert block["secretAccessKey"] == "SECRET_SNAKE"
-        assert block["endpointUrl"] == "https://custom.r2.example.com"
+        assert [e["mode"] for e in fake.events] == ["ping", "setup", "process_raster"]
+        for event in fake.events:
+            block = event["output_credentials"]
+            assert block["accessKeyId"] == "AKIA_SNAKE"
+            assert block["secretAccessKey"] == "SECRET_SNAKE"
+            assert block["endpointUrl"] == "https://custom.r2.example.com"
 
     def test_all_lambda_shards_error_raises(self, manifest, monkeypatch, tmp_path):
         import boto3
-
-        import zagg.runner as runner_mod
 
         cfg, sm_path, _shard, _data = manifest
 
         def responder(event):
             return {"statusCode": 500, "body": json.dumps({"error": "boom"})}
 
-        fake = _FakeLambdaClient(responder)
+        fake = _FakeLambdaClient(_lifecycle(responder))
         monkeypatch.setattr(boto3, "client", lambda *a, **k: fake)
-        real_open = runner_mod.open_store
-        monkeypatch.setattr(
-            runner_mod,
-            "open_store",
-            lambda path, **kw: (
-                str(tmp_path / "x.zarr") if path.startswith("s3://") else real_open(path, **kw)
-            ),
-        )
         with pytest.raises(RuntimeError, match="boom"):
             agg(cfg, catalog=sm_path, store="s3://bucket/out.zarr", backend="lambda")
 
@@ -469,26 +555,17 @@ class TestRasterLambdaBackend:
         # error — recorded, never retried. Single shard -> all-error RuntimeError.
         import boto3
 
-        import zagg.runner as runner_mod
-
         cfg, sm_path, _shard, _data = manifest
 
         def responder(event):
             return {"__function_error__": True, "errorMessage": "boom in worker"}
 
-        fake = _FakeLambdaClient(responder)
+        fake = _FakeLambdaClient(_lifecycle(responder))
         monkeypatch.setattr(boto3, "client", lambda *a, **k: fake)
-        real_open = runner_mod.open_store
-        monkeypatch.setattr(
-            runner_mod,
-            "open_store",
-            lambda path, **kw: (
-                str(tmp_path / "fe.zarr") if path.startswith("s3://") else real_open(path, **kw)
-            ),
-        )
         with pytest.raises(RuntimeError, match="Lambda error"):
             agg(cfg, catalog=sm_path, store="s3://bucket/out.zarr", backend="lambda")
-        assert len(fake.events) == 1  # deterministic FunctionError -> no retry
+        # deterministic FunctionError -> no retry
+        assert [e["mode"] for e in fake.events] == ["ping", "setup", "process_raster"]
 
     def test_lambda_transient_retry_then_success(self, manifest, monkeypatch, tmp_path):
         # A transient invoke fault (Connection reset) on the first attempt retries
@@ -507,42 +584,30 @@ class TestRasterLambdaBackend:
             body = {"timesteps": len(event["time_index"]), "cells_with_data": 4096}
             return {"statusCode": 200, "body": json.dumps(body)}
 
-        fake = _FakeLambdaClient(responder)
+        fake = _FakeLambdaClient(_lifecycle(responder))
         monkeypatch.setattr(boto3, "client", lambda *a, **k: fake)
         monkeypatch.setattr(runner_mod.time, "sleep", lambda *a: None)
-        real_open = runner_mod.open_store
-        monkeypatch.setattr(
-            runner_mod,
-            "open_store",
-            lambda path, **kw: (
-                str(tmp_path / "tr.zarr") if path.startswith("s3://") else real_open(path, **kw)
-            ),
-        )
         summary = agg(cfg, catalog=sm_path, store="s3://bucket/out.zarr", backend="lambda")
         assert summary["cells_error"] == 0
         assert summary["cells_with_data"] == 1
-        assert len(fake.events) == 2  # first invoke raised (transient), retried once
+        # first shard invoke raised (transient), retried once
+        assert [e["mode"] for e in fake.events] == [
+            "ping",
+            "setup",
+            "process_raster",
+            "process_raster",
+        ]
 
     def test_lambda_dense_layout_fails_fast(self, manifest, monkeypatch, tmp_path):
         # A dense-layout config on the lambda backend must be refused up front,
         # before any invoke — the fake client records zero events.
         import boto3
 
-        import zagg.runner as runner_mod
-
         cfg, sm_path, _shard, _data = manifest
         cfg.output["grid"]["layout"] = "dense"
 
         fake = _FakeLambdaClient(lambda event: {"statusCode": 200, "body": "{}"})
         monkeypatch.setattr(boto3, "client", lambda *a, **k: fake)
-        real_open = runner_mod.open_store
-        monkeypatch.setattr(
-            runner_mod,
-            "open_store",
-            lambda path, **kw: (
-                str(tmp_path / "dense.zarr") if path.startswith("s3://") else real_open(path, **kw)
-            ),
-        )
         with pytest.raises(ValueError, match="fullsphere"):
             agg(cfg, catalog=sm_path, store="s3://bucket/out.zarr", backend="lambda")
         assert fake.events == []
@@ -551,8 +616,6 @@ class TestRasterLambdaBackend:
         # Granules without a time_key fall back to the datetime string as the
         # group key; the worker event's time_index must be keyed by that string.
         import boto3
-
-        import zagg.runner as runner_mod
 
         cfg = _cfg(tmp_path)
         data = _index_raster()
@@ -579,18 +642,79 @@ class TestRasterLambdaBackend:
             body = {"timesteps": 1, "cells_with_data": 4096}
             return {"statusCode": 200, "body": json.dumps(body)}
 
-        fake = _FakeLambdaClient(responder)
+        fake = _FakeLambdaClient(_lifecycle(responder))
         monkeypatch.setattr(boto3, "client", lambda *a, **k: fake)
-        real_open = runner_mod.open_store
-        monkeypatch.setattr(
-            runner_mod,
-            "open_store",
-            lambda path, **kw: (
-                str(tmp_path / "dt.zarr") if path.startswith("s3://") else real_open(path, **kw)
-            ),
-        )
         agg(cfg, catalog=sm_path, store="s3://bucket/out.zarr", backend="lambda")
         assert set(seen["time_index"]) == {T0}
+
+
+class TestInvokeLambdaRasterSetupEvent:
+    """Pin the ACTUAL raster setup event on the wire (issue #264) and the
+    stale-deployment echo guard: the sync RequestResponse invoke carries
+    config + times_us (plain ints) + overwrite, and any success body that
+    does not echo ``"pipeline": "raster"`` — a deployed function without the
+    raster setup branch fell through to the point-path template — raises the
+    redeploy message. Mirrors ``TestInvokeLambdaSetupEvent`` (test_hive)."""
+
+    @staticmethod
+    def _invoke(client, config_dict, **kw):
+        from zagg.runner import _invoke_lambda_raster_setup
+
+        _invoke_lambda_raster_setup(
+            client,
+            "process-shard",
+            "s3://out/product",
+            config_dict=config_dict,
+            times_us=np.array([1752422540000000, 1752854540000000], dtype=np.int64),
+            **kw,
+        )
+        return json.loads(client.invoke.call_args.kwargs["Payload"])
+
+    def test_event_matches_baseline(self, tmp_path):
+        from test_hive import _wire_client
+
+        cfg = _cfg(tmp_path)
+        config_dict = {"data_source": cfg.data_source, "output": cfg.output}
+        client = _wire_client({"ok": True, "mode": "setup", "pipeline": "raster", "timesteps": 2})
+        event = self._invoke(client, config_dict)
+        assert client.invoke.call_args.kwargs["InvocationType"] == "RequestResponse"
+        assert event == {
+            "mode": "setup",
+            "store_path": "s3://out/product",
+            "overwrite": False,
+            "config": config_dict,
+            "times_us": [1752422540000000, 1752854540000000],
+        }
+
+    def test_creds_and_overwrite_threaded(self, tmp_path):
+        from test_hive import _wire_client
+
+        creds = {"accessKeyId": "AK", "secretAccessKey": "SK"}
+        client = _wire_client({"ok": True, "mode": "setup", "pipeline": "raster", "timesteps": 2})
+        event = self._invoke(client, {"data_source": {}}, overwrite=True, output_creds_event=creds)
+        assert event["overwrite"] is True
+        assert event["output_credentials"] == creds
+
+    def test_non_200_raises(self, tmp_path):
+        from test_hive import _wire_client
+
+        with pytest.raises(RuntimeError, match="Lambda raster setup error"):
+            self._invoke(
+                _wire_client({"error": "boom", "mode": "setup"}, status_code=500),
+                {"data_source": {}},
+            )
+
+    def test_missing_pipeline_echo_raises_redeploy(self, tmp_path):
+        # A stale function's flat branch answers 200 with the layout echo but
+        # no "pipeline" key: the dispatcher must refuse with the redeploy
+        # remedy rather than fan workers into a point-path template.
+        from test_hive import _wire_client
+
+        with pytest.raises(RuntimeError, match="redeploy"):
+            self._invoke(
+                _wire_client({"ok": True, "mode": "setup", "layout": "flat"}),
+                {"data_source": {}},
+            )
 
 
 class TestShippedTemplate:
