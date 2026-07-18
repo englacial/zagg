@@ -633,6 +633,80 @@ class TestSpillWorkerMultiBlock:
             _run(monkeypatch, cfg, grid, _shard_key(), dfs)
 
 
+class TestSpillOverlap:
+    """Async read/reduce overlap (phase 5): one reducer thread, same bytes."""
+
+    def _drive(self, cfg, dfs, **kw):
+        grid = _grid(cfg)
+        agg = SpillAggregator(cfg, grid, "pandas", 1, block_bytes=1, **kw)
+        for df in dfs:
+            agg.add_read(df)
+            agg.granule_done()
+        agg.flush()
+        return agg, grid
+
+    def test_overlap_identical_to_sequential(self, monkeypatch):
+        from zagg.config import get_agg_fields
+
+        key = _shard_key()
+        outs = []
+        for overlap in (False, True):
+            cfg = _config(streaming={"buffer_granules": 1, "mode": "spill"})
+            dfs = _granule_dfs(_grid(cfg), key, _CELL_LISTS, seed=13)
+            agg, grid = self._drive(cfg, dfs, overlap=overlap)
+            assert agg._closed_blocks == len(_CELL_LISTS)
+            out = agg.chunk_outputs(grid.children(key), get_agg_fields(cfg))
+            assert agg._reducer is None  # joined before emission
+            outs.append(out)
+            agg.close()
+        (stats_a, pay_a, idx_a, locs_a, cwd_a), (stats_b, pay_b, idx_b, locs_b, cwd_b) = outs
+        assert cwd_a == cwd_b
+        assert locs_a == locs_b == {}
+        for name in stats_a:
+            np.testing.assert_array_equal(stats_a[name], stats_b[name])
+        for name in pay_a:
+            assert idx_a[name] == idx_b[name]
+            for x, y in zip(pay_a[name], pay_b[name], strict=True):
+                np.testing.assert_array_equal(x, y)
+
+    def test_reduce_error_propagates_at_next_join(self, monkeypatch):
+        cfg = _config(streaming={"buffer_granules": 1, "mode": "spill"})
+        key = _shard_key()
+        dfs = _granule_dfs(_grid(cfg), key, _CELL_LISTS, seed=1)
+
+        def boom(self, block):
+            raise ValueError("synthetic reduce failure")
+
+        monkeypatch.setattr(SpillAggregator, "_fold_block", boom)
+        with pytest.raises(RuntimeError, match="overlap thread"):
+            self._drive(cfg, dfs)
+
+    def test_reduce_error_propagates_at_finalize(self, monkeypatch):
+        from zagg.config import get_agg_fields
+
+        cfg = _config(streaming={"buffer_granules": 1, "mode": "spill"})
+        key = _shard_key()
+        grid = _grid(cfg)
+        dfs = _granule_dfs(grid, key, _CELL_LISTS[:1], seed=1)
+        agg = SpillAggregator(cfg, grid, "pandas", 1, block_bytes=1)
+        calls = {"n": 0}
+        orig = SpillAggregator._fold_block
+
+        def flaky(self, block):
+            calls["n"] += 1
+            if calls["n"] == 1:
+                raise ValueError("synthetic reduce failure")
+            orig(self, block)
+
+        monkeypatch.setattr(SpillAggregator, "_fold_block", flaky)
+        agg.add_read(dfs[0])
+        agg.granule_done()  # one flush -> one closed block, failing on the thread
+        agg.flush()
+        with pytest.raises(RuntimeError, match="overlap thread"):
+            agg.chunk_outputs(grid.children(key), get_agg_fields(cfg))
+        agg.close()
+
+
 class TestTmpGuard:
     def test_raises_naming_disk_variant_when_tmp_too_small(self, monkeypatch):
         import os as _os

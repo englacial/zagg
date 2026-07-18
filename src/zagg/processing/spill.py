@@ -39,6 +39,7 @@ from __future__ import annotations
 
 import os
 import tempfile
+import threading
 import time
 
 import numpy as np
@@ -357,6 +358,7 @@ class SpillAggregator:
         buffer_granules: int,
         block_bytes: int | None = None,
         tmp_dir: str | None = None,
+        overlap: bool = True,
     ):
         self.config = config
         self.grid = grid
@@ -396,6 +398,12 @@ class SpillAggregator:
         self._block = SpillBlock(self.tmp_dir)
         self._closed_blocks = 0
         self._finalized = False
+        # Async read/reduce overlap (phase 5): at most one closed block is
+        # being reduced on ``_reducer`` while reads fill the next block; its
+        # failure is parked in ``_reduce_err`` and re-raised at the next join.
+        self.overlap = bool(overlap)
+        self._reducer: threading.Thread | None = None
+        self._reduce_err: BaseException | None = None
         # Cross-block mergeable running state (only ever fed on block close).
         self._counts: dict[int, int] = {}
         self._digests: dict[str, dict[int, np.ndarray]] = {n: {} for n in self._digest_fields}
@@ -469,7 +477,17 @@ class SpillAggregator:
     # -- block close / mergeable fold ----------------------------------------
 
     def _close_block(self) -> None:
-        """Reduce the full block into mergeable state and open a fresh one."""
+        """Hand the full block to the reducer and open a fresh one.
+
+        Async read/reduce overlap (issue #217 phase 5): the closed block is
+        reduced disk→memory on one worker thread while reads keep streaming
+        network→disk into the next block. At most one closed block is in
+        flight — the next close **joins** the previous reduce before starting
+        its own — so the /tmp working set stays closing + filling (the
+        threshold formula's reservation) and blocks fold in close order, which
+        keeps the merge sequence (and therefore the bytes out) identical to
+        the sequential path. ``overlap=False`` reduces inline.
+        """
         if not self._mergeable:
             raise SpillOverflowError(
                 f"spill block hit the {self.block_bytes:,}-byte threshold but the "
@@ -478,10 +496,41 @@ class SpillAggregator:
                 f"Remedies: a bigger memory tier, a '-disk' function variant with "
                 f"more ephemeral storage, or a finer parent_order (smaller shards)."
             )
-        self._fold_block(self._block)
-        self._block.close()
+        block = self._block
         self._block = SpillBlock(self.tmp_dir)
         self._closed_blocks += 1
+        if not self.overlap:
+            try:
+                self._fold_block(block)
+            finally:
+                block.close()
+            return
+        self._join_reducer()
+        self._reducer = threading.Thread(
+            target=self._reduce_one, args=(block,), name="zagg-spill-reduce", daemon=True
+        )
+        self._reducer.start()
+
+    def _reduce_one(self, block: SpillBlock) -> None:
+        """Reducer-thread body: fold one closed block, then release its fds."""
+        try:
+            self._fold_block(block)
+        except BaseException as e:  # surfaced by _join_reducer on the main thread
+            self._reduce_err = e
+        finally:
+            block.close()
+
+    def _join_reducer(self) -> None:
+        """Wait for the in-flight block reduce; re-raise its failure loudly."""
+        if self._reducer is not None:
+            self._reducer.join()
+            self._reducer = None
+        if self._reduce_err is not None:
+            err, self._reduce_err = self._reduce_err, None
+            raise RuntimeError(
+                "spill block reduce failed on the overlap thread; the merged "
+                "running state is incomplete"
+            ) from err
 
     def _fold_block(self, block: SpillBlock) -> None:
         """Fold one block into the running mergeable state, per partition.
@@ -562,10 +611,14 @@ class SpillAggregator:
     def _chunk_outputs_merged(self, children, agg_fields: dict):
         """Multi-block regime: emit from the cross-block mergeable state."""
         if not self._finalized:
-            # The final (still-open) block was never threshold-closed; fold it
+            # Join the in-flight overlap reduce (its failure re-raises here),
+            # then fold the final (still-open, never threshold-closed) block
             # into the running state once, before the first emission.
-            self._fold_block(self._block)
-            self._block.close()
+            self._join_reducer()
+            try:
+                self._fold_block(self._block)
+            finally:
+                self._block.close()
             self._finalized = True
         children = np.asarray(children)
         n_cells = len(children)
@@ -598,6 +651,16 @@ class SpillAggregator:
         return stats_arrays, ragged_payloads, ragged_cell_indices, {}, cells_with_data
 
     def close(self) -> None:
-        """Release every spill fd and the cached partition (idempotent)."""
+        """Release every spill fd and the cached partition (idempotent).
+
+        Joins a still-running overlap reduce first (without re-raising — close
+        runs on cleanup paths and must not mask the original error; the parked
+        failure stays in ``_reduce_err`` for a later ``_join_reducer``). The
+        reducer thread always terminates after its one block, so no thread can
+        outlive the shard even when the worker aborts mid-read.
+        """
+        if self._reducer is not None:
+            self._reducer.join()
+            self._reducer = None
         self._block.close()
         self._loaded = None
