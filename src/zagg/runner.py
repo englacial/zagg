@@ -2919,27 +2919,37 @@ _POLL_RETRY_CONFIG = {
 }
 
 
+def _output_store_kwargs(output_creds_event, region):
+    """obstore kwargs for the output store, shared by the async result poller
+    and the hive manifest checker (issues #151, #274).
+
+    Mirrors the worker's ``_output_store_kwargs``: the explicit
+    output-credentials block when supplied, else the ambient chain. Carries the
+    short per-request :data:`_POLL_RETRY_CONFIG` (issue #186) so a single 5xx
+    can't block for minutes and silently overrun a poll/check deadline.
+    """
+    kwargs = {"region": region, "retry_config": _POLL_RETRY_CONFIG}
+    if output_creds_event:
+        kwargs["region"] = output_creds_event.get("region", region)
+        kwargs["credentials"] = output_creds_event
+        if output_creds_event.get("endpointUrl"):
+            kwargs["endpoint_url"] = output_creds_event["endpointUrl"]
+    return kwargs
+
+
 def _result_fetcher(box, prefix, output_creds_event, region, key):
     """Zero-arg fetch closure for one shard's async result object (#151).
 
     The obstore store is built lazily on the first poll and shared across all
     cells via ``box`` (a plain dict; a benign first-poll race just builds it
     twice), so runs whose dispatch is fully mocked (tests) never touch
-    obstore/S3. Credential resolution mirrors the worker's
-    ``_output_store_kwargs``: the explicit output-credentials block when
-    supplied, else the ambient chain.
+    obstore/S3.
     """
 
     def fetch():
         store = box.get("store")
         if store is None:
-            kwargs = {"region": region, "retry_config": _POLL_RETRY_CONFIG}
-            if output_creds_event:
-                kwargs["region"] = output_creds_event.get("region", region)
-                kwargs["credentials"] = output_creds_event
-                if output_creds_event.get("endpointUrl"):
-                    kwargs["endpoint_url"] = output_creds_event["endpointUrl"]
-            store = open_object_store(prefix, **kwargs)
+            store = open_object_store(prefix, **_output_store_kwargs(output_creds_event, region))
             box["store"] = store
         return _fetch_result(store, key)
 
@@ -2947,15 +2957,24 @@ def _result_fetcher(box, prefix, output_creds_event, region, key):
 
 
 def _fetch_result(result_store, key):
-    """Read one worker-written result envelope; None while it hasn't landed."""
+    """Read one worker-written result envelope + its S3 post time (#151, #274).
+
+    Returns ``(envelope, last_modified)`` -- the parsed JSON envelope and the
+    result object's ``LastModified`` (obstore ``GetResult.meta["last_modified"]``,
+    an ``ObjectMeta`` TypedDict), which IS the moment the worker POSTed its
+    ``.status`` result. ``None`` while the object hasn't landed. The post time
+    is the true result-ready wall, independent of poll cadence (issue #274 Fix 1).
+    """
     import obstore
     from obstore.exceptions import NotFoundError
 
     try:
-        data = obstore.get(result_store, key).bytes()
+        response = obstore.get(result_store, key)
+        last_modified = response.meta["last_modified"]
+        data = response.bytes()
     except (FileNotFoundError, NotFoundError):
         return None
-    return json.loads(bytes(data))
+    return json.loads(bytes(data)), last_modified
 
 
 def _invoke_lambda_event(
@@ -3124,21 +3143,32 @@ def _poll_lambda_result(
         # *persistent* fault (e.g. missing s3:GetObject) surfaces in the
         # deadline error below instead of masquerading as a worker crash.
         try:
-            result = result_fetch()
+            fetched = result_fetch()
             fetch_error = None
         except Exception as e:
             fetch_error = e
-            result = None
-        if result is not None:
+            fetched = None
+        if fetched is not None:
+            result, post_time = fetched
             try:
                 body = json.loads(result.get("body", "{}"))
             except (json.JSONDecodeError, TypeError):
                 body = {}
+            # Result-ready wall (issue #274 Fix 1): measure to when the worker
+            # POSTed its .status result (the object's S3 LastModified), not to
+            # when this poll happened to catch it -- so the reported wall is the
+            # same true value at any poll cadence. Fall back to the real clock
+            # only if the store reported no timestamp (defensive; S3 always has
+            # one). ~+-1s LastModified granularity is accepted (issue decision).
+            if post_time is not None:
+                wall_time = post_time.timestamp() - wall_start
+            else:
+                wall_time = time.time() - wall_start
             return {
                 "shard_key": shard_key,
                 "status_code": result.get("statusCode"),
                 "body": body,
-                "wall_time": time.time() - wall_start,
+                "wall_time": wall_time,
                 "lambda_duration": body.get("duration_s", 0),
                 "error": body.get("error"),
                 "retries": retries,

@@ -1,6 +1,7 @@
 """Tests for the runner module (Python API)."""
 
 import json
+from datetime import datetime, timezone
 
 import pytest
 
@@ -745,8 +746,12 @@ class TestInvokeLambdaCellAsync:
         )
 
     @staticmethod
-    def _envelope(body):
-        return {"statusCode": 200, "body": json.dumps(body)}
+    def _envelope(body, *, last_modified=None):
+        # result_fetch now yields (envelope, LastModified) -- the result
+        # object's S3 post time (issue #274 Fix 1). Default to "now" for the
+        # shape-only tests that don't assert the reported wall.
+        env = {"statusCode": 200, "body": json.dumps(body)}
+        return env, last_modified or datetime.now(timezone.utc)
 
     def test_event_invoke_carries_result_url(self):
         from unittest.mock import MagicMock
@@ -793,6 +798,38 @@ class TestInvokeLambdaCellAsync:
         assert len(sleeps) == 2  # slept between the misses
         assert result["status_code"] == 200
 
+    def test_wall_is_result_post_time_not_detection(self, monkeypatch):
+        """Fix 1 (issue #274): the reported wall is measured to the worker's
+        ``.status`` POST time (the result object's S3 ``LastModified``), NOT to
+        when the poll loop happened to catch it -- so widening the poll interval
+        leaves the reported wall unchanged."""
+        from unittest.mock import MagicMock
+
+        import zagg.runner as runner
+
+        # Sleeps are no-ops, so detection (time.time()) lands ~immediately after
+        # wall_start; a detection-based wall would be ~0s. The worker posted its
+        # result 3s after the invoke fired -- the true result-ready wall is 3s.
+        monkeypatch.setattr(runner.time, "sleep", lambda s: None)
+        wall_start = runner.time.time()
+        post_time = datetime.fromtimestamp(wall_start + 3.0, tz=timezone.utc)
+        envelope = {"statusCode": 200, "body": json.dumps({"total_obs": 1, "duration_s": 1.0})}
+
+        def poll_with_interval(poll_interval_s):
+            # Two misses (interval-driven sleeps) before the result lands.
+            fetch = MagicMock(side_effect=[None, None, (envelope, post_time)])
+            return runner._poll_lambda_result(
+                fetch, 12345, 0, wall_start, 0, 60.0, poll_interval_s=poll_interval_s
+            )
+
+        fast = poll_with_interval(5.0)
+        slow = poll_with_interval(30.0)
+        # Post-time wall (3s), not detection (~0s) -- and identical at either
+        # cadence, so tightening/loosening the interval never moves the wall.
+        assert fast["wall_time"] == pytest.approx(3.0, abs=0.5)
+        assert slow["wall_time"] == pytest.approx(3.0, abs=0.5)
+        assert fast["status_code"] == 200
+
     def test_missing_result_at_deadline_records_error_without_retry(self):
         from unittest.mock import MagicMock
 
@@ -817,7 +854,10 @@ class TestInvokeLambdaCellAsync:
         client.invoke.return_value = {"StatusCode": 202}
         result = self._invoke(
             client,
-            lambda: {"statusCode": 500, "body": json.dumps({"error": "Failed to write zarr"})},
+            lambda: (
+                {"statusCode": 500, "body": json.dumps({"error": "Failed to write zarr"})},
+                datetime.now(timezone.utc),
+            ),
         )
         assert result["status_code"] == 500
         assert result["error"] == "Failed to write zarr"
@@ -940,7 +980,11 @@ class TestResultFetcher:
         assert fetch() is None  # nothing written yet
         writer = open_object_store(prefix)
         obstore.put(writer, "12345.json", json.dumps({"statusCode": 200, "body": "{}"}).encode())
-        assert fetch() == {"statusCode": 200, "body": "{}"}
+        # fetch now yields (envelope, LastModified) -- the object's S3 post
+        # time drives the result-ready wall (issue #274 Fix 1).
+        envelope, last_modified = fetch()
+        assert envelope == {"statusCode": 200, "body": "{}"}
+        assert last_modified is not None
         assert "store" in box  # built lazily, cached for subsequent cells
 
     def test_poller_store_uses_short_retry_config(self, monkeypatch):
@@ -2134,12 +2178,15 @@ class TestInvokeLambdaEvent:
         from zagg import runner
 
         client = self._client()
-        fetched = {
-            "statusCode": 200,
-            "body": json.dumps(
-                {"results": {"max_t2m": 5.0}, "timesteps_processed": 2, "duration_s": 2.0}
-            ),
-        }
+        fetched = (
+            {
+                "statusCode": 200,
+                "body": json.dumps(
+                    {"results": {"max_t2m": 5.0}, "timesteps_processed": 2, "duration_s": 2.0}
+                ),
+            },
+            datetime.now(timezone.utc),
+        )
         result = runner._invoke_lambda_event(
             client,
             dict(self._EV),
