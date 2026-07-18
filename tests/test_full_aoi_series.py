@@ -488,8 +488,8 @@ def test_objects_columns_retained_and_mismatch_dropped():
     assert list(df.columns) == fas.FULL_AOI_COLUMNS
     # Appended in order: object counts (phase 3), then layout + parity (phase
     # 4), then the worker phase split + setup cost (issue #250), then the
-    # #256 write split + finalize cost.
-    assert fas.FULL_AOI_COLUMNS[-10:] == [
+    # #256 write split + finalize cost, then the #272 first-consumer column.
+    assert fas.FULL_AOI_COLUMNS[-11:-1] == [
         "objects_total",
         "objects_expected",
         "store_layout",
@@ -501,6 +501,7 @@ def test_objects_columns_retained_and_mismatch_dropped():
         "phase_write_s",
         "finalize_cost_usd",
     ]
+    assert fas.FULL_AOI_COLUMNS[-1] == "first_consumer_s"
     assert df.iloc[0]["objects_total"] == 27
     assert df.iloc[0]["objects_expected"] == 25
     assert "objects_mismatch" not in df.columns
@@ -510,6 +511,43 @@ def test_objects_columns_retained_and_mismatch_dropped():
         del legacy[k]
     old = fas.records_to_frame([legacy])
     assert old.iloc[0]["objects_total"] is None or str(old.iloc[0]["objects_total"]) == "nan"
+
+
+def test_first_consumer_column_in_schema():
+    # issue #272: the full-AOI release series carries the time-to-first-consumer
+    # column; flatten_record threads it when present and the reindex adds it
+    # (null) when a row lacks it.
+    import pandas as pd
+
+    assert "first_consumer_s" in fas.FULL_AOI_COLUMNS
+    rec = fas.flatten_record({"target": "t", "ref": "r", "first_consumer_s": 74.5})
+    assert rec["first_consumer_s"] == 74.5
+    df = fas.records_to_frame([{"target": "t", "ref": "r"}])
+    assert "first_consumer_s" in df.columns and pd.isna(df.iloc[0]["first_consumer_s"])
+
+
+def test_release_table_renders_with_first_consumer(tmp_path):
+    # issue #272: the per-release table (distinct from the per-merge schema)
+    # renders the whole-AOI totals + the time-to-first-consumer column.
+    pytest.importorskip("matplotlib")
+    ps = pytest.importorskip("plot_series")
+    recs = [
+        {
+            "target": "full_aoi_neon_o9",
+            "ref": "0.33.0",
+            "n_shards_ok": 12,
+            "total_obs": 201_759_500,
+            "first_consumer_s": 74.5,
+            "total_wall_s": 138.0,
+            "total_cost_usd": 0.3412,
+            "max_memory_mb": 2200.0,
+        }
+    ]
+    out = tmp_path / "release_table.png"
+    assert ps._render_release_table(recs, "zagg full-AOI point (release 0.33.0)", out) is True
+    assert out.exists() and out.stat().st_size > 0
+    empty = tmp_path / "e.png"
+    assert ps._render_release_table([], "x", empty) is False and not empty.exists()
 
 
 def test_full_aoi_objects_figure_skips_legacy_series(tmp_path):
@@ -544,7 +582,8 @@ def test_store_layout_and_parity_columns_retained_parity_detail_dropped():
     )
     df = fas.records_to_frame([rec])
     assert list(df.columns) == fas.FULL_AOI_COLUMNS
-    assert fas.FULL_AOI_COLUMNS[-8:-6] == ["store_layout", "parity_ok"]
+    # issue #272 appended first_consumer_s at the tail, shifting these by one.
+    assert fas.FULL_AOI_COLUMNS[-9:-7] == ["store_layout", "parity_ok"]
     row = df.iloc[0]
     assert row["store_layout"] == "hive"
     assert row["parity_ok"] == False  # noqa: E712 -- nullable bool column

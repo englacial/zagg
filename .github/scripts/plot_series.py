@@ -266,6 +266,63 @@ def _table_title(prefix: str, recs: list[dict]) -> str:
     )
 
 
+def _render_release_table(recs: list[dict], title: str, out_png: Path) -> bool:
+    """Per-release table (issue #272): the whole-AOI release schema — shards,
+    obs, TIME-TO-FIRST-CONSUMER (earliest shard's result-ready post time),
+    all-consumable wall, total cost, memory. Distinct from ``_render_table``
+    (the single-shard per-merge bench_metrics schema). False on no records."""
+    import matplotlib
+
+    matplotlib.use("Agg")  # headless CI
+    import matplotlib.pyplot as plt
+
+    if not recs:
+        return False
+    fmt = bench_metrics._fmt
+    headers = [
+        "target",
+        "release",
+        "shards",
+        "obs",
+        "first consumer (s)",
+        "wall (s)",
+        "total $",
+        "mem (MB)",
+    ]
+    cell_text = []
+    for r in recs:
+        cost_cell = fmt(r.get("total_cost_usd"), ".5f")
+        cost_cell = f"${cost_cell}" if cost_cell != "n/a" else "n/a"
+        cell_text.append(
+            [
+                str(r.get("target") or "")[-26:],
+                str(r.get("ref") or r.get("commit") or "")[:14],
+                fmt(r.get("n_shards_ok"), ",.0f"),
+                fmt(r.get("total_obs"), ",.0f"),
+                fmt(r.get("first_consumer_s"), ".1f"),
+                fmt(r.get("total_wall_s"), ".1f"),
+                cost_cell,
+                fmt(r.get("max_memory_mb"), ".0f"),
+            ]
+        )
+    fig, ax = plt.subplots(figsize=(11, 0.5 * len(recs) + 1.2))
+    ax.axis("off")
+    table = ax.table(cellText=cell_text, colLabels=headers, loc="center", cellLoc="right")
+    table.auto_set_font_size(False)
+    table.set_fontsize(9)
+    table.scale(1, 1.4)
+    for (row, col), cell in table.get_celld().items():
+        if row == 0:
+            cell.set_text_props(weight="bold")
+        if col == 0:  # left-align the target column
+            cell.set_text_props(ha="left")
+    ax.set_title(title, fontsize=10)
+    out_png.parent.mkdir(parents=True, exist_ok=True)
+    fig.savefig(out_png, dpi=120, bbox_inches="tight")
+    plt.close(fig)
+    return True
+
+
 def make_latest_table(df: pd.DataFrame, out_png: Path) -> bool:
     """Render the FROZEN latest-merge table as a PNG (the historical snapshot,
     issue #133's freeze). Embedded live in the docs by raw URL. False if no
@@ -804,6 +861,8 @@ def write_index(
         f'<h3>{title}</h3>\n<img src="{name}.png" alt="{name}">'
         for name, title in (
             ("full_aoi_summary", "Summary — total billed cost (lambda-s ⇔ USD) and wall"),
+            ("full_aoi_point_table", "Point pipeline — latest release (with time-to-first-consumer)"),
+            ("full_aoi_raster_table", "Raster pipeline — latest release (with time-to-first-consumer)"),
             ("full_aoi_point_phases", "Point pipeline — per-phase seconds (max shard)"),
             (
                 "full_aoi_raster_phases",
@@ -995,6 +1054,23 @@ def main(argv: list[str] | None = None) -> int:
         rendered.append("full_aoi_raster_phases")
     if plot_summary.make_release_objects_figure(point_hist, outdir / "full_aoi_objects.png"):
         rendered.append("full_aoi_objects")
+
+    # Per-release tables (issue #272): the release figures had no rendered table.
+    # Each carries the whole-AOI totals + the time-to-first-consumer column.
+    point_latest = _latest_of(point_hist).to_dict(orient="records")
+    if _render_release_table(
+        point_latest,
+        f"zagg full-AOI point (release {str((point_latest[0] if point_latest else {}).get('ref') or '')})",
+        outdir / "full_aoi_point_table.png",
+    ):
+        rendered.append("full_aoi_point_table")
+    raster_latest = _latest_of(raster_hist).to_dict(orient="records")
+    if _render_release_table(
+        raster_latest,
+        f"zagg full-AOI raster (release {str((raster_latest[0] if raster_latest else {}).get('ref') or '')})",
+        outdir / "full_aoi_raster_table.png",
+    ):
+        rendered.append("full_aoi_raster_table")
 
     write_index(
         outdir,

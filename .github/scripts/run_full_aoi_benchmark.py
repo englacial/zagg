@@ -589,6 +589,17 @@ def run_target(
         max_retries=1,  # a failed shard is a failure -- never re-pay (#119)
     )
     results = summary.get("results", [])
+    # Time-to-first-consumer (issue #272): the earliest shard's result-ready post
+    # time -- min over shards of the per-shard wall_time, which #274/#275 pinned
+    # to the ``.status`` object's ``LastModified`` (result-ready), not the poll
+    # detection. The run's ``total_wall_s`` is the LAST shard (all-consumable);
+    # this is when a consumer could start on the FIRST shard. Table-only column.
+    consumer_walls = [
+        float(r["wall_time"])
+        for r in results
+        if r.get("status_code") == 200 and not r.get("error") and r.get("wall_time") is not None
+    ]
+    first_consumer_s = min(consumer_walls) if consumer_walls else None
     lam = float(summary.get("lambda_time_s") or 0.0)
     run.update(
         n_shards_ok=summary.get("cells_with_data"),
@@ -598,6 +609,7 @@ def run_target(
         gb_seconds=summary.get("gb_seconds"),
         cost_usd=summary.get("estimated_cost_usd"),
         total_wall_s=summary.get("wall_time_s"),
+        first_consumer_s=first_consumer_s,
         setup_s=summary.get("setup_s"),
         setup_cost_usd=_invoke_cost_usd(summary.get("setup_s")),
         finalize_cost_usd=_invoke_cost_usd(summary.get("finalize_s")),
