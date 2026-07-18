@@ -697,11 +697,13 @@ class TestSpillWorkerSingleBlock:
             "aggregate",
             "spill_write_s",
             "spill_read_s",
+            "spill_reduce_s",
             "spill_bytes",
         }
         assert timings["spill_bytes"] > 0
         assert timings["spill_write_s"] >= 0
         assert timings["spill_read_s"] >= 0
+        assert timings["spill_reduce_s"] >= 0
 
 
 class TestSpillWorkerMultiBlock:
@@ -782,6 +784,18 @@ class TestSpillWorkerMultiBlock:
             dp = by_cell_p[cell_i]
             for q in (0.1, 0.5, 0.9):
                 assert abs(quantile_from_tdigest(ds, q) - quantile_from_tdigest(dp, q)) < 1.0
+
+    def test_multi_block_reduce_time_is_captured(self, monkeypatch):
+        # The block fold runs only in the multi-block regime, so spill_reduce_s
+        # (the #280 reduce-CPU-vs-read-I/O split) is populated here, not on the
+        # single-block exact path.
+        self._force_tiny_blocks(monkeypatch)
+        key = _shard_key()
+        cfg = _config(streaming={"buffer_granules": 2, "mode": "spill"})
+        grid = _grid(cfg)
+        dfs = _granule_dfs(grid, key, _CELL_LISTS, obs_per_cell=200, seed=3)
+        _, _, meta = _run(monkeypatch, cfg, grid, key, dfs, profile=True)
+        assert meta["phase_timings"]["spill_reduce_s"] > 0
 
     def test_multi_block_actually_engaged_and_counts_exact(self, monkeypatch):
         self._force_tiny_blocks(monkeypatch)

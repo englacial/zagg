@@ -507,6 +507,11 @@ class SpillAggregator:
         self.spill_bytes = 0
         self.spill_write_s = 0.0
         self.spill_read_s = 0.0
+        # Wall spent in the block fold's *compute* (group + build + merge),
+        # separate from spill_read_s (the read-back I/O), so a profile run can
+        # split reduce-CPU vs read-I/O — the measurement that decides whether the
+        # #280 reducer parallelization should target compute or I/O.
+        self.spill_reduce_s = 0.0
         self._buffer: list = []
         self._buffered_granules = 0
 
@@ -637,6 +642,7 @@ class SpillAggregator:
             t0 = time.perf_counter()
             cells, cols = block.read_partition(key, close=True)
             self.spill_read_s += time.perf_counter() - t0
+            t1 = time.perf_counter()
             col_arrays, cell_to_slice = _group_columns(cols, cells)
             del cells, cols
             for cell, (start, end) in cell_to_slice.items():
@@ -650,6 +656,7 @@ class SpillAggregator:
                         )
                     else:
                         self._digest_parts[name].setdefault(cell, []).append(fresh)
+            self.spill_reduce_s += time.perf_counter() - t1
 
     def _finalize_kway(self) -> None:
         """Collapse each k-way field's per-block parts into one digest per cell.
