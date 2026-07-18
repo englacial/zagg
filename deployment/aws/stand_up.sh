@@ -78,6 +78,17 @@ DIST_BUCKET="${DIST_BUCKET:-sliderule-public-cors}"
 DIST_PREFIX="${DIST_PREFIX:-}"                       # keys: [<prefix>/]<minor>/<zip>
 DIST_REGION="${DIST_REGION:-us-west-2}"
 
+# Distribution reads are signed with the caller's credentials by default — the
+# dist bucket no longer allows anonymous reads (issue #267), so an unsigned
+# request 403s even for callers whose credentials could read it. Set
+# STAND_UP_ANON=1 to restore unsigned reads against a genuinely public mirror
+# (e.g. a self-hosted DIST_BUCKET copy); only truthy values enable it, so
+# STAND_UP_ANON=0/false means signed as intended. Expanded unquoted (single
+# flag, no spaces) so the empty default vanishes — macOS bash 3.2 + `set -u`
+# rejects the empty-array idiom.
+DIST_SIGN=""
+case "${STAND_UP_ANON:-}" in 1|true|yes) DIST_SIGN="--no-sign-request" ;; esac
+
 dist_key()   { local p="$DIST_PREFIX"; [ -n "$p" ] && p="$p/"; echo "${p}${1}/${2}"; }  # minor, zip
 dist_root()  { local p="$DIST_PREFIX"; [ -n "$p" ] && p="$p/"; echo "${p}${1}"; }       # versions.json path
 
@@ -93,7 +104,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # CORS bucket's versions.json) -> explicit LAMBDA_VERSION -> the repo's git tag
 # (works from a fresh clone) -> the installed zagg.
 if [ "${LAMBDA_VERSION:-}" = "latest" ]; then
-    MINOR="$(aws s3 cp "s3://$DIST_BUCKET/$(dist_root versions.json)" - --region "$DIST_REGION" --no-sign-request 2>/dev/null \
+    MINOR="$(aws s3 cp "s3://$DIST_BUCKET/$(dist_root versions.json)" - --region "$DIST_REGION" $DIST_SIGN 2>/dev/null \
         | python3 -c 'import json,sys; print(json.load(sys.stdin)["latest"])' 2>/dev/null || true)"
     [ -z "$MINOR" ] && { echo "ERROR: could not read 'latest' from s3://$DIST_BUCKET/$(dist_root versions.json)"; exit 1; }
     echo "Resolved LAMBDA_VERSION=latest -> $MINOR"
@@ -120,10 +131,10 @@ echo "zagg lambda artifacts: $MINOR ($ARCH), region $REGION"
 SRC_BUCKET="$DIST_BUCKET"; SRC_REGION="$DIST_REGION"
 SRC_LAYER_KEY="$(dist_key "$MINOR" "$LAYER_ZIP")"; SRC_FUNC_KEY="$(dist_key "$MINOR" "$FUNC_ZIP")"
 for KEY in "$SRC_LAYER_KEY" "$SRC_FUNC_KEY"; do
-    if ! HEAD_ERR="$(aws s3api head-object --bucket "$DIST_BUCKET" --key "$KEY" --region "$DIST_REGION" --no-sign-request 2>&1 >/dev/null)"; then
+    if ! HEAD_ERR="$(aws s3api head-object --bucket "$DIST_BUCKET" --key "$KEY" --region "$DIST_REGION" $DIST_SIGN 2>&1 >/dev/null)"; then
         echo "ERROR: minor $MINOR is not staged: could not HEAD s3://$DIST_BUCKET/$KEY"
         [ -n "$HEAD_ERR" ] && echo "       aws: $HEAD_ERR"
-        STAGED="$(aws s3 cp "s3://$DIST_BUCKET/$(dist_root versions.json)" - --region "$DIST_REGION" --no-sign-request 2>/dev/null \
+        STAGED="$(aws s3 cp "s3://$DIST_BUCKET/$(dist_root versions.json)" - --region "$DIST_REGION" $DIST_SIGN 2>/dev/null \
             | python3 -c 'import json,sys; print(" ".join(json.load(sys.stdin).get("minors", [])))' 2>/dev/null || true)"
         [ -n "$STAGED" ] && echo "       Staged minors on s3://$DIST_BUCKET: $STAGED"
         echo "       Set LAMBDA_VERSION to a staged minor, or LAMBDA_VERSION=latest for the"
@@ -173,8 +184,8 @@ else
     fi
     TMPDIR="$(mktemp -d)"; trap 'rm -rf "$TMPDIR"' EXIT
     echo "Copying zips from s3://$SRC_BUCKET into s3://$STAGING_BUCKET/ ..."
-    run aws s3 cp "s3://$SRC_BUCKET/$SRC_LAYER_KEY" "$TMPDIR/$LAYER_ZIP" --region "$SRC_REGION" --no-sign-request
-    run aws s3 cp "s3://$SRC_BUCKET/$SRC_FUNC_KEY"  "$TMPDIR/$FUNC_ZIP"  --region "$SRC_REGION" --no-sign-request
+    run aws s3 cp "s3://$SRC_BUCKET/$SRC_LAYER_KEY" "$TMPDIR/$LAYER_ZIP" --region "$SRC_REGION" $DIST_SIGN
+    run aws s3 cp "s3://$SRC_BUCKET/$SRC_FUNC_KEY"  "$TMPDIR/$FUNC_ZIP"  --region "$SRC_REGION" $DIST_SIGN
     run aws s3 cp "$TMPDIR/$LAYER_ZIP" "s3://$STAGING_BUCKET/$LAYER_ZIP" --region "$REGION"
     run aws s3 cp "$TMPDIR/$FUNC_ZIP"  "s3://$STAGING_BUCKET/$FUNC_ZIP"  --region "$REGION"
     ARTIFACT_BUCKET="$STAGING_BUCKET"

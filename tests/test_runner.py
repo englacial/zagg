@@ -355,15 +355,22 @@ class TestCheckSignature:
             _check_signature(c, built)
 
 
-class TestDenseDeprecation:
-    def test_dense_layout_emits_warning(self, atl06_config, catalog_file):
+class TestDenseRemoval:
+    def test_dense_layout_rejected(self, atl06_config, catalog_file):
+        # The dense layout was removed (issue #88): a config selecting it is
+        # rejected at validation, and grid construction refuses it too
+        # (test_grids.py::test_healpix_explicit_dense_raises).
+        from zagg.config import validate_config
+
         atl06_config.output["grid"]["layout"] = "dense"
         atl06_config.catalog = catalog_file
-        with pytest.warns(DeprecationWarning, match="dense.*deprecated"):
-            agg(atl06_config, store="./out.zarr", dry_run=True)
+        with pytest.raises(ValueError, match="fullsphere"):
+            validate_config(atl06_config)
 
-    def test_fullsphere_layout_does_not_warn(self, atl06_config, catalog_file):
-        atl06_config.output["grid"]["layout"] = "fullsphere"
+    def test_default_layout_does_not_warn(self, atl06_config, catalog_file):
+        # An omitted layout is the silent default path; the explicit
+        # flat/fullsphere DeprecationWarnings (issue #253) live at from_config
+        # and are covered in test_grids.py::TestFromConfig.
         atl06_config.catalog = catalog_file
         import warnings as _w
 
@@ -978,6 +985,8 @@ class TestMaxRetriesPassthrough:
         )
         monkeypatch.setattr(grids_mod, "from_config", lambda *a, **k: _stub_grid())
         monkeypatch.setattr(runner, "_invoke_lambda_setup", lambda *a, **k: None)
+        # Flat lambda lifecycle pinned explicitly (issue #253 defaults hive).
+        atl06_config.output["store_layout"] = "flat"
         monkeypatch.setattr(runner, "_invoke_lambda_finalize", lambda *a, **k: None)
         monkeypatch.setattr(runner, "_get_function_timeout_s", lambda *a, **k: 720)
         from unittest.mock import MagicMock
@@ -1051,6 +1060,8 @@ class TestInvocationPassthrough:
         )
         monkeypatch.setattr(grids_mod, "from_config", lambda *a, **k: grid_factory())
         monkeypatch.setattr(runner, "_invoke_lambda_setup", lambda *a, **k: None)
+        # Flat lambda lifecycle pinned explicitly (issue #253 defaults hive).
+        atl06_config.output["store_layout"] = "flat"
         monkeypatch.setattr(runner, "_invoke_lambda_finalize", lambda *a, **k: None)
         monkeypatch.setattr(runner, "_get_function_timeout_s", lambda *a, **k: 720)
         monkeypatch.setattr(boto3, "Session", lambda *a, **k: MagicMock())
@@ -1398,6 +1409,8 @@ class TestSummaryKeysByteIdentical:
     }
 
     def test_local_summary_keys_and_counts(self, monkeypatch, atl06_config):
+        # Flat local path pinned explicitly (issue #253 defaults hive).
+        atl06_config.output["store_layout"] = "flat"
         import zagg.grids as grids_mod
         from zagg import runner
 
@@ -1452,6 +1465,8 @@ class TestSummaryKeysByteIdentical:
         assert len(summary["results"]) == 3  # raised cell excluded
 
     def test_local_threads_aoi_payload(self, monkeypatch, atl06_config):
+        # Flat local path pinned explicitly (issue #253 defaults hive).
+        atl06_config.output["store_layout"] = "flat"
         # When the manifest carries an aoi_mask list, _run_local threads each
         # shard's payload into _process_and_write; when it doesn't, the kwarg is
         # omitted entirely so the flag-off call is unchanged (issue #101).
@@ -1526,6 +1541,8 @@ class TestSummaryKeysByteIdentical:
         )
         monkeypatch.setattr(grids_mod, "from_config", lambda *a, **k: _stub_grid())
         monkeypatch.setattr(runner, "_invoke_lambda_setup", lambda *a, **k: None)
+        # Flat lambda lifecycle pinned explicitly (issue #253 defaults hive).
+        atl06_config.output["store_layout"] = "flat"
         monkeypatch.setattr(runner, "_invoke_lambda_finalize", lambda *a, **k: None)
         monkeypatch.setattr(runner, "_get_function_timeout_s", lambda *a, **k: 720)
         from unittest.mock import MagicMock
@@ -1617,6 +1634,8 @@ class TestSummaryKeysByteIdentical:
         return cat
 
     def test_local_clamps_granule_workers_per_cell(self, monkeypatch, atl06_config):
+        # Flat local path pinned explicitly (issue #253 defaults hive).
+        atl06_config.output["store_layout"] = "flat"
         # Issue #184 (item 1): _run_local threads a per-cell config whose
         # granule_workers is min(K, n_granules); cells at/above K get the
         # SHARED config object untouched.
@@ -1673,6 +1692,8 @@ class TestSummaryKeysByteIdentical:
         )
         monkeypatch.setattr(grids_mod, "from_config", lambda *a, **k: _stub_grid())
         monkeypatch.setattr(runner, "_invoke_lambda_setup", lambda *a, **k: None)
+        # Flat lambda lifecycle pinned explicitly (issue #253 defaults hive).
+        atl06_config.output["store_layout"] = "flat"
         monkeypatch.setattr(runner, "_invoke_lambda_finalize", lambda *a, **k: None)
         monkeypatch.setattr(runner, "_get_function_timeout_s", lambda *a, **k: 720)
         from unittest.mock import MagicMock
@@ -1736,6 +1757,8 @@ class TestSummaryKeysByteIdentical:
         )
         monkeypatch.setattr(grids_mod, "from_config", lambda *a, **k: _stub_grid())
         monkeypatch.setattr(runner, "_invoke_lambda_setup", lambda *a, **k: None)
+        # Flat lambda lifecycle pinned explicitly (issue #253 defaults hive).
+        atl06_config.output["store_layout"] = "flat"
         monkeypatch.setattr(runner, "_invoke_lambda_finalize", lambda *a, **k: None)
         monkeypatch.setattr(runner, "_get_function_timeout_s", lambda *a, **k: 720)
         from unittest.mock import MagicMock
@@ -1811,6 +1834,8 @@ class TestSummaryKeysByteIdentical:
         )
         monkeypatch.setattr(grids_mod, "from_config", lambda *a, **k: _stub_grid())
         monkeypatch.setattr(runner, "_invoke_lambda_setup", lambda *a, **k: None)
+        # Flat lambda lifecycle pinned explicitly (issue #253 defaults hive).
+        atl06_config.output["store_layout"] = "flat"
         monkeypatch.setattr(runner, "_invoke_lambda_finalize", lambda *a, **k: None)
         monkeypatch.setattr(runner, "_get_function_timeout_s", lambda *a, **k: 720)
         from unittest.mock import MagicMock
@@ -2698,6 +2723,8 @@ def _run_lambda_with_durations(
     )
     monkeypatch.setattr(grids_mod, "from_config", lambda *a, **k: _stub_grid())
     monkeypatch.setattr(runner, "_invoke_lambda_setup", lambda *a, **k: None)
+    # Flat lambda lifecycle pinned explicitly (issue #253 defaults hive).
+    atl06_config.output["store_layout"] = "flat"
     monkeypatch.setattr(runner, "_invoke_lambda_finalize", lambda *a, **k: None)
     monkeypatch.setattr(runner, "_get_function_timeout_s", lambda *a, **k: timeout)
     from unittest.mock import MagicMock
@@ -3438,6 +3465,8 @@ class TestConsolidationGate:
         )
         monkeypatch.setattr(grids_mod, "from_config", lambda *a, **k: _stub_grid())
         monkeypatch.setattr(runner, "_invoke_lambda_setup", lambda *a, **k: None)
+        # Flat lambda lifecycle pinned explicitly (issue #253 defaults hive).
+        atl06_config.output["store_layout"] = "flat"
         monkeypatch.setattr(runner, "_get_function_timeout_s", lambda *a, **k: 720)
         calls = []
         monkeypatch.setattr(runner, "_invoke_lambda_finalize", lambda *a, **k: calls.append(1))
@@ -3700,6 +3729,8 @@ class TestLambdaResolverSeamRasterEvents:
                 {},
                 None,
                 "s3://b/out.zarr",
+                times_us=[0],
+                overwrite=False,
                 max_workers=1,
                 region="us-west-2",
                 function_name="pinned-raster",

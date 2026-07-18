@@ -9,9 +9,15 @@ D1–D6); the convention itself is owned by the mortie spec and versioned as
 [Time windows](#time-windows-morton-hive2) below) is `morton-hive/2` — a
 strict superset: a `/1` store *is* a `/2` store with `schedule: none`.
 
-It is opt-in (default `flat`, today's single shared store) and wired to
-**both backends** — the local runner and the Lambda handler share the same
-per-shard write path (see [Status](#status)).
+It is the **default for HEALPix output** (issue #253) — point aggregation
+and the raster pipeline alike (issue #247; the hive/flat split sits one
+abstraction above the pipeline kind): an omitted `output.store_layout`
+resolves to `hive`. An explicit `store_layout: flat` (the single shared
+store) remains for interop/debug but is deprecated — removal is gated on the
+sparse-DGGS read path (issue #251 phase 3);
+rectilinear grids keep the flat shared store. Hive is
+wired to **both backends** — the local runner and the Lambda handler share
+the same per-shard write path (see [Status](#status)).
 
 ## Layout
 
@@ -59,7 +65,7 @@ per-shard write path (see [Status](#status)).
 ```yaml
 output:
   store: s3://bucket/product        # becomes the hive root
-  store_layout: hive                # default: flat
+  store_layout: hive                # the HEALPix default (issue #253); may be omitted
   grid:
     type: healpix                   # hive is HEALPix-only (morton digit tree)
     parent_order: 9                 # shard order -> tree depth
@@ -143,10 +149,11 @@ output:
 Validation: `output.windowing` requires the hive layout on a healpix grid;
 `time_field` must be a declared `data_source` column (the worker can only
 filter what it reads); explicit windows must be well-formed (frozen label
-grammar, `start < end`, unique labels, disjoint ranges). Raster pipelines
-reject the block
-([issue #247](https://github.com/englacial/zagg/issues/247) tracks raster
-windowing). Changing the windowing of an existing store fails the frozen-key
+grammar, `start < end`, unique labels, disjoint ranges). On the raster path
+([issue #247](https://github.com/englacial/zagg/issues/247)) membership is
+the acquisition's STAC `datetime`: `time_field` is optional (fixed to
+`datetime`) and the `epoch`/`scale`/`units` conversion knobs are rejected.
+Changing the windowing of an existing store fails the frozen-key
 manifest check like an orders change — clear the root first.
 
 ## The manifest (`morton_hive.json`)
@@ -341,6 +348,58 @@ handler** — a logged error line in CloudWatch, but no writes, no result
 mirror, and no async redelivery — so the failure is fail-open by
 construction; the root object simply doesn't appear until the sweep or a
 refresh builds it.
+
+## Raster hive stores (issue #247)
+
+Raster (pull-NN) pipelines write the same tree with **windowed `(time, cells)`
+leaves**: one vanilla zarr v3 leaf per **(shard, window)** unit at
+`shard_leaf_path(root, shard, window=label)`, each carrying leaf-local `time`
+(int64 microseconds, CF attrs) and `cell_ids` coords plus one
+`(T_leaf, cells_per_shard)` array per configured band, chunked
+`(1, cells_per_chunk)`. The leaf's time axis is the unit's **own acquisition
+groups** — known at dispatch from the catalog, so both dispatchers produce
+identical leaves — and its coords are written at template time (nothing is
+deferred to a per-shard coords pass). There is no flat global template on the
+hive branch: template time writes only `morton_hive.json` (D5/D6).
+
+Differences from the aggregation path, all espg-ratified on
+[issue #247](https://github.com/englacial/zagg/issues/247):
+
+- **Window membership is the acquisition's STAC `datetime`**, decided at
+  dispatch — there is no per-observation timestamp column, so no
+  observation-level filter is injected. `output.windowing.time_field` is
+  optional (fixed to `datetime`, which the manifest temporal block records);
+  the `epoch`/`scale`/`units` conversion knobs are rejected (STAC datetimes
+  are already ISO-8601 UTC). An acquisition *group* (entries sharing a
+  `time_key` — one datatake's adjacent MGRS tiles) belongs to the window
+  containing its earliest datetime within the shard, so a group never splits
+  across leaves at a boundary.
+- **Schedule `none` is supported for consistency**
+  ([ratified](https://github.com/englacial/zagg/issues/247#issuecomment-5007157978)):
+  one bare `{full_id}.zarr` leaf per shard carrying the full time axis;
+  re-run = whole-leaf replacement; D14 `"full"` gated off exactly as
+  aggregation gates it. The append cost (a re-run rewrites the whole leaf)
+  is the user's explicit choice, visible in the manifest.
+- **Coverage is popcount-decided per D14** from the spatial union of the
+  unit's acquisitions (per-timestep validity stays data-plane nodata, D9):
+  an interior shard — every child cell covered — stamps
+  `encoding: "full"` with **no sidecar PUT**; an edge-of-scene/swath shard
+  writes the real bitmap sidecar.
+- **The D15 stamp truth** is the window label plus the actual ISO-UTC
+  `[min, max]` of the unit's acquisition datetimes and the acquisition
+  count; the root `coverage.moc` unions the per-leaf ranges as cache.
+- **`sharded: true` is permanently excluded** on the raster path (not
+  deferred): per-timestep slab streaming would read-modify-write each
+  `ShardingCodec` object once per timestep, and raster object count is
+  time-axis-dominated anyway.
+
+The shared worker (`zagg.processing.raster.process_and_write_raster_hive`,
+the raster analog of `process_and_write_hive`) runs identically under the
+local dispatcher and the Lambda `mode: "process_raster"` hive branch; hive
+events carry no `time_index` (the leaf axis is unit-local) plus an optional
+`window`, while flat raster events stay byte-identical to pre-#247 runs. The
+manifest rides the same ping → async-setup → finalize-backstop lifecycle as
+aggregation ([issue #252](https://github.com/englacial/zagg/issues/252)).
 
 ## Reading a hive store
 

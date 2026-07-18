@@ -33,13 +33,20 @@ Two release legs (`lambda-benchmark-fullaoi.yml`, tag-triggered):
   (`run_raster_benchmark.py`) dispatches through `agg(profile=True)` — the
   runner's raster path threads the profile key to the workers and rolls their
   stage timings, billed durations and peak RSS into the summary — and retains
-  its own `raster_series.parquet`. Two deviations from the target end-state,
-  pending upstream: **hive is gated, not absent** — the manifest carries a
-  `pending_targets` hive variant the harness can already dispatch (a
-  `store_layout` override + re-validate), promoted to live the moment issue
-  #237 lands (the raster path rejects hive until then, issue #239) — and **no
-  strict AOI mask** (issue #101 is point-path-only); the AOI scoping is the
-  catalog's STAC-query clip.
+  its own `raster_series.parquet`. The dispatch is invoke-only end to end
+  (issue #264): after the issue #252 preflight ping, the `(time, cells)`
+  template is written by a synchronous `mode="setup"` Lambda invoke before
+  fan-out — recorded as `template_s`, the raster analogue of the point path's
+  `setup_s` — so the leg runs cleanly under the `zagg-benchmark` OIDC role's
+  no-S3 grant (the "template write happens inside the Lambda" invariant in
+  [Lambda benchmark CI/CD setup](benchmark-cicd.md) now holds for both legs).
+  Two deviations from the target end-state:
+  **the live target still pins `store_layout: flat`** — raster + hive is now
+  legal and is the defaulted profile (issues #247/#253: an unpinned healpix
+  raster config writes hive leaves), so the manifest's `pending_targets` hive
+  variant is unblocked and awaits promotion as a deliberate benchmark-manifest
+  change — and **no strict AOI mask** (issue #101 is point-path-only); the
+  AOI scoping is the catalog's STAC-query clip.
 
 ### Summary — total billed cost and wall time
 

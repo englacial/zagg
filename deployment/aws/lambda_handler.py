@@ -45,18 +45,24 @@ hive-layout config -- output.store_layout: hive, issue #199 -- it writes the
 morton_hive.json manifest instead, and each process-mode worker emits its own
 leaf template. Current dispatchers send hive setup as a fire-and-forget Event
 invoke right after the ping -- the primary manifest write, issue #252 hybrid
--- and older synchronous dispatchers keep working against this function):
+-- and older synchronous dispatchers keep working against this function. For
+a raster-pipeline config -- data_source.reader: raster, issue #264 -- it
+writes the raster (time, cells) template instead, from a synchronous invoke):
 {
     "mode": "setup",
     "store_path": str,
     "parent_order": int,        # HEALPix fallback; config.output.grid wins
-    "n_parent_cells": int,      # OPTIONAL -- dense layout only (populated count)
+    "n_parent_cells": None,     # OPTIONAL -- ignored (dense layout removed, issue #88)
     "overwrite": bool,
     "config": dict,             # single source of truth: child_order, chunk_inner,
                                 #   layout, store_layout, and grid type all come from here
     "dataset": dict (optional, hive only) -- {"short_name", "version"} identity
         block for the manifest, sourced from the ShardMap metadata by the
         orchestrator (matching the local dispatcher). Absent on flat runs.
+    "times_us": [int, ...] (raster only, issue #264) -- the catalog-derived
+        time coordinate, int64 microseconds since the epoch; the orchestrator
+        owns the global timestep index and threads it here so the template
+        write needs no S3 access from the dispatcher.
     "output_credentials": dict (optional, same shape as process mode),
 }
 
@@ -639,6 +645,17 @@ def _handle_extract(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
 def _handle_setup(event: Dict[str, Any]) -> Dict[str, Any]:
     """Create the zarr template at ``event['store_path']``.
 
+    For a FLAT raster-pipeline config (``data_source.reader: raster``, issue
+    #264; the hive layout wins the branch below regardless of pipeline kind —
+    issue #247) this writes the ``(time, cells)`` raster template + its ``time``
+    coordinate via ``emit_raster_template`` — the orchestrator dispatches it
+    as a synchronous setup invoke before fan-out (the template is
+    load-bearing: workers write slabs into its arrays), so an invoke-only
+    dispatcher (the CI OIDC role) never needs S3 write access. ``times_us``
+    (the catalog-derived int64 time coordinate) rides in the event; the
+    success body echoes ``"pipeline": "raster"`` so the dispatcher can refuse
+    a stale deployment that fell through to the point-path template below.
+
     For a hive-layout config (issue #199 phase 3) template time writes ONLY
     the ``morton_hive.json`` manifest — no global zarr template exists (zero
     metadata above the leaves, D5); each worker emits its own leaf template.
@@ -660,6 +677,24 @@ def _handle_setup(event: Dict[str, Any]) -> Dict[str, Any]:
     logger.info(f"Setup mode: creating template at {event.get('store_path')}")
     try:
         config = load_config_from_dict(event["config"])
+        from zagg.config import get_layout
+
+        if get_layout(config) == "dense":
+            # The dense layout was removed (issue #88): reject the stale deployed
+            # event with a clean 400 (the PR #257 fold pattern) instead of letting
+            # from_config raise into the generic 500 below — one guard for the
+            # hive, raster, and flat branches alike.
+            error_msg = (
+                "setup requires output.grid.layout: fullsphere (dense was removed — issue #88)"
+            )
+            logger.error(error_msg)
+            return {"statusCode": 400, "body": json.dumps({"error": error_msg})}
+        # Layout splits BEFORE pipeline (issue #247): a hive store's template
+        # time writes ONLY the manifest regardless of pipeline kind (D5 — the
+        # raster hive worker emits its own per-leaf templates, exactly like
+        # the point path), so the hive branch below owns raster + hive too;
+        # the raster branch here is the FLAT (time, cells) template (issue
+        # #264), byte-identical for flat raster runs.
         if get_store_layout(config) == "hive":
             from zagg.config import get_windowing
             from zagg.hive import build_manifest, ensure_manifest
@@ -678,25 +713,45 @@ def _handle_setup(event: Dict[str, Any]) -> Dict[str, Any]:
                 "statusCode": 200,
                 "body": json.dumps({"ok": True, "mode": "setup", "layout": "hive"}),
             }
+        if (config.data_source or {}).get("reader") == "raster":
+            import numpy as np
+
+            from zagg.processing.raster import emit_raster_template
+
+            store = open_store(event["store_path"], **_output_store_kwargs(event))
+            grid = from_config(config)
+            times_us = np.asarray(event["times_us"], dtype=np.int64)
+            if times_us.size == 0:
+                # A zero-timestep template is degenerate: the arrays get a
+                # 0-length time axis no worker can slab-write into.
+                # RasterStrategy.run refuses an empty catalog before it would
+                # dispatch (runner.py); guard the load-bearing invoke-only
+                # writer too, so a hand-rolled or drifted event can't write an
+                # unusable success-shaped store (issue #264).
+                raise ValueError("raster setup received empty times_us (no timesteps to template)")
+            emit_raster_template(
+                store, grid, config, times_us, overwrite=event.get("overwrite", False)
+            )
+            return {
+                "statusCode": 200,
+                "body": json.dumps(
+                    {
+                        "ok": True,
+                        "mode": "setup",
+                        "pipeline": "raster",
+                        "timesteps": int(times_us.size),
+                    }
+                ),
+            }
         store = open_store(event["store_path"], **_output_store_kwargs(event))
         # Build the grid exactly as the worker does (from_config), so the
         # template's chunk structure can't drift from what workers write. The
         # old hand-built HEALPix branch dropped chunk_inner, under-chunking the
         # template at parent_order while workers wrote finer chunk_inner block
         # indices -> "block index out of bounds" (issue #99). from_config reads
-        # chunk_inner + layout from the config. n_parent_cells is inert unless
-        # the config selects layout: dense, where it threads through as
-        # populated_shards (only its count matters for emit_template).
-        populated = (
-            list(range(event["n_parent_cells"]))
-            if event.get("n_parent_cells") is not None
-            else None
-        )
-        grid = from_config(
-            config,
-            parent_order=event.get("parent_order"),
-            populated_shards=populated,
-        )
+        # chunk_inner + layout from the config. The event's n_parent_cells is
+        # ignored — the dense layout it selected was removed (issue #88).
+        grid = from_config(config, parent_order=event.get("parent_order"))
         grid.emit_template(store, overwrite=event.get("overwrite", False))
         return {
             "statusCode": 200,
@@ -987,14 +1042,23 @@ def _handle_process_raster(event: Dict[str, Any]) -> Dict[str, Any]:
     # fallback -- exactly the point-path split.
     rss_sampler = _PeakRSSSampler().start()
     try:
-        required = ["shard_key", "granules", "config", "store_path", "time_index"]
+        # The hive path (issue #247) needs no ``time_index``: the worker
+        # builds its own leaf-local index from the dispatched subset. Peek at
+        # the raw config dict (no load yet) so a flat event — including one
+        # with no config at all — reports the flat requirements byte-identical
+        # to before.
+        cfg_dict = event.get("config")
+        output = cfg_dict.get("output") if isinstance(cfg_dict, dict) else None
+        hive = isinstance(output, dict) and output.get("store_layout") == "hive"
+        required = ["shard_key", "granules", "config", "store_path"]
+        if not hive:
+            required.append("time_index")
         missing = [p for p in required if p not in event]
         if missing:
             error_msg = f"Missing required parameters: {', '.join(missing)}"
             logger.error(error_msg)
             return {"statusCode": 400, "body": json.dumps({"error": error_msg})}
 
-        from zagg.config import get_layout
         from zagg.grids import from_config
         from zagg.processing.raster import (
             new_stage_stats,
@@ -1004,18 +1068,71 @@ def _handle_process_raster(event: Dict[str, Any]) -> Dict[str, Any]:
         )
 
         config = load_config_from_dict(event["config"])
-        if get_layout(config) == "dense":
-            # Dense layout keys blocks by populated-shard position, which the
-            # worker cannot reconstruct from one shard's event; fullsphere (the
-            # default) keys by nested id and needs no shared state.
-            error_msg = "raster lambda workers require output.grid.layout: fullsphere"
-            logger.error(error_msg)
-            return {"statusCode": 400, "body": json.dumps({"error": error_msg})}
-        grid = from_config(config)
+        try:
+            grid = from_config(config)
+        except ValueError as e:
+            # Fail fast with a clean 400 on an invalid grid config (e.g. a
+            # stale layout: dense, removed in issue #88) instead of a retried
+            # 500 (review fold, PR #257).
+            logger.error(str(e))
+            return {"statusCode": 400, "body": json.dumps({"error": str(e)})}
 
         shard_key = int(event["shard_key"])
-        time_index = {k: int(v) for k, v in event["time_index"].items()}
         source = config.data_source or {}
+        profile = bool(event.get("profile"))
+
+        if hive:
+            # Hive branch (issue #247), mirroring the aggregation one: the
+            # worker owns its WHOLE leaf — process_and_write_raster_hive is
+            # the same code path the local dispatcher runs (leaf template +
+            # slabs + coverage + D4 commit stamp), so leaf semantics cannot
+            # drift between backends. ``window`` ({"label", ...}) is the
+            # dispatch unit's time window, absent on schedule-none stores; the
+            # response mirrors the stamped ISO ``time_range`` back for the
+            # dispatcher's root-summary union. A write failure raises into the
+            # 500 envelope: the leaf is then unstamped debris, replaced
+            # wholesale on retry (D13).
+            from zagg.processing.raster import process_and_write_raster_hive
+
+            meta = process_and_write_raster_hive(
+                shard_key,
+                event["granules"],
+                grid,
+                event["store_path"],
+                config,
+                store_kwargs=_output_store_kwargs(event),
+                window=event.get("window"),
+                profile=profile,
+                region=source.get("source_region"),
+                anonymous=source.get("anonymous", True),
+            )
+            body = {
+                "shard_key": shard_key,
+                "timesteps": meta["timesteps"],
+                "granule_count": meta["granule_count"],
+                "skipped": meta["skipped"],
+                # Shared summary keys (see the flat branch below): a raster
+                # unit's obs tally is its timestep count; cells_with_data
+                # counts the leaf's occupied-cell union via the stamp input.
+                "cells_with_data": meta.get("cells_with_data", 0),
+                "total_obs": meta["timesteps"],
+                "duration_s": time.time() - start_time,
+            }
+            if meta.get("time_range") is not None:
+                body["time_range"] = meta["time_range"]
+            # Worker memory telemetry (issue #250), mirroring the flat branch:
+            # sampled per-invocation peak, container high-water fallback.
+            rss_sampler.stop()
+            body["container_hwm_mb"] = _max_memory_mb()
+            sampled_peak = rss_sampler.peak_mb
+            body["max_memory_mb"] = (
+                sampled_peak if sampled_peak is not None else body["container_hwm_mb"]
+            )
+            if profile and "phase_timings" in meta:
+                body["phase_timings"] = meta["phase_timings"]
+            return {"statusCode": 200, "body": json.dumps(body)}
+
+        time_index = {k: int(v) for k, v in event["time_index"].items()}
 
         # Stream the slabs: open the store up front and write + free each
         # timestep's slab as ``process_raster_shard`` completes its acquisition
@@ -1034,7 +1151,6 @@ def _handle_process_raster(event: Dict[str, Any]) -> Dict[str, Any]:
         # overlap, so stage sums can exceed ``sample`` (see
         # ``new_stage_stats``). Default (no ``profile`` key) emits nothing:
         # the body stays byte-identical and the sample path times nothing.
-        profile = bool(event.get("profile"))
         write_s = 0.0
         stage_stats = new_stage_stats() if profile else None
 

@@ -54,19 +54,11 @@ class TestCreateZarrTemplate:
         for name in all_vars:
             assert group[name].shape == expected_shape
 
-    def test_array_shape_n_parent_cells(self, all_vars):
-        parent_order = 6
-        child_order = 8
-        n_parent_cells = 1
-
+    def test_n_parent_cells_removed(self):
+        # The dense-pack selector was removed (issue #88): passing it hard-errors.
         store = MemoryStore()
-        xdggs_zarr_template(store, parent_order, child_order, n_parent_cells=n_parent_cells)
-
-        group = open_group(store, path=str(child_order), mode="r")
-        expected_shape = (16,)
-
-        for name in all_vars:
-            assert group[name].shape == expected_shape
+        with pytest.raises(ValueError, match="removed"):
+            xdggs_zarr_template(store, 6, 8, n_parent_cells=1)
 
     def test_chunk_shape(self, all_vars):
         parent_order = 6

@@ -419,8 +419,8 @@ class InconsistentShardError(ValueError):
 class OutputGrid(Protocol):
     """Pluggable output grid.
 
-    Implementations may be stateless (fullsphere DGGS, rectilinear) or carry
-    a populated-shard list (dense DGGS) so block_index can resolve.
+    Implementations are stateless (fullsphere DGGS, rectilinear):
+    ``block_index`` resolves from the shard key alone.
     """
 
     @property
@@ -473,8 +473,8 @@ class OutputGrid(Protocol):
     def block_index(self, shard_key: ShardKey) -> tuple[int, ...]:
         """Storage block index for this shard in the Zarr array.
 
-        For stateless layouts this is pure arithmetic on shard_key. For dense
-        layouts it consults the populated-shard list built at template time.
+        Pure arithmetic on ``shard_key`` (the parent nested id for HEALPix,
+        the row/col block for rectilinear).
         """
         ...
 

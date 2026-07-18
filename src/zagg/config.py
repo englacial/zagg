@@ -289,8 +289,11 @@ def validate_config(config: PipelineConfig) -> None:
             if len(grid["bounds"]) != 4:
                 raise ValueError("output.grid.bounds must be [xmin, ymin, xmax, ymax]")
         layout = grid.get("layout")
-        if layout is not None and layout not in ("dense", "fullsphere"):
-            raise ValueError(f"output.grid.layout must be 'dense' or 'fullsphere' (got {layout!r})")
+        if layout is not None and layout != "fullsphere":
+            raise ValueError(
+                f"output.grid.layout must be 'fullsphere' (got {layout!r}; "
+                "the deprecated 'dense' layout was removed — issue #88)"
+            )
         # Optional cell_ids encoding (issue #135): "nested" (default, the DGGS
         # standard) or "morton" (emit the packed morton words as cell_ids — a
         # test/prototype capability). HEALPix-only: rectilinear grids have no
@@ -358,49 +361,9 @@ def validate_config(config: PipelineConfig) -> None:
             f"output.consolidate_metadata must be a boolean (got {consolidate_metadata!r})"
         )
 
-    # Optional store layout (issue #199 phase 2): "flat" (default, today's single
-    # shared store) or "hive" (one leaf zarr per shard under a morton digit tree —
-    # docs/design/sparse_coverage.md D1-D6). Hive ids are morton decimal strings,
-    # so the layout is HEALPix-only; metadata consolidation assumes the single
-    # shared store, so it is rejected with hive rather than silently mis-writing.
-    # Sharded (ShardingCodec) output works on BOTH layouts (issue #236) and is
-    # the K>1 default on both.
-    store_layout = config.output.get("store_layout")
-    if store_layout is not None and store_layout not in ("flat", "hive"):
-        raise ValueError(f"output.store_layout must be 'flat' or 'hive' (got {store_layout!r})")
-    if store_layout == "hive":
-        if (grid or {}).get("type", "healpix") != "healpix":
-            raise ValueError(
-                "output.store_layout: hive requires a healpix grid (hive node names "
-                f"are morton decimal digits; grid type is {(grid or {}).get('type')!r})"
-            )
-        if consolidate_metadata:
-            raise ValueError(
-                "output.store_layout: hive has no store-root zarr hierarchy to "
-                "consolidate (D5/D12) — drop output.consolidate_metadata"
-            )
-
-    # End-of-run root coverage MOC (issue #200 phase 3), boolean when present.
-    # Default ON for the hive layout (O9: coverage is the default on healpix
-    # templates); it writes {store}/coverage.moc, a hive-root object, so an
-    # EXPLICIT true on a non-healpix grid or a flat-layout store is a config
-    # mistake, not a no-op — reject it pointedly. Absent simply means off
-    # there (get_coverage_moc resolves the default).
-    coverage_moc = config.output.get("coverage_moc")
-    if coverage_moc is not None and not isinstance(coverage_moc, bool):
-        raise ValueError(f"output.coverage_moc must be a boolean (got {coverage_moc!r})")
-    if coverage_moc:
-        if (grid or {}).get("type", "healpix") != "healpix":
-            raise ValueError(
-                "output.coverage_moc requires a healpix grid (the root coverage.moc "
-                "is a morton MOC; drop the flag for rectilinear output)"
-            )
-        if store_layout != "hive":
-            raise ValueError(
-                "output.coverage_moc requires output.store_layout: hive (the root "
-                "coverage.moc lives at the hive store root; flat stores have no "
-                "hive root to bootstrap from)"
-            )
+    # Store layout + root coverage MOC — shared with the raster branch
+    # (issue #247: raster + hive is legal, so the checks live in one place).
+    _validate_store_layout_keys(config)
 
     # Temporal windowing block (issue #246, morton-hive/2): nested
     # output.windowing declares the window schedule + time encoding. Absent =
@@ -709,42 +672,76 @@ def _validate_raster_config(config: PipelineConfig) -> None:
         if key not in grid:
             raise ValueError(f"output.grid.{key} is required for healpix grid")
     if grid.get("sharded"):
+        # Permanent exclusion, not a deferral (espg-ratified on issue #247):
+        # per-timestep slab streaming over a ShardingCodec object would
+        # read-modify-write it once per timestep, and raster object count is
+        # time-axis-dominated anyway — sharding the cell axis buys little.
         raise ValueError(
-            "raster templates do not support sharded: true yet (issue #218); "
-            "chunks are (1, cells_per_chunk) — one object per timestep-chunk"
+            "raster pipelines do not support sharded: true (per-timestep slab "
+            "streaming would read-modify-write each ShardingCodec object; "
+            "chunks stay (1, cells_per_chunk) — one object per timestep-chunk)"
         )
-    # The hive shard layout and its root coverage MOC are point-pipeline
-    # capabilities; the raster path always writes the flat (time, cells) store
-    # and never consults these keys (issue #239), so an explicit request is a
-    # config mistake, not a no-op — reject it pointedly.
+    # Store layout, root coverage MOC, and temporal windowing ride the SHARED
+    # checks (issue #247: raster + hive is legal — the issue #239 stopgap
+    # rejections are gone). _validate_windowing resolves the raster
+    # time_field/encoding rules (membership is the acquisition's STAC
+    # datetime; the conversion knobs do not apply).
+    _validate_store_layout_keys(config)
+    _validate_windowing(config)
+
+
+def _validate_store_layout_keys(config: PipelineConfig) -> None:
+    """Shared ``output.store_layout`` / ``coverage_moc`` cross-checks.
+
+    Optional store layout (issue #199 phase 2): "hive" (one leaf zarr per
+    shard under a morton digit tree — ``docs/design/sparse_coverage.md``
+    D1-D6) or "flat" (the single shared store). The default is grid-aware
+    (issue #253, ``get_store_layout``): HEALPix -> hive, rectilinear -> flat —
+    so the hive gates below resolve through the default, not the raw key.
+    Hive ids are morton decimal strings, so the layout is HEALPix-only;
+    metadata consolidation assumes the single shared store, so it is rejected
+    with hive (explicit or defaulted) rather than silently mis-writing. Called
+    from both the point-pipeline and raster validation branches (issue #247:
+    raster + hive is legal, so the checks live in one place; the issue #239
+    stopgap rejections are gone).
+
+    The end-of-run root coverage MOC (issue #200 phase 3) is boolean when
+    present, default ON for the hive layout (O9); it writes
+    ``{store}/coverage.moc``, a hive-root object, so an EXPLICIT true on a
+    non-healpix grid or a flat-layout store is a config mistake, not a no-op —
+    rejected pointedly. Absent simply means off there (``get_coverage_moc``
+    resolves the default).
+    """
+    grid = config.output.get("grid")
     store_layout = config.output.get("store_layout")
     if store_layout is not None and store_layout not in ("flat", "hive"):
         raise ValueError(f"output.store_layout must be 'flat' or 'hive' (got {store_layout!r})")
-    if store_layout == "hive":
-        raise ValueError(
-            "output.store_layout: hive is not supported on the raster path "
-            "yet — see issue #237 for the design; drop the key (raster output "
-            "is a flat (time, cells) store)"
-        )
+    if get_store_layout(config) == "hive":
+        if (grid or {}).get("type", "healpix") != "healpix":
+            raise ValueError(
+                "output.store_layout: hive requires a healpix grid (hive node names "
+                f"are morton decimal digits; grid type is {(grid or {}).get('type')!r})"
+            )
+        if config.output.get("consolidate_metadata"):
+            raise ValueError(
+                "output.store_layout: hive has no store-root zarr hierarchy to "
+                "consolidate (D5/D12) — drop output.consolidate_metadata"
+            )
     coverage_moc = config.output.get("coverage_moc")
     if coverage_moc is not None and not isinstance(coverage_moc, bool):
         raise ValueError(f"output.coverage_moc must be a boolean (got {coverage_moc!r})")
     if coverage_moc:
-        raise ValueError(
-            "output.coverage_moc is not supported on the raster path yet — "
-            "see issue #237 for the design; drop the flag (there is no hive "
-            "store root to write coverage.moc to)"
-        )
-    # Time-windowed hive leaves are a point-pipeline capability in this round;
-    # the raster (time, cells) product's windowing is its own design (issue
-    # #247). Reject pointedly rather than silently ignoring the block —
-    # extending the early-return validation posture from issue #239.
-    if config.output.get("windowing"):
-        raise ValueError(
-            "raster pipelines do not support output.windowing yet (issue #247); "
-            "drop the block — raster output is a (time, cells) cube, not "
-            "windowed hive leaves"
-        )
+        if (grid or {}).get("type", "healpix") != "healpix":
+            raise ValueError(
+                "output.coverage_moc requires a healpix grid (the root coverage.moc "
+                "is a morton MOC; drop the flag for rectilinear output)"
+            )
+        if get_store_layout(config) != "hive":
+            raise ValueError(
+                "output.coverage_moc requires output.store_layout: hive (the root "
+                "coverage.moc lives at the hive store root; flat stores have no "
+                "hive root to bootstrap from)"
+            )
 
 
 def _validate_windowing(config: PipelineConfig) -> None:
@@ -762,7 +759,10 @@ def _validate_windowing(config: PipelineConfig) -> None:
     ``variables`` entry or the base level's ``variables``) — a coordinate or
     a non-base (segment-rate) level column is rejected, since the stamp
     ``time_range`` is pooled from read variable columns and window membership
-    is decided per observation.
+    is decided per observation. On the RASTER path (issue #247) membership is
+    the acquisition's STAC ``datetime`` instead: ``time_field`` is optional
+    (fixed to ``datetime``) and the ``epoch``/``scale``/``units`` conversion
+    knobs are rejected.
     """
     from zagg import windows as _windows
 
@@ -796,12 +796,39 @@ def _validate_windowing(config: PipelineConfig) -> None:
             "output.windowing requires a healpix grid (windowed leaves are a "
             f"morton-hive convention; grid type is {grid.get('type')!r})"
         )
-    if (config.output.get("store_layout") or "flat") != "hive":
+    if get_store_layout(config) != "hive":
         raise ValueError(
             "output.windowing requires output.store_layout: hive (window leaves "
             "are hive leaf zarrs; the flat shared store has no leaves to window)"
         )
     time_field = block.get("time_field")
+    if (config.data_source or {}).get("reader") == "raster":
+        # Raster window membership is the acquisition's STAC ``datetime``,
+        # decided at dispatch (issue #247, ratified): there is no
+        # per-observation timestamp column, so ``time_field`` is optional and
+        # fixed — the manifest records the resolved field, and a property-name
+        # knob (e.g. ``start_datetime`` for interval-typed items) can be added
+        # later without breaking any existing manifest.
+        if time_field is not None and time_field != "datetime":
+            raise ValueError(
+                f"output.windowing.time_field {time_field!r} is not configurable "
+                "on the raster path: window membership is the acquisition's STAC "
+                "datetime (drop the key, or set it to 'datetime')"
+            )
+        # The epoch/scale/units knobs describe a dataset-unit time_field
+        # conversion; STAC datetimes are already ISO-8601 UTC instants, so
+        # there is nothing to configure — reject rather than record a
+        # misleading manifest temporal block (get_windowing resolves the
+        # fixed encoding).
+        knobs = [k for k in ("epoch", "scale", "units") if block.get(k) is not None]
+        if knobs:
+            raise ValueError(
+                f"output.windowing.{knobs[0]} does not apply to raster "
+                "pipelines: STAC datetimes are ISO-8601 UTC instants (drop the "
+                "key)"
+            )
+        _validate_windowing_windows(block, schedule)
+        return
     if not isinstance(time_field, str) or not time_field:
         raise ValueError(
             "output.windowing.time_field is required: the per-observation "
@@ -860,6 +887,19 @@ def _validate_windowing(config: PipelineConfig) -> None:
         raise ValueError(
             f"output.windowing.units must be one of {tuple(_windows.UNIT_SECONDS)} (got {units!r})"
         )
+    _validate_windowing_windows(block, schedule)
+
+
+def _validate_windowing_windows(block: dict, schedule: str) -> None:
+    """Validate the ``windows`` list half of ``output.windowing`` (issue #246).
+
+    Shared by the point-pipeline and raster branches of
+    :func:`_validate_windowing`: frozen label grammar, half-open
+    ``start < end``, unique labels, non-overlapping ranges — required for
+    ``schedule: explicit``, rejected otherwise.
+    """
+    from zagg import windows as _windows
+
     declared_windows = block.get("windows")
     if schedule != "explicit":
         if declared_windows is not None:
@@ -1986,7 +2026,8 @@ def get_layout(config: PipelineConfig) -> str:
     Returns
     -------
     str
-        ``"fullsphere"`` (default) or ``"dense"`` (deprecated).
+        ``"fullsphere"`` (the only layout; the deprecated ``"dense"`` pack
+        was removed — issue #88).
     """
     return config.output.get("grid", {}).get("layout", "fullsphere")
 
@@ -2044,23 +2085,35 @@ def get_store_path(config: PipelineConfig) -> str | None:
 
 
 def get_store_layout(config: PipelineConfig) -> str:
-    """Return the STORE layout — flat single store vs morton hive (issue #199).
+    """Return the STORE layout — morton hive vs flat single store (issue #199).
 
     Distinct from ``output.grid.layout`` (the HEALPix *array* layout inside one
     store): ``output.store_layout`` selects how shard output is arranged under
-    ``output.store``. ``"flat"`` (default) is today's single shared zarr store.
-    ``"hive"`` writes one self-describing leaf zarr per shard at
-    ``{store}/{sign+base}/{d1}/.../{full_id}.zarr`` with a root
+    ``output.store``. ``"hive"`` writes one self-describing leaf zarr per shard
+    at ``{store}/{sign+base}/{d1}/.../{full_id}.zarr`` with a root
     ``morton_hive.json`` manifest and a per-leaf commit stamp — see
-    ``docs/design/sparse_coverage.md`` (D1-D6) and :mod:`zagg.hive`. A
-    present-but-null key falls back to the default, like ``layout``.
+    ``docs/design/sparse_coverage.md`` (D1-D6) and :mod:`zagg.hive`. ``"flat"``
+    is the single shared zarr store.
+
+    The default is grid-aware and pipeline-agnostic (issue #253): HEALPix
+    grids default to ``"hive"`` (the ratified profile — for point aggregation
+    AND the raster path, which writes hive leaves per issue #247); rectilinear
+    grids default to ``"flat"`` (hive ids are morton digits — HEALPix-only).
+    An explicit HEALPix ``"flat"`` remains valid for interop/debug but is
+    deprecated — removal is gated on the sparse-DGGS read path (issue #251
+    phase 3). A present-but-null key falls back to the default, like
+    ``layout``.
 
     Returns
     -------
     str
-        ``"flat"`` (default) or ``"hive"``.
+        ``"flat"`` or ``"hive"``.
     """
-    return config.output.get("store_layout") or "flat"
+    layout = config.output.get("store_layout")
+    if layout is not None:
+        return layout
+    grid_type = (config.output.get("grid") or {}).get("type", "healpix")
+    return "hive" if grid_type == "healpix" else "flat"
 
 
 def get_coverage_moc(config: PipelineConfig) -> bool:
@@ -2090,9 +2143,13 @@ def get_windowing(config: PipelineConfig) -> dict | None:
 
     ``epoch`` and explicit-window boundaries are canonicalized to ISO-8601
     UTC strings; ``windows`` is ``None`` except for ``schedule: explicit``.
-    The same dict feeds the manifest temporal block
-    (:func:`zagg.hive.build_manifest`) and the dispatch fan-out, so the two
-    can never disagree.
+    On the raster branch (``reader: raster``) ``time_field`` is the fixed STAC
+    ``datetime`` and ``epoch``/``scale``/``units`` are hardcoded to the
+    Unix-epoch UTC-seconds encoding any ISO instant normalizes to, rather than
+    canonicalizing a declared ``epoch`` off the block (``_validate_windowing``
+    rejects those conversion knobs there). The same dict feeds the manifest
+    temporal block (:func:`zagg.hive.build_manifest`) and the dispatch fan-out,
+    so the two can never disagree.
     """
     from zagg import windows as _windows
 
@@ -2109,6 +2166,20 @@ def get_windowing(config: PipelineConfig) -> dict | None:
             }
             for w in block["windows"]
         ]
+    if (config.data_source or {}).get("reader") == "raster":
+        # Raster membership is the acquisition's STAC ``datetime`` (issue
+        # #247, ratified): the manifest records the resolved field plus the
+        # fixed encoding any ISO-8601 UTC instant normalizes to (UTC seconds
+        # since the Unix epoch). _validate_windowing rejects the conversion
+        # knobs on raster configs, so nothing here can disagree with it.
+        return {
+            "schedule": block["schedule"],
+            "time_field": "datetime",
+            "epoch": "1970-01-01T00:00:00+00:00",
+            "scale": "utc",
+            "units": "seconds",
+            "windows": declared,
+        }
     return {
         "schedule": block["schedule"],
         "time_field": block["time_field"],

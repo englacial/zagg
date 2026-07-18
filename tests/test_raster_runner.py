@@ -43,6 +43,10 @@ def _cfg(tmp_path):
             "output": {
                 "grid": {"type": "healpix", "parent_order": 10, "child_order": 16},
                 "store": str(tmp_path / "out.zarr"),
+                # Pinned: these tests pin the FLAT (time, cells) write path;
+                # since issue #253 an unpinned healpix raster config resolves
+                # hive. Hive tests override this to "hive" per test.
+                "store_layout": "flat",
             },
         }
     )
@@ -80,7 +84,7 @@ def manifest(tmp_path):
     _write_tiff(tmp_path / "t1.tif", np.full((96, 96), 555, dtype=np.uint16))
     cfg = _cfg(tmp_path)
     shard = _shard_for_raster()
-    grid = from_config(cfg, populated_shards=[shard])
+    grid = from_config(cfg)
     entries = [
         _entry("g0", str(tmp_path / "t0.tif"), T0, "dt-1"),
         _entry("g1", str(tmp_path / "t1.tif"), T1, "dt-2"),
@@ -101,7 +105,7 @@ class TestRasterAgg:
         assert summary["timesteps"] == 2
         assert summary["total_obs"] == 2
 
-        grid = from_config(cfg, populated_shards=[shard])
+        grid = from_config(cfg)
         store_path = cfg.output["store"]
         red = open_array(store_path + f"/{grid.group_path}/red", zarr_format=3, consolidated=False)
         cells = grid.children(shard)
@@ -168,7 +172,7 @@ class TestRasterAgg:
         shard0 = _shard_for_raster_at(0.0)
         shard1 = _shard_for_raster_at(7000.0)
         assert shard0 != shard1
-        grid = from_config(cfg, populated_shards=[shard0, shard1])
+        grid = from_config(cfg)
         sm = ShardMap(
             grid.spatial_signature(),
             [shard0, shard1],
@@ -233,7 +237,7 @@ class TestRasterAgg:
         agg(cfg, catalog=sm_path, backend="local", max_workers=2, overwrite=True)
 
         # A manifest with a DIFFERENT time index: one datatake instead of two.
-        grid = from_config(cfg, populated_shards=[shard])
+        grid = from_config(cfg)
         one = ShardMap(
             grid.spatial_signature(),
             [shard],
@@ -289,11 +293,41 @@ class _FakeLambdaClient:
         return out
 
 
+def _lifecycle(responder):
+    """Wrap a per-shard responder with canned ping/setup answers (issue #264).
+
+    The lambda lifecycle is ping → sync raster setup → fan-out; tests that
+    exercise the fan-out answer the two lifecycle invokes canonically and
+    route only ``mode="process_raster"`` events to ``responder``.
+    """
+
+    def _respond(event):
+        if event["mode"] == "ping":
+            return {
+                "statusCode": 200,
+                "body": json.dumps({"ok": True, "mode": "ping", "zagg_version": "test"}),
+            }
+        if event["mode"] == "setup":
+            body = {
+                "ok": True,
+                "mode": "setup",
+                "pipeline": "raster",
+                "timesteps": len(event["times_us"]),
+            }
+            return {"statusCode": 200, "body": json.dumps(body)}
+        return responder(event)
+
+    return _respond
+
+
 class TestRasterLambdaBackend:
+    # Issue #264: the lambda path never opens or writes the store from the
+    # orchestrator (the template rides the sync setup invoke), so these tests
+    # no longer intercept open_store for the s3 URL — a regression to an
+    # orchestrator-side write would surface as a real-S3 attempt.
+
     def test_events_and_summary(self, manifest, monkeypatch, tmp_path):
         import boto3
-
-        import zagg.runner as runner_mod
 
         cfg, sm_path, shard, _data = manifest
 
@@ -305,18 +339,8 @@ class TestRasterLambdaBackend:
             body = {"timesteps": len(event["time_index"]), "cells_with_data": 4096}
             return {"statusCode": 200, "body": json.dumps(body)}
 
-        fake = _FakeLambdaClient(responder)
+        fake = _FakeLambdaClient(_lifecycle(responder))
         monkeypatch.setattr(boto3, "client", lambda *a, **k: fake)
-        # Template emission targets the store path; keep it local by
-        # intercepting open_store for the s3 URL.
-        real_open = runner_mod.open_store
-
-        def fake_open(path, **kw):
-            if path.startswith("s3://"):
-                return str(tmp_path / "lambda_out.zarr")
-            return real_open(path, **kw)
-
-        monkeypatch.setattr(runner_mod, "open_store", fake_open)
         summary = agg(
             cfg, catalog=sm_path, store="s3://bucket/out.zarr", backend="lambda", max_workers=2
         )
@@ -324,22 +348,115 @@ class TestRasterLambdaBackend:
         assert summary["total_cells"] == 1 and summary["cells_with_data"] == 1
         assert summary["cells_error"] == 0
         assert summary["total_obs"] == 2
-        assert len(fake.events) == 1
+        assert [e["mode"] for e in fake.events] == ["ping", "setup", "process_raster"]
         # No profile -> the payload stays byte-identical (no key) and the
         # profile rollups stay out of the summary (issue #250).
-        assert "profile" not in fake.events[0]
+        assert "profile" not in fake.events[-1]
         assert "worker_stage_max" not in summary
         # Always-on telemetry rollups are null-safe on a body without them.
         assert summary["lambda_time_s"] is None and summary["max_memory_mb"] is None
         assert summary["template_s"] >= 0.0
+
+    def test_lifecycle_order_and_setup_event_pinned(self, manifest, monkeypatch):
+        # The wire-level pin of the raster lifecycle (issue #264): ping →
+        # sync setup → fan-out, with the EXACT setup event on the wire —
+        # config + times_us (plain ints, the catalog-derived coordinate) +
+        # overwrite — and no orchestrator store write anywhere.
+        import boto3
+
+        import zagg.runner as runner_mod
+        from zagg.processing.raster import raster_time_index
+
+        cfg, sm_path, shard, _data = manifest
+        _idx, times_us = raster_time_index(runner_mod._load_catalog(sm_path)["granules"])
+
+        def responder(event):
+            body = {"timesteps": len(event["time_index"]), "cells_with_data": 4096}
+            return {"statusCode": 200, "body": json.dumps(body)}
+
+        fake = _FakeLambdaClient(_lifecycle(responder))
+        monkeypatch.setattr(boto3, "client", lambda *a, **k: fake)
+        real_open = runner_mod.open_store
+
+        def guard_open(path, **kw):
+            assert not path.startswith("s3://"), "orchestrator opened the s3 store"
+            return real_open(path, **kw)
+
+        monkeypatch.setattr(runner_mod, "open_store", guard_open)
+        agg(cfg, catalog=sm_path, store="s3://bucket/out.zarr", backend="lambda")
+        assert [e["mode"] for e in fake.events] == ["ping", "setup", "process_raster"]
+        ping, setup = fake.events[0], fake.events[1]
+        expected_config = {
+            "data_source": cfg.data_source,
+            "output": cfg.output,
+            "pipeline": cfg.pipeline,
+        }
+        assert ping["store_path"] == "s3://bucket/out.zarr"
+        assert ping["config"] == expected_config
+        assert setup == {
+            "mode": "setup",
+            "store_path": "s3://bucket/out.zarr",
+            "overwrite": False,
+            "config": expected_config,
+            "times_us": [int(t) for t in times_us],
+        }
+        assert all(isinstance(t, int) for t in setup["times_us"])  # JSON-safe int64
+
+    def test_stale_ping_fails_fast_no_setup(self, manifest, monkeypatch):
+        # A pre-#252 function doesn't know mode="ping" (400 fall-through with
+        # zero writes): the raster dispatch must raise the redeploy message
+        # before the setup invoke or any worker.
+        import boto3
+
+        cfg, sm_path, _shard, _data = manifest
+
+        def responder(event):
+            if event["mode"] == "ping":
+                return {"statusCode": 400, "body": json.dumps({"error": "shard_key required"})}
+            raise AssertionError(f"unexpected invoke after failed ping: {event['mode']}")
+
+        fake = _FakeLambdaClient(responder)
+        monkeypatch.setattr(boto3, "client", lambda *a, **k: fake)
+        with pytest.raises(RuntimeError, match="redeploy") as excinfo:
+            agg(cfg, catalog=sm_path, store="s3://bucket/out.zarr", backend="lambda")
+        # The shared ping is pipeline-neutral (issue #264): a raster operator
+        # must not get hive-worded guidance for a raster run.
+        assert "hive" not in str(excinfo.value).lower()
+        assert [e["mode"] for e in fake.events] == ["ping"]
+
+    def test_stale_setup_echo_fails_fast_no_fanout(self, manifest, monkeypatch):
+        # A function that knows ping (#252) but predates the raster setup
+        # branch (#264) falls through to the point-path template and echoes
+        # "layout" instead of "pipeline": the dispatcher must refuse with the
+        # redeploy message before any worker writes into the wrong template.
+        import boto3
+
+        cfg, sm_path, _shard, _data = manifest
+
+        def responder(event):
+            if event["mode"] == "ping":
+                return {
+                    "statusCode": 200,
+                    "body": json.dumps({"ok": True, "mode": "ping", "zagg_version": "old"}),
+                }
+            if event["mode"] == "setup":
+                return {
+                    "statusCode": 200,
+                    "body": json.dumps({"ok": True, "mode": "setup", "layout": "flat"}),
+                }
+            raise AssertionError(f"unexpected invoke after stale setup: {event['mode']}")
+
+        fake = _FakeLambdaClient(responder)
+        monkeypatch.setattr(boto3, "client", lambda *a, **k: fake)
+        with pytest.raises(RuntimeError, match="issue #264 raster setup branch"):
+            agg(cfg, catalog=sm_path, store="s3://bucket/out.zarr", backend="lambda")
+        assert [e["mode"] for e in fake.events] == ["ping", "setup"]
 
     def test_lambda_profile_threads_key_and_rolls_up(self, manifest, monkeypatch, tmp_path):
         # Issue #250: profile=True rides the event; the summary rolls the
         # workers' phase_timings (stages straggler-maxed + write bucket,
         # counts summed) and the billed-duration / peak-RSS telemetry.
         import boto3
-
-        import zagg.runner as runner_mod
 
         cfg, sm_path, _shard, _data = manifest
 
@@ -367,16 +484,8 @@ class TestRasterLambdaBackend:
             }
             return {"statusCode": 200, "body": json.dumps(body)}
 
-        fake = _FakeLambdaClient(responder)
+        fake = _FakeLambdaClient(_lifecycle(responder))
         monkeypatch.setattr(boto3, "client", lambda *a, **k: fake)
-        real_open = runner_mod.open_store
-
-        def fake_open(path, **kw):
-            if path.startswith("s3://"):
-                return str(tmp_path / "lambda_out.zarr")
-            return real_open(path, **kw)
-
-        monkeypatch.setattr(runner_mod, "open_store", fake_open)
         summary = agg(
             cfg,
             catalog=sm_path,
@@ -404,9 +513,10 @@ class TestRasterLambdaBackend:
         # snake_case creds + a custom output endpoint must reach the worker event
         # as the handler-required camelCase block (accessKeyId/secretAccessKey)
         # with endpointUrl threaded in — parity with the spatial/temporal paths.
+        # The ping + setup lifecycle invokes (issue #264) carry the same block:
+        # the setup invoke is the template WRITE, so a dropped key there would
+        # 403 the handler against an external (R2/MinIO) target.
         import boto3
-
-        import zagg.runner as runner_mod
 
         cfg, sm_path, _shard, _data = manifest
 
@@ -414,16 +524,8 @@ class TestRasterLambdaBackend:
             body = {"timesteps": len(event["time_index"]), "cells_with_data": 4096}
             return {"statusCode": 200, "body": json.dumps(body)}
 
-        fake = _FakeLambdaClient(responder)
+        fake = _FakeLambdaClient(_lifecycle(responder))
         monkeypatch.setattr(boto3, "client", lambda *a, **k: fake)
-        real_open = runner_mod.open_store
-        monkeypatch.setattr(
-            runner_mod,
-            "open_store",
-            lambda path, **kw: (
-                str(tmp_path / "creds.zarr") if path.startswith("s3://") else real_open(path, **kw)
-            ),
-        )
         agg(
             cfg,
             catalog=sm_path,
@@ -435,32 +537,23 @@ class TestRasterLambdaBackend:
             },
             output_endpoint_url="https://custom.r2.example.com",
         )
-        assert len(fake.events) == 1
-        block = fake.events[0]["output_credentials"]
-        assert block["accessKeyId"] == "AKIA_SNAKE"
-        assert block["secretAccessKey"] == "SECRET_SNAKE"
-        assert block["endpointUrl"] == "https://custom.r2.example.com"
+        assert [e["mode"] for e in fake.events] == ["ping", "setup", "process_raster"]
+        for event in fake.events:
+            block = event["output_credentials"]
+            assert block["accessKeyId"] == "AKIA_SNAKE"
+            assert block["secretAccessKey"] == "SECRET_SNAKE"
+            assert block["endpointUrl"] == "https://custom.r2.example.com"
 
     def test_all_lambda_shards_error_raises(self, manifest, monkeypatch, tmp_path):
         import boto3
-
-        import zagg.runner as runner_mod
 
         cfg, sm_path, _shard, _data = manifest
 
         def responder(event):
             return {"statusCode": 500, "body": json.dumps({"error": "boom"})}
 
-        fake = _FakeLambdaClient(responder)
+        fake = _FakeLambdaClient(_lifecycle(responder))
         monkeypatch.setattr(boto3, "client", lambda *a, **k: fake)
-        real_open = runner_mod.open_store
-        monkeypatch.setattr(
-            runner_mod,
-            "open_store",
-            lambda path, **kw: (
-                str(tmp_path / "x.zarr") if path.startswith("s3://") else real_open(path, **kw)
-            ),
-        )
         with pytest.raises(RuntimeError, match="boom"):
             agg(cfg, catalog=sm_path, store="s3://bucket/out.zarr", backend="lambda")
 
@@ -469,26 +562,17 @@ class TestRasterLambdaBackend:
         # error — recorded, never retried. Single shard -> all-error RuntimeError.
         import boto3
 
-        import zagg.runner as runner_mod
-
         cfg, sm_path, _shard, _data = manifest
 
         def responder(event):
             return {"__function_error__": True, "errorMessage": "boom in worker"}
 
-        fake = _FakeLambdaClient(responder)
+        fake = _FakeLambdaClient(_lifecycle(responder))
         monkeypatch.setattr(boto3, "client", lambda *a, **k: fake)
-        real_open = runner_mod.open_store
-        monkeypatch.setattr(
-            runner_mod,
-            "open_store",
-            lambda path, **kw: (
-                str(tmp_path / "fe.zarr") if path.startswith("s3://") else real_open(path, **kw)
-            ),
-        )
         with pytest.raises(RuntimeError, match="Lambda error"):
             agg(cfg, catalog=sm_path, store="s3://bucket/out.zarr", backend="lambda")
-        assert len(fake.events) == 1  # deterministic FunctionError -> no retry
+        # deterministic FunctionError -> no retry
+        assert [e["mode"] for e in fake.events] == ["ping", "setup", "process_raster"]
 
     def test_lambda_transient_retry_then_success(self, manifest, monkeypatch, tmp_path):
         # A transient invoke fault (Connection reset) on the first attempt retries
@@ -507,42 +591,31 @@ class TestRasterLambdaBackend:
             body = {"timesteps": len(event["time_index"]), "cells_with_data": 4096}
             return {"statusCode": 200, "body": json.dumps(body)}
 
-        fake = _FakeLambdaClient(responder)
+        fake = _FakeLambdaClient(_lifecycle(responder))
         monkeypatch.setattr(boto3, "client", lambda *a, **k: fake)
         monkeypatch.setattr(runner_mod.time, "sleep", lambda *a: None)
-        real_open = runner_mod.open_store
-        monkeypatch.setattr(
-            runner_mod,
-            "open_store",
-            lambda path, **kw: (
-                str(tmp_path / "tr.zarr") if path.startswith("s3://") else real_open(path, **kw)
-            ),
-        )
         summary = agg(cfg, catalog=sm_path, store="s3://bucket/out.zarr", backend="lambda")
         assert summary["cells_error"] == 0
         assert summary["cells_with_data"] == 1
-        assert len(fake.events) == 2  # first invoke raised (transient), retried once
+        # first shard invoke raised (transient), retried once
+        assert [e["mode"] for e in fake.events] == [
+            "ping",
+            "setup",
+            "process_raster",
+            "process_raster",
+        ]
 
     def test_lambda_dense_layout_fails_fast(self, manifest, monkeypatch, tmp_path):
-        # A dense-layout config on the lambda backend must be refused up front,
-        # before any invoke — the fake client records zero events.
+        # The dense layout was removed (issue #88): a config still selecting it
+        # is refused at grid construction, before any invoke — the fake client
+        # records zero events.
         import boto3
-
-        import zagg.runner as runner_mod
 
         cfg, sm_path, _shard, _data = manifest
         cfg.output["grid"]["layout"] = "dense"
 
         fake = _FakeLambdaClient(lambda event: {"statusCode": 200, "body": "{}"})
         monkeypatch.setattr(boto3, "client", lambda *a, **k: fake)
-        real_open = runner_mod.open_store
-        monkeypatch.setattr(
-            runner_mod,
-            "open_store",
-            lambda path, **kw: (
-                str(tmp_path / "dense.zarr") if path.startswith("s3://") else real_open(path, **kw)
-            ),
-        )
         with pytest.raises(ValueError, match="fullsphere"):
             agg(cfg, catalog=sm_path, store="s3://bucket/out.zarr", backend="lambda")
         assert fake.events == []
@@ -552,13 +625,11 @@ class TestRasterLambdaBackend:
         # group key; the worker event's time_index must be keyed by that string.
         import boto3
 
-        import zagg.runner as runner_mod
-
         cfg = _cfg(tmp_path)
         data = _index_raster()
         _write_tiff(tmp_path / "d0.tif", data)
         shard = _shard_for_raster()
-        grid = from_config(cfg, populated_shards=[shard])
+        grid = from_config(cfg)
         entries = [
             {
                 "id": "g0",
@@ -579,18 +650,95 @@ class TestRasterLambdaBackend:
             body = {"timesteps": 1, "cells_with_data": 4096}
             return {"statusCode": 200, "body": json.dumps(body)}
 
-        fake = _FakeLambdaClient(responder)
+        fake = _FakeLambdaClient(_lifecycle(responder))
         monkeypatch.setattr(boto3, "client", lambda *a, **k: fake)
-        real_open = runner_mod.open_store
-        monkeypatch.setattr(
-            runner_mod,
-            "open_store",
-            lambda path, **kw: (
-                str(tmp_path / "dt.zarr") if path.startswith("s3://") else real_open(path, **kw)
-            ),
-        )
         agg(cfg, catalog=sm_path, store="s3://bucket/out.zarr", backend="lambda")
         assert set(seen["time_index"]) == {T0}
+
+
+class TestInvokeLambdaRasterSetupEvent:
+    """Pin the ACTUAL raster setup event on the wire (issue #264) and the
+    stale-deployment echo guard: the sync RequestResponse invoke carries
+    config + times_us (plain ints) + overwrite, and any success body that
+    does not echo ``"pipeline": "raster"`` — a deployed function without the
+    raster setup branch fell through to the point-path template — raises the
+    redeploy message. Mirrors ``TestInvokeLambdaSetupEvent`` (test_hive)."""
+
+    @staticmethod
+    def _invoke(client, config_dict, **kw):
+        from zagg.runner import _invoke_lambda_raster_setup
+
+        _invoke_lambda_raster_setup(
+            client,
+            "process-shard",
+            "s3://out/product",
+            config_dict=config_dict,
+            times_us=np.array([1752422540000000, 1752854540000000], dtype=np.int64),
+            **kw,
+        )
+        return json.loads(client.invoke.call_args.kwargs["Payload"])
+
+    def test_event_matches_baseline(self, tmp_path):
+        from test_hive import _wire_client
+
+        cfg = _cfg(tmp_path)
+        config_dict = {"data_source": cfg.data_source, "output": cfg.output}
+        client = _wire_client({"ok": True, "mode": "setup", "pipeline": "raster", "timesteps": 2})
+        event = self._invoke(client, config_dict)
+        assert client.invoke.call_args.kwargs["InvocationType"] == "RequestResponse"
+        assert event == {
+            "mode": "setup",
+            "store_path": "s3://out/product",
+            "overwrite": False,
+            "config": config_dict,
+            "times_us": [1752422540000000, 1752854540000000],
+        }
+
+    def test_creds_and_overwrite_threaded(self, tmp_path):
+        from test_hive import _wire_client
+
+        creds = {"accessKeyId": "AK", "secretAccessKey": "SK"}
+        client = _wire_client({"ok": True, "mode": "setup", "pipeline": "raster", "timesteps": 2})
+        event = self._invoke(client, {"data_source": {}}, overwrite=True, output_creds_event=creds)
+        assert event["overwrite"] is True
+        assert event["output_credentials"] == creds
+
+    def test_non_200_raises(self, tmp_path):
+        from test_hive import _wire_client
+
+        # A generic 500 can't be told apart from a raising pre-#264 flat branch,
+        # so the message must carry the redeploy hint.
+        with pytest.raises(RuntimeError, match="Lambda raster setup error") as excinfo:
+            self._invoke(
+                _wire_client({"error": "boom", "mode": "setup"}, status_code=500),
+                {"data_source": {}},
+            )
+        assert "redeploy" in str(excinfo.value)
+
+        # The legitimate ContainsGroupError overwrite-refusal is the only non-200
+        # a correctly-deployed function returns on the normal path; it must
+        # surface the store message WITHOUT the inapplicable redeploy hedge.
+        err = "A group exists in store 's3://out/product' at path ''"
+        with pytest.raises(RuntimeError, match="Lambda raster setup error") as excinfo:
+            self._invoke(
+                _wire_client({"error": err, "mode": "setup"}, status_code=500),
+                {"data_source": {}},
+            )
+        msg = str(excinfo.value)
+        assert "redeploy" not in msg
+        assert "A group exists in store" in msg
+
+    def test_missing_pipeline_echo_raises_redeploy(self, tmp_path):
+        # A stale function's flat branch answers 200 with the layout echo but
+        # no "pipeline" key: the dispatcher must refuse with the redeploy
+        # remedy rather than fan workers into a point-path template.
+        from test_hive import _wire_client
+
+        with pytest.raises(RuntimeError, match="redeploy"):
+            self._invoke(
+                _wire_client({"ok": True, "mode": "setup", "layout": "flat"}),
+                {"data_source": {}},
+            )
 
 
 class TestShippedTemplate:
@@ -600,3 +748,449 @@ class TestShippedTemplate:
         assert cfg.data_source["reader"] == "raster"
         assert cfg.data_source["bands"]["scl"]["dtype"] == "uint8"
         assert cfg.output["grid"]["child_order"] == 19
+
+
+class TestRasterHiveLocalBackend:
+    """Local raster hive runs (issue #247 phase 3): manifest, leaves, coverage."""
+
+    def test_defaulted_layout_dispatches_hive(self, tmp_path, manifest):
+        # Issue #253 phase 4: an OMITTED store_layout on a healpix raster
+        # config resolves hive (the grid-keyed, pipeline-agnostic default) and
+        # dispatches down the issue #247 hive path — manifest + stamped leaf,
+        # no flat global template at the store root.
+        from pathlib import Path
+
+        from zagg import hive
+
+        cfg, sm_path, shard, _data = manifest
+        del cfg.output["store_layout"]  # the fixture pins flat; drop for the default
+        summary = agg(cfg, catalog=sm_path, backend="local", max_workers=2)
+        assert summary["cells_with_data"] == 1 and summary["cells_error"] == 0
+
+        store_path = cfg.output["store"]
+        assert hive.read_manifest(store_path)["spec"] == "morton-hive/1"
+        stamp = hive.read_commit(hive.shard_leaf_path(store_path, shard))
+        assert stamp and stamp["complete"]
+        assert "zarr.json" not in {p.name for p in Path(store_path).iterdir()}  # D5
+
+    def test_schedule_none_end_to_end(self, tmp_path, manifest):
+        from pathlib import Path
+
+        from zagg import hive
+
+        cfg, sm_path, shard, data = manifest
+        cfg.output["store_layout"] = "hive"
+        summary = agg(cfg, catalog=sm_path, backend="local", max_workers=2)
+        assert summary["cells_with_data"] == 1 and summary["cells_error"] == 0
+
+        store_path = cfg.output["store"]
+        # Root manifest: /1 spec (schedule none), no temporal block.
+        m = hive.read_manifest(store_path)
+        assert m["spec"] == "morton-hive/1" and "temporal" not in m
+        # No store-root zarr objects (D5): only the manifest, the root
+        # coverage.moc, and the digit tree.
+        root_children = sorted(p.name for p in Path(store_path).iterdir())
+        assert "zarr.json" not in root_children
+        assert {"morton_hive.json", "coverage.moc"} <= set(root_children)
+        # One bare leaf carrying the FULL time axis, stamped /1.
+        leaf = hive.shard_leaf_path(store_path, shard)
+        stamp = hive.read_commit(leaf)
+        assert stamp and stamp["complete"] and stamp["spec"] == "morton-hive/1"
+        assert "window" not in stamp and "time_range" not in stamp
+        grid = from_config(cfg)
+        red = open_array(leaf + f"/{grid.group_path}/red", zarr_format=3, consolidated=False)
+        assert red.shape == (2, grid.cells_per_shard)
+        cells = grid.children(shard)
+        rows, cols, valid = grid.sample(cells, UTM18, TRANSFORM, (96, 96))
+        np.testing.assert_array_equal(red[0, :][valid], data[rows[valid], cols[valid]])
+        assert (red[1, :][valid] == 555).all()
+        # Root coverage.moc (default-on for hive) covers the shard, no
+        # time_range on an unwindowed store.
+        cov = hive.read_root_coverage(store_path)
+        assert cov is not None and "time_range" not in cov
+        np.testing.assert_array_equal(
+            hive.root_coverage_words(cov), np.asarray([shard], dtype=np.uint64)
+        )
+
+    def test_windowed_daily_leaves(self, tmp_path, manifest):
+        from zagg import hive
+
+        cfg, sm_path, shard, data = manifest
+        cfg.output["store_layout"] = "hive"
+        cfg.output["windowing"] = {"schedule": "daily"}
+        summary = agg(cfg, catalog=sm_path, backend="local", max_workers=2)
+        # Two datatakes on different days -> two (shard, window) units.
+        assert summary["total_cells"] == 2
+        assert summary["cells_with_data"] == 2 and summary["cells_error"] == 0
+
+        store_path = cfg.output["store"]
+        m = hive.read_manifest(store_path)
+        assert m["spec"] == "morton-hive/2"
+        assert m["temporal"]["schedule"] == "daily"
+        assert m["temporal"]["time_field"] == "datetime"  # the resolved field
+        grid = from_config(cfg)
+        for label, instant, value_check in (
+            ("20260713", T0, None),
+            ("20260718", T1, 555),
+        ):
+            leaf = hive.shard_leaf_path(store_path, shard, window=label)
+            stamp = hive.read_commit(leaf)
+            assert stamp and stamp["spec"] == "morton-hive/2"
+            assert stamp["window"] == label
+            assert stamp["time_range"] == [instant, instant]
+            red = open_array(leaf + f"/{grid.group_path}/red", zarr_format=3, consolidated=False)
+            assert red.shape == (1, grid.cells_per_shard)
+            if value_check is not None:
+                cells = grid.children(shard)
+                _r, _c, valid = grid.sample(cells, UTM18, TRANSFORM, (96, 96))
+                assert (red[0, :][valid] == value_check).all()
+        # Root summary unions the two windowed stamps' time ranges (D15).
+        cov = hive.read_root_coverage(store_path)
+        assert cov["time_range"] == [T0, T1]
+
+
+class TestRasterHiveLambdaBackend:
+    """Lambda raster hive dispatch (issue #247 phase 4): lifecycle + events."""
+
+    def test_lifecycle_and_event_shapes(self, manifest, monkeypatch):
+        # The hive manifest rides the issue #252 hybrid lifecycle: ping (read-
+        # only precheck) -> async setup (manifest write) -> per-unit process
+        # invokes (no time_index; window on windowed units) -> finalize
+        # backstop -> fire-and-forget coverage. Scripted responder, no writes.
+        import boto3
+
+        cfg, sm_path, shard, _data = manifest
+        cfg.output["store_layout"] = "hive"
+        cfg.output["windowing"] = {"schedule": "daily"}
+
+        def responder(event):
+            mode = event["mode"]
+            if mode == "ping":
+                body = {"ok": True, "mode": "ping", "zagg_version": "test"}
+                return {"statusCode": 200, "body": json.dumps(body)}
+            if mode in ("setup", "coverage"):
+                return {"statusCode": 200, "body": "{}"}  # Event invokes: unread
+            if mode == "finalize":
+                body = {"ok": True, "mode": "finalize", "layout": "hive"}
+                return {"statusCode": 200, "body": json.dumps(body)}
+            assert mode == "process_raster"
+            label = event["window"]["label"]
+            body = {
+                "shard_key": event["shard_key"],
+                "timesteps": 1,
+                "cells_with_data": 7,
+                "time_range": {
+                    "20260713": [T0, T0],
+                    "20260718": [T1, T1],
+                }[label],
+            }
+            return {"statusCode": 200, "body": json.dumps(body)}
+
+        fake = _FakeLambdaClient(responder)
+        monkeypatch.setattr(boto3, "client", lambda *a, **k: fake)
+        summary = agg(
+            cfg, catalog=sm_path, store="s3://bucket/out.zarr", backend="lambda", max_workers=2
+        )
+        assert summary["total_cells"] == 2  # two (shard, window) units
+        assert summary["cells_with_data"] == 2
+
+        modes = [e["mode"] for e in fake.events]
+        assert modes[:2] == ["ping", "setup"]
+        assert modes[-2:] == ["finalize", "coverage"]
+        assert modes[2:-2] == ["process_raster", "process_raster"]
+        # Lifecycle events carry the manifest inputs (config + parent_order +
+        # dataset identity), mirroring the aggregation hive path.
+        for ev in fake.events[:2] + [fake.events[-2]]:
+            assert ev["config"]["output"]["store_layout"] == "hive"
+            assert ev["parent_order"] == 10
+            assert "dataset" in ev
+        # Hive process events: no time_index (leaf-local axis), window payload
+        # with the daily labels, one unit per (shard, window).
+        procs = fake.events[2:-2]
+        assert all("time_index" not in ev for ev in procs)
+        assert sorted(ev["window"]["label"] for ev in procs) == ["20260713", "20260718"]
+        assert all(ev["shard_key"] == shard for ev in procs)
+        # Root coverage rides serialized in the event, with the D15 time union.
+        cov = fake.events[-1]["coverage"]
+        assert cov["encoding"] == "ranges"
+        assert cov["time_range"] == [T0, T1]
+
+    def test_defaulted_layout_dispatches_hive(self, manifest, monkeypatch):
+        # Issue #253 phase 4, lambda dispatcher: a healpix raster config with
+        # NO store_layout key runs the hive lifecycle (ping -> async setup ->
+        # hive process events -> finalize/coverage), not the issue #264 flat
+        # sync-setup path. The default resolves in get_store_layout on both
+        # ends — the events forward the config untouched, no injected key.
+        import boto3
+
+        cfg, sm_path, shard, _data = manifest
+        del cfg.output["store_layout"]  # the fixture pins flat; drop for the default
+
+        def responder(event):
+            mode = event["mode"]
+            if mode == "ping":
+                body = {"ok": True, "mode": "ping", "zagg_version": "test"}
+                return {"statusCode": 200, "body": json.dumps(body)}
+            if mode in ("setup", "coverage"):
+                return {"statusCode": 200, "body": "{}"}  # Event invokes: unread
+            if mode == "finalize":
+                body = {"ok": True, "mode": "finalize", "layout": "hive"}
+                return {"statusCode": 200, "body": json.dumps(body)}
+            assert mode == "process_raster"
+            body = {
+                "shard_key": event["shard_key"],
+                "timesteps": 2,
+                "cells_with_data": 7,
+                "time_range": [T0, T1],
+            }
+            return {"statusCode": 200, "body": json.dumps(body)}
+
+        fake = _FakeLambdaClient(responder)
+        monkeypatch.setattr(boto3, "client", lambda *a, **k: fake)
+        summary = agg(
+            cfg, catalog=sm_path, store="s3://bucket/out.zarr", backend="lambda", max_workers=2
+        )
+        assert summary["cells_with_data"] == 1
+
+        modes = [e["mode"] for e in fake.events]
+        assert modes[:2] == ["ping", "setup"]
+        assert modes[-2:] == ["finalize", "coverage"]
+        procs = [e for e in fake.events if e["mode"] == "process_raster"]
+        # Hive-shaped process events: leaf-local time axis, no flat time_index;
+        # schedule none -> no window payload.
+        assert procs == [e for e in fake.events[2:-2]]
+        assert all("time_index" not in ev and "window" not in ev for ev in procs)
+        assert all(ev["shard_key"] == shard for ev in procs)
+        # No sync flat raster setup: no event carries the flat template's
+        # times_us, and the forwarded config still has no store_layout key.
+        assert all("times_us" not in ev for ev in fake.events)
+        for ev in fake.events[:2] + [fake.events[-2]]:
+            assert "store_layout" not in ev["config"]["output"]
+
+    def test_all_failed_finalizes_before_raise(self, manifest, monkeypatch):
+        # All-shards-failed still runs the finalize backstop BEFORE the
+        # all-failed raise, mirroring the local backend: on Lambda the
+        # pre-dispatch setup write is a droppable retries-0 async invoke, so
+        # finalize is the only reliable manifest write and must run even when
+        # every shard errored. Nothing succeeded, so no coverage invoke fires.
+        import boto3
+
+        cfg, sm_path, _shard, _data = manifest
+        cfg.output["store_layout"] = "hive"
+        cfg.output["windowing"] = {"schedule": "daily"}
+
+        def responder(event):
+            mode = event["mode"]
+            if mode == "process_raster":
+                return {"statusCode": 500, "body": json.dumps({"error": "boom"})}
+            return {"statusCode": 200, "body": "{}"}
+
+        fake = _FakeLambdaClient(responder)
+        monkeypatch.setattr(boto3, "client", lambda *a, **k: fake)
+        with pytest.raises(RuntimeError, match="boom"):
+            agg(cfg, catalog=sm_path, store="s3://bucket/out.zarr", backend="lambda", max_workers=2)
+
+        modes = [e["mode"] for e in fake.events]
+        # Every shard 500s (two daily windows), so the run raises — but the
+        # finalize backstop lands after the process events and before the raise.
+        assert "finalize" in modes
+        assert "coverage" not in modes  # nothing succeeded -> done empty
+        proc_idx = [i for i, m in enumerate(modes) if m == "process_raster"]
+        assert proc_idx and modes.index("finalize") > max(proc_idx)
+
+    def test_flat_process_events_unchanged(self, manifest, monkeypatch):
+        # Flat PROCESS events are byte-identical to pre-#247 runs — exactly
+        # the pre-hive key set, no window/hive keys — inside the issue #264
+        # lifecycle (ping -> sync raster setup -> fan-out), and no hive
+        # lifecycle invokes (no finalize/coverage) ride a flat run.
+        import boto3
+
+        cfg, sm_path, _shard, _data = manifest
+
+        def responder(event):
+            body = {"timesteps": len(event["time_index"]), "cells_with_data": 4096}
+            return {"statusCode": 200, "body": json.dumps(body)}
+
+        fake = _FakeLambdaClient(_lifecycle(responder))
+        monkeypatch.setattr(boto3, "client", lambda *a, **k: fake)
+        agg(cfg, catalog=sm_path, store="s3://bucket/out.zarr", backend="lambda")
+        assert [e["mode"] for e in fake.events] == ["ping", "setup", "process_raster"]
+        assert set(fake.events[-1]) == {
+            "mode",
+            "shard_key",
+            "granules",
+            "config",
+            "store_path",
+            "time_index",
+        }
+
+    def test_parity_with_local_backend(self, manifest, monkeypatch, tmp_path):
+        # Both dispatchers, same inputs -> identical leaf sets and stamps
+        # (bar the write clocks): the lambda run drives the REAL handler
+        # (deployment/aws/lambda_handler.py) with s3:// paths remapped onto
+        # tmp_path, the local run writes directly; then compare.
+        import importlib.util
+        from pathlib import Path
+        from unittest.mock import MagicMock
+
+        import boto3
+
+        import zagg.hive as hive
+        import zagg.store as store_mod
+
+        spec = importlib.util.spec_from_file_location(
+            "zagg_lambda_handler_parity",
+            Path(__file__).parent.parent / "deployment" / "aws" / "lambda_handler.py",
+        )
+        handler_mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(handler_mod)
+
+        cfg, sm_path, shard, _data = manifest
+        cfg.output["store_layout"] = "hive"
+        cfg.output["windowing"] = {"schedule": "daily"}
+
+        s3root = tmp_path / "s3root"
+
+        def _translate(path):
+            return str(s3root / path.removeprefix("s3://")) if path.startswith("s3://") else path
+
+        real_open_store = store_mod.open_store
+        real_open_object = hive.open_object_store
+        monkeypatch.setattr(
+            store_mod, "open_store", lambda path, **kw: real_open_store(_translate(path))
+        )
+        monkeypatch.setattr(
+            hive, "open_object_store", lambda path, **kw: real_open_object(_translate(path))
+        )
+        # The handler binds open_store at its own import; patch that binding too.
+        monkeypatch.setattr(
+            handler_mod, "open_store", lambda path, **kw: real_open_store(_translate(path))
+        )
+
+        def responder(event):
+            return handler_mod.lambda_handler(event, MagicMock())
+
+        fake = _FakeLambdaClient(responder)
+        monkeypatch.setattr(boto3, "client", lambda *a, **k: fake)
+        lam = agg(
+            cfg, catalog=sm_path, store="s3://bucket/out.zarr", backend="lambda", max_workers=2
+        )
+        assert lam["cells_with_data"] == 2 and lam["cells_error"] == 0
+        lam_root = str(s3root / "bucket/out.zarr")
+
+        loc_root = str(tmp_path / "local_out.zarr")
+        loc = agg(cfg, catalog=sm_path, store=loc_root, backend="local", max_workers=2)
+        assert loc["cells_with_data"] == 2
+
+        def _leaves(root):
+            return sorted(
+                str(p.relative_to(root)) for p in Path(root).rglob("*.zarr") if p.is_dir()
+            )
+
+        assert _leaves(lam_root) == _leaves(loc_root) != []
+        for rel in _leaves(loc_root):
+            a = hive.read_commit(f"{lam_root}/{rel}")
+            b = hive.read_commit(f"{loc_root}/{rel}")
+            assert a is not None and b is not None
+            a.pop("written_at"), b.pop("written_at")
+            assert a == b
+        # Manifests agree on the frozen keys (generated_at differs).
+        ma, mb = hive.read_manifest(lam_root), hive.read_manifest(loc_root)
+        for key in ("spec", "dataset", "cell_order", "shard_order", "temporal"):
+            assert ma.get(key) == mb.get(key)
+
+
+class TestRasterHiveIdempotency:
+    """Window re-run + backfill (D13) and the flat-raster default pin
+    (issue #247 phase 5)."""
+
+    def _snapshot(self, root):
+        from pathlib import Path
+
+        out = {}
+        for p in Path(root).rglob("*"):
+            if p.is_file():
+                out[str(p.relative_to(root))] = p.read_bytes()
+        return out
+
+    def _one_granule_map(self, tmp_path, cfg, shard, href, dt, key, name):
+        grid = from_config(cfg)
+        sm = ShardMap(
+            grid.spatial_signature(),
+            [shard],
+            [[_entry("g", href, dt, key)]],
+            {"collection": "s2-test"},
+        )
+        path = str(tmp_path / name)
+        sm.to_json(path)
+        return path
+
+    def test_window_rerun_and_backfill(self, tmp_path, manifest):
+        from pathlib import Path
+
+        from zagg import hive
+
+        cfg, sm_path, shard, _data = manifest
+        cfg.output["store_layout"] = "hive"
+        cfg.output["windowing"] = {"schedule": "daily"}
+        store_path = cfg.output["store"]
+        t1_map = self._one_granule_map(
+            tmp_path, cfg, shard, str(tmp_path / "t1.tif"), T1, "dt-2", "t1only.json"
+        )
+        t0_map = self._one_granule_map(
+            tmp_path, cfg, shard, str(tmp_path / "t0.tif"), T0, "dt-1", "t0only.json"
+        )
+
+        # Full run: both daily windows land.
+        agg(cfg, catalog=sm_path, backend="local", max_workers=2)
+        leaf_a = hive.shard_leaf_path(store_path, shard, window="20260713")
+        leaf_b = hive.shard_leaf_path(store_path, shard, window="20260718")
+        before_a = self._snapshot(leaf_a)
+        manifest_bytes = Path(store_path, "morton_hive.json").read_bytes()
+
+        # Re-dispatch window B only: leaf B is replaced wholesale, sibling
+        # window A stays byte-untouched, the manifest is not rewritten.
+        stamp_b_before = hive.read_commit(leaf_b)
+        agg(cfg, catalog=t1_map, backend="local", max_workers=2)
+        assert self._snapshot(leaf_a) == before_a
+        stamp_b_after = hive.read_commit(leaf_b)
+        assert stamp_b_after["complete"] and stamp_b_after["window"] == "20260718"
+        assert stamp_b_after["time_range"] == stamp_b_before["time_range"]
+        assert Path(store_path, "morton_hive.json").read_bytes() == manifest_bytes
+
+        # Backfill into a FRESH store: start with the later window, then add
+        # the earlier one — a new leaf appears, the committed later leaf and
+        # the manifest stay byte-untouched (D13: no resize, no manifest touch).
+        cfg.output["store"] = str(tmp_path / "backfill.zarr")
+        store2 = cfg.output["store"]
+        agg(cfg, catalog=t1_map, backend="local", max_workers=2)
+        leaf_b2 = hive.shard_leaf_path(store2, shard, window="20260718")
+        before_b2 = self._snapshot(leaf_b2)
+        manifest2 = Path(store2, "morton_hive.json").read_bytes()
+
+        agg(cfg, catalog=t0_map, backend="local", max_workers=2)
+        leaf_a2 = hive.shard_leaf_path(store2, shard, window="20260713")
+        assert hive.read_commit(leaf_a2)["window"] == "20260713"  # new earlier leaf
+        assert self._snapshot(leaf_b2) == before_b2  # committed leaf untouched
+        assert Path(store2, "morton_hive.json").read_bytes() == manifest2
+        # The root summary now spans both windows (cache union, D15).
+        cov = hive.read_root_coverage(store2)
+        assert cov["time_range"] == [T0, T1]
+
+    def test_flat_pin_no_hive_objects(self, tmp_path, manifest):
+        # Explicit store_layout: flat (the fixture pin; since issue #253 the
+        # healpix default is hive) -> the flat (time, cells) store, with no
+        # hive artifacts anywhere in the tree: flat output is object-for-
+        # object what pre-#247 runs wrote (the flat write path is untouched;
+        # this pins the absence of new objects).
+        from pathlib import Path
+
+        cfg, sm_path, _shard, _data = manifest
+        summary = agg(cfg, catalog=sm_path, backend="local", max_workers=2)
+        assert summary["cells_with_data"] == 1
+        store = Path(cfg.output["store"])
+        grid = from_config(cfg)
+        assert sorted(p.name for p in store.iterdir()) == sorted(["zarr.json", grid.group_path])
+        names = {p.name for p in store.rglob("*")}
+        assert "morton_hive.json" not in names
+        assert "coverage.moc" not in names

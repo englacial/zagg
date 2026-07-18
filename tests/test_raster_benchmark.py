@@ -94,12 +94,13 @@ def test_dry_run_builds_shardmap_offline(tmp_path):
     assert df.iloc[0]["stage_fetch_s"] is None or str(df.iloc[0]["stage_fetch_s"]) == "nan"
 
 
-def test_pending_hive_target_blocked_on_237():
-    # The hive raster leg (espg directive on PR #261) waits in pending_targets
-    # until issue #237 lands upstream. This TRIPWIRE pins today's gate: the
-    # raster path still rejects hive (issue #239). When issue #237 merges and
-    # this stops raising, promote the pending target into "targets" (the
-    # harness already applies the store_layout override) and delete this test.
+def test_pending_hive_target_awaits_promotion():
+    # The hive raster leg (espg directive on PR #261) waits in pending_targets.
+    # The issue #239 gate this tripwire used to pin is GONE — raster + hive is
+    # legal since issue #247 — but the ratified #247 phasing runs the hive
+    # benchmark arm AFTER that PR, so the target stays pending here: the
+    # follow-up promotes it into "targets" (the harness already applies the
+    # store_layout override) and deletes this test.
     from zagg.config import load_config, validate_config
 
     manifest, base = rrb.load_targets(str(BENCH / "targets_raster_neon.json"))
@@ -108,8 +109,7 @@ def test_pending_hive_target_blocked_on_237():
     assert pend["config"] == manifest["targets"]["raster_s2_neon_2025"]["config"]
     cfg = load_config(str(base / pend["config"]))
     cfg.output["store_layout"] = "hive"
-    with pytest.raises(ValueError, match="issue #237"):
-        validate_config(cfg)
+    validate_config(cfg)  # the promotion path is open (issue #247)
     # pending_targets never joins the default dispatch set.
     assert "raster_s2_neon_2025_hive" not in manifest["targets"]
 
@@ -187,36 +187,21 @@ def test_run_target_dispatches_via_agg_and_records_summary(monkeypatch, tmp_path
 
 def test_run_target_applies_store_layout_override(tmp_path):
     # The harness's per-target store_layout override (the issue #237 hive-flip
-    # path) applies + re-validates the layout inside run_target itself. Flat is
-    # valid today, so the override rides end-to-end into the record; hive still
-    # trips today's gate (issue #239) through run_target -- proving the promotion
-    # path executes the override + re-validation, not just a manual validate.
+    # path) applies + re-validates the layout inside run_target itself. Both
+    # layouts are valid since issue #247, so each override rides end-to-end
+    # into the record — proving the promotion path executes the override +
+    # re-validation, not just a manual validate.
     import copy
 
     manifest, base = rrb.load_targets(str(BENCH / "targets_raster_neon.json"))
     ctx = {"timestamp": "t", "commit": "c", "ref": "v0.0.0", "event": "release"}
 
-    flat = copy.deepcopy(manifest)
-    flat["targets"]["raster_s2_neon_2025"]["store_layout"] = "flat"
-    run = rrb.run_target(
-        "raster_s2_neon_2025",
-        flat,
-        base,
-        store="s3://bucket/raster_s2_neon_2025.zarr",
-        region="us-west-2",
-        function_name="process-shard",
-        context=ctx,
-        dry_run=True,
-        artifacts_dir=str(tmp_path),
-    )
-    assert run["store_layout"] == "flat"
-
-    hive = copy.deepcopy(manifest)
-    hive["targets"]["raster_s2_neon_2025"]["store_layout"] = "hive"
-    with pytest.raises(ValueError, match="issue #237"):
-        rrb.run_target(
+    for layout in ("flat", "hive"):
+        over = copy.deepcopy(manifest)
+        over["targets"]["raster_s2_neon_2025"]["store_layout"] = layout
+        run = rrb.run_target(
             "raster_s2_neon_2025",
-            hive,
+            over,
             base,
             store="s3://bucket/raster_s2_neon_2025.zarr",
             region="us-west-2",
@@ -225,6 +210,7 @@ def test_run_target_applies_store_layout_override(tmp_path):
             dry_run=True,
             artifacts_dir=str(tmp_path),
         )
+        assert run["store_layout"] == layout
 
 
 def _record(commit="c0", target="raster_s2_neon_2025", event="release", **over):
