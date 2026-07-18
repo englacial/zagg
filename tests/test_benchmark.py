@@ -719,12 +719,25 @@ def test_every_live_shardmap_resolves_to_a_config():
 # --- provisional (PR-tree-only) handoff targets (issue #130) ---------------
 
 
-def test_merge_matrix_collapsed_to_single_hive_config():
-    # The issue #250 collapse (espg-approved restructure on PR #256): "run all"
-    # is exactly the one hive configuration; the retired 2x2 arms stay
-    # resolvable by explicit --target from provisional_targets.
+def test_merge_matrix_is_inline_sidecar_spill_ab():
+    # Issue #272 re-expands the #250 single-target collapse to the read-backend
+    # A/B on the shipping spill+disk path: "run all" is the two hive arms, inline
+    # (green) and sidecar (purple). The retired mask 2x2 stays resolvable by
+    # explicit --target from provisional_targets.
     manifest, base = run_benchmark.load_targets(str(BENCH / "targets.json"))
-    assert run_benchmark.all_target_names(manifest) == ["tdigest_healpix_o9_hive"]
+    assert run_benchmark.all_target_names(manifest) == [
+        "tdigest_healpix_o9_hive",
+        "tdigest_healpix_o9_hive_sidecar",
+    ]
+    # Both arms ship spill on the -disk worker; they differ only by read backend.
+    for name, backend in (
+        ("tdigest_healpix_o9_hive", "inline"),
+        ("tdigest_healpix_o9_hive_sidecar", "sidecar"),
+    ):
+        t = run_benchmark._resolve_target(manifest, name)
+        assert t["index_backend"] == backend
+        assert t["streaming_mode"] == "spill"
+        assert t["worker"] == {"memory": 4096, "extra_disk": True}
     for retired in (
         "tdigest_healpix_o9_inline_nomask",
         "tdigest_healpix_o9_sidecar_nomask",

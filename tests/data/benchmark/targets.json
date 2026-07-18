@@ -60,13 +60,24 @@
   },
   "targets": {
     "tdigest_healpix_o9_hive": {
-      "_comment": "The whole per-merge leg (issue #250 collapse): o9 t-digest, store_layout: hive, sharded, pinned densest shard, inline read path, no AOI mask. Still the write-path regression arm (object-count tripwire hard-fails on a sharded-write bypass -- issue #215). Issue #272: this leg now measures the SPILL path on the disk-provisioned worker -- streaming_mode: spill + worker {memory 4096, extra_disk true} routes the dispatch to process-shard-4096-disk (6144 MB /tmp), and the ephemeral /tmp cost is billed into cost_per_shard_usd (bench_metrics). The merge path is not measured (it times out on the heavy shards anyway); this is a config swap, not a merge-vs-spill A/B.",
+      "_comment": "Per-merge leg, INLINE arm (green) of the read-backend A/B (issue #272, re-expanding the #193/#202 inline-vs-sidecar matrix that #250 collapsed). o9 t-digest, store_layout: hive, pinned densest shard, no AOI mask. Ships SPILL on the disk worker (what production runs): streaming_mode: spill + worker {memory 4096, extra_disk true} -> process-shard-4096-disk (6144 MB /tmp), ephemeral /tmp cost billed into cost_per_shard_usd. Still the write-path regression arm (object-count tripwire, issue #215). Spill on this light shard is within Lambda noise of merge (+~3% wall / <5% cost) but is what ships -- it's a rescue on the heavy shards (fleet A/B on #272: merge times out at 148g, spill completes; 19% faster/cheaper at 120g).",
       "config": "configs/atl03_tdigest_healpix_o9_hive.yaml",
       "shardmap": "healpix_o9",
       "aggregator": "tdigest",
       "grid_type": "healpix",
       "grid_size": "o9",
       "index_backend": "inline",
+      "streaming_mode": "spill",
+      "worker": {"memory": 4096, "extra_disk": true}
+    },
+    "tdigest_healpix_o9_hive_sidecar": {
+      "_comment": "Per-merge leg, SIDECAR arm (purple) of the read-backend A/B (issue #272). Identical to the inline arm except index_backend: sidecar -- the precomputed chunk-map manifest fetch. Fleet A/B (#272): sidecar beat inline everywhere (NEON + both heavy shards), ~8-15% faster/cheaper at equal memory, so this is the line to watch. Both arms plot on one panel per figure: inline green, sidecar purple.",
+      "config": "configs/atl03_tdigest_healpix_o9_hive.yaml",
+      "shardmap": "healpix_o9",
+      "aggregator": "tdigest",
+      "grid_type": "healpix",
+      "grid_size": "o9",
+      "index_backend": "sidecar",
       "streaming_mode": "spill",
       "worker": {"memory": 4096, "extra_disk": true}
     }
