@@ -297,6 +297,17 @@ class TestRasterSetupMode:
         assert resp["statusCode"] == 500
         assert "times_us" in json.loads(resp["body"])["error"]
 
+    def test_setup_dense_layout_400(self, handler_mod, tmp_path):
+        # Symmetry with the worker (test_dense_layout_400): a dense-layout
+        # raster config gets the worker's clean 400 instead of an opaque
+        # from_config 500 (issue #264).
+        store_path = tmp_path / "dense.zarr"
+        event = self._setup_event(store_path, self.TIMES)
+        event["config"] = _config_dict(store_path, layout="dense")
+        resp = handler_mod._handle_setup(event)
+        assert resp["statusCode"] == 400
+        assert "fullsphere" in json.loads(resp["body"])["error"]
+
     def test_setup_rerun_overwrite_semantics(self, handler_mod, tmp_path):
         # Local-path parity (test_overwrite_and_rerun): an identical rerun is
         # idempotent; a CHANGED time index refuses without overwrite=True and
