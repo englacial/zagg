@@ -3278,7 +3278,17 @@ def _invoke_lambda_raster_setup(
         raise RuntimeError(f"Lambda raster setup failed: {payload}")
     result = json.loads(payload)
     if result.get("statusCode") != 200:
-        raise RuntimeError(f"Lambda raster setup error: {result.get('body')}")
+        # A pre-#264 function reaches the flat branch and calls
+        # grid.emit_template on the raster config, which can raise (a raster
+        # template has no point-path shape) → 500. A 500 is indistinguishable
+        # from a genuine failure here, so surface the redeploy hint alongside
+        # the body rather than swallowing the stale-deployment case.
+        raise RuntimeError(
+            f"Lambda raster setup error: {result.get('body')} — if this is a "
+            f"pre-#264 deployment, its flat point-path branch may have raised "
+            f"on the raster config; redeploy the function, then rerun with "
+            f"overwrite to replace anything it wrote"
+        )
     try:
         body = json.loads(result.get("body") or "{}")
     except (TypeError, ValueError):
