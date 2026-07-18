@@ -72,6 +72,15 @@ def from_config(
         child_order = get_child_order(config)
         sharded = get_sharded(config, default=True)
         chunk_inner = grid_cfg.get("chunk_inner")
+        # Raster (per-timestep (time, cells) slab writes) never shards — a
+        # permanent exclusion (issue #247, guarded in config._validate_raster):
+        # a ShardingCodec object would be read-modify-written once per timestep.
+        # So the #259 derivation below must not engage for raster: an omitted
+        # chunk_inner has to stay K==1 / unsharded (its pre-#259 behavior), else
+        # the derived inner chunk shards the grid and the raster template emit
+        # rejects it (raster.py). The config's `sharded: true` guard fires only on
+        # an *explicit* flag; the derivation is downstream of it, so gate here.
+        is_raster = (config.data_source or {}).get("reader") == "raster"
         # issue #259: with sharding on (the default) but chunk_inner omitted, the
         # grid used to fall to chunk_order == parent_order — K==1 — and silently
         # disable sharding, so a config that only set `sharded: true` still paid a
@@ -85,7 +94,7 @@ def from_config(
         # Gate on fullsphere (the sole supported geometry since issue #88 removed
         # dense) so any other layout falls straight through to the constructor's
         # "Unknown layout" error rather than deriving first.
-        if chunk_inner is None and sharded and layout == "fullsphere":
+        if chunk_inner is None and sharded and layout == "fullsphere" and not is_raster:
             derived = child_order - 6
             if derived > resolved_parent:
                 chunk_inner = derived

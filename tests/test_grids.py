@@ -458,6 +458,21 @@ class TestFromConfig:
         with pytest.raises(ValueError, match="Unknown layout"):
             from_config(cfg)
 
+    def test_chunk_inner_not_derived_for_raster(self):
+        # issue #259 regression: raster (per-timestep (time, cells) slab writes)
+        # never shards — a permanent exclusion (issue #247). So the 64x64
+        # derivation must NOT engage for a raster config, even though it omits
+        # chunk_inner and the orders would otherwise derive one (parent 11 /
+        # child 19 -> 13 > 11): the grid must stay K==1 / unsharded, or the
+        # derived inner chunk shards it and the raster template emit rejects it.
+        cfg = default_config("sentinel2_l2a")
+        assert (cfg.data_source or {}).get("reader") == "raster"
+        assert cfg.output.get("grid", {}).get("chunk_inner") is None
+        g = from_config(cfg)
+        assert g.chunk_order == g.parent_order  # not derived to 13
+        assert g.chunks_per_shard == 1
+        assert g.sharded is False
+
 
 class TestBackcompatWrapper:
     """xdggs_zarr_template (the public API) must keep producing the same
