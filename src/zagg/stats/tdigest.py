@@ -85,22 +85,14 @@ __all__ = [
 _DEFAULT_DELTA = 512
 
 
-def _k1_scale(q: float, delta: float) -> float:
-    """Dunning's k1 scale function: k(q) = delta * (arcsin(2q - 1)/pi + 1/2).
+def _k1_scale_array(q: np.ndarray, delta: float) -> np.ndarray:
+    """Dunning's k1 scale ``k(q) = delta * (arcsin(2q - 1)/pi + 1/2)``, vectorized.
 
-    Maps the cumulative rank fraction q ∈ [0, 1] onto [0, delta].  Its
+    Maps each cumulative rank fraction ``q ∈ [0, 1]`` onto ``[0, delta]``.  The
     derivative is largest at the tails (q → 0 or 1) and smallest at the median,
     so bounding each centroid to span ≤ 1 unit of k yields narrow, high-
     resolution centroids in the tails and wide centroids in the middle — the
-    defining t-digest property.  A digest holds ~delta centroids regardless of
-    the observation count, and is loss-free while the count stays ≤ delta.
-    """
-    qc = min(1.0, max(0.0, q))
-    return delta * (float(np.arcsin(2.0 * qc - 1.0)) / np.pi + 0.5)
-
-
-def _k1_scale_array(q: np.ndarray, delta: float) -> np.ndarray:
-    """Vectorized :func:`_k1_scale` over an array of rank fractions.
+    defining t-digest property.
 
     Evaluating the ``arcsin`` for every rank in **one** ufunc call is the whole
     point: the scalar per-observation ``float(np.arcsin(...))`` in the old
@@ -348,50 +340,15 @@ def merge_tdigests(
         else None
     )
 
-    delta_f = float(delta)
-    n_total = float(combined[:, 1].sum())
+    # Re-compress the concatenated sub-centroids under the same k1 budget as
+    # the build path — the weighted variant of the greedy rule (issue #279).
+    out_means, out_weights, starts = _compress(combined[:, 0], combined[:, 1], float(delta))
 
-    means: list[float] = []
-    weights: list[float] = []
-    starts: list[int] = []
-
-    cur_mean = float(combined[0, 0])
-    cur_weight = float(combined[0, 1])
-    cur_start = 0
-    # Cumulative weight before the current centroid's first sub-centroid, and
-    # the k1 scale value at that left edge. A sub-centroid merges in while the
-    # combined centroid still spans ≤ 1 unit of the k1 scale.
-    cum_left = 0.0
-    k_left = _k1_scale(0.0, delta_f)
-
-    for i in range(1, len(combined)):
-        v_mean = float(combined[i, 0])
-        v_weight = float(combined[i, 1])
-        k_right = _k1_scale((cum_left + cur_weight + v_weight) / n_total, delta_f)
-        if k_right - k_left <= 1.0:
-            # Weighted mean update.
-            total = cur_weight + v_weight
-            cur_mean = (cur_mean * cur_weight + v_mean * v_weight) / total
-            cur_weight = total
-        else:
-            means.append(cur_mean)
-            weights.append(cur_weight)
-            starts.append(cur_start)
-            cum_left += cur_weight
-            k_left = _k1_scale(cum_left / n_total, delta_f)
-            cur_mean = v_mean
-            cur_weight = v_weight
-            cur_start = i
-
-    means.append(cur_mean)
-    weights.append(cur_weight)
-    starts.append(cur_start)
-
-    out = np.empty((len(means), 2), dtype=np.float32)
-    out[:, 0] = means
-    out[:, 1] = weights
+    out = np.empty((len(out_means), 2), dtype=np.float32)
+    out[:, 0] = out_means
+    out[:, 1] = out_weights
     if combined_locs is not None:
-        return out, _centroid_ancestors(combined_locs, starts, len(combined))
+        return out, _centroid_ancestors(combined_locs, starts.tolist(), len(combined))
     return out
 
 
