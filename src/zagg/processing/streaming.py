@@ -39,8 +39,13 @@ from zagg.config import (
 )
 from zagg.stats.tdigest import _DEFAULT_DELTA, build_tdigest, merge_tdigests
 
-#: The one ragged reducer with a merge law wired up.
+#: Ragged reducers with a cross-block merge law wired up. ``build_tdigest`` folds
+#: k-way (order-independent) on the spill path; ``build_tdigest_pairwise`` folds
+#: pairwise (order-dependent). Both share the same build and both merge pairwise
+#: on the merge-mode path (issue #279).
 _TDIGEST_FUNCTION = "zagg.stats.tdigest.build_tdigest"
+_TDIGEST_PAIRWISE_FUNCTION = "zagg.stats.tdigest.build_tdigest_pairwise"
+_TDIGEST_FUNCTIONS = (_TDIGEST_FUNCTION, _TDIGEST_PAIRWISE_FUNCTION)
 
 
 def get_streaming(config: PipelineConfig) -> dict | None:
@@ -110,10 +115,10 @@ def validate_streaming(config: PipelineConfig) -> None:
                     f"field '{name}': located ragged fields (location: "
                     f"{sig['location']!r}) cannot stream yet"
                 )
-            elif meta.get("function") != _TDIGEST_FUNCTION:
+            elif meta.get("function") not in _TDIGEST_FUNCTIONS:
                 problems.append(
                     f"field '{name}': ragged function {meta.get('function')!r} has no "
-                    f"merge law (only {_TDIGEST_FUNCTION})"
+                    f"merge law (only {' or '.join(_TDIGEST_FUNCTIONS)})"
                 )
             elif tuple(sig["inner_shape"]) != (2,):
                 # The pooled path validates payload shape per cell via
