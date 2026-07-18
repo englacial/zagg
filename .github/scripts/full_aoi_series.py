@@ -111,6 +111,11 @@ FULL_AOI_COLUMNS = [
     # backstop, issue #252). The SUMMED total (cost_usd + setup + finalize)
     # is a display-side derivation; cost_usd itself stays worker GB-seconds.
     "finalize_cost_usd",
+    # Time-to-first-consumer (issue #272): the earliest shard's result-ready
+    # post time (min over shards; total_wall_s is the last/all-consumable). A
+    # table-only column -- the plots keep wall + billed cost. Null on rows
+    # recorded before it (or a run with no completed shard).
+    "first_consumer_s",
 ]
 
 # run-record write_throughput key -> flat column name.
