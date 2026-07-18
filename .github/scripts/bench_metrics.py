@@ -21,6 +21,31 @@ from zagg.dispatch import LAMBDA_MEMORY_GB, LAMBDA_PRICE_PER_GB_SEC
 from zagg.grids.healpix import HealpixGrid
 from zagg.grids.rectilinear import RectilinearGrid
 
+# Ephemeral (/tmp) storage billing for the spill arm (issue #272). The spill
+# streaming mode runs on a disk-provisioned worker variant (issue #235/#258 --
+# ``process-shard-4096-disk``, 6144 MB /tmp); AWS bills /tmp above the 512 MB
+# free tier at a flat $/GB-second (us-west-2 == us-east-1, AWS-published), which
+# the compute GB-s model above does NOT include. The merge arm runs on the base
+# 512 MB /tmp function, so its ephemeral cost is $0 (all free-tier). Cost per
+# shard = compute (runtime * memory_gb * price) + ephemeral (runtime *
+# billable_gb * ephemeral_price).
+LAMBDA_EPHEMERAL_PRICE_PER_GB_SEC = 0.0000000309
+FREE_EPHEMERAL_MB = 512  # the always-free /tmp allotment; only the excess bills
+
+
+def ephemeral_cost_usd(runtime_s, tmp_mb) -> float | None:
+    """Ephemeral-storage dollars for one shard's ``runtime_s`` at ``tmp_mb`` /tmp.
+
+    ``None`` when either input is missing. $0 when ``tmp_mb`` is at/below the
+    512 MB free tier (the merge arm / any non-disk worker). Only the excess over
+    the free tier bills, at :data:`LAMBDA_EPHEMERAL_PRICE_PER_GB_SEC`.
+    """
+    if runtime_s is None or tmp_mb is None:
+        return None
+    billable_gb = max(0.0, (tmp_mb - FREE_EPHEMERAL_MB) / 1024.0)
+    return runtime_s * billable_gb * LAMBDA_EPHEMERAL_PRICE_PER_GB_SEC
+
+
 # Mean Earth radius (IUGG); a HEALPix shard is the sphere area split evenly across
 # the 12*4^parent_order cells at the shard (parent) order.
 EARTH_RADIUS_KM = 6371.0088
@@ -103,6 +128,14 @@ RECORD_COLUMNS = [
     "phase_index_s",
     "phase_aggregate_s",
     "phase_write_s",
+    # Streaming-mode axis (issue #272): "merge" (default) | "spill". The spill
+    # arm dispatches to a disk-provisioned worker; ``tmp_mb`` is its configured
+    # /tmp, and ``ephemeral_cost_usd`` is the /tmp billing folded into
+    # ``cost_per_shard_usd`` (0 on the 512 MB merge arm). Null on rows recorded
+    # before the axis (renderers read them as merge / no disk).
+    "streaming_mode",
+    "tmp_mb",
+    "ephemeral_cost_usd",
 ]
 
 # summary["worker_phase_max"] key -> series column (issues #250/#256). A phase
@@ -187,7 +220,15 @@ def build_record(
     the object columns null.
     """
     area = shard_area_km2(grid)
-    cost = summary.get("estimated_cost_usd")
+    # Compute cost from the worker's GB-s model; add the /tmp ephemeral term
+    # (issue #272) so cost_per_shard_usd is the TRUE bill on the disk-provisioned
+    # spill arm. tmp_mb comes from the target's worker block via run_benchmark;
+    # absent (merge arm / legacy) -> eph is None/0 and cost is compute-only.
+    compute_cost = summary.get("estimated_cost_usd")
+    eph = ephemeral_cost_usd(_runtime_s(summary), context.get("tmp_mb"))
+    cost = compute_cost
+    if compute_cost is not None:
+        cost = compute_cost + (eph or 0.0)
     cost_per_100km2 = None
     if cost is not None and area > 0:
         cost_per_100km2 = cost * 100.0 / area
@@ -245,6 +286,13 @@ def build_record(
     record["objects_expected"] = o.get("objects_expected")
     record["objects_per_shard"] = o.get("objects_per_shard")
     record["objects_mismatch"] = o.get("objects_mismatch")
+    # Streaming-mode + ephemeral axis (issue #272): threaded from the target by
+    # run_benchmark. ``ephemeral_cost_usd`` is the /tmp component already folded
+    # into ``cost_per_shard_usd`` above -- carried separately so the merge-vs-
+    # spill cost delta is legible in the series.
+    record["streaming_mode"] = context.get("streaming_mode")
+    record["tmp_mb"] = context.get("tmp_mb")
+    record["ephemeral_cost_usd"] = eph
     return record
 
 

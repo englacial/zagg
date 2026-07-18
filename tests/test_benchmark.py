@@ -122,6 +122,47 @@ def test_build_record_cost_per_100km2():
     }
 
 
+def test_ephemeral_cost_usd():
+    # issue #272: only /tmp above the 512 MB free tier bills, at the AWS rate.
+    price = bench_metrics.LAMBDA_EPHEMERAL_PRICE_PER_GB_SEC
+    # 6144 MB /tmp (the -disk spill worker) -> 5.5 GB billable.
+    assert bench_metrics.ephemeral_cost_usd(200.0, 6144) == pytest.approx(200.0 * 5.5 * price)
+    # 512 MB (merge arm / free tier) -> $0; below the tier clamps to 0, not negative.
+    assert bench_metrics.ephemeral_cost_usd(200.0, 512) == 0.0
+    assert bench_metrics.ephemeral_cost_usd(200.0, 128) == 0.0
+    # Missing inputs -> None (legacy rows).
+    assert bench_metrics.ephemeral_cost_usd(None, 6144) is None
+    assert bench_metrics.ephemeral_cost_usd(200.0, None) is None
+
+
+def test_build_record_spill_folds_ephemeral_into_cost():
+    # issue #272: the spill arm's disk /tmp billing is added to cost_per_shard_usd
+    # (and cost_per_100km2), and surfaced separately as ephemeral_cost_usd.
+    g = HealpixGrid(parent_order=11, child_order=19)
+    rec = bench_metrics.build_record(
+        _summary(),  # estimated_cost_usd 0.00547, runtime 205 s (worker_max_s)
+        grid=g,
+        context={"target": "t", "streaming_mode": "spill", "tmp_mb": 6144},
+    )
+    eph = 205.0 * 5.5 * bench_metrics.LAMBDA_EPHEMERAL_PRICE_PER_GB_SEC
+    assert rec["ephemeral_cost_usd"] == pytest.approx(eph)
+    assert rec["cost_per_shard_usd"] == pytest.approx(0.00547 + eph)
+    area = bench_metrics.shard_area_km2(g)
+    assert rec["cost_per_100km2_usd"] == pytest.approx((0.00547 + eph) * 100.0 / area)
+    assert rec["streaming_mode"] == "spill"
+    assert rec["tmp_mb"] == 6144
+
+
+def test_build_record_merge_arm_no_ephemeral():
+    # No tmp_mb (merge arm / legacy row): cost stays compute-only, eph null.
+    g = HealpixGrid(parent_order=11, child_order=19)
+    rec = bench_metrics.build_record(_summary(), grid=g, context={"target": "t"})
+    assert rec["cost_per_shard_usd"] == 0.00547
+    assert rec["ephemeral_cost_usd"] is None
+    assert rec["tmp_mb"] is None
+    assert rec["streaming_mode"] is None
+
+
 def test_build_record_max_memory_null_safe():
     # An empty/legacy summary leaves max_memory_mb null so old rows degrade.
     g = HealpixGrid(parent_order=11, child_order=19)
@@ -139,9 +180,9 @@ def test_codec_column_is_last_and_threaded(monkeypatch):
     cols = bench_metrics.RECORD_COLUMNS
     assert cols.index("codec") < cols.index("read") < cols.index("total_wall_s")
     # The wall breakdown (#180), read backend (#193), object counts (#240),
-    # store layout (#240 phase 4) and worker phase split (#250/#256) appended
-    # in that order.
-    assert cols[-12:] == [
+    # store layout (#240 phase 4), worker phase split (#250/#256) and the
+    # streaming-mode/ephemeral axis (#272) appended in that order.
+    assert cols[-15:] == [
         "total_wall_s",
         "setup_s",
         "fanout_s",
@@ -154,6 +195,9 @@ def test_codec_column_is_last_and_threaded(monkeypatch):
         "phase_index_s",
         "phase_aggregate_s",
         "phase_write_s",
+        "streaming_mode",
+        "tmp_mb",
+        "ephemeral_cost_usd",
     ]
     g = HealpixGrid(parent_order=11, child_order=19)
     rec = bench_metrics.build_record(_summary(), grid=g, context={"codec": "sharded"})
@@ -1777,9 +1821,9 @@ def _objects_payload(mismatch=None):
 def test_objects_columns_are_last_and_threaded():
     # Stable-schema rule: new columns append LAST (issue #240; store_layout
     # appended after the object counts in phase 4; the #250/#256 phase split
-    # appended after those).
+    # then the #272 streaming-mode/ephemeral axis appended after those).
     cols = bench_metrics.RECORD_COLUMNS
-    assert cols[-7:-4] == ["objects_total", "objects_expected", "store_layout"]
+    assert cols[-10:-7] == ["objects_total", "objects_expected", "store_layout"]
     g = HealpixGrid(parent_order=11, child_order=19)
     rec = bench_metrics.build_record(_summary(), grid=g, context={}, objects=_objects_payload())
     assert rec["objects_total"] == 10
