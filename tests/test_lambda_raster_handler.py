@@ -288,6 +288,15 @@ class TestRasterSetupMode:
         assert resp["statusCode"] == 500
         assert "times_us" in json.loads(resp["body"])["error"]
 
+    def test_setup_empty_times_us_500(self, handler_mod, tmp_path):
+        # An empty times_us would write a degenerate zero-timestep template
+        # (0-length time axis, unusable). The runner refuses an empty catalog
+        # pre-dispatch; the invoke-only writer must too (issue #264).
+        event = self._setup_event(tmp_path / "empty.zarr", [])
+        resp = handler_mod._handle_setup(event)
+        assert resp["statusCode"] == 500
+        assert "times_us" in json.loads(resp["body"])["error"]
+
     def test_setup_rerun_overwrite_semantics(self, handler_mod, tmp_path):
         # Local-path parity (test_overwrite_and_rerun): an identical rerun is
         # idempotent; a CHANGED time index refuses without overwrite=True and
