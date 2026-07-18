@@ -5,6 +5,14 @@
 <body>
 <h1>zagg Lambda benchmark</h1>
 <p>arm64 · 4 GB · o9 · hive · tdigest · NEON SERC AOP box · per release (full AOI) and per merge (single densest shard).</p>
+<h2>Per-release benchmarks (full-AOI NEON)</h2>
+<p>The whole AOP_NEON box, every shard, once per release tag — the point (tdigest, hive, AOI mask) and raster (Sentinel-2 2025) legs.</p>
+<h3>Summary — total billed cost (lambda-s ⇔ USD) and wall</h3>
+<img src="full_aoi_summary.png" alt="full_aoi_summary">
+<h3>Point pipeline — per-phase seconds (max shard)</h3>
+<img src="full_aoi_point_phases.png" alt="full_aoi_point_phases">
+<h3>Store objects (issue #240 tripwire)</h3>
+<img src="full_aoi_objects.png" alt="full_aoi_objects">
 <hr>
 <h2>Per commit to main (single densest shard)</h2>
 <p>One configuration — o9, hive, sharded, tdigest, no AOI mask — isolating code deltas from data drift (merge sha on the x-axis).</p>
