@@ -98,6 +98,22 @@ class TestRoundTrip:
             block.append(np.zeros(4, np.uint64), np.arange(4, dtype=np.uint64), bad)
         block.close()
 
+    def test_row_misalignment_raises_before_writing(self, tmp_path):
+        block = SpillBlock(tmp_dir=str(tmp_path))
+        block.append(np.zeros(3, np.uint64), np.arange(3, dtype=np.uint64), _cols(3))
+        # A column longer than cells must fail loudly, not orphan bytes.
+        bad = _cols(5)
+        with pytest.raises(ValueError, match="row-aligned"):
+            block.append(np.zeros(3, np.uint64), np.arange(3, dtype=np.uint64), bad)
+        # part_ids length disagreeing is caught the same way.
+        with pytest.raises(ValueError, match="row-aligned"):
+            block.append(np.zeros(2, np.uint64), np.arange(3, dtype=np.uint64), _cols(3))
+        # Stream is intact: the first append round-trips unchanged.
+        got_cells, _ = block.read_partition(0)
+        np.testing.assert_array_equal(got_cells, [0, 1, 2])
+        assert block.n_rows(0) == 3
+        block.close()
+
     def test_empty_append_is_noop(self, tmp_path):
         block = SpillBlock(tmp_dir=str(tmp_path))
         cols = _cols(3)

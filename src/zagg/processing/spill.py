@@ -225,7 +225,10 @@ class SpillBlock:
                     f"{self._schema} (cells {self._cell_dtype}), got {got} "
                     f"(cells {np.dtype(cells.dtype)})"
                 )
-        if len(cells) == 0:
+        n = len(cells)
+        if len(part_ids) != n or any(len(arr) != n for arr in col_dict.values()):
+            raise ValueError("spill append: part_ids/cells/columns must be row-aligned")
+        if n == 0:
             return 0
         # Segment per maximal run of one partition id. No monotonicity is
         # assumed: a partition appearing in several runs simply gets several
