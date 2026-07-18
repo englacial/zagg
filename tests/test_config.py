@@ -2270,3 +2270,103 @@ class TestConsolidateMetadataFlag:
         cfg.output = {**cfg.output, "consolidate_metadata": "yes"}
         with pytest.raises(ValueError, match="output.consolidate_metadata must be a boolean"):
             validate_config(cfg)
+
+
+# ---------------------------------------------------------------------------
+# Worker-size selection block (issue #235)
+# ---------------------------------------------------------------------------
+
+
+class TestWorkerBlock:
+    """Issue #235: the optional top-level ``worker:`` block selects one of the
+    pre-provisioned Lambda size variants (memory in {2048, 4096, 8192},
+    ``extra_disk`` for the ``-disk`` /tmp twin). Invalid values fail at config
+    load — a typo would otherwise surface as a per-shard ResourceNotFound
+    after the Lambda fan-out starts."""
+
+    def test_absent_block_is_none_and_valid(self, atl06_config):
+        # Back-compat: every existing config has no worker key.
+        assert atl06_config.worker is None
+        validate_config(atl06_config)
+
+    def test_all_provisioned_memories_accepted(self, atl06_config):
+        for memory in (2048, 4096, 8192):
+            for extra_disk in (True, False):
+                atl06_config.worker = {"memory": memory, "extra_disk": extra_disk}
+                validate_config(atl06_config)
+
+    def test_extra_disk_optional(self, atl06_config):
+        atl06_config.worker = {"memory": 2048}
+        validate_config(atl06_config)
+
+    def test_loads_from_yaml_top_level(self, atl06_yaml, tmp_path):
+        # The block is a top-level section alongside pipeline:, not nested
+        # under output: (thread decision).
+        text = open(atl06_yaml).read() + "\nworker:\n  memory: 2048\n  extra_disk: true\n"
+        p = tmp_path / "atl06_worker.yaml"
+        p.write_text(text)
+        cfg = load_config(str(p))
+        assert cfg.worker == {"memory": 2048, "extra_disk": True}
+
+    def test_dict_roundtrip_carries_worker(self, atl06_config):
+        atl06_config.worker = {"memory": 8192, "extra_disk": False}
+        restored = load_config_from_dict(asdict(atl06_config))
+        assert restored.worker == atl06_config.worker
+
+    def test_unprovisioned_memory_rejected_naming_allowed_set(self, atl06_config):
+        atl06_config.worker = {"memory": 1024}
+        with pytest.raises(ValueError, match=r"worker\.memory must be one of \[2048, 4096, 8192\]"):
+            validate_config(atl06_config)
+
+    def test_missing_memory_rejected(self, atl06_config):
+        atl06_config.worker = {"extra_disk": True}
+        with pytest.raises(ValueError, match=r"worker\.memory must be one of"):
+            validate_config(atl06_config)
+
+    def test_string_memory_rejected(self, atl06_config):
+        # "4096" (a string) is not the provisioned int — the suffix must be
+        # built from a validated int, not whatever str() yields.
+        atl06_config.worker = {"memory": "4096"}
+        with pytest.raises(ValueError, match=r"worker\.memory must be one of"):
+            validate_config(atl06_config)
+
+    def test_bool_memory_rejected(self, atl06_config):
+        atl06_config.worker = {"memory": True}
+        with pytest.raises(ValueError, match=r"worker\.memory must be one of"):
+            validate_config(atl06_config)
+
+    def test_non_mapping_block_rejected(self, atl06_config):
+        atl06_config.worker = 4096
+        with pytest.raises(ValueError, match="worker must be a mapping"):
+            validate_config(atl06_config)
+
+    def test_unknown_key_rejected(self, atl06_config):
+        # The plan's earlier extra_tmp spelling must not be silently ignored.
+        atl06_config.worker = {"memory": 4096, "extra_tmp": True}
+        with pytest.raises(ValueError, match=r"Unknown worker keys: \['extra_tmp'\]"):
+            validate_config(atl06_config)
+
+    def test_non_bool_extra_disk_rejected(self, atl06_config):
+        atl06_config.worker = {"memory": 4096, "extra_disk": "yes"}
+        with pytest.raises(ValueError, match=r"worker\.extra_disk must be a boolean"):
+            validate_config(atl06_config)
+
+    def test_validated_on_temporal_pipeline_too(self):
+        # The block is validated before the pipeline-kind branch, so a bad
+        # value fails on temporal configs as well (they fan out on Lambda).
+        cfg = PipelineConfig(
+            aggregation={
+                "variables": {
+                    "v": {
+                        "variable": "PRECT",
+                        "collection": "c",
+                        "spatial_func": "mean",
+                        "temporal_reducer": "sum",
+                    }
+                }
+            },
+            pipeline={"type": "temporal"},
+            worker={"memory": 512},
+        )
+        with pytest.raises(ValueError, match=r"worker\.memory must be one of"):
+            validate_config(cfg)

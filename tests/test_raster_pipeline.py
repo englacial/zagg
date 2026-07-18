@@ -11,6 +11,7 @@ import pytest
 from pyproj import CRS, Transformer
 from test_raster import ORIGIN, RES, TRANSFORM, UTM18, _index_raster, _write_tiff
 from zarr import open_array
+from zarr.errors import ContainsGroupError
 from zarr.storage import MemoryStore
 
 from zagg.config import get_raster_bands, load_config_from_dict, validate_config
@@ -21,6 +22,7 @@ from zagg.processing.raster import (
     _shard_workers,
     _write_buffer,
     emit_raster_template,
+    new_stage_stats,
     process_raster_shard,
     raster_group_spec,
     raster_time_index,
@@ -87,10 +89,172 @@ class TestRasterConfigValidation:
         with pytest.raises(ValueError, match="requires a string 'dtype'"):
             validate_config(_raster_config(bands={"red": {"asset": "red"}}))
 
-    def test_sharded_rejected(self):
+    def test_sharded_rejected_permanently(self):
+        # Espg-ratified on issue #247: sharded raster output is a PERMANENT
+        # exclusion (per-timestep slab streaming would read-modify-write the
+        # ShardingCodec object), not a deferral — the message says why.
         grid = {"type": "healpix", "parent_order": 10, "child_order": 16, "sharded": True}
-        with pytest.raises(ValueError, match="sharded"):
+        with pytest.raises(ValueError, match="read-modify-write"):
             validate_config(_raster_config(grid=grid))
+
+    def test_hive_store_layout_validates(self):
+        # Issue #247: raster + hive is legal (the issue #239 stopgap is gone).
+        cfg = _raster_config()
+        cfg.output["store_layout"] = "hive"
+        validate_config(cfg)
+
+    def test_hive_plus_sharded_rejected(self):
+        grid = {"type": "healpix", "parent_order": 10, "child_order": 16, "sharded": True}
+        cfg = _raster_config(grid=grid)
+        cfg.output["store_layout"] = "hive"
+        with pytest.raises(ValueError, match="read-modify-write"):
+            validate_config(cfg)
+
+    def test_coverage_moc_validates_on_hive(self):
+        cfg = _raster_config()
+        cfg.output["store_layout"] = "hive"
+        cfg.output["coverage_moc"] = True
+        validate_config(cfg)
+
+    def test_coverage_moc_rejected_on_flat(self):
+        # The shared check (issue #200 posture): an explicit true without the
+        # hive layout is a config mistake, not a no-op.
+        cfg = _raster_config()
+        cfg.output["store_layout"] = "flat"  # explicit: healpix defaults hive (issue #253)
+        cfg.output["coverage_moc"] = True
+        with pytest.raises(ValueError, match="store_layout: hive"):
+            validate_config(cfg)
+
+    def test_hive_consolidate_metadata_rejected(self):
+        # Issue #247: raster now routes through the shared store-layout check,
+        # so hive + consolidate_metadata: true hits the "no store-root zarr
+        # hierarchy" rejection (D5/D12) just like the point path.
+        cfg = _raster_config()
+        cfg.output["store_layout"] = "hive"
+        cfg.output["consolidate_metadata"] = True
+        with pytest.raises(ValueError, match="no store-root zarr hierarchy"):
+            validate_config(cfg)
+
+    def test_coverage_moc_defaults_on_for_hive(self):
+        # get_coverage_moc defaults ON for raster+hive (O9 root coverage) and
+        # OFF for raster flat — the shared default resolution now covers raster.
+        from zagg.config import get_coverage_moc
+
+        hive = _raster_config()
+        hive.output["store_layout"] = "hive"
+        assert get_coverage_moc(hive) is True
+
+        flat = _raster_config()
+        flat.output["store_layout"] = "flat"  # explicit: healpix defaults hive (issue #253)
+        assert get_coverage_moc(flat) is False
+
+    def test_windowing_validates_and_normalizes(self):
+        # Issue #247 (ratified): raster window membership is the acquisition's
+        # STAC datetime — time_field is optional and the manifest records the
+        # resolved field plus the fixed ISO-instant encoding.
+        from zagg.config import get_windowing
+
+        cfg = _raster_config()
+        cfg.output["store_layout"] = "hive"
+        cfg.output["windowing"] = {"schedule": "yearly"}
+        validate_config(cfg)
+        assert get_windowing(cfg) == {
+            "schedule": "yearly",
+            "time_field": "datetime",
+            "epoch": "1970-01-01T00:00:00+00:00",
+            "scale": "utc",
+            "units": "seconds",
+            "windows": None,
+        }
+
+    def test_windowing_explicit_time_field_datetime_accepted(self):
+        cfg = _raster_config()
+        cfg.output["store_layout"] = "hive"
+        cfg.output["windowing"] = {"schedule": "yearly", "time_field": "datetime"}
+        validate_config(cfg)
+
+    def test_windowing_other_time_field_rejected(self):
+        cfg = _raster_config()
+        cfg.output["store_layout"] = "hive"
+        cfg.output["windowing"] = {"schedule": "yearly", "time_field": "delta_time"}
+        with pytest.raises(ValueError, match="STAC"):
+            validate_config(cfg)
+
+    def test_windowing_conversion_knobs_rejected(self):
+        # epoch/scale/units describe a dataset-unit time_field conversion;
+        # STAC datetimes are already ISO-8601 UTC — nothing to configure.
+        for knob, value in (("epoch", "2018-01-01"), ("scale", "gps"), ("units", "days")):
+            cfg = _raster_config()
+            cfg.output["store_layout"] = "hive"
+            cfg.output["windowing"] = {"schedule": "yearly", knob: value}
+            with pytest.raises(ValueError, match=f"output.windowing.{knob}"):
+                validate_config(cfg)
+
+    def test_windowing_requires_hive_layout(self):
+        # raster + flat + windowing lands on the SHARED hive-only check.
+        cfg = _raster_config()
+        cfg.output["store_layout"] = "flat"  # explicit: healpix defaults hive (issue #253)
+        cfg.output["windowing"] = {"schedule": "yearly"}
+        with pytest.raises(ValueError, match="store_layout: hive"):
+            validate_config(cfg)
+
+    def test_windowing_schedule_none_inert(self):
+        from zagg.config import get_windowing
+
+        cfg = _raster_config()
+        cfg.output["store_layout"] = "hive"
+        cfg.output["windowing"] = {"schedule": "none"}
+        validate_config(cfg)
+        assert get_windowing(cfg) is None
+
+    def test_windowing_explicit_list_validated(self):
+        cfg = _raster_config()
+        cfg.output["store_layout"] = "hive"
+        cfg.output["windowing"] = {
+            "schedule": "explicit",
+            "windows": [
+                {"label": "a", "start": "2019-02-01", "end": "2019-01-01"},
+            ],
+        }
+        with pytest.raises(ValueError, match="half-open"):
+            validate_config(cfg)
+
+    def test_windowing_explicit_list_normalizes(self):
+        # Issue #247: the happy path for schedule: explicit — a valid two-window
+        # list normalizes through get_windowing with each boundary canonicalized
+        # to ISO-8601 UTC, mirroring the generative case in
+        # test_windowing_validates_and_normalizes so both normalizations stay locked.
+        from zagg.config import get_windowing
+
+        cfg = _raster_config()
+        cfg.output["store_layout"] = "hive"
+        cfg.output["windowing"] = {
+            "schedule": "explicit",
+            "windows": [
+                {"label": "q1", "start": "2019-01-01", "end": "2019-04-01"},
+                {"label": "q2", "start": "2019-04-01", "end": "2019-07-01"},
+            ],
+        }
+        validate_config(cfg)
+        assert get_windowing(cfg) == {
+            "schedule": "explicit",
+            "time_field": "datetime",
+            "epoch": "1970-01-01T00:00:00+00:00",
+            "scale": "utc",
+            "units": "seconds",
+            "windows": [
+                {
+                    "label": "q1",
+                    "start": "2019-01-01T00:00:00+00:00",
+                    "end": "2019-04-01T00:00:00+00:00",
+                },
+                {
+                    "label": "q2",
+                    "start": "2019-04-01T00:00:00+00:00",
+                    "end": "2019-07-01T00:00:00+00:00",
+                },
+            ],
+        }
 
     def test_rectilinear_grid_rejected_for_now(self):
         grid = {"type": "rectilinear", "crs": UTM18, "resolution": 10, "bounds": [0, 0, 1, 1]}
@@ -553,6 +717,27 @@ class TestTemplateAndSlabs:
         red = open_array(store, path=f"{grid.group_path}/red", zarr_format=3, consolidated=False)
         assert red.shape == (0, 12 * 4**16)
 
+    def test_overwrite_false_refuses_same_count_different_values(self, tmp_path):
+        # overwrite=False must refuse a rerun whose timestep COUNT is unchanged
+        # but whose time values differ: to_zarr's shape guard doesn't catch it,
+        # so without an explicit check the unconditional time write would
+        # silently clobber the coordinate workers slab-write against (issue
+        # #264). An identical rerun stays idempotent; overwrite=True rewrites.
+        cfg, grid, _shard = _healpix_setup(tmp_path)
+        store = MemoryStore()
+        emit_raster_template(store, grid, cfg, np.array([100, 200], dtype=np.int64))
+        # Idempotent: same values, overwrite=False, no raise.
+        emit_raster_template(store, grid, cfg, np.array([100, 200], dtype=np.int64))
+        # Same count, shifted values: refused, and the store is left untouched.
+        with pytest.raises(ContainsGroupError):
+            emit_raster_template(store, grid, cfg, np.array([100, 999], dtype=np.int64))
+        tarr = open_array(store, path=f"{grid.group_path}/time", zarr_format=3, consolidated=False)
+        np.testing.assert_array_equal(tarr[:], np.array([100, 200], dtype=np.int64))
+        # overwrite=True rewrites the shifted coordinate cleanly.
+        emit_raster_template(store, grid, cfg, np.array([100, 999], dtype=np.int64), overwrite=True)
+        tarr = open_array(store, path=f"{grid.group_path}/time", zarr_format=3, consolidated=False)
+        np.testing.assert_array_equal(tarr[:], np.array([100, 999], dtype=np.int64))
+
     def test_time_attrs_round_trip(self, tmp_path):
         cfg, grid, _shard = _healpix_setup(tmp_path)
         store = MemoryStore()
@@ -595,6 +780,105 @@ class TestTemplateAndSlabs:
         got = red[0, start:stop]
         np.testing.assert_array_equal(got[valid], data[rows[valid], cols[valid]])
         assert (got[~valid] == 0).all()  # fill outside the raster footprint
+
+
+class TestLeafTemplate:
+    """Per-(shard, window) hive leaf templates (issue #247 phase 2)."""
+
+    def test_leaf_spec_shapes_and_root_group(self, tmp_path):
+        from zagg.processing.raster import raster_leaf_spec
+
+        cfg, grid, _shard = _healpix_setup(tmp_path)
+        spec = raster_leaf_spec(grid, cfg, 3)
+        inner = spec.members[grid.group_path]  # root group wraps the members (D4 stamp target)
+        red = inner.members["red"]
+        assert tuple(red.shape) == (3, grid.cells_per_shard)
+        cg = red.chunk_grid
+        cfg_block = cg["configuration"] if isinstance(cg, dict) else cg.configuration
+        assert tuple(cfg_block["chunk_shape"]) == (1, grid.cells_per_chunk)
+        assert red.attributes["scale_factor"] == 0.0001
+        assert tuple(inner.members["time"].shape) == (3,)
+        assert tuple(inner.members["cell_ids"].shape) == (grid.cells_per_shard,)
+
+    def test_leaf_spec_sharded_rejected(self, tmp_path):
+        from zagg.processing.raster import raster_leaf_spec
+
+        cfg, grid, _shard = _healpix_setup(tmp_path)
+        grid.sharded = True
+        with pytest.raises(ValueError, match="read-modify-write"):
+            raster_leaf_spec(grid, cfg, 1)
+
+    def test_leaf_template_round_trip(self, tmp_path):
+        # Emit one leaf, stream the shard's slabs into it at leaf-local
+        # indices, and read everything back: per-band dtype/fill, the leaf's
+        # own time axis, and the shard's cell_ids — written at template time,
+        # not per-slab.
+        from zagg.processing.raster import emit_raster_leaf_template, write_raster_leaf_slab
+
+        cfg, grid, shard = _healpix_setup(tmp_path)
+        data = _index_raster()
+        _write_tiff(tmp_path / "t0.tif", data)
+        _write_tiff(tmp_path / "t1.tif", np.full((96, 96), 321, dtype=np.uint16))
+        granules = [
+            _entry("g0", {"red": str(tmp_path / "t0.tif")}, T0, time_key="dt-1"),
+            _entry("g1", {"red": str(tmp_path / "t1.tif")}, T1, time_key="dt-2"),
+        ]
+        index, times = raster_time_index([granules])
+
+        store = MemoryStore()
+        emit_raster_leaf_template(store, grid, cfg, shard, times)
+        slabs, _meta = process_raster_shard(grid, shard, granules, cfg, index)
+        for t, slab in slabs.items():
+            write_raster_leaf_slab(store, grid, t, slab)
+
+        red = open_array(store, path=f"{grid.group_path}/red", zarr_format=3, consolidated=False)
+        assert red.shape == (2, grid.cells_per_shard)
+        assert red.dtype == np.uint16 and red.fill_value == 0
+        cells = grid.children(shard)
+        rows, cols, valid = grid.sample(cells, UTM18, TRANSFORM, (96, 96))
+        got_t0 = red[0, :]
+        np.testing.assert_array_equal(got_t0[valid], data[rows[valid], cols[valid]])
+        assert (got_t0[~valid] == 0).all()
+        assert (red[1, :][valid] == 321).all()
+        tarr = open_array(store, path=f"{grid.group_path}/time", zarr_format=3, consolidated=False)
+        np.testing.assert_array_equal(tarr[:], times)
+        assert tarr.attrs["units"] == "microseconds since 1970-01-01T00:00:00"
+        ids = open_array(
+            store, path=f"{grid.group_path}/cell_ids", zarr_format=3, consolidated=False
+        )
+        np.testing.assert_array_equal(
+            ids[:], np.asarray(grid.encode_cell_ids(cells), dtype=np.uint64)
+        )
+
+    def test_leaf_overwrite_replaces_wholesale(self, tmp_path):
+        # Retry semantics (D4): re-emitting with overwrite=True replaces the
+        # prior attempt's arrays — a NARROWER time axis must not leave stale
+        # timesteps behind.
+        from zagg.processing.raster import emit_raster_leaf_template
+
+        cfg, grid, shard = _healpix_setup(tmp_path)
+        store = MemoryStore()
+        emit_raster_leaf_template(store, grid, cfg, shard, np.array([1, 2, 3], dtype=np.int64))
+        emit_raster_leaf_template(
+            store, grid, cfg, shard, np.array([9], dtype=np.int64), overwrite=True
+        )
+        red = open_array(store, path=f"{grid.group_path}/red", zarr_format=3, consolidated=False)
+        assert red.shape == (1, grid.cells_per_shard)
+        tarr = open_array(store, path=f"{grid.group_path}/time", zarr_format=3, consolidated=False)
+        np.testing.assert_array_equal(tarr[:], [9])
+
+    def test_flat_template_unchanged_by_refactor(self, tmp_path):
+        # The shared-members refactor must leave the FLAT template spec
+        # byte-identical: same member set, shapes, chunking, codecs.
+        cfg, grid, _shard = _healpix_setup(tmp_path)
+        spec = raster_group_spec(grid, cfg, 2)
+        assert set(spec.members) == {"time", "cell_ids", "red"}
+        # Fullsphere cell axis (issue #88: the dense pack is gone; shape is
+        # metadata — writes stay sparse).
+        assert tuple(spec.members["red"].shape) == (2, 12 * 4**16)
+        codecs = spec.members["red"].codecs
+        names = [c["name"] if isinstance(c, dict) else c.name for c in codecs]
+        assert names == ["bytes", "zstd"]
 
 
 class TestGeometryCache:
@@ -655,3 +939,312 @@ class TestGeometryCache:
         for got in (cached1, cached2):
             np.testing.assert_array_equal(got[0]["red"], uncached[0]["red"])
             np.testing.assert_array_equal(got[1], uncached[1])
+
+
+class TestStageStats:
+    """Issue #249: opt-in per-stage sample profiling via ``stage_stats``."""
+
+    _STAGES = ("open", "geometry", "fetch", "decode", "gather")
+
+    def _run(self, tmp_path, n_timesteps=3, second_grid=True, stage_stats=None):
+        # Mirrors TestGeomCache._run_counting: n timesteps of a 96x96 10 m
+        # 'red' plus (optionally) a 48x48 20 m 'scl' — two distinct source
+        # grids exercising the geom_cache hit accounting.
+        vals = [11, 22, 33, 44][:n_timesteps]
+        granules = []
+        for i, v in enumerate(vals):
+            _write_tiff(tmp_path / f"s{i}.tif", np.full((96, 96), v, dtype=np.uint16))
+            assets = {"red": str(tmp_path / f"s{i}.tif")}
+            if second_grid:
+                _write_tiff(tmp_path / f"c{i}.tif", np.full((48, 48), 4, dtype=np.uint16), res=20.0)
+                assets["scl"] = str(tmp_path / f"c{i}.tif")
+            granules.append(
+                _entry(f"g{i}", assets, f"2026-07-{13 + i:02d}T16:02:20+00:00", time_key=f"dt-{i}")
+            )
+        bands = {"red": {"asset": "red", "dtype": "uint16"}}
+        if second_grid:
+            bands["scl"] = {"asset": "scl", "dtype": "uint16"}
+        grid = _rect_grid([ORIGIN[0], ORIGIN[1] - 960.0, ORIGIN[0] + 960.0, ORIGIN[1]], [96, 96])
+        cfg = _raster_config(bands=bands, nodata=None)
+        index, _ = raster_time_index([granules])
+        return process_raster_shard(grid, 0, granules, cfg, index, stage_stats=stage_stats)
+
+    def test_counts_and_stage_seconds(self, tmp_path):
+        stats = new_stage_stats()
+        _slabs, meta = self._run(tmp_path, n_timesteps=3, second_grid=True, stage_stats=stats)
+        assert meta["timesteps"] == 3
+        assert stats["assets"] == 6  # 3 timesteps x 2 bands
+        assert stats["geom_hits"] == 4  # assets - 2 distinct source grids
+        assert stats["tiles"] >= stats["assets"]  # every sample fetches >= 1 tile
+        assert all(stats[k] >= 0.0 for k in self._STAGES)
+        assert sum(stats[k] for k in self._STAGES) > 0.0
+
+    def test_profiled_output_matches_default(self, tmp_path):
+        golden, _m = self._run(tmp_path)
+        stats = new_stage_stats()
+        profiled, _m2 = self._run(tmp_path, stage_stats=stats)
+        assert stats["assets"] == 6
+        assert set(golden) == set(profiled)
+        for t in golden:
+            assert set(golden[t]) == set(profiled[t])
+            for f in golden[t]:
+                np.testing.assert_array_equal(golden[t][f], profiled[t][f])
+
+    def test_default_path_makes_no_timing_calls(self, tmp_path, monkeypatch):
+        # The issue #249 zero-overhead gate: with stage_stats=None the sample
+        # path must never call time.time(). Rebind raster.py's module-level
+        # ``time`` name to a booby trap — only this module's calls are caught.
+        import zagg.processing.raster as raster_mod
+
+        class _Boom:
+            @staticmethod
+            def time():
+                raise AssertionError("time.time() called on the unprofiled sample path")
+
+        monkeypatch.setattr(raster_mod, "time", _Boom)
+        _slabs, meta = self._run(tmp_path, n_timesteps=1, second_grid=False)
+        assert meta["timesteps"] == 1
+
+
+class TestRasterHiveWorker:
+    """The shared per-(shard, window) hive leaf write path (issue #247 phase 3)."""
+
+    def _setup(self, tmp_path, value=555):
+        cfg, grid, shard = _healpix_setup(tmp_path)
+        data = np.full((96, 96), value, dtype=np.uint16)
+        _write_tiff(tmp_path / "h0.tif", data)
+        _write_tiff(tmp_path / "h1.tif", np.full((96, 96), 777, dtype=np.uint16))
+        granules = [
+            _entry("g0", {"red": str(tmp_path / "h0.tif")}, T0, time_key="dt-1"),
+            _entry("g1", {"red": str(tmp_path / "h1.tif")}, T1, time_key="dt-2"),
+        ]
+        return cfg, grid, shard, granules, str(tmp_path / "hivestore")
+
+    def test_windowed_leaf_stamp_and_coverage(self, tmp_path):
+        from zagg import hive
+        from zagg.processing.raster import process_and_write_raster_hive
+
+        cfg, grid, shard, granules, root = self._setup(tmp_path)
+        meta = process_and_write_raster_hive(
+            shard,
+            granules[:1],
+            grid,
+            root,
+            cfg,
+            store_kwargs={},
+            window={"label": "20260713"},
+        )
+        leaf = hive.shard_leaf_path(root, shard, window="20260713")
+        stamp = hive.read_commit(leaf)
+        assert stamp and stamp["complete"] and stamp["spec"] == "morton-hive/2"
+        assert stamp["window"] == "20260713"
+        # D15 truth: the unit's actual acquisition extent (one instant here).
+        assert stamp["time_range"] == [T0, T0]
+        assert meta["time_range"] == [T0, T0]
+        assert stamp["granule_count"] == 1
+        # Occupied union = cells whose center lands on the (nodata-free) raster.
+        cells = grid.children(shard)
+        _rows, _cols, valid = grid.sample(cells, UTM18, TRANSFORM, (96, 96))
+        assert stamp["cells_with_data"] == int(valid.sum())
+        # Edge shard (raster covers a fraction of the shard): real bitmap
+        # sidecar, decoding to exactly the occupied cells.
+        assert stamp["coverage"]["encoding"] == "bitmap"
+        got = hive.read_coverage_bitmap(leaf, coverage=stamp["coverage"])
+        np.testing.assert_array_equal(got, np.sort(np.asarray(cells, dtype=np.uint64)[valid]))
+        # Leaf data at leaf-local indices, leaf-local time axis of length 1.
+        red = open_array(leaf + f"/{grid.group_path}/red", zarr_format=3, consolidated=False)
+        assert red.shape == (1, grid.cells_per_shard)
+        assert (red[0, :][valid] == 555).all()
+
+    def test_schedule_none_bare_leaf(self, tmp_path):
+        from zagg import hive
+        from zagg.processing.raster import process_and_write_raster_hive
+
+        cfg, grid, shard, granules, root = self._setup(tmp_path)
+        meta = process_and_write_raster_hive(
+            shard, granules, grid, root, cfg, store_kwargs={}, window=None
+        )
+        assert meta["timesteps"] == 2 and "time_range" not in meta
+        leaf = hive.shard_leaf_path(root, shard)  # bare {full_id}.zarr name
+        stamp = hive.read_commit(leaf)
+        assert stamp and stamp["spec"] == "morton-hive/1"
+        assert "window" not in stamp and "time_range" not in stamp
+        # D14 "full" is gated off without a window — even full occupancy would
+        # stamp a bitmap; here the shard is edge-covered anyway.
+        assert stamp["coverage"]["encoding"] == "bitmap"
+        red = open_array(leaf + f"/{grid.group_path}/red", zarr_format=3, consolidated=False)
+        assert red.shape == (2, grid.cells_per_shard)
+
+    def test_disjoint_timesteps_coverage_is_union(self, tmp_path):
+        # D14 spatial union across acquisitions: two timesteps whose footprints
+        # occupy DISJOINT cell subsets of one shard must stamp coverage = the
+        # OR of both. A regression dropping the union (e.g. sampling only the
+        # last group) would decode to one timestep's set, which — since neither
+        # is a superset of the other — this test rejects.
+        from zagg import hive
+        from zagg.processing.raster import process_and_write_raster_hive
+
+        cfg, grid, shard = _healpix_setup(tmp_path)
+        # Second raster shifted ~480 m west: overlapping but neither footprint
+        # covers the other, so each timestep owns shard cells the other misses
+        # (the shard's covered patch sits at the raster's east edge, so a west
+        # shift keeps both timesteps' exclusive cells inside this shard).
+        origin1 = (ORIGIN[0] - 480.0, ORIGIN[1])
+        transform1 = (RES, 0.0, origin1[0], 0.0, -RES, origin1[1])
+        _write_tiff(tmp_path / "d0.tif", np.full((96, 96), 555, dtype=np.uint16))
+        _write_tiff(tmp_path / "d1.tif", np.full((96, 96), 777, dtype=np.uint16), origin=origin1)
+        granules = [
+            _entry("g0", {"red": str(tmp_path / "d0.tif")}, T0, time_key="dt-1"),
+            _entry("g1", {"red": str(tmp_path / "d1.tif")}, T1, time_key="dt-2"),
+        ]
+
+        cells = grid.children(shard)
+        _r0, _c0, valid0 = grid.sample(cells, UTM18, TRANSFORM, (96, 96))
+        _r1, _c1, valid1 = grid.sample(cells, UTM18, transform1, (96, 96))
+        # Premise: both timesteps land cells, and neither is a superset — some
+        # cell is valid in exactly one, so the union is strictly larger.
+        assert valid0.any() and valid1.any()
+        assert (valid0 & ~valid1).any() and (valid1 & ~valid0).any()
+        union = valid0 | valid1
+
+        root = str(tmp_path / "hivestore")
+        process_and_write_raster_hive(
+            shard, granules, grid, root, cfg, store_kwargs={}, window=None
+        )
+        leaf = hive.shard_leaf_path(root, shard)
+        stamp = hive.read_commit(leaf)
+        assert stamp and stamp["complete"]
+        assert stamp["cells_with_data"] == int(union.sum())
+        got = hive.read_coverage_bitmap(leaf, coverage=stamp["coverage"])
+        np.testing.assert_array_equal(got, np.sort(np.asarray(cells, dtype=np.uint64)[union]))
+
+    def test_no_data_unit_creates_no_prefix(self, tmp_path):
+        from zagg import hive
+        from zagg.processing.raster import process_and_write_raster_hive
+
+        cfg, grid, shard, _granules, root = self._setup(tmp_path)
+        meta = process_and_write_raster_hive(
+            shard, [], grid, root, cfg, store_kwargs={}, window={"label": "20260713"}
+        )
+        assert meta["timesteps"] == 0
+        leaf = hive.shard_leaf_path(root, shard, window="20260713")
+        import os as _os
+
+        assert not _os.path.exists(leaf)
+
+    def test_torn_worker_debris_and_rerun_replaces(self, tmp_path, monkeypatch):
+        import zagg.processing.raster as raster_mod
+        from zagg import hive
+        from zagg.processing.raster import process_and_write_raster_hive
+
+        cfg, grid, shard, granules, root = self._setup(tmp_path)
+        real_write = raster_mod.write_raster_leaf_slab
+        calls = {"n": 0}
+
+        def _tear(store, g, t, slab):
+            calls["n"] += 1
+            if calls["n"] == 2:
+                raise RuntimeError("torn mid-shard")
+            return real_write(store, g, t, slab)
+
+        monkeypatch.setattr(raster_mod, "write_raster_leaf_slab", _tear)
+        with pytest.raises(RuntimeError, match="torn"):
+            process_and_write_raster_hive(
+                shard, granules, grid, root, cfg, store_kwargs={}, window=None
+            )
+        leaf = hive.shard_leaf_path(root, shard)
+        import os as _os
+
+        assert _os.path.exists(leaf)  # prefix exists...
+        assert hive.read_commit(leaf) is None  # ...but unstamped: debris (D4)
+
+        # Re-run replaces the leaf WHOLESALE (D13): a narrower time axis must
+        # not leave the torn attempt's arrays or extra timesteps behind.
+        monkeypatch.setattr(raster_mod, "write_raster_leaf_slab", real_write)
+        process_and_write_raster_hive(
+            shard, granules[:1], grid, root, cfg, store_kwargs={}, window=None
+        )
+        stamp = hive.read_commit(leaf)
+        assert stamp and stamp["complete"]
+        red = open_array(leaf + f"/{grid.group_path}/red", zarr_format=3, consolidated=False)
+        assert red.shape == (1, grid.cells_per_shard)
+
+
+class TestRasterHivePopcount:
+    """D14 popcount: interior shard stamps "full" (no sidecar), edge shard
+    writes the real bitmap (issue #247 phase 5)."""
+
+    def _setup(self, tmp_path):
+        # Coarse shards (order 14, ~400 m) with 16 order-16 children (~100 m):
+        # the 960 m raster fully covers interior shards and clips edge ones.
+        from mortie import clip2order, geo2mort
+
+        cfg = _raster_config(
+            bands={"red": {"asset": "red", "dtype": "uint16"}},
+            grid={"type": "healpix", "parent_order": 14, "child_order": 16},
+        )
+        data = np.full((96, 96), 555, dtype=np.uint16)  # no nodata anywhere
+        _write_tiff(tmp_path / "full.tif", data)
+        granules = [_entry("g0", {"red": str(tmp_path / "full.tif")}, T0, time_key="dt-1")]
+        to_wgs = Transformer.from_crs(CRS(UTM18), CRS("EPSG:4326"), always_xy=True)
+
+        def shard_at(dx, dy):
+            lon, lat = to_wgs.transform(ORIGIN[0] + dx, ORIGIN[1] - dy)
+            leaf = geo2mort(np.array([lat]), np.array([lon]), order=29, points=True)
+            return int(clip2order(14, leaf)[0])
+
+        return cfg, granules, shard_at, str(tmp_path / "store")
+
+    def _coverage_counts(self, cfg, grid, shard):
+        cells = grid.children(shard)
+        _r, _c, valid = grid.sample(cells, UTM18, TRANSFORM, (96, 96))
+        return int(valid.sum()), grid.cells_per_shard
+
+    def test_interior_full_no_sidecar_edge_bitmap(self, tmp_path):
+        import os as _os
+
+        from zagg import hive
+        from zagg.grids import HealpixGrid
+        from zagg.processing.raster import process_and_write_raster_hive
+
+        cfg, granules, shard_at, root = self._setup(tmp_path)
+        interior = shard_at(480.0, 480.0)  # raster center
+        grid = HealpixGrid(14, 16, config=cfg)
+        n_valid, n_cells = self._coverage_counts(cfg, grid, interior)
+        assert n_valid == n_cells  # the fixture premise: fully covered shard
+
+        process_and_write_raster_hive(
+            interior, granules, grid, root, cfg, store_kwargs={}, window={"label": "20260713"}
+        )
+        leaf = hive.shard_leaf_path(root, interior, window="20260713")
+        stamp = hive.read_commit(leaf)
+        assert stamp["coverage"]["encoding"] == "full"
+        assert "sidecar" not in stamp["coverage"]
+        # Asserted via object listing: NO coverage.moc object in the leaf.
+        assert "coverage.moc" not in _os.listdir(leaf)
+        # And the reader short-circuits: no bitmap to fetch.
+        assert hive.read_coverage_bitmap(leaf, coverage=stamp["coverage"]) is None
+
+        # An edge-of-scene shard: hunt along the raster's top edge for one the
+        # scene only clips (the frozen fixture geometry guarantees several).
+        edge = None
+        for dx in range(0, 960, 60):
+            cand = shard_at(float(dx), 20.0)
+            g = HealpixGrid(14, 16, config=cfg)
+            nv, nc = self._coverage_counts(cfg, g, cand)
+            if 0 < nv < nc:
+                edge, egrid, e_valid = cand, g, nv
+                break
+        assert edge is not None, "fixture drift: no partially-covered shard found"
+
+        process_and_write_raster_hive(
+            edge, granules, egrid, root, cfg, store_kwargs={}, window={"label": "20260713"}
+        )
+        eleaf = hive.shard_leaf_path(root, edge, window="20260713")
+        estamp = hive.read_commit(eleaf)
+        assert estamp["coverage"]["encoding"] == "bitmap"
+        assert estamp["cells_with_data"] == e_valid
+        # Asserted via object listing: the real bitmap sidecar object exists.
+        assert "coverage.moc" in _os.listdir(eleaf)
+        got = hive.read_coverage_bitmap(eleaf, coverage=estamp["coverage"])
+        assert got is not None and got.size == e_valid

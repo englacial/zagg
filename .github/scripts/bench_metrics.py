@@ -66,9 +66,13 @@ RECORD_COLUMNS = [
     # Wall-time breakdown (issue #180): end-to-end AOI dispatch wall and its
     # three phases. ``runtime_s`` above is the single worker's compute;
     # ``total_wall_s`` is what the orchestrator actually waits (setup +
-    # fanout/poll + finalize). ``finalize_s`` is the zarr metadata
-    # consolidation invoke -- a ~fixed cost worth tracking for regression
-    # (issue #191). Null on rows recorded before these were surfaced.
+    # fanout/poll + finalize). ``finalize_s`` is the finalize invoke: zarr
+    # metadata consolidation on flat (issue #191); on hive it is the
+    # idempotent morton_hive.json backstop (issue #252 hybrid -- the primary
+    # manifest write fires as an async Event invoke at init) -- keep it
+    # displayed. ``setup_s`` on hive rows is the lightweight preflight ping
+    # plus the ~10 ms Event dispatch of the manifest write. Null on rows
+    # recorded before these were surfaced.
     "total_wall_s",
     "setup_s",
     "fanout_s",
@@ -89,7 +93,26 @@ RECORD_COLUMNS = [
     # recorded before the hive arm existed (read back as flat). The renderers
     # key the inline/sidecar x AOI-mask panels on flat rows only.
     "store_layout",
+    # Worker phase split (issues #250/#256): straggler (max across cells)
+    # seconds per phase from ``summary["worker_phase_max"]`` (profile=True).
+    # The RAW emitted phase names are retained -- read/index/aggregate plus
+    # the #256 ``write`` split; the approved display maps agg = index +
+    # aggregate at RENDER time, so the series stays emission truth. Null on
+    # rows recorded before the capture (or a phase before its split landed).
+    "phase_read_s",
+    "phase_index_s",
+    "phase_aggregate_s",
+    "phase_write_s",
 ]
+
+# summary["worker_phase_max"] key -> series column (issues #250/#256). A phase
+# the worker grows later stays out of the series until a column appends here.
+PHASE_MAP = {
+    "read": "phase_read_s",
+    "index": "phase_index_s",
+    "aggregate": "phase_aggregate_s",
+    "write": "phase_write_s",
+}
 
 
 def select_densest_shard(shardmap: dict) -> tuple[int, int]:
@@ -209,6 +232,11 @@ def build_record(
         "fanout_s": summary.get("fanout_s"),
         "finalize_s": summary.get("finalize_s"),
     }
+    # Worker phase split (issues #250/#256), null-safe: a summary without
+    # profiling (or a pre-write-split worker) leaves the missing phases null.
+    wpm = summary.get("worker_phase_max") or {}
+    for src, col in PHASE_MAP.items():
+        record[col] = wpm.get(src)
     # Store object counts (issue #240). The two scalar columns are retained in
     # the parquet series; per_shard/mismatch ride the metrics.json record only
     # (update_series's reindex drops them).
@@ -232,13 +260,14 @@ def _fmt(value, spec: str = "") -> str:
 
 # Column headers for every rendered benchmark table -- the PR comment, the
 # published ``latest.md``, and the latest-table PNG all use these in this order.
+# Per-100 km² normalization is dropped from ALL rendered outputs (issue #250
+# item 7, espg-approved); ``cost_per_100km2_usd`` stays in the parquet history.
 TABLE_HEADERS = [
     "target",
     "obs",
     "runtime (s)",
     "wall (s)",
     "cost/shard",
-    "cost/100 km²",
     "% timeout",
     "mem (MB)",
     "% cap",
@@ -281,7 +310,6 @@ def format_record_cells(r: dict) -> dict:
         "runtime (s)": _fmt(r.get("runtime_s"), ".1f"),
         "wall (s)": _fmt(r.get("total_wall_s"), ".1f"),
         "cost/shard": "$" + _fmt(r.get("cost_per_shard_usd"), ".5f"),
-        "cost/100 km²": "$" + _fmt(r.get("cost_per_100km2_usd"), ".5f"),
         "% timeout": _fmt(r.get("worker_pct_timeout"), ".0%"),
         "mem (MB)": _fmt(r.get("max_memory_mb"), ".0f"),
         "% cap": _fmt(mem_frac, ".0%"),

@@ -1,0 +1,37 @@
+# Sentinel-2 L2A -> HEALPix (time, cells) raster benchmark config (issue #250).
+#
+# The raster release leg: pull-NN ingest of the Earth Search Collection-1 COGs
+# (anonymous, us-west-2) over the NEON SERC AOP box, one year of datatakes
+# (2025, the pinned catalog catalogs/cat_s2_neon_2025.parquet). Identical to
+# the shipped src/zagg/configs/sentinel2_l2a.yaml except ``parent_order: 9`` --
+# the o9 dispatch shard matching the point-pipeline legs (~12.8 km shards, 4
+# over the SERC box, 4^10 order-19 cells each; the same override espg's
+# operational S2 SERC run pins).
+#
+# Layout notes: this live leg PINS ``store_layout: flat`` -- since the issue
+# #253 default flip an unpinned healpix raster config resolves to hive (legal
+# since issue #247), and the leg stays flat until the pending_targets hive
+# variant is deliberately promoted (targets_raster_neon.json; espg directive
+# on PR #261). ``sharded`` does not apply to the (time, cells) slab writes.
+data_source:
+  reader: raster
+  bands:
+    red: {asset: red, dtype: uint16, fill_value: 0, scale: 0.0001, offset: -0.1}
+    green: {asset: green, dtype: uint16, fill_value: 0, scale: 0.0001, offset: -0.1}
+    blue: {asset: blue, dtype: uint16, fill_value: 0, scale: 0.0001, offset: -0.1}
+    nir: {asset: nir, dtype: uint16, fill_value: 0, scale: 0.0001, offset: -0.1}
+    # Scene classification (20 m source): categorical -- pull-NN is exact, no
+    # resampling arithmetic. Value 0 is the nodata class.
+    scl: {asset: scl, dtype: uint8, fill_value: 0}
+  nodata: 0
+  anonymous: true
+
+output:
+  # Pinned: the retained flat arm (deprecated-but-valid interop profile,
+  # issue #253); the hive raster leg waits in pending_targets.
+  store_layout: flat
+  grid:
+    type: healpix
+    indexing_scheme: nested
+    parent_order: 9              # dispatch shard: 4^(19-9) order-19 cells
+    child_order: 19              # leaf cell resolution (~12.4 m)

@@ -24,6 +24,8 @@ import concurrent.futures
 import os
 import re
 import threading
+import time
+import warnings
 from urllib.parse import urlparse
 
 import numpy as np
@@ -154,6 +156,39 @@ def _build_store(key):
     return LocalStore(loc)
 
 
+def new_stage_stats() -> dict:
+    """Fresh per-invoke stage accumulator for the sample path (issue #249).
+
+    The floats are wall-clock seconds (``time.time()`` deltas, the issue #100
+    convention) of **stage work volume**: each asset-sample times its own
+    stages independently and the K x bands concurrent samples of an invoke
+    overlap on one event loop, so a stage total is the sum of per-sample
+    elapsed walls *including* time suspended while sibling samples ran. The
+    sums attribute where the samples' time went (which stage differs between
+    a fast and a slow invoke) — they are NOT a wall decomposition and can
+    exceed the invoke's wall clock. That is deliberate: the ``write_buffer >
+    1`` sample/write remainder on PR #232 already showed wall splits go
+    approximate under overlap.
+
+    Keys — seconds: ``open`` (store lookup + TIFF header round trips + geo/
+    dtype parse), ``geometry`` (pull-NN mapping; a ``geom_cache`` hit records
+    ~0), ``fetch`` (tile GETs), ``decode``, ``gather`` (tile-index derivation
+    + numpy scatter/gather).
+    Counts: ``assets`` (asset-samples), ``tiles`` (tiles fetched),
+    ``geom_hits`` (mappings served from ``geom_cache``).
+    """
+    return {
+        "open": 0.0,
+        "geometry": 0.0,
+        "fetch": 0.0,
+        "decode": 0.0,
+        "gather": 0.0,
+        "assets": 0,
+        "tiles": 0,
+        "geom_hits": 0,
+    }
+
+
 async def sample_asset_async(
     grid,
     cells,
@@ -194,6 +229,7 @@ async def _sample_one(
     anonymous: bool = True,
     fill=0,
     geom_cache: dict | None = None,
+    stage_stats: dict | None = None,
 ):
     """:func:`sample_asset_async` body, also returning the raster's center
     ``(lon, lat)`` — the ownership rule's tile-center input (#218).
@@ -204,9 +240,20 @@ async def _sample_one(
     computes it once per distinct grid (~175 ms at o9) instead of once per
     asset-sample. ``None`` (the default, and the public ``sample_asset*``
     path) computes per call, unchanged.
+
+    ``stage_stats`` (issue #249) accumulates per-stage seconds + counts in
+    place — see :func:`new_stage_stats` for the keys and the work-volume (not
+    wall-decomposition) semantics. ``None`` (the default, and the public
+    ``sample_asset*`` path) makes no timing calls at all — the hot path is
+    unchanged. Accumulation is plain ``+=`` on the event loop with no await
+    between read and write, so it is atomic by the same argument as the
+    ``geom_cache`` store below — no locks; the ``write_buffer`` sink threads
+    never touch this dict.
     """
     from async_tiff import TIFF
 
+    prof = stage_stats is not None
+    _t0 = time.time() if prof else None
     store, path = _store_and_path(href, region=region, anonymous=anonymous)
     tiff = await TIFF.open(path, store=store)
     ifd = tiff.ifds[0]
@@ -223,8 +270,14 @@ async def _sample_one(
     epsg, transform = _geo_from_ifd(ifd)
     shape = (ifd.image_height, ifd.image_width)
     center = _raster_center_lonlat(epsg, transform, shape)
+    if prof:
+        stage_stats["open"] += time.time() - _t0
+        stage_stats["assets"] += 1
+        _t0 = time.time()
     geom_key = (epsg, transform, shape)
     geom = geom_cache.get(geom_key) if geom_cache is not None else None
+    if prof and geom is not None:
+        stage_stats["geom_hits"] += 1
     if geom is None:
         # INVARIANT (issue #244 thread): no ``await`` between this check and
         # the store below. asyncio interleaves only at await points, so the
@@ -243,17 +296,32 @@ async def _sample_one(
         if geom_cache is not None:
             geom_cache[geom_key] = geom
     rows, cols, valid = geom
+    if prof:
+        stage_stats["geometry"] += time.time() - _t0
+        _t0 = time.time()
 
     th, tw = ifd.tile_height, ifd.tile_width
     vr, vc = rows[valid], cols[valid]
     tr, tc = vr // th, vc // tw
 
     if vr.size == 0:
+        if prof:
+            stage_stats["gather"] += time.time() - _t0
         return np.full(rows.shape, fill, dtype=dtype), valid, center
 
     pairs = np.unique(np.stack([tr, tc], axis=1), axis=0)
+    if prof:
+        stage_stats["gather"] += time.time() - _t0
+        _t0 = time.time()
     tiles = await asyncio.gather(*[tiff.fetch_tile(int(c), int(r), 0) for r, c in pairs])
+    if prof:
+        stage_stats["fetch"] += time.time() - _t0
+        stage_stats["tiles"] += len(pairs)
+        _t0 = time.time()
     decoded = await asyncio.gather(*[t.decode() for t in tiles])
+    if prof:
+        stage_stats["decode"] += time.time() - _t0
+        _t0 = time.time()
 
     gathered = np.full(vr.shape, fill, dtype=dtype)
     for (trow, tcol), dec in zip(pairs, decoded):
@@ -263,6 +331,8 @@ async def _sample_one(
 
     values = np.full(rows.shape, fill, dtype=dtype)
     values[valid] = gathered
+    if prof:
+        stage_stats["gather"] += time.time() - _t0
     return values, valid, center
 
 
@@ -323,6 +393,7 @@ async def sample_item_async(
     region: str | None = None,
     anonymous: bool = True,
     geom_cache: dict | None = None,
+    stage_stats: dict | None = None,
 ):
     """Sample every configured band of one STAC item, concurrently.
 
@@ -366,6 +437,7 @@ async def sample_item_async(
                 anonymous=anonymous,
                 fill=bands[f]["fill_value"],
                 geom_cache=geom_cache,
+                stage_stats=stage_stats,
             )
             for f in fields
         ]
@@ -388,6 +460,19 @@ def _iso_us(iso: str) -> int:
     if dt.tzinfo is None:
         dt = dt.replace(tzinfo=timezone.utc)
     return int(dt.timestamp() * 1_000_000)
+
+
+def _us_iso(us: int) -> str:
+    """Microseconds since the epoch -> canonical ISO-8601 UTC (seconds precision).
+
+    The inverse of :func:`_iso_us` at the stamp's seconds precision — the D15
+    ``time_range`` rendering (:func:`zagg.windows.iso_utc` convention).
+    """
+    from datetime import datetime, timezone
+
+    return datetime.fromtimestamp(int(us) // 1_000_000, tz=timezone.utc).isoformat(
+        timespec="seconds"
+    )
 
 
 def raster_time_index(granules) -> tuple[dict, np.ndarray]:
@@ -496,6 +581,8 @@ def process_raster_shard(
     region: str | None = None,
     anonymous: bool = True,
     on_slab=None,
+    stage_stats: dict | None = None,
+    occupied_out: list | None = None,
 ):
     """Process one shard of a raster pipeline: every acquisition group -> slab.
 
@@ -521,6 +608,20 @@ def process_raster_shard(
         double-buffer); the returned ``slabs`` is then empty. When ``None``
         (the default) every slab accumulates into ``slabs`` and is returned,
         as before, and ``write_buffer`` is ignored.
+    stage_stats : dict, optional
+        Per-invoke stage accumulator from :func:`new_stage_stats` (issue
+        #249): the sample path adds per-stage seconds (``open`` / ``geometry``
+        / ``fetch`` / ``decode`` / ``gather``) and counts (``assets`` /
+        ``tiles`` / ``geom_hits``) in place. Stage seconds are work volume,
+        not a wall decomposition — concurrent samples overlap, so their sum
+        can exceed this call's wall (see :func:`new_stage_stats`). ``None``
+        (the default) makes no timing calls — the sample path is unchanged.
+    occupied_out : list, optional
+        When given, receives one uint64 array of the shard's OCCUPIED cell
+        words — cells valid in at least one timestep, i.e. the spatial union
+        across the acquisitions sampled (the D14 coverage input; per-timestep
+        validity stays data-plane nodata, D9). Mirrors ``process_shard``'s
+        seam of the same name. ``None`` (the default) allocates nothing.
 
     Returns
     -------
@@ -567,6 +668,13 @@ def process_raster_shard(
     # Sentinel-2 shard has exactly two distinct source grids (10 m bands,
     # 20 m scl) — this turns 425 geometry computations into 2.
     geom_cache: dict = {}
+    # Occupied-cell union (issue #247): OR of per-timestep validity across the
+    # shard's acquisition groups — the D14 coverage input. Accumulation is an
+    # in-place index-assign on the event loop (no await between read and
+    # write, and no name rebinding into the coroutine scope), atomic by the
+    # same argument as the geom_cache store; allocated only when a sink was
+    # passed, so the default path is unchanged.
+    occupied_acc = np.zeros(len(cells), dtype=bool) if occupied_out is not None else None
 
     async def _run_all():
         sem = asyncio.Semaphore(k)
@@ -584,6 +692,7 @@ def process_raster_shard(
                             region=region,
                             anonymous=anonymous,
                             geom_cache=geom_cache,
+                            stage_stats=stage_stats,
                         )
                         for e in items
                     ]
@@ -623,6 +732,8 @@ def process_raster_shard(
                     if lonlat is None:
                         lonlat = grid.cell_lonlat(cells)
                     values, valid = _combine_by_ownership(sampled, lonlat, bands)
+                if occupied_acc is not None:
+                    occupied_acc[valid] = True
                 slab = {}
                 for f, v in values.items():
                     out = v.copy()  # keep the asset dtype (np.where would promote)
@@ -642,6 +753,8 @@ def process_raster_shard(
         return slabs
 
     slabs = _run_sync(_run_all())
+    if occupied_out is not None:
+        occupied_out.append(np.asarray(cells, dtype=np.uint64)[occupied_acc])
     metadata = {
         "shard_key": int(shard_key),
         "granule_count": len(granules),
@@ -680,6 +793,67 @@ def _combine_by_ownership(sampled, lonlat, bands):
 _TIME_ATTRS = {"units": "microseconds since 1970-01-01T00:00:00", "calendar": "proleptic_gregorian"}
 
 
+def _raster_array_spec(shape, chunks, dims, dtype, fill, attrs=None):
+    """ArraySpec shared by the flat template and the hive leaf spec."""
+    from pydantic_zarr.experimental.v3 import ArraySpec, NamedConfig
+
+    return ArraySpec(
+        attributes=attrs or {},
+        shape=shape,
+        dimension_names=dims,
+        data_type=dtype,
+        chunk_grid=NamedConfig(name="regular", configuration={"chunk_shape": chunks}),
+        chunk_key_encoding=NamedConfig(name="default", configuration={"separator": "/"}),
+        codecs=(
+            NamedConfig(name="bytes", configuration={"endian": "little"}),
+            NamedConfig(name="zstd", configuration={"level": 3, "checksum": False}),
+        ),
+        storage_transformers=(),
+        fill_value=fill,
+    )
+
+
+def _check_raster_grid(grid) -> None:
+    """Shared template guards: no sharded output, 1-D cell axis only."""
+    if getattr(grid, "sharded", False):
+        # Permanent exclusion (espg-ratified on issue #247), mirroring the
+        # validate_config message: per-timestep slab streaming would
+        # read-modify-write each ShardingCodec object.
+        raise ValueError(
+            "raster templates do not support sharded output (per-timestep slab "
+            "streaming would read-modify-write each ShardingCodec object)"
+        )
+    if len(grid.array_shape) != 1:
+        raise ValueError(
+            "raster templates currently require a 1-D cell axis (HEALPix); "
+            "the rectilinear (time, y, x) variant is future work (issue #218)"
+        )
+
+
+def _raster_members(grid, config, n_time: int, n_cells: int) -> dict:
+    """The ``time``/``cell_ids``/band ArraySpec members for one raster store."""
+    from zagg.config import get_raster_bands
+
+    members = {
+        "time": _raster_array_spec(
+            (n_time,), (max(n_time, 1),), ("time",), "int64", 0, dict(_TIME_ATTRS)
+        ),
+        "cell_ids": _raster_array_spec(
+            (n_cells,), (grid.cells_per_chunk,), ("cells",), "uint64", 0
+        ),
+    }
+    for name, meta in get_raster_bands(config).items():
+        members[name] = _raster_array_spec(
+            (n_time, n_cells),
+            (1, grid.cells_per_chunk),
+            ("time", "cells"),
+            meta["dtype"],
+            meta["fill_value"],
+            meta["attrs"] or {},
+        )
+    return members
+
+
 def raster_group_spec(grid, config, n_time: int):
     """pydantic-zarr GroupSpec for the raster ``(time, cells)`` template.
 
@@ -688,61 +862,110 @@ def raster_group_spec(grid, config, n_time: int):
     Plus ``time`` (int64 microseconds, CF attrs) and ``cell_ids`` (uint64,
     written per shard by :func:`write_raster_coords`).
     """
-    from pydantic_zarr.experimental.v3 import ArraySpec, GroupSpec, NamedConfig
+    from pydantic_zarr.experimental.v3 import GroupSpec
 
-    from zagg.config import get_raster_bands
-
-    if getattr(grid, "sharded", False):
-        raise ValueError("raster templates do not support sharded output yet (issue #218)")
+    _check_raster_grid(grid)
     n_pixels = int(np.prod(grid.array_shape))
-    if len(grid.array_shape) != 1:
-        raise ValueError(
-            "raster templates currently require a 1-D cell axis (HEALPix); "
-            "the rectilinear (time, y, x) variant is future work (issue #218)"
-        )
-
-    def _arr(shape, chunks, dims, dtype, fill, attrs=None):
-        return ArraySpec(
-            attributes=attrs or {},
-            shape=shape,
-            dimension_names=dims,
-            data_type=dtype,
-            chunk_grid=NamedConfig(name="regular", configuration={"chunk_shape": chunks}),
-            chunk_key_encoding=NamedConfig(name="default", configuration={"separator": "/"}),
-            codecs=(
-                NamedConfig(name="bytes", configuration={"endian": "little"}),
-                NamedConfig(name="zstd", configuration={"level": 3, "checksum": False}),
-            ),
-            storage_transformers=(),
-            fill_value=fill,
-        )
-
-    members = {
-        "time": _arr((n_time,), (max(n_time, 1),), ("time",), "int64", 0, dict(_TIME_ATTRS)),
-        "cell_ids": _arr((n_pixels,), (grid.cells_per_chunk,), ("cells",), "uint64", 0),
-    }
-    for name, meta in get_raster_bands(config).items():
-        members[name] = _arr(
-            (n_time, n_pixels),
-            (1, grid.cells_per_chunk),
-            ("time", "cells"),
-            meta["dtype"],
-            meta["fill_value"],
-            meta["attrs"] or {},
-        )
-    return GroupSpec(members=members, attributes={})
+    return GroupSpec(members=_raster_members(grid, config, n_time, n_pixels), attributes={})
 
 
 def emit_raster_template(store, grid, config, times_us: np.ndarray, *, overwrite: bool = False):
     """Write the raster template and its ``time`` coordinate values."""
     from zarr import config as zarr_config
     from zarr import open_array
+    from zarr.errors import ArrayNotFoundError, ContainsGroupError
 
+    times_us = np.asarray(times_us, dtype=np.int64)
     spec = raster_group_spec(grid, config, int(len(times_us)))
+    time_path = f"{grid.group_path}/time"
     with zarr_config.set({"async.concurrency": 128}):
+        if not overwrite:
+            # ``to_zarr(overwrite=False)`` only refuses a template whose SPEC
+            # differs (a changed timestep COUNT -> different ``time`` shape ->
+            # ContainsGroupError). A store already holding a same-length but
+            # different-valued time axis slips past it, and the unconditional
+            # ``arr[:]`` below would silently rewrite the coordinate the
+            # workers slab-write against. Refuse that too, so overwrite=False
+            # uniformly won't clobber a differing template (issue #264).
+            try:
+                existing = open_array(store, path=time_path, zarr_format=3, consolidated=False)
+            except ArrayNotFoundError:
+                existing = None
+            if existing is not None and not np.array_equal(existing[:], times_us):
+                raise ContainsGroupError(store, grid.group_path)
         spec.to_zarr(store, grid.group_path, overwrite=overwrite)
+        arr = open_array(store, path=time_path, zarr_format=3, consolidated=False)
+        arr[:] = times_us
+    return store
+
+
+def raster_leaf_spec(grid, config, n_time: int):
+    """GroupSpec for ONE shard's hive leaf zarr (issue #247, D3/D13).
+
+    The raster analog of ``HealpixGrid.shard_spec``: the same member set as
+    :func:`raster_group_spec` — ``time``/``cell_ids`` plus one ``(time,
+    cells)`` array per band, same dtypes/fills/chunking — with the cells axis
+    sized to a single shard (``cells_per_shard``) and the time axis to the
+    LEAF's own acquisitions (``n_time`` = the groups intersecting this shard
+    × window, known at dispatch from the catalog). Wrapped in a ROOT group
+    (members under ``grid.group_path``, mirroring ``emit_shard_template``) so
+    the D4 commit stamp is one attrs update on an object that exists anyway.
+    """
+    from pydantic_zarr.experimental.v3 import GroupSpec
+
+    _check_raster_grid(grid)
+    inner = GroupSpec(
+        members=_raster_members(grid, config, n_time, grid.cells_per_shard), attributes={}
+    )
+    return GroupSpec(members={grid.group_path: inner}, attributes={})
+
+
+def emit_raster_leaf_template(
+    store, grid, config, shard_key: int, times_us: np.ndarray, *, overwrite: bool = False
+):
+    """Write one leaf's template plus its ``time`` and ``cell_ids`` coords.
+
+    Unlike the flat path (template at fan-out time, coords per shard after
+    the slabs), a leaf's coordinates are fully known at template time — the
+    time axis is the leaf's own acquisition groups and ``cell_ids`` is the
+    shard's children — so both are written here, once. Called lazily on the
+    first slab (mirroring ``process_and_write_hive``'s lazy ``_leaf``) with
+    ``overwrite=True`` so a no-data shard never creates the ``.zarr/`` prefix
+    and a retry replaces debris wholesale (D4).
+    """
+    from zarr import config as zarr_config
+    from zarr import open_array
+
+    spec = raster_leaf_spec(grid, config, int(len(times_us)))
+    cell_ids = grid.encode_cell_ids(grid.children(int(shard_key)))
+    with zarr_config.set({"async.concurrency": 128}):
+        spec.to_zarr(store, "", overwrite=overwrite)
         arr = open_array(store, path=f"{grid.group_path}/time", zarr_format=3, consolidated=False)
         arr[:] = np.asarray(times_us, dtype=np.int64)
+        arr = open_array(
+            store, path=f"{grid.group_path}/cell_ids", zarr_format=3, consolidated=False
+        )
+        arr[:] = np.asarray(cell_ids, dtype=np.uint64)
+    return store
+
+
+def write_raster_leaf_slab(store, grid, t_idx: int, slab: dict):
+    """Write one timestep's slab at LEAF-LOCAL indices: ``array[t, :] = values``.
+
+    The leaf's arrays span exactly one shard, so the cell axis needs no
+    block offset (contrast :func:`write_raster_slab`); ``t_idx`` is the
+    leaf-local timestep from the leaf's own time index. Chunk-aligned by
+    construction (whole rows of ``(1, cells_per_chunk)`` chunks).
+    """
+    from zarr import config as zarr_config
+    from zarr import open_array
+
+    with zarr_config.set({"async.concurrency": 128}):
+        for name, values in slab.items():
+            arr = open_array(
+                store, path=f"{grid.group_path}/{name}", zarr_format=3, consolidated=False
+            )
+            arr[int(t_idx), :] = np.asarray(values, dtype=arr.dtype)
     return store
 
 
@@ -790,14 +1013,178 @@ def write_raster_coords(store, grid, shard_key: int):
     return store
 
 
+def process_and_write_raster_hive(
+    shard_key,
+    granules,
+    grid,
+    store_root: str,
+    config,
+    *,
+    store_kwargs: dict,
+    window: dict | None = None,
+    profile: bool = False,
+    region: str | None = None,
+    anonymous: bool = True,
+    stage_stats: dict | None = None,
+):
+    """Process one raster shard into its own hive leaf store (issue #247).
+
+    The raster analog of :func:`zagg.hive.process_and_write_hive` — the
+    SHARED per-(shard, window) write path for both dispatchers, so leaf
+    templating, slab placement, coverage, and stamp ordering cannot drift
+    between backends. The unit's output is a self-describing leaf zarr at
+    :func:`zagg.hive.shard_leaf_path` (windowed name when ``window`` is
+    given, the bare schedule-``none`` leaf otherwise, D13), whose time axis
+    is the unit's OWN acquisition groups (:func:`raster_time_index` over the
+    dispatched subset — deterministic, so both dispatchers produce identical
+    leaves). The leaf template is emitted lazily on the first slab
+    (``overwrite=True``): a no-data unit never creates the ``.zarr/`` prefix,
+    a torn worker leaves an UNSTAMPED prefix (debris, D4), and a re-run
+    replaces the leaf wholesale (the D13 append/idempotency story).
+
+    ``window`` is the dispatch unit's ``{"label", ...}`` payload. Membership
+    was decided AT DISPATCH — the acquisition group's STAC ``datetime``, the
+    ratified issue #247 rule — so unlike the aggregation path no
+    observation-level filter is injected; the window selects the leaf name,
+    arms the D14 popcount (``encoding: "full"`` — gated off on ``None``
+    exactly as aggregation gates it for schedule-none stores), and adds the
+    D15 stamp truth: the window label plus the ACTUAL ISO-UTC ``[min, max]``
+    of the unit's acquisition datetimes (also returned as
+    ``metadata["time_range"]`` for the dispatcher's root-summary union).
+
+    The stamp is the leaf's FINAL write: dense slabs (streamed) -> coverage
+    sidecar (edge shards only; interior shards stamp ``"full"`` with no
+    sidecar PUT) -> stamp. ``cells_with_data`` counts the occupied-cell
+    union; ``granule_count`` the unit's acquisitions (asset-carrying
+    entries). ``profile`` mirrors the flat handler's issue #100/#249
+    convention: ``metadata["phase_timings"] = {"sample", "write", "stages"}``
+    with the leaf write-out (template + slabs + sidecar + stamp) as
+    ``write``; default makes no timing calls beyond a passed-through
+    ``stage_stats`` (the local dispatcher's debug-logging flavor).
+    """
+    from zagg.hive import (
+        COVERAGE_SIDECAR,
+        build_coverage,
+        encode_coverage_bitmap,
+        shard_leaf_path,
+        stamp_commit,
+        write_coverage_sidecar,
+    )
+    from zagg.store import open_store
+
+    t_start = time.time()
+    if profile and stage_stats is None:
+        stage_stats = new_stage_stats()
+    label = window["label"] if window else None
+    leaf_path = shard_leaf_path(store_root, int(shard_key), window=label)
+    # The leaf's own time axis, from the dispatched subset. Every group key in
+    # the subset is in this index by construction, so the worker never trips
+    # the foreign-manifest guard.
+    time_index, times_us = raster_time_index([granules])
+    box: dict = {}
+    write_s = 0.0
+
+    def _leaf():
+        if "store" not in box:
+            store = open_store(leaf_path, **store_kwargs)
+            # overwrite=True: an existing prefix is debris from a torn run
+            # (D4) or a prior committed leaf being redone (D13 re-run) — both
+            # replaced wholesale; per-leaf state never blocks a retry. The
+            # overwrite enumeration warns about the prior attempt's coverage
+            # sidecar — the one foreign key we put there ourselves — so that
+            # specific warning is expected and suppressed (the
+            # process_and_write_hive posture); anything else stays loud.
+            with warnings.catch_warnings():
+                warnings.filterwarnings("ignore", message=f"Object at {COVERAGE_SIDECAR}")
+                emit_raster_leaf_template(
+                    store, grid, config, int(shard_key), times_us, overwrite=True
+                )
+            box["store"] = store
+        return box["store"]
+
+    def _write_slab(t_idx, slab):
+        nonlocal write_s
+        _t0 = time.time() if profile else None
+        write_raster_leaf_slab(_leaf(), grid, t_idx, slab)
+        if profile:
+            write_s += time.time() - _t0
+
+    occupied: list = []
+    _slabs, meta = process_raster_shard(
+        grid,
+        int(shard_key),
+        granules,
+        config,
+        time_index,
+        region=region,
+        anonymous=anonymous,
+        on_slab=_write_slab,
+        stage_stats=stage_stats,
+        occupied_out=occupied,
+    )
+    # Stamp ONLY a leaf that wrote slabs: a unit that streamed nothing has no
+    # prefix, and a worker error raised out above, leaving debris (D4). Write
+    # order is pinned: dense slabs -> coverage sidecar -> stamp.
+    meta["cells_with_data"] = 0
+    if "store" in box:
+        _t0 = time.time() if profile else None
+        words = occupied[0] if occupied and occupied[0].size else None
+        # D14 popcount: a fully-occupied subtree stamps encoding "full" — no
+        # sidecar PUT. Gated on a windowed unit (/2 stores) so schedule-none
+        # output mirrors aggregation's gate (hive.process_and_write_hive).
+        depth = int(grid.child_order) - int(grid.parent_order)
+        full = window is not None and words is not None and np.unique(words).size == 4**depth
+        bitmap = None
+        if words is not None and not full and depth > 0:
+            bitmap = encode_coverage_bitmap(int(shard_key), words, grid.child_order)
+            write_coverage_sidecar(leaf_path, bitmap, **store_kwargs)
+        # D15 truth: the actual acquisition extent written, as ISO-UTC — the
+        # min/max STAC datetime over the unit's asset-carrying entries (item
+        # instants, not group coordinates, so adjacent-tile spreads count).
+        time_range = None
+        if window is not None:
+            instants = [_iso_us(e["datetime"]) for e in granules if e.get("assets")]
+            if instants:
+                time_range = [_us_iso(min(instants)), _us_iso(max(instants))]
+                meta["time_range"] = time_range
+        meta["cells_with_data"] = int(words.size) if words is not None else 0
+        stamp_commit(
+            box["store"],
+            cells_with_data=meta["cells_with_data"],
+            granule_count=meta["granule_count"] - meta["skipped"],
+            coverage=build_coverage(
+                int(shard_key), words, grid.child_order, bitmap=bitmap, full=full
+            ),
+            window=label,
+            time_range=time_range,
+        )
+        if profile:
+            write_s += time.time() - _t0
+    # Phase split (issues #100/#249, the flat raster handler's convention):
+    # only a unit that actually wrote carries it, so a no-data unit stays
+    # write-less and sample/write always decompose this call's wall.
+    if profile and "store" in box:
+        meta["phase_timings"] = {
+            "sample": (time.time() - t_start) - write_s,
+            "write": write_s,
+            "stages": stage_stats,
+        }
+    return meta
+
+
 __all__ = [
+    "new_stage_stats",
     "sample_asset",
     "sample_asset_async",
     "sample_item_async",
     "raster_time_index",
     "process_raster_shard",
+    "process_and_write_raster_hive",
     "raster_group_spec",
+    "raster_leaf_spec",
     "emit_raster_template",
+    "emit_raster_leaf_template",
     "write_raster_slab",
+    "write_raster_leaf_slab",
     "write_raster_coords",
 ]

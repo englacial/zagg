@@ -150,6 +150,9 @@ output:
 # Optional top-level fields:
 catalog: catalog_ATL06_cycle22_order6.json
 store: ./output.zarr
+worker:            # lambda backend: pick a pre-provisioned worker size
+  memory: 2048     # 2048 | 4096 | 8192 (see docs/deployment/lambda.md)
+  extra_disk: false
 ```
 
 HEALPix output writes a **morton-hive, sharded** store by default: one
@@ -158,8 +161,10 @@ inner chunks bundled into one object per array — see
 [Hive store layout](hive_layout.md) and [Sharded storage](sharding.md).
 An explicit `output.store_layout: flat` (the single shared zarr store) remains
 for interop/debug but is deprecated — removal is tracked in
-[issue #251](https://github.com/englacial/zagg/issues/251). Rectilinear grids
-and raster pipelines keep the flat shared store.
+[issue #251](https://github.com/englacial/zagg/issues/251). The default is
+grid-keyed, not pipeline-keyed: HEALPix raster output writes hive leaves too
+([issue #247](https://github.com/englacial/zagg/issues/247)); rectilinear
+grids keep the flat shared store.
 
 See `src/zagg/configs/atl06.yaml` for a complete example and the
 [custom aggregations notebook](https://github.com/englacial/zagg/blob/main/notebooks/custom_aggregations.ipynb)

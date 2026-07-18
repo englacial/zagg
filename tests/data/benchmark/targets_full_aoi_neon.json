@@ -1,5 +1,5 @@
 {
-  "description": "Full-AOI NEON benchmark targets (issue #202 legs 1+5). Unlike targets.json (ONE pinned densest shard/target), each target here dispatches ALL shards over the AOP_NEON.geojson box, so the recorded numbers are the true full-AOI cost, not a single-cell probe. Reset-series axes per issue #202: index_backend (inline vs sidecar) x aoi_mask (on vs off), o9 shards only, tdigest/sharded/granule_workers=4 fixed. Recorded PER RELEASE (not per merge). run_full_aoi_benchmark.py builds the shardmap over the AOI+temporal+cmr below from a catalog (--catalog), then dispatches every shard. In CI it builds from the PINNED catalog catalogs/cat_neon.parquet -- the AOI-bbox+temporal subset of the local full ATL03 catalog (2089 granules, the cat_88s precedent), so the release harness runs offline (no CMR) and the granule set is FIXED across releases: the per-release series then tracks CODE change over the whole AOI, not CMR data drift. Rebuild it by prefiltering the full catalog to this manifest's aoi bbox + temporal (run_full_aoi_benchmark._prefilter) and Catalog.to_geoparquet. The whole-AOI build fans to 4 o9 shards (densest 92 granules -- distinct from targets.json's single CMR-pinned densest cell at 66). NOT consumed by run_benchmark.py or the single-shard drift test; a NEW harness owns it (leg 4a).",
+  "description": "Full-AOI NEON benchmark targets (issue #202 legs 1+5), collapsed to the SINGLE point-pipeline release leg per issue #250 (espg-approved restructure on PR #256): o9, hive store layout, sharded, tdigest, inline read, WITH the strict AOI binary mask, all shards over the AOP_NEON.geojson box, recorded PER RELEASE. The former inline/sidecar x mask/nomask 2x2 and the flat parity arm are retired (their rows stay in full_aoi_series.parquet; figures move to Archived). The raster release leg (Sentinel-2 2025) rides its own manifest (targets_raster_neon.json) and harness. run_full_aoi_benchmark.py builds the shardmap over the AOI+temporal+cmr below from the PINNED catalog catalogs/cat_neon.parquet (2089 granules, offline, fixed across releases: the series tracks CODE change, not CMR drift; rebuild via run_full_aoi_benchmark._prefilter + Catalog.to_geoparquet). The whole-AOI build fans to 4 o9 shards. Dispatched with profile=True so the worker phase split (read/index/aggregate/write) lands in the series.",
   "aoi": {
     "file": "AOP_NEON.geojson",
     "name": "NEON SERC AOP box"
@@ -21,47 +21,14 @@
     "note": "Default dispatch target; the workflow overrides region/function from the shared BENCHMARK_* repo vars (the same ones the per-merge run uses). No account is pinned -- the release run reuses the per-merge benchmark role, and run_benchmark.py asserts no account either. A fork may add an optional expect_account here to make the harness assert the caller account before billing (it no-ops when absent)."
   },
   "targets": {
-    "full_aoi_neon_o9_inline_nomask": {
-      "config": "configs/atl03_tdigest_healpix_o9.yaml",
-      "aggregator": "tdigest",
-      "grid_type": "healpix",
-      "grid_size": "o9",
-      "index_backend": "inline",
-      "aoi_mask": false
-    },
-    "full_aoi_neon_o9_inline_mask": {
-      "config": "configs/atl03_tdigest_healpix_o9.yaml",
-      "aggregator": "tdigest",
-      "grid_type": "healpix",
-      "grid_size": "o9",
-      "index_backend": "inline",
-      "aoi_mask": true
-    },
-    "full_aoi_neon_o9_sidecar_nomask": {
-      "config": "configs/atl03_tdigest_healpix_o9.yaml",
-      "aggregator": "tdigest",
-      "grid_type": "healpix",
-      "grid_size": "o9",
-      "index_backend": "sidecar",
-      "aoi_mask": false
-    },
-    "full_aoi_neon_o9_sidecar_mask": {
-      "config": "configs/atl03_tdigest_healpix_o9.yaml",
-      "aggregator": "tdigest",
-      "grid_type": "healpix",
-      "grid_size": "o9",
-      "index_backend": "sidecar",
-      "aoi_mask": true
-    },
-    "full_aoi_neon_o9_hive": {
-      "_comment": "Hive-layout PRIMARY arm over ALL 4 NEON shards (hive is the HEALPix default since issue #253; issue #240 item 2, unblocked by issue #236). RECORD-ONLY like the rest of the release leg (espg ruling on PR #242: a flaky-CMR release must never be blocked). parity_with names the flat sibling target (same config modulo store_layout): after this target's dispatch the harness reads BOTH stores back and records per-shard array-content parity (parity_ok + JSON detail) -- the flat sibling must run first, so this target is listed last (targets run in manifest order). Excluded from the 2x2 cost panels via the store_layout column; its rows live in the release series parquet.",
+    "full_aoi_neon_o9_hive_mask": {
+      "_comment": "The whole point-pipeline release leg (issue #250 collapse): the per-merge hive config plus the strict AOI binary mask (issue #101), every NEON shard. Record-only like the rest of the release leg (espg ruling on PR #242: a release is never blocked on it).",
       "config": "configs/atl03_tdigest_healpix_o9_hive.yaml",
       "aggregator": "tdigest",
       "grid_type": "healpix",
       "grid_size": "o9",
       "index_backend": "inline",
-      "aoi_mask": false,
-      "parity_with": "full_aoi_neon_o9_inline_nomask"
+      "aoi_mask": true
     }
   }
 }

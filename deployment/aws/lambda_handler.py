@@ -43,7 +43,11 @@ Event payload (default / process mode):
 Setup mode (creates the zarr template once before per-cell fan-out; for a
 hive-layout config -- output.store_layout: hive, issue #199 -- it writes the
 morton_hive.json manifest instead, and each process-mode worker emits its own
-leaf template):
+leaf template. Current dispatchers send hive setup as a fire-and-forget Event
+invoke right after the ping -- the primary manifest write, issue #252 hybrid
+-- and older synchronous dispatchers keep working against this function. For
+a raster-pipeline config -- data_source.reader: raster, issue #264 -- it
+writes the raster (time, cells) template instead, from a synchronous invoke):
 {
     "mode": "setup",
     "store_path": str,
@@ -55,15 +59,45 @@ leaf template):
     "dataset": dict (optional, hive only) -- {"short_name", "version"} identity
         block for the manifest, sourced from the ShardMap metadata by the
         orchestrator (matching the local dispatcher). Absent on flat runs.
+    "times_us": [int, ...] (raster only, issue #264) -- the catalog-derived
+        time coordinate, int64 microseconds since the epoch; the orchestrator
+        owns the global timestep index and threads it here so the template
+        write needs no S3 access from the dispatcher.
     "output_credentials": dict (optional, same shape as process mode),
 }
 
-Finalize mode (consolidates zarr metadata after all cells complete):
+Finalize mode (after all cells complete: consolidates zarr metadata; for a
+hive-layout config -- issue #252 hybrid -- it re-ensures the morton_hive.json
+manifest instead, the idempotent backstop for the async init-time setup write):
 {
     "mode": "finalize",
     "store_path": str,
+    "config": dict (optional, hive only) -- same single-source config as setup;
+        its presence + store_layout selects the manifest write. With it ride
+        "parent_order", "overwrite", and the optional "dataset" identity
+        block, mirroring the hive setup event. Absent on flat runs (their
+        event is byte-identical to pre-#252).
     "output_credentials": dict (optional, same shape as process mode),
 }
+
+Ping mode (hive pre-fan-out preflight, issue #252 — writes nothing; kept while
+flat exists, issue #251):
+{
+    "mode": "ping",
+    "store_path": str,
+    "config": dict,             # same manifest inputs as hive finalize; with it
+    "parent_order": int,        #   ride "overwrite" and the optional "dataset"
+    "overwrite": bool,          #   identity block
+    "dataset": dict (optional),
+    "output_credentials": dict (optional, same shape as process mode),
+}
+Answering 200 at all is the versioning half of the guard: a function deployed
+before the issue #252 hive dispatch lifecycle doesn't know the mode, so
+the event falls through to the process handler's 400 (zero writes) and the
+dispatcher fails fast with a redeploy message before any worker runs. The body
+echoes the deployed zagg version; the handler also runs the READ-ONLY
+zagg.hive.validate_manifest against any existing root so an incompatible rerun
+refuses up front (D2).
 
 Extract mode (chunk-boundary geometry extraction, issue #148 — one parquet per
 granule under an S3 prefix; a batch of granules per invocation for the fan-out):
@@ -444,6 +478,7 @@ def lambda_handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
 
     Default ``mode`` (or no mode) runs per-cell processing. ``mode="setup"``
     creates the zarr template; ``mode="finalize"`` consolidates metadata;
+    ``mode="ping"`` is the hive pre-fan-out preflight (issue #252);
     ``mode="coverage"`` writes the store-root ``coverage.moc`` (issue #200);
     ``mode="extract"`` extracts chunk-boundary geometry parquets (issue #148);
     ``mode="process_event"`` runs the temporal/event worker (issue #12).
@@ -459,6 +494,8 @@ def lambda_handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
         return _handle_setup(event)
     if mode == "finalize":
         return _handle_finalize(event)
+    if mode == "ping":
+        return _handle_ping(event)
     if mode == "coverage":
         return _handle_coverage(event)
     # Extract mode returns directly: the result_url mirror below is for the
@@ -608,12 +645,28 @@ def _handle_extract(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
 def _handle_setup(event: Dict[str, Any]) -> Dict[str, Any]:
     """Create the zarr template at ``event['store_path']``.
 
+    For a FLAT raster-pipeline config (``data_source.reader: raster``, issue
+    #264; the hive layout wins the branch below regardless of pipeline kind —
+    issue #247) this writes the ``(time, cells)`` raster template + its ``time``
+    coordinate via ``emit_raster_template`` — the orchestrator dispatches it
+    as a synchronous setup invoke before fan-out (the template is
+    load-bearing: workers write slabs into its arrays), so an invoke-only
+    dispatcher (the CI OIDC role) never needs S3 write access. ``times_us``
+    (the catalog-derived int64 time coordinate) rides in the event; the
+    success body echoes ``"pipeline": "raster"`` so the dispatcher can refuse
+    a stale deployment that fell through to the point-path template below.
+
     For a hive-layout config (issue #199 phase 3) template time writes ONLY
     the ``morton_hive.json`` manifest — no global zarr template exists (zero
     metadata above the leaves, D5); each worker emits its own leaf template.
-    The optional ``dataset`` event key carries the manifest's identity block
-    (the orchestrator sources it from the ShardMap metadata, same as the local
-    path). The flat path below is byte-identical to before, bar one addition:
+    Current dispatchers send hive setup as a fire-and-forget Event invoke
+    right after the ping (issue #252 hybrid) — this branch is the PRIMARY
+    manifest write, run off the critical path, with finalize as idempotent
+    backstop; older synchronous dispatchers keep working against it
+    unchanged. The optional ``dataset`` event key carries
+    the manifest's identity block (the orchestrator sources it from the
+    ShardMap metadata, same as the local path).
+    The flat path below is byte-identical to before, bar one addition:
     the success body now ECHOES the layout it acted on (``"layout"``) — a
     stale deployment without the hive branch returns the old echo-less body,
     which the dispatcher rejects for hive runs instead of silently letting old
@@ -624,6 +677,12 @@ def _handle_setup(event: Dict[str, Any]) -> Dict[str, Any]:
     logger.info(f"Setup mode: creating template at {event.get('store_path')}")
     try:
         config = load_config_from_dict(event["config"])
+        # Layout splits BEFORE pipeline (issue #247): a hive store's template
+        # time writes ONLY the manifest regardless of pipeline kind (D5 — the
+        # raster hive worker emits its own per-leaf templates, exactly like
+        # the point path), so the hive branch below owns raster + hive too;
+        # the raster branch here is the FLAT (time, cells) template (issue
+        # #264), byte-identical for flat raster runs.
         if get_store_layout(config) == "hive":
             from zagg.config import get_windowing
             from zagg.hive import build_manifest, ensure_manifest
@@ -641,6 +700,48 @@ def _handle_setup(event: Dict[str, Any]) -> Dict[str, Any]:
             return {
                 "statusCode": 200,
                 "body": json.dumps({"ok": True, "mode": "setup", "layout": "hive"}),
+            }
+        if (config.data_source or {}).get("reader") == "raster":
+            import numpy as np
+
+            from zagg.config import get_layout
+            from zagg.processing.raster import emit_raster_template
+
+            if get_layout(config) == "dense":
+                # Symmetry with the worker (_handle_process_raster): the dense
+                # layout was removed outright (issue #88), so from_config below
+                # would raise — surfacing as a retried 500 from this invoke-only
+                # path. Reject the stale deployed event with the worker's clean
+                # 400 instead (the PR #257 fold pattern); validate_config
+                # rejects dense pre-dispatch too, so this is defense-in-depth
+                # (issue #264).
+                error_msg = "raster lambda workers require output.grid.layout: fullsphere"
+                logger.error(error_msg)
+                return {"statusCode": 400, "body": json.dumps({"error": error_msg})}
+            store = open_store(event["store_path"], **_output_store_kwargs(event))
+            grid = from_config(config)
+            times_us = np.asarray(event["times_us"], dtype=np.int64)
+            if times_us.size == 0:
+                # A zero-timestep template is degenerate: the arrays get a
+                # 0-length time axis no worker can slab-write into.
+                # RasterStrategy.run refuses an empty catalog before it would
+                # dispatch (runner.py); guard the load-bearing invoke-only
+                # writer too, so a hand-rolled or drifted event can't write an
+                # unusable success-shaped store (issue #264).
+                raise ValueError("raster setup received empty times_us (no timesteps to template)")
+            emit_raster_template(
+                store, grid, config, times_us, overwrite=event.get("overwrite", False)
+            )
+            return {
+                "statusCode": 200,
+                "body": json.dumps(
+                    {
+                        "ok": True,
+                        "mode": "setup",
+                        "pipeline": "raster",
+                        "timesteps": int(times_us.size),
+                    }
+                ),
             }
         store = open_store(event["store_path"], **_output_store_kwargs(event))
         # Build the grid exactly as the worker does (from_config), so the
@@ -662,17 +763,97 @@ def _handle_setup(event: Dict[str, Any]) -> Dict[str, Any]:
 
 
 def _handle_finalize(event: Dict[str, Any]) -> Dict[str, Any]:
-    """Consolidate zarr metadata for the store at ``event['store_path']``."""
-    from zarr import consolidate_metadata
+    """Finalize the store at ``event['store_path']``.
 
-    logger.info(f"Finalize mode: consolidating metadata at {event.get('store_path')}")
+    Flat: consolidate zarr metadata (byte-identical to before). Hive (issue
+    #252 hybrid): re-ensure the root ``morton_hive.json`` manifest — the
+    idempotent BACKSTOP for the async init-time setup invoke (a frozen-key-
+    matching manifest is accepted, no second PUT). Worker Event invokes run
+    with retries 0 (template.yaml EventInvokeConfig), so a lost async init
+    write is never redelivered — this backstop self-heals it. The manifest
+    inputs mirror the hive setup event (``config``/``parent_order``/
+    ``dataset``/``overwrite``); there is no zarr hierarchy above the leaves
+    to consolidate (D5), so the hive branch returns without touching zarr.
+    The success body echoes ``"layout": "hive"``, matching setup's echo.
+    """
+    logger.info(f"Finalize mode: finalizing store at {event.get('store_path')}")
     try:
+        if "config" in event:
+            config = load_config_from_dict(event["config"])
+            if get_store_layout(config) == "hive":
+                from zagg.config import get_windowing
+                from zagg.grids import from_config
+                from zagg.hive import build_manifest, ensure_manifest
+
+                grid = from_config(config, parent_order=event.get("parent_order"))
+                ensure_manifest(
+                    event["store_path"],
+                    build_manifest(
+                        grid, dataset=event.get("dataset"), windowing=get_windowing(config)
+                    ),
+                    overwrite=event.get("overwrite", False),
+                    **_output_store_kwargs(event),
+                )
+                return {
+                    "statusCode": 200,
+                    "body": json.dumps({"ok": True, "mode": "finalize", "layout": "hive"}),
+                }
+        from zarr import consolidate_metadata
+
         store = open_store(event["store_path"], **_output_store_kwargs(event))
         consolidate_metadata(store, zarr_format=3)
         return {"statusCode": 200, "body": json.dumps({"ok": True, "mode": "finalize"})}
     except Exception as e:
         logger.exception(e)
         return {"statusCode": 500, "body": json.dumps({"error": str(e), "mode": "finalize"})}
+
+
+def _handle_ping(event: Dict[str, Any]) -> Dict[str, Any]:
+    """Hive pre-fan-out preflight (issue #252) — writes nothing.
+
+    Answering 200 at all is the versioning half of the guard: a function that
+    predates the issue #252 hive lifecycle doesn't know ``mode="ping"``,
+    so the event falls through to its process handler's 400 (zero writes) and
+    the dispatcher fails fast with a redeploy message before any worker is
+    dispatched. The body echoes the deployed zagg version for observability.
+
+    The store half mirrors setup/finalize's manifest inputs and runs the
+    READ-ONLY :func:`zagg.hive.validate_manifest` against any existing root,
+    so a run into a store templated for different orders/identity refuses up
+    front (the D2 mixed-order footgun) instead of after the fan-out (PR #255
+    review fold). This covers sequential reruns; two concurrent runs into
+    the same fresh root both pass here, colliding within seconds of init
+    once the async setup write lands (issue #252 hybrid). Kept while flat
+    exists (issue #251): once flat is removed, a stale function simply
+    errors and the ping can be dropped.
+    """
+    logger.info(f"Ping mode: hive preflight for {event.get('store_path')}")
+    try:
+        import zagg
+
+        if "config" in event:
+            config = load_config_from_dict(event["config"])
+            if get_store_layout(config) == "hive":
+                from zagg.config import get_windowing
+                from zagg.grids import from_config
+                from zagg.hive import build_manifest, validate_manifest
+
+                grid = from_config(config, parent_order=event.get("parent_order"))
+                validate_manifest(
+                    event["store_path"],
+                    build_manifest(
+                        grid, dataset=event.get("dataset"), windowing=get_windowing(config)
+                    ),
+                    overwrite=event.get("overwrite", False),
+                    **_output_store_kwargs(event),
+                )
+        return {
+            "statusCode": 200,
+            "body": json.dumps({"ok": True, "mode": "ping", "zagg_version": zagg.__version__}),
+        }
+    except Exception as e:
+        logger.exception(e)
+        return {"statusCode": 500, "body": json.dumps({"error": str(e), "mode": "ping"})}
 
 
 def _handle_coverage(event: Dict[str, Any]) -> Dict[str, Any]:
@@ -855,8 +1036,23 @@ def _handle_process_raster(event: Dict[str, Any]) -> Dict[str, Any]:
     mode.
     """
     start_time = time.time()
+    # Per-invocation peak-RSS sampler (issue #141 convention; raster parity
+    # for issue #250): the body reports THIS invocation's sampled peak, with
+    # the container-lifetime ``ru_maxrss`` high-water as the off-Linux
+    # fallback -- exactly the point-path split.
+    rss_sampler = _PeakRSSSampler().start()
     try:
-        required = ["shard_key", "granules", "config", "store_path", "time_index"]
+        # The hive path (issue #247) needs no ``time_index``: the worker
+        # builds its own leaf-local index from the dispatched subset. Peek at
+        # the raw config dict (no load yet) so a flat event — including one
+        # with no config at all — reports the flat requirements byte-identical
+        # to before.
+        cfg_dict = event.get("config")
+        output = cfg_dict.get("output") if isinstance(cfg_dict, dict) else None
+        hive = isinstance(output, dict) and output.get("store_layout") == "hive"
+        required = ["shard_key", "granules", "config", "store_path"]
+        if not hive:
+            required.append("time_index")
         missing = [p for p in required if p not in event]
         if missing:
             error_msg = f"Missing required parameters: {', '.join(missing)}"
@@ -865,6 +1061,7 @@ def _handle_process_raster(event: Dict[str, Any]) -> Dict[str, Any]:
 
         from zagg.grids import from_config
         from zagg.processing.raster import (
+            new_stage_stats,
             process_raster_shard,
             write_raster_coords,
             write_raster_slab,
@@ -881,8 +1078,61 @@ def _handle_process_raster(event: Dict[str, Any]) -> Dict[str, Any]:
             return {"statusCode": 400, "body": json.dumps({"error": str(e)})}
 
         shard_key = int(event["shard_key"])
-        time_index = {k: int(v) for k, v in event["time_index"].items()}
         source = config.data_source or {}
+        profile = bool(event.get("profile"))
+
+        if hive:
+            # Hive branch (issue #247), mirroring the aggregation one: the
+            # worker owns its WHOLE leaf — process_and_write_raster_hive is
+            # the same code path the local dispatcher runs (leaf template +
+            # slabs + coverage + D4 commit stamp), so leaf semantics cannot
+            # drift between backends. ``window`` ({"label", ...}) is the
+            # dispatch unit's time window, absent on schedule-none stores; the
+            # response mirrors the stamped ISO ``time_range`` back for the
+            # dispatcher's root-summary union. A write failure raises into the
+            # 500 envelope: the leaf is then unstamped debris, replaced
+            # wholesale on retry (D13).
+            from zagg.processing.raster import process_and_write_raster_hive
+
+            meta = process_and_write_raster_hive(
+                shard_key,
+                event["granules"],
+                grid,
+                event["store_path"],
+                config,
+                store_kwargs=_output_store_kwargs(event),
+                window=event.get("window"),
+                profile=profile,
+                region=source.get("source_region"),
+                anonymous=source.get("anonymous", True),
+            )
+            body = {
+                "shard_key": shard_key,
+                "timesteps": meta["timesteps"],
+                "granule_count": meta["granule_count"],
+                "skipped": meta["skipped"],
+                # Shared summary keys (see the flat branch below): a raster
+                # unit's obs tally is its timestep count; cells_with_data
+                # counts the leaf's occupied-cell union via the stamp input.
+                "cells_with_data": meta.get("cells_with_data", 0),
+                "total_obs": meta["timesteps"],
+                "duration_s": time.time() - start_time,
+            }
+            if meta.get("time_range") is not None:
+                body["time_range"] = meta["time_range"]
+            # Worker memory telemetry (issue #250), mirroring the flat branch:
+            # sampled per-invocation peak, container high-water fallback.
+            rss_sampler.stop()
+            body["container_hwm_mb"] = _max_memory_mb()
+            sampled_peak = rss_sampler.peak_mb
+            body["max_memory_mb"] = (
+                sampled_peak if sampled_peak is not None else body["container_hwm_mb"]
+            )
+            if profile and "phase_timings" in meta:
+                body["phase_timings"] = meta["phase_timings"]
+            return {"statusCode": 200, "body": json.dumps(body)}
+
+        time_index = {k: int(v) for k, v in event["time_index"].items()}
 
         # Stream the slabs: open the store up front and write + free each
         # timestep's slab as ``process_raster_shard`` completes its acquisition
@@ -895,10 +1145,14 @@ def _handle_process_raster(event: Dict[str, Any]) -> Dict[str, Any]:
         # remainder — the split the PR #232 double-buffer decision needs
         # measured. Exact at write_buffer=1 (writes serialize in the loop);
         # at write_buffer>1 writes overlap sampling, so the remainder is
-        # approximate — A/B on ``duration_s`` instead. Default (no
-        # ``profile`` key) emits nothing: the body stays byte-identical.
-        profile = bool(event.get("profile"))
+        # approximate — A/B on ``duration_s`` instead. ``stages`` (issue
+        # #249) splits the sample bucket into per-stage work volumes +
+        # counts — attribution, not a wall decomposition: concurrent samples
+        # overlap, so stage sums can exceed ``sample`` (see
+        # ``new_stage_stats``). Default (no ``profile`` key) emits nothing:
+        # the body stays byte-identical and the sample path times nothing.
         write_s = 0.0
+        stage_stats = new_stage_stats() if profile else None
 
         def _write_slab(t_idx: int, slab: dict) -> None:
             nonlocal wrote, write_s
@@ -917,6 +1171,7 @@ def _handle_process_raster(event: Dict[str, Any]) -> Dict[str, Any]:
             region=source.get("source_region"),
             anonymous=source.get("anonymous", True),
             on_slab=_write_slab,
+            stage_stats=stage_stats,
         )
         if wrote:
             write_raster_coords(store, grid, shard_key)
@@ -932,9 +1187,21 @@ def _handle_process_raster(event: Dict[str, Any]) -> Dict[str, Any]:
             "total_obs": meta["timesteps"],
             "duration_s": time.time() - start_time,
         }
+        # Worker memory telemetry (issue #250): sampled per-invocation peak,
+        # container high-water fallback (see the process-mode stamp).
+        rss_sampler.stop()
+        body["container_hwm_mb"] = _max_memory_mb()
+        sampled_peak = rss_sampler.peak_mb
+        body["max_memory_mb"] = (
+            sampled_peak if sampled_peak is not None else body["container_hwm_mb"]
+        )
         if profile:
             total = time.time() - start_time
-            body["phase_timings"] = {"sample": total - write_s, "write": write_s}
+            body["phase_timings"] = {
+                "sample": total - write_s,
+                "write": write_s,
+                "stages": stage_stats,
+            }
         return {"statusCode": 200, "body": json.dumps(body)}
     except Exception as e:
         logger.error(f"raster worker failed: {e}", exc_info=True)
@@ -948,6 +1215,8 @@ def _handle_process_raster(event: Dict[str, Any]) -> Dict[str, Any]:
                 }
             ),
         }
+    finally:
+        rss_sampler.stop()  # idempotent; ends the daemon thread on error paths too
 
 
 def _handle_process(event: Dict[str, Any], context: Any) -> Dict[str, Any]:

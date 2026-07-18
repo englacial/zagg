@@ -17,9 +17,10 @@ leaf zarr** under a morton digit tree::
   ``*.zarr`` objects — zero zarr metadata above the leaf, so 2,000 workers
   share no mutable state and a delimiter-LIST with no digit children is a
   definitive "nothing finer exists".
-- **Manifest (D6)**: ``morton_hive.json`` is written once at template time and
-  never touched during a run; with it every shard path is computable with zero
-  requests. The convention is versioned (``morton-hive/1``) from day one.
+- **Manifest (D6)**: ``morton_hive.json`` is written once — at finalize since
+  issue #252 (reader-facing only; workers never read it) — and never touched
+  during a run; with it every shard path is computable with zero requests.
+  The convention is versioned (``morton-hive/1``) from day one.
 - **Commit stamp (D4)**: the shard's FINAL write is a root
   ``group.attrs.update(...)`` marking completion (plus cell count, timestamp,
   granule count). A ``.zarr/`` prefix whose root metadata lacks the stamp is
@@ -49,6 +50,7 @@ from __future__ import annotations
 
 import json
 import logging
+import time
 import warnings
 from datetime import datetime, timezone
 
@@ -202,23 +204,28 @@ def build_manifest(grid, dataset: dict | None = None, windowing: dict | None = N
     return manifest
 
 
-def ensure_manifest(store_root: str, manifest: dict, *, overwrite: bool = False, **store_kwargs):
-    """Write the root manifest once at template time; verify it on reruns.
+def validate_manifest(
+    store_root: str, manifest: dict, *, overwrite: bool = False, **store_kwargs
+) -> dict | None:
+    """Read-only frozen-key precheck — the fail-fast half of the manifest guard.
 
-    A retry into an existing hive store must be able to proceed (that is the
-    D4 debris/retry model), so an existing manifest is accepted — but only if
-    its FROZEN keys match the run's own (:data:`_FROZEN_MANIFEST_KEYS`: orders
-    + identity + schedule — the flat path's ``_check_signature`` analogue).
-    ``generated_at`` and ``pyramid`` are excluded: the pyramid block is
-    populated/updated by the §7 sweep by design (D11), so comparing it would
-    brick every resume after the first sweep.
+    Split out of :func:`ensure_manifest` when the manifest WRITE came off the
+    synchronous pre-dispatch path (issue #252). The write moving off the
+    critical path is fine for readers, but it dragged the writer-side guard
+    along with it — so an incompatible rerun could write mixed-order leaves
+    before the check ever fired (D2). This function is the guard on its own:
+    the lambda ping runs it BEFORE fan-out to refuse an incompatible existing
+    store up front, while the write itself rides the async init-time setup
+    invoke with a finalize backstop (issue #252 hybrid; the local dispatcher
+    writes directly at init via :func:`ensure_manifest`, which calls this
+    first).
 
-    ``overwrite=True`` replaces the MANIFEST ONLY — it never clears data. To
-    guard against the silent-corruption footgun (committed leaves from the old
-    orders would survive a "re-template" and be indistinguishable from legal
-    mixed-order data, D2), an overwrite that CHANGES the frozen keys refuses
-    when the digit tree already has children (one delimiter-LIST); clear the
-    store root first. Returns the manifest now in effect.
+    Performs exactly the checks :func:`ensure_manifest` does and writes nothing:
+    reads the existing manifest; on an existing store whose FROZEN keys mismatch
+    (:data:`_FROZEN_MANIFEST_KEYS`) it raises — the same ``does not match this
+    run`` refusal without ``overwrite``, and the same ``list_with_delimiter``
+    shard-data refusal with ``overwrite`` (the D2 old-order-masquerade footgun).
+    Returns the existing manifest (``None`` on a fresh root).
     """
     import obstore
 
@@ -248,6 +255,47 @@ def ensure_manifest(store_root: str, manifest: dict, *, overwrite: bool = False,
                 f"data (e.g. {children[0]!r}/), and overwrite replaces the "
                 f"manifest only — clear the store root first"
             )
+    return existing
+
+
+def ensure_manifest(store_root: str, manifest: dict, *, overwrite: bool = False, **store_kwargs):
+    """Write the root manifest; verify it on reruns (idempotent).
+
+    Lifecycle (issue #252 hybrid): the PRIMARY write runs at init — the local
+    dispatcher writes directly pre-dispatch; the lambda dispatcher fires the
+    ``mode="setup"`` hive branch as a fire-and-forget Event invoke right
+    after the ping — so the manifest typically lands within seconds of init
+    (best-effort: the Event invoke shares worker concurrency and runs
+    retries-0, deferring to the finalize backstop under throttling or a
+    dropped invoke) and a reader can consume completed leaves while the store
+    builds. Finalize calls this
+    again as an idempotent BACKSTOP (an existing frozen-key-matching manifest
+    is accepted — no second PUT): worker Event invokes run with retries 0, so
+    a lost async init write self-heals at finalize. The fail-fast half of the
+    guard is exposed separately as :func:`validate_manifest` (the ping's
+    read-only precheck), which this function runs first.
+
+    A retry into an existing hive store must be able to proceed (that is the
+    D4 debris/retry model), so an existing manifest is accepted — but only if
+    its FROZEN keys match the run's own (:data:`_FROZEN_MANIFEST_KEYS`: orders
+    + identity + schedule — the flat path's ``_check_signature`` analogue).
+    ``generated_at`` and ``pyramid`` are excluded: the pyramid block is
+    populated/updated by the §7 sweep by design (D11), so comparing it would
+    brick every resume after the first sweep.
+
+    ``overwrite=True`` replaces the MANIFEST ONLY — it never clears data. To
+    guard against the silent-corruption footgun (committed leaves from the old
+    orders would survive a "re-template" and be indistinguishable from legal
+    mixed-order data, D2), an overwrite that CHANGES the frozen keys refuses
+    when the digit tree already has children (one delimiter-LIST); clear the
+    store root first. Returns the manifest now in effect.
+    """
+    import obstore
+
+    store = open_object_store(store_root, **store_kwargs)
+    existing = validate_manifest(store_root, manifest, overwrite=overwrite, **store_kwargs)
+    if existing is not None and not overwrite:
+        return existing
     obstore.put(store, MANIFEST_NAME, json.dumps(manifest, indent=1).encode())
     return manifest
 
@@ -843,9 +891,15 @@ def process_and_write_hive(
     the K carriers accumulate and the whole leaf is written once
     (``write_leaf_to_zarr`` — one ShardingCodec object per array), mirroring
     the flat sharded switch in ``runner._process_and_write``.
-    ``profile`` forwards to ``process_shard`` (issue #100); the write phase is
-    interleaved with the stream (or a single post-stream pass when sharded),
-    so no separate ``write`` timing is recorded.
+    ``profile`` forwards to ``process_shard`` (issue #100), which fills
+    ``metadata["phase_timings"]`` with read/index/aggregate; the leaf write
+    work — interleaved with the stream (or a single post-stream pass when
+    sharded), plus the ragged/coverage/stamp finalize — accumulates into an
+    additive ``write`` phase alongside them (issue #249). Unlike the flat
+    path, the lazy leaf template emission counts as write: in hive the worker
+    owns its leaf's template PUTs (there is no dispatcher-side template), so
+    excluding them would hide real write-out cost. Default ``False`` makes
+    zero timing calls and leaves ``metadata`` unchanged — no probe tax.
 
     ``window`` (issue #246, D13/D15) is one dispatch unit's time window:
     ``{"label", "start", "end"}``, bounds half-open in DATASET units
@@ -877,6 +931,7 @@ def process_and_write_hive(
 
     leaf_path = shard_leaf_path(store_root, shard_key, window=window["label"] if window else None)
     box: dict = {}
+    _write_elapsed = 0.0
 
     def _leaf():
         if "store" not in box:
@@ -927,11 +982,15 @@ def process_and_write_hive(
     ragged_chunks: list = []
 
     def _write_chunk(block_index, carrier, ragged):
+        nonlocal _write_elapsed
+        _t0 = time.time() if profile else None
         store = _leaf()
         local = leaf_block_index(grid, block_index, shard_key)
         write_dataframe_to_zarr(carrier, store, grid=grid, chunk_idx=local)
         if ragged:
             ragged_chunks.append((local, ragged))
+        if profile:
+            _write_elapsed += time.time() - _t0
 
     # Occupied-cell sink (issue #200): the worker already holds the shard's
     # populated cell words; collect them here to derive the stamp's coverage.
@@ -966,7 +1025,10 @@ def process_and_write_hive(
     # the ``.zarr/`` prefix — same contract as the streaming path's first
     # ``_write_chunk``.
     if sharded and chunk_results and not metadata.get("error"):
+        _t0 = time.time() if profile else None
         write_leaf_to_zarr(chunk_results, _leaf(), grid=grid, shard_key=int(shard_key))
+        if profile:
+            _write_elapsed += time.time() - _t0
     # Stamp ONLY a fully-written leaf: an errored shard (or one that streamed
     # no chunks) stays unstamped — debris by definition (D4). The stamp is the
     # last write, so its presence certifies everything before it landed — the
@@ -976,6 +1038,7 @@ def process_and_write_hive(
     # The leaf write order is pinned: dense (streamed, or one object each when
     # sharded) -> ragged (one object, issue #209) -> coverage sidecar -> stamp.
     if "store" in box and not metadata.get("error"):
+        _t0 = time.time() if profile else None
         if not sharded:
             write_ragged_leaf_to_zarr(ragged_chunks, box["store"], grid=grid)
         words = np.concatenate(occupied) if occupied else None
@@ -1004,6 +1067,16 @@ def process_and_write_hive(
             window=window["label"] if window else None,
             time_range=time_range,
         )
+        if profile:
+            _write_elapsed += time.time() - _t0
+    # Write-phase split (issue #249): read/index/aggregate come from
+    # ``process_shard``; ``write`` is the leaf write-out above (template +
+    # dense chunks + ragged + coverage sidecar + stamp). Same gate as the flat
+    # Lambda handler's issue #100 write bracket: only a clean, actually-written
+    # shard carries it, so a time-to-failure never lands as a write duration
+    # and a no-data shard (no leaf) stays write-less.
+    if profile and not metadata.get("error") and "phase_timings" in metadata and "store" in box:
+        metadata["phase_timings"]["write"] = _write_elapsed
     return metadata
 
 

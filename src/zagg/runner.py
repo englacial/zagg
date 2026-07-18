@@ -44,7 +44,6 @@ from zagg.config import (
     get_store_layout,
     get_store_path,
     get_windowing,
-    load_config_from_dict,
 )
 from zagg.dispatch import (
     LAMBDA_MEMORY_GB,
@@ -67,6 +66,30 @@ from zagg.processing import (
 from zagg.store import open_object_store, open_store
 
 logger = logging.getLogger(__name__)
+
+
+def _resolve_function_name(config: PipelineConfig, function_name: str | None) -> str:
+    """Resolve the Lambda function to invoke (issue #235).
+
+    Precedence: an explicit ``function_name`` (``agg`` kwarg /
+    ``--function-name``) wins verbatim; otherwise the base name comes from
+    ``ZAGG_LAMBDA_FUNCTION_NAME`` (default ``"process-shard"``) and the
+    config's optional top-level ``worker:`` block appends the
+    pre-provisioned variant suffix — ``-<memory>``, plus ``-disk`` when
+    ``extra_disk`` is true (validated against the provisioned set at config
+    load). No block -> the bare base name, byte-identical prior behavior.
+    Shared by the spatial, raster, and temporal Lambda paths.
+    """
+    if function_name is not None:
+        return function_name
+    base = os.environ.get("ZAGG_LAMBDA_FUNCTION_NAME", "process-shard")
+    worker = config.worker
+    if not worker:
+        return base
+    suffix = f"-{worker['memory']}"
+    if worker.get("extra_disk"):
+        suffix += "-disk"
+    return base + suffix
 
 
 def agg(
@@ -120,8 +143,11 @@ def agg(
     dry_run : bool
         Preview what would be processed without running.
     function_name : str, optional
-        Lambda function name. Defaults to env ``ZAGG_LAMBDA_FUNCTION_NAME``
-        or ``"process-shard"``. Only used with ``backend="lambda"``.
+        Lambda function name; an explicit value wins verbatim. Default
+        resolves env ``ZAGG_LAMBDA_FUNCTION_NAME`` (or ``"process-shard"``)
+        plus the config ``worker:`` block's pre-provisioned variant suffix
+        (``-<memory>``/``-disk``, issue #235) via
+        :func:`_resolve_function_name`. Only used with ``backend="lambda"``.
     region : str
         AWS region for S3 and Lambda. Default ``"us-west-2"``.
     output_credentials : dict, optional
@@ -147,11 +173,16 @@ def agg(
         forwarded config). pyarrow is not used on either path; the experimental
         ``arrow-kernel`` reducer was dropped with pyarrow.
     profile : bool
-        Opt-in per-phase timing (issue #100). When ``True`` (lambda backend),
-        forwards ``profile`` into each cell event so the worker emits a
-        ``phase_timings`` (read/index/aggregate) sub-dict, and the run prints a
-        per-phase worker breakdown. Default ``False`` leaves the worker path and
-        per-cell event payload byte-identical -- no probe tax.
+        Opt-in per-phase timing (issue #100). On the *point* path, ``True``
+        (lambda backend only) forwards ``profile`` into each cell event so the
+        worker emits a ``phase_timings`` (read/index/aggregate/write — issue
+        #249) sub-dict, and the run prints a per-phase worker breakdown. On the
+        *raster* path, ``True`` profiles on **both** backends: the worker emits
+        the issue #249 stage set (open/geometry/fetch/decode/gather + write),
+        rolled up into ``summary["worker_stage_max"]`` (straggler-maxed seconds)
+        and ``summary["worker_stage_counts"]`` (summed work counts) rather than
+        printed. Default ``False`` leaves the worker path and per-cell event
+        payload byte-identical -- no probe tax.
     max_retries : int
         Lambda-only (issue #119). Per-cell retry budget for *transient*
         client-side faults (throttle/network) in ``_invoke_lambda_cell``;
@@ -343,8 +374,7 @@ class SpatialStrategy:
                 raise ValueError(f"Lambda backend requires s3:// store path, got: {store_path}")
             if invocation not in ("async", "sync"):
                 raise ValueError(f"Unknown invocation: {invocation!r} (expected 'async' or 'sync')")
-            if function_name is None:
-                function_name = os.environ.get("ZAGG_LAMBDA_FUNCTION_NAME", "process-shard")
+            function_name = _resolve_function_name(config, function_name)
             return _run_lambda(
                 config,
                 catalog_data,
@@ -549,6 +579,31 @@ class TemporalStrategy:
         return summary
 
 
+# Stage keys of the per-shard raster profile (issue #249): float seconds vs
+# int counts, split so the rollup straggler-maxes seconds and sums counts.
+_RASTER_STAGE_SECONDS = ("open", "geometry", "fetch", "decode", "gather")
+_RASTER_STAGE_COUNTS = ("assets", "tiles", "geom_hits")
+
+
+def _fold_raster_stages(stage_max: dict, stage_counts: dict, stages: dict, write_s) -> None:
+    """Fold one shard's stage stats into the run rollup (issue #250).
+
+    Seconds are straggler-maxed across shards (the ``worker_phase_max``
+    framing); counts are summed run totals. ``write_s`` (the handler's write
+    bucket / the local path's timed slab writes) rides next to the issue #249
+    stage set as ``"write"``. Unknown future stages are ignored so the summary
+    schema stays stable; an unprofiled shard folds nothing.
+    """
+    for key in _RASTER_STAGE_SECONDS:
+        if key in stages:
+            stage_max[key] = max(stage_max.get(key, 0.0), float(stages[key]))
+    for key in _RASTER_STAGE_COUNTS:
+        if key in stages:
+            stage_counts[key] = stage_counts.get(key, 0) + int(stages[key])
+    if write_s is not None:
+        stage_max["write"] = max(stage_max.get("write", 0.0), float(write_s))
+
+
 class RasterStrategy:
     """The raster pull-NN path (issue #218): ``reader: raster`` on a spatial grid.
 
@@ -564,8 +619,11 @@ class RasterStrategy:
     simple transport: synchronous invokes with transient-only retries; the
     issue-151 async result-object channel and the preflight concurrency probe
     are follow-ups (raster shards are seconds of COG windows, well inside NAT
-    idle limits). Either way the runner owns the template + global time index
-    before fan-out (the single-writer append design).
+    idle limits). Either way the runner owns the global time index before
+    fan-out (the single-writer append design); the template write is
+    orchestrator-side on the local backend but rides the sync setup invoke on
+    lambda (issue #264 — the dispatcher may hold an invoke-only role with no
+    S3 write access, e.g. the CI OIDC benchmark role).
 
     Summary schema note: ``total_obs`` is shared with the spatial/temporal
     strategies so a caller sees one summary shape across pipeline kinds. On the
@@ -574,6 +632,16 @@ class RasterStrategy:
     observation count); ``timesteps`` separately carries the global datatake
     count. A dashboard summing ``total_obs`` across kinds mixes units — read it
     per kind.
+
+    ``profile=True`` (issue #250) threads the opt-in ``profile`` event key to
+    the workers (byte-identical payload when off) and rolls their
+    ``phase_timings`` up into ``summary["worker_stage_max"]`` (straggler-maxed
+    seconds per issue #249 stage + the ``write`` bucket) and
+    ``summary["worker_stage_counts"]`` (summed work counts); the local backend
+    profiles the same stages in-process. The lambda summary also carries the
+    always-on worker rollups ``template_s`` / ``lambda_time_s`` /
+    ``worker_max_s`` / ``worker_median_s`` / ``max_memory_mb`` (null-safe on
+    workers predating the fields) so the release benchmark reads one summary.
     """
 
     def run(
@@ -591,10 +659,13 @@ class RasterStrategy:
         region,
         output_credentials,
         output_endpoint_url,
+        profile=False,
         **_ignored,
     ):
         from zagg.processing.raster import (
             emit_raster_template,
+            new_stage_stats,
+            process_and_write_raster_hive,
             process_raster_shard,
             raster_time_index,
             write_raster_coords,
@@ -626,28 +697,69 @@ class RasterStrategy:
             raise ValueError("catalog carries no raster granule entries (no assets/datetime)")
 
         resolved_endpoint = output_endpoint_url or get_output_endpoint_url(config)
-        zarr_store = open_store(
-            store_path,
-            region=region,
-            credentials=output_credentials,
-            endpoint_url=resolved_endpoint,
-        )
-        emit_raster_template(zarr_store, grid, config, times_us, overwrite=overwrite)
+        store_layout = get_store_layout(config)
+        windowing = get_windowing(config)
+        store_kwargs = {
+            "region": region,
+            "credentials": output_credentials,
+            "endpoint_url": resolved_endpoint,
+        }
+        # Temporal fan-out (issue #247): one work unit per (shard, window),
+        # membership decided at dispatch from the acquisitions' STAC
+        # datetimes. None (schedule none/absent) keeps the (shard, records)
+        # pairs — one bare leaf per shard carrying the full time axis (D13).
+        # Shared by both backends, so the fan-out cannot drift between them.
+        if store_layout == "hive" and windowing is not None:
+            cells = _raster_windowed_units(cells, windowing)
 
         if backend == "lambda":
+            # No orchestrator-side store write on the lambda path (issue
+            # #264): the flat template rides the sync setup invoke inside
+            # _run_lambda_shards, so the dispatcher needs only
+            # lambda:InvokeFunction (the CI OIDC invoke-only role). Hive
+            # (issue #247) likewise: the manifest rides the #252 ping ->
+            # async-setup -> finalize-backstop lifecycle in there.
+            md = catalog_data.get("metadata") or {}
             return self._run_lambda_shards(
                 config,
                 cells,
                 time_index,
                 grid,
                 store_path,
+                times_us=times_us,
+                overwrite=overwrite,
                 max_workers=max_workers,
                 region=region,
                 function_name=_ignored.get("function_name"),
                 max_retries=_ignored.get("max_retries") or 3,
                 output_credentials=output_credentials,
                 output_endpoint_url=resolved_endpoint,
+                store_layout=store_layout,
+                dataset={"short_name": md.get("short_name"), "version": md.get("version")},
+                profile=profile,
             )
+
+        # Local backend: template emission stays orchestrator-owned (the
+        # process writes the store directly); time it (always-on, the issue
+        # #180 bracket convention) so the benchmark harness can split
+        # setup-ish wall from the fan-out (issue #250). On the hive branch
+        # (issue #247) the bracket covers the pre-dispatch manifest write
+        # instead — there is no flat global template (D5): each unit emits
+        # its own leaf template lazily inside process_and_write_raster_hive.
+        manifest = None
+        template_t0 = time.time()
+        if store_layout == "hive":
+            from zagg.hive import build_manifest, ensure_manifest
+
+            zarr_store = None
+            manifest = build_manifest(
+                grid, dataset=catalog_data.get("metadata"), windowing=windowing
+            )
+            ensure_manifest(store_path, manifest, overwrite=overwrite, **store_kwargs)
+        else:
+            zarr_store = open_store(store_path, **store_kwargs)
+            emit_raster_template(zarr_store, grid, config, times_us, overwrite=overwrite)
+        template_s = time.time() - template_t0
 
         source = config.data_source or {}
         src_kwargs = {
@@ -660,47 +772,122 @@ class RasterStrategy:
         errors = 0
         timesteps_written = 0
         last_error = None
+        ok_metas: list = []
 
         def _one(pair):
-            shard_key, granules = pair
+            # (shard, records) pairs, or (shard, records, window) triples when
+            # a window schedule fanned the dispatch (issue #247).
+            shard_key, granules = pair[0], pair[1]
+            window = pair[2] if len(pair) > 2 else None
             wrote = False
-
-            def _write_slab(t_idx, slab):
-                nonlocal wrote
-                write_raster_slab(zarr_store, grid, int(shard_key), t_idx, slab)
-                wrote = True
-
-            # Stream: write + free each timestep's slab as it completes (issue
-            # #231), so a shard holds ~1 slab, not all T.
-            _slabs, meta = process_raster_shard(
-                grid,
-                int(shard_key),
-                granules,
-                config,
-                time_index,
-                on_slab=_write_slab,
-                **src_kwargs,
+            # Per-stage sample profiling (issue #249), the local flavor of the
+            # lambda handler's opt-in ``profile`` key: allocated when profiling
+            # (issue #250) or when debug logging is on, so the default path
+            # passes None and the sample path times nothing.
+            stage_stats = (
+                new_stage_stats() if profile or logger.isEnabledFor(logging.DEBUG) else None
             )
-            if wrote:
-                write_raster_coords(zarr_store, grid, int(shard_key))
-            return meta
+            write_s = 0.0
 
+            if store_layout == "hive":
+                # Shared per-(shard, window) leaf write path (same function
+                # the lambda hive branch runs): leaf template + slabs +
+                # coverage + commit stamp, D4 debris semantics on error. The
+                # worker owns the profile sample/write split (issue #250):
+                # its returned write bucket feeds the same rollup as the
+                # flat branch's sink timing below.
+                meta = process_and_write_raster_hive(
+                    int(shard_key),
+                    granules,
+                    grid,
+                    store_path,
+                    config,
+                    store_kwargs=store_kwargs,
+                    window=window,
+                    profile=profile,
+                    stage_stats=stage_stats,
+                    **src_kwargs,
+                )
+                write_s = (meta.get("phase_timings") or {}).get("write", 0.0)
+            else:
+
+                def _write_slab(t_idx, slab):
+                    nonlocal wrote, write_s
+                    w0 = time.time() if profile else 0.0
+                    write_raster_slab(zarr_store, grid, int(shard_key), t_idx, slab)
+                    if profile:
+                        write_s += time.time() - w0
+                    wrote = True
+
+                # Stream: write + free each timestep's slab as it completes
+                # (issue #231), so a shard holds ~1 slab, not all T.
+                _slabs, meta = process_raster_shard(
+                    grid,
+                    int(shard_key),
+                    granules,
+                    config,
+                    time_index,
+                    on_slab=_write_slab,
+                    stage_stats=stage_stats,
+                    **src_kwargs,
+                )
+                if wrote:
+                    write_raster_coords(zarr_store, grid, int(shard_key))
+            if stage_stats is not None:
+                logger.debug(
+                    f"raster shard {shard_label(grid, int(shard_key))} stages: {stage_stats}"
+                )
+            return meta, stage_stats, write_s
+
+        stage_max: dict = {}
+        stage_counts: dict = {}
         with ThreadPoolExecutor(max_workers=max_workers) as pool:
             futures = {pool.submit(_one, pair): pair[0] for pair in cells}
             for fut in as_completed(futures):
                 label = shard_label(grid, futures[fut])
                 try:
-                    meta = fut.result()
+                    meta, stage_stats, write_s = fut.result()
                 except Exception as e:  # noqa: BLE001 - per-shard isolation, run continues
                     errors += 1
                     last_error = e
                     logger.warning(f"raster shard {label} failed: {e}")
                     continue
+                ok_metas.append(meta)
                 if meta["timesteps"]:
                     shards_with_data += 1
                     timesteps_written += meta["timesteps"]
+                if profile and stage_stats is not None:
+                    _fold_raster_stages(stage_max, stage_counts, stage_stats, write_s)
 
         wall_time = time.time() - t0
+        if store_layout == "hive":
+            # End-of-run manifest backstop (issue #252 hybrid, local flavor):
+            # idempotent re-ensure — a frozen-key-matching manifest is
+            # accepted with no second PUT; required reader-facing schema
+            # (D6), so a failure raises. Then the root coverage.moc union
+            # (issue #200 phase 3; D15 time union) — a regenerable cache
+            # (D9), fail-open.
+            from zagg.hive import ensure_manifest
+
+            ensure_manifest(store_path, manifest, overwrite=overwrite, **store_kwargs)
+            if get_coverage_moc(config):
+                from zagg.hive import build_root_coverage, write_root_coverage
+                from zagg.windows import union_time_range
+
+                try:
+                    # Only units that wrote (and stamped) a leaf: timesteps==0
+                    # means the lazy template never fired — no leaf to cover.
+                    done = [m["shard_key"] for m in ok_metas if m.get("timesteps")]
+                    if done:
+                        envelope = build_root_coverage(
+                            done,
+                            int(grid.parent_order),
+                            time_range=union_time_range(*(m.get("time_range") for m in ok_metas)),
+                        )
+                        write_root_coverage(store_path, envelope, **store_kwargs)
+                        logger.info(f"Wrote root coverage.moc ({len(envelope['ranges'])} ranges)")
+                except Exception as e:
+                    logger.warning(f"root coverage.moc write failed (fail-open, D9): {e}")
         # Per-shard isolation lets one bad shard be counted and skipped, but a
         # run where EVERY shard raised (e.g. a config band whose ``asset`` is
         # absent from every granule) would otherwise return a success-shaped,
@@ -718,9 +905,15 @@ class RasterStrategy:
             "total_obs": timesteps_written,
             "timesteps": int(len(times_us)),
             "wall_time_s": wall_time,
+            "template_s": template_s,
             "store_path": store_path,
             "backend": "local",
         }
+        if profile:
+            # Straggler-maxed stage seconds + summed work counts (issue #250);
+            # stage seconds are work volume, never a wall decomposition.
+            summary["worker_stage_max"] = stage_max
+            summary["worker_stage_counts"] = stage_counts
         logger.info(
             f"Done: {shards_with_data}/{len(cells)} shards, {len(times_us)} timesteps, "
             f"{errors} errors, {wall_time:.1f}s"
@@ -735,26 +928,43 @@ class RasterStrategy:
         grid,
         store_path,
         *,
+        times_us,
+        overwrite,
         max_workers,
         region,
         function_name,
         max_retries,
         output_credentials,
         output_endpoint_url,
+        store_layout="flat",
+        dataset=None,
+        profile=False,
     ):
         """Fan shards out, one synchronous ``mode="process_raster"`` invoke each.
 
-        The worker gets the shard's ShardMap entries plus only its own slice of
-        the global time index (the template — runner-emitted before this — is
-        the shared truth for the full axis). Transient invoke faults retry with
+        Before fan-out the lifecycle is ping → setup. Flat (issue #264): the
+        lightweight ``mode="ping"`` fails fast on a pre-#252 deployment with
+        zero writes, then ``_invoke_lambda_raster_setup`` writes the template
+        WORKER-SIDE — the orchestrator never PUTs to the store, so an
+        invoke-only role (the CI OIDC benchmark role) dispatches cleanly; the
+        worker gets the shard's ShardMap entries plus only its own slice of
+        the global time index (the setup-emitted template is the shared truth
+        for the full axis), events byte-identical to pre-#247 runs. Hive
+        (issue #247): units may carry a ``window`` and no ``time_index`` (the
+        worker builds its leaf-local index), and the manifest rides the issue
+        #252 hybrid lifecycle — the same ping doubles as the read-only
+        frozen-key precheck, then the fire-and-forget ASYNC setup write (the
+        manifest is reader-facing only, not load-bearing for workers), then
+        finalize's idempotent backstop after the fan-out, with the root
+        ``coverage.moc`` dispatched fire-and-forget (fail-open, D9) exactly
+        as the aggregation path does. Transient invoke faults retry with
         backoff; a Lambda ``FunctionError`` or non-200 envelope is a shard
         error (per-shard isolation, all-error raise as on the local backend).
         """
         import boto3
         from botocore.config import Config
 
-        if function_name is None:
-            function_name = os.environ.get("ZAGG_LAMBDA_FUNCTION_NAME", "process-shard")
+        function_name = _resolve_function_name(config, function_name)
         max_workers = min(max_workers or 64, len(cells)) or 1
         client = boto3.client(
             "lambda",
@@ -777,17 +987,80 @@ class RasterStrategy:
         output_creds_event = _build_output_creds_event(
             output_credentials, output_endpoint_url, region
         )
+        # Ping → setup, bracketed as template_s (the setup-ish wall the
+        # benchmark splits from fan-out, issue #250). Flat: the template is
+        # load-bearing before fan-out — workers write slabs into its arrays —
+        # so the setup invoke is synchronous (issue #264; NOT the #252 async
+        # hybrid, whose artifact is not load-bearing). Hive (issue #247): the
+        # manifest is reader-facing only, so the setup write fires as the
+        # #252 async Event invoke with finalize as its idempotent backstop;
+        # the shared ping then also runs the read-only frozen-key precheck
+        # (validate_manifest) against an incompatible existing store.
+        template_t0 = time.time()
+        if store_layout == "hive":
+            parent_order = int(grid.parent_order)
+            _invoke_lambda_ping(
+                client,
+                function_name,
+                store_path,
+                config_dict=config_dict,
+                dataset=dataset,
+                parent_order=parent_order,
+                overwrite=overwrite,
+                output_creds_event=output_creds_event,
+            )
+            _invoke_lambda_setup_async(
+                client,
+                function_name,
+                store_path,
+                config_dict=config_dict,
+                dataset=dataset,
+                parent_order=parent_order,
+                overwrite=overwrite,
+                output_creds_event=output_creds_event,
+            )
+        else:
+            _invoke_lambda_ping(
+                client,
+                function_name,
+                store_path,
+                config_dict=config_dict,
+                overwrite=overwrite,
+                output_creds_event=output_creds_event,
+            )
+            _invoke_lambda_raster_setup(
+                client,
+                function_name,
+                store_path,
+                config_dict=config_dict,
+                times_us=times_us,
+                overwrite=overwrite,
+                output_creds_event=output_creds_event,
+            )
+        template_s = time.time() - template_t0
 
-        def _event(shard_key, granules):
-            keys = {e.get("time_key") or e.get("datetime") for e in granules if e.get("assets")}
+        def _event(shard_key, granules, window=None):
             ev = {
                 "mode": "process_raster",
                 "shard_key": int(shard_key),
                 "granules": granules,
                 "config": config_dict,
                 "store_path": store_path,
-                "time_index": {k: time_index[k] for k in keys},
             }
+            if store_layout == "hive":
+                # No time_index: the hive worker's leaf time axis is its own
+                # unit's acquisitions (issue #247). Flat events below stay
+                # byte-identical to pre-#247 runs.
+                if window is not None:
+                    ev["window"] = window
+            else:
+                keys = {e.get("time_key") or e.get("datetime") for e in granules if e.get("assets")}
+                ev["time_index"] = {k: time_index[k] for k in keys}
+            if profile:
+                # Opt-in (issue #250): the worker then emits phase_timings
+                # (write bucket + issue #249 stages). Absent -> the payload is
+                # byte-identical to the pre-profile path (the #100 convention).
+                ev["profile"] = True
             if output_creds_event is not None:
                 ev["output_credentials"] = output_creds_event
             return ev
@@ -843,6 +1116,7 @@ class RasterStrategy:
         errors = 0
         timesteps_written = 0
         last_error = None
+        ok_units: list = []  # (shard_key, body) — coverage needs keys, rollups bodies
         with ThreadPoolExecutor(max_workers=max_workers) as pool:
             futures = {pool.submit(_one, pair): pair[0] for pair in cells}
             for fut in as_completed(futures):
@@ -854,13 +1128,68 @@ class RasterStrategy:
                     logger.warning(f"raster shard {label} failed: {result['error']}")
                     continue
                 body = result["body"]
+                ok_units.append((int(futures[fut]), body))
                 if body.get("timesteps"):
                     shards_with_data += 1
                     timesteps_written += body["timesteps"]
 
         wall_time = time.time() - t0
+        if store_layout == "hive":
+            # Finalize-backstop-before-all-failed-raise, mirroring the local
+            # backend (where ensure_manifest + root coverage run ahead of the
+            # identical raise). On Lambda the pre-dispatch manifest write is the
+            # droppable retries-0 async ``setup`` invoke, so finalize is the only
+            # reliable manifest write — it must run even when every shard failed.
+            # With every shard failed ``done`` is empty, so no coverage invoke
+            # fires (natural gating); the finalize backstop still runs.
+            #
+            # Finalize backstop (issue #252 hybrid): idempotent ensure_manifest
+            # worker-side — required reader-facing schema (D6), so a failure
+            # raises, unlike the fail-open coverage dispatch below.
+            _invoke_lambda_finalize(
+                client,
+                function_name,
+                store_path,
+                output_creds_event=output_creds_event,
+                config_dict=config_dict,
+                dataset=dataset,
+                parent_order=int(grid.parent_order),
+                overwrite=overwrite,
+            )
+            if get_coverage_moc(config):
+                # Root coverage.moc (issue #200 phase 3): one fire-and-forget
+                # worker invoke GET-unions-PUTs the serialized envelope — the
+                # aggregation path's transport, D15 time union included.
+                # Fail-open: a regenerable cache (D9).
+                try:
+                    from zagg.hive import build_root_coverage
+                    from zagg.windows import union_time_range
+
+                    done = [k for k, b in ok_units if b.get("timesteps")]
+                    if done:
+                        envelope = build_root_coverage(
+                            done,
+                            int(grid.parent_order),
+                            time_range=union_time_range(
+                                *(b.get("time_range") for _k, b in ok_units)
+                            ),
+                        )
+                        _invoke_lambda_coverage(
+                            client,
+                            function_name,
+                            store_path,
+                            envelope,
+                            output_creds_event=output_creds_event,
+                        )
+                except Exception as e:
+                    logger.warning(f"root coverage.moc dispatch failed (fail-open, D9): {e}")
         if cells and errors == len(cells):
             raise RuntimeError(f"all {errors} raster shard(s) failed; last error: {last_error}")
+        # Worker telemetry rollup (issue #250): billed durations and peak RSS,
+        # null-safe on bodies from a worker that predates either field.
+        ok_bodies = [b for _k, b in ok_units]
+        durations = [float(b["duration_s"]) for b in ok_bodies if b.get("duration_s") is not None]
+        mems = [float(b["max_memory_mb"]) for b in ok_bodies if b.get("max_memory_mb") is not None]
         summary = {
             "total_cells": len(cells),
             "cells_with_data": shards_with_data,
@@ -869,9 +1198,27 @@ class RasterStrategy:
             "total_obs": timesteps_written,
             "timesteps": int(len(time_index)),
             "wall_time_s": wall_time,
+            "template_s": template_s,
+            "lambda_time_s": sum(durations) if durations else None,
+            "worker_max_s": max(durations) if durations else None,
+            "worker_median_s": statistics.median(durations) if durations else None,
+            "max_memory_mb": max(mems) if mems else None,
             "store_path": store_path,
             "backend": "lambda",
         }
+        if profile:
+            # Straggler-maxed stage seconds (+ the write bucket) and summed
+            # work counts across shards (issue #250); the stage seconds are
+            # work volume (overlapped samples), never a wall decomposition.
+            stage_max: dict = {}
+            stage_counts: dict = {}
+            for body in ok_bodies:
+                pt = body.get("phase_timings") or {}
+                _fold_raster_stages(
+                    stage_max, stage_counts, pt.get("stages") or {}, pt.get("write")
+                )
+            summary["worker_stage_max"] = stage_max
+            summary["worker_stage_counts"] = stage_counts
         logger.info(
             f"Done (lambda): {shards_with_data}/{len(cells)} shards, "
             f"{errors} errors, {wall_time:.1f}s"
@@ -978,8 +1325,7 @@ def _run_lambda_events(
         )
     if invocation not in ("async", "sync"):
         raise ValueError(f"Unknown invocation: {invocation!r} (expected 'async' or 'sync')")
-    if function_name is None:
-        function_name = os.environ.get("ZAGG_LAMBDA_FUNCTION_NAME", "process-shard")
+    function_name = _resolve_function_name(config, function_name)
 
     # Orchestrator-side credential fetch (issue #213, Phase 4): a config-named
     # provider is resolved through the registry and called ONCE (DAAC creds
@@ -1458,6 +1804,56 @@ def _windowed_units(cells: list[tuple], windowing: dict, bounds_temporal: dict |
     return units
 
 
+def _raster_windowed_units(cells: list[tuple], windowing: dict) -> list:
+    """Expand raster ``(shard, records)`` pairs into ``(shard, records, window)`` units.
+
+    The raster analog of :func:`_windowed_units` (issue #247): membership is
+    decided HERE, at dispatch — there is no worker-side observation filter.
+    An acquisition GROUP (entries sharing a ``time_key``, the
+    :func:`~zagg.processing.raster.raster_time_index` grouping) belongs to
+    the window containing its earliest STAC ``datetime`` within the shard —
+    the group's leaf time coordinate — so a datatake's adjacent MGRS tiles
+    never split across leaves at a window boundary. Explicit schedules DROP
+    groups outside every declared window (nothing downstream would filter
+    them); generative schedules always place a group. Window payloads carry
+    only the label: bounds stay UTC-calendar terms and no dataset-unit
+    conversion exists on the raster path. Asset-less records are dropped
+    (the worker would skip them anyway). Shard-major expansion preserves the
+    incoming cell order; windows are chronological (= lexicographic) within
+    a shard, declared order for explicit schedules.
+
+    ``windows_intersecting(earliest, earliest, ...)`` returns at most one
+    label, so ``labels[0]`` is THE window containing the group's instant,
+    never a first-match tiebreak: explicit windows are validated disjoint
+    (:func:`~zagg.config._validate_windowing_windows` rejects overlapping
+    declared ranges) and generative windows partition time, so no instant can
+    fall in two declared windows at once.
+    """
+    from zagg.windows import parse_utc, windows_intersecting
+
+    schedule, declared = windowing["schedule"], windowing.get("windows")
+    label_order = [w["label"] for w in declared] if schedule == "explicit" else None
+    units = []
+    for shard_key, records in cells:
+        groups: dict = {}
+        for e in records:
+            if not e.get("assets"):
+                continue
+            if not e.get("datetime"):
+                raise ValueError(f"raster granule entry {e.get('id')!r} carries no datetime")
+            groups.setdefault(e.get("time_key") or e["datetime"], []).append(e)
+        by_window: dict = {}
+        for _key, items in groups.items():
+            earliest = min(parse_utc(e["datetime"]) for e in items)
+            labels = windows_intersecting(earliest, earliest, schedule, declared)
+            if labels:
+                by_window.setdefault(labels[0], []).extend(items)
+        for label in label_order if label_order is not None else sorted(by_window):
+            if label in by_window:
+                units.append((shard_key, by_window[label], {"label": label}))
+    return units
+
+
 def _resolve_source_credentials(config) -> dict:
     """S3 read credentials for the source datasets, provider-selected.
 
@@ -1668,19 +2064,29 @@ def _run_local(
     windowing = get_windowing(config)
     if store_layout == "hive":
         # Hive layout (issue #199 phase 2): no shared zarr template — zero
-        # metadata above the leaves (D5). Template time writes only the root
-        # manifest (D6); each shard emits its own leaf template lazily inside
-        # hive.process_and_write_hive (the leaf write path lives in zagg.hive,
-        # next to the manifest/stamp machinery it exercises).
-        from zagg.hive import build_manifest, ensure_manifest, process_and_write_hive
-
-        ensure_manifest(
-            store_path,
-            build_manifest(grid, dataset=catalog_data.get("metadata"), windowing=windowing),
-            overwrite=overwrite,
-            **store_kwargs,
+        # metadata above the leaves (D5); each shard emits its own leaf
+        # template lazily inside hive.process_and_write_hive (the leaf write
+        # path lives in zagg.hive, next to the manifest/stamp machinery it
+        # exercises). The root manifest (D6) is written HERE, pre-dispatch
+        # (issue #252 hybrid): the local dispatcher writes the store
+        # directly, so the write costs ~0 wall and a reader can consume
+        # completed leaves while the run builds — mirroring the lambda
+        # backend's async init-time setup invoke.
+        from zagg.hive import (
+            build_manifest,
+            ensure_manifest,
+            process_and_write_hive,
         )
+
         zarr_store = None
+        # Build the manifest once, up front, and reuse it at finalize.
+        # ensure_manifest runs the read-only validate_manifest frozen-key
+        # precheck before its PUT, so the pre-dispatch fail-fast (review
+        # fold, issue #252) is preserved: a rerun into an incompatible
+        # existing store refuses in ~0s, before any leaf write (D2), instead
+        # of mixing new-order leaves into an old-order store.
+        manifest = build_manifest(grid, dataset=catalog_data.get("metadata"), windowing=windowing)
+        ensure_manifest(store_path, manifest, overwrite=overwrite, **store_kwargs)
         # Temporal fan-out (issue #246 phase 5): one work unit per (shard,
         # window). None (schedule none/absent) keeps the (shard, records)
         # pairs — dispatch byte-identical to pre-windowing runs.
@@ -1792,6 +2198,20 @@ def _run_local(
     # skip it unless output.consolidate_metadata is true.
     if get_consolidate_metadata(config):
         consolidate_metadata(zarr_store, zarr_format=3)
+    # End-of-run manifest backstop (issue #252 hybrid): the manifest already
+    # landed pre-dispatch above; this idempotent re-ensure (a frozen-key-
+    # matching manifest is accepted — no second PUT) self-heals a root whose
+    # manifest was lost mid-run, mirroring the lambda path where the init
+    # write is a retries-0 Event invoke. Unlike the root coverage.moc below
+    # (a regenerable cache, D9), the manifest is REQUIRED reader-facing
+    # schema (D6), so a failed backstop raises.
+    if store_layout == "hive":
+        ensure_manifest(
+            store_path,
+            manifest,
+            overwrite=overwrite,
+            **store_kwargs,
+        )
     wall_time = time.time() - start_time
 
     # End-of-run root coverage.moc (issue #200 phase 3; default-on for hive,
@@ -2066,7 +2486,29 @@ def _run_lambda(
     # so gate the invoke dispatcher-side. When off we hand the executor a no-op
     # finalize (mirroring the temporal path's ``_run_lambda_events``, which has no
     # metadata to consolidate) so no ``mode: "finalize"`` Lambda is dispatched.
-    if get_consolidate_metadata(config):
+    # Hive (issue #252 hybrid): finalize ALWAYS runs — its ensure_manifest
+    # is the idempotent BACKSTOP for the async init-time manifest write (a
+    # retries-0 Event invoke is never redelivered if lost; finalize
+    # self-heals it) — so the consolidate_metadata gate stays flat-only. The
+    # manifest inputs (config + dataset identity from the ShardMap metadata,
+    # the same source as the local path) ride the finalize event; flat
+    # finalize events stay byte-identical.
+    if get_store_layout(config) == "hive":
+        md = catalog_data.get("metadata") or {}
+        dataset = {"short_name": md.get("short_name"), "version": md.get("version")}
+
+        def _finalize_fn():
+            return _invoke_lambda_finalize(
+                state["lambda_client"],
+                function_name,
+                store_path,
+                output_creds_event=output_creds_event,
+                config_dict=config_dict,
+                dataset=dataset,
+                parent_order=parent_order,
+                overwrite=overwrite,
+            )
+    elif get_consolidate_metadata(config):
 
         def _finalize_fn():
             return _invoke_lambda_finalize(
@@ -2090,35 +2532,59 @@ def _run_lambda(
     executor.preflight(len(cells))
     max_workers = state["workers"]
 
-    # Create template via Lambda. The template write happens inside the
-    # function so the orchestrator only needs lambda:InvokeFunction; no
-    # direct S3 access to the output bucket is required (works cleanly
-    # for cross-account callers like CryoCloud).
+    # Create template via Lambda (flat only). The template write happens
+    # inside the function so the orchestrator only needs
+    # lambda:InvokeFunction; no direct S3 access to the output bucket is
+    # required (works cleanly for cross-account callers like CryoCloud).
     # Orchestrator phase brackets (always-on; just time.time() deltas around
     # calls that already happen, so no worker probe tax -- issue #100). They
     # decompose wall time into setup invoke / fan-out / finalize invoke so
     # "where did wall time go" is answerable from the summary.
-    # Hive layout (issue #199 phase 3): setup mode writes morton_hive.json
-    # instead of a global template. The worker builds the manifest itself from
-    # the event's config; only the dataset identity (from the ShardMap
-    # metadata, matching the local path's source) rides in the event — flat
-    # runs omit the key, keeping their setup event byte-identical.
-    dataset = None
-    if get_store_layout(config) == "hive":
-        md = catalog_data.get("metadata") or {}
-        dataset = {"short_name": md.get("short_name"), "version": md.get("version")}
+    # Hive layout (issue #252 hybrid): NO synchronous manifest-writing setup
+    # invoke. First the lightweight ping — fail-fast for a stale deployment
+    # plus the read-only frozen-key precheck (see _invoke_lambda_ping; kept
+    # while flat exists — issue #251) — then the manifest write fires as a
+    # fire-and-forget Event invoke of the existing mode="setup" hive branch
+    # (~10 ms, the root-coverage dispatch precedent below): the manifest
+    # typically lands within seconds of init (best-effort — the Event invoke
+    # shares worker concurrency and runs retries-0, so under throttling or a
+    # dropped invoke the write defers to the finalize backstop), so a reader
+    # can consume completed leaves while the store builds, and finalize's
+    # ensure_manifest demotes to an idempotent backstop. setup_s keeps
+    # bracketing the phase (ping + Event dispatch).
     setup_start = time.time()
-    _invoke_lambda_setup(
-        state["lambda_client"],
-        function_name,
-        store_path,
-        parent_order=parent_order,
-        child_order=child_order,
-        overwrite=overwrite,
-        config_dict=config_dict,
-        output_creds_event=output_creds_event,
-        dataset=dataset,
-    )
+    if get_store_layout(config) == "hive":
+        _invoke_lambda_ping(
+            state["lambda_client"],
+            function_name,
+            store_path,
+            config_dict=config_dict,
+            dataset=dataset,
+            parent_order=parent_order,
+            overwrite=overwrite,
+            output_creds_event=output_creds_event,
+        )
+        _invoke_lambda_setup_async(
+            state["lambda_client"],
+            function_name,
+            store_path,
+            config_dict=config_dict,
+            dataset=dataset,
+            parent_order=parent_order,
+            overwrite=overwrite,
+            output_creds_event=output_creds_event,
+        )
+    else:
+        _invoke_lambda_setup(
+            state["lambda_client"],
+            function_name,
+            store_path,
+            parent_order=parent_order,
+            child_order=child_order,
+            overwrite=overwrite,
+            config_dict=config_dict,
+            output_creds_event=output_creds_event,
+        )
     setup_s = time.time() - setup_start
 
     start_time = time.time()
@@ -2875,24 +3341,15 @@ def _invoke_lambda_setup(
     overwrite,
     config_dict,
     output_creds_event=None,
-    dataset=None,
 ):
-    """Invoke Lambda in setup mode to create the zarr template.
+    """Invoke Lambda in setup mode to create the zarr template (flat only).
 
-    For a hive-layout config (issue #199 phase 3) the worker writes
-    ``morton_hive.json`` instead; ``dataset`` (``{"short_name", "version"}``
-    from the ShardMap metadata) is threaded through for the manifest's
-    identity block. The key is added only when set, so flat setup events stay
-    byte-identical.
-
-    Stale-deployment guard (review finding, PR #205): a function deployed
-    before phase 3 has no hive branch — it would emit the flat GLOBAL template
-    at the hive root, return the same 200 body, and the whole run would then
-    silently write a flat store. The phase-3 handler echoes the layout it
-    acted on (``"layout"`` in the response body), and a hive dispatch REQUIRES
-    that echo — failing fast at setup with a redeploy message instead of after
-    a full fan-out. Flat dispatch does not require the echo, so a new
-    dispatcher keeps working against old deployed functions for flat runs.
+    Hive runs no longer dispatch setup SYNCHRONOUSLY (issue #252 hybrid):
+    the morton_hive.json write fires as a fire-and-forget Event invoke of
+    the same setup mode instead (``_invoke_lambda_setup_async``), so nothing
+    but the ping runs ahead of the fan-out. The flat setup event is
+    byte-identical to the pre-#199-phase-3 event, so a new dispatcher keeps
+    working against old deployed functions for flat runs.
     """
     event = {
         "mode": "setup",
@@ -2903,6 +3360,205 @@ def _invoke_lambda_setup(
         # the setup event stays byte-identical for deployed handlers until the
         # flat setup mode itself goes (#251 Phase 3).
         "n_parent_cells": None,
+        "overwrite": overwrite,
+        "config": config_dict,
+    }
+    if output_creds_event is not None:
+        event["output_credentials"] = output_creds_event
+    response = lambda_client.invoke(
+        FunctionName=function_name,
+        InvocationType="RequestResponse",
+        Payload=json.dumps(event),
+    )
+    payload = response["Payload"].read().decode("utf-8")
+    if response.get("FunctionError"):
+        raise RuntimeError(f"Lambda setup failed: {payload}")
+    result = json.loads(payload)
+    if result.get("statusCode") != 200:
+        raise RuntimeError(f"Lambda setup error: {result.get('body')}")
+
+
+def _invoke_lambda_setup_async(
+    lambda_client,
+    function_name,
+    store_path,
+    *,
+    config_dict,
+    dataset=None,
+    parent_order=None,
+    overwrite=False,
+    output_creds_event=None,
+):
+    """Fire-and-forget hive manifest write at init (issue #252 hybrid).
+
+    One ``InvocationType="Event"`` invoke of the existing ``mode="setup"``
+    hive branch (~10 ms of dispatcher wall, the root-coverage dispatch
+    precedent), posted immediately after the ping passes: the handler runs
+    ``ensure_manifest(build_manifest(...))`` in parallel with the worker
+    fan-out, so ``morton_hive.json`` typically lands within seconds of init
+    (best-effort: the Event invoke shares worker concurrency and runs
+    retries-0 — under throttling or a dropped invoke the write defers to the
+    finalize backstop) and a reader can start consuming completed leaves while
+    the store builds. The event
+    carries the same manifest inputs as the ping/finalize events (``config``
+    + ``parent_order`` + ``dataset`` identity + ``overwrite`` — the retired
+    synchronous hive setup event's shape). No response is read; a lost Event
+    invoke (retries 0, issue #151 hygiene) is self-healed by finalize's
+    idempotent ensure_manifest backstop — see ``_invoke_lambda_finalize``.
+    """
+    event = {
+        "mode": "setup",
+        "store_path": store_path,
+        "parent_order": parent_order,
+        "overwrite": overwrite,
+        "config": config_dict,
+    }
+    if dataset is not None:
+        event["dataset"] = dataset
+    if output_creds_event is not None:
+        event["output_credentials"] = output_creds_event
+    lambda_client.invoke(
+        FunctionName=function_name,
+        InvocationType="Event",
+        Payload=json.dumps(event),
+    )
+
+
+def _invoke_lambda_raster_setup(
+    lambda_client,
+    function_name,
+    store_path,
+    *,
+    config_dict,
+    times_us,
+    overwrite=False,
+    output_creds_event=None,
+):
+    """Synchronous raster template write via the setup mode (issue #264).
+
+    One RequestResponse invoke of ``mode="setup"``: the handler detects the
+    raster pipeline from the event's config (``data_source.reader: raster``)
+    and runs ``emit_raster_template`` worker-side, so the orchestrator needs
+    only ``lambda:InvokeFunction`` — the CI OIDC benchmark role is
+    deliberately invoke-only and must never PUT to the store. Synchronous
+    because the template is load-bearing before fan-out (workers write slabs
+    into its arrays) — the flat point-path lifecycle, not the #252 async
+    hybrid. ``times_us`` is the catalog-derived global time coordinate
+    (int64 μs since the epoch), JSON-safe as a plain int list.
+
+    A deployed function that predates the raster setup branch would fall
+    through to the point-path ``grid.emit_template`` — wrong template, right
+    status code — so the success body must echo ``"pipeline": "raster"``
+    (the PR #205 layout-echo precedent); anything else raises a redeploy
+    error before any worker is dispatched. The ping preceding this call
+    already gated out pre-#252 functions with zero writes.
+    """
+    event = {
+        "mode": "setup",
+        "store_path": store_path,
+        "overwrite": overwrite,
+        "config": config_dict,
+        # times_us rides inline in this sync RequestResponse payload (6 MB
+        # cap, not the 256 KB async/Event cap); int64 μs stamps serialize at
+        # ~17 B each → ~350K-timestep headroom, orders above any real catalog
+        # (the pinned NEON benchmark catalog is 85 items). No chunking
+        # fallback — a pathological series would surface as a boto ClientError.
+        "times_us": [int(t) for t in times_us],
+    }
+    if output_creds_event is not None:
+        event["output_credentials"] = output_creds_event
+    response = lambda_client.invoke(
+        FunctionName=function_name,
+        InvocationType="RequestResponse",
+        Payload=json.dumps(event),
+    )
+    payload = response["Payload"].read().decode("utf-8")
+    if response.get("FunctionError"):
+        raise RuntimeError(f"Lambda raster setup failed: {payload}")
+    result = json.loads(payload)
+    if result.get("statusCode") != 200:
+        # A pre-#264 function reaches the flat branch and calls
+        # grid.emit_template on the raster config, which can raise (a raster
+        # template has no point-path shape) → 500 — indistinguishable from a
+        # genuine failure, so it carries the redeploy hint. But the only non-200
+        # a correctly-deployed function returns on the normal runner path is the
+        # legitimate ContainsGroupError overwrite-refusal (a store already
+        # holding a different-valued group), for which "redeploy" is noise. Gate
+        # the hedge off that case with a conservative, best-effort match on
+        # zarr's "A group exists in store" text (messaging only, not control
+        # flow): always surface the handler body; append the redeploy hedge only
+        # when the body does NOT look like the overwrite refusal.
+        body_repr = result.get("body")
+        if "a group exists in store" in str(body_repr).lower():
+            raise RuntimeError(f"Lambda raster setup error: {body_repr}")
+        raise RuntimeError(
+            f"Lambda raster setup error: {body_repr} — if this is a "
+            f"pre-#264 deployment, its flat point-path branch may have raised "
+            f"on the raster config; redeploy the function, then rerun with "
+            f"overwrite to replace anything it wrote"
+        )
+    try:
+        body = json.loads(result.get("body") or "{}")
+    except (TypeError, ValueError):
+        body = {}
+    if body.get("pipeline") != "raster":
+        raise RuntimeError(
+            f"Lambda raster setup fell through to the point-path template "
+            f"(response body {result.get('body')!r}): the deployed function "
+            f"predates the issue #264 raster setup branch — redeploy the "
+            f"function, then rerun with overwrite to replace anything it wrote"
+        )
+
+
+def _invoke_lambda_ping(
+    lambda_client,
+    function_name,
+    store_path,
+    *,
+    config_dict,
+    dataset=None,
+    parent_order=None,
+    overwrite=False,
+    output_creds_event=None,
+):
+    """Pre-fan-out fail-fast ping for hive dispatch (issue #252).
+
+    One lightweight RequestResponse invoke, decoupled from the manifest WRITE
+    (which fires right after this ping as an async Event invoke of the setup
+    mode — issue #252 hybrid). Two failure modes are caught before any worker
+    is dispatched:
+
+    - **Stale deployment:** a function that predates the issue #252 hive
+      lifecycle has no ping mode, so the event falls through to its process
+      handler's 400 with ZERO writes — strictly earlier and cheaper than the
+      retired PR #205 layout-echo guard, which only fired after a
+      pre-#199-phase-3 function had already written the flat GLOBAL template
+      at the hive root. This also gates out hive-capable-but-pre-#252
+      functions, which lack this precheck and finalize's manifest backstop.
+    - **Incompatible existing store:** the handler runs the read-only
+      ``zagg.hive.validate_manifest`` against the event's manifest inputs
+      (same keys as hive setup/finalize), so a frozen-key mismatch — or an
+      overwrite into a root with shard data — refuses up front (D2) instead
+      of after the fan-out (PR #255 review fold). This covers sequential
+      reruns; two CONCURRENT runs racing into the same fresh root both pass
+      here, but with the manifest landing seconds after init (the async
+      setup invoke) the loser's collision window shrinks from run-length to
+      seconds. Same last-writer caveat the manifest write itself has always
+      had.
+
+    The raster lambda path reuses this ping (issue #264) ahead of its sync
+    template-writing setup invoke: a raster config carries no hive layout, so
+    only the stale-deployment half applies (the handler's manifest precheck
+    is a no-op), and the setup response's ``pipeline`` echo covers the
+    hive-capable-but-pre-#264 window this ping cannot see.
+
+    Kept while flat exists (issue #251): once flat is removed, a stale
+    function just errors and the ping can be dropped.
+    """
+    event = {
+        "mode": "ping",
+        "store_path": store_path,
+        "parent_order": parent_order,
         "overwrite": overwrite,
         "config": config_dict,
     }
@@ -2917,30 +3573,67 @@ def _invoke_lambda_setup(
     )
     payload = response["Payload"].read().decode("utf-8")
     if response.get("FunctionError"):
-        raise RuntimeError(f"Lambda setup failed: {payload}")
+        raise RuntimeError(f"Lambda ping failed: {payload}")
     result = json.loads(payload)
     if result.get("statusCode") != 200:
-        raise RuntimeError(f"Lambda setup error: {result.get('body')}")
-    # Resolve through the one grid-aware default (issue #253) instead of
-    # mirroring it by hand — the same pattern the deployed worker uses.
-    requested = get_store_layout(load_config_from_dict(config_dict or {}))
-    if requested == "hive":
         try:
-            echoed = json.loads(result.get("body") or "{}").get("layout")
+            body = json.loads(result.get("body") or "{}")
         except (TypeError, ValueError):
-            echoed = None
-        if echoed != "hive":
+            body = {}
+        if body.get("mode") == "ping":
+            # The deployed function KNOWS ping — this is validate_manifest
+            # refusing the store, not a stale deployment.
             raise RuntimeError(
-                f"Lambda setup did not confirm the hive store layout (response body "
-                f"{result.get('body')!r}): the deployed function predates issue #199 "
-                f"phase 3 and would write a FLAT store at the hive root — redeploy "
-                f"the function before dispatching hive runs"
+                f"Lambda ping refused the store at {store_path}: "
+                f"{body.get('error')!r} — the store was templated for a "
+                f"different configuration; clear the store root (or pick a "
+                f"new one) before dispatching this run"
             )
+        raise RuntimeError(
+            f"Lambda ping failed (response body {result.get('body')!r}): the "
+            f"deployed function predates the issue #252 dispatch lifecycle — "
+            f"redeploy the function before dispatching this run"
+        )
+    try:
+        version = json.loads(result.get("body") or "{}").get("zagg_version")
+    except (TypeError, ValueError):
+        version = None
+    logger.info(f"Preflight OK (function zagg version {version})")
 
 
-def _invoke_lambda_finalize(lambda_client, function_name, store_path, output_creds_event=None):
-    """Invoke Lambda in finalize mode to consolidate zarr metadata."""
+def _invoke_lambda_finalize(
+    lambda_client,
+    function_name,
+    store_path,
+    output_creds_event=None,
+    *,
+    config_dict=None,
+    dataset=None,
+    parent_order=None,
+    overwrite=False,
+):
+    """Invoke Lambda in finalize mode.
+
+    Flat: consolidates zarr metadata — the event stays byte-identical to the
+    pre-#252 one. Hive (issue #252 hybrid): the event additionally carries
+    the manifest inputs (``config`` + ``parent_order`` + ``dataset`` identity
+    + ``overwrite``, mirroring the hive setup event) and the worker's
+    ``ensure_manifest`` acts as the idempotent BACKSTOP for the async
+    init-time write — a frozen-key-matching existing manifest is accepted, no
+    second PUT. The backstop is load-bearing: worker Event invokes run with
+    retries 0 (template.yaml EventInvokeConfig, issue #151 hygiene), so a
+    lost async init write is never redelivered — finalize self-heals it;
+    symmetrically, finalize failure is no longer load-bearing for manifest
+    existence. The manifest is REQUIRED reader-facing schema (D6), so a
+    non-200 still raises — unlike the fail-open root coverage.moc (D9).
+    """
     event = {"mode": "finalize", "store_path": store_path}
+    if config_dict is not None:
+        event["config"] = config_dict
+        event["parent_order"] = parent_order
+        event["overwrite"] = overwrite
+        if dataset is not None:
+            event["dataset"] = dataset
     if output_creds_event is not None:
         event["output_credentials"] = output_creds_event
     response = lambda_client.invoke(

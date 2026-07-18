@@ -6,7 +6,7 @@ Aggregate point observations to multi-resolution grids using HEALPix spatial ind
 
 ## Overview
 
-zagg aggregates sparse point data (e.g., ICESat-2 ATL06 elevation measurements) to gridded products using HEALPix/morton spatial indexing. Processing runs in parallel on AWS Lambda — each worker handles one spatial cell independently, writing [Zarr v3](https://zarr-specs.readthedocs.io/en/latest/v3/core/v3.0.html) output following the [DGGS convention](https://github.com/zarr-conventions/dggs). HEALPix output defaults to the **morton-hive, sharded** layout — one self-describing leaf zarr per shard ([docs/hive_layout.md](docs/hive_layout.md)); the flat shared store remains for interop/debug (deprecated, removal tracked in [#251](https://github.com/englacial/zagg/issues/251)) and stays the layout for rectilinear grids and raster pipelines.
+zagg aggregates sparse point data (e.g., ICESat-2 ATL06 elevation measurements) to gridded products using HEALPix/morton spatial indexing. Processing runs in parallel on AWS Lambda — each worker handles one spatial cell independently, writing [Zarr v3](https://zarr-specs.readthedocs.io/en/latest/v3/core/v3.0.html) output following the [DGGS convention](https://github.com/zarr-conventions/dggs). HEALPix output defaults to the **morton-hive, sharded** layout — one self-describing leaf zarr per shard ([docs/hive_layout.md](docs/hive_layout.md)); the flat shared store remains for interop/debug (deprecated, removal tracked in [#251](https://github.com/englacial/zagg/issues/251)) and stays the layout for rectilinear grids. The default is grid-keyed for every pipeline: HEALPix raster ingest writes hive leaves too ([#247](https://github.com/englacial/zagg/issues/247)).
 
 ## Features
 

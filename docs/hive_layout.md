@@ -9,11 +9,13 @@ D1–D6); the convention itself is owned by the mortie spec and versioned as
 [Time windows](#time-windows-morton-hive2) below) is `morton-hive/2` — a
 strict superset: a `/1` store *is* a `/2` store with `schedule: none`.
 
-It is the **default for HEALPix point aggregation** (issue #253): an omitted
-`output.store_layout` resolves to `hive`. An explicit `store_layout: flat`
-(the single shared store) remains for interop/debug but is deprecated —
-removal is gated on the sparse-DGGS read path (issue #251 phase 3);
-rectilinear grids and raster pipelines keep the flat shared store. Hive is
+It is the **default for HEALPix output** (issue #253) — point aggregation
+and the raster pipeline alike (issue #247; the hive/flat split sits one
+abstraction above the pipeline kind): an omitted `output.store_layout`
+resolves to `hive`. An explicit `store_layout: flat` (the single shared
+store) remains for interop/debug but is deprecated — removal is gated on the
+sparse-DGGS read path (issue #251 phase 3);
+rectilinear grids keep the flat shared store. Hive is
 wired to **both backends** — the local runner and the Lambda handler share
 the same per-shard write path (see [Status](#status)).
 
@@ -147,17 +149,35 @@ output:
 Validation: `output.windowing` requires the hive layout on a healpix grid;
 `time_field` must be a declared `data_source` column (the worker can only
 filter what it reads); explicit windows must be well-formed (frozen label
-grammar, `start < end`, unique labels, disjoint ranges). Raster pipelines
-reject the block
-([issue #247](https://github.com/englacial/zagg/issues/247) tracks raster
-windowing). Changing the windowing of an existing store fails the frozen-key
+grammar, `start < end`, unique labels, disjoint ranges). On the raster path
+([issue #247](https://github.com/englacial/zagg/issues/247)) membership is
+the acquisition's STAC `datetime`: `time_field` is optional (fixed to
+`datetime`) and the `epoch`/`scale`/`units` conversion knobs are rejected.
+Changing the windowing of an existing store fails the frozen-key
 manifest check like an orders change — clear the root first.
 
 ## The manifest (`morton_hive.json`)
 
-Written **once at template time**, before any shard dispatches; never touched
-during a run (D6). With it, every shard path is computable arithmetically with
-zero requests:
+Written **asynchronously at init**
+([issue #252](https://github.com/englacial/zagg/issues/252) hybrid): the
+local dispatcher writes it directly before dispatch; the Lambda leg fires
+the existing `mode: "setup"` hive branch as a fire-and-forget Event invoke
+immediately after the `mode: "ping"` preflight passes, so the manifest
+typically lands within seconds of init (best-effort: the Event invoke shares
+worker concurrency and runs retries-0, deferring to the finalize backstop
+under throttling or a dropped invoke) and a reader can start consuming
+completed leaves while the store builds. Finalize re-ensures it as an
+**idempotent backstop** (a
+frozen-key-matching manifest is accepted — no second PUT): worker Event
+invokes run with retries 0, so a lost async init write self-heals at end of
+run, and a run that crashes mid-fan-out still left a manifest at init.
+Otherwise never touched during a run (D6); the read-only frozen-key precheck
+(`zagg.hive.validate_manifest`) still runs before the fan-out so an
+incompatible existing store refuses up front on reruns (two concurrent first
+writes into a fresh root now collide within seconds of init, not at the
+losing run's finalize).
+With the manifest, every shard
+path is computable arithmetically with zero requests:
 
 ```json
 {
@@ -320,13 +340,66 @@ doesn't list, it warns once per store and suggests
 that rebuilds the root MOC from the stamped leaves (debris excluded) and
 writes it with `source: "refresh"`. No reader ever auto-walks (D10).
 
-**Deploy note** (mirrors the PR #205 setup-echo note): the Lambda leg posts
+**Deploy note** (the sync-invoke analogue is the `mode: "ping"` preflight,
+which replaced the PR #205 setup echo — issue #252): the Lambda leg posts
 one fire-and-forget `mode: "coverage"` invoke, which requires the
 redeployed function. An **older deployment 400s the event in its process
 handler** — a logged error line in CloudWatch, but no writes, no result
 mirror, and no async redelivery — so the failure is fail-open by
 construction; the root object simply doesn't appear until the sweep or a
 refresh builds it.
+
+## Raster hive stores (issue #247)
+
+Raster (pull-NN) pipelines write the same tree with **windowed `(time, cells)`
+leaves**: one vanilla zarr v3 leaf per **(shard, window)** unit at
+`shard_leaf_path(root, shard, window=label)`, each carrying leaf-local `time`
+(int64 microseconds, CF attrs) and `cell_ids` coords plus one
+`(T_leaf, cells_per_shard)` array per configured band, chunked
+`(1, cells_per_chunk)`. The leaf's time axis is the unit's **own acquisition
+groups** — known at dispatch from the catalog, so both dispatchers produce
+identical leaves — and its coords are written at template time (nothing is
+deferred to a per-shard coords pass). There is no flat global template on the
+hive branch: template time writes only `morton_hive.json` (D5/D6).
+
+Differences from the aggregation path, all espg-ratified on
+[issue #247](https://github.com/englacial/zagg/issues/247):
+
+- **Window membership is the acquisition's STAC `datetime`**, decided at
+  dispatch — there is no per-observation timestamp column, so no
+  observation-level filter is injected. `output.windowing.time_field` is
+  optional (fixed to `datetime`, which the manifest temporal block records);
+  the `epoch`/`scale`/`units` conversion knobs are rejected (STAC datetimes
+  are already ISO-8601 UTC). An acquisition *group* (entries sharing a
+  `time_key` — one datatake's adjacent MGRS tiles) belongs to the window
+  containing its earliest datetime within the shard, so a group never splits
+  across leaves at a boundary.
+- **Schedule `none` is supported for consistency**
+  ([ratified](https://github.com/englacial/zagg/issues/247#issuecomment-5007157978)):
+  one bare `{full_id}.zarr` leaf per shard carrying the full time axis;
+  re-run = whole-leaf replacement; D14 `"full"` gated off exactly as
+  aggregation gates it. The append cost (a re-run rewrites the whole leaf)
+  is the user's explicit choice, visible in the manifest.
+- **Coverage is popcount-decided per D14** from the spatial union of the
+  unit's acquisitions (per-timestep validity stays data-plane nodata, D9):
+  an interior shard — every child cell covered — stamps
+  `encoding: "full"` with **no sidecar PUT**; an edge-of-scene/swath shard
+  writes the real bitmap sidecar.
+- **The D15 stamp truth** is the window label plus the actual ISO-UTC
+  `[min, max]` of the unit's acquisition datetimes and the acquisition
+  count; the root `coverage.moc` unions the per-leaf ranges as cache.
+- **`sharded: true` is permanently excluded** on the raster path (not
+  deferred): per-timestep slab streaming would read-modify-write each
+  `ShardingCodec` object once per timestep, and raster object count is
+  time-axis-dominated anyway.
+
+The shared worker (`zagg.processing.raster.process_and_write_raster_hive`,
+the raster analog of `process_and_write_hive`) runs identically under the
+local dispatcher and the Lambda `mode: "process_raster"` hive branch; hive
+events carry no `time_index` (the leaf axis is unit-local) plus an optional
+`window`, while flat raster events stay byte-identical to pre-#247 runs. The
+manifest rides the same ping → async-setup → finalize-backstop lifecycle as
+aggregation ([issue #252](https://github.com/englacial/zagg/issues/252)).
 
 ## Reading a hive store
 
@@ -364,10 +437,13 @@ under D9/O7). The §7 sweep remains the authoritative rebuilder.
 - **Both backends** write hive stores end-to-end through the same
   `zagg.hive.process_and_write_hive` code path. On **Lambda**
   ([issue #199](https://github.com/englacial/zagg/issues/199) phase 3)
-  `mode: "setup"` writes only the manifest — the orchestrator still needs no
-  S3 access — and each worker derives its leaf path from its `shard_key` +
-  the event config's orders, emits its own leaf template, and stamps
-  completion as its final PUT. The async status channel stays at the flat
+  the manifest write fires as an async `mode: "setup"` Event invoke at init,
+  with `mode: "finalize"` as its idempotent backstop
+  ([issue #252](https://github.com/englacial/zagg/issues/252) hybrid; a
+  lightweight `mode: "ping"` preflight keeps the pre-fan-out fail-fast) —
+  the orchestrator still needs no S3 access — and each worker derives its leaf
+  path from its `shard_key` + the event config's orders, emits its own leaf
+  template, and stamps completion as its final PUT. The async status channel stays at the flat
   sibling prefix (`{store_root}.status/<run_id>/…`), outside the digit tree.
 - **Coverage ships** ([issue #200](https://github.com/englacial/zagg/issues/200)
   phases 1–4): the tier-0 morton box on the commit stamp, the exact
