@@ -61,14 +61,17 @@ def _at_or_after_floor(hist: pd.DataFrame) -> pd.DataFrame:
 
 
 # Point-pipeline diagnostics panels: (derived column, panel title). ``agg`` is
-# the approved index+aggregate mapping; setup/finalize keep the issue #252
-# semantics (hive: ping+dispatch / manifest backstop). Never stacked.
+# the approved index+aggregate mapping. Never stacked. Issue #272: the
+# ``setup`` (sync ping) and ``finalize`` (hive manifest backstop) panels are
+# dropped -- #274 minimizes both (finalize skipped via the overlapped
+# manifest check; setup ping is cold-start-only), so plotting them is noise.
+# They stay in the series columns (setup_s/finalize_s), so if either ever
+# creeps back up it shows as ``total_wall_s`` diverging from read+agg+write --
+# no dedicated panel needed.
 POINT_PHASE_PANELS = [
     ("phase_read_s", "read (max shard)"),
     ("phase_agg_s", "agg = index + aggregate (max shard)"),
     ("phase_write_s", "write (max shard)"),
-    ("setup_s", "setup (sync path)"),
-    ("finalize_s", "finalize (hive: manifest backstop)"),
 ]
 
 # Raster diagnostics panels: the issue #249 stage set + the write bucket.
