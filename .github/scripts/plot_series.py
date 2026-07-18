@@ -942,17 +942,17 @@ def main(argv: list[str] | None = None) -> int:
     # PNGs persist on the benchmarks branch under the Archived section.
     merge_hist = plot_summary.merge_history(df)
     if not merge_hist.empty:
-        if plot_summary.make_summary_figure(
-            [("per-merge point (hive, densest shard)", merge_hist, "commit")],
-            outdir / "merge_summary.png",
-        ):
+        # Issue #272: the per-merge leg is the inline-vs-sidecar A/B on spill+disk
+        # -- two lines per figure (inline green, sidecar purple), cost + wall.
+        if plot_summary.make_merge_ab_figure(merge_hist, outdir / "merge_summary.png"):
             rendered.append("merge_summary")
         if plot_summary.make_diagnostics_figure(
             merge_hist,
             plot_summary.POINT_PHASE_PANELS,
             "commit",
             outdir / "merge_phases.png",
-            "zagg per-merge point — per-phase seconds vs merge",
+            "zagg per-merge point — per-phase seconds vs merge (inline vs sidecar)",
+            arm_col="target",
         ):
             rendered.append("merge_phases")
     latest = _latest_of(merge_hist).to_dict(orient="records")

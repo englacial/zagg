@@ -322,10 +322,11 @@ def test_summary_and_point_diagnostics_render(tmp_path):
         is True
     )
     assert obj.exists() and obj.stat().st_size > 0
-    # The approved panel set: read / agg / write / setup / finalize -- never
-    # the raw index+aggregate pair, and finalize kept per issue #252.
+    # The panel set: read / agg / write -- the raw index+aggregate pair is
+    # mapped to agg, and issue #272 dropped the setup/finalize panels (they stay
+    # as series columns; #274 minimizes both).
     cols = [c for c, _t in psu.POINT_PHASE_PANELS]
-    assert cols == ["phase_read_s", "phase_agg_s", "phase_write_s", "setup_s", "finalize_s"]
+    assert cols == ["phase_read_s", "phase_agg_s", "phase_write_s"]
 
 
 def test_diagnostics_skips_when_no_panel_has_data(tmp_path):
@@ -409,6 +410,71 @@ def test_history_floors_below_0_33_0():
     ]
     hist = psu.merge_history(pd.DataFrame(rows))
     assert list(hist["commit"]) == ["c25", "c28"]
+
+
+def _ab_rows():
+    rows = []
+    for i, commit in enumerate(("c1", "c2")):
+        for tgt in _psu().LIVE_MERGE_TARGETS:
+            rows.append(
+                {
+                    "timestamp": f"2026-07-1{i}T00:00:00Z",
+                    "commit": commit,
+                    "event": "merge",
+                    "target": tgt,
+                    "zagg_version": "0.33.0",
+                    "cost_per_shard_usd": 0.005,
+                    "setup_s": 3.0,
+                    "finalize_s": 3.0,
+                    "phase_index_s": 10.0,
+                    "phase_aggregate_s": 5.0,
+                    "phase_read_s": 40.0,
+                    "phase_write_s": 8.0,
+                    "total_wall_s": 120.0 if tgt == _psu().LIVE_MERGE_TARGETS[0] else 100.0,
+                    "max_memory_mb": 1600.0,
+                    "memory_gb": 4.0,
+                }
+            )
+    return rows
+
+
+def _psu():
+    import plot_summary
+
+    return plot_summary
+
+
+def test_merge_history_returns_both_ab_arms():
+    # issue #272: the per-merge leg is the inline+sidecar A/B, so merge_history
+    # keeps BOTH live targets (not just the inline arm) for the two-line plot.
+    psu = pytest.importorskip("plot_summary")
+    import pandas as pd
+
+    hist = psu.merge_history(pd.DataFrame(_ab_rows()))
+    assert set(hist["target"]) == set(psu.LIVE_MERGE_TARGETS)
+
+
+def test_merge_ab_two_line_figures_render(tmp_path):
+    # issue #272: the per-merge summary + diagnostics overlay inline (green) and
+    # sidecar (purple) on a shared commit axis; empty/missing-col -> False.
+    pytest.importorskip("matplotlib")
+    psu = pytest.importorskip("plot_summary")
+    import pandas as pd
+
+    hist = psu.merge_history(pd.DataFrame(_ab_rows()))
+    ab = tmp_path / "merge_summary.png"
+    assert psu.make_merge_ab_figure(hist, ab) is True
+    assert ab.exists() and ab.stat().st_size > 0
+    diag = tmp_path / "merge_phases.png"
+    assert (
+        psu.make_diagnostics_figure(
+            hist, psu.POINT_PHASE_PANELS, "commit", diag, "t", arm_col="target"
+        )
+        is True
+    )
+    assert diag.exists()
+    empty = tmp_path / "e.png"
+    assert psu.make_merge_ab_figure(pd.DataFrame(), empty) is False and not empty.exists()
 
 
 # --- store object-count columns (issue #240) --------------------------------
