@@ -16,6 +16,7 @@ import logging
 import os
 import random
 import statistics
+import threading
 import time
 import uuid
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -2493,11 +2494,28 @@ def _run_lambda(
     # manifest inputs (config + dataset identity from the ShardMap metadata,
     # the same source as the local path) ride the finalize event; flat
     # finalize events stay byte-identical.
+    # Hive manifest checker handles (issue #274 Fix 2): the background thread is
+    # started after the async setup invoke (below) and joined at fan-out end;
+    # _finalize_fn reads ``manifest_found`` to decide whether the backstop invoke
+    # is still needed. None on the flat path (no checker runs there).
+    manifest_found = None
+    manifest_stop = None
+    manifest_thread = None
+
     if get_store_layout(config) == "hive":
         md = catalog_data.get("metadata") or {}
         dataset = {"short_name": md.get("short_name"), "version": md.get("version")}
 
         def _finalize_fn():
+            # issue #274 Fix 2: the checker overlapped the fan-out. Manifest
+            # present -> the async init write (#252) landed; SKIP the backstop
+            # invoke (happy path, ~0 wall). Absent -> rare lost retries-0 Event
+            # write; invoke the finalize backstop to self-heal (unchanged path).
+            if manifest_found is not None and manifest_found.is_set():
+                logger.info(
+                    "morton_hive.json present (overlapped check) -- skipping finalize backstop"
+                )
+                return None
             return _invoke_lambda_finalize(
                 state["lambda_client"],
                 function_name,
@@ -2574,6 +2592,16 @@ def _run_lambda(
             overwrite=overwrite,
             output_creds_event=output_creds_event,
         )
+        # Overlap the fan-out with the client-side morton_hive.json check
+        # (issue #274 Fix 2): the async setup write above typically lands
+        # within seconds, so by finalize the flag is set and the blocking
+        # backstop invoke is skipped. Reads via the poller's output-store path.
+        from zagg.hive import read_manifest
+
+        manifest_kwargs = _output_store_kwargs(output_creds_event, region)
+        manifest_found, manifest_stop, manifest_thread = _start_manifest_checker(
+            lambda: read_manifest(store_path, **manifest_kwargs) is not None
+        )
     else:
         _invoke_lambda_setup(
             state["lambda_client"],
@@ -2622,6 +2650,13 @@ def _run_lambda(
         )
     finally:
         executor.shutdown()
+        # Stop the overlapped manifest checker and read its verdict (#274 Fix 2).
+        # It ran the whole fan-out; stopping now wakes it from its interval wait
+        # and joins cleanly (a final check already ran), leaving manifest_found
+        # settled before _finalize_fn consults it.
+        if manifest_stop is not None:
+            manifest_stop.set()
+            manifest_thread.join(timeout=_MANIFEST_CHECK_JOIN_TIMEOUT_S)
     fanout_s = time.time() - start_time
 
     # Consolidate metadata via Lambda (same rationale as setup -- avoids
@@ -2897,6 +2932,14 @@ _DEFAULT_FUNCTION_TIMEOUT_S = 900
 _ASYNC_POLL_MARGIN_S = 90.0
 _ASYNC_POLL_INTERVAL_S = 5.0
 
+# Hive manifest checker (issue #274 Fix 2). The morton_hive.json backstop is
+# confirmed CLIENT-side, overlapped with the fan-out, instead of a blocking
+# finalize invoke: a background thread GETs the manifest every INTERVAL until
+# it's present (async init write, #252), then the finalize backstop is skipped.
+# JOIN_TIMEOUT bounds the wait when stopping the checker at fan-out end.
+_MANIFEST_CHECK_INTERVAL_S = 10.0
+_MANIFEST_CHECK_JOIN_TIMEOUT_S = 30.0
+
 # Async (Event) invoke requests cap at 256 KB (vs 6 MB synchronous). Budget a
 # little under it so the dispatch pre-flight fails with a remedy before
 # Lambda's raw RequestEntityTooLargeException does; the realistic trigger is a
@@ -2975,6 +3018,39 @@ def _fetch_result(result_store, key):
     except (FileNotFoundError, NotFoundError):
         return None
     return json.loads(bytes(data)), last_modified
+
+
+def _start_manifest_checker(check_present, *, interval_s=_MANIFEST_CHECK_INTERVAL_S):
+    """Overlap the hive fan-out with a background morton_hive.json check (#274 Fix 2).
+
+    ``check_present`` is a zero-arg predicate returning True once the manifest is
+    readable. The moment it is, ``found`` is set and the thread stops; otherwise
+    it re-checks every ``interval_s`` until ``stop`` is set (the caller sets it and
+    joins at fan-out end). The dispatcher NEVER blocks on this -- it overlaps the
+    (hundreds-of-seconds) fan-out, so the async init-time manifest write (#252) has
+    landed by the first check in practice and the finalize backstop is skipped. A
+    transient GET fault is swallowed and retried next tick, never fatal. At least
+    one check always runs (even if ``stop`` is already set), so joining right after
+    an instant fan-out still yields a definitive present/absent verdict. Returns
+    ``(found, stop, thread)``; the thread is a daemon.
+    """
+    found = threading.Event()
+    stop = threading.Event()
+
+    def _run():
+        while True:
+            try:
+                if check_present():
+                    found.set()
+            except Exception:
+                pass  # transient GET fault -- re-check next tick, never fatal
+            if found.is_set() or stop.is_set():
+                return
+            stop.wait(interval_s)
+
+    thread = threading.Thread(target=_run, name="hive-manifest-check", daemon=True)
+    thread.start()
+    return found, stop, thread
 
 
 def _invoke_lambda_event(
