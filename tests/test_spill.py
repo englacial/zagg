@@ -446,6 +446,41 @@ class TestSpillConfig:
             SpillAggregator(cfg, grid, "pandas", 25)
 
 
+class TestBlockThreshold:
+    """The derived threshold must reserve the measured ~3x build peak."""
+
+    def test_derivation_includes_build_multiplier(self, monkeypatch):
+        from zagg.processing import spill
+
+        monkeypatch.setattr(spill, "_memory_budget_bytes", lambda: 4096 * 2**20)
+
+        class _Big:  # ~39 GB free: the /tmp cap must not bind
+            f_bavail = 10**7
+            f_frsize = 4096
+
+        monkeypatch.setattr(spill.os, "statvfs", lambda _p: _Big())
+        one = spill._default_block_bytes(1)
+        # 0.8 x 0.75 x mem / _BUILD_MULT: the phase-3 replays measured the
+        # partition build (columns + sort copies + outputs) peaking at
+        # ~2.6-3.5x the partition bytes, so the reservation divides by 3 —
+        # without it a derived K=1 block builds at ~3x its bytes and OOMs.
+        assert one == int(0.8 * 0.75 * 4096 * 2**20 / spill._BUILD_MULT)
+        # K divides the build unit (one partition), so it multiplies the block.
+        assert spill._default_block_bytes(4) == 4 * one
+
+    def test_tmp_cap_binds_when_small(self, monkeypatch):
+        from zagg.processing import spill
+
+        monkeypatch.setattr(spill, "_memory_budget_bytes", lambda: 4096 * 2**20)
+
+        class _Small:
+            f_bavail = 1000
+            f_frsize = 4096
+
+        monkeypatch.setattr(spill.os, "statvfs", lambda _p: _Small())
+        assert spill._default_block_bytes(1) == int(0.45 * 1000 * 4096)
+
+
 class TestSpillWorkerSingleBlock:
     """Single-block spill == pooled, byte for byte, on every reducer."""
 

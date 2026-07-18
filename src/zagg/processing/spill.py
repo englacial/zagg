@@ -309,23 +309,35 @@ def _memory_budget_bytes() -> int:
         return 2 * 2**30
 
 
+#: Peak in-memory working set of reducing one partition, as a multiple of its
+#: spilled bytes. Measured on the issue #217 phase-3 replays (real 120/148 g
+#: count slabs, K=1): 5,787 MB peak over a 1,652 MB partition and 8,338 MB
+#: over 3,054 MB — the read-back columns, the stable-sort gather copies, and
+#: the per-cell outputs coexist at ~2.6-3.5x the partition bytes. Budget the
+#: worst case; do not lower without re-measuring the replay.
+_BUILD_MULT = 3
+
+
 def _default_block_bytes(n_partitions: int, tmp_dir: str | None = None) -> int:
     """Default spill-block threshold (issue #217 design comment).
 
     The formula: a closing block's reduce working set is its **largest
-    partition** (~block/K) plus the block's outputs, live alongside the read
-    buffer — so block bytes ≲ ``0.8 x (memory - read buffer - outputs) x K``.
-    The read buffer and output carriers aren't measurable up front; they are
-    budgeted at 25% of memory combined, giving ``0.8 x 0.75 x memory x K =
-    0.6 x memory x K``. ``/tmp`` must additionally hold the closing block
-    beside the filling one, so the result is capped at 45% of the spill
-    directory's current free space. Injectable for tests and ops via
+    partition** (~block/K) at the measured :data:`_BUILD_MULT` build peak
+    (columns + sort copies + outputs), live alongside the read buffer — so
+    block bytes ≲ ``0.8 x (memory - read buffer - outputs) x K /
+    _BUILD_MULT``. The read buffer and output carriers aren't measurable up
+    front; they are budgeted at 25% of memory combined, giving ``0.8 x 0.75 /
+    3 x memory x K = 0.2 x memory x K``. ``/tmp`` must additionally hold the
+    closing block beside the filling one, so the result is capped at 45% of
+    the spill directory's current free space. A finer ``chunk_inner`` raises
+    K and with it the usable block (the build unit is one partition, not the
+    block). Injectable for tests and ops via
     ``SpillAggregator(block_bytes=...)``.
     """
     mem = _memory_budget_bytes()
     st = os.statvfs(tmp_dir or tempfile.gettempdir())
     tmp_cap = int(0.45 * st.f_bavail * st.f_frsize)
-    return max(1, min(int(0.6 * mem * n_partitions), tmp_cap))
+    return max(1, min(int(0.8 * 0.75 * mem * n_partitions / _BUILD_MULT), tmp_cap))
 
 
 class SpillAggregator:
