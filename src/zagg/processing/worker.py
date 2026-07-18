@@ -714,6 +714,9 @@ def process_shard(
             # closes mid-read) or the aggregate phase (single-block reduce).
             phase_timings["spill_write_s"] = buffered.spill_write_s
             phase_timings["spill_read_s"] = buffered.spill_read_s
+            # Block-fold compute (group+build+merge), split from read-back I/O so
+            # a profile run shows reduce-CPU vs read-I/O — the #280 measurement.
+            phase_timings["spill_reduce_s"] = buffered.spill_reduce_s
             phase_timings["spill_bytes"] = buffered.spill_bytes
         metadata["phase_timings"] = phase_timings
 
