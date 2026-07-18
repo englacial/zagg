@@ -279,32 +279,36 @@ def _render_release_table(recs: list[dict], title: str, out_png: Path) -> bool:
     if not recs:
         return False
     fmt = bench_metrics._fmt
-    headers = [
-        "target",
-        "release",
-        "shards",
-        "obs",
-        "first consumer (s)",
-        "wall (s)",
-        "total $",
-        "mem (MB)",
-    ]
+
+    def _has(key):
+        return any(r.get(key) is not None and r.get(key) == r.get(key) for r in recs)
+
+    # Schema-adaptive so the SAME renderer serves the point and raster legs: the
+    # point series records ``total_obs`` + ``first_consumer_s``; the raster
+    # series records ``slabs_written`` and computes no first-consumer. Show a
+    # column only where the leg actually has the data (else the raster table
+    # carried two permanently-n/a columns and an over-claiming caption).
+    has_fc = _has("first_consumer_s")
+    count_key = "total_obs" if _has("total_obs") else "slabs_written"
+    count_hdr = "obs" if count_key == "total_obs" else "slabs"
+    headers = ["target", "release", "shards", count_hdr]
+    if has_fc:
+        headers.append("first consumer (s)")
+    headers += ["wall (s)", "total $", "mem (MB)"]
     cell_text = []
     for r in recs:
         cost_cell = fmt(r.get("total_cost_usd"), ".5f")
         cost_cell = f"${cost_cell}" if cost_cell != "n/a" else "n/a"
-        cell_text.append(
-            [
-                str(r.get("target") or "")[-26:],
-                str(r.get("ref") or r.get("commit") or "")[:14],
-                fmt(r.get("n_shards_ok"), ",.0f"),
-                fmt(r.get("total_obs"), ",.0f"),
-                fmt(r.get("first_consumer_s"), ".1f"),
-                fmt(r.get("total_wall_s"), ".1f"),
-                cost_cell,
-                fmt(r.get("max_memory_mb"), ".0f"),
-            ]
-        )
+        row = [
+            str(r.get("target") or "")[-26:],
+            str(r.get("ref") or r.get("commit") or "")[:14],
+            fmt(r.get("n_shards_ok"), ",.0f"),
+            fmt(r.get(count_key), ",.0f"),
+        ]
+        if has_fc:
+            row.append(fmt(r.get("first_consumer_s"), ".1f"))
+        row += [fmt(r.get("total_wall_s"), ".1f"), cost_cell, fmt(r.get("max_memory_mb"), ".0f")]
+        cell_text.append(row)
     fig, ax = plt.subplots(figsize=(11, 0.5 * len(recs) + 1.2))
     ax.axis("off")
     table = ax.table(cellText=cell_text, colLabels=headers, loc="center", cellLoc="right")
@@ -861,8 +865,11 @@ def write_index(
         f'<h3>{title}</h3>\n<img src="{name}.png" alt="{name}">'
         for name, title in (
             ("full_aoi_summary", "Summary — total billed cost (lambda-s ⇔ USD) and wall"),
-            ("full_aoi_point_table", "Point pipeline — latest release (with time-to-first-consumer)"),
-            ("full_aoi_raster_table", "Raster pipeline — latest release (with time-to-first-consumer)"),
+            (
+                "full_aoi_point_table",
+                "Point pipeline — latest release (with time-to-first-consumer)",
+            ),
+            ("full_aoi_raster_table", "Raster pipeline — latest release"),
             ("full_aoi_point_phases", "Point pipeline — per-phase seconds (max shard)"),
             (
                 "full_aoi_raster_phases",

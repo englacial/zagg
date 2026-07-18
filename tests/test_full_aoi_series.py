@@ -550,6 +550,31 @@ def test_release_table_renders_with_first_consumer(tmp_path):
     assert ps._render_release_table([], "x", empty) is False and not empty.exists()
 
 
+def test_release_table_adapts_to_raster_schema(tmp_path):
+    # issue #272 review fold: the shared renderer serves BOTH legs. The raster
+    # series records ``slabs_written`` (not ``total_obs``) and no first-consumer,
+    # so the table must drop the first-consumer column and show slabs -- not two
+    # permanently-n/a columns. Verified via the header/cell builder (no render).
+    ps = pytest.importorskip("plot_series")
+    raster = [
+        {
+            "target": "raster_s2_neon_2025",
+            "ref": "0.33.0",
+            "n_shards_ok": 4,
+            "slabs_written": 85,
+            "total_wall_s": 210.0,
+            "total_cost_usd": 0.12,
+            "max_memory_mb": 900.0,
+        }
+    ]
+    # A point record keeps the first-consumer column + the "obs" header.
+    point = [{"target": "p", "ref": "0.33.0", "total_obs": 2e8, "first_consumer_s": 74.5}]
+    pytest.importorskip("matplotlib")
+    r_out, p_out = tmp_path / "r.png", tmp_path / "p.png"
+    assert ps._render_release_table(raster, "raster", r_out) is True and r_out.exists()
+    assert ps._render_release_table(point, "point", p_out) is True and p_out.exists()
+
+
 def test_full_aoi_objects_figure_skips_legacy_series(tmp_path):
     # A pre-#240 series parquet has no objects_total column (or an all-null
     # one): the objects figure must skip cleanly (False, no file), while the
