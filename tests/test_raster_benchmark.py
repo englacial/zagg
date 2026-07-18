@@ -243,7 +243,7 @@ def _record(commit="c0", target="raster_s2_neon_2025", event="release", **over):
         "worker_median_s": 480.0,
         "memory_gb": 4.0,
         "price_per_gb_sec": 1.33334e-05,
-        "zagg_version": "0.32.0",
+        "zagg_version": "0.33.0",
         "per_shard_granules": [10, 20, 25, 30],
         # Distinct values so a column transposition can't pass unnoticed.
         "stage_max": {

@@ -23,6 +23,7 @@ import sys
 from pathlib import Path
 
 import pandas as pd
+from packaging.version import InvalidVersion, Version
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import bench_metrics  # noqa: E402
@@ -31,6 +32,33 @@ from zagg.dispatch import LAMBDA_MEMORY_GB, LAMBDA_PRICE_PER_GB_SEC  # noqa: E40
 
 # The collapsed live per-merge target (issue #250): the single hive config.
 LIVE_MERGE_TARGET = "tdigest_healpix_o9_hive"
+
+# Series version floor (issue #272): only rows at/after this release are plotted.
+# Pre-0.33.0 rows are wrong -- their cost estimates predate the ~100 s async
+# setup term, and the last pre-floor point was a no-run recorded as 0 s / $0 that
+# collapses the axis. Applied at RENDER time to every history; the retained
+# parquet series is NOT pruned (a physical prune is an @espg action).
+_VERSION_FLOOR = Version("0.33.0")
+
+
+def _at_or_after_floor(hist: pd.DataFrame) -> pd.DataFrame:
+    """Drop rows below the :data:`_VERSION_FLOOR` (issue #272).
+
+    Keyed on ``zagg_version`` with a dev-suffix-tolerant parse (``0.33.1.dev5+g``
+    parses and sorts after ``0.33.0``). A missing/unparseable version can't be
+    proven at/after the floor, so it drops too (legacy rows predate it anyway).
+    """
+    if hist.empty or "zagg_version" not in hist.columns:
+        return hist
+
+    def _ok(v) -> bool:
+        try:
+            return Version(str(v)) >= _VERSION_FLOOR
+        except (InvalidVersion, TypeError):
+            return False
+
+    return hist[hist["zagg_version"].map(_ok)]
+
 
 # Point-pipeline diagnostics panels: (derived column, panel title). ``agg`` is
 # the approved index+aggregate mapping; setup/finalize keep the issue #252
@@ -83,6 +111,7 @@ def point_release_history(fa_df: pd.DataFrame) -> pd.DataFrame:
     if "event" in hist.columns:
         hist = hist[hist["event"] == "release"]
     hist = hist.dropna(subset=["target"])
+    hist = _at_or_after_floor(hist)
     if hist.empty:
         return hist
     hist = hist.sort_values("timestamp" if "timestamp" in hist.columns else "commit")
@@ -104,6 +133,7 @@ def raster_release_history(r_df: pd.DataFrame) -> pd.DataFrame:
     if "event" in hist.columns:
         hist = hist[hist["event"] == "release"]
     hist = hist.dropna(subset=["target"])
+    hist = _at_or_after_floor(hist)
     if hist.empty:
         return hist
     hist = hist.sort_values("timestamp" if "timestamp" in hist.columns else "commit")
@@ -121,6 +151,7 @@ def merge_history(df: pd.DataFrame) -> pd.DataFrame:
     if df.empty or "target" not in df.columns:
         return pd.DataFrame()
     hist = df[(df.get("event") == "merge") & (df["target"] == LIVE_MERGE_TARGET)].copy()
+    hist = _at_or_after_floor(hist)
     if hist.empty:
         return hist
     hist = hist.sort_values("timestamp")
