@@ -95,6 +95,24 @@ def _resolve_function_name(config: PipelineConfig, function_name: str | None) ->
     return base + suffix
 
 
+def _with_progress(accumulate, on_progress, total, *, metered=False):
+    """Wrap a dispatch accumulator with the optional progress hook (issue #298).
+
+    ``on_progress(done, total, cost_usd)`` fires after each unit is folded in;
+    ``cost_usd`` is the report's running metered rollup on Lambda paths
+    (``metered=True``) and ``None`` where nothing is billed. ``None`` hook ->
+    the accumulator is returned untouched, keeping the default path identical.
+    """
+    if on_progress is None:
+        return accumulate
+
+    def wrapped(report, i, result):
+        accumulate(report, i, result)
+        on_progress(i, total, report.cost.cost_usd if metered else None)
+
+    return wrapped
+
+
 def _worker_memory_gb(config: PipelineConfig) -> float:
     """Billed memory (GB) of the worker this run dispatches to (issue #298).
 
@@ -135,6 +153,7 @@ def agg(
     invocation: str = "async",
     force_cold: bool = False,
     events=None,
+    on_progress=None,
 ) -> dict:
     """Run the aggregation pipeline.
 
@@ -259,6 +278,15 @@ def agg(
         invoke per event (see :func:`_run_lambda_events`). Ignored by the
         spatial path. Until the event reader + catalog land, the caller
         supplies events directly (e.g. from a notebook).
+    on_progress : Callable[[int, int, float | None], None], optional
+        Per-completed-unit progress hook (issue #298): called from the
+        dispatch accumulator with ``(done, total, cost_usd)`` -- the 1-based
+        completion count, the unit total, and the running metered cost
+        (``None`` on paths with no metered cost: local backends and the
+        raster fan-out, which carries no per-unit pricing). Drives
+        ``zagg.notebook``'s progress bar; must be cheap and must not raise
+        (it runs on the dispatch thread). Default ``None`` -- no callback,
+        byte-identical prior behavior.
     Returns
     -------
     dict
@@ -296,6 +324,7 @@ def agg(
         invocation=invocation,
         force_cold=force_cold,
         events=events,
+        on_progress=on_progress,
     )
 
 
@@ -331,6 +360,7 @@ class SpatialStrategy:
         invocation="async",
         force_cold=False,
         events=None,
+        on_progress=None,
     ):
         # Resolve catalog and store
         catalog_path = catalog or config.catalog
@@ -386,6 +416,7 @@ class SpatialStrategy:
                 output_credentials=output_credentials,
                 output_endpoint_url=resolved_endpoint,
                 handoff=resolved_handoff,
+                on_progress=on_progress,
             )
         elif backend == "lambda":
             if max_workers is None:
@@ -415,6 +446,7 @@ class SpatialStrategy:
                 max_retries=max_retries,
                 invocation=invocation,
                 force_cold=force_cold,
+                on_progress=on_progress,
             )
         else:
             raise ValueError(f"Unknown backend: {backend!r} (expected 'local' or 'lambda')")
@@ -458,6 +490,7 @@ class TemporalStrategy:
         invocation="async",
         force_cold=False,
         events=None,
+        on_progress=None,
     ):
         from zagg.config import collection_options
         from zagg.temporal import prepare_collection, process_event, specs_from_config
@@ -501,6 +534,7 @@ class TemporalStrategy:
                 max_retries=max_retries,
                 invocation=invocation,
                 force_cold=force_cold,
+                on_progress=on_progress,
             )
 
         if max_workers is None:
@@ -554,13 +588,15 @@ class TemporalStrategy:
                 {"event_key": event_key, "results": outcome["results"], "meta": outcome["meta"]}
             )
 
+        accumulate = _with_progress(_accumulate, on_progress, n)
+
         start_time = time.time()
         try:
             report = dispatch(
                 executor,
                 event_list,
                 retry=LOCAL_RETRY,
-                accumulate=_accumulate,
+                accumulate=accumulate,
             )
         finally:
             executor.shutdown()
@@ -686,6 +722,7 @@ class RasterStrategy:
         output_endpoint_url,
         profile=False,
         invocation="async",
+        on_progress=None,
         **_ignored,
     ):
         from zagg.processing.raster import (
@@ -764,6 +801,7 @@ class RasterStrategy:
                 dataset={"short_name": md.get("short_name"), "version": md.get("version")},
                 profile=profile,
                 invocation=invocation,
+                on_progress=on_progress,
             )
 
         # Local backend: template emission stays orchestrator-owned (the
@@ -870,7 +908,7 @@ class RasterStrategy:
         stage_counts: dict = {}
         with ThreadPoolExecutor(max_workers=max_workers) as pool:
             futures = {pool.submit(_one, pair): pair[0] for pair in cells}
-            for fut in as_completed(futures):
+            for i, fut in enumerate(as_completed(futures), 1):
                 label = shard_label(grid, futures[fut])
                 try:
                     meta, stage_stats, write_s = fut.result()
@@ -879,6 +917,10 @@ class RasterStrategy:
                     last_error = e
                     logger.warning(f"raster shard {label} failed: {e}")
                     continue
+                finally:
+                    # Progress hook (issue #298): local raster has no metered cost.
+                    if on_progress is not None:
+                        on_progress(i, len(cells), None)
                 ok_metas.append(meta)
                 if meta["timesteps"]:
                     shards_with_data += 1
@@ -967,6 +1009,7 @@ class RasterStrategy:
         dataset=None,
         profile=False,
         invocation="async",
+        on_progress=None,
     ):
         """Fan shards out, one ``mode="process_raster"`` invoke each.
 
@@ -1165,9 +1208,13 @@ class RasterStrategy:
         ok_units: list = []  # (shard_key, body) — coverage needs keys, rollups bodies
         with ThreadPoolExecutor(max_workers=max_workers) as pool:
             futures = {pool.submit(_one, pair): pair[0] for pair in cells}
-            for fut in as_completed(futures):
+            for i, fut in enumerate(as_completed(futures), 1):
                 label = shard_label(grid, futures[fut])
                 result = fut.result()
+                # Progress hook (issue #298): the raster fan-out has no
+                # per-unit pricing rollup, so the running cost rides as None.
+                if on_progress is not None:
+                    on_progress(i, len(cells), None)
                 if result["error"]:
                     errors += 1
                     last_error = result["error"]
@@ -1306,6 +1353,7 @@ def _run_lambda_events(
     max_retries=3,
     invocation="async",
     force_cold=False,
+    on_progress=None,
 ):
     """Fan the temporal pipeline out one event per Lambda invoke (issue #12, Phase 8).
 
@@ -1518,12 +1566,14 @@ def _run_lambda_events(
             rate = i / elapsed if elapsed > 0 else 0
             logger.info(f"  [{i:4d}/{n}] {rate:.1f} events/s")
 
+    accumulate = _with_progress(_accumulate, on_progress, n, metered=True)
+
     try:
         report = dispatch(
             executor,
             event_list,
             retry=LAMBDA_RETRY,
-            accumulate=_accumulate,
+            accumulate=accumulate,
             on_submit_error=lambda e: raise_for_fd_exhaustion(e, max_workers),
         )
     finally:
@@ -2088,6 +2138,7 @@ def _run_local(
     output_credentials=None,
     output_endpoint_url=None,
     handoff="arrow",
+    on_progress=None,
 ):
     """Run processing locally via the generic dispatch loop on a thread pool.
 
@@ -2251,13 +2302,15 @@ def _run_local(
             if i % 10 == 0 or n <= 20:
                 logger.info(f"  [{i}/{n}] {label}: {obs:,} obs")
 
+    accumulate = _with_progress(_accumulate, on_progress, n)
+
     start_time = time.time()
     try:
         report = dispatch(
             executor,
             cells,
             retry=LOCAL_RETRY,
-            accumulate=_accumulate,
+            accumulate=accumulate,
         )
     finally:
         executor.shutdown()
@@ -2347,6 +2400,7 @@ def _run_lambda(
     max_retries=3,
     invocation="async",
     force_cold=False,
+    on_progress=None,
 ):
     """Run processing via AWS Lambda invocation.
 
@@ -2726,12 +2780,14 @@ def _run_lambda(
             rate = i / elapsed if elapsed > 0 else 0
             logger.info(f"  [{i:4d}/{n}] {rate:.1f} cells/s")
 
+    accumulate = _with_progress(_accumulate, on_progress, n, metered=True)
+
     try:
         report = dispatch(
             executor,
             cells,
             retry=LAMBDA_RETRY,
-            accumulate=_accumulate,
+            accumulate=accumulate,
             # _invoke_lambda_cell already re-raises FD exhaustion with ulimit
             # guidance; this is a backstop for exhaustion that surfaces outside
             # the cell body (e.g. at submit time). Other exceptions propagate.

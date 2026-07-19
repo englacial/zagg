@@ -123,7 +123,7 @@ class TestCostBlock:
     a 1 s billed duration, no live AWS.
     """
 
-    def _run(self, monkeypatch, cfg, duration=1.0):
+    def _run(self, monkeypatch, cfg, duration=1.0, **extra):
         monkeypatch.setattr(
             runner,
             "compute_available_workers",
@@ -152,6 +152,7 @@ class TestCostBlock:
             dry_run=False,
             region="us-west-2",
             function_name="process-shard",
+            **extra,
         )
 
     def _flat_cfg(self):
@@ -193,6 +194,22 @@ class TestCostBlock:
         cfg = self._flat_cfg()
         cfg.worker = {"memory": 2048}
         assert runner._worker_memory_gb(cfg) == 2.0
+
+    def test_on_progress_fires_per_completed_shard(self, lambda_env, monkeypatch):
+        # Progress hook (issue #298 phase 2): one call per completed unit with
+        # the 1-based done count, the unit total, and the running metered cost.
+        from zagg.dispatch import LAMBDA_PRICE_PER_GB_SEC
+
+        seen = []
+        self._run(
+            monkeypatch,
+            self._flat_cfg(),
+            on_progress=lambda done, total, cost: seen.append((done, total, cost)),
+        )
+        assert [(d, t) for d, t, _ in seen] == [(1, 4), (2, 4), (3, 4), (4, 4)]
+        costs = [c for _, _, c in seen]
+        assert costs == sorted(costs)  # running rollup only grows
+        assert costs[-1] == pytest.approx(4 * 1.0 * 4.0 * LAMBDA_PRICE_PER_GB_SEC)
 
 
 class TestCostBlockEvents:
