@@ -1,21 +1,28 @@
-"""Consolidated CONUS cost estimate, both orders, cold+warm, with 95% intervals.
+"""Consolidated CONUS cost estimate, both orders, with 95% intervals.
 
-Assembles the measured 0.24.0-sharded regressions into the full-CONUS dollar
-table the estimate doc reports. Per the operational split (espg):
+Assembles the measured **0.36.0** stratified 25-shard regressions into the
+full-CONUS dollar table the estimate doc reports. Both orders were re-run on
+``process-shard-4096-disk`` (4 GB RAM + ephemeral spill disk), **hive + sidecar +
+spill**, in two passes per order:
 
-  * **cold (first run)** = ``inline`` backend, genuinely-uncached reads, measured
-    cache-independently (does not depend on the shared granule-keyed sidecar cache
-    state). This is the realistic first-pass read cost.
-  * **warm (repeat)** = ``sidecar`` backend, reads hit the prebuilt manifest cache.
-  * **+ sidecar build** = the one-time write to populate the cache on the true
-    first run, estimated from the o8 (sidecar on_miss:build cold) - (inline cold)
-    delta and applied uniformly, so ``first-run total = cold(inline) + build``.
+  * **cold cache (v035)** = pre-store-cache-fix (#287/#288), cold sidecar cache.
+    This is the realistic first-pass read cost.
+  * **warm cache + fix (v036)** = warm sidecar cache with the #288 store-cache
+    fix. This is the current-code operating point and the headline number.
 
-Each (order, scenario) fit is applied to that order's full CONUS per-shard
+Both passes use the same ``sidecar`` backend / ``hive`` layout / ``spill``
+streaming -- the only axis that moves between them is cache warmth plus the #288
+fix, so the v035->v036 delta isolates the store-cache effect (small at CONUS's
+~80-210-granule scale; decisive at the 88S pole, a different regime -- ref #148).
+
+Each (order, pass) fit is applied to that order's full CONUS per-shard
 granule-count distribution and carries a 95% interval propagating the OLS
 parameter covariance (systematic, correlated across shards -- the dominant term)
 plus the per-shard residual scatter (independent, averages down over N). See
 ``estimate_with_ci.py`` for the interval math.
+
+The input result files are flat lists of per-shard records under
+``data/conus/results/`` (``conus_o{8,9}_v0{35,36}.json``).
 """
 
 from __future__ import annotations
@@ -38,17 +45,25 @@ COUNTS = {
     9: HERE / "conus_shard_granule_counts.parquet",
 }
 
+# (order, pass) -> flat per-shard results list (0.36.0 stratified 25-shard run)
+FILES = {
+    (8, "cold"): RES / "conus_o8_v035.json",
+    (8, "warm"): RES / "conus_o8_v036.json",
+    (9, "cold"): RES / "conus_o9_v035.json",
+    (9, "warm"): RES / "conus_o9_v036.json",
+}
 
-def _points(pass_rec):
+
+def _points(rows):
+    """(granules, runtime_s) arrays over the succeeded shards of a flat list."""
     ok = [
         (r["n_granules"], r["runtime_s"])
-        for r in pass_rec["per_shard"]
+        for r in rows
         if not r.get("error") and r.get("runtime_s") and r.get("n_granules")
     ]
     return (
         np.array([x[0] for x in ok], float),
         np.array([x[1] for x in ok], float),
-        [r for r in pass_rec["per_shard"] if not r.get("error")],
     )
 
 
@@ -71,6 +86,7 @@ def _fit_ci(g, t, n_shards, g_total):
         "resid_std_s": round(s_resid, 1),
         "n_pts": len(g),
         "lambda_s": float(total_lam),
+        "gb_seconds": float(total_lam) * LAMBDA_MEMORY_GB,
         "cost": cost,
         "ci": half,
         "lo": cost - half,
@@ -84,28 +100,22 @@ def _dist(order):
     return int(len(c)), float(c.sum())
 
 
-def _envelope(pass_rec):
-    """Max per-shard wall/lambda time + peak RSS across the measured shards."""
-    rows = [r for r in pass_rec["per_shard"] if not r.get("error")]
+def _envelope(rows):
+    """Max per-shard runtime/wall + peak RSS across the measured shards."""
+    ok = [r for r in rows if not r.get("error")]
     return {
-        "max_runtime_s": max((r["runtime_s"] for r in rows), default=None),
-        "max_wall_s": max((r.get("wall_time_s") or 0 for r in rows), default=None),
-        "max_rss_mb": max((r.get("max_memory_mb") or 0 for r in rows), default=None),
-        "max_granules": max((r["n_granules"] for r in rows), default=None),
-        "n_ok": len(rows),
-        "n_err": sum(1 for r in pass_rec["per_shard"] if r.get("error")),
+        "max_runtime_s": max((r["runtime_s"] for r in ok), default=None),
+        "max_wall_s": max((r.get("dispatch_wall_s") or 0 for r in ok), default=None),
+        "max_rss_mb": max((r.get("max_memory_mb") or 0 for r in ok), default=None),
+        "max_granules": max((r["n_granules"] for r in ok), default=None),
+        "n_ok": len(ok),
+        "n_err": sum(1 for r in rows if r.get("error")),
     }
 
 
 def main():
-    files = {
-        ("o8", "inline_cold"): RES / "conus_inline_cold_o8.json",
-        ("o8", "sidecar"): RES / "conus_regression_results_o8.json",
-        ("o9", "inline_cold"): RES / "conus_inline_cold_o9.json",
-        ("o9", "sidecar"): RES / "conus_regression_results_o9warm.json",
-    }
     loaded = {}
-    for k, f in files.items():
+    for k, f in FILES.items():
         if f.exists():
             loaded[k] = json.loads(f.read_text())
         else:
@@ -115,56 +125,46 @@ def main():
     for order_i, tag in [(8, "o8"), (9, "o9")]:
         n_shards, g_total = _dist(order_i)
         rec = {"n_shards": n_shards, "g_total": int(g_total)}
-        # cold = inline cold pass
-        ic = loaded.get((tag, "inline_cold"))
-        if ic and ic.get("cold"):
-            g, t, _ = _points(ic["cold"])
-            rec["cold_inline"] = _fit_ci(g, t, n_shards, g_total)
-            rec["cold_env"] = _envelope(ic["cold"])
-        # warm = sidecar warm pass
-        sc = loaded.get((tag, "sidecar"))
-        if sc and sc.get("warm"):
-            g, t, _ = _points(sc["warm"])
-            rec["warm_sidecar"] = _fit_ci(g, t, n_shards, g_total)
-            rec["warm_env"] = _envelope(sc["warm"])
-        # build-cold (sidecar on_miss:build) -- for the write addend
-        if sc and sc.get("cold"):
-            g, t, _ = _points(sc["cold"])
-            rec["build_cold"] = _fit_ci(g, t, n_shards, g_total)
-            rec["build_cold_verified"] = sc.get("sidecar_write_verified")
+        for pass_, key in (("cold", "cold_v035"), ("warm", "warm_v036")):
+            rows = loaded.get((order_i, pass_))
+            if not rows:
+                continue
+            g, t = _points(rows)
+            rec[key] = _fit_ci(g, t, n_shards, g_total)
+            rec[key + "_env"] = _envelope(rows)
+        # store-cache-fix effect on the full-CONUS total
+        if "cold_v035" in rec and "warm_v036" in rec:
+            c0, c1 = rec["cold_v035"]["cost"], rec["warm_v036"]["cost"]
+            rec["store_cache_pct"] = round(100 * (c1 - c0) / c0, 1) if c0 else None
         out[tag] = rec
 
-    # sidecar-build write addend from o8: (build_cold) - (inline_cold)
-    addend = None
-    if "cold_inline" in out.get("o8", {}) and "build_cold" in out.get("o8", {}):
-        addend = out["o8"]["build_cold"]["cost"] - out["o8"]["cold_inline"]["cost"]
-        out["sidecar_build_addend_o8_usd"] = addend
-
     print(json.dumps(out, indent=2, default=lambda x: round(x, 2) if isinstance(x, float) else x))
-    print("\n" + "=" * 78)
-    print(f"{'order':6} {'scenario':16} {'cost':>10} {'95% CI':>18} {'fit':>28} {'R2':>5}")
-    print("-" * 78)
+    print("\n" + "=" * 82)
+    print(f"{'order':6} {'pass':22} {'cost':>10} {'95% CI':>18} {'fit':>28} {'R2':>5}")
+    print("-" * 82)
     for tag in ("o8", "o9"):
         r = out.get(tag, {})
-        for scen, key in [("cold (inline)", "cold_inline"), ("warm (sidecar)", "warm_sidecar")]:
+        for scen, key in [("cold cache (v035)", "cold_v035"), ("warm+fix (v036)", "warm_v036")]:
             c = r.get(key)
             if not c:
                 continue
             print(
-                f"{tag:6} {scen:16} ${c['cost']:>8.0f} "
+                f"{tag:6} {scen:22} ${c['cost']:>8.0f} "
                 f"${c['lo']:>6.0f}..${c['hi']:<6.0f}(+/-{c['pct']:.0f}%) "
                 f"{c['slope']:>6.3f}/gran+{c['intercept']:>6.0f}/shard  {c['r2']}"
             )
-    if addend is not None:
-        print(f"\nsidecar-build write addend (o8, applied to first-run): +${addend:.0f}")
-    print("\n=== o8 time envelope (900 s worker) ===")
-    for scen in ("cold_env", "warm_env"):
-        e = out.get("o8", {}).get(scen)
-        if e:
-            print(
-                f"  o8 {scen}: max_wall={e['max_wall_s']}s max_rss={e['max_rss_mb']}MB "
-                f"@ {e['max_granules']} gran; ok={e['n_ok']}/{e['n_ok'] + e['n_err']}"
-            )
+        if r.get("store_cache_pct") is not None:
+            print(f"       store-cache-fix effect (v035->v036): {r['store_cache_pct']:+.1f}%")
+    print("\n=== time / memory envelope (900 s worker, 4 GB RAM) ===")
+    for tag in ("o8", "o9"):
+        for scen, key in (("cold v035", "cold_v035_env"), ("warm v036", "warm_v036_env")):
+            e = out.get(tag, {}).get(key)
+            if e:
+                print(
+                    f"  {tag} {scen}: max_runtime={e['max_runtime_s']:.0f}s "
+                    f"max_wall={e['max_wall_s']:.0f}s max_rss={e['max_rss_mb']:.0f}MB "
+                    f"@ {e['max_granules']} gran; ok={e['n_ok']}/{e['n_ok'] + e['n_err']}"
+                )
     Path(RES / "conus_final_estimate.json").write_text(json.dumps(out, indent=2))
     print(f"\nwrote {RES / 'conus_final_estimate.json'}")
 
