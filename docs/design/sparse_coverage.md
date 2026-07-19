@@ -2,7 +2,9 @@
 
 **Status**: draft. Tracks [#198](https://github.com/englacial/zagg/issues/198);
 temporal-partitioning amendments (D13–D15) ratified on
-[#237](https://github.com/englacial/zagg/issues/237).
+[#237](https://github.com/englacial/zagg/issues/237); morton-only-storage
+amendment (D16, O10) ratified on
+[#262](https://github.com/englacial/zagg/issues/262).
 
 > All design decisions (both made and open) are consolidated in the
 > [Decisions registry](#8-decisions-registry). Inline references use **D#** for
@@ -305,11 +307,16 @@ scope:
   materializing dense full-sphere coordinates. The accessor uses it to
   truncate the notional global grid to where data exists — top-level MOC
   coverage/polygons drive what the extension exposes.
-- **Coordinates stay sparse.** The `morton` coordinate (packed u64 words,
-  `MortonIndexDtype` in memory — upstream ask tracked in
-  [#72](https://github.com/englacial/zagg/issues/72)) is the native cell
-  labeling; `cell_ids` (HEALPix NESTED) remains the interop encoding
-  (`cell_ids_encoding`, [#135](https://github.com/englacial/zagg/issues/135)).
+- **Coordinates stay sparse, and morton is the only stored coordinate**
+  (D16). The `morton` coordinate (packed u64 words, `MortonIndexDtype` in
+  memory — upstream ask tracked in
+  [#72](https://github.com/englacial/zagg/issues/72)) is the sole cell
+  labeling on disk. NESTED `cell_ids` remains the *interop* encoding but is
+  fabricated exactly, on demand (`mort2healpix` is vectorized arithmetic):
+  moczarr fabricates it Python-side, the gridlook-jupyter hub proxy at serve
+  time, a TS decode for browser-direct stores. The `cell_ids_encoding` knob
+  ([#135](https://github.com/englacial/zagg/issues/135)) retires with the
+  D16 writer flip.
 - **Dense views are fabricated lazily**, per-region, on demand — never stored.
 - **Multi-store alignment**: opening several stores (datasets) over one AOI
   yields aligned sparse views whose join semantics are the §5 truncation
@@ -419,6 +426,38 @@ write path (§2) is load-bearing; this phase is optimization.
   re-templates the manifest — append-heavy stores should prefer generative
   schedules. (That exception is an implication recorded from the ratified
   schedule set, not separately ratified on the thread.)
+- **D16 — Morton-only storage: NESTED is fabricated, never stored**
+  (espg-ratified in-session 2026-07-17, filed on
+  [#262](https://github.com/englacial/zagg/issues/262); both verification
+  checks — artools clean, gridlook requirement satisfiable by fabrication —
+  [confirmed on the thread](https://github.com/englacial/zagg/issues/262#issuecomment-5007833161)).
+  zagg stops writing the `cell_ids` (NESTED uint64) array to leaves;
+  `morton` is the only stored cell coordinate and the declared convention
+  coordinate. Rationale: (1) morton words carry order intrinsically, so
+  mixed-order arrays (D2 coarse shards, §7 pyramids) are first-class where
+  NESTED u64 needs side-metadata or zuniq/nuniq; (2) kills the
+  dual-encoding cost — one u64 array per leaf (8 B/cell, plus one array's
+  objects per leaf in the
+  [#236](https://github.com/englacial/zagg/issues/236)/[#240](https://github.com/englacial/zagg/issues/240)
+  object-count currency) and the NESTED↔morton double-encode maintenance
+  ([#72](https://github.com/englacial/zagg/issues/72)); (3) the reader
+  stack is ready — the moczarr fabrication layer was the named gate and is
+  merged (espg/moczarr PR #7), with `open_hive` + xdggs
+  `grid_name: "morton"` + MOC-backed lazy index. Third instance of the
+  derived-views principle (§6 dense views, D9 caches). Ratified
+  refinements: the dggs attrs use a **distinct grid `name: "morton"`** —
+  never `name: "healpix"` + `indexing_scheme: "morton"`, which scheme-blind
+  readers silently misread as NESTED (garbage renders); a distinct name
+  makes them hard-reject with a diagnostic, and matches moczarr's xdggs
+  registration. Unknown-resolution point encodings at order 29 are clipped
+  on the fly to order 24 for Number-safe browser paths (NESTED ids are
+  float64-exact only through order 24; genuinely-finer-than-24 data takes
+  other measures — hub-side fabrication, aggregation). The writer flip
+  sequences as 0.x phases (emit knob default-on → default flip → removal),
+  bundled into the same break window as the
+  [#299](https://github.com/englacial/zagg/issues/299) leaf rename so
+  moczarr golden vectors regenerate once. The order-29 discriminator
+  metadata is O10.
 
 ### 8.2 Open for review (input needed)
 
@@ -474,6 +513,16 @@ write path (§2) is load-bearing; this phase is optimization.
   true rejected elsewhere). The write is fail-open on both backends; the
   Lambda leg is one fire-and-forget `mode: "coverage"` Event invoke with the
   pre-serialized ranges envelope.
+- **O10 — order-29 resolution discriminator** (carved from D16): two
+  order-29 encodings exist — (a) genuinely order-29 resolution, and (b)
+  unknown resolution point-encoded at order 29, the default for any raw
+  lat/lon conversion and expected to be common. Readers need declared
+  metadata to tell them apart, because the D16 clip rule (29→24) applies
+  only to (b). Proposal: `resolution: "exact" | "point"` in the dggs attrs
+  block, defaulting to `"point"` for raw conversions. Intersects mortie's
+  documented point-id/area-word parse non-injectivity at order 29; field
+  name, values, and placement to be frozen with the mortie spec page
+  ([mortie#62](https://github.com/espg/mortie/issues/62)).
 
 ## 9. References
 
