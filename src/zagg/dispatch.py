@@ -358,7 +358,12 @@ def max_cost_usd(
     return n_units * LAMBDA_PRICE_PER_GB_SEC_BY_ARCH[arch] * memory_gb * timeout_s
 
 
-def estimate_cost_usd(catalog_data=None, *, template_hash=None, history=None) -> float | None:
+def estimate_cost_usd(
+    catalog_data: dict | None = None,
+    *,
+    template_hash: str | None = None,
+    history: list | None = None,
+) -> float | None:
     """Estimated run cost from prior-run history (issue #298 Phase 3 -- stub).
 
     Interface placeholder for the pilot-first estimator ratified on issue
