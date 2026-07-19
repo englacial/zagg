@@ -1396,6 +1396,24 @@ class TestInvokeLambdaRaster:
         assert result["body"] == {}
         assert "no worker result" in result["error"]
 
+    def test_async_non_200_result_surfaces_error_like_sync(self):
+        # A landed non-200 envelope is a shard error, exactly as the sync branch
+        # maps ``raw.get("statusCode") != 200`` (parity, review fold).
+        from zagg import runner
+
+        client = self._client()
+        landed = ({"statusCode": 500, "body": json.dumps({"error": "boom"})}, None)
+        result = runner._invoke_lambda_raster(
+            client,
+            dict(self._EVENT),
+            function_name="process-shard",
+            result_url="s3://out/x.zarr.status/run1/12345.json",
+            result_fetch=lambda: landed,
+            poll_timeout_s=10,
+        )
+        assert result["error"] == "boom"
+        assert result["body"] == {"error": "boom"}
+
     def test_async_oversized_payload_raises_before_dispatch(self):
         from zagg import runner
 
