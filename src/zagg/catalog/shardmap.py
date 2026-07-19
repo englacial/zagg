@@ -608,9 +608,12 @@ class ShardMap:
         re-intersected at ``target_order`` (the same ``morton_coverage_moc``
         machinery :meth:`build` uses), restricted to that shard's own
         descendant cells (``generate_morton_children(shard_key,
-        target_order)``) so the result reproduces the direct
-        :meth:`build` at the finer order exactly, at a fraction of the cost
-        (only this shard's granules, not the whole catalog). Refine always
+        target_order)``). In the interior this reproduces the direct
+        :meth:`build` at the finer order; at a region/AOI boundary it may
+        **over-include** child shards a region-restricted direct build would
+        drop (the #101 whole-shard overhang class -- reproject applies no
+        region clip), but it never drops a real intersection. Costs only this
+        shard's granules, not the whole catalog. Refine always
         re-intersects via the mortie MOC path regardless of the source's
         ``backend`` (a spherely-built source is not reproduced by it), so the
         derived map records ``backend="mortie"``.
