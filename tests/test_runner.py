@@ -2545,6 +2545,20 @@ class TestTemporalStrategy:
         )
         assert sorted(seen) == [(1, 2, None), (2, 2, None)]
 
+    def test_raising_on_progress_hook_does_not_unwind_run(self):
+        # A cosmetic progress display must not kill a run mid-flight: a hook
+        # that raises is caught and logged by _with_progress, the run completes
+        # normally and still returns its summary (issue #298 fold).
+        from zagg.runner import agg
+
+        def _boom(done, total, cost):
+            raise RuntimeError("hook boom")
+
+        summary = agg(_temporal_config(), events=_synthetic_events(), on_progress=_boom)
+        assert summary["backend"] == "local"
+        assert summary["total_events"] == 2
+        assert summary["events_with_data"] == 2
+
     def test_max_cells_truncates_events(self):
         from zagg.runner import agg
 

@@ -102,13 +102,19 @@ def _with_progress(accumulate, on_progress, total, *, metered=False):
     ``cost_usd`` is the report's running metered rollup on Lambda paths
     (``metered=True``) and ``None`` where nothing is billed. ``None`` hook ->
     the accumulator is returned untouched, keeping the default path identical.
+    The counters/results are already folded before the hook runs, so a raising
+    hook is swallowed (losing only the tick): a cosmetic progress display must
+    not unwind a paid fan-out mid-flight.
     """
     if on_progress is None:
         return accumulate
 
     def wrapped(report, i, result):
         accumulate(report, i, result)
-        on_progress(i, total, report.cost.cost_usd if metered else None)
+        try:
+            on_progress(i, total, report.cost.cost_usd if metered else None)
+        except Exception:  # noqa: BLE001 - progress is cosmetic, never fatal
+            logger.warning("on_progress hook raised; ignoring", exc_info=True)
 
     return wrapped
 
@@ -284,9 +290,10 @@ def agg(
         completion count, the unit total, and the running metered cost
         (``None`` on paths with no metered cost: local backends and the
         raster fan-out, which carries no per-unit pricing). Drives
-        ``zagg.notebook``'s progress bar; must be cheap and must not raise
-        (it runs on the dispatch thread). Default ``None`` -- no callback,
-        byte-identical prior behavior.
+        ``zagg.notebook``'s progress bar; it runs on the dispatch thread, so it
+        must be cheap. A raising hook is caught and logged, never propagated --
+        a cosmetic progress display must not unwind a paid fan-out mid-flight.
+        Default ``None`` -- no callback, byte-identical prior behavior.
     Returns
     -------
     dict
@@ -918,9 +925,14 @@ class RasterStrategy:
                     logger.warning(f"raster shard {label} failed: {e}")
                     continue
                 finally:
-                    # Progress hook (issue #298): local raster has no metered cost.
+                    # Progress hook (issue #298): local raster has no metered
+                    # cost. A raising hook is swallowed -- progress is cosmetic
+                    # and must not unwind the run (mirrors _with_progress).
                     if on_progress is not None:
-                        on_progress(i, len(cells), None)
+                        try:
+                            on_progress(i, len(cells), None)
+                        except Exception:  # noqa: BLE001 - progress is cosmetic, never fatal
+                            logger.warning("on_progress hook raised; ignoring", exc_info=True)
                 ok_metas.append(meta)
                 if meta["timesteps"]:
                     shards_with_data += 1
@@ -1212,9 +1224,14 @@ class RasterStrategy:
                 label = shard_label(grid, futures[fut])
                 result = fut.result()
                 # Progress hook (issue #298): the raster fan-out has no
-                # per-unit pricing rollup, so the running cost rides as None.
+                # per-unit pricing rollup, so the running cost rides as None. A
+                # raising hook is swallowed -- progress is cosmetic and must not
+                # unwind a paid fan-out (mirrors _with_progress).
                 if on_progress is not None:
-                    on_progress(i, len(cells), None)
+                    try:
+                        on_progress(i, len(cells), None)
+                    except Exception:  # noqa: BLE001 - progress is cosmetic, never fatal
+                        logger.warning("on_progress hook raised; ignoring", exc_info=True)
                 if result["error"]:
                     errors += 1
                     last_error = result["error"]
