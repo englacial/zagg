@@ -456,7 +456,9 @@ write path (§2) is load-bearing; this phase is optimization.
   sequences as 0.x phases (emit knob default-on → default flip → removal),
   bundled into the same break window as the
   [#299](https://github.com/englacial/zagg/issues/299) leaf rename so
-  moczarr golden vectors regenerate once. The order-29 discriminator
+  moczarr golden vectors regenerate once. (The #299 break-window bundling
+  is a sequencing implication recorded from in-session planning, not
+  separately ratified on the thread.) The order-29 discriminator
   metadata is O10.
 
 ### 8.2 Open for review (input needed)
