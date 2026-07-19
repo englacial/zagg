@@ -958,16 +958,30 @@ class TestReproject:
 
     def test_coarsen_dedups_granule_spanning_multiple_children(self, fine_grid, coarse_grid):
         # A granule wide enough to land in >=2 fine shards under the same
-        # coarse parent must count once in the coarsened granule list.
+        # coarse parent must count once in the coarsened granule list. Force
+        # and assert the dedup scenario is real -- otherwise the union-across-
+        # children branch never runs and the test proves nothing.
+        from mortie import clip2order
+
         cat = _catalog([_item("Gwide", -76.60, -76.52)])
         sm_fine = ShardMap.build(cat, fine_grid, backend="mortie")
-        gs_fine = _granule_shards(sm_fine)
-        assert len(gs_fine["Gwide"]) >= 1  # sanity: built onto >=1 fine shard
+        fine_shards = _granule_shards(sm_fine)["Gwide"]
+        assert len(fine_shards) >= 2, "Gwide must span >=2 fine shards to exercise dedup"
+
+        # >=2 of those fine shards must coarsen to a common parent, else the
+        # coarsen path never unions Gwide across children.
+        fine_arr = np.asarray([int(k) for k in fine_shards], dtype=np.uint64)
+        parents = clip2order(11, fine_arr).tolist()
+        shared = {int(p) for p in parents if parents.count(p) >= 2}
+        assert shared, "no coarse parent gathers >=2 of Gwide's fine shards"
 
         sm_coarse = sm_fine.reproject(coarse_grid)
         gs_coarse = _granule_shards(sm_coarse)
-        assert len(gs_coarse["Gwide"]) >= 1
-        # No duplicate ids within any single coarsened shard's granule list.
+        # The union collapsed >=2 fine children into one coarse shard, so Gwide's
+        # coarse shard count is strictly fewer than its fine count.
+        assert len(gs_coarse["Gwide"]) < len(fine_shards)
+        assert shared <= gs_coarse["Gwide"]
+        # And it appears exactly once within each coarsened shard's granule list.
         for gran_list in sm_coarse.granules:
             ids = [g["id"] for g in gran_list]
             assert len(ids) == len(set(ids))
