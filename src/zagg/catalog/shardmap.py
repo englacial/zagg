@@ -652,7 +652,7 @@ class ShardMap:
             return ShardMap(
                 target_grid.spatial_signature(),
                 list(self.shard_keys),
-                [list(g) for g in self.granules],
+                [[_granule_entry(g) for g in shard] for shard in self.granules],
                 meta,
                 self.aoi_mask,
             )
@@ -671,7 +671,7 @@ class ShardMap:
                 seen: dict = {}
                 for i in groups[k]:
                     for g in self.granules[i]:
-                        seen[g["id"]] = g
+                        seen[g["id"]] = _granule_entry(g)
                 new_granules.append(list(seen.values()))
             method = "coarsen"
         else:
