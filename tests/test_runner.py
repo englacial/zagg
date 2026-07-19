@@ -1432,6 +1432,9 @@ class TestSummaryKeysByteIdentical:
         "gb_seconds",
         "price_per_gb_sec",
         "estimated_cost_usd",
+        # Structured max/estimated/actual block (issue #298); the flat
+        # estimated_cost_usd key above keeps its legacy actual-rollup meaning.
+        "cost",
         "store_path",
         "backend",
         "function_name",

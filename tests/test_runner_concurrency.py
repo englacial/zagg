@@ -116,6 +116,85 @@ class TestProbeClampsWorkers:
         assert summary["cells_with_data"] == 4
 
 
+class TestCostBlock:
+    """Structured cost block in the lambda summary (issue #298).
+
+    Reuses the mocked ``_run_lambda`` harness above: 4 shards, each reporting
+    a 1 s billed duration, no live AWS.
+    """
+
+    def _run(self, monkeypatch, cfg, duration=1.0):
+        monkeypatch.setattr(
+            runner,
+            "compute_available_workers",
+            lambda requested, *a, **k: (4, _report(4)),
+        )
+        monkeypatch.setattr(
+            runner,
+            "_invoke_lambda_cell",
+            lambda *a, **k: {
+                "status_code": 200,
+                "body": {"total_obs": 5},
+                "error": None,
+                "lambda_duration": duration,
+                "shard_key": 0,
+            },
+        )
+        return runner._run_lambda(
+            cfg,
+            _catalog(),
+            "s3://out/x.zarr",
+            12,
+            max_cells=None,
+            morton_cell=None,
+            max_workers=4,
+            overwrite=False,
+            dry_run=False,
+            region="us-west-2",
+            function_name="process-shard",
+        )
+
+    def _flat_cfg(self):
+        cfg = default_config("atl06")
+        cfg.output["store_layout"] = "flat"
+        return cfg
+
+    def test_cost_block_shape_and_ceiling(self, lambda_env, monkeypatch):
+        from zagg.dispatch import LAMBDA_PRICE_PER_GB_SEC, max_cost_usd
+
+        summary = self._run(monkeypatch, self._flat_cfg())
+        cost = summary["cost"]
+        # Ceiling: 4 shards x 4 GB x 900 s, computable pre-invoke.
+        assert cost["max_cost_usd"] == pytest.approx(max_cost_usd(4, 4.0, timeout_s=900))
+        # Estimated stays a None placeholder until issues #297/#299 land.
+        assert cost["estimated_cost_usd"] is None
+        # Actual mirrors the legacy rollup key (4 x 1 s x 4 GB x rate).
+        assert cost["actual_cost_usd"] == pytest.approx(4 * 1.0 * 4.0 * LAMBDA_PRICE_PER_GB_SEC)
+        assert cost["actual_cost_usd"] == summary["estimated_cost_usd"]
+
+    def test_max_bounds_actual(self, lambda_env, monkeypatch):
+        # Property: even at the worst billed duration (the 900 s function
+        # timeout), the pre-invoke ceiling bounds the rollup.
+        summary = self._run(monkeypatch, self._flat_cfg(), duration=900.0)
+        cost = summary["cost"]
+        assert cost["max_cost_usd"] >= cost["actual_cost_usd"]
+
+    def test_worker_variant_prices_its_memory(self, lambda_env, monkeypatch):
+        # A worker: 8192 variant (issue #235) bills 8 GB, not the flat 4.
+        cfg = self._flat_cfg()
+        cfg.worker = {"memory": 8192}
+        summary = self._run(monkeypatch, cfg)
+        assert summary["gb_seconds"] == pytest.approx(4 * 1.0 * 8.0)
+        base = self._run(monkeypatch, self._flat_cfg())
+        assert summary["cost"]["max_cost_usd"] == pytest.approx(2 * base["cost"]["max_cost_usd"])
+
+    def test_worker_memory_gb_resolution(self):
+        assert runner._worker_memory_gb(self._flat_cfg()) == 4.0
+        cfg = self._flat_cfg()
+        cfg.worker = {"memory": 2048}
+        assert runner._worker_memory_gb(cfg) == 2.0
+
+
 class TestFdExhaustionSurfaces:
     def test_errno_24_in_future_reraised_with_guidance(self, lambda_env, monkeypatch):
         monkeypatch.setattr(

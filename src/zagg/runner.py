@@ -47,6 +47,7 @@ from zagg.config import (
     get_windowing,
 )
 from zagg.dispatch import (
+    LAMBDA_ARCH,
     LAMBDA_MEMORY_GB,
     LAMBDA_PRICE_PER_GB_SEC,
     LAMBDA_RETRY,
@@ -55,6 +56,7 @@ from zagg.dispatch import (
     LocalExecutor,
     PreflightReport,
     dispatch,
+    max_cost_usd,
 )
 from zagg.grids.base import shard_label
 from zagg.grids.morton import morton_word
@@ -91,6 +93,24 @@ def _resolve_function_name(config: PipelineConfig, function_name: str | None) ->
     if worker.get("extra_disk"):
         suffix += "-disk"
     return base + suffix
+
+
+def _worker_memory_gb(config: PipelineConfig) -> float:
+    """Billed memory (GB) of the worker this run dispatches to (issue #298).
+
+    The optional ``worker:`` block selects a pre-provisioned ``-<memory>``
+    variant (issue #235, MB); absent block -> the base function's
+    :data:`~zagg.dispatch.LAMBDA_MEMORY_GB`. Keys both the pre-invoke cost
+    ceiling and the actual-cost rollup so the two use one memory figure. An
+    explicit ``function_name`` kwarg can dispatch to a differently-sized
+    function than the config declares; cost math still keys off the config
+    (the pre-#298 rollup hardcoded 4 GB regardless, so this only narrows the
+    gap).
+    """
+    worker = config.worker
+    if worker and worker.get("memory"):
+        return worker["memory"] / 1024.0
+    return LAMBDA_MEMORY_GB
 
 
 def agg(
@@ -1369,6 +1389,14 @@ def _run_lambda_events(
 
     n = len(event_list)
     logger.info(f"Processing {n} events (lambda)")
+    # Pre-invoke cost ceiling (issue #298), same math as the spatial path: one
+    # invoke per event, each billed at most to the function timeout.
+    memory_gb = _worker_memory_gb(config)
+    run_max_cost = max_cost_usd(n, memory_gb, timeout_s=_DEFAULT_FUNCTION_TIMEOUT_S)
+    logger.info(
+        f"Max cost ceiling: ~${run_max_cost:.2f} ({n} events x {memory_gb:g} GB x "
+        f"{_DEFAULT_FUNCTION_TIMEOUT_S}s, {LAMBDA_ARCH})"
+    )
     if max_workers is None:
         # The AR-repo orchestrator's default fan-out width (one storm per
         # worker); the preflight probe clamps it to account concurrency anyway.
@@ -1452,6 +1480,9 @@ def _run_lambda_events(
         # Tabular output has no metadata to consolidate; keep the executor
         # contract without a finalize invoke.
         finalize_fn=lambda: None,
+        # Per-event cost tracks the worker variant actually billed (issue #298);
+        # without a worker: block this is the default 4.0, byte-identical.
+        memory_gb=memory_gb,
     )
     executor.preflight(n)
     max_workers = state["workers"]
@@ -1511,10 +1542,21 @@ def _run_lambda_events(
     )
 
     # Cost presentation mirrors the spatial path: one multiply over the summed
-    # per-event durations the report accumulated.
+    # per-event durations the report accumulated. memory_gb resolved
+    # pre-fan-out via _worker_memory_gb (issue #298).
     total_lambda_time = report.cost.compute_time_s
-    gb_seconds = total_lambda_time * LAMBDA_MEMORY_GB
+    gb_seconds = total_lambda_time * memory_gb
     estimated_cost = gb_seconds * LAMBDA_PRICE_PER_GB_SEC
+
+    # Structured cost block (issue #298), mirroring the spatial summary; the
+    # legacy flat ``estimated_cost_usd`` key keeps the actual-cost rollup.
+    report.max_cost_usd = run_max_cost
+    report.actual_cost_usd = estimated_cost
+    cost_block = {
+        "max_cost_usd": run_max_cost,
+        "estimated_cost_usd": report.estimated_cost_usd,
+        "actual_cost_usd": estimated_cost,
+    }
 
     # Failed events keep their error detail (rows carry successes only), so a
     # caller can see *which* events failed and why, not just the count --
@@ -1540,6 +1582,7 @@ def _run_lambda_events(
         "gb_seconds": gb_seconds,
         "price_per_gb_sec": LAMBDA_PRICE_PER_GB_SEC,
         "estimated_cost_usd": estimated_cost,
+        "cost": cost_block,
         "function_timeout_s": state.get("function_timeout_s", _DEFAULT_FUNCTION_TIMEOUT_S),
         "store_path": store_path,
         "output_path": output_path,
@@ -2350,6 +2393,18 @@ def _run_lambda(
     if windowing is not None:
         cells = _windowed_units(cells, windowing, (config.bounds or {}).get("temporal"))
 
+    # Pre-invoke cost ceiling (issue #298): every unit is one invoke billed at
+    # the worker's memory for at most the function timeout, so the bill is
+    # bounded from the shardmap + config alone, before any fan-out. Priced with
+    # the deployed-default timeout constant — the live function Timeout is only
+    # readable after preflight builds the client.
+    memory_gb = _worker_memory_gb(config)
+    run_max_cost = max_cost_usd(len(cells), memory_gb, timeout_s=_DEFAULT_FUNCTION_TIMEOUT_S)
+    logger.info(
+        f"Max cost ceiling: ~${run_max_cost:.2f} ({len(cells)} units x {memory_gb:g} GB x "
+        f"{_DEFAULT_FUNCTION_TIMEOUT_S}s, {LAMBDA_ARCH})"
+    )
+
     # Authenticate (for per-cell source reads inside the Lambda)
     s3_creds = _resolve_source_credentials(config)
 
@@ -2570,6 +2625,9 @@ def _run_lambda(
         preflight_fn=_preflight,
         pool_factory=ThreadPoolExecutor,
         finalize_fn=_finalize_fn,
+        # Per-cell cost tracks the worker variant actually billed (issue #298);
+        # without a worker: block this is the default 4.0, byte-identical.
+        memory_gb=memory_gb,
     )
     # preflight() runs the probe, builds the sized client, and sizes the pool.
     executor.preflight(len(cells))
@@ -2761,11 +2819,26 @@ def _run_lambda(
     # ULP of estimated_cost_usd -- stays byte-identical to the pre-refactor path
     # (summing per-cell cost_usd would diverge in FP). Runner owns presentation;
     # the per-cell CellCost.cost_usd is for the report's structured breakdown.
+    # memory_gb resolved pre-fan-out via _worker_memory_gb (issue #298): the
+    # default function keeps 4.0 (byte-identical); a worker: variant now bills
+    # at its actual size instead of the old flat constant.
     total_lambda_time = report.cost.compute_time_s
-    memory_gb = LAMBDA_MEMORY_GB
     gb_seconds = total_lambda_time * memory_gb
     price_per_gb_sec = LAMBDA_PRICE_PER_GB_SEC
     estimated_cost = gb_seconds * price_per_gb_sec
+
+    # Structured cost block (issue #298): the pre-invoke ceiling, the deferred
+    # prior-history estimate (None until issues #297/#299 land the sidecar
+    # history), and the billed-duration rollup. The legacy flat
+    # ``estimated_cost_usd`` summary key keeps its pre-#298 meaning (the
+    # actual-cost rollup) for existing consumers.
+    report.max_cost_usd = run_max_cost
+    report.actual_cost_usd = estimated_cost
+    cost_block = {
+        "max_cost_usd": run_max_cost,
+        "estimated_cost_usd": report.estimated_cost_usd,
+        "actual_cost_usd": estimated_cost,
+    }
 
     # Worker-runtime distribution (issue #100). Wall time on a parallel fan-out
     # tracks the *straggler*, not the mean, so surface max / median / pstdev of
@@ -2818,6 +2891,7 @@ def _run_lambda(
         "gb_seconds": gb_seconds,
         "price_per_gb_sec": price_per_gb_sec,
         "estimated_cost_usd": estimated_cost,
+        "cost": cost_block,
         "setup_s": setup_s,
         "fanout_s": fanout_s,
         "finalize_s": finalize_s,
