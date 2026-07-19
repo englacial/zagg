@@ -380,6 +380,64 @@ where every assigned granule genuinely crosses the shard — the AOI-edge
 over-assignment that inflates a tiny box AOI does **not** apply at continental
 scale. **No AOI mask**: CONUS is a bulk grid, so `output.aoi_mask` is off.
 
+### 4e. Cost drivers — where the 0.24.0 → 0.36.0 drop comes from
+
+The drop from the prior 0.24.0 o9 estimate (cold `inline` $471 / warm `sidecar`
+$419) to the 0.36.0 warm+fix operating point ($380) is **cumulative** across
+several 0.36.0-era changes — not the store-cache fix alone. In descending impact
+on the CONUS per-shard runtime the cost is fit on:
+
+- **spill (#217)** — bounds worker RAM by spilling photons to on-disk partitions,
+  so the whole-shard t-digest state need not sit in memory. This is what makes **o8
+  tractable at 4 GB** (the dense shards that OOM'd at 0.24.0) and lets o9 stay at
+  4 GB. It is a *feasibility* unlock more than a headline-cost lever at o9, but it
+  reshapes the achievable operating points.
+- **t-digest numpy vectorization (#279 / PR #282)** — ~15× faster digest build and
+  ~6× faster spill-fold, pure-numpy. This lands directly on the **aggregate phase**,
+  which is a real slice of CONUS runtime: `phase_aggregate_s` is **16–123 s/shard
+  (median 48, ~28 % of runtime) at o9** and **49–364 s/shard (median 125, ~38 %) at
+  o8** in the v036 records. Cutting that phase is a **major, distinct** contributor
+  to the runtime/cost drop — separate from spill.
+- **hive store-layout optimizations** — hive writes one self-describing leaf per
+  shard rather than region-writing into a global fullsphere store. Its effect on the
+  **per-shard write phase** *is* captured in the cost (`phase_write_s` is only
+  3–10 s/shard at o9, 6–27 s at o8 — write is ≤4 % of runtime, so this is a modest
+  slice), **but see the measurement caveat below** for the setup phase.
+- **sidecar store-cache (#287/#288)** — the v035→v036 delta isolates *only* this
+  (both passes already have spill + numpy-tdigest): **−4 % (o9) / −5 % (o8)** on the
+  CONUS total. Small here (index-bound saving swamped by read + contention at
+  ~80–210 gran/shard); **decisive at the 88S pole** (#148).
+- read-path work (#270 / #273 / #149, compiled-hidefix + sidecar chunk manifests)
+  reduces the read phase generally; it is the ~62–72 %-of-runtime `phase_read_s`
+  term and predates most of the above.
+
+**Don't double-count:** the **−5 % you see in v035→v036 is store-cache+warm only**
+(both are 0.36.0, both already carry spill + numpy-tdigest). The **big drop vs the
+0.24.0 report** is where spill + the #279/#282 t-digest vectorization + hive
+per-shard write show up — none of which is visible in the v035↔v036 comparison
+because both sides already have them.
+
+**Measurement caveat — the cost basis is fan-out only, not setup.** The CONUS
+estimate fits **per-shard `runtime_s`** (the worker's read + aggregate + write) and
+extrapolates that — i.e. it costs the **fan-out phase**. Confirm against the record
+fields: `gb_seconds = runtime_s × 4 GB` exactly, so the cost meter is `runtime_s`;
+the records carry `setup_s` (per-worker warmup) but **no `template_s`** — the
+dispatch/**template-emission invoke is a separate call entirely absent from these
+per-shard records**, so neither the 0.24.0 nor the 0.36.0 CONUS cost includes it
+(consistent between the two reports). Consequence for driver attribution:
+
+- Hive's effect on the **per-shard write phase IS captured** in the cost (via
+  `phase_write_s` → `runtime_s`), so it legitimately contributes to the drop above.
+- Hive's effect on **setup/template emission is NOT captured** — that phase is
+  outside the cost basis in both reports. And critically, the **prior
+  (fullsphere-layout) report timed only the worker fan-out, not setup** either, so
+  any hive *setup-phase* win is **invisible** to this before/after cost comparison.
+  We do not claim it.
+- For reference, the per-worker `setup_s` the records *do* carry is small and
+  **excluded from the headline**: mean **2.4 s (max 5.2 s) at o9**, **1.7 s (max
+  4.9 s) at o8** — worker warmup, not the dispatch/template invoke. The
+  dispatch/template-emission cost is not measured here at all.
+
 ## 5. Reproducibility
 
 ```bash
