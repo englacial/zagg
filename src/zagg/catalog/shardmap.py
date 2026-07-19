@@ -722,6 +722,9 @@ class ShardMap:
         }
         meta["total_shards"] = len(new_keys)
         meta["total_pairs"] = sum(len(g) for g in new_granules)
+        # The dropped per-shard AOI mask (aoi_mask=None below) must not still be
+        # advertised in the derived map's metadata.
+        meta.pop("aoi_mask", None)
         return ShardMap(target_grid.spatial_signature(), new_keys, new_granules, meta, None)
 
     def to_json(self, path: str) -> None:
