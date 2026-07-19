@@ -106,13 +106,14 @@ def test_expected_counts_live_matrix_config():
     # zarr.json objects, then exactly one object per array per shard.
     config = load_config(str(BENCH / "configs" / "atl03_tdigest_healpix_o9.yaml"))
     exp = bench_objects.expected_object_counts(from_config(config), n_shards=1)
+    # metadata ceiling adds the optional run-level stats parquet (issue #297).
     assert exp == {
-        "metadata": 6,
+        "metadata": 7,
         "metadata_min": 6,
         "per_shard_min": 4,
         "per_shard_max": 4,
         "total_min": 10,
-        "total_max": 10,
+        "total_max": 11,
         "exact": True,
     }
 
@@ -122,10 +123,10 @@ def test_expected_counts_aoimask_config_adds_one_array():
     # sharded object per shard.
     config = load_config(str(BENCH / "configs" / "atl03_tdigest_healpix_o9_aoimask.yaml"))
     exp = bench_objects.expected_object_counts(from_config(config), n_shards=4)
-    assert exp["metadata"] == 7
+    assert exp["metadata"] == 8
     assert exp["per_shard_min"] == exp["per_shard_max"] == 5
     assert exp["exact"] is True
-    assert exp["total_max"] == 7 + 4 * 5
+    assert exp["total_max"] == 8 + 4 * 5
 
 
 def test_expected_counts_unsharded_is_bounded_not_exact():
@@ -133,7 +134,7 @@ def test_expected_counts_unsharded_is_bounded_not_exact():
     # chunks are omitted), ragged 0..K -- a bounded, non-exact expectation.
     exp = bench_objects.expected_object_counts(_grid(sharded=False), n_shards=1)
     k = 16
-    assert exp["metadata"] == 6
+    assert exp["metadata"] == 7
     assert exp["exact"] is False
     assert exp["per_shard_min"] == 3  # one populated chunk x 3 dense arrays
     assert exp["per_shard_max"] == 4 * k
@@ -161,8 +162,10 @@ def test_flat_sharded_store_matches_model(tmp_path):
     measured = bench_objects.store_object_counts(root, grid=grid, shard_keys=words)
     expected = bench_objects.expected_object_counts(grid, n_shards=2)
     assert expected["exact"] is True
-    assert measured["objects_total"] == expected["total_max"] == 6 + 2 * 4
-    assert measured["objects_metadata"] == expected["metadata"] == 6
+    # Direct writes (no runner) -> no run parquet, so the floor of the
+    # issue-#297-widened metadata window is what lands.
+    assert measured["objects_total"] == expected["total_min"] == 6 + 2 * 4
+    assert measured["objects_metadata"] == expected["metadata_min"] == 6
     assert measured["objects_other"] == 0
     assert measured["objects_per_shard"] == {_KEY_A: 4, _KEY_B: 4}
     assert bench_objects.object_count_mismatch(measured, expected) is None
@@ -302,7 +305,8 @@ def test_hive_store_matches_model(tmp_path, monkeypatch):
     # K == 1 leaf: every per-array count is deterministic, so the hive model
     # is exact here and the real store matches it object-for-object.
     assert expected["exact"] is True
-    assert measured["objects_metadata"] == expected["metadata"] == 2
+    # Through the runner: manifest + root MOC + the run stats parquet (#297).
+    assert measured["objects_metadata"] == expected["metadata"] == 3
     assert measured["objects_other"] == 0
     assert list(measured["objects_per_shard"]) == [_KEY_A]
     assert measured["objects_total"] == expected["total_max"]
@@ -380,7 +384,7 @@ def test_measure_objects_end_to_end(tmp_path):
     payload = run_benchmark._measure_objects(cfg, grid, root, word, region="us-west-2")
     assert payload == {
         "objects_total": 10,  # 6 metadata + 4 shard objects
-        "objects_expected": 10,
+        "objects_expected": 11,  # ceiling includes the optional run parquet (#297)
         "objects_per_shard": {_KEY_A: 4},
         "objects_mismatch": None,
     }
@@ -406,7 +410,7 @@ def test_measure_objects_flags_bypass(tmp_path):
     )
     assert payload["objects_mismatch"] is not None
     assert payload["objects_total"] == 6 + 64  # metadata + 16 chunks x 4 arrays
-    assert payload["objects_expected"] == 10
+    assert payload["objects_expected"] == 11  # ceiling includes the run parquet (#297)
 
 
 # --- review folds (PR #242) ---------------------------------------------------
@@ -550,11 +554,11 @@ def test_hive_sharded_store_matches_model(tmp_path, monkeypatch):
     )
     # Exact: per leaf = root+group zarr.json (2) + one zarr.json AND one data
     # object per array + the coverage sidecar + the stats.json sibling
-    # (issue #297); store root = manifest + MOC.
+    # (issue #297); store root = manifest + MOC + the run stats parquet.
     n_arrays = len(grid.shard_spec().members)
     assert expected["exact"] is True
     assert expected["per_shard_max"] == 2 + 2 * n_arrays + 1 + 1
-    assert expected["metadata"] == 2
+    assert expected["metadata"] == 3
     assert measured["objects_total"] == expected["total_max"]
     assert measured["objects_other"] == 0
     assert bench_objects.object_count_mismatch(measured, expected) is None

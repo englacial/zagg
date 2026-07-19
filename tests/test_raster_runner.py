@@ -1271,7 +1271,12 @@ class TestRasterHiveIdempotency:
         assert summary["cells_with_data"] == 1
         store = Path(cfg.output["store"])
         grid = from_config(cfg)
-        assert sorted(p.name for p in store.iterdir()) == sorted(["zarr.json", grid.group_path])
+        # The run-level stats parquet (issue #297) now rides at the store
+        # root on every backend; still no hive artifacts anywhere in the tree.
+        root_names = sorted(p.name for p in store.iterdir())
+        parquets = [n for n in root_names if n.startswith("stats_") and n.endswith(".parquet")]
+        assert len(parquets) == 1
+        assert root_names == sorted(["zarr.json", grid.group_path, parquets[0]])
         names = {p.name for p in store.rglob("*")}
         assert "morton_hive.json" not in names
         assert "coverage.moc" not in names

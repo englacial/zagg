@@ -871,6 +871,7 @@ class RasterStrategy:
 
         stage_max: dict = {}
         stage_counts: dict = {}
+        stats_failures: list = []  # (shard_key, exception) — run-parquet rows (#297)
         with ThreadPoolExecutor(max_workers=max_workers) as pool:
             futures = {pool.submit(_one, pair): pair[0] for pair in cells}
             for fut in as_completed(futures):
@@ -880,6 +881,7 @@ class RasterStrategy:
                 except Exception as e:  # noqa: BLE001 - per-shard isolation, run continues
                     errors += 1
                     last_error = e
+                    stats_failures.append((int(futures[fut]), e))
                     logger.warning(f"raster shard {label} failed: {e}")
                     continue
                 ok_metas.append(meta)
@@ -918,6 +920,19 @@ class RasterStrategy:
                         logger.info(f"Wrote root coverage.moc ({len(envelope['ranges'])} ranges)")
                 except Exception as e:
                     logger.warning(f"root coverage.moc write failed (fail-open, D9): {e}")
+        # Run-level stats parquet (issue #297 phase 3), BEFORE the all-failed
+        # raise below so the failure evidence persists at the store root.
+        from zagg.telemetry import failure_record, flatten_record
+
+        rows = [flatten_record(m["stats"]) for m in ok_metas if m.get("stats")]
+        rows += [
+            flatten_record(
+                failure_record(shard_key=key, error=str(exc)),
+                error_class=type(exc).__name__,
+            )
+            for key, exc in stats_failures
+        ]
+        _write_run_stats(store_path, rows, run_id=uuid.uuid4().hex, store_kwargs=store_kwargs)
         # Per-shard isolation lets one bad shard be counted and skipped, but a
         # run where EVERY shard raised (e.g. a config band whose ``asset`` is
         # absent from every granule) would otherwise return a success-shaped,
@@ -1173,6 +1188,7 @@ class RasterStrategy:
         timesteps_written = 0
         last_error = None
         ok_units: list = []  # (shard_key, body) — coverage needs keys, rollups bodies
+        stats_failures: list = []  # (shard_key, error, body) — run-parquet rows (#297)
         with ThreadPoolExecutor(max_workers=max_workers) as pool:
             futures = {pool.submit(_one, pair): pair[0] for pair in cells}
             for fut in as_completed(futures):
@@ -1181,6 +1197,7 @@ class RasterStrategy:
                 if result["error"]:
                     errors += 1
                     last_error = result["error"]
+                    stats_failures.append((int(futures[fut]), result["error"], result["body"]))
                     logger.warning(f"raster shard {label} failed: {result['error']}")
                     continue
                 body = result["body"]
@@ -1239,6 +1256,29 @@ class RasterStrategy:
                         )
                 except Exception as e:
                     logger.warning(f"root coverage.moc dispatch failed (fail-open, D9): {e}")
+        # Run-level stats parquet (issue #297 phase 3), BEFORE the all-failed
+        # raise so the failure evidence persists at the store root. Success
+        # rows ride the envelopes' records; a failed unit's landed body may
+        # still carry duration until failure.
+        from zagg.telemetry import failure_record, flatten_record
+
+        rows = []
+        for key, body in ok_units:
+            record = body.get("stats")
+            if record is not None:
+                rows.append(flatten_record(record))
+        rows += [
+            flatten_record(
+                failure_record(shard_key=key, error=error, duration_s=body.get("duration_s"))
+            )
+            for key, error, body in stats_failures
+        ]
+        _write_run_stats(
+            store_path,
+            rows,
+            run_id=uuid.uuid4().hex,
+            store_kwargs=_output_store_kwargs(output_creds_event, region),
+        )
         if cells and errors == len(cells):
             raise RuntimeError(f"all {errors} raster shard(s) failed; last error: {last_error}")
         # Worker telemetry rollup (issue #250): billed durations and peak RSS,
@@ -1932,6 +1972,59 @@ def _resolve_invoked_by(session, region) -> dict | None:
         return None
 
 
+def _write_run_stats(store_path, rows, *, run_id, store_kwargs, summary=None) -> None:
+    """Fail-open write of the run-level stats parquet at the store root (#297).
+
+    One row per dispatched shard, failure rows included. Fail-open by design:
+    the dispatcher may hold an invoke-only role with no S3 write access (the
+    CI OIDC benchmark role), and a missing parquet must never fail a run whose
+    data landed — the leaf sidecars remain the durable per-shard truth.
+    """
+    if not rows:
+        return
+    try:
+        from zagg.telemetry import write_run_parquet
+
+        path = write_run_parquet(store_path, rows, run_id=run_id, store_kwargs=store_kwargs)
+        if summary is not None:
+            summary["run_stats_path"] = path
+        logger.info(f"Wrote run stats parquet ({len(rows)} rows): {path}")
+    except Exception as e:
+        logger.warning(f"run stats parquet write failed (fail-open, issue #297): {e}")
+
+
+def _lambda_result_rows(results) -> list:
+    """Run-parquet rows from the lambda dispatch's per-cell result dicts.
+
+    Success rows come from the envelope-ridden worker record
+    (``body["stats"]``); a 200 body from a worker predating the record falls
+    back to a dispatcher-built record over the same body; everything else is
+    a failure row (error, duration until failure, retry count).
+    """
+    from zagg.telemetry import build_record, failure_record, flatten_record
+
+    rows = []
+    for r in results:
+        body = r.get("body") or {}
+        record = body.get("stats")
+        if record is None:
+            if r.get("status_code") == 200 and not r.get("error"):
+                # Stale deployed worker (no record in the envelope): derive one
+                # from the body's counters so the row is not a false failure.
+                record = build_record(
+                    shard_key=r.get("shard_key") if r.get("shard_key") is not None else -1,
+                    metadata=body,
+                )
+            else:
+                record = failure_record(
+                    shard_key=r.get("shard_key"),
+                    error=r.get("error") or f"status {r.get('status_code')}",
+                    duration_s=r.get("lambda_duration") or r.get("wall_time"),
+                )
+        rows.append(flatten_record(record, retries=r.get("retries")))
+    return rows
+
+
 def _resolve_source_credentials(config) -> dict:
     """S3 read credentials for the source datasets, provider-selected.
 
@@ -2262,6 +2355,7 @@ def _run_local(
     executor.preflight(len(cells))
 
     n = len(cells)
+    stats_failures: list = []  # (shard_key, exception) — run-parquet failure rows (#297)
 
     def _accumulate(report, i, outcome):
         # _safe_label, not shard_label: a malformed key that failed the cell
@@ -2269,6 +2363,7 @@ def _run_local(
         label = _safe_label(grid, outcome["shard_key"])
         if not outcome["ok"]:
             report.cells_error += 1
+            stats_failures.append((outcome["shard_key"], outcome["error"]))
             logger.warning(f"  [{i}/{n}] {label}: ERROR {outcome['error']}")
             return
         meta = outcome["meta"]
@@ -2352,6 +2447,21 @@ def _run_local(
         "backend": "local",
         "results": report.results,
     }
+    # Run-level stats parquet (issue #297 phase 3): one row per shard from the
+    # metas' envelope records, failure rows from the raised-cell captures.
+    from zagg.telemetry import failure_record, flatten_record
+
+    rows = [flatten_record(m["stats"]) for m in report.results if m.get("stats")]
+    rows += [
+        flatten_record(
+            failure_record(shard_key=int(key), error=str(exc)),
+            error_class=type(exc).__name__,
+        )
+        for key, exc in stats_failures
+    ]
+    _write_run_stats(
+        store_path, rows, run_id=uuid.uuid4().hex, store_kwargs=store_kwargs, summary=summary
+    )
     logger.info(
         f"Done: {report.cells_with_data} cells, {report.total_obs:,} obs, {report.cells_error} errors, {wall_time:.1f}s"
     )
@@ -2451,10 +2561,11 @@ def _run_lambda(
     # behind a ~4 min NAT idle timeout that severed every >250 s benchmark
     # target. The run_id keeps reruns into the same store from reading stale
     # results. ``invocation="sync"`` skips the channel (legacy RequestResponse).
+    run_id = uuid.uuid4().hex
     result_prefix = None
     result_box: dict = {}
     if invocation == "async":
-        result_prefix = f"{store_path.rstrip('/')}.status/{uuid.uuid4().hex}"
+        result_prefix = f"{store_path.rstrip('/')}.status/{run_id}"
         logger.info(f"Async worker results at {result_prefix}")
 
     # The dispatch lambda_client is built inside preflight() (once the probe
@@ -2913,6 +3024,16 @@ def _run_lambda(
     }
     if profile:
         summary["worker_phase_max"] = worker_phase_max
+    # Run-level stats parquet (issue #297 phase 3): success rows straight off
+    # the async result envelopes (no second S3 listing), failure rows from the
+    # dispatch results the RunReport accumulated.
+    _write_run_stats(
+        store_path,
+        _lambda_result_rows(report.results),
+        run_id=run_id,
+        store_kwargs=_output_store_kwargs(output_creds_event, region),
+        summary=summary,
+    )
     logger.info(
         f"Done: {report.cells_with_data} cells, {report.total_obs:,} obs, {report.cells_error} errors, {wall_time:.1f}s"
     )

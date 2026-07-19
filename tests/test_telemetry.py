@@ -5,11 +5,15 @@ import pytest
 from zagg.telemetry import (
     SCHEMA_VERSION,
     build_record,
+    failure_record,
+    flatten_record,
     granules_sha256,
     merge,
     read_sidecar,
+    run_parquet_key,
     sidecar_key,
     sidecar_path,
+    write_run_parquet,
     write_sidecar,
 )
 
@@ -254,3 +258,77 @@ class TestSidecarIO:
     def test_read_absent_returns_none(self, tmp_path):
         (tmp_path / "-4").mkdir()
         assert read_sidecar(str(tmp_path / "-4" / "-4.zarr")) is None
+
+
+class TestRunParquet:
+    """Run-level parquet rows (issue #297 phase 3): flattened records plus
+    dispatcher-built failure rows, round-trippable by fastparquet and pyarrow."""
+
+    def test_flatten_record_columns(self):
+        cfg = {"memory_mb": 4096, "arch": "aarch64", "function_variant": "zagg-process-shard"}
+        ident = {"arn": "arn:aws:iam::1:user/x", "userid": "AIDA1"}
+        row = flatten_record(_record(7, lambda_config=cfg, invoked_by=ident), retries=2)
+        assert row["shard_key"] == 7 and row["success"] is True
+        assert row["retries"] == 2 and row["error_class"] is None
+        assert row["phase_read"] == 8.0 and row["phase_aggregate"] == 2.0
+        assert row["lambda_memory_mb"] == 4096
+        assert row["lambda_function_variant"] == "zagg-process-shard"
+        assert row["invoked_by"] == ident["arn"]
+        assert row["invoked_by_userid"] == ident["userid"]
+        assert "phase_timings" not in row and "lambda" not in row  # flattened away
+
+    def test_failure_record_and_error_class(self):
+        rec = failure_record(shard_key=9, error="Lambda timeout: Task timed out", duration_s=901.0)
+        assert rec["success"] is False and rec["duration_s"] == 901.0
+        row = flatten_record(rec, retries=3)
+        assert row["error_class"] == "Lambda timeout"  # derived from the string
+        row = flatten_record(rec, error_class="TimeoutError")
+        assert row["error_class"] == "TimeoutError"  # explicit wins
+        assert failure_record(shard_key=None, error="boom")["shard_key"] is None
+
+    def test_run_parquet_key_shape(self):
+        key = run_parquet_key("abc123", timestamp="20260718T010203Z")
+        assert key == "stats_abc123_20260718T010203Z.parquet"
+
+    def test_round_trip(self, tmp_path):
+        import pandas as pd
+
+        rows = [
+            flatten_record(
+                _record(
+                    1,
+                    lambda_config={"memory_mb": 4096, "arch": "aarch64", "function_variant": "f"},
+                    invoked_by={"arn": "arn:x", "userid": "u"},
+                ),
+                retries=0,
+            ),
+            flatten_record(_record(2)),  # local flavor: all-None identity columns
+            flatten_record(
+                failure_record(shard_key=3, error="Lambda OOM: killed", duration_s=100.0),
+                retries=2,
+            ),
+        ]
+        root = str(tmp_path / "store")
+        path = write_run_parquet(root, rows, run_id="deadbeef")
+        assert path.startswith(root + "/stats_deadbeef_")
+
+        df = pd.read_parquet(path, engine="fastparquet")
+        assert len(df) == 3
+        assert set(df["shard_key"]) == {1, 2, 3}
+        by_key = df.set_index("shard_key")
+        assert bool(by_key.loc[3, "success"]) is False
+        assert by_key.loc[3, "error_class"] == "Lambda OOM"
+        assert by_key.loc[3, "retries"] == 2
+        assert by_key.loc[1, "invoked_by"] == "arn:x"
+        assert pd.isna(by_key.loc[2, "invoked_by"])
+        assert by_key.loc[1, "gb_seconds"] > 0
+
+        # pyarrow (the duckdb/Athena reader family) round-trips it too.
+        pa_parquet = pytest.importorskip("pyarrow.parquet")
+        table = pa_parquet.read_table(path)
+        assert table.num_rows == 3
+        assert "invoked_by" in table.column_names
+
+    def test_empty_rows_raise(self, tmp_path):
+        with pytest.raises(ValueError, match="at least one"):
+            write_run_parquet(str(tmp_path), [], run_id="x")

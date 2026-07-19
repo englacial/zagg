@@ -1167,7 +1167,9 @@ class TestRunnerWiring:
         # the mocked worker wrote no leaf, so the node holds only stats.json).
         listing = sorted(os.listdir(root))
         node = listing[0]
-        assert listing == [node, hive.ROOT_COVERAGE_NAME, hive.MANIFEST_NAME]
+        parquets = [n for n in listing if n.startswith("stats_") and n.endswith(".parquet")]
+        assert len(parquets) == 1  # run-level stats parquet (issue #297 phase 3)
+        assert listing == [node, hive.ROOT_COVERAGE_NAME, hive.MANIFEST_NAME, parquets[0]]
         from zagg.telemetry import read_sidecar
 
         leaf = hive.shard_leaf_path(root, shard)

@@ -116,8 +116,11 @@ def expected_object_counts(
     if store_layout == "flat":
         _require_fullsphere(grid)
         members = _member_layouts(grid)
-        # Root zarr.json + group zarr.json + one zarr.json per array (exact).
-        metadata_min = metadata_max = 2 + len(members)
+        # Root zarr.json + group zarr.json + one zarr.json per array (exact),
+        # plus the OPTIONAL run-level stats parquet (issue #297) — fail-open,
+        # absent when the dispatcher role cannot PUT (the CI OIDC role).
+        metadata_min = 2 + len(members)
+        metadata_max = metadata_min + 1
         lo = hi = 0
         for m in members:
             blocks = m["blocks_per_shard"]
@@ -138,8 +141,10 @@ def expected_object_counts(
         # the floor is the manifest alone, the ceiling adds the MOC. A real
         # sharded-write bypass lands in the per-shard DATA counts (asserted
         # exactly in object_count_mismatch), never in this metadata window.
+        # ... plus the OPTIONAL run-level stats parquet (issue #297), same
+        # fail-open posture as the root MOC.
         metadata_min = 1
-        metadata_max = 1 + (1 if coverage_moc else 0)
+        metadata_max = 1 + (1 if coverage_moc else 0) + 1
         # Leaf fixed objects: leaf root zarr.json + group zarr.json + one
         # zarr.json per array, plus the in-leaf coverage.moc sidecar (written
         # for any populated leaf when the leaf has depth, i.e. child_order >
@@ -165,6 +170,11 @@ def expected_object_counts(
         "total_max": metadata_max + n_shards * hi,
         "exact": lo == hi,
     }
+
+
+def _is_run_parquet(key: str) -> bool:
+    """A store-root run-level stats parquet (issue #297): ``stats_*.parquet``."""
+    return "/" not in key and key.startswith("stats_") and key.endswith(".parquet")
 
 
 def list_store_keys(store_path: str, **store_kwargs) -> list[str]:
@@ -222,7 +232,7 @@ def store_object_counts(
         label_of = {int(grid.block_index(int(k))[0]): grid.shard_label(int(k)) for k in shard_keys}
         group = grid.group_path
         for key in keys:
-            if key == "zarr.json" or key.endswith("/zarr.json"):
+            if key == "zarr.json" or key.endswith("/zarr.json") or _is_run_parquet(key):
                 metadata += 1
                 continue
             parts = key.split("/")
@@ -257,7 +267,7 @@ def store_object_counts(
             prefix.rstrip("/").rsplit("/", 1)[0] + "/": label for prefix, label in leaf_of.items()
         }
         for key in keys:
-            if key in (hive.MANIFEST_NAME, hive.ROOT_COVERAGE_NAME):
+            if key in (hive.MANIFEST_NAME, hive.ROOT_COVERAGE_NAME) or _is_run_parquet(key):
                 metadata += 1
                 continue
             for prefix, label in leaf_of.items():

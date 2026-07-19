@@ -1421,6 +1421,7 @@ class TestSummaryKeysByteIdentical:
         "store_path",
         "backend",
         "results",
+        "run_stats_path",  # run-level stats parquet (issue #297 phase 3)
     }
     _LAMBDA_KEYS = {
         "total_cells",
@@ -3361,6 +3362,38 @@ class TestProfilePlumbing:
         )
         runner.agg(atl06_config, catalog="ignored", store="./out.zarr", backend="local")
         assert captured["handoff"] == "pandas"
+
+
+class TestRunStatsRows:
+    """Run-parquet row building from lambda dispatch results (issue #297)."""
+
+    def test_success_stale_and_failure_rows(self):
+        from zagg.runner import _lambda_result_rows
+        from zagg.telemetry import build_record
+
+        rec = build_record(shard_key=1, metadata={"total_obs": 5, "duration_s": 1.0})
+        results = [
+            {"shard_key": 1, "status_code": 200, "body": {"stats": rec}, "retries": 0},
+            # Stale deployed worker: 200 body without a record — derived row.
+            {"shard_key": 2, "status_code": 200, "body": {"total_obs": 3, "duration_s": 2.0}},
+            # Failure: error + duration-until-failure + retry count.
+            {
+                "shard_key": 3,
+                "status_code": None,
+                "body": {},
+                "error": "Lambda timeout: Task timed out",
+                "retries": 3,
+                "lambda_duration": 0,
+                "wall_time": 42.0,
+            },
+        ]
+        rows = _lambda_result_rows(results)
+        assert [r["shard_key"] for r in rows] == [1, 2, 3]
+        assert rows[0]["success"] is True and rows[0]["retries"] == 0
+        assert rows[1]["success"] is True and rows[1]["n_obs"] == 3
+        assert rows[2]["success"] is False
+        assert rows[2]["error_class"] == "Lambda timeout"
+        assert rows[2]["duration_s"] == 42.0 and rows[2]["retries"] == 3
 
 
 class TestWorkerPhaseTimings:
