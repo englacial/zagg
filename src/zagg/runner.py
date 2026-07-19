@@ -920,6 +920,12 @@ class RasterStrategy:
             # writes no leaf, so ``timesteps`` alone would orphan a sidecar.
             # Fail-open on the sidecar PUT.
             meta.setdefault("duration_s", time.time() - unit_t0)
+            # A raster unit's obs tally is its timestep count (the raster
+            # obs-count convention). Mirror the Lambda handler, which injects
+            # ``total_obs`` before ``build_record``, so the same shard yields an
+            # identical ``n_obs`` across backends (the record's whole point is a
+            # backend-independent, mergeable row for the run parquet).
+            meta.setdefault("total_obs", meta.get("timesteps", 0))
             record = build_record(
                 shard_key=int(shard_key),
                 metadata=meta,

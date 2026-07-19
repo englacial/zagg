@@ -939,6 +939,10 @@ class TestRasterHiveLocalBackend:
         assert record["shard_key"] == int(shard)
         assert record["invoked_by"] is None and record["lambda"] is None
         assert {"sample", "write"} <= set(record["phase_timings"])
+        # n_obs is the unit's timestep count (raster obs-count convention),
+        # matching the Lambda backend's ``total_obs`` injection — a raster
+        # shard cannot yield n_obs=timesteps on Lambda and 0 locally (#297).
+        assert record["n_obs"] == red.shape[0] == 2
 
     def test_windowed_daily_leaves(self, tmp_path, manifest):
         from zagg import hive
