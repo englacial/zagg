@@ -269,7 +269,13 @@ def run(config: PipelineConfig, **kwargs) -> RunView:
 
     total = None
     if kwargs.get("events") is not None:
-        total = len(list(kwargs["events"]))
+        # Materialize once and rebind: a one-shot iterable (generator) would be
+        # exhausted by the count, then forwarded empty to agg -- TemporalStrategy's
+        # ``list(events)`` would yield [] and the run would silently process zero
+        # events. List/tuple inputs are unchanged by the round-trip.
+        events = list(kwargs["events"])
+        kwargs["events"] = events
+        total = len(events)
     elif kwargs.get("catalog") or config.catalog:
         preview = max_cost_preview(
             config,
