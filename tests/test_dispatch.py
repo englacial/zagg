@@ -13,8 +13,10 @@ from concurrent.futures import Future, ThreadPoolExecutor
 import pytest
 
 from zagg.dispatch import (
+    LAMBDA_ARCH,
     LAMBDA_MEMORY_GB,
     LAMBDA_PRICE_PER_GB_SEC,
+    LAMBDA_PRICE_PER_GB_SEC_BY_ARCH,
     LAMBDA_RETRY,
     LOCAL_RETRY,
     CellCost,
@@ -25,6 +27,7 @@ from zagg.dispatch import (
     RunReport,
     dispatch,
     lambda_classify,
+    max_cost_usd,
     never_classify,
 )
 
@@ -132,6 +135,46 @@ class TestLambdaExecutor:
         ex = self._make(finalize_fn=_fin)
         ex.finalize()
         assert called["n"] == 1
+
+
+class TestMaxCostUsd:
+    """Pre-invoke cost ceiling math against the price table (issue #298)."""
+
+    def test_matches_price_table(self):
+        # 100 shards x 4 GB x 900 s at the arm64 rate.
+        expected = 100 * LAMBDA_PRICE_PER_GB_SEC_BY_ARCH["arm64"] * 4.0 * 900
+        assert max_cost_usd(100, 4.0, timeout_s=900) == pytest.approx(expected)
+
+    def test_scales_with_memory_variant(self):
+        # An 8 GB worker: variant (issue #235) doubles the 4 GB ceiling.
+        four = max_cost_usd(10, 4.0, timeout_s=900)
+        eight = max_cost_usd(10, 8.0, timeout_s=900)
+        assert eight == pytest.approx(2 * four)
+
+    def test_default_arch_is_the_deployed_fleet(self):
+        # Only arm64 is deployed (template.yaml Architecture default); the
+        # flat constant must stay an alias into the table.
+        assert LAMBDA_ARCH == "arm64"
+        assert LAMBDA_PRICE_PER_GB_SEC == LAMBDA_PRICE_PER_GB_SEC_BY_ARCH[LAMBDA_ARCH]
+        assert max_cost_usd(1, 1.0, timeout_s=1, arch="arm64") == pytest.approx(
+            LAMBDA_PRICE_PER_GB_SEC
+        )
+
+    def test_unknown_arch_raises(self):
+        # Pricing must fail loudly, never silently fall back to another rate.
+        with pytest.raises(KeyError):
+            max_cost_usd(1, 4.0, timeout_s=900, arch="riscv")
+
+    def test_zero_shards_costs_nothing(self):
+        assert max_cost_usd(0, 4.0, timeout_s=900) == 0.0
+
+    def test_run_report_cost_fields_default_none(self):
+        # Local runs never stamp the block; the defaults must read as "no
+        # metered cost", and finalize()'s empty-report contract still holds.
+        report = RunReport()
+        assert report.max_cost_usd is None
+        assert report.estimated_cost_usd is None
+        assert report.actual_cost_usd is None
 
 
 class TestDispatchLoop:

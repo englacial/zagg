@@ -77,6 +77,13 @@ class RunReport:
     counters; cost is accumulated per-result via :meth:`Executor.measure_cost`.
     ``runner.py`` reads this to build the public summary dict and to print cost
     -- this module never formats or prints.
+
+    The run-level cost block (issue #298) is stamped by the runner, not the
+    loop: ``max_cost_usd`` is the pre-invoke ceiling (:func:`max_cost_usd`),
+    ``actual_cost_usd`` the post-run rollup of billed durations, and
+    ``estimated_cost_usd`` the prior-history estimate (``None`` until the
+    issue #297/#299 sidecar history exists). All three stay ``None`` on runs
+    that carry no metered cost (local backend).
     """
 
     results: list[dict] = field(default_factory=list)
@@ -84,6 +91,9 @@ class RunReport:
     cells_error: int = 0
     total_obs: int = 0
     cost: CellCost = field(default_factory=CellCost)
+    max_cost_usd: float | None = None
+    estimated_cost_usd: float | None = None
+    actual_cost_usd: float | None = None
 
 
 # ---------------------------------------------------------------------------
@@ -313,12 +323,38 @@ class LocalExecutor:
         self._pool.shutdown()
 
 
-# arm64 Lambda pricing, $/GB-second, and the function's memory in GB. Matches
-# the constants inlined into ``_run_lambda`` before this extraction; surfaced
-# here so :meth:`LambdaExecutor.measure_cost` and the runner's presentation
-# read one source.
+# Lambda pricing, $/GB-second, keyed by CPU architecture, and the default
+# function memory in GB. The deployed fleet is arm64-only (template.yaml
+# ``Architecture`` default; no x86_64 variant is stood up), so the table
+# carries one row -- an x86_64 deployment adds its rate here (issue #298).
+# ``LAMBDA_PRICE_PER_GB_SEC`` stays the flat arm64 constant so
+# :meth:`LambdaExecutor.measure_cost` and the runner's presentation keep
+# reading one source, byte-identical to the pre-table path.
+LAMBDA_ARCH = "arm64"
+LAMBDA_PRICE_PER_GB_SEC_BY_ARCH = {"arm64": 0.0000133334}
 LAMBDA_MEMORY_GB = 4.0  # issue #193: production worker sized to 4 GB (2.3 vCPU)
-LAMBDA_PRICE_PER_GB_SEC = 0.0000133334
+LAMBDA_PRICE_PER_GB_SEC = LAMBDA_PRICE_PER_GB_SEC_BY_ARCH[LAMBDA_ARCH]
+
+
+def max_cost_usd(
+    n_shards: int,
+    memory_gb: float,
+    *,
+    timeout_s: float,
+    arch: str = LAMBDA_ARCH,
+) -> float:
+    """Hard ceiling on a fan-out's Lambda bill, computable before any invoke.
+
+    Every work unit is one Lambda invocation billed at ``memory_gb`` for at
+    most the function timeout, so ``n_shards * rate(arch) * memory_gb *
+    timeout_s`` bounds one clean pass over the shardmap (issue #298).
+    Transient-fault retries (:data:`LAMBDA_RETRY`, rare) re-bill a unit and
+    are deliberately not folded in -- the ceiling prices the run as planned,
+    not the worst-case retry storm. ``arch`` keys the price table
+    (:data:`LAMBDA_PRICE_PER_GB_SEC_BY_ARCH`); an unknown arch raises
+    ``KeyError`` rather than pricing silently wrong.
+    """
+    return n_shards * LAMBDA_PRICE_PER_GB_SEC_BY_ARCH[arch] * memory_gb * timeout_s
 
 
 class LambdaExecutor:
