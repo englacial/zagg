@@ -241,6 +241,39 @@ class TestRunWrapper:
         notebook.run(default_config("atl06"), events=[{"event_key": "a"}, {"event_key": "b"}])
         assert totals == [2]
 
+    def test_events_generator_not_exhausted_by_count(self, monkeypatch):
+        # A one-shot generator must survive to agg: run() counts it once for the
+        # bar total, then rebinds the materialized list so TemporalStrategy's
+        # list(events) still sees every event (issue #298 fold).
+        totals = []
+        seen = {}
+
+        class _Recorder:
+            def update(self, done, total, cost_usd):
+                pass
+
+            def close(self):
+                pass
+
+        def _factory(total, desc="shards"):
+            totals.append(total)
+            return _Recorder()
+
+        def _fake_agg(config, *, events=None, on_progress=None, **k):
+            seen["events"] = list(events)
+            return {"backend": "local"}
+
+        monkeypatch.setattr("zagg.runner.agg", _fake_agg)
+        monkeypatch.setattr(notebook, "_make_progress", _factory)
+        gen = (e for e in ({"event_key": "a"}, {"event_key": "b"}, {"event_key": "c"}))
+        notebook.run(default_config("atl06"), events=gen)
+        assert totals == [3]
+        assert seen["events"] == [
+            {"event_key": "a"},
+            {"event_key": "b"},
+            {"event_key": "c"},
+        ]
+
 
 class TestConfirmMaxCost:
     def test_yes_answer_proceeds(self, capsys):
