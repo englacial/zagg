@@ -265,24 +265,26 @@ sampled tail). o9 stays the safe default (~1.5 GB peak); o8 is the cheaper total
 (§4) once the 8 GB arm is in place. o7 remains untested under spill and is out of
 scope here.
 
-**Why coarsen at all? Coarser is monotonically cheaper per unit data.** A NEON
-SERC AOI order sweep (0.24.0 sharded, inline nomask;
-`data/conus/results/order_sweep_*`) shows the incentive:
+**Why coarsen at all? Coarser is cheaper per unit data.** The 0.36.0 v036 CONUS
+run measures it directly — the per-unit economics from the 25-shard stratified
+sample per order (cost incl. ephemeral; `obs`, `cost_per_shard_usd`, granule reads
+straight from `conus_o{8,9}_v036.json`):
 
-| order | shards | obs | cost | $/Mobs | $/100 km² |
-| --- | ---: | ---: | ---: | ---: | ---: |
-| **o8** | 2 | 50.7 M | $0.0359 | **$0.000708** | **$0.00277** |
-| **o9** | 4 | 24.8 M | $0.0262 | $0.001057 | $0.00405 |
-| **o10** | 9 | 11.4 M | $0.0321 | $0.002811 | $0.00881 |
+| order | sample shards | obs | cost | $/Mobs | $/100 km² | obs / (shard,gran) read |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| **o8** | 25 | 1,150 M | $0.4532 | **$0.000394** | **$0.00279** | ~360 k |
+| **o9** | 25 | 412 M | $0.2181 | $0.000529 | $0.00538 | ~200 k |
 
-o8 is **~33 % cheaper per obs** than o9; o10 is **~2.7× worse** than o9. Two
+o8 is **~25 % cheaper per obs** and **~48 % cheaper per 100 km²** than o9. Two
 compounding reasons: fewer shards means fewer fixed-overhead payments, and fewer
-**redundant granule re-reads** — o8 extracts ~225 k obs per (shard, granule) read
-vs o9's ~87 k, i.e. less #65 swath over-assignment. So there is a real cost pull
-toward o8; the question §4c answers is whether it can *run*. (The per-order `obs`
-are deterministic; the absolute `cost` is a single-shard-set Lambda timing and is
-**n=1 noisy** at the ~±15 % level — o9 has read $0.026–0.029 across runs — so read
-the **per-unit ratios and the monotone trend**, not the exact cents.)
+**redundant granule re-reads** — o8 extracts ~360 k obs per (shard, granule) read
+vs o9's ~200 k (~1.8×), i.e. less #65 swath over-assignment. So there is a real
+cost pull toward o8; §4c's original question was whether it can *run* — with spill,
+it now does. (The per-order `obs` are deterministic; the per-shard `cost` is a
+Lambda timing and is noisy at the ~±15 % level — read the **per-unit ratios and the
+monotone trend**, not the exact cents. An earlier NEON SERC sweep, now superseded
+by this CONUS measurement, showed the same o8<o9 ordering and that o10 is ~2.7×
+worse than o9 — finer than o9 loses to redundant re-reads.)
 
 The reason coarsening was *hard* at CONUS scale: per-shard peak RSS is driven by
 **cell-coverage density (surface density), not granule count** — so it only shows
