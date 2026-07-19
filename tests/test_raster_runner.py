@@ -856,6 +856,15 @@ class TestRasterHiveLocalBackend:
         np.testing.assert_array_equal(
             hive.root_coverage_words(cov), np.asarray([shard], dtype=np.uint64)
         )
+        # Stats sidecar (issue #297): SIBLING of the leaf, success only; the
+        # local backend carries no lambda config / caller identity.
+        from zagg.telemetry import read_sidecar
+
+        record = read_sidecar(leaf)
+        assert record["schema_version"] == 1 and record["success"] is True
+        assert record["shard_key"] == int(shard)
+        assert record["invoked_by"] is None and record["lambda"] is None
+        assert {"sample", "write"} <= set(record["phase_timings"])
 
     def test_windowed_daily_leaves(self, tmp_path, manifest):
         from zagg import hive

@@ -21,6 +21,7 @@ them do object-store I/O and import their backends lazily.
 from __future__ import annotations
 
 import hashlib
+import json
 import os
 import platform
 from datetime import datetime, timezone
@@ -64,6 +65,15 @@ def granules_sha256(granule_ids: Iterable[str] | None) -> str | None:
     if not ids:
         return None
     return hashlib.sha256("\n".join(ids).encode()).hexdigest()
+
+
+def raster_granule_ids(granules: Iterable[dict]) -> list:
+    """Catalog-identity inputs for a raster unit's stats record.
+
+    Raster ShardMap entries carry no granule URL; the stable per-acquisition
+    identity is the STAC item id when present, else the acquisition datetime.
+    """
+    return [e.get("id") or e.get("datetime") for e in granules if e.get("id") or e.get("datetime")]
 
 
 def lambda_env() -> dict | None:
@@ -191,3 +201,60 @@ def _zagg_version() -> str:
     import zagg
 
     return zagg.__version__
+
+
+# ---------------------------------------------------------------------------
+# Leaf sidecar I/O (phase 2) — one small JSON object per hive leaf, written by
+# the worker on success only, SIBLING to the leaf ``.zarr`` (never inside it:
+# the leaf stays vanilla zarr v3 and the D4 commit stamp stays its final write).
+# ---------------------------------------------------------------------------
+
+
+def sidecar_key(leaf_name: str) -> str:
+    """Sidecar object name for a leaf zarr basename.
+
+    Bare leaves get :data:`SIDECAR_NAME`; windowed leaves (issue #246) get
+    ``stats_{window}.json`` — a hive node directory holds every window's leaf
+    of its one shard, so a bare ``stats.json`` would self-clobber across
+    windows. Mirrors the ``{full_id}_{window}.zarr`` leaf naming.
+    """
+    from zagg.windows import split_leaf_name
+
+    _full_id, window = split_leaf_name(leaf_name)
+    if window is None:
+        return SIDECAR_NAME
+    stem, ext = SIDECAR_NAME.rsplit(".", 1)
+    return f"{stem}_{window}.{ext}"
+
+
+def sidecar_path(leaf_path: str) -> str:
+    """Absolute path of a leaf's stats sidecar (sibling of the ``.zarr``)."""
+    prefix, _, name = leaf_path.rstrip("/").rpartition("/")
+    return f"{prefix}/{sidecar_key(name)}"
+
+
+def write_sidecar(leaf_path: str, record: dict, **store_kwargs) -> None:
+    """PUT ``record`` as the leaf's stats sidecar (success path only, #297)."""
+    import obstore
+
+    from zagg.store import open_object_store
+
+    prefix, _, name = leaf_path.rstrip("/").rpartition("/")
+    obstore.put(
+        open_object_store(prefix, **store_kwargs), sidecar_key(name), json.dumps(record).encode()
+    )
+
+
+def read_sidecar(leaf_path: str, **store_kwargs) -> dict | None:
+    """The leaf's stats sidecar record, or ``None`` when absent."""
+    import obstore
+    from obstore.exceptions import NotFoundError
+
+    from zagg.store import open_object_store
+
+    prefix, _, name = leaf_path.rstrip("/").rpartition("/")
+    try:
+        data = obstore.get(open_object_store(prefix, **store_kwargs), sidecar_key(name)).bytes()
+    except (FileNotFoundError, NotFoundError):
+        return None
+    return json.loads(bytes(data))

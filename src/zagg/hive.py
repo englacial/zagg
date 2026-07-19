@@ -891,15 +891,16 @@ def process_and_write_hive(
     the K carriers accumulate and the whole leaf is written once
     (``write_leaf_to_zarr`` — one ShardingCodec object per array), mirroring
     the flat sharded switch in ``runner._process_and_write``.
-    ``profile`` forwards to ``process_shard`` (issue #100), which fills
-    ``metadata["phase_timings"]`` with read/index/aggregate; the leaf write
-    work — interleaved with the stream (or a single post-stream pass when
-    sharded), plus the ragged/coverage/stamp finalize — accumulates into an
-    additive ``write`` phase alongside them (issue #249). Unlike the flat
-    path, the lazy leaf template emission counts as write: in hive the worker
-    owns its leaf's template PUTs (there is no dispatcher-side template), so
-    excluding them would hide real write-out cost. Default ``False`` makes
-    zero timing calls and leaves ``metadata`` unchanged — no probe tax.
+    Phase timings are always collected (issue #297; formerly the opt-in
+    ``profile`` gate of issues #100/#249): ``process_shard`` fills
+    ``metadata["phase_timings"]`` with read/index/aggregate, and the leaf
+    write work — interleaved with the stream (or a single post-stream pass
+    when sharded), plus the ragged/coverage/stamp finalize — accumulates into
+    an additive ``write`` phase alongside them. Unlike the flat path, the
+    lazy leaf template emission counts as write: in hive the worker owns its
+    leaf's template PUTs (there is no dispatcher-side template), so excluding
+    them would hide real write-out cost. ``profile`` is retained and
+    forwarded (it still gates dispatcher-side rollup verbosity).
 
     ``window`` (issue #246, D13/D15) is one dispatch unit's time window:
     ``{"label", "start", "end"}``, bounds half-open in DATASET units
@@ -983,14 +984,13 @@ def process_and_write_hive(
 
     def _write_chunk(block_index, carrier, ragged):
         nonlocal _write_elapsed
-        _t0 = time.time() if profile else None
+        _t0 = time.time()
         store = _leaf()
         local = leaf_block_index(grid, block_index, shard_key)
         write_dataframe_to_zarr(carrier, store, grid=grid, chunk_idx=local)
         if ragged:
             ragged_chunks.append((local, ragged))
-        if profile:
-            _write_elapsed += time.time() - _t0
+        _write_elapsed += time.time() - _t0
 
     # Occupied-cell sink (issue #200): the worker already holds the shard's
     # populated cell words; collect them here to derive the stamp's coverage.
@@ -1025,10 +1025,9 @@ def process_and_write_hive(
     # the ``.zarr/`` prefix — same contract as the streaming path's first
     # ``_write_chunk``.
     if sharded and chunk_results and not metadata.get("error"):
-        _t0 = time.time() if profile else None
+        _t0 = time.time()
         write_leaf_to_zarr(chunk_results, _leaf(), grid=grid, shard_key=int(shard_key))
-        if profile:
-            _write_elapsed += time.time() - _t0
+        _write_elapsed += time.time() - _t0
     # Stamp ONLY a fully-written leaf: an errored shard (or one that streamed
     # no chunks) stays unstamped — debris by definition (D4). The stamp is the
     # last write, so its presence certifies everything before it landed — the
@@ -1038,7 +1037,7 @@ def process_and_write_hive(
     # The leaf write order is pinned: dense (streamed, or one object each when
     # sharded) -> ragged (one object, issue #209) -> coverage sidecar -> stamp.
     if "store" in box and not metadata.get("error"):
-        _t0 = time.time() if profile else None
+        _t0 = time.time()
         if not sharded:
             write_ragged_leaf_to_zarr(ragged_chunks, box["store"], grid=grid)
         words = np.concatenate(occupied) if occupied else None
@@ -1067,15 +1066,14 @@ def process_and_write_hive(
             window=window["label"] if window else None,
             time_range=time_range,
         )
-        if profile:
-            _write_elapsed += time.time() - _t0
+        _write_elapsed += time.time() - _t0
     # Write-phase split (issue #249): read/index/aggregate come from
     # ``process_shard``; ``write`` is the leaf write-out above (template +
     # dense chunks + ragged + coverage sidecar + stamp). Same gate as the flat
     # Lambda handler's issue #100 write bracket: only a clean, actually-written
     # shard carries it, so a time-to-failure never lands as a write duration
     # and a no-data shard (no leaf) stays write-less.
-    if profile and not metadata.get("error") and "phase_timings" in metadata and "store" in box:
+    if not metadata.get("error") and "phase_timings" in metadata and "store" in box:
         metadata["phase_timings"]["write"] = _write_elapsed
     return metadata
 

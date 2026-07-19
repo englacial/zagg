@@ -143,9 +143,10 @@ def expected_object_counts(
         # Leaf fixed objects: leaf root zarr.json + group zarr.json + one
         # zarr.json per array, plus the in-leaf coverage.moc sidecar (written
         # for any populated leaf when the leaf has depth, i.e. child_order >
-        # parent_order).
+        # parent_order), plus the stats.json sidecar SIBLING to the leaf
+        # (issue #297 — one per successful shard, in the leaf's node dir).
         sidecar = 1 if grid.child_order > grid.parent_order else 0
-        lo = hi = 2 + len(members) + sidecar
+        lo = hi = 3 + len(members) + sidecar
         for m in members:
             blocks = m["blocks_per_shard"]
             hi += blocks
@@ -248,6 +249,13 @@ def store_object_counts(
             hive.shard_leaf_path("", int(k)).lstrip("/") + "/": grid.shard_label(int(k))
             for k in shard_keys
         }
+        # The per-shard stats sidecar (issue #297) is a SIBLING of the leaf
+        # .zarr — ``{node}/stats.json`` (``stats_{window}.json`` windowed) —
+        # so attribute it to the node's shard rather than pooling it in
+        # ``other``.
+        stats_of = {
+            prefix.rstrip("/").rsplit("/", 1)[0] + "/": label for prefix, label in leaf_of.items()
+        }
         for key in keys:
             if key in (hive.MANIFEST_NAME, hive.ROOT_COVERAGE_NAME):
                 metadata += 1
@@ -257,7 +265,14 @@ def store_object_counts(
                     per_shard[label] = per_shard.get(label, 0) + 1
                     break
             else:
-                other.append(key)
+                node, _, name = key.rpartition("/")
+                is_stats = name == "stats.json" or (
+                    name.startswith("stats_") and name.endswith(".json")
+                )
+                if is_stats and node + "/" in stats_of:
+                    per_shard[stats_of[node + "/"]] = per_shard.get(stats_of[node + "/"], 0) + 1
+                else:
+                    other.append(key)
     else:
         raise ValueError(f"unknown store_layout: {store_layout!r} (expected 'flat' or 'hive')")
 

@@ -2066,15 +2066,16 @@ def test_hive_config_expected_counts_root_moc_optional():
         grid, n_shards=1, store_layout="hive", coverage_moc=True
     )
     # 4 arrays (cell_ids/morton/count/h_tdigest): leaf root+group zarr.json (2)
-    # + 4 array zarr.json + 4 sharded data objects + coverage sidecar = 11.
+    # + 4 array zarr.json + 4 sharded data objects + coverage sidecar +
+    # stats.json sibling (issue #297) = 12.
     # Store root: morton_hive.json (always) + coverage.moc (optional) -> [1, 2].
     assert exp == {
         "metadata": 2,
         "metadata_min": 1,
-        "per_shard_min": 11,
-        "per_shard_max": 11,
-        "total_min": 12,
-        "total_max": 13,
+        "per_shard_min": 12,
+        "per_shard_max": 12,
+        "total_min": 13,
+        "total_max": 14,
         "exact": True,
     }
 

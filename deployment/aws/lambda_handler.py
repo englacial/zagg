@@ -29,6 +29,12 @@ Event payload (default / process mode):
         Forwarded to ``process_shard`` so the worker fills the ``aoi_mask``
         column; absent when ``output.aoi_mask`` is off (the column is not
         allocated), keeping the flag-off event and outputs byte-identical.
+    "invoked_by": dict (optional, issue #297) -- {"arn", "userid"} caller
+        identity the dispatcher resolved once per run via sts
+        get-caller-identity; the worker copies it VERBATIM into the per-shard
+        stats record (sidecar + envelope). Workers cannot see the invoker
+        themselves (Event invokes carry no caller identity). Absent -> the
+        stats record carries null.
     "result_url": str (optional, issue #151) -- where to ALSO write this
         invocation's response envelope as JSON (e.g.
         "s3://bucket/out.zarr.status/<run_id>/<shard_label>.json", where the
@@ -1128,8 +1134,37 @@ def _handle_process_raster(event: Dict[str, Any]) -> Dict[str, Any]:
             body["max_memory_mb"] = (
                 sampled_peak if sampled_peak is not None else body["container_hwm_mb"]
             )
-            if profile and "phase_timings" in meta:
+            # Always-on collection (issue #297); the per-stage ``stages`` block
+            # inside stays gated on ``profile`` (raster.py).
+            if "phase_timings" in meta:
                 body["phase_timings"] = meta["phase_timings"]
+            # Per-shard stats record (issue #297): envelope ride + the leaf
+            # sidecar (only when the unit wrote a leaf — timesteps > 0 means
+            # slabs streamed, so the leaf exists and is stamped). Fail-open on
+            # the sidecar PUT; the record still rides the envelope.
+            from zagg.telemetry import build_record, lambda_env, raster_granule_ids, write_sidecar
+
+            record = build_record(
+                shard_key=shard_key,
+                metadata=body,
+                granule_ids=raster_granule_ids(event["granules"]),
+                invoked_by=event.get("invoked_by"),
+                lambda_config=lambda_env(),
+            )
+            body["stats"] = record
+            if meta["timesteps"]:
+                from zagg.hive import shard_leaf_path
+
+                try:
+                    window = event.get("window")
+                    leaf = shard_leaf_path(
+                        event["store_path"],
+                        shard_key,
+                        window=window["label"] if window else None,
+                    )
+                    write_sidecar(leaf, record, **_output_store_kwargs(event))
+                except Exception as e:
+                    logger.warning(f"stats sidecar write failed (fail-open, issue #297): {e}")
             return {"statusCode": 200, "body": json.dumps(body)}
 
         time_index = {k: int(v) for k, v in event["time_index"].items()}
@@ -1156,10 +1191,9 @@ def _handle_process_raster(event: Dict[str, Any]) -> Dict[str, Any]:
 
         def _write_slab(t_idx: int, slab: dict) -> None:
             nonlocal wrote, write_s
-            w0 = time.time() if profile else 0.0
+            w0 = time.time()
             write_raster_slab(store, grid, shard_key, t_idx, slab)
-            if profile:
-                write_s += time.time() - w0
+            write_s += time.time() - w0
             wrote = True
 
         _slabs, meta = process_raster_shard(
@@ -1195,13 +1229,25 @@ def _handle_process_raster(event: Dict[str, Any]) -> Dict[str, Any]:
         body["max_memory_mb"] = (
             sampled_peak if sampled_peak is not None else body["container_hwm_mb"]
         )
+        # Always-on sample/write split (issue #297); ``stages`` (issue #249)
+        # stays profile-gated verbosity.
+        body["phase_timings"] = {
+            "sample": (time.time() - start_time) - write_s,
+            "write": write_s,
+        }
         if profile:
-            total = time.time() - start_time
-            body["phase_timings"] = {
-                "sample": total - write_s,
-                "write": write_s,
-                "stages": stage_stats,
-            }
+            body["phase_timings"]["stages"] = stage_stats
+        # Stats record (issue #297): envelope ride only — a flat store has no
+        # per-shard leaf for a sidecar sibling (see the PR #302 discussion).
+        from zagg.telemetry import build_record, lambda_env, raster_granule_ids
+
+        body["stats"] = build_record(
+            shard_key=shard_key,
+            metadata=body,
+            granule_ids=raster_granule_ids(event["granules"]),
+            invoked_by=event.get("invoked_by"),
+            lambda_config=lambda_env(),
+        )
         return {"statusCode": 200, "body": json.dumps(body)}
     except Exception as e:
         logger.error(f"raster worker failed: {e}", exc_info=True)
@@ -1416,7 +1462,7 @@ def _handle_process(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
                 store = _get_store()
                 if store is None:
                     return  # template missing — recorded in write_error, skip the rest
-                _t0 = time.time() if profile else None
+                _t0 = time.time()
                 try:
                     # write_dataframe_to_zarr no-ops on an empty carrier, so no per-chunk
                     # emptiness check is needed. Use each chunk's own block_index.
@@ -1430,8 +1476,7 @@ def _handle_process(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
                     logger.error(f"Failed to write zarr to {store_path}: {e}")
                     write_error["msg"] = f"Failed to write zarr: {e}"
                     return
-                if profile:
-                    _write_elapsed += time.time() - _t0
+                _write_elapsed += time.time() - _t0
 
             chunk_results = [] if sharded else None
             _df_out, metadata = process_shard(
@@ -1454,13 +1499,12 @@ def _handle_process(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
             if sharded and chunk_results:
                 store = _get_store()
                 if store is not None:
-                    _write_t0 = time.time() if profile else None
+                    _write_t0 = time.time()
                     try:
                         write_shard_to_zarr(
                             chunk_results, store, grid=grid, shard_key=int(shard_key)
                         )
-                        if profile:
-                            _write_elapsed += time.time() - _write_t0
+                        _write_elapsed += time.time() - _write_t0
                     except Exception as e:
                         logger.error(f"Failed to write zarr to {store_path}: {e}")
                         write_error["msg"] = f"Failed to write zarr: {e}"
@@ -1471,14 +1515,13 @@ def _handle_process(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
         if write_error:
             metadata["error"] = write_error["msg"]
 
-        # Record the write-phase timing (issue #100): read/index/aggregate come from
-        # ``process_shard``; ``write`` is the time spent in the streaming callback /
-        # sharded write. Only attach it on a clean write (no ``error``) so a time-to-
-        # failure is never folded in as a real write duration; the no-data path wrote
-        # nothing (``_write_elapsed`` stays 0) but also has no chunks, so writing 0 is
-        # harmless — gate on a populated ``phase_timings`` and no error to match the
-        # old "write absent on failure / no-data" contract.
-        if profile and not metadata.get("error") and "phase_timings" in metadata and store_box:
+        # Record the write-phase timing (issue #100; always-on collection since
+        # issue #297): read/index/aggregate come from ``process_shard``; ``write``
+        # is the time spent in the streaming callback / sharded write. Only attach
+        # it on a clean write (no ``error``) so a time-to-failure is never folded
+        # in as a real write duration; the no-data path wrote nothing and has no
+        # chunks — "write absent on failure / no-data" is unchanged.
+        if not metadata.get("error") and "phase_timings" in metadata and store_box:
             metadata["phase_timings"]["write"] = _write_elapsed
 
         # Peak worker RSS (issues #120, #141): captured here, after the write phase,
@@ -1504,6 +1547,36 @@ def _handle_process(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
         metadata["cpu_seconds"] = round(
             (cpu_t1.user - cpu_t0.user) + (cpu_t1.system - cpu_t0.system), 3
         )
+
+        # Per-shard stats record (issue #297): rides the response envelope
+        # (``body["stats"]``) so the dispatcher builds the run parquet with no
+        # second S3 listing; hive leaves additionally get the ``stats.json``
+        # sidecar SIBLING to the leaf .zarr — success only (an error-free hive
+        # shard is by construction written + stamped). ``invoked_by`` is copied
+        # verbatim from the invoke payload (the dispatcher resolves it; the
+        # worker cannot). Fail-open: a sidecar PUT failure never fails a shard
+        # whose data landed — the record still rides the envelope.
+        from zagg.telemetry import build_record, lambda_env, write_sidecar
+
+        record = build_record(
+            shard_key=int(shard_key),
+            metadata=metadata,
+            granule_ids=event.get("granule_urls"),
+            invoked_by=event.get("invoked_by"),
+            lambda_config=lambda_env(),
+        )
+        metadata["stats"] = record
+        if get_store_layout(config) == "hive" and not metadata.get("error"):
+            from zagg.hive import shard_leaf_path
+
+            try:
+                window = event.get("window")
+                leaf = shard_leaf_path(
+                    store_path, int(shard_key), window=window["label"] if window else None
+                )
+                write_sidecar(leaf, record, **_output_store_kwargs(event))
+            except Exception as e:
+                logger.warning(f"stats sidecar write failed (fail-open, issue #297): {e}")
 
         # Log structured result
         logger.info(

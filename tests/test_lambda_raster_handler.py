@@ -239,9 +239,7 @@ class TestProcessRasterResultMirror:
         # unaffected.
         event, _grid, _data = raster_event
         called = []
-        monkeypatch.setattr(
-            handler_mod, "_write_result", lambda *a: called.append(a) or True
-        )
+        monkeypatch.setattr(handler_mod, "_write_result", lambda *a: called.append(a) or True)
         resp = handler_mod.lambda_handler(event, MagicMock())
         assert called == []
         assert resp["statusCode"] == 200
@@ -414,10 +412,15 @@ class TestRasterPhaseTimings:
         assert pt["write"] > 0.0
         assert pt["sample"] + pt["write"] == pytest.approx(body["duration_s"], rel=0.05)
 
-    def test_no_profile_key_no_timings(self, handler_mod, raster_event):
+    def test_no_profile_key_still_collects_sample_write(self, handler_mod, raster_event):
+        # Always-on collection (issue #297): the sample/write split is emitted
+        # without the profile key; the per-stage ``stages`` verbosity stays
+        # profile-gated.
         event, _grid, _data = raster_event
         resp = handler_mod.lambda_handler(event, MagicMock())
-        assert "phase_timings" not in json.loads(resp["body"])
+        body = json.loads(resp["body"])
+        assert set(body["phase_timings"]) == {"sample", "write"}
+        assert body["phase_timings"]["write"] > 0.0
 
     def test_profile_emits_stage_split(self, handler_mod, raster_event):
         # Issue #249: the sample bucket split per stage + counts, additive
@@ -436,8 +439,10 @@ class TestRasterPhaseTimings:
         assert sum(stages[k] for k in floats) > 0.0
 
     def test_no_profile_passes_no_stage_stats(self, handler_mod, raster_event, monkeypatch):
-        # Zero-overhead gate: without ``profile`` the worker must receive
-        # stage_stats=None so the sample path makes no timing calls at all.
+        # The per-stage gate survives always-on collection (issue #297):
+        # without ``profile`` the worker receives stage_stats=None so the
+        # sample path makes no per-stage timing calls, and the emitted
+        # phase_timings carry no ``stages`` block.
         import zagg.processing.raster as raster_mod
 
         event, _grid, _data = raster_event
@@ -456,7 +461,7 @@ class TestRasterPhaseTimings:
         resp = handler_mod.lambda_handler(event, MagicMock())
         assert resp["statusCode"] == 200, resp
         assert seen["stage_stats"] is None
-        assert "phase_timings" not in json.loads(resp["body"])
+        assert "stages" not in json.loads(resp["body"])["phase_timings"]
 
 
 class TestProcessRasterHiveMode:
@@ -521,6 +526,29 @@ class TestProcessRasterHiveMode:
         leaf = hive.shard_leaf_path(event["store_path"], event["shard_key"])
         stamp = hive.read_commit(leaf)
         assert stamp and stamp["spec"] == "morton-hive/1" and "window" not in stamp
+
+    def test_hive_leaf_gets_stats_sidecar(self, handler_mod, tmp_path):
+        # Issue #297: the raster hive worker writes the stats record SIBLING
+        # to the leaf .zarr, equal to the envelope's body["stats"], with
+        # invoked_by copied verbatim.
+        from zagg import hive
+        from zagg.telemetry import read_sidecar
+
+        event = self._hive_event(tmp_path)
+        event["invoked_by"] = {"arn": "arn:aws:iam::123:user/x", "userid": "AIDAEXAMPLE"}
+        resp = handler_mod.lambda_handler(event, MagicMock())
+        assert resp["statusCode"] == 200, resp
+        body = json.loads(resp["body"])
+        leaf = hive.shard_leaf_path(event["store_path"], event["shard_key"])
+        record = read_sidecar(leaf)
+        assert record == body["stats"]
+        assert record["schema_version"] == 1
+        assert record["success"] is True
+        assert record["invoked_by"] == event["invoked_by"]
+        assert record["n_granules"] == 1
+        # Always-on sample/write collection flows into the record.
+        assert {"sample", "write"} <= set(record["phase_timings"])
+        assert record["max_memory_mb"] is not None
 
     def test_hive_missing_params_omit_time_index(self, handler_mod):
         # A hive event needs no time_index: the 400 for an empty hive event

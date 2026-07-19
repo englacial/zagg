@@ -2,7 +2,16 @@
 
 import pytest
 
-from zagg.telemetry import SCHEMA_VERSION, build_record, granules_sha256, merge
+from zagg.telemetry import (
+    SCHEMA_VERSION,
+    build_record,
+    granules_sha256,
+    merge,
+    read_sidecar,
+    sidecar_key,
+    sidecar_path,
+    write_sidecar,
+)
 
 
 def _record(
@@ -160,3 +169,30 @@ class TestMerge:
         bad["schema_version"] = 2
         with pytest.raises(ValueError, match="schema_version"):
             merge([good, bad])
+
+
+class TestSidecarIO:
+    """The leaf sidecar is a SIBLING of the leaf ``.zarr`` (issue #297):
+    ``stats.json`` bare, ``stats_{window}.json`` windowed (a node dir holds
+    every window's leaf of its one shard)."""
+
+    def test_sidecar_key_bare_and_windowed(self):
+        assert sidecar_key("-4211322.zarr") == "stats.json"
+        assert sidecar_key("-4211322_20260713.zarr") == "stats_20260713.json"
+
+    def test_sidecar_path_is_sibling_not_inside_leaf(self):
+        leaf = "/root/-4/2/1/1/3/2/2/-4211322.zarr"
+        assert sidecar_path(leaf) == "/root/-4/2/1/1/3/2/2/stats.json"
+
+    def test_write_read_roundtrip(self, tmp_path):
+        leaf = str(tmp_path / "-4" / "2" / "-42.zarr")
+        rec = _record()
+        write_sidecar(leaf, rec)
+        assert read_sidecar(leaf) == rec
+        # Sibling object, never inside the leaf prefix.
+        assert (tmp_path / "-4" / "2" / "stats.json").exists()
+        assert not (tmp_path / "-4" / "2" / "-42.zarr").exists()
+
+    def test_read_absent_returns_none(self, tmp_path):
+        (tmp_path / "-4").mkdir()
+        assert read_sidecar(str(tmp_path / "-4" / "-4.zarr")) is None
