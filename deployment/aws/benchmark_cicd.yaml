@@ -140,8 +140,8 @@ Resources:
                   - lambda:GetFunctionConfiguration
                   - lambda:GetFunctionConcurrency
                 Resource:
-                  - !Sub "arn:aws:lambda:${AWS::Region}:${AWS::AccountId}:function:${BenchmarkFunctionName}"
-                  - !Sub "arn:aws:lambda:${AWS::Region}:${AWS::AccountId}:function:${TestFunctionName}"
+                  - !Sub "arn:aws:lambda:${AWS::Region}:${AWS::AccountId}:function:${BenchmarkFunctionName}*"
+                  - !Sub "arn:aws:lambda:${AWS::Region}:${AWS::AccountId}:function:${TestFunctionName}*"
               # Pre-flight worker-sizing probe (issue #28/#63 via concurrency.py);
               # these degrade gracefully but are needed for the guard to work.
               # Neither action supports resource-level scoping -> "*".
