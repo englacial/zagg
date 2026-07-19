@@ -195,6 +195,87 @@ class TestCostBlock:
         assert runner._worker_memory_gb(cfg) == 2.0
 
 
+class TestCostBlockEvents:
+    """Structured cost block on the tabular events path (issue #298).
+
+    The events path (``_run_lambda_events``) carries its own copy of the
+    phase-1 cost logic -- the pre-invoke ceiling, the ``memory_gb`` fed to the
+    ``LambdaExecutor``, the ``gb_seconds`` rollup, and the ``cost`` block -- so
+    it needs its own coverage; ``TestCostBlock`` only drives the spatial
+    ``_run_lambda``. Mocks mirror that harness: 3 events, each billing a 1 s
+    duration, no live AWS.
+    """
+
+    def _events(self, n=3):
+        return [{"event_key": f"e{i}", "event_mask_uri": f"s3://b/m{i}.npy"} for i in range(n)]
+
+    def _run(self, monkeypatch, cfg, n=3, duration=1.0):
+        monkeypatch.setattr(
+            runner,
+            "compute_available_workers",
+            lambda requested, *a, **k: (n, _report(n)),
+        )
+        monkeypatch.setattr(
+            runner,
+            "_invoke_lambda_event",
+            lambda client, ev, *a, **k: {
+                "status_code": 200,
+                "body": {"timesteps_processed": 1, "results": {}, "meta": {}},
+                "error": None,
+                "event_key": ev["event_key"],
+                "lambda_duration": duration,
+            },
+        )
+        # No real tabular write; return a sentinel path like the real writer.
+        monkeypatch.setattr(runner, "_write_tabular_output", lambda *a, **k: "s3://out/x.parquet")
+        return runner._run_lambda_events(
+            cfg,
+            self._events(n),
+            "s3://out/x.parquet",
+            max_workers=n,
+            region="us-west-2",
+            function_name="process-shard",
+            invocation="sync",
+        )
+
+    def _cfg(self):
+        from zagg.config import PipelineConfig
+
+        # output.format must be tabular (not the "zarr" default) to clear the
+        # temporal guard; mirrors the events-path seam test.
+        return PipelineConfig(output={"format": "parquet"})
+
+    def test_cost_block_shape_and_ceiling(self, lambda_env, monkeypatch):
+        from zagg.dispatch import LAMBDA_PRICE_PER_GB_SEC, max_cost_usd
+
+        summary = self._run(monkeypatch, self._cfg())
+        cost = summary["cost"]
+        # Ceiling: 3 events x 4 GB x 900 s, computable pre-invoke.
+        assert cost["max_cost_usd"] == pytest.approx(max_cost_usd(3, 4.0, timeout_s=900))
+        # Estimated stays a None placeholder until issues #297/#299 land.
+        assert cost["estimated_cost_usd"] is None
+        # Actual mirrors the legacy rollup key (3 x 1 s x 4 GB x rate).
+        assert cost["actual_cost_usd"] == pytest.approx(3 * 1.0 * 4.0 * LAMBDA_PRICE_PER_GB_SEC)
+        assert cost["actual_cost_usd"] == summary["estimated_cost_usd"]
+
+    def test_max_bounds_actual(self, lambda_env, monkeypatch):
+        # Even at the worst billed duration (the 900 s timeout), the pre-invoke
+        # ceiling bounds the rollup.
+        summary = self._run(monkeypatch, self._cfg(), duration=900.0)
+        cost = summary["cost"]
+        assert cost["max_cost_usd"] >= cost["actual_cost_usd"]
+
+    def test_worker_variant_prices_its_memory(self, lambda_env, monkeypatch):
+        # A worker: 8192 variant (issue #235) bills 8 GB in both the gb_seconds
+        # rollup and the ceiling -- guarding against a revert to flat 4 GB.
+        cfg = self._cfg()
+        cfg.worker = {"memory": 8192}
+        summary = self._run(monkeypatch, cfg)
+        assert summary["gb_seconds"] == pytest.approx(3 * 1.0 * 8.0)
+        base = self._run(monkeypatch, self._cfg())
+        assert summary["cost"]["max_cost_usd"] == pytest.approx(2 * base["cost"]["max_cost_usd"])
+
+
 class TestFdExhaustionSurfaces:
     def test_errno_24_in_future_reraised_with_guidance(self, lambda_env, monkeypatch):
         monkeypatch.setattr(
