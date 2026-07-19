@@ -2384,6 +2384,12 @@ def _run_lambda(
     logger.info(f"Processing {len(cells)} of {len(all_shards)} cells (lambda)")
 
     if dry_run:
+        # The pre-invoke cost ceiling is deliberately not surfaced here: the
+        # windowed-unit expansion below runs after this return, so a ceiling on
+        # the pre-windowing shard count would undercount temporal runs (wrong
+        # direction for an upper bound). The phase-2 CLI gate (issue #298) adds
+        # a precompute helper that expands units first and owns the dry-run
+        # ceiling; this path stays a pure shard/granule preview until then.
         return _dry_run_summary(cells, store_path)
 
     # Temporal fan-out (issue #246 phase 5): one work unit per (shard,
