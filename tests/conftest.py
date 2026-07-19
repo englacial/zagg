@@ -1,3 +1,5 @@
+import os
+
 import numpy as np
 import pandas as pd
 import pytest
@@ -60,17 +62,22 @@ def _no_s3_run_stats(monkeypatch):
     The dispatcher's run-level parquet write (issue #297) is fail-open in
     production, but a unit test driving a lambda-path harness with an
     ``s3://`` store path must not attempt a live PUT (ambient local
-    credentials could reach a real bucket). Local-path writes stay live so
-    the parquet wiring is still integration-tested; a test that wants the
-    s3 branch re-patches ``zagg.runner._write_run_stats`` itself.
+    credentials could reach a real bucket). Relative local store paths are
+    skipped too: tests using ``"./out.zarr"`` would otherwise scribble
+    accumulating ``stats_*.parquet`` files into the repo working directory.
+    Absolute ``tmp_path`` stores stay live so the parquet wiring is still
+    integration-tested; a test that wants the s3 branch re-patches
+    ``zagg.runner._write_run_stats`` itself.
     """
     from zagg import runner
 
     real = runner._write_run_stats
 
     def guard(store_path, rows, *, summary=None, **kwargs):
-        if str(store_path).startswith("s3://"):
-            # Skip the live PUT, but mirror the real helper's schema contract
+        sp = str(store_path)
+        if sp.startswith("s3://") or not os.path.isabs(sp):
+            # Skip the live PUT (real S3, or a relative path that would land in
+            # the repo cwd), but mirror the real helper's schema contract
             # (issue #297): a skipped write still leaves ``run_stats_path``
             # present (None), so the summary key set stays deterministic.
             if summary is not None:
