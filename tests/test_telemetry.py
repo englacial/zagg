@@ -154,6 +154,42 @@ class TestMerge:
         assert m["timestamp"] == max(a["timestamp"], b["timestamp"])
         assert m["success"] is True
 
+    def test_cost_fields_fold(self):
+        price = 0.0000133334
+        cfg_a = {"memory_mb": 4096, "arch": "aarch64", "function_variant": "zagg-process-shard"}
+        cfg_b = {"memory_mb": 2048, "arch": "aarch64", "function_variant": "zagg-process-shard"}
+        a = _record(1, duration=10.0, lambda_config=cfg_a)  # 40 gb-s
+        b = _record(2, duration=5.0, lambda_config=cfg_b)  # 10 gb-s
+        m = merge([a, b])
+        # _SUM_OR_NONE fold of populated cost: parts add.
+        assert m["gb_seconds"] == pytest.approx(50.0)
+        assert m["est_cost_usd"] == pytest.approx(50.0 * price)
+        # Differing lambda blocks collapse to None (absorbing identity).
+        assert m["lambda"] is None
+
+    def test_cost_fields_shared_lambda_survives(self):
+        cfg = {"memory_mb": 4096, "arch": "aarch64", "function_variant": "zagg-process-shard"}
+        a = _record(1, duration=10.0, lambda_config=cfg)
+        b = _record(2, duration=5.0, lambda_config=cfg)
+        m = merge([a, b])
+        assert m["lambda"] == cfg
+        # ... but as a defensive copy, not an alias of either input's dict.
+        assert m["lambda"] is not a["lambda"]
+        assert m["lambda"] is not b["lambda"]
+        assert m["gb_seconds"] == pytest.approx(60.0)  # (10+5) * 4096/1024
+
+    def test_cost_fields_mixed_populated_and_none(self):
+        price = 0.0000133334
+        cfg = {"memory_mb": 4096, "arch": "aarch64", "function_variant": "zagg-process-shard"}
+        metered = _record(1, duration=10.0, lambda_config=cfg)  # 40 gb-s
+        unmetered = _record(2, duration=5.0, lambda_config=None)  # gb_seconds None
+        m = merge([metered, unmetered])
+        # Only the populated record contributes to the sum.
+        assert m["gb_seconds"] == pytest.approx(40.0)
+        assert m["est_cost_usd"] == pytest.approx(40.0 * price)
+        # One populated + one None lambda block -> mismatch -> None.
+        assert m["lambda"] is None
+
     def test_identity_fields_collapse_to_none_on_mismatch(self):
         a = _record(1)
         b = _record(2, granules=("s3://b/g3.h5",))
