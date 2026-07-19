@@ -725,6 +725,16 @@ class ShardMap:
         # The dropped per-shard AOI mask (aoi_mask=None below) must not still be
         # advertised in the derived map's metadata.
         meta.pop("aoi_mask", None)
+        # This reproject ran no timed build, so the source build's timing must
+        # not describe the derived map.
+        meta.pop("build_wall_s", None)
+        if method == "refine":
+            meta["mortie_order"] = mortie_order
+        else:
+            # Coarsen is a pure regroup: no geometry backend and no order-based
+            # build ran, so the source's ``backend``/``mortie_order`` don't apply.
+            meta.pop("backend", None)
+            meta.pop("mortie_order", None)
         return ShardMap(target_grid.spatial_signature(), new_keys, new_granules, meta, None)
 
     def to_json(self, path: str) -> None:
