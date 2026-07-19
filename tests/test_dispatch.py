@@ -168,6 +168,14 @@ class TestMaxCostUsd:
     def test_zero_shards_costs_nothing(self):
         assert max_cost_usd(0, 4.0, timeout_s=900) == 0.0
 
+    def test_estimator_stub_returns_none(self):
+        # Phase-3 interface stub (pilot-first / regression tiers): always None
+        # until issues #297/#299 land the sidecar history it reads.
+        from zagg.dispatch import estimate_cost_usd
+
+        assert estimate_cost_usd() is None
+        assert estimate_cost_usd({"shard_keys": [1]}, template_hash="abc", history=[]) is None
+
     def test_run_report_cost_fields_default_none(self):
         # Local runs never stamp the block; the defaults must read as "no
         # metered cost", and finalize()'s empty-report contract still holds.
