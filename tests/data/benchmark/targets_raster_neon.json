@@ -1,31 +1,26 @@
 {
- "description": "Raster release benchmark targets (issue #250 restructure, espg-approved on PR #256): the Sentinel-2 pipeline over the NEON SERC AOP box, one year of 2025 datatakes, recorded PER RELEASE next to the point-pipeline leg (targets_full_aoi_neon.json). run_raster_benchmark.py builds the shardmap from the PINNED catalog catalogs/cat_s2_neon_2025.parquet (85 Earth Search c1 items, 2025-01-01..2025-12-31, the AOI-scoped STAC query espg's operational S2 SERC run pins) so the release harness runs offline (no STAC) and the granule set is FIXED across releases -- the series tracks CODE change, not catalog drift. Rebuild via zagg.catalog.sources.STACSource(assets=[red,green,blue,nir,scl], time_key=s2:datatake_id) over the AOI + year and Catalog.to_geoparquet. The harness owns its own per-shard mode=process_raster dispatch (profile: true) because zagg.runner's raster lambda transport does not thread profile or surface per-shard phase_timings; it captures the issue #249 stage set (open/geometry/fetch/decode/gather + write) per PR #256. Layout: the live leg is store_layout: hive -- the production default for HEALPix raster since issues #247/#253, with the #237 promotion ratified by @espg on issue #272 (the flat interop profile is deprecated). No strict AOI binary mask (issue #101 is point-path-only) -- the AOI scoping is the catalog's STAC-query clip.",
- "aoi": {
-  "file": "AOP_NEON.geojson",
-  "name": "NEON SERC AOP box"
- },
- "temporal": {
-  "start": "2025-01-01",
-  "end": "2025-12-31"
- },
- "dispatch": {
-  "region": "us-west-2",
-  "function_name": "process-shard",
-  "note": "Default dispatch target; the workflow overrides region/function from the shared BENCHMARK_* repo vars, exactly as the point-pipeline release leg does."
- },
- "targets": {
-  "raster_s2_neon_2025": {
-   "config": "configs/s2_neon_o9.yaml",
-   "catalog": "catalogs/cat_s2_neon_2025.parquet",
-   "pipeline": "raster",
-   "grid_type": "healpix",
-   "grid_size": "o9",
-   "collection": "sentinel-2-c1-l2a",
-   "worker": {
-    "memory": 4096,
-    "extra_disk": true
-   }
+  "description": "Raster release benchmark targets (issue #250 restructure, espg-approved on PR #256): the Sentinel-2 pipeline over the NEON SERC AOP box, one year of 2025 datatakes, recorded PER RELEASE next to the point-pipeline leg (targets_full_aoi_neon.json). run_raster_benchmark.py builds the shardmap from the PINNED catalog catalogs/cat_s2_neon_2025.parquet (85 Earth Search c1 items, 2025-01-01..2025-12-31, the AOI-scoped STAC query espg's operational S2 SERC run pins) so the release harness runs offline (no STAC) and the granule set is FIXED across releases -- the series tracks CODE change, not catalog drift. Rebuild via zagg.catalog.sources.STACSource(assets=[red,green,blue,nir,scl], time_key=s2:datatake_id) over the AOI + year and Catalog.to_geoparquet. The harness owns its own per-shard mode=process_raster dispatch (profile: true) because zagg.runner's raster lambda transport does not thread profile or surface per-shard phase_timings; it captures the issue #249 stage set (open/geometry/fetch/decode/gather + write) per PR #256. Layout: the live leg is store_layout: hive -- the production default for HEALPix raster since issues #247/#253, with the #237 promotion ratified by @espg on issue #272 (the flat interop profile is deprecated). No strict AOI binary mask (issue #101 is point-path-only) -- the AOI scoping is the catalog's STAC-query clip.",
+  "aoi": {
+    "file": "AOP_NEON.geojson",
+    "name": "NEON SERC AOP box"
+  },
+  "temporal": {
+    "start": "2025-01-01",
+    "end": "2025-12-31"
+  },
+  "dispatch": {
+    "region": "us-west-2",
+    "function_name": "process-shard",
+    "note": "Default dispatch target; the workflow overrides region/function from the shared BENCHMARK_* repo vars, exactly as the point-pipeline release leg does."
+  },
+  "targets": {
+    "raster_s2_neon_2025": {
+      "config": "configs/s2_neon_o9.yaml",
+      "catalog": "catalogs/cat_s2_neon_2025.parquet",
+      "pipeline": "raster",
+      "grid_type": "healpix",
+      "grid_size": "o9",
+      "collection": "sentinel-2-c1-l2a"
+    }
   }
- }
 }
-

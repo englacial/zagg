@@ -84,19 +84,6 @@ def run_target(
     if target.get("store_layout"):
         config.output["store_layout"] = target["store_layout"]
         validate_config(config)
-    # Worker-variant selection (issue #284): a raster target may pin the
-    # pre-provisioned worker variant so the release raster leg dispatches to the
-    # SAME function production runs (and the tdigest leg) use -- the disk-spill
-    # variant -- instead of the bare base. Mirrors run_benchmark.run_target's
-    # suffix resolution: base name + ``-<memory>`` + ``-disk`` when extra_disk.
-    # Absent -> the base function name, unchanged.
-    resolved_function_name = function_name
-    worker = target.get("worker")
-    if worker:
-        config.worker = dict(worker)
-        resolved_function_name = (
-            function_name + f"-{worker['memory']}" + ("-disk" if worker.get("extra_disk") else "")
-        )
     grid = from_config(config)
 
     cat = Catalog.from_geoparquet(str(_resolve(base, target["catalog"])))
@@ -109,7 +96,7 @@ def run_target(
     print(
         f"[{name}] shards={len(cells)} granules(total pairs)={sum(counts)} "
         f"per-shard={sorted(counts)} shardmap_build={build_s:.1f}s "
-        f"-> {resolved_function_name} @ {region}",
+        f"-> {function_name} @ {region}",
         flush=True,
     )
 
@@ -152,7 +139,7 @@ def run_target(
         backend="lambda",
         morton_cell=None,  # ALL shards over the AOI
         region=region,
-        function_name=resolved_function_name,
+        function_name=function_name,
         overwrite=True,
         profile=True,
         max_retries=1,  # a failed shard is a failure -- never re-pay (#119)
