@@ -181,7 +181,13 @@ def merge(records: Iterable[dict]) -> dict:
     out: dict[str, Any] = {"schema_version": SCHEMA_VERSION}
     for key in _EQ_OR_NONE_KEYS:
         first = records[0].get(key)
-        out[key] = first if all(r.get(key) == first for r in records) else None
+        if all(r.get(key) == first for r in records):
+            # Defensively copy dict values (``lambda``/``invoked_by``) so a
+            # rolled-up record never aliases a leaf's nested dict, mirroring
+            # build_record (issue #297).
+            out[key] = dict(first) if isinstance(first, dict) else first
+        else:
+            out[key] = None
     for key in _SUM_KEYS:
         out[key] = sum(r.get(key) or 0 for r in records)
     phase_timings: dict[str, float] = {}
