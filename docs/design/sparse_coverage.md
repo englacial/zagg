@@ -5,7 +5,12 @@ temporal-partitioning amendments (D13–D15) ratified on
 [#237](https://github.com/englacial/zagg/issues/237); morton-only-storage
 amendment ratified on
 [#262](https://github.com/englacial/zagg/issues/262) (D16; open item O10
-carved from it).
+carved from it); 2026-07 consolidation (D17–D22, O3 resolved, O11 opened)
+recording decisions settled on the
+[#251](https://github.com/englacial/zagg/issues/251)/[#236](https://github.com/englacial/zagg/issues/236)/[#209](https://github.com/englacial/zagg/issues/209)
+and [#296](https://github.com/englacial/zagg/issues/296)-family threads —
+per-entry provenance (thread-ratified vs in-session-recorded) is cited
+inline.
 
 > All design decisions (both made and open) are consolidated in the
 > [Decisions registry](#8-decisions-registry). Inline references use **D#** for
@@ -30,8 +35,9 @@ set of primitives answers all of them:
    this fine ICESat-2 observation, what GEDI observation contains it?"
    Because a morton decimal string prefix *is* the spatial ancestor, that
    join is **truncation** — arithmetic, not I/O.
-3. **xdggs assumes dense full-sphere coordinates.** The current `fullsphere`
-   layout materializes a coordinate entry for every cell of the global grid.
+3. **xdggs assumes dense full-sphere coordinates.** The legacy `fullsphere`
+   layout (deprecated, dense path removed in 0.x — D17) materialized a
+   coordinate entry for every cell of the global grid.
    For sparse-coverage data (a continent, a flight campaign) this is waste at
    best and intractable at global orders. The fix is a **domain declaration**:
    a coverage MOC conservatively declaring where data exists, letting the
@@ -51,12 +57,19 @@ what zagg consumes:
 
 ```
 {store_root}/
-  morton_hive.json               <- static manifest (§3); root-only exception
-  coverage.moc                   <- optional root MOC (§4, O9); root-only exception
-  {sign+base}/{d1}/{d2}/.../     <- one digit per level (D2)
-    {full_id}.zarr/              <- self-describing leaf (D3), vanilla zarr v3
-    {full_id}_{window}.zarr/     <- time-windowed leaf (D13); naming frozen on
-                                    the mortie spec page (morton-hive/2)
+  {hash}.morton_hive.json        <- per-product static manifest (§3, D19);
+                                    pre-D19 stores: a single morton_hive.json
+  {hash}.yaml                    <- template registry entry (D19)
+  coverage.moc                   <- optional root MOC (§4, O9)
+  <run records (parquet)>        <- run-level telemetry, one row/shard (D20)
+  {sign+base}/{d1}/{d2}/.../     <- one digit per level (D2; digit-chunking is
+                                    the manifest path_grouping param, D21)
+    {hash}.zarr/                 <- leaf, basename = template hash (D19;
+                                    pre-D19: {full_id}.zarr, D3); zarr v3,
+                                    dense arrays via ShardingCodec (D17)
+    {hash}_{window}.zarr/        <- time-windowed leaf (D13 grammar, D19 base)
+    {hash}.stats.json            <- per-shard stats sidecar, sibling (D20)
+    <sub-shardmap JSON>          <- leaf sub-map for sweep rollups (D22)
 ```
 
 - **Ids are morton decimal strings** (D1): sign + base digit (constant width,
@@ -64,10 +77,15 @@ what zagg consumes:
   `0`. String prefix = spatial ancestor at every level.
 - **One digit per path component** (D2), because shards live at mixed orders —
   across datasets *and* within a store (coarse shards in sparse regions) —
-  so every order must be a legal node.
+  so every order must be a legal node. D21 makes the digit-chunking a
+  declared manifest parameter (`path_grouping`, default `1` = this layout);
+  readers chunk the digit string per the manifest, never by assumption.
 - **Full morton id at the leaf** (D3): `.../1/2/3/-31123.zarr/` is
   self-describing without parsing its path, greppable in inventories,
-  unambiguous if moved.
+  unambiguous if moved. *Amended by D19*: leaf basenames become template
+  hashes — spatial identity lives in the path, product identity in the
+  basename; the greppable full id moves to the stamp attrs and the stats
+  sidecar's `shard_key` (D20).
 - **Time-windowed leaves** (D13, ratified on
   [#237](https://github.com/englacial/zagg/issues/237)): a store whose
   manifest declares a temporal window schedule (§3) partitions each shard's
@@ -86,13 +104,17 @@ what zagg consumes:
   debris rule (rationale on the #237 thread). Cross-window reads open W
   leaves and concatenate along time; paths stay arithmetic because the
   schedule lives in the manifest (D10 preserved). The no-partitioning
-  degenerate case (`schedule: none`) keeps the bare `{full_id}.zarr` name and
-  is byte-identical to the pre-D13 layout — a `morton-hive/1` store *is* a
-  `/2` store with `schedule: none`.
+  degenerate case (`schedule: none`) keeps the bare leaf name (pre-D19
+  `{full_id}.zarr`, byte-identical to the pre-D13 layout; post-D19
+  `{hash}.zarr` — the window grammar is unchanged either way) — a
+  `morton-hive/1` store *is* a `/2` store with `schedule: none`.
 - **Node invariant**: below the root, a node contains *only* digit children
-  (`[1-4]/`) and `*.zarr` objects. Nothing else, ever — the walker's child
-  classification depends on it. The root alone also carries the manifest and
-  MOC objects.
+  (`[1-4]/`), `*.zarr` objects, and the declared leaf-adjacent sidecars —
+  the per-shard stats record (D20) and the sub-shardmap JSON (D22) — with
+  nothing else, ever: the walker's child classification depends on the name
+  set being closed. The root alone also carries the manifest(s), the
+  template registry (`{hash}.yaml`, D19), MOC objects, and run-level
+  telemetry records (D20).
 - **Termination condition**: S3 has no empty directories (a prefix exists iff
   ≥1 object lies beneath it) and LIST is strongly consistent, so a
   delimiter-LIST returning no digit-shaped children is a definitive "nothing
@@ -136,8 +158,16 @@ again during a run. Contents:
   orders, the allowed set).
 - Split schedule (implicit under D2: one digit per level to `shard_order`;
   recorded explicitly for forward compatibility).
-- Pyramid declaration: which ancestor orders carry overview zarrs, and their
-  aggregation methods (populated/updated by the §7 sweep).
+- `path_grouping` (D21): how many morton digits each path component chunks.
+  Existing stores are retroactively `1`; new stores default `1`; changing the
+  default later is a parameter flip for new stores, never a schema break.
+- Rollup/pyramid declaration (D22 extends the original overview-only form):
+  which ancestor orders carry which derived artifact family — overview
+  zarrs, stats rollups, sub-shardmap rollups — declared **per artifact
+  family** (schedules may differ; display overviews as dense as rendering
+  warrants, metadata rollups sparser), populated/updated by the §7 sweep.
+  Tree shape (`path_grouping`) and rollup schedules are deliberately
+  decoupled.
 - **Temporal block** (D15, ratified on
   [#237](https://github.com/englacial/zagg/issues/237)): a store carrying this
   block declares `spec: "morton-hive/2"` (the version string of D6 covers these
@@ -151,9 +181,10 @@ again during a run. Contents:
   Generative schedules keep the manifest
   write-once and static as data accrues: appending a new year to a
   `yearly` store adds leaves the schedule already describes — no manifest
-  touch, and **no new manifests**: the store has exactly one
-  `morton_hive.json`, and each new windowed leaf brings only its own zarr
-  metadata + D4 stamp. The explicit-range-list form is the noted exception:
+  touch, and **no new manifests**: the store has exactly one manifest *per
+  product* (pre-D19: one `morton_hive.json` total; post-D19: one
+  `{hash}.morton_hive.json` per template hash), and each new windowed leaf
+  brings only its own zarr metadata + D4 stamp. The explicit-range-list form is the noted exception:
   appending a window outside the declared list re-templates the manifest (a
   rare, single-writer, template-time operation, not a worker-race write) —
   append-heavy stores should prefer generative schedules. (This exception is
@@ -300,9 +331,10 @@ millions of photons the walk is the robustness path, not the join path (D10).
 
 ## 6. Layer 4: the xarray/xdggs extension ("sparse DGGS")
 
-This is the layer that should eventually land upstream — in xdggs if the
-convention generalizes, or as its own xarray extension if not (O3). Broad
-scope:
+This layer ships as zagg's own standalone extension — **moczarr** (O3
+resolved: standalone-first, offered upstream; xdggs adoption of
+`MortonIndexDtype` ([#72](https://github.com/englacial/zagg/issues/72)) is a
+follow-on, not a gate). Broad scope:
 
 - **Domain = MOC.** A dataset declares its coverage as a MOC instead of
   materializing dense full-sphere coordinates. The accessor uses it to
@@ -330,6 +362,9 @@ Everything derived or stale-prone lives in a second pass, never at write time
 (D11) — overviews aggregate across worker-shard boundaries, so they *can't*
 be produced by shard workers anyway.
 
+The sweep owns four derived artifact families (D22; the original scope was
+the first two):
+
 - **Overview zarrs at ancestor nodes**, explicitly marked
   (`role: overview` + source order + aggregation method in attrs). Never
   inferred from position: a shallow zarr may equally be *coarse source* in a
@@ -337,13 +372,30 @@ be produced by shard workers anyway.
   (4 children per order).
 - **MOC (re)generation** — compose ancestor MOCs bottom-up from the leaf
   stamps (union, re-coarsen to budget) and refresh the root `coverage.moc`.
+- **Sub-shardmap rollups** (D22): each leaf prefix carries its shard's
+  sub-map as full ShardMap JSON; the sweep folds them up-tree via the
+  coarsen path (`ShardMap.reproject` — exact pure regroup, granule union
+  deduped by id; [#294](https://github.com/englacial/zagg/issues/294)).
+- **Stats/cost rollups** (D22): the per-shard stats sidecars (D20) fold
+  up-tree — the schema is associative by construction, so the rollup is the
+  same fold shape as the pyramid.
 - **Optional interop materialization**: if a use case ever demands a
   `zarr.open(store_root)`-able hierarchy or a one-GET consolidated index,
   the sweep generates it *as a derived artifact* here. Round one ships
   without it (D12).
 
+Every rollup is stamped with **generation info** (merged-leaf count + max
+leaf timestamp): after a leaf re-run, ancestors are *detectably* stale —
+staleness is detected, not prevented, and rollups are regenerated
+opportunistically (D9 semantics). The core test obligation is
+**rollup == direct**: the folded artifact at level N must equal direct
+computation at level N, for every family. Triggering is an end-of-run
+dispatcher hook plus a manual CLI; the sweep discovers work from the run
+record, not by listing.
+
 The sweep is idempotent and can fail or lag without corrupting anything: the
-write path (§2) is load-bearing; this phase is optimization.
+write path (§2) is load-bearing; this phase is optimization — deleting every
+rollup leaves all leaf reads intact.
 
 ## 8. Decisions registry
 
@@ -359,8 +411,14 @@ write path (§2) is load-bearing; this phase is optimization.
   Grouped-digit and two-level schedules are dead ends. Note the schedule is
   *logical only*: S3 partitioning is delimiter-blind, so slashes buy zero
   throughput ([#197](https://github.com/englacial/zagg/issues/197) is the
-  throughput fix).
+  throughput fix). *Amended by D21*: digit-chunking becomes the declared
+  `path_grouping` manifest parameter (default `1` = this rule); the
+  "grouped-digit schedules are dead ends" verdict is thereby softened to
+  "grouping is a parameter, never a schema fork."
 - **D3 — Full morton id at the leaf** (`{full_id}.zarr`), self-describing.
+  *Amended by D19*: basename becomes the template hash; spatial identity is
+  the path, product identity the basename, and the full id moves to stamp
+  attrs + the D20 sidecar's `shard_key`.
 - **D4 — Commit stamp via final root-attrs update.** Absence (LIST) is
   trustworthy; presence requires the stamp. Torn shards are debris,
   overwritable on retry. One small PUT; not consolidation.
@@ -377,9 +435,16 @@ write path (§2) is load-bearing; this phase is optimization.
   write access). Replaces consolidated metadata (disabled; measured
   +70 s/worker).
 - **D9 — MOC is a regenerable cache; the tree walk is ground truth.**
-- **D10 — Arithmetic-first reads; no LISTs in join loops.**
+- **D10 — Arithmetic-first reads; no LISTs in join loops.** *Strengthened
+  with D22 (espg-ratified in-session, recorded on
+  [#300](https://github.com/englacial/zagg/issues/300#issuecomment-5017464707)):
+  MOC-first is the reader contract — full recursive enumeration is
+  **out-of-contract** for readers, reserved for prefix-sharded audit
+  tooling. The §5 discovery walk remains the robustness/verification path,
+  never the read path.*
 - **D11 — Pyramids/overviews are a second-pass sweep**, `role: overview`
-  attrs, never inferred from tree position.
+  attrs, never inferred from tree position. *Scope extended by D22 (four
+  artifact families, generation stamps, per-family manifest schedules).*
 - **D12 — Plain manifest, not a zarr-native hierarchy, in round one.**
   Hierarchy metadata at nodes reintroduces the metadata-op storm
   ([#189](https://github.com/englacial/zagg/issues/189),
@@ -403,7 +468,9 @@ write path (§2) is load-bearing; this phase is optimization.
   `{full_id}_{window}.zarr`, underscore separator, split on the first `_`
   — grammar and boundary semantics recorded on the
   [mortie spec page](https://github.com/espg/mortie/issues/62#issuecomment-4986809092)
-  as part of `morton-hive/2`. Reserved (lean, not decided): §7
+  as part of `morton-hive/2`. (*D19 swaps the `{full_id}` base for
+  `{hash}`; the underscore grammar and window semantics are unchanged — the
+  spec-page update rides the D19 break.*) Reserved (lean, not decided): §7
   overview/pyramid zarrs inherit window naming (per-window overviews, with
   an optional all-time overview as a derived artifact).
 - **D14 — Coverage `encoding: "full"` fast path**
@@ -462,6 +529,112 @@ write path (§2) is load-bearing; this phase is optimization.
   separately ratified on the thread.) The order-29 discriminator
   metadata is O10.
 
+- **D17 — Hive+sharded is the HEALPix default; flat/fullsphere deprecated;
+  dense leaf arrays write through the ShardingCodec.**
+  (Phase-1 ratification recorded on
+  [#251](https://github.com/englacial/zagg/issues/251#issuecomment-4989697559);
+  landed via PR #257 (default flip + dense-layout removal), #233 (`sharded:
+  true` default), #241 (hive dense parity); leaf object model ratified
+  in-session, recorded on
+  [#236](https://github.com/englacial/zagg/issues/236#issuecomment-4986241727).)
+  Every HEALPix config — point aggregation and raster — targets hive; the
+  grid determines the layout (no `store_layout` knob survives, #238); rect
+  keeps its bounded flat store. Hive leaf dense arrays are one object per
+  array per leaf via the ShardingCodec (always-accumulate); `sharded: false`
+  remains a legitimate opt-out, and **raster leaves skip the sharding codec
+  by design** — the only raster/aggregation difference at the leaf
+  ([espg on PR #257](https://github.com/englacial/zagg/pull/257#issuecomment-5005249126)).
+  `grid.shard_order` (sub-shard object granularity) is removed
+  ([#238](https://github.com/englacial/zagg/issues/238#issuecomment-4986885796));
+  the manifest's `shard_order` (tree/dispatch order) is unrelated and stays.
+  Full flat-machinery removal remains gated on the O3 reader (the #251
+  phase-2 gate).
+- **D18 — Ragged output = sharded vlen-bytes** (espg-ratified in-session,
+  recorded on
+  [#209](https://github.com/englacial/zagg/issues/209#issuecomment-4940116927);
+  tracking [#210](https://github.com/englacial/zagg/issues/210)). Ragged
+  t-digest arrays store as `bytes` dtype + vlen-bytes codec under the
+  ShardingCodec — one object per shard, 2-GET single-cell reads — with
+  element interpretation as an attrs convention and a **golden-bytes framing
+  pin** byte-compatible with numcodecs `VLenArray`. The CSR-per-inner-chunk
+  fanout is deleted. A typed `vlen-array<float32>` ZDType is deferred behind
+  three gates (upstream zarr-extensions convergence, at-scale proof, a
+  second consumer); the framing pin guarantees any future migration is
+  metadata-only. This is the second noted soft-exception to "vanilla zarr
+  v3" leaves (after the §4 coverage sidecar): plain zarr readers see opaque
+  bytes, not garbage.
+- **D19 — Template-hash leaf naming: the hive tree is a multi-product
+  store** (settled across
+  [#296](https://github.com/englacial/zagg/issues/296#issuecomment-5014826849)
+  and [#299](https://github.com/englacial/zagg/issues/299); espg on-thread:
+  [naming + registry + per-product manifests](https://github.com/englacial/zagg/issues/299#issuecomment-5017263033);
+  breaking, pre-1.0, same window as the D16 writer flip). Leaf basename =
+  truncated sha256 (12 hex; collision domain is templates-within-one-store)
+  of the **canonicalized** agg template (parse YAML → sorted-key JSON →
+  hash; never raw bytes). Products colocate as siblings under one morton
+  prefix; discovery is a prefix listing. The template itself is written to
+  the store root as `{hash}.yaml` — a content-addressed registry designed so
+  a future external/community registry is a pure file-merge superset.
+  Manifests go per-product (`{hash}.morton_hive.json`; root listing is
+  product discovery). **Catalog identity lives in the sidecar, never the
+  name**: granule count + sha256 of sorted granule ids + zagg version;
+  dedup/`has_run` consults name *and* sidecar (a catalog-grown shard is
+  "stale", not "hit") — the template hash alone proves identity only for a
+  frozen catalog. Immutable-provenance naming
+  (`{hash}+{catalog-hash}.zarr`) is an opt-in for frozen-catalog archival
+  runs; default stays template-hash-only. The output content hash that
+  makes dedup *verifiable* is O11 (proposal). Old-layout stores must fail
+  loudly, never misread.
+- **D20 — Per-shard telemetry sidecar + run records** (espg on-thread:
+  [sibling placement + envelope ride](https://github.com/englacial/zagg/issues/297#issuecomment-5016910923),
+  [caller identity](https://github.com/englacial/zagg/issues/297#issuecomment-5016901381);
+  schema decisions recorded on
+  [#296](https://github.com/englacial/zagg/issues/296#issuecomment-5014826849)).
+  Each successful shard writes a versioned stats record as a **sibling**
+  object next to the leaf (not inside the `.zarr/`): timings
+  (read/index/aggregate/write/spill), counts, memory, cost (GB-s ×
+  price), catalog identity (D19), zagg version, and `invoked_by` (caller
+  identity resolved once per run by the dispatcher via STS and stamped
+  through the invoke payload — workers cannot see the caller). The schema
+  is **mergeable by construction** — only associative stats (counts, sums,
+  min/max, t-digests; never stored means) — so up-tree rollups are a pure
+  fold (D22). The record also rides the async result envelope; the
+  dispatcher writes a **run-level parquet at the store root** (one row per
+  shard, *including failure rows* sourced from the run report — sidecars
+  exist only on success; CloudWatch structured logs remain the failure
+  forensics channel). Sidecars omit account-identifying fields (request
+  ids, ARNs beyond the caller identity).
+- **D21 — `path_grouping` is a manifest parameter, not a layout**
+  (espg-ratified in-session, recorded on
+  [#300](https://github.com/englacial/zagg/issues/300#issuecomment-5017464707)).
+  The manifest declares how many morton digits each path component chunks;
+  existing stores are retroactively `1`; new stores default `1`; readers
+  chunk the digit string per the manifest. Rationale: hive paths are
+  *computed* (manifest + MOC → arithmetic paths → parallel GETs — zero
+  LISTs on every hot path), so grouping is walk ergonomics, not
+  performance; hard-adopting a grouped layout would have forked the path
+  dialect permanently for ~$1.60 and ~1.6 s per rare full walk. A future
+  default flip (e.g. to 3-order groups) is a parameter change, never a
+  schema break.
+- **D22 — One unified second-pass sweep owns all derived artifacts**
+  (espg on-thread:
+  [trigger + sub-map format + schedule discussion](https://github.com/englacial/zagg/issues/300#issuecomment-5017291722);
+  schedule decoupling ratified in-session, recorded on
+  [#300](https://github.com/englacial/zagg/issues/300#issuecomment-5017464707)).
+  Four families — overview zarrs, MOC regen, sub-shardmap rollups (full
+  ShardMap JSON at leaf prefixes, folded via the exact coarsen regroup,
+  [#294](https://github.com/englacial/zagg/issues/294)), stats rollups
+  (D20 fold) — in one idempotent pass with per-family, manifest-declared
+  order schedules (decoupled from `path_grouping`). Generation stamps
+  (merged-leaf count + max leaf timestamp) make staleness detectable, not
+  prevented; **rollup == direct** is the standing test obligation per
+  family; trigger is end-of-run hook + manual CLI; the sweep discovers work
+  from the run record, never by listing. Nothing is load-bearing: deleting
+  every rollup leaves leaf reads intact (D9 semantics). (The refine
+  direction of `ShardMap.reproject` and its no-region semantics are still
+  under review on PR #295 — the sweep depends only on the exact coarsen
+  direction.)
+
 ### 8.2 Open for review (input needed)
 
 - **O1 — MOC serialization format** for `coverage.moc`: JSON of nested-range
@@ -472,9 +645,14 @@ write path (§2) is load-bearing; this phase is optimization.
   `MAX_DEPTH = 18` constant, not a u64 limit; the coverage/MOC paths now
   reach the packed-u64 kernel ceiling (order 29), so cell-order MOCs at
   order 19 are representable today.
-- **O3 — Upstream target**: extend xdggs vs. standalone xarray extension.
-  Depends partly on xdggs's appetite for MortonIndexDtype (#72) and
-  non-dense coordinate models.
+- **O3 — Upstream target: RESOLVED — standalone-first (moczarr)**
+  ([espg-ratified, recorded on
+  #251](https://github.com/englacial/zagg/issues/251#issuecomment-4989697559)):
+  the sparse-DGGS reader ships as zagg's own standalone xarray extension
+  (espg/moczarr, published from our side and offered upstream); xdggs
+  adoption of MortonIndexDtype (#72) is a follow-on, not a 1.0 gate.
+  Near-drop-in `xr.open_zarr()`-grade ergonomics is a hard acceptance
+  criterion (it gates the #251 flat removal).
 - **O4 — Multi-dataset join API**: what does the cross-resolution join look
   like in xarray terms — alignment, an accessor method, a lazy index?
 - **O5 — Sentinel-2 encoding**: native ~10 m order, one order finer (6 m,
@@ -526,6 +704,21 @@ write path (§2) is load-bearing; this phase is optimization.
   documented point-id/area-word parse non-injectivity at order 29; field
   name, values, and placement to be frozen with the mortie spec page
   ([mortie#62](https://github.com/espg/mortie/issues/62)).
+- **O11 — logical content hash of outputs** (carved from D19; **proposal
+  awaiting espg sign-off** — espg asked for expanded context on
+  [#299](https://github.com/englacial/zagg/issues/299#issuecomment-5017263033),
+  expansion posted
+  [in reply](https://github.com/englacial/zagg/issues/299#issuecomment-5017334704)).
+  Proposal: per-array sha256 over *decoded* values (raw C-order bytes at the
+  declared dtype, after decompression — never stored object bytes, which
+  churn on codec/library upgrades), recorded in the D20 sidecar as
+  `{array_name: hash}` plus one combined hash. Exact bytes, no float
+  tolerance: any value change — including flagged code changes that pass
+  `np.isclose` (the PR #282 class) — flips the hash by design;
+  interpretation pairs the hash with the sidecar's recorded zagg version.
+  Motivation: outputs have been byte-identical between runs in practice, so
+  this turns D19's "probably already ran" dedup into a verifiable claim
+  without folding catalog identity into leaf names.
 
 ## 9. References
 
