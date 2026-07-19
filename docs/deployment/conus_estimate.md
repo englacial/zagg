@@ -1,36 +1,47 @@
 # CONUS cost estimate (issue #202, leg 4)
 
-> **Recommendation: order 9 at 4 GB.** o9 is the only order that runs CONUS
-> cleanly today (25/25 shards, RSS ≤ 2.5 GB). Coarser orders (o8/o7) would
-> amortise per-shard overhead but hit a **memory wall** that has two layers
-> (§4c): the pooled read pool (fixable — `aggregation.streaming` bounds it, and
-> it rescues *most* o8 shards) and the **per-cell t-digest state**, which is held
-> for the whole shard and is the hard floor — for the densest o8 shards it exceeds
-> 4 GB at *any* buffer. **Chunk-scoped digest streaming** (bound the digest state
-> to one inner chunk, not the whole shard) is the architectural fix that would
-> unlock o8/o7; a code-feasibility pass scopes it as a moderate-to-deep refactor (§4c, tracked in #217). Until it lands, o9 is the operating point.
+> **Recommendation: order 9 at 4 GB is the default operating point; order 8 is now
+> tractable too (via spill).** As of **0.36.0**, both orders run CONUS cleanly on
+> `process-shard-4096-disk` (4 GB RAM + ephemeral spill disk), **hive + sidecar +
+> spill** — all 25 o9 *and* all 25 o8 stratified shards finish under the 900 s
+> worker at 4 GB. **`streaming_mode: spill` is what unlocked o8**: it spills photons
+> to on-disk partitions so the whole-shard t-digest state no longer has to sit in
+> RAM (the architectural fix §4c anticipated as #217). o8 would **OOM without it**.
+> The residual caveat is memory *headroom*, not failure: the densest o8 shards peak
+> at **~3.7 GB of 4 GB RAM** (§4c), so an **8 GB-RAM o8 arm** is worth adding for
+> margin. o9 keeps a comfortable ~1.5 GB peak and is the safe default; o8 costs less
+> in total (fewer, larger shards) and is the coarsening win once the 8 GB arm lands.
 
 **This is an estimate, not a benchmark result.** We are *not* running CONUS. This
 document sizes what a full contiguous-US (lower-48) ATL03 aggregation *would*
-cost, from (a) the real CONUS order-9 shard map we build offline and (b) per-shard
-cost regressions fit from **measured 0.24.0 Lambda data** (25 stratified CONUS
-shards, both read modes, §4b). All numbers are at zagg 0.24.0 — the **sharded**
-t-digest write (issues #209 / #211), so the pre-#211 write bloat is already gone.
+cost, from (a) the real CONUS order-9 and order-8 shard maps we build offline and
+(b) per-shard cost regressions fit from **measured 0.36.0 Lambda data** (25
+stratified CONUS shards per order, §4b). All numbers are at zagg 0.36.0 —
+**hive + sidecar + spill** on the `process-shard-4096-disk` worker, with the
+**sharded** t-digest write (issues #209 / #211, so the pre-#211 write bloat is
+gone) and the **#287/#288 store-cache fix**. Each order was run in two passes:
+**v035** (cold sidecar cache, pre-#288) and **v036** (warm cache + the #288 fix —
+the current-code numbers and the headline below).
 
-> **Headline: order 9 at 4 GB is the operating point — the only order that runs
-> CONUS cleanly today.** Coarser orders (o8/o7) would amortise per-shard overhead
-> but hit a memory wall driven by **cell-coverage density, not granule count**
-> (§4c). Streaming the reads (`aggregation.streaming`) rescues *most* o8 shards at
-> 4 GB, but the whole-shard **per-cell t-digest state** is a buffer-independent
-> floor that exceeds 4 GB for the densest o8 shards — o7 OOMs outright.
-> Chunk-scoping that digest state would unlock coarser orders (scoped as a
-> moderate-to-deep refactor, §4c / #217); until then o9 is the recommendation. The remaining
-> upper-bound lever on the o9 total is the #65 swath over-assignment (§4d).
+> **Headline: o9 at 4 GB is the default operating point, o8 is newly tractable via
+> spill.** Both orders complete all 25 stratified shards under 900 s at 4 GB. Peak
+> RSS is driven by **cell-coverage density, not granule count** (§4c): o9 peaks
+> ~1.5 GB, o8 peaks ~3.7 GB on its densest-coverage shards — `spill` keeps that
+> under 4 GB where 0.24.0 pooling OOM'd. The **#288 store-cache fix** trims ~4–5 %
+> off both orders at CONUS's ~80–210-granule scale (small here; decisive at the 88S
+> pole — different regime, ref #148). The remaining upper-bound lever on the totals
+> is the #65 swath over-assignment (§4d).
 
-| Order 9 @ 4 GB (measured) | cost (95 % CI) | wall @ 2,000 workers |
-| --- | ---: | ---: |
-| **First run** (cold, `inline` uncached reads) | **$471** ($406–536, ±14 %) | **~1.2 h** |
-| **Repeat** (warm, `sidecar` cached reads) | **$419** ($367–472, ±13 %) | **~1.1 h** |
+| 0.36.0 @ 4 GB, warm + #288 (v036) | cost (95 % CI) | wall @ 2,000 workers | peak RSS |
+| --- | ---: | ---: | ---: |
+| **Order 9** (49,285 shards) | **$379** ($339–419, ±11 %) | **~1.0 h** | ~1.5 GB |
+| **Order 8** (12,596 shards) | **$211** ($180–243, ±15 %) | **~0.6 h** | ~3.7 GB |
+
+Before the #288 store-cache fix (v035, cold cache): o9 **$394** ($351–437), o8
+**$223** ($192–255) — the fix is worth ~4 % (o9) / ~5 % (o8) on the full-CONUS
+total (§4b). For reference, the prior 0.24.0 o9 estimate quoted first-run (cold
+`inline`) **$471** and repeat (warm `sidecar`) **$419**; the 0.36.0 warm+fix o9
+operating point is **$379**.
 
 Everything here is reproducible offline from the committed artifacts (the dollar
 totals additionally require the measured regression JSONs under
@@ -44,8 +55,9 @@ totals additionally require the measured regression JSONs under
 | `data/conus/conus_shard_granule_counts.parquet` | per-shard granule-count table (the load-bearing artifact) |
 | `data/conus/conus_shard_stats.json` | summary stats + granule distribution |
 | `data/conus/select_regression_shards.py` | stratified <=25-shard regression-training plan |
-| `data/conus/run_conus_regression.py` | billed cold/warm dispatch driver (`--index-backend inline` / sidecar) |
-| `data/conus/estimate_with_ci.py`, `conus_final_estimate.py` | apply the fits to the CONUS distribution with a 95 % interval |
+| `data/conus/run_conus_regression.py` | billed dispatch driver (hive + sidecar + spill) |
+| `data/conus/results/conus_o{8,9}_v0{35,36}.json` | measured 25-shard 0.36.0 per-shard records (v035 cold cache / v036 warm + #288) |
+| `data/conus/conus_final_estimate.py` | applies each order's v035/v036 fit to the CONUS distribution with a 95 % interval |
 
 ## 1. Polygon reference
 
@@ -110,114 +122,148 @@ smooths out. Rendered from the committed shard maps by
 
 ## 3. Per-shard granule-count distribution
 
-The regression's input variable is granules-per-shard. The full distribution is
-in `data/conus/conus_shard_stats.json`; the per-shard table is
-`data/conus/conus_shard_granule_counts.parquet`.
+The regression's input variable is granules-per-shard. The full distributions are
+in `data/conus/conus_shard_stats.json` (o9) and `conus_shard_stats_o8.json` (o8);
+the per-shard tables are `conus_shard_granule_counts.parquet` /
+`conus_shard_granule_counts_o8.parquet`.
 
 <!-- CONUS_DISTRIBUTION_TABLE -->
-| Statistic | Granules/shard |
-| --- | ---: |
-| min | 21 |
-| median | 70 |
-| mean | 72.24 |
-| p90 | 84 |
-| p99 | 99 |
-| max | 144 |
+| Statistic | o9 granules/shard | o8 granules/shard |
+| --- | ---: | ---: |
+| min | 21 | 43 |
+| median | 70 | 111 |
+| mean | 72.24 | 112.07 |
+| p90 | 84 | 122 |
+| p99 | 99 | 141 |
+| max | 144 | 211 |
+| total shards | 49,285 | 12,596 |
+| total (shard, granule) pairs | 3,560,313 | 1,411,589 |
 
-**The distribution is sharply peaked**: ~99 % of CONUS o9 shards carry 50–100
-granules (median 70), a thin tail to 144, a handful below 50 — the mid-latitude
-regime (no polar RGT convergence). Consequences for the regression:
+**Both distributions are sharply peaked** (the mid-latitude regime — no polar RGT
+convergence): ~99 % of o9 shards carry 50–100 granules (median 70), a thin tail to
+144; o8 (4× the area) roughly doubles that to a median 111, tail to 211. The
+stratified regression sample spans the realised band at each order (o9 21–144, o8
+43–211). Consequences for the regression:
 
-- Every CONUS o9 shard runs well under the 900 s timeout, so **no shard is
-  excluded** from the regression-training selection (0 excluded).
-- The fit is an **interpolation** across the realised 21–144 granule band, not an
-  extrapolation. But granule count is a *noisy* predictor (§4b, R² 0.60–0.72):
-  per-shard observation density swings ~10× (surface brightness × crossing
-  geometry), so the totals carry a **±13–14 % interval**, not a point quote.
+- Every measured shard at both orders runs well under the 900 s timeout (o9 max
+  347 s, o8 max 672 s), so **no shard is excluded** from the training selection —
+  o8 running to completion at 4 GB is new in 0.36.0 and depends on `spill` (§4c).
+- The fit is an **interpolation** across the realised granule band, not an
+  extrapolation. But granule count is a *noisy* predictor (§4b): o9 fits cleanly
+  (R² ~0.79) for a **±11 %** interval; o8's total is intercept-dominated (spill's
+  fixed per-shard overhead) with a noisier slope (R² ~0.32) → a **±15 %** interval.
 
 ## 4. Operational-cost model
 
-Cost is accounted in **four columns** with **Lambda GB-second the primary**, for
-**two read scenarios** applied across every CONUS o9 shard (per espg):
+Cost is accounted in **four columns** with **Lambda GB-second the primary**,
+applied across every CONUS shard at each order. The 0.36.0 runs fix the config
+(**hive + sidecar + spill**, `process-shard-4096-disk`) and vary only the cache
+state across two passes (per espg):
 
-- **First run (cold)** — `inline` index backend: reads are genuinely uncached
-  (byte-range HDF5 every invoke), **cache-independent**. This is the realistic
-  one-shot / first-pass read cost.
-- **Repeat (warm)** — `sidecar` index backend: reads hit the prebuilt
-  granule-keyed chunk manifests, so a re-run is cheaper. The manifest cache is
-  built once (a small one-time write, now that #211 collapses the ragged t-digest
-  to one object/shard); every subsequent reprocess is warm.
+- **v035 (cold cache, pre-#288)** — first-pass read cost with a cold sidecar
+  cache and the pre-#288 store-cache behaviour.
+- **v036 (warm cache + #288 fix)** — the current-code operating point: warm
+  granule-keyed chunk manifests plus the #287/#288 store-cache fix. **This is the
+  headline.**
 
-Each scenario has its **own** measured regression (§4b), applied to the CONUS
-per-shard granule counts and summed.
+Each order fits its **own** measured regression per pass (§4b), applied to that
+order's CONUS per-shard granule counts and summed. Primary GB-s totals (v036):
 
-| Cost column | What it counts | First run (cold) | Repeat (warm) |
+| Cost column | What it counts | Order 9 (v036) | Order 8 (v036) |
 | --- | --- | ---: | ---: |
-| **Lambda GB-s** (primary) | `Σ λ-seconds × 4 GB × $0.0000133334/GB-s`, via the per-scenario regression (§4b) | 35.3 M GB-s ≈ **$471** | 31.4 M GB-s ≈ **$419** |
-| **S3 PUT/GET** | output PUTs (now **1 t-digest object/shard** post-#211, no write storm) + one-time sidecar-manifest write on the first sidecar run; GETs are granule byte-range reads (NSIDC bucket) | small one-time (sharded write) | ~$0 (no sidecar/CSR re-write) |
+| **Lambda GB-s** (primary) | `Σ λ-seconds × 4 GB × $0.0000133334/GB-s`, via the per-order regression (§4b) | 28.4 M GB-s ≈ **$379** | 15.9 M GB-s ≈ **$211** |
+| **S3 PUT/GET** | output PUTs (hive: K objects/shard; still no write storm post-#211) + one-time sidecar-manifest write on the first pass; GETs are granule byte-range reads (NSIDC bucket) | small one-time | small one-time |
 | **CMR / catalog build** | one-time STAC/geoparquet catalog build (offline/local for CONUS) | ~$0 | ~$0 |
-| **CloudWatch / logs** | ~one log stream per shard × 49,285 | ~$1–3 | ~$1–3 |
+| **CloudWatch / logs** | ~one log stream per shard | ~$1–3 | ~$1 |
 
-The repeat cache saves **~$52/run (11 %)** on reads. The pre-#211 cold **S3 PUT
-storm (~$440, ~1,792 objects/shard)** is **gone** — sharding writes one t-digest
-object per shard, so the write phase no longer dominates cold.
+**o8 costs less in total than o9** despite peaking hotter on RAM: 12,596 shards
+vs 49,285 amortises the per-shard overhead over ~4× fewer, larger dispatch units,
+so the ~$211 o8 total undercuts o9's ~$379 — the coarsening win (§4c). o8 carries
+a wider interval (±15 % vs ±11 %) because spill's fixed per-shard overhead
+dominates its fit (§4b).
 
-**Why the cache is only ~11 % here (it caches the *index*, not the data).** The
-sidecar persists each granule's **chunk map** (which HDF5 byte-ranges to read), so
-it eliminates only the per-shard **index-build** phase — the fits show the cache
-cutting the per-shard intercept from **37.9 → 12.6 s** (~25 s/shard) while leaving
-the per-granule slope unchanged (~2 s/gran): the photon read itself is uncached
-either way. At CONUS o9 density (~70 granules/shard) the per-granule read (~140
-s/shard) dwarfs that ~25 s, so caching the index caps the win at ~11 % of the
-total. Two caveats on comparing to earlier testing: (1) **cold here is `inline`**
-(the compiled hidefix path, which already builds the chunk map fast) — the cache's
-larger value shows against the slow `hierarchical` pure-h5coro baseline; (2)
-sparser test shards make the fixed index a bigger fraction of the bill, whereas
-CONUS's dense shards are read-bound.
+**The #288 store-cache fix is small at CONUS scale (~4–5 %).** The sidecar caches
+the *index* (each granule's chunk map / HDF5 byte-ranges), not the photon data, so
+it only trims the per-shard index-build phase — worth ~0.3 s/granule at CONUS's
+~80–210-granule scale. At that density the photon read dominates, and concurrent
+25-shard S3/Lambda contention swamps the per-shard saving (see the per-shard noise
+in §4b). It is **decisive at the 88S pole instead** — a different, index-bound
+regime (ref #148). The pre-#211 cold **S3 PUT storm** is long gone; the write phase
+never dominates at either order.
 
 ### 4a. Wall-clock at scale
 
 Idealised perfect-packing wall = `Σ λ-seconds / N_workers`, floored by the slowest
-single shard (~400 s / 7 min for o9 — throughput-bound, not concurrency-bound):
+single shard (o9 ~347 s, o8 ~672 s — throughput-bound, not concurrency-bound). At
+the v036 operating point:
 
-| scenario | Σ λ-seconds | **wall @ 2,000 workers** | wall @ 1,000 workers |
+| order (v036) | Σ λ-seconds | **wall @ 2,000 workers** | wall @ 1,000 workers |
 | --- | ---: | ---: | ---: |
-| First run (cold) | 8.83 M | **~1.2 h** (74 min) | ~2.5 h |
-| Repeat (warm) | 7.86 M | **~1.1 h** (66 min) | ~2.2 h |
+| Order 9 | 7.10 M | **~1.0 h** (59 min) | ~2.0 h |
+| Order 8 | 3.96 M | **~0.6 h** (33 min) | ~1.1 h |
 
-**2,000 concurrent is above the current 1,000-per-account Lambda limit** — it
-assumes a limit increase; at the default 1,000 the walls are ~2.5 h / ~2.2 h.
+o8's coarser tiling means fewer total λ-seconds (fewer, larger shards), so its
+wall is shorter despite ~2× the per-shard runtime. **2,000 concurrent is above the
+current 1,000-per-account Lambda limit** — it assumes a limit increase; at the
+default 1,000 the walls are ~2.0 h (o9) / ~1.1 h (o8).
 
-### 4b. Regression — measured (25-shard CONUS dispatch, zagg 0.24.0 sharded)
+### 4b. Regression — measured (25-shard CONUS dispatch, zagg 0.36.0, hive + sidecar + spill)
 
-Fit from a **real 25-shard stratified CONUS run** on the production `process-shard`
-Lambda (4 GB, arm64), spanning the full 21–144 granule/shard band, in both read
-modes. All 25 shards succeeded in both modes (RSS ≤ 2.5 GB — o9 fits 4 GB
-cleanly). Raw per-shard points: `data/conus/results/conus_inline_cold_o9.json`
-(cold) and `conus_regression_results_o9warm.json` (warm).
+Fit from a **real 25-shard stratified CONUS run per order** on the
+`process-shard-4096-disk` Lambda (4 GB RAM + spill disk, arm64), spanning the full
+realised granule/shard band (o9 21–144, o8 43–211), in two passes each (v035 cold
+cache, v036 warm + #288). **All 25 shards succeeded at both orders in both
+passes** — o8 only because `spill` bounds RAM (§4c). Raw per-shard points:
+`data/conus/results/conus_o{8,9}_v0{35,36}.json`.
 
-| scenario | fit (granules → λ-seconds) | R² | CONUS total | 95 % CI |
+| order · pass | fit (granules → λ-seconds) | R² | CONUS total | 95 % CI |
 | --- | --- | ---: | ---: | ---: |
-| **cold** (first run, `inline`) | `1.96 × granules + 38 s/shard` | 0.60 | $471 | $406–536 |
-| **warm** (repeat, `sidecar`) | `2.03 × granules + 13 s/shard` | 0.72 | $419 | $367–472 |
+| **o9 · v036** (warm + #288) | `1.86 × granules + 10 s/shard` | 0.79 | **$379** | $339–419 |
+| o9 · v035 (cold cache) | `2.03 × granules + 3 s/shard` | 0.79 | $394 | $351–437 |
+| **o8 · v036** (warm + #288) | `1.52 × granules + 144 s/shard` | 0.32 | **$211** | $180–243 |
+| o8 · v035 (cold cache) | `1.36 × granules + 181 s/shard` | 0.27 | $223 | $192–255 |
 
-*(The warm total reproduces the independently-measured sharded $417 from an
-earlier run — cross-checked.)*
+The **v035→v036 (store-cache-fix) effect** on the full-CONUS total is **−4 %** (o9,
+$394→$379) / **−5 %** (o8, $223→$211); on the raw 25-shard sample it is −4.5 % (o9)
+/ −4.3 % (o8). The per-shard delta is **noisy** — individual shards move −28…+26 %
+(o9) and **−37…+32 %** (o8) — because concurrent-shard S3/Lambda contention swamps
+the ~0.3 s/granule the fix saves at CONUS density. o8's low R² (0.27–0.32) reflects
+that its runtime is dominated by spill's fixed ~150 s/shard flush/merge overhead,
+not the granule slope — so its total is intercept-driven and carries the wider
+±15 % interval; o9 (spill overhead near-zero at ~1.5 GB peak) stays slope-driven
+with a clean ±11 %. Reproduce with `python data/conus/conus_final_estimate.py`.
 
-**Confidence interval.** Granule count is a noisy cost predictor (R² 0.60–0.72),
-so the CONUS total is not a point value. The 95 % interval propagates two sources
-in quadrature on `Σ λ-seconds = slope·G_total + intercept·N`:
+**Confidence interval.** Granule count is a noisy cost predictor (R² 0.27–0.79
+across orders), so the CONUS total is not a point value. The 95 % interval
+propagates two sources in quadrature on `Σ λ-seconds = slope·G_total + intercept·N`:
 
 1. **parameter uncertainty** (OLS covariance of slope/intercept) — *systematic*,
-   correlated across all 49,285 shards; this is the **dominant** term and does not
+   correlated across all N shards; this is the **dominant** term and does not
    average out.
 2. **per-shard residual scatter** — independent, so its contribution to the total
-   grows only as √N and is near-negligible at N ≈ 50 k (a prediction-interval
+   grows only as √N and is near-negligible at CONUS N (a prediction-interval
    component, included for honesty).
 
-See `estimate_with_ci.py` / `conus_final_estimate.py`.
+See `estimate_with_ci.py` (per-file CLI) / `conus_final_estimate.py` (the
+consolidated both-orders reproducer).
 
-### 4c. Order feasibility — why o9 is the ceiling for coarsening
+### 4c. Order feasibility — o8 is now tractable via spill; the wall is headroom, not failure
+
+**Update (0.36.0): `streaming_mode: spill` unlocked o8.** The 0.24.0-era analysis
+below (kept for the density insight and the fix rationale) concluded o8 hit a
+whole-shard **t-digest memory wall** at 4 GB and that only an architectural change
+— spill photons to on-disk partitions so the digest state need not sit in RAM,
+tracked as #217 — would fix it. **That fix landed.** The 0.36.0 CONUS run
+(`process-shard-4096-disk`, hive + sidecar + `spill`) completes **all 25 o8 shards
+under 900 s at 4 GB**, including the exact dense shards that OOM'd at 0.24.0 (the
+85 g / 148 g / 155 g shards now run at 3.65 / 3.71 / 2.96 GB). So o8 is no longer
+gated on RAM — the residual is **headroom, not feasibility**: the densest o8 shard
+peaks at **~3.7 GB of 4 GB**, thin margin. **Recommend adding an 8 GB-RAM o8 arm**
+so the dense-coverage tail has room (it does not change the GB-s *fit*, which is
+timing-driven; it buys reliability against a shard that lands hotter than the
+sampled tail). o9 stays the safe default (~1.5 GB peak); o8 is the cheaper total
+(§4) once the 8 GB arm is in place. o7 remains untested under spill and is out of
+scope here.
 
 **Why coarsen at all? Coarser is monotonically cheaper per unit data.** A NEON
 SERC AOI order sweep (0.24.0 sharded, inline nomask;
@@ -238,22 +284,25 @@ are deterministic; the absolute `cost` is a single-shard-set Lambda timing and i
 **n=1 noisy** at the ~±15 % level — o9 has read $0.026–0.029 across runs — so read
 the **per-unit ratios and the monotone trend**, not the exact cents.)
 
-The answer at CONUS scale: coarsening hits a **memory wall**. Per-shard peak RSS
-is driven by **cell-coverage density (surface density), not granule count** — so
-it only shows up once you sample the whole continent, not a single site.
+The reason coarsening was *hard* at CONUS scale: per-shard peak RSS is driven by
+**cell-coverage density (surface density), not granule count** — so it only shows
+up once you sample the whole continent, not a single site. This is what forced the
+spill fix, and the density signature persists in the 0.36.0 numbers (an 85 g o8
+shard peaks at 3.65 GB while a 211 g shard runs at 1.3 GB):
 
 | order | shard area | CONUS shards | 4 GB result | evidence |
 | --- | ---: | ---: | --- | --- |
-| **o7** | 2,594 km² | — | **OOM outright** | 1/1 NEON shard (181 gran) died ~990 s; 16.7 M cells |
-| **o8** | 649 km² | 12,596 | **pooled: OOMs ~20 %; streamed: dense tail still OOMs** | see below |
-| **o9** | 162 km² | 49,285 | **fits cleanly** | 25/25 CONUS shards, RSS ≤ 2.5 GB |
+| **o7** | 2,594 km² | — | untested under spill | 1/1 NEON shard (181 gran) died ~990 s pooled; 16.7 M cells |
+| **o8** | 649 km² | 12,596 | **spill: 25/25 pass**, peak ~3.7 GB (was: pooled OOM ~20 %) | 0.36.0 CONUS run |
+| **o9** | 162 km² | 49,285 | **fits cleanly**, peak ~1.5 GB | 25/25 CONUS shards |
 | **o10** | 41 km² | — | fits | 9/9 NEON shards, ~560–680 MB |
 
-**The o8 memory wall — two layers.** A 25-shard stratified CONUS o8 run OOM'd on
-**5/25 shards at 4 GB**, deterministically (same 5 in both read modes), survivors
-peaking at 3.5 GB. It is **not a leak** and **not granule count**: an 85-granule
-shard OOMs while a 211-granule shard runs at 1.6 GB. Two distinct memory sources,
-only one of which is fixable by tuning:
+**The o8 memory wall — historical (0.24.0, pre-spill), kept for the fix rationale.**
+Before `spill`, a 25-shard stratified CONUS o8 run OOM'd on **5/25 shards at 4 GB**,
+deterministically (same 5 in both read modes), survivors peaking at 3.5 GB. It was
+**not a leak** and **not granule count**: an 85-granule shard OOM'd while a
+211-granule shard ran at 1.6 GB. Two distinct memory sources, only one of which was
+fixable by buffer tuning — the second is exactly what `spill` now offloads to disk:
 
 *(1) The pooled read pool (fixable).* The default worker holds the whole shard's
 photons before aggregating (`worker.py` `all_reads` → `_concat_and_group`).
@@ -282,12 +331,14 @@ runtime toward the wall (176 g hit 875 s / 97 % at buffer 12). At **8 GB pooled*
 155 g fits (7.7 GB, 94 %) but 148 g still OOMs — so the dense tail needs 8–10 GB
 (2–2.5× the GB-s price) with a residual failure tail even then.
 
-**The real fix is architectural, not a memory tier or a buffer value.** The digest
-state is held whole-shard; at o8 (4× o9's cell count) the densest-coverage shards
-overflow 4 GB no matter how the reads are streamed. **Chunk-scoped digest
-streaming** — process → write → free one inner chunk's cells at a time, bounding
-digest state to ≈1/K of the shard — would decouple worker memory from shard area.
-A code-feasibility pass found:
+**The real fix was architectural, not a memory tier or a buffer value — and it
+shipped as `spill`.** The digest state was held whole-shard; at o8 (4× o9's cell
+count) the densest-coverage shards overflowed 4 GB no matter how the reads were
+streamed. The fix — spill photons to on-disk partitions so the whole-shard digest
+state no longer sits in RAM — is what `streaming_mode: spill` now does (the
+single-pass on-disk-partition option below), trading the RAM wall for a Lambda
+`/tmp` disk budget (`tmp_mb: 6144` on the 4096-disk worker). The original
+feasibility scoping (#217), retained for the record:
 
 - The **write side already streams-and-frees per inner chunk** (`worker.py`
   `write_chunk` + `grid.iter_chunks`, issue #91) — but only on the **unsharded**
@@ -309,18 +360,19 @@ A code-feasibility pass found:
   is **exact**, strictly better than the current cross-buffer `merge_tdigests`
   approximation.
 
-Until that lands, **o9 at 4 GB is the recommendation**: its 4× smaller cell count
-keeps the digest state comfortably under 4 GB with no new machinery — and, notably,
-"dispatch finer parent_order shards" *is* the zero-refactor version of chunk-
-scoping (smaller dispatch unit → intrinsically smaller digest state). (An earlier
-2-shard NEON o8 test passed at 1.5–1.8 GB — but two shards over one uniform forest
-site did not sample CONUS's photon-density range; the continental regression is
-what exposed the tail.)
+With `spill` shipped, **both o9 and o8 are operable at 4 GB**: o9 needs no spill
+(1.5 GB peak, the safe default), and o8 rides spill to keep the dense tail under
+4 GB — with the ~3.7 GB peak arguing for an 8 GB o8 arm for margin. "Dispatch finer
+parent_order shards" remains the zero-config fallback (smaller dispatch unit →
+intrinsically smaller digest state), but it is no longer the *only* way to run
+coarse. (The earlier 2-shard NEON o8 test that passed at 1.5–1.8 GB under-sampled
+CONUS's photon-density range; the continental regression is what exposed the dense
+tail — and what spill now carries.)
 
 ### 4d. Remaining upper-bound caveat
 
 The #209 write bloat that dominated the old cold estimate is **fixed** (#211,
-0.24.0 sharded). The one remaining upper-bound axis is **#65 swath
+sharded write). The one remaining upper-bound axis is **#65 swath
 over-assignment**: granule→shard assignment uses the coarse CMR swath polygon, so
 reads are an upper bound on granules that truly contribute photons. This is *only*
 the swath-vs-beams envelope: CONUS is ~98.6 % fully-covered **interior** shards,
@@ -333,22 +385,93 @@ scale. **No AOI mask**: CONUS is a bulk grid, so `output.aoi_mask` is off.
 ```bash
 # 1. polygon (one-time network fetch of the public source outline)
 python data/conus/build_conus_polygon.py
-# 2. o9 shard map + stats (needs the local full ATL03 v007 catalog)
-python data/conus/build_conus_shardmap.py
-# 3. stratified regression-training shard plan
+# 2. shard map + stats per order (needs the local full ATL03 v007 catalog)
+python data/conus/build_conus_shardmap.py            # o9 (default)
+python data/conus/build_conus_shardmap.py --order 8  # o8
+# 3. stratified regression-training shard plan (per order)
 python data/conus/select_regression_shards.py
-# 4. billed cold + warm dispatch (AWS profile 'nasa', account 742127912612):
-#    cold = inline uncached reads; warm = sidecar cached reads
-AWS_PROFILE=nasa python data/conus/run_conus_regression.py --order 9 \
-  --config tests/data/benchmark/configs/atl03_tdigest_healpix_o9_cached.yaml \
-  --index-backend inline --cold-only --out data/conus/results/conus_inline_cold_o9.json
-AWS_PROFILE=nasa python data/conus/run_conus_regression.py --order 9 \
-  --config tests/data/benchmark/configs/atl03_tdigest_healpix_o9_cached.yaml \
-  --out data/conus/results/conus_regression_results_o9warm.json
-# 5. apply fits to the CONUS distribution with a 95% interval
+# 4. billed 25-shard dispatch, hive + sidecar + spill on process-shard-4096-disk
+#    (AWS profile 'nasa', account 742127912612), two passes per order:
+#    v035 = cold sidecar cache (pre-#288); v036 = warm cache + the #288 fix.
+#    Results already committed under data/conus/results/conus_o{8,9}_v0{35,36}.json
+# 5. apply each order's v035/v036 fit to the CONUS distribution with a 95% interval
 python data/conus/conus_final_estimate.py
 ```
 
 Temporal window `2018-10-13 → 2026-03-15`, catalog
-`data/atl03_v007/atl03_v007_full.parquet` (555,867 granules), grid config
-`tests/data/benchmark/configs/atl03_tdigest_healpix_o9_cached.yaml`.
+`data/atl03_v007/atl03_v007_full.parquet` (555,867 granules). Estimate inputs:
+the committed `data/conus/results/conus_o{8,9}_v0{35,36}.json` per-shard records
+and the full-CONUS `conus_shard_granule_counts{,_o8}.parquet` distributions.
+
+## 6. Per-shard measured records (0.36.0, v036 warm + #288)
+
+The full 25-shard stratified sample the regressions are fit from, per order,
+sorted by granule count. Peak RSS confirms the density signature (§4c): the RAM
+peak tracks cell-coverage density, not granule count. Source:
+`data/conus/results/conus_o{8,9}_v036.json`.
+
+**Order 9** (peak ~1.5 GB — fits 4 GB with room; no spill needed):
+
+| gran | obs (M) | runtime s | max RSS MB | cost $ |
+| ---: | ---: | ---: | ---: | ---: |
+| 21 | 5.4 | 61 | 725 | 0.0033 |
+| 26 | 4.2 | 49 | 618 | 0.0026 |
+| 31 | 8.9 | 71 | 688 | 0.0038 |
+| 36 | 11.2 | 92 | 840 | 0.0049 |
+| 41 | 6.9 | 90 | 613 | 0.0048 |
+| 47 | 7.0 | 77 | 576 | 0.0041 |
+| 52 | 5.8 | 76 | 548 | 0.0041 |
+| 57 | 10.0 | 103 | 698 | 0.0055 |
+| 62 | 23.0 | 142 | 1386 | 0.0076 |
+| 67 | 23.0 | 126 | 1145 | 0.0067 |
+| 72 | 26.2 | 160 | 971 | 0.0086 |
+| 77 | 14.9 | 177 | 748 | 0.0095 |
+| 83 | 10.6 | 141 | 657 | 0.0075 |
+| 88 | 4.9 | 112 | 470 | 0.0060 |
+| 93 | 26.8 | 175 | 1296 | 0.0094 |
+| 98 | 24.5 | 190 | 1024 | 0.0102 |
+| 103 | 18.6 | 218 | 844 | 0.0117 |
+| 108 | 34.9 | 293 | 1514 | 0.0157 |
+| 113 | 22.9 | 221 | 934 | 0.0118 |
+| 118 | 35.6 | 241 | 1371 | 0.0129 |
+| 124 | 15.5 | 272 | 883 | 0.0145 |
+| 129 | 20.4 | 223 | 782 | 0.0119 |
+| 134 | 41.3 | 347 | 1457 | 0.0186 |
+| 138 | 4.9 | 197 | 469 | 0.0105 |
+| 144 | 4.6 | 221 | 560 | 0.0118 |
+| **2,062** | **412** | **4,076** | max **1,514** | **0.218** |
+
+**Order 8** (peak ~3.7 GB — rides spill under 4 GB; the 8 GB arm buys headroom):
+
+| gran | obs (M) | runtime s | max RSS MB | cost $ |
+| ---: | ---: | ---: | ---: | ---: |
+| 43 | 11.5 | 127 | 1153 | 0.0068 |
+| 60 | 16.4 | 207 | 1086 | 0.0110 |
+| 64 | 34.5 | 284 | 1682 | 0.0152 |
+| 66 | 57.4 | 269 | 2419 | 0.0144 |
+| 71 | 26.8 | 176 | 1205 | 0.0094 |
+| 78 | 35.6 | 308 | 1388 | 0.0165 |
+| 85 | 95.8 | 307 | 3653 | 0.0164 |
+| 92 | 36.7 | 209 | 1430 | 0.0112 |
+| 99 | 43.2 | 233 | 1434 | 0.0125 |
+| 106 | 32.3 | 218 | 1234 | 0.0117 |
+| 113 | 42.8 | 308 | 1462 | 0.0165 |
+| 120 | 82.6 | 365 | 2600 | 0.0195 |
+| 127 | 60.4 | 347 | 1804 | 0.0186 |
+| 134 | 30.4 | 361 | 1180 | 0.0193 |
+| 141 | 24.7 | 347 | 1090 | 0.0186 |
+| 148 | 152.7 | 663 | 3709 | 0.0355 |
+| 155 | 101.9 | 672 | 2964 | 0.0360 |
+| 162 | 13.9 | 277 | 1026 | 0.0148 |
+| 169 | 59.0 | 442 | 2281 | 0.0237 |
+| 176 | 74.0 | 500 | 1744 | 0.0268 |
+| 184 | 37.4 | 482 | 2038 | 0.0258 |
+| 190 | 16.2 | 288 | 1028 | 0.0154 |
+| 196 | 19.8 | 287 | 1133 | 0.0153 |
+| 206 | 19.3 | 484 | 961 | 0.0259 |
+| 211 | 24.4 | 308 | 1291 | 0.0165 |
+| **3,196** | **1,150** | **8,470** | max **3,709** | **0.453** |
+
+The densest-coverage shards (85 g → 3.65 GB, 148 g → 3.71 GB) — not the
+highest-granule (211 g → 1.29 GB) — set the RAM peak, and are exactly the shards
+that OOM'd pre-spill (§4c). All 25 finish under the 900 s worker (max 672 s).
