@@ -913,9 +913,12 @@ class RasterStrategy:
                     f"raster shard {shard_label(grid, int(shard_key))} stages: {stage_stats}"
                 )
             # Per-shard stats record (issue #297), the raster-local flavor:
-            # hive units that wrote a leaf (timesteps > 0 -> stamped) get the
-            # sidecar sibling; the record rides ``meta`` for the run parquet
-            # either way. Fail-open on the sidecar PUT.
+            # hive units that wrote a leaf get the sidecar sibling; the record
+            # rides ``meta`` for the run parquet either way. Gate on the
+            # accurate ``leaf_written`` signal (set iff a slab streamed) rather
+            # than ``timesteps`` — a unit with acquisitions but no occupied cell
+            # writes no leaf, so ``timesteps`` alone would orphan a sidecar.
+            # Fail-open on the sidecar PUT.
             meta.setdefault("duration_s", time.time() - unit_t0)
             record = build_record(
                 shard_key=int(shard_key),
@@ -923,7 +926,7 @@ class RasterStrategy:
                 granule_ids=raster_granule_ids(granules),
             )
             meta["stats"] = record
-            if store_layout == "hive" and meta.get("timesteps"):
+            if store_layout == "hive" and meta.get("leaf_written"):
                 from zagg.hive import shard_leaf_path
 
                 try:
