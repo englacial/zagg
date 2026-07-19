@@ -550,6 +550,37 @@ class TestProcessRasterHiveMode:
         assert {"sample", "write"} <= set(record["phase_timings"])
         assert record["max_memory_mb"] is not None
 
+    def test_hive_no_leaf_writes_no_orphan_sidecar(self, handler_mod, tmp_path, monkeypatch):
+        # Issue #297 fold: a unit with acquisitions (timesteps > 0) but no slab
+        # streamed writes no leaf .zarr — so it must NOT get an orphan
+        # stats.json sibling. The sidecar gate keys on the accurate
+        # ``leaf_written`` signal, not the ``timesteps`` proxy.
+        from zagg import hive
+        from zagg.processing import raster as raster_mod
+        from zagg.telemetry import read_sidecar
+
+        def _no_slab(grid_, shard_key, granules, config, time_index, *, on_slab=None, **kw):
+            # Report an acquisition but stream nothing: ``on_slab`` is never
+            # called, so ``process_and_write_raster_hive`` leaves ``store`` out
+            # of its box and never opens/stamps the leaf.
+            return {}, {
+                "shard_key": int(shard_key),
+                "granule_count": len(granules),
+                "skipped": 0,
+                "timesteps": 1,
+            }
+
+        monkeypatch.setattr(raster_mod, "process_raster_shard", _no_slab)
+        event = self._hive_event(tmp_path)
+        resp = handler_mod.lambda_handler(event, MagicMock())
+        assert resp["statusCode"] == 200, resp
+        body = json.loads(resp["body"])
+        assert body["timesteps"] == 1  # acquisitions present ...
+        assert "stats" in body  # ... the record still rides the envelope ...
+        # ... but no leaf was written, so no sidecar sibling exists.
+        leaf = hive.shard_leaf_path(event["store_path"], event["shard_key"])
+        assert read_sidecar(leaf) is None
+
     def test_hive_missing_params_omit_time_index(self, handler_mod):
         # A hive event needs no time_index: the 400 for an empty hive event
         # names the other four requirements only.

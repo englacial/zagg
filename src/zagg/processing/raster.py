@@ -1125,6 +1125,12 @@ def process_and_write_raster_hive(
     # prefix, and a worker error raised out above, leaving debris (D4). Write
     # order is pinned: dense slabs -> coverage sidecar -> stamp.
     meta["cells_with_data"] = 0
+    # Accurate leaf-written signal for the stats-sidecar gate (issue #297): set
+    # iff a slab streamed (``"store" in box``), so both dispatchers gate the
+    # sidecar PUT on leaf existence rather than the ``timesteps`` proxy (a unit
+    # with acquisitions but no occupied cell writes no leaf). ``phase_timings``
+    # cannot serve as the gate — it rides only under ``profile``.
+    meta["leaf_written"] = "store" in box
     if "store" in box:
         _t0 = time.time()
         words = occupied[0] if occupied and occupied[0].size else None

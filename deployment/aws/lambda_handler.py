@@ -1139,9 +1139,11 @@ def _handle_process_raster(event: Dict[str, Any]) -> Dict[str, Any]:
             if "phase_timings" in meta:
                 body["phase_timings"] = meta["phase_timings"]
             # Per-shard stats record (issue #297): envelope ride + the leaf
-            # sidecar (only when the unit wrote a leaf — timesteps > 0 means
-            # slabs streamed, so the leaf exists and is stamped). Fail-open on
-            # the sidecar PUT; the record still rides the envelope.
+            # sidecar (only when the unit wrote a leaf — ``leaf_written`` is the
+            # accurate signal, set iff a slab streamed and the leaf was stamped;
+            # a unit with acquisitions but no occupied cell writes no leaf, so
+            # ``timesteps`` alone would orphan a sidecar). Fail-open on the
+            # sidecar PUT; the record still rides the envelope.
             from zagg.telemetry import build_record, lambda_env, raster_granule_ids, write_sidecar
 
             record = build_record(
@@ -1152,7 +1154,7 @@ def _handle_process_raster(event: Dict[str, Any]) -> Dict[str, Any]:
                 lambda_config=lambda_env(),
             )
             body["stats"] = record
-            if meta["timesteps"]:
+            if meta.get("leaf_written"):
                 from zagg.hive import shard_leaf_path
 
                 try:
