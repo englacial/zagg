@@ -610,7 +610,10 @@ class ShardMap:
         descendant cells (``generate_morton_children(shard_key,
         target_order)``) so the result reproduces the direct
         :meth:`build` at the finer order exactly, at a fraction of the cost
-        (only this shard's granules, not the whole catalog).
+        (only this shard's granules, not the whole catalog). Refine always
+        re-intersects via the mortie MOC path regardless of the source's
+        ``backend`` (a spherely-built source is not reproduced by it), so the
+        derived map records ``backend="mortie"``.
         """
         from mortie import clip2order, generate_morton_children
 
@@ -729,6 +732,10 @@ class ShardMap:
         # not describe the derived map.
         meta.pop("build_wall_s", None)
         if method == "refine":
+            # Refine re-intersects via the mortie MOC path (``_intersect_mortie``)
+            # regardless of the source's backend -- a spherely-built (exact-S2)
+            # source is not reproduced by it -- so record what actually ran.
+            meta["backend"] = "mortie"
             meta["mortie_order"] = mortie_order
         else:
             # Coarsen is a pure regroup: no geometry backend and no order-based
