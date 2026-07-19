@@ -56,6 +56,7 @@ from zagg.dispatch import (
     LocalExecutor,
     PreflightReport,
     dispatch,
+    estimate_cost_usd,
     max_cost_usd,
 )
 from zagg.grids.base import shard_label
@@ -1617,7 +1618,9 @@ def _run_lambda_events(
 
     # Structured cost block (issue #298), mirroring the spatial summary; the
     # legacy flat ``estimated_cost_usd`` key keeps the actual-cost rollup.
+    # estimate_cost_usd is the Phase-3 stub (None until #297/#299 land).
     report.max_cost_usd = run_max_cost
+    report.estimated_cost_usd = estimate_cost_usd()
     report.actual_cost_usd = estimated_cost
     cost_block = {
         "max_cost_usd": run_max_cost,
@@ -2907,11 +2910,12 @@ def _run_lambda(
     estimated_cost = gb_seconds * price_per_gb_sec
 
     # Structured cost block (issue #298): the pre-invoke ceiling, the deferred
-    # prior-history estimate (None until issues #297/#299 land the sidecar
-    # history), and the billed-duration rollup. The legacy flat
-    # ``estimated_cost_usd`` summary key keeps its pre-#298 meaning (the
-    # actual-cost rollup) for existing consumers.
+    # prior-history estimate (the estimate_cost_usd stub -- None until issues
+    # #297/#299 land the sidecar history), and the billed-duration rollup. The
+    # legacy flat ``estimated_cost_usd`` summary key keeps its pre-#298
+    # meaning (the actual-cost rollup) for existing consumers.
     report.max_cost_usd = run_max_cost
+    report.estimated_cost_usd = estimate_cost_usd(catalog_data)
     report.actual_cost_usd = estimated_cost
     cost_block = {
         "max_cost_usd": run_max_cost,
