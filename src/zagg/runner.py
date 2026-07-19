@@ -3383,7 +3383,12 @@ def _invoke_lambda_raster(
                 body = polled.get("body") or {}
                 error = polled.get("error")
                 status = polled.get("status_code")
-                if not error and status is not None and status != 200:
+                # Surface a non-200 landed envelope as a shard error, exactly as
+                # the sync branch's ``raw.get("statusCode") != 200`` does. A
+                # deadline miss already set ``error`` (short-circuiting here), and
+                # a status-less landed envelope maps to ``"status None"`` — parity
+                # with sync (the deployed worker always emits ``statusCode``).
+                if not error and status != 200:
                     error = body.get("error", f"status {status}")
                 return {"error": error, "body": body}
             raw_text = resp["Payload"].read().decode("utf-8")
