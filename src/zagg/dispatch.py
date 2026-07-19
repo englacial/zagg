@@ -368,6 +368,12 @@ def estimate_cost_usd(catalog_data=None, *, template_hash=None, history=None) ->
     returns ``None`` and the run's ``cost.estimated_cost_usd`` stays a
     placeholder.
 
+    The temporal event fan-out has no shardmap (its fan-out unit is the
+    event, resolved at call time, not a catalog shard), so
+    ``_run_lambda_events`` wires this stub with no ``catalog_data`` and its
+    estimate stays ``None`` until an event-history tier exists -- out of
+    scope for issue #298; both tiers below key on per-shard counts.
+
     Two tiers, tried in order once wired:
 
     * **Tier 1 -- pilot-first.** Prior actuals for the *same* template hash at
