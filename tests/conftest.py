@@ -51,3 +51,26 @@ def point_words(n, seed, lat0=45.0, lon0=45.0, spread=1e-4):
     lats = lat0 + rng.uniform(-spread, spread, n)
     lons = lon0 + rng.uniform(-spread, spread, n)
     return morton_words(MortonIndexArray.from_latlon(lats, lons, points=True))
+
+
+@pytest.fixture(autouse=True)
+def _no_s3_run_stats(monkeypatch):
+    """Keep unit tests hermetic: never PUT the run stats parquet to real S3.
+
+    The dispatcher's run-level parquet write (issue #297) is fail-open in
+    production, but a unit test driving a lambda-path harness with an
+    ``s3://`` store path must not attempt a live PUT (ambient local
+    credentials could reach a real bucket). Local-path writes stay live so
+    the parquet wiring is still integration-tested; a test that wants the
+    s3 branch re-patches ``zagg.runner._write_run_stats`` itself.
+    """
+    from zagg import runner
+
+    real = runner._write_run_stats
+
+    def guard(store_path, rows, **kwargs):
+        if str(store_path).startswith("s3://"):
+            return
+        return real(store_path, rows, **kwargs)
+
+    monkeypatch.setattr(runner, "_write_run_stats", guard)

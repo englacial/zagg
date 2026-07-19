@@ -217,6 +217,115 @@ def _zagg_version() -> str:
     return zagg.__version__
 
 
+def failure_record(*, shard_key=None, error, duration_s=None) -> dict:
+    """Skeleton record for a shard with no worker record (issue #297 phase 3).
+
+    Timed-out / OOM / dropped shards write no sidecar and return no envelope
+    record; the dispatcher still owes the run parquet a row (error, duration
+    until failure). Built through :func:`build_record` so the row shape and
+    schema version cannot drift from real records; ``shard_key`` may be
+    unknown (``None``) when the failure predates key resolution.
+    """
+    record = build_record(
+        shard_key=shard_key if shard_key is not None else -1,
+        metadata={"error": str(error) or "unknown failure", "duration_s": duration_s},
+    )
+    if shard_key is None:
+        record["shard_key"] = None
+    return record
+
+
+#: Scalar record fields copied straight into a parquet row (flatten order).
+_ROW_SCALARS = (
+    "schema_version",
+    "shard_key",
+    "template_hash",
+    "zagg_version",
+    "n_shards",
+    "n_granules",
+    "granules_sha256",
+    "n_obs",
+    "cells_with_data",
+    "duration_s",
+    "gb_seconds",
+    "est_cost_usd",
+    "spill_bytes",
+    "max_memory_mb",
+    "container_hwm_mb",
+    "timestamp",
+    "success",
+    "error",
+)
+
+
+def flatten_record(record: dict, *, retries=None, error_class=None) -> dict:
+    """One run-parquet row from a stats record (issue #297 phase 3).
+
+    Nested blocks flatten to columns duckdb/Athena can query directly:
+    ``phase_timings`` -> ``phase_{name}``, ``lambda`` -> ``lambda_memory_mb``
+    / ``lambda_arch`` / ``lambda_function_variant``, ``invoked_by`` ->
+    ``invoked_by`` (the ARN) + ``invoked_by_userid``. ``retries`` is the
+    dispatcher's attempt count for the shard; ``error_class`` defaults to the
+    error string's leading token (callers with the real exception type pass
+    it explicitly).
+    """
+    row = {key: record.get(key) for key in _ROW_SCALARS}
+    error = record.get("error")
+    if error_class is None and error:
+        error_class = str(error).split(":", 1)[0]
+    row["error_class"] = error_class
+    row["retries"] = retries
+    for name, secs in (record.get("phase_timings") or {}).items():
+        row[f"phase_{name}"] = secs
+    lam = record.get("lambda") or {}
+    row["lambda_memory_mb"] = lam.get("memory_mb")
+    row["lambda_arch"] = lam.get("arch")
+    row["lambda_function_variant"] = lam.get("function_variant")
+    ident = record.get("invoked_by") or {}
+    row["invoked_by"] = ident.get("arn")
+    row["invoked_by_userid"] = ident.get("userid")
+    return row
+
+
+def run_parquet_key(run_id: str, timestamp: str | None = None) -> str:
+    """Store-root object name of a run's stats parquet: run id + timestamp."""
+    ts = timestamp or datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    return f"stats_{run_id}_{ts}.parquet"
+
+
+def write_run_parquet(
+    store_root: str, rows: list, *, run_id: str, store_kwargs: dict | None = None
+) -> str:
+    """PUT the run-level stats parquet at the store root (issue #297 phase 3).
+
+    One row per dispatched shard — successes from the workers' records
+    (envelope-ridden, no second S3 listing), failures from the dispatcher's
+    :class:`~zagg.dispatch.RunReport` via :func:`failure_record`. Written with
+    the core ``fastparquet`` engine (the :mod:`zagg.catalog.extract`
+    precedent — pyarrow stays off the worker path, issue #130);
+    ``object_encoding="utf8"`` pins string columns that may be all-null in a
+    given run (e.g. ``invoked_by`` locally). Returns the object's full path.
+    """
+    import tempfile
+
+    import obstore
+    import pandas as pd
+
+    from zagg.store import open_object_store
+
+    if not rows:
+        raise ValueError("write_run_parquet requires at least one row")
+    key = run_parquet_key(run_id)
+    df = pd.DataFrame(rows)
+    with tempfile.TemporaryDirectory() as tmp:
+        local = os.path.join(tmp, key)
+        df.to_parquet(local, engine="fastparquet", index=False, object_encoding="utf8")
+        with open(local, "rb") as fh:
+            data = fh.read()
+    obstore.put(open_object_store(store_root, **(store_kwargs or {})), key, data)
+    return f"{store_root.rstrip('/')}/{key}"
+
+
 # ---------------------------------------------------------------------------
 # Leaf sidecar I/O (phase 2) — one small JSON object per hive leaf, written by
 # the worker on success only, SIBLING to the leaf ``.zarr`` (never inside it:
