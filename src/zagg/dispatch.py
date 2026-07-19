@@ -337,7 +337,7 @@ LAMBDA_PRICE_PER_GB_SEC = LAMBDA_PRICE_PER_GB_SEC_BY_ARCH[LAMBDA_ARCH]
 
 
 def max_cost_usd(
-    n_shards: int,
+    n_units: int,
     memory_gb: float,
     *,
     timeout_s: float,
@@ -346,15 +346,16 @@ def max_cost_usd(
     """Hard ceiling on a fan-out's Lambda bill, computable before any invoke.
 
     Every work unit is one Lambda invocation billed at ``memory_gb`` for at
-    most the function timeout, so ``n_shards * rate(arch) * memory_gb *
-    timeout_s`` bounds one clean pass over the shardmap (issue #298).
+    most the function timeout, so ``n_units * rate(arch) * memory_gb *
+    timeout_s`` bounds one invoke per work unit (issue #298). A work unit is
+    a shard on the spatial path and an event on the tabular/temporal path.
     Transient-fault retries (:data:`LAMBDA_RETRY`, rare) re-bill a unit and
     are deliberately not folded in -- the ceiling prices the run as planned,
     not the worst-case retry storm. ``arch`` keys the price table
     (:data:`LAMBDA_PRICE_PER_GB_SEC_BY_ARCH`); an unknown arch raises
     ``KeyError`` rather than pricing silently wrong.
     """
-    return n_shards * LAMBDA_PRICE_PER_GB_SEC_BY_ARCH[arch] * memory_gb * timeout_s
+    return n_units * LAMBDA_PRICE_PER_GB_SEC_BY_ARCH[arch] * memory_gb * timeout_s
 
 
 class LambdaExecutor:
