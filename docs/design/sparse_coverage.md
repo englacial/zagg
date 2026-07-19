@@ -538,8 +538,10 @@ rollup leaves all leaf reads intact.
   in-session, recorded on
   [#236](https://github.com/englacial/zagg/issues/236#issuecomment-4986241727).)
   Every HEALPix config — point aggregation and raster — targets hive; the
-  grid determines the layout (no `store_layout` knob survives, #238); rect
-  keeps its bounded flat store. Hive leaf dense arrays are one object per
+  grid keys the default layout (hive for HEALPix; PR #257 / #253), and an
+  explicit `store_layout: flat` survives only as a deprecated escape hatch
+  (emits a `DeprecationWarning`) until the O3-gated flat removal; rect keeps
+  its bounded flat store. Hive leaf dense arrays are one object per
   array per leaf via the ShardingCodec (always-accumulate); `sharded: false`
   remains a legitimate opt-out, and **raster leaves skip the sharding codec
   by design** — the only raster/aggregation difference at the leaf
