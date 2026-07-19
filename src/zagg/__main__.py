@@ -10,8 +10,10 @@ Usage:
 import argparse
 import json
 import logging
+import sys
 
 from zagg.config import load_config
+from zagg.notebook import confirm_max_cost, max_cost_preview
 from zagg.runner import agg, normalize_output_credentials
 
 
@@ -81,6 +83,13 @@ examples:
         "worker: block's variant suffix (issue #235). Resolved in the runner "
         "so the config selection is not silently masked.",
     )
+    parser.add_argument(
+        "--yes",
+        "-y",
+        action="store_true",
+        help="Skip the max-cost confirmation prompt before a Lambda fan-out "
+        "(issue #298). The ceiling is still printed.",
+    )
     args = parser.parse_args()
 
     logging.basicConfig(level=logging.INFO, format="%(message)s")
@@ -96,6 +105,22 @@ examples:
         # Accept camelCase, snake_case, or STS PascalCase key spellings.
         output_credentials = normalize_output_credentials(output_credentials)
         output_endpoint_url = output_credentials.get("endpointUrl")
+
+    # Max-cost gate (issue #298): a Lambda fan-out spends real money, so the
+    # CLI blocks on the pre-invoke ceiling with a yes/no prompt; --yes/-y
+    # skips. Dry runs invoke nothing, and a run with no resolvable catalog is
+    # about to raise agg's own error -- both bypass the gate. The notebook
+    # wrapper (zagg.notebook) never blocks; this prompt is CLI-only.
+    if args.backend == "lambda" and not args.dry_run and (args.catalog or config.catalog):
+        preview = max_cost_preview(
+            config,
+            args.catalog,
+            max_cells=args.max_cells,
+            morton_cell=args.morton_cell,
+        )
+        if not confirm_max_cost(preview, assume_yes=args.yes):
+            print("Aborted: max-cost gate declined (rerun with --yes to skip the prompt).")
+            sys.exit(1)
 
     results = agg(
         config,

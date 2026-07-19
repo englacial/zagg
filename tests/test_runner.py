@@ -2532,6 +2532,19 @@ class TestTemporalStrategy:
         assert by_key["storm1"]["results"]["max_t2m"] == pytest.approx(5.0)
         assert by_key["storm2"]["results"]["max_t2m"] == pytest.approx(9.0)
 
+    def test_on_progress_fires_per_event_with_no_metered_cost(self):
+        # Progress hook (issue #298 phase 2) on the temporal local path: one
+        # call per event; local carries no metered cost, so cost rides as None.
+        from zagg.runner import agg
+
+        seen = []
+        agg(
+            _temporal_config(),
+            events=_synthetic_events(),
+            on_progress=lambda done, total, cost: seen.append((done, total, cost)),
+        )
+        assert sorted(seen) == [(1, 2, None), (2, 2, None)]
+
     def test_max_cells_truncates_events(self):
         from zagg.runner import agg
 
