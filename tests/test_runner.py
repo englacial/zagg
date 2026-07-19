@@ -517,7 +517,9 @@ class TestInvokeLambdaCellEvent:
 
     _CREDS = {"accessKeyId": "a", "secretAccessKey": "s", "sessionToken": "t"}
 
-    def _captured_event(self, *, child_order, profile=False, aoi_payload=None, handoff="pandas"):
+    def _captured_event(
+        self, *, child_order, profile=False, aoi_payload=None, handoff="pandas", invoked_by=None
+    ):
         from unittest.mock import MagicMock
 
         from zagg.runner import _invoke_lambda_cell
@@ -543,6 +545,7 @@ class TestInvokeLambdaCellEvent:
             profile=profile,
             aoi_payload=aoi_payload,
             handoff=handoff,
+            invoked_by=invoked_by,
         )
         return json.loads(client.invoke.call_args.kwargs["Payload"])
 
@@ -595,6 +598,65 @@ class TestInvokeLambdaCellEvent:
         # path; no "handoff" key is added (#130).
         event = self._captured_event(child_order=12, handoff="pandas")
         assert "handoff" not in event
+
+    def test_invoked_by_adds_event_key(self):
+        # issue #297: the dispatcher-resolved caller identity threads into the
+        # cell event so the worker copies it verbatim into the stats sidecar.
+        ident = {"arn": "arn:aws:iam::123:user/x", "userid": "AIDAEXAMPLE"}
+        event = self._captured_event(child_order=12, invoked_by=ident)
+        assert event["invoked_by"] == ident
+
+    def test_default_event_has_no_invoked_by_key(self):
+        # Fail-open resolve (None): no "invoked_by" key, so the event stays
+        # byte-identical to the pre-#297 path.
+        event = self._captured_event(child_order=12, invoked_by=None)
+        assert "invoked_by" not in event
+
+
+class TestResolveInvokedBy:
+    """``_resolve_invoked_by`` (issue #297): STS caller identity, or ``None``.
+
+    The spatial ``_run_lambda`` passes a ``boto3.Session()`` here — the raster
+    ``_run_lambda_shards`` passes the ``boto3`` module — so the resolver is
+    exercised through the same ``.client`` seam both call sites use. Fail-open:
+    a stubbed/mocked/raising session must never stamp junk into the persisted
+    records, so it degrades to ``None``.
+    """
+
+    def _session(self, ident=None, *, raises=False):
+        from unittest.mock import MagicMock
+
+        session = MagicMock()
+        sts = session.client.return_value
+        if raises:
+            sts.get_caller_identity.side_effect = RuntimeError("no creds")
+        else:
+            sts.get_caller_identity.return_value = ident
+        return session
+
+    def test_real_identity_threads_through(self):
+        from zagg.runner import _resolve_invoked_by
+
+        session = self._session({"Arn": "arn:aws:iam::123:user/x", "UserId": "AIDAEXAMPLE"})
+        assert _resolve_invoked_by(session, "us-west-2") == {
+            "arn": "arn:aws:iam::123:user/x",
+            "userid": "AIDAEXAMPLE",
+        }
+        session.client.assert_called_once_with("sts", region_name="us-west-2")
+
+    def test_mock_identity_degrades_to_none(self):
+        # A bare MagicMock session (the spatial-test seam) returns non-string
+        # Arn/UserId; the shape-check rejects it rather than stamping junk.
+        from unittest.mock import MagicMock
+
+        from zagg.runner import _resolve_invoked_by
+
+        assert _resolve_invoked_by(MagicMock(), "us-west-2") is None
+
+    def test_sts_failure_degrades_to_none(self):
+        from zagg.runner import _resolve_invoked_by
+
+        assert _resolve_invoked_by(self._session(raises=True), "us-west-2") is None
 
 
 class TestInvokeLambdaCellRetry:

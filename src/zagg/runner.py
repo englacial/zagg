@@ -1079,6 +1079,14 @@ class RasterStrategy:
         # resolved once per run, stamped into every shard event. Reuses the
         # module's client seam (a bare namespace with .client) so tests that
         # patch boto3.client intercept it like every other invoke.
+        #
+        # Seam divergence with the spatial ``_run_lambda`` (which passes a
+        # ``boto3.Session()`` instance) is DELIBERATE, keyed to the two test
+        # harnesses: the raster tests patch ``boto3.client`` (this module route
+        # hits the fake), the spatial tests patch ``boto3.Session`` (that route
+        # degrades to None via the shape-check). Unifying either direction would
+        # send real STS ``get-caller-identity`` from the other family's unit
+        # tests. ``_resolve_invoked_by`` accepts either (both expose ``.client``).
         invoked_by = _resolve_invoked_by(boto3, region)
         # Ping → setup, bracketed as template_s (the setup-ish wall the
         # benchmark splits from fan-out, issue #250). Flat: the template is
@@ -1967,6 +1975,13 @@ def _resolve_invoked_by(session, region) -> dict | None:
     carry no caller identity) and copies this verbatim into the sidecar; the
     run parquet carries it as a column. Fail-open: a failed resolve logs and
     the records carry ``null`` rather than failing the run.
+
+    ``session`` is any object exposing ``.client(service, region_name=...)`` —
+    the raster path passes the ``boto3`` module, the spatial path a
+    ``boto3.Session()`` instance. That per-path seam is deliberate (each rides
+    the mock its test harness patches); see the call sites. A stubbed/mocked
+    session that returns non-string identity fields degrades to ``None`` via
+    the shape-check below rather than stamping junk into persisted records.
     """
     try:
         ident = session.client("sts", region_name=region).get_caller_identity()
@@ -2585,6 +2600,11 @@ def _run_lambda(
     state: dict = {}
     # Caller identity for the per-shard stats records (issue #297): resolved
     # once per run, stamped into every cell event; workers copy it verbatim.
+    # Passes the run's ``session`` (not the module, as the raster path does) so
+    # this route rides the ``boto3.Session`` seam the spatial tests patch —
+    # their MagicMock session degrades to None via the shape-check, no network.
+    # See the matching note at the raster call site: the per-path seam is
+    # deliberate; unifying it would send real STS from one test family.
     invoked_by = _resolve_invoked_by(session, region)
 
     def _preflight(n):
