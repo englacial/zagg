@@ -256,6 +256,14 @@ Resources:
       Architectures: [!Ref Architecture]
       MemorySize: !Ref MemorySize
       Timeout: !Ref Timeout
+      # Base process-shard IS the production worker: 4 GB + ephemeral disk so the
+      # spill streaming path (issue #217) runs on it, and deploy/benchmarks/raster
+      # all target this one function (issue #284 option 2). 6144 MB = the
+      # WorkerDiskTmp 4096-key value (memory + 2048); hardcoded, not FindInMap,
+      # because MemorySize is a free param (no AllowedValues) — keep in sync with
+      # the WorkerDiskTmp 4096 entry if the base memory default changes.
+      EphemeralStorage:
+        Size: 6144
       Role: !If [ShouldCreateRole, !GetAtt ExecutionRole.Arn, !Ref ExecutionRoleArn]
       Layers: [!Ref DepsLayer]
       Environment:
