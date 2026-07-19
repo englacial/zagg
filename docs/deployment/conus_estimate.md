@@ -34,14 +34,18 @@ the current-code numbers and the headline below).
 
 | 0.36.0 @ 4 GB, warm + #288 (v036) | cost (95 % CI) | wall @ 2,000 workers | peak RSS |
 | --- | ---: | ---: | ---: |
-| **Order 9** (49,285 shards) | **$379** ($339–419, ±11 %) | **~1.0 h** | ~1.5 GB |
-| **Order 8** (12,596 shards) | **$211** ($180–243, ±15 %) | **~0.6 h** | ~3.7 GB |
+| **Order 9** (49,285 shards) | **$380** ($340–420, ±11 %) | **~1.0 h** | ~1.5 GB |
+| **Order 8** (12,596 shards) | **$212** ($180–244, ±15 %) | **~0.6 h** | ~3.7 GB |
 
-Before the #288 store-cache fix (v035, cold cache): o9 **$394** ($351–437), o8
-**$223** ($192–255) — the fix is worth ~4 % (o9) / ~5 % (o8) on the full-CONUS
-total (§4b). For reference, the prior 0.24.0 o9 estimate quoted first-run (cold
-`inline`) **$471** and repeat (warm `sidecar`) **$419**; the 0.36.0 warm+fix o9
-operating point is **$379**.
+Totals are the **true `-disk` bill** = compute (RAM GB-s) **+ ephemeral /tmp GB-s**
+(§4): the ephemeral term is ~0.3 % of compute — o9 $379 compute + $1.2 ephemeral,
+o8 $211 + $0.7 — immaterial but now included. Before the #288 store-cache fix
+(v035, cold cache): o9 **$395** ($352–439), o8 **$224** ($192–256) — the fix is
+worth ~4 % (o9) / ~5 % (o8) on the full-CONUS total (§4b). For reference, the prior
+0.24.0 o9 estimate quoted first-run (cold `inline`) **$471** and repeat (warm
+`sidecar`) **$419**; the 0.36.0 warm+fix o9 operating point is **$380** — the big
+drop vs 0.24.0 is spill + the #279/#282 t-digest vectorization + hive per-shard
+write, *not* the store-cache alone (§4e drivers).
 
 Everything here is reproducible offline from the committed artifacts (the dollar
 totals additionally require the measured regression JSONs under
@@ -155,7 +159,7 @@ stratified regression sample spans the realised band at each order (o9 21–144,
 
 ## 4. Operational-cost model
 
-Cost is accounted in **four columns** with **Lambda GB-second the primary**,
+Cost is accounted in **five columns** with **Lambda GB-second the primary**,
 applied across every CONUS shard at each order. The 0.36.0 runs fix the config
 (**hive + sidecar + spill**, `process-shard-4096-disk`) and vary only the cache
 state across two passes (per espg):
@@ -167,20 +171,24 @@ state across two passes (per espg):
   headline.**
 
 Each order fits its **own** measured regression per pass (§4b), applied to that
-order's CONUS per-shard granule counts and summed. Primary GB-s totals (v036):
+order's CONUS per-shard granule counts and summed. The **`-disk` worker bills two
+GB-s meters**: compute RAM and ephemeral /tmp. Totals (v036):
 
 | Cost column | What it counts | Order 9 (v036) | Order 8 (v036) |
 | --- | --- | ---: | ---: |
-| **Lambda GB-s** (primary) | `Σ λ-seconds × 4 GB × $0.0000133334/GB-s`, via the per-order regression (§4b) | 28.4 M GB-s ≈ **$379** | 15.9 M GB-s ≈ **$211** |
+| **Lambda compute GB-s** (primary) | `Σ λ-seconds × 4 GB × $0.0000133334/GB-s` (current arm64 rate), via the per-order regression (§4b) | 28.4 M GB-s ≈ **$379** | 15.9 M GB-s ≈ **$211** |
+| **Ephemeral /tmp GB-s** | `Σ λ-seconds × 5.5 GB × $0.0000000309/GB-s` — the `-disk` worker provisions `tmp_mb=6144`, first 512 MB free → 5.5 GB billable (used by `spill`) | +**$1.2** (0.3 %) | +**$0.7** (0.3 %) |
 | **S3 PUT/GET** | output PUTs (hive: K objects/shard; still no write storm post-#211) + one-time sidecar-manifest write on the first pass; GETs are granule byte-range reads (NSIDC bucket) | small one-time | small one-time |
 | **CMR / catalog build** | one-time STAC/geoparquet catalog build (offline/local for CONUS) | ~$0 | ~$0 |
 | **CloudWatch / logs** | ~one log stream per shard | ~$1–3 | ~$1 |
+| **Total (compute + ephemeral)** | the true `-disk` bill | **$380** | **$212** |
 
-**o8 costs less in total than o9** despite peaking hotter on RAM: 12,596 shards
-vs 49,285 amortises the per-shard overhead over ~4× fewer, larger dispatch units,
-so the ~$211 o8 total undercuts o9's ~$379 — the coarsening win (§4c). o8 carries
-a wider interval (±15 % vs ±11 %) because spill's fixed per-shard overhead
-dominates its fit (§4b).
+The ephemeral term is **~0.3 % of compute** at CONUS density (immaterial but now
+correct — spill trades RAM for a small /tmp budget). **o8 costs less in total than
+o9** despite peaking hotter on RAM: 12,596 shards vs 49,285 amortises the per-shard
+overhead over ~4× fewer, larger dispatch units, so the ~$212 o8 total undercuts
+o9's ~$380 — the coarsening win (§4c). o8 carries a wider interval (±15 % vs ±11 %)
+because spill's fixed per-shard overhead dominates its fit (§4b).
 
 **The #288 store-cache fix is small at CONUS scale (~4–5 %).** The sidecar caches
 the *index* (each granule's chunk map / HDF5 byte-ranges), not the photon data, so
@@ -216,15 +224,18 @@ cache, v036 warm + #288). **All 25 shards succeeded at both orders in both
 passes** — o8 only because `spill` bounds RAM (§4c). Raw per-shard points:
 `data/conus/results/conus_o{8,9}_v0{35,36}.json`.
 
+CONUS total is the full `-disk` bill (compute + ephemeral /tmp, §4); the fit and
+CI are on `Σ λ-seconds`:
+
 | order · pass | fit (granules → λ-seconds) | R² | CONUS total | 95 % CI |
 | --- | --- | ---: | ---: | ---: |
-| **o9 · v036** (warm + #288) | `1.86 × granules + 10 s/shard` | 0.79 | **$379** | $339–419 |
-| o9 · v035 (cold cache) | `2.03 × granules + 3 s/shard` | 0.79 | $394 | $351–437 |
-| **o8 · v036** (warm + #288) | `1.52 × granules + 144 s/shard` | 0.32 | **$211** | $180–243 |
-| o8 · v035 (cold cache) | `1.36 × granules + 181 s/shard` | 0.27 | $223 | $192–255 |
+| **o9 · v036** (warm + #288) | `1.86 × granules + 10 s/shard` | 0.79 | **$380** | $340–420 |
+| o9 · v035 (cold cache) | `2.03 × granules + 3 s/shard` | 0.79 | $395 | $352–439 |
+| **o8 · v036** (warm + #288) | `1.52 × granules + 144 s/shard` | 0.32 | **$212** | $180–244 |
+| o8 · v035 (cold cache) | `1.36 × granules + 181 s/shard` | 0.27 | $224 | $192–256 |
 
 The **v035→v036 (store-cache-fix) effect** on the full-CONUS total is **−4 %** (o9,
-$394→$379) / **−5 %** (o8, $223→$211); on the raw 25-shard sample it is −4.5 % (o9)
+$395→$380) / **−5 %** (o8, $224→$212); on the raw 25-shard sample it is −4.5 % (o9)
 / −4.3 % (o8). The per-shard delta is **noisy** — individual shards move −28…+26 %
 (o9) and **−37…+32 %** (o8) — because concurrent-shard S3/Lambda contention swamps
 the ~0.3 s/granule the fix saves at CONUS density. o8's low R² (0.27–0.32) reflects
