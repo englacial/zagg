@@ -3,8 +3,9 @@
 **Status**: draft. Tracks [#198](https://github.com/englacial/zagg/issues/198);
 temporal-partitioning amendments (D13–D15) ratified on
 [#237](https://github.com/englacial/zagg/issues/237); morton-only-storage
-amendment (D16, O10) ratified on
-[#262](https://github.com/englacial/zagg/issues/262).
+amendment ratified on
+[#262](https://github.com/englacial/zagg/issues/262) (D16; open item O10
+carved from it).
 
 > All design decisions (both made and open) are consolidated in the
 > [Decisions registry](#8-decisions-registry). Inline references use **D#** for
