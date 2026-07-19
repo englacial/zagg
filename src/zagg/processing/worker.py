@@ -206,12 +206,14 @@ def process_shard(
         be a read column (declared, e.g. the windowing ``time_field``) or the
         key is likewise omitted.
     profile : bool, optional
-        Opt-in per-phase timing (issue #100 phase 2). When ``True``, fills
-        ``metadata["phase_timings"]`` with ``read`` / ``index`` / ``aggregate``
-        wall-clock seconds (``time.time()`` deltas) for the in-worker stages.
-        Default ``False`` takes the current path unchanged — no added timing
-        calls, no ``phase_timings`` key — so the worker pays no probe tax on
-        ordinary runs. (The ``write`` phase runs in the lambda handler, outside
+        Retained knob from the opt-in era (issue #100 phase 2); phase-timing
+        COLLECTION is now always-on (issue #297): ``metadata["phase_timings"]``
+        always carries ``read`` / ``index`` / ``aggregate`` wall-clock seconds
+        (``time.time()`` deltas — a handful of calls per shard, no measurable
+        probe tax) so the per-shard stats sidecar is complete by default. The
+        flag still gates *verbosity* elsewhere (e.g. the dispatcher's summary
+        rollups and the raster per-stage stats); it no longer changes this
+        function's behavior. (The ``write`` phase runs in the caller, outside
         this function.)
 
     Returns
@@ -325,10 +327,11 @@ def process_shard(
     else:
         buffered = None
 
-    # Opt-in per-phase timing (issue #100). Only allocated when profiling so the
-    # default path stays byte-identical (no dict, no time.time() calls).
-    phase_timings: dict | None = {} if profile else None
-    _read_t0 = time.time() if profile else None
+    # Per-phase timing (issue #100; always-on collection since issue #297 —
+    # the stats sidecar needs complete timings by default, and the cost is a
+    # few time.time() calls per shard).
+    phase_timings: dict = {}
+    _read_t0 = time.time()
 
     # Granule fan-out width (issue #180). Resolved before any read so a bad
     # value is a loud config error, not N per-granule warnings. (Backend
@@ -495,8 +498,7 @@ def process_shard(
         # deliberately charges ALL group+merge cost to ``read`` — the tail
         # flush must not fall between phases and vanish from the accounting.
         buffered.flush()
-    if profile:
-        phase_timings["read"] = time.time() - _read_t0
+    phase_timings["read"] = time.time() - _read_t0
 
     if buffered.empty if buffered is not None else not all_reads:
         # Distinguish a genuinely-empty read from one where a group read raised
@@ -514,8 +516,7 @@ def process_shard(
             logger.info(f"  No data after filtering for shard {label} - skipping")
             metadata["error"] = "No data after filtering"
         metadata["duration_s"] = (datetime.now() - start_time).total_seconds()
-        if profile:
-            metadata["phase_timings"] = phase_timings
+        metadata["phase_timings"] = phase_timings
         return pd.DataFrame(), metadata
 
     data_vars = get_data_vars(config)
@@ -551,7 +552,7 @@ def process_shard(
             f"(the runner does)."
         )
 
-    _index_t0 = time.time() if profile else None
+    _index_t0 = time.time()
 
     # ---- Pool the shard's reads ONCE (shared across all K chunks) -------------
     # The shard is read+grouped a single time; only the ``chunk_precompute``
@@ -592,9 +593,8 @@ def process_shard(
                 np.fromiter(cell_to_slice.keys(), dtype=np.uint64, count=len(cell_to_slice))
             )
 
-    if profile:
-        phase_timings["index"] = time.time() - _index_t0
-        _aggregate_t0 = time.time()
+    phase_timings["index"] = time.time() - _index_t0
+    _aggregate_t0 = time.time()
 
     # ---- Aggregate + build one carrier per finer chunk -----------------------
     # ``iter_chunks`` is the K-chunk seam (issue #30 item 3); a minimal grid (e.g.
@@ -705,17 +705,16 @@ def process_shard(
         # remainder (defensive) and the cached grouped partition.
         buffered.close()
 
-    if profile:
-        phase_timings["aggregate"] = time.time() - _aggregate_t0
-        if spill_mode:
-            # The espg-approved /tmp throughput instrumentation (issue #217):
-            # exact bytes spilled plus the wall spent in partition appends and
-            # read-backs. Read-backs can land in either the read phase (block
-            # closes mid-read) or the aggregate phase (single-block reduce).
-            phase_timings["spill_write_s"] = buffered.spill_write_s
-            phase_timings["spill_read_s"] = buffered.spill_read_s
-            phase_timings["spill_bytes"] = buffered.spill_bytes
-        metadata["phase_timings"] = phase_timings
+    phase_timings["aggregate"] = time.time() - _aggregate_t0
+    if spill_mode:
+        # The espg-approved /tmp throughput instrumentation (issue #217):
+        # exact bytes spilled plus the wall spent in partition appends and
+        # read-backs. Read-backs can land in either the read phase (block
+        # closes mid-read) or the aggregate phase (single-block reduce).
+        phase_timings["spill_write_s"] = buffered.spill_write_s
+        phase_timings["spill_read_s"] = buffered.spill_read_s
+        phase_timings["spill_bytes"] = buffered.spill_bytes
+    metadata["phase_timings"] = phase_timings
 
     duration = (datetime.now() - start_time).total_seconds()
     logger.info(f"Completed shard {label} in {duration:.1f}s")

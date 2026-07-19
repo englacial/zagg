@@ -549,10 +549,11 @@ def test_hive_sharded_store_matches_model(tmp_path, monkeypatch):
         root, grid=grid, shard_keys=[shard], store_layout="hive"
     )
     # Exact: per leaf = root+group zarr.json (2) + one zarr.json AND one data
-    # object per array + the coverage sidecar; store root = manifest + MOC.
+    # object per array + the coverage sidecar + the stats.json sibling
+    # (issue #297); store root = manifest + MOC.
     n_arrays = len(grid.shard_spec().members)
     assert expected["exact"] is True
-    assert expected["per_shard_max"] == 2 + 2 * n_arrays + 1
+    assert expected["per_shard_max"] == 2 + 2 * n_arrays + 1 + 1
     assert expected["metadata"] == 2
     assert measured["objects_total"] == expected["total_max"]
     assert measured["objects_other"] == 0

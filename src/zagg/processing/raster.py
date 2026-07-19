@@ -1056,11 +1056,11 @@ def process_and_write_raster_hive(
     sidecar (edge shards only; interior shards stamp ``"full"`` with no
     sidecar PUT) -> stamp. ``cells_with_data`` counts the occupied-cell
     union; ``granule_count`` the unit's acquisitions (asset-carrying
-    entries). ``profile`` mirrors the flat handler's issue #100/#249
-    convention: ``metadata["phase_timings"] = {"sample", "write", "stages"}``
-    with the leaf write-out (template + slabs + sidecar + stamp) as
-    ``write``; default makes no timing calls beyond a passed-through
-    ``stage_stats`` (the local dispatcher's debug-logging flavor).
+    entries). Phase timings are always collected (issue #297):
+    ``metadata["phase_timings"] = {"sample", "write"}`` with the leaf
+    write-out (template + slabs + sidecar + stamp) as ``write``; the
+    per-stage ``stages`` block (issue #249) stays gated on ``profile`` /
+    a passed ``stage_stats`` (the local dispatcher's debug-logging flavor).
     """
     from zagg.hive import (
         COVERAGE_SIDECAR,
@@ -1104,10 +1104,9 @@ def process_and_write_raster_hive(
 
     def _write_slab(t_idx, slab):
         nonlocal write_s
-        _t0 = time.time() if profile else None
+        _t0 = time.time()
         write_raster_leaf_slab(_leaf(), grid, t_idx, slab)
-        if profile:
-            write_s += time.time() - _t0
+        write_s += time.time() - _t0
 
     occupied: list = []
     _slabs, meta = process_raster_shard(
@@ -1127,7 +1126,7 @@ def process_and_write_raster_hive(
     # order is pinned: dense slabs -> coverage sidecar -> stamp.
     meta["cells_with_data"] = 0
     if "store" in box:
-        _t0 = time.time() if profile else None
+        _t0 = time.time()
         words = occupied[0] if occupied and occupied[0].size else None
         # D14 popcount: a fully-occupied subtree stamps encoding "full" — no
         # sidecar PUT. Gated on a windowed unit (/2 stores) so schedule-none
@@ -1158,17 +1157,19 @@ def process_and_write_raster_hive(
             window=label,
             time_range=time_range,
         )
-        if profile:
-            write_s += time.time() - _t0
-    # Phase split (issues #100/#249, the flat raster handler's convention):
-    # only a unit that actually wrote carries it, so a no-data unit stays
-    # write-less and sample/write always decompose this call's wall.
-    if profile and "store" in box:
+        write_s += time.time() - _t0
+    # Phase split (issues #100/#249; always-on collection since issue #297 —
+    # the stats sidecar needs complete timings by default): only a unit that
+    # actually wrote carries it, so a no-data unit stays write-less and
+    # sample/write always decompose this call's wall. The per-stage ``stages``
+    # block stays verbosity, gated on profiling/debug (a passed stage_stats).
+    if "store" in box:
         meta["phase_timings"] = {
             "sample": (time.time() - t_start) - write_s,
             "write": write_s,
-            "stages": stage_stats,
         }
+        if stage_stats is not None:
+            meta["phase_timings"]["stages"] = stage_stats
     return meta
 
 

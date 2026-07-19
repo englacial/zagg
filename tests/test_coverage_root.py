@@ -290,7 +290,11 @@ class TestLocalRootCoverage:
 
         root, _shard = self._agg(monkeypatch, tmp_path, coverage_moc=False)
         assert hive.read_root_coverage(root) is None
-        assert sorted(os.listdir(root)) == [hive.MANIFEST_NAME]
+        # Root carries the manifest plus the successful shard's node dir (its
+        # stats sidecar, issue #297) — but no coverage.moc.
+        listing = sorted(os.listdir(root))
+        assert hive.ROOT_COVERAGE_NAME not in listing
+        assert listing[-1] == hive.MANIFEST_NAME and len(listing) == 2
 
 
 class TestLambdaCoverageDispatch:

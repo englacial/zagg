@@ -742,6 +742,7 @@ class RasterStrategy:
             write_raster_coords,
             write_raster_slab,
         )
+        from zagg.telemetry import build_record, raster_granule_ids, write_sidecar
 
         catalog_path = catalog or config.catalog
         if not catalog_path:
@@ -853,6 +854,7 @@ class RasterStrategy:
             shard_key, granules = pair[0], pair[1]
             window = pair[2] if len(pair) > 2 else None
             wrote = False
+            unit_t0 = time.time()
             # Per-stage sample profiling (issue #249), the local flavor of the
             # lambda handler's opt-in ``profile`` key: allocated when profiling
             # (issue #250) or when debug logging is on, so the default path
@@ -910,6 +912,27 @@ class RasterStrategy:
                 logger.debug(
                     f"raster shard {shard_label(grid, int(shard_key))} stages: {stage_stats}"
                 )
+            # Per-shard stats record (issue #297), the raster-local flavor:
+            # hive units that wrote a leaf (timesteps > 0 -> stamped) get the
+            # sidecar sibling; the record rides ``meta`` for the run parquet
+            # either way. Fail-open on the sidecar PUT.
+            meta.setdefault("duration_s", time.time() - unit_t0)
+            record = build_record(
+                shard_key=int(shard_key),
+                metadata=meta,
+                granule_ids=raster_granule_ids(granules),
+            )
+            meta["stats"] = record
+            if store_layout == "hive" and meta.get("timesteps"):
+                from zagg.hive import shard_leaf_path
+
+                try:
+                    leaf = shard_leaf_path(
+                        store_path, int(shard_key), window=window["label"] if window else None
+                    )
+                    write_sidecar(leaf, record, **store_kwargs)
+                except Exception as e:
+                    logger.warning(f"stats sidecar write failed (fail-open, issue #297): {e}")
             return meta, stage_stats, write_s
 
         stage_max: dict = {}
@@ -1104,6 +1127,11 @@ class RasterStrategy:
             result_prefix = f"{store_path.rstrip('/')}.status/{uuid.uuid4().hex}"
             function_timeout_s = _get_function_timeout_s(client, function_name)
             logger.info(f"Async raster results at {result_prefix}")
+        # Caller identity for the per-shard stats records (issue #297):
+        # resolved once per run, stamped into every shard event. Reuses the
+        # module's client seam (a bare namespace with .client) so tests that
+        # patch boto3.client intercept it like every other invoke.
+        invoked_by = _resolve_invoked_by(boto3, region)
         # Ping → setup, bracketed as template_s (the setup-ish wall the
         # benchmark splits from fan-out, issue #250). Flat: the template is
         # load-bearing before fan-out — workers write slabs into its arrays —
@@ -1174,10 +1202,12 @@ class RasterStrategy:
                 keys = {e.get("time_key") or e.get("datetime") for e in granules if e.get("assets")}
                 ev["time_index"] = {k: time_index[k] for k in keys}
             if profile:
-                # Opt-in (issue #250): the worker then emits phase_timings
-                # (write bucket + issue #249 stages). Absent -> the payload is
-                # byte-identical to the pre-profile path (the #100 convention).
+                # Opt-in (issue #250): the worker then adds the per-stage
+                # ``stages`` block to its (now always-on, issue #297)
+                # phase_timings.
                 ev["profile"] = True
+            if invoked_by is not None:
+                ev["invoked_by"] = invoked_by
             if output_creds_event is not None:
                 ev["output_credentials"] = output_creds_event
             return ev
@@ -1993,6 +2023,28 @@ def _raster_windowed_units(cells: list[tuple], windowing: dict) -> list:
     return units
 
 
+def _resolve_invoked_by(session, region) -> dict | None:
+    """Caller identity for the run's stats records (issue #297), or ``None``.
+
+    Resolved ONCE per run via ``sts get-caller-identity`` and stamped into
+    every invoke payload — the worker cannot see the invoker (Event invokes
+    carry no caller identity) and copies this verbatim into the sidecar; the
+    run parquet carries it as a column. Fail-open: a failed resolve logs and
+    the records carry ``null`` rather than failing the run.
+    """
+    try:
+        ident = session.client("sts", region_name=region).get_caller_identity()
+        arn, userid = ident["Arn"], ident["UserId"]
+        # Shape-check rather than trust: a stubbed/mocked session must degrade
+        # to None, not stamp junk into every worker's persisted record.
+        if not (isinstance(arn, str) and isinstance(userid, str)):
+            return None
+        return {"arn": arn, "userid": userid}
+    except Exception as e:
+        logger.warning(f"sts get-caller-identity failed; stats invoked_by omitted: {e}")
+        return None
+
+
 def _resolve_source_credentials(config) -> dict:
     """S3 read credentials for the source datasets, provider-selected.
 
@@ -2192,6 +2244,7 @@ def _run_local(
     # Build grid from the run config (single source of truth) and refuse a
     # shard map built for a different grid.
     from zagg.grids import from_config
+    from zagg.telemetry import build_record, write_sidecar
 
     grid = from_config(config)
     _check_signature(grid, catalog_data)
@@ -2290,6 +2343,27 @@ def _run_local(
                     handoff=handoff,
                     **extra,
                 )
+            # Per-shard stats record (issue #297): same schema as the Lambda
+            # worker's (no lambda config / caller identity on the local
+            # backend). Hive leaves get the stats.json sidecar SIBLING on
+            # success; the record rides ``meta`` for the run parquet either
+            # way. Fail-open on the sidecar PUT.
+            record = build_record(
+                shard_key=int(shard_key),
+                metadata=meta,
+                granule_ids=_resolve_urls(records, driver),
+            )
+            meta["stats"] = record
+            if store_layout == "hive" and not meta.get("error"):
+                from zagg.hive import shard_leaf_path
+
+                try:
+                    leaf = shard_leaf_path(
+                        store_path, int(shard_key), window=window["label"] if window else None
+                    )
+                    write_sidecar(leaf, record, **store_kwargs)
+                except Exception as e:
+                    logger.warning(f"stats sidecar write failed (fail-open, issue #297): {e}")
             return {"shard_key": shard_key, "ok": True, "meta": meta}
         except Exception as e:
             return {"shard_key": shard_key, "ok": False, "error": e}
@@ -2524,6 +2598,9 @@ def _run_lambda(
     # over a not-yet-built name.
     session = boto3.Session()
     state: dict = {}
+    # Caller identity for the per-shard stats records (issue #297): resolved
+    # once per run, stamped into every cell event; workers copy it verbatim.
+    invoked_by = _resolve_invoked_by(session, region)
 
     def _preflight(n):
         # Pre-flight concurrency probe: clamp workers to what local file
@@ -2639,6 +2716,7 @@ def _run_lambda(
             handoff=handoff,
             profile=profile,
             label=label,
+            invoked_by=invoked_by,
             **extra,
         )
 
@@ -4097,6 +4175,7 @@ def _invoke_lambda_cell(
     result_fetch=None,
     poll_timeout_s=None,
     label=None,
+    invoked_by=None,
 ):
     """Invoke Lambda for a single cell with retry logic.
 
@@ -4161,6 +4240,10 @@ def _invoke_lambda_cell(
     # it, staying byte-identical to the pre-handoff path (#130).
     if handoff and handoff != "pandas":
         event["handoff"] = handoff
+    # Caller identity for the stats record (issue #297); absent when the STS
+    # resolve failed (fail-open), keeping the event key optional.
+    if invoked_by is not None:
+        event["invoked_by"] = invoked_by
     # Async dispatch (issue #151): tell the worker where to mirror its response
     # envelope and fire-and-forget. Absent -> the legacy synchronous invoke.
     invocation_type = "RequestResponse"

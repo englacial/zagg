@@ -929,11 +929,11 @@ class TestProcessAndWriteHiveSharded:
 
 
 class TestHiveProfileWritePhase:
-    """Issue #249 (PR #256): opt-in ``profile`` adds an additive ``write``
-    phase to the hive worker's ``phase_timings``, next to process_shard's
-    read/index/aggregate — the same split the flat Lambda handler has carried
-    since issue #100. Default off: zero timing calls and byte-identical
-    output."""
+    """Issues #249/#297: the hive worker's ``phase_timings`` carry an additive
+    ``write`` phase next to process_shard's read/index/aggregate — the same
+    split the flat Lambda handler has carried since issue #100. Collection is
+    always-on since issue #297 (the stats sidecar needs complete timings);
+    ``profile`` no longer changes this function's metadata."""
 
     _grid = TestProcessAndWriteHive._grid
     _carrier = TestProcessAndWriteHive._carrier
@@ -944,13 +944,12 @@ class TestHiveProfileWritePhase:
     _SHARD_PHASES = {"read": 1.0, "index": 0.5, "aggregate": 0.25}
 
     def _profiled_fake(self, grid, ragged=None, error=None):
-        """Streaming fake honoring the real profile contract: seeds
-        ``metadata['phase_timings']`` only when ``profile=True`` arrives."""
+        """Streaming fake honoring the real (always-on, issue #297) contract:
+        ``metadata['phase_timings']`` is always seeded."""
 
         def fake(g, shard_key, urls, **kwargs):
             meta = self._meta(shard_key, error=error)
-            if kwargs.get("profile"):
-                meta["phase_timings"] = dict(self._SHARD_PHASES)
+            meta["phase_timings"] = dict(self._SHARD_PHASES)
             if error is None:
                 carrier = self._carrier(grid, shard_key)
                 kwargs["write_chunk"](grid.block_index(int(shard_key)), carrier, ragged or {})
@@ -977,9 +976,9 @@ class TestHiveProfileWritePhase:
         )
         return grid, shard, root, meta
 
-    def test_profile_adds_nonnegative_write_phase(self, monkeypatch, cfg, tmp_path):
+    def test_write_phase_added_nonnegative(self, monkeypatch, cfg, tmp_path):
         fake = self._profiled_fake(self._grid(cfg), ragged={"h": ([np.array([1.0, 2.0])], [0])})
-        _grid, _shard, _root, meta = self._run(monkeypatch, cfg, tmp_path, fake, profile=True)
+        _grid, _shard, _root, meta = self._run(monkeypatch, cfg, tmp_path, fake)
         timings = meta["phase_timings"]
         # Additive: the process_shard phases keep their names and values.
         assert set(timings) == {"read", "index", "aggregate", "write"}
@@ -1010,7 +1009,6 @@ class TestHiveProfileWritePhase:
             str(tmp_path / "store"),
             cfg,
             store_kwargs={},
-            profile=True,
         )
         assert meta["phase_timings"]["write"] >= 0.0
         assert set(meta["phase_timings"]) == {"read", "index", "aggregate", "write"}
@@ -1019,41 +1017,28 @@ class TestHiveProfileWritePhase:
         # Same gate as the flat handler (issue #100): a shard that wrote no
         # leaf carries no write phase — read/index/aggregate stay as reported.
         fake = self._profiled_fake(self._grid(cfg), error="No granules found")
-        _grid, _shard, root, meta = self._run(monkeypatch, cfg, tmp_path, fake, profile=True)
+        _grid, _shard, root, meta = self._run(monkeypatch, cfg, tmp_path, fake)
         assert meta["phase_timings"] == self._SHARD_PHASES
         assert "write" not in meta["phase_timings"]
 
-    def test_default_path_makes_no_timing_calls(self, monkeypatch, cfg, tmp_path):
-        # The issue #249 zero-overhead gate, hive edition: without profile the
-        # write path must never call time.time(). Rebind hive.py's module-level
-        # ``time`` name to a booby trap — only this module's calls are caught.
-        class _Boom:
-            @staticmethod
-            def time():
-                raise AssertionError("time.time() called on the unprofiled hive write path")
-
-        monkeypatch.setattr(hive, "time", _Boom)
+    def test_default_path_collects_write_phase(self, monkeypatch, cfg, tmp_path):
+        # Always-on collection (issue #297): the write bracket is stamped
+        # without any profile flag — the sidecar record is complete by default.
         fake = self._profiled_fake(self._grid(cfg), ragged={"h": ([np.array([1.0, 2.0])], [0])})
         _grid, shard, root, meta = self._run(monkeypatch, cfg, tmp_path, fake)
-        assert "phase_timings" not in meta
+        assert set(meta["phase_timings"]) == {"read", "index", "aggregate", "write"}
         # The leaf still landed, fully stamped.
         from zagg.store import open_store
 
         leaf = hive.shard_leaf_path(root, shard)
         assert hive.read_commit(open_store(leaf))["complete"] is True
 
-    def test_sharded_default_path_makes_no_timing_calls(self, monkeypatch, cfg, tmp_path):
-        # Sharded edition of the trap (review finding): the post-stream
-        # write_leaf_to_zarr bracket must also make zero time.time() calls
-        # when profile is off — the streaming trap above never executes it.
+    def test_sharded_default_path_stamps_write_when_timed(self, monkeypatch, cfg, tmp_path):
+        # Sharded edition: the post-stream write_leaf_to_zarr bracket lands in
+        # the always-on write bucket too (a fake without phase_timings gets no
+        # write key — the "populated phase_timings" gate is unchanged).
         import zagg.processing as processing
 
-        class _Boom:
-            @staticmethod
-            def time():
-                raise AssertionError("time.time() called on the unprofiled sharded write path")
-
-        monkeypatch.setattr(hive, "time", _Boom)
         sharded_helper = TestProcessAndWriteHiveSharded()
         grid = sharded_helper._grid(cfg)
         fake = _sharded_accumulate_fake(grid, sharded_helper._chunk_carrier, self._meta)
@@ -1063,8 +1048,9 @@ class TestHiveProfileWritePhase:
         meta = hive.process_and_write_hive(
             shard, ["s3://b/g1.h5"], grid, {}, root, cfg, store_kwargs={}
         )
+        # The fake seeds no phase_timings, so none appear (the write stamp
+        # rides an existing dict); the sharded leaf still landed, stamped.
         assert "phase_timings" not in meta
-        # The sharded leaf still landed, fully stamped.
         from zagg.store import open_store
 
         leaf = hive.shard_leaf_path(root, shard)
@@ -1102,10 +1088,12 @@ class TestHiveProfileWritePhase:
                 assert on == off
             else:
                 assert outs["on"][rel] == outs["off"][rel], rel
-        # And the metadata differs ONLY by the phase_timings sub-dict.
+        # And the metadata matches modulo the wall-clock timing VALUES
+        # (collection is always-on since issue #297, so both carry the keys).
         on_meta = {k: v for k, v in leaves["on"].items() if k != "phase_timings"}
-        assert on_meta == leaves["off"]
-        assert "phase_timings" not in leaves["off"]
+        off_meta = {k: v for k, v in leaves["off"].items() if k != "phase_timings"}
+        assert on_meta == off_meta
+        assert set(leaves["on"]["phase_timings"]) == set(leaves["off"]["phase_timings"])
 
 
 class TestLeafBlockIndex:
@@ -1174,8 +1162,16 @@ class TestRunnerWiring:
         assert calls == [(shard, root)]
         # The run wrote ONLY the manifest at the root — no shared zarr
         # template (D5). The root coverage.moc (issue #200 phase 3,
-        # default-on for hive) is the only other root object.
-        assert sorted(os.listdir(root)) == [hive.ROOT_COVERAGE_NAME, hive.MANIFEST_NAME]
+        # default-on for hive) is the only other root object, plus the
+        # successful shard's node dir carrying its stats sidecar (issue #297;
+        # the mocked worker wrote no leaf, so the node holds only stats.json).
+        listing = sorted(os.listdir(root))
+        node = listing[0]
+        assert listing == [node, hive.ROOT_COVERAGE_NAME, hive.MANIFEST_NAME]
+        from zagg.telemetry import read_sidecar
+
+        leaf = hive.shard_leaf_path(root, shard)
+        assert read_sidecar(leaf)["shard_key"] == shard
         assert hive.read_manifest(root)["shard_order"] == 6
 
     def test_local_hive_finalize_backstop_restores_lost_manifest(self, monkeypatch, cfg, tmp_path):

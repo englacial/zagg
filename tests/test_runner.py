@@ -3394,8 +3394,8 @@ class TestProfilePlumbing:
 
 
 class TestWorkerPhaseTimings:
-    """``process_shard(profile=...)`` emits ``phase_timings`` only when set, and
-    leaves the default metadata unchanged otherwise (issue #100 phase 2)."""
+    """``process_shard`` collects ``phase_timings`` always-on (issue #297; the
+    opt-in ``profile`` gate of issue #100 no longer gates collection)."""
 
     def _run(self, monkeypatch, *, profile, with_data=True):
         import numpy as np
@@ -3464,9 +3464,10 @@ class TestWorkerPhaseTimings:
         )
         return meta
 
-    def test_no_phase_timings_by_default(self, monkeypatch):
+    def test_phase_timings_present_by_default(self, monkeypatch):
+        # Always-on collection (issue #297): no profile flag needed.
         meta = self._run(monkeypatch, profile=False)
-        assert "phase_timings" not in meta
+        assert set(meta["phase_timings"]) == {"read", "index", "aggregate"}
 
     def test_phase_timings_present_when_profiled(self, monkeypatch):
         meta = self._run(monkeypatch, profile=True)

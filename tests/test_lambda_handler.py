@@ -153,6 +153,18 @@ class TestProcessEventDispatch:
         assert resp["statusCode"] == 200
         assert captured["shard_key"] == 12345
 
+    def test_flat_body_carries_stats_record_no_sidecar(self, handler_mod, monkeypatch):
+        # Issue #297: flat layouts have no per-shard leaf, so no sidecar
+        # object — but the record still rides the envelope for the parquet.
+        event = _base_event(_healpix_config_dict())
+        event["child_order"] = 12
+        event["invoked_by"] = {"arn": "arn:aws:iam::123:user/x", "userid": "AIDAEXAMPLE"}
+        resp, _captured = self._run(handler_mod, monkeypatch, event)
+        body = json.loads(resp["body"])
+        assert body["stats"]["schema_version"] == 1
+        assert body["stats"]["shard_key"] == 12345
+        assert body["stats"]["invoked_by"] == event["invoked_by"]
+
     def test_handoff_event_key_forwarded_to_worker(self, handler_mod, monkeypatch):
         # issue #130: an explicit handoff event key reaches process_shard so the
         # deployed worker selects the named carrier (the key still wins, #132 wire (A)).
@@ -896,6 +908,8 @@ class TestProcessHive:
                 "granule_count": 1,
                 "files_processed": 1,
                 "duration_s": 0.0,
+                # Mirrors the real worker's always-on collection (issue #297).
+                "phase_timings": {"read": 0.0, "index": 0.0, "aggregate": 0.0},
                 "error": None,
             }
 
@@ -1038,6 +1052,66 @@ class TestProcessHive:
         for name, vals in coords.items():
             df[name] = vals
         return df
+
+    def test_hive_event_writes_stats_sidecar(self, handler_mod, monkeypatch, tmp_path):
+        # Issue #297: on success the worker writes the stats record as a
+        # SIBLING of the leaf .zarr, byte-equal to the envelope's
+        # body["stats"], with invoked_by copied verbatim from the event.
+        import zagg.processing as processing
+        from zagg import hive
+        from zagg.telemetry import granules_sha256, read_sidecar
+
+        grid = self._grid()
+        monkeypatch.setattr(processing, "process_shard", self._streaming_fake(grid))
+        event = self._event(tmp_path)
+        event["invoked_by"] = {"arn": "arn:aws:iam::123:user/x", "userid": "AIDAEXAMPLE"}
+        resp = handler_mod._handle_process(event, _context())
+        assert resp["statusCode"] == 200, resp["body"]
+        body = json.loads(resp["body"])
+
+        leaf = hive.shard_leaf_path(event["store_path"], self._WORD)
+        record = read_sidecar(leaf)
+        assert record == body["stats"]
+        assert record["schema_version"] == 1
+        assert record["shard_key"] == self._WORD
+        assert record["template_hash"] is None
+        assert record["success"] is True and record["error"] is None
+        assert record["n_obs"] == 7 and record["cells_with_data"] == 5
+        assert record["n_granules"] == 1
+        assert record["granules_sha256"] == granules_sha256(event["granule_urls"])
+        assert record["invoked_by"] == event["invoked_by"]
+        # Memory telemetry is stamped BEFORE the record is built (issue #141
+        # sampler / ru_maxrss fallback), so the sidecar carries it.
+        assert record["max_memory_mb"] is not None
+        assert record["container_hwm_mb"] is not None
+        # Always-on write bracket (issue #297) flows into the record too.
+        assert "write" in record["phase_timings"]
+
+    def test_hive_no_data_shard_writes_no_sidecar(self, handler_mod, monkeypatch, tmp_path):
+        import zagg.processing as processing
+        from zagg import hive
+        from zagg.telemetry import read_sidecar
+
+        def no_data_fake(g, shard_key, urls, **kwargs):
+            return pd.DataFrame(), {
+                "shard_key": int(shard_key),
+                "cells_with_data": 0,
+                "total_obs": 0,
+                "granule_count": 1,
+                "files_processed": 1,
+                "duration_s": 0.0,
+                "error": "No data after filtering",
+            }
+
+        monkeypatch.setattr(processing, "process_shard", no_data_fake)
+        event = self._event(tmp_path)
+        resp = handler_mod._handle_process(event, _context())
+        body = json.loads(resp["body"])
+        # The record still rides the envelope (failure row material for the
+        # run parquet) but no sidecar object exists — success only.
+        assert body["stats"]["success"] is False
+        leaf = hive.shard_leaf_path(event["store_path"], self._WORD)
+        assert read_sidecar(leaf) is None
 
     def test_hive_worker_death_leaves_debris_then_retry_cleans(
         self, handler_mod, monkeypatch, tmp_path
