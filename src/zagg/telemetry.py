@@ -41,7 +41,7 @@ SIDECAR_NAME = "stats.json"
 # Merge dispositions (associative + commutative by construction). Floats sum,
 # so equality across fold orders holds up to FP summation order.
 _SUM_KEYS = ("n_shards", "n_granules", "n_obs", "cells_with_data", "duration_s")
-_SUM_OR_NONE_KEYS = ("gb_seconds", "est_cost_usd")
+_SUM_OR_NONE_KEYS = ("gb_seconds", "est_cost_usd", "spill_bytes")
 _MAX_OR_NONE_KEYS = ("max_memory_mb", "container_hwm_mb")
 _EQ_OR_NONE_KEYS = (
     "shard_key",
@@ -121,11 +121,18 @@ def build_record(
     if lambda_config and lambda_config.get("memory_mb"):
         gb_seconds = duration_s * lambda_config["memory_mb"] / 1024.0
         est_cost = gb_seconds * LAMBDA_PRICE_PER_GB_SEC
-    phase_timings = {
+    phase_entries = {
         k: float(v)
         for k, v in (metadata.get("phase_timings") or {}).items()
         if isinstance(v, (int, float)) and not isinstance(v, bool)
     }
+    # Byte-volume metrics (the spill instrumentation, issue #217) must not ride
+    # in the seconds-only phase block: the run parquet flattens phase_timings to
+    # seconds-typed columns, where a byte count would mislead cost/latency
+    # queries. Split any ``*_bytes`` entries out; surface spill volume on its own
+    # summed field (issue #297).
+    spill_bytes = phase_entries.get("spill_bytes")
+    phase_timings = {k: v for k, v in phase_entries.items() if not k.endswith("_bytes")}
     granule_ids = list(granule_ids) if granule_ids is not None else None
     n_granules = metadata.get("granule_count")
     if n_granules is None:
@@ -142,6 +149,7 @@ def build_record(
         "cells_with_data": int(metadata.get("cells_with_data") or 0),
         "phase_timings": phase_timings,
         "duration_s": duration_s,
+        "spill_bytes": spill_bytes,
         "gb_seconds": gb_seconds,
         "est_cost_usd": est_cost,
         "max_memory_mb": _opt_float(metadata.get("max_memory_mb")),
