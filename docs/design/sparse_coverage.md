@@ -551,10 +551,12 @@ rollup leaves all leaf reads intact.
   the manifest's `shard_order` (tree/dispatch order) is unrelated and stays.
   Full flat-machinery removal remains gated on the O3 reader (the #251
   phase-2 gate).
-- **D18 — Ragged output = sharded vlen-bytes** (espg-ratified in-session,
-  recorded on
-  [#209](https://github.com/englacial/zagg/issues/209#issuecomment-4940116927);
-  tracking [#210](https://github.com/englacial/zagg/issues/210)). Ragged
+- **D18 — Ragged output = sharded vlen-bytes** (measurement + recommendation
+  on
+  [#209](https://github.com/englacial/zagg/issues/209#issuecomment-4940116927),
+  with espg's in-session ratification of the vlen-bytes adoption recorded in
+  the [#210](https://github.com/englacial/zagg/issues/210) body; tracking
+  [#210](https://github.com/englacial/zagg/issues/210)). Ragged
   t-digest arrays store as `bytes` dtype + vlen-bytes codec under the
   ShardingCodec — one object per shard, 2-GET single-cell reads — with
   element interpretation as an attrs convention and a **golden-bytes framing
