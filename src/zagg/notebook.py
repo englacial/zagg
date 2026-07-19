@@ -20,7 +20,7 @@ from __future__ import annotations
 import html
 import logging
 
-from zagg.config import PipelineConfig, get_windowing
+from zagg.config import PipelineConfig, get_pipeline_type, get_store_layout, get_windowing
 from zagg.dispatch import LAMBDA_ARCH, max_cost_usd
 
 logger = logging.getLogger(__name__)
@@ -40,13 +40,30 @@ def max_cost_preview(
 ) -> dict:
     """Resolve the pre-invoke cost ceiling from shardmap + config alone.
 
-    Mirrors ``_run_lambda``'s unit accounting -- cell selection
-    (``max_cells``/``morton_cell``) and the issue #246 windowed-unit expansion
-    -- so the previewed ceiling equals the one the run logs before fan-out.
+    Mirrors the dispatching path's unit accounting -- cell selection
+    (``max_cells``/``morton_cell``) and the windowed-unit expansion -- so the
+    previewed ceiling equals the one the run logs before fan-out. The unit
+    accounting branches on pipeline kind exactly as :func:`~zagg.runner.agg`:
+    the spatial path expands with :func:`~zagg.runner._windowed_units` (issue
+    #246); the ``reader: raster`` re-route mirrors ``RasterStrategy.run``, whose
+    windowed fan-out (:func:`~zagg.runner._raster_windowed_units`, issue #247)
+    fires only on the hive layout and groups by acquisition, so its unit count
+    differs from the spatial expansion for a windowed-raster config. A temporal
+    run has no shardmap ceiling -- its fan-out unit is the ``events=`` item
+    resolved at call time, not a catalog shard -- so this raises ``ValueError``.
     Returns ``{n_units, memory_gb, arch, timeout_s, max_cost_usd}``. No AWS
     access and no grid-signature check: this is display math, not dispatch.
     """
     from zagg import runner
+
+    kind = get_pipeline_type(config)
+    if kind == "temporal":
+        raise ValueError(
+            "temporal runs take events=; no shardmap ceiling (the fan-out unit "
+            "is the event, resolved at call time, not a catalog shard)"
+        )
+    if kind == "spatial" and (config.data_source or {}).get("reader") == "raster":
+        kind = "raster"
 
     catalog_path = catalog or config.catalog
     if not catalog_path:
@@ -54,7 +71,12 @@ def max_cost_preview(
     catalog_data = runner._load_catalog(catalog_path)
     cells = runner._select_cells(catalog_data, morton_cell=morton_cell, max_cells=max_cells)
     windowing = get_windowing(config)
-    if windowing is not None:
+    if kind == "raster":
+        # Mirror RasterStrategy.run: windowed fan-out only on the hive layout;
+        # otherwise one unit per selected cell (cells == _select_cells).
+        if get_store_layout(config) == "hive" and windowing is not None:
+            cells = runner._raster_windowed_units(cells, windowing)
+    elif windowing is not None:
         cells = runner._windowed_units(cells, windowing, (config.bounds or {}).get("temporal"))
     memory_gb = runner._worker_memory_gb(config)
     timeout_s = runner._DEFAULT_FUNCTION_TIMEOUT_S
