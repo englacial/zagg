@@ -1516,6 +1516,7 @@ class TestSummaryKeysByteIdentical:
         "worker_cold_starts",
         "worker_warm_starts",
         "worker_rss_start_max_by_gen",
+        "run_stats_path",  # run-level stats parquet (issue #297 phase 3)
     }
 
     def test_local_summary_keys_and_counts(self, monkeypatch, atl06_config):

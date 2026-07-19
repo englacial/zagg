@@ -2117,6 +2117,13 @@ def _write_run_stats(store_path, rows, *, run_id, store_kwargs, summary=None) ->
     CI OIDC benchmark role), and a missing parquet must never fail a run whose
     data landed — the leaf sidecars remain the durable per-shard truth.
     """
+    # Keep the summary key set deterministic (issue #297): ``run_stats_path``
+    # is always present, defaulting to None, and only rewritten to the real
+    # path once the PUT lands. A skipped/empty/fail-open write leaves it None
+    # rather than absent, so consumers (and TestSummaryKeysByteIdentical) see a
+    # stable schema regardless of write outcome.
+    if summary is not None:
+        summary["run_stats_path"] = None
     if not rows:
         return
     try:

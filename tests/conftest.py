@@ -68,9 +68,14 @@ def _no_s3_run_stats(monkeypatch):
 
     real = runner._write_run_stats
 
-    def guard(store_path, rows, **kwargs):
+    def guard(store_path, rows, *, summary=None, **kwargs):
         if str(store_path).startswith("s3://"):
+            # Skip the live PUT, but mirror the real helper's schema contract
+            # (issue #297): a skipped write still leaves ``run_stats_path``
+            # present (None), so the summary key set stays deterministic.
+            if summary is not None:
+                summary["run_stats_path"] = None
             return
-        return real(store_path, rows, **kwargs)
+        return real(store_path, rows, summary=summary, **kwargs)
 
     monkeypatch.setattr(runner, "_write_run_stats", guard)
