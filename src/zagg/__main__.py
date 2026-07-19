@@ -12,7 +12,7 @@ import json
 import logging
 import sys
 
-from zagg.config import load_config
+from zagg.config import get_pipeline_type, load_config
 from zagg.notebook import confirm_max_cost, max_cost_preview
 from zagg.runner import agg, normalize_output_credentials
 
@@ -109,9 +109,17 @@ examples:
     # Max-cost gate (issue #298): a Lambda fan-out spends real money, so the
     # CLI blocks on the pre-invoke ceiling with a yes/no prompt; --yes/-y
     # skips. Dry runs invoke nothing, and a run with no resolvable catalog is
-    # about to raise agg's own error -- both bypass the gate. The notebook
+    # about to raise agg's own error -- both bypass the gate. Temporal configs
+    # have no shardmap ceiling (max_cost_preview raises for them) and via the
+    # CLI carry no events source, so agg would raise anyway -- the gate only
+    # engages for the catalog-driven kinds (spatial/raster). The notebook
     # wrapper (zagg.notebook) never blocks; this prompt is CLI-only.
-    if args.backend == "lambda" and not args.dry_run and (args.catalog or config.catalog):
+    if (
+        args.backend == "lambda"
+        and not args.dry_run
+        and (args.catalog or config.catalog)
+        and get_pipeline_type(config) != "temporal"
+    ):
         preview = max_cost_preview(
             config,
             args.catalog,

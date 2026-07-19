@@ -83,6 +83,53 @@ class TestMaxCostPreview:
         assert "Max cost ceiling: ~$0.19" in line
         assert "4 units x 4 GB x 900s, arm64" in line
 
+    def test_temporal_config_has_no_shardmap_ceiling(self):
+        # A temporal run's fan-out unit is the event, not a catalog shard, so
+        # there is no shardmap ceiling to preview -- raise rather than bill a
+        # meaningless shard-based figure (issue #298 fold).
+        cfg = default_config("atl06")
+        cfg.pipeline = {"type": "temporal"}
+        with pytest.raises(ValueError, match="temporal runs take events="):
+            notebook.max_cost_preview(cfg, SHARDMAP)
+
+    def test_raster_nonwindowed_counts_selected_cells(self, monkeypatch):
+        # reader: raster on a flat (non-hive) layout fans out one unit per
+        # selected cell (cells == _select_cells); the spatial windowed
+        # expansion must never run on a raster config.
+        from zagg import runner
+
+        cfg = default_config("atl06")
+        cfg.data_source["reader"] = "raster"
+        cfg.output["store_layout"] = "flat"
+        monkeypatch.setattr(
+            runner,
+            "_windowed_units",
+            lambda *a, **k: pytest.fail("spatial _windowed_units ran on a raster config"),
+        )
+        preview = notebook.max_cost_preview(cfg, SHARDMAP)
+        assert preview["n_units"] == 4
+
+    def test_windowed_raster_uses_raster_units(self, monkeypatch):
+        # A windowed hive raster mirrors RasterStrategy.run: the (shard, window)
+        # count comes from _raster_windowed_units, never the spatial
+        # _windowed_units -- their membership rules differ (issue #247 fold).
+        from zagg import runner
+
+        cfg = default_config("atl06")
+        cfg.data_source["reader"] = "raster"
+        cfg.output["store_layout"] = "hive"
+        cfg.output["windowing"] = {"schedule": "monthly"}
+        monkeypatch.setattr(
+            runner, "_raster_windowed_units", lambda cells, windowing: [object()] * 7
+        )
+        monkeypatch.setattr(
+            runner,
+            "_windowed_units",
+            lambda *a, **k: pytest.fail("spatial _windowed_units ran on a raster config"),
+        )
+        preview = notebook.max_cost_preview(cfg, SHARDMAP)
+        assert preview["n_units"] == 7
+
 
 class TestProgressFactory:
     def test_tqdm_present_returns_bar(self):
@@ -363,3 +410,31 @@ class TestCliGate:
         cli, called = self._drive(monkeypatch, ["zagg", "--config", "c.yaml"])
         cli.main()
         assert called["agg"] is True
+
+    def test_temporal_backend_skips_gate(self, monkeypatch, capsys):
+        # Temporal configs have no shardmap ceiling (max_cost_preview raises)
+        # and no CLI events source, so the gate skips them outright: no prompt,
+        # no ceiling printed, straight to agg (issue #298 fold).
+        import builtins
+
+        import zagg.__main__ as cli
+
+        called = {"agg": False}
+
+        def _fake_agg(config, **kwargs):
+            called["agg"] = True
+            return _lambda_summary()
+
+        def _boom(q):
+            raise AssertionError("temporal runs have no shardmap ceiling -- no prompt")
+
+        cfg = default_config("atl06")
+        cfg.catalog = SHARDMAP
+        cfg.pipeline = {"type": "temporal"}
+        monkeypatch.setattr(cli, "agg", _fake_agg)
+        monkeypatch.setattr(cli, "load_config", lambda path: cfg)
+        monkeypatch.setattr(builtins, "input", _boom)
+        monkeypatch.setattr("sys.argv", ["zagg", "--config", "c.yaml", "--backend", "lambda"])
+        cli.main()
+        assert called["agg"] is True
+        assert "Max cost ceiling" not in capsys.readouterr().out
