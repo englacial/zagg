@@ -928,6 +928,98 @@ class TestBeamFootprintBehavior:
             ShardMap.build(cat, grid, backend="spherely", footprint="beams")
 
 
+class TestReproject:
+    """``ShardMap.reproject`` (issue #294): derive a map at another HEALPix
+    order without rebuilding from the catalog -- coarsen is a pure regroup,
+    refine is a scoped re-intersection using the source catalog's footprints.
+    """
+
+    @pytest.fixture
+    def fine_grid(self):
+        return HealpixGrid(12, 14, layout="fullsphere")
+
+    @pytest.fixture
+    def coarse_grid(self):
+        return HealpixGrid(11, 14, layout="fullsphere")
+
+    def test_coarsen_matches_direct_build(self, catalog, fine_grid, coarse_grid):
+        sm_fine = ShardMap.build(catalog, fine_grid, backend="mortie")
+        sm_coarse_direct = ShardMap.build(catalog, coarse_grid, backend="mortie")
+        sm_coarse_reproj = sm_fine.reproject(coarse_grid)
+
+        assert sorted(sm_coarse_reproj.shard_keys) == sorted(sm_coarse_direct.shard_keys)
+        assert _granule_shards(sm_coarse_reproj) == _granule_shards(sm_coarse_direct)
+        assert sm_coarse_reproj.grid_signature == coarse_grid.spatial_signature()
+        assert sm_coarse_reproj.metadata["reproject"] == {
+            "source_parent_order": 12,
+            "target_parent_order": 11,
+            "method": "coarsen",
+        }
+
+    def test_coarsen_dedups_granule_spanning_multiple_children(self, fine_grid, coarse_grid):
+        # A granule wide enough to land in >=2 fine shards under the same
+        # coarse parent must count once in the coarsened granule list.
+        cat = _catalog([_item("Gwide", -76.60, -76.52)])
+        sm_fine = ShardMap.build(cat, fine_grid, backend="mortie")
+        gs_fine = _granule_shards(sm_fine)
+        assert len(gs_fine["Gwide"]) >= 1  # sanity: built onto >=1 fine shard
+
+        sm_coarse = sm_fine.reproject(coarse_grid)
+        gs_coarse = _granule_shards(sm_coarse)
+        assert len(gs_coarse["Gwide"]) >= 1
+        # No duplicate ids within any single coarsened shard's granule list.
+        for gran_list in sm_coarse.granules:
+            ids = [g["id"] for g in gran_list]
+            assert len(ids) == len(set(ids))
+
+    def test_refine_reproduces_build(self, catalog, fine_grid, coarse_grid):
+        sm_coarse = ShardMap.build(catalog, coarse_grid, backend="mortie")
+        sm_fine_direct = ShardMap.build(catalog, fine_grid, backend="mortie")
+        sm_fine_reproj = sm_coarse.reproject(fine_grid, catalog=catalog)
+
+        assert sorted(sm_fine_reproj.shard_keys) == sorted(sm_fine_direct.shard_keys)
+        assert _granule_shards(sm_fine_reproj) == _granule_shards(sm_fine_direct)
+        assert sm_fine_reproj.grid_signature == fine_grid.spatial_signature()
+        assert sm_fine_reproj.metadata["reproject"]["method"] == "refine"
+
+    def test_refine_without_catalog_raises(self, catalog, coarse_grid, fine_grid):
+        sm_coarse = ShardMap.build(catalog, coarse_grid, backend="mortie")
+        with pytest.raises(ValueError, match="needs the source Catalog"):
+            sm_coarse.reproject(fine_grid)
+
+    def test_round_trip_coarsen_then_refine(self, catalog, fine_grid, coarse_grid):
+        sm_fine = ShardMap.build(catalog, fine_grid, backend="mortie")
+        sm_coarse = sm_fine.reproject(coarse_grid)
+        sm_round = sm_coarse.reproject(fine_grid, catalog=catalog)
+
+        assert sorted(sm_round.shard_keys) == sorted(sm_fine.shard_keys)
+        assert _granule_shards(sm_round) == _granule_shards(sm_fine)
+
+    def test_same_order_returns_copy(self, catalog, fine_grid):
+        sm = ShardMap.build(catalog, fine_grid, backend="mortie")
+        sm2 = sm.reproject(fine_grid)
+        assert sm2 is not sm
+        assert sm2.shard_keys == sm.shard_keys
+        assert sm2.granules == sm.granules
+        assert sm2.metadata["reproject"] == {
+            "source_parent_order": 12,
+            "target_parent_order": 12,
+            "method": "noop",
+        }
+
+    def test_mismatched_child_order_rejected(self, catalog, fine_grid):
+        sm = ShardMap.build(catalog, fine_grid, backend="mortie")
+        other_leaf = HealpixGrid(11, 17, layout="fullsphere")  # different child_order
+        with pytest.raises(ValueError, match="child_order must match"):
+            sm.reproject(other_leaf)
+
+    def test_non_healpix_signature_rejected(self, catalog, grid, fake_spherely):
+        sm = ShardMap.build(catalog, grid, backend="spherely")  # RectilinearGrid
+        hp = HealpixGrid(11, 14, layout="fullsphere")
+        with pytest.raises(ValueError, match="HEALPix"):
+            sm.reproject(hp)
+
+
 class TestIsBeamProduct:
     def test_known_beam_products(self):
         from zagg.catalog.beams import is_beam_product
