@@ -76,6 +76,7 @@ class TestBuildRecord:
         assert rec["cells_with_data"] == 7
         assert rec["duration_s"] == 12.5
         assert rec["phase_timings"] == {"read": 8.0, "index": 1.0, "aggregate": 2.0}
+        assert rec["spill_bytes"] is None  # no spill instrumentation off-Lambda
         assert rec["max_memory_mb"] == 512.0
         assert rec["success"] is True
         assert rec["error"] is None
@@ -105,6 +106,27 @@ class TestBuildRecord:
     def test_non_numeric_phase_entries_dropped(self):
         rec = _record(phases={"sample": 3.0, "write": 1.0, "stages": {"open": 2}})
         assert rec["phase_timings"] == {"sample": 3.0, "write": 1.0}
+
+    def test_spill_bytes_split_out_of_timings(self):
+        # The spill instrumentation (issue #217) stamps byte counts alongside
+        # the ``*_s`` seconds in ``phase_timings``; the record keeps timings
+        # seconds-only and surfaces the volume on its own top-level field.
+        rec = _record(
+            phases={
+                "read": 8.0,
+                "aggregate": 2.0,
+                "spill_write_s": 0.5,
+                "spill_read_s": 0.25,
+                "spill_bytes": 4096.0,
+            }
+        )
+        assert rec["phase_timings"] == {
+            "read": 8.0,
+            "aggregate": 2.0,
+            "spill_write_s": 0.5,
+            "spill_read_s": 0.25,
+        }
+        assert rec["spill_bytes"] == pytest.approx(4096.0)
 
     def test_granules_sha256_order_independent(self):
         assert granules_sha256(["b", "a"]) == granules_sha256(["a", "b"])
