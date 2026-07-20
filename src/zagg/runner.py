@@ -1016,7 +1016,9 @@ class RasterStrategy:
             )
             for key, exc in stats_failures
         ]
-        _write_run_stats(store_path, rows, run_id=uuid.uuid4().hex, store_kwargs=store_kwargs)
+        run_stats_path = _write_run_stats(
+            store_path, rows, run_id=uuid.uuid4().hex, store_kwargs=store_kwargs
+        )
         # Per-shard isolation lets one bad shard be counted and skipped, but a
         # run where EVERY shard raised (e.g. a config band whose ``asset`` is
         # absent from every granule) would otherwise return a success-shaped,
@@ -1037,6 +1039,7 @@ class RasterStrategy:
             "template_s": template_s,
             "store_path": store_path,
             "backend": "local",
+            "run_stats_path": run_stats_path,
         }
         if profile:
             # Straggler-maxed stage seconds + summed work counts (issue #250);
@@ -1375,7 +1378,7 @@ class RasterStrategy:
             )
             for key, error, body in stats_failures
         ]
-        _write_run_stats(
+        run_stats_path = _write_run_stats(
             store_path,
             rows,
             run_id=uuid.uuid4().hex,
@@ -1403,6 +1406,7 @@ class RasterStrategy:
             "max_memory_mb": max(mems) if mems else None,
             "store_path": store_path,
             "backend": "lambda",
+            "run_stats_path": run_stats_path,
         }
         if profile:
             # Straggler-maxed stage seconds (+ the write bucket) and summed
@@ -2109,13 +2113,18 @@ def _resolve_invoked_by(session, region) -> dict | None:
         return None
 
 
-def _write_run_stats(store_path, rows, *, run_id, store_kwargs, summary=None) -> None:
+def _write_run_stats(store_path, rows, *, run_id, store_kwargs, summary=None) -> str | None:
     """Fail-open write of the run-level stats parquet at the store root (#297).
 
     One row per dispatched shard, failure rows included. Fail-open by design:
     the dispatcher may hold an invoke-only role with no S3 write access (the
     CI OIDC benchmark role), and a missing parquet must never fail a run whose
     data landed — the leaf sidecars remain the durable per-shard truth.
+
+    Returns the written path, or ``None`` when the write was skipped/failed —
+    for callers whose summary dict does not exist yet at write time (the
+    raster paths persist the parquet BEFORE their all-failed raise, then fold
+    the returned path into the summary they build afterwards).
     """
     # Keep the summary key set deterministic (issue #297): ``run_stats_path``
     # is always present, defaulting to None, and only rewritten to the real
@@ -2125,7 +2134,7 @@ def _write_run_stats(store_path, rows, *, run_id, store_kwargs, summary=None) ->
     if summary is not None:
         summary["run_stats_path"] = None
     if not rows:
-        return
+        return None
     try:
         from zagg.telemetry import write_run_parquet
 
@@ -2133,8 +2142,10 @@ def _write_run_stats(store_path, rows, *, run_id, store_kwargs, summary=None) ->
         if summary is not None:
             summary["run_stats_path"] = path
         logger.info(f"Wrote run stats parquet ({len(rows)} rows): {path}")
+        return path
     except Exception as e:
         logger.warning(f"run stats parquet write failed (fail-open, issue #297): {e}")
+        return None
 
 
 def _lambda_result_rows(results) -> list:
