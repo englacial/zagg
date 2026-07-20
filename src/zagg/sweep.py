@@ -41,8 +41,8 @@ logger = logging.getLogger(__name__)
 #: Envelope version of every rollup object this module writes.
 SWEEP_SPEC = "zagg-sweep/1"
 
-#: Families swept when the caller does not choose (phase 1: stats only).
-DEFAULT_FAMILIES = ("stats",)
+#: Families swept when the caller does not choose (D22 phases 1-2).
+DEFAULT_FAMILIES = ("stats", "moc")
 
 
 class SweepFamily:
@@ -65,11 +65,13 @@ class SweepFamily:
         """The family's per-node rollup object name."""
         return f"{self.name}.rollup.json"
 
-    def read_leaf(self, store_root, decimal, window, store_kwargs):
+    def read_leaf(self, store_root, decimal, window, spec, store_kwargs):
         """One leaf's ``(payload, timestamp)`` contribution, or ``None``.
 
         ``None`` means the leaf carries no artifact for this family (e.g. a
         fail-open sidecar PUT that never landed) — it is skipped, not fatal.
+        ``spec`` is the manifest's store spec string, threaded so spec-keyed
+        sidecar naming (the PR #307 D23 seam) resolves per store.
         """
         raise NotImplementedError
 
@@ -93,13 +95,13 @@ class StatsFamily(SweepFamily):
 
     name = "stats"
 
-    def read_leaf(self, store_root, decimal, window, store_kwargs):
+    def read_leaf(self, store_root, decimal, window, spec, store_kwargs):
         from zagg.grids.morton import morton_word
         from zagg.hive import shard_leaf_path
         from zagg.telemetry import read_sidecar
 
         leaf = shard_leaf_path(store_root, morton_word(decimal), window=window)
-        record = read_sidecar(leaf, **store_kwargs)
+        record = read_sidecar(leaf, spec, **store_kwargs)
         if record is None:
             return None
         return record, record.get("timestamp")
@@ -108,6 +110,118 @@ class StatsFamily(SweepFamily):
         from zagg.telemetry import merge
 
         return merge(payloads)
+
+
+class MocFamily(SweepFamily):
+    """MOC regen (D8/D9): committed-leaf coverage folded up-tree + root refresh.
+
+    A leaf contributes iff its D4 commit stamp is present (unstamped debris is
+    invisible, exactly as the walk treats it); the staleness timestamp is the
+    stamp's ``written_at``. Payloads are shard-order ranges bodies (the root
+    ``coverage.moc``'s O1 encoding, minus its carrier fields) plus the D15
+    time union, so the fold is a word union and the base-node artifacts
+    compose directly into the store root. :meth:`finish` refreshes the root
+    ``coverage.moc`` from those base folds via the GET-union-PUT writer —
+    the sweep is the REGENERATOR; the runner's end-of-run fail-open write
+    stays the fast path (O7/D9) — skipping the PUT when the existing root
+    already covers the folded words and time range (sweep idempotence). The
+    O8 in-leaf bitmap contract is untouched: this family reads only the
+    stamp envelope, never the cell-order bitmap sidecar.
+    """
+
+    name = "moc"
+
+    def read_leaf(self, store_root, decimal, window, spec, store_kwargs):
+        # ``spec`` is unused here: leaf PATHS are the frozen /1-/2 grammar
+        # (shard_leaf_path); the D23 /3 leaf naming has no writer yet, and
+        # adopting it is the issue #299 flip, which lands in shard_leaf_path.
+        from zagg.grids.morton import morton_word
+        from zagg.hive import read_commit, shard_leaf_path
+        from zagg.store import open_store
+
+        leaf = shard_leaf_path(store_root, morton_word(decimal), window=window)
+        stamp = read_commit(open_store(leaf, **store_kwargs))
+        if stamp is None:
+            return None  # absent leaf or unstamped debris (D4)
+        payload = _moc_payload([morton_word(decimal)], stamp.get("time_range"))
+        return payload, stamp.get("written_at")
+
+    def merge(self, payloads: list) -> dict:
+        import numpy as np
+
+        from zagg.hive import root_coverage_words
+        from zagg.windows import union_time_range
+
+        words = np.unique(np.concatenate([root_coverage_words(p) for p in payloads]))
+        return _moc_payload(words, union_time_range(*(p.get("time_range") for p in payloads)))
+
+    def finish(self, store_root, tops, shard_order, store_kwargs) -> dict:
+        """Refresh the store-root ``coverage.moc`` from the base-node folds.
+
+        Unions with the existing root object (the sweep may cover only the
+        dirty subtrees — untouched bases must keep their listing), via the
+        same :func:`zagg.hive.write_root_coverage` transport the runner uses.
+        No PUT when the existing root already lists every folded word and
+        covers the folded time range, so an unchanged tree re-sweep is a
+        no-op here too.
+        """
+        import numpy as np
+
+        from zagg.hive import (
+            build_root_coverage,
+            read_root_coverage,
+            root_coverage_words,
+            write_root_coverage,
+        )
+        from zagg.windows import union_time_range
+
+        if not tops:
+            return {"root_moc_written": False}
+        words = np.unique(np.concatenate([root_coverage_words(t["payload"]) for t in tops]))
+        time_range = union_time_range(*(t["payload"].get("time_range") for t in tops))
+        try:
+            existing = read_root_coverage(store_root, **store_kwargs)
+        except ValueError:
+            existing = None  # unparsable root -> regenerate (D9)
+        if isinstance(existing, dict):
+            try:
+                covered = bool(np.isin(words, root_coverage_words(existing)).all())
+                covered = covered and (
+                    union_time_range(existing.get("time_range"), time_range)
+                    == existing.get("time_range")
+                )
+                if covered:
+                    return {"root_moc_written": False}
+            except (KeyError, TypeError, ValueError):
+                pass  # malformed cache cannot vouch for coverage -> rewrite
+        write_root_coverage(
+            store_root,
+            build_root_coverage(words, shard_order, source="sweep", time_range=time_range),
+            **store_kwargs,
+        )
+        return {"root_moc_written": True}
+
+
+def _moc_payload(words, time_range) -> dict:
+    """A rollup's shard-order ranges body (deterministic — no carrier fields).
+
+    Reuses :func:`zagg.hive.build_root_coverage` for the O1 range encoding and
+    drops ``source``/``generated_at`` (they would defeat skip-if-current
+    byte stability) and ``spec`` (the rollup rides the ``zagg-sweep/1``
+    envelope; the root object written by :meth:`MocFamily.finish` carries the
+    full ``morton-moc/1`` carrier as usual). ``time_range`` is normalized
+    through the D15 union so leaf and merged payloads compare equal.
+    """
+    from zagg.grids.morton import morton_decimal
+    from zagg.hive import _decimal_order, build_root_coverage
+    from zagg.windows import union_time_range
+
+    order = _decimal_order(morton_decimal(int(words[0])))
+    envelope = build_root_coverage(words, order, time_range=union_time_range(time_range))
+    payload = {"encoding": "ranges", "order": envelope["order"], "ranges": envelope["ranges"]}
+    if "time_range" in envelope:
+        payload["time_range"] = envelope["time_range"]
+    return payload
 
 
 class SubmapFamily(SweepFamily):
@@ -146,7 +260,7 @@ class DebrisFamily(SweepFamily):
 #: Family registry (D22's plug-in point): name -> class. Unavailable entries
 #: are visible slots that :func:`get_family` refuses with their ``reason``.
 FAMILIES: dict[str, type[SweepFamily]] = {
-    cls.name: cls for cls in (StatsFamily, SubmapFamily, OverviewFamily, DebrisFamily)
+    cls.name: cls for cls in (StatsFamily, MocFamily, SubmapFamily, OverviewFamily, DebrisFamily)
 }
 
 
@@ -196,7 +310,7 @@ def run_sweep(store_root: str, leaves, *, families=None, store_kwargs: dict | No
     }
     for fam in fams:
         summary["families"][fam.name] = _sweep_family(
-            store_root, store, fam, by_shard, shard_order, store_kwargs
+            store_root, store, fam, by_shard, shard_order, manifest.get("spec"), store_kwargs
         )
     return summary
 
@@ -222,13 +336,21 @@ def _normalize_leaves(leaves, shard_order: int):
     return by_shard, skipped
 
 
-def _sweep_family(store_root, store, fam, by_shard, shard_order, store_kwargs) -> dict:
+def _sweep_family(store_root, store, fam, by_shard, shard_order, spec, store_kwargs) -> dict:
     """Bottom-up fold of one family over the dirty ancestor paths."""
     counts = {"written": 0, "current": 0, "empty": 0, "failed": 0}
     computed: dict[str, dict | None] = {}
     for decimal in sorted(by_shard):
         computed[decimal] = _rollup_shard_node(
-            store_root, store, fam, decimal, by_shard[decimal], shard_order, store_kwargs, counts
+            store_root,
+            store,
+            fam,
+            decimal,
+            by_shard[decimal],
+            shard_order,
+            spec,
+            store_kwargs,
+            counts,
         )
     frontier = [d for d in sorted(by_shard) if computed[d] is not None]
     for _order in range(shard_order - 1, -1, -1):
@@ -247,7 +369,7 @@ def _sweep_family(store_root, store, fam, by_shard, shard_order, store_kwargs) -
 
 
 def _rollup_shard_node(
-    store_root, store, fam, decimal, windows, shard_order, store_kwargs, counts
+    store_root, store, fam, decimal, windows, shard_order, spec, store_kwargs, counts
 ) -> dict | None:
     """Fold one shard node's window-leaf artifacts into its rollup.
 
@@ -262,7 +384,7 @@ def _rollup_shard_node(
     parts = []
     for window in sorted(known, key=lambda w: (w is not None, w or "")):
         try:
-            got = fam.read_leaf(store_root, decimal, window, store_kwargs)
+            got = fam.read_leaf(store_root, decimal, window, spec, store_kwargs)
         except Exception as e:
             logger.warning(
                 f"sweep[{fam.name}]: leaf read failed at {decimal} window {window!r}; "

@@ -197,6 +197,122 @@ class TestWorkSetEdges:
             run_sweep(str(tmp_path), [])
 
 
+def _stamp_leaf(root, decimal, *, window=None, time_range=None):
+    """A minimal committed leaf: root zarr group + D4 commit stamp."""
+    import zarr
+
+    from zagg.hive import stamp_commit
+    from zagg.store import open_store
+
+    leaf = shard_leaf_path(str(root), morton_word(decimal), window=window)
+    store = open_store(leaf)
+    zarr.open_group(store, mode="w", zarr_format=3)
+    stamp_commit(store, cells_with_data=1, granule_count=1, window=window, time_range=time_range)
+
+
+def _payload_words(payload):
+    from zagg.hive import root_coverage_words
+
+    return sorted(int(w) for w in root_coverage_words(payload))
+
+
+class TestMocRollup:
+    def test_union_equals_direct_walk(self, tmp_path):
+        _write_manifest(tmp_path)
+        decimals = ("-311", "-312", "-321")
+        for d in decimals:
+            _stamp_leaf(tmp_path, d)
+        result = run_sweep(str(tmp_path), _leaf_refs(*decimals), families=("moc",))
+        moc = result["families"]["moc"]
+        assert moc["written"] == 6 and moc["root_moc_written"] is True
+        base = _rollup(tmp_path, "-3", family="moc")
+        assert _payload_words(base["payload"]) == sorted(morton_word(d) for d in decimals)
+        assert _payload_words(_rollup(tmp_path, "-31", family="moc")["payload"]) == sorted(
+            morton_word(d) for d in ("-311", "-312")
+        )
+        # The refreshed root coverage.moc lists exactly the committed shards.
+        from zagg.hive import read_root_coverage
+
+        root_moc = read_root_coverage(str(tmp_path))
+        assert root_moc["source"] == "sweep" and root_moc["order"] == SHARD_ORDER
+        assert _payload_words(root_moc) == sorted(morton_word(d) for d in decimals)
+
+    def test_unstamped_debris_is_invisible(self, tmp_path):
+        import zarr
+
+        from zagg.store import open_store
+
+        _write_manifest(tmp_path)
+        _stamp_leaf(tmp_path, "-311")
+        # A torn worker's leaf: prefix exists, no commit stamp (D4).
+        debris = shard_leaf_path(str(tmp_path), morton_word("-312"))
+        zarr.open_group(open_store(debris), mode="w", zarr_format=3)
+        result = run_sweep(str(tmp_path), _leaf_refs("-311", "-312"), families=("moc",))
+        assert result["families"]["moc"]["empty"] == 1
+        assert _payload_words(_rollup(tmp_path, "-31", family="moc")["payload"]) == [
+            morton_word("-311")
+        ]
+
+    def test_windowed_stamps_union_time_range(self, tmp_path):
+        _write_manifest(tmp_path)
+        _stamp_leaf(
+            tmp_path,
+            "-311",
+            window="2019",
+            time_range=["2019-02-01T00:00:00+00:00", "2019-11-01T00:00:00+00:00"],
+        )
+        _stamp_leaf(
+            tmp_path,
+            "-311",
+            window="2020",
+            time_range=["2020-01-01T00:00:00+00:00", "2020-06-01T00:00:00+00:00"],
+        )
+        word = morton_word("-311")
+        run_sweep(str(tmp_path), [(word, "2019"), (word, "2020")], families=("moc",))
+        node = _rollup(tmp_path, "-311", family="moc")
+        # Two stamped windows of one shard: one covered word, unioned extent.
+        assert node["generation"]["n_leaves"] == 2
+        assert _payload_words(node["payload"]) == [word]
+        assert node["payload"]["time_range"] == [
+            "2019-02-01T00:00:00+00:00",
+            "2020-06-01T00:00:00+00:00",
+        ]
+
+    def test_second_pass_writes_nothing_including_root(self, tmp_path):
+        _write_manifest(tmp_path)
+        for d in ("-311", "-321"):
+            _stamp_leaf(tmp_path, d)
+        refs = _leaf_refs("-311", "-321")
+        first = run_sweep(str(tmp_path), refs, families=("moc",))["families"]["moc"]
+        assert first["written"] == 5 and first["root_moc_written"] is True
+        second = run_sweep(str(tmp_path), refs, families=("moc",))["families"]["moc"]
+        assert second["written"] == 0 and second["current"] == 5
+        assert second["root_moc_written"] is False
+
+    def test_root_union_keeps_untouched_bases(self, tmp_path):
+        from zagg.hive import build_root_coverage, read_root_coverage, write_root_coverage
+
+        _write_manifest(tmp_path)
+        # A prior run's root MOC lists a shard under ANOTHER base that this
+        # sweep never visits; the refresh must union, not replace (D9).
+        other = morton_word("411")
+        write_root_coverage(str(tmp_path), build_root_coverage([other], SHARD_ORDER))
+        _stamp_leaf(tmp_path, "-311")
+        run_sweep(str(tmp_path), _leaf_refs("-311"), families=("moc",))
+        assert _payload_words(read_root_coverage(str(tmp_path))) == sorted(
+            [other, morton_word("-311")]
+        )
+
+    def test_default_families_cover_stats_and_moc(self, tmp_path):
+        _write_manifest(tmp_path)
+        _put_leaf(tmp_path, "-311")
+        _stamp_leaf(tmp_path, "-311")
+        summary = run_sweep(str(tmp_path), _leaf_refs("-311"))
+        assert set(summary["families"]) == {"stats", "moc"}
+        assert _rollup(tmp_path, "-3", family="stats") is not None
+        assert _rollup(tmp_path, "-3", family="moc") is not None
+
+
 class TestFamilyRegistry:
     def test_unknown_family_raises(self):
         with pytest.raises(ValueError, match="unknown sweep family"):
