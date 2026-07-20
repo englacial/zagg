@@ -297,7 +297,8 @@ class TestLocalRootCoverage:
         assert hive.ROOT_COVERAGE_NAME not in listing
         assert hive.MANIFEST_NAME in listing
         assert any(n.startswith("stats_") and n.endswith(".parquet") for n in listing)
-        assert len(listing) == 3
+        # node dir + manifest + aggregation.yaml (issue #299) + run parquet.
+        assert len(listing) == 4
 
 
 class TestLambdaCoverageDispatch:

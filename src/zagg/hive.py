@@ -93,6 +93,12 @@ _ZSTD_LEVEL = 3
 #: (:data:`COVERAGE_SIDECAR`), different location and encoding.
 ROOT_COVERAGE_NAME = "coverage.moc"
 
+#: Canonical semantic core object name at the product root (D19): a DERIVED
+#: convenience (D9 cache class) — deterministic YAML of the output-defining
+#: subset. The manifest's ``semantic_hash`` is the truth; divergence resolves
+#: to the hash.
+AGGREGATION_CORE_NAME = "aggregation.yaml"
+
 #: Product-name grammar (D19; normative on the mortie spec page §6.5):
 #: URL-safe lowercase alphanumerics plus ``-``/``_``. The base-component
 #: exclusion (``-?[1-6]``, :func:`_is_base_component`) is checked separately —
@@ -276,6 +282,8 @@ def build_manifest(grid, dataset: dict | None = None, windowing: dict | None = N
     leaf-stamp truth and root-summary cache. ``None`` writes the ``/1``
     manifest byte-identical to pre-windowing runs.
     """
+    from zagg.semantics import semantic_hash
+
     dataset = dataset or {}
     manifest = {
         "spec": HIVE_SPEC_V2 if windowing else HIVE_SPEC,
@@ -283,9 +291,17 @@ def build_manifest(grid, dataset: dict | None = None, windowing: dict | None = N
             "short_name": dataset.get("short_name"),
             "version": dataset.get("version"),
         },
+        # D19 (issue #299): the FULL sha256 of the canonicalized semantic
+        # core — a frozen key, so reusing a product name/root with different
+        # aggregation semantics refuses up front like an orders mismatch.
+        "semantic_hash": semantic_hash(grid.config),
         "cell_order": int(grid.child_order),
         "shard_order": int(grid.parent_order),
         "split_schedule": [1] * int(grid.parent_order),
+        # D21: how many morton digits each path component chunks. Existing
+        # stores are retroactively 1 (the _frozen normalization); new stores
+        # declare it explicitly.
+        "path_grouping": 1,
         "pyramid": {"orders": [], "aggregation": {}},
         "generated_at": _utcnow(),
     }
@@ -341,7 +357,7 @@ def validate_manifest(
 
     store = open_object_store(store_root, **store_kwargs)
     existing = _read_json(store, MANIFEST_NAME)
-    frozen_matches = existing is not None and _frozen(existing) == _frozen(manifest)
+    frozen_matches = _frozen_matches(existing, manifest)
     if existing is not None and not overwrite:
         if not frozen_matches:
             raise ValueError(
@@ -368,7 +384,14 @@ def validate_manifest(
     return existing
 
 
-def ensure_manifest(store_root: str, manifest: dict, *, overwrite: bool = False, **store_kwargs):
+def ensure_manifest(
+    store_root: str,
+    manifest: dict,
+    *,
+    overwrite: bool = False,
+    config=None,
+    **store_kwargs,
+):
     """Write the root manifest; verify it on reruns (idempotent).
 
     Lifecycle (issue #252 hybrid): the PRIMARY write runs at init — the local
@@ -407,7 +430,49 @@ def ensure_manifest(store_root: str, manifest: dict, *, overwrite: bool = False,
     if existing is not None and not overwrite:
         return existing
     obstore.put(store, MANIFEST_NAME, json.dumps(manifest, indent=1).encode())
+    if config is not None:
+        write_semantic_core(store_root, config, **store_kwargs)
     return manifest
+
+
+def write_semantic_core(store_root: str, config, **store_kwargs) -> None:
+    """PUT the canonical semantic core as ``aggregation.yaml`` (D19).
+
+    A derived convenience next to the manifest (D9 cache class): sorted-key,
+    deterministic YAML of the output-defining subset, so product names stay
+    human-inspectable without a registry. FAIL-OPEN — the manifest's
+    ``semantic_hash`` is the truth and the sweep can regenerate this; a
+    failed PUT must not fail the run.
+    """
+    import obstore
+    import yaml
+
+    from zagg.semantics import semantic_core
+
+    try:
+        payload = yaml.safe_dump(semantic_core(config), sort_keys=True)
+        obstore.put(
+            open_object_store(store_root, **store_kwargs),
+            AGGREGATION_CORE_NAME,
+            payload.encode(),
+        )
+    except Exception as e:
+        logger.warning(f"{AGGREGATION_CORE_NAME} write failed (fail-open, D9 cache class): {e}")
+
+
+def append_spec(existing: dict | None, manifest: dict) -> str:
+    """The naming spec in effect for this run's writes (issue #299).
+
+    On append into an existing store the writer honors the EXISTING
+    manifest's declared spec — one grammar per product tree (D6/D23): a
+    future ``morton-hive/3``-emitting writer must not emit ``/3`` names into
+    a ``/2`` tree (the frozen ``spec`` key would refuse the manifest, but
+    naming calls run per-shard and must agree too). Fresh stores use the
+    run's own manifest spec. The PR #307 seam
+    (:func:`zagg.telemetry.sidecar_key`, :func:`zagg.windows.leaf_name_v3`)
+    is keyed by exactly this value.
+    """
+    return (existing or manifest)["spec"]
 
 
 #: Manifest keys the resume match-check compares (orders + identity + split
@@ -419,16 +484,42 @@ def ensure_manifest(store_root: str, manifest: dict, *, overwrite: bool = False,
 _FROZEN_MANIFEST_KEYS = (
     "spec",
     "dataset",
+    "semantic_hash",
     "cell_order",
     "shard_order",
     "split_schedule",
+    "path_grouping",
     "temporal",
 )
 
 
 def _frozen(manifest: dict) -> dict:
-    """The frozen-key projection of a manifest (resume/overwrite match-check)."""
-    return {k: manifest.get(k) for k in _FROZEN_MANIFEST_KEYS}
+    """The frozen-key projection of a manifest (resume/overwrite match-check).
+
+    ``path_grouping`` normalizes ``absent -> 1`` (D21: existing stores are
+    retroactively ``1``), so appends to pre-D21 manifests never refuse on it.
+    """
+    frozen = {k: manifest.get(k) for k in _FROZEN_MANIFEST_KEYS}
+    frozen["path_grouping"] = manifest.get("path_grouping") or 1
+    return frozen
+
+
+def _frozen_matches(existing: dict | None, manifest: dict) -> bool:
+    """Whether two manifests agree on every frozen key (issue #299).
+
+    ``semantic_hash`` is compared only when BOTH sides declare it: a
+    pre-#299 manifest lacks the key, and refusing every append to an
+    existing store on its absence would brick resumes — the orders/schedule
+    keys still guard those stores. Two hash-carrying manifests must match
+    exactly (D19: the hash is a frozen key).
+    """
+    if existing is None:
+        return False
+    fa, fb = _frozen(existing), _frozen(manifest)
+    if fa["semantic_hash"] is None or fb["semantic_hash"] is None:
+        fa.pop("semantic_hash")
+        fb.pop("semantic_hash")
+    return fa == fb
 
 
 def _is_base_component(name: str) -> bool:
