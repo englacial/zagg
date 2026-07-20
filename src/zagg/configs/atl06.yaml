@@ -19,9 +19,6 @@ aggregation:
   # A nullable/sparse source should set "pandas" (see atl06_nullable.yaml).
   handoff: arrow
   coordinates:
-    cell_ids:
-      dtype: uint64
-      fill_value: 0
     morton:
       dtype: uint64
       fill_value: 0

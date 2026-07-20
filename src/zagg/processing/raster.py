@@ -870,17 +870,26 @@ def _check_raster_grid(grid) -> None:
 
 
 def _raster_members(grid, config, n_time: int, n_cells: int) -> dict:
-    """The ``time``/``cell_ids``/band ArraySpec members for one raster store."""
+    """The ``time``/``morton``/band ArraySpec members for one raster store.
+
+    ``morton`` (packed u64 words) is the sole stored cell coordinate — the
+    D16 flip applies to the raster path too (espg-ruled on the PR #314
+    review: one default cell coordinate everywhere). The legacy NESTED
+    ``cell_ids`` array rides only the same ``emit_cell_ids`` transition
+    hatch as the spatial path — never a separate schedule.
+    """
     from zagg.config import get_raster_bands
 
     members = {
         "time": _raster_array_spec(
             (n_time,), (max(n_time, 1),), ("time",), "int64", 0, dict(_TIME_ATTRS)
         ),
-        "cell_ids": _raster_array_spec(
-            (n_cells,), (grid.cells_per_chunk,), ("cells",), "uint64", 0
-        ),
+        "morton": _raster_array_spec((n_cells,), (grid.cells_per_chunk,), ("cells",), "uint64", 0),
     }
+    if grid.emit_cell_ids:
+        members["cell_ids"] = _raster_array_spec(
+            (n_cells,), (grid.cells_per_chunk,), ("cells",), "uint64", 0
+        )
     for name, meta in get_raster_bands(config).items():
         members[name] = _raster_array_spec(
             (n_time, n_cells),
@@ -898,14 +907,19 @@ def raster_group_spec(grid, config, n_time: int):
 
     Per band: shape ``(n_time, n_pixels)``, chunks ``(1, cells_per_chunk)`` —
     one storage object per (timestep, chunk), so per-date rewrites are exact.
-    Plus ``time`` (int64 microseconds, CF attrs) and ``cell_ids`` (uint64,
-    written per shard by :func:`write_raster_coords`).
+    Plus ``time`` (int64 microseconds, CF attrs) and ``morton`` (packed u64
+    words, written per shard by :func:`write_raster_coords`). The group
+    carries the same morton-declared dggs attrs block as the spatial path
+    (issues #304/#305): one reader contract for every store.
     """
     from pydantic_zarr.experimental.v3 import GroupSpec
 
     _check_raster_grid(grid)
     n_pixels = int(np.prod(grid.array_shape))
-    return GroupSpec(members=_raster_members(grid, config, n_time, n_pixels), attributes={})
+    return GroupSpec(
+        members=_raster_members(grid, config, n_time, n_pixels),
+        attributes=grid._dggs_attrs(),
+    )
 
 
 def emit_raster_template(store, grid, config, times_us: np.ndarray, *, overwrite: bool = False):
@@ -942,7 +956,7 @@ def raster_leaf_spec(grid, config, n_time: int):
     """GroupSpec for ONE shard's hive leaf zarr (issue #247, D3/D13).
 
     The raster analog of ``HealpixGrid.shard_spec``: the same member set as
-    :func:`raster_group_spec` — ``time``/``cell_ids`` plus one ``(time,
+    :func:`raster_group_spec` — ``time``/``morton`` plus one ``(time,
     cells)`` array per band, same dtypes/fills/chunking — with the cells axis
     sized to a single shard (``cells_per_shard``) and the time axis to the
     LEAF's own acquisitions (``n_time`` = the groups intersecting this shard
@@ -954,7 +968,11 @@ def raster_leaf_spec(grid, config, n_time: int):
 
     _check_raster_grid(grid)
     inner = GroupSpec(
-        members=_raster_members(grid, config, n_time, grid.cells_per_shard), attributes={}
+        members=_raster_members(grid, config, n_time, grid.cells_per_shard),
+        # The same morton-declared dggs attrs as the spatial leaf (issue
+        # #304 — one reader contract), on the inner group like
+        # HealpixGrid._group_spec.
+        attributes=grid._dggs_attrs(),
     )
     return GroupSpec(members={grid.group_path: inner}, attributes={})
 
@@ -962,12 +980,13 @@ def raster_leaf_spec(grid, config, n_time: int):
 def emit_raster_leaf_template(
     store, grid, config, shard_key: int, times_us: np.ndarray, *, overwrite: bool = False
 ):
-    """Write one leaf's template plus its ``time`` and ``cell_ids`` coords.
+    """Write one leaf's template plus its ``time`` and ``morton`` coords.
 
     Unlike the flat path (template at fan-out time, coords per shard after
     the slabs), a leaf's coordinates are fully known at template time — the
-    time axis is the leaf's own acquisition groups and ``cell_ids`` is the
-    shard's children — so both are written here, once. Called lazily on the
+    time axis is the leaf's own acquisition groups and ``morton`` is the
+    shard's children (packed words; the legacy ``cell_ids`` only under the
+    ``emit_cell_ids`` hatch) — so both are written here, once. Called lazily on the
     first slab (mirroring ``process_and_write_hive``'s lazy ``_leaf``) with
     ``overwrite=True`` so a no-data shard never creates the ``.zarr/`` prefix
     and a retry replaces debris wholesale (D4).
@@ -976,15 +995,18 @@ def emit_raster_leaf_template(
     from zarr import open_array
 
     spec = raster_leaf_spec(grid, config, int(len(times_us)))
-    cell_ids = grid.encode_cell_ids(grid.children(int(shard_key)))
+    children = np.asarray(grid.children(int(shard_key)), dtype=np.uint64)
     with zarr_config.set({"async.concurrency": 128}):
         spec.to_zarr(store, "", overwrite=overwrite)
         arr = open_array(store, path=f"{grid.group_path}/time", zarr_format=3, consolidated=False)
         arr[:] = np.asarray(times_us, dtype=np.int64)
-        arr = open_array(
-            store, path=f"{grid.group_path}/cell_ids", zarr_format=3, consolidated=False
-        )
-        arr[:] = np.asarray(cell_ids, dtype=np.uint64)
+        arr = open_array(store, path=f"{grid.group_path}/morton", zarr_format=3, consolidated=False)
+        arr[:] = children
+        if grid.emit_cell_ids:
+            arr = open_array(
+                store, path=f"{grid.group_path}/cell_ids", zarr_format=3, consolidated=False
+            )
+            arr[:] = np.asarray(grid.encode_cell_ids(children), dtype=np.uint64)
     return store
 
 
@@ -1038,17 +1060,25 @@ def write_raster_slab(store, grid, shard_key: int, t_idx: int, slab: dict):
 
 
 def write_raster_coords(store, grid, shard_key: int):
-    """Write the shard's ``cell_ids`` coordinate block (once per shard)."""
+    """Write the shard's ``morton`` coordinate block (once per shard).
+
+    Packed u64 words — the sole stored cell coordinate (D16, issue #304);
+    the legacy NESTED ``cell_ids`` block rides only the ``emit_cell_ids``
+    transition hatch, exactly like the spatial path.
+    """
     from zarr import config as zarr_config
     from zarr import open_array
 
     start, stop = _shard_cell_range(grid, shard_key)
-    cell_ids = grid.encode_cell_ids(grid.children(int(shard_key)))
+    children = np.asarray(grid.children(int(shard_key)), dtype=np.uint64)
     with zarr_config.set({"async.concurrency": 128}):
-        arr = open_array(
-            store, path=f"{grid.group_path}/cell_ids", zarr_format=3, consolidated=False
-        )
-        arr[start:stop] = np.asarray(cell_ids, dtype=np.uint64)
+        arr = open_array(store, path=f"{grid.group_path}/morton", zarr_format=3, consolidated=False)
+        arr[start:stop] = children
+        if grid.emit_cell_ids:
+            arr = open_array(
+                store, path=f"{grid.group_path}/cell_ids", zarr_format=3, consolidated=False
+            )
+            arr[start:stop] = np.asarray(grid.encode_cell_ids(children), dtype=np.uint64)
     return store
 
 

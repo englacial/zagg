@@ -47,9 +47,6 @@ data_source:
 
 aggregation:
   coordinates:
-    cell_ids:
-      dtype: uint64
-      fill_value: 0
     morton:
       dtype: uint64
       fill_value: 0

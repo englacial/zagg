@@ -11,10 +11,12 @@ dtypes, and the extension metadata lives at the interchange layer only — and
 reconstructed as a ``MortonIndexArray`` on read.
 
 This is the contained #71 migration: only the ``morton`` coordinate adopts the
-type. ``cell_ids`` stays NESTED ``uint64`` by default (the DGGS coordinate;
-``output.grid.cell_ids_encoding: morton`` optionally emits the morton words
-instead — issue #135), and the internal leaf/cell/shard morton arithmetic
-(``cells_of`` / ``shards_of`` / ``children``) stays on plain ``uint64`` ndarrays.
+type — and since the D16 flip (issue #304) it is the only stored cell
+coordinate by default (the legacy NESTED ``cell_ids`` array survives behind
+the ``output.grid.emit_cell_ids: true`` transition hatch; the issue-#135
+``cell_ids_encoding`` knob is retired). The internal leaf/cell/shard morton
+arithmetic (``cells_of`` / ``shards_of`` / ``children``) stays on plain
+``uint64`` ndarrays.
 
 Storing the raw ``uint64`` words (rather than a reinterpreted ``int64``) is what
 removes the sign hazard: the packed word's prefix is ``base+1``, so base cells
@@ -47,16 +49,6 @@ MORTON_CONVENTION = {
     "name": "morton-dggs",
     "description": "Packed-u64 morton (HEALPix) DGGS convention",
 }
-
-#: O10 resolution discriminator (espg-ratified, issue #305): ``exact`` — ids
-#: are true cells at their encoded order; grid-derived cell coordinates are
-#: exact BY CONSTRUCTION, so every zagg aggregation output emits it.
-RESOLUTION_EXACT = "exact"
-#: ``point`` — locations cast to order 29 with no area claim (raw lat/lon
-#: conversions: the temporal event path, future HHDC id fields). The mortie
-#: spec page's 29->24 clip rule applies to ``point`` ONLY. Emission is per
-#: data kind and the writer always knows which; no heuristic fallback.
-RESOLUTION_POINT = "point"
 
 
 def is_morton_array(values) -> bool:
@@ -230,8 +222,6 @@ def is_morton_arrow(col) -> bool:
 __all__ = [
     "MORTON_CONVENTION",
     "MORTON_EXTENSION_NAME",
-    "RESOLUTION_EXACT",
-    "RESOLUTION_POINT",
     "is_morton_array",
     "is_morton_arrow",
     "morton_box",

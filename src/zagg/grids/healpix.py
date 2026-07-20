@@ -14,7 +14,7 @@ from zagg.config import (
     default_config,
     get_agg_fields,
     get_aoi_mask,
-    get_cell_ids_encoding,
+    get_emit_cell_ids,
     get_output_signature,
     output_field_signature,
 )
@@ -27,7 +27,7 @@ from zagg.grids.base import (
     vector_array_spec,
     vlen_dtype_warning_suppressed,
 )
-from zagg.grids.morton import RESOLUTION_EXACT, morton_decimal, to_morton_array
+from zagg.grids.morton import MORTON_CONVENTION, morton_decimal, to_morton_array
 
 HEALPIX_BASE_CELLS: int = 12
 # Reference order at which ``assign`` resolves points before ``cells_of`` /
@@ -115,19 +115,12 @@ class HealpixGrid:
         self.sharded = bool(sharded)
         self.layout = layout
         self.config = config or default_config("atl06")
-        # cell_ids coordinate encoding (issue #135): "nested" (default, the DGGS
-        # standard) or "morton" (emit the packed morton words as cell_ids — a
-        # test/prototype capability). Default is byte-identical to a pre-flag run.
-        # Re-validated here (not only in validate_config) because both coords_of
-        # (the cell_ids values) and _dggs_attrs (the recorded indexing_scheme)
-        # interpret this string: an unvalidated third value would write NESTED
-        # values while recording a different scheme — a mis-decode for consumers.
-        self.cell_ids_encoding = get_cell_ids_encoding(self.config)
-        if self.cell_ids_encoding not in ("nested", "morton"):
-            raise ValueError(
-                f"Unknown cell_ids_encoding: {self.cell_ids_encoding!r} "
-                "(expected 'nested' or 'morton')"
-            )
+        # D16 default flip (issue #304 phase 2): the legacy cell_ids array is
+        # written only under the explicit transition hatch; morton is the one
+        # stored cell coordinate. Both the template member (_group_spec) and
+        # the coords column (coords_of) key off this single flag so template
+        # and writes can never disagree.
+        self.emit_cell_ids = get_emit_cell_ids(self.config)
 
     @property
     def n_shards(self) -> int:
@@ -397,13 +390,14 @@ class HealpixGrid:
         return cell_ids
 
     def chunk_coords(self, shard_key) -> dict:
-        """Per-cell coord columns for HEALPix: ``morton`` and ``cell_ids``.
+        """Per-cell coord columns for HEALPix: ``morton`` (plus legacy ``cell_ids``).
 
         ``morton`` is a mortie ``MortonIndexArray`` (the typed coordinate; #71);
-        it is stored as ``uint64`` on disk via :mod:`zagg.grids.morton`. ``cell_ids``
-        is NESTED ``uint64`` (the DGGS coordinate) by default; the
-        ``output.grid.cell_ids_encoding: morton`` flag (issue #135) emits the
-        packed morton words instead.
+        it is stored as ``uint64`` on disk via :mod:`zagg.grids.morton` and is
+        the ONLY cell coordinate written by default (D16, issue #304). The
+        ``output.grid.emit_cell_ids: true`` transition hatch adds the legacy
+        NESTED ``uint64`` ``cell_ids`` array (the issue #135 encoding knob was
+        retired in issue #304 phase 3 — morton stored, NESTED derived).
         """
         return self.coords_of(self.children(shard_key))
 
@@ -416,14 +410,10 @@ class HealpixGrid:
         ``chunk_coords`` is just ``coords_of(children(shard_key))``.
         """
         children = np.asarray(children)
-        if self.cell_ids_encoding == "morton":
-            cell_ids = np.asarray(children, dtype=np.uint64)
-        else:
-            cell_ids = self.encode_cell_ids(children)
-        return {
-            "morton": to_morton_array(children),
-            "cell_ids": cell_ids,
-        }
+        coords: dict = {"morton": to_morton_array(children)}
+        if self.emit_cell_ids:
+            coords["cell_ids"] = self.encode_cell_ids(children)
+        return coords
 
     # ── identity / nesting ───────────────────────────────────────────────
 
@@ -447,15 +437,17 @@ class HealpixGrid:
         """Canonical fingerprint of the grid's defining parameters.
 
         The full fingerprint: the spatial layout (:meth:`spatial_signature`)
-        plus the Option-B output-field set and the ``cell_ids_encoding``
-        (issue #135 — mixed encodings must never co-aggregate; ``nests_with``
-        keys on both). The shard-map reuse guard keys on the spatial part
-        only (#89).
+        plus the Option-B output-field set and the ``emit_cell_ids`` hatch
+        state (issue #304 — the hatch changes the leaf schema, so mixed
+        states must never co-aggregate; ``nests_with`` keys on both). The
+        shard-map reuse guard keys on the spatial part only (#89). (The
+        issue #135 ``cell_ids_encoding`` field was retired in issue #304
+        phase 3.)
         """
         return {
             **self.spatial_signature(),
             "output_fields": output_field_signature(self.config),
-            "cell_ids_encoding": self.cell_ids_encoding,
+            "emit_cell_ids": self.emit_cell_ids,
         }
 
     def nests_with(self, other) -> bool:
@@ -464,14 +456,13 @@ class HealpixGrid:
         Any two HEALPix grids nest (the nested hierarchy subdivides 4-for-1 at
         every order), provided they declare the same Option-B output-field set
         (issue #29) — co-aggregated grids must produce the same scalar/vector
-        schema — and the same ``cell_ids_encoding`` (issue #135): NESTED ids
-        and morton words are different id spaces, so a consumer joining
-        co-aggregated products on ``cell_ids`` would silently mismatch.
-        Cross-family (e.g. rectilinear) never nests.
+        schema — and the same ``emit_cell_ids`` hatch state (issue #304): one
+        store carrying an extra cell_ids array while the other does not is a
+        schema mismatch. Cross-family (e.g. rectilinear) never nests.
         """
         if not isinstance(other, HealpixGrid):
             return False
-        if self.cell_ids_encoding != other.cell_ids_encoding:
+        if self.emit_cell_ids != other.emit_cell_ids:
             return False
         return output_field_signature(self.config) == output_field_signature(other.config)
 
@@ -566,9 +557,21 @@ class HealpixGrid:
 
         members = {}
         for name, meta in self.config.aggregation.get("coordinates", {}).items():
+            # D16 default flip (issue #304 phase 2): a declared cell_ids
+            # coordinate is honored only under the emit_cell_ids transition
+            # hatch — otherwise the member is skipped so the template never
+            # carries an array the writer will not fill. Keyed off the same
+            # flag as coords_of, so template and writes cannot disagree.
+            if name == "cell_ids" and not self.emit_cell_ids:
+                continue
             dtype = meta.get("dtype", "float32")
             fill = meta.get("fill_value", "NaN")
             members[name] = _shard(base.with_data_type(dtype).with_fill_value(fill))
+        if self.emit_cell_ids and "cell_ids" not in members:
+            # The hatch must not depend on the config still DECLARING the
+            # legacy coordinate (phase 3 removes the shipped declarations):
+            # synthesize the standard uint64/fill-0 member.
+            members["cell_ids"] = _shard(base.with_data_type("uint64").with_fill_value(0))
         # Optional strict-AOI cell mask (issue #101): a bool array aligned to the
         # cell grid, emitted only when ``output.aoi_mask`` is on so off-runs stay
         # byte-identical. fill_value False — cells never written (out-of-AOI shards,
@@ -656,42 +659,42 @@ class HealpixGrid:
         return GroupSpec(members=members, attributes=self._dggs_attrs())
 
     def _dggs_attrs(self) -> dict:
-        return {
-            "zarr_conventions": [
-                {
-                    "schema_url": "https://raw.githubusercontent.com/zarr-conventions/dggs/refs/tags/v1/schema.json",
-                    "spec_url": "https://github.com/zarr-conventions/dggs/blob/v1/README.md",
-                    "uuid": "7b255807-140c-42ca-97f6-7a1cfecdbc38",
-                    "name": "dggs",
-                    "description": "Discrete Global Grid Systems convention for zarr",
-                }
-            ],
-            "dggs": {
-                "name": "healpix",
-                "refinement_level": self.child_order,
-                # cell_ids_encoding: morton (issue #135) stores packed morton words
-                # as cell_ids, so the recorded scheme must not claim "nested" — a
-                # consumer decoding morton words as NESTED ids would mis-place every
-                # cell. "morton" is outside the DGGS convention's standard schemes;
-                # the flag is a test/prototype capability.
-                "indexing_scheme": self.cell_ids_encoding,
-                # O10 resolution discriminator (issue #305, espg-ratified):
-                # grid-derived cell coordinates are "exact" by construction —
-                # every id is a true cell at its encoded order. "point"
-                # (RESOLUTION_POINT) is reserved for location-derived id
-                # fields (raw lat/lon cast to order 29 — the temporal event
-                # path), which the 29->24 clip rule on the mortie spec page
-                # applies to; no zagg aggregation output ever emits it.
-                "resolution": RESOLUTION_EXACT,
-                "spatial_dimension": "cells",
-                "ellipsoid": {
-                    "name": "WGS84",
-                    "semimajor_axis": 6378137.0,
-                    "inverse_flattening": 298.257223563,
-                },
-                "coordinate": "cell_ids",
-                "compression": "none",
+        dggs_entry = {
+            "schema_url": "https://raw.githubusercontent.com/zarr-conventions/dggs/refs/tags/v1/schema.json",
+            "spec_url": "https://github.com/zarr-conventions/dggs/blob/v1/README.md",
+            "uuid": "7b255807-140c-42ca-97f6-7a1cfecdbc38",
+            "name": "dggs",
+            "description": "Discrete Global Grid Systems convention for zarr",
+        }
+        common = {
+            "refinement_level": self.child_order,
+            # No kind/resolution field (O10 final ruling, espg 2026-07-21):
+            # point-vs-area kind is carried by the packed-word ENCODING
+            # itself (mortie spec page §4 — area words are exact cells at
+            # every order; point ids are points), so readers never consult
+            # a declaration and the attrs block carries none.
+            "spatial_dimension": "cells",
+            "ellipsoid": {
+                "name": "WGS84",
+                "semimajor_axis": 6378137.0,
+                "inverse_flattening": 298.257223563,
             },
+            "compression": "none",
+        }
+        # D16 / issue #304 phase 3: every HEALPix aggregation store is
+        # morton-declared — the DISTINCT grid name "morton" with the typed
+        # `morton` coordinate. Never name: "healpix" + indexing_scheme:
+        # "morton", which a scheme-blind reader silently misreads as NESTED
+        # (garbage renders); an unknown grid name makes it hard-reject with a
+        # diagnostic instead, and matches moczarr's xdggs registration. The
+        # self-declared convention entry (issue #305; permanent UUID) rides
+        # the zarr_conventions LIST alongside the generic dggs entry, so a
+        # future upstream registry entry can coexist too. A hatch store
+        # (emit_cell_ids) carries the legacy NESTED array as an EXTRA member;
+        # the declared coordinate stays morton.
+        return {
+            "zarr_conventions": [dggs_entry, dict(MORTON_CONVENTION)],
+            "dggs": {"name": "morton", **common, "coordinate": "morton"},
         }
 
 

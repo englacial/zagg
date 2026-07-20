@@ -2048,7 +2048,7 @@ def test_run_target_threads_store_layout():
 
 
 def test_hive_config_expected_counts_root_moc_optional():
-    # The committed hive arm's model: per-shard DATA is exact (11 objects/leaf,
+    # The committed hive arm's model: per-shard DATA is exact (per-leaf count,
     # the sharded-write-bypass tripwire), but the store-root coverage.moc is a
     # fail-open, regenerable D9 cache (runner.write_root_coverage) that may be
     # present OR absent -- so store-root metadata is a [1, 2] window (the
@@ -2065,19 +2065,20 @@ def test_hive_config_expected_counts_root_moc_optional():
     exp = bench_objects.expected_object_counts(
         grid, n_shards=1, store_layout="hive", coverage_moc=True
     )
-    # 4 arrays (cell_ids/morton/count/h_tdigest): leaf root+group zarr.json (2)
-    # + 4 array zarr.json + 4 sharded data objects + coverage sidecar +
-    # stats.json sibling (issue #297) = 12.
+    # 3 arrays (morton/count/h_tdigest — no legacy cell_ids since the D16
+    # flip, issue #304): leaf root+group zarr.json (2) + 3 array zarr.json +
+    # 3 sharded data objects + coverage sidecar + stats.json sibling
+    # (issue #297) = 10.
     # Store root: morton_hive.json (always) + coverage.moc (optional) + the
     # run stats parquet (optional, issue #297) + aggregation.yaml (optional,
     # issue #299) -> [1, 4].
     assert exp == {
         "metadata": 4,
         "metadata_min": 1,
-        "per_shard_min": 12,
-        "per_shard_max": 12,
-        "total_min": 13,
-        "total_max": 16,
+        "per_shard_min": 10,
+        "per_shard_max": 10,
+        "total_min": 11,
+        "total_max": 14,
         "exact": True,
     }
 

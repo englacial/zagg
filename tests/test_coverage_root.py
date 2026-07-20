@@ -545,7 +545,7 @@ class TestIntersections:
 
             coords = grid.chunk_coords(shard_key)
             df = pd.DataFrame(
-                {var: 0.0 for var in get_data_vars(cfg)}, index=range(len(coords["cell_ids"]))
+                {var: 0.0 for var in get_data_vars(cfg)}, index=range(len(coords["morton"]))
             )
             for name, vals in coords.items():
                 df[name] = vals

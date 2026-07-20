@@ -354,7 +354,9 @@ refresh builds it.
 Raster (pull-NN) pipelines write the same tree with **windowed `(time, cells)`
 leaves**: one vanilla zarr v3 leaf per **(shard, window)** unit at
 `shard_leaf_path(root, shard, window=label)`, each carrying leaf-local `time`
-(int64 microseconds, CF attrs) and `cell_ids` coords plus one
+(int64 microseconds, CF attrs) and `morton` (packed u64 words) as the sole cell
+coordinate — `cell_ids` (NESTED) rides only the `emit_cell_ids` transition hatch
+(issue #304) — plus one
 `(T_leaf, cells_per_shard)` array per configured band, chunked
 `(1, cells_per_chunk)`. The leaf's time axis is the unit's **own acquisition
 groups** — known at dispatch from the catalog, so both dispatchers produce

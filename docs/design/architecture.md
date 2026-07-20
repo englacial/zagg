@@ -92,8 +92,9 @@ Target coverage: ~1,300 cells covering Antarctic grounded ice drainage basins (e
 │                                                      │             │
 │ Shape:  12 × 4^child_order  (786,432 cells at O12)   │             │
 │ Chunks: 4^(child - parent)  (4,096 cells at O12-O6)  │             │
-│ Arrays: cell_ids, morton, count, h_min, h_max,       │             │
+│ Arrays: morton, count, h_min, h_max,                 │             │
 │         h_mean, h_sigma, h_variance, h_q25-75        │             │
+│ (cell_ids only under emit_cell_ids — issue #304)     │             │
 │                                                      │             │
 │ Written to: s3://bucket/prefix/12/                   │             │
 └──────────────────────────┬───────────────────────────┘             │
@@ -155,8 +156,8 @@ Target coverage: ~1,300 cells covering Antarctic grounded ice drainage basins (e
 │ │  │  └───────────────────────────────────────────────┘   │
 │ │  │       │                                              │
 │ │  │       ▼                                              │
-│ │  │  mort2healpix(children) → cell_ids                   │
-│ │  │  Assemble output DataFrame (11 columns × 4,096 rows) │
+│ │  │  Assemble output DataFrame (morton + data vars;      │
+│ │  │  NESTED cell_ids derived at read — issue #304)       │
 │ │  └──────────────────────────┬───────────────────────────┘
 │ │                             │
 │ │                             ▼
@@ -183,8 +184,7 @@ Target coverage: ~1,300 cells covering Antarctic grounded ice drainage basins (e
 │ Output Zarr store:                                   │
 │   s3://bucket/prefix/                                │
 │   └── 12/                                            │
-│       ├── cell_ids   (uint64, fill=0)                │
-│       ├── morton     (int64,  fill=0)                │
+│       ├── morton     (uint64, fill=0)                │
 │       ├── count      (int32,  fill=0)                │
 │       ├── h_min      (float32, fill=NaN)             │
 │       ├── h_max      (float32, fill=NaN)             │

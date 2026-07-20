@@ -117,13 +117,13 @@ class TestProcessRasterMode:
         np.testing.assert_array_equal(got[valid], data[rows[valid], cols[valid]])
         assert (got[~valid] == 0).all()
         ids = open_array(
-            event["store_path"] + f"/{grid.group_path}/cell_ids",
+            event["store_path"] + f"/{grid.group_path}/morton",
             zarr_format=3,
             consolidated=False,
         )
         np.testing.assert_array_equal(
             ids[start : start + grid.cells_per_shard],
-            np.asarray(grid.encode_cell_ids(cells), dtype=np.uint64),
+            np.asarray(cells, dtype=np.uint64),
         )
 
     def test_handler_streams_slabs_incrementally(self, handler_mod, raster_event, monkeypatch):

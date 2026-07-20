@@ -1,5 +1,6 @@
 import numpy as np
 import zarr
+from conftest import nested_ids
 from zarr.storage import MemoryStore
 
 from zagg.config import default_config, get_coords, get_data_vars
@@ -13,7 +14,8 @@ def test_full_integration(zarr_store, mock_dataframe_factory):
     child_order = 8
 
     cfg = default_config()
-    coords = get_coords(cfg)
+    # D16 flip (issue #304): the stored coordinate set excludes cell_ids.
+    coords = [c for c in get_coords(cfg) if c != "cell_ids"]
     data_vars = get_data_vars(cfg)
 
     grid = HealpixGrid(parent_order, child_order, layout="fullsphere", config=cfg)
@@ -23,12 +25,12 @@ def test_full_integration(zarr_store, mock_dataframe_factory):
     df_out = mock_dataframe_factory(-78.5, -132.0, parent_order, child_order)
 
     n_children = 4 ** (child_order - parent_order)
-    chunk_idx = (int(df_out["cell_ids"].min()) // n_children,)
+    chunk_idx = (int(nested_ids(df_out).min()) // n_children,)
     write_dataframe_to_zarr(df_out, store, grid=grid, chunk_idx=chunk_idx)
 
     group = zarr.open_group(store=store, path=str(child_order), mode="r")
-    min_idx = int(df_out["cell_ids"].min())
-    max_idx = int(df_out["cell_ids"].max())
+    min_idx = int(nested_ids(df_out).min())
+    max_idx = int(nested_ids(df_out).max())
 
     for col in coords + data_vars:
         actual = group[col][min_idx : max_idx + 1]
@@ -92,7 +94,8 @@ def test_multiple_parent_cells(zarr_store, mock_dataframe_factory):
     child_order = 8
 
     cfg = default_config()
-    coords = get_coords(cfg)
+    # D16 flip (issue #304): the stored coordinate set excludes cell_ids.
+    coords = [c for c in get_coords(cfg) if c != "cell_ids"]
     data_vars = get_data_vars(cfg)
 
     grid = HealpixGrid(parent_order, child_order, layout="fullsphere", config=cfg)
@@ -109,7 +112,7 @@ def test_multiple_parent_cells(zarr_store, mock_dataframe_factory):
         df_out = mock_dataframe_factory(lat, lon, parent_order, child_order)
 
         n_children = 4 ** (child_order - parent_order)
-        chunk_idx = (int(df_out["cell_ids"].min()) // n_children,)
+        chunk_idx = (int(nested_ids(df_out).min()) // n_children,)
         write_dataframe_to_zarr(df_out, store, grid=grid, chunk_idx=chunk_idx)
 
         all_data[(lat, lon)] = df_out
@@ -117,8 +120,8 @@ def test_multiple_parent_cells(zarr_store, mock_dataframe_factory):
     group = zarr.open_group(store=store, path=str(child_order), mode="r")
 
     for (lat, lon), df_out in all_data.items():
-        min_idx = int(df_out["cell_ids"].min())
-        max_idx = int(df_out["cell_ids"].max())
+        min_idx = int(nested_ids(df_out).min())
+        max_idx = int(nested_ids(df_out).max())
 
         for col in coords + data_vars:
             actual = group[col][min_idx : max_idx + 1]
