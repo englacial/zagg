@@ -50,6 +50,7 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 import time
 import warnings
 from datetime import datetime, timezone
@@ -91,6 +92,115 @@ _ZSTD_LEVEL = 3
 #: invariant, next to the manifest. Same name as the in-leaf sidecar
 #: (:data:`COVERAGE_SIDECAR`), different location and encoding.
 ROOT_COVERAGE_NAME = "coverage.moc"
+
+#: Product-name grammar (D19; normative on the mortie spec page §6.5):
+#: URL-safe lowercase alphanumerics plus ``-``/``_``. The base-component
+#: exclusion (``-?[1-6]``, :func:`_is_base_component`) is checked separately —
+#: a name shaped like a hive base component would make the walker's child
+#: classification ambiguous at a multi-product store root.
+_PRODUCT_NAME_RE = re.compile(r"^[a-z0-9_-]+$")
+
+
+def validate_product_name(name: str) -> str:
+    """Validate a D19 product name; returns it.
+
+    Grammar (normative on the mortie spec page §6.5): one or more of
+    ``[a-z0-9_-]``, and never matching the morton base-component grammar
+    ``-?[1-6]`` — the root-form discrimination
+    (:func:`classify_store_root`) depends on names and digit components
+    being disjoint. Names are URL-safe by construction (they appear in
+    gridlook deep-links and web paths).
+    """
+    if not isinstance(name, str) or not _PRODUCT_NAME_RE.match(name):
+        raise ValueError(
+            f"product name {name!r} does not match the D19 grammar ([a-z0-9_-]+, "
+            f"lowercase; normative on the mortie spec page)"
+        )
+    if _is_base_component(name):
+        raise ValueError(
+            f"product name {name!r} matches the morton base-component grammar "
+            f"(-?[1-6]); such names are excluded so a store root's children stay "
+            f"unambiguous (D19)"
+        )
+    return name
+
+
+def product_root(store_root: str, name: str) -> str:
+    """Root prefix of product ``name`` under a multi-product store (D19).
+
+    A product subtree is a COMPLETE, unmodified morton-hive store (bare-named
+    manifest + MOC + digit tree), so everything that takes a ``store_root``
+    takes this value unchanged.
+    """
+    return f"{store_root.rstrip('/')}/{validate_product_name(name)}"
+
+
+def effective_store_root(store_path: str, config) -> str:
+    """The store root a run writes into: the product root when one is named.
+
+    ``output.product_name`` (issue #299) prefixes the configured store path
+    with the D19 ``{name}/`` product root; absent, the bare single-product
+    layout is unchanged (byte-identical stores — the D19 revision is
+    additive).
+    """
+    from zagg.config import get_product_name
+
+    name = get_product_name(config)
+    return product_root(store_path, name) if name else store_path
+
+
+def classify_store_root(store_root: str, **store_kwargs) -> str:
+    """Root-form discrimination by CONTENT (D19): what sits at ``store_root``.
+
+    Returns ``"bare"`` (a manifest at the root ⇒ a single-product store — the
+    digit tree lives right here), ``"products"`` (no manifest, and at least
+    one name-shaped child prefix ⇒ a directory of product roots), or
+    ``"empty"`` (neither). Base-component-shaped children without a manifest
+    still classify as ``"bare"`` — the manifest write is async (issue #252),
+    so a store mid-first-run must not be misread as a product directory.
+    """
+    import obstore
+
+    store = open_object_store(store_root, **store_kwargs)
+    if _read_json(store, MANIFEST_NAME) is not None:
+        return "bare"
+    listing = obstore.list_with_delimiter(store)
+    children = [p.rstrip("/").split("/")[-1] for p in listing["common_prefixes"]]
+    if any(_is_base_component(c) for c in children):
+        return "bare"
+    names = [c for c in children if _is_valid_product_name(c)]
+    return "products" if names else "empty"
+
+
+def list_products(store_root: str, **store_kwargs) -> dict:
+    """``{name: manifest}`` for every product under a multi-product root (D19).
+
+    Discovery is the root listing itself — no name↔hash translation layer:
+    each name-shaped child prefix is read for its bare-named
+    ``morton_hive.json``. Children without a readable manifest are skipped
+    (debris or mid-write; the D4 posture — absence of a manifest means the
+    product is not yet discoverable).
+    """
+    import obstore
+
+    store = open_object_store(store_root, **store_kwargs)
+    listing = obstore.list_with_delimiter(store)
+    children = [p.rstrip("/").split("/")[-1] for p in listing["common_prefixes"]]
+    products = {}
+    for name in sorted(c for c in children if _is_valid_product_name(c)):
+        manifest = read_manifest(product_root(store_root, name), **store_kwargs)
+        if manifest is not None:
+            products[name] = manifest
+    return products
+
+
+def _is_valid_product_name(name: str) -> bool:
+    """Whether ``name`` satisfies the D19 product-name grammar (no raise)."""
+    try:
+        validate_product_name(name)
+    except ValueError:
+        return False
+    return True
 
 
 def shard_leaf_path(store_root: str, shard_key, window: str | None = None) -> str:
