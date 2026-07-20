@@ -309,7 +309,10 @@ def test_hive_store_matches_model(tmp_path, monkeypatch):
     assert measured["objects_metadata"] == expected["metadata"] == 3
     assert measured["objects_other"] == 0
     assert list(measured["objects_per_shard"]) == [_KEY_A]
-    assert measured["objects_total"] == expected["total_max"]
+    # The end-of-run sweep (issue #300) lands its rollups in their own bucket
+    # (second-pass D9 caches); the write-path total excludes them.
+    assert measured["objects_rollups"] > 0
+    assert measured["objects_total"] - measured["objects_rollups"] == expected["total_max"]
     assert bench_objects.object_count_mismatch(measured, expected) is None
     # Attribution really is the leaf prefix.
     leaf = hive.shard_leaf_path("", word).lstrip("/")
@@ -557,8 +560,11 @@ def test_hive_sharded_store_matches_model(tmp_path, monkeypatch):
     # (issue #297); store root = manifest + MOC + the run stats parquet.
     n_arrays = len(grid.shard_spec().members)
     assert expected["exact"] is True
-    assert expected["per_shard_max"] == 2 + 2 * n_arrays + 1 + 1
+    # ... + the stats.json AND shardmap.json siblings (issues #297/#300).
+    assert expected["per_shard_max"] == 2 + 2 * n_arrays + 1 + 2
     assert expected["metadata"] == 3
-    assert measured["objects_total"] == expected["total_max"]
+    # Sweep rollups (issue #300) ride their own bucket, outside the
+    # write-path total this model audits.
+    assert measured["objects_total"] - measured["objects_rollups"] == expected["total_max"]
     assert measured["objects_other"] == 0
     assert bench_objects.object_count_mismatch(measured, expected) is None
