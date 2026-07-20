@@ -820,16 +820,25 @@ rollup leaves all leaf reads intact.
   provenance attrs; the pyramid is the store's resolution axis, partially
   materialized. Reader support is gated on mortie#116 mixed-order morton
   (tracked as moczarr#8); the schema needs no bump — this is what the
-  coordinate system was built for. Open sub-point (deferred pending
-  discussion, espg leans recorded 2026-07-20): how a `none`
-  (non-composable) field behaves — the recorded lean is **per-field
-  exclusion from coarser materializations** (composable fields roll up;
-  non-composable fields exist only at native resolution — matching
-  #201's "which fields degrade" question) rather than min-semantics
-  pinning the whole product; and whether `none` fields are permitted at
-  all — lean: allowed, with a **loud warning** at template validation.
-  Per-field exclusion makes "resolution of a product" per-field, which
-  readers must handle; not ratified.
+  coordinate system was built for. Sub-point **ruled** (espg-ratified
+  in-session, 2026-07-20, on the #201 thread): `none` (non-composable)
+  fields are **allowed, with a loud warning** at template validation,
+  and at overview orders the default is **per-field exclusion** —
+  composable fields roll up, `none` fields exist only at native
+  resolution (min-semantics product pinning rejected; "resolution of a
+  product" is per-field, which readers handle via the manifest's
+  per-family declarations). An **explicitly declared derived summary**
+  is available as the opt-in: e.g. an auto-digest of a roster field's
+  raw values **under a different field name** at overview orders, so
+  overview schema never silently differs from source; the declaration
+  lives in the **pyramid block, never the semantic core** (leaf truth is
+  unchanged — two products differing only in overview-summary
+  declarations are the same product), and derived fields carry their own
+  composability class and O11 hashes. Deterministic subsampling
+  (seeded reservoir per cell, seed = f(cell, window, field) for O11
+  reproducibility) is **deferred** until a concrete consumer (the #265
+  HHDC class) asks; concatenation ("roster pyramids") is **rejected** —
+  volume never shrinks, every level duplicates the raw data beneath it.
 
 ### 8.2 Open for review (input needed)
 
