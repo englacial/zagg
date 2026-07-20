@@ -931,6 +931,19 @@ class TestRasterMortonCoordinate:
         assert grp.attrs["dggs"]["coordinate"] == "morton"
         assert "cell_ids" not in grp
 
+    def test_written_flat_attrs_round_trip(self, tmp_path):
+        # F14: the FLAT write is the one that changed from attributes={} to
+        # grid._dggs_attrs(); pin the written-store attrs there too, not just
+        # on the leaf.
+        import zarr
+
+        cfg, grid, _shard = _healpix_setup(tmp_path)
+        store = MemoryStore()
+        emit_raster_template(store, grid, cfg, np.array([0], dtype=np.int64))
+        grp = zarr.open_group(store, path=grid.group_path, mode="r", zarr_format=3)
+        assert grp.attrs["dggs"]["coordinate"] == "morton"
+        assert "cell_ids" not in grp
+
 
 class TestGeometryCache:
     """Issue #244: the pull-NN mapping is memoized per (epsg, transform, shape)
