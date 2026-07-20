@@ -20,7 +20,8 @@ so it cannot drift from what the template actually emits:
   array at K>1 gives 1..K objects (zarr's default ``write_empty_chunks=False``
   omits all-fill chunks, so empty inner chunks write nothing).
 - **hive** (per-shard leaf zarrs): store-root objects (``morton_hive.json``,
-  plus ``coverage.moc`` when ``output.coverage_moc`` is on — the hive default)
+  plus ``coverage.moc`` when ``output.coverage_moc`` is on — the hive default —
+  plus the fail-open ``aggregation.yaml`` semantic core, issue #299)
   plus, per populated leaf, the leaf metadata (root + group + per-array
   ``zarr.json``), the in-leaf ``coverage.moc`` sidecar (depth > 0), one
   whole-leaf ragged object per ragged field, and — since issue #236 — one
@@ -141,10 +142,12 @@ def expected_object_counts(
         # the floor is the manifest alone, the ceiling adds the MOC. A real
         # sharded-write bypass lands in the per-shard DATA counts (asserted
         # exactly in object_count_mismatch), never in this metadata window.
-        # ... plus the OPTIONAL run-level stats parquet (issue #297), same
+        # ... plus the OPTIONAL run-level stats parquet (issue #297) and the
+        # OPTIONAL aggregation.yaml semantic core (issue #299, D19 — a
+        # fail-open derived convenience riding the manifest write), same
         # fail-open posture as the root MOC.
         metadata_min = 1
-        metadata_max = 1 + (1 if coverage_moc else 0) + 1
+        metadata_max = 1 + (1 if coverage_moc else 0) + 1 + 1
         # Leaf fixed objects: leaf root zarr.json + group zarr.json + one
         # zarr.json per array, plus the in-leaf coverage.moc sidecar (written
         # for any populated leaf when the leaf has depth, i.e. child_order >
@@ -267,7 +270,10 @@ def store_object_counts(
             prefix.rstrip("/").rsplit("/", 1)[0] + "/": label for prefix, label in leaf_of.items()
         }
         for key in keys:
-            if key in (hive.MANIFEST_NAME, hive.ROOT_COVERAGE_NAME) or _is_run_parquet(key):
+            if (
+                key in (hive.MANIFEST_NAME, hive.ROOT_COVERAGE_NAME, hive.AGGREGATION_CORE_NAME)
+                or _is_run_parquet(key)
+            ):
                 metadata += 1
                 continue
             for prefix, label in leaf_of.items():

@@ -305,8 +305,9 @@ def test_hive_store_matches_model(tmp_path, monkeypatch):
     # K == 1 leaf: every per-array count is deterministic, so the hive model
     # is exact here and the real store matches it object-for-object.
     assert expected["exact"] is True
-    # Through the runner: manifest + root MOC + the run stats parquet (#297).
-    assert measured["objects_metadata"] == expected["metadata"] == 3
+    # Through the runner: manifest + aggregation.yaml (issue #299) + root
+    # MOC + the run stats parquet (#297).
+    assert measured["objects_metadata"] == expected["metadata"] == 4
     assert measured["objects_other"] == 0
     assert list(measured["objects_per_shard"]) == [_KEY_A]
     assert measured["objects_total"] == expected["total_max"]
@@ -554,11 +555,12 @@ def test_hive_sharded_store_matches_model(tmp_path, monkeypatch):
     )
     # Exact: per leaf = root+group zarr.json (2) + one zarr.json AND one data
     # object per array + the coverage sidecar + the stats.json sibling
-    # (issue #297); store root = manifest + MOC + the run stats parquet.
+    # (issue #297); store root = manifest + aggregation.yaml (issue #299)
+    # + MOC + the run stats parquet.
     n_arrays = len(grid.shard_spec().members)
     assert expected["exact"] is True
     assert expected["per_shard_max"] == 2 + 2 * n_arrays + 1 + 1
-    assert expected["metadata"] == 3
+    assert expected["metadata"] == 4
     assert measured["objects_total"] == expected["total_max"]
     assert measured["objects_other"] == 0
     assert bench_objects.object_count_mismatch(measured, expected) is None

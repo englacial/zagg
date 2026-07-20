@@ -859,8 +859,10 @@ class RasterStrategy:
         max_workers = min(max_workers or 4, len(cells)) or 1
         # Run identity for the stats records (issue #297): generated once per
         # run, stamped into every record so leaf sidecars join back to the
-        # run-level parquet (which reuses it in its object name).
+        # run-level parquet (which reuses it in its object name). The
+        # semantic-core hash (issue #299) rides every record the same way.
         run_id = uuid.uuid4().hex
+        run_semantic_hash = _semantic_hash(config)
         t0 = time.time()
         shards_with_data = 0
         errors = 0
@@ -951,6 +953,7 @@ class RasterStrategy:
                 metadata=meta,
                 granule_ids=raster_granule_ids(granules),
                 run_id=run_id,
+                semantic_hash=run_semantic_hash,
             )
             meta["stats"] = record
             if store_layout == "hive" and meta.get("leaf_written"):
@@ -2460,6 +2463,9 @@ def _run_local(
     # stamped into every record so leaf sidecars join back to the run-level
     # parquet (which reuses it in its object name).
     run_id = uuid.uuid4().hex
+    # The run config's semantic-core hash (issue #299, D19): stamped into
+    # every stats record so has_run's identity check has a recorded value.
+    run_semantic_hash = _semantic_hash(config)
     store_layout = get_store_layout(config)
     store_kwargs = {
         "region": region,
@@ -2570,6 +2576,7 @@ def _run_local(
                 metadata=meta,
                 granule_ids=_resolve_urls(records, driver),
                 run_id=run_id,
+                semantic_hash=run_semantic_hash,
             )
             meta["stats"] = record
             if store_layout == "hive" and not meta.get("error"):
