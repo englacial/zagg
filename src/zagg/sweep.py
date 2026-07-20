@@ -439,6 +439,13 @@ def _rollup_interior(store, fam, node, computed, counts) -> dict | None:
     is probed on the store (<= 4 GETs, no LIST) so prior runs' siblings keep
     contributing. Generation is the children's sum/max — fold-of-folds equals
     the direct leaf fold because every family's merge is associative (§8.3).
+
+    The store is append-only at the leaf level (leaf deletion/GC is the
+    registered debris family, deliberately stubbed), so a child that emptied
+    this pass returns ``None`` from its shard rollup and this fallback picks up
+    its prior on-store rollup — an emptied/vanished leaf keeps contributing to
+    its parent until a deletion-aware family exists. Under append-only + D9
+    (rollups are regenerable caches) that is intended, not stale-serving.
     """
     from zagg.hive import _decimal_order
 
