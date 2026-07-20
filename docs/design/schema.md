@@ -67,8 +67,8 @@ Everything else --- the Zarr template, `calculate_cell_statistics`, and `process
 
 | Column | Type | Description |
 |--------|------|-------------|
-| `cell_ids` | uint64 | HEALPix cell ID at child order |
-| `morton` | int64 | Morton index at child order |
+| `morton` | uint64 | Morton index at child order (default coordinate) |
+| `cell_ids` | uint64 | HEALPix NESTED cell ID at child order (hatch-only, issue #304) |
 | `count` | int32 | Number of observations |
 | `h_mean` | float32 | Inverse-variance weighted mean elevation |
 | `h_sigma` | float32 | Uncertainty of weighted mean |
