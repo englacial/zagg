@@ -368,6 +368,10 @@ def write_run_parquet(
 #: ``/1``/``/2`` (and an absent spec) keep the frozen legacy sidecar names.
 SPEC_V3 = "morton-hive/3"
 
+#: Specs that key the frozen legacy sidecar names (bare / ``stats_{window}.json``).
+#: An absent spec (``None``) is a ``morton-hive/1`` store by definition.
+_LEGACY_SPECS = (None, "morton-hive/1", "morton-hive/2")
+
 
 def sidecar_key(leaf_name: str, spec: str | None = None) -> str:
     """Sidecar object name for a leaf zarr basename, keyed by store spec.
@@ -386,12 +390,22 @@ def sidecar_key(leaf_name: str, spec: str | None = None) -> str:
     leaf basename itself, so the token has ONE source
     (:func:`zagg.windows.leaf_name_v3`) and the issue #299 writer flip is a
     spec switch here, not a rename.
+
+    An unrecognized spec RAISES rather than silently defaulting to the legacy
+    grammar: a versioned naming bump must be a loud, deliberate change here, or
+    a writer/reader spec mismatch would key the wrong sidecar name and read as
+    absent instead of failing.
     """
     if spec == SPEC_V3:
         stem = leaf_name.removesuffix(".zarr")
         if not stem or stem == leaf_name:
             raise ValueError(f"{leaf_name!r} is not a leaf zarr name")
         return f"{stem}.stats.json"
+    if spec not in _LEGACY_SPECS:
+        raise ValueError(
+            f"unknown store spec {spec!r} (one of {_LEGACY_SPECS} for legacy names "
+            f"or {SPEC_V3!r} for D23 window-only naming)"
+        )
     from zagg.windows import split_leaf_name
 
     _full_id, window = split_leaf_name(leaf_name)
