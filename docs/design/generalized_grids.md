@@ -292,7 +292,7 @@ The generalization is straightforward: each `OutputGrid` implementation owns its
 
 | Grid | Array shape | Chunk shape | Coord arrays | Metadata conformance |
 |---|---|---|---|---|
-| HealpixGrid | `(12 · 4^child_order,)` | `4^(child − shard)` | `cell_ids` (uint64), `morton` (int64) | **xdggs** (unchanged) |
+| HealpixGrid | `(12 · 4^child_order,)` | `4^(child − shard)` | `morton` (uint64); `cell_ids` (uint64) hatch-only (issue #304) | **xdggs** (unchanged) |
 | H3Grid | `(n_cells_at_resolution,)` | `≈ 7^Δ` padded | `h3_index` (uint64) | **xdggs** (H3 variant) |
 | S2Grid | `(n_cells_at_resolution,)` | `≈ 4^Δ` | `s2_cell_id` (uint64) | **xdggs** (S2 variant) |
 | RectilinearGrid | `(height, width)` 2D | user-specified, typically `(256, 256)` | `x`, `y` + `crs` attr | **CF + GeoZarr** |
