@@ -346,7 +346,12 @@ def run_parquet_key(run_id: str, timestamp: str | None = None) -> str:
 
 
 def write_run_parquet(
-    store_root: str, rows: list, *, run_id: str, store_kwargs: dict | None = None
+    store_root: str,
+    rows: list,
+    *,
+    run_id: str,
+    timestamp: str | None = None,
+    store_kwargs: dict | None = None,
 ) -> str:
     """PUT the run-level stats parquet at the store root (issue #297 phase 3).
 
@@ -357,6 +362,11 @@ def write_run_parquet(
     precedent — pyarrow stays off the worker path, issue #130);
     ``object_encoding="utf8"`` pins string columns that may be all-null in a
     given run (e.g. ``invoked_by`` locally). Returns the object's full path.
+
+    ``timestamp`` pins the D20 key instead of stamping write time — the D8
+    worker-invoke transport (issue #313): the dispatcher names the object at
+    dispatch so ``summary["run_stats_path"]`` is knowable without reading the
+    fire-and-forget worker's response.
     """
     import tempfile
 
@@ -367,7 +377,7 @@ def write_run_parquet(
 
     if not rows:
         raise ValueError("write_run_parquet requires at least one row")
-    key = run_parquet_key(run_id)
+    key = run_parquet_key(run_id, timestamp)
     df = pd.DataFrame(rows)
     with tempfile.TemporaryDirectory() as tmp:
         local = os.path.join(tmp, key)
@@ -376,6 +386,49 @@ def write_run_parquet(
             data = fh.read()
     obstore.put(open_object_store(store_root, **(store_kwargs or {})), key, data)
     return f"{store_root.rstrip('/')}/{key}"
+
+
+def rows_from_status(status_prefix: str, *, store_kwargs: dict | None = None) -> list:
+    """Run-parquet rows assembled worker-side from the async status prefix.
+
+    The pointer transport of the D8 worker-invoke run-record write (issue
+    #313): when a run's rows exceed the async-invoke payload budget, the
+    dispatcher sends the status-prefix LOCATION instead and the worker — whose
+    role can read the store side — LISTs the per-shard result envelopes the
+    workers mirrored there (issue #151) and flattens each envelope's
+    ``body["stats"]`` record into a row. Envelopes without a record (stale
+    worker) and unparsable objects are skipped with a warning — the run
+    record is best-effort telemetry (fail-open, D9-style), never load-bearing.
+    Failure rows cannot be assembled here (a timed-out shard mirrored no
+    envelope); the dispatcher sends those few rows inline alongside the
+    pointer. Dispatcher-side ``retries`` are likewise not recoverable from
+    envelopes, so pointer-assembled success rows carry ``retries: None``.
+    """
+    import json as _json
+    import logging
+
+    import obstore
+
+    from zagg.store import open_object_store
+
+    logger = logging.getLogger(__name__)
+    store = open_object_store(status_prefix, **(store_kwargs or {}))
+    rows = []
+    for batch in obstore.list(store):
+        for meta in batch:
+            key = meta["path"]
+            if not key.endswith(".json"):
+                continue
+            try:
+                envelope = _json.loads(bytes(obstore.get(store, key).bytes()))
+                body = _json.loads(envelope.get("body", "{}"))
+                record = body.get("stats")
+            except Exception as e:
+                logger.warning(f"skipping unparsable status envelope {key}: {e}")
+                continue
+            if isinstance(record, dict):
+                rows.append(flatten_record(record))
+    return rows
 
 
 # ---------------------------------------------------------------------------
