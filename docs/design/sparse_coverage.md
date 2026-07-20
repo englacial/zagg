@@ -69,9 +69,10 @@ what zagg consumes:
                                     schedule: none (reserved token — lean).
                                     /1–/2 stores keep {full_id}.zarr and
                                     {full_id}_{window}.zarr (D3/D13)
-      {window}.stats.json        <- per-shard stats sidecar, sibling (D20,
-                                    naming aligned by D23; all.stats.json
-                                    for the degenerate case)
+      stats_{window}.json        <- per-shard stats sidecar, sibling; ratified
+                                    D20 naming (stats.json for schedule: none).
+                                    D23 lean, not ratified: {window}.stats.json
+                                    / all.stats.json (follow-up to #302)
       <sub-shardmap JSON>        <- leaf sub-map for sweep rollups (D22)
 ```
 
