@@ -29,7 +29,9 @@ from typing import Any, Iterable
 
 from zagg.dispatch import LAMBDA_PRICE_PER_GB_SEC, LAMBDA_PRICE_PER_GB_SEC_BY_ARCH
 
-#: Version stamped into every record; bump on any key change (issue #297).
+#: Version stamped into every record (issue #297). The bump-on-key-change rule
+#: applies once the schema is released; while unreleased, pre-release key changes
+#: (e.g. the D19 rev 2 / D20 record) rev in place and this stays 1.
 SCHEMA_VERSION = 1
 
 #: Leaf sidecar object name (sibling of the leaf ``.zarr``, not inside it).
