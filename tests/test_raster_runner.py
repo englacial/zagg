@@ -354,6 +354,10 @@ def _lifecycle(responder):
                 "statusCode": 200,
                 "body": json.dumps({"ok": True, "mode": "ping", "zagg_version": "test"}),
             }
+        if event["mode"] == "stats":
+            # The issue #313 fire-and-forget run-record invoke; nobody reads
+            # the response.
+            return {"statusCode": 200, "body": json.dumps({"ok": True, "mode": "stats"})}
         if event["mode"] == "setup":
             body = {
                 "ok": True,
@@ -409,9 +413,11 @@ class TestRasterLambdaBackend:
         assert summary["backend"] == "lambda"
         assert summary["total_cells"] == 1 and summary["cells_with_data"] == 1
         assert summary["cells_error"] == 0
-        # The key is unconditional (issue #297) — None here because the
-        # conftest guard skips the live s3 PUT in unit tests.
+        # The key is unconditional (issue #297) — None here because the fake
+        # worker bodies carry no stats records and nothing failed, so there
+        # are no rows and no mode="stats" dispatch (issue #313).
         assert "run_stats_path" in summary and summary["run_stats_path"] is None
+        assert not any(e["mode"] == "stats" for e in fake.events)
         # Cost block (issue #298, rolled into the raster path here): the
         # pre-invoke ceiling, the deferred estimate stub, and the billed
         # rollup — 30 s x 4 GB x the arm64 rate — with the legacy flat key
@@ -770,8 +776,12 @@ class TestRasterLambdaBackend:
                 backend="lambda",
                 invocation="sync",
             )
-        # deterministic FunctionError -> no retry
-        assert [e["mode"] for e in fake.events] == ["ping", "setup", "process_raster"]
+        # deterministic FunctionError -> no retry; the trailing mode="stats"
+        # invoke carries the failure rows (dispatched BEFORE the all-failed
+        # raise so the run record persists the evidence — issue #313).
+        assert [e["mode"] for e in fake.events] == ["ping", "setup", "process_raster", "stats"]
+        stats_event = fake.events[-1]
+        assert [r["success"] for r in stats_event["rows"]] == [False]
 
     def test_lambda_transient_retry_then_success(self, manifest, monkeypatch, tmp_path):
         # A transient invoke fault (Connection reset) on the first attempt retries
