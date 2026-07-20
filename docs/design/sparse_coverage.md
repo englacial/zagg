@@ -595,7 +595,13 @@ rollup leaves all leaf reads intact.
   lifecycle/expiration, access policy, inventory) dominate in practice —
   under colocation each would need per-object tagging or the
   out-of-contract full enumeration; under hash-first each is one prefix
-  rule. Within-product walk/terminal semantics revert to the proven
+  rule. Cost prediction for appending new shards to a product is likewise
+  greatly simplified (espg-noted in-session, 2026-07-20): the product root
+  scopes its own telemetry history — the D20 run records and sidecars all
+  sit under one prefix — so the pilot-first cost estimator's priors (the
+  #298 design) are exactly the product's own records: same template, same
+  per-observation cost profile, no cross-product filtering. Within-product
+  walk/terminal semantics revert to the proven
   single-product forms, and per-product artifacts keep bare names (one
   less naming surface for readers to get wrong). What hash-first gives
   up — a single spatial prefix spanning all products — serves no planned
