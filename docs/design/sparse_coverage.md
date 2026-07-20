@@ -353,6 +353,11 @@ new wiring on the read side.
 4. Within the leaf zarr, the `morton` coordinate locates the observation(s)
    in the containing cell.
 
+(Under D24 a target's orders may be regionally heterogeneous — the
+declared sets bound them; the *leaf's* actual orders come from its
+morton words / MOC, and the truncation predicate is unchanged.
+Mixed-order reader support is gated on mortie#116 / moczarr#8.)
+
 Per-observation LISTs are forbidden in the join loop: at 2,000 workers ×
 millions of photons the walk is the robustness path, not the join path (D10).
 
