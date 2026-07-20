@@ -230,6 +230,7 @@ async def _sample_one(
     fill=0,
     geom_cache: dict | None = None,
     stage_stats: dict | None = None,
+    io_stats: dict | None = None,
 ):
     """:func:`sample_asset_async` body, also returning the raster's center
     ``(lon, lat)`` — the ownership rule's tile-center input (#218).
@@ -249,6 +250,15 @@ async def _sample_one(
     between read and write, so it is atomic by the same argument as the
     ``geom_cache`` store below — no locks; the ``write_buffer`` sink threads
     never touch this dict.
+
+    ``io_stats`` (issue #297) accumulates the read-volume counters for the
+    per-shard stats record, in place and by the same on-loop ``+=`` argument:
+    ``bytes_read`` (compressed tile bytes fetched), ``px_decoded`` (pixels in
+    the decoded tiles — whole tiles are read to sample a few cells), and
+    ``px_sampled`` (cell samples actually gathered). Unlike ``stage_stats``
+    this is ALWAYS-ON in the shard workers (the counters are a ``len()`` and
+    two multiplies per asset — no timing calls); ``None`` (the public
+    ``sample_asset*`` path) counts nothing.
     """
     from async_tiff import TIFF
 
@@ -304,6 +314,9 @@ async def _sample_one(
     vr, vc = rows[valid], cols[valid]
     tr, tc = vr // th, vc // tw
 
+    if io_stats is not None:
+        io_stats["px_sampled"] += int(vr.size)
+
     if vr.size == 0:
         if prof:
             stage_stats["gather"] += time.time() - _t0
@@ -318,6 +331,9 @@ async def _sample_one(
         stage_stats["fetch"] += time.time() - _t0
         stage_stats["tiles"] += len(pairs)
         _t0 = time.time()
+    if io_stats is not None:
+        io_stats["bytes_read"] += sum(len(t.compressed_bytes) for t in tiles)
+        io_stats["px_decoded"] += len(pairs) * th * tw
     decoded = await asyncio.gather(*[t.decode() for t in tiles])
     if prof:
         stage_stats["decode"] += time.time() - _t0
@@ -394,6 +410,7 @@ async def sample_item_async(
     anonymous: bool = True,
     geom_cache: dict | None = None,
     stage_stats: dict | None = None,
+    io_stats: dict | None = None,
 ):
     """Sample every configured band of one STAC item, concurrently.
 
@@ -438,6 +455,7 @@ async def sample_item_async(
                 fill=bands[f]["fill_value"],
                 geom_cache=geom_cache,
                 stage_stats=stage_stats,
+                io_stats=io_stats,
             )
             for f in fields
         ]
@@ -675,6 +693,12 @@ def process_raster_shard(
     # same argument as the geom_cache store; allocated only when a sink was
     # passed, so the default path is unchanged.
     occupied_acc = np.zeros(len(cells), dtype=bool) if occupied_out is not None else None
+    # Read-volume counters (issue #297): always-on inputs for the stats
+    # record — compressed bytes fetched, pixels decoded (whole tiles), and
+    # cell samples gathered. Their sampled/decoded ratio is the extract's
+    # over-provision at read time; stored raw (associative sums), never as a
+    # ratio, per the mergeable-by-construction schema rule.
+    io_stats = {"bytes_read": 0, "px_decoded": 0, "px_sampled": 0}
 
     async def _run_all():
         sem = asyncio.Semaphore(k)
@@ -693,6 +717,7 @@ def process_raster_shard(
                             anonymous=anonymous,
                             geom_cache=geom_cache,
                             stage_stats=stage_stats,
+                            io_stats=io_stats,
                         )
                         for e in items
                     ]
@@ -760,6 +785,10 @@ def process_raster_shard(
         "granule_count": len(granules),
         "skipped": skipped,
         "timesteps": len(groups),
+        # Read-volume counters (issue #297) for the stats record.
+        "raster_bytes_read": io_stats["bytes_read"],
+        "raster_px_decoded": io_stats["px_decoded"],
+        "raster_px_sampled": io_stats["px_sampled"],
     }
     return slabs, metadata
 

@@ -41,7 +41,14 @@ SIDECAR_NAME = "stats.json"
 # Merge dispositions (associative + commutative by construction). Floats sum,
 # so equality across fold orders holds up to FP summation order.
 _SUM_KEYS = ("n_shards", "n_granules", "n_obs", "cells_with_data", "duration_s")
-_SUM_OR_NONE_KEYS = ("gb_seconds", "est_cost_usd", "spill_bytes")
+_SUM_OR_NONE_KEYS = (
+    "gb_seconds",
+    "est_cost_usd",
+    "spill_bytes",
+    "raster_bytes_read",
+    "raster_px_decoded",
+    "raster_px_sampled",
+)
 _MAX_OR_NONE_KEYS = ("max_memory_mb", "container_hwm_mb")
 _EQ_OR_NONE_KEYS = (
     "shard_key",
@@ -150,6 +157,13 @@ def build_record(
         "phase_timings": phase_timings,
         "duration_s": duration_s,
         "spill_bytes": spill_bytes,
+        # Raster read-volume counters (issue #297): compressed bytes fetched,
+        # pixels decoded (whole tiles), cell samples gathered. Stored raw —
+        # the extract's over-provision (px_decoded / px_sampled) is derived at
+        # read, never stored (mergeable-by-construction). None off-raster.
+        "raster_bytes_read": _opt_int(metadata.get("raster_bytes_read")),
+        "raster_px_decoded": _opt_int(metadata.get("raster_px_decoded")),
+        "raster_px_sampled": _opt_int(metadata.get("raster_px_sampled")),
         "gb_seconds": gb_seconds,
         "est_cost_usd": est_cost,
         "max_memory_mb": _opt_float(metadata.get("max_memory_mb")),
@@ -211,6 +225,10 @@ def _opt_float(value) -> float | None:
     return float(value) if value is not None else None
 
 
+def _opt_int(value) -> int | None:
+    return int(value) if value is not None else None
+
+
 def _zagg_version() -> str:
     import zagg
 
@@ -250,6 +268,9 @@ _ROW_SCALARS = (
     "gb_seconds",
     "est_cost_usd",
     "spill_bytes",
+    "raster_bytes_read",
+    "raster_px_decoded",
+    "raster_px_sampled",
     "max_memory_mb",
     "container_hwm_mb",
     "timestamp",
