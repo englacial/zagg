@@ -268,10 +268,10 @@ the data itself). Tracks [#200](https://github.com/englacial/zagg/issues/200).
   shard's coverage is within one base cell *by construction* (a shard is a
   single subtree; its id alone is the trivial 1-member cover, so the box is
   what buys sub-shard resolution). Padded to exactly 4 slots for fixed width
-  (32 B raw; four decimal strings in attrs); pad-sentinel *lean* is null
-  (base-0 words / JSON `null`), with repetition-padding the viable
-  alternative since repeats are idempotent under MOC algebra — the choice
-  is frozen with the mortie-side spec (O8). Future *store-level* covers that cross base
+  (32 B raw; four decimal strings in attrs); the pad sentinel is null
+  (base-0 words / JSON `null`), decided with the mortie-side spec (O8);
+  repetition-padding would also have worked since repeats are idempotent
+  under MOC algebra, but null is the frozen choice. Future *store-level* covers that cross base
   cells generalize to **≤ 12 members** (the 12 base cells). Readers
   AOI-reject on the box without parsing anything larger.
 - **Tier 1 — the exact shard bitmap** *(as O8 resolved it — the originally
