@@ -1495,6 +1495,11 @@ class TestStatsMode:
             (prefix / f"{shard}.json").write_text(json.dumps(envelope))
         # A stale-worker envelope without a record is skipped, not fatal.
         (prefix / "13.json").write_text(json.dumps({"statusCode": 200, "body": "{}"}))
+        # An unparsable-bytes object hits the except branch (logged + skipped),
+        # and a non-.json object under the prefix is filtered before any GET —
+        # neither aborts the write nor adds a row.
+        (prefix / "14.json").write_text("not json")
+        (prefix / "manifest.txt").write_text("ignore me")
 
         root = str(tmp_path / "out")
         event = {
