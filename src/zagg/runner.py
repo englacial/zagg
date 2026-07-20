@@ -2303,10 +2303,14 @@ def _dispatch_run_stats(
         # Fire -> verify -> re-fire (the async-per-D8 hardening): the Event
         # invoke is retries-0 and failure rows exist only in this run report,
         # so verify the parquet landed (read-only HEAD poll on the pinned
-        # key) and re-fire ONCE if not. Bounded — the dispatcher never
-        # meaningfully blocks — then fail-open with a logged notice (success
-        # rows stay rebuildable from the leaf sidecars; a late queued invoke
-        # may still land the object after we stop looking).
+        # key) and re-fire ONCE if not. This is not free: every successful run
+        # now waits at its tail for one async worker round-trip (cold start +
+        # envelope assemble + PUT), caught by the next <=2s HEAD tick — seconds
+        # of added wall on the common path where fire-and-forget returned
+        # instantly; the drop case pays up to 2x the verify window. Bounded, then
+        # fail-open with a logged notice (success rows stay rebuildable from the
+        # leaf sidecars; a late queued invoke may still land the object after we
+        # stop looking).
         for attempt in (1, 2):
             lambda_client.invoke(
                 FunctionName=function_name,
@@ -2350,7 +2354,6 @@ def _await_run_stats_object(store_path, key, store_kwargs, *, window_s=None) -> 
     if window_s <= 0:
         return True
     import obstore
-    from obstore.exceptions import NotFoundError
 
     from zagg.store import open_object_store
 
@@ -2360,25 +2363,12 @@ def _await_run_stats_object(store_path, key, store_kwargs, *, window_s=None) -> 
         logger.warning(f"run stats verify skipped (cannot open store read-only): {e}")
         return False
     deadline = time.time() + window_s
-    warned = False
     while True:
         try:
             obstore.head(store, key)
             return True
-        except (FileNotFoundError, NotFoundError):
-            pass  # genuinely not there yet — what the re-fire targets
-        except Exception as e:
-            # A non-not-found error (e.g. a prefix-scoped read grant that 403s
-            # HEADs at the store root) is a structural read gap the re-fire can
-            # never fix, and otherwise looks identical to a dropped invoke. Warn
-            # once so it's visible in the log; still treat as absent (we don't
-            # classify auth beyond not-FileNotFoundError — obstore's error
-            # taxonomy varies by backend).
-            if not warned:
-                logger.warning(
-                    f"run stats verify cannot read {key}: {e} — treating as absent"
-                )
-                warned = True
+        except Exception:
+            pass
         if time.time() >= deadline:
             return False
         time.sleep(_RUN_STATS_VERIFY_INTERVAL_S)
