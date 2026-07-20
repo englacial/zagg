@@ -1019,6 +1019,20 @@ class TestCellIdsEncoding:
         g2 = HealpixGrid(parent_order=6, child_order=8, layout="fullsphere", config=cfg2)
         assert "cell_ids" not in g2.spec().members
 
+    def test_hatch_with_aoi_mask_emits_both_members(self):
+        # emit_cell_ids and output.aoi_mask are independent template branches
+        # (#304 phase 2 hatch vs #101 strict-AOI mask). Exercise the combined
+        # template so both extra members ride alongside the always-present
+        # morton coordinate in one spec.
+        cfg = self._cfg(emit=True)
+        cfg.output["aoi_mask"] = True
+        g = HealpixGrid(parent_order=6, child_order=8, layout="fullsphere", config=cfg)
+        members = g.spec().members
+        assert "morton" in members
+        assert "cell_ids" in members
+        assert "aoi_mask" in members
+        assert str(members["aoi_mask"].data_type) == "bool"
+
     def test_mixed_hatch_states_do_not_nest(self):
         # One store carries the extra array, the other does not — different
         # leaf schemas must never co-aggregate.
