@@ -440,6 +440,14 @@ class SubmapFamily(SweepFamily):
             # not a reprojection; keep counts honest without a noop stamp.
             meta.update(total_shards=len(keys), total_pairs=sum(len(g) for g in granules))
         else:
+            # Interior fold: coarsen the children to this node's order. The
+            # resulting metadata["reproject"]["source_parent_order"] records the
+            # immediately-lower fold level (payloads[0]'s parent_order, one order
+            # below this node) — the LAST hop, not the leaf/shard origin order.
+            # Coarsen is transitive, so the folded data equals a direct reproject
+            # of the leaf-level map straight to this order (§8.3,
+            # test_rollup_equals_direct_reproject); the stamp naming the last hop
+            # is by design, not a data discrepancy.
             folded = folded.reproject(_ReprojectTarget(signature, order))
         return {
             "metadata": folded.metadata,
