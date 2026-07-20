@@ -44,6 +44,7 @@ from zagg.config import (
     get_pipeline_type,
     get_store_layout,
     get_store_path,
+    get_sweep,
     get_windowing,
 )
 from zagg.dispatch import (
@@ -1046,6 +1047,18 @@ class RasterStrategy:
         run_stats_path = _write_run_stats(
             store_path, rows, run_id=run_id, store_kwargs=store_kwargs
         )
+        # End-of-run rollup sweep (issue #300): in-process on the local
+        # backend (this process is the worker — see _run_local's note; D8
+        # constrains only the Lambda paths). Only units that wrote a leaf
+        # contribute work; fail-open inside sweep_after_run (D9).
+        if store_layout == "hive" and get_sweep(config):
+            from zagg.sweep import leaves_from_stats_records, sweep_after_run
+
+            leaves = leaves_from_stats_records(
+                [m.get("stats") for m in ok_metas if m.get("leaf_written")]
+            )
+            if leaves:
+                sweep_after_run(store_path, leaves, store_kwargs=store_kwargs)
         # Per-shard isolation lets one bad shard be counted and skipped, but a
         # run where EVERY shard raised (e.g. a config band whose ``asset`` is
         # absent from every granule) would otherwise return a success-shaped,
@@ -1437,6 +1450,25 @@ class RasterStrategy:
             run_id=run_id,
             store_kwargs=_output_store_kwargs(output_creds_event, region),
         )
+        # End-of-run rollup sweep (issue #300): D8 worker-invoke transport,
+        # mirroring the aggregation lambda path — one fire-and-forget
+        # mode="sweep" Event invoke, fail-open (D9; the CLI backstops).
+        if store_layout == "hive" and get_sweep(config):
+            try:
+                from zagg.sweep import leaves_from_stats_records
+
+                leaves = leaves_from_stats_records([b.get("stats") for _k, b in ok_units])
+                if leaves:
+                    _invoke_lambda_sweep(
+                        client,
+                        function_name,
+                        store_path,
+                        leaves,
+                        output_creds_event=output_creds_event,
+                    )
+                    logger.info(f"Dispatched rollup sweep ({len(leaves)} leaves, fire-and-forget)")
+            except Exception as e:
+                logger.warning(f"rollup sweep dispatch failed (fail-open, D9): {e}")
         if cells and errors == len(cells):
             raise RuntimeError(f"all {errors} raster shard(s) failed; last error: {last_error}")
         # Worker telemetry rollup (issue #250): billed durations and peak RSS,
@@ -2723,6 +2755,17 @@ def _run_local(
         for key, exc in stats_failures
     ]
     _write_run_stats(store_path, rows, run_id=run_id, store_kwargs=store_kwargs, summary=summary)
+    # End-of-run rollup sweep (issue #300): the LOCAL dispatcher runs it
+    # in-process — this process is also the worker and already PUTs every
+    # leaf with these credentials, so the D8 orchestrator-no-write rule
+    # (which sends the Lambda paths through a mode="sweep" worker invoke)
+    # doesn't constrain it. Fail-open inside sweep_after_run (D9).
+    if store_layout == "hive" and get_sweep(config):
+        from zagg.sweep import leaves_from_stats_records, sweep_after_run
+
+        leaves = leaves_from_stats_records([m.get("stats") for m in report.results])
+        if leaves:
+            sweep_after_run(store_path, leaves, store_kwargs=store_kwargs)
     logger.info(
         f"Done: {report.cells_with_data} cells, {report.total_obs:,} obs, {report.cells_error} errors, {wall_time:.1f}s"
     )
@@ -3353,6 +3396,34 @@ def _run_lambda(
         store_kwargs=_output_store_kwargs(output_creds_event, region),
         summary=summary,
     )
+    # End-of-run rollup sweep (issue #300): the Lambda dispatcher never PUTs
+    # (D8 standing rule), so the sweep rides ONE fire-and-forget mode="sweep"
+    # worker Event invoke — async, retries-0, fail-open (D9: rollups are
+    # caches; `python -m zagg.sweep` is the regeneration backstop). Leaves
+    # come from the envelope stats records; a stale deployed worker's
+    # record-less envelope simply contributes no leaf.
+    if get_store_layout(config) == "hive" and get_sweep(config):
+        try:
+            from zagg.sweep import leaves_from_stats_records
+
+            leaves = leaves_from_stats_records(
+                [
+                    (r.get("body") or {}).get("stats")
+                    for r in report.results
+                    if r.get("status_code") == 200 and not r.get("error")
+                ]
+            )
+            if leaves:
+                _invoke_lambda_sweep(
+                    state["lambda_client"],
+                    function_name,
+                    store_path,
+                    leaves,
+                    output_creds_event=output_creds_event,
+                )
+                logger.info(f"Dispatched rollup sweep ({len(leaves)} leaves, fire-and-forget)")
+        except Exception as e:
+            logger.warning(f"rollup sweep dispatch failed (fail-open, D9): {e}")
     logger.info(
         f"Done: {report.cells_with_data} cells, {report.total_obs:,} obs, {report.cells_error} errors, {wall_time:.1f}s"
     )
@@ -4428,6 +4499,34 @@ def _invoke_lambda_coverage(
     event = {"mode": "coverage", "store_path": store_path, "coverage": envelope}
     if output_creds_event is not None:
         event["output_credentials"] = output_creds_event
+    lambda_client.invoke(
+        FunctionName=function_name,
+        InvocationType="Event",
+        Payload=json.dumps(event),
+    )
+
+
+def _invoke_lambda_sweep(lambda_client, function_name, store_path, leaves, output_creds_event=None):
+    """Fire-and-forget end-of-run rollup sweep invoke (issue #300, D8).
+
+    ``InvocationType="Event"`` (async, retries-0 semantics, nothing blocks on
+    it and no response is read) — the Lambda-path dispatcher never PUTs to
+    the store (the D8 standing rule), so the sweep runs worker-side exactly
+    like the root ``coverage.moc``'s ``mode="coverage"`` leg. The run's
+    ``(shard_key, window)`` leaves ride inline when they fit the async
+    budget; an oversized set falls back to ``discover: true`` — the worker
+    re-derives the work set from the store's run records (the D22 discovery
+    path; this run's parquet is written before this invoke fires). Failure is
+    harmless by design: rollups are regenerable caches (D9) and the manual
+    CLI (``python -m zagg.sweep``) is the regeneration backstop.
+    """
+    event: dict = {"mode": "sweep", "store_path": store_path}
+    if output_creds_event is not None:
+        event["output_credentials"] = output_creds_event
+    event["leaves"] = [[int(key), window] for key, window in leaves]
+    if len(json.dumps(event)) > _ASYNC_PAYLOAD_CAP_BYTES:
+        del event["leaves"]
+        event["discover"] = True
     lambda_client.invoke(
         FunctionName=function_name,
         InvocationType="Event",

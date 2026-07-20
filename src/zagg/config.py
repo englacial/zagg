@@ -742,6 +742,17 @@ def _validate_store_layout_keys(config: PipelineConfig) -> None:
                 "coverage.moc lives at the hive store root; flat stores have no "
                 "hive root to bootstrap from)"
             )
+    # End-of-run rollup sweep trigger (issue #300), same posture as
+    # coverage_moc: boolean when present, default ON for hive (get_sweep
+    # resolves it), explicit true on a non-hive store is a config mistake.
+    sweep = config.output.get("sweep")
+    if sweep is not None and not isinstance(sweep, bool):
+        raise ValueError(f"output.sweep must be a boolean (got {sweep!r})")
+    if sweep and get_store_layout(config) != "hive":
+        raise ValueError(
+            "output.sweep requires output.store_layout: hive (the rollup sweep "
+            "folds hive-tree leaf artifacts; flat stores have no digit tree)"
+        )
 
 
 def _validate_windowing(config: PipelineConfig) -> None:
@@ -2127,6 +2138,24 @@ def get_coverage_moc(config: PipelineConfig) -> bool:
     like ``store_layout``.
     """
     flag = config.output.get("coverage_moc")
+    if flag is None:
+        return get_store_layout(config) == "hive"
+    return bool(flag)
+
+
+def get_sweep(config: PipelineConfig) -> bool:
+    """Whether the end-of-run rollup sweep trigger is on (issue #300).
+
+    Default ON for hive-layout stores (the D22 sweep folds hive-tree leaf
+    artifacts into interior rollups; every artifact is a fail-open regenerable
+    cache, D9); ``output.sweep: false`` opts out. Non-hive configs default
+    off, and an explicit ``true`` there is rejected by ``validate_config``,
+    mirroring ``coverage_moc``. A present-but-null key falls back to the
+    default. The trigger transport is backend-shaped (D8): the local
+    dispatchers run the sweep in-process; the Lambda dispatchers post a
+    fire-and-forget ``mode="sweep"`` worker Event invoke.
+    """
+    flag = config.output.get("sweep")
     if flag is None:
         return get_store_layout(config) == "hive"
     return bool(flag)

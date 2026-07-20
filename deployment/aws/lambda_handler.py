@@ -120,6 +120,20 @@ echoes the deployed zagg version; the handler also runs the READ-ONLY
 zagg.hive.validate_manifest against any existing root so an incompatible rerun
 refuses up front (D2).
 
+Sweep mode (unified rollup sweep, issue #300 — the D8 worker-invoke transport
+for the D22 second pass; fire-and-forget Event invoke from the dispatcher at
+end of run, like coverage mode; also invocable ad hoc):
+{
+    "mode": "sweep",
+    "store_path": str,
+    "leaves": [[shard_key, window-or-null], ...] (optional) -- the run's
+        completed leaves, inline when they fit the async payload budget,
+    "discover": bool (optional) -- re-derive the work set from the store's
+        run-record parquets instead (zagg.sweep.discover_leaves; sent when
+        the leaves list would overflow the 256 KB Event cap),
+    "output_credentials": dict (optional, same shape as process mode),
+}
+
 Extract mode (chunk-boundary geometry extraction, issue #148 — one parquet per
 granule under an S3 prefix; a batch of granules per invocation for the fan-out):
 {
@@ -501,6 +515,7 @@ def lambda_handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
     creates the zarr template; ``mode="finalize"`` consolidates metadata;
     ``mode="ping"`` is the hive pre-fan-out preflight (issue #252);
     ``mode="coverage"`` writes the store-root ``coverage.moc`` (issue #200);
+    ``mode="sweep"`` folds the D22 rollup families worker-side (issue #300);
     ``mode="extract"`` extracts chunk-boundary geometry parquets (issue #148);
     ``mode="process_event"`` runs the temporal/event worker (issue #12).
     """
@@ -519,6 +534,8 @@ def lambda_handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
         return _handle_ping(event)
     if mode == "coverage":
         return _handle_coverage(event)
+    if mode == "sweep":
+        return _handle_sweep(event)
     # Extract mode returns directly: the result_url mirror below is for the
     # per-unit fan-out handlers (spatial process, temporal process_event) only.
     if mode == "extract":
@@ -905,6 +922,50 @@ def _handle_coverage(event: Dict[str, Any]) -> Dict[str, Any]:
     except Exception as e:
         logger.exception(e)
         return {"statusCode": 500, "body": json.dumps({"error": str(e), "mode": "coverage"})}
+
+
+def _handle_sweep(event: Dict[str, Any]) -> Dict[str, Any]:
+    """Run the unified rollup sweep worker-side (issue #300, D8 transport).
+
+    Posted fire-and-forget (``InvocationType="Event"``) by the Lambda-path
+    dispatcher at end of run — the D8 orchestrator-no-write rule means the
+    dispatcher cannot PUT rollups itself, so the worker role folds them,
+    exactly like the root ``coverage.moc``. The work set rides inline as
+    ``leaves`` (``[[shard_key, window], ...]``) when it fits the async
+    budget; ``discover: true`` has the worker re-derive it from the store's
+    run records (the D22 discovery path). Nobody reads this response on the
+    Event invoke; errors log and fail open — every rollup is a regenerable
+    cache (D9) and ``python -m zagg.sweep`` is the manual backstop.
+    """
+    from zagg.sweep import discover_leaves, run_sweep
+
+    logger.info(f"Sweep mode: folding rollups at {event.get('store_path')}")
+    try:
+        store_kwargs = _output_store_kwargs(event)
+        if event.get("leaves") is not None:
+            leaves = [(int(key), window) for key, window in event["leaves"]]
+        else:
+            leaves = discover_leaves(event["store_path"], store_kwargs=store_kwargs)
+        if not leaves:
+            return {
+                "statusCode": 200,
+                "body": json.dumps({"ok": True, "mode": "sweep", "n_leaves": 0}),
+            }
+        summary = run_sweep(event["store_path"], leaves, store_kwargs=store_kwargs)
+        return {
+            "statusCode": 200,
+            "body": json.dumps(
+                {
+                    "ok": True,
+                    "mode": "sweep",
+                    "n_leaves": summary["n_leaves"],
+                    "families": summary["families"],
+                }
+            ),
+        }
+    except Exception as e:
+        logger.exception(e)
+        return {"statusCode": 500, "body": json.dumps({"error": str(e), "mode": "sweep"})}
 
 
 def _json_scalar(v: Any) -> Any:

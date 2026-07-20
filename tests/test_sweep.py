@@ -704,3 +704,178 @@ class TestSweepCli:
         _write_manifest(tmp_path)
         assert main([str(tmp_path)]) == 0
         assert "nothing to sweep" in capsys.readouterr().out
+
+
+class TestSweepConfig:
+    """output.sweep (issue #300): default on for hive, boolean, hive-only —
+    mirroring coverage_moc's posture."""
+
+    def _cfg(self, **output):
+        from zagg.config import default_config
+
+        cfg = default_config("atl06")
+        cfg.output.update(output)
+        return cfg
+
+    def test_default_on_for_hive(self):
+        from zagg.config import get_sweep, validate_config
+
+        cfg = self._cfg(store_layout="hive")
+        assert get_sweep(cfg) is True
+        validate_config(cfg)
+
+    def test_explicit_off(self):
+        from zagg.config import get_sweep
+
+        assert get_sweep(self._cfg(store_layout="hive", sweep=False)) is False
+
+    def test_null_falls_back_to_default(self):
+        from zagg.config import get_sweep
+
+        assert get_sweep(self._cfg(store_layout="hive", sweep=None)) is True
+
+    def test_default_off_for_flat(self):
+        from zagg.config import get_sweep
+
+        assert get_sweep(self._cfg(store_layout="flat", coverage_moc=False)) is False
+
+    def test_explicit_true_on_flat_rejected(self):
+        from zagg.config import validate_config
+
+        with pytest.raises(ValueError, match="output.sweep requires"):
+            validate_config(self._cfg(store_layout="flat", coverage_moc=False, sweep=True))
+
+    def test_non_bool_rejected(self):
+        from zagg.config import validate_config
+
+        with pytest.raises(ValueError, match="output.sweep must be a boolean"):
+            validate_config(self._cfg(store_layout="hive", sweep="yes"))
+
+
+class TestSweepHook:
+    def test_sweep_after_run_is_fail_open(self, monkeypatch, caplog):
+        from zagg import sweep as sm
+
+        def boom(*a, **k):
+            raise RuntimeError("kaput")
+
+        monkeypatch.setattr(sm, "run_sweep", boom)
+        assert sm.sweep_after_run("/nowhere", [(1, None)]) is None
+        assert "fail-open" in caplog.text
+
+    def test_leaves_from_stats_records(self):
+        from zagg.sweep import leaves_from_stats_records
+
+        records = [
+            {"shard_key": 7, "window": None, "success": True},
+            {"shard_key": 7, "window": "2019", "success": True},
+            {"shard_key": 7, "window": "2019", "success": True},  # dup collapses
+            {"shard_key": 8, "success": True},  # pre-#300 record: no window key
+            {"shard_key": 9, "window": None, "success": False},  # failures skipped
+            {"shard_key": None, "success": True},  # keyless skipped
+            None,  # record-less envelope skipped
+        ]
+        assert leaves_from_stats_records(records) == [(7, None), (7, "2019"), (8, None)]
+
+    def test_local_run_folds_rollups(self, monkeypatch, tmp_path):
+        # End-to-end through the local backend (fake hive write): the
+        # in-process hook folds the stats family up the ancestor chain.
+        from zagg import hive, runner
+        from zagg.config import default_config
+        from zagg.runner import agg
+
+        cfg = default_config("atl06")
+        cfg.output["store_layout"] = "hive"
+        shard = morton_word("-5112333")
+        monkeypatch.setattr(runner, "get_nsidc_s3_credentials", lambda: {"accessKeyId": "a"})
+
+        def fake_hive_write(shard_key, granule_urls, grid, s3_creds, store_root, config, **kw):
+            return {"shard_key": int(shard_key), "error": None, "total_obs": 1}
+
+        monkeypatch.setattr(hive, "process_and_write_hive", fake_hive_write)
+        catalog = {
+            "metadata": {"short_name": "ATL06", "version": "007"},
+            "grid_signature": {
+                "type": "healpix",
+                "indexing_scheme": "nested",
+                "parent_order": 6,
+                "child_order": 12,
+                "layout": "fullsphere",
+            },
+            "shard_keys": [int(shard)],
+            "granules": [[_entry("g1")]],
+        }
+        path = tmp_path / "catalog.json"
+        path.write_text(json.dumps(catalog))
+        root = str(tmp_path / "out")
+        agg(cfg, catalog=str(path), store=root, backend="local")
+        # The stats rollup chain reaches the base node (order 0)...
+        base = _rollup(Path(root), "-5")
+        assert base is not None and base["payload"]["n_shards"] == 1
+        # ...and the submap family folded the worker-emitted leaf sub-map.
+        sub = _rollup(Path(root), "-5", family="submap")
+        assert sub is not None
+        assert [g["id"] for g in sub["payload"]["granules"][0]] == ["g1"]
+
+    def test_local_run_sweep_off_writes_no_rollups(self, monkeypatch, tmp_path):
+        from zagg import hive, runner
+        from zagg.config import default_config
+        from zagg.runner import agg
+
+        cfg = default_config("atl06")
+        cfg.output["store_layout"] = "hive"
+        cfg.output["sweep"] = False
+        shard = morton_word("-5112333")
+        monkeypatch.setattr(runner, "get_nsidc_s3_credentials", lambda: {"accessKeyId": "a"})
+        monkeypatch.setattr(
+            hive,
+            "process_and_write_hive",
+            lambda shard_key, *a, **k: {"shard_key": int(shard_key), "error": None, "total_obs": 1},
+        )
+        catalog = {
+            "metadata": {"short_name": "ATL06", "version": "007"},
+            "grid_signature": {
+                "type": "healpix",
+                "indexing_scheme": "nested",
+                "parent_order": 6,
+                "child_order": 12,
+                "layout": "fullsphere",
+            },
+            "shard_keys": [int(shard)],
+            "granules": [[_entry("g1")]],
+        }
+        path = tmp_path / "catalog.json"
+        path.write_text(json.dumps(catalog))
+        root = str(tmp_path / "out")
+        agg(cfg, catalog=str(path), store=root, backend="local")
+        assert not list(Path(root).rglob("*.rollup.json"))
+
+
+class TestInvokeLambdaSweep:
+    def _client(self):
+        from unittest.mock import MagicMock
+
+        return MagicMock()
+
+    def test_inline_leaves_event(self):
+        from zagg.runner import _invoke_lambda_sweep
+
+        client = self._client()
+        _invoke_lambda_sweep(client, "fn", "s3://b/store", [(7, None), (8, "2019")])
+        kwargs = client.invoke.call_args.kwargs
+        assert kwargs["InvocationType"] == "Event"
+        event = json.loads(kwargs["Payload"])
+        assert event["mode"] == "sweep"
+        assert event["leaves"] == [[7, None], [8, "2019"]]
+        assert "discover" not in event
+
+    def test_oversized_leaves_fall_back_to_discovery(self):
+        from zagg.runner import _ASYNC_PAYLOAD_CAP_BYTES, _invoke_lambda_sweep
+
+        client = self._client()
+        # Packed-word-sized keys (~20 digits each) comfortably overflow the budget.
+        n = _ASYNC_PAYLOAD_CAP_BYTES // 16
+        _invoke_lambda_sweep(client, "fn", "s3://b/store", [(10**19 + i, "2019") for i in range(n)])
+        event = json.loads(client.invoke.call_args.kwargs["Payload"])
+        assert "leaves" not in event
+        assert event["discover"] is True

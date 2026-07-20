@@ -728,8 +728,50 @@ def _put_rollup(store, fam, decimal: str, envelope: dict) -> None:
 
 
 # ---------------------------------------------------------------------------
-# Trigger surfaces (issue #300 phases 4-5): run-record discovery + manual CLI.
+# Trigger surfaces (issue #300 phases 4-5): run-record discovery, the manual
+# CLI, and the end-of-run hook wrapper.
 # ---------------------------------------------------------------------------
+
+
+def sweep_after_run(
+    store_root: str, leaves, *, families=None, store_kwargs: dict | None = None
+) -> dict | None:
+    """End-of-run hook: fail-open wrapper around :func:`run_sweep` (D22).
+
+    Off the critical path by contract: any failure — missing manifest, no
+    store write access, a family blowing up — logs one warning and returns
+    ``None``; the run result is untouched. Rollups are regenerable caches
+    (D9), so a skipped sweep costs one later CLI pass, never a wrong answer.
+    Called in-process by the LOCAL dispatchers only (they are the workers and
+    hold the user's store credentials); the Lambda dispatchers never PUT (the
+    D8 standing rule) and post a fire-and-forget ``mode="sweep"`` worker
+    Event invoke instead, whose handler calls :func:`run_sweep` directly.
+    """
+    try:
+        summary = run_sweep(store_root, leaves, families=families, store_kwargs=store_kwargs)
+        logger.info(f"Post-run sweep: {summary['families']}")
+        return summary
+    except Exception as e:
+        logger.warning(f"post-run sweep failed (fail-open, D9/D22 — rollups are caches): {e}")
+        return None
+
+
+def leaves_from_stats_records(records) -> list:
+    """``(shard_key, window)`` work-set pairs from per-shard stats records.
+
+    The dispatcher-side bridge from a run report to the sweep: every
+    successful unit's record (envelope- or meta-ridden) names its leaf via
+    ``shard_key`` + the issue #300 ``window`` field. Records without a window
+    key (older workers) map to the unwindowed leaf name — on a windowed store
+    that read simply misses (fail-open; the CLI backstops). Failure and
+    ``None`` records are skipped; pairs are deduplicated and sorted.
+    """
+    refs = {
+        (int(r["shard_key"]), r.get("window"))
+        for r in records
+        if r and r.get("success") and r.get("shard_key") is not None
+    }
+    return sorted(refs, key=lambda p: (p[0], p[1] is not None, p[1] or ""))
 
 
 def discover_leaves(store_root: str, *, store_kwargs: dict | None = None) -> list:
