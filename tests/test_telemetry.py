@@ -29,6 +29,7 @@ def _record(
     memory=512.0,
     lambda_config=None,
     invoked_by=None,
+    run_id=None,
     error=None,
 ):
     metadata = {
@@ -49,6 +50,7 @@ def _record(
         metadata=metadata,
         granule_ids=list(granules),
         invoked_by=invoked_by,
+        run_id=run_id,
         lambda_config=lambda_config,
     )
 
@@ -72,7 +74,8 @@ class TestBuildRecord:
         rec = _record()
         assert rec["schema_version"] == SCHEMA_VERSION
         assert rec["shard_key"] == 101
-        assert rec["template_hash"] is None  # placeholder until issue #299
+        assert rec["semantic_hash"] is None  # placeholder until issue #299
+        assert rec["run_id"] is None  # local flavor: no dispatcher-stamped id
         assert rec["n_shards"] == 1
         assert rec["n_granules"] == 2
         assert rec["granules_sha256"] == granules_sha256(["s3://b/g1.h5", "s3://b/g2.h5"])
@@ -113,6 +116,11 @@ class TestBuildRecord:
     def test_invoked_by_copied_verbatim(self):
         ident = {"arn": "arn:aws:sts::123:assumed-role/x/y", "userid": "AROA:me"}
         assert _record(invoked_by=ident)["invoked_by"] == ident
+
+    def test_run_id_copied_verbatim(self):
+        # Threaded like invoked_by (issue #297): dispatcher-known, stamped
+        # through the invoke payload, copied verbatim into the record.
+        assert _record(run_id="deadbeef")["run_id"] == "deadbeef"
 
     def test_raster_counters_default_none_and_populate(self):
         # Off-raster records carry the read-volume fields as None (issue #297).
@@ -228,6 +236,14 @@ class TestMerge:
         assert m["granules_sha256"] is None
         assert m["zagg_version"] == a["zagg_version"]  # shared value survives
 
+    def test_run_id_merges_equal_or_none(self):
+        # Same-run records keep the id; a cross-run fold collapses to None
+        # (absorbing), like every other identity field (issue #297).
+        a, b = _record(1, run_id="run1"), _record(2, run_id="run1")
+        assert merge([a, b])["run_id"] == "run1"
+        assert merge([a, _record(3, run_id="run2")])["run_id"] is None
+        assert merge([a, _record(4)])["run_id"] is None
+
     def test_success_ands(self):
         assert merge([_record(1), _record(2, error="boom")])["success"] is False
 
@@ -312,8 +328,11 @@ class TestRunParquet:
     def test_flatten_record_columns(self):
         cfg = {"memory_mb": 4096, "arch": "aarch64", "function_variant": "zagg-process-shard"}
         ident = {"arn": "arn:aws:iam::1:user/x", "userid": "AIDA1"}
-        row = flatten_record(_record(7, lambda_config=cfg, invoked_by=ident), retries=2)
+        row = flatten_record(
+            _record(7, lambda_config=cfg, invoked_by=ident, run_id="cafe01"), retries=2
+        )
         assert row["shard_key"] == 7 and row["success"] is True
+        assert row["run_id"] == "cafe01" and row["semantic_hash"] is None
         assert row["retries"] == 2 and row["error_class"] is None
         assert row["phase_read"] == 8.0 and row["phase_aggregate"] == 2.0
         assert row["lambda_memory_mb"] == 4096
@@ -324,8 +343,11 @@ class TestRunParquet:
         assert "phase_timings" not in row and "lambda" not in row  # flattened away
 
     def test_failure_record_and_error_class(self):
-        rec = failure_record(shard_key=9, error="Lambda timeout: Task timed out", duration_s=901.0)
+        rec = failure_record(
+            shard_key=9, error="Lambda timeout: Task timed out", duration_s=901.0, run_id="ab12"
+        )
         assert rec["success"] is False and rec["duration_s"] == 901.0
+        assert rec["run_id"] == "ab12"  # dispatcher stamps failure rows too
         row = flatten_record(rec, retries=3)
         assert row["error_class"] == "Lambda timeout"  # derived from the string
         row = flatten_record(rec, error_class="TimeoutError")
@@ -333,8 +355,9 @@ class TestRunParquet:
         assert failure_record(shard_key=None, error="boom")["shard_key"] is None
 
     def test_run_parquet_key_shape(self):
+        # Timestamp-first (D20) so a lexicographic listing is chronological.
         key = run_parquet_key("abc123", timestamp="20260718T010203Z")
-        assert key == "stats_abc123_20260718T010203Z.parquet"
+        assert key == "stats_20260718T010203Z_abc123.parquet"
 
     def test_round_trip(self, tmp_path):
         import pandas as pd
@@ -356,7 +379,8 @@ class TestRunParquet:
         ]
         root = str(tmp_path / "store")
         path = write_run_parquet(root, rows, run_id="deadbeef")
-        assert path.startswith(root + "/stats_deadbeef_")
+        assert path.startswith(root + "/stats_")
+        assert path.endswith("_deadbeef.parquet")  # timestamp-first, run id last
 
         df = pd.read_parquet(path, engine="fastparquet")
         assert len(df) == 3

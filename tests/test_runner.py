@@ -518,7 +518,14 @@ class TestInvokeLambdaCellEvent:
     _CREDS = {"accessKeyId": "a", "secretAccessKey": "s", "sessionToken": "t"}
 
     def _captured_event(
-        self, *, child_order, profile=False, aoi_payload=None, handoff="pandas", invoked_by=None
+        self,
+        *,
+        child_order,
+        profile=False,
+        aoi_payload=None,
+        handoff="pandas",
+        invoked_by=None,
+        run_id=None,
     ):
         from unittest.mock import MagicMock
 
@@ -546,6 +553,7 @@ class TestInvokeLambdaCellEvent:
             aoi_payload=aoi_payload,
             handoff=handoff,
             invoked_by=invoked_by,
+            run_id=run_id,
         )
         return json.loads(client.invoke.call_args.kwargs["Payload"])
 
@@ -611,6 +619,16 @@ class TestInvokeLambdaCellEvent:
         # byte-identical to the pre-#297 path.
         event = self._captured_event(child_order=12, invoked_by=None)
         assert "invoked_by" not in event
+
+    def test_run_id_adds_event_key(self):
+        # issue #297: the dispatcher's run identity threads into the cell
+        # event so the worker copies it verbatim into the stats record.
+        event = self._captured_event(child_order=12, run_id="deadbeef")
+        assert event["run_id"] == "deadbeef"
+
+    def test_default_event_has_no_run_id_key(self):
+        event = self._captured_event(child_order=12, run_id=None)
+        assert "run_id" not in event
 
 
 class TestResolveInvokedBy:
