@@ -145,6 +145,7 @@ The notebooks under `notebooks/` run on [Binder](https://mybinder.org/v2/gh/engl
 | `rasterized_zarr.ipynb` | Rasterize the published HEALPix store to an 8 km polar-stereo grid | [![Binder](https://mybinder.org/badge_logo.svg)](https://mybinder.org/v2/gh/englacial/zagg/main?urlpath=lab/tree/notebooks/rasterized_zarr.ipynb) |
 | `jupyterhub_example.ipynb` | Drive the API from a science hub; read & visualize a published result | [![Binder](https://mybinder.org/badge_logo.svg)](https://mybinder.org/v2/gh/englacial/zagg/main?urlpath=lab/tree/notebooks/jupyterhub_example.ipynb) |
 | `cryocloud_example.ipynb` | End-to-end ISMIP6 read + **AWS Lambda fan-out** on CryoCloud | **not Binder-runnable** (needs live AWS + Earthdata credentials) |
+| `cost_reporting.ipynb` | Max / estimated / actual invoke cost + progress-bar dispatch wrapper | [![Binder](https://mybinder.org/badge_logo.svg)](https://mybinder.org/v2/gh/englacial/zagg/main?urlpath=lab/tree/notebooks/cost_reporting.ipynb) |
 
 `cryocloud_example.ipynb` is the only Lambda demo; it dispatches to a deployed AWS Lambda and reads private-account S3 via the CryoCloud IRSA role, so it cannot run on Binder.
 

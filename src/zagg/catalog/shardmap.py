@@ -562,6 +562,191 @@ class ShardMap:
             meta["aoi_mask"] = True
         return cls(grid.spatial_signature(), shard_keys, granules, meta, aoi_mask)
 
+    def reproject(self, target_grid, catalog=None) -> "ShardMap":
+        """Derive a ShardMap at ``target_grid``'s ``parent_order`` (issue #294).
+
+        HEALPix nesting means a shard map at one order is derivable from
+        another **without touching the source catalog again** in the coarsen
+        direction, and with only a scoped (per-shard) re-intersection in the
+        refine direction -- either is far cheaper than a full
+        :meth:`build` over the whole catalog.
+
+        Parameters
+        ----------
+        target_grid : HealpixGrid
+            Grid to reproject onto. Must share ``child_order`` (the leaf
+            resolution) with the source grid -- reprojecting across different
+            DGGS resolutions isn't meaningful, only the shard (dispatch) order
+            changes.
+        catalog : Catalog, optional
+            Required only when refining (``target_grid.parent_order >`` this
+            map's ``parent_order``): the shard map itself stores only
+            ``{"id", "s3", "https"}`` per granule, not footprint geometry, so
+            recovering which finer cell each granule falls in needs the
+            granule records (``catalog.granule_records()``) back.
+
+        Returns
+        -------
+        ShardMap
+            New map at ``target_grid.parent_order``. ``metadata`` records the
+            source order and ``reproject: {method: "coarsen"|"refine"|"noop"}``.
+
+        Notes
+        -----
+        **Coarsen** (``target_order < source_order``): pure regroup, exact,
+        no geometry. Each source shard's key coarsens via
+        ``mortie.clip2order(target_order, shard_key)``; shards sharing a
+        coarse parent are grouped and their granule lists unioned, deduplicated
+        by granule ``id`` (a granule spanning multiple children counts once in
+        the parent). Exact because footprint-to-cell assignment nests: a
+        granule intersects a coarse cell iff it intersects one of its finer
+        children.
+
+        **Refine** (``target_order > source_order``): cannot be a pure
+        regroup -- the coarse map never recorded which child cell a granule
+        fell in. Instead, for each source shard, its own granules are
+        re-intersected at ``target_order`` (the same ``morton_coverage_moc``
+        machinery :meth:`build` uses), restricted to that shard's own
+        descendant cells (``generate_morton_children(shard_key,
+        target_order)``). In the interior this reproduces the direct
+        :meth:`build` at the finer order; at a region/AOI boundary it may
+        **over-include** child shards a region-restricted direct build would
+        drop (the #101 whole-shard overhang class -- reproject applies no
+        region clip), but it never drops a real intersection. Costs only this
+        shard's granules, not the whole catalog. Refine always
+        re-intersects via the mortie MOC path regardless of the source's
+        ``backend`` (a spherely-built source is not reproduced by it), so the
+        derived map records ``backend="mortie"``.
+        """
+        from mortie import clip2order, generate_morton_children
+
+        target_order = getattr(target_grid, "parent_order", None)
+        target_child_order = getattr(target_grid, "child_order", None)
+        if target_order is None or target_child_order is None:
+            raise ValueError(
+                "reproject: target_grid must be a HEALPix grid (parent_order/child_order)"
+            )
+        source_order = self.grid_signature.get("parent_order")
+        source_child_order = self.grid_signature.get("child_order")
+        if source_order is None or self.grid_signature.get("type") != "healpix":
+            raise ValueError("reproject: source ShardMap must be a HEALPix grid_signature")
+        if source_child_order != target_child_order:
+            raise ValueError(
+                f"reproject: child_order must match (source={source_child_order}, "
+                f"target={target_child_order}) -- reproject only changes the shard "
+                "(parent_order), not the leaf DGGS resolution"
+            )
+        if not (0 <= target_order <= target_child_order):
+            raise ValueError(
+                f"reproject: target_order {target_order} outside [0, child_order="
+                f"{target_child_order}]"
+            )
+
+        if target_order == source_order:
+            meta = dict(self.metadata or {})
+            meta["reproject"] = {
+                "source_parent_order": int(source_order),
+                "target_parent_order": int(target_order),
+                "method": "noop",
+            }
+            return ShardMap(
+                target_grid.spatial_signature(),
+                list(self.shard_keys),
+                [[_granule_entry(g) for g in shard] for shard in self.granules],
+                meta,
+                self.aoi_mask,
+            )
+
+        if target_order < source_order:
+            # ── coarsen: pure regroup, exact, no geometry ────────────────
+            keys = np.asarray([int(k) for k in self.shard_keys], dtype=np.uint64)
+            parents = clip2order(target_order, keys)
+            groups: Dict[int, List[int]] = {}
+            for i, p in enumerate(parents.tolist()):
+                groups.setdefault(int(p), []).append(i)
+
+            new_keys = sorted(groups)
+            new_granules = []
+            for k in new_keys:
+                seen: dict = {}
+                for i in groups[k]:
+                    for g in self.granules[i]:
+                        seen[g["id"]] = _granule_entry(g)
+                new_granules.append(list(seen.values()))
+            method = "coarsen"
+        else:
+            # ── refine: scoped re-intersection (needs source footprints) ─
+            if catalog is None:
+                raise ValueError(
+                    "reproject: refine (target_order > source_order) needs the source "
+                    "Catalog for granule footprints -- the ShardMap itself only stores "
+                    "{id, s3, https}, not geometry. Pass catalog=<Catalog>."
+                )
+            records_by_id = {r["id"]: r for r in catalog.granule_records()}
+            footprint = self.metadata.get("footprint", "swath")
+            product = (self.metadata.get("collection") or "").split("_")[0].upper()
+            mortie_order = _resolve_mortie_order(None, target_grid)
+
+            new_granules_map: Dict[int, dict] = {}
+            for shard_key, gran_list in zip(self.shard_keys, self.granules):
+                ids = [g["id"] for g in gran_list]
+                missing = [gid for gid in ids if gid not in records_by_id]
+                if missing:
+                    extra = "..." if len(missing) > 5 else ""
+                    raise ValueError(
+                        f"reproject: refine needs footprints for all granules in the source "
+                        f"map, but the catalog is missing {len(missing)} of them (e.g. "
+                        f"{missing[:5]}{extra})"
+                    )
+                sub_records = [records_by_id[gid] for gid in ids]
+                descendants = set(
+                    int(s) for s in generate_morton_children(int(shard_key), target_order)
+                )
+                shard_to_idx = _intersect_mortie(
+                    sub_records,
+                    target_grid,
+                    descendants,
+                    order=mortie_order,
+                    footprint=footprint,
+                    product=product,
+                )
+                for k, idxs in shard_to_idx.items():
+                    bucket = new_granules_map.setdefault(int(k), {})
+                    for i in idxs:
+                        entry = _granule_entry(sub_records[i])
+                        bucket[entry["id"]] = entry
+
+            new_keys = sorted(new_granules_map)
+            new_granules = [list(new_granules_map[k].values()) for k in new_keys]
+            method = "refine"
+
+        meta = dict(self.metadata or {})
+        meta["reproject"] = {
+            "source_parent_order": int(source_order),
+            "target_parent_order": int(target_order),
+            "method": method,
+        }
+        meta["total_shards"] = len(new_keys)
+        meta["total_pairs"] = sum(len(g) for g in new_granules)
+        # The dropped per-shard AOI mask (aoi_mask=None below) must not still be
+        # advertised in the derived map's metadata.
+        meta.pop("aoi_mask", None)
+        # This reproject ran no timed build, so the source build's timing must
+        # not describe the derived map.
+        meta.pop("build_wall_s", None)
+        if method == "refine":
+            # Refine re-intersects via the mortie MOC path (``_intersect_mortie``)
+            # regardless of the source's backend -- a spherely-built (exact-S2)
+            # source is not reproduced by it -- so record what actually ran.
+            meta["backend"] = "mortie"
+            meta["mortie_order"] = mortie_order
+        else:
+            # Coarsen is a pure regroup: no geometry backend and no order-based
+            # build ran, so the source's ``backend``/``mortie_order`` don't apply.
+            meta.pop("backend", None)
+            meta.pop("mortie_order", None)
+        return ShardMap(target_grid.spatial_signature(), new_keys, new_granules, meta, None)
+
     def to_json(self, path: str) -> None:
         """Write the manifest as JSON."""
         from pathlib import Path

@@ -77,6 +77,13 @@ class RunReport:
     counters; cost is accumulated per-result via :meth:`Executor.measure_cost`.
     ``runner.py`` reads this to build the public summary dict and to print cost
     -- this module never formats or prints.
+
+    The run-level cost block (issue #298) is stamped by the runner, not the
+    loop: ``max_cost_usd`` is the pre-invoke ceiling (:func:`max_cost_usd`),
+    ``actual_cost_usd`` the post-run rollup of billed durations, and
+    ``estimated_cost_usd`` the prior-history estimate (``None`` until the
+    issue #297/#299 sidecar history exists). All three stay ``None`` on runs
+    that carry no metered cost (local backend).
     """
 
     results: list[dict] = field(default_factory=list)
@@ -84,6 +91,9 @@ class RunReport:
     cells_error: int = 0
     total_obs: int = 0
     cost: CellCost = field(default_factory=CellCost)
+    max_cost_usd: float | None = None
+    estimated_cost_usd: float | None = None
+    actual_cost_usd: float | None = None
 
 
 # ---------------------------------------------------------------------------
@@ -313,12 +323,89 @@ class LocalExecutor:
         self._pool.shutdown()
 
 
-# arm64 Lambda pricing, $/GB-second, and the function's memory in GB. Matches
-# the constants inlined into ``_run_lambda`` before this extraction; surfaced
-# here so :meth:`LambdaExecutor.measure_cost` and the runner's presentation
-# read one source.
+# Lambda pricing, $/GB-second, keyed by CPU architecture, and the default
+# function memory in GB. The deployed fleet is arm64-only (template.yaml
+# ``Architecture`` default; no x86_64 variant is stood up), so the table
+# carries one row -- an x86_64 deployment adds its rate here (issue #298).
+# ``LAMBDA_PRICE_PER_GB_SEC`` stays the flat arm64 constant so
+# :meth:`LambdaExecutor.measure_cost` and the runner's presentation keep
+# reading one source, byte-identical to the pre-table path.
+LAMBDA_ARCH = "arm64"
+LAMBDA_PRICE_PER_GB_SEC_BY_ARCH = {"arm64": 0.0000133334}
 LAMBDA_MEMORY_GB = 4.0  # issue #193: production worker sized to 4 GB (2.3 vCPU)
-LAMBDA_PRICE_PER_GB_SEC = 0.0000133334
+LAMBDA_PRICE_PER_GB_SEC = LAMBDA_PRICE_PER_GB_SEC_BY_ARCH[LAMBDA_ARCH]
+
+
+def max_cost_usd(
+    n_units: int,
+    memory_gb: float,
+    *,
+    timeout_s: float,
+    arch: str = LAMBDA_ARCH,
+) -> float:
+    """Hard ceiling on a fan-out's Lambda bill, computable before any invoke.
+
+    Every work unit is one Lambda invocation billed at ``memory_gb`` for at
+    most the function timeout, so ``n_units * rate(arch) * memory_gb *
+    timeout_s`` bounds one invoke per work unit (issue #298). A work unit is
+    a shard on the spatial path and an event on the tabular/temporal path.
+    Transient-fault retries (:data:`LAMBDA_RETRY`, rare) re-bill a unit and
+    are deliberately not folded in -- the ceiling prices the run as planned,
+    not the worst-case retry storm. ``arch`` keys the price table
+    (:data:`LAMBDA_PRICE_PER_GB_SEC_BY_ARCH`); an unknown arch raises
+    ``KeyError`` rather than pricing silently wrong.
+    """
+    return n_units * LAMBDA_PRICE_PER_GB_SEC_BY_ARCH[arch] * memory_gb * timeout_s
+
+
+def estimate_cost_usd(
+    catalog_data: dict | None = None,
+    *,
+    template_hash: str | None = None,
+    history: list | None = None,
+) -> float | None:
+    """Estimated run cost from prior-run history (issue #298 Phase 3 -- stub).
+
+    Interface placeholder for the pilot-first estimator ratified on issue
+    #298; the implementation is deferred behind issues #297 (per-shard stats
+    sidecars) and #299 (template-hash identity), which create the history it
+    reads. Until both land there is nothing to estimate from, so this always
+    returns ``None`` and the run's ``cost.estimated_cost_usd`` stays a
+    placeholder.
+
+    The temporal event fan-out has no shardmap (its fan-out unit is the
+    event, resolved at call time, not a catalog shard), so
+    ``_run_lambda_events`` wires this stub with no ``catalog_data`` and its
+    estimate stays ``None`` until an event-history tier exists -- out of
+    scope for issue #298; both tiers below key on per-shard counts.
+
+    Two tiers, tried in order once wired:
+
+    * **Tier 1 -- pilot-first.** Prior actuals for the *same* template hash at
+      any shard (the dev -> single-shard test -> fleet workflow means a pilot
+      run usually exists), scaled to the remaining shards by per-shard
+      granule/observation counts from the shardmap. One measured shard scaled
+      by relative shard size is a much tighter prior than a global fit.
+    * **Tier 2 -- cross-template regression (fallback).** No same-hash pilot:
+      regress cost on per-shard ``n_obs`` across the sidecar history of other
+      templates.
+
+    Parameters
+    ----------
+    catalog_data : dict, optional
+        The loaded shardmap: per-shard granule/obs counts for the tier-1
+        scaling and the tier-2 regressors.
+    template_hash : str, optional
+        The run's template identity (issue #299) used to select tier-1 priors.
+    history : optional
+        Prior-run sidecar records (issue #297) to estimate from.
+
+    Returns
+    -------
+    float or None
+        ``None`` until the sidecar history exists.
+    """
+    return None
 
 
 class LambdaExecutor:

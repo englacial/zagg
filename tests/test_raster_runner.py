@@ -209,6 +209,53 @@ class TestRasterAgg:
             np.testing.assert_array_equal(got[valid], data[rows[valid], cols[valid]])
             assert (got[~valid] == 0).all()
 
+    def test_local_on_progress_ticks_including_failed_shard(self, tmp_path):
+        # Progress hook (issue #298 fold): the local raster loop ticks once per
+        # completed shard -- 1-based, monotone, total = shard count, cost=None
+        # (no metered cost) -- and the tick sits in a finally after the bare
+        # except/continue, so a FAILED shard still ticks. Two shards, one of
+        # which raises: its lone granule's asset map lacks the configured band.
+        cfg = _cfg(tmp_path)
+        data0 = _index_raster()
+        _write_tiff(tmp_path / "s0.tif", data0)
+        shard0 = _shard_for_raster_at(0.0)
+        shard1 = _shard_for_raster_at(7000.0)
+        assert shard0 != shard1
+        grid = from_config(cfg)
+        # shard1's granule carries assets WITHOUT the configured "red" band, so
+        # sample_item_async raises for that shard only (shard0 still writes).
+        bad = {
+            "id": "g1",
+            "s3": None,
+            "https": None,
+            "assets": {"green": str(tmp_path / "s0.tif")},
+            "datetime": T0,
+            "time_key": "dt-1",
+        }
+        sm = ShardMap(
+            grid.spatial_signature(),
+            [shard0, shard1],
+            [[_entry("g0", str(tmp_path / "s0.tif"), T0, "dt-1")], [bad]],
+            {"collection": "s2-test"},
+        )
+        path = str(tmp_path / "sm_fail.json")
+        sm.to_json(path)
+
+        ticks = []
+        summary = agg(
+            cfg,
+            catalog=path,
+            backend="local",
+            max_workers=1,
+            on_progress=lambda done, total, cost: ticks.append((done, total, cost)),
+        )
+        assert summary["cells_error"] == 1
+        assert summary["cells_with_data"] == 1
+        # Both shards tick (the failing one included), 1-based and monotone.
+        assert [t[0] for t in ticks] == [1, 2]
+        assert all(t[1] == 2 for t in ticks)  # runner's authoritative total
+        assert all(t[2] is None for t in ticks)  # local raster: no metered cost
+
     def test_signature_mismatch_raises(self, tmp_path, manifest):
         # A ShardMap built under a different grid (parent 9 / child 15) than the
         # run config (parent 10 / child 16) must be refused by _check_signature.
@@ -370,6 +417,33 @@ class TestRasterLambdaBackend:
         # Always-on telemetry rollups are null-safe on a body without them.
         assert summary["lambda_time_s"] is None and summary["max_memory_mb"] is None
         assert summary["template_s"] >= 0.0
+
+    def test_on_progress_ticks_on_lambda_fanout(self, manifest, monkeypatch):
+        # Progress hook (issue #298 fold): the lambda raster fan-out ticks once
+        # per completed shard -- 1-based, total = shard count, cost=None (the
+        # raster fan-out carries no per-unit pricing rollup). The lifecycle
+        # invokes (ping/setup) never tick; only the process_raster fan-out does.
+        import boto3
+
+        cfg, sm_path, shard, _data = manifest
+
+        def responder(event):
+            body = {"timesteps": len(event["time_index"]), "cells_with_data": 4096}
+            return {"statusCode": 200, "body": json.dumps(body)}
+
+        fake = _FakeLambdaClient(_lifecycle(responder))
+        monkeypatch.setattr(boto3, "client", lambda *a, **k: fake)
+        ticks = []
+        agg(
+            cfg,
+            catalog=sm_path,
+            store="s3://bucket/out.zarr",
+            backend="lambda",
+            max_workers=2,
+            invocation="sync",
+            on_progress=lambda done, total, cost: ticks.append((done, total, cost)),
+        )
+        assert ticks == [(1, 1, None)]
 
     def test_lifecycle_order_and_setup_event_pinned(self, manifest, monkeypatch):
         # The wire-level pin of the raster lifecycle (issue #264): ping →

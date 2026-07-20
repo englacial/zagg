@@ -47,6 +47,7 @@ from zagg.config import (
     get_windowing,
 )
 from zagg.dispatch import (
+    LAMBDA_ARCH,
     LAMBDA_MEMORY_GB,
     LAMBDA_PRICE_PER_GB_SEC,
     LAMBDA_RETRY,
@@ -55,6 +56,8 @@ from zagg.dispatch import (
     LocalExecutor,
     PreflightReport,
     dispatch,
+    estimate_cost_usd,
+    max_cost_usd,
 )
 from zagg.grids.base import shard_label
 from zagg.grids.morton import morton_word
@@ -93,6 +96,48 @@ def _resolve_function_name(config: PipelineConfig, function_name: str | None) ->
     return base + suffix
 
 
+def _with_progress(accumulate, on_progress, total, *, metered=False):
+    """Wrap a dispatch accumulator with the optional progress hook (issue #298).
+
+    ``on_progress(done, total, cost_usd)`` fires after each unit is folded in;
+    ``cost_usd`` is the report's running metered rollup on Lambda paths
+    (``metered=True``) and ``None`` where nothing is billed. ``None`` hook ->
+    the accumulator is returned untouched, keeping the default path identical.
+    The counters/results are already folded before the hook runs, so a raising
+    hook is swallowed (losing only the tick): a cosmetic progress display must
+    not unwind a paid fan-out mid-flight.
+    """
+    if on_progress is None:
+        return accumulate
+
+    def wrapped(report, i, result):
+        accumulate(report, i, result)
+        try:
+            on_progress(i, total, report.cost.cost_usd if metered else None)
+        except Exception:  # noqa: BLE001 - progress is cosmetic, never fatal
+            logger.warning("on_progress hook raised; ignoring", exc_info=True)
+
+    return wrapped
+
+
+def _worker_memory_gb(config: PipelineConfig) -> float:
+    """Billed memory (GB) of the worker this run dispatches to (issue #298).
+
+    The optional ``worker:`` block selects a pre-provisioned ``-<memory>``
+    variant (issue #235, MB); absent block -> the base function's
+    :data:`~zagg.dispatch.LAMBDA_MEMORY_GB`. Keys both the pre-invoke cost
+    ceiling and the actual-cost rollup so the two use one memory figure. An
+    explicit ``function_name`` kwarg can dispatch to a differently-sized
+    function than the config declares; cost math still keys off the config
+    (the pre-#298 rollup hardcoded 4 GB regardless, so this only narrows the
+    gap).
+    """
+    worker = config.worker
+    if worker and worker.get("memory"):
+        return worker["memory"] / 1024.0
+    return LAMBDA_MEMORY_GB
+
+
 def agg(
     config: PipelineConfig,
     *,
@@ -115,6 +160,7 @@ def agg(
     invocation: str = "async",
     force_cold: bool = False,
     events=None,
+    on_progress=None,
 ) -> dict:
     """Run the aggregation pipeline.
 
@@ -239,6 +285,16 @@ def agg(
         invoke per event (see :func:`_run_lambda_events`). Ignored by the
         spatial path. Until the event reader + catalog land, the caller
         supplies events directly (e.g. from a notebook).
+    on_progress : Callable[[int, int, float | None], None], optional
+        Per-completed-unit progress hook (issue #298): called from the
+        dispatch accumulator with ``(done, total, cost_usd)`` -- the 1-based
+        completion count, the unit total, and the running metered cost
+        (``None`` on paths with no metered cost: local backends and the
+        raster fan-out, which carries no per-unit pricing). Drives
+        ``zagg.notebook``'s progress bar; it runs on the dispatch thread, so it
+        must be cheap. A raising hook is caught and logged, never propagated --
+        a cosmetic progress display must not unwind a paid fan-out mid-flight.
+        Default ``None`` -- no callback, byte-identical prior behavior.
     Returns
     -------
     dict
@@ -276,6 +332,7 @@ def agg(
         invocation=invocation,
         force_cold=force_cold,
         events=events,
+        on_progress=on_progress,
     )
 
 
@@ -311,6 +368,7 @@ class SpatialStrategy:
         invocation="async",
         force_cold=False,
         events=None,
+        on_progress=None,
     ):
         # Resolve catalog and store
         catalog_path = catalog or config.catalog
@@ -366,6 +424,7 @@ class SpatialStrategy:
                 output_credentials=output_credentials,
                 output_endpoint_url=resolved_endpoint,
                 handoff=resolved_handoff,
+                on_progress=on_progress,
             )
         elif backend == "lambda":
             if max_workers is None:
@@ -395,6 +454,7 @@ class SpatialStrategy:
                 max_retries=max_retries,
                 invocation=invocation,
                 force_cold=force_cold,
+                on_progress=on_progress,
             )
         else:
             raise ValueError(f"Unknown backend: {backend!r} (expected 'local' or 'lambda')")
@@ -438,6 +498,7 @@ class TemporalStrategy:
         invocation="async",
         force_cold=False,
         events=None,
+        on_progress=None,
     ):
         from zagg.config import collection_options
         from zagg.temporal import prepare_collection, process_event, specs_from_config
@@ -481,6 +542,7 @@ class TemporalStrategy:
                 max_retries=max_retries,
                 invocation=invocation,
                 force_cold=force_cold,
+                on_progress=on_progress,
             )
 
         if max_workers is None:
@@ -534,13 +596,15 @@ class TemporalStrategy:
                 {"event_key": event_key, "results": outcome["results"], "meta": outcome["meta"]}
             )
 
+        accumulate = _with_progress(_accumulate, on_progress, n)
+
         start_time = time.time()
         try:
             report = dispatch(
                 executor,
                 event_list,
                 retry=LOCAL_RETRY,
-                accumulate=_accumulate,
+                accumulate=accumulate,
             )
         finally:
             executor.shutdown()
@@ -666,6 +730,7 @@ class RasterStrategy:
         output_endpoint_url,
         profile=False,
         invocation="async",
+        on_progress=None,
         **_ignored,
     ):
         from zagg.processing.raster import (
@@ -745,6 +810,7 @@ class RasterStrategy:
                 dataset={"short_name": md.get("short_name"), "version": md.get("version")},
                 profile=profile,
                 invocation=invocation,
+                on_progress=on_progress,
             )
 
         # Local backend: template emission stays orchestrator-owned (the
@@ -883,7 +949,7 @@ class RasterStrategy:
         stats_failures: list = []  # (shard_key, exception) — run-parquet rows (#297)
         with ThreadPoolExecutor(max_workers=max_workers) as pool:
             futures = {pool.submit(_one, pair): pair[0] for pair in cells}
-            for fut in as_completed(futures):
+            for i, fut in enumerate(as_completed(futures), 1):
                 label = shard_label(grid, futures[fut])
                 try:
                     meta, stage_stats, write_s = fut.result()
@@ -893,6 +959,15 @@ class RasterStrategy:
                     stats_failures.append((int(futures[fut]), e))
                     logger.warning(f"raster shard {label} failed: {e}")
                     continue
+                finally:
+                    # Progress hook (issue #298): local raster has no metered
+                    # cost. A raising hook is swallowed -- progress is cosmetic
+                    # and must not unwind the run (mirrors _with_progress).
+                    if on_progress is not None:
+                        try:
+                            on_progress(i, len(cells), None)
+                        except Exception:  # noqa: BLE001 - progress is cosmetic, never fatal
+                            logger.warning("on_progress hook raised; ignoring", exc_info=True)
                 ok_metas.append(meta)
                 if meta["timesteps"]:
                     shards_with_data += 1
@@ -997,6 +1072,7 @@ class RasterStrategy:
         dataset=None,
         profile=False,
         invocation="async",
+        on_progress=None,
     ):
         """Fan shards out, one ``mode="process_raster"`` invoke each.
 
@@ -1211,9 +1287,18 @@ class RasterStrategy:
         stats_failures: list = []  # (shard_key, error, body) — run-parquet rows (#297)
         with ThreadPoolExecutor(max_workers=max_workers) as pool:
             futures = {pool.submit(_one, pair): pair[0] for pair in cells}
-            for fut in as_completed(futures):
+            for i, fut in enumerate(as_completed(futures), 1):
                 label = shard_label(grid, futures[fut])
                 result = fut.result()
+                # Progress hook (issue #298): the raster fan-out has no
+                # per-unit pricing rollup, so the running cost rides as None. A
+                # raising hook is swallowed -- progress is cosmetic and must not
+                # unwind a paid fan-out (mirrors _with_progress).
+                if on_progress is not None:
+                    try:
+                        on_progress(i, len(cells), None)
+                    except Exception:  # noqa: BLE001 - progress is cosmetic, never fatal
+                        logger.warning("on_progress hook raised; ignoring", exc_info=True)
                 if result["error"]:
                     errors += 1
                     last_error = result["error"]
@@ -1377,6 +1462,7 @@ def _run_lambda_events(
     max_retries=3,
     invocation="async",
     force_cold=False,
+    on_progress=None,
 ):
     """Fan the temporal pipeline out one event per Lambda invoke (issue #12, Phase 8).
 
@@ -1460,6 +1546,14 @@ def _run_lambda_events(
 
     n = len(event_list)
     logger.info(f"Processing {n} events (lambda)")
+    # Pre-invoke cost ceiling (issue #298), same math as the spatial path: one
+    # invoke per event, each billed at most to the function timeout.
+    memory_gb = _worker_memory_gb(config)
+    run_max_cost = max_cost_usd(n, memory_gb, timeout_s=_DEFAULT_FUNCTION_TIMEOUT_S)
+    logger.info(
+        f"Max cost ceiling: ~${run_max_cost:.2f} ({n} events x {memory_gb:g} GB x "
+        f"{_DEFAULT_FUNCTION_TIMEOUT_S}s, {LAMBDA_ARCH})"
+    )
     if max_workers is None:
         # The AR-repo orchestrator's default fan-out width (one storm per
         # worker); the preflight probe clamps it to account concurrency anyway.
@@ -1543,6 +1637,9 @@ def _run_lambda_events(
         # Tabular output has no metadata to consolidate; keep the executor
         # contract without a finalize invoke.
         finalize_fn=lambda: None,
+        # Per-event cost tracks the worker variant actually billed (issue #298);
+        # without a worker: block this is the default 4.0, byte-identical.
+        memory_gb=memory_gb,
     )
     executor.preflight(n)
     max_workers = state["workers"]
@@ -1578,12 +1675,14 @@ def _run_lambda_events(
             rate = i / elapsed if elapsed > 0 else 0
             logger.info(f"  [{i:4d}/{n}] {rate:.1f} events/s")
 
+    accumulate = _with_progress(_accumulate, on_progress, n, metered=True)
+
     try:
         report = dispatch(
             executor,
             event_list,
             retry=LAMBDA_RETRY,
-            accumulate=_accumulate,
+            accumulate=accumulate,
             on_submit_error=lambda e: raise_for_fd_exhaustion(e, max_workers),
         )
     finally:
@@ -1602,10 +1701,23 @@ def _run_lambda_events(
     )
 
     # Cost presentation mirrors the spatial path: one multiply over the summed
-    # per-event durations the report accumulated.
+    # per-event durations the report accumulated. memory_gb resolved
+    # pre-fan-out via _worker_memory_gb (issue #298).
     total_lambda_time = report.cost.compute_time_s
-    gb_seconds = total_lambda_time * LAMBDA_MEMORY_GB
+    gb_seconds = total_lambda_time * memory_gb
     estimated_cost = gb_seconds * LAMBDA_PRICE_PER_GB_SEC
+
+    # Structured cost block (issue #298), mirroring the spatial summary; the
+    # legacy flat ``estimated_cost_usd`` key keeps the actual-cost rollup.
+    # estimate_cost_usd is the Phase-3 stub (None until #297/#299 land).
+    report.max_cost_usd = run_max_cost
+    report.estimated_cost_usd = estimate_cost_usd()
+    report.actual_cost_usd = estimated_cost
+    cost_block = {
+        "max_cost_usd": run_max_cost,
+        "estimated_cost_usd": report.estimated_cost_usd,
+        "actual_cost_usd": estimated_cost,
+    }
 
     # Failed events keep their error detail (rows carry successes only), so a
     # caller can see *which* events failed and why, not just the count --
@@ -1631,6 +1743,7 @@ def _run_lambda_events(
         "gb_seconds": gb_seconds,
         "price_per_gb_sec": LAMBDA_PRICE_PER_GB_SEC,
         "estimated_cost_usd": estimated_cost,
+        "cost": cost_block,
         "function_timeout_s": state.get("function_timeout_s", _DEFAULT_FUNCTION_TIMEOUT_S),
         "store_path": store_path,
         "output_path": output_path,
@@ -2232,6 +2345,7 @@ def _run_local(
     output_credentials=None,
     output_endpoint_url=None,
     handoff="arrow",
+    on_progress=None,
 ):
     """Run processing locally via the generic dispatch loop on a thread pool.
 
@@ -2419,13 +2533,15 @@ def _run_local(
             if i % 10 == 0 or n <= 20:
                 logger.info(f"  [{i}/{n}] {label}: {obs:,} obs")
 
+    accumulate = _with_progress(_accumulate, on_progress, n)
+
     start_time = time.time()
     try:
         report = dispatch(
             executor,
             cells,
             retry=LOCAL_RETRY,
-            accumulate=_accumulate,
+            accumulate=accumulate,
         )
     finally:
         executor.shutdown()
@@ -2530,6 +2646,7 @@ def _run_lambda(
     max_retries=3,
     invocation="async",
     force_cold=False,
+    on_progress=None,
 ):
     """Run processing via AWS Lambda invocation.
 
@@ -2567,6 +2684,12 @@ def _run_lambda(
     logger.info(f"Processing {len(cells)} of {len(all_shards)} cells (lambda)")
 
     if dry_run:
+        # The pre-invoke cost ceiling is deliberately not surfaced here: the
+        # windowed-unit expansion below runs after this return, so a ceiling on
+        # the pre-windowing shard count would undercount temporal runs (wrong
+        # direction for an upper bound). The phase-2 CLI gate (issue #298) adds
+        # a precompute helper that expands units first and owns the dry-run
+        # ceiling; this path stays a pure shard/granule preview until then.
         return _dry_run_summary(cells, store_path)
 
     # Temporal fan-out (issue #246 phase 5): one work unit per (shard,
@@ -2575,6 +2698,18 @@ def _run_lambda(
     windowing = get_windowing(config)
     if windowing is not None:
         cells = _windowed_units(cells, windowing, (config.bounds or {}).get("temporal"))
+
+    # Pre-invoke cost ceiling (issue #298): every unit is one invoke billed at
+    # the worker's memory for at most the function timeout, so the bill is
+    # bounded from the shardmap + config alone, before any fan-out. Priced with
+    # the deployed-default timeout constant — the live function Timeout is only
+    # readable after preflight builds the client.
+    memory_gb = _worker_memory_gb(config)
+    run_max_cost = max_cost_usd(len(cells), memory_gb, timeout_s=_DEFAULT_FUNCTION_TIMEOUT_S)
+    logger.info(
+        f"Max cost ceiling: ~${run_max_cost:.2f} ({len(cells)} units x {memory_gb:g} GB x "
+        f"{_DEFAULT_FUNCTION_TIMEOUT_S}s, {LAMBDA_ARCH})"
+    )
 
     # Authenticate (for per-cell source reads inside the Lambda)
     s3_creds = _resolve_source_credentials(config)
@@ -2806,6 +2941,9 @@ def _run_lambda(
         preflight_fn=_preflight,
         pool_factory=ThreadPoolExecutor,
         finalize_fn=_finalize_fn,
+        # Per-cell cost tracks the worker variant actually billed (issue #298);
+        # without a worker: block this is the default 4.0, byte-identical.
+        memory_gb=memory_gb,
     )
     # preflight() runs the probe, builds the sized client, and sizes the pool.
     executor.preflight(len(cells))
@@ -2898,12 +3036,14 @@ def _run_lambda(
             rate = i / elapsed if elapsed > 0 else 0
             logger.info(f"  [{i:4d}/{n}] {rate:.1f} cells/s")
 
+    accumulate = _with_progress(_accumulate, on_progress, n, metered=True)
+
     try:
         report = dispatch(
             executor,
             cells,
             retry=LAMBDA_RETRY,
-            accumulate=_accumulate,
+            accumulate=accumulate,
             # _invoke_lambda_cell already re-raises FD exhaustion with ulimit
             # guidance; this is a backstop for exhaustion that surfaces outside
             # the cell body (e.g. at submit time). Other exceptions propagate.
@@ -2997,11 +3137,27 @@ def _run_lambda(
     # ULP of estimated_cost_usd -- stays byte-identical to the pre-refactor path
     # (summing per-cell cost_usd would diverge in FP). Runner owns presentation;
     # the per-cell CellCost.cost_usd is for the report's structured breakdown.
+    # memory_gb resolved pre-fan-out via _worker_memory_gb (issue #298): the
+    # default function keeps 4.0 (byte-identical); a worker: variant now bills
+    # at its actual size instead of the old flat constant.
     total_lambda_time = report.cost.compute_time_s
-    memory_gb = LAMBDA_MEMORY_GB
     gb_seconds = total_lambda_time * memory_gb
     price_per_gb_sec = LAMBDA_PRICE_PER_GB_SEC
     estimated_cost = gb_seconds * price_per_gb_sec
+
+    # Structured cost block (issue #298): the pre-invoke ceiling, the deferred
+    # prior-history estimate (the estimate_cost_usd stub -- None until issues
+    # #297/#299 land the sidecar history), and the billed-duration rollup. The
+    # legacy flat ``estimated_cost_usd`` summary key keeps its pre-#298
+    # meaning (the actual-cost rollup) for existing consumers.
+    report.max_cost_usd = run_max_cost
+    report.estimated_cost_usd = estimate_cost_usd(catalog_data)
+    report.actual_cost_usd = estimated_cost
+    cost_block = {
+        "max_cost_usd": run_max_cost,
+        "estimated_cost_usd": report.estimated_cost_usd,
+        "actual_cost_usd": estimated_cost,
+    }
 
     # Worker-runtime distribution (issue #100). Wall time on a parallel fan-out
     # tracks the *straggler*, not the mean, so surface max / median / pstdev of
@@ -3054,6 +3210,7 @@ def _run_lambda(
         "gb_seconds": gb_seconds,
         "price_per_gb_sec": price_per_gb_sec,
         "estimated_cost_usd": estimated_cost,
+        "cost": cost_block,
         "setup_s": setup_s,
         "fanout_s": fanout_s,
         "finalize_s": finalize_s,

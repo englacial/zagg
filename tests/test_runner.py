@@ -1495,6 +1495,9 @@ class TestSummaryKeysByteIdentical:
         "gb_seconds",
         "price_per_gb_sec",
         "estimated_cost_usd",
+        # Structured max/estimated/actual block (issue #298); the flat
+        # estimated_cost_usd key above keeps its legacy actual-rollup meaning.
+        "cost",
         "store_path",
         "backend",
         "function_name",
@@ -2592,6 +2595,33 @@ class TestTemporalStrategy:
         by_key = {r["event_key"]: r for r in summary["results"]}
         assert by_key["storm1"]["results"]["max_t2m"] == pytest.approx(5.0)
         assert by_key["storm2"]["results"]["max_t2m"] == pytest.approx(9.0)
+
+    def test_on_progress_fires_per_event_with_no_metered_cost(self):
+        # Progress hook (issue #298 phase 2) on the temporal local path: one
+        # call per event; local carries no metered cost, so cost rides as None.
+        from zagg.runner import agg
+
+        seen = []
+        agg(
+            _temporal_config(),
+            events=_synthetic_events(),
+            on_progress=lambda done, total, cost: seen.append((done, total, cost)),
+        )
+        assert sorted(seen) == [(1, 2, None), (2, 2, None)]
+
+    def test_raising_on_progress_hook_does_not_unwind_run(self):
+        # A cosmetic progress display must not kill a run mid-flight: a hook
+        # that raises is caught and logged by _with_progress, the run completes
+        # normally and still returns its summary (issue #298 fold).
+        from zagg.runner import agg
+
+        def _boom(done, total, cost):
+            raise RuntimeError("hook boom")
+
+        summary = agg(_temporal_config(), events=_synthetic_events(), on_progress=_boom)
+        assert summary["backend"] == "local"
+        assert summary["total_events"] == 2
+        assert summary["events_with_data"] == 2
 
     def test_max_cells_truncates_events(self):
         from zagg.runner import agg
