@@ -319,6 +319,17 @@ class TestSidecarIO:
         with pytest.raises(ValueError, match="not a leaf zarr name"):
             sidecar_key(".zarr", SPEC_V3)
 
+    def test_unknown_spec_raises(self):
+        # An unrecognized spec must not silently fall back to the legacy names:
+        # a future morton-hive/4 or a typo would key the wrong sidecar and read
+        # as absent instead of failing. /1 and /2 (and absent) stay legacy.
+        with pytest.raises(ValueError, match="unknown store spec"):
+            sidecar_key("-4211322.zarr", "morton-hive/4")
+        with pytest.raises(ValueError, match="unknown store spec"):
+            sidecar_key("-4211322.zarr", "Morton-Hive/3")
+        assert sidecar_key("-4211322.zarr", "morton-hive/1") == "stats.json"
+        assert sidecar_key("-4211322_2019.zarr", "morton-hive/2") == "stats_2019.json"
+
     def test_v3_write_read_roundtrip(self, tmp_path):
         from zagg.windows import leaf_name_v3
 
