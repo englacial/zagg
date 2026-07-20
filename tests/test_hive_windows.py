@@ -334,13 +334,16 @@ class TestManifestTemporal:
         m = hive.build_manifest(self._grid(cfg), dataset={"short_name": "ATL06", "version": "007"})
         assert m["spec"] == "morton-hive/1"
         assert "temporal" not in m
-        # The exact pre-#246 key set: no new keys leak into unwindowed stores.
+        # The exact key set: no TEMPORAL keys leak into unwindowed stores
+        # (semantic_hash/path_grouping joined for every store — issue #299).
         assert set(m) == {
             "spec",
             "dataset",
+            "semantic_hash",
             "cell_order",
             "shard_order",
             "split_schedule",
+            "path_grouping",
             "pyramid",
             "generated_at",
         }

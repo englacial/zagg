@@ -294,6 +294,173 @@ class TestManifest:
 # ── leaf template + commit stamp (D3/D4) ─────────────────────────────────────
 
 
+class TestSemanticManifest:
+    """Issue #299 phase 3: semantic_hash + path_grouping frozen keys, the
+    aggregation.yaml derived core, and the append-spec seam."""
+
+    def _grid(self, cfg):
+        return HealpixGrid(parent_order=6, child_order=8, layout="fullsphere", config=cfg)
+
+    def test_manifest_carries_semantic_hash_and_grouping(self, cfg):
+        from zagg.semantics import semantic_hash
+
+        m = hive.build_manifest(self._grid(cfg))
+        assert m["semantic_hash"] == semantic_hash(cfg) and len(m["semantic_hash"]) == 64
+        assert m["path_grouping"] == 1
+
+    def test_append_to_pre299_manifest_accepted(self, cfg, tmp_path):
+        # A pre-#299 manifest lacks semantic_hash/path_grouping; appends must
+        # not refuse on the new keys (absent-side tolerance / absent=>1).
+        root = str(tmp_path / "store")
+        grid = self._grid(cfg)
+        old = hive.build_manifest(grid)
+        del old["semantic_hash"]
+        del old["path_grouping"]
+        hive.ensure_manifest(root, old)
+        fresh = hive.build_manifest(grid)
+        assert hive.validate_manifest(root, fresh) == old
+        # And the accepted manifest (no second PUT) is the existing one.
+        assert hive.ensure_manifest(root, fresh) == old
+
+    def test_semantic_mismatch_refuses(self, cfg, tmp_path):
+        # Both manifests carry the hash and they differ -> frozen-key refusal,
+        # exactly like an orders mismatch (D19).
+        root = str(tmp_path / "store")
+        hive.ensure_manifest(root, hive.build_manifest(self._grid(cfg)))
+        import copy
+
+        other_cfg = copy.deepcopy(cfg)
+        other_cfg.aggregation["variables"]["count"]["dtype"] = "int64"
+        other = hive.build_manifest(self._grid(other_cfg))
+        with pytest.raises(ValueError, match="does not match this run"):
+            hive.validate_manifest(root, other)
+
+    def test_grouping_mismatch_refuses(self, cfg, tmp_path):
+        # path_grouping IS frozen (path shape): an explicit different value
+        # refuses; only ABSENT normalizes to 1.
+        root = str(tmp_path / "store")
+        grid = self._grid(cfg)
+        grouped = hive.build_manifest(grid)
+        grouped["path_grouping"] = 3
+        hive.ensure_manifest(root, grouped)
+        with pytest.raises(ValueError, match="does not match this run"):
+            hive.validate_manifest(root, hive.build_manifest(grid))
+
+    def test_aggregation_core_written_with_manifest(self, cfg, tmp_path):
+        import yaml as _yaml
+
+        from zagg.semantics import semantic_core
+
+        root = str(tmp_path / "store")
+        hive.ensure_manifest(root, hive.build_manifest(self._grid(cfg)), config=cfg)
+        payload = (tmp_path / "store" / hive.AGGREGATION_CORE_NAME).read_text()
+        assert _yaml.safe_load(payload) == semantic_core(cfg)
+        # Deterministic: a rewrite is byte-identical (sorted-key dump).
+        hive.write_semantic_core(root, cfg)
+        assert (tmp_path / "store" / hive.AGGREGATION_CORE_NAME).read_text() == payload
+
+    def test_aggregation_core_write_is_fail_open(self, cfg, monkeypatch, caplog):
+        import obstore
+
+        def boom(*a, **k):
+            raise OSError("no")
+
+        monkeypatch.setattr(obstore, "put", boom)
+        with caplog.at_level("WARNING"):
+            hive.write_semantic_core("/nonexistent-root-zzz", cfg)
+        assert any("fail-open" in r.message for r in caplog.records)
+
+
+class TestProductRoots:
+    """D19 named product roots (issue #299 phase 2): additive — a product
+    subtree is a complete, unmodified morton-hive store."""
+
+    def _grid(self, cfg):
+        return HealpixGrid(parent_order=6, child_order=8, layout="fullsphere", config=cfg)
+
+    def test_name_grammar(self):
+        for good in ("atl06", "atl06_h_li", "s2-serc-2025", "x", "88s_o9"):
+            assert hive.validate_product_name(good) == good
+        for bad in ("ATL06", "a b", "", "a/b", "a.b", "café", None, 7):
+            with pytest.raises((ValueError, TypeError)):
+                hive.validate_product_name(bad)
+
+    def test_name_length_cap(self):
+        # D19 length cap (espg ruling, mortie spec §6.5): 192 accepts, 193
+        # rejects — the boundary of the POSIX-255-less-13-decoration budget.
+        assert hive.validate_product_name("a" * hive.PRODUCT_NAME_MAX) == "a" * 192
+        assert hive.PRODUCT_NAME_MAX == 192
+        with pytest.raises(ValueError, match="caps names"):
+            hive.validate_product_name("a" * (hive.PRODUCT_NAME_MAX + 1))
+
+    def test_base_component_exclusion(self):
+        # Names shaped like hive base components would make the walker's
+        # child classification ambiguous (D19).
+        for bad in ("1", "6", "-1", "-6", "3"):
+            with pytest.raises(ValueError, match="base-component"):
+                hive.validate_product_name(bad)
+        # Digit-LEADING names longer than a base component are fine.
+        assert hive.validate_product_name("2019_run") == "2019_run"
+
+    def test_product_root_join(self):
+        assert hive.product_root("s3://b/root/", "atl06") == "s3://b/root/atl06"
+        with pytest.raises(ValueError, match="grammar"):
+            hive.product_root("s3://b/root", "BAD")
+
+    def test_leaf_path_under_product_root_is_unchanged(self, cfg):
+        # A product subtree is byte-identical to a bare store: the same leaf
+        # path arithmetic applies below the product root.
+        word = _shard_word()
+        bare = hive.shard_leaf_path("s3://b/root", word)
+        under = hive.shard_leaf_path(hive.product_root("s3://b/root", "atl06"), word)
+        assert under == bare.replace("s3://b/root/", "s3://b/root/atl06/")
+
+    def test_effective_store_root(self, cfg):
+        assert hive.effective_store_root("s3://b/root", cfg) == "s3://b/root"
+        cfg.output["product_name"] = "atl06_h_li"
+        assert hive.effective_store_root("s3://b/root", cfg) == "s3://b/root/atl06_h_li"
+
+    def test_product_name_validated_at_config_load(self, cfg):
+        from zagg.config import validate_config
+
+        cfg.output["product_name"] = "UPPER"
+        with pytest.raises(ValueError, match="grammar"):
+            validate_config(cfg)
+
+    def test_classify_store_root(self, cfg, tmp_path):
+        root = str(tmp_path / "store")
+        (tmp_path / "store").mkdir()
+        assert hive.classify_store_root(root) == "empty"
+        # A product directory: manifests only under {name}/.
+        m = hive.build_manifest(self._grid(cfg))
+        hive.ensure_manifest(hive.product_root(root, "atl06"), m)
+        assert hive.classify_store_root(root) == "products"
+        # A manifest at the root wins: bare single-product store.
+        bare = str(tmp_path / "bare")
+        hive.ensure_manifest(bare, m)
+        assert hive.classify_store_root(bare) == "bare"
+
+    def test_mid_write_bare_store_not_misread(self, cfg, tmp_path):
+        # The manifest write is async (issue #252): digit-shaped children
+        # without a manifest are a bare store mid-first-run, never "products".
+        root = tmp_path / "store"
+        (root / "3" / "1").mkdir(parents=True)
+        (root / "3" / "1" / "obj").write_text("x")
+        assert hive.classify_store_root(str(root)) == "bare"
+
+    def test_list_products(self, cfg, tmp_path):
+        root = str(tmp_path / "store")
+        m = hive.build_manifest(self._grid(cfg))
+        hive.ensure_manifest(hive.product_root(root, "atl06"), m)
+        hive.ensure_manifest(hive.product_root(root, "atl03_tdigest"), m)
+        # An undiscoverable (manifest-less) child prefix is skipped, not an error.
+        (tmp_path / "store" / "debris_product").mkdir()
+        (tmp_path / "store" / "debris_product" / "junk").write_text("x")
+        products = hive.list_products(root)
+        assert sorted(products) == ["atl03_tdigest", "atl06"]
+        assert products["atl06"]["spec"] == m["spec"]
+
+
 class TestLeafTemplateAndStamp:
     def _grid(self, cfg):
         return HealpixGrid(parent_order=6, child_order=8, layout="fullsphere", config=cfg)
@@ -1160,16 +1327,23 @@ class TestRunnerWiring:
         agg(cfg, catalog=catalog_path, store=root, backend="local")
 
         assert calls == [(shard, root)]
-        # The run wrote ONLY the manifest at the root — no shared zarr
-        # template (D5). The root coverage.moc (issue #200 phase 3,
-        # default-on for hive) is the only other root object, plus the
-        # successful shard's node dir carrying its stats sidecar (issue #297;
-        # the mocked worker wrote no leaf, so the node holds only stats.json).
+        # The run wrote ONLY root-level objects at the root — no shared zarr
+        # template (D5): the manifest, its aggregation.yaml semantic core
+        # (issue #299, D19 — rides the manifest write), the root coverage.moc
+        # (issue #200 phase 3, default-on for hive), plus the successful
+        # shard's node dir carrying its stats sidecar (issue #297; the mocked
+        # worker wrote no leaf, so the node holds only stats.json).
         listing = sorted(os.listdir(root))
         node = listing[0]
         parquets = [n for n in listing if n.startswith("stats_") and n.endswith(".parquet")]
         assert len(parquets) == 1  # run-level stats parquet (issue #297 phase 3)
-        assert listing == [node, hive.ROOT_COVERAGE_NAME, hive.MANIFEST_NAME, parquets[0]]
+        assert listing == [
+            node,
+            hive.AGGREGATION_CORE_NAME,
+            hive.ROOT_COVERAGE_NAME,
+            hive.MANIFEST_NAME,
+            parquets[0],
+        ]
         from zagg.telemetry import read_sidecar
 
         leaf = hive.shard_leaf_path(root, shard)

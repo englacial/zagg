@@ -1028,6 +1028,47 @@ class TestCellIdsEncoding:
         assert self._grid("nested")._dggs_attrs()["dggs"]["indexing_scheme"] == "nested"
         assert self._grid("morton")._dggs_attrs()["dggs"]["indexing_scheme"] == "morton"
 
+    def test_dggs_attrs_declare_resolution_exact(self):
+        # O10 discriminator (issue #305): grid-derived cell coordinates are
+        # "exact" by construction, under every encoding — "point" is reserved
+        # for location-derived id paths that don't exist in zagg outputs.
+        from zagg.grids.morton import RESOLUTION_EXACT
+
+        for enc in (None, "nested", "morton"):
+            assert self._grid(enc)._dggs_attrs()["dggs"]["resolution"] == RESOLUTION_EXACT
+
+    def test_dggs_attrs_reach_written_store(self):
+        # Round-trip past the return-value assertions above: the dggs block
+        # (incl. `resolution`) must survive spec()->emit_template->to_zarr and
+        # be readable off the WRITTEN group's attrs — that store path is what
+        # #305 readers key on.
+        from zagg.grids.morton import RESOLUTION_EXACT
+
+        g = self._grid()
+        store = MemoryStore()
+        g.emit_template(store)
+        attrs = open_group(store, path="8", mode="r").attrs
+        assert attrs["dggs"]["resolution"] == RESOLUTION_EXACT
+        assert isinstance(attrs["zarr_conventions"], list)
+        assert len(attrs["zarr_conventions"]) >= 1
+
+    def test_morton_convention_constants_pinned(self):
+        # The self-declared convention identity (issue #305): the UUID is
+        # minted once and PERMANENT — this pin makes an accidental regeneration
+        # a test failure, not a silent identity change.
+        from zagg.grids.morton import MORTON_CONVENTION, RESOLUTION_EXACT, RESOLUTION_POINT
+
+        assert MORTON_CONVENTION["uuid"] == "3e22156d-ea9e-4e01-95fe-e3809a4b41e7"
+        assert MORTON_CONVENTION["name"] == "morton-dggs"
+        # Same entry shape as the zarr_conventions list already emitted by
+        # _dggs_attrs, so the PR-2 attrs flip can append it verbatim.
+        emitted = self._grid()._dggs_attrs()["zarr_conventions"][0]
+        assert set(MORTON_CONVENTION) == set(emitted)
+        # The normative home is the mortie spec page, not the design doc.
+        assert "espg/mortie" in MORTON_CONVENTION["spec_url"]
+        assert MORTON_CONVENTION["spec_url"].endswith("docs/specification.md")
+        assert (RESOLUTION_EXACT, RESOLUTION_POINT) == ("exact", "point")
+
     def test_spatial_signature_unchanged_by_encoding(self):
         # The encoding changes coordinate VALUES, not the spatial layout, so
         # shard maps stay reusable across the flag (#89).
