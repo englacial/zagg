@@ -3608,6 +3608,27 @@ class TestDispatchRunStats:
         assert path is None and client.events == []
         assert summary["run_stats_path"] is None
 
+    def test_pointer_inline_rows_over_budget_skips_fail_open(self, monkeypatch):
+        # A result_prefix IS present (pointer transport available), but the
+        # rows that MUST ride inline overflow the cap on their own — there is
+        # nothing to fall back to, so it fail-open skips: returns None, no invoke.
+        from zagg import runner
+
+        monkeypatch.setattr(runner, "_RUN_STATS_INLINE_CAP_BYTES", 8)
+        client = self._Client()
+        summary = {}
+        path = runner._dispatch_run_stats(
+            client,
+            "fn",
+            "s3://b/out.zarr",
+            self._rows(n_ok=5, n_fail=3),
+            run_id="rid",
+            result_prefix="s3://b/out.zarr.status/rid",
+            summary=summary,
+        )
+        assert path is None and client.events == []
+        assert summary["run_stats_path"] is None
+
     def test_invoke_failure_is_fail_open(self):
         from zagg import runner
 
