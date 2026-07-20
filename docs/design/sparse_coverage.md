@@ -56,21 +56,28 @@ contract: [mortie #48](https://github.com/espg/mortie/issues/48) discussion →
 what zagg consumes:
 
 ```
-{store_root}/
-  {hash}.morton_hive.json        <- per-product static manifest (§3, D19);
-                                    pre-D19 stores: a single morton_hive.json
-  {hash}.yaml                    <- template registry entry (D19)
-  coverage.moc                   <- optional root MOC (§4, O9)
-  <run records (parquet)>        <- run-level telemetry, one row/shard (D20)
-  {sign+base}/{d1}/{d2}/.../     <- one digit per level (D2; digit-chunking is
+{store_root}/                    <- multi-product form (D19): a directory of
+  {hash}.yaml                       stores + a content-addressed registry
+  {hash}/                        <- product root: each product subtree is a
+    morton_hive.json                COMPLETE morton-hive store — bare-named
+    coverage.moc                    manifest (§3) + optional root MOC (§4, O9)
+    <run records (parquet)>      <- run-level telemetry, one row/shard (D20)
+    {sign+base}/{d1}/{d2}/.../   <- one digit per level (D2; digit-chunking is
                                     the manifest path_grouping param, D21)
-    {hash}.zarr/                 <- leaf, basename = template hash (D19;
-                                    pre-D19: {full_id}.zarr, D3); zarr v3,
-                                    dense arrays via ShardingCodec (D17)
-    {hash}_{window}.zarr/        <- time-windowed leaf (D13 grammar, D19 base)
-    {hash}.stats.json            <- per-shard stats sidecar, sibling (D20)
-    <sub-shardmap JSON>          <- leaf sub-map for sweep rollups (D22)
+      {full_id}.zarr/            <- self-describing leaf (D3), zarr v3; dense
+                                    arrays via ShardingCodec (D17)
+      {full_id}_{window}.zarr/   <- time-windowed leaf (D13); naming frozen on
+                                    the mortie spec page (morton-hive/2)
+      stats.json                 <- per-shard stats sidecar, sibling (D20;
+                                    stats_{window}.json for windowed leaves)
+      <sub-shardmap JSON>        <- leaf sub-map for sweep rollups (D22)
 ```
+
+A bare single-product store (today's layout — `morton_hive.json` at the
+store root, no `{hash}/` level) remains fully valid: the D19 product root is
+*additive*, and a product subtree is byte-identical to a bare store. A
+reader distinguishes the two forms by what sits at the root (a manifest ⇒
+bare store; `{hash}.yaml` entries ⇒ product directory).
 
 - **Ids are morton decimal strings** (D1): sign + base digit (constant width,
   12 values `1..6`/`-1..-6`), then one digit per order, digits `1-4`, never
@@ -82,10 +89,9 @@ what zagg consumes:
   readers chunk the digit string per the manifest, never by assumption.
 - **Full morton id at the leaf** (D3): `.../1/2/3/-31123.zarr/` is
   self-describing without parsing its path, greppable in inventories,
-  unambiguous if moved. *Amended by D19*: leaf basenames become template
-  hashes — spatial identity lives in the path, product identity in the
-  basename; the greppable full id moves to the stamp attrs and the stats
-  sidecar's `shard_key` (D20).
+  unambiguous if moved. (Unchanged by D19 — product identity lives at the
+  product *root*, above the tree, so leaf naming and the within-product
+  walk semantics survive untouched.)
 - **Time-windowed leaves** (D13, ratified on
   [#237](https://github.com/englacial/zagg/issues/237)): a store whose
   manifest declares a temporal window schedule (§3) partitions each shard's
@@ -104,17 +110,17 @@ what zagg consumes:
   debris rule (rationale on the #237 thread). Cross-window reads open W
   leaves and concatenate along time; paths stay arithmetic because the
   schedule lives in the manifest (D10 preserved). The no-partitioning
-  degenerate case (`schedule: none`) keeps the bare leaf name (pre-D19
-  `{full_id}.zarr`, byte-identical to the pre-D13 layout; post-D19
-  `{hash}.zarr` — the window grammar is unchanged either way) — a
-  `morton-hive/1` store *is* a `/2` store with `schedule: none`.
-- **Node invariant**: below the root, a node contains *only* digit children
-  (`[1-4]/`), `*.zarr` objects, and the declared leaf-adjacent sidecars —
-  the per-shard stats record (D20) and the sub-shardmap JSON (D22) — with
-  nothing else, ever: the walker's child classification depends on the name
-  set being closed. The root alone also carries the manifest(s), the
-  template registry (`{hash}.yaml`, D19), MOC objects, and run-level
-  telemetry records (D20).
+  degenerate case (`schedule: none`) keeps the bare `{full_id}.zarr` name and
+  is byte-identical to the pre-D13 layout — a `morton-hive/1` store *is* a
+  `/2` store with `schedule: none`.
+- **Node invariant**: below a product root, a node contains *only* digit
+  children (`[1-4]/`), `*.zarr` objects, and the declared leaf-adjacent
+  sidecars — the per-shard stats record (D20) and the sub-shardmap JSON
+  (D22) — with nothing else, ever: the walker's child classification
+  depends on the name set being closed. The product root alone also carries
+  the manifest, MOC objects, and run-level telemetry records (D20); the
+  *store* root of a multi-product directory carries only `{hash}.yaml`
+  registry entries and `{hash}/` product roots (D19).
 - **Termination condition**: S3 has no empty directories (a prefix exists iff
   ≥1 object lies beneath it) and LIST is strongly consistent, so a
   delimiter-LIST returning no digit-shaped children is a definitive "nothing
@@ -181,10 +187,10 @@ again during a run. Contents:
   Generative schedules keep the manifest
   write-once and static as data accrues: appending a new year to a
   `yearly` store adds leaves the schedule already describes — no manifest
-  touch, and **no new manifests**: the store has exactly one manifest *per
-  product* (pre-D19: one `morton_hive.json` total; post-D19: one
-  `{hash}.morton_hive.json` per template hash), and each new windowed leaf
-  brings only its own zarr metadata + D4 stamp. The explicit-range-list form is the noted exception:
+  touch, and **no new manifests**: each product tree has exactly one
+  `morton_hive.json` (under D19 a multi-product store is a directory of
+  product trees, each with its own bare-named manifest), and each new
+  windowed leaf brings only its own zarr metadata + D4 stamp. The explicit-range-list form is the noted exception:
   appending a window outside the declared list re-templates the manifest (a
   rare, single-writer, template-time operation, not a worker-race write) —
   append-heavy stores should prefer generative schedules. (This exception is
@@ -416,9 +422,8 @@ rollup leaves all leaf reads intact.
   "grouped-digit schedules are dead ends" verdict is thereby softened to
   "grouping is a parameter, never a schema fork."
 - **D3 — Full morton id at the leaf** (`{full_id}.zarr`), self-describing.
-  *Amended by D19*: basename becomes the template hash; spatial identity is
-  the path, product identity the basename, and the full id moves to stamp
-  attrs + the D20 sidecar's `shard_key`.
+  (Unchanged by D19: product identity lives at the product root, above the
+  tree.)
 - **D4 — Commit stamp via final root-attrs update.** Absence (LIST) is
   trustworthy; presence requires the stamp. Torn shards are debris,
   overwritable on retry. One small PUT; not consolidation.
@@ -468,9 +473,8 @@ rollup leaves all leaf reads intact.
   `{full_id}_{window}.zarr`, underscore separator, split on the first `_`
   — grammar and boundary semantics recorded on the
   [mortie spec page](https://github.com/espg/mortie/issues/62#issuecomment-4986809092)
-  as part of `morton-hive/2`. (*D19 swaps the `{full_id}` base for
-  `{hash}`; the underscore grammar and window semantics are unchanged — the
-  spec-page update rides the D19 break.*) Reserved (lean, not decided): §7
+  as part of `morton-hive/2`. (Unchanged by D19 — leaf naming survives the
+  product-root design intact.) Reserved (lean, not decided): §7
   overview/pyramid zarrs inherit window naming (per-window overviews, with
   an optional all-time overview as a derived artifact).
 - **D14 — Coverage `encoding: "full"` fast path**
@@ -521,13 +525,11 @@ rollup leaves all leaf reads intact.
   on the fly to order 24 for Number-safe browser paths (NESTED ids are
   float64-exact only through order 24; genuinely-finer-than-24 data takes
   other measures — hub-side fabrication, aggregation). The writer flip
-  sequences as 0.x phases (emit knob default-on → default flip → removal),
-  bundled into the same break window as the
-  [#299](https://github.com/englacial/zagg/issues/299) leaf rename so
-  moczarr golden vectors regenerate once. (The #299 break-window bundling
-  is a sequencing implication recorded from in-session planning, not
-  separately ratified on the thread.) The order-29 discriminator
-  metadata is O10.
+  sequences as 0.x phases (emit knob default-on → default flip → removal).
+  (An earlier plan bundled the flip with a #299 leaf-basename rename;
+  D19's product-root revision made #299 additive, so this writer flip is
+  the one remaining breaking store change in this family.) The order-29
+  discriminator metadata is O10.
 
 - **D17 — Hive+sharded is the HEALPix default; flat/fullsphere deprecated;
   dense leaf arrays write through the ShardingCodec.**
@@ -567,28 +569,48 @@ rollup leaves all leaf reads intact.
   metadata-only. This is the second noted soft-exception to "vanilla zarr
   v3" leaves (after the §4 coverage sidecar): plain zarr readers see opaque
   bytes, not garbage.
-- **D19 — Template-hash leaf naming: the hive tree is a multi-product
-  store** (settled across
+- **D19 — Template-hash product roots: a multi-product store is a
+  directory of stores + a registry** (concept settled across
   [#296](https://github.com/englacial/zagg/issues/296#issuecomment-5014826849)
-  and [#299](https://github.com/englacial/zagg/issues/299); espg on-thread:
+  and [#299](https://github.com/englacial/zagg/issues/299) — espg
+  on-thread:
   [naming + registry + per-product manifests](https://github.com/englacial/zagg/issues/299#issuecomment-5017263033);
-  breaking, pre-1.0, same window as the D16 writer flip). Leaf basename =
-  truncated sha256 (12 hex; collision domain is templates-within-one-store)
-  of the **canonicalized** agg template (parse YAML → sorted-key JSON →
-  hash; never raw bytes). Products colocate as siblings under one morton
-  prefix; discovery is a prefix listing. The template itself is written to
-  the store root as `{hash}.yaml` — a content-addressed registry designed so
-  a future external/community registry is a pure file-merge superset.
-  Manifests go per-product (`{hash}.morton_hive.json`; root listing is
-  product discovery). **Catalog identity lives in the sidecar, never the
-  name**: granule count + sha256 of sorted granule ids + zagg version;
-  dedup/`has_run` consults name *and* sidecar (a catalog-grown shard is
-  "stale", not "hit") — the template hash alone proves identity only for a
-  frozen catalog. Immutable-provenance naming
-  (`{hash}+{catalog-hash}.zarr`) is an opt-in for frozen-catalog archival
+  **hash-first revision espg-ratified in-session 2026-07-20**, superseding
+  the earlier leaf-basename form recorded in this PR's phase 2 —
+  trade study on the PR #306 thread). Each product lives under its own
+  root prefix `{hash}/`, where hash = truncated sha256 (12 hex; collision
+  domain is products-within-one-store) of the **canonicalized** agg
+  template (parse YAML → sorted-key JSON → hash; never raw bytes). A
+  product subtree is a *complete, unmodified* morton-hive store —
+  bare-named manifest and MOC, `{full_id}.zarr` leaves (D3 and D13's
+  frozen grammar untouched) — so existing single-product stores are
+  already valid and the change is **additive, not breaking**; readers
+  distinguish the two root forms by content (manifest ⇒ bare store,
+  `{hash}.yaml` entries ⇒ product directory). The template itself is
+  written beside each product root as `{hash}.yaml` — a content-addressed
+  registry designed so a future external/community registry is a pure
+  file-merge superset; root listing is product discovery. Rationale for
+  hash-first over leaf-basename colocation: S3's only cheap scoping
+  primitive is the prefix, and product-scoped operations (delete,
+  lifecycle/expiration, access policy, inventory) dominate in practice —
+  under colocation each would need per-object tagging or the
+  out-of-contract full enumeration; under hash-first each is one prefix
+  rule. Within-product walk/terminal semantics revert to the proven
+  single-product forms, and per-product artifacts keep bare names (one
+  less naming surface for readers to get wrong). What hash-first gives
+  up — a single spatial prefix spanning all products — serves no planned
+  workload: cross-product reads are manifest + MOC + truncation
+  arithmetic (§5) and never depended on physical colocation. **Catalog
+  identity lives in the sidecar, never the name**: granule count + sha256
+  of sorted granule ids + zagg version; dedup/`has_run` consults the
+  computed path *and* sidecar (a catalog-grown shard is "stale", not
+  "hit") — the template hash alone proves identity only for a frozen
+  catalog. Immutable-provenance naming (product root
+  `{hash}+{catalog-hash}/`) is an opt-in for frozen-catalog archival
   runs; default stays template-hash-only. The output content hash that
-  makes dedup *verifiable* is O11 (proposal). Old-layout stores must fail
-  loudly, never misread.
+  makes dedup *verifiable* is O11 (proposal). D7 generalizes cleanly:
+  "one store per dataset" becomes "one product tree per template" under a
+  shared root, with cross-product joins unchanged.
 - **D20 — Per-shard telemetry sidecar + run records** (espg on-thread:
   [sibling placement + envelope ride](https://github.com/englacial/zagg/issues/297#issuecomment-5016910923),
   [caller identity](https://github.com/englacial/zagg/issues/297#issuecomment-5016901381);
