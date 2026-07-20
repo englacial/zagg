@@ -358,6 +358,9 @@ class TestRasterLambdaBackend:
         assert summary["backend"] == "lambda"
         assert summary["total_cells"] == 1 and summary["cells_with_data"] == 1
         assert summary["cells_error"] == 0
+        # The key is unconditional (issue #297) — None here because the
+        # conftest guard skips the live s3 PUT in unit tests.
+        assert "run_stats_path" in summary and summary["run_stats_path"] is None
         assert summary["total_obs"] == 2
         assert [e["mode"] for e in fake.events] == ["ping", "setup", "process_raster"]
         # No profile -> the payload stays byte-identical (no key) and the
@@ -865,6 +868,11 @@ class TestRasterHiveLocalBackend:
         assert record["shard_key"] == int(shard)
         assert record["invoked_by"] is None and record["lambda"] is None
         assert {"sample", "write"} <= set(record["phase_timings"])
+        # Read-volume counters (issue #297) ride the local record too.
+        assert record["raster_bytes_read"] > 0
+        assert record["raster_px_decoded"] >= record["raster_px_sampled"] > 0
+        # And the raster summary carries the run parquet path (spatial parity).
+        assert summary["run_stats_path"].endswith(".parquet")
         # n_obs is the unit's timestep count (raster obs-count convention),
         # matching the Lambda backend's ``total_obs`` injection — a raster
         # shard cannot yield n_obs=timesteps on Lambda and 0 locally (#297).

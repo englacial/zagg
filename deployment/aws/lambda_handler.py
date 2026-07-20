@@ -1123,6 +1123,10 @@ def _handle_process_raster(event: Dict[str, Any]) -> Dict[str, Any]:
                 "cells_with_data": meta.get("cells_with_data", 0),
                 "total_obs": meta["timesteps"],
                 "duration_s": time.time() - start_time,
+                # Read-volume counters (issue #297) for the stats record.
+                "raster_bytes_read": meta.get("raster_bytes_read"),
+                "raster_px_decoded": meta.get("raster_px_decoded"),
+                "raster_px_sampled": meta.get("raster_px_sampled"),
             }
             if meta.get("time_range") is not None:
                 body["time_range"] = meta["time_range"]
@@ -1222,6 +1226,10 @@ def _handle_process_raster(event: Dict[str, Any]) -> Dict[str, Any]:
             "cells_with_data": grid.cells_per_shard if wrote else 0,
             "total_obs": meta["timesteps"],
             "duration_s": time.time() - start_time,
+            # Read-volume counters (issue #297) for the stats record.
+            "raster_bytes_read": meta.get("raster_bytes_read"),
+            "raster_px_decoded": meta.get("raster_px_decoded"),
+            "raster_px_sampled": meta.get("raster_px_sampled"),
         }
         # Worker memory telemetry (issue #250): sampled per-invocation peak,
         # container high-water fallback (see the process-mode stamp).

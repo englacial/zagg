@@ -107,6 +107,25 @@ class TestBuildRecord:
         ident = {"arn": "arn:aws:sts::123:assumed-role/x/y", "userid": "AROA:me"}
         assert _record(invoked_by=ident)["invoked_by"] == ident
 
+    def test_raster_counters_default_none_and_populate(self):
+        # Off-raster records carry the read-volume fields as None (issue #297).
+        rec = _record()
+        assert rec["raster_bytes_read"] is None
+        assert rec["raster_px_decoded"] is None
+        assert rec["raster_px_sampled"] is None
+        rec = build_record(
+            shard_key=1,
+            metadata={
+                "duration_s": 1.0,
+                "raster_bytes_read": 2048,
+                "raster_px_decoded": 4096,
+                "raster_px_sampled": 100,
+            },
+        )
+        assert rec["raster_bytes_read"] == 2048
+        assert rec["raster_px_decoded"] == 4096
+        assert rec["raster_px_sampled"] == 100
+
     def test_non_numeric_phase_entries_dropped(self):
         rec = _record(phases={"sample": 3.0, "write": 1.0, "stages": {"open": 2}})
         assert rec["phase_timings"] == {"sample": 3.0, "write": 1.0}
@@ -205,6 +224,25 @@ class TestMerge:
     def test_success_ands(self):
         assert merge([_record(1), _record(2, error="boom")])["success"] is False
 
+    def test_raster_counters_fold(self):
+        # Read-volume counters sum; a mixed raster/non-raster fold sums only
+        # the populated part (None-aware, like the cost fields).
+        a = build_record(
+            shard_key=1,
+            metadata={"raster_bytes_read": 100, "raster_px_decoded": 10, "raster_px_sampled": 2},
+        )
+        b = build_record(
+            shard_key=2,
+            metadata={"raster_bytes_read": 900, "raster_px_decoded": 30, "raster_px_sampled": 6},
+        )
+        m = merge([a, b])
+        assert m["raster_bytes_read"] == 1000
+        assert m["raster_px_decoded"] == 40
+        assert m["raster_px_sampled"] == 8
+        mixed = merge([a, _record(3)])
+        assert mixed["raster_bytes_read"] == 100  # None drops out of the sum
+        assert merge([_record(1), _record(2)])["raster_bytes_read"] is None
+
     def test_associative(self):
         a = _record(1, n_obs=10, duration=1.5, memory=100.0)
         b = _record(2, n_obs=20, duration=2.5, memory=None)
@@ -275,6 +313,7 @@ class TestRunParquet:
         assert row["lambda_function_variant"] == "zagg-process-shard"
         assert row["invoked_by"] == ident["arn"]
         assert row["invoked_by_userid"] == ident["userid"]
+        assert "raster_bytes_read" in row  # read-volume columns always present
         assert "phase_timings" not in row and "lambda" not in row  # flattened away
 
     def test_failure_record_and_error_class(self):
