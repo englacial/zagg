@@ -134,8 +134,33 @@ class TestCanonicalization:
             "resolution": 100,
             "bounds": [0, 0, 1000, 1000],
         }
-        assert semantic_core(rect)["grid"] == {"type": "rectilinear"}
+        # F1: rect folds in the spatially-defining params (crs/resolution/
+        # bounds) — D24's resolution-axis exclusion is HEALPix-only.
+        assert semantic_core(rect)["grid"] == {
+            "type": "rectilinear",
+            "crs": "EPSG:3031",
+            "resolution": 100,
+            "bounds": [0, 0, 1000, 1000],
+        }
         assert semantic_hash(rect) != semantic_hash(_cfg())
+
+    def test_rect_resolution_changes_hash(self):
+        # F1: two rect products differing only in resolution (or CRS) are
+        # different products — they must not collide on semantic_hash.
+        base = default_config("atl06_polar")
+        base = copy.deepcopy(base)
+        base.output["grid"] = {
+            "type": "rectilinear",
+            "crs": "EPSG:3031",
+            "resolution": 100,
+            "bounds": [0, 0, 1000, 1000],
+        }
+        finer = copy.deepcopy(base)
+        finer.output["grid"]["resolution"] = 50
+        assert semantic_hash(finer) != semantic_hash(base)
+        other_crs = copy.deepcopy(base)
+        other_crs.output["grid"]["crs"] = "EPSG:3413"
+        assert semantic_hash(other_crs) != semantic_hash(base)
 
     def test_null_packaging_values_drop_out(self):
         # A present-but-null read knob (YAML `driver:`) is identical to an
