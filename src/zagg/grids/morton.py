@@ -11,10 +11,12 @@ dtypes, and the extension metadata lives at the interchange layer only — and
 reconstructed as a ``MortonIndexArray`` on read.
 
 This is the contained #71 migration: only the ``morton`` coordinate adopts the
-type. ``cell_ids`` stays NESTED ``uint64`` by default (the DGGS coordinate;
-``output.grid.cell_ids_encoding: morton`` optionally emits the morton words
-instead — issue #135), and the internal leaf/cell/shard morton arithmetic
-(``cells_of`` / ``shards_of`` / ``children``) stays on plain ``uint64`` ndarrays.
+type — and since the D16 flip (issue #304) it is the only stored cell
+coordinate by default (the legacy NESTED ``cell_ids`` array survives behind
+the ``output.grid.emit_cell_ids: true`` transition hatch, with values per the
+issue-#135 ``cell_ids_encoding`` knob). The internal leaf/cell/shard morton
+arithmetic (``cells_of`` / ``shards_of`` / ``children``) stays on plain
+``uint64`` ndarrays.
 
 Storing the raw ``uint64`` words (rather than a reinterpreted ``int64``) is what
 removes the sign hazard: the packed word's prefix is ``base+1``, so base cells

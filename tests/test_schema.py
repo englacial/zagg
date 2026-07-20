@@ -17,7 +17,9 @@ def cfg():
 
 @pytest.fixture
 def coords(cfg):
-    return get_coords(cfg)
+    # The D16 flip (issue #304): a declared legacy cell_ids coordinate is not
+    # emitted by default — morton is the only stored cell coordinate.
+    return [c for c in get_coords(cfg) if c != "cell_ids"]
 
 
 @pytest.fixture
@@ -78,11 +80,12 @@ class TestCreateZarrTemplate:
         xdggs_zarr_template(store, parent_order=6, child_order=8)
 
         group = open_group(store, path="8", mode="r")
-        assert group["cell_ids"].dtype == np.uint64
         # morton is stored as uint64 (#71): the mortie MortonIndexArray's packed
         # words are unsigned, so base cells 7-11 (bit 63 set) no longer read back
-        # negative as they did under the old int64 coordinate.
+        # negative as they did under the old int64 coordinate. It is the only
+        # stored cell coordinate (D16, issue #304).
         assert group["morton"].dtype == np.uint64
+        assert "cell_ids" not in group
 
     def test_count_dtype(self):
         store = MemoryStore()
@@ -108,7 +111,6 @@ class TestCreateZarrTemplate:
         group = open_group(store, path="8", mode="r")
 
         # Coordinates have fill_value 0
-        assert group["cell_ids"].fill_value == 0
         assert group["morton"].fill_value == 0
 
         # Count has fill_value 0
@@ -157,7 +159,9 @@ class TestConfigDrivenFields:
         ]
 
     def test_expected_coords(self, coords):
-        assert coords == ["cell_ids", "morton"]
+        # The declared config still carries the legacy cell_ids coordinate
+        # (phase 3 of issue #304 removes it); the EMITTED set is morton-only.
+        assert coords == ["morton"]
 
     def test_all_agg_fields_have_required_metadata(self, cfg):
         for name, meta in get_agg_fields(cfg).items():

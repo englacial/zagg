@@ -1081,7 +1081,7 @@ class TestProcessAndWriteHiveWindowed:
         from zagg.config import get_agg_fields, get_data_vars, get_output_signature
 
         coords = grid.chunk_coords(shard)
-        n = len(coords["cell_ids"])
+        n = len(coords["morton"])
         agg = get_agg_fields(grid.config)
         df = pd.DataFrame(
             {

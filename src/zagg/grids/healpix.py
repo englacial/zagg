@@ -15,6 +15,7 @@ from zagg.config import (
     get_agg_fields,
     get_aoi_mask,
     get_cell_ids_encoding,
+    get_emit_cell_ids,
     get_output_signature,
     output_field_signature,
 )
@@ -133,6 +134,12 @@ class HealpixGrid:
                 f"Unknown cell_ids_encoding: {self.cell_ids_encoding!r} "
                 "(expected 'nested' or 'morton')"
             )
+        # D16 default flip (issue #304 phase 2): the legacy cell_ids array is
+        # written only under the explicit transition hatch; morton is the one
+        # stored cell coordinate. Both the template member (_group_spec) and
+        # the coords column (coords_of) key off this single flag so template
+        # and writes can never disagree.
+        self.emit_cell_ids = get_emit_cell_ids(self.config)
 
     @property
     def n_shards(self) -> int:
@@ -402,13 +409,14 @@ class HealpixGrid:
         return cell_ids
 
     def chunk_coords(self, shard_key) -> dict:
-        """Per-cell coord columns for HEALPix: ``morton`` and ``cell_ids``.
+        """Per-cell coord columns for HEALPix: ``morton`` (plus legacy ``cell_ids``).
 
         ``morton`` is a mortie ``MortonIndexArray`` (the typed coordinate; #71);
-        it is stored as ``uint64`` on disk via :mod:`zagg.grids.morton`. ``cell_ids``
-        is NESTED ``uint64`` (the DGGS coordinate) by default; the
-        ``output.grid.cell_ids_encoding: morton`` flag (issue #135) emits the
-        packed morton words instead.
+        it is stored as ``uint64`` on disk via :mod:`zagg.grids.morton` and is
+        the ONLY cell coordinate written by default (D16, issue #304). The
+        ``output.grid.emit_cell_ids: true`` transition hatch adds the legacy
+        ``cell_ids`` array — NESTED ``uint64``, or the packed morton words under
+        ``cell_ids_encoding: morton`` (issue #135).
         """
         return self.coords_of(self.children(shard_key))
 
@@ -421,14 +429,13 @@ class HealpixGrid:
         ``chunk_coords`` is just ``coords_of(children(shard_key))``.
         """
         children = np.asarray(children)
-        if self.cell_ids_encoding == "morton":
-            cell_ids = np.asarray(children, dtype=np.uint64)
-        else:
-            cell_ids = self.encode_cell_ids(children)
-        return {
-            "morton": to_morton_array(children),
-            "cell_ids": cell_ids,
-        }
+        coords: dict = {"morton": to_morton_array(children)}
+        if self.emit_cell_ids:
+            if self.cell_ids_encoding == "morton":
+                coords["cell_ids"] = np.asarray(children, dtype=np.uint64)
+            else:
+                coords["cell_ids"] = self.encode_cell_ids(children)
+        return coords
 
     # ── identity / nesting ───────────────────────────────────────────────
 
@@ -461,6 +468,10 @@ class HealpixGrid:
             **self.spatial_signature(),
             "output_fields": output_field_signature(self.config),
             "cell_ids_encoding": self.cell_ids_encoding,
+            # The transition hatch (issue #304 phase 2) changes the leaf
+            # schema (an extra cell_ids array), so it is part of the full
+            # fingerprint — mixed hatch states must never co-aggregate.
+            "emit_cell_ids": self.emit_cell_ids,
         }
 
     def nests_with(self, other) -> bool:
@@ -477,6 +488,10 @@ class HealpixGrid:
         if not isinstance(other, HealpixGrid):
             return False
         if self.cell_ids_encoding != other.cell_ids_encoding:
+            return False
+        if self.emit_cell_ids != other.emit_cell_ids:
+            # The hatch changes the leaf schema (issue #304 phase 2): one
+            # store carries a cell_ids array, the other does not.
             return False
         return output_field_signature(self.config) == output_field_signature(other.config)
 
@@ -571,9 +586,21 @@ class HealpixGrid:
 
         members = {}
         for name, meta in self.config.aggregation.get("coordinates", {}).items():
+            # D16 default flip (issue #304 phase 2): a declared cell_ids
+            # coordinate is honored only under the emit_cell_ids transition
+            # hatch — otherwise the member is skipped so the template never
+            # carries an array the writer will not fill. Keyed off the same
+            # flag as coords_of, so template and writes cannot disagree.
+            if name == "cell_ids" and not self.emit_cell_ids:
+                continue
             dtype = meta.get("dtype", "float32")
             fill = meta.get("fill_value", "NaN")
             members[name] = _shard(base.with_data_type(dtype).with_fill_value(fill))
+        if self.emit_cell_ids and "cell_ids" not in members:
+            # The hatch must not depend on the config still DECLARING the
+            # legacy coordinate (phase 3 removes the shipped declarations):
+            # synthesize the standard uint64/fill-0 member.
+            members["cell_ids"] = _shard(base.with_data_type("uint64").with_fill_value(0))
         # Optional strict-AOI cell mask (issue #101): a bool array aligned to the
         # cell grid, emitted only when ``output.aoi_mask`` is on so off-runs stay
         # byte-identical. fill_value False — cells never written (out-of-AOI shards,

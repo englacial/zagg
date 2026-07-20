@@ -710,7 +710,9 @@ class TestPlainConfigByteIdentical:
 
 class TestMortonCoordinate:
     """The ``morton`` coordinate is a mortie ``MortonIndexArray`` stored as
-    ``uint64`` on disk (#71); ``cell_ids`` stays NESTED ``uint64`` (DGGS)."""
+    ``uint64`` on disk (#71); it is the ONLY stored cell coordinate by
+    default (D16, issue #304 — legacy ``cell_ids`` only under the
+    ``emit_cell_ids`` transition hatch)."""
 
     def test_chunk_coords_morton_is_extension_array(self, cfg):
         from mortie import MortonIndexArray
@@ -719,8 +721,8 @@ class TestMortonCoordinate:
         parent = _valid_parents(1)[0]
         coords = g.chunk_coords(parent)
         assert isinstance(coords["morton"], MortonIndexArray)
-        # cell_ids stays a plain NESTED integer array, unchanged.
-        assert not isinstance(coords["cell_ids"], MortonIndexArray)
+        # D16 flip (issue #304 phase 2): no legacy cell_ids column by default.
+        assert "cell_ids" not in coords
 
     def test_morton_words_match_generate_children(self, cfg):
         """The typed coordinate carries the same packed words generate_morton_children
@@ -770,9 +772,9 @@ class TestMortonCoordinate:
 
         parent = _valid_parents(1)[0]
         coords = g.chunk_coords(parent)
-        n = len(coords["cell_ids"])
-        df = pd.DataFrame({"cell_ids": coords["cell_ids"]})
-        df["morton"] = coords["morton"]
+        nested = g.encode_cell_ids(g.children(parent))
+        n = len(nested)
+        df = pd.DataFrame({"morton": coords["morton"]})
         for var in get_data_vars(cfg):
             df[var] = np.zeros(n, dtype=np.int32 if var == "count" else np.float32)
 
@@ -780,8 +782,8 @@ class TestMortonCoordinate:
 
         grp = open_group(store, path=str(child_order), mode="r")
         assert grp["morton"].dtype == np.uint64
-        lo = int(np.asarray(coords["cell_ids"]).min())
-        hi = int(np.asarray(coords["cell_ids"]).max())
+        lo = int(np.asarray(nested).min())
+        hi = int(np.asarray(nested).max())
         stored = grp["morton"][lo : hi + 1]
         expected = morton_words(coords["morton"])
         np.testing.assert_array_equal(stored, expected)
@@ -957,38 +959,81 @@ class TestShardLabel:
 
 
 class TestCellIdsEncoding:
-    """Issue #135: ``output.grid.cell_ids_encoding`` — ``cell_ids`` stays NESTED
-    HEALPix uint64 by default; ``morton`` emits the packed morton words instead
-    (a test/prototype capability). Default behavior is byte-identical."""
+    """Issue #135 (``cell_ids_encoding``) + issue #304 (the D16 default flip):
+    ``morton`` is the only stored cell coordinate by default; the
+    ``emit_cell_ids: true`` transition hatch restores the legacy ``cell_ids``
+    array (NESTED uint64, or packed morton words under
+    ``cell_ids_encoding: morton``)."""
 
     @staticmethod
-    def _cfg(encoding=None):
+    def _cfg(encoding=None, emit=None):
         cfg = default_config("atl06")
         if encoding is not None:
             cfg.output["grid"]["cell_ids_encoding"] = encoding
+        if emit is not None:
+            cfg.output["grid"]["emit_cell_ids"] = emit
         return cfg
 
-    def _grid(self, encoding=None):
+    def _grid(self, encoding=None, emit=None):
         return HealpixGrid(
-            parent_order=6, child_order=8, layout="fullsphere", config=self._cfg(encoding)
+            parent_order=6, child_order=8, layout="fullsphere", config=self._cfg(encoding, emit)
         )
+
+    def test_default_emits_no_cell_ids(self):
+        # The D16 flip (issue #304 phase 2): by default neither the coords
+        # column nor the template member exists — keyed off ONE flag so the
+        # writer and the template cannot disagree.
+        parent = _valid_parents(1)[0]
+        g = self._grid()
+        assert "cell_ids" not in g.chunk_coords(parent)
+        assert "cell_ids" not in g.spec().members
+        assert "cell_ids" not in g.shard_spec().members
+        assert g.signature()["emit_cell_ids"] is False
+
+    def test_hatch_restores_declared_member(self):
+        # emit_cell_ids: true keeps the legacy array (the atl06 config still
+        # declares the coordinate, so the declared dtype/fill are honored).
+        g = self._grid(emit=True)
+        parent = _valid_parents(1)[0]
+        coords = g.chunk_coords(parent)
+        np.testing.assert_array_equal(coords["cell_ids"], g.encode_cell_ids(g.children(parent)))
+        assert str(g.spec().members["cell_ids"].data_type) == "uint64"
+        assert g.signature()["emit_cell_ids"] is True
+
+    def test_hatch_synthesizes_member_when_undeclared(self):
+        # Phase 3 removes the shipped cell_ids declarations; the hatch must
+        # not depend on them — an undeclared cell_ids member synthesizes as
+        # the standard uint64/fill-0 array.
+        cfg = self._cfg(emit=True)
+        del cfg.aggregation["coordinates"]["cell_ids"]
+        g = HealpixGrid(parent_order=6, child_order=8, layout="fullsphere", config=cfg)
+        member = g.spec().members["cell_ids"]
+        assert str(member.data_type) == "uint64"
+        assert "cell_ids" in g.chunk_coords(_valid_parents(1)[0])
+
+    def test_mixed_hatch_states_do_not_nest(self):
+        # One store carries the extra array, the other does not — different
+        # leaf schemas must never co-aggregate.
+        assert not self._grid().nests_with(self._grid(emit=True))
+        assert not self._grid(emit=True).nests_with(self._grid())
+        assert self._grid(emit=True).nests_with(self._grid(emit=True))
 
     def test_default_and_explicit_nested_identical(self):
         parent = _valid_parents(1)[0]
-        default = self._grid().chunk_coords(parent)
-        nested = self._grid("nested").chunk_coords(parent)
+        default = self._grid(emit=True).chunk_coords(parent)
+        nested = self._grid("nested", emit=True).chunk_coords(parent)
         np.testing.assert_array_equal(default["cell_ids"], nested["cell_ids"])
         np.testing.assert_array_equal(
             np.asarray(default["morton"]._data), np.asarray(nested["morton"]._data)
         )
-        # Default stays the NESTED encode, unchanged.
-        g = self._grid()
+        # The hatch's default stays the NESTED encode, unchanged.
+        g = self._grid(emit=True)
         np.testing.assert_array_equal(default["cell_ids"], g.encode_cell_ids(g.children(parent)))
 
     def test_morton_encoding_emits_words(self):
         from zagg.grids.morton import morton_words
 
-        g = self._grid("morton")
+        g = self._grid("morton", emit=True)
         parent = _valid_parents(1)[0]
         coords = g.chunk_coords(parent)
         children = np.asarray(g.children(parent), dtype=np.uint64)
@@ -1002,7 +1047,7 @@ class TestCellIdsEncoding:
 
         from zagg.processing import write_dataframe_to_zarr
 
-        cfg = self._cfg("morton")
+        cfg = self._cfg("morton", emit=True)
         g = HealpixGrid(parent_order=6, child_order=8, layout="fullsphere", config=cfg)
         store = MemoryStore()
         g.emit_template(store)

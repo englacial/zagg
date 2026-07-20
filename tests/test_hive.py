@@ -18,7 +18,7 @@ from zarr.storage import MemoryStore
 from zagg import hive
 from zagg.config import default_config, get_data_vars, validate_config
 from zagg.grids import HealpixGrid
-from zagg.grids.morton import morton_decimal
+from zagg.grids.morton import morton_decimal, morton_words
 
 
 @pytest.fixture
@@ -303,7 +303,7 @@ class TestLeafTemplateAndStamp:
         store = MemoryStore()
         g.emit_shard_template(store, overwrite=True)
         grp = zarr.open_group(store, path=g.group_path, mode="r", zarr_format=3)
-        for name in ("morton", "cell_ids", *get_data_vars(cfg)):
+        for name in ("morton", *get_data_vars(cfg)):
             assert grp[name].shape == (g.cells_per_shard,)
             assert grp[name].chunks == (g.cells_per_chunk,)
 
@@ -328,7 +328,7 @@ class TestLeafTemplateAndStamp:
         store = MemoryStore()
         g.emit_shard_template(store, overwrite=True)
         grp = zarr.open_group(store, path=g.group_path, mode="r", zarr_format=3)
-        for name in ("morton", "cell_ids", *get_data_vars(cfg)):
+        for name in ("morton", *get_data_vars(cfg)):
             assert grp[name].shape == (g.cells_per_shard,)
             assert grp[name].shards == (g.cells_per_shard,)
             assert grp[name].chunks == (g.cells_per_chunk,)
@@ -384,7 +384,7 @@ class TestProcessAndWriteHive:
         from zagg.config import get_agg_fields, get_output_signature
 
         coords = grid.chunk_coords(shard)
-        n = len(coords["cell_ids"])
+        n = len(coords["morton"])
         agg = get_agg_fields(grid.config)
         df = pd.DataFrame(
             {
@@ -442,8 +442,8 @@ class TestProcessAndWriteHive:
         # Dense data landed at the leaf-LOCAL block 0.
         grp = zarr.open_group(leaf_store, path=grid.group_path, mode="r", zarr_format=3)
         np.testing.assert_array_equal(
-            np.asarray(grp["cell_ids"][:]),
-            np.asarray(grid.chunk_coords(shard)["cell_ids"]),
+            np.asarray(grp["morton"][:]),
+            morton_words(grid.chunk_coords(shard)["morton"]),
         )
         # The ragged payload sits in the leaf's vlen-bytes array at its cell
         # position (issue #209), as ONE data object.
@@ -748,7 +748,7 @@ class TestProcessAndWriteHiveSharded:
         leaf = hive.shard_leaf_path(root, shard)
         leaf_store = open_store(leaf)
         base = grid.block_index(shard)[0] * grid.cells_per_shard
-        names = ["morton", "cell_ids", "h", *get_data_vars(cfg)]
+        names = ["morton", "h", *get_data_vars(cfg)]
         for name in names:
             # ONE ShardingCodec object per array (was K per-chunk objects).
             assert self._leaf_object_count(leaf, grid, name) == 1, name
@@ -1286,7 +1286,7 @@ class TestRunnerWiring:
         agg(cfg, catalog=catalog_path, store=root, backend="local")
 
         leaf = hive.shard_leaf_path(root, shard)
-        for name in ("morton", "cell_ids", "h"):
+        for name in ("morton", "h"):
             chunk_dir = os.path.join(leaf, grid.group_path, name, "c")
             n_objects = sum(len(files) for _d, _s, files in os.walk(chunk_dir))
             assert n_objects == 1, name

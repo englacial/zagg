@@ -309,6 +309,20 @@ def validate_config(config: PipelineConfig) -> None:
                     "output.grid.cell_ids_encoding only applies to healpix grids "
                     f"(grid type is {grid['type']!r})"
                 )
+        # Transition escape hatch (issue #304 phase 2): emit the legacy
+        # cell_ids array ALONGSIDE the morton coordinate. Default off — morton
+        # is the only stored cell coordinate (D16); the hatch exists for
+        # transition stores (browser-direct demos) until the gridlook morton
+        # path lands. HEALPix-only for the same reason as cell_ids_encoding.
+        emit = grid.get("emit_cell_ids")
+        if emit is not None:
+            if not isinstance(emit, bool):
+                raise ValueError(f"output.grid.emit_cell_ids must be a boolean (got {emit!r})")
+            if emit and grid["type"] != "healpix":
+                raise ValueError(
+                    "output.grid.emit_cell_ids only applies to healpix grids "
+                    f"(grid type is {grid['type']!r})"
+                )
         # The legacy output.grid.indexing_scheme key is descriptive only (the
         # shipped configs carry "nested"); it does NOT select the cell_ids
         # encoding. Reject any other value so a user reaching for it lands on the
@@ -2068,6 +2082,19 @@ def get_cell_ids_encoding(config: PipelineConfig) -> str:
     # A present-but-null key (YAML ``cell_ids_encoding:``) must fall back to the
     # default too — the same treatment ``from_config`` gives a null ``layout``.
     return config.output.get("grid", {}).get("cell_ids_encoding") or "nested"
+
+
+def get_emit_cell_ids(config: PipelineConfig) -> bool:
+    """Whether to keep writing the legacy ``cell_ids`` array (issue #304).
+
+    Default ``False`` (the D16 flip): ``morton`` is the only stored cell
+    coordinate; NESTED ids are derived at read (moczarr fabrication). ``True``
+    is the transition escape hatch — the ``cell_ids`` array is written in
+    ADDITION to ``morton`` (values per ``cell_ids_encoding``) so legacy
+    browser-direct consumers keep working until the gridlook morton decode
+    lands; the dggs attrs are unaffected by the hatch.
+    """
+    return bool(config.output.get("grid", {}).get("emit_cell_ids", False))
 
 
 def get_store_path(config: PipelineConfig) -> str | None:

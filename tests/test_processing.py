@@ -3,6 +3,7 @@ import gc
 import numpy as np
 import pandas as pd
 import pytest
+from conftest import nested_ids
 from zarr import open_group
 from zarr.storage import MemoryStore
 
@@ -48,7 +49,8 @@ class TestWriteDataframeToZarr:
         child_order = 8
 
         cfg = default_config()
-        coords = get_coords(cfg)
+        # D16 flip (issue #304): the stored coordinate set excludes cell_ids.
+        coords = [c for c in get_coords(cfg) if c != "cell_ids"]
         data_vars = get_data_vars(cfg)
 
         grid = HealpixGrid(parent_order, child_order, layout="fullsphere", config=cfg)
@@ -58,12 +60,12 @@ class TestWriteDataframeToZarr:
         df_out = mock_dataframe_factory(-78.5, -132.0, parent_order, child_order)
 
         n_children = 4 ** (child_order - parent_order)
-        chunk_idx = (int(df_out["cell_ids"].min()) // n_children,)
+        chunk_idx = (int(nested_ids(df_out).min()) // n_children,)
         assert write_dataframe_to_zarr(df_out, store, grid=grid, chunk_idx=chunk_idx)
 
         group = open_group(store=store, mode="r", path=str(child_order))
-        min_idx = int(df_out["cell_ids"].min())
-        max_idx = int(df_out["cell_ids"].max())
+        min_idx = int(nested_ids(df_out).min())
+        max_idx = int(nested_ids(df_out).max())
 
         for col in coords + data_vars:
             actual = group[col][min_idx : max_idx + 1]
@@ -87,7 +89,7 @@ class TestWriteDataframeToZarr:
         df_out = mock_dataframe_factory(-78.5, -132.0, parent_order, child_order)
         df_out = df_out.iloc[: len(df_out) // 2]
         n_children = 4 ** (child_order - parent_order)
-        chunk_idx = (int(df_out["cell_ids"].min()) // n_children,)
+        chunk_idx = (int(nested_ids(df_out).min()) // n_children,)
         with pytest.raises(ValueError, match="Expected.*rows for chunk_shape"):
             write_dataframe_to_zarr(df_out, store, grid=grid, chunk_idx=chunk_idx)
 
@@ -3142,8 +3144,8 @@ class TestTypedMortonCarrier:
         cfg, grid, parent, stats = self._setup()
         carrier = self._carrier(cfg, grid, parent, stats, use_arrow=True)
         assert is_morton_arrow(carrier.column("morton"))
-        # cell_ids stays a plain NESTED uint64 column, no extension metadata.
-        assert not is_morton_arrow(carrier.column("cell_ids"))
+        # D16 flip (issue #304): no legacy cell_ids column in the carrier.
+        assert "cell_ids" not in carrier.schema.names
 
     def test_extraction_yields_uint64_words(self):
         pytest.importorskip("arro3.core")
@@ -3215,13 +3217,11 @@ class TestTypedMortonCarrier:
         # word replaced by the sentinel (0), so the typed column carries a null.
         words = np.asarray(grid.children(parent), dtype=np.uint64).copy()
         words[0] = 0
-        cell_ids = grid.encode_cell_ids(grid.children(parent))
         mia = to_morton_array(words)
         assert mia.isna()[0]  # the sentinel really is a missing entry
 
         typed_cols = {var: ac.Array.from_numpy(stats[var]) for var in get_data_vars(cfg)}
         typed_cols["morton"] = morton_to_arrow(mia)
-        typed_cols["cell_ids"] = ac.Array.from_numpy(np.asarray(cell_ids))
         typed = self._store_bytes(ac.Table.from_pydict(typed_cols), grid, parent)
 
         strip_cols = dict(typed_cols)
@@ -3230,7 +3230,6 @@ class TestTypedMortonCarrier:
 
         df = pd.DataFrame({var: stats[var] for var in get_data_vars(cfg)})
         df["morton"] = mia
-        df["cell_ids"] = cell_ids
         via_pandas = self._store_bytes(df, grid, parent)
 
         assert typed.keys() == via_pandas.keys() == stripped.keys()

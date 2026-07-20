@@ -553,6 +553,9 @@ class TestSpatialSignature:
             **spatial,
             "output_fields": g.signature()["output_fields"],
             "cell_ids_encoding": "nested",
+            # The issue #304 transition hatch is part of the full fingerprint
+            # (an extra cell_ids array changes the leaf schema), default off.
+            "emit_cell_ids": False,
         }
 
     def test_rectilinear_excludes_output_fields(self, grid):
