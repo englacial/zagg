@@ -541,7 +541,7 @@ class TestBuildAOIMask:
 
 class TestSpatialSignature:
     """``spatial_signature()`` is the full signature minus the co-aggregation
-    components — ``output_fields`` (#89) and, for HEALPix, ``cell_ids_encoding``
+    components — ``output_fields`` (#89) and, for HEALPix, ``emit_cell_ids``
     (issue #135)."""
 
     def test_healpix_excludes_output_fields(self):
@@ -552,9 +552,9 @@ class TestSpatialSignature:
         assert g.signature() == {
             **spatial,
             "output_fields": g.signature()["output_fields"],
-            "cell_ids_encoding": "nested",
             # The issue #304 transition hatch is part of the full fingerprint
             # (an extra cell_ids array changes the leaf schema), default off.
+            # (The #135 cell_ids_encoding field retired with the knob.)
             "emit_cell_ids": False,
         }
 

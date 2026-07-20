@@ -959,24 +959,22 @@ class TestShardLabel:
 
 
 class TestCellIdsEncoding:
-    """Issue #135 (``cell_ids_encoding``) + issue #304 (the D16 default flip):
-    ``morton`` is the only stored cell coordinate by default; the
-    ``emit_cell_ids: true`` transition hatch restores the legacy ``cell_ids``
-    array (NESTED uint64, or packed morton words under
-    ``cell_ids_encoding: morton``)."""
+    """Issue #304 (the D16 flip, all phases): ``morton`` is the only stored
+    cell coordinate and every HEALPix store is morton-declared; the
+    ``emit_cell_ids: true`` transition hatch adds the legacy NESTED
+    ``cell_ids`` array as an EXTRA member (the issue #135 encoding knob is
+    retired — morton stored, NESTED derived at read)."""
 
     @staticmethod
-    def _cfg(encoding=None, emit=None):
+    def _cfg(emit=None):
         cfg = default_config("atl06")
-        if encoding is not None:
-            cfg.output["grid"]["cell_ids_encoding"] = encoding
         if emit is not None:
             cfg.output["grid"]["emit_cell_ids"] = emit
         return cfg
 
-    def _grid(self, encoding=None, emit=None):
+    def _grid(self, emit=None):
         return HealpixGrid(
-            parent_order=6, child_order=8, layout="fullsphere", config=self._cfg(encoding, emit)
+            parent_order=6, child_order=8, layout="fullsphere", config=self._cfg(emit)
         )
 
     def test_default_emits_no_cell_ids(self):
@@ -990,26 +988,36 @@ class TestCellIdsEncoding:
         assert "cell_ids" not in g.shard_spec().members
         assert g.signature()["emit_cell_ids"] is False
 
-    def test_hatch_restores_declared_member(self):
-        # emit_cell_ids: true keeps the legacy array (the atl06 config still
-        # declares the coordinate, so the declared dtype/fill are honored).
+    def test_hatch_emits_nested_cell_ids(self):
+        # emit_cell_ids: true restores the legacy NESTED array — member
+        # synthesized (the shipped configs no longer declare it, issue #304
+        # phase 3) and the coords column carries the NESTED encode.
         g = self._grid(emit=True)
         parent = _valid_parents(1)[0]
         coords = g.chunk_coords(parent)
         np.testing.assert_array_equal(coords["cell_ids"], g.encode_cell_ids(g.children(parent)))
         assert str(g.spec().members["cell_ids"].data_type) == "uint64"
+        assert str(g.shard_spec().members["cell_ids"].data_type) == "uint64"
         assert g.signature()["emit_cell_ids"] is True
 
-    def test_hatch_synthesizes_member_when_undeclared(self):
-        # Phase 3 removes the shipped cell_ids declarations; the hatch must
-        # not depend on them — an undeclared cell_ids member synthesizes as
-        # the standard uint64/fill-0 array.
+    def test_hatch_honors_declared_member(self):
+        # A config that still declares the legacy coordinate (user configs in
+        # the wild) keeps its declared dtype/fill under the hatch.
         cfg = self._cfg(emit=True)
-        del cfg.aggregation["coordinates"]["cell_ids"]
+        cfg.aggregation.setdefault("coordinates", {})["cell_ids"] = {
+            "dtype": "uint64",
+            "fill_value": 0,
+        }
         g = HealpixGrid(parent_order=6, child_order=8, layout="fullsphere", config=cfg)
-        member = g.spec().members["cell_ids"]
-        assert str(member.data_type) == "uint64"
-        assert "cell_ids" in g.chunk_coords(_valid_parents(1)[0])
+        assert str(g.spec().members["cell_ids"].data_type) == "uint64"
+        # Without the hatch the declaration is skipped, not honored.
+        cfg2 = self._cfg()
+        cfg2.aggregation.setdefault("coordinates", {})["cell_ids"] = {
+            "dtype": "uint64",
+            "fill_value": 0,
+        }
+        g2 = HealpixGrid(parent_order=6, child_order=8, layout="fullsphere", config=cfg2)
+        assert "cell_ids" not in g2.spec().members
 
     def test_mixed_hatch_states_do_not_nest(self):
         # One store carries the extra array, the other does not — different
@@ -1018,36 +1026,12 @@ class TestCellIdsEncoding:
         assert not self._grid(emit=True).nests_with(self._grid())
         assert self._grid(emit=True).nests_with(self._grid(emit=True))
 
-    def test_default_and_explicit_nested_identical(self):
-        parent = _valid_parents(1)[0]
-        default = self._grid(emit=True).chunk_coords(parent)
-        nested = self._grid("nested", emit=True).chunk_coords(parent)
-        np.testing.assert_array_equal(default["cell_ids"], nested["cell_ids"])
-        np.testing.assert_array_equal(
-            np.asarray(default["morton"]._data), np.asarray(nested["morton"]._data)
-        )
-        # The hatch's default stays the NESTED encode, unchanged.
-        g = self._grid(emit=True)
-        np.testing.assert_array_equal(default["cell_ids"], g.encode_cell_ids(g.children(parent)))
-
-    def test_morton_encoding_emits_words(self):
-        from zagg.grids.morton import morton_words
-
-        g = self._grid("morton", emit=True)
-        parent = _valid_parents(1)[0]
-        coords = g.chunk_coords(parent)
-        children = np.asarray(g.children(parent), dtype=np.uint64)
-        assert coords["cell_ids"].dtype == np.uint64
-        np.testing.assert_array_equal(coords["cell_ids"], children)
-        # The morton coordinate itself is unchanged (still the typed array).
-        np.testing.assert_array_equal(morton_words(coords["morton"]), children)
-
-    def test_morton_encoding_roundtrips_through_zarr(self):
+    def test_hatch_roundtrips_through_zarr(self):
         import pandas as pd
 
         from zagg.processing import write_dataframe_to_zarr
 
-        cfg = self._cfg("morton", emit=True)
+        cfg = self._cfg(emit=True)
         g = HealpixGrid(parent_order=6, child_order=8, layout="fullsphere", config=cfg)
         store = MemoryStore()
         g.emit_template(store)
@@ -1065,76 +1049,45 @@ class TestCellIdsEncoding:
         grp = open_group(store, path="8", mode="r")
         start = chunk_idx[0] * n
         stored = grp["cell_ids"][start : start + n]
-        np.testing.assert_array_equal(stored, np.asarray(g.children(parent), dtype=np.uint64))
+        np.testing.assert_array_equal(stored, g.encode_cell_ids(g.children(parent)))
         assert stored.dtype == np.uint64
 
-    def test_dggs_attrs_record_encoding(self):
-        # Nested stores are unchanged; a morton-declared store uses the
-        # DISTINCT grid name (D16 / issue #304 phase 1) — never
-        # name: "healpix" + indexing_scheme: "morton", which scheme-blind
-        # readers silently misread as NESTED.
-        assert self._grid()._dggs_attrs()["dggs"]["indexing_scheme"] == "nested"
-        assert self._grid("nested")._dggs_attrs()["dggs"]["indexing_scheme"] == "nested"
-        morton = self._grid("morton")._dggs_attrs()["dggs"]
-        assert morton["name"] == "morton"
-        assert "indexing_scheme" not in morton
-
-    def test_morton_attrs_declare_convention_block(self):
-        # Issue #304 phase 1: the morton-declared attrs flip — grid name
-        # "morton", the typed `morton` coordinate, and the self-declared
-        # convention entry (issue #305, permanent UUID) appended to the
+    def test_dggs_attrs_are_morton_declared(self):
+        # Issue #304 phase 3: EVERY HEALPix aggregation store is
+        # morton-declared — grid name "morton", typed `morton` coordinate,
+        # never name: "healpix" + indexing_scheme: "morton" (D16: scheme-blind
+        # readers must hard-reject, not silently misread), and the
+        # self-declared convention entry (issue #305, permanent UUID) on the
         # zarr_conventions LIST so future upstream entries can coexist.
         from zagg.grids.morton import MORTON_CONVENTION
 
-        attrs = self._grid("morton")._dggs_attrs()
-        assert attrs["dggs"]["coordinate"] == "morton"
-        assert attrs["dggs"]["name"] == "morton"
-        assert MORTON_CONVENTION in attrs["zarr_conventions"]
-        names = [c["name"] for c in attrs["zarr_conventions"]]
-        assert names == ["dggs", "morton-dggs"]
-
-    def test_nested_attrs_unchanged_by_flip(self):
-        # The default store's attrs block keeps the same key set and values as
-        # the pre-flip form (key order is not part of the contract; JSON attrs
-        # parse order-independently): name healpix, NESTED coordinate, one
-        # convention entry.
-        attrs = self._grid()._dggs_attrs()
-        assert attrs["dggs"]["name"] == "healpix"
-        assert attrs["dggs"]["coordinate"] == "cell_ids"
-        assert len(attrs["zarr_conventions"]) == 1
+        for emit in (None, True):
+            attrs = self._grid(emit)._dggs_attrs()
+            assert attrs["dggs"]["name"] == "morton"
+            assert attrs["dggs"]["coordinate"] == "morton"
+            assert "indexing_scheme" not in attrs["dggs"]
+            assert MORTON_CONVENTION in attrs["zarr_conventions"]
+            names = [c["name"] for c in attrs["zarr_conventions"]]
+            assert names == ["dggs", "morton-dggs"]
 
     def test_dggs_attrs_declare_resolution_exact(self):
         # O10 discriminator (issue #305): grid-derived cell coordinates are
-        # "exact" by construction, under every encoding — "point" is reserved
-        # for location-derived id paths that don't exist in zagg outputs.
+        # "exact" by construction — "point" is reserved for location-derived
+        # id paths that don't exist in zagg outputs.
         from zagg.grids.morton import RESOLUTION_EXACT
 
-        for enc in (None, "nested", "morton"):
-            assert self._grid(enc)._dggs_attrs()["dggs"]["resolution"] == RESOLUTION_EXACT
+        for emit in (None, True):
+            assert self._grid(emit)._dggs_attrs()["dggs"]["resolution"] == RESOLUTION_EXACT
 
     def test_dggs_attrs_reach_written_store(self):
-        # Round-trip past the return-value assertions above: the dggs block
-        # (incl. `resolution`) must survive spec()->emit_template->to_zarr and
-        # be readable off the WRITTEN group's attrs — that store path is what
-        # #305 readers key on.
+        # Round-trip past the return-value assertions above: the full flipped
+        # dggs block (name/coordinate "morton", resolution exact, no
+        # indexing_scheme) and BOTH convention entries must survive
+        # spec()->emit_template->to_zarr and be readable off the WRITTEN
+        # group's attrs — that store path is what #305 readers key on.
         from zagg.grids.morton import RESOLUTION_EXACT
 
         g = self._grid()
-        store = MemoryStore()
-        g.emit_template(store)
-        attrs = open_group(store, path="8", mode="r").attrs
-        assert attrs["dggs"]["resolution"] == RESOLUTION_EXACT
-        assert isinstance(attrs["zarr_conventions"], list)
-        assert len(attrs["zarr_conventions"]) >= 1
-
-    def test_morton_dggs_attrs_reach_written_store(self):
-        # Companion to the nested case above for the morton-declared grid: the
-        # full flipped dggs block (name/coordinate "morton", resolution exact,
-        # no indexing_scheme) and BOTH convention entries must survive
-        # spec()->emit_template->to_zarr and be readable off the WRITTEN group.
-        from zagg.grids.morton import RESOLUTION_EXACT
-
-        g = self._grid("morton")
         store = MemoryStore()
         g.emit_template(store)
         attrs = open_group(store, path="8", mode="r").attrs
@@ -1153,8 +1106,7 @@ class TestCellIdsEncoding:
 
         assert MORTON_CONVENTION["uuid"] == "3e22156d-ea9e-4e01-95fe-e3809a4b41e7"
         assert MORTON_CONVENTION["name"] == "morton-dggs"
-        # Same entry shape as the zarr_conventions list already emitted by
-        # _dggs_attrs, so the PR-2 attrs flip can append it verbatim.
+        # Same entry shape as the generic dggs entry it rides beside.
         emitted = self._grid()._dggs_attrs()["zarr_conventions"][0]
         assert set(MORTON_CONVENTION) == set(emitted)
         # The normative home is the mortie spec page, not the design doc.
@@ -1162,37 +1114,22 @@ class TestCellIdsEncoding:
         assert MORTON_CONVENTION["spec_url"].endswith("docs/specification.md")
         assert (RESOLUTION_EXACT, RESOLUTION_POINT) == ("exact", "point")
 
-    def test_spatial_signature_unchanged_by_encoding(self):
-        # The encoding changes coordinate VALUES, not the spatial layout, so
-        # shard maps stay reusable across the flag (#89).
-        assert self._grid("morton").spatial_signature() == self._grid().spatial_signature()
+    def test_spatial_signature_unchanged_by_hatch(self):
+        # The hatch changes the leaf schema, not the spatial layout, so shard
+        # maps stay reusable across the flag (#89).
+        assert self._grid(emit=True).spatial_signature() == self._grid().spatial_signature()
+        assert "emit_cell_ids" not in self._grid().spatial_signature()
 
-    def test_unknown_encoding_rejected_at_grid_construction(self):
-        # coords_of (values) and _dggs_attrs (recorded scheme) both interpret the
-        # string, so a grid built from an UNVALIDATED config must reject a third
-        # value here — otherwise NESTED values would be recorded under a foreign
-        # scheme name and consumers would mis-decode every cell.
-        with pytest.raises(ValueError, match="Unknown cell_ids_encoding"):
-            self._grid("ring")
+    def test_retired_knob_errors_at_config_validation(self):
+        # The issue #135 knob is retired (issue #304 phase 3): a config still
+        # carrying it fails loudly at validation with the migration pointer
+        # (grid construction no longer reads it at all).
+        from zagg.config import validate_config
 
-    def test_signature_records_encoding(self):
-        # The full fingerprint carries the encoding (issue #135) so the
-        # validate_compatible rejection message names the actual mismatch;
-        # spatial_signature (shard-map reuse) deliberately does not.
-        assert self._grid().signature()["cell_ids_encoding"] == "nested"
-        assert self._grid("morton").signature()["cell_ids_encoding"] == "morton"
-        assert "cell_ids_encoding" not in self._grid("morton").spatial_signature()
-
-    def test_mixed_encodings_do_not_nest(self):
-        # NESTED ids and morton words are different id spaces: co-aggregating
-        # them would let a consumer join on cell_ids and silently mismatch.
-        nested, morton = self._grid(), self._grid("morton")
-        assert not nested.nests_with(morton)
-        assert not morton.nests_with(nested)
-        # Same encoding still nests — including default vs explicit "nested",
-        # so the gate changes nothing for anyone not using the flag.
-        assert nested.nests_with(self._grid("nested"))
-        assert morton.nests_with(self._grid("morton"))
+        cfg = self._cfg()
+        cfg.output["grid"]["cell_ids_encoding"] = "morton"
+        with pytest.raises(ValueError, match="cell_ids_encoding was retired"):
+            validate_config(cfg)
 
 
 class TestChunkInnerMultiChunk:

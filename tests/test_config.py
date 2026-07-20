@@ -1117,8 +1117,10 @@ class TestAccessors:
         assert fields["h_q50"]["params"]["q"] == 0.50
 
     def test_get_coords(self, atl06_config):
+        # The shipped configs declare morton only (issue #304 phase 3 — the
+        # legacy cell_ids declaration was removed with the D16 flip).
         coords = get_coords(atl06_config)
-        assert "cell_ids" in coords
+        assert "cell_ids" not in coords
         assert "morton" in coords
 
     def test_get_data_vars(self, atl06_config):
@@ -1414,8 +1416,8 @@ class TestOutputGridValidation:
             validate_config(cfg)
 
 
-def _cfg_with_cell_ids_encoding(encoding=None, grid_type="healpix") -> PipelineConfig:
-    """Minimal valid config; sets output.grid.cell_ids_encoding only when given."""
+def _cfg_with_grid_knobs(grid_type="healpix", **grid_extra) -> PipelineConfig:
+    """Minimal valid config; extra output.grid keys applied when given."""
     grid: dict = {"type": grid_type, "parent_order": 6, "child_order": 12}
     if grid_type == "rectilinear":
         grid = {
@@ -1424,8 +1426,7 @@ def _cfg_with_cell_ids_encoding(encoding=None, grid_type="healpix") -> PipelineC
             "resolution": 100,
             "bounds": [0, 0, 1000, 1000],
         }
-    if encoding is not None:
-        grid["cell_ids_encoding"] = encoding
+    grid.update(grid_extra)
     return PipelineConfig(
         data_source={
             "reader": "h5coro",
@@ -1438,59 +1439,54 @@ def _cfg_with_cell_ids_encoding(encoding=None, grid_type="healpix") -> PipelineC
     )
 
 
-class TestCellIdsEncoding:
-    """Issue #135: optional output.grid.cell_ids_encoding — "nested" (default,
-    the DGGS standard) or "morton" (emit packed morton words as cell_ids)."""
+class TestCellIdsKnobs:
+    """Issue #304 phase 3: the issue #135 ``cell_ids_encoding`` knob is
+    retired (morton stored, NESTED derived); ``emit_cell_ids`` is the one
+    remaining transition hatch."""
 
-    def test_default_is_nested(self):
-        from zagg.config import get_cell_ids_encoding
+    def test_retired_knob_gets_pointed_error(self):
+        # Any value — including the formerly-valid ones — errors with the
+        # migration pointer, never a silent ignore.
+        for value in ("nested", "morton", "bogus"):
+            with pytest.raises(ValueError, match="cell_ids_encoding was retired"):
+                validate_config(_cfg_with_grid_knobs(cell_ids_encoding=value))
 
-        assert get_cell_ids_encoding(_cfg_with_cell_ids_encoding()) == "nested"
-
-    def test_explicit_values_accessor(self):
-        from zagg.config import get_cell_ids_encoding
-
-        assert get_cell_ids_encoding(_cfg_with_cell_ids_encoding("nested")) == "nested"
-        assert get_cell_ids_encoding(_cfg_with_cell_ids_encoding("morton")) == "morton"
-
-    def test_valid_values_validate(self):
-        validate_config(_cfg_with_cell_ids_encoding())  # absent
-        validate_config(_cfg_with_cell_ids_encoding("nested"))
-        validate_config(_cfg_with_cell_ids_encoding("morton"))
-
-    def test_invalid_value_rejected_at_load(self):
-        with pytest.raises(ValueError, match="cell_ids_encoding must be 'nested' or 'morton'"):
-            validate_config(_cfg_with_cell_ids_encoding("bogus"))
-
-    def test_rejected_on_rectilinear(self):
-        # Rectilinear grids have no cell_ids coordinate; the knob would silently
-        # do nothing, so it is rejected at load.
-        with pytest.raises(ValueError, match="only applies to healpix"):
-            validate_config(_cfg_with_cell_ids_encoding("morton", grid_type="rectilinear"))
-
-    def test_rectilinear_without_encoding_still_validates(self):
-        validate_config(_cfg_with_cell_ids_encoding(grid_type="rectilinear"))
-
-    def test_present_but_null_key_falls_back_to_nested(self):
-        # YAML `cell_ids_encoding:` (explicit null) must behave like an absent
-        # key: the accessor returns "nested" (never None) and validation passes,
-        # so the store attrs stay byte-identical to a pre-flag run.
-        from zagg.config import get_cell_ids_encoding
-
-        cfg = _cfg_with_cell_ids_encoding()
+    def test_absent_and_null_knob_validate(self):
+        validate_config(_cfg_with_grid_knobs())
+        # YAML `cell_ids_encoding:` (explicit null) behaves like absent.
+        cfg = _cfg_with_grid_knobs()
         cfg.output["grid"]["cell_ids_encoding"] = None
-        assert get_cell_ids_encoding(cfg) == "nested"
         validate_config(cfg)
 
+    def test_emit_cell_ids_accessor_and_validation(self):
+        from zagg.config import get_emit_cell_ids
+
+        assert get_emit_cell_ids(_cfg_with_grid_knobs()) is False
+        cfg = _cfg_with_grid_knobs(emit_cell_ids=True)
+        validate_config(cfg)
+        assert get_emit_cell_ids(cfg) is True
+
+    def test_emit_cell_ids_rejects_non_boolean(self):
+        with pytest.raises(ValueError, match="emit_cell_ids must be a boolean"):
+            validate_config(_cfg_with_grid_knobs(emit_cell_ids="yes"))
+
+    def test_emit_cell_ids_rejected_on_rectilinear(self):
+        # Rectilinear grids have no cell_ids coordinate; the flag would
+        # silently do nothing, so a true value is rejected at load.
+        with pytest.raises(ValueError, match="only applies to healpix"):
+            validate_config(_cfg_with_grid_knobs(emit_cell_ids=True, grid_type="rectilinear"))
+
+    def test_rectilinear_without_knobs_still_validates(self):
+        validate_config(_cfg_with_grid_knobs(grid_type="rectilinear"))
+
     def test_legacy_indexing_scheme_key_is_descriptive_only(self):
-        # The shipped configs carry output.grid.indexing_scheme: nested, which no
-        # code reads; setting it to "morton" would otherwise silently do nothing.
-        # It must fail loudly and point at the real knob.
-        cfg = _cfg_with_cell_ids_encoding()
+        # The shipped configs carry output.grid.indexing_scheme: nested, which
+        # no code reads; any other value must fail loudly.
+        cfg = _cfg_with_grid_knobs()
         cfg.output["grid"]["indexing_scheme"] = "nested"
         validate_config(cfg)  # the shipped value stays valid
         cfg.output["grid"]["indexing_scheme"] = "morton"
-        with pytest.raises(ValueError, match="cell_ids_encoding: morton"):
+        with pytest.raises(ValueError, match="declared coordinate is morton"):
             validate_config(cfg)
 
 

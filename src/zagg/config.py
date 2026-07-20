@@ -294,26 +294,23 @@ def validate_config(config: PipelineConfig) -> None:
                 f"output.grid.layout must be 'fullsphere' (got {layout!r}; "
                 "the deprecated 'dense' layout was removed — issue #88)"
             )
-        # Optional cell_ids encoding (issue #135): "nested" (default, the DGGS
-        # standard) or "morton" (emit the packed morton words as cell_ids — a
-        # test/prototype capability). HEALPix-only: rectilinear grids have no
-        # cell_ids coordinate, so the knob would silently do nothing there.
-        encoding = grid.get("cell_ids_encoding")
-        if encoding is not None:
-            if encoding not in ("nested", "morton"):
-                raise ValueError(
-                    f"output.grid.cell_ids_encoding must be 'nested' or 'morton' (got {encoding!r})"
-                )
-            if grid["type"] != "healpix":
-                raise ValueError(
-                    "output.grid.cell_ids_encoding only applies to healpix grids "
-                    f"(grid type is {grid['type']!r})"
-                )
-        # Transition escape hatch (issue #304 phase 2): emit the legacy
+        # The issue #135 knob is retired (issue #304 phase 3, D16 — #135
+        # inverts): morton is the stored cell coordinate and NESTED ids are
+        # DERIVED at read (moczarr fabrication). A config still carrying the
+        # key gets a pointed error, never a silent ignore.
+        if grid.get("cell_ids_encoding") is not None:
+            raise ValueError(
+                "output.grid.cell_ids_encoding was retired (issue #304): morton is "
+                "the stored cell coordinate and NESTED ids are derived at read; "
+                "to keep writing the legacy NESTED cell_ids array for transition "
+                "stores set output.grid.emit_cell_ids: true"
+            )
+        # Transition escape hatch (issue #304 phase 2): emit the legacy NESTED
         # cell_ids array ALONGSIDE the morton coordinate. Default off — morton
         # is the only stored cell coordinate (D16); the hatch exists for
         # transition stores (browser-direct demos) until the gridlook morton
-        # path lands. HEALPix-only for the same reason as cell_ids_encoding.
+        # path lands. HEALPix-only: rectilinear grids have no cell_ids
+        # coordinate, so the flag would silently do nothing there.
         emit = grid.get("emit_cell_ids")
         if emit is not None:
             if not isinstance(emit, bool):
@@ -324,15 +321,14 @@ def validate_config(config: PipelineConfig) -> None:
                     f"(grid type is {grid['type']!r})"
                 )
         # The legacy output.grid.indexing_scheme key is descriptive only (the
-        # shipped configs carry "nested"); it does NOT select the cell_ids
-        # encoding. Reject any other value so a user reaching for it lands on the
-        # real knob instead of a silently-NESTED store.
+        # shipped configs carry "nested"); it never selected an encoding.
+        # Reject any other value so a user reaching for it fails loudly.
         legacy_scheme = grid.get("indexing_scheme")
         if legacy_scheme is not None and legacy_scheme != "nested":
             raise ValueError(
                 f"output.grid.indexing_scheme is descriptive and must be 'nested' "
-                f"(got {legacy_scheme!r}); to emit morton words as cell_ids set "
-                f"output.grid.cell_ids_encoding: morton"
+                f"(got {legacy_scheme!r}); the store's declared coordinate is morton "
+                f"(D16 — issue #304)"
             )
 
     # Validate the optional per-cell carrier (issue #132). Mirrors the worker's
@@ -2059,29 +2055,6 @@ def get_sharded(config: PipelineConfig, default: bool = False) -> bool:
     not cost the ~K-fold object blow-up).
     """
     return bool(config.output.get("grid", {}).get("sharded", default))
-
-
-def get_cell_ids_encoding(config: PipelineConfig) -> str:
-    """Return the HEALPix ``cell_ids`` coordinate encoding (issue #135).
-
-    ``"nested"`` (default) stores the standardized NESTED HEALPix cell IDs.
-    ``"morton"`` stores the packed morton words instead — the same ``uint64``
-    words the ``morton`` coordinate carries — opening test/prototype flows that
-    index by morton directly. Default behavior (key absent, explicit ``null``,
-    or ``"nested"``) is byte-identical to a pre-flag run.
-
-    Parameters
-    ----------
-    config : PipelineConfig
-
-    Returns
-    -------
-    str
-        ``"nested"`` (default) or ``"morton"``.
-    """
-    # A present-but-null key (YAML ``cell_ids_encoding:``) must fall back to the
-    # default too — the same treatment ``from_config`` gives a null ``layout``.
-    return config.output.get("grid", {}).get("cell_ids_encoding") or "nested"
 
 
 def get_emit_cell_ids(config: PipelineConfig) -> bool:

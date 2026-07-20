@@ -36,12 +36,19 @@ PyCapsule surface speak the Arrow C Data Interface directly (pyarrow stays in
 the off-Lambda `catalog` extra). Arrow nulls map to mortie's all-zero empty
 sentinel word in both directions, so missing values round-trip.
 
-## `cell_ids` encoding
+## `cell_ids`: morton-only storage (D16)
 
-`cell_ids` stays the standardized **NESTED HEALPix** id (`uint64`) by default.
-For test and prototyping flows, `output.grid.cell_ids_encoding: morton` emits
-the packed morton words as `cell_ids` instead (HEALPix grids only; the store's
-`dggs.indexing_scheme` attribute records the active encoding):
+Since the issue #304 flip, **`morton` is the only stored cell coordinate**:
+the packed `uint64` words carry the cell identity (and its order,
+intrinsically), the store's `dggs` attrs declare grid `name: "morton"` +
+`coordinate: "morton"`, and NESTED HEALPix ids are **derived at read** (the
+moczarr fabrication layer). The issue #135 `cell_ids_encoding` knob is
+retired — a config still carrying it fails validation with a migration
+pointer.
+
+For transition stores (browser-direct demos until the gridlook morton decode
+lands), the escape hatch keeps writing the legacy NESTED array *in addition
+to* `morton`:
 
 ```yaml
 output:
@@ -49,17 +56,16 @@ output:
     type: healpix
     parent_order: 6
     child_order: 12
-    cell_ids_encoding: morton   # default: nested
+    emit_cell_ids: true   # default: false — morton only
 ```
 
-The default (key absent or `nested`) is byte-identical to a pre-flag run.
-
-Note the grid's `spatial_signature()` (recorded in ShardMap manifests) stays
-`nested` regardless of the flag — deliberately, so shard maps remain reusable
-across encodings: the flag changes coordinate *values*, not the spatial layout.
-Only the store's `dggs.indexing_scheme` attribute tracks the active encoding.
-(The pre-existing `output.grid.indexing_scheme` config key is descriptive only
-and must stay `nested`; `cell_ids_encoding` is the knob.)
+A hatch store's declared coordinate stays `morton`; `cell_ids` is an extra
+legacy member. The grid's `spatial_signature()` (recorded in ShardMap
+manifests) is unchanged by the hatch — deliberately, so shard maps remain
+reusable — while the full `signature()` records `emit_cell_ids` (the hatch
+changes the leaf schema, so mixed states never co-aggregate). (The
+pre-existing `output.grid.indexing_scheme` config key is descriptive only and
+must stay `nested`.)
 
 ## Shardmap parquet manifests
 

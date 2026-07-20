@@ -13,8 +13,8 @@ reconstructed as a ``MortonIndexArray`` on read.
 This is the contained #71 migration: only the ``morton`` coordinate adopts the
 type — and since the D16 flip (issue #304) it is the only stored cell
 coordinate by default (the legacy NESTED ``cell_ids`` array survives behind
-the ``output.grid.emit_cell_ids: true`` transition hatch, with values per the
-issue-#135 ``cell_ids_encoding`` knob). The internal leaf/cell/shard morton
+the ``output.grid.emit_cell_ids: true`` transition hatch; the issue-#135
+``cell_ids_encoding`` knob is retired). The internal leaf/cell/shard morton
 arithmetic (``cells_of`` / ``shards_of`` / ``children``) stays on plain
 ``uint64`` ndarrays.
 
