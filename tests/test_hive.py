@@ -294,6 +294,89 @@ class TestManifest:
 # ── leaf template + commit stamp (D3/D4) ─────────────────────────────────────
 
 
+class TestSemanticManifest:
+    """Issue #299 phase 3: semantic_hash + path_grouping frozen keys, the
+    aggregation.yaml derived core, and the append-spec seam."""
+
+    def _grid(self, cfg):
+        return HealpixGrid(parent_order=6, child_order=8, layout="fullsphere", config=cfg)
+
+    def test_manifest_carries_semantic_hash_and_grouping(self, cfg):
+        from zagg.semantics import semantic_hash
+
+        m = hive.build_manifest(self._grid(cfg))
+        assert m["semantic_hash"] == semantic_hash(cfg) and len(m["semantic_hash"]) == 64
+        assert m["path_grouping"] == 1
+
+    def test_append_to_pre299_manifest_accepted(self, cfg, tmp_path):
+        # A pre-#299 manifest lacks semantic_hash/path_grouping; appends must
+        # not refuse on the new keys (absent-side tolerance / absent=>1).
+        root = str(tmp_path / "store")
+        grid = self._grid(cfg)
+        old = hive.build_manifest(grid)
+        del old["semantic_hash"]
+        del old["path_grouping"]
+        hive.ensure_manifest(root, old)
+        fresh = hive.build_manifest(grid)
+        assert hive.validate_manifest(root, fresh) == old
+        # And the accepted manifest (no second PUT) is the existing one.
+        assert hive.ensure_manifest(root, fresh) == old
+
+    def test_semantic_mismatch_refuses(self, cfg, tmp_path):
+        # Both manifests carry the hash and they differ -> frozen-key refusal,
+        # exactly like an orders mismatch (D19).
+        root = str(tmp_path / "store")
+        hive.ensure_manifest(root, hive.build_manifest(self._grid(cfg)))
+        import copy
+
+        other_cfg = copy.deepcopy(cfg)
+        other_cfg.aggregation["variables"]["count"]["dtype"] = "int64"
+        other = hive.build_manifest(self._grid(other_cfg))
+        with pytest.raises(ValueError, match="does not match this run"):
+            hive.validate_manifest(root, other)
+
+    def test_grouping_mismatch_refuses(self, cfg, tmp_path):
+        # path_grouping IS frozen (path shape): an explicit different value
+        # refuses; only ABSENT normalizes to 1.
+        root = str(tmp_path / "store")
+        grid = self._grid(cfg)
+        grouped = hive.build_manifest(grid)
+        grouped["path_grouping"] = 3
+        hive.ensure_manifest(root, grouped)
+        with pytest.raises(ValueError, match="does not match this run"):
+            hive.validate_manifest(root, hive.build_manifest(grid))
+
+    def test_aggregation_core_written_with_manifest(self, cfg, tmp_path):
+        import yaml as _yaml
+
+        from zagg.semantics import semantic_core
+
+        root = str(tmp_path / "store")
+        hive.ensure_manifest(root, hive.build_manifest(self._grid(cfg)), config=cfg)
+        payload = (tmp_path / "store" / hive.AGGREGATION_CORE_NAME).read_text()
+        assert _yaml.safe_load(payload) == semantic_core(cfg)
+        # Deterministic: a rewrite is byte-identical (sorted-key dump).
+        hive.write_semantic_core(root, cfg)
+        assert (tmp_path / "store" / hive.AGGREGATION_CORE_NAME).read_text() == payload
+
+    def test_aggregation_core_write_is_fail_open(self, cfg, monkeypatch, caplog):
+        import obstore
+
+        def boom(*a, **k):
+            raise OSError("no")
+
+        monkeypatch.setattr(obstore, "put", boom)
+        with caplog.at_level("WARNING"):
+            hive.write_semantic_core("/nonexistent-root-zzz", cfg)
+        assert any("fail-open" in r.message for r in caplog.records)
+
+    def test_append_spec_honors_existing(self, cfg):
+        manifest = hive.build_manifest(self._grid(cfg))
+        assert hive.append_spec(None, manifest) == manifest["spec"]
+        existing = dict(manifest, spec="morton-hive/2")
+        assert hive.append_spec(existing, manifest) == "morton-hive/2"
+
+
 class TestProductRoots:
     """D19 named product roots (issue #299 phase 2): additive — a product
     subtree is a complete, unmodified morton-hive store."""
@@ -1242,16 +1325,23 @@ class TestRunnerWiring:
         agg(cfg, catalog=catalog_path, store=root, backend="local")
 
         assert calls == [(shard, root)]
-        # The run wrote ONLY the manifest at the root — no shared zarr
-        # template (D5). The root coverage.moc (issue #200 phase 3,
-        # default-on for hive) is the only other root object, plus the
-        # successful shard's node dir carrying its stats sidecar (issue #297;
-        # the mocked worker wrote no leaf, so the node holds only stats.json).
+        # The run wrote ONLY root-level objects at the root — no shared zarr
+        # template (D5): the manifest, its aggregation.yaml semantic core
+        # (issue #299, D19 — rides the manifest write), the root coverage.moc
+        # (issue #200 phase 3, default-on for hive), plus the successful
+        # shard's node dir carrying its stats sidecar (issue #297; the mocked
+        # worker wrote no leaf, so the node holds only stats.json).
         listing = sorted(os.listdir(root))
         node = listing[0]
         parquets = [n for n in listing if n.startswith("stats_") and n.endswith(".parquet")]
         assert len(parquets) == 1  # run-level stats parquet (issue #297 phase 3)
-        assert listing == [node, hive.ROOT_COVERAGE_NAME, hive.MANIFEST_NAME, parquets[0]]
+        assert listing == [
+            node,
+            hive.AGGREGATION_CORE_NAME,
+            hive.ROOT_COVERAGE_NAME,
+            hive.MANIFEST_NAME,
+            parquets[0],
+        ]
         from zagg.telemetry import read_sidecar
 
         leaf = hive.shard_leaf_path(root, shard)

@@ -68,6 +68,7 @@ from zagg.processing import (
     write_ragged_to_zarr,
     write_shard_to_zarr,
 )
+from zagg.semantics import semantic_hash as _semantic_hash
 from zagg.store import open_object_store, open_store
 
 logger = logging.getLogger(__name__)
@@ -839,7 +840,12 @@ class RasterStrategy:
             manifest = build_manifest(
                 grid, dataset=catalog_data.get("metadata"), windowing=windowing
             )
-            ensure_manifest(store_path, manifest, overwrite=overwrite, **store_kwargs)
+            # The manifest IN EFFECT (an accepted existing one on append)
+            # keys the writers' naming spec (issue #299 spec-compat) and the
+            # D19 aggregation.yaml core rides the primary write.
+            manifest = ensure_manifest(
+                store_path, manifest, overwrite=overwrite, config=config, **store_kwargs
+            )
         else:
             zarr_store = open_store(store_path, **store_kwargs)
             emit_raster_template(zarr_store, grid, config, times_us, overwrite=overwrite)
@@ -954,7 +960,11 @@ class RasterStrategy:
                     leaf = shard_leaf_path(
                         store_path, int(shard_key), window=window["label"] if window else None
                     )
-                    write_sidecar(leaf, record, **store_kwargs)
+                    # Sidecar naming keys on the manifest spec IN EFFECT
+                    # (issue #299 spec-compat; the #307 seam).
+                    write_sidecar(
+                        leaf, record, spec=manifest["spec"] if manifest else None, **store_kwargs
+                    )
                 except Exception as e:
                     logger.warning(f"stats sidecar write failed (fail-open, issue #297): {e}")
             return meta, stage_stats, write_s
@@ -1000,7 +1010,9 @@ class RasterStrategy:
             # (D9), fail-open.
             from zagg.hive import ensure_manifest
 
-            ensure_manifest(store_path, manifest, overwrite=overwrite, **store_kwargs)
+            ensure_manifest(
+                store_path, manifest, overwrite=overwrite, config=config, **store_kwargs
+            )
             if get_coverage_moc(config):
                 from zagg.hive import build_root_coverage, write_root_coverage
                 from zagg.windows import union_time_range
@@ -2479,7 +2491,12 @@ def _run_local(
         # existing store refuses in ~0s, before any leaf write (D2), instead
         # of mixing new-order leaves into an old-order store.
         manifest = build_manifest(grid, dataset=catalog_data.get("metadata"), windowing=windowing)
-        ensure_manifest(store_path, manifest, overwrite=overwrite, **store_kwargs)
+        # Capture the manifest IN EFFECT (the accepted existing one on
+        # append): its spec keys the writers' naming calls (issue #299
+        # spec-compat), and the D19 aggregation.yaml core rides the write.
+        manifest = ensure_manifest(
+            store_path, manifest, overwrite=overwrite, config=config, **store_kwargs
+        )
         # Temporal fan-out (issue #246 phase 5): one work unit per (shard,
         # window). None (schedule none/absent) keeps the (shard, records)
         # pairs — dispatch byte-identical to pre-windowing runs.
@@ -2562,7 +2579,9 @@ def _run_local(
                     leaf = shard_leaf_path(
                         store_path, int(shard_key), window=window["label"] if window else None
                     )
-                    write_sidecar(leaf, record, **store_kwargs)
+                    # Sidecar naming keys on the manifest spec IN EFFECT
+                    # (issue #299 spec-compat; the #307 seam).
+                    write_sidecar(leaf, record, spec=manifest["spec"], **store_kwargs)
                 except Exception as e:
                     logger.warning(f"stats sidecar write failed (fail-open, issue #297): {e}")
             return {"shard_key": shard_key, "ok": True, "meta": meta}
