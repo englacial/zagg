@@ -169,6 +169,19 @@ class TestCanonicalization:
         b.data_source["read_plan"] = None
         assert semantic_hash(a) == semantic_hash(b)
 
+    def test_nested_null_values_drop_out(self):
+        # F2: an explicit null NESTED inside a semantic dict (YAML `value:`)
+        # hashes identically to the key being absent — pruning is recursive.
+        absent = _cfg()
+        absent.data_source["quality_filter"] = {"dataset": "/q"}
+        null_valued = _cfg()
+        null_valued.data_source["quality_filter"] = {"dataset": "/q", "value": None}
+        assert semantic_hash(null_valued) == semantic_hash(absent)
+        # ...but a real value (0 included) is content, not an absent key.
+        zero_valued = _cfg()
+        zero_valued.data_source["quality_filter"] = {"dataset": "/q", "value": 0}
+        assert semantic_hash(zero_valued) != semantic_hash(absent)
+
     def test_fingerprint_rejects_short_input(self):
         with pytest.raises(ValueError, match="not a semantic hash"):
             semantic_fingerprint("abc")
