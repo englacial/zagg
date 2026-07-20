@@ -399,6 +399,19 @@ class SubmapFamily(SweepFamily):
         return sub, timestamp
 
     def merge(self, payloads: list, *, node, order) -> dict:
+        """Fold child sub-maps into this node's rollup (§8.3).
+
+        Identity metadata (``collection``/``short_name``/``version``/
+        ``footprint``) is inherited from the first child payload
+        (``payloads[0]``); only ``total_granules`` is recomputed. The
+        one-store-per-product invariant (D7/D19: one product tree per semantic
+        core, one catalog family) makes those fields uniform across a node's
+        children by construction, so the first child is representative. A store
+        that accreted leaves from more than one catalog under one root would
+        need identity reconciliation this fold does not attempt (the rollup
+        would advertise one arbitrary child's identity). ``grid_signature`` is
+        safe regardless — all children of a node share ``child_order``.
+        """
         from zagg.catalog.shardmap import ShardMap
 
         # Same-key union first (several windows of one shard), deduplicated by
