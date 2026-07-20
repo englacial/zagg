@@ -3482,6 +3482,124 @@ class TestProfilePlumbing:
         assert captured["handoff"] == "pandas"
 
 
+class TestLambdaRunStatsDispatch:
+    """The spatial lambda path announces the dispatched run-record path
+    (issue #313): the PUT rides the worker invoke, so the summary carries the
+    pinned D20 key rather than a dispatcher-write result."""
+
+    def test_summary_carries_dispatched_path(self, monkeypatch, atl06_config):
+        summary = _run_lambda_with_durations(monkeypatch, atl06_config, [10.0, 11.0, 12.0, 13.0])
+        path = summary["run_stats_path"]
+        assert path.startswith("s3://out/x.zarr/stats_")
+        assert path.endswith(".parquet")
+
+
+class TestDispatchRunStats:
+    """The issue #313 D8 transport seam: the run-record PUT rides a
+    fire-and-forget mode="stats" worker invoke; transport is size-gated."""
+
+    class _Client:
+        def __init__(self, raise_on_invoke=False):
+            self.events = []
+            self._raise = raise_on_invoke
+
+        def invoke(self, **kwargs):
+            if self._raise:
+                raise RuntimeError("invoke down")
+            self.events.append(json.loads(kwargs["Payload"]))
+            assert kwargs["InvocationType"] == "Event"
+            return {}
+
+    @staticmethod
+    def _rows(n_ok=2, n_fail=1):
+        from zagg.telemetry import build_record, failure_record, flatten_record
+
+        rows = [
+            flatten_record(build_record(shard_key=i, metadata={"duration_s": 1.0}))
+            for i in range(n_ok)
+        ]
+        rows += [
+            flatten_record(failure_record(shard_key=100 + i, error="boom")) for i in range(n_fail)
+        ]
+        return rows
+
+    def test_inline_transport(self):
+        from zagg import runner
+
+        client = self._Client()
+        summary = {}
+        path = runner._dispatch_run_stats(
+            client,
+            "fn",
+            "s3://b/out.zarr",
+            self._rows(),
+            run_id="rid",
+            result_prefix="s3://b/out.zarr.status/rid",
+            output_creds_event={"accessKeyId": "a", "secretAccessKey": "s"},
+            summary=summary,
+        )
+        (event,) = client.events
+        assert event["mode"] == "stats" and event["run_id"] == "rid"
+        assert len(event["rows"]) == 3 and "rows_from" not in event
+        assert event["output_credentials"]["accessKeyId"] == "a"
+        # The announced path is the pinned D20 key (timestamp-first).
+        assert path == f"s3://b/out.zarr/stats_{event['timestamp']}_rid.parquet"
+        assert summary["run_stats_path"] == path
+
+    def test_pointer_transport_keeps_failures_inline(self, monkeypatch):
+        from zagg import runner
+
+        # Small enough that six rows overflow, one failure row still fits.
+        monkeypatch.setattr(runner, "_RUN_STATS_INLINE_CAP_BYTES", 2048)
+        client = self._Client()
+        path = runner._dispatch_run_stats(
+            client,
+            "fn",
+            "s3://b/out.zarr",
+            self._rows(n_ok=5, n_fail=1),
+            run_id="rid",
+            result_prefix="s3://b/out.zarr.status/rid",
+        )
+        (event,) = client.events
+        assert event["rows_from"] == "s3://b/out.zarr.status/rid"
+        # Only the failure row rides inline (no envelope exists for it).
+        assert [r["success"] for r in event["rows"]] == [False]
+        assert path is not None
+
+    def test_oversized_sync_run_skips_fail_open(self, monkeypatch):
+        from zagg import runner
+
+        monkeypatch.setattr(runner, "_RUN_STATS_INLINE_CAP_BYTES", 8)
+        client = self._Client()
+        summary = {}
+        path = runner._dispatch_run_stats(
+            client, "fn", "s3://b/out.zarr", self._rows(), run_id="rid", summary=summary
+        )
+        assert path is None and client.events == []
+        assert summary["run_stats_path"] is None
+
+    def test_invoke_failure_is_fail_open(self):
+        from zagg import runner
+
+        summary = {}
+        path = runner._dispatch_run_stats(
+            self._Client(raise_on_invoke=True),
+            "fn",
+            "s3://b/out.zarr",
+            self._rows(),
+            run_id="rid",
+            summary=summary,
+        )
+        assert path is None and summary["run_stats_path"] is None
+
+    def test_empty_rows_no_invoke(self):
+        from zagg import runner
+
+        client = self._Client()
+        assert runner._dispatch_run_stats(client, "fn", "s3://b/x", [], run_id="r") is None
+        assert client.events == []
+
+
 class TestRunStatsRows:
     """Run-parquet row building from lambda dispatch results (issue #297)."""
 

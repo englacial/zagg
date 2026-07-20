@@ -1427,11 +1427,15 @@ class RasterStrategy:
             )
             for key, error, body in stats_failures
         ]
-        run_stats_path = _write_run_stats(
+        # D8 worker-invoke transport (issue #313): mirrors the spatial path.
+        run_stats_path = _dispatch_run_stats(
+            client,
+            function_name,
             store_path,
             rows,
             run_id=run_id,
-            store_kwargs=_output_store_kwargs(output_creds_event, region),
+            result_prefix=result_prefix,
+            output_creds_event=output_creds_event,
         )
         if cells and errors == len(cells):
             raise RuntimeError(f"all {errors} raster shard(s) failed; last error: {last_error}")
@@ -2217,6 +2221,84 @@ def _write_run_stats(store_path, rows, *, run_id, store_kwargs, summary=None) ->
         return path
     except Exception as e:
         logger.warning(f"run stats parquet write failed (fail-open, issue #297): {e}")
+        return None
+
+
+def _dispatch_run_stats(
+    lambda_client,
+    function_name,
+    store_path,
+    rows,
+    *,
+    run_id,
+    result_prefix=None,
+    output_creds_event=None,
+    summary=None,
+) -> str | None:
+    """Fire-and-forget worker-invoke run-record write (issue #313, D8).
+
+    The Lambda-path twin of :func:`_write_run_stats`: the orchestrator has no
+    S3 write access (D8 — the invariant that keeps every store write behind
+    worker-role prefix grants), so the parquet PUT rides a ``mode="stats"``
+    Event invoke exactly like the root ``coverage.moc``. Transport is
+    size-gated (the seam the PR #315 body describes): rows inline under
+    :data:`_RUN_STATS_INLINE_CAP_BYTES`; above it the run's async status
+    prefix is sent as a pointer (``rows_from``) with only the failure rows
+    inline (no envelope exists to assemble them from); an oversized SYNC run
+    (no prefix) logs a fail-open skip. The D20 object key is pinned here
+    (``timestamp`` rides the event), so the returned/announced
+    ``run_stats_path`` names the real object — best-effort: the invoke is
+    fire-and-forget, mirroring the root MOC's semantics. Fail-open
+    everywhere: telemetry must never fail a run whose data landed.
+    """
+    from datetime import datetime, timezone
+
+    from zagg.telemetry import run_parquet_key
+
+    if summary is not None:
+        summary["run_stats_path"] = None
+    if not rows:
+        return None
+    try:
+        timestamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+        event = {
+            "mode": "stats",
+            "store_path": store_path,
+            "run_id": run_id,
+            "timestamp": timestamp,
+        }
+        if output_creds_event is not None:
+            event["output_credentials"] = output_creds_event
+        if len(json.dumps(rows)) <= _RUN_STATS_INLINE_CAP_BYTES:
+            event["rows"] = rows
+        elif result_prefix is not None:
+            failures = [r for r in rows if not r.get("success")]
+            if len(json.dumps(failures)) > _RUN_STATS_INLINE_CAP_BYTES:
+                logger.warning(
+                    f"run stats failure rows alone exceed the inline budget "
+                    f"({len(failures)} rows); skipping run record (fail-open, issue #313)"
+                )
+                return None
+            event["rows"] = failures
+            event["rows_from"] = result_prefix
+        else:
+            logger.warning(
+                f"run stats rows ({len(rows)}) exceed the async payload budget and this "
+                f"sync run has no status prefix to point at; skipping (fail-open, issue #313)"
+            )
+            return None
+        lambda_client.invoke(
+            FunctionName=function_name,
+            InvocationType="Event",
+            Payload=json.dumps(event),
+        )
+        path = f"{store_path.rstrip('/')}/{run_parquet_key(run_id, timestamp)}"
+        if summary is not None:
+            summary["run_stats_path"] = path
+        logger.info(f"Dispatched run stats write ({len(rows)} rows, fire-and-forget): {path}")
+        return path
+    except Exception as e:
+        logger.warning(f"run stats dispatch failed (fail-open, issue #313): {e}")
         return None
 
 
@@ -3319,14 +3401,19 @@ def _run_lambda(
     }
     if profile:
         summary["worker_phase_max"] = worker_phase_max
-    # Run-level stats parquet (issue #297 phase 3): success rows straight off
-    # the async result envelopes (no second S3 listing), failure rows from the
-    # dispatch results the RunReport accumulated.
-    _write_run_stats(
+    # Run-level stats parquet (issue #297 phase 3; D8 worker-invoke transport,
+    # issue #313): success rows straight off the async result envelopes,
+    # failure rows from the dispatch results the RunReport accumulated. The
+    # PUT itself rides a fire-and-forget worker invoke — the dispatcher may
+    # hold an invoke-only role with no S3 write access.
+    _dispatch_run_stats(
+        state["lambda_client"],
+        function_name,
         store_path,
         _lambda_result_rows(report.results, run_id=run_id),
         run_id=run_id,
-        store_kwargs=_output_store_kwargs(output_creds_event, region),
+        result_prefix=result_prefix,
+        output_creds_event=output_creds_event,
         summary=summary,
     )
     logger.info(
@@ -3464,6 +3551,12 @@ _MANIFEST_CHECK_JOIN_TIMEOUT_S = 30.0
 # Lambda's raw RequestEntityTooLargeException does; the realistic trigger is a
 # large strict-AOI ``aoi_payload`` (issue #101).
 _ASYNC_PAYLOAD_CAP_BYTES = 250 * 1024
+
+#: Inline-rows budget for the mode="stats" run-record invoke (issue #313):
+#: the Event cap above minus ~50 KB headroom for the rest of the event
+#: (credentials block, paths). Above this the dispatcher sends the status
+#: prefix pointer instead (failure rows stay inline — they have no envelope).
+_RUN_STATS_INLINE_CAP_BYTES = 200 * 1024
 
 # The result poller owns its retrying at the loop level (a fetch every
 # _ASYNC_POLL_INTERVAL_S until the deadline), so its store gets a short
