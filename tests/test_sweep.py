@@ -719,6 +719,40 @@ class TestDiscoverLeaves:
         refs = discover_leaves(str(tmp_path))
         assert refs == [(morton_word("-311"), "2019"), (morton_word("-311"), "2020")]
 
+    def test_mixed_deployment_pre_and_post_column_records_union(self, tmp_path):
+        # Mixed deployment: one post-#300 record names window "2019" for a
+        # shard, and a pre-column record touches the SAME shard whose node also
+        # holds window "2020"'s sidecar. The fallback node LIST must fire even
+        # though "2019" already named the shard — the subtraction that skipped
+        # already-seen keys dropped "2020". LIST + set dedup is idempotent.
+        import pandas as pd
+
+        from zagg.sweep import discover_leaves
+
+        _write_manifest(tmp_path)
+        manifest = json.loads((tmp_path / MANIFEST_NAME).read_text())
+        manifest["spec"] = "morton-hive/2"
+        manifest["temporal"] = {"schedule": "yearly", "time_field": "t"}
+        (tmp_path / MANIFEST_NAME).write_text(json.dumps(manifest))
+        # Post-column record: names window "2019" for shard -311.
+        _run_record(tmp_path, [_row("-311", window="2019")], run_id="new1")
+        # Pre-column record for the same shard: no window column at all.
+        row = _row("-311", window="2020")
+        row.pop("window")
+        df = pd.DataFrame([row])
+        df["shard_key"] = pd.array([morton_word("-311")], dtype="UInt64")
+        df.to_parquet(
+            tmp_path / "stats_20260101T000000Z_old3.parquet",
+            engine="fastparquet",
+            index=False,
+            object_encoding="utf8",
+        )
+        # The node holds BOTH windows' sidecars; only "2020" needs the fallback.
+        _put_leaf(tmp_path, "-311", window="2019")
+        _put_leaf(tmp_path, "-311", window="2020")
+        refs = discover_leaves(str(tmp_path))
+        assert refs == [(morton_word("-311"), "2019"), (morton_word("-311"), "2020")]
+
     def test_inexact_float_keys_skipped_with_warning(self, tmp_path, caplog):
         import pandas as pd
 

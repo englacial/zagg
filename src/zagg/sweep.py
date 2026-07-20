@@ -851,9 +851,12 @@ def discover_leaves(store_root: str, *, store_kwargs: dict | None = None) -> lis
     ``stats_*.parquet`` run records (both the timestamp-first D20 names and
     the older ``stats_{run_id}_{ts}`` form); their success rows give the work
     set — discovery is from run records, never a tree enumeration. Windowed
-    leaves resolve through the records' ``window`` column; rows from
-    pre-column records on a windowed store fall back to one delimiter LIST of
-    that shard's node (bounded by the run-record shard set). Rows whose
+    leaves resolve through the records' ``window`` column; every shard that
+    contributed a pre-column (window-less) row on a windowed store falls back
+    to one delimiter LIST of that shard's node — regardless of whether some
+    other record already named one of its windows, since the LIST + set dedup
+    is idempotent and a mixed-deployment store can hold a window only the
+    sidecar knows about (bounded by the run-record shard set). Rows whose
     ``shard_key`` came back float-typed (pre-fix parquets mixing keys with
     failure-row nulls) are skipped past 2^53 with a warning — those keys are
     inexact by construction; :func:`zagg.telemetry.write_run_parquet` now
@@ -922,10 +925,13 @@ def discover_leaves(store_root: str, *, store_kwargs: dict | None = None) -> lis
                 refs.add((key, None))
     # Pre-``window``-column records on a windowed store: the row can't name
     # its leaf, so resolve each shard's windows with ONE delimiter LIST of its
-    # node — scoped by the run-record shard set, never a tree walk.
+    # node — scoped by the run-record shard set, never a tree walk. Every
+    # pre-column shard is LISTed even if another record already named one of
+    # its windows: the LIST + set dedup is idempotent, and on a mixed
+    # deployment the sidecar can hold a window no post-column record names.
     from zagg.grids.morton import morton_decimal
 
-    for key in sorted(fallback_keys - {k for k, _w in refs}):
+    for key in sorted(fallback_keys):
         node_listing = obstore.list_with_delimiter(store, _node_rel(morton_decimal(key)) + "/")
         for obj in node_listing["objects"]:
             window = _sidecar_window(obj["path"].rsplit("/", 1)[-1], spec)
