@@ -5,7 +5,7 @@ temporal-partitioning amendments (D13–D15) ratified on
 [#237](https://github.com/englacial/zagg/issues/237); morton-only-storage
 amendment ratified on
 [#262](https://github.com/englacial/zagg/issues/262) (D16; open item O10
-carved from it); 2026-07 consolidation (D17–D22, O3 resolved, O11 opened)
+carved from it); 2026-07 consolidation (D17–D23, O3 resolved, O11 opened)
 recording decisions settled on the
 [#251](https://github.com/englacial/zagg/issues/251)/[#236](https://github.com/englacial/zagg/issues/236)/[#209](https://github.com/englacial/zagg/issues/209)
 and [#296](https://github.com/englacial/zagg/issues/296)-family threads —
@@ -64,12 +64,14 @@ what zagg consumes:
     <run records (parquet)>      <- run-level telemetry, one row/shard (D20)
     {sign+base}/{d1}/{d2}/.../   <- one digit per level (D2; digit-chunking is
                                     the manifest path_grouping param, D21)
-      {full_id}.zarr/            <- self-describing leaf (D3), zarr v3; dense
-                                    arrays via ShardingCodec (D17)
-      {full_id}_{window}.zarr/   <- time-windowed leaf (D13); naming frozen on
-                                    the mortie spec page (morton-hive/2)
-      stats.json                 <- per-shard stats sidecar, sibling (D20;
-                                    stats_{window}.json for windowed leaves)
+      {window}.zarr/             <- leaf, basename = time window (D23,
+                                    morton-hive/3); `all.zarr` for
+                                    schedule: none (reserved token — lean).
+                                    /1–/2 stores keep {full_id}.zarr and
+                                    {full_id}_{window}.zarr (D3/D13)
+      {window}.stats.json        <- per-shard stats sidecar, sibling (D20,
+                                    naming aligned by D23; all.stats.json
+                                    for the degenerate case)
       <sub-shardmap JSON>        <- leaf sub-map for sweep rollups (D22)
 ```
 
@@ -90,8 +92,10 @@ bare store; `{hash}.yaml` entries ⇒ product directory).
 - **Full morton id at the leaf** (D3): `.../1/2/3/-31123.zarr/` is
   self-describing without parsing its path, greppable in inventories,
   unambiguous if moved. (Unchanged by D19 — product identity lives at the
-  product *root*, above the tree, so leaf naming and the within-product
-  walk semantics survive untouched.)
+  product *root*, above the tree. *Superseded by D23 for `morton-hive/3`
+  stores*: the basename becomes the time window; the full id stays
+  recoverable from the path arithmetically and from the stamp/sidecar
+  `shard_key`.)
 - **Time-windowed leaves** (D13, ratified on
   [#237](https://github.com/englacial/zagg/issues/237)): a store whose
   manifest declares a temporal window schedule (§3) partitions each shard's
@@ -112,7 +116,8 @@ bare store; `{hash}.yaml` entries ⇒ product directory).
   schedule lives in the manifest (D10 preserved). The no-partitioning
   degenerate case (`schedule: none`) keeps the bare `{full_id}.zarr` name and
   is byte-identical to the pre-D13 layout — a `morton-hive/1` store *is* a
-  `/2` store with `schedule: none`.
+  `/2` store with `schedule: none`. (Leaf *naming* is revised by D23 for
+  `morton-hive/3` stores; the windowing semantics here are unchanged.)
 - **Node invariant**: below a product root, a node contains *only* digit
   children (`[1-4]/`), `*.zarr` objects, and the declared leaf-adjacent
   sidecars — the per-shard stats record (D20) and the sub-shardmap JSON
@@ -177,7 +182,8 @@ again during a run. Contents:
 - **Temporal block** (D15, ratified on
   [#237](https://github.com/englacial/zagg/issues/237)): a store carrying this
   block declares `spec: "morton-hive/2"` (the version string of D6 covers these
-  temporal/windowed-leaf extensions). It records time
+  temporal/windowed-leaf extensions; `/3` = the same semantics under D23
+  window-only leaf naming). It records time
   encoding/units/epoch/calendar, the membership timestamp field, the **window
   schedule** (`none` | `yearly` | `monthly` | `daily` | explicit range list;
   `quarterly` grammar-reserved), and the append policy. Label grammar and
@@ -474,7 +480,9 @@ rollup leaves all leaf reads intact.
   — grammar and boundary semantics recorded on the
   [mortie spec page](https://github.com/espg/mortie/issues/62#issuecomment-4986809092)
   as part of `morton-hive/2`. (Unchanged by D19 — leaf naming survives the
-  product-root design intact.) Reserved (lean, not decided): §7
+  product-root design intact. *Naming revised by D23 for `morton-hive/3`*:
+  the basename becomes the window alone; the `/2` grammar stays frozen for
+  `/2` stores.) Reserved (lean, not decided): §7
   overview/pyramid zarrs inherit window naming (per-window overviews, with
   an optional all-time overview as a derived artifact).
 - **D14 — Coverage `encoding: "full"` fast path**
@@ -669,6 +677,36 @@ rollup leaves all leaf reads intact.
   direction of `ShardMap.reproject` and its no-region semantics are still
   under review on PR #295 — the sweep depends only on the exact coarsen
   direction.)
+- **D23 — Leaf basename = time window (`{window}.zarr`), `morton-hive/3`**
+  (espg-proposed and ratified in-session, 2026-07-20; recorded here and on
+  the PR #306 thread). Completes the axis separation D19 began: product =
+  root prefix (D19), space = digit path (D1/D2), **time = basename** —
+  each identity axis in exactly one place, none encoded twice. This
+  removes the last path/basename redundancy (the #296 observation that
+  started the naming work, applied to its final instance): the morton id
+  currently appears in both the path and the leaf name. Listing a shard
+  node returns the temporal inventory directly (`2019.zarr`,
+  `2020.zarr`, …) — what append planning and time-series discovery
+  actually ask. Spec bump to `morton-hive/3` under D6 versioning: `/1`
+  and `/2` stores remain valid forever under their frozen grammars;
+  readers discriminate by the manifest `spec` string; the `/3` grammar is
+  to be re-frozen on the mortie spec page
+  ([mortie#62](https://github.com/espg/mortie/issues/62)). Costs accepted
+  with the decision: the name==path self-check moves to the stamp attrs /
+  D20 sidecar `shard_key` (an fsck pays one GET per leaf); D3's
+  "unambiguous if moved" softens to "recoverable from attrs" — the moved
+  case reduces to a downloader that materializes the prefix tree into
+  folder names (espg-noted in-session). **Leans recorded, not ratified**:
+  the `schedule: none` reserved token — proposal `all.zarr` (reads as
+  all-time; cannot collide with the digit-shaped window grammar;
+  `none.zarr` matches the schedule literal but reads worse) — and the
+  sidecar alignment `{window}.stats.json` / `all.stats.json` (D20
+  naming; follow-up to the merged PR #302). Rejected alternative: time
+  as a *path* level (`{hash}/{window}/{morton…}`) would make
+  window-scoped ops prefix-cheap but duplicates the morton tree per
+  window and shatters the dominant read — a time series at a location —
+  across W prefixes; reads dominate window expiry, so time stays at the
+  leaf.
 
 ### 8.2 Open for review (input needed)
 
