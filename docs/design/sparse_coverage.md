@@ -4,10 +4,13 @@
 temporal-partitioning amendments (D13–D15) ratified on
 [#237](https://github.com/englacial/zagg/issues/237); morton-only-storage
 amendment ratified on
-[#262](https://github.com/englacial/zagg/issues/262) (D16; open item O10
-carved from it); 2026-07 consolidation (D17–D24; O3/O11 resolved, O8
+[#262](https://github.com/englacial/zagg/issues/262) (D16; O10 carved from
+it, resolved via [#305](https://github.com/englacial/zagg/issues/305));
+2026-07 consolidation (D17–D24; O3/O10/O11 resolved, O8
 constants blessed, O12–O14 opened, D23 tokens ratified, §8.3
-test-obligations index added)
+test-obligations index added; normative grammars/constants relocated to the
+[mortie spec page](https://github.com/espg/mortie/blob/main/docs/specification.md)
+per the #305 acceptance criterion)
 recording decisions settled on the
 [#251](https://github.com/englacial/zagg/issues/251)/[#236](https://github.com/englacial/zagg/issues/236)/[#209](https://github.com/englacial/zagg/issues/209)
 and [#296](https://github.com/englacial/zagg/issues/296)-family threads —
@@ -54,7 +57,11 @@ artifacts.
 
 The layout convention is **owned by the mortie spec** (the frozen 1.x
 contract: [mortie #48](https://github.com/espg/mortie/issues/48) discussion →
-[mortie #62](https://github.com/espg/mortie/issues/62) spec page). Summary of
+[mortie #62](https://github.com/espg/mortie/issues/62) →
+[`docs/specification.md`](https://github.com/espg/mortie/blob/main/docs/specification.md),
+the normative page). Grammars and constants are normative **there only**;
+this registry records decisions and rationale and cites the page (the #305
+acceptance criterion — duplicated normative text drifts). Summary of
 what zagg consumes:
 
 ```
@@ -224,7 +231,9 @@ again during a run. Contents:
   `quarterly` grammar-reserved), and the append policy. Label grammar and
   boundary semantics (UTC calendar terms, half-open `[start, end)`,
   lexicographic = chronological) are frozen on the
-  [mortie spec page](https://github.com/espg/mortie/issues/62#issuecomment-4986809092).
+  [mortie spec page §6.3](https://github.com/espg/mortie/blob/main/docs/specification.md)
+  (consolidated there from the
+  [original #62 thread record](https://github.com/espg/mortie/issues/62#issuecomment-4986809092)).
   Generative schedules keep the manifest
   write-once and static as data accrues: appending a new year to a
   `yearly` store adds leaves the schedule already describes — no manifest
@@ -519,8 +528,10 @@ rollup leaves all leaf reads intact.
   per-year 88S runs, seasonal subsets, and append-as-acquired are all
   window leaves under the same convention. Leaf naming is **frozen**:
   `{full_id}_{window}.zarr`, underscore separator, split on the first `_`
-  — grammar and boundary semantics recorded on the
-  [mortie spec page](https://github.com/espg/mortie/issues/62#issuecomment-4986809092)
+  — grammar and boundary semantics normative on the
+  [mortie spec page §6.3](https://github.com/espg/mortie/blob/main/docs/specification.md)
+  (originally recorded on the
+  [#62 thread](https://github.com/espg/mortie/issues/62#issuecomment-4986809092))
   as part of `morton-hive/2`. (Unchanged by D19 — leaf naming survives the
   product-root design intact. *Naming revised by D23 for `morton-hive/3`*:
   the basename becomes the window alone; the `/2` grammar stays frozen for
@@ -579,7 +590,8 @@ rollup leaves all leaf reads intact.
   (An earlier plan bundled the flip with a #299 leaf-basename rename;
   D19's product-root revision made #299 additive, so this writer flip is
   the one remaining breaking store change in this family.) The order-29
-  discriminator metadata is O10.
+  discriminator metadata is O10 (resolved: `resolution: "exact" | "point"`,
+  clip rule `point`-only — see the O10 entry).
 
 - **D17 — Hive+sharded is the HEALPix default; flat/fullsphere deprecated;
   dense leaf arrays write through the ShardingCodec.**
@@ -688,8 +700,9 @@ rollup leaves all leaf reads intact.
   ergonomics (the full digest is what is compared; a short fingerprint —
   12 hex — is the display/CLI shorthand); and product names are
   **URL-safe by requirement** (they appear in gridlook deep-links and web
-  paths — proposed charset: lowercase alphanumerics plus `-`/`_`, frozen
-  with the name grammar on the mortie spec page).
+  paths — charset lowercase alphanumerics plus `-`/`_`, with the
+  base-component exclusion; the grammar is normative on the
+  [mortie spec page §6.5](https://github.com/espg/mortie/blob/main/docs/specification.md)).
 - **D20 — Per-shard telemetry sidecar + run records** (espg on-thread:
   [sibling placement + envelope ride](https://github.com/englacial/zagg/issues/297#issuecomment-5016910923),
   [caller identity](https://github.com/englacial/zagg/issues/297#issuecomment-5016901381);
@@ -765,8 +778,9 @@ rollup leaves all leaf reads intact.
   actually ask. Spec bump to `morton-hive/3` under D6 versioning: `/1`
   and `/2` stores remain valid forever under their frozen grammars;
   readers discriminate by the manifest `spec` string; the `/3` grammar is
-  to be re-frozen on the mortie spec page
-  ([mortie#62](https://github.com/espg/mortie/issues/62)). Costs accepted
+  frozen on the
+  [mortie spec page §6.4](https://github.com/espg/mortie/blob/main/docs/specification.md)
+  (mortie#62, drafted via espg/mortie PR #118). Costs accepted
   with the decision: the name==path self-check moves to the stamp attrs /
   D20 sidecar `shard_key` (an fsck pays one GET per leaf); D3's
   "unambiguous if moved" softens to "recoverable from attrs" — the moved
@@ -888,13 +902,15 @@ rollup leaves all leaf reads intact.
   Stamp attrs carry only the tier-0 box + the bitmap's order + pointer +
   byte sizes; pad sentinel is JSON null; the envelope gains an
   `encoding: "ranges" | "bitmap"` discriminator (later extended by D14 to add
-  a third value, `"full"`). Bit convention (frozen
-  with the mortie spec, golden-vector-pinned on PR #208): bit i = the i-th
+  a third value, `"full"`). Bit convention (normative on the
+  [mortie spec page §7](https://github.com/espg/mortie/blob/main/docs/specification.md),
+  golden-vector-pinned on PR #208): bit i = the i-th
   shard-subtree cell in ascending packed-word order (base-4 D1 digit tail,
   digits 1..4 → 0..3), MSB-first per byte. *Addendum (espg-blessed
   in-session, 2026-07-20 — closing the #276 item-5 flag)*: the PR #208
   contract constants stand as-shipped — the bitmap bit convention and the
-  root-MOC range ordering are **contract** (both golden-vector-pinned);
+  root-MOC range ordering are **contract** (both golden-vector-pinned;
+  spec page §7.2–§7.3);
   zstd level 3 is **non-normative** (any zstd level decodes identically;
   only "zstd stream" is contract).
 - **O9 — end-of-run root MOC default**: **RESOLVED — on** for hive stores
@@ -904,16 +920,36 @@ rollup leaves all leaf reads intact.
   true rejected elsewhere). The write is fail-open on both backends; the
   Lambda leg is one fire-and-forget `mode: "coverage"` Event invoke with the
   pre-serialized ranges envelope.
-- **O10 — order-29 resolution discriminator** (carved from D16): two
-  order-29 encodings exist — (a) genuinely order-29 resolution, and (b)
-  unknown resolution point-encoded at order 29, the default for any raw
-  lat/lon conversion and expected to be common. Readers need declared
-  metadata to tell them apart, because the D16 clip rule (29→24) applies
-  only to (b). Proposal: `resolution: "exact" | "point"` in the dggs attrs
-  block, defaulting to `"point"` for raw conversions. Intersects mortie's
-  documented point-id/area-word parse non-injectivity at order 29; field
-  name, values, and placement to be frozen with the mortie spec page
-  ([mortie#62](https://github.com/espg/mortie/issues/62)).
+- **O10 — order-29 resolution discriminator: RESOLVED — `resolution:
+  "exact" | "point"` in the dggs attrs block** (espg-ratified in-session,
+  2026-07-21; carved from D16; ruling recorded on
+  [#305](https://github.com/englacial/zagg/issues/305#issuecomment-5025784723)).
+  Two order-29 encodings exist — (a) genuinely order-29 resolution, and
+  (b) unknown resolution point-encoded at order 29, the default for any
+  raw lat/lon conversion — and readers need declared metadata to tell
+  them apart, because the D16 clip rule (29→24) applies only to (b).
+  Ruling: emission is **per data kind and the writer always knows
+  which** — grid-derived cell coordinates are `exact` **by construction**
+  (all zagg aggregation outputs); location-derived id fields (order-29
+  ids from raw lat/lon — the temporal event path, future HHDC) are
+  `point`. There is **no heuristic default**: the issue-body's "default
+  `point` for raw conversions" was refined away — a writer either
+  produces grid cells (`exact`) or converts raw coordinates (`point`),
+  never guesses. The clip rule keys only on the declared field.
+  Intersects mortie's documented point-id/area-word parse non-injectivity
+  at order 29; field name, values, placement, and the clip rule's
+  point-only scope are frozen normatively on the
+  [mortie spec page §4–§5](https://github.com/espg/mortie/blob/main/docs/specification.md)
+  (mortie#62, drafted via espg/mortie PR #118). Implementation:
+  `RESOLUTION_EXACT`/`RESOLUTION_POINT` in `zagg.grids.morton` (the
+  importable seam for future `point` writers) and the `resolution` field
+  in `HealpixGrid._dggs_attrs`. The companion identity ruling (same
+  session): morton-declared stores carry a **self-declared convention
+  UUID** — minted once, permanent, normative value on the mortie spec
+  page §5 (`MORTON_CONVENTION` in `zagg.grids.morton`) — while the
+  upstream dggs-registry ask
+  ([#72](https://github.com/englacial/zagg/issues/72) ask 3) proceeds in
+  parallel; the conventions attrs are a list, so both entries coexist.
 - **O11 — logical content hash of outputs: RESOLVED — adopted as
   proposed** (espg-ratified in-session, 2026-07-20; carved from D19,
   discussion trail on
