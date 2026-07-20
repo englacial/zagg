@@ -16,7 +16,7 @@ from zagg.grids import HealpixGrid
 from zagg.grids.morton import morton_word
 from zagg.semantics import semantic_hash
 from zagg.store import open_store
-from zagg.telemetry import build_record, write_sidecar
+from zagg.telemetry import build_record, sidecar_key, write_sidecar
 
 WORD = morton_word("1121121")  # order-6 shard key
 GRANULES = ["s3://b/g1.h5", "s3://b/g2.h5"]
@@ -156,3 +156,30 @@ class TestHasRun:
         out = has_run(str(tmp_path), cfg, [WORD, other])
         assert out[WORD]["status"] == "hit"
         assert out[other]["status"] == "miss"
+
+    def test_windowed_leaf_status(self, tmp_path):
+        # A windowed store (issue #246): the (shard, window) leaf carries its
+        # own legacy `stats_{window}.json` sidecar (spec=None), and has_run must
+        # key on the window so a hit for one window is a miss for another.
+        cfg = _cfg()
+        root = str(tmp_path)
+        leaf = hive.shard_leaf_path(root, WORD, window="2025")
+        assert sidecar_key(leaf.rstrip("/").rsplit("/", 1)[-1]) == "stats_2025.json"
+        store = open_store(leaf)
+        _grid(cfg).emit_shard_template(store, overwrite=True)
+        group = zarr.open_group(store, path="", mode="a", zarr_format=3)
+        group.attrs[hive.COMMIT_ATTR] = {"cells_with_data": 1}
+        write_sidecar(
+            leaf,
+            build_record(
+                shard_key=WORD,
+                metadata={"total_obs": 2, "cells_with_data": 1, "duration_s": 0.1},
+                granule_ids=GRANULES,
+                semantic_hash=semantic_hash(cfg),
+            ),
+        )
+        hit = has_run(root, cfg, {WORD: GRANULES}, window="2025")
+        assert hit[WORD]["status"] == "hit"
+        # A different window has no leaf: a plain miss (windows are disjoint).
+        miss = has_run(root, cfg, {WORD: GRANULES}, window="2024")
+        assert miss[WORD]["status"] == "miss"
