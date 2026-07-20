@@ -20,8 +20,16 @@ Every rollup is stamped with **generation info** — merged-leaf count + max
 leaf timestamp (D22) — making staleness *detectable, not prevented*: a leaf
 re-run bumps its artifact timestamp past every earlier stamp, so ancestors'
 stored generations no longer match and the next sweep rewrites exactly that
-chain (skip-if-current elsewhere keeps the pass idempotent: a second sweep
-over an unchanged tree PUTs nothing).
+chain. Skip-if-current is a **two-part test**: the generation stamp is the
+fast path (a matching count + max timestamp), backstopped by a
+**payload-equality** check for same-second rewrites. Both timestamp sources
+resolve to whole seconds (``timespec="seconds"``), so a leaf re-run within one
+wall-clock second carries an unchanged stamp; every node therefore recomputes
+its merged payload BEFORE the skip decision and PUTs whenever the stored
+payload differs, so a same-second content change still rewrites the whole
+chain (shard nodes re-read their leaf sidecars each pass; interior nodes fold
+the freshly computed child payloads, so the rewrite cascades up). A second
+sweep over an unchanged tree recomputes but PUTs nothing.
 
 Rollup objects are JSON sidecars at digit nodes, named ``{family}.rollup.json``
 — deliberately DISTINCT from the leaf sidecar names (``stats.json`` /
@@ -285,8 +293,10 @@ def run_sweep(store_root: str, leaves, *, families=None, store_kwargs: dict | No
     unsupported this round, matching ``refresh_root_coverage``).
 
     Idempotent: a rollup whose stored generation (merged-leaf count + max
-    leaf timestamp) matches the freshly computed one is left untouched, so a
-    second pass over an unchanged tree writes nothing. Returns a summary with
+    leaf timestamp) AND stored payload both match the freshly computed ones is
+    left untouched, so a second pass over an unchanged tree writes nothing; the
+    payload compare is the same-second backstop the generation stamp cannot see
+    (module docstring). Returns a summary with
     per-family ``written`` / ``current`` (skip-if-current) / ``empty`` (no
     artifact found) / ``failed`` (unmergeable, logged) counts.
     """
@@ -398,12 +408,16 @@ def _rollup_shard_node(
         counts["empty"] += 1
         return None
     generation = _generation(len(parts), [ts for _w, _p, ts in parts])
-    if existing is not None and existing.get("generation") == generation:
-        counts["current"] += 1
-        return existing
     payload = _merged(fam, [p for _w, p, _ts in parts], decimal, counts)
     if payload is None:
         return None
+    if (
+        existing is not None
+        and existing.get("generation") == generation
+        and existing.get("payload") == payload
+    ):
+        counts["current"] += 1
+        return existing
     envelope = {
         "spec": SWEEP_SPEC,
         "family": fam.name,
@@ -443,12 +457,16 @@ def _rollup_interior(store, fam, node, computed, counts) -> dict | None:
         [a["generation"].get("max_leaf_timestamp") for a in children],
     )
     existing = _read_rollup(store, fam, node)
-    if existing is not None and existing.get("generation") == generation:
-        counts["current"] += 1
-        return existing
     payload = _merged(fam, [a["payload"] for a in children], node, counts)
     if payload is None:
         return None
+    if (
+        existing is not None
+        and existing.get("generation") == generation
+        and existing.get("payload") == payload
+    ):
+        counts["current"] += 1
+        return existing
     envelope = {
         "spec": SWEEP_SPEC,
         "family": fam.name,
