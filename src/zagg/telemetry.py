@@ -27,7 +27,7 @@ import platform
 from datetime import datetime, timezone
 from typing import Any, Iterable
 
-from zagg.dispatch import LAMBDA_PRICE_PER_GB_SEC
+from zagg.dispatch import LAMBDA_PRICE_PER_GB_SEC, LAMBDA_PRICE_PER_GB_SEC_BY_ARCH
 
 #: Version stamped into every record; bump on any key change (issue #297).
 SCHEMA_VERSION = 1
@@ -37,6 +37,11 @@ SCHEMA_VERSION = 1
 #: — mirroring the ``{full_id}_{window}.zarr`` leaf naming so two windows of one
 #: shard cannot clobber each other's sidecar.
 SIDECAR_NAME = "stats.json"
+
+#: ``platform.machine()`` spellings -> the #298 price-table arch keys, so the
+#: worker-side record prices with the same table the dispatcher's cost block
+#: uses. An unmapped/absent arch falls back to the flat default rate.
+_ARCH_ALIASES = {"aarch64": "arm64", "arm64": "arm64", "x86_64": "x86_64", "amd64": "x86_64"}
 
 # Merge dispositions (associative + commutative by construction). Floats sum,
 # so equality across fold orders holds up to FP summation order.
@@ -127,7 +132,10 @@ def build_record(
     gb_seconds = est_cost = None
     if lambda_config and lambda_config.get("memory_mb"):
         gb_seconds = duration_s * lambda_config["memory_mb"] / 1024.0
-        est_cost = gb_seconds * LAMBDA_PRICE_PER_GB_SEC
+        # Arch-keyed rate (issue #298's price table, folded in here): the
+        # record prices with the same table as the dispatcher's cost block.
+        arch = _ARCH_ALIASES.get(str(lambda_config.get("arch") or "").lower())
+        est_cost = gb_seconds * LAMBDA_PRICE_PER_GB_SEC_BY_ARCH.get(arch, LAMBDA_PRICE_PER_GB_SEC)
     phase_entries = {
         k: float(v)
         for k, v in (metadata.get("phase_timings") or {}).items()

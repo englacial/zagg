@@ -1116,6 +1116,15 @@ class RasterStrategy:
             raise ValueError(f"Unknown invocation: {invocation!r} (expected 'async' or 'sync')")
         function_name = _resolve_function_name(config, function_name)
         max_workers = min(max_workers or 64, len(cells)) or 1
+        # Pre-invoke cost ceiling (issue #298, rolled into #297 for the raster
+        # path): one invoke per unit, billed at the worker's memory for at
+        # most the function timeout — same math as the spatial/temporal paths.
+        memory_gb = _worker_memory_gb(config)
+        run_max_cost = max_cost_usd(len(cells), memory_gb, timeout_s=_DEFAULT_FUNCTION_TIMEOUT_S)
+        logger.info(
+            f"Max cost ceiling: ~${run_max_cost:.2f} ({len(cells)} units x {memory_gb:g} GB x "
+            f"{_DEFAULT_FUNCTION_TIMEOUT_S}s, {LAMBDA_ARCH})"
+        )
         client = boto3.client(
             "lambda",
             region_name=region,
@@ -1391,6 +1400,23 @@ class RasterStrategy:
         ok_bodies = [b for _k, b in ok_units]
         durations = [float(b["duration_s"]) for b in ok_bodies if b.get("duration_s") is not None]
         mems = [float(b["max_memory_mb"]) for b in ok_bodies if b.get("max_memory_mb") is not None]
+        # Actual-cost rollup (issues #298/#297): billed durations across
+        # successes AND landed failures (a failed unit's body still carries
+        # its duration until failure), priced like the spatial path. The
+        # structured cost block mirrors _run_lambda's; estimate_cost_usd is
+        # the Phase-3 stub (None until the #297/#299 history exists).
+        billed_s = sum(durations) + sum(
+            float(b["duration_s"])
+            for _k, _e, b in stats_failures
+            if b.get("duration_s") is not None
+        )
+        gb_seconds = billed_s * memory_gb
+        actual_cost = gb_seconds * LAMBDA_PRICE_PER_GB_SEC
+        cost_block = {
+            "max_cost_usd": run_max_cost,
+            "estimated_cost_usd": estimate_cost_usd(),
+            "actual_cost_usd": actual_cost,
+        }
         summary = {
             "total_cells": len(cells),
             "cells_with_data": shards_with_data,
@@ -1401,6 +1427,12 @@ class RasterStrategy:
             "wall_time_s": wall_time,
             "template_s": template_s,
             "lambda_time_s": sum(durations) if durations else None,
+            "gb_seconds": gb_seconds,
+            "price_per_gb_sec": LAMBDA_PRICE_PER_GB_SEC,
+            # Legacy flat key = the actual-cost rollup, matching the other
+            # lambda summaries' pre-#298 meaning.
+            "estimated_cost_usd": actual_cost,
+            "cost": cost_block,
             "worker_max_s": max(durations) if durations else None,
             "worker_median_s": statistics.median(durations) if durations else None,
             "max_memory_mb": max(mems) if mems else None,
