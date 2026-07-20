@@ -174,7 +174,7 @@ class TestMaxCostUsd:
         from zagg.dispatch import estimate_cost_usd
 
         assert estimate_cost_usd() is None
-        assert estimate_cost_usd({"shard_keys": [1]}, template_hash="abc", history=[]) is None
+        assert estimate_cost_usd({"shard_keys": [1]}, semantic_hash="abc", history=[]) is None
 
     def test_run_report_cost_fields_default_none(self):
         # Local runs never stamp the block; the defaults must read as "no
