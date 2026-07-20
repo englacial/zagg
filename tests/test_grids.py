@@ -1116,7 +1116,12 @@ class TestCellIdsEncoding:
         # The self-declared convention identity (issue #305): the UUID is
         # minted once and PERMANENT — this pin makes an accidental regeneration
         # a test failure, not a silent identity change.
-        from zagg.grids.morton import MORTON_CONVENTION, RESOLUTION_EXACT, RESOLUTION_POINT
+        from zagg.grids.morton import (
+            MORTON_CONVENTION,
+            RESOLUTION_EXACT,
+            RESOLUTION_MIXED,
+            RESOLUTION_POINT,
+        )
 
         assert MORTON_CONVENTION["uuid"] == "3e22156d-ea9e-4e01-95fe-e3809a4b41e7"
         assert MORTON_CONVENTION["name"] == "morton-dggs"
@@ -1126,7 +1131,15 @@ class TestCellIdsEncoding:
         # The normative home is the mortie spec page, not the design doc.
         assert "espg/mortie" in MORTON_CONVENTION["spec_url"]
         assert MORTON_CONVENTION["spec_url"].endswith("docs/specification.md")
-        assert (RESOLUTION_EXACT, RESOLUTION_POINT) == ("exact", "point")
+        # The full declared-value set (mortie spec §4; "mixed" espg-proposed
+        # on the PR #118 review, 2026-07-21 — order-29 ids are points, all
+        # other orders exact, clip rule inapplicable). zagg writers emit only
+        # "exact"; the constants are the seam for the point/mixed paths.
+        assert (RESOLUTION_EXACT, RESOLUTION_POINT, RESOLUTION_MIXED) == (
+            "exact",
+            "point",
+            "mixed",
+        )
 
     def test_spatial_signature_unchanged_by_hatch(self):
         # The hatch changes the leaf schema, not the spatial layout, so shard

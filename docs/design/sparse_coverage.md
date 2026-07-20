@@ -936,6 +936,11 @@ rollup leaves all leaf reads intact.
   `point` for raw conversions" was refined away — a writer either
   produces grid cells (`exact`) or converts raw coordinates (`point`),
   never guesses. The clip rule keys only on the declared field.
+  *Addendum (espg-proposed on the mortie PR #118 review, 2026-07-21)*: a
+  third value **`mixed`** — order-29 ids are points, ids at any other
+  order are exact (per-id recovery via the reserved order 29); the 29→24
+  clip rule is inapplicable to `mixed` arrays, and genuinely-exact
+  order-29 cells are unrepresentable under it (declare `exact`).
   Intersects mortie's documented point-id/area-word parse non-injectivity
   at order 29; field name, values, placement, and the clip rule's
   point-only scope are frozen normatively on the
