@@ -3650,7 +3650,7 @@ class TestDispatchRunStats:
             (self.root / key).write_bytes(b"parquet")
             return {}
 
-    def _verify_dispatch(self, monkeypatch, tmp_path, drop_first):
+    def _verify_dispatch(self, monkeypatch, tmp_path, drop_first, summary=None):
         from zagg import runner
 
         monkeypatch.setattr(runner, "_RUN_STATS_VERIFY_WINDOW_S", 0.5)
@@ -3658,7 +3658,9 @@ class TestDispatchRunStats:
         root = tmp_path / "out"
         root.mkdir()
         client = self._VerifyClient(root, drop_first=drop_first)
-        path = runner._dispatch_run_stats(client, "fn", str(root), self._rows(), run_id="rid")
+        path = runner._dispatch_run_stats(
+            client, "fn", str(root), self._rows(), run_id="rid", summary=summary
+        )
         return client, path, root
 
     def test_verify_present_no_refire(self, monkeypatch, tmp_path):
@@ -3670,18 +3672,28 @@ class TestDispatchRunStats:
     def test_dropped_first_invoke_refires_once(self, monkeypatch, tmp_path):
         # Retries-0 loss on the first Event invoke: the bounded read-only
         # check re-fires exactly once and the re-fired invoke lands.
-        client, path, root = self._verify_dispatch(monkeypatch, tmp_path, drop_first=1)
+        summary = {}
+        client, path, root = self._verify_dispatch(
+            monkeypatch, tmp_path, drop_first=1, summary=summary
+        )
         assert len(client.events) == 2
         assert client.events[0] == client.events[1]  # identical payload re-fired
         assert (root / path.rsplit("/", 1)[1]).exists()
+        # Path is set once on attempt 1 and survives the re-fire, not clobbered.
+        assert summary["run_stats_path"] == path
 
     def test_both_invokes_dropped_gives_up_fail_open(self, monkeypatch, tmp_path):
         # Both dropped: exactly two invokes (never more), announced path still
         # returned (a late queued invoke may still land it), nothing written.
-        client, path, root = self._verify_dispatch(monkeypatch, tmp_path, drop_first=2)
+        summary = {}
+        client, path, root = self._verify_dispatch(
+            monkeypatch, tmp_path, drop_first=2, summary=summary
+        )
         assert len(client.events) == 2
         assert path is not None
         assert not any(root.glob("stats_*.parquet"))
+        # Set on the first fire even though verification never confirmed it.
+        assert summary["run_stats_path"] == path
 
     def test_invoke_failure_is_fail_open(self):
         from zagg import runner
