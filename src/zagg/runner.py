@@ -2350,6 +2350,7 @@ def _await_run_stats_object(store_path, key, store_kwargs, *, window_s=None) -> 
     if window_s <= 0:
         return True
     import obstore
+    from obstore.exceptions import NotFoundError
 
     from zagg.store import open_object_store
 
@@ -2359,12 +2360,25 @@ def _await_run_stats_object(store_path, key, store_kwargs, *, window_s=None) -> 
         logger.warning(f"run stats verify skipped (cannot open store read-only): {e}")
         return False
     deadline = time.time() + window_s
+    warned = False
     while True:
         try:
             obstore.head(store, key)
             return True
-        except Exception:
-            pass
+        except (FileNotFoundError, NotFoundError):
+            pass  # genuinely not there yet — what the re-fire targets
+        except Exception as e:
+            # A non-not-found error (e.g. a prefix-scoped read grant that 403s
+            # HEADs at the store root) is a structural read gap the re-fire can
+            # never fix, and otherwise looks identical to a dropped invoke. Warn
+            # once so it's visible in the log; still treat as absent (we don't
+            # classify auth beyond not-FileNotFoundError — obstore's error
+            # taxonomy varies by backend).
+            if not warned:
+                logger.warning(
+                    f"run stats verify cannot read {key}: {e} — treating as absent"
+                )
+                warned = True
         if time.time() >= deadline:
             return False
         time.sleep(_RUN_STATS_VERIFY_INTERVAL_S)
