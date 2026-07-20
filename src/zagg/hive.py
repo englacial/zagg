@@ -441,8 +441,10 @@ def write_semantic_core(store_root: str, config, **store_kwargs) -> None:
     A derived convenience next to the manifest (D9 cache class): sorted-key,
     deterministic YAML of the output-defining subset, so product names stay
     human-inspectable without a registry. FAIL-OPEN — the manifest's
-    ``semantic_hash`` is the truth and the sweep can regenerate this; a
-    failed PUT must not fail the run.
+    ``semantic_hash`` is the truth, and the core is regenerable straight from
+    the config (rewriting it is a single :func:`write_semantic_core` call), so
+    a failed PUT must not fail the run. The D22 pyramid sweep is the intended
+    owner of the rewrite once it lands; there is no regenerator today.
     """
     import obstore
     import yaml
