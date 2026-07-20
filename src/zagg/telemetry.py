@@ -438,21 +438,24 @@ def rows_from_status(status_prefix: str, *, store_kwargs: dict | None = None) ->
 
     logger = logging.getLogger(__name__)
     store = open_object_store(status_prefix, **(store_kwargs or {}))
+    # Immediate children only — the layout is flat (``{run_id}/{shard}.json``),
+    # so ``list_with_delimiter`` (the coverage.py/hive.py prefix-walk precedent)
+    # matches the semantics and won't parse any future nested key as an envelope.
+    listing = obstore.list_with_delimiter(store)
     rows = []
-    for batch in obstore.list(store):
-        for meta in batch:
-            key = meta["path"]
-            if not key.endswith(".json"):
-                continue
-            try:
-                envelope = _json.loads(bytes(obstore.get(store, key).bytes()))
-                body = _json.loads(envelope.get("body", "{}"))
-                record = body.get("stats")
-            except Exception as e:
-                logger.warning(f"skipping unparsable status envelope {key}: {e}")
-                continue
-            if isinstance(record, dict):
-                rows.append(flatten_record(record))
+    for meta in listing["objects"]:
+        key = meta["path"]
+        if not key.endswith(".json"):
+            continue
+        try:
+            envelope = _json.loads(bytes(obstore.get(store, key).bytes()))
+            body = _json.loads(envelope.get("body", "{}"))
+            record = body.get("stats")
+        except Exception as e:
+            logger.warning(f"skipping unparsable status envelope {key}: {e}")
+            continue
+        if isinstance(record, dict):
+            rows.append(flatten_record(record))
     return rows
 
 
