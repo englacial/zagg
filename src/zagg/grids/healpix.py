@@ -125,9 +125,10 @@ class HealpixGrid:
         # standard) or "morton" (emit the packed morton words as cell_ids — a
         # test/prototype capability). Default is byte-identical to a pre-flag run.
         # Re-validated here (not only in validate_config) because both coords_of
-        # (the cell_ids values) and _dggs_attrs (the recorded indexing_scheme)
-        # interpret this string: an unvalidated third value would write NESTED
-        # values while recording a different scheme — a mis-decode for consumers.
+        # (which interprets this string for the hatch's cell_ids VALUES) and
+        # _dggs_attrs (which keys the morton-declared block on it) consume it: an
+        # unvalidated third value would write NESTED values while declaring a
+        # different block — a mis-decode for consumers.
         self.cell_ids_encoding = get_cell_ids_encoding(self.config)
         if self.cell_ids_encoding not in ("nested", "morton"):
             raise ValueError(
