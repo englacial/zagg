@@ -1065,6 +1065,21 @@ class TestCellIdsEncoding:
         for enc in (None, "nested", "morton"):
             assert self._grid(enc)._dggs_attrs()["dggs"]["resolution"] == RESOLUTION_EXACT
 
+    def test_dggs_attrs_reach_written_store(self):
+        # Round-trip past the return-value assertions above: the dggs block
+        # (incl. `resolution`) must survive spec()->emit_template->to_zarr and
+        # be readable off the WRITTEN group's attrs — that store path is what
+        # #305 readers key on.
+        from zagg.grids.morton import RESOLUTION_EXACT
+
+        g = self._grid()
+        store = MemoryStore()
+        g.emit_template(store)
+        attrs = open_group(store, path="8", mode="r").attrs
+        assert attrs["dggs"]["resolution"] == RESOLUTION_EXACT
+        assert isinstance(attrs["zarr_conventions"], list)
+        assert len(attrs["zarr_conventions"]) >= 1
+
     def test_morton_convention_constants_pinned(self):
         # The self-declared convention identity (issue #305): the UUID is
         # minted once and PERMANENT — this pin makes an accidental regeneration
