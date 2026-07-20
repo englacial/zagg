@@ -360,8 +360,7 @@ def run_parquet_key(run_id: str, timestamp: str | None = None) -> str:
     ts = timestamp or datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
     if not _RUN_TS_RE.match(ts):
         raise ValueError(
-            f"run parquet timestamp {ts!r} does not match the D20 grammar "
-            f"({_RUN_TS_RE.pattern})"
+            f"run parquet timestamp {ts!r} does not match the D20 grammar ({_RUN_TS_RE.pattern})"
         )
     if not isinstance(run_id, str) or not _RUN_ID_RE.match(run_id):
         raise ValueError(
