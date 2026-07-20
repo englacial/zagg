@@ -801,6 +801,31 @@ class TestSweepCli:
         assert main([str(tmp_path)]) == 0
         assert "nothing to sweep" in capsys.readouterr().out
 
+    def test_end_to_end_windowed_discovery_folds_both_windows(self, tmp_path):
+        # The at-scale seam: a windowed run record threads through
+        # discover_leaves into a real run_sweep, and the discovered
+        # ``(key, window)`` pairs name the leaves the fold reads — exercising
+        # the discovery-side sidecar-name grammar against the fold-side reader.
+        from zagg.sweep import discover_leaves
+
+        _write_manifest(tmp_path)
+        manifest = json.loads((tmp_path / MANIFEST_NAME).read_text())
+        manifest["spec"] = "morton-hive/2"
+        manifest["temporal"] = {"schedule": "yearly", "time_field": "t"}
+        (tmp_path / MANIFEST_NAME).write_text(json.dumps(manifest))
+        # Real windowed leaf sidecars for two windows of one shard...
+        a = _put_leaf(tmp_path, "-311", window="2019")
+        b = _put_leaf(tmp_path, "-311", window="2020")
+        # ...and a real run record carrying the window column.
+        _run_record(tmp_path, [_row("-311", window="2019"), _row("-311", window="2020")])
+        refs = discover_leaves(str(tmp_path))
+        assert refs == [(morton_word("-311"), "2019"), (morton_word("-311"), "2020")]
+        run_sweep(str(tmp_path), refs, families=("stats",))
+        node = _rollup(tmp_path, "-311")
+        assert node["generation"]["n_leaves"] == 2
+        assert node["windows"] == ["2019", "2020"]
+        assert node["payload"] == merge([a, b])
+
 
 class TestSweepConfig:
     """output.sweep (issue #300): default on for hive, boolean, hive-only —
