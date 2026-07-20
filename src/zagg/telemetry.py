@@ -428,9 +428,15 @@ def rows_from_status(status_prefix: str, *, store_kwargs: dict | None = None) ->
     envelope); the dispatcher sends those few rows inline alongside the
     pointer. Dispatcher-side ``retries`` are likewise not recoverable from
     envelopes, so pointer-assembled success rows carry ``retries: None``.
+
+    The per-envelope GETs fan out over a bounded thread pool (this branch is
+    the large-run one — hundreds to thousands of shards — where thousands of
+    serial S3 round-trips would eat a real slice of the worker's 900 s budget;
+    the run record is the thing you most want kept for exactly those runs).
     """
     import json as _json
     import logging
+    from concurrent.futures import ThreadPoolExecutor
 
     import obstore
 
@@ -442,21 +448,22 @@ def rows_from_status(status_prefix: str, *, store_kwargs: dict | None = None) ->
     # so ``list_with_delimiter`` (the coverage.py/hive.py prefix-walk precedent)
     # matches the semantics and won't parse any future nested key as an envelope.
     listing = obstore.list_with_delimiter(store)
-    rows = []
-    for meta in listing["objects"]:
-        key = meta["path"]
-        if not key.endswith(".json"):
-            continue
+    keys = [meta["path"] for meta in listing["objects"] if meta["path"].endswith(".json")]
+
+    def _record(key: str) -> dict | None:
         try:
             envelope = _json.loads(bytes(obstore.get(store, key).bytes()))
             body = _json.loads(envelope.get("body", "{}"))
             record = body.get("stats")
         except Exception as e:
             logger.warning(f"skipping unparsable status envelope {key}: {e}")
-            continue
-        if isinstance(record, dict):
-            rows.append(flatten_record(record))
-    return rows
+            return None
+        return record if isinstance(record, dict) else None
+
+    if not keys:
+        return []
+    with ThreadPoolExecutor(max_workers=min(16, len(keys))) as pool:
+        return [flatten_record(rec) for rec in pool.map(_record, keys) if rec is not None]
 
 
 # ---------------------------------------------------------------------------
