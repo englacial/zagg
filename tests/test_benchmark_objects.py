@@ -319,6 +319,35 @@ def test_hive_store_matches_model(tmp_path, monkeypatch):
     assert any(k.startswith(leaf) for k in bench_objects.list_store_keys(root))
 
 
+def test_hive_misplaced_rollup_counts_into_shard(monkeypatch):
+    # A `.rollup.json` name is a second-pass sweep cache ONLY when it sits
+    # outside every leaf `.zarr/` prefix (issue #300 review). A legit rollup at
+    # the digit node lands in ``objects_rollups``; a hand-planted
+    # `{leaf}.zarr/stats.rollup.json` is a write-path bypass and must surface
+    # as one of that shard's data objects (tripping the exact #215 guard), not
+    # vanish into the bucket.
+    from zagg import hive
+
+    grid = from_config(_cfg())
+    word = int(morton_word(_KEY_A))
+    label = grid.shard_label(word)
+    leaf = hive.shard_leaf_path("", word).lstrip("/")  # {node}.zarr
+    node = leaf.rsplit("/", 1)[0]  # the digit node dir (rollup lives here)
+    keys = [
+        f"{leaf}/count/c/0",  # normal in-leaf data object -> this shard
+        f"{node}/stats.rollup.json",  # legit sibling rollup -> rollup bucket
+        f"{leaf}/stats.rollup.json",  # MISPLACED in-leaf rollup -> this shard
+    ]
+    monkeypatch.setattr(bench_objects, "list_store_keys", lambda *a, **k: keys)
+    measured = bench_objects.store_object_counts(
+        "unused", grid=grid, shard_keys=[word], store_layout="hive"
+    )
+    assert measured["objects_rollups"] == 1  # only the sibling rollup
+    assert measured["objects_per_shard"] == {label: 2}  # data + misplaced rollup
+    assert measured["objects_other"] == 0
+    assert not any(k.endswith("stats.rollup.json") for k in measured["other_keys"])
+
+
 # --- mismatch helper (pure) --------------------------------------------------
 
 

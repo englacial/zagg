@@ -276,18 +276,26 @@ def store_object_counts(
             if key in (hive.MANIFEST_NAME, hive.ROOT_COVERAGE_NAME) or _is_run_parquet(key):
                 metadata += 1
                 continue
-            # Sweep rollups (issue #300): `{family}.rollup.json` at any digit
-            # node — second-pass D9 caches with their own bucket, never
-            # write-path objects (and never inside a leaf prefix, so the #215
-            # per-shard guard is untouched).
-            if key.endswith(".rollup.json"):
-                rollups += 1
-                continue
+            # Leaf-prefix membership FIRST (issue #300 review): an object that
+            # lands INSIDE a leaf `.zarr/` prefix is that shard's data object —
+            # rollup-named or not — so it counts into ``per_shard`` and trips
+            # the exact #215 per-shard guard. Only keys OUTSIDE every leaf
+            # prefix are eligible for the rollup / sibling buckets below.
             for prefix, label in leaf_of.items():
                 if key.startswith(prefix):
                     per_shard[label] = per_shard.get(label, 0) + 1
                     break
             else:
+                # Sweep rollups (issue #300): `{family}.rollup.json` at a digit
+                # node — second-pass D9 caches with their own bucket, never
+                # write-path objects. Legit rollups sit at `{node}/` (siblings
+                # of the leaf `.zarr/`), so classifying them here — after the
+                # leaf-membership check has failed — leaves the per-shard guard
+                # untouched while a MISPLACED in-leaf rollup falls to the
+                # attribution above and trips #215 instead of vanishing.
+                if key.endswith(".rollup.json"):
+                    rollups += 1
+                    continue
                 node, _, name = key.rpartition("/")
                 is_sibling = any(
                     name == f"{stem}.json"
