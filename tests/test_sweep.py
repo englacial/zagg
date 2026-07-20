@@ -494,6 +494,27 @@ class TestSubmapRollup:
         assert result["families"]["submap"]["failed"] == 1
         assert result["families"]["submap"]["written"] == 0
 
+    def test_submap_emittable_gates_unmergeable_units(self):
+        from zagg.sweep import submap_emittable
+
+        # A HEALPix signature with id-bearing entries is the only emittable case.
+        assert submap_emittable(SUBMAP_SIG, [_entry("gA"), _entry("gB")])
+        # Rectilinear raster signature (no parent_order/child_order) -> skip: the
+        # sub-shardmap fold is HEALPix-morton only (reproject is HEALPix-only).
+        rect_sig = {
+            "type": "rectilinear",
+            "crs": "EPSG:4326",
+            "affine": [1.0, 0.0, 0.0, 0.0, -1.0, 0.0],
+            "shape": [10, 10],
+            "chunk_shape": [5, 5],
+        }
+        raster_entries = [{"s3": "s3://b/t0", "datetime": "2025-01-01T00:00:00Z"}]
+        assert not submap_emittable(rect_sig, raster_entries)
+        # HEALPix signature but id-less entries (raster ShardMap falls back to
+        # datetime, telemetry.py) -> also skip, never a KeyError in the fold.
+        assert not submap_emittable(SUBMAP_SIG, raster_entries)
+        assert not submap_emittable(None, [_entry("gA")])
+
 
 class TestLocalRunnerEmitsSubmap:
     """The local backend's in-process worker writes the leaf sub-map on

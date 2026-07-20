@@ -957,17 +957,24 @@ class RasterStrategy:
                 # entries as full ShardMap JSON, sibling to the stats sidecar
                 # (same in-process rationale as the aggregation local path).
                 try:
-                    from zagg.sweep import write_leaf_submap
+                    from zagg.sweep import submap_emittable, write_leaf_submap
 
-                    write_leaf_submap(
-                        store_path,
-                        int(shard_key),
-                        granules,
-                        grid_signature=catalog_data["grid_signature"],
-                        metadata=catalog_data.get("metadata"),
-                        window=window["label"] if window else None,
-                        store_kwargs=store_kwargs,
-                    )
+                    sig = catalog_data["grid_signature"]
+                    if submap_emittable(sig, granules):
+                        write_leaf_submap(
+                            store_path,
+                            int(shard_key),
+                            granules,
+                            grid_signature=sig,
+                            metadata=catalog_data.get("metadata"),
+                            window=window["label"] if window else None,
+                            store_kwargs=store_kwargs,
+                        )
+                    else:
+                        logger.debug(
+                            f"leaf sub-map skipped for shard {shard_key}: non-HEALPix grid "
+                            f"or id-less entries (unmergeable, issue #300)"
+                        )
                 except Exception as e:
                     logger.warning(f"leaf sub-map write failed (fail-open, issue #300): {e}")
             return meta, stage_stats, write_s
@@ -2623,17 +2630,24 @@ def _run_local(
                 # (the Lambda path threads them via the event's submap block).
                 # Fail-open, like the sidecar.
                 try:
-                    from zagg.sweep import write_leaf_submap
+                    from zagg.sweep import submap_emittable, write_leaf_submap
 
-                    write_leaf_submap(
-                        store_path,
-                        int(shard_key),
-                        records,
-                        grid_signature=catalog_data["grid_signature"],
-                        metadata=catalog_data.get("metadata"),
-                        window=window["label"] if window else None,
-                        store_kwargs=store_kwargs,
-                    )
+                    sig = catalog_data["grid_signature"]
+                    if submap_emittable(sig, records):
+                        write_leaf_submap(
+                            store_path,
+                            int(shard_key),
+                            records,
+                            grid_signature=sig,
+                            metadata=catalog_data.get("metadata"),
+                            window=window["label"] if window else None,
+                            store_kwargs=store_kwargs,
+                        )
+                    else:
+                        logger.debug(
+                            f"leaf sub-map skipped for shard {shard_key}: non-HEALPix grid "
+                            f"or id-less entries (unmergeable, issue #300)"
+                        )
                 except Exception as e:
                     logger.warning(f"leaf sub-map write failed (fail-open, issue #300): {e}")
             return {"shard_key": shard_key, "ok": True, "meta": meta}

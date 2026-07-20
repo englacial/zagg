@@ -312,6 +312,24 @@ def write_leaf_submap(
     )
 
 
+def submap_emittable(grid_signature: dict | None, granules) -> bool:
+    """Whether a unit's leaf sub-map can be folded by :class:`SubmapFamily`.
+
+    The sub-shardmap fold is HEALPix-morton only — ``reproject`` coarsens by
+    ``parent_order``/``child_order`` and the merge keys entries by granule
+    ``id``. A rectilinear raster signature (grid ``type != "healpix"``, no
+    ``parent_order``/``child_order``) or id-less granule entries would fold to
+    a ``failed`` node the sweep can never consume, so the emission sites (issue
+    #300) check this and skip the write instead of persisting an unmergeable
+    payload. ``store_layout: hive`` is HEALPix-only by validation, so the
+    realistic skip is id-less raster entries under a rectilinear signature.
+    """
+    sig = grid_signature or {}
+    if sig.get("type") != "healpix" or "parent_order" not in sig or "child_order" not in sig:
+        return False
+    return all("id" in g for g in granules)
+
+
 class SubmapFamily(SweepFamily):
     """Sub-shardmap rollups (D22): leaf ShardMap JSON folded via ``reproject``.
 

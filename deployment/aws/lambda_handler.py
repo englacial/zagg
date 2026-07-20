@@ -1257,18 +1257,24 @@ def _handle_process_raster(event: Dict[str, Any]) -> Dict[str, Any]:
                 submap = event.get("submap")
                 if submap:
                     try:
-                        from zagg.sweep import write_leaf_submap
+                        from zagg.sweep import submap_emittable, write_leaf_submap
 
                         window = event.get("window")
-                        write_leaf_submap(
-                            event["store_path"],
-                            shard_key,
-                            event["granules"],
-                            grid_signature=submap["grid_signature"],
-                            metadata=submap.get("metadata"),
-                            window=window["label"] if window else None,
-                            store_kwargs=_output_store_kwargs(event),
-                        )
+                        if submap_emittable(submap["grid_signature"], event["granules"]):
+                            write_leaf_submap(
+                                event["store_path"],
+                                shard_key,
+                                event["granules"],
+                                grid_signature=submap["grid_signature"],
+                                metadata=submap.get("metadata"),
+                                window=window["label"] if window else None,
+                                store_kwargs=_output_store_kwargs(event),
+                            )
+                        else:
+                            logger.debug(
+                                f"leaf sub-map skipped for shard {shard_key}: non-HEALPix "
+                                f"grid or id-less entries (unmergeable, issue #300)"
+                            )
                     except Exception as e:
                         logger.warning(f"leaf sub-map write failed (fail-open, issue #300): {e}")
             return {"statusCode": 200, "body": json.dumps(body)}
@@ -1698,18 +1704,25 @@ def _handle_process(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
             submap = event.get("submap")
             if submap:
                 try:
-                    from zagg.sweep import write_leaf_submap
+                    from zagg.sweep import submap_emittable, write_leaf_submap
 
                     window = event.get("window")
-                    write_leaf_submap(
-                        store_path,
-                        int(shard_key),
-                        submap.get("granules") or [],
-                        grid_signature=submap["grid_signature"],
-                        metadata=submap.get("metadata"),
-                        window=window["label"] if window else None,
-                        store_kwargs=_output_store_kwargs(event),
-                    )
+                    granules = submap.get("granules") or []
+                    if submap_emittable(submap["grid_signature"], granules):
+                        write_leaf_submap(
+                            store_path,
+                            int(shard_key),
+                            granules,
+                            grid_signature=submap["grid_signature"],
+                            metadata=submap.get("metadata"),
+                            window=window["label"] if window else None,
+                            store_kwargs=_output_store_kwargs(event),
+                        )
+                    else:
+                        logger.debug(
+                            f"leaf sub-map skipped for shard {shard_key}: non-HEALPix grid "
+                            f"or id-less entries (unmergeable, issue #300)"
+                        )
                 except Exception as e:
                     logger.warning(f"leaf sub-map write failed (fail-open, issue #300): {e}")
 
