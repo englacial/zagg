@@ -7,6 +7,7 @@ Phase 2 covers the rectilinear shapely cell-center ``contains`` path.
 
 import numpy as np
 import pytest
+from conftest import nested_ids
 
 from zagg.grids import HealpixGrid
 from zagg.grids.aoi import (
@@ -496,11 +497,11 @@ class TestEndToEndWrite:
             aoi_mask=mask,
         )
         n_children = 4 ** (child_order - parent_order)
-        chunk_idx = (int(df["cell_ids"].min()) // n_children,)
+        chunk_idx = (int(nested_ids(df).min()) // n_children,)
         write_dataframe_to_zarr(carrier, store, grid=grid, chunk_idx=chunk_idx)
 
         group = open_group(store=store, mode="r", path=str(child_order))
-        lo, hi = int(df["cell_ids"].min()), int(df["cell_ids"].max())
+        lo, hi = int(nested_ids(df).min()), int(nested_ids(df).max())
         actual = group["aoi_mask"][lo : hi + 1]
         assert actual.dtype == np.bool_
         np.testing.assert_array_equal(actual, mask)
@@ -521,7 +522,7 @@ class TestEndToEndWrite:
             grid.emit_template(store)
             df = mock_dataframe_factory(-78.5, -132.0, parent_order, child_order)
             n_children = 4 ** (child_order - parent_order)
-            chunk_idx = (int(df["cell_ids"].min()) // n_children,)
+            chunk_idx = (int(nested_ids(df).min()) // n_children,)
             write_dataframe_to_zarr(df, store, grid=grid, chunk_idx=chunk_idx)
             return store
 

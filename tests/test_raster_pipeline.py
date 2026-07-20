@@ -25,6 +25,7 @@ from zagg.processing.raster import (
     new_stage_stats,
     process_raster_shard,
     raster_group_spec,
+    raster_leaf_spec,
     raster_time_index,
     sample_item_async,
     write_raster_coords,
@@ -657,7 +658,7 @@ class TestTemplateAndSlabs:
         assert red.attributes["scale_factor"] == 0.0001
         assert red.attributes["add_offset"] == -0.1
         assert tuple(spec.members["time"].shape) == (3,)
-        assert tuple(spec.members["cell_ids"].shape) == (n_cells,)
+        assert tuple(spec.members["morton"].shape) == (n_cells,)
 
     def test_sharded_grid_rejected(self, tmp_path):
         cfg, grid, _shard = _healpix_setup(tmp_path)
@@ -698,13 +699,10 @@ class TestTemplateAndSlabs:
         # time coordinate round-trips as microseconds since epoch.
         tarr = open_array(store, path=f"{grid.group_path}/time", zarr_format=3, consolidated=False)
         np.testing.assert_array_equal(tarr[:], times)
-        # cell_ids written for the shard's block, in children order.
-        ids = open_array(
-            store, path=f"{grid.group_path}/cell_ids", zarr_format=3, consolidated=False
-        )
-        np.testing.assert_array_equal(
-            ids[start:stop], np.asarray(grid.encode_cell_ids(cells), dtype=np.uint64)
-        )
+        # morton written for the shard's block, in children order (D16 —
+        # packed words are the sole stored cell coordinate, issue #304).
+        ids = open_array(store, path=f"{grid.group_path}/morton", zarr_format=3, consolidated=False)
+        np.testing.assert_array_equal(ids[start:stop], np.asarray(cells, dtype=np.uint64))
         assert valid.sum() > 50  # the 960 m raster covers many ~97 m cells
 
     def test_zero_time_template(self, tmp_path):
@@ -798,7 +796,7 @@ class TestLeafTemplate:
         assert tuple(cfg_block["chunk_shape"]) == (1, grid.cells_per_chunk)
         assert red.attributes["scale_factor"] == 0.0001
         assert tuple(inner.members["time"].shape) == (3,)
-        assert tuple(inner.members["cell_ids"].shape) == (grid.cells_per_shard,)
+        assert tuple(inner.members["morton"].shape) == (grid.cells_per_shard,)
 
     def test_leaf_spec_sharded_rejected(self, tmp_path):
         from zagg.processing.raster import raster_leaf_spec
@@ -811,7 +809,7 @@ class TestLeafTemplate:
     def test_leaf_template_round_trip(self, tmp_path):
         # Emit one leaf, stream the shard's slabs into it at leaf-local
         # indices, and read everything back: per-band dtype/fill, the leaf's
-        # own time axis, and the shard's cell_ids — written at template time,
+        # own time axis, and the shard's morton words — written at template time,
         # not per-slab.
         from zagg.processing.raster import emit_raster_leaf_template, write_raster_leaf_slab
 
@@ -843,12 +841,8 @@ class TestLeafTemplate:
         tarr = open_array(store, path=f"{grid.group_path}/time", zarr_format=3, consolidated=False)
         np.testing.assert_array_equal(tarr[:], times)
         assert tarr.attrs["units"] == "microseconds since 1970-01-01T00:00:00"
-        ids = open_array(
-            store, path=f"{grid.group_path}/cell_ids", zarr_format=3, consolidated=False
-        )
-        np.testing.assert_array_equal(
-            ids[:], np.asarray(grid.encode_cell_ids(cells), dtype=np.uint64)
-        )
+        ids = open_array(store, path=f"{grid.group_path}/morton", zarr_format=3, consolidated=False)
+        np.testing.assert_array_equal(ids[:], np.asarray(cells, dtype=np.uint64))
 
     def test_leaf_overwrite_replaces_wholesale(self, tmp_path):
         # Retry semantics (D4): re-emitting with overwrite=True replaces the
@@ -872,13 +866,83 @@ class TestLeafTemplate:
         # byte-identical: same member set, shapes, chunking, codecs.
         cfg, grid, _shard = _healpix_setup(tmp_path)
         spec = raster_group_spec(grid, cfg, 2)
-        assert set(spec.members) == {"time", "cell_ids", "red"}
+        assert set(spec.members) == {"time", "morton", "red"}
         # Fullsphere cell axis (issue #88: the dense pack is gone; shape is
         # metadata — writes stay sparse).
         assert tuple(spec.members["red"].shape) == (2, 12 * 4**16)
         codecs = spec.members["red"].codecs
         names = [c["name"] if isinstance(c, dict) else c.name for c in codecs]
         assert names == ["bytes", "zstd"]
+
+
+class TestRasterMortonCoordinate:
+    """Issue #304 raster extension (espg-ruled): morton is the sole stored
+    cell coordinate on the raster path too, with the same dggs attrs block
+    and the same emit_cell_ids transition hatch as the spatial path."""
+
+    def test_default_has_no_cell_ids(self, tmp_path):
+        cfg, grid, _shard = _healpix_setup(tmp_path)
+        assert "cell_ids" not in raster_group_spec(grid, cfg, 2).members
+        inner = raster_leaf_spec(grid, cfg, 2).members[grid.group_path]
+        assert "cell_ids" not in inner.members
+
+    def test_hatch_restores_cell_ids(self, tmp_path):
+        cfg, grid, _shard = _healpix_setup(tmp_path)
+        cfg.output["grid"]["emit_cell_ids"] = True
+        grid = HealpixGrid(10, 16, config=cfg)
+        spec = raster_group_spec(grid, cfg, 2)
+        assert str(spec.members["cell_ids"].data_type) == "uint64"
+        # And the leaf writer fills BOTH coords under the hatch.
+        from zagg.processing.raster import emit_raster_leaf_template
+
+        store = MemoryStore()
+        emit_raster_leaf_template(store, grid, cfg, _shard, np.array([0], dtype=np.int64))
+        ids = open_array(
+            store, path=f"{grid.group_path}/cell_ids", zarr_format=3, consolidated=False
+        )
+        cells = grid.children(_shard)
+        np.testing.assert_array_equal(
+            ids[:], np.asarray(grid.encode_cell_ids(cells), dtype=np.uint64)
+        )
+
+    def test_dggs_attrs_match_spatial_contract(self, tmp_path):
+        # One reader contract everywhere: the raster group carries the same
+        # morton-declared block HealpixGrid emits for aggregation stores.
+        cfg, grid, _shard = _healpix_setup(tmp_path)
+        for attrs in (
+            raster_group_spec(grid, cfg, 2).attributes,
+            raster_leaf_spec(grid, cfg, 2).members[grid.group_path].attributes,
+        ):
+            assert attrs == grid._dggs_attrs()
+            assert attrs["dggs"]["name"] == "morton"
+            assert attrs["dggs"]["coordinate"] == "morton"
+            names = [c["name"] for c in attrs["zarr_conventions"]]
+            assert names == ["dggs", "morton-dggs"]
+
+    def test_written_leaf_attrs_round_trip(self, tmp_path):
+        import zarr
+
+        from zagg.processing.raster import emit_raster_leaf_template
+
+        cfg, grid, shard = _healpix_setup(tmp_path)
+        store = MemoryStore()
+        emit_raster_leaf_template(store, grid, cfg, shard, np.array([0], dtype=np.int64))
+        grp = zarr.open_group(store, path=grid.group_path, mode="r", zarr_format=3)
+        assert grp.attrs["dggs"]["coordinate"] == "morton"
+        assert "cell_ids" not in grp
+
+    def test_written_flat_attrs_round_trip(self, tmp_path):
+        # F14: the FLAT write is the one that changed from attributes={} to
+        # grid._dggs_attrs(); pin the written-store attrs there too, not just
+        # on the leaf.
+        import zarr
+
+        cfg, grid, _shard = _healpix_setup(tmp_path)
+        store = MemoryStore()
+        emit_raster_template(store, grid, cfg, np.array([0], dtype=np.int64))
+        grp = zarr.open_group(store, path=grid.group_path, mode="r", zarr_format=3)
+        assert grp.attrs["dggs"]["coordinate"] == "morton"
+        assert "cell_ids" not in grp
 
 
 class TestGeometryCache:

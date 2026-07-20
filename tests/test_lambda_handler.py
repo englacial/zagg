@@ -23,6 +23,7 @@ from zarr.storage import MemoryStore
 
 from zagg.config import default_config
 from zagg.grids import HEALPIX_BASE_CELLS, from_config
+from zagg.grids.morton import morton_words
 
 REPO_ROOT = Path(__file__).parent.parent
 HANDLER_PATH = REPO_ROOT / "deployment" / "aws" / "lambda_handler.py"
@@ -884,7 +885,7 @@ class TestProcessHive:
         from zagg.config import get_agg_fields, get_data_vars, get_output_signature
 
         coords = grid.chunk_coords(shard)
-        n = len(coords["cell_ids"])
+        n = len(coords["morton"])
         agg = get_agg_fields(grid.config)
         df = pd.DataFrame(
             {
@@ -945,8 +946,8 @@ class TestProcessHive:
         # its vlen-bytes array at the cell position (issue #209), ONE object.
         grp = zarr.open_group(leaf_store, path=grid.group_path, mode="r", zarr_format=3)
         np.testing.assert_array_equal(
-            np.asarray(grp["cell_ids"][:]),
-            np.asarray(grid.chunk_coords(self._WORD)["cell_ids"]),
+            np.asarray(grp["morton"][:]),
+            morton_words(grid.chunk_coords(self._WORD)["morton"]),
         )
         ragged_arr = zarr.open_array(leaf_store, path=f"{grid.group_path}/h", mode="r")
         np.testing.assert_array_equal(np.frombuffer(ragged_arr[0:1][0], "<f4"), [1.0, 2.0])
@@ -1015,15 +1016,15 @@ class TestProcessHive:
         leaf = hive.shard_leaf_path(event["store_path"], self._WORD)
         leaf_store = open_store(leaf)
         cfg = load_config_from_dict(cfg_dict)
-        for name in ("morton", "cell_ids", "h", *get_data_vars(cfg)):
+        for name in ("morton", "h", *get_data_vars(cfg)):
             chunk_dir = os.path.join(leaf, grid.group_path, name, "c")
             n_objects = sum(len(files) for _d, _s, files in os.walk(chunk_dir))
             assert n_objects == 1, name
         # Whole-leaf contents readable after a fresh open; stamp is present.
         grp = zarr.open_group(leaf_store, path=grid.group_path, mode="r", zarr_format=3)
         np.testing.assert_array_equal(
-            np.asarray(grp["cell_ids"][:]),
-            np.asarray(grid.chunk_coords(self._WORD)["cell_ids"]),
+            np.asarray(grp["morton"][:]),
+            morton_words(grid.chunk_coords(self._WORD)["morton"]),
         )
         assert hive.read_commit(leaf_store)["complete"] is True
 
@@ -1536,7 +1537,7 @@ class TestSetupTemplate:
     def _template_chunk_count(store, worker_grid):
         """Number of chunks in the emitted cell-resolution array."""
         group = open_group(store, path=str(worker_grid.child_order), mode="r")
-        cell_arr = group["cell_ids"]
+        cell_arr = group["morton"]
         return cell_arr.shape[0] // cell_arr.chunks[0]
 
     def test_setup_template_chunked_at_chunk_inner(self, handler_mod, monkeypatch):

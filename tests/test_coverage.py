@@ -447,7 +447,7 @@ def _rec_meta(shard):
 
 def _carrier(grid, shard):
     coords = grid.chunk_coords(shard)
-    n = len(coords["cell_ids"])
+    n = len(coords["morton"])
     df = pd.DataFrame(
         {
             var: np.zeros(n, dtype=np.int32 if var == "count" else np.float32)
