@@ -436,6 +436,73 @@ class TestRasterLambdaBackend:
         assert summary["lambda_time_s"] == 30.0 and summary["max_memory_mb"] is None
         assert summary["template_s"] >= 0.0
 
+    def test_mixed_fanout_bills_landed_failure(self, tmp_path, monkeypatch):
+        # Issue #297: the actual-cost rollup bills LANDED failures — a unit
+        # whose non-200 envelope still carried a ``duration_s`` — alongside the
+        # successes, priced identically. A mixed fan-out (one 200 @ 30 s, one
+        # 500 @ 12 s) pins the failed-unit-billing term so deleting it fails
+        # here, and guards against the ok/failed lists double-counting a unit.
+        # ``lambda_time_s`` stays the ok-only worker-latency stat, and one
+        # failure among two units must NOT trip the all-failed raise.
+        import boto3
+
+        from zagg.dispatch import LAMBDA_PRICE_PER_GB_SEC
+
+        cfg = _cfg(tmp_path)
+        _write_tiff(tmp_path / "s0.tif", _index_raster())
+        _write_tiff(
+            tmp_path / "s1.tif",
+            np.full((96, 96), 777, dtype=np.uint16),
+            origin=(ORIGIN[0] + 7000.0, ORIGIN[1]),
+        )
+        shard0 = _shard_for_raster_at(0.0)
+        shard1 = _shard_for_raster_at(7000.0)
+        grid = from_config(cfg)
+        sm = ShardMap(
+            grid.spatial_signature(),
+            [shard0, shard1],
+            [
+                [_entry("g0", str(tmp_path / "s0.tif"), T0, "dt-1")],
+                [_entry("g1", str(tmp_path / "s1.tif"), T1, "dt-2")],
+            ],
+            {"collection": "s2-test"},
+        )
+        sm_path = str(tmp_path / "sm2.json")
+        sm.to_json(sm_path)
+
+        def responder(event):
+            if event["shard_key"] == shard0:
+                body = {"timesteps": 1, "cells_with_data": 4096, "duration_s": 30.0}
+                return {"statusCode": 200, "body": json.dumps(body)}
+            # Landed failure: a non-200 envelope that still carries its billed
+            # duration (the worker ran, then raised before success).
+            return {
+                "statusCode": 500,
+                "body": json.dumps({"error": "boom", "duration_s": 12.0}),
+            }
+
+        fake = _FakeLambdaClient(_lifecycle(responder))
+        monkeypatch.setattr(boto3, "client", lambda *a, **k: fake)
+        summary = agg(
+            cfg,
+            catalog=sm_path,
+            store="s3://bucket/out.zarr",
+            backend="lambda",
+            max_workers=2,
+            invocation="sync",
+        )
+        # One failed, one succeeded — a partial failure, so no all-failed raise.
+        assert summary["cells_error"] == 1 and summary["cells_with_data"] == 1
+        # gb_seconds / actual cost bill BOTH the 30 s success and the 12 s
+        # landed failure: (30 + 12) s x 4 GB x the arm64 rate.
+        assert summary["gb_seconds"] == pytest.approx((30.0 + 12.0) * 4.0)
+        expected_cost = (30.0 + 12.0) * 4.0 * LAMBDA_PRICE_PER_GB_SEC
+        assert summary["cost"]["actual_cost_usd"] == pytest.approx(expected_cost)
+        assert summary["estimated_cost_usd"] == pytest.approx(expected_cost)
+        # lambda_time_s is the ok-only worker-latency stat — the failure's
+        # duration bills but never enters the latency rollup.
+        assert summary["lambda_time_s"] == pytest.approx(30.0)
+
     def test_on_progress_ticks_on_lambda_fanout(self, manifest, monkeypatch):
         # Progress hook (issue #298 fold): the lambda raster fan-out ticks once
         # per completed shard -- 1-based, total = shard count, cost=None (the
