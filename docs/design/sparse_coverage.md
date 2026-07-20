@@ -6,7 +6,7 @@ temporal-partitioning amendments (D13–D15) ratified on
 amendment ratified on
 [#262](https://github.com/englacial/zagg/issues/262) (D16; open item O10
 carved from it); 2026-07 consolidation (D17–D24; O3/O11 resolved, O8
-constants blessed, O12–O13 opened, D23 tokens ratified, §8.3
+constants blessed, O12–O14 opened, D23 tokens ratified, §8.3
 test-obligations index added)
 recording decisions settled on the
 [#251](https://github.com/englacial/zagg/issues/251)/[#236](https://github.com/englacial/zagg/issues/236)/[#209](https://github.com/englacial/zagg/issues/209)
@@ -950,6 +950,36 @@ rollup leaves all leaf reads intact.
   Open: the summary's exact schema, its placement in the published copy
   (product root), and whether sub-shardmap rollups publish as-is (they
   carry granule ids — likely fine) or coarsen.
+
+- **O14 — reader tree model: product and resolution axes as DataTree**
+  (direction espg-ratified in-session 2026-07-20; API details open with
+  moczarr — espg/moczarr#1). The store's four hierarchical axes map to
+  xarray `DataTree` unevenly, and the mapping is now declared: the
+  **product axis** is a strong fit (`open_store()` → one child node per
+  `{name}/`, each node today's `open_hive` Dataset — heterogeneous
+  schemas are exactly the non-alignable-groups case DataTree exists for,
+  and D19's named roots make node names human-meaningful); the
+  **resolution axis** is a good fit once #201/D24 materialize (one node
+  per order, source + overviews distinguished by `role`, riding the
+  emerging multiscale-DataTree conventions) — with the honest caveat
+  that a D24-heterogeneous product has no complete Dataset at any single
+  order: the seamless order-k view is a *computed compose* (per the
+  composability classes), never a tree node, so the DataTree represents
+  what is *stored* and the single-resolution Dataset stays an
+  accessor-fabricated view; the **window axis** stays a concatenated
+  time dimension inside each node (windows-as-nodes would shatter the
+  dominant time-series read); the **spatial digit axis is never tree
+  nodes** — a node per morton digit recreates the D5/D12 metadata storm
+  client-side. The Rust-backed fast `open_datatree` path applies to
+  zarr-native hierarchies, which the hive tree deliberately is not
+  (D12) — it plugs in via D12's escape hatch instead: the sweep's
+  optional interop materialization can generate a consolidated,
+  `open_datatree`-able hierarchy *as a derived cache* for non-moczarr
+  consumers, while the MOC-first opener remains the truth path (the
+  derived-views principle, third instance). Phasing: (1) `open_hive` →
+  Dataset stays the primitive, unchanged; (2) `open_store()` →
+  product-level DataTree after moczarr#11; (3) level nodes with
+  #201/D24; (4) optional sweep-generated interop hierarchy.
 
 ### 8.3 Standing test obligations (what a conforming implementation proves)
 
