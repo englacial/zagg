@@ -1024,9 +1024,37 @@ class TestCellIdsEncoding:
         assert stored.dtype == np.uint64
 
     def test_dggs_attrs_record_encoding(self):
+        # Nested stores are unchanged; a morton-declared store uses the
+        # DISTINCT grid name (D16 / issue #304 phase 1) — never
+        # name: "healpix" + indexing_scheme: "morton", which scheme-blind
+        # readers silently misread as NESTED.
         assert self._grid()._dggs_attrs()["dggs"]["indexing_scheme"] == "nested"
         assert self._grid("nested")._dggs_attrs()["dggs"]["indexing_scheme"] == "nested"
-        assert self._grid("morton")._dggs_attrs()["dggs"]["indexing_scheme"] == "morton"
+        morton = self._grid("morton")._dggs_attrs()["dggs"]
+        assert morton["name"] == "morton"
+        assert "indexing_scheme" not in morton
+
+    def test_morton_attrs_declare_convention_block(self):
+        # Issue #304 phase 1: the morton-declared attrs flip — grid name
+        # "morton", the typed `morton` coordinate, and the self-declared
+        # convention entry (issue #305, permanent UUID) appended to the
+        # zarr_conventions LIST so future upstream entries can coexist.
+        from zagg.grids.morton import MORTON_CONVENTION
+
+        attrs = self._grid("morton")._dggs_attrs()
+        assert attrs["dggs"]["coordinate"] == "morton"
+        assert attrs["dggs"]["name"] == "morton"
+        assert MORTON_CONVENTION in attrs["zarr_conventions"]
+        names = [c["name"] for c in attrs["zarr_conventions"]]
+        assert names == ["dggs", "morton-dggs"]
+
+    def test_nested_attrs_unchanged_by_flip(self):
+        # The default store's attrs block is byte-identical in shape to the
+        # pre-flip form: name healpix, NESTED coordinate, one convention entry.
+        attrs = self._grid()._dggs_attrs()
+        assert attrs["dggs"]["name"] == "healpix"
+        assert attrs["dggs"]["coordinate"] == "cell_ids"
+        assert len(attrs["zarr_conventions"]) == 1
 
     def test_dggs_attrs_declare_resolution_exact(self):
         # O10 discriminator (issue #305): grid-derived cell coordinates are

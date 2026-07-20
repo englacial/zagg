@@ -27,7 +27,12 @@ from zagg.grids.base import (
     vector_array_spec,
     vlen_dtype_warning_suppressed,
 )
-from zagg.grids.morton import RESOLUTION_EXACT, morton_decimal, to_morton_array
+from zagg.grids.morton import (
+    MORTON_CONVENTION,
+    RESOLUTION_EXACT,
+    morton_decimal,
+    to_morton_array,
+)
 
 HEALPIX_BASE_CELLS: int = 12
 # Reference order at which ``assign`` resolves points before ``cells_of`` /
@@ -656,41 +661,52 @@ class HealpixGrid:
         return GroupSpec(members=members, attributes=self._dggs_attrs())
 
     def _dggs_attrs(self) -> dict:
+        dggs_entry = {
+            "schema_url": "https://raw.githubusercontent.com/zarr-conventions/dggs/refs/tags/v1/schema.json",
+            "spec_url": "https://github.com/zarr-conventions/dggs/blob/v1/README.md",
+            "uuid": "7b255807-140c-42ca-97f6-7a1cfecdbc38",
+            "name": "dggs",
+            "description": "Discrete Global Grid Systems convention for zarr",
+        }
+        common = {
+            "refinement_level": self.child_order,
+            # O10 resolution discriminator (issue #305, espg-ratified):
+            # grid-derived cell coordinates are "exact" by construction —
+            # every id is a true cell at its encoded order. "point"
+            # (RESOLUTION_POINT) is reserved for location-derived id
+            # fields (raw lat/lon cast to order 29 — the temporal event
+            # path), which the 29->24 clip rule on the mortie spec page
+            # applies to; no zagg aggregation output ever emits it.
+            "resolution": RESOLUTION_EXACT,
+            "spatial_dimension": "cells",
+            "ellipsoid": {
+                "name": "WGS84",
+                "semimajor_axis": 6378137.0,
+                "inverse_flattening": 298.257223563,
+            },
+            "compression": "none",
+        }
+        if self.cell_ids_encoding == "morton":
+            # D16 / issue #304 phase 1: a morton-declared store uses the
+            # DISTINCT grid name "morton" with the typed `morton` coordinate —
+            # never name: "healpix" + indexing_scheme: "morton", which a
+            # scheme-blind reader silently misreads as NESTED (garbage
+            # renders); an unknown grid name makes it hard-reject with a
+            # diagnostic instead, and matches moczarr's xdggs registration.
+            # The self-declared convention entry (issue #305; permanent UUID)
+            # rides the zarr_conventions LIST alongside the generic dggs
+            # entry, so a future upstream registry entry can coexist too.
+            return {
+                "zarr_conventions": [dggs_entry, dict(MORTON_CONVENTION)],
+                "dggs": {"name": "morton", **common, "coordinate": "morton"},
+            }
         return {
-            "zarr_conventions": [
-                {
-                    "schema_url": "https://raw.githubusercontent.com/zarr-conventions/dggs/refs/tags/v1/schema.json",
-                    "spec_url": "https://github.com/zarr-conventions/dggs/blob/v1/README.md",
-                    "uuid": "7b255807-140c-42ca-97f6-7a1cfecdbc38",
-                    "name": "dggs",
-                    "description": "Discrete Global Grid Systems convention for zarr",
-                }
-            ],
+            "zarr_conventions": [dggs_entry],
             "dggs": {
                 "name": "healpix",
-                "refinement_level": self.child_order,
-                # cell_ids_encoding: morton (issue #135) stores packed morton words
-                # as cell_ids, so the recorded scheme must not claim "nested" — a
-                # consumer decoding morton words as NESTED ids would mis-place every
-                # cell. "morton" is outside the DGGS convention's standard schemes;
-                # the flag is a test/prototype capability.
-                "indexing_scheme": self.cell_ids_encoding,
-                # O10 resolution discriminator (issue #305, espg-ratified):
-                # grid-derived cell coordinates are "exact" by construction —
-                # every id is a true cell at its encoded order. "point"
-                # (RESOLUTION_POINT) is reserved for location-derived id
-                # fields (raw lat/lon cast to order 29 — the temporal event
-                # path), which the 29->24 clip rule on the mortie spec page
-                # applies to; no zagg aggregation output ever emits it.
-                "resolution": RESOLUTION_EXACT,
-                "spatial_dimension": "cells",
-                "ellipsoid": {
-                    "name": "WGS84",
-                    "semimajor_axis": 6378137.0,
-                    "inverse_flattening": 298.257223563,
-                },
+                "indexing_scheme": "nested",
+                **common,
                 "coordinate": "cell_ids",
-                "compression": "none",
             },
         }
 
