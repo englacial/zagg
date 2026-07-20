@@ -2234,6 +2234,7 @@ def _dispatch_run_stats(
     result_prefix=None,
     output_creds_event=None,
     summary=None,
+    inline_rows=None,
 ) -> str | None:
     """Fire-and-forget worker-invoke run-record write (issue #313, D8).
 
@@ -2243,9 +2244,12 @@ def _dispatch_run_stats(
     Event invoke exactly like the root ``coverage.moc``. Transport is
     size-gated (the seam the PR #315 body describes): rows inline under
     :data:`_RUN_STATS_INLINE_CAP_BYTES`; above it the run's async status
-    prefix is sent as a pointer (``rows_from``) with only the failure rows
-    inline (no envelope exists to assemble them from); an oversized SYNC run
-    (no prefix) logs a fail-open skip. The D20 object key is pinned here
+    prefix is sent as a pointer (``rows_from``) with only the rows the worker
+    cannot reassemble from the mirrored envelopes riding inline. Those are
+    given by ``inline_rows`` when the caller knows them (the spatial path:
+    failure rows PLUS stale-worker fallback-success rows — issue #313); absent,
+    the failure rows alone are kept inline (the raster path builds no fallback
+    rows). An oversized SYNC run (no prefix) logs a fail-open skip. The D20 object key is pinned here
     (``timestamp`` rides the event), so the returned/announced
     ``run_stats_path`` names the real object — best-effort: the invoke is
     fire-and-forget, mirroring the root MOC's semantics. Fail-open
@@ -2272,14 +2276,18 @@ def _dispatch_run_stats(
         if len(json.dumps(rows)) <= _RUN_STATS_INLINE_CAP_BYTES:
             event["rows"] = rows
         elif result_prefix is not None:
-            failures = [r for r in rows if not r.get("success")]
-            if len(json.dumps(failures)) > _RUN_STATS_INLINE_CAP_BYTES:
+            inline = (
+                inline_rows
+                if inline_rows is not None
+                else [r for r in rows if not r.get("success")]
+            )
+            if len(json.dumps(inline)) > _RUN_STATS_INLINE_CAP_BYTES:
                 logger.warning(
-                    f"run stats failure rows alone exceed the inline budget "
-                    f"({len(failures)} rows); skipping run record (fail-open, issue #313)"
+                    f"run stats inline rows alone exceed the inline budget "
+                    f"({len(inline)} rows); skipping run record (fail-open, issue #313)"
                 )
                 return None
-            event["rows"] = failures
+            event["rows"] = inline
             event["rows_from"] = result_prefix
         else:
             logger.warning(
@@ -2302,7 +2310,7 @@ def _dispatch_run_stats(
         return None
 
 
-def _lambda_result_rows(results, *, run_id=None) -> list:
+def _lambda_result_rows(results, *, run_id=None) -> tuple[list, list]:
     """Run-parquet rows from the lambda dispatch's per-cell result dicts.
 
     Success rows come from the envelope-ridden worker record
@@ -2311,13 +2319,25 @@ def _lambda_result_rows(results, *, run_id=None) -> list:
     a failure row (error, duration until failure, retry count). ``run_id``
     stamps the dispatcher-built fallback/failure rows; envelope records
     already carry it (the worker copies it from the event).
+
+    Returns ``(rows, inline_rows)``. ``inline_rows`` is the subset that MUST
+    ride inline on the pointer transport (issue #313): the pointer path has
+    the worker re-derive success rows from the mirrored envelopes via
+    :func:`~zagg.telemetry.rows_from_status`, which reads only ``body["stats"]``
+    — so any row NOT backed by an envelope record (failure rows, and the
+    stale-worker fallback-success rows built here) would be dropped worker-side
+    and has to be sent inline alongside the pointer.
     """
     from zagg.telemetry import build_record, failure_record, flatten_record
 
     rows = []
+    inline_rows = []
     for r in results:
         body = r.get("body") or {}
         record = body.get("stats")
+        # Envelope-backed rows are re-derivable worker-side (rows_from_status);
+        # everything else the pointer path can't rebuild, so it rides inline.
+        rideable = record is not None
         if record is None:
             if r.get("status_code") == 200 and not r.get("error"):
                 # Stale deployed worker (no record in the envelope): derive one
@@ -2334,8 +2354,11 @@ def _lambda_result_rows(results, *, run_id=None) -> list:
                     duration_s=r.get("lambda_duration") or r.get("wall_time"),
                     run_id=run_id,
                 )
-        rows.append(flatten_record(record, retries=r.get("retries")))
-    return rows
+        row = flatten_record(record, retries=r.get("retries"))
+        rows.append(row)
+        if not rideable:
+            inline_rows.append(row)
+    return rows, inline_rows
 
 
 def _resolve_source_credentials(config) -> dict:
@@ -3406,15 +3429,17 @@ def _run_lambda(
     # failure rows from the dispatch results the RunReport accumulated. The
     # PUT itself rides a fire-and-forget worker invoke — the dispatcher may
     # hold an invoke-only role with no S3 write access.
+    stats_rows, stats_inline_rows = _lambda_result_rows(report.results, run_id=run_id)
     _dispatch_run_stats(
         state["lambda_client"],
         function_name,
         store_path,
-        _lambda_result_rows(report.results, run_id=run_id),
+        stats_rows,
         run_id=run_id,
         result_prefix=result_prefix,
         output_creds_event=output_creds_event,
         summary=summary,
+        inline_rows=stats_inline_rows,
     )
     logger.info(
         f"Done: {report.cells_with_data} cells, {report.total_obs:,} obs, {report.cells_error} errors, {wall_time:.1f}s"
