@@ -159,11 +159,13 @@ class TestProcessEventDispatch:
         event = _base_event(_healpix_config_dict())
         event["child_order"] = 12
         event["invoked_by"] = {"arn": "arn:aws:iam::123:user/x", "userid": "AIDAEXAMPLE"}
+        event["run_id"] = "deadbeef"
         resp, _captured = self._run(handler_mod, monkeypatch, event)
         body = json.loads(resp["body"])
         assert body["stats"]["schema_version"] == 1
         assert body["stats"]["shard_key"] == 12345
         assert body["stats"]["invoked_by"] == event["invoked_by"]
+        assert body["stats"]["run_id"] == "deadbeef"  # copied verbatim (issue #297)
 
     def test_handoff_event_key_forwarded_to_worker(self, handler_mod, monkeypatch):
         # issue #130: an explicit handoff event key reaches process_shard so the
@@ -1065,6 +1067,7 @@ class TestProcessHive:
         monkeypatch.setattr(processing, "process_shard", self._streaming_fake(grid))
         event = self._event(tmp_path)
         event["invoked_by"] = {"arn": "arn:aws:iam::123:user/x", "userid": "AIDAEXAMPLE"}
+        event["run_id"] = "deadbeef"
         resp = handler_mod._handle_process(event, _context())
         assert resp["statusCode"] == 200, resp["body"]
         body = json.loads(resp["body"])
@@ -1074,7 +1077,8 @@ class TestProcessHive:
         assert record == body["stats"]
         assert record["schema_version"] == 1
         assert record["shard_key"] == self._WORD
-        assert record["template_hash"] is None
+        assert record["semantic_hash"] is None
+        assert record["run_id"] == "deadbeef"  # copied verbatim (issue #297)
         assert record["success"] is True and record["error"] is None
         assert record["n_obs"] == 7 and record["cells_with_data"] == 5
         assert record["n_granules"] == 1

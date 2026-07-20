@@ -1248,10 +1248,11 @@ class TestRasterHiveLambdaBackend:
         assert proc_idx and modes.index("finalize") > max(proc_idx)
 
     def test_flat_process_events_unchanged(self, manifest, monkeypatch):
-        # Flat PROCESS events are byte-identical to pre-#247 runs — exactly
-        # the pre-hive key set, no window/hive keys — inside the issue #264
-        # lifecycle (ping -> sync raster setup -> fan-out), and no hive
-        # lifecycle invokes (no finalize/coverage) ride a flat run.
+        # Flat PROCESS events carry exactly the pre-hive key set — no
+        # window/hive keys — plus the always-on ``run_id`` stamp (issue #297)
+        # — inside the issue #264 lifecycle (ping -> sync raster setup ->
+        # fan-out), and no hive lifecycle invokes (no finalize/coverage) ride
+        # a flat run.
         import boto3
 
         cfg, sm_path, _shard, _data = manifest
@@ -1271,7 +1272,11 @@ class TestRasterHiveLambdaBackend:
             "config",
             "store_path",
             "time_index",
+            "run_id",
         }
+        # One run identity across the fan-out (issue #297): the worker copies
+        # it verbatim so sidecars join the run-level parquet.
+        assert isinstance(fake.events[-1]["run_id"], str) and fake.events[-1]["run_id"]
 
     def test_parity_with_local_backend(self, manifest, monkeypatch, tmp_path):
         # Both dispatchers, same inputs -> identical leaf sets and stamps

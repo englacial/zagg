@@ -35,6 +35,11 @@ Event payload (default / process mode):
         stats record (sidecar + envelope). Workers cannot see the invoker
         themselves (Event invokes carry no caller identity). Absent -> the
         stats record carries null.
+    "run_id": str (optional, issue #297) -- the dispatcher's per-run identity,
+        threaded like invoked_by: copied VERBATIM into the per-shard stats
+        record so leaf sidecars join back to the run-level stats parquet
+        (whose object name carries the same id). Absent -> the stats record
+        carries null.
     "result_url": str (optional, issue #151) -- where to ALSO write this
         invocation's response envelope as JSON (e.g.
         "s3://bucket/out.zarr.status/<run_id>/<shard_label>.json", where the
@@ -1155,6 +1160,7 @@ def _handle_process_raster(event: Dict[str, Any]) -> Dict[str, Any]:
                 metadata=body,
                 granule_ids=raster_granule_ids(event["granules"]),
                 invoked_by=event.get("invoked_by"),
+                run_id=event.get("run_id"),
                 lambda_config=lambda_env(),
             )
             body["stats"] = record
@@ -1256,6 +1262,7 @@ def _handle_process_raster(event: Dict[str, Any]) -> Dict[str, Any]:
             metadata=body,
             granule_ids=raster_granule_ids(event["granules"]),
             invoked_by=event.get("invoked_by"),
+            run_id=event.get("run_id"),
             lambda_config=lambda_env(),
         )
         return {"statusCode": 200, "body": json.dumps(body)}
@@ -1573,6 +1580,7 @@ def _handle_process(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
             metadata=metadata,
             granule_ids=event.get("granule_urls"),
             invoked_by=event.get("invoked_by"),
+            run_id=event.get("run_id"),
             lambda_config=lambda_env(),
         )
         metadata["stats"] = record

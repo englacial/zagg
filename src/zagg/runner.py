@@ -841,6 +841,10 @@ class RasterStrategy:
             "anonymous": source.get("anonymous", True),
         }
         max_workers = min(max_workers or 4, len(cells)) or 1
+        # Run identity for the stats records (issue #297): generated once per
+        # run, stamped into every record so leaf sidecars join back to the
+        # run-level parquet (which reuses it in its object name).
+        run_id = uuid.uuid4().hex
         t0 = time.time()
         shards_with_data = 0
         errors = 0
@@ -930,6 +934,7 @@ class RasterStrategy:
                 shard_key=int(shard_key),
                 metadata=meta,
                 granule_ids=raster_granule_ids(granules),
+                run_id=run_id,
             )
             meta["stats"] = record
             if store_layout == "hive" and meta.get("leaf_written"):
@@ -1011,13 +1016,13 @@ class RasterStrategy:
         rows = [flatten_record(m["stats"]) for m in ok_metas if m.get("stats")]
         rows += [
             flatten_record(
-                failure_record(shard_key=key, error=str(exc)),
+                failure_record(shard_key=key, error=str(exc), run_id=run_id),
                 error_class=type(exc).__name__,
             )
             for key, exc in stats_failures
         ]
         run_stats_path = _write_run_stats(
-            store_path, rows, run_id=uuid.uuid4().hex, store_kwargs=store_kwargs
+            store_path, rows, run_id=run_id, store_kwargs=store_kwargs
         )
         # Per-shard isolation lets one bad shard be counted and skipped, but a
         # run where EVERY shard raised (e.g. a config band whose ``asset`` is
@@ -1156,11 +1161,16 @@ class RasterStrategy:
         # Timeout, read once here. ``invocation="sync"`` skips the channel
         # (legacy RequestResponse). Only the SHARD fan-out goes async; the
         # ping/setup lifecycle below stays synchronous (issue #264).
+        # Run identity for the stats records (issue #297): generated once per
+        # run, stamped into every shard event (workers copy it verbatim into
+        # sidecar + envelope records) and reused for the run parquet's object
+        # name and the async status prefix.
+        run_id = uuid.uuid4().hex
         result_prefix = None
         result_box: dict = {}
         function_timeout_s = _DEFAULT_FUNCTION_TIMEOUT_S
         if invocation == "async":
-            result_prefix = f"{store_path.rstrip('/')}.status/{uuid.uuid4().hex}"
+            result_prefix = f"{store_path.rstrip('/')}.status/{run_id}"
             function_timeout_s = _get_function_timeout_s(client, function_name)
             logger.info(f"Async raster results at {result_prefix}")
         # Caller identity for the per-shard stats records (issue #297):
@@ -1252,6 +1262,9 @@ class RasterStrategy:
                 ev["profile"] = True
             if invoked_by is not None:
                 ev["invoked_by"] = invoked_by
+            # Threaded like invoked_by (issue #297): the worker copies it
+            # verbatim into the stats record so leaf sidecars join the run.
+            ev["run_id"] = run_id
             if output_creds_event is not None:
                 ev["output_credentials"] = output_creds_event
             return ev
@@ -1383,14 +1396,16 @@ class RasterStrategy:
                 rows.append(flatten_record(record))
         rows += [
             flatten_record(
-                failure_record(shard_key=key, error=error, duration_s=body.get("duration_s"))
+                failure_record(
+                    shard_key=key, error=error, duration_s=body.get("duration_s"), run_id=run_id
+                )
             )
             for key, error, body in stats_failures
         ]
         run_stats_path = _write_run_stats(
             store_path,
             rows,
-            run_id=uuid.uuid4().hex,
+            run_id=run_id,
             store_kwargs=_output_store_kwargs(output_creds_event, region),
         )
         if cells and errors == len(cells):
@@ -2180,13 +2195,15 @@ def _write_run_stats(store_path, rows, *, run_id, store_kwargs, summary=None) ->
         return None
 
 
-def _lambda_result_rows(results) -> list:
+def _lambda_result_rows(results, *, run_id=None) -> list:
     """Run-parquet rows from the lambda dispatch's per-cell result dicts.
 
     Success rows come from the envelope-ridden worker record
     (``body["stats"]``); a 200 body from a worker predating the record falls
     back to a dispatcher-built record over the same body; everything else is
-    a failure row (error, duration until failure, retry count).
+    a failure row (error, duration until failure, retry count). ``run_id``
+    stamps the dispatcher-built fallback/failure rows; envelope records
+    already carry it (the worker copies it from the event).
     """
     from zagg.telemetry import build_record, failure_record, flatten_record
 
@@ -2201,12 +2218,14 @@ def _lambda_result_rows(results) -> list:
                 record = build_record(
                     shard_key=r.get("shard_key") if r.get("shard_key") is not None else -1,
                     metadata=body,
+                    run_id=run_id,
                 )
             else:
                 record = failure_record(
                     shard_key=r.get("shard_key"),
                     error=r.get("error") or f"status {r.get('status_code')}",
                     duration_s=r.get("lambda_duration") or r.get("wall_time"),
+                    run_id=run_id,
                 )
         rows.append(flatten_record(record, retries=r.get("retries")))
     return rows
@@ -2415,6 +2434,10 @@ def _run_local(
 
     grid = from_config(config)
     _check_signature(grid, catalog_data)
+    # Run identity for the stats records (issue #297): generated once per run,
+    # stamped into every record so leaf sidecars join back to the run-level
+    # parquet (which reuses it in its object name).
+    run_id = uuid.uuid4().hex
     store_layout = get_store_layout(config)
     store_kwargs = {
         "region": region,
@@ -2519,6 +2542,7 @@ def _run_local(
                 shard_key=int(shard_key),
                 metadata=meta,
                 granule_ids=_resolve_urls(records, driver),
+                run_id=run_id,
             )
             meta["stats"] = record
             if store_layout == "hive" and not meta.get("error"):
@@ -2644,14 +2668,12 @@ def _run_local(
     rows = [flatten_record(m["stats"]) for m in report.results if m.get("stats")]
     rows += [
         flatten_record(
-            failure_record(shard_key=int(key), error=str(exc)),
+            failure_record(shard_key=int(key), error=str(exc), run_id=run_id),
             error_class=type(exc).__name__,
         )
         for key, exc in stats_failures
     ]
-    _write_run_stats(
-        store_path, rows, run_id=uuid.uuid4().hex, store_kwargs=store_kwargs, summary=summary
-    )
+    _write_run_stats(store_path, rows, run_id=run_id, store_kwargs=store_kwargs, summary=summary)
     logger.info(
         f"Done: {report.cells_with_data} cells, {report.total_obs:,} obs, {report.cells_error} errors, {wall_time:.1f}s"
     )
@@ -2907,6 +2929,7 @@ def _run_lambda(
             profile=profile,
             label=label,
             invoked_by=invoked_by,
+            run_id=run_id,
             **extra,
         )
 
@@ -3265,7 +3288,7 @@ def _run_lambda(
     # dispatch results the RunReport accumulated.
     _write_run_stats(
         store_path,
-        _lambda_result_rows(report.results),
+        _lambda_result_rows(report.results, run_id=run_id),
         run_id=run_id,
         store_kwargs=_output_store_kwargs(output_creds_event, region),
         summary=summary,
@@ -4376,6 +4399,7 @@ def _invoke_lambda_cell(
     poll_timeout_s=None,
     label=None,
     invoked_by=None,
+    run_id=None,
 ):
     """Invoke Lambda for a single cell with retry logic.
 
@@ -4444,6 +4468,10 @@ def _invoke_lambda_cell(
     # resolve failed (fail-open), keeping the event key optional.
     if invoked_by is not None:
         event["invoked_by"] = invoked_by
+    # Run identity, threaded like invoked_by (issue #297): the worker copies
+    # it verbatim into the stats record so leaf sidecars join the run parquet.
+    if run_id is not None:
+        event["run_id"] = run_id
     # Async dispatch (issue #151): tell the worker where to mirror its response
     # envelope and fire-and-forget. Absent -> the legacy synchronous invoke.
     invocation_type = "RequestResponse"

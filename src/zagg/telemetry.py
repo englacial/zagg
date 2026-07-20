@@ -3,7 +3,7 @@
 One versioned record per processed shard, built from the worker's existing
 ``metadata`` dict. Two consumers, one source: the JSON **sidecar** written as a
 SIBLING object next to a hive leaf ``.zarr`` (``stats.json``; the
-``{hash}.stats.json`` naming arrives with issue #299 — ``template_hash`` is a
+``{hash}.stats.json`` naming arrives with issue #299 — ``semantic_hash`` is a
 nullable placeholder until then), and the **run-level parquet** the dispatcher
 writes at the store root (one row per shard, failure rows included).
 
@@ -57,7 +57,8 @@ _SUM_OR_NONE_KEYS = (
 _MAX_OR_NONE_KEYS = ("max_memory_mb", "container_hwm_mb")
 _EQ_OR_NONE_KEYS = (
     "shard_key",
-    "template_hash",
+    "run_id",
+    "semantic_hash",
     "granules_sha256",
     "zagg_version",
     "lambda",
@@ -112,6 +113,7 @@ def build_record(
     metadata: dict,
     granule_ids: Iterable[str] | None = None,
     invoked_by: dict | None = None,
+    run_id: str | None = None,
     lambda_config: dict | None = None,
 ) -> dict:
     """Build one shard's stats record from the worker's ``metadata`` dict.
@@ -122,6 +124,9 @@ def build_record(
     telemetry keys when the caller stamped them. ``invoked_by`` is copied
     VERBATIM from the invoke payload — the dispatcher resolves it via
     ``sts get-caller-identity`` once per run; workers cannot see the invoker.
+    ``run_id`` is threaded the same way (dispatcher-generated, stamped through
+    the invoke payload, copied verbatim) so a leaf sidecar joins back to its
+    run-level parquet.
     ``lambda_config`` is :func:`lambda_env` on Lambda, ``None`` locally;
     when present it prices ``gb_seconds`` / ``est_cost_usd`` from
     ``duration_s`` (the billed-duration approximation the dispatcher's cost
@@ -155,7 +160,11 @@ def build_record(
     return {
         "schema_version": SCHEMA_VERSION,
         "shard_key": int(shard_key),
-        "template_hash": None,  # nullable until issue #299 lands the hasher
+        "run_id": run_id,
+        # The semantic-core hash (D19 rev 2, docs/design/sparse_coverage.md):
+        # hashes the config's semantic core, NOT the whole template. Nullable
+        # until issue #299 lands the hasher.
+        "semantic_hash": None,
         "zagg_version": _zagg_version(),
         "n_shards": 1,
         "n_granules": int(n_granules),
@@ -245,7 +254,7 @@ def _zagg_version() -> str:
     return zagg.__version__
 
 
-def failure_record(*, shard_key=None, error, duration_s=None) -> dict:
+def failure_record(*, shard_key=None, error, duration_s=None, run_id=None) -> dict:
     """Skeleton record for a shard with no worker record (issue #297 phase 3).
 
     Timed-out / OOM / dropped shards write no sidecar and return no envelope
@@ -257,6 +266,7 @@ def failure_record(*, shard_key=None, error, duration_s=None) -> dict:
     record = build_record(
         shard_key=shard_key if shard_key is not None else -1,
         metadata={"error": str(error) or "unknown failure", "duration_s": duration_s},
+        run_id=run_id,
     )
     if shard_key is None:
         record["shard_key"] = None
@@ -267,7 +277,8 @@ def failure_record(*, shard_key=None, error, duration_s=None) -> dict:
 _ROW_SCALARS = (
     "schema_version",
     "shard_key",
-    "template_hash",
+    "run_id",
+    "semantic_hash",
     "zagg_version",
     "n_shards",
     "n_granules",
@@ -319,9 +330,14 @@ def flatten_record(record: dict, *, retries=None, error_class=None) -> dict:
 
 
 def run_parquet_key(run_id: str, timestamp: str | None = None) -> str:
-    """Store-root object name of a run's stats parquet: run id + timestamp."""
+    """Store-root object name of a run's stats parquet: timestamp, then run id.
+
+    Timestamp-first (D20, docs/design/sparse_coverage.md) so a lexicographic
+    listing of ``stats_*.parquet`` is chronological and time-range queries can
+    prune on the key alone.
+    """
     ts = timestamp or datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
-    return f"stats_{run_id}_{ts}.parquet"
+    return f"stats_{ts}_{run_id}.parquet"
 
 
 def write_run_parquet(
