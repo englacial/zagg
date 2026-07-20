@@ -397,9 +397,16 @@ def sidecar_key(leaf_name: str, spec: str | None = None) -> str:
     absent instead of failing.
     """
     if spec == SPEC_V3:
+        from zagg.windows import validate_label
+
         stem = leaf_name.removesuffix(".zarr")
         if not stem or stem == leaf_name:
             raise ValueError(f"{leaf_name!r} is not a leaf zarr name")
+        # Match the legacy branch's strictness: a malformed stem (embedded
+        # ``/`` path escape, forbidden ``_``) must raise, not pass through as a
+        # malformed key. The ``all`` schedule-none token satisfies the explicit
+        # grammar, so it keeps passing.
+        validate_label(stem)
         return f"{stem}.stats.json"
     if spec not in _LEGACY_SPECS:
         raise ValueError(

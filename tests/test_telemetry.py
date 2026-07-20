@@ -330,6 +330,22 @@ class TestSidecarIO:
         assert sidecar_key("-4211322.zarr", "morton-hive/1") == "stats.json"
         assert sidecar_key("-4211322_2019.zarr", "morton-hive/2") == "stats_2019.json"
 
+    def test_v3_malformed_stem_raises(self):
+        # The v3 branch must be as strict as legacy: a stem that fails the label
+        # grammar (embedded ``/`` path escape, forbidden ``_``) raises rather
+        # than yielding a malformed sidecar key.
+        with pytest.raises(ValueError, match="grammar"):
+            sidecar_key("a/b.zarr", SPEC_V3)
+        with pytest.raises(ValueError, match="grammar"):
+            sidecar_key("foo_bar.zarr", SPEC_V3)
+        # The schedule-none token still satisfies the explicit grammar.
+        from zagg.windows import SCHEDULE_NONE_TOKEN
+
+        assert (
+            sidecar_key(f"{SCHEDULE_NONE_TOKEN}.zarr", SPEC_V3)
+            == f"{SCHEDULE_NONE_TOKEN}.stats.json"
+        )
+
     def test_v3_write_read_roundtrip(self, tmp_path):
         from zagg.windows import leaf_name_v3
 
