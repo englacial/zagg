@@ -361,14 +361,14 @@ def max_cost_usd(
 def estimate_cost_usd(
     catalog_data: dict | None = None,
     *,
-    template_hash: str | None = None,
+    semantic_hash: str | None = None,
     history: list | None = None,
 ) -> float | None:
     """Estimated run cost from prior-run history (issue #298 Phase 3 -- stub).
 
     Interface placeholder for the pilot-first estimator ratified on issue
     #298; the implementation is deferred behind issues #297 (per-shard stats
-    sidecars) and #299 (template-hash identity), which create the history it
+    sidecars) and #299 (semantic-hash identity), which create the history it
     reads. Until both land there is nothing to estimate from, so this always
     returns ``None`` and the run's ``cost.estimated_cost_usd`` stays a
     placeholder.
@@ -381,7 +381,7 @@ def estimate_cost_usd(
 
     Two tiers, tried in order once wired:
 
-    * **Tier 1 -- pilot-first.** Prior actuals for the *same* template hash at
+    * **Tier 1 -- pilot-first.** Prior actuals for the *same* semantic hash at
       any shard (the dev -> single-shard test -> fleet workflow means a pilot
       run usually exists), scaled to the remaining shards by per-shard
       granule/observation counts from the shardmap. One measured shard scaled
@@ -395,8 +395,8 @@ def estimate_cost_usd(
     catalog_data : dict, optional
         The loaded shardmap: per-shard granule/obs counts for the tier-1
         scaling and the tier-2 regressors.
-    template_hash : str, optional
-        The run's template identity (issue #299) used to select tier-1 priors.
+    semantic_hash : str, optional
+        The run's semantic-hash identity (issue #299) used to select tier-1 priors.
     history : optional
         Prior-run sidecar records (issue #297) to estimate from.
 
