@@ -3559,6 +3559,36 @@ class TestDispatchRunStats:
         assert [r["success"] for r in event["rows"]] == [False]
         assert path is not None
 
+    def test_pointer_transport_rides_inline_rows(self, monkeypatch):
+        # The spatial path passes inline_rows = failure rows PLUS stale-worker
+        # fallback-success rows (issue #313): rows_from_status can't rebuild a
+        # fallback-success shard worker-side, so it must ride inline — not be
+        # dropped by the default `not success` failure-filter.
+        from zagg import runner
+        from zagg.telemetry import build_record, flatten_record
+
+        monkeypatch.setattr(runner, "_RUN_STATS_INLINE_CAP_BYTES", 2048)
+        client = self._Client()
+        rows = self._rows(n_ok=5, n_fail=1)
+        # A fallback-success row (success=True) the caller marked inline-required.
+        fallback = flatten_record(build_record(shard_key=999, metadata={"duration_s": 1.0}))
+        inline_rows = [fallback] + [r for r in rows if not r.get("success")]
+        path = runner._dispatch_run_stats(
+            client,
+            "fn",
+            "s3://b/out.zarr",
+            rows + [fallback],
+            run_id="rid",
+            result_prefix="s3://b/out.zarr.status/rid",
+            inline_rows=inline_rows,
+        )
+        (event,) = client.events
+        assert event["rows_from"] == "s3://b/out.zarr.status/rid"
+        # The fallback-success row rides inline despite success=True.
+        assert 999 in [r["shard_key"] for r in event["rows"]]
+        assert [r["shard_key"] for r in event["rows"]] == [r["shard_key"] for r in inline_rows]
+        assert path is not None
+
     def test_oversized_sync_run_skips_fail_open(self, monkeypatch):
         from zagg import runner
 
@@ -3616,13 +3646,17 @@ class TestRunStatsRows:
                 "wall_time": 42.0,
             },
         ]
-        rows = _lambda_result_rows(results)
+        rows, inline_rows = _lambda_result_rows(results)
         assert [r["shard_key"] for r in rows] == [1, 2, 3]
         assert rows[0]["success"] is True and rows[0]["retries"] == 0
         assert rows[1]["success"] is True and rows[1]["n_obs"] == 3
         assert rows[2]["success"] is False
         assert rows[2]["error_class"] == "Lambda timeout"
         assert rows[2]["duration_s"] == 42.0 and rows[2]["retries"] == 3
+        # inline_rows = the rows the pointer path can't reassemble worker-side:
+        # the stale-worker fallback-success row (shard 2) and the failure row
+        # (shard 3), but NOT the envelope-backed success row (shard 1).
+        assert [r["shard_key"] for r in inline_rows] == [2, 3]
 
 
 class TestWorkerPhaseTimings:
