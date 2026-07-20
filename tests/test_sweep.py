@@ -9,6 +9,7 @@ leaves leaf reads intact).
 
 import json
 from datetime import datetime, timezone
+from pathlib import Path
 
 import obstore
 import pytest
@@ -357,14 +358,203 @@ class TestMocRollup:
             [other, morton_word("-311")]
         )
 
-    def test_default_families_cover_stats_and_moc(self, tmp_path):
+    def test_default_families_cover_all_implemented(self, tmp_path):
         _write_manifest(tmp_path)
         _put_leaf(tmp_path, "-311")
         _stamp_leaf(tmp_path, "-311")
         summary = run_sweep(str(tmp_path), _leaf_refs("-311"))
-        assert set(summary["families"]) == {"stats", "moc"}
+        assert set(summary["families"]) == {"stats", "moc", "submap"}
         assert _rollup(tmp_path, "-3", family="stats") is not None
         assert _rollup(tmp_path, "-3", family="moc") is not None
+        # No leaf sub-map was written -> the submap family finds nothing and
+        # stays empty without failing the pass.
+        assert summary["families"]["submap"]["empty"] >= 1
+        assert _rollup(tmp_path, "-3", family="submap") is None
+
+
+SUBMAP_SIG = {
+    "type": "healpix",
+    "indexing_scheme": "nested",
+    "parent_order": SHARD_ORDER,
+    "child_order": SHARD_ORDER + 2,
+    "layout": "flat",
+}
+
+
+def _entry(gid):
+    return {"id": gid, "s3": f"s3://bucket/{gid}", "https": f"https://host/{gid}"}
+
+
+def _emit_submap(root, decimal, gids, window=None):
+    from zagg.sweep import write_leaf_submap
+
+    write_leaf_submap(
+        str(root),
+        morton_word(decimal),
+        [_entry(g) for g in gids],
+        grid_signature=SUBMAP_SIG,
+        metadata={"collection": "TEST_001"},
+        window=window,
+    )
+
+
+class TestSubmapNaming:
+    def test_legacy_and_v3_names(self):
+        from zagg.sweep import submap_key
+
+        assert submap_key("-311.zarr") == "shardmap.json"
+        assert submap_key("-311_2019.zarr") == "shardmap_2019.json"
+        assert submap_key("2019.zarr", spec="morton-hive/3") == "2019.shardmap.json"
+
+    def test_unknown_spec_raises(self):
+        from zagg.sweep import submap_key
+
+        with pytest.raises(ValueError, match="unknown store spec"):
+            submap_key("-311.zarr", spec="morton-hive/9")
+
+
+class TestSubmapRollup:
+    def test_leaf_submap_is_loadable_shardmap_json(self, tmp_path):
+        from zagg.catalog.shardmap import ShardMap
+        from zagg.sweep import _node_rel
+
+        _write_manifest(tmp_path)
+        _emit_submap(tmp_path, "-311", ["gA", "gB"])
+        path = tmp_path / _node_rel("-311") / "shardmap.json"
+        sm = ShardMap.from_json(str(path))
+        assert sm.shard_keys == [morton_word("-311")]
+        assert [g["id"] for g in sm.granules[0]] == ["gA", "gB"]
+        assert sm.metadata["total_shards"] == 1 and sm.metadata["total_granules"] == 2
+        assert json.loads(path.read_text())["written_at"]  # staleness stamp rides the file
+
+    def test_rollup_equals_direct_reproject(self, tmp_path):
+        from zagg.catalog.shardmap import ShardMap
+        from zagg.sweep import _ReprojectTarget
+
+        _write_manifest(tmp_path)
+        per_shard = {"-311": ["gA", "gB"], "-312": ["gB"], "-321": ["gC"]}
+        for dec, gids in per_shard.items():
+            _emit_submap(tmp_path, dec, gids)
+        result = run_sweep(str(tmp_path), _leaf_refs(*per_shard), families=("submap",))
+        assert result["families"]["submap"]["written"] == 6
+        # -31 folds two shards; a granule shared across them (gB) counts once
+        # (the #294 dedup rule), and the rollup grid signature carries the
+        # node's order.
+        r31 = _rollup(tmp_path, "-31", family="submap")["payload"]
+        assert r31["shard_keys"] == [morton_word("-31")]
+        assert sorted(e["id"] for e in r31["granules"][0]) == ["gA", "gB"]
+        assert r31["grid_signature"]["parent_order"] == 1
+        assert r31["metadata"]["reproject"]["method"] == "coarsen"
+        # Rollup == direct (§8.3): the base rollup equals the run-level
+        # ShardMap reprojected straight to order 0 by the production coarsen.
+        direct = ShardMap(
+            dict(SUBMAP_SIG),
+            [morton_word(d) for d in sorted(per_shard)],
+            [[_entry(g) for g in per_shard[d]] for d in sorted(per_shard)],
+            {"collection": "TEST_001"},
+        ).reproject(_ReprojectTarget(SUBMAP_SIG, 0))
+        r3 = _rollup(tmp_path, "-3", family="submap")["payload"]
+        assert r3["shard_keys"] == [int(k) for k in direct.shard_keys]
+        assert {e["id"] for e in r3["granules"][0]} == {e["id"] for e in direct.granules[0]}
+
+    def test_window_union_dedups_by_id(self, tmp_path):
+        _write_manifest(tmp_path)
+        _emit_submap(tmp_path, "-311", ["gA", "gB"], window="2019")
+        _emit_submap(tmp_path, "-311", ["gB", "gC"], window="2020")
+        word = morton_word("-311")
+        run_sweep(str(tmp_path), [(word, "2019"), (word, "2020")], families=("submap",))
+        node = _rollup(tmp_path, "-311", family="submap")
+        assert node["generation"]["n_leaves"] == 2
+        assert node["payload"]["shard_keys"] == [word]
+        assert sorted(e["id"] for e in node["payload"]["granules"][0]) == ["gA", "gB", "gC"]
+        # Same-order union, not a reprojection: no fold stamp at the shard node.
+        assert "reproject" not in node["payload"]["metadata"]
+
+    def test_idempotent_and_incremental(self, tmp_path):
+        _write_manifest(tmp_path)
+        _emit_submap(tmp_path, "-311", ["gA"])
+        run_sweep(str(tmp_path), _leaf_refs("-311"), families=("submap",))
+        second = run_sweep(str(tmp_path), _leaf_refs("-311"), families=("submap",))
+        assert second["families"]["submap"]["written"] == 0
+        # A later run adds a sibling shard; sweeping ONLY it keeps -311's
+        # contribution via the stored sibling rollup.
+        _emit_submap(tmp_path, "-312", ["gB"])
+        run_sweep(str(tmp_path), _leaf_refs("-312"), families=("submap",))
+        r31 = _rollup(tmp_path, "-31", family="submap")["payload"]
+        assert sorted(e["id"] for e in r31["granules"][0]) == ["gA", "gB"]
+
+    def test_malformed_submap_counts_failed(self, tmp_path):
+        from zagg.sweep import _node_rel
+
+        _write_manifest(tmp_path)
+        node = tmp_path / _node_rel("-311")
+        node.mkdir(parents=True)
+        (node / "shardmap.json").write_text(json.dumps({"shard_keys": [1]}))  # missing keys
+        result = run_sweep(str(tmp_path), _leaf_refs("-311"), families=("submap",))
+        assert result["families"]["submap"]["failed"] == 1
+        assert result["families"]["submap"]["written"] == 0
+
+
+class TestLocalRunnerEmitsSubmap:
+    """The local backend's in-process worker writes the leaf sub-map on
+    success (issue #300) — sibling to the stats sidecar, fail-open."""
+
+    SHARD = "-5112333"  # order 6, matching default_config's parent_order
+
+    def _agg(self, monkeypatch, tmp_path, *, meta_error=None):
+        from zagg import hive, runner
+        from zagg.config import default_config
+        from zagg.runner import agg
+
+        cfg = default_config("atl06")
+        cfg.output["store_layout"] = "hive"
+        shard = morton_word(self.SHARD)
+        monkeypatch.setattr(runner, "get_nsidc_s3_credentials", lambda: {"accessKeyId": "a"})
+
+        def fake_hive_write(shard_key, granule_urls, grid, s3_creds, store_root, config, **kw):
+            return {"shard_key": int(shard_key), "error": meta_error, "total_obs": 1}
+
+        monkeypatch.setattr(hive, "process_and_write_hive", fake_hive_write)
+        catalog = {
+            "metadata": {"short_name": "ATL06", "version": "007"},
+            "grid_signature": {
+                "type": "healpix",
+                "indexing_scheme": "nested",
+                "parent_order": int(cfg.output["grid"]["parent_order"]),
+                "child_order": int(cfg.output["grid"]["child_order"]),
+                "layout": cfg.output["grid"].get("layout", "fullsphere"),
+            },
+            "shard_keys": [int(shard)],
+            "granules": [[_entry("g1")]],
+        }
+        path = tmp_path / "catalog.json"
+        path.write_text(json.dumps(catalog))
+        root = str(tmp_path / "out")
+        agg(cfg, catalog=str(path), store=root, backend="local")
+        return root, shard, catalog
+
+    def test_success_writes_leaf_submap(self, monkeypatch, tmp_path):
+        from zagg.catalog.shardmap import ShardMap
+        from zagg.sweep import submap_key
+
+        root, shard, catalog = self._agg(monkeypatch, tmp_path)
+        from zagg.hive import shard_leaf_path
+
+        leaf = shard_leaf_path(root, shard)
+        prefix, _, name = leaf.rpartition("/")
+        sub = ShardMap.from_json(f"{prefix}/{submap_key(name)}")
+        assert sub.shard_keys == [shard]
+        assert [g["id"] for g in sub.granules[0]] == ["g1"]
+        assert sub.grid_signature == catalog["grid_signature"]
+
+    def test_failed_shard_writes_none(self, monkeypatch, tmp_path):
+        from zagg.hive import shard_leaf_path
+        from zagg.sweep import submap_key
+
+        root, shard, _catalog = self._agg(monkeypatch, tmp_path, meta_error="boom")
+        leaf = shard_leaf_path(root, shard)
+        prefix, _, name = leaf.rpartition("/")
+        assert not Path(f"{prefix}/{submap_key(name)}").exists()
 
 
 class TestFamilyRegistry:
@@ -374,7 +564,7 @@ class TestFamilyRegistry:
 
     @pytest.mark.parametrize(
         ("name", "marker"),
-        [("submap", "PR #295"), ("overview", "issue #201"), ("debris", "not implemented")],
+        [("overview", "issue #201"), ("debris", "not implemented")],
     )
     def test_stub_families_refuse_with_pointer(self, name, marker):
         assert name in sweep_mod.FAMILIES  # registered slot stays visible
@@ -385,5 +575,5 @@ class TestFamilyRegistry:
         except NotImplementedError as e:
             assert marker in str(e)
 
-    def test_stats_is_a_default_family(self):
-        assert "stats" in sweep_mod.DEFAULT_FAMILIES
+    def test_default_families_are_the_implemented_set(self):
+        assert sweep_mod.DEFAULT_FAMILIES == ("stats", "moc", "submap")

@@ -808,6 +808,10 @@ class RasterStrategy:
                 output_endpoint_url=resolved_endpoint,
                 store_layout=store_layout,
                 dataset={"short_name": md.get("short_name"), "version": md.get("version")},
+                catalog_signature={
+                    "grid_signature": catalog_data.get("grid_signature"),
+                    "metadata": catalog_data.get("metadata"),
+                },
                 profile=profile,
                 invocation=invocation,
                 on_progress=on_progress,
@@ -947,6 +951,23 @@ class RasterStrategy:
                     write_sidecar(leaf, record, **store_kwargs)
                 except Exception as e:
                     logger.warning(f"stats sidecar write failed (fail-open, issue #297): {e}")
+                # Leaf sub-map (issue #300, D22): the unit's raster ShardMap
+                # entries as full ShardMap JSON, sibling to the stats sidecar
+                # (same in-process rationale as the aggregation local path).
+                try:
+                    from zagg.sweep import write_leaf_submap
+
+                    write_leaf_submap(
+                        store_path,
+                        int(shard_key),
+                        granules,
+                        grid_signature=catalog_data["grid_signature"],
+                        metadata=catalog_data.get("metadata"),
+                        window=window["label"] if window else None,
+                        store_kwargs=store_kwargs,
+                    )
+                except Exception as e:
+                    logger.warning(f"leaf sub-map write failed (fail-open, issue #300): {e}")
             return meta, stage_stats, write_s
 
         stage_max: dict = {}
@@ -1075,6 +1096,7 @@ class RasterStrategy:
         output_endpoint_url,
         store_layout="flat",
         dataset=None,
+        catalog_signature=None,
         profile=False,
         invocation="async",
         on_progress=None,
@@ -1252,6 +1274,12 @@ class RasterStrategy:
                 # byte-identical to pre-#247 runs.
                 if window is not None:
                     ev["window"] = window
+                # Leaf sub-map fields (issue #300, D22): raster events already
+                # carry the unit's full ShardMap entries in ``granules``, so
+                # only the catalog identity rides here; the worker writes the
+                # full ShardMap JSON sub-map next to the leaf on success.
+                if catalog_signature is not None:
+                    ev["submap"] = catalog_signature
             else:
                 keys = {e.get("time_key") or e.get("datetime") for e in granules if e.get("assets")}
                 ev["time_index"] = {k: time_index[k] for k in keys}
@@ -2555,6 +2583,25 @@ def _run_local(
                     write_sidecar(leaf, record, **store_kwargs)
                 except Exception as e:
                     logger.warning(f"stats sidecar write failed (fail-open, issue #297): {e}")
+                # Leaf sub-map (issue #300, D22): the unit's ShardMap entries as
+                # full ShardMap JSON, sibling to the stats sidecar. The local
+                # "worker" is in-process, so the catalog fields are in scope
+                # (the Lambda path threads them via the event's submap block).
+                # Fail-open, like the sidecar.
+                try:
+                    from zagg.sweep import write_leaf_submap
+
+                    write_leaf_submap(
+                        store_path,
+                        int(shard_key),
+                        records,
+                        grid_signature=catalog_data["grid_signature"],
+                        metadata=catalog_data.get("metadata"),
+                        window=window["label"] if window else None,
+                        store_kwargs=store_kwargs,
+                    )
+                except Exception as e:
+                    logger.warning(f"leaf sub-map write failed (fail-open, issue #300): {e}")
             return {"shard_key": shard_key, "ok": True, "meta": meta}
         except Exception as e:
             return {"shard_key": shard_key, "ok": False, "error": e}
@@ -2911,6 +2958,16 @@ def _run_lambda(
         granule_urls = _resolve_urls(records, "s3")
         ds = _clamped_data_source(config.data_source, len(granule_urls))
         cell_config_dict = {**config_dict, "data_source": ds} if ds is not None else config_dict
+        # Leaf sub-map fields (issue #300, D22): the worker writes the full
+        # ShardMap JSON sub-map at the leaf prefix on success, but the event's
+        # bare granule_urls can't reconstruct the {id, s3, https} entries — so
+        # the unit's entries + the catalog identity ride a dedicated block
+        # (size-gated in _invoke_lambda_cell; dropped, never fatal).
+        submap = {
+            "grid_signature": catalog_data["grid_signature"],
+            "metadata": catalog_data.get("metadata"),
+            "granules": records,
+        }
         return _invoke_lambda_cell(
             state["lambda_client"],
             grid.block_index(int(shard_key)),
@@ -2930,6 +2987,7 @@ def _run_lambda(
             label=label,
             invoked_by=invoked_by,
             run_id=run_id,
+            submap=submap,
             **extra,
         )
 
@@ -4400,6 +4458,7 @@ def _invoke_lambda_cell(
     label=None,
     invoked_by=None,
     run_id=None,
+    submap=None,
 ):
     """Invoke Lambda for a single cell with retry logic.
 
@@ -4425,6 +4484,12 @@ def _invoke_lambda_cell(
     connection sits idle while the shard runs, so long shards survive NAT idle
     timeouts (GitHub-hosted runners sever synchronous invokes at ~4 min). When
     ``None`` (legacy sync path) the invoke is byte-identical to before.
+    ``submap`` (issue #300) forwards the unit's leaf sub-map fields
+    (``grid_signature``/``metadata``/``granules`` — the ShardMap entries the
+    worker cannot derive from bare urls) so the worker writes the D22 full
+    ShardMap JSON sub-map next to the leaf; size-gated below (dropped, never
+    fatal, when it would push an async event over the 256 KB cap) and omitted
+    (``None``) the event stays byte-identical.
     """
     wall_start = time.time()
 
@@ -4484,6 +4549,20 @@ def _invoke_lambda_cell(
     # rather than letting every attempt fail on Lambda's raw
     # RequestEntityTooLargeException (issue #151).
     payload = json.dumps(event)
+    # Leaf sub-map block (issue #300): attached only when it FITS — a unit
+    # whose granule entries would push an async event over the cap keeps its
+    # pre-#300 payload (the sub-map is a regenerable D9 artifact; the manual
+    # sweep CLI is the backstop), so the cap gate below can never start
+    # rejecting a run that dispatched fine before.
+    if submap is not None:
+        with_submap = json.dumps({**event, "submap": submap})
+        if invocation_type != "Event" or len(with_submap) <= _ASYNC_PAYLOAD_CAP_BYTES:
+            payload = with_submap
+        else:
+            logger.debug(
+                f"cell {label or shard_key}: dropping submap block ({len(with_submap):,} "
+                f"bytes over the async budget); leaf sub-map deferred to the sweep CLI"
+            )
     if invocation_type == "Event" and len(payload) > _ASYNC_PAYLOAD_CAP_BYTES:
         raise ValueError(
             f"cell {label or shard_key} event payload is {len(payload):,} bytes, over the "

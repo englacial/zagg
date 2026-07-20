@@ -40,6 +40,16 @@ Event payload (default / process mode):
         record so leaf sidecars join back to the run-level stats parquet
         (whose object name carries the same id). Absent -> the stats record
         carries null.
+    "submap": dict (optional, issue #300, hive only) -- {"grid_signature",
+        "metadata", "granules"} leaf sub-map fields: on success the worker
+        writes the unit's full ShardMap JSON sub-map (D22) sibling to the
+        stats sidecar via zagg.sweep.write_leaf_submap. The dispatcher
+        threads the {id, s3, https} granule entries here because the event's
+        bare granule_urls can't reconstruct them; size-gated dispatcher-side
+        (dropped when it would push an async event over the 256 KB cap).
+        Absent -> no write (old dispatchers keep working). The raster
+        process_raster mode carries the same block minus "granules" (its
+        events already ship the entries).
     "result_url": str (optional, issue #151) -- where to ALSO write this
         invocation's response envelope as JSON (e.g.
         "s3://bucket/out.zarr.status/<run_id>/<shard_label>.json", where the
@@ -1177,6 +1187,28 @@ def _handle_process_raster(event: Dict[str, Any]) -> Dict[str, Any]:
                     write_sidecar(leaf, record, **_output_store_kwargs(event))
                 except Exception as e:
                     logger.warning(f"stats sidecar write failed (fail-open, issue #297): {e}")
+                # Leaf sub-map (issue #300, D22): full ShardMap JSON next to
+                # the stats sidecar. Raster events already carry the unit's
+                # ShardMap entries in ``granules``; the ``submap`` block adds
+                # the catalog identity a worker cannot derive. Absent block
+                # (old dispatcher) -> no write, fail-open like the sidecar.
+                submap = event.get("submap")
+                if submap:
+                    try:
+                        from zagg.sweep import write_leaf_submap
+
+                        window = event.get("window")
+                        write_leaf_submap(
+                            event["store_path"],
+                            shard_key,
+                            event["granules"],
+                            grid_signature=submap["grid_signature"],
+                            metadata=submap.get("metadata"),
+                            window=window["label"] if window else None,
+                            store_kwargs=_output_store_kwargs(event),
+                        )
+                    except Exception as e:
+                        logger.warning(f"leaf sub-map write failed (fail-open, issue #300): {e}")
             return {"statusCode": 200, "body": json.dumps(body)}
 
         time_index = {k: int(v) for k, v in event["time_index"].items()}
@@ -1595,6 +1627,28 @@ def _handle_process(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
                 write_sidecar(leaf, record, **_output_store_kwargs(event))
             except Exception as e:
                 logger.warning(f"stats sidecar write failed (fail-open, issue #297): {e}")
+            # Leaf sub-map (issue #300, D22): full ShardMap JSON next to the
+            # stats sidecar. The event's bare granule_urls can't reconstruct
+            # the ShardMap entries, so the dispatcher threads them (plus the
+            # catalog identity) in the size-gated ``submap`` block; absent
+            # (old dispatcher, or dropped for the async cap) -> no write.
+            submap = event.get("submap")
+            if submap:
+                try:
+                    from zagg.sweep import write_leaf_submap
+
+                    window = event.get("window")
+                    write_leaf_submap(
+                        store_path,
+                        int(shard_key),
+                        submap.get("granules") or [],
+                        grid_signature=submap["grid_signature"],
+                        metadata=submap.get("metadata"),
+                        window=window["label"] if window else None,
+                        store_kwargs=_output_store_kwargs(event),
+                    )
+                except Exception as e:
+                    logger.warning(f"leaf sub-map write failed (fail-open, issue #300): {e}")
 
         # Log structured result
         logger.info(

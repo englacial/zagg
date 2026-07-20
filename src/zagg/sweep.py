@@ -3,8 +3,9 @@
 One idempotent bottom-up pass over a hive store's digit tree that folds leaf
 artifacts into interior-node rollups, per registered **artifact family**
 (D22): stats sidecars (the :func:`zagg.telemetry.merge` fold), MOC regen,
-sub-shardmap rollups (stubbed on PR #295), overview zarrs (reserved for
-issue #201), and optional debris collection (stubbed). Everything the sweep
+sub-shardmap rollups (leaf ShardMap JSON folded via the #294 exact coarsen
+regroup), overview zarrs (reserved for issue #201), and optional debris
+collection (stubbed). Everything the sweep
 writes is a **regenerable cache, never truth** (D9): deleting every rollup
 leaves all leaf reads intact, and the leaf sidecars/stamps remain the durable
 ground truth.
@@ -49,8 +50,8 @@ logger = logging.getLogger(__name__)
 #: Envelope version of every rollup object this module writes.
 SWEEP_SPEC = "zagg-sweep/1"
 
-#: Families swept when the caller does not choose (D22 phases 1-2).
-DEFAULT_FAMILIES = ("stats", "moc")
+#: Families swept when the caller does not choose (D22 phases 1-3).
+DEFAULT_FAMILIES = ("stats", "moc", "submap")
 
 
 class SweepFamily:
@@ -83,8 +84,13 @@ class SweepFamily:
         """
         raise NotImplementedError
 
-    def merge(self, payloads: list) -> dict:
-        """Fold payloads into one (associative — rollup == direct, §8.3)."""
+    def merge(self, payloads: list, *, node, order) -> dict:
+        """Fold payloads into one (associative — rollup == direct, §8.3).
+
+        ``node``/``order`` name the target rollup node (decimal prefix and its
+        morton order) for families whose fold is order-aware (the sub-shardmap
+        reproject); order-free families ignore them.
+        """
         raise NotImplementedError
 
     def finish(self, store_root, tops, shard_order, store_kwargs) -> dict:
@@ -114,7 +120,7 @@ class StatsFamily(SweepFamily):
             return None
         return record, record.get("timestamp")
 
-    def merge(self, payloads: list) -> dict:
+    def merge(self, payloads: list, *, node, order) -> dict:
         from zagg.telemetry import merge
 
         return merge(payloads)
@@ -154,7 +160,7 @@ class MocFamily(SweepFamily):
         payload = _moc_payload([morton_word(decimal)], stamp.get("time_range"))
         return payload, stamp.get("written_at")
 
-    def merge(self, payloads: list) -> dict:
+    def merge(self, payloads: list, *, node, order) -> dict:
         import numpy as np
 
         from zagg.hive import root_coverage_words
@@ -232,15 +238,172 @@ def _moc_payload(words, time_range) -> dict:
     return payload
 
 
+#: Leaf sub-map object name (bare leaves); windowed and ``/3`` leaves derive
+#: their names through :func:`submap_key`, single-sourced on the stats-sidecar
+#: naming seam.
+SUBMAP_NAME = "shardmap.json"
+
+
+def submap_key(leaf_name: str, spec: str | None = None) -> str:
+    """Sub-map object name for a leaf zarr basename, keyed by store spec.
+
+    Single-sourced on the PR #307 sidecar-naming seam
+    (:func:`zagg.telemetry.sidecar_key`) with the ``shardmap`` stem swapped in:
+    legacy stores get ``shardmap.json`` / ``shardmap_{window}.json``,
+    ``morton-hive/3`` stores get ``{window}.shardmap.json`` — so the issue
+    #299 writer flip renames both sidecars through one seam. Raises on an
+    unknown spec, exactly as the seam does.
+    """
+    from zagg.telemetry import sidecar_key
+
+    key = sidecar_key(leaf_name, spec)
+    if key.endswith(".stats.json"):  # D23 /3 grammar: {stem}.stats.json
+        return key.removesuffix(".stats.json") + ".shardmap.json"
+    return "shardmap" + key.removeprefix("stats")  # legacy: stats[_{window}].json
+
+
+def write_leaf_submap(
+    store_root: str,
+    shard_key,
+    granules,
+    *,
+    grid_signature: dict,
+    metadata: dict | None = None,
+    window: str | None = None,
+    spec: str | None = None,
+    store_kwargs: dict | None = None,
+) -> None:
+    """PUT one leaf's sub-map — full ShardMap JSON (D22, ratified) — at its prefix.
+
+    The payload is a one-shard :class:`~zagg.catalog.shardmap.ShardMap` in the
+    standard JSON schema (``metadata``/``grid_signature``/``shard_keys``/
+    ``granules``) plus a top-level ``written_at`` staleness stamp — extra keys
+    are ignored by ``ShardMap.from_json``, so the object stays loadable as-is.
+    ``granules`` are the unit's ShardMap entries, copied verbatim (windowed
+    units carry their window's subset, so the shard-node fold's window union
+    reassembles the shard). ``metadata`` is the run catalog's, with the
+    whole-catalog counts and build fields rewritten to describe this sub-map
+    (the same fields ``reproject`` strips from derived maps). Written by the
+    worker on success, sibling to the stats sidecar — call sites fail open.
+    """
+    import obstore
+
+    from zagg.hive import _utcnow, shard_leaf_path
+    from zagg.store import open_object_store
+
+    entries = [dict(g) for g in granules]
+    meta = dict(metadata or {})
+    for stale in ("aoi_mask", "build_wall_s", "reproject"):
+        meta.pop(stale, None)
+    meta.update(total_shards=1, total_granules=len(entries), total_pairs=len(entries))
+    payload = {
+        "metadata": meta,
+        "grid_signature": dict(grid_signature),
+        "shard_keys": [int(shard_key)],
+        "granules": [entries],
+        "written_at": _utcnow(),
+    }
+    leaf = shard_leaf_path(store_root, int(shard_key), window=window)
+    prefix, _, name = leaf.rstrip("/").rpartition("/")
+    obstore.put(
+        open_object_store(prefix, **(store_kwargs or {})),
+        submap_key(name, spec),
+        json.dumps(payload, indent=1).encode(),
+    )
+
+
 class SubmapFamily(SweepFamily):
-    """Sub-shardmap rollups (D22) — registered, NOT implemented yet."""
+    """Sub-shardmap rollups (D22): leaf ShardMap JSON folded via ``reproject``.
+
+    Leaf artifact: the full-ShardMap-JSON sub-map the worker writes next to
+    the leaf (:func:`write_leaf_submap`). Shard-node fold: the windows' entry
+    lists union, deduplicated by granule ``id`` (a granule spanning two
+    windows counts once). Interior fold: children sub-maps concatenate and
+    coarsen to the node's order via :meth:`ShardMap.reproject` — the #294
+    exact pure regroup (granule union deduped by id), now over stored
+    artifacts — so the rollup at order N equals a direct reproject of the
+    leaf-level map to N (§8.3). Every rollup's ``payload`` is a plain
+    ShardMap JSON dict (the sweep envelope wraps it, as for every family).
+    """
 
     name = "submap"
-    available = False
-    reason = (
-        "sub-shardmap rollups fold leaf ShardMap JSON up-tree via the exact "
-        "coarsen regroup (ShardMap.reproject), still under review on PR #295"
-    )
+
+    def read_leaf(self, store_root, decimal, window, spec, store_kwargs):
+        import obstore
+        from obstore.exceptions import NotFoundError
+
+        from zagg.grids.morton import morton_word
+        from zagg.hive import shard_leaf_path
+        from zagg.store import open_object_store
+
+        leaf = shard_leaf_path(store_root, morton_word(decimal), window=window)
+        prefix, _, name = leaf.rstrip("/").rpartition("/")
+        try:
+            data = obstore.get(
+                open_object_store(prefix, **store_kwargs), submap_key(name, spec)
+            ).bytes()
+        except (FileNotFoundError, NotFoundError):
+            return None
+        sub = json.loads(bytes(data))
+        ok = isinstance(sub, dict) and all(
+            k in sub for k in ("grid_signature", "shard_keys", "granules")
+        )
+        if not ok:
+            # Loud, not absent: a present-but-malformed sub-map means a broken
+            # writer; the engine catches per leaf and counts it failed.
+            raise ValueError(f"malformed leaf sub-map next to {leaf}")
+        timestamp = sub.pop("written_at", None)
+        return sub, timestamp
+
+    def merge(self, payloads: list, *, node, order) -> dict:
+        from zagg.catalog.shardmap import ShardMap
+
+        # Same-key union first (several windows of one shard), deduplicated by
+        # granule id — the same rule reproject's coarsen applies across shards.
+        buckets: dict[int, dict] = {}
+        for p in payloads:
+            for key, entries in zip(p["shard_keys"], p["granules"]):
+                bucket = buckets.setdefault(int(key), {})
+                for entry in entries:
+                    bucket[entry["id"]] = dict(entry)
+        keys = sorted(buckets)
+        granules = [list(buckets[k].values()) for k in keys]
+        signature = dict(payloads[0]["grid_signature"])
+        meta = dict(payloads[0].get("metadata") or {})
+        meta.pop("reproject", None)  # never inherit a child fold's stamp
+        meta["total_granules"] = len({e["id"] for g in granules for e in g})
+        folded = ShardMap(signature, keys, granules, meta)
+        if int(signature["parent_order"]) == int(order):
+            # Shard-node fold: already at the node's order — a window union,
+            # not a reprojection; keep counts honest without a noop stamp.
+            meta.update(total_shards=len(keys), total_pairs=sum(len(g) for g in granules))
+        else:
+            folded = folded.reproject(_ReprojectTarget(signature, order))
+        return {
+            "metadata": folded.metadata,
+            "grid_signature": folded.grid_signature,
+            "shard_keys": [int(k) for k in folded.shard_keys],
+            "granules": folded.granules,
+        }
+
+
+class _ReprojectTarget:
+    """Minimal coarsen-target shim for :meth:`ShardMap.reproject`.
+
+    ``reproject`` consumes exactly ``parent_order``/``child_order`` and
+    ``spatial_signature()``. The sweep has no run config to build a full
+    :class:`~zagg.grids.healpix.HealpixGrid` from, and the target signature IS
+    the source's with the shard order swapped — reproject changes only the
+    dispatch order, never the leaf DGGS resolution.
+    """
+
+    def __init__(self, signature: dict, parent_order: int):
+        self._signature = {**signature, "parent_order": int(parent_order)}
+        self.parent_order = int(parent_order)
+        self.child_order = int(signature["child_order"])
+
+    def spatial_signature(self) -> dict:
+        return dict(self._signature)
 
 
 class OverviewFamily(SweepFamily):
@@ -408,7 +571,7 @@ def _rollup_shard_node(
         counts["empty"] += 1
         return None
     generation = _generation(len(parts), [ts for _w, _p, ts in parts])
-    payload = _merged(fam, [p for _w, p, _ts in parts], decimal, counts)
+    payload = _merged(fam, [p for _w, p, _ts in parts], decimal, shard_order, counts)
     if payload is None:
         return None
     if (
@@ -464,7 +627,7 @@ def _rollup_interior(store, fam, node, computed, counts) -> dict | None:
         [a["generation"].get("max_leaf_timestamp") for a in children],
     )
     existing = _read_rollup(store, fam, node)
-    payload = _merged(fam, [a["payload"] for a in children], node, counts)
+    payload = _merged(fam, [a["payload"] for a in children], node, _decimal_order(node), counts)
     if payload is None:
         return None
     if (
@@ -487,10 +650,10 @@ def _rollup_interior(store, fam, node, computed, counts) -> dict | None:
     return envelope
 
 
-def _merged(fam, payloads, node, counts) -> dict | None:
+def _merged(fam, payloads, node, order, counts) -> dict | None:
     """The family fold, fail-open per node: unmergeable -> logged + skipped."""
     try:
-        return fam.merge(payloads)
+        return fam.merge(payloads, node=node, order=order)
     except Exception as e:
         logger.warning(f"sweep[{fam.name}]: merge failed at node {node}; skipping ({e})")
         counts["failed"] += 1
