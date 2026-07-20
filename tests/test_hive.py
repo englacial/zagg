@@ -385,6 +385,14 @@ class TestProductRoots:
             with pytest.raises((ValueError, TypeError)):
                 hive.validate_product_name(bad)
 
+    def test_name_length_cap(self):
+        # D19 length cap (espg ruling, mortie spec §6.5): 192 accepts, 193
+        # rejects — the boundary of the POSIX-255-less-13-decoration budget.
+        assert hive.validate_product_name("a" * hive.PRODUCT_NAME_MAX) == "a" * 192
+        assert hive.PRODUCT_NAME_MAX == 192
+        with pytest.raises(ValueError, match="caps names"):
+            hive.validate_product_name("a" * (hive.PRODUCT_NAME_MAX + 1))
+
     def test_base_component_exclusion(self):
         # Names shaped like hive base components would make the walker's
         # child classification ambiguous (D19).

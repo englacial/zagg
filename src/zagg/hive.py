@@ -100,27 +100,44 @@ ROOT_COVERAGE_NAME = "coverage.moc"
 AGGREGATION_CORE_NAME = "aggregation.yaml"
 
 #: Product-name grammar (D19; normative on the mortie spec page §6.5):
-#: URL-safe lowercase alphanumerics plus ``-``/``_``. The base-component
-#: exclusion (``-?[1-6]``, :func:`_is_base_component`) is checked separately —
-#: a name shaped like a hive base component would make the walker's child
-#: classification ambiguous at a multi-product store root.
+#: URL-safe lowercase alphanumerics plus ``-``/``_``, at most
+#: :data:`PRODUCT_NAME_MAX` chars. The base-component exclusion (``-?[1-6]``,
+#: :func:`_is_base_component`) is checked separately — a name shaped like a
+#: hive base component would make the walker's child classification ambiguous
+#: at a multi-product store root.
 _PRODUCT_NAME_RE = re.compile(r"^[a-z0-9_-]+$")
+
+#: Product-name length cap (D19; espg ruling mirrored from the mortie spec page
+#: §6.5). Derivation: a POSIX filename component is 255 bytes; the immutable-
+#: provenance decoration reserves 13 (``+`` + a 12-hex digest) ⇒ a 242-byte
+#: hard ceiling. 192 sits 50 under that, and leaves the S3 total-key and
+#: PATH_MAX budgets comfortable (the name also nests under the store prefix and
+#: the digit tree). The grammar is single-byte per char, so char count == byte
+#: count here.
+PRODUCT_NAME_MAX = 192
 
 
 def validate_product_name(name: str) -> str:
     """Validate a D19 product name; returns it.
 
     Grammar (normative on the mortie spec page §6.5): one or more of
-    ``[a-z0-9_-]``, and never matching the morton base-component grammar
-    ``-?[1-6]`` — the root-form discrimination
-    (:func:`classify_store_root`) depends on names and digit components
-    being disjoint. Names are URL-safe by construction (they appear in
-    gridlook deep-links and web paths).
+    ``[a-z0-9_-]``, at most :data:`PRODUCT_NAME_MAX` characters, and never
+    matching the morton base-component grammar ``-?[1-6]`` — the root-form
+    discrimination (:func:`classify_store_root`) depends on names and digit
+    components being disjoint. Names are URL-safe by construction (they appear
+    in gridlook deep-links and web paths).
     """
     if not isinstance(name, str) or not _PRODUCT_NAME_RE.match(name):
         raise ValueError(
             f"product name {name!r} does not match the D19 grammar ([a-z0-9_-]+, "
             f"lowercase; normative on the mortie spec page)"
+        )
+    if len(name) > PRODUCT_NAME_MAX:
+        raise ValueError(
+            f"product name {name!r} is {len(name)} chars; the D19 grammar caps names "
+            f"at {PRODUCT_NAME_MAX} (normative on the mortie spec page §6.5 — a POSIX "
+            f"255-byte filename component less the 13-byte immutable-provenance "
+            f"decoration)"
         )
     if _is_base_component(name):
         raise ValueError(
