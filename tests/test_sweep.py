@@ -515,6 +515,29 @@ class TestSubmapRollup:
         assert not submap_emittable(SUBMAP_SIG, raster_entries)
         assert not submap_emittable(None, [_entry("gA")])
 
+    def test_unsupported_signature_counts_empty_not_failed(self, tmp_path):
+        # A well-formed-but-unsupported leaf sub-map (all required keys, but a
+        # rectilinear grid_signature the HEALPix-only fold cannot coarsen) is a
+        # SKIP, not corruption: read_leaf returns None -> "empty", never "failed".
+        from zagg.sweep import _node_rel
+
+        _write_manifest(tmp_path)
+        node = tmp_path / _node_rel("-311")
+        node.mkdir(parents=True)
+        (node / "shardmap.json").write_text(
+            json.dumps(
+                {
+                    "grid_signature": {"type": "rectilinear", "shape": [10, 10]},
+                    "shard_keys": [morton_word("-311")],
+                    "granules": [[{"s3": "s3://b/t0", "datetime": "2025-01-01T00:00:00Z"}]],
+                }
+            )
+        )
+        result = run_sweep(str(tmp_path), _leaf_refs("-311"), families=("submap",))
+        assert result["families"]["submap"]["empty"] == 1
+        assert result["families"]["submap"]["failed"] == 0
+        assert result["families"]["submap"]["written"] == 0
+
 
 class TestLocalRunnerEmitsSubmap:
     """The local backend's in-process worker writes the leaf sub-map on

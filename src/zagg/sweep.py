@@ -53,6 +53,21 @@ SWEEP_SPEC = "zagg-sweep/1"
 #: Families swept when the caller does not choose (D22 phases 1-3).
 DEFAULT_FAMILIES = ("stats", "moc", "submap")
 
+#: Grid types already warned about as unsupported leaf sub-maps (once-ish, so a
+#: raster sweep does not warn-spam per shard). Never security-load-bearing.
+_warned_unsupported_submap: set[str | None] = set()
+
+
+def _warn_unsupported_submap(grid_type: str | None) -> None:
+    """Warn once per grid type that a non-HEALPix leaf sub-map was skipped."""
+    if grid_type in _warned_unsupported_submap:
+        return
+    _warned_unsupported_submap.add(grid_type)
+    logger.warning(
+        f"sweep[submap]: skipping non-HEALPix leaf sub-map (grid type {grid_type!r}); "
+        f"the sub-shardmap fold is HEALPix-only (issue #300)"
+    )
+
 
 class SweepFamily:
     """One derived-artifact family (D22): how leaves read and payloads fold.
@@ -367,9 +382,19 @@ class SubmapFamily(SweepFamily):
             k in sub for k in ("grid_signature", "shard_keys", "granules")
         )
         if not ok:
-            # Loud, not absent: a present-but-malformed sub-map means a broken
-            # writer; the engine catches per leaf and counts it failed.
+            # Corrupt (missing required keys): a present-but-malformed sub-map
+            # means a broken writer; the engine catches per leaf and counts it
+            # failed — the loud, not-absent signal.
             raise ValueError(f"malformed leaf sub-map next to {leaf}")
+        sig = sub["grid_signature"] or {}
+        if sig.get("type") != "healpix" or "parent_order" not in sig or "child_order" not in sig:
+            # Unsupported (not corrupt): the sub-shardmap fold is HEALPix-only
+            # (reproject coarsens by parent/child order). A non-HEALPix leaf —
+            # e.g. a rectilinear raster sub-map slipped past the emission guard
+            # (submap_emittable) — is a SKIP, not a broken writer: return None so
+            # the engine counts it "empty", never "failed" (data-corruption).
+            _warn_unsupported_submap(sig.get("type"))
+            return None
         timestamp = sub.pop("written_at", None)
         return sub, timestamp
 
@@ -383,6 +408,12 @@ class SubmapFamily(SweepFamily):
             for key, entries in zip(p["shard_keys"], p["granules"]):
                 bucket = buckets.setdefault(int(key), {})
                 for entry in entries:
+                    # read_leaf already filters non-HEALPix/id-less leaves to the
+                    # "empty" skip path, so an id-less entry reaching the fold is a
+                    # genuinely broken artifact — name the field cleanly ("failed"),
+                    # never a bare KeyError.
+                    if "id" not in entry:
+                        raise ValueError("leaf sub-map granule entry missing required 'id' field")
                     bucket[entry["id"]] = dict(entry)
         keys = sorted(buckets)
         granules = [list(buckets[k].values()) for k in keys]
