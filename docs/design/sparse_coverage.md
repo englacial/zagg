@@ -625,7 +625,10 @@ rollup leaves all leaf reads intact.
   is **mergeable by construction** — only associative stats (counts, sums,
   min/max, t-digests; never stored means) — so up-tree rollups are a pure
   fold (D22). The record also rides the async result envelope; the
-  dispatcher writes a **run-level parquet at the store root** (one row per
+  dispatcher writes a **run-level parquet at the product root** — a run maps
+  to one template ⇒ one product tree (D7/D19), so it lands under `{hash}/`,
+  never the multi-product store root, whose node invariant admits only
+  `{hash}.yaml` + `{hash}/` — with one row per
   shard, *including failure rows* sourced from the run report — sidecars
   exist only on success; CloudWatch structured logs remain the failure
   forensics channel). Sidecars omit account-identifying fields (request
