@@ -427,6 +427,24 @@ class TestSubmapRollup:
         assert sm.metadata["total_shards"] == 1 and sm.metadata["total_granules"] == 2
         assert json.loads(path.read_text())["written_at"]  # staleness stamp rides the file
 
+    def test_reproject_shim_matches_real_grid_signature(self):
+        # Pin the coarsen-target shim to the real grid it stands in for: at the
+        # coarsened order N, _ReprojectTarget(SUBMAP_SIG, N).spatial_signature()
+        # must equal a genuine HealpixGrid's — otherwise the rollup oracle below
+        # would only prove the fold agrees with itself. The signatures match on
+        # every key except ``layout``: SUBMAP_SIG carries the store-layout token
+        # ("flat"), while a live grid reports its DGGS layout ("fullsphere");
+        # reproject only swaps the dispatch order, never the DGGS resolution.
+        from zagg.grids.healpix import HealpixGrid
+        from zagg.sweep import _ReprojectTarget
+
+        for order in (0, 1, SHARD_ORDER):
+            shim = _ReprojectTarget(SUBMAP_SIG, order).spatial_signature()
+            real = HealpixGrid(order, SUBMAP_SIG["child_order"]).spatial_signature()
+            assert {k: v for k, v in shim.items() if k != "layout"} == {
+                k: v for k, v in real.items() if k != "layout"
+            }
+
     def test_rollup_equals_direct_reproject(self, tmp_path):
         from zagg.catalog.shardmap import ShardMap
         from zagg.sweep import _ReprojectTarget
