@@ -116,6 +116,7 @@ def build_record(
     granule_ids: Iterable[str] | None = None,
     invoked_by: dict | None = None,
     run_id: str | None = None,
+    semantic_hash: str | None = None,
     lambda_config: dict | None = None,
 ) -> dict:
     """Build one shard's stats record from the worker's ``metadata`` dict.
@@ -128,7 +129,9 @@ def build_record(
     ``sts get-caller-identity`` once per run; workers cannot see the invoker.
     ``run_id`` is threaded the same way (dispatcher-generated, stamped through
     the invoke payload, copied verbatim) so a leaf sidecar joins back to its
-    run-level parquet.
+    run-level parquet. ``semantic_hash`` (issue #299, D19) is the run
+    config's semantic-core hash — the identity half the ``has_run`` dedup
+    check compares; ``granules_sha256`` below is the catalog half.
     ``lambda_config`` is :func:`lambda_env` on Lambda, ``None`` locally;
     when present it prices ``gb_seconds`` / ``est_cost_usd`` from
     ``duration_s`` (the billed-duration approximation the dispatcher's cost
@@ -163,10 +166,10 @@ def build_record(
         "schema_version": SCHEMA_VERSION,
         "shard_key": int(shard_key),
         "run_id": run_id,
-        # The semantic-core hash (D19 rev 2, docs/design/sparse_coverage.md):
-        # hashes the config's semantic core, NOT the whole template. Nullable
-        # until issue #299 lands the hasher.
-        "semantic_hash": None,
+        # The semantic-core hash (D19 rev 2, issue #299): hashes the config's
+        # semantic core, NOT the whole template. Nullable for callers without
+        # a config in scope.
+        "semantic_hash": semantic_hash,
         "zagg_version": _zagg_version(),
         "n_shards": 1,
         "n_granules": int(n_granules),

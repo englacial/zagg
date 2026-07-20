@@ -726,6 +726,13 @@ def _validate_store_layout_keys(config: PipelineConfig) -> None:
     store_layout = config.output.get("store_layout")
     if store_layout is not None and store_layout not in ("flat", "hive"):
         raise ValueError(f"output.store_layout must be 'flat' or 'hive' (got {store_layout!r})")
+    # D19 product name (issue #299): validated at load so a bad name fails
+    # before any store I/O. The grammar lives in hive.py (one source).
+    name = config.output.get("product_name")
+    if name is not None:
+        from zagg.hive import validate_product_name
+
+        validate_product_name(name)
     if get_store_layout(config) == "hive":
         if (grid or {}).get("type", "healpix") != "healpix":
             raise ValueError(
@@ -2068,6 +2075,17 @@ def get_emit_cell_ids(config: PipelineConfig) -> bool:
     lands; the dggs attrs are unaffected by the hatch.
     """
     return bool(config.output.get("grid", {}).get("emit_cell_ids", False))
+
+
+def get_product_name(config: PipelineConfig) -> str | None:
+    """The D19 product name (issue #299), or ``None`` for a bare store.
+
+    When set, the run's effective store root becomes
+    ``{output.store}/{product_name}/`` (``zagg.hive.effective_store_root``) —
+    a NAMED product root in a multi-product store. Absent (the default),
+    stores keep today's bare single-product layout byte-identically.
+    """
+    return config.output.get("product_name")
 
 
 def get_store_path(config: PipelineConfig) -> str | None:

@@ -50,6 +50,7 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 import time
 import warnings
 from datetime import datetime, timezone
@@ -91,6 +92,138 @@ _ZSTD_LEVEL = 3
 #: invariant, next to the manifest. Same name as the in-leaf sidecar
 #: (:data:`COVERAGE_SIDECAR`), different location and encoding.
 ROOT_COVERAGE_NAME = "coverage.moc"
+
+#: Canonical semantic core object name at the product root (D19): a DERIVED
+#: convenience (D9 cache class) — deterministic YAML of the output-defining
+#: subset. The manifest's ``semantic_hash`` is the truth; divergence resolves
+#: to the hash.
+AGGREGATION_CORE_NAME = "aggregation.yaml"
+
+#: Product-name grammar (D19; normative on the mortie spec page §6.5):
+#: URL-safe lowercase alphanumerics plus ``-``/``_``, at most
+#: :data:`PRODUCT_NAME_MAX` chars. The base-component exclusion (``-?[1-6]``,
+#: :func:`_is_base_component`) is checked separately — a name shaped like a
+#: hive base component would make the walker's child classification ambiguous
+#: at a multi-product store root.
+_PRODUCT_NAME_RE = re.compile(r"^[a-z0-9_-]+$")
+
+#: Product-name length cap (D19; espg ruling mirrored from the mortie spec page
+#: §6.5). Derivation: a POSIX filename component is 255 bytes; the immutable-
+#: provenance decoration reserves 13 (``+`` + a 12-hex digest) ⇒ a 242-byte
+#: hard ceiling. 192 sits 50 under that, and leaves the S3 total-key and
+#: PATH_MAX budgets comfortable (the name also nests under the store prefix and
+#: the digit tree). The grammar is single-byte per char, so char count == byte
+#: count here.
+PRODUCT_NAME_MAX = 192
+
+
+def validate_product_name(name: str) -> str:
+    """Validate a D19 product name; returns it.
+
+    Grammar (normative on the mortie spec page §6.5): one or more of
+    ``[a-z0-9_-]``, at most :data:`PRODUCT_NAME_MAX` characters, and never
+    matching the morton base-component grammar ``-?[1-6]`` — the root-form
+    discrimination (:func:`classify_store_root`) depends on names and digit
+    components being disjoint. Names are URL-safe by construction (they appear
+    in gridlook deep-links and web paths).
+    """
+    if not isinstance(name, str) or not _PRODUCT_NAME_RE.match(name):
+        raise ValueError(
+            f"product name {name!r} does not match the D19 grammar ([a-z0-9_-]+, "
+            f"lowercase; normative on the mortie spec page)"
+        )
+    if len(name) > PRODUCT_NAME_MAX:
+        raise ValueError(
+            f"product name {name!r} is {len(name)} chars; the D19 grammar caps names "
+            f"at {PRODUCT_NAME_MAX} (normative on the mortie spec page §6.5 — a POSIX "
+            f"255-byte filename component less the 13-byte immutable-provenance "
+            f"decoration)"
+        )
+    if _is_base_component(name):
+        raise ValueError(
+            f"product name {name!r} matches the morton base-component grammar "
+            f"(-?[1-6]); such names are excluded so a store root's children stay "
+            f"unambiguous (D19)"
+        )
+    return name
+
+
+def product_root(store_root: str, name: str) -> str:
+    """Root prefix of product ``name`` under a multi-product store (D19).
+
+    A product subtree is a COMPLETE, unmodified morton-hive store (bare-named
+    manifest + MOC + digit tree), so everything that takes a ``store_root``
+    takes this value unchanged.
+    """
+    return f"{store_root.rstrip('/')}/{validate_product_name(name)}"
+
+
+def effective_store_root(store_path: str, config) -> str:
+    """The store root a run writes into: the product root when one is named.
+
+    ``output.product_name`` (issue #299) prefixes the configured store path
+    with the D19 ``{name}/`` product root; absent, the bare single-product
+    layout is unchanged (byte-identical stores — the D19 revision is
+    additive).
+    """
+    from zagg.config import get_product_name
+
+    name = get_product_name(config)
+    return product_root(store_path, name) if name else store_path
+
+
+def classify_store_root(store_root: str, **store_kwargs) -> str:
+    """Root-form discrimination by CONTENT (D19): what sits at ``store_root``.
+
+    Returns ``"bare"`` (a manifest at the root ⇒ a single-product store — the
+    digit tree lives right here), ``"products"`` (no manifest, and at least
+    one name-shaped child prefix ⇒ a directory of product roots), or
+    ``"empty"`` (neither). Base-component-shaped children without a manifest
+    still classify as ``"bare"`` — the manifest write is async (issue #252),
+    so a store mid-first-run must not be misread as a product directory.
+    """
+    import obstore
+
+    store = open_object_store(store_root, **store_kwargs)
+    if _read_json(store, MANIFEST_NAME) is not None:
+        return "bare"
+    listing = obstore.list_with_delimiter(store)
+    children = [p.rstrip("/").split("/")[-1] for p in listing["common_prefixes"]]
+    if any(_is_base_component(c) for c in children):
+        return "bare"
+    names = [c for c in children if _is_valid_product_name(c)]
+    return "products" if names else "empty"
+
+
+def list_products(store_root: str, **store_kwargs) -> dict:
+    """``{name: manifest}`` for every product under a multi-product root (D19).
+
+    Discovery is the root listing itself — no name↔hash translation layer:
+    each name-shaped child prefix is read for its bare-named
+    ``morton_hive.json``. Children without a readable manifest are skipped
+    (debris or mid-write; the D4 posture — absence of a manifest means the
+    product is not yet discoverable).
+    """
+    import obstore
+
+    store = open_object_store(store_root, **store_kwargs)
+    listing = obstore.list_with_delimiter(store)
+    children = [p.rstrip("/").split("/")[-1] for p in listing["common_prefixes"]]
+    products = {}
+    for name in sorted(c for c in children if _is_valid_product_name(c)):
+        manifest = read_manifest(product_root(store_root, name), **store_kwargs)
+        if manifest is not None:
+            products[name] = manifest
+    return products
+
+
+def _is_valid_product_name(name: str) -> bool:
+    """Whether ``name`` satisfies the D19 product-name grammar (no raise)."""
+    try:
+        validate_product_name(name)
+    except ValueError:
+        return False
+    return True
 
 
 def shard_leaf_path(store_root: str, shard_key, window: str | None = None) -> str:
@@ -166,6 +299,8 @@ def build_manifest(grid, dataset: dict | None = None, windowing: dict | None = N
     leaf-stamp truth and root-summary cache. ``None`` writes the ``/1``
     manifest byte-identical to pre-windowing runs.
     """
+    from zagg.semantics import semantic_hash
+
     dataset = dataset or {}
     manifest = {
         "spec": HIVE_SPEC_V2 if windowing else HIVE_SPEC,
@@ -173,9 +308,17 @@ def build_manifest(grid, dataset: dict | None = None, windowing: dict | None = N
             "short_name": dataset.get("short_name"),
             "version": dataset.get("version"),
         },
+        # D19 (issue #299): the FULL sha256 of the canonicalized semantic
+        # core — a frozen key, so reusing a product name/root with different
+        # aggregation semantics refuses up front like an orders mismatch.
+        "semantic_hash": semantic_hash(grid.config),
         "cell_order": int(grid.child_order),
         "shard_order": int(grid.parent_order),
         "split_schedule": [1] * int(grid.parent_order),
+        # D21: how many morton digits each path component chunks. Existing
+        # stores are retroactively 1 (the _frozen normalization); new stores
+        # declare it explicitly.
+        "path_grouping": 1,
         "pyramid": {"orders": [], "aggregation": {}},
         "generated_at": _utcnow(),
     }
@@ -231,7 +374,7 @@ def validate_manifest(
 
     store = open_object_store(store_root, **store_kwargs)
     existing = _read_json(store, MANIFEST_NAME)
-    frozen_matches = existing is not None and _frozen(existing) == _frozen(manifest)
+    frozen_matches = _frozen_matches(existing, manifest)
     if existing is not None and not overwrite:
         if not frozen_matches:
             raise ValueError(
@@ -258,7 +401,14 @@ def validate_manifest(
     return existing
 
 
-def ensure_manifest(store_root: str, manifest: dict, *, overwrite: bool = False, **store_kwargs):
+def ensure_manifest(
+    store_root: str,
+    manifest: dict,
+    *,
+    overwrite: bool = False,
+    config=None,
+    **store_kwargs,
+):
     """Write the root manifest; verify it on reruns (idempotent).
 
     Lifecycle (issue #252 hybrid): the PRIMARY write runs at init — the local
@@ -297,7 +447,36 @@ def ensure_manifest(store_root: str, manifest: dict, *, overwrite: bool = False,
     if existing is not None and not overwrite:
         return existing
     obstore.put(store, MANIFEST_NAME, json.dumps(manifest, indent=1).encode())
+    if config is not None:
+        write_semantic_core(store_root, config, **store_kwargs)
     return manifest
+
+
+def write_semantic_core(store_root: str, config, **store_kwargs) -> None:
+    """PUT the canonical semantic core as ``aggregation.yaml`` (D19).
+
+    A derived convenience next to the manifest (D9 cache class): sorted-key,
+    deterministic YAML of the output-defining subset, so product names stay
+    human-inspectable without a registry. FAIL-OPEN — the manifest's
+    ``semantic_hash`` is the truth, and the core is regenerable straight from
+    the config (rewriting it is a single :func:`write_semantic_core` call), so
+    a failed PUT must not fail the run. The D22 pyramid sweep is the intended
+    owner of the rewrite once it lands; there is no regenerator today.
+    """
+    import obstore
+    import yaml
+
+    from zagg.semantics import semantic_core
+
+    try:
+        payload = yaml.safe_dump(semantic_core(config), sort_keys=True)
+        obstore.put(
+            open_object_store(store_root, **store_kwargs),
+            AGGREGATION_CORE_NAME,
+            payload.encode(),
+        )
+    except Exception as e:
+        logger.warning(f"{AGGREGATION_CORE_NAME} write failed (fail-open, D9 cache class): {e}")
 
 
 #: Manifest keys the resume match-check compares (orders + identity + split
@@ -309,16 +488,42 @@ def ensure_manifest(store_root: str, manifest: dict, *, overwrite: bool = False,
 _FROZEN_MANIFEST_KEYS = (
     "spec",
     "dataset",
+    "semantic_hash",
     "cell_order",
     "shard_order",
     "split_schedule",
+    "path_grouping",
     "temporal",
 )
 
 
 def _frozen(manifest: dict) -> dict:
-    """The frozen-key projection of a manifest (resume/overwrite match-check)."""
-    return {k: manifest.get(k) for k in _FROZEN_MANIFEST_KEYS}
+    """The frozen-key projection of a manifest (resume/overwrite match-check).
+
+    ``path_grouping`` normalizes ``absent -> 1`` (D21: existing stores are
+    retroactively ``1``), so appends to pre-D21 manifests never refuse on it.
+    """
+    frozen = {k: manifest.get(k) for k in _FROZEN_MANIFEST_KEYS}
+    frozen["path_grouping"] = manifest.get("path_grouping") or 1
+    return frozen
+
+
+def _frozen_matches(existing: dict | None, manifest: dict) -> bool:
+    """Whether two manifests agree on every frozen key (issue #299).
+
+    ``semantic_hash`` is compared only when BOTH sides declare it: a
+    pre-#299 manifest lacks the key, and refusing every append to an
+    existing store on its absence would brick resumes — the orders/schedule
+    keys still guard those stores. Two hash-carrying manifests must match
+    exactly (D19: the hash is a frozen key).
+    """
+    if existing is None:
+        return False
+    fa, fb = _frozen(existing), _frozen(manifest)
+    if fa["semantic_hash"] is None or fb["semantic_hash"] is None:
+        fa.pop("semantic_hash")
+        fb.pop("semantic_hash")
+    return fa == fb
 
 
 def _is_base_component(name: str) -> bool:

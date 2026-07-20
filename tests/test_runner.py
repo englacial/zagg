@@ -1433,9 +1433,16 @@ class TestProcessAndWriteStreaming:
 def _stub_grid():
     from unittest.mock import MagicMock
 
+    from zagg.config import default_config
+
     grid = MagicMock()
     grid.signature.return_value = {}
     grid.spatial_signature.return_value = {}
+    # build_manifest hashes grid.config's semantic core (issue #299), so the
+    # stub needs a real config, not a MagicMock (JSON-unserializable).
+    grid.config = default_config("atl06")
+    grid.parent_order = 6
+    grid.child_order = 8
     grid.block_index.side_effect = lambda k: (k,)
     # Deterministic decimal-string-shaped labels (issue #199) so status keys
     # built off the stub are real strings.

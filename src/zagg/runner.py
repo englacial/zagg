@@ -61,12 +61,14 @@ from zagg.dispatch import (
 )
 from zagg.grids.base import shard_label
 from zagg.grids.morton import morton_word
+from zagg.hive import effective_store_root
 from zagg.processing import (
     process_shard,
     write_dataframe_to_zarr,
     write_ragged_to_zarr,
     write_shard_to_zarr,
 )
+from zagg.semantics import semantic_hash as _semantic_hash
 from zagg.store import open_object_store, open_store
 
 logger = logging.getLogger(__name__)
@@ -377,6 +379,9 @@ class SpatialStrategy:
         store_path = store or get_store_path(config)
         if not store_path:
             raise ValueError("No store path specified (pass store= or set output.store: in config)")
+        # D19 product root (issue #299): a named product writes into
+        # {store}/{name}/ — a complete, unmodified store under that prefix.
+        store_path = effective_store_root(store_path, config)
 
         # child_order is HEALPix-specific (leaf order); other grids don't define it.
         grid_type = config.output.get("grid", {}).get("type", "healpix")
@@ -515,6 +520,9 @@ class TemporalStrategy:
             )
 
         store_path = store or get_store_path(config)
+        if store_path:
+            # D19 product root (issue #299) — same treatment as the spatial run.
+            store_path = effective_store_root(store_path, config)
         specs = specs_from_config(config)
         event_list = list(events)
         if max_cells is not None:
@@ -750,6 +758,9 @@ class RasterStrategy:
         store_path = store or get_store_path(config)
         if not store_path:
             raise ValueError("No store path specified (pass store= or set output.store: in config)")
+        # D19 product root (issue #299): a named product writes into
+        # {store}/{name}/ — a complete, unmodified store under that prefix.
+        store_path = effective_store_root(store_path, config)
         if backend not in ("local", "lambda"):
             raise ValueError(f"Unknown backend: {backend!r} (expected 'local' or 'lambda')")
         if backend == "lambda" and not store_path.startswith("s3://"):
@@ -829,7 +840,12 @@ class RasterStrategy:
             manifest = build_manifest(
                 grid, dataset=catalog_data.get("metadata"), windowing=windowing
             )
-            ensure_manifest(store_path, manifest, overwrite=overwrite, **store_kwargs)
+            # The manifest IN EFFECT (an accepted existing one on append)
+            # keys the writers' naming spec (issue #299 spec-compat) and the
+            # D19 aggregation.yaml core rides the primary write.
+            manifest = ensure_manifest(
+                store_path, manifest, overwrite=overwrite, config=config, **store_kwargs
+            )
         else:
             zarr_store = open_store(store_path, **store_kwargs)
             emit_raster_template(zarr_store, grid, config, times_us, overwrite=overwrite)
@@ -843,8 +859,10 @@ class RasterStrategy:
         max_workers = min(max_workers or 4, len(cells)) or 1
         # Run identity for the stats records (issue #297): generated once per
         # run, stamped into every record so leaf sidecars join back to the
-        # run-level parquet (which reuses it in its object name).
+        # run-level parquet (which reuses it in its object name). The
+        # semantic-core hash (issue #299) rides every record the same way.
         run_id = uuid.uuid4().hex
+        run_semantic_hash = _semantic_hash(config)
         t0 = time.time()
         shards_with_data = 0
         errors = 0
@@ -935,6 +953,7 @@ class RasterStrategy:
                 metadata=meta,
                 granule_ids=raster_granule_ids(granules),
                 run_id=run_id,
+                semantic_hash=run_semantic_hash,
             )
             meta["stats"] = record
             if store_layout == "hive" and meta.get("leaf_written"):
@@ -944,7 +963,11 @@ class RasterStrategy:
                     leaf = shard_leaf_path(
                         store_path, int(shard_key), window=window["label"] if window else None
                     )
-                    write_sidecar(leaf, record, **store_kwargs)
+                    # Sidecar naming keys on the manifest spec IN EFFECT
+                    # (issue #299 spec-compat; the #307 seam).
+                    write_sidecar(
+                        leaf, record, spec=manifest["spec"] if manifest else None, **store_kwargs
+                    )
                 except Exception as e:
                     logger.warning(f"stats sidecar write failed (fail-open, issue #297): {e}")
             return meta, stage_stats, write_s
@@ -990,7 +1013,9 @@ class RasterStrategy:
             # (D9), fail-open.
             from zagg.hive import ensure_manifest
 
-            ensure_manifest(store_path, manifest, overwrite=overwrite, **store_kwargs)
+            ensure_manifest(
+                store_path, manifest, overwrite=overwrite, config=config, **store_kwargs
+            )
             if get_coverage_moc(config):
                 from zagg.hive import build_root_coverage, write_root_coverage
                 from zagg.windows import union_time_range
@@ -2438,6 +2463,9 @@ def _run_local(
     # stamped into every record so leaf sidecars join back to the run-level
     # parquet (which reuses it in its object name).
     run_id = uuid.uuid4().hex
+    # The run config's semantic-core hash (issue #299, D19): stamped into
+    # every stats record so has_run's identity check has a recorded value.
+    run_semantic_hash = _semantic_hash(config)
     store_layout = get_store_layout(config)
     store_kwargs = {
         "region": region,
@@ -2469,7 +2497,12 @@ def _run_local(
         # existing store refuses in ~0s, before any leaf write (D2), instead
         # of mixing new-order leaves into an old-order store.
         manifest = build_manifest(grid, dataset=catalog_data.get("metadata"), windowing=windowing)
-        ensure_manifest(store_path, manifest, overwrite=overwrite, **store_kwargs)
+        # Capture the manifest IN EFFECT (the accepted existing one on
+        # append): its spec keys the writers' naming calls (issue #299
+        # spec-compat), and the D19 aggregation.yaml core rides the write.
+        manifest = ensure_manifest(
+            store_path, manifest, overwrite=overwrite, config=config, **store_kwargs
+        )
         # Temporal fan-out (issue #246 phase 5): one work unit per (shard,
         # window). None (schedule none/absent) keeps the (shard, records)
         # pairs — dispatch byte-identical to pre-windowing runs.
@@ -2543,6 +2576,7 @@ def _run_local(
                 metadata=meta,
                 granule_ids=_resolve_urls(records, driver),
                 run_id=run_id,
+                semantic_hash=run_semantic_hash,
             )
             meta["stats"] = record
             if store_layout == "hive" and not meta.get("error"):
@@ -2552,7 +2586,9 @@ def _run_local(
                     leaf = shard_leaf_path(
                         store_path, int(shard_key), window=window["label"] if window else None
                     )
-                    write_sidecar(leaf, record, **store_kwargs)
+                    # Sidecar naming keys on the manifest spec IN EFFECT
+                    # (issue #299 spec-compat; the #307 seam).
+                    write_sidecar(leaf, record, spec=manifest["spec"], **store_kwargs)
                 except Exception as e:
                     logger.warning(f"stats sidecar write failed (fail-open, issue #297): {e}")
             return {"shard_key": shard_key, "ok": True, "meta": meta}

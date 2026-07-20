@@ -656,8 +656,13 @@ rollup leaves all leaf reads intact.
   **`semantic_hash`** verifies it — sha256 over the canonicalized
   **output-defining subset only**: the `aggregation` block (functions +
   params + dtypes + fills + ragged kinds), the `data_source` semantics
-  (dataset/product, groups, coordinates, variables, filters), and the
-  grid *type + indexing scheme*. Excluded as packaging: cell order (a
+  (dataset/product, groups, coordinates, variables, filters), the
+  grid *type + indexing scheme*, and the **pipeline type** (`spatial` |
+  `temporal` | `event`, absent ⇒ `spatial` — espg-ruled on the PR #316
+  review, 2026-07-21: a temporal engine over the same aggregation block is
+  a different product; the original list omitted it only because the
+  temporal path wasn't in frame, and pre-merge was the free moment to add
+  it — no store carries a hash yet). Excluded as packaging: cell order (a
   resolution axis — D24), parent/shard order, `chunk_inner`/`sharded`,
   worker size, streaming mode (merge-vs-spill lands `np.isclose` and
   shares one store, with the actual mode recorded per-run), and read
