@@ -430,7 +430,9 @@ rollup leaves all leaf reads intact.
   "grouping is a parameter, never a schema fork."
 - **D3 — Full morton id at the leaf** (`{full_id}.zarr`), self-describing.
   (Unchanged by D19: product identity lives at the product root, above the
-  tree.)
+  tree. *Superseded by D23 for `morton-hive/3` stores*: the basename becomes
+  the time window; the full id stays recoverable from the path and from the
+  stamp/sidecar `shard_key`.)
 - **D4 — Commit stamp via final root-attrs update.** Absence (LIST) is
   trustworthy; presence requires the stamp. Torn shards are debris,
   overwritable on retry. One small PUT; not consolidation.
@@ -591,8 +593,9 @@ rollup leaves all leaf reads intact.
   domain is products-within-one-store) of the **canonicalized** agg
   template (parse YAML → sorted-key JSON → hash; never raw bytes). A
   product subtree is a *complete, unmodified* morton-hive store —
-  bare-named manifest and MOC, `{full_id}.zarr` leaves (D3 and D13's
-  frozen grammar untouched) — so existing single-product stores are
+  bare-named manifest and MOC, `{full_id}.zarr` leaves under `/1`–`/2`
+  grammars (`{window}.zarr` under `/3` — D23; D3 and D13's grammar
+  untouched by D19) — so existing single-product stores are
   already valid and the change is **additive, not breaking**; readers
   distinguish the two root forms by content (manifest ⇒ bare store,
   `{hash}.yaml` entries ⇒ product directory). The template itself is
