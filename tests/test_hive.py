@@ -294,6 +294,88 @@ class TestManifest:
 # ── leaf template + commit stamp (D3/D4) ─────────────────────────────────────
 
 
+class TestProductRoots:
+    """D19 named product roots (issue #299 phase 2): additive — a product
+    subtree is a complete, unmodified morton-hive store."""
+
+    def _grid(self, cfg):
+        return HealpixGrid(parent_order=6, child_order=8, layout="fullsphere", config=cfg)
+
+    def test_name_grammar(self):
+        for good in ("atl06", "atl06_h_li", "s2-serc-2025", "x", "88s_o9"):
+            assert hive.validate_product_name(good) == good
+        for bad in ("ATL06", "a b", "", "a/b", "a.b", "café", None, 7):
+            with pytest.raises((ValueError, TypeError)):
+                hive.validate_product_name(bad)
+
+    def test_base_component_exclusion(self):
+        # Names shaped like hive base components would make the walker's
+        # child classification ambiguous (D19).
+        for bad in ("1", "6", "-1", "-6", "3"):
+            with pytest.raises(ValueError, match="base-component"):
+                hive.validate_product_name(bad)
+        # Digit-LEADING names longer than a base component are fine.
+        assert hive.validate_product_name("2019_run") == "2019_run"
+
+    def test_product_root_join(self):
+        assert hive.product_root("s3://b/root/", "atl06") == "s3://b/root/atl06"
+        with pytest.raises(ValueError, match="grammar"):
+            hive.product_root("s3://b/root", "BAD")
+
+    def test_leaf_path_under_product_root_is_unchanged(self, cfg):
+        # A product subtree is byte-identical to a bare store: the same leaf
+        # path arithmetic applies below the product root.
+        word = _shard_word()
+        bare = hive.shard_leaf_path("s3://b/root", word)
+        under = hive.shard_leaf_path(hive.product_root("s3://b/root", "atl06"), word)
+        assert under == bare.replace("s3://b/root/", "s3://b/root/atl06/")
+
+    def test_effective_store_root(self, cfg):
+        assert hive.effective_store_root("s3://b/root", cfg) == "s3://b/root"
+        cfg.output["product_name"] = "atl06_h_li"
+        assert hive.effective_store_root("s3://b/root", cfg) == "s3://b/root/atl06_h_li"
+
+    def test_product_name_validated_at_config_load(self, cfg):
+        from zagg.config import validate_config
+
+        cfg.output["product_name"] = "UPPER"
+        with pytest.raises(ValueError, match="grammar"):
+            validate_config(cfg)
+
+    def test_classify_store_root(self, cfg, tmp_path):
+        root = str(tmp_path / "store")
+        (tmp_path / "store").mkdir()
+        assert hive.classify_store_root(root) == "empty"
+        # A product directory: manifests only under {name}/.
+        m = hive.build_manifest(self._grid(cfg))
+        hive.ensure_manifest(hive.product_root(root, "atl06"), m)
+        assert hive.classify_store_root(root) == "products"
+        # A manifest at the root wins: bare single-product store.
+        bare = str(tmp_path / "bare")
+        hive.ensure_manifest(bare, m)
+        assert hive.classify_store_root(bare) == "bare"
+
+    def test_mid_write_bare_store_not_misread(self, cfg, tmp_path):
+        # The manifest write is async (issue #252): digit-shaped children
+        # without a manifest are a bare store mid-first-run, never "products".
+        root = tmp_path / "store"
+        (root / "3" / "1").mkdir(parents=True)
+        (root / "3" / "1" / "obj").write_text("x")
+        assert hive.classify_store_root(str(root)) == "bare"
+
+    def test_list_products(self, cfg, tmp_path):
+        root = str(tmp_path / "store")
+        m = hive.build_manifest(self._grid(cfg))
+        hive.ensure_manifest(hive.product_root(root, "atl06"), m)
+        hive.ensure_manifest(hive.product_root(root, "atl03_tdigest"), m)
+        # An undiscoverable (manifest-less) child prefix is skipped, not an error.
+        (tmp_path / "store" / "debris_product").mkdir()
+        (tmp_path / "store" / "debris_product" / "junk").write_text("x")
+        products = hive.list_products(root)
+        assert sorted(products) == ["atl03_tdigest", "atl06"]
+        assert products["atl06"]["spec"] == m["spec"]
+
+
 class TestLeafTemplateAndStamp:
     def _grid(self, cfg):
         return HealpixGrid(parent_order=6, child_order=8, layout="fullsphere", config=cfg)

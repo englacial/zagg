@@ -61,6 +61,7 @@ from zagg.dispatch import (
 )
 from zagg.grids.base import shard_label
 from zagg.grids.morton import morton_word
+from zagg.hive import effective_store_root
 from zagg.processing import (
     process_shard,
     write_dataframe_to_zarr,
@@ -377,6 +378,9 @@ class SpatialStrategy:
         store_path = store or get_store_path(config)
         if not store_path:
             raise ValueError("No store path specified (pass store= or set output.store: in config)")
+        # D19 product root (issue #299): a named product writes into
+        # {store}/{name}/ — a complete, unmodified store under that prefix.
+        store_path = effective_store_root(store_path, config)
 
         # child_order is HEALPix-specific (leaf order); other grids don't define it.
         grid_type = config.output.get("grid", {}).get("type", "healpix")
@@ -515,6 +519,9 @@ class TemporalStrategy:
             )
 
         store_path = store or get_store_path(config)
+        if store_path:
+            # D19 product root (issue #299) — same treatment as the spatial run.
+            store_path = effective_store_root(store_path, config)
         specs = specs_from_config(config)
         event_list = list(events)
         if max_cells is not None:
@@ -750,6 +757,9 @@ class RasterStrategy:
         store_path = store or get_store_path(config)
         if not store_path:
             raise ValueError("No store path specified (pass store= or set output.store: in config)")
+        # D19 product root (issue #299): a named product writes into
+        # {store}/{name}/ — a complete, unmodified store under that prefix.
+        store_path = effective_store_root(store_path, config)
         if backend not in ("local", "lambda"):
             raise ValueError(f"Unknown backend: {backend!r} (expected 'local' or 'lambda')")
         if backend == "lambda" and not store_path.startswith("s3://"):
