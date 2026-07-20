@@ -154,8 +154,14 @@ products by listing `{store_root}/` and reading each
   no objects (D4/D5), their run records are distinct by name
   (timestamp + run id, D20), and the manifest precheck admits both
   (frozen keys match by construction under D19). Same-(shard, window)
-  concurrency degrades to D4 semantics — last writer wins; the loser's
-  partial output is stamped-over or remains ignorable debris. Interior
+  concurrency is **out of contract**: *sequential* re-runs give clean D4
+  last-writer-wins replacement, but a leaf is several objects (per-array
+  ShardingCodec objects D17, the ragged object D18, root attrs, coverage
+  sidecar) and S3 PUTs are not transactional across them — two
+  *simultaneous* different-content co-writers can interleave those objects
+  and leave a stamped-but-torn leaf, which is neither replacement nor
+  ignorable debris. Detection is content verification (the O11 hash) or a
+  re-run; the supported contract stays shard-disjoint. Interior
   rollups may go stale during any of this, which D22's generation stamps
   make detectable, never silently wrong. Cross-product concurrency shares
   nothing at all.
@@ -936,7 +942,9 @@ registry — CI coverage should be auditable against this list:
   no-op) and nothing-load-bearing (deleting every rollup leaves leaf
   reads green).
 - **Merge-fold algebra** (D20): associativity/commutativity of the stats
-  record fold; merge-of-children == direct.
+  record fold; merge-of-children == direct — exactly for count/sum/min/max,
+  up to the approximate class (`np.isclose`) for order-dependent t-digest
+  members (cf. D24).
 - **Semantic-hash canonicalization** (D19): syntactic edits (whitespace,
   key order, comments) never change the hash; packaging-knob edits
   (orders, chunking, worker size, streaming mode) never change the hash;
