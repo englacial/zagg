@@ -3482,6 +3482,241 @@ class TestProfilePlumbing:
         assert captured["handoff"] == "pandas"
 
 
+class TestLambdaRunStatsDispatch:
+    """The spatial lambda path announces the dispatched run-record path
+    (issue #313): the PUT rides the worker invoke, so the summary carries the
+    pinned D20 key rather than a dispatcher-write result."""
+
+    def test_summary_carries_dispatched_path(self, monkeypatch, atl06_config):
+        summary = _run_lambda_with_durations(monkeypatch, atl06_config, [10.0, 11.0, 12.0, 13.0])
+        path = summary["run_stats_path"]
+        assert path.startswith("s3://out/x.zarr/stats_")
+        assert path.endswith(".parquet")
+
+
+class TestDispatchRunStats:
+    """The issue #313 D8 transport seam: the run-record PUT rides a
+    fire-and-forget mode="stats" worker invoke; transport is size-gated."""
+
+    class _Client:
+        def __init__(self, raise_on_invoke=False):
+            self.events = []
+            self._raise = raise_on_invoke
+
+        def invoke(self, **kwargs):
+            if self._raise:
+                raise RuntimeError("invoke down")
+            self.events.append(json.loads(kwargs["Payload"]))
+            assert kwargs["InvocationType"] == "Event"
+            return {}
+
+    @staticmethod
+    def _rows(n_ok=2, n_fail=1):
+        from zagg.telemetry import build_record, failure_record, flatten_record
+
+        rows = [
+            flatten_record(build_record(shard_key=i, metadata={"duration_s": 1.0}))
+            for i in range(n_ok)
+        ]
+        rows += [
+            flatten_record(failure_record(shard_key=100 + i, error="boom")) for i in range(n_fail)
+        ]
+        return rows
+
+    def test_inline_transport(self):
+        from zagg import runner
+
+        client = self._Client()
+        summary = {}
+        path = runner._dispatch_run_stats(
+            client,
+            "fn",
+            "s3://b/out.zarr",
+            self._rows(),
+            run_id="rid",
+            result_prefix="s3://b/out.zarr.status/rid",
+            output_creds_event={"accessKeyId": "a", "secretAccessKey": "s"},
+            summary=summary,
+        )
+        (event,) = client.events
+        assert event["mode"] == "stats" and event["run_id"] == "rid"
+        assert len(event["rows"]) == 3 and "rows_from" not in event
+        assert event["output_credentials"]["accessKeyId"] == "a"
+        # The announced path is the pinned D20 key (timestamp-first).
+        assert path == f"s3://b/out.zarr/stats_{event['timestamp']}_rid.parquet"
+        assert summary["run_stats_path"] == path
+
+    def test_pointer_transport_keeps_failures_inline(self, monkeypatch):
+        from zagg import runner
+
+        # Small enough that six rows overflow, one failure row still fits.
+        monkeypatch.setattr(runner, "_RUN_STATS_INLINE_CAP_BYTES", 2048)
+        client = self._Client()
+        path = runner._dispatch_run_stats(
+            client,
+            "fn",
+            "s3://b/out.zarr",
+            self._rows(n_ok=5, n_fail=1),
+            run_id="rid",
+            result_prefix="s3://b/out.zarr.status/rid",
+        )
+        (event,) = client.events
+        assert event["rows_from"] == "s3://b/out.zarr.status/rid"
+        # Only the failure row rides inline (no envelope exists for it).
+        assert [r["success"] for r in event["rows"]] == [False]
+        assert path is not None
+
+    def test_pointer_transport_rides_inline_rows(self, monkeypatch):
+        # The spatial path passes inline_rows = failure rows PLUS stale-worker
+        # fallback-success rows (issue #313): rows_from_status can't rebuild a
+        # fallback-success shard worker-side, so it must ride inline — not be
+        # dropped by the default `not success` failure-filter.
+        from zagg import runner
+        from zagg.telemetry import build_record, flatten_record
+
+        monkeypatch.setattr(runner, "_RUN_STATS_INLINE_CAP_BYTES", 2048)
+        client = self._Client()
+        rows = self._rows(n_ok=5, n_fail=1)
+        # A fallback-success row (success=True) the caller marked inline-required.
+        fallback = flatten_record(build_record(shard_key=999, metadata={"duration_s": 1.0}))
+        inline_rows = [fallback] + [r for r in rows if not r.get("success")]
+        path = runner._dispatch_run_stats(
+            client,
+            "fn",
+            "s3://b/out.zarr",
+            rows + [fallback],
+            run_id="rid",
+            result_prefix="s3://b/out.zarr.status/rid",
+            inline_rows=inline_rows,
+        )
+        (event,) = client.events
+        assert event["rows_from"] == "s3://b/out.zarr.status/rid"
+        # The fallback-success row rides inline despite success=True.
+        assert 999 in [r["shard_key"] for r in event["rows"]]
+        assert [r["shard_key"] for r in event["rows"]] == [r["shard_key"] for r in inline_rows]
+        assert path is not None
+
+    def test_oversized_sync_run_skips_fail_open(self, monkeypatch):
+        from zagg import runner
+
+        monkeypatch.setattr(runner, "_RUN_STATS_INLINE_CAP_BYTES", 8)
+        client = self._Client()
+        summary = {}
+        path = runner._dispatch_run_stats(
+            client, "fn", "s3://b/out.zarr", self._rows(), run_id="rid", summary=summary
+        )
+        assert path is None and client.events == []
+        assert summary["run_stats_path"] is None
+
+    def test_pointer_inline_rows_over_budget_skips_fail_open(self, monkeypatch):
+        # A result_prefix IS present (pointer transport available), but the
+        # rows that MUST ride inline overflow the cap on their own — there is
+        # nothing to fall back to, so it fail-open skips: returns None, no invoke.
+        from zagg import runner
+
+        monkeypatch.setattr(runner, "_RUN_STATS_INLINE_CAP_BYTES", 8)
+        client = self._Client()
+        summary = {}
+        path = runner._dispatch_run_stats(
+            client,
+            "fn",
+            "s3://b/out.zarr",
+            self._rows(n_ok=5, n_fail=3),
+            run_id="rid",
+            result_prefix="s3://b/out.zarr.status/rid",
+            summary=summary,
+        )
+        assert path is None and client.events == []
+        assert summary["run_stats_path"] is None
+
+    class _VerifyClient:
+        """Fake client for the fire->verify->re-fire leg: `drop_first` Event
+        invokes vanish (retries-0 loss); the next one 'lands' by writing the
+        parquet object at the pinned key, as the worker would."""
+
+        def __init__(self, root, drop_first=0):
+            self.root = root
+            self.drop = drop_first
+            self.events = []
+
+        def invoke(self, **kwargs):
+            from zagg.telemetry import run_parquet_key
+
+            event = json.loads(kwargs["Payload"])
+            self.events.append(event)
+            if len(self.events) <= self.drop:
+                return {}  # dropped Event invoke: nothing lands
+            key = run_parquet_key(event["run_id"], event["timestamp"])
+            (self.root / key).write_bytes(b"parquet")
+            return {}
+
+    def _verify_dispatch(self, monkeypatch, tmp_path, drop_first, summary=None):
+        from zagg import runner
+
+        monkeypatch.setattr(runner, "_RUN_STATS_VERIFY_WINDOW_S", 0.5)
+        monkeypatch.setattr(runner, "_RUN_STATS_VERIFY_INTERVAL_S", 0.01)
+        root = tmp_path / "out"
+        root.mkdir()
+        client = self._VerifyClient(root, drop_first=drop_first)
+        path = runner._dispatch_run_stats(
+            client, "fn", str(root), self._rows(), run_id="rid", summary=summary
+        )
+        return client, path, root
+
+    def test_verify_present_no_refire(self, monkeypatch, tmp_path):
+        # The first invoke lands -> the existence poll passes -> ONE invoke.
+        client, path, root = self._verify_dispatch(monkeypatch, tmp_path, drop_first=0)
+        assert len(client.events) == 1
+        assert (root / path.rsplit("/", 1)[1]).exists()
+
+    def test_dropped_first_invoke_refires_once(self, monkeypatch, tmp_path):
+        # Retries-0 loss on the first Event invoke: the bounded read-only
+        # check re-fires exactly once and the re-fired invoke lands.
+        summary = {}
+        client, path, root = self._verify_dispatch(
+            monkeypatch, tmp_path, drop_first=1, summary=summary
+        )
+        assert len(client.events) == 2
+        assert client.events[0] == client.events[1]  # identical payload re-fired
+        assert (root / path.rsplit("/", 1)[1]).exists()
+        # Path is set once on attempt 1 and survives the re-fire, not clobbered.
+        assert summary["run_stats_path"] == path
+
+    def test_both_invokes_dropped_gives_up_fail_open(self, monkeypatch, tmp_path):
+        # Both dropped: exactly two invokes (never more), announced path still
+        # returned (a late queued invoke may still land it), nothing written.
+        summary = {}
+        client, path, root = self._verify_dispatch(
+            monkeypatch, tmp_path, drop_first=2, summary=summary
+        )
+        assert len(client.events) == 2
+        assert path is not None
+        assert not any(root.glob("stats_*.parquet"))
+        # Set on the first fire even though verification never confirmed it.
+        assert summary["run_stats_path"] == path
+
+    def test_invoke_failure_is_fail_open(self):
+        from zagg import runner
+
+        summary = {}
+        path = runner._dispatch_run_stats(
+            self._Client(raise_on_invoke=True),
+            "fn",
+            "s3://b/out.zarr",
+            self._rows(),
+            run_id="rid",
+            summary=summary,
+        )
+        assert path is None and summary["run_stats_path"] is None
+
+    def test_empty_rows_no_invoke(self):
+        from zagg import runner
+
+        client = self._Client()
+        assert runner._dispatch_run_stats(client, "fn", "s3://b/x", [], run_id="r") is None
+        assert client.events == []
+
+
 class TestRunStatsRows:
     """Run-parquet row building from lambda dispatch results (issue #297)."""
 
@@ -3505,13 +3740,17 @@ class TestRunStatsRows:
                 "wall_time": 42.0,
             },
         ]
-        rows = _lambda_result_rows(results)
+        rows, inline_rows = _lambda_result_rows(results)
         assert [r["shard_key"] for r in rows] == [1, 2, 3]
         assert rows[0]["success"] is True and rows[0]["retries"] == 0
         assert rows[1]["success"] is True and rows[1]["n_obs"] == 3
         assert rows[2]["success"] is False
         assert rows[2]["error_class"] == "Lambda timeout"
         assert rows[2]["duration_s"] == 42.0 and rows[2]["retries"] == 3
+        # inline_rows = the rows the pointer path can't reassemble worker-side:
+        # the stale-worker fallback-success row (shard 2) and the failure row
+        # (shard 3), but NOT the envelope-backed success row (shard 1).
+        assert [r["shard_key"] for r in inline_rows] == [2, 3]
 
 
 class TestWorkerPhaseTimings:

@@ -134,6 +134,22 @@ end of run, like coverage mode; also invocable ad hoc):
     "output_credentials": dict (optional, same shape as process mode),
 }
 
+Stats mode (run-level stats parquet, issue #313 — the D8 worker-invoke
+transport for the issue #297 run record; fire-and-forget Event invoke from
+the dispatcher at end of run, like coverage mode):
+{
+    "mode": "stats",
+    "store_path": str,
+    "run_id": str,
+    "timestamp": str (optional) -- pins the D20 key the dispatcher announced,
+    "rows": [dict, ...] (optional) -- inline run-parquet rows (always carries
+        the failure rows; small runs send everything inline),
+    "rows_from": str (optional) -- the run's async status prefix; the worker
+        assembles success rows from the mirrored result envelopes when the
+        row set exceeds the async payload budget,
+    "output_credentials": dict (optional, same shape as process mode),
+}
+
 Extract mode (chunk-boundary geometry extraction, issue #148 — one parquet per
 granule under an S3 prefix; a batch of granules per invocation for the fan-out):
 {
@@ -536,6 +552,8 @@ def lambda_handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
         return _handle_coverage(event)
     if mode == "sweep":
         return _handle_sweep(event)
+    if mode == "stats":
+        return _handle_stats(event)
     # Extract mode returns directly: the result_url mirror below is for the
     # per-unit fan-out handlers (spatial process, temporal process_event) only.
     if mode == "extract":
@@ -966,6 +984,52 @@ def _handle_sweep(event: Dict[str, Any]) -> Dict[str, Any]:
     except Exception as e:
         logger.exception(e)
         return {"statusCode": 500, "body": json.dumps({"error": str(e), "mode": "sweep"})}
+
+
+def _handle_stats(event: Dict[str, Any]) -> Dict[str, Any]:
+    """Write the run-level stats parquet at the store root (issue #313).
+
+    Posted fire-and-forget (``InvocationType="Event"``) by the dispatcher at
+    end of run — the D8 orchestrator-no-write invariant means the dispatcher
+    (e.g. the invoke-only CI OIDC role) cannot PUT the parquet itself, so the
+    worker role performs the write, exactly like the root ``coverage.moc``
+    (``mode="coverage"``). Two row transports, chosen dispatcher-side by
+    payload size: ``rows`` inline (small runs; always carries the failure
+    rows, which have no mirrored envelope to read back), and/or ``rows_from``
+    — the run's async status prefix, from which the worker assembles the
+    success rows (issue #151 envelopes; worker-role read). ``timestamp``
+    pins the D20 key so the dispatcher knows the path it announced. Nobody
+    reads this response on the Event invoke; errors log and fail open — the
+    run record is best-effort telemetry, never load-bearing.
+    """
+    from zagg.telemetry import rows_from_status, write_run_parquet
+
+    logger.info(f"Stats mode: writing run parquet at {event.get('store_path')}")
+    try:
+        rows = list(event.get("rows") or [])
+        if event.get("rows_from"):
+            rows += rows_from_status(event["rows_from"], store_kwargs=_output_store_kwargs(event))
+        if not rows:
+            # A pointer prefix that yielded nothing (and no inline rows):
+            # nothing to persist — not an error (fail-open telemetry).
+            return {
+                "statusCode": 200,
+                "body": json.dumps({"ok": True, "mode": "stats", "rows": 0}),
+            }
+        path = write_run_parquet(
+            event["store_path"],
+            rows,
+            run_id=event["run_id"],
+            timestamp=event.get("timestamp"),
+            store_kwargs=_output_store_kwargs(event),
+        )
+        return {
+            "statusCode": 200,
+            "body": json.dumps({"ok": True, "mode": "stats", "rows": len(rows), "path": path}),
+        }
+    except Exception as e:
+        logger.exception(e)
+        return {"statusCode": 500, "body": json.dumps({"error": str(e), "mode": "stats"})}
 
 
 def _json_scalar(v: Any) -> Any:

@@ -24,6 +24,7 @@ import hashlib
 import json
 import os
 import platform
+import re
 from datetime import datetime, timezone
 from typing import Any, Iterable
 
@@ -343,19 +344,47 @@ def flatten_record(record: dict, *, retries=None, error_class=None) -> dict:
     return row
 
 
+#: ``run_id`` charset for the parquet key: opaque, no ``/`` or ``.`` (mirrors
+#: the frozen window-label grammar in :mod:`zagg.windows`).
+_RUN_ID_RE = re.compile(r"^[0-9A-Za-z-]{1,64}$")
+#: The D20 ``%Y%m%dT%H%M%SZ`` timestamp grammar — the only shape ``run_parquet_key``
+#: emits itself, pinned so a caller-supplied value can't smuggle a path escape.
+_RUN_TS_RE = re.compile(r"^[0-9]{8}T[0-9]{6}Z$")
+
+
 def run_parquet_key(run_id: str, timestamp: str | None = None) -> str:
     """Store-root object name of a run's stats parquet: timestamp, then run id.
 
     Timestamp-first (D20, docs/design/sparse_coverage.md) so a lexicographic
     listing of ``stats_*.parquet`` is chronological and time-range queries can
     prune on the key alone.
+
+    Both components flow into the object KEY, so both are validated against
+    their frozen grammar first — the D8 worker-invoke transport (issue #313)
+    makes ``timestamp`` a caller-supplied input, and an embedded ``/`` or
+    ``..`` would escape the store root. Like :func:`sidecar_key`'s
+    ``validate_label``, a malformed value RAISES rather than composing a
+    traversing key.
     """
     ts = timestamp or datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    if not _RUN_TS_RE.match(ts):
+        raise ValueError(
+            f"run parquet timestamp {ts!r} does not match the D20 grammar ({_RUN_TS_RE.pattern})"
+        )
+    if not isinstance(run_id, str) or not _RUN_ID_RE.match(run_id):
+        raise ValueError(
+            f"run_id {run_id!r} does not match the opaque key charset ({_RUN_ID_RE.pattern})"
+        )
     return f"stats_{ts}_{run_id}.parquet"
 
 
 def write_run_parquet(
-    store_root: str, rows: list, *, run_id: str, store_kwargs: dict | None = None
+    store_root: str,
+    rows: list,
+    *,
+    run_id: str,
+    timestamp: str | None = None,
+    store_kwargs: dict | None = None,
 ) -> str:
     """PUT the run-level stats parquet at the store root (issue #297 phase 3).
 
@@ -366,6 +395,11 @@ def write_run_parquet(
     precedent — pyarrow stays off the worker path, issue #130);
     ``object_encoding="utf8"`` pins string columns that may be all-null in a
     given run (e.g. ``invoked_by`` locally). Returns the object's full path.
+
+    ``timestamp`` pins the D20 key instead of stamping write time — the D8
+    worker-invoke transport (issue #313): the dispatcher names the object at
+    dispatch so ``summary["run_stats_path"]`` is knowable without reading the
+    fire-and-forget worker's response.
     """
     import tempfile
 
@@ -376,7 +410,7 @@ def write_run_parquet(
 
     if not rows:
         raise ValueError("write_run_parquet requires at least one row")
-    key = run_parquet_key(run_id)
+    key = run_parquet_key(run_id, timestamp)
     df = pd.DataFrame(rows)
     # Packed morton shard keys exceed 2^53 (and int64 for high base cells), so
     # the DataFrame's float64 inference on a column that mixes ints with
@@ -397,6 +431,59 @@ def write_run_parquet(
             data = fh.read()
     obstore.put(open_object_store(store_root, **(store_kwargs or {})), key, data)
     return f"{store_root.rstrip('/')}/{key}"
+
+
+def rows_from_status(status_prefix: str, *, store_kwargs: dict | None = None) -> list:
+    """Run-parquet rows assembled worker-side from the async status prefix.
+
+    The pointer transport of the D8 worker-invoke run-record write (issue
+    #313): when a run's rows exceed the async-invoke payload budget, the
+    dispatcher sends the status-prefix LOCATION instead and the worker — whose
+    role can read the store side — LISTs the per-shard result envelopes the
+    workers mirrored there (issue #151) and flattens each envelope's
+    ``body["stats"]`` record into a row. Envelopes without a record (stale
+    worker) and unparsable objects are skipped with a warning — the run
+    record is best-effort telemetry (fail-open, D9-style), never load-bearing.
+    Failure rows cannot be assembled here (a timed-out shard mirrored no
+    envelope); the dispatcher sends those few rows inline alongside the
+    pointer. Dispatcher-side ``retries`` are likewise not recoverable from
+    envelopes, so pointer-assembled success rows carry ``retries: None``.
+
+    The per-envelope GETs fan out over a bounded thread pool (this branch is
+    the large-run one — hundreds to thousands of shards — where thousands of
+    serial S3 round-trips would eat a real slice of the worker's 900 s budget;
+    the run record is the thing you most want kept for exactly those runs).
+    """
+    import json as _json
+    import logging
+    from concurrent.futures import ThreadPoolExecutor
+
+    import obstore
+
+    from zagg.store import open_object_store
+
+    logger = logging.getLogger(__name__)
+    store = open_object_store(status_prefix, **(store_kwargs or {}))
+    # Immediate children only — the layout is flat (``{run_id}/{shard}.json``),
+    # so ``list_with_delimiter`` (the coverage.py/hive.py prefix-walk precedent)
+    # matches the semantics and won't parse any future nested key as an envelope.
+    listing = obstore.list_with_delimiter(store)
+    keys = [meta["path"] for meta in listing["objects"] if meta["path"].endswith(".json")]
+
+    def _record(key: str) -> dict | None:
+        try:
+            envelope = _json.loads(bytes(obstore.get(store, key).bytes()))
+            body = _json.loads(envelope.get("body", "{}"))
+            record = body.get("stats")
+        except Exception as e:
+            logger.warning(f"skipping unparsable status envelope {key}: {e}")
+            return None
+        return record if isinstance(record, dict) else None
+
+    if not keys:
+        return []
+    with ThreadPoolExecutor(max_workers=min(16, len(keys))) as pool:
+        return [flatten_record(rec) for rec in pool.map(_record, keys) if rec is not None]
 
 
 # ---------------------------------------------------------------------------

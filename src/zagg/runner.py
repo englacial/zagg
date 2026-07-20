@@ -1477,10 +1477,15 @@ class RasterStrategy:
             )
             for key, error, body in stats_failures
         ]
-        run_stats_path = _write_run_stats(
+        # D8 worker-invoke transport (issue #313): mirrors the spatial path.
+        run_stats_path = _dispatch_run_stats(
+            client,
+            function_name,
             store_path,
             rows,
             run_id=run_id,
+            result_prefix=result_prefix,
+            output_creds_event=output_creds_event,
             store_kwargs=_output_store_kwargs(output_creds_event, region),
         )
         # End-of-run rollup sweep (issue #300): D8 worker-invoke transport,
@@ -2289,7 +2294,156 @@ def _write_run_stats(store_path, rows, *, run_id, store_kwargs, summary=None) ->
         return None
 
 
-def _lambda_result_rows(results, *, run_id=None) -> list:
+def _dispatch_run_stats(
+    lambda_client,
+    function_name,
+    store_path,
+    rows,
+    *,
+    run_id,
+    result_prefix=None,
+    output_creds_event=None,
+    store_kwargs=None,
+    summary=None,
+    inline_rows=None,
+) -> str | None:
+    """Fire-and-forget worker-invoke run-record write (issue #313, D8).
+
+    The Lambda-path twin of :func:`_write_run_stats`: the orchestrator has no
+    S3 write access (D8 — the invariant that keeps every store write behind
+    worker-role prefix grants), so the parquet PUT rides a ``mode="stats"``
+    Event invoke exactly like the root ``coverage.moc``. Transport is
+    size-gated (the seam the PR #315 body describes): rows inline under
+    :data:`_RUN_STATS_INLINE_CAP_BYTES`; above it the run's async status
+    prefix is sent as a pointer (``rows_from``) with only the rows the worker
+    cannot reassemble from the mirrored envelopes riding inline. Those are
+    given by ``inline_rows`` when the caller knows them (the spatial path:
+    failure rows PLUS stale-worker fallback-success rows — issue #313); absent,
+    the failure rows alone are kept inline (the raster path builds no fallback
+    rows). An oversized SYNC run (no prefix) logs a fail-open skip. The D20 object key is pinned here
+    (``timestamp`` rides the event), so the returned/announced
+    ``run_stats_path`` names the real object — best-effort: the invoke is
+    fire-and-forget, mirroring the root MOC's semantics. Fail-open
+    everywhere: telemetry must never fail a run whose data landed.
+    """
+    from datetime import datetime, timezone
+
+    from zagg.telemetry import run_parquet_key
+
+    if summary is not None:
+        summary["run_stats_path"] = None
+    if not rows:
+        return None
+    try:
+        timestamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+        event = {
+            "mode": "stats",
+            "store_path": store_path,
+            "run_id": run_id,
+            "timestamp": timestamp,
+        }
+        if output_creds_event is not None:
+            event["output_credentials"] = output_creds_event
+        if len(json.dumps(rows)) <= _RUN_STATS_INLINE_CAP_BYTES:
+            event["rows"] = rows
+        elif result_prefix is not None:
+            inline = (
+                inline_rows
+                if inline_rows is not None
+                else [r for r in rows if not r.get("success")]
+            )
+            if len(json.dumps(inline)) > _RUN_STATS_INLINE_CAP_BYTES:
+                logger.warning(
+                    f"run stats inline rows alone exceed the inline budget "
+                    f"({len(inline)} rows); skipping run record (fail-open, issue #313)"
+                )
+                return None
+            event["rows"] = inline
+            event["rows_from"] = result_prefix
+        else:
+            logger.warning(
+                f"run stats rows ({len(rows)}) exceed the async payload budget and this "
+                f"sync run has no status prefix to point at; skipping (fail-open, issue #313)"
+            )
+            return None
+        key = run_parquet_key(run_id, timestamp)
+        path = f"{store_path.rstrip('/')}/{key}"
+        payload = json.dumps(event)
+        # Fire -> verify -> re-fire (the async-per-D8 hardening): the Event
+        # invoke is retries-0 and failure rows exist only in this run report,
+        # so verify the parquet landed (read-only HEAD poll on the pinned
+        # key) and re-fire ONCE if not. This is not free: every successful run
+        # now waits at its tail for one async worker round-trip (cold start +
+        # envelope assemble + PUT), caught by the next <=2s HEAD tick — seconds
+        # of added wall on the common path where fire-and-forget returned
+        # instantly; the drop case pays up to 2x the verify window. Bounded, then
+        # fail-open with a logged notice (success rows stay rebuildable from the
+        # leaf sidecars; a late queued invoke may still land the object after we
+        # stop looking).
+        for attempt in (1, 2):
+            lambda_client.invoke(
+                FunctionName=function_name,
+                InvocationType="Event",
+                Payload=payload,
+            )
+            if attempt == 1:
+                if summary is not None:
+                    summary["run_stats_path"] = path
+                logger.info(
+                    f"Dispatched run stats write ({len(rows)} rows, fire-and-forget): {path}"
+                )
+            if _await_run_stats_object(store_path, key, store_kwargs):
+                return path
+            if attempt == 1 and _RUN_STATS_VERIFY_WINDOW_S > 0:
+                logger.warning(
+                    f"run stats parquet not visible after "
+                    f"{_RUN_STATS_VERIFY_WINDOW_S:g}s; re-firing the Event invoke "
+                    f"once (issue #313)"
+                )
+        logger.warning(
+            f"run stats parquet still absent after the re-fire (fail-open, issue #313): "
+            f"{path} — failure rows may be lost; the run report remains in this summary"
+        )
+        return path
+    except Exception as e:
+        logger.warning(f"run stats dispatch failed (fail-open, issue #313): {e}")
+        return None
+
+
+def _await_run_stats_object(store_path, key, store_kwargs, *, window_s=None) -> bool:
+    """Bounded READ-ONLY existence poll for the run parquet (issue #313).
+
+    True once the object exists; False at the deadline. A non-positive window
+    skips verification entirely (reports True after zero reads) — the single-
+    fire escape hatch, and what unit tests set to keep dispatch synchronous
+    paths read-free. Read errors count as absent (the poll is best-effort;
+    the caller's fail-open handles a dispatcher that cannot read the store).
+    """
+    window_s = _RUN_STATS_VERIFY_WINDOW_S if window_s is None else window_s
+    if window_s <= 0:
+        return True
+    import obstore
+
+    from zagg.store import open_object_store
+
+    try:
+        store = open_object_store(store_path, **(store_kwargs or {}))
+    except Exception as e:
+        logger.warning(f"run stats verify skipped (cannot open store read-only): {e}")
+        return False
+    deadline = time.time() + window_s
+    while True:
+        try:
+            obstore.head(store, key)
+            return True
+        except Exception:
+            pass
+        if time.time() >= deadline:
+            return False
+        time.sleep(_RUN_STATS_VERIFY_INTERVAL_S)
+
+
+def _lambda_result_rows(results, *, run_id=None) -> tuple[list, list]:
     """Run-parquet rows from the lambda dispatch's per-cell result dicts.
 
     Success rows come from the envelope-ridden worker record
@@ -2298,13 +2452,25 @@ def _lambda_result_rows(results, *, run_id=None) -> list:
     a failure row (error, duration until failure, retry count). ``run_id``
     stamps the dispatcher-built fallback/failure rows; envelope records
     already carry it (the worker copies it from the event).
+
+    Returns ``(rows, inline_rows)``. ``inline_rows`` is the subset that MUST
+    ride inline on the pointer transport (issue #313): the pointer path has
+    the worker re-derive success rows from the mirrored envelopes via
+    :func:`~zagg.telemetry.rows_from_status`, which reads only ``body["stats"]``
+    — so any row NOT backed by an envelope record (failure rows, and the
+    stale-worker fallback-success rows built here) would be dropped worker-side
+    and has to be sent inline alongside the pointer.
     """
     from zagg.telemetry import build_record, failure_record, flatten_record
 
     rows = []
+    inline_rows = []
     for r in results:
         body = r.get("body") or {}
         record = body.get("stats")
+        # Envelope-backed rows are re-derivable worker-side (rows_from_status);
+        # everything else the pointer path can't rebuild, so it rides inline.
+        rideable = record is not None
         if record is None:
             if r.get("status_code") == 200 and not r.get("error"):
                 # Stale deployed worker (no record in the envelope): derive one
@@ -2321,8 +2487,11 @@ def _lambda_result_rows(results, *, run_id=None) -> list:
                     duration_s=r.get("lambda_duration") or r.get("wall_time"),
                     run_id=run_id,
                 )
-        rows.append(flatten_record(record, retries=r.get("retries")))
-    return rows
+        row = flatten_record(record, retries=r.get("retries"))
+        rows.append(row)
+        if not rideable:
+            inline_rows.append(row)
+    return rows, inline_rows
 
 
 def _resolve_source_credentials(config) -> dict:
@@ -3438,15 +3607,23 @@ def _run_lambda(
     }
     if profile:
         summary["worker_phase_max"] = worker_phase_max
-    # Run-level stats parquet (issue #297 phase 3): success rows straight off
-    # the async result envelopes (no second S3 listing), failure rows from the
-    # dispatch results the RunReport accumulated.
-    _write_run_stats(
+    # Run-level stats parquet (issue #297 phase 3; D8 worker-invoke transport,
+    # issue #313): success rows straight off the async result envelopes,
+    # failure rows from the dispatch results the RunReport accumulated. The
+    # PUT itself rides a fire-and-forget worker invoke — the dispatcher may
+    # hold an invoke-only role with no S3 write access.
+    stats_rows, stats_inline_rows = _lambda_result_rows(report.results, run_id=run_id)
+    _dispatch_run_stats(
+        state["lambda_client"],
+        function_name,
         store_path,
-        _lambda_result_rows(report.results, run_id=run_id),
+        stats_rows,
         run_id=run_id,
+        result_prefix=result_prefix,
+        output_creds_event=output_creds_event,
         store_kwargs=_output_store_kwargs(output_creds_event, region),
         summary=summary,
+        inline_rows=stats_inline_rows,
     )
     # End-of-run rollup sweep (issue #300): the Lambda dispatcher never PUTs
     # (D8 standing rule), so the sweep rides ONE fire-and-forget mode="sweep"
@@ -3611,6 +3788,22 @@ _MANIFEST_CHECK_JOIN_TIMEOUT_S = 30.0
 # Lambda's raw RequestEntityTooLargeException does; the realistic trigger is a
 # large strict-AOI ``aoi_payload`` (issue #101).
 _ASYNC_PAYLOAD_CAP_BYTES = 250 * 1024
+
+#: Inline-rows budget for the mode="stats" run-record invoke (issue #313):
+#: the Event cap above minus ~50 KB headroom for the rest of the event
+#: (credentials block, paths). Above this the dispatcher sends the status
+#: prefix pointer instead (failure rows stay inline — they have no envelope).
+_RUN_STATS_INLINE_CAP_BYTES = 200 * 1024
+
+#: Fire -> verify -> re-fire bounds for the mode="stats" Event invoke (issue
+#: #313 hardening): failure rows exist only in the dispatcher's run report,
+#: so a dropped retries-0 Event invoke loses them permanently. After firing,
+#: the dispatcher does a READ-ONLY existence poll on the pinned parquet key
+#: (reads were never forbidden — it already polls result objects) for at most
+#: the window, re-fires ONCE if absent, then gives up fail-open. Worst case
+#: 2 x window of end-of-run wall; <= 0 disables verification (single fire).
+_RUN_STATS_VERIFY_WINDOW_S = 20.0
+_RUN_STATS_VERIFY_INTERVAL_S = 2.0
 
 # The result poller owns its retrying at the loop level (a fetch every
 # _ASYNC_POLL_INTERVAL_S until the deadline), so its store gets a short
@@ -4568,9 +4761,13 @@ def _invoke_lambda_sweep(lambda_client, function_name, store_path, leaves, outpu
     ``(shard_key, window)`` leaves ride inline when they fit the async
     budget; an oversized set falls back to ``discover: true`` — the worker
     re-derives the work set from the store's run records (the D22 discovery
-    path; this run's parquet is written before this invoke fires). Failure is
-    harmless by design: rollups are regenerable caches (D9) and the manual
-    CLI (``python -m zagg.sweep``) is the regeneration backstop.
+    path). Ordering caveat since issue #313 moved the run-record write behind
+    its own fire-and-forget ``mode="stats"`` invoke: the two Event invokes
+    race, so a ``discover`` fallback may read only earlier runs' records and
+    miss this run's leaves — accepted (fail-open): the oversized case is
+    rare, and the next hook run or the manual CLI backstop
+    (``python -m zagg.sweep``) folds anything missed. Failure is harmless by
+    design: rollups are regenerable caches (D9).
     """
     event: dict = {"mode": "sweep", "store_path": store_path}
     if output_creds_event is not None:

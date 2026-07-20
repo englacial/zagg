@@ -1445,6 +1445,96 @@ class TestFinalizeHive:
         assert len(calls) == 1
 
 
+class TestStatsMode:
+    """mode="stats" (issue #313): the D8 worker-invoke run-record write —
+    the dispatcher cannot PUT the run parquet (orchestrator-no-write), so a
+    fire-and-forget Event invoke has the worker role write it, like the root
+    coverage.moc."""
+
+    @staticmethod
+    def _rows():
+        from zagg.telemetry import build_record, failure_record, flatten_record
+
+        ok = build_record(shard_key=1, metadata={"total_obs": 5, "duration_s": 1.0})
+        bad = failure_record(shard_key=2, error="Lambda timeout: x", duration_s=900.0)
+        return [flatten_record(ok), flatten_record(bad, retries=3)]
+
+    def test_inline_rows_written_at_pinned_key(self, handler_mod, tmp_path):
+        import pandas as pd
+
+        root = str(tmp_path / "out")
+        event = {
+            "mode": "stats",
+            "store_path": root,
+            "run_id": "runid1",
+            "timestamp": "20260720T010203Z",
+            "rows": self._rows(),
+        }
+        resp = handler_mod.lambda_handler(event, MagicMock())
+        assert resp["statusCode"] == 200, resp["body"]
+        body = json.loads(resp["body"])
+        assert body["rows"] == 2
+        # The dispatcher-pinned D20 key, so the announced path is the real one.
+        path = f"{root}/stats_20260720T010203Z_runid1.parquet"
+        assert body["path"] == path
+        df = pd.read_parquet(path, engine="fastparquet")
+        assert set(df["shard_key"]) == {1, 2}
+        assert bool(df.set_index("shard_key").loc[2, "success"]) is False
+
+    def test_pointer_rows_assembled_from_status_prefix(self, handler_mod, tmp_path):
+        import pandas as pd
+
+        from zagg.telemetry import build_record
+
+        # Mirror two per-shard result envelopes the way _write_result does.
+        prefix = tmp_path / "out.zarr.status" / "runid2"
+        prefix.mkdir(parents=True)
+        for shard in (11, 12):
+            rec = build_record(shard_key=shard, metadata={"total_obs": 1, "duration_s": 2.0})
+            envelope = {"statusCode": 200, "body": json.dumps({"stats": rec})}
+            (prefix / f"{shard}.json").write_text(json.dumps(envelope))
+        # A stale-worker envelope without a record is skipped, not fatal.
+        (prefix / "13.json").write_text(json.dumps({"statusCode": 200, "body": "{}"}))
+        # An unparsable-bytes object hits the except branch (logged + skipped),
+        # and a non-.json object under the prefix is filtered before any GET —
+        # neither aborts the write nor adds a row.
+        (prefix / "14.json").write_text("not json")
+        (prefix / "manifest.txt").write_text("ignore me")
+
+        root = str(tmp_path / "out")
+        event = {
+            "mode": "stats",
+            "store_path": root,
+            "run_id": "runid2",
+            "timestamp": "20260720T010203Z",
+            # Failure rows ride inline next to the pointer (no envelope to read).
+            "rows": [r for r in self._rows() if not r["success"]],
+            "rows_from": str(prefix),
+        }
+        resp = handler_mod.lambda_handler(event, MagicMock())
+        assert resp["statusCode"] == 200, resp["body"]
+        assert json.loads(resp["body"])["rows"] == 3
+        df = pd.read_parquet(f"{root}/stats_20260720T010203Z_runid2.parquet", engine="fastparquet")
+        assert set(df["shard_key"]) == {2, 11, 12}
+
+    def test_empty_rows_is_ok_and_writes_nothing(self, handler_mod, tmp_path):
+        root = str(tmp_path / "out")
+        resp = handler_mod.lambda_handler(
+            {"mode": "stats", "store_path": root, "run_id": "r"}, MagicMock()
+        )
+        assert resp["statusCode"] == 200
+        assert json.loads(resp["body"])["rows"] == 0
+        assert not (tmp_path / "out").exists()
+
+    def test_failure_is_500_fail_open(self, handler_mod):
+        # No store_path -> the write raises; the envelope reports it, nobody
+        # reads it on the Event invoke (fail-open by design).
+        resp = handler_mod.lambda_handler(
+            {"mode": "stats", "run_id": "r", "rows": [{}]}, MagicMock()
+        )
+        assert resp["statusCode"] == 500
+
+
 class TestPingMode:
     """Issue #252: the hive pre-fan-out preflight. Answering 200 at all gates
     the deployment generation (a pre-fold function 400s the unknown mode via
