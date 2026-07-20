@@ -2069,14 +2069,15 @@ def test_hive_config_expected_counts_root_moc_optional():
     # + 4 array zarr.json + 4 sharded data objects + coverage sidecar +
     # stats.json sibling (issue #297) = 12.
     # Store root: morton_hive.json (always) + coverage.moc (optional) + the
-    # run stats parquet (optional, issue #297) -> [1, 3].
+    # run stats parquet (optional, issue #297) + aggregation.yaml (optional,
+    # issue #299) -> [1, 4].
     assert exp == {
-        "metadata": 3,
+        "metadata": 4,
         "metadata_min": 1,
         "per_shard_min": 12,
         "per_shard_max": 12,
         "total_min": 13,
-        "total_max": 15,
+        "total_max": 16,
         "exact": True,
     }
 
