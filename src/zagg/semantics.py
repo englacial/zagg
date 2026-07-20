@@ -61,6 +61,14 @@ AGGREGATION_PACKAGING_KEYS = ("handoff",)
 #: — recorded rationale on the issue #299 thread).
 FINGERPRINT_HEX = 12
 
+#: Non-healpix grid keys that spatially define the product (F1, issue #299).
+#: For rect/other grids the cell geometry is fixed by CRS + resolution +
+#: bounds, so two such products differing in any of these are different
+#: products (D24's resolution-axis exclusion is a HEALPix/morton composability
+#: argument that does not extend to rect — over-discriminating is safe, a
+#: semantic collision is not). HEALPix stays type + indexing scheme only.
+GRID_SPATIAL_KEYS = ("crs", "resolution", "bounds")
+
 
 def _without(mapping: dict, keys: tuple[str, ...]) -> dict:
     return {k: v for k, v in (mapping or {}).items() if k not in keys and v is not None}
@@ -76,15 +84,21 @@ def semantic_core(config: PipelineConfig) -> dict:
     """
     grid_cfg = (config.output or {}).get("grid", {}) or {}
     grid_type = grid_cfg.get("type", "healpix")
-    core: dict = {
-        "aggregation": _without(config.aggregation, AGGREGATION_PACKAGING_KEYS),
-        "data_source": _without(config.data_source, DATA_SOURCE_PACKAGING_KEYS),
-        "grid": {"type": grid_type},
-    }
+    grid: dict = {"type": grid_type}
     if grid_type == "healpix":
         # The one indexing scheme zagg writes (the morton store convention
         # rides D16 attrs; the underlying cell tiling is HEALPix NESTED).
-        core["grid"]["indexing_scheme"] = "nested"
+        grid["indexing_scheme"] = "nested"
+    else:
+        # Rect/other: fold in the spatially-defining params when present (F1).
+        for key in GRID_SPATIAL_KEYS:
+            if key in grid_cfg:
+                grid[key] = grid_cfg[key]
+    core: dict = {
+        "aggregation": _without(config.aggregation, AGGREGATION_PACKAGING_KEYS),
+        "data_source": _without(config.data_source, DATA_SOURCE_PACKAGING_KEYS),
+        "grid": grid,
+    }
     return core
 
 
@@ -120,6 +134,7 @@ __all__ = [
     "AGGREGATION_PACKAGING_KEYS",
     "DATA_SOURCE_PACKAGING_KEYS",
     "FINGERPRINT_HEX",
+    "GRID_SPATIAL_KEYS",
     "canonical_semantic_json",
     "semantic_core",
     "semantic_fingerprint",
