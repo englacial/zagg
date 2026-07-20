@@ -20,7 +20,11 @@ Included (the semantic core):
 - the grid **type + indexing scheme** (D19: cell order is a resolution axis
   (D24), parent/shard order and chunking are packaging — hashing the whole
   template would have made o8 and o9 runs different products and blocked
-  mixed-order processing).
+  mixed-order processing);
+- the **pipeline type** (``spatial`` | ``temporal`` | ``event``; absent
+  normalizes to ``spatial`` — espg-ruled on the PR #316 review: a temporal
+  engine over the same aggregation block is a different product; D19's
+  ratified list omitted it only because the temporal path wasn't in frame).
 
 Excluded as packaging: all orders (``parent_order``/``child_order``/
 ``chunk_inner``), ``sharded``, store layout/path, ``emit_cell_ids`` (the
@@ -46,7 +50,7 @@ from __future__ import annotations
 import hashlib
 import json
 
-from zagg.config import PipelineConfig
+from zagg.config import PipelineConfig, get_pipeline_type
 
 #: ``data_source`` keys that are read machinery, not output semantics (D19).
 #: Changing any of these must never change the ``semantic_hash``.
@@ -115,6 +119,13 @@ def semantic_core(config: PipelineConfig) -> dict:
         "aggregation": _without(config.aggregation, AGGREGATION_PACKAGING_KEYS),
         "data_source": _without(config.data_source, DATA_SOURCE_PACKAGING_KEYS),
         "grid": grid,
+        # pipeline.type is output-defining (espg-ruled on the PR #316
+        # review, 2026-07-21): a temporal/event engine over an identical
+        # aggregation block is a DIFFERENT product. Absent normalizes to
+        # the "spatial" default on both sides (get_pipeline_type's default),
+        # the same discipline as the manifest's path_grouping absent=>1, so
+        # every existing config hashes stably.
+        "pipeline": {"type": get_pipeline_type(config)},
     }
     return _prune_nulls(core)
 

@@ -189,7 +189,8 @@ class TestCanonicalization:
 
     def test_golden_hash_pin(self):
         # F4: a fully-inline config with fixed dicts, pinned to its exact
-        # digest. This catches accidental canonicalization drift — any change
+        # digest (re-pinned when pipeline.type joined the core, espg-ruled
+        # 2026-07-21). This catches accidental canonicalization drift — any change
         # to key ordering, null pruning, the packaging-key sets, or the JSON
         # separators would move this hash, so an unintended edit fails loudly.
         cfg = PipelineConfig(
@@ -213,8 +214,21 @@ class TestCanonicalization:
             output={"grid": {"type": "healpix", "parent_order": 6, "child_order": 12}},
         )
         assert semantic_hash(cfg) == (
-            "c17f7523ffb21e7b5a33d092f4ab12eaf805b1f88117f592132805458f354f86"
+            "98450eb2909a105f8989c55e317d27180bf92c559859ad1415bf77445f925f22"
         )
+
+    def test_pipeline_type_is_semantic(self):
+        # espg-ruled on the PR #316 review (2026-07-21): a temporal engine
+        # over the same aggregation block is a DIFFERENT product. Absent
+        # normalizes to the spatial default, so existing configs hash stably.
+        base = _cfg()
+        explicit = _cfg()
+        explicit.pipeline = {"type": "spatial"}
+        assert semantic_hash(base) == semantic_hash(explicit)
+        temporal = _cfg()
+        temporal.pipeline = {"type": "temporal"}
+        assert semantic_hash(temporal) != semantic_hash(base)
+        assert semantic_core(temporal)["pipeline"] == {"type": "temporal"}
 
     def test_fingerprint_rejects_short_input(self):
         with pytest.raises(ValueError, match="not a semantic hash"):
