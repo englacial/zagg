@@ -55,6 +55,17 @@ def shard_status(
     path, STAC item ids/datetimes for raster — cf.
     :func:`zagg.telemetry.granules_sha256`); ``None`` skips the catalog
     check (identity match alone then gates the hit).
+
+    .. warning::
+       The catalog check is an EXACT ``granules_sha256`` comparison, so
+       ``granule_ids`` must be the same id space the writer recorded — a
+       caller that supplies a different space (bare short-names vs resolved
+       URLs, sorted vs dispatch order) makes EVERY stamped shard report
+       ``stale`` on ``catalog_match`` rather than a genuine catalog change.
+       A ``"catalog grown/changed"`` stale carries both
+       ``granules_sha256_recorded`` and ``granules_sha256_current`` so a
+       mis-spaced caller can see the mismatch is systematic (every shard
+       differs), not a real snapshot drift.
     """
     leaf = shard_leaf_path(store_root, int(shard_key), window=window)
     stamp = read_commit(open_store(leaf, **store_kwargs))
@@ -73,11 +84,21 @@ def shard_status(
         # O11 verifier, surfaced when recorded (never recomputed here).
         detail["content_hashes"] = content
     if granule_ids is not None:
-        detail["catalog_match"] = sidecar.get("granules_sha256") == granules_sha256(granule_ids)
+        recorded = sidecar.get("granules_sha256")
+        current = granules_sha256(granule_ids)
+        detail["catalog_match"] = recorded == current
     if not detail["semantic_hash_match"]:
         return {"status": "stale", "reason": "semantic_hash mismatch or unrecorded", **detail}
     if detail["catalog_match"] is False:
-        return {"status": "stale", "reason": "catalog grown/changed", **detail}
+        # Surface both digests so a systematic id-space mismatch (every shard
+        # differs) is distinguishable from a genuine per-shard catalog change.
+        return {
+            "status": "stale",
+            "reason": "catalog grown/changed",
+            "granules_sha256_recorded": recorded,
+            "granules_sha256_current": current,
+            **detail,
+        }
     return {"status": "hit", **detail}
 
 

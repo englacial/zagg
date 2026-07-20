@@ -98,6 +98,9 @@ class TestShardStatus:
         assert status["status"] == "stale"
         assert status["catalog_match"] is False
         assert status["semantic_hash_match"] is True
+        # F8: the recorded vs current digests are surfaced so a systematic
+        # id-space mismatch is distinguishable from a genuine catalog change.
+        assert status["granules_sha256_recorded"] != status["granules_sha256_current"]
 
     def test_semantic_mismatch_is_stale(self, tmp_path):
         cfg = _cfg()
