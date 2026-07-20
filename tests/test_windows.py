@@ -163,6 +163,26 @@ class TestLeafNameSplit:
             w.leaf_name("-31123", "melt_2019")
 
 
+# ── leaf_name_v3 (D23 window-only naming) ────────────────────────────────────
+
+
+class TestLeafNameV3:
+    def test_window_and_none(self):
+        assert w.leaf_name_v3("2019") == "2019.zarr"
+        assert w.leaf_name_v3(None) == f"{w.SCHEDULE_NONE_TOKEN}.zarr"
+
+    def test_explicit_label_equal_to_reserved_token_raises(self):
+        # The explicit grammar admits "all", but leaf_name_v3(None) already
+        # owns that leaf — an explicit label equal to the token must raise
+        # rather than alias the no-schedule leaf (D23 reservation).
+        with pytest.raises(ValueError, match="reserved schedule:none token"):
+            w.leaf_name_v3(w.SCHEDULE_NONE_TOKEN)
+
+    def test_rejects_bad_window(self):
+        with pytest.raises(ValueError, match="grammar"):
+            w.leaf_name_v3("melt_2019")
+
+
 # ── windows_intersecting ─────────────────────────────────────────────────────
 
 
