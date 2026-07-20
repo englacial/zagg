@@ -1094,8 +1094,10 @@ class TestCellIdsEncoding:
         assert names == ["dggs", "morton-dggs"]
 
     def test_nested_attrs_unchanged_by_flip(self):
-        # The default store's attrs block is byte-identical in shape to the
-        # pre-flip form: name healpix, NESTED coordinate, one convention entry.
+        # The default store's attrs block keeps the same key set and values as
+        # the pre-flip form (key order is not part of the contract; JSON attrs
+        # parse order-independently): name healpix, NESTED coordinate, one
+        # convention entry.
         attrs = self._grid()._dggs_attrs()
         assert attrs["dggs"]["name"] == "healpix"
         assert attrs["dggs"]["coordinate"] == "cell_ids"
