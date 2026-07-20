@@ -2063,7 +2063,7 @@ def get_emit_cell_ids(config: PipelineConfig) -> bool:
     Default ``False`` (the D16 flip): ``morton`` is the only stored cell
     coordinate; NESTED ids are derived at read (moczarr fabrication). ``True``
     is the transition escape hatch — the ``cell_ids`` array is written in
-    ADDITION to ``morton`` (values per ``cell_ids_encoding``) so legacy
+    ADDITION to ``morton`` (holding the NESTED encode) so legacy
     browser-direct consumers keep working until the gridlook morton decode
     lands; the dggs attrs are unaffected by the hatch.
     """
