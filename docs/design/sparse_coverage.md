@@ -675,7 +675,7 @@ rollup leaves all leaf reads intact.
   "hit"). Immutable-provenance naming (product root
   `{name}+{catalog-hash}/`) stays an opt-in for frozen-catalog archival
   runs. The output content hash that makes dedup *verifiable* is O11
-  (proposal; it complements the semantic hash — "intended identical" vs
+  (resolved — adopted; it complements the semantic hash — "intended identical" vs
   "actually byte-identical"). A community registry maps names → semantic
   cores + hashes; cross-deployment name collisions are disambiguated by
   the hash in metadata rather than prevented by unreadable paths. D7
