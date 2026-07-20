@@ -231,6 +231,25 @@ class TestWorkSetEdges:
         with pytest.raises(ValueError, match="not a hive store root"):
             run_sweep(str(tmp_path), [])
 
+    def test_empty_work_set_writes_nothing(self, tmp_path):
+        # A run that touched nothing (or a caller that filtered every leaf out)
+        # on a manifest-bearing store: the frontier walk breaks immediately and
+        # MocFamily.finish(tops=[]) reports no root MOC. No object is written.
+        from zagg.hive import read_root_coverage
+
+        _write_manifest(tmp_path)
+        _put_leaf(tmp_path, "-311")
+        _stamp_leaf(tmp_path, "-311")
+        summary = run_sweep(str(tmp_path), [])
+        assert summary["n_leaves"] == 0
+        for fam in ("stats", "moc"):
+            counts = summary["families"][fam]
+            assert counts["written"] == 0 and counts["current"] == 0
+            assert counts["empty"] == 0 and counts["failed"] == 0
+        assert summary["families"]["moc"]["root_moc_written"] is False
+        assert not list(tmp_path.rglob("*.rollup.json"))
+        assert read_root_coverage(str(tmp_path)) is None
+
 
 def _stamp_leaf(root, decimal, *, window=None, time_range=None):
     """A minimal committed leaf: root zarr group + D4 commit stamp."""
