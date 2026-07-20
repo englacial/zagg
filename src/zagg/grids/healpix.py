@@ -27,12 +27,7 @@ from zagg.grids.base import (
     vector_array_spec,
     vlen_dtype_warning_suppressed,
 )
-from zagg.grids.morton import (
-    MORTON_CONVENTION,
-    RESOLUTION_EXACT,
-    morton_decimal,
-    to_morton_array,
-)
+from zagg.grids.morton import MORTON_CONVENTION, morton_decimal, to_morton_array
 
 HEALPIX_BASE_CELLS: int = 12
 # Reference order at which ``assign`` resolves points before ``cells_of`` /
@@ -673,14 +668,11 @@ class HealpixGrid:
         }
         common = {
             "refinement_level": self.child_order,
-            # O10 resolution discriminator (issue #305, espg-ratified):
-            # grid-derived cell coordinates are "exact" by construction —
-            # every id is a true cell at its encoded order. "point"
-            # (RESOLUTION_POINT) is reserved for location-derived id
-            # fields (raw lat/lon cast to order 29 — the temporal event
-            # path), which the 29->24 clip rule on the mortie spec page
-            # applies to; no zagg aggregation output ever emits it.
-            "resolution": RESOLUTION_EXACT,
+            # No kind/resolution field (O10 final ruling, espg 2026-07-21):
+            # point-vs-area kind is carried by the packed-word ENCODING
+            # itself (mortie spec page §4 — area words are exact cells at
+            # every order; point ids are points), so readers never consult
+            # a declaration and the attrs block carries none.
             "spatial_dimension": "cells",
             "ellipsoid": {
                 "name": "WGS84",

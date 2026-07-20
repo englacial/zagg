@@ -50,26 +50,6 @@ MORTON_CONVENTION = {
     "description": "Packed-u64 morton (HEALPix) DGGS convention",
 }
 
-#: O10 resolution discriminator (espg-ratified, issue #305): ``exact`` — ids
-#: are true cells at their encoded order; grid-derived cell coordinates are
-#: exact BY CONSTRUCTION, so every zagg aggregation output emits it.
-RESOLUTION_EXACT = "exact"
-#: ``point`` — locations cast to order 29 with no area claim (raw lat/lon
-#: conversions: the temporal event path, future HHDC id fields). The mortie
-#: spec page's 29->24 clip rule applies to ``point`` ONLY. Emission is per
-#: data kind and the writer always knows which; no heuristic fallback.
-RESOLUTION_POINT = "point"
-#: ``mixed`` (espg-proposed on the mortie PR #118 review, 2026-07-21):
-#: order-29 ids are points (unknown resolution), ids at any other order are
-#: exact — per-id recovery via the RESERVED order 29. The 29->24 clip rule is
-#: INAPPLICABLE to mixed arrays (clipping destroys the in-band signal;
-#: Number-safe paths use the other D16 measures), and genuinely-exact
-#: order-29 cells are unrepresentable under it (declare ``exact``). Accepted
-#: as a declared value; no zagg writer emits it today (aggregation outputs
-#: are ``exact`` — the HHDC exact-cells-plus-raw-locations direction is the
-#: intended consumer).
-RESOLUTION_MIXED = "mixed"
-
 
 def is_morton_array(values) -> bool:
     """True if ``values`` is a mortie ``MortonIndexArray``."""
@@ -242,9 +222,6 @@ def is_morton_arrow(col) -> bool:
 __all__ = [
     "MORTON_CONVENTION",
     "MORTON_EXTENSION_NAME",
-    "RESOLUTION_EXACT",
-    "RESOLUTION_MIXED",
-    "RESOLUTION_POINT",
     "is_morton_array",
     "is_morton_arrow",
     "morton_box",

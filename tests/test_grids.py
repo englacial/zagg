@@ -1084,30 +1084,26 @@ class TestCellIdsEncoding:
             names = [c["name"] for c in attrs["zarr_conventions"]]
             assert names == ["dggs", "morton-dggs"]
 
-    def test_dggs_attrs_declare_resolution_exact(self):
-        # O10 discriminator (issue #305): grid-derived cell coordinates are
-        # "exact" by construction — "point" is reserved for location-derived
-        # id paths that don't exist in zagg outputs.
-        from zagg.grids.morton import RESOLUTION_EXACT
-
+    def test_dggs_attrs_carry_no_kind_field(self):
+        # O10 final ruling (espg 2026-07-21): kind is carried by the word
+        # ENCODING (mortie spec §4), never by attrs — no resolution field.
         for emit in (None, True):
-            assert self._grid(emit)._dggs_attrs()["dggs"]["resolution"] == RESOLUTION_EXACT
+            assert "resolution" not in self._grid(emit)._dggs_attrs()["dggs"]
 
     def test_dggs_attrs_reach_written_store(self):
         # Round-trip past the return-value assertions above: the full flipped
-        # dggs block (name/coordinate "morton", resolution exact, no
-        # indexing_scheme) and BOTH convention entries must survive
-        # spec()->emit_template->to_zarr and be readable off the WRITTEN
-        # group's attrs — that store path is what #305 readers key on.
-        from zagg.grids.morton import RESOLUTION_EXACT
-
+        # dggs block (name/coordinate "morton", no indexing_scheme, no
+        # kind/resolution field — O10 final ruling) and BOTH convention
+        # entries must survive spec()->emit_template->to_zarr and be readable
+        # off the WRITTEN group's attrs — that store path is what #305
+        # readers key on.
         g = self._grid()
         store = MemoryStore()
         g.emit_template(store)
         attrs = open_group(store, path="8", mode="r").attrs
         assert attrs["dggs"]["name"] == "morton"
         assert attrs["dggs"]["coordinate"] == "morton"
-        assert attrs["dggs"]["resolution"] == RESOLUTION_EXACT
+        assert "resolution" not in attrs["dggs"]
         assert "indexing_scheme" not in attrs["dggs"]
         names = [c["name"] for c in attrs["zarr_conventions"]]
         assert names == ["dggs", "morton-dggs"]
@@ -1116,12 +1112,7 @@ class TestCellIdsEncoding:
         # The self-declared convention identity (issue #305): the UUID is
         # minted once and PERMANENT — this pin makes an accidental regeneration
         # a test failure, not a silent identity change.
-        from zagg.grids.morton import (
-            MORTON_CONVENTION,
-            RESOLUTION_EXACT,
-            RESOLUTION_MIXED,
-            RESOLUTION_POINT,
-        )
+        from zagg.grids.morton import MORTON_CONVENTION
 
         assert MORTON_CONVENTION["uuid"] == "3e22156d-ea9e-4e01-95fe-e3809a4b41e7"
         assert MORTON_CONVENTION["name"] == "morton-dggs"
@@ -1131,15 +1122,6 @@ class TestCellIdsEncoding:
         # The normative home is the mortie spec page, not the design doc.
         assert "espg/mortie" in MORTON_CONVENTION["spec_url"]
         assert MORTON_CONVENTION["spec_url"].endswith("docs/specification.md")
-        # The full declared-value set (mortie spec §4; "mixed" espg-proposed
-        # on the PR #118 review, 2026-07-21 — order-29 ids are points, all
-        # other orders exact, clip rule inapplicable). zagg writers emit only
-        # "exact"; the constants are the seam for the point/mixed paths.
-        assert (RESOLUTION_EXACT, RESOLUTION_POINT, RESOLUTION_MIXED) == (
-            "exact",
-            "point",
-            "mixed",
-        )
 
     def test_spatial_signature_unchanged_by_hatch(self):
         # The hatch changes the leaf schema, not the spatial layout, so shard

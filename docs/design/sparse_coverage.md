@@ -590,8 +590,9 @@ rollup leaves all leaf reads intact.
   (An earlier plan bundled the flip with a #299 leaf-basename rename;
   D19's product-root revision made #299 additive, so this writer flip is
   the one remaining breaking store change in this family.) The order-29
-  discriminator metadata is O10 (resolved: `resolution: "exact" | "point"`,
-  clip rule `point`-only — see the O10 entry).
+  discriminator metadata is O10 (final ruling: kind is encoding-carried,
+  no metadata field; the clip is a viewer-side transient cast — see the
+  O10 entry).
 
 - **D17 — Hive+sharded is the HEALPix default; flat/fullsphere deprecated;
   dense leaf arrays write through the ShardingCodec.**
@@ -920,36 +921,28 @@ rollup leaves all leaf reads intact.
   true rejected elsewhere). The write is fail-open on both backends; the
   Lambda leg is one fire-and-forget `mode: "coverage"` Event invoke with the
   pre-serialized ranges envelope.
-- **O10 — order-29 resolution discriminator: RESOLVED — `resolution:
-  "exact" | "point"` in the dggs attrs block** (espg-ratified in-session,
-  2026-07-21; carved from D16; ruling recorded on
-  [#305](https://github.com/englacial/zagg/issues/305#issuecomment-5025784723)).
-  Two order-29 encodings exist — (a) genuinely order-29 resolution, and
-  (b) unknown resolution point-encoded at order 29, the default for any
-  raw lat/lon conversion — and readers need declared metadata to tell
-  them apart, because the D16 clip rule (29→24) applies only to (b).
-  Ruling: emission is **per data kind and the writer always knows
-  which** — grid-derived cell coordinates are `exact` **by construction**
-  (all zagg aggregation outputs); location-derived id fields (order-29
-  ids from raw lat/lon — the temporal event path, future HHDC) are
-  `point`. There is **no heuristic default**: the issue-body's "default
-  `point` for raw conversions" was refined away — a writer either
-  produces grid cells (`exact`) or converts raw coordinates (`point`),
-  never guesses. The clip rule keys only on the declared field.
-  *Addendum (espg-proposed on the mortie PR #118 review, 2026-07-21)*: a
-  third value **`mixed`** — order-29 ids are points, ids at any other
-  order are exact (per-id recovery via the reserved order 29); the 29→24
-  clip rule is inapplicable to `mixed` arrays, and genuinely-exact
-  order-29 cells are unrepresentable under it (declare `exact`).
-  Intersects mortie's documented point-id/area-word parse non-injectivity
-  at order 29; field name, values, placement, and the clip rule's
-  point-only scope are frozen normatively on the
-  [mortie spec page §4–§5](https://github.com/espg/mortie/blob/main/docs/specification.md)
-  (mortie#62, drafted via espg/mortie PR #118). Implementation:
-  `RESOLUTION_EXACT`/`RESOLUTION_POINT` in `zagg.grids.morton` (the
-  importable seam for future `point` writers) and the `resolution` field
-  in `HealpixGrid._dggs_attrs`. The companion identity ruling (same
-  session): morton-declared stores carry a **self-declared convention
+- **O10 — order-29 kind: RESOLVED by encoding-carried convention**
+  (espg-ratified 2026-07-21 on the mortie PR #118 review — the FINAL
+  ruling, superseding this entry's earlier declaration-based forms:
+  `resolution: "exact" | "point"`, recorded on
+  [#305](https://github.com/englacial/zagg/issues/305#issuecomment-5025784723),
+  and the interim three-value `mixed` addendum). **Point-ness is carried
+  by the encoding itself, never by store or array metadata**: mortie's
+  area words and point ids are distinct encodings — area words are exact
+  cells at EVERY order including 29 (nothing unrepresentable); point ids
+  are points, full stop. There is **no metadata field**; readers key on
+  the packed word's suffix region. The 29→24 clip is **not spec
+  semantics** — it is a viewer-side *transient cast* (a gridlook/JS
+  float64-safety measure at the display layer; other viewers or future
+  runtimes may not need it), and membership of a point in a coarser cell
+  is likewise the ordinary transient truncation. The one remaining
+  ambiguity — the order-29 decimal string, which denotes both kinds — is
+  resolved by the normative parse tie-break **pinned on the
+  [mortie spec page §4](https://github.com/espg/mortie/blob/main/docs/specification.md)**
+  (a parsed string always yields the AREA word; golden-pinned at the bit
+  level in mortie's `test_spec_page.py`). zagg emits no kind field and
+  carries no kind constants. The companion identity ruling stands
+  unchanged: morton-declared stores carry a **self-declared convention
   UUID** — minted once, permanent, normative value on the mortie spec
   page §5 (`MORTON_CONVENTION` in `zagg.grids.morton`) — while the
   upstream dggs-registry ask
