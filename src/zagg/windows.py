@@ -240,6 +240,12 @@ def leaf_name_v3(window: str | None) -> str:
     """
     if window is None:
         return f"{SCHEDULE_NONE_TOKEN}.zarr"
+    if window == SCHEDULE_NONE_TOKEN:
+        raise ValueError(
+            f"window label {window!r} is the reserved schedule:none token "
+            f"(SCHEDULE_NONE_TOKEN, D23) — the explicit grammar admits it, but it "
+            f"would alias the no-schedule leaf; declare a different explicit label"
+        )
     validate_label(window)
     return f"{window}.zarr"
 
