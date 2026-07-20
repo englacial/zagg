@@ -549,11 +549,13 @@ class TestProcessRasterHiveMode:
         # Always-on sample/write collection flows into the record.
         assert {"sample", "write"} <= set(record["phase_timings"])
         assert record["max_memory_mb"] is not None
-        # Read-volume counters (issue #297): whole tiles are fetched+decoded
-        # to sample the shard's cells, so decoded pixels bound samples and the
-        # over-provision ratio is derivable at read.
+        # Read-volume counters (issue #297): whole tiles are fetched+decoded to
+        # sample the shard's cells. The decoded/sampled ratio reads as
+        # over-provision only when the output grid is coarser than the source; a
+        # finer grid (e.g. HEALPix o16+ vs 10 m S2) can invert it, so assert each
+        # counter is positive rather than pinning their order.
         assert record["raster_bytes_read"] > 0
-        assert record["raster_px_decoded"] >= record["raster_px_sampled"] > 0
+        assert record["raster_px_decoded"] > 0 and record["raster_px_sampled"] > 0
 
     def test_hive_no_leaf_writes_no_orphan_sidecar(self, handler_mod, tmp_path, monkeypatch):
         # Issue #297 fold: a unit with acquisitions (timesteps > 0) but no slab
