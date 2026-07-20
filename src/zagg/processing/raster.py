@@ -703,9 +703,11 @@ def process_raster_shard(
     occupied_acc = np.zeros(len(cells), dtype=bool) if occupied_out is not None else None
     # Read-volume counters (issue #297): always-on inputs for the stats
     # record — compressed bytes fetched, pixels decoded (whole tiles), and
-    # cell samples gathered. Their sampled/decoded ratio is the extract's
-    # over-provision at read time; stored raw (associative sums), never as a
-    # ratio, per the mergeable-by-construction schema rule.
+    # cell samples gathered. Their decoded/sampled ratio reads as the extract's
+    # read-time over-provision only when the output grid is coarser than the
+    # source; a finer grid (more cells than source pixels) inverts it below 1.
+    # Stored raw (associative sums), never as a ratio, per the
+    # mergeable-by-construction schema rule.
     io_stats = {"bytes_read": 0, "px_decoded": 0, "px_sampled": 0}
 
     async def _run_all():

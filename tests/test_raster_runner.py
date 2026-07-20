@@ -960,9 +960,11 @@ class TestRasterHiveLocalBackend:
         assert record["shard_key"] == int(shard)
         assert record["invoked_by"] is None and record["lambda"] is None
         assert {"sample", "write"} <= set(record["phase_timings"])
-        # Read-volume counters (issue #297) ride the local record too.
+        # Read-volume counters (issue #297) ride the local record too. Order of
+        # decoded vs sampled is regime-bound (a grid finer than the source
+        # inverts it), so assert each counter is positive, not their ratio.
         assert record["raster_bytes_read"] > 0
-        assert record["raster_px_decoded"] >= record["raster_px_sampled"] > 0
+        assert record["raster_px_decoded"] > 0 and record["raster_px_sampled"] > 0
         # And the raster summary carries the run parquet path (spatial parity).
         assert summary["run_stats_path"].endswith(".parquet")
         # n_obs is the unit's timestep count (raster obs-count convention),

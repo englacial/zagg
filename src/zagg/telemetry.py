@@ -166,9 +166,11 @@ def build_record(
         "duration_s": duration_s,
         "spill_bytes": spill_bytes,
         # Raster read-volume counters (issue #297): compressed bytes fetched,
-        # pixels decoded (whole tiles), cell samples gathered. Stored raw —
-        # the extract's over-provision (px_decoded / px_sampled) is derived at
-        # read, never stored (mergeable-by-construction). None off-raster.
+        # pixels decoded (whole tiles), cell samples gathered. Stored raw — the
+        # px_decoded / px_sampled ratio is derived at read, never stored
+        # (mergeable-by-construction). That ratio reads as read-time
+        # over-provision only when the output grid is coarser than the source; a
+        # finer grid can push it below 1. None off-raster.
         "raster_bytes_read": _opt_int(metadata.get("raster_bytes_read")),
         "raster_px_decoded": _opt_int(metadata.get("raster_px_decoded")),
         "raster_px_sampled": _opt_int(metadata.get("raster_px_sampled")),
