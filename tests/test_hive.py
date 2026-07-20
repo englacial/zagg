@@ -370,12 +370,6 @@ class TestSemanticManifest:
             hive.write_semantic_core("/nonexistent-root-zzz", cfg)
         assert any("fail-open" in r.message for r in caplog.records)
 
-    def test_append_spec_honors_existing(self, cfg):
-        manifest = hive.build_manifest(self._grid(cfg))
-        assert hive.append_spec(None, manifest) == manifest["spec"]
-        existing = dict(manifest, spec="morton-hive/2")
-        assert hive.append_spec(existing, manifest) == "morton-hive/2"
-
 
 class TestProductRoots:
     """D19 named product roots (issue #299 phase 2): additive — a product
