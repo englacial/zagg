@@ -5,7 +5,8 @@ temporal-partitioning amendments (D13–D15) ratified on
 [#237](https://github.com/englacial/zagg/issues/237); morton-only-storage
 amendment ratified on
 [#262](https://github.com/englacial/zagg/issues/262) (D16; open item O10
-carved from it); 2026-07 consolidation (D17–D24, O3 resolved, O11 opened)
+carved from it); 2026-07 consolidation (D17–D24, O3 resolved, O11–O13
+opened, §8.3 test-obligations index added)
 recording decisions settled on the
 [#251](https://github.com/englacial/zagg/issues/251)/[#236](https://github.com/englacial/zagg/issues/236)/[#209](https://github.com/englacial/zagg/issues/209)
 and [#296](https://github.com/englacial/zagg/issues/296)-family threads —
@@ -147,6 +148,17 @@ products by listing `{store_root}/` and reading each
 - **The write path needs zero metadata above the leaf** (D5). No zarr group
   objects at digit nodes, no shared mutable state, no create-group races
   across 2,000 workers.
+- **Concurrency contract** (a derived property, recorded 2026-07-20 —
+  assembled here so it exists in one place): concurrent runs against one
+  product are supported whenever they are **shard-disjoint** — they share
+  no objects (D4/D5), their run records are distinct by name
+  (timestamp + run id, D20), and the manifest precheck admits both
+  (frozen keys match by construction under D19). Same-(shard, window)
+  concurrency degrades to D4 semantics — last writer wins; the loser's
+  partial output is stamped-over or remains ignorable debris. Interior
+  rollups may go stale during any of this, which D22's generation stamps
+  make detectable, never silently wrong. Cross-product concurrency shares
+  nothing at all.
 
 Zarr-version note: implicit groups were a *draft*-v3 feature, dropped before
 finalization; v2 requires explicit `.zgroup` objects too. Neither models the
@@ -661,7 +673,15 @@ rollup leaves all leaf reads intact.
   the hash in metadata rather than prevented by unreadable paths. D7
   generalizes cleanly: "one store per dataset" becomes "one product tree
   per semantic core" under a shared root, with cross-product joins
-  unchanged.
+  unchanged. Three refinements (espg-confirmed in-session, 2026-07-20):
+  **the manifest `semantic_hash` is truth** — `aggregation.yaml` is a
+  derived convenience (D9 cache class, sweep-regenerable), so divergence
+  resolves to the hash; the hash is stored **full-length** with git-style
+  ergonomics (the full digest is what is compared; a short fingerprint —
+  12 hex — is the display/CLI shorthand); and product names are
+  **URL-safe by requirement** (they appear in gridlook deep-links and web
+  paths — proposed charset: lowercase alphanumerics plus `-`/`_`, frozen
+  with the name grammar on the mortie spec page).
 - **D20 — Per-shard telemetry sidecar + run records** (espg on-thread:
   [sibling placement + envelope ride](https://github.com/englacial/zagg/issues/297#issuecomment-5016910923),
   [caller identity](https://github.com/englacial/zagg/issues/297#issuecomment-5016901381);
@@ -719,7 +739,11 @@ rollup leaves all leaf reads intact.
   every rollup leaves leaf reads intact (D9 semantics). (The refine
   direction of `ShardMap.reproject` and its no-region semantics are still
   under review on PR #295 — the sweep depends only on the exact coarsen
-  direction.)
+  direction.) An optional fifth, audit-class family (espg-directed
+  in-session, 2026-07-20): **debris collection** — unstamped `.zarr/`
+  prefixes older than a declared horizon are deleted, prefix-sharded,
+  never load-bearing (D4 already makes debris ignorable; this stops it
+  accumulating as paid storage at fleet scale).
 - **D23 — Leaf basename = time window (`{window}.zarr`), `morton-hive/3`**
   (espg-proposed and ratified in-session, 2026-07-20; recorded here and on
   the PR #306 thread). Completes the axis separation D19 began: product =
@@ -785,7 +809,16 @@ rollup leaves all leaf reads intact.
   provenance attrs; the pyramid is the store's resolution axis, partially
   materialized. Reader support is gated on mortie#116 mixed-order morton
   (tracked as moczarr#8); the schema needs no bump — this is what the
-  coordinate system was built for.
+  coordinate system was built for. Open sub-point (deferred pending
+  discussion, espg leans recorded 2026-07-20): how a `none`
+  (non-composable) field behaves — the recorded lean is **per-field
+  exclusion from coarser materializations** (composable fields roll up;
+  non-composable fields exist only at native resolution — matching
+  #201's "which fields degrade" question) rather than min-semantics
+  pinning the whole product; and whether `none` fields are permitted at
+  all — lean: allowed, with a **loud warning** at template validation.
+  Per-field exclusion makes "resolution of a product" per-field, which
+  readers must handle; not ratified.
 
 ### 8.2 Open for review (input needed)
 
@@ -871,6 +904,58 @@ rollup leaves all leaf reads intact.
   Motivation: outputs have been byte-identical between runs in practice, so
   this turns D19's "probably already ran" dedup into a verifiable claim
   without folding catalog identity into leaf names.
+- **O12 — retention/expiration (proposal, espg-directed to record
+  2026-07-20)**: **product-level** retention is a *prefix* lifecycle rule
+  (one rule per `{name}/` — delete or transition a whole product); 
+  **window-level** retention within a product is the *tag* mechanism —
+  the expiration rule filters on an object tag (e.g. `ephemeral=true`)
+  and keep-alive is a retag (`PutObjectTagging`), never an access-refresh
+  or self-copy "touch" (plain S3 lifecycle cannot key on access; a
+  self-copy is a full write per object). Pin/unpin is therefore explicit
+  and cheap. Open: tag vocabulary, who tags at write time (worker vs
+  dispatcher), and whether pinned windows are recorded in the manifest or
+  only in tags.
+- **O13 — publication profile (shape espg-ratified in-session,
+  2026-07-20; details open)**: publishing a product to a public bucket is
+  a **prefix copy minus operator telemetry**, with the telemetry replaced
+  by a **simple roll-up summary** that preserves cost-estimation utility
+  (per-product totals; no `invoked_by` ARNs, no request ids, no per-run
+  operator detail). Defined once so publishing tooling never improvises.
+  Open: the summary's exact schema, its placement in the published copy
+  (product root), and whether sub-shardmap rollups publish as-is (they
+  carry granule ids — likely fine) or coarsen.
+
+### 8.3 Standing test obligations (what a conforming implementation proves)
+
+Consolidated index of the normative test claims scattered through the
+registry — CI coverage should be auditable against this list:
+
+- **Rollup == direct**, per derived-artifact family (D22): stats fold,
+  shardmap coarsen (the #294 exactness property), MOC union, overview
+  aggregation. Sweep idempotence (second run over an unchanged tree is a
+  no-op) and nothing-load-bearing (deleting every rollup leaves leaf
+  reads green).
+- **Merge-fold algebra** (D20): associativity/commutativity of the stats
+  record fold; merge-of-children == direct.
+- **Semantic-hash canonicalization** (D19): syntactic edits (whitespace,
+  key order, comments) never change the hash; packaging-knob edits
+  (orders, chunking, worker size, streaming mode) never change the hash;
+  any semantic edit does. Name-grammar validation (base-component
+  exclusion, URL-safe charset).
+- **Manifest guard** (§3): frozen-key match ⇒ idempotent accept, no
+  second PUT; mismatch ⇒ pre-dispatch refusal; `path_grouping` absent⇒1
+  normalization; allowed-set membership for `cell_order`/`shard_order`.
+- **D24 guards**: cross-cell-order write into an occupied (shard, window)
+  leaf refuses with the useful error; same-order rerun replaces (D4);
+  composability-class derivation from the aggregator merge-law flags.
+- **Naming dialects** (D23): `/3` round-trip (`{window}.zarr` ↔ sidecar
+  stem) with `/1`–`/2` grammars byte-unchanged; spec-string
+  discrimination.
+- **Golden byte pins**: the D18 vlen-bytes framing (numcodecs
+  `VLenArray`-compatible) and the O8 coverage-bitmap bit convention
+  (PR #208 vectors).
+- **Stamp/debris semantics** (D4): an unstamped leaf is invisible to
+  readers and safely overwritable; a stamped leaf is complete.
 
 ## 9. References
 
