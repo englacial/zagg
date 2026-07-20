@@ -460,21 +460,6 @@ def write_semantic_core(store_root: str, config, **store_kwargs) -> None:
         logger.warning(f"{AGGREGATION_CORE_NAME} write failed (fail-open, D9 cache class): {e}")
 
 
-def append_spec(existing: dict | None, manifest: dict) -> str:
-    """The naming spec in effect for this run's writes (issue #299).
-
-    On append into an existing store the writer honors the EXISTING
-    manifest's declared spec — one grammar per product tree (D6/D23): a
-    future ``morton-hive/3``-emitting writer must not emit ``/3`` names into
-    a ``/2`` tree (the frozen ``spec`` key would refuse the manifest, but
-    naming calls run per-shard and must agree too). Fresh stores use the
-    run's own manifest spec. The PR #307 seam
-    (:func:`zagg.telemetry.sidecar_key`, :func:`zagg.windows.leaf_name_v3`)
-    is keyed by exactly this value.
-    """
-    return (existing or manifest)["spec"]
-
-
 #: Manifest keys the resume match-check compares (orders + identity + split
 #: and temporal schedules — a windowing change re-partitions the leaf names,
 #: so it must refuse resume exactly like an orders change). ``generated_at``
