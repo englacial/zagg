@@ -1171,6 +1171,7 @@ def _handle_process_raster(event: Dict[str, Any]) -> Dict[str, Any]:
                 granule_ids=raster_granule_ids(event["granules"]),
                 invoked_by=event.get("invoked_by"),
                 run_id=event.get("run_id"),
+                window=(event.get("window") or {}).get("label"),
                 lambda_config=lambda_env(),
             )
             body["stats"] = record
@@ -1613,6 +1614,7 @@ def _handle_process(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
             granule_ids=event.get("granule_urls"),
             invoked_by=event.get("invoked_by"),
             run_id=event.get("run_id"),
+            window=(event.get("window") or {}).get("label"),
             lambda_config=lambda_env(),
         )
         metadata["stats"] = record

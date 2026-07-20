@@ -725,3 +725,174 @@ def _put_rollup(store, fam, decimal: str, envelope: dict) -> None:
     import obstore
 
     obstore.put(store, _rollup_key(fam, decimal), json.dumps(envelope, indent=1).encode())
+
+
+# ---------------------------------------------------------------------------
+# Trigger surfaces (issue #300 phases 4-5): run-record discovery + manual CLI.
+# ---------------------------------------------------------------------------
+
+
+def discover_leaves(store_root: str, *, store_kwargs: dict | None = None) -> list:
+    """Leaf refs from the run-record parquets at the product root (D22).
+
+    One shallow delimiter LIST of the product root finds the
+    ``stats_*.parquet`` run records (both the timestamp-first D20 names and
+    the older ``stats_{run_id}_{ts}`` form); their success rows give the work
+    set — discovery is from run records, never a tree enumeration. Windowed
+    leaves resolve through the records' ``window`` column; rows from
+    pre-column records on a windowed store fall back to one delimiter LIST of
+    that shard's node (bounded by the run-record shard set). Rows whose
+    ``shard_key`` came back float-typed (pre-fix parquets mixing keys with
+    failure-row nulls) are skipped past 2^53 with a warning — those keys are
+    inexact by construction; :func:`zagg.telemetry.write_run_parquet` now
+    writes the column nullable-UInt64 so new records round-trip exactly.
+    Returns sorted, deduplicated ``(shard_key, window)`` pairs.
+    """
+    import re
+    import tempfile
+
+    import obstore
+
+    from zagg.hive import MANIFEST_NAME, read_manifest
+    from zagg.store import open_object_store
+
+    store_kwargs = dict(store_kwargs or {})
+    manifest = read_manifest(store_root, **store_kwargs)
+    if manifest is None:
+        raise ValueError(f"no {MANIFEST_NAME} at {store_root} — not a hive store root")
+    spec = manifest.get("spec")
+    windowed = manifest.get("temporal") is not None
+    store = open_object_store(store_root, **store_kwargs)
+    listing = obstore.list_with_delimiter(store)
+    names = sorted(
+        o["path"].rsplit("/", 1)[-1]
+        for o in listing["objects"]
+        if re.fullmatch(r"stats_.+\.parquet", o["path"].rsplit("/", 1)[-1])
+    )
+    refs: set = set()
+    fallback_keys: set[int] = set()
+    warned_float = False
+    for name in names:
+        import pandas as pd
+
+        with tempfile.NamedTemporaryFile(suffix=".parquet") as tmp:
+            tmp.write(bytes(obstore.get(store, name).bytes()))
+            tmp.flush()
+            try:
+                df = pd.read_parquet(tmp.name, engine="fastparquet")
+            except Exception as e:
+                logger.warning(f"sweep discovery: unreadable run record {name}; skipping ({e})")
+                continue
+        if "shard_key" not in df.columns:
+            logger.warning(f"sweep discovery: run record {name} has no shard_key; skipping")
+            continue
+        ok = df[df["shard_key"].notna() & df.get("success", True)]
+        has_window = "window" in df.columns
+        for _idx, row in ok.iterrows():
+            key = row["shard_key"]
+            if isinstance(key, float):
+                if key != int(key) or key >= 2**53:
+                    if not warned_float:
+                        warned_float = True
+                        logger.warning(
+                            f"sweep discovery: {name} stores shard_key as float64 (a "
+                            f"pre-fix run record); keys past 2^53 are inexact and are "
+                            f"skipped — re-run those shards or sweep them by hand"
+                        )
+                    continue
+            key = int(key)
+            if has_window:
+                window = row["window"]
+                refs.add((key, None if window is None or pd.isna(window) else str(window)))
+            elif windowed:
+                fallback_keys.add(key)  # pre-column record: resolve below
+            else:
+                refs.add((key, None))
+    # Pre-``window``-column records on a windowed store: the row can't name
+    # its leaf, so resolve each shard's windows with ONE delimiter LIST of its
+    # node — scoped by the run-record shard set, never a tree walk.
+    from zagg.grids.morton import morton_decimal
+
+    for key in sorted(fallback_keys - {k for k, _w in refs}):
+        node_listing = obstore.list_with_delimiter(store, _node_rel(morton_decimal(key)) + "/")
+        for obj in node_listing["objects"]:
+            window = _sidecar_window(obj["path"].rsplit("/", 1)[-1], spec)
+            if window is not _NO_SIDECAR:
+                refs.add((key, window))
+    return sorted(refs, key=lambda r: (r[0], r[1] is not None, r[1] or ""))
+
+
+#: Sentinel: "this object is not a stats sidecar" (``None`` means unwindowed).
+_NO_SIDECAR = object()
+
+
+def _sidecar_window(name: str, spec: str | None):
+    """The window label a stats-sidecar object name encodes, else the sentinel."""
+    from zagg.telemetry import SIDECAR_NAME, SPEC_V3
+    from zagg.windows import validate_label
+
+    try:
+        if spec == SPEC_V3:
+            if not name.endswith(".stats.json"):
+                return _NO_SIDECAR
+            stem = name.removesuffix(".stats.json")
+            validate_label(stem)
+            return stem
+        if name == SIDECAR_NAME:
+            return None
+        stem, ext = SIDECAR_NAME.rsplit(".", 1)
+        if name.startswith(f"{stem}_") and name.endswith(f".{ext}"):
+            window = name[len(stem) + 1 : -(len(ext) + 1)]
+            validate_label(window)
+            return window
+    except ValueError:
+        return _NO_SIDECAR
+    return _NO_SIDECAR
+
+
+def main(argv=None) -> int:
+    """Manual CLI: ``python -m zagg.sweep <store_root>`` (issue #300, D22)."""
+    import argparse
+
+    parser = argparse.ArgumentParser(
+        description="zagg unified rollup sweep: fold leaf artifacts into interior-node "
+        "rollups (issue #300). Work is discovered from the store's run records."
+    )
+    parser.add_argument("store_root", help="Hive store root (local path or s3://bucket/prefix)")
+    parser.add_argument(
+        "--families",
+        default=None,
+        help=f"Comma-separated families (default: {','.join(DEFAULT_FAMILIES)}; "
+        f"registered: {', '.join(sorted(FAMILIES))})",
+    )
+    parser.add_argument("--region", default="us-west-2", help="AWS region (default: us-west-2)")
+    parser.add_argument(
+        "--output-creds",
+        default=None,
+        metavar="PATH",
+        help="Path to a JSON credentials file for the store (same format as python -m zagg)",
+    )
+    args = parser.parse_args(argv)
+    logging.basicConfig(level=logging.INFO, format="%(message)s")
+    store_kwargs: dict = {"region": args.region}
+    if args.output_creds:
+        from zagg.runner import normalize_output_credentials
+
+        with open(args.output_creds) as f:
+            credentials = normalize_output_credentials(json.load(f))
+        store_kwargs["credentials"] = credentials
+        store_kwargs["endpoint_url"] = credentials.get("endpointUrl")
+    families = [f.strip() for f in args.families.split(",")] if args.families else None
+    leaves = discover_leaves(args.store_root, store_kwargs=store_kwargs)
+    if not leaves:
+        print("No completed leaves found in the store's run records; nothing to sweep.")
+        return 0
+    summary = run_sweep(args.store_root, leaves, families=families, store_kwargs=store_kwargs)
+    print(json.dumps(summary, indent=2))
+    return 0
+
+
+if __name__ == "__main__":
+    import sys
+
+    sys.exit(main())

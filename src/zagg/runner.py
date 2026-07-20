@@ -939,6 +939,7 @@ class RasterStrategy:
                 metadata=meta,
                 granule_ids=raster_granule_ids(granules),
                 run_id=run_id,
+                window=window["label"] if window else None,
             )
             meta["stats"] = record
             if store_layout == "hive" and meta.get("leaf_written"):
@@ -2571,6 +2572,7 @@ def _run_local(
                 metadata=meta,
                 granule_ids=_resolve_urls(records, driver),
                 run_id=run_id,
+                window=window["label"] if window else None,
             )
             meta["stats"] = record
             if store_layout == "hive" and not meta.get("error"):

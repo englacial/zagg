@@ -459,3 +459,49 @@ class TestRunParquet:
     def test_empty_rows_raise(self, tmp_path):
         with pytest.raises(ValueError, match="at least one"):
             write_run_parquet(str(tmp_path), [], run_id="x")
+
+
+class TestWindowColumn:
+    """The per-shard record's ``window`` label (issue #300): threaded like
+    run_id, merged equal-or-None, flattened to a run-parquet column."""
+
+    def _windowed(self, window, **kwargs):
+        return build_record(
+            shard_key=5,
+            metadata={"total_obs": 1, "duration_s": 1.0},
+            window=window,
+            **kwargs,
+        )
+
+    def test_recorded_and_defaults_none(self):
+        assert self._windowed("2019")["window"] == "2019"
+        assert _record(5)["window"] is None
+
+    def test_merge_equal_keeps_mismatch_collapses(self):
+        a, b = self._windowed("2019"), self._windowed("2019")
+        assert merge([a, b])["window"] == "2019"
+        assert merge([a, self._windowed("2020")])["window"] is None  # cross-window rollup
+
+    def test_flattened_to_row(self):
+        row = flatten_record(self._windowed("2019"))
+        assert row["window"] == "2019"
+
+
+class TestRunParquetShardKeyExactness:
+    """Packed morton words round-trip the run parquet exactly (issue #300):
+    the sweep's run-record discovery recomputes leaf paths from these keys, so
+    float64 inference (from failure-row nulls) would corrupt them silently."""
+
+    def test_uint64_with_null_round_trips(self, tmp_path):
+        import pandas as pd
+
+        word = 10376293541461622786  # morton_word("-311"): > 2^63, float64-inexact
+        rows = [
+            flatten_record(_record(word)),
+            flatten_record(failure_record(shard_key=None, error="boom")),
+        ]
+        path = write_run_parquet(str(tmp_path / "store"), rows, run_id="ff01")
+        df = pd.read_parquet(path, engine="fastparquet")
+        assert str(df["shard_key"].dtype) == "UInt64"
+        assert int(df["shard_key"].dropna().iloc[0]) == word  # exact, not 2^53-rounded
+        assert df["shard_key"].isna().sum() == 1  # the failure row keeps its null

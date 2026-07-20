@@ -577,3 +577,130 @@ class TestFamilyRegistry:
 
     def test_default_families_are_the_implemented_set(self):
         assert sweep_mod.DEFAULT_FAMILIES == ("stats", "moc", "submap")
+
+
+def _run_record(root, rows, run_id="r1"):
+    from zagg.telemetry import write_run_parquet
+
+    write_run_parquet(str(root), rows, run_id=run_id)
+
+
+def _row(decimal, *, window=None, success=True):
+    from zagg.telemetry import build_record, failure_record, flatten_record
+
+    if success:
+        rec = build_record(
+            shard_key=morton_word(decimal),
+            metadata={"total_obs": 1, "duration_s": 1.0},
+            window=window,
+        )
+    else:
+        rec = failure_record(shard_key=morton_word(decimal), error="boom")
+    return flatten_record(rec)
+
+
+class TestDiscoverLeaves:
+    def test_column_first_discovery(self, tmp_path):
+        from zagg.sweep import discover_leaves
+
+        _write_manifest(tmp_path)
+        _run_record(
+            tmp_path,
+            [
+                _row("-311"),
+                _row("-312"),
+                _row("-321", success=False),  # failure rows never become work
+            ],
+        )
+        refs = discover_leaves(str(tmp_path))
+        assert refs == [(morton_word("-311"), None), (morton_word("-312"), None)]
+
+    def test_windowed_column_names_the_leaf(self, tmp_path):
+        from zagg.sweep import discover_leaves
+
+        _write_manifest(tmp_path)
+        # Windowed store: the manifest carries a temporal block.
+        manifest = json.loads((tmp_path / MANIFEST_NAME).read_text())
+        manifest["spec"] = "morton-hive/2"
+        manifest["temporal"] = {"schedule": "yearly", "time_field": "t"}
+        (tmp_path / MANIFEST_NAME).write_text(json.dumps(manifest))
+        _run_record(
+            tmp_path, [_row("-311", window="2019"), _row("-311", window="2020")], run_id="r2"
+        )
+        refs = discover_leaves(str(tmp_path))
+        assert refs == [(morton_word("-311"), "2019"), (morton_word("-311"), "2020")]
+
+    def test_pre_column_windowed_rows_fall_back_to_node_list(self, tmp_path):
+        import pandas as pd
+
+        from zagg.sweep import discover_leaves
+
+        _write_manifest(tmp_path)
+        manifest = json.loads((tmp_path / MANIFEST_NAME).read_text())
+        manifest["spec"] = "morton-hive/2"
+        manifest["temporal"] = {"schedule": "yearly", "time_field": "t"}
+        (tmp_path / MANIFEST_NAME).write_text(json.dumps(manifest))
+        # A pre-#300 run record: no window column at all. Its shard's windows
+        # resolve from the node's sidecar names (one bounded delimiter LIST).
+        row = _row("-311", window="2019")
+        row.pop("window")
+        df = pd.DataFrame([row])
+        df["shard_key"] = pd.array([morton_word("-311")], dtype="UInt64")
+        df.to_parquet(
+            tmp_path / "stats_20260101T000000Z_old1.parquet",
+            engine="fastparquet",
+            index=False,
+            object_encoding="utf8",
+        )
+        _put_leaf(tmp_path, "-311", window="2019")
+        _put_leaf(tmp_path, "-311", window="2020")
+        refs = discover_leaves(str(tmp_path))
+        assert refs == [(morton_word("-311"), "2019"), (morton_word("-311"), "2020")]
+
+    def test_inexact_float_keys_skipped_with_warning(self, tmp_path, caplog):
+        import pandas as pd
+
+        from zagg.sweep import discover_leaves
+
+        _write_manifest(tmp_path)
+        # A pre-fix parquet whose key column collapsed to float64: packed
+        # words are inexact there and must be skipped, not silently mangled.
+        row = _row("-311")
+        df = pd.DataFrame([row])
+        df["shard_key"] = df["shard_key"].astype("float64")
+        df.to_parquet(
+            tmp_path / "stats_20260101T000000Z_old2.parquet",
+            engine="fastparquet",
+            index=False,
+            object_encoding="utf8",
+        )
+        refs = discover_leaves(str(tmp_path))
+        assert refs == []
+        assert "inexact" in caplog.text
+
+    def test_no_manifest_raises(self, tmp_path):
+        from zagg.sweep import discover_leaves
+
+        with pytest.raises(ValueError, match="not a hive store root"):
+            discover_leaves(str(tmp_path))
+
+
+class TestSweepCli:
+    def test_end_to_end_discovers_and_folds(self, tmp_path, capsys):
+        from zagg.sweep import main
+
+        _write_manifest(tmp_path)
+        rec_a = _put_leaf(tmp_path, "-311")
+        rec_b = _put_leaf(tmp_path, "-312")
+        _run_record(tmp_path, [_row("-311"), _row("-312")])
+        assert main([str(tmp_path), "--families", "stats"]) == 0
+        summary = json.loads(capsys.readouterr().out)
+        assert summary["families"]["stats"]["written"] == 4  # -311, -312, -31, -3
+        assert _rollup(tmp_path, "-3")["payload"] == merge([rec_a, rec_b])
+
+    def test_empty_store_is_a_noop(self, tmp_path, capsys):
+        from zagg.sweep import main
+
+        _write_manifest(tmp_path)
+        assert main([str(tmp_path)]) == 0
+        assert "nothing to sweep" in capsys.readouterr().out

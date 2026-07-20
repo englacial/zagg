@@ -58,6 +58,7 @@ _SUM_OR_NONE_KEYS = (
 )
 _MAX_OR_NONE_KEYS = ("max_memory_mb", "container_hwm_mb")
 _EQ_OR_NONE_KEYS = (
+    "window",
     "shard_key",
     "run_id",
     "semantic_hash",
@@ -116,6 +117,7 @@ def build_record(
     granule_ids: Iterable[str] | None = None,
     invoked_by: dict | None = None,
     run_id: str | None = None,
+    window: str | None = None,
     lambda_config: dict | None = None,
 ) -> dict:
     """Build one shard's stats record from the worker's ``metadata`` dict.
@@ -129,6 +131,11 @@ def build_record(
     ``run_id`` is threaded the same way (dispatcher-generated, stamped through
     the invoke payload, copied verbatim) so a leaf sidecar joins back to its
     run-level parquet.
+    ``window`` (issue #300) is the unit's time-window label (``None``
+    unwindowed) — recorded so run records name the exact leaf a row describes
+    (the sweep's run-record discovery computes sidecar names from it) and
+    merged equal-or-``None`` like the other identity fields, so a cross-window
+    rollup reads ``None``.
     ``lambda_config`` is :func:`lambda_env` on Lambda, ``None`` locally;
     when present it prices ``gb_seconds`` / ``est_cost_usd`` from
     ``duration_s`` (the billed-duration approximation the dispatcher's cost
@@ -162,6 +169,7 @@ def build_record(
     return {
         "schema_version": SCHEMA_VERSION,
         "shard_key": int(shard_key),
+        "window": str(window) if window is not None else None,
         "run_id": run_id,
         # The semantic-core hash (D19 rev 2, docs/design/sparse_coverage.md):
         # hashes the config's semantic core, NOT the whole template. Nullable
@@ -279,6 +287,7 @@ def failure_record(*, shard_key=None, error, duration_s=None, run_id=None) -> di
 _ROW_SCALARS = (
     "schema_version",
     "shard_key",
+    "window",
     "run_id",
     "semantic_hash",
     "zagg_version",
@@ -366,6 +375,18 @@ def write_run_parquet(
         raise ValueError("write_run_parquet requires at least one row")
     key = run_parquet_key(run_id)
     df = pd.DataFrame(rows)
+    # Packed morton shard keys exceed 2^53 (and int64 for high base cells), so
+    # the DataFrame's float64 inference on a column that mixes ints with
+    # failure-row ``None``s silently corrupts them (issue #300 — the sweep's
+    # run-record discovery needs exact keys back). Rebuild the column as
+    # nullable UInt64 straight from the row values, bypassing the float
+    # intermediate; key spaces it cannot hold (a negative key) fall through
+    # untouched.
+    if "shard_key" in df.columns:
+        try:
+            df["shard_key"] = pd.array([r.get("shard_key") for r in rows], dtype="UInt64")
+        except (TypeError, ValueError, OverflowError):
+            pass
     with tempfile.TemporaryDirectory() as tmp:
         local = os.path.join(tmp, key)
         df.to_parquet(local, engine="fastparquet", index=False, object_encoding="utf8")
