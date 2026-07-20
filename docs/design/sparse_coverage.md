@@ -5,8 +5,9 @@ temporal-partitioning amendments (D13–D15) ratified on
 [#237](https://github.com/englacial/zagg/issues/237); morton-only-storage
 amendment ratified on
 [#262](https://github.com/englacial/zagg/issues/262) (D16; open item O10
-carved from it); 2026-07 consolidation (D17–D24, O3 resolved, O11–O13
-opened, §8.3 test-obligations index added)
+carved from it); 2026-07 consolidation (D17–D24; O3/O11 resolved, O8
+constants blessed, O12–O13 opened, D23 tokens ratified, §8.3
+test-obligations index added)
 recording decisions settled on the
 [#251](https://github.com/englacial/zagg/issues/251)/[#236](https://github.com/englacial/zagg/issues/236)/[#209](https://github.com/englacial/zagg/issues/209)
 and [#296](https://github.com/englacial/zagg/issues/296)-family threads —
@@ -69,13 +70,14 @@ what zagg consumes:
                                     the manifest path_grouping param, D21)
       {window}.zarr/             <- leaf, basename = time window (D23,
                                     morton-hive/3); `all.zarr` for
-                                    schedule: none (reserved token — lean).
+                                    schedule: none (reserved token, ratified;
+                                    excluded from the window grammar).
                                     /1–/2 stores keep {full_id}.zarr and
                                     {full_id}_{window}.zarr (D3/D13)
-      stats_{window}.json        <- per-shard stats sidecar, sibling; ratified
-                                    D20 naming (stats.json for schedule: none).
-                                    D23 lean, not ratified: {window}.stats.json
-                                    / all.stats.json (follow-up to #302)
+      {window}.stats.json        <- per-shard stats sidecar, sibling (D20,
+                                    D23-aligned for /3; all.stats.json for
+                                    schedule: none). /1–/2 stores keep
+                                    stats_{window}.json / stats.json
       <sub-shardmap JSON>        <- leaf sub-map for sweep rollups (D22)
 ```
 
@@ -769,12 +771,15 @@ rollup leaves all leaf reads intact.
   D20 sidecar `shard_key` (an fsck pays one GET per leaf); D3's
   "unambiguous if moved" softens to "recoverable from attrs" — the moved
   case reduces to a downloader that materializes the prefix tree into
-  folder names (espg-noted in-session). **Leans recorded, not ratified**:
-  the `schedule: none` reserved token — proposal `all.zarr` (reads as
-  all-time; cannot collide with the digit-shaped window grammar;
-  `none.zarr` matches the schedule literal but reads worse) — and the
-  sidecar alignment `{window}.stats.json` / `all.stats.json` (D20
-  naming; follow-up to the merged PR #302). Rejected alternative: time
+  folder names (espg-noted in-session). **Both leans ratified**
+  (espg, in-session 2026-07-20): the `schedule: none` reserved token is
+  **`all`** (`all.zarr`; reads as all-time; cannot collide with the
+  digit-shaped window grammar; excluded from the window grammar forever
+  on the mortie spec page), and the sidecar aligns to
+  **`{window}.stats.json` / `all.stats.json`** for `/3` stores (the
+  spec-keyed seam shipped in PR #307 makes both a constant flip; `/1`–`/2`
+  stores keep the frozen `stats_{window}.json` / `stats.json` names).
+  Rejected alternative: time
   as a *path* level (`{name}/{window}/{morton…}`) would make
   window-scoped ops prefix-cheap but duplicates the morton tree per
   window and shatters the dominant read — a time series at a location —
@@ -877,7 +882,12 @@ rollup leaves all leaf reads intact.
   a third value, `"full"`). Bit convention (frozen
   with the mortie spec, golden-vector-pinned on PR #208): bit i = the i-th
   shard-subtree cell in ascending packed-word order (base-4 D1 digit tail,
-  digits 1..4 → 0..3), MSB-first per byte.
+  digits 1..4 → 0..3), MSB-first per byte. *Addendum (espg-blessed
+  in-session, 2026-07-20 — closing the #276 item-5 flag)*: the PR #208
+  contract constants stand as-shipped — the bitmap bit convention and the
+  root-MOC range ordering are **contract** (both golden-vector-pinned);
+  zstd level 3 is **non-normative** (any zstd level decodes identically;
+  only "zstd stream" is contract).
 - **O9 — end-of-run root MOC default**: **RESOLVED — on** for hive stores
   ([espg](https://github.com/englacial/zagg/issues/200#issuecomment-4938859764):
   coverage MOCs are the default for healpix templates; PR #208 implements
@@ -895,21 +905,31 @@ rollup leaves all leaf reads intact.
   documented point-id/area-word parse non-injectivity at order 29; field
   name, values, and placement to be frozen with the mortie spec page
   ([mortie#62](https://github.com/espg/mortie/issues/62)).
-- **O11 — logical content hash of outputs** (carved from D19; **proposal
-  awaiting espg sign-off** — espg asked for expanded context on
-  [#299](https://github.com/englacial/zagg/issues/299#issuecomment-5017263033),
-  expansion posted
-  [in reply](https://github.com/englacial/zagg/issues/299#issuecomment-5017334704)).
-  Proposal: per-array sha256 over *decoded* values (raw C-order bytes at the
-  declared dtype, after decompression — never stored object bytes, which
-  churn on codec/library upgrades), recorded in the D20 sidecar as
-  `{array_name: hash}` plus one combined hash. Exact bytes, no float
-  tolerance: any value change — including flagged code changes that pass
-  `np.isclose` (the PR #282 class) — flips the hash by design;
+- **O11 — logical content hash of outputs: RESOLVED — adopted as
+  proposed** (espg-ratified in-session, 2026-07-20; carved from D19,
+  discussion trail on
+  [#299](https://github.com/englacial/zagg/issues/299#issuecomment-5017263033)
+  and
+  [the expansion](https://github.com/englacial/zagg/issues/299#issuecomment-5017334704)).
+  Per-array sha256 over *decoded* values — **"per-array" means per named
+  zarr array (variable) in the leaf** (each data field, the ragged bytes
+  array, `morton`, every coordinate), hashed over that array's full
+  decoded contents (raw C-order bytes at the declared dtype, after
+  decompression); the ShardingCodec's inner chunks and the
+  one-object-per-array packaging are invisible to it by construction —
+  never stored object bytes, which churn on codec/library upgrades.
+  Recorded in the D20 sidecar as `{array_name: hash}` plus one combined
+  hash (hash of the sorted per-array hashes). **Computed at write**,
+  in-worker (the data is already in memory — near-free); **scope: all
+  arrays including coordinates** (cheap, deterministic). Exact bytes, no
+  float tolerance: any value change — including flagged code changes that
+  pass `np.isclose` (the PR #282 class) — flips the hash by design;
   interpretation pairs the hash with the sidecar's recorded zagg version.
-  Motivation: outputs have been byte-identical between runs in practice, so
-  this turns D19's "probably already ran" dedup into a verifiable claim
-  without folding catalog identity into leaf names.
+  Three jobs: the verification half of D19's `semantic_hash` ("intended
+  identical" vs "actually byte-identical"); the mismatch localizer
+  ("only `h_li_tdigest` differs in this leaf"); and the detection
+  mechanism for stamped-but-torn leaves under the §2 concurrency
+  contract's out-of-contract case.
 - **O12 — retention/expiration (proposal, espg-directed to record
   2026-07-20)**: **product-level** retention is a *prefix* lifecycle rule
   (one rule per `{name}/` — delete or transition a whole product); 
