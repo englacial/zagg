@@ -71,7 +71,23 @@ GRID_SPATIAL_KEYS = ("crs", "resolution", "bounds")
 
 
 def _without(mapping: dict, keys: tuple[str, ...]) -> dict:
-    return {k: v for k, v in (mapping or {}).items() if k not in keys and v is not None}
+    return {k: v for k, v in (mapping or {}).items() if k not in keys}
+
+
+def _prune_nulls(obj):
+    """Recursively drop ``None``-valued keys from every dict in ``obj``.
+
+    §8.3 canonicalization: a YAML explicit-null (``key:``) must hash identically
+    to an absent key, at every depth — not just the top level. Applied to the
+    whole core so a nested ``None`` (e.g. ``quality_filter.value:``) drops out.
+    Lists are recursed but never pruned by value: list entries are positional,
+    so a ``None`` element is content, not an absent key.
+    """
+    if isinstance(obj, dict):
+        return {k: _prune_nulls(v) for k, v in obj.items() if v is not None}
+    if isinstance(obj, list):
+        return [_prune_nulls(v) for v in obj]
+    return obj
 
 
 def semantic_core(config: PipelineConfig) -> dict:
@@ -79,8 +95,9 @@ def semantic_core(config: PipelineConfig) -> dict:
 
     Deterministic given the config's semantics: two configs differing only in
     packaging knobs (orders, chunking, worker size, read machinery, carrier)
-    map to the same core. The returned structure is JSON-serializable plain
-    data (the YAML loader guarantees it).
+    map to the same core. ``None``-valued keys are pruned recursively so a
+    YAML explicit-null hashes identically to an absent key (§8.3). The returned
+    structure is JSON-serializable plain data (the YAML loader guarantees it).
     """
     grid_cfg = (config.output or {}).get("grid", {}) or {}
     grid_type = grid_cfg.get("type", "healpix")
@@ -99,7 +116,7 @@ def semantic_core(config: PipelineConfig) -> dict:
         "data_source": _without(config.data_source, DATA_SOURCE_PACKAGING_KEYS),
         "grid": grid,
     }
-    return core
+    return _prune_nulls(core)
 
 
 def canonical_semantic_json(config: PipelineConfig) -> str:
