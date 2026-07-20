@@ -332,7 +332,15 @@ async def _sample_one(
         stage_stats["tiles"] += len(pairs)
         _t0 = time.time()
     if io_stats is not None:
-        io_stats["bytes_read"] += sum(len(t.compressed_bytes) for t in tiles)
+        # compressed_bytes is one Buffer (chunky) or a list of Buffers (planar);
+        # normalize so bytes_read counts bytes, not buffers, if the single-band
+        # guard above (bits_per_sample != 1) is ever relaxed for multi-band COGs.
+        # A lone Buffer answers len() with its byte count; only the planar
+        # list/tuple needs per-buffer summing.
+        io_stats["bytes_read"] += sum(
+            sum(len(x) for x in cb) if isinstance(cb, (list, tuple)) else len(cb)
+            for cb in (t.compressed_bytes for t in tiles)
+        )
         io_stats["px_decoded"] += len(pairs) * th * tw
     decoded = await asyncio.gather(*[t.decode() for t in tiles])
     if prof:
