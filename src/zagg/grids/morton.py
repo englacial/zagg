@@ -33,6 +33,31 @@ import numpy as np
 MORTON_EXTENSION_NAME = "mortie.morton_index"
 _EXTENSION_NAME_KEY = "ARROW:extension:name"
 
+#: Self-declared ``zarr_conventions`` entry for morton-declared stores
+#: (issue #305, D16). The UUID is minted once and PERMANENT — readers key on
+#: it; never regenerate it. The spec/schema URLs point at the mortie
+#: specification page (``docs/specification.md`` — the normative home of the
+#: convention; zagg's design doc only cites it). ``zarr_conventions`` is a
+#: LIST: a future upstream dggs-registry entry (issue #72 ask 3) coexists
+#: alongside this one rather than replacing it.
+MORTON_CONVENTION = {
+    "schema_url": "https://github.com/espg/mortie/blob/main/docs/specification.md#dggs-attrs",
+    "spec_url": "https://github.com/espg/mortie/blob/main/docs/specification.md",
+    "uuid": "3e22156d-ea9e-4e01-95fe-e3809a4b41e7",
+    "name": "morton-dggs",
+    "description": "Packed-u64 morton (HEALPix) DGGS convention",
+}
+
+#: O10 resolution discriminator (espg-ratified, issue #305): ``exact`` — ids
+#: are true cells at their encoded order; grid-derived cell coordinates are
+#: exact BY CONSTRUCTION, so every zagg aggregation output emits it.
+RESOLUTION_EXACT = "exact"
+#: ``point`` — locations cast to order 29 with no area claim (raw lat/lon
+#: conversions: the temporal event path, future HHDC id fields). The mortie
+#: spec page's 29->24 clip rule applies to ``point`` ONLY. Emission is per
+#: data kind and the writer always knows which; no heuristic fallback.
+RESOLUTION_POINT = "point"
+
 
 def is_morton_array(values) -> bool:
     """True if ``values`` is a mortie ``MortonIndexArray``."""
@@ -203,7 +228,10 @@ def is_morton_arrow(col) -> bool:
 
 
 __all__ = [
+    "MORTON_CONVENTION",
     "MORTON_EXTENSION_NAME",
+    "RESOLUTION_EXACT",
+    "RESOLUTION_POINT",
     "is_morton_array",
     "is_morton_arrow",
     "morton_box",
