@@ -767,7 +767,12 @@ rollup leaves all leaf reads intact.
   the decision: (1) **composability class** — `exact | approximate |
   none` — is declared in the semantic core, derived from the product's
   aggregator set; a `none` product pins its cell order (resolution *is*
-  identity there) and refuses mixed-order appends. (2) Per (shard,
+  identity there) and refuses mixed-order appends. The implementation
+  ships helper functions to derive the class from the product's
+  aggregator set (the existing mergeable-reducer merge-law flags) and to
+  enforce it — at template-validation time (the class is recorded into
+  the semantic core) and at append time (the mixed-order guard consults
+  it) (espg-directed in-session). (2) Per (shard,
   window) there is **one resolution at a time**: heterogeneity is
   regional, across shards. A same-cell-order rerun is D4 idempotent
   replacement; **writing a different cell order into an occupied leaf
