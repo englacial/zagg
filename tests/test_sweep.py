@@ -8,6 +8,7 @@ leaves leaf reads intact).
 """
 
 import json
+from datetime import datetime, timezone
 
 import obstore
 import pytest
@@ -114,7 +115,10 @@ class TestIdempotenceAndStaleness:
         assert second["current"] == 5
         assert _rollup(tmp_path, "-3") == before  # byte-stable, not just skipped
 
-    def test_leaf_rerun_makes_ancestors_detectably_stale(self, tmp_path):
+    def test_leaf_rerun_day_apart_bumps_generation_stamp(self, tmp_path):
+        # Fast path: distinct timestamps make the generation stamp itself move,
+        # so staleness is caught by the (n_leaves, max_leaf_timestamp) compare
+        # alone. Timestamps are hand-injected here to force the day-apart gap.
         _write_manifest(tmp_path)
         _put_leaf(tmp_path, "-311", timestamp="2026-01-01T00:00:00+00:00")
         _put_leaf(tmp_path, "-321", timestamp="2026-01-02T00:00:00+00:00")
@@ -128,6 +132,37 @@ class TestIdempotenceAndStaleness:
         fresh = _rollup(tmp_path, "-3")
         assert fresh["generation"] != stale_gen
         assert fresh["generation"]["max_leaf_timestamp"] == "2026-01-03T00:00:00+00:00"
+        assert fresh["payload"]["n_obs"] == 99 + 10
+
+    def test_leaf_rerun_same_second_rewrites_via_payload_compare(self, tmp_path, monkeypatch):
+        # Backstop path: the production timestamp comes from build_record, which
+        # stamps timespec="seconds" — so a real back-to-back re-run carries the
+        # SAME (n_leaves, max_leaf_timestamp) and the generation stamp is blind
+        # to it. Freeze the wall clock to force that same-second collision (no
+        # hand-injected timestamp=; build_record still stamps the record), then
+        # assert the payload-equality backstop rewrites the whole chain anyway.
+        _write_manifest(tmp_path)
+        frozen = datetime(2026, 5, 1, 12, 0, 0, tzinfo=timezone.utc)
+
+        class _FrozenClock:
+            @staticmethod
+            def now(tz=None):
+                return frozen
+
+        monkeypatch.setattr("zagg.telemetry.datetime", _FrozenClock)
+        _put_leaf(tmp_path, "-311")  # real build_record auto-stamp
+        _put_leaf(tmp_path, "-321")
+        run_sweep(str(tmp_path), _leaf_refs("-311", "-321"))
+        stale = _rollup(tmp_path, "-3")
+        # Same wall-clock second, different content: re-run -311 with new obs.
+        _put_leaf(tmp_path, "-311", n_obs=99)
+        result = run_sweep(str(tmp_path), _leaf_refs("-311"))["families"]["stats"]
+        assert result["written"] == 3  # -311, -31, -3: the full stale chain
+        fresh = _rollup(tmp_path, "-3")
+        # The generation stamp is IDENTICAL (same second, unchanged leaf count),
+        # so only the payload compare could have caught the change.
+        assert fresh["generation"] == stale["generation"]
+        assert fresh["payload"] != stale["payload"]
         assert fresh["payload"]["n_obs"] == 99 + 10
 
     def test_incremental_append_unions_windows_and_siblings(self, tmp_path):
