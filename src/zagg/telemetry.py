@@ -364,14 +364,34 @@ def write_run_parquet(
 # ---------------------------------------------------------------------------
 
 
-def sidecar_key(leaf_name: str) -> str:
-    """Sidecar object name for a leaf zarr basename.
+#: Manifest ``spec`` string selecting the D23 window-only naming grammar.
+#: ``/1``/``/2`` (and an absent spec) keep the frozen legacy sidecar names.
+SPEC_V3 = "morton-hive/3"
 
-    Bare leaves get :data:`SIDECAR_NAME`; windowed leaves (issue #246) get
+
+def sidecar_key(leaf_name: str, spec: str | None = None) -> str:
+    """Sidecar object name for a leaf zarr basename, keyed by store spec.
+
+    Legacy (``spec`` absent / ``morton-hive/1`` / ``/2``): bare leaves get
+    :data:`SIDECAR_NAME`; windowed leaves (issue #246) get
     ``stats_{window}.json`` — a hive node directory holds every window's leaf
     of its one shard, so a bare ``stats.json`` would self-clobber across
-    windows. Mirrors the ``{full_id}_{window}.zarr`` leaf naming.
+    windows. Mirrors the ``{full_id}_{window}.zarr`` leaf naming. Frozen: what
+    every current writer emits, unchanged.
+
+    ``morton-hive/3`` (:data:`SPEC_V3`, D23 — window-only leaf naming, no
+    writer yet): the sidecar is the leaf stem + ``.stats.json`` —
+    ``{window}.stats.json``, and ``all.stats.json`` for the ``schedule:
+    none`` :data:`~zagg.windows.SCHEDULE_NONE_TOKEN` leaf. Derived from the
+    leaf basename itself, so the token has ONE source
+    (:func:`zagg.windows.leaf_name_v3`) and the issue #299 writer flip is a
+    spec switch here, not a rename.
     """
+    if spec == SPEC_V3:
+        stem = leaf_name.removesuffix(".zarr")
+        if not stem or stem == leaf_name:
+            raise ValueError(f"{leaf_name!r} is not a leaf zarr name")
+        return f"{stem}.stats.json"
     from zagg.windows import split_leaf_name
 
     _full_id, window = split_leaf_name(leaf_name)
@@ -381,13 +401,13 @@ def sidecar_key(leaf_name: str) -> str:
     return f"{stem}_{window}.{ext}"
 
 
-def sidecar_path(leaf_path: str) -> str:
+def sidecar_path(leaf_path: str, spec: str | None = None) -> str:
     """Absolute path of a leaf's stats sidecar (sibling of the ``.zarr``)."""
     prefix, _, name = leaf_path.rstrip("/").rpartition("/")
-    return f"{prefix}/{sidecar_key(name)}"
+    return f"{prefix}/{sidecar_key(name, spec)}"
 
 
-def write_sidecar(leaf_path: str, record: dict, **store_kwargs) -> None:
+def write_sidecar(leaf_path: str, record: dict, spec: str | None = None, **store_kwargs) -> None:
     """PUT ``record`` as the leaf's stats sidecar (success path only, #297)."""
     import obstore
 
@@ -395,11 +415,13 @@ def write_sidecar(leaf_path: str, record: dict, **store_kwargs) -> None:
 
     prefix, _, name = leaf_path.rstrip("/").rpartition("/")
     obstore.put(
-        open_object_store(prefix, **store_kwargs), sidecar_key(name), json.dumps(record).encode()
+        open_object_store(prefix, **store_kwargs),
+        sidecar_key(name, spec),
+        json.dumps(record).encode(),
     )
 
 
-def read_sidecar(leaf_path: str, **store_kwargs) -> dict | None:
+def read_sidecar(leaf_path: str, spec: str | None = None, **store_kwargs) -> dict | None:
     """The leaf's stats sidecar record, or ``None`` when absent."""
     import obstore
     from obstore.exceptions import NotFoundError
@@ -408,7 +430,9 @@ def read_sidecar(leaf_path: str, **store_kwargs) -> dict | None:
 
     prefix, _, name = leaf_path.rstrip("/").rpartition("/")
     try:
-        data = obstore.get(open_object_store(prefix, **store_kwargs), sidecar_key(name)).bytes()
+        data = obstore.get(
+            open_object_store(prefix, **store_kwargs), sidecar_key(name, spec)
+        ).bytes()
     except (FileNotFoundError, NotFoundError):
         return None
     return json.loads(bytes(data))

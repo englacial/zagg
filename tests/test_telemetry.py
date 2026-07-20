@@ -4,6 +4,7 @@ import pytest
 
 from zagg.telemetry import (
     SCHEMA_VERSION,
+    SPEC_V3,
     build_record,
     failure_record,
     flatten_record,
@@ -299,6 +300,35 @@ class TestSidecarIO:
         # Sibling object, never inside the leaf prefix.
         assert (tmp_path / "-4" / "2" / "stats.json").exists()
         assert not (tmp_path / "-4" / "2" / "-42.zarr").exists()
+
+    def test_v3_spec_keys_off_leaf_stem(self):
+        # D23 window-only naming (morton-hive/3): sidecar = leaf stem +
+        # .stats.json, derived from the leaf basename so the schedule-none
+        # token has one source (windows.leaf_name_v3). Legacy specs above are
+        # frozen — every current writer emits them unchanged.
+        from zagg.windows import SCHEDULE_NONE_TOKEN, leaf_name_v3
+
+        assert sidecar_key(leaf_name_v3("2019"), SPEC_V3) == "2019.stats.json"
+        assert leaf_name_v3(None) == f"{SCHEDULE_NONE_TOKEN}.zarr"
+        assert sidecar_key(leaf_name_v3(None), SPEC_V3) == f"{SCHEDULE_NONE_TOKEN}.stats.json"
+        # The /1 and /2 specs (and an absent spec) keep the legacy names.
+        assert sidecar_key("-4211322.zarr", "morton-hive/2") == "stats.json"
+        assert sidecar_key("-4211322_2019.zarr", "morton-hive/1") == "stats_2019.json"
+        with pytest.raises(ValueError, match="not a leaf zarr name"):
+            sidecar_key("2019", SPEC_V3)
+        with pytest.raises(ValueError, match="not a leaf zarr name"):
+            sidecar_key(".zarr", SPEC_V3)
+
+    def test_v3_write_read_roundtrip(self, tmp_path):
+        from zagg.windows import leaf_name_v3
+
+        leaf = str(tmp_path / "-4" / "2" / leaf_name_v3("2019"))
+        rec = _record()
+        write_sidecar(leaf, rec, spec=SPEC_V3)
+        assert read_sidecar(leaf, spec=SPEC_V3) == rec
+        assert (tmp_path / "-4" / "2" / "2019.stats.json").exists()
+        # The legacy reader does not see it (different name — spec selects).
+        assert read_sidecar(leaf) is None
 
     def test_read_absent_returns_none(self, tmp_path):
         (tmp_path / "-4").mkdir()
