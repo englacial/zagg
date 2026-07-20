@@ -1411,6 +1411,7 @@ class RasterStrategy:
             run_id=run_id,
             result_prefix=result_prefix,
             output_creds_event=output_creds_event,
+            store_kwargs=_output_store_kwargs(output_creds_event, region),
         )
         if cells and errors == len(cells):
             raise RuntimeError(f"all {errors} raster shard(s) failed; last error: {last_error}")
@@ -2208,6 +2209,7 @@ def _dispatch_run_stats(
     run_id,
     result_prefix=None,
     output_creds_event=None,
+    store_kwargs=None,
     summary=None,
     inline_rows=None,
 ) -> str | None:
@@ -2270,19 +2272,77 @@ def _dispatch_run_stats(
                 f"sync run has no status prefix to point at; skipping (fail-open, issue #313)"
             )
             return None
-        lambda_client.invoke(
-            FunctionName=function_name,
-            InvocationType="Event",
-            Payload=json.dumps(event),
+        key = run_parquet_key(run_id, timestamp)
+        path = f"{store_path.rstrip('/')}/{key}"
+        payload = json.dumps(event)
+        # Fire -> verify -> re-fire (the async-per-D8 hardening): the Event
+        # invoke is retries-0 and failure rows exist only in this run report,
+        # so verify the parquet landed (read-only HEAD poll on the pinned
+        # key) and re-fire ONCE if not. Bounded — the dispatcher never
+        # meaningfully blocks — then fail-open with a logged notice (success
+        # rows stay rebuildable from the leaf sidecars; a late queued invoke
+        # may still land the object after we stop looking).
+        for attempt in (1, 2):
+            lambda_client.invoke(
+                FunctionName=function_name,
+                InvocationType="Event",
+                Payload=payload,
+            )
+            if attempt == 1:
+                if summary is not None:
+                    summary["run_stats_path"] = path
+                logger.info(
+                    f"Dispatched run stats write ({len(rows)} rows, fire-and-forget): {path}"
+                )
+            if _await_run_stats_object(store_path, key, store_kwargs):
+                return path
+            if attempt == 1 and _RUN_STATS_VERIFY_WINDOW_S > 0:
+                logger.warning(
+                    f"run stats parquet not visible after "
+                    f"{_RUN_STATS_VERIFY_WINDOW_S:g}s; re-firing the Event invoke "
+                    f"once (issue #313)"
+                )
+        logger.warning(
+            f"run stats parquet still absent after the re-fire (fail-open, issue #313): "
+            f"{path} — failure rows may be lost; the run report remains in this summary"
         )
-        path = f"{store_path.rstrip('/')}/{run_parquet_key(run_id, timestamp)}"
-        if summary is not None:
-            summary["run_stats_path"] = path
-        logger.info(f"Dispatched run stats write ({len(rows)} rows, fire-and-forget): {path}")
         return path
     except Exception as e:
         logger.warning(f"run stats dispatch failed (fail-open, issue #313): {e}")
         return None
+
+
+def _await_run_stats_object(store_path, key, store_kwargs, *, window_s=None) -> bool:
+    """Bounded READ-ONLY existence poll for the run parquet (issue #313).
+
+    True once the object exists; False at the deadline. A non-positive window
+    skips verification entirely (reports True after zero reads) — the single-
+    fire escape hatch, and what unit tests set to keep dispatch synchronous
+    paths read-free. Read errors count as absent (the poll is best-effort;
+    the caller's fail-open handles a dispatcher that cannot read the store).
+    """
+    window_s = _RUN_STATS_VERIFY_WINDOW_S if window_s is None else window_s
+    if window_s <= 0:
+        return True
+    import obstore
+
+    from zagg.store import open_object_store
+
+    try:
+        store = open_object_store(store_path, **(store_kwargs or {}))
+    except Exception as e:
+        logger.warning(f"run stats verify skipped (cannot open store read-only): {e}")
+        return False
+    deadline = time.time() + window_s
+    while True:
+        try:
+            obstore.head(store, key)
+            return True
+        except Exception:
+            pass
+        if time.time() >= deadline:
+            return False
+        time.sleep(_RUN_STATS_VERIFY_INTERVAL_S)
 
 
 def _lambda_result_rows(results, *, run_id=None) -> tuple[list, list]:
@@ -3402,6 +3462,7 @@ def _run_lambda(
         run_id=run_id,
         result_prefix=result_prefix,
         output_creds_event=output_creds_event,
+        store_kwargs=_output_store_kwargs(output_creds_event, region),
         summary=summary,
         inline_rows=stats_inline_rows,
     )
@@ -3546,6 +3607,16 @@ _ASYNC_PAYLOAD_CAP_BYTES = 250 * 1024
 #: (credentials block, paths). Above this the dispatcher sends the status
 #: prefix pointer instead (failure rows stay inline — they have no envelope).
 _RUN_STATS_INLINE_CAP_BYTES = 200 * 1024
+
+#: Fire -> verify -> re-fire bounds for the mode="stats" Event invoke (issue
+#: #313 hardening): failure rows exist only in the dispatcher's run report,
+#: so a dropped retries-0 Event invoke loses them permanently. After firing,
+#: the dispatcher does a READ-ONLY existence poll on the pinned parquet key
+#: (reads were never forbidden — it already polls result objects) for at most
+#: the window, re-fires ONCE if absent, then gives up fail-open. Worst case
+#: 2 x window of end-of-run wall; <= 0 disables verification (single fire).
+_RUN_STATS_VERIFY_WINDOW_S = 20.0
+_RUN_STATS_VERIFY_INTERVAL_S = 2.0
 
 # The result poller owns its retrying at the loop level (a fetch every
 # _ASYNC_POLL_INTERVAL_S until the deadline), so its store gets a short

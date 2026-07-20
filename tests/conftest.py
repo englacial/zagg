@@ -86,3 +86,18 @@ def _no_s3_run_stats(monkeypatch):
         return real(store_path, rows, summary=summary, **kwargs)
 
     monkeypatch.setattr(runner, "_write_run_stats", guard)
+
+
+@pytest.fixture(autouse=True)
+def _no_run_stats_verify(monkeypatch):
+    """Disable the issue #313 fire->verify->re-fire poll by default in tests.
+
+    The verify leg does read-only existence polls against the OUTPUT store —
+    a real network HEAD for the s3:// store paths unit harnesses use, plus a
+    bounded sleep-poll either way. A zero window reports success after zero
+    reads (the documented single-fire escape hatch), keeping dispatch tests
+    hermetic and fast; the re-fire tests set the window back explicitly.
+    """
+    from zagg import runner
+
+    monkeypatch.setattr(runner, "_RUN_STATS_VERIFY_WINDOW_S", 0.0)
