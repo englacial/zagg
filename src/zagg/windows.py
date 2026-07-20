@@ -221,6 +221,29 @@ def windows_intersecting(
         label = window_label(hi, schedule)
 
 
+#: The ``schedule: none`` leaf token under D23 window-only naming
+#: (``morton-hive/3``): the degenerate no-schedule leaf is ``all.zarr`` and
+#: its sidecar ``all.stats.json``. LEAN, not ratified (recorded with D23 in
+#: docs/design/sparse_coverage.md §8.1): kept a single constant so
+#: ratifying a different token is a one-line change.
+SCHEDULE_NONE_TOKEN = "all"
+
+
+def leaf_name_v3(window: str | None) -> str:
+    """The ``morton-hive/3`` leaf basename: the time window alone (D23).
+
+    Space lives in the digit path, time in the basename — the morton id no
+    longer repeats in the leaf name. ``None`` (``schedule: none``) is the
+    reserved :data:`SCHEDULE_NONE_TOKEN` leaf. No ``/3`` writer exists yet
+    (issue #299 flips the writers to this seam); ``/1``/``/2`` stores keep
+    :func:`leaf_name`'s frozen grammar forever (D6 versioning).
+    """
+    if window is None:
+        return f"{SCHEDULE_NONE_TOKEN}.zarr"
+    validate_label(window)
+    return f"{window}.zarr"
+
+
 def leaf_name(full_id: str, window: str | None = None) -> str:
     """The leaf zarr basename: ``{full_id}_{window}.zarr``, or bare (D13).
 
