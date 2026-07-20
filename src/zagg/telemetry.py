@@ -24,6 +24,7 @@ import hashlib
 import json
 import os
 import platform
+import re
 from datetime import datetime, timezone
 from typing import Any, Iterable
 
@@ -334,14 +335,38 @@ def flatten_record(record: dict, *, retries=None, error_class=None) -> dict:
     return row
 
 
+#: ``run_id`` charset for the parquet key: opaque, no ``/`` or ``.`` (mirrors
+#: the frozen window-label grammar in :mod:`zagg.windows`).
+_RUN_ID_RE = re.compile(r"^[0-9A-Za-z-]{1,64}$")
+#: The D20 ``%Y%m%dT%H%M%SZ`` timestamp grammar — the only shape ``run_parquet_key``
+#: emits itself, pinned so a caller-supplied value can't smuggle a path escape.
+_RUN_TS_RE = re.compile(r"^[0-9]{8}T[0-9]{6}Z$")
+
+
 def run_parquet_key(run_id: str, timestamp: str | None = None) -> str:
     """Store-root object name of a run's stats parquet: timestamp, then run id.
 
     Timestamp-first (D20, docs/design/sparse_coverage.md) so a lexicographic
     listing of ``stats_*.parquet`` is chronological and time-range queries can
     prune on the key alone.
+
+    Both components flow into the object KEY, so both are validated against
+    their frozen grammar first — the D8 worker-invoke transport (issue #313)
+    makes ``timestamp`` a caller-supplied input, and an embedded ``/`` or
+    ``..`` would escape the store root. Like :func:`sidecar_key`'s
+    ``validate_label``, a malformed value RAISES rather than composing a
+    traversing key.
     """
     ts = timestamp or datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    if not _RUN_TS_RE.match(ts):
+        raise ValueError(
+            f"run parquet timestamp {ts!r} does not match the D20 grammar "
+            f"({_RUN_TS_RE.pattern})"
+        )
+    if not isinstance(run_id, str) or not _RUN_ID_RE.match(run_id):
+        raise ValueError(
+            f"run_id {run_id!r} does not match the opaque key charset ({_RUN_ID_RE.pattern})"
+        )
     return f"stats_{ts}_{run_id}.parquet"
 
 

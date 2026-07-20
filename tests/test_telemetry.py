@@ -416,6 +416,20 @@ class TestRunParquet:
         key = run_parquet_key("abc123", timestamp="20260718T010203Z")
         assert key == "stats_20260718T010203Z_abc123.parquet"
 
+    def test_run_parquet_key_rejects_traversal(self):
+        # Both components land in the object key; a ``/`` or ``..`` must RAISE
+        # (issue #313 makes timestamp caller-supplied) rather than escape root.
+        import pytest
+
+        with pytest.raises(ValueError):
+            run_parquet_key("../../etc/passwd", timestamp="20260718T010203Z")
+        with pytest.raises(ValueError):
+            run_parquet_key("ab/cd", timestamp="20260718T010203Z")
+        with pytest.raises(ValueError):
+            run_parquet_key("abc123", timestamp="../evil")
+        with pytest.raises(ValueError):
+            run_parquet_key("abc123", timestamp="2026/07/18")
+
     def test_round_trip(self, tmp_path):
         import pandas as pd
 
