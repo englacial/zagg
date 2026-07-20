@@ -5,7 +5,7 @@ temporal-partitioning amendments (D13–D15) ratified on
 [#237](https://github.com/englacial/zagg/issues/237); morton-only-storage
 amendment ratified on
 [#262](https://github.com/englacial/zagg/issues/262) (D16; open item O10
-carved from it); 2026-07 consolidation (D17–D23, O3 resolved, O11 opened)
+carved from it); 2026-07 consolidation (D17–D24, O3 resolved, O11 opened)
 recording decisions settled on the
 [#251](https://github.com/englacial/zagg/issues/251)/[#236](https://github.com/englacial/zagg/issues/236)/[#209](https://github.com/englacial/zagg/issues/209)
 and [#296](https://github.com/englacial/zagg/issues/296)-family threads —
@@ -57,11 +57,13 @@ what zagg consumes:
 
 ```
 {store_root}/                    <- multi-product form (D19): a directory of
-  {hash}.yaml                       stores + a content-addressed registry
-  {hash}/                        <- product root: each product subtree is a
-    morton_hive.json                COMPLETE morton-hive store — bare-named
+  {name}/                        <- NAMED product root — each product subtree
+    morton_hive.json                is a COMPLETE morton-hive store: bare-named
     coverage.moc                    manifest (§3) + optional root MOC (§4, O9)
-    <run records (parquet)>      <- run-level telemetry, one row/shard (D20)
+    aggregation.yaml             <- canonical semantic core (D19); its hash is
+                                    a frozen manifest key, not a path name
+    <run records (parquet)>      <- run-level telemetry, one row/shard;
+                                    timestamp-first names (D20)
     {sign+base}/{d1}/{d2}/.../   <- one digit per level (D2; digit-chunking is
                                     the manifest path_grouping param, D21)
       {window}.zarr/             <- leaf, basename = time window (D23,
@@ -77,10 +79,14 @@ what zagg consumes:
 ```
 
 A bare single-product store (today's layout — `morton_hive.json` at the
-store root, no `{hash}/` level) remains fully valid: the D19 product root is
+store root, no `{name}/` level) remains fully valid: the D19 product root is
 *additive*, and a product subtree is byte-identical to a bare store. A
 reader distinguishes the two forms by what sits at the root (a manifest ⇒
-bare store; `{hash}.yaml` entries ⇒ product directory).
+bare store; only name-shaped prefixes ⇒ product directory). Product names
+must not match the base-component grammar (`-?[1-6]`) so the walker's child
+classification stays unambiguous; gridlook and other viewers enumerate
+products by listing `{store_root}/` and reading each
+`{name}/morton_hive.json` directly — no name↔hash translation layer.
 
 - **Ids are morton decimal strings** (D1): sign + base digit (constant width,
   12 values `1..6`/`-1..-6`), then one digit per order, digits `1-4`, never
@@ -124,9 +130,9 @@ bare store; `{hash}.yaml` entries ⇒ product directory).
   sidecars — the per-shard stats record (D20) and the sub-shardmap JSON
   (D22) — with nothing else, ever: the walker's child classification
   depends on the name set being closed. The product root alone also carries
-  the manifest, MOC objects, and run-level telemetry records (D20); the
-  *store* root of a multi-product directory carries only `{hash}.yaml`
-  registry entries and `{hash}/` product roots (D19).
+  the manifest, MOC objects, the semantic core (`aggregation.yaml`, D19),
+  and run-level telemetry records (D20); the *store* root of a
+  multi-product directory carries only `{name}/` product roots (D19).
 - **Termination condition**: S3 has no empty directories (a prefix exists iff
   ≥1 object lies beneath it) and LIST is strongly consistent, so a
   delimiter-LIST returning no digit-shaped children is a definitive "nothing
@@ -166,13 +172,21 @@ again during a run. Contents:
 - `spec`: convention version string (e.g. `"morton-hive/1"`) — the convention
   itself is versioned from day one (D6).
 - Dataset identity (short name, product/version).
-- `cell_order`, `shard_order` (and, if a store permits region-dependent shard
-  orders, the allowed set).
+- `cell_order`, `shard_order` — each as a declared **allowed set/range**
+  when the store permits region-dependent orders (D24: shard order is pure
+  packaging; cell order is a resolution axis with per-leaf truth in the
+  morton words + MOC). The allowed sets are the frozen keys; runs within
+  the set pass the append precheck.
+- `semantic_hash` (D19): sha256 of the canonical semantic core — a frozen
+  key, so reusing a product name with different aggregation semantics
+  refuses up front, exactly as an order mismatch does.
 - Split schedule (implicit under D2: one digit per level to `shard_order`;
   recorded explicitly for forward compatibility).
 - `path_grouping` (D21): how many morton digits each path component chunks.
   Existing stores are retroactively `1`; new stores default `1`; changing the
   default later is a parameter flip for new stores, never a schema break.
+  When compared as a frozen key, an absent field normalizes to `1` on both
+  sides, so appends to pre-D21 stores never refuse on it.
 - Rollup/pyramid declaration (D22 extends the original overview-only form):
   which ancestor orders carry which derived artifact family — overview
   zarrs, stats rollups, sub-shardmap rollups — declared **per artifact
@@ -580,55 +594,69 @@ rollup leaves all leaf reads intact.
   metadata-only. This is the second noted soft-exception to "vanilla zarr
   v3" leaves (after the §4 coverage sidecar): plain zarr readers see opaque
   bytes, not garbage.
-- **D19 — Template-hash product roots: a multi-product store is a
-  directory of stores + a registry** (concept settled across
+- **D19 — Named product roots + semantic-core hash: a multi-product store
+  is a directory of stores; the name is the address, the hash is the
+  integrity check** (concept settled across
   [#296](https://github.com/englacial/zagg/issues/296#issuecomment-5014826849)
   and [#299](https://github.com/englacial/zagg/issues/299) — espg
   on-thread:
-  [naming + registry + per-product manifests](https://github.com/englacial/zagg/issues/299#issuecomment-5017263033);
-  **hash-first revision espg-ratified in-session 2026-07-20**, superseding
-  the earlier leaf-basename form recorded in this PR's phase 2 —
-  trade study on the PR #306 thread). Each product lives under its own
-  root prefix `{hash}/`, where hash = truncated sha256 (12 hex; collision
-  domain is products-within-one-store) of the **canonicalized** agg
-  template (parse YAML → sorted-key JSON → hash; never raw bytes). A
-  product subtree is a *complete, unmodified* morton-hive store —
-  bare-named manifest and MOC, `{full_id}.zarr` leaves under `/1`–`/2`
-  grammars (`{window}.zarr` under `/3` — D23; D3 and D13's grammar
-  untouched by D19) — so existing single-product stores are
-  already valid and the change is **additive, not breaking**; readers
-  distinguish the two root forms by content (manifest ⇒ bare store,
-  `{hash}.yaml` entries ⇒ product directory). The template itself is
-  written beside each product root as `{hash}.yaml` — a content-addressed
-  registry designed so a future external/community registry is a pure
-  file-merge superset; root listing is product discovery. Rationale for
-  hash-first over leaf-basename colocation: S3's only cheap scoping
-  primitive is the prefix, and product-scoped operations (delete,
-  lifecycle/expiration, access policy, inventory) dominate in practice —
-  under colocation each would need per-object tagging or the
-  out-of-contract full enumeration; under hash-first each is one prefix
-  rule. Cost prediction for appending new shards to a product is likewise
-  greatly simplified (espg-noted in-session, 2026-07-20): the product root
-  scopes its own telemetry history — the D20 run records and sidecars all
-  sit under one prefix — so the pilot-first cost estimator's priors (the
-  #298 design) are exactly the product's own records: same template, same
-  per-observation cost profile, no cross-product filtering. Within-product
-  walk/terminal semantics revert to the proven
-  single-product forms, and per-product artifacts keep bare names (one
-  less naming surface for readers to get wrong). What hash-first gives
-  up — a single spatial prefix spanning all products — serves no planned
-  workload: cross-product reads are manifest + MOC + truncation
-  arithmetic (§5) and never depended on physical colocation. **Catalog
-  identity lives in the sidecar, never the name**: granule count + sha256
-  of sorted granule ids + zagg version; dedup/`has_run` consults the
-  computed path *and* sidecar (a catalog-grown shard is "stale", not
-  "hit") — the template hash alone proves identity only for a frozen
-  catalog. Immutable-provenance naming (product root
-  `{hash}+{catalog-hash}/`) is an opt-in for frozen-catalog archival
-  runs; default stays template-hash-only. The output content hash that
-  makes dedup *verifiable* is O11 (proposal). D7 generalizes cleanly:
-  "one store per dataset" becomes "one product tree per template" under a
-  shared root, with cross-product joins unchanged.
+  [registry + per-product manifests](https://github.com/englacial/zagg/issues/299#issuecomment-5017263033);
+  revision history, all espg-ratified in-session 2026-07-20, trade
+  studies on the PR #306 thread: leaf-hash basenames (phase 2) →
+  hash-named product roots (phase 3) → **named roots with the hash demoted
+  to metadata (this revision)**). Each product lives under its own
+  human-readable root prefix `{name}/`; a product subtree is a *complete,
+  unmodified* morton-hive store — bare-named manifest and MOC,
+  `{full_id}.zarr` leaves under `/1`–`/2` grammars (`{window}.zarr` under
+  `/3` — D23) — so existing single-product stores are already valid and
+  the change is **additive, not breaking**. Readers distinguish the two
+  root forms by content (manifest ⇒ bare store; name-shaped prefixes ⇒
+  product directory; names must not match the base-component grammar);
+  viewers enumerate products by listing the root and reading each
+  `{name}/morton_hive.json` — no name↔hash translation layer.
+  **Identity is split**: the *name* addresses the product; the
+  **`semantic_hash`** verifies it — sha256 over the canonicalized
+  **output-defining subset only**: the `aggregation` block (functions +
+  params + dtypes + fills + ragged kinds), the `data_source` semantics
+  (dataset/product, groups, coordinates, variables, filters), and the
+  grid *type + indexing scheme*. Excluded as packaging: cell order (a
+  resolution axis — D24), parent/shard order, `chunk_inner`/`sharded`,
+  worker size, streaming mode (merge-vs-spill lands `np.isclose` and
+  shares one store, with the actual mode recorded per-run), and read
+  knobs — hashing the whole template would have made o8 and o9 runs
+  different products and blocked mixed-order processing. The hash is a
+  **frozen manifest key** (reusing a name with different aggregation
+  semantics refuses up front, like any frozen-key mismatch) and is
+  recorded in leaf attrs and D20 sidecars. The *literal* template is
+  deliberately **not** the product-level record (it carries run-varying
+  packaging): the product root holds the canonical semantic core as
+  `aggregation.yaml` (deterministic, valid YAML); each run archives its
+  literal template with its run record, and sidecars carry the run id to
+  join back. (This factoring formalizes a seam the code already has:
+  `spatial_signature` vs `output_field_signature`, the #89 split.)
+  Rationale for product-root prefixes (unchanged from the hash-first
+  study): S3's only cheap scoping primitive is the prefix, and
+  product-scoped operations (delete, lifecycle/expiration, access policy,
+  inventory) dominate — each is one prefix rule. Cost prediction for
+  appending new shards is likewise scoped (espg-noted in-session): the
+  product root holds its own telemetry history, so the pilot-first
+  estimator's priors (the #298 design) are exactly the product's own
+  records. What a shared spatial tree would have offered — one prefix
+  spanning all products — serves no planned workload (§5 reads are
+  arithmetic). **Catalog identity lives in the sidecar, never the name**:
+  granule count + sha256 of sorted granule ids + zagg version;
+  dedup/`has_run` consults the computed path, the `semantic_hash`, *and*
+  the sidecar catalog identity (a catalog-grown shard is "stale", not
+  "hit"). Immutable-provenance naming (product root
+  `{name}+{catalog-hash}/`) stays an opt-in for frozen-catalog archival
+  runs. The output content hash that makes dedup *verifiable* is O11
+  (proposal; it complements the semantic hash — "intended identical" vs
+  "actually byte-identical"). A community registry maps names → semantic
+  cores + hashes; cross-deployment name collisions are disambiguated by
+  the hash in metadata rather than prevented by unreadable paths. D7
+  generalizes cleanly: "one store per dataset" becomes "one product tree
+  per semantic core" under a shared root, with cross-product joins
+  unchanged.
 - **D20 — Per-shard telemetry sidecar + run records** (espg on-thread:
   [sibling placement + envelope ride](https://github.com/englacial/zagg/issues/297#issuecomment-5016910923),
   [caller identity](https://github.com/englacial/zagg/issues/297#issuecomment-5016901381);
@@ -644,13 +672,19 @@ rollup leaves all leaf reads intact.
   min/max, t-digests; never stored means) — so up-tree rollups are a pure
   fold (D22). The record also rides the async result envelope; the
   dispatcher writes a **run-level parquet at the product root** — a run maps
-  to one template ⇒ one product tree (D7/D19), so it lands under `{hash}/`,
+  to one product ⇒ one product tree (D7/D19), so it lands under `{name}/`,
   never the multi-product store root, whose node invariant admits only
-  `{hash}.yaml` + `{hash}/` — with one row per
+  `{name}/` product roots — with one row per
   shard, *including failure rows* sourced from the run report — sidecars
   exist only on success; CloudWatch structured logs remain the failure
-  forensics channel). Sidecars omit account-identifying fields (request
-  ids, ARNs beyond the caller identity).
+  forensics channel). Run-record names are **timestamp-first**
+  (`stats_{timestamp}_{run_id}.parquet`) so lexicographic listing is
+  chronological and time-range queries prune on keys before reading;
+  per-user scoping stays the `invoked_by` *column* (names stay stable
+  identifiers). Sidecars carry the `run_id` (joining leaf → run record →
+  that run's archived literal template, D19) and the D19 `semantic_hash`;
+  they omit account-identifying fields (request ids, ARNs beyond the
+  caller identity).
 - **D21 — `path_grouping` is a manifest parameter, not a layout**
   (espg-ratified in-session, recorded on
   [#300](https://github.com/englacial/zagg/issues/300#issuecomment-5017464707)).
@@ -706,11 +740,42 @@ rollup leaves all leaf reads intact.
   `none.zarr` matches the schedule literal but reads worse) — and the
   sidecar alignment `{window}.stats.json` / `all.stats.json` (D20
   naming; follow-up to the merged PR #302). Rejected alternative: time
-  as a *path* level (`{hash}/{window}/{morton…}`) would make
+  as a *path* level (`{name}/{window}/{morton…}`) would make
   window-scoped ops prefix-cheap but duplicates the morton tree per
   window and shatters the dominant read — a time series at a location —
   across W prefixes; reads dominate window expiry, so time stays at the
   leaf.
+- **D24 — Resolution polymorphism: cell order is a query/packaging axis,
+  not product identity** (espg-proposed and ratified in-session,
+  2026-07-20; rationale recorded on the PR #306 thread). Aggregation
+  *composes* across orders — finer cells fold to coarser under the same
+  merge law (exactly for count/sum/min/max; `np.isclose` for t-digest,
+  whose merge is order-dependent — the same epistemic class as
+  merge-vs-spill, already ruled one-store) — so a product's cell order is
+  excluded from the D19 `semantic_hash`, and one product tree may carry
+  **regionally heterogeneous resolution** (e.g. o19 cells in polar
+  shards, o17 mid-latitude). The design had already committed to the
+  pillars: D22's rollup==direct obligation *is* the composition claim;
+  D16 chose morton words because they carry order intrinsically; D11's
+  `role` attr anticipated coarse *source*; the #217 mergeable-reducer
+  machinery provides per-aggregator merge laws. Consequences frozen with
+  the decision: (1) **composability class** — `exact | approximate |
+  none` — is declared in the semantic core, derived from the product's
+  aggregator set; a `none` product pins its cell order (resolution *is*
+  identity there) and refuses mixed-order appends. (2) Per (shard,
+  window) there is **one resolution at a time**: heterogeneity is
+  regional, across shards. A same-cell-order rerun is D4 idempotent
+  replacement; **writing a different cell order into an occupied leaf
+  refuses with a useful error** (espg-directed) — intentional
+  re-resolution means rerunning at a parent order that isn't occupied, or
+  explicitly clearing the leaf. (3) Manifest `cell_order` and
+  `shard_order` become declared allowed sets/ranges (§3); per-leaf truth
+  is the morton words + MOC. (4) Coarse source and sweep-built overviews
+  unify — the same multi-order tree, distinguished only by `role`/
+  provenance attrs; the pyramid is the store's resolution axis, partially
+  materialized. Reader support is gated on mortie#116 mixed-order morton
+  (tracked as moczarr#8); the schema needs no bump — this is what the
+  coordinate system was built for.
 
 ### 8.2 Open for review (input needed)
 
