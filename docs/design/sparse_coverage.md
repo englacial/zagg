@@ -976,7 +976,7 @@ rollup leaves all leaf reads intact.
   optional interop materialization can generate a consolidated,
   `open_datatree`-able hierarchy *as a derived cache* for non-moczarr
   consumers, while the MOC-first opener remains the truth path (the
-  derived-views principle, third instance). Phasing: (1) `open_hive` →
+  derived-views principle, fourth instance). Phasing: (1) `open_hive` →
   Dataset stays the primitive, unchanged; (2) `open_store()` →
   product-level DataTree after moczarr#11; (3) level nodes with
   #201/D24; (4) optional sweep-generated interop hierarchy.
