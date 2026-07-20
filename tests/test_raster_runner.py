@@ -389,7 +389,11 @@ class TestRasterLambdaBackend:
             assert event["shard_key"] == shard
             assert set(event["time_index"]) == {"dt-1", "dt-2"}
             assert event["config"]["data_source"]["reader"] == "raster"
-            body = {"timesteps": len(event["time_index"]), "cells_with_data": 4096}
+            body = {
+                "timesteps": len(event["time_index"]),
+                "cells_with_data": 4096,
+                "duration_s": 30.0,
+            }
             return {"statusCode": 200, "body": json.dumps(body)}
 
         fake = _FakeLambdaClient(_lifecycle(responder))
@@ -408,14 +412,28 @@ class TestRasterLambdaBackend:
         # The key is unconditional (issue #297) — None here because the
         # conftest guard skips the live s3 PUT in unit tests.
         assert "run_stats_path" in summary and summary["run_stats_path"] is None
+        # Cost block (issue #298, rolled into the raster path here): the
+        # pre-invoke ceiling, the deferred estimate stub, and the billed
+        # rollup — 30 s x 4 GB x the arm64 rate — with the legacy flat key
+        # keeping the actual-cost meaning like the other lambda summaries.
+        from zagg.dispatch import LAMBDA_PRICE_PER_GB_SEC
+
+        assert summary["gb_seconds"] == pytest.approx(30.0 * 4.0)
+        expected_cost = 30.0 * 4.0 * LAMBDA_PRICE_PER_GB_SEC
+        assert summary["estimated_cost_usd"] == pytest.approx(expected_cost)
+        cost = summary["cost"]
+        assert cost["actual_cost_usd"] == pytest.approx(expected_cost)
+        assert cost["estimated_cost_usd"] is None  # Phase-3 stub
+        assert cost["max_cost_usd"] == pytest.approx(1 * 4.0 * 900 * LAMBDA_PRICE_PER_GB_SEC)
         assert summary["total_obs"] == 2
         assert [e["mode"] for e in fake.events] == ["ping", "setup", "process_raster"]
         # No profile -> the payload stays byte-identical (no key) and the
         # profile rollups stay out of the summary (issue #250).
         assert "profile" not in fake.events[-1]
         assert "worker_stage_max" not in summary
-        # Always-on telemetry rollups are null-safe on a body without them.
-        assert summary["lambda_time_s"] is None and summary["max_memory_mb"] is None
+        # Telemetry rollups: duration lands, memory stays null-safe on a
+        # body without it.
+        assert summary["lambda_time_s"] == 30.0 and summary["max_memory_mb"] is None
         assert summary["template_s"] >= 0.0
 
     def test_on_progress_ticks_on_lambda_fanout(self, manifest, monkeypatch):

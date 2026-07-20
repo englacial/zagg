@@ -103,6 +103,13 @@ class TestBuildRecord:
         assert rec["gb_seconds"] == pytest.approx(40.0)
         assert rec["est_cost_usd"] == pytest.approx(40.0 * 0.0000133334)
 
+    def test_unknown_arch_falls_back_to_default_rate(self):
+        # The record prices via the #298 arch table; an unmapped arch uses the
+        # flat default rate instead of raising in a worker.
+        cfg = {"memory_mb": 1024, "arch": "riscv64", "function_variant": "f"}
+        rec = _record(duration=10.0, lambda_config=cfg)
+        assert rec["est_cost_usd"] == pytest.approx(10.0 * 0.0000133334)
+
     def test_invoked_by_copied_verbatim(self):
         ident = {"arn": "arn:aws:sts::123:assumed-role/x/y", "userid": "AROA:me"}
         assert _record(invoked_by=ident)["invoked_by"] == ident
