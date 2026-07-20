@@ -96,6 +96,11 @@ class TestCanonicalization:
         cfg = _cfg()
         cfg.worker = {"memory": 8192, "extra_disk": True}
         assert semantic_hash(cfg) == base
+        # emit_cell_ids is the issue #304 transition hatch, not identity (F4):
+        # the core reads only the grid type/scheme, so it drops out.
+        cfg = _cfg()
+        cfg.output["grid"]["emit_cell_ids"] = True
+        assert semantic_hash(cfg) == base
 
     def test_semantic_edits_always_change_hash(self):
         base = semantic_hash(_cfg())
@@ -181,6 +186,35 @@ class TestCanonicalization:
         zero_valued = _cfg()
         zero_valued.data_source["quality_filter"] = {"dataset": "/q", "value": 0}
         assert semantic_hash(zero_valued) != semantic_hash(absent)
+
+    def test_golden_hash_pin(self):
+        # F4: a fully-inline config with fixed dicts, pinned to its exact
+        # digest. This catches accidental canonicalization drift — any change
+        # to key ordering, null pruning, the packaging-key sets, or the JSON
+        # separators would move this hash, so an unintended edit fails loudly.
+        cfg = PipelineConfig(
+            data_source={
+                "reader": "h5coro",
+                "groups": ["gt1l", "gt2l"],
+                "variables": {"h_li": "/land_ice_segments/h_li"},
+                "coordinates": {
+                    "latitude": "/land_ice_segments/latitude",
+                    "longitude": "/land_ice_segments/longitude",
+                },
+                "quality_filter": {"dataset": "/land_ice_segments/atl06_quality_summary"},
+            },
+            aggregation={
+                "handoff": "arrow",
+                "variables": {
+                    "count": {"function": "len", "source": "h_li", "dtype": "int32"},
+                    "h_mean": {"function": "mean", "source": "h_li", "dtype": "float32"},
+                },
+            },
+            output={"grid": {"type": "healpix", "parent_order": 6, "child_order": 12}},
+        )
+        assert semantic_hash(cfg) == (
+            "c17f7523ffb21e7b5a33d092f4ab12eaf805b1f88117f592132805458f354f86"
+        )
 
     def test_fingerprint_rejects_short_input(self):
         with pytest.raises(ValueError, match="not a semantic hash"):
