@@ -2051,9 +2051,10 @@ def test_hive_config_expected_counts_root_moc_optional():
     # The committed hive arm's model: per-shard DATA is exact (11 objects/leaf,
     # the sharded-write-bypass tripwire), but the store-root coverage.moc is a
     # fail-open, regenerable D9 cache (runner.write_root_coverage) that may be
-    # present OR absent -- so store-root metadata is a [1, 3] window (the
-    # morton_hive.json manifest always; +coverage.moc and the run stats parquet
-    # when they land) and the total is [14, 16]. A real bypass still fails on
+    # present OR absent -- so store-root metadata is a [1, 4] window (the
+    # morton_hive.json manifest always; +coverage.moc, the run stats parquet,
+    # and aggregation.yaml when they land) and the total is [12, 15]. A real
+    # bypass still fails on
     # the exact per-shard count.
     import bench_objects
 
