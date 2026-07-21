@@ -703,7 +703,9 @@ class TestSpillWorkerSingleBlock:
         assert timings["spill_bytes"] > 0
         assert timings["spill_write_s"] >= 0
         assert timings["spill_read_s"] >= 0
-        assert timings["spill_reduce_s"] >= 0
+        # Single-block regime never enters _fold_block, so the reduce-CPU split
+        # is deterministically zero here (the multi-block case asserts > 0).
+        assert timings["spill_reduce_s"] == 0.0
 
 
 class TestSpillWorkerMultiBlock:
