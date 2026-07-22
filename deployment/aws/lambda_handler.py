@@ -40,6 +40,16 @@ Event payload (default / process mode):
         record so leaf sidecars join back to the run-level stats parquet
         (whose object name carries the same id). Absent -> the stats record
         carries null.
+    "submap": dict (optional, issue #300, hive only) -- {"grid_signature",
+        "metadata", "granules"} leaf sub-map fields: on success the worker
+        writes the unit's full ShardMap JSON sub-map (D22) sibling to the
+        stats sidecar via zagg.sweep.write_leaf_submap. The dispatcher
+        threads the {id, s3, https} granule entries here because the event's
+        bare granule_urls can't reconstruct them; size-gated dispatcher-side
+        (dropped when it would push an async event over the 256 KB cap).
+        Absent -> no write (old dispatchers keep working). The raster
+        process_raster mode carries the same block minus "granules" (its
+        events already ship the entries).
     "result_url": str (optional, issue #151) -- where to ALSO write this
         invocation's response envelope as JSON (e.g.
         "s3://bucket/out.zarr.status/<run_id>/<shard_label>.json", where the
@@ -109,6 +119,20 @@ dispatcher fails fast with a redeploy message before any worker runs. The body
 echoes the deployed zagg version; the handler also runs the READ-ONLY
 zagg.hive.validate_manifest against any existing root so an incompatible rerun
 refuses up front (D2).
+
+Sweep mode (unified rollup sweep, issue #300 — the D8 worker-invoke transport
+for the D22 second pass; fire-and-forget Event invoke from the dispatcher at
+end of run, like coverage mode; also invocable ad hoc):
+{
+    "mode": "sweep",
+    "store_path": str,
+    "leaves": [[shard_key, window-or-null], ...] (optional) -- the run's
+        completed leaves, inline when they fit the async payload budget,
+    "discover": bool (optional) -- re-derive the work set from the store's
+        run-record parquets instead (zagg.sweep.discover_leaves; sent when
+        the leaves list would overflow the 256 KB Event cap),
+    "output_credentials": dict (optional, same shape as process mode),
+}
 
 Stats mode (run-level stats parquet, issue #313 — the D8 worker-invoke
 transport for the issue #297 run record; fire-and-forget Event invoke from
@@ -507,6 +531,7 @@ def lambda_handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
     creates the zarr template; ``mode="finalize"`` consolidates metadata;
     ``mode="ping"`` is the hive pre-fan-out preflight (issue #252);
     ``mode="coverage"`` writes the store-root ``coverage.moc`` (issue #200);
+    ``mode="sweep"`` folds the D22 rollup families worker-side (issue #300);
     ``mode="extract"`` extracts chunk-boundary geometry parquets (issue #148);
     ``mode="process_event"`` runs the temporal/event worker (issue #12).
     """
@@ -525,6 +550,8 @@ def lambda_handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
         return _handle_ping(event)
     if mode == "coverage":
         return _handle_coverage(event)
+    if mode == "sweep":
+        return _handle_sweep(event)
     if mode == "stats":
         return _handle_stats(event)
     # Extract mode returns directly: the result_url mirror below is for the
@@ -915,6 +942,50 @@ def _handle_coverage(event: Dict[str, Any]) -> Dict[str, Any]:
         return {"statusCode": 500, "body": json.dumps({"error": str(e), "mode": "coverage"})}
 
 
+def _handle_sweep(event: Dict[str, Any]) -> Dict[str, Any]:
+    """Run the unified rollup sweep worker-side (issue #300, D8 transport).
+
+    Posted fire-and-forget (``InvocationType="Event"``) by the Lambda-path
+    dispatcher at end of run — the D8 orchestrator-no-write rule means the
+    dispatcher cannot PUT rollups itself, so the worker role folds them,
+    exactly like the root ``coverage.moc``. The work set rides inline as
+    ``leaves`` (``[[shard_key, window], ...]``) when it fits the async
+    budget; ``discover: true`` has the worker re-derive it from the store's
+    run records (the D22 discovery path). Nobody reads this response on the
+    Event invoke; errors log and fail open — every rollup is a regenerable
+    cache (D9) and ``python -m zagg.sweep`` is the manual backstop.
+    """
+    from zagg.sweep import discover_leaves, run_sweep
+
+    logger.info(f"Sweep mode: folding rollups at {event.get('store_path')}")
+    try:
+        store_kwargs = _output_store_kwargs(event)
+        if event.get("leaves") is not None:
+            leaves = [(int(key), window) for key, window in event["leaves"]]
+        else:
+            leaves = discover_leaves(event["store_path"], store_kwargs=store_kwargs)
+        if not leaves:
+            return {
+                "statusCode": 200,
+                "body": json.dumps({"ok": True, "mode": "sweep", "n_leaves": 0}),
+            }
+        summary = run_sweep(event["store_path"], leaves, store_kwargs=store_kwargs)
+        return {
+            "statusCode": 200,
+            "body": json.dumps(
+                {
+                    "ok": True,
+                    "mode": "sweep",
+                    "n_leaves": summary["n_leaves"],
+                    "families": summary["families"],
+                }
+            ),
+        }
+    except Exception as e:
+        logger.exception(e)
+        return {"statusCode": 500, "body": json.dumps({"error": str(e), "mode": "sweep"})}
+
+
 def _handle_stats(event: Dict[str, Any]) -> Dict[str, Any]:
     """Write the run-level stats parquet at the store root (issue #313).
 
@@ -1225,6 +1296,7 @@ def _handle_process_raster(event: Dict[str, Any]) -> Dict[str, Any]:
                 granule_ids=raster_granule_ids(event["granules"]),
                 invoked_by=event.get("invoked_by"),
                 run_id=event.get("run_id"),
+                window=(event.get("window") or {}).get("label"),
                 lambda_config=lambda_env(),
             )
             body["stats"] = record
@@ -1241,6 +1313,34 @@ def _handle_process_raster(event: Dict[str, Any]) -> Dict[str, Any]:
                     write_sidecar(leaf, record, **_output_store_kwargs(event))
                 except Exception as e:
                     logger.warning(f"stats sidecar write failed (fail-open, issue #297): {e}")
+                # Leaf sub-map (issue #300, D22): full ShardMap JSON next to
+                # the stats sidecar. Raster events already carry the unit's
+                # ShardMap entries in ``granules``; the ``submap`` block adds
+                # the catalog identity a worker cannot derive. Absent block
+                # (old dispatcher) -> no write, fail-open like the sidecar.
+                submap = event.get("submap")
+                if submap:
+                    try:
+                        from zagg.sweep import submap_emittable, write_leaf_submap
+
+                        window = event.get("window")
+                        if submap_emittable(submap["grid_signature"], event["granules"]):
+                            write_leaf_submap(
+                                event["store_path"],
+                                shard_key,
+                                event["granules"],
+                                grid_signature=submap["grid_signature"],
+                                metadata=submap.get("metadata"),
+                                window=window["label"] if window else None,
+                                store_kwargs=_output_store_kwargs(event),
+                            )
+                        else:
+                            logger.debug(
+                                f"leaf sub-map skipped for shard {shard_key}: non-HEALPix "
+                                f"grid or id-less entries (unmergeable, issue #300)"
+                            )
+                    except Exception as e:
+                        logger.warning(f"leaf sub-map write failed (fail-open, issue #300): {e}")
             return {"statusCode": 200, "body": json.dumps(body)}
 
         time_index = {k: int(v) for k, v in event["time_index"].items()}
@@ -1645,6 +1745,7 @@ def _handle_process(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
             granule_ids=event.get("granule_urls"),
             invoked_by=event.get("invoked_by"),
             run_id=event.get("run_id"),
+            window=(event.get("window") or {}).get("label"),
             lambda_config=lambda_env(),
         )
         metadata["stats"] = record
@@ -1659,6 +1760,35 @@ def _handle_process(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
                 write_sidecar(leaf, record, **_output_store_kwargs(event))
             except Exception as e:
                 logger.warning(f"stats sidecar write failed (fail-open, issue #297): {e}")
+            # Leaf sub-map (issue #300, D22): full ShardMap JSON next to the
+            # stats sidecar. The event's bare granule_urls can't reconstruct
+            # the ShardMap entries, so the dispatcher threads them (plus the
+            # catalog identity) in the size-gated ``submap`` block; absent
+            # (old dispatcher, or dropped for the async cap) -> no write.
+            submap = event.get("submap")
+            if submap:
+                try:
+                    from zagg.sweep import submap_emittable, write_leaf_submap
+
+                    window = event.get("window")
+                    granules = submap.get("granules") or []
+                    if submap_emittable(submap["grid_signature"], granules):
+                        write_leaf_submap(
+                            store_path,
+                            int(shard_key),
+                            granules,
+                            grid_signature=submap["grid_signature"],
+                            metadata=submap.get("metadata"),
+                            window=window["label"] if window else None,
+                            store_kwargs=_output_store_kwargs(event),
+                        )
+                    else:
+                        logger.debug(
+                            f"leaf sub-map skipped for shard {shard_key}: non-HEALPix grid "
+                            f"or id-less entries (unmergeable, issue #300)"
+                        )
+                except Exception as e:
+                    logger.warning(f"leaf sub-map write failed (fail-open, issue #300): {e}")
 
         # Log structured result
         logger.info(

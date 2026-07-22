@@ -44,6 +44,7 @@ from zagg.config import (
     get_pipeline_type,
     get_store_layout,
     get_store_path,
+    get_sweep,
     get_windowing,
 )
 from zagg.dispatch import (
@@ -819,6 +820,10 @@ class RasterStrategy:
                 output_endpoint_url=resolved_endpoint,
                 store_layout=store_layout,
                 dataset={"short_name": md.get("short_name"), "version": md.get("version")},
+                catalog_signature={
+                    "grid_signature": catalog_data.get("grid_signature"),
+                    "metadata": catalog_data.get("metadata"),
+                },
                 profile=profile,
                 invocation=invocation,
                 on_progress=on_progress,
@@ -953,6 +958,7 @@ class RasterStrategy:
                 metadata=meta,
                 granule_ids=raster_granule_ids(granules),
                 run_id=run_id,
+                window=window["label"] if window else None,
                 semantic_hash=run_semantic_hash,
             )
             meta["stats"] = record
@@ -970,6 +976,31 @@ class RasterStrategy:
                     )
                 except Exception as e:
                     logger.warning(f"stats sidecar write failed (fail-open, issue #297): {e}")
+                # Leaf sub-map (issue #300, D22): the unit's raster ShardMap
+                # entries as full ShardMap JSON, sibling to the stats sidecar
+                # (same in-process rationale as the aggregation local path).
+                try:
+                    from zagg.sweep import submap_emittable, write_leaf_submap
+
+                    sig = catalog_data["grid_signature"]
+                    if submap_emittable(sig, granules):
+                        write_leaf_submap(
+                            store_path,
+                            int(shard_key),
+                            granules,
+                            grid_signature=sig,
+                            metadata=catalog_data.get("metadata"),
+                            window=window["label"] if window else None,
+                            spec=manifest["spec"] if manifest else None,
+                            store_kwargs=store_kwargs,
+                        )
+                    else:
+                        logger.debug(
+                            f"leaf sub-map skipped for shard {shard_key}: non-HEALPix grid "
+                            f"or id-less entries (unmergeable, issue #300)"
+                        )
+                except Exception as e:
+                    logger.warning(f"leaf sub-map write failed (fail-open, issue #300): {e}")
             return meta, stage_stats, write_s
 
         stage_max: dict = {}
@@ -1049,6 +1080,18 @@ class RasterStrategy:
         run_stats_path = _write_run_stats(
             store_path, rows, run_id=run_id, store_kwargs=store_kwargs
         )
+        # End-of-run rollup sweep (issue #300): in-process on the local
+        # backend (this process is the worker — see _run_local's note; D8
+        # constrains only the Lambda paths). Only units that wrote a leaf
+        # contribute work; fail-open inside sweep_after_run (D9).
+        if store_layout == "hive" and get_sweep(config):
+            from zagg.sweep import leaves_from_stats_records, sweep_after_run
+
+            leaves = leaves_from_stats_records(
+                [m.get("stats") for m in ok_metas if m.get("leaf_written")]
+            )
+            if leaves:
+                sweep_after_run(store_path, leaves, store_kwargs=store_kwargs)
         # Per-shard isolation lets one bad shard be counted and skipped, but a
         # run where EVERY shard raised (e.g. a config band whose ``asset`` is
         # absent from every granule) would otherwise return a success-shaped,
@@ -1100,6 +1143,7 @@ class RasterStrategy:
         output_endpoint_url,
         store_layout="flat",
         dataset=None,
+        catalog_signature=None,
         profile=False,
         invocation="async",
         on_progress=None,
@@ -1277,6 +1321,12 @@ class RasterStrategy:
                 # byte-identical to pre-#247 runs.
                 if window is not None:
                     ev["window"] = window
+                # Leaf sub-map fields (issue #300, D22): raster events already
+                # carry the unit's full ShardMap entries in ``granules``, so
+                # only the catalog identity rides here; the worker writes the
+                # full ShardMap JSON sub-map next to the leaf on success.
+                if catalog_signature is not None:
+                    ev["submap"] = catalog_signature
             else:
                 keys = {e.get("time_key") or e.get("datetime") for e in granules if e.get("assets")}
                 ev["time_index"] = {k: time_index[k] for k in keys}
@@ -1438,6 +1488,25 @@ class RasterStrategy:
             output_creds_event=output_creds_event,
             store_kwargs=_output_store_kwargs(output_creds_event, region),
         )
+        # End-of-run rollup sweep (issue #300): D8 worker-invoke transport,
+        # mirroring the aggregation lambda path — one fire-and-forget
+        # mode="sweep" Event invoke, fail-open (D9; the CLI backstops).
+        if store_layout == "hive" and get_sweep(config):
+            try:
+                from zagg.sweep import leaves_from_stats_records
+
+                leaves = leaves_from_stats_records([b.get("stats") for _k, b in ok_units])
+                if leaves:
+                    _invoke_lambda_sweep(
+                        client,
+                        function_name,
+                        store_path,
+                        leaves,
+                        output_creds_event=output_creds_event,
+                    )
+                    logger.info(f"Dispatched rollup sweep ({len(leaves)} leaves, fire-and-forget)")
+            except Exception as e:
+                logger.warning(f"rollup sweep dispatch failed (fail-open, D9): {e}")
         if cells and errors == len(cells):
             raise RuntimeError(f"all {errors} raster shard(s) failed; last error: {last_error}")
         # Worker telemetry rollup (issue #250): billed durations and peak RSS,
@@ -2745,6 +2814,7 @@ def _run_local(
                 metadata=meta,
                 granule_ids=_resolve_urls(records, driver),
                 run_id=run_id,
+                window=window["label"] if window else None,
                 semantic_hash=run_semantic_hash,
             )
             meta["stats"] = record
@@ -2760,6 +2830,33 @@ def _run_local(
                     write_sidecar(leaf, record, spec=manifest["spec"], **store_kwargs)
                 except Exception as e:
                     logger.warning(f"stats sidecar write failed (fail-open, issue #297): {e}")
+                # Leaf sub-map (issue #300, D22): the unit's ShardMap entries as
+                # full ShardMap JSON, sibling to the stats sidecar. The local
+                # "worker" is in-process, so the catalog fields are in scope
+                # (the Lambda path threads them via the event's submap block).
+                # Fail-open, like the sidecar.
+                try:
+                    from zagg.sweep import submap_emittable, write_leaf_submap
+
+                    sig = catalog_data["grid_signature"]
+                    if submap_emittable(sig, records):
+                        write_leaf_submap(
+                            store_path,
+                            int(shard_key),
+                            records,
+                            grid_signature=sig,
+                            metadata=catalog_data.get("metadata"),
+                            window=window["label"] if window else None,
+                            spec=manifest["spec"],
+                            store_kwargs=store_kwargs,
+                        )
+                    else:
+                        logger.debug(
+                            f"leaf sub-map skipped for shard {shard_key}: non-HEALPix grid "
+                            f"or id-less entries (unmergeable, issue #300)"
+                        )
+                except Exception as e:
+                    logger.warning(f"leaf sub-map write failed (fail-open, issue #300): {e}")
             return {"shard_key": shard_key, "ok": True, "meta": meta}
         except Exception as e:
             return {"shard_key": shard_key, "ok": False, "error": e}
@@ -2879,6 +2976,17 @@ def _run_local(
         for key, exc in stats_failures
     ]
     _write_run_stats(store_path, rows, run_id=run_id, store_kwargs=store_kwargs, summary=summary)
+    # End-of-run rollup sweep (issue #300): the LOCAL dispatcher runs it
+    # in-process — this process is also the worker and already PUTs every
+    # leaf with these credentials, so the D8 orchestrator-no-write rule
+    # (which sends the Lambda paths through a mode="sweep" worker invoke)
+    # doesn't constrain it. Fail-open inside sweep_after_run (D9).
+    if store_layout == "hive" and get_sweep(config):
+        from zagg.sweep import leaves_from_stats_records, sweep_after_run
+
+        leaves = leaves_from_stats_records([m.get("stats") for m in report.results])
+        if leaves:
+            sweep_after_run(store_path, leaves, store_kwargs=store_kwargs)
     logger.info(
         f"Done: {report.cells_with_data} cells, {report.total_obs:,} obs, {report.cells_error} errors, {wall_time:.1f}s"
     )
@@ -3116,6 +3224,16 @@ def _run_lambda(
         granule_urls = _resolve_urls(records, "s3")
         ds = _clamped_data_source(config.data_source, len(granule_urls))
         cell_config_dict = {**config_dict, "data_source": ds} if ds is not None else config_dict
+        # Leaf sub-map fields (issue #300, D22): the worker writes the full
+        # ShardMap JSON sub-map at the leaf prefix on success, but the event's
+        # bare granule_urls can't reconstruct the {id, s3, https} entries — so
+        # the unit's entries + the catalog identity ride a dedicated block
+        # (size-gated in _invoke_lambda_cell; dropped, never fatal).
+        submap = {
+            "grid_signature": catalog_data["grid_signature"],
+            "metadata": catalog_data.get("metadata"),
+            "granules": records,
+        }
         return _invoke_lambda_cell(
             state["lambda_client"],
             grid.block_index(int(shard_key)),
@@ -3135,6 +3253,7 @@ def _run_lambda(
             label=label,
             invoked_by=invoked_by,
             run_id=run_id,
+            submap=submap,
             **extra,
         )
 
@@ -3506,6 +3625,34 @@ def _run_lambda(
         summary=summary,
         inline_rows=stats_inline_rows,
     )
+    # End-of-run rollup sweep (issue #300): the Lambda dispatcher never PUTs
+    # (D8 standing rule), so the sweep rides ONE fire-and-forget mode="sweep"
+    # worker Event invoke — async, retries-0, fail-open (D9: rollups are
+    # caches; `python -m zagg.sweep` is the regeneration backstop). Leaves
+    # come from the envelope stats records; a stale deployed worker's
+    # record-less envelope simply contributes no leaf.
+    if get_store_layout(config) == "hive" and get_sweep(config):
+        try:
+            from zagg.sweep import leaves_from_stats_records
+
+            leaves = leaves_from_stats_records(
+                [
+                    (r.get("body") or {}).get("stats")
+                    for r in report.results
+                    if r.get("status_code") == 200 and not r.get("error")
+                ]
+            )
+            if leaves:
+                _invoke_lambda_sweep(
+                    state["lambda_client"],
+                    function_name,
+                    store_path,
+                    leaves,
+                    output_creds_event=output_creds_event,
+                )
+                logger.info(f"Dispatched rollup sweep ({len(leaves)} leaves, fire-and-forget)")
+        except Exception as e:
+            logger.warning(f"rollup sweep dispatch failed (fail-open, D9): {e}")
     logger.info(
         f"Done: {report.cells_with_data} cells, {report.total_obs:,} obs, {report.cells_error} errors, {wall_time:.1f}s"
     )
@@ -4604,6 +4751,38 @@ def _invoke_lambda_coverage(
     )
 
 
+def _invoke_lambda_sweep(lambda_client, function_name, store_path, leaves, output_creds_event=None):
+    """Fire-and-forget end-of-run rollup sweep invoke (issue #300, D8).
+
+    ``InvocationType="Event"`` (async, retries-0 semantics, nothing blocks on
+    it and no response is read) — the Lambda-path dispatcher never PUTs to
+    the store (the D8 standing rule), so the sweep runs worker-side exactly
+    like the root ``coverage.moc``'s ``mode="coverage"`` leg. The run's
+    ``(shard_key, window)`` leaves ride inline when they fit the async
+    budget; an oversized set falls back to ``discover: true`` — the worker
+    re-derives the work set from the store's run records (the D22 discovery
+    path). Ordering caveat since issue #313 moved the run-record write behind
+    its own fire-and-forget ``mode="stats"`` invoke: the two Event invokes
+    race, so a ``discover`` fallback may read only earlier runs' records and
+    miss this run's leaves — accepted (fail-open): the oversized case is
+    rare, and the next hook run or the manual CLI backstop
+    (``python -m zagg.sweep``) folds anything missed. Failure is harmless by
+    design: rollups are regenerable caches (D9).
+    """
+    event: dict = {"mode": "sweep", "store_path": store_path}
+    if output_creds_event is not None:
+        event["output_credentials"] = output_creds_event
+    event["leaves"] = [[int(key), window] for key, window in leaves]
+    if len(json.dumps(event)) > _ASYNC_PAYLOAD_CAP_BYTES:
+        del event["leaves"]
+        event["discover"] = True
+    lambda_client.invoke(
+        FunctionName=function_name,
+        InvocationType="Event",
+        Payload=json.dumps(event),
+    )
+
+
 def _invoke_lambda_cell(
     lambda_client,
     chunk_idx,
@@ -4629,6 +4808,7 @@ def _invoke_lambda_cell(
     label=None,
     invoked_by=None,
     run_id=None,
+    submap=None,
 ):
     """Invoke Lambda for a single cell with retry logic.
 
@@ -4654,6 +4834,12 @@ def _invoke_lambda_cell(
     connection sits idle while the shard runs, so long shards survive NAT idle
     timeouts (GitHub-hosted runners sever synchronous invokes at ~4 min). When
     ``None`` (legacy sync path) the invoke is byte-identical to before.
+    ``submap`` (issue #300) forwards the unit's leaf sub-map fields
+    (``grid_signature``/``metadata``/``granules`` — the ShardMap entries the
+    worker cannot derive from bare urls) so the worker writes the D22 full
+    ShardMap JSON sub-map next to the leaf; size-gated below (dropped, never
+    fatal, when it would push an async event over the 256 KB cap) and omitted
+    (``None``) the event stays byte-identical.
     """
     wall_start = time.time()
 
@@ -4713,6 +4899,20 @@ def _invoke_lambda_cell(
     # rather than letting every attempt fail on Lambda's raw
     # RequestEntityTooLargeException (issue #151).
     payload = json.dumps(event)
+    # Leaf sub-map block (issue #300): attached only when it FITS — a unit
+    # whose granule entries would push an async event over the cap keeps its
+    # pre-#300 payload (the sub-map is a regenerable D9 artifact; the manual
+    # sweep CLI is the backstop), so the cap gate below can never start
+    # rejecting a run that dispatched fine before.
+    if submap is not None:
+        with_submap = json.dumps({**event, "submap": submap})
+        if invocation_type != "Event" or len(with_submap) <= _ASYNC_PAYLOAD_CAP_BYTES:
+            payload = with_submap
+        else:
+            logger.debug(
+                f"cell {label or shard_key}: dropping submap block ({len(with_submap):,} "
+                f"bytes over the async budget); leaf sub-map deferred to the sweep CLI"
+            )
     if invocation_type == "Event" and len(payload) > _ASYNC_PAYLOAD_CAP_BYTES:
         raise ValueError(
             f"cell {label or shard_key} event payload is {len(payload):,} bytes, over the "

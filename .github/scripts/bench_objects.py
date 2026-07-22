@@ -151,10 +151,14 @@ def expected_object_counts(
         # Leaf fixed objects: leaf root zarr.json + group zarr.json + one
         # zarr.json per array, plus the in-leaf coverage.moc sidecar (written
         # for any populated leaf when the leaf has depth, i.e. child_order >
-        # parent_order), plus the stats.json sidecar SIBLING to the leaf
-        # (issue #297 — one per successful shard, in the leaf's node dir).
+        # parent_order), plus TWO node-dir siblings per successful shard: the
+        # stats.json sidecar (issue #297) and the shardmap.json leaf sub-map
+        # (issue #300 — same success gate; on the Lambda path it may be
+        # legitimately absent for a unit whose submap event block was dropped
+        # over the async payload cap, which then surfaces here as a mismatch
+        # worth seeing rather than a modeled window).
         sidecar = 1 if grid.child_order > grid.parent_order else 0
-        lo = hi = 3 + len(members) + sidecar
+        lo = hi = 4 + len(members) + sidecar
         for m in members:
             blocks = m["blocks_per_shard"]
             hi += blocks
@@ -228,6 +232,7 @@ def store_object_counts(
     per_shard: dict[str, int] = {}
     other: list[str] = []
     metadata = 0
+    rollups = 0
 
     if store_layout == "flat":
         _require_fullsphere(grid)
@@ -262,30 +267,49 @@ def store_object_counts(
             hive.shard_leaf_path("", int(k)).lstrip("/") + "/": grid.shard_label(int(k))
             for k in shard_keys
         }
-        # The per-shard stats sidecar (issue #297) is a SIBLING of the leaf
-        # .zarr — ``{node}/stats.json`` (``stats_{window}.json`` windowed) —
-        # so attribute it to the node's shard rather than pooling it in
+        # The per-shard stats sidecar (issue #297) and the leaf sub-map
+        # (issue #300) are SIBLINGS of the leaf .zarr — ``{node}/stats.json``
+        # and ``{node}/shardmap.json`` (``_{window}`` suffixed when windowed)
+        # — so attribute them to the node's shard rather than pooling them in
         # ``other``.
         stats_of = {
             prefix.rstrip("/").rsplit("/", 1)[0] + "/": label for prefix, label in leaf_of.items()
         }
         for key in keys:
-            if (
-                key in (hive.MANIFEST_NAME, hive.ROOT_COVERAGE_NAME, hive.AGGREGATION_CORE_NAME)
-                or _is_run_parquet(key)
-            ):
+            if key in (
+                hive.MANIFEST_NAME,
+                hive.ROOT_COVERAGE_NAME,
+                hive.AGGREGATION_CORE_NAME,
+            ) or _is_run_parquet(key):
                 metadata += 1
                 continue
+            # Leaf-prefix membership FIRST (issue #300 review): an object that
+            # lands INSIDE a leaf `.zarr/` prefix is that shard's data object —
+            # rollup-named or not — so it counts into ``per_shard`` and trips
+            # the exact #215 per-shard guard. Only keys OUTSIDE every leaf
+            # prefix are eligible for the rollup / sibling buckets below.
             for prefix, label in leaf_of.items():
                 if key.startswith(prefix):
                     per_shard[label] = per_shard.get(label, 0) + 1
                     break
             else:
+                # Sweep rollups (issue #300): `{family}.rollup.json` at a digit
+                # node — second-pass D9 caches with their own bucket, never
+                # write-path objects. Legit rollups sit at `{node}/` (siblings
+                # of the leaf `.zarr/`), so classifying them here — after the
+                # leaf-membership check has failed — leaves the per-shard guard
+                # untouched while a MISPLACED in-leaf rollup falls to the
+                # attribution above and trips #215 instead of vanishing.
+                if key.endswith(".rollup.json"):
+                    rollups += 1
+                    continue
                 node, _, name = key.rpartition("/")
-                is_stats = name == "stats.json" or (
-                    name.startswith("stats_") and name.endswith(".json")
+                is_sibling = any(
+                    name == f"{stem}.json"
+                    or (name.startswith(f"{stem}_") and name.endswith(".json"))
+                    for stem in ("stats", "shardmap")
                 )
-                if is_stats and node + "/" in stats_of:
+                if is_sibling and node + "/" in stats_of:
                     per_shard[stats_of[node + "/"]] = per_shard.get(stats_of[node + "/"], 0) + 1
                 else:
                     other.append(key)
@@ -296,6 +320,7 @@ def store_object_counts(
         "objects_total": len(keys),
         "objects_metadata": metadata,
         "objects_per_shard": per_shard,
+        "objects_rollups": rollups,
         "objects_other": len(other),
         "other_keys": other[:20],
     }
@@ -352,7 +377,13 @@ def object_count_mismatch(measured: dict, expected: dict) -> str | None:
     know every object the run writes.
     """
     problems = []
-    total = measured["objects_total"]
+    # Sweep rollups (issue #300) are second-pass D9 caches, not write-path
+    # objects: the end-of-run sweep may or may not have landed them by
+    # measurement time (fire-and-forget on Lambda), so they are tallied in
+    # their own bucket and excluded from the write-path total this model
+    # audits (the #215 bypass guard below is untouched — rollups never live
+    # inside a leaf prefix).
+    total = measured["objects_total"] - measured.get("objects_rollups", 0)
     meta = measured["objects_metadata"]
     meta_lo, meta_hi = expected["metadata_min"], expected["metadata"]
     if not (meta_lo <= meta <= meta_hi):

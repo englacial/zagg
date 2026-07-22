@@ -2048,12 +2048,14 @@ def test_run_target_threads_store_layout():
 
 
 def test_hive_config_expected_counts_root_moc_optional():
-    # The committed hive arm's model: per-shard DATA is exact (per-leaf count,
+    # The committed hive arm's model: per-shard DATA is exact (11 objects/leaf,
     # the sharded-write-bypass tripwire), but the store-root coverage.moc is a
     # fail-open, regenerable D9 cache (runner.write_root_coverage) that may be
-    # present OR absent -- so store-root metadata is a [1, 2] window (the
-    # morton_hive.json manifest always; +coverage.moc when it lands) and the
-    # total is [12, 13]. A real bypass still fails on the exact per-shard count.
+    # present OR absent -- so store-root metadata is a [1, 4] window (the
+    # morton_hive.json manifest always; +coverage.moc, the run stats parquet,
+    # and aggregation.yaml when they land) and the total is [12, 15]. A real
+    # bypass still fails on
+    # the exact per-shard count.
     import bench_objects
 
     from zagg.config import get_coverage_moc, get_store_layout, load_config
@@ -2067,18 +2069,18 @@ def test_hive_config_expected_counts_root_moc_optional():
     )
     # 3 arrays (morton/count/h_tdigest — no legacy cell_ids since the D16
     # flip, issue #304): leaf root+group zarr.json (2) + 3 array zarr.json +
-    # 3 sharded data objects + coverage sidecar + stats.json sibling
-    # (issue #297) = 10.
+    # 3 sharded data objects + coverage sidecar + stats.json AND
+    # shardmap.json siblings (issues #297/#300) = 11.
     # Store root: morton_hive.json (always) + coverage.moc (optional) + the
     # run stats parquet (optional, issue #297) + aggregation.yaml (optional,
     # issue #299) -> [1, 4].
     assert exp == {
         "metadata": 4,
         "metadata_min": 1,
-        "per_shard_min": 10,
-        "per_shard_max": 10,
-        "total_min": 11,
-        "total_max": 14,
+        "per_shard_min": 11,
+        "per_shard_max": 11,
+        "total_min": 12,
+        "total_max": 15,
         "exact": True,
     }
 
