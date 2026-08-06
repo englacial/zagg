@@ -116,10 +116,11 @@ def test_build_record_cost_per_100km2():
     assert rec["max_memory_mb"] == 1963.0  # threaded from the summary (issue #120)
     # The record is the series schema plus the JSON-only object-count keys
     # (issues #240/#362) that update_series's reindex deliberately drops.
+    # ``objects_mismatch`` is no longer among them -- it became a retained column
+    # in issue #365, so a recorded anomaly is explicable from the series alone.
     assert set(rec) == set(bench_metrics.RECORD_COLUMNS) | {
         "objects_per_shard",
         "objects_telemetry",
-        "objects_mismatch",
     }
 
 
@@ -182,9 +183,10 @@ def test_codec_column_is_last_and_threaded(monkeypatch):
     assert cols.index("codec") < cols.index("read") < cols.index("total_wall_s")
     # The wall breakdown (#180), read backend (#193), object counts (#240),
     # store layout (#240 phase 4), worker phase split (#250/#256), the
-    # streaming-mode/ephemeral axis (#272) and the worker-build provenance stamp
-    # (#341/#296) appended in that order.
-    assert cols[-17:] == [
+    # streaming-mode/ephemeral axis (#272), the worker-build provenance stamp
+    # (#341/#296), the netted write-path count (#362) and the tripwire verdict
+    # (#365) appended in that order.
+    assert cols[-18:] == [
         "total_wall_s",
         "setup_s",
         "fanout_s",
@@ -202,6 +204,7 @@ def test_codec_column_is_last_and_threaded(monkeypatch):
         "ephemeral_cost_usd",
         "variant_guard",
         "objects_write_path",
+        "objects_mismatch",
     ]
     g = HealpixGrid(parent_order=11, child_order=19)
     rec = bench_metrics.build_record(_summary(), grid=g, context={"codec": "sharded"})
@@ -665,8 +668,9 @@ def test_variant_guard_status_verified_and_base(tmp_path, monkeypatch):
 def test_variant_guard_column_is_in_the_series_schema():
     # Appended to the stable RECORD_COLUMNS schema so update_series's reindex
     # retains it (legacy rows read back null). No longer LAST: the issue #362
-    # netted-count column appended after it, per the same rule.
-    assert bench_metrics.RECORD_COLUMNS[-2] == "variant_guard"
+    # netted-count column and the issue #365 tripwire verdict appended after it,
+    # per the same rule.
+    assert bench_metrics.RECORD_COLUMNS[-3] == "variant_guard"
     rec = bench_metrics.build_record(
         _summary(), grid=HealpixGrid(11, 19), context={"target": "t", "variant_guard": "verified"}
     )
@@ -2191,21 +2195,23 @@ def test_objects_columns_are_last_and_threaded():
     # appended after the object counts in phase 4; the #250/#256 phase split
     # then the #272 streaming-mode/ephemeral axis appended after those).
     cols = bench_metrics.RECORD_COLUMNS
-    assert cols[-12:-9] == ["objects_total", "objects_expected", "store_layout"]
-    # The netted audited count (issue #362) is a SEPARATE column, appended last
-    # rather than redefining ``objects_total`` -- so a row written before it
-    # cannot be misread as having been audited on the netted figure.
-    assert cols[-1] == "objects_write_path"
+    assert cols[-13:-10] == ["objects_total", "objects_expected", "store_layout"]
+    # The netted audited count (issue #362) is a SEPARATE column, appended after
+    # them rather than redefining ``objects_total`` -- so a row written before it
+    # cannot be misread as having been audited on the netted figure. The tripwire
+    # verdict (issue #365) appended after that.
+    assert cols[-2:] == ["objects_write_path", "objects_mismatch"]
     g = HealpixGrid(parent_order=11, child_order=19)
     rec = bench_metrics.build_record(_summary(), grid=g, context={}, objects=_objects_payload())
     assert rec["objects_total"] == 10
     assert rec["objects_expected"] == 10
     assert rec["objects_write_path"] == 10  # nothing to net out in this payload
-    # per_shard/mismatch ride the metrics.json record only -- deliberately NOT
-    # series columns (update_series's reindex drops them).
+    # per_shard rides the metrics.json record only -- deliberately NOT a series
+    # column (update_series's reindex drops it). The mismatch verdict IS retained
+    # (issue #365), null on this clean payload.
     assert rec["objects_per_shard"] == {"1121121": 4}
     assert rec["objects_mismatch"] is None
-    assert "objects_per_shard" not in cols and "objects_mismatch" not in cols
+    assert "objects_per_shard" not in cols
     # No measurement (dry-run / legacy) -> null columns, not a crash.
     bare = bench_metrics.build_record(_summary(), grid=g, context={})
     assert bare["objects_total"] is None and bare["objects_expected"] is None
