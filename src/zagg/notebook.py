@@ -1,5 +1,8 @@
 """Notebook-facing dispatch wrapper: progress bar + rich run report (issue #298).
 
+:class:`StageTimer` (issue #328) is the shared stage-timing helper the three
+narrative notebooks print their summary table from.
+
 :func:`run` wraps :func:`zagg.runner.agg` with a per-shard progress bar driven
 by the runner's ``on_progress`` callback (one tick per completed work unit,
 with the running Lambda cost in the postfix) and returns a :class:`RunView`
@@ -19,11 +22,123 @@ from __future__ import annotations
 
 import html
 import logging
+import time
+from contextlib import contextmanager
+from typing import Iterator
 
 from zagg.config import PipelineConfig, get_pipeline_type, get_store_layout, get_windowing
 from zagg.dispatch import BENIGN_ERRORS, LAMBDA_ARCH, max_cost_usd
 
 logger = logging.getLogger(__name__)
+
+
+# ---------------------------------------------------------------------------
+# Stage timing (issue #328)
+# ---------------------------------------------------------------------------
+
+
+class StageTimer:
+    """Wall-clock stage timings + a summary table (issue #328).
+
+    The three narrative notebooks (query / write / read) each time their own
+    stages through one timer and print the same table, so pipeline latency is
+    comparable across runs and across the legs::
+
+        timer = StageTimer("query")
+        with timer.stage("CMR query"):
+            catalog = CMRSource().fetch(query)
+        with timer.stage("shard assignment"):
+            shardmap = ShardMap.build(catalog, grid)
+        print(timer.summary())    # text table; ``timer`` alone renders in Jupyter
+
+    Re-entering a stage name **accumulates** into it and counts the calls, which
+    is what the read leg's per-block ``fetch``/``decode``/``rasterize`` split
+    needs. Timing is ``time.perf_counter``; a stage that raises is still
+    recorded (the exception propagates unchanged). :meth:`as_dict` is the
+    machine-comparable form — the shape a later run-over-run series would key
+    on (wiring that up is out of scope here, issue #328 phase 4).
+
+    Value types in :attr:`stages` (and so in :meth:`as_dict`): ``seconds`` is a
+    ``float``, ``calls`` an ``int``. They share one mapping whose annotation
+    widens to ``float`` — mypy promotes ``int`` — so a consumer serializing the
+    snapshot should read ``calls`` as the integer count it is.
+    """
+
+    def __init__(self, label: str = "run"):
+        self.label = label
+        #: Insertion-ordered ``{stage: {"seconds": float, "calls": int}}``.
+        self.stages: dict[str, dict[str, float]] = {}
+
+    @contextmanager
+    def stage(self, name: str) -> Iterator[None]:
+        """Time the block, accumulating into ``name``."""
+        start = time.perf_counter()
+        try:
+            yield
+        finally:
+            elapsed = time.perf_counter() - start
+            entry = self.stages.setdefault(name, {"seconds": 0.0, "calls": 0})
+            entry["seconds"] += elapsed
+            entry["calls"] += 1
+
+    @property
+    def total_s(self) -> float:
+        """Sum of every stage's accumulated seconds."""
+        return sum(e["seconds"] for e in self.stages.values())
+
+    def as_dict(self) -> dict:
+        """``{"label", "stages": {name: {seconds: float, calls: int}}, "total_s"}``."""
+        return {
+            "label": self.label,
+            "stages": {k: dict(v) for k, v in self.stages.items()},
+            "total_s": self.total_s,
+        }
+
+    def _rows(self) -> list[tuple[str, int, float, float]]:
+        total = self.total_s
+        return [
+            (
+                name,
+                int(e["calls"]),
+                e["seconds"],
+                (100.0 * e["seconds"] / total) if total else 0.0,
+            )
+            for name, e in self.stages.items()
+        ]
+
+    def __repr__(self) -> str:
+        return f"StageTimer({self.label!r}: {len(self.stages)} stages, {self.total_s:.2f}s)"
+
+    def summary(self) -> str:
+        """The stage table as plain text (the notebooks ``print`` this)."""
+        if not self.stages:
+            return f"{self.label}: no stages timed"
+        width = max(len(name) for name in self.stages)
+        width = max(width, len("stage"))
+        head = f"{'stage':<{width}}  {'calls':>5}  {'seconds':>9}  {'%':>6}"
+        lines = [f"{self.label} stage timings", head, "-" * len(head)]
+        for name, calls, seconds, pct in self._rows():
+            lines.append(f"{name:<{width}}  {calls:>5d}  {seconds:>9.3f}  {pct:>5.1f}%")
+        lines.append("-" * len(head))
+        lines.append(f"{'total':<{width}}  {'':>5}  {self.total_s:>9.3f}  {100.0:>5.1f}%")
+        return "\n".join(lines)
+
+    def _repr_html_(self) -> str:
+        esc = html.escape
+        out = [f"<div><h4>{esc(self.label)} stage timings</h4>"]
+        if not self.stages:
+            return out[0] + "<p>no stages timed</p></div>"
+        out.append("<table><tr><th>stage</th><th>calls</th><th>seconds</th><th>%</th></tr>")
+        for name, calls, seconds, pct in self._rows():
+            out.append(
+                f"<tr><td>{esc(name)}</td><td>{calls}</td>"
+                f"<td>{seconds:.3f}</td><td>{pct:.1f}%</td></tr>"
+            )
+        out.append(
+            f"<tr><td><b>total</b></td><td></td><td><b>{self.total_s:.3f}</b></td><td></td></tr>"
+        )
+        out.append("</table></div>")
+        return "".join(out)
 
 
 # ---------------------------------------------------------------------------

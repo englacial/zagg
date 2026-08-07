@@ -13,6 +13,7 @@ extra:
 nav:
   - "index.md"
   - "quickstart.md"
+  - "Notebooks": "notebooks.md"
   - "Strict-AOI mask": "aoi_mask.md"
   - "Virtual index": "virtual_index.md"
   - "API":

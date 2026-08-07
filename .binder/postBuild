@@ -2,11 +2,14 @@
 # repo2docker runs this after building the conda environment.
 #
 # Install zagg from the checked-out repo together with its ``analysis`` extra
-# (the notebook runtime: jupyter/notebook, xarray, cartopy, matplotlib, ...),
-# the ``catalog`` extra (stac-geoparquet), which the anonymous CMR-STAC
-# catalog-build cells in jupyterhub_example / shardmap_viewer need, and the
-# ``viz`` extra (ipyleaflet -- a pure-Python Jupyter widget) for the
-# shardmap_viewer notebook's interactive map. Keeping the dependency set in
+# (the notebook runtime: jupyter/notebook, xarray, cartopy, matplotlib, tqdm,
+# ...), the ``catalog`` extra (stac-geoparquet), which the anonymous CMR-STAC
+# catalog-build cells in jupyterhub_example / shardmap_viewer /
+# 01_query_shardmap need, and the ``viz`` extra (ipyleaflet -- a pure-Python
+# Jupyter widget) for the shardmap_viewer notebook's interactive map. tqdm
+# (``analysis``, espg-ratified on issue #265 -- never in the ``lambda`` extra)
+# is what 02_dispatch_fleet's ``RunHandle.progress()`` bar needs. Keeping the
+# dependency set in
 # pyproject.toml's extras means the Binder image and a local
 # ``pip install "zagg[analysis,catalog,viz]"`` resolve the same way.
 #

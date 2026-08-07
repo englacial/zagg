@@ -180,3 +180,6 @@ occupancy mask and a shared `(offset, gain)` z-window per block (the
 [t-digest reader notebook](https://github.com/englacial/zagg/blob/main/notebooks/tdigest_reader_example.ipynb)
 walks through `read_tensors` and `read_raw_values` end to end on a self-contained
 synthetic store.
+
+To see the whole pipeline instead of one leg — query, write, and read, each
+timing its own stage — start at the [notebooks page](notebooks.md).

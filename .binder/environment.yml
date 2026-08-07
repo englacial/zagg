@@ -10,9 +10,19 @@
 # Only PyPI/conda-forge resolvable packages appear here: no ``git+`` URLs and no
 # spherely fork. The Binder-runnable notebooks read synthetic data, the public
 # anonymous source.coop store, or anonymous CMR-STAC granule *metadata*
-# (jupyterhub_example, shardmap_viewer) -- all of which use the default HEALPix
-# ``mortie`` backend, so the exact-S2 spherely SpatialIndex backend is never on
-# their import path.
+# (jupyterhub_example, shardmap_viewer, 01_query_shardmap) -- all of which use
+# the default HEALPix ``mortie`` backend, so the exact-S2 spherely SpatialIndex
+# backend is never on their import path.
+#
+# The narrative series (issue #328) is Binder-runnable in its DEFAULT mode only,
+# which is what the badges cover:
+#   * 01_query_shardmap  -- anonymous CMR-STAC query + an AOI file in the tree.
+#   * 02_dispatch_fleet  -- ``USE_REAL_FLEET = False``: an injected stub Lambda
+#     client, so no AWS account, no credentials, and no store traffic. The
+#     ``True`` branch needs a deployed fleet and is not a Binder path.
+#   * 03_read_tensors    -- ``SOURCE = "synthetic"``: writes a t-digest store to
+#     a temp directory with zagg's own write path, then reads it back. The
+#     ``"public"`` branch reads a published bucket and is not covered here.
 name: zagg-binder
 channels:
   - conda-forge

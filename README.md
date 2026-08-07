@@ -137,7 +137,19 @@ Adjust `GRID_SPACING` in the notebook to control output resolution.
 
 ## Example Notebooks
 
-The notebooks under `notebooks/` run on [Binder](https://mybinder.org/v2/gh/englacial/zagg/main?urlpath=lab/tree/notebooks) — no install, no credentials. They install `zagg[analysis]` via the `.binder/` conda config and read only synthetic in-notebook data or the **anonymous, public** [source.coop](https://source.coop/englacial/zagg/benchmarks) benchmark store.
+The notebooks under `notebooks/` run on [Binder](https://mybinder.org/v2/gh/englacial/zagg/main?urlpath=lab/tree/notebooks) — no install, no credentials. They install `zagg[analysis,catalog,viz]` via the `.binder/` conda config, and read only synthetic data (built in-notebook or into a temp directory), files in this git tree, **anonymous** NASA CMR-STAC granule *metadata*, or the **anonymous, public** [source.coop](https://source.coop/englacial/zagg/benchmarks) benchmark store.
+
+**The narrative series** — one pipeline end to end, each notebook timing its own stage so pipeline latency is tracked (issue [#328](https://github.com/englacial/zagg/issues/328)):
+
+| Notebook | Leg | Stages timed | Binder |
+|----------|-----|--------------|--------|
+| `01_query_shardmap.ipynb` | query | CMR query · catalog build · shard assignment | [![Binder](https://mybinder.org/badge_logo.svg)](https://mybinder.org/v2/gh/englacial/zagg/main?urlpath=lab/tree/notebooks/01_query_shardmap.ipynb) |
+| `02_dispatch_fleet.ipynb` | write | dispatch wall · fleet completion · per-phase worker splits | [![Binder](https://mybinder.org/badge_logo.svg)](https://mybinder.org/v2/gh/englacial/zagg/main?urlpath=lab/tree/notebooks/02_dispatch_fleet.ipynb) |
+| `03_read_tensors.ipynb` | read | fetch · decode · vertical rasterize | [![Binder](https://mybinder.org/badge_logo.svg)](https://mybinder.org/v2/gh/englacial/zagg/main?urlpath=lab/tree/notebooks/03_read_tensors.ipynb) |
+
+`02_dispatch_fleet.ipynb` runs on Binder in its **stub mode** — the fan-out is driven by an injected stub Lambda client, so the whole `zagg.client` API (futures, progress, error surfacing, the post-run tail) runs with no AWS account and no cost; `USE_REAL_FLEET = True` points the same cells at the deployed fleet. `03_read_tensors.ipynb` runs on Binder against a t-digest store it writes to a temp directory with zagg's own write path; `SOURCE = "public"` points the identical read cells at a published store.
+
+**The rest:**
 
 | Notebook | What it shows | Binder |
 |----------|---------------|--------|
@@ -171,6 +183,7 @@ zagg/
 
 ## Documentation
 
+- **[Notebooks](docs/notebooks.md)** — the stage-timed query → write → read narrative series, plus the reference notebooks
 - **[Architecture](docs/design/architecture.md)** — design philosophy, end-to-end flow diagram, key decisions
 - **[Schema](docs/design/schema.md)** — aggregation dispatch, extending with new statistics
 - **[API Reference](docs/api/catalog.md)** — catalog, processing, schema, auth modules

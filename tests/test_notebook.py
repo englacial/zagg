@@ -438,3 +438,90 @@ class TestCliGate:
         cli.main()
         assert called["agg"] is True
         assert "Max cost ceiling" not in capsys.readouterr().out
+
+
+class TestStageTimer:
+    """The shared narrative-notebook stage timer (issue #328)."""
+
+    def test_stages_record_in_order_with_calls(self):
+        timer = notebook.StageTimer("query")
+        with timer.stage("CMR query"):
+            pass
+        with timer.stage("catalog build"):
+            pass
+        assert list(timer.stages) == ["CMR query", "catalog build"]
+        assert all(e["calls"] == 1 for e in timer.stages.values())
+        assert all(e["seconds"] >= 0.0 for e in timer.stages.values())
+
+    def test_reentering_a_stage_accumulates(self):
+        # The read leg times fetch/decode/rasterize once per block, so repeated
+        # entries must sum into one row rather than overwrite it.
+        timer = notebook.StageTimer("read")
+        for _ in range(3):
+            with timer.stage("decode"):
+                pass
+        assert timer.stages["decode"]["calls"] == 3
+        assert len(timer.stages) == 1
+
+    def test_elapsed_tracks_real_time(self, monkeypatch):
+        ticks = iter([10.0, 10.25, 100.0, 100.75])
+        monkeypatch.setattr(notebook.time, "perf_counter", lambda: next(ticks))
+        timer = notebook.StageTimer()
+        with timer.stage("a"):
+            pass
+        with timer.stage("a"):
+            pass
+        assert timer.stages["a"]["seconds"] == pytest.approx(1.0)
+        assert timer.total_s == pytest.approx(1.0)
+
+    def test_a_raising_stage_is_still_recorded(self):
+        timer = notebook.StageTimer()
+        with pytest.raises(ValueError, match="boom"):
+            with timer.stage("fetch"):
+                raise ValueError("boom")
+        assert timer.stages["fetch"]["calls"] == 1
+
+    def test_as_dict_is_the_machine_comparable_form(self, monkeypatch):
+        ticks = iter([0.0, 2.0, 0.0, 6.0])
+        monkeypatch.setattr(notebook.time, "perf_counter", lambda: next(ticks))
+        timer = notebook.StageTimer("write")
+        with timer.stage("dispatch"):
+            pass
+        with timer.stage("fleet"):
+            pass
+        payload = timer.as_dict()
+        assert payload["label"] == "write"
+        assert payload["total_s"] == pytest.approx(8.0)
+        assert payload["stages"]["dispatch"] == {"seconds": pytest.approx(2.0), "calls": 1}
+        # A copy: mutating the snapshot must not touch the timer.
+        payload["stages"]["dispatch"]["seconds"] = 0.0
+        assert timer.stages["dispatch"]["seconds"] == pytest.approx(2.0)
+
+    def test_summary_table_carries_every_stage_and_a_total(self, monkeypatch):
+        ticks = iter([0.0, 1.0, 0.0, 3.0])
+        monkeypatch.setattr(notebook.time, "perf_counter", lambda: next(ticks))
+        timer = notebook.StageTimer("read")
+        with timer.stage("fetch"):
+            pass
+        with timer.stage("rasterize"):
+            pass
+        text = timer.summary()
+        assert "read stage timings" in text
+        assert "fetch" in text and "rasterize" in text
+        assert "4.000" in text  # the total row
+        assert "25.0%" in text and "75.0%" in text
+
+    def test_empty_timer_renders_without_dividing_by_zero(self):
+        timer = notebook.StageTimer("query")
+        assert timer.summary() == "query: no stages timed"
+        assert "no stages timed" in timer._repr_html_()
+        assert timer.total_s == 0.0
+        assert "0 stages" in repr(timer)
+
+    def test_html_repr_escapes_stage_names(self):
+        timer = notebook.StageTimer("read <x>")
+        with timer.stage("decode <b>"):
+            pass
+        html_out = timer._repr_html_()
+        assert "&lt;b&gt;" in html_out and "<b>decode" not in html_out
+        assert "&lt;x&gt;" in html_out
