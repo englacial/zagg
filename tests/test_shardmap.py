@@ -362,6 +362,262 @@ class TestMortieOrder:
         assert _resolve_mortie_order(None, grid) == 8
 
 
+def _intersect_mortie_serial(records, grid, all_shards, order, footprint="swath", product="ATL03"):
+    """The pre-#396 per-granule HEALPix path, verbatim -- the identity oracle.
+
+    Kept here rather than in ``shardmap.py`` so exactly one implementation ships,
+    while the batch rewire is still pinned against the logic it replaced:
+    ``morton_coverage_moc`` once per ring, ``moc_to_order`` + ``np.unique`` per
+    ring, a scalar ``in all_shards`` test per cell, and a ``dict.fromkeys`` dedup
+    per shard (``shardmap.py:307-340`` at ad8aa30, the merge-base of this PR).
+    """
+    from mortie import moc_to_order, morton_coverage_moc
+
+    from zagg.catalog.shardmap import _granule_footprints
+
+    out: dict = {}
+    parent_order = grid.parent_order
+    for i, rec in enumerate(records):
+        for rlats, rlons in _granule_footprints(rec, footprint, product):
+            try:
+                moc = np.asarray(morton_coverage_moc(rlats, rlons, order=order))
+            except Exception:
+                continue
+            if moc.size == 0:
+                continue
+            try:
+                shards = np.unique(moc_to_order(moc, parent_order))
+            except Exception:
+                continue
+            for s in shards.tolist():
+                s = int(s)
+                if s in all_shards:
+                    out.setdefault(s, []).append(i)
+    return {k: list(dict.fromkeys(v)) for k, v in out.items()}
+
+
+def _overlapping_catalog(n=12):
+    """n granules sliding west->east across SERC with overlapping footprints.
+
+    Neighbors overlap (0.02-deg windows every 0.008 deg), so granules on either
+    side of any batch-block boundary share shards -- the regroup must gather a
+    shard's granules across blocks, not just concatenate disjoint shard sets.
+    """
+    items = [_item(f"G{i:02d}", -76.62 + 0.008 * i, -76.60 + 0.008 * i) for i in range(n)]
+    return _catalog(items)
+
+
+class TestMortieBatch:
+    """The HEALPix mortie path is a batch call into mortie, not a granule loop (#396).
+
+    ``_intersect_mortie`` flattens every granule's rings into mortie's ragged
+    layout, covers them a block at a time via ``polygons_to_morton_mocs``, and
+    resolves shard membership with ``searchsorted`` instead of a scalar
+    ``in all_shards`` per cell. The pin is **exact identity** with the serial
+    oracle above -- not just the pair set but the per-shard granule *order*, so
+    the manifest a build writes is byte-identical to the pre-#396 one.
+    """
+
+    @pytest.fixture
+    def hp_grid(self):
+        return HealpixGrid(11, 17, layout="fullsphere")
+
+    @staticmethod
+    def _inputs(cat, grid, region=None):
+        from zagg.catalog.shardmap import _region_parts
+
+        records = cat.granule_records()
+        all_shards = {int(s) for s in grid.coverage(_region_parts(region, cat.metadata))}
+        return records, all_shards
+
+    def test_batch_equals_serial_swath(self, hp_grid):
+        cat = _overlapping_catalog()
+        records, all_shards = self._inputs(cat, hp_grid)
+        batch = shardmap._intersect_mortie(records, hp_grid, all_shards, order=11)
+        serial = _intersect_mortie_serial(records, hp_grid, all_shards, order=11)
+        assert len(serial) > 4, "fixture must span multiple shards"
+        assert any(len(v) > 1 for v in serial.values()), "fixture must share shards across granules"
+        assert batch == serial
+
+    def test_batch_equals_serial_beams(self):
+        # ``beams`` yields three corridor rings per granule (issue #65): the one
+        # case where the ring -> granule map does real work, since a granule's
+        # shards are the union over its rings and the batch is one ring per entry.
+        from zagg.catalog.shardmap import _granule_footprints
+
+        hp = HealpixGrid(12, 14, layout="fullsphere")
+        cat = _atl03_catalog(
+            [_swath_item(gid, lon, 38.89) for gid, lon in (("Ga", -76.52), ("Gb", -76.50))]
+        )
+        region = [
+            (
+                np.array([38.74, 38.74, 39.04, 39.04, 38.74]),
+                np.array([-76.62, -76.42, -76.42, -76.62, -76.62]),
+            )
+        ]
+        records, all_shards = self._inputs(cat, hp, region=region)
+        assert len(_granule_footprints(records[0], "beams", "ATL03")) == 3
+        kw = {"order": 14, "footprint": "beams", "product": "ATL03"}
+        batch = shardmap._intersect_mortie(records, hp, all_shards, **kw)
+        serial = _intersect_mortie_serial(records, hp, all_shards, **kw)
+        assert serial
+        assert batch == serial
+
+    def test_identity_holds_across_block_boundaries(self, hp_grid, monkeypatch):
+        # A block size of 5 over 12 overlapping granules puts cuts at 5/10, and
+        # neighbours straddle every cut, so shards must gather granules from more
+        # than one block -- and in record order, not block-concatenation order.
+        cat = _overlapping_catalog()
+        records, all_shards = self._inputs(cat, hp_grid)
+        serial = _intersect_mortie_serial(records, hp_grid, all_shards, order=11)
+        monkeypatch.setattr(shardmap, "_MOC_BATCH_RINGS", 5)
+        batch = shardmap._intersect_mortie(records, hp_grid, all_shards, order=11)
+        assert batch == serial
+        block_of = {i: i // 5 for i in range(len(records))}
+        assert any(len({block_of[i] for i in v}) >= 2 for v in batch.values()), (
+            "no shard drew granules from two blocks -- cross-block regroup unexercised"
+        )
+
+    def test_build_pair_identity(self, hp_grid):
+        # The public path: the manifest a build writes matches the oracle's
+        # (shard, granule id) assignment exactly, including per-shard order.
+        cat = _overlapping_catalog()
+        records, all_shards = self._inputs(cat, hp_grid)
+        sm = ShardMap.build(cat, hp_grid, backend="mortie")
+        serial = _intersect_mortie_serial(records, hp_grid, all_shards, order=11)
+        assert sm.shard_keys == sorted(serial)
+        assert [[g["id"] for g in shard] for shard in sm.granules] == [
+            [records[i]["id"] for i in serial[k]] for k in sorted(serial)
+        ]
+
+    def test_malformed_rings_dropped_not_fatal(self, hp_grid):
+        # The batch call is fail-fast for its whole block where the serial loop
+        # dropped one granule, so unusable rings are screened before it: a
+        # non-finite vertex, a 2-vertex ring, and a lat/lon length mismatch must
+        # each vanish quietly while their neighbours still assign.
+        good = _overlapping_catalog(n=2).granule_records()
+        bad = [
+            {
+                "id": "Gnan",
+                "lats": np.array([38.85, np.nan, 38.9, 38.85]),
+                "lons": np.full(4, -76.6),
+            },
+            {"id": "Gshort", "lats": np.array([38.85, 38.9]), "lons": np.array([-76.6, -76.5])},
+            {"id": "Gmismatch", "lats": np.array([38.85, 38.9, 38.95]), "lons": np.full(4, -76.6)},
+        ]
+        records = [good[0], *bad, good[1]]
+        _, all_shards = self._inputs(_overlapping_catalog(n=2), hp_grid)
+        out = shardmap._intersect_mortie(records, hp_grid, all_shards, order=11)
+        assigned = {i for v in out.values() for i in v}
+        assert assigned == {0, 4}, f"only the two well-formed granules assign, got {assigned}"
+        # The screen in ``_flatten_rings`` is a Python *copy* of mortie's rejection
+        # rules, not a derivation from them, so it is the one place this PR can
+        # diverge from the oracle by construction. Pin it against mortie itself:
+        # if mortie's accept/reject set moves, the screen starts dropping rings
+        # mortie would have covered and only this assertion notices.
+        assert out == _intersect_mortie_serial(records, hp_grid, all_shards, order=11)
+        # All rings malformed: ``_flatten_rings`` returns None -> {}, and the
+        # serial loop swallows every granule -> {} too.
+        all_bad = shardmap._intersect_mortie(bad, hp_grid, all_shards, order=11)
+        assert all_bad == _intersect_mortie_serial(bad, hp_grid, all_shards, order=11) == {}
+
+    def test_batch_failure_falls_back_to_serial(self, hp_grid, monkeypatch):
+        # An undocumented mortie-side failure (e.g. a captured kernel panic)
+        # raises for the whole block; the fallback must reproduce the serial
+        # result rather than lose the build.
+        import mortie
+
+        cat = _overlapping_catalog()
+        records, all_shards = self._inputs(cat, hp_grid)
+        serial = _intersect_mortie_serial(records, hp_grid, all_shards, order=11)
+
+        def boom(*a, **kw):
+            raise RuntimeError("polygon 3: polygon coverage panicked")
+
+        monkeypatch.setattr(mortie, "polygons_to_morton_mocs", boom)
+        with pytest.warns(RuntimeWarning, match="fell back to the per-ring path"):
+            assert shardmap._intersect_mortie(records, hp_grid, all_shards, order=11) == serial
+
+    def test_fallback_warns_once_per_build(self, hp_grid, monkeypatch):
+        # The fallback is correct but several times slower, so it must not be
+        # silent -- an operator whose build suddenly takes 4x needs to know a
+        # mortie-side failure caused it. Equally it must not shout per block:
+        # three blocks fall back here and exactly one warning comes out.
+        import mortie
+
+        records, all_shards = self._inputs(_overlapping_catalog(), hp_grid)
+
+        def boom(*a, **kw):
+            raise RuntimeError("polygon 3: polygon coverage panicked")
+
+        monkeypatch.setattr(shardmap, "_MOC_BATCH_RINGS", 5)
+        monkeypatch.setattr(mortie, "polygons_to_morton_mocs", boom)
+        with pytest.warns(RuntimeWarning, match="polygon coverage panicked") as rec:
+            shardmap._intersect_mortie(records, hp_grid, all_shards, order=11)
+        assert len(rec) == 1, f"three blocks fell back; expected one warning, got {len(rec)}"
+
+    def test_fallback_is_scoped_to_the_failing_block(self, hp_grid, monkeypatch):
+        # ``_batch_ring_mocs`` claims the fallback is "for this block only": the
+        # surviving blocks stay on the batch path and the regroup still stitches
+        # every block into record order. The test above cannot see that -- one
+        # block, raising unconditionally -- so raise on the Nth call instead,
+        # with the block size cut to 5 so 12 granules make three blocks and each
+        # takes a turn as the failing one (including the last, partial, block).
+        import mortie
+
+        cat = _overlapping_catalog()
+        records, all_shards = self._inputs(cat, hp_grid)
+        serial = _intersect_mortie_serial(records, hp_grid, all_shards, order=11)
+        real = mortie.polygons_to_morton_mocs
+        monkeypatch.setattr(shardmap, "_MOC_BATCH_RINGS", 5)
+
+        def make_flaky(bad):
+            state = {"calls": 0, "batched": 0}
+
+            def flaky(*a, **kw):
+                state["calls"] += 1
+                if state["calls"] - 1 == bad:
+                    raise RuntimeError("polygon 3: polygon coverage panicked")
+                state["batched"] += 1
+                return real(*a, **kw)
+
+            return flaky, state
+
+        for bad_block in (0, 1, 2):
+            flaky, state = make_flaky(bad_block)
+            monkeypatch.setattr(mortie, "polygons_to_morton_mocs", flaky)
+            with pytest.warns(RuntimeWarning, match="fell back to the per-ring path"):
+                out = shardmap._intersect_mortie(records, hp_grid, all_shards, order=11)
+            assert out == serial
+            assert state["calls"] == 3, f"expected three blocks, saw {state['calls']}"
+            assert state["batched"] == 2, "the surviving blocks must stay on the batch path"
+
+    def test_empty_inputs_short_circuit(self, hp_grid):
+        cat = _overlapping_catalog(n=2)
+        records, all_shards = self._inputs(cat, hp_grid)
+        assert shardmap._intersect_mortie([], hp_grid, all_shards, order=11) == {}
+        assert shardmap._intersect_mortie(records, hp_grid, set(), order=11) == {}
+
+    def test_flatten_rings_offsets_contract(self):
+        # mortie's batch contract is strict: offsets[0] == 0 and offsets[-1] ==
+        # len(lats) == len(lons) (exact coverage). Rings also stay attributable:
+        # the three beam rings of granule 0 all own record 0.
+        from zagg.catalog.shardmap import _flatten_rings
+
+        records = _atl03_catalog(
+            [_swath_item(gid, lon, 38.89) for gid, lon in (("Ga", -76.52), ("Gb", -76.50))]
+        ).granule_records()
+        lats, lons, offsets, owners = _flatten_rings(records, "beams", "ATL03")
+        assert offsets[0] == 0
+        assert offsets[-1] == lats.size == lons.size
+        assert np.all(np.diff(offsets) >= 3)
+        assert owners.tolist() == [0, 0, 0, 1, 1, 1]
+        assert offsets.size == owners.size + 1
+        # Swath mode is one ring per granule, so owners are the record indices.
+        assert _flatten_rings(records, "swath", "ATL03")[3].tolist() == [0, 1]
+        assert _flatten_rings([], "swath", "ATL03") is None
+
+
 class TestIO:
     def test_round_trip(self, catalog, grid, fake_spherely):
         sm = ShardMap.build(catalog, grid, backend="spherely")

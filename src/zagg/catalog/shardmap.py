@@ -32,6 +32,7 @@ from __future__ import annotations
 import importlib
 import json
 import time
+import warnings
 from dataclasses import dataclass, field
 from typing import Dict, List
 
@@ -42,6 +43,42 @@ import numpy as np
 # derived order is clamped to this so an exotic ``chunk_order`` can't push the MOC
 # order past the cap and silently lose coverage (#92).
 MORTIE_MOC_ORDER_CAP = 18
+
+# Rings per batch call into mortie's ``polygons_to_morton_mocs`` (issue #396),
+# set from a sweep over **real** CMR catalogs
+# (``bench/shardmap_batch_vs_serial.py --knee``) -- the two earlier values (1024,
+# then 256) were both picked against synthetic footprints and were both too
+# large. A real ATL03 quarter-orbit footprint covers a median 9,266 MOC words at
+# order 13 (mean 8,659, max 10,881 over 1,000 granules sampled from the clone)
+# against ~220 for a compact synthetic quadrilateral, so a synthetic sweep
+# under-reads the block's memory by ~40x.
+#
+# Peak has **two** terms and blocking bounds only one of them. The block term is
+# this constant x per-ring MOC words: California at order 13 peaks 57 MB at
+# block 32, 251 at 64, 412 at 256, 616 at 2048. The catalog term is
+# ``_flatten_rings``' up-front concatenate -- ~0.5 KB of vertices per granule,
+# so 283 MB of lat/lon plus 9 MB of offsets/owners across the 555,867-granule
+# clone -- which no block size removes, and which is why the same 190,625-pair
+# build peaks well above California's 4,354-granule figure at the same block.
+# Sizing a build's memory means adding both, not reading the block alone.
+#
+# Wall is where the block earns nothing above ~32. Quote it min-of-N only:
+# ``polygons_to_morton_mocs`` is rayon-parallel, so single-shot walls scatter by
+# tens of percent on a loaded machine -- wider than the effect. Min of 3,
+# California at order 13: 12.62 s at block 8, 11.06 at 16, 9.89 at 32, 9.84 at
+# 48, 9.67 at 64, then 9.5-9.8 flat out to 2048. So the batch's fixed cost is
+# amortized by ~32 rings (within 4% of the asymptote), against the order of
+# magnitude the synthetic sweep suggested. Order 9 is flatter still (0.73 s at
+# 16, 0.66 at 32, 0.64 at 64, 0.58 at 1024).
+#
+# 32 is the size: it holds the block term to 57 MB on California -- 4.4x under
+# 64's 251 MB and 7x under 256's 412 MB -- for 2% wall there. On the far denser
+# 88S catalog the two are much closer on both axes (32: 57.37 s / 192 MB,
+# 64: 55.02 s / 206 MB, min of 6 across two block orderings), so nothing there
+# argues against it. Block ordering matters when measuring this: a single
+# block-major sweep on a loaded machine put 88S's 32 at 63.13 s, and reversing
+# the order moved it to 57.37 s against 64's 56.55 s -- drift, not a knee.
+_MOC_BATCH_RINGS = 32
 
 # ── granule footprint helpers ────────────────────────────────────────────────
 
@@ -107,6 +144,105 @@ def _granule_footprints(rec, footprint, product):
     return [(rec["lats"], rec["lons"])]
 
 
+def _flatten_rings(records, footprint, product):
+    """Flatten every granule's rings into mortie's ragged batch layout (#396).
+
+    Returns ``(lats, lons, offsets, owners)`` or ``None`` when nothing survives.
+    ``offsets`` are arrow list offsets satisfying mortie's strict batch contract
+    (``offsets[0] == 0`` and ``offsets[-1] == len(lats) == len(lons)``: exact
+    coverage of the vertex arrays), and ``owners[r]`` is the **record index ring
+    ``r`` came from**. That ring -> granule map is what makes the flattening
+    lossless: ``_granule_footprints`` yields one ring per granule in ``"swath"``
+    mode but one per beam pair in ``"beams"`` mode (issue #65), while mortie's
+    batch is one-ring-per-entry by design, so a granule's shard set is the union
+    over its own rings, recovered through ``owners``.
+
+    Rings mortie's coverage rejects outright -- fewer than 3 vertices, mismatched
+    lat/lon lengths, or a non-finite coordinate -- are dropped here. The serial
+    path swallowed those per granule; the batch call fails the *whole* call
+    instead (naming the lowest-index offender), so screening them out up front is
+    what keeps one malformed footprint from taking the build down with it.
+    """
+    lat_parts, lon_parts, counts, owners = [], [], [], []
+    for i, rec in enumerate(records):
+        for rlats, rlons in _granule_footprints(rec, footprint, product):
+            rlats = np.asarray(rlats, dtype=float)
+            rlons = np.asarray(rlons, dtype=float)
+            if rlats.size != rlons.size or rlats.size < 3:
+                continue
+            if not (np.isfinite(rlats).all() and np.isfinite(rlons).all()):
+                continue
+            lat_parts.append(rlats)
+            lon_parts.append(rlons)
+            counts.append(rlats.size)
+            owners.append(i)
+    if not counts:
+        return None
+    offsets = np.zeros(len(counts) + 1, dtype=np.int64)
+    np.cumsum(np.asarray(counts, dtype=np.int64), out=offsets[1:])
+    return (
+        np.concatenate(lat_parts),
+        np.concatenate(lon_parts),
+        offsets,
+        np.asarray(owners, dtype=np.int64),
+    )
+
+
+def _first_of_run(values) -> np.ndarray:
+    """Boolean mask marking the first element of every run of equal values.
+
+    Precondition: ``values.size >= 1`` (``mask[0] = True`` raises ``IndexError``
+    on an empty array). Both call sites in ``_intersect_mortie`` guarantee it --
+    the first runs only after the ``if not hit_shards: return {}`` short-circuit,
+    and the second slices a non-empty run of that same array -- so the empty case
+    is left as a documented contract rather than an untested branch.
+    """
+    mask = np.empty(values.size, dtype=bool)
+    mask[0] = True
+    np.not_equal(values[1:], values[:-1], out=mask[1:])
+    return mask
+
+
+def _batch_ring_mocs(lats, lons, offsets, start, stop, order) -> tuple:
+    """MOCs for rings ``[start, stop)`` -- one batch call into mortie (#396).
+
+    Returns ``(mocs, batch_exc)``, where ``batch_exc`` is the exception that
+    forced the serial fallback for this block, or ``None`` when the batch call
+    succeeded. The caller surfaces it once per build rather than per block.
+
+    ``polygons_to_morton_mocs`` (mortie >= 0.9.4, espg/mortie#153) covers the
+    whole block in one crossing of the Python/Rust boundary with the GIL
+    released and rayon spread across polygons, replacing one
+    ``morton_coverage_moc`` call per granule. The offsets slice is re-based so
+    the block satisfies the strict exact-coverage contract on its own vertex
+    slice.
+
+    The batch call is fail-fast for the whole block, where the serial path
+    dropped just the offending granule; ``_flatten_rings`` screens the
+    documented rejection causes, so a raise here means something undocumented
+    (e.g. a captured kernel panic). Rather than lose the build, fall back to the
+    per-ring scalar path for this block only, which restores the old
+    swallow-one-granule behavior exactly.
+    """
+    from mortie import morton_coverage_moc, polygons_to_morton_mocs
+
+    lo, hi = int(offsets[start]), int(offsets[stop])
+    try:
+        values, out_offsets = polygons_to_morton_mocs(
+            lats[lo:hi], lons[lo:hi], offsets[start : stop + 1] - lo, order=order
+        )
+    except Exception as exc:
+        mocs = []
+        for r in range(start, stop):
+            a, b = int(offsets[r]), int(offsets[r + 1])
+            try:
+                mocs.append(np.asarray(morton_coverage_moc(lats[a:b], lons[a:b], order=order)))
+            except Exception:
+                mocs.append(np.empty(0, dtype=np.uint64))
+        return mocs, exc
+    return [values[out_offsets[r] : out_offsets[r + 1]] for r in range(stop - start)], None
+
+
 def _resolve_mortie_order(mortie_order, grid) -> int:
     """Choose the MOC order for the mortie backend.
 
@@ -125,8 +261,8 @@ def _resolve_mortie_order(mortie_order, grid) -> int:
     order resolves to 13. Keying the MOC to the chunk order matches the unit work
     is dispatched at: footprints resolve no finer than the chunk the worker reads,
     which is enough to keep ``moc_to_order`` from upsampling onto neighbor shards
-    (#92) at near-minimal compute -- the order-sweep benchmark
-    (``benchmarks/mortie_order_sweep.py``) shows granules/shard flat for every
+    (#92) at near-minimal compute -- the real-catalog order sweep
+    (``bench/neon_order_sweep.py``) shows granules/shard flat for every
     order >= ``parent_order`` while wall-time grows with order, so a finer MOC
     buys precision the order-``parent_order`` shard cells can't see.
     The order is still clamped to ``MORTIE_MOC_ORDER_CAP`` (mortie's order-18
@@ -307,37 +443,95 @@ def _intersect_spherely(
 def _intersect_mortie(
     records, grid, all_shards, order=8, footprint="swath", product="ATL03"
 ) -> Dict[int, List[int]]:
-    """HEALPix MOC intersection via mortie ``morton_coverage_moc``.
+    """HEALPix MOC intersection via mortie's batch ``polygons_to_morton_mocs``.
 
     ``footprint="beams"`` decomposes each granule into per-beam-pair corridor
     rings (issue #65); a granule maps to a shard if any of its rings cover it
     (deduped). Consumes the same ``(lats, lons)`` rings as the spherely path.
+
+    The HEALPix path is batched (issue #396): every granule's rings are flattened
+    once into mortie's ragged layout (``_flatten_rings``) and covered a block at
+    a time (``_batch_ring_mocs``) instead of one ``morton_coverage_moc`` call per
+    granule, and shard membership is a ``searchsorted`` over the sorted shard
+    array -- the same vectorized shape the non-HEALPix branch below already used
+    -- instead of a scalar ``in all_shards`` test per cell. The result is
+    identical: same shards, same per-shard granule order (records are visited in
+    order, so the flattened owners are non-decreasing and a stable sort by shard
+    leaves each shard's granules in record order, deduped).
     """
-    from mortie import moc_to_order, morton_coverage, morton_coverage_moc
+    from mortie import moc_to_order, morton_coverage
 
     is_healpix = hasattr(grid, "parent_order") and hasattr(grid, "child_order")
     out: Dict[int, List[int]] = {}
 
     if is_healpix:
+        flat = _flatten_rings(records, footprint, product)
+        if flat is None or not all_shards:
+            return {}
+        lats, lons, offsets, owners = flat
         parent_order = grid.parent_order
-        for i, rec in enumerate(records):
-            for rlats, rlons in _granule_footprints(rec, footprint, product):
-                try:
-                    moc = np.asarray(morton_coverage_moc(rlats, rlons, order=order))
-                except Exception:
-                    continue
+        shard_arr = np.fromiter(all_shards, dtype=np.uint64, count=len(all_shards))
+        shard_arr.sort()
+
+        hit_shards, hit_owners = [], []
+        warned = False
+        for start in range(0, owners.size, _MOC_BATCH_RINGS):
+            stop = min(start + _MOC_BATCH_RINGS, owners.size)
+            mocs, batch_exc = _batch_ring_mocs(lats, lons, offsets, start, stop, order)
+            if batch_exc is not None and not warned:
+                # Silence would hide a mortie-side bug behind a several-times
+                # slower path (the serial loop is ~4x the batch on realistic
+                # footprints), but one warning per block is noise on a
+                # pathological catalog -- so say it once per build.
+                warned = True
+                warnings.warn(
+                    f"mortie's batch coverage raised ({batch_exc!r}); this build fell back "
+                    "to the per-ring path for the affected block(s). Results are unchanged, "
+                    "but the build is several times slower. Reported once per build (#396).",
+                    RuntimeWarning,
+                    stacklevel=2,
+                )
+            for r, moc in enumerate(mocs):
                 if moc.size == 0:
                     continue
                 try:
-                    shards = np.unique(moc_to_order(moc, parent_order))
+                    # ``moc_to_order`` refines the MOC's coarse interior cells to
+                    # the shard order; its cell budget can refuse a huge
+                    # expansion, which drops that ring exactly as before.
+                    shards = np.unique(np.asarray(moc_to_order(moc, parent_order)))
                 except Exception:
                     continue
-                for s in shards.tolist():
-                    s = int(s)
-                    if s in all_shards:
-                        out.setdefault(s, []).append(i)
-        # Dedup a granule reached via multiple beam rings (no-op for swath).
-        return {k: list(dict.fromkeys(v)) for k, v in out.items()}
+                # Filter to the AOI here, per ring, rather than accumulating the
+                # block's densified cells and filtering once: a real quarter-orbit
+                # footprint densifies to ~17k order-11 cells, so a block-level
+                # buffer (plus its concatenate copies) dwarfs the AOI hits it
+                # exists to produce. Per-ring keeps the accumulator bounded by
+                # hits, as the pre-#396 loop was, and is just as vectorized --
+                # ``owners`` is non-decreasing in ``r``, so appending in ring
+                # order leaves the sort/dedup invariant below untouched.
+                cand = shards.astype(np.uint64, copy=False)
+                pos = np.searchsorted(shard_arr, cand)
+                np.clip(pos, 0, shard_arr.size - 1, out=pos)
+                kept = cand[shard_arr[pos] == cand]
+                if kept.size:
+                    hit_shards.append(kept)
+                    hit_owners.append(np.full(kept.size, owners[start + r], dtype=np.int64))
+
+        if not hit_shards:
+            return {}
+        cand = np.concatenate(hit_shards)
+        own = np.concatenate(hit_owners)
+        srt = np.argsort(cand, kind="stable")
+        cand, own = cand[srt], own[srt]
+        bounds = np.flatnonzero(_first_of_run(cand))
+        for a, b in zip(bounds, np.append(bounds[1:], cand.size)):
+            # Owners are non-decreasing within a shard (records visited in order,
+            # a granule's beam rings adjacent), so dropping repeats of the run
+            # dedups a granule reached via several rings -- the ``dict.fromkeys``
+            # the serial path ended with.
+            granules = own[a:b]
+            out[int(cand[a])] = [int(g) for g in granules[_first_of_run(granules)]]
+        return out
 
     # Non-HEALPix: flat order-`order` granule cell index + per-shard lookup.
     cell_arrays, rec_idx = [], []
