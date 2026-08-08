@@ -7,6 +7,9 @@ themselves are pinned in ``tests/test_windows.py``; the frozen grammar lives
 on the mortie spec page (mortie#62).
 """
 
+import re
+from datetime import datetime, timezone
+
 import pytest
 
 from zagg import hive
@@ -39,6 +42,21 @@ def _windowed(cfg, schedule="yearly", **over):
     block.update(over)
     cfg.output["windowing"] = block
     return cfg
+
+
+def _raster_windowed(schedule="yearly"):
+    """A minimal raster + hive + windowing config (issue #247)."""
+    c = default_config("atl06")
+    c.data_source = {
+        "reader": "raster",
+        "bands": {"red": {"asset": "red", "dtype": "uint16"}},
+    }
+    c.aggregation = {}
+    c.output["grid"] = {"type": "healpix", "parent_order": 6, "child_order": 12}
+    c.output["store_layout"] = "hive"
+    c.output["windowing"] = {"schedule": schedule}
+    validate_config(c)
+    return c
 
 
 # ── config block (phase 2) ───────────────────────────────────────────────────
@@ -233,6 +251,96 @@ class TestWindowingConfig:
         _windowed(cfg, epoch="the beginning")
         with pytest.raises(ValueError, match="ISO-8601"):
             validate_config(cfg)
+
+    @pytest.mark.parametrize(
+        "epoch, declared, rendered, shift",
+        [
+            (
+                "2018-01-01T00:00:00.5Z",
+                "2018-01-01T00:00:00.500000+00:00",
+                "2018-01-01T00:00:00+00:00",
+                "500000",
+            ),
+            # The fraction survives a non-UTC declaration: the guard compares
+            # INSTANTS, not spellings, so it is the dropped fraction that
+            # refuses this — never the offset (Python accepts sub-minute
+            # offsets, and a whole-second one of those round-trips clean).
+            (
+                "2018-01-01T05:30:00.001+05:30",
+                "2018-01-01T00:00:00.001000+00:00",
+                "2018-01-01T00:00:00+00:00",
+                "1000",
+            ),
+            # The smallest representable violation — a microsecond-precision
+            # timestamp pasted in from a data file — reads as an integer count,
+            # not as 1e-06.
+            (
+                "2018-01-01T00:00:00.000001Z",
+                "2018-01-01T00:00:00.000001+00:00",
+                "2018-01-01T00:00:00+00:00",
+                "1",
+            ),
+            # The production path is datetime-typed, not str: yaml.safe_load
+            # resolves an ISO timestamp scalar to an aware datetime and
+            # windows.parse_utc passes it through, so the message must render
+            # the author's value rather than repr a stdlib constructor call.
+            (
+                datetime(2018, 1, 1, 0, 0, 0, 500000, tzinfo=timezone.utc),
+                "2018-01-01T00:00:00.500000+00:00",
+                "2018-01-01T00:00:00+00:00",
+                "500000",
+            ),
+        ],
+    )
+    def test_subsecond_epoch_rejected(self, cfg, epoch, declared, rendered, shift):
+        # The epoch parses at full precision but is CONSUMED through
+        # windows.iso_utc (timespec="seconds"), so a sub-second epoch used to
+        # validate clean and then shift every window conversion by the dropped
+        # fraction (issue #390 — the PR #367 validate-vs-render mismatch class).
+        # The message quotes the declared instant, the rendered value and the
+        # shift, so the refusal is tied to what get_windowing would actually emit.
+        _windowed(cfg, epoch=epoch)
+        with pytest.raises(
+            ValueError,
+            match=rf"epoch {re.escape(repr(declared))} carries sub-second precision.*"
+            rf"recorded as {re.escape(repr(rendered))}.*shift every window "
+            rf"conversion by {shift} µs",
+        ):
+            validate_config(cfg)
+
+    @pytest.mark.parametrize(
+        "epoch",
+        [
+            "2018-01-01T00:00:00Z",
+            "2018-01-01T00:00:00+00:00",
+            # Naive input is taken AS UTC (windows.parse_utc), and a whole-second
+            # offset-bearing epoch still round-trips — only the fraction is lost.
+            "2018-01-01T00:00:00",
+            "2018-01-01T05:30:00+05:30",
+        ],
+    )
+    def test_whole_second_epoch_accepted(self, cfg, epoch):
+        # The guard is exactly "the rendering is lossless", not "the declaration
+        # is spelled canonically": every whole-second spelling stays legal and
+        # canonicalizes to the same instant.
+        _windowed(cfg, epoch=epoch)
+        validate_config(cfg)
+        assert get_windowing(cfg)["epoch"] == "2018-01-01T00:00:00+00:00"
+
+    def test_schedule_none_keeps_subsecond_epoch(self, cfg):
+        # The guard sits AFTER the ``schedule: none`` early return, and must:
+        # an inert block is equivalent to an absent one (test_absent_is_none),
+        # get_windowing returns None, and the epoch is never rendered — so
+        # there is no conversion to shift and nothing to refuse.
+        cfg.output["store_layout"] = "hive"
+        cfg.output["windowing"] = {
+            "schedule": "none",
+            "time_field": "delta_time",
+            "epoch": "2018-01-01T00:00:00.5Z",
+            "scale": "gps",
+        }
+        validate_config(cfg)
+        assert get_windowing(cfg) is None
 
     def test_bad_scale_and_units(self, cfg):
         _windowed(cfg, scale="tt")
@@ -590,6 +698,20 @@ class TestWindowingConfig:
         validate_config(c)
         assert get_windowing(c)["time_field"] == "datetime"
 
+    def test_raster_epoch_renders_through_iso_utc(self):
+        # Issue #390: the raster epoch is FIXED (issue #247) but not SPELLED —
+        # get_windowing renders it with windows.iso_utc like every other
+        # instant it emits. Asserting against the renderer's own output rather
+        # than a literal is the point: this stays true through a change to
+        # iso_utc's precision or offset form, and only a re-introduced literal
+        # in config.py can break it.
+        from zagg import windows as _windows
+
+        c = _raster_windowed()
+        assert get_windowing(c)["epoch"] == _windows.iso_utc(
+            _windows.parse_utc(datetime(1970, 1, 1, tzinfo=timezone.utc))
+        )
+
 
 # ── manifest temporal block + spec bump (phase 2) ────────────────────────────
 
@@ -629,6 +751,21 @@ class TestManifestTemporal:
             "calendar": "proleptic_gregorian",
             "append_policy": "new-window",
         }
+
+    def test_raster_and_point_epochs_spell_one_instant_alike(self, cfg):
+        # The drift the rendered raster epoch prevents (issue #390): both
+        # branches of get_windowing feed the SAME manifest field, so a given
+        # instant has to reach it spelled one way. A point config declaring
+        # the Unix epoch and a raster config (whose epoch is fixed to it)
+        # therefore must produce byte-identical temporal epochs — this is the
+        # assertion a re-introduced literal on either branch breaks, since a
+        # literal is free to disagree with whatever iso_utc emits.
+        _windowed(cfg, epoch="1970-01-01T00:00:00Z", scale="utc")
+        validate_config(cfg)
+        point = hive.build_manifest(self._grid(cfg), windowing=get_windowing(cfg))
+        rcfg = _raster_windowed()
+        raster = hive.build_manifest(self._grid(rcfg), windowing=get_windowing(rcfg))
+        assert raster["temporal"]["epoch"] == point["temporal"]["epoch"]
 
     def test_explicit_manifest_carries_windows_and_retemplate_policy(self, cfg):
         _windowed(cfg, schedule="explicit")

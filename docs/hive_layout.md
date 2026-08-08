@@ -166,7 +166,9 @@ output:
   need `bounds.temporal` to enumerate generative windows.
 - **Stamps carry the truth, the manifest the schema** (D15): each windowed
   leaf's commit stamp records its `window` label and the ACTUAL written
-  `time_range` as ISO-8601 UTC strings; the root `coverage.moc` summary
+  `time_range` as ISO-8601 UTC strings (both ends at whole-second
+  granularity, which narrows the tail by up to 1 s — see
+  [The commit stamp](#the-commit-stamp)); the root `coverage.moc` summary
   carries the run's time-range union (cache, regenerable); temporal *extent*
   never lives in the manifest, which stays write-once. Appending a new year
   to a `yearly` store adds leaves the schedule already describes — no
@@ -193,7 +195,13 @@ same second (say `12:00:01.0Z` → `12:00:01.4Z`) the window dispatches as an
 empty `ge x`/`lt x` pair, so it is rejected — the point form is the spelling
 for one-second intent. A sub-second range that *straddles* a second boundary
 (`12:00:01.9Z` → `12:00:02.1Z`) is still valid; it renders to the one-second
-window its truncated bounds describe. On the raster path
+window its truncated bounds describe. The `epoch` is the one time value held
+to a stricter rule ([issue #390](https://github.com/englacial/zagg/issues/390)):
+it too renders at whole-second granularity, but it defines *every* window
+conversion rather than one edge of one window, so a sub-second `epoch` is
+**refused** rather than truncated — `2018-01-01T00:00:00.5Z` would shift every
+boundary by half a second, invisibly. Declare it at second precision. On the
+raster path
 ([issue #247](https://github.com/englacial/zagg/issues/247)) membership is
 the acquisition's STAC `datetime`: `time_field` is optional (fixed to
 `datetime`) and the `epoch`/`scale`/`units` conversion knobs are rejected.
@@ -512,6 +520,26 @@ stamp, so coverage shares the debris semantics: no stamp, no visible coverage.
 A windowed leaf's stamp ([Time windows](#time-windows-morton-hive2)) declares
 `spec: "morton-hive/2"` and adds `window` (the label) plus `time_range` — the
 actual `[t_min, t_max]` written, as ISO-8601 UTC strings.
+
+**Reader caveat — `t_max` floors, so the recorded range can end up to 1 s
+early.** Both ends render through `windows.iso_utc`'s whole-second
+granularity (`isoformat(timespec="seconds")`), so each truncates to the second
+*containing* it. On `t_min` that is harmless: the recorded start is at or
+before the true first observation. On `t_max` it is not — a last observation
+at `12:00:00.7` is recorded as `12:00:00`, so the closed `[t_min, t_max]` is
+a slight **under**-estimate of the extent written, not an envelope around it.
+**A consumer that prunes leaves on the stamp must treat `t_max` as inclusive
+with 1 s of slack** (test the query against `t_max + 1 s`); pruning on the
+recorded value alone can skip a leaf that genuinely holds data in the queried
+interval. Sub-second inputs reach the rendering on both pipelines — a float
+`delta_time` column on the point path (`windows.iso_time_range`), a
+millisecond-bearing STAC `datetime` on the raster path
+(`processing/raster._us_iso`). The narrowing is recorded rather than fixed
+(ruled on [PR #398](https://github.com/englacial/zagg/pull/398)): no in-tree
+consumer prunes on `time_range` — every use is a union into the regenerable
+root `coverage.moc` summary or the overview rollup — and rendering the range
+outward instead would change the bytes of a stamp field external readers
+decode.
 
 ## Coverage
 

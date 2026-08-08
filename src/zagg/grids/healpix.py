@@ -249,7 +249,7 @@ class HealpixGrid:
         crossing the antimeridian or enclosing a pole, where a lon/lat box is
         the wrong shape entirely.
         """
-        from mortie.tools import mort2polygon
+        from mortie import mort2polygon
 
         lats: list[float] = []
         lons: list[float] = []
@@ -433,7 +433,7 @@ class HealpixGrid:
 
     def shard_footprint(self, shard_key):
         """Parent-cell polygon in WGS84 (lon, lat)."""
-        from mortie.tools import mort2polygon
+        from mortie import mort2polygon
         from shapely.geometry import Polygon
 
         verts = mort2polygon(int(shard_key), step=32)
