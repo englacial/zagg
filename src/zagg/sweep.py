@@ -438,10 +438,18 @@ class SubmapFamily(SweepFamily):
         would advertise one arbitrary child's identity). ``grid_signature`` is
         safe regardless — all children of a node share ``child_order``.
         """
-        from zagg.catalog.shardmap import ShardMap
+        from zagg.catalog.shardmap import (
+            ShardMap,
+            _recorded_identity,
+            _refuse_basename_collisions,
+        )
 
         # Same-key union first (several windows of one shard), deduplicated by
         # granule id — the same rule reproject's coarsen applies across shards.
+        # Keyed like coarsen's, on everything that distinguishes one granule from
+        # another rather than on the id alone (issue #468): two granules whose
+        # recorded identity collapses must both survive the union to be seen,
+        # not have one silently overwrite the other here.
         buckets: dict[int, dict] = {}
         for p in payloads:
             for key, entries in zip(p["shard_keys"], p["granules"]):
@@ -453,7 +461,8 @@ class SubmapFamily(SweepFamily):
                     # never a bare KeyError.
                     if "id" not in entry:
                         raise ValueError("leaf sub-map granule entry missing required 'id' field")
-                    bucket[entry["id"]] = dict(entry)
+                    entry = dict(entry)
+                    bucket[_recorded_identity(entry)[1]] = entry
         keys = sorted(buckets)
         granules = [list(buckets[k].values()) for k in keys]
         signature = dict(payloads[0]["grid_signature"])
@@ -464,6 +473,13 @@ class SubmapFamily(SweepFamily):
         # keys agreeing rather than inheriting a stale build-side value.
         meta["granules_assigned"] = meta["total_granules"]
         folded = ShardMap(signature, keys, granules, meta)
+        # The union above mints shard membership just as build and reproject do,
+        # so it owns the same identity invariant (issue #468). Checked here for
+        # BOTH arms: the interior arm inherits the check from reproject anyway,
+        # and a shard-node fold that stayed silent while its parent refused
+        # would be incoherent. Note this reaches ``_merged``'s fail-open handler
+        # as a skipped rollup node -- see the PR's questions for review.
+        _refuse_basename_collisions(keys, granules)
         if int(signature["parent_order"]) == int(order):
             # Shard-node fold: already at the node's order — a window union,
             # not a reprojection; keep counts honest without a noop stamp.

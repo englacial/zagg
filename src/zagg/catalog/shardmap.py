@@ -162,6 +162,99 @@ def _granule_entry(rec: dict) -> dict:
     return entry
 
 
+def _recorded_identity(entry: dict, canonicalize=None) -> tuple[str | None, tuple]:
+    """``(canonical, distinguishing)`` for one shard entry.
+
+    ``canonical`` is the granule id the leaf's D20 sidecar will carry — the
+    basename of the href the runner resolves (:func:`zagg.telemetry.canonical_granule_id`),
+    falling back to the id, then the datetime, for the raster entries that carry
+    no href. ``None`` when there is nothing to canonicalize.
+
+    ``distinguishing`` is what separates one granule from another. ``datetime``
+    counts because :func:`zagg.telemetry.raster_granule_ids` records two
+    acquisitions sharing an item id as one id; the sibling ``assets`` do not,
+    because a record's identity is the primary alone (issue #425).
+
+    ``canonicalize`` lets a hot loop hoist the import out of the per-entry path.
+    """
+    if canonicalize is None:
+        from zagg.telemetry import canonical_granule_id as canonicalize
+
+    href = entry.get("s3") or entry.get("https")
+    named = href or entry.get("id") or entry.get("datetime")
+    canonical = canonicalize(named) if named else None
+    return canonical, (
+        entry.get("id"),
+        entry.get("s3"),
+        entry.get("https"),
+        entry.get("datetime"),
+    )
+
+
+def _collision_label(entry: dict) -> str:
+    """Name one colliding entry by what tells it apart from its partner.
+
+    The href when there is one — the prefix is what differs and what the remedy
+    acts on. A raster pair has no href and both members carry the same id (that
+    IS the collapse), so the datetime is the only thing left that separates them.
+    """
+    href = entry.get("s3") or entry.get("https")
+    if href:
+        return str(href)
+    if entry.get("id") and entry.get("datetime"):
+        return f"{entry['id']} @ {entry['datetime']}"
+    return str(entry.get("id") or entry.get("datetime"))
+
+
+def _refuse_basename_collisions(shard_keys, granules) -> None:
+    """Refuse a map whose recorded granule identity is not per-shard unique (#468).
+
+    Two granules of one shard whose recorded ids collapse onto one make the
+    shard's catalog identity name fewer granules than it reads. PR #420 question
+    (6) ruled the leaf-gate consequence acceptable *because* every catalog zagg
+    reads names granules globally uniquely; this enforces that "because" where
+    the invariant is owned rather than assuming it.
+
+    Entries agreeing on every distinguishing field (:func:`_recorded_identity`)
+    are one granule listed twice and pass — coarsen unions sibling shards, where
+    a granule spanning several children legitimately arrives more than once.
+    """
+    n_collisions = 0
+    shown: list = []
+    # Imported once rather than per entry: this runs over every granule of every
+    # shard, 555,867 of them at clone scale.
+    from zagg.telemetry import canonical_granule_id
+
+    for key, entries in zip(shard_keys, granules):
+        by_canonical: dict = {}
+        for entry in entries:
+            canonical, distinguishing = _recorded_identity(entry, canonical_granule_id)
+            # Empty as well as absent: an id of ``"/"`` canonicalizes to ``""``,
+            # and reporting ``''`` as the collapsed id is exactly the
+            # silently-wrong identity ``canonical_granule_id`` refuses to mint.
+            if not canonical:
+                continue
+            by_canonical.setdefault(canonical, {})[distinguishing] = _collision_label(entry)
+        # Filtered before sorting -- on every catalog zagg reads the filter
+        # discards all of them, so sorting first is a per-shard sort of nothing.
+        # Only the first few groups are retained: the message prints three, and a
+        # wholly mis-scoped catalog has one group per granule.
+        found = sorted((c, sorted(n.values())) for c, n in by_canonical.items() if len(n) > 1)
+        n_collisions += len(found)
+        shown += [(key, c, named) for c, named in found[: max(0, 4 - len(shown))]]
+    if not n_collisions:
+        return
+    listed = "; ".join(f"shard {k} {c!r} <- {named}" for k, c, named in shown[:3])
+    raise ValueError(
+        f"ShardMap: {n_collisions} per-shard granule identity collision(s) — granules "
+        f"assigned to one shard record as ONE granule id, so the shard's catalog identity "
+        f"names fewer granules than it reads (issue #468). Usually one basename under two "
+        f"key prefixes, in which case re-scope the catalog query so each granule appears "
+        f"once, or de-collide the basenames; the entries below are named by whatever "
+        f"separates them: {listed}{' ...' if n_collisions > 3 else ''}"
+    )
+
+
 #: Granule-id core for the catalog-time sibling join (issue #425): the
 #: datetime / orbit / sub-orbit-granule / track fields shared between the
 #: products of one acquisition (GEDI01_B_* and GEDI02_A_* of the same
@@ -1503,6 +1596,10 @@ class ShardMap:
 
         shard_keys = sorted(shard_to_idx)
         granules = [[_granule_entry(records[i]) for i in shard_to_idx[k]] for k in shard_keys]
+        # The per-shard identity invariant is owned here (issue #468): refuse a
+        # build whose shards name two granules the same, rather than leaving it
+        # to be discovered as duplicate drift at the leaf gate.
+        _refuse_basename_collisions(shard_keys, granules)
         meta = {
             **(catalog.metadata or {}),
             "backend": chosen,
@@ -1660,10 +1757,17 @@ class ShardMap:
             new_keys = sorted(groups)
             new_granules = []
             for k in new_keys:
+                # Keyed on what distinguishes one granule from another, not on
+                # the id alone: coarsening merges sibling shards, so a basename
+                # collision that was cross-shard at the source order lands
+                # in-shard here, and an id-keyed dedup would drop one of the two
+                # rather than let the check below name it (issue #468). A
+                # granule spanning several children still counts once.
                 seen: dict = {}
                 for i in groups[k]:
                     for g in self.granules[i]:
-                        seen[g["id"]] = _granule_entry(g)
+                        entry = _granule_entry(g)
+                        seen[_recorded_identity(entry)[1]] = entry
                 new_granules.append(list(seen.values()))
             method = "coarsen"
         else:
@@ -1712,11 +1816,16 @@ class ShardMap:
                     bucket = new_granules_map.setdefault(int(k), {})
                     for i in idxs:
                         entry = _granule_entry(sub_records[i])
-                        bucket[entry["id"]] = entry
+                        bucket[_recorded_identity(entry)[1]] = entry
 
             new_keys = sorted(new_granules_map)
             new_granules = [list(new_granules_map[k].values()) for k in new_keys]
             method = "refine"
+
+        # Reproject mints NEW shard membership, so it can mint a collision the
+        # source map did not have -- coarsen by merging sibling shards, refine
+        # by re-intersecting -- and owns the same invariant ``build`` does (#468).
+        _refuse_basename_collisions(new_keys, new_granules)
 
         meta = dict(self.metadata or {})
         meta["reproject"] = {

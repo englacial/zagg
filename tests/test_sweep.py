@@ -1308,3 +1308,58 @@ class TestHandlerSweepResponse:
             assert body["duration_s"] >= 0.0
             assert body["record"] is None
             assert (body["discover_s"] >= 0.0) if derived else (body["discover_s"] is None)
+
+
+class TestSubmapIdentityCollisions:
+    """The family fold is a third shardmap constructor path, so it owns the
+    per-shard identity invariant too (issue #468 review finding (1))."""
+
+    def _collided(self, gid="gDup"):
+        return [
+            {"id": gid, "s3": f"s3://bucket/{p}/{gid}", "https": f"https://host/{p}/{gid}"}
+            for p in ("p1", "p2")
+        ]
+
+    def test_the_union_keeps_both_members_of_a_collided_pair(self):
+        # Pre-#468 the union keyed on ``entry["id"]`` alone, so the second
+        # granule overwrote the first and the collapse was unobservable. It must
+        # survive the union to be seen at all.
+        from zagg.catalog.shardmap import _recorded_identity
+
+        pair = self._collided()
+        keyed = {_recorded_identity(e)[1]: e for e in pair}
+        assert len(keyed) == 2, "the distinguishing key must separate the pair"
+        assert len({e["id"] for e in pair}) == 1, "an id-keyed union would drop one"
+
+    def test_shard_node_fold_refuses_a_collided_pair(self):
+        from zagg.sweep import SubmapFamily
+
+        payload = {
+            "grid_signature": dict(SUBMAP_SIG),
+            "shard_keys": [morton_word("-311")],
+            "granules": [self._collided()],
+            "metadata": {"collection": "TEST_001"},
+        }
+        with pytest.raises(ValueError, match="identity collision"):
+            SubmapFamily().merge([payload], node="-311", order=SHARD_ORDER)
+
+    def test_a_refused_fold_is_a_named_skip_not_a_lost_node(self, caplog):
+        # ``_merged`` is fail-open, so the refusal lands as a skipped rollup
+        # node. Pin that the operator at least gets the collision named in the
+        # log rather than a bare "merge failed" -- the fail-open posture itself
+        # is raised for review on the PR, not changed here.
+        import logging as _logging
+
+        from zagg.sweep import SubmapFamily, _merged
+
+        payload = {
+            "grid_signature": dict(SUBMAP_SIG),
+            "shard_keys": [morton_word("-311")],
+            "granules": [self._collided()],
+            "metadata": {"collection": "TEST_001"},
+        }
+        counts = {"failed": 0}
+        with caplog.at_level(_logging.WARNING):
+            out = _merged(SubmapFamily(), [payload], "-311", SHARD_ORDER, counts)
+        assert out is None and counts["failed"] == 1
+        assert any("identity collision" in r.message for r in caplog.records)
