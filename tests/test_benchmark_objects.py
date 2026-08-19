@@ -349,12 +349,12 @@ def test_hive_store_matches_model(tmp_path, monkeypatch):
     # (issue #201, with their #342 sidecars) in their own buckets (second-pass
     # D9 caches); the write-path total excludes all three.
     assert measured["objects_rollups"] > 0
-    assert measured["objects_overviews"] > 0
+    assert measured["objects_sweep"] > 0
     assert any(k.endswith("/all.stats.json") for k in bench_objects.list_store_keys(root))
     write_path = (
         measured["objects_total"]
         - measured["objects_rollups"]
-        - measured["objects_overviews"]
+        - measured["objects_sweep"]
         - measured["objects_telemetry"]
     )
     assert write_path == expected["total_max"]
@@ -393,6 +393,29 @@ def test_hive_misplaced_rollup_counts_into_shard(monkeypatch):
     assert not any(k.endswith("stats.rollup.json") for k in measured["other_keys"])
 
 
+def test_measured_keys_are_the_documented_contract(monkeypatch):
+    # The bucket names are the record's grammar, and every reader of them
+    # (``write_path_total``) goes through ``.get(..., 0)`` — so a half-done
+    # rename reads as "zero objects in that bucket" instead of failing. Pin
+    # the key SET, which is what issue #433's ``objects_overviews`` ->
+    # ``objects_sweep`` rename moved.
+    grid = from_config(_cfg())
+    monkeypatch.setattr(bench_objects, "list_store_keys", lambda *a, **k: [])
+    measured = bench_objects.store_object_counts(
+        "unused", grid=grid, shard_keys=[int(morton_word(_KEY_A))], store_layout="hive"
+    )
+    assert set(measured) == {
+        "objects_total",
+        "objects_metadata",
+        "objects_per_shard",
+        "objects_rollups",
+        "objects_sweep",
+        "objects_telemetry",
+        "objects_other",
+        "other_keys",
+    }
+
+
 def test_hive_overview_zarrs_count_into_their_own_bucket(monkeypatch):
     # Sweep overview zarrs (issue #201) are `{window}.zarr` / `all.zarr` at a
     # digit node — window tokens can never parse as morton ids, so they get
@@ -418,7 +441,7 @@ def test_hive_overview_zarrs_count_into_their_own_bucket(monkeypatch):
     measured = bench_objects.store_object_counts(
         "unused", grid=grid, shard_keys=[word], store_layout="hive"
     )
-    assert measured["objects_overviews"] == 2
+    assert measured["objects_sweep"] == 2
     assert measured["objects_rollups"] == 1
     assert measured["objects_per_shard"] == {label: 1}
     assert measured["objects_other"] == 1
@@ -430,7 +453,7 @@ def test_hive_columns_split_by_who_wrote_them(monkeypatch):
     # grammar with two writers. Under a DISPATCHED leaf's node it is the leaf
     # worker's own write-path artifact (audited, per shard, so the #215 guard
     # covers it); at an ancestor node it is a STAGE column the sweep wrote,
-    # which rides the overviews bucket outside the audited total — as does its
+    # which rides the sweep bucket outside the audited total — as does its
     # D20 sidecar, while the leaf column's sidecar stays that shard's.
     from zagg import hive
 
@@ -445,7 +468,7 @@ def test_hive_columns_split_by_who_wrote_them(monkeypatch):
         f"{node}/all.pyramid.zarr/zarr.json",  # the LEAF column -> this shard
         f"{node}/all.pyramid.zarr/6/count/c/0",  # ... and its group object
         f"{node}/all.pyramid.stats.json",  # ... and its D20 sidecar
-        f"{base}/all.pyramid.zarr/zarr.json",  # a STAGE column -> overviews
+        f"{base}/all.pyramid.zarr/zarr.json",  # a STAGE column -> sweep
         f"{base}/all.pyramid.stats.json",  # ... and its sidecar
     ]
     monkeypatch.setattr(bench_objects, "list_store_keys", lambda *a, **k: keys)
@@ -453,7 +476,7 @@ def test_hive_columns_split_by_who_wrote_them(monkeypatch):
         "unused", grid=grid, shard_keys=[word], store_layout="hive"
     )
     assert measured["objects_per_shard"] == {label: 4}
-    assert measured["objects_overviews"] == 2
+    assert measured["objects_sweep"] == 2
     assert measured["objects_other"] == 0
 
 
@@ -548,7 +571,7 @@ def test_hive_node_stats_sidecars_classified(monkeypatch):
         f"{node}/2019.shardmap.json",  # D23-named leaf sub-map -> this shard
         f"{leaf}/2019.stats.json",  # MISPLACED in-leaf sidecar -> this shard
         f"{base}/all.zarr/zarr.json",  # the overview zarr itself
-        f"{base}/all.stats.json",  # its D23 sidecar -> overviews
+        f"{base}/all.stats.json",  # its D23 sidecar -> sweep
         f"{base}/2019.stats.json",  # a per-window overview sidecar
         "stats_20260731T000000Z_run0.parquet",
     ]
@@ -556,7 +579,7 @@ def test_hive_node_stats_sidecars_classified(monkeypatch):
     measured = bench_objects.store_object_counts(
         "unused", grid=grid, shard_keys=[word], store_layout="hive"
     )
-    assert measured["objects_overviews"] == 3  # the zarr + its two sidecars
+    assert measured["objects_sweep"] == 3  # the zarr + its two sidecars
     assert measured["objects_per_shard"] == {label: 6}
     assert measured["objects_metadata"] == 1
     assert measured["objects_telemetry"] == 1
@@ -587,7 +610,7 @@ def test_hive_stray_stats_json_stays_a_loud_other(monkeypatch):
         hive.MANIFEST_NAME,
         f"{leaf}/count/c/0",  # in-leaf data -> this shard
         f"{node}/2019.stats.json",  # dispatched leaf's D23 sidecar -> this shard
-        f"{base}/all.zarr/zarr.json",  # a real overview zarr -> overviews
+        f"{base}/all.zarr/zarr.json",  # a real overview zarr -> sweep
         f"{base}/all.stats.json",  # its sidecar, anchored to that node
         *strays,
     ]
@@ -595,7 +618,7 @@ def test_hive_stray_stats_json_stays_a_loud_other(monkeypatch):
     measured = bench_objects.store_object_counts(
         "unused", grid=grid, shard_keys=[word], store_layout="hive"
     )
-    assert measured["objects_overviews"] == 2  # the overview zarr + its sidecar
+    assert measured["objects_sweep"] == 2  # the overview zarr + its sidecar
     assert measured["objects_per_shard"] == {label: 2}
     assert measured["objects_metadata"] == 1
     assert measured["objects_other"] == 3
@@ -729,7 +752,7 @@ def test_measure_objects_reports_the_netted_count(tmp_path):
         "objects_metadata": 3,
         "objects_per_shard": {"1121121": 13},
         "objects_rollups": 5,
-        "objects_overviews": 3,
+        "objects_sweep": 3,
         "objects_telemetry": 24,
         "objects_other": 0,
         "other_keys": [],
@@ -944,7 +967,7 @@ def test_hive_sharded_store_matches_model(tmp_path, monkeypatch, pyramid):
     write_path = (
         measured["objects_total"]
         - measured["objects_rollups"]
-        - measured["objects_overviews"]
+        - measured["objects_sweep"]
         - measured["objects_telemetry"]
     )
     assert write_path == expected["total_max"]

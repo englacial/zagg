@@ -58,18 +58,27 @@ LEAF_REGIME = "leaf-column"
 def generation_key(block) -> tuple:
     """The staged sweep's skip-gate key over a summed ``generation`` block.
 
-    ``(n_leaves, max_leaf_timestamp, run ids)`` — the block the stage worker
-    records in these attrs and in the ladder entries it writes (§4.4/§4.6).
-    The run ids are the issue #417 term: stamps resolve to **one second**, so
-    the count/timestamp pair alone reads a same-second rewrite of a child at
-    an unchanged leaf count as *current* and serves stale content. Every
-    stage stamp carries its ``run_id`` (PR #416 phase 2), so a foreign
-    rewrite moves the id set, and the single-writer law forbids a run
-    rewriting its own object mid-run. A block without ``run_ids`` (pre-#417,
-    or children that are all fleet-written leaf columns — those stamps carry
-    no run id) keys on the empty tuple, never on a wildcard: an upgraded
-    store re-folds once rather than inheriting the blind spot. A non-block
-    keys on ``()``, which matches no generation.
+    ``(n_leaves, max_leaf_timestamp, run ids, granule_count)`` — the block
+    the stage worker records in these attrs and in the ladder entries it
+    writes (§4.4/§4.6). The last two terms exist because stamps resolve to
+    **one second**, so the count/timestamp pair alone reads a same-second
+    rewrite of a child at an unchanged leaf count as *current* and serves
+    stale content:
+
+    - ``run_ids`` (issue #417) — every STAGE stamp carries its ``run_id``
+      (PR #416 phase 2), so a foreign rewrite moves the id set, and the
+      single-writer law forbids a run rewriting its own object mid-run;
+    - ``granule_count`` (issue #433) — fleet-written leaf columns carry no
+      run id (§4.6: absence means not-a-stage-artifact), so at the finest
+      dispatch tuple the id term is empty and the run-id half cannot see a
+      same-second leaf rewrite at all. Every stamp, fleet or stage, records
+      the granules it folded, so the common case — a leaf re-run over more
+      granules — moves this term instead.
+
+    A block missing either term keys on that term's zero (empty tuple / 0),
+    never on a wildcard: an upgraded store re-folds once rather than
+    inheriting the blind spot. A non-block keys on ``()``, which matches no
+    generation.
 
     ``run_ids`` is compared as a SET: the recorded list is read back off an
     artifact this process did not write, so its order is not a property to
@@ -82,21 +91,34 @@ def generation_key(block) -> tuple:
         int(block.get("n_leaves") or 0),
         block.get("max_leaf_timestamp"),
         tuple(sorted(set(block.get("run_ids") or ()))),
+        int(block.get("granule_count") or 0),
     )
 
 
 def stamped_generation_key(block, stamp) -> tuple:
-    """One child's contribution to its parent's skip key (issue #417).
+    """One child's contribution to its parent's skip key (issues #417/#433).
 
     :func:`generation_key` over the child's recorded ``generation`` block —
     or, for a leaf column (which records none), the leaf identity: one leaf
     at its stamp's timestamp — **unioned with the run id that stamped THIS
-    child**. That id is the term the issue turns on: the run that wrote the
-    child is what a same-second foreign rewrite changes, and reading the
-    relayed block alone would see only the ids of the child's own children
-    (empty all the way down a fleet-built store, so the gate would fall back
-    to the count/timestamp pair it is meant to strengthen). Fleet-written
-    stamps carry no ``run_id`` and contribute nothing.
+    child, and carrying that stamp's own granule count**. Both come off the
+    child's stamp rather than its relayed block: the run that wrote the
+    child and the granules it folded are what a same-second foreign rewrite
+    changes, and reading the relayed block alone would see only its own
+    children's ids (empty all the way down a fleet-built store, so the gate
+    would fall back to the count/timestamp pair it is meant to strengthen).
+    Fleet-written stamps carry no ``run_id`` and contribute none; they do
+    carry ``granule_count``, which is the leaf arm's whole point (issue
+    #433).
+
+    The two are composed differently ON PURPOSE (review finding): the run id
+    is UNIONED with the block's, the granule count REPLACES it. A stage
+    column's stamp count and its recorded block's are the same sum over the
+    same children (:func:`zagg.sweep_stage._summed_generation` and the relay
+    column's stamp both reduce that run's readers), so replacing loses
+    nothing and upgrades a pre-#433 block — which carries no count — off the
+    stamp. Unioning or ADDING them would double-count every granule at every
+    level of the ladder.
     """
     stamp = stamp if isinstance(stamp, dict) else {}
     if not isinstance(block, dict):
@@ -104,7 +126,9 @@ def stamped_generation_key(block, stamp) -> tuple:
     runs = set(block.get("run_ids") or ())
     if stamp.get("run_id"):
         runs.add(stamp["run_id"])
-    return generation_key({**block, "run_ids": sorted(runs)})
+    return generation_key(
+        {**block, "run_ids": sorted(runs), "granule_count": stamp.get("granule_count")}
+    )
 
 
 def column_resolutions(levels: list, node_order: int) -> list[int]:

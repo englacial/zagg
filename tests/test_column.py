@@ -15,7 +15,13 @@ import obstore
 import pytest
 import zarr
 
-from zagg.column import column_resolutions, fold_column, leaf_slabs
+from zagg.column import (
+    column_resolutions,
+    fold_column,
+    generation_key,
+    leaf_slabs,
+    stamped_generation_key,
+)
 from zagg.grids.morton import morton_word
 from zagg.hive import MANIFEST_NAME, shard_leaf_path, stamp_commit
 from zagg.stats.tdigest import build_tdigest, merge_tdigests_kway
@@ -92,6 +98,61 @@ def _make_leaf(root, decimal, cells):
         group[name][:] = slab
     stamp_commit(store, cells_with_data=len(cells), granule_count=1)
     return slabs
+
+
+class TestGenerationKey:
+    """The staged sweep's skip-gate key as a PURE function (issues #417/#433).
+    The sweep's own tests pin the gate's behavior; these pin the grammar
+    ``docs/specification.md`` §4.5 declares normative — term order, the
+    non-block sentinel, and the additive MUST ("absent reads as the zero,
+    never as a wildcard") per term and for both at once."""
+
+    BLOCK = {
+        "n_leaves": 2,
+        "max_leaf_timestamp": "2026-08-11T00:00:00+00:00",
+        "run_ids": ["stage-b", "stage-a"],
+        "granule_count": 7,
+    }
+
+    def test_term_order_and_normalization(self):
+        # The third term is a sorted SET: recorded order is not a property.
+        ts, ids = "2026-08-11T00:00:00+00:00", ("stage-a", "stage-b")
+        assert generation_key(self.BLOCK) == (2, ts, ids, 7)
+
+    def test_a_non_block_matches_no_generation(self):
+        for value in (None, [], "generation", 0):
+            assert generation_key(value) == ()
+
+    @pytest.mark.parametrize("absent", ["run_ids", "granule_count"])
+    def test_an_absent_term_reads_as_its_zero_not_a_wildcard(self, absent):
+        older = {k: v for k, v in self.BLOCK.items() if k != absent}
+        assert generation_key(older) != generation_key(self.BLOCK)
+        assert generation_key(older) == generation_key({**older, absent: None})
+
+    def test_a_pre_417_block_carries_neither_term(self):
+        older = {k: self.BLOCK[k] for k in ("n_leaves", "max_leaf_timestamp")}
+        assert generation_key(older) == (2, self.BLOCK["max_leaf_timestamp"], (), 0)
+
+    def test_the_leaf_arm_is_the_identity_plus_the_stamp_terms(self):
+        """Issue #433's arm — a fleet-written leaf column has no ``generation``
+        block and a stamp with a count but no ``run_id`` (§4.6), so the granule
+        count is the only term a same-second rewrite can move."""
+        stamp = {"written_at": "2026-08-11T00:00:00+00:00", "granule_count": 3}
+        assert stamped_generation_key(None, stamp) == (1, stamp["written_at"], (), 3)
+        appended = stamped_generation_key(None, {**stamp, "granule_count": 4})
+        assert appended != stamped_generation_key(None, stamp)
+
+    def test_the_stage_arm_unions_the_id_and_takes_the_stamp_count(self):
+        stamp = {"written_at": "…", "run_id": "stage-c", "granule_count": 7}
+        assert stamped_generation_key(self.BLOCK, stamp) == (
+            2,
+            self.BLOCK["max_leaf_timestamp"],
+            ("stage-a", "stage-b", "stage-c"),
+            7,
+        )
+        # A pre-#433 stage column reads the stamp's count, never falls back to 0.
+        older = {k: v for k, v in self.BLOCK.items() if k != "granule_count"}
+        assert stamped_generation_key(older, stamp)[3] == 7
 
 
 class TestColumnResolutions:

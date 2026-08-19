@@ -51,7 +51,8 @@ append is ordinary under-coverage, recorded and healed by the next sweep.
 Stage-written stamps carry the run id: a skip-if-current read that sees a
 FOREIGN fresh stamp aborts loudly (:class:`ForeignSweepError` — the backstop
 for residual races the lease cannot see), and the run id is also a TERM of
-the skip key (issue #417), so a same-second rewrite cannot read as current.
+the skip key, with the granule count for the fleet-written children that
+carry none (issues #417/#433), so a same-second rewrite cannot read as current.
 
 **Soft barriers.** Inter-stage barriers are scheduling preferences, not
 correctness (#381 point (6)): a stage run before its finer tuple landed
@@ -301,11 +302,11 @@ class _ColumnReader:
     def generation(self) -> tuple:
         """This column's generation basis: its own, or the leaf identity.
 
-        :func:`zagg.column.stamped_generation_key`'s triple: a stage column's
-        recorded ``generation`` block (the summed ratchet) or a leaf column's
-        identity — one leaf at its stamp's timestamp — plus the run id THIS
-        column's own stamp carries (fleet-written ones carry none, review
-        finding). The parent's skip gate keys on the SUM of these.
+        :func:`zagg.column.stamped_generation_key`'s four terms: a stage
+        column's recorded ``generation`` block (the summed ratchet) or a leaf
+        column's identity — one leaf at its stamp's timestamp — plus the run
+        id and granule count THIS column's own stamp carries (fleet-written
+        ones carry no id, only a count). The parent's gate keys on the SUM.
         """
         from zagg.column import COLUMN_ATTR, stamped_generation_key
 
@@ -386,22 +387,24 @@ def _readers_for(
 def _summed_generation(rows: list) -> dict:
     """The ratchet key: child generations summed (skip-if-current basis).
 
-    ``run_ids`` is the union over the contributing children — issue #417's
-    term; see :func:`zagg.column.generation_key`.
+    ``run_ids`` unions the contributing children's, ``granule_count`` sums
+    them (issues #417/#433); see :func:`zagg.column.generation_key`.
     """
-    n, stamps, runs = 0, [], set()
+    n, granules, stamps, runs = 0, 0, [], set()
     for row in rows:
         for reader in row:
             if _is_reader(reader):
-                count, timestamp, run_ids = reader.generation()
+                count, timestamp, run_ids, granule_count = reader.generation()
                 n += count
                 stamps.append(timestamp)
                 runs.update(run_ids)
+                granules += granule_count
     stamps = [t for t in stamps if t is not None]
     return {
         "n_leaves": int(n),
         "max_leaf_timestamp": max(stamps) if stamps else None,
         "run_ids": sorted(runs),
+        "granule_count": int(granules),
     }
 
 
@@ -1051,11 +1054,12 @@ def stage_node(
     tuple order materializes every dirty artifact node beneath the dispatch
     node — skip-if-current keyed on SUMMED CHILD GENERATIONS (the ratchet:
     a healed or appended child moves the sum and forces the rewrite; a
-    content hash cannot be had without folding, so #417's count/timestamp/
-    run-id key is the gate) — and finally its own stage column (relay +
-    gatherables), unless this is the root tuple (no parent consumes it) or
-    the all-time item (per-window columns carry the gen-1 tier; an all-time
-    column would relay merged content, breaching the merge-source law).
+    content hash cannot be had without folding, so the #417/#433
+    count/timestamp/run-id/granule key is the gate) — and finally its own
+    stage column (relay + gatherables), unless this is the root tuple (no
+    parent consumes it) or the all-time item (per-window columns carry the
+    gen-1 tier; an all-time column would relay merged content, breaching the
+    merge-source law).
     """
     from zagg.column import generation_key
     from zagg.sweep_overview import ENVELOPE_NAME, _read_envelope

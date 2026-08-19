@@ -557,12 +557,17 @@ residual-race backstop).
 correctness: a tuple run before its finer tuple landed under-covers loudly
 (`source_children`) and self-heals on the next pass — the skip gate keys on
 summed child generations, so a healed child forces the parent rewrite. That
-key is a triple — leaf count, newest child stamp, and the set of `run_id`s
-those stamps carry ([issue #417](https://github.com/englacial/zagg/issues/417),
+key has four terms — leaf count, newest child stamp, the set of `run_id`s
+those stamps carry ([issue #417](https://github.com/englacial/zagg/issues/417))
+and their summed `granule_count`
+([issue #433](https://github.com/englacial/zagg/issues/433),
 [specification §4.5](specification.md)) — because stamps resolve to one
-second: without the run ids a child rewritten inside its own recorded second
-at an unchanged leaf count would read as current and the parent would keep
-the stale fold.
+second: without them a child rewritten inside its own recorded second at an
+unchanged leaf count would read as current and the parent would keep the
+stale fold. The last two divide the work by who wrote the child: a stage
+column carries the run id that wrote it, a fleet-written leaf column carries
+none — so at the finest tuple it is the granule count, which every writer
+stamps, that moves under a re-run over more granules.
 
 **Aging.** Stage reruns refresh the ancestor artifacts they revisit (a
 rewrite is a fresh PUT), and the finisher's manifest RMW + root-MOC write

@@ -42,7 +42,7 @@ ladder** (issue #418, the decision that issue asks to be made explicitly).
 What the model claims to predict exactly is what the *leaf workers* write:
 the leaf zarr, its sidecars, and — new — the leaf's own pyramid column.
 Everything the SWEEP writes stays outside the audited total, in the
-unbounded ``objects_rollups`` / ``objects_overviews`` buckets: the D9
+unbounded ``objects_rollups`` / ``objects_sweep`` buckets: the D9
 rollups (issue #300), the ladder overview zarrs above the shard node (issue
 #201/#384), and **stage columns** — the ``{window}.pyramid.zarr`` artifacts
 the staged sweep writes at ANCESTOR nodes (specification §4.6). Three
@@ -417,23 +417,22 @@ def store_object_counts(
     """LIST a run's output store and attribute its objects per shard.
 
     Returns ``{"objects_total", "objects_metadata", "objects_per_shard",
-    "objects_rollups", "objects_overviews", "objects_telemetry",
-    "objects_other", "other_keys"}``. ``objects_overviews`` is the
-    SECOND-PASS SWEEP bucket, of which overview zarrs are one family and
-    ancestor-node stage columns (issue #418) another — the name predates the
-    second family and is load-bearing for the record's readers, so it is
-    described here rather than renamed. ``objects_per_shard`` keys are the
-    dispatched shards' external labels (``grid.shard_label``); a data object
-    whose block resolves to an undispatched shard is keyed ``"block:<n>"`` so
-    a stray write is visible rather than silently pooled. ``other_keys`` is a
-    capped sample of unclassifiable keys.
+    "objects_rollups", "objects_sweep", "objects_telemetry", "objects_other",
+    "other_keys"}``. ``objects_sweep`` is the SECOND-PASS SWEEP bucket, of
+    which overview zarrs are one family and ancestor-node stage columns
+    (issue #418) another — named for the pass, not for one of its families
+    (issue #433). ``objects_per_shard`` keys are the dispatched shards'
+    external labels (``grid.shard_label``); a data object whose block resolves
+    to an undispatched shard is keyed ``"block:<n>"`` so a stray write is
+    visible rather than silently pooled. ``other_keys`` is a capped sample of
+    unclassifiable keys.
     """
     keys = [k for k in list_store_keys(store_path, **store_kwargs) if not _is_status_object(k)]
     per_shard: dict[str, int] = {}
     other: list[str] = []
     metadata = 0
     rollups = 0
-    overviews = 0
+    sweep = 0
     telemetry = 0
 
     if store_layout == "flat":
@@ -536,13 +535,13 @@ def store_object_counts(
                 # while the shard's cells were resident), so it counts into
                 # ``per_shard`` and rides the exact #215 guard; a column at
                 # any other node is a STAGE column the sweep wrote, which
-                # joins the overviews bucket outside the audited total (the
-                # leaf-only scope stated in the module docstring).
+                # joins the second-pass sweep bucket outside the audited total
+                # (the leaf-only scope stated in the module docstring).
                 column_node = _column_node(key)
                 if column_node is not None:
                     label = stats_of.get(column_node + "/")
                     if label is None:
-                        overviews += 1
+                        sweep += 1
                     else:
                         per_shard[label] = per_shard.get(label, 0) + 1
                     continue
@@ -555,7 +554,7 @@ def store_object_counts(
                 # id-named `.zarr` outside the dispatched leaf set stays a
                 # loud ``other`` finding.
                 if _overview_node(key) is not None:
-                    overviews += 1
+                    sweep += 1
                     continue
                 node, _, name = key.rpartition("/")
                 # Sidecar grammars, both naming generations
@@ -584,7 +583,7 @@ def store_object_counts(
                     # nor steal a real leaf sidecar's attribution; the
                     # ``overview_nodes`` anchor keeps every OTHER ``.stats.json``
                     # (store root, stray prefix, undispatched leaf) loud.
-                    overviews += 1
+                    sweep += 1
                 else:
                     other.append(key)
     else:
@@ -595,7 +594,7 @@ def store_object_counts(
         "objects_metadata": metadata,
         "objects_per_shard": per_shard,
         "objects_rollups": rollups,
-        "objects_overviews": overviews,
+        "objects_sweep": sweep,
         "objects_telemetry": telemetry,
         "objects_other": len(other),
         "other_keys": other[:20],
@@ -665,9 +664,10 @@ def write_path_total(measured: dict) -> int:
     ``objects_total`` is every object under the store prefix. Three buckets are
     not write-path objects and are subtracted here:
 
-    * sweep rollups (issue #300) and overview zarrs (issue #201) — second-pass
+    * ``objects_rollups`` (issue #300) and ``objects_sweep`` — the second-pass
       D9 caches the end-of-run sweep may or may not have landed by measurement
-      time (fire-and-forget on Lambda);
+      time (fire-and-forget on Lambda: overview zarrs, issue #201, and stage
+      columns, issue #418);
     * per-run root telemetry (issue #362) — additionally unbounded, since its
       names are per-run unique, so a reused store accumulates it and no fixed
       expectation could ever hold.
@@ -676,11 +676,20 @@ def write_path_total(measured: dict) -> int:
     ``objects_expected`` is comparable to; ``objects_total`` stays gross
     because storage/cost questions want every object. Single-sourced so the
     reported figure and the asserted figure cannot drift apart.
+
+    Only ``objects_total`` is subscripted; the three subtrahends are read
+    tolerantly ON PURPOSE (review finding) — :func:`object_count_mismatch`
+    accepts a PARTIAL ``measured`` carrying just the terms an assertion
+    needs, so a caller that never swept omits the sweep buckets rather than
+    writing zeros. The cost of that tolerance is that a bucket RENAME would
+    under-subtract silently instead of raising; the key set the measured side
+    emits is pinned directly against this docstring so a half-done rename
+    fails there first.
     """
     return (
         measured["objects_total"]
         - measured.get("objects_rollups", 0)
-        - measured.get("objects_overviews", 0)
+        - measured.get("objects_sweep", 0)
         - measured.get("objects_telemetry", 0)
     )
 

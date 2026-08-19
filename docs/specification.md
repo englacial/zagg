@@ -750,7 +750,8 @@ to the append-later cascade regime), and `source_children` (present in both
 stage regimes: a gather that under-covers says so exactly like a merge) —
 plus `run_id`, the sweep run that wrote the artifact, and a `generation`
 block summing the consumed children (the stage skip gate's ratchet key —
-`{n_leaves, max_leaf_timestamp, run_ids}`, composition in §4.5).
+`{n_leaves, max_leaf_timestamp, run_ids, granule_count}`, composition in
+§4.5).
 The commit stamp of a stage-written artifact carries the same `run_id` key
 (additive to the stamp grammar; fleet-written stamps never carry it, and a
 reader treats its absence as "not a stage artifact", never an error): it is
@@ -1039,26 +1040,44 @@ staged sweep's finisher.
   ```json
   "generation": {"n_leaves": 16,
                  "max_leaf_timestamp": "2026-08-09T00:00:00+00:00",
-                 "run_ids": ["stage-20260809T000000Z-ab12cd"]}
+                 "run_ids": ["stage-20260809T000000Z-ab12cd"],
+                 "granule_count": 512}
   ```
 
   — the summed leaf count of the consumed children, the newest child stamp,
-  and the **sorted set of `run_id`s** those children's stamps carry, unioned
+  the **sorted set of `run_id`s** those children's stamps carry, unioned
   with the ids their own recorded blocks relay
-  ([#417](https://github.com/englacial/zagg/issues/417)). A level is folded
-  again exactly when this triple moves. The third term is load-bearing:
+  ([#417](https://github.com/englacial/zagg/issues/417)), and the summed
+  `granule_count` of those same stamps
+  ([#433](https://github.com/englacial/zagg/issues/433)). A level is folded
+  again exactly when these four terms move. The last two are load-bearing:
   stamps resolve to **one second**, so the first two alone read a child
   rewritten inside its own recorded second at an unchanged leaf count as
   *current*, and the `/1` content-hash backstop cannot apply without doing
   the fold the skip exists to avoid. A run may not rewrite its own object
   mid-run (single-writer law, §4.8), so a same-second rewrite is a foreign
-  run's and moves the set. `run_ids` is **additive**: absent, it MUST be
-  read as the empty set (a pre-#417 entry, or children that are all
-  fleet-written leaf columns — those stamps carry no `run_id`), never as a
-  wildcard that matches any set, so an upgraded store folds once more
-  rather than inheriting the blind spot. Fleet-written leaf columns
-  contribute no run id, so at the finest tuple the term is empty and the
-  gate rests on the pair alone.
+  run's and moves the id set — but only where the children are stage
+  artifacts: **fleet-written leaf columns carry no `run_id`** (§4.6:
+  absence means not-a-stage-artifact), so at the finest dispatch tuple that
+  term is empty and `granule_count` is what moves. Every stamp, fleet or
+  stage, records the granules it folded, so a leaf re-run over more
+  granules — the common append case — moves the fourth term at an unchanged
+  leaf count and second. A stage stamp's `granule_count` is already the sum
+  over its own children, so the term ratchets up the ladder exactly as
+  `n_leaves` does.
+
+  Both terms are **additive**: absent, `run_ids` MUST be read as the empty
+  set and `granule_count` as `0` — never as a wildcard that matches any
+  value — so an upgraded store (a pre-#417 or pre-#433 entry) folds once
+  more rather than inheriting the blind spot.
+
+  **Known boundary.** A rewrite that changes none of the four terms — same
+  leaf count, same recorded second, no `run_id`, same `granule_count` — is
+  invisible to the gate. A fleet leaf re-run over the *same* granule set
+  that nonetheless folds different bytes (a changed field declaration, a
+  repaired torn write) is the shape of it. The gate is a staleness ratchet,
+  not a content check: it deliberately decides without folding, and the `/1`
+  content hash is where content divergence is caught.
 
 ### 4.6 Leaf column artifacts (`zagg-column/1`)
 
@@ -1227,7 +1246,8 @@ members at the same resolution — `groups` entries record `regime:
 **relay member** (the group at `shard_order`: the subtree's leaf node-order
 partials, the merge-source tier every coarser merge consumes — the espg
 merge-source ruling on the #384 thread). Stage-column attrs additionally
-carry `generation` (`{n_leaves, max_leaf_timestamp, run_ids}` summed over
+carry `generation` (`{n_leaves, max_leaf_timestamp, run_ids, granule_count}`
+summed over
 the consumed children — the parent's skip-gate key, §4.5), `source_children` (a
 gather that under-covered says so in the artifact), and `run_id`; the
 commit stamp carries `run_id` too. Cadence decides placement (columns sit
@@ -1286,7 +1306,9 @@ carry `run_id`, and a skip-if-current read that sees a foreign stamp
 written after the run started aborts loudly). The same `run_id` is a **term
 of the skip key** (§4.5): the abort covers a foreign stamp written *since
 this run started*, and the key covers the foreign rewrite that landed
-before it — inside the second the timestamp cannot resolve.
+before it — inside the second the timestamp cannot resolve. A *fleet*
+rewrite of a leaf column carries no `run_id` for either mechanism to see,
+which is why the key's fourth term is the leaf's `granule_count` (§4.5).
 
 ## 5. O11 content hashes
 

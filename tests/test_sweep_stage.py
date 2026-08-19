@@ -762,11 +762,13 @@ class TestBothChannelsStageSweep:
 
 
 class TestSameSecondSkipGate:
-    """Issue #417: the skip key carries the stamping RUN IDS, not the timestamp
-    alone. ``hive._utcnow`` resolves to one second, so a child rewritten inside
-    the same second at an unchanged leaf count moved neither term of the old
-    ``(n_leaves, max_leaf_timestamp)`` pair — the gate read it as current and
-    served the stale fold."""
+    """Issues #417/#433: the skip key carries the stamping RUN IDS and the
+    summed GRANULE COUNT, not the timestamp alone. ``hive._utcnow`` resolves to
+    one second, so a child rewritten inside the same second at an unchanged leaf
+    count moved neither term of the old ``(n_leaves, max_leaf_timestamp)`` pair
+    — the gate read it as current and served the stale fold. The two added
+    terms split by who wrote the child: a stage column carries a ``run_id``, a
+    fleet-written leaf column carries only its granule count."""
 
     def test_same_second_foreign_rewrite_is_refolded(self, tmp_path):
         root = tmp_path / "s"
@@ -810,6 +812,32 @@ class TestSameSecondSkipGate:
         # sibling '1112' partial (272), where it held 136 + 272 before.
         assert before[0] == 136 + 272 and after[0] == 1000 + 272
 
+    def test_same_second_fleet_rewrite_of_a_leaf_is_refolded(self, tmp_path):
+        """Issue #433's arm: the FINEST tuple, whose children are fleet-written
+        leaf columns. Their stamps carry no ``run_id`` at all (specification
+        §4.6 — absence means not-a-stage-artifact), so #417's third term is
+        empty here and the fourth is what moves: a leaf re-run over MORE
+        GRANULES, restamped inside its own recorded second at an unchanged leaf
+        count. No injected stamp grammar — ``write_column`` writes exactly the
+        stamp this asserts on."""
+        root = tmp_path / "s"
+        m = _stage_store(root)
+        _sweep(root, m)
+        leaf = "1/1/1/1/all.pyramid.zarr"
+        stamp = dict(_artifact(root, leaf).attrs)["morton_hive_commit"]
+        was, granules = stamp["written_at"], stamp["granule_count"]
+        _write_leaf(root, "1111", 9, granules=granules + 1)
+        _restamp(root, leaf, written_at=was)
+        stamp = dict(_artifact(root, leaf).attrs)["morton_hive_commit"]
+        assert stamp["written_at"] == was and "run_id" not in stamp
+        (row,) = _sweep(root, m, run_id="B")["stages"]
+        assert row["written"] > 0
+        # The parent carries the REWRITE's partial (136 * 10), not the stale
+        # one, and so does every level above it.
+        assert list(_artifact(root, "1/1/1/all.zarr")["3"]["count"][:])[0] == 136 * 10
+        assert list(_artifact(root, "1/1/all.zarr")["2"]["count"][:])[0] == 136 * 10 + 272
+        assert list(_artifact(root, "1/all.zarr")["1"]["count"][:])[0] == 136 * 10 + 272 + 408
+
     def test_entry_without_run_ids_stays_current(self, tmp_path):
         """The upgrade path: a pre-#417 entry keys on the empty run-id set, and
         fleet-written leaf columns carry no run id, so nothing re-folds."""
@@ -823,6 +851,21 @@ class TestSameSecondSkipGate:
             path.write_text(json.dumps(envelope, indent=1))
         (row,) = _sweep(root, m, run_id="B")["stages"]
         assert row["written"] == 0 and row["current"] == 7
+
+    def test_entry_without_a_granule_count_refolds_once(self, tmp_path):
+        """The other half of the upgrade path: a pre-#433 entry keys on ``0``,
+        never on a wildcard, so a store swept before the term existed folds once
+        more rather than inheriting the blind spot (specification §4.5)."""
+        root = tmp_path / "s"
+        m = _stage_store(root)
+        _sweep(root, m)
+        for path in root.rglob(ENVELOPE_NAME):
+            envelope = json.loads(path.read_text())
+            for entry in envelope["windows"].values():
+                assert entry["generation"].pop("granule_count") > 0
+            path.write_text(json.dumps(envelope, indent=1))
+        (row,) = _sweep(root, m, run_id="B")["stages"]
+        assert row["written"] == 7 and row["current"] == 0
 
 
 class TestMergeSourceLaw:
