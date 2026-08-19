@@ -966,6 +966,19 @@ class TestShippedTemplate:
         assert cfg.data_source["bands"]["scl"]["dtype"] == "uint8"
         assert cfg.output["grid"]["child_order"] == 19
 
+    def test_sentinel2_l2a_config_declares_the_overview_family_off(self):
+        # Issue #459: an ABSENT output.pyramid resolves to the every-2-orders
+        # default schedule (``get_pyramid`` -> ``{}``), so a raster run
+        # dispatches an overview family that generates nothing -- raster leaves
+        # are column-less by construction (issue #399 option (b), unimplemented).
+        # The shipped template declares the opt-out rather than inheriting the
+        # default, and ``None`` is the "family OFF" resolution.
+        from zagg.config import get_pyramid
+
+        cfg = default_config("sentinel2_l2a")
+        assert cfg.output["pyramid"] is False
+        assert get_pyramid(cfg) is None
+
 
 class TestRasterHiveLocalBackend:
     """Local raster hive runs (issue #247 phase 3): manifest, leaves, coverage."""

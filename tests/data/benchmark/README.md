@@ -179,6 +179,20 @@ places the panel.
    print(bench_metrics.select_densest_shard(sm))   # -> (shard_key, n_granules)
    ```
 
+   > **Re-pinning a map that already exists** is one command:
+   > `tools/repin_benchmark_shardmaps.py` (issue #444) rebuilds through the
+   > drift check's own recipe, selects the pin (nested rule included), prunes
+   > the ring maps, and writes the map plus its `targets.json`
+   > `shard_key`/`n_granules`. It re-pins **deliberately** — the drift check
+   > stays the accident detector — so run it only when a convention or grammar
+   > change makes the committed words wrong. `--check` rebuilds and reports the
+   > differences without writing. The entry's `note` is prose: restate it by
+   > hand in the same commit.
+   >
+   > ```bash
+   > uv run python tools/repin_benchmark_shardmaps.py --check healpix_o9_88s
+   > ```
+
    > **The committed maps span two granule-record schemas.** The five
    > `sm_healpix_*.json` maps were last rebuilt after issue #246, so their
    > granule records carry `time_start`/`time_end` (and their `metadata` a

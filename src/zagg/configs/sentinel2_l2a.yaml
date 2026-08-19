@@ -38,6 +38,7 @@ output:
   # int64 microseconds cannot state and a toc word can. Output-defining: a
   # store born on toc is a different product from a legacy-axis one.
   time_encoding: toc
+  pyramid: false                 # overview family off: raster leaves are column-less (issue #399, issue #459)
   grid:
     type: healpix
     parent_order: 11
