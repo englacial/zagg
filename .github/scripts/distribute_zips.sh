@@ -6,13 +6,21 @@
 # current at pip-install time. Idempotent: re-running a release overwrites that
 # minor's objects.
 #
-# Since issue #497 the destination is Source Cooperative, not the in-account
-# `sliderule-public-cors` bucket: that bucket cannot host public data under
-# NASA's clearance posture and is being retired (issue #499). --prefix produces
-# publish_mirror.sh's layout (<prefix>/<minor>/<zip>), and stand_up.sh already
-# reads it via DIST_PREFIX, so the write side and the read side match.
+# The destination is whatever --bucket says. publish.yml passes the in-account
+# `sliderule-public-cors` bucket with no prefix, which is what runs today.
+#
+# Since issue #497 this also SUPPORTS Source Cooperative: --prefix produces
+# publish_mirror.sh's layout (<prefix>/<minor>/<zip>), which stand_up.sh already
+# reads via DIST_PREFIX, and a published destination gets the owner ACL below.
+# publish.yml is not pointed at it yet -- that half of issue #497 phase 2 is
+# still to land, and the move matters because the dist bucket cannot host public
+# data under NASA's clearance posture and is being retired (issue #499).
 #
 # Usage:
+#   # today's release path
+#   distribute_zips.sh --minor 0.2 --tag 0.2.3 --bucket sliderule-public-cors \
+#       --dir ./zips [--region us-west-2]
+#   # the Source Cooperative destination (issue #497)
 #   distribute_zips.sh --minor 0.2 --tag 0.2.3 \
 #       --bucket us-west-2.opendata.source.coop --prefix englacial/zagg/lambda \
 #       --dir ./zips [--region us-west-2]

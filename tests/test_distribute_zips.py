@@ -6,10 +6,11 @@ versions.json index at the destination root. The versions.json read-modify-write
 is the part with real logic, so it's covered against both the seed (absent) and
 merge paths.
 
-Since issue #497 the destination is Source Cooperative under a key prefix, so
-the ``--prefix`` layout and the ``bucket-owner-full-control`` ACL that Source
-Cooperative requires (issue #495 phase 1) are covered too -- including the
-in-account bucket case, where the ACL must NOT be sent.
+Since issue #497 the script also supports Source Cooperative under a key prefix
+(``publish.yml`` is not pointed at it yet), so the ``--prefix`` layout and the
+``bucket-owner-full-control`` ACL that destination requires (issue #495 phase 1)
+are covered too -- including the in-account bucket case that runs today, where
+the ACL must NOT be sent.
 """
 
 import json
@@ -54,9 +55,9 @@ exit 0
 """
 
 
-#: The release destination since issue #497: Source Cooperative, under the same
+#: The destination issue #497 prepares for -- Source Cooperative, under the same
 #: <prefix>/<minor>/<zip> layout publish_mirror.sh writes and stand_up.sh's
-#: DIST_PREFIX already reads.
+#: DIST_PREFIX already reads. Not yet what publish.yml passes.
 MIRROR_BUCKET = "us-west-2.opendata.source.coop"
 MIRROR_PREFIX = "englacial/zagg/lambda"
 
