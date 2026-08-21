@@ -393,14 +393,38 @@ def _template_named_twins():
     return twins
 
 
-def _statement_arns(role, sid):
-    """The !Sub ARN strings of the role's Sid=<sid> policy statement."""
+def _role_statements(role):
+    """The inline policy statements of a benchmark_cicd.yaml CI/CD role."""
     tpl = _load_cfn(CICD)
-    statements = tpl["Resources"][role]["Properties"]["Policies"][0]["PolicyDocument"]["Statement"]
-    stmt = next(s for s in statements if s.get("Sid") == sid)
-    resource = stmt["Resource"]
+    return tpl["Resources"][role]["Properties"]["Policies"][0]["PolicyDocument"]["Statement"]
+
+
+def _statement(role, sid):
+    """The role's Sid=<sid> policy statement."""
+    return next(s for s in _role_statements(role) if s.get("Sid") == sid)
+
+
+def _actions(statement):
+    """A statement's Action entries, whether scalar or list.
+
+    Normalizing first is load-bearing: ``"s3:Foo" in statement["Action"]`` is a
+    substring test rather than a membership test when Action is a scalar string,
+    and this template carries both shapes.
+    """
+    action = statement.get("Action")
+    return action if isinstance(action, list) else [action]
+
+
+def _arns(statement):
+    """A statement's Resource ARNs, ``!Sub`` flattened."""
+    resource = statement["Resource"]
     items = resource if isinstance(resource, list) else [resource]
     return [item["Sub"] if isinstance(item, dict) else item for item in items]
+
+
+def _statement_arns(role, sid):
+    """The !Sub ARN strings of the role's Sid=<sid> policy statement."""
+    return _arns(_statement(role, sid))
 
 
 def _script_default_variants():
@@ -599,3 +623,130 @@ def test_role_statements_enumerate_exact_arns():
             assert "*" not in arn, (
                 f"{role}.{sid} in {CICD} must enumerate exact ARNs, found wildcard: {arn}"
             )
+
+
+# --- Source Cooperative publication grant (issue #497 phase 1) --------------
+# The EXISTING zagg-lambda-release role gets S3 write on zagg's Source
+# Cooperative prefix -- it already had the right trust domain (GitHub Actions
+# OIDC) and needed permissions, not an identity. Same statement shape as the
+# fleet's published grant in template.yaml (issue #495, asserted in
+# tests/test_lambda_build.py); the roles stay separate because the trust
+# domains genuinely differ.
+
+MIRROR_SCRIPT = REPO / "deployment" / "aws" / "publish_mirror.sh"
+SOURCE_COOP = "arn:aws:s3:::us-west-2.opendata.source.coop"
+
+
+def _cicd_roles():
+    """Every IAM role benchmark_cicd.yaml provisions.
+
+    Derived, not typed out: the sweeps below exist to catch a stray
+    ``s3:PutObjectAcl`` or a widened source.coop grant, and a role added to this
+    stack later is exactly where one would appear.
+    """
+    tpl = _load_cfn(CICD)
+    roles = [k for k, v in tpl["Resources"].items() if v.get("Type") == "AWS::IAM::Role"]
+    assert roles, f"no AWS::IAM::Role resources found in {CICD}"
+    return roles
+
+
+def _mirror_destination():
+    """(bucket, prefix) publish_mirror.sh defaults to, read from its shell defaults.
+
+    Read from the script rather than restated, so the grant is pinned to the
+    destination the mirror actually writes and not to a copy of it that drifts.
+    """
+    text = MIRROR_SCRIPT.read_text()
+    bucket = re.search(r'^MIRROR_BUCKET="\$\{MIRROR_BUCKET:-([^}]+)\}"', text, re.MULTILINE)
+    prefix = re.search(r'^MIRROR_PREFIX="\$\{MIRROR_PREFIX:-([^}]+)\}"', text, re.MULTILINE)
+    assert bucket and prefix, f"MIRROR_BUCKET/MIRROR_PREFIX defaults not found in {MIRROR_SCRIPT}"
+    return bucket.group(1), prefix.group(1)
+
+
+def test_release_role_reaches_exactly_the_mirror_keys():
+    bucket, prefix = _mirror_destination()
+    # publish_mirror.sh's own repo-root block: MIRROR_REPO_PREFIX=${MIRROR_PREFIX%/lambda}.
+    repo_prefix = prefix.removesuffix("/lambda")
+    assert repo_prefix != prefix, f"{MIRROR_SCRIPT} no longer publishes under a lambda/ prefix"
+    assert _arns(_statement("ReleaseRole", "PublishToSourceCoop")) == [
+        f"arn:aws:s3:::{bucket}/{prefix}/*",
+        # Enumerated exact keys, not an englacial/zagg/* wildcard: the repo-root
+        # index + license are the only things outside lambda/ the mirror writes.
+        f"arn:aws:s3:::{bucket}/{repo_prefix}/README.md",
+        f"arn:aws:s3:::{bucket}/{repo_prefix}/LICENSE",
+    ]
+
+
+def test_published_grant_carries_the_acl_and_multipart_halves():
+    # PutObjectAcl is load-bearing, not incidental: distribute_zips.sh sends
+    # x-amz-acl: bucket-owner-full-control to a published destination, and S3
+    # evaluates it against s3:PutObjectAcl on PutObject AND on
+    # CreateMultipartUpload -- without the grant that PUT 403s (issue #496: the
+    # two halves are only correct together). publish_mirror.sh sends no ACL, so
+    # the two repo-root keys it alone writes are not yet reachable under this
+    # role; that is raised on the PR, not fixed here (issue #497 does not name
+    # it). The multipart pair covers the failure path PutObject does not:
+    # the CLI's own abort of an in-flight layer upload would otherwise 403 and
+    # leak parts billed to Source Cooperative. DeleteObject is deliberately
+    # absent -- a re-published minor overwrites, and the mirror never prunes.
+    assert sorted(_actions(_statement("ReleaseRole", "PublishToSourceCoop"))) == [
+        "s3:AbortMultipartUpload",
+        "s3:GetObject",
+        "s3:ListMultipartUploadParts",
+        "s3:PutObject",
+        "s3:PutObjectAcl",
+    ]
+
+
+def test_put_object_acl_is_granted_on_the_published_destination_only():
+    # The canned ACL is not sent to the dist bucket (we already own those
+    # objects), so granting PutObjectAcl there would be unexplained privilege --
+    # the same rule template.yaml's execution role follows for
+    # sliderule-public-cors.
+    published = _arns(_statement("ReleaseRole", "PublishToSourceCoop"))
+    for role in _cicd_roles():
+        for stmt in _role_statements(role):
+            if "s3:PutObjectAcl" in _actions(stmt):
+                assert _arns(stmt) == published, (
+                    f"{role} grants s3:PutObjectAcl outside the published destination: "
+                    f"{_arns(stmt)}"
+                )
+
+
+def test_published_list_bucket_is_unconditional():
+    bucket = _statement("ReleaseRole", "ListSourceCoopBucket")
+    assert _arns(bucket) == [SOURCE_COOP]
+    # s3:ListBucket ONLY. ListBucketMultipartUploads is bucket-wide (s3:prefix
+    # cannot constrain it), so Source Cooperative's bucket policy does not grant
+    # it and holding it here would be denied cross-account anyway (espg,
+    # 2026-08-20).
+    assert _actions(bucket) == ["s3:ListBucket"]
+    # An s3:prefix condition would make absent objects 403 instead of 404 (a
+    # GetObject evaluation carries no s3:prefix context key). distribute_zips.sh
+    # seeds versions.json only on a miss and treats any other read failure as
+    # fatal, so the condition would not corrupt the index -- it would fail every
+    # release instead, which is no better a place to discover it.
+    assert "Condition" not in bucket, (
+        "an s3:prefix condition on ListBucket makes absent objects 403 instead "
+        "of 404, which distribute_zips.sh reads as a failed index read, not a miss"
+    )
+
+
+def test_release_role_does_not_pre_empt_the_benchmarks_prefix():
+    # Whether zagg-bench-*/zagg-examples/* migrate to englacial/zagg/benchmarks/
+    # is question (1) of issue #497 and is unresolved, so the grant must not
+    # reach it -- nor the fleet's demo/ prefix (template.yaml, issue #495).
+    reachable = {
+        arn
+        for role in _cicd_roles()
+        for stmt in _role_statements(role)
+        for arn in _arns(stmt)
+        if isinstance(arn, str) and "source.coop" in arn
+    }
+    assert not any(
+        arn.startswith(f"{SOURCE_COOP}/englacial/zagg/benchmarks") for arn in reachable
+    ), "issue #497 question (1) is unresolved -- the grant must not pre-empt benchmarks/"
+    assert not any(
+        arn in (f"{SOURCE_COOP}/englacial/*", f"{SOURCE_COOP}/englacial/zagg/*")
+        for arn in reachable
+    ), "the fine-grained split lives on our side -- do not grant the whole org prefix"
