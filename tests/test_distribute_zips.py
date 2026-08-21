@@ -134,9 +134,12 @@ def test_versions_index_merges_and_sorts(tmp_path):
 def test_index_lives_under_the_prefix_not_the_bucket_root(tmp_path):
     # The mirror bucket's root is another organization's namespace -- the index
     # belongs beside the minors, and stand_up.sh reads it there (dist_root()).
+    # Asserted on the s3:// ARGUMENTS rather than as a substring of the log, so
+    # the test states the destination instead of relying on how the line reads.
     root, log = _run(tmp_path)
-    assert f"s3://{MIRROR_BUCKET}/{MIRROR_PREFIX}/versions.json" in log
-    assert f"s3://{MIRROR_BUCKET}/versions.json " not in log
+    targets = {arg for ln in log.splitlines() for arg in ln.split() if arg.startswith("s3://")}
+    index = f"s3://{MIRROR_BUCKET}/{MIRROR_PREFIX}/versions.json"
+    assert {t for t in targets if t.endswith("/versions.json")} == {index}
     assert (root / "versions.json").exists()
 
 
