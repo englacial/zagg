@@ -637,6 +637,19 @@ MIRROR_SCRIPT = REPO / "deployment" / "aws" / "publish_mirror.sh"
 SOURCE_COOP = "arn:aws:s3:::us-west-2.opendata.source.coop"
 
 
+def _cicd_roles():
+    """Every IAM role benchmark_cicd.yaml provisions.
+
+    Derived, not typed out: the sweeps below exist to catch a stray
+    ``s3:PutObjectAcl`` or a widened source.coop grant, and a role added to this
+    stack later is exactly where one would appear.
+    """
+    tpl = _load_cfn(CICD)
+    roles = [k for k, v in tpl["Resources"].items() if v.get("Type") == "AWS::IAM::Role"]
+    assert roles, f"no AWS::IAM::Role resources found in {CICD}"
+    return roles
+
+
 def _mirror_destination():
     """(bucket, prefix) publish_mirror.sh defaults to, read from its shell defaults.
 
@@ -691,7 +704,7 @@ def test_put_object_acl_is_granted_on_the_published_destination_only():
     # the same rule template.yaml's execution role follows for
     # sliderule-public-cors.
     published = _arns(_statement("ReleaseRole", "PublishToSourceCoop"))
-    for role in ("ReleaseRole", "DeployRole", "BenchmarkInvokeRole"):
+    for role in _cicd_roles():
         for stmt in _role_statements(role):
             if "s3:PutObjectAcl" in _actions(stmt):
                 assert _arns(stmt) == published, (
@@ -725,7 +738,7 @@ def test_release_role_does_not_pre_empt_the_benchmarks_prefix():
     # reach it -- nor the fleet's demo/ prefix (template.yaml, issue #495).
     reachable = {
         arn
-        for role in ("ReleaseRole", "DeployRole", "BenchmarkInvokeRole")
+        for role in _cicd_roles()
         for stmt in _role_statements(role)
         for arn in _arns(stmt)
         if isinstance(arn, str) and "source.coop" in arn
