@@ -431,13 +431,16 @@ the section-2 stack (`benchmark_cicd.yaml`). Their grants, for reference:
     `s3://us-west-2.opendata.source.coop/englacial/zagg/lambda/*` (plus the
     repo-root `README.md`/`LICENSE` keys), and an **unconditioned**
     `s3:ListBucket` on that bucket — the Source Cooperative mirror (issue #497).
-    `PutObjectAcl` travels with `PutObject`: every write carries
-    `x-amz-acl: bucket-owner-full-control` and the two halves are only correct
-    together (issue #496). The `ListBucket` grant carries no `s3:prefix`
-    condition on purpose — with one, an absent key answers 403 instead of 404
-    and `distribute_zips.sh` would reseed `versions.json` instead of merging
-    into it. `englacial/zagg/benchmarks/*` is deliberately **not** granted
-    (issue #497 question (1) is open).
+    `PutObjectAcl` travels with `PutObject`: a write carrying
+    `x-amz-acl: bucket-owner-full-control` needs both halves (issue #496).
+    `distribute_zips.sh` sends that header to a published destination;
+    `publish_mirror.sh` sends none, so the two repo-root keys it alone writes are
+    granted but not yet reachable under this role. The `ListBucket` grant carries
+    no `s3:prefix` condition on purpose — with one, an absent key answers 403
+    instead of 404, and `distribute_zips.sh` seeds `versions.json` only on a
+    genuine miss and treats any other read failure as fatal, so a conditioned
+    grant would fail every release. `englacial/zagg/benchmarks/*` is deliberately
+    **not** granted (issue #497 question (1) is open).
 
 **Verify:** `aws iam get-role --role-name zagg-benchmark-deploy` /
 `zagg-lambda-release`.
