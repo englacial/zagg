@@ -366,10 +366,18 @@ Resources:
               # answers 403 AccessDenied. A GetObject request carries no
               # s3:prefix context key, so a StringLike on it never matches
               # during a GET evaluation and every absent object would come back
-              # 403. distribute_zips.sh reads versions.json with
-              # `aws s3 cp ... || echo '{"minors": []}'`, which cannot tell 403
-              # from 404 -- a 403 there would silently reseed the index and drop
-              # every previously published minor from it.
+              # 403. distribute_zips.sh must be able to tell "not published yet"
+              # from "denied": it seeds the index only on a miss and treats every
+              # other read failure as fatal, so a 403 here stops the release
+              # rather than republishing an empty index.
+              #
+              # Cross-account this grant is necessary, not sufficient -- Source
+              # Cooperative's bucket policy has to permit the list for our
+              # principal too, and issue #497 records unsigned ListObjectsV2
+              # against the bucket, so it does. The ListBucketMultipartUploads
+              # note above is the same two-sided rule with the opposite answer:
+              # that action is bucket-wide, their policy does not grant it, so
+              # holding it here would be denied whatever we write.
               - Sid: ListSourceCoopBucket
                 Effect: Allow
                 Action: s3:ListBucket

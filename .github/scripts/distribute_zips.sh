@@ -81,13 +81,32 @@ done
 ( cd "$DIR" && sha256sum lambda_layer_*.zip lambda_function_*.zip > SHA256SUMS )
 aws s3 cp "$DIR/SHA256SUMS" "$BASE/$MINOR/SHA256SUMS" --region "$REGION" $ACL
 
-# Merge this minor into the root index (read-modify-write; absent => seed). The
-# read must be able to tell "not published yet" from "denied": the release role
-# holds an UNCONDITIONED s3:ListBucket on the destination (issue #497) so an
-# absent key answers 404 rather than 403 -- otherwise a permissions fault would
-# reseed the index here and silently drop every published minor from it.
-aws s3 cp "$BASE/versions.json" ./versions.json --region "$REGION" 2>/dev/null \
-  || echo '{"minors": []}' > versions.json
+# Merge this minor into the index (read-modify-write). ONLY a genuinely absent
+# index seeds: the next statement PUTs this file back over the good one, so
+# treating any failure as "absent" turns a throttle, a 5xx, an expired session or
+# a typo'd --prefix into a silent republish of an empty index -- destructive
+# without a DeleteObject in sight, and recoverable only from bucket versioning we
+# do not control. Anything that is not a miss is fatal, with the CLI's own
+# message kept (never 2>/dev/null) so the release log says why.
+#
+# The miss has to answer 404, not 403: S3 returns NoSuchKey only to a caller
+# holding s3:ListBucket on the bucket, which the release role holds unconditioned
+# (issue #497). Cross-account that is necessary, not sufficient -- Source
+# Cooperative's bucket policy has to permit the list for our principal too; issue
+# #497 records unsigned ListObjectsV2 against the bucket, so it does.
+#
+# Two legitimate seeds: the first release ever published to a destination, and
+# the first release after the destination moves -- today's index lives at
+# sliderule-public-cors/versions.json, not under the new prefix, so the first
+# mirrored release seeds rather than merges.
+if ERR="$(aws s3 cp "$BASE/versions.json" ./versions.json --region "$REGION" 2>&1)"; then
+  :
+elif printf '%s' "$ERR" | grep -qE '404|Not Found|NoSuchKey|does not exist'; then
+  echo '{"minors": []}' > versions.json
+else
+  echo "ERROR: could not read $BASE/versions.json: $ERR" >&2
+  exit 1
+fi
 python3 - "$MINOR" "$TAG" <<'PY'
 import json, sys
 minor, tag = sys.argv[1], sys.argv[2]

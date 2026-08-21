@@ -27,7 +27,9 @@ WORKFLOW = REPO / ".github" / "workflows" / "publish.yml"
 
 # A stub `aws` CLI: logs every `s3 cp`, fails the versions.json *download* unless
 # a seed exists in $SEED_DIR, and captures every *upload* into $CAPTURE_DIR so the
-# test can read back what the script produced.
+# test can read back what the script produced. The download failure carries the
+# CLI's real 404 wording, because the script now discriminates on it; $READ_ERROR
+# overrides it to stand in for a failure that is NOT a clean miss.
 STUB_AWS = """#!/bin/bash
 set -euo pipefail
 if [ "$1" = "s3" ] && [ "$2" = "cp" ]; then
@@ -37,6 +39,8 @@ if [ "$1" = "s3" ] && [ "$2" = "cp" ]; then
     # download: serve a seeded versions.json if present, else fail (not found).
     base="$(basename "$SRC")"
     if [ -f "$SEED_DIR/$base" ]; then cp "$SEED_DIR/$base" "$DST"; exit 0; fi
+    echo "${READ_ERROR:-fatal error: An error occurred (404) when calling the \
+HeadObject operation: Key \\"$SRC\\" does not exist}" >&2
     exit 1
   else
     # upload: capture under the destination key.
@@ -57,11 +61,15 @@ MIRROR_BUCKET = "us-west-2.opendata.source.coop"
 MIRROR_PREFIX = "englacial/zagg/lambda"
 
 
-def _run(tmp_path, *, seed_versions=None, bucket=MIRROR_BUCKET, prefix=MIRROR_PREFIX):
-    """Run the script against the stub and return (destination root, aws log).
+def _prepare(
+    tmp_path, *, seed_versions=None, bucket=MIRROR_BUCKET, prefix=MIRROR_PREFIX, read_error=None
+):
+    """Build the stub harness; return (argv, env, destination root).
 
     The root is the captured tree under ``prefix``, so a caller asserting on
     ``root / "0.3" / ...`` is asserting the prefixed key, not just the tail.
+    ``read_error`` makes the index download fail with something other than a
+    clean miss, for the callers that assert the script refuses to seed on it.
     """
     if not shutil.which("sha256sum"):
         pytest.skip("sha256sum not available")
@@ -94,13 +102,20 @@ def _run(tmp_path, *, seed_versions=None, bucket=MIRROR_BUCKET, prefix=MIRROR_PR
         "SEED_DIR": str(seed_dir),
         "CAPTURE_DIR": str(capture),
     }
+    if read_error is not None:
+        env["READ_ERROR"] = read_error
     argv = ["bash", str(SCRIPT), "--minor", "0.3", "--tag", "0.3.1", "--bucket", bucket]
     if prefix:
         argv += ["--prefix", prefix]
     argv += ["--dir", str(zips)]
+    return argv, env, (capture / prefix if prefix else capture)
+
+
+def _run(tmp_path, **kwargs):
+    """Run the script against the stub and return (destination root, aws log)."""
+    argv, env, root = _prepare(tmp_path, **kwargs)
     subprocess.run(argv, check=True, env=env, cwd=tmp_path)
-    log = (tmp_path / "aws.log").read_text()
-    return capture / prefix if prefix else capture, log
+    return root, (tmp_path / "aws.log").read_text()
 
 
 def test_uploads_four_zips_and_sums(tmp_path):
@@ -129,6 +144,25 @@ def test_versions_index_merges_and_sorts(tmp_path):
     # New minor merged; sorted numerically (0.10 > 0.3, not lexically); latest correct.
     assert index["minors"] == ["0.1", "0.2", "0.3", "0.10"]
     assert index["latest"] == "0.10"
+
+
+def test_a_read_failure_that_is_not_a_miss_never_reseeds_the_index(tmp_path):
+    # Fold review: the index read used to swallow every failure into the seed
+    # branch, and the very next statement PUTs the seed back over the good index.
+    # A throttle, a 5xx, an expired session or a typo'd --prefix would drop every
+    # published minor with no DeleteObject in sight. Only a miss may seed.
+    argv, env, root = _prepare(
+        tmp_path,
+        read_error=(
+            "fatal error: An error occurred (403) when calling the HeadObject "
+            "operation: Forbidden"
+        ),
+    )
+    result = subprocess.run(argv, env=env, cwd=tmp_path, capture_output=True, text=True)
+    assert result.returncode != 0
+    # ...and it says why: the CLI's own message survives instead of 2>/dev/null.
+    assert "versions.json" in result.stderr and "403" in result.stderr
+    assert not (root / "versions.json").exists(), "a failed read must not republish the index"
 
 
 def test_index_lives_under_the_prefix_not_the_bucket_root(tmp_path):

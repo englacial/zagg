@@ -706,12 +706,13 @@ def test_published_list_bucket_is_unconditional():
     # 2026-08-20).
     assert _actions(bucket) == ["s3:ListBucket"]
     # An s3:prefix condition would make absent objects 403 instead of 404 (a
-    # GetObject evaluation carries no s3:prefix context key), and
-    # distribute_zips.sh cannot tell a 403 on versions.json from a clean miss --
-    # it would reseed the index and drop every published minor from it.
+    # GetObject evaluation carries no s3:prefix context key). distribute_zips.sh
+    # seeds versions.json only on a miss and treats any other read failure as
+    # fatal, so the condition would not corrupt the index -- it would fail every
+    # release instead, which is no better a place to discover it.
     assert "Condition" not in bucket, (
         "an s3:prefix condition on ListBucket makes absent objects 403 instead "
-        "of 404, which reseeds versions.json instead of merging into it"
+        "of 404, which distribute_zips.sh reads as a failed index read, not a miss"
     )
 
 
