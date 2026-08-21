@@ -47,8 +47,9 @@ BASE="s3://$BUCKET${PREFIX:+/$PREFIX}"
 # unconditionally would 403 against the in-account dist bucket. Expanded
 # unquoted (fixed flags, no spaces) so the empty default vanishes -- same idiom
 # as stand_up.sh's DIST_SIGN, since `set -u` + bash 3.2 rejects empty arrays.
+PUBLISHED_BUCKETS="us-west-2.opendata.source.coop"   # == zagg.store._PUBLISHED_BUCKETS
 ACL=""
-case " us-west-2.opendata.source.coop " in
+case " $PUBLISHED_BUCKETS " in
   *" $BUCKET "*) ACL="--acl bucket-owner-full-control" ;;
 esac
 

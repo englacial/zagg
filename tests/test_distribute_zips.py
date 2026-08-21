@@ -158,6 +158,21 @@ def test_every_upload_hands_the_object_to_the_bucket_owner(tmp_path):
     assert downloads and all("--acl" not in ln for ln in downloads)
 
 
+def test_the_scripts_published_bucket_list_matches_the_fleets():
+    # Fold review: the list lives in two places -- here and in
+    # zagg.store._PUBLISHED_BUCKETS -- and the drift is silent in the expensive
+    # direction. If the mirror moves (or a second published bucket is added on
+    # the fleet's side) this script's `case` stops matching, $ACL stays empty,
+    # and the first PUT is AccessDenied at release time, on a tag, after PyPI
+    # has already published. The ACL half is exactly what issue #496 established
+    # you cannot get wrong by halves.
+    from zagg.store import _PUBLISHED_BUCKETS
+
+    match = re.search(r'^PUBLISHED_BUCKETS="([^"]*)"', SCRIPT.read_text(), re.MULTILINE)
+    assert match, f"PUBLISHED_BUCKETS not found in {SCRIPT}"
+    assert set(match.group(1).split()) == set(_PUBLISHED_BUCKETS)
+
+
 def test_no_acl_against_a_bucket_we_own(tmp_path):
     # Keyed on the destination, mirroring zagg.store._PUBLISHED_BUCKETS: the
     # release role holds s3:PutObjectAcl on the mirror ONLY, so sending the
