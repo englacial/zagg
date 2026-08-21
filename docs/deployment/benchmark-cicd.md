@@ -513,17 +513,16 @@ gh variable set BENCHMARK_TEST_STAGE_BUCKET  --body "sliderule-public"
 # Release (tier 3)
 gh variable set LAMBDA_RELEASE_ROLE_ARN   --body "arn:aws:iam::ACCOUNT_ID:role/zagg-lambda-release"
 gh variable set LAMBDA_PROD_FUNCTION_NAME --body "process-shard"
-gh variable set LAMBDA_DIST_BUCKET        --body "us-west-2.opendata.source.coop"
-gh variable set LAMBDA_DIST_PREFIX        --body "englacial/zagg/lambda"
+gh variable set LAMBDA_DIST_BUCKET        --body "sliderule-public-cors"
 gh variable set LAMBDA_AWS_REGION         --body "us-west-2"
 ```
 
-`LAMBDA_DIST_BUCKET`/`LAMBDA_DIST_PREFIX` are the Source Cooperative mirror since
-issue #497 — `sliderule-public-cors` cannot host public data under NASA's
-clearance posture and is being retired (issue #499). **Set them only after Source
-Cooperative grants `zagg-lambda-release` write access at `englacial/*`**: until
-every variable above exists, `distribute` (and with it `deploy-prod`) skips, and
-a release still attaches the zips to the GitHub Release.
+Until every variable above exists, `distribute` (and with it `deploy-prod`)
+skips, and a release still attaches the zips to the GitHub Release. The
+distribution destination moves to the Source Cooperative mirror under issue #497
+— `distribute_zips.sh` already takes the `--prefix` that mirror needs, and
+`sliderule-public-cors` cannot host public data under NASA's clearance posture
+(issue #499) — but `publish.yml` is not yet pointed at it.
 
 Protect the production deploy:
 

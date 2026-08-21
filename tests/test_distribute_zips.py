@@ -186,18 +186,11 @@ def test_errors_when_zip_count_wrong(tmp_path):
     assert "expected 4 zips" in result.stderr
 
 
-# --- publish.yml wiring (issue #497 phase 2) --------------------------------
-# The prod deploy publishes its layer version straight out of whatever
-# `distribute` staged, so the two jobs must agree on bucket AND prefix. They
-# skip together too: `deploy-prod` needs `distribute`, and the "no unstaged-layer
-# deploy" safety rests on that skip propagating.
-
-GATED_VARS = {
-    "LAMBDA_RELEASE_ROLE_ARN",
-    "LAMBDA_DIST_BUCKET",
-    "LAMBDA_DIST_PREFIX",
-    "LAMBDA_AWS_REGION",
-}
+# --- publish.yml release-job coupling (issue #497 phase 2) ------------------
+# `deploy-prod` publish-layer-versions straight out of what `distribute` staged,
+# so retargeting the distribution destination silently breaks the prod deploy
+# unless BOTH jobs follow it. These pin the coupling itself rather than the
+# literal destination, which is a repo-variable and moves with the mirror.
 
 
 def _publish_jobs():
@@ -210,29 +203,34 @@ def _step_with(job, needle):
     return next(s for s in job["steps"] if needle in s.get("run", ""))
 
 
-def test_release_jobs_gate_on_every_destination_var():
-    # An unset prefix would aim the release at the mirror bucket's ROOT --
-    # another organization's namespace -- so it is gated, not defaulted. A
-    # release before Source Cooperative grants the role (issue #497 question
-    # (4)) must SKIP and still attach zips to the GitHub Release.
+def test_prod_deploy_gates_on_everything_distribute_does():
+    # The "no unstaged-layer deploy" safety rests on distribute's skip
+    # propagating, so a var that can make distribute skip must make deploy-prod
+    # skip too -- a partial config must skip, never half-deploy prod.
     jobs = _publish_jobs()
-    for name in ("distribute", "deploy-prod"):
-        gated = set(re.findall(r"vars\.(\w+)", jobs[name]["if"]))
-        assert GATED_VARS <= gated, f"{name} does not gate on {GATED_VARS - gated}"
+    gates = {
+        name: set(re.findall(r"vars\.(\w+)", jobs[name]["if"]))
+        for name in jobs
+        if "if" in jobs[name]
+    }
+    assert gates["distribute"], "distribute is ungated -- a release with no AWS config would fail"
+    assert gates["distribute"] <= gates["deploy-prod"]
 
 
-def test_prod_deploy_reads_the_layer_key_distribute_wrote():
+def test_prod_deploy_carries_every_destination_var_distribute_uses():
+    # Whatever LAMBDA_DIST_* distribute writes to, deploy-prod must read from --
+    # otherwise the layer key it publishes points at the old destination.
     jobs = _publish_jobs()
-    assert (
-        '--prefix "${{ vars.LAMBDA_DIST_PREFIX }}"'
-        in _step_with(jobs["distribute"], "distribute_zips.sh")["run"]
-    )
-    # ...and the script really lays the objects out as <prefix>/<minor>/<zip>.
-    assert '"$BASE/$MINOR/$(basename "$z")"' in SCRIPT.read_text()
-    deploy = _step_with(jobs["deploy-prod"], "deploy_lambda.sh")
-    assert deploy["env"]["DIST_PREFIX"] == "${{ vars.LAMBDA_DIST_PREFIX }}"
-    assert deploy["env"]["DIST_BUCKET"] == "${{ vars.LAMBDA_DIST_BUCKET }}"
-    assert (
-        '--layer-key "${DIST_PREFIX:+$DIST_PREFIX/}${MINOR}/lambda_layer_arm64.zip"'
-        in (deploy["run"])
-    )
+    written = {
+        var
+        for var in re.findall(
+            r"vars\.(\w+)", _step_with(jobs["distribute"], "distribute_zips.sh")["run"]
+        )
+        if var.startswith("LAMBDA_DIST_")
+    }
+    read = {
+        var
+        for value in _step_with(jobs["deploy-prod"], "deploy_lambda.sh")["env"].values()
+        for var in re.findall(r"vars\.(\w+)", str(value))
+    }
+    assert written and written <= read, f"deploy-prod does not follow {written - read}"
