@@ -76,6 +76,12 @@ Resources:
       # blocks stay on; only the policy/restrict blocks are relaxed. NOTE: this
       # can't override ACCOUNT-level Block Public Access -- relax that separately
       # (see benchmark-cicd.md §10) if enabled.
+      # HISTORICAL, read this before trusting the block below: the LIVE bucket
+      # has all four Block Public Access flags true and anonymous GET 403s. That
+      # is not drift -- espg closed it deliberately, because NASA buckets have
+      # no clearance to host public data (issue #497). The bucket is being
+      # retired under issue #499; published artifacts go to Source Cooperative
+      # (the PublishToSourceCoop grant below).
       PublicAccessBlockConfiguration:
         BlockPublicAcls: true
         IgnorePublicAcls: true
@@ -303,6 +309,71 @@ Resources:
                 Effect: Allow
                 Action: [s3:PutObject, s3:GetObject]
                 Resource: !Sub "arn:aws:s3:::${DistBucketName}/*"
+              # Published destination (issue #497): the release role's half of
+              # the identity model template.yaml's ExecutionRole carries for the
+              # fleet (issue #495) -- same statement shape, different trust
+              # domain, which is why this stays a SEPARATE role rather than a
+              # widened zagg-lambda-execution. The role already exists with the
+              # right trust (GitHub Actions OIDC, above); it needed S3
+              # permissions, not an identity.
+              #
+              # Scoped to englacial/zagg/lambda/* -- the per-minor zips,
+              # SHA256SUMS and the versions.json index that distribute_zips.sh /
+              # publish_mirror.sh write. NOT englacial/zagg/benchmarks/*:
+              # whether the measurement artifacts migrate is question (1) of
+              # issue #497 and is unresolved, so the grant does not pre-empt it.
+              # DeleteObject is deliberately absent -- a re-published minor
+              # overwrites via PutObject and the mirror never prunes.
+              #
+              # PutObjectAcl is load-bearing, not incidental: every write here
+              # carries x-amz-acl: bucket-owner-full-control, which S3 evaluates
+              # against s3:PutObjectAcl on both PutObject and
+              # CreateMultipartUpload -- without it the first published PUT is
+              # AccessDenied (issue #496; the two halves are only correct
+              # together). Granted HERE ONLY: the header is not sent to
+              # DistBucketName, whose objects we already own.
+              #
+              # The multipart actions cover the FAILURE path PutObject does not:
+              # the layer zips are large enough that the aws CLI uploads them
+              # multipart, and without AbortMultipartUpload the CLI's own
+              # cleanup 403s, leaving parts invisible to ListObjects and billed
+              # to Source Cooperative. ListMultipartUploadParts is object-scoped
+              # and stays with it. ListBucketMultipartUploads is deliberately
+              # NOT granted: it is bucket-wide (s3:prefix cannot constrain it),
+              # so Source Cooperative's bucket policy does not grant it and
+              # holding it here would be denied cross-account anyway (espg,
+              # 2026-08-20). Leaked parts age out on their 7-day lifecycle rule.
+              - Sid: PublishToSourceCoop
+                Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:PutObject
+                  - s3:PutObjectAcl
+                  - s3:AbortMultipartUpload
+                  - s3:ListMultipartUploadParts
+                Resource:
+                  - arn:aws:s3:::us-west-2.opendata.source.coop/englacial/zagg/lambda/*
+                  # The repo-root metadata publish_mirror.sh also writes (its
+                  # MIRROR_REPO_PREFIX block): the version-independent index and
+                  # the code license. Enumerated as exact keys rather than an
+                  # englacial/zagg/* wildcard so the grant cannot reach demo/
+                  # (the fleet's) or benchmarks/ (undecided).
+                  - arn:aws:s3:::us-west-2.opendata.source.coop/englacial/zagg/README.md
+                  - arn:aws:s3:::us-west-2.opendata.source.coop/englacial/zagg/LICENSE
+              # Unconditional by intent -- do NOT add an s3:prefix condition.
+              # S3 answers a GET on a missing key with 404 NoSuchKey only when
+              # the caller holds s3:ListBucket on the bucket; otherwise it
+              # answers 403 AccessDenied. A GetObject request carries no
+              # s3:prefix context key, so a StringLike on it never matches
+              # during a GET evaluation and every absent object would come back
+              # 403. distribute_zips.sh reads versions.json with
+              # `aws s3 cp ... || echo '{"minors": []}'`, which cannot tell 403
+              # from 404 -- a 403 there would silently reseed the index and drop
+              # every previously published minor from it.
+              - Sid: ListSourceCoopBucket
+                Effect: Allow
+                Action: s3:ListBucket
+                Resource: arn:aws:s3:::us-west-2.opendata.source.coop
 
 Outputs:
   BenchmarkInvokeRoleArn:
