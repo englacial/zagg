@@ -665,11 +665,14 @@ def test_release_role_reaches_exactly_the_mirror_keys():
 
 
 def test_published_grant_carries_the_acl_and_multipart_halves():
-    # PutObjectAcl is load-bearing, not incidental: every write carries
-    # x-amz-acl: bucket-owner-full-control, which S3 evaluates against
-    # s3:PutObjectAcl on PutObject AND on CreateMultipartUpload -- without it
-    # the first published PUT 403s (issue #496: the two halves are only correct
-    # together). The multipart pair covers the failure path PutObject does not:
+    # PutObjectAcl is load-bearing, not incidental: distribute_zips.sh sends
+    # x-amz-acl: bucket-owner-full-control to a published destination, and S3
+    # evaluates it against s3:PutObjectAcl on PutObject AND on
+    # CreateMultipartUpload -- without the grant that PUT 403s (issue #496: the
+    # two halves are only correct together). publish_mirror.sh sends no ACL, so
+    # the two repo-root keys it alone writes are not yet reachable under this
+    # role; that is raised on the PR, not fixed here (issue #497 does not name
+    # it). The multipart pair covers the failure path PutObject does not:
     # the CLI's own abort of an in-flight layer upload would otherwise 403 and
     # leak parts billed to Source Cooperative. DeleteObject is deliberately
     # absent -- a re-published minor overwrites, and the mirror never prunes.

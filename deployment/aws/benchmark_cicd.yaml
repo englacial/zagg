@@ -325,12 +325,18 @@ Resources:
               # DeleteObject is deliberately absent -- a re-published minor
               # overwrites via PutObject and the mirror never prunes.
               #
-              # PutObjectAcl is load-bearing, not incidental: every write here
-              # carries x-amz-acl: bucket-owner-full-control, which S3 evaluates
+              # PutObjectAcl pairs with PutObject here: Source Cooperative
+              # requires x-amz-acl: bucket-owner-full-control, which S3 evaluates
               # against s3:PutObjectAcl on both PutObject and
-              # CreateMultipartUpload -- without it the first published PUT is
+              # CreateMultipartUpload -- without it a published PUT is
               # AccessDenied (issue #496; the two halves are only correct
-              # together). Granted HERE ONLY: the header is not sent to
+              # together). NOT every writer sends it today: distribute_zips.sh
+              # does, for a published destination only; publish_mirror.sh sends
+              # no ACL on any of its five PUTs and is the ONLY writer of the two
+              # repo-root keys below, so those two are granted but not reachable
+              # under this role until that changes. Left as it stands because
+              # issue #497 does not name publish_mirror.sh -- raised for review
+              # instead. Granted HERE ONLY: the header is never sent to
               # DistBucketName, whose objects we already own.
               #
               # The multipart actions cover the FAILURE path PutObject does not:
