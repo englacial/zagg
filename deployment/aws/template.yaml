@@ -243,6 +243,15 @@ Resources:
                   - s3:PutObject
                   - s3:DeleteObject
                 Resource: arn:aws:s3:::sliderule-public-cors/*
+              # Unconditional by intent -- do NOT add an s3:prefix condition,
+              # same reasoning as the source.coop grant below. Without
+              # bucket-level ListBucket an absent key answers 403 AccessDenied
+              # rather than 404 NoSuchKey, and the sidecar read path catches the
+              # 404 only, so a missing sidecar hard-errors instead of taking
+              # on_miss=fallback (issue #502).
+              - Effect: Allow
+                Action: s3:ListBucket
+                Resource: arn:aws:s3:::sliderule-public-cors
               # Published destination (issue #495): the same policy shape as
               # the staging grant above, pointed at Source Cooperative. This
               # retires the data.source.coop proxy hop and the egress it paid

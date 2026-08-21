@@ -261,13 +261,46 @@ class TestTemplateEnvironment:
         # virtual-index write-back + sidecar reads (zagg-index/*, issue #160)
         # AND worker-written output zarr stores (e.g. zagg-examples/*). This is
         # the STAGING half of the identity model in issue #495; the published
-        # half is asserted in the next test.
+        # half is asserted in test_execution_role_is_the_published_identity
+        # (named, not "the next test" -- issue #502 slotted a bucket-level
+        # ListBucket pin between them).
         arn = "arn:aws:s3:::sliderule-public-cors/*"
         role = self._load_template()["Resources"]["ExecutionRole"]["Properties"]
         stmts = role["Policies"][0]["PolicyDocument"]["Statement"]
         matches = [s for s in stmts if s.get("Resource") == arn]
         assert len(matches) == 1
         assert sorted(matches[0]["Action"]) == ["s3:DeleteObject", "s3:GetObject", "s3:PutObject"]
+
+    def test_execution_role_lists_the_public_cors_bucket(self):
+        # Bucket-level ListBucket is what makes S3 answer 404 NoSuchKey rather
+        # than 403 AccessDenied on an absent key. The sidecar read path catches
+        # the 404 ONLY -- obstore's NotFoundError subclasses FileNotFoundError,
+        # and that ``return None`` is what selects on_miss=fallback -- so
+        # without this grant a missing sidecar hard-errors where it should have
+        # quietly taken the slow route (issue #502).
+        role = self._load_template()["Resources"]["ExecutionRole"]["Properties"]
+        stmts = role["Policies"][0]["PolicyDocument"]["Statement"]
+        # Resource and Action both go through the normalizing helpers: the
+        # grant is IAM-identical whether either is written as a scalar or a
+        # one-element list, so neither shape should fail this spuriously --
+        # matching on the raw Resource would report the grant MISSING when it
+        # is present and correct. The list-of-one also keeps the bare-bucket
+        # ARN pinned (not .../*, and not a superset).
+        bucket = [
+            s for s in stmts if _statement_resources(s) == ["arn:aws:s3:::sliderule-public-cors"]
+        ]
+        assert len(bucket) == 1, "the execution role must list sliderule-public-cors"
+        assert _statement_actions(bucket[0]) == ["s3:ListBucket"]
+        # An explicit Deny here would pass every other assertion in this test
+        # while overriding the bucket policy's public ListBucket grant.
+        assert bucket[0]["Effect"] == "Allow"
+        # Unconditional on purpose, same reasoning as the source.coop grant: a
+        # GetObject evaluation carries no s3:prefix context key, so a condition
+        # on it never matches during a GET and every absent object 403s anyway.
+        assert "Condition" not in bucket[0], (
+            "an s3:prefix condition on ListBucket makes absent objects 403 "
+            "instead of 404, which defeats on_miss=fallback on the sidecar path"
+        )
 
     def test_execution_role_is_the_published_identity(self):
         # Issue #495 (revised): the fleet publishes to Source Cooperative as
