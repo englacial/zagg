@@ -2,12 +2,19 @@
 
 Runs the real script with a stub ``aws`` on PATH (no network), and asserts it
 uploads the four zips + SHA256SUMS under the minor prefix and maintains the
-top-level versions.json index. The versions.json read-modify-write is the part
-with real logic, so it's covered against both the seed (absent) and merge paths.
+versions.json index at the destination root. The versions.json read-modify-write
+is the part with real logic, so it's covered against both the seed (absent) and
+merge paths.
+
+Since issue #497 the destination is Source Cooperative under a key prefix, so
+the ``--prefix`` layout and the ``bucket-owner-full-control`` ACL that Source
+Cooperative requires (issue #495 phase 1) are covered too -- including the
+in-account bucket case, where the ACL must NOT be sent.
 """
 
 import json
 import os
+import re
 import shutil
 import subprocess
 from pathlib import Path
@@ -16,6 +23,7 @@ import pytest
 
 REPO = Path(__file__).resolve().parents[1]
 SCRIPT = REPO / ".github" / "scripts" / "distribute_zips.sh"
+WORKFLOW = REPO / ".github" / "workflows" / "publish.yml"
 
 # A stub `aws` CLI: logs every `s3 cp`, fails the versions.json *download* unless
 # a seed exists in $SEED_DIR, and captures every *upload* into $CAPTURE_DIR so the
@@ -24,7 +32,7 @@ STUB_AWS = """#!/bin/bash
 set -euo pipefail
 if [ "$1" = "s3" ] && [ "$2" = "cp" ]; then
   SRC="$3"; DST="$4"
-  echo "$SRC -> $DST" >> "$AWS_LOG"
+  echo "$*" >> "$AWS_LOG"
   if [[ "$SRC" == s3://* ]]; then
     # download: serve a seeded versions.json if present, else fail (not found).
     base="$(basename "$SRC")"
@@ -42,7 +50,19 @@ exit 0
 """
 
 
-def _run(tmp_path, *, seed_versions=None):
+#: The release destination since issue #497: Source Cooperative, under the same
+#: <prefix>/<minor>/<zip> layout publish_mirror.sh writes and stand_up.sh's
+#: DIST_PREFIX already reads.
+MIRROR_BUCKET = "us-west-2.opendata.source.coop"
+MIRROR_PREFIX = "englacial/zagg/lambda"
+
+
+def _run(tmp_path, *, seed_versions=None, bucket=MIRROR_BUCKET, prefix=MIRROR_PREFIX):
+    """Run the script against the stub and return (destination root, aws log).
+
+    The root is the captured tree under ``prefix``, so a caller asserting on
+    ``root / "0.3" / ...`` is asserting the prefixed key, not just the tail.
+    """
     if not shutil.which("sha256sum"):
         pytest.skip("sha256sum not available")
     bindir = tmp_path / "bin"
@@ -74,29 +94,17 @@ def _run(tmp_path, *, seed_versions=None):
         "SEED_DIR": str(seed_dir),
         "CAPTURE_DIR": str(capture),
     }
-    subprocess.run(
-        [
-            "bash",
-            str(SCRIPT),
-            "--minor",
-            "0.3",
-            "--tag",
-            "0.3.1",
-            "--bucket",
-            "sliderule-public-cors",
-            "--dir",
-            str(zips),
-        ],
-        check=True,
-        env=env,
-        cwd=tmp_path,
-    )
+    argv = ["bash", str(SCRIPT), "--minor", "0.3", "--tag", "0.3.1", "--bucket", bucket]
+    if prefix:
+        argv += ["--prefix", prefix]
+    argv += ["--dir", str(zips)]
+    subprocess.run(argv, check=True, env=env, cwd=tmp_path)
     log = (tmp_path / "aws.log").read_text()
-    return capture, log
+    return capture / prefix if prefix else capture, log
 
 
 def test_uploads_four_zips_and_sums(tmp_path):
-    capture, log = _run(tmp_path)
+    root, log = _run(tmp_path)
     for name in (
         "lambda_layer_arm64.zip",
         "lambda_layer_x86_64.zip",
@@ -104,23 +112,57 @@ def test_uploads_four_zips_and_sums(tmp_path):
         "lambda_function_x86_64_py312.zip",
         "SHA256SUMS",
     ):
-        assert (capture / "0.3" / name).exists(), f"{name} not uploaded under 0.3/"
+        assert (root / "0.3" / name).exists(), f"{name} not uploaded under {MIRROR_PREFIX}/0.3/"
 
 
 def test_versions_index_seeds_when_absent(tmp_path):
-    capture, _ = _run(tmp_path)  # no seed -> download fails -> seed {"minors": []}
-    index = json.loads((capture / "versions.json").read_text())
+    root, _ = _run(tmp_path)  # no seed -> download fails -> seed {"minors": []}
+    index = json.loads((root / "versions.json").read_text())
     assert index["minors"] == ["0.3"]
     assert index["latest"] == "0.3"
     assert index["latest_tag"] == "0.3.1"
 
 
 def test_versions_index_merges_and_sorts(tmp_path):
-    capture, _ = _run(tmp_path, seed_versions={"minors": ["0.1", "0.10", "0.2"]})
-    index = json.loads((capture / "versions.json").read_text())
+    root, _ = _run(tmp_path, seed_versions={"minors": ["0.1", "0.10", "0.2"]})
+    index = json.loads((root / "versions.json").read_text())
     # New minor merged; sorted numerically (0.10 > 0.3, not lexically); latest correct.
     assert index["minors"] == ["0.1", "0.2", "0.3", "0.10"]
     assert index["latest"] == "0.10"
+
+
+def test_index_lives_under_the_prefix_not_the_bucket_root(tmp_path):
+    # The mirror bucket's root is another organization's namespace -- the index
+    # belongs beside the minors, and stand_up.sh reads it there (dist_root()).
+    root, log = _run(tmp_path)
+    assert f"s3://{MIRROR_BUCKET}/{MIRROR_PREFIX}/versions.json" in log
+    assert f"s3://{MIRROR_BUCKET}/versions.json " not in log
+    assert (root / "versions.json").exists()
+
+
+def test_every_upload_hands_the_object_to_the_bucket_owner(tmp_path):
+    # Source Cooperative requires x-amz-acl: bucket-owner-full-control on every
+    # write (issue #495 phase 1); without it the first PUT is AccessDenied. It
+    # must reach the index too, not just the zips -- the index is re-PUT on
+    # every release.
+    _, log = _run(tmp_path)
+    uploads = [ln for ln in log.splitlines() if not ln.split()[2].startswith("s3://")]
+    assert len(uploads) == 6, f"expected 4 zips + SHA256SUMS + versions.json, got: {uploads}"
+    for line in uploads:
+        assert "--acl bucket-owner-full-control" in line, f"ACL missing on upload: {line}"
+    # ...and never on the READ: `aws s3 cp s3://... ./versions.json` takes no ACL.
+    downloads = [ln for ln in log.splitlines() if ln.split()[2].startswith("s3://")]
+    assert downloads and all("--acl" not in ln for ln in downloads)
+
+
+def test_no_acl_against_a_bucket_we_own(tmp_path):
+    # Keyed on the destination, mirroring zagg.store._PUBLISHED_BUCKETS: the
+    # release role holds s3:PutObjectAcl on the mirror ONLY, so sending the
+    # header at the in-account dist bucket would 403 rather than help.
+    root, log = _run(tmp_path, bucket="sliderule-public-cors", prefix="")
+    assert "--acl" not in log
+    assert (root / "0.3" / "SHA256SUMS").exists()
+    assert (root / "versions.json").exists()
 
 
 def test_errors_when_zip_count_wrong(tmp_path):
@@ -142,3 +184,55 @@ def test_errors_when_zip_count_wrong(tmp_path):
     )
     assert result.returncode != 0
     assert "expected 4 zips" in result.stderr
+
+
+# --- publish.yml wiring (issue #497 phase 2) --------------------------------
+# The prod deploy publishes its layer version straight out of whatever
+# `distribute` staged, so the two jobs must agree on bucket AND prefix. They
+# skip together too: `deploy-prod` needs `distribute`, and the "no unstaged-layer
+# deploy" safety rests on that skip propagating.
+
+GATED_VARS = {
+    "LAMBDA_RELEASE_ROLE_ARN",
+    "LAMBDA_DIST_BUCKET",
+    "LAMBDA_DIST_PREFIX",
+    "LAMBDA_AWS_REGION",
+}
+
+
+def _publish_jobs():
+    import yaml
+
+    return yaml.safe_load(WORKFLOW.read_text())["jobs"]
+
+
+def _step_with(job, needle):
+    return next(s for s in job["steps"] if needle in s.get("run", ""))
+
+
+def test_release_jobs_gate_on_every_destination_var():
+    # An unset prefix would aim the release at the mirror bucket's ROOT --
+    # another organization's namespace -- so it is gated, not defaulted. A
+    # release before Source Cooperative grants the role (issue #497 question
+    # (4)) must SKIP and still attach zips to the GitHub Release.
+    jobs = _publish_jobs()
+    for name in ("distribute", "deploy-prod"):
+        gated = set(re.findall(r"vars\.(\w+)", jobs[name]["if"]))
+        assert GATED_VARS <= gated, f"{name} does not gate on {GATED_VARS - gated}"
+
+
+def test_prod_deploy_reads_the_layer_key_distribute_wrote():
+    jobs = _publish_jobs()
+    assert (
+        '--prefix "${{ vars.LAMBDA_DIST_PREFIX }}"'
+        in _step_with(jobs["distribute"], "distribute_zips.sh")["run"]
+    )
+    # ...and the script really lays the objects out as <prefix>/<minor>/<zip>.
+    assert '"$BASE/$MINOR/$(basename "$z")"' in SCRIPT.read_text()
+    deploy = _step_with(jobs["deploy-prod"], "deploy_lambda.sh")
+    assert deploy["env"]["DIST_PREFIX"] == "${{ vars.LAMBDA_DIST_PREFIX }}"
+    assert deploy["env"]["DIST_BUCKET"] == "${{ vars.LAMBDA_DIST_BUCKET }}"
+    assert (
+        '--layer-key "${DIST_PREFIX:+$DIST_PREFIX/}${MINOR}/lambda_layer_arm64.zip"'
+        in (deploy["run"])
+    )

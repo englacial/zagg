@@ -426,6 +426,18 @@ the section-2 stack (`benchmark_cicd.yaml`). Their grants, for reference:
   - the same six `lambda:*` actions (incl. `lambda:GetLayerVersion`)
     on `process-shard` (+ `process-shard-deps`).
   - `s3:PutObject`/`s3:GetObject` on `s3://sliderule-public-cors/*` (distribute).
+  - `s3:GetObject`/`s3:PutObject`/`s3:PutObjectAcl` +
+    `s3:AbortMultipartUpload`/`s3:ListMultipartUploadParts` on
+    `s3://us-west-2.opendata.source.coop/englacial/zagg/lambda/*` (plus the
+    repo-root `README.md`/`LICENSE` keys), and an **unconditioned**
+    `s3:ListBucket` on that bucket — the Source Cooperative mirror (issue #497).
+    `PutObjectAcl` travels with `PutObject`: every write carries
+    `x-amz-acl: bucket-owner-full-control` and the two halves are only correct
+    together (issue #496). The `ListBucket` grant carries no `s3:prefix`
+    condition on purpose — with one, an absent key answers 403 instead of 404
+    and `distribute_zips.sh` would reseed `versions.json` instead of merging
+    into it. `englacial/zagg/benchmarks/*` is deliberately **not** granted
+    (issue #497 question (1) is open).
 
 **Verify:** `aws iam get-role --role-name zagg-benchmark-deploy` /
 `zagg-lambda-release`.
@@ -501,9 +513,17 @@ gh variable set BENCHMARK_TEST_STAGE_BUCKET  --body "sliderule-public"
 # Release (tier 3)
 gh variable set LAMBDA_RELEASE_ROLE_ARN   --body "arn:aws:iam::ACCOUNT_ID:role/zagg-lambda-release"
 gh variable set LAMBDA_PROD_FUNCTION_NAME --body "process-shard"
-gh variable set LAMBDA_DIST_BUCKET        --body "sliderule-public-cors"
+gh variable set LAMBDA_DIST_BUCKET        --body "us-west-2.opendata.source.coop"
+gh variable set LAMBDA_DIST_PREFIX        --body "englacial/zagg/lambda"
 gh variable set LAMBDA_AWS_REGION         --body "us-west-2"
 ```
+
+`LAMBDA_DIST_BUCKET`/`LAMBDA_DIST_PREFIX` are the Source Cooperative mirror since
+issue #497 — `sliderule-public-cors` cannot host public data under NASA's
+clearance posture and is being retired (issue #499). **Set them only after Source
+Cooperative grants `zagg-lambda-release` write access at `englacial/*`**: until
+every variable above exists, `distribute` (and with it `deploy-prod`) skips, and
+a release still attaches the zips to the GitHub Release.
 
 Protect the production deploy:
 
