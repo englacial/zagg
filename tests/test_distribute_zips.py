@@ -152,13 +152,8 @@ def test_a_read_failure_that_is_not_a_miss_never_reseeds_the_index(tmp_path):
     # branch, and the very next statement PUTs the seed back over the good index.
     # A throttle, a 5xx, an expired session or a typo'd --prefix would drop every
     # published minor with no DeleteObject in sight. Only a miss may seed.
-    argv, env, root = _prepare(
-        tmp_path,
-        read_error=(
-            "fatal error: An error occurred (403) when calling the HeadObject "
-            "operation: Forbidden"
-        ),
-    )
+    denied = "An error occurred (403) when calling the HeadObject operation: Forbidden"
+    argv, env, root = _prepare(tmp_path, read_error=f"fatal error: {denied}")
     result = subprocess.run(argv, env=env, cwd=tmp_path, capture_output=True, text=True)
     assert result.returncode != 0
     # ...and it says why: the CLI's own message survives instead of 2>/dev/null.
