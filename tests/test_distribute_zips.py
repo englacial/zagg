@@ -225,6 +225,11 @@ def test_errors_when_zip_count_wrong(tmp_path):
 # so retargeting the distribution destination silently breaks the prod deploy
 # unless BOTH jobs follow it. These pin the coupling itself rather than the
 # literal destination, which is a repo-variable and moves with the mirror.
+#
+# Fold review: they pin the *use* of each destination variable, not only its
+# declaration -- binding DIST_PREFIX in `env` and leaving `--layer-key` alone is
+# the likeliest way to half-apply the wiring, and it points publish-layer-version
+# at an un-prefixed key that is outside the grant.
 
 
 def _publish_jobs():
@@ -234,7 +239,15 @@ def _publish_jobs():
 
 
 def _step_with(job, needle):
-    return next(s for s in job["steps"] if needle in s.get("run", ""))
+    step = next((s for s in job["steps"] if needle in s.get("run", "")), None)
+    assert step is not None, f"no step of {job.get('name', '?')} runs {needle}"
+    return step
+
+
+def _arg(run, flag):
+    """The quoted value ``flag`` is given in a shell invocation ("" if absent)."""
+    match = re.search(rf'{re.escape(flag)}\s+"([^"]*)"', run)
+    return match.group(1) if match else ""
 
 
 def test_prod_deploy_gates_on_everything_distribute_does():
@@ -255,16 +268,30 @@ def test_prod_deploy_carries_every_destination_var_distribute_uses():
     # Whatever LAMBDA_DIST_* distribute writes to, deploy-prod must read from --
     # otherwise the layer key it publishes points at the old destination.
     jobs = _publish_jobs()
-    written = {
-        var
-        for var in re.findall(
-            r"vars\.(\w+)", _step_with(jobs["distribute"], "distribute_zips.sh")["run"]
-        )
-        if var.startswith("LAMBDA_DIST_")
-    }
-    read = {
-        var
-        for value in _step_with(jobs["deploy-prod"], "deploy_lambda.sh")["env"].values()
-        for var in re.findall(r"vars\.(\w+)", str(value))
-    }
+    dist = _step_with(jobs["distribute"], "distribute_zips.sh")["run"]
+    prod = _step_with(jobs["deploy-prod"], "deploy_lambda.sh")
+    written = {var for var in re.findall(r"vars\.(\w+)", dist) if var.startswith("LAMBDA_DIST_")}
+    # env NAME -> the vars.* it is bound to, so the binding can be followed into
+    # the command rather than stopping at the `env` block.
+    bound = {name: set(re.findall(r"vars\.(\w+)", str(v))) for name, v in prod["env"].items()}
+    read = set().union(*bound.values())
     assert written and written <= read, f"deploy-prod does not follow {written - read}"
+    # Bound is not used: a destination variable declared in `env` and never
+    # referenced by the command leaves the deploy pointing at the old layout.
+    for name, sources in bound.items():
+        if sources & written:
+            assert re.search(rf"\$\{{?{name}\b", prod["run"]), (
+                f"deploy-prod binds {name} but its command never uses it, so the "
+                f"layer it publishes does not follow {sorted(sources & written)}"
+            )
+    # ...and the prefix distribute writes UNDER has to reach the layer KEY
+    # specifically (the bucket reaches --layer-bucket instead). Vacuous until the
+    # workflow half of phase 2 lands and `distribute` grows its --prefix.
+    prefix_vars = set(re.findall(r"vars\.(\w+)", _arg(dist, "--prefix")))
+    layer_key = _arg(prod["run"], "--layer-key")
+    for name, sources in bound.items():
+        if sources & prefix_vars:
+            assert name in layer_key, (
+                f"deploy-prod's --layer-key ({layer_key!r}) is not built from {name}, so "
+                f"publish-layer-version reads the un-prefixed key distribute never wrote"
+            )
