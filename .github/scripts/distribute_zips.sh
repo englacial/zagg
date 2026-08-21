@@ -53,6 +53,17 @@ case " $PUBLISHED_BUCKETS " in
   *" $BUCKET "*) ACL="--acl bucket-owner-full-control" ;;
 esac
 
+# A published bucket's root is another organization's namespace, and it is
+# outside the release role's grant, so writing there 403s mid-release with no
+# explanation. The workflow gates on the prefix too, but that gate is one
+# `gh variable set` away from being the only thing standing between a release
+# and the bucket root -- hold the invariant here as well, where the keys are
+# actually built.
+if [ -n "$ACL" ] && [ -z "$PREFIX" ]; then
+  echo "refusing to publish to $BUCKET root: --prefix is required for a published bucket" >&2
+  exit 2
+fi
+
 shopt -s nullglob
 # All four are globs (note the trailing * on the layer names) so nullglob drops
 # any that's missing -- the count check then catches it here, not at `aws s3 cp`.

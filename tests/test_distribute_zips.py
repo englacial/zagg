@@ -183,6 +183,22 @@ def test_no_acl_against_a_bucket_we_own(tmp_path):
     assert (root / "versions.json").exists()
 
 
+def test_refuses_a_published_bucket_without_a_prefix(tmp_path):
+    # Fold review: the only thing keeping a release out of the mirror bucket's
+    # root -- another organization's namespace, and outside the grant -- was the
+    # workflow's `vars.LAMBDA_DIST_PREFIX != ''` gate. Flipping LAMBDA_DIST_BUCKET
+    # to the mirror is one `gh variable set`, so the script holds the invariant
+    # itself and the workflow gate is defence in depth. Refused before any upload:
+    # no --dir contents are needed to reach it.
+    result = subprocess.run(
+        ["bash", str(SCRIPT), "--minor", "0.3", "--bucket", MIRROR_BUCKET, "--dir", str(tmp_path)],
+        capture_output=True,
+        text=True,
+    )
+    assert result.returncode != 0
+    assert "--prefix is required" in result.stderr
+
+
 def test_errors_when_zip_count_wrong(tmp_path):
     if not shutil.which("sha256sum"):
         pytest.skip("sha256sum not available")
