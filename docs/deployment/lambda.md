@@ -587,9 +587,12 @@ slowest worker's own run), and the *sum* of them by `total_barrier_budget_s`
 (default 7,200 s), so the tail's worst case is a constant rather than a
 function of the store's order. Past the total, each remaining barrier degrades
 to a single check. An expiry is recorded as `barrier_timed_out` on the run
-summary and in the finisher's stage block: when the invoke was merely *queued*
-rather than lost, its late artifacts are still correct — the cost is that the
-finisher's per-level actuals under-report.
+summary — and only there: the dispatcher does put the key on the finisher's
+stage block, but the handler does not forward it and `run_stage_finisher`
+takes no such parameter, so nothing durable records that the run's actuals may
+be short. Watch the dispatcher's own log for it. When the invoke was merely
+*queued* rather than lost, its late artifacts are still correct — the cost is
+that the finisher's per-level actuals under-report.
 
 Admission is the ordinary per-store sweep lease (`sweep.lease.json`). The
 *first* stage worker creates the intent; every sibling of the same run reads
