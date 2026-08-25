@@ -549,12 +549,13 @@ staged arm, reusing that event's credential resolution and its
 | `run_started` | stage | Dispatcher-pinned UTC ISO stamp, shared by every worker of the run. A worker computing its own would read a sibling's fresh stamp as a foreign sweep's |
 | `dispatch` | stage | The tuple's dispatch order. The worker runs exactly that one tuple |
 | `nodes` | stage | This invoke's dispatch nodes, as morton decimals. Must be non-empty and every entry must sit at exactly `dispatch` order — the worker refuses otherwise. In the example above the store is shard-order 6, so at `tuple_width: 3` the dispatch orders are 3 and 0, and an order-3 dispatch takes 4-digit nodes |
-| `batch` | stage | Which batch of that tuple this is; names the record object |
-| `tuple_width` | both | Optional; defaults to `zagg.sweep_stage.DEFAULT_TUPLE_WIDTH` |
+| `batch` | stage | Optional (defaults to `0`); which batch of that tuple this is, and what names the record object |
+| `tuple_width` | stage | Optional; defaults to `zagg.sweep_stage.DEFAULT_TUPLE_WIDTH`. A finisher takes no tuple width — one on a finisher block is inert |
 | `partition` | stage | Optional `{"index", "of"}`; recorded on the stage rows |
 | `lease_ttl_s` | both | Optional lease TTL override |
-| `records_from` | both | The run's status prefix — a store **sibling** (`<store>.status/run-<run_id>`, `zagg.client_transport.run_status_prefix`). Each invoke PUTs its record there; the finisher reads them back |
-| `touch_policy` | finisher | The `output.touch` declaration (issue #501) governing the `aggregation.yaml` touch |
+| `records_from` | both | The run's status prefix — a store **sibling** (`<store>.status/run-<run_id>`, `zagg.client_transport.run_status_prefix`). Each invoke PUTs its record there; the finisher reads them back. **Required** on a finisher (it refuses by name without it, and equally on a prefix holding zero records); optional on a stage worker, which then folds correctly but writes **no record** — so its barrier waits out the full timeout and the finisher's actuals under-report, exactly as a lost invoke would look |
+| `touch_policy` | finisher | Optional (defaults to `"auto"`); the `output.touch` declaration (issue #501) governing the `aggregation.yaml` touch |
+| `barrier_timed_out` | finisher | Sent by the dispatcher when any tuple's barrier expired. **Currently inert**: `run_stage_finisher` takes no such parameter and the handler does not forward it, so the short-actuals warning lives only on the dispatcher's own run summary, not in a durable record |
 
 Every store write stays worker-side. The dispatcher only invokes and polls.
 
