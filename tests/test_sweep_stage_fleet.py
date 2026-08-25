@@ -864,6 +864,19 @@ class TestBatching:
         nodes, refs = batches[0]
         assert nodes == ["-2", "1"] and len(refs) == len(LEAVES)
 
+    def test_the_node_buckets_match_the_per_node_slices(self):
+        # The quadratic fix (review finding): bucketing the work set by
+        # `_node_at` ONCE must hand each node exactly the slice the per-node
+        # prefix scan handed it, windows and order included.
+        from zagg.sweep_fleet import _bucket_leaf_refs, _leaf_refs, dispatch_nodes
+
+        by_shard = {d: {None, "2024"} for d in LEAVES}
+        for dispatch in (0, 1, 2, 3):
+            buckets = _bucket_leaf_refs(by_shard, dispatch)
+            assert sorted(buckets) == dispatch_nodes(by_shard, dispatch)
+            for node, refs in buckets.items():
+                assert refs == _leaf_refs(by_shard, [node])
+
     def test_every_node_lands_in_exactly_one_batch(self):
         # 4^5 order-5 leaves under one base cell: enough that the leaf slices
         # alone blow the async cap several times over.

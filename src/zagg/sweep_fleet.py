@@ -86,6 +86,30 @@ def _leaf_refs(by_shard, nodes=None) -> list:
     ]
 
 
+def _bucket_leaf_refs(by_shard, dispatch: int) -> dict:
+    """``{dispatch node: [[shard_key, window], ...]}`` in ONE pass over the work set.
+
+    :func:`pack_batches` needs every node's leaf slice, and asking
+    :func:`_leaf_refs` for them one node at a time re-sorts and re-scans the
+    WHOLE work set per node — quadratic, and the dominant dispatcher cost on
+    the ~49k-node finest tuple of an o9 store (review finding). Bucketing by
+    :func:`zagg.sweep_stage._node_at` once is linear and yields each node's
+    slice in exactly the order ``_leaf_refs(by_shard, [node])`` would have.
+    """
+    from zagg.grids.morton import morton_word
+    from zagg.sweep_stage import _node_at
+
+    dispatch = int(dispatch)
+    buckets: dict = {}
+    for decimal in sorted(by_shard):
+        key = int(morton_word(decimal))
+        buckets.setdefault(_node_at(decimal, dispatch), []).extend(
+            [key, window]
+            for window in sorted(by_shard[decimal], key=lambda w: (w is not None, w))
+        )
+    return buckets
+
+
 def build_stage_event(store_path: str, block: dict, leaves, output_creds_event=None) -> dict:
     """One ``mode="sweep"`` + ``stage`` worker event; the single build site.
 
@@ -121,12 +145,14 @@ def pack_batches(nodes, by_shard, *, block: dict, store_path: str, output_creds_
     """Split one tuple's dispatch nodes into invoke-sized batches.
 
     Returns ``[(nodes, leaves), ...]``, every node in exactly one batch and in
-    order. Greedy in sorted node order, with the projected payload measured
-    incrementally (a full ``json.dumps`` per candidate node would be quadratic
-    on the ~49k-node finest tuple of an o9 store). A single node whose own leaf
-    slice already overflows the cap is emitted alone with ``leaves=None`` —
-    :func:`build_stage_event` then sends the ``discover: true`` form rather
-    than truncating a work set, which would silently under-fold.
+    order. Greedy in sorted node order over a work set bucketed by dispatch
+    node ONCE (:func:`_bucket_leaf_refs`), with the projected payload measured
+    incrementally — a full ``json.dumps`` per candidate node, or a full work-set
+    scan per node, would be quadratic on the ~49k-node finest tuple of an o9
+    store. A single node whose own leaf slice already overflows the cap is
+    emitted alone with ``leaves=None`` — :func:`build_stage_event` then sends
+    the ``discover: true`` form rather than truncating a work set, which would
+    silently under-fold.
     """
     from zagg.runner import _ASYNC_PAYLOAD_CAP_BYTES
 
@@ -136,12 +162,13 @@ def pack_batches(nodes, by_shard, *, block: dict, store_path: str, output_creds_
     envelope["nodes"] = []
     base = len(json.dumps(build_stage_event(store_path, envelope, [], output_creds_event))) + 64
     budget = _ASYNC_PAYLOAD_CAP_BYTES - base
+    buckets = _bucket_leaf_refs(by_shard, int(block["dispatch"]))
     batches: list = []
     cur_nodes: list = []
     cur_leaves: list = []
     cur_bytes = 0
     for node in nodes:
-        refs = _leaf_refs(by_shard, [node])
+        refs = buckets.get(node, [])
         cost = len(node) + 4 + sum(len(json.dumps(r)) + 1 for r in refs)
         if cur_nodes and cur_bytes + cost > budget:
             batches.append((cur_nodes, cur_leaves))
