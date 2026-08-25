@@ -297,8 +297,17 @@ def await_records(
     store_kwargs: dict,
     timeout_s: float,
     interval_s: float,
+    ignore=frozenset(),
 ) -> tuple:
     """Poll until every expected record lands, or the budget runs out.
+
+    ``ignore`` names basenames that were ALREADY under the prefix before the
+    fan-out fired; they are subtracted from every poll. Record names are
+    deterministic from ``(dispatch, batch)`` and the prefix is keyed on the run
+    id alone, so re-driving a run under its original id — the obvious recovery
+    after a dispatcher died mid-fan-out — would otherwise let every barrier
+    pass instantly on the previous attempt's records, dropping the tuple
+    ordering the byte-identity acceptance rests on.
 
     Returns ``(seen, timed_out)``. The SOFT barrier: a timeout is logged
     loudly and returned, never raised — the next tuple folding over a node
@@ -329,6 +338,7 @@ def await_records(
     reporting it as slow workers.
     """
     deadline = time.monotonic() + float(timeout_s)
+    stale = set(ignore)
     seen: set = set()
     faults = 0
     listed_ever = False
@@ -336,7 +346,7 @@ def await_records(
         names, listed_ok = _present(records_from, store_kwargs)
         if listed_ok:
             listed_ever, faults = True, 0
-            seen = names & expected
+            seen = (names - stale) & expected
         else:
             faults += 1
             if faults >= _LIST_FAULT_LIMIT:
@@ -458,6 +468,18 @@ def run_stage_sweep_fleet(
 
     budget_left = [float(total_barrier_budget_s)]
 
+    # Record names are deterministic and the prefix is keyed on run_id alone,
+    # so a SUPPLIED run_id that has been driven before would make every barrier
+    # pass instantly on the prior attempt's records. Snapshot what is already
+    # there, once, before the first invoke: the barriers then wait on records
+    # that appear AFTER the fan-out.
+    stale_records, _listed = _present(records_from, store_kwargs)
+    if stale_records:
+        logger.info(
+            f"stage fleet: run {run_id} already has {len(stale_records)} record(s) under "
+            f"{records_from} from an earlier attempt — the barriers ignore them"
+        )
+
     def _barrier(expected: set) -> tuple:
         """One barrier, clamped to whatever is left of the run's TOTAL budget."""
         t = time.perf_counter()
@@ -474,6 +496,7 @@ def run_stage_sweep_fleet(
             store_kwargs=store_kwargs,
             timeout_s=budget,
             interval_s=poll_interval_s,
+            ignore=stale_records,
         )
         budget_left[0] -= time.perf_counter() - t
         return seen, timed_out

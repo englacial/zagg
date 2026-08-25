@@ -1212,6 +1212,31 @@ class TestFleetOrchestration:
         assert attrs["source_children"] == {"folded": 1, "missing": 0, "unreadable": 0}
         assert healed["finisher"]["levels"]["0"]["source_children"]["missing"] == 0
 
+    def test_a_reused_run_id_cannot_pass_a_barrier_on_stale_records(self, tmp_path):
+        # Record names are deterministic from (dispatch, batch) and the prefix
+        # is keyed on run_id alone, so re-driving a run under its original id --
+        # the obvious recovery -- made every barrier pass instantly on the
+        # PREVIOUS attempt's records (review finding): no ordering at all, and
+        # a finisher aggregating a mix of old and new.
+        from zagg.client_transport import run_status_prefix
+
+        root = tmp_path / "s"
+        _stage_store(root)
+        run_id = "reused"
+        prefix = Path(run_status_prefix(str(root), run_id))
+        prefix.mkdir(parents=True, exist_ok=True)
+        for dispatch in (0, 1, 2):  # every name this run will produce
+            (prefix / stage_record_name(dispatch, 0)).write_text("{}")
+        (prefix / FINISHER_RECORD_NAME).write_text("{}")
+        # A client that records invokes and lands NOTHING: every barrier must
+        # expire, because nothing new appeared.
+        summary = _fleet(
+            root, _FakeLambda(None), tuple_width=1, run_id=run_id, barrier_timeout_s=0.05
+        )
+        assert summary["run_id"] == run_id
+        assert all(s["barrier_timed_out"] for s in summary["stages"])
+        assert summary["finisher"]["landed"] is False
+
     def test_scope_narrows_the_fan_out(self, tmp_path):
         from zagg.sweep_stages import normalize_scope
 
