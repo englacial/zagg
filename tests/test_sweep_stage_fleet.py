@@ -426,9 +426,7 @@ class TestFinisherArm:
         _stage_store(root)
         self._sweep_all(root, prefix)
         with pytest.raises(ValueError, match="no records_from"):
-            run_stage_finisher(
-                str(root), [(morton_word(d), None) for d in LEAVES], run_id="F"
-            )
+            run_stage_finisher(str(root), [(morton_word(d), None) for d in LEAVES], run_id="F")
 
     def test_a_finisher_over_zero_records_refuses(self, tmp_path):
         # The fan-out was lost (or the prefix is wrong): stamping the manifest
@@ -687,9 +685,9 @@ class TestHandlerStageArm:
             mod.lambda_handler(_event(root, {"role": "nope", "run_id": "F"}), None)["body"]
         )
         assert set(stage) == set(finisher) == set(failed)
-        assert all(
-            not isinstance(v, (dict, list)) for v in stage.values()
-        ), "the envelope carries scalars only"
+        assert all(not isinstance(v, (dict, list)) for v in stage.values()), (
+            "the envelope carries scalars only"
+        )
         assert "level_actuals" not in stage and "result" not in stage
         assert stage["error"] is None and failed["ok"] is False
 

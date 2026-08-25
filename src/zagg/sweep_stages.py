@@ -720,9 +720,7 @@ def merge_level_actuals(target: dict, incoming: dict) -> dict:
     return target
 
 
-def read_stage_records(
-    records_from: str, *, run_id: str, store_kwargs: dict | None = None
-) -> list:
+def read_stage_records(records_from: str, *, run_id: str, store_kwargs: dict | None = None) -> list:
     """One run's stage records under its status prefix, sorted by object name.
 
     Immediate children only (the ``rows_from_status`` precedent — the layout
