@@ -997,6 +997,33 @@ class TestFleetOrchestration:
         assert [b["role"] for b in client.blocks()] == ["stage"] * 3 + ["finisher"]
         assert [s["dispatch_order"] for s in summary["stages"]] == [2, 1, 0]
         assert summary["invokes"] == 4 and summary["finisher"]["landed"]
+        assert summary["finisher"]["fired"] and summary["skipped"] is None
+
+    def test_no_dispatch_nodes_fires_nothing_at_all(self, tmp_path):
+        # The finisher refuses a zero-record run by design and an Event invoke
+        # hides its 500, so firing one here would buy a full barrier waiting on
+        # a record that can never land (review finding). The key set does not
+        # move: `finisher` still answers `landed`, plus why it never fired.
+        from zagg.sweep_fleet import run_stage_sweep_fleet
+
+        mod = _handler_module()
+        root = tmp_path / "s"
+        _stage_store(root)
+        client = _FakeLambda(mod.lambda_handler)
+        summary = run_stage_sweep_fleet(
+            client,
+            "zagg-worker",
+            str(root),
+            [],
+            shard_order=3,
+            store_kwargs={},
+            poll_interval_s=0.01,
+            barrier_timeout_s=30,
+        )
+        assert client.events == [] and summary["invokes"] == 0
+        assert summary["stages"] == [] and summary["skipped"] == "no dispatch nodes"
+        assert summary["finisher"] == {"landed": False, "fired": False}
+        assert summary["duration_s"] < 5, "it waited on a barrier it should have skipped"
 
     def test_the_run_identity_is_pinned_across_every_invoke(self, tmp_path):
         mod = _handler_module()

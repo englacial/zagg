@@ -370,6 +370,9 @@ def run_stage_sweep_fleet(
         "records_from": records_from,
         "n_leaves": sum(len(w) for w in by_shard.values()),
         "skipped_leaves": skipped,
+        # Why the run did nothing, or None. Always present: a caller reading
+        # the summary should never have to know which branch produced it.
+        "skipped": None,
         "invokes": 0,
         "stages": [],
     }
@@ -438,6 +441,20 @@ def run_stage_sweep_fleet(
             f"stage fleet: tuple @{dispatch} — {len(nodes)} node(s) in {len(batches)} invoke(s), "
             f"{len(seen)}/{len(expected)} record(s) in {time.perf_counter() - t_stage:.1f}s"
         )
+    if not summary["stages"]:
+        # No tuple produced a dispatch node, so no stage record can exist —
+        # and the finisher REFUSES a zero-record run by design ("a finisher
+        # fires only after a fan-out", :func:`zagg.sweep_stages.run_stage_finisher`).
+        # Firing it would buy one guaranteed 500 the Event invoke hides, then a
+        # full barrier waiting on a record that can never land.
+        logger.info(
+            f"stage fleet: run {run_id} has no dispatch nodes ({summary['n_leaves']} leaf "
+            f"ref(s), {skipped} skipped) — nothing fired, no finisher, no barrier"
+        )
+        summary["skipped"] = "no dispatch nodes"
+        summary["finisher"] = {"landed": False, "fired": False}
+        summary["duration_s"] = time.perf_counter() - t0
+        return summary
     _fire(
         build_stage_event(
             store_path,
@@ -458,7 +475,7 @@ def run_stage_sweep_fleet(
         timeout_s=barrier_timeout_s,
         interval_s=poll_interval_s,
     )
-    summary["finisher"] = {"landed": not timed_out}
+    summary["finisher"] = {"landed": not timed_out, "fired": True}
     if seen:
         summary["finisher"].update(_read_finisher_record(records_from, store_kwargs))
     summary["duration_s"] = time.perf_counter() - t0
