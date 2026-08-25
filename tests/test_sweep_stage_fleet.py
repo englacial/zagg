@@ -940,6 +940,32 @@ class TestBatching:
         )
         assert event["discover"] is True and "leaves" not in event
 
+    def test_each_batch_carries_exactly_its_own_subtrees_leaves(self):
+        # The invariant the whole batching design rests on, and the one a
+        # single-batch fixture cannot reach (review finding): batch i's leaves
+        # are exactly the work-set leaves under batch i's nodes. A slicing bug
+        # here makes the fleet fold a different input set than the in-process
+        # pass while every other phase-2 assertion still passes.
+        from mortie import generate_morton_children
+
+        from zagg.grids.morton import morton_decimal
+        from zagg.sweep_fleet import pack_batches
+
+        leaves = [morton_decimal(int(w)) for w in generate_morton_children(morton_word("1"), 7)]
+        by_shard = {d: {None} for d in leaves}
+        nodes = sorted({d[:4] for d in leaves})
+        batches = pack_batches(
+            nodes, by_shard, block=self._block(3), store_path="s3://bucket/p.zarr"
+        )
+        assert len(batches) > 1
+        seen: list = []
+        for batch_nodes, refs in batches:
+            assert refs is not None
+            decimals = [morton_decimal(int(k)) for k, _w in refs]
+            assert all(d.startswith(tuple(batch_nodes)) for d in decimals)
+            seen += decimals
+        assert sorted(seen) == sorted(by_shard)  # nothing lost, nothing duplicated
+
     def test_the_discovery_fallback_is_logged_by_name(self, caplog):
         # Reaching the fallback means a batch was sized somewhere other than
         # pack_batches; a silent switch to a store-wide LIST would show up only
@@ -1262,20 +1288,55 @@ class TestFleetOrchestration:
         assert not (root / "-2" / "all.zarr").exists()
         assert summary["scope"] == [str(int(w)) for w in normalize_scope(["1111"])]
 
-    def test_partitioned_leaf_slices_ride_with_their_own_nodes(self, tmp_path):
+    def test_the_finest_tuple_rides_inline_with_the_whole_work_set(self, tmp_path):
+        # Smoke: at this fixture's size the finest tuple is ONE batch, so it
+        # carries every leaf inline. The per-batch slicing property needs a
+        # multi-batch fan-out -- the next test.
         mod = _handler_module()
         root = tmp_path / "s"
         _stage_store(root)
         client = _FakeLambda(mod.lambda_handler)
         _fleet(root, client, tuple_width=1)
-        # The finest tuple's single batch carries every leaf; each node's slice
-        # is the leaves under it, so a batch's leaves are exactly its subtree's.
-        finest = next(e for e in client.events if e["stage"].get("dispatch") == 2)
+        finest = [e for e in client.events if e["stage"].get("dispatch") == 2]
         from zagg.grids.morton import morton_decimal
 
-        decimals = {morton_decimal(int(k)) for k, _w in finest["leaves"]}
-        assert decimals == set(LEAVES)
-        assert all(any(d.startswith(n) for n in finest["stage"]["nodes"]) for d in decimals)
+        assert len(finest) == 1
+        assert {morton_decimal(int(k)) for k, _w in finest[0]["leaves"]} == set(LEAVES)
+
+    def test_a_multi_batch_tuple_partitions_its_leaves(self, tmp_path, monkeypatch):
+        # Merge-source-critical (review finding): across a fan-out, each
+        # batch's leaves are exactly the work-set leaves under that batch's
+        # nodes -- none dropped, none duplicated, none riding the wrong invoke.
+        import zagg.runner
+        from zagg.grids.morton import morton_decimal
+
+        mod = _handler_module()
+        root = tmp_path / "s"
+        _stage_store(root)
+        # Measure the single-batch payload, then cap just under it so the same
+        # tuple has to split. (`store_path` is in every event, so a literal cap
+        # would be a function of tmp_path's length.)
+        probe = _FakeLambda(None)
+        _fleet(root, probe, tuple_width=1, barrier_timeout_s=0.01)
+        single = next(e for e in probe.events if e["stage"].get("dispatch") == 2)
+        assert len(single["stage"]["nodes"]) > 1
+        monkeypatch.setattr(zagg.runner, "_ASYNC_PAYLOAD_CAP_BYTES", len(json.dumps(single)) - 40)
+
+        client = _FakeLambda(mod.lambda_handler)
+        _fleet(root, client, tuple_width=1)
+        events = [e for e in client.events if e["stage"].get("dispatch") == 2]
+        assert len(events) > 1, "the cap did not force a multi-batch fan-out"
+        nodes: list = []
+        seen: list = []
+        for event in events:
+            assert "leaves" in event and "discover" not in event
+            batch_nodes = tuple(event["stage"]["nodes"])
+            decimals = sorted(morton_decimal(int(k)) for k, _w in event["leaves"])
+            assert decimals == sorted(d for d in LEAVES if d.startswith(batch_nodes))
+            nodes += list(batch_nodes)
+            seen += decimals
+        assert sorted(seen) == sorted(LEAVES)  # nothing lost, nothing duplicated
+        assert sorted(nodes) == sorted(set(nodes)) == single["stage"]["nodes"]
 
 
 class TestRunnerSeam:
