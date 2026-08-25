@@ -920,6 +920,7 @@ def run_stage_finisher(
     run_id: str,
     records_from: str | None = None,
     touch_policy: str = "auto",
+    lease_ttl_s: int | None = None,
     store_kwargs: dict | None = None,
     record: bool = True,
 ) -> dict:
@@ -935,17 +936,38 @@ def run_stage_finisher(
     one object that says a fleet staged run completed, and the last thing the
     dispatcher polls for.
 
+    Admission is the ordinary per-store lease, acquired as this invoke's FIRST
+    act — the finisher is the one invoke that touches the store-root
+    singletons (the root ``coverage.moc`` and the manifest RMW), so it is the
+    last place that may run unadmitted. A fan-out over thousands of dispatch
+    nodes can outlive the TTL between the final stage worker's beat and this
+    invoke, which is exactly the window a foreign sweep may claim; the call is
+    idempotent re-admission when the run still holds its own intent, and
+    refuses BY NAME (:class:`zagg.sweep_lease.SweepRefusedError`) when a live
+    foreign one holds the store, rather than doing the RMW alongside the
+    claimant's own finisher and reporting ``lease.released: False`` as a clean
+    finish.
+
     Ordering is the local ordering. The lease is released inside
     :func:`run_finisher`, before the two records land, exactly as the CLI path
     releases it before ``_write_stage_record``: the records are the run's
-    telemetry, not part of its admission.
+    telemetry, not part of its admission. On ANY failure it is deliberately
+    left HELD (:func:`run_stage_sweep`'s posture): a half-finished store
+    expires into claimability rather than admitting a sibling now.
     """
     from zagg.hive import MANIFEST_NAME, read_manifest
     from zagg.sweep import _normalize_leaves
-    from zagg.sweep_lease import release_lease
+    from zagg.sweep_lease import DEFAULT_TTL_S, acquire_lease, release_lease
 
     t0 = time.perf_counter()
     store_kwargs = dict(store_kwargs or {})
+    acquire_lease(
+        store_root,
+        run_id=run_id,
+        scope=None,
+        ttl_s=int(lease_ttl_s or DEFAULT_TTL_S),
+        store_kwargs=store_kwargs,
+    )
     manifest = read_manifest(store_root, **store_kwargs)
     if manifest is None:
         raise ValueError(f"no {MANIFEST_NAME} at {store_root} — not a hive store root")

@@ -1329,7 +1329,9 @@ def _handle_stage_sweep(
       (``zagg.sweep_stages.run_stage_finisher``): aggregate the run's stage
       records into the manifest's per-level actuals, refresh the root
       ``coverage.moc``, touch ``aggregation.yaml``, release the lease, write
-      the run record.
+      the run record. It takes the lease first, like every other role: it is
+      the invoke that writes the store-root singletons, so a fan-out that
+      outlived its TTL must refuse here rather than finish over a claimant.
 
     Unlike the families arm this one does NOT fail open in the handler: a
     staged run is a fan-out with a soft barrier, so a swallowed 500 would read
@@ -1356,6 +1358,7 @@ def _handle_stage_sweep(
                 run_id=block["run_id"],
                 records_from=block.get("records_from"),
                 touch_policy=block.get("touch_policy", "auto"),
+                lease_ttl_s=block.get("lease_ttl_s"),
                 store_kwargs=store_kwargs,
             )
         elif role == "stage":

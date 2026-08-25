@@ -355,6 +355,45 @@ class TestFinisherArm:
         assert (prefix / FINISHER_RECORD_NAME).exists()
         assert json.loads((root / summary["record"]).read_text())["mode"] == "stages"
 
+    def test_the_finisher_refuses_under_a_foreign_lease(self, tmp_path):
+        # The fan-out outlived the TTL and a foreign sweep claimed the store.
+        # The finisher writes the root singletons, so it must refuse rather
+        # than do the manifest RMW alongside the claimant's own finisher.
+        from zagg.hive import read_manifest
+        from zagg.sweep_lease import SweepRefusedError, acquire_lease, release_lease
+
+        root, prefix = tmp_path / "s", tmp_path / "status"
+        _stage_store(root)
+        self._sweep_all(root, prefix)
+        assert release_lease(str(root), run_id="F")
+        acquire_lease(str(root), run_id="foreign-runner")
+        before = read_manifest(str(root))
+        with pytest.raises(SweepRefusedError, match="foreign-runner"):
+            run_stage_finisher(
+                str(root),
+                [(morton_word(d), None) for d in LEAVES],
+                run_id="F",
+                records_from=str(prefix),
+            )
+        assert read_manifest(str(root)) == before
+        assert not (prefix / FINISHER_RECORD_NAME).exists()
+
+    def test_the_finisher_re_admits_its_own_run(self, tmp_path):
+        # The idempotent half: the run's own live intent is re-read, not refused.
+        from zagg.sweep_lease import read_lease
+
+        root, prefix = tmp_path / "s", tmp_path / "status"
+        _stage_store(root)
+        self._sweep_all(root, prefix)
+        assert read_lease(str(root))["run_id"] == "F"
+        summary = run_stage_finisher(
+            str(root),
+            [(morton_word(d), None) for d in LEAVES],
+            run_id="F",
+            records_from=str(prefix),
+        )
+        assert summary["lease"]["released"] and read_lease(str(root)) is None
+
     def test_merge_is_idempotent_over_reinvoked_batches(self, tmp_path):
         # A re-fired batch (Event retry) rewrites its own record; the merge is
         # keyed per (artifact node, window) and ASSIGNED, so coverage counts
