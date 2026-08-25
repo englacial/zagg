@@ -1825,6 +1825,38 @@ class TestByteIdentityOracle:
 
         assert [r for r in sorted(fleet) if cli[r] != fleet[r]] == [MANIFEST_NAME]
 
+    def test_the_oracle_detects_a_wrong_fold(self, tmp_path, monkeypatch):
+        # The negative control for the BYTE branch — the one the acceptance
+        # actually rests on. The scoped-run control below trips the object-SET
+        # check and never reaches it. Here the object sets are identical and
+        # only the content moves: the finisher under-reports one child row of
+        # the record-based aggregation, which is the single channel the fleet
+        # rebuilds from the wire rather than from an in-process accumulator.
+        import zagg.sweep_stages
+
+        def lossy(target, incoming):
+            trimmed = {
+                k: {**e, "children": dict(list((e.get("children") or {}).items())[1:])}
+                for k, e in (incoming or {}).items()
+            }
+            return merge_level_actuals(target, trimmed)
+
+        mod = _handler_module()
+        root = tmp_path / "s"
+        _stage_store(root)
+        _write_discovery_record(root)
+        base = _snapshot(root)
+        _cli_sweep(root)
+        cli = _snapshot(root)
+        _restore(root, base)
+        monkeypatch.setattr(zagg.sweep_stages, "merge_level_actuals", lossy)
+        _fleet(root, _FakeLambda(mod.lambda_handler))
+        fleet = _snapshot(root)
+
+        assert sorted(_artifacts(cli)) == sorted(_artifacts(fleet))  # the SET is untouched
+        with pytest.raises(AssertionError, match=r"object\(s\) differ between executors"):
+            _assert_identical(cli, fleet)
+
     def test_the_oracle_detects_a_divergent_build(self, tmp_path):
         # Negative control: an acceptance test that cannot fail proves nothing.
         # A fleet run scoped to one base cell folds strictly less than the CLI's
