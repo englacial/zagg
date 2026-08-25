@@ -5593,6 +5593,8 @@ def _invoke_lambda_stage_sweep(
     output_creds_event=None,
     store_kwargs=None,
     touch_policy="auto",
+    barrier_timeout_s=None,
+    total_barrier_budget_s=None,
 ) -> dict | None:
     """End-of-run STAGED sweep over the fleet (issue #519); its summary.
 
@@ -5609,9 +5611,32 @@ def _invoke_lambda_stage_sweep(
     one of them stays worker-side. Fail-open (D9): a refused lease, a lost
     invoke or a timed-out barrier costs one later
     ``python -m zagg.sweep --stages`` pass, never a wrong answer.
+
+    **How long the tail can block.** One barrier per tuple plus the finisher's,
+    each bounded by ``barrier_timeout_s``
+    (:data:`zagg.sweep_fleet.DEFAULT_BARRIER_TIMEOUT_S`) and ALL of them
+    bounded together by ``total_barrier_budget_s``
+    (:data:`zagg.sweep_fleet.DEFAULT_TOTAL_BARRIER_BUDGET_S`) — so the worst
+    case is the total, a constant, not ``(n_tuples + 1) x`` the per-barrier
+    budget that grows with the store's order. Both are keywords here so a
+    caller can shorten them for a small store or lengthen them for a throttled
+    account.
+
+    **If the dispatcher dies mid-barrier** (a CI timeout, Ctrl-C, a driving
+    Lambda's own 900 s ceiling) the run's lease stays HELD, because the
+    finisher is its only releaser and it never fired. That is the lease's
+    designed recovery, not a leak: the lease carries a TTL, and an expired
+    lease is claimable — the next sweep takes the store over by name. The
+    ladder the workers already wrote stays valid either way; under-coverage is
+    recorded per artifact and heals on the next pass (#381 point (6)).
     """
     from zagg.sweep_fleet import run_stage_sweep_fleet
 
+    knobs = {}
+    if barrier_timeout_s is not None:
+        knobs["barrier_timeout_s"] = float(barrier_timeout_s)
+    if total_barrier_budget_s is not None:
+        knobs["total_barrier_budget_s"] = float(total_barrier_budget_s)
     try:
         summary = run_stage_sweep_fleet(
             lambda_client,
@@ -5622,6 +5647,7 @@ def _invoke_lambda_stage_sweep(
             output_creds_event=output_creds_event,
             store_kwargs=store_kwargs,
             touch_policy=touch_policy,
+            **knobs,
         )
     except Exception as e:
         logger.warning(f"staged sweep dispatch failed (fail-open, D9 — regenerable): {e}")
@@ -5631,6 +5657,12 @@ def _invoke_lambda_stage_sweep(
         f"{[(s['dispatch_order'], s['records_seen'], s['batches']) for s in summary['stages']]}, "
         f"finisher landed={summary['finisher']['landed']}"
     )
+    if summary.get("barrier_timed_out"):
+        logger.warning(
+            f"staged sweep {summary['run_id']}: at least one barrier expired — the ladder may "
+            "be partially covered and the finisher's per-level actuals may under-report; "
+            "under-coverage is recorded per artifact and heals on the next pass"
+        )
     return summary
 
 

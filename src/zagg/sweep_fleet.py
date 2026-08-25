@@ -55,6 +55,13 @@ logger = logging.getLogger(__name__)
 #: function timeout (900 s on the deployed fleet), and Event invokes queue, so
 #: the budget has to cover a cold fan-out plus one worker's full run.
 DEFAULT_BARRIER_TIMEOUT_S = 1200
+#: TOTAL barrier budget for one run, in seconds — the bound on the whole tail.
+#: Without it the dispatcher blocks for ``(n_tuples + 1) x`` the per-tuple
+#: budget, which grows with the store's order and is what an operator actually
+#: notices. Two hours is sized as "one fully expired barrier plus room for the
+#: rest of the ladder"; past it the barriers degrade to a single check each and
+#: the run proceeds, which is the same fail-open posture as a timeout.
+DEFAULT_TOTAL_BARRIER_BUDGET_S = 7200
 #: Seconds between barrier polls. One LIST per poll, not one HEAD per record.
 DEFAULT_POLL_INTERVAL_S = 5.0
 #: The ``batch`` index a packed batch is MEASURED with. Larger than any batch
@@ -299,7 +306,9 @@ def await_records(
                 f"recorded per artifact and heals on the next pass (#381 point (6))"
             )
             return seen, True
-        time.sleep(float(interval_s))
+        # Clamped to the deadline: a poll interval longer than what is left
+        # would overshoot the budget the caller is bounding the tail with.
+        time.sleep(max(0.0, min(float(interval_s), deadline - time.monotonic())))
 
 
 def run_stage_sweep_fleet(
@@ -317,6 +326,7 @@ def run_stage_sweep_fleet(
     touch_policy: str = "auto",
     lease_ttl_s: int | None = None,
     barrier_timeout_s: float = DEFAULT_BARRIER_TIMEOUT_S,
+    total_barrier_budget_s: float = DEFAULT_TOTAL_BARRIER_BUDGET_S,
     poll_interval_s: float = DEFAULT_POLL_INTERVAL_S,
 ) -> dict:
     """One staged sweep run over the fleet: tuples, barriers, finisher last.
@@ -336,6 +346,12 @@ def run_stage_sweep_fleet(
     supplied) and threaded verbatim into every invoke. ``run_started`` is
     pinned here too: every worker of the run must agree on when the run began,
     or a sibling's fresh stamp reads as a foreign sweep's.
+
+    ``barrier_timeout_s`` bounds ONE barrier; ``total_barrier_budget_s`` bounds
+    the sum of them, so the tail's worst case is a constant rather than a
+    function of the store's order (there is one barrier per tuple plus the
+    finisher's). Once the total is spent each remaining barrier degrades to a
+    single check — fail-open, exactly as a timeout is.
 
     Returns the dispatcher's own summary — what it fired and what it saw. The
     RUN's record is the finisher's (``sweep_stats_{ts}_stages.json`` at the
@@ -376,6 +392,28 @@ def run_stage_sweep_fleet(
         "invokes": 0,
         "stages": [],
     }
+
+    budget_left = [float(total_barrier_budget_s)]
+
+    def _barrier(expected: set) -> tuple:
+        """One barrier, clamped to whatever is left of the run's TOTAL budget."""
+        t = time.perf_counter()
+        budget = max(0.0, min(float(barrier_timeout_s), budget_left[0]))
+        if budget <= 0.0:
+            logger.warning(
+                f"stage fleet: the run's total barrier budget "
+                f"({float(total_barrier_budget_s):.0f}s) is spent — checking once for "
+                f"{len(expected)} record(s) rather than waiting, and proceeding fail-open"
+            )
+        seen, timed_out = await_records(
+            records_from,
+            expected,
+            store_kwargs=store_kwargs,
+            timeout_s=budget,
+            interval_s=poll_interval_s,
+        )
+        budget_left[0] -= time.perf_counter() - t
+        return seen, timed_out
 
     def _fire(event: dict) -> None:
         lambda_client.invoke(
@@ -419,13 +457,7 @@ def run_stage_sweep_fleet(
                 )
             )
         t_stage = time.perf_counter()
-        seen, timed_out = await_records(
-            records_from,
-            expected,
-            store_kwargs=store_kwargs,
-            timeout_s=barrier_timeout_s,
-            interval_s=poll_interval_s,
-        )
+        seen, timed_out = _barrier(expected)
         summary["stages"].append(
             {
                 "dispatch_order": dispatch,
@@ -468,13 +500,7 @@ def run_stage_sweep_fleet(
             output_creds_event,
         )
     )
-    seen, timed_out = await_records(
-        records_from,
-        {FINISHER_RECORD_NAME},
-        store_kwargs=store_kwargs,
-        timeout_s=barrier_timeout_s,
-        interval_s=poll_interval_s,
-    )
+    seen, timed_out = _barrier({FINISHER_RECORD_NAME})
     summary["finisher"] = {"landed": not timed_out, "fired": True}
     if seen:
         summary["finisher"].update(_read_finisher_record(records_from, store_kwargs))

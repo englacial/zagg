@@ -1074,6 +1074,28 @@ class TestFleetOrchestration:
         assert all(s["barrier_timed_out"] for s in summary["stages"])
         assert summary["finisher"]["landed"] is False
 
+    def test_the_total_barrier_budget_bounds_the_whole_tail(self, tmp_path):
+        # The tail's worst case must be a constant, not `(n_tuples + 1) x` the
+        # per-barrier budget -- that product grows with the store's order and
+        # is what a dispatcher's own ceiling runs into (review finding).
+        import time
+
+        root = tmp_path / "s"
+        _stage_store(root)
+        t = time.perf_counter()
+        summary = _fleet(
+            root,
+            _FakeLambda(None),
+            tuple_width=1,
+            barrier_timeout_s=0.5,
+            total_barrier_budget_s=0.5,
+        )
+        elapsed = time.perf_counter() - t
+        assert all(s["barrier_timed_out"] for s in summary["stages"])
+        assert summary["finisher"]["landed"] is False
+        # Four barriers at 0.5 s each would be 2 s; the total caps it at one.
+        assert elapsed < 1.5, f"the total budget was not enforced ({elapsed:.2f}s)"
+
     def test_a_lost_invoke_times_the_barrier_out_and_the_run_proceeds(self, tmp_path):
         # #381 point (6): the barrier is a scheduling preference. A dropped
         # finest-tuple invoke must not stall the run — the coarser tuples still
@@ -1146,6 +1168,30 @@ class TestRunnerSeam:
             )
         assert summary is not None and summary["finisher"]["landed"]
         assert "Dispatched staged sweep" in caplog.text
+
+    def test_the_seam_threads_the_barrier_knobs(self, tmp_path):
+        # Neither budget was reachable from the runner, so an operator could not
+        # shorten the tail for a small store nor lengthen it for a throttled
+        # account (review finding).
+        import time
+
+        from zagg.runner import _invoke_lambda_stage_sweep
+
+        root = tmp_path / "s"
+        _stage_store(root)
+        t = time.perf_counter()
+        summary = _invoke_lambda_stage_sweep(
+            _FakeLambda(None),
+            "zagg-worker",
+            str(root),
+            [(morton_word(d), None) for d in LEAVES],
+            shard_order=3,
+            store_kwargs={},
+            barrier_timeout_s=0.3,
+            total_barrier_budget_s=0.3,
+        )
+        assert summary is not None and summary["finisher"]["landed"] is False
+        assert time.perf_counter() - t < 2.0, "the seam did not forward the barrier knobs"
 
     def test_the_seam_is_fail_open(self, tmp_path, caplog):
         import logging
