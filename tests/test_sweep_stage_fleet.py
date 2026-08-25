@@ -139,6 +139,50 @@ class TestStageWorkerArm:
         # Held, ours, and NOT released: release is the finisher's final act.
         assert held is not None and held["run_id"] == "F" and held["scope"] is None
 
+    def test_an_empty_node_set_refuses_instead_of_sweeping_the_store(self, tmp_path):
+        # ``scope=None`` is whole-store; a dropped/empty ``nodes`` key must not
+        # decay into it, or every worker that loses the key double-writes every
+        # object as a same-run sibling nothing refuses.
+        from zagg.sweep_lease import read_lease
+
+        root = tmp_path / "s"
+        _stage_store(root)
+        for nodes in ([], ()):
+            with pytest.raises(ValueError, match="empty node set"):
+                run_stage_worker(
+                    str(root),
+                    [(morton_word(d), None) for d in LEAVES],
+                    run_id="F",
+                    run_started=RUN_STARTED,
+                    dispatch=0,
+                    nodes=nodes,
+                )
+        # Refused before admission and before any fold: no lease, no artifacts.
+        assert read_lease(str(root)) is None
+        assert not (root / "1" / "all.zarr").exists()
+        assert not (root / "-2" / "all.zarr").exists()
+
+    def test_a_node_off_the_dispatch_order_refuses_the_whole_invoke(self, tmp_path):
+        from zagg.sweep_lease import read_lease
+
+        root = tmp_path / "s"
+        _stage_store(root)
+        # "111" is an order-3 node; handed at dispatch 0 it admits its ancestor
+        # base cell "1" whole (containment resolves both ways), so this invoke
+        # would quietly fold four times its share.
+        with pytest.raises(ValueError, match=r"not at order 0: \['111'\]"):
+            run_stage_worker(
+                str(root),
+                [(morton_word(d), None) for d in LEAVES],
+                run_id="F",
+                run_started=RUN_STARTED,
+                dispatch=0,
+                nodes=["1", "111"],
+            )
+        # The whole invoke refuses — the good node in the same set is not swept.
+        assert read_lease(str(root)) is None
+        assert not (root / "1" / "all.zarr").exists()
+
     def test_a_sibling_worker_of_the_same_run_is_admitted(self, tmp_path):
         root = tmp_path / "s"
         _stage_store(root)
@@ -433,6 +477,18 @@ class TestHandlerStageArm:
         assert response["statusCode"] == 500
         body = json.loads(response["body"])
         assert body["error_class"] == "SweepRefusedError" and "live-runner" in body["error"]
+        assert not (prefix / stage_record_name(0, 0)).exists()
+
+    def test_a_stage_event_without_nodes_refuses_by_name(self, tmp_path):
+        mod = _handler_module()
+        root, prefix = tmp_path / "s", tmp_path / "status"
+        _stage_store(root)
+        block = _stage_block(0, ["1"], records_from=prefix)
+        del block["nodes"]
+        response = mod.lambda_handler(_event(root, block), None)
+        assert response["statusCode"] == 500
+        body = json.loads(response["body"])
+        assert body["error_class"] == "ValueError" and "empty node set" in body["error"]
         assert not (prefix / stage_record_name(0, 0)).exists()
 
     def test_an_unknown_role_refuses_by_name(self, tmp_path):

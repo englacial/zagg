@@ -803,6 +803,18 @@ def run_stage_worker(
     relies on, which is why the merge-source law makes the fleet build
     byte-identical to the CLI build.
 
+    The node set is validated BY NAME before anything is read or written: it
+    must be non-empty, and every entry must sit at exactly the ``dispatch``
+    order. Neither check is decoration. An empty set would reach the pass as
+    ``scope=None`` — whole store — and a node coarser or finer than
+    ``dispatch`` over-claims its ancestor's subtree, because
+    :func:`scope_admits` resolves containment in BOTH directions. Either way
+    this invoke silently widens its share, and two same-run siblings then
+    double-write the same objects — which neither the lease nor the
+    foreign-fresh stamp catches, since both are same-run-permissive by design
+    (that IS how a fan-out's siblings are admitted). A bad node set has to be
+    loud here or it is never loud at all.
+
     Admission is the ordinary per-store lease. Every worker of a run calls
     :func:`zagg.sweep_lease.acquire_lease` with the SAME run id, so the first
     one creates the intent and the rest read their own back (the idempotent
@@ -817,20 +829,35 @@ def run_stage_worker(
     :func:`stage_record_name` and is both the dispatcher's soft-barrier signal
     and the finisher's aggregation input. Returns that record.
     """
-    from zagg.hive import MANIFEST_NAME, read_manifest
+    from zagg.hive import MANIFEST_NAME, _decimal_order, read_manifest
     from zagg.sweep import _normalize_leaves
     from zagg.sweep_lease import DEFAULT_TTL_S, acquire_lease, heartbeat_lease
 
     t0 = time.perf_counter()
     store_kwargs = dict(store_kwargs or {})
     nodes = [str(n) for n in nodes]
+    if not nodes:
+        raise ValueError(
+            f"stage invoke (run {run_id!r}, dispatch order {dispatch}, batch {batch}) was "
+            "handed an empty node set — a stage worker folds ITS share of a tuple; an "
+            "empty set would sweep the whole store as a same-run sibling of every other "
+            "worker, which admission cannot catch"
+        )
+    misordered = sorted({n for n in nodes if _decimal_order(n) != int(dispatch)})
+    if misordered:
+        raise ValueError(
+            f"stage invoke (run {run_id!r}, dispatch order {dispatch}, batch {batch}) was "
+            f"handed nodes that are not at order {dispatch}: {misordered} (orders "
+            f"{sorted({_decimal_order(n) for n in misordered})}) — containment resolves "
+            "both ways, so an off-order node over-claims its ancestor's whole subtree"
+        )
     manifest = read_manifest(store_root, **store_kwargs)
     if manifest is None:
         raise ValueError(f"no {MANIFEST_NAME} at {store_root} — not a hive store root")
     shard_order = int(manifest["shard_order"])
     ladder_entries(manifest.get("pyramid") or {}, shard_order)  # loud /2 gate
     by_shard, skipped = _normalize_leaves(leaves, shard_order)
-    scope = normalize_scope(nodes) if nodes else None
+    scope = normalize_scope(nodes)
     ttl_s = int(lease_ttl_s or DEFAULT_TTL_S)
     lease = acquire_lease(
         store_root, run_id=run_id, scope=None, ttl_s=ttl_s, store_kwargs=store_kwargs
