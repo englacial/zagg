@@ -1682,8 +1682,10 @@ class TestByteIdentityOracle:
         fleet = _fleet(root, client, tuple_width=width if fleet_width is None else fleet_width)
         return cli, _snapshot(root), fleet, client
 
-    @pytest.mark.parametrize("width,tuples", ((1, 3), (2, 2), (3, 1)))
-    def test_the_fleet_build_is_byte_identical_to_the_cli_build(self, tmp_path, width, tuples):
+    @pytest.mark.parametrize("width,tuples,objects", ((1, 3, 181), (2, 2, 163), (3, 1, 136)))
+    def test_the_fleet_build_is_byte_identical_to_the_cli_build(
+        self, tmp_path, width, tuples, objects
+    ):
         # At every tuple width, not just the default: width 3 folds the whole
         # o3 ladder from one tuple, so it has no tuple SEQUENCE for the
         # transport to get wrong. Widths 1 and 2 put the ordering the
@@ -1693,12 +1695,18 @@ class TestByteIdentityOracle:
         assert summary["finisher"]["landed"] and not summary["barrier_timed_out"]
         assert len(summary["stages"]) == tuples
         _assert_identical(cli, fleet)
-        # Never vacuous: the ladder really was built, columns and all.
+        # Never vacuous — and pinned to what the SWEEP wrote rather than to
+        # what the fixture left behind: the pre-sweep store already carries a
+        # leaf `all.pyramid.stats.json` per column and the root `coverage.moc`,
+        # so their mere presence would pass on a fleet arm that wrote nothing.
+        # This work set's ladder is exactly seven nodes (3 at order 2, 2 at
+        # order 1, 2 at order 0), each one a group and a rollup; the object
+        # total moves with the width because narrower tuples also write relay
+        # stage columns the width-3 build never needs.
         rels = _artifacts(fleet)
-        assert any(_is_group_metadata(r) for r in rels)
-        assert any(r.endswith("overview.rollup.json") for r in rels)
-        assert any(r.endswith("all.pyramid.stats.json") for r in rels)
-        assert "coverage.moc" in rels and len(rels) > 100
+        assert sum(_is_group_metadata(r) for r in rels) == 7
+        assert sum(r.endswith("overview.rollup.json") for r in rels) == 7
+        assert len(rels) == objects
 
     def test_both_arms_leave_one_run_record_and_no_lease(self, tmp_path):
         cli, fleet, _, _ = self._both_arms(tmp_path)
