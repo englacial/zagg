@@ -171,6 +171,22 @@ def sweep_stage_pass(
     shard_order = int(manifest["shard_order"])
     cell_order = int(manifest["cell_order"])
     levels = ladder_entries(pyramid, shard_order)
+    # The schedule and the ``only_dispatch`` refusal come FIRST — before the
+    # ``fields``/``candidates`` gates below, which both return a clean empty
+    # summary. A mistyped dispatch order against a store with nothing to sweep
+    # would otherwise read as a no-op and PUT a well-formed record with no
+    # stages, which the dispatcher's barrier accepts (review finding). It is a
+    # pure function of shard_order and tuple_width and needs nothing on disk.
+    schedule = stage_tuples(shard_order, tuple_width=tuple_width)
+    if only_dispatch is not None:
+        picked = [t for t in schedule if int(t["dispatch"]) == int(only_dispatch)]
+        if not picked:
+            raise ValueError(
+                f"no stage tuple dispatches at order {only_dispatch} (shard_order "
+                f"{shard_order}, tuple_width {tuple_width}); the dispatch orders are "
+                f"{[t['dispatch'] for t in schedule]}"
+            )
+        schedule = picked
     decl = pyramid.get("overview") if isinstance(pyramid.get("overview"), dict) else {}
     # THE shared admission predicate (:func:`zagg.column._is_composable`), not a
     # literal class list: this map goes to ``stage_node`` unfiltered and reaches
@@ -200,16 +216,6 @@ def sweep_stage_pass(
         level_actuals = {}  # callers may pass one to accumulate across passes
     from zagg.windows import SCHEDULE_NONE_TOKEN
 
-    schedule = stage_tuples(shard_order, tuple_width=tuple_width)
-    if only_dispatch is not None:
-        picked = [t for t in schedule if int(t["dispatch"]) == int(only_dispatch)]
-        if not picked:
-            raise ValueError(
-                f"no stage tuple dispatches at order {only_dispatch} (shard_order "
-                f"{shard_order}, tuple_width {tuple_width}); the dispatch orders are "
-                f"{[t['dispatch'] for t in schedule]}"
-            )
-        schedule = picked
     for stage in schedule:
         t0 = time.perf_counter()
         counts = {

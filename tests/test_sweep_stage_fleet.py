@@ -122,6 +122,32 @@ class TestStageWorkerArm:
                 str(root), manifest, {d: {None} for d in LEAVES}, run_id="A", only_dispatch=1
             )
 
+    def test_a_mistyped_dispatch_refuses_even_with_nothing_to_sweep(self, tmp_path):
+        # The refusal must not sit behind the pass's empty-summary gates: a
+        # store with no composable fields would otherwise let ANY dispatch
+        # order return ``stages: []`` and PUT a well-formed record on it.
+        import copy
+
+        from zagg.sweep_stages import sweep_stage_pass
+
+        root = tmp_path / "s"
+        manifest = _stage_store(root)
+        bare = copy.deepcopy(manifest)
+        bare["pyramid"]["overview"]["fields"] = {}
+        assert sweep_stage_pass(str(root), bare, {}, run_id="A")["stages"] == []
+        with pytest.raises(ValueError, match="no stage tuple dispatches at order 7"):
+            sweep_stage_pass(str(root), bare, {}, run_id="A", only_dispatch=7)
+        # Same over the worker entry point, with an order-7 node set to match.
+        with pytest.raises(ValueError, match="no stage tuple dispatches at order 7"):
+            run_stage_worker(
+                str(root),
+                [(morton_word(d), None) for d in LEAVES],
+                run_id="F",
+                run_started=RUN_STARTED,
+                dispatch=7,
+                nodes=["11111111"],
+            )
+
     def test_the_worker_writes_and_holds_the_lease(self, tmp_path):
         from zagg.sweep_lease import read_lease
 
