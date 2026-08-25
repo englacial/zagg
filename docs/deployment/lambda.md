@@ -572,7 +572,14 @@ ordering exactly:
    recorded in each artifact's own `source_children` and heals on the next
    pass, so an expired barrier logs loudly and the run proceeds;
 3. next tuple; then the **finisher** invoke last — root `coverage.moc`,
-   manifest per-level actuals, `aggregation.yaml` touch, lease release.
+   manifest per-level actuals, `aggregation.yaml` touch, lease release —
+   **unless no tuple produced a dispatch node at all** (every leaf skipped as
+   mixed-order, or filtered out by scope), in which case nothing fires, there
+   is no finisher and no barrier, and the summary says so:
+   `skipped: "no dispatch nodes"` with `finisher.fired: false`. A finisher
+   over zero stage records refuses by design, so firing it would buy one
+   guaranteed 500 the Event invoke hides plus a full barrier on a record that
+   can never land.
 
 One barrier is bounded by `barrier_timeout_s` (default 2,700 s — three times
 the 900 s function timeout: queue drain, one throttle redelivery, and the
