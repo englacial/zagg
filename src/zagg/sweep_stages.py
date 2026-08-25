@@ -936,6 +936,16 @@ def run_stage_finisher(
     one object that says a fleet staged run completed, and the last thing the
     dispatcher polls for.
 
+    ``records_from`` is REQUIRED and the prefix must list at least one stage
+    record; both refuse by name. A finisher only ever fires after a fan-out,
+    so no prefix (or a prefix listing nothing — the wrong bucket, a role that
+    cannot list it, every stage invoke lost) means the fan-out itself was
+    lost, and stamping a manifest with NO actuals on that basis is precisely
+    the silent under-reporting :func:`_put_stage_record` refuses to fail open
+    on. A PARTIAL set stays fine: fewer records than batches under-reports
+    coverage, which is recorded and self-heals on the next run (#381 point
+    (6)); only zero is indistinguishable from "nothing ran".
+
     Admission is the ordinary per-store lease, acquired as this invoke's FIRST
     act — the finisher is the one invoke that touches the store-root
     singletons (the root ``coverage.moc`` and the manifest RMW), so it is the
@@ -961,6 +971,12 @@ def run_stage_finisher(
 
     t0 = time.perf_counter()
     store_kwargs = dict(store_kwargs or {})
+    if not records_from:
+        raise ValueError(
+            f"the finisher for run {run_id!r} was handed no records_from — the run's "
+            "stage records ARE its per-level actuals; finishing without them would "
+            "stamp the manifest with no coverage at all"
+        )
     acquire_lease(
         store_root,
         run_id=run_id,
@@ -976,7 +992,14 @@ def run_stage_finisher(
     by_shard, skipped = _normalize_leaves(leaves, shard_order)
     merged: dict = {}
     stage_rows: list = []
-    records = read_stage_records(records_from, store_kwargs=store_kwargs) if records_from else []
+    records = read_stage_records(records_from, store_kwargs=store_kwargs)
+    if not records:
+        raise ValueError(
+            f"the finisher for run {run_id!r} found no stage records under "
+            f"{records_from} — a finisher fires only after a fan-out, so zero records "
+            "means the fan-out was lost; refusing rather than recording an empty sweep "
+            "(a PARTIAL set is fine: under-coverage is recorded and self-heals)"
+        )
     for row in records:
         merge_level_actuals(merged, row.get("level_actuals") or {})
         stage_rows.extend(row.get("stages") or [])
@@ -1008,11 +1031,10 @@ def run_stage_finisher(
     summary["duration_s"] = time.perf_counter() - t0
     if record:
         summary["record"] = _write_stage_record(store_root, summary, store_kwargs)
-    if records_from:
-        summary["finisher_record"] = _put_stage_record(
-            records_from,
-            FINISHER_RECORD_NAME,
-            {"spec": STAGE_RECORD_SPEC, "role": "finisher", **summary},
-            store_kwargs,
-        )
+    summary["finisher_record"] = _put_stage_record(
+        records_from,
+        FINISHER_RECORD_NAME,
+        {"spec": STAGE_RECORD_SPEC, "role": "finisher", **summary},
+        store_kwargs,
+    )
     return summary

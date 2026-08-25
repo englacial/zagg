@@ -394,6 +394,56 @@ class TestFinisherArm:
         )
         assert summary["lease"]["released"] and read_lease(str(root)) is None
 
+    def test_a_finisher_without_records_from_refuses(self, tmp_path):
+        root, prefix = tmp_path / "s", tmp_path / "status"
+        _stage_store(root)
+        self._sweep_all(root, prefix)
+        with pytest.raises(ValueError, match="no records_from"):
+            run_stage_finisher(
+                str(root), [(morton_word(d), None) for d in LEAVES], run_id="F"
+            )
+
+    def test_a_finisher_over_zero_records_refuses(self, tmp_path):
+        # The fan-out was lost (or the prefix is wrong): stamping the manifest
+        # with no actuals at all is the silent under-report this channel exists
+        # to prevent, so it refuses instead of reporting a clean finish.
+        from zagg.hive import read_manifest
+        from zagg.sweep_lease import read_lease
+
+        root, prefix = tmp_path / "s", tmp_path / "status"
+        _stage_store(root)
+        self._sweep_all(root, prefix)
+        empty = tmp_path / "elsewhere"
+        empty.mkdir()
+        before = read_manifest(str(root))
+        with pytest.raises(ValueError, match="no stage records"):
+            run_stage_finisher(
+                str(root),
+                [(morton_word(d), None) for d in LEAVES],
+                run_id="F",
+                records_from=str(empty),
+            )
+        assert read_manifest(str(root)) == before
+        assert not (empty / FINISHER_RECORD_NAME).exists()
+        assert read_lease(str(root))["run_id"] == "F"  # failure leaves it HELD
+
+    def test_a_partial_record_set_still_finishes(self, tmp_path):
+        # Only ZERO refuses: under-coverage from a lost batch is recorded and
+        # heals on the next run (#381 point (6)).
+        root, prefix = tmp_path / "s", tmp_path / "status"
+        _stage_store(root)
+        self._sweep_all(root, prefix)
+        (prefix / stage_record_name(0, 1)).unlink()
+        summary = run_stage_finisher(
+            str(root),
+            [(morton_word(d), None) for d in LEAVES],
+            run_id="F",
+            records_from=str(prefix),
+        )
+        assert summary["stage_records"] == 1 and summary["lease"]["released"]
+        # 4 with both records (see above); the lost batch under-reports, loudly.
+        assert summary["levels"]["0"]["source_children"]["folded"] == 3
+
     def test_merge_is_idempotent_over_reinvoked_batches(self, tmp_path):
         # A re-fired batch (Event retry) rewrites its own record; the merge is
         # keyed per (artifact node, window) and ASSIGNED, so coverage counts
