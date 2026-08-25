@@ -801,14 +801,14 @@ class _FakeLambda:
         return [e["stage"] for e in self.events]
 
 
-def _fleet(root, client, **kwargs):
+def _fleet(root, client, *, leaves=None, **kwargs):
     from zagg.sweep_fleet import run_stage_sweep_fleet
 
     return run_stage_sweep_fleet(
         client,
         "zagg-worker",
         str(root),
-        [(morton_word(d), None) for d in LEAVES],
+        [(morton_word(d), None) for d in LEAVES] if leaves is None else leaves,
         shard_order=3,
         store_kwargs={},
         poll_interval_s=0.01,
@@ -1542,17 +1542,24 @@ def _restore(root, snapshot):
         q.write_bytes(data)
 
 
-def _write_discovery_record(root, leaves=LEAVES):
-    """The listing-based run record ``python -m zagg.sweep`` discovers from."""
+def _write_discovery_record(root, leaves=LEAVES, windows=(None,)):
+    """The listing-based run record ``python -m zagg.sweep`` discovers from.
+
+    The stamp in the NAME is a sentinel, not an instant: ``discover_leaves``
+    globs ``stats_*.parquet`` and never parses it. (``RUN_STARTED`` above is
+    the opposite — there the instant is load-bearing, since it is what the
+    foreign-fresh-stamp abort compares against.)
+    """
     import pandas as pd
 
+    rows = [(d, w) for d in leaves for w in windows]
     pd.DataFrame(
         {
-            "shard_key": pd.array([morton_word(d) for d in leaves], dtype="UInt64"),
-            "success": [True] * len(leaves),
-            "window": [None] * len(leaves),
+            "shard_key": pd.array([morton_word(d) for d, _w in rows], dtype="UInt64"),
+            "success": [True] * len(rows),
+            "window": [w for _d, w in rows],
         }
-    ).to_parquet(root / "stats_20260825T000000Z_test.parquet", engine="fastparquet")
+    ).to_parquet(root / "stats_00000000T000000Z_test.parquet", engine="fastparquet")
 
 
 def _cli_sweep(root, *, tuple_width=3):
@@ -1640,7 +1647,15 @@ class TestByteIdentityOracle:
     """THE acceptance: same store, two executors, identical bytes."""
 
     def _both_arms(
-        self, tmp_path, monkeypatch=None, *, fields=None, width=3, fleet_width=None, squeeze=False
+        self,
+        tmp_path,
+        monkeypatch=None,
+        *,
+        fields=None,
+        width=3,
+        fleet_width=None,
+        squeeze=False,
+        windows=None,
     ):
         """CLI sweep -> snapshot -> reset -> fleet sweep -> snapshot.
 
@@ -1649,12 +1664,21 @@ class TestByteIdentityOracle:
         ``width`` drives BOTH arms (the byte-exact comparison); ``fleet_width``
         overrides the fleet's alone, which is the deliberate cross-width arm.
         ``squeeze`` caps the async payload just under the tuple's REAL event so
-        the fan-out has to split. Returns ``(cli, fleet, summary, client)``.
+        the fan-out has to split. ``windows`` swaps in the windowed/all-time
+        store so the leaf refs carry a window rather than ``None``.
+        Returns ``(cli, fleet, summary, client)``.
         """
         mod = _handler_module()
         root = tmp_path / "s"
-        _stage_store(root, **({} if fields is None else {"fields": fields}))
-        _write_discovery_record(root)
+        if windows is None:
+            _stage_store(root, **({} if fields is None else {"fields": fields}))
+            refs = None
+        else:
+            from test_sweep_stage import TestWindowedStageSweep
+
+            TestWindowedStageSweep()._windowed_store(root)
+            refs = [(morton_word(d), w) for d in LEAVES for w in windows]
+        _write_discovery_record(root, windows=windows or (None,))
         base = _snapshot(root)
 
         _cli_sweep(root, tuple_width=width)
@@ -1681,7 +1705,12 @@ class TestByteIdentityOracle:
             )
 
         client = _FakeLambda(mod.lambda_handler)
-        fleet = _fleet(root, client, tuple_width=width if fleet_width is None else fleet_width)
+        fleet = _fleet(
+            root,
+            client,
+            leaves=refs,
+            tuple_width=width if fleet_width is None else fleet_width,
+        )
         return cli, _snapshot(root), fleet, client
 
     @pytest.mark.parametrize("width,tuples,objects", ((1, 3, 181), (2, 2, 163), (3, 1, 136)))
@@ -1801,6 +1830,24 @@ class TestByteIdentityOracle:
         assert not summary["barrier_timed_out"]
         assert not client.pending, "an invoke never drained — the barriers did not wait for it"
         _assert_identical(cli, _snapshot(root))
+
+    @pytest.mark.parametrize("width", (1, 3))
+    def test_identity_holds_for_a_windowed_store(self, tmp_path, width):
+        # The `window` dimension of the leaf refs, and the `windows` block of
+        # the rollups: every other arm hands both executors ``window=None``
+        # for all four leaves, so the wire's window field was outside the
+        # acceptance. Here each leaf rides twice, once per window, and the
+        # all-time fold sits over the per-window gen-1 tier
+        # (`TestWindowedStageSweep` in test_sweep_stage.py owns that store).
+        from test_sweep_stage import TestWindowedStageSweep
+
+        cli, fleet, summary, _ = self._both_arms(
+            tmp_path, width=width, windows=TestWindowedStageSweep.WINDOWS
+        )
+        assert summary["n_leaves"] == 8 and summary["finisher"]["landed"]
+        _assert_identical(cli, fleet)
+        rels = _artifacts(fleet)
+        assert sum(r.endswith("/2019.zarr/zarr.json") for r in rels) == 7
 
     def test_identity_holds_for_a_both_channel_store(self, tmp_path):
         # The located + temporal companion channels (issue #410) ride the same
