@@ -642,10 +642,38 @@ store itself.
 **Permissions.** Nothing new on the worker side — the execution role already
 writes the store and the `<store>.status/` sibling (the issue #151 async result
 channel), which is where the stage records land. The dispatcher needs
-`lambda:InvokeFunction` plus `s3:ListBucket` scoped to `<store>.status/*` so it
-can poll the barrier; the v2 Event transport already requires that prefix, so a
-correctly scoped dispatcher role needs no new grant. No CloudFormation, layer,
-or IAM template change ships with this transport.
+`lambda:InvokeFunction`, plus **two** grants on that sibling prefix:
+`s3:ListBucket` for the barrier's poll and `s3:GetObject` for the finisher
+record it reports (`stage_records`, `levels`, `lease`, `record`,
+`duration_s`). The v2 Event transport already both lists and gets that prefix,
+so a correctly scoped dispatcher role needs no new grant, and no
+CloudFormation, layer, or IAM template change ships with this transport.
+
+Mind the shape if you are writing the policy by hand: `s3:ListBucket` is a
+**bucket-level** action, so its `Resource` is the bucket ARN and the prefix
+rides an `s3:prefix` condition. A key-level ARN matches nothing:
+
+```yaml
+# WRONG — never matches
+- Effect: Allow
+  Action: s3:ListBucket
+  Resource: arn:aws:s3:::bucket/prefix.zarr.status/*
+
+# Right
+- Effect: Allow
+  Action: s3:ListBucket
+  Resource: arn:aws:s3:::bucket
+  Condition: { StringLike: { s3:prefix: "prefix.zarr.status/*" } }
+- Effect: Allow
+  Action: s3:GetObject
+  Resource: arn:aws:s3:::bucket/prefix.zarr.status/*
+```
+
+Both failures are quiet rather than loud. A missing list grant reads in the run
+log exactly like slow workers — "the prefix is empty" and "the LIST failed" are
+the same empty set — until the dispatcher gives up after five consecutive
+faulted LISTs and proceeds fail-open. A missing `s3:GetObject` completes the
+run and simply drops the finisher's reporting from the summary.
 
 !!! note "Dispatch nodes come from the work set, not from the store"
     The dispatcher cannot read the root `coverage.moc`, so it derives dispatch
