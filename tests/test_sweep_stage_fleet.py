@@ -1588,6 +1588,42 @@ def _assert_identical(cli, fleet, *, ladder_data_only=False):
     assert not differing, f"{len(differing)} object(s) differ between executors: {differing[:8]}"
 
 
+class _DeferringLambda:
+    """A Lambda client whose invokes do not run until the barrier polls.
+
+    :class:`_FakeLambda` runs the handler INSIDE ``invoke()``, so every worker
+    has folded and written before ``_fire`` returns: the tuple ordering rides
+    on the dispatcher's own loop alone and deleting the soft barrier outright
+    changes no bytes, which makes the barrier — the mechanism
+    :func:`zagg.sweep_fleet.await_records` nominates as load-bearing for this
+    acceptance — unfalsifiable. Here ``invoke()`` only QUEUES, and the drain is
+    wired to the dispatcher's own poll: one pending event per ``_present``.
+    A tuple's child columns then exist only because the barrier waited for
+    them, so a barrier that does not wait folds over columns that are not on
+    disk yet.
+    """
+
+    def __init__(self, handler, monkeypatch):
+        import zagg.sweep_fleet
+
+        self.handler = handler
+        self.events: list = []
+        self.pending: list = []
+        present = zagg.sweep_fleet._present
+
+        def drained(records_from, store_kwargs):
+            if self.pending:
+                self.handler(self.pending.pop(0), None)
+            return present(records_from, store_kwargs)
+
+        monkeypatch.setattr(zagg.sweep_fleet, "_present", drained)
+
+    def invoke(self, FunctionName, InvocationType, Payload):  # noqa: N803 (boto3 spelling)
+        self.events.append(json.loads(Payload))
+        self.pending.append(self.events[-1])
+        return {"StatusCode": 202}
+
+
 class TestByteIdentityOracle:
     """THE acceptance: same store, two executors, identical bytes."""
 
@@ -1703,6 +1739,31 @@ class TestByteIdentityOracle:
             b = _devolatilize(json.loads(fleet[rel]))["attributes"]["zagg_overview"]
             differing = {k for k in set(a) | set(b) if a.get(k) != b.get(k)}
             assert differing <= {"generation", "source_children"}, (rel, differing)
+
+    def test_identity_holds_when_the_workers_run_only_while_the_barrier_waits(
+        self, tmp_path, monkeypatch
+    ):
+        # The barrier under load: with a deferring executor no worker runs
+        # until the dispatcher polls for its record, so the soft barrier is
+        # the ONLY thing standing between a coarse tuple and its unwritten
+        # children. Stubbing `_barrier` out to return its expected set makes
+        # this arm fail (nothing drains, so nothing is folded) while
+        # `_FakeLambda`'s synchronous arms all stay green — which is the
+        # measurement that says this one can see the barrier at all.
+        mod = _handler_module()
+        root = tmp_path / "s"
+        _stage_store(root)
+        _write_discovery_record(root)
+        base = _snapshot(root)
+        _cli_sweep(root, tuple_width=1)
+        cli = _snapshot(root)
+        _restore(root, base)
+
+        client = _DeferringLambda(mod.lambda_handler, monkeypatch)
+        summary = _fleet(root, client, tuple_width=1)
+        assert not summary["barrier_timed_out"]
+        assert not client.pending, "an invoke never drained — the barriers did not wait for it"
+        _assert_identical(cli, _snapshot(root))
 
     def test_identity_holds_for_a_both_channel_store(self, tmp_path):
         # The located + temporal companion channels (issue #410) ride the same
