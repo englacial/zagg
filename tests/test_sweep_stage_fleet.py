@@ -1105,6 +1105,21 @@ class TestFleetOrchestration:
         }
         assert summary["records_from"].endswith(f".status/run-{summary['run_id']}")
 
+    def test_the_lease_ttl_reaches_the_finisher_too(self, tmp_path):
+        # It was threaded into every stage block and dropped from the
+        # finisher's, so a non-default run re-admitted its finisher on
+        # DEFAULT_TTL_S -- the TTL moving on the last acquire before release
+        # (review finding). One TTL governs the whole run.
+        mod = _handler_module()
+        root = tmp_path / "s"
+        _stage_store(root)
+        client = _FakeLambda(mod.lambda_handler)
+        summary = _fleet(root, client, tuple_width=1, lease_ttl_s=137)
+        blocks = client.blocks()
+        assert [b["role"] for b in blocks][-1] == "finisher"
+        assert {b["lease_ttl_s"] for b in blocks} == {137}
+        assert summary["finisher"]["lease"]["released"]
+
     def test_the_ladder_lands_and_the_lease_is_released(self, tmp_path):
         from zagg.hive import read_manifest
         from zagg.sweep_lease import read_lease

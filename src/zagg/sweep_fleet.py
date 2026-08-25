@@ -552,21 +552,22 @@ def run_stage_sweep_fleet(
         return summary
     stages_timed_out = any(st["barrier_timed_out"] for st in summary["stages"])
     summary["barrier_timed_out"] = stages_timed_out
+    finisher_block = {
+        "role": "finisher",
+        "run_id": run_id,
+        "records_from": records_from,
+        "touch_policy": touch_policy,
+        # The finisher is aggregating a record set the dispatcher knows may be
+        # short; it rides on the wire so the RUN record says so.
+        "barrier_timed_out": stages_timed_out,
+    }
+    if lease_ttl_s is not None:
+        # The finisher re-acquires before it releases, so dropping the run's
+        # TTL here would move it on the LAST acquire — widening exactly the
+        # window a foreign sweep may claim. One TTL governs the whole run.
+        finisher_block["lease_ttl_s"] = int(lease_ttl_s)
     _fire(
-        build_stage_event(
-            store_path,
-            {
-                "role": "finisher",
-                "run_id": run_id,
-                "records_from": records_from,
-                "touch_policy": touch_policy,
-                # The finisher is aggregating a record set the dispatcher knows
-                # may be short; it rides on the wire so the RUN record says so.
-                "barrier_timed_out": stages_timed_out,
-            },
-            _leaf_refs(by_shard),
-            output_creds_event,
-        )
+        build_stage_event(store_path, finisher_block, _leaf_refs(by_shard), output_creds_event)
     )
     seen, timed_out = _barrier({FINISHER_RECORD_NAME})
     summary["finisher"] = {"landed": not timed_out, "fired": True}
