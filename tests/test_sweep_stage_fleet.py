@@ -29,6 +29,7 @@ import pytest
 from test_sweep_stage import LEAVES, _artifact, _stage_store, _write_leaf  # noqa: E402
 
 from zagg.grids.morton import morton_word
+from zagg.sweep_fleet import build_stage_event
 from zagg.sweep_stages import (
     FINISHER_RECORD_NAME,
     STAGE_RECORD_SPEC,
@@ -1442,3 +1443,283 @@ class TestRunnerSeam:
         src = inspect.getsource(runner._run_lambda)
         assert 'config.output.get("sweep") == "stages"' in src
         assert "_invoke_lambda_stage_sweep(" in src
+
+
+# ---------------------------------------------------------------------------
+# Phase 3: THE ACCEPTANCE — the byte-identity oracle.
+#
+# The merge-source law (espg ruling 2026-08-09, issue #384) makes the /2 build
+# a fixed function of the store: independent of tuple grouping, of
+# partitioning, and of EXECUTOR. So the fleet-built ladder must be
+# byte-identical to the CLI-built ladder on the same store, and that is the
+# whole acceptance for this transport — any difference is a transport bug, not
+# a tolerance. Fully offline: the Lambda client is mocked to run the worker arm
+# in-process, so no AWS is touched.
+# ---------------------------------------------------------------------------
+
+
+#: JSON values that are the RUN's identity or its clock rather than its
+#: content: the run id every stage artifact stamps, the D4 commit instant, the
+#: provenance instant, and the D20 sidecar's write timestamp. Two executors
+#: are not expected to agree on these and nothing reads them for content.
+#: EVERYTHING else — every chunk byte, every count, every digest payload,
+#: every generation key, every ``source_children`` tally — must match exactly.
+_VOLATILE_KEYS = frozenset({"run_id", "written_at", "generated_at", "timestamp"})
+
+
+#: Store-root objects that are not ladder artifacts: the input run record the
+#: CLI discovers from, and the staged run record itself — which differs
+#: between executors BY DESIGN (the fleet's carries ``transport: "lambda"``
+#: and the stage-record count; the CLI's carries the lease intent block).
+#: Both are checked separately rather than byte-compared.
+def _is_run_record(rel: str) -> bool:
+    return (rel.startswith("sweep_stats_") and rel.endswith("_stages.json")) or (
+        rel.startswith("stats_") and rel.endswith(".parquet")
+    )
+
+
+def _devolatilize(value):
+    if isinstance(value, dict):
+        return {
+            k: ("<volatile>" if k in _VOLATILE_KEYS else _devolatilize(v)) for k, v in value.items()
+        }
+    if isinstance(value, list):
+        return [_devolatilize(v) for v in value]
+    return value
+
+
+def _canonical(rel: str, data: bytes):
+    """One store object reduced to what two executors MUST agree on.
+
+    JSON objects (``zarr.json`` group/array metadata, the ``overview.rollup``
+    envelope, the D20 sidecars, the root ``coverage.moc`` envelope) are
+    compared with the run identity and the clock blanked; every other object —
+    every chunk — is compared as raw bytes, no tolerance.
+    """
+    if rel.endswith(".json") or rel.endswith(".moc"):
+        return json.dumps(_devolatilize(json.loads(data)), sort_keys=True, indent=1)
+    return data
+
+
+def _is_group_metadata(rel: str) -> bool:
+    """The ladder artifact's OWN ``zarr.json`` (not one of its arrays')."""
+    return rel.endswith("all.zarr/zarr.json")
+
+
+def _snapshot(root):
+    return {
+        str(p.relative_to(root)): p.read_bytes() for p in sorted(root.rglob("*")) if p.is_file()
+    }
+
+
+def _restore(root, snapshot):
+    """Put the store back to a prior snapshot, byte for byte."""
+    live = sorted(root.rglob("*"), key=lambda q: len(str(q)), reverse=True)
+    for p in live:
+        if p.is_file() and str(p.relative_to(root)) not in snapshot:
+            p.unlink()
+    for p in sorted(root.rglob("*"), key=lambda q: len(str(q)), reverse=True):
+        if p.is_dir() and not any(p.iterdir()):
+            p.rmdir()
+    for rel, data in snapshot.items():
+        q = root / rel
+        q.parent.mkdir(parents=True, exist_ok=True)
+        q.write_bytes(data)
+
+
+def _write_discovery_record(root, leaves=LEAVES):
+    """The listing-based run record ``python -m zagg.sweep`` discovers from."""
+    import pandas as pd
+
+    pd.DataFrame(
+        {
+            "shard_key": pd.array([morton_word(d) for d in leaves], dtype="UInt64"),
+            "success": [True] * len(leaves),
+            "window": [None] * len(leaves),
+        }
+    ).to_parquet(root / "stats_20260825T000000Z_test.parquet", engine="fastparquet")
+
+
+def _cli_sweep(root, *, tuple_width=3):
+    from zagg.sweep import main
+
+    argv = [str(root), "--stages"]
+    if tuple_width != 3:
+        argv += ["--tuple-width", str(tuple_width)]
+    assert main(argv) == 0
+
+
+def _artifacts(snapshot, *, ladder_data_only=False):
+    """The comparable objects of a snapshot, canonicalized.
+
+    ``ladder_data_only`` narrows to the ladder overviews' DATA — their chunks
+    and their per-array metadata — dropping each artifact's own group
+    ``zarr.json``. That is the cross-tuple-width comparison: the group attrs
+    carry per-run PROVENANCE (``source_children``, the summed child
+    ``generation``) which is legitimately width-dependent, because a width-1
+    build folds an order-0 node from order-1 stage columns while a width-3
+    build folds it from the leaf columns three orders down. The merge-source
+    law is a claim about the CONTENT, and that is what this compares —
+    ``TestMergeSourceLaw`` in ``test_sweep_stage.py`` pins the same claim
+    in-process, the same way (arrays, not attrs).
+    """
+    out = {}
+    for rel, data in snapshot.items():
+        if _is_run_record(rel):
+            continue
+        if ladder_data_only and ("all.zarr/" not in rel or _is_group_metadata(rel)):
+            continue
+        out[rel] = _canonical(rel, data)
+    return out
+
+
+def _assert_identical(cli, fleet, *, ladder_data_only=False):
+    a = _artifacts(cli, ladder_data_only=ladder_data_only)
+    b = _artifacts(fleet, ladder_data_only=ladder_data_only)
+    assert a, "the oracle compared nothing — the fixture wrote no artifacts"
+    assert sorted(a) == sorted(b), (
+        f"object sets differ: CLI-only {sorted(set(a) - set(b))}, "
+        f"fleet-only {sorted(set(b) - set(a))}"
+    )
+    differing = [rel for rel in sorted(a) if a[rel] != b[rel]]
+    assert not differing, f"{len(differing)} object(s) differ between executors: {differing[:8]}"
+
+
+class TestByteIdentityOracle:
+    """THE acceptance: same store, two executors, identical bytes."""
+
+    def _both_arms(self, tmp_path, monkeypatch=None, *, fields=None, fleet_width=None, cap=None):
+        """CLI sweep -> snapshot -> reset -> fleet sweep -> snapshot.
+
+        One store, swept twice from the SAME pre-sweep bytes, so nothing about
+        the comparison can be an artifact of two fixtures diverging.
+        """
+        mod = _handler_module()
+        root = tmp_path / "s"
+        _stage_store(root) if fields is None else _stage_store(root, fields=fields)
+        _write_discovery_record(root)
+        base = _snapshot(root)
+
+        _cli_sweep(root)
+        cli = _snapshot(root)
+
+        _restore(root, base)
+        assert _snapshot(root) == base, "the reset did not restore the pre-sweep store"
+
+        if cap is not None:
+            import zagg.runner
+
+            monkeypatch.setattr(zagg.runner, "_ASYNC_PAYLOAD_CAP_BYTES", cap)
+        fleet = _fleet(
+            root,
+            _FakeLambda(mod.lambda_handler),
+            **({} if fleet_width is None else {"tuple_width": fleet_width}),
+        )
+        return cli, _snapshot(root), fleet
+
+    def test_the_fleet_build_is_byte_identical_to_the_cli_build(self, tmp_path):
+        cli, fleet, summary = self._both_arms(tmp_path)
+        assert summary["finisher"]["landed"] and not summary["barrier_timed_out"]
+        _assert_identical(cli, fleet)
+        # Never vacuous: the ladder really was built, columns and all.
+        rels = _artifacts(fleet)
+        assert any(_is_group_metadata(r) for r in rels)
+        assert any(r.endswith("overview.rollup.json") for r in rels)
+        assert any(r.endswith("all.pyramid.stats.json") for r in rels)
+        assert "coverage.moc" in rels and len(rels) > 100
+
+    def test_both_arms_leave_one_run_record_and_no_lease(self, tmp_path):
+        cli, fleet, _ = self._both_arms(tmp_path)
+        for snapshot, transport in ((cli, None), (fleet, "lambda")):
+            records = [r for r in snapshot if r.startswith("sweep_stats_")]
+            assert len(records) == 1
+            body = json.loads(snapshot[records[0]])
+            assert body["mode"] == "stages"
+            assert body.get("transport") == transport
+            assert "sweep.lease.json" not in snapshot  # released, both arms
+
+    def test_the_manifest_actuals_agree(self, tmp_path):
+        # The finisher's manifest RMW is the one artifact the fleet rebuilds
+        # from the stage records rather than from an in-process accumulator —
+        # the aggregation channel's correctness lands right here.
+        cli, fleet, _ = self._both_arms(tmp_path)
+        from zagg.hive import MANIFEST_NAME
+
+        a = _devolatilize(json.loads(cli[MANIFEST_NAME]))["pyramid"]["overviews"]
+        b = _devolatilize(json.loads(fleet[MANIFEST_NAME]))["pyramid"]["overviews"]
+        assert a == b
+        assert {e["node"]: e["actuals"]["merges_from_raw"] for e in b} == {3: 1, 2: 1, 1: 2, 0: 2}
+
+    def test_identity_survives_a_multi_batch_fan_out(self, tmp_path, monkeypatch):
+        # The transport's own degree of freedom: with the payload cap squeezed
+        # so a tuple cannot ride one invoke, the SAME tuple is folded by
+        # several workers. Grouping across invokes must change no bytes.
+        import zagg.runner
+
+        mod = _handler_module()
+        root = tmp_path / "s"
+        _stage_store(root)
+        _write_discovery_record(root)
+        base = _snapshot(root)
+        _cli_sweep(root)
+        cli = _snapshot(root)
+        _restore(root, base)
+
+        probe = build_stage_event(
+            str(root),
+            _stage_block(0, ["1"], records_from=str(root) + ".status/run-x"),
+            _leaf_refs(),
+        )
+        monkeypatch.setattr(zagg.runner, "_ASYNC_PAYLOAD_CAP_BYTES", len(json.dumps(probe)) - 30)
+        client = _FakeLambda(mod.lambda_handler)
+        summary = _fleet(root, client)
+        assert summary["stages"][0]["batches"] > 1  # the split really happened
+        _assert_identical(cli, _snapshot(root))
+
+    def test_identity_survives_a_different_tuple_width(self, tmp_path):
+        # Grouping across EXECUTORS and across tuple widths at once: the CLI
+        # walks one width-3 tuple, the fleet walks three width-1 tuples. The
+        # stage COLUMNS differ by construction (width 1 dispatches at orders 2
+        # and 1, so it writes relay columns width 3 never needs), which is why
+        # this arm compares the ladder overviews — the product — not the
+        # scaffolding. `TestMergeSourceLaw` in test_sweep_stage.py pins the
+        # same claim in-process.
+        cli, fleet, _ = self._both_arms(tmp_path, fleet_width=1)
+        _assert_identical(cli, fleet, ladder_data_only=True)
+        # And say exactly what the group attrs are allowed to differ in, so a
+        # future divergence in anything ELSE cannot hide behind the exclusion.
+        groups = [r for r in _artifacts(fleet) if _is_group_metadata(r)]
+        assert groups
+        for rel in groups:
+            a = _devolatilize(json.loads(cli[rel]))["attributes"]["zagg_overview"]
+            b = _devolatilize(json.loads(fleet[rel]))["attributes"]["zagg_overview"]
+            differing = {k for k in set(a) | set(b) if a.get(k) != b.get(k)}
+            assert differing <= {"generation", "source_children"}, (rel, differing)
+
+    def test_identity_holds_for_a_both_channel_store(self, tmp_path):
+        # The located + temporal companion channels (issue #410) ride the same
+        # fold, so a transport that reordered or re-partitioned a merge would
+        # show up here as mismatched companion words rather than mismatched
+        # digests.
+        from test_sweep_stage import BOTH_CHANNEL_FIELDS
+
+        cli, fleet, _ = self._both_arms(tmp_path, fields=BOTH_CHANNEL_FIELDS)
+        _assert_identical(cli, fleet)
+
+    def test_the_oracle_detects_a_divergent_build(self, tmp_path):
+        # Negative control: an acceptance test that cannot fail proves nothing.
+        # A fleet run scoped to one base cell folds strictly less than the CLI's
+        # whole-store pass, and the comparison must say so.
+        from zagg.sweep_stages import normalize_scope
+
+        mod = _handler_module()
+        root = tmp_path / "s"
+        _stage_store(root)
+        _write_discovery_record(root)
+        base = _snapshot(root)
+        _cli_sweep(root)
+        cli = _snapshot(root)
+        _restore(root, base)
+        _fleet(root, _FakeLambda(mod.lambda_handler), scope=normalize_scope(["1111"]))
+        with pytest.raises(AssertionError, match="object sets differ"):
+            _assert_identical(cli, _snapshot(root))
