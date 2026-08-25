@@ -29,7 +29,6 @@ import pytest
 from test_sweep_stage import LEAVES, _artifact, _stage_store, _write_leaf  # noqa: E402
 
 from zagg.grids.morton import morton_word
-from zagg.sweep_fleet import build_stage_event
 from zagg.sweep_stages import (
     FINISHER_RECORD_NAME,
     STAGE_RECORD_SPEC,
@@ -1638,13 +1637,17 @@ class _DeferringLambda:
 class TestByteIdentityOracle:
     """THE acceptance: same store, two executors, identical bytes."""
 
-    def _both_arms(self, tmp_path, monkeypatch=None, *, fields=None, width=3, fleet_width=None):
+    def _both_arms(
+        self, tmp_path, monkeypatch=None, *, fields=None, width=3, fleet_width=None, squeeze=False
+    ):
         """CLI sweep -> snapshot -> reset -> fleet sweep -> snapshot.
 
         One store, swept twice from the SAME pre-sweep bytes, so nothing about
         the comparison can be an artifact of two fixtures diverging.
         ``width`` drives BOTH arms (the byte-exact comparison); ``fleet_width``
         overrides the fleet's alone, which is the deliberate cross-width arm.
+        ``squeeze`` caps the async payload just under the tuple's REAL event so
+        the fan-out has to split. Returns ``(cli, fleet, summary, client)``.
         """
         mod = _handler_module()
         root = tmp_path / "s"
@@ -1658,12 +1661,26 @@ class TestByteIdentityOracle:
         _restore(root, base)
         assert _snapshot(root) == base, "the reset did not restore the pre-sweep store"
 
-        fleet = _fleet(
-            root,
-            _FakeLambda(mod.lambda_handler),
-            tuple_width=width if fleet_width is None else fleet_width,
-        )
-        return cli, _snapshot(root), fleet
+        if squeeze:
+            # Measured, not guessed: a probe run with no handler writes nothing
+            # and reports the tuple's real single-batch event. One byte under
+            # it is the ONLY cap that both forces the split and leaves every
+            # proper subset small enough to ship its leaf slice inline —
+            # squeeze harder and every batch degrades to ``discover: true``
+            # and the per-batch slicing this arm exists for never rides.
+            import zagg.runner
+
+            probe = _FakeLambda(None)
+            _fleet(root, probe, tuple_width=width, barrier_timeout_s=0.01)
+            single = next(e for e in probe.events if e["stage"].get("role") == "stage")
+            assert len(single["stage"]["nodes"]) > 1
+            monkeypatch.setattr(
+                zagg.runner, "_ASYNC_PAYLOAD_CAP_BYTES", len(json.dumps(single)) - 1
+            )
+
+        client = _FakeLambda(mod.lambda_handler)
+        fleet = _fleet(root, client, tuple_width=width if fleet_width is None else fleet_width)
+        return cli, _snapshot(root), fleet, client
 
     @pytest.mark.parametrize("width,tuples", ((1, 3), (2, 2), (3, 1)))
     def test_the_fleet_build_is_byte_identical_to_the_cli_build(self, tmp_path, width, tuples):
@@ -1672,7 +1689,7 @@ class TestByteIdentityOracle:
         # transport to get wrong. Widths 1 and 2 put the ordering the
         # dispatcher's barriers exist to preserve inside the byte-exact
         # assertion — reversing ``stage_tuples`` in the dispatcher fails them.
-        cli, fleet, summary = self._both_arms(tmp_path, width=width)
+        cli, fleet, summary, _ = self._both_arms(tmp_path, width=width)
         assert summary["finisher"]["landed"] and not summary["barrier_timed_out"]
         assert len(summary["stages"]) == tuples
         _assert_identical(cli, fleet)
@@ -1684,7 +1701,7 @@ class TestByteIdentityOracle:
         assert "coverage.moc" in rels and len(rels) > 100
 
     def test_both_arms_leave_one_run_record_and_no_lease(self, tmp_path):
-        cli, fleet, _ = self._both_arms(tmp_path)
+        cli, fleet, _, _ = self._both_arms(tmp_path)
         for snapshot, transport in ((cli, None), (fleet, "lambda")):
             records = [r for r in snapshot if r.startswith("sweep_stats_")]
             assert len(records) == 1
@@ -1697,7 +1714,7 @@ class TestByteIdentityOracle:
         # The finisher's manifest RMW is the one artifact the fleet rebuilds
         # from the stage records rather than from an in-process accumulator —
         # the aggregation channel's correctness lands right here.
-        cli, fleet, _ = self._both_arms(tmp_path)
+        cli, fleet, _, _ = self._both_arms(tmp_path)
         from zagg.hive import MANIFEST_NAME
 
         a = _devolatilize(json.loads(cli[MANIFEST_NAME]))["pyramid"]["overviews"]
@@ -1709,27 +1726,15 @@ class TestByteIdentityOracle:
         # The transport's own degree of freedom: with the payload cap squeezed
         # so a tuple cannot ride one invoke, the SAME tuple is folded by
         # several workers. Grouping across invokes must change no bytes.
-        import zagg.runner
-
-        mod = _handler_module()
-        root = tmp_path / "s"
-        _stage_store(root)
-        _write_discovery_record(root)
-        base = _snapshot(root)
-        _cli_sweep(root)
-        cli = _snapshot(root)
-        _restore(root, base)
-
-        probe = build_stage_event(
-            str(root),
-            _stage_block(0, ["1"], records_from=str(root) + ".status/run-x"),
-            _leaf_refs(),
-        )
-        monkeypatch.setattr(zagg.runner, "_ASYNC_PAYLOAD_CAP_BYTES", len(json.dumps(probe)) - 30)
-        client = _FakeLambda(mod.lambda_handler)
-        summary = _fleet(root, client)
+        cli, fleet, summary, client = self._both_arms(tmp_path, monkeypatch, squeeze=True)
         assert summary["stages"][0]["batches"] > 1  # the split really happened
-        _assert_identical(cli, _snapshot(root))
+        # And it split with its leaf SLICE on the wire, not onto a store-wide
+        # re-discovery — otherwise every worker re-derives the whole work set
+        # and `pack_batches`' partition is never exercised at all.
+        fired = [e for e in client.events if e["stage"].get("role") == "stage"]
+        assert len(fired) > 1
+        assert all("leaves" in e and "discover" not in e for e in fired)
+        _assert_identical(cli, fleet)
 
     def test_identity_survives_a_different_tuple_width(self, tmp_path):
         # Grouping across EXECUTORS and across tuple widths at once: the CLI
@@ -1739,7 +1744,7 @@ class TestByteIdentityOracle:
         # this arm compares the ladder overviews — the product — not the
         # scaffolding. `TestMergeSourceLaw` in test_sweep_stage.py pins the
         # same claim in-process.
-        cli, fleet, _ = self._both_arms(tmp_path, fleet_width=1)
+        cli, fleet, _, _ = self._both_arms(tmp_path, fleet_width=1)
         _assert_identical(cli, fleet, ladder_data_only=True)
         # And say exactly what the group attrs are allowed to differ in, so a
         # future divergence in anything ELSE cannot hide behind the exclusion.
@@ -1783,7 +1788,7 @@ class TestByteIdentityOracle:
         # digests.
         from test_sweep_stage import BOTH_CHANNEL_FIELDS
 
-        cli, fleet, _ = self._both_arms(tmp_path, fields=BOTH_CHANNEL_FIELDS)
+        cli, fleet, _, _ = self._both_arms(tmp_path, fields=BOTH_CHANNEL_FIELDS)
         _assert_identical(cli, fleet)
 
     def test_a_moc_only_subtree_is_the_one_documented_difference(self, tmp_path):
