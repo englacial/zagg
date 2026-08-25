@@ -726,9 +726,18 @@ so nothing else can hide behind the exclusion.
 
 The one **documented** difference between executors is pinned by its own test:
 the dispatcher derives dispatch nodes from the work set it holds, so a subtree
-that appears only in the root MOC is not invoked. Both a post-run chained sweep
-and a discovery-driven one hand over a work set that covers the MOC, so the
-identity claim holds wherever the transport is actually used.
+that appears only in the root MOC is not invoked. It is real, and on an
+appended store it bites on every incremental run — the root MOC carries every
+prior run's shards while the work set carries only this one's.
+
+For the **chained** case the identity claim still holds, but not because the
+work set covers the MOC (it does not). It holds because the local twin is
+scoped the same way: `stage_sweep_after_run` passes the run's own shard
+decimals as `scope`, which filters the in-process pass's `work set ∪ MOC`
+right back down to the run's footprint. Same node set, same bytes. Drive the
+fleet transport over a work set narrower than the store's coverage and the
+difference is exactly what the test pins — the un-invoked subtree keeps its
+prior ladder and heals on the next pass that does include it.
 
 !!! info "Live-fleet validation is deferred"
     The acceptance above is fully offline by design. Validation against a real
