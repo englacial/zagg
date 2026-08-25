@@ -166,12 +166,21 @@ end of run, like coverage mode; also invocable ad hoc):
                                   #   stage columns, on the same store
           "partition": {"index": int, "of": int},  # optional, recorded only
           "lease_ttl_s": int,     # optional
-          "records_from": str,    # the run's status prefix (a store SIBLING,
+          "records_from": str,    # REQUIRED, both roles. The run's status prefix
+                                  #   (a store SIBLING,
                                   #   zagg.client_transport.run_status_prefix):
                                   #   where this invoke PUTs its record, and
                                   #   where a finisher reads the run's records
-                                  #   back to rebuild the per-level actuals
+                                  #   back to rebuild the per-level actuals. A
+                                  #   worker that wrote no record reads to the
+                                  #   dispatcher exactly like a lost invoke, so
+                                  #   both roles refuse by name without it
           "touch_policy": str,    # optional, role="finisher" (issue #501)
+          "barrier_timed_out": bool,  # optional, role="finisher": the
+                                  #   dispatcher's verdict on its own soft
+                                  #   barrier. Recorded in the store-root run
+                                  #   record, so a run whose per-level actuals
+                                  #   may be short says so durably
         }
         All store writes stay worker-side (D8). The work set rides in the
         SAME "leaves"/"discover" keys the families arm uses -- a stage invoke
