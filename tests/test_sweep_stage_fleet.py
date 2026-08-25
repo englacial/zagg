@@ -11,9 +11,11 @@ Standing claims:
   tuple, soft-barrier on the stage records, then the next tuple, finisher
   last (#381 point (6): under-coverage is loud and self-healing);
 - **the acceptance**: the fleet-built ladder is byte-identical to the
-  CLI-built ladder on the same store (the merge-source law, espg ruling
-  2026-08-09, issue #384) — its ``TestByteIdentityOracle`` lands with phase 3
-  of this PR and is NOT in this file yet; phases 1-2 pin the transport.
+  CLI-built ladder on the same store AND the same work set (the merge-source
+  law, espg ruling 2026-08-09, issue #384) — ``TestByteIdentityOracle`` below.
+  The work-set half of that precondition is the transport's one documented
+  divergence: the dispatcher derives its nodes from the work set alone (D8),
+  while the in-process pass unions it with the root ``coverage.moc``.
 """
 
 from __future__ import annotations
