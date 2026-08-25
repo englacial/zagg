@@ -533,8 +533,8 @@ staged arm, reusing that event's credential resolution and its
     "role": "stage",
     "run_id": "stage-20260825T094152Z-53c774",
     "run_started": "2026-08-25T09:41:52+00:00",
-    "dispatch": 6,
-    "nodes": ["111", "112"],
+    "dispatch": 3,
+    "nodes": ["1111", "1112"],
     "batch": 0,
     "tuple_width": 3,
     "records_from": "s3://bucket/prefix.zarr.status/run-stage-20260825T094152Z-53c774"
@@ -548,7 +548,7 @@ staged arm, reusing that event's credential resolution and its
 | `run_id` | both | The sweep run's identity: the lease, the skip-key / foreign-stamp namespace, and the status prefix all key on it |
 | `run_started` | stage | Dispatcher-pinned UTC ISO stamp, shared by every worker of the run. A worker computing its own would read a sibling's fresh stamp as a foreign sweep's |
 | `dispatch` | stage | The tuple's dispatch order. The worker runs exactly that one tuple |
-| `nodes` | stage | This invoke's dispatch nodes, as morton decimals. Must be non-empty and every entry must sit at exactly `dispatch` order — the worker refuses otherwise |
+| `nodes` | stage | This invoke's dispatch nodes, as morton decimals. Must be non-empty and every entry must sit at exactly `dispatch` order — the worker refuses otherwise. In the example above the store is shard-order 6, so at `tuple_width: 3` the dispatch orders are 3 and 0, and an order-3 dispatch takes 4-digit nodes |
 | `batch` | stage | Which batch of that tuple this is; names the record object |
 | `tuple_width` | both | Optional; defaults to `zagg.sweep_stage.DEFAULT_TUPLE_WIDTH` |
 | `partition` | stage | Optional `{"index", "of"}`; recorded on the stage rows |
