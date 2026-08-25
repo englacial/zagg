@@ -12,7 +12,8 @@ Standing claims:
   last (#381 point (6): under-coverage is loud and self-healing);
 - **the acceptance**: the fleet-built ladder is byte-identical to the
   CLI-built ladder on the same store (the merge-source law, espg ruling
-  2026-08-09, issue #384) — see ``TestByteIdentityOracle``.
+  2026-08-09, issue #384) — its ``TestByteIdentityOracle`` lands with phase 3
+  of this PR and is NOT in this file yet; phases 1-2 pin the transport.
 """
 
 from __future__ import annotations
@@ -535,6 +536,11 @@ class TestFinisherArm:
         assert summary["lease"]["released"]
 
     def test_merge_level_actuals_first_wins_on_level_metadata(self):
+        # The merge runs in sorted record-NAME order, which is a dispatcher
+        # batching artifact, so the level metadata must not be last-wins: the
+        # second worker here disagrees on all three values and loses. (They
+        # cannot legitimately disagree — every worker derives them per level
+        # via ``classify_level`` — which is exactly why the tie is pinned.)
         target: dict = {}
         merge_level_actuals(
             target,
@@ -544,13 +550,17 @@ class TestFinisherArm:
             target,
             {
                 "2": {
-                    "cells": 3,
-                    "regime": "stage-gather",
-                    "merges_from_raw": 1,
+                    "cells": 999,
+                    "regime": "stage-merge",
+                    "merges_from_raw": 7,
                     "children": {"111|all": {"folded": 2, "missing": 0, "unreadable": 0}},
                 }
             },
         )
+        assert target[2]["cells"] == 3
+        assert target[2]["regime"] == "stage-gather"
+        assert target[2]["merges_from_raw"] == 1
+        # The per-(node, window) rows still merge in from both.
         assert target[2]["children"] == {"111|all": {"folded": 2, "missing": 0, "unreadable": 0}}
 
 
