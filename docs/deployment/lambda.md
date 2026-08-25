@@ -706,16 +706,23 @@ That is not an argument, it is the test. `TestByteIdentityOracle` in
 `tests/test_sweep_stage_fleet.py` builds a column-bearing store, runs the CLI
 staged sweep, snapshots every object, resets the store to its pre-sweep bytes,
 runs the fleet path with the Lambda client mocked to execute the worker arm
-in-process, and byte-compares every object — chunk data exactly, JSON modulo
-the run identity and the clock. Any difference is a transport bug.
+in-process, and byte-compares every store artifact — chunk data exactly, JSON
+modulo the run identity and the clock. The two run records are checked for
+shape rather than bytes (one of each, no leftover lease), since they differ
+between executors by design. Any other difference is a transport bug.
 
 It runs that comparison across every degree of freedom the transport has:
-tuple widths 1, 2 and 3 (136–181 objects each); a multi-batch fan-out with the
+tuple widths 1, 2 and 3 (136–181 objects each), both executors at the same
+width so the comparison stays full; a multi-batch fan-out with the
 payload cap squeezed so one tuple needs several invokes; an executor that runs
 each worker only while the barrier is waiting, so the barrier is falsifiable;
 a windowed store; and a store whose digest field carries both the located and
 the temporal companion channel. Two negative controls prove the comparison has
-teeth — a wrong fold and a scoped-out subtree both fail it.
+teeth — a wrong fold and a scoped-out subtree both fail it. One arm is
+deliberately narrower: the CLI-at-width-3 vs fleet-at-width-1 comparison drops
+each artifact's group `zarr.json`, because `source_children` names a
+genuinely different fold across widths, and re-checks those attrs separately
+so nothing else can hide behind the exclusion.
 
 The one **documented** difference between executors is pinned by its own test:
 the dispatcher derives dispatch nodes from the work set it holds, so a subtree
