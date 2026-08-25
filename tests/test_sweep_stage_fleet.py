@@ -1139,9 +1139,24 @@ class TestFleetOrchestration:
         mod = _handler_module()
         root = tmp_path / "s"
         _stage_store(root)
-        _fleet(root, _FakeLambda(mod.lambda_handler), scope=normalize_scope(["1111"]))
+        summary = _fleet(root, _FakeLambda(mod.lambda_handler), scope=normalize_scope(["1111"]))
         assert (root / "1" / "all.zarr").exists()
         assert not (root / "-2" / "all.zarr").exists()
+        assert summary["scope"] == [str(int(w)) for w in normalize_scope(["1111"])]
+
+    def test_a_raw_decimal_scope_is_normalized_like_the_in_process_pass(self, tmp_path):
+        # `stage_sweep_after_run` -- the local chaining this transport mirrors
+        # -- passes DECIMAL STRINGS, so handing `scope` straight to `scope_admits`
+        # made the fleet filter differently from the twin (review finding).
+        from zagg.sweep_stages import normalize_scope
+
+        mod = _handler_module()
+        root = tmp_path / "s"
+        _stage_store(root)
+        summary = _fleet(root, _FakeLambda(mod.lambda_handler), scope=["1111"])
+        assert (root / "1" / "all.zarr").exists()
+        assert not (root / "-2" / "all.zarr").exists()
+        assert summary["scope"] == [str(int(w)) for w in normalize_scope(["1111"])]
 
     def test_partitioned_leaf_slices_ride_with_their_own_nodes(self, tmp_path):
         mod = _handler_module()

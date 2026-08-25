@@ -384,12 +384,17 @@ def run_stage_sweep_fleet(
     from zagg.hive import _utcnow
     from zagg.sweep import _normalize_leaves
     from zagg.sweep_stage import DEFAULT_TUPLE_WIDTH, stage_tuples
-    from zagg.sweep_stages import FINISHER_RECORD_NAME, stage_record_name
+    from zagg.sweep_stages import FINISHER_RECORD_NAME, normalize_scope, stage_record_name
 
     t0 = time.perf_counter()
     store_kwargs = dict(store_kwargs or {})
     tuple_width = int(DEFAULT_TUPLE_WIDTH if tuple_width is None else tuple_width)
     shard_order = int(shard_order)
+    # The same canonicalization the in-process pass does (run_stage_sweep), so
+    # every documented spelling — morton words, D1 decimals, a shardmap's keys
+    # — filters identically here. `stage_sweep_after_run`, the local chaining
+    # this transport mirrors, passes decimal strings.
+    scope = normalize_scope(scope)
     by_shard, skipped = _normalize_leaves(leaves, shard_order)
     run_id = run_id or (
         f"stage-{datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%SZ')}-{uuid.uuid4().hex[:6]}"
@@ -402,6 +407,7 @@ def run_stage_sweep_fleet(
         "store_root": store_path,
         "shard_order": shard_order,
         "tuple_width": tuple_width,
+        "scope": None if scope is None else [str(int(w)) for w in scope],
         "transport": "lambda",
         "records_from": records_from,
         "n_leaves": sum(len(w) for w in by_shard.values()),
