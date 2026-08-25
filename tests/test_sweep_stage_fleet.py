@@ -540,7 +540,12 @@ class TestHandlerStageArm:
         body = json.loads(response["body"])
         assert body["ok"] and body["stage"] == "stage" and body["run_id"] == "F"
         assert body["n_leaves"] == len(LEAVES) and body["duration_s"] >= 0.0
-        assert body["result"]["stages"][0]["written"] > 0
+        assert body["dispatch"] == 0 and body["batch"] == 0 and body["n_nodes"] == 1
+        assert body["written"] > 0 and body["failed"] == 0
+        # The record is durable at the status prefix; the envelope names it and
+        # carries no rows (``record`` is the store-root run record — finisher only).
+        assert body["record"] is None
+        assert body["stage_record"].endswith(stage_record_name(0, 0))
         assert (prefix / stage_record_name(0, 0)).exists()
 
     def test_finisher_role_round_trips_over_the_event(self, tmp_path):
@@ -562,8 +567,9 @@ class TestHandlerStageArm:
         )
         body = json.loads(response["body"])
         assert response["statusCode"] == 200 and body["stage"] == "finisher"
-        assert body["result"]["lease"]["released"]
+        assert body["lease_released"] and body["stage_records"] == 1
         assert body["record"].startswith("sweep_stats_")
+        assert body["stage_record"].endswith(FINISHER_RECORD_NAME)
 
     def test_discovery_transport_is_shared_with_the_families_arm(self, tmp_path):
         import pandas as pd
@@ -621,6 +627,35 @@ class TestHandlerStageArm:
         response = mod.lambda_handler(_event(root, {"role": "nope", "run_id": "F"}), None)
         assert response["statusCode"] == 500
         assert "unknown stage role" in json.loads(response["body"])["error"]
+
+    def test_the_envelope_is_scalars_and_one_fixed_key_set(self, tmp_path):
+        # A stage record is one row per (artifact node, window); a finest-tuple
+        # batch is megabytes of them, so echoing it would fail a SUCCEEDED
+        # invoke on the 6 MB response cap. Only scalars cross the wire, and the
+        # key set does not move with the role or the outcome.
+        mod = _handler_module()
+        root, prefix = tmp_path / "s", tmp_path / "status"
+        _stage_store(root)
+        stage = json.loads(
+            mod.lambda_handler(
+                _event(root, _stage_block(0, ["1", "-2"], records_from=prefix)), None
+            )["body"]
+        )
+        finisher = json.loads(
+            mod.lambda_handler(
+                _event(root, {"role": "finisher", "run_id": "F", "records_from": str(prefix)}),
+                None,
+            )["body"]
+        )
+        failed = json.loads(
+            mod.lambda_handler(_event(root, {"role": "nope", "run_id": "F"}), None)["body"]
+        )
+        assert set(stage) == set(finisher) == set(failed)
+        assert all(
+            not isinstance(v, (dict, list)) for v in stage.values()
+        ), "the envelope carries scalars only"
+        assert "level_actuals" not in stage and "result" not in stage
+        assert stage["error"] is None and failed["ok"] is False
 
     def test_the_families_arm_is_untouched_without_a_stage_block(self, tmp_path):
         mod = _handler_module()

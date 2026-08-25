@@ -1306,6 +1306,63 @@ def _handle_sweep(event: Dict[str, Any]) -> Dict[str, Any]:
         return {"statusCode": 500, "body": json.dumps({"error": str(e), "mode": "sweep"})}
 
 
+#: The per-stage counts the stage arm's envelope totals for a driver.
+_STAGE_COUNTS = ("written", "current", "failed", "under_covered")
+
+
+def _stage_body(
+    role: str,
+    block: Dict[str, Any],
+    out: Optional[Dict[str, Any]],
+    *,
+    n_leaves: int,
+    duration_s: float,
+    discover_s: Optional[float],
+    error: Optional[BaseException] = None,
+) -> Dict[str, Any]:
+    """The stage arm's response envelope: compact scalars, one fixed key set.
+
+    The record itself is NOT echoed. A stage record carries one row per
+    (artifact node, window) -- a finest-tuple batch is tens of thousands of
+    rows, megabytes of JSON -- so embedding it would let a batch that folded
+    correctly and PUT its record correctly come back to a RequestResponse
+    driver as ``ResponseSizeTooLarge``, indistinguishable from the invoke
+    failure the 500 exists to disambiguate. The record is already durable at
+    the status prefix and the finisher reads it from there; the envelope
+    carries only its identity and the totals.
+
+    Two record keys, because they name two different objects: ``record`` is
+    the store-root run record (``sweep_stats_*_stages.json``, the finisher's
+    only -- ``None`` for a stage invoke, matching the families arm's use of
+    that key), and ``stage_record`` is the status-prefix object this invoke
+    PUT. The key SET is identical across both roles and both outcomes, with
+    ``None`` where a role has no such value, so a driver can read any field
+    off any stage response without a KeyError.
+    """
+    out = out or {}
+    rows = out.get("stages") or []
+    body: Dict[str, Any] = {
+        "ok": error is None,
+        "mode": "sweep",
+        "stage": role,
+        "run_id": block.get("run_id"),
+        "dispatch": out.get("dispatch"),
+        "batch": out.get("batch"),
+        "n_nodes": out.get("n_nodes"),
+        "n_leaves": n_leaves,
+        "stage_records": out.get("stage_records"),
+        "lease_released": (out.get("lease") or {}).get("released"),
+        "duration_s": duration_s,
+        "discover_s": discover_s,
+        "record": out.get("record") if role == "finisher" else None,
+        "stage_record": out.get("finisher_record") if role == "finisher" else out.get("record"),
+        "error": None if error is None else str(error),
+        "error_class": None if error is None else type(error).__name__,
+    }
+    body.update({name: sum(int(row.get(name) or 0) for row in rows) for name in _STAGE_COUNTS})
+    return body
+
+
 def _handle_stage_sweep(
     event: Dict[str, Any],
     leaves: Any,
@@ -1381,17 +1438,14 @@ def _handle_stage_sweep(
         return {
             "statusCode": 200,
             "body": json.dumps(
-                {
-                    "ok": True,
-                    "mode": "sweep",
-                    "stage": role,
-                    "run_id": block.get("run_id"),
-                    "n_leaves": len(leaves),
-                    "duration_s": time.perf_counter() - t0,
-                    "discover_s": discover_s,
-                    "record": out.get("record"),
-                    "result": out,
-                }
+                _stage_body(
+                    role,
+                    block,
+                    out,
+                    n_leaves=len(leaves),
+                    duration_s=time.perf_counter() - t0,
+                    discover_s=discover_s,
+                )
             ),
         }
     except Exception as e:
@@ -1399,13 +1453,15 @@ def _handle_stage_sweep(
         return {
             "statusCode": 500,
             "body": json.dumps(
-                {
-                    "error": str(e),
-                    "error_class": type(e).__name__,
-                    "mode": "sweep",
-                    "stage": role,
-                    "run_id": block.get("run_id"),
-                }
+                _stage_body(
+                    role,
+                    block,
+                    None,
+                    n_leaves=len(leaves),
+                    duration_s=time.perf_counter() - t0,
+                    discover_s=discover_s,
+                    error=e,
+                )
             ),
         }
 
