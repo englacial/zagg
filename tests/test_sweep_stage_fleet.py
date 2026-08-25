@@ -986,6 +986,70 @@ class TestStageEvent:
         assert event["output_credentials"] == creds
 
 
+class TestBarrier:
+    def test_a_failed_list_is_not_an_empty_prefix(self, tmp_path, caplog):
+        # `set()` for both meant a permissions typo read exactly like "no
+        # records yet", at DEBUG (review finding).
+        import logging
+
+        import zagg.store
+        from zagg.sweep_fleet import _present
+
+        assert _present(str(tmp_path / "nothing-here"), {}) == (set(), True)
+
+        def _boom(*_a, **_k):
+            raise PermissionError("s3:ListBucket denied on the .status sibling")
+
+        with caplog.at_level(logging.WARNING, logger="zagg.sweep_fleet"):
+            with pytest.MonkeyPatch.context() as mp:
+                mp.setattr(zagg.store, "open_object_store", _boom)
+                assert _present("s3://b/p.zarr.status/run-F", {}) == (set(), False)
+        assert "cannot list" in caplog.text
+
+    def test_a_broken_list_ends_the_barrier_instead_of_burning_it(self, monkeypatch, caplog):
+        # A dispatcher that can never see the records must not spend the whole
+        # barrier budget of every tuple discovering that (review finding).
+        import logging
+
+        import zagg.sweep_fleet as sweep_fleet
+
+        calls = []
+
+        def _blind(records_from, store_kwargs):
+            calls.append(records_from)
+            return set(), False
+
+        monkeypatch.setattr(sweep_fleet, "_present", _blind)
+        with caplog.at_level(logging.WARNING, logger="zagg.sweep_fleet"):
+            seen, timed_out = sweep_fleet.await_records(
+                "s3://b/p.zarr.status/run-F",
+                {"stage-0-000000.json"},
+                store_kwargs={},
+                timeout_s=600,
+                interval_s=0.0,
+            )
+        assert (seen, timed_out) == (set(), True)
+        assert len(calls) == sweep_fleet._LIST_FAULT_LIMIT, "it polled past the fault limit"
+        assert "consecutive LIST failures" in caplog.text
+
+    def test_the_timeout_says_when_it_never_listed_at_all(self, monkeypatch, caplog):
+        import logging
+
+        import zagg.sweep_fleet as sweep_fleet
+
+        monkeypatch.setattr(sweep_fleet, "_LIST_FAULT_LIMIT", 1_000_000)
+        monkeypatch.setattr(sweep_fleet, "_present", lambda *_a, **_k: (set(), False))
+        with caplog.at_level(logging.WARNING, logger="zagg.sweep_fleet"):
+            sweep_fleet.await_records(
+                "s3://b/p.zarr.status/run-F",
+                {"stage-0-000000.json"},
+                store_kwargs={},
+                timeout_s=0.0,
+                interval_s=0.0,
+            )
+        assert "never listed successfully" in caplog.text
+
+
 class TestFleetOrchestration:
     def test_tuple_ordering_is_finest_first_with_the_finisher_last(self, tmp_path):
         mod = _handler_module()

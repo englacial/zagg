@@ -69,6 +69,11 @@ DEFAULT_BARRIER_TIMEOUT_S = 2700
 DEFAULT_TOTAL_BARRIER_BUDGET_S = 7200
 #: Seconds between barrier polls. One LIST per poll, not one HEAD per record.
 DEFAULT_POLL_INTERVAL_S = 5.0
+#: Consecutive failed LISTs that end a barrier early. A dispatcher that cannot
+#: list the status prefix at all — a role scoped to the store root but not to
+#: its `.status` sibling, a wrong region, expired credentials — would otherwise
+#: poll to the deadline of every barrier and report it as slow workers.
+_LIST_FAULT_LIMIT = 5
 #: The ``batch`` index a packed batch is MEASURED with. Larger than any batch
 #: count a real fan-out reaches, so the measured payload is never smaller than
 #: the one that ships (the index is assigned after packing).
@@ -259,13 +264,19 @@ def pack_batches(nodes, by_shard, *, block: dict, store_path: str, output_creds_
     return batches
 
 
-def _present(records_from: str, store_kwargs: dict) -> set:
-    """Basenames currently under the run's status prefix (one LIST).
+def _present(records_from: str, store_kwargs: dict) -> tuple:
+    """``(basenames, listed_ok)`` under the run's status prefix (one LIST).
 
     A read, not a write: on ``s3://`` this is a single ``ListObjectsV2`` and
     the dispatcher stays write-free (D8). On a LOCAL path ``open_object_store``
     materializes the directory (it has no read-only mode) — a filesystem
     artifact of the test/CLI path, outside the store root, never an object.
+
+    The flag is the point: "the prefix is empty" and "the LIST failed" are the
+    same empty set, and they call for opposite reactions. The status prefix is
+    a store SIBLING (``<store>.status/run-<id>``), so a dispatcher role scoped
+    to the store root has no ``s3:ListBucket`` on it at all — a permanent
+    fault, not a slow worker, and it is the likely one for this call.
     """
     import obstore
 
@@ -273,10 +284,10 @@ def _present(records_from: str, store_kwargs: dict) -> set:
 
     try:
         listing = obstore.list_with_delimiter(open_object_store(records_from, **store_kwargs))
-    except Exception as e:  # a prefix with no objects yet, or a transient fault
-        logger.debug(f"stage fleet: cannot list {records_from} ({e})")
-        return set()
-    return {meta["path"].rsplit("/", 1)[-1] for meta in listing["objects"]}
+    except Exception as e:
+        logger.warning(f"stage fleet: cannot list {records_from} ({e})")
+        return set(), False
+    return {meta["path"].rsplit("/", 1)[-1] for meta in listing["objects"]}, True
 
 
 def await_records(
@@ -311,10 +322,32 @@ def await_records(
     That is why ``barrier_timed_out`` is propagated into the dispatcher's
     summary AND into the finisher's own block rather than only logged: the run
     record has to say its actuals may be short instead of reading clean.
+
+    A barrier also ends early — loudly, and still fail-open — when the status
+    prefix cannot be LISTED ``_LIST_FAULT_LIMIT`` times running: that is a
+    dispatcher-side fault, and polling out the budget would buy nothing while
+    reporting it as slow workers.
     """
     deadline = time.monotonic() + float(timeout_s)
+    seen: set = set()
+    faults = 0
+    listed_ever = False
     while True:
-        seen = _present(records_from, store_kwargs) & expected
+        names, listed_ok = _present(records_from, store_kwargs)
+        if listed_ok:
+            listed_ever, faults = True, 0
+            seen = names & expected
+        else:
+            faults += 1
+            if faults >= _LIST_FAULT_LIMIT:
+                logger.warning(
+                    f"stage fleet: abandoning the barrier on {records_from} after {faults} "
+                    f"consecutive LIST failures — the dispatcher cannot SEE the run's stage "
+                    f"records (a permissions, region or endpoint fault, not slow workers), "
+                    f"so waiting out the budget would buy nothing; proceeding fail-open with "
+                    f"{len(seen)}/{len(expected)} record(s) seen"
+                )
+                return seen, True
         if seen >= expected:
             return seen, False
         if time.monotonic() >= deadline:
@@ -322,7 +355,9 @@ def await_records(
             logger.warning(
                 f"stage fleet: barrier timed out after {timeout_s:.0f}s with "
                 f"{len(missing)}/{len(expected)} stage record(s) missing ({missing[:5]}"
-                f"{' ...' if len(missing) > 5 else ''}) — proceeding: under-coverage is "
+                f"{' ...' if len(missing) > 5 else ''})"
+                f"{'' if listed_ever else ' — and the status prefix never listed successfully'}"
+                f" — proceeding: under-coverage is "
                 f"recorded per artifact and heals on the next pass (#381 point (6))"
             )
             return seen, True
