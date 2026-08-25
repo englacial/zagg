@@ -1748,13 +1748,24 @@ class TestByteIdentityOracle:
         _assert_identical(cli, fleet, ladder_data_only=True)
         # And say exactly what the group attrs are allowed to differ in, so a
         # future divergence in anything ELSE cannot hide behind the exclusion.
-        groups = [r for r in _artifacts(fleet) if _is_group_metadata(r)]
-        assert groups
-        for rel in groups:
-            a = _devolatilize(json.loads(cli[rel]))["attributes"]["zagg_overview"]
-            b = _devolatilize(json.loads(fleet[rel]))["attributes"]["zagg_overview"]
-            differing = {k for k in set(a) | set(b) if a.get(k) != b.get(k)}
-            assert differing <= {"generation", "source_children"}, (rel, differing)
+        # The whole `attributes` dict is checked, not just `zagg_overview`:
+        # `morton_hive_commit`'s `complete`/`cells_with_data`/`granule_count`
+        # rode out of this arm entirely before.
+        cli_groups = {r for r in _artifacts(cli) if _is_group_metadata(r)}
+        fleet_groups = {r for r in _artifacts(fleet) if _is_group_metadata(r)}
+        assert cli_groups and cli_groups == fleet_groups
+        for rel in sorted(cli_groups):
+            a = _devolatilize(json.loads(cli[rel]))["attributes"]
+            b = _devolatilize(json.loads(fleet[rel]))["attributes"]
+            top = {k for k in set(a) | set(b) if a.get(k) != b.get(k)}
+            assert top <= {"zagg_overview"}, (rel, top)
+            # And within it, ONLY the per-run provenance tally. `generation`
+            # is not on this list: with the run ids blanked its `n_leaves` and
+            # `max_leaf_timestamp` are width-independent, which is the whole
+            # content of the merge-source law at the attrs level.
+            x, y = a.get("zagg_overview", {}), b.get("zagg_overview", {})
+            differing = {k for k in set(x) | set(y) if x.get(k) != y.get(k)}
+            assert differing <= {"source_children"}, (rel, differing)
 
     def test_identity_holds_when_the_workers_run_only_while_the_barrier_waits(
         self, tmp_path, monkeypatch
