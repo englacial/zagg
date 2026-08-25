@@ -125,8 +125,7 @@ def _bucket_leaf_refs(by_shard, dispatch: int) -> dict:
     for decimal in sorted(by_shard):
         key = int(morton_word(decimal))
         buckets.setdefault(_node_at(decimal, dispatch), []).extend(
-            [key, window]
-            for window in sorted(by_shard[decimal], key=lambda w: (w is not None, w))
+            [key, window] for window in sorted(by_shard[decimal], key=lambda w: (w is not None, w))
         )
     return buckets
 
@@ -589,9 +588,7 @@ def run_stage_sweep_fleet(
         # TTL here would move it on the LAST acquire — widening exactly the
         # window a foreign sweep may claim. One TTL governs the whole run.
         finisher_block["lease_ttl_s"] = int(lease_ttl_s)
-    _fire(
-        build_stage_event(store_path, finisher_block, _leaf_refs(by_shard), output_creds_event)
-    )
+    _fire(build_stage_event(store_path, finisher_block, _leaf_refs(by_shard), output_creds_event))
     seen, timed_out = _barrier({FINISHER_RECORD_NAME})
     summary["finisher"] = {"landed": not timed_out, "fired": True}
     summary["barrier_timed_out"] = stages_timed_out or timed_out
