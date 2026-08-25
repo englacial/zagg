@@ -1459,12 +1459,15 @@ class TestRunnerSeam:
 
 
 #: JSON values that are the RUN's identity or its clock rather than its
-#: content: the run id every stage artifact stamps, the D4 commit instant, the
-#: provenance instant, and the D20 sidecar's write timestamp. Two executors
-#: are not expected to agree on these and nothing reads them for content.
-#: EVERYTHING else — every chunk byte, every count, every digest payload,
-#: every generation key, every ``source_children`` tally — must match exactly.
-_VOLATILE_KEYS = frozenset({"run_id", "written_at", "generated_at", "timestamp"})
+#: content: the run id every stage artifact stamps — as a scalar (``run_id``)
+#: and as the folded children's list of them (``run_ids``, inside
+#: ``generation``) — the D4 commit instant, the provenance instant, and the
+#: D20 sidecar's write timestamp. Two executors are not expected to agree on
+#: these and nothing reads them for content. EVERYTHING else — every chunk
+#: byte, every count, every digest payload, every remaining generation key
+#: (``n_leaves``, ``max_leaf_timestamp``), every ``source_children`` tally —
+#: must match exactly.
+_VOLATILE_KEYS = frozenset({"run_id", "run_ids", "written_at", "generated_at", "timestamp"})
 
 
 #: Store-root objects that are not ladder artifacts: the input run record the
