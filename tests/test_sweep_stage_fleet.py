@@ -65,6 +65,11 @@ def _event(root, block, leaves=LEAVES):
 RUN_STARTED = "2026-08-25T00:00:00+00:00"
 
 
+def _records(root):
+    """The run's status prefix for a local fixture store — a store SIBLING."""
+    return f"{root}.status"
+
+
 def _stage_block(dispatch, nodes, *, run_id="F", batch=0, records_from=None, **extra):
     block = {
         "role": "stage",
@@ -97,6 +102,7 @@ class TestStageWorkerArm:
             run_started=RUN_STARTED,
             dispatch=0,
             nodes=["1"],
+            records_from=_records(root),
         )
         (row,) = record["stages"]
         assert row["dispatch_order"] == 0 and row["nodes"] == 1 and row["written"] > 0
@@ -149,6 +155,7 @@ class TestStageWorkerArm:
                 run_started=RUN_STARTED,
                 dispatch=7,
                 nodes=["11111111"],
+                records_from=_records(root),
             )
 
     def test_the_worker_writes_and_holds_the_lease(self, tmp_path):
@@ -163,6 +170,7 @@ class TestStageWorkerArm:
             run_started=RUN_STARTED,
             dispatch=0,
             nodes=["1"],
+            records_from=_records(root),
         )
         held = read_lease(str(root))
         # Held, ours, and NOT released: release is the finisher's final act.
@@ -185,6 +193,7 @@ class TestStageWorkerArm:
                     run_started=RUN_STARTED,
                     dispatch=0,
                     nodes=nodes,
+                    records_from=_records(root),
                 )
         # Refused before admission and before any fold: no lease, no artifacts.
         assert read_lease(str(root)) is None
@@ -207,6 +216,7 @@ class TestStageWorkerArm:
                 run_started=RUN_STARTED,
                 dispatch=0,
                 nodes=["1", "111"],
+                records_from=_records(root),
             )
         # The whole invoke refuses — the good node in the same set is not swept.
         assert read_lease(str(root)) is None
@@ -223,6 +233,7 @@ class TestStageWorkerArm:
                 run_started=RUN_STARTED,
                 dispatch=0,
                 nodes=[node],
+                records_from=_records(root),
             )
         assert (root / "1" / "all.zarr").exists() and (root / "-2" / "all.zarr").exists()
 
@@ -240,6 +251,7 @@ class TestStageWorkerArm:
                 run_started=RUN_STARTED,
                 dispatch=0,
                 nodes=["1"],
+                records_from=_records(root),
             )
 
     def test_a_foreign_fresh_stamp_aborts_the_invoke(self, tmp_path):
@@ -257,6 +269,7 @@ class TestStageWorkerArm:
             run_started=RUN_STARTED,
             dispatch=0,
             nodes=["1"],
+            records_from=_records(root),
         )
         g = zarr.open_group(
             open_store(str(root / "1" / "1" / "1" / "all.zarr")), path="", mode="r+", zarr_format=3
@@ -275,6 +288,7 @@ class TestStageWorkerArm:
                 run_started=RUN_STARTED,
                 dispatch=0,
                 nodes=["1"],
+                records_from=_records(root),
             )
 
     def test_the_run_id_skip_key_makes_a_reinvoke_current(self, tmp_path):
@@ -287,6 +301,7 @@ class TestStageWorkerArm:
             run_started=RUN_STARTED,
             dispatch=0,
             nodes=["1"],
+            records_from=_records(root),
         )
         again = run_stage_worker(
             str(root),
@@ -295,6 +310,7 @@ class TestStageWorkerArm:
             run_started=RUN_STARTED,
             dispatch=0,
             nodes=["1"],
+            records_from=_records(root),
         )
         assert first["stages"][0]["written"] > 0
         assert again["stages"][0]["written"] == 0 and again["stages"][0]["current"] > 0
@@ -319,6 +335,27 @@ class TestStageWorkerArm:
         assert on_disk["spec"] == STAGE_RECORD_SPEC and on_disk["role"] == "stage"
         assert on_disk["level_actuals"] and record["record"].endswith(name)
 
+    def test_a_worker_nobody_can_witness_refuses_by_name(self, tmp_path):
+        # A stage invoke without a records prefix folds correctly and then
+        # writes nothing anyone reads: its barrier waits out the full timeout
+        # and looks exactly like a lost invoke, and its coverage never reaches
+        # the manifest. Loud here or never loud at all (review finding).
+        root = tmp_path / "s"
+        _stage_store(root)
+        with pytest.raises(ValueError, match="no records_from"):
+            run_stage_worker(
+                str(root),
+                [(morton_word(d), None) for d in LEAVES],
+                run_id="F",
+                run_started=RUN_STARTED,
+                dispatch=0,
+                nodes=["1"],
+                records_from="",
+            )
+        # Refused BEFORE admission and before any fold: no lease, no artifacts.
+        assert not (root / "sweep.lease.json").exists()
+        assert not (root / "1" / "all.zarr").exists()
+
     def test_a_stage_worker_never_touches_store_root_singletons(self, tmp_path):
         from zagg.hive import MANIFEST_NAME
 
@@ -337,6 +374,7 @@ class TestStageWorkerArm:
             run_started=RUN_STARTED,
             dispatch=0,
             nodes=["1", "-2"],
+            records_from=_records(root),
         )
         # The finisher owns the manifest RMW and the root MOC refresh; a stage
         # worker writing either would breach the singleton single-writer law.
@@ -711,7 +749,7 @@ class TestHandlerStageArm:
             return real(*args, **kwargs)
 
         monkeypatch.setattr(sweep_stages, "run_stage_worker", _spy)
-        block = _stage_block(0, ["1"])
+        block = _stage_block(0, ["1"], records_from=_records(root))
         del block["tuple_width"]
         assert mod.lambda_handler(_event(root, block), None)["statusCode"] == 200
         assert seen["tuple_width"] == sweep_stage.DEFAULT_TUPLE_WIDTH

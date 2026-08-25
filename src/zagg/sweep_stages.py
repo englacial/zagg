@@ -804,7 +804,7 @@ def run_stage_worker(
     batch: int = 0,
     tuple_width: int = DEFAULT_TUPLE_WIDTH,
     partition: dict | None = None,
-    records_from: str | None = None,
+    records_from: str,
     lease_ttl_s: int | None = None,
     store_kwargs: dict | None = None,
 ) -> dict:
@@ -847,9 +847,14 @@ def run_stage_worker(
     is the finisher's final act (:func:`run_stage_finisher`), so a run that
     dies mid-fan-out leaves a claimable intent, not an open store.
 
-    ``records_from`` is the run's status prefix; the record lands there under
-    :func:`stage_record_name` and is both the dispatcher's soft-barrier signal
-    and the finisher's aggregation input. Returns that record.
+    ``records_from`` is the run's status prefix and is REQUIRED: the record
+    lands there under :func:`stage_record_name` and is both the dispatcher's
+    soft-barrier signal and the finisher's aggregation input. A worker that
+    wrote no record would fold correctly and then be indistinguishable from a
+    lost invoke — its barrier waits out the full timeout and its coverage
+    never reaches the manifest. That is a worse outcome than a loud refusal,
+    so an absent prefix refuses BY NAME before anything is read or written
+    (review finding). Returns the record.
     """
     from zagg.hive import MANIFEST_NAME, _decimal_order, read_manifest
     from zagg.sweep import _normalize_leaves
@@ -857,6 +862,13 @@ def run_stage_worker(
 
     t0 = time.perf_counter()
     store_kwargs = dict(store_kwargs or {})
+    if not records_from:
+        raise ValueError(
+            f"stage invoke for run {run_id!r} (dispatch {dispatch}, batch {batch}) was "
+            "handed no records_from — a worker whose record nobody can witness reads to "
+            "the dispatcher exactly like a lost invoke, and its coverage never reaches "
+            "the manifest; refusing rather than folding invisibly"
+        )
     nodes = [str(n) for n in nodes]
     if not nodes:
         raise ValueError(
@@ -928,10 +940,9 @@ def run_stage_worker(
     }
     if summary.get("root_moc_stale"):
         record["root_moc_stale"] = True
-    if records_from:
-        record["record"] = _put_stage_record(
-            records_from, stage_record_name(dispatch, batch), record, store_kwargs
-        )
+    record["record"] = _put_stage_record(
+        records_from, stage_record_name(dispatch, batch), record, store_kwargs
+    )
     return record
 
 
