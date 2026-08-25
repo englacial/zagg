@@ -896,6 +896,10 @@ class TestBatching:
         assert flat == nodes  # every node once, in order
 
     def test_batches_stay_under_the_async_cap(self):
+        # `build_stage_event` holds the cap unconditionally -- it strips the
+        # leaves to get there -- so asserting only on its output is a tautology
+        # (review finding). What pack_batches owes is that a batch it sized to
+        # ride INLINE actually does: leaves present, no discover, under the cap.
         from mortie import generate_morton_children
 
         from zagg.grids.morton import morton_decimal
@@ -906,12 +910,15 @@ class TestBatching:
         by_shard = {d: {None} for d in leaves}
         nodes = sorted({d[:4] for d in leaves})
         block = self._block(3)
-        for batch, (batch_nodes, refs) in enumerate(
-            pack_batches(nodes, by_shard, block=block, store_path="s3://bucket/p.zarr")
-        ):
+        batches = pack_batches(nodes, by_shard, block=block, store_path="s3://bucket/p.zarr")
+        assert len(batches) > 1
+        for batch, (batch_nodes, refs) in enumerate(batches):
+            assert refs is not None, "these nodes' slices each fit; none is a discover batch"
             event = build_stage_event(
                 "s3://bucket/p.zarr", {**block, "nodes": batch_nodes, "batch": batch}, refs
             )
+            assert len(event["leaves"]) == len(refs), f"batch {batch} lost its inline leaves"
+            assert "discover" not in event
             assert len(json.dumps(event)) <= _ASYNC_PAYLOAD_CAP_BYTES
 
     def test_one_overflowing_node_falls_back_to_discovery_not_truncation(self):
