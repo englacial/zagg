@@ -503,6 +503,182 @@ every warm sandbox at once. It requires `lambda:GetFunctionConfiguration` +
 pool for all users of the function, so it is off by default and independent
 of the self-recycle knobs (both can be enabled).
 
+## Staged pyramid sweep over the fleet {#staged-sweep}
+
+The `zagg-pyramid/2` above-shard ladder is built by the **staged dense sweep**
+(issues #384/#416): stage workers fold child columns into parent columns, one
+dispatch tuple at a time, finest tuple first. `python -m zagg.sweep <root>
+--stages` runs the whole thing in one local process. Issue #519 added the
+fleet transport so it can also run entirely worker-side.
+
+You need the fleet transport whenever the **dispatcher cannot write to the
+store**. The canonical case is a Source Cooperative–published store: the
+bucket policy names the *fleet execution role* as the write identity
+(#495/#496), so a local stage worker has no sanctioned write path at all and
+the CLI cannot serve those stores. It is also the D8 posture everywhere else —
+the Lambda dispatcher never PUTs; workers do.
+
+### Wire grammar
+
+No new mode. A `stage` block on the existing `mode: "sweep"` event selects the
+staged arm, reusing that event's credential resolution and its
+`leaves` / `discover` work-set transport:
+
+```json
+{
+  "mode": "sweep",
+  "store_path": "s3://bucket/prefix.zarr",
+  "leaves": [[1152921504606846982, null]],
+  "stage": {
+    "role": "stage",
+    "run_id": "stage-20260825T094152Z-53c774",
+    "run_started": "2026-08-25T09:41:52+00:00",
+    "dispatch": 6,
+    "nodes": ["111", "112"],
+    "batch": 0,
+    "tuple_width": 3,
+    "records_from": "s3://bucket/prefix.zarr.status/run-stage-20260825T094152Z-53c774"
+  }
+}
+```
+
+| Key | Role | Description |
+|-----|------|-------------|
+| `role` | both | `"stage"` (default) or `"finisher"` |
+| `run_id` | both | The sweep run's identity: the lease, the skip-key / foreign-stamp namespace, and the status prefix all key on it |
+| `run_started` | stage | Dispatcher-pinned UTC ISO stamp, shared by every worker of the run. A worker computing its own would read a sibling's fresh stamp as a foreign sweep's |
+| `dispatch` | stage | The tuple's dispatch order. The worker runs exactly that one tuple |
+| `nodes` | stage | This invoke's dispatch nodes, as morton decimals. Must be non-empty and every entry must sit at exactly `dispatch` order — the worker refuses otherwise |
+| `batch` | stage | Which batch of that tuple this is; names the record object |
+| `tuple_width` | both | Optional; defaults to `zagg.sweep_stage.DEFAULT_TUPLE_WIDTH` |
+| `partition` | stage | Optional `{"index", "of"}`; recorded on the stage rows |
+| `lease_ttl_s` | both | Optional lease TTL override |
+| `records_from` | both | The run's status prefix — a store **sibling** (`<store>.status/run-<run_id>`, `zagg.client_transport.run_status_prefix`). Each invoke PUTs its record there; the finisher reads them back |
+| `touch_policy` | finisher | The `output.touch` declaration (issue #501) governing the `aggregation.yaml` touch |
+
+Every store write stays worker-side. The dispatcher only invokes and polls.
+
+### How a run is sequenced
+
+`zagg.sweep_fleet.run_stage_sweep_fleet` mirrors the in-process driver's tuple
+ordering exactly:
+
+1. **fan out** one tuple's dispatch nodes, batched under the 250 KB async
+   payload cap, one `InvocationType="Event"` invoke per batch;
+2. **soft-barrier** — poll the status prefix until every batch's stage record
+   lands, or the barrier budget expires. Per #381 point (6) the barrier is a
+   *scheduling* preference, not a correctness device: under-coverage is
+   recorded in each artifact's own `source_children` and heals on the next
+   pass, so an expired barrier logs loudly and the run proceeds;
+3. next tuple; then the **finisher** invoke last — root `coverage.moc`,
+   manifest per-level actuals, `aggregation.yaml` touch, lease release.
+
+One barrier is bounded by `barrier_timeout_s` (default 2,700 s — three times
+the 900 s function timeout: queue drain, one throttle redelivery, and the
+slowest worker's own run), and the *sum* of them by `total_barrier_budget_s`
+(default 7,200 s), so the tail's worst case is a constant rather than a
+function of the store's order. Past the total, each remaining barrier degrades
+to a single check. An expiry is recorded as `barrier_timed_out` on the run
+summary and in the finisher's stage block: when the invoke was merely *queued*
+rather than lost, its late artifacts are still correct — the cost is that the
+finisher's per-level actuals under-report.
+
+Admission is the ordinary per-store sweep lease (`sweep.lease.json`). The
+*first* stage worker creates the intent; every sibling of the same run reads
+its own back; a live foreign intent refuses the invoke by name. Release is the
+finisher's final act, so a run that dies mid-fan-out leaves a claimable
+intent, not an open store.
+
+### Running it
+
+Opt in on a Lambda-backed run with `output.sweep: "stages"` — the same knob
+the local dispatcher reads — and the runner tail chains the fleet sweep after
+the rollup-families leg, auto-scoped to the run's own footprint. Ad hoc, drive
+`zagg.sweep_fleet.run_stage_sweep_fleet` with a boto3 Lambda client:
+
+```python
+import boto3
+from zagg.sweep_fleet import run_stage_sweep_fleet
+
+summary = run_stage_sweep_fleet(
+    boto3.client("lambda"),
+    "zagg-worker",
+    "s3://bucket/prefix.zarr",
+    leaves,                    # [(shard_key, window), ...]
+    shard_order=6,
+    store_kwargs={"region": "us-west-2"},
+)
+```
+
+`shard_order` is passed in rather than read from the manifest on purpose: a
+dispatcher role may hold nothing but `lambda:InvokeFunction` against the
+store itself.
+
+**Permissions.** Nothing new on the worker side — the execution role already
+writes the store and the `<store>.status/` sibling (the issue #151 async result
+channel), which is where the stage records land. The dispatcher needs
+`lambda:InvokeFunction` plus `s3:ListBucket` scoped to `<store>.status/*` so it
+can poll the barrier; the v2 Event transport already requires that prefix, so a
+correctly scoped dispatcher role needs no new grant. No CloudFormation, layer,
+or IAM template change ships with this transport.
+
+!!! note "Dispatch nodes come from the work set, not from the store"
+    The dispatcher cannot read the root `coverage.moc`, so it derives dispatch
+    nodes from the leaves it holds. The in-process pass derives them from work
+    set ∪ root MOC, so a node whose *only* leaves are untouched siblings
+    recorded in the MOC is not invoked. That is the same scoped-sweep posture
+    `stage_sweep_after_run` already has (#381 point (11)); a worker still folds
+    every child on disk under each node it *is* handed, so untouched siblings
+    are folded in, never dropped.
+
+!!! warning "The tail blocks while the sweep runs"
+    Unlike every other end-of-run invoke, the staged sweep is not
+    fire-and-forget: the tuple ordering has to be held by somebody, and the
+    dispatcher is the only party that sees each tuple finish. The barrier waits
+    are bounded by a total budget and the whole leg is fail-open (D9) — a
+    refused lease, a lost invoke or an expired barrier costs one later
+    `python -m zagg.sweep --stages` pass, never a wrong answer. A dispatcher
+    killed mid-barrier leaves the run's lease held until its TTL expires into
+    claimability, which is the lease's designed recovery.
+
+### Why the fleet build is trusted
+
+Grouping is a dispatch knob, never grammar — the **merge-source law** (espg
+ruling 2026-08-09, issue #384) makes the build a fixed function of the store,
+independent of tuple width, partitioning, and executor. Splitting a tuple
+across invokes is therefore free: dispatch nodes at one order own disjoint
+subtrees, and a tuple's folds read only columns one tuple *finer*.
+
+That is not an argument, it is the test. `TestByteIdentityOracle` in
+`tests/test_sweep_stage_fleet.py` builds a column-bearing store, runs the CLI
+staged sweep, snapshots every object, resets the store to its pre-sweep bytes,
+runs the fleet path with the Lambda client mocked to execute the worker arm
+in-process, and byte-compares every object — chunk data exactly, JSON modulo
+the run identity and the clock. Any difference is a transport bug.
+
+It runs that comparison across every degree of freedom the transport has:
+tuple widths 1, 2 and 3 (136–181 objects each); a multi-batch fan-out with the
+payload cap squeezed so one tuple needs several invokes; an executor that runs
+each worker only while the barrier is waiting, so the barrier is falsifiable;
+a windowed store; and a store whose digest field carries both the located and
+the temporal companion channel. Two negative controls prove the comparison has
+teeth — a wrong fold and a scoped-out subtree both fail it.
+
+The one **documented** difference between executors is pinned by its own test:
+the dispatcher derives dispatch nodes from the work set it holds, so a subtree
+that appears only in the root MOC is not invoked. Both a post-run chained sweep
+and a discovery-driven one hand over a work set that covers the MOC, so the
+identity claim holds wherever the transport is actually used.
+
+!!! info "Live-fleet validation is deferred"
+    The acceptance above is fully offline by design. Validation against a real
+    deployed function rides the next release plus a cents-scale probe on a
+    column-bearing probe store (the SERC GEDI 0.50 probe store is exactly that
+    testbed); no deploy, no Lambda invoke, and no S3 write was made from the
+    implementing branch. The `stage` arm ships in the function zip like any
+    other handler change — there is no template, layer, or IAM change to
+    stage first.
+
 ## Cost Estimate
 
 **Per invocation** (180s average, 2 GB memory): ~$0.006
