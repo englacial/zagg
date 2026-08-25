@@ -57,6 +57,10 @@ logger = logging.getLogger(__name__)
 DEFAULT_BARRIER_TIMEOUT_S = 1200
 #: Seconds between barrier polls. One LIST per poll, not one HEAD per record.
 DEFAULT_POLL_INTERVAL_S = 5.0
+#: The ``batch`` index a packed batch is MEASURED with. Larger than any batch
+#: count a real fan-out reaches, so the measured payload is never smaller than
+#: the one that ships (the index is assigned after packing).
+_BATCH_INDEX_PROBE = 9_999_999
 
 
 def dispatch_nodes(by_shard, dispatch: int, scope=None) -> list:
@@ -110,6 +114,23 @@ def _bucket_leaf_refs(by_shard, dispatch: int) -> dict:
     return buckets
 
 
+def _inline_event(store_path: str, block: dict, leaves, output_creds_event=None) -> dict:
+    """The event build with NO cap fallback — the shape the packer measures.
+
+    :func:`build_stage_event` is this plus the last-resort conversion to
+    ``discover: true``; measuring through THAT would measure the stripped
+    event and call every overflow a fit.
+    """
+    event: dict = {"mode": "sweep", "store_path": store_path, "stage": dict(block)}
+    if output_creds_event is not None:
+        event["output_credentials"] = output_creds_event
+    if leaves is None:
+        event["discover"] = True
+    else:
+        event["leaves"] = list(leaves)
+    return event
+
+
 def build_stage_event(store_path: str, block: dict, leaves, output_creds_event=None) -> dict:
     """One ``mode="sweep"`` + ``stage`` worker event; the single build site.
 
@@ -119,6 +140,10 @@ def build_stage_event(store_path: str, block: dict, leaves, output_creds_event=N
     and each dispatch node prefix-filters it anyway, so the fallback stays
     correct per batch (it costs a LIST plus a parquet read per invoke, which
     is why :func:`pack_batches` spends its budget on keeping leaves inline).
+    That fallback is a LAST resort, not a routine path: :func:`pack_batches`
+    measures every batch it emits, so reaching it means the batch was built
+    somewhere else — hence the WARNING naming the batch, since a silent switch
+    to a store-wide LIST shows up only as unexplained worker latency.
 
     ``leaves=None`` asks for the discovery form outright — what
     :func:`pack_batches` returns for a batch whose own leaf slice cannot fit.
@@ -128,17 +153,39 @@ def build_stage_event(store_path: str, block: dict, leaves, output_creds_event=N
     """
     from zagg.runner import _ASYNC_PAYLOAD_CAP_BYTES
 
-    event: dict = {"mode": "sweep", "store_path": store_path, "stage": dict(block)}
-    if output_creds_event is not None:
-        event["output_credentials"] = output_creds_event
-    if leaves is None:
-        event["discover"] = True
-        return event
-    event["leaves"] = list(leaves)
-    if len(json.dumps(event)) > _ASYNC_PAYLOAD_CAP_BYTES:
+    event = _inline_event(store_path, block, leaves, output_creds_event)
+    if leaves is not None and len(json.dumps(event)) > _ASYNC_PAYLOAD_CAP_BYTES:
+        logger.warning(
+            f"stage fleet: run {block.get('run_id')!r} role {block.get('role', 'stage')} "
+            f"batch {block.get('batch')} @{block.get('dispatch')} overflowed the "
+            f"{_ASYNC_PAYLOAD_CAP_BYTES}-byte async payload cap with "
+            f"{len(event['leaves'])} inline leaf ref(s) — falling back to discover: true, "
+            "which costs the worker a store-wide LIST plus a parquet read"
+        )
         del event["leaves"]
         event["discover"] = True
     return event
+
+
+def _fit_batch(nodes, buckets, *, block: dict, store_path: str, output_creds_event, cap) -> list:
+    """Split one greedily-packed batch until its REAL event fits under the cap.
+
+    The incremental accounting in :func:`pack_batches` is an estimate; this is
+    what makes it verifiable rather than merely careful. A batch that still
+    measures over is halved and re-measured rather than handed to
+    :func:`build_stage_event`, whose only recourse is to strip ``leaves`` and
+    make the worker rediscover the whole work set. A single node that cannot
+    fit alone IS the discover case, and is emitted as one.
+    """
+    leaves = [ref for node in nodes for ref in buckets.get(node, [])]
+    probe = {**block, "nodes": list(nodes), "batch": _BATCH_INDEX_PROBE}
+    if len(json.dumps(_inline_event(store_path, probe, leaves, output_creds_event))) <= cap:
+        return [(list(nodes), leaves)]
+    if len(nodes) == 1:
+        return [(list(nodes), None)]  # its own leaves overflow: discover
+    mid = len(nodes) // 2
+    kw = dict(block=block, store_path=store_path, output_creds_event=output_creds_event, cap=cap)
+    return _fit_batch(nodes[:mid], buckets, **kw) + _fit_batch(nodes[mid:], buckets, **kw)
 
 
 def pack_batches(nodes, by_shard, *, block: dict, store_path: str, output_creds_event=None) -> list:
@@ -153,6 +200,12 @@ def pack_batches(nodes, by_shard, *, block: dict, store_path: str, output_creds_
     emitted alone with ``leaves=None`` — :func:`build_stage_event` then sends
     the ``discover: true`` form rather than truncating a work set, which would
     silently under-fold.
+
+    The estimate is deliberately CONSERVATIVE (it charges the real ``", "``
+    separators and a fixed envelope margin), and every batch it produces is
+    then measured with one real ``json.dumps`` and split if it still exceeds
+    the cap — so a batch this function calls inline ships inline, instead of
+    being silently converted to ``discover: true`` at build time.
     """
     from zagg.runner import _ASYNC_PAYLOAD_CAP_BYTES
 
@@ -163,24 +216,34 @@ def pack_batches(nodes, by_shard, *, block: dict, store_path: str, output_creds_
     base = len(json.dumps(build_stage_event(store_path, envelope, [], output_creds_event))) + 64
     budget = _ASYNC_PAYLOAD_CAP_BYTES - base
     buckets = _bucket_leaf_refs(by_shard, int(block["dispatch"]))
-    batches: list = []
+    grouped: list = []
     cur_nodes: list = []
-    cur_leaves: list = []
     cur_bytes = 0
     for node in nodes:
-        refs = buckets.get(node, [])
-        cost = len(node) + 4 + sum(len(json.dumps(r)) + 1 for r in refs)
+        # `", "` between elements, both lists: json.dumps' default separators.
+        cost = len(node) + 4 + sum(len(json.dumps(r)) + 2 for r in buckets.get(node, []))
         if cur_nodes and cur_bytes + cost > budget:
-            batches.append((cur_nodes, cur_leaves))
-            cur_nodes, cur_leaves, cur_bytes = [], [], 0
+            grouped.append(cur_nodes)
+            cur_nodes, cur_bytes = [], 0
         if not cur_nodes and cost > budget:
-            batches.append(([node], None))  # its own leaves overflow: discover
+            grouped.append([node])
             continue
         cur_nodes.append(node)
-        cur_leaves.extend(refs)
         cur_bytes += cost
     if cur_nodes:
-        batches.append((cur_nodes, cur_leaves))
+        grouped.append(cur_nodes)
+    batches: list = []
+    for batch_nodes in grouped:
+        batches.extend(
+            _fit_batch(
+                batch_nodes,
+                buckets,
+                block=block,
+                store_path=store_path,
+                output_creds_event=output_creds_event,
+                cap=_ASYNC_PAYLOAD_CAP_BYTES,
+            )
+        )
     return batches
 
 

@@ -933,6 +933,25 @@ class TestBatching:
         )
         assert event["discover"] is True and "leaves" not in event
 
+    def test_the_discovery_fallback_is_logged_by_name(self, caplog):
+        # Reaching the fallback means a batch was sized somewhere other than
+        # pack_batches; a silent switch to a store-wide LIST would show up only
+        # as unexplained worker latency, so it names the batch at WARNING.
+        import logging
+
+        from mortie import generate_morton_children
+
+        from zagg.grids.morton import morton_decimal
+        from zagg.sweep_fleet import build_stage_event
+
+        leaves = [morton_decimal(int(w)) for w in generate_morton_children(morton_word("1"), 8)]
+        refs = [[morton_word(d), None] for d in leaves]
+        block = {**self._block(0), "nodes": ["1"], "batch": 7}
+        with caplog.at_level(logging.WARNING, logger="zagg.sweep_fleet"):
+            event = build_stage_event("s3://bucket/p.zarr", block, refs)
+        assert event["discover"] is True and "leaves" not in event
+        assert "batch 7" in caplog.text and "async payload cap" in caplog.text
+
     def test_an_empty_work_set_is_not_a_discovery_request(self):
         from zagg.sweep_fleet import build_stage_event
 
