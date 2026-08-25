@@ -621,9 +621,11 @@ def stage_sweep_after_run(
     invokes exactly their ancestor chain). Fail-open like
     :func:`zagg.sweep.sweep_after_run` — every stage artifact is regenerable
     (D9), so a refused lease or a failed stage costs one later
-    ``python -m zagg.sweep --stages`` pass, never a wrong answer. Local
-    backend only for now (D8: the Lambda dispatcher never writes; the
-    worker-transport forward is the recorded open question (b)).
+    ``python -m zagg.sweep --stages`` pass, never a wrong answer. This is the
+    LOCAL dispatcher's chaining: it is also the worker, so D8 does not
+    constrain it. The Lambda dispatcher's twin is
+    :func:`zagg.sweep_fleet.run_stage_sweep_fleet` (issue #519) — same tuple
+    ordering, every write moved into ``mode="sweep"`` stage invokes.
 
     ``touch_policy`` is the run's ``output.touch`` (issue #501): the dispatcher
     reads the config to decide to chain at all, so it also passes the policy

@@ -762,3 +762,357 @@ class TestUnderCoverageHeals(object):
         )
         attrs = dict(_artifact(root, "1/all.zarr").attrs)["zagg_overview"]
         assert attrs["source_children"] == {"folded": 3, "missing": 0, "unreadable": 0}
+
+
+# ---------------------------------------------------------------------------
+# Phase 2: the dispatcher — tuple ordering, batching, the soft barrier.
+# ---------------------------------------------------------------------------
+
+
+class _FakeLambda:
+    """A Lambda client that executes the worker arm in-process.
+
+    ``drop`` names record basenames whose invoke is silently swallowed — a
+    lost Event invoke, which is what the soft barrier exists to survive.
+    """
+
+    def __init__(self, handler=None, drop=()):
+        self.handler = handler
+        self.drop = set(drop)
+        self.events = []
+        self.responses = []
+
+    def invoke(self, FunctionName, InvocationType, Payload):  # noqa: N803 (boto3 spelling)
+        event = json.loads(Payload)
+        self.events.append(event)
+        block = event["stage"]
+        name = (
+            FINISHER_RECORD_NAME
+            if block.get("role") == "finisher"
+            else stage_record_name(block["dispatch"], block["batch"])
+        )
+        if self.handler is not None and name not in self.drop:
+            self.responses.append(self.handler(event, None))
+        return {"StatusCode": 202}
+
+    def blocks(self):
+        return [e["stage"] for e in self.events]
+
+
+def _fleet(root, client, **kwargs):
+    from zagg.sweep_fleet import run_stage_sweep_fleet
+
+    return run_stage_sweep_fleet(
+        client,
+        "zagg-worker",
+        str(root),
+        [(morton_word(d), None) for d in LEAVES],
+        shard_order=3,
+        store_kwargs={},
+        poll_interval_s=0.01,
+        **kwargs,
+    )
+
+
+class TestDispatchNodes:
+    def test_nodes_are_the_work_set_ancestors_at_the_dispatch_order(self):
+        from zagg.sweep_fleet import dispatch_nodes
+
+        by_shard = {d: {None} for d in LEAVES}
+        assert dispatch_nodes(by_shard, 0) == ["-2", "1"]
+        assert dispatch_nodes(by_shard, 1) == ["-21", "11"]
+        assert dispatch_nodes(by_shard, 2) == ["-211", "111", "112"]
+        assert dispatch_nodes(by_shard, 3) == sorted(LEAVES)
+
+    def test_scope_filters_them(self):
+        from zagg.sweep_fleet import dispatch_nodes
+        from zagg.sweep_stages import normalize_scope
+
+        by_shard = {d: {None} for d in LEAVES}
+        assert dispatch_nodes(by_shard, 0, normalize_scope(["1111"])) == ["1"]
+
+    def test_every_node_sits_at_the_dispatch_order_the_worker_demands(self):
+        # The pairing the fold's node-order refusal depends on: what the
+        # dispatcher names is exactly what run_stage_worker will accept.
+        from zagg.hive import _decimal_order
+        from zagg.sweep_fleet import dispatch_nodes
+
+        by_shard = {d: {None} for d in LEAVES}
+        for dispatch in (0, 1, 2, 3):
+            assert all(_decimal_order(n) == dispatch for n in dispatch_nodes(by_shard, dispatch))
+
+
+class TestBatching:
+    def _block(self, dispatch=0):
+        return {
+            "role": "stage",
+            "run_id": "F",
+            "run_started": RUN_STARTED,
+            "dispatch": dispatch,
+            "tuple_width": 3,
+            "records_from": "s3://b/p.zarr.status/run-F",
+        }
+
+    def test_a_small_tuple_is_one_batch_carrying_every_leaf(self):
+        from zagg.sweep_fleet import pack_batches
+
+        by_shard = {d: {None} for d in LEAVES}
+        batches = pack_batches(
+            ["-2", "1"], by_shard, block=self._block(), store_path="s3://b/p.zarr"
+        )
+        assert len(batches) == 1
+        nodes, refs = batches[0]
+        assert nodes == ["-2", "1"] and len(refs) == len(LEAVES)
+
+    def test_every_node_lands_in_exactly_one_batch(self):
+        # 4^5 order-5 leaves under one base cell: enough that the leaf slices
+        # alone blow the async cap several times over.
+        from mortie import generate_morton_children
+
+        from zagg.grids.morton import morton_decimal
+        from zagg.sweep_fleet import pack_batches
+
+        leaves = [morton_decimal(int(w)) for w in generate_morton_children(morton_word("1"), 7)]
+        by_shard = {d: {None} for d in leaves}
+        nodes = sorted({d[:4] for d in leaves})
+        batches = pack_batches(
+            nodes, by_shard, block=self._block(3), store_path="s3://bucket/p.zarr"
+        )
+        assert len(batches) > 1
+        flat = [n for batch, _ in batches for n in batch]
+        assert flat == nodes  # every node once, in order
+
+    def test_batches_stay_under_the_async_cap(self):
+        from mortie import generate_morton_children
+
+        from zagg.grids.morton import morton_decimal
+        from zagg.runner import _ASYNC_PAYLOAD_CAP_BYTES
+        from zagg.sweep_fleet import build_stage_event, pack_batches
+
+        leaves = [morton_decimal(int(w)) for w in generate_morton_children(morton_word("1"), 7)]
+        by_shard = {d: {None} for d in leaves}
+        nodes = sorted({d[:4] for d in leaves})
+        block = self._block(3)
+        for batch, (batch_nodes, refs) in enumerate(
+            pack_batches(nodes, by_shard, block=block, store_path="s3://bucket/p.zarr")
+        ):
+            event = build_stage_event(
+                "s3://bucket/p.zarr", {**block, "nodes": batch_nodes, "batch": batch}, refs
+            )
+            assert len(json.dumps(event)) <= _ASYNC_PAYLOAD_CAP_BYTES
+
+    def test_one_overflowing_node_falls_back_to_discovery_not_truncation(self):
+        # One dispatch node whose own leaf slice cannot fit: the batch must be
+        # that node alone with NO inline leaves, so build_stage_event turns it
+        # into the discover form. Truncating the slice would silently under-fold.
+        from mortie import generate_morton_children
+
+        from zagg.grids.morton import morton_decimal
+        from zagg.sweep_fleet import build_stage_event, pack_batches
+
+        leaves = [morton_decimal(int(w)) for w in generate_morton_children(morton_word("1"), 8)]
+        by_shard = {d: {None} for d in leaves}
+        block = self._block(0)
+        batches = pack_batches(["1"], by_shard, block=block, store_path="s3://bucket/p.zarr")
+        assert batches == [(["1"], None)]
+        event = build_stage_event(
+            "s3://bucket/p.zarr", {**block, "nodes": ["1"], "batch": 0}, batches[0][1]
+        )
+        assert event["discover"] is True and "leaves" not in event
+
+    def test_an_empty_work_set_is_not_a_discovery_request(self):
+        from zagg.sweep_fleet import build_stage_event
+
+        # `leaves=[]` means "nothing to do", `leaves=None` means "derive it".
+        # Collapsing the two would turn a no-op invoke into a store-wide LIST.
+        event = build_stage_event("s3://b/p.zarr", self._block(), [])
+        assert event["leaves"] == [] and "discover" not in event
+
+
+class TestStageEvent:
+    def test_the_event_is_a_sweep_event_with_a_stage_block(self):
+        from zagg.sweep_fleet import build_stage_event
+
+        block = {"role": "stage", "run_id": "F", "dispatch": 0, "nodes": ["1"], "batch": 0}
+        event = build_stage_event("s3://b/p.zarr", block, [[1, None]])
+        assert event["mode"] == "sweep" and event["store_path"] == "s3://b/p.zarr"
+        assert event["stage"] == block and event["leaves"] == [[1, None]]
+        assert "output_credentials" not in event  # absent unless supplied
+
+    def test_output_credentials_ride_when_supplied(self):
+        from zagg.sweep_fleet import build_stage_event
+
+        creds = {"accessKeyId": "A", "secretAccessKey": "B"}
+        event = build_stage_event("s3://b/p.zarr", {"role": "stage"}, [], creds)
+        assert event["output_credentials"] == creds
+
+
+class TestFleetOrchestration:
+    def test_tuple_ordering_is_finest_first_with_the_finisher_last(self, tmp_path):
+        mod = _handler_module()
+        root = tmp_path / "s"
+        _stage_store(root)
+        client = _FakeLambda(mod.lambda_handler)
+        summary = _fleet(root, client, tuple_width=1)
+        assert [b.get("dispatch") for b in client.blocks()] == [2, 1, 0, None]
+        assert [b["role"] for b in client.blocks()] == ["stage"] * 3 + ["finisher"]
+        assert [s["dispatch_order"] for s in summary["stages"]] == [2, 1, 0]
+        assert summary["invokes"] == 4 and summary["finisher"]["landed"]
+
+    def test_the_run_identity_is_pinned_across_every_invoke(self, tmp_path):
+        mod = _handler_module()
+        root = tmp_path / "s"
+        _stage_store(root)
+        client = _FakeLambda(mod.lambda_handler)
+        summary = _fleet(root, client, tuple_width=1)
+        blocks = client.blocks()
+        assert {b["run_id"] for b in blocks} == {summary["run_id"]}
+        assert {b["records_from"] for b in blocks} == {summary["records_from"]}
+        # run_started is pinned ONCE: a worker computing its own would read a
+        # sibling's fresh stamp as a foreign sweep's.
+        assert {b["run_started"] for b in blocks if b["role"] == "stage"} == {
+            summary["run_started"]
+        }
+        assert summary["records_from"].endswith(f".status/run-{summary['run_id']}")
+
+    def test_the_ladder_lands_and_the_lease_is_released(self, tmp_path):
+        from zagg.hive import read_manifest
+        from zagg.sweep_lease import read_lease
+
+        mod = _handler_module()
+        root = tmp_path / "s"
+        _stage_store(root)
+        summary = _fleet(root, _FakeLambda(mod.lambda_handler), tuple_width=1)
+        assert (root / "1" / "all.zarr").exists() and (root / "-2" / "all.zarr").exists()
+        assert read_lease(str(root)) is None and summary["finisher"]["lease"]["released"]
+        entries = {e["node"]: e for e in read_manifest(str(root))["pyramid"]["overviews"]}
+        assert entries[0]["actuals"]["merges_from_raw"] == 2
+
+    def test_the_dispatcher_writes_nothing_itself(self, tmp_path):
+        # D8, pinned: with a client that only RECORDS invokes, the store is
+        # byte-for-byte what the fixture left — no lease, no records, no ladder.
+        root = tmp_path / "s"
+        _stage_store(root)
+        before = {p: p.read_bytes() for p in sorted(root.rglob("*")) if p.is_file()}
+        client = _FakeLambda(None)
+        summary = _fleet(root, client, tuple_width=1, barrier_timeout_s=0.05)
+        after = {p: p.read_bytes() for p in sorted(root.rglob("*")) if p.is_file()}
+        assert after == before
+        # Not even the lease: the FIRST stage worker creates the intent, never
+        # the dispatcher. (The barrier's LIST does materialize the local
+        # `.status` DIRECTORY -- a filesystem artifact of a local-path store,
+        # outside the store root; on s3:// a LIST creates no object.)
+        assert not (root / "sweep.lease.json").exists()
+        assert not list((tmp_path / "s.status").rglob("*.json"))
+        assert client.events and summary["invokes"] == 4
+        assert all(s["barrier_timed_out"] for s in summary["stages"])
+        assert summary["finisher"]["landed"] is False
+
+    def test_a_lost_invoke_times_the_barrier_out_and_the_run_proceeds(self, tmp_path):
+        # #381 point (6): the barrier is a scheduling preference. A dropped
+        # finest-tuple invoke must not stall the run — the coarser tuples still
+        # fire, the miss is recorded per artifact, and the next pass heals.
+        mod = _handler_module()
+        root = tmp_path / "s"
+        _stage_store(root)
+        client = _FakeLambda(mod.lambda_handler, drop={stage_record_name(0, 0)})
+        summary = _fleet(root, client, tuple_width=1, barrier_timeout_s=0.05)
+        assert [s["barrier_timed_out"] for s in summary["stages"]] == [False, False, True]
+        # The run did not stall: the finisher still fired and settled the store.
+        assert summary["finisher"]["landed"] and summary["finisher"]["lease"]["released"]
+        # The lost tuple's own level is simply absent -- a hole, not a wrong
+        # answer, and not recorded as coverage either.
+        assert (root / "1" / "1" / "all.zarr").exists()
+        assert not (root / "1" / "all.zarr").exists()
+        assert "0" not in summary["finisher"]["levels"]
+        # The heal: a second run with every invoke delivered closes the gap.
+        healed = _fleet(root, _FakeLambda(mod.lambda_handler), tuple_width=1)
+        assert not any(s["barrier_timed_out"] for s in healed["stages"])
+        attrs = dict(_artifact(root, "1/all.zarr").attrs)["zagg_overview"]
+        # At width 1 the order-0 node's children are the order-1 stage columns,
+        # and base cell '1' has exactly one ('11') — fully covered, no hole.
+        assert attrs["source_children"] == {"folded": 1, "missing": 0, "unreadable": 0}
+        assert healed["finisher"]["levels"]["0"]["source_children"]["missing"] == 0
+
+    def test_scope_narrows_the_fan_out(self, tmp_path):
+        from zagg.sweep_stages import normalize_scope
+
+        mod = _handler_module()
+        root = tmp_path / "s"
+        _stage_store(root)
+        _fleet(root, _FakeLambda(mod.lambda_handler), scope=normalize_scope(["1111"]))
+        assert (root / "1" / "all.zarr").exists()
+        assert not (root / "-2" / "all.zarr").exists()
+
+    def test_partitioned_leaf_slices_ride_with_their_own_nodes(self, tmp_path):
+        mod = _handler_module()
+        root = tmp_path / "s"
+        _stage_store(root)
+        client = _FakeLambda(mod.lambda_handler)
+        _fleet(root, client, tuple_width=1)
+        # The finest tuple's single batch carries every leaf; each node's slice
+        # is the leaves under it, so a batch's leaves are exactly its subtree's.
+        finest = next(e for e in client.events if e["stage"].get("dispatch") == 2)
+        from zagg.grids.morton import morton_decimal
+
+        decimals = {morton_decimal(int(k)) for k, _w in finest["leaves"]}
+        assert decimals == set(LEAVES)
+        assert all(any(d.startswith(n) for n in finest["stage"]["nodes"]) for d in decimals)
+
+
+class TestRunnerSeam:
+    def test_the_seam_forwards_and_reports(self, tmp_path, caplog):
+        import logging
+
+        from zagg.runner import _invoke_lambda_stage_sweep
+
+        mod = _handler_module()
+        root = tmp_path / "s"
+        _stage_store(root)
+        with caplog.at_level(logging.INFO, logger="zagg.runner"):
+            summary = _invoke_lambda_stage_sweep(
+                _FakeLambda(mod.lambda_handler),
+                "zagg-worker",
+                str(root),
+                [(morton_word(d), None) for d in LEAVES],
+                shard_order=3,
+                store_kwargs={},
+            )
+        assert summary is not None and summary["finisher"]["landed"]
+        assert "Dispatched staged sweep" in caplog.text
+
+    def test_the_seam_is_fail_open(self, tmp_path, caplog):
+        import logging
+
+        from zagg.runner import _invoke_lambda_stage_sweep
+
+        class Boom:
+            def invoke(self, **kwargs):
+                raise RuntimeError("throttled")
+
+        root = tmp_path / "s"
+        _stage_store(root)
+        with caplog.at_level(logging.WARNING, logger="zagg.runner"):
+            assert (
+                _invoke_lambda_stage_sweep(
+                    Boom(),
+                    "zagg-worker",
+                    str(root),
+                    [(morton_word(d), None) for d in LEAVES],
+                    shard_order=3,
+                    store_kwargs={},
+                )
+                is None
+            )
+        assert "staged sweep dispatch failed" in caplog.text
+
+    def test_the_tail_gate_is_the_stages_knob(self):
+        # The seam is reached only under `output.sweep: "stages"` — the same
+        # opt-in the local dispatcher reads (issue #384's recorded lean).
+        import inspect
+
+        from zagg import runner
+
+        src = inspect.getsource(runner._run_lambda)
+        assert 'config.output.get("sweep") == "stages"' in src
+        assert "_invoke_lambda_stage_sweep(" in src
