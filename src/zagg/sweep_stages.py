@@ -714,14 +714,24 @@ def merge_level_actuals(target: dict, incoming: dict) -> dict:
     return target
 
 
-def read_stage_records(records_from: str, *, store_kwargs: dict | None = None) -> list:
-    """Every stage record under a run's status prefix, sorted by object name.
+def read_stage_records(
+    records_from: str, *, run_id: str, store_kwargs: dict | None = None
+) -> list:
+    """One run's stage records under its status prefix, sorted by object name.
 
     Immediate children only (the ``rows_from_status`` precedent — the layout
     is flat), and the finisher's own record is excluded: it is written after
     this read, by the caller. Unparsable objects are skipped with a warning
     rather than aborting the finish; the resulting actuals under-report, which
     is exactly the recorded-and-healed under-coverage posture (#381 point (6)).
+
+    Records carrying another ``run_id`` are skipped. The prefix is run-scoped
+    (``run_status_prefix``), but object NAMES are ``stage-<dispatch>-<batch>``
+    and the batching is a dispatcher choice, not a store fact: a resumed run
+    under the same id with fewer or differently-numbered batches leaves the
+    dead attempt's higher-numbered records in place, and since
+    :func:`merge_level_actuals` ASSIGNS in sorted-name order those stale rows
+    would win the merge and land in the manifest permanently.
     """
     import obstore
 
@@ -741,10 +751,16 @@ def read_stage_records(records_from: str, *, store_kwargs: dict | None = None) -
         except Exception as e:
             logger.warning(f"stage sweep: unreadable stage record {key} ({e}); skipping")
             continue
-        if isinstance(record, dict) and record.get("spec") == STAGE_RECORD_SPEC:
-            out.append(record)
-        else:
+        if not (isinstance(record, dict) and record.get("spec") == STAGE_RECORD_SPEC):
             logger.warning(f"stage sweep: {key} is not a {STAGE_RECORD_SPEC} record; skipping")
+            continue
+        if record.get("run_id") != run_id:
+            logger.warning(
+                f"stage sweep: {key} belongs to run {record.get('run_id')!r}, not "
+                f"{run_id!r} (a prior attempt's debris under this prefix); skipping"
+            )
+            continue
+        out.append(record)
     return out
 
 
@@ -992,7 +1008,7 @@ def run_stage_finisher(
     by_shard, skipped = _normalize_leaves(leaves, shard_order)
     merged: dict = {}
     stage_rows: list = []
-    records = read_stage_records(records_from, store_kwargs=store_kwargs)
+    records = read_stage_records(records_from, run_id=run_id, store_kwargs=store_kwargs)
     if not records:
         raise ValueError(
             f"the finisher for run {run_id!r} found no stage records under "

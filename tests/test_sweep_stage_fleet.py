@@ -444,6 +444,40 @@ class TestFinisherArm:
         # 4 with both records (see above); the lost batch under-reports, loudly.
         assert summary["levels"]["0"]["source_children"]["folded"] == 3
 
+    def test_a_prior_attempts_record_cannot_win_the_merge(self, tmp_path):
+        # Same prefix, same id, a dead attempt's higher-numbered batch: the
+        # merge ASSIGNS in sorted-name order, so an unfiltered read would let
+        # ``stage-00-0009`` overwrite the fresh rows with stale counts.
+        root, prefix = tmp_path / "s", tmp_path / "status"
+        _stage_store(root)
+        self._sweep_all(root, prefix)
+        stale = json.loads((prefix / stage_record_name(0, 0)).read_text())
+        stale["run_id"] = "E"  # the earlier attempt
+        for level in stale["level_actuals"].values():
+            for row in level["children"].values():
+                row["folded"] = 99
+        (prefix / stage_record_name(0, 9)).write_text(json.dumps(stale))
+        summary = run_stage_finisher(
+            str(root),
+            [(morton_word(d), None) for d in LEAVES],
+            run_id="F",
+            records_from=str(prefix),
+        )
+        assert summary["stage_records"] == 2  # the stale one is not one of ours
+        assert summary["levels"]["0"]["source_children"]["folded"] == 4
+
+    def test_read_stage_records_filters_on_run_id(self, tmp_path):
+        from zagg.sweep_stages import read_stage_records
+
+        root, prefix = tmp_path / "s", tmp_path / "status"
+        _stage_store(root)
+        self._sweep_all(root, prefix)
+        stale = json.loads((prefix / stage_record_name(0, 0)).read_text())
+        stale["run_id"] = "E"
+        (prefix / stage_record_name(0, 9)).write_text(json.dumps(stale))
+        assert [r["batch"] for r in read_stage_records(str(prefix), run_id="F")] == [0, 1]
+        assert [r["run_id"] for r in read_stage_records(str(prefix), run_id="E")] == ["E"]
+
     def test_merge_is_idempotent_over_reinvoked_batches(self, tmp_path):
         # A re-fired batch (Event retry) rewrites its own record; the merge is
         # keyed per (artifact node, window) and ASSIGNED, so coverage counts
