@@ -611,13 +611,21 @@ own footprint.
 !!! warning "Only the spatial Lambda tail chains it"
     `output.sweep: "stages"` validates on any hive config, and every tail
     reads it as truthy and runs the rollup-families sweep — but only the
-    spatial Lambda tail goes on to dispatch the staged one. The raster path
-    (`data_source.reader: raster`) and the v2 `Run.dispatch` tail call the
-    families sweep and stop, with no warning at either seam, so the knob is
-    accepted and the ladder silently is not built. The operator's evidence is
-    an absent ladder hours later. On those paths, follow the run with an
-    explicit `run_stage_sweep_fleet` call (below) or a
-    `python -m zagg.sweep <root> --stages` pass.
+    spatial Lambda tail goes on to dispatch the staged one. The other two
+    unwired tails are not the same case:
+
+    * **raster** (`data_source.reader: raster`) does not chain, and is right
+      not to. A raster store is column-less by construction — there are no
+      digest columns to fold above the shard — so it declares no
+      `zagg-pyramid/2` ladder at all, and a stage worker handed one would
+      refuse it at the `/2` declaration gate (`zagg.sweep_stage.ladder_entries`)
+      rather than build anything. Nothing is missing from such a store.
+    * the v2 **`Run.dispatch`** tail is the real gap: a column-bearing `/2`
+      store dispatched through it accepts the knob, runs the families sweep
+      and silently builds no ladder, with no warning at the seam. The
+      operator's evidence is an absent ladder hours later. Follow such a run
+      with an explicit `run_stage_sweep_fleet` call (below) or a
+      `python -m zagg.sweep <root> --stages` pass.
 
 Ad hoc, drive `zagg.sweep_fleet.run_stage_sweep_fleet` with a boto3 Lambda
 client:
