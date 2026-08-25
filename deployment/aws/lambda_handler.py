@@ -158,7 +158,12 @@ end of run, like coverage mode; also invocable ad hoc):
                                   #   decimals (role="stage")
           "batch": int,           # which batch of that tuple this is; names
                                   #   the record object (role="stage")
-          "tuple_width": int,     # optional, default 3
+          "tuple_width": int,     # optional; defaults to
+                                  #   zagg.sweep_stage.DEFAULT_TUPLE_WIDTH, the one
+                                  #   source the CLI path uses too -- a copied
+                                  #   literal here would give the fleet a different
+                                  #   tuple grouping, hence a different set of
+                                  #   stage columns, on the same store
           "partition": {"index": int, "of": int},  # optional, recorded only
           "lease_ttl_s": int,     # optional
           "records_from": str,    # the run's status prefix (a store SIBLING,
@@ -1398,6 +1403,7 @@ def _handle_stage_sweep(
     fail-open at the dispatcher's call site (every stage artifact is
     regenerable, D9, and ``python -m zagg.sweep --stages`` is the backstop).
     """
+    from zagg.sweep_stage import DEFAULT_TUPLE_WIDTH
     from zagg.sweep_stages import run_stage_finisher, run_stage_worker
 
     block = event["stage"]
@@ -1427,7 +1433,7 @@ def _handle_stage_sweep(
                 dispatch=int(block["dispatch"]),
                 nodes=block.get("nodes") or [],
                 batch=int(block.get("batch", 0)),
-                tuple_width=int(block.get("tuple_width", 3)),
+                tuple_width=int(block.get("tuple_width", DEFAULT_TUPLE_WIDTH)),
                 partition=block.get("partition"),
                 records_from=block.get("records_from"),
                 lease_ttl_s=block.get("lease_ttl_s"),

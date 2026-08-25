@@ -657,6 +657,29 @@ class TestHandlerStageArm:
         assert "level_actuals" not in stage and "result" not in stage
         assert stage["error"] is None and failed["ok"] is False
 
+    def test_the_wire_default_tuple_width_is_the_single_source(self, tmp_path, monkeypatch):
+        # ``stage_tuples``' grouping decides which orders dispatch, hence which
+        # nodes get a stage column at all; a literal here would drift from the
+        # CLI path the moment the constant moves.
+        import zagg.sweep_stage as sweep_stage
+        import zagg.sweep_stages as sweep_stages
+
+        mod = _handler_module()
+        root = tmp_path / "s"
+        _stage_store(root)
+        seen = {}
+        real = sweep_stages.run_stage_worker
+
+        def _spy(*args, **kwargs):
+            seen.update(kwargs)
+            return real(*args, **kwargs)
+
+        monkeypatch.setattr(sweep_stages, "run_stage_worker", _spy)
+        block = _stage_block(0, ["1"])
+        del block["tuple_width"]
+        assert mod.lambda_handler(_event(root, block), None)["statusCode"] == 200
+        assert seen["tuple_width"] == sweep_stage.DEFAULT_TUPLE_WIDTH
+
     def test_the_families_arm_is_untouched_without_a_stage_block(self, tmp_path):
         mod = _handler_module()
         root = tmp_path / "s"
