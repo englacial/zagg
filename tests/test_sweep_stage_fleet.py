@@ -1451,10 +1451,21 @@ class TestRunnerSeam:
 # The merge-source law (espg ruling 2026-08-09, issue #384) makes the /2 build
 # a fixed function of the store: independent of tuple grouping, of
 # partitioning, and of EXECUTOR. So the fleet-built ladder must be
-# byte-identical to the CLI-built ladder on the same store, and that is the
-# whole acceptance for this transport — any difference is a transport bug, not
-# a tolerance. Fully offline: the Lambda client is mocked to run the worker arm
-# in-process, so no AWS is touched.
+# byte-identical to the CLI-built ladder on the same store AND the same work
+# set, and that is the whole acceptance for this transport — any difference is
+# a transport bug, not a tolerance.
+#
+# The work-set precondition is not a hedge, it is the one documented
+# divergence: the dispatcher takes its nodes from the work set alone (an
+# invoke-only role cannot read the root ``coverage.moc`` — D8), while the
+# in-process pass unions the work set with that MOC. Both drivers this
+# transport actually has — ``stage_sweep_after_run`` and a discovery-driven
+# run — hand it a work set that already covers the MOC's leaves, so the
+# precondition holds by construction, and the MOC-only-subtree arm below pins
+# what happens when it does not.
+#
+# Fully offline: the Lambda client is mocked to run the worker arm in-process,
+# so no AWS is touched.
 # ---------------------------------------------------------------------------
 
 
@@ -1774,6 +1785,40 @@ class TestByteIdentityOracle:
 
         cli, fleet, _ = self._both_arms(tmp_path, fields=BOTH_CHANNEL_FIELDS)
         _assert_identical(cli, fleet)
+
+    def test_a_moc_only_subtree_is_the_one_documented_difference(self, tmp_path):
+        # The acceptance's precondition, pinned by name so a future change to
+        # either executor's node derivation cannot move it silently. A leaf on
+        # disk and in the root MOC but NOT in the run's work set is folded by
+        # the in-process pass (work set ∪ MOC) and not by the dispatcher (work
+        # set alone, D8). By design — #381 point (11): the run's shard set IS
+        # the touched shardmap, and the next pass heals the rest.
+        from zagg.hive import build_root_coverage, write_root_coverage
+
+        mod = _handler_module()
+        root = tmp_path / "s"
+        _stage_store(root)
+        _write_leaf(root, "3111", 7)
+        write_root_coverage(
+            str(root), build_root_coverage([morton_word(d) for d in LEAVES + ["3111"]], 3)
+        )
+        _write_discovery_record(root)  # the work set stays LEAVES
+        base = _snapshot(root)
+        _cli_sweep(root)
+        cli = _artifacts(_snapshot(root))
+        _restore(root, base)
+        _fleet(root, _FakeLambda(mod.lambda_handler))
+        fleet = _artifacts(_snapshot(root))
+
+        # Exactly the MOC-only subtree is missing, and nothing else is:
+        assert not set(fleet) - set(cli)
+        missing = set(cli) - set(fleet)
+        assert missing and {rel.split("/")[0] for rel in missing} == {"3"}
+        # ...and every object BOTH built is byte-identical, bar the manifest,
+        # whose per-level actuals count the folds each executor performed.
+        from zagg.hive import MANIFEST_NAME
+
+        assert [r for r in sorted(fleet) if cli[r] != fleet[r]] == [MANIFEST_NAME]
 
     def test_the_oracle_detects_a_divergent_build(self, tmp_path):
         # Negative control: an acceptance test that cannot fail proves nothing.
