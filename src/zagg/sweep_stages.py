@@ -135,6 +135,7 @@ def sweep_stage_pass(
     on_stage=None,
     on_node=None,
     level_actuals: dict | None = None,
+    only_dispatch: int | None = None,
 ) -> dict:
     """One staged pass over the dirty set: every tuple, finest first.
 
@@ -151,6 +152,14 @@ def sweep_stage_pass(
     an o9 store is ~49k dispatch nodes), so a per-tuple-only beat would let
     the holder's own lease expire mid-tuple (review finding). Returns the
     pass summary with per-stage rows.
+
+    ``only_dispatch`` restricts the pass to the ONE tuple dispatching at that
+    order — what a fleet stage worker runs (issue #519). The in-process driver
+    leaves it ``None`` and walks every tuple finest-first; the fleet transport
+    walks the same tuples, one invoke fan-out per tuple, so the two differ in
+    grouping alone (the merge-source law: grouping changes no bytes). An order
+    that dispatches no tuple refuses BY NAME rather than sweeping nothing — a
+    mistyped dispatch order must not read as a clean no-op.
     """
     from zagg.hive import _utcnow
     from zagg.store import open_object_store
@@ -191,7 +200,17 @@ def sweep_stage_pass(
         level_actuals = {}  # callers may pass one to accumulate across passes
     from zagg.windows import SCHEDULE_NONE_TOKEN
 
-    for stage in stage_tuples(shard_order, tuple_width=tuple_width):
+    schedule = stage_tuples(shard_order, tuple_width=tuple_width)
+    if only_dispatch is not None:
+        picked = [t for t in schedule if int(t["dispatch"]) == int(only_dispatch)]
+        if not picked:
+            raise ValueError(
+                f"no stage tuple dispatches at order {only_dispatch} (shard_order "
+                f"{shard_order}, tuple_width {tuple_width}); the dispatch orders are "
+                f"{[t['dispatch'] for t in schedule]}"
+            )
+        schedule = picked
+    for stage in schedule:
         t0 = time.perf_counter()
         counts = {
             "written": 0,
@@ -621,3 +640,330 @@ def stage_sweep_after_run(
     except Exception as e:
         logger.warning(f"post-run staged sweep failed (fail-open, D9 — regenerable): {e}")
         return None
+
+
+# ---------------------------------------------------------------------------
+# The FLEET worker arm (issue #519): one Lambda invoke's share of a staged
+# sweep. :func:`run_stage_sweep` above is the same run done in one process;
+# these two entry points are what a ``mode="sweep"`` event's ``stage`` block
+# reaches, and the dispatcher that fans them out lives in
+# :mod:`zagg.sweep_fleet` (D8: it invokes and polls, it never writes).
+# ---------------------------------------------------------------------------
+
+#: Envelope version of a stage invoke's record — the fleet's soft-barrier
+#: signal (the dispatcher polls for it) AND its aggregation channel (the
+#: finisher reads the run's records to rebuild the per-level actuals the
+#: in-process driver accumulates in memory).
+STAGE_RECORD_SPEC = "zagg-sweep-stage-record/1"
+
+#: The finisher's own record basename — the last object of a fleet staged run.
+FINISHER_RECORD_NAME = "finisher.json"
+
+
+def stage_record_name(dispatch: int, batch: int) -> str:
+    """One stage invoke's record basename: ``stage-<dispatch>-<batch>.json``.
+
+    Zero-padded so a plain lexicographic listing reads finest-tuple-last in
+    dispatch order, and deterministic from ``(dispatch, batch)`` alone — the
+    dispatcher names every object it will poll for before it fires a single
+    invoke, so the soft barrier needs no listing and no worker response.
+    """
+    return f"stage-{int(dispatch):02d}-{int(batch):04d}.json"
+
+
+def _jsonable_actuals(level_actuals: dict) -> dict:
+    """The raw per-artifact actuals map as JSON (int level keys -> strings)."""
+    return {
+        str(int(k)): {
+            "cells": int(v["cells"]),
+            "regime": v["regime"],
+            "merges_from_raw": int(v["merges_from_raw"]),
+            "children": {str(t): dict(row) for t, row in v["children"].items()},
+        }
+        for k, v in level_actuals.items()
+    }
+
+
+def merge_level_actuals(target: dict, incoming: dict) -> dict:
+    """Fold one worker's raw actuals into the run's, in place; the target.
+
+    The fleet's answer to the in-process ``level_actuals`` dict. Rows are
+    keyed per ``(artifact node, window)`` and ASSIGNED, never added
+    (:func:`zagg.sweep_stage._accumulate_actuals`), so merging across workers
+    is a plain dict update: a coarse ancestor two batches both visited
+    contributes its row ONCE, exactly as a partitioned in-process run
+    re-visiting it does. ``cells``/``regime``/``merges_from_raw`` are
+    first-wins per level, mirroring the in-process ``setdefault`` — they are
+    derived per level (:func:`zagg.sweep_stage.classify_level`), so every
+    worker computes the same values and the tie never has to be broken.
+    """
+    for k, entry in (incoming or {}).items():
+        cur = target.setdefault(
+            int(k),
+            {
+                "cells": int(entry["cells"]),
+                "regime": entry["regime"],
+                "merges_from_raw": int(entry["merges_from_raw"]),
+                "children": {},
+            },
+        )
+        for node_window, row in (entry.get("children") or {}).items():
+            cur["children"][str(node_window)] = {
+                name: int(row.get(name) or 0) for name in ("folded", "missing", "unreadable")
+            }
+    return target
+
+
+def read_stage_records(records_from: str, *, store_kwargs: dict | None = None) -> list:
+    """Every stage record under a run's status prefix, sorted by object name.
+
+    Immediate children only (the ``rows_from_status`` precedent — the layout
+    is flat), and the finisher's own record is excluded: it is written after
+    this read, by the caller. Unparsable objects are skipped with a warning
+    rather than aborting the finish; the resulting actuals under-report, which
+    is exactly the recorded-and-healed under-coverage posture (#381 point (6)).
+    """
+    import obstore
+
+    from zagg.store import open_object_store
+
+    store = open_object_store(records_from, **dict(store_kwargs or {}))
+    listing = obstore.list_with_delimiter(store)
+    keys = sorted(
+        meta["path"].rsplit("/", 1)[-1]
+        for meta in listing["objects"]
+        if meta["path"].rsplit("/", 1)[-1].startswith("stage-") and meta["path"].endswith(".json")
+    )
+    out = []
+    for key in keys:
+        try:
+            record = json.loads(bytes(obstore.get(store, key).bytes()))
+        except Exception as e:
+            logger.warning(f"stage sweep: unreadable stage record {key} ({e}); skipping")
+            continue
+        if isinstance(record, dict) and record.get("spec") == STAGE_RECORD_SPEC:
+            out.append(record)
+        else:
+            logger.warning(f"stage sweep: {key} is not a {STAGE_RECORD_SPEC} record; skipping")
+    return out
+
+
+def _put_stage_record(records_from: str, name: str, record: dict, store_kwargs: dict) -> str:
+    """PUT one stage record under the run's status prefix; its full URL.
+
+    Deliberately NOT fail-open, unlike the store-root run record: this object
+    is the transport, not telemetry about it. The dispatcher's soft barrier
+    polls for it and the finisher rebuilds the manifest's per-level actuals
+    from it, so swallowing a failed PUT would silently under-report coverage
+    in the one place #381 point (7) exists to record it. The artifacts are
+    already written and every stage is idempotent (skip-if-current), so the
+    cost of raising is one re-invoke, not one re-fold.
+    """
+    import obstore
+
+    from zagg.store import open_object_store
+
+    obstore.put(
+        open_object_store(records_from, **store_kwargs),
+        name,
+        json.dumps(record, indent=1).encode(),
+    )
+    return f"{records_from.rstrip('/')}/{name}"
+
+
+def run_stage_worker(
+    store_root: str,
+    leaves,
+    *,
+    run_id: str,
+    run_started: str,
+    dispatch: int,
+    nodes,
+    batch: int = 0,
+    tuple_width: int = DEFAULT_TUPLE_WIDTH,
+    partition: dict | None = None,
+    records_from: str | None = None,
+    lease_ttl_s: int | None = None,
+    store_kwargs: dict | None = None,
+) -> dict:
+    """One fleet stage worker: this invoke's dispatch nodes, one tuple.
+
+    The worker half of the issue #519 transport. Everything the in-process
+    driver does per tuple happens here — lease admission, the run-id skip
+    keys, the :class:`zagg.sweep_stage.ForeignSweepError` backstop, the fold,
+    every store write (D8 intact: the dispatcher only invokes and polls) —
+    restricted to ``nodes`` (this invoke's share of the tuple's dispatch
+    nodes, spelled as decimals) at the ``dispatch`` order.
+
+    ``nodes`` reaches the pass as the ordinary ``scope`` MOC, so a worker
+    folds exactly the dispatch nodes it was handed and no others. Dispatch
+    nodes at one order own disjoint subtrees and a tuple's folds read only
+    columns one tuple FINER, so the split across invokes is free of
+    cross-worker dependencies — the same disjointness the in-process pass
+    relies on, which is why the merge-source law makes the fleet build
+    byte-identical to the CLI build.
+
+    Admission is the ordinary per-store lease. Every worker of a run calls
+    :func:`zagg.sweep_lease.acquire_lease` with the SAME run id, so the first
+    one creates the intent and the rest read their own back (the idempotent
+    re-admission); a live FOREIGN intent refuses this invoke by name. The
+    lease scope is left ``None`` deliberately: the lease is store-granular by
+    correctness, and recording one batch's node list would record whichever
+    worker happened to win the create race. Nobody releases it here — release
+    is the finisher's final act (:func:`run_stage_finisher`), so a run that
+    dies mid-fan-out leaves a claimable intent, not an open store.
+
+    ``records_from`` is the run's status prefix; the record lands there under
+    :func:`stage_record_name` and is both the dispatcher's soft-barrier signal
+    and the finisher's aggregation input. Returns that record.
+    """
+    from zagg.hive import MANIFEST_NAME, read_manifest
+    from zagg.sweep import _normalize_leaves
+    from zagg.sweep_lease import DEFAULT_TTL_S, acquire_lease, heartbeat_lease
+
+    t0 = time.perf_counter()
+    store_kwargs = dict(store_kwargs or {})
+    nodes = [str(n) for n in nodes]
+    manifest = read_manifest(store_root, **store_kwargs)
+    if manifest is None:
+        raise ValueError(f"no {MANIFEST_NAME} at {store_root} — not a hive store root")
+    shard_order = int(manifest["shard_order"])
+    ladder_entries(manifest.get("pyramid") or {}, shard_order)  # loud /2 gate
+    by_shard, skipped = _normalize_leaves(leaves, shard_order)
+    scope = normalize_scope(nodes) if nodes else None
+    ttl_s = int(lease_ttl_s or DEFAULT_TTL_S)
+    lease = acquire_lease(
+        store_root, run_id=run_id, scope=None, ttl_s=ttl_s, store_kwargs=store_kwargs
+    )
+    last_beat = [time.monotonic()]
+
+    def _maybe_beat(*_args):
+        if time.monotonic() - last_beat[0] >= ttl_s / 3:
+            heartbeat_lease(store_root, lease, store_kwargs=store_kwargs)
+            last_beat[0] = time.monotonic()
+
+    level_actuals: dict = {}
+    summary = sweep_stage_pass(
+        store_root,
+        manifest,
+        by_shard,
+        scope=scope,
+        tuple_width=tuple_width,
+        run_id=run_id,
+        run_started=run_started,
+        store_kwargs=store_kwargs,
+        on_stage=_maybe_beat,
+        on_node=_maybe_beat,
+        level_actuals=level_actuals,
+        only_dispatch=int(dispatch),
+    )
+    rows = summary["stages"]
+    if partition is not None:
+        for row in rows:
+            row["partition"] = dict(partition)
+    record = {
+        "spec": STAGE_RECORD_SPEC,
+        "role": "stage",
+        "run_id": run_id,
+        "run_started": run_started,
+        "dispatch": int(dispatch),
+        "batch": int(batch),
+        "tuple_width": int(tuple_width),
+        "n_nodes": len(nodes),
+        "n_leaves": sum(len(w) for w in by_shard.values()),
+        "skipped_leaves": skipped,
+        "partition": None if partition is None else dict(partition),
+        "stages": rows,
+        "level_actuals": _jsonable_actuals(level_actuals),
+        "duration_s": time.perf_counter() - t0,
+    }
+    if summary.get("root_moc_stale"):
+        record["root_moc_stale"] = True
+    if records_from:
+        record["record"] = _put_stage_record(
+            records_from, stage_record_name(dispatch, batch), record, store_kwargs
+        )
+    return record
+
+
+def run_stage_finisher(
+    store_root: str,
+    leaves,
+    *,
+    run_id: str,
+    records_from: str | None = None,
+    touch_policy: str = "auto",
+    store_kwargs: dict | None = None,
+    record: bool = True,
+) -> dict:
+    """The fleet's finisher invoke: aggregate the run's records, then finish.
+
+    The counterpart to the tail of :func:`run_stage_sweep`. It rebuilds the
+    per-level actuals the in-process driver carries in memory by reading the
+    run's stage records (:func:`read_stage_records`) instead — which is why
+    the dispatcher never has to ship them and never has to hold them — then
+    runs the ordinary :func:`run_finisher` (root MOC, manifest actuals,
+    ``aggregation.yaml`` touch, lease release LAST), writes the store-root
+    run record, and finally its own :data:`FINISHER_RECORD_NAME` record: the
+    one object that says a fleet staged run completed, and the last thing the
+    dispatcher polls for.
+
+    Ordering is the local ordering. The lease is released inside
+    :func:`run_finisher`, before the two records land, exactly as the CLI path
+    releases it before ``_write_stage_record``: the records are the run's
+    telemetry, not part of its admission.
+    """
+    from zagg.hive import MANIFEST_NAME, read_manifest
+    from zagg.sweep import _normalize_leaves
+    from zagg.sweep_lease import release_lease
+
+    t0 = time.perf_counter()
+    store_kwargs = dict(store_kwargs or {})
+    manifest = read_manifest(store_root, **store_kwargs)
+    if manifest is None:
+        raise ValueError(f"no {MANIFEST_NAME} at {store_root} — not a hive store root")
+    shard_order = int(manifest["shard_order"])
+    ladder_entries(manifest.get("pyramid") or {}, shard_order)  # loud /2 gate
+    by_shard, skipped = _normalize_leaves(leaves, shard_order)
+    merged: dict = {}
+    stage_rows: list = []
+    records = read_stage_records(records_from, store_kwargs=store_kwargs) if records_from else []
+    for row in records:
+        merge_level_actuals(merged, row.get("level_actuals") or {})
+        stage_rows.extend(row.get("stages") or [])
+    aggregated = aggregate_actuals(merged)
+    summary: dict = {
+        "run_id": run_id,
+        "store_root": store_root,
+        "shard_order": shard_order,
+        "transport": "lambda",
+        "n_leaves": sum(len(w) for w in by_shard.values()),
+        "skipped_leaves": skipped,
+        "stage_records": len(records),
+        "stages": stage_rows,
+        "levels": {str(k): v for k, v in sorted(aggregated.items(), reverse=True)},
+    }
+    if any(r.get("root_moc_stale") for r in records):
+        summary["root_moc_stale"] = True
+    summary["finisher"] = run_finisher(
+        store_root,
+        manifest,
+        by_shard,
+        aggregated,
+        run_id=run_id,
+        store_kwargs=store_kwargs,
+        release=lambda: release_lease(store_root, run_id=run_id, store_kwargs=store_kwargs),
+        touch_policy=touch_policy,
+    )
+    summary["lease"] = {"released": bool(summary["finisher"].get("lease_released"))}
+    summary["duration_s"] = time.perf_counter() - t0
+    if record:
+        summary["record"] = _write_stage_record(store_root, summary, store_kwargs)
+    if records_from:
+        summary["finisher_record"] = _put_stage_record(
+            records_from,
+            FINISHER_RECORD_NAME,
+            {"spec": STAGE_RECORD_SPEC, "role": "finisher", **summary},
+            store_kwargs,
+        )
+    return summary
