@@ -602,10 +602,24 @@ intent, not an open store.
 
 ### Running it
 
-Opt in on a Lambda-backed run with `output.sweep: "stages"` — the same knob
-the local dispatcher reads — and the runner tail chains the fleet sweep after
-the rollup-families leg, auto-scoped to the run's own footprint. Ad hoc, drive
-`zagg.sweep_fleet.run_stage_sweep_fleet` with a boto3 Lambda client:
+Opt in with `output.sweep: "stages"` — the same knob the spatial local
+dispatcher reads — and the **spatial** Lambda tail (`runner._run_lambda`)
+chains the fleet sweep after the rollup-families leg, auto-scoped to the run's
+own footprint.
+
+!!! warning "Only the spatial Lambda tail chains it"
+    `output.sweep: "stages"` validates on any hive config, and every tail
+    reads it as truthy and runs the rollup-families sweep — but only the
+    spatial Lambda tail goes on to dispatch the staged one. The raster path
+    (`data_source.reader: raster`) and the v2 `Run.dispatch` tail call the
+    families sweep and stop, with no warning at either seam, so the knob is
+    accepted and the ladder silently is not built. The operator's evidence is
+    an absent ladder hours later. On those paths, follow the run with an
+    explicit `run_stage_sweep_fleet` call (below) or a
+    `python -m zagg.sweep <root> --stages` pass.
+
+Ad hoc, drive `zagg.sweep_fleet.run_stage_sweep_fleet` with a boto3 Lambda
+client:
 
 ```python
 import boto3
