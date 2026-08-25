@@ -543,6 +543,41 @@ class TestFinisherArm:
         assert [r["batch"] for r in read_stage_records(str(prefix), run_id="F")] == [0, 1]
         assert [r["run_id"] for r in read_stage_records(str(prefix), run_id="E")] == ["E"]
 
+    def test_an_expired_barrier_is_recorded_in_the_run_record(self, tmp_path):
+        # The dispatcher is the only party that knows it stopped waiting, and
+        # its log does not outlive the process. A barrier that expired on a
+        # QUEUED invoke lets this finisher aggregate before its late siblings
+        # write, so the per-level actuals can be short — the run record has to
+        # say so (review finding).
+        root, prefix = tmp_path / "s", tmp_path / "status"
+        _stage_store(root)
+        self._sweep_all(root, prefix)
+        summary = run_stage_finisher(
+            str(root),
+            [(morton_word(d), None) for d in LEAVES],
+            run_id="F",
+            records_from=str(prefix),
+            barrier_timed_out=True,
+        )
+        assert summary["barrier_timed_out"] is True
+        assert json.loads((root / summary["record"]).read_text())["barrier_timed_out"] is True
+        assert json.loads((prefix / FINISHER_RECORD_NAME).read_text())["barrier_timed_out"] is True
+
+    def test_a_clean_run_records_the_barrier_as_intact(self, tmp_path):
+        root, prefix = tmp_path / "s", tmp_path / "status"
+        _stage_store(root)
+        self._sweep_all(root, prefix)
+        summary = run_stage_finisher(
+            str(root),
+            [(morton_word(d), None) for d in LEAVES],
+            run_id="F",
+            records_from=str(prefix),
+        )
+        # Present and false, never absent: a reader must not have to guess
+        # whether an old finisher simply did not record it.
+        assert summary["barrier_timed_out"] is False
+        assert json.loads((root / summary["record"]).read_text())["barrier_timed_out"] is False
+
     def test_merge_is_idempotent_over_reinvoked_batches(self, tmp_path):
         # A re-fired batch (Event retry) rewrites its own record; the merge is
         # keyed per (artifact node, window) and ASSIGNED, so coverage counts
@@ -644,6 +679,29 @@ class TestHandlerStageArm:
         assert body["lease_released"] and body["stage_records"] == 1
         assert body["record"].startswith("sweep_stats_")
         assert body["stage_record"].endswith(FINISHER_RECORD_NAME)
+
+    def test_the_dispatchers_barrier_verdict_reaches_the_finisher(self, tmp_path):
+        # End to end over the wire: sweep_fleet puts barrier_timed_out on the
+        # finisher block, the handler forwards it, the run record keeps it.
+        mod = _handler_module()
+        root, prefix = tmp_path / "s", tmp_path / "status"
+        _stage_store(root)
+        mod.lambda_handler(_event(root, _stage_block(0, ["1", "-2"], records_from=prefix)), None)
+        response = mod.lambda_handler(
+            _event(
+                root,
+                {
+                    "role": "finisher",
+                    "run_id": "F",
+                    "records_from": str(prefix),
+                    "barrier_timed_out": True,
+                },
+            ),
+            None,
+        )
+        assert response["statusCode"] == 200
+        record = json.loads(response["body"])["record"]
+        assert json.loads((root / record).read_text())["barrier_timed_out"] is True
 
     def test_discovery_transport_is_shared_with_the_families_arm(self, tmp_path):
         import pandas as pd

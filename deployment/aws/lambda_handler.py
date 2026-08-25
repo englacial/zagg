@@ -1422,6 +1422,11 @@ def _handle_stage_sweep(
                 records_from=block.get("records_from"),
                 touch_policy=block.get("touch_policy", "auto"),
                 lease_ttl_s=block.get("lease_ttl_s"),
+                # The dispatcher's soft-barrier verdict (issue #519 review): it
+                # is the only party that knows whether it stopped waiting, the
+                # finisher cannot tell, and the run record is the only durable
+                # place that can say the per-level actuals may be short.
+                barrier_timed_out=bool(block.get("barrier_timed_out")),
                 store_kwargs=store_kwargs,
             )
         elif role == "stage":

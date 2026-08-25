@@ -555,7 +555,7 @@ staged arm, reusing that event's credential resolution and its
 | `lease_ttl_s` | both | Optional lease TTL override |
 | `records_from` | both | **Required.** The run's status prefix — a store **sibling** (`<store>.status/run-<run_id>`, `zagg.client_transport.run_status_prefix`). Each invoke PUTs its record there; the finisher reads them back. Both roles refuse by name without it: a stage worker that wrote no record would fold correctly and then be indistinguishable from a lost invoke, and a finisher without the records has no per-level actuals at all. A finisher also refuses a prefix holding zero records (a *partial* set is fine — under-coverage is recorded and self-heals) |
 | `touch_policy` | finisher | Optional (defaults to `"auto"`); the `output.touch` declaration (issue #501) governing the `aggregation.yaml` touch |
-| `barrier_timed_out` | finisher | Sent by the dispatcher when any tuple's barrier expired. **Currently inert**: `run_stage_finisher` takes no such parameter and the handler does not forward it, so the short-actuals warning lives only on the dispatcher's own run summary, not in a durable record |
+| `barrier_timed_out` | finisher | Optional, defaults `false`. Sent by the dispatcher when any tuple's barrier expired; the finisher records it in the store-root run record and in `finisher.json`, so the durable record says the per-level actuals may be short |
 
 Every store write stays worker-side. The dispatcher only invokes and polls.
 
@@ -586,13 +586,14 @@ the 900 s function timeout: queue drain, one throttle redelivery, and the
 slowest worker's own run), and the *sum* of them by `total_barrier_budget_s`
 (default 7,200 s), so the tail's worst case is a constant rather than a
 function of the store's order. Past the total, each remaining barrier degrades
-to a single check. An expiry is recorded as `barrier_timed_out` on the run
-summary — and only there: the dispatcher does put the key on the finisher's
-stage block, but the handler does not forward it and `run_stage_finisher`
-takes no such parameter, so nothing durable records that the run's actuals may
-be short. Watch the dispatcher's own log for it. When the invoke was merely
-*queued* rather than lost, its late artifacts are still correct — the cost is
-that the finisher's per-level actuals under-report.
+to a single check. An expiry is recorded as `barrier_timed_out` on the
+dispatcher's run summary, forwarded on the finisher's stage block, and stamped
+into the store-root run record (`sweep_stats_{ts}_stages.json`) and
+`finisher.json` — so a run whose actuals may be short says so durably, not
+only in a dispatcher log that dies with the process. When the invoke was merely
+*queued* rather than lost, its late artifacts are still correct — a same-run
+sibling is not foreign, so nothing aborts — and the cost is exactly that the
+finisher's per-level actuals under-report until the next pass heals them.
 
 Admission is the ordinary per-store sweep lease (`sweep.lease.json`). The
 *first* stage worker creates the intent; every sibling of the same run reads

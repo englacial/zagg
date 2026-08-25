@@ -953,6 +953,7 @@ def run_stage_finisher(
     run_id: str,
     records_from: str | None = None,
     touch_policy: str = "auto",
+    barrier_timed_out: bool = False,
     lease_ttl_s: int | None = None,
     store_kwargs: dict | None = None,
     record: bool = True,
@@ -968,6 +969,10 @@ def run_stage_finisher(
     run record, and finally its own :data:`FINISHER_RECORD_NAME` record: the
     one object that says a fleet staged run completed, and the last thing the
     dispatcher polls for.
+
+    ``barrier_timed_out`` is the dispatcher's verdict on its own soft barrier,
+    threaded in so the RUN RECORD says the per-level actuals may be short — see
+    where it is recorded below.
 
     ``records_from`` is REQUIRED and the prefix must list at least one stage
     record; both refuse by name. A finisher only ever fires after a fan-out,
@@ -1050,6 +1055,20 @@ def run_stage_finisher(
     }
     if any(r.get("root_moc_stale") for r in records):
         summary["root_moc_stale"] = True
+    # The dispatcher's soft-barrier verdict, made DURABLE (review finding). A
+    # barrier that expired on a QUEUED rather than a lost invoke lets this
+    # finisher aggregate before its late siblings have written: their artifacts
+    # are still correct (a same-run sibling is not foreign, so nothing aborts),
+    # but the per-level actuals recorded below can be short. Without this the
+    # only witness is the dispatcher's log, which does not outlive the process
+    # — and the manifest would claim coverage it did not observe.
+    summary["barrier_timed_out"] = bool(barrier_timed_out)
+    if barrier_timed_out:
+        logger.warning(
+            f"stage sweep {run_id}: the dispatcher reported an expired barrier — the "
+            f"per-level actuals recorded from {len(records)} stage record(s) may "
+            "under-report; the next pass heals them"
+        )
     summary["finisher"] = run_finisher(
         store_root,
         manifest,
