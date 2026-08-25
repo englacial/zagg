@@ -780,12 +780,16 @@ def _put_stage_record(records_from: str, name: str, record: dict, store_kwargs: 
     in the one place #381 point (7) exists to record it. The artifacts are
     already written and every stage is idempotent (skip-if-current), so the
     cost of raising is one re-invoke, not one re-fold.
+
+    Routed through :func:`zagg.store.put_object`, never raw ``obstore.put``
+    (issue #522): the record lands under the run's status prefix, which on a
+    published store sits inside the same grant as the store itself, so a write
+    that skipped the canned-ACL handle would publish an object Source
+    Cooperative cannot manage — and say nothing about it.
     """
-    import obstore
+    from zagg.store import open_object_store, put_object
 
-    from zagg.store import open_object_store
-
-    obstore.put(
+    put_object(
         open_object_store(records_from, **store_kwargs),
         name,
         json.dumps(record, indent=1).encode(),
