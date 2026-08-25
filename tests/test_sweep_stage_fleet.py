@@ -1591,38 +1591,43 @@ def _assert_identical(cli, fleet, *, ladder_data_only=False):
 class TestByteIdentityOracle:
     """THE acceptance: same store, two executors, identical bytes."""
 
-    def _both_arms(self, tmp_path, monkeypatch=None, *, fields=None, fleet_width=None, cap=None):
+    def _both_arms(self, tmp_path, monkeypatch=None, *, fields=None, width=3, fleet_width=None):
         """CLI sweep -> snapshot -> reset -> fleet sweep -> snapshot.
 
         One store, swept twice from the SAME pre-sweep bytes, so nothing about
         the comparison can be an artifact of two fixtures diverging.
+        ``width`` drives BOTH arms (the byte-exact comparison); ``fleet_width``
+        overrides the fleet's alone, which is the deliberate cross-width arm.
         """
         mod = _handler_module()
         root = tmp_path / "s"
-        _stage_store(root) if fields is None else _stage_store(root, fields=fields)
+        _stage_store(root, **({} if fields is None else {"fields": fields}))
         _write_discovery_record(root)
         base = _snapshot(root)
 
-        _cli_sweep(root)
+        _cli_sweep(root, tuple_width=width)
         cli = _snapshot(root)
 
         _restore(root, base)
         assert _snapshot(root) == base, "the reset did not restore the pre-sweep store"
 
-        if cap is not None:
-            import zagg.runner
-
-            monkeypatch.setattr(zagg.runner, "_ASYNC_PAYLOAD_CAP_BYTES", cap)
         fleet = _fleet(
             root,
             _FakeLambda(mod.lambda_handler),
-            **({} if fleet_width is None else {"tuple_width": fleet_width}),
+            tuple_width=width if fleet_width is None else fleet_width,
         )
         return cli, _snapshot(root), fleet
 
-    def test_the_fleet_build_is_byte_identical_to_the_cli_build(self, tmp_path):
-        cli, fleet, summary = self._both_arms(tmp_path)
+    @pytest.mark.parametrize("width,tuples", ((1, 3), (2, 2), (3, 1)))
+    def test_the_fleet_build_is_byte_identical_to_the_cli_build(self, tmp_path, width, tuples):
+        # At every tuple width, not just the default: width 3 folds the whole
+        # o3 ladder from one tuple, so it has no tuple SEQUENCE for the
+        # transport to get wrong. Widths 1 and 2 put the ordering the
+        # dispatcher's barriers exist to preserve inside the byte-exact
+        # assertion — reversing ``stage_tuples`` in the dispatcher fails them.
+        cli, fleet, summary = self._both_arms(tmp_path, width=width)
         assert summary["finisher"]["landed"] and not summary["barrier_timed_out"]
+        assert len(summary["stages"]) == tuples
         _assert_identical(cli, fleet)
         # Never vacuous: the ladder really was built, columns and all.
         rels = _artifacts(fleet)
