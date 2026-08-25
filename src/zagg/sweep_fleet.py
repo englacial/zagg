@@ -51,10 +51,15 @@ import time
 
 logger = logging.getLogger(__name__)
 
-#: Barrier budget per tuple, in seconds. A stage invoke is bounded by the
-#: function timeout (900 s on the deployed fleet), and Event invokes queue, so
-#: the budget has to cover a cold fan-out plus one worker's full run.
-DEFAULT_BARRIER_TIMEOUT_S = 1200
+#: Barrier budget per tuple, in seconds. Sized as THREE function timeouts
+#: (900 s on the deployed fleet): one for the fan-out to drain out of the async
+#: invocation queue behind an account- or reserved-concurrency ceiling, one for
+#: a throttle-driven redelivery, one for the slowest worker's own full run. It
+#: deliberately does NOT cover the queue's worst case — Lambda retains async
+#: events for up to 6 hours — because the barrier is a scheduling preference,
+#: not a correctness device; :func:`await_records` documents what an expiry
+#: costs when the invoke was merely queued rather than lost.
+DEFAULT_BARRIER_TIMEOUT_S = 2700
 #: TOTAL barrier budget for one run, in seconds — the bound on the whole tail.
 #: Without it the dispatcher blocks for ``(n_tuples + 1) x`` the per-tuple
 #: budget, which grows with the store's order and is what an operator actually
@@ -291,6 +296,21 @@ def await_records(
     (6)). Blocking here is what keeps the fleet's tuple ordering identical to
     the in-process driver's, which is what the byte-identity acceptance rests
     on.
+
+    **An expiry does not mean the invoke was lost.** The likelier cause is that
+    it has not STARTED: Lambda retains asynchronous events for up to 6 hours,
+    and a fan-out of thousands against a concurrency ceiling runs its tail long
+    after it was fired. Such a worker is a same-run sibling, so nothing refuses
+    it — ``ForeignSweepError`` is about OTHER runs, by design — and the column
+    it eventually writes is correct. What the run loses is bookkeeping: the
+    finisher aggregated before that record existed, so its per-level actuals
+    UNDER-REPORT what is on disk, and its lease release lands while same-run
+    writers are still pending (a later foreign sweep is then admitted early; it
+    does not corrupt, since each side aborts on the other's fresh stamp, but it
+    is a louder failure than the under-coverage the soft barrier promises).
+    That is why ``barrier_timed_out`` is propagated into the dispatcher's
+    summary AND into the finisher's own block rather than only logged: the run
+    record has to say its actuals may be short instead of reading clean.
     """
     deadline = time.monotonic() + float(timeout_s)
     while True:
@@ -390,6 +410,8 @@ def run_stage_sweep_fleet(
         # the summary should never have to know which branch produced it.
         "skipped": None,
         "invokes": 0,
+        # True if ANY barrier expired: the run's actuals may under-report.
+        "barrier_timed_out": False,
         "stages": [],
     }
 
@@ -487,6 +509,8 @@ def run_stage_sweep_fleet(
         summary["finisher"] = {"landed": False, "fired": False}
         summary["duration_s"] = time.perf_counter() - t0
         return summary
+    stages_timed_out = any(st["barrier_timed_out"] for st in summary["stages"])
+    summary["barrier_timed_out"] = stages_timed_out
     _fire(
         build_stage_event(
             store_path,
@@ -495,6 +519,9 @@ def run_stage_sweep_fleet(
                 "run_id": run_id,
                 "records_from": records_from,
                 "touch_policy": touch_policy,
+                # The finisher is aggregating a record set the dispatcher knows
+                # may be short; it rides on the wire so the RUN record says so.
+                "barrier_timed_out": stages_timed_out,
             },
             _leaf_refs(by_shard),
             output_creds_event,
@@ -502,6 +529,7 @@ def run_stage_sweep_fleet(
     )
     seen, timed_out = _barrier({FINISHER_RECORD_NAME})
     summary["finisher"] = {"landed": not timed_out, "fired": True}
+    summary["barrier_timed_out"] = stages_timed_out or timed_out
     if seen:
         summary["finisher"].update(_read_finisher_record(records_from, store_kwargs))
     summary["duration_s"] = time.perf_counter() - t0

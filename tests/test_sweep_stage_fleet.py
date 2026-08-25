@@ -1106,6 +1106,12 @@ class TestFleetOrchestration:
         client = _FakeLambda(mod.lambda_handler, drop={stage_record_name(0, 0)})
         summary = _fleet(root, client, tuple_width=1, barrier_timeout_s=0.05)
         assert [s["barrier_timed_out"] for s in summary["stages"]] == [False, False, True]
+        # An expiry may mean the invoke is merely QUEUED, so the finisher can
+        # aggregate a short record set. The run says so instead of reading
+        # clean, and the finisher is told on the wire (review finding).
+        assert summary["barrier_timed_out"] is True
+        finisher = next(b for b in client.blocks() if b["role"] == "finisher")
+        assert finisher["barrier_timed_out"] is True
         # The run did not stall: the finisher still fired and settled the store.
         assert summary["finisher"]["landed"] and summary["finisher"]["lease"]["released"]
         # The lost tuple's own level is simply absent -- a hole, not a wrong
@@ -1114,8 +1120,13 @@ class TestFleetOrchestration:
         assert not (root / "1" / "all.zarr").exists()
         assert "0" not in summary["finisher"]["levels"]
         # The heal: a second run with every invoke delivered closes the gap.
-        healed = _fleet(root, _FakeLambda(mod.lambda_handler), tuple_width=1)
+        healed_client = _FakeLambda(mod.lambda_handler)
+        healed = _fleet(root, healed_client, tuple_width=1)
         assert not any(s["barrier_timed_out"] for s in healed["stages"])
+        assert healed["barrier_timed_out"] is False
+        assert not next(b for b in healed_client.blocks() if b["role"] == "finisher")[
+            "barrier_timed_out"
+        ]
         attrs = dict(_artifact(root, "1/all.zarr").attrs)["zagg_overview"]
         # At width 1 the order-0 node's children are the order-1 stage columns,
         # and base cell '1' has exactly one ('11') — fully covered, no hole.
@@ -1192,6 +1203,29 @@ class TestRunnerSeam:
         )
         assert summary is not None and summary["finisher"]["landed"] is False
         assert time.perf_counter() - t < 2.0, "the seam did not forward the barrier knobs"
+
+    def test_the_seam_says_a_barrier_expired(self, tmp_path, caplog):
+        # A partially covered staged sweep read like a clean one in the run log
+        # (review finding): the seam logged records_seen at INFO and nothing else.
+        import logging
+
+        from zagg.runner import _invoke_lambda_stage_sweep
+
+        root = tmp_path / "s"
+        _stage_store(root)
+        with caplog.at_level(logging.WARNING, logger="zagg.runner"):
+            summary = _invoke_lambda_stage_sweep(
+                _FakeLambda(None),
+                "zagg-worker",
+                str(root),
+                [(morton_word(d), None) for d in LEAVES],
+                shard_order=3,
+                store_kwargs={},
+                barrier_timeout_s=0.05,
+                total_barrier_budget_s=0.05,
+            )
+        assert summary["barrier_timed_out"] is True
+        assert "at least one barrier expired" in caplog.text
 
     def test_the_seam_is_fail_open(self, tmp_path, caplog):
         import logging
