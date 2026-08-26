@@ -601,12 +601,13 @@ def closest_obs_shardmap(
     so the eventual paired product is reconstructable from the manifest alone: ``paired_epochs``
     (ISO instants of every epoch that selected the granule) and
     ``epoch_offsets_ns`` (row-aligned SIGNED ``acquisition - epoch`` ns).
-    Do NOT derive a paired map with :meth:`ShardMap.reproject`: its
-    ``_granule_entry`` passthrough does not know these two keys, so a
-    reprojected map (the ``noop`` same-order branch included) drops the
-    provenance while ``metadata["closest_obs"]`` rides through describing the
+    :meth:`ShardMap.reproject` carries both through every arm (issue #517), so a
+    derived map keeps its per-entry provenance; a coarsen that unions a granule
+    from several children keeps the last child's copy. What reproject still
+    cannot fix is ``metadata["closest_obs"]``, which rides through describing the
     SOURCE map — after a coarsen its shard ids name a shard set that no longer
-    exists. Rebuild at the target grid instead of reprojecting.
+    exists. Rebuild at the target grid rather than reprojecting whenever that
+    ledger has to be true of the map carrying it.
     ``metadata["closest_obs"]`` records the query: the reference stores, the
     epoch totals, every dropped epoch with its near-miss offset (``None``
     where there was no acquisition to measure against, so

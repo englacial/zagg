@@ -2378,6 +2378,49 @@ class TestReproject:
         with pytest.raises(ValueError, match="HEALPix"):
             sm.reproject(hp)
 
+    def _tagged(self, sm):
+        """``sm`` with an auxiliary key on every entry -- the shape a builder
+        attaches that ``_granule_entry``'s closed key set does not know."""
+        granules = [
+            [{**g, "paired_epochs": [f"epoch-{g['id']}"]} for g in shard] for shard in sm.granules
+        ]
+        return ShardMap(sm.grid_signature, list(sm.shard_keys), granules, dict(sm.metadata))
+
+    @pytest.mark.parametrize("method", ["noop", "coarsen", "refine"])
+    def test_auxiliary_entry_keys_ride_through_every_arm(
+        self, catalog, fine_grid, coarse_grid, method
+    ):
+        # Every arm rebuilds its entries through _granule_entry, whose key set is
+        # closed, so a builder's per-entry keys were dropped from the derived map
+        # (issue #517 -- the closest-obs pairing provenance is the case in hand).
+        source = self._tagged(ShardMap.build(catalog, coarse_grid, backend="mortie"))
+        target, kwargs = {
+            "noop": (coarse_grid, {}),
+            "coarsen": (HealpixGrid(10, 14, layout="fullsphere"), {}),
+            "refine": (fine_grid, {"catalog": catalog}),
+        }[method]
+        derived = source.reproject(target, **kwargs)
+        assert derived.metadata["reproject"]["method"] == method
+        entries = [g for shard in derived.granules for g in shard]
+        assert entries
+        assert all(g["paired_epochs"] == [f"epoch-{g['id']}"] for g in entries)
+
+    @pytest.mark.parametrize("method", ["noop", "coarsen", "refine"])
+    def test_a_plain_map_gains_nothing_from_the_passthrough(
+        self, catalog, fine_grid, coarse_grid, method
+    ):
+        # The other half of #517's acceptance: a map with no auxiliary keys must
+        # reproject to exactly what it reprojected to before.
+        source = ShardMap.build(catalog, coarse_grid, backend="mortie")
+        target, kwargs = {
+            "noop": (coarse_grid, {}),
+            "coarsen": (HealpixGrid(10, 14, layout="fullsphere"), {}),
+            "refine": (fine_grid, {"catalog": catalog}),
+        }[method]
+        derived = source.reproject(target, **kwargs)
+        known = {"id", "s3", "https", "assets", "datetime", "time_key", "time_start", "time_end"}
+        assert all(set(g) <= known for shard in derived.granules for g in shard)
+
 
 class TestIsBeamProduct:
     def test_known_beam_products(self):

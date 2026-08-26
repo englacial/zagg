@@ -804,19 +804,35 @@ class TestClosestObsShardmap:
         assert isinstance(calls[0]["region"], list)
         assert sm.shard_keys == [SHARD_KEY]
 
-    def test_reprojecting_a_paired_map_drops_the_provenance(self, tmp_path):
-        # Pins the documented trap: ShardMap._granule_entry does not know the
-        # two provenance keys, so even the same-order noop branch strips them
-        # while metadata["closest_obs"] rides through describing the SOURCE
-        # map. Carrying them through reproject is a shardmap.py change left
-        # standing for review — until then, rebuild, never reproject.
+    def test_reprojecting_a_paired_map_keeps_the_provenance(self, tmp_path):
+        # PR #511's pin, flipped by issue #517: ShardMap._granule_entry's key set
+        # is closed, so every reproject arm — the same-order noop branch included
+        # — used to strip the two provenance keys, leaving a map that is
+        # spatially valid but can no longer say why any granule is in it. The
+        # generic auxiliary-key passthrough now carries them through verbatim.
+        # metadata["closest_obs"] still rides through describing the SOURCE map;
+        # that half of the trap is unchanged and stays pinned below.
         store, cat = self._setup(tmp_path)
         sm = closest_obs_shardmap(cat, store, grid=_grid(), backend="mortie")
         assert "paired_epochs" in sm.granules[0][0]
         noop = sm.reproject(_grid())
-        assert "paired_epochs" not in noop.granules[0][0]
-        assert "epoch_offsets_ns" not in noop.granules[0][0]
+        assert noop.granules == sm.granules
+        assert noop.granules[0][0]["paired_epochs"] == sm.granules[0][0]["paired_epochs"]
+        assert noop.granules[0][0]["epoch_offsets_ns"] == sm.granules[0][0]["epoch_offsets_ns"]
         assert noop.metadata["closest_obs"] == sm.metadata["closest_obs"]
+
+    def test_coarsening_a_paired_map_keeps_the_provenance(self, tmp_path):
+        # The coarsen arm regroups the map's own entries rather than rebuilding
+        # from a catalog, but it too rebuilt each entry through _granule_entry
+        # and dropped the keys with it (issue #517).
+        store, cat = self._setup(tmp_path)
+        sm = closest_obs_shardmap(cat, store, grid=_grid(), backend="mortie")
+        source = sm.granules[0][0]
+        coarse = sm.reproject(_grid(parent_order=3))
+        carried = [g for shard in coarse.granules for g in shard if g["id"] == source["id"]]
+        assert carried, "the granule must survive the coarsen to say anything about its keys"
+        assert all(g["paired_epochs"] == source["paired_epochs"] for g in carried)
+        assert all(g["epoch_offsets_ns"] == source["epoch_offsets_ns"] for g in carried)
 
 
 # ── phase 4: two-store scenarios ─────────────────────────────────────────────

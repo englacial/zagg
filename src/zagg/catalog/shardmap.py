@@ -162,6 +162,27 @@ def _granule_entry(rec: dict) -> dict:
     return entry
 
 
+def _carry_auxiliary(entry: dict, source: dict) -> dict:
+    """``entry`` plus the per-entry keys :func:`_granule_entry`'s fixed set omits.
+
+    ``reproject`` rebuilds every entry through :func:`_granule_entry`, whose key
+    set is closed, so a per-entry key a *builder* attached to the map was dropped
+    from the derived map. The closest-observation pairing provenance
+    (``paired_epochs`` / ``epoch_offsets_ns``, issue #509) is the case in hand:
+    without it a reprojected paired map stays spatially valid but can no longer
+    say why any granule is in it (issue #517).
+
+    A generic passthrough rather than an allowlist — the next builder's keys ride
+    through without a second edit here. Recognized keys are never overwritten:
+    :func:`_granule_entry` (and, in the refine arm, the identity carry of issue
+    #512) has already settled those.
+    """
+    for key, value in source.items():
+        if key not in entry:
+            entry[key] = value
+    return entry
+
+
 def _recorded_identity(entry: dict, canonicalize=None) -> tuple[tuple[tuple[str, str], ...], tuple]:
     """``(canonicals, distinguishing)`` for one shard entry.
 
@@ -1848,7 +1869,10 @@ class ShardMap:
             return ShardMap(
                 target_grid.spatial_signature(),
                 list(self.shard_keys),
-                [[_granule_entry(g) for g in shard] for shard in self.granules],
+                [
+                    [_carry_auxiliary(_granule_entry(g), g) for g in shard]
+                    for shard in self.granules
+                ],
                 meta,
                 self.aoi_mask,
             )
@@ -1870,10 +1894,14 @@ class ShardMap:
                 # in-shard here, and an id-keyed dedup would drop one of the two
                 # rather than let the check below name it (issue #468). A
                 # granule spanning several children still counts once.
+                # The union is last-wins on the entry, so a granule arriving from
+                # several children keeps the last child's auxiliary keys (issue
+                # #517) -- unchanged from the pre-passthrough behaviour, which
+                # was last-wins on the same key.
                 seen: dict = {}
                 for i in groups[k]:
                     for g in self.granules[i]:
-                        entry = _granule_entry(g)
+                        entry = _carry_auxiliary(_granule_entry(g), g)
                         seen[_recorded_identity(entry)[1]] = entry
                 new_granules.append(list(seen.values()))
             method = "coarsen"
@@ -1932,7 +1960,8 @@ class ShardMap:
                         # keeps the pair distinct so the guard refuses loudly.
                         # A non-colliding map is unchanged: its entries came
                         # from these same records, so the overlay is a no-op.
-                        entry = _granule_entry({**sub_records[i], **gran_list[i]})
+                        src = gran_list[i]
+                        entry = _carry_auxiliary(_granule_entry({**sub_records[i], **src}), src)
                         bucket[_recorded_identity(entry)[1]] = entry
 
             new_keys = sorted(new_granules_map)
