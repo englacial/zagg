@@ -2842,35 +2842,64 @@ class TestBasenameCollisions:
         a = {"id": "SCENE", "s3": None, "https": None, "datetime": "2025-06-01T00:00:00Z"}
         shardmap._refuse_basename_collisions([7], [[a, dict(a)]])
 
-    def test_refine_rebuilds_hrefs_from_the_catalog_so_it_cannot_collide(
-        self, catalog, fine_grid, coarse_grid
-    ):
-        # The refine arm looks each entry up in the catalog by id and rebuilds
-        # the entry from THAT record, so a source map's per-entry hrefs never
-        # reach the new map: a collided pair arrives as one identical entry and
-        # the check has nothing left to see. Pinning it because it bounds what
-        # the guard can promise -- only ``build`` and coarsen can surface an
-        # href collision (issue #468 review finding (2)).
-        sm = ShardMap.build(
-            _catalog([_item("Gdup", -76.62, -76.57)]), coarse_grid, backend="mortie"
-        )
+    def _legacy_collided_source(self, coarse_grid):
+        """A one-shard map holding a collided pair: one id, two href prefixes.
+
+        The shape a pre-#468 manifest takes -- refused at construction today, so
+        it can only reach ``refine`` through a loader, which warns rather than
+        refuses (PR #482 question (2)).
+        """
         cat = _catalog([_item("Gdup", -76.62, -76.57)])
+        sm = ShardMap.build(cat, coarse_grid, backend="mortie")
         collided = [
             {"id": "Gdup", "s3": f"s3://b/{p}/Gdup.h5", "https": f"https://h/{p}/Gdup.h5"}
             for p in ("p1", "p2")
         ]
-        source = ShardMap(
-            sm.grid_signature,
-            list(sm.shard_keys),
-            [collided] + [list(g) for g in sm.granules[1:]],
-            dict(sm.metadata),
-        )
-        refined = source.reproject(fine_grid, catalog=cat)
-        entries = [g for shard in refined.granules for g in shard]
-        assert all(g["s3"] == "s3://b/Gdup.h5" for g in entries), "hrefs come from the catalog"
-        # One granule out, not two: the prefixes -- and with them the collision
-        # -- were discarded upstream of the check, not by it.
-        assert {g["id"] for g in entries} == {"Gdup"}
+        source = ShardMap(sm.grid_signature, [sm.shard_keys[0]], [collided], dict(sm.metadata))
+        return cat, source
+
+    def test_refine_carries_the_map_hrefs_so_a_collision_survives_to_the_guard(
+        self, catalog, fine_grid, coarse_grid
+    ):
+        # The refine arm looks each entry up in the catalog by id. Rebuilt from
+        # THAT record alone, a collided pair arrived as one identical entry and
+        # the two collapsed into one -- a granule lost silently, upstream of a
+        # guard that then had nothing left to see (issue #512; the bound issue
+        # #468 review finding (2) recorded). The map's own hrefs now win over
+        # the record's, so the pair stays distinct and the guard refuses.
+        cat, source = self._legacy_collided_source(coarse_grid)
+        with pytest.raises(ValueError, match="identity collision") as excinfo:
+            source.reproject(fine_grid, catalog=cat)
+        message = str(excinfo.value)
+        assert "s3://b/p1/Gdup.h5" in message and "s3://b/p2/Gdup.h5" in message
+
+    def test_refine_of_a_loaded_legacy_collision_never_changes_the_count_silently(
+        self, catalog, fine_grid, coarse_grid, tmp_path
+    ):
+        # The acceptance path of issue #512: the loader is the one door left
+        # open onto a colliding map, so the refine behind it must not lose a
+        # member quietly. Before the fix this returned a map holding ONE entry
+        # per shard where two went in, with both prefixes rewritten to the
+        # catalog's single href.
+        cat, source = self._legacy_collided_source(coarse_grid)
+        path = str(tmp_path / "legacy.json")
+        source.to_json(path)
+        with pytest.warns(RuntimeWarning, match="identity collision"):
+            loaded = ShardMap.from_json(path)
+        with pytest.raises(ValueError, match="identity collision"):
+            loaded.reproject(fine_grid, catalog=cat)
+
+    def test_refine_of_a_clean_map_is_unchanged_by_the_href_carry(
+        self, catalog, fine_grid, coarse_grid
+    ):
+        # The overlay must be a no-op wherever there is no collision: a normal
+        # map's entries came from these same records, so refine still produces
+        # exactly what it produced before (issue #512).
+        sm_coarse = ShardMap.build(catalog, coarse_grid, backend="mortie")
+        refined = sm_coarse.reproject(fine_grid, catalog=catalog)
+        direct = ShardMap.build(catalog, fine_grid, backend="mortie")
+        assert refined.shard_keys == direct.shard_keys
+        assert refined.granules == direct.granules
 
     def test_an_id_that_canonicalizes_to_empty_warns_and_is_skipped(self):
         # ``canonical_granule_id("/")`` strips the separator down to "", which

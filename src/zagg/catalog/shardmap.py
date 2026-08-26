@@ -326,16 +326,18 @@ def _warn_loaded_collisions(sm: "ShardMap", path: str) -> "ShardMap":
     ``from_json`` / ``from_parquet`` read manifests built before the #468 guard
     existed; refusing would make a historical map unreadable (PR #482 question
     (2) ruling). The hazard the warning names: a leaf gate reading this map
-    records fewer granules than it reads, and ``refine`` silently drops one
-    collided member (issue #512).
+    records fewer granules than it reads. ``refine`` used to silently drop one
+    collided member on top of that; it now carries the map's own hrefs through
+    and refuses instead, so the collision is loud wherever it is derived from
+    (issue #512).
     """
     message = _basename_collision_message(sm.shard_keys, sm.granules, stacklevel=4, source=path)
     if message is not None:
         warnings.warn(
             f"{path}: this manifest predates the construction-time identity guard "
             f"and would be refused by it; loading anyway (historical maps stay "
-            f"readable), but note refine silently drops a collided member "
-            f"(issue #512). {message}",
+            f"readable), but note reproject refuses it rather than deriving from "
+            f"it (issue #512). {message}",
             RuntimeWarning,
             stacklevel=3,
         )
@@ -1920,7 +1922,17 @@ class ShardMap:
                 for k, idxs in shard_to_idx.items():
                     bucket = new_granules_map.setdefault(int(k), {})
                     for i in idxs:
-                        entry = _granule_entry(sub_records[i])
+                        # The MAP entry's own identity keys win over the catalog
+                        # record's. Rebuilt from the record alone, a legacy
+                        # collided pair (two entries, one id, two href prefixes)
+                        # arrived as one IDENTICAL entry and the two collapsed
+                        # into one bucket slot -- a granule lost silently,
+                        # upstream of the guard below, which then had nothing
+                        # left to see (issue #512). Carrying the map's own hrefs
+                        # keeps the pair distinct so the guard refuses loudly.
+                        # A non-colliding map is unchanged: its entries came
+                        # from these same records, so the overlay is a no-op.
+                        entry = _granule_entry({**sub_records[i], **gran_list[i]})
                         bucket[_recorded_identity(entry)[1]] = entry
 
             new_keys = sorted(new_granules_map)
