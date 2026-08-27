@@ -1991,7 +1991,7 @@ class ShardMap:
                 for k, idxs in shard_to_idx.items():
                     bucket = new_granules_map.setdefault(int(k), {})
                     for i in idxs:
-                        # The MAP entry's own identity keys win over the catalog
+                        # The MAP entry's own IDENTITY keys win over the catalog
                         # record's. Rebuilt from the record alone, a legacy
                         # collided pair (two entries, one id, two href prefixes)
                         # arrived as one IDENTICAL entry and the two collapsed
@@ -1999,10 +1999,18 @@ class ShardMap:
                         # upstream of the guard below, which then had nothing
                         # left to see (issue #512). Carrying the map's own hrefs
                         # keeps the pair distinct so the guard refuses loudly.
-                        # A non-colliding map is unchanged: its entries came
-                        # from these same records, so the overlay is a no-op.
+                        # Scoped to what ``_recorded_identity`` distinguishes on,
+                        # ``datetime`` included: the raster form of the same
+                        # collision is two acquisitions under one item id,
+                        # separated by nothing else (issue #468). Everything the
+                        # catalog is authoritative for -- the time metadata --
+                        # stays the record's, so a refine against a corrected
+                        # catalog still picks the correction up. (``assets``
+                        # already rides in via ``sub_records`` above.)
                         src = gran_list[i]
-                        entry = _carry_auxiliary(_granule_entry({**sub_records[i], **src}), src)
+                        identity = {k: src[k] for k in ("s3", "https", "datetime") if k in src}
+                        entry = _granule_entry({**sub_records[i], **identity})
+                        entry = _carry_auxiliary(entry, src)
                         bucket[_recorded_identity(entry)[1]] = entry
 
             new_keys = sorted(new_granules_map)

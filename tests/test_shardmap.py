@@ -2999,6 +2999,30 @@ class TestBasenameCollisions:
         with pytest.raises(ValueError, match="identity collision"):
             loaded.reproject(fine_grid, catalog=cat)
 
+    def test_refine_leaves_the_catalog_authoritative_for_the_time_metadata(
+        self, catalog, fine_grid, coarse_grid
+    ):
+        # The href carry is scoped to the identity keys. Widening it to every
+        # _granule_entry key would quietly invert authority for the time
+        # metadata too -- reproject never checks that ``catalog`` is the one the
+        # map was built from, so a refine against a re-fetched catalog would
+        # keep the map's stale value instead of the correction (issue #512).
+        item = _item("Gwest", -76.62, -76.57)
+        item["properties"]["start_datetime"] = "2025-06-01T00:00:00Z"
+        item["properties"]["end_datetime"] = "2025-06-01T00:10:00Z"
+        cat = _catalog([item])
+        built = ShardMap.build(cat, coarse_grid, backend="mortie")
+        recorded = built.granules[0][0]["time_start"]
+        assert recorded and recorded != "1999-01-01T00:00:00Z"
+        stale = [
+            [{**g, "time_start": "1999-01-01T00:00:00Z"} for g in shard] for shard in built.granules
+        ]
+        source = ShardMap(built.grid_signature, list(built.shard_keys), stale, dict(built.metadata))
+        refined = source.reproject(fine_grid, catalog=cat)
+        entries = [g for shard in refined.granules for g in shard]
+        assert entries
+        assert all(g["time_start"] == recorded for g in entries)
+
     def test_a_same_order_reproject_of_a_collision_keeps_both_members(self, coarse_grid):
         # The loader's warning tells an operator which derivations are refused,
         # so the exemption has to be true too: the same-order arm returns before
