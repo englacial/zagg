@@ -2999,6 +2999,17 @@ class TestBasenameCollisions:
         with pytest.raises(ValueError, match="identity collision"):
             loaded.reproject(fine_grid, catalog=cat)
 
+    def test_a_same_order_reproject_of_a_collision_keeps_both_members(self, coarse_grid):
+        # The loader's warning tells an operator which derivations are refused,
+        # so the exemption has to be true too: the same-order arm returns before
+        # the guard, and is entitled to because it is identity -- both members
+        # come out, nothing is dropped, so there is nothing to refuse (issue
+        # #512). Pinned because the warning names it.
+        _cat, source = self._legacy_collided_source(coarse_grid)
+        same_order = source.reproject(coarse_grid)
+        entries = [g for shard in same_order.granules for g in shard]
+        assert [g["s3"] for g in entries] == ["s3://b/p1/Gdup.h5", "s3://b/p2/Gdup.h5"]
+
     def test_refine_of_a_clean_map_is_unchanged_by_the_href_carry(
         self, catalog, fine_grid, coarse_grid
     ):

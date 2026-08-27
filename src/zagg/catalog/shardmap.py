@@ -380,17 +380,20 @@ def _warn_loaded_collisions(sm: "ShardMap", path: str) -> "ShardMap":
     existed; refusing would make a historical map unreadable (PR #482 question
     (2) ruling). The hazard the warning names: a leaf gate reading this map
     records fewer granules than it reads. ``refine`` used to silently drop one
-    collided member on top of that; it now carries the map's own hrefs through
-    and refuses instead, so the collision is loud wherever it is derived from
-    (issue #512).
+    collided member on top of that; it now carries the map's own hrefs through,
+    so the pair reaches ``_refuse_basename_collisions`` and the arms that mint
+    new shard membership — coarsen and refine — refuse instead of deriving
+    (issue #512). A same-order ``reproject`` is exempt because it is identity:
+    it returns both members and loses nothing, so there is nothing to refuse.
     """
     message = _basename_collision_message(sm.shard_keys, sm.granules, stacklevel=4, source=path)
     if message is not None:
         warnings.warn(
             f"{path}: this manifest predates the construction-time identity guard "
             f"and would be refused by it; loading anyway (historical maps stay "
-            f"readable), but note reproject refuses it rather than deriving from "
-            f"it (issue #512). {message}",
+            f"readable), but note deriving from it at another order -- reproject's "
+            f"coarsen and refine -- is refused rather than silently dropping a "
+            f"collided member (issue #512). {message}",
             RuntimeWarning,
             stacklevel=3,
         )
