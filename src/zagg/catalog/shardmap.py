@@ -183,6 +183,38 @@ def _carry_auxiliary(entry: dict, source: dict) -> dict:
     return entry
 
 
+def _union_auxiliary(banked: dict, entry: dict) -> None:
+    """Fold ``entry``'s auxiliary rows into ``banked`` -- the coarsen union.
+
+    Coarsening merges sibling shards, so a granule reaching one parent from
+    several children arrives once per child, each time with that child's own
+    auxiliary payload. Last-wins on the entry kept only the final child's, and
+    the payloads differ by construction: ``closest_obs_shardmap`` accumulates
+    the pairing provenance PER SHARD, so the discard silently lost the very
+    record issue #517 exists to keep.
+
+    The equal-length list-valued keys are read as parallel columns of one table
+    -- ``paired_epochs`` beside its row-aligned ``epoch_offsets_ns`` -- so the
+    union is over whole ROWS. Row-wise keeps the pairing aligned (a per-key
+    union would not: two children agreeing on the epoch but not the offset
+    would leave the two columns different lengths), drops the rows two children
+    genuinely share, and rebuilds rather than extends, so the source map's own
+    lists are never mutated. Columns that do not line up are not guessed at:
+    the banked value stands.
+    """
+    cols = [k for k, v in entry.items() if isinstance(v, list) and isinstance(banked.get(k), list)]
+    if (
+        not cols
+        or len({len(entry[k]) for k in cols}) > 1
+        or len({len(banked[k]) for k in cols}) > 1
+    ):
+        return
+    rows = list(zip(*(banked[k] for k in cols)))
+    rows += [row for row in zip(*(entry[k] for k in cols)) if row not in rows]
+    for j, key in enumerate(cols):
+        banked[key] = [row[j] for row in rows]
+
+
 def _recorded_identity(entry: dict, canonicalize=None) -> tuple[tuple[tuple[str, str], ...], tuple]:
     """``(canonicals, distinguishing)`` for one shard entry.
 
@@ -1894,15 +1926,21 @@ class ShardMap:
                 # in-shard here, and an id-keyed dedup would drop one of the two
                 # rather than let the check below name it (issue #468). A
                 # granule spanning several children still counts once.
-                # The union is last-wins on the entry, so a granule arriving from
-                # several children keeps the last child's auxiliary keys (issue
-                # #517) -- unchanged from the pre-passthrough behaviour, which
-                # was last-wins on the same key.
+                # A granule arriving from several children brings one auxiliary
+                # payload per child, and the closest-obs provenance is built per
+                # shard, so those payloads differ. Last-wins on the entry kept
+                # the final child's alone; the rows are unioned instead (issue
+                # #517). The identity fields are settled by the first arrival --
+                # they are what the key already matched on.
                 seen: dict = {}
                 for i in groups[k]:
                     for g in self.granules[i]:
                         entry = _carry_auxiliary(_granule_entry(g), g)
-                        seen[_recorded_identity(entry)[1]] = entry
+                        identity = _recorded_identity(entry)[1]
+                        if identity in seen:
+                            _union_auxiliary(seen[identity], entry)
+                        else:
+                            seen[identity] = entry
                 new_granules.append(list(seen.values()))
             method = "coarsen"
         else:

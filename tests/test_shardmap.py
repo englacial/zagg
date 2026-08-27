@@ -2421,6 +2421,73 @@ class TestReproject:
         known = {"id", "s3", "https", "assets", "datetime", "time_key", "time_start", "time_end"}
         assert all(set(g) <= known for shard in derived.granules for g in shard)
 
+    def _tagged_per_shard(self, sm):
+        """``sm`` with provenance that DIFFERS shard by shard.
+
+        The shape ``closest_obs_shardmap`` emits: it accumulates ``chosen``
+        inside its per-shard loop, so one granule sitting in several shards
+        carries a different ``paired_epochs`` in each.
+        """
+        granules = [
+            [{**g, "paired_epochs": [f"e-{k}"], "epoch_offsets_ns": [int(k) % 997]} for g in shard]
+            for k, shard in zip(sm.shard_keys, sm.granules)
+        ]
+        return ShardMap(sm.grid_signature, list(sm.shard_keys), granules, dict(sm.metadata))
+
+    def test_coarsen_unions_the_provenance_of_every_contributing_child(self, catalog, coarse_grid):
+        # Coarsening merges sibling shards, and the union was last-wins on the
+        # entry: a granule reaching one parent from four children kept the
+        # fourth's provenance and dropped three, silently -- issue #517's loss
+        # reappearing on the arm the first pass left alone.
+        from mortie import clip2order
+
+        source = self._tagged_per_shard(ShardMap.build(catalog, coarse_grid, backend="mortie"))
+        keys = [int(k) for k in source.shard_keys]
+        parents = clip2order(10, np.asarray(keys, dtype=np.uint64)).tolist()
+        expected: dict = {}
+        for parent, key, shard in zip(parents, keys, source.granules):
+            for g in shard:
+                expected.setdefault((int(parent), g["id"]), []).append(key)
+        assert any(len(v) > 1 for v in expected.values()), "need a multi-child granule to test"
+
+        coarse = source.reproject(HealpixGrid(10, 14, layout="fullsphere"))
+        assert coarse.metadata["reproject"]["method"] == "coarsen"
+        seen = set()
+        for parent, shard in zip(coarse.shard_keys, coarse.granules):
+            for g in shard:
+                children = expected[(int(parent), g["id"])]
+                assert g["paired_epochs"] == [f"e-{k}" for k in children]
+                # The sibling column has to move row for row with it.
+                assert g["epoch_offsets_ns"] == [k % 997 for k in children]
+                seen.add((int(parent), g["id"]))
+        assert seen == set(expected)
+
+    def test_the_coarsen_union_drops_the_rows_two_children_share(self, catalog, coarse_grid):
+        # Row-wise, not per-key: two children that paired the same granule to the
+        # same epoch contribute one row, not two, and a per-key union would leave
+        # the columns different lengths the moment they agreed on one and not the
+        # other (issue #517).
+        built = ShardMap.build(catalog, coarse_grid, backend="mortie")
+        granules = [
+            [{**g, "paired_epochs": ["shared", f"own-{k}"], "epoch_offsets_ns": [0, 1]} for g in s]
+            for k, s in zip(built.shard_keys, built.granules)
+        ]
+        source = ShardMap(built.grid_signature, list(built.shard_keys), granules, {})
+        coarse = source.reproject(HealpixGrid(10, 14, layout="fullsphere"))
+        for shard in coarse.granules:
+            for g in shard:
+                assert g["paired_epochs"].count("shared") == 1
+                assert len(g["paired_epochs"]) == len(g["epoch_offsets_ns"])
+
+    def test_the_coarsen_union_leaves_the_source_map_untouched(self, catalog, coarse_grid):
+        # The union rebuilds the columns rather than extending them: the derived
+        # map's entries still share the source's list objects (as ``assets``
+        # always has), so an in-place merge would rewrite the map it was handed.
+        source = self._tagged_per_shard(ShardMap.build(catalog, coarse_grid, backend="mortie"))
+        before = [[dict(g) for g in shard] for shard in source.granules]
+        source.reproject(HealpixGrid(10, 14, layout="fullsphere"))
+        assert source.granules == before
+
 
 class TestIsBeamProduct:
     def test_known_beam_products(self):

@@ -602,8 +602,9 @@ def closest_obs_shardmap(
     (ISO instants of every epoch that selected the granule) and
     ``epoch_offsets_ns`` (row-aligned SIGNED ``acquisition - epoch`` ns).
     :meth:`ShardMap.reproject` carries both through every arm (issue #517), so a
-    derived map keeps its per-entry provenance; a coarsen that unions a granule
-    from several children keeps the last child's copy. What reproject still
+    derived map keeps its per-entry provenance; because these keys are
+    accumulated per shard, a coarsen unions the rows of every child a granule
+    reached rather than keeping one child's. What reproject still
     cannot fix is ``metadata["closest_obs"]``, which rides through describing the
     SOURCE map — after a coarsen its shard ids name a shard set that no longer
     exists. Rebuild at the target grid rather than reprojecting whenever that
