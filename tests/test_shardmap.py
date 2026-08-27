@@ -2418,7 +2418,11 @@ class TestReproject:
             "refine": (fine_grid, {"catalog": catalog}),
         }[method]
         derived = source.reproject(target, **kwargs)
-        known = {"id", "s3", "https", "assets", "datetime", "time_key", "time_start", "time_end"}
+        # Derived from _granule_entry rather than hand-copied from it: the claim
+        # is that the passthrough added nothing BEYOND what _granule_entry
+        # produces, so a snapshot of its key set would fail in the wrong file
+        # the day that set changes.
+        known = set().union(*(set(shardmap._granule_entry(r)) for r in catalog.granule_records()))
         assert all(set(g) <= known for shard in derived.granules for g in shard)
 
     def _tagged_per_shard(self, sm):
