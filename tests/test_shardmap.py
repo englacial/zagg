@@ -2969,7 +2969,7 @@ class TestBasenameCollisions:
         return cat, source
 
     def test_refine_carries_the_map_hrefs_so_a_collision_survives_to_the_guard(
-        self, catalog, fine_grid, coarse_grid
+        self, fine_grid, coarse_grid
     ):
         # The refine arm looks each entry up in the catalog by id. Rebuilt from
         # THAT record alone, a collided pair arrived as one identical entry and
@@ -2984,7 +2984,7 @@ class TestBasenameCollisions:
         assert "s3://b/p1/Gdup.h5" in message and "s3://b/p2/Gdup.h5" in message
 
     def test_refine_of_a_loaded_legacy_collision_never_changes_the_count_silently(
-        self, catalog, fine_grid, coarse_grid, tmp_path
+        self, fine_grid, coarse_grid, tmp_path
     ):
         # The acceptance path of issue #512: the loader is the one door left
         # open onto a colliding map, so the refine behind it must not lose a
