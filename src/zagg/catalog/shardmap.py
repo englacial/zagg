@@ -176,6 +176,17 @@ def _carry_auxiliary(entry: dict, source: dict) -> dict:
     through without a second edit here. Recognized keys are never overwritten:
     :func:`_granule_entry` (and, in the refine arm, the identity carry of issue
     #512) has already settled those.
+
+    What that costs, for the next builder to know: ``reproject`` mints new shard
+    membership, so a per-entry key whose meaning depends on the SOURCE order or
+    shard is stale the moment it rides through, and a generic passthrough carries
+    it anyway. Map-level state gets the opposite default a few hundred lines down
+    — ``total_shards``/``total_pairs``/``granules_assigned`` recomputed,
+    ``aoi_mask`` and ``build_wall_s`` popped — precisely because a derived map
+    must not inherit them. Per-entry state is not examined that way; a key that
+    needs to change with the grid has to be handled where it is attached.
+    :func:`_union_auxiliary` covers the one case reproject can see, a granule
+    reaching one coarsened shard from several children.
     """
     for key, value in source.items():
         if key not in entry:
