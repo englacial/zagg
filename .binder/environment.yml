@@ -12,13 +12,16 @@
 # anonymous public source.coop demo stores and build no catalogs at all, so no
 # SpatialIndex backend is on their import path -- exact-S2 spherely least of all.
 #
-# NOTE (2026-08-26): ``postBuild`` still installs ``[analysis,catalog,viz]``, but
-# ``catalog`` (stac-geoparquet) and ``viz`` (ipyleaflet) were carried for the
-# jupyterhub_example / shardmap_viewer notebooks, which have been archived off
-# main. Neither remaining notebook imports them, so both extras -- and much of
-# ``analysis`` -- are now dead weight in the image and could be trimmed to speed
-# the build. Left in place rather than trimmed blind: that is a dependency
-# change, and the image is not the place to discover a transitive need.
+# NOTE (2026-09-10, was 2026-08-26): ``postBuild`` installs ``[analysis,catalog,viz]``.
+# ``viz`` (ipyleaflet) is LOAD-BEARING and must stay: ``hhdc_viewer``'s footprint
+# map imports ``ipyleaflet`` (``from ipyleaflet import GeoJSON, Map``), and like
+# ipympl it is a frontend extension, so a mid-session ``%pip install`` in the
+# notebook cannot recover it -- the image is the only place it can come from.
+# ``catalog`` (stac-geoparquet) was carried for the jupyterhub_example /
+# shardmap_viewer notebooks, which have been archived off main; it -- and much of
+# ``analysis`` -- is now dead weight and could be trimmed to speed the build.
+# Left in place rather than trimmed blind: that is a dependency change, and the
+# image is not the place to discover a transitive need.
 name: zagg-binder
 channels:
   - conda-forge
