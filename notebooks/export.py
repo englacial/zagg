@@ -191,10 +191,13 @@ def voxel_chips(handles, block, sensor="atl03", order=22, side=128, path=None):
         print(
             f"         {len(cut)} chip(s) needed a trim; worst kept {100 * worst:.1f}% of its weight"
         )
-    # Dense size is the tensors in MEMORY; on-disk is deflate on runs of zeros.
+    # Dense size is the tensors in MEMORY; the file is their deflate (mostly runs
+    # of zeros) PLUS a cell-word lattice per chip, so the ratio is the whole
+    # archive against the tensors, not the tensors' compressibility alone.
     print(
-        f"         {human_bytes(dense)} in memory -> {human_bytes(on_disk)} on disk "
-        f"({dense / on_disk:.0f}x — {100 * filled / (dense // 4):.3f}% of voxels occupied)"
+        f"         {human_bytes(dense)} of tensors in memory -> {human_bytes(on_disk)} on disk "
+        f"with their cell words ({dense / on_disk:.0f}x — "
+        f"{100 * filled / (dense // 4):.3f}% of voxels occupied)"
     )
     return path, meta
 
@@ -260,7 +263,7 @@ def registered_pair(handles, block, order=19, n_bins=128, resolution=0.5, path=N
     )
     print("\n".join(lines))
     print(
-        f"  wrote  {human_bytes(dense)} in memory -> {human_bytes(on_disk)} on disk "
-        f"in {path}, {time.perf_counter() - t1:.1f}s"
+        f"  wrote  {human_bytes(dense)} of cubes in memory -> {human_bytes(on_disk)} on disk "
+        f"in {path} with the shared cell lattice, {time.perf_counter() - t1:.1f}s"
     )
     return path, cubes
