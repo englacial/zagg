@@ -64,7 +64,6 @@ __all__ = [
     "block_of",
     "grid_xy",
     "densest_shard",
-    "human_bytes",
     "joint_cells",
     "paired_blocks",
     "viewer_stats",
@@ -218,11 +217,6 @@ def joint_cells(words, block_order: int = BLOCK_ORDER):
         return {}
     blocks, counts = np.unique(block_of(both, block_order), return_counts=True)
     return {int(b): int(c) for b, c in zip(blocks, counts)}
-
-
-def human_bytes(n) -> str:
-    """Byte count -> '320.0 MiB' / '1.25 GiB'. Exports print both sides of a write."""
-    return f"{n / 2**30:.2f} GiB" if n >= 2**30 else f"{n / 2**20:.1f} MiB"
 
 
 def block_of(words, block_order: int = BLOCK_ORDER):

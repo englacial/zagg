@@ -23,9 +23,31 @@ from moczarr.hhdc import (
     rowcol_to_rank,
 )
 from mortie import generate_morton_children
-from viewers import BLOCK_ORDER, SIDE, UNITS, human_bytes
+from viewers import BLOCK_ORDER, SIDE, UNITS
 
 __all__ = ["fit_window", "registered_pair", "voxel_chips"]
+
+
+def human_bytes(n) -> str:
+    """Byte count -> '320.0 MiB' / '1.25 GiB'. Exports print both sides of a write."""
+    return f"{n / 2**30:.2f} GiB" if n >= 2**30 else f"{n / 2**20:.1f} MiB"
+
+
+def _cell_words(word, order, depth):
+    """Order-`order` cells under `word`, in the (2**depth,)**2 raster the cubes use.
+
+    Children come back in z-order rank, the cubes are (row, col) rasters; this is
+    the deinterleave between them, done once at WRITE time so the exports carry
+    their own geometry and a reader georeferences with ``mort2geo(cells)`` alone.
+    """
+    rank = rowcol_to_rank(*np.divmod(np.arange(4**depth), 2**depth), depth=depth)
+    return generate_morton_children(int(word), order)[rank].reshape(2**depth, 2**depth)
+
+
+def _write_npy(zf, member, arr):
+    buf = BytesIO()
+    np.save(buf, arr)
+    zf.writestr(member, buf.getvalue())
 
 
 def _wq(zs, ws, q):
@@ -99,7 +121,7 @@ def voxel_chips(handles, block, sensor="atl03", order=22, side=128, path=None):
     its order-29 point word to `order` -- nested ranks are hierarchical -- which is
     how the cube gets finer than the stored cells. The z bin equals the cell edge
     and `n_bins` equals `side`, so every chip is a true cube; each keeps its own
-    `z0` and trim record in `meta.json`.
+    `z0` and trim record in `meta.json`, and its cell words in a `.cells` member.
     """
     store, field = handles[sensor]
     n_bins = side
@@ -138,10 +160,10 @@ def voxel_chips(handles, block, sensor="atl03", order=22, side=128, path=None):
                 acc = np.zeros((side, side, n_bins), dtype=np.float32)
                 np.add.at(acc, (row[mk] % side, col[mk] % side, iz), wt[mk])
                 chip = np.rint(acc).astype(np.uint32)  # merged centroids weigh fractionally
-                name = mz.morton_decimal(int(tiles[rowcol_to_rank(i, j, depth=depth)]))
-                buf = BytesIO()
-                np.save(buf, chip)
-                zf.writestr(f"{name}.npy", buf.getvalue())
+                tile = int(tiles[rowcol_to_rank(i, j, depth=depth)])
+                name = mz.morton_decimal(tile)
+                _write_npy(zf, f"{name}.npy", chip)
+                _write_npy(zf, f"{name}.cells.npy", _cell_words(tile, order, side.bit_length() - 1))
                 meta[name] = {
                     "z0": z0,
                     "dz": dz,
@@ -182,6 +204,7 @@ def registered_pair(handles, block, order=19, n_bins=128, resolution=0.5, path=N
 
     Each GEDI o18 cell is REPLICATED into its four o19 children rather than ATL03
     being merged up to o18 -- so a GEDI cube sums to four times its stored weight.
+    The `cells` key is the shared lattice's cell words, in cube (row, col) order.
     `chunk_z_range` is handed both sensors' digests together; derived per sensor it
     puts them bins apart, and nothing downstream notices.
     """
@@ -224,7 +247,8 @@ def registered_pair(handles, block, order=19, n_bins=128, resolution=0.5, path=N
         )
 
     path = path or f"registered_o{order}_{mz.morton_decimal(int(block))}.npz"
-    np.savez_compressed(path, **cubes, z0=z0, dz=dz, order=order)
+    cells = _cell_words(block, order, order - BLOCK_ORDER)
+    np.savez_compressed(path, **cubes, z0=z0, dz=dz, order=order, cells=cells)
     dense, on_disk = sum(c.nbytes for c in cubes.values()), os.path.getsize(path)
     fit = "as asked" if abs(dz - resolution) < 1e-9 else f"DEGRADED from {resolution:g} m"
     print(
