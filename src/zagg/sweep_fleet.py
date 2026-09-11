@@ -94,6 +94,31 @@ def dispatch_nodes(by_shard, dispatch: int, scope=None) -> list:
     return [n for n in nodes if scope_admits(n, scope)]
 
 
+def coverage_dispatch_nodes(by_shard, coverage, dispatch: int) -> list:
+    """Dispatch nodes COMPUTED from the store's own coverage (issue #547 ruling).
+
+    Worker assignment is never a hardcoded count: expand the store's coverage
+    MOC to the ``dispatch`` order, intersect with the shard set, and assign
+    workers from the result — 110 is merely what ATL03's o6 coverage evaluates
+    to today (espg ruling, 2026-09-11). ``coverage`` is a MOC the caller
+    already HOLDS — the run record's shard set, or the root ``coverage.moc``'s
+    words (:func:`zagg.hive.root_coverage_words`) handed in by the operator —
+    never read from the store here (D8: the invoke-only dispatcher role
+    cannot).
+
+    Spelled as :func:`dispatch_nodes` over the shard set with the coverage as
+    the scope MOC, because the two formulations name ONE set: a dispatch-order
+    ancestor of a committed shard lies in the coverage expanded to the
+    dispatch order exactly when its subtree intersects the coverage MOC
+    (containment resolves in either direction — :func:`zagg.sweep_stages.scope_admits`).
+    At the default one node per invoke, ``len()`` of the result IS the tuple's
+    worker count.
+    """
+    from zagg.sweep_stages import normalize_scope
+
+    return dispatch_nodes(by_shard, int(dispatch), normalize_scope(coverage))
+
+
 def _leaf_refs(by_shard, nodes=None) -> list:
     """``[[shard_key, window], ...]`` for the whole work set, or one node slice."""
     from zagg.grids.morton import morton_word
@@ -204,7 +229,9 @@ def _fit_batch(nodes, buckets, *, block: dict, store_path: str, output_creds_eve
     return _fit_batch(nodes[:mid], buckets, **kw) + _fit_batch(nodes[mid:], buckets, **kw)
 
 
-def pack_batches(nodes, by_shard, *, block: dict, store_path: str, output_creds_event=None) -> list:
+def pack_batches(
+    nodes, by_shard, *, block: dict, store_path: str, output_creds_event=None, max_nodes=None
+) -> list:
     """Split one tuple's dispatch nodes into invoke-sized batches.
 
     Returns ``[(nodes, leaves), ...]``, every node in exactly one batch and in
@@ -217,6 +244,16 @@ def pack_batches(nodes, by_shard, *, block: dict, store_path: str, output_creds_
     the ``discover: true`` form rather than truncating a work set, which would
     silently under-fold.
 
+    ``max_nodes`` caps how many dispatch nodes ride one batch; ``None`` packs
+    by payload alone. The two caps COMPOSE — whichever binds first closes the
+    batch, and the post-measure split below can only make batches smaller — so
+    every batch holds at most ``max_nodes`` nodes AND fits the payload cap.
+    Orchestration only, like ``tuple_width``: dispatch nodes own disjoint
+    subtrees, so batch membership changes no store bytes (the byte-identity
+    oracle re-runs at ``max_nodes=1``). Without it the payload cap alone put
+    an entire tuple on ONE worker — the whole 110-node ATL03 T1 fan-out is
+    ~90 KB (issue #547).
+
     The estimate is deliberately CONSERVATIVE (it charges the real ``", "``
     separators and a fixed envelope margin), and every batch it produces is
     then measured with one real ``json.dumps`` and split if it still exceeds
@@ -224,6 +261,12 @@ def pack_batches(nodes, by_shard, *, block: dict, store_path: str, output_creds_
     being silently converted to ``discover: true`` at build time.
     """
     from zagg.runner import _ASYNC_PAYLOAD_CAP_BYTES
+
+    if max_nodes is not None and int(max_nodes) < 1:
+        raise ValueError(
+            f"max_nodes must be >= 1, got {max_nodes} — pass None for payload-only packing"
+        )
+    max_nodes = None if max_nodes is None else int(max_nodes)
 
     # The fixed cost of the event minus its two variable-length lists, plus a
     # margin for the JSON punctuation the incremental accounting approximates.
@@ -238,7 +281,8 @@ def pack_batches(nodes, by_shard, *, block: dict, store_path: str, output_creds_
     for node in nodes:
         # `", "` between elements, both lists: json.dumps' default separators.
         cost = len(node) + 4 + sum(len(json.dumps(r)) + 2 for r in buckets.get(node, []))
-        if cur_nodes and cur_bytes + cost > budget:
+        full = cur_bytes + cost > budget or (max_nodes is not None and len(cur_nodes) >= max_nodes)
+        if cur_nodes and full:
             grouped.append(cur_nodes)
             cur_nodes, cur_bytes = [], 0
         if not cur_nodes and cost > budget:
@@ -384,6 +428,7 @@ def run_stage_sweep_fleet(
     shard_order: int,
     scope=None,
     tuple_width: int | None = None,
+    max_nodes_per_invoke: int | None = 1,
     run_id: str | None = None,
     output_creds_event=None,
     store_kwargs: dict | None = None,
@@ -404,6 +449,17 @@ def run_stage_sweep_fleet(
     ``shard_order`` is supplied by the caller rather than read from the
     manifest for the same reason: a dispatcher role may hold nothing but
     ``lambda:InvokeFunction``. The runner has it from the config.
+
+    ``max_nodes_per_invoke`` caps how many dispatch nodes one invoke folds
+    (:func:`pack_batches`, where it composes with the async payload cap). The
+    default is 1 — one dispatch node per invoke at every tuple, the espg-ruled
+    fan-out (issue #547, 2026-09-11): the finest tuple is where it binds (its
+    fattest node is already a full ``4^width`` subtree of leaf columns against
+    the 900 s wall), and the coarser tuples' node counts are small.
+    Orchestration only, like ``tuple_width`` — no store byte moves with it —
+    and the resulting worker count is COMPUTED from the work set per tuple
+    (:func:`dispatch_nodes`, or :func:`coverage_dispatch_nodes` from a
+    coverage MOC), never hardcoded. ``None`` restores payload-only packing.
 
     ``run_id`` names the lease, the skip-key/foreign-stamp namespace AND the
     status prefix the stage records land under, so it is generated here (or
@@ -451,6 +507,7 @@ def run_stage_sweep_fleet(
         "store_root": store_path,
         "shard_order": shard_order,
         "tuple_width": tuple_width,
+        "max_nodes_per_invoke": max_nodes_per_invoke,
         "scope": None if scope is None else [str(int(w)) for w in scope],
         "transport": "lambda",
         "records_from": records_from,
@@ -529,6 +586,7 @@ def run_stage_sweep_fleet(
             block=block,
             store_path=store_path,
             output_creds_event=output_creds_event,
+            max_nodes=max_nodes_per_invoke,
         )
         expected = set()
         for batch, (batch_nodes, batch_leaves) in enumerate(batches):

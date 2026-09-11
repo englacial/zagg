@@ -940,6 +940,62 @@ class TestDispatchNodes:
             assert all(_decimal_order(n) == dispatch for n in dispatch_nodes(by_shard, dispatch))
 
 
+class TestCoverageComputedAssignment:
+    """The espg generality ruling (issue #547, 2026-09-11): the dispatch-node
+    count is COMPUTED from the store's own coverage — the coverage MOC expanded
+    to the dispatch order, intersected with the shard set — never hardcoded.
+    110 is merely what ATL03's o6 coverage evaluates to today. Computed
+    dispatcher-side from a MOC the caller already holds, never read from the
+    store (D8)."""
+
+    def test_assignment_is_computed_from_the_fixture_stores_own_coverage(self, tmp_path):
+        from zagg.hive import read_root_coverage, root_coverage_words
+        from zagg.sweep_fleet import coverage_dispatch_nodes, dispatch_nodes
+
+        root = tmp_path / "s"
+        _stage_store(root)  # writes the root coverage.moc for exactly LEAVES
+        words = root_coverage_words(read_root_coverage(str(root)))
+        by_shard = {d: {None} for d in LEAVES}
+        # Pinned by value at every dispatch order — at the default one node
+        # per invoke, len() of each set IS that tuple's worker count:
+        assert coverage_dispatch_nodes(by_shard, words, 0) == ["-2", "1"]
+        assert coverage_dispatch_nodes(by_shard, words, 1) == ["-21", "11"]
+        assert coverage_dispatch_nodes(by_shard, words, 2) == ["-211", "111", "112"]
+        assert coverage_dispatch_nodes(by_shard, words, 3) == sorted(LEAVES)
+        # This store's coverage covers its work set, so the coverage-computed
+        # assignment and the work-set derivation name the same nodes:
+        for dispatch in (0, 1, 2, 3):
+            computed = coverage_dispatch_nodes(by_shard, words, dispatch)
+            assert computed == dispatch_nodes(by_shard, dispatch)
+
+    def test_a_coverage_only_subtree_gets_no_worker(self):
+        # The intersect-with-the-shard-set half: a covered cell with no
+        # committed shard in the work set is not assigned an invoke — the same
+        # scoped posture the dispatcher already has (D8, #381 point (11)).
+        from zagg.hive import build_root_coverage, root_coverage_words
+        from zagg.sweep_fleet import coverage_dispatch_nodes
+
+        words = root_coverage_words(
+            build_root_coverage([morton_word(d) for d in LEAVES + ["3111"]], 3)
+        )
+        by_shard = {d: {None} for d in LEAVES}
+        assert coverage_dispatch_nodes(by_shard, words, 0) == ["-2", "1"]
+
+    def test_a_shard_outside_the_coverage_gets_no_worker_either(self):
+        # The expand-the-coverage half: the assignment is the INTERSECTION,
+        # so a work-set shard the coverage MOC does not cover is filtered
+        # exactly as a scope MOC would filter it.
+        from zagg.hive import build_root_coverage, root_coverage_words
+        from zagg.sweep_fleet import coverage_dispatch_nodes
+
+        words = root_coverage_words(
+            build_root_coverage([morton_word(d) for d in LEAVES if d != "-2111"], 3)
+        )
+        by_shard = {d: {None} for d in LEAVES}
+        assert coverage_dispatch_nodes(by_shard, words, 0) == ["1"]
+        assert coverage_dispatch_nodes(by_shard, words, 2) == ["111", "112"]
+
+
 class TestBatching:
     def _block(self, dispatch=0):
         return {
@@ -1083,6 +1139,76 @@ class TestBatching:
         assert event["discover"] is True and "leaves" not in event
         assert "batch 7" in caplog.text and "async payload cap" in caplog.text
 
+    def test_max_nodes_one_gives_one_batch_per_node(self):
+        # The ruled T1 fan-out (issue #547): 110 dispatch nodes -> 110 single-
+        # node batches, each carrying exactly its own node's leaf slice. 110 is
+        # built here from a node set, as it is in production from the coverage
+        # (`TestCoverageComputedAssignment`) — the packer never pins a count.
+        from mortie import generate_morton_children
+
+        from zagg.grids.morton import morton_decimal
+        from zagg.sweep_fleet import pack_batches
+
+        under_1 = [morton_decimal(int(w)) for w in generate_morton_children(morton_word("1"), 3)]
+        under_2 = [morton_decimal(int(w)) for w in generate_morton_children(morton_word("2"), 3)]
+        nodes = sorted(under_1 + under_2[:46])
+        assert len(nodes) == 110
+        by_shard = {n + "1": {None} for n in nodes}
+        batches = pack_batches(
+            nodes, by_shard, block=self._block(3), store_path="s3://b/p.zarr", max_nodes=1
+        )
+        assert len(batches) == 110
+        assert [b for b, _ in batches] == [[n] for n in nodes]
+        for (node,), refs in batches:
+            assert refs == [[morton_word(node + "1"), None]]
+
+    def test_the_max_nodes_cap_composes_with_the_payload_cap(self):
+        # Two caps, one batch list: no batch exceeds max_nodes AND every
+        # inline batch measures under the async cap — on a work set whose leaf
+        # slices force the payload cap to bind below the node cap.
+        from mortie import generate_morton_children
+
+        from zagg.grids.morton import morton_decimal
+        from zagg.runner import _ASYNC_PAYLOAD_CAP_BYTES
+        from zagg.sweep_fleet import build_stage_event, pack_batches
+
+        leaves = [morton_decimal(int(w)) for w in generate_morton_children(morton_word("1"), 7)]
+        by_shard = {d: {None} for d in leaves}
+        nodes = sorted({d[:4] for d in leaves})
+        block = self._block(3)
+        # ~39 of these 256-leaf-ref nodes fit the 250 KB cap. At max_nodes=50
+        # the PAYLOAD cap is what closes batches (all under 50); at
+        # max_nodes=16 the NODE cap is (all exactly 16, where 39 would fit).
+        at_50 = pack_batches(nodes, by_shard, block=block, store_path="s3://b/p.zarr", max_nodes=50)
+        assert all(len(batch_nodes) < 50 for batch_nodes, _ in at_50)
+        at_16 = pack_batches(nodes, by_shard, block=block, store_path="s3://b/p.zarr", max_nodes=16)
+        assert [len(batch_nodes) for batch_nodes, _ in at_16] == [16, 16, 16, 16]
+        # Either way: nothing lost or reordered, and every batch ships inline
+        # under the measured cap.
+        for batches in (at_50, at_16):
+            assert [n for batch_nodes, _ in batches for n in batch_nodes] == nodes
+            for batch, (batch_nodes, refs) in enumerate(batches):
+                assert refs is not None
+                event = build_stage_event(
+                    "s3://b/p.zarr", {**block, "nodes": batch_nodes, "batch": batch}, refs
+                )
+                assert "discover" not in event
+                assert len(json.dumps(event)) <= _ASYNC_PAYLOAD_CAP_BYTES
+
+    def test_a_max_nodes_below_one_refuses_by_name(self):
+        from zagg.sweep_fleet import pack_batches
+
+        by_shard = {d: {None} for d in LEAVES}
+        for bad in (0, -1):
+            with pytest.raises(ValueError, match="max_nodes"):
+                pack_batches(
+                    ["-2", "1"],
+                    by_shard,
+                    block=self._block(),
+                    store_path="s3://b/p.zarr",
+                    max_nodes=bad,
+                )
+
     def test_an_empty_work_set_is_not_a_discovery_request(self):
         from zagg.sweep_fleet import build_stage_event
 
@@ -1176,15 +1302,17 @@ class TestBarrier:
 
 class TestFleetOrchestration:
     def test_tuple_ordering_is_finest_first_with_the_finisher_last(self, tmp_path):
+        # At the ruled default of one dispatch node per invoke the fixture's
+        # three tuples fan out 3/2/2 invokes — still strictly finest-first.
         mod = _handler_module()
         root = tmp_path / "s"
         _stage_store(root)
         client = _FakeLambda(mod.lambda_handler)
         summary = _fleet(root, client, tuple_width=1)
-        assert [b.get("dispatch") for b in client.blocks()] == [2, 1, 0, None]
-        assert [b["role"] for b in client.blocks()] == ["stage"] * 3 + ["finisher"]
+        assert [b.get("dispatch") for b in client.blocks()] == [2, 2, 2, 1, 1, 0, 0, None]
+        assert [b["role"] for b in client.blocks()] == ["stage"] * 7 + ["finisher"]
         assert [s["dispatch_order"] for s in summary["stages"]] == [2, 1, 0]
-        assert summary["invokes"] == 4 and summary["finisher"]["landed"]
+        assert summary["invokes"] == 8 and summary["finisher"]["landed"]
         assert summary["finisher"]["fired"] and summary["skipped"] is None
 
     def test_no_dispatch_nodes_fires_nothing_at_all(self, tmp_path):
@@ -1273,7 +1401,7 @@ class TestFleetOrchestration:
         # outside the store root; on s3:// a LIST creates no object.)
         assert not (root / "sweep.lease.json").exists()
         assert not list((tmp_path / "s.status").rglob("*.json"))
-        assert client.events and summary["invokes"] == 4
+        assert client.events and summary["invokes"] == 8
         assert all(s["barrier_timed_out"] for s in summary["stages"])
         assert summary["finisher"]["landed"] is False
 
@@ -1306,7 +1434,11 @@ class TestFleetOrchestration:
         mod = _handler_module()
         root = tmp_path / "s"
         _stage_store(root)
-        client = _FakeLambda(mod.lambda_handler, drop={stage_record_name(0, 0)})
+        # One node per invoke is the default, so losing the whole order-0
+        # tuple means losing both of its single-node batches.
+        client = _FakeLambda(
+            mod.lambda_handler, drop={stage_record_name(0, 0), stage_record_name(0, 1)}
+        )
         summary = _fleet(root, client, tuple_width=1, barrier_timeout_s=0.05)
         assert [s["barrier_timed_out"] for s in summary["stages"]] == [False, False, True]
         # An expiry may mean the invoke is merely QUEUED, so the finisher can
@@ -1349,8 +1481,11 @@ class TestFleetOrchestration:
         run_id = "reused"
         prefix = Path(run_status_prefix(str(root), run_id))
         prefix.mkdir(parents=True, exist_ok=True)
-        for dispatch in (0, 1, 2):  # every name this run will produce
-            (prefix / stage_record_name(dispatch, 0)).write_text("{}")
+        # Every name this run will produce: one batch per dispatch node at the
+        # default fan-out (3/2/2 nodes at dispatch 2/1/0 on this fixture).
+        for dispatch, batches in ((0, 2), (1, 2), (2, 3)):
+            for batch in range(batches):
+                (prefix / stage_record_name(dispatch, batch)).write_text("{}")
         (prefix / FINISHER_RECORD_NAME).write_text("{}")
         # A client that records invokes and lands NOTHING: every barrier must
         # expire, because nothing new appeared.
@@ -1386,15 +1521,35 @@ class TestFleetOrchestration:
         assert not (root / "-2" / "all.zarr").exists()
         assert summary["scope"] == [str(int(w)) for w in normalize_scope(["1111"])]
 
-    def test_the_finest_tuple_rides_inline_with_the_whole_work_set(self, tmp_path):
-        # Smoke: at this fixture's size the finest tuple is ONE batch, so it
-        # carries every leaf inline. The per-batch slicing property needs a
-        # multi-batch fan-out -- the next test.
+    def test_the_default_fan_out_is_one_node_per_invoke(self, tmp_path):
+        # The espg-ruled default (issue #547, 2026-09-11): every tuple
+        # dispatches one node per invoke, and the count is COMPUTED from the
+        # work set per tuple — 3/2/2 on this fixture, never a pinned number.
         mod = _handler_module()
         root = tmp_path / "s"
         _stage_store(root)
         client = _FakeLambda(mod.lambda_handler)
-        _fleet(root, client, tuple_width=1)
+        summary = _fleet(root, client, tuple_width=1)
+        assert summary["max_nodes_per_invoke"] == 1
+        stage_blocks = [b for b in client.blocks() if b["role"] == "stage"]
+        assert all(len(b["nodes"]) == 1 for b in stage_blocks)
+        assert [(s["nodes"], s["batches"]) for s in summary["stages"]] == [
+            (3, 3),
+            (2, 2),
+            (2, 2),
+        ]
+        assert summary["finisher"]["landed"]
+
+    def test_the_finest_tuple_rides_inline_with_the_whole_work_set(self, tmp_path):
+        # Smoke for PAYLOAD-ONLY packing (max_nodes_per_invoke=None): at this
+        # fixture's size the finest tuple is ONE batch, so it carries every
+        # leaf inline. The per-batch slicing property needs a multi-batch
+        # fan-out -- the next test.
+        mod = _handler_module()
+        root = tmp_path / "s"
+        _stage_store(root)
+        client = _FakeLambda(mod.lambda_handler)
+        _fleet(root, client, tuple_width=1, max_nodes_per_invoke=None)
         finest = [e for e in client.events if e["stage"].get("dispatch") == 2]
         from zagg.grids.morton import morton_decimal
 
@@ -1415,13 +1570,13 @@ class TestFleetOrchestration:
         # tuple has to split. (`store_path` is in every event, so a literal cap
         # would be a function of tmp_path's length.)
         probe = _FakeLambda(None)
-        _fleet(root, probe, tuple_width=1, barrier_timeout_s=0.01)
+        _fleet(root, probe, tuple_width=1, max_nodes_per_invoke=None, barrier_timeout_s=0.01)
         single = next(e for e in probe.events if e["stage"].get("dispatch") == 2)
         assert len(single["stage"]["nodes"]) > 1
         monkeypatch.setattr(zagg.runner, "_ASYNC_PAYLOAD_CAP_BYTES", len(json.dumps(single)) - 40)
 
         client = _FakeLambda(mod.lambda_handler)
-        _fleet(root, client, tuple_width=1)
+        _fleet(root, client, tuple_width=1, max_nodes_per_invoke=None)
         events = [e for e in client.events if e["stage"].get("dispatch") == 2]
         assert len(events) > 1, "the cap did not force a multi-batch fan-out"
         nodes: list = []
@@ -1752,6 +1907,7 @@ class TestByteIdentityOracle:
         fleet_width=None,
         squeeze=False,
         windows=None,
+        max_nodes="default",
     ):
         """CLI sweep -> snapshot -> reset -> fleet sweep -> snapshot.
 
@@ -1760,8 +1916,12 @@ class TestByteIdentityOracle:
         ``width`` drives BOTH arms (the byte-exact comparison); ``fleet_width``
         overrides the fleet's alone, which is the deliberate cross-width arm.
         ``squeeze`` caps the async payload just under the tuple's REAL event so
-        the fan-out has to split. ``windows`` swaps in the windowed/all-time
-        store so the leaf refs carry a window rather than ``None``.
+        the fan-out has to split — it packs by payload alone
+        (``max_nodes_per_invoke=None``), since that is the axis it exists to
+        exercise. ``max_nodes`` (an int or ``None``) overrides the fleet's
+        ``max_nodes_per_invoke``; ``"default"`` leaves the dispatcher's own
+        default in force. ``windows`` swaps in the windowed/all-time store so
+        the leaf refs carry a window rather than ``None``.
         Returns ``(cli, fleet, summary, client)``.
         """
         mod = _handler_module()
@@ -1783,6 +1943,7 @@ class TestByteIdentityOracle:
         _restore(root, base)
         assert _snapshot(root) == base, "the reset did not restore the pre-sweep store"
 
+        extra = {} if max_nodes == "default" else {"max_nodes_per_invoke": max_nodes}
         if squeeze:
             # Measured, not guessed: a probe run with no handler writes nothing
             # and reports the tuple's real single-batch event. One byte under
@@ -1792,8 +1953,9 @@ class TestByteIdentityOracle:
             # and the per-batch slicing this arm exists for never rides.
             import zagg.runner
 
+            extra = {"max_nodes_per_invoke": None}
             probe = _FakeLambda(None)
-            _fleet(root, probe, tuple_width=width, barrier_timeout_s=0.01)
+            _fleet(root, probe, tuple_width=width, barrier_timeout_s=0.01, **extra)
             single = next(e for e in probe.events if e["stage"].get("role") == "stage")
             assert len(single["stage"]["nodes"]) > 1
             monkeypatch.setattr(
@@ -1806,6 +1968,7 @@ class TestByteIdentityOracle:
             client,
             leaves=refs,
             tuple_width=width if fleet_width is None else fleet_width,
+            **extra,
         )
         return cli, _snapshot(root), fleet, client
 
@@ -1868,6 +2031,19 @@ class TestByteIdentityOracle:
         # and `pack_batches`' partition is never exercised at all.
         fired = [e for e in client.events if e["stage"].get("role") == "stage"]
         assert len(fired) > 1
+        assert all("leaves" in e and "discover" not in e for e in fired)
+        _assert_identical(cli, fleet)
+
+    def test_identity_survives_the_one_node_per_invoke_fan_out(self, tmp_path):
+        # The espg-ruled fan-out (issue #547, 2026-09-11): one dispatch node
+        # per invoke — the finest grouping this transport can express, and the
+        # dispatcher's default. Batch membership is orchestration only, so the
+        # oracle re-runs at it: the finer fan-out must change no bytes.
+        cli, fleet, summary, client = self._both_arms(tmp_path, max_nodes=1)
+        assert all(s["batches"] == s["nodes"] for s in summary["stages"])
+        fired = [e for e in client.events if e["stage"].get("role") == "stage"]
+        assert len(fired) > 1  # the split really happened on this fixture
+        assert all(len(e["stage"]["nodes"]) == 1 for e in fired)
         assert all("leaves" in e and "discover" not in e for e in fired)
         _assert_identical(cli, fleet)
 
