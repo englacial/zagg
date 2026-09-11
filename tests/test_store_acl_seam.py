@@ -109,17 +109,15 @@ class TestOwnershipSemanticsUnchanged:
             assert put.acl == ACL, f"{put.path} published with no canned ACL"
             assert put.acl_signed, f"{put.path} carries an unsigned ACL: {put.signed_headers}"
 
-    def test_a_multipart_chunk_signs_the_acl_on_create_multipart_upload(self, published, fake_s3):
-        # ``CreateMultipartUpload`` is the request that applies a multipart
-        # object's ACL -- ``UploadPart``/``CompleteMultipartUpload`` ignore
-        # ``x-amz-acl`` -- and at ~131 MB/shard multipart is the fleet's NORMAL
-        # write path, so the seam has to route THAT request to the twin and not
-        # merely the simple PUT. The test above cannot see it: ``_puts()``
-        # filters on ``method == "PUT"`` and this one is a ``POST ?uploads``,
-        # so a chunk that crossed the multipart threshold would leave it green
-        # while the object landed owner-less. ``test_store_acl_signing``'s
-        # ``test_acl_default_header_is_signed_on_create_multipart_upload`` pins
-        # the same request through bare obstore; this is it through zagg.
+    def test_an_oversize_chunk_is_written_as_one_signed_put(self, published, fake_s3):
+        # Issue #534: the chunk objects that cross obstore's 5 MiB multipart
+        # threshold are exactly the ones that failed, because ``UploadPart``
+        # refuses ``x-amz-acl``. The test above cannot see them -- ``_puts()``
+        # filters on ``method == "PUT"`` and a multipart flow opens with a
+        # ``POST ?uploads`` -- so a regression to multipart would leave it green
+        # while every ragged chunk 400'd in the fleet. So assert the framing and
+        # not merely the header: one PUT for the chunk, no multipart request of
+        # any shape.
         import numpy as np
         import zarr
 
@@ -139,13 +137,111 @@ class TestOwnershipSemanticsUnchanged:
         )
         array[:] = np.arange(n, dtype="i4")
 
-        creates = [r for r in fake_s3.requests if r.method == "POST" and "uploads" in r.query]
-        assert len(creates) == 1, f"expected one CreateMultipartUpload, got {creates}"
-        (create,) = creates
-        assert create.acl == ACL, "the multipart chunk was created with no canned ACL"
-        assert create.acl_signed, (
-            f"CreateMultipartUpload carries an unsigned ACL: {create.signed_headers}"
+        assert not [r for r in fake_s3.requests if r.method == "POST" and "uploads" in r.query]
+        assert not [r for r in _puts(fake_s3) if "partNumber" in r.query]
+        (chunk,) = [r for r in _puts(fake_s3) if r.path.endswith("/big/c/0")]
+        assert chunk.acl == ACL, "the oversize chunk was published with no canned ACL"
+        assert chunk.acl_signed, f"the chunk carries an unsigned ACL: {chunk.signed_headers}"
+        # The bytes really landed: a single PUT that never happened would
+        # satisfy every assertion above.
+        assert len(fake_s3.objects["englacial/zagg/demo.zarr/big/c/0"]) == n * 4
+
+    def test_an_oversize_side_channel_object_is_written_as_one_put(self, published, fake_s3):
+        # The raw-obstore seam has the same bug and takes the same fix. Most of
+        # what goes through ``put_object`` is small JSON, but the inline index
+        # buffer, the temporal tabular object and a column backfill payload are
+        # bounded by nothing that keeps them under 5 MiB.
+        from zagg.store import open_object_store, put_object
+
+        payload = b"x" * (8 * 1024 * 1024)
+        put_object(published(open_object_store), "big.parquet", payload)
+
+        assert not [r for r in fake_s3.requests if r.method == "POST"]
+        (put,) = _puts(fake_s3)
+        assert "partNumber" not in put.query
+        assert put.acl == ACL
+        assert put.acl_signed
+        assert fake_s3.objects["englacial/zagg/demo.zarr/big.parquet"] == payload
+
+    def test_a_conditional_write_is_a_single_put_too(self, published, fake_s3, monkeypatch):
+        # ``set_if_not_exists`` and ``put_object(mode="create")`` -- the sweep
+        # lease's claim -- are conditional puts, and obstore already declines
+        # multipart for any mode other than "overwrite". So the WIRE cannot
+        # tell the two apart: drop ``use_multipart=False`` from
+        # ``set_if_not_exists`` and the framing below is unchanged. The
+        # observable difference is the argument, so spy on it at the seam --
+        # the way ``tests/test_output.py`` pins ``put_object`` -- and keep the
+        # framing assertions alongside, so the twin's one-operation property
+        # rests on our own request rather than on an obstore detail.
+        import obstore
+        from zarr.core.buffer import cpu
+        from zarr.core.sync import sync
+
+        from zagg.store import open_object_store, open_store, put_object
+
+        real_put_async = obstore.put_async
+        seen = []
+
+        async def _spy(store, key, value, **kwargs):
+            seen.append((key, kwargs))
+            return await real_put_async(store, key, value, **kwargs)
+
+        monkeypatch.setattr(obstore, "put_async", _spy)
+
+        zstore = published(open_store)
+        sync(zstore.set_if_not_exists("cond", cpu.Buffer.from_bytes(b"y" * (8 * 1024 * 1024))))
+        put_object(published(open_object_store), "lease.json", b"{}", mode="create")
+
+        (cond,) = [(key, kwargs) for key, kwargs in seen if key == "cond"]
+        assert cond[1].get("mode") == "create"
+        assert cond[1].get("use_multipart") is False, (
+            f"set_if_not_exists left the framing to obstore: {cond[1]}"
         )
+
+        assert not [r for r in fake_s3.requests if r.method == "POST"]
+        assert len(_puts(fake_s3)) == 2
+        for put in _puts(fake_s3):
+            assert "partNumber" not in put.query
+            assert put.acl == ACL and put.acl_signed
+
+    def test_an_in_account_write_still_multiparts(self, fake_s3, monkeypatch):
+        # The fix must stay invisible off the published path: declining
+        # multipart is the price of carrying the ACL, and an in-account target
+        # carries no ACL, so it keeps obstore's own framing and its parallelism.
+        import obstore
+
+        import zagg.store as store_mod
+
+        monkeypatch.setattr(store_mod, "_external_target", lambda *a, **k: False)
+        payload = b"x" * (8 * 1024 * 1024)
+        store = store_mod.open_object_store(
+            STORE_PATH,
+            credentials=CREDS,
+            endpoint_url=fake_s3.endpoint,
+            client_options={"allow_http": True},
+        )
+        assert store_mod.acl_write_store(store) is store
+        store_mod.put_object(store, "big", payload)
+
+        assert [r for r in fake_s3.requests if r.method == "POST" and "uploads" in r.query]
+        assert [r for r in _puts(fake_s3) if "partNumber" in r.query]
+        assert obstore.get(store, "big").bytes() == payload
+
+    def test_a_payload_past_the_single_put_ceiling_is_refused_by_key(self):
+        # The tripwire for the day a chunk object outgrows ``PutObject``.
+        # Driven on the check itself rather than through a 5 GiB buffer, and
+        # asserted to name the key, because saying WHICH object is its job.
+        from types import SimpleNamespace
+
+        from zagg.store import _SINGLE_PUT_MAX_BYTES, _check_single_put
+
+        _check_single_put("small", b"x" * 1024)
+        _check_single_put("unmeasurable", object())
+        with pytest.raises(ValueError, match=r"19/h_tdigest_signal/c/0.*multipart"):
+            _check_single_put(
+                "19/h_tdigest_signal/c/0",
+                SimpleNamespace(nbytes=_SINGLE_PUT_MAX_BYTES + 1),
+            )
 
     def test_put_object_signs_the_acl_on_a_side_channel_write(self, published, fake_s3):
         # Status envelopes, hive manifests and stats sidecars are real objects

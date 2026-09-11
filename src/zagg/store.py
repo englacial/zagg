@@ -85,10 +85,7 @@ _S3_READONLY_RETRY_CONFIG = {
 # ``<HeadersNotSigned>x-amz-acl</HeadersNotSigned>`` -- so a handle that carries
 # the ACL cannot list. That is not a corner: the per-leaf template guard lists
 # the digit tree and the status poller lists its channel, which is how 2,726/2,726
-# fleet workers died on the first source.coop build. The signed half is
-# load-bearing and must not be given up: ``CreateMultipartUpload`` is what sets a
-# multipart object's ACL (``UploadPart``/``CompleteMultipartUpload`` ignore it),
-# and at ~131 MB/shard multipart is the normal write path.
+# fleet workers died on the first source.coop build.
 #
 # So the header rides a SEPARATE handle from the one that reads (issue #522):
 # :func:`_s3_object_store` returns a clean store and hangs an ACL-bearing twin
@@ -98,10 +95,42 @@ _S3_READONLY_RETRY_CONFIG = {
 # also retires the old inert-header exception: ``open_object_store`` has no
 # read-only concept, so ``temporal.open_dataset``'s NetCDF branch (a pure GET of
 # a consumer INPUT bucket, issue #223) used to send the header and now does not.
+#
+# And that handle issues exactly ONE operation, ``PutObject`` (issue #534).
+# Signing the header is necessary but not sufficient, because S3's rules differ
+# per operation: ``x-amz-acl`` is legal on ``PutObject`` and on
+# ``CreateMultipartUpload``, and ILLEGAL on ``UploadPart``, which answers
+# ``400 InvalidArgument``, "The specified header is not valid in this context",
+# ``<ArgumentName>x-amz-acl</ArgumentName>``. obstore has no per-request ACL and
+# no way to withhold a default header from one operation, so a multipart write on
+# this handle cannot be made legal -- it can only be avoided. Both write seams
+# therefore pass ``use_multipart=False`` (:func:`put_object` and
+# :class:`_AclWriteObjectStore`), which leaves ``PutObject`` as the only request
+# the twin is capable of making. That is deliberately a property of the handle
+# rather than a list of permitted operations: enumerating the operations once,
+# and missing ``UploadPart``, is exactly how #534 reached the fleet, where it
+# failed 52 of 60 sampled shards on the CA GEDI build.
+#
+# The cost is a multipart upload's parallelism, on objects that do not need it:
+# zagg publishes 1-17 MB chunk objects (an ATL03 leaf's largest measured 16.9 MB,
+# a GEDI ``rx_flux`` chunk ~11 MB) against obstore's 5 MiB multipart threshold,
+# so only the handful of ragged chunks per leaf were multipart at all.
+# :data:`_SINGLE_PUT_MAX_BYTES` is where that stops being true.
+#
 # The asymmetry above is pinned by ``tests/test_store_acl_signing.py`` against
 # captured wire bytes, so an obstore change to it fails there rather than in a
 # fleet run.
 _BUCKET_OWNER_ACL = "bucket-owner-full-control"
+
+# S3's ``PutObject`` ceiling. A larger object can only be written as a multipart
+# upload, which is the one thing a handle carrying the canned ACL cannot do
+# (issue #534) -- so this is not a limit to absorb quietly but the point at which
+# publishing to an external bucket needs a different answer: a finer chunk grid,
+# or a clean multipart write followed by a ``PutObjectAcl`` to hand ownership
+# over (the grant already includes that action). Today's published objects are
+# ~300x below it; the check exists so that the day one is not, it surfaces here
+# with the key that caused it rather than as a 400 partway through a fleet run.
+_SINGLE_PUT_MAX_BYTES = 5 * 1024**3
 
 # Where the ACL-bearing twin hangs off the clean handle. An attribute rather
 # than a registry so the pairing travels with the store -- including through
@@ -331,18 +360,28 @@ class _AclWriteObjectStore(ObjectStore):
     not the hazard: ``tests/test_store_acl_signing.py`` measures ``POST
     ?delete`` signing the header fine.
 
-    Overriding the two write methods rather than reimplementing them keeps the
-    adapter's own semantics (the ``mode="create"`` conditional put, its
-    ``AlreadyExistsError`` suppression) as the single source of truth.
+    Both write methods are spelled out here rather than delegated to a second
+    adapter, because the adapter cannot express the one thing that makes them
+    legal: it calls ``put_async(store, key, buf)`` bare, and the ACL handle must
+    pass ``use_multipart=False`` (issue #534, see :data:`_BUCKET_OWNER_ACL`).
+    ``set_if_not_exists`` gets it too, although obstore already forces a
+    non-multipart upload for any ``mode`` other than ``"overwrite"`` -- relying
+    on that would leave the twin's single-operation property resting on an
+    obstore implementation detail. The wire cannot tell the two apart, so
+    ``tests/test_store_acl_seam.py`` spies on ``obstore.put_async`` and asserts
+    the argument itself; drop it here and that test goes red.
     """
 
     def __init__(self, store, acl_store, *, read_only: bool = False) -> None:
         super().__init__(store, read_only=read_only)
-        self._acl_writer = ObjectStore(store=acl_store, read_only=read_only)
+        # The RAW obstore handle, not a second zarr adapter: the writes below
+        # drive obstore directly, so an adapter around it would be an unused
+        # wrapper whose own ``read_only`` flag could drift from this store's.
+        self._acl_store = acl_store
 
     def with_read_only(self, read_only: bool = False):
         # docstring inherited
-        return type(self)(self.store, self._acl_writer.store, read_only=read_only)
+        return type(self)(self.store, self._acl_store, read_only=read_only)
 
     def __eq__(self, other: object) -> bool:
         # The inherited __eq__ compares only ``read_only`` and ``self.store``
@@ -356,18 +395,29 @@ class _AclWriteObjectStore(ObjectStore):
         return (
             isinstance(other, _AclWriteObjectStore)
             and super().__eq__(other)
-            and self._acl_writer.store == other._acl_writer.store
+            and self._acl_store == other._acl_store
         )
 
     async def set(self, key, value):
         # docstring inherited
+        import obstore as obs
+
         self._check_writable()
-        await self._acl_writer.set(key, value)
+        buf = value.as_buffer_like()
+        _check_single_put(key, buf)
+        await obs.put_async(self._acl_store, key, buf, use_multipart=False)
 
     async def set_if_not_exists(self, key, value):
         # docstring inherited
+        import contextlib
+
+        import obstore as obs
+
         self._check_writable()
-        await self._acl_writer.set_if_not_exists(key, value)
+        buf = value.as_buffer_like()
+        _check_single_put(key, buf)
+        with contextlib.suppress(obs.exceptions.AlreadyExistsError):
+            await obs.put_async(self._acl_store, key, buf, mode="create", use_multipart=False)
 
 
 def _s3_object_store(
@@ -571,6 +621,25 @@ def acl_write_store(store):
     return getattr(store, _ACL_WRITE_STORE_ATTR, store)
 
 
+def _check_single_put(key, value):
+    """Refuse a payload only a multipart upload could carry (issue #534).
+
+    Sized off the buffer where it can be, and skipped where it cannot: obstore
+    accepts paths, file objects and iterators too, and none of zagg's write
+    seams pass one. A miss here costs the clear error, not correctness -- S3
+    still rejects the request.
+    """
+    size = getattr(value, "nbytes", None)
+    if not isinstance(size, int):
+        size = len(value) if isinstance(value, bytes | bytearray) else None
+    if size is not None and size > _SINGLE_PUT_MAX_BYTES:
+        raise ValueError(
+            f"{key}: {size} bytes exceeds the {_SINGLE_PUT_MAX_BYTES}-byte single-PUT "
+            "ceiling, and a write carrying the bucket-owner canned ACL cannot use a "
+            "multipart upload (issue #534)"
+        )
+
+
 def put_object(store, key, value, **kwargs):
     """``obstore.put`` onto the handle that carries the canned ACL (issue #522).
 
@@ -580,11 +649,28 @@ def put_object(store, key, value, **kwargs):
     keep using the store the caller already holds, which is the clean one.
     ``tests/test_store.py`` fails the build if a direct ``obstore.put`` is
     reintroduced, because a missed site publishes an object Source Cooperative
-    cannot manage and says nothing about it.
+    cannot manage and says nothing about it. A second guard there covers the
+    boto3 writes the first cannot see (it scans obstore names only), against an
+    allowlist naming why each of the two that exist may stand outside this seam
+    -- so a new one fails the build rather than quietly publishing an
+    owner-less object.
+
+    A write that lands on the ACL twin is forced to a single ``PutObject``
+    (issue #534). Most objects on this route are small JSON, but not all of them
+    -- the inline index buffer, the temporal tabular object and a column
+    backfill payload can all cross obstore's 5 MiB multipart threshold, and any
+    of them multiparting would fail the same way a chunk write did.
     """
     import obstore
 
-    return obstore.put(acl_write_store(store), key, value, **kwargs)
+    target = acl_write_store(store)
+    if target is not store:
+        # Overridden, not defaulted: ``use_multipart=True`` on this handle is a
+        # request for a 400, so there is nothing for a caller to know better
+        # about. In-account targets keep obstore's own choice untouched.
+        kwargs["use_multipart"] = False
+        _check_single_put(key, value)
+    return obstore.put(target, key, value, **kwargs)
 
 
 def parse_s3_path(path: str) -> tuple[str, str]:

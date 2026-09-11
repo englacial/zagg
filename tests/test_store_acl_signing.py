@@ -130,6 +130,12 @@ class FakeS3:
                 payload = self.rfile.read(length)
                 self._record()
                 query = parse_qs(urlparse(self.path).query, keep_blank_values=True)
+                if "uploadId" in query and "x-amz-acl" in self.headers:
+                    # What real S3 answers, verbatim (issue #534). ``x-amz-acl``
+                    # is legal on PutObject and CreateMultipartUpload and not on
+                    # UploadPart, and the stand-in has to model the difference
+                    # or the fleet's failure mode passes silently here.
+                    return self._send(400, server._invalid_acl_argument_xml())
                 with server._lock:
                     if "uploadId" in query:  # UploadPart
                         upload = server.uploads.setdefault(query["uploadId"][0], {})
@@ -195,6 +201,15 @@ class FakeS3:
             ET.SubElement(node, "ETag").text = '"fake"'
         for pfx in sorted(common):
             ET.SubElement(ET.SubElement(root, "CommonPrefixes"), "Prefix").text = pfx
+        return ET.tostring(root, encoding="utf-8", xml_declaration=True)
+
+    def _invalid_acl_argument_xml(self) -> bytes:
+        """The ``400`` S3 returns for ``x-amz-acl`` on ``UploadPart``."""
+        root = ET.Element("Error")
+        ET.SubElement(root, "Code").text = "InvalidArgument"
+        ET.SubElement(root, "Message").text = "The specified header is not valid in this context"
+        ET.SubElement(root, "ArgumentName").text = "x-amz-acl"
+        ET.SubElement(root, "ArgumentValue").text = ACL
         return ET.tostring(root, encoding="utf-8", xml_declaration=True)
 
     def _initiate_upload_xml(self, key: str) -> bytes:
@@ -296,28 +311,54 @@ class TestObstoreDefaultHeaderSigning:
         assert put.acl == ACL
         assert put.acl_signed, f"expected x-amz-acl in SignedHeaders, got {put.signed_headers}"
 
-    def test_acl_default_header_is_signed_on_create_multipart_upload(self, fake_s3):
-        # The write that actually matters at fleet scale. At ~131 MB/shard a
-        # published write is a MULTIPART upload, and CreateMultipartUpload is
-        # the one request in that flow that applies a canned ACL
-        # (UploadPart/CompleteMultipartUpload ignore ``x-amz-acl``). If obstore
-        # ever stopped signing the default header there, every published shard
-        # would land owner-less -- no 403, nothing to notice -- which is a
-        # worse failure than the LIST bug this PR fixes. So pin it.
+    def test_a_multipart_write_carrying_the_acl_dies_on_uploadpart(self, fake_s3):
+        """Issue #534, in one request pair.
+
+        obstore signs the default header on ``CreateMultipartUpload`` -- the
+        request that would actually apply the ACL -- and then sends it again on
+        ``UploadPart``, where S3 refuses it: ``400 InvalidArgument``, "The
+        specified header is not valid in this context",
+        ``<ArgumentName>x-amz-acl</ArgumentName>``. Both halves are asserted
+        here, because the fix depends on both: the signing is why a canned ACL
+        can be carried at all, and the rejection is why it cannot be carried
+        through a multipart upload.
+
+        This is what 52 of 60 sampled shards hit on the CA GEDI build, and what
+        a deliberate single-shard test hit at ``partNumber=1`` -- its store on
+        source.coop is missing exactly its two ragged chunks, the only objects
+        it wrote over obstore's 5 MiB multipart threshold.
+        """
         import obstore
 
         store = _raw_store(fake_s3, default_headers=ACL_HEADERS)
-        payload = b"x" * (3 * 1024 * 1024)
-        with obstore.open_writer(
-            store, "big", buffer_size=1024 * 1024, max_concurrency=1
-        ) as writer:
-            writer.write(payload)
+        with pytest.raises(obstore.exceptions.BaseError, match="InvalidArgument"):
+            obstore.put(store, "big", b"x" * (8 * 1024 * 1024))
+
         (create,) = [r for r in fake_s3.of("POST") if "uploads" in r.query]
         assert create.acl == ACL
         assert create.acl_signed, (
             f"expected x-amz-acl in SignedHeaders, got {create.signed_headers}"
         )
-        # The whole flow completed, so the capture above is the real one.
+        parts = [r for r in fake_s3.of("PUT") if "partNumber" in r.query]
+        assert parts, "no UploadPart went out -- the flow did not reach the rejection"
+        assert all(part.acl == ACL for part in parts)
+        assert "p/big" not in fake_s3.objects
+
+    def test_the_same_payload_lands_as_a_single_put(self, fake_s3):
+        # The other half of the fix's premise, one layer below zagg: the ACL is
+        # legal on ``PutObject`` at any size, so declining multipart is all it
+        # takes. Same bytes, same handle, same header -- only the framing
+        # differs.
+        import obstore
+
+        store = _raw_store(fake_s3, default_headers=ACL_HEADERS)
+        payload = b"x" * (8 * 1024 * 1024)
+        obstore.put(store, "big", payload, use_multipart=False)
+
+        (put,) = fake_s3.of("PUT")
+        assert put.acl == ACL
+        assert put.acl_signed
+        assert not fake_s3.of("POST")
         assert fake_s3.objects["p/big"] == payload
 
     def test_acl_default_header_is_unsigned_on_list(self, fake_s3):

@@ -70,6 +70,10 @@ out.zarr/
 demo/outputs/
 demo/wheels/
 demo/atl03_v007_full.parquet
+# hhdc_viewer.ipynb's export cells write these into notebooks/ by construction
+# every time anyone runs it to the end (an .npz of o22 voxel chips and an .npz
+# of the co-registered pair, tens of MB); generated artifacts, not sources.
+notebooks/*.np[yz]
 
 # data/ holds builder scripts + small AOI geojsons only — the heavy neighbors
 # (the local ATL03 catalog clone, generated shardmaps, per-shard count tables)

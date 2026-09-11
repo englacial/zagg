@@ -294,8 +294,12 @@ class TestTemplateEnvironment:
         # this bucket carries x-amz-acl: bucket-owner-full-control, and S3
         # evaluates that against s3:PutObjectAcl on PutObject AND on
         # CreateMultipartUpload -- without it the first published PUT 403s.
-        # The multipart pair covers the failure path PutObject does not:
-        # obstore's own abort (it holds the UploadId) would otherwise 403 and
+        # The multipart pair is kept although issue #534 made every published
+        # write a single PutObject (an ACL-bearing UploadPart is rejected, so
+        # the ACL handle cannot multipart at all): it is the policy shape
+        # Source Cooperative's own Option 3 documentation asks for, it is what
+        # we sent them, and it still covers the failure path PutObject does not
+        # -- obstore's own abort (it holds the UploadId) would otherwise 403 and
         # leak parts billed to Source Cooperative.
         assert sorted(objects[0]["Action"]) == [
             "s3:AbortMultipartUpload",
@@ -604,8 +608,13 @@ class TestWorkerSizeVariants:
     """
 
     _SIZES = ("2048", "4096", "8192")
-    _DISK_TMP = {"2048": 4096, "4096": 6144, "8192": 10240}
     _LAMBDA_EPHEMERAL_CEILING_MB = 10240
+    # Every -disk variant sits at the ceiling (issue #536), superseding issue
+    # #235's memory + 2048. The spill block is disk-bound at every tier --
+    # ``_default_block_bytes`` is min(0.2 x memory x K, 0.45 x free_tmp) and
+    # K = 64 on the production grids -- so memory never chose the block size,
+    # and 249 CA GEDI shards died on the 6144-derived 2.70 GiB cap.
+    _DISK_TMP = dict.fromkeys(_SIZES, _LAMBDA_EPHEMERAL_CEILING_MB)
 
     @staticmethod
     def _expand_foreach(tpl, section):
@@ -662,8 +671,8 @@ class TestWorkerSizeVariants:
 
     def test_foreach_expands_to_six_variants(self):
         # The ratified matrix: 3 memories x {default 512 /tmp, -disk /tmp =
-        # memory + 2048} -> 6 functions; the top -disk size sits exactly at
-        # Lambda's EphemeralStorage ceiling (no clamping).
+        # Lambda's EphemeralStorage ceiling} -> 6 functions. Issue #536 moved
+        # every -disk size to the ceiling; before it, only 8192 reached it.
         tpl, resources = self._expanded_resources()
         for size in self._SIZES:
             std = resources[f"WorkerFn{size}"]["Properties"]
@@ -674,8 +683,14 @@ class TestWorkerSizeVariants:
             assert disk["FunctionName"] == {"Sub": f"${{FunctionName}}-{size}-disk"}
             assert disk["MemorySize"] == size
             tmp_mb = self._resolve_find_in_map(tpl, disk["EphemeralStorage"]["Size"])
-            assert tmp_mb == self._DISK_TMP[size] == int(size) + 2048
-        assert self._DISK_TMP["8192"] == self._LAMBDA_EPHEMERAL_CEILING_MB
+            assert tmp_mb == self._DISK_TMP[size] == self._LAMBDA_EPHEMERAL_CEILING_MB
+        # Asserted against the mapping AS WRITTEN, not just against the
+        # constant: _DISK_TMP is derived from the ceiling, so a template that
+        # dropped a size back to memory + 2048 must fail here rather than
+        # agree with a table that moved with it.
+        assert {k: v["SizeMb"] for k, v in tpl["Mappings"]["WorkerDiskTmp"].items()} == {
+            size: self._LAMBDA_EPHEMERAL_CEILING_MB for size in self._SIZES
+        }
 
     def test_variants_mirror_process_fn(self):
         # Same lockstep contract as ExtractFn (test_extract_fn_mirrors_

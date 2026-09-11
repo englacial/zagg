@@ -544,6 +544,109 @@ class TestPutObjectRouting:
         ]
         assert offenders == [], f"use zagg.store.put_object instead: {offenders}"
 
+    # The same question asked of boto3 (issue #534 fold). The obstore scan
+    # above is what makes "every raw write goes through put_object" true, but
+    # it only knows obstore NAMES -- a boto3 client writes the same objects and
+    # is invisible to it. That gap matters in the direction that stays quiet:
+    # boto3's transfer manager puts a canned ACL on ``CreateMultipartUpload``
+    # and not on ``UploadPart``, so it never hits the 400 of issue #534, and a
+    # boto3 write to a published bucket with NO ``ACL`` ExtraArg simply creates
+    # objects our account owns and Source Cooperative cannot manage -- issue
+    # #495's failure, with nothing to notice.
+    #
+    # Attribute calls only, and no attempt to prove the receiver is a boto3
+    # client: these names are distinctive enough, tracking client bindings
+    # through ``boto3.client(...)`` / ``session.client(...)`` / an injected
+    # handle is not tractable, and a false positive here is a loud test failure
+    # rather than a silent publish. ``copy`` is deliberately absent -- numpy's
+    # ``.copy()`` is everywhere and ``copy_object`` is the unambiguous
+    # spelling. zagg's own ``put_object`` is always a bare-Name call, so the
+    # attribute-only rule does not collide with it.
+    _BOTO3_WRITE_APIS = frozenset(
+        {
+            "upload_file",
+            "upload_fileobj",
+            "put_object",
+            "copy_object",
+            "create_multipart_upload",
+            "upload_part",
+        }
+    )
+
+    # The boto3 writes that exist today, each with the reason it is allowed to
+    # stand outside the put_object seam. Keyed by (module suffix, API) rather
+    # than by line, so an unrelated edit above them does not churn this list --
+    # while a NEW boto3 write, or a new API in one of these files, still fails.
+    _KNOWN_BOTO3_WRITES = {
+        # Carries the canned ACL itself, via ``_copy_acl`` on the same
+        # ``_external_target`` predicate the store seam uses: the skip-run touch
+        # re-creates an object and must not strip the ownership an earlier PUT
+        # handed over (issue #495).
+        ("zagg/lifecycle.py", "copy_object"),
+        # No ACL, and none needed: the extraction Lambda delivers boundary
+        # parquets to an IN-ACCOUNT bucket. Held by its docstring rather than
+        # by a check -- ``output_prefix`` reaches ``run_extraction`` straight
+        # from the invoke event -- so if that ever points at a published
+        # bucket, this entry is the thing to revisit (issue #534 review).
+        ("zagg/catalog/extract.py", "upload_file"),
+    }
+
+    @classmethod
+    def _boto3_write_calls(cls, path):
+        """``(attr, lineno)`` for each object-creating boto3 call in ``path``."""
+        import ast
+
+        return [
+            (node.func.attr, node.lineno)
+            for node in ast.walk(ast.parse(path.read_text()))
+            if isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Attribute)
+            and node.func.attr in cls._BOTO3_WRITE_APIS
+        ]
+
+    def test_no_new_module_writes_an_object_through_boto3(self):
+        # Fails closed: a boto3 write added anywhere under the package (or in
+        # the handler that ships beside it) has to be added to
+        # ``_KNOWN_BOTO3_WRITES`` with a reason, which is the moment to decide
+        # whether its destination needs the canned ACL.
+        import zagg
+
+        pkg = Path(zagg.__file__).parent
+        repo = Path(__file__).parent.parent
+        files = sorted(pkg.rglob("*.py")) + sorted((repo / "deployment" / "aws").glob("*.py"))
+
+        found, offenders = set(), []
+        for path in files:
+            module = path.relative_to(pkg.parent if path.is_relative_to(pkg) else repo).as_posix()
+            for attr, lineno in self._boto3_write_calls(path):
+                found.add((module, attr))
+                if (module, attr) not in self._KNOWN_BOTO3_WRITES:
+                    offenders.append(f"{module}:{lineno} {attr}")
+        assert offenders == [], (
+            "a boto3 write outside the put_object seam -- route it through "
+            f"zagg.store.put_object, or allow it in _KNOWN_BOTO3_WRITES with a reason: {offenders}"
+        )
+        # And the list stays honest in the other direction: an entry whose call
+        # is gone (routed through put_object, say) must not linger as cover for
+        # a future one.
+        assert found == self._KNOWN_BOTO3_WRITES, (
+            f"stale _KNOWN_BOTO3_WRITES entries: {self._KNOWN_BOTO3_WRITES - found}"
+        )
+
+    def test_the_boto3_guard_catches_a_new_upload(self, tmp_path):
+        # Same treatment as the obstore scan below: a guard is only worth its
+        # docstring if it fires. Pins that the receiver's spelling does not
+        # matter and that ``.copy()`` is not swept up with ``copy_object``.
+        sneaky = tmp_path / "sneaky.py"
+        sneaky.write_text(
+            "import boto3\n"
+            "def f(client, arr):\n"
+            "    boto3.client('s3').upload_file('a', 'b', 'c')\n"
+            "    client.put_object(Bucket='b', Key='k', Body=b'v')\n"
+            "    return arr.copy()  # numpy, not S3\n"
+        )
+        assert self._boto3_write_calls(sneaky) == [("upload_file", 3), ("put_object", 4)]
+
     def test_the_guard_catches_an_aliased_write(self, tmp_path):
         # The scan is only worth its docstring if it fires; pin the two shapes
         # a substring match used to miss.
