@@ -845,3 +845,92 @@ class TestSweepCLI:
         )
         with pytest.raises(ValueError, match=r"power of two|morton digit"):
             mod.main(["s3://nowhere/store", "--families", "stats", "--partitions", bad])
+
+
+class TestHandlerForwardsThePartitionContract:
+    """The worker transport must carry the ``partition``/``families`` blocks
+    (issue #527).
+
+    Every test above exercises :func:`run_sweep` directly, so a transport that
+    drops the blocks is invisible to all of them: the contract holds, and the
+    partition simply never reaches it. That is what shipped — the handler
+    called ``run_sweep(store_path, leaves, store_kwargs=...)`` and nothing
+    else — and it cost the CA campaign a 2,726-leaf sweep: on the ``discover``
+    transport every one of 16 partition workers derived the WHOLE store's work
+    set and died at the 900 s wall. Two shapes are pinned here: the call the
+    handler makes, and the objects a partitioned invoke actually writes.
+    """
+
+    def _handler(self):
+        from test_sweep import _handler_module
+
+        return _handler_module()
+
+    def _spy_on_run_sweep(self, monkeypatch):
+        seen: dict = {}
+        pristine = sweep_mod.run_sweep
+
+        def spy(store_root, leaves, **kwargs):
+            seen.update(kwargs)
+            return pristine(store_root, leaves, **kwargs)
+
+        monkeypatch.setattr(sweep_mod, "run_sweep", spy)
+        return seen
+
+    def test_partition_and_families_reach_run_sweep(self, tmp_path, monkeypatch):
+        refs = _store(tmp_path)
+        seen = self._spy_on_run_sweep(monkeypatch)
+        block = {"index": 0, "of": 4}
+        response = self._handler()._handle_sweep(
+            {
+                "mode": "sweep",
+                "store_path": str(tmp_path),
+                "leaves": [[int(word), window] for word, window in refs],
+                "partition": block,
+                "families": ["stats"],
+            }
+        )
+        assert response["statusCode"] == 200
+        assert seen["partition"] == block  # verbatim, not reconstructed
+        assert seen["families"] == ["stats"]
+
+    def test_absent_blocks_forward_as_none(self, tmp_path, monkeypatch):
+        # An unpartitioned, family-less invoke must call run_sweep exactly as
+        # the pre-#527 handler did: the fix adds reach, never new behaviour.
+        refs = _store(tmp_path)
+        seen = self._spy_on_run_sweep(monkeypatch)
+        self._handler()._handle_sweep(
+            {
+                "mode": "sweep",
+                "store_path": str(tmp_path),
+                "leaves": [[int(word), window] for word, window in refs],
+            }
+        )
+        assert seen["partition"] is None
+        assert seen["families"] is None
+
+    def test_a_partitioned_invoke_writes_only_its_own_subtree(self, tmp_path, monkeypatch):
+        # The behavioural proof, end to end through the transport: partition 0
+        # of 4 owns the "-31" subtree and nothing above the split order. With
+        # the block dropped this wrote the whole tree from a partial work set
+        # -- the coarse nodes above the split, from one partition's leaves.
+        refs = _store(tmp_path)
+        keys = _written(monkeypatch)
+        response = self._handler()._handle_sweep(
+            {
+                "mode": "sweep",
+                "store_path": str(tmp_path),
+                "leaves": [[int(word), window] for word, window in refs],
+                "partition": {"index": 0, "of": 4},
+                "families": ["stats"],
+            }
+        )
+        # _handle_sweep swallows every exception into a 500, so without this
+        # the key set alone would go green on an invoke that raised after the
+        # last rollup PUT (review finding, issue #527).
+        assert response["statusCode"] == 200
+        assert sorted(keys) == [
+            "-3/1/1/stats.rollup.json",
+            "-3/1/2/stats.rollup.json",
+            "-3/1/stats.rollup.json",
+        ]

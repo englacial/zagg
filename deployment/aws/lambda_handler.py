@@ -1203,12 +1203,60 @@ def _handle_sweep(event: Dict[str, Any]) -> Dict[str, Any]:
     run records (the D22 discovery path). Nobody reads this response on the
     Event invoke; errors log and fail open — every rollup is a regenerable
     cache (D9) and ``python -m zagg.sweep`` is the manual backstop.
+
+    ``partition`` and ``families`` are forwarded verbatim (issue #527). The
+    partition block is not decoration: per issue #377 it filters the work set
+    worker-side, **stops the bottom-up walk at the split order**, and defers
+    the ``finish()`` hook — the three things that make concurrent partitions
+    disjoint. Dropping it made a ``discover``-transport partition sweep the
+    WHOLE store in every worker (the CA 2,726-leaf sweep died at the 900 s
+    wall in all 16), and made an inline-partitioned pass write coarse nodes
+    above the split from partial data. ``families`` scopes the pass to a
+    subset of :data:`zagg.sweep.DEFAULT_FAMILIES` (the issue #520 ``columns``
+    backfill is the first caller that needs it).
+
+    **Pick a width that fits the wall.** A partition does 1/N-th of the work
+    but faces the same 900 s timeout, so a width that is merely *narrower* than
+    the whole store still dies — N ways instead of one, each having done 1/N-th
+    of the fold. The width must satisfy ``leaves x s_per_leaf / N < 900`` AND be
+    a power of four (``partition_split_order`` splits on whole morton digits).
+    For the CA ATL03 store that is 2,726 leaves x ~60 s/leaf (the SERC probe's
+    measured rate) = 163,560 s of fold work, so ``ceil(163560 / 900) = 182``
+    partitions minimum, rounded up to the first legal power of four: **256**
+    (4^4, ~639 s/worker — fits, no headroom) or **1024** (4^5, ~160 s/worker —
+    the width to actually use). The 16 that died was ~10,222 s/worker, 11x over
+    the wall; forwarding the block does not change that, only the width does.
+
+    **A partitioned pass writes NOTHING above the split order, and the root
+    singletons are still owed.** Orders below the split are never walked
+    (``range(shard_order - 1, min_order - 1, -1)`` in
+    :func:`zagg.sweep._sweep_family`); ``MocFamily.finish`` — the only writer of
+    the store-root ``coverage.moc`` and its sibling ``coverage.toc`` — is
+    skipped and reported as ``finish_deferred``; and :mod:`zagg.sweep_overview`
+    likewise defers the manifest ``pyramid.materialized`` RMW. That deferral is
+    exactly what keeps concurrent partitions disjoint, but nothing on this
+    transport picks it back up: a **subsequent partition-less pass** over the
+    same work set is what writes the coarse levels, ``coverage.moc``,
+    ``coverage.toc``, and the manifest update. It is cheap — every rollup the
+    partitions already wrote is skip-if-current, so the follow-up only pays the
+    orders above the split. Note there is no finisher arm in the mode table
+    above: :func:`zagg.sweep_stages.run_finisher` is called from exactly one
+    place, ``run_stage_sweep`` (the ``--stages`` CLI), so on the fleet **the
+    partition-less follow-up invoke IS the finisher**. A partitioned "toc
+    sweep" that stops after the fan-out produces no toc.
     """
     from zagg.sweep import discover_leaves, run_sweep
+    from zagg.sweep_partition import normalize_partition
 
     logger.info(f"Sweep mode: folding rollups at {event.get('store_path')}")
     try:
         store_kwargs = _output_store_kwargs(event)
+        # Validate the block BEFORE anything touches the store: on the
+        # ``discover`` transport the next statement is a store-root LIST plus a
+        # parquet read per run record, and a malformed partition should not
+        # cost that. run_sweep re-validates (it is the authority); this is the
+        # same guard ``python -m zagg.sweep`` carries for argv, issue #377.
+        normalize_partition(event.get("partition"))
         t0 = time.perf_counter()
         if event.get("leaves") is not None:
             leaves = [(int(key), window) for key, window in event["leaves"]]
@@ -1239,7 +1287,13 @@ def _handle_sweep(event: Dict[str, Any]) -> Dict[str, Any]:
                     }
                 ),
             }
-        summary = run_sweep(event["store_path"], leaves, store_kwargs=store_kwargs)
+        summary = run_sweep(
+            event["store_path"],
+            leaves,
+            store_kwargs=store_kwargs,
+            families=event.get("families"),
+            partition=event.get("partition"),
+        )
         return {
             "statusCode": 200,
             "body": json.dumps(

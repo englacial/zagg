@@ -2395,9 +2395,10 @@ def _patch_tabular_s3(monkeypatch):
         # store it builds (issue #522), which needs a __dict__.
         return SimpleNamespace()
 
-    def _fake_put(store, key, payload):
+    def _fake_put(store, key, payload, **kwargs):
         captured["key"] = key
         captured["payload"] = payload
+        captured["kwargs"] = kwargs
 
     monkeypatch.setattr(obstore.store, "S3Store", _fake_s3store)
     monkeypatch.setattr(obstore, "put", _fake_put)

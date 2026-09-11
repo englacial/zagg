@@ -198,7 +198,7 @@ strict = ds.where(ds["aoi_mask"])
   equivalent `(lats, lons)` ring.
 
 See the runnable, data-free example in
-[`notebooks/aoi_mask.ipynb`](https://github.com/englacial/zagg/blob/main/notebooks/aoi_mask.ipynb),
+[`aoi_mask.ipynb`](https://github.com/englacial/zagg/blob/c56221b4/notebooks/aoi_mask.ipynb) (archived — see the note below),
 which builds a small HEALPix grid + AOI box and shows the mask is `True` exactly
 for the in-AOI cells. The notebook is self-contained (no remote data) and runs
 anywhere `zagg` (with `mortie>=0.8.3`) is installed. Binder launch additionally

@@ -169,19 +169,38 @@ Parameters:
       <FunctionName>-S (default 512 MB /tmp) and <FunctionName>-S-disk
       (/tmp from the WorkerDiskTmp mapping — keep that table in sync with
       this list). This is not a free-form knob: any added size needs a
-      matching WorkerDiskTmp entry and must keep memory+2048 within Lambda's
-      10240 MB /tmp ceiling (so nothing above 8192). The unsuffixed function
-      and its -extract twin are independent of this list and stay the
-      no-config default.
+      matching WorkerDiskTmp entry, whose value is Lambda's 10240 MB
+      EphemeralStorage ceiling for every size (issue #536). The unsuffixed
+      function and its -extract twin are independent of this list and stay
+      the no-config default.
 
 Mappings:
-  # /tmp for the -disk variants is memory + 2048 MB (issue #235 thread
-  # decision); 10240 for the 8192 variant is exactly Lambda's
-  # EphemeralStorage ceiling, so the rule holds with no clamping. Keys must
-  # cover every WorkerMemorySizes entry.
+  # /tmp for the -disk variants is Lambda's 10240 MB EphemeralStorage ceiling
+  # at EVERY memory size (issue #536), superseding the memory + 2048 rule of
+  # issue #235 -- under which only the 8192 variant reached the ceiling.
+  #
+  # The rule changed because the thing /tmp actually gates does not scale with
+  # memory. ``zagg.processing.spill._default_block_bytes`` is
+  # ``min(0.2 x memory x K, 0.45 x free_tmp)`` with
+  # ``K = 4 ** (group_order - parent_order)``, and K is 64 on the production
+  # HEALPix grids -- so the memory term is 26-102 GiB across the size list
+  # while the disk term was 2.70-4.50 GiB. Disk bound the block by 6-23x at
+  # every tier, and a config with no cross-block fold law (the GEDI waveform
+  # reducers) raises SpillOverflowError at the first crossing rather than
+  # approximate. 249 of 2,726 shards on the CA GEDI build died exactly there,
+  # and all 10 of the densest re-ran clean at 10240 (peak spill 3.56 GiB,
+  # spill_blocks_closed 0).
+  #
+  # Ephemeral storage above 512 MB bills at $0.0000000309/GB-s -- $0.08 of
+  # headroom across a 2,726-shard run, against $48.65 of compute.
+  #
+  # This raises the CEILING; it is not a licence to drop memory. The 900 s
+  # timeout still scales with vCPU (which follows memory), and the dense band
+  # measured 673-732 s at 8192 MB. Keys must cover every WorkerMemorySizes
+  # entry.
   WorkerDiskTmp:
-    "2048": {SizeMb: 4096}
-    "4096": {SizeMb: 6144}
+    "2048": {SizeMb: 10240}
+    "4096": {SizeMb: 10240}
     "8192": {SizeMb: 10240}
 
 Conditions:

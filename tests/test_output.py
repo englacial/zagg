@@ -220,9 +220,10 @@ class TestWriteTabular:
             # the store it builds (issue #522), which needs a __dict__.
             return SimpleNamespace()
 
-        def _fake_put(store, key, payload):
+        def _fake_put(store, key, payload, **kwargs):
             captured["key"] = key
             captured["payload"] = payload
+            captured["kwargs"] = kwargs
 
         monkeypatch.setattr(obstore.store, "S3Store", _fake_s3store)
         monkeypatch.setattr(obstore, "put", _fake_put)
@@ -232,6 +233,11 @@ class TestWriteTabular:
         assert out == "s3://bucket/dir/events.parquet"
         assert captured["bucket"] == "bucket"
         assert captured["key"] == "dir/events.parquet"
+        # An explicit-credential target is an external one, so this write
+        # carries the canned ACL -- and a tabular object is one of the few
+        # side-channel payloads that can exceed obstore's 5 MiB multipart
+        # threshold, where an ACL-bearing UploadPart 400s (issue #534).
+        assert captured["kwargs"] == {"use_multipart": False}
         assert captured["opts"]["access_key_id"] == "a"
         back = pd.read_parquet(io.BytesIO(captured["payload"])).set_index("event_key")
         assert back.loc["storm1", "max_t2m"] == pytest.approx(5.0)

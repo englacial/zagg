@@ -219,7 +219,11 @@ def _put_parquet(local_path: str, output_prefix: str, name: str) -> str:
 
     Returns the destination URI. S3 uploads use the ambient (execution-role)
     credentials — the extraction Lambda writes to an in-account bucket, unlike
-    the NSIDC *read* side which needs the event's temporary credentials.
+    the NSIDC *read* side which needs the event's temporary credentials. That
+    in-account destination is also why this boto3 transfer sits outside the
+    canned-ACL seam in :mod:`zagg.store` (issues #522/#534): nothing here is
+    published to an external bucket, so there is no ownership to hand over and
+    no reason to decline ``upload_file``'s multipart.
     """
     if output_prefix.startswith("s3://"):
         import boto3

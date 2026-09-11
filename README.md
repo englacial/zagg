@@ -127,27 +127,24 @@ The store path and output grid parameters are defined in the YAML config (`outpu
 
 ### Step 4: Visualize Results
 
-The output Zarr is a public DGGS dataset. The included notebook rasterizes HEALPix cells to a polar stereographic grid for fast rendering with `imshow`.
+The output Zarr is a public DGGS dataset. The included notebooks read it back anonymously — a paired 3-D view of one shard, and the cell-level GEDI × ATL03 digest join.
 
 ```bash
-uv run jupyter notebook notebooks/rasterized_zarr.ipynb
+uv run jupyter notebook notebooks/hhdc_viewer.ipynb
 ```
-
-Adjust `GRID_SPACING` in the notebook to control output resolution.
 
 ## Example Notebooks
 
-The notebooks under `notebooks/` run on [Binder](https://mybinder.org/v2/gh/englacial/zagg/main?urlpath=lab/tree/notebooks) — no install, no credentials. They install `zagg[analysis]` via the `.binder/` conda config and read only synthetic in-notebook data or the **anonymous, public** [source.coop](https://source.coop/englacial/zagg/benchmarks) benchmark store.
+The notebooks under `notebooks/` run on [Binder](https://mybinder.org/v2/gh/englacial/zagg/main?urlpath=lab/tree/notebooks) — no install, no credentials. Both are **reader-only**: they import `mortie` + `moczarr[zagg]` and call no zagg public API — the only zagg code on the path is the t-digest algebra `moczarr` imports rather than vendors, which is exactly what the `[zagg]` extra is for — reading the anonymous, public [source.coop](https://source.coop/englacial/zagg) demo stores (ICESat-2 ATL03 + GEDI L1B over California and the NEON AOP sites). Each carries its own `%pip install` line, so they run outside Binder unchanged.
 
 | Notebook | What it shows | Binder |
 |----------|---------------|--------|
-| `custom_aggregations.ipynb` | Config-driven aggregation API on synthetic data | [![Binder](https://mybinder.org/badge_logo.svg)](https://mybinder.org/v2/gh/englacial/zagg/main?urlpath=lab/tree/notebooks/custom_aggregations.ipynb) |
-| `rasterized_zarr.ipynb` | Rasterize the published HEALPix store to an 8 km polar-stereo grid | [![Binder](https://mybinder.org/badge_logo.svg)](https://mybinder.org/v2/gh/englacial/zagg/main?urlpath=lab/tree/notebooks/rasterized_zarr.ipynb) |
-| `jupyterhub_example.ipynb` | Drive the API from a science hub; read & visualize a published result | [![Binder](https://mybinder.org/badge_logo.svg)](https://mybinder.org/v2/gh/englacial/zagg/main?urlpath=lab/tree/notebooks/jupyterhub_example.ipynb) |
-| `cryocloud_example.ipynb` | End-to-end ISMIP6 read + **AWS Lambda fan-out** on CryoCloud | **not Binder-runnable** (needs live AWS + Earthdata credentials) |
-| `cost_reporting.ipynb` | Max / estimated / actual invoke cost + progress-bar dispatch wrapper | [![Binder](https://mybinder.org/badge_logo.svg)](https://mybinder.org/v2/gh/englacial/zagg/main?urlpath=lab/tree/notebooks/cost_reporting.ipynb) |
+| `hhdc_viewer.ipynb` | Polygon → MOC → shard → **rotatable paired 3-D view** (ATL03 + GEDI), binned or exact → numpy tensors | [![Binder](https://mybinder.org/badge_logo.svg)](https://mybinder.org/v2/gh/englacial/zagg/main?urlpath=lab/tree/notebooks/hhdc_viewer.ipynb) |
+| `waveform_viewer.ipynb` | The cell-level join: one GEDI footprint against the 2×2 ATL03 cells beneath it, both from stored digests | [![Binder](https://mybinder.org/badge_logo.svg)](https://mybinder.org/v2/gh/englacial/zagg/main?urlpath=lab/tree/notebooks/waveform_viewer.ipynb) |
 
-`cryocloud_example.ipynb` is the only Lambda demo; it dispatches to a deployed AWS Lambda and reads private-account S3 via the CryoCloud IRSA role, so it cannot run on Binder.
+They share `notebooks/viewers.py`, which holds the drawing so the notebooks stay about the read path. The two are split because one needs `%matplotlib widget` for its rotatable 3-D view and the other `%matplotlib inline`; the backends collide in a single kernel.
+
+**Archived notebooks.** The earlier examples (`custom_aggregations`, `rasterized_zarr`, `jupyterhub_example`, `cryocloud_example`, `cost_reporting`, `aoi_mask`, `shardmap_viewer`, `tdigest_reader_example`, `sentinel2_fusion`) were written against older APIs and had drifted out of date — stale documentation being worse than none. They are removed from `main` and preserved at [`c56221b4`](https://github.com/englacial/zagg/tree/c56221b4/notebooks), the last commit on `main` that carried them — a commit permalink rather than a branch link, because GitHub keeps a blob URL at an explicit sha forever and there is no ref anyone has to remember not to delete.
 
 ## Project Structure
 

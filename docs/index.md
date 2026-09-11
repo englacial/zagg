@@ -59,7 +59,7 @@ See [Lambda Deployment](deployment/lambda.md) for AWS setup.
 ### 3. Visualize results
 
 ```bash
-uv run jupyter notebook notebooks/rasterized_zarr.ipynb
+uv run jupyter notebook notebooks/hhdc_viewer.ipynb
 ```
 
 ## Design Philosophy

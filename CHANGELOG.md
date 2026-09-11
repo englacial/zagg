@@ -7,6 +7,58 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+- every `-disk` worker variant gets Lambda's 10240 MB `/tmp` ceiling (#536)
+  ([#537](https://github.com/englacial/zagg/pull/537))
+  - The spill block is **disk-bound at every memory tier**:
+    `_default_block_bytes` is `min(0.2 x memory x K, 0.45 x free_tmp)` and
+    `K = 4 ** (group_order - parent_order)` is 64 on the production grids, so
+    the memory term is 26–102 GiB while the disk term was 2.70–4.50 GiB.
+  - 249 of 2,726 shards on the CA GEDI build raised `SpillOverflowError` at the
+    6144-derived 2.70 GiB cap — the waveform reducers have no cross-block fold
+    law, so the config is exact-single-block-only and refuses rather than
+    approximate. The 10 densest re-ran clean at 10240 MB (peak spill 3.56 GiB
+    against 4.50 GiB, `spill_blocks_closed = 0`).
+  - Supersedes issue #235's `memory + 2048`, under which only the 8192 variant
+    reached the ceiling. Extra ephemeral storage costs $0.08 across a
+    2,726-shard run. This raises the ceiling only: the 900 s timeout still
+    scales with vCPU, so it is not a licence to drop a memory tier.
+
+- an ACL-bearing write is a single `PutObject`, never a multipart upload (#534)
+  ([#535](https://github.com/englacial/zagg/pull/535))
+  - `x-amz-acl` is legal on `PutObject` and `CreateMultipartUpload` and illegal
+    on `UploadPart`, which S3 answers `400 InvalidArgument` / "The specified
+    header is not valid in this context". obstore attaches the canned ACL as a
+    `client_options.default_headers` entry, so it rode every request the write
+    twin made, and any object over obstore's 5 MiB multipart threshold failed —
+    52 of 60 sampled shards on the CA GEDI build, and a deliberate single-shard
+    test whose store is missing exactly its two ragged chunks.
+  - Both write seams (`_AclWriteObjectStore.set`/`set_if_not_exists` and
+    `put_object`) now pass `use_multipart=False` when the target carries the
+    ACL, leaving `PutObject` as the only request the twin can issue — a
+    property of the handle rather than a list of permitted operations, since
+    enumerating that list once and missing `UploadPart` is how this shipped.
+    In-account targets are untouched and still multipart.
+  - `_SINGLE_PUT_MAX_BYTES` refuses, by key, a payload past S3's 5 GiB
+    `PutObject` ceiling; published chunk objects run 1–17 MB.
+
+- the sweep Lambda handler forwards the `partition` and `families` blocks (#527)
+  ([#528](https://github.com/englacial/zagg/pull/528))
+  - `_handle_sweep` dropped both blocks on the floor, so a fleet `mode="sweep"`
+    invoke could never be partitioned and could never be scoped to a family
+    subset — `run_sweep` has accepted both since #377/#520, but nothing
+    worker-side ever received them. On the `discover` transport every
+    "partition" worker therefore derived and swept the WHOLE store; the CA
+    ATL03 toc/overview sweep died at the 900 s wall in all 16 workers with
+    nothing written. On the inline transport a partitioned pass walked to the
+    root with only its own subset, so nodes above the split order were written
+    from partial data by racing workers.
+  - Absent keys forward as `None`, so an unpartitioned invoke is behaviourally
+    unchanged. This adds reach, not new behaviour.
+  - Operator note: a partitioned pass writes nothing below the split order and
+    defers `finish()`, so the root `coverage.moc`/`coverage.toc` and the
+    manifest `pyramid.materialized` update are still owed by a subsequent
+    partition-less pass. Pick the width so that
+    `leaves x s_per_leaf / partitions < 900 s`, rounded up to a power of four.
 - published-bucket store handles no longer 403 on reads: the canned ACL rides a
   separate write handle (#522) ([#523](https://github.com/englacial/zagg/pull/523))
   - The `x-amz-acl: bucket-owner-full-control` header that issue #495 attached
