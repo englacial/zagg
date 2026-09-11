@@ -1563,9 +1563,16 @@ shape: one declared product, one entry):
   declared-but-unmaterialized remains legal (§4.5), so a path list would
   claim presence this block cannot promise.
 - **`order2res`** — the flat per-order lookup `{str(order): cells}` (JSON
-  has no integer keys): the one-key answer to *"what cell resolutions can I
-  read at order k"*, whose key set is exactly the orders present. It is a
-  projection of `datasets` and MUST agree with it entry for entry.
+  has no integer keys): the cell resolutions of the **pyramid levels** at
+  order k, whose key set is exactly the orders present. It is a projection
+  of `datasets` and MUST agree with it entry for entry. It does **not**
+  carry the base's native `cells`: those ride in `base` alone, which shares
+  the shard order's key (in the example above, `order2res["3"]` is
+  `[5, 4]` while `base` adds 6 at that same order 3). So the resolutions
+  readable at order k are `order2res[str(k)]` **unioned with**
+  `base["cells"]` when `k == base["order"]` — a reader assembling a
+  complete per-order map MUST union the base in, never overwrite the entry
+  with it.
 - **`base`** — the native source data (`{"order": shard_order, "cells":
   [cell_order]}`): the finest rung of the resolution ladder a reader picks
   from, deliberately **not** a `datasets` entry — it is not a pyramid level
