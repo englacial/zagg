@@ -281,6 +281,58 @@ class TestFoldRegimes:
         assert "declined" in format_report(report)
 
 
+class TestContributorDefects:
+    """Contributor-side defects the SWEEP treats as ordinary never raise."""
+
+    def _leaf_dir(self, root, dec):
+        from pathlib import Path
+
+        return Path(shard_leaf_path(str(root), morton_word(dec)))
+
+    def test_missing_leaf_named_by_the_moc(self, tmp_path):
+        # The root coverage.moc is a D9 regenerable cache, so it can name a
+        # leaf whose object is gone. The fold skips it; the harness must skip
+        # the cells it covered, name it, and NOT raise.
+        import shutil
+
+        manifest = _build_store(tmp_path)
+        _sweep(tmp_path, manifest)
+        shutil.rmtree(self._leaf_dir(tmp_path, "-311"))
+        report = validate_pyramid(str(tmp_path), full=True)
+        assert any("-311" in w and "unreadable" in w for w in report["warnings"]), report
+        assert "declined — NOT validated" in format_report(report)
+
+    def test_leaf_missing_a_declared_field(self, tmp_path):
+        # Schema evolution: the field postdates the leaf, so it contributes
+        # fill — a KeyError out of `group[field]` would be a traceback on a
+        # store the sweep writes correctly.
+        import shutil
+
+        manifest = _build_store(tmp_path)
+        shutil.rmtree(self._leaf_dir(tmp_path, "-321") / str(CELL_ORDER) / "h_noise")
+        _sweep(tmp_path, manifest)
+        report = validate_pyramid(str(tmp_path), full=True)
+        assert report["checks"]["digests"]["status"] == "pass", format_report(report)
+        assert any("lacks field 'h_noise'" in w for w in report["warnings"]), report
+
+    def test_half_paired_leaf_keeps_the_fill_word(self, tmp_path):
+        # spec §3.3: a leaf carrying the `of` digest but not the packed word
+        # poisons every output cell it covers to the fill word 0, siblings
+        # included. Expecting a k-way merge there is a false fail on a store
+        # the sweep wrote correctly.
+        import shutil
+
+        manifest = _build_store(tmp_path)
+        shutil.rmtree(self._leaf_dir(tmp_path, "-311") / str(CELL_ORDER) / "composition")
+        _sweep(tmp_path, manifest)
+        group = zarr.open_group(
+            open_store(f"{tmp_path}/-3/1/all.zarr"), path="3", mode="r", zarr_format=3
+        )
+        assert not group["composition"][0:4].any()  # the poisoned span
+        report = validate_pyramid(str(tmp_path), full=True)
+        assert report["checks"]["composition"]["status"] == "pass", format_report(report)
+
+
 class TestLadderGrammars:
     """The read-side follows either pyramid grammar's ladder."""
 
