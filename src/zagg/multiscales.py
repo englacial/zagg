@@ -121,9 +121,12 @@ def manifest_multiscales(manifest: dict):
             cell_order=int(manifest["cell_order"]),
             name=(manifest.get("dataset") or {}).get("short_name"),
         )
-    except (KeyError, TypeError, ValueError) as e:
+    except (AttributeError, KeyError, TypeError, ValueError) as e:
         # Derived convenience, never load-bearing: a manifest the pyramid
         # grammar itself would refuse must not crash the mirror projection.
+        # ``AttributeError`` is the hand-edit leg: every ``.get`` chain above
+        # (``dataset``, ``pyramid.overview``, a field meta) hits a scalar and
+        # raises it when the key was flattened by hand.
         logger.warning(f"multiscales: mirror derivation skipped ({e!r})")
         return None
 

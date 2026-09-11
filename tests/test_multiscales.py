@@ -65,6 +65,25 @@ def _v2_block(cfg):
     return overview_block_v2(knob, levels, ("cascade", 1), fields, excluded)
 
 
+def _v2_manifest():
+    """The manifest keys the mirror derivation reads, all well-formed."""
+    return {
+        "shard_order": SHARD_ORDER,
+        "cell_order": CELL_ORDER,
+        "dataset": {"short_name": "MS"},
+        "pyramid": _v2_block(_cfg(pyramid={"overviews": 3})),
+    }
+
+
+def _flatten(manifest, path, value):
+    """Replace one dotted manifest key with ``value`` — a hand-edit mis-paste."""
+    *parents, leaf = path.split(".")
+    node = manifest
+    for parent in parents:
+        node = node[parent]
+    node[leaf] = value
+
+
 class TestMultiscalesBlock:
     def test_mirror_projects_the_v2_block(self):
         block = _v2_block(_cfg(pyramid={"overviews": 3}))
@@ -131,6 +150,25 @@ class TestManifestMultiscales:
 
     def test_missing_orders_warns_never_raises(self, caplog):
         manifest = {"pyramid": {"spec": PYRAMID_SPEC_V2, "overviews": [{"node": 1, "cells": [2]}]}}
+        with caplog.at_level("WARNING"):
+            assert manifest_multiscales(manifest) is None
+        assert "mirror derivation skipped" in caplog.text
+
+    @pytest.mark.parametrize(
+        ("path", "value"),
+        [
+            ("dataset", "MS"),  # flattened to its own short_name
+            ("pyramid.overview", "off"),  # family dict flattened to a token
+            ("pyramid.overview.fields", {"count": "exact"}),  # the {name: class} summary
+        ],
+    )
+    def test_hand_edited_scalars_warn_never_raise(self, path, value, caplog):
+        # Every ``.get`` chain in the derivation raises AttributeError on a
+        # scalar, not KeyError/TypeError: the guard must skip the mirror, not
+        # crash build_manifest/declare_pyramid (the manifest is hand-editable).
+        manifest = _v2_manifest()
+        assert manifest_multiscales(manifest) is not None
+        _flatten(manifest, path, value)
         with caplog.at_level("WARNING"):
             assert manifest_multiscales(manifest) is None
         assert "mirror derivation skipped" in caplog.text
