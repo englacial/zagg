@@ -183,6 +183,10 @@ class TestCountOnlyUpgradeInPlace:
         block = tcb._twin_block(on)
         block["overview"]["fields"] = _era_048_fields(block)
         tcb._install_pyramid(era, block)
+        # ``declare_pyramid`` finds its validation leaf through the store's
+        # RUN RECORDS; without one the field-level probe is silently skipped
+        # and the re-declaration under test is the degraded path.
+        tcb._write_run_record(era)
         return era, on, cfg
 
     def test_a_count_only_column_reads_declaration_drift(self, tmp_path, monkeypatch):
@@ -213,6 +217,9 @@ class TestCountOnlyUpgradeInPlace:
             "composition": "none",
         }
         summary = tcb._declare(era, cfg, overviews=5)
+        # A real 0.48-era leaf was typed against the widened declaration —
+        # not the "no committed leaf" skip.
+        assert summary["validated"].startswith("leaf ")
         assert summary["fields"] == {
             "count": "exact",
             "h_tdigest_signal": "approximate",
@@ -417,7 +424,10 @@ class TestGediFromScratch:
         _build_flux_store(on, monkeypatch)
         for decimal in tcb.SHARDS:
             assert not tcb._column_path(off, decimal).exists()
+        tcb._write_run_record(off)
         summary = tcb._declare(off, cfg, overviews=5)
+        # The flux leaf itself was typed against the declaration.
+        assert summary["validated"].startswith("leaf ")
         assert summary["fields"] == {"count": "exact", "rx_flux": "approximate"}
         # The §2.0 declaration rides the manifest entry with its calibration
         # (issue #424): the backfill's stored-weights gate compares against it.
