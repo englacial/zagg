@@ -94,23 +94,35 @@ def dispatch_nodes(by_shard, dispatch: int, scope=None) -> list:
     return [n for n in nodes if scope_admits(n, scope)]
 
 
-def coverage_dispatch_nodes(by_shard, coverage, dispatch: int) -> list:
+def coverage_dispatch_nodes(by_shard, dispatch: int, coverage, scope=None) -> list:
     """Dispatch nodes COMPUTED from the store's own coverage (issue #547 ruling).
 
-    Worker assignment is never a hardcoded count: expand the store's coverage
+    THE ruled computation, and what ``run_stage_sweep_fleet(..., coverage=...)``
+    calls once per tuple — not a helper beside the dispatcher, but the
+    dispatcher's own node derivation when a coverage MOC is supplied.
+
+    Worker assignment is never a hardcoded count: coarsen the store's coverage
     MOC to the ``dispatch`` order, intersect with the shard set, and assign
     workers from the result — 110 is merely what ATL03's o6 coverage evaluates
     to today (espg ruling, 2026-09-11). ``coverage`` is a MOC the caller
     already HOLDS — the run record's shard set, or the root ``coverage.moc``'s
     words (:func:`zagg.hive.root_coverage_words`) handed in by the operator —
     never read from the store here (D8: the invoke-only dispatcher role
-    cannot).
+    cannot). ``scope`` is the run's own scope MOC when it has one; the
+    assignment is then the intersection of all three
+    (:func:`zagg.sweep_stages.compose_scope`), since a scoped run must not
+    widen just because a coverage was supplied.
+
+    The argument order mirrors :func:`dispatch_nodes` exactly — same work set,
+    same ``dispatch``, then the MOC that filters — so the two spellings cannot
+    read as a swap of one another.
 
     Spelled as :func:`dispatch_nodes` over the shard set with the coverage as
     the scope MOC, because the two formulations name ONE set: a dispatch-order
-    ancestor of a committed shard lies in the coverage expanded to the
-    dispatch order exactly when its subtree intersects the coverage MOC
-    (containment resolves in either direction — :func:`zagg.sweep_stages.scope_admits`).
+    ancestor of a committed shard lies in the coverage resolved to the dispatch
+    order exactly when its subtree intersects the coverage MOC (containment
+    resolves in either direction — :func:`zagg.sweep_stages.scope_admits`), so
+    nothing here depends on which of the two orders is finer.
     At the default one node per invoke, ``len()`` of the result IS the tuple's
     worker count.
 
@@ -122,7 +134,7 @@ def coverage_dispatch_nodes(by_shard, coverage, dispatch: int) -> list:
     whole-store dispatch, which is what a caller whose coverage fetch came
     back empty would otherwise get.
     """
-    from zagg.sweep_stages import normalize_scope
+    from zagg.sweep_stages import compose_scope, normalize_scope
 
     if coverage is None:
         raise ValueError(
@@ -134,7 +146,8 @@ def coverage_dispatch_nodes(by_shard, coverage, dispatch: int) -> list:
     words = list(coverage.keys() if isinstance(coverage, dict) else coverage)
     if not words:
         return []
-    return dispatch_nodes(by_shard, int(dispatch), normalize_scope(words))
+    filter_moc = compose_scope(normalize_scope(scope), normalize_scope(words))
+    return dispatch_nodes(by_shard, int(dispatch), filter_moc)
 
 
 def _leaf_refs(by_shard, nodes=None) -> list:
@@ -465,6 +478,7 @@ def run_stage_sweep_fleet(
     *,
     shard_order: int,
     scope=None,
+    coverage=None,
     tuple_width: int | None = None,
     max_nodes_per_invoke: int | None = 1,
     run_id: str | None = None,
@@ -487,6 +501,19 @@ def run_stage_sweep_fleet(
     ``shard_order`` is supplied by the caller rather than read from the
     manifest for the same reason: a dispatcher role may hold nothing but
     ``lambda:InvokeFunction``. The runner has it from the config.
+
+    ``coverage`` is the store's own coverage MOC, and supplying it makes every
+    tuple's node set THE ruled computation (:func:`coverage_dispatch_nodes`,
+    issue #547): coverage resolved to the tuple's dispatch order ∩ the shard
+    set, so the worker count per tuple is evaluated from the store rather than
+    pinned anywhere — 110 is only what ATL03's o6 coverage evaluates to today.
+    It composes with ``scope`` (intersection, so a scoped run cannot widen),
+    and it is handed IN, the way ``shard_order`` is — the operator reads it
+    with :func:`zagg.hive.read_root_coverage` /
+    :func:`zagg.hive.root_coverage_words`, and the dispatcher never reads the
+    store (D8). Omitted, the nodes come from the work set alone, which is what
+    the runner's auto-scoped tail passes and what this transport has always
+    done.
 
     ``max_nodes_per_invoke`` caps how many dispatch nodes one invoke folds
     (:func:`pack_batches`, where it composes with the async payload cap). The
@@ -553,6 +580,11 @@ def run_stage_sweep_fleet(
         "tuple_width": tuple_width,
         "max_nodes_per_invoke": max_nodes_per_invoke,
         "scope": None if scope is None else [str(int(w)) for w in scope],
+        # Whether the per-tuple node sets were computed from the store's own
+        # coverage (issue #547) or from the work set alone. The words
+        # themselves are not recorded: a shard-order coverage MOC is thousands
+        # of them, and the run record is read by operators.
+        "coverage_computed": coverage is not None,
         "transport": "lambda",
         "records_from": records_from,
         "n_leaves": sum(len(w) for w in by_shard.values()),
@@ -611,7 +643,14 @@ def run_stage_sweep_fleet(
 
     for stage in stage_tuples(shard_order, tuple_width=tuple_width):
         dispatch = int(stage["dispatch"])
-        nodes = dispatch_nodes(by_shard, dispatch, scope)
+        # The ruled computation when a coverage MOC was handed in, the work set
+        # alone otherwise. Both derive the nodes dispatcher-side, per tuple —
+        # neither reads the store (D8).
+        nodes = (
+            dispatch_nodes(by_shard, dispatch, scope)
+            if coverage is None
+            else coverage_dispatch_nodes(by_shard, dispatch, coverage, scope)
+        )
         if not nodes:
             continue
         block = {

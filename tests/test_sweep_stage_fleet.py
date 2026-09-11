@@ -959,14 +959,14 @@ class TestCoverageComputedAssignment:
         by_shard = {d: {None} for d in LEAVES}
         # Pinned by value at every dispatch order — at the default one node
         # per invoke, len() of each set IS that tuple's worker count:
-        assert coverage_dispatch_nodes(by_shard, words, 0) == ["-2", "1"]
-        assert coverage_dispatch_nodes(by_shard, words, 1) == ["-21", "11"]
-        assert coverage_dispatch_nodes(by_shard, words, 2) == ["-211", "111", "112"]
-        assert coverage_dispatch_nodes(by_shard, words, 3) == sorted(LEAVES)
+        assert coverage_dispatch_nodes(by_shard, 0, words) == ["-2", "1"]
+        assert coverage_dispatch_nodes(by_shard, 1, words) == ["-21", "11"]
+        assert coverage_dispatch_nodes(by_shard, 2, words) == ["-211", "111", "112"]
+        assert coverage_dispatch_nodes(by_shard, 3, words) == sorted(LEAVES)
         # This store's coverage covers its work set, so the coverage-computed
         # assignment and the work-set derivation name the same nodes:
         for dispatch in (0, 1, 2, 3):
-            computed = coverage_dispatch_nodes(by_shard, words, dispatch)
+            computed = coverage_dispatch_nodes(by_shard, dispatch, words)
             assert computed == dispatch_nodes(by_shard, dispatch)
 
     def test_a_coverage_only_subtree_gets_no_worker(self):
@@ -980,7 +980,7 @@ class TestCoverageComputedAssignment:
             build_root_coverage([morton_word(d) for d in LEAVES + ["3111"]], 3)
         )
         by_shard = {d: {None} for d in LEAVES}
-        assert coverage_dispatch_nodes(by_shard, words, 0) == ["-2", "1"]
+        assert coverage_dispatch_nodes(by_shard, 0, words) == ["-2", "1"]
 
     def test_a_shard_outside_the_coverage_gets_no_worker_either(self):
         # The expand-the-coverage half: the assignment is the INTERSECTION,
@@ -993,8 +993,8 @@ class TestCoverageComputedAssignment:
             build_root_coverage([morton_word(d) for d in LEAVES if d != "-2111"], 3)
         )
         by_shard = {d: {None} for d in LEAVES}
-        assert coverage_dispatch_nodes(by_shard, words, 0) == ["1"]
-        assert coverage_dispatch_nodes(by_shard, words, 2) == ["111", "112"]
+        assert coverage_dispatch_nodes(by_shard, 0, words) == ["1"]
+        assert coverage_dispatch_nodes(by_shard, 2, words) == ["111", "112"]
 
     def test_an_empty_coverage_assigns_no_workers(self):
         # A store that covers nothing yet is a real input HERE, unlike a
@@ -1005,7 +1005,7 @@ class TestCoverageComputedAssignment:
 
         by_shard = {d: {None} for d in LEAVES}
         for empty in ([], (), {}, np.asarray([], dtype=np.uint64)):
-            assert coverage_dispatch_nodes(by_shard, empty, 0) == []
+            assert coverage_dispatch_nodes(by_shard, 0, empty) == []
 
     def test_a_missing_coverage_refuses_rather_than_dispatching_everything(self):
         # The other direction of the same trap: a caller whose coverage fetch
@@ -1016,9 +1016,66 @@ class TestCoverageComputedAssignment:
 
         by_shard = {d: {None} for d in LEAVES}
         with pytest.raises(ValueError, match="coverage"):
-            coverage_dispatch_nodes(by_shard, None, 0)
+            coverage_dispatch_nodes(by_shard, 0, None)
         # The unscoped derivation is still reachable, by its own name:
         assert dispatch_nodes(by_shard, 0) == ["-2", "1"]
+
+    def test_the_dispatcher_itself_computes_from_the_supplied_coverage(self, tmp_path):
+        # The SEAM, not the helper (review finding): `coverage=` on the
+        # dispatcher makes the ruled computation the node derivation of every
+        # tuple of a real run. Handed in, never read here — D8.
+        from zagg.hive import read_root_coverage, root_coverage_words
+        from zagg.sweep_fleet import coverage_dispatch_nodes
+
+        root = tmp_path / "s"
+        _stage_store(root)
+        words = root_coverage_words(read_root_coverage(str(root)))
+        client = _FakeLambda(None)
+        summary = _fleet(root, client, tuple_width=1, coverage=words, barrier_timeout_s=0.01)
+        assert summary["coverage_computed"] is True
+        # One invoke per dispatch node at the default, so the fired node sets
+        # ARE the computed assignment, tuple by tuple:
+        by_shard = {d: {None} for d in LEAVES}
+        fired = {}
+        for block in client.blocks():
+            if block["role"] == "stage":
+                fired.setdefault(block["dispatch"], []).extend(block["nodes"])
+        assert {d: sorted(n) for d, n in fired.items()} == {
+            d: coverage_dispatch_nodes(by_shard, d, words) for d in (2, 1, 0)
+        }
+        assert [s["nodes"] for s in summary["stages"]] == [3, 2, 2]
+
+    def test_a_supplied_coverage_intersects_the_run_scope_rather_than_widening_it(self, tmp_path):
+        # Two filters, one assignment: a scoped run stays scoped when a
+        # coverage MOC arrives, and vice versa. Either alone would be a
+        # widening the other was meant to prevent.
+        from zagg.hive import read_root_coverage, root_coverage_words
+
+        root = tmp_path / "s"
+        _stage_store(root)
+        words = root_coverage_words(read_root_coverage(str(root)))
+        client = _FakeLambda(None)
+        summary = _fleet(
+            root,
+            client,
+            coverage=words,
+            scope=["1111"],
+            tuple_width=1,
+            barrier_timeout_s=0.01,
+        )
+        nodes = [b["nodes"] for b in client.blocks() if b["role"] == "stage"]
+        assert nodes == [["111"], ["11"], ["1"]]  # not the coverage's "-2" leg
+        assert summary["coverage_computed"] is True
+
+    def test_an_empty_coverage_fires_nothing_at_the_seam_either(self, tmp_path):
+        # The empty-coverage posture end to end: no nodes anywhere means the
+        # run is the documented no-op, not a whole-store dispatch.
+        root = tmp_path / "s"
+        _stage_store(root)
+        client = _FakeLambda(None)
+        summary = _fleet(root, client, coverage=[], barrier_timeout_s=0.01)
+        assert client.events == [] and summary["invokes"] == 0
+        assert summary["skipped"] == "no dispatch nodes"
 
 
 class TestBatching:
