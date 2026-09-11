@@ -32,9 +32,10 @@ guard refuses the repo's delta-8192 variant by hash).
 **DRY-RUN is the default.** Without ``--execute`` nothing is written: the
 manifest is read (anonymously with ``--anon``), the replacement block is
 derived the same way ``declare_pyramid`` derives it, and the manifest diff,
-the ladder table, and the semantic-hash verdict are printed. ``--execute``
-performs the real single-PUT RMW with full store-truth validation (leaf
-probe + semantic guard + frozen-key recheck) — that flag is the operator's.
+the ladder table, and both read-only gates ``--execute`` applies — the
+semantic-hash verdict and the leaf probe — are printed. ``--execute`` performs
+the real single-PUT RMW with full store-truth validation (the same two gates
+plus the frozen-key recheck) — that flag is the operator's.
 
 Version gate: the live stores were written by zagg 0.52.0, whose classifier
 admits ``composition`` as ``packed``. A pre-0.52 environment silently drops
@@ -119,6 +120,25 @@ def _semantic_verdict(manifest: dict, config) -> str:
     )
 
 
+def _leaf_probe_verdict(store_root: str, manifest: dict, block: dict, store_kwargs: dict) -> str:
+    """``--execute``'s store-truth gate, run read-only so the dry run predicts it.
+
+    :func:`zagg.sweep_overview._validate_block_against_store` is a pure read
+    (one shallow LIST of the run records, then one GET per ref until a committed
+    leaf lands) and is the gate most likely to refuse the live run — a declared
+    digest field whose array or ``inner_shape`` the leaves do not carry. Running
+    only the semantic guard here would let "DRY-RUN: nothing was written" read
+    as "--execute will succeed". Private helper by necessity: it is the only
+    way to apply exactly the gate ``declare_pyramid`` applies.
+    """
+    from zagg.sweep_overview import _validate_block_against_store
+
+    try:
+        return _validate_block_against_store(store_root, manifest, block, store_kwargs)
+    except Exception as exc:  # the refusal IS the verdict — never a stack trace
+        return f"REFUSED — --execute WILL FAIL: {exc}"
+
+
 def _preserving_materialized(prior, block: dict) -> dict:
     """``block`` as ``declare_pyramid`` will compare it: prior actuals copied on.
 
@@ -134,9 +154,10 @@ def _preserving_materialized(prior, block: dict) -> dict:
     return merged
 
 
-def _print_dry_run(manifest: dict, block: dict, verdict: str) -> None:
+def _print_dry_run(manifest: dict, block: dict, verdict: str, leaf_probe: str) -> None:
     prior = manifest.get("pyramid")
     print(f"semantic guard: {verdict}")
+    print(f"leaf probe: {leaf_probe}")
     print()
     if "overviews" in block:
         print("declared ladder (node -> member cell resolutions):")
@@ -219,7 +240,12 @@ def main(argv=None) -> int:
     block = _derive_block(config, manifest)
 
     if not args.execute:
-        _print_dry_run(manifest, block, _semantic_verdict(manifest, config))
+        _print_dry_run(
+            manifest,
+            block,
+            _semantic_verdict(manifest, config),
+            _leaf_probe_verdict(args.store_root, manifest, block, store_kwargs),
+        )
         return 0
 
     if args.anon:
