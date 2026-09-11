@@ -792,7 +792,12 @@ regionally heterogeneous resolution).
   demoted contributor is still a counted leaf (or child), so the level
   materializes and carries the record.
 
-  `field`/`class`/`reason`/`contributors` are always present; `of` names
+  `field`/`class`/`reason`/`contributors` are always present. A
+  **contributor** is one *source read* the fold performed: a `(child,
+  window)` staged column on a `/2` merge (so one child missing a half in `W`
+  windows counts `W`), a `(leaf, window)` column read on a `/1` fold from
+  leaves, and one child overview on a `/1` cascade. `contributors` counts the
+  ones this `(field, reason)` fired on, in that unit. `of` names
   the §3.3 linkage; `cells` is keyed whenever the demotion left output cells
   at the fill word that no surviving contributor covers — always in the
   `word-missing` direction, and in the `divisor-missing` direction only where
@@ -806,7 +811,12 @@ regionally heterogeneous resolution).
   byte-identical to a pre-#518 writer's), and MUST NOT read absence as "no
   demotion ever occurred" on a pre-#518 store. The record is the per-field
   refinement of `source_children`: those counters say a whole contributor
-  was unusable, this key says **which field** folded short and **why** — a
+  was unusable, this key says **which field** folded short and **why**. The
+  two counters are **not in the same unit** and MUST NOT be compared:
+  `source_children` counts **children**, classifying each child once however
+  many windows it contributed, while `contributors` counts the per-read
+  instances defined above — they coincide only in the single-window,
+  one-read-per-child case. A
   demoted field's cells hold the fill value, which §3.2 makes
   byte-indistinguishable from genuine emptiness, so the attrs are the only
   place the distinction can live. The `demoted/` conformance fixture (§7)

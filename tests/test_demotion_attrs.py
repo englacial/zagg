@@ -177,7 +177,10 @@ class TestStageArtifactDemotions:
                 "cells": 1,
             }
         ]
-        # The record sits with the coverage counters it refines.
+        # The record sits with the coverage counters it refines — NOT a pinned
+        # equality: ``contributors`` counts per-read instances (here one
+        # (child, window) column) and ``source_children`` counts children, so
+        # the two coincide only in this single-window shape (spec §4.3).
         assert attrs["source_children"]["unreadable"] == 1
 
     def test_a_missing_divisor_lands_in_the_artifact(self, tmp_path):
