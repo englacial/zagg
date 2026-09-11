@@ -204,7 +204,9 @@ def healpix_aoi_moc(polygon_parts, order: int) -> np.ndarray:
     # geometry entry point routes a (Multi)Polygon's rings through the same
     # one even-odd descent, so this is bit-identical to the pre-1.0 call
     # (disjoint parts union, a nested part carves a hole) -- pinned in
-    # tests/test_aoi_mask.py.
+    # tests/test_aoi_mask.py. Only the refusals moved: a degenerate ring or an
+    # empty parts list now raises out of shapely's constructor rather than out
+    # of mortie, still ValueError but with shapely's wording.
     rings = [
         Polygon(list(zip(np.asarray(p[1], dtype=float), np.asarray(p[0], dtype=float))))
         for p in polygon_parts
