@@ -54,9 +54,19 @@ observation.
 
 `stage_tuples(shard_order=9, tuple_width=3)` produces exactly the ruled
 batching — workers fold 3 rungs each, dispatch nodes at orders `0 mod 3`,
-finest tuple first:
+finest tuple first.
 
-| tuple | orders folded | dispatch order | ATL03 dispatch nodes | reads (one tuple finer) | writes |
+**Every dispatch-node count in this table is COMPUTED, never pinned** (espg
+generality ruling, 2026-09-11): the store's own coverage MOC expanded to the
+tuple's dispatch order, intersected with the shard set, is the worker
+assignment — `zagg.sweep_fleet.coverage_dispatch_nodes` (from a coverage MOC
+the dispatcher already holds; D8 stands) or `dispatch_nodes` (from the work
+set) is what the runbook evaluates at dispatch time. The numbers shown are
+today's evaluation of ATL03's audited coverage; a different store, or the same
+store after more appends, evaluates to different counts through the same
+computation.
+
+| tuple | orders folded | dispatch order | ATL03 dispatch nodes (computed — today's evaluation) | reads (one tuple finer) | writes |
 |---|---|---|---|---|---|
 | T1 | [8, 7, 6] | 6 | **110** | leaf columns (2,918 total; ≤64 per node, avg 26.5) | 1,226 overview nodes + 110 stage columns |
 | T2 | [5, 4, 3] | 3 | **22** | o6 stage columns (110; ≤64 per node, avg 5) | 116 overview nodes + 22 stage columns |
@@ -73,9 +83,11 @@ the ladder across several batches and demanding byte-identity with the CLI
 build. (The tuple-width oracle `test_byte_identity_across_tuple_widths` is a
 *different* axis: how many rungs one worker folds, compared at two widths. It
 does not cover this claim.)
-Proposed worker counts are therefore **one invoke per dispatch node**:
-110 → 22 → 3 → 1 per store (~136 invokes/store). GEDI's first level will be
-of the same magnitude (its o6-equivalent count, derived at dispatch).
+Proposed worker counts are therefore **one invoke per dispatch node** — now
+the dispatcher's default (`max_nodes_per_invoke=1`, ruled 2026-09-11):
+110 → 22 → 3 → 1 per store (~136 invokes/store), every count evaluated from
+the coverage at dispatch time as above. GEDI's first level will be of the
+same magnitude (its o6-equivalent count, derived at dispatch).
 
 Why one-per-node and not coarser grouping: the per-invoke wall bound is the
 fattest dispatch node, and at o6 that is already up to 64 leaf columns
@@ -85,16 +97,20 @@ writes — still probably inside 900 s, but with half the headroom for no cost
 benefit (Lambda bills GB-seconds; the same work costs the same split finer).
 See Q2 below.
 
-**A required dispatcher addition before the run**: `sweep_fleet.pack_batches`
-(PR #525) splits a tuple's nodes by the 250 KB async payload cap **only**.
-The whole ATL03 T1 fan-out — 110 nodes + 2,918 inline leaf refs — is ~90 KB,
-so today's packer emits **one batch = one worker for the entire first rung**,
-which is hours of work against a 900 s wall. The runbook needs a
-max-nodes-per-invoke (equivalently target-worker-count) knob on
-`run_stage_sweep_fleet` / `pack_batches`. Small, orchestration-only (changes
-no bytes, like `tuple_width`); proposed as a follow-up commit on the #525
-branch or the runbook branch. Without it the fleet path cannot express this
-schedule at all.
+**The dispatcher addition — LANDED on this branch** (was: required before the
+run). `sweep_fleet.pack_batches` split a tuple's nodes by the 250 KB async
+payload cap **only**: the whole ATL03 T1 fan-out — 110 nodes + 2,918 inline
+leaf refs — is ~90 KB, so the old packer emitted **one batch = one worker for
+the entire first rung**, hours of work against a 900 s wall.
+`run_stage_sweep_fleet` / `pack_batches` now take `max_nodes_per_invoke` /
+`max_nodes`, **default 1** — one dispatch node per invoke at every tuple, the
+ruled T1 fan-out — composing with the payload cap (whichever binds first
+closes a batch); `None` restores payload-only packing. Orchestration-only
+(changes no bytes, like `tuple_width`): the byte-identity oracle re-runs at
+`max_nodes=1` (`test_identity_survives_the_one_node_per_invoke_fan_out`), and
+the coverage-computed assignment is pinned against a fixture store's own
+`coverage.moc` (`TestCoverageComputedAssignment`, both in
+`tests/test_sweep_stage_fleet.py`).
 
 ## Wall-time per batch (against the 900 s wall)
 
@@ -255,8 +271,9 @@ schedule removes the mechanism itself:
   published stores (the bucket policy names the fleet role, #495/#496) — so
   both the plumbing and the ruling are **hard prerequisites** for the backfill
   leg. See Q3.
-- (c) **The stage dispatcher needs the worker-count knob** (payload-only
-  packing → one worker per tuple today; see the schedule section).
+- (c) **CLOSED — the stage dispatcher's worker-count knob landed on this
+  branch** (`max_nodes_per_invoke`, default one node per invoke, coverage-
+  computed assignment; see the schedule section).
 - (d) GEDI's families rollups are incomplete (moc 249/353, submap 244/353) —
   separate from the pyramid, could ride the same fleet window as a cheap
   families pass, or wait.
@@ -270,11 +287,22 @@ schedule removes the mechanism itself:
    `--execute`.
 2. Column backfill (`--families columns`) over the fleet, once (b) is ruled;
    gate step 3 on `failed: 0`.
-3. Staged fleet sweep (`run_stage_sweep_fleet`, tuple_width 3) with the
-   worker-count knob from (c): 110 → 22 → 3 → finisher.
+3. Staged fleet sweep (`run_stage_sweep_fleet`, tuple_width 3) at the default
+   one node per invoke: 110 → 22 → 3 → finisher on today's evaluation of
+   ATL03's coverage (computed at dispatch, per the schedule section).
 4. zagg#434 E2E acceptance against the swept store before any LoD claim (S3).
 
 ## Questions for espg (blocking the final runbook)
+
+> **Update 2026-09-11 — all three RULED** (plus the `/2` grammar), in
+> [the issue #547 rulings comment](https://github.com/englacial/zagg/issues/547#issuecomment-5641047734):
+> (1) batches `[8,7,6]/[5,4,3]/[2,1,0]`, preceded by a one-node T1 canary;
+> (2) one dispatch node per invoke at T1, the count computed from the store's
+> own coverage (never hardcoded — the knob and computation landed on this
+> branch, see the schedule section); (3) strictly serial declare → backfill →
+> coverage/rollup refresh → ladder sweep, interleaving rejected and the
+> lease/heartbeat ruling thereby avoided. The questions below stand as asked,
+> for the record.
 
 1. **Batch boundaries** — confirm `tuple_width 3` ⇒ `[8,7,6] / [5,4,3] /
    [2,1,0]` (dispatch nodes at o6/o3/base, matching the table above), or
