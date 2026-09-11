@@ -36,12 +36,20 @@ centroids by mean before any CDF interpolation — concatenation does not
 preserve the sort, and an unsorted digest interpolates garbage (the
 sort-before-interp trap).
 
-Both pyramid grammars are read: ``zagg-pyramid/1`` derives each level's cell
-order by constant depth (spec §4.4), ``zagg-pyramid/2`` takes the manifest's
-expanded ``overviews`` list as the contract. The fixture suite exercises the
-``/1`` sweep (both production stores declare ``/1`` today); ``/2`` leaf-node
-members (inside the leaf zarrs) are out of scope — validation folds against
-the base arrays either way.
+Both pyramid grammars are PARSED — ``zagg-pyramid/1`` derives each level's
+cell order by constant depth (spec §4.4), ``zagg-pyramid/2`` takes the
+manifest's expanded ``overviews`` list as the contract — so either
+declaration is read back and reported. Only ``/1`` is VALIDATED: the fold
+model here is the ``/1`` level-from-level cascade, while a ``/2`` ladder is
+written by the staged sweep (:mod:`zagg.sweep_stage`), which folds from the
+dispatch node's child columns and stamps different provenance. A ``/2`` store
+is refused at the declaration check rather than best-effort validated against
+a fold it does not have. Both production stores declare ``/1`` today.
+
+Each node's fold source is read from its OWN recorded provenance
+(``zagg_overview.fold_source`` / ``fold_from_order``), never assumed to be
+the next finer level: ``fold_source: "leaves"``, ``exact_levels > 1`` and the
+gap-wider-than-the-slab fallback all fold from the raw leaves instead.
 """
 
 from __future__ import annotations
@@ -311,6 +319,17 @@ class _Harness:
         self.cell_order = int(manifest["cell_order"])
         self.fields = _composable_fields(manifest)
         self._groups: dict = {}
+        self.warnings: list = []
+
+    def warn(self, message: str) -> None:
+        """Record a check the harness DECLINED to make, for the report.
+
+        Skipping quietly is the failure mode the negative suite exists to
+        rule out: everything the pass could not validate is named here and
+        printed by :func:`format_report`.
+        """
+        if message not in self.warnings and len(self.warnings) < 200:
+            self.warnings.append(message)
 
     def _open(self, rel: str, inner: int):
         import zarr
@@ -438,6 +457,23 @@ def validate_pyramid(
         )
         skip_rest("no composable fields", after="declaration")
         return _finish(report)
+    if report["pyramid_spec"] == "zagg-pyramid/2":
+        # Refused the way a windowed store is: the /2 ladder is written by the
+        # STAGED sweep (:mod:`zagg.sweep_stage`), whose levels fold from the
+        # dispatch node's child columns at the shard/child order rather than
+        # level-from-level, and which stamps ``regime``/``merges_from_raw``/
+        # ``source_children`` instead of ``fold_source``/``fold_from_order``.
+        # Validating it with the /1 cascade model would produce a verdict from
+        # a fold the store does not have (review finding); the ladder above is
+        # still parsed and reported, so the DECLARATION is on the record.
+        checks["declaration"] = _entry(
+            "fail",
+            f"zagg-pyramid/2 ladder {[k for k, _ in ladder]} declared — this harness "
+            f"validates the /1 cascade fold only; the /2 staged sweep's write shape and "
+            f"provenance differ (issue #434 scope)",
+        )
+        skip_rest("zagg-pyramid/2 store", after="declaration")
+        return _finish(report)
     detail = (
         f"{report['pyramid_spec']} ladder {[k for k, _ in ladder]}; composable fields "
         f"{sorted(fields)} (classes {report['field_classes']})"
@@ -560,15 +596,22 @@ def _value_checks(harness, ladder, declared, probes, leaves, checks, report, *, 
         if not full and len(nodes) > harness.sample_nodes:
             picks = harness.rng.choice(len(nodes), harness.sample_nodes, replace=False)
             nodes = sorted(nodes[int(p)] for p in picks)
-        source = _source_for(harness, ladder, i, declared, probes, leaves)
         for node in nodes:
+            attrs = probes[k][node]
+            source, compose_exact, note = _source_for(
+                harness, ladder, i, declared, probes, leaves, attrs
+            )
+            if note:
+                harness.warn(f"{node}: {note}")
+            if source is None:
+                continue
             _check_node(
                 harness,
                 node,
                 k,
                 t,
                 source,
-                probes[k][node],
+                attrs,
                 count_meta,
                 exact_fields,
                 digest_fields,
@@ -576,6 +619,7 @@ def _value_checks(harness, ladder, declared, probes, leaves, checks, report, *, 
                 errors,
                 counted,
                 full=full,
+                compose_exact=compose_exact,
             )
 
     if full and count_meta is not None:
@@ -599,20 +643,63 @@ def _value_checks(harness, ladder, declared, probes, leaves, checks, report, *, 
         else:
             checks[name] = _entry("pass", f"{counted[name]} check(s), all consistent")
     report["sampled"] = counted
+    if harness.warnings:
+        report["warnings"] = list(harness.warnings)
 
 
-def _source_for(harness, ladder, i, declared, probes, leaves):
-    """The fold-source tier for ladder level ``i``: one level finer, or leaves."""
+def _source_for(harness, ladder, i, declared, probes, leaves, attrs):
+    """One node's fold-source tier, from its OWN recorded provenance.
+
+    Returns ``(source, exact_composition, note)``. The sweep records which
+    regime made each level (``zagg_overview.fold_source`` /
+    ``fold_from_order``, :func:`zagg.sweep_overview._fold_provenance`), and
+    three reachable regimes are NOT "the next finer ladder level":
+    ``fold_source: "leaves"`` (every level folds from the raw leaves),
+    ``exact_levels > 1`` (the finest N do), and the gap-wider-than-the-slab
+    fallback. Assuming the cascade would make the packed composition compare —
+    which is exact, and re-quantizes its lanes once per fold — a GUARANTEED
+    false fail under any of them, so the tier is read, never inferred (review
+    finding).
+
+    With no usable provenance the next-finer heuristic still holds for counts
+    and digests (an associative law and a tolerance-based one), but the exact
+    composition compare is declined and said so: ``exact_composition`` is
+    False. The finest level is the one case that needs no provenance — it has
+    no finer overview to cascade from at all.
+    """
+    from zagg.sweep_overview import OVERVIEW_ATTR
+
+    leaf_tier = (harness.shard_order, harness.cell_order, leaves, harness.leaf_group)
+    provenance = (attrs or {}).get(OVERVIEW_ATTR)
+    provenance = provenance if isinstance(provenance, dict) else {}
+    recorded = provenance.get("fold_source")
+    if recorded == "leaves":
+        return leaf_tier, True, None
+    if recorded == "cascade":
+        k_src = provenance.get("fold_from_order")
+        tier = _node_tier(harness, ladder, declared, probes, k_src)
+        if tier is None:
+            return None, False, f"cascade from order {k_src!r}, which is not a declared level"
+        return tier, True, None
     if i == 0:
-        return (
-            harness.shard_order,
-            harness.cell_order,
-            leaves,
-            harness.leaf_group,
-        )
+        return leaf_tier, True, None
     k_src, t_src = ladder[i - 1]
     materialized = [n for n in declared[k_src] if probes[k_src].get(n) is not None]
-    return (k_src, t_src, materialized, lambda node: harness.node_group(node, t_src))
+    return (
+        (k_src, t_src, materialized, lambda node: harness.node_group(node, t_src)),
+        False,
+        f"no recorded fold provenance ({recorded!r}); counts/digests checked against "
+        f"order {k_src}, composition NOT validated",
+    )
+
+
+def _node_tier(harness, ladder, declared, probes, k_src):
+    """The materialized-node tier at ladder order ``k_src``, or None."""
+    for k, t in ladder:
+        if k == k_src:
+            materialized = [n for n in declared[k] if probes[k].get(n) is not None]
+            return (k, t, materialized, lambda node, t=t: harness.node_group(node, t))
+    return None
 
 
 def _check_node(
@@ -630,6 +717,7 @@ def _check_node(
     counted,
     *,
     full,
+    compose_exact=True,
 ):
     from zagg.grids.morton import morton_word
     from zagg.stats.composition import merge_composition_kway
@@ -765,8 +853,10 @@ def _check_node(
             if problem := _digest_mismatch(stored_digest, ref):
                 errors["digests"].append(f"{node}[{int(j)}]/{name}: {problem}")
 
-        # Composition: exact k-way word merge, n from the `of` digest.
-        for name, meta in packed_fields.items():
+        # Composition: exact k-way word merge, n from the `of` digest. Run
+        # only when the node's own provenance pins the tier it folded from —
+        # an exact compare against a guessed tier is a false fail, not a check.
+        for name, meta in (packed_fields if compose_exact else {}).items():
             of = meta["of"]
             of_meta = harness.fields.get(of) or {}
             of_dtype = of_meta.get("dtype", "float32")
@@ -856,6 +946,12 @@ def format_report(report: dict) -> str:
     for name in CHECKS:
         entry = report["checks"][name]
         lines.append(f"  [{entry['status'].upper():4}] {name:15} {entry['detail']}")
+    warnings = report.get("warnings") or []
+    if warnings:
+        lines.append(f"  {len(warnings)} check(s) declined — NOT validated:")
+        lines.extend(f"    - {w}" for w in warnings[:10])
+        if len(warnings) > 10:
+            lines.append(f"    - ... {len(warnings) - 10} more")
     lines.append(f"VERDICT: {'PASS' if report['passed'] else 'FAIL'}")
     return "\n".join(lines)
 
