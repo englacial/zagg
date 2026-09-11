@@ -309,6 +309,39 @@ class TestV2Provenance:
                 name,
                 format_report(report),
             )
+        # The decline is scoped to the per-cell comparisons: the declined
+        # nodes are still READ BACK (role/provenance/arrays/morton/§3.3).
+        assert report["checks"]["readback"]["status"] == "pass", format_report(report)
+
+    def test_stamped_under_coverage_cannot_hide_a_corruption(self, tmp_path):
+        # The adversarial direction of the test above: source_children is
+        # written by the artifact about ITSELF, so a corrupt ladder that
+        # stamps missing:1 on every node must not decline its way to PASS.
+        # Every source column here IS committed, so the stamp is stale — a
+        # read-back failure — and the value checks run and catch the counts.
+        _build_store(tmp_path)
+        for rel, order in (("-3/1/1", 4), ("-3/1", 3), ("-3", 2)):
+            group = _node_group(tmp_path, rel, order)
+            counts = group["count"][:]
+            counts[int(np.flatnonzero(counts > 0)[0])] += 7
+            group["count"][:] = counts
+            self._stamp_under_coverage(tmp_path, rel)
+        report = validate_pyramid(str(tmp_path), full=True)
+        assert report["passed"] is False, format_report(report)
+        assert report["checks"]["counts"]["status"] == "fail", format_report(report)
+        entry = report["checks"]["readback"]
+        assert entry["status"] == "fail"
+        assert any("sources have since healed" in m for m in entry["mismatches"]), entry
+        assert not any("under-covers its subtree (" in w for w in report.get("warnings") or [])
+
+    def _stamp_under_coverage(self, tmp_path, node_rel):
+        self._edit_node_attrs(
+            tmp_path,
+            node_rel,
+            lambda a: a["zagg_overview"].update(
+                source_children={"folded": 1, "missing": 1, "unreadable": 0}
+            ),
+        )
 
     def test_manifest_actuals_mismatch_is_caught(self, tmp_path):
         # The finisher's per-entry actuals (#381 point (7)) are bookkeeping a
