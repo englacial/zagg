@@ -109,10 +109,12 @@ class TestFourFieldSchema:
         compares stored columns against, derived from the same machinery
         ``write_column`` writes with — so this is the 204 exemplar shards'
         schema, pinned from the CURRENT classifiers alone (the class map is
-        pinned in ``test_strata_composability.py::TestD24Classification``).
+        pinned in ``test_strata_composability.py::TestD24Classification``)
+        over the LIVE CA store's geometry, which the vendored manifest
+        supplies: node order 9, the five-group ladder ``[13, 12, 11, 10, 9]``.
         """
         from zagg.column import composable_fields
-        from zagg.column_backfill import column_structure
+        from zagg.column_backfill import column_structure, manifest_column_plan
         from zagg.config import default_config
         from zagg.pyramid import declared_fields
 
@@ -125,8 +127,12 @@ class TestFourFieldSchema:
             "h_tdigest_noise",
             "h_tdigest_signal",
         ]
-        structure = column_structure(composable, node_order=11, resolutions=[13, 11])
-        assert set(structure) == {"13", "11"}
+        plan = manifest_column_plan(json.loads(CA_MANIFEST.read_text()))
+        assert (plan.node_order, plan.resolutions) == (9, [13, 12, 11, 10, 9])
+        structure = column_structure(
+            composable, node_order=plan.node_order, resolutions=plan.resolutions
+        )
+        assert set(structure) == {"13", "12", "11", "10", "9"}
         for group in structure.values():
             assert set(group) == ATL03_COLUMN_ARRAYS
 
@@ -271,6 +277,8 @@ class TestLiveCaManifestPlan:
         plan = manifest_column_plan(json.loads(CA_MANIFEST.read_text()))
         assert sorted(plan.fields) == ["count"]
         assert (plan.node_order, plan.cell_order) == (9, 19)
+        # The ladder is the other half of what a live column must be.
+        assert plan.resolutions == [13, 12, 11, 10, 9]
 
     def test_a_four_field_column_under_the_count_only_plan_is_drift(self, tmp_path, monkeypatch):
         """The keying is bidirectional — which protects nothing by itself.
