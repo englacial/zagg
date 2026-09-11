@@ -3477,6 +3477,49 @@ class TestDeclarePyramid:
         assert after["pyramid"]["spec"] == PYRAMID_SPEC_V2
         assert after["pyramid"]["overview"]["materialized"] == actuals
 
+    def test_declare_v2_replaces_v1_declared_but_never_materialized(self, tmp_path):
+        # The live atl03_tdigest_o9 shape (issue #520 audit): a /1 declaration
+        # retrofit-installed but NEVER swept — no ``materialized`` key at all.
+        # Replacing it with the /2 dense ladder must be a clean single-PUT
+        # replace that invents no actuals inventory out of nothing.
+        from zagg.pyramid import PYRAMID_SPEC_V2
+
+        _write_manifest(tmp_path)  # /1 orders [1, 0], no materialized
+        _make_leaf(tmp_path, "-311", self.CELLS["-311"])
+        _run_record(tmp_path, ("-311",))
+        cfg = _leaf_cfg()
+        cfg.output["pyramid"] = {"overviews": [3]}
+        summary = declare_pyramid(str(tmp_path), cfg)
+        assert summary["previous"] == "replaced" and summary["updated"] is True
+        assert "orders" not in summary  # /2 summaries carry no /1 schedule key
+        after = read_manifest(str(tmp_path))["pyramid"]
+        assert after["spec"] == PYRAMID_SPEC_V2
+        # The dense every-order ladder: leaf entry + one member per order to 0.
+        assert after["overviews"] == [
+            {"node": 2, "cells": [3]},
+            {"node": 1, "cells": [2]},
+            {"node": 0, "cells": [1]},
+        ]
+        assert "materialized" not in after["overview"]
+        assert "orders" not in after["overview"] and "spacing" not in after["overview"]
+
+    def test_declare_v2_replaces_v1_declared_off(self, tmp_path):
+        # The live gedi_flux_o9 shape: pyramids declared OFF (``orders: []``,
+        # the /1 declared-off signal) — the /2 retrofit replaces it wholesale.
+        from zagg.pyramid import PYRAMID_SPEC_V2
+
+        _write_manifest(tmp_path, orders=())
+        _make_leaf(tmp_path, "-311", self.CELLS["-311"])
+        _run_record(tmp_path, ("-311",))
+        cfg = _leaf_cfg()
+        cfg.output["pyramid"] = {"overviews": [3]}
+        summary = declare_pyramid(str(tmp_path), cfg)
+        assert summary["previous"] == "replaced" and summary["updated"] is True
+        after = read_manifest(str(tmp_path))["pyramid"]
+        assert after["spec"] == PYRAMID_SPEC_V2
+        assert [e["node"] for e in after["overviews"]] == [2, 1, 0]
+        assert "materialized" not in after["overview"]
+
     def test_declared_v2_store_sweeps_to_a_loud_noop(self, tmp_path, caplog):
         # End-to-end (#381 point (11)): declaring is free, sweeping is the
         # operational decision — a /2 retrofit leaves the store sweep-safe.
