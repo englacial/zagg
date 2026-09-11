@@ -34,7 +34,10 @@ spec §4.4/§4.6 make normative:
   merge-source law makes tuple grouping irrelevant). A gather level's
   packed word is compared as ASSIGNED gen-1 content, not re-merged (§3.4
   quantization drift is per merge). The column tier itself is validated
-  against the leaf's own cell arrays — the §4.6 from-leaves parity;
+  against the leaf's own cell arrays — the §4.6 from-leaves parity, whose
+  per-cell fold factor is set by the geometry rather than by ``sample_cells``
+  and is therefore bounded by :data:`COLUMN_PARITY_FOLD_MAX` outside full
+  mode;
 - **idempotency** (fixture mode) — an immediate
   :func:`zagg.sweep_stages.sweep_stage_pass` re-run is a no-op (the #417
   generation ratchet), refused for ``s3://`` roots like the ``/1`` arm's.
@@ -70,6 +73,19 @@ from zagg.pyramid_check_core import (
 )
 
 logger = logging.getLogger(__name__)
+
+#: Leaf-cell fold factor above which the §4.6 from-leaves parity leg declines
+#: a sampled column cell's PAYLOAD comparisons (digests, packed ``of``
+#: weights). A column group at resolution ``q`` folds ``4 ** (cell_order - q)``
+#: leaf cells per cell, and the group at the node order has exactly ONE cell —
+#: so ``sample_cells`` cannot shrink it, and the coarsest groups would re-fold
+#: a whole leaf per sampled leaf (review finding: ~1.05M ragged payloads at the
+#: ATL03 o9 target, which is the leaf worker's own workload, not a sample).
+#: ``4**6`` keeps a sampled cell's ragged re-fold near the ~4k payloads the
+#: module header's "sample nodes and cells" bound promises; exact count parity
+#: is dense and stays exhaustive, and ``full=True`` (fixture mode) is never
+#: bounded at all.
+COLUMN_PARITY_FOLD_MAX = 4**6
 
 
 def validate_v2(
@@ -336,6 +352,19 @@ def _value_checks_v2(
         attrs = col_probes[dec]
         errors["readback"].extend(_column_attrs_errors(dec, s, attrs, resolutions))
         for q in resolutions:
+            # Bound the fold: one cell of the group at ``q`` covers
+            # ``4 ** (cell_order - q)`` leaf cells, whatever ``sample_cells``
+            # says, so the payload legs are declined (and NAMED) above
+            # :data:`COLUMN_PARITY_FOLD_MAX` outside full mode.
+            fold = 4 ** (harness.cell_order - q)
+            refold = full or fold <= COLUMN_PARITY_FOLD_MAX
+            if not refold:
+                harness.warn(
+                    f"column group [{q}]: each cell folds {fold} leaf cells "
+                    f"(> {COLUMN_PARITY_FOLD_MAX}) — §4.6 digest/composition parity "
+                    f"declined for this group in sampled mode (counts still compared); "
+                    f"rerun --full on a fixture-scale store to check it"
+                )
             _check_node(
                 harness,
                 dec,
@@ -354,6 +383,7 @@ def _value_checks_v2(
                 role="column",
                 provenance_attr="zagg_column",
                 group_getter=harness.column_group,
+                refold_payloads=refold,
             )
 
     # -- the finisher's manifest actuals (#381 point (7)), when recorded.

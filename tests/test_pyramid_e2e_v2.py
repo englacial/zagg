@@ -179,6 +179,27 @@ class TestV2FixtureE2E:
         assert "VERDICT: PASS" in out and "columns" in out
         assert json.loads(out_json.read_text())["passed"] is True
 
+    def test_wide_column_group_declines_payload_parity_in_sampled_mode(self, tmp_path, monkeypatch):
+        # The §4.6 parity leg's span is the GEOMETRY's (one cell of the group
+        # at q covers 4**(cell_order - q) leaf cells), so sample_cells cannot
+        # bound it — a coarse group re-folds a whole leaf per sampled leaf.
+        # Above the bound the payload legs are declined and NAMED; counts
+        # (dense) still run, and full mode is never bounded.
+        from zagg import pyramid_check_v2
+
+        _build_store(tmp_path)
+        monkeypatch.setattr(pyramid_check_v2, "COLUMN_PARITY_FOLD_MAX", 4)
+        report = validate_pyramid(str(tmp_path), sample_nodes=2, sample_cells=3, seed=7)
+        assert report["passed"] is True, format_report(report)
+        declined = [w for w in report.get("warnings") or [] if "column group [3]" in w]
+        assert declined, format_report(report)
+        assert "64 leaf cells" in declined[0] and "counts still compared" in declined[0]
+        assert report["sampled"]["counts"] > 0
+        # ... and the bound does not apply in full (fixture) mode.
+        full = validate_pyramid(str(tmp_path), full=True)
+        assert full["passed"] is True, format_report(full)
+        assert not any("column group [" in w for w in full.get("warnings") or [])
+
     def test_gather_levels_carry_gen1_bytes(self, tmp_path):
         # The acceptance contract the harness leans on: a gather level's cell
         # IS the leaf column's cell, assigned — pin it directly so the
