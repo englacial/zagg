@@ -53,14 +53,14 @@
         }
       },
       "cells_with_data_order": 5,
-      "generated_at": "2026-09-11T01:05:43+00:00"
+      "generated_at": "2026-09-11T01:23:29+00:00"
     },
     "morton_hive_commit": {
       "spec": "morton-hive/1",
       "complete": true,
       "cells_with_data": 3,
       "granule_count": 1,
-      "written_at": "2026-09-11T01:05:43+00:00"
+      "written_at": "2026-09-11T01:23:29+00:00"
     }
   },
   "zarr_format": 3,

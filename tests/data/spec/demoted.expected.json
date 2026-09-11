@@ -468,7 +468,8 @@
     "class": "packed",
     "reason": "divisor-missing",
     "contributors": 1,
-    "of": "h_tdigest_signal"
+    "of": "h_tdigest_signal",
+    "cells": 4
    }
   ]
  }
