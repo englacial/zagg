@@ -517,14 +517,26 @@ def run_stage_sweep_fleet(
 
     ``max_nodes_per_invoke`` caps how many dispatch nodes one invoke folds
     (:func:`pack_batches`, where it composes with the async payload cap). The
-    default is 1 — one dispatch node per invoke at every tuple, the espg-ruled
-    fan-out (issue #547, 2026-09-11): the finest tuple is where it binds (its
+    default is 1 — one dispatch node per invoke. Orchestration only, like
+    ``tuple_width`` — no store byte moves with it — and the resulting worker
+    count is COMPUTED per tuple (:func:`dispatch_nodes`, or
+    :func:`coverage_dispatch_nodes` from a coverage MOC), never hardcoded.
+    ``None`` restores payload-only packing, which puts a whole tuple on one
+    worker whenever it fits the 250 KB async cap.
+
+    **What the ruling covers, and what this default extends.** The espg ruling
+    (issue #547, 2026-09-11) named T1 — ATL03's 110-node o6 tuple, whose
     fattest node is already a full ``4^width`` subtree of leaf columns against
-    the 900 s wall), and the coarser tuples' node counts are small.
-    Orchestration only, like ``tuple_width`` — no store byte moves with it —
-    and the resulting worker count is COMPUTED from the work set per tuple
-    (:func:`dispatch_nodes`, or :func:`coverage_dispatch_nodes` from a
-    coverage MOC), never hardcoded. ``None`` restores payload-only packing.
+    the 900 s wall, so one node per invoke is what keeps it inside the wall.
+    Making it the default at EVERY tuple is this dispatcher's extension, and
+    it is safe on that store only because the coarser tuples are small (22,
+    then 3). It is not free in the store's order: at ``max_nodes=1`` the
+    ~49k-node finest tuple of an o9 store is ~49k ``Event`` invokes, ~49k
+    objects under the run's status prefix, and an ``expected`` set of ~49k
+    names that every barrier poll re-LISTs — a dispatcher-side cost the
+    payload cap used to bound. Sweeping such a store, pass a cap sized to the
+    per-invoke wall (or ``None``); the knob is reachable from the runner's
+    seam too (:func:`zagg.runner._invoke_lambda_stage_sweep`).
 
     ``run_id`` names the lease, the skip-key/foreign-stamp namespace AND the
     status prefix the stage records land under, so it is generated here (or

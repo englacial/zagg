@@ -5593,6 +5593,7 @@ def _invoke_lambda_stage_sweep(
     output_creds_event=None,
     store_kwargs=None,
     touch_policy="auto",
+    max_nodes_per_invoke="default",
     barrier_timeout_s=None,
     total_barrier_budget_s=None,
 ) -> dict | None:
@@ -5622,6 +5623,17 @@ def _invoke_lambda_stage_sweep(
     caller can shorten them for a small store or lengthen them for a throttled
     account.
 
+    **How wide the fan-out is.** ``max_nodes_per_invoke`` is the tail's grip on
+    the invoke shape (:func:`zagg.sweep_fleet.run_stage_sweep_fleet`, where the
+    default and its scope are documented). Left at ``"default"`` the seam
+    passes nothing and INHERITS the dispatcher's ruled one-dispatch-node-per-
+    invoke fan-out; an explicit value — including ``None``, which restores
+    payload-only packing and puts a whole tuple on one worker — is forwarded
+    verbatim. The knob is orchestration only: dispatch nodes own disjoint
+    subtrees, so no store byte moves with it. It is reachable HERE because the
+    ruled default is sized for a store whose finest tuple is ~110 nodes, and
+    the tail runs against whatever store the config names.
+
     **If the dispatcher dies mid-barrier** (a CI timeout, Ctrl-C, a driving
     Lambda's own 900 s ceiling) the run's lease stays HELD, because the
     finisher is its only releaser and it never fired. That is the lease's
@@ -5637,6 +5649,10 @@ def _invoke_lambda_stage_sweep(
         knobs["barrier_timeout_s"] = float(barrier_timeout_s)
     if total_barrier_budget_s is not None:
         knobs["total_barrier_budget_s"] = float(total_barrier_budget_s)
+    # `"default"`, not `None`: `None` is a MEANING here (payload-only packing),
+    # so it cannot double as the unset sentinel the barrier knobs use.
+    if max_nodes_per_invoke != "default":
+        knobs["max_nodes_per_invoke"] = max_nodes_per_invoke
     try:
         summary = run_stage_sweep_fleet(
             lambda_client,
