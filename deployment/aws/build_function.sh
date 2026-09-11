@@ -215,7 +215,12 @@ if [ "$UNZIPPED_BYTES" -gt "$FUNCTION_BUDGET" ]; then
 fi
 
 # --- Create zip ---
+# Remove any previous artifact first: `zip` ADDS to and UPDATES an existing
+# archive, never deleting entries absent from the input tree, so a stale zip in
+# deployment/builds/ (a dev box, a second `pytest -m slow`) would keep whatever
+# an earlier build shipped alongside this one's file set.
 mkdir -p "$OUTPUT_DIR"
+rm -f "${OUTPUT_DIR}/${ZIP_NAME}"
 cd "$BUILD_DIR" && zip -r9q "${OUTPUT_DIR}/${ZIP_NAME}" .
 cd "$SCRIPT_DIR"
 
