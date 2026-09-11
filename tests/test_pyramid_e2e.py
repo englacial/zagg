@@ -385,6 +385,24 @@ class TestHarnessCatchesCorruption:
         assert "partial uncommitted" in entry["detail"]
         assert report["partial_nodes"] == ["-41"]
 
+    def test_role_without_commit_stamp_is_not_materialized(self, tmp_path):
+        # The other torn-write variant: the write order pins role/provenance
+        # attrs BEFORE the D4 commit stamp, so a writer killed in between
+        # leaves a node the cascade skips (`_overview_committed`) but a
+        # role-only gate would accept.
+        from zagg.hive import COMMIT_ATTR
+
+        self._swept(tmp_path)
+        node_meta = tmp_path / "-4" / "1" / "all.zarr" / "zarr.json"
+        meta = json.loads(node_meta.read_text())
+        meta["attributes"].pop(COMMIT_ATTR)
+        node_meta.write_text(json.dumps(meta))
+        report = validate_pyramid(str(tmp_path), full=True)
+        entry = report["checks"]["materialization"]
+        assert entry["status"] == "fail"
+        assert "4/5 declared nodes materialized" in entry["detail"]
+        assert report["partial_nodes"] == ["-41"]
+
     def test_probe_error_is_not_the_pre_sweep_baseline(self, tmp_path):
         # A probe that fails for any reason other than not-found (here an
         # unparsable node zarr.json; in production a credential/throttle

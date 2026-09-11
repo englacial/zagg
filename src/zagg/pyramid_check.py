@@ -453,11 +453,24 @@ def validate_pyramid(
         return _finish(report)
 
     # -- [2] materialization: declared node roster vs stored overview objects.
-    # "Materialized" means COMMITTED: the node's root group carries the
-    # ``role: overview`` stamp. A bare/attr-less node object is a partial
-    # write (e.g. the aborted 2026-08-25 sweep's debris, issue #547
-    # forensics) and counts as unmaterialized, reported separately.
+    # "Materialized" means COMMITTED, in the sweep's own sense: the node's root
+    # group carries the ``role: overview`` attr AND the D4 commit stamp. The
+    # write order pins role/provenance attrs BEFORE the stamp, so role alone
+    # accepts a torn write that :func:`zagg.sweep_overview._overview_committed`
+    # refuses — and whose arrays the cascade deliberately left at fill (review
+    # finding). Both stamps live in the one ``zarr.json`` already probed, so
+    # this costs no extra GET. A bare/attr-less node object or a role-without-
+    # stamp one is a partial write (e.g. the aborted 2026-08-25 sweep's debris,
+    # issue #547 forensics): unmaterialized, reported separately.
+    from zagg.hive import COMMIT_ATTR
     from zagg.sweep_overview import ROLE_ATTR
+
+    def committed(attrs) -> bool:
+        return (
+            attrs is not None
+            and attrs.get(ROLE_ATTR) == "overview"
+            and isinstance(attrs.get(COMMIT_ATTR), dict)
+        )
 
     declared = {k: _declared_nodes(leaves, k) for k, _ in ladder}
     probes: dict = {}
@@ -468,15 +481,10 @@ def validate_pyramid(
     for k, _t in ladder:
         probed, errored = _probe_nodes(store_root, declared[k], store_kwargs)
         probe_errors.extend(f"{n}: {e}" for n, e in sorted(errored.items()))
-        probes[k] = {
-            n: attrs if attrs is not None and attrs.get(ROLE_ATTR) == "overview" else None
-            for n, attrs in probed.items()
-        }
+        probes[k] = {n: attrs if committed(attrs) else None for n, attrs in probed.items()}
         found = [n for n, attrs in probes[k].items() if attrs is not None]
         partial.extend(
-            n
-            for n, attrs in sorted(probed.items())
-            if attrs is not None and attrs.get(ROLE_ATTR) != "overview"
+            n for n, attrs in sorted(probed.items()) if attrs is not None and not committed(attrs)
         )
         per_order[k] = {"declared": len(declared[k]), "materialized": len(found)}
         missing.extend(sorted(set(declared[k]) - set(found)))
