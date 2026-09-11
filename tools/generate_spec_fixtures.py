@@ -55,7 +55,10 @@ conformance tests assert decoded values, never object bytes.
   every-order ladder rooted at node 0, the #376 fold keys, and the
   preserved ``/1``-era ``materialized`` actuals — plus, through the
   ``pyramid.expected.json`` record of the raw config knob, the leaf-list
-  form of the declaration the expansion was derived from. No store beneath
+  form of the declaration the expansion was derived from. Since issue #392
+  the same manifest also carries the §4.9 ``multiscales`` discovery mirror
+  installed beside every ``/2`` block (``column/``, committed earlier and
+  unregenerated, is the absent-key ⇒ pre-convention pin). No store beneath
   it on purpose — the block is a template-time artifact, decodable from
   ``morton_hive.json`` alone; the ``/2`` artifacts a fleet writes are the
   ``column/`` fixture's job (issue #383 — sweep-side levels are issue #384).
@@ -789,6 +792,34 @@ def build_pyramid(out: Path) -> None:
         # cannot drift from the formula on the page.
         "default_overviews": [{"node": s, "cells": [chunk]}]
         + [{"node": k, "cells": [k + (chunk - s)]} for k in range(s - 1, -1, -1)],
+        # The §4.9 discovery mirror the retrofit installs beside a /2 block
+        # (issue #392) — spelled from the same INPUTS by §4.9's projection
+        # rules (datasets verbatim from the expanded levels, artifact kind by
+        # the node-order rule, order2res the flat per-order lookup), never
+        # read back from the written manifest.
+        "multiscales": [
+            {
+                "spec": "zagg-multiscales/1",
+                "name": "SPEC_FIXTURE",
+                "base": {"order": s, "cells": [PYRAMID_GRID["child_order"]]},
+                "datasets": [
+                    {
+                        "order": e["node"],
+                        "cells": list(e["cells"]),
+                        "artifact": "column" if e["node"] == s else "overview",
+                    }
+                    for e in levels
+                ],
+                "order2res": {str(e["node"]): list(e["cells"]) for e in levels},
+                "fields": {
+                    "count": "exact",
+                    "h_tdigest": "approximate",
+                    "h_min": "exact",
+                    "h_mean": "none",
+                },
+                "fold": {"fold_source": "cascade", "exact_levels": 1},
+            }
+        ],
     }
     (out.parent / f"{out.name}.expected.json").write_text(json.dumps(expected, indent=1) + "\n")
     print(f"{out.name}: manifest-only, {len(levels)} level entries, /1 actuals preserved")

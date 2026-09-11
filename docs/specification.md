@@ -1507,6 +1507,92 @@ of the skip key** (§4.5): the abort covers a foreign stamp written *since
 this run started*, and the key covers the foreign rewrite that landed
 before it — inside the second the timestamp cannot resolve.
 
+### 4.9 The `multiscales` discovery mirror (`zagg-multiscales/1`)
+
+**Status: contract — issue
+[#392](https://github.com/englacial/zagg/issues/392) (espg re-scope ruling
+2026-09-10: zagg-native convention metadata only).** A `zagg-pyramid/2`
+store is inherently a multiresolution grid (§4 intro), but that identity is
+discoverable only through §4.5's own grammar. The manifest therefore ALSO
+carries a **machine-readable convention declaration** of the ladder — the
+OME/zarr-style multiscales attr grammar adapted to the node-tree reality —
+so a reader discovers the whole ladder from **one metadata read**
+(`morton_hive.json`).
+
+**Contract.** The manifest key `multiscales` (a top-level sibling of
+`pyramid`) is present **exactly when** the manifest's `pyramid` block
+declares `zagg-pyramid/2`: a `/1`, declared-off, or pre-pyramid manifest
+carries no `multiscales` key, and its absence means *pre-convention (or
+single-resolution) store* — never an error, and no `spec` marker bump
+anywhere. The value is a **list of one** multiscale object (the OME-style
+shape: one declared product, one entry):
+
+```json
+"multiscales": [
+  {
+    "spec": "zagg-multiscales/1",
+    "name": "SPEC_FIXTURE",
+    "base": {"order": 3, "cells": [6]},
+    "datasets": [
+      {"order": 3, "cells": [5, 4], "artifact": "column"},
+      {"order": 2, "cells": [3], "artifact": "overview"},
+      {"order": 1, "cells": [2], "artifact": "overview"},
+      {"order": 0, "cells": [1], "artifact": "overview"}
+    ],
+    "order2res": {"3": [5, 4], "2": [3], "1": [2], "0": [1]},
+    "fields": {"count": "exact", "h_min": "exact",
+               "h_tdigest": "approximate", "h_mean": "none"},
+    "fold": {"fold_source": "cascade", "exact_levels": 1}
+  }
+]
+```
+
+- **`spec`** — the revision marker; conformance rule as everywhere
+  (strict-check, fail loudly on an unknown revision).
+- **`name`** — the manifest's `dataset.short_name` (`null` when the
+  manifest records none): identity, not grammar.
+- **`datasets`** — one entry per §4.4 level entry, **finest first**, in the
+  recorded `pyramid.overviews` order: `order` and `cells` are copied
+  **verbatim** from the level entry (`cells` keeps §4.5's vocabulary — the
+  reader-facing cell resolutions stored at that node order), and
+  `artifact` names the kind that carries the level — `"column"` for the
+  leaf entry (`node == shard_order`, the §4.6 per-leaf
+  `{window}.pyramid.zarr`), `"overview"` for every ladder entry (the §4.1
+  ancestor-node `{window}.zarr`). Artifact *paths* are not recorded here:
+  node addressing stays the manifest + mortie hive-path grammar, and
+  declared-but-unmaterialized remains legal (§4.5), so a path list would
+  claim presence this block cannot promise.
+- **`order2res`** — the flat per-order lookup `{str(order): cells}` (JSON
+  has no integer keys): the one-key answer to *"what cell resolutions can I
+  read at order k"*, whose key set is exactly the orders present. It is a
+  projection of `datasets` and MUST agree with it entry for entry.
+- **`base`** — the native source data (`{"order": shard_order, "cells":
+  [cell_order]}`): the finest rung of the resolution ladder a reader picks
+  from, deliberately **not** a `datasets` entry — it is not a pyramid level
+  (§4.5: a member at the base data's own order would *be* the base data).
+- **`fields`** — `{name: class}` projected from the §4.5 D24 map: the
+  zero-open composability answer (which fields exist at every ladder order,
+  which are exact there, which exist only at native resolution). The class
+  tokens and their meaning are §4.5's; the accuracy contract per class is
+  §4.4's doctrine.
+- **`fold`** — the declared fold provenance: `fold_source` always, and
+  `exact_levels` exactly when the `pyramid` family dict declares it (§4.5's
+  presence rule — the deprecated `leaves` regime records no boundary).
+
+**Derivation and precedence.** The mirror is **derived, never
+authoritative**: zagg computes it from the `pyramid` block in the same
+write that installs that block (`hive.build_manifest` at template time;
+`declare_pyramid` on retrofit, which also installs the mirror on an
+already-`/2` store whose declaration predates this section, and removes it
+when a retrofit leaves `/2`). On ANY disagreement between this block and
+the `pyramid` block, **the `pyramid` block wins** — a reader that consumes
+the mirror MAY cross-check it against `pyramid.overviews` and MUST resolve
+a conflict in the `pyramid` block's favor. Sweep actuals never enter the
+mirror: materialization truth stays in §4.5's `actuals`/`materialized`
+bookkeeping and §4.3's per-artifact attrs. A reader MUST tolerate
+additional keys on the multiscale object and on its entries (additive
+grammar, same rule as §4.5).
+
 ## 5. O11 content hashes
 
 **Status: contract — frozen on
@@ -1775,7 +1861,10 @@ product is never sharded, §8/#247):
   derived from. It writes no store beneath it on purpose: the pyramid block
   is a template-time manifest artifact, decodable from `morton_hive.json`
   alone — the `/2` artifacts a fleet writes are `column/`'s job below
-  (sweep-side levels are #384's).
+  (sweep-side levels are #384's). The same manifest carries the §4.9
+  `multiscales` discovery mirror the retrofit installs beside a `/2`
+  block; `column/`, committed before §4.9 and unregenerated, is the
+  absent-key ⇒ pre-convention pin.
 - **`column/`** — the `minimal/` inputs plus an explicit
   `output.pyramid.overviews: 5` knob, so the same worker invocation that
   committed the leaf also wrote its §4.6 **column**: `all.pyramid.zarr`

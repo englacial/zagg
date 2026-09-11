@@ -865,6 +865,76 @@ class TestPyramidV2Declaration:
         assert manifest["cell_order"] == _expected(PYRAMID)["cell_order"]
 
 
+class TestMultiscalesMirror:
+    """§4.9 — the ``multiscales`` discovery mirror (issue #392).
+
+    Every assertion decodes the committed ``pyramid/`` manifest from spec
+    text alone; expected values come from the generator's INPUTS.
+    """
+
+    def _mirror(self):
+        manifest = json.loads((SPEC_DATA / PYRAMID / "morton_hive.json").read_text())
+        return manifest["multiscales"]
+
+    def test_marker_and_shape(self):
+        # §4.9: a list of ONE multiscale object, spec-marked, name from the
+        # manifest's dataset identity.
+        mirror = self._mirror()
+        assert mirror == _expected(PYRAMID)["multiscales"]
+        (entry,) = mirror
+        assert entry["spec"] == "zagg-multiscales/1"
+        assert entry["name"] == "SPEC_FIXTURE"
+
+    def test_datasets_project_the_pyramid_block(self):
+        # §4.9: datasets mirror pyramid.overviews VERBATIM (finest first),
+        # with the artifact kind by the node-order rule — "column" at the
+        # shard order, "overview" above it. The pyramid block wins on any
+        # disagreement, so agreement here is the conformance claim.
+        exp = _expected(PYRAMID)
+        (entry,) = self._mirror()
+        levels = _pyramid_block()["overviews"]
+        assert [{"order": e["node"], "cells": e["cells"]} for e in levels] == [
+            {"order": d["order"], "cells": d["cells"]} for d in entry["datasets"]
+        ]
+        for d in entry["datasets"]:
+            assert d["artifact"] == ("column" if d["order"] == exp["shard_order"] else "overview")
+
+    def test_order2res_is_the_flat_per_order_lookup(self):
+        # §4.9: string keys (JSON has no int keys), key set exactly the
+        # orders present, values agreeing with datasets entry for entry.
+        (entry,) = self._mirror()
+        assert entry["order2res"] == {str(d["order"]): d["cells"] for d in entry["datasets"]}
+
+    def test_base_is_the_native_resolution_never_a_dataset(self):
+        # §4.9: the native source data is the base key — not a datasets
+        # entry (a member at the base data's own order would BE the data).
+        exp = _expected(PYRAMID)
+        (entry,) = self._mirror()
+        assert entry["base"] == {"order": exp["shard_order"], "cells": [exp["cell_order"]]}
+        assert all(d["cells"] != [exp["cell_order"]] for d in entry["datasets"])
+
+    def test_fields_and_fold_project_the_family_dict(self):
+        # §4.9: {name: class} projected from the §4.5 D24 map; declared fold
+        # provenance from the family dict (exact_levels present exactly when
+        # declared there).
+        (entry,) = self._mirror()
+        overview = _pyramid_block()["overview"]
+        assert entry["fields"] == {n: m["class"] for n, m in overview["fields"].items()}
+        assert entry["fold"] == {
+            "fold_source": overview["fold_source"],
+            "exact_levels": overview["exact_levels"],
+        }
+
+    def test_absence_is_the_pre_convention_pin(self):
+        # §4.9: the key is present exactly when the pyramid block is /2 —
+        # column/ (a /2 store committed before §4.9) pins absence as the
+        # legal pre-convention state, and raster_toc/ pins that /1 never
+        # carries it.
+        for name in ("column", "raster_toc"):
+            manifest = json.loads((SPEC_DATA / name / "morton_hive.json").read_text())
+            assert "multiscales" not in manifest
+
+
 #: The §4.6 leaf-column fixture (issue #383): the ``minimal`` inputs plus an
 #: explicit ``output.pyramid.overviews: 5`` knob, so the committed store holds
 #: a leaf AND the column its worker wrote beside it.
