@@ -199,3 +199,150 @@ class TestStageArtifactDemotions:
                 "of": "h_sig",
             }
         ]
+
+
+def _v1_manifest(root, fields):
+    """A ``zagg-pyramid/1`` cascade manifest over the shard-2/cell-4 twins.
+
+    The ``tsc.TestEndToEndStrataPyramid`` recipe: orders ``[1, 0]``, the
+    finest exact-from-leaves, the root a cascade of it.
+    """
+    import json
+
+    import obstore
+
+    from zagg.hive import MANIFEST_NAME
+    from zagg.store import open_object_store
+
+    manifest = {
+        "spec": "morton-hive/1",
+        "dataset": {"short_name": "TEST", "version": "1"},
+        "cell_order": 4,
+        "shard_order": 2,
+        "split_schedule": [1, 1],
+        "pyramid": {
+            "spec": "zagg-pyramid/1",
+            "overview": {
+                "spacing": 2,
+                "orders": [1, 0],
+                "all_time": False,
+                "fold_source": "cascade",
+                "exact_levels": 1,
+                "fields": fields,
+            },
+        },
+        "generated_at": "2026-01-01T00:00:00+00:00",
+    }
+    obstore.put(open_object_store(str(root)), MANIFEST_NAME, json.dumps(manifest).encode())
+    return manifest
+
+
+def _v1_attrs(root, node_rel):
+    import zarr
+
+    from zagg.store import open_store
+
+    group = zarr.open_group(
+        open_store(f"{root}/{node_rel}/all.zarr", read_only=True), path="", mode="r", zarr_format=3
+    )
+    return dict(dict(group.attrs)[OVERVIEW_ATTR])
+
+
+class TestV1SweepArtifactDemotions:
+    """The ``/1`` sweep's two fold regimes write the same record (issue #518)."""
+
+    FIELDS = {
+        "count": {"class": "exact", "method": "sum", "dtype": "int32", "fill_value": 0},
+        **{k: dict(v) for k, v in tsc._STRATA_FIELDS.items()},
+    }
+
+    def _store(self, root):
+        """Two committed strata leaves under node -31 (shard 2, cell 4)."""
+        a, _ = tsc._strata_cells(k=16, n=60, seed=515)
+        b, _ = tsc._strata_cells(k=16, n=60, seed=518)
+        for dec, cells in (("-311", a), ("-312", b)):
+            tsc._write_strata_leaf(root, dec, cells, shard_order=2, cell_order=4)
+        return _v1_manifest(root, {k: dict(v) for k, v in self.FIELDS.items()})
+
+    def _sweep(self, root, manifest):
+        from zagg.sweep_overview import sweep_overviews
+
+        counts = sweep_overviews(str(root), manifest, {"-311": {None}, "-312": {None}})
+        assert counts["failed"] == 0 and counts["written"] == 2
+        return counts
+
+    def test_a_clean_sweep_writes_no_demotions_key(self, tmp_path):
+        manifest = self._store(tmp_path)
+        self._sweep(tmp_path, manifest)
+        for node_rel in ("-3/1", "-3"):
+            assert "demotions" not in _v1_attrs(tmp_path, node_rel), node_rel
+
+    def test_a_half_paired_leaf_lands_in_the_leaves_fold_attrs(self, tmp_path):
+        """``_fold_node``'s poison rail, visible at the level it fired."""
+        import shutil
+
+        manifest = self._store(tmp_path)
+        shutil.rmtree(tmp_path / "-3" / "1" / "2" / "-312.zarr" / "4" / "composition")
+        self._sweep(tmp_path, manifest)
+        level1 = _v1_attrs(tmp_path, "-3/1")
+        assert level1["fold_source"] == "leaves"
+        # Leaf -312 owns the span [4, 8) of the 16-cell level-1 slab.
+        assert level1["demotions"] == [
+            {
+                "field": "composition",
+                "class": "packed",
+                "reason": "word-missing",
+                "contributors": 1,
+                "of": "h_sig",
+                "cells": 4,
+            }
+        ]
+        # The rail fired at level 1 only: the level-0 cascade folds a child
+        # overview that carries BOTH arrays (the poisoned cells are ordinary
+        # fill there), so its attrs stay clean.
+        level0 = _v1_attrs(tmp_path, "-3")
+        assert level0["fold_source"] == "cascade"
+        assert "demotions" not in level0
+
+    def test_a_mis_declared_divisor_lands_in_the_cascade_attrs(self, tmp_path):
+        """The issue's acceptance shape: composition packed over a ``none`` divisor.
+
+        A manifest whose ``of`` digest is class ``none`` (the mis-declared
+        divisor) still folds composition at the exact-from-leaves level —
+        the leaf ARRAYS carry the digest regardless of its class — but every
+        coarser level cascades from overviews that do NOT materialize it, so
+        composition silently never cascades. The level-0 attrs now say so.
+        """
+        fields = {k: dict(v) for k, v in self.FIELDS.items()}
+        fields["h_sig"] = {"class": "none"}
+        a, _ = tsc._strata_cells(k=16, n=60, seed=515)
+        b, _ = tsc._strata_cells(k=16, n=60, seed=518)
+        for dec, cells in (("-311", a), ("-312", b)):
+            tsc._write_strata_leaf(tmp_path, dec, cells, shard_order=2, cell_order=4)
+        manifest = _v1_manifest(tmp_path, fields)
+        self._sweep(tmp_path, manifest)
+        level1 = _v1_attrs(tmp_path, "-3/1")
+        assert "demotions" not in level1 and "h_sig" not in level1["fields"]
+        level0 = _v1_attrs(tmp_path, "-3")
+        assert level0["demotions"] == [
+            {
+                "field": "composition",
+                "class": "packed",
+                "reason": "divisor-missing",
+                "contributors": 1,
+                "of": "h_sig",
+            }
+        ]
+        # And the composition array at level 0 is all fill — which is exactly
+        # why the record has to exist: the bytes alone cannot say why.
+        import zarr
+
+        from zagg.store import open_store
+
+        group = zarr.open_group(
+            open_store(f"{tmp_path}/-3/all.zarr", read_only=True),
+            path="2",
+            mode="r",
+            zarr_format=3,
+        )
+        assert int(group["composition"][:].sum()) == 0
