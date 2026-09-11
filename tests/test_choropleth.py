@@ -249,6 +249,23 @@ class TestGeometry:
             assert shape(feature["geometry"]).is_valid
 
 
+def _capture_export(monkeypatch) -> dict:
+    """Record ``export_choropleth``'s kwargs: pins the CLI's own plumbing.
+
+    A local store discards every ``store_kwargs`` key (``open_object_store``
+    takes the ``LocalStore`` branch), so the credential wiring is only
+    checkable at the call boundary.
+    """
+    seen: dict = {}
+
+    def fake(store_root, **kwargs):
+        seen.update(kwargs, store_root=store_root)
+        return {"type": "FeatureCollection", "features": [], "zagg_choropleth": {}}
+
+    monkeypatch.setattr("zagg.choropleth.export_choropleth", fake)
+    return seen
+
+
 class TestCli:
     def test_writes_loadable_geojson(self, tmp_path, capsys):
         _store(tmp_path)
@@ -263,6 +280,34 @@ class TestCli:
         assert main([str(tmp_path), "--order", "1"]) == 0
         fc = json.loads(capsys.readouterr().out)
         assert {f["properties"]["morton"] for f in fc["features"]} == {"-31", "-32"}
+
+    def test_anon_and_region_reach_the_store_kwargs(self, tmp_path, monkeypatch):
+        seen = _capture_export(monkeypatch)
+        assert main([str(tmp_path), "--anon", "--region", "us-east-1"]) == 0
+        assert seen["store_root"] == str(tmp_path)
+        assert seen["store_kwargs"] == {"region": "us-east-1", "skip_signature": True}
+
+    def test_output_creds_reach_the_store_kwargs(self, tmp_path, monkeypatch):
+        seen = _capture_export(monkeypatch)
+        creds = tmp_path / "creds.json"
+        # Written in boto spelling: main reads the camelCase keys
+        # normalize_output_credentials emits (runner._OUTPUT_CRED_ALIASES).
+        creds.write_text(
+            json.dumps(
+                {
+                    "aws_access_key_id": "AK",
+                    "aws_secret_access_key": "SK",
+                    "endpoint_url": "https://data.source.coop",
+                }
+            )
+        )
+        assert main([str(tmp_path), "--output-creds", str(creds)]) == 0
+        assert seen["store_kwargs"]["credentials"] == {
+            "accessKeyId": "AK",
+            "secretAccessKey": "SK",
+            "endpointUrl": "https://data.source.coop",
+        }
+        assert seen["store_kwargs"]["endpoint_url"] == "https://data.source.coop"
 
 
 LIVE_STORE = os.environ.get("ZAGG_CHOROPLETH_LIVE_STORE")
