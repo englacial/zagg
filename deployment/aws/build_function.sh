@@ -50,6 +50,20 @@ PIP="$PYTHON -m pip"
 
 # Detect Python version
 PY_VER=$($PYTHON -c "import sys; print(f'{sys.version_info.major}{sys.version_info.minor}')")
+
+# Below the floor the zagg install refuses (requires-python >=3.12); ABOVE it
+# nothing refuses, so a 3.13-only host would resolve cp313 wheels and name the
+# artifact lambda_function_<arch>_py313.zip, which the release/deploy globs
+# happily pick up against template.yaml's Runtime: python3.12 — an ABI
+# mismatch that only surfaces as an import error inside a deployed worker.
+if [ "$PY_VER" != "312" ]; then
+    echo "ERROR: selected ${PYTHON} is python${PY_VER}, but the Lambda runtime"
+    echo "       is python3.12 (deployment/aws/template.yaml Runtime) — binary"
+    echo "       wheels would be ABI-mismatched. Put a pip-carrying python3.12"
+    echo "       on PATH and rebuild."
+    exit 1
+fi
+
 ZIP_NAME="lambda_function_${ARCH_LABEL}_py${PY_VER}.zip"
 
 echo "============================================================"
