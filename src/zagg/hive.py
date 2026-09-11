@@ -115,6 +115,13 @@ _PRODUCT_NAME_RE = re.compile(r"^[a-z0-9_-]+$")
 #: count here.
 PRODUCT_NAME_MAX = 192
 
+#: The store-root child reserved for the §4.10 multiscales companion group
+#: (issue #394). Defined here rather than imported from
+#: :mod:`zagg.multiscales` (which mirrors it as ``GROUP_NAME``) because that
+#: module imports this one, and the product-name grammar must not acquire a
+#: cycle for a string literal.
+MULTISCALES_GROUP_NAME = "multiscales"
+
 
 def validate_product_name(name: str) -> str:
     """Validate a D19 product name; returns it.
@@ -144,13 +151,16 @@ def validate_product_name(name: str) -> str:
             f"(-?[1-6]); such names are excluded so a store root's children stay "
             f"unambiguous (D19)"
         )
-    if name == "multiscales":
+    if name == MULTISCALES_GROUP_NAME:
         # The issue #394 companion group owns this store-root child (spec
         # §4.10); a product by the same name would collide with it at every
-        # multi-product root.
+        # multi-product root. The reservation gates CREATION and ADDRESSING
+        # only — discovery calls :func:`_warn_legacy_multiscales_product` so
+        # a pre-reservation product by this name is reported, never dropped
+        # in silence.
         raise ValueError(
-            "product name 'multiscales' is reserved for the multiscales companion "
-            "group at the store root (spec §4.10, issue #394)"
+            f"product name {MULTISCALES_GROUP_NAME!r} is reserved for the multiscales "
+            f"companion group at the store root (spec §4.10, issue #394)"
         )
     return name
 
@@ -198,6 +208,7 @@ def classify_store_root(store_root: str, **store_kwargs) -> str:
     children = [p.rstrip("/").split("/")[-1] for p in listing["common_prefixes"]]
     if any(_is_base_component(c) for c in children):
         return "bare"
+    _warn_legacy_multiscales_product(store, store_root, children)
     names = [c for c in children if _is_valid_product_name(c)]
     return "products" if names else "empty"
 
@@ -216,12 +227,39 @@ def list_products(store_root: str, **store_kwargs) -> dict:
     store = open_object_store(store_root, **store_kwargs)
     listing = obstore.list_with_delimiter(store)
     children = [p.rstrip("/").split("/")[-1] for p in listing["common_prefixes"]]
+    _warn_legacy_multiscales_product(store, store_root, children)
     products = {}
     for name in sorted(c for c in children if _is_valid_product_name(c)):
         manifest = read_manifest(product_root(store_root, name), **store_kwargs)
         if manifest is not None:
             products[name] = manifest
     return products
+
+
+def _warn_legacy_multiscales_product(store, store_root: str, children: list[str]) -> None:
+    """Report a store-root child named ``multiscales`` that is a real PRODUCT.
+
+    The §4.10 reservation (issue #394) is retroactive on discovery: a store
+    built before it may hold a product literally named ``multiscales``, which
+    :func:`_is_valid_product_name` now filters out of
+    :func:`classify_store_root` and :func:`list_products`. Filtered is right
+    — :func:`product_root` refuses to address the name, so nothing could read
+    the product back anyway — but SILENTLY filtered is not: the product would
+    simply stop appearing. The companion group carries no ``morton_hive.json``
+    (metadata-only, §4.10) and a product always does, so the manifest at the
+    prefix discriminates the two and this warns on exactly the collision,
+    never on the ordinary companion. One GET, and only when the prefix exists.
+    """
+    if MULTISCALES_GROUP_NAME not in children:
+        return
+    if _read_json(store, f"{MULTISCALES_GROUP_NAME}/{MANIFEST_NAME}") is None:
+        return  # the §4.10 companion group itself — no manifest, no collision
+    logger.warning(
+        f"{store_root}/{MULTISCALES_GROUP_NAME}/ carries a {MANIFEST_NAME}, so it is a "
+        f"PRODUCT — but that name is reserved for the multiscales companion group (spec "
+        f"§4.10, issue #394), so it is excluded from product discovery and cannot be "
+        f"addressed; rename the product to keep it reachable"
+    )
 
 
 def _is_valid_product_name(name: str) -> bool:

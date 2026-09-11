@@ -1523,7 +1523,13 @@ to 0 — that a plain zarr reader opens with zero custom code. It holds
   always legal (a pre-convention store, or a gated windowed store). The
   name `multiscales` is **reserved** at the store root: it is excluded
   from the D19 product-name grammar (like the base-component exclusion) so
-  a multi-product root walker can never classify it as a product.
+  a multi-product root walker can never classify it as a product. The
+  reservation is retroactive on a store predating it that holds a product
+  literally named `multiscales`: that product is no longer discoverable or
+  addressable and MUST be renamed — but the exclusion is **reported, not
+  silent** (a product carries a `morton_hive.json` at its root and the
+  companion group never does, so discovery discriminates the two and warns
+  on the collision).
 - **Writers.** The staged sweep's designated finisher refreshes the
   companion after its manifest RMW, gated on the run having touched shards
   and **fail-open** (the finisher's load-bearing steps never fail on it);
