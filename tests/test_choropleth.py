@@ -2,8 +2,10 @@
 
 Pins the exporter's contract on local fixture stores (no live S3): rollup-
 preferred resolution with per-feature provenance, the leaf-sidecar fallback
-on a partial/stale rollup tree (the live ATL03 demo store's shape), the
-``--order`` rollup-node mode, and GeoJSON validity — ``[lon, lat]`` order
+on a partial/stale rollup tree (the live ATL03 demo store has the stale-
+*interior* half of that shape), the freshness checks and their documented
+limit, the ``--order`` rollup-node mode, and GeoJSON validity — ``[lon,
+lat]`` order
 (mortie returns ``[lat, lon]``), closed CCW rings, antimeridian splitting,
 shapely round-trip. One env-gated slow smoke runs against a published store.
 """
@@ -142,7 +144,7 @@ class TestLeafMode:
 
     def test_partial_rollup_tree_mixes_sources(self, tmp_path):
         _store(tmp_path)
-        # Drop one shard's rollup: the ATL03 shape (rollups for some leaves only).
+        # Drop one shard's rollup: a tree with rollups for some leaves only.
         (tmp_path / "-3" / "1" / "2" / "stats.rollup.json").unlink()
         feats = _by_morton(export_choropleth(str(tmp_path)))
         assert feats["-312"]["properties"]["source"] == "leaf_stats"
@@ -184,7 +186,8 @@ class TestOrderMode:
 
     def test_bare_interior_node_folds_children_rollups(self, tmp_path):
         _store(tmp_path)
-        # The live ATL03 tree has interior nodes with no rollup object at all.
+        # An interior node can carry no rollup object at all (a swept subtree
+        # under an unswept ancestor); the fold still lands on its children's.
         (tmp_path / "-3" / "1" / "stats.rollup.json").unlink()
         props = _by_morton(export_choropleth(str(tmp_path), order=1))["-31"]["properties"]
         assert props["source"] == "rollup"  # folded from the shard-node rollups
