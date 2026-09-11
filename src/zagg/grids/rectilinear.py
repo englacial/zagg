@@ -378,7 +378,8 @@ class RectilinearGrid:
     def assign(self, lats, lons) -> np.ndarray:
         """Map (lat, lon) points to row-major flat cell indices.
 
-        Returns ``-1`` for out-of-bounds points.
+        Returns ``-1`` for out-of-bounds points. Elementwise, per the
+        protocol: N-D input returns the input shape.
         """
         lats = np.asarray(lats)
         lons = np.asarray(lons)
@@ -395,7 +396,10 @@ class RectilinearGrid:
         return np.asarray(leaf_ids)
 
     def shards_of(self, leaf_ids) -> np.ndarray:
-        """Packed shard key per leaf. OOB leaves get ``-1``."""
+        """Packed shard key per leaf. OOB leaves get ``-1``.
+
+        Elementwise, per the protocol: N-D input returns the input shape.
+        """
         leaf_ids = np.asarray(leaf_ids)
         out = np.full_like(leaf_ids, OOB_SENTINEL, dtype=np.int64)
         valid = leaf_ids != OOB_SENTINEL
