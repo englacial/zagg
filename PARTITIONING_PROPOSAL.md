@@ -63,8 +63,16 @@ finest tuple first:
 | T3 | [2, 1, 0] | 0 | **3** (base cells) | o3 stage columns (22; avg 7.3 per base cell) | 18 overview nodes |
 | finisher | — | — | **1** | stage records | root singletons + manifest actuals, lease release |
 
-Each dispatch node owns a disjoint subtree, so splitting a tuple across
-invokes changes no bytes (the PR #525 byte-identity oracle covers widths 1–3).
+Each dispatch node owns a **disjoint** subtree that no other node touches, so
+the batch a node rides in cannot change the bytes it writes — that is an
+argument from the partitioning, and it is what licenses the max-nodes-per-invoke
+knob in (c) below, which moves only batch membership. The PR #525 acceptance
+tests exactly that axis — `test_identity_survives_a_multi_batch_fan_out`, in
+`TestByteIdentityOracle` (`pr525:tests/test_sweep_stage_fleet.py`) — rebuilding
+the ladder across several batches and demanding byte-identity with the CLI
+build. (The tuple-width oracle `test_byte_identity_across_tuple_widths` is a
+*different* axis: how many rungs one worker folds, compared at two widths. It
+does not cover this claim.)
 Proposed worker counts are therefore **one invoke per dispatch node**:
 110 → 22 → 3 → 1 per store (~136 invokes/store). GEDI's first level will be
 of the same magnitude (its o6-equivalent count, derived at dispatch).
