@@ -34,8 +34,22 @@ case "$MACHINE_ARCH" in
     *) echo "ERROR: Unknown architecture: $MACHINE_ARCH"; exit 1 ;;
 esac
 
+# Prefer python3.12 (the Lambda runtime target, and what zagg's
+# requires-python floor accepts) — same intent as build_layer.sh. Scan every
+# PATH match and take the first one that actually carries pip: a uv/venv
+# python shadows the system one but ships without pip, and `python -m pip`
+# there dies with "No module named pip". CI's setup-python 3.12 has pip.
+PYTHON=""
+for cand in $(type -ap python3.12) $(type -ap python3); do
+    if "$cand" -m pip --version >/dev/null 2>&1; then PYTHON="$cand"; break; fi
+done
+if [ -z "$PYTHON" ]; then
+    echo "ERROR: no python3 with pip on PATH"; exit 1
+fi
+PIP="$PYTHON -m pip"
+
 # Detect Python version
-PY_VER=$(python3 -c "import sys; print(f'{sys.version_info.major}{sys.version_info.minor}')")
+PY_VER=$($PYTHON -c "import sys; print(f'{sys.version_info.major}{sys.version_info.minor}')")
 ZIP_NAME="lambda_function_${ARCH_LABEL}_py${PY_VER}.zip"
 
 echo "============================================================"
@@ -45,16 +59,49 @@ echo "============================================================"
 
 # --- Copy our code ---
 echo ""
-echo "Copying handler and zagg package..."
+echo "Copying handler..."
 cp "$REPO_ROOT/deployment/aws/lambda_handler.py" "$BUILD_DIR/"
-cp -r "$REPO_ROOT/src/zagg" "$BUILD_DIR/zagg"
+
+# --- Install zagg itself (issue #546) ---
+# A raw `cp -r src/zagg` ships no `_version.py` (hatch-vcs generates that file
+# only during a package build), so every worker-side write recorded
+# `zagg_version: 0.0.0+unknown`. Installing the repo through pip runs the
+# hatchling + hatch-vcs backend, which stamps `zagg/_version.py` from the git
+# tag. A shallow CI checkout (actions/checkout default) carries no tags, so
+# deepen it first; on a full clone `describe` succeeds and nothing is fetched.
+if ! git -C "$REPO_ROOT" describe --tags >/dev/null 2>&1; then
+    git -C "$REPO_ROOT" fetch --quiet --tags --unshallow 2>/dev/null \
+        || git -C "$REPO_ROOT" fetch --quiet --tags 2>/dev/null \
+        || true
+fi
+echo ""
+echo "Installing zagg (hatch-vcs stamps zagg/_version.py)..."
+$PIP install --target "$BUILD_DIR" --no-deps --no-cache-dir "$REPO_ROOT"
+
+# Assert the stamp: 0.0.0* is the zagg/__init__.py fallback sentinel and
+# 0.1.dev* is setuptools-scm's no-tag fallback — either would put an unusable
+# version in every worker-written artifact, undetectable from the store
+# (issue #546). Mirrored in tests/test_lambda_build.py.
+ZAGG_BUILD_VERSION=$($PYTHON -c "
+import runpy, sys
+print(runpy.run_path(sys.argv[1])['__version__'])
+" "$BUILD_DIR/zagg/_version.py")
+echo "zagg version stamped: ${ZAGG_BUILD_VERSION}"
+case "$ZAGG_BUILD_VERSION" in
+    ""|0.0.0*|0.1.dev*)
+        echo "ERROR: zagg version resolved to '${ZAGG_BUILD_VERSION}' — workers built from"
+        echo "       this zip would write zagg_version 0.0.0+unknown-class artifacts"
+        echo "       (issue #546). Make a git tag reachable (git fetch --tags --unshallow)"
+        echo "       or set SETUPTOOLS_SCM_PRETEND_VERSION_FOR_ZAGG before building."
+        exit 1 ;;
+esac
 
 # --- Install function-level dependencies ---
 # These are packages NOT in the Lambda layer.
 # pip resolves transitive deps automatically — no manual dep hunting.
 echo ""
 echo "Installing function dependencies (pip resolves transitive deps)..."
-pip3 install --target "$BUILD_DIR" --no-cache-dir \
+$PIP install --target "$BUILD_DIR" --no-cache-dir \
     "obstore>=0.8.2" \
     "zarr>=3.1.5" \
     "pydantic-zarr>=0.9.1" \
@@ -97,6 +144,9 @@ done
 
 # --- Clean build artifacts ---
 echo "Cleaning caches and test directories..."
+# pip --target materializes [project.scripts] launchers under bin/ — dead
+# weight in a Lambda zip, with shebangs pointing at the build machine.
+rm -rf "$BUILD_DIR/bin"
 find "$BUILD_DIR" -type d -name "__pycache__" -exec rm -rf {} + 2>/dev/null || true
 # Strip dist-info except for packages whose code calls importlib.metadata.version()
 # at runtime. zarr / pydantic_zarr do this for in-package version checks; without
