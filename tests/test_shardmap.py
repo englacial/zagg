@@ -1040,10 +1040,20 @@ class TestFootprintCells:
 
     def test_batch_refusal_names_the_record_range(self, hp_grid, monkeypatch):
         # mortie's cell-budget ``ValueError`` names the offending MOC by its
-        # index *within the call*, which blocking makes block-local: an
-        # un-rebased "MOC 2" out of the second block of 5 is a plausible record
-        # index and would send the operator to the wrong granule. The wrapper
-        # must re-base it to the block's record range and chain the original.
+        # index *within the call* ("moc 0: moc_to_order would densify to ...",
+        # mortie 1.0), which blocking makes block-local: an un-rebased "moc 2"
+        # out of the second block of 5 is a plausible record index and would
+        # send the operator to the wrong granule. The wrapper must re-base it to
+        # the block's record range and chain the original.
+        #
+        # The refusal here is mortie's own, not a hand-written string: the
+        # second block is re-run at order 20, which blows the cell budget in
+        # microseconds. That pins the index-bearing shape against the live
+        # kernel, so a mortie release that drops the index fails here rather
+        # than leaving the re-base pointing at nothing. The other two refusal
+        # tests stay synthetic.
+        import re
+
         import mortie
 
         cat = _overlapping_catalog().index_footprints(11)
@@ -1053,17 +1063,19 @@ class TestFootprintCells:
         )
         real, calls = mortie.moc_to_order, []
 
-        def boom(*args, **kwargs):
+        def boom(vals, order, **kwargs):
             calls.append(1)
             if len(calls) == 2:
-                raise ValueError("MOC 2 exceeds max_cells")
-            return real(*args, **kwargs)
+                return real(vals, 20, **kwargs)  # mortie's own budget refusal
+            return real(vals, order, **kwargs)
 
         monkeypatch.setattr(shardmap, "_CELLS_BATCH_RECORDS", 5)
         monkeypatch.setattr(mortie, "moc_to_order", boom)
         with pytest.raises(ValueError, match=r"records 5-9") as exc:
             shardmap._intersect_footprint_cells(rows, values, offsets, hp_grid, all_shards)
-        assert "MOC 2 exceeds max_cells" in str(exc.value)
+        # mortie's own wording, index and all -- chained, not paraphrased.
+        assert re.search(r"moc \d+: moc_to_order would densify to", str(exc.value))
+        assert "exceeding max_cells=" in str(exc.value)
         assert isinstance(exc.value.__cause__, ValueError)
 
     def test_batch_refusal_range_reads_the_survivor_owners(self, hp_grid, monkeypatch):
@@ -1090,6 +1102,9 @@ class TestFootprintCells:
         got = shardmap._intersect_footprint_cells(rows, values, offsets, hp_grid, shards)
         assert {g for v in got.values() for g in v} == {3, 6}, "survivors must be [3, 6]"
 
+        # Synthetic here (the shape mortie really emits is pinned in
+        # ``test_batch_refusal_names_the_record_range``); this test is about
+        # which records the wrapper names, not about mortie's wording.
         def boom(*args, **kwargs):
             raise ValueError("MOC 1 exceeds max_cells")
 
@@ -1612,6 +1627,9 @@ class TestLiveCover:
         cat = _overlapping_catalog(n=2)
         indexed_cat = cat.index_footprints(11)
 
+        # Synthetic, like the one above: this test is about the remedy text,
+        # and mortie's real refusal wording is pinned in
+        # ``test_batch_refusal_names_the_record_range``.
         def boom(*args, **kwargs):
             raise ValueError("MOC 0 would expand to more than 1048576 cells at order 11")
 

@@ -750,11 +750,15 @@ def _intersect_footprint_cells(
                 np.asarray(hit_vals), parent_order, offsets=np.asarray(hit_off)
             )
         except ValueError as exc:
-            # mortie names the offending MOC by its index *within the call*,
+            # mortie names the offending MOC by its index *within the call*
+            # ("moc 400: moc_to_order would densify to ... exceeding
+            # max_cells=...", mortie 1.0; the scalar form carries no index),
             # which is a slot in this block, not a record. Re-base it: an
-            # un-rebased "MOC 400" out of a 512-record block is a plausible
+            # un-rebased "moc 400" out of a 512-record block is a plausible
             # record index, so it would send the operator to the wrong granule
             # rather than obviously failing. Re-raise, never swallow.
+            # ``tests/test_shardmap.py::…::test_batch_refusal_names_the_record_range``
+            # pins that shape against the live kernel.
             # The remedy depends on where the cover came from (issue #445).
             # Telling the operator of an *unindexed* build to re-index or drop a
             # column names two things that do not exist, and re-indexing would
