@@ -24,6 +24,7 @@ import importlib.util
 import json
 from pathlib import Path
 
+import numpy as np
 import pytest
 
 # The staged-sweep fixtures live with the in-process suite; the fleet arm is
@@ -1209,6 +1210,22 @@ class TestBatching:
                     max_nodes=bad,
                 )
 
+    def test_a_non_integral_max_nodes_refuses_rather_than_truncating(self):
+        # `int()` alone is not validation (review finding): it would read 2.9
+        # as 2 and True as 1, silently — so the summary's record would disagree
+        # with the grouping that shipped — and a string would raise int()'s own
+        # message rather than one naming this knob.
+        from zagg.sweep_fleet import normalize_max_nodes
+
+        for bad in (2.9, True, False, "two", "3", object()):
+            with pytest.raises(ValueError, match="max_nodes"):
+                normalize_max_nodes(bad)
+        # Whole numbers pass in whatever spelling they arrive: a float that IS
+        # an integer, and numpy's int (a shardmap-derived count is often one).
+        assert normalize_max_nodes(None) is None
+        assert normalize_max_nodes(3) == normalize_max_nodes(3.0) == 3
+        assert normalize_max_nodes(np.int64(7)) == 7
+
     def test_an_empty_work_set_is_not_a_discovery_request(self):
         from zagg.sweep_fleet import build_stage_event
 
@@ -1340,6 +1357,34 @@ class TestFleetOrchestration:
         assert summary["stages"] == [] and summary["skipped"] == "no dispatch nodes"
         assert summary["finisher"] == {"landed": False, "fired": False}
         assert summary["duration_s"] < 5, "it waited on a barrier it should have skipped"
+
+    def test_the_entry_point_validates_max_nodes_before_any_invoke(self, tmp_path):
+        # `pack_batches` is reached only inside the tuple loop, so a run whose
+        # tuples all filter out used to return a summary recording an invalid
+        # knob as though it were honored (review finding). Validate where the
+        # value enters, and record the EFFECTIVE one.
+        from zagg.sweep_fleet import run_stage_sweep_fleet
+
+        root = tmp_path / "s"
+        _stage_store(root)
+        client = _FakeLambda(None)
+        with pytest.raises(ValueError, match="max_nodes"):
+            _fleet(root, client, max_nodes_per_invoke=0)
+        assert client.events == [], "it fired before validating"
+        summary = run_stage_sweep_fleet(
+            client,
+            "zagg-worker",
+            str(root),
+            [],
+            shard_order=3,
+            store_kwargs={},
+            poll_interval_s=0.01,
+            max_nodes_per_invoke=3.0,
+        )
+        assert summary["skipped"] == "no dispatch nodes"
+        assert summary["max_nodes_per_invoke"] == 3 and not isinstance(
+            summary["max_nodes_per_invoke"], float
+        )
 
     def test_the_run_identity_is_pinned_across_every_invoke(self, tmp_path):
         mod = _handler_module()
