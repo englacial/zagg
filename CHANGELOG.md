@@ -15,7 +15,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   polymorphic name: `moc_and` / `moc_intersects` / `moc_to_order` /
   `toc_reduce` take the ragged batch through `offsets=`, `decimal_to_word` and
   `mortie.arrow.from_wkb` are the array forms, the per-ring fallback in
-  `_batch_ring_mocs` is a one-group `polygons_to_morton_mocs`, and the
+  `_batch_ring_mocs` goes through `from_geometry(Polygon(ring), moc=True)` (a
+  different entry point to the same ring kernel), and the
   ring-parts AOI cover (`healpix_aoi_moc`) goes through
   `from_geometry(..., moc=True)` on a shapely (Multi)Polygon — bit-identical to
   the retired multipart ring form, holes included, pinned in
