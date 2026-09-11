@@ -575,7 +575,12 @@ def _batch_ring_mocs(lats, lons, offsets, start, stop, order) -> tuple:
             try:
                 # The scalar entry point (mortie 1.0 retired the one-ring form of
                 # the batch coverer): the same ring kernel, reached without the
-                # batch call that just failed.
+                # batch call that just failed. Note the refusal for a degenerate
+                # ring now comes from shapely's LinearRing constructor ("A
+                # linearring requires at least 4 coordinates.") rather than from
+                # mortie, so this ``except`` is catching shapely too; the
+                # ``size < 3`` screen in ``_flatten_rings`` keeps it unreached in
+                # practice.
                 ring = Polygon(list(zip(lons[a:b], lats[a:b])))
                 mocs.append(np.asarray(from_geometry(ring, order=order, moc=True), dtype=np.uint64))
             except Exception:
