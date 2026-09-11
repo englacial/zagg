@@ -144,21 +144,36 @@ order *k*; ladder orders **coarser than k are deferred** to a coarse-level
 finisher (the issue #377 deferred phase); partitions are blind order-k grid
 cells, not coverage-derived.
 
-- **split_order 5**: 1,024 blind partitions over a store whose coverage is a
-  sparse Antarctic ring — nearly every partition owned no leaves and matched
-  nothing; orders 5, 3, 1 were deferred regardless; the one partition that
-  matched tried and failed. Work scattered into empty partitions.
+- **split_order 5**: the split landed at order 5, but the declared /1 ladder
+  was `[7,5,3,1]` — only order 7 sits strictly below the split, so each
+  invoke's in-scope share was a single rung and orders **5, 3 and 1 were
+  deferred** to a coarse-level finisher that never ran. The invokes were not
+  empty-partition invokes: `partition_leaves` returns "``{partition index:
+  work set}`` for the NON-EMPTY partitions only"
+  (`src/zagg/sweep_partition.py:113-136`), and both fan-outs built on it fire
+  one invoke per *occupied* prefix (`runner._invoke_lambda_sweep`;
+  `sweep_partitions`). What the 1,680 no-op `sweep_stats` records therefore
+  show is invokes whose declared rungs fell outside their partition's scope,
+  plus the one that matched and failed — not work scattered into empty cells.
+  (The records do not name the dispatch path; a `discover: true` fan-out
+  enumerating all `4^k` indices and filtering worker-side via
+  `select_partition` would also produce no-ops at this count. Either way the
+  mechanism is scope-vs-declaration, not geometry-vs-coverage.)
 - **split_order 8**: every declared order (7, 5, 3, 1) is coarser than 8, so
   **the entire ladder was deferred** to the finisher — which never ran.
 
-Both failures are the same root cause: partition geometry chosen a priori,
-disconnected from both the declared ladder and the store's actual coverage.
-The staged /2 schedule removes the mechanism itself:
+Both failures are the same root cause: a partition geometry chosen a priori,
+**disconnected from the declared ladder** — the split order decided which rungs
+each invoke could reach, and the declaration had no say in it. The staged /2
+schedule removes the mechanism itself:
 
-1. **Dispatch sets are derived, not guessed** — the dispatcher's nodes come
-   from the run-record work set (the same discovery the audit used to count
-   844/272/110/…), so every invoke names nodes that exist and owns leaves.
-   Empty partitions cannot occur.
+1. **Dispatch order and ladder scope are chosen together** — the dispatcher's
+   nodes come from the run-record work set (the same discovery the audit used
+   to count 844/272/110/…) *at the tuple's own dispatch order*, so each invoke
+   names existing nodes and owns exactly the rungs of its tuple. Coverage-
+   derived dispatch is not itself new — `partition_leaves` already fires only
+   occupied partitions — what is new is that no split order is picked
+   independently of the rungs it has to cover.
 2. **No coarse-order deferral exists** — every rung belongs to exactly one
    tuple and every tuple is dispatched by the same driver in sequence; the
    designated finisher (implemented and dispatched last in PR #525) handles
