@@ -385,6 +385,21 @@ class TestHarnessCatchesCorruption:
         assert "partial uncommitted" in entry["detail"]
         assert report["partial_nodes"] == ["-41"]
 
+    def test_probe_error_is_not_the_pre_sweep_baseline(self, tmp_path):
+        # A probe that fails for any reason other than not-found (here an
+        # unparsable node zarr.json; in production a credential/throttle
+        # error) must NOT read as "declared but unmaterialized ... pre-sweep
+        # baseline" — that sentence is the report's most consequential claim.
+        self._swept(tmp_path)
+        (tmp_path / "-4" / "1" / "all.zarr" / "zarr.json").write_text("{not json")
+        report = validate_pyramid(str(tmp_path), full=True)
+        entry = report["checks"]["materialization"]
+        assert entry["status"] == "fail"
+        assert "probe error" in entry["detail"]
+        assert "pre-sweep baseline" not in entry["detail"]
+        assert any("-41" in e for e in report["probe_errors"])
+        assert report["passed"] is False
+
     def test_stale_overview_after_leaf_change_is_caught(self, tmp_path):
         # The E2E failure mode the gate exists for: base data moved, ladder
         # did not. Rewrite one leaf with different observations, no re-sweep.
