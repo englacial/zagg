@@ -32,7 +32,7 @@ def _shard_word(order=6):
     """A real southern packed shard word (decimal form ``-5112333`` at order 6)."""
     from mortie import geo2mort
 
-    return int(geo2mort(np.array([-78.5]), np.array([-132.0]), order=order)[0])
+    return int(geo2mort(-78.5, -132.0, order=order)[0])
 
 
 # ── config flag ──────────────────────────────────────────────────────────────

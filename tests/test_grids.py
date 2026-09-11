@@ -100,8 +100,8 @@ class TestBlockIndex:
 
         g = HealpixGrid(parent_order=6, child_order=8, layout="fullsphere")
         parent = _valid_parents(1)[0]
-        expected, _ = mort2healpix(np.asarray([parent]))
-        assert g.block_index(parent) == (int(expected[0]),)
+        expected, _ = mort2healpix(parent)  # scalar in -> scalar out (mortie >=1.0)
+        assert g.block_index(parent) == (expected,)
         # Range check: must lie in [0, 12·4^parent_order)
         assert 0 <= g.block_index(parent)[0] < 12 * 4**6
 
@@ -134,9 +134,7 @@ class TestRoundTrip:
 
         g = HealpixGrid(parent_order=6, child_order=12, config=cfg)
         lat, lon = -78.5, -132.0
-        expected_parent = int(
-            clip2order(6, geo2mort(np.array([lat]), np.array([lon]), order=18))[0]
-        )
+        expected_parent = int(clip2order(6, geo2mort(lat, lon, order=18))[0])
         leaves = g.assign(np.array([lat]), np.array([lon]))
         assert g.shard_of(leaves) == expected_parent
 
@@ -745,7 +743,7 @@ class TestMortonCoordinate:
         from zagg.grids.morton import morton_words, to_morton_array
 
         # A southern point lands in a high base cell whose packed word sets bit 63.
-        leaf = geo2mort(np.array([-78.5]), np.array([-132.0]), order=18)
+        leaf = geo2mort(-78.5, -132.0, order=18)
         cells = clip2order(8, leaf)
         coord = to_morton_array(cells)
         words = morton_words(coord)
@@ -843,7 +841,7 @@ class TestMortonArrowAdapter:
 
         from zagg.grids.morton import morton_from_arrow, morton_to_arrow, morton_words
 
-        leaf = geo2mort(np.array([-78.5]), np.array([-132.0]), order=18)
+        leaf = geo2mort(-78.5, -132.0, order=18)
         cells = np.asarray(clip2order(8, leaf), dtype=np.uint64)
         words = morton_words(morton_from_arrow(morton_to_arrow(cells)))
         np.testing.assert_array_equal(words, cells)
@@ -899,7 +897,7 @@ class TestShardLabel:
         # spread of orders (order-0 base cells through fine cells).
         for lat, lon in [(-78.5, -132.0), (-72.1, 25.4), (78.3, 12.0), (0.1, 0.1)]:
             for order in (0, 6, 9, 18):
-                word = int(geo2mort(np.array([lat]), np.array([lon]), order=order)[0])
+                word = int(geo2mort(lat, lon, order=order)[0])
                 s = morton_decimal(word)
                 # Grammar: optional sign, base 1..6, then one 1..4 digit per order.
                 body = s.lstrip("-")
@@ -915,7 +913,7 @@ class TestShardLabel:
 
         from zagg.grids.morton import morton_decimal, morton_word
 
-        word = int(geo2mort(np.array([-78.5]), np.array([-132.0]), order=29)[0])
+        word = int(geo2mort(-78.5, -132.0, order=29)[0])
         s = morton_decimal(word)
         assert len(s.lstrip("-")) == 30
         assert morton_word(s) == word
@@ -938,7 +936,7 @@ class TestShardLabel:
         from zagg.grids.morton import morton_decimal, morton_word, morton_words_from_decimals
 
         decimals = [
-            morton_decimal(int(geo2mort(np.array([lat]), np.array([lon]), order=order)[0]))
+            morton_decimal(int(geo2mort(lat, lon, order=order)[0]))
             for lat, lon in [(-78.5, -132.0), (78.3, 12.0), (-72.1, 25.4), (0.1, 0.1)]
             for order in (0, 6, 9, 18)
         ]

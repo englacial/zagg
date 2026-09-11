@@ -321,7 +321,7 @@ class TestBlockAssembly:
             store, "12/h_tdigest", block_order=block_order
         )
         assert block.shape == (side, side, 128)
-        parent = int(clip2order(block_order, np.array([shard6], dtype=np.uint64))[0])
+        parent = int(clip2order(block_order, shard6)[0])
         assert word == parent
         # The whole order-6 shard tensor, placed at its rank within `parent`.
         ((shard_tensor, *_rest),) = read_tensors(store, "12/h_tdigest", block_order=6)
