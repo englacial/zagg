@@ -20,7 +20,8 @@ coverage-MOC serializations, and the rank-space deinterleave. This page owns
 the **array-level** contracts inside a leaf; it cites mortie's page for path
 and word semantics and never restates them.
 
-**Latitude convention of the words** (*informative* — issue
+**Latitude convention of the words** (*informative* — see
+[Normative language](#normative-language) below; issue
 [#549](https://github.com/englacial/zagg/issues/549)): the packed words are
 produced by mortie's geodetic ingress (`geo2mort`) under **mortie's default
 latitude convention** — zagg passes no `latitude=` override anywhere
@@ -34,13 +35,15 @@ floors mortie at ≥ 0.9.8 (issue
 written by zagg 0.45.0 or later — including the published o9 stores, written
 by zagg 0.52.0 — is **authalic-wgs84**. The two conventions are
 non-corresponding partitions of the sphere (mortie spec §9): the offset
-peaks near 45° latitude at 0.12830° (~14.26 km), and covers/stores MUST NOT
-be composed across conventions. The `dggs` attrs block
+peaks near 45° latitude at 0.12830° (~14.26 km), so a cover or store built
+under one convention does not describe cells under the other, and composing
+them is meaningless (mortie spec §9 is where the prohibition binds). The
+`dggs` attrs block
 (`zagg.grids.healpix.HealpixGrid._dggs_attrs`) does not yet stamp mortie's
 `latitude` token; until it does, this paragraph is the record for zagg
 stores, and a reader reproducing cell geometry (e.g. a viewer's boundary
-golden test) must apply the geodetic ↔ authalic conversion at every
-geodetic seam exactly as mortie spec §9 prescribes.
+golden test) needs the geodetic ↔ authalic conversion at every geodetic
+seam, exactly as mortie spec §9 prescribes.
 
 Design *rationale* — why each decision was made, with trade studies and
 ratification records — lives in
