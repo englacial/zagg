@@ -743,6 +743,16 @@ regionally heterogeneous resolution).
     in any overview or column, so every contributor fires this arm and the
     field silently never folds upward.
 
+  On `zagg-overview/2` the record survives only a level that materializes.
+  The stage fold counts a contributor the rail fired on as `unreadable`, and
+  a level where **no** contributor folded cleanly is not written at all — so
+  the mis-declared-divisor shape above, which fires on *every* contributor,
+  leaves no artifact and therefore no `demotions`. A reader MUST NOT read the
+  key's absence at a `/2` level as evidence the rail did not fire there; the
+  absent level is the evidence. The `/1` fold paths do not share this: a
+  demoted contributor is still a counted leaf (or child), so the level
+  materializes and carries the record.
+
   `field`/`class`/`reason`/`contributors` are always present; `of` names
   the §3.3 linkage; `cells` is keyed only in the `word-missing` direction.
   Readers MUST tolerate additional keys, MUST tolerate the key's absence (a

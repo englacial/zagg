@@ -564,6 +564,11 @@ def _merge_slabs(
     Returns ``(slabs, folded, missing, unreadable, demotions)`` — the last a
     :func:`zagg.sweep_overview.demotion_records` list naming every packed
     field the half-pair rail demoted here, per direction (issue #518).
+
+    The rail marks a fired contributor ``broken``, which is a WHOLE-contributor
+    verdict, not a per-field one: where it fires on every contributor (the
+    mis-declared-divisor shape) ``folded == 0`` and :func:`_stage_fold` drops
+    the level, records included — see the note at its ``folded == 0`` guard.
     """
     from zagg.stats.composition import merge_composition_kway
     from zagg.sweep_overview import (
@@ -825,6 +830,17 @@ def _stage_fold(
         )
         regime, merges_from_raw = STAGE_MERGE, 2
     if folded == 0:
+        # No contributor folded cleanly — the level is not materialized, and
+        # any packed-rail record dies with it (issue #518, spec §4.3). That
+        # is load-bearing for the mis-declared-divisor shape, which fires on
+        # EVERY contributor: the `/2` level vanishes rather than landing with
+        # a `demotions` record, so the key's absence here is not evidence the
+        # rail stayed quiet. Pinned in
+        # ``tests/test_demotion_attrs.py::test_every_contributor_firing_drops_the_level``
+        # and standing for review — flipping it means making a packed-rail
+        # firing a per-field demotion rather than a whole-contributor verdict
+        # in ``_merge_slabs``'s ``broken`` set, which is committed
+        # ``source_children`` semantics predating #518.
         return None
     granules, ranges = 0, []
     for row in rows:
