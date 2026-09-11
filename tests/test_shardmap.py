@@ -1924,10 +1924,7 @@ class TestSpatialSignature:
 
         # Southern points → high base cells whose packed parent word sets bit 63.
         pts = [(-78.5, -132.0), (-72.1, 25.4), (-65.0, -45.0)]
-        keys = sorted(
-            int(clip2order(6, geo2mort(np.array([lat]), np.array([lon]), order=18))[0])
-            for lat, lon in pts
-        )
+        keys = sorted(int(clip2order(6, geo2mort(lat, lon, order=18))[0]) for lat, lon in pts)
         assert any(k > 2**63 for k in keys)  # at least one bit-63-set key
         sm = ShardMap({"type": "healpix"}, keys, [[] for _ in keys], {})
         with tempfile.NamedTemporaryFile(suffix=".json", delete=False) as f:
@@ -2791,7 +2788,7 @@ class TestBasenameCollisions:
         sm_fine = ShardMap.build(catalog, fine_grid, backend="mortie")
         by_parent: dict = {}
         for k in sm_fine.shard_keys:
-            parent = clip2order(11, np.asarray([k], dtype=np.uint64))
+            parent = clip2order(11, k)
             by_parent.setdefault(int(parent[0]), []).append(k)
         siblings = next(ks for ks in by_parent.values() if len(ks) >= 2)[:2]
         granules = [
