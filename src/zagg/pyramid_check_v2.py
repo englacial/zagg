@@ -186,6 +186,19 @@ def validate_v2(
         report,
         full=full,
     )
+    # The roster is the fold source for the WHOLE /2 ladder, not just for the
+    # ``fold_source: "leaves"`` levels as in /1, so a stale root coverage.moc
+    # that understates it prints as value MISMATCHES rather than declines:
+    # the unlisted leaf is simply not a contributor, ``complete`` stays True,
+    # and every covering cell reports the sentence for a broken sweep. The
+    # /2 arm cannot tell the two apart, so it names the candidate cause
+    # instead of guessing (review finding).
+    if roster_source == "coverage.moc" and checks["counts"]["status"] == "fail":
+        checks["counts"]["detail"] += (
+            "; NOTE the leaf roster came from the root coverage.moc — a STALE moc "
+            "understates the fold source and reads exactly like a short fold; rerun "
+            "with --roster list to tell a broken sweep from a stale cache"
+        )
 
     # -- [8] idempotency (fixture mode): an immediate staged re-pass is a no-op.
     if resweep:
