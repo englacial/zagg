@@ -65,9 +65,11 @@ def _build_store(
     pyramid=None,
     shards=SHARDS,
     kitchen_sink=False,
+    flux=False,
     window=None,
     windowing=None,
     time_range=None,
+    dataset_name="COL_TEST",
 ):
     """A real hive store: every shard through ``process_and_write_hive``.
 
@@ -84,6 +86,11 @@ def _build_store(
     ``time_range`` is the D15 observed extent in DATASET units the fake
     reports — which the leaf's stamp carries as an ISO pair and the backfill
     recovers from there rather than computing.
+
+    ``flux`` selects the generator's GEDI-shaped arm (a ``weights: flux``
+    ragged ``rx_flux`` in place of ``h_tdigest``), the §2.0 surface issue
+    #548 drives through the backfill; ``dataset_name`` names it apart in the
+    manifest.
     """
     from dataclasses import replace
 
@@ -92,7 +99,7 @@ def _build_store(
     from zagg.grids import HealpixGrid
 
     gen = _generator()
-    cfg = gen._config(kitchen_sink=kitchen_sink, pyramid=pyramid)
+    cfg = gen._config(kitchen_sink=kitchen_sink, pyramid=pyramid, flux=flux)
     # The generator's config declares no ``data_source.variables``; the fake
     # reader never needs them, but ``load_config`` (the CLI retrofit path)
     # validates every ``source:`` against them, and data_source IS in the
@@ -111,12 +118,17 @@ def _build_store(
     grid = HealpixGrid(4, 6, layout="fullsphere", config=cfg, chunk_inner=5, sharded=True)
     root.mkdir(parents=True, exist_ok=True)
     hive.ensure_manifest(
-        str(root), hive.build_manifest(grid, dataset={"short_name": "COL_TEST", "version": "1"})
+        str(root), hive.build_manifest(grid, dataset={"short_name": dataset_name, "version": "1"})
     )
     for decimal in shards:
         shard = morton_word(decimal)
-        by_chunk, _cells = gen._build_cells(grid, shard, kitchen_sink=kitchen_sink)
-        inner = gen._fake_process_shard(grid, by_chunk, kitchen_sink=kitchen_sink)
+        by_chunk, _cells = gen._build_cells(grid, shard, kitchen_sink=kitchen_sink, flux=flux)
+        inner = gen._fake_process_shard(
+            grid,
+            by_chunk,
+            kitchen_sink=kitchen_sink,
+            ragged_field="rx_flux" if flux else "h_tdigest",
+        )
 
         def fake(*args, _inner=inner, **kwargs):
             if kwargs.get("chunk_results") is None:
