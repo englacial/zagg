@@ -57,14 +57,25 @@ batching — workers fold 3 rungs each, dispatch nodes at orders `0 mod 3`,
 finest tuple first.
 
 **Every dispatch-node count in this table is COMPUTED, never pinned** (espg
-generality ruling, 2026-09-11): the store's own coverage MOC expanded to the
+generality ruling, 2026-09-11): the store's own coverage MOC resolved to the
 tuple's dispatch order, intersected with the shard set, is the worker
-assignment — `zagg.sweep_fleet.coverage_dispatch_nodes` (from a coverage MOC
-the dispatcher already holds; D8 stands) or `dispatch_nodes` (from the work
-set) is what the runbook evaluates at dispatch time. The numbers shown are
-today's evaluation of ATL03's audited coverage; a different store, or the same
-store after more appends, evaluates to different counts through the same
-computation.
+assignment. (A root `coverage.moc` sits at the shard order, which is finer than
+every dispatch order, so in the dominant case that resolution *coarsens* the
+coverage to its covering ancestors; containment resolves in either direction,
+so nothing depends on which of the two is finer.)
+
+That computation is what the runbook evaluates at dispatch time, and it is
+reachable as the dispatcher's own node derivation, not as a helper beside it:
+`run_stage_sweep_fleet(..., coverage=root_coverage_words(read_root_coverage(root)))`
+calls `zagg.sweep_fleet.coverage_dispatch_nodes` once per tuple, composing with
+`scope=` if the run has one. The coverage MOC is read **operator-side** and
+handed in, exactly as `shard_order` is — D8 stands, the dispatcher never reads
+the store. Omit `coverage=` and the nodes come from the work set alone
+(`dispatch_nodes`), which is what the runner's auto-scoped tail passes.
+
+The numbers shown are today's evaluation of ATL03's audited coverage; a
+different store, or the same store after more appends, evaluates to different
+counts through the same computation.
 
 | tuple | orders folded | dispatch order | ATL03 dispatch nodes (computed — today's evaluation) | reads (one tuple finer) | writes |
 |---|---|---|---|---|---|
@@ -83,8 +94,9 @@ the ladder across several batches and demanding byte-identity with the CLI
 build. (The tuple-width oracle `test_byte_identity_across_tuple_widths` is a
 *different* axis: how many rungs one worker folds, compared at two widths. It
 does not cover this claim.)
-Proposed worker counts are therefore **one invoke per dispatch node** — now
-the dispatcher's default (`max_nodes_per_invoke=1`, ruled 2026-09-11):
+Proposed worker counts are therefore **one invoke per dispatch node** — ruled
+at T1 on 2026-09-11, and proposed here at all four rungs, which is what the
+dispatcher's default now does (`max_nodes_per_invoke=1`):
 110 → 22 → 3 → 1 per store (~136 invokes/store), every count evaluated from
 the coverage at dispatch time as above. GEDI's first level will be of the
 same magnitude (its o6-equivalent count, derived at dispatch).
@@ -103,14 +115,24 @@ payload cap **only**: the whole ATL03 T1 fan-out — 110 nodes + 2,918 inline
 leaf refs — is ~90 KB, so the old packer emitted **one batch = one worker for
 the entire first rung**, hours of work against a 900 s wall.
 `run_stage_sweep_fleet` / `pack_batches` now take `max_nodes_per_invoke` /
-`max_nodes`, **default 1** — one dispatch node per invoke at every tuple, the
-ruled T1 fan-out — composing with the payload cap (whichever binds first
-closes a batch); `None` restores payload-only packing. Orchestration-only
-(changes no bytes, like `tuple_width`): the byte-identity oracle re-runs at
-`max_nodes=1` (`test_identity_survives_the_one_node_per_invoke_fan_out`), and
-the coverage-computed assignment is pinned against a fixture store's own
-`coverage.moc` (`TestCoverageComputedAssignment`, both in
-`tests/test_sweep_stage_fleet.py`).
+`max_nodes`, **default 1** — one dispatch node per invoke — composing with the
+payload cap (whichever binds first closes a batch); `None` restores
+payload-only packing. The ruling named **T1**; making 1 the default at *every*
+tuple is this proposal's extension, and it holds on this store because the
+coarser tuples are small (22 nodes, then 3). It is not free in the store's
+order — the ~49k-node finest tuple of an o9 store would be ~49k invokes and a
+49k-name barrier set — so the knob is reachable from the runner's tail seam
+(`_invoke_lambda_stage_sweep`) and the ad-hoc driver alike, and
+`docs/deployment/lambda.md` carries that sizing note for operators.
+
+Orchestration-only (changes no bytes, like `tuple_width`): the byte-identity
+oracle re-runs at `max_nodes=1`
+(`test_identity_survives_the_one_node_per_invoke_fan_out`) *and* at the
+payload-only grouping it replaced
+(`test_identity_survives_whole_tuple_grouping`), and the coverage-computed
+assignment is pinned both at the helper and through a real dispatcher run
+against a fixture store's own `coverage.moc`
+(`TestCoverageComputedAssignment`, all in `tests/test_sweep_stage_fleet.py`).
 
 ## Wall-time per batch (against the 900 s wall)
 
