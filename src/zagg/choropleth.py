@@ -27,7 +27,11 @@ rollup at all, while GEDI's tree is complete):
 
 Each feature marks provenance: ``"source": "rollup"`` (numbers came from
 stored rollups), ``"leaf_stats"`` (folded from leaf sidecars), ``"mixed"``
-(both, under a stale interior node), or ``"missing"``.
+(both, under a stale interior node), ``"partial"`` (the fold reached a
+covered shard with no readable stats, so the numbers are short by whatever
+that subtree holds), or ``"missing"`` (nothing at all). Every feature also
+carries ``n_covered``, the covered shards beneath its node, so a consumer
+can size a ``partial`` cell's hole against ``n_leaves``.
 
 Shard discovery is the store-root ``coverage.moc`` ranges MOC (D10: no tree
 LIST on the discovery path). Geometry is ``mortie.mort2polygon`` per node —
@@ -83,6 +87,8 @@ def export_choropleth(store_root: str, *, order=None, step=4, workers=8, store_k
     manifest ``shard_order`` (mixed-order stores are unsupported, as in the
     sweep).
     """
+    from collections import Counter
+
     from mortie import mort2polygon
 
     from zagg.grids.morton import morton_word
@@ -96,7 +102,8 @@ def export_choropleth(store_root: str, *, order=None, step=4, workers=8, store_k
     order = shard_order if order is None else int(order)
     if not 0 <= order <= shard_order:
         raise ValueError(f"order must be in [0, {shard_order}] (the shard order); got {order}")
-    nodes = sorted({d[: len(_decimal_base(d)) + order] for d in covered})
+    n_covered = Counter(d[: len(_decimal_base(d)) + order] for d in covered)
+    nodes = sorted(n_covered)
     store = open_object_store(store_root, **store_kwargs)
     fam = get_family("stats")
     spec = manifest.get("spec")
@@ -113,7 +120,13 @@ def export_choropleth(store_root: str, *, order=None, step=4, workers=8, store_k
         resolved = list(pool.map(resolve, nodes))
     features = []
     for node, ring, (record, source, n_leaves) in zip(nodes, rings, resolved):
-        props = {"morton": node, "order": order, "source": source, "n_leaves": n_leaves}
+        props = {
+            "morton": node,
+            "order": order,
+            "source": source,
+            "n_leaves": n_leaves,
+            "n_covered": n_covered[node],
+        }
         for key in PROPERTY_KEYS + ("success", "timestamp"):
             props[key] = None if record is None else record.get(key)
         features.append({"type": "Feature", "geometry": _geometry(ring), "properties": props})
@@ -158,6 +171,10 @@ def _resolve_node(store, node: str, covered, shard_order: int, spec, fam):
     the four children → ``(None, "missing", 0)``. The fold is
     :func:`zagg.telemetry.merge`, the same associative law the sweep uses, so
     a folded-from-below value equals what a fresh rollup would store.
+
+    A fold that loses a covered child subtree (nothing readable beneath it)
+    reports ``"partial"``, not the child sources: the numbers are real but
+    short, and a choropleth must not color that cell as a low reading.
     """
     from zagg.hive import _decimal_order
     from zagg.sweep import _read_rollup
@@ -175,12 +192,13 @@ def _resolve_node(store, node: str, covered, shard_order: int, spec, fam):
             f"choropleth: stale/partial stats rollup at node {node} ({n_leaves} leaves "
             f"< {beneath} covered shards); folding from below"
         )
-    parts, sources, n_leaves = [], set(), 0
+    parts, sources, n_leaves, partial = [], set(), 0, False
     for digit in "1234":
         child = node + digit
         if not any(d.startswith(child) for d in covered):
             continue
         record, source, n = _resolve_node(store, child, covered, shard_order, spec, fam)
+        partial = partial or record is None or source == "partial"
         if record is None:
             continue
         parts.append(record)
@@ -193,6 +211,12 @@ def _resolve_node(store, node: str, covered, shard_order: int, spec, fam):
     except ValueError as e:
         logger.warning(f"choropleth: cannot fold node {node}'s children ({e}); marking missing")
         return None, "missing", 0
+    if partial:
+        logger.info(
+            f"choropleth: node {node} folded from below over "
+            f"{n_leaves} leaves with a covered subtree missing; marking partial"
+        )
+        return merged, "partial", n_leaves
     return merged, sources.pop() if len(sources) == 1 else "mixed", n_leaves
 
 

@@ -84,6 +84,7 @@ class TestLeafMode:
             assert props["source"] == "rollup"
             assert props["order"] == SHARD_ORDER
             assert props["n_leaves"] == 1
+            assert props["n_covered"] == 1
             assert props["n_obs"] == rec["n_obs"]
             assert props["cells_with_data"] == rec["cells_with_data"]
             assert props["n_granules"] == rec["n_granules"]
@@ -166,6 +167,16 @@ class TestOrderMode:
         props = _by_morton(export_choropleth(str(tmp_path), order=1))["-31"]["properties"]
         assert props["source"] == "rollup"  # folded from the shard-node rollups
         assert props["n_leaves"] == 2
+
+    def test_dead_covered_subtree_marks_the_node_partial(self, tmp_path):
+        recs = _store(tmp_path, decimals=("-311", "-312"))
+        # A third covered shard with no stats artifact at all: the fold loses
+        # it, so the coarse cell must not read as a complete low value.
+        _put_coverage(tmp_path, ["-311", "-312", "-313"])
+        props = _by_morton(export_choropleth(str(tmp_path), order=1))["-31"]["properties"]
+        assert props["source"] == "partial"
+        assert props["n_leaves"] == 2 and props["n_covered"] == 3
+        assert props["n_obs"] == merge(list(recs.values()))["n_obs"]
 
     def test_order_bounds_checked(self, tmp_path):
         _store(tmp_path)
