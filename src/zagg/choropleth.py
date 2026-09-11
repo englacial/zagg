@@ -83,9 +83,13 @@ def export_choropleth(store_root: str, *, order=None, step=4, workers=8, store_k
     (``mortie.mort2polygon``; > 1 traces curved cell edges — matters near the
     poles). ``store_kwargs`` reach :func:`zagg.store.open_object_store`
     (``skip_signature=True`` + ``region`` for anonymous published-bucket
-    reads). ``workers`` bounds the thread pool resolving nodes concurrently —
-    per-node work is independent small-object GETs, so a published store
-    export is fetch-latency-bound (1 = sequential).
+    reads). ``workers`` bounds the thread pool resolving the *emitted* nodes
+    concurrently (1 = sequential), so effective concurrency is ``min(workers,
+    len(features))`` and each task's own fold-from-below descent runs serially
+    inside it: leaf mode is many independent small-object GETs and is
+    fetch-latency-bound, while a coarse ``order`` over a stale tree is a few
+    deep serial crawls — export at a finer order (or in leaf mode) when that
+    matters.
 
     Raises ``ValueError`` when the root manifest or a usable ``coverage.moc``
     is absent (discovery is the root MOC — regenerate it with
@@ -374,7 +378,8 @@ def main(argv=None) -> int:
         "--workers",
         type=int,
         default=8,
-        help="Concurrent node-resolution threads (default: 8; 1 = sequential)",
+        help="Concurrent node-resolution threads (default: 8; 1 = sequential). "
+        "Bounded by the emitted feature count, so a coarse --order is near-serial",
     )
     parser.add_argument("--region", default="us-west-2", help="AWS region (default: us-west-2)")
     parser.add_argument(
