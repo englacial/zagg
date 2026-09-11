@@ -138,6 +138,12 @@ def _ladder(manifest: dict) -> list[tuple[int, int]]:
     return [(k, c - (s - k)) for k in ks]
 
 
+def _field_companions(name: str, meta: dict) -> list:
+    from zagg.sweep_overview import field_companions
+
+    return field_companions(name, meta)
+
+
 def _composable_fields(manifest: dict) -> dict:
     """The manifest's composable field entries, by the sweep's own gate."""
     from zagg.column import _is_composable
@@ -318,6 +324,18 @@ class _Harness:
         self.shard_order = int(manifest["shard_order"])
         self.cell_order = int(manifest["cell_order"])
         self.fields = _composable_fields(manifest)
+        # ``{sibling array: owning field}`` for every declared companion
+        # channel (issue #410): a located/temporal field's ``{field}_locations``
+        # / ``{field}_times`` slabs are written by both fold paths, so an
+        # overview that lost one is not a valid overview. Their VALUES cannot
+        # be re-derived here (the words are keyed to the centroid partition the
+        # merge produced), but their presence and row alignment can.
+        self.companions = {
+            sibling: name
+            for name, meta in self.fields.items()
+            if meta.get("class") == "approximate"
+            for _kwarg, sibling in _field_companions(name, meta)
+        }
         self._groups: dict = {}
         self.warnings: list = []
 
@@ -647,6 +665,19 @@ def _value_checks(harness, ladder, declared, probes, leaves, checks, report, *, 
         for n, m in harness.fields.items()
         if m.get("class") == "approximate" and list(m.get("inner_shape") or [2]) == [2]
     }
+    # Approximate fields this harness's (k,2) digest re-fold cannot compare.
+    # Dropping them silently would let "N check(s), all consistent" stand for a
+    # declared composable field NOTHING touched (review finding), so they are
+    # named in the report and in the digests detail instead.
+    wide_fields = {
+        n: list(m.get("inner_shape") or [2])
+        for n, m in harness.fields.items()
+        if m.get("class") == "approximate" and list(m.get("inner_shape") or [2]) != [2]
+    }
+    if wide_fields:
+        report["unchecked_fields"] = wide_fields
+        for n, shape in sorted(wide_fields.items()):
+            harness.warn(f"field {n!r}: inner_shape {shape} != [2] — digest values NOT validated")
     packed_fields = {n: m for n, m in harness.fields.items() if m.get("class") == "packed"}
     exact_fields = {
         n: m for n, m in harness.fields.items() if m.get("class") == "exact" and n != "count"
@@ -694,7 +725,13 @@ def _value_checks(harness, ladder, declared, probes, leaves, checks, report, *, 
         if name == "counts" and count_meta is None:
             checks[name] = _entry("fail", "no exact 'count' field declared — nothing to conserve")
         elif name == "digests" and not digest_fields:
-            checks[name] = _entry("skip", "no (k,2) approximate digest field declared")
+            checks[name] = _entry(
+                "skip" if not wide_fields else "fail",
+                "no (k,2) approximate digest field declared"
+                if not wide_fields
+                else f"every declared approximate field has inner_shape != [2] "
+                f"({wide_fields}) — NOT validated by this harness",
+            )
         elif name == "composition" and not packed_fields:
             checks[name] = _entry("skip", "no packed composition field declared")
         elif errs:
@@ -712,6 +749,11 @@ def _value_checks(harness, ladder, declared, probes, leaves, checks, report, *, 
             )
         else:
             checks[name] = _entry("pass", f"{counted[name]} check(s), all consistent")
+    if wide_fields and digest_fields:
+        checks["digests"]["detail"] += (
+            f"; {len(wide_fields)} declared approximate field(s) NOT validated "
+            f"(inner_shape != [2]): {sorted(wide_fields)}"
+        )
     report["sampled"] = counted
     if harness.warnings:
         report["warnings"] = list(harness.warnings)
@@ -814,10 +856,18 @@ def _check_node(
         errors["readback"].append(f"{node}: overview group open failed: {exc}")
         return
     arrays = set(group.array_keys())
-    wanted = {"morton", *harness.fields}
+    wanted = {"morton", *harness.fields, *harness.companions}
     if not wanted <= arrays:
         errors["readback"].append(f"{node}: arrays missing {sorted(wanted - arrays)}")
         return
+    # A companion sibling must be row-aligned with the payload it rides (§9.1):
+    # a channel that silently vanished or shortened cannot be caught by value.
+    for sibling, owner in harness.companions.items():
+        if group[sibling].shape != group[owner].shape:
+            errors["readback"].append(
+                f"{node}: companion {sibling} shape {group[sibling].shape} != "
+                f"{owner} {group[owner].shape}"
+            )
 
     # Populated-cell sample from the count array (count is the presence law).
     if count_meta is None:
