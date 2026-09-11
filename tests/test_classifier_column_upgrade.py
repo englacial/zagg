@@ -333,46 +333,15 @@ class TestLiveCaManifestPlan:
         assert set(dict(group.arrays())) == {"morton", "count"}
 
 
-def _build_flux_store(root, monkeypatch, *, pyramid=None, shards=tcb.SHARDS):
+def _build_flux_store(root, monkeypatch, **kwargs):
     """A GEDI-shaped hive store: ``count`` + a ``weights: flux`` digest.
 
-    ``tcb._build_store``'s recipe over the fixture generator's flux arm —
-    the §2.0 surface the #524 suite does not drive through the backfill.
-    ``pyramid=False`` is the live ``gedi_flux_o9.zarr`` state: built
-    pyramid-off, no columns, no declaration.
+    ``tcb._build_store``'s flux arm — the §2.0 surface the #524 suite does
+    not drive through the backfill. ``pyramid=False`` is the live
+    ``gedi_flux_o9.zarr`` state: built pyramid-off, no columns, no
+    declaration.
     """
-    from dataclasses import replace
-
-    import zagg.processing as processing
-    from zagg import hive
-    from zagg.grids import HealpixGrid
-
-    gen = tcb._generator()
-    cfg = gen._config(False, pyramid=pyramid, flux=True)
-    cfg = replace(cfg, data_source={**cfg.data_source, "variables": {"h": "g/h"}})
-    grid = HealpixGrid(4, 6, layout="fullsphere", config=cfg, chunk_inner=5, sharded=True)
-    root.mkdir(parents=True, exist_ok=True)
-    hive.ensure_manifest(
-        str(root), hive.build_manifest(grid, dataset={"short_name": "FLUX_TEST", "version": "1"})
-    )
-    for decimal in shards:
-        shard = morton_word(decimal)
-        by_chunk, _cells = gen._build_cells(grid, shard, kitchen_sink=False, flux=True)
-        inner = gen._fake_process_shard(grid, by_chunk, kitchen_sink=False, ragged_field="rx_flux")
-
-        def fake(*args, _inner=inner, **kwargs):
-            if kwargs.get("chunk_results") is None:
-                kwargs["chunk_results"] = []
-            df, meta = _inner(*args, **kwargs)
-            meta["phase_timings"] = {"read": 0.0, "index": 0.0, "aggregate": 0.0}
-            return df, meta
-
-        monkeypatch.setattr(processing, "process_shard", fake)
-        meta = hive.process_and_write_hive(
-            shard, ["s3://fixture/a.h5"], grid, {}, str(root), cfg, store_kwargs={}
-        )
-        assert meta.get("error") is None, meta.get("error")
-    return cfg, grid
+    return tcb._build_store(root, monkeypatch, flux=True, dataset_name="FLUX_TEST", **kwargs)
 
 
 class TestGediFromScratch:
