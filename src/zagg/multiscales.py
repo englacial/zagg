@@ -233,12 +233,18 @@ def write_multiscales_group(store_root: str, *, store_kwargs=None) -> dict:
         # MortonIndexArray per shard on top of that (21x at 50k words).
         decimals = morton_decimals_from_words(root_coverage_words(envelope))
         source = "coverage.moc"
+        # The INPUT's own age (spec §4.10): ``generated_at`` below is write
+        # time, so a companion derived from a stale root MOC would otherwise
+        # self-certify fresh. The root carrier stamps itself; a hand-built
+        # envelope may not, and the key is simply absent then.
+        members_stamp = envelope.get("generated_at")
     else:
         from zagg.sweep import discover_leaves
 
         refs = discover_leaves(store_root, store_kwargs=store_kwargs)
         decimals = sorted(set(morton_decimals_from_words([int(key) for key, _ in refs])))
         source = "run-records"
+        members_stamp = None  # the records carry no single input age (§4.10)
     (entry,) = mirror
     children: dict[str, dict] = {}
     for ds in entry["datasets"]:
@@ -270,6 +276,7 @@ def write_multiscales_group(store_root: str, *, store_kwargs=None) -> dict:
                 "window": "all",
                 "members_source": source,
                 "generated_at": _utcnow(),
+                **({"members_generated_at": members_stamp} if members_stamp else {}),
             },
         },
         "consolidated_metadata": {

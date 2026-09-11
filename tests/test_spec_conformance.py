@@ -993,6 +993,11 @@ class TestMultiscalesCompanion:
         assert stamp["window"] == exp["window"]
         assert stamp["members_source"] == exp["members_source"]
         assert stamp["generated_at"]  # present; value is write-time truth
+        # §4.10: the INPUT's age rides beside it, so a companion written from
+        # a stale root MOC cannot self-certify fresh — on the "coverage.moc"
+        # branch it is that envelope's own stamp, byte-for-byte.
+        envelope = json.loads((SPEC_DATA / MULTISCALES / "coverage.moc").read_text())
+        assert stamp["members_generated_at"] == envelope["generated_at"]
 
     def test_consolidated_metadata_inlines_the_children(self):
         # §4.10: one GET of the root document walks the whole tree — the

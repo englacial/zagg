@@ -340,6 +340,10 @@ class TestCompanionGroup:
         assert stamp["spec"] == MULTISCALES_SPEC
         assert stamp["window"] == "all" and stamp["members_source"] == "coverage.moc"
         assert stamp["generated_at"]
+        # §4.10: the INPUT's age, so a companion derived from a stale root
+        # MOC cannot self-certify fresh on its write-time stamp alone.
+        envelope = json.loads((tmp_path / "coverage.moc").read_text())
+        assert stamp["members_generated_at"] == envelope["generated_at"]
         assert sorted(k for k, _ in group.members()) == ["0", "1"]
         for order, members in self.MEMBERS.items():
             level = group[order].attrs[LEVEL_ATTR]
@@ -382,6 +386,11 @@ class TestCompanionGroup:
         _run_record(tmp_path)
         summary = write_multiscales_group(str(tmp_path))
         assert summary["members_source"] == "run-records"
+        # No single input age to record on this branch — the key is absent.
+        stamp = json.loads((tmp_path / GROUP_NAME / "zarr.json").read_text())["attributes"][
+            GROUP_ATTR
+        ]
+        assert "members_generated_at" not in stamp
         for order, members in self.MEMBERS.items():
             doc = json.loads((tmp_path / GROUP_NAME / order / "zarr.json").read_text())
             assert doc["attributes"][LEVEL_ATTR]["members"] == members

@@ -1470,7 +1470,8 @@ to 0 — that a plain zarr reader opens with zero custom code. It holds
     "spec": "zagg-multiscales/1",
     "window": "all",
     "members_source": "coverage.moc",
-    "generated_at": "2026-09-11T00:00:00+00:00"
+    "generated_at": "2026-09-11T00:00:00+00:00",
+    "members_generated_at": "2026-09-10T23:12:04+00:00"
   }
   ```
 
@@ -1479,8 +1480,13 @@ to 0 — that a plain zarr reader opens with zero custom code. It holds
   fold (per-window mirrors are a declared non-goal of `/1`, issue #394
   decision (2)). `members_source` records where the member node set came
   from: `"coverage.moc"` (the root MOC, one GET) or `"run-records"` (the
-  D22 discovery fallback). `generated_at` is the staleness discriminator
-  (see below).
+  D22 discovery fallback). `generated_at` is when the companion was
+  WRITTEN; `members_generated_at` is the age of the INPUT the member sets
+  were derived from — the root MOC envelope's own `generated_at`, present
+  exactly when `members_source` is `"coverage.moc"` and that envelope
+  carries the field. The two together are the staleness discriminator (see
+  below). A reader MUST tolerate its absence (a `"run-records"` companion,
+  or a MOC that carries no stamp).
 - **Per-order groups** — the child group named `str(order)` carries
 
   ```json
@@ -1525,9 +1531,14 @@ to 0 — that a plain zarr reader opens with zero custom code. It holds
 - **Normativity and staleness.** The manifest + hive remain truth; the
   companion is a **recorded mirror** (D9 cache class): regenerable at any
   time, self-healing on the sweep ratchet (the finisher rewrites it each
-  admitted run), and stale-detectable — a `generated_at` older than the
-  manifest's pyramid declaration or the newest §4.5 `actuals` means the
-  member sets may lag store truth. On any disagreement the manifest wins,
+  admitted run), and stale-detectable — but the test is
+  `members_generated_at`, not `generated_at`: the write-time stamp only
+  says when the mirror was last rewritten, so a companion derived from a
+  stale root MOC carries a *fresh* `generated_at`. A
+  `members_generated_at` older than the manifest's pyramid declaration or
+  the newest §4.5 `actuals` means the member sets may lag store truth; its
+  absence means the input age is unknown and the member sets carry no
+  freshness proof at all. On any disagreement the manifest wins,
   exactly as §4.9. A reader MUST tolerate additional keys in both attrs
   blocks.
 
