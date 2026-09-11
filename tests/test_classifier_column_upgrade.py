@@ -290,12 +290,17 @@ class TestLiveCaManifestPlan:
 
         A 4-field exemplar column reads ``declaration-drift`` under a
         count-only plan exactly as the reverse does, so a backfill run
-        against the un-re-declared manifest would DOWNGRADE the ~204
-        0.52-era shards. The field-set keying makes both directions loud in
-        the summary (``written``, never ``current``); the ordering guarantee
-        lives in the runbook, and this pin is what makes skipping step 1
-        a visible rewrite rather than a silent no-op.
+        against the un-re-declared manifest DOWNGRADES the ~204 0.52-era
+        shards — driven here through the pass, so the loss is the array set
+        on disk and not a verdict. The field-set keying makes both
+        directions loud in the summary (``written``, never ``current``); the
+        ordering guarantee lives in the runbook, and this pin is what makes
+        skipping step 1 a visible rewrite rather than a silent no-op.
         """
+        import zarr
+
+        from zagg.store import open_store
+
         root = tmp_path / "on"
         tcb._build_store(root, monkeypatch, shards=tcb.SHARDS[:1], kitchen_sink=True)
         plan = tcb._plan(root)
@@ -304,6 +309,21 @@ class TestLiveCaManifestPlan:
             False,
             "declaration-drift",
         )
+        # Now run it: the live manifest's count-only declaration over the
+        # 4-field exemplar column.
+        block = tcb._twin_block(root)
+        block["overview"]["fields"] = _era_048_fields(block)
+        tcb._install_pyramid(root, block)
+        summary = tcb._backfill(root, shards=tcb.SHARDS[:1])
+        assert summary["written"] == 1 and summary["current"] == 0
+        group = zarr.open_group(
+            open_store(str(tcb._column_path(root, tcb.SHARDS[0])), read_only=True),
+            path="5",
+            mode="r",
+            zarr_format=3,
+        )
+        # The digests, ``composition`` and every located sibling are GONE.
+        assert set(dict(group.arrays())) == {"morton", "count"}
 
 
 def _build_flux_store(root, monkeypatch, *, pyramid=None, shards=tcb.SHARDS):
