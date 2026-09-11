@@ -109,6 +109,28 @@ class TestLeafMode:
         assert props["n_leaves"] == 2
         assert props["n_obs"] == merge(recs)["n_obs"] == 7
 
+    def test_window_landed_after_the_sweep_unseats_the_shard_rollup(self, tmp_path):
+        _write_manifest(tmp_path)
+        first = _put_leaf(tmp_path, "-311", window="2019", n_obs=3)
+        _put_coverage(tmp_path, ["-311"])
+        run_sweep(str(tmp_path), [(morton_word("-311"), "2019")], families=("stats",))
+        second = _put_leaf(tmp_path, "-311", window="2020", n_obs=4)  # no re-sweep
+        props = _by_morton(export_choropleth(str(tmp_path)))["-311"]["properties"]
+        assert props["source"] == "leaf_stats"  # the rollup never merged 2020
+        assert props["n_leaves"] == 2
+        assert props["n_obs"] == merge([first, second])["n_obs"] == 7
+
+    def test_rerun_leaf_under_a_rollup_stays_rollup(self, tmp_path):
+        # The documented limit of the freshness checks: a leaf re-run in place
+        # (same shard, same window) moves no counter either check reads, so the
+        # rollup is still served and ``timestamp`` is the vintage signal.
+        recs = _store(tmp_path, decimals=("-311",))
+        _put_leaf(tmp_path, "-311", n_obs=1000)
+        props = _by_morton(export_choropleth(str(tmp_path)))["-311"]["properties"]
+        assert props["source"] == "rollup"
+        assert props["n_obs"] == recs["-311"]["n_obs"] == 10
+        assert props["timestamp"] == recs["-311"]["timestamp"]
+
     def test_covered_shard_without_stats_is_emitted_null(self, tmp_path):
         _store(tmp_path, decimals=("-311",))
         _put_coverage(tmp_path, ["-311", "-322"])  # -322 has coverage, no artifacts

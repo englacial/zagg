@@ -13,11 +13,15 @@ the live demo stores make that ladder load-bearing, not theoretical (ATL03's
 stats rollups cover only ~40% of its leaves; two interior nodes carry no
 rollup at all, while GEDI's tree is complete):
 
-1. A node's own ``stats.rollup.json`` when present — and, at interior nodes,
-   when its generation stamp accounts for at least the covered shards beneath
-   it (``n_leaves >= covered shards`` — necessary, not sufficient: on a
-   windowed store several window leaves ride one shard, so a partial rollup
-   can still pass; a rollup that FAILS it is definitely stale/partial).
+1. A node's own ``stats.rollup.json`` when present — at interior nodes when
+   its generation stamp accounts for at least the covered shards beneath it
+   (``n_leaves >= covered shards``), and at shard nodes when the windows the
+   envelope records still match the sidecars the node holds. Both checks see
+   only *new* leaves: a leaf re-run in place (same shard, same window) moves
+   no counter either one reads, so a rollup that FAILS a check is definitely
+   stale, while one that passes is not thereby proven fresh — on any store,
+   windowed or not. A feature's ``timestamp`` is the latest leaf timestamp
+   its numbers account for; that is the vintage signal.
 2. Otherwise fold from below: child rollups where usable, per-leaf
    ``stats.json`` sidecars at the shards (windows discovered by one node
    LIST, merged via :func:`zagg.telemetry.merge`; a LIST-less store falls
@@ -221,14 +225,40 @@ def _resolve_node(store, node: str, covered, shard_order: int, spec, fam):
 
 
 def _resolve_shard(store, decimal: str, spec, fam):
-    """One shard node: its rollup, else its merged leaf sidecars, else missing."""
-    from zagg.sweep import _read_rollup
+    """One shard node: its rollup, else its merged leaf sidecars, else missing.
+
+    The rollup is taken on its face with one check, free because the envelope
+    already carries the evidence: a windowed shard's rollup records the
+    windows it merged (``_rollup_shard_node``), so a window that landed after
+    the sweep is caught by the one node LIST the fallback would run anyway.
+    An unwindowed shard skips even that — its single leaf is by construction
+    the one the rollup merged — so the happy path stays one GET per shard.
+    Neither arm sees a leaf re-run in place (same window, new content): that
+    needs the leaf's own timestamp, i.e. exactly the fold the rollup exists
+    to avoid. See the module docstring's ladder note.
+    """
+    from zagg.sweep import _read_rollup, _sidecar_window
     from zagg.telemetry import merge
 
     envelope = _read_rollup(store, fam, decimal)
+    names = listed = None
     if envelope is not None:
-        return envelope["payload"], "rollup", int(envelope["generation"]["n_leaves"])
-    records = _leaf_sidecars(store, decimal, spec)
+        n_leaves = int(envelope["generation"]["n_leaves"])
+        merged = {None if w is None else str(w) for w in envelope.get("windows") or [None]}
+        if merged == {None}:  # unwindowed shard: the one leaf is in the rollup
+            return envelope["payload"], "rollup", n_leaves
+        names, listed = _sidecar_names(store, decimal, spec)
+        # A failed LIST is no evidence about windows, so it never unseats a rollup.
+        unmerged = {_sidecar_window(n, spec) for n in names} - merged if listed else set()
+        if not unmerged:
+            return envelope["payload"], "rollup", n_leaves
+        logger.info(
+            f"choropleth: shard {decimal}'s stats rollup predates window(s) "
+            f"{sorted(str(w) for w in unmerged)}; folding its leaf sidecars"
+        )
+    if names is None:
+        names, listed = _sidecar_names(store, decimal, spec)
+    records = _read_sidecars(store, decimal, names)
     if not records:
         return None, "missing", 0
     try:
@@ -238,16 +268,16 @@ def _resolve_shard(store, decimal: str, spec, fam):
         return None, "missing", 0
 
 
-def _leaf_sidecars(store, decimal: str, spec) -> list[dict]:
-    """A shard node's readable stats-sidecar records (all windows).
+def _sidecar_names(store, decimal: str, spec) -> tuple[list[str], bool]:
+    """A shard node's stats-sidecar object names + whether the LIST succeeded.
 
     Windows are discovered by one delimiter LIST of the shard's node — the
     same bounded, run-scoped pattern as the sweep's pre-column fallback,
     never a tree walk. A store without LIST permission falls back to the one
-    sidecar name that needs no discovery: the unwindowed leaf's.
+    sidecar name that needs no discovery, the unwindowed leaf's, and reports
+    ``False``: that guess is not evidence of which windows exist.
     """
     import obstore
-    from obstore.exceptions import NotFoundError
 
     from zagg.sweep import _NO_SIDECAR, _node_rel, _sidecar_window
     from zagg.telemetry import SPEC_V3, sidecar_key
@@ -257,11 +287,21 @@ def _leaf_sidecars(store, decimal: str, spec) -> list[dict]:
     try:
         listing = obstore.list_with_delimiter(store, node + "/")
         names = [o["path"].rsplit("/", 1)[-1] for o in listing["objects"]]
-        names = [n for n in names if _sidecar_window(n, spec) is not _NO_SIDECAR]
+        return [n for n in names if _sidecar_window(n, spec) is not _NO_SIDECAR], True
     except Exception as e:  # no LIST permission on the published bucket
         logger.debug(f"choropleth: node LIST failed at {node} ({e}); trying unwindowed sidecar")
         stem = SCHEDULE_NONE_TOKEN if spec == SPEC_V3 else decimal
-        names = [sidecar_key(f"{stem}.zarr", spec)]
+        return [sidecar_key(f"{stem}.zarr", spec)], False
+
+
+def _read_sidecars(store, decimal: str, names) -> list[dict]:
+    """The readable stats-sidecar records among ``names`` at a shard node."""
+    import obstore
+    from obstore.exceptions import NotFoundError
+
+    from zagg.sweep import _node_rel
+
+    node = _node_rel(decimal)
     records = []
     for name in names:
         try:
