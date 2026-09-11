@@ -996,6 +996,30 @@ class TestCoverageComputedAssignment:
         assert coverage_dispatch_nodes(by_shard, words, 0) == ["1"]
         assert coverage_dispatch_nodes(by_shard, words, 2) == ["111", "112"]
 
+    def test_an_empty_coverage_assigns_no_workers(self):
+        # A store that covers nothing yet is a real input HERE, unlike a
+        # hand-typed `--scope` (review finding): `normalize_scope` refuses an
+        # empty MOC and advises passing None, which in a coverage argument
+        # means the OPPOSITE — dispatch everything.
+        from zagg.sweep_fleet import coverage_dispatch_nodes
+
+        by_shard = {d: {None} for d in LEAVES}
+        for empty in ([], (), {}, np.asarray([], dtype=np.uint64)):
+            assert coverage_dispatch_nodes(by_shard, empty, 0) == []
+
+    def test_a_missing_coverage_refuses_rather_than_dispatching_everything(self):
+        # The other direction of the same trap: a caller whose coverage fetch
+        # came back empty (an absent or unreadable root `coverage.moc`) must
+        # not fail OPEN to a whole-store dispatch from a function whose whole
+        # claim is that the coverage is half the assignment.
+        from zagg.sweep_fleet import coverage_dispatch_nodes, dispatch_nodes
+
+        by_shard = {d: {None} for d in LEAVES}
+        with pytest.raises(ValueError, match="coverage"):
+            coverage_dispatch_nodes(by_shard, None, 0)
+        # The unscoped derivation is still reachable, by its own name:
+        assert dispatch_nodes(by_shard, 0) == ["-2", "1"]
+
 
 class TestBatching:
     def _block(self, dispatch=0):

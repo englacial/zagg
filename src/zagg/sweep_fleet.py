@@ -113,10 +113,28 @@ def coverage_dispatch_nodes(by_shard, coverage, dispatch: int) -> list:
     (containment resolves in either direction — :func:`zagg.sweep_stages.scope_admits`).
     At the default one node per invoke, ``len()`` of the result IS the tuple's
     worker count.
+
+    A coverage MOC's empty/absent cases are the OPPOSITE of a hand-typed
+    ``--scope``'s, so they are handled here rather than inherited from
+    :func:`zagg.sweep_stages.normalize_scope` (review finding): an EMPTY
+    coverage is a real input — a store that covers nothing yet — and assigns
+    no workers, while ``None`` refuses by name rather than failing open to a
+    whole-store dispatch, which is what a caller whose coverage fetch came
+    back empty would otherwise get.
     """
     from zagg.sweep_stages import normalize_scope
 
-    return dispatch_nodes(by_shard, int(dispatch), normalize_scope(coverage))
+    if coverage is None:
+        raise ValueError(
+            "coverage_dispatch_nodes needs the store's coverage MOC — None is not "
+            "'whole store' here, because a coverage that failed to load must not "
+            "silently widen the dispatch; call dispatch_nodes(by_shard, dispatch) to "
+            "derive from the work set alone"
+        )
+    words = list(coverage.keys() if isinstance(coverage, dict) else coverage)
+    if not words:
+        return []
+    return dispatch_nodes(by_shard, int(dispatch), normalize_scope(words))
 
 
 def _leaf_refs(by_shard, nodes=None) -> list:
