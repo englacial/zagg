@@ -15,7 +15,7 @@ from test_readers import _KEY_A, _KEY_B, _build_store, _sharded_store
 from zarr.storage import MemoryStore
 
 from zagg.grids.morton import morton_word
-from zagg.readers._layout import rank_to_rowcol, rowcol_to_rank
+from zagg.readers._layout import rank_to_rowcol, rowcol_to_rank, subtree_cell_span
 from zagg.readers.tdigest_tensor import cell_index, read_cell, read_raw_values, read_tensors
 
 # Golden (rank, x, y) triples copied verbatim from mortie's merged test file
@@ -616,3 +616,38 @@ class TestMaskBlockCrossing:
         assert int((block_mask == 1).sum()) == sum(int((m == 1).sum()) for m in chunk_masks) + 1
         # And the digest-bearing cells still match the tensor's mass exactly.
         np.testing.assert_array_equal(block_mask == 2, tensor.sum(axis=2) > 0)
+
+
+class TestSubtreeSpanBit63:
+    """Southern (base 7-11) words set bit 63, so ``np.asarray(word)`` infers
+    uint64 where a northern word infers int64 — two mortie kernel paths since
+    the explicit ``dtype=np.uint64`` boxing came off (issue #543). Every other
+    subtree test runs on the northern ``_KEY_A``/``_KEY_B`` stores, so this
+    pins the uint64 branch against the int64 one."""
+
+    @staticmethod
+    def _spans(shard):
+        """``(whole-shard span, per-order-9-child spans)`` on an order-12,
+        single-root (4**6) cells axis anchored at the shard's first cell."""
+        from mortie import generate_morton_children
+
+        anchor = int(generate_morton_children(shard, 12)[0])
+        whole = subtree_cell_span(shard, anchor, 0, 12, 4096, "12/h_tdigest")
+        kids = [
+            subtree_cell_span(int(c), anchor, 0, 12, 4096, "12/h_tdigest")
+            for c in generate_morton_children(shard, 9)
+        ]
+        return whole, kids
+
+    def test_southern_word_spans_match_the_northern_path(self):
+        from mortie import clip2order, geo2mort
+
+        south = int(clip2order(6, geo2mort(-78.5, -132.0, order=18))[0])
+        north = morton_word(_KEY_A)
+        assert south >= 2**63 and np.asarray(south).dtype == np.uint64
+        assert north < 2**63 and np.asarray(north).dtype == np.int64
+
+        whole, kids = self._spans(south)
+        assert whole == (0, 4096)
+        assert kids == [(i * 64, (i + 1) * 64) for i in range(64)]
+        assert (whole, kids) == self._spans(north)
