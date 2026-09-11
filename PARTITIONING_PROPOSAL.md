@@ -216,15 +216,37 @@ schedule removes the mechanism itself:
   declaration **is** the config, and the backfill's skip-if-current gate
   compares realized structure against whatever that block says (the ATL03
   bullet above).
-- (b) **Fleet-scale backfill concurrency is gated on the lease-vs-partition
-  ruling** (PR #524, question 3). #528 landed the handler forwarding
-  (`families`/`partition` reach workers), but the runner fires partitions as
-  concurrent Event invokes while the sweep lease is store-granular — exactly
-  one is admitted. A single unpartitioned invoke cannot do the backfill
-  either (2,918 leaves × ~141 s ≫ 900 s), and a local/EC2 in-process run is
-  not a sanctioned write path on the published stores (the bucket policy
-  names the fleet role, #495/#496). So the ruling is a **hard prerequisite**
-  for the backfill leg — see Q3.
+- (b) **Fleet-scale backfill concurrency needs one hop of `run_id` plumbing,
+  and then a release/heartbeat ruling** (PR #524, question 3). The admission
+  pattern itself already exists: `acquire_lease` re-admits a same-run sibling
+  idempotently —
+
+  ```python
+  existing = read_lease(store_root, store_kwargs=store_kwargs)
+  if existing is not None and existing.get("run_id") == str(run_id):
+      return existing  # already ours (an idempotent re-admission)
+  ```
+
+  (`src/zagg/sweep_lease.py:135-137`) — and `backfill_columns` exposes both
+  levers (`run_id: str | None = None`, `lease: bool = True`, the latter
+  documented for callers already holding the lease). What is missing is that
+  no dispatcher-chosen `run_id` can *reach* them: the handler forwards
+  `families` and `partition` only on `mode="sweep"`
+  (`pr524:deployment/aws/lambda_handler.py`, the `run_sweep(...)` call), and
+  `ColumnFamily.sweep_store(store_root, manifest, by_shard, store_kwargs,
+  min_order)` has nowhere to put `run_id`/`lease`. So each partition invoke
+  mints its own `f"backfill-{uuid4}"` and the store-granular lease then
+  refuses the siblings — "exactly one is admitted" is a plumbing artifact, not
+  a design property. Thread one `run_id` through and they are all admitted;
+  the genuine open question is **who releases**, since `release_lease` honours
+  any holder of the matching `run_id` and `backfill_columns` releases in a
+  `finally` — the first sibling to finish would drop the lease out from under
+  the rest, and every sibling heartbeats the same object. A single
+  unpartitioned invoke cannot do the backfill either (2,918 leaves × ~141 s ≫
+  900 s), and a local/EC2 in-process run is not a sanctioned write path on the
+  published stores (the bucket policy names the fleet role, #495/#496) — so
+  both the plumbing and the ruling are **hard prerequisites** for the backfill
+  leg. See Q3.
 - (c) **The stage dispatcher needs the worker-count knob** (payload-only
   packing → one worker per tuple today; see the schedule section).
 - (d) GEDI's families rollups are incomplete (moc 249/353, submap 244/353) —
@@ -257,10 +279,18 @@ schedule removes the mechanism itself:
    nodes per invoke; worst case ~128 columns + ~4 GB writes, thinner
    headroom)? And sign-off on adding the max-nodes-per-invoke knob to
    `sweep_fleet` (without it the packer emits one worker per tuple).
-3. **Backfill sequencing + lease** — backfill fully before the ladder sweep
-   (recommended: T1's fold gate needs 4-field columns under every dispatch
-   node; interleaving per-subtree buys ~nothing at these costs), and — the
-   hard one — rule PR #524's lease-vs-partition question so the Lambda
-   backfill can run concurrently at all: scoped per-partition lease, or a
-   partition-aware admission for same-run siblings (the stage transport's
-   own idempotent re-admission pattern)?
+3. **Backfill sequencing + lease ownership among siblings** — backfill fully
+   before the ladder sweep (recommended: T1's fold gate needs 4-field columns
+   under every dispatch node; interleaving per-subtree buys ~nothing at these
+   costs), and — the hard one — rule how a same-`run_id` sibling set shares
+   one store lease. Admission is not the question (`acquire_lease` already
+   re-admits same-run siblings; only the `run_id` plumbing in gap (b) is
+   missing, which is a small mechanical change). **Release and heartbeat
+   are**: with `backfill_columns` releasing in a `finally`, the first sibling
+   to finish drops the lease while the others are still writing. Options:
+   (1) only the dispatcher acquires and releases, workers run `lease=False`;
+   (2) the workers refcount — last one out releases; or (3) keep
+   per-worker release and accept that a late sibling runs unleased. (1) looks
+   right (it matches the stage transport's finisher-releases shape) but it
+   puts lease liveness on the dispatcher for the full multi-hour backfill —
+   your call.
