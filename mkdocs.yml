@@ -32,6 +32,7 @@ nav:
       - "Hive store layout": "hive_layout.md"
       - "Typed morton boundary": "morton_arrow.md"
       - "Temporal events": "temporal_events.md"
+      - "Pyramid /1 -> /2 upgrade": "pyramid_upgrade.md"
   - "Deployment":
       - "Standing Up the Backend": "deployment/standup.md"
       - "AWS Lambda": "deployment/lambda.md"

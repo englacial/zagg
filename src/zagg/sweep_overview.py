@@ -639,7 +639,9 @@ def _update_manifest_pyramid(store_root, folded: dict, store_kwargs) -> bool:
         return False
 
 
-def declare_pyramid(store_root: str, config, *, store_kwargs=None) -> dict:
+def declare_pyramid(
+    store_root: str, config, *, overviews=None, chunk_order=None, store_kwargs=None
+) -> dict:
     """Install/refresh the manifest ``pyramid`` declaration on an EXISTING store.
 
     The issue #358 retrofit tool: declaration is no longer birth-only. The
@@ -668,6 +670,22 @@ def declare_pyramid(store_root: str, config, *, store_kwargs=None) -> dict:
       ``nan_policy`` half the leaf is silent on. The D19 ``aggregation.yaml``
       core is NOT used (it is itself config-derived and written fail-open).
 
+    ``overviews=`` / ``chunk_order=`` (issue #520) are the ``/2`` retrofit
+    levers, and they are what makes this tool the second step of the
+    ``/1 -> /2`` upgrade recipe. Without them the grid-less retrofit path can
+    only ever declare ``/1``: the #384 default flip fires off the GRID's
+    resolved ``chunk_order``, which there is no grid here to ask, and the
+    config a published store was built with has no reason to spell
+    ``output.pyramid.overviews``. ``overviews=`` spells the leaf resolutions
+    outright (overriding whatever the config's own pyramid knob says,
+    ``false`` included — logged, and the point of the lever); ``chunk_order=``
+    supplies the one number the default flip is missing. Both are validated
+    against the MANIFEST's ``shard_order``/``cell_order`` — the store's truth,
+    not the config's — before anything is written, and the two silent-no-op
+    spellings refuse by name rather than falling back to ``/1``
+    (:func:`zagg.pyramid.retrofit_declaration`). The summary records which
+    lever declared the block in ``declared_via``.
+
     Idempotent RMW: an identical existing declaration is not re-PUT; a
     changed one is rewritten PRESERVING any ``materialized`` actuals (they
     inventory overview artifacts already on disk — overviews at
@@ -686,6 +704,7 @@ def declare_pyramid(store_root: str, config, *, store_kwargs=None) -> dict:
     """
 
     from zagg.hive import MANIFEST_NAME, _frozen_matches, read_manifest
+    from zagg.pyramid import retrofit_declaration
     from zagg.store import open_object_store, put_object
 
     store_kwargs = dict(store_kwargs or {})
@@ -706,7 +725,33 @@ def declare_pyramid(store_root: str, config, *, store_kwargs=None) -> dict:
             f"not a hive store manifest; declare_pyramid retrofits existing hive stores only"
         )
     shard_order = int(manifest["shard_order"])
-    block = build_pyramid_block(config, shard_order)
+    config, default_chunk, declared_via = retrofit_declaration(
+        config,
+        overviews=overviews,
+        chunk_order=chunk_order,
+        parent_order=shard_order,
+        child_order=int(manifest["cell_order"]),
+    )
+    block = build_pyramid_block(config, shard_order, default_chunk)
+    if (overviews is not None or chunk_order is not None) and "overviews" not in block:
+        # Both levers exist to produce a /2 block; anything that swallowed one must
+        # say so rather than install the /1 fallback the caller explicitly reached
+        # past. Raster is refused by name upstream now (``retrofit_declaration``,
+        # both arms), so what survives to here is the ``chunk_order=`` arm on a
+        # NON-raster config: the lever was validated against the MANIFEST's
+        # ``cell_order`` while the #384 flip gates on the CONFIG's own
+        # ``output.grid.child_order``, and orders are packaging — excluded from
+        # the semantic core — so ``_semantic_guard`` cannot catch a config whose
+        # grid disagrees with the store (review finding, issue #520).
+        raise ValueError(
+            f"declare_pyramid({declared_via}) did not produce a zagg-pyramid/2 block: the "
+            f"issue #384 default flip needs the order strictly inside this CONFIG's own "
+            f"`output.grid.child_order` "
+            f"({(config.output.get('grid') or {}).get('child_order')!r}), which is not where "
+            f"the store's manifest puts its cells (cell_order {int(manifest['cell_order'])}) "
+            f"— the config's grid does not describe this store. Pass overviews= to spell the "
+            f"schedule outright; nothing was written"
+        )
     # Compare (and write) canonical JSON: ``prior`` came back through
     # ``json.loads``, so any non-JSON-primitive surviving the derivation (a tuple
     # in a ``summarize`` declaration, say) would differ from its round-tripped
@@ -772,6 +817,9 @@ def declare_pyramid(store_root: str, config, *, store_kwargs=None) -> dict:
         # every future sweep of this store (issue #376) — it is printed by
         # ``python -m zagg.sweep --declare-pyramid`` and nowhere else.
         "fold_source": block["overview"].get("fold_source"),
+        # Which lever declared this block (issue #520): the config as supplied,
+        # or one of the two /2 retrofit overrides.
+        "declared_via": declared_via,
         "fields": {n: m.get("class") for n, m in (block["overview"].get("fields") or {}).items()},
         "validated": f"{validated}; {semantic}",
         "previous": "absent" if prior is None else "identical" if prior == block else "replaced",
