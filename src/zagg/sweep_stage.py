@@ -477,7 +477,10 @@ def _gather_slabs(rows: list, fields: dict, *, res: int, span: int, n_out: int) 
     counted). Payloads are ASSIGNED, never decoded or re-folded — the
     acceptance contract that gather levels carry gen-1 bytes untouched.
     Returns ``(slabs, folded, missing, unreadable, demotions)`` — the last
-    always empty here (see the comment at the return).
+    always empty here because a gather FOLDS nothing, so the packed rail has
+    no site to fire in; NOT because a gather cannot relay the half-paired
+    shape the rail exists for. It can, and the residual is the laundering
+    case named at the return.
 
     A located field's sibling is gathered under the same rule as its payload
     (ruling 4 on issue #410): a gather ASSIGNS gen-1 bytes, so the pair stays
@@ -523,9 +526,19 @@ def _gather_slabs(rows: list, fields: dict, *, res: int, span: int, n_out: int) 
             values = grouped[name] if name in grouped else reader.read(res, name)
             if values is not None:
                 slabs[name][seg] = values
-    # A gather assigns gen-1 bytes and folds nothing, so the packed guard
-    # rail has no site here — the demotions slot is empty by construction
-    # (issue #518), kept so every fold arm returns one shape.
+    # A gather ASSIGNS gen-1 bytes, so the packed guard rail — a fold-site
+    # check — has no site to fire in and the demotions slot is empty (issue
+    # #518), kept so every fold arm returns one shape. Empty because nothing
+    # folds here, NOT because a gather cannot produce the half-paired shape
+    # the rail exists for: a source column carrying the ``of`` digest without
+    # the word relays a PRESENT, all-fill word array beside a populated
+    # divisor (the packed pair is not validated the way ``_located_pair``
+    # validates a located one), which the next rung's ``_merge_slabs`` then
+    # reads as legitimate ``(0, n)`` parts — diluting the lane fractions
+    # instead of blanking them, with no rail fired and nothing in any attrs.
+    # That relay laundering predates issue #518 and stands as a question on
+    # its PR; the fix belongs beside ``_companion_group``'s
+    # pairing logic, not in this observability path (review finding).
     return (slabs, *_source_counts(rows, broken), [])
 
 
