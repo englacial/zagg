@@ -96,6 +96,14 @@ case "$ZAGG_BUILD_VERSION" in
         exit 1 ;;
 esac
 
+# pip --target materializes [project.scripts] launchers under bin/ — dead
+# weight in a Lambda zip, with shebangs pointing at the build machine. Removed
+# here, before the deps install, and not with the other cleanup below: pip
+# resolves a --target collision by SKIPPING the colliding top-level item with a
+# warning ("Target directory .../bin already exists"), so a surviving bin/ from
+# this install silently drops the next one's.
+rm -rf "$BUILD_DIR/bin"
+
 # --- Install function-level dependencies ---
 # These are packages NOT in the Lambda layer.
 # pip resolves transitive deps automatically — no manual dep hunting.
@@ -144,8 +152,7 @@ done
 
 # --- Clean build artifacts ---
 echo "Cleaning caches and test directories..."
-# pip --target materializes [project.scripts] launchers under bin/ — dead
-# weight in a Lambda zip, with shebangs pointing at the build machine.
+# bin/ from the deps install (zagg's was removed before it, see above).
 rm -rf "$BUILD_DIR/bin"
 find "$BUILD_DIR" -type d -name "__pycache__" -exec rm -rf {} + 2>/dev/null || true
 # Strip dist-info except for packages whose code calls importlib.metadata.version()
