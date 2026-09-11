@@ -2,7 +2,7 @@
 
 Measures the phase-1 rewire of ``_intersect_mortie`` -- one batched
 ``mortie.polygons_to_morton_mocs`` call per block of rings, replacing one
-``morton_coverage_moc`` call per granule -- against the per-granule loop it
+coverage call per granule -- against the per-granule loop it
 replaced, and both against the phase-3 ``cells`` arm, which reads the MOC the
 catalog already carries (``Catalog.index_footprints``) and does no geometry at
 all. **Wall and peak RSS** for every arm; the phase-3 indexing pass is timed
@@ -307,7 +307,10 @@ def run_cases(names, orders=None, arms=("serial", "batch"), reps=1):
     Three arms, each the whole intersection for one implementation:
 
     ``serial``
-        the pre-#396 per-granule ``morton_coverage_moc`` loop -- the oracle.
+        the pre-#396 per-granule loop -- the oracle. It reaches the ring
+        kernel one granule at a time through a one-group
+        ``polygons_to_morton_mocs``; the granule-at-a-time name it originally
+        called, ``morton_coverage_moc``, was retired in mortie 1.0 (#559).
     ``batch``
         phase 1: ``polygons_to_morton_mocs`` a block of rings at a time.
     ``cells``

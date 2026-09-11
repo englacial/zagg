@@ -46,8 +46,8 @@ dependencies = [
     # 0.9.10; those three names are NOT top-level in 0.9.9, so this floor and
     # the import style are one change, not two (issue #493).
     # Previously floor 0.9.9 for the SEGMENTED toc reduce (espg/mortie#177,
-    # released in 0.9.9): tocs_reduce(words, offsets) is the per-group
-    # semilattice join the
+    # released in 0.9.9): tocs_reduce(words, offsets) — retired in 1.0, now
+    # toc_reduce(words, offsets=) — is the per-group semilattice join the
     # spec §8.2/§8.3 temporal companions fold with — one Rust crossing for a
     # whole cell's centroid partition, where the scalar toc_reduce 0.9.6 ships
     # would be a Python loop per centroid (issue #410,
@@ -62,22 +62,25 @@ dependencies = [
     # the store attr tokens are authalic-wgs84 / geodetic-spherical (same
     # section). Earlier floors: 0.9.6
     # for the MOC batch twins on ShardMap.build's stored-index path
-    # (issue #396 phase 4): mocs_and, the 1xN broadcast intersection of the AOI
+    # (issue #396 phase 4): mocs_and (retired in 1.0, now moc_and), the 1xN
+    # broadcast intersection of the AOI
     # cover against the footprint_cells column (espg/mortie#173, landed in
     # espg/mortie#174) — the piece 0.9.5 lacks — chained into
-    # mocs_to_orders, itself a 0.9.5 arrival
+    # mocs_to_orders (retired in 1.0, now moc_to_order), itself a 0.9.5 arrival
     # (espg/mortie#156). Together: two Rust crossings per
     # block of records where 0.9.5 forced a Python loop of scalar
     # moc_and/moc_to_order per granule. Earlier floors: 0.9.5
     # for the WKB batch cover behind the ``footprint_cells`` catalog
-    # column (issue #396): mortie.arrow.from_wkbs, the pyarrow skin
+    # column (issue #396): mortie.arrow.from_wkbs (retired in 1.0, now
+    # mortie.arrow.from_wkb), the pyarrow skin
     # (espg/mortie#163) over the backend-free Rust WKB reader
     # (espg/mortie#157), which covers a geoparquet geometry column in one
     # crossing and is what Catalog.index_footprints builds the column from.
     # 0.9.5 also deletes mortie/tools.py (espg/mortie#159's domain split); zagg
     # imports nothing from it since englacial/zagg#411. 0.9.4
     # for the batch coverage entry point — polygons_to_morton_mocs, the
-    # many->many ragged sibling of morton_coverage_moc (espg/mortie#153) that
+    # many->many ragged sibling of morton_coverage_moc (espg/mortie#153; that
+    # one-ring sibling was itself retired in 1.0) that
     # ShardMap.build calls once for a whole catalog instead of once per
     # granule; 0.9.3 for the reader deinterleave (issue #336) — rank_to_xy /
     # xy_to_rank, the nested-rank <-> face-local (x, y) pair the readers place cells by
