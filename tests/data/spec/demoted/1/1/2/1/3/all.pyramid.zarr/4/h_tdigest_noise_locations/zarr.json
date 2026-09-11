@@ -1,0 +1,56 @@
+{
+  "shape": [
+    1
+  ],
+  "data_type": "variable_length_bytes",
+  "chunk_grid": {
+    "name": "regular",
+    "configuration": {
+      "chunk_shape": [
+        1
+      ]
+    }
+  },
+  "chunk_key_encoding": {
+    "name": "default",
+    "configuration": {
+      "separator": "/"
+    }
+  },
+  "fill_value": "",
+  "codecs": [
+    {
+      "name": "vlen-bytes",
+      "configuration": {}
+    },
+    {
+      "name": "zstd",
+      "configuration": {
+        "level": 3,
+        "checksum": false
+      }
+    }
+  ],
+  "attributes": {
+    "ragged": {
+      "spec": "zagg-ragged/1",
+      "element": {
+        "dtype": "uint64",
+        "shape": [
+          -1
+        ]
+      }
+    },
+    "located": {
+      "spec": "zagg-located/1",
+      "shape": "per-centroid",
+      "grammar": "mortie-morton/1"
+    }
+  },
+  "dimension_names": [
+    "cells"
+  ],
+  "zarr_format": 3,
+  "node_type": "array",
+  "storage_transformers": []
+}
