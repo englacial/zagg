@@ -191,11 +191,21 @@ def _declared_nodes(leaves: list[str], k: int) -> list[str]:
     return sorted({d[: _base_len(d) + k] for d in leaves})
 
 
-def _probe_nodes(store_root, nodes, store_kwargs) -> dict:
-    """``{node: root-group attrs | None}`` — one small GET per declared node."""
+def _probe_nodes(store_root, nodes, store_kwargs) -> tuple[dict, dict]:
+    """``({node: attrs | None}, {node: error})`` — one small GET per node.
+
+    ``None`` means the object is genuinely ABSENT (not-found), which is the
+    pre-sweep baseline. Every other transport failure — expired or missing
+    credentials, a wrong region, a throttled/5xx burst — is an ERROR, kept in
+    the second map so it can never be reported as "declared but unmaterialized"
+    (review finding): a credential mistake and an unswept store are opposite
+    diagnoses and must not print the same sentence. An unparsable ``zarr.json``
+    keeps its parse error alongside the empty-attrs (partial) verdict.
+    """
     import concurrent.futures
 
     import obstore
+    from obstore.exceptions import NotFoundError
 
     from zagg.store import open_object_store
     from zagg.sweep import _node_rel
@@ -205,15 +215,21 @@ def _probe_nodes(store_root, nodes, store_kwargs) -> dict:
     def probe(node):
         try:
             raw = obstore.get(store, f"{_node_rel(node)}/all.zarr/zarr.json").bytes()
-        except Exception:
-            return node, None
+        except (FileNotFoundError, NotFoundError):
+            return node, None, None
+        except Exception as exc:
+            return node, None, f"{type(exc).__name__}: {exc}"
         try:
-            return node, dict(json.loads(bytes(raw)).get("attributes") or {})
-        except Exception:
-            return node, {}
+            return node, dict(json.loads(bytes(raw)).get("attributes") or {}), None
+        except Exception as exc:
+            return node, {}, f"unparsable zarr.json: {type(exc).__name__}: {exc}"
 
     with concurrent.futures.ThreadPoolExecutor(max_workers=8) as pool:
-        return dict(pool.map(probe, nodes))
+        results = list(pool.map(probe, nodes))
+    return (
+        {node: attrs for node, attrs, _ in results},
+        {node: err for node, _, err in results if err is not None},
+    )
 
 
 def _missing_mask(values: np.ndarray, fill_value) -> np.ndarray:
@@ -448,8 +464,10 @@ def validate_pyramid(
     per_order = {}
     missing: list = []
     partial: list = []
+    probe_errors: list = []
     for k, _t in ladder:
-        probed = _probe_nodes(store_root, declared[k], store_kwargs)
+        probed, errored = _probe_nodes(store_root, declared[k], store_kwargs)
+        probe_errors.extend(f"{n}: {e}" for n, e in sorted(errored.items()))
         probes[k] = {
             n: attrs if attrs is not None and attrs.get(ROLE_ATTR) == "overview" else None
             for n, attrs in probed.items()
@@ -467,10 +485,22 @@ def validate_pyramid(
     report["nodes"] = {str(k): v for k, v in per_order.items()}
     report["missing_nodes"] = missing[:50]
     report["partial_nodes"] = partial[:50]
+    report["probe_errors"] = probe_errors[:50]
     summary = ", ".join(
         f"o{k} {per_order[k]['materialized']}/{per_order[k]['declared']}" for k, _ in ladder
     )
     debris = f"; {len(partial)} partial uncommitted node object(s) {partial[:8]}" if partial else ""
+    # A probe that failed for any reason OTHER than not-found is not evidence
+    # about the sweep at all: it fails loudly and separately, so a credential
+    # or throttle problem can never print as the pre-sweep baseline.
+    if probe_errors:
+        checks["materialization"] = _entry(
+            "fail",
+            f"{len(probe_errors)} probe error(s) — node state is UNKNOWN, not a "
+            f"sweep verdict: {probe_errors[:3]}",
+        )
+        skip_rest("node probes failed", after="materialization")
+        return _finish(report)
     if total_found == 0:
         checks["materialization"] = _entry(
             "fail",
