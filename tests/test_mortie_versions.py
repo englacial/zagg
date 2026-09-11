@@ -35,6 +35,7 @@ words between ``mortie`` and the number, so reflowing a paragraph can move one
 in or out of scope.
 """
 
+import ast
 import re
 import tomllib
 from pathlib import Path
@@ -255,3 +256,123 @@ class TestGuardFires:
         assert ".toml" not in SCAN_SUFFIXES
         pyproject = REPO_ROOT / "pyproject.toml"
         assert not any(pyproject.is_relative_to(root) for root in SCAN_ROOTS)
+
+
+# --- Import-surface pin -------------------------------------------------------
+#
+# The version guard above compares *numbers*; this one compares *names*. Issue
+# #559's failure mode was a name vanishing from mortie and surfacing only when a
+# cold path happened to run, and the floor alone cannot catch that: a floor is
+# satisfied by any newer mortie, including one that has retired a name zagg
+# still spells. So resolve every mortie name the tree spells against the mortie
+# that is actually installed, statically, without running any of it.
+
+# Python trees scanned. ``bench/`` and ``notebooks/*.py`` matter most: nothing
+# in the suite executes them, so they are exactly where a retired name hides.
+IMPORT_SCAN_ROOTS = (
+    REPO_ROOT / "src",
+    REPO_ROOT / "bench",
+    REPO_ROOT / "tests",
+    REPO_ROOT / "notebooks",
+)
+
+# Notebook trees scanned, code cells only.
+NOTEBOOK_SCAN_ROOTS = (REPO_ROOT / "notebooks", REPO_ROOT / "demo")
+
+# Submodules ``hasattr(mortie, name)`` misses until something imports them.
+# Keeping this a list rather than an ``importlib`` attempt means a name that
+# stops being a submodule fails here instead of being silently re-imported.
+MORTIE_SUBMODULE_NAMES = frozenset({"arrow", "tests"})
+
+
+def _notebook_code(path):
+    """Source of a notebook's code cells, magics stripped so it parses."""
+    import json
+
+    cells = json.loads(path.read_text(encoding="utf-8")).get("cells", [])
+    out = []
+    for cell in cells:
+        if cell.get("cell_type") != "code":
+            continue
+        lines = [
+            "" if ln.lstrip().startswith(("%", "!")) else ln.rstrip("\n")
+            for ln in cell.get("source", [])
+        ]
+        out.append("\n".join(lines))
+    return "\n".join(out)
+
+
+def _mortie_names(source, path):
+    """Every ``(name, lineno)`` this source asks mortie to provide."""
+    found = []
+    for node in ast.walk(ast.parse(source, filename=str(path))):
+        if isinstance(node, ast.ImportFrom) and node.level == 0:
+            parts = (node.module or "").split(".")
+            if parts[0] != "mortie":
+                continue
+            if len(parts) > 1 and parts[1] not in MORTIE_SUBMODULE_NAMES:
+                found.append((parts[1], node.lineno, node.module))
+                continue
+            for alias in node.names:
+                found.append((alias.name, node.lineno, node.module))
+        elif isinstance(node, ast.Attribute) and isinstance(node.value, ast.Name):
+            if node.value.id == "mortie":
+                found.append((node.attr, node.lineno, "mortie"))
+    return found
+
+
+def _resolve(module_name, name):
+    """Is ``name`` reachable on ``module_name``, submodules included?"""
+    import importlib
+
+    module = importlib.import_module(module_name)
+    if hasattr(module, name):
+        return True
+    if module_name == "mortie" and name in MORTIE_SUBMODULE_NAMES:
+        importlib.import_module(f"mortie.{name}")
+        return True
+    return False
+
+
+class TestMortieImportSurface:
+    def test_every_mortie_name_the_tree_spells_resolves(self):
+        # The regression test #559 was missing. On the pre-migration tree this
+        # fails at all nine call sites; nothing else in the suite would.
+        missing = []
+        for root in IMPORT_SCAN_ROOTS:
+            for path in sorted(root.rglob("*.py")):
+                for name, lineno, module in _mortie_names(path.read_text(), path):
+                    if not _resolve(module, name):
+                        missing.append(f"{path.relative_to(REPO_ROOT)}:{lineno} {module}.{name}")
+        assert not missing, "names no installed mortie provides:\n  " + "\n  ".join(missing)
+
+    def test_every_mortie_name_the_notebooks_spell_resolves(self):
+        # Same guard over the reader notebooks, which no test imports and which
+        # a Binder build resolves against whatever mortie PyPI hands it -- the
+        # exact path issue #559 came in on.
+        missing = []
+        for root in NOTEBOOK_SCAN_ROOTS:
+            for path in sorted(root.rglob("*.ipynb")):
+                if ".ipynb_checkpoints" in path.parts:
+                    continue
+                for name, lineno, module in _mortie_names(_notebook_code(path), path):
+                    if not _resolve(module, name):
+                        missing.append(f"{path.relative_to(REPO_ROOT)}:{lineno} {module}.{name}")
+        assert not missing, "names no installed mortie provides:\n  " + "\n  ".join(missing)
+
+    def test_the_guard_would_notice_a_retired_name(self):
+        # A guard that silently found nothing would pass forever, so pin both
+        # halves: a spelling mortie does not have is reported, and the scan is
+        # actually reaching call sites (the tree spells more than a handful).
+        found = _mortie_names(
+            "import mortie\nfrom mortie import decimals_to_words\nmortie.mocs_and(x)\n",
+            REPO_ROOT / "<synthetic>",
+        )
+        assert [n for n, _, _ in found] == ["decimals_to_words", "mocs_and"]
+        assert not any(_resolve(m, n) for n, _, m in found)
+        seen = sum(
+            len(_mortie_names(p.read_text(), p))
+            for root in IMPORT_SCAN_ROOTS
+            for p in root.rglob("*.py")
+        )
+        assert seen > 20, f"the scan only reached {seen} mortie names -- has it stopped walking?"
