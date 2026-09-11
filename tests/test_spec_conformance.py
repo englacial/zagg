@@ -1037,9 +1037,13 @@ class TestMultiscalesCompanion:
 
     def test_no_companion_group_is_the_absence_pin(self):
         # §4.10: absence of the whole group is legal — every other fixture,
-        # /2 declarations included, carries none.
-        for name in ("minimal", "column", "pyramid", "kitchen_sink", "flux", "raster_toc"):
-            assert not (SPEC_DATA / name / "multiscales").exists()
+        # /2 declarations included, carries none. Derived from the fixture
+        # directory rather than listed, so a fixture added later is pinned
+        # the day it lands (a hardcoded tuple silently exempts it).
+        others = sorted(p for p in SPEC_DATA.iterdir() if p.is_dir() and p.name != MULTISCALES)
+        assert len(others) > 1  # the sweep found fixtures, not an empty tree
+        for fixture in others:
+            assert not (fixture / MULTISCALES).exists()
 
 
 #: The §4.6 leaf-column fixture (issue #383): the ``minimal`` inputs plus an
