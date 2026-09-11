@@ -152,6 +152,43 @@ class TestRoundTrip:
         assert cell_ids.shape == children.shape
 
 
+class TestNDPassthrough:
+    """``assign``/``shards_of`` are elementwise on BOTH real backends: N-D in,
+    same shape out, same values as the raveled 1-D path. The a-priori planner
+    depends on it -- ``_chunk_shard_mask`` feeds a 2-D ``(n_chunks, samples)``
+    lat/lon pair straight through and reduces with ``.any(axis=1)`` (issue
+    #543), so a backend that raveled would mis-plan."""
+
+    LATS_2D = np.array([[-78.5, -78.0, -77.5], [12.0, 12.5, 13.0]])
+    LONS_2D = np.array([[-132.0, -131.0, -130.0], [45.0, 45.5, 46.0]])
+
+    def test_healpix_preserves_shape_and_values(self, cfg):
+        g = HealpixGrid(parent_order=6, child_order=12, config=cfg)
+        leaf = np.asarray(g.assign(self.LATS_2D, self.LONS_2D))
+        shards = np.asarray(g.shards_of(leaf))
+        assert leaf.shape == shards.shape == self.LATS_2D.shape
+        flat = np.asarray(g.assign(self.LATS_2D.ravel(), self.LONS_2D.ravel()))
+        np.testing.assert_array_equal(leaf.ravel(), flat)
+        np.testing.assert_array_equal(shards.ravel(), np.asarray(g.shards_of(flat)))
+
+    def test_rectilinear_preserves_shape_and_values(self, cfg):
+        from zagg.grids import RectilinearGrid
+
+        # Row 0 lands inside the polar grid; row 1 is northern, so it is OOB --
+        # the sentinel must keep its 2-D place, not collapse the result.
+        g = RectilinearGrid(
+            "EPSG:3031", 100000.0, (-4e5, -4e5, 4e5, 4e5), chunk_shape=(4, 4), config=cfg
+        )
+        lats = np.array([[-88.0, -87.5, -87.0], [12.0, 12.5, 13.0]])
+        leaf = g.assign(lats, self.LONS_2D)
+        shards = g.shards_of(leaf)
+        assert leaf.shape == shards.shape == lats.shape
+        assert (leaf[1] == -1).all() and (shards[1] == -1).all()
+        flat = g.assign(lats.ravel(), self.LONS_2D.ravel())
+        np.testing.assert_array_equal(leaf.ravel(), flat)
+        np.testing.assert_array_equal(shards.ravel(), g.shards_of(flat))
+
+
 class TestReferenceOrder:
     """Regression: the HEALPix assign reference order must reach mortie 0.8.1's
     max (29), not the old hardcoded 18 -- otherwise a fine ``child_order`` is

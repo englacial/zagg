@@ -644,7 +644,14 @@ class OutputGrid(Protocol):
         ...
 
     def assign(self, lats: np.ndarray, lons: np.ndarray) -> np.ndarray:
-        """Map (lat, lon) points to leaf ids."""
+        """Map (lat, lon) points to leaf ids.
+
+        Elementwise: N-D input returns the input shape. The a-priori chunk
+        planner feeds a 2-D ``(n_chunks, samples_per_chunk)`` lat/lon pair
+        straight through ``assign`` -> :meth:`shards_of` and reduces with
+        ``.any(axis=1)`` (``processing.apriori._chunk_shard_mask``, issue
+        #543), so a backend that ravels would mis-plan silently.
+        """
         ...
 
     def cells_of(self, leaf_ids: np.ndarray) -> np.ndarray:
@@ -663,7 +670,10 @@ class OutputGrid(Protocol):
         ...
 
     def shards_of(self, leaf_ids: np.ndarray) -> np.ndarray:
-        """Vectorized: shard key for each leaf id."""
+        """Vectorized: shard key for each leaf id.
+
+        Elementwise, like :meth:`assign`: N-D input returns the input shape.
+        """
         ...
 
     def shard_of(self, leaf_ids: np.ndarray) -> ShardKey:
