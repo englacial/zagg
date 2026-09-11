@@ -985,7 +985,7 @@ def _aggregate_chunk_cells(
     )
 
     # Batch the per-centroid companion folds across the loop (issue #476): each
-    # ``build_tdigest`` inside defers its ``tocs_reduce``/``common_ancestor``
+    # ``build_tdigest`` inside defers its ``toc_reduce``/``common_ancestor``
     # partition and the context exit runs ONE fold per channel over the whole
     # chunk, filling the collected vectors in place — byte-identically, before
     # anything reads them (the ragged writer runs after this returns). Armed only
