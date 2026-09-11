@@ -61,8 +61,12 @@ def multiscales_block(pyramid: dict, *, shard_order: int, cell_order: int, name=
       ``artifact`` the kind that carries the level (:data:`ARTIFACT_COLUMN`
       at the shard order, :data:`ARTIFACT_OVERVIEW` above it);
     - ``order2res`` — the flat per-order lookup ``{str(order): cells}``
-      (JSON has no int keys), the one-key answer to "what can I read at
-      order k"; keys are exactly the orders present;
+      (JSON has no int keys): the cell resolutions of the **pyramid
+      levels** at order k, keys exactly the orders present. It does NOT
+      carry the base's native ``cells``, which ride in ``base`` alone and
+      share the shard order's key — the resolutions readable at order k are
+      ``order2res[str(k)]`` UNIONed with ``base["cells"]`` when
+      ``k == base["order"]``, never the base overwriting the entry;
     - ``base`` — the native source data (``{order, cells: [cell_order]}``):
       part of the resolution ladder a reader picks from, never a pyramid
       level (it IS the data, §4.5), so it is not a dataset entry;

@@ -911,7 +911,12 @@ class TestMultiscalesMirror:
         exp = _expected(PYRAMID)
         (entry,) = self._mirror()
         assert entry["base"] == {"order": exp["shard_order"], "cells": [exp["cell_order"]]}
-        assert all(d["cells"] != [exp["cell_order"]] for d in entry["datasets"])
+        # membership, not whole-list inequality: the native resolution is not
+        # a MEMBER of any level entry's cells — least of all the leaf entry's,
+        # which shares the base's order key in order2res (§4.9's union rule).
+        for d in entry["datasets"]:
+            assert exp["cell_order"] not in d["cells"]
+        assert exp["cell_order"] not in entry["order2res"][str(exp["shard_order"])]
 
     def test_fields_and_fold_project_the_family_dict(self):
         # §4.9: {name: class} projected from the §4.5 D24 map; declared fold
