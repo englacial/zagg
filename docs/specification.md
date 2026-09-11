@@ -29,11 +29,19 @@ latitude convention** — zagg passes no `latitude=` override anywhere
 (geodetic latitude converted to authalic before the spherical HEALPix
 mapping, mortie spec §9) from mortie 0.9.8 on
 ([espg/mortie#186](https://github.com/espg/mortie/issues/186), on PyPI
-2026-08-16); earlier mortie encoded `geodetic-spherical`. zagg ≥ 0.45.0
-floors mortie at ≥ 0.9.8 (issue
-[#438](https://github.com/englacial/zagg/issues/438)), so every store
-written by zagg 0.45.0 or later — including the published o9 stores, written
-by zagg 0.52.0 — is **authalic-wgs84**. The two conventions are
+2026-08-16); earlier mortie encoded `geodetic-spherical`. The convention a
+store carries is therefore mortie's default *at write time*, not a property
+zagg declares: zagg ≥ 0.45.0 floors mortie at ≥ 0.9.8 (issue
+[#438](https://github.com/englacial/zagg/issues/438)), so any environment
+that resolved those declared dependencies encodes authalic — but on the
+fleet mortie comes from the separately built Lambda layer, not from the
+function zip, so a worker whose layer predates the bump would write
+`geodetic-spherical`, and nothing in the store records which. The
+**published o9 stores are authalic-wgs84** on stronger, artifact-level
+evidence: they were written by zagg 0.52.0, whose temporal encode path runs
+`from mortie import TOC_MAX_NS` (a name mortie exports only from 0.9.10
+on), so a worker on a stale layer raises there instead of writing. The two
+conventions are
 non-corresponding partitions of the sphere (mortie spec §9): the offset
 peaks near 45° latitude at 0.12830° (~14.26 km), so a cover or store built
 under one convention does not describe cells under the other, and composing
