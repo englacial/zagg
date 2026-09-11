@@ -1,0 +1,60 @@
+{
+  "attributes": {
+    "role": "overview",
+    "zagg_overview": {
+      "spec": "zagg-overview/1",
+      "node": "112",
+      "order": 2,
+      "cell_order": 4,
+      "source_shard_order": 4,
+      "source_cell_order": 6,
+      "window": "all",
+      "fields": {
+        "count": {
+          "class": "exact",
+          "method": "sum",
+          "nan_policy": "skip"
+        },
+        "h_tdigest_noise": {
+          "class": "approximate",
+          "method": "tdigest_kway"
+        },
+        "composition": {
+          "class": "packed",
+          "method": "composition_kway"
+        }
+      },
+      "fold_source": "cascade",
+      "fold_from_order": 3,
+      "source_children": {
+        "folded": 1,
+        "missing": 0,
+        "unreadable": 0
+      },
+      "demotions": [
+        {
+          "field": "composition",
+          "class": "packed",
+          "reason": "divisor-missing",
+          "contributors": 1,
+          "of": "h_tdigest_signal"
+        }
+      ],
+      "generation": {
+        "n_leaves": 1,
+        "max_leaf_timestamp": "2026-09-11T01:05:43+00:00"
+      },
+      "content_hash": "f0f9c89eba2a6277f832450bb5753596aa2ea9d092d42cbf77c5c60ae6728330",
+      "generated_at": "2026-09-11T01:05:43+00:00"
+    },
+    "morton_hive_commit": {
+      "spec": "morton-hive/1",
+      "complete": true,
+      "cells_with_data": 1,
+      "granule_count": 1,
+      "written_at": "2026-09-11T01:05:43+00:00"
+    }
+  },
+  "zarr_format": 3,
+  "node_type": "group"
+}

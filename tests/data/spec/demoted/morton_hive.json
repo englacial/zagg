@@ -1,0 +1,73 @@
+{
+ "spec": "morton-hive/1",
+ "dataset": {
+  "short_name": "SPEC_FIXTURE",
+  "version": "1"
+ },
+ "semantic_hash": "12756f7a17b97861d7216325ccaf827d51e09dc00f89ae0a1e46e36b6de380d1",
+ "cell_order": 6,
+ "shard_order": 4,
+ "split_schedule": [
+  1,
+  1,
+  1,
+  1
+ ],
+ "path_grouping": 1,
+ "pyramid": {
+  "spec": "zagg-pyramid/1",
+  "overview": {
+   "spacing": 1,
+   "orders": [
+    3,
+    2
+   ],
+   "all_time": false,
+   "fold_source": "cascade",
+   "exact_levels": 1,
+   "fields": {
+    "count": {
+     "class": "exact",
+     "method": "sum",
+     "nan_policy": "skip",
+     "dtype": "int32",
+     "fill_value": 0
+    },
+    "h_tdigest_signal": {
+     "class": "none"
+    },
+    "h_tdigest_noise": {
+     "class": "approximate",
+     "method": "tdigest_kway",
+     "dtype": "float32",
+     "inner_shape": [
+      2
+     ],
+     "delta": 16,
+     "overview_delta": 16,
+     "location": "leaf_id"
+    },
+    "composition": {
+     "class": "packed",
+     "method": "composition_kway",
+     "dtype": "uint64",
+     "fill_value": 0,
+     "of": "h_tdigest_signal",
+     "threshold": 2
+    }
+   },
+   "materialized": {
+    "orders": [
+     2,
+     3
+    ],
+    "fold_sources": {
+     "3": "leaves",
+     "2": "cascade"
+    },
+    "generated_at": "2026-09-11T01:05:43+00:00"
+   }
+  }
+ },
+ "generated_at": "2026-09-11T01:05:43+00:00"
+}

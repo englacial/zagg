@@ -1,0 +1,28 @@
+{
+  "attributes": {
+    "morton_hive_commit": {
+      "spec": "morton-hive/1",
+      "complete": true,
+      "cells_with_data": 4,
+      "granule_count": 1,
+      "written_at": "2026-09-11T01:05:43+00:00",
+      "coverage": {
+        "spec": "morton-moc/1",
+        "box": [
+          "112131",
+          "1121322",
+          "1121344",
+          null
+        ],
+        "cell_order": 6,
+        "source": "worker",
+        "encoding": "bitmap",
+        "sidecar": "coverage.moc",
+        "nbytes": 11,
+        "raw_nbytes": 2
+      }
+    }
+  },
+  "zarr_format": 3,
+  "node_type": "group"
+}
