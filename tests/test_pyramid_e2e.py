@@ -281,6 +281,35 @@ class TestFoldRegimes:
         assert "declined" in format_report(report)
 
 
+class TestDeclaredButUnvalidated:
+    """Nothing declared composable leaves the report without a trace."""
+
+    def test_wide_inner_shape_is_named_not_dropped(self, tmp_path):
+        # A non-(k,2) approximate field is outside this harness's digest
+        # re-fold: "N check(s), all consistent" must not stand for it.
+        manifest = _build_store(tmp_path)
+        _sweep(tmp_path, manifest)
+        manifest["pyramid"]["overview"]["fields"]["h_noise"]["inner_shape"] = [3]
+        obstore.put(open_object_store(str(tmp_path)), MANIFEST_NAME, json.dumps(manifest).encode())
+        report = validate_pyramid(str(tmp_path), full=True)
+        assert report["unchecked_fields"] == {"h_noise": [3]}
+        assert "NOT validated" in report["checks"]["digests"]["detail"]
+        assert any("h_noise" in w for w in report["warnings"])
+
+    def test_declared_companion_sibling_must_be_present(self, tmp_path):
+        # Issue #410: a located/temporal field's sibling slab is written by
+        # both fold paths, so an overview that lost one is not a valid
+        # overview — a channel that vanished used to pass this gate cleanly.
+        manifest = _build_store(tmp_path)
+        _sweep(tmp_path, manifest)
+        manifest["pyramid"]["overview"]["fields"]["h_sig"]["location"] = "morton"
+        obstore.put(open_object_store(str(tmp_path)), MANIFEST_NAME, json.dumps(manifest).encode())
+        report = validate_pyramid(str(tmp_path), full=True)
+        entry = report["checks"]["readback"]
+        assert entry["status"] == "fail"
+        assert "h_sig_locations" in entry["detail"]
+
+
 class TestContributorDefects:
     """Contributor-side defects the SWEEP treats as ordinary never raise."""
 
