@@ -579,6 +579,11 @@ def _actuals_errors(entries, s, harness, errors, counted, probes, declared) -> N
     fully materialized, i.e. a sweep clearly ran but its finisher's record
     did not land. A PRESENT block must record the leaf-column law at the
     leaf entry and the derived stage regime at 1/2 merges-from-raw above it.
+
+    §4.5 calls ``actuals`` an additive key a reader must TOLERATE, and this
+    module's contract is a verdict on a malformed store, never a traceback
+    (review finding): a block that is not a mapping, or whose counters do
+    not read as integers, is a read-back error by name.
     """
     from zagg.sweep_stage import STAGE_GATHER, STAGE_MERGE, classify_level
 
@@ -596,11 +601,17 @@ def _actuals_errors(entries, s, harness, errors, counted, probes, declared) -> N
                 )
             continue
         counted["readback"] += 1
+        if not isinstance(a, dict):
+            errors["readback"].append(
+                f"manifest actuals for node {node}: a {type(a).__name__}, not the §4.5 "
+                f"mapping — the finisher's record cannot be validated"
+            )
+            continue
         if node == s:
-            if a.get("regime") != "leaf-column" or int(a.get("merges_from_raw", 0)) != 1:
+            if a.get("regime") != "leaf-column" or _as_int(a.get("merges_from_raw")) != 1:
                 errors["readback"].append(
                     f"manifest actuals for the leaf entry (node {node}): "
-                    f"({a.get('regime')!r}, {a.get('merges_from_raw')}) != ('leaf-column', 1)"
+                    f"({a.get('regime')!r}, {a.get('merges_from_raw')!r}) != ('leaf-column', 1)"
                 )
             continue
         r = int(e["cells"][0])
@@ -610,10 +621,10 @@ def _actuals_errors(entries, s, harness, errors, counted, probes, declared) -> N
             errors["readback"].append(
                 f"manifest actuals for node {node}: unknown regime {a.get('regime')!r}"
             )
-        elif a.get("regime") != expected or int(a.get("merges_from_raw", 0)) != mfr:
+        elif a.get("regime") != expected or _as_int(a.get("merges_from_raw")) != mfr:
             errors["readback"].append(
                 f"manifest actuals for node {node}: ({a.get('regime')!r}, "
-                f"{a.get('merges_from_raw')}) != derived ({expected!r}, {mfr}) (§4.5)"
+                f"{a.get('merges_from_raw')!r}) != derived ({expected!r}, {mfr}) (§4.5)"
             )
 
 
