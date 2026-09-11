@@ -1298,7 +1298,9 @@ class TestBatchedCompanionFolds:
         plain = [build_tdigest(v, delta=d, locations=lo, temporal=t) for v, lo, t, d in cells]
         crossings = []
         orig = mortie.toc_reduce
-        monkeypatch.setattr(mortie, "toc_reduce", lambda *a, **k: crossings.append(1) or orig(*a, **k))
+        monkeypatch.setattr(
+            mortie, "toc_reduce", lambda *a, **k: crossings.append(1) or orig(*a, **k)
+        )
         monkeypatch.setattr(td_mod, "_BATCH_ROW_CAP", 40)
         with batched_companion_folds():
             batched = [build_tdigest(v, delta=d, locations=lo, temporal=t) for v, lo, t, d in cells]
