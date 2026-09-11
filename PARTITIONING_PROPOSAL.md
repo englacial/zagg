@@ -5,9 +5,11 @@ RULED dense every-order ladder (`[8..0]` above the o9 shard) on the two live
 stores — `atl03_tdigest_o9.zarr` and `gedi_flux_o9.zarr` — on **Lambda**, via
 the PR #525 stage transport (ruled load-bearing, not fallback), after the
 PR #524 column backfill and the `tools/redeclare_dense_ladder.py`
-re-declaration. All numbers below come from the 2026-09-10 anonymous
-live-store audit; nothing is guessed (that is what killed the 08-25 attempt —
-see the forensics section).
+re-declaration. The topology numbers below come from the 2026-09-10 anonymous
+live-store audit, and the per-node geometry from `expand_overviews`; the one
+unmeasured quantity — bytes per overview node — is labelled as such wherever
+it is used, because assuming instead of deriving is what killed the 08-25
+attempt (see the forensics section).
 
 Version gate, restated because it is silent when violated: the stores were
 written by **zagg 0.52.0** (`composition` classifies `packed`); every leg —
@@ -25,11 +27,28 @@ ATL03: 2,918 committed leaves; above-shard node counts
 |---|---|---|---|---|---|---|---|---|---|
 | nodes | 844 | 272 | 110 | 58 | 36 | 22 | 9 | 6 | 3 |
 
-Total 1,360 dense overview nodes (~31k objects, ~136 GB written; each node is
-constant-depth, same shape class as a leaf, ~100 MB). GEDI: 2,927 leaves,
-~1,353 nodes, same shape. The runbook derives GEDI's per-order counts the same
-way at dispatch time — from the run-record work set / coverage MOC expansion —
-never from this table.
+Total 1,360 dense overview nodes (~31k objects). GEDI: 2,927 leaves, ~1,353
+nodes. The runbook derives GEDI's per-order counts the same way at dispatch
+time — from the run-record work set / coverage MOC expansion — never from this
+table.
+
+**Per-node size is the one quantity below that is not measured** — neither
+store has a materialized overview node yet — so it is labelled everywhere it
+is used. What *is* derived: `expand_overviews` sets `d = base − shard_order`
+(`src/zagg/pyramid.py`, the fixed every-order ladder), so with
+`--overviews 13` on the o9 ATL03 store `d = 4` and **every above-shard node
+holds `4^d` = 256 cells**, constant depth — not a leaf's `4^(19−9)` ≈ 1.05M
+native cells. GEDI's `--overviews 12` gives `d = 3`, i.e. 64 cells per node.
+
+A node's bytes are dominated by its two digest fields (count and the
+composition word are a few bytes per cell), and those have a hard ceiling: the
+δ=4096 centroid cap at 8 B per centroid (`inner_shape [2]`, float32). So
+**≤16 MiB per saturated ATL03 node** (256 × 2 × 4096 × 8 B), i.e. **≤ ~23 GB
+per store** across 1,360 nodes. That is arithmetic, not a measurement — real
+nodes at the finer orders fold well under δ centroids. The espg-side audit's
+**~136 GB** (1,360 × ~100 MB/node) is a *conservative upper bound*, carried
+below as such; the first materialized node replaces both numbers with an
+observation.
 
 ## The schedule: three tuples plus the finisher
 
@@ -73,16 +92,22 @@ schedule at all.
 
 Assumptions: 4 GB workers (the benchmark-envelope shape; $ anchors below are
 memory-independent since Lambda bills GB-s), leaf columns are the few-MB
-`all.pyramid.zarr` per-shard artifacts (orders 9–13 fields), overview nodes
-~100 MB each, S3 sustained ~50–100 MB/s per worker.
+`all.pyramid.zarr` per-shard artifacts (orders 9–13 fields), S3 sustained
+~50–100 MB/s per worker. Per-node write bytes are bracketed by the two figures
+from the topology section — the δ=4096 ceiling (≤16 MiB/node) and the audit's
+conservative ~100 MB/node — and every write line below states which it uses.
 
 - **T1** (the binding batch): worst node = 64 leaf columns. Read ≤64 ×
-  ~2–10 MB ≈ 0.1–0.6 GB; fold (k-way digest merge + packed composition over
-  ~1M-cell slabs × 21 nodes worst case); write ≤21 nodes × ~100 MB ≈ 2.1 GB.
-  Estimate **90–350 s worst-case, ~60–150 s typical** — ≥2.5× headroom.
-  All 110 invokes fire concurrently; the tuple completes in one worker-wall.
-- **T2 / T3**: reads are stage columns (small), writes ≤ a few hundred MB.
-  **≤120 s / ≤60 s.**
+  ~2–10 MB ≈ 0.1–0.6 GB; fold (k-way digest merge + packed composition) over
+  21 nodes × 256-cell slabs ≈ 5.4k cells worst case; write ≤21 nodes — that is
+  **≤0.35 GB at the ceiling, ≤2.1 GB at the audit bound**. Estimate
+  **90–350 s worst-case, ~60–150 s typical**: the read leg binds at the
+  ceiling, the write leg at the audit bound, and the range spans both —
+  ≥2.5× headroom against the 900 s wall either way. All 110 invokes fire
+  concurrently; the tuple completes in one worker-wall.
+- **T2 / T3**: reads are stage columns (small); writes are the same ≤21-node
+  share (avg 5.3 nodes per T2 worker) on the same two brackets — ≤0.35 GB /
+  ≤2.1 GB worst case, well under either at the average. **≤120 s / ≤60 s.**
 - **Finisher**: record merge + root singletons, **≤60 s**.
 - Barriers: dispatcher soft-barrier per tuple (bounded 2,700 s each, 7,200 s
   total budget — comfortable for 3 tuples whose workers finish in minutes).
@@ -97,15 +122,18 @@ inside the 900 s wall; concurrency only moves wall-clock, not cost.
 ## Cost estimate (anchored on observed prior sweeps)
 
 Anchors: prior full-store sweeps — the same read-every-leaf-once shape as the
-backfill — cost **$27.48 (ATL03)** and **$60.73 (GEDI)**; audit volumes are
-~300 GB leaf reads and ~136 GB overview writes per store.
+backfill — cost **$27.48 (ATL03)** and **$60.73 (GEDI)**. These are
+measurements; the table's compute rows scale from them. Audited read volume is
+~300 GB of leaf reads per store; overview write volume is the bracket above
+(≤~23 GB at the δ=4096 ceiling, ≤~136 GB at the audit bound).
 
 | leg | ATL03 | GEDI | basis |
 |---|---|---|---|
 | column backfill | ~$25–30 | ~$55–65 | the prior-sweep anchor is exactly this workload (every leaf read once, digests recomputed); ATL03 skips 204 current columns (−7%) |
-| ladder sweep | ~$2–5 | ~$2–5 | ~136 invokes, T1-dominated: 110 × ~150–350 s × 4 GB ≈ $1–2.5 compute; 136 GB PUT + ~31k requests ≈ negligible; margin ×2 |
+| ladder sweep | ~$2–5 | ~$2–5 | ~136 invokes, T1-dominated: 110 × ~150–350 s × 4 GB ≈ $1–2.5 compute; ~31k PUTs ≈ negligible, and insensitive to the write bracket (S3 PUT bills per request, not per byte); margin ×2 |
 | re-declaration | ~$0 | ~$0 | one manifest RMW each |
-| **total** | **~$30–35** | **~$60–70** | **campaign ≈ $90–105** |
+| **one-time total** | **~$30–35** | **~$60–70** | **campaign ≈ $90–105** |
+| *storage (recurring)* | *~$0.5–3/mo* | *~$0.5–3/mo* | the campaign's only ongoing cost: ~23–136 GB of **new** overview objects per store at ~$0.023/GB-month (S3 Standard, us-west-2). The bracket collapses once one node is measured |
 
 ## Why 2026-08-25 failed, and why this schedule cannot fail the same way
 
