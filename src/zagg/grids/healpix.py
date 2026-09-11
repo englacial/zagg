@@ -196,8 +196,8 @@ class HealpixGrid:
         # sub-chunk's block index is its own nested-cell id (fullsphere only).
         sub_chunks = generate_morton_children(int(shard_key), self.chunk_order)
         for sub in np.asarray(sub_chunks):
-            healpix, _ = mort2healpix(np.asarray([int(sub)]))
-            block = (int(healpix[0]),)
+            healpix, _ = mort2healpix(int(sub))  # scalar in → scalar out (mortie ≥1.0)
+            block = (healpix,)
             children = generate_morton_children(int(sub), self.child_order)
             yield (block, children)
 
@@ -420,8 +420,8 @@ class HealpixGrid:
         """
         from mortie import mort2healpix
 
-        healpix, _ = mort2healpix(np.asarray([int(shard_key)]))
-        return (int(healpix[0]),)
+        healpix, _ = mort2healpix(int(shard_key))  # scalar in → scalar out (mortie ≥1.0)
+        return (healpix,)
 
     def shard_label(self, shard_key) -> str:
         """Decimal morton string for this shard's packed word (issue #199).
