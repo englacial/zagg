@@ -305,6 +305,17 @@ class TestV2Provenance:
         assert entry["status"] == "fail"
         assert any("merges_from_raw 3" in m for m in entry["mismatches"])
 
+    def test_absent_merges_from_raw_is_caught(self, tmp_path):
+        # §4.4 makes the key normative on a /2 stage artifact, alongside
+        # regime and source_children: an absent key is the one way to make no
+        # claim at all, and it used to pass while both siblings were required.
+        _build_store(tmp_path)
+        self._edit_node_attrs(tmp_path, "-3", lambda a: a["zagg_overview"].pop("merges_from_raw"))
+        report = validate_pyramid(str(tmp_path), full=True)
+        entry = report["checks"]["readback"]
+        assert entry["status"] == "fail"
+        assert any("merges_from_raw None != 2" in m for m in entry["mismatches"]), entry
+
     def test_missing_source_children_is_caught(self, tmp_path):
         _build_store(tmp_path)
         self._edit_node_attrs(tmp_path, "-3", lambda a: a["zagg_overview"].pop("source_children"))
