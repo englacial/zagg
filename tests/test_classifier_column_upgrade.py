@@ -18,7 +18,8 @@ three #548 claims against it, on fixture stores:
    runbook re-declares BEFORE backfilling (the vendored live CA manifest
    yields a count-only plan that would downgrade a 4-field column);
 3. **the field list is derived from the classifiers at run time** —
-   ``declare_pyramid`` replaces a 0.48-era all-``none`` map wholesale
+   ``declare_pyramid`` replaces a 0.48-era count-only field map (the
+   digests demoted to ``none``, as the live manifest has them) wholesale
    (``build_pyramid_block`` -> ``declared_fields`` -> the D24 classifiers),
    so the re-declaration inherits the upgrade with no frozen field list;
 
@@ -167,7 +168,11 @@ class TestCountOnlyUpgradeInPlace:
         Both stores build pyramid-ON from identical inputs (the leaf arrays
         are classifier-independent); ``era`` is then demoted to what an
         08-19 build left behind — every column rewritten count-only, and the
-        manifest's field map re-declared with the digests ``none``.
+        manifest's field map re-declared count-only (the digests demoted to
+        ``none``, ``count`` still ``exact``), which is the live CA
+        manifest's shape. NOT an all-``none`` map: that one is REFUSED by
+        ``manifest_column_plan`` (``test_column_backfill.py::
+        test_all_none_class_fields_refuse``) and never reaches a backfill.
         """
         era, on = tmp_path / "era", tmp_path / "on"
         cfg, _grid = tcb._build_store(era, monkeypatch, kitchen_sink=True)
@@ -196,7 +201,7 @@ class TestCountOnlyUpgradeInPlace:
     def test_redeclaration_derives_the_field_map_from_current_classifiers(
         self, tmp_path, monkeypatch
     ):
-        """#548 (3): the all-``none`` map is replaced at run time, not inherited."""
+        """#548 (3): the count-only map is replaced at run time, not inherited."""
         from zagg.hive import read_manifest
 
         era, _on, cfg = self._era_048_store(tmp_path, monkeypatch)
