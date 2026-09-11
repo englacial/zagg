@@ -103,12 +103,12 @@ class TestStageArtifactDemotions:
 
         return _ColumnReader(path, run_id="A", run_started=_utcnow(), store_kwargs={})
 
-    def _fold_and_write(self, root, paths):
-        """A (node 1, cells 2) stage merge over the two columns, written."""
-        from zagg.sweep_stage import _stage_fold, _write_stage_overview
+    def _fold(self, paths):
+        """A (node 1, cells 2) stage merge over the two columns."""
+        from zagg.sweep_stage import _stage_fold
 
         readers = {"1111": [self._reader(paths[0])], "1112": [self._reader(paths[1])]}
-        fold = _stage_fold(
+        return _stage_fold(
             "11",
             1,
             2,
@@ -118,6 +118,12 @@ class TestStageArtifactDemotions:
             child_order=NODE_ORDER,
             all_time=False,
         )
+
+    def _fold_and_write(self, root, paths):
+        """The same merge, written to its artifact."""
+        from zagg.sweep_stage import _write_stage_overview
+
+        fold = self._fold(paths)
         assert fold is not None and fold["regime"] == "stage-merge"
         _write_stage_overview(
             str(root),
@@ -199,6 +205,27 @@ class TestStageArtifactDemotions:
                 "of": "h_sig",
             }
         ]
+
+    def test_every_contributor_firing_drops_the_level(self, tmp_path):
+        """Pinned, not fixed: the `/2` level vanishes instead of recording.
+
+        The rail's ``broken`` marking is a WHOLE-contributor verdict, so the
+        mis-declared-divisor shape — which fires on every contributor —
+        leaves ``folded == 0`` and ``_stage_fold`` returns ``None``: no
+        artifact, no ``demotions``, and the fields that folded cleanly are
+        dropped too. That is committed ``source_children`` semantics
+        predating issue #518, disclosed in spec §4.3 and standing for review
+        rather than changed here. The `/1` paths do not share it —
+        ``_fold_node`` returns ``None`` only on ``n_leaves == 0``
+        (``TestV1SweepArtifactDemotions`` above).
+        """
+        import shutil
+
+        paths = self._columns(tmp_path)
+        for path in paths:
+            shutil.rmtree(f"{path}/{NODE_ORDER}/h_sig")
+        assert self._fold(paths) is None
+        assert not (tmp_path / "1" / "1" / "all.zarr").exists()
 
 
 def _v1_manifest(root, fields):
