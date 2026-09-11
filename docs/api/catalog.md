@@ -92,7 +92,7 @@ today; antimeridian-split STAC footprints are the natural producer.
 ### What indexing buys, after #445
 
 An **unindexed** mortie `swath` build on a HEALPix grid now covers the geometry
-column itself — the same `from_wkbs` cover, at the grid's `parent_order`, thrown
+column itself — the same `from_wkb` cover, at the grid's `parent_order`, thrown
 away when the build ends — and runs the same intersection
 ([issue #445](https://github.com/englacial/zagg/issues/445)). The column no
 longer buys a *different* code path; it buys **skipping the cover**, which is

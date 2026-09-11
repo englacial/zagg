@@ -19,7 +19,7 @@ Geometry backends (all sphere-correct):
   query per shard) when the spatial-index build of spherely is present, else
   falls back to elementwise ``spherely.intersects`` -- a brute
   O(granules x shards) path that is still sphere-correct (no fork needed).
-- ``mortie``   -- HEALPix MOC intersection (``morton_coverage_moc``); a tiny
+- ``mortie``   -- HEALPix MOC intersection (``polygons_to_morton_mocs``); a tiny
   ~0.01% polar omission vs S2 (espg/mortie#32), no extra deps.
 
 shapely is no longer an intersection backend -- its WGS84 STRtree path had
@@ -41,7 +41,7 @@ from typing import Dict, List
 import numpy as np
 
 # Upper bound on the MOC order mortie's ``morton_coverage`` /
-# ``morton_coverage_moc`` accept; a higher order raises inside mortie. The
+# ``polygons_to_morton_mocs`` accept; a higher order raises inside mortie. The
 # derived order is clamped to this so an exotic ``chunk_order`` can't push the MOC
 # order past the cap and silently lose coverage (#92).
 MORTIE_MOC_ORDER_CAP = 18
@@ -82,7 +82,7 @@ MORTIE_MOC_ORDER_CAP = 18
 # the order moved it to 57.37 s against 64's 56.55 s -- drift, not a knee.
 _MOC_BATCH_RINGS = 32
 
-# Records per ``mocs_and``/``mocs_to_orders`` call on the stored-index path
+# Records per ``moc_and``/``moc_to_order`` call on the stored-index path
 # (``_intersect_footprint_cells``, mortie 0.9.6's batch twins, espg/mortie#173).
 # Same shape of argument as ``_MOC_BATCH_RINGS`` above: the whole-catalog single
 # call holds *three* catalog-proportional arrays live at once -- the int64
@@ -116,11 +116,11 @@ _MOC_BATCH_RINGS = 32
 # not assumed, negligible: 104 us/call at the 2,721-cell California operand,
 # ~113 ms across the clone's 1,086 blocks, ~4% of wall.
 #
-# The ``mocs_intersect`` prefilter (the later phase) reuses this constant for
+# The ``moc_intersects`` prefilter (the later phase) reuses this constant for
 # both of its passes, and the blocking survives the prefilter for measured
 # reasons on each:
 # - the *predicate* pass walks every row, so what it hands mortie is
-#   catalog-proportional exactly like the unblocked ``mocs_and`` was. The
+#   catalog-proportional exactly like the unblocked ``moc_and`` was. The
 #   mechanism is the binding's documented input copy; the figures below are
 #   RSS over plateau -- that copy plus whatever the allocator keeps -- so
 #   they are observations of the peak, not measurements of the copy. On the
@@ -549,7 +549,7 @@ def _batch_ring_mocs(lats, lons, offsets, start, stop, order) -> tuple:
     ``polygons_to_morton_mocs`` (mortie >= 0.9.4, espg/mortie#153) covers the
     whole block in one crossing of the Python/Rust boundary with the GIL
     released and rayon spread across polygons, replacing one
-    ``morton_coverage_moc`` call per granule. The offsets slice is re-based so
+    ``from_geometry`` call per granule. The offsets slice is re-based so
     the block satisfies the strict exact-coverage contract on its own vertex
     slice.
 
@@ -560,7 +560,8 @@ def _batch_ring_mocs(lats, lons, offsets, start, stop, order) -> tuple:
     per-ring scalar path for this block only, which restores the old
     swallow-one-granule behavior exactly.
     """
-    from mortie import morton_coverage_moc, polygons_to_morton_mocs
+    from mortie import from_geometry, polygons_to_morton_mocs
+    from shapely.geometry import Polygon
 
     lo, hi = int(offsets[start]), int(offsets[stop])
     try:
@@ -572,7 +573,11 @@ def _batch_ring_mocs(lats, lons, offsets, start, stop, order) -> tuple:
         for r in range(start, stop):
             a, b = int(offsets[r]), int(offsets[r + 1])
             try:
-                mocs.append(np.asarray(morton_coverage_moc(lats[a:b], lons[a:b], order=order)))
+                # The scalar entry point (mortie 1.0 retired the one-ring form of
+                # the batch coverer): the same ring kernel, reached without the
+                # batch call that just failed.
+                ring = Polygon(list(zip(lons[a:b], lats[a:b])))
+                mocs.append(np.asarray(from_geometry(ring, order=order, moc=True), dtype=np.uint64))
             except Exception:
                 mocs.append(np.empty(0, dtype=np.uint64))
         return mocs, exc
@@ -634,15 +639,15 @@ def _intersect_footprint_cells(
     shared intersection.
 
     mortie 0.9.6's batch twins (espg/mortie#173) remove the per-granule Python
-    loop: one ``mocs_and(aoi_moc, ...)`` per block of records (empty results
-    keep zero-width slots), chained into one ``mocs_to_orders`` (empty in,
+    loop: one ``moc_and(aoi_moc, ...)`` per block of records (empty results
+    keep zero-width slots), chained into one ``moc_to_order`` (empty in,
     empty out) -- two boundary crossings per block instead of two calls per
     granule, and the AOI operand is normalized once per block instead of per
-    granule. A ``mocs_intersect`` prefilter runs first: the predicate walks
+    granule. A ``moc_intersects`` prefilter runs first: the predicate walks
     the row-aligned column in contiguous slices (no gather), and only the
     surviving records -- ~0.4% at clone scale against a regional AOI -- reach
-    the materializing gather + ``mocs_and`` pass. The predicate is exact
-    (``hits[i]`` iff ``mocs_and``'s slot ``i`` would be non-empty, mortie's
+    the materializing gather + ``moc_and`` pass. The predicate is exact
+    (``hits[i]`` iff ``moc_and``'s slot ``i`` would be non-empty, mortie's
     documented contract), so survivors' results are byte-identical to running
     every record through. Both passes are blocked by ``_CELLS_BATCH_RECORDS``
     (see the constant): the survivor pass because its gather copy plus
@@ -650,7 +655,7 @@ def _intersect_footprint_cells(
     whole-column clone call measured ~1.1 GB of RSS over plateau against
     ~184 MB blocked.
     """
-    from mortie import compress_moc, mocs_and, mocs_intersect, mocs_to_orders
+    from mortie import compress_moc, moc_and, moc_intersects, moc_to_order
 
     if len(rows) == 0 or not all_shards:
         return {}
@@ -659,7 +664,7 @@ def _intersect_footprint_cells(
     shard_arr.sort()
     # Uniform-order cells, so no cell contains another and the sorted array is
     # already a well-formed MOC; compressing it just folds complete sibling
-    # quadruples into their parent, shrinking the shared ``mocs_and`` operand
+    # quadruples into their parent, shrinking the shared ``moc_and`` operand
     # without changing any result.
     aoi_moc = np.asarray(compress_moc(shard_arr))
 
@@ -669,7 +674,7 @@ def _intersect_footprint_cells(
     # catalog, which should not be built through. One semantic change rides on
     # the batch: the scalar loop's per-granule ``except Exception: continue``
     # around ``moc_to_order`` (cell-budget refusal -> silently drop that
-    # granule) has no batch equivalent -- ``mocs_to_orders`` applies the same
+    # granule) has no batch equivalent -- ``moc_to_order`` applies the same
     # per-MOC budget but refuses the *whole call* (``ValueError`` naming the
     # lowest-index offender), so a refusal now fails the build loudly instead
     # of quietly losing one granule. This is a real divergence from the
@@ -684,7 +689,7 @@ def _intersect_footprint_cells(
     # Deliberate, and narrow -- refusal is not unreachable, but it is remote.
     # ``aoi_moc``
     # is compressed, so the intersection can keep cells *coarser* than
-    # ``parent_order`` and ``mocs_to_orders`` can genuinely expand; the bound
+    # ``parent_order`` and ``moc_to_order`` can genuinely expand; the bound
     # is the AOI-clipped footprint densified at ``parent_order``, so tripping
     # the 1<<20 flat-cell budget takes a single granule covering >1e6 shard
     # cells inside the AOI. At that size the silent drop is the worse
@@ -711,7 +716,9 @@ def _intersect_footprint_cells(
     for a in range(0, n_rows, _CELLS_BATCH_RECORDS):
         b = min(a + _CELLS_BATCH_RECORDS, n_rows)
         base = offsets[a]
-        hits[a:b] = mocs_intersect(aoi_moc, values[base : offsets[b]], offsets[a : b + 1] - base)
+        hits[a:b] = moc_intersects(
+            aoi_moc, values[base : offsets[b]], offsets=offsets[a : b + 1] - base
+        )
     # ``surv`` holds *original record indices* (``np.flatnonzero`` of a
     # record-aligned mask, so it is strictly increasing) -- the owner mapping
     # below must come from it, never from block-local positions.
@@ -733,8 +740,10 @@ def _intersect_footprint_cells(
         np.cumsum(lens, out=rec_off[1:])
         idx = np.repeat(starts - rec_off[:-1], lens) + np.arange(rec_off[-1], dtype=np.int64)
         try:
-            hit_vals, hit_off = mocs_and(aoi_moc, values[idx], rec_off)
-            flat, flat_off = mocs_to_orders(np.asarray(hit_vals), np.asarray(hit_off), parent_order)
+            hit_vals, hit_off = moc_and(aoi_moc, values[idx], offsets=rec_off)
+            flat, flat_off = moc_to_order(
+                np.asarray(hit_vals), parent_order, offsets=np.asarray(hit_off)
+            )
         except ValueError as exc:
             # mortie names the offending MOC by its index *within the call*,
             # which is a slot in this block, not a record. Re-base it: an
@@ -1225,7 +1234,7 @@ def _intersect_mortie(
 
     The HEALPix path is batched (issue #396): every granule's rings are flattened
     once into mortie's ragged layout (``_flatten_rings``) and covered a block at
-    a time (``_batch_ring_mocs``) instead of one ``morton_coverage_moc`` call per
+    a time (``_batch_ring_mocs``) instead of one ring-cover call per
     granule, and shard membership is a ``searchsorted`` over the sorted shard
     array -- the same vectorized shape the non-HEALPix branch below already used
     -- instead of a scalar ``in all_shards`` test per cell. The result is
@@ -1781,7 +1790,7 @@ class ShardMap:
         **Refine** (``target_order > source_order``): cannot be a pure
         regroup -- the coarse map never recorded which child cell a granule
         fell in. Instead, for each source shard, its own granules are
-        re-intersected at ``target_order`` (the same ``morton_coverage_moc``
+        re-intersected at ``target_order`` (the same ``polygons_to_morton_mocs``
         machinery :meth:`build` uses), restricted to that shard's own
         descendant cells (``generate_morton_children(shard_key,
         target_order)``). In the interior this reproduces the direct

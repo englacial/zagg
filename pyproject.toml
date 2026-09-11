@@ -86,7 +86,12 @@ dependencies = [
     # route through (issue #199) — decimal_repr / to_decimal, the
     # _decimal_to_word parse-back, hive_path, and the MortonIndexScalar decimal
     # display.
-    "mortie>=0.9.10",
+    # Floor 1.0.0 (issue #559): mortie 1.0 retired the plural batch names with
+    # no aliases (espg/mortie#187) -- moc_and / moc_intersects / moc_to_order /
+    # toc_reduce take ``offsets=``, decimal_to_word and arrow.from_wkb are the
+    # array forms, polygons_to_morton_mocs is the only ring coverer -- so every
+    # call in this package only resolves from 1.0.0 on.
+    "mortie>=1.0.0",
     "earthaccess",
     "boto3",
     "fastparquet",

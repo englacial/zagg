@@ -571,7 +571,7 @@ class Catalog:
         """Cover every footprint at ``order`` and return the MOCs -- persisting nothing.
 
         The shared core of :meth:`index_footprints` and of ``ShardMap.build``'s
-        **unindexed** mortie path (issue #445): one ``mortie.arrow.from_wkbs``
+        **unindexed** mortie path (issue #445): one ``mortie.arrow.from_wkb``
         call over the geometry column, screened by :meth:`granule_row_mask`, in
         the same row-aligned ragged layout :meth:`footprint_cells` returns. The
         only difference between the two callers is what they do with it --
@@ -606,12 +606,12 @@ class Catalog:
         empty runs cost 8 bytes each.
 
         Memory is :meth:`index_footprints`' documented posture, because it is
-        this method: ``from_wkbs`` bounds its own peak at roughly the result
+        this method: ``from_wkb`` bounds its own peak at roughly the result
         size, and the screen's WKB copy plus live shapely objects is the term it
         does not bound (~1 GB over the parquet read on the 555,867-row ATL03
         clone -- a peak, not a leak, issue #429).
         """
-        from mortie.arrow import from_wkbs
+        from mortie.arrow import from_wkb
 
         column = self.table.column("geometry")
         # The shapely objects the screen decodes die with the call, so its peak
@@ -620,9 +620,9 @@ class Catalog:
         if keep.all():
             # The case that actually occurs (every catalog in the tree); taking
             # the column whole avoids a second WKB copy.
-            values, kept_offsets = from_wkbs(column, order=int(order))
+            values, kept_offsets = from_wkb(column, order=int(order))
         elif keep.any():
-            values, kept_offsets = from_wkbs(column.filter(pa.array(keep)), order=int(order))
+            values, kept_offsets = from_wkb(column.filter(pa.array(keep)), order=int(order))
         else:
             values, kept_offsets = np.empty(0, dtype=np.uint64), np.zeros(1, dtype=np.int64)
         # Scatter the kept rows' MOC lengths back over every row: screened rows
@@ -676,7 +676,7 @@ class Catalog:
 
         Notes
         -----
-        ``mortie.arrow.from_wkbs`` (mortie >= 0.9.5, espg/mortie#157/#163) takes
+        ``mortie.arrow.from_wkb`` (mortie >= 0.9.5, espg/mortie#157/#163) takes
         the geometry column across the Python/Rust boundary once, with the GIL
         released and chunking that bounds peak at roughly the result size. It
         covers the **union of the rings inside each blob**, where
@@ -698,7 +698,7 @@ class Catalog:
         would once have indexed -- see :meth:`granule_row_mask`'s Raises.
 
         The screen is cheap in time but it is this pass's **peak in memory**, and
-        it is the term ``from_wkbs``'s chunking does not bound: on the
+        it is the term ``from_wkb``'s chunking does not bound: on the
         555,867-row ATL03 clone RSS goes 835 MB after the parquet read -> 1,169
         MB after ``to_numpy`` (a full WKB copy) -> 1,794 MB with the shapely
         objects live. They die with ``granule_row_mask``'s frame, so that stays

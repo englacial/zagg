@@ -133,11 +133,12 @@ def test_mortie_version_asserted(monkeypatch):
 
     from zagg.grids import aoi
 
-    for bad in ("0.8.1", "0.8.2", "0.8.3.dev1", "0.7.2"):
+    # Floor is 1.0.0 (#559): the pre-1.0 spellings this module used are gone.
+    for bad in ("0.8.3", "0.9.11", "1.0.0.dev1", "0.7.2"):
         monkeypatch.setattr(mortie, "__version__", bad, raising=False)
         with pytest.raises(RuntimeError, match="aoi_mask requires mortie"):
             aoi._assert_mortie_version()
-    for ok in ("0.8.3", "0.9.0", "1.0.0"):
+    for ok in ("1.0.0", "1.0.1", "1.2.0"):
         monkeypatch.setattr(mortie, "__version__", ok, raising=False)
         aoi._assert_mortie_version()  # no raise
 
@@ -583,6 +584,41 @@ class TestWKBWKTInput:
         ring = healpix_aoi_moc(_box(*box), order)
         geo = healpix_aoi_moc_from_geometry(AOIGeometry.from_wkb(wkb), order)
         np.testing.assert_array_equal(np.sort(ring), np.sort(geo))
+
+    def test_healpix_moc_multipart_and_hole_equal_geometry(self):
+        # mortie 1.0 retired the multipart ring form of the scalar coverer
+        # (#559), so the ring-parts path now routes through ``from_geometry``.
+        # It must keep the pre-1.0 parts semantics: disjoint parts union, and a
+        # nested part carves a hole -- both bit-identical to the WKB path.
+        import shapely
+        from mortie import moc_to_order
+
+        from zagg.grids.aoi import (
+            AOIGeometry,
+            healpix_aoi_moc,
+            healpix_aoi_moc_from_geometry,
+        )
+
+        order = 8
+        a, b = _box(10.0, 10.0, 20.0, 20.0)[0], _box(30.0, 30.0, 35.0, 35.0)[0]
+        outer, hole = _box(-20.0, -20.0, -10.0, -10.0)[0], _box(-17.0, -17.0, -13.0, -13.0)[0]
+
+        def poly(lats, lons, holes=()):
+            return shapely.Polygon(list(zip(lons, lats)), [list(zip(h[1], h[0])) for h in holes])
+
+        multi = shapely.MultiPolygon([poly(*a), poly(*b)])
+        parts = healpix_aoi_moc([a, b], order)
+        geo = healpix_aoi_moc_from_geometry(AOIGeometry.from_wkb(multi.wkb), order)
+        np.testing.assert_array_equal(np.sort(parts), np.sort(geo))
+
+        donut = healpix_aoi_moc([outer, hole], order)
+        geo = healpix_aoi_moc_from_geometry(
+            AOIGeometry.from_wkb(poly(*outer, holes=[hole]).wkb), order
+        )
+        np.testing.assert_array_equal(np.sort(donut), np.sort(geo))
+        # and the nested part really is a hole: fewer cells than the outer alone
+        flat = lambda m: np.unique(np.asarray(moc_to_order(m, order), dtype=np.uint64))  # noqa: E731
+        assert flat(donut).size < flat(healpix_aoi_moc([outer], order)).size
 
     def test_healpix_mask_wkt_equals_ring_end_to_end(self):
         # The whole per-shard mask (not just the MOC) must match: build via the grid
