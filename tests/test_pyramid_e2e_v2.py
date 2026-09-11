@@ -260,6 +260,22 @@ class TestV2Baselines:
         assert "leaf entry" in entry["detail"]
         assert report["passed"] is False
 
+    def test_leaf_entry_only_list_names_the_v2_grammar(self, tmp_path):
+        # A /2 list truncated to its leaf entry has no ABOVE-SHARD level, so
+        # it exits through the shared prologue's empty-ladder gate, before
+        # the /2 spine's grammar leg ever runs. The sentence there must still
+        # name the /2 contract rather than read as "nothing declared".
+        _build_store(tmp_path, backfill=False, sweep=False)
+        manifest = json.loads((tmp_path / MANIFEST_NAME).read_text())
+        manifest["pyramid"]["overviews"] = [{"node": SHARD_ORDER, "cells": [5]}]
+        obstore.put(open_object_store(str(tmp_path)), MANIFEST_NAME, json.dumps(manifest).encode())
+        report = validate_pyramid(str(tmp_path))
+        entry = report["checks"]["declaration"]
+        assert entry["status"] == "fail"
+        assert "zagg-pyramid/2 block records 1 level entry(ies)" in entry["detail"]
+        assert "fixed every-order ladder" in entry["detail"]
+        assert report["passed"] is False
+
     def test_non_expanded_ladder_fails_declaration(self, tmp_path):
         # Every order from shard_order - 1 to 0 must be recorded: a reader
         # never re-derives the ladder, so a gap is a broken contract.

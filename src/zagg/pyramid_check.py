@@ -208,9 +208,21 @@ def validate_pyramid(
     report["ladder"] = [{"node": k, "cells": t} for k, t in ladder]
     report["field_classes"] = {c: sorted(n) for c, n in classes.items()}
     if not ladder:
-        checks["declaration"] = _entry(
-            "fail", "no pyramid overview declaration in the manifest (declared: False)"
-        )
+        # The shared prologue runs before either arm, so the sentence must not
+        # be /1-flavoured: a /2 list recorded with its leaf entry and no ladder
+        # (a truncated or hand-edited block — exactly the class
+        # ``_declaration_grammar`` exists to name) reaches here too, and used
+        # to exit as a bare "nothing declared" (review finding).
+        detail = "no pyramid overview declaration in the manifest (declared: False)"
+        if report["pyramid_spec"] == "zagg-pyramid/2":
+            detail += (
+                f": the zagg-pyramid/2 block records {len(pyramid.get('overviews') or [])} "
+                f"level entry(ies), none of them above the shard order — the /2 list is "
+                f"always the leaf entry at node {int(manifest['shard_order'])} PLUS the "
+                f"fixed every-order ladder down to 0 (§4.4/§4.5), so a list without one "
+                f"is truncated, not a shallower pyramid"
+            )
+        checks["declaration"] = _entry("fail", detail)
         skip_rest("no declaration", after="declaration")
         return _finish(report, CHECKS)
     if not fields:
