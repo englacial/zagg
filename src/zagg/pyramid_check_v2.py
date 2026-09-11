@@ -405,6 +405,19 @@ def _value_checks_v2(
     )
 
 
+def _as_int(value) -> int | None:
+    """``int(value)`` or None — attrs are untrusted JSON, and this is a reader.
+
+    Absent and malformed both become None, which never equals an expected
+    counter, so the caller's one comparison covers "no claim at all" and
+    "an unreadable claim" alike without a traceback out of a read-only run.
+    """
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
+
+
 def _coverage_verdict(node, sc, leaves, col_probes, harness, errors) -> bool:
     """Whether one ladder node's per-cell value comparisons may run (§4.3).
 
@@ -459,7 +472,10 @@ def _stage_provenance_errors(node, k, r, s, prov, gather) -> list:
     gather at/below the shard resolution, merge above — with its
     merges-from-raw at 1/2 (never 3 upfront: gen 3 belongs only to the
     append-later cascade regime), the ``source_children`` counters (present
-    in BOTH stage regimes), and the writing ``run_id``.
+    in BOTH stage regimes), and the writing ``run_id``. ``merges_from_raw``
+    is REQUIRED like its two siblings — §4.4 makes it normative on a ``/2``
+    stage artifact, and an absent key is the one way to make no claim at all
+    (review finding: it used to pass, alone among the three).
     """
     from zagg.sweep_overview import OVERVIEW_ATTR
     from zagg.sweep_stage import OVERVIEW_SPEC_V2, STAGE_GATHER, STAGE_MERGE
@@ -486,7 +502,7 @@ def _stage_provenance_errors(node, k, r, s, prov, gather) -> list:
             f"(cells {r} vs shard order {s}, §4.4)"
         )
     expected_mfr = 1 if gather else 2
-    if prov.get("merges_from_raw") is not None and int(prov["merges_from_raw"]) != expected_mfr:
+    if _as_int(prov.get("merges_from_raw")) != expected_mfr:
         errs.append(
             f"{node}: merges_from_raw {prov.get('merges_from_raw')} != {expected_mfr} "
             f"for a {expected_regime} level (never 3 for an upfront level, §4.4)"
