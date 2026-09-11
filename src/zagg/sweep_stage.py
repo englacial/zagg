@@ -476,7 +476,8 @@ def _gather_slabs(rows: list, fields: dict, *, res: int, span: int, n_out: int) 
     itself ``None`` when the candidate's column is missing — under-coverage,
     counted). Payloads are ASSIGNED, never decoded or re-folded — the
     acceptance contract that gather levels carry gen-1 bytes untouched.
-    Returns ``(slabs, folded, missing, unreadable)``.
+    Returns ``(slabs, folded, missing, unreadable, demotions)`` — the last
+    always empty here (see the comment at the return).
 
     A located field's sibling is gathered under the same rule as its payload
     (ruling 4 on issue #410): a gather ASSIGNS gen-1 bytes, so the pair stays
@@ -522,7 +523,10 @@ def _gather_slabs(rows: list, fields: dict, *, res: int, span: int, n_out: int) 
             values = grouped[name] if name in grouped else reader.read(res, name)
             if values is not None:
                 slabs[name][seg] = values
-    return (slabs, *_source_counts(rows, broken))
+    # A gather assigns gen-1 bytes and folds nothing, so the packed guard
+    # rail has no site here — the demotions slot is empty by construction
+    # (issue #518), kept so every fold arm returns one shape.
+    return (slabs, *_source_counts(rows, broken), [])
 
 
 def _merge_slabs(
@@ -556,15 +560,23 @@ def _merge_slabs(
     (spec §9.1). Fields whose reads are sound still fold that contributor: the
     read succeeded, so the loss is known per field, and the per-child
     ``unreadable`` count is what says the artifact folded short.
+
+    Returns ``(slabs, folded, missing, unreadable, demotions)`` — the last a
+    :func:`zagg.sweep_overview.demotion_records` list naming every packed
+    field the half-pair rail demoted here, per direction (issue #518).
     """
     from zagg.stats.composition import merge_composition_kway
     from zagg.sweep_overview import (
+        DEMOTION_DIVISOR_MISSING,
+        DEMOTION_WORD_MISSING,
         _empty_slab,
         combine_dense,
         decode_digest,
+        demotion_records,
         field_companions,
         fold_dense,
         fold_digests,
+        note_demotion,
         overview_fold_delta,
         payload_weight,
     )
@@ -662,6 +674,7 @@ def _merge_slabs(
         slabs[name] = out
         for kwarg, sibling in declared:
             slabs[sibling] = sibling_slabs[kwarg]
+    demoted: dict = {}
     for name, meta in fields.items():
         if meta["class"] != "packed":
             continue
@@ -725,13 +738,21 @@ def _merge_slabs(
                             f"contributor unreadable (spec §3.3, §1.1)"
                         )
                         broken.add((i, w))
+                        # Either direction is a demotion the artifact must
+                        # record (issue #518, spec §4.3): the level's word
+                        # coverage folded short, and the bytes alone cannot
+                        # say so (the fill word makes no §3.2 claim).
                         if of_values is not None:
-                            poisoned.update(
-                                range(
-                                    base // factor,
-                                    (base + src_per_child + factor - 1) // factor,
-                                )
+                            blanked = range(
+                                base // factor,
+                                (base + src_per_child + factor - 1) // factor,
                             )
+                            poisoned.update(blanked)
+                            note_demotion(
+                                demoted, name, DEMOTION_WORD_MISSING, of_name, cells=blanked
+                            )
+                        else:
+                            note_demotion(demoted, name, DEMOTION_DIVISOR_MISSING, of_name)
                     continue
                 for pos in range(len(word_slab)):
                     n = payload_weight(of_values[pos], of_dtype)
@@ -745,7 +766,7 @@ def _merge_slabs(
             if j not in poisoned:
                 out[j] = merge_composition_kway(parts)
         slabs[name] = out
-    return (slabs, *_source_counts(rows, broken))
+    return (slabs, *_source_counts(rows, broken), demotion_records(demoted))
 
 
 def _dense_rows(readers: dict, node: str, *, depth: int) -> list:
@@ -788,13 +809,13 @@ def _stage_fold(
     n_out = 4 ** (r - k)
     regime = classify_level(r, shard_order=shard_order)
     if regime == STAGE_GATHER and not all_time:
-        slabs, folded, missing, unreadable = _gather_slabs(
+        slabs, folded, missing, unreadable, demotions = _gather_slabs(
             rows, fields, res=r, span=4 ** (r - child_order), n_out=n_out
         )
         merges_from_raw = 1
     else:
         res_src = r if (all_time and regime == STAGE_GATHER) else shard_order
-        slabs, folded, missing, unreadable = _merge_slabs(
+        slabs, folded, missing, unreadable, demotions = _merge_slabs(
             rows,
             fields,
             res_src=res_src,
@@ -812,7 +833,7 @@ def _stage_fold(
                 granules += int(reader.stamp.get("granule_count") or 0)
                 if reader.stamp.get("time_range") is not None:
                     ranges.append(reader.stamp["time_range"])
-    return {
+    fold = {
         "slabs": slabs,
         "generation": _summed_generation([row for row in rows if row is not None]),
         "content_hash": _content_hash(node, k, r, fields, slabs),
@@ -826,6 +847,12 @@ def _stage_fold(
             "unreadable": int(unreadable),
         },
     }
+    if demotions:
+        # The packed guard rail fired at this node (issue #518): carry the
+        # record to the writer so the artifact says so (spec §4.3), keyed
+        # only when non-empty — a clean fold's attrs are byte-identical.
+        fold["demotions"] = demotions
+    return fold
 
 
 def _write_stage_overview(
@@ -882,28 +909,33 @@ def _write_stage_overview(
         arr[:] = slab
     populated = _populated_mask(fold["slabs"], fields)
     root = zarr.open_group(store, path="", mode="r+", zarr_format=3)
-    root.attrs.update(
+    provenance = {
+        "spec": OVERVIEW_SPEC_V2,
+        "node": node,
+        "order": int(k),
+        "cell_order": int(r),
+        "source_shard_order": int(shard_order),
+        "source_cell_order": int(cell_order),
+        "window": key,
+        "fields": {n: _field_provenance(m) for n, m in fields.items()},
+        "regime": fold["regime"],
+        "merges_from_raw": int(fold["merges_from_raw"]),
+        "source_children": dict(fold["source_children"]),
+    }
+    if fold.get("demotions"):
+        # Artifact-visible packed-rail demotions (issue #518, spec §4.3) —
+        # keyed only when the rail fired, so a clean level's attrs are
+        # byte-identical to a pre-#518 writer's.
+        provenance["demotions"] = list(fold["demotions"])
+    provenance.update(
         {
-            ROLE_ATTR: "overview",
-            OVERVIEW_ATTR: {
-                "spec": OVERVIEW_SPEC_V2,
-                "node": node,
-                "order": int(k),
-                "cell_order": int(r),
-                "source_shard_order": int(shard_order),
-                "source_cell_order": int(cell_order),
-                "window": key,
-                "fields": {n: _field_provenance(m) for n, m in fields.items()},
-                "regime": fold["regime"],
-                "merges_from_raw": int(fold["merges_from_raw"]),
-                "source_children": dict(fold["source_children"]),
-                "generation": fold["generation"],
-                "content_hash": fold["content_hash"],
-                "run_id": run_id,
-                "generated_at": _utcnow(),
-            },
+            "generation": fold["generation"],
+            "content_hash": fold["content_hash"],
+            "run_id": run_id,
+            "generated_at": _utcnow(),
         }
     )
+    root.attrs.update({ROLE_ATTR: "overview", OVERVIEW_ATTR: provenance})
     stamp_window = key if windowed else None
     stamp_commit(
         store,
@@ -1282,7 +1314,7 @@ def stage_node(
     folded: dict = {}
     relay_sc = None
     for res in members:
-        slabs, folded_n, missing, unreadable = _gather_slabs(
+        slabs, folded_n, missing, unreadable, _demotions = _gather_slabs(
             _dense_rows(readers, node, depth=child_order - dispatch),
             fields,
             res=res,

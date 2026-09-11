@@ -108,6 +108,60 @@ TDIGEST_LAW = "tdigest_kway"
 #: why ``packed`` is its own class rather than an ``exact`` method.
 COMPOSITION_LAW = "composition_kway"
 
+#: The two ways the ``packed`` guard rail demotes a field at a fold site
+#: (issue #518) — each names which HALF of the ``(word, of-digest)`` pair a
+#: contributor was missing. ``word-missing``: the contributor carried the
+#: §3.3 divisor but not the word, so the output cells its rows reach are
+#: blanked to the fill word (a published word over a denominator it never
+#: covered would be a §3.3 skew — absence over wrongness). ``divisor-missing``:
+#: the contributor carried the word but not its ``of`` digest, so it
+#: contributes nothing for the field (the fold's ``n`` inputs are that
+#: digest's per-cell weights and are never guessed).
+DEMOTION_WORD_MISSING = "word-missing"
+DEMOTION_DIVISOR_MISSING = "divisor-missing"
+
+
+def note_demotion(acc: dict, field: str, reason: str, of, *, cells=None) -> None:
+    """Accumulate one contributor's packed-rail demotion (issue #518).
+
+    ``acc`` is a fold site's ``{(field, reason): {of, contributors, cells}}``
+    scratch map; ``cells`` is the iterable of output-cell indices the
+    contributor caused to be blanked (the ``word-missing`` direction only —
+    a dropped contributor blanks nothing, its absence is ordinary
+    under-coverage for the one field).
+    """
+    entry = acc.setdefault((str(field), str(reason)), {"of": of, "contributors": 0, "cells": set()})
+    entry["contributors"] += 1
+    if cells is not None:
+        entry["cells"].update(int(c) for c in cells)
+
+
+def demotion_records(acc: dict) -> list:
+    """The attrs-facing ``demotions`` list: one record per ``(field, reason)``.
+
+    The artifact-visible record of the ``packed`` guard rail firing at this
+    node (issue #518, spec §4.3): without it the only trace of a demoted
+    composition is a log line in an exited worker, and a reader cannot tell
+    a fill cell that is absence-by-design from one the rail blanked. Sorted
+    by ``(field, reason)`` so the recorded list is deterministic; ``cells``
+    is keyed only when output cells were actively blanked, and readers MUST
+    tolerate additional keys (the §4.3 posture).
+    """
+    records = []
+    for (field, reason), entry in sorted(acc.items()):
+        record = {
+            "field": field,
+            "class": "packed",
+            "reason": reason,
+            "contributors": int(entry["contributors"]),
+        }
+        if entry.get("of") is not None:
+            record["of"] = str(entry["of"])
+        if entry["cells"]:
+            record["cells"] = len(entry["cells"])
+        records.append(record)
+    return records
+
 
 # ---------------------------------------------------------------------------
 # Phase A: per-field up-aggregation kernels (the D24 merge laws over arrays).

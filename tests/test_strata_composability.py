@@ -950,7 +950,8 @@ class TestStageMergeHalfPair:
 
         # The control: both pairs whole, the word is the k-way merge of every
         # source cell's (word, n) and the cell counts as folded.
-        slabs, folded, missing, unreadable = self._merge(paths)
+        slabs, folded, missing, unreadable, demotions = self._merge(paths)
+        assert demotions == [], "a clean fold records no demotion (issue #518)"
         expected = []
         for path in paths:
             group = zarr.open_group(
@@ -972,10 +973,21 @@ class TestStageMergeHalfPair:
         # level's N_signal is unchanged — which is exactly why the word may
         # not be published over the surviving subset.
         shutil.rmtree(f"{paths[1]}/{self.RES}/composition")
-        slabs, folded, missing, unreadable = self._merge(paths)
+        slabs, folded, missing, unreadable, demotions = self._merge(paths)
         assert (folded, missing, unreadable) == (1, 0, 1)
         assert int(slabs["composition"][0]) == 0, "the covered cell keeps the fill word"
         assert self._weight(slabs["h_sig"], 0) == pooled, "the divisor still folds both"
+        # The rail's firing is returned for the artifact record (issue #518).
+        assert demotions == [
+            {
+                "field": "composition",
+                "class": "packed",
+                "reason": "word-missing",
+                "contributors": 1,
+                "of": "h_sig",
+                "cells": 1,
+            }
+        ]
 
     def test_a_contributor_missing_the_divisor_drops_without_poisoning(self, tmp_path):
         import shutil
@@ -997,8 +1009,19 @@ class TestStageMergeHalfPair:
         # nothing is poisoned and the shared cell keeps the surviving word.
         # Still counted unreadable: the level did fold short.
         shutil.rmtree(f"{paths[1]}/{self.RES}/h_sig")
-        slabs, folded, missing, unreadable = self._merge(paths)
+        slabs, folded, missing, unreadable, demotions = self._merge(paths)
         assert (folded, missing, unreadable) == (1, 0, 1)
+        # Recorded without ``cells``: nothing was blanked, the contributor
+        # simply folded short for the field (issue #518).
+        assert demotions == [
+            {
+                "field": "composition",
+                "class": "packed",
+                "reason": "divisor-missing",
+                "contributors": 1,
+                "of": "h_sig",
+            }
+        ]
         group = zarr.open_group(
             open_store(paths[0], read_only=True), path=str(self.RES), mode="r", zarr_format=3
         )
