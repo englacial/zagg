@@ -755,8 +755,8 @@ regionally heterogeneous resolution).
 
   **`demotions` records the `packed` guard rail firing at this node**
   ([#518](https://github.com/englacial/zagg/issues/518)) — present exactly
-  when a fold demoted a `packed`-class field here, on **both** attrs
-  revisions (`zagg-overview/1` and `/2`, §4.4):
+  when the fold that **last wrote this artifact** demoted a `packed`-class
+  field, on **both** attrs revisions (`zagg-overview/1` and `/2`, §4.4):
 
   ```json
   "demotions": [
@@ -819,8 +819,15 @@ regionally heterogeneous resolution).
   one-read-per-child case. A
   demoted field's cells hold the fill value, which §3.2 makes
   byte-indistinguishable from genuine emptiness, so the attrs are the only
-  place the distinction can live. The `demoted/` conformance fixture (§7)
-  commits one fired and one clean level.
+  place the distinction can live. Like `fields`, `source_children` and
+  `fold_from_order` beside it, a `demotions` state is **as current as the
+  artifact's own write** and never a live claim about the manifest in force:
+  the skip-if-current gates key on generations and regime, not on the field
+  declarations, so after a manifest edit (the mis-declared `of` being
+  introduced or corrected — §4.5, manifests outlive their writer) a level
+  whose bytes have not changed stays current carrying the previous fold's
+  answer. The `demoted/` conformance fixture (§7) commits one fired and one
+  clean level.
 
 An overview also carries the standard D4 **commit stamp** as its final
 write: an unstamped overview prefix is debris, exactly as for leaves.
