@@ -304,6 +304,40 @@ class TestV1SweepArtifactDemotions:
         assert level0["fold_source"] == "cascade"
         assert "demotions" not in level0
 
+    def test_a_leaf_the_fold_skips_whole_leaves_no_record(self, tmp_path):
+        """A leaf that raises LATER contributes nothing — records included.
+
+        The drop arm fires early in the field loop; if a later field in the
+        same leaf raises, the enclosing guard skips the leaf whole (``failed``,
+        no slab touched, not counted in ``n_leaves``). The record must go with
+        it, or the attrs name a contributor this fold never used and
+        ``contributors`` over-counts (review finding).
+        """
+        import shutil
+
+        import zarr
+
+        from zagg.store import open_store
+        from zagg.sweep_overview import sweep_overviews
+
+        # ``composition`` ahead of ``h_noise`` so the drop arm fires BEFORE
+        # the field that raises.
+        fields = {k: dict(self.FIELDS[k]) for k in ("count", "composition", "h_sig", "h_noise")}
+        a, _ = tsc._strata_cells(k=16, n=60, seed=515)
+        b, _ = tsc._strata_cells(k=16, n=60, seed=518)
+        for dec, cells in (("-311", a), ("-312", b)):
+            tsc._write_strata_leaf(tmp_path, dec, cells, shard_order=2, cell_order=4)
+        leaf = tmp_path / "-3" / "1" / "2" / "-312.zarr"
+        # Leaf -312 loses the divisor array (the drop arm) and carries a §2.0
+        # weights declaration the manifest refuses (issue #424) on a later field.
+        shutil.rmtree(leaf / "4" / "h_sig")
+        group = zarr.open_group(open_store(str(leaf)), path="4", mode="r+", zarr_format=3)
+        group["h_noise"].attrs["weights"] = "flux"
+        manifest = _v1_manifest(tmp_path, fields)
+        counts = sweep_overviews(str(tmp_path), manifest, {"-311": {None}, "-312": {None}})
+        assert counts["failed"] == 1 and counts["written"] == 2
+        assert "demotions" not in _v1_attrs(tmp_path, "-3/1")
+
     def test_a_mis_declared_divisor_lands_in_the_cascade_attrs(self, tmp_path):
         """The issue's acceptance shape: composition packed over a ``none`` divisor.
 
