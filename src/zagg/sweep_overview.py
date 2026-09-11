@@ -1720,6 +1720,11 @@ def _fold_node(
                 cell_digests: dict = {}
                 leaf_packed: dict = {}
                 leaf_poison: set = set()
+                # The divisor-missing direction's records, collected here and
+                # applied with ``leaf_poison`` below for the same reason: a
+                # leaf that raises on a LATER field is skipped whole, so it
+                # must leave no record either (review finding).
+                leaf_dropped: list = []
                 for name, meta in fields.items():
                     try:
                         arr = group[name]
@@ -1778,7 +1783,7 @@ def _fold_node(
                             )
                             # Recorded (issue #518): the field folds short of
                             # this leaf's rows, and the bytes cannot say so.
-                            note_demotion(demoted, name, DEMOTION_DIVISOR_MISSING, of_name)
+                            leaf_dropped.append((name, of_name))
                             continue
                         of_dtype = (fields.get(of_name) or {}).get("dtype") or "float32"
                         words_arr = arr[:]
@@ -1836,6 +1841,12 @@ def _fold_node(
             for name, contributions in leaf_packed.items():
                 for i, word, n in contributions:
                     packed[name].setdefault(start + i // fold_factor, []).append((word, n))
+            # BOTH rail directions record only now, for the same reason the
+            # poison applies only now: a leaf that raised is skipped whole and
+            # contributed to nothing, so an attrs record naming it would claim
+            # a contributor this fold never used (review finding).
+            for name, of_name in leaf_dropped:
+                note_demotion(demoted, name, DEMOTION_DIVISOR_MISSING, of_name)
             # The leaf's whole span, which is exactly the output cells its
             # rows reach (``leaf_cells // fold_factor == span`` in both fold
             # geometries). Applied only once the leaf has read cleanly: an
