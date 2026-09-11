@@ -229,6 +229,30 @@ def _fit_batch(nodes, buckets, *, block: dict, store_path: str, output_creds_eve
     return _fit_batch(nodes[:mid], buckets, **kw) + _fit_batch(nodes[mid:], buckets, **kw)
 
 
+def normalize_max_nodes(max_nodes):
+    """``max_nodes`` as an int >= 1, or ``None`` — refused by name, once.
+
+    Validated where the value ENTERS rather than where it is used, so a run
+    whose tuples all filter out still records a value it could have honored.
+    ``int()`` on its own is not validation: it truncates ``2.9`` to 2 and reads
+    ``True`` as 1 (both silently, so the summary's record would disagree with
+    what shipped), and it raises ``invalid literal for int()`` on a string —
+    not a message naming this knob (review finding).
+    """
+    if max_nodes is None:
+        return None
+    try:
+        value = int(max_nodes)
+    except (TypeError, ValueError):
+        value = None
+    if value is None or isinstance(max_nodes, bool) or value != max_nodes or value < 1:
+        raise ValueError(
+            f"max_nodes must be a whole number >= 1, got {max_nodes!r} — "
+            "pass None for payload-only packing"
+        )
+    return value
+
+
 def pack_batches(
     nodes, by_shard, *, block: dict, store_path: str, output_creds_event=None, max_nodes=None
 ) -> list:
@@ -262,11 +286,7 @@ def pack_batches(
     """
     from zagg.runner import _ASYNC_PAYLOAD_CAP_BYTES
 
-    if max_nodes is not None and int(max_nodes) < 1:
-        raise ValueError(
-            f"max_nodes must be >= 1, got {max_nodes} — pass None for payload-only packing"
-        )
-    max_nodes = None if max_nodes is None else int(max_nodes)
+    max_nodes = normalize_max_nodes(max_nodes)
 
     # The fixed cost of the event minus its two variable-length lists, plus a
     # margin for the JSON punctuation the incremental accounting approximates.
@@ -489,6 +509,12 @@ def run_stage_sweep_fleet(
     t0 = time.perf_counter()
     store_kwargs = dict(store_kwargs or {})
     tuple_width = int(DEFAULT_TUPLE_WIDTH if tuple_width is None else tuple_width)
+    # Normalized HERE, not on first use inside the tuple loop: a run whose
+    # tuples all filter out never reaches `pack_batches`, and would otherwise
+    # report a value it never validated (review finding). The summary below
+    # records the EFFECTIVE value, so the run's own record cannot disagree
+    # with what shipped.
+    max_nodes_per_invoke = normalize_max_nodes(max_nodes_per_invoke)
     shard_order = int(shard_order)
     # The same canonicalization the in-process pass does (run_stage_sweep), so
     # every documented spelling — morton words, D1 decimals, a shardmap's keys
