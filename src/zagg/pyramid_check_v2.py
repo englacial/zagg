@@ -451,17 +451,26 @@ def _coverage_verdict(node, sc, leaves, col_probes, harness, errors) -> bool:
 def _stage_provenance_errors(node, k, r, s, prov, gather) -> list:
     """One ladder artifact's ``zagg-overview/2`` attrs vs the §4.4 contract.
 
-    A missing block is left to :func:`_check_node`'s read-back leg (one
-    report line, not two); a present one must record the DERIVED regime —
+    An ABSENT block is left to :func:`_check_node`'s read-back leg (one
+    report line, not two). A block that is present but not a MAPPING is an
+    error here: that leg tests key presence only, so a ``zagg_overview`` set
+    to a string satisfies it and would otherwise skip this whole contract
+    silently (review finding). A present one must record the DERIVED regime —
     gather at/below the shard resolution, merge above — with its
     merges-from-raw at 1/2 (never 3 upfront: gen 3 belongs only to the
     append-later cascade regime), the ``source_children`` counters (present
     in BOTH stage regimes), and the writing ``run_id``.
     """
+    from zagg.sweep_overview import OVERVIEW_ATTR
     from zagg.sweep_stage import OVERVIEW_SPEC_V2, STAGE_GATHER, STAGE_MERGE
 
-    if not isinstance(prov, dict):
+    if prov is None:
         return []
+    if not isinstance(prov, dict):
+        return [
+            f"{node}: {OVERVIEW_ATTR!r} attrs are a {type(prov).__name__}, not the §4.4 "
+            f"provenance mapping — nothing in the block can be validated"
+        ]
     errs = []
     if prov.get("spec") != OVERVIEW_SPEC_V2:
         errs.append(f"{node}: attrs spec {prov.get('spec')!r} != {OVERVIEW_SPEC_V2!r}")
@@ -494,12 +503,22 @@ def _stage_provenance_errors(node, k, r, s, prov, gather) -> list:
 
 
 def _column_attrs_errors(dec, s, attrs, resolutions) -> list:
-    """One leaf column's ``zagg_column`` attrs vs the §4.6 contract."""
+    """One leaf column's ``zagg_column`` attrs vs the §4.6 contract.
+
+    Absent is :func:`_check_node`'s read-back leg (one line, not two);
+    present-but-not-a-mapping is an error HERE, since that leg tests key
+    presence only and cannot see it (review finding).
+    """
     from zagg.column import COLUMN_ATTR, COLUMN_SPEC
 
     block = attrs.get(COLUMN_ATTR)
+    if block is None:
+        return []
     if not isinstance(block, dict):
-        return []  # the missing-attrs line is _check_node's read-back leg
+        return [
+            f"{dec}: {COLUMN_ATTR!r} attrs are a {type(block).__name__}, not the §4.6 "
+            f"column mapping — nothing in the block can be validated"
+        ]
     errs = []
     if block.get("spec") != COLUMN_SPEC:
         errs.append(f"{dec}: column attrs spec {block.get('spec')!r} != {COLUMN_SPEC!r}")

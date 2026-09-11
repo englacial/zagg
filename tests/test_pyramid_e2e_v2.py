@@ -364,6 +364,30 @@ class TestV2Provenance:
             ),
         )
 
+    def test_non_mapping_provenance_block_is_caught(self, tmp_path):
+        # _check_node's read-back leg tests key PRESENCE, so a zagg_overview
+        # set to a string satisfies it and used to skip the whole §4.4
+        # contract silently — spec/order/regime/merges_from_raw/run_id.
+        _build_store(tmp_path)
+        self._edit_node_attrs(tmp_path, "-3", lambda a: a.update(zagg_overview="totally bogus"))
+        report = validate_pyramid(str(tmp_path), full=True)
+        entry = report["checks"]["readback"]
+        assert entry["status"] == "fail"
+        assert any("not the §4.4 provenance mapping" in m for m in entry["mismatches"]), entry
+        assert report["passed"] is False
+
+    def test_non_mapping_column_block_is_caught(self, tmp_path):
+        # Same hole on the §4.6 tier: a zagg_column that is a list.
+        _build_store(tmp_path)
+        col_meta = tmp_path / "-3" / "1" / "1" / "1" / "all.pyramid.zarr" / "zarr.json"
+        meta = json.loads(col_meta.read_text())
+        meta["attributes"]["zagg_column"] = ["not", "a", "dict"]
+        col_meta.write_text(json.dumps(meta))
+        report = validate_pyramid(str(tmp_path), full=True)
+        entry = report["checks"]["readback"]
+        assert entry["status"] == "fail"
+        assert any("not the §4.6 column mapping" in m for m in entry["mismatches"]), entry
+
     def test_manifest_actuals_mismatch_is_caught(self, tmp_path):
         # The finisher's per-entry actuals (#381 point (7)) are bookkeeping a
         # reader may bind: a recorded regime that disagrees with the derived
