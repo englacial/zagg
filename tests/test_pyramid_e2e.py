@@ -230,13 +230,23 @@ class TestFixtureE2E:
         assert json.loads(out_json.read_text())["passed"] is True
 
     def test_sampled_mode_matches_full(self, tmp_path):
-        # Production posture on the fixture: bounded samples, roster listing.
+        # Production posture on the fixture: bounded samples, roster listing —
+        # and the same per-check verdicts the exhaustive pass reaches, on
+        # strictly fewer comparisons (the name's actual claim).
         manifest = _build_store(tmp_path)
         _sweep(tmp_path, manifest)
         report = validate_pyramid(
             str(tmp_path), sample_nodes=2, sample_cells=3, seed=7, roster="list"
         )
+        full = validate_pyramid(str(tmp_path), full=True)
         assert report["passed"] is True, format_report(report)
+        assert [report["checks"][c]["status"] for c in CHECKS] == [
+            full["checks"][c]["status"] for c in CHECKS
+        ], (format_report(report), format_report(full))
+        assert report["ladder"] == full["ladder"]
+        assert report["nodes"] == full["nodes"]
+        for name in ("readback", "counts", "digests", "composition"):
+            assert 0 < report["sampled"][name] <= full["sampled"][name], name
         assert report["roster"]["source"] == "list"
         assert report["roster"]["leaves"] == len(LEAVES)
 
@@ -449,17 +459,20 @@ class TestPreSweepBaseline:
         assert "no pyramid overview declaration" in report["checks"]["declaration"]["detail"]
         assert report["passed"] is False
 
-    def test_v1_era_none_classes_fail_declaration(self, tmp_path):
+    def test_v1_era_none_classes_still_declare(self, tmp_path):
         # The pre-#515 CA declaration: ladder present, every field 'none'
-        # except count... with ONLY count composable the ladder still folds;
-        # strata declared 'none' means the store's substance never rolls up —
-        # flagged via the recorded class map rather than a hard failure.
+        # except count. With ONLY count composable the ladder still folds, so
+        # the DECLARATION check passes — the strata never rolling up is
+        # flagged via the recorded class map and the skipped value checks,
+        # not by failing the declaration (the check this pins explicitly).
         manifest = _build_store(tmp_path)
         fields = manifest["pyramid"]["overview"]["fields"]
         for name in ("h_sig", "h_noise", "composition"):
             fields[name] = {"class": "none"}
         obstore.put(open_object_store(str(tmp_path)), MANIFEST_NAME, json.dumps(manifest).encode())
         report = validate_pyramid(str(tmp_path))
+        assert report["checks"]["declaration"]["status"] == "pass"
+        assert "composable fields ['count']" in report["checks"]["declaration"]["detail"]
         assert report["field_classes"]["none"] == ["composition", "h_noise", "h_sig"]
         assert report["checks"]["digests"]["status"] == "skip"
         assert report["checks"]["composition"]["status"] == "skip"
@@ -512,6 +525,39 @@ class TestHarnessCatchesCorruption:
         report = validate_pyramid(str(tmp_path), full=True)
         assert report["checks"]["digests"]["status"] == "fail"
         assert "weight" in report["checks"]["digests"]["detail"]
+
+    def test_broken_cascade_level_is_caught_on_its_own(self, tmp_path):
+        # The finest-level cases above reach the coarse check only
+        # TRANSITIVELY (corrupting -31 also breaks -3, whose fold source it
+        # is). This corrupts the CASCADE-written node itself, so the i > 0
+        # source tier and `_Harness.span`'s rank arithmetic are pinned
+        # independently — an off-by-one there would otherwise hide behind the
+        # finest-level failures.
+        from zagg.sweep_overview import decode_digest
+
+        self._swept(tmp_path)
+        group = self._overview_group(tmp_path, "-3", 2)
+        counts = group["count"][:]
+        j = int(np.flatnonzero(counts > 0)[0])
+        counts[j] += 1
+        group["count"][:] = counts
+        words = group["composition"][:]
+        w = int(np.flatnonzero(words > 0)[0])
+        words[w] = int(words[w]) ^ (1 << 8)
+        group["composition"][:] = words
+        slab = group["h_sig"][:]
+        d = next(i for i in range(len(slab)) if slab[i] is not None and len(slab[i]))
+        digest = decode_digest(bytes(slab[d]), "float32").copy()
+        digest[:, 1] *= 2
+        slab[d] = encode_digest(digest, "float32")
+        group["h_sig"][:] = slab
+        report = validate_pyramid(str(tmp_path), full=True)
+        for name in ("counts", "digests", "composition"):
+            assert report["checks"][name]["status"] == "fail", (name, format_report(report))
+            assert all(
+                m.startswith("-3[") or m.startswith("ladder ")
+                for m in report["checks"][name].get("mismatches", [])
+            ), report["checks"][name]
 
     def test_missing_node_object_is_caught(self, tmp_path):
         import shutil
