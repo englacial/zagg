@@ -368,15 +368,76 @@ class _Harness:
         depth = src_cell_order - _order(cell_dec)
         return _rank(cell_dec[len(container_dec) :]) * 4**depth, 4**depth
 
-    def contributions(self, cell_dec, source, field: str) -> list:
-        """The contributor slab slices for one output cell, one field."""
+    def contributions(self, cell_dec, source, field: str) -> tuple[list, bool]:
+        """``(slab slices, complete)`` for one output cell, one field.
+
+        Both contributor-side reads are guarded, because both are cases the
+        SWEEP treats as ordinary and neither may raise out of a read-only
+        production run (review finding):
+
+        * a roster member whose object is absent or unreadable — the root
+          ``coverage.moc`` is a D9 regenerable cache, so it can name a leaf
+          that is gone. The fold skips it (``read_commit`` is None, or a
+          logged unreadable leaf); the harness cannot reconstruct what the
+          sweep saw, so ``complete`` goes False and the caller declines the
+          cell rather than comparing against a short fold.
+        * a contributor missing the declared FIELD — supported schema
+          evolution: it contributes fill, which is exactly no contribution,
+          so the comparison stays valid and ``complete`` stays True.
+        """
         src_order, src_cell_order, roster, opener = source
-        out = []
+        out, complete = [], True
         for container in self.containers(cell_dec, src_order, roster):
-            group = opener(container)
+            try:
+                group = opener(container)
+            except Exception as exc:
+                self.warn(f"contributor {container} unreadable ({exc}) — cells it covers skipped")
+                complete = False
+                continue
+            try:
+                arr = group[field]
+            except KeyError:
+                self.warn(f"contributor {container} lacks field {field!r} — contributes fill")
+                continue
             start, n = self.span(cell_dec, container, src_cell_order)
-            out.append(np.asarray(group[field][start : start + n]))
-        return out
+            out.append(np.asarray(arr[start : start + n]))
+        return out, complete
+
+    def paired_contributions(self, cell_dec, source, word_field: str, of_field: str):
+        """``(parts, poisoned, complete)`` for a packed field and its divisor.
+
+        Mirrors the sweep's half-pair poison rule (``_fold_node``): a
+        contributor carrying the ``of`` digest but NOT the word leaves every
+        output cell it covers at the fill word ``0``, whatever its siblings
+        contributed — so the expected word for such a cell is the fill, not a
+        k-way merge (spec §3.3). The reverse skew (word without divisor)
+        contributes nothing and poisons nothing. Pairing per CONTAINER also
+        keeps the two arrays aligned, which zipping two independent
+        ``contributions`` calls does not once either side drops a container.
+        """
+        src_order, src_cell_order, roster, opener = source
+        parts, poisoned, complete = [], False, True
+        for container in self.containers(cell_dec, src_order, roster):
+            try:
+                group = opener(container)
+            except Exception as exc:
+                self.warn(f"contributor {container} unreadable ({exc}) — cells it covers skipped")
+                complete = False
+                continue
+            has_word, has_of = word_field in group, of_field in group
+            if has_of and not has_word:
+                poisoned = True
+                continue
+            if not has_of:
+                continue
+            start, n = self.span(cell_dec, container, src_cell_order)
+            parts.append(
+                (
+                    np.asarray(group[word_field][start : start + n]),
+                    np.asarray(group[of_field][start : start + n]),
+                )
+            )
+        return parts, poisoned, complete
 
 
 def validate_pyramid(
@@ -808,8 +869,10 @@ def _check_node(
     for j in cells:
         cell_dec = node + _tail(int(j), t - k)
         # Counts: exact conservation.
+        parts, complete = harness.contributions(cell_dec, source, "count")
+        if not complete:
+            continue  # an unreadable contributor: this cell is not validated
         counted["counts"] += 1
-        parts = harness.contributions(cell_dec, source, "count")
         expected = _exact_expected(
             np.concatenate(parts) if parts else np.array([], dtype=counts.dtype),
             "sum",
@@ -824,7 +887,9 @@ def _check_node(
 
         # Other exact fields, same law check.
         for name, meta in exact_fields.items():
-            parts = harness.contributions(cell_dec, source, name)
+            parts, complete = harness.contributions(cell_dec, source, name)
+            if not complete:
+                continue
             vals = (
                 np.concatenate(parts)
                 if parts
@@ -844,12 +909,10 @@ def _check_node(
         # Digests: k-way re-fold, weight-exact + CDF within tolerance.
         for name, meta in digest_fields.items():
             dtype = meta.get("dtype", "float32")
-            payloads = [
-                p
-                for chunk in harness.contributions(cell_dec, source, name)
-                for p in chunk.tolist()
-                if p is not None and len(p)
-            ]
+            chunks, complete = harness.contributions(cell_dec, source, name)
+            if not complete:
+                continue
+            payloads = [p for chunk in chunks for p in chunk.tolist() if p is not None and len(p)]
             raw = _payload_bytes(group[name][int(j) : int(j) + 1][0])
             counted["digests"] += 1
             if not payloads:
@@ -877,15 +940,19 @@ def _check_node(
             of_meta = harness.fields.get(of) or {}
             of_dtype = of_meta.get("dtype", "float32")
             inner = tuple(of_meta.get("inner_shape") or (2,))
-            words = harness.contributions(cell_dec, source, name)
-            digests = harness.contributions(cell_dec, source, of)
+            paired, poisoned, complete = harness.paired_contributions(cell_dec, source, name, of)
+            if not complete:
+                continue
             parts = []
-            for wchunk, dchunk in zip(words, digests):
+            for wchunk, dchunk in paired:
                 for w, p in zip(wchunk.tolist(), dchunk.tolist()):
                     n = payload_weight(p, of_dtype, inner)
                     if n > 0:
                         parts.append((int(w), n))
-            expected_word = merge_composition_kway(parts) if parts else 0
+            # A half-paired contributor poisons the whole cell to the fill
+            # word, siblings included (spec §3.3) — that is the sweep's rule,
+            # so it is the expectation here too.
+            expected_word = 0 if poisoned or not parts else merge_composition_kway(parts)
             stored_word = int(np.asarray(group[name][int(j)]))
             counted["composition"] += 1
             if stored_word != expected_word:
@@ -905,7 +972,9 @@ def _check_node(
     # ... and the fill side of the presence law: no contributor may carry data.
     for j in empty_probe:
         cell_dec = node + _tail(int(j), t - k)
-        parts = harness.contributions(cell_dec, source, "count")
+        parts, complete = harness.contributions(cell_dec, source, "count")
+        if not complete:
+            continue
         got = _exact_expected(
             np.concatenate(parts) if parts else np.array([], dtype=counts.dtype), "sum", fill
         )
@@ -925,17 +994,28 @@ def _ladder_totals(harness, ladder, materialized, leaves, count_meta, errors, co
     """
     fill = count_meta.get("fill_value", 0)
 
-    def total(groups):
-        out = 0
-        for group in groups:
-            values = np.asarray(group["count"][:])
+    def total(opener, names):
+        out, complete = 0, True
+        for name in names:
+            try:
+                values = np.asarray(opener(name)["count"][:])
+            except Exception as exc:
+                # A stale root MOC can name a leaf that is gone (D9 cache):
+                # skipped and named, never a traceback out of a read-only run.
+                harness.warn(f"ladder totals: {name} unreadable ({exc}) — totals not comparable")
+                complete = False
+                continue
             out += int(values[~_missing_mask(values, fill)].sum())
-        return out
+        return out, complete
 
-    base = total(harness.leaf_group(d) for d in leaves)
+    base, complete = total(harness.leaf_group, leaves)
+    if not complete:
+        return
     for k, t in ladder:
+        level, complete = total(lambda n, t=t: harness.node_group(n, t), materialized[k])
+        if not complete:
+            continue
         counted["counts"] += 1
-        level = total(harness.node_group(n, t) for n in materialized[k])
         if level != base:
             errors["counts"].append(f"ladder o{k}: total {level} != base {base}")
 
