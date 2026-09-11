@@ -144,7 +144,11 @@ class TestFourFieldSchema:
             mode="r",
             zarr_format=3,
         )
-        for _res, group in column.groups():
+        groups = dict(column.groups())
+        # The group set is half the claim — pin it by value so a build that
+        # wrote no group (or no column) cannot pass the loop vacuously.
+        assert set(groups) == {"5", "4"}
+        for group in groups.values():
             assert set(dict(group.arrays())) == ATL03_COLUMN_ARRAYS
 
 
