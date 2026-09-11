@@ -506,6 +506,60 @@ def _settle_value_checks(
         report["warnings"] = list(harness.warnings)
 
 
+def _declared_subset(node, t, attrs, provenance_attr, arrays, harness, errors):
+    """Declared fields this artifact legally OMITS (§4.4), or None if broken.
+
+    Spec §4.4: "an overview's variable set may therefore be a *subset* of the
+    leaf's — heterogeneous variable sets across level nodes are in contract,
+    and a reader MUST NOT assume every leaf field exists at every overview
+    order". The sweep is built for it —
+    :meth:`zagg.sweep_stage._ColumnReader.read` reads an absent field as
+    ``None`` so a deepened ``overviews`` declaration over existing columns
+    under-covers rather than aborting — so requiring every DECLARED field on
+    every artifact false-fails a store mid-declaration-deepening (review
+    finding). Two absences are told apart:
+
+    - the field's payload and ALL its companion siblings are gone, and the
+      artifact's own recorded ``fields`` map does not claim it — a legal
+      subset: its value checks are declined and NAMED, nothing fails;
+    - anything else — the artifact's attrs claim a field whose array is gone,
+      a payload without its declared companion, or an orphaned companion
+      without its payload — is corruption or a broken channel (issue #410),
+      and fails read-back by name.
+
+    ``morton`` is the cell coordinate, never a declared overview field: its
+    absence is always a failure.
+    """
+    if "morton" not in arrays:
+        errors["readback"].append(f"{node}[{t}]: no 'morton' coordinate array")
+        return None
+    block = (attrs or {}).get(provenance_attr)
+    recorded = set((block.get("fields") or {})) if isinstance(block, dict) else set()
+    absent, broken = set(), []
+    for name in harness.fields:
+        siblings = {s for s, owner in harness.companions.items() if owner == name}
+        gone = {s for s in siblings if s not in arrays}
+        if name in arrays:
+            if gone:
+                broken.append(f"{name} present but declared companion(s) {sorted(gone)} missing")
+        elif name in recorded:
+            broken.append(f"{name} absent, but this artifact's {provenance_attr!r} claims it")
+        elif gone != siblings:
+            broken.append(f"{name} absent while companion(s) {sorted(siblings - gone)} remain")
+        else:
+            absent.add(name)
+    if broken:
+        errors["readback"].append(f"{node}[{t}]: arrays {'; '.join(sorted(broken))}")
+        return None
+    for name in sorted(absent):
+        harness.warn(
+            f"{node}[{t}]: declared field {name!r} has no array here and the artifact does "
+            f"not claim one — a legal §4.4 variable subset (a declaration deepened over an "
+            f"older artifact); its value checks are DECLINED until the leaf re-runs"
+        )
+    return absent
+
+
 def _check_node(
     harness,
     node,
@@ -583,13 +637,19 @@ def _check_node(
         errors["readback"].append(f"{node}: group open failed at resolution {t}: {exc}")
         return
     arrays = set(group.array_keys())
-    wanted = {"morton", *harness.fields, *harness.companions}
-    if not wanted <= arrays:
-        errors["readback"].append(f"{node}[{t}]: arrays missing {sorted(wanted - arrays)}")
+    absent = _declared_subset(node, t, attrs, provenance_attr, arrays, harness, errors)
+    if absent is None:
         return
+    if absent:
+        exact_fields = {n: m for n, m in exact_fields.items() if n not in absent}
+        digest_fields = {n: m for n, m in digest_fields.items() if n not in absent}
+        packed_fields = {n: m for n, m in packed_fields.items() if n not in absent}
+        count_meta = None if "count" in absent else count_meta
     # A companion sibling must be row-aligned with the payload it rides (§9.1):
     # a channel that silently vanished or shortened cannot be caught by value.
     for sibling, owner in harness.companions.items():
+        if owner in absent:
+            continue
         if group[sibling].shape != group[owner].shape:
             errors["readback"].append(
                 f"{node}: companion {sibling} shape {group[sibling].shape} != "
