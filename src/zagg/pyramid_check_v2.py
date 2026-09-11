@@ -31,7 +31,8 @@ spec §4.4/§4.6 make normative:
   at resolution ``r`` reads each contributing leaf's column group at
   ``max(r, shard_order)`` — its own cells for a gather, its node-order
   partial for a merge — which is byte-what the staged sweep consumed (the
-  merge-source law makes tuple grouping irrelevant). A gather level's
+  merge-source law makes tuple grouping irrelevant *for the folded values*;
+  see :func:`_value_checks_v2` for the §3.3 poison-unit caveat). A gather level's
   packed word is compared as ASSIGNED gen-1 content, not re-merged (§3.4
   quantization drift is per merge). The column tier itself is validated
   against the leaf's own cell arrays — the §4.6 from-leaves parity, whose
@@ -289,11 +290,22 @@ def _value_checks_v2(
     """Read-back + counts + digests + composition, both /2 tiers.
 
     Ladder levels re-fold from the LEAF COLUMNS (the gen-1 tier the staged
-    sweep itself consumes — the merge-source law makes the tuple grouping
-    between them irrelevant); the column tier re-folds from the leaf's own
-    cell arrays (§4.6 from-leaves parity). The composition compare is always
-    exact here: the /2 regime is DERIVED from the geometry
+    sweep itself consumes); the column tier re-folds from the leaf's own cell
+    arrays (§4.6 from-leaves parity). The composition compare is always exact
+    here: the /2 regime is DERIVED from the geometry
     (:func:`zagg.sweep_stage.classify_level`), never guessed.
+
+    The merge-source law makes the FOLDED VALUES independent of the tuple
+    grouping the sweep happened to use, which is what licenses re-folding
+    per leaf. It does not extend to the §3.3 half-pair poison, whose unit is
+    the CHILD COLUMN at ``child_order`` (``sweep_stage._merge_slabs`` blanks
+    ``range(base // factor, ...)``, siblings included, left wide by design) —
+    so a contributor carrying an ``of`` digest without its word poisons a
+    span this harness, pairing per LEAF in
+    :meth:`zagg.pyramid_check_core._Harness.paired_contributions`, would
+    expect a k-way merge for. It needs a stage column skewed that way, so it
+    is not reachable from a sweep that wrote its pairs; the law is quoted
+    here for values only, not for the poison span (review finding).
     """
     from zagg.column import column_resolutions
     from zagg.sweep_overview import OVERVIEW_ATTR
