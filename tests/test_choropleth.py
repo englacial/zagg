@@ -232,6 +232,16 @@ class TestGeometry:
         assert all(-180.0 <= x <= 180.0 for x in lons)
         assert shape(geom).is_valid
 
+    def test_coarse_default_step_traces_the_polar_corner(self, tmp_path):
+        _store(tmp_path, decimals=("111",))  # base cell 1 has a pole corner
+        coarse = _by_morton(export_choropleth(str(tmp_path), order=0))["1"]["geometry"]
+        pinned = _by_morton(export_choropleth(str(tmp_path), order=0, step=4))["1"]["geometry"]
+        assert len(coarse["coordinates"][0]) == 4 * (4 << 6) + 1  # 256 points per side
+        assert shape(coarse).area > 1.05 * shape(pinned).area  # step=4 chords the corner off
+        leaf = _by_morton(export_choropleth(str(tmp_path)))["111"]["geometry"]
+        # 4 << max(0, 6 - order): the fixture's leaves are order 2, a live o9 store's get 4.
+        assert len(leaf["coordinates"][0]) == 4 * (4 << (6 - SHARD_ORDER)) + 1
+
     def test_every_feature_shapely_round_trips_through_json(self, tmp_path):
         _store(tmp_path)
         fc = json.loads(json.dumps(export_choropleth(str(tmp_path))))
