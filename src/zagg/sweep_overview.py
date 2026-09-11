@@ -673,7 +673,11 @@ def declare_pyramid(store_root: str, config, *, store_kwargs=None) -> dict:
     inventory overview artifacts already on disk — overviews at
     now-undeclared orders stay as regenerable-cache debris, D24 option A).
     An ``output.pyramid: false`` config installs the declared-off block:
-    recording absence is a valid retrofit.
+    recording absence is a valid retrofit. The manifest ``multiscales``
+    discovery mirror (issue #392, spec §4.9) is maintained by the same
+    write: installed/refreshed for a ``/2`` block, removed otherwise — so
+    declaring an unchanged ``/2`` config again on a pre-mirror store is the
+    one "identical" case that still PUTs (it adds the missing mirror).
 
     Returns a summary dict carrying ``fold_source`` (the declared fold
     regime, issue #376), ``fields`` (``{name: class}``), ``validated`` (what
@@ -758,6 +762,17 @@ def declare_pyramid(store_root: str, config, *, store_kwargs=None) -> dict:
     materialized = prior_overview.get("materialized") if isinstance(prior_overview, dict) else None
     if materialized is not None:
         block["overview"]["materialized"] = materialized
+    # The issue #392 discovery mirror rides the same RMW: derived from the
+    # block being installed (never authoritative — the pyramid block wins,
+    # §4.9), present exactly when that block is /2, removed otherwise. A /2
+    # store declared before the mirror existed stays idempotent on
+    # the pyramid block yet still gains the key here.
+    from zagg.multiscales import manifest_multiscales
+
+    mirror = manifest_multiscales({**fresh, "pyramid": block})
+    mirror_current = (
+        fresh.get("multiscales") == mirror if mirror is not None else "multiscales" not in fresh
+    )
     summary = {
         # The schedule key of the declared revision, and only that one: this
         # dict is what ``--declare-pyramid`` prints, and an empty ``orders``
@@ -775,12 +790,18 @@ def declare_pyramid(store_root: str, config, *, store_kwargs=None) -> dict:
         "fields": {n: m.get("class") for n, m in (block["overview"].get("fields") or {}).items()},
         "validated": f"{validated}; {semantic}",
         "previous": "absent" if prior is None else "identical" if prior == block else "replaced",
-        "updated": prior != block,
+        "updated": prior != block or not mirror_current,
+        # Whether the written manifest carries the §4.9 mirror — /2 only.
+        "multiscales": mirror is not None,
     }
-    if prior == block:
+    if prior == block and mirror_current:
         logger.info("declare_pyramid: the manifest already carries this declaration; no write")
         return summary
     fresh["pyramid"] = block
+    if mirror is not None:
+        fresh["multiscales"] = mirror
+    else:
+        fresh.pop("multiscales", None)
     put_object(
         open_object_store(store_root, **store_kwargs),
         MANIFEST_NAME,

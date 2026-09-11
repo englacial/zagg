@@ -291,7 +291,10 @@ def build_manifest(grid, dataset: dict | None = None, windowing: dict | None = N
     (:func:`zagg.sweep_overview.build_pyramid_block`, issue #201); the §7
     sweep populates ``materialized`` actuals but never rewrites the
     declaration (overviews are a second-pass sweep, never written at
-    fan-out time — D11).
+    fan-out time — D11). A ``/2`` declaration additionally carries the
+    ``multiscales`` discovery mirror beside it (issue #392, spec §4.9):
+    derived from the block by :func:`zagg.multiscales.manifest_multiscales`,
+    never authoritative, absent on ``/1``/declared-off manifests.
 
     ``windowing`` (issue #246) is the normalized declaration from
     :func:`zagg.config.get_windowing`; when given, the manifest declares
@@ -330,6 +333,14 @@ def build_manifest(grid, dataset: dict | None = None, windowing: dict | None = N
         ),
         "generated_at": _utcnow(),
     }
+    # The issue #392 discovery mirror: present exactly when the block above
+    # declares /2 (absent = pre-convention store; the pyramid block wins on
+    # any disagreement — it is the normative declaration, spec §4.5/§4.9).
+    from zagg.multiscales import manifest_multiscales
+
+    multiscales = manifest_multiscales(manifest)
+    if multiscales is not None:
+        manifest["multiscales"] = multiscales
     if windowing:
         temporal = {
             "schedule": windowing["schedule"],
