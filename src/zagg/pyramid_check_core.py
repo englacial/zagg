@@ -527,6 +527,7 @@ def _check_node(
     provenance_attr=None,
     group_getter=None,
     values=True,
+    refold_payloads=True,
 ):
     """The value laws over one artifact's resolution group, both grammars.
 
@@ -547,6 +548,12 @@ def _check_node(
     that under-covers its subtree), where a cell value is not evidence but
     the artifact's own shape still is (review finding: under-coverage argues
     against comparing cell values, not against reading the artifact back).
+    ``refold_payloads=False`` keeps the per-cell exact legs (dense arrays)
+    but drops the two that read whole contributor PAYLOADS — the digest
+    k-way re-fold and the packed word's ``of`` weights — for a cell whose
+    contributor span the caller has judged too wide to be a sample (review
+    finding: the §4.6 parity leg's span is set by the geometry, so
+    ``sample_cells`` cannot shrink it).
     """
     from zagg.grids.morton import morton_word
     from zagg.stats.composition import merge_composition_kway
@@ -680,7 +687,7 @@ def _check_node(
                 errors["counts"].append(f"{node}[{int(j)}]/{name}: {stored} != fold {expected}")
 
         # Digests: k-way re-fold, weight-exact + CDF within tolerance.
-        for name, meta in digest_fields.items():
+        for name, meta in (digest_fields if refold_payloads else {}).items():
             dtype = meta.get("dtype", "float32")
             chunks, complete = harness.contributions(cell_dec, source, name)
             if not complete:
@@ -709,7 +716,7 @@ def _check_node(
         # only when the fold tier is PINNED (the /1 node's own provenance, or
         # the /2 grammar's derived regime) — an exact compare against a
         # guessed tier is a false fail, not a check.
-        for name, meta in (packed_fields if compose_exact else {}).items():
+        for name, meta in (packed_fields if compose_exact and refold_payloads else {}).items():
             of = meta["of"]
             of_meta = harness.fields.get(of) or {}
             of_dtype = of_meta.get("dtype", "float32")
