@@ -37,22 +37,23 @@
           "class": "packed",
           "reason": "divisor-missing",
           "contributors": 1,
-          "of": "h_tdigest_signal"
+          "of": "h_tdigest_signal",
+          "cells": 4
         }
       ],
       "generation": {
         "n_leaves": 1,
-        "max_leaf_timestamp": "2026-09-11T01:05:43+00:00"
+        "max_leaf_timestamp": "2026-09-11T01:23:29+00:00"
       },
       "content_hash": "f0f9c89eba2a6277f832450bb5753596aa2ea9d092d42cbf77c5c60ae6728330",
-      "generated_at": "2026-09-11T01:05:43+00:00"
+      "generated_at": "2026-09-11T01:23:29+00:00"
     },
     "morton_hive_commit": {
       "spec": "morton-hive/1",
       "complete": true,
       "cells_with_data": 1,
       "granule_count": 1,
-      "written_at": "2026-09-11T01:05:43+00:00"
+      "written_at": "2026-09-11T01:23:29+00:00"
     }
   },
   "zarr_format": 3,

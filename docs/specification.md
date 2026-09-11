@@ -754,7 +754,14 @@ regionally heterogeneous resolution).
   materializes and carries the record.
 
   `field`/`class`/`reason`/`contributors` are always present; `of` names
-  the §3.3 linkage; `cells` is keyed only in the `word-missing` direction.
+  the §3.3 linkage; `cells` is keyed whenever the demotion left output cells
+  at the fill word that no surviving contributor covers — always in the
+  `word-missing` direction, and in the `divisor-missing` direction only where
+  contributors own **disjoint** spans of the level (the `/1` cascade of child
+  overviews, where a child skipped for the field leaves its whole span fill).
+  Where many contributors share each output cell — a `/1` fold from leaves, a
+  `/2` stage merge — a dropped contributor blanks nothing and the key is
+  absent. A reader MUST NOT read its absence as "nothing was blanked".
   Readers MUST tolerate additional keys, MUST tolerate the key's absence (a
   clean fold, or any pre-#518 artifact — a clean fold's attrs are
   byte-identical to a pre-#518 writer's), and MUST NOT read absence as "no
@@ -1770,7 +1777,8 @@ product is never sharded, §8/#247):
   leaf arrays carry the divisor regardless of its declared class) and
   carries **no** `demotions` key — the absence pin — while the cascaded
   level above it fires `divisor-missing` on its one contributor, holds the
-  all-fill word slab, and records the demotion in its `zagg_overview`
+  all-fill word slab, and records the demotion — `cells: 4`, the skipped
+  child's whole disjoint span of the 16-cell level — in its `zagg_overview`
   attrs. `demoted.expected.json` records both levels' paths, fold sources
   and the demotions list beside the leaf record.
 

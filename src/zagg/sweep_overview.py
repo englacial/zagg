@@ -126,9 +126,13 @@ def note_demotion(acc: dict, field: str, reason: str, of, *, cells=None) -> None
 
     ``acc`` is a fold site's ``{(field, reason): {of, contributors, cells}}``
     scratch map; ``cells`` is the iterable of output-cell indices the
-    contributor caused to be blanked (the ``word-missing`` direction only —
-    a dropped contributor blanks nothing, its absence is ordinary
-    under-coverage for the one field).
+    contributor left at the fill word that no surviving contributor covers.
+    Always the case in the ``word-missing`` direction (the fold blanks them);
+    in the ``divisor-missing`` direction only where contributors own DISJOINT
+    spans — the cascade, where a skipped child's span stays fill. At a leaf
+    fold (and a stage merge) many contributors share each output cell, so a
+    dropped one blanks nothing and the caller passes no ``cells``: its
+    absence is ordinary under-coverage for the one field.
     """
     entry = acc.setdefault((str(field), str(reason)), {"of": of, "contributors": 0, "cells": set()})
     entry["contributors"] += 1
@@ -144,8 +148,9 @@ def demotion_records(acc: dict) -> list:
     composition is a log line in an exited worker, and a reader cannot tell
     a fill cell that is absence-by-design from one the rail blanked. Sorted
     by ``(field, reason)`` so the recorded list is deterministic; ``cells``
-    is keyed only when output cells were actively blanked, and readers MUST
-    tolerate additional keys (the §4.3 posture).
+    is keyed only when the demotion left output cells at the fill word that
+    no surviving contributor covers, and readers MUST tolerate additional
+    keys (the §4.3 posture).
     """
     records = []
     for (field, reason), entry in sorted(acc.items()):
@@ -2039,17 +2044,14 @@ def _cascade_node(
             continue
         start = _rel_rank(child, node) * span
         for field, reason, of in notes:
-            # In the word-missing direction the child's whole span stays at
-            # the fill word while its divisor digest folds — the same
-            # word-coverage shortfall the leaf fold poisons for, reached by
-            # assignment here — so the span is the record's ``cells``.
-            note_demotion(
-                demoted,
-                field,
-                reason,
-                of,
-                cells=range(start, start + span) if reason == DEMOTION_WORD_MISSING else None,
-            )
+            # BOTH directions leave the child's whole span at the fill word,
+            # so the span is the record's ``cells`` either way — unlike the
+            # leaf fold, where a dropped contributor blanks nothing because
+            # SIBLING leaves' words cover the same output cells. Children own
+            # DISJOINT spans here (the assignment below), so a child skipped
+            # for the field leaves span cells nothing else can ever cover
+            # (review finding).
+            note_demotion(demoted, field, reason, of, cells=range(start, start + span))
         for name, partial in partials.items():
             # Children own disjoint spans of the parent slab, so this is an
             # assignment — the accumulate-then-merge the leaf fold needs (and

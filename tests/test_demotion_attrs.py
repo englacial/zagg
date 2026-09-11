@@ -385,6 +385,9 @@ class TestV1SweepArtifactDemotions:
         level1 = _v1_attrs(tmp_path, "-3/1")
         assert "demotions" not in level1 and "h_sig" not in level1["fields"]
         level0 = _v1_attrs(tmp_path, "-3")
+        # ``cells`` is keyed in the cascade's drop direction too: children own
+        # disjoint spans, so the skipped child's 4 cells of the 16-cell level-0
+        # slab stay at the fill word with nothing else able to cover them.
         assert level0["demotions"] == [
             {
                 "field": "composition",
@@ -392,6 +395,7 @@ class TestV1SweepArtifactDemotions:
                 "reason": "divisor-missing",
                 "contributors": 1,
                 "of": "h_sig",
+                "cells": 4,
             }
         ]
         # And the composition array at level 0 is all fill — which is exactly

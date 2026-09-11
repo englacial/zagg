@@ -2014,14 +2014,18 @@ class TestDemotionAttrs:
         assert block["demotions"] == exp["demoted"]["demotions"]
         [record] = block["demotions"]
         # The record grammar: ``field``/``class``/``reason``/``contributors``
-        # always, ``of`` naming the §3.3 linkage, ``cells`` only when output
-        # cells were blanked (the ``word-missing`` direction) — and readers
-        # MUST tolerate additional keys (§4.3).
+        # always, ``of`` naming the §3.3 linkage, ``cells`` whenever the
+        # demotion left output cells at the fill word no surviving contributor
+        # covers — the case here, since a cascade's children own disjoint
+        # spans — and readers MUST tolerate additional keys (§4.3).
         assert record["field"] == "composition" and record["class"] == "packed"
         assert record["reason"] in ("word-missing", "divisor-missing")
-        assert record["reason"] == "divisor-missing" and "cells" not in record
+        assert record["reason"] == "divisor-missing"
         assert record["contributors"] == 1
         assert record["of"] == "h_tdigest_signal"
+        # The child's whole span, and the level is one child wide: 4 of the
+        # node's 16 cells, matching the all-fill word slab below.
+        assert record["cells"] == 4
 
     def test_the_clean_level_carries_no_demotions_key(self):
         # Absent, never empty: a level the rail did not fire at is
