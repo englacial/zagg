@@ -160,7 +160,7 @@ def _write_leaf(root, dec, per_cell):
     stamp_commit(store, cells_with_data=sum(1 for c in per_cell if c["n_signal"]), granule_count=1)
 
 
-def _build_store(root, *, orders=(1, 0), leaves=LEAVES):
+def _build_store(root, *, orders=(1, 0), leaves=LEAVES, fold_source="cascade", exact_levels=1):
     """Leaves + manifest (dense /1 ladder) + root coverage; returns the manifest."""
     for i, dec in enumerate(leaves):
         _write_leaf(root, dec, _cells(LEAF_CELLS, 40, seed=100 + i))
@@ -176,8 +176,8 @@ def _build_store(root, *, orders=(1, 0), leaves=LEAVES):
                 "spacing": 1,
                 "orders": list(orders),
                 "all_time": False,
-                "fold_source": "cascade",
-                "exact_levels": 1,
+                "fold_source": fold_source,
+                "exact_levels": exact_levels,
                 "fields": {k: dict(v) for k, v in FIELDS.items()},
             },
         },
@@ -241,6 +241,46 @@ class TestFixtureE2E:
         assert report["roster"]["leaves"] == len(LEAVES)
 
 
+class TestFoldRegimes:
+    """The fold source is READ per node, never assumed to be the next level."""
+
+    def test_leaves_regime_passes(self, tmp_path):
+        # `fold_source: "leaves"` folds EVERY level from the raw leaves, so
+        # the coarse level's composition word is a single quantization over
+        # the leaves' words — comparing it against the order-1 overviews (the
+        # next-finer assumption) would be a guaranteed false fail.
+        manifest = _build_store(tmp_path, fold_source="leaves")
+        _sweep(tmp_path, manifest)
+        report = validate_pyramid(str(tmp_path), full=True)
+        assert report["passed"] is True, format_report(report)
+        assert report["checks"]["composition"]["status"] == "pass"
+
+    def test_exact_levels_two_passes(self, tmp_path):
+        # Same trap by the other knob: exact_levels 2 makes BOTH declared
+        # levels leaves-sourced under a 'cascade' declaration.
+        manifest = _build_store(tmp_path, exact_levels=2)
+        _sweep(tmp_path, manifest)
+        report = validate_pyramid(str(tmp_path), full=True)
+        assert report["passed"] is True, format_report(report)
+        assert report["checks"]["composition"]["status"] == "pass"
+
+    def test_missing_provenance_declines_the_exact_compare(self, tmp_path):
+        # A node whose recorded fold provenance is gone: counts and digests
+        # still hold under the next-finer heuristic (associative/tolerance
+        # laws), but the exact composition compare is DECLINED and named.
+        from zagg.sweep_overview import OVERVIEW_ATTR
+
+        manifest = _build_store(tmp_path)
+        _sweep(tmp_path, manifest)
+        node_meta = tmp_path / "-3" / "all.zarr" / "zarr.json"
+        meta = json.loads(node_meta.read_text())
+        meta["attributes"][OVERVIEW_ATTR].pop("fold_source")
+        node_meta.write_text(json.dumps(meta))
+        report = validate_pyramid(str(tmp_path), full=True)
+        assert any("no recorded fold provenance" in w for w in report["warnings"]), report
+        assert "declined" in format_report(report)
+
+
 class TestLadderGrammars:
     """The read-side follows either pyramid grammar's ladder."""
 
@@ -267,6 +307,22 @@ class TestLadderGrammars:
             (Path(__file__).parent / "data" / "ca_atl03_tdigest_o9_morton_hive.json").read_text()
         )
         assert _ladder(manifest) == [(k, k + 4) for k in range(8, -1, -1)]
+
+    def test_v2_store_is_refused_not_best_effort_validated(self, tmp_path):
+        # The /2 ladder is written by the STAGED sweep, whose fold is not a
+        # level-from-level cascade: the declaration is parsed and reported,
+        # but validating it with the /1 model would manufacture a verdict.
+        manifest = _build_store(tmp_path)
+        _sweep(tmp_path, manifest)
+        manifest["pyramid"]["spec"] = "zagg-pyramid/2"
+        manifest["pyramid"]["overviews"] = [{"node": 1, "cells": [3]}, {"node": 0, "cells": [2]}]
+        obstore.put(open_object_store(str(tmp_path)), MANIFEST_NAME, json.dumps(manifest).encode())
+        report = validate_pyramid(str(tmp_path), full=True)
+        entry = report["checks"]["declaration"]
+        assert entry["status"] == "fail"
+        assert "zagg-pyramid/2" in entry["detail"]
+        assert report["ladder"] == [{"node": 1, "cells": 3}, {"node": 0, "cells": 2}]
+        assert report["passed"] is False
 
 
 class TestPreSweepBaseline:
