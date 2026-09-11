@@ -448,6 +448,43 @@ class TestV2Provenance:
         assert any("leaf-column" in m for m in entry["mismatches"])
 
 
+class TestV2DeclaredFieldSubset:
+    """§4.4: an artifact's variable set may be a SUBSET of the leaf's."""
+
+    def test_deepened_declaration_declines_the_new_field(self, tmp_path):
+        # A field declared AFTER the artifacts were written: every ladder
+        # node and every column legally omits it (the sweep's own posture —
+        # sweep_stage._ColumnReader.read folds an absent member as fill), so
+        # the harness declines and NAMES it rather than false-failing a store
+        # mid-declaration-deepening.
+        _build_store(tmp_path)
+        manifest = json.loads((tmp_path / MANIFEST_NAME).read_text())
+        manifest["pyramid"]["overview"]["fields"]["h_extra"] = dict(FIELDS["h_sig"])
+        obstore.put(open_object_store(str(tmp_path)), MANIFEST_NAME, json.dumps(manifest).encode())
+        report = validate_pyramid(str(tmp_path), full=True)
+        assert report["passed"] is True, format_report(report)
+        declined = [w for w in report["warnings"] if "'h_extra'" in w]
+        assert declined, format_report(report)
+        assert "legal §4.4 variable subset" in declined[0]
+        # ... and the fields that ARE there are still compared.
+        assert report["checks"]["digests"]["status"] == "pass"
+        assert report["sampled"]["digests"] > 0
+
+    def test_attrs_claiming_an_absent_array_is_corruption(self, tmp_path):
+        # The other side of the same law: the artifact's own zagg_overview
+        # fields map claims h_noise, but the array is gone — an integrity
+        # break, not a declaration subset.
+        import shutil
+
+        _build_store(tmp_path)
+        shutil.rmtree(tmp_path / "-3" / "all.zarr" / "2" / "h_noise")
+        report = validate_pyramid(str(tmp_path), full=True)
+        entry = report["checks"]["readback"]
+        assert entry["status"] == "fail"
+        assert any("h_noise absent, but this artifact's" in m for m in entry["mismatches"]), entry
+        assert report["passed"] is False
+
+
 class TestV2Corruption:
     """Break the swept /2 store, see FAIL — at every level shape and tier."""
 
