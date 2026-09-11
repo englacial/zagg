@@ -48,10 +48,16 @@ under one convention does not describe cells under the other, and composing
 them is meaningless (mortie spec §9 is where the prohibition binds). The
 `dggs` attrs block
 (`zagg.grids.healpix.HealpixGrid._dggs_attrs`) does not yet stamp mortie's
-`latitude` token; until it does, this paragraph is the record for zagg
-stores, and a reader reproducing cell geometry (e.g. a viewer's boundary
-golden test) needs the geodetic ↔ authalic conversion at every geodetic
-seam, exactly as mortie spec §9 prescribes.
+`latitude` token; what it does stamp is `ellipsoid: {name: WGS84,
+semimajor_axis: 6378137.0, inverse_flattening: 298.257223563}` and no sphere
+radius — that entry is the **ingress datum** (the geodetic coordinates fed
+to `geo2mort`, equal-area on that ellipsoid by construction), not an
+instruction to compute cell geometry on the ellipsoid: the words themselves
+live on the R = 6371.0088 km authalic sphere the conversion maps onto.
+Until the token lands, this paragraph is the record for zagg stores, and a
+reader reproducing cell geometry (e.g. a viewer's boundary golden test)
+needs the geodetic ↔ authalic conversion at every geodetic seam, exactly as
+mortie spec §9 prescribes.
 
 Design *rationale* — why each decision was made, with trade studies and
 ratification records — lives in
