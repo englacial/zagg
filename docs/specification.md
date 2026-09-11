@@ -1437,6 +1437,100 @@ bookkeeping and §4.3's per-artifact attrs. A reader MUST tolerate
 additional keys on the multiscale object and on its entries (additive
 grammar, same rule as §4.5).
 
+### 4.10 The multiscales companion group
+
+**Status: contract — issue
+[#394](https://github.com/englacial/zagg/issues/394) (espg re-scope ruling
+2026-09-10: zagg-native, references only — never data copies).** The §4.9
+mirror makes the ladder *discoverable*; the **companion group** makes it
+*walkable by stock zarr tooling*: one literal zarr v3 group hierarchy at
+the reserved store-root path **`multiscales/`**, mirroring the **coarse
+ladder** — one child group per §4.4 ladder order, `shard_order - 1` down
+to 0 — that a plain zarr reader opens with zero custom code. It holds
+**metadata only**: group documents and attrs. No arrays and no data bytes
+— every entry *references* node artifacts by store-root-relative path.
+
+**Contract.**
+
+- **Layout.** `multiscales/zarr.json` is a zarr v3 group document whose
+  `attributes` carry the §4.9 `multiscales` list (derived fresh from the
+  manifest's `pyramid` block at write time — the block wins over any
+  recorded copy, §4.9) plus the `zagg_multiscales` provenance stamp, and
+  whose `consolidated_metadata` block (`kind: "inline"`, `must_understand:
+  false`) inlines every child group document byte-identically — so one GET
+  of that object walks the whole tree. Each ladder order additionally has
+  its own `multiscales/{order}/zarr.json` group document, so
+  non-consolidated walkers work too. Write order is child documents first,
+  the root document LAST — the root doc is the commit marker; a prefix
+  without it is debris.
+- **The root stamp** —
+
+  ```json
+  "zagg_multiscales": {
+    "spec": "zagg-multiscales/1",
+    "window": "all",
+    "members_source": "coverage.moc",
+    "generated_at": "2026-09-11T00:00:00+00:00"
+  }
+  ```
+
+  `window` is the §4.2 window token the member references resolve —
+  **`"all"` only in this revision**: the companion mirrors the all-time
+  fold (per-window mirrors are a declared non-goal of `/1`, issue #394
+  decision (2)). `members_source` records where the member node set came
+  from: `"coverage.moc"` (the root MOC, one GET) or `"run-records"` (the
+  D22 discovery fallback). `generated_at` is the staleness discriminator
+  (see below).
+- **Per-order groups** — the child group named `str(order)` carries
+
+  ```json
+  "zagg_multiscales_level": {
+    "spec": "zagg-multiscales/1",
+    "order": 2, "cells": [3], "artifact": "overview", "window": "all",
+    "members": {"-311": "-3/1/1/all.zarr/3"}
+  }
+  ```
+
+  `order`/`cells`/`artifact` are the §4.9 dataset entry verbatim;
+  `members` maps each **node decimal** the ladder owns at this order —
+  the order-`k` ancestors of the store's occupied shards — to the
+  **store-root-relative path of that node's resolution group**:
+  `{hive_path(node)}/all.zarr/{cells[0]}` (path grammar: mortie's
+  hive-path convention; a ladder entry has exactly one member resolution,
+  §4.4). The leaf entry and the native resolution are deliberately **not**
+  mirrored: their artifact count is the shard count, which is exactly the
+  scale the hive grammar exists to handle — the companion is the coarse,
+  cap-bounded tier (issue #394 decision (1)); both remain declared in the
+  root attrs' §4.9 list.
+- **References claim ownership, never presence.** A member names where the
+  node's overview artifact lives **when materialized**; overviews are
+  regenerable caches (§4.1) and declared-but-unswept is legal (§4.5), so a
+  reader following a member path MUST treat an absent or unstamped
+  artifact as "not materialized", never as a broken store. An empty
+  `members` map (a declared-but-unoccupied store) is likewise legal.
+- **Presence and gating.** The companion is written for a `/2` store whose
+  all-time fold exists by declaration: an unwindowed store always (its
+  single fold IS all-time, §4.2), a windowed store only when
+  `pyramid.overview.all_time` is true. Absence of the whole group is
+  always legal (a pre-convention store, or a gated windowed store). The
+  name `multiscales` is **reserved** at the store root: it is excluded
+  from the D19 product-name grammar (like the base-component exclusion) so
+  a multi-product root walker can never classify it as a product.
+- **Writers.** The staged sweep's designated finisher refreshes the
+  companion after its manifest RMW, gated on the run having touched shards
+  and **fail-open** (the finisher's load-bearing steps never fail on it);
+  `python -m zagg.sweep <root> --write-multiscales` writes/refreshes it
+  standalone. Single-writer discipline is inherited from the finisher's
+  own (§4.8: one finisher per admitted run).
+- **Normativity and staleness.** The manifest + hive remain truth; the
+  companion is a **recorded mirror** (D9 cache class): regenerable at any
+  time, self-healing on the sweep ratchet (the finisher rewrites it each
+  admitted run), and stale-detectable — a `generated_at` older than the
+  manifest's pyramid declaration or the newest §4.5 `actuals` means the
+  member sets may lag store truth. On any disagreement the manifest wins,
+  exactly as §4.9. A reader MUST tolerate additional keys in both attrs
+  blocks.
+
 ## 5. O11 content hashes
 
 **Status: contract — frozen on
@@ -1669,11 +1763,12 @@ drift fails zagg's own suite (`tests/test_spec_conformance.py`) on
 whichever side moved. moczarr vendors the same fixtures for its parity
 gates (espg/moczarr#19/#20).
 
-Six tiny single-shard hive stores plus one manifest-only declaration, all
-on the same deliberately small geometry — shard order 4, inner-chunk order
-5, cell order 6 (16 cells, K = 4 inner chunks of 4 cells), sharded (the
-hive default; `raster_toc/` is the one exception — a `(time, cells)`
-product is never sharded, §8/#247):
+Six tiny single-shard hive stores plus two metadata-only ones (the
+`pyramid/` declaration and the `multiscales/` companion), all on the same
+deliberately small geometry — shard order 4, inner-chunk order 5, cell
+order 6 (16 cells, K = 4 inner chunks of 4 cells), sharded (the hive
+default; `raster_toc/` is the one exception — a `(time, cells)` product is
+never sharded, §8/#247):
 
 - **`minimal/`** — one *unlocated* digest field (`h_tdigest`) plus `count`.
   The smallest thing that is a conforming store.
@@ -1728,6 +1823,16 @@ product is never sharded, §8/#247):
   arrives with the sweep-side fixtures of
   [#384](https://github.com/englacial/zagg/issues/384).
 
+- **`multiscales/`** — the §4.10 companion-group surface: METADATA ONLY —
+  a `zagg-pyramid/2` manifest on `pyramid/`'s grid, a production root
+  `coverage.moc` naming two occupied order-3 shards, and the companion
+  tree at the reserved root path `multiscales/`: a consolidated root
+  group document (the §4.9 mirror + the `zagg_multiscales` stamp) plus
+  one child group per coarse ladder order, each mapping the order's
+  ancestor nodes to store-root-relative resolution-group paths. No
+  arrays, no leaves, no overview artifacts — the committed golden pins
+  that §4.10 references claim ownership, never presence, and that the
+  tree opens with stock zarr alone.
 - **`raster_toc/`** — the §8 temporal declaration surface: one raster
   `(time, cells)` hive leaf whose `time` coordinate is `uint64` toc words
   carrying `temporal: {"spec": "zagg-toc/1", "shape": "coordinate", …}` and no CF

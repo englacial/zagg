@@ -1,0 +1,140 @@
+{
+ "zarr_format": 3,
+ "node_type": "group",
+ "attributes": {
+  "multiscales": [
+   {
+    "spec": "zagg-multiscales/1",
+    "name": "SPEC_FIXTURE",
+    "base": {
+     "order": 3,
+     "cells": [
+      6
+     ]
+    },
+    "datasets": [
+     {
+      "order": 3,
+      "cells": [
+       5,
+       4
+      ],
+      "artifact": "column"
+     },
+     {
+      "order": 2,
+      "cells": [
+       3
+      ],
+      "artifact": "overview"
+     },
+     {
+      "order": 1,
+      "cells": [
+       2
+      ],
+      "artifact": "overview"
+     },
+     {
+      "order": 0,
+      "cells": [
+       1
+      ],
+      "artifact": "overview"
+     }
+    ],
+    "order2res": {
+     "3": [
+      5,
+      4
+     ],
+     "2": [
+      3
+     ],
+     "1": [
+      2
+     ],
+     "0": [
+      1
+     ]
+    },
+    "fields": {
+     "count": "exact",
+     "h_tdigest": "approximate",
+     "h_min": "exact",
+     "h_mean": "none"
+    },
+    "fold": {
+     "fold_source": "cascade",
+     "exact_levels": 1
+    }
+   }
+  ],
+  "zagg_multiscales": {
+   "spec": "zagg-multiscales/1",
+   "window": "all",
+   "members_source": "coverage.moc",
+   "generated_at": "2026-09-11T01:14:36+00:00"
+  }
+ },
+ "consolidated_metadata": {
+  "kind": "inline",
+  "must_understand": false,
+  "metadata": {
+   "2": {
+    "zarr_format": 3,
+    "node_type": "group",
+    "attributes": {
+     "zagg_multiscales_level": {
+      "spec": "zagg-multiscales/1",
+      "order": 2,
+      "cells": [
+       3
+      ],
+      "artifact": "overview",
+      "window": "all",
+      "members": {
+       "-311": "-3/1/1/all.zarr/3"
+      }
+     }
+    }
+   },
+   "1": {
+    "zarr_format": 3,
+    "node_type": "group",
+    "attributes": {
+     "zagg_multiscales_level": {
+      "spec": "zagg-multiscales/1",
+      "order": 1,
+      "cells": [
+       2
+      ],
+      "artifact": "overview",
+      "window": "all",
+      "members": {
+       "-31": "-3/1/all.zarr/2"
+      }
+     }
+    }
+   },
+   "0": {
+    "zarr_format": 3,
+    "node_type": "group",
+    "attributes": {
+     "zagg_multiscales_level": {
+      "spec": "zagg-multiscales/1",
+      "order": 0,
+      "cells": [
+       1
+      ],
+      "artifact": "overview",
+      "window": "all",
+      "members": {
+       "-3": "-3/all.zarr/1"
+      }
+     }
+    }
+   }
+  }
+ }
+}

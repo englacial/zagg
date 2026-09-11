@@ -1,0 +1,149 @@
+{
+ "spec": "morton-hive/1",
+ "dataset": {
+  "short_name": "SPEC_FIXTURE",
+  "version": "1"
+ },
+ "semantic_hash": "55f495522d501e29c35363437e7bce3ca6bf3137eda6880493e53b9a854ff6bb",
+ "cell_order": 6,
+ "shard_order": 3,
+ "split_schedule": [
+  1,
+  1,
+  1
+ ],
+ "path_grouping": 1,
+ "pyramid": {
+  "spec": "zagg-pyramid/2",
+  "overviews": [
+   {
+    "node": 3,
+    "cells": [
+     5,
+     4
+    ]
+   },
+   {
+    "node": 2,
+    "cells": [
+     3
+    ]
+   },
+   {
+    "node": 1,
+    "cells": [
+     2
+    ]
+   },
+   {
+    "node": 0,
+    "cells": [
+     1
+    ]
+   }
+  ],
+  "overview": {
+   "all_time": false,
+   "fold_source": "cascade",
+   "exact_levels": 1,
+   "fields": {
+    "count": {
+     "class": "exact",
+     "method": "sum",
+     "nan_policy": "skip",
+     "dtype": "int32",
+     "fill_value": 0
+    },
+    "h_tdigest": {
+     "class": "approximate",
+     "method": "tdigest_kway",
+     "dtype": "float32",
+     "inner_shape": [
+      2
+     ],
+     "delta": 16,
+     "overview_delta": 16
+    },
+    "h_min": {
+     "class": "exact",
+     "method": "min",
+     "nan_policy": "skip",
+     "dtype": "float32",
+     "fill_value": 0
+    },
+    "h_mean": {
+     "class": "none"
+    }
+   }
+  }
+ },
+ "generated_at": "2026-09-11T01:14:36+00:00",
+ "multiscales": [
+  {
+   "spec": "zagg-multiscales/1",
+   "name": "SPEC_FIXTURE",
+   "base": {
+    "order": 3,
+    "cells": [
+     6
+    ]
+   },
+   "datasets": [
+    {
+     "order": 3,
+     "cells": [
+      5,
+      4
+     ],
+     "artifact": "column"
+    },
+    {
+     "order": 2,
+     "cells": [
+      3
+     ],
+     "artifact": "overview"
+    },
+    {
+     "order": 1,
+     "cells": [
+      2
+     ],
+     "artifact": "overview"
+    },
+    {
+     "order": 0,
+     "cells": [
+      1
+     ],
+     "artifact": "overview"
+    }
+   ],
+   "order2res": {
+    "3": [
+     5,
+     4
+    ],
+    "2": [
+     3
+    ],
+    "1": [
+     2
+    ],
+    "0": [
+     1
+    ]
+   },
+   "fields": {
+    "count": "exact",
+    "h_tdigest": "approximate",
+    "h_min": "exact",
+    "h_mean": "none"
+   },
+   "fold": {
+    "fold_source": "cascade",
+    "exact_levels": 1
+   }
+  }
+ ]
+}
