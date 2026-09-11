@@ -327,9 +327,9 @@ class _Harness:
         # ``{sibling array: owning field}`` for every declared companion
         # channel (issue #410): a located/temporal field's ``{field}_locations``
         # / ``{field}_times`` slabs are written by both fold paths, so an
-        # overview that lost one is not a valid overview. Their VALUES cannot
-        # be re-derived here (the words are keyed to the centroid partition the
-        # merge produced), but their presence and row alignment can.
+        # overview that lost one is not a valid overview. Their VALUES cannot be
+        # re-derived here (the words are keyed to the centroid partition the
+        # merge produced); presence and row alignment can.
         self.companions = {
             sibling: name
             for name, meta in self.fields.items()
@@ -389,19 +389,15 @@ class _Harness:
     def contributions(self, cell_dec, source, field: str) -> tuple[list, bool]:
         """``(slab slices, complete)`` for one output cell, one field.
 
-        Both contributor-side reads are guarded, because both are cases the
-        SWEEP treats as ordinary and neither may raise out of a read-only
-        production run (review finding):
-
-        * a roster member whose object is absent or unreadable — the root
-          ``coverage.moc`` is a D9 regenerable cache, so it can name a leaf
-          that is gone. The fold skips it (``read_commit`` is None, or a
-          logged unreadable leaf); the harness cannot reconstruct what the
-          sweep saw, so ``complete`` goes False and the caller declines the
-          cell rather than comparing against a short fold.
-        * a contributor missing the declared FIELD — supported schema
-          evolution: it contributes fill, which is exactly no contribution,
-          so the comparison stays valid and ``complete`` stays True.
+        Both contributor-side reads are guarded: each is a case the SWEEP
+        treats as ordinary, so neither may raise out of a read-only run
+        (review finding). A roster member whose object is absent or unreadable
+        — the root ``coverage.moc`` is a D9 regenerable cache and can name a
+        leaf that is gone — sets ``complete`` False, and the caller declines
+        the cell rather than compare against a short fold. A contributor
+        missing the declared FIELD is supported schema evolution: it
+        contributes fill, which is exactly no contribution, so the comparison
+        stays valid and ``complete`` stays True.
         """
         src_order, src_cell_order, roster, opener = source
         out, complete = [], True
@@ -427,11 +423,11 @@ class _Harness:
         Mirrors the sweep's half-pair poison rule (``_fold_node``): a
         contributor carrying the ``of`` digest but NOT the word leaves every
         output cell it covers at the fill word ``0``, whatever its siblings
-        contributed — so the expected word for such a cell is the fill, not a
-        k-way merge (spec §3.3). The reverse skew (word without divisor)
-        contributes nothing and poisons nothing. Pairing per CONTAINER also
-        keeps the two arrays aligned, which zipping two independent
-        ``contributions`` calls does not once either side drops a container.
+        contributed — so the expected word there is the fill, not a k-way
+        merge (spec §3.3). The reverse skew (word without divisor) contributes
+        nothing and poisons nothing. Pairing per CONTAINER also keeps the two
+        arrays aligned, which zipping two independent ``contributions`` calls
+        does not once either side drops a container.
         """
         src_order, src_cell_order, roster, opener = source
         parts, poisoned, complete = [], False, True
@@ -483,9 +479,8 @@ def validate_pyramid(
     ``full=True`` is REFUSED for ``s3://`` roots, like ``resweep``: it voids
     every bound in the module header — ``_ladder_totals`` alone reads every
     leaf's whole ``count`` array (~12 GB across the ATL03 o9 roster, whose
-    leaves are ``4**10`` int32 each) and the per-cell arm then walks every
-    populated cell of every node. Sampling is what makes this safe to point
-    at a production store (review finding).
+    leaves are ``4**10`` int32 each) before the per-cell arm walks every
+    populated cell of every node (review finding).
     """
     from zagg.hive import read_manifest
 
@@ -553,12 +548,11 @@ def validate_pyramid(
     if report["pyramid_spec"] == "zagg-pyramid/2":
         # Refused the way a windowed store is: the /2 ladder is written by the
         # STAGED sweep (:mod:`zagg.sweep_stage`), whose levels fold from the
-        # dispatch node's child columns at the shard/child order rather than
-        # level-from-level, and which stamps ``regime``/``merges_from_raw``/
-        # ``source_children`` instead of ``fold_source``/``fold_from_order``.
-        # Validating it with the /1 cascade model would produce a verdict from
-        # a fold the store does not have (review finding); the ladder above is
-        # still parsed and reported, so the DECLARATION is on the record.
+        # dispatch node's child columns rather than level-from-level, and which
+        # stamps ``regime``/``merges_from_raw`` instead of ``fold_source``/
+        # ``fold_from_order``. Validating it with the /1 cascade model would
+        # produce a verdict from a fold the store does not have (review
+        # finding); the ladder above is parsed, so the declaration is recorded.
         checks["declaration"] = _entry(
             "fail",
             f"zagg-pyramid/2 ladder {[k for k, _ in ladder]} declared — this harness "
@@ -587,10 +581,10 @@ def validate_pyramid(
     # write order pins role/provenance attrs BEFORE the stamp, so role alone
     # accepts a torn write that :func:`zagg.sweep_overview._overview_committed`
     # refuses — and whose arrays the cascade deliberately left at fill (review
-    # finding). Both stamps live in the one ``zarr.json`` already probed, so
-    # this costs no extra GET. A bare/attr-less node object or a role-without-
-    # stamp one is a partial write (e.g. the aborted 2026-08-25 sweep's debris,
-    # issue #547 forensics): unmaterialized, reported separately.
+    # finding). Both live in the one ``zarr.json`` already probed, so this
+    # costs no extra GET. A bare/attr-less node object or a role-without-stamp
+    # one is a partial write (the aborted 2026-08-25 sweep's debris, issue #547
+    # forensics): unmaterialized, reported separately.
     from zagg.hive import COMMIT_ATTR
     from zagg.sweep_overview import ROLE_ATTR
 
@@ -783,15 +777,12 @@ def _source_for(harness, ladder, i, declared, probes, leaves, attrs):
     ``fold_source: "leaves"`` (every level folds from the raw leaves),
     ``exact_levels > 1`` (the finest N do), and the gap-wider-than-the-slab
     fallback. Assuming the cascade would make the packed composition compare —
-    which is exact, and re-quantizes its lanes once per fold — a GUARANTEED
-    false fail under any of them, so the tier is read, never inferred (review
-    finding).
-
-    With no usable provenance the next-finer heuristic still holds for counts
-    and digests (an associative law and a tolerance-based one), but the exact
-    composition compare is declined and said so: ``exact_composition`` is
-    False. The finest level is the one case that needs no provenance — it has
-    no finer overview to cascade from at all.
+    exact, and re-quantized once per fold — a GUARANTEED false fail under any
+    of them, so the tier is read, never inferred (review finding). With no
+    usable provenance the next-finer heuristic still holds for counts and
+    digests (an associative law and a tolerance-based one) but the exact
+    composition compare is declined and said so. The finest level needs no
+    provenance: it has no finer overview to cascade from at all.
     """
     from zagg.sweep_overview import OVERVIEW_ATTR
 
