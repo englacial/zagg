@@ -67,6 +67,24 @@ def _config_yaml(tmp_path) -> str:
     return str(path)
 
 
+def _other_config() -> dict:
+    """A config differing in the semantic core (a reducer), not in ``output.*``."""
+    other = json.loads(json.dumps(CONFIG_DICT))
+    other["aggregation"]["variables"]["h_min"]["function"] = "max"
+    return other
+
+
+def _stamp_semantic_hash(root, config_dict: dict) -> None:
+    """Give the fixture manifest a ``semantic_hash`` — the live stores carry one,
+    so without this every ``--execute`` test runs the unverified (pre-#299) branch."""
+    from zagg.config import load_config_from_dict
+    from zagg.semantics import semantic_hash
+
+    manifest = json.loads((root / MANIFEST_NAME).read_text())
+    manifest["semantic_hash"] = semantic_hash(load_config_from_dict(config_dict))
+    (root / MANIFEST_NAME).write_text(json.dumps(manifest))
+
+
 class TestDryRun:
     def test_prints_diff_and_writes_nothing(self, tmp_path, capsys):
         _store(tmp_path)  # /1 [1, 0], never materialized (the atl03 shape)
@@ -147,18 +165,8 @@ class TestDryRun:
         assert "manifest pyramid diff" not in out
 
     def test_semantic_mismatch_is_loud_but_read_only(self, tmp_path, capsys):
-        import obstore
-
-        from zagg.config import load_config_from_dict
-        from zagg.semantics import semantic_hash
-        from zagg.store import open_object_store
-
         _store(tmp_path)
-        other = dict(CONFIG_DICT, aggregation=json.loads(json.dumps(CONFIG_DICT["aggregation"])))
-        other["aggregation"]["variables"]["h_min"]["function"] = "max"
-        manifest = json.loads((tmp_path / MANIFEST_NAME).read_text())
-        manifest["semantic_hash"] = semantic_hash(load_config_from_dict(other))
-        obstore.put(open_object_store(str(tmp_path)), MANIFEST_NAME, json.dumps(manifest).encode())
+        _stamp_semantic_hash(tmp_path, _other_config())
         before = (tmp_path / MANIFEST_NAME).read_bytes()
         rc = tool.main([str(tmp_path), "--config", _config_yaml(tmp_path), "--overviews", "3"])
         assert rc == 0
@@ -187,6 +195,33 @@ class TestExecute:
         assert block["spec"] == PYRAMID_SPEC_V2
         assert [e["node"] for e in block["overviews"]] == [2, 1, 0]
 
+    def test_execute_refuses_a_semantic_mismatch(self, tmp_path):
+        """The fixtures write no ``semantic_hash``; the live manifests do.
+
+        With one present, ``--execute`` must take the *comparing* branch of
+        ``_semantic_guard`` and refuse a config that did not build the store —
+        the whole reason the tool demands the ORIGINAL δ=4096 config.
+        """
+        _store(tmp_path)
+        _stamp_semantic_hash(tmp_path, _other_config())
+        before = (tmp_path / MANIFEST_NAME).read_bytes()
+        with pytest.raises(ValueError, match="did not build this store"):
+            tool.main(
+                [str(tmp_path), "--config", _config_yaml(tmp_path), "--overviews", "3", "--execute"]
+            )
+        assert (tmp_path / MANIFEST_NAME).read_bytes() == before
+
+    def test_execute_matching_semantic_hash_installs(self, tmp_path):
+        """The same gate must not false-refuse the intended retrofit: the
+        ``output.pyramid`` edit is outside the semantic core."""
+        _store(tmp_path)
+        _stamp_semantic_hash(tmp_path, CONFIG_DICT)
+        tool.main(
+            [str(tmp_path), "--config", _config_yaml(tmp_path), "--overviews", "3", "--execute"]
+        )
+        block = read_manifest(str(tmp_path))["pyramid"]
+        assert [e["node"] for e in block["overviews"]] == [2, 1, 0]
+
     def test_execute_refuses_anon(self, tmp_path):
         _store(tmp_path)
         with pytest.raises(SystemExit, match="cannot run with --anon"):
@@ -201,6 +236,42 @@ class TestExecute:
                     "--anon",
                 ]
             )
+
+
+class TestStoreRootRefusals:
+    """The two pre-derivation manifest gates (they sit after the version gate,
+    which is what ``TestVersionGate`` short-circuits before reaching them)."""
+
+    def test_no_manifest_is_not_a_hive_store_root(self, tmp_path):
+        with pytest.raises(SystemExit, match="not a hive store root"):
+            tool.main([str(tmp_path), "--config", _config_yaml(tmp_path), "--overviews", "3"])
+
+    def test_manifest_without_orders_refuses(self, tmp_path):
+        (tmp_path / MANIFEST_NAME).write_text(json.dumps({"spec": "morton-hive/1"}))
+        with pytest.raises(SystemExit, match="declares no shard_order/cell_order"):
+            tool.main([str(tmp_path), "--config", _config_yaml(tmp_path), "--overviews", "3"])
+
+
+class TestAnon:
+    def test_anon_threads_skip_signature_into_the_store_read(self, tmp_path, monkeypatch, capsys):
+        """``--anon``'s only use is a public-bucket dry run: pin the key name."""
+        from zagg import hive
+
+        seen: dict = {}
+        real = hive.read_manifest
+
+        def spy(store_root, **store_kwargs):
+            seen.update(store_kwargs)
+            return real(store_root)
+
+        monkeypatch.setattr(hive, "read_manifest", spy)
+        _store(tmp_path)
+        rc = tool.main(
+            [str(tmp_path), "--config", _config_yaml(tmp_path), "--overviews", "3", "--anon"]
+        )
+        assert rc == 0
+        assert seen == {"region": "us-west-2", "skip_signature": True}
+        assert "DRY-RUN: nothing was written" in capsys.readouterr().out
 
 
 class TestVersionGate:
