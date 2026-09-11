@@ -281,6 +281,24 @@ class TestFoldRegimes:
         assert "declined" in format_report(report)
 
 
+class TestProductionBounds:
+    """Sampling is what makes this safe to point at a production store."""
+
+    def test_full_is_refused_for_s3_roots(self, tmp_path):
+        import pytest
+
+        with pytest.raises(ValueError, match="refused for s3://"):
+            validate_pyramid("s3://bucket/prefix.zarr", full=True)
+
+    def test_cli_refuses_full_on_s3(self, capsys):
+        import pytest
+
+        with pytest.raises(SystemExit) as exc:
+            main(["s3://bucket/prefix.zarr", "--anon", "--full"])
+        assert exc.value.code == 2
+        assert "--full is refused for s3:// roots" in capsys.readouterr().err
+
+
 class TestDeclaredButUnvalidated:
     """Nothing declared composable leaves the report without a trace."""
 
