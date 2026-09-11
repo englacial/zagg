@@ -22,8 +22,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the retired multipart ring form, holes included, pinned in
   `tests/test_aoi_mask.py`. `pyproject` requires `mortie>=1.0.0`, the AOI
   version guard moves to the same floor, and the reader notebooks pin
-  `mortie>=1.0` with `moczarr[zagg]>=0.7.1` (the moczarr release that carries
+  `mortie>=1.0` with `moczarr[zagg]>=0.8.0` (the moczarr release that carries
   its own migration, espg/moczarr#59). No behaviour change.
+  **Release order:** zagg 0.53.0 is the first zagg on mortie 1.0, and
+  moczarr 0.8.0's `[zagg]` extra floors on `zagg>=0.53.0` alongside its own
+  `mortie>=1.0.0` (espg/moczarr#61) — so zagg 0.53.0 ships first, then
+  moczarr 0.8.0, then a Binder rebuild.
 
 - every `-disk` worker variant gets Lambda's 10240 MB `/tmp` ceiling (#536)
   ([#537](https://github.com/englacial/zagg/pull/537))
