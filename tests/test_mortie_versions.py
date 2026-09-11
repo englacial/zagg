@@ -18,9 +18,12 @@ an API the dependency floor does not guarantee, which reaches a user as an
 quoted under ``docs/`` or ``src/`` must be at or below the floor, and the
 ``aoi_mask`` family — the sites that document (3) and therefore cannot be
 de-versioned — must quote the enforced constant exactly wherever they state it
-as a *requirement* (``mortie >= 0.8.3``). Arrival voice in those same files
+as a *requirement* (``mortie >= 1.0.0``). Arrival voice in those same files
 ("shipped in 0.8.2") is history, not a restatement of the gate, so it is held
-to the floor like any other citation and not to the constant.
+to the floor like any other citation and not to the constant. (This file is in
+neither ``SCAN_ROOT``, so nothing checks that sentence against the constant it
+quotes — a ``MIN_MORTIE_VERSION`` bump has to update it by hand; the loose
+citation examples further down are deliberately synthetic and stay put.)
 
 Scope note — two blind spots, both deliberate and both needing a human eye on a
 ``MIN_MORTIE_VERSION`` bump. A citation is recognized only where the release
