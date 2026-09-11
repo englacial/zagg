@@ -1457,8 +1457,10 @@ to 0 — that a plain zarr reader opens with zero custom code. It holds
   manifest's `pyramid` block at write time — the block wins over any
   recorded copy, §4.9) plus the `zagg_multiscales` provenance stamp, and
   whose `consolidated_metadata` block (`kind: "inline"`, `must_understand:
-  false`) inlines every child group document byte-identically — so one GET
-  of that object walks the whole tree. Each ladder order additionally has
+  false`) inlines every child group document identically **as JSON** — the
+  inlined copy and the standalone `multiscales/{order}/zarr.json` decode to
+  equal documents, not to equal bytes (the nested copy is indented deeper),
+  so one GET of that object walks the whole tree. Each ladder order additionally has
   its own `multiscales/{order}/zarr.json` group document, so
   non-consolidated walkers work too. Write order is child documents first,
   the root document LAST — the root doc is the commit marker; a prefix
