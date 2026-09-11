@@ -377,9 +377,16 @@ class TestGediFromScratch:
         ``rx_flux`` is ``approximate`` (the waveform digest joined the digest
         family in issue #508; ``temporal: per-centroid`` is the §8.3 shape,
         not the ``per-cell`` exclusion), so a GEDI ``declare_pyramid`` today
-        admits ``{count, rx_flux}`` and a backfill materializes columns
-        carrying both plus the ``rx_flux_times`` sibling. Every per-shot
-        companion stays ``none``.
+        admits ``{count, rx_flux}``. Every per-shot companion stays ``none``.
+
+        Scope: ``temporal`` is pinned here at the DECLARATION level only —
+        the fixture generator's flux arm declares no temporal channel, so
+        the from-scratch test below exercises the §2.0 ``weights`` surface
+        and not the §8.3 companion. The temporal fold itself (the
+        ``*_times`` sibling through ``column_from_leaf`` / ``write_column``)
+        is covered in ``test_column.py`` (``_CHANNELS``,
+        ``test_a_missing_temporal_slab_refuses_by_name``); driving it
+        through the BACKFILL is left to a follow-up.
         """
         from zagg.config import default_config
         from zagg.pyramid import declared_fields
