@@ -278,11 +278,11 @@ class TestDeclarePyramid:
 SHARDS = ("-311", "-312")
 
 
-def _coverage(root, decimals=SHARDS):
+def _coverage(root, decimals=SHARDS, order=SHARD_ORDER):
     from zagg.grids.morton import morton_word
     from zagg.hive import build_root_coverage, write_root_coverage
 
-    envelope = build_root_coverage([morton_word(d) for d in decimals], SHARD_ORDER)
+    envelope = build_root_coverage([morton_word(d) for d in decimals], order)
     write_root_coverage(str(root), envelope)
 
 
@@ -381,6 +381,24 @@ class TestCompanionGroup:
         self._store(tmp_path)
         _run_record(tmp_path)
         summary = write_multiscales_group(str(tmp_path))
+        assert summary["members_source"] == "run-records"
+        for order, members in self.MEMBERS.items():
+            doc = json.loads((tmp_path / GROUP_NAME / order / "zarr.json").read_text())
+            assert doc["attributes"][LEVEL_ATTR]["members"] == members
+
+    def test_wrong_order_coverage_moc_falls_back_to_run_records(self, tmp_path, caplog):
+        # The root MOC survives an ``ensure_manifest(overwrite=True)``
+        # re-template, so its order can drift from the manifest's. Member
+        # decimals are prefix slices of the envelope's words: a COARSER
+        # envelope would file order-1 nodes under the order-1 level with only
+        # a base decimal, i.e. a wrong companion rather than an empty one.
+        self._store(tmp_path)
+        _coverage(tmp_path, decimals=("-31",), order=1)  # manifest says 2
+        assert json.loads((tmp_path / "coverage.moc").read_text())["order"] == 1
+        _run_record(tmp_path)
+        with caplog.at_level("WARNING"):
+            summary = write_multiscales_group(str(tmp_path))
+        assert "is order 1 but the manifest declares shard_order 2" in caplog.text
         assert summary["members_source"] == "run-records"
         for order, members in self.MEMBERS.items():
             doc = json.loads((tmp_path / GROUP_NAME / order / "zarr.json").read_text())

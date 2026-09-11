@@ -166,9 +166,9 @@ def write_multiscales_group(store_root: str, *, store_kwargs=None) -> dict:
     via zarr v3 consolidated metadata (one GET walks the tree), and is PUT
     LAST — the commit marker; a prefix without it is debris.
 
-    Member discovery is the root ``coverage.moc`` when usable (one GET),
-    else the D22 run-record discovery; the stamp records which
-    (``members_source``). Raises on a store with no ``/2`` declaration
+    Member discovery is the root ``coverage.moc`` when usable (one GET:
+    present, and at the manifest's ``shard_order``), else the D22 run-record
+    discovery; the stamp records which (``members_source``). Raises on a store with no ``/2`` declaration
     (the caller's explicit operation, same posture as ``declare_pyramid``);
     returns a ``{"written": False, "reason": ...}`` summary on the
     windowed-without-``all_time`` gate — a legal store this revision's
@@ -209,7 +209,24 @@ def write_multiscales_group(store_root: str, *, store_kwargs=None) -> dict:
             f"the /1 companion mirrors the all-time fold only; nothing written"
         )
         return {"written": False, "reason": "windowed store without all_time"}
+    shard_order = int(manifest["shard_order"])
     envelope = load_coverage(store_root, **store_kwargs)
+    if envelope is not None and int(envelope.get("order", -1)) != shard_order:
+        # The root MOC is a store-ROOT object: it survives an
+        # ``ensure_manifest(..., overwrite=True)`` re-template, so its order
+        # can drift from the manifest's. ``_node_at`` is prefix slicing, so a
+        # coarser envelope would yield member decimals SHORTER than the level
+        # they are filed under — a wrong companion, which §4.10's
+        # "ownership, not presence" rule cannot absorb (a reader reads it as
+        # store truth). Fall through to the run records, whose packed words
+        # are self-describing. Same gate as the overview sweep's
+        # ``_candidate_decimals``.
+        logger.warning(
+            f"multiscales: the root coverage.moc at {store_root} is order "
+            f"{envelope.get('order')} but the manifest declares shard_order "
+            f"{shard_order} — ignoring it; discovering members from the run records"
+        )
+        envelope = None
     if envelope is not None:
         # One batch decode, never a per-word wrap: the expansion is already
         # O(covered shards), and the scalar form rebuilds a one-element
