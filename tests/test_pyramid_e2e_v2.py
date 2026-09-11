@@ -150,6 +150,9 @@ class TestV2FixtureE2E:
         assert report["columns"] == {"declared": 5, "materialized": 5}
         assert report["roster"] == {"source": "coverage.moc", "leaves": len(LEAVES)}
         assert report["missing_nodes"] == [] and report["missing_columns"] == []
+        # A clean fixture declines NOTHING: without this, a regression that
+        # starts silently declining legs still shows green here.
+        assert report.get("warnings") in (None, []), report.get("warnings")
         printed = format_report(report)
         for name in CHECKS_V2:
             assert name in printed
@@ -615,12 +618,14 @@ class TestV2Corruption:
         _write_leaf(tmp_path, "-3111", _cells(LEAF_CELLS, 40, seed=999))
         report = validate_pyramid(str(tmp_path), full=True)
         assert report["passed"] is False
-        failing = {
-            n
-            for n in ("counts", "digests", "composition")
-            if report["checks"][n]["status"] == "fail"
-        }
-        assert failing, format_report(report)
+        # Name the leg: the COLUMN-vs-leaf parity is what went stale, so
+        # every mismatch is on the rewritten leaf's own column. (The ladder
+        # folds from that column and is still self-consistent with it, and
+        # `counts` cannot move — _cells gives every cell the same total.)
+        for name in ("digests", "composition"):
+            entry = report["checks"][name]
+            assert entry["status"] == "fail", format_report(report)
+            assert {m.split("[")[0] for m in entry["mismatches"]} == {"-3111"}, entry
 
     def test_stale_ladder_after_rebackfill_without_resweep(self, tmp_path):
         # The E2E failure mode the gate exists for, /2 shape: leaf AND column
@@ -632,12 +637,14 @@ class TestV2Corruption:
         assert counts["written"] == 1, counts
         report = validate_pyramid(str(tmp_path), full=True)
         assert report["passed"] is False
-        failing = {
-            n
-            for n in ("counts", "digests", "composition")
-            if report["checks"][n]["status"] == "fail"
-        }
-        assert failing, format_report(report)
+        # The column is fresh again, so the §4.6 parity leg is CLEAN: every
+        # mismatch must be on a LADDER node above the rewritten leaf.
+        for name in ("digests", "composition"):
+            entry = report["checks"][name]
+            assert entry["status"] == "fail", format_report(report)
+            nodes = {m.split("[")[0] for m in entry["mismatches"]}
+            assert nodes <= {"-311", "-31", "-3"}, entry
+            assert "-311" in nodes, entry
 
     def test_blanked_node_does_not_pass(self, tmp_path):
         # A correctly-SHAPED but empty node must fail via the fill-side
