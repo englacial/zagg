@@ -2151,6 +2151,10 @@ class TestByteIdentityOracle:
 
         extra = {} if max_nodes == "default" else {"max_nodes_per_invoke": max_nodes}
         if squeeze:
+            # It packs by payload alone, so an explicit `max_nodes` would be
+            # silently discarded and the arm would report green on an axis it
+            # never drove (review finding). Refuse the combination instead.
+            assert max_nodes == "default", "squeeze packs by payload alone"
             # Measured, not guessed: a probe run with no handler writes nothing
             # and reports the tuple's real single-batch event. One byte under
             # it is the ONLY cap that both forces the split and leaves every
@@ -2253,6 +2257,21 @@ class TestByteIdentityOracle:
         fired = [e for e in client.events if e["stage"].get("role") == "stage"]
         assert len(fired) > 1  # the split really happened on this fixture
         assert all(len(e["stage"]["nodes"]) == 1 for e in fired)
+        assert all("leaves" in e and "discover" not in e for e in fired)
+        _assert_identical(cli, fleet)
+
+    def test_identity_survives_whole_tuple_grouping(self, tmp_path):
+        # The OTHER end of the grouping axis, and the shape this transport
+        # shipped before the ruled default: `max_nodes_per_invoke=None` packs
+        # by payload alone, so this fixture's whole tuple rides ONE invoke and
+        # one worker folds every dispatch node of it. No oracle arm held that
+        # grouping once the default became 1 (review finding) — `squeeze`
+        # forces a split by construction, and every other arm now inherits the
+        # one-node fan-out.
+        cli, fleet, summary, client = self._both_arms(tmp_path, max_nodes=None)
+        assert [s["batches"] for s in summary["stages"]] == [1]
+        fired = [e for e in client.events if e["stage"].get("role") == "stage"]
+        assert len(fired) == 1 and len(fired[0]["stage"]["nodes"]) > 1
         assert all("leaves" in e and "discover" not in e for e in fired)
         _assert_identical(cli, fleet)
 
