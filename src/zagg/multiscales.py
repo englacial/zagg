@@ -179,7 +179,7 @@ def write_multiscales_group(store_root: str, *, store_kwargs=None) -> dict:
     import json
 
     from zagg.coverage import load_coverage
-    from zagg.grids.morton import morton_decimal
+    from zagg.grids.morton import morton_decimals_from_words
     from zagg.hive import MANIFEST_NAME, _utcnow, read_manifest, root_coverage_words
     from zagg.store import open_object_store, put_object
     from zagg.sweep_overview import _node_at, _node_rel
@@ -211,13 +211,16 @@ def write_multiscales_group(store_root: str, *, store_kwargs=None) -> dict:
         return {"written": False, "reason": "windowed store without all_time"}
     envelope = load_coverage(store_root, **store_kwargs)
     if envelope is not None:
-        decimals = [morton_decimal(int(w)) for w in root_coverage_words(envelope)]
+        # One batch decode, never a per-word wrap: the expansion is already
+        # O(covered shards), and the scalar form rebuilds a one-element
+        # MortonIndexArray per shard on top of that (21x at 50k words).
+        decimals = morton_decimals_from_words(root_coverage_words(envelope))
         source = "coverage.moc"
     else:
         from zagg.sweep import discover_leaves
 
         refs = discover_leaves(store_root, store_kwargs=store_kwargs)
-        decimals = sorted({morton_decimal(int(key)) for key, _ in refs})
+        decimals = sorted(set(morton_decimals_from_words([int(key) for key, _ in refs])))
         source = "run-records"
     (entry,) = mirror
     children: dict[str, dict] = {}
