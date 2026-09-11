@@ -492,6 +492,23 @@ class TestCompanionGroup:
         summary = json.loads(capsys.readouterr().out)
         assert summary["written"] is True and summary["members_source"] == "coverage.moc"
 
+    def test_declaring_off_removes_the_companion(self, tmp_path):
+        # §4.10's removal half: the companion is the one artifact that
+        # asserts /2 without reading the manifest, and the finisher cannot
+        # heal it (the writer refuses a non-/2 store, fail-open), so the
+        # retrofit that drops the §4.9 mirror deletes the commit marker too.
+        self._store(tmp_path)
+        _coverage(tmp_path)
+        write_multiscales_group(str(tmp_path))
+        assert (tmp_path / GROUP_NAME / "zarr.json").exists()
+        summary = declare_pyramid(str(tmp_path), _cfg(pyramid=False))
+        assert summary["multiscales"] is False
+        assert "multiscales" not in read_manifest(str(tmp_path))
+        assert not (tmp_path / GROUP_NAME / "zarr.json").exists()
+        # Children may survive as debris — un-committed, and overwritten in
+        # place by the next companion write.
+        assert (tmp_path / GROUP_NAME / "1" / "zarr.json").exists()
+
     def test_product_name_multiscales_is_reserved(self):
         from zagg.hive import validate_product_name
 

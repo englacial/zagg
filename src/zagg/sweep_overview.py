@@ -798,16 +798,49 @@ def declare_pyramid(store_root: str, config, *, store_kwargs=None) -> dict:
         logger.info("declare_pyramid: the manifest already carries this declaration; no write")
         return summary
     fresh["pyramid"] = block
+    store = open_object_store(store_root, **store_kwargs)
     if mirror is not None:
         fresh["multiscales"] = mirror
     else:
         fresh.pop("multiscales", None)
-    put_object(
-        open_object_store(store_root, **store_kwargs),
-        MANIFEST_NAME,
-        json.dumps(fresh, indent=1).encode(),
-    )
+    put_object(store, MANIFEST_NAME, json.dumps(fresh, indent=1).encode())
+    if mirror is None:
+        _remove_multiscales_group(store, store_root)
     return summary
+
+
+def _remove_multiscales_group(store, store_root: str) -> None:
+    """Delete the §4.10 companion's commit marker when a store stops being ``/2``.
+
+    The manifest mirror is popped above, but the companion group is the one
+    artifact in the store that asserts ``/2`` WITHOUT consulting the manifest
+    — that is its whole point — so "the manifest wins on disagreement" has no
+    reader to apply it and a retrofit off ``/2`` would leave stock tooling a
+    ladder the manifest no longer declares (the finisher cannot heal it
+    either: :func:`zagg.multiscales.write_multiscales_group` refuses a
+    non-``/2`` store and the finisher swallows that fail-open). Deleting the
+    ROOT document is enough and is all this does: §4.10 makes it the commit
+    marker written LAST, so a prefix without it is debris, and a later
+    companion write overwrites the children in place. Best-effort — the
+    manifest (truth) is already written, so a failed delete warns rather than
+    unwinding it.
+    """
+    import obstore
+    from obstore.exceptions import NotFoundError
+
+    from zagg.multiscales import GROUP_NAME
+
+    try:
+        obstore.delete(store, f"{GROUP_NAME}/zarr.json")
+    except (FileNotFoundError, NotFoundError):
+        pass  # no companion on this store — the ordinary case
+    except Exception as e:  # best-effort: the manifest (truth) is already written
+        logger.warning(
+            f"declare_pyramid: the manifest at {store_root} no longer declares /2, but "
+            f"deleting the companion group's {GROUP_NAME}/zarr.json failed ({e}) — stock "
+            f"tooling will keep reading a ladder the manifest does not declare; remove the "
+            f"object by hand"
+        )
 
 
 def _semantic_guard(manifest: dict, config) -> str:

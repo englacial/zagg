@@ -1530,6 +1530,15 @@ to 0 — that a plain zarr reader opens with zero custom code. It holds
   `python -m zagg.sweep <root> --write-multiscales` writes/refreshes it
   standalone. Single-writer discipline is inherited from the finisher's
   own (§4.8: one finisher per admitted run).
+- **Removal.** A store that stops declaring `/2` MUST NOT keep a readable
+  companion: the group asserts the ladder *without* consulting the
+  manifest, so the §4.9 precedence rule has no reader to apply. The same
+  write that drops the §4.9 mirror (`declare_pyramid`, on a retrofit that
+  leaves `/2`) therefore deletes `multiscales/zarr.json` — the commit
+  marker, so removing it alone un-commits the tree and any surviving child
+  prefix is debris a later companion write overwrites. The delete is
+  best-effort (the manifest is truth and is already written); a failure is
+  logged, not unwound.
 - **Normativity and staleness.** The manifest + hive remain truth; the
   companion is a **recorded mirror** (D9 cache class): regenerable at any
   time, self-healing on the sweep ratchet (the finisher rewrites it each
