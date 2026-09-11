@@ -92,6 +92,36 @@ class TestDryRun:
         with pytest.raises(SystemExit, match="derives no /2 ladder"):
             tool.main([str(tmp_path), "--config", _config_yaml(tmp_path)])
 
+    def test_identical_declaration_reports_a_no_op(self, tmp_path, capsys):
+        _store(tmp_path)
+        argv = [str(tmp_path), "--config", _config_yaml(tmp_path), "--overviews", "3"]
+        tool.main(argv + ["--execute"])
+        capsys.readouterr()
+        assert tool.main(argv) == 0
+        out = capsys.readouterr().out
+        assert "IDENTICAL — --execute would be a no-op" in out
+        assert "manifest pyramid diff" not in out
+
+    def test_prior_actuals_do_not_fake_a_pending_put(self, tmp_path, capsys):
+        """A store already swept once must still dry-run as a no-op.
+
+        ``declare_pyramid`` copies prior ``materialized`` actuals onto the block
+        before comparing, so a dry run that diffed the raw derived block would
+        print their removal and promise a PUT that ``--execute`` never makes.
+        """
+        _store(tmp_path)
+        argv = [str(tmp_path), "--config", _config_yaml(tmp_path), "--overviews", "3"]
+        tool.main(argv + ["--execute"])
+        manifest = json.loads((tmp_path / MANIFEST_NAME).read_text())
+        manifest["pyramid"]["overview"]["materialized"] = {"orders": [2], "cells": {"2": 4}}
+        (tmp_path / MANIFEST_NAME).write_text(json.dumps(manifest))
+        capsys.readouterr()
+        assert tool.main(argv) == 0
+        out = capsys.readouterr().out
+        assert "preserves them verbatim" in out
+        assert "IDENTICAL — --execute would be a no-op" in out
+        assert "manifest pyramid diff" not in out
+
     def test_semantic_mismatch_is_loud_but_read_only(self, tmp_path, capsys):
         import obstore
 

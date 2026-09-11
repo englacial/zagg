@@ -119,6 +119,21 @@ def _semantic_verdict(manifest: dict, config) -> str:
     )
 
 
+def _preserving_materialized(prior, block: dict) -> dict:
+    """``block`` as ``declare_pyramid`` will compare it: prior actuals copied on.
+
+    Returns ``block`` itself when there are none, so callers can test identity
+    to report whether a preservation happened.
+    """
+    prior_overview = prior.get("overview") if isinstance(prior, dict) else None
+    materialized = prior_overview.get("materialized") if isinstance(prior_overview, dict) else None
+    if materialized is None:
+        return block
+    merged = json.loads(json.dumps(block))
+    merged["overview"]["materialized"] = materialized
+    return merged
+
+
 def _print_dry_run(manifest: dict, block: dict, verdict: str) -> None:
     prior = manifest.get("pyramid")
     print(f"semantic guard: {verdict}")
@@ -129,16 +144,21 @@ def _print_dry_run(manifest: dict, block: dict, verdict: str) -> None:
             print(f"  {entry['node']:>2} -> {entry['cells']}")
     fields = block["overview"].get("fields") or {}
     print("field classes: " + json.dumps({n: m.get("class") for n, m in fields.items()}))
-    prior_overview = prior.get("overview") if isinstance(prior, dict) else None
-    materialized = prior_overview.get("materialized") if isinstance(prior_overview, dict) else None
-    if materialized is not None:
+    # ``declare_pyramid`` copies any prior actuals onto the block BEFORE it
+    # compares (``sweep_overview.py``, the ``materialized``/``previous`` pair):
+    # diffing the raw derived block instead would print a spurious "removes
+    # materialized" hunk — and claim a PUT — on every store that has already
+    # been swept, which is exactly when an operator re-checks before a repeat
+    # ``--execute``. Compare what ``--execute`` will compare.
+    compare = _preserving_materialized(prior, block)
+    if compare is not block:
         print("prior 'materialized' actuals present — declare_pyramid preserves them verbatim")
     print()
-    if prior == block:
+    if prior == compare:
         print("manifest pyramid block: IDENTICAL — --execute would be a no-op (no PUT)")
         return
     before = json.dumps(prior, indent=1, sort_keys=True).splitlines()
-    after = json.dumps(block, indent=1, sort_keys=True).splitlines()
+    after = json.dumps(compare, indent=1, sort_keys=True).splitlines()
     print("manifest pyramid diff (stored -> re-declared):")
     for line in difflib.unified_diff(before, after, "pyramid (stored)", "pyramid (re-declared)"):
         print(line.rstrip("\n"))
