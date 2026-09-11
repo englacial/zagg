@@ -514,6 +514,14 @@ class TestV2Corruption:
         assert all(m.startswith("-3[") for m in report["checks"]["counts"]["mismatches"]), report[
             "checks"
         ]["counts"]
+        # A moc-sourced roster is the /2 arm's other reading of this sentence
+        # (a stale moc understates the fold source), so a failing counts leg
+        # names it as a candidate cause rather than leaving it ambiguous.
+        assert report["roster"]["source"] == "coverage.moc"
+        assert "STALE moc" in report["checks"]["counts"]["detail"]
+        listed = validate_pyramid(str(tmp_path), full=True, roster="list")
+        assert listed["checks"]["counts"]["status"] == "fail"
+        assert "STALE moc" not in listed["checks"]["counts"]["detail"]
 
     def test_broken_composition_word_is_caught_in_both_regimes(self, tmp_path):
         _build_store(tmp_path)
