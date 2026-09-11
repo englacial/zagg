@@ -441,6 +441,33 @@ class TestHarnessCatchesCorruption:
         assert "partial uncommitted" in entry["detail"]
         assert report["partial_nodes"] == ["-41"]
 
+    def _blank(self, group):
+        group["count"][:] = np.zeros_like(group["count"][:])
+        group["composition"][:] = np.zeros_like(group["composition"][:])
+        for name in ("h_sig", "h_noise"):
+            slab = group[name][:]
+            slab[:] = b""
+            group[name][:] = slab
+
+    def test_blanked_node_does_not_pass(self, tmp_path):
+        # A correctly-SHAPED but empty node runs zero per-cell value
+        # comparisons; "0 check(s), all consistent" would be a rubber stamp.
+        # Both sampled and full mode must refuse it.
+        self._swept(tmp_path)
+        self._blank(self._overview_group(tmp_path, "-3/1", 3))
+        for kwargs in ({"full": True}, {"sample_nodes": 99, "sample_cells": 8}):
+            report = validate_pyramid(str(tmp_path), **kwargs)
+            assert report["passed"] is not True, (kwargs, format_report(report))
+            assert report["checks"]["counts"]["status"] == "fail", format_report(report)
+
+    def test_blanked_coarse_node_does_not_pass(self, tmp_path):
+        # Same, at the CASCADE-written level: its source is the order-1 tier.
+        self._swept(tmp_path)
+        self._blank(self._overview_group(tmp_path, "-3", 2))
+        report = validate_pyramid(str(tmp_path), full=True)
+        assert report["passed"] is not True, format_report(report)
+        assert report["checks"]["counts"]["status"] == "fail"
+
     def test_role_without_commit_stamp_is_not_materialized(self, tmp_path):
         # The other torn-write variant: the write order pins role/provenance
         # attrs BEFORE the D4 commit stamp, so a writer killed in between

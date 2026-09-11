@@ -640,6 +640,15 @@ def _value_checks(harness, ladder, declared, probes, leaves, checks, report, *, 
             checks[name] = _entry(
                 "fail", f"{len(errs)} mismatch(es); first: {errs[0]}", mismatches=errs[:20]
             )
+        elif not counted[name]:
+            # Zero comparisons is not a pass: a declared, applicable check that
+            # never ran validated NOTHING, and an acceptance gate that reports
+            # that as a pass is a rubber stamp (review finding).
+            checks[name] = _entry(
+                "fail",
+                f"0 {name} comparison(s) performed — NOTHING was validated "
+                f"(declared fields present, but no sampled node/cell reached the check)",
+            )
         else:
             checks[name] = _entry("pass", f"{counted[name]} check(s), all consistent")
     report["sampled"] = counted
@@ -760,6 +769,13 @@ def _check_node(
         cells = np.sort(harness.rng.choice(populated, harness.sample_cells, replace=False))
     empty = np.flatnonzero(_missing_mask(counts, fill))
     empty_cell = int(empty[0]) if len(empty) else None
+    # The fill side of the presence law, sampled the same way: an output cell
+    # at fill must have NO contributors carrying data. Without it a node whose
+    # slabs are entirely blank runs zero per-cell comparisons and reports
+    # "pass" on blank payloads — the rubber stamp (review finding).
+    empty_probe = empty
+    if len(empty) > harness.sample_cells:
+        empty_probe = np.sort(harness.rng.choice(empty, harness.sample_cells, replace=False))
 
     # Morton sanity: rank arithmetic must agree with the stored cell words.
     if len(cells):
@@ -885,6 +901,20 @@ def _check_node(
         for name in digest_fields:
             if len(_payload_bytes(group[name][empty_cell : empty_cell + 1][0])):
                 errors["digests"].append(f"{node}[{empty_cell}]/{name}: empty cell has a digest")
+
+    # ... and the fill side of the presence law: no contributor may carry data.
+    for j in empty_probe:
+        cell_dec = node + _tail(int(j), t - k)
+        parts = harness.contributions(cell_dec, source, "count")
+        got = _exact_expected(
+            np.concatenate(parts) if parts else np.array([], dtype=counts.dtype), "sum", fill
+        )
+        counted["counts"] += 1
+        if got is not None and float(got) != 0.0:
+            errors["counts"].append(
+                f"{node}[{int(j)}]: cell is fill, but contributors total {got} — "
+                f"the fold dropped data (blank/short node)"
+            )
 
 
 def _ladder_totals(harness, ladder, materialized, leaves, count_meta, errors, counted):
