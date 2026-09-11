@@ -202,12 +202,20 @@ schedule removes the mechanism itself:
 
 **Gaps (noted, not fixed here):**
 
-- (a) **The original build configs are not in the repo.** The store manifests
-  pin δ=4096 (a parent_order-9 config variant); the repo carries δ=8192. The
-  semantic guard refuses any config that did not build the store, so espg
-  must supply the original ATL03 and GEDI configs for both the re-declaration
-  and the backfill. (`output.*` edits — the pyramid knob — do not move the
-  hash.)
+- (a) **The original build configs are not in the repo** — a **step 1**
+  blocker only. The store manifests pin δ=4096 (a parent_order-9 config
+  variant); the repo carries δ=8192, and the semantic guard refuses any config
+  that did not build the store, so espg must supply the original ATL03 and
+  GEDI configs for the **re-declaration**. (`output.*` edits — the pyramid
+  knob — do not move the hash.) The **backfill takes no config at all**:
+  `backfill_columns(store_root, manifest, by_shard, ...)` derives its plan
+  from the manifest (`plan = manifest_column_plan(manifest)`, then
+  `column_structure(plan.fields, ...)`) and consults no semantic hash, and the
+  `columns` family hook passes the same three arguments. That is precisely
+  *why* getting step 1's block exactly right matters: from there on the
+  declaration **is** the config, and the backfill's skip-if-current gate
+  compares realized structure against whatever that block says (the ATL03
+  bullet above).
 - (b) **Fleet-scale backfill concurrency is gated on the lease-vs-partition
   ruling** (PR #524, question 3). #528 landed the handler forwarding
   (`families`/`partition` reach workers), but the runner fires partitions as
