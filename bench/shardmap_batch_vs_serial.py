@@ -151,13 +151,17 @@ def _intersect_serial(records, grid, all_shards, order):
     every run, so a drift between them shows up as a test failure, not as a
     quietly wrong benchmark.
     """
-    from mortie import moc_to_order, morton_coverage_moc
+    from mortie import moc_to_order, polygons_to_morton_mocs
 
     out: dict = {}
     parent_order = grid.parent_order
     for i, rec in enumerate(records):
         try:
-            moc = np.asarray(morton_coverage_moc(rec["lats"], rec["lons"], order=order))
+            moc = np.asarray(
+                polygons_to_morton_mocs(
+                    rec["lats"], rec["lons"], np.array([0, len(rec["lats"])]), order=order
+                )[0]
+            )
         except Exception:
             continue
         if moc.size == 0:
@@ -226,7 +230,7 @@ def _measure_child(name, path, order, block):
     if block is not None:
         # ``--block`` overrides the arm's own blocking constant: rings per
         # ``polygons_to_morton_mocs`` call on the batch arm, records per
-        # ``mocs_and``/``mocs_to_orders`` call on the cells arm (phase 4).
+        # ``moc_and``/``moc_to_order`` call on the cells arm (phase 4).
         if path == "cells":
             shardmap._CELLS_BATCH_RECORDS = block
         else:
@@ -241,7 +245,7 @@ def _measure_child(name, path, order, block):
         # plan (which since #439 carries the record -> table-row alignment as
         # ``granule_row_mask``'s whole-table shapely screen, the term ``build``
         # pays every time in place of the id lookup it used to) and the blocked
-        # ``mocs_and``/``mocs_to_orders`` batch itself. Only ``index_footprints``
+        # ``moc_and``/``moc_to_order`` batch itself. Only ``index_footprints``
         # above is outside, because only it is one-time.
         def fn(records, grid, all_shards, order):  # unused args: the shared arm signature
             plan = shardmap._footprint_cells_plan(cat, grid, "mortie", "swath", None)
@@ -307,9 +311,9 @@ def run_cases(names, orders=None, arms=("serial", "batch"), reps=1):
     ``batch``
         phase 1: ``polygons_to_morton_mocs`` a block of rings at a time.
     ``cells``
-        phases 3-4: no geometry at all -- ``mocs_and`` of the AOI's own shard
+        phases 3-4: no geometry at all -- ``moc_and`` of the AOI's own shard
         MOC against a block of granules' **stored** MOCs
-        (``Catalog.index_footprints``), chained into ``mocs_to_orders``,
+        (``Catalog.index_footprints``), chained into ``moc_to_order``,
         ``_CELLS_BATCH_RECORDS`` records per call. The indexing
         pass runs in the same child but is timed separately and
         reported as ``idx_s``, because it is one-time per catalog where the
@@ -391,7 +395,7 @@ def run_knee(name, order=13, blocks=KNEE_BLOCKS, reps=1, arm="batch"):
 
     ``arm="batch"`` sweeps ``_MOC_BATCH_RINGS`` (rings per
     ``polygons_to_morton_mocs`` call); ``arm="cells"`` sweeps
-    ``_CELLS_BATCH_RECORDS`` (records per ``mocs_and``/``mocs_to_orders`` call
+    ``_CELLS_BATCH_RECORDS`` (records per ``moc_and``/``moc_to_order`` call
     on the phase-4 stored-index path -- pass record-scaled ``--blocks``, the
     ring-scaled defaults are far too small for it).
 

@@ -77,11 +77,11 @@ and writes it alongside the data columns.
 
 - **HEALPix** uses native morton, no lat/lon-center decode: a compact
   multi-order coverage (MOC) of the AOI at `child_order`
-  (`morton_coverage_moc`), intersected per shard (`moc_and`) and expanded to the
+  (`from_geometry(..., moc=True)`), intersected per shard (`moc_and`) and expanded to the
   cell order (`moc_to_order`) for membership against the shard's `children()`.
-  This requires `mortie >= 0.8.3` (the order-29 MOC coverage cap plus the public
-  WKB/WKT cover entry points, below); the mask code asserts the resolved version at
-  use.
+  This requires `mortie >= 1.0.0` (the 1.0 polymorphic cover API — `from_geometry`
+  for ring parts, the public WKB/WKT entry points below); the mask code asserts the
+  resolved version at use.
 - **Rectilinear** reprojects the AOI polygon to the grid CRS (the same `to_crs`
   reprojection `coverage` uses) and tests each cell center with a
   prepared-geometry shapely `contains`. The WGS84 ring is **densified** before
@@ -99,7 +99,7 @@ The AOI polygon can be supplied two ways, and both produce the **identical** mas
 
 - the original `[(lats, lons), ...]` exterior-ring parts (e.g. from
   `zagg.catalog.load_polygon` on a GeoJSON), or
-- a native geometry as **WKB** bytes or **WKT** text (`mortie >= 0.8.3`).
+- a native geometry as **WKB** bytes or **WKT** text (`mortie >= 1.0.0`).
 
 WKB/WKT is wired through `ShardMap.build(..., aoi=...)` and
 `make_shardmap(..., aoi=...)`, and from the CLI via `--aoi-wkt` /
@@ -118,7 +118,7 @@ sm = make_shardmap(query, grid, region=parts, aoi=wkb_bytes)   # or aoi=wkt_str
 
 On the HEALPix engine the WKB/WKT geometry rides mortie's public `from_wkb` /
 `from_wkt` cover entry points (espg/mortie#89) with `moc=True`, which decompose the
-geometry and route Polygon/MultiPolygon to the same `morton_coverage_moc` used for
+geometry and route Polygon/MultiPolygon to the same ring coverer used for
 ring input — so the compact MOC, and therefore the mask, is bit-for-bit the same as
 the equivalent ring. On the rectilinear engine the shapely-loaded geometry's
 exterior rings reproject through the same densify + `to_crs` path as a ring AOI.
@@ -145,7 +145,7 @@ its engine. A client filtering on `aoi_mask` should expect slightly different
 edge semantics across grid families:
 
 - **HEALPix is overlap/coverage-based (inclusive at the boundary).**
-  `morton_coverage_moc` builds a MOC that *covers* the AOI, so a leaf cell whose
+  the cover builds a MOC that *covers* the AOI, so a leaf cell whose
   area overlaps the AOI — even partially, including one whose center lies just
   outside — is in the MOC and marked `True`. The MOC is a superset cover, so the
   HEALPix mask leans **inclusive**: it never drops a cell that touches the AOI.
@@ -194,13 +194,13 @@ strict = ds.where(ds["aoi_mask"])
 - **WKB/WKT AOI input** is supported (see *Supplying the AOI* above): pass `aoi=`
   WKB bytes / WKT text to `ShardMap.build` / `make_shardmap`, or `--aoi-wkt` /
   `--aoi-wkb` on the CLI. It rides mortie's public WKB/WKT cover entry points
-  (espg/mortie#89, `mortie >= 0.8.3`) and yields the identical mask to the
+  (espg/mortie#89; `mortie >= 1.0.0`) and yields the identical mask to the
   equivalent `(lats, lons)` ring.
 
 See the runnable, data-free example in
 [`aoi_mask.ipynb`](https://github.com/englacial/zagg/blob/c56221b4/notebooks/aoi_mask.ipynb) (archived — see the note below),
 which builds a small HEALPix grid + AOI box and shows the mask is `True` exactly
 for the in-AOI cells. The notebook is self-contained (no remote data) and runs
-anywhere `zagg` (with `mortie>=0.8.3`) is installed. Binder launch additionally
+anywhere `zagg` (with `mortie>=1.0.0`) is installed. Binder launch additionally
 needs the repo-wide `.binder/` environment, which lands separately via #105; until
 then the Binder badge won't resolve `zagg` + `mortie` on a default build.

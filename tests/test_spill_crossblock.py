@@ -135,8 +135,9 @@ def _point_leafs(grid, cell, n, rng):
     out = np.empty(0, dtype=np.uint64)
     scale = 0.2
     while len(out) < n:
-        lats = float(lat) + rng.uniform(-scale, scale, 4 * n)
-        lons = float(lon) + rng.uniform(-scale, scale, 4 * n)
+        # mortie 1.0: array in, array out -- a length-1 input stays length 1
+        lats = float(lat[0]) + rng.uniform(-scale, scale, 4 * n)
+        lons = float(lon[0]) + rng.uniform(-scale, scale, 4 * n)
         leafs = np.asarray(grid.assign(lats, lons))
         out = np.concatenate([out, leafs[np.asarray(grid.cells_of(leafs)) == cell]])
         scale *= 0.5
