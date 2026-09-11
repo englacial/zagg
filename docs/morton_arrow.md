@@ -67,6 +67,26 @@ changes the leaf schema, so mixed states never co-aggregate). (The
 pre-existing `output.grid.indexing_scheme` config key is descriptive only and
 must stay `nested`.)
 
+## Native-only viewer/reader track (no xdggs)
+
+Standing ruling (espg, 2026-09-10 — issue
+[#550](https://github.com/englacial/zagg/issues/550)): the viewer/reader
+track carries **no xdggs translation layer** — native code only. The viewer
+path decodes native morton words directly, via mortie-core / healpix-geo (TS
+codec + wasm — [espg/gridlook#8](https://github.com/espg/gridlook/issues/8)),
+never through the xdggs library or its conventions; moczarr's gridlook feeder
+surfaces stay native moczarr reads (`open_leaf` / `read_tensors` /
+`read_ragged` — moczarr's `dggs.py` is excluded from the feeder path); and
+the gridlook-fork hive shim's fabricated `dggs` attrs are a transitional
+crutch to be retired by the phase 6 v2 native awareness, not an architecture.
+zagg's multiscales metadata work
+([#392](https://github.com/englacial/zagg/issues/392) /
+[#394](https://github.com/englacial/zagg/issues/394)) is scoped to
+zagg-native zarr metadata accordingly — xdggs is not a dependency or bridge
+anywhere on this track. The self-describing `dggs` attrs block zagg stores
+carry (D16, above) is unaffected: it is a zarr convention entry a native
+reader may ignore, not an xdggs dependency.
+
 ## Shardmap parquet manifests
 
 `ShardMap.to_parquet` / `ShardMap.from_parquet` are the Arrow-native siblings
