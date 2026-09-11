@@ -417,10 +417,14 @@ class TestLadderGrammars:
         )
         assert _ladder(manifest) == [(k, k + 4) for k in range(8, -1, -1)]
 
-    def test_v2_store_is_refused_not_best_effort_validated(self, tmp_path):
-        # The /2 ladder is written by the STAGED sweep, whose fold is not a
-        # level-from-level cascade: the declaration is parsed and reported,
-        # but validating it with the /1 model would manufacture a verdict.
+    def test_v2_store_routes_to_the_v2_arm_never_the_cascade_model(self, tmp_path):
+        # A /2 declaration is VALIDATED by the /2 arm (the espg ruling on
+        # issue #547: the re-declaration is /2 and this harness is its gate;
+        # tests/test_pyramid_e2e_v2.py owns the positive path). It is never
+        # best-effort validated with the /1 cascade model: this store's /2
+        # list is malformed (no leaf entry, no fixed ladder), so the /2
+        # grammar leg fails it BY NAME — while the ladder is still parsed
+        # and reported.
         manifest = _build_store(tmp_path)
         _sweep(tmp_path, manifest)
         manifest["pyramid"]["spec"] = "zagg-pyramid/2"
@@ -429,7 +433,7 @@ class TestLadderGrammars:
         report = validate_pyramid(str(tmp_path), full=True)
         entry = report["checks"]["declaration"]
         assert entry["status"] == "fail"
-        assert "zagg-pyramid/2" in entry["detail"]
+        assert "malformed zagg-pyramid/2 declaration" in entry["detail"]
         assert report["ladder"] == [{"node": 1, "cells": 3}, {"node": 0, "cells": 2}]
         assert report["passed"] is False
 
