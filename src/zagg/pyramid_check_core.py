@@ -526,6 +526,7 @@ def _check_node(
     role="overview",
     provenance_attr=None,
     group_getter=None,
+    values=True,
 ):
     """The value laws over one artifact's resolution group, both grammars.
 
@@ -538,7 +539,14 @@ def _check_node(
     the sweep wrote correctly (§3.4 drift is per MERGE, and a gather is not
     one). ``role``/``provenance_attr``/``group_getter`` retarget the
     read-back leg at the artifact kind (ladder overview, or a §4.6 column
-    group under ``role: column``).
+    group under ``role: column``). ``values=False`` runs the STRUCTURAL legs
+    only — role attr, provenance presence, group open, arrays present,
+    companion row alignment, morton rank arithmetic, the §3.3 composition
+    attrs — and skips the per-cell comparisons against the fold source: the
+    posture for an artifact whose SOURCE tier is known short (a ``/2`` level
+    that under-covers its subtree), where a cell value is not evidence but
+    the artifact's own shape still is (review finding: under-coverage argues
+    against comparing cell values, not against reading the artifact back).
     """
     from zagg.grids.morton import morton_word
     from zagg.stats.composition import merge_composition_kway
@@ -627,6 +635,9 @@ def _check_node(
             errors["composition"].append(
                 f"{node}/{name}: threshold {block.get('threshold')} != declared {meta['threshold']}"
             )
+
+    if not values:
+        return
 
     for j in cells:
         cell_dec = node + _tail(int(j), t - k)

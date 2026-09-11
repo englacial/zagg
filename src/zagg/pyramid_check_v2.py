@@ -40,8 +40,13 @@ spec §4.4/§4.6 make normative:
   generation ratchet), refused for ``s3://`` roots like the ``/1`` arm's.
 
 A level whose ``source_children`` records ``missing``/``unreadable``
-children under-covers its subtree (§4.3): its value checks are DECLINED and
-named — the fill cells there are not evidence, and the next sweep heals it.
+children claims to under-cover its subtree (§4.3). The claim is the artifact
+talking about itself, so it is CROSS-CHECKED against the committed leaf
+columns of that subtree (:func:`_coverage_verdict`): genuinely short sources
+DECLINE the level's per-cell comparisons and are named — the fill cells
+there are not evidence, and the next sweep heals it — while a level stamped
+short whose sources are all committed is a STALE artifact and fails by name.
+The decline never covers the structural read-back legs.
 """
 
 from __future__ import annotations
@@ -300,14 +305,7 @@ def _value_checks_v2(
             errors["readback"].extend(_stage_provenance_errors(node, k, r, s, prov, gather))
             sc = (prov or {}).get("source_children") if isinstance(prov, dict) else None
             sc = sc if isinstance(sc, dict) else {}
-            if int(sc.get("missing") or 0) or int(sc.get("unreadable") or 0):
-                counted["readback"] += 1
-                harness.warn(
-                    f"{node}: level under-covers its subtree ({sc}) — value checks "
-                    f"declined; a fill cell there is not evidence (§4.3), and the next "
-                    f"sweep heals it"
-                )
-                continue
+            values = _coverage_verdict(node, sc, leaves, col_probes, harness, errors)
             _check_node(
                 harness,
                 node,
@@ -324,6 +322,7 @@ def _value_checks_v2(
                 full=full,
                 compose_exact=True,
                 gather=gather,
+                values=values,
             )
 
     # -- the leaf-column tier, from the leaves' own cell arrays (§4.6 parity).
@@ -374,6 +373,49 @@ def _value_checks_v2(
         wide_fields=wide_fields,
         packed_fields=packed_fields,
     )
+
+
+def _coverage_verdict(node, sc, leaves, col_probes, harness, errors) -> bool:
+    """Whether one ladder node's per-cell value comparisons may run (§4.3).
+
+    A level's ``source_children`` counters are written by the ARTIFACT UNDER
+    TEST about itself, so taking them on faith would let a corrupt ladder
+    stamp ``missing: 1`` and decline its way past the gate (review finding:
+    reproduced as a ``PASS`` on nine corrupted nodes). The claim is therefore
+    CROSS-CHECKED against the roster the harness already holds: a node's
+    sources are the committed leaf columns of its subtree (the §4.6 gen-1
+    tier), which :func:`_columns_check` just probed.
+
+    - stamped short **and** some source column is genuinely absent — the
+      benign case: decline the per-cell comparisons (a fill cell there is not
+      evidence) and name it; the ``columns`` check carries the failure;
+    - stamped short while EVERY source column is committed — a STALE
+      artifact whose sources have since healed: a read-back failure by name,
+      and the value checks run, because the tier they compare against is
+      complete;
+    - not stamped short — the ordinary path.
+
+    Either way the structural read-back legs run (``values=False`` keeps
+    role/provenance/arrays/companions/morton/§3.3 attrs), so nothing is
+    rubber-stamped and nothing is declined that coverage does not touch.
+    """
+    if not (int(sc.get("missing") or 0) or int(sc.get("unreadable") or 0)):
+        return True
+    subtree = [d for d in leaves if d.startswith(node)]
+    uncommitted = [d for d in subtree if col_probes.get(d) is None]
+    if not uncommitted:
+        errors["readback"].append(
+            f"{node}: records source_children {sc} — under-covers its subtree — while "
+            f"all {len(subtree)} of its source column(s) are committed: a STALE level "
+            f"whose sources have since healed; re-sweep"
+        )
+        return True
+    harness.warn(
+        f"{node}: level under-covers its subtree ({sc}; {len(uncommitted)}/{len(subtree)} "
+        f"source column(s) uncommitted, e.g. {uncommitted[:3]}) — per-cell value checks "
+        f"declined; a fill cell there is not evidence (§4.3), and the next sweep heals it"
+    )
+    return False
 
 
 def _stage_provenance_errors(node, k, r, s, prov, gather) -> list:
