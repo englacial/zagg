@@ -15,7 +15,7 @@ import pyarrow as pa
 import pyarrow.compute as pc
 import pyarrow.parquet as pq
 import shapely
-from mortie import moc_to_order, morton_coverage_moc
+from mortie import moc_to_order, polygons_to_morton_mocs
 
 from zagg.catalog import load_polygon, polygon_to_bbox
 from zagg.catalog.sources import CMRSource, Query
@@ -28,7 +28,8 @@ ORDER = 14  # ~0.4 km cells: fine enough that the tiny AOI is tightly resolved
 
 
 def cells(lats, lons, order=ORDER):
-    moc = np.asarray(morton_coverage_moc(np.asarray(lats), np.asarray(lons), order=order))
+    lats, lons = np.asarray(lats), np.asarray(lons)
+    moc = np.asarray(polygons_to_morton_mocs(lats, lons, np.array([0, len(lats)]), order=order)[0])
     if moc.size == 0:
         return np.empty(0, dtype=np.uint64)
     return np.unique(moc_to_order(moc, order))

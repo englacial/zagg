@@ -7,6 +7,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+- **mortie 1.0 is now the floor** (#559): mortie 1.0.0 retired its plural batch
+  names with no aliases (espg/mortie#187), so a fresh install against unpinned
+  mortie failed at import — first seen on a Binder build of the reader
+  notebooks (`cannot import name 'decimals_to_words'`, raised inside moczarr;
+  zagg itself has nine such sites). Every call moves to the surviving
+  polymorphic name: `moc_and` / `moc_intersects` / `moc_to_order` /
+  `toc_reduce` take the ragged batch through `offsets=`, `decimal_to_word` and
+  `mortie.arrow.from_wkb` are the array forms, the per-ring fallback in
+  `_batch_ring_mocs` goes through `from_geometry(Polygon(ring), moc=True)` (a
+  different entry point to the same ring kernel), and the
+  ring-parts AOI cover (`healpix_aoi_moc`) goes through
+  `from_geometry(..., moc=True)` on a shapely (Multi)Polygon — bit-identical to
+  the retired multipart ring form, holes included, pinned in
+  `tests/test_aoi_mask.py`. `pyproject` requires `mortie>=1.0.0`, the AOI
+  version guard moves to the same floor, and the reader notebooks pin
+  `mortie>=1.0` with `moczarr[zagg]>=0.8.0` (the moczarr release that carries
+  its own migration, espg/moczarr#59). No behaviour change.
+  **Release order:** zagg 0.53.0 is the first zagg on mortie 1.0, and
+  moczarr 0.8.0's `[zagg]` extra floors on `zagg>=0.53.0` alongside its own
+  `mortie>=1.0.0` (espg/moczarr#61) — so zagg 0.53.0 ships first, then
+  moczarr 0.8.0, then a Binder rebuild.
+
 - every `-disk` worker variant gets Lambda's 10240 MB `/tmp` ceiling (#536)
   ([#537](https://github.com/englacial/zagg/pull/537))
   - The spill block is **disk-bound at every memory tier**:
