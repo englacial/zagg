@@ -479,9 +479,23 @@ def validate_pyramid(
     (refused for ``s3://`` roots: production sweeps are fleet-side, issue
     #547). The report's ``checks`` map carries one ``status``/``detail``
     entry per :data:`CHECKS` phase; ``passed`` is True iff no check failed.
+
+    ``full=True`` is REFUSED for ``s3://`` roots, like ``resweep``: it voids
+    every bound in the module header — ``_ladder_totals`` alone reads every
+    leaf's whole ``count`` array (~12 GB across the ATL03 o9 roster, whose
+    leaves are ``4**10`` int32 each) and the per-cell arm then walks every
+    populated cell of every node. Sampling is what makes this safe to point
+    at a production store (review finding).
     """
     from zagg.hive import read_manifest
 
+    if full and str(store_root).startswith("s3://"):
+        raise ValueError(
+            "full=True is refused for s3:// roots — it reads every leaf's whole count "
+            "array and every populated cell of every node, which is the bound sampling "
+            "exists to keep; run the sampled default (optionally with larger "
+            "--sample-nodes/--sample-cells), or --full against a local store"
+        )
     store_kwargs = dict(store_kwargs or {})
     report: dict = {"store": store_root, "checks": {}}
     checks = report["checks"]
@@ -1143,7 +1157,8 @@ def main(argv=None) -> int:
     parser.add_argument(
         "--full",
         action="store_true",
-        help="Check every node and every populated cell + ladder totals (fixture-scale stores)",
+        help="Check every node and every populated cell + ladder totals "
+        "(LOCAL fixture-scale stores only; refused for s3:// roots)",
     )
     parser.add_argument(
         "--roster",
@@ -1156,6 +1171,15 @@ def main(argv=None) -> int:
     logging.basicConfig(level=logging.WARNING, format="%(message)s")
     store_kwargs: dict = {}
     if args.store_root.startswith("s3://"):
+        if args.full:
+            # `--full` sits right beside `--anon`, which only a production
+            # invocation passes: refuse the pairing here rather than let the
+            # library ValueError out as a traceback (review finding).
+            parser.error(
+                "--full is refused for s3:// roots: it reads every leaf's whole count "
+                "array and every populated cell of every node. Use the sampled default "
+                "(--sample-nodes/--sample-cells raise the bound deliberately)."
+            )
         store_kwargs["region"] = args.region
         if args.anon:
             store_kwargs["skip_signature"] = True
