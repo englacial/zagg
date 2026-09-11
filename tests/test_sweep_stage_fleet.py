@@ -1257,18 +1257,44 @@ class TestBatching:
         leaves = [morton_decimal(int(w)) for w in generate_morton_children(morton_word("1"), 7)]
         by_shard = {d: {None} for d in leaves}
         nodes = sorted({d[:4] for d in leaves})
+        # 64 FAT nodes (256 leaf refs each) followed by 64 THIN ones (4 each),
+        # so one node list can close batches on either cap.
+        thin = [morton_decimal(int(w)) for w in generate_morton_children(morton_word("2"), 4)]
+        mixed_work = {d: {None} for d in leaves + thin}
+        mixed = sorted({d[:4] for d in leaves} | {d[:4] for d in thin})
+        assert len(nodes) == 64 and len(mixed) == 128
         block = self._block(3)
-        # ~39 of these 256-leaf-ref nodes fit the 250 KB cap. At max_nodes=50
-        # the PAYLOAD cap is what closes batches (all under 50); at
-        # max_nodes=16 the NODE cap is (all exactly 16, where 39 would fit).
-        at_50 = pack_batches(nodes, by_shard, block=block, store_path="s3://b/p.zarr", max_nodes=50)
-        assert all(len(batch_nodes) < 50 for batch_nodes, _ in at_50)
-        at_16 = pack_batches(nodes, by_shard, block=block, store_path="s3://b/p.zarr", max_nodes=16)
-        assert [len(batch_nodes) for batch_nodes, _ in at_16] == [16, 16, 16, 16]
-        # Either way: nothing lost or reordered, and every batch ships inline
-        # under the measured cap.
-        for batches in (at_50, at_16):
-            assert [n for batch_nodes, _ in batches for n in batch_nodes] == nodes
+
+        def pack(node_list, work, cap):
+            return pack_batches(
+                node_list, work, block=block, store_path="s3://b/p.zarr", max_nodes=cap
+            )
+
+        def widths(node_list, work, cap):
+            return [len(batch_nodes) for batch_nodes, _ in pack(node_list, work, cap)]
+
+        # Exactly 34 of the fat nodes fit the 250 KB cap. So at max_nodes=50
+        # the node cap NEVER binds and the batching is the payload-only one,
+        # batch for batch — pinned by value, not by an inequality a regression
+        # to two nodes per batch would also pass. At max_nodes=16 the NODE cap
+        # closes every batch, where 34 would fit.
+        assert widths(nodes, by_shard, 50) == widths(nodes, by_shard, None) == [34, 30]
+        assert widths(nodes, by_shard, 16) == [16, 16, 16, 16]
+        # Both caps binding in ONE batch list — the docstring's "whichever
+        # binds first closes the batch". At max_nodes=40 the first batch closes
+        # on the PAYLOAD cap at the same 34 fat nodes the unconstrained run
+        # took, and the later batches close on the NODE cap at 40 once the thin
+        # nodes make 40 affordable again.
+        assert widths(mixed, mixed_work, None) == [34, 94]
+        assert widths(mixed, mixed_work, 40) == [34, 40, 40, 14]
+
+        at_50 = pack(nodes, by_shard, 50)
+        at_16 = pack(nodes, by_shard, 16)
+        at_40 = pack(mixed, mixed_work, 40)
+        # Whichever cap closed a batch: nothing lost or reordered, and every
+        # batch ships inline under the measured cap.
+        for batches, expect in ((at_50, nodes), (at_16, nodes), (at_40, mixed)):
+            assert [n for batch_nodes, _ in batches for n in batch_nodes] == expect
             for batch, (batch_nodes, refs) in enumerate(batches):
                 assert refs is not None
                 event = build_stage_event(
