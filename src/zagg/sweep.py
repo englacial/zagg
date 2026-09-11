@@ -1328,6 +1328,14 @@ def main(argv=None) -> int:
         "(issue #358), print the summary, and exit — declaration-only: no sweep "
         "pass runs in the same invocation (--families and --partitions are ignored)",
     )
+    parser.add_argument(
+        "--write-multiscales",
+        action="store_true",
+        help="Write/refresh the stock-tool-legible multiscales companion group at "
+        "the store root from the manifest's zagg-pyramid/2 declaration (issue #394, "
+        "spec 4.10), print the summary, and exit — metadata-only: no sweep pass "
+        "runs in the same invocation (--families and --partitions are ignored)",
+    )
     args = parser.parse_args(argv)
     # Validate the fan-out width from argv alone, BEFORE anything touches the
     # store: discover_leaves is a LIST plus a parquet read per run record, and
@@ -1355,6 +1363,12 @@ def main(argv=None) -> int:
         summary = declare_pyramid(
             args.store_root, load_config(args.declare_pyramid), store_kwargs=store_kwargs
         )
+        print(json.dumps(summary, indent=2))
+        return 0
+    if args.write_multiscales:
+        from zagg.multiscales import write_multiscales_group
+
+        summary = write_multiscales_group(args.store_root, store_kwargs=store_kwargs)
         print(json.dumps(summary, indent=2))
         return 0
     families = [f.strip() for f in args.families.split(",")] if args.families else None

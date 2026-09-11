@@ -1,4 +1,6 @@
-"""The manifest ``multiscales`` discovery mirror (issue #392, spec §4.9)."""
+"""The ``multiscales`` convention surface: the manifest discovery mirror
+(issue #392, spec §4.9) and the stock-tool-legible companion group
+(issue #394, spec §4.10)."""
 
 import json
 
@@ -11,9 +13,13 @@ from zagg.hive import MANIFEST_NAME, build_manifest, ensure_manifest, read_manif
 from zagg.multiscales import (
     ARTIFACT_COLUMN,
     ARTIFACT_OVERVIEW,
+    GROUP_ATTR,
+    GROUP_NAME,
+    LEVEL_ATTR,
     MULTISCALES_SPEC,
     manifest_multiscales,
     multiscales_block,
+    write_multiscales_group,
 )
 from zagg.pyramid import PYRAMID_SPEC_V2, declared_fields, expand_overviews, overview_block_v2
 from zagg.store import open_object_store
@@ -265,3 +271,198 @@ class TestDeclarePyramid:
         final = read_manifest(str(tmp_path))
         assert final["pyramid"]["overviews"][0]["actuals"]["regime"] == "leaf-column"
         assert final["multiscales"] == before == manifest_multiscales(final)
+
+
+#: The occupied order-2 shards the companion fixtures declare (one parent
+#: node at order 1, one at order 0 — base ``-3``).
+SHARDS = ("-311", "-312")
+
+
+def _coverage(root, decimals=SHARDS):
+    from zagg.grids.morton import morton_word
+    from zagg.hive import build_root_coverage, write_root_coverage
+
+    envelope = build_root_coverage([morton_word(d) for d in decimals], SHARD_ORDER)
+    write_root_coverage(str(root), envelope)
+
+
+def _run_record(root, decimals=SHARDS):
+    """One run-record parquet naming ``decimals`` as completed shards (D20)."""
+    from zagg.grids.morton import morton_word
+    from zagg.telemetry import build_record, flatten_record, write_run_parquet
+
+    rows = [
+        flatten_record(
+            build_record(shard_key=morton_word(d), metadata={"total_obs": 1, "duration_s": 1.0})
+        )
+        for d in decimals
+    ]
+    write_run_parquet(str(root), rows, run_id="r1")
+
+
+class TestCompanionGroup:
+    """The issue #394 stock-tool-legible companion (spec §4.10)."""
+
+    def _store(self, root):
+        ensure_manifest(
+            str(root),
+            build_manifest(
+                _grid(_cfg(pyramid={"overviews": 3})), dataset={"short_name": "MS", "version": "1"}
+            ),
+        )
+
+    #: The §4.10 member maps this geometry derives: the order-1 ancestors of
+    #: the two occupied shards collapse to one node, order 0 to the base.
+    MEMBERS = {
+        "1": {"-31": "-3/1/all.zarr/2"},
+        "0": {"-3": "-3/all.zarr/1"},
+    }
+
+    def test_companion_is_stock_zarr_walkable(self, tmp_path):
+        import zarr
+
+        self._store(tmp_path)
+        _coverage(tmp_path)
+        summary = write_multiscales_group(str(tmp_path))
+        assert summary == {
+            "written": True,
+            "orders": [1, 0],
+            "members": {"1": 1, "0": 1},
+            "members_source": "coverage.moc",
+            "window": "all",
+        }
+        # The stock-tool claim, asserted with stock zarr: open the reserved
+        # root child, walk the children, read the attrs — zero zagg code.
+        group = zarr.open_group(str(tmp_path / GROUP_NAME), mode="r")
+        manifest = read_manifest(str(tmp_path))
+        assert group.attrs["multiscales"] == manifest["multiscales"]
+        stamp = group.attrs[GROUP_ATTR]
+        assert stamp["spec"] == MULTISCALES_SPEC
+        assert stamp["window"] == "all" and stamp["members_source"] == "coverage.moc"
+        assert stamp["generated_at"]
+        assert sorted(k for k, _ in group.members()) == ["0", "1"]
+        for order, members in self.MEMBERS.items():
+            level = group[order].attrs[LEVEL_ATTR]
+            assert level["spec"] == MULTISCALES_SPEC
+            assert level["order"] == int(order)
+            assert level["cells"] == [int(order) + 1]  # the §4.4 ladder: k + d
+            assert level["artifact"] == ARTIFACT_OVERVIEW
+            assert level["window"] == "all"
+            assert level["members"] == members
+
+    def test_metadata_only_no_arrays_no_data(self, tmp_path):
+        # §4.10: references, never copies — the companion holds exactly one
+        # zarr.json group document per node and nothing else.
+        self._store(tmp_path)
+        _coverage(tmp_path)
+        write_multiscales_group(str(tmp_path))
+        objects = sorted(
+            str(p.relative_to(tmp_path / GROUP_NAME))
+            for p in (tmp_path / GROUP_NAME).rglob("*")
+            if p.is_file()
+        )
+        assert objects == ["0/zarr.json", "1/zarr.json", "zarr.json"]
+
+    def test_consolidated_metadata_inlines_the_children(self, tmp_path):
+        # §4.10: one GET of the root document walks the whole tree — the
+        # inlined child documents are byte-identical to the standalone ones.
+        self._store(tmp_path)
+        _coverage(tmp_path)
+        write_multiscales_group(str(tmp_path))
+        root_doc = json.loads((tmp_path / GROUP_NAME / "zarr.json").read_text())
+        consolidated = root_doc["consolidated_metadata"]
+        assert consolidated["kind"] == "inline" and consolidated["must_understand"] is False
+        for order in ("1", "0"):
+            child = json.loads((tmp_path / GROUP_NAME / order / "zarr.json").read_text())
+            assert consolidated["metadata"][order] == child
+            assert child["zarr_format"] == 3 and child["node_type"] == "group"
+
+    def test_run_record_fallback_discovers_the_same_members(self, tmp_path):
+        self._store(tmp_path)
+        _run_record(tmp_path)
+        summary = write_multiscales_group(str(tmp_path))
+        assert summary["members_source"] == "run-records"
+        for order, members in self.MEMBERS.items():
+            doc = json.loads((tmp_path / GROUP_NAME / order / "zarr.json").read_text())
+            assert doc["attributes"][LEVEL_ATTR]["members"] == members
+
+    def test_empty_store_writes_empty_member_sets(self, tmp_path, caplog):
+        # Declared-but-unoccupied is legal; the companion says so honestly.
+        self._store(tmp_path)
+        with caplog.at_level("WARNING"):
+            summary = write_multiscales_group(str(tmp_path))
+        assert summary["written"] is True and summary["members"] == {"1": 0, "0": 0}
+        assert "empty member sets" in caplog.text
+
+    def test_refresh_overwrites_in_place(self, tmp_path):
+        # The ratchet self-heal: a later write with more coverage replaces
+        # the member sets; the layout never accumulates debris.
+        self._store(tmp_path)
+        _coverage(tmp_path, decimals=("-311",))
+        write_multiscales_group(str(tmp_path))
+        _coverage(tmp_path)  # unions in -312
+        summary = write_multiscales_group(str(tmp_path))
+        assert summary["members"] == {"1": 1, "0": 1}
+        doc = json.loads((tmp_path / GROUP_NAME / "1" / "zarr.json").read_text())
+        assert doc["attributes"][LEVEL_ATTR]["members"] == self.MEMBERS["1"]
+
+    def test_refuses_a_store_without_a_v2_declaration(self, tmp_path):
+        ensure_manifest(
+            str(tmp_path), build_manifest(_grid(_cfg(pyramid={"orders": [1]})), dataset={})
+        )
+        with pytest.raises(ValueError, match="no zagg-pyramid/2"):
+            write_multiscales_group(str(tmp_path))
+        assert not (tmp_path / GROUP_NAME).exists()
+
+    def test_windowed_without_all_time_is_gated(self, tmp_path, caplog):
+        # v1 mirrors the all-time fold only (issue #394 decision (2)): a
+        # windowed store must declare all_time to get a companion.
+        self._store(tmp_path)
+        manifest = read_manifest(str(tmp_path))
+        manifest["temporal"] = {"schedule": "yearly", "time_field": "t"}
+        obstore.put(open_object_store(str(tmp_path)), MANIFEST_NAME, json.dumps(manifest).encode())
+        with caplog.at_level("WARNING"):
+            summary = write_multiscales_group(str(tmp_path))
+        assert summary == {"written": False, "reason": "windowed store without all_time"}
+        assert not (tmp_path / GROUP_NAME).exists()
+        manifest["pyramid"]["overview"]["all_time"] = True
+        obstore.put(open_object_store(str(tmp_path)), MANIFEST_NAME, json.dumps(manifest).encode())
+        assert write_multiscales_group(str(tmp_path))["written"] is True
+
+    def test_finisher_refreshes_the_companion_fail_open(self, tmp_path, monkeypatch):
+        # The issue #394 writer seam: the designated finisher refreshes the
+        # companion when the run touched shards (gated on by_shard like the
+        # root-MOC refresh), and its failure never fails the finisher.
+        self._store(tmp_path)
+        manifest = read_manifest(str(tmp_path))
+        out = run_finisher(str(tmp_path), manifest, {}, {}, run_id="t")
+        assert "multiscales_group" not in out  # no shards -> no refresh
+        assert not (tmp_path / GROUP_NAME).exists()
+        out = run_finisher(str(tmp_path), manifest, {d: None for d in SHARDS}, {}, run_id="t")
+        assert out["multiscales_group"] is True
+        doc = json.loads((tmp_path / GROUP_NAME / "1" / "zarr.json").read_text())
+        # The finisher's own root-MOC refresh (step 1) feeds step 2b.
+        assert doc["attributes"][LEVEL_ATTR]["members"] == self.MEMBERS["1"]
+        import zagg.multiscales as multiscales
+
+        def boom(*a, **k):
+            raise RuntimeError("companion down")
+
+        monkeypatch.setattr(multiscales, "write_multiscales_group", boom)
+        out = run_finisher(str(tmp_path), manifest, {d: None for d in SHARDS}, {}, run_id="t")
+        assert out["multiscales_group"] is False  # fail-open: finisher survived
+
+    def test_cli_write_multiscales(self, tmp_path, capsys):
+        from zagg.sweep import main
+
+        self._store(tmp_path)
+        _coverage(tmp_path)
+        assert main([str(tmp_path), "--write-multiscales"]) == 0
+        summary = json.loads(capsys.readouterr().out)
+        assert summary["written"] is True and summary["members_source"] == "coverage.moc"
+
+    def test_product_name_multiscales_is_reserved(self):
+        from zagg.hive import validate_product_name
+
+        with pytest.raises(ValueError, match="reserved for the multiscales companion"):
+            validate_product_name("multiscales")

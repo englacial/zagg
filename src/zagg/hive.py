@@ -144,6 +144,14 @@ def validate_product_name(name: str) -> str:
             f"(-?[1-6]); such names are excluded so a store root's children stay "
             f"unambiguous (D19)"
         )
+    if name == "multiscales":
+        # The issue #394 companion group owns this store-root child (spec
+        # §4.10); a product by the same name would collide with it at every
+        # multi-product root.
+        raise ValueError(
+            "product name 'multiscales' is reserved for the multiscales companion "
+            "group at the store root (spec §4.10, issue #394)"
+        )
     return name
 
 
