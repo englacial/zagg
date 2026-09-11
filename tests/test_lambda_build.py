@@ -161,8 +161,12 @@ class TestFunctionBuild:
         import tempfile
         import zipfile
 
+        # Newest by mtime, matching test_function_build_succeeds: builds_dir
+        # accumulates one zip per arch/python it has ever built, and glob order
+        # is arbitrary — measure the artifact the last build produced.
+        newest = max(zips, key=lambda p: p.stat().st_mtime)
         with tempfile.TemporaryDirectory() as tmp:
-            with zipfile.ZipFile(zips[0]) as zf:
+            with zipfile.ZipFile(newest) as zf:
                 zf.extractall(tmp)
             # Sum all file sizes
             total = sum(f.stat().st_size for f in Path(tmp).rglob("*") if f.is_file())
