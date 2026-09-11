@@ -199,7 +199,12 @@ def write_multiscales_group(store_root: str, *, store_kwargs=None) -> dict:
         )
     overview = (manifest.get("pyramid") or {}).get("overview") or {}
     if manifest.get("temporal") is not None and not overview.get("all_time"):
-        logger.warning(
+        # INFO, not WARNING: §4.10 calls this store shape legal ("a gated
+        # windowed store"), and the finisher calls this writer on EVERY
+        # admitted sweep — warning about the ordinary case would train
+        # operators to ignore the one logger where the fail-open warnings
+        # live. The reason rides back in the summary for the CLI caller.
+        logger.info(
             f"multiscales: {store_root} is windowed and declares no all_time fold — "
             f"the /1 companion mirrors the all-time fold only; nothing written"
         )

@@ -421,10 +421,14 @@ class TestCompanionGroup:
         manifest = read_manifest(str(tmp_path))
         manifest["temporal"] = {"schedule": "yearly", "time_field": "t"}
         obstore.put(open_object_store(str(tmp_path)), MANIFEST_NAME, json.dumps(manifest).encode())
-        with caplog.at_level("WARNING"):
+        with caplog.at_level("INFO"):
             summary = write_multiscales_group(str(tmp_path))
         assert summary == {"written": False, "reason": "windowed store without all_time"}
         assert not (tmp_path / GROUP_NAME).exists()
+        # A legal store shape the finisher re-visits every run: the reason is
+        # logged at INFO and returned, never warned about (§4.10).
+        (gated,) = [r for r in caplog.records if "declares no all_time" in r.message]
+        assert gated.levelname == "INFO"
         manifest["pyramid"]["overview"]["all_time"] = True
         obstore.put(open_object_store(str(tmp_path)), MANIFEST_NAME, json.dumps(manifest).encode())
         assert write_multiscales_group(str(tmp_path))["written"] is True
