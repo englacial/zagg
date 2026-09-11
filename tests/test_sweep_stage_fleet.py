@@ -1763,6 +1763,51 @@ class TestRunnerSeam:
         assert summary is not None and summary["finisher"]["landed"] is False
         assert time.perf_counter() - t < 2.0, "the seam did not forward the barrier knobs"
 
+    def test_the_seam_inherits_the_ruled_fan_out(self, tmp_path):
+        # The production call site passes no grouping knob, so the deployed
+        # `output.sweep: "stages"` tail's fan-out shape IS the dispatcher's
+        # default — unpinned before this (review finding).
+        from zagg.runner import _invoke_lambda_stage_sweep
+
+        mod = _handler_module()
+        root = tmp_path / "s"
+        _stage_store(root)
+        client = _FakeLambda(mod.lambda_handler)
+        summary = _invoke_lambda_stage_sweep(
+            client,
+            "zagg-worker",
+            str(root),
+            [(morton_word(d), None) for d in LEAVES],
+            shard_order=3,
+            store_kwargs={},
+        )
+        fired = [e for e in client.events if e["stage"].get("role") == "stage"]
+        assert len(fired) > 1 and all(len(e["stage"]["nodes"]) == 1 for e in fired)
+        assert all(s["batches"] == s["nodes"] for s in summary["stages"])
+
+    def test_the_seam_threads_the_fan_out_knob(self, tmp_path):
+        # And an operator can override it for a store whose finest tuple is
+        # far larger than the ~110 nodes the ruling was sized on. `None` is a
+        # MEANING (payload-only packing), so the seam's unset sentinel cannot
+        # be `None` the way the barrier knobs' is.
+        from zagg.runner import _invoke_lambda_stage_sweep
+
+        mod = _handler_module()
+        root = tmp_path / "s"
+        _stage_store(root)
+        client = _FakeLambda(mod.lambda_handler)
+        _invoke_lambda_stage_sweep(
+            client,
+            "zagg-worker",
+            str(root),
+            [(morton_word(d), None) for d in LEAVES],
+            shard_order=3,
+            store_kwargs={},
+            max_nodes_per_invoke=None,
+        )
+        fired = [e for e in client.events if e["stage"].get("role") == "stage"]
+        assert len(fired) == 1 and len(fired[0]["stage"]["nodes"]) > 1
+
     def test_the_seam_says_a_barrier_expired(self, tmp_path, caplog):
         # A partially covered staged sweep read like a clean one in the run log
         # (review finding): the seam logged records_seen at INFO and nothing else.
