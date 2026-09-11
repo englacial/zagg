@@ -83,9 +83,16 @@ cp "$REPO_ROOT/deployment/aws/lambda_handler.py" "$BUILD_DIR/"
 # hatchling + hatch-vcs backend, which stamps `zagg/_version.py` from the git
 # tag. A shallow CI checkout (actions/checkout default) carries no tags, so
 # deepen it first; on a full clone `describe` succeeds and nothing is fetched.
+# The deepen MUTATES the caller's repository — it imports every remote tag and
+# un-shallows a clone that may have been made shallow on purpose. It is also
+# the one network step here, so announce it (an unshallow of a large history
+# otherwise reads as a hang) and set GIT_TERMINAL_PROMPT=0: without cached
+# credentials git would block on an interactive prompt inside a
+# non-interactive build instead of falling through to the assertion below.
 if ! git -C "$REPO_ROOT" describe --tags >/dev/null 2>&1; then
-    git -C "$REPO_ROOT" fetch --quiet --tags --unshallow 2>/dev/null \
-        || git -C "$REPO_ROOT" fetch --quiet --tags 2>/dev/null \
+    echo "Deepening checkout for hatch-vcs (no reachable tag; fetches tags into $REPO_ROOT)..."
+    GIT_TERMINAL_PROMPT=0 git -C "$REPO_ROOT" fetch --quiet --tags --unshallow 2>/dev/null \
+        || GIT_TERMINAL_PROMPT=0 git -C "$REPO_ROOT" fetch --quiet --tags 2>/dev/null \
         || true
 fi
 echo ""
