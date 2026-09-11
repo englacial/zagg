@@ -73,15 +73,23 @@ PROPERTY_KEYS = (
 )
 
 
-def export_choropleth(store_root: str, *, order=None, step=4, workers=8, store_kwargs=None) -> dict:
+def export_choropleth(
+    store_root: str, *, order=None, step=None, workers=8, store_kwargs=None
+) -> dict:
     """GeoJSON ``FeatureCollection`` of a store's per-node stats (issue #301).
 
     ``order`` selects the emission level: ``None`` (default) emits one
     feature per covered shard; an integer ``0 <= order <= shard_order`` emits
     one feature per covered rollup-tree node at that HEALPix order (the
     zoomed-out layer). ``step`` is points per polygon side
-    (``mortie.mort2polygon``; > 1 traces curved cell edges — matters near the
-    poles). ``store_kwargs`` reach :func:`zagg.store.open_object_store`
+    (``mortie.mort2polygon``; > 1 traces curved cell edges) and defaults to
+    ``4 << max(0, 6 - order)`` — 4 at leaf scale, 256 at order 0. It scales
+    because the polar error is a fixed *fraction* of the cell: mortie
+    collapses a cell's polar corner to a single vertex, so at ``step=4`` the
+    chord to it bites ~8% of the area out of every pole-cornered cell
+    (8 per order) — invisible at order 9, plain at the coarse orders this
+    exports. The vertices are spent where the features are few and huge.
+    ``store_kwargs`` reach :func:`zagg.store.open_object_store`
     (``skip_signature=True`` + ``region`` for anonymous published-bucket
     reads). ``workers`` bounds the thread pool resolving the *emitted* nodes
     concurrently (1 = sequential), so effective concurrency is ``min(workers,
@@ -112,6 +120,7 @@ def export_choropleth(store_root: str, *, order=None, step=4, workers=8, store_k
     order = shard_order if order is None else int(order)
     if not 0 <= order <= shard_order:
         raise ValueError(f"order must be in [0, {shard_order}] (the shard order); got {order}")
+    step = 4 << max(0, 6 - order) if step is None else int(step)
     n_covered = Counter(d[: len(_decimal_base(d)) + order] for d in covered)
     nodes = sorted(n_covered)
     store = open_object_store(store_root, **store_kwargs)
@@ -366,8 +375,9 @@ def main(argv=None) -> int:
     parser.add_argument(
         "--step",
         type=int,
-        default=4,
-        help="Points per polygon side (default: 4; raise near the poles)",
+        default=None,
+        help="Points per polygon side (default: scales with the emitted order, "
+        "4 at leaf scale up to 256 at --order 0, so coarse polar cells keep their corner)",
     )
     parser.add_argument(
         "--anon",
