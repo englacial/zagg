@@ -92,6 +92,30 @@ class TestDryRun:
         with pytest.raises(SystemExit, match="derives no /2 ladder"):
             tool.main([str(tmp_path), "--config", _config_yaml(tmp_path)])
 
+    def test_reports_the_leaf_probe_verdict(self, tmp_path, capsys):
+        _store(tmp_path)
+        tool.main([str(tmp_path), "--config", _config_yaml(tmp_path), "--overviews", "3"])
+        out = capsys.readouterr().out
+        assert "leaf probe: " in out
+        assert "REFUSED" not in out
+
+    def test_leaf_probe_refusal_is_a_verdict_not_a_traceback(self, tmp_path, capsys):
+        """Field drift refuses ``--execute``; the dry run must say so, not raise."""
+        _store(tmp_path)
+        drifted = json.loads(json.dumps(CONFIG_DICT))
+        drifted["aggregation"]["variables"]["absent_field"] = {
+            "function": "mean",
+            "source": "h_ph",
+            "dtype": "float32",
+        }
+        path = tmp_path / "drifted.yaml"
+        path.write_text(yaml.safe_dump(drifted))
+        rc = tool.main([str(tmp_path), "--config", str(path), "--overviews", "3"])
+        assert rc == 0
+        out = capsys.readouterr().out
+        assert "leaf probe: REFUSED — --execute WILL FAIL" in out
+        assert "absent_field" in out
+
     def test_identical_declaration_reports_a_no_op(self, tmp_path, capsys):
         _store(tmp_path)
         argv = [str(tmp_path), "--config", _config_yaml(tmp_path), "--overviews", "3"]
