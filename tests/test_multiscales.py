@@ -17,7 +17,8 @@ from zagg.multiscales import (
 )
 from zagg.pyramid import PYRAMID_SPEC_V2, declared_fields, expand_overviews, overview_block_v2
 from zagg.store import open_object_store
-from zagg.sweep_overview import PYRAMID_SPEC, declare_pyramid
+from zagg.sweep_overview import PYRAMID_SPEC, _update_manifest_pyramid, declare_pyramid
+from zagg.sweep_stages import run_finisher
 
 SHARD_ORDER = 2
 CELL_ORDER = 4
@@ -237,3 +238,30 @@ class TestDeclarePyramid:
         summary = declare_pyramid(str(tmp_path), _cfg(pyramid=False))
         assert summary["updated"] is True and summary["multiscales"] is False
         assert "multiscales" not in read_manifest(str(tmp_path))
+
+    def test_sweep_manifest_rmws_preserve_the_mirror(self, tmp_path):
+        # Declaration is not the last writer: two whole-manifest RMWs run
+        # after it on a /2 store and dump the WHOLE dict back — the sweep's
+        # fail-open ``materialized`` update and the finisher's per-entry
+        # actuals. The derived mirror must ride through both byte-for-byte
+        # (§4.9: sweep actuals never enter it), and the failure mode is
+        # silent, so pin it here rather than trust the two call sites.
+        self._store(tmp_path, _cfg(pyramid={"overviews": 3}))
+        before = read_manifest(str(tmp_path))["multiscales"]
+        assert _update_manifest_pyramid(str(tmp_path), {0: "leaves"}, {})
+        manifest = read_manifest(str(tmp_path))
+        assert manifest["pyramid"]["overview"]["materialized"]["orders"] == [0]
+        assert manifest["multiscales"] == before == manifest_multiscales(manifest)
+        actuals = {
+            order: {
+                "regime": "stage-merge",
+                "merges_from_raw": 2,
+                "source_children": {"folded": 4, "missing": 0, "unreadable": 0},
+            }
+            for order in (1, 0)
+        }
+        out = run_finisher(str(tmp_path), manifest, {}, actuals, run_id="t")
+        assert out["manifest_updated"] is True
+        final = read_manifest(str(tmp_path))
+        assert final["pyramid"]["overviews"][0]["actuals"]["regime"] == "leaf-column"
+        assert final["multiscales"] == before == manifest_multiscales(final)
