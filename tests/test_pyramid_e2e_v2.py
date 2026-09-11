@@ -414,6 +414,26 @@ class TestV2Provenance:
         assert entry["status"] == "fail"
         assert any("manifest actuals for node 0" in m for m in entry["mismatches"])
 
+    def test_malformed_actuals_is_a_verdict_not_a_traceback(self, tmp_path):
+        # §4.5 calls actuals an additive key a reader must TOLERATE, and the
+        # module's contract is "reports cleanly and exits 1, never a
+        # traceback" — a non-mapping block used to raise AttributeError out
+        # of a read-only run, and a non-numeric counter after it.
+        _build_store(tmp_path)
+        manifest = json.loads((tmp_path / MANIFEST_NAME).read_text())
+        for e in manifest["pyramid"]["overviews"]:
+            if e["node"] == 0:
+                e["actuals"] = "stage-merge"
+            elif e["node"] == 1:
+                e["actuals"]["merges_from_raw"] = "two"
+        obstore.put(open_object_store(str(tmp_path)), MANIFEST_NAME, json.dumps(manifest).encode())
+        report = validate_pyramid(str(tmp_path), full=True)
+        entry = report["checks"]["readback"]
+        assert entry["status"] == "fail"
+        assert any("node 0: a str, not the §4.5 mapping" in m for m in entry["mismatches"]), entry
+        assert any("node 1" in m and "'two'" in m for m in entry["mismatches"]), entry
+        assert report["passed"] is False
+
     def test_column_attrs_are_validated(self, tmp_path):
         # The §4.6 groups map: a column claiming a stage regime for a group
         # it folded from its own leaf is a broken write.
