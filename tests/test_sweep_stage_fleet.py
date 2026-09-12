@@ -1,0 +1,2040 @@
+"""The fleet transport for the /2 staged dense sweep (issue #519).
+
+Standing claims:
+
+- one ``mode="sweep"`` event with a ``stage`` block IS the worker arm: lease
+  admission, run-id skip keys and the foreign-fresh-stamp abort are the
+  in-process pass's, unchanged, and every store write stays worker-side (D8);
+- a tuple splits across invokes freely — dispatch nodes at one order own
+  disjoint subtrees and read only columns one tuple finer;
+- the dispatcher mirrors ``run_stage_sweep``'s tuple ordering: fan out a
+  tuple, soft-barrier on the stage records, then the next tuple, finisher
+  last (#381 point (6): under-coverage is loud and self-healing);
+- **the acceptance**: the fleet-built ladder is byte-identical to the
+  CLI-built ladder on the same store AND the same work set (the merge-source
+  law, espg ruling 2026-08-09, issue #384) — ``TestByteIdentityOracle`` below.
+  The work-set half of that precondition is the transport's one documented
+  divergence: the dispatcher derives its nodes from the work set alone (D8),
+  while the in-process pass unions it with the root ``coverage.moc``.
+"""
+
+from __future__ import annotations
+
+import importlib.util
+import json
+from pathlib import Path
+
+import pytest
+
+# The staged-sweep fixtures live with the in-process suite; the fleet arm is
+# the SAME store and the SAME expectations, reached over the wire.
+from test_sweep_stage import LEAVES, _artifact, _stage_store, _write_leaf  # noqa: E402
+
+from zagg.grids.morton import morton_word
+from zagg.sweep_stages import (
+    FINISHER_RECORD_NAME,
+    STAGE_RECORD_SPEC,
+    merge_level_actuals,
+    run_stage_finisher,
+    run_stage_worker,
+    stage_record_name,
+)
+
+
+def _handler_module():
+    handler_path = Path(__file__).parent.parent / "deployment" / "aws" / "lambda_handler.py"
+    spec = importlib.util.spec_from_file_location("zagg_lambda_handler_stage", handler_path)
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
+def _leaf_refs(leaves=LEAVES):
+    return [[morton_word(d), None] for d in leaves]
+
+
+def _event(root, block, leaves=LEAVES):
+    return {
+        "mode": "sweep",
+        "store_path": str(root),
+        "leaves": _leaf_refs(leaves),
+        "stage": block,
+    }
+
+
+RUN_STARTED = "2026-08-25T00:00:00+00:00"
+
+
+def _records(root):
+    """The run's status prefix for a local fixture store — a store SIBLING."""
+    return f"{root}.status"
+
+
+def _stage_block(dispatch, nodes, *, run_id="F", batch=0, records_from=None, **extra):
+    block = {
+        "role": "stage",
+        "run_id": run_id,
+        "run_started": RUN_STARTED,
+        "dispatch": int(dispatch),
+        "nodes": list(nodes),
+        "batch": int(batch),
+        "tuple_width": 3,
+    }
+    if records_from is not None:
+        block["records_from"] = str(records_from)
+    block.update(extra)
+    return block
+
+
+# ---------------------------------------------------------------------------
+# Phase 1: the worker arm.
+# ---------------------------------------------------------------------------
+
+
+class TestStageWorkerArm:
+    def test_one_invoke_folds_only_its_nodes(self, tmp_path):
+        root = tmp_path / "s"
+        _stage_store(root)
+        record = run_stage_worker(
+            str(root),
+            [(morton_word(d), None) for d in LEAVES],
+            run_id="F",
+            run_started=RUN_STARTED,
+            dispatch=0,
+            nodes=["1"],
+            records_from=_records(root),
+        )
+        (row,) = record["stages"]
+        assert row["dispatch_order"] == 0 and row["nodes"] == 1 and row["written"] > 0
+        assert (root / "1" / "all.zarr").exists()
+        # The base cell it was NOT handed is untouched — the fan-out's whole point.
+        assert not (root / "-2" / "all.zarr").exists()
+
+    def test_the_tuple_restriction_is_the_only_difference(self, tmp_path):
+        # Without ``only_dispatch`` a scope naming an order-0 node also admits
+        # its own subtree at every finer dispatch order (containment resolves
+        # both ways), which would have one worker sweep the whole ladder.
+        from zagg.sweep_stages import normalize_scope, sweep_stage_pass
+
+        root = tmp_path / "s"
+        manifest = _stage_store(root)
+        whole = sweep_stage_pass(
+            str(root),
+            manifest,
+            {d: {None} for d in LEAVES},
+            run_id="A",
+            scope=normalize_scope(["1"]),
+        )
+        assert [r["dispatch_order"] for r in whole["stages"]] == [0]  # o3/width 3: one tuple
+        with pytest.raises(ValueError, match="no stage tuple dispatches at order 1"):
+            sweep_stage_pass(
+                str(root), manifest, {d: {None} for d in LEAVES}, run_id="A", only_dispatch=1
+            )
+
+    def test_a_mistyped_dispatch_refuses_even_with_nothing_to_sweep(self, tmp_path):
+        # The refusal must not sit behind the pass's empty-summary gates: a
+        # store with no composable fields would otherwise let ANY dispatch
+        # order return ``stages: []`` and PUT a well-formed record on it.
+        import copy
+
+        from zagg.sweep_stages import sweep_stage_pass
+
+        root = tmp_path / "s"
+        manifest = _stage_store(root)
+        bare = copy.deepcopy(manifest)
+        bare["pyramid"]["overview"]["fields"] = {}
+        assert sweep_stage_pass(str(root), bare, {}, run_id="A")["stages"] == []
+        with pytest.raises(ValueError, match="no stage tuple dispatches at order 7"):
+            sweep_stage_pass(str(root), bare, {}, run_id="A", only_dispatch=7)
+        # Same over the worker entry point, with an order-7 node set to match.
+        with pytest.raises(ValueError, match="no stage tuple dispatches at order 7"):
+            run_stage_worker(
+                str(root),
+                [(morton_word(d), None) for d in LEAVES],
+                run_id="F",
+                run_started=RUN_STARTED,
+                dispatch=7,
+                nodes=["11111111"],
+                records_from=_records(root),
+            )
+
+    def test_the_worker_writes_and_holds_the_lease(self, tmp_path):
+        from zagg.sweep_lease import read_lease
+
+        root = tmp_path / "s"
+        _stage_store(root)
+        run_stage_worker(
+            str(root),
+            [(morton_word(d), None) for d in LEAVES],
+            run_id="F",
+            run_started=RUN_STARTED,
+            dispatch=0,
+            nodes=["1"],
+            records_from=_records(root),
+        )
+        held = read_lease(str(root))
+        # Held, ours, and NOT released: release is the finisher's final act.
+        assert held is not None and held["run_id"] == "F" and held["scope"] is None
+
+    def test_an_empty_node_set_refuses_instead_of_sweeping_the_store(self, tmp_path):
+        # ``scope=None`` is whole-store; a dropped/empty ``nodes`` key must not
+        # decay into it, or every worker that loses the key double-writes every
+        # object as a same-run sibling nothing refuses.
+        from zagg.sweep_lease import read_lease
+
+        root = tmp_path / "s"
+        _stage_store(root)
+        for nodes in ([], ()):
+            with pytest.raises(ValueError, match="empty node set"):
+                run_stage_worker(
+                    str(root),
+                    [(morton_word(d), None) for d in LEAVES],
+                    run_id="F",
+                    run_started=RUN_STARTED,
+                    dispatch=0,
+                    nodes=nodes,
+                    records_from=_records(root),
+                )
+        # Refused before admission and before any fold: no lease, no artifacts.
+        assert read_lease(str(root)) is None
+        assert not (root / "1" / "all.zarr").exists()
+        assert not (root / "-2" / "all.zarr").exists()
+
+    def test_a_node_off_the_dispatch_order_refuses_the_whole_invoke(self, tmp_path):
+        from zagg.sweep_lease import read_lease
+
+        root = tmp_path / "s"
+        _stage_store(root)
+        # "111" is an order-3 node; handed at dispatch 0 it admits its ancestor
+        # base cell "1" whole (containment resolves both ways), so this invoke
+        # would quietly fold four times its share.
+        with pytest.raises(ValueError, match=r"not at order 0: \['111'\]"):
+            run_stage_worker(
+                str(root),
+                [(morton_word(d), None) for d in LEAVES],
+                run_id="F",
+                run_started=RUN_STARTED,
+                dispatch=0,
+                nodes=["1", "111"],
+                records_from=_records(root),
+            )
+        # The whole invoke refuses — the good node in the same set is not swept.
+        assert read_lease(str(root)) is None
+        assert not (root / "1" / "all.zarr").exists()
+
+    def test_a_sibling_worker_of_the_same_run_is_admitted(self, tmp_path):
+        root = tmp_path / "s"
+        _stage_store(root)
+        for node in ("1", "-2"):
+            run_stage_worker(
+                str(root),
+                [(morton_word(d), None) for d in LEAVES],
+                run_id="F",
+                run_started=RUN_STARTED,
+                dispatch=0,
+                nodes=[node],
+                records_from=_records(root),
+            )
+        assert (root / "1" / "all.zarr").exists() and (root / "-2" / "all.zarr").exists()
+
+    def test_a_foreign_live_lease_refuses_the_invoke(self, tmp_path):
+        from zagg.sweep_lease import SweepRefusedError, acquire_lease
+
+        root = tmp_path / "s"
+        _stage_store(root)
+        acquire_lease(str(root), run_id="live-runner")
+        with pytest.raises(SweepRefusedError, match="live-runner"):
+            run_stage_worker(
+                str(root),
+                [(morton_word(d), None) for d in LEAVES],
+                run_id="F",
+                run_started=RUN_STARTED,
+                dispatch=0,
+                nodes=["1"],
+                records_from=_records(root),
+            )
+
+    def test_a_foreign_fresh_stamp_aborts_the_invoke(self, tmp_path):
+        import zarr
+
+        from zagg.store import open_store
+        from zagg.sweep_stage import ForeignSweepError
+
+        root = tmp_path / "s"
+        _stage_store(root)
+        run_stage_worker(
+            str(root),
+            [(morton_word(d), None) for d in LEAVES],
+            run_id="F",
+            run_started=RUN_STARTED,
+            dispatch=0,
+            nodes=["1"],
+            records_from=_records(root),
+        )
+        g = zarr.open_group(
+            open_store(str(root / "1" / "1" / "1" / "all.zarr")), path="", mode="r+", zarr_format=3
+        )
+        stamp = dict(g.attrs["morton_hive_commit"])
+        stamp["run_id"] = "zombie"
+        stamp["written_at"] = "2999-01-01T00:00:00+00:00"
+        g.attrs["morton_hive_commit"] = stamp
+        # Same run id: this is a live sibling of the run that already holds the
+        # lease, so admission passes and the STAMP is what has to catch it.
+        with pytest.raises(ForeignSweepError, match="zombie"):
+            run_stage_worker(
+                str(root),
+                [(morton_word(d), None) for d in LEAVES],
+                run_id="F",
+                run_started=RUN_STARTED,
+                dispatch=0,
+                nodes=["1"],
+                records_from=_records(root),
+            )
+
+    def test_the_run_id_skip_key_makes_a_reinvoke_current(self, tmp_path):
+        root = tmp_path / "s"
+        _stage_store(root)
+        first = run_stage_worker(
+            str(root),
+            [(morton_word(d), None) for d in LEAVES],
+            run_id="F",
+            run_started=RUN_STARTED,
+            dispatch=0,
+            nodes=["1"],
+            records_from=_records(root),
+        )
+        again = run_stage_worker(
+            str(root),
+            [(morton_word(d), None) for d in LEAVES],
+            run_id="F",
+            run_started=RUN_STARTED,
+            dispatch=0,
+            nodes=["1"],
+            records_from=_records(root),
+        )
+        assert first["stages"][0]["written"] > 0
+        assert again["stages"][0]["written"] == 0 and again["stages"][0]["current"] > 0
+
+    def test_the_record_lands_at_the_status_prefix(self, tmp_path):
+        root = tmp_path / "s"
+        _stage_store(root)
+        prefix = tmp_path / "status"
+        record = run_stage_worker(
+            str(root),
+            [(morton_word(d), None) for d in LEAVES],
+            run_id="F",
+            run_started=RUN_STARTED,
+            dispatch=0,
+            nodes=["1"],
+            batch=2,
+            records_from=str(prefix),
+        )
+        name = stage_record_name(0, 2)
+        assert name == "stage-00-0002.json"
+        on_disk = json.loads((prefix / name).read_text())
+        assert on_disk["spec"] == STAGE_RECORD_SPEC and on_disk["role"] == "stage"
+        assert on_disk["level_actuals"] and record["record"].endswith(name)
+
+    def test_a_worker_nobody_can_witness_refuses_by_name(self, tmp_path):
+        # A stage invoke without a records prefix folds correctly and then
+        # writes nothing anyone reads: its barrier waits out the full timeout
+        # and looks exactly like a lost invoke, and its coverage never reaches
+        # the manifest. Loud here or never loud at all (review finding).
+        root = tmp_path / "s"
+        _stage_store(root)
+        with pytest.raises(ValueError, match="no records_from"):
+            run_stage_worker(
+                str(root),
+                [(morton_word(d), None) for d in LEAVES],
+                run_id="F",
+                run_started=RUN_STARTED,
+                dispatch=0,
+                nodes=["1"],
+                records_from="",
+            )
+        # Refused BEFORE admission and before any fold: no lease, no artifacts.
+        assert not (root / "sweep.lease.json").exists()
+        assert not (root / "1" / "all.zarr").exists()
+
+    def test_a_stage_worker_never_touches_store_root_singletons(self, tmp_path):
+        from zagg.hive import MANIFEST_NAME
+
+        root = tmp_path / "s"
+        _stage_store(root)
+        before = {
+            name: (root / name).read_bytes()
+            for name in (MANIFEST_NAME, "coverage.moc")
+            if (root / name).exists()
+        }
+        assert set(before) == {MANIFEST_NAME, "coverage.moc"}
+        run_stage_worker(
+            str(root),
+            [(morton_word(d), None) for d in LEAVES],
+            run_id="F",
+            run_started=RUN_STARTED,
+            dispatch=0,
+            nodes=["1", "-2"],
+            records_from=_records(root),
+        )
+        # The finisher owns the manifest RMW and the root MOC refresh; a stage
+        # worker writing either would breach the singleton single-writer law.
+        # (The lease IS a store-root object, but it is control plane, not data.)
+        assert {name: (root / name).read_bytes() for name in before} == before
+
+
+class TestFinisherArm:
+    def _sweep_all(self, root, prefix, *, run_id="F"):
+        for batch, node in enumerate(("1", "-2")):
+            run_stage_worker(
+                str(root),
+                [(morton_word(d), None) for d in LEAVES],
+                run_id=run_id,
+                run_started=RUN_STARTED,
+                dispatch=0,
+                nodes=[node],
+                batch=batch,
+                records_from=str(prefix),
+            )
+
+    def test_the_finisher_aggregates_the_records_and_releases(self, tmp_path):
+        from zagg.hive import read_manifest, read_root_coverage
+        from zagg.sweep_lease import read_lease
+
+        root, prefix = tmp_path / "s", tmp_path / "status"
+        _stage_store(root)
+        self._sweep_all(root, prefix)
+        summary = run_stage_finisher(
+            str(root),
+            [(morton_word(d), None) for d in LEAVES],
+            run_id="F",
+            records_from=str(prefix),
+        )
+        assert summary["stage_records"] == 2 and summary["transport"] == "lambda"
+        assert summary["lease"]["released"] and read_lease(str(root)) is None
+        assert read_root_coverage(str(root))["source"] == "sweep"
+        entries = {e["node"]: e for e in read_manifest(str(root))["pyramid"]["overviews"]}
+        # Node 0's two base-cell artifacts, summed ONCE across the two invokes.
+        assert entries[0]["actuals"]["source_children"] == {
+            "folded": 4,
+            "missing": 0,
+            "unreadable": 0,
+        }
+        assert (prefix / FINISHER_RECORD_NAME).exists()
+        assert json.loads((root / summary["record"]).read_text())["mode"] == "stages"
+
+    def test_the_finisher_refuses_under_a_foreign_lease(self, tmp_path):
+        # The fan-out outlived the TTL and a foreign sweep claimed the store.
+        # The finisher writes the root singletons, so it must refuse rather
+        # than do the manifest RMW alongside the claimant's own finisher.
+        from zagg.hive import read_manifest
+        from zagg.sweep_lease import SweepRefusedError, acquire_lease, release_lease
+
+        root, prefix = tmp_path / "s", tmp_path / "status"
+        _stage_store(root)
+        self._sweep_all(root, prefix)
+        assert release_lease(str(root), run_id="F")
+        acquire_lease(str(root), run_id="foreign-runner")
+        before = read_manifest(str(root))
+        with pytest.raises(SweepRefusedError, match="foreign-runner"):
+            run_stage_finisher(
+                str(root),
+                [(morton_word(d), None) for d in LEAVES],
+                run_id="F",
+                records_from=str(prefix),
+            )
+        assert read_manifest(str(root)) == before
+        assert not (prefix / FINISHER_RECORD_NAME).exists()
+
+    def test_the_finisher_re_admits_its_own_run(self, tmp_path):
+        # The idempotent half: the run's own live intent is re-read, not refused.
+        from zagg.sweep_lease import read_lease
+
+        root, prefix = tmp_path / "s", tmp_path / "status"
+        _stage_store(root)
+        self._sweep_all(root, prefix)
+        assert read_lease(str(root))["run_id"] == "F"
+        summary = run_stage_finisher(
+            str(root),
+            [(morton_word(d), None) for d in LEAVES],
+            run_id="F",
+            records_from=str(prefix),
+        )
+        assert summary["lease"]["released"] and read_lease(str(root)) is None
+
+    def test_a_finisher_without_records_from_refuses(self, tmp_path):
+        root, prefix = tmp_path / "s", tmp_path / "status"
+        _stage_store(root)
+        self._sweep_all(root, prefix)
+        with pytest.raises(ValueError, match="no records_from"):
+            run_stage_finisher(str(root), [(morton_word(d), None) for d in LEAVES], run_id="F")
+
+    def test_a_finisher_over_zero_records_refuses(self, tmp_path):
+        # The fan-out was lost (or the prefix is wrong): stamping the manifest
+        # with no actuals at all is the silent under-report this channel exists
+        # to prevent, so it refuses instead of reporting a clean finish.
+        from zagg.hive import read_manifest
+        from zagg.sweep_lease import read_lease
+
+        root, prefix = tmp_path / "s", tmp_path / "status"
+        _stage_store(root)
+        self._sweep_all(root, prefix)
+        empty = tmp_path / "elsewhere"
+        empty.mkdir()
+        before = read_manifest(str(root))
+        with pytest.raises(ValueError, match="no stage records"):
+            run_stage_finisher(
+                str(root),
+                [(morton_word(d), None) for d in LEAVES],
+                run_id="F",
+                records_from=str(empty),
+            )
+        assert read_manifest(str(root)) == before
+        assert not (empty / FINISHER_RECORD_NAME).exists()
+        assert read_lease(str(root))["run_id"] == "F"  # failure leaves it HELD
+
+    def test_a_partial_record_set_still_finishes(self, tmp_path):
+        # Only ZERO refuses: under-coverage from a lost batch is recorded and
+        # heals on the next run (#381 point (6)).
+        root, prefix = tmp_path / "s", tmp_path / "status"
+        _stage_store(root)
+        self._sweep_all(root, prefix)
+        (prefix / stage_record_name(0, 1)).unlink()
+        summary = run_stage_finisher(
+            str(root),
+            [(morton_word(d), None) for d in LEAVES],
+            run_id="F",
+            records_from=str(prefix),
+        )
+        assert summary["stage_records"] == 1 and summary["lease"]["released"]
+        # 4 with both records (see above); the lost batch under-reports, loudly.
+        assert summary["levels"]["0"]["source_children"]["folded"] == 3
+
+    def test_a_prior_attempts_record_cannot_win_the_merge(self, tmp_path):
+        # Same prefix, same id, a dead attempt's higher-numbered batch: the
+        # merge ASSIGNS in sorted-name order, so an unfiltered read would let
+        # ``stage-00-0009`` overwrite the fresh rows with stale counts.
+        root, prefix = tmp_path / "s", tmp_path / "status"
+        _stage_store(root)
+        self._sweep_all(root, prefix)
+        stale = json.loads((prefix / stage_record_name(0, 0)).read_text())
+        stale["run_id"] = "E"  # the earlier attempt
+        for level in stale["level_actuals"].values():
+            for row in level["children"].values():
+                row["folded"] = 99
+        (prefix / stage_record_name(0, 9)).write_text(json.dumps(stale))
+        summary = run_stage_finisher(
+            str(root),
+            [(morton_word(d), None) for d in LEAVES],
+            run_id="F",
+            records_from=str(prefix),
+        )
+        assert summary["stage_records"] == 2  # the stale one is not one of ours
+        assert summary["levels"]["0"]["source_children"]["folded"] == 4
+
+    def test_read_stage_records_filters_on_run_id(self, tmp_path):
+        from zagg.sweep_stages import read_stage_records
+
+        root, prefix = tmp_path / "s", tmp_path / "status"
+        _stage_store(root)
+        self._sweep_all(root, prefix)
+        stale = json.loads((prefix / stage_record_name(0, 0)).read_text())
+        stale["run_id"] = "E"
+        (prefix / stage_record_name(0, 9)).write_text(json.dumps(stale))
+        assert [r["batch"] for r in read_stage_records(str(prefix), run_id="F")] == [0, 1]
+        assert [r["run_id"] for r in read_stage_records(str(prefix), run_id="E")] == ["E"]
+
+    def test_an_expired_barrier_is_recorded_in_the_run_record(self, tmp_path):
+        # The dispatcher is the only party that knows it stopped waiting, and
+        # its log does not outlive the process. A barrier that expired on a
+        # QUEUED invoke lets this finisher aggregate before its late siblings
+        # write, so the per-level actuals can be short — the run record has to
+        # say so (review finding).
+        root, prefix = tmp_path / "s", tmp_path / "status"
+        _stage_store(root)
+        self._sweep_all(root, prefix)
+        summary = run_stage_finisher(
+            str(root),
+            [(morton_word(d), None) for d in LEAVES],
+            run_id="F",
+            records_from=str(prefix),
+            barrier_timed_out=True,
+        )
+        assert summary["barrier_timed_out"] is True
+        assert json.loads((root / summary["record"]).read_text())["barrier_timed_out"] is True
+        assert json.loads((prefix / FINISHER_RECORD_NAME).read_text())["barrier_timed_out"] is True
+
+    def test_a_clean_run_records_the_barrier_as_intact(self, tmp_path):
+        root, prefix = tmp_path / "s", tmp_path / "status"
+        _stage_store(root)
+        self._sweep_all(root, prefix)
+        summary = run_stage_finisher(
+            str(root),
+            [(morton_word(d), None) for d in LEAVES],
+            run_id="F",
+            records_from=str(prefix),
+        )
+        # Present and false, never absent: a reader must not have to guess
+        # whether an old finisher simply did not record it.
+        assert summary["barrier_timed_out"] is False
+        assert json.loads((root / summary["record"]).read_text())["barrier_timed_out"] is False
+
+    def test_merge_is_idempotent_over_reinvoked_batches(self, tmp_path):
+        # A re-fired batch (Event retry) rewrites its own record; the merge is
+        # keyed per (artifact node, window) and ASSIGNED, so coverage counts
+        # cannot inflate.
+        root, prefix = tmp_path / "s", tmp_path / "status"
+        _stage_store(root)
+        self._sweep_all(root, prefix)
+        self._sweep_all(root, prefix)
+        summary = run_stage_finisher(
+            str(root),
+            [(morton_word(d), None) for d in LEAVES],
+            run_id="F",
+            records_from=str(prefix),
+        )
+        assert summary["levels"]["0"]["source_children"]["folded"] == 4
+
+    def test_unreadable_record_is_skipped_not_fatal(self, tmp_path):
+        root, prefix = tmp_path / "s", tmp_path / "status"
+        _stage_store(root)
+        self._sweep_all(root, prefix)
+        (prefix / stage_record_name(0, 1)).write_text("{not json")
+        summary = run_stage_finisher(
+            str(root),
+            [(morton_word(d), None) for d in LEAVES],
+            run_id="F",
+            records_from=str(prefix),
+        )
+        assert summary["stage_records"] == 1  # the survivor; under-report, not abort
+        assert summary["lease"]["released"]
+
+    def test_merge_level_actuals_first_wins_on_level_metadata(self):
+        # The merge runs in sorted record-NAME order, which is a dispatcher
+        # batching artifact, so the level metadata must not be last-wins: the
+        # second worker here disagrees on all three values and loses. (They
+        # cannot legitimately disagree — every worker derives them per level
+        # via ``classify_level`` — which is exactly why the tie is pinned.)
+        target: dict = {}
+        merge_level_actuals(
+            target,
+            {"2": {"cells": 3, "regime": "stage-gather", "merges_from_raw": 1, "children": {}}},
+        )
+        merge_level_actuals(
+            target,
+            {
+                "2": {
+                    "cells": 999,
+                    "regime": "stage-merge",
+                    "merges_from_raw": 7,
+                    "children": {"111|all": {"folded": 2, "missing": 0, "unreadable": 0}},
+                }
+            },
+        )
+        assert target[2]["cells"] == 3
+        assert target[2]["regime"] == "stage-gather"
+        assert target[2]["merges_from_raw"] == 1
+        # The per-(node, window) rows still merge in from both.
+        assert target[2]["children"] == {"111|all": {"folded": 2, "missing": 0, "unreadable": 0}}
+
+
+class TestHandlerStageArm:
+    def test_stage_role_round_trips_over_the_event(self, tmp_path):
+        mod = _handler_module()
+        root, prefix = tmp_path / "s", tmp_path / "status"
+        _stage_store(root)
+        response = mod.lambda_handler(
+            _event(root, _stage_block(0, ["1"], records_from=prefix)), None
+        )
+        assert response["statusCode"] == 200
+        body = json.loads(response["body"])
+        assert body["ok"] and body["stage"] == "stage" and body["run_id"] == "F"
+        assert body["n_leaves"] == len(LEAVES) and body["duration_s"] >= 0.0
+        assert body["dispatch"] == 0 and body["batch"] == 0 and body["n_nodes"] == 1
+        assert body["written"] > 0 and body["failed"] == 0
+        # The record is durable at the status prefix; the envelope names it and
+        # carries no rows (``record`` is the store-root run record — finisher only).
+        assert body["record"] is None
+        assert body["stage_record"].endswith(stage_record_name(0, 0))
+        assert (prefix / stage_record_name(0, 0)).exists()
+
+    def test_finisher_role_round_trips_over_the_event(self, tmp_path):
+        mod = _handler_module()
+        root, prefix = tmp_path / "s", tmp_path / "status"
+        _stage_store(root)
+        mod.lambda_handler(_event(root, _stage_block(0, ["1", "-2"], records_from=prefix)), None)
+        response = mod.lambda_handler(
+            _event(
+                root,
+                {
+                    "role": "finisher",
+                    "run_id": "F",
+                    "records_from": str(prefix),
+                    "touch_policy": "auto",
+                },
+            ),
+            None,
+        )
+        body = json.loads(response["body"])
+        assert response["statusCode"] == 200 and body["stage"] == "finisher"
+        assert body["lease_released"] and body["stage_records"] == 1
+        assert body["record"].startswith("sweep_stats_")
+        assert body["stage_record"].endswith(FINISHER_RECORD_NAME)
+
+    def test_the_dispatchers_barrier_verdict_reaches_the_finisher(self, tmp_path):
+        # End to end over the wire: sweep_fleet puts barrier_timed_out on the
+        # finisher block, the handler forwards it, the run record keeps it.
+        mod = _handler_module()
+        root, prefix = tmp_path / "s", tmp_path / "status"
+        _stage_store(root)
+        mod.lambda_handler(_event(root, _stage_block(0, ["1", "-2"], records_from=prefix)), None)
+        response = mod.lambda_handler(
+            _event(
+                root,
+                {
+                    "role": "finisher",
+                    "run_id": "F",
+                    "records_from": str(prefix),
+                    "barrier_timed_out": True,
+                },
+            ),
+            None,
+        )
+        assert response["statusCode"] == 200
+        record = json.loads(response["body"])["record"]
+        assert json.loads((root / record).read_text())["barrier_timed_out"] is True
+
+    def test_discovery_transport_is_shared_with_the_families_arm(self, tmp_path):
+        import pandas as pd
+
+        mod = _handler_module()
+        root, prefix = tmp_path / "s", tmp_path / "status"
+        _stage_store(root)
+        pd.DataFrame(
+            {
+                "shard_key": pd.array([morton_word(d) for d in LEAVES], dtype="UInt64"),
+                "success": [True] * len(LEAVES),
+                "window": [None] * len(LEAVES),
+            }
+        ).to_parquet(root / "stats_20260825T000000Z_test.parquet", engine="fastparquet")
+        event = {
+            "mode": "sweep",
+            "store_path": str(root),
+            "stage": _stage_block(0, ["1"], records_from=prefix),
+        }
+        body = json.loads(mod.lambda_handler(event, None)["body"])
+        assert body["ok"] and body["n_leaves"] == len(LEAVES)
+        assert body["discover_s"] >= 0.0  # the work set was derived, not shipped
+
+    def test_a_failed_stage_invoke_reports_500(self, tmp_path):
+        from zagg.sweep_lease import acquire_lease
+
+        mod = _handler_module()
+        root, prefix = tmp_path / "s", tmp_path / "status"
+        _stage_store(root)
+        acquire_lease(str(root), run_id="live-runner")
+        response = mod.lambda_handler(
+            _event(root, _stage_block(0, ["1"], records_from=prefix)), None
+        )
+        assert response["statusCode"] == 500
+        body = json.loads(response["body"])
+        assert body["error_class"] == "SweepRefusedError" and "live-runner" in body["error"]
+        assert not (prefix / stage_record_name(0, 0)).exists()
+
+    def test_a_stage_event_without_nodes_refuses_by_name(self, tmp_path):
+        mod = _handler_module()
+        root, prefix = tmp_path / "s", tmp_path / "status"
+        _stage_store(root)
+        block = _stage_block(0, ["1"], records_from=prefix)
+        del block["nodes"]
+        response = mod.lambda_handler(_event(root, block), None)
+        assert response["statusCode"] == 500
+        body = json.loads(response["body"])
+        assert body["error_class"] == "ValueError" and "empty node set" in body["error"]
+        assert not (prefix / stage_record_name(0, 0)).exists()
+
+    def test_an_unknown_role_refuses_by_name(self, tmp_path):
+        mod = _handler_module()
+        root = tmp_path / "s"
+        _stage_store(root)
+        response = mod.lambda_handler(_event(root, {"role": "nope", "run_id": "F"}), None)
+        assert response["statusCode"] == 500
+        assert "unknown stage role" in json.loads(response["body"])["error"]
+
+    def test_the_envelope_is_scalars_and_one_fixed_key_set(self, tmp_path):
+        # A stage record is one row per (artifact node, window); a finest-tuple
+        # batch is megabytes of them, so echoing it would fail a SUCCEEDED
+        # invoke on the 6 MB response cap. Only scalars cross the wire, and the
+        # key set does not move with the role or the outcome.
+        mod = _handler_module()
+        root, prefix = tmp_path / "s", tmp_path / "status"
+        _stage_store(root)
+        stage = json.loads(
+            mod.lambda_handler(
+                _event(root, _stage_block(0, ["1", "-2"], records_from=prefix)), None
+            )["body"]
+        )
+        finisher = json.loads(
+            mod.lambda_handler(
+                _event(root, {"role": "finisher", "run_id": "F", "records_from": str(prefix)}),
+                None,
+            )["body"]
+        )
+        failed = json.loads(
+            mod.lambda_handler(_event(root, {"role": "nope", "run_id": "F"}), None)["body"]
+        )
+        assert set(stage) == set(finisher) == set(failed)
+        assert all(not isinstance(v, (dict, list)) for v in stage.values()), (
+            "the envelope carries scalars only"
+        )
+        assert "level_actuals" not in stage and "result" not in stage
+        assert stage["error"] is None and failed["ok"] is False
+
+    def test_the_wire_default_tuple_width_is_the_single_source(self, tmp_path, monkeypatch):
+        # ``stage_tuples``' grouping decides which orders dispatch, hence which
+        # nodes get a stage column at all; a literal here would drift from the
+        # CLI path the moment the constant moves.
+        import zagg.sweep_stage as sweep_stage
+        import zagg.sweep_stages as sweep_stages
+
+        mod = _handler_module()
+        root = tmp_path / "s"
+        _stage_store(root)
+        seen = {}
+        real = sweep_stages.run_stage_worker
+
+        def _spy(*args, **kwargs):
+            seen.update(kwargs)
+            return real(*args, **kwargs)
+
+        monkeypatch.setattr(sweep_stages, "run_stage_worker", _spy)
+        block = _stage_block(0, ["1"], records_from=_records(root))
+        del block["tuple_width"]
+        assert mod.lambda_handler(_event(root, block), None)["statusCode"] == 200
+        assert seen["tuple_width"] == sweep_stage.DEFAULT_TUPLE_WIDTH
+
+    def test_the_families_arm_is_untouched_without_a_stage_block(self, tmp_path):
+        mod = _handler_module()
+        root = tmp_path / "s"
+        _stage_store(root)
+        body = json.loads(
+            mod.lambda_handler(
+                {"mode": "sweep", "store_path": str(root), "leaves": _leaf_refs()}, None
+            )["body"]
+        )
+        assert "families" in body and "stage" not in body
+
+
+class TestUnderCoverageHeals(object):
+    def test_a_missing_child_under_covers_then_heals_over_the_wire(self, tmp_path):
+        root, prefix = tmp_path / "s", tmp_path / "status"
+        _stage_store(root, skip_columns={"1121"})
+        record = run_stage_worker(
+            str(root),
+            [(morton_word(d), None) for d in LEAVES],
+            run_id="F",
+            run_started=RUN_STARTED,
+            dispatch=0,
+            nodes=["1"],
+            records_from=str(prefix),
+        )
+        assert record["stages"][0]["under_covered"] > 0
+        attrs = dict(_artifact(root, "1/all.zarr").attrs)["zagg_overview"]
+        assert attrs["source_children"] == {"folded": 2, "missing": 1, "unreadable": 0}
+        _write_leaf(root, "1121", 2)
+        # A second RUN: run F's finisher released the lease as its final act,
+        # and the dispatcher pins the new run's start stamp at dispatch time —
+        # run F's artifacts are then a COMPLETED prior sweep's, not a live
+        # sibling's, which is what keeps the foreign-fresh backstop quiet.
+        from zagg.hive import _utcnow
+        from zagg.sweep_lease import release_lease
+
+        assert release_lease(str(root), run_id="F")
+        run_stage_worker(
+            str(root),
+            [(morton_word(d), None) for d in LEAVES],
+            run_id="G",
+            run_started=_utcnow(),
+            dispatch=0,
+            nodes=["1"],
+            records_from=str(prefix),
+        )
+        attrs = dict(_artifact(root, "1/all.zarr").attrs)["zagg_overview"]
+        assert attrs["source_children"] == {"folded": 3, "missing": 0, "unreadable": 0}
+
+
+# ---------------------------------------------------------------------------
+# Phase 2: the dispatcher — tuple ordering, batching, the soft barrier.
+# ---------------------------------------------------------------------------
+
+
+class _FakeLambda:
+    """A Lambda client that executes the worker arm in-process.
+
+    ``drop`` names record basenames whose invoke is silently swallowed — a
+    lost Event invoke, which is what the soft barrier exists to survive.
+    """
+
+    def __init__(self, handler=None, drop=()):
+        self.handler = handler
+        self.drop = set(drop)
+        self.events = []
+        self.responses = []
+
+    def invoke(self, FunctionName, InvocationType, Payload):  # noqa: N803 (boto3 spelling)
+        event = json.loads(Payload)
+        self.events.append(event)
+        block = event["stage"]
+        name = (
+            FINISHER_RECORD_NAME
+            if block.get("role") == "finisher"
+            else stage_record_name(block["dispatch"], block["batch"])
+        )
+        if self.handler is not None and name not in self.drop:
+            self.responses.append(self.handler(event, None))
+        return {"StatusCode": 202}
+
+    def blocks(self):
+        return [e["stage"] for e in self.events]
+
+
+def _fleet(root, client, *, leaves=None, **kwargs):
+    from zagg.sweep_fleet import run_stage_sweep_fleet
+
+    return run_stage_sweep_fleet(
+        client,
+        "zagg-worker",
+        str(root),
+        [(morton_word(d), None) for d in LEAVES] if leaves is None else leaves,
+        shard_order=3,
+        store_kwargs={},
+        poll_interval_s=0.01,
+        **kwargs,
+    )
+
+
+class TestDispatchNodes:
+    def test_nodes_are_the_work_set_ancestors_at_the_dispatch_order(self):
+        from zagg.sweep_fleet import dispatch_nodes
+
+        by_shard = {d: {None} for d in LEAVES}
+        assert dispatch_nodes(by_shard, 0) == ["-2", "1"]
+        assert dispatch_nodes(by_shard, 1) == ["-21", "11"]
+        assert dispatch_nodes(by_shard, 2) == ["-211", "111", "112"]
+        assert dispatch_nodes(by_shard, 3) == sorted(LEAVES)
+
+    def test_scope_filters_them(self):
+        from zagg.sweep_fleet import dispatch_nodes
+        from zagg.sweep_stages import normalize_scope
+
+        by_shard = {d: {None} for d in LEAVES}
+        assert dispatch_nodes(by_shard, 0, normalize_scope(["1111"])) == ["1"]
+
+    def test_every_node_sits_at_the_dispatch_order_the_worker_demands(self):
+        # The pairing the fold's node-order refusal depends on: what the
+        # dispatcher names is exactly what run_stage_worker will accept.
+        from zagg.hive import _decimal_order
+        from zagg.sweep_fleet import dispatch_nodes
+
+        by_shard = {d: {None} for d in LEAVES}
+        for dispatch in (0, 1, 2, 3):
+            assert all(_decimal_order(n) == dispatch for n in dispatch_nodes(by_shard, dispatch))
+
+
+class TestBatching:
+    def _block(self, dispatch=0):
+        return {
+            "role": "stage",
+            "run_id": "F",
+            "run_started": RUN_STARTED,
+            "dispatch": dispatch,
+            "tuple_width": 3,
+            "records_from": "s3://b/p.zarr.status/run-F",
+        }
+
+    def test_a_small_tuple_is_one_batch_carrying_every_leaf(self):
+        from zagg.sweep_fleet import pack_batches
+
+        by_shard = {d: {None} for d in LEAVES}
+        batches = pack_batches(
+            ["-2", "1"], by_shard, block=self._block(), store_path="s3://b/p.zarr"
+        )
+        assert len(batches) == 1
+        nodes, refs = batches[0]
+        assert nodes == ["-2", "1"] and len(refs) == len(LEAVES)
+
+    def test_the_node_buckets_match_the_per_node_slices(self):
+        # The quadratic fix (review finding): bucketing the work set by
+        # `_node_at` ONCE must hand each node exactly the slice the per-node
+        # prefix scan handed it, windows and order included.
+        from zagg.sweep_fleet import _bucket_leaf_refs, _leaf_refs, dispatch_nodes
+
+        by_shard = {d: {None, "2024"} for d in LEAVES}
+        for dispatch in (0, 1, 2, 3):
+            buckets = _bucket_leaf_refs(by_shard, dispatch)
+            assert sorted(buckets) == dispatch_nodes(by_shard, dispatch)
+            for node, refs in buckets.items():
+                assert refs == _leaf_refs(by_shard, [node])
+
+    def test_every_node_lands_in_exactly_one_batch(self):
+        # 4^5 order-5 leaves under one base cell: enough that the leaf slices
+        # alone blow the async cap several times over.
+        from mortie import generate_morton_children
+
+        from zagg.grids.morton import morton_decimal
+        from zagg.sweep_fleet import pack_batches
+
+        leaves = [morton_decimal(int(w)) for w in generate_morton_children(morton_word("1"), 7)]
+        by_shard = {d: {None} for d in leaves}
+        nodes = sorted({d[:4] for d in leaves})
+        batches = pack_batches(
+            nodes, by_shard, block=self._block(3), store_path="s3://bucket/p.zarr"
+        )
+        assert len(batches) > 1
+        flat = [n for batch, _ in batches for n in batch]
+        assert flat == nodes  # every node once, in order
+
+    def test_batches_stay_under_the_async_cap(self):
+        # `build_stage_event` holds the cap unconditionally -- it strips the
+        # leaves to get there -- so asserting only on its output is a tautology
+        # (review finding). What pack_batches owes is that a batch it sized to
+        # ride INLINE actually does: leaves present, no discover, under the cap.
+        from mortie import generate_morton_children
+
+        from zagg.grids.morton import morton_decimal
+        from zagg.runner import _ASYNC_PAYLOAD_CAP_BYTES
+        from zagg.sweep_fleet import build_stage_event, pack_batches
+
+        leaves = [morton_decimal(int(w)) for w in generate_morton_children(morton_word("1"), 7)]
+        by_shard = {d: {None} for d in leaves}
+        nodes = sorted({d[:4] for d in leaves})
+        block = self._block(3)
+        batches = pack_batches(nodes, by_shard, block=block, store_path="s3://bucket/p.zarr")
+        assert len(batches) > 1
+        for batch, (batch_nodes, refs) in enumerate(batches):
+            assert refs is not None, "these nodes' slices each fit; none is a discover batch"
+            event = build_stage_event(
+                "s3://bucket/p.zarr", {**block, "nodes": batch_nodes, "batch": batch}, refs
+            )
+            assert len(event["leaves"]) == len(refs), f"batch {batch} lost its inline leaves"
+            assert "discover" not in event
+            assert len(json.dumps(event)) <= _ASYNC_PAYLOAD_CAP_BYTES
+
+    def test_one_overflowing_node_falls_back_to_discovery_not_truncation(self):
+        # One dispatch node whose own leaf slice cannot fit: the batch must be
+        # that node alone with NO inline leaves, so build_stage_event turns it
+        # into the discover form. Truncating the slice would silently under-fold.
+        from mortie import generate_morton_children
+
+        from zagg.grids.morton import morton_decimal
+        from zagg.sweep_fleet import build_stage_event, pack_batches
+
+        leaves = [morton_decimal(int(w)) for w in generate_morton_children(morton_word("1"), 8)]
+        by_shard = {d: {None} for d in leaves}
+        block = self._block(0)
+        batches = pack_batches(["1"], by_shard, block=block, store_path="s3://bucket/p.zarr")
+        assert batches == [(["1"], None)]
+        event = build_stage_event(
+            "s3://bucket/p.zarr", {**block, "nodes": ["1"], "batch": 0}, batches[0][1]
+        )
+        assert event["discover"] is True and "leaves" not in event
+
+    def test_each_batch_carries_exactly_its_own_subtrees_leaves(self):
+        # The invariant the whole batching design rests on, and the one a
+        # single-batch fixture cannot reach (review finding): batch i's leaves
+        # are exactly the work-set leaves under batch i's nodes. A slicing bug
+        # here makes the fleet fold a different input set than the in-process
+        # pass while every other phase-2 assertion still passes.
+        from mortie import generate_morton_children
+
+        from zagg.grids.morton import morton_decimal
+        from zagg.sweep_fleet import pack_batches
+
+        leaves = [morton_decimal(int(w)) for w in generate_morton_children(morton_word("1"), 7)]
+        by_shard = {d: {None} for d in leaves}
+        nodes = sorted({d[:4] for d in leaves})
+        batches = pack_batches(
+            nodes, by_shard, block=self._block(3), store_path="s3://bucket/p.zarr"
+        )
+        assert len(batches) > 1
+        seen: list = []
+        for batch_nodes, refs in batches:
+            assert refs is not None
+            decimals = [morton_decimal(int(k)) for k, _w in refs]
+            assert all(d.startswith(tuple(batch_nodes)) for d in decimals)
+            seen += decimals
+        assert sorted(seen) == sorted(by_shard)  # nothing lost, nothing duplicated
+
+    def test_the_discovery_fallback_is_logged_by_name(self, caplog):
+        # Reaching the fallback means a batch was sized somewhere other than
+        # pack_batches; a silent switch to a store-wide LIST would show up only
+        # as unexplained worker latency, so it names the batch at WARNING.
+        import logging
+
+        from mortie import generate_morton_children
+
+        from zagg.grids.morton import morton_decimal
+        from zagg.sweep_fleet import build_stage_event
+
+        leaves = [morton_decimal(int(w)) for w in generate_morton_children(morton_word("1"), 8)]
+        refs = [[morton_word(d), None] for d in leaves]
+        block = {**self._block(0), "nodes": ["1"], "batch": 7}
+        with caplog.at_level(logging.WARNING, logger="zagg.sweep_fleet"):
+            event = build_stage_event("s3://bucket/p.zarr", block, refs)
+        assert event["discover"] is True and "leaves" not in event
+        assert "batch 7" in caplog.text and "async payload cap" in caplog.text
+
+    def test_an_empty_work_set_is_not_a_discovery_request(self):
+        from zagg.sweep_fleet import build_stage_event
+
+        # `leaves=[]` means "nothing to do", `leaves=None` means "derive it".
+        # Collapsing the two would turn a no-op invoke into a store-wide LIST.
+        event = build_stage_event("s3://b/p.zarr", self._block(), [])
+        assert event["leaves"] == [] and "discover" not in event
+
+
+class TestStageEvent:
+    def test_the_event_is_a_sweep_event_with_a_stage_block(self):
+        from zagg.sweep_fleet import build_stage_event
+
+        block = {"role": "stage", "run_id": "F", "dispatch": 0, "nodes": ["1"], "batch": 0}
+        event = build_stage_event("s3://b/p.zarr", block, [[1, None]])
+        assert event["mode"] == "sweep" and event["store_path"] == "s3://b/p.zarr"
+        assert event["stage"] == block and event["leaves"] == [[1, None]]
+        assert "output_credentials" not in event  # absent unless supplied
+
+    def test_output_credentials_ride_when_supplied(self):
+        from zagg.sweep_fleet import build_stage_event
+
+        creds = {"accessKeyId": "A", "secretAccessKey": "B"}
+        event = build_stage_event("s3://b/p.zarr", {"role": "stage"}, [], creds)
+        assert event["output_credentials"] == creds
+
+
+class TestBarrier:
+    def test_a_failed_list_is_not_an_empty_prefix(self, tmp_path, caplog):
+        # `set()` for both meant a permissions typo read exactly like "no
+        # records yet", at DEBUG (review finding).
+        import logging
+
+        import zagg.store
+        from zagg.sweep_fleet import _present
+
+        assert _present(str(tmp_path / "nothing-here"), {}) == (set(), True)
+
+        def _boom(*_a, **_k):
+            raise PermissionError("s3:ListBucket denied on the .status sibling")
+
+        with caplog.at_level(logging.WARNING, logger="zagg.sweep_fleet"):
+            with pytest.MonkeyPatch.context() as mp:
+                mp.setattr(zagg.store, "open_object_store", _boom)
+                assert _present("s3://b/p.zarr.status/run-F", {}) == (set(), False)
+        assert "cannot list" in caplog.text
+
+    def test_a_broken_list_ends_the_barrier_instead_of_burning_it(self, monkeypatch, caplog):
+        # A dispatcher that can never see the records must not spend the whole
+        # barrier budget of every tuple discovering that (review finding).
+        import logging
+
+        import zagg.sweep_fleet as sweep_fleet
+
+        calls = []
+
+        def _blind(records_from, store_kwargs):
+            calls.append(records_from)
+            return set(), False
+
+        monkeypatch.setattr(sweep_fleet, "_present", _blind)
+        with caplog.at_level(logging.WARNING, logger="zagg.sweep_fleet"):
+            seen, timed_out = sweep_fleet.await_records(
+                "s3://b/p.zarr.status/run-F",
+                {"stage-0-000000.json"},
+                store_kwargs={},
+                timeout_s=600,
+                interval_s=0.0,
+            )
+        assert (seen, timed_out) == (set(), True)
+        assert len(calls) == sweep_fleet._LIST_FAULT_LIMIT, "it polled past the fault limit"
+        assert "consecutive LIST failures" in caplog.text
+
+    def test_the_timeout_says_when_it_never_listed_at_all(self, monkeypatch, caplog):
+        import logging
+
+        import zagg.sweep_fleet as sweep_fleet
+
+        monkeypatch.setattr(sweep_fleet, "_LIST_FAULT_LIMIT", 1_000_000)
+        monkeypatch.setattr(sweep_fleet, "_present", lambda *_a, **_k: (set(), False))
+        with caplog.at_level(logging.WARNING, logger="zagg.sweep_fleet"):
+            sweep_fleet.await_records(
+                "s3://b/p.zarr.status/run-F",
+                {"stage-0-000000.json"},
+                store_kwargs={},
+                timeout_s=0.0,
+                interval_s=0.0,
+            )
+        assert "never listed successfully" in caplog.text
+
+
+class TestFleetOrchestration:
+    def test_tuple_ordering_is_finest_first_with_the_finisher_last(self, tmp_path):
+        mod = _handler_module()
+        root = tmp_path / "s"
+        _stage_store(root)
+        client = _FakeLambda(mod.lambda_handler)
+        summary = _fleet(root, client, tuple_width=1)
+        assert [b.get("dispatch") for b in client.blocks()] == [2, 1, 0, None]
+        assert [b["role"] for b in client.blocks()] == ["stage"] * 3 + ["finisher"]
+        assert [s["dispatch_order"] for s in summary["stages"]] == [2, 1, 0]
+        assert summary["invokes"] == 4 and summary["finisher"]["landed"]
+        assert summary["finisher"]["fired"] and summary["skipped"] is None
+
+    def test_no_dispatch_nodes_fires_nothing_at_all(self, tmp_path):
+        # The finisher refuses a zero-record run by design and an Event invoke
+        # hides its 500, so firing one here would buy a full barrier waiting on
+        # a record that can never land (review finding). The key set does not
+        # move: `finisher` still answers `landed`, plus why it never fired.
+        from zagg.sweep_fleet import run_stage_sweep_fleet
+
+        mod = _handler_module()
+        root = tmp_path / "s"
+        _stage_store(root)
+        client = _FakeLambda(mod.lambda_handler)
+        summary = run_stage_sweep_fleet(
+            client,
+            "zagg-worker",
+            str(root),
+            [],
+            shard_order=3,
+            store_kwargs={},
+            poll_interval_s=0.01,
+            barrier_timeout_s=30,
+        )
+        assert client.events == [] and summary["invokes"] == 0
+        assert summary["stages"] == [] and summary["skipped"] == "no dispatch nodes"
+        assert summary["finisher"] == {"landed": False, "fired": False}
+        assert summary["duration_s"] < 5, "it waited on a barrier it should have skipped"
+
+    def test_the_run_identity_is_pinned_across_every_invoke(self, tmp_path):
+        mod = _handler_module()
+        root = tmp_path / "s"
+        _stage_store(root)
+        client = _FakeLambda(mod.lambda_handler)
+        summary = _fleet(root, client, tuple_width=1)
+        blocks = client.blocks()
+        assert {b["run_id"] for b in blocks} == {summary["run_id"]}
+        assert {b["records_from"] for b in blocks} == {summary["records_from"]}
+        # run_started is pinned ONCE: a worker computing its own would read a
+        # sibling's fresh stamp as a foreign sweep's.
+        assert {b["run_started"] for b in blocks if b["role"] == "stage"} == {
+            summary["run_started"]
+        }
+        assert summary["records_from"].endswith(f".status/run-{summary['run_id']}")
+
+    def test_the_lease_ttl_reaches_the_finisher_too(self, tmp_path):
+        # It was threaded into every stage block and dropped from the
+        # finisher's, so a non-default run re-admitted its finisher on
+        # DEFAULT_TTL_S -- the TTL moving on the last acquire before release
+        # (review finding). One TTL governs the whole run.
+        mod = _handler_module()
+        root = tmp_path / "s"
+        _stage_store(root)
+        client = _FakeLambda(mod.lambda_handler)
+        summary = _fleet(root, client, tuple_width=1, lease_ttl_s=137)
+        blocks = client.blocks()
+        assert [b["role"] for b in blocks][-1] == "finisher"
+        assert {b["lease_ttl_s"] for b in blocks} == {137}
+        assert summary["finisher"]["lease"]["released"]
+
+    def test_the_ladder_lands_and_the_lease_is_released(self, tmp_path):
+        from zagg.hive import read_manifest
+        from zagg.sweep_lease import read_lease
+
+        mod = _handler_module()
+        root = tmp_path / "s"
+        _stage_store(root)
+        summary = _fleet(root, _FakeLambda(mod.lambda_handler), tuple_width=1)
+        assert (root / "1" / "all.zarr").exists() and (root / "-2" / "all.zarr").exists()
+        assert read_lease(str(root)) is None and summary["finisher"]["lease"]["released"]
+        entries = {e["node"]: e for e in read_manifest(str(root))["pyramid"]["overviews"]}
+        assert entries[0]["actuals"]["merges_from_raw"] == 2
+
+    def test_the_dispatcher_writes_nothing_itself(self, tmp_path):
+        # D8, pinned: with a client that only RECORDS invokes, the store is
+        # byte-for-byte what the fixture left — no lease, no records, no ladder.
+        root = tmp_path / "s"
+        _stage_store(root)
+        before = {p: p.read_bytes() for p in sorted(root.rglob("*")) if p.is_file()}
+        client = _FakeLambda(None)
+        summary = _fleet(root, client, tuple_width=1, barrier_timeout_s=0.05)
+        after = {p: p.read_bytes() for p in sorted(root.rglob("*")) if p.is_file()}
+        assert after == before
+        # Not even the lease: the FIRST stage worker creates the intent, never
+        # the dispatcher. (The barrier's LIST does materialize the local
+        # `.status` DIRECTORY -- a filesystem artifact of a local-path store,
+        # outside the store root; on s3:// a LIST creates no object.)
+        assert not (root / "sweep.lease.json").exists()
+        assert not list((tmp_path / "s.status").rglob("*.json"))
+        assert client.events and summary["invokes"] == 4
+        assert all(s["barrier_timed_out"] for s in summary["stages"])
+        assert summary["finisher"]["landed"] is False
+
+    def test_the_total_barrier_budget_bounds_the_whole_tail(self, tmp_path):
+        # The tail's worst case must be a constant, not `(n_tuples + 1) x` the
+        # per-barrier budget -- that product grows with the store's order and
+        # is what a dispatcher's own ceiling runs into (review finding).
+        import time
+
+        root = tmp_path / "s"
+        _stage_store(root)
+        t = time.perf_counter()
+        summary = _fleet(
+            root,
+            _FakeLambda(None),
+            tuple_width=1,
+            barrier_timeout_s=0.5,
+            total_barrier_budget_s=0.5,
+        )
+        elapsed = time.perf_counter() - t
+        assert all(s["barrier_timed_out"] for s in summary["stages"])
+        assert summary["finisher"]["landed"] is False
+        # Four barriers at 0.5 s each would be 2 s; the total caps it at one.
+        assert elapsed < 1.5, f"the total budget was not enforced ({elapsed:.2f}s)"
+
+    def test_a_lost_invoke_times_the_barrier_out_and_the_run_proceeds(self, tmp_path):
+        # #381 point (6): the barrier is a scheduling preference. A dropped
+        # finest-tuple invoke must not stall the run — the coarser tuples still
+        # fire, the miss is recorded per artifact, and the next pass heals.
+        mod = _handler_module()
+        root = tmp_path / "s"
+        _stage_store(root)
+        client = _FakeLambda(mod.lambda_handler, drop={stage_record_name(0, 0)})
+        summary = _fleet(root, client, tuple_width=1, barrier_timeout_s=0.05)
+        assert [s["barrier_timed_out"] for s in summary["stages"]] == [False, False, True]
+        # An expiry may mean the invoke is merely QUEUED, so the finisher can
+        # aggregate a short record set. The run says so instead of reading
+        # clean, and the finisher is told on the wire (review finding).
+        assert summary["barrier_timed_out"] is True
+        finisher = next(b for b in client.blocks() if b["role"] == "finisher")
+        assert finisher["barrier_timed_out"] is True
+        # The run did not stall: the finisher still fired and settled the store.
+        assert summary["finisher"]["landed"] and summary["finisher"]["lease"]["released"]
+        # The lost tuple's own level is simply absent -- a hole, not a wrong
+        # answer, and not recorded as coverage either.
+        assert (root / "1" / "1" / "all.zarr").exists()
+        assert not (root / "1" / "all.zarr").exists()
+        assert "0" not in summary["finisher"]["levels"]
+        # The heal: a second run with every invoke delivered closes the gap.
+        healed_client = _FakeLambda(mod.lambda_handler)
+        healed = _fleet(root, healed_client, tuple_width=1)
+        assert not any(s["barrier_timed_out"] for s in healed["stages"])
+        assert healed["barrier_timed_out"] is False
+        assert not next(b for b in healed_client.blocks() if b["role"] == "finisher")[
+            "barrier_timed_out"
+        ]
+        attrs = dict(_artifact(root, "1/all.zarr").attrs)["zagg_overview"]
+        # At width 1 the order-0 node's children are the order-1 stage columns,
+        # and base cell '1' has exactly one ('11') — fully covered, no hole.
+        assert attrs["source_children"] == {"folded": 1, "missing": 0, "unreadable": 0}
+        assert healed["finisher"]["levels"]["0"]["source_children"]["missing"] == 0
+
+    def test_a_reused_run_id_cannot_pass_a_barrier_on_stale_records(self, tmp_path):
+        # Record names are deterministic from (dispatch, batch) and the prefix
+        # is keyed on run_id alone, so re-driving a run under its original id --
+        # the obvious recovery -- made every barrier pass instantly on the
+        # PREVIOUS attempt's records (review finding): no ordering at all, and
+        # a finisher aggregating a mix of old and new.
+        from zagg.client_transport import run_status_prefix
+
+        root = tmp_path / "s"
+        _stage_store(root)
+        run_id = "reused"
+        prefix = Path(run_status_prefix(str(root), run_id))
+        prefix.mkdir(parents=True, exist_ok=True)
+        for dispatch in (0, 1, 2):  # every name this run will produce
+            (prefix / stage_record_name(dispatch, 0)).write_text("{}")
+        (prefix / FINISHER_RECORD_NAME).write_text("{}")
+        # A client that records invokes and lands NOTHING: every barrier must
+        # expire, because nothing new appeared.
+        summary = _fleet(
+            root, _FakeLambda(None), tuple_width=1, run_id=run_id, barrier_timeout_s=0.05
+        )
+        assert summary["run_id"] == run_id
+        assert all(s["barrier_timed_out"] for s in summary["stages"])
+        assert summary["finisher"]["landed"] is False
+
+    def test_scope_narrows_the_fan_out(self, tmp_path):
+        from zagg.sweep_stages import normalize_scope
+
+        mod = _handler_module()
+        root = tmp_path / "s"
+        _stage_store(root)
+        summary = _fleet(root, _FakeLambda(mod.lambda_handler), scope=normalize_scope(["1111"]))
+        assert (root / "1" / "all.zarr").exists()
+        assert not (root / "-2" / "all.zarr").exists()
+        assert summary["scope"] == [str(int(w)) for w in normalize_scope(["1111"])]
+
+    def test_a_raw_decimal_scope_is_normalized_like_the_in_process_pass(self, tmp_path):
+        # `stage_sweep_after_run` -- the local chaining this transport mirrors
+        # -- passes DECIMAL STRINGS, so handing `scope` straight to `scope_admits`
+        # made the fleet filter differently from the twin (review finding).
+        from zagg.sweep_stages import normalize_scope
+
+        mod = _handler_module()
+        root = tmp_path / "s"
+        _stage_store(root)
+        summary = _fleet(root, _FakeLambda(mod.lambda_handler), scope=["1111"])
+        assert (root / "1" / "all.zarr").exists()
+        assert not (root / "-2" / "all.zarr").exists()
+        assert summary["scope"] == [str(int(w)) for w in normalize_scope(["1111"])]
+
+    def test_the_finest_tuple_rides_inline_with_the_whole_work_set(self, tmp_path):
+        # Smoke: at this fixture's size the finest tuple is ONE batch, so it
+        # carries every leaf inline. The per-batch slicing property needs a
+        # multi-batch fan-out -- the next test.
+        mod = _handler_module()
+        root = tmp_path / "s"
+        _stage_store(root)
+        client = _FakeLambda(mod.lambda_handler)
+        _fleet(root, client, tuple_width=1)
+        finest = [e for e in client.events if e["stage"].get("dispatch") == 2]
+        from zagg.grids.morton import morton_decimal
+
+        assert len(finest) == 1
+        assert {morton_decimal(int(k)) for k, _w in finest[0]["leaves"]} == set(LEAVES)
+
+    def test_a_multi_batch_tuple_partitions_its_leaves(self, tmp_path, monkeypatch):
+        # Merge-source-critical (review finding): across a fan-out, each
+        # batch's leaves are exactly the work-set leaves under that batch's
+        # nodes -- none dropped, none duplicated, none riding the wrong invoke.
+        import zagg.runner
+        from zagg.grids.morton import morton_decimal
+
+        mod = _handler_module()
+        root = tmp_path / "s"
+        _stage_store(root)
+        # Measure the single-batch payload, then cap just under it so the same
+        # tuple has to split. (`store_path` is in every event, so a literal cap
+        # would be a function of tmp_path's length.)
+        probe = _FakeLambda(None)
+        _fleet(root, probe, tuple_width=1, barrier_timeout_s=0.01)
+        single = next(e for e in probe.events if e["stage"].get("dispatch") == 2)
+        assert len(single["stage"]["nodes"]) > 1
+        monkeypatch.setattr(zagg.runner, "_ASYNC_PAYLOAD_CAP_BYTES", len(json.dumps(single)) - 40)
+
+        client = _FakeLambda(mod.lambda_handler)
+        _fleet(root, client, tuple_width=1)
+        events = [e for e in client.events if e["stage"].get("dispatch") == 2]
+        assert len(events) > 1, "the cap did not force a multi-batch fan-out"
+        nodes: list = []
+        seen: list = []
+        for event in events:
+            assert "leaves" in event and "discover" not in event
+            batch_nodes = tuple(event["stage"]["nodes"])
+            decimals = sorted(morton_decimal(int(k)) for k, _w in event["leaves"])
+            assert decimals == sorted(d for d in LEAVES if d.startswith(batch_nodes))
+            nodes += list(batch_nodes)
+            seen += decimals
+        assert sorted(seen) == sorted(LEAVES)  # nothing lost, nothing duplicated
+        assert sorted(nodes) == sorted(set(nodes)) == single["stage"]["nodes"]
+
+
+class TestRunnerSeam:
+    def test_the_seam_forwards_and_reports(self, tmp_path, caplog):
+        import logging
+
+        from zagg.runner import _invoke_lambda_stage_sweep
+
+        mod = _handler_module()
+        root = tmp_path / "s"
+        _stage_store(root)
+        with caplog.at_level(logging.INFO, logger="zagg.runner"):
+            summary = _invoke_lambda_stage_sweep(
+                _FakeLambda(mod.lambda_handler),
+                "zagg-worker",
+                str(root),
+                [(morton_word(d), None) for d in LEAVES],
+                shard_order=3,
+                store_kwargs={},
+            )
+        assert summary is not None and summary["finisher"]["landed"]
+        assert "Dispatched staged sweep" in caplog.text
+
+    def test_the_seam_threads_the_barrier_knobs(self, tmp_path):
+        # Neither budget was reachable from the runner, so an operator could not
+        # shorten the tail for a small store nor lengthen it for a throttled
+        # account (review finding).
+        import time
+
+        from zagg.runner import _invoke_lambda_stage_sweep
+
+        root = tmp_path / "s"
+        _stage_store(root)
+        t = time.perf_counter()
+        summary = _invoke_lambda_stage_sweep(
+            _FakeLambda(None),
+            "zagg-worker",
+            str(root),
+            [(morton_word(d), None) for d in LEAVES],
+            shard_order=3,
+            store_kwargs={},
+            barrier_timeout_s=0.3,
+            total_barrier_budget_s=0.3,
+        )
+        assert summary is not None and summary["finisher"]["landed"] is False
+        assert time.perf_counter() - t < 2.0, "the seam did not forward the barrier knobs"
+
+    def test_the_seam_says_a_barrier_expired(self, tmp_path, caplog):
+        # A partially covered staged sweep read like a clean one in the run log
+        # (review finding): the seam logged records_seen at INFO and nothing else.
+        import logging
+
+        from zagg.runner import _invoke_lambda_stage_sweep
+
+        root = tmp_path / "s"
+        _stage_store(root)
+        with caplog.at_level(logging.WARNING, logger="zagg.runner"):
+            summary = _invoke_lambda_stage_sweep(
+                _FakeLambda(None),
+                "zagg-worker",
+                str(root),
+                [(morton_word(d), None) for d in LEAVES],
+                shard_order=3,
+                store_kwargs={},
+                barrier_timeout_s=0.05,
+                total_barrier_budget_s=0.05,
+            )
+        assert summary["barrier_timed_out"] is True
+        assert "at least one barrier expired" in caplog.text
+
+    def test_the_seam_is_fail_open(self, tmp_path, caplog):
+        import logging
+
+        from zagg.runner import _invoke_lambda_stage_sweep
+
+        class Boom:
+            def invoke(self, **kwargs):
+                raise RuntimeError("throttled")
+
+        root = tmp_path / "s"
+        _stage_store(root)
+        with caplog.at_level(logging.WARNING, logger="zagg.runner"):
+            assert (
+                _invoke_lambda_stage_sweep(
+                    Boom(),
+                    "zagg-worker",
+                    str(root),
+                    [(morton_word(d), None) for d in LEAVES],
+                    shard_order=3,
+                    store_kwargs={},
+                )
+                is None
+            )
+        assert "staged sweep dispatch failed" in caplog.text
+
+    def test_the_tail_gate_is_the_stages_knob(self):
+        # The seam is reached only under `output.sweep: "stages"` — the same
+        # opt-in the local dispatcher reads (issue #384's recorded lean).
+        import inspect
+
+        from zagg import runner
+
+        src = inspect.getsource(runner._run_lambda)
+        assert 'config.output.get("sweep") == "stages"' in src
+        assert "_invoke_lambda_stage_sweep(" in src
+
+
+# ---------------------------------------------------------------------------
+# Phase 3: THE ACCEPTANCE — the byte-identity oracle.
+#
+# The merge-source law (espg ruling 2026-08-09, issue #384) makes the /2 build
+# a fixed function of the store: independent of tuple grouping, of
+# partitioning, and of EXECUTOR. So the fleet-built ladder must be
+# byte-identical to the CLI-built ladder on the same store AND the same work
+# set, and that is the whole acceptance for this transport — any difference is
+# a transport bug, not a tolerance.
+#
+# The work-set precondition is not a hedge, it is the one documented
+# divergence: the dispatcher takes its nodes from the work set alone (an
+# invoke-only role cannot read the root ``coverage.moc`` — D8), while the
+# in-process pass unions the work set with that MOC. Both drivers this
+# transport actually has — ``stage_sweep_after_run`` and a discovery-driven
+# run — hand it a work set that already covers the MOC's leaves, so the
+# precondition holds by construction, and the MOC-only-subtree arm below pins
+# what happens when it does not.
+#
+# Fully offline: the Lambda client is mocked to run the worker arm in-process,
+# so no AWS is touched.
+# ---------------------------------------------------------------------------
+
+
+#: JSON values that are the RUN's identity or its clock rather than its
+#: content: the run id every stage artifact stamps — as a scalar (``run_id``)
+#: and as the folded children's list of them (``run_ids``, inside
+#: ``generation``) — the D4 commit instant, the provenance instant, and the
+#: D20 sidecar's write timestamp. Two executors are not expected to agree on
+#: these and nothing reads them for content. EVERYTHING else — every chunk
+#: byte, every count, every digest payload, every remaining generation key
+#: (``n_leaves``, ``max_leaf_timestamp``), every ``source_children`` tally —
+#: must match exactly.
+_VOLATILE_KEYS = frozenset({"run_id", "run_ids", "written_at", "generated_at", "timestamp"})
+
+
+#: Store-root objects that are not ladder artifacts: the input run record the
+#: CLI discovers from, and the staged run record itself — which differs
+#: between executors BY DESIGN (the fleet's carries ``transport: "lambda"``
+#: and the stage-record count; the CLI's carries the lease intent block).
+#: Both are checked separately rather than byte-compared.
+def _is_run_record(rel: str) -> bool:
+    return (rel.startswith("sweep_stats_") and rel.endswith("_stages.json")) or (
+        rel.startswith("stats_") and rel.endswith(".parquet")
+    )
+
+
+def _devolatilize(value):
+    if isinstance(value, dict):
+        return {
+            k: ("<volatile>" if k in _VOLATILE_KEYS else _devolatilize(v)) for k, v in value.items()
+        }
+    if isinstance(value, list):
+        return [_devolatilize(v) for v in value]
+    return value
+
+
+def _canonical(rel: str, data: bytes):
+    """One store object reduced to what two executors MUST agree on.
+
+    JSON objects (``zarr.json`` group/array metadata, the ``overview.rollup``
+    envelope, the D20 sidecars, the root ``coverage.moc`` envelope) are
+    compared with the run identity and the clock blanked; every other object —
+    every chunk — is compared as raw bytes, no tolerance.
+    """
+    if rel.endswith(".json") or rel.endswith(".moc"):
+        return json.dumps(_devolatilize(json.loads(data)), sort_keys=True, indent=1)
+    return data
+
+
+def _is_group_metadata(rel: str) -> bool:
+    """The ladder artifact's OWN ``zarr.json`` (not one of its arrays')."""
+    return rel.endswith("all.zarr/zarr.json")
+
+
+def _snapshot(root):
+    return {
+        str(p.relative_to(root)): p.read_bytes() for p in sorted(root.rglob("*")) if p.is_file()
+    }
+
+
+def _restore(root, snapshot):
+    """Put the store back to a prior snapshot, byte for byte."""
+    live = sorted(root.rglob("*"), key=lambda q: len(str(q)), reverse=True)
+    for p in live:
+        if p.is_file() and str(p.relative_to(root)) not in snapshot:
+            p.unlink()
+    for p in sorted(root.rglob("*"), key=lambda q: len(str(q)), reverse=True):
+        if p.is_dir() and not any(p.iterdir()):
+            p.rmdir()
+    for rel, data in snapshot.items():
+        q = root / rel
+        q.parent.mkdir(parents=True, exist_ok=True)
+        q.write_bytes(data)
+
+
+def _write_discovery_record(root, leaves=LEAVES, windows=(None,)):
+    """The listing-based run record ``python -m zagg.sweep`` discovers from.
+
+    The stamp in the NAME is a sentinel, not an instant: ``discover_leaves``
+    globs ``stats_*.parquet`` and never parses it. (``RUN_STARTED`` above is
+    the opposite — there the instant is load-bearing, since it is what the
+    foreign-fresh-stamp abort compares against.)
+    """
+    import pandas as pd
+
+    rows = [(d, w) for d in leaves for w in windows]
+    pd.DataFrame(
+        {
+            "shard_key": pd.array([morton_word(d) for d, _w in rows], dtype="UInt64"),
+            "success": [True] * len(rows),
+            "window": [w for _d, w in rows],
+        }
+    ).to_parquet(root / "stats_00000000T000000Z_test.parquet", engine="fastparquet")
+
+
+def _cli_sweep(root, *, tuple_width=3):
+    from zagg.sweep import main
+
+    argv = [str(root), "--stages"]
+    if tuple_width != 3:
+        argv += ["--tuple-width", str(tuple_width)]
+    assert main(argv) == 0
+
+
+def _artifacts(snapshot, *, ladder_data_only=False):
+    """The comparable objects of a snapshot, canonicalized.
+
+    ``ladder_data_only`` narrows to the ladder overviews' DATA — their chunks
+    and their per-array metadata — dropping each artifact's own group
+    ``zarr.json``. That is the cross-tuple-width comparison: the group attrs
+    carry per-run PROVENANCE (``source_children``, the summed child
+    ``generation``) which is legitimately width-dependent, because a width-1
+    build folds an order-0 node from order-1 stage columns while a width-3
+    build folds it from the leaf columns three orders down. The merge-source
+    law is a claim about the CONTENT, and that is what this compares —
+    ``TestMergeSourceLaw`` in ``test_sweep_stage.py`` pins the same claim
+    in-process, the same way (arrays, not attrs).
+    """
+    out = {}
+    for rel, data in snapshot.items():
+        if _is_run_record(rel):
+            continue
+        if ladder_data_only and ("all.zarr/" not in rel or _is_group_metadata(rel)):
+            continue
+        out[rel] = _canonical(rel, data)
+    return out
+
+
+def _assert_identical(cli, fleet, *, ladder_data_only=False):
+    a = _artifacts(cli, ladder_data_only=ladder_data_only)
+    b = _artifacts(fleet, ladder_data_only=ladder_data_only)
+    assert a, "the oracle compared nothing — the fixture wrote no artifacts"
+    assert sorted(a) == sorted(b), (
+        f"object sets differ: CLI-only {sorted(set(a) - set(b))}, "
+        f"fleet-only {sorted(set(b) - set(a))}"
+    )
+    differing = [rel for rel in sorted(a) if a[rel] != b[rel]]
+    assert not differing, f"{len(differing)} object(s) differ between executors: {differing[:8]}"
+
+
+class _DeferringLambda:
+    """A Lambda client whose invokes do not run until the barrier polls.
+
+    :class:`_FakeLambda` runs the handler INSIDE ``invoke()``, so every worker
+    has folded and written before ``_fire`` returns: the tuple ordering rides
+    on the dispatcher's own loop alone and deleting the soft barrier outright
+    changes no bytes, which makes the barrier — the mechanism
+    :func:`zagg.sweep_fleet.await_records` nominates as load-bearing for this
+    acceptance — unfalsifiable. Here ``invoke()`` only QUEUES, and the drain is
+    wired to the dispatcher's own poll: one pending event per ``_present``.
+    A tuple's child columns then exist only because the barrier waited for
+    them, so a barrier that does not wait folds over columns that are not on
+    disk yet.
+    """
+
+    def __init__(self, handler, monkeypatch):
+        import zagg.sweep_fleet
+
+        self.handler = handler
+        self.events: list = []
+        self.pending: list = []
+        present = zagg.sweep_fleet._present
+
+        def drained(records_from, store_kwargs):
+            if self.pending:
+                self.handler(self.pending.pop(0), None)
+            return present(records_from, store_kwargs)
+
+        monkeypatch.setattr(zagg.sweep_fleet, "_present", drained)
+
+    def invoke(self, FunctionName, InvocationType, Payload):  # noqa: N803 (boto3 spelling)
+        self.events.append(json.loads(Payload))
+        self.pending.append(self.events[-1])
+        return {"StatusCode": 202}
+
+
+class TestByteIdentityOracle:
+    """THE acceptance: same store, two executors, identical bytes."""
+
+    def _both_arms(
+        self,
+        tmp_path,
+        monkeypatch=None,
+        *,
+        fields=None,
+        width=3,
+        fleet_width=None,
+        squeeze=False,
+        windows=None,
+    ):
+        """CLI sweep -> snapshot -> reset -> fleet sweep -> snapshot.
+
+        One store, swept twice from the SAME pre-sweep bytes, so nothing about
+        the comparison can be an artifact of two fixtures diverging.
+        ``width`` drives BOTH arms (the byte-exact comparison); ``fleet_width``
+        overrides the fleet's alone, which is the deliberate cross-width arm.
+        ``squeeze`` caps the async payload just under the tuple's REAL event so
+        the fan-out has to split. ``windows`` swaps in the windowed/all-time
+        store so the leaf refs carry a window rather than ``None``.
+        Returns ``(cli, fleet, summary, client)``.
+        """
+        mod = _handler_module()
+        root = tmp_path / "s"
+        if windows is None:
+            _stage_store(root, **({} if fields is None else {"fields": fields}))
+            refs = None
+        else:
+            from test_sweep_stage import TestWindowedStageSweep
+
+            TestWindowedStageSweep()._windowed_store(root)
+            refs = [(morton_word(d), w) for d in LEAVES for w in windows]
+        _write_discovery_record(root, windows=windows or (None,))
+        base = _snapshot(root)
+
+        _cli_sweep(root, tuple_width=width)
+        cli = _snapshot(root)
+
+        _restore(root, base)
+        assert _snapshot(root) == base, "the reset did not restore the pre-sweep store"
+
+        if squeeze:
+            # Measured, not guessed: a probe run with no handler writes nothing
+            # and reports the tuple's real single-batch event. One byte under
+            # it is the ONLY cap that both forces the split and leaves every
+            # proper subset small enough to ship its leaf slice inline —
+            # squeeze harder and every batch degrades to ``discover: true``
+            # and the per-batch slicing this arm exists for never rides.
+            import zagg.runner
+
+            probe = _FakeLambda(None)
+            _fleet(root, probe, tuple_width=width, barrier_timeout_s=0.01)
+            single = next(e for e in probe.events if e["stage"].get("role") == "stage")
+            assert len(single["stage"]["nodes"]) > 1
+            monkeypatch.setattr(
+                zagg.runner, "_ASYNC_PAYLOAD_CAP_BYTES", len(json.dumps(single)) - 1
+            )
+
+        client = _FakeLambda(mod.lambda_handler)
+        fleet = _fleet(
+            root,
+            client,
+            leaves=refs,
+            tuple_width=width if fleet_width is None else fleet_width,
+        )
+        return cli, _snapshot(root), fleet, client
+
+    @pytest.mark.parametrize("width,tuples,objects", ((1, 3, 181), (2, 2, 163), (3, 1, 136)))
+    def test_the_fleet_build_is_byte_identical_to_the_cli_build(
+        self, tmp_path, width, tuples, objects
+    ):
+        # At every tuple width, not just the default: width 3 folds the whole
+        # o3 ladder from one tuple, so it has no tuple SEQUENCE for the
+        # transport to get wrong. Widths 1 and 2 put the ordering the
+        # dispatcher's barriers exist to preserve inside the byte-exact
+        # assertion — reversing ``stage_tuples`` in the dispatcher fails them.
+        cli, fleet, summary, _ = self._both_arms(tmp_path, width=width)
+        assert summary["finisher"]["landed"] and not summary["barrier_timed_out"]
+        assert len(summary["stages"]) == tuples
+        _assert_identical(cli, fleet)
+        # Never vacuous — and pinned to what the SWEEP wrote rather than to
+        # what the fixture left behind: the pre-sweep store already carries a
+        # leaf `all.pyramid.stats.json` per column and the root `coverage.moc`,
+        # so their mere presence would pass on a fleet arm that wrote nothing.
+        # This work set's ladder is exactly seven nodes (3 at order 2, 2 at
+        # order 1, 2 at order 0), each one a group and a rollup; the object
+        # total moves with the width because narrower tuples also write relay
+        # stage columns the width-3 build never needs.
+        rels = _artifacts(fleet)
+        assert sum(_is_group_metadata(r) for r in rels) == 7
+        assert sum(r.endswith("overview.rollup.json") for r in rels) == 7
+        assert len(rels) == objects
+
+    def test_both_arms_leave_one_run_record_and_no_lease(self, tmp_path):
+        cli, fleet, _, _ = self._both_arms(tmp_path)
+        for snapshot, transport in ((cli, None), (fleet, "lambda")):
+            records = [r for r in snapshot if r.startswith("sweep_stats_")]
+            assert len(records) == 1
+            body = json.loads(snapshot[records[0]])
+            assert body["mode"] == "stages"
+            assert body.get("transport") == transport
+            assert "sweep.lease.json" not in snapshot  # released, both arms
+
+    def test_the_manifest_actuals_agree(self, tmp_path):
+        # The finisher's manifest RMW is the one artifact the fleet rebuilds
+        # from the stage records rather than from an in-process accumulator —
+        # the aggregation channel's correctness lands right here.
+        cli, fleet, _, _ = self._both_arms(tmp_path)
+        from zagg.hive import MANIFEST_NAME
+
+        a = _devolatilize(json.loads(cli[MANIFEST_NAME]))["pyramid"]["overviews"]
+        b = _devolatilize(json.loads(fleet[MANIFEST_NAME]))["pyramid"]["overviews"]
+        assert a == b
+        assert {e["node"]: e["actuals"]["merges_from_raw"] for e in b} == {3: 1, 2: 1, 1: 2, 0: 2}
+
+    def test_identity_survives_a_multi_batch_fan_out(self, tmp_path, monkeypatch):
+        # The transport's own degree of freedom: with the payload cap squeezed
+        # so a tuple cannot ride one invoke, the SAME tuple is folded by
+        # several workers. Grouping across invokes must change no bytes.
+        cli, fleet, summary, client = self._both_arms(tmp_path, monkeypatch, squeeze=True)
+        assert summary["stages"][0]["batches"] > 1  # the split really happened
+        # And it split with its leaf SLICE on the wire, not onto a store-wide
+        # re-discovery — otherwise every worker re-derives the whole work set
+        # and `pack_batches`' partition is never exercised at all.
+        fired = [e for e in client.events if e["stage"].get("role") == "stage"]
+        assert len(fired) > 1
+        assert all("leaves" in e and "discover" not in e for e in fired)
+        _assert_identical(cli, fleet)
+
+    def test_identity_survives_a_different_tuple_width(self, tmp_path):
+        # Grouping across EXECUTORS and across tuple widths at once: the CLI
+        # walks one width-3 tuple, the fleet walks three width-1 tuples. The
+        # stage COLUMNS differ by construction (width 1 dispatches at orders 2
+        # and 1, so it writes relay columns width 3 never needs), which is why
+        # this arm compares the ladder overviews — the product — not the
+        # scaffolding. `TestMergeSourceLaw` in test_sweep_stage.py pins the
+        # same claim in-process.
+        cli, fleet, _, _ = self._both_arms(tmp_path, fleet_width=1)
+        _assert_identical(cli, fleet, ladder_data_only=True)
+        # And say exactly what the group attrs are allowed to differ in, so a
+        # future divergence in anything ELSE cannot hide behind the exclusion.
+        # The whole `attributes` dict is checked, not just `zagg_overview`:
+        # `morton_hive_commit`'s `complete`/`cells_with_data`/`granule_count`
+        # rode out of this arm entirely before.
+        cli_groups = {r for r in _artifacts(cli) if _is_group_metadata(r)}
+        fleet_groups = {r for r in _artifacts(fleet) if _is_group_metadata(r)}
+        assert cli_groups and cli_groups == fleet_groups
+        for rel in sorted(cli_groups):
+            a = _devolatilize(json.loads(cli[rel]))["attributes"]
+            b = _devolatilize(json.loads(fleet[rel]))["attributes"]
+            top = {k for k in set(a) | set(b) if a.get(k) != b.get(k)}
+            assert top <= {"zagg_overview"}, (rel, top)
+            # And within it, ONLY the per-run provenance tally. `generation`
+            # is not on this list: with the run ids blanked its `n_leaves` and
+            # `max_leaf_timestamp` are width-independent, which is the whole
+            # content of the merge-source law at the attrs level.
+            x, y = a.get("zagg_overview", {}), b.get("zagg_overview", {})
+            differing = {k for k in set(x) | set(y) if x.get(k) != y.get(k)}
+            assert differing <= {"source_children"}, (rel, differing)
+
+    def test_identity_holds_when_the_workers_run_only_while_the_barrier_waits(
+        self, tmp_path, monkeypatch
+    ):
+        # The barrier under load: with a deferring executor no worker runs
+        # until the dispatcher polls for its record, so the soft barrier is
+        # the ONLY thing standing between a coarse tuple and its unwritten
+        # children. Stubbing `_barrier` out to return its expected set makes
+        # this arm fail (nothing drains, so nothing is folded) while
+        # `_FakeLambda`'s synchronous arms all stay green — which is the
+        # measurement that says this one can see the barrier at all.
+        mod = _handler_module()
+        root = tmp_path / "s"
+        _stage_store(root)
+        _write_discovery_record(root)
+        base = _snapshot(root)
+        _cli_sweep(root, tuple_width=1)
+        cli = _snapshot(root)
+        _restore(root, base)
+
+        client = _DeferringLambda(mod.lambda_handler, monkeypatch)
+        summary = _fleet(root, client, tuple_width=1)
+        assert not summary["barrier_timed_out"]
+        assert not client.pending, "an invoke never drained — the barriers did not wait for it"
+        _assert_identical(cli, _snapshot(root))
+
+    @pytest.mark.parametrize("width", (1, 3))
+    def test_identity_holds_for_a_windowed_store(self, tmp_path, width):
+        # The `window` dimension of the leaf refs, and the `windows` block of
+        # the rollups: every other arm hands both executors ``window=None``
+        # for all four leaves, so the wire's window field was outside the
+        # acceptance. Here each leaf rides twice, once per window, and the
+        # all-time fold sits over the per-window gen-1 tier
+        # (`TestWindowedStageSweep` in test_sweep_stage.py owns that store).
+        from test_sweep_stage import TestWindowedStageSweep
+
+        cli, fleet, summary, _ = self._both_arms(
+            tmp_path, width=width, windows=TestWindowedStageSweep.WINDOWS
+        )
+        assert summary["n_leaves"] == 8 and summary["finisher"]["landed"]
+        _assert_identical(cli, fleet)
+        rels = _artifacts(fleet)
+        assert sum(r.endswith("/2019.zarr/zarr.json") for r in rels) == 7
+
+    def test_identity_holds_for_a_both_channel_store(self, tmp_path):
+        # The located + temporal companion channels (issue #410) ride the same
+        # fold, so a transport that reordered or re-partitioned a merge would
+        # show up here as mismatched companion words rather than mismatched
+        # digests.
+        from test_sweep_stage import BOTH_CHANNEL_FIELDS
+
+        cli, fleet, _, _ = self._both_arms(tmp_path, fields=BOTH_CHANNEL_FIELDS)
+        _assert_identical(cli, fleet)
+
+    def test_a_moc_only_subtree_is_the_one_documented_difference(self, tmp_path):
+        # The acceptance's precondition, pinned by name so a future change to
+        # either executor's node derivation cannot move it silently. A leaf on
+        # disk and in the root MOC but NOT in the run's work set is folded by
+        # the in-process pass (work set ∪ MOC) and not by the dispatcher (work
+        # set alone, D8). By design — #381 point (11): the run's shard set IS
+        # the touched shardmap, and the next pass heals the rest.
+        from zagg.hive import build_root_coverage, write_root_coverage
+
+        mod = _handler_module()
+        root = tmp_path / "s"
+        _stage_store(root)
+        _write_leaf(root, "3111", 7)
+        write_root_coverage(
+            str(root), build_root_coverage([morton_word(d) for d in LEAVES + ["3111"]], 3)
+        )
+        _write_discovery_record(root)  # the work set stays LEAVES
+        base = _snapshot(root)
+        _cli_sweep(root)
+        cli = _artifacts(_snapshot(root))
+        _restore(root, base)
+        _fleet(root, _FakeLambda(mod.lambda_handler))
+        fleet = _artifacts(_snapshot(root))
+
+        # Exactly the MOC-only subtree is missing, and nothing else is:
+        assert not set(fleet) - set(cli)
+        missing = set(cli) - set(fleet)
+        assert missing and {rel.split("/")[0] for rel in missing} == {"3"}
+        # ...and every object BOTH built is byte-identical, bar the manifest,
+        # whose per-level actuals count the folds each executor performed.
+        from zagg.hive import MANIFEST_NAME
+
+        assert [r for r in sorted(fleet) if cli[r] != fleet[r]] == [MANIFEST_NAME]
+
+    def test_the_oracle_detects_a_wrong_fold(self, tmp_path, monkeypatch):
+        # The negative control for the BYTE branch — the one the acceptance
+        # actually rests on. The scoped-run control below trips the object-SET
+        # check and never reaches it. Here the object sets are identical and
+        # only the content moves: the finisher under-reports one child row of
+        # the record-based aggregation, which is the single channel the fleet
+        # rebuilds from the wire rather than from an in-process accumulator.
+        import zagg.sweep_stages
+
+        def lossy(target, incoming):
+            trimmed = {
+                k: {**e, "children": dict(list((e.get("children") or {}).items())[1:])}
+                for k, e in (incoming or {}).items()
+            }
+            return merge_level_actuals(target, trimmed)
+
+        mod = _handler_module()
+        root = tmp_path / "s"
+        _stage_store(root)
+        _write_discovery_record(root)
+        base = _snapshot(root)
+        _cli_sweep(root)
+        cli = _snapshot(root)
+        _restore(root, base)
+        monkeypatch.setattr(zagg.sweep_stages, "merge_level_actuals", lossy)
+        _fleet(root, _FakeLambda(mod.lambda_handler))
+        fleet = _snapshot(root)
+
+        assert sorted(_artifacts(cli)) == sorted(_artifacts(fleet))  # the SET is untouched
+        with pytest.raises(AssertionError, match=r"object\(s\) differ between executors"):
+            _assert_identical(cli, fleet)
+
+    def test_the_oracle_detects_a_divergent_build(self, tmp_path):
+        # Negative control: an acceptance test that cannot fail proves nothing.
+        # A fleet run scoped to one base cell folds strictly less than the CLI's
+        # whole-store pass, and the comparison must say so.
+        from zagg.sweep_stages import normalize_scope
+
+        mod = _handler_module()
+        root = tmp_path / "s"
+        _stage_store(root)
+        _write_discovery_record(root)
+        base = _snapshot(root)
+        _cli_sweep(root)
+        cli = _snapshot(root)
+        _restore(root, base)
+        _fleet(root, _FakeLambda(mod.lambda_handler), scope=normalize_scope(["1111"]))
+        with pytest.raises(AssertionError, match="object sets differ"):
+            _assert_identical(cli, _snapshot(root))

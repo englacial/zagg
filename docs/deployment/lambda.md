@@ -503,6 +503,260 @@ every warm sandbox at once. It requires `lambda:GetFunctionConfiguration` +
 pool for all users of the function, so it is off by default and independent
 of the self-recycle knobs (both can be enabled).
 
+## Staged pyramid sweep over the fleet {#staged-sweep}
+
+The `zagg-pyramid/2` above-shard ladder is built by the **staged dense sweep**
+(issues #384/#416): stage workers fold child columns into parent columns, one
+dispatch tuple at a time, finest tuple first. `python -m zagg.sweep <root>
+--stages` runs the whole thing in one local process. Issue #519 added the
+fleet transport so it can also run entirely worker-side.
+
+You need the fleet transport whenever the **dispatcher cannot write to the
+store**. The canonical case is a Source Cooperative–published store: the
+bucket policy names the *fleet execution role* as the write identity
+(#495/#496), so a local stage worker has no sanctioned write path at all and
+the CLI cannot serve those stores. It is also the D8 posture everywhere else —
+the Lambda dispatcher never PUTs; workers do.
+
+### Wire grammar
+
+No new mode. A `stage` block on the existing `mode: "sweep"` event selects the
+staged arm, reusing that event's credential resolution and its
+`leaves` / `discover` work-set transport:
+
+```json
+{
+  "mode": "sweep",
+  "store_path": "s3://bucket/prefix.zarr",
+  "leaves": [[1152921504606846982, null]],
+  "stage": {
+    "role": "stage",
+    "run_id": "stage-20260825T094152Z-53c774",
+    "run_started": "2026-08-25T09:41:52+00:00",
+    "dispatch": 3,
+    "nodes": ["1111", "1112"],
+    "batch": 0,
+    "tuple_width": 3,
+    "records_from": "s3://bucket/prefix.zarr.status/run-stage-20260825T094152Z-53c774"
+  }
+}
+```
+
+| Key | Role | Description |
+|-----|------|-------------|
+| `role` | both | `"stage"` (default) or `"finisher"` |
+| `run_id` | both | The sweep run's identity: the lease, the skip-key / foreign-stamp namespace, and the status prefix all key on it |
+| `run_started` | stage | Dispatcher-pinned UTC ISO stamp, shared by every worker of the run. A worker computing its own would read a sibling's fresh stamp as a foreign sweep's |
+| `dispatch` | stage | The tuple's dispatch order. The worker runs exactly that one tuple |
+| `nodes` | stage | This invoke's dispatch nodes, as morton decimals. Must be non-empty and every entry must sit at exactly `dispatch` order — the worker refuses otherwise. In the example above the store is shard-order 6, so at `tuple_width: 3` the dispatch orders are 3 and 0, and an order-3 dispatch takes 4-digit nodes |
+| `batch` | stage | Optional (defaults to `0`); which batch of that tuple this is, and what names the record object |
+| `tuple_width` | stage | Optional; defaults to `zagg.sweep_stage.DEFAULT_TUPLE_WIDTH`. A finisher takes no tuple width — one on a finisher block is inert |
+| `partition` | stage | Optional `{"index", "of"}`; recorded on the stage rows |
+| `lease_ttl_s` | both | Optional lease TTL override |
+| `records_from` | both | **Required.** The run's status prefix — a store **sibling** (`<store>.status/run-<run_id>`, `zagg.client_transport.run_status_prefix`). Each invoke PUTs its record there; the finisher reads them back. Both roles refuse by name without it: a stage worker that wrote no record would fold correctly and then be indistinguishable from a lost invoke, and a finisher without the records has no per-level actuals at all. A finisher also refuses a prefix holding zero records (a *partial* set is fine — under-coverage is recorded and self-heals) |
+| `touch_policy` | finisher | Optional (defaults to `"auto"`); the `output.touch` declaration (issue #501) governing the `aggregation.yaml` touch |
+| `barrier_timed_out` | finisher | Optional, defaults `false`. Sent by the dispatcher when any tuple's barrier expired; the finisher records it in the store-root run record and in `finisher.json`, so the durable record says the per-level actuals may be short |
+
+Every store write stays worker-side. The dispatcher only invokes and polls.
+
+### How a run is sequenced
+
+`zagg.sweep_fleet.run_stage_sweep_fleet` mirrors the in-process driver's tuple
+ordering exactly:
+
+1. **fan out** one tuple's dispatch nodes, batched under the 250 KB async
+   payload cap, one `InvocationType="Event"` invoke per batch;
+2. **soft-barrier** — poll the status prefix until every batch's stage record
+   lands, or the barrier budget expires. Per #381 point (6) the barrier is a
+   *scheduling* preference, not a correctness device: under-coverage is
+   recorded in each artifact's own `source_children` and heals on the next
+   pass, so an expired barrier logs loudly and the run proceeds;
+3. next tuple; then the **finisher** invoke last — root `coverage.moc`,
+   manifest per-level actuals, `aggregation.yaml` touch, lease release —
+   **unless no tuple produced a dispatch node at all** (every leaf skipped as
+   mixed-order, or filtered out by scope), in which case nothing fires, there
+   is no finisher and no barrier, and the summary says so:
+   `skipped: "no dispatch nodes"` with `finisher.fired: false`. A finisher
+   over zero stage records refuses by design, so firing it would buy one
+   guaranteed 500 the Event invoke hides plus a full barrier on a record that
+   can never land.
+
+One barrier is bounded by `barrier_timeout_s` (default 2,700 s — three times
+the 900 s function timeout: queue drain, one throttle redelivery, and the
+slowest worker's own run), and the *sum* of them by `total_barrier_budget_s`
+(default 7,200 s), so the tail's worst case is a constant rather than a
+function of the store's order. Past the total, each remaining barrier degrades
+to a single check. An expiry is recorded as `barrier_timed_out` on the
+dispatcher's run summary, forwarded on the finisher's stage block, and stamped
+into the store-root run record (`sweep_stats_{ts}_stages.json`) and
+`finisher.json` — so a run whose actuals may be short says so durably, not
+only in a dispatcher log that dies with the process. When the invoke was merely
+*queued* rather than lost, its late artifacts are still correct — a same-run
+sibling is not foreign, so nothing aborts — and the cost is exactly that the
+finisher's per-level actuals under-report until the next pass heals them.
+
+Admission is the ordinary per-store sweep lease (`sweep.lease.json`). The
+*first* stage worker creates the intent; every sibling of the same run reads
+its own back; a live foreign intent refuses the invoke by name. Release is the
+finisher's final act, so a run that dies mid-fan-out leaves a claimable
+intent, not an open store.
+
+### Running it
+
+Opt in with `output.sweep: "stages"` — the same knob the spatial local
+dispatcher reads — and the **spatial** Lambda tail (`runner._run_lambda`)
+chains the fleet sweep after the rollup-families leg, auto-scoped to the run's
+own footprint.
+
+!!! warning "Only the spatial Lambda tail chains it"
+    `output.sweep: "stages"` validates on any hive config, and every tail
+    reads it as truthy and runs the rollup-families sweep — but only the
+    spatial Lambda tail goes on to dispatch the staged one. The other two
+    unwired tails are not the same case:
+
+    * **raster** (`data_source.reader: raster`) does not chain, and is right
+      not to. A raster store is column-less by construction — there are no
+      digest columns to fold above the shard — so it declares no
+      `zagg-pyramid/2` ladder at all, and a stage worker handed one would
+      refuse it at the `/2` declaration gate (`zagg.sweep_stage.ladder_entries`)
+      rather than build anything. Nothing is missing from such a store.
+    * the v2 **`Run.dispatch`** tail is the real gap: a column-bearing `/2`
+      store dispatched through it accepts the knob, runs the families sweep
+      and silently builds no ladder, with no warning at the seam. The
+      operator's evidence is an absent ladder hours later. Follow such a run
+      with an explicit `run_stage_sweep_fleet` call (below) or a
+      `python -m zagg.sweep <root> --stages` pass.
+
+Ad hoc, drive `zagg.sweep_fleet.run_stage_sweep_fleet` with a boto3 Lambda
+client:
+
+```python
+import boto3
+from zagg.sweep_fleet import run_stage_sweep_fleet
+
+summary = run_stage_sweep_fleet(
+    boto3.client("lambda"),
+    "zagg-worker",
+    "s3://bucket/prefix.zarr",
+    leaves,                    # [(shard_key, window), ...]
+    shard_order=6,
+    store_kwargs={"region": "us-west-2"},
+)
+```
+
+`shard_order` is passed in rather than read from the manifest on purpose: a
+dispatcher role may hold nothing but `lambda:InvokeFunction` against the
+store itself.
+
+**Permissions.** Nothing new on the worker side — the execution role already
+writes the store and the `<store>.status/` sibling (the issue #151 async result
+channel), which is where the stage records land. The dispatcher needs
+`lambda:InvokeFunction`, plus **two** grants on that sibling prefix:
+`s3:ListBucket` for the barrier's poll and `s3:GetObject` for the finisher
+record it reports (`stage_records`, `levels`, `lease`, `record`,
+`duration_s`). The v2 Event transport already both lists and gets that prefix,
+so a correctly scoped dispatcher role needs no new grant, and no
+CloudFormation, layer, or IAM template change ships with this transport.
+
+Mind the shape if you are writing the policy by hand: `s3:ListBucket` is a
+**bucket-level** action, so its `Resource` is the bucket ARN and the prefix
+rides an `s3:prefix` condition. A key-level ARN matches nothing:
+
+```yaml
+# WRONG — never matches
+- Effect: Allow
+  Action: s3:ListBucket
+  Resource: arn:aws:s3:::bucket/prefix.zarr.status/*
+
+# Right
+- Effect: Allow
+  Action: s3:ListBucket
+  Resource: arn:aws:s3:::bucket
+  Condition: { StringLike: { s3:prefix: "prefix.zarr.status/*" } }
+- Effect: Allow
+  Action: s3:GetObject
+  Resource: arn:aws:s3:::bucket/prefix.zarr.status/*
+```
+
+Both failures are quiet rather than loud. A missing list grant reads in the run
+log exactly like slow workers — "the prefix is empty" and "the LIST failed" are
+the same empty set — until the dispatcher gives up after five consecutive
+faulted LISTs and proceeds fail-open. A missing `s3:GetObject` completes the
+run and simply drops the finisher's reporting from the summary.
+
+!!! note "Dispatch nodes come from the work set, not from the store"
+    The dispatcher cannot read the root `coverage.moc`, so it derives dispatch
+    nodes from the leaves it holds. The in-process pass derives them from work
+    set ∪ root MOC, so a node whose *only* leaves are untouched siblings
+    recorded in the MOC is not invoked. That is the same scoped-sweep posture
+    `stage_sweep_after_run` already has (#381 point (11)); a worker still folds
+    every child on disk under each node it *is* handed, so untouched siblings
+    are folded in, never dropped.
+
+!!! warning "The tail blocks while the sweep runs"
+    Unlike every other end-of-run invoke, the staged sweep is not
+    fire-and-forget: the tuple ordering has to be held by somebody, and the
+    dispatcher is the only party that sees each tuple finish. The barrier waits
+    are bounded by a total budget and the whole leg is fail-open (D9) — a
+    refused lease, a lost invoke or an expired barrier costs one later
+    `python -m zagg.sweep --stages` pass, never a wrong answer. A dispatcher
+    killed mid-barrier leaves the run's lease held until its TTL expires into
+    claimability, which is the lease's designed recovery.
+
+### Why the fleet build is trusted
+
+Grouping is a dispatch knob, never grammar — the **merge-source law** (espg
+ruling 2026-08-09, issue #384) makes the build a fixed function of the store,
+independent of tuple width, partitioning, and executor. Splitting a tuple
+across invokes is therefore free: dispatch nodes at one order own disjoint
+subtrees, and a tuple's folds read only columns one tuple *finer*.
+
+That is not an argument, it is the test. `TestByteIdentityOracle` in
+`tests/test_sweep_stage_fleet.py` builds a column-bearing store, runs the CLI
+staged sweep, snapshots every object, resets the store to its pre-sweep bytes,
+runs the fleet path with the Lambda client mocked to execute the worker arm
+in-process, and byte-compares every store artifact — chunk data exactly, JSON
+modulo the run identity and the clock. The two run records are checked for
+shape rather than bytes (one of each, no leftover lease), since they differ
+between executors by design. Any other difference is a transport bug.
+
+It runs that comparison across every degree of freedom the transport has:
+tuple widths 1, 2 and 3 (136–181 objects each), both executors at the same
+width so the comparison stays full; a multi-batch fan-out with the
+payload cap squeezed so one tuple needs several invokes; an executor that runs
+each worker only while the barrier is waiting, so the barrier is falsifiable;
+a windowed store; and a store whose digest field carries both the located and
+the temporal companion channel. Two negative controls prove the comparison has
+teeth — a wrong fold and a scoped-out subtree both fail it. One arm is
+deliberately narrower: the CLI-at-width-3 vs fleet-at-width-1 comparison drops
+each artifact's group `zarr.json`, because `source_children` names a
+genuinely different fold across widths, and re-checks those attrs separately
+so nothing else can hide behind the exclusion.
+
+The one **documented** difference between executors is pinned by its own test:
+the dispatcher derives dispatch nodes from the work set it holds, so a subtree
+that appears only in the root MOC is not invoked. It is real, and on an
+appended store it bites on every incremental run — the root MOC carries every
+prior run's shards while the work set carries only this one's.
+
+For the **chained** case the identity claim still holds, but not because the
+work set covers the MOC (it does not). It holds because the local twin is
+scoped the same way: `stage_sweep_after_run` passes the run's own shard
+decimals as `scope`, which filters the in-process pass's `work set ∪ MOC`
+right back down to the run's footprint. Same node set, same bytes. Drive the
+fleet transport over a work set narrower than the store's coverage and the
+difference is exactly what the test pins — the un-invoked subtree keeps its
+prior ladder and heals on the next pass that does include it.
+
+!!! info "Live-fleet validation is deferred"
+    The acceptance above is fully offline by design. Validation against a real
+    deployed function rides the next release plus a cents-scale probe on a
+    column-bearing probe store (the SERC GEDI 0.50 probe store is exactly that
+    testbed); no deploy, no Lambda invoke, and no S3 write was made from the
+    implementing branch. The `stage` arm ships in the function zip like any
+    other handler change — there is no template, layer, or IAM change to
+    stage first.
+
 ## Cost Estimate
 
 **Per invocation** (180s average, 2 GB memory): ~$0.006

@@ -133,11 +133,12 @@ def test_mortie_version_asserted(monkeypatch):
 
     from zagg.grids import aoi
 
-    for bad in ("0.8.1", "0.8.2", "0.8.3.dev1", "0.7.2"):
+    # Floor is 1.0.0 (#559): the pre-1.0 spellings this module used are gone.
+    for bad in ("0.8.3", "0.9.11", "1.0.0.dev1", "0.7.2"):
         monkeypatch.setattr(mortie, "__version__", bad, raising=False)
         with pytest.raises(RuntimeError, match="aoi_mask requires mortie"):
             aoi._assert_mortie_version()
-    for ok in ("0.8.3", "0.9.0", "1.0.0"):
+    for ok in ("1.0.0", "1.0.1", "1.2.0"):
         monkeypatch.setattr(mortie, "__version__", ok, raising=False)
         aoi._assert_mortie_version()  # no raise
 
@@ -583,6 +584,81 @@ class TestWKBWKTInput:
         ring = healpix_aoi_moc(_box(*box), order)
         geo = healpix_aoi_moc_from_geometry(AOIGeometry.from_wkb(wkb), order)
         np.testing.assert_array_equal(np.sort(ring), np.sort(geo))
+
+    def test_healpix_moc_multipart_and_hole_equal_geometry(self):
+        # mortie 1.0 retired the multipart ring form of the scalar coverer
+        # (#559), so the ring-parts path now routes through ``from_geometry``.
+        # What is pinned here is the parts semantics themselves -- disjoint
+        # parts union, a nested part carves a hole, part order does not matter,
+        # an open ring covers what the closed one covers -- each also checked
+        # equal to the WKB route. (Both routes end in the same ``_cover_parts``
+        # kernel, so the route agreement alone would not catch a semantics
+        # change; equality with the pre-1.0 multipart form was measured against
+        # mortie 0.9.11 at migration time, not pinned here.)
+        import shapely
+        from mortie import moc_to_order
+
+        from zagg.grids.aoi import (
+            AOIGeometry,
+            healpix_aoi_moc,
+            healpix_aoi_moc_from_geometry,
+        )
+
+        order = 8
+        a, b = _box(10.0, 10.0, 20.0, 20.0)[0], _box(30.0, 30.0, 35.0, 35.0)[0]
+        outer, hole = _box(-20.0, -20.0, -10.0, -10.0)[0], _box(-17.0, -17.0, -13.0, -13.0)[0]
+
+        def poly(lats, lons, holes=()):
+            return shapely.Polygon(list(zip(lons, lats)), [list(zip(h[1], h[0])) for h in holes])
+
+        multi = shapely.MultiPolygon([poly(*a), poly(*b)])
+        parts = healpix_aoi_moc([a, b], order)
+        geo = healpix_aoi_moc_from_geometry(AOIGeometry.from_wkb(multi.wkb), order)
+        np.testing.assert_array_equal(np.sort(parts), np.sort(geo))
+
+        donut = healpix_aoi_moc([outer, hole], order)
+        geo = healpix_aoi_moc_from_geometry(
+            AOIGeometry.from_wkb(poly(*outer, holes=[hole]).wkb), order
+        )
+        np.testing.assert_array_equal(np.sort(donut), np.sort(geo))
+
+        # and the nested part really is a hole: fewer cells than the outer alone
+        def flat(m):
+            return np.unique(np.asarray(moc_to_order(m, order), dtype=np.uint64))
+
+        assert flat(donut).size < flat(healpix_aoi_moc([outer], order)).size
+
+        # The two shapes ``load_polygon`` actually emits, which the route
+        # agreement above does not reach on its own -- both are places a future
+        # shapely could start normalizing the ring before mortie sees it.
+        #
+        # (1) an OPEN ring (no repeated first vertex): shapely closes it
+        # implicitly, so it must cover exactly what the closed ring covers.
+        closed = _box(10.0, 10.0, 20.0, 20.0)[0]
+        opened = (closed[0][:-1], closed[1][:-1])
+        np.testing.assert_array_equal(
+            np.sort(healpix_aoi_moc([opened], order)),
+            np.sort(healpix_aoi_moc([closed], order)),
+        )
+        np.testing.assert_array_equal(
+            np.sort(healpix_aoi_moc([opened], order)),
+            np.sort(healpix_aoi_moc_from_geometry(AOIGeometry.from_wkb(poly(*opened).wkb), order)),
+        )
+
+        # (2) the hole listed BEFORE its outer part. The descent is even-odd,
+        # not first-part-wins, so part order must not matter -- and the
+        # (topologically invalid) MultiPolygon has to survive shapely both ways.
+        hole_first = healpix_aoi_moc([hole, outer], order)
+        np.testing.assert_array_equal(np.sort(hole_first), np.sort(donut))
+        np.testing.assert_array_equal(
+            np.sort(hole_first),
+            np.sort(
+                healpix_aoi_moc_from_geometry(
+                    AOIGeometry.from_wkb(shapely.MultiPolygon([poly(*hole), poly(*outer)]).wkb),
+                    order,
+                )
+            ),
+        )
 
     def test_healpix_mask_wkt_equals_ring_end_to_end(self):
         # The whole per-shard mask (not just the MOC) must match: build via the grid

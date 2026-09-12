@@ -1,0 +1,18 @@
+{
+ "spec": "zagg-sweep/1",
+ "family": "overview",
+ "node": "112",
+ "order": 2,
+ "windows": {
+  "all": {
+   "object": "all.zarr",
+   "generation": {
+    "n_leaves": 1,
+    "max_leaf_timestamp": "2026-09-11T01:23:29+00:00"
+   },
+   "content_hash": "f0f9c89eba2a6277f832450bb5753596aa2ea9d092d42cbf77c5c60ae6728330",
+   "fold_source": "cascade",
+   "fold_from_order": 3
+  }
+ }
+}

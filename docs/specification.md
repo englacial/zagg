@@ -20,6 +20,45 @@ coverage-MOC serializations, and the rank-space deinterleave. This page owns
 the **array-level** contracts inside a leaf; it cites mortie's page for path
 and word semantics and never restates them.
 
+**Latitude convention of the words** (*informative* — see
+[Normative language](#normative-language) below; issue
+[#549](https://github.com/englacial/zagg/issues/549)): the packed words are
+produced by mortie's geodetic ingress (`geo2mort`) under **mortie's default
+latitude convention** — zagg passes no `latitude=` override anywhere
+(`zagg.grids.healpix.HealpixGrid.assign`). That default is `authalic-wgs84`
+(geodetic latitude converted to authalic before the spherical HEALPix
+mapping, mortie spec §9) from mortie 0.9.8 on
+([espg/mortie#186](https://github.com/espg/mortie/issues/186), on PyPI
+2026-08-16); earlier mortie encoded `geodetic-spherical`. The convention a
+store carries is therefore mortie's default *at write time*, not a property
+zagg declares: zagg ≥ 0.45.0 floors mortie at ≥ 0.9.8 (issue
+[#438](https://github.com/englacial/zagg/issues/438)), so any environment
+that resolved those declared dependencies encodes authalic — but on the
+fleet mortie comes from the separately built Lambda layer, not from the
+function zip, so a worker whose layer predates the bump would write
+`geodetic-spherical`, and nothing in the store records which. The
+**published o9 stores are authalic-wgs84** on stronger, artifact-level
+evidence: they were written by zagg 0.52.0, whose temporal encode path runs
+`from mortie import TOC_MAX_NS` (a name mortie exports only from 0.9.10
+on), so a worker on a stale layer raises there instead of writing. The two
+conventions are
+non-corresponding partitions of the sphere (mortie spec §9): the offset
+peaks near 45° latitude at 0.12830° (~14.26 km), so a cover or store built
+under one convention does not describe cells under the other, and composing
+them is meaningless (mortie spec §9 is where the prohibition binds). The
+`dggs` attrs block
+(`zagg.grids.healpix.HealpixGrid._dggs_attrs`) does not yet stamp mortie's
+`latitude` token; what it does stamp is `ellipsoid: {name: WGS84,
+semimajor_axis: 6378137.0, inverse_flattening: 298.257223563}` and no sphere
+radius — that entry is the **ingress datum** (the geodetic coordinates fed
+to `geo2mort`, equal-area on that ellipsoid by construction), not an
+instruction to compute cell geometry on the ellipsoid: the words themselves
+live on the R = 6371.0088 km authalic sphere the conversion maps onto.
+Until the token lands, this paragraph is the record for zagg stores, and a
+reader reproducing cell geometry (e.g. a viewer's boundary golden test)
+needs the geodetic ↔ authalic conversion at every geodetic seam, exactly as
+mortie spec §9 prescribes.
+
 Design *rationale* — why each decision was made, with trade studies and
 ratification records — lives in
 [`design/sparse_coverage.md`](design/sparse_coverage.md) (the D/O-numbered
@@ -714,6 +753,82 @@ regionally heterogeneous resolution).
   MUST tolerate the key's absence (a `"leaves"` level, or a pre-#376
   artifact) and MUST NOT read absence as `missing: 0`.
 
+  **`demotions` records the `packed` guard rail firing at this node**
+  ([#518](https://github.com/englacial/zagg/issues/518)) — present exactly
+  when the fold that **last wrote this artifact** demoted a `packed`-class
+  field, on **both** attrs revisions (`zagg-overview/1` and `/2`, §4.4):
+
+  ```json
+  "demotions": [
+    {"field": "composition", "class": "packed", "reason": "word-missing",
+     "contributors": 1, "of": "h_tdigest_signal", "cells": 4}
+  ]
+  ```
+
+  One record per `(field, reason)`, sorted by that pair. `reason` is one of:
+
+  - `"word-missing"` — a contributor carried the field's §3.3 **divisor**
+    digest but not the word. The fold blanks the output cells that
+    contributor's rows reach to the fill word (`cells` counts them):
+    publishing the surviving siblings' word over an `N_signal` that counts
+    rows the word never covered would be a §3.3 skew — absence over
+    wrongness;
+  - `"divisor-missing"` — a contributor carried the **word** but not its
+    `of` digest, so it contributes nothing for the field (the fold's `n`
+    inputs are that digest's per-cell weights and are never guessed). This
+    is the shape a **mis-declared divisor** leaves at every level above the
+    leaves: a manifest naming an `of` whose own entry is `class: "none"`
+    (§4.5 — manifests outlive their writer) materializes no divisor array
+    in any overview or column, so every contributor fires this arm and the
+    field silently never folds upward.
+
+  On `zagg-overview/2` the record survives only a level that materializes.
+  The stage fold counts a contributor the rail fired on as `unreadable`, and
+  a level where **no** contributor folded cleanly is not written at all — so
+  the mis-declared-divisor shape above, which fires on *every* contributor,
+  leaves no artifact and therefore no `demotions`. A reader MUST NOT read the
+  key's absence at a `/2` level as evidence the rail did not fire there; the
+  absent level is the evidence. The `/1` fold paths do not share this: a
+  demoted contributor is still a counted leaf (or child), so the level
+  materializes and carries the record.
+
+  `field`/`class`/`reason`/`contributors` are always present. A
+  **contributor** is one *source read* the fold performed: a `(child,
+  window)` staged column on a `/2` merge (so one child missing a half in `W`
+  windows counts `W`), a `(leaf, window)` column read on a `/1` fold from
+  leaves, and one child overview on a `/1` cascade. `contributors` counts the
+  ones this `(field, reason)` fired on, in that unit. `of` names
+  the §3.3 linkage; `cells` is keyed whenever the demotion left output cells
+  at the fill word that no surviving contributor covers — always in the
+  `word-missing` direction, and in the `divisor-missing` direction only where
+  contributors own **disjoint** spans of the level (the `/1` cascade of child
+  overviews, where a child skipped for the field leaves its whole span fill).
+  Where many contributors share each output cell — a `/1` fold from leaves, a
+  `/2` stage merge — a dropped contributor blanks nothing and the key is
+  absent. A reader MUST NOT read its absence as "nothing was blanked".
+  Readers MUST tolerate additional keys, MUST tolerate the key's absence (a
+  clean fold, or any pre-#518 artifact — a clean fold's attrs are
+  byte-identical to a pre-#518 writer's), and MUST NOT read absence as "no
+  demotion ever occurred" on a pre-#518 store. The record is the per-field
+  refinement of `source_children`: those counters say a whole contributor
+  was unusable, this key says **which field** folded short and **why**. The
+  two counters are **not in the same unit** and MUST NOT be compared:
+  `source_children` counts **children**, classifying each child once however
+  many windows it contributed, while `contributors` counts the per-read
+  instances defined above — they coincide only in the single-window,
+  one-read-per-child case. A
+  demoted field's cells hold the fill value, which §3.2 makes
+  byte-indistinguishable from genuine emptiness, so the attrs are the only
+  place the distinction can live. Like `fields`, `source_children` and
+  `fold_from_order` beside it, a `demotions` state is **as current as the
+  artifact's own write** and never a live claim about the manifest in force:
+  the skip-if-current gates key on generations and regime, not on the field
+  declarations, so after a manifest edit (the mis-declared `of` being
+  introduced or corrected — §4.5, manifests outlive their writer) a level
+  whose bytes have not changed stays current carrying the previous fold's
+  answer. The `demoted/` conformance fixture (§7) commits one fired and one
+  clean level.
+
 An overview also carries the standard D4 **commit stamp** as its final
 write: an unstamped overview prefix is debris, exactly as for leaves.
 Write order is pinned — template, arrays, `role`/provenance attrs, stamp
@@ -782,7 +897,9 @@ to the append-later cascade regime), and `source_children` (present in both
 stage regimes: a gather that under-covers says so exactly like a merge) —
 plus `run_id`, the sweep run that wrote the artifact, and a `generation`
 block summing the consumed children (the stage skip gate's ratchet key —
-`{n_leaves, max_leaf_timestamp, run_ids}`, composition in §4.5).
+`{n_leaves, max_leaf_timestamp, run_ids}`, composition in §4.5). §4.3's
+`demotions` key rides `/2` artifacts unchanged (same grammar, same
+present-exactly-when-fired rule).
 The commit stamp of a stage-written artifact carries the same `run_id` key
 (additive to the stamp grammar; fleet-written stamps never carry it, and a
 reader treats its absence as "not a stage artifact", never an error): it is
@@ -1141,9 +1258,41 @@ manifest. A run whose declaration carries no leaf-node levels **deletes** any
 column and sidecar a previous declaration left at that `(leaf, window)`, so a
 column never outlives the declaration that wrote it.
 Like overviews, columns are derived artifacts a reader MUST NOT require;
-unlike overviews they are **not** regenerated by a sweep — the single writer
-of a column is its leaf's worker, ever (no locking anywhere), and repair is
-re-invoking the idempotent leaf, never a sweep-side fold from raw cells.
+unlike overviews they are **not** regenerated by a rollup sweep — the writer
+of a column is its leaf's worker (no locking anywhere), and repair is
+re-invoking the idempotent leaf, never a sweep-side fold from raw cells
+during a rollup pass.
+
+The **one** sanctioned second writer is the `/1 -> /2` **column backfill**
+([#520](https://github.com/englacial/zagg/issues/520)): an explicit upgrade
+pass that recomputes a committed leaf's column from that leaf's own **stored
+arrays**, for stores built before their fields were declared composable —
+which is what lets a published store take the `/2` staged sweep without
+re-aggregation. It writes the same artifact under the same discipline, so it
+inherits the single-writer law rather than repealing it, under two conditions
+a reader MAY assume of any store:
+
+- it is serialized against every other sweep by the §4.8 admission lease,
+  held for the whole pass and heartbeated on the **wall clock** (a beat lands
+  within a fixed fraction of `ttl_s` of the last one, however long a single
+  leaf takes). §4.8's expiry rule is the residual and is not repealed here: a
+  holder that stalls past its `ttl_s` without beating is claimable like any
+  other, so what a reader MAY assume is the lease's guarantee, not a stronger
+  one; and
+- it MUST NOT run while an aggregation run may write the same
+  `(leaf, window)`. This is the one pass for which §4.8's fleet ∥ sweep
+  disjointness does not hold, and no control-plane object can enforce it: it
+  is an operator precondition, and running a backfill against a live fleet
+  risks a chimera column exactly as two concurrent sweeps would.
+
+The backfill changes no byte of this format. A backfilled column is
+byte-identical to the one the leaf's worker would have written from the same
+leaf — the two provenance timestamps (`zagg_column.generated_at` and the
+stamp's `written_at`) aside — and it is written only where the manifest's own
+`/2` declaration (§4.5) carries leaf-node levels **and** at least one
+composable field; a store still declaring `/1`, declared off, or `class:
+"none"` on every field is refused and MUST be re-declared first, never
+guessed at.
 
 - **Naming.** One column per `(node, window)`, and its basename MUST be
   `{window stem}.pyramid.zarr` — the stem derived from the D23 **window
@@ -1266,13 +1415,27 @@ re-invoking the idempotent leaf, never a sweep-side fold from raw cells.
   the stamp, fail-open: absence reads unverifiable, never tampered.
 - **Failure identity.** A column-write failure fails the worker unit; the
   retry rewrites leaf and column wholesale. A committed leaf whose column
-  is absent or unstamped therefore reads as **either** a torn worker
-  **or** a leaf whose writing declaration carried no column (the gate and
-  the clear above) — and the manifest cannot always separate the two,
-  since its `pyramid` block MAY lag. Readers never require a column, so
-  absence is never an error state; where the **writing** declaration is
-  known to carry leaf-node levels, absence is the torn-worker signature
-  and the repair is re-invoking the idempotent leaf.
+  is absent or unstamped therefore reads as **one of three** things: a torn
+  worker; a leaf whose writing declaration carried no column (the gate and
+  the clear above); or — since the backfill sanctioned above — a leaf that
+  a `/1 -> /2` upgrade pass has not reached, or failed on. The manifest
+  cannot always separate them, since its `pyramid` block MAY lag, and after
+  a re-declaration it necessarily leads the leaves. Readers never require a
+  column, so absence is never an error state; the three differ only in
+  their **repair**:
+  - where the **writing** declaration is known to carry leaf-node levels,
+    absence is the torn-worker signature and the repair is re-invoking the
+    idempotent leaf;
+  - where the leaf-node levels arrived by RE-DECLARATION — the `/1 -> /2`
+    upgrade, whose whole point is that the leaf is not rewritten — absence
+    is the backfill's signature instead, and the repair is re-running the
+    idempotent backfill. Re-invoking the leaf would re-aggregate from
+    source granules, the one cost the upgrade exists to avoid;
+  - and a leaf that predates any column declaration needs no repair at all.
+
+  A backfill counts a leaf it cannot read or fold and carries on, so a
+  partially-completed pass leaves exactly this state on the store; what
+  distinguishes it is the pass's own summary (`failed`), not the artifacts.
 
 **Stage columns (issue #384).** The staged sweep writes the SAME artifact
 shape at its dispatch nodes (`{window}.pyramid.zarr` under an ancestor
@@ -1669,7 +1832,7 @@ drift fails zagg's own suite (`tests/test_spec_conformance.py`) on
 whichever side moved. moczarr vendors the same fixtures for its parity
 gates (espg/moczarr#19/#20).
 
-Six tiny single-shard hive stores plus one manifest-only declaration, all
+Seven tiny single-shard hive stores plus one manifest-only declaration, all
 on the same deliberately small geometry — shard order 4, inner-chunk order
 5, cell order 6 (16 cells, K = 4 inner chunks of 4 cells), sharded (the
 hive default; `raster_toc/` is the one exception — a `(time, cells)`
@@ -1785,7 +1948,7 @@ product is never sharded, §8/#247):
   word it fed the writer, so the writer is pinned rather than self-certified),
   the decoded digest rows read back — the same exception `column/`'s group
   values are — and `obs_total`, the cell plan's own observation count, which
-  §10.3's weight rule says the digest's total weight MUST equal. The other six
+  §10.3's weight rule says the digest's total weight MUST equal. The other
   fixtures have **no root coverage object at all**: none of them declares a
   temporal field, so a sweep of one produces no section, and their committed
   trees are byte-identical to their pre-§10 selves — which is exactly §10's
@@ -1800,8 +1963,22 @@ product is never sharded, §8/#247):
   clocked whole buckets past the rest of the plan, so the cover is a
   MULTI-word set with a real hole in it: a reader that quantized every word
   into one bucket would satisfy the parity and containment claims and fail
-  `gap_ns`. The other six fixtures carry no `coverage.toc` either, the §10.5
+  `gap_ns`. The other fixtures carry no `coverage.toc` either, the §10.5
   absence pin.
+
+- **`demoted/`** — the §4.3 `demotions` surface
+  ([#518](https://github.com/englacial/zagg/issues/518)): the
+  `kitchen_sink/` store swept under a hand-installed `/1` cascade manifest
+  whose composition `of` divisor is **mis-declared** `class: "none"` (§4.5:
+  manifests outlive their writer). Two committed overviews pin the pair of
+  readings: the exact-from-leaves level folds `composition` cleanly (the
+  leaf arrays carry the divisor regardless of its declared class) and
+  carries **no** `demotions` key — the absence pin — while the cascaded
+  level above it fires `divisor-missing` on its one contributor, holds the
+  all-fill word slab, and records the demotion — `cells: 4`, the skipped
+  child's whole disjoint span of the 16-cell level — in its `zagg_overview`
+  attrs. `demoted.expected.json` records both levels' paths, fold sources
+  and the demotions list beside the leaf record.
 
 `minimal/` and `kitchen_sink/` pin the layout edge cases a reader must
 handle (`column/`'s leaf is `minimal/`'s, so it pins them again): inner chunk
@@ -2855,6 +3032,6 @@ decoded word set — derived from the generator's inputs through the
 quantization law above, never transcribed — plus the parity claim on
 committed bytes, the required keys above, and the `gap_ns` interval the
 fixture's two clusters leave uncovered, which is what makes the object a
-test of the never-bridge law rather than of a single bucket. The other six fixtures carry no `coverage.toc` at all,
+test of the never-bridge law rather than of a single bucket. The other fixtures carry no `coverage.toc` at all,
 which pins the absence rule as bytes, exactly as §10's section absence is
 pinned.

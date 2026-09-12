@@ -347,3 +347,113 @@ def overview_block_v2(knob: dict, levels: list, fold: tuple, fields: dict, exclu
         "overviews": [dict(e) for e in levels],
         "overview": overview,
     }
+
+
+def spelled_schedule(knob: dict) -> dict:
+    """The pyramid-schedule keys an ``output.pyramid`` knob actually spells.
+
+    Empty for the omitted-knob default (the one shape the issue #384 flip
+    completes), so ``if spelled_schedule(knob)`` is the "this config already
+    declares its own schedule" test :func:`retrofit_declaration` gates on.
+    """
+    return {k: knob[k] for k in ("overviews", "orders", "spacing") if knob.get(k) is not None}
+
+
+def retrofit_declaration(config, *, overviews, chunk_order, parent_order: int, child_order: int):
+    """The grid-less retrofit's explicit ``/2`` lever (issue #520).
+
+    :func:`zagg.sweep_overview.declare_pyramid` re-derives the manifest block
+    from a supplied pipeline config, and the config a published store was
+    built with has no reason to spell ``output.pyramid.overviews``: the #384
+    default flip fires off the GRID's resolved ``chunk_order``, which the
+    retrofit path has no grid to ask. So the retrofit falls back to ``/1``,
+    and a ``/1`` declaration is exactly what a store being upgraded to ``/2``
+    must not get. This is the lever that closes that: ``overviews=`` spells
+    the leaf resolutions outright, ``chunk_order=`` supplies the one number
+    the default flip is missing.
+
+    Returns ``(config, chunk_order, note)`` for
+    :func:`zagg.sweep_overview.build_pyramid_block` — the config with the
+    declaration injected, the chunk order to derive the default from, and the
+    summary's ``declared_via`` note. Both levers are validated against the
+    MANIFEST's own orders (``parent_order``/``child_order`` here) before
+    anything is written, which is the retrofit contract: the store's truth
+    wins over the config's.
+
+    Every refusal is by name; in particular the two SILENT no-ops refuse
+    rather than falling through to a ``/1`` block the caller did not ask for:
+    passing both levers (``chunk_order=`` is inert once a schedule is
+    spelled), and ``chunk_order=`` against a config that already spells one —
+    or spells ``output.pyramid: false``, which declares no pyramid for the
+    default flip to complete. ``overviews=`` DOES override a config's own
+    pyramid knob, including ``false``: that is the whole point of the lever
+    on a store whose build declared no pyramid, and the override is logged.
+
+    A ``reader: raster`` config is refused HERE, on **both** arms. The #384
+    default flip's raster exemption lives inside the flip condition
+    (:func:`zagg.sweep_overview.build_pyramid_block`), which the ``overviews=``
+    arm does not go through — it writes the knob and takes the explicit
+    branch, which has no reader check — so without this an ``--overviews`` on
+    a raster store would install a ``/2`` block declaring leaf columns spec
+    §4.6 places entirely out of scope (review finding, issue #520).
+    """
+    from dataclasses import replace
+
+    from zagg.config import get_pyramid
+
+    if overviews is not None and chunk_order is not None:
+        raise ValueError(
+            "declare_pyramid takes overviews= or chunk_order=, not both: chunk_order= only "
+            "supplies the issue #384 default flip, which an explicit overviews= schedule "
+            "replaces wholesale — passing both would silently ignore one of them"
+        )
+    if (config.data_source or {}).get("reader") == "raster":
+        raise ValueError(
+            "declare_pyramid(overviews=/chunk_order=) refuses a `reader: raster` config: "
+            "raster hive stores are column-less by construction and spec §4.6 does not apply "
+            "to them (issue #399 owns their overview regime). The #384 default flip already "
+            "exempts them, but `overviews=` bypasses the flip entirely — it would install a "
+            "zagg-pyramid/2 block declaring leaf columns nothing writes, which the column "
+            "backfill would then chase into raster leaves. Nothing was written"
+        )
+    knob = get_pyramid(config)
+    if overviews is not None:
+        resolutions = normalize_overviews(overviews)
+        validate_overviews(resolutions, parent_order=parent_order, child_order=child_order)
+        if knob is None:
+            logger.warning(
+                f"declare_pyramid: overviews={resolutions} OVERRIDES this config's "
+                f"`output.pyramid: false` — the store is being declared ON"
+            )
+            knob = {}
+        elif spelled_schedule(knob):
+            logger.warning(
+                f"declare_pyramid: overviews={resolutions} REPLACES the schedule this "
+                f"config spells ({spelled_schedule(knob)})"
+            )
+        output = {**config.output, "pyramid": {**knob, "overviews": resolutions}}
+        return replace(config, output=output), None, f"overviews={resolutions}"
+    if chunk_order is None:
+        return config, None, "config"
+    chunk_order = int(chunk_order)
+    if knob is None:
+        raise ValueError(
+            "chunk_order= completes the issue #384 DEFAULT declaration, and this config "
+            "spells `output.pyramid: false` — there is no pyramid to default. Pass "
+            "overviews= to declare one on a store whose build declared none"
+        )
+    spelled = spelled_schedule(knob)
+    if spelled:
+        raise ValueError(
+            f"chunk_order={chunk_order} is inert: this config already spells a schedule "
+            f"({spelled}), and the default flip only fires when none is spelled. Drop "
+            f"chunk_order=, or pass overviews= to replace the spelled schedule"
+        )
+    if not parent_order < chunk_order < child_order:
+        raise ValueError(
+            f"chunk_order={chunk_order} is not strictly between this store's shard_order "
+            f"({parent_order}) and cell_order ({child_order}) — the default leaf resolution "
+            f"lives strictly inside the shard's resolution window (the base data itself is "
+            f"order {child_order}; the shard-order aggregate is writer-side, never declared)"
+        )
+    return config, chunk_order, f"chunk_order={chunk_order}"

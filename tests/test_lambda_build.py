@@ -129,6 +129,23 @@ class TestFunctionBuild:
         zips = list(builds_dir.glob("lambda_function_*.zip"))
         assert len(zips) > 0, f"No function zip found in {builds_dir}"
 
+        # The zip must carry a hatch-vcs-stamped zagg/_version.py (issue #546):
+        # without it workers fall back to the 0.0.0+unknown sentinel and every
+        # worker-written artifact records an unusable version. 0.1.dev* is
+        # setuptools-scm's no-tag fallback — just as unusable. Mirrored as a
+        # build-time assertion in deployment/aws/build_function.sh.
+        import zipfile
+
+        newest = max(zips, key=lambda p: p.stat().st_mtime)
+        with zipfile.ZipFile(newest) as zf:
+            version_src = zf.read("zagg/_version.py").decode()
+        namespace: dict = {}
+        exec(version_src, namespace)
+        version = namespace["__version__"]
+        assert version and not version.startswith(("0.0.0", "0.1.dev")), (
+            f"function zip stamped unusable zagg version {version!r} (issue #546)"
+        )
+
     @pytest.mark.slow
     def test_function_build_size(self, build_script):
         """Function code zip must fit within size budget.
@@ -144,8 +161,12 @@ class TestFunctionBuild:
         import tempfile
         import zipfile
 
+        # Newest by mtime, matching test_function_build_succeeds: builds_dir
+        # accumulates one zip per arch/python it has ever built, and glob order
+        # is arbitrary — measure the artifact the last build produced.
+        newest = max(zips, key=lambda p: p.stat().st_mtime)
         with tempfile.TemporaryDirectory() as tmp:
-            with zipfile.ZipFile(zips[0]) as zf:
+            with zipfile.ZipFile(newest) as zf:
                 zf.extractall(tmp)
             # Sum all file sizes
             total = sum(f.stat().st_size for f in Path(tmp).rglob("*") if f.is_file())
