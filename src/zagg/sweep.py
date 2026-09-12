@@ -1359,6 +1359,14 @@ def main(argv=None) -> int:
         "pass runs in the same invocation (--families and --partitions are ignored)",
     )
     parser.add_argument(
+        "--write-multiscales",
+        action="store_true",
+        help="Write/refresh the stock-tool-legible multiscales companion group at "
+        "the store root from the manifest's zagg-pyramid/2 declaration (issue #394, "
+        "spec 4.10), print the summary, and exit — metadata-only: no sweep pass "
+        "runs in the same invocation (--families and --partitions are ignored)",
+    )
+    parser.add_argument(
         "--overviews",
         default=None,
         metavar="RESOLUTIONS",
@@ -1405,6 +1413,12 @@ def main(argv=None) -> int:
             overviews=resolutions,
             store_kwargs=store_kwargs,
         )
+        print(json.dumps(summary, indent=2))
+        return 0
+    if args.write_multiscales:
+        from zagg.multiscales import write_multiscales_group
+
+        summary = write_multiscales_group(args.store_root, store_kwargs=store_kwargs)
         print(json.dumps(summary, indent=2))
         return 0
     families = [f.strip() for f in args.families.split(",")] if args.families else None

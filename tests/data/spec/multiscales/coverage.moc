@@ -1,0 +1,13 @@
+{
+ "spec": "morton-moc/1",
+ "encoding": "ranges",
+ "order": 3,
+ "source": "dispatcher",
+ "generated_at": "2026-09-11T01:38:44+00:00",
+ "ranges": [
+  [
+   "-3111",
+   "-3112"
+  ]
+ ]
+}

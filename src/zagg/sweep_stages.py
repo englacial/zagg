@@ -316,13 +316,17 @@ def run_finisher(
        ``materialized`` is deliberately NOT written on ``/2`` stores: the
        per-entry actuals are the one source of truth (the flatten-ruling
        principle; any /1-era inventory is preserved verbatim);
+    2b. the issue #394 multiscales companion refresh
+        (:func:`zagg.multiscales.write_multiscales_group`, spec §4.10) —
+        gated on ``by_shard`` like step 1, fail-open like step 3 (the
+        companion is a D9-class recorded mirror, regenerable at any time);
     3. the ``aggregation.yaml`` lifecycle touch (issue #388's machinery);
     4. lease release via ``release()`` — the FINAL act, so a finisher that
        failed midway leaves the lease held and the run claimable/idempotent
        (re-invoking re-runs steps 1-3 harmlessly).
 
     Failures in steps 1-2 RAISE (the orchestrator records the incomplete
-    finish and leaves the lease for recovery); step 3 is fail-open telemetry.
+    finish and leaves the lease for recovery); steps 2b and 3 are fail-open.
     """
 
     from zagg.grids.morton import morton_word
@@ -382,6 +386,23 @@ def run_finisher(
             json.dumps(fresh, indent=1).encode(),
         )
         out["manifest_updated"] = True
+    # 2b. the issue #394 multiscales companion refresh (spec §4.10) —
+    # gated on ``by_shard`` exactly like the root-MOC refresh above (a run
+    # that touched no shards learned nothing about membership), and
+    # FAIL-OPEN like step 3: the companion is a recorded mirror (D9 cache
+    # class), regenerable at any time, so its write must never fail the
+    # finisher whose steps 1-2 are load-bearing.
+    if by_shard:
+        try:
+            from zagg.multiscales import write_multiscales_group
+
+            ms = write_multiscales_group(store_root, store_kwargs=store_kwargs)
+            out["multiscales_group"] = bool(ms.get("written"))
+        except Exception as e:
+            logger.warning(
+                f"finisher: multiscales companion write failed (fail-open, D9 cache class): {e}"
+            )
+            out["multiscales_group"] = False
     # ``touch_policy`` is the issue #501 declaration (``output.touch``), threaded
     # in from whichever caller holds the config: the post-run chaining path does
     # (``runner`` reads ``config`` on the line it decides to chain from), the
