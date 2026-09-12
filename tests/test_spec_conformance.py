@@ -1214,11 +1214,7 @@ class TestFixtureSemanticHash:
         MULTISCALES,
         "raster_toc",
         "temporal",
-=======
-        "raster_toc",
-        "temporal",
         "demoted",
->>>>>>> origin/main
     )
 
     @pytest.mark.parametrize(

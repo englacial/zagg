@@ -1365,6 +1365,8 @@ def main(argv=None) -> int:
         "the store root from the manifest's zagg-pyramid/2 declaration (issue #394, "
         "spec 4.10), print the summary, and exit — metadata-only: no sweep pass "
         "runs in the same invocation (--families and --partitions are ignored)",
+    )
+    parser.add_argument(
         "--overviews",
         default=None,
         metavar="RESOLUTIONS",
