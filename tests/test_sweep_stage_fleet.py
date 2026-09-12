@@ -1809,7 +1809,10 @@ class TestByteIdentityOracle:
         )
         return cli, _snapshot(root), fleet, client
 
-    @pytest.mark.parametrize("width,tuples,objects", ((1, 3, 181), (2, 2, 163), (3, 1, 136)))
+    # +4 per arm since issue #394: the finisher writes the §4.10 companion group
+    # (multiscales/zarr.json + one group doc per ladder level) on /2 stores —
+    # byte-identity covers them; only the census moved.
+    @pytest.mark.parametrize("width,tuples,objects", ((1, 3, 185), (2, 2, 167), (3, 1, 140)))
     def test_the_fleet_build_is_byte_identical_to_the_cli_build(
         self, tmp_path, width, tuples, objects
     ):
